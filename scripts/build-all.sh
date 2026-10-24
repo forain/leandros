@@ -366,11 +366,37 @@ build_doom() {
     # whichever tree linked last owns. See Makefile.leandros on DOOM_BIN.
     mkdir -p "$ROOT_DIR/target/doom"
     if [[ "$arch" == "x86_64" ]]; then
-        # C callers pass doubles in xmm0; the soft-float libc must export
-        # trampolines, or DOOM's synth computes garbage and clips.
+        # C callers pass doubles in xmm0; every float-ABI symbol DOOM links
+        # must read SSE registers, or DOOM's synth computes garbage and clips.
         python3 "$ROOT_DIR/scripts/check-c-float-abi.py" "$objdir/doom-$arch" || return 1
     fi
     cp -f "$objdir/doom-$arch" "$ROOT_DIR/target/doom/doom-$arch"
+}
+
+# Function to build floattest: a C program linked against libleandros_libc.a
+# exactly like DOOM, which checks every float-taking libc entry point and
+# compiler-rt float builtin plus printf("%f") (lane floatabi). FLOATTEST_LIBC
+# overrides the archive (e.g. to show the soft-float one failing).
+build_floattest() {
+    local arch="$1"
+    local libc
+    if [[ "$arch" == "x86_64" ]]; then
+        libc="$ROOT_DIR/userland/target/x86_64-unknown-leandros/release/libleandros_libc.a"
+    else
+        libc="$ROOT_DIR/userland/target/aarch64-unknown-none/release/libleandros_libc.a"
+    fi
+    libc="${FLOATTEST_LIBC:-$libc}"
+    local out="$ROOT_DIR/target/floattest"
+    mkdir -p "$out"
+    local lld
+    lld=$(find "$(rustc --print sysroot)" -name rust-lld | head -n 1)
+    echo "🧮 Building $arch floattest..."
+    clang --target="$arch-unknown-none" -ffreestanding -nostdlib -fno-stack-protector -static -O2 \
+        -c "$ROOT_DIR/userland/floattest-c/floattest.c" -o "$out/floattest-$arch.o" || return 1
+    "$lld" -flavor gnu -static -nostdlib -o "$out/floattest-$arch" "$out/floattest-$arch.o" "$libc" || return 1
+    if [[ "$arch" == "x86_64" && -z "${FLOATTEST_LIBC:-}" ]]; then
+        python3 "$ROOT_DIR/scripts/check-c-float-abi.py" "$out/floattest-$arch" || return 1
+    fi
 }
 
 # Function to build MAME
@@ -996,6 +1022,7 @@ for arch in "${ARCHS[@]}"; do
     build_relibc "$arch"
     build_userland "$arch"
     build_doom "$arch"
+    build_floattest "$arch" || exit 1
     build_mame "$arch"
     build_firefox "$arch"
     build_portal "$arch"

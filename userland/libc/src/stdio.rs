@@ -97,6 +97,86 @@ impl<'a> Sink<'a> {
     }
 }
 
+/// Integer / FP register slots the printf thunks save (see do_format).
+pub(crate) const ARGV_INT: usize = 8;
+pub(crate) const ARGV_FP: usize = 8;
+
+/// Small stack buffer for float formatting (output past its end is cut).
+struct FBuf { b: [u8; 352], n: usize }
+
+impl FBuf {
+    fn new() -> Self { FBuf { b: [0; 352], n: 0 } }
+    fn as_bytes(&self) -> &[u8] { &self.b[..self.n] }
+    fn push(&mut self, c: u8) { if self.n < self.b.len() { self.b[self.n] = c; self.n += 1; } }
+}
+
+impl core::fmt::Write for FBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &c in s.as_bytes() { self.push(c); }
+        Ok(())
+    }
+}
+
+/// C `%e` text: Rust prints `1.5e-7`, C wants `1.5e-07`.
+fn fmt_exp(v: f64, prec: usize) -> (FBuf, i32) {
+    use core::fmt::Write;
+    let mut raw = FBuf::new();
+    let _ = write!(raw, "{:.*e}", prec, v);
+    let r = raw.as_bytes();
+    let Some(epos) = r.iter().position(|&c| c == b'e') else { return (raw, 0) };
+    let mut exp: i32 = 0;
+    let (neg, digits) = if r.get(epos + 1) == Some(&b'-') { (true, &r[epos + 2..]) } else { (false, &r[epos + 1..]) };
+    for &d in digits { exp = exp * 10 + (d - b'0') as i32; }
+    if neg { exp = -exp; }
+    let mut out = FBuf::new();
+    for &c in &r[..epos] { out.push(c); }
+    let _ = write!(out, "e{}{:02}", if neg { '-' } else { '+' }, exp.unsigned_abs());
+    (out, exp)
+}
+
+/// Drop trailing fractional zeros (and a bare '.') before any exponent (%g).
+fn strip_zeros(b: &FBuf) -> FBuf {
+    let s = b.as_bytes();
+    let epos = s.iter().position(|&c| c == b'e').unwrap_or(s.len());
+    let mut end = epos;
+    if s[..epos].contains(&b'.') {
+        while end > 0 && s[end - 1] == b'0' { end -= 1; }
+        if end > 0 && s[end - 1] == b'.' { end -= 1; }
+    }
+    let mut out = FBuf::new();
+    for &c in &s[..end] { out.push(c); }
+    for &c in &s[epos..] { out.push(c); }
+    out
+}
+
+/// `%f %e %g` (and upper-case forms) with C's default precision of 6.
+fn fmt_float(spec: u8, v: f64, prec: Option<usize>) -> FBuf {
+    use core::fmt::Write;
+    let mut out = if v.is_nan() || v.is_infinite() {
+        let mut o = FBuf::new();
+        let _ = o.write_str(if v.is_nan() { "nan" } else if v < 0.0 { "-inf" } else { "inf" });
+        o
+    } else {
+        match spec | 0x20 {
+            b'f' => { let mut o = FBuf::new(); let _ = write!(o, "{:.*}", prec.unwrap_or(6), v); o }
+            b'e' => fmt_exp(v, prec.unwrap_or(6)).0,
+            _ => {
+                let p = match prec { Some(0) => 1, Some(p) => p, None => 6 };
+                let x = if v == 0.0 { 0 } else { fmt_exp(v, p - 1).1 };
+                if (p as i32) > x && x >= -4 {
+                    let mut o = FBuf::new();
+                    let _ = write!(o, "{:.*}", (p as i32 - 1 - x) as usize, v);
+                    strip_zeros(&o)
+                } else {
+                    strip_zeros(&fmt_exp(v, p - 1).0)
+                }
+            }
+        }
+    };
+    if spec.is_ascii_uppercase() { for c in &mut out.b[..out.n] { *c = c.to_ascii_uppercase(); } }
+    out
+}
+
 /// Core formatter. `argv` points to an array of `u64` variadic arguments.
 ///
 /// # Safety
@@ -108,8 +188,16 @@ pub(crate) unsafe fn do_format(sink: &mut Sink<'_>, fmt: *const u8, argv: *const
     let mut fi    = 0usize; // index into fmt
     let mut ai    = 0usize; // index into argv
 
+    // argv layout (filled by the printf thunks): [0..ARGV_INT) integer
+    // register args, [ARGV_INT..ARGV_INT+ARGV_FP) the FP/SIMD argument
+    // registers (xmm0-7 / d0-d7), where C passes variadic doubles.
+    let fpv = argv.add(ARGV_INT);
+    let mut fai = 0usize;
     macro_rules! next_arg {
-        () => {{ let v = *argv.add(ai); ai += 1; v }}
+        () => {{ let v = if ai < ARGV_INT { *argv.add(ai) } else { 0 }; ai += 1; v }}
+    }
+    macro_rules! next_fp_arg {
+        () => {{ let v = if fai < ARGV_FP { f64::from_bits(*fpv.add(fai)) } else { 0.0 }; fai += 1; v }}
     }
 
     loop {
@@ -127,9 +215,12 @@ pub(crate) unsafe fn do_format(sink: &mut Sink<'_>, fmt: *const u8, argv: *const
             width = width * 10 + (*fmt.add(fi) - b'0') as usize; fi += 1;
         }
 
+        let (fwidth, fzero) = (width, zero_pad); // floats: before the int hack
+        let mut fprec: Option<usize> = None;
         // Skip precision (with basic support for zero-padding)
         if *fmt.add(fi) == b'.' {
             fi += 1;
+            fprec = Some(0);
             let mut prec = 0usize;
             let mut has_prec = false;
             while { let d = *fmt.add(fi); d >= b'0' && d <= b'9' } {
@@ -137,6 +228,7 @@ pub(crate) unsafe fn do_format(sink: &mut Sink<'_>, fmt: *const u8, argv: *const
                 fi += 1;
                 has_prec = true;
             }
+            if has_prec { fprec = Some(prec); }
             if has_prec && !zero_pad && width == 0 {
                 zero_pad = true;
                 width = prec;
@@ -204,6 +296,27 @@ pub(crate) unsafe fn do_format(sink: &mut Sink<'_>, fmt: *const u8, argv: *const
                 let v = next_arg!() as u8;
                 emit_padded(sink, core::slice::from_ref(&v), &mut count);
             }
+            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
+                let v = next_fp_arg!();
+                let out = fmt_float(spec, v, fprec);
+                let data = out.as_bytes();
+                let len = data.len();
+                let padn = if fwidth > len { fwidth - len } else { 0 };
+                let finite = v.is_finite();
+                if left_align {
+                    sink.emit_bytes(data);
+                    for _ in 0..padn { sink.emit_byte(b' '); }
+                } else if fzero && finite {
+                    let sign = if !data.is_empty() && data[0] == b'-' { 1 } else { 0 };
+                    sink.emit_bytes(&data[..sign]);
+                    for _ in 0..padn { sink.emit_byte(b'0'); }
+                    sink.emit_bytes(&data[sign..]);
+                } else {
+                    for _ in 0..padn { sink.emit_byte(b' '); }
+                    sink.emit_bytes(data);
+                }
+                count += (len + padn) as i32;
+            }
             b'%' => { sink.emit_byte(b'%'); count += 1; }
             _    => { sink.emit_byte(b'%'); sink.emit_byte(spec); count += 2; }
         }
@@ -213,147 +326,188 @@ pub(crate) unsafe fn do_format(sink: &mut Sink<'_>, fmt: *const u8, argv: *const
 
 // ── Public formatted I/O ──────────────────────────────────────────────────────
 //
-// On AArch64, AAPCS64 passes integer variadic args in x1–x7 then the stack.
-// The assembly thunks below save x1–x7 to a `[u64; 7]` on the stack and
-// then call the `_impl` function with a pointer to that array.
-// This is sufficient for up to 7 formatted arguments — more than enough for
-// typical printf calls.
-
+// Variadic thunks: save the integer argument registers after the fixed ones
+// to argv[0..8) and the FP/SIMD argument registers (where AAPCS64 and SysV
+// pass variadic doubles; SysV's `al` count is an upper bound, saving all 8 is
+// always safe) to argv[8..16), then call the `_impl` with that array.
+// Arguments that spill to the stack are not supported.
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
-    // printf(fmt, ...) → printf_asm_impl(fmt, &args[7])
     ".global printf",
     ".type printf, %function",
     "printf:",
-    "   sub  sp,  sp, #80",
-    "   stp  x29, x30, [sp, #64]",
-    "   stp  x1,  x2, [sp, #0]",
-    "   stp  x3,  x4, [sp, #16]",
-    "   stp  x5,  x6, [sp, #32]",
-    "   str  x7,      [sp, #48]",
-    "   mov  x1,  sp",          // x1 = pointer to saved args
+    "   sub  sp,  sp, #144",
+    "   stp  x29, x30, [sp, #128]",
+    "   str  x1, [sp, #0]",
+    "   str  x2, [sp, #8]",
+    "   str  x3, [sp, #16]",
+    "   str  x4, [sp, #24]",
+    "   str  x5, [sp, #32]",
+    "   str  x6, [sp, #40]",
+    "   str  x7, [sp, #48]",
+    "   stp  d0, d1, [sp, #64]",
+    "   stp  d2, d3, [sp, #80]",
+    "   stp  d4, d5, [sp, #96]",
+    "   stp  d6, d7, [sp, #112]",
+    "   mov  x1,  sp",
     "   bl   printf_impl",
-    "   ldp  x29, x30, [sp, #64]",
-    "   add  sp,  sp, #80",
+    "   ldp  x29, x30, [sp, #128]",
+    "   add  sp,  sp, #144",
     "   ret",
 
-    // fprintf(fd_as_ptr, fmt, ...) → same idea
     ".global fprintf",
     ".type fprintf, %function",
     "fprintf:",
-    "   sub  sp,  sp, #80",
-    "   stp  x29, x30, [sp, #64]",
-    "   stp  x2,  x3, [sp, #0]",
-    "   stp  x4,  x5, [sp, #16]",
-    "   stp  x6,  x7, [sp, #32]",
-    "   str  xzr,     [sp, #48]",
+    "   sub  sp,  sp, #144",
+    "   stp  x29, x30, [sp, #128]",
+    "   str  x2, [sp, #0]",
+    "   str  x3, [sp, #8]",
+    "   str  x4, [sp, #16]",
+    "   str  x5, [sp, #24]",
+    "   str  x6, [sp, #32]",
+    "   str  x7, [sp, #40]",
+    "   stp  d0, d1, [sp, #64]",
+    "   stp  d2, d3, [sp, #80]",
+    "   stp  d4, d5, [sp, #96]",
+    "   stp  d6, d7, [sp, #112]",
     "   mov  x2,  sp",
     "   bl   fprintf_impl",
-    "   ldp  x29, x30, [sp, #64]",
-    "   add  sp,  sp, #80",
+    "   ldp  x29, x30, [sp, #128]",
+    "   add  sp,  sp, #144",
     "   ret",
 
-    // sprintf(buf, fmt, ...)
     ".global sprintf",
     ".type sprintf, %function",
     "sprintf:",
-    "   sub  sp,  sp, #80",
-    "   stp  x29, x30, [sp, #64]",
-    "   stp  x2,  x3, [sp, #0]",
-    "   stp  x4,  x5, [sp, #16]",
-    "   stp  x6,  x7, [sp, #32]",
-    "   str  xzr,     [sp, #48]",
+    "   sub  sp,  sp, #144",
+    "   stp  x29, x30, [sp, #128]",
+    "   str  x2, [sp, #0]",
+    "   str  x3, [sp, #8]",
+    "   str  x4, [sp, #16]",
+    "   str  x5, [sp, #24]",
+    "   str  x6, [sp, #32]",
+    "   str  x7, [sp, #40]",
+    "   stp  d0, d1, [sp, #64]",
+    "   stp  d2, d3, [sp, #80]",
+    "   stp  d4, d5, [sp, #96]",
+    "   stp  d6, d7, [sp, #112]",
     "   mov  x2,  sp",
     "   bl   sprintf_impl",
-    "   ldp  x29, x30, [sp, #64]",
-    "   add  sp,  sp, #80",
+    "   ldp  x29, x30, [sp, #128]",
+    "   add  sp,  sp, #144",
     "   ret",
 
-    // snprintf(buf, size, fmt, ...)
     ".global snprintf",
     ".type snprintf, %function",
     "snprintf:",
-    "   sub  sp,  sp, #80",
-    "   stp  x29, x30, [sp, #64]",
-    "   stp  x3,  x4, [sp, #0]",
-    "   stp  x5,  x6, [sp, #16]",
-    "   stp  x7, xzr, [sp, #32]",
-    "   str  xzr,     [sp, #48]",
+    "   sub  sp,  sp, #144",
+    "   stp  x29, x30, [sp, #128]",
+    "   str  x3, [sp, #0]",
+    "   str  x4, [sp, #8]",
+    "   str  x5, [sp, #16]",
+    "   str  x6, [sp, #24]",
+    "   str  x7, [sp, #32]",
+    "   stp  d0, d1, [sp, #64]",
+    "   stp  d2, d3, [sp, #80]",
+    "   stp  d4, d5, [sp, #96]",
+    "   stp  d6, d7, [sp, #112]",
     "   mov  x3,  sp",
     "   bl   snprintf_impl",
-    "   ldp  x29, x30, [sp, #64]",
-    "   add  sp,  sp, #80",
+    "   ldp  x29, x30, [sp, #128]",
+    "   add  sp,  sp, #144",
     "   ret",
 );
+
 
 // x86_64 assembly for printf functions
 // On x86_64, System V ABI passes integer args in rdi, rsi, rdx, rcx, r8, r9, then stack
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
-    // printf(fmt, ...) → printf_impl(fmt, &args[6])
     ".global printf",
     ".type printf, @function",
     "printf:",
-    "   sub  rsp, 56",          // 8 bytes alignment + 6*8 for args
-    "   mov  [rsp+0],  rsi",    // save rsi (arg 1)
-    "   mov  [rsp+8],  rdx",    // save rdx (arg 2)
-    "   mov  [rsp+16], rcx",    // save rcx (arg 3)
-    "   mov  [rsp+24], r8",     // save r8  (arg 4)
-    "   mov  [rsp+32], r9",     // save r9  (arg 5)
-    "   mov  qword ptr [rsp+40], 0", // padding
-    "   mov  rsi, rsp",         // rsi = pointer to saved args
+    "   sub  rsp, 136",
+    "   mov  [rsp+0], rsi",
+    "   mov  [rsp+8], rdx",
+    "   mov  [rsp+16], rcx",
+    "   mov  [rsp+24], r8",
+    "   mov  [rsp+32], r9",
+    "   movq [rsp+64], xmm0",
+    "   movq [rsp+72], xmm1",
+    "   movq [rsp+80], xmm2",
+    "   movq [rsp+88], xmm3",
+    "   movq [rsp+96], xmm4",
+    "   movq [rsp+104], xmm5",
+    "   movq [rsp+112], xmm6",
+    "   movq [rsp+120], xmm7",
+    "   mov  rsi, rsp",
     "   call printf_impl",
-    "   add  rsp, 56",
+    "   add  rsp, 136",
     "   ret",
 
-    // fprintf(fd, fmt, ...) → fprintf_impl(fd, fmt, &args)
     ".global fprintf",
     ".type fprintf, @function",
     "fprintf:",
-    "   sub  rsp, 56",
-    "   mov  [rsp+0],  rdx",    // save rdx (arg 2, first vararg)
-    "   mov  [rsp+8],  rcx",    // save rcx (arg 3)
-    "   mov  [rsp+16], r8",     // save r8  (arg 4)
-    "   mov  [rsp+24], r9",     // save r9  (arg 5)
-    "   mov  qword ptr [rsp+32], 0",
-    "   mov  qword ptr [rsp+40], 0",
-    "   mov  rdx, rsp",         // rdx = pointer to saved args
+    "   sub  rsp, 136",
+    "   mov  [rsp+0], rdx",
+    "   mov  [rsp+8], rcx",
+    "   mov  [rsp+16], r8",
+    "   mov  [rsp+24], r9",
+    "   movq [rsp+64], xmm0",
+    "   movq [rsp+72], xmm1",
+    "   movq [rsp+80], xmm2",
+    "   movq [rsp+88], xmm3",
+    "   movq [rsp+96], xmm4",
+    "   movq [rsp+104], xmm5",
+    "   movq [rsp+112], xmm6",
+    "   movq [rsp+120], xmm7",
+    "   mov  rdx, rsp",
     "   call fprintf_impl",
-    "   add  rsp, 56",
+    "   add  rsp, 136",
     "   ret",
 
-    // sprintf(buf, fmt, ...) → sprintf_impl(buf, fmt, &args)
     ".global sprintf",
     ".type sprintf, @function",
     "sprintf:",
-    "   sub  rsp, 56",
-    "   mov  [rsp+0],  rdx",    // save rdx (arg 2, first vararg)
-    "   mov  [rsp+8],  rcx",    // save rcx (arg 3)
-    "   mov  [rsp+16], r8",     // save r8  (arg 4)
-    "   mov  [rsp+24], r9",     // save r9  (arg 5)
-    "   mov  qword ptr [rsp+32], 0",
-    "   mov  qword ptr [rsp+40], 0",
-    "   mov  rdx, rsp",         // rdx = pointer to saved args
+    "   sub  rsp, 136",
+    "   mov  [rsp+0], rdx",
+    "   mov  [rsp+8], rcx",
+    "   mov  [rsp+16], r8",
+    "   mov  [rsp+24], r9",
+    "   movq [rsp+64], xmm0",
+    "   movq [rsp+72], xmm1",
+    "   movq [rsp+80], xmm2",
+    "   movq [rsp+88], xmm3",
+    "   movq [rsp+96], xmm4",
+    "   movq [rsp+104], xmm5",
+    "   movq [rsp+112], xmm6",
+    "   movq [rsp+120], xmm7",
+    "   mov  rdx, rsp",
     "   call sprintf_impl",
-    "   add  rsp, 56",
+    "   add  rsp, 136",
     "   ret",
 
-    // snprintf(buf, size, fmt, ...) → snprintf_impl(buf, size, fmt, &args)
     ".global snprintf",
     ".type snprintf, @function",
     "snprintf:",
-    "   sub  rsp, 56",
-    "   mov  [rsp+0],  rcx",    // save rcx (arg 3, first vararg)
-    "   mov  [rsp+8],  r8",     // save r8  (arg 4)
-    "   mov  [rsp+16], r9",     // save r9  (arg 5)
-    "   mov  qword ptr [rsp+24], 0",
-    "   mov  qword ptr [rsp+32], 0",
-    "   mov  qword ptr [rsp+40], 0",
-    "   mov  rcx, rsp",         // rcx = pointer to saved args
+    "   sub  rsp, 136",
+    "   mov  [rsp+0], rcx",
+    "   mov  [rsp+8], r8",
+    "   mov  [rsp+16], r9",
+    "   movq [rsp+64], xmm0",
+    "   movq [rsp+72], xmm1",
+    "   movq [rsp+80], xmm2",
+    "   movq [rsp+88], xmm3",
+    "   movq [rsp+96], xmm4",
+    "   movq [rsp+104], xmm5",
+    "   movq [rsp+112], xmm6",
+    "   movq [rsp+120], xmm7",
+    "   mov  rcx, rsp",
     "   call snprintf_impl",
-    "   add  rsp, 56",
+    "   add  rsp, 136",
     "   ret",
 );
+
 
 #[cfg(target_arch = "aarch64")]
 #[no_mangle]

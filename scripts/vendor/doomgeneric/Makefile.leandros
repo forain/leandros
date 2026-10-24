@@ -50,7 +50,13 @@ endif
 CFLAGS = --target=$(TARGET) -I. -Iinclude -static -fno-stack-protector -ffreestanding -nostdlib -O2 $(CFLAGS_ARCH)
 LDFLAGS = -static -nostdlib $(LDFLAGS_ARCH)
 
-LIBC = $(LEANDROS_ROOT)/userland/target/$(TARGET)/release/libleandros_libc.a
+# x86_64: the hard-float archive (build-userland.sh, lane floatabi); the
+# x86_64-unknown-none one is soft-float and passes doubles in integer registers.
+ifeq ($(ARCH),x86_64)
+    LIBC = $(LEANDROS_ROOT)/userland/target/x86_64-unknown-leandros/release/libleandros_libc.a
+else
+    LIBC = $(LEANDROS_ROOT)/userland/target/$(TARGET)/release/libleandros_libc.a
+endif
 
 # Select DRM, SDL, or legacy framebuffer version
 USE_SDL ?= 1
