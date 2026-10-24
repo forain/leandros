@@ -39,11 +39,15 @@ pub const L_FD_TABLE: u8 = 10;
 /// RUN_QUEUE in the lock order: an RQ holder never takes RUN_QUEUE
 /// (asserted in `TrackedMutex::lock`/`try_lock`).
 pub const L_RQ: u8 = 11;
-pub const N_LOCKS: usize = 12;
+/// The AF_UNIX connection table (`servers/net` `UNIX_CONNS`; lane ipcfast).
+pub const L_UNIX_CONNS: u8 = 12;
+/// The per-process socket tables (`servers/net` `SOCK_TABLES`; lane ipcfast).
+pub const L_SOCK_TABLES: u8 = 13;
+pub const N_LOCKS: usize = 14;
 
 pub static NAMES: [&str; N_LOCKS] = [
     "-", "RUN_QUEUE", "PIPEWIRE_STATE", "FD_TABLES", "PIPE_RINGS", "VIRTIO_GPU", "PORT_TABLE", "EPOLL",
-    "ADDRSPACE_BUSY", "F2FS_MOUNTS", "FD_TABLE", "RQ",
+    "ADDRSPACE_BUSY", "F2FS_MOUNTS", "FD_TABLE", "RQ", "UNIX_CONNS", "SOCK_TABLES",
 ];
 
 /// Lock order RUN_QUEUE (TASKS) → RQ: taking TASKS while this CPU holds a
@@ -534,6 +538,7 @@ pub struct TrackedGuard<'a, T> {
     id: u8,
     site1: u32,
     since: u64,
+    lock: &'a spin::Mutex<T>,
     guard: spin::MutexGuard<'a, T>,
 }
 
@@ -561,7 +566,7 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
         if let Some(guard) = self.inner.try_lock() {
             HOLDER[self.lock_id() as usize].store(cpu as u8 + 1, Ordering::Relaxed);
             let (site1, since) = on_acquire(self.lock_id(), loc);
-            return TrackedGuard { id: self.lock_id(), site1, since, guard };
+            return TrackedGuard { id: self.lock_id(), site1, since, lock: &self.inner, guard };
         }
         WANT[cpu].store(self.lock_id(), Ordering::Relaxed);
         let w0 = now_ns();
@@ -588,7 +593,7 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
             SITE_CWAITS[site1 as usize - 1].fetch_add(1, Ordering::Relaxed);
             SITE_CWAIT_NS[site1 as usize - 1].fetch_add(since.saturating_sub(w0), Ordering::Relaxed);
         }
-        TrackedGuard { id: self.lock_id(), site1, since, guard }
+        TrackedGuard { id: self.lock_id(), site1, since, lock: &self.inner, guard }
     }
 
     #[inline]
@@ -598,7 +603,7 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
         let guard = self.inner.try_lock()?;
         HOLDER[self.lock_id() as usize].store(me() as u8 + 1, Ordering::Relaxed);
         let (site1, since) = on_acquire(self.lock_id(), core::panic::Location::caller());
-        Some(TrackedGuard { id: self.lock_id(), site1, since, guard })
+        Some(TrackedGuard { id: self.lock_id(), site1, since, lock: &self.inner, guard })
     }
 
     /// `try_lock` that keeps trying for up to `max_ns` before giving up.
@@ -653,6 +658,82 @@ impl<'a, T> Drop for TrackedGuard<'a, T> {
         // by a late clear from the previous one.
         on_release(self.id, self.site1, self.since);
         HOLDER[self.id as usize].store(0, Ordering::Relaxed);
+    }
+}
+
+/// Spin for `m` with IRQs masked, answering TLB shootdowns (see
+/// `TrackedMutex::lock`), and charge lock `id`'s contention counters.
+fn spin_acquire<G>(id: u8, mut try_once: impl FnMut() -> Option<G>, busy: impl Fn() -> bool) -> G {
+    let cpu = me();
+    let i = id as usize;
+    ACQ[cpu][i].fetch_add(1, Ordering::Relaxed);
+    if let Some(g) = try_once() { return g; }
+    WANT[cpu].store(id, Ordering::Relaxed);
+    let w0 = now_ns();
+    let g = loop {
+        if !busy() { if let Some(g) = try_once() { break g; } }
+        mm::paging::tlb_service_pending();
+        core::hint::spin_loop();
+    };
+    WANT[cpu].store(0, Ordering::Relaxed);
+    CONT[cpu][i].fetch_add(1, Ordering::Relaxed);
+    CONT_NS[cpu][i].fetch_add(now_ns().saturating_sub(w0), Ordering::Relaxed);
+    g
+}
+
+impl<'a, T> TrackedGuard<'a, T> {
+    /// Run `f` with the lock released, then take it again (lane ipcfast: the
+    /// AF_UNIX user copies run here instead of under UNIX_CONNS). The guard
+    /// stays valid across the call, but everything read through it before
+    /// may have changed: callers re-validate after it returns. Never for
+    /// RUN_QUEUE (its drop flushes wakes made in the hold).
+    #[track_caller]
+    pub fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        assert!(self.id != L_RUN_QUEUE);
+        on_release(self.id, self.site1, self.since);
+        HOLDER[self.id as usize].store(0, Ordering::Relaxed);
+        // SAFETY: this guard owns the lock; it is re-taken (and the new
+        // guard forgotten) before the old guard is used or dropped again.
+        unsafe { self.lock.force_unlock(); }
+        let r = f();
+        let lock = self.lock;
+        core::mem::forget(spin_acquire(self.id, || lock.try_lock(), || lock.is_locked()));
+        HOLDER[self.id as usize].store(me() as u8 + 1, Ordering::Relaxed);
+        let (site1, since) = on_acquire(self.id, core::panic::Location::caller());
+        self.site1 = site1;
+        self.since = since;
+        r
+    }
+}
+
+/// A reader-writer spinlock with the [`TrackedMutex`] contention counters
+/// and TLB-shootdown-safe spinning. `lock()` is the exclusive side, so a
+/// `TrackedMutex` converts by changing only its type; hot read-only paths
+/// call `read()` and no longer serialize each other (lane ipcfast:
+/// SOCK_TABLES is looked up ~5 times per AF_UNIX sendmsg/recvmsg).
+pub struct TrackedRwLock<T> {
+    id: u8,
+    inner: spin::RwLock<T>,
+}
+
+impl<T> TrackedRwLock<T> {
+    pub const fn new(id: u8, value: T) -> Self { Self { id, inner: spin::RwLock::new(value) } }
+
+    #[inline]
+    pub fn lock(&self) -> spin::RwLockWriteGuard<'_, T> {
+        spin_acquire(self.id, || self.inner.try_write(), || self.inner.writer_count() != 0 || self.inner.reader_count() != 0)
+    }
+
+    #[inline]
+    pub fn read(&self) -> spin::RwLockReadGuard<'_, T> {
+        spin_acquire(self.id, || self.inner.try_read(), || self.inner.writer_count() != 0)
+    }
+
+    #[inline]
+    pub fn try_lock(&self) -> Option<spin::RwLockWriteGuard<'_, T>> {
+        let g = self.inner.try_write()?;
+        ACQ[me()][self.id as usize].fetch_add(1, Ordering::Relaxed);
+        Some(g)
     }
 }
 

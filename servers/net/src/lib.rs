@@ -407,6 +407,54 @@ struct UnixRing {
     /// Datagrams queued (datagram/seqpacket rings only): each is charged
     /// `DGRAM_OVERHEAD` on top of its bytes against the sender's SO_SNDBUF.
     nrec: usize,
+    /// A writer / reader is copying into / out of `buf` with UNIX_CONNS
+    /// released (`reserve_write` / `reserve_read`, lane ipcfast). While set,
+    /// `buf` must not be reallocated or freed, and nobody else may write /
+    /// read this direction; the copier clears it in its commit.
+    wbusy: bool,
+    rbusy: bool,
+}
+
+/// A span of a ring handed to a copier that runs without UNIX_CONNS: `n`
+/// bytes starting at `pos`, wrapping at `cap`. `buf` stays put while the
+/// matching busy flag is set (see `UnixRing::wbusy`).
+#[derive(Clone, Copy)]
+struct RingSpan { base: *mut u8, cap: usize, pos: usize, n: usize }
+
+impl RingSpan {
+    /// Copy user/kernel iovecs into the span (writer side). Returns the bytes
+    /// copied and whether a fault ended the copy early.
+    fn fill(&self, iovs: &[(usize, usize)]) -> (usize, bool) {
+        self.copy(iovs, true)
+    }
+
+    /// Copy the span out into iovecs (reader side).
+    fn drain(&self, iovs: &[(usize, usize)]) -> (usize, bool) {
+        self.copy(iovs, false)
+    }
+
+    fn copy(&self, iovs: &[(usize, usize)], into_ring: bool) -> (usize, bool) {
+        let mut done = 0usize;
+        for &(base, len) in iovs {
+            let mut off = 0usize;
+            while off < len && done < self.n {
+                let pos = (self.pos + done) % self.cap;
+                let chunk = (len - off).min(self.n - done).min(self.cap - pos);
+                let left = unsafe {
+                    if into_ring {
+                        sched::uaccess::copy_raw(self.base.add(pos), (base + off) as *const u8, chunk)
+                    } else {
+                        sched::uaccess::copy_raw((base + off) as *mut u8, self.base.add(pos), chunk)
+                    }
+                };
+                done += chunk - left;
+                off += chunk - left;
+                if left != 0 { return (done, true); }
+            }
+            if done >= self.n { break; }
+        }
+        (done, false)
+    }
 }
 
 /// What one queued AF_UNIX datagram costs beyond its payload when measured
@@ -417,7 +465,7 @@ const DGRAM_OVERHEAD: usize = 576;
 
 impl UnixRing {
     const fn new() -> Self {
-        Self { buf: alloc::vec::Vec::new(), rpos: 0, wpos: 0, count: 0, wtotal: 0, rtotal: 0, nrec: 0 }
+        Self { buf: alloc::vec::Vec::new(), rpos: 0, wpos: 0, count: 0, wtotal: 0, rtotal: 0, nrec: 0, wbusy: false, rbusy: false }
     }
 
     /// What the queued datagrams cost against SO_SNDBUF (see `DGRAM_OVERHEAD`).
@@ -431,7 +479,8 @@ impl UnixRing {
     /// copied are committed. `Err(EFAULT)` when a fault stopped the copy
     /// before its first byte.
     fn write(&mut self, data: *const u8, len: usize) -> Result<usize, i32> {
-        self.grow(len);
+        if self.wbusy { return Ok(0); }
+        if !self.rbusy { self.grow(len); }
         let cap = self.buf.len();
         let n = len.min(cap - self.count);
         let mut done = 0usize;
@@ -455,6 +504,7 @@ impl UnixRing {
     /// fault rules as [`write`](Self::write): only bytes that reached the
     /// caller are consumed, and `Err(EFAULT)` means none did.
     fn read(&mut self, data: *mut u8, len: usize) -> Result<usize, i32> {
+        if self.rbusy { return Ok(0); }
         let n = len.min(self.count);
         let cap = self.buf.len();
         let mut done = 0usize;
@@ -471,13 +521,59 @@ impl UnixRing {
         }
         self.count -= done;
         self.rtotal += done as u64;
-        // Drained: give a grown buffer back (the next write re-allocates).
-        if self.count == 0 && cap > RING_INIT {
+        self.shrink_if_drained();
+        if faulted && done == 0 { Err(-14) } else { Ok(done) }
+    }
+
+    /// Drained: give a grown buffer back (the next write re-allocates) —
+    /// unless a writer is copying into it right now.
+    fn shrink_if_drained(&mut self) {
+        if self.count == 0 && self.buf.len() > RING_INIT && !self.wbusy && !self.rbusy {
             self.buf = alloc::vec::Vec::new();
             self.rpos = 0;
             self.wpos = 0;
         }
-        if faulted && done == 0 { Err(-14) } else { Ok(done) }
+    }
+
+    /// Writer: claim room for up to `len` bytes to be copied with
+    /// UNIX_CONNS released. `None` while another writer holds this
+    /// direction; a span with `n == 0` when the ring is full.
+    fn reserve_write(&mut self, len: usize) -> Option<RingSpan> {
+        if self.wbusy { return None; }
+        if !self.rbusy { self.grow(len); }
+        let cap = self.buf.len();
+        let n = len.min(cap - self.count);
+        if n > 0 { self.wbusy = true; }
+        Some(RingSpan { base: self.buf.as_mut_ptr(), cap, pos: self.wpos, n })
+    }
+
+    /// Writer: publish `done` bytes of a span from `reserve_write`.
+    fn commit_write(&mut self, sp: &RingSpan, done: usize) {
+        if sp.n == 0 { return; }
+        self.wbusy = false;
+        self.wpos = (sp.pos + done) % sp.cap;
+        self.count += done;
+        self.wtotal += done as u64;
+        self.shrink_if_drained();
+    }
+
+    /// Reader: claim up to `len` queued bytes to be copied out with
+    /// UNIX_CONNS released. `None` while another reader holds this direction.
+    fn reserve_read(&mut self, len: usize) -> Option<RingSpan> {
+        if self.rbusy { return None; }
+        let n = len.min(self.count);
+        if n > 0 { self.rbusy = true; }
+        Some(RingSpan { base: self.buf.as_mut_ptr(), cap: self.buf.len(), pos: self.rpos, n })
+    }
+
+    /// Reader: consume `done` bytes of a span from `reserve_read`.
+    fn commit_read(&mut self, sp: &RingSpan, done: usize) {
+        if sp.n == 0 { return; }
+        self.rbusy = false;
+        self.rpos = (sp.pos + done) % sp.cap;
+        self.count -= done;
+        self.rtotal += done as u64;
+        self.shrink_if_drained();
     }
 
     /// Copy up to `len` queued bytes, starting `skip` bytes past the read
@@ -532,12 +628,17 @@ impl UnixRing {
         let new_cap = new_cap.min(RING_MAX);
         let mut nb: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         if nb.try_reserve_exact(new_cap).is_err() { return; }
-        nb.resize(new_cap, 0);
-        // Copy the queued bytes out in stream order.
+        // No zero-fill (it was a memset of up to RING_MAX per grow, and every
+        // drained ring re-grows): ring bytes are only ever read after a write
+        // put them there. Copy the queued bytes out in stream order.
         let first = self.count.min(cap.saturating_sub(self.rpos));
-        if first > 0 { nb[..first].copy_from_slice(&self.buf[self.rpos..self.rpos + first]); }
         let rest = self.count - first;
-        if rest > 0 { nb[first..self.count].copy_from_slice(&self.buf[..rest]); }
+        unsafe {
+            let dst = nb.as_mut_ptr();
+            if first > 0 { core::ptr::copy_nonoverlapping(self.buf.as_ptr().add(self.rpos), dst, first); }
+            if rest > 0 { core::ptr::copy_nonoverlapping(self.buf.as_ptr(), dst.add(first), rest); }
+            nb.set_len(new_cap);
+        }
         self.buf = nb;
         self.rpos = 0;
         self.wpos = self.count % new_cap;
@@ -760,6 +861,12 @@ struct UnixConn {
 }
 
 impl UnixConn {
+    /// A copier is inside one of the rings with UNIX_CONNS released: the
+    /// slot must not be reset or reused until it commits.
+    fn copying(&self) -> bool {
+        self.ring_ab.wbusy || self.ring_ab.rbusy || self.ring_ba.wbusy || self.ring_ba.rbusy
+    }
+
     const fn new() -> Self {
         Self {
             in_use: false,
@@ -865,13 +972,14 @@ impl UnixConn {
     }
 }
 
-static UNIX_CONNS: Mutex<alloc::vec::Vec<UnixConn>> = Mutex::new(alloc::vec::Vec::new());
+static UNIX_CONNS: sched::lockwatch::TrackedMutex<alloc::vec::Vec<UnixConn>> =
+    sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_UNIX_CONNS, alloc::vec::Vec::new());
 
 /// A free connection slot, growing the pool when every slot is in use.
 /// `None` once `MAX_CONNS` slots exist and all are in use (or the heap is
 /// out of memory).
 fn unix_conn_slot(conns: &mut alloc::vec::Vec<UnixConn>) -> Option<usize> {
-    if let Some(i) = conns.iter().position(|c| !c.in_use) { return Some(i); }
+    if let Some(i) = conns.iter().position(|c| !c.in_use && !c.copying()) { return Some(i); }
     if conns.len() >= MAX_CONNS { return None; }
     let want = (conns.len().max(32)).min(MAX_CONNS - conns.len());
     if conns.try_reserve(want).is_err() { return None; }
@@ -1088,7 +1196,8 @@ impl ::core::ops::IndexMut<usize> for SockTables {
     fn index_mut(&mut self, i: usize) -> &mut ProcSockTable { &mut self.slots[i] }
 }
 
-static SOCK_TABLES: Mutex<SockTables> = Mutex::new(SockTables::new());
+static SOCK_TABLES: sched::lockwatch::TrackedRwLock<SockTables> =
+    sched::lockwatch::TrackedRwLock::new(sched::lockwatch::L_SOCK_TABLES, SockTables::new());
 
 // ── Per-description socket options ──────────────────────────────────────────
 
@@ -1266,7 +1375,7 @@ fn get_or_create<'a>(pid: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcS
 /// Every open socket fd of `pid`'s process (close_range).
 pub fn open_fds(pid: u32) -> alloc::vec::Vec<usize> {
     let pid = sched::tgid_of(pid);
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     match tbls.iter().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t.socks.iter().enumerate().filter(|(_, e)| e.in_use).map(|(i, _)| i + SOCK_FD_BASE).collect(),
         None => alloc::vec::Vec::new(),
@@ -1278,7 +1387,7 @@ pub fn open_fds(pid: u32) -> alloc::vec::Vec<usize> {
 pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
     let pid = sched::tgid_of(pid);
     let slot = fd_to_slot(fd)?;
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
     if slot < t.socks.len() && t.socks[slot].in_use { Some(t.socks[slot].ofd) } else { None }
 }
@@ -1306,7 +1415,7 @@ pub fn inflight_vfs(id: u32) -> Option<vfs::TransferFd> {
 pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
     if id == 0 { return None; }
     let pid = sched::tgid_of(pid);
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     let find = |t: &ProcSockTable| t.socks.iter().position(|e| e.in_use && e.ofd == id)
         .map(|s| (t.pid, s + SOCK_FD_BASE));
     if let Some(r) = tbls.iter().find(|t| t.in_use && t.pid == pid).and_then(find) { return Some(r); }
@@ -1794,7 +1903,7 @@ pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<sched::PollTag> {
 /// the lock released before the caller touches any stack.
 fn inet_sock_info(pid: u32, fd: usize) -> Option<(SockState, u8, u16)> {
     let slot = fd_to_slot(fd)?;
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
     Some((tbl.socks[slot].state, tbl.socks[slot].sock_type, tbl.socks[slot].bound_port))
@@ -1875,7 +1984,8 @@ fn unix_listener_gone(sock_id: u64) {
             c.closed_b = true;
             c.refs_b = 0;
             c.reset_a = true;
-            c.ring_ab = UnixRing::new();
+            // Never under a copier working with UNIX_CONNS released.
+            if !c.ring_ab.wbusy && !c.ring_ab.rbusy { c.ring_ab = UnixRing::new(); }
             for b in c.fdq_ab.drain(..) { orphans.extend(b.fds); }
             c.seq = c.seq.wrapping_add(1);
         }
@@ -1919,7 +2029,7 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
         return vfs::export_fd(pid, fd).map(XferFd::Vfs);
     };
     let entry = {
-        let tbls = SOCK_TABLES.lock();
+        let tbls = SOCK_TABLES.read();
         let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
         let e = tbl.socks[slot];
@@ -3999,7 +4109,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
 
     let (state, _bound_port, sock_type, listen_ofd) = {
-        let tbls = SOCK_TABLES.lock();
+        let tbls = SOCK_TABLES.read();
         let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
             Some(t) => t, None => return err_reply(-9),
         };
@@ -4487,7 +4597,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         // the socket state so every later send/recv/poll/close looks in the
         // same socket set: an established flow stays on its interface.
         let (bound_addr, dgram_ofd) = {
-            let tbls = SOCK_TABLES.lock();
+            let tbls = SOCK_TABLES.read();
             let e = tbls.iter().find(|t| t.in_use && t.pid == pid)
                 .and_then(|t| t.socks.get(slot).filter(|e| e.in_use).copied());
             (e.and_then(|e| match e.state {
@@ -4832,8 +4942,10 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                  kdata: Option<alloc::vec::Vec<u8>>) -> Message {
     let len = match kdata { Some(ref d) => d.len(), None => len };
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
-    let mut tbls = SOCK_TABLES.lock();
-    let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
+    // Shared: a send only reads the table (lane ipcfast: the write lock here
+    // serialized every send in the system and stalled all readers).
+    let tbls = SOCK_TABLES.read();
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t, None => return err_reply(-9),
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
@@ -4869,11 +4981,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             // `queued`: something reached the peer (a zero-length datagram
             // is a record too, and must wake its reader).
             let (r, queued) = if sock_type == SOCK_STREAM as u8 {
-                let r = if is_a {
-                    conn.ring_ab.write(buf_ptr as *const u8, len)
-                } else {
-                    conn.ring_ba.write(buf_ptr as *const u8, len)
-                };
+                let r = unix_stream_write(&mut conns, conn_idx, is_a, buf_ptr, len);
                 (r, matches!(r, Ok(n) if n > 0))
             } else {
                 let ring = if is_a { &mut conn.ring_ab } else { &mut conn.ring_ba };
@@ -4885,6 +4993,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                 }
             };
             let n = match r { Ok(n) => n, Err(e) => return err_reply(e) }; // EFAULT, EMSGSIZE
+            let conn = &mut conns[conn_idx];
             // New readable edge for the peer end.
             if queued { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns); // release UNIX_CONNS before waking pollers (K2 lock order)
@@ -4916,10 +5025,11 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             // Pre-accept the connector is end A, so its own half-close counts
             // here too (accept preserves conn_idx, so the flag carries over).
             if conn.wr_shut(true) { return err_reply(-32); } // EPIPE
-            let n = match conn.ring_ab.write(buf_ptr as *const u8, len) {
+            let n = match unix_stream_write(&mut conns, conn_idx, true, buf_ptr, len) {
                 Ok(n) => n,
-                Err(e) => return err_reply(e), // EFAULT
+                Err(e) => return err_reply(e), // EFAULT, EPIPE
             };
+            let conn = &mut conns[conn_idx];
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns);
             if n > 0 { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
@@ -5228,9 +5338,21 @@ struct StreamRead {
 ///     (unix_peek_fds) and stay queued. Without `want_fds`, nothing is
 ///     touched.
 /// The caller holds UNIX_CONNS and has checked that the connection is in use.
-fn unix_stream_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
+/// A non-peek read copies out with UNIX_CONNS released (lane ipcfast:
+/// reserve_read / commit_read); `conns` is re-taken before returning.
+fn unix_stream_read_locked(conns: &mut sched::lockwatch::TrackedGuard<'static, alloc::vec::Vec<UnixConn>>,
+                           conn_idx: usize, is_a: bool,
                            iovs: &[(usize, usize)], peek: bool, want_fds: bool) -> StreamRead {
     let mut out = StreamRead { nread: 0, fault: false, fds: None, discard: alloc::vec::Vec::new() };
+    // Another reader of this direction is mid-copy: wait for its commit (it
+    // moves rtotal and may consume the fd batch the limit below depends on).
+    loop {
+        let c = &conns[conn_idx];
+        let busy = if is_a { c.ring_ba.rbusy } else { c.ring_ab.rbusy };
+        if !busy { break; }
+        conns.unlocked(|| sched::yield_now("unix-rd"));
+        if !conns[conn_idx].in_use { return out; }
+    }
     let c = &mut conns[conn_idx];
     let rstart = if is_a { c.ring_ba.rtotal } else { c.ring_ab.rtotal };
     // A batch whose first byte is already consumed has no reader. The rule
@@ -5247,21 +5369,41 @@ fn unix_stream_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
         None => usize::MAX,
     };
     let ring = if is_a { &mut c.ring_ba } else { &mut c.ring_ab };
-    for &(base, len) in iovs.iter() {
-        if out.nread >= limit { break; }
-        let want = len.min(limit - out.nread);
-        if want == 0 { continue; }
-        let r = if peek {
-            ring.peek(out.nread, base as *mut u8, want)
-        } else {
-            ring.read(base as *mut u8, want)
-        };
-        match r {
-            Ok(n) => { out.nread += n; if n < want { break; } }
-            Err(_) => { out.fault = true; break; }
+    if peek {
+        for &(base, len) in iovs.iter() {
+            if out.nread >= limit { break; }
+            let want = len.min(limit - out.nread);
+            if want == 0 { continue; }
+            match ring.peek(out.nread, base as *mut u8, want) {
+                Ok(n) => { out.nread += n; if n < want { break; } }
+                Err(_) => { out.fault = true; break; }
+            }
         }
+    } else if iovs.iter().fold(0usize, |a, &(_, l)| a.saturating_add(l)).min(limit) < UNIX_UNLOCKED_COPY_MIN {
+        // Small read: the copy is cheaper than releasing and re-taking the lock.
+        for &(base, len) in iovs.iter() {
+            if out.nread >= limit { break; }
+            let want = len.min(limit - out.nread);
+            if want == 0 { continue; }
+            match ring.read(base as *mut u8, want) {
+                Ok(n) => { out.nread += n; if n < want { break; } }
+                Err(_) => { out.fault = true; break; }
+            }
+        }
+    } else {
+        let want = iovs.iter().fold(0usize, |a, &(_, l)| a.saturating_add(l)).min(limit);
+        // rbusy was clear above and the lock is still held: this succeeds.
+        let sp = match ring.reserve_read(want) { Some(sp) => sp, None => return out };
+        if sp.n == 0 { return out; }
+        let (done, fault) = conns.unlocked(|| sp.drain(iovs));
+        let c = &mut conns[conn_idx];
+        let ring = if is_a { &mut c.ring_ba } else { &mut c.ring_ab };
+        ring.commit_read(&sp, done);
+        out.nread = done;
+        out.fault = fault;
     }
     if out.nread == 0 { return out; }
+    let c = &mut conns[conn_idx];
     let touched = c.rx_fdq(is_a).first().map_or(false, |b| b.seq_byte < rstart + out.nread as u64);
     if !touched { return out; }
     if peek {
@@ -5269,7 +5411,7 @@ fn unix_stream_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
             let batch = c.rx_fdq(is_a)[0].fds.clone();
             let mut clones = alloc::vec::Vec::with_capacity(batch.len());
             for x in batch.iter() {
-                if let Some(y) = xfer_clone_locked(conns, x) { clones.push(y); }
+                if let Some(y) = xfer_clone_locked(&mut conns[..], x) { clones.push(y); }
             }
             out.fds = Some(clones);
         }
@@ -5278,6 +5420,42 @@ fn unix_stream_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
         if want_fds { out.fds = Some(fds); } else { out.discard.extend(fds); }
     }
     out
+}
+
+/// Copies at least this long move between a unix stream ring and the caller
+/// with UNIX_CONNS released (reserve / copy / commit); shorter ones are
+/// cheaper done under the lock than releasing and re-taking it.
+const UNIX_UNLOCKED_COPY_MIN: usize = 1024;
+
+/// Stream write of `len` bytes at `src` (user or kernel memory) into end
+/// `is_a`'s outgoing ring. The caller holds UNIX_CONNS and has done the
+/// EPIPE checks; a long copy runs with the lock released (lane ipcfast).
+/// Returns the bytes queued (0: ring full), EPIPE if the connection went
+/// away while waiting for another writer, EFAULT if nothing could be read.
+fn unix_stream_write(conns: &mut sched::lockwatch::TrackedGuard<'static, alloc::vec::Vec<UnixConn>>,
+                     conn_idx: usize, is_a: bool, src: usize, len: usize) -> Result<usize, i32> {
+    loop {
+        let c = &conns[conn_idx];
+        let busy = if is_a { c.ring_ab.wbusy } else { c.ring_ba.wbusy };
+        if !busy { break; }
+        conns.unlocked(|| sched::yield_now("unix-wr"));
+        let c = &conns[conn_idx];
+        if !c.in_use || (if is_a { c.closed_b } else { c.closed_a })
+            || c.wr_shut(is_a) || c.rd_shut(!is_a) {
+            return Err(-32); // EPIPE
+        }
+    }
+    let c = &mut conns[conn_idx];
+    let ring = if is_a { &mut c.ring_ab } else { &mut c.ring_ba };
+    if len < UNIX_UNLOCKED_COPY_MIN { return ring.write(src as *const u8, len); }
+    let sp = match ring.reserve_write(len) { Some(sp) => sp, None => return Ok(0) };
+    if sp.n == 0 { return Ok(0); }
+    let (done, fault) = conns.unlocked(|| sp.fill(&[(src, len)]));
+    let c = &mut conns[conn_idx];
+    let ring = if is_a { &mut c.ring_ab } else { &mut c.ring_ba };
+    ring.commit_write(&sp, done);
+    if done == 0 && fault { return Err(-14); } // EFAULT
+    Ok(done)
 }
 
 /// What one AF_UNIX datagram/seqpacket read took (see `unix_dgram_read_locked`).
@@ -5316,7 +5494,7 @@ fn unix_dgram_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
             let batch = c.rx_fdq(is_a)[0].fds.clone();
             let mut clones = alloc::vec::Vec::with_capacity(batch.len());
             for x in batch.iter() {
-                if let Some(y) = xfer_clone_locked(conns, x) { clones.push(y); }
+                if let Some(y) = xfer_clone_locked(&mut conns[..], x) { clones.push(y); }
             }
             out.fds = Some(clones);
         }
@@ -5331,7 +5509,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                flags: usize) -> Message {
     let peek = flags & MSG_PEEK != 0;
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t, None => return err_reply(-9),
     };
@@ -5532,7 +5710,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
 /// A connected AF_UNIX datagram or seqpacket socket of this process.
 fn unix_dgram_connected(pid: u32, fd: usize) -> bool {
     let Some(slot) = fd_to_slot(fd) else { return false };
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     tbls.iter().find(|t| t.in_use && t.pid == pid).map_or(false, |t| {
         slot < t.socks.len() && t.socks[slot].in_use
             && t.socks[slot].sock_type != SOCK_STREAM as u8
@@ -5550,7 +5728,7 @@ fn unix_conn_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
 
 fn unix_stream_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
     let slot = fd_to_slot(fd)?;
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
     if tbl.socks[slot].sock_type != SOCK_STREAM as u8 { return None; }
@@ -5853,19 +6031,33 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
         for tf in batch { xfer_drop(tf); }
         return err_reply(ETOOMANYREFS);
     }
+    // Reserve ring space, copy from the caller with UNIX_CONNS released
+    // (lane ipcfast: a 64 KiB copy held the lock every unix socket in the
+    // system needs for ~20 µs), then commit. Another writer on this
+    // direction mid-copy: wait for its commit with the lock released.
+    let sp = loop {
+        let conn = &mut conns[conn_idx];
+        let ring = if is_a { &mut conn.ring_ab } else { &mut conn.ring_ba };
+        if let Some(sp) = ring.reserve_write(requested) { break sp; }
+        conns.unlocked(|| sched::yield_now("unix-wr"));
+        let conn = &conns[conn_idx];
+        if !conn.in_use || (if is_a { conn.closed_b } else { conn.closed_a })
+            || conn.wr_shut(is_a) || conn.rd_shut(!is_a) {
+            drop(conns);
+            for tf in batch { xfer_drop(tf); }
+            return err_reply(-32); // EPIPE
+        }
+    };
+    let (total, fault) = if sp.n == 0 { (0, false) } else { conns.unlocked(|| sp.fill(&iovs[..n_iov])) };
+    let conn = &mut conns[conn_idx];
     let seq = if is_a { conn.ring_ab.wtotal } else { conn.ring_ba.wtotal };
-    let mut total = 0usize;
-    let mut fault = false;
-    for i in 0..n_iov {
-        let (base, len) = iovs[i];
-        let r = if is_a {
-            conn.ring_ab.write(base as *const u8, len)
-        } else {
-            conn.ring_ba.write(base as *const u8, len)
-        };
-        let n = match r { Ok(n) => n, Err(_) => { fault = true; break; } };
-        total += n;
-        if n < len { break; } // ring full (or a fault mid-buffer) → partial write
+    if is_a { conn.ring_ab.commit_write(&sp, total) } else { conn.ring_ba.commit_write(&sp, total) }
+    // The peer went away during the copy: the bytes are lost with it, and so
+    // must the fds be (pushing them would pin them in a dead queue).
+    if total > 0 && (!conn.in_use || (if is_a { conn.closed_b } else { conn.closed_a })) {
+        drop(conns);
+        for tf in batch { xfer_drop(tf); }
+        return val_reply(total as u64);
     }
     if total == 0 && fault {
         drop(conns);
@@ -5907,7 +6099,7 @@ const MSG_TRUNC: i32 = 0x20;
 /// datagram over all the iovecs, with its address in msg_name.
 fn inet_dgram(pid: u32, fd: usize) -> bool {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return false };
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     match tbls.iter().find(|t| t.in_use && t.pid == pid) {
         Some(t) if slot < t.socks.len() && t.socks[slot].in_use =>
             matches!(t.socks[slot].state, SockState::IcmpUnbound | SockState::IcmpBound { .. })
@@ -6386,7 +6578,7 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
     // State is copied out and every table lock released before UNIX_CONNS or a
     // stack lock is taken (K2 lock order), exactly as handle_recv does.
     let (state, sock_type, ofd) = {
-        let tbls = SOCK_TABLES.lock();
+        let tbls = SOCK_TABLES.read();
         let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
             Some(t) => t, None => return err_reply(-9),
         };
@@ -6580,7 +6772,7 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         let val: Option<i32> = if optlen < 4 { None } else { sched::uaccess::read_user::<i32>(optval_ptr) };
         let Some(v) = val else { return err_reply(if optlen < 4 { -22 } else { -14 }) };
         let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
-        let tbls = SOCK_TABLES.lock();
+        let tbls = SOCK_TABLES.read();
         let Some(e) = tbls.iter().find(|t| t.in_use && t.pid == pid)
             .and_then(|t| t.socks.get(slot).copied()).filter(|e| e.in_use) else { return err_reply(-9) };
         drop(tbls);
@@ -6701,7 +6893,7 @@ pub fn sock_timeo(pid: u32, fd: usize, send: bool) -> u64 {
 /// A copy of the table entry of `fd` (in use), if any.
 fn sock_entry(pid: u32, fd: usize) -> Option<SockEntry> {
     let slot = fd_to_slot(fd)?;
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     tbls.iter().find(|t| t.in_use && t.pid == pid)
         .and_then(|t| t.socks.get(slot).copied()).filter(|e| e.in_use)
 }
@@ -6897,7 +7089,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         const SO_DOMAIN: usize = 39;
         const SO_REUSEADDR: usize = 2;
         let entry = fd_to_slot(fd).and_then(|slot| {
-            let tbls = SOCK_TABLES.lock();
+            let tbls = SOCK_TABLES.read();
             let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
             if slot < t.socks.len() && t.socks[slot].in_use { Some(t.socks[slot]) } else { None }
         });
@@ -7118,7 +7310,7 @@ fn handle_exec_cloexec(pid: u32) -> Message {
     let mut slot = 0usize;
     loop {
         let is_cloexec = {
-            let tbls = SOCK_TABLES.lock();
+            let tbls = SOCK_TABLES.read();
             match tbls.iter().find(|t| t.in_use && t.pid == pid) {
                 Some(t) if slot < t.socks.len() => t.socks[slot].in_use && t.socks[slot].cloexec,
                 _ => return ok_reply(),
@@ -7158,7 +7350,7 @@ fn handle_setfl(pid: u32, sockfd: usize, flags: u32) -> Message {
 /// file descriptor") and Firefox exited with "we don't have any display".
 fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     let state = tbl.socks[slot].state;
@@ -7214,7 +7406,7 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
 
 fn handle_getfl(pid: u32, sockfd: usize) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     val_reply(if tbl.socks[slot].nonblock { 0x800 } else { 0 })
@@ -7240,7 +7432,7 @@ fn handle_setfd(pid: u32, sockfd: usize, arg: u32) -> Message {
 fn handle_getfd(pid: u32, sockfd: usize) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let cloexec = {
-        let tbls = SOCK_TABLES.lock();
+        let tbls = SOCK_TABLES.read();
         match tbls.iter().find(|t| t.in_use && t.pid == pid) {
             Some(t) if slot < t.socks.len() && t.socks[slot].in_use => Some(t.socks[slot].cloexec),
             _ => None,
@@ -7332,7 +7524,7 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
 pub fn sock_is_hidden(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid);
     let Some(slot) = fd_to_slot(fd) else { return false };
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     tbls.iter().find(|t| t.in_use && t.pid == pid)
         .map_or(false, |t| slot < t.socks.len() && t.socks[slot].in_use && t.is_hidden(slot))
 }
@@ -7342,7 +7534,7 @@ pub fn sock_is_hidden(pid: u32, fd: usize) -> bool {
 /// Descriptor numbers of every open socket of `pid`'s process.
 pub fn open_sock_fds(pid: u32) -> alloc::vec::Vec<usize> {
     let pid = sched::tgid_of(pid);
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     match tbls.iter().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t.socks.iter().enumerate().filter(|(_, e)| e.in_use).map(|(i, _)| SOCK_FD_BASE + i).collect(),
         None => alloc::vec::Vec::new(),
@@ -7352,7 +7544,7 @@ pub fn open_sock_fds(pid: u32) -> alloc::vec::Vec<usize> {
 pub fn sock_is_open(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid);
     let Some(slot) = fd_to_slot(fd) else { return false };
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     tbls.iter().find(|t| t.in_use && t.pid == pid)
         .map_or(false, |t| slot < t.socks.len() && t.socks[slot].in_use)
 }
@@ -7530,7 +7722,7 @@ fn unix_end_keys(conn_idx: usize, is_a: bool, requested: u32) -> sched::PollTag 
 /// or reused; see `vfs::ofd`).
 fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
-    let tbls = SOCK_TABLES.lock();
+    let tbls = SOCK_TABLES.read();
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t, None => return err_reply(-9),
     };

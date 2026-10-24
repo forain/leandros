@@ -7130,8 +7130,7 @@ fn sys_write_impl(fd: usize, buf_ptr: usize, count: usize, append_held: bool) ->
         f if is_sock_handle(f) => {
             let msg = make_vfs_msg(net_server::NET_SEND,
                 &[fd as u64, buf_ptr as u64, count as u64, 0, 0, 0]);
-            let nonblock = net_fd_nonblock(pid, fd);
-            net_block_timeo(pid, fd, nonblock, true,
+            net_block_lazy(pid, fd, false, true,
                 || net_reply_val(&net_server::handle(&msg, pid)))
         }
 
@@ -7336,8 +7335,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
             let pid = current_pid();
             let msg = make_vfs_msg(net_server::NET_RECV,
                 &[fd as u64, buf_ptr as u64, count as u64, 0, 0, 0]);
-            let nonblock = net_fd_nonblock(pid, fd);
-            net_block_timeo(pid, fd, nonblock, false,
+            net_block_lazy(pid, fd, false, false,
                 || net_reply_val(&net_server::handle(&msg, pid)))
         }
         _ => {
@@ -11820,8 +11818,7 @@ fn sys_accept(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize, flags: usize) 
         &[sockfd as u64, addr_ptr as u64, addrlen_ptr as u64, flags as u64]);
     // A blocking listener waits for a connection (bounded by SO_RCVTIMEO);
     // it used to answer EAGAIN at once, like a non-blocking one.
-    let nonblock = net_fd_nonblock(pid, sockfd);
-    let r = net_block_timeo(pid, sockfd, nonblock, false,
+    let r = net_block_lazy(pid, sockfd, false, false,
         || net_reply_val(&net_server::handle(&msg, pid)));
     if r < 0 { return r; }
     let r = publish_handle(pid, r as usize, 0);
@@ -11985,8 +11982,18 @@ fn net_block_timeo(pid: u32, fd: usize, nonblock: bool, send: bool, mut op: impl
 /// MSG_DONTWAIT in `flags` — returns it straight through.
 fn net_blocking_op(pid: u32, sockfd: usize, flags: usize, send: bool, msg: &Message) -> isize {
     const MSG_DONTWAIT: usize = 0x40;
-    let nonblock = flags & MSG_DONTWAIT != 0 || net_fd_nonblock(pid, sockfd);
-    net_block_timeo(pid, sockfd, nonblock, send, || net_reply_val(&net_server::handle(msg, pid)))
+    net_block_lazy(pid, sockfd, flags & MSG_DONTWAIT != 0, send, || net_reply_val(&net_server::handle(msg, pid)))
+}
+
+/// `net_block_timeo` that asks for the fd's O_NONBLOCK (a whole NET_GETFL
+/// round through the net server, SOCK_TABLES included) only when the first
+/// attempt would block: an op that completes at once never needs it (lane
+/// ipcfast: one GETFL per send/recv was a third of a 64 B round trip's
+/// lock traffic). `dontwait`: MSG_DONTWAIT or the like, known up front.
+fn net_block_lazy(pid: u32, fd: usize, dontwait: bool, send: bool, mut op: impl FnMut() -> isize) -> isize {
+    let n = op();
+    if n != -11 || dontwait || net_fd_nonblock(pid, fd) { return n; }
+    net_block_timeo(pid, fd, false, send, op)
 }
 
 /// M4/M5 unix-socket exchange trace. Prints one line per connect/accept and
