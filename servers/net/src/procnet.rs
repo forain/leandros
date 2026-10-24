@@ -145,6 +145,10 @@ fn nic(w: &mut Out) {
     let _ = writeln!(w, "tcp_recovery: fast_retransmit {} rto {} partial_ack {} dup_acks {}",
                      r[0].load(Ordering::Relaxed), r[1].load(Ordering::Relaxed),
                      r[2].load(Ordering::Relaxed), r[3].load(Ordering::Relaxed));
+    let x = &smoltcp::socket::tcp::RX_STATS;
+    let _ = writeln!(w, "tcp_rx: in_order {} out_of_order {} too_many_holes {} out_of_window {}",
+                     x[0].load(Ordering::Relaxed), x[1].load(Ordering::Relaxed),
+                     x[2].load(Ordering::Relaxed), x[3].load(Ordering::Relaxed));
     let n = &smoltcp::iface::NEIGHBOR_STATS;
     let _ = writeln!(w, "neighbor: unresolved {} stale_sends {} refresh_requests {} refreshed_by_traffic {}",
                      n[0].load(Ordering::Relaxed), n[1].load(Ordering::Relaxed),

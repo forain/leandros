@@ -13,6 +13,11 @@ use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 /// retransmits, duplicate ACKs received.
 pub static RECOVERY_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 fn stat(i: usize) { RECOVERY_STATS[i].fetch_add(1, AtomicOrdering::Relaxed); }
+/// LEANDROS: receive-side counters: in-order data segments, out-of-order
+/// segments kept, segments dropped for too many holes, data segments outside
+/// the window (already received: retransmissions).
+pub static RX_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+fn rx_stat(i: usize) { RX_STATS[i].fetch_add(1, AtomicOrdering::Relaxed); }
 
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
@@ -1400,6 +1405,22 @@ impl<'a> Socket<'a> {
                     .map(|(left, right)| (left as u32, right as u32))
                     .next();
             }
+
+            // LEANDROS: fill the other two blocks with the next-lowest ranges
+            // (RFC 2018 says SHOULD report as many as fit), so a sender with
+            // many holes learns about them several per ACK, not one.
+            let first = reply_repr.sack_ranges[0];
+            let mut k = 1;
+            for r in self
+                .assembler
+                .iter_data(reply_repr.ack_number.map(|s| s.0 as usize).unwrap_or(0))
+                .map(|(left, right)| (left as u32, right as u32))
+            {
+                if k == reply_repr.sack_ranges.len() { break; }
+                if Some(r) == first { continue; }
+                reply_repr.sack_ranges[k] = Some(r);
+                k += 1;
+            }
         }
 
         // Since the sACK option may have changed the length of the payload, update that.
@@ -1643,6 +1664,7 @@ impl<'a> Socket<'a> {
                                 window_start,
                                 window_end
                             );
+                            rx_stat(3);
                             false
                         }
                     }
@@ -1793,6 +1815,12 @@ impl<'a> Socket<'a> {
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no + 1;
                 self.remote_last_ack = Some(repr.seq_number);
+                // LEANDROS: record SACK-permitted on the active open too. Only
+                // the passive open (Listen) did, so every outbound connection
+                // offered sackOK in its SYN and then never sent a SACK block:
+                // a sender facing a burst of losses could repair one hole per
+                // RTO (lane shapedl: 0.6 Mbit/s on a 20 Mbit/s lossy link).
+                self.remote_has_sack = repr.sack_permitted;
                 self.remote_win_scale = repr.window_scale;
                 // Remote doesn't support window scaling, don't do it.
                 if self.remote_win_scale.is_none() {
@@ -2027,7 +2055,11 @@ impl<'a> Socket<'a> {
                 payload_len,
                 payload_offset
             );
-            return None;
+            rx_stat(2);
+            // LEANDROS: still ACK it (RFC 5681 4.2: an out-of-order segment
+            // gets an immediate duplicate ACK), so the sender keeps counting
+            // duplicates and keeps its SACK scoreboard moving.
+            return Some(self.ack_reply(ip_repr, repr));
         };
 
         // Place payload octets into the buffer.
@@ -2085,6 +2117,7 @@ impl<'a> Socket<'a> {
         // Per RFC 5681, we should send an immediate ACK when either:
         //  1) an out-of-order segment is received, or
         //  2) a segment arrives that fills in all or part of a gap in sequence space.
+        rx_stat(if self.assembler.is_empty() { 0 } else { 1 });
         if !self.assembler.is_empty() || !assembler_was_empty {
             // Note that we change the transmitter state here.
             // This is fine because smoltcp assumes that it can always transmit zero or one
