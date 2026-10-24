@@ -47,11 +47,16 @@ pub fn prepare() {
 /// After enumeration: advertise the mouse's buttons and wheel on the pointer
 /// node, size the motion scale, and start polling.
 pub fn init() {
-    if !usb::hid::present() { return; }
+    let present = usb::hid::present();
+    // A controller with nothing plugged in at boot is still polled: its
+    // first keyboard or mouse arrives by hot-plug (lane udevhot2).
+    if !present && usb::controller_count() == 0 { return; }
     crate::rel_pointer::init_scale();
-    // REL_WHEEL, and BTN_LEFT..BTN_EXTRA (0x110..0x114, bits 0..4 of the
-    // 0x110 bitmap byte) — merged with whatever virtio-tablet reported.
-    crate::rel_pointer::advertise(0x1F, false, false);
+    if present {
+        // REL_WHEEL, and BTN_LEFT..BTN_EXTRA (0x110..0x114, bits 0..4 of the
+        // 0x110 bitmap byte) — merged with whatever virtio-tablet reported.
+        crate::rel_pointer::advertise(0x1F, false, false);
+    }
     ACTIVE.store(true, Ordering::Release);
 }
 

@@ -47,9 +47,9 @@ def serial_log(run_id):
     return log
 
 
-def boot(arch, env):
+def boot(arch, env, *extra):
     drv("stop", timeout=60)
-    rc, out = drv("start", arch, timeout=300, env=env)
+    rc, out = drv("start", arch, *extra, timeout=300, env=env)
     if rc != 0:
         print("FAIL: boot\n" + out[-800:]); return False
     rc, out = drv("login", "root", "root", "240", timeout=400, env=env)
@@ -322,7 +322,7 @@ def phase_hub(arch, run_id, env):
     return ok
 
 
-def key_events(run_id, dev, node="all", secs=1.5, inject=True):
+def key_events(run_id, dev, node="all", secs=1.5, inject=True, route=False):
     """Inject key 'a' down/up (no "device": QEMU routes to the newest keyboard handler; `dev` is informational) while a cat in the guest
     records `node` ("all": every /dev/input/eventN -- a USB keyboard with its own node
     reaches userspace only there, event0 then feeds just the kernel console); returns the
@@ -334,8 +334,12 @@ def key_events(run_id, dev, node="all", secs=1.5, inject=True):
         sh(f"sh -c 'cat {n} > /tmp/ev{i}.out 2>/dev/null & echo $! > /tmp/ev{i}.pid' </dev/null >/dev/null 2>&1; true", 20)
     time.sleep(0.5)
     ev = lambda d: {"type": "key", "data": {"down": d, "key": {"type": "qcode", "data": "a"}}}
-    reps, _ = qmp_multi([("input-send-event", {"events": [ev(True)]}),
-                         ("input-send-event", {"events": [ev(False)]})] if inject else [("query-status", {})], run_id)
+    # route=<display id>: send to the console of that display device; a
+    # keyboard added with "display": <id> is bound to it (unaddressed events
+    # go to virtio-keyboard, not a hot-added usb-kbd).
+    tgt = {"device": route} if route else {}
+    reps, _ = qmp_multi([("input-send-event", {**tgt, "events": [ev(True)]}),
+                         ("input-send-event", {**tgt, "events": [ev(False)]})] if inject else [("query-status", {})], run_id)
     if any("error" in r for r in reps): print(f"  input-send-event {dev} error: {reps}"); return -1
     time.sleep(secs)
     out = sh("kill $(cat /tmp/ev*.pid) 2>/dev/null; cat /tmp/ev*.out | wc -c", 20)
@@ -466,6 +470,59 @@ def phase_hid(arch, run_id, env):
     return ok
 
 
+def phase_emptyhot(arch, run_id, env):
+    """An xHCI with nothing plugged in at boot still sees its first hot-added
+    keyboard and stick (lane udevhot2: the hot-plug scan and the HID poll used
+    to start only when a device was present at probe)."""
+    ok = True
+    ia = os.path.join(REPO, f"usbunplug-e-{run_id}.img")
+    ha = make_img(ia)
+    env = dict(env)
+    env["LEANDROS_QEMU_EXTRA"] = "-device qemu-xhci,id=xhs"
+    # virgl: its GPU has the id the hot-added keyboard binds to, so the
+    # injected keys reach it and not virtio-keyboard.
+    try:
+        if not boot(arch, env, "--virgl"): return False
+        s0 = set(sh("ls /dev/input", 20).split())
+        rc, o = drv("qmp", "device_add", json.dumps({"driver": "usb-kbd", "bus": "xhs.0", "id": "kbde", "display": "virglgpu"}), timeout=60)
+        print(f"device_add usb-kbd rc={rc} {o.strip()[-100:]}")
+        rc1, _ = drv("qmp", "blockdev-add", json.dumps({"driver": "raw", "node-name": "ste",
+                     "file": {"driver": "file", "filename": ia}}), timeout=60)
+        rc2, o2 = drv("qmp", "device_add", json.dumps({"driver": "usb-storage", "bus": "xhs.0",
+                     "drive": "ste", "id": "usbe"}), timeout=60)
+        print(f"blockdev-add rc={rc1} device_add usb-storage rc={rc2} {o2.strip()[-100:]}")
+        t0, node, disk = time.time(), None, None
+        while time.time() - t0 < REPLUG_S and not (node and disk):
+            time.sleep(1)
+            if not node:
+                cur = [x for x in sh("ls /dev/input", 20).split() if re.fullmatch(r"event\d+", x) and x not in s0]
+                if cur: node = "/dev/input/" + sorted(cur)[0]
+            if not disk:
+                disk = next((n for n, x in node_hashes().items() if x == ha), None)
+        print(f"after {time.time() - t0:.1f} s: keyboard node={node} stick={disk}")
+        if node:
+            info = sh(f"evtest2 info {node}", 20)
+            print(f"  {info.strip()[-120:]}")
+            if "USB Keyboard" in info: print("PASS: (emptyhot) hot-added keyboard has its node")
+            else: ok = False; print(f"FAIL: (emptyhot) {node} is not the USB keyboard")
+            n = key_events(run_id, "kbde", node, route="virglgpu")
+            print(f"  keys on {node}: {n} bytes")
+            if n > 0: print("PASS: (emptyhot) hot-added keyboard delivers keys")
+            else: ok = False; print("FAIL: (emptyhot) no key bytes from the hot-added keyboard")
+        else:
+            ok = False; print("FAIL: (emptyhot) no eventN for a usb-kbd added to an empty xHCI")
+        if disk: print("PASS: (emptyhot) hot-added stick readable")
+        else: ok = False; print("FAIL: (emptyhot) usb-storage added to an empty xHCI never appeared")
+        for l in [l for l in serial_log(run_id).splitlines() if "[USB" in l or "[XHCI]" in l][-6:]:
+            print("  " + l.strip()[-150:])
+    finally:
+        try: drv("stop", timeout=60)
+        except subprocess.TimeoutExpired: pass
+        try: os.unlink(ia)
+        except OSError: pass
+    return ok
+
+
 def main():
     arch = sys.argv[1] if len(sys.argv) > 1 else "aarch64"
     which = sys.argv[2] if len(sys.argv) > 2 else "all"
@@ -478,7 +535,7 @@ def main():
     if which in ("notready", "all"):
         r = phase_notready(arch, run_id, env); ok &= r
         print("notready phase: " + ("PASS" if r else "FAIL"))
-    for name, fn in (("fastreplug", phase_fastreplug), ("hub", phase_hub), ("hid", phase_hid)):
+    for name, fn in (("fastreplug", phase_fastreplug), ("hub", phase_hub), ("hid", phase_hid), ("emptyhot", phase_emptyhot)):
         if which in (name, "all"):
             r = fn(arch, run_id, env); ok &= r
             print(f"{name} phase: " + ("PASS" if r else "FAIL"))

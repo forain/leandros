@@ -1069,7 +1069,9 @@ pub fn init() -> usize {
     for t in crate::usb_hcd::mass_storage_devices() {
         if probe(t, &mut waiting) { n += 1; }
     }
-    if crate::usb_hcd::device_count() > 0 || !waiting.is_empty() {
+    // Every running controller is scanned, also one with nothing plugged
+    // in at boot: its first device can only arrive by hot-plug.
+    if usb::controller_count() > 0 || !waiting.is_empty() {
         if sched::kthread::spawn("usb-hotplug", move || hotplug_thread(waiting)).is_none() {
             serial_debug("[USB-MSC] could not start the hot-plug thread\n");
         }
