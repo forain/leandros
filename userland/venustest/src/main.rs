@@ -89,6 +89,8 @@ const VIRTGPU_PARAM_LEANDROS_CTX_ID: u64 = 0x1000_0001;
 const VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS: u64 = 0x1000_0002;
 /// LeandrOS-private: host-visible window length in MiB (0 = no window).
 const VIRTGPU_PARAM_LEANDROS_HOSTVIS_MIB: u64 = 0x1000_0003;
+/// Free per-open 3D context slots (MAX_GPU_CTXS minus the bound ones).
+const VIRTGPU_PARAM_LEANDROS_FREE_CTXS: u64 = 0x1000_000C;
 /// Low 32 bits of the fence id of the most recent EXECBUFFER *on this open*.
 /// Exists so the de-globalization of that fence is assertable — see phase 3.
 const VIRTGPU_PARAM_LEANDROS_LAST_FENCE: u64 = 0x1000_0004;
@@ -1967,19 +1969,25 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     // the boundary by one.
     out(b"--- phase 3: per-open context slot exhaustion ---\n");
     {
-        const N_CTX: usize = 16; // MAX_GPU_CTXS
-        const N_TRY: usize = N_CTX + 1;
-        let mut fds = [-1i32; N_TRY];
-        let mut ids = [0u64; N_TRY];
-        let mut init_ok = [false; N_TRY];
+        // The cap is MAX_GPU_CTXS (256 since lane procpool); the kernel
+        // reports how many slots are free right now, so the boundary is exact
+        // whatever else holds a context. Older kernels: the historical 16.
+        const N_MAX: usize = 256;
+        let free = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_FREE_CTXS);
+        let n_ctx: usize = if free == u64::MAX || free == 0 { 16 } else { (free as usize).min(N_MAX) };
+        let n_try: usize = n_ctx + 1;
+        out(b"  free context slots = "); out_u64(n_ctx as u64); out(b"\n");
+        let mut fds = [-1i32; N_MAX + 1];
+        let mut ids = [0u64; N_MAX + 1];
+        let mut init_ok = [false; N_MAX + 1];
 
         let mut opened = 0usize;
-        for i in 0..N_TRY {
+        for i in 0..n_try {
             fds[i] = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
             if fds[i] < 0 { break; }
             opened += 1;
         }
-        if !report(b"phase3_open_17_fds", opened == N_TRY) { failures += 1; }
+        if !report(b"phase3_open_17_fds", opened == n_try) { failures += 1; }
 
         for i in 0..opened {
             init_ok[i] = ctx_init_venus(fds[i]);
@@ -1993,8 +2001,8 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
         }
 
         // The first 16 must each have succeeded with a real, unique id.
-        let mut distinct_ok = opened >= N_CTX;
-        for i in 0..N_CTX.min(opened) {
+        let mut distinct_ok = opened >= n_ctx;
+        for i in 0..n_ctx.min(opened) {
             if !init_ok[i] || ids[i] == 0 || ids[i] == CTX_UNKNOWN {
                 distinct_ok = false;
             }
@@ -2012,14 +2020,14 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
         if !report(b"phase3_16_contexts_distinct", distinct_ok) { failures += 1; }
 
         // The 17th must fail the ioctl outright…
-        let refused = opened == N_TRY && !init_ok[N_CTX];
+        let refused = opened == n_try && !init_ok[n_ctx];
         if !report(b"phase3_17th_context_init_refused", refused) { failures += 1; }
 
         // …and must not have been left holding anyone's context.
-        let orphan_ok = opened == N_TRY && ids[N_CTX] == 0;
-        if !orphan_ok && opened == N_TRY {
+        let orphan_ok = opened == n_try && ids[n_ctx] == 0;
+        if !orphan_ok && opened == n_try {
             out(b"  17th open ctx_id = ");
-            out_ctx(ids[N_CTX]);
+            out_ctx(ids[n_ctx]);
             out(b" (expected 0)\n");
         }
         if !report(b"phase3_17th_has_no_context", orphan_ok) { failures += 1; }

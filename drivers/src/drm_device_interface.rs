@@ -582,6 +582,10 @@ const VIRTGPU_PARAM_LEANDROS_CTRLQ_STAT: u64 = 0x1000_000A;
 /// without a fragmented allocator or a custom boot. Forcing only changes the
 /// SHAPE of new guest backings, never who can reach them.
 const VIRTGPU_PARAM_LEANDROS_SCATTER: u64 = 0x1000_000B;
+/// LeandrOS extension: how many per-open 3D context slots are free right now
+/// (`MAX_GPU_CTXS` minus the bound ones). venustest's slot-exhaustion phase
+/// sizes itself from this instead of hard-coding the cap.
+const VIRTGPU_PARAM_LEANDROS_FREE_CTXS: u64 = 0x1000_000C;
 /// EXECBUFFER submissions that waited on an in-fence (syncobj or FENCE_FD_IN).
 pub static EXEC_IN_FENCE_WAITS: AtomicU64 = AtomicU64::new(0);
 
@@ -1771,8 +1775,12 @@ fn hostvis_rel(phys: usize) -> Option<u64> {
 /// `hostvis_vma_release` if the mapping is not installed); Some(false) if it
 /// names no live span or runs past the span's end — the mmap must fail.
 pub fn mmap_pin_window(token: usize, len: usize) -> Option<bool> {
-    let rel = hostvis_rel(token)?;
-    Some(HOSTVIS_SPANS.lock().pin_map(rel, len as u64))
+    let rel = hostvis_rel(token);
+    hvdbg("pin_window tok=", token as u64, rel.unwrap_or(u64::MAX), len as u32 as u64);
+    let rel = rel?;
+    let r = HOSTVIS_SPANS.lock().pin_map(rel, len as u64);
+    hvdbg("pin_window res ", rel, HOSTVIS_SPANS.lock().spans.len() as u64, r as u64);
+    Some(r)
 }
 
 /// mm device-VMA hook: a fork aliased a device mapping.
@@ -1785,7 +1793,20 @@ pub fn hostvis_vma_retain(phys: usize, _len: usize) {
 /// round-trip for a span this frees is done by `hostvis_reap` from a driver
 /// path, never under the address space's busy flag.
 pub fn hostvis_vma_release(phys: usize, _len: usize) {
-    if let Some(rel) = hostvis_rel(phys) { HOSTVIS_SPANS.lock().release_map(rel); }
+    let rel = hostvis_rel(phys);
+    let ok = match rel { Some(r) => HOSTVIS_SPANS.lock().release_map(r), None => false };
+    hvdbg("vma_release phys=", phys as u64, rel.unwrap_or(u64::MAX), ok as u64);
+}
+
+// KVMVENUS3 DEBUG: rate-limited span trace.
+static HVDBG_N: AtomicU64 = AtomicU64::new(0);
+fn hvdbg(what: &str, a: u64, b: u64, c: u64) {
+    if HVDBG_N.fetch_add(1, Ordering::Relaxed) >= 400 { return; }
+    crate::pci::serial_debug("[HVDBG] "); crate::pci::serial_debug(what);
+    crate::pci::serial_debug_hex((a >> 32) as u32); crate::pci::serial_debug_hex(a as u32);
+    crate::pci::serial_debug(" "); crate::pci::serial_debug_hex((b >> 32) as u32); crate::pci::serial_debug_hex(b as u32);
+    crate::pci::serial_debug(" "); crate::pci::serial_debug_hex(c as u32);
+    crate::pci::serial_debug("\n");
 }
 
 /// Tear down the host side of every span whose owner died while mapped and
@@ -3048,6 +3069,7 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
     let (res_handle, zero) = match m.get_mut(&obj) {
         Some(o) => {
             o.refs = o.refs.saturating_sub(1);
+            if o.map_phys != 0 { hvdbg("blob_unref obj=", obj as u64, o.win_off, o.refs as u64); }
             (o.res_handle, o.refs == 0)
         }
         None => return false,
@@ -3065,8 +3087,10 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
     // into a zombie that `hostvis_reap` tears down once the last mapping goes.
     let deferred = match dead.as_ref() {
         Some(o) if o.map_phys != 0 => {
-            HOSTVIS_SPANS.lock().owner_gone(o.win_off, o.res_handle)
-                == crate::hostvis_core::OwnerGone::Deferred
+            let g = HOSTVIS_SPANS.lock().owner_gone(o.win_off, o.res_handle);
+            hvdbg("owner_gone off=", o.win_off, o.res_handle as u64,
+                  match g { crate::hostvis_core::OwnerGone::Deferred => 1, crate::hostvis_core::OwnerGone::FreeNow => 2, _ => 3 });
+            g == crate::hostvis_core::OwnerGone::Deferred
         }
         _ => false,
     };
@@ -8764,6 +8788,12 @@ impl DrmDeviceInterface {
                 _ => return Err(DriverError::InvalidParameter),
             };
             { let o = n.min(u32::MAX as u64) as u32; ucp_out(req.value as u64, &o as *const u32 as *const u8, 4); }
+            return Ok(0);
+        }
+        if req.param == VIRTGPU_PARAM_LEANDROS_FREE_CTXS {
+            if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            let n = VIRTGPU_CTXS.lock().iter().filter(|c| c.open_id == 0).count() as u32;
+            uwrite_user(req.value as usize, &n)?;
             return Ok(0);
         }
         if req.param == VIRTGPU_PARAM_LEANDROS_SCATTER {
