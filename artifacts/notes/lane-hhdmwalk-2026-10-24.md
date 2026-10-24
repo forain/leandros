@@ -14,7 +14,10 @@ openbugs L8.3 tail: aarch64 counterpart of the x86_64 HHDM gap check/fill.
 ## Evidence
 - 6 GiB default boot (HVF): boot completes, memtest 1/1 PASS (tests-hhdmw-def); Limine's HHDM is complete on QEMU, so
   nothing is reported or patched.
-- aarch64 regress on the merged branch: see the merge commit's lane run (tests-hhdmw-reg).
+- Status PARTIAL: the aarch64 HHDM walker is merged REPORT-ONLY by default (holes logged and dropped from mm); filling happens only with mm.hhdmfill=1|2m and is UNPROVEN in-guest (earlyfb.test=unmap4g/unmap4g1 wedges silently on HVF).
+- Regress: aarch64 44/45 green; the one failure, host:evgkeytest.py (held_btn_bit_cleared, held_key_seen_down), passed on re-run alone on this lane (22.1s RC=0) and on main 263148d0 (RC=0) -> flake, unrelated to this lane (another lane reports it failing on main; owned by lane evgkeyreg). x86_64 release build OK.
+- x86 gap: Limine 11.4.1 on the HP left PDPTE 0 above 4 GiB despite a 13 GiB usable memmap (see lane-fbmm-2026-10-16.md); the aarch64 walker cannot reproduce this on QEMU (6G default: 1 range mapped, 0 patched).
+- Found separately: under TCG the kernel faults early (ESR 0x96000004, FAR 0x9000018 in uart::putc_within before the HHDM offset is set; TTBR0 L0 empty, VBAR=0 loop). Tracked separately; makes TCG unusable for debugging the fill.
 
 ## Open: why the fill path is unproven
 - `earlyfb.test=unmap4g1` (one GiB, 0x1_0000_0000, which holds no Limine allocation) wedges on HVF with **no kernel
