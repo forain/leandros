@@ -3231,6 +3231,11 @@ fn blob_obj_count() -> u32 {
 ///
 /// LOCKING: takes BLOB_BUFFERS and nothing else, touches no user memory, and is
 /// called with no other lock held — the 82d0cc3 discipline.
+/// Bit 0 of a DRM_IOCTL_MMAP (0x1007) result: the GPU backend asked for an
+/// uncached (WC/UC) CPU mapping of this token. Physical results are page
+/// aligned, so the bit is free; servers/drm clears it and sets the hint.
+pub const MMAP_RET_UNCACHED: usize = 1;
+
 pub fn blob_map_cache_type(phys: u64) -> u32 {
     if phys == 0 { return crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_CACHED; }
     // A GPU backend's PCI aperture (VRAM through BAR1) is never write-back.
@@ -7964,8 +7969,11 @@ impl DrmDeviceInterface {
         // which refuses it.
         if requested_phys != 0 {
             if let Some(b) = crate::gpu_uapi::backend() {
-                if let Some((phys, _uncached)) = (b.mmap)(requested_phys, open_id) {
-                    return Ok(phys as usize);
+                if let Some((phys, uncached)) = (b.mmap)(requested_phys, open_id) {
+                    // The backend's caching answer rides in bit 0 of the
+                    // (page-aligned) result; servers/drm strips it into the
+                    // reply's mapping hint.
+                    return Ok(phys as usize | if uncached { MMAP_RET_UNCACHED } else { 0 });
                 }
             }
         }

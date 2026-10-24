@@ -220,9 +220,18 @@ pub(super) fn stat_tick() {
 pub fn proc_text() -> Option<String> {
     let mut s = String::new();
     let gt = proc_gt(&mut s).is_some();
+    // KMS flush / CPU-mapping counters: there in the fake (QEMU) mode too.
+    let kms = [super::kms::FLUSHED_FLIPS.load(Relaxed) as u64, super::uapi::MMAP_BY_TYPE[0].load(Relaxed),
+               super::uapi::MMAP_BY_TYPE[1].load(Relaxed), super::uapi::MMAP_BY_TYPE[2].load(Relaxed)];
+    let kms_any = gt || kms.iter().any(|&v| v != 0);
+    if kms_any {
+        for (k, v) in ["flips_clflushed", "mmap_wb", "mmap_wc", "mmap_uc"].iter().zip(kms) {
+            let _ = writeln!(s, "{} {}", k, v);
+        }
+    }
     let uapi = super::uapi::proc_errors(&mut s);
     let prime = crate::drm_device_interface::proc_prime(&mut s);
-    if gt || uapi || prime { Some(s) } else { None }
+    if gt || kms_any || uapi || prime { Some(s) } else { None }
 }
 
 fn proc_gt(s: &mut String) -> Option<()> {
@@ -252,7 +261,6 @@ fn proc_gt(s: &mut String) -> Option<()> {
     put("flips_not_latched", NOT_LATCHED.load(Relaxed));
     put("flip_fence_us", PRES_NS[0].load(Relaxed) / 1000);
     put("flip_clflush_us", PRES_NS[1].load(Relaxed) / 1000);
-    put("flips_clflushed", super::kms::FLUSHED_FLIPS.load(Relaxed) as u64);
     put("fifo_underruns", super::kms::underruns() as u64);
     put("flip_latch_us", PRES_NS[2].load(Relaxed) / 1000);
     put("uptime_ms", now_ns() / 1_000_000);
