@@ -432,6 +432,9 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         m.data[24..32].copy_from_slice(
             &drivers::drm_device_interface::drm_event_poll_tag(open_id).to_le_bytes());
         m.data[32] = 1;
+        // Its exact key: READY_EVENTS pushes wake keyed (drm_event_wake).
+        sched::poll_reply_put_keys(&mut m.data,
+            &[drivers::drm_device_interface::drm_event_poll_key(open_id)]);
         m
     } else if msg.tag == vfs_server::VFS_CLOSE {
         // The VFS sends this once the LAST fd on this open is gone, with the
@@ -479,7 +482,10 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     // drmGetDevices2() classify the device at all are built into the image by
     // scripts/mkfs-f2fs-populated.py.
     vfs_server::register_device("/dev/dri/renderD128", port_id, DEV_ID_RENDER, DRM_MAJOR, RENDER_MINOR);
-    port::register_handler(port_id, handle);
+    // Kernel-only: VFS_READ copies page-flip events to the task named in slot
+    // 3 (copy_to_task). Only the kernel's VFS forward may fill that slot; a raw user IPC naming another pid would read or write
+    // that process's memory (openbugs L1.17).
+    port::register_kernel_handler(port_id, handle);
     // Teach the VFS how to drop the DRM reference an exported dmabuf fd holds.
     //
     // This crate is the one place that already depends on BOTH `vfs_server` and

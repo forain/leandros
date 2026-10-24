@@ -4777,7 +4777,7 @@ fn ext_flip_deliver() -> Option<bool> {
     LAST_FLIP_DELIVER_TICK.store(sched::ticks(), Ordering::Relaxed);
     DELIVERED_SEQ.fetch_add(1, Ordering::Relaxed);
     ext_frame_note_delivery(now.saturating_sub(queued));
-    drm_event_wake(drm_event_poll_tag(o));
+    drm_event_wake(o);
     Some(more)
 }
 
@@ -4907,7 +4907,7 @@ fn hw_events_drain() -> bool {
         EXT_LAST_DELIVER_NS.store(now, Ordering::Relaxed);
         LAST_FLIP_DELIVER_TICK.store(sched::ticks(), Ordering::Relaxed);
         DELIVERED_SEQ.fetch_add(1, Ordering::Relaxed);
-        for &o in &woke[..nwoke] { drm_event_wake(drm_event_poll_tag(o)); }
+        for &o in &woke[..nwoke] { drm_event_wake(o); }
     }
     true
 }
@@ -5031,12 +5031,19 @@ fn flip_fence_service() -> bool {
     if !due { return true; }
     let mut ready = match READY_EVENTS.try_lock() { Some(g) => g, None => return false };
     let mut n = 0u64;
+    // The distinct opens to wake, keyed; past `opens`' capacity the rest are
+    // OR'ed into a bit-only wake (over-wakes, never loses).
+    let mut opens = [0u32; 8];
+    let mut nopens = 0usize;
     let mut tags = 0u64;
     while let Some(&(_, f, _, _)) = pend.front() {
         if f == 0 || f > floor { break; }
         if let Some((blob, _, _, o)) = pend.pop_front() {
             ready.push_back((o, blob));
-            tags |= drm_event_poll_tag(o);
+            if !opens[..nopens].contains(&o) {
+                if nopens < opens.len() { opens[nopens] = o; nopens += 1; }
+                else { tags |= drm_event_poll_tag(o); }
+            }
             n += 1;
         }
     }
@@ -5046,7 +5053,8 @@ fn flip_fence_service() -> bool {
         LAST_FLIP_DELIVER_TICK.store(sched::ticks(), Ordering::Relaxed);
         FLIPS_IRQ_DELIVERED.fetch_add(n, Ordering::Relaxed);
         DELIVERED_SEQ.fetch_add(n, Ordering::Relaxed);
-        drm_event_wake(tags);
+        for &o in &opens[..nopens] { drm_event_wake(o); }
+        if tags != 0 && !sched::try_wake_poll_tagged(tags) { sched::request_poll_wake_tagged(tags); }
     }
     true
 }
@@ -5062,11 +5070,21 @@ pub fn drm_event_poll_tag(open_id: u32) -> u64 {
     sched::poll_tag(sched::poll_class::DRM, 0x4000_0000 | open_id)
 }
 
-/// Wake the pollers of the opens in `tags` from IRQ/tick context; a
-/// contended RUN_QUEUE defers the wake to the next tick rather than dropping
-/// it (the events are already queued, so a lost wake would strand them).
-fn drm_event_wake(tags: u64) {
-    if !sched::try_wake_poll_tagged(tags) { sched::request_poll_wake_tagged(tags); }
+/// The exact key of `open_id`'s event queue (same bit as
+/// `drm_event_poll_tag`): what the VFS_POLL reply names and what every
+/// READY_EVENTS push wakes, so a poller whose bloom mask merely shares the bit
+/// is not woken (lane panelwake: the bit-only wake woke ~18 tasks per flip).
+pub fn drm_event_poll_key(open_id: u32) -> u64 {
+    sched::poll_key(sched::poll_class::DRM, 0x4000_0000 | open_id)
+}
+
+/// Wake the pollers of `open_id`'s event queue from IRQ/tick context, keyed;
+/// a contended RUN_QUEUE defers the keyed wake to the next tick rather than
+/// dropping it (the events are already queued, so a lost wake would strand
+/// them).
+fn drm_event_wake(open_id: u32) {
+    let k = drm_event_poll_key(open_id);
+    if !sched::try_wake_poll_key(k) { sched::request_poll_wake_key(k); }
 }
 
 /// Flip events delivered on their present's fence (the interrupt path), as
@@ -5348,7 +5366,7 @@ pub fn drm_tick() {
         drop(pend);
         LAST_FLIP_DELIVER_TICK.store(now, Ordering::Relaxed);
         DELIVERED_SEQ.fetch_add(1, Ordering::Relaxed);
-        drm_event_wake(drm_event_poll_tag(o));
+        drm_event_wake(o);
     }
 }
 

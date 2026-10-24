@@ -100,6 +100,8 @@ pub struct IntrPipe {
 
 impl IntrPipe {
     pub fn slot(&self) -> u8 { self.slot }
+    /// Whether this pipe belongs to controller `hc`.
+    pub fn on(&self, hc: &Arc<Hc>) -> bool { Arc::ptr_eq(&self.hc, hc) }
     pub fn interface(&self) -> u8 { self.iface }
     pub fn endpoint(&self) -> u8 { self.ep_addr }
 

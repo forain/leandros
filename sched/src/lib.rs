@@ -489,8 +489,11 @@ fn log_exit(rq: &mut runqueue::RunQueue, pid: Pid, status: ExitStatus, parent_tg
     // on its way out of the run queue, so this is the one edge its park can
     // rely on (lock-free; the next tick pays it). The child's SIGCHLD wakes it
     // too, but only when one is sent.
-    request_poll_wake_tagged(poll_tag(poll_class::WAIT, parent_tgid));
-    if is_process { request_poll_wake_tagged(poll_tag(poll_class::PIDFD, pid)); }
+    // Keyed (lane panelwake): the WAIT park and the pidfd answer name these
+    // objects by bits only (never refined) or by this exact key, so the key
+    // reaches every real waiter and skips pollers that merely share the bit.
+    request_poll_wake_key(poll_key(poll_class::WAIT, parent_tgid));
+    if is_process { request_poll_wake_key(poll_key(poll_class::PIDFD, pid)); }
 }
 
 /// What a pidfd for process `tgid` reports: `(exited, reaped)`. Exited means
@@ -628,8 +631,8 @@ fn group_exit_notice(rq: &RunQueue, tgid: Pid, uid: u32) -> Option<(Pid, ExitSta
 /// Send a settled process's SIGCHLD and wake its waiters (no locks held).
 fn send_group_exit_notice(tgid: Pid, n: (Pid, ExitStatus, u32, u8)) {
     let (parent, status, uid, exit_sig) = n;
-    request_poll_wake_tagged(poll_tag(poll_class::WAIT, parent));
-    wake_poll_tagged(poll_tag(poll_class::PIDFD, tgid));
+    request_poll_wake_key(poll_key(poll_class::WAIT, parent));
+    wake_poll_key(poll_key(poll_class::PIDFD, tgid));
     // The clone's exit signal: SIGCHLD unless clone/clone3 asked for another,
     // 0 for none at all.
     if exit_sig != 0 {
@@ -1302,7 +1305,7 @@ fn reparent_children(dead_tgid: Pid) {
             EXIT_LOG.lock().for_each_pending(|rec| {
                 if rec.parent_tgid == dead_tgid { rec.parent_tgid = init; handed = true; }
             });
-            if handed { request_poll_wake_tagged(poll_tag(poll_class::WAIT, init)); }
+            if handed { request_poll_wake_key(poll_key(poll_class::WAIT, init)); }
         }
         let mut pdeath = [(0 as Pid, 0u8); BATCH];
         let mut npd = 0usize;
@@ -1947,7 +1950,7 @@ pub fn deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> isize {
     // sibling may sit in sigtimedwait/sigsuspend; the new pending bit is a
     // readiness edge for them (RUN_QUEUE is released above). Tagged, not a
     // broadcast — see `signal_wake_tag`.
-    wake_poll_tagged(signal_wake_tag(tgid_of(pid)));
+    wake_poll_key(signal_wake_key(tgid_of(pid)));
     ret
 }
 
@@ -1960,6 +1963,11 @@ pub fn deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> isize {
 /// processes signal each other) to re-probe and re-park.
 #[inline]
 pub fn signal_wake_tag(tgid: Pid) -> u64 { poll_tag(poll_class::SIGNALFD, tgid) }
+/// The exact key of `signal_wake_tag` (lane panelwake): signal posts wake it
+/// keyed, so a parked poller whose mask shares the bit only through some
+/// other keyed interest is not woken on every SIGCHLD. Its consumers (a
+/// signalfd's poll answer, keyed; sigwait parks, bits only) all still match.
+pub fn signal_wake_key(tgid: Pid) -> u64 { poll_key(poll_class::SIGNALFD, tgid) }
 
 /// `deliver_signal` for IRQ context (a POSIX-timer SIGEV_THREAD_ID expiry
 /// targeting a specific thread): bounded `try_lock_spin`, `None` when
@@ -1982,7 +1990,7 @@ pub fn try_deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> Option<i
     let tgid = rq.find_pid(pid).map_or(pid, |t| t.tgid);
     let (ret, woke, _) = post_signal_thread(&mut rq, pid, signo, info);
     let ret = if ret == 0 && already { 1 } else { ret };
-    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, signal_wake_tag(tgid));
+    let woken = rq.unblock_port_keyed(POLL_WAIT_CHANNEL, signal_wake_key(tgid));
     drop(rq);
     wakestat::note(core::panic::Location::caller(), false, woken, 0);
     if woke || woken > 0 { wake_up_an_idle_cpu(); }
@@ -2153,7 +2161,7 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isi
     if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
     // Wake any signalfd poller / sigwaiter in the target tgid (RUN_QUEUE
     // released above). Tagged, see `signal_wake_tag`.
-    wake_poll_tagged(signal_wake_tag(tgid));
+    wake_poll_key(signal_wake_key(tgid));
     ret
 }
 
@@ -2181,7 +2189,7 @@ pub fn try_deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) ->
     };
     let (ret, woke, _) = post_signal_process(&mut rq, tgid, signo, info);
     let ret = if ret == 0 && already { 1 } else { ret };
-    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, signal_wake_tag(tgid));
+    let woken = rq.unblock_port_keyed(POLL_WAIT_CHANNEL, signal_wake_key(tgid));
     drop(rq);
     wakestat::note(core::panic::Location::caller(), false, woken, 0);
     if woke || woken > 0 { wake_up_an_idle_cpu(); }
@@ -2290,7 +2298,22 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
                 // interrupts its wait. With none chosen (every thread masks
                 // it, e.g. std's fork() blocks all signals) nothing is woken:
                 // the unblock is itself a syscall whose return runs the claim.
-                if let Some(slot) = chosen {
+                //
+                // Not for a signal the group discards (SIG_IGN, or SIG_DFL of
+                // a default-ignore signal such as SIGCHLD): it can interrupt
+                // nothing (`has_deliverable_signal`), so the wake only made
+                // the sleeper re-probe and park again — one useless epoll
+                // wake per child exit for every parent without a SIGCHLD
+                // handler (lane panelwake). Linux drops such a signal at
+                // generation (`sig_ignored`). It stays queued here and is
+                // discarded on the next return to user space, as before;
+                // sigwait / signalfd consumers mask it and are woken by
+                // the signal key instead.
+                let discarded = !unblockable && rq.find_pid(tgid).map_or(false, |l| {
+                    let h = l.signal_actions[idx].handler;
+                    h == 1 || (h == 0 && signal::SIGDFL_IGNORE & bit != 0 && signo != signal::SIGCONT)
+                });
+                if let Some(slot) = chosen.filter(|_| !discarded) {
                     if let Some(t) = rq.get_mut(slot) {
                         if t.state == TaskState::Blocked {
                             t.set_state(TaskState::Ready);
@@ -7305,8 +7328,8 @@ fn scheduler_run_loop() -> ! {
                     // SIGCHLD needs task context (it takes RUN_QUEUE and may
                     // wake the parent's threads): a worker sends it. The wait
                     // channel is lock-free and goes now.
-                    request_poll_wake_tagged(poll_tag(poll_class::WAIT, n.0));
-                    request_poll_wake_tagged(poll_tag(poll_class::PIDFD, tgid));
+                    request_poll_wake_key(poll_key(poll_class::WAIT, n.0));
+                    request_poll_wake_key(poll_key(poll_class::PIDFD, tgid));
                     if let Some(wq) = workqueue::system() {
                         let _ = wq.queue_fn(move || send_group_exit_notice(tgid, n));
                     }
@@ -7994,8 +8017,8 @@ pub fn exit(code: i32) -> ! {
     // common last thread out and gets the immediate wake; any other thread's
     // exit may be the last one too (the leader can pthread_exit first), and
     // that rarer case is paid by the next tick. `log_exit` backs both.
-    let pidfd_tag = poll_tag(poll_class::PIDFD, tgid);
-    if pid == tgid { wake_poll_tagged(pidfd_tag); } else { request_poll_wake_tagged(pidfd_tag); }
+    let pidfd_key = poll_key(poll_class::PIDFD, tgid);
+    if pid == tgid { wake_poll_key(pidfd_key); } else { request_poll_wake_key(pidfd_key); }
     if let Some(n) = notice {
         // Process-directed: deliver to any parent thread that hasn't masked
         // SIGCHLD (tokio blocks it on the main thread), not blindly the leader.
@@ -8220,9 +8243,9 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         (None, None) => return GroupKillStep::Done,
     };
 
-    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal, had_vfork, sigkill_pending) = {
+    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal, had_vfork, unmasked_pending) = {
         let t = rq.get_mut(idx).unwrap();
-        let sigkill_pending = t.signal_pending & (1u64 << (signal::SIGKILL - 1)) != 0;
+        let unmasked_pending = t.signal_pending & (!t.signal_mask | signal::UNBLOCKABLE);
         t.set_state(TaskState::Zombie);
         t.group_killed = true;
         t.exit_code = exit_code;
@@ -8232,7 +8255,7 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         // `term_signal` is NOT set here: `exit_group_signal` stamps it on
         // every member of the group before this loop starts, so a member
         // reaped through this path already carries it.
-        (t.pid, t.on_cpu(), t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal, had_vfork, sigkill_pending)
+        (t.pid, t.on_cpu(), t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal, had_vfork, unmasked_pending)
     };
     if had_vfork { rq.unblock_port(VFORK_WAIT_CHANNEL); }
     // Lane killexec: a SIGKILL already sent to this member (a process-directed
@@ -8242,11 +8265,31 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
     // complete_signal turns any SIGKILL into a group exit at send time, and
     // de_thread then fails. Without this the exec'd image ran on unkillable
     // by that kill (killmt proclife exec_kill: "child not reaped").
-    if sigkill_pending {
+    // Lane fatalsig: the same holds for any other pending, unblocked signal
+    // whose action is fatal (SIG_DFL terminate/core): Linux's complete_signal
+    // group-exits at send time. Handled, ignored, stop and default-ignore
+    // signals stay dropped with the thread they were directed at.
+    let fatal_sig = {
+        let mut found = 0u32;
+        if unmasked_pending & (1u64 << (signal::SIGKILL - 1)) != 0 {
+            found = signal::SIGKILL;
+        } else if unmasked_pending != 0 {
+            for sig in 1..=64u32 {
+                if unmasked_pending & (1u64 << (sig - 1)) == 0 { continue; }
+                if signal::default_terminates(sig)
+                    && rq.find_pid(tgid).map_or(false, |l| l.signal_actions[(sig - 1) as usize].handler == 0)
+                {
+                    found = sig;
+                    break;
+                }
+            }
+        }
+        found
+    };
+    if fatal_sig != 0 {
         if let Some(me) = rq.find_pid_mut(pid) {
             if me.forced_exit == 0 {
-                let signo = signal::SIGKILL;
-                me.forced_exit = (1u32 << 31) | (signo << 8) | ((128 + signo) & 0xff);
+                me.forced_exit = (1u32 << 31) | (fatal_sig << 8) | ((128 + fatal_sig) & 0xff);
             }
         }
     }

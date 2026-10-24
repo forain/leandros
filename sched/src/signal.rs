@@ -66,11 +66,18 @@ pub const SIGRET_TRAMPOLINE_VA: usize = 0x0000_7fff_ff00_0000;
 //                 signal itself is dequeued there is nothing left to do.
 //   SIGURG  = 23  (bit 22)
 //   SIGWINCH = 28 (bit 27)
-const SIGDFL_IGNORE: u64 = (1u64 << 16) | (1u64 << 17) | (1u64 << 22) | (1u64 << 27);
+pub(crate) const SIGDFL_IGNORE: u64 = (1u64 << 16) | (1u64 << 17) | (1u64 << 22) | (1u64 << 27);
 
 /// Signals whose SIG_DFL action is "stop the process": SIGSTOP 19, SIGTSTP 20,
 /// SIGTTIN 21, SIGTTOU 22 (bits 18..=21).
 pub(crate) const SIGDFL_STOP: u64 = (1u64 << 18) | (1u64 << 19) | (1u64 << 20) | (1u64 << 21);
+
+/// True when `sig` (1..=64) with SIG_DFL terminates the process.
+pub(crate) fn default_terminates(sig: u32) -> bool {
+    if sig == 0 || sig > 64 { return false; }
+    let bit = 1u64 << (sig - 1);
+    bit & (SIGDFL_IGNORE | SIGDFL_STOP) == 0
+}
 
 // Signal numbers used for default-terminate calculation.
 const SIGSEGV: u32 = 11;

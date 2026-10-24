@@ -1852,6 +1852,10 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     }
     vfs_server::register_device("/dev/input/event0", port_id, 0, 13, 64);
     vfs_server::register_device("/dev/input/event1", port_id, 1, 13, 65);
-    port::register_handler(port_id, handle);
+    // Kernel-only: VFS_READ / VFS_IOCTL copy to and from the task named in
+    // slot 3 (copy_to_task/copy_from_task). Only the kernel's VFS forward may
+    // fill that slot; a raw user IPC naming another pid would read or write
+    // that process's memory (openbugs L1.17).
+    port::register_kernel_handler(port_id, handle);
     Some(port_id)
 }

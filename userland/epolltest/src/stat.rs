@@ -7,6 +7,8 @@
 
 use crate::*;
 
+extern "C" { fn _exit(code: c_int) -> !; }
+
 fn parse_u(s: &[u8]) -> Option<i64> {
     if s.is_empty() { return None; }
     let mut x = 0i64;
@@ -96,6 +98,66 @@ pub unsafe fn stat_main() -> i32 {
         // A useless wake from a ring-named wake must be pinned on the blip fd.
         rep(b"stat_useless_attributed", x - x0 == 0 || has);
     }
+    // Two tries: boot-time ambient wakes (see exit_wake_keyed) can land in the
+    // first window; the bug reads 25+ on every try.
+    rep(b"stat_exit_wake_keyed", exit_wake_keyed() || exit_wake_keyed());
     if fail == 0 { write(1, b"SUMMARY stat pass\n".as_ptr(), 18); }
     fail
+}
+
+/// Lane panelwake guard: a child's exit wakes its parent's wait4 park
+/// (`poll_class::WAIT`) and its pidfd pollers (`PIDFD`). Those wakes used to
+/// go out bit-only, so every parked poller whose bloom mask held the same
+/// bit through an unrelated KEYED interest (an eventfd here) woke, re-probed
+/// and re-parked. We park on 96 idle eventfds (keyed bits covering most of
+/// the 64 buckets) while 24 children exit; with keyed exit wakes the
+/// fingerprints reject every one of them, so the park takes no useless wake.
+/// `epolltest xwake`: run `exit_wake_keyed` by itself, so `/proc/wakestat`
+/// attributes only its wakes.
+pub unsafe fn exit_wake_main() -> i32 {
+    let ok = exit_wake_keyed() || exit_wake_keyed();
+    let msg: &[u8] = if ok { b"stat_exit_wake_keyed: PASS\n" } else { b"stat_exit_wake_keyed: FAIL\n" };
+    write(1, msg.as_ptr(), msg.len());
+    if ok { 0 } else { 1 }
+}
+
+unsafe fn exit_wake_keyed() -> bool {
+    const NFD: usize = 96;
+    const NKID: usize = 24;
+    let ep = epoll_create1(0);
+    if ep < 0 { return false; }
+    let mut fds = [-1 as c_int; NFD];
+    for f in fds.iter_mut() {
+        *f = syscall(nr::EVENTFD2, 0i64, 0o4000i64) as c_int;
+        if *f < 0 || !ep_add(ep, *f, EPOLLIN) { return false; }
+    }
+    let mut kids = [0 as c_int; NKID];
+    for (i, k) in kids.iter_mut().enumerate() {
+        let pid = crate::cost::fork();
+        if pid == 0 { usleep(40_000 + i as u32 * 6_000); _exit(0); }
+        *k = pid;
+    }
+    let before = row(ep, -1);
+    let mut ev = epoll_event { events: 0, data: epoll_data { fd: 0 } };
+    // One wait spanning every exit: a useless wake re-parks in the kernel.
+    let n = epoll_wait(ep, &mut ev, 1, 40 + NKID as c_int * 6 + 300);
+    let after = row(ep, -1);
+    for &k in &kids { let mut st = 0; crate::cost::waitpid(k, &mut st, 0); }
+    for &f in &fds { close(f); }
+    close(ep);
+    let b = before.unwrap_or((0, 0, 0, false));
+    let Some(a) = after else { return false };
+    write(1, b"  exit_wake: useless=".as_ptr(), 21); write_i64(1, a.2 - b.2);
+    write(1, b" parks=".as_ptr(), 7); write_i64(1, a.0 - b.0);
+    write(1, b"\n".as_ptr(), 1);
+    // Bound 1, not 0: the first run after boot (3/3, and only that one) takes
+    // exactly one useless wake that is not an exit wake. `epolltest xwake`
+    // run alone, or `stat` run a second time, reads 0; /proc/wakestat pins
+    // it on an eventfd write (vfs EventFd write site) from the boot-time
+    // session teardown. With 96 u16 fingerprints parked, a foreign keyed
+    // wake on a shared bloom bit matches one with p ~ 96/65536, and the
+    // boot window carries several hundred keyed wakes: a fingerprint
+    // collision, inherent to the filter. Bit-only exit/signal wakes (the
+    // bug) read 25 here, one per child plus one.
+    n == 0 && a.2 - b.2 <= 1
 }

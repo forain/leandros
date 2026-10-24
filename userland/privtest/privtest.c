@@ -490,6 +490,56 @@ static void vfs_port_kernel_only(void) {
     expect("los_ipc_send_vfs_port_eperm", syscall(LOS_IPC_SEND, vfs, &m, sizeof m), EPERM);
 }
 
+/* openbugs L1.17: the evdev and DRM servers copy to/from the task whose pid
+ * is in request slot 3 — a value only the kernel's VFS forward may fill. An
+ * unprivileged process that sends the request itself must not be able to make
+ * them write ANOTHER process's memory. The ports are not published, so try
+ * every small port id with an EVIOCGNAME(64) aimed at a sibling's buffer
+ * (evdev) and a DRM_IOCTL_VERSION / VFS_READ (drm): the sibling's buffer
+ * must stay untouched, and no handler port may accept the request. */
+static volatile unsigned char pt_victim_buf[64];
+static void device_ports_kernel_only(void) {
+    if (!on_leandros()) { skip("los_ipc_evdev_foreign_pid_*", "not LeandrOS"); return; }
+    int up[2], down[2];
+    if (pipe(up) != 0 || pipe(down) != 0) { skip("los_ipc_evdev_foreign_pid_*", "pipe"); return; }
+    memset((void *)pt_victim_buf, 0xAA, sizeof pt_victim_buf);
+    pid_t victim = fork();
+    if (victim == 0) {
+        char b = 0;
+        (void)!write(up[1], "r", 1);
+        (void)!read(down[0], &b, 1);
+        for (size_t i = 0; i < sizeof pt_victim_buf; i++) if (pt_victim_buf[i] != 0xAA) _exit(1);
+        _exit(0);
+    }
+    char b = 0; (void)!read(up[0], &b, 1);
+    pid_t atk = fork();
+    if (atk == 0) {
+        for (uint32_t p = 1; p < 1024; p++) {
+            struct lmsg m;
+            /* evdev: EVIOCGNAME(64) into the victim's buffer, dev 0 and 1. */
+            for (uint64_t dev = 0; dev < 2; dev++) {
+                memset(&m, 0, sizeof m); m.tag = 0x28; m.reply_port = 0xffffffffu;
+                uint64_t a[5] = { dev, 0x80404506ULL, (uint64_t)(uintptr_t)pt_victim_buf, (uint64_t)victim, 0 };
+                memcpy(m.data, a, sizeof a);
+                (void)syscall(LOS_IPC_SEND, p, &m, sizeof m);
+            }
+            /* drm: VFS_READ of page-flip events into the victim's buffer. */
+            memset(&m, 0, sizeof m); m.tag = 0x11; m.reply_port = 0xffffffffu;
+            uint64_t r[5] = { 0, (uint64_t)(uintptr_t)pt_victim_buf, 64, (uint64_t)victim, 0 };
+            memcpy(m.data, r, sizeof r);
+            (void)syscall(LOS_IPC_SEND, p, &m, sizeof m);
+        }
+        _exit(0);
+    }
+    int st = 0; waitpid(atk, &st, 0);
+    (void)!write(down[1], "g", 1);
+    st = 0; waitpid(victim, &st, 0);
+    int untouched = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    printf("los_ipc_evdev_foreign_pid_untouched: %s\n", untouched ? "PASS" : "FAIL (victim buffer written via raw IPC)");
+    if (untouched) npass++; else nfail++;
+    close(up[0]); close(up[1]); close(down[0]); close(down[1]);
+}
+
 /* AT_RANDOM must come from a real generator: distinct across execs, even
  * execs that land in the same timer tick (the old tick-derived bytes did
  * not). `privtest --atrandom` prints the 16 bytes as hex. */
@@ -921,6 +971,7 @@ static void user_cases(void *arg) {
     user_dev_net_cases();
     user_leandros_cases(c);
     vfs_port_kernel_only();
+    device_ports_kernel_only();
     atrandom_cases();
     user_cred_cases();
     user_session_rlimit_cases();
@@ -965,6 +1016,44 @@ static void kill_all_case(void *arg) {
  * gets EBUSY — by open or by IPC — readers are not writers, and the device
  * is free again once the holder's last fd closes). SKIPped while something
  * (a PipeWire session) holds the device. */
+/* A user process must not act as another process's open of /dev/pipewire:
+ * the VFS tags on the audio port (auxv 258) carry the kernel-filled open_id,
+ * so a raw LOS_IPC_CALL naming the holder's open_id — VFS_CLOSE (0x13)
+ * releases its claim, VFS_IOCTL (0x28) SET_PARAMS (0x101) passes the
+ * holder-only check — would forge it. An unprivileged child tries every
+ * small open_id; each call must be EPERM and the device must stay held. */
+static void root_audio_forged_open_cases(void) {
+    unsigned long port = getauxval(258);
+    if (port == 0 || port == 0xffffffffUL) { skip("audio_forged_open_id_*", "no audio port in auxv"); return; }
+    pid_t k = fork();
+    if (k == 0) {
+        if (setgroups(0, NULL) != 0 || setgid(65534) != 0 || setuid(65534) != 0) _exit(3);
+        int bad = 0;
+        uint8_t params[8] = { 0x44, 0xac, 0, 0, 2, 0, 0, 0 };
+        for (uint64_t id = 1; id <= 1024; id++) {
+            struct lmsg m; memset(&m, 0, sizeof m);
+            uint64_t a1[5] = { 0, 0x101, (uint64_t)(uintptr_t)params, 0, id };
+            m.tag = 0x28; memcpy(m.data, a1, sizeof a1);
+            long r = syscall(LOS_IPC_CALL, (long)port, &m, sizeof m);
+            if (!(r < 0 && errno == EPERM)) bad |= 1;
+            memset(&m, 0, sizeof m);
+            uint64_t a2[2] = { 0, id };
+            m.tag = 0x13; memcpy(m.data, a2, sizeof a2);
+            r = syscall(LOS_IPC_CALL, (long)port, &m, sizeof m);
+            if (!(r < 0 && errno == EPERM)) bad |= 2;
+        }
+        _exit(bad);
+    }
+    int st = 0;
+    waitpid(k, &st, 0);
+    int rc = WIFEXITED(st) ? WEXITSTATUS(st) : 99;
+    check("audio_forged_open_id_raw_ipc_eperm", rc == 0,
+          rc == 3 ? "could not drop to nobody" : "raw VFS-tag IPC to the audio port was not refused");
+    int x = open(AUDIO_NODE, O_WRONLY);
+    expect("audio_forged_open_id_holder_kept", x, EBUSY);
+    if (x >= 0) close(x);
+}
+
 static void root_audio_cases(void) {
     struct stat st;
     if (stat(AUDIO_NODE, &st) != 0) { skip("root_audio_*", "no " AUDIO_NODE); return; }
@@ -983,6 +1072,7 @@ static void root_audio_cases(void) {
     long ip = audio_ipc_set_params();
     if (ip == -2) skip("root_audio_ipc_while_held_ebusy", "no audio port in auxv");
     else expect("root_audio_ipc_while_held_ebusy", ip, EBUSY);
+    root_audio_forged_open_cases();
     int d = dup(a);
     close(a);
     expect("root_audio_dup_keeps_device", open(AUDIO_NODE, O_WRONLY), EBUSY);
