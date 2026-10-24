@@ -13384,6 +13384,18 @@ fn ep_hit(t: &sched::PollTag, r: &sched::WakeRing) -> bool {
     r.keys().iter().any(|&k| own.contains(&k) || unk & sched::poll_key_bit(k) != 0)
 }
 
+/// Classify a useless wake for `wakestat::EP_NAMELESS` (see there).
+fn ep_nameless_why(woke_ring: bool, named: bool, r: &sched::WakeRing, self_tag: u64,
+                   others: &[EpSnap]) -> usize {
+    if !woke_ring || r.tags == sched::POLL_TAG_ALL { return 1; }
+    if named { return 0; }
+    if r.n == 0 && r.tags == 0 { return if r.flags != 0 { 2 } else { 7 }; }
+    if others.iter().any(|o| o.ents.iter().any(|e| e.used && e.known && ep_hit(&e.tag, r))) { return 3; }
+    if r.tags & self_tag != 0 { return 4; }
+    if r.n > 0 { return 5; }
+    6
+}
+
 fn ep_merge(a: &mut sched::WakeRing, b: &sched::WakeRing) {
     for &k in b.keys() { a.push_key(k); }
     a.push_tags(b.tags);
@@ -13613,6 +13625,7 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
     let mut churn = 0u32;
     let mut woke = false; // a real sleep ended since the last park (EP_USELESS)
     let mut woke_ring = false; // that wake named registrations (else: an unattributed full re-probe)
+    let mut last_ring = sched::WakeRing::EMPTY; // that wake's ring (EP_NAMELESS)
     let st = ws::ep_stat(c.inst, sched::current_tgid(), epfd as u32);
     loop {
         let gen0 = EPOLL_CTL_GEN.load(Ordering::Acquire);
@@ -13662,6 +13675,7 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
         pending = false;
         let why_now = core::mem::replace(&mut why, EpWhy::Nothing); // the kids are judged by it too
         woke_ring = matches!(why_now, EpWhy::Ring(_));
+        if let EpWhy::Ring(r) = &why_now { last_ring = *r; }
         recheck.clear(); changed.clear();
         // ---- PROBE ---- only the candidates; per registration, exactly the
         // probe-everything loop's rules.
@@ -13839,11 +13853,14 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
             // Attribute the useless wake: the registrations this pass probed
             // (the ones the wake's ring named), else the unattributed bucket.
             st.useless.fetch_add(1, Relaxed);
+            let mut named = false;
             if woke_ring {
                 for i in 0..cand.len().min(c.ents.len()) {
-                    if cand[i] && c.ents[i].used { st.note_fd(c.ents[i].fd as u32); }
+                    if cand[i] && c.ents[i].used { st.note_fd(c.ents[i].fd as u32); named = true; }
                 }
             } else { st.note_fd(ws::EpStat::ALL_FD); }
+            ws::EP_NAMELESS[ep_nameless_why(woke_ring, named, &last_ring, self_tag, &c.others)]
+                .fetch_add(1, Relaxed);
         }
         match sched::poll_listen_park(lid, if infinite { u64::MAX } else { deadline }) {
             sched::ListenPark::Taken(r) => { ep_share(&mut c.others, &r); why = EpWhy::Ring(r); }

@@ -116,17 +116,19 @@ pub unsafe fn stat_main() -> i32 {
 /// `epolltest xwake`: run `exit_wake_keyed` by itself, so `/proc/wakestat`
 /// attributes only its wakes.
 pub unsafe fn exit_wake_main() -> i32 {
-    let ok = exit_wake_keyed() || exit_wake_keyed();
+    // One instance across both tries: a retry on a fresh epoll fd could get
+    // the closed one's number and read its stale /proc/epollstat row.
+    let ep = epoll_create1(0);
+    let ok = ep >= 0 && (exit_wake_keyed(ep) || exit_wake_keyed(ep));
+    if ep >= 0 { close(ep); }
     let msg: &[u8] = if ok { b"stat_exit_wake_keyed: PASS\n" } else { b"stat_exit_wake_keyed: FAIL\n" };
     write(1, msg.as_ptr(), msg.len());
     if ok { 0 } else { 1 }
 }
 
-unsafe fn exit_wake_keyed() -> bool {
+unsafe fn exit_wake_keyed(ep: c_int) -> bool {
     const NFD: usize = 96;
     const NKID: usize = 24;
-    let ep = epoll_create1(0);
-    if ep < 0 { return false; }
     let mut fds = [-1 as c_int; NFD];
     for f in fds.iter_mut() {
         *f = syscall(nr::EVENTFD2, 0i64, 0o4000i64) as c_int;
@@ -145,7 +147,6 @@ unsafe fn exit_wake_keyed() -> bool {
     let after = row(ep, -1);
     for &k in &kids { let mut st = 0; crate::cost::waitpid(k, &mut st, 0); }
     for &f in &fds { close(f); }
-    close(ep);
     let b = before.unwrap_or((0, 0, 0, false));
     let Some(a) = after else { return false };
     write(1, b"  exit_wake: useless=".as_ptr(), 21); write_i64(1, a.2 - b.2);
@@ -160,7 +161,8 @@ unsafe fn exit_wake_keyed() -> bool {
     // boot window carries several hundred keyed wakes: a fingerprint
     // collision, inherent to the filter. Bit-only exit/signal wakes (the
     // bug) read 25 here, one per child plus one.
-    n == 0 && a.2 - b.2 <= 1
+    // parks >= 1: the row is live (the wait parked), not a stale one.
+    n == 0 && a.0 - b.0 >= 1 && a.2 - b.2 <= 1
 }
 
 /// Lane panelpipe guard: a pipe reader parked in epoll for POLLIN must be

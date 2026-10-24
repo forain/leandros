@@ -67,6 +67,13 @@ pub static EP_PASSES: AtomicU64 = AtomicU64::new(0);
 pub static EP_RECHECK: AtomicU64 = AtomicU64::new(0);
 pub static EP_GENCANCEL: AtomicU64 = AtomicU64::new(0);
 pub static EP_USELESS: AtomicU64 = AtomicU64::new(0);
+/// Useless epoll wakes by what the wake's ring named (lane epnameless), read
+/// through `/proc/wakestat` (`# epnameless ...`): 0 named a registration
+/// (probed, still not ready), 1 unknown/ALL, 2 deadline flag only, 3 a kept
+/// snapshot's registration (another instance), 4 the instance's own tag bit
+/// (bit-only wake on its epoll_ctl bit), 5 keys none of which is a
+/// registration's, 6 other bits, 7 empty.
+pub static EP_NAMELESS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 pub static EP_PROBE_NS: AtomicU64 = AtomicU64::new(0);
 pub static EP_FILT_NS: AtomicU64 = AtomicU64::new(0);
 
