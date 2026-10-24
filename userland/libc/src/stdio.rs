@@ -193,11 +193,22 @@ pub(crate) unsafe fn do_format(sink: &mut Sink<'_>, fmt: *const u8, argv: *const
     // registers (xmm0-7 / d0-d7), where C passes variadic doubles.
     let fpv = argv.add(ARGV_INT);
     let mut fai = 0usize;
+    // argv[16] = caller's stack argument area (ints and doubles that overflow
+    // the registers share it, in order); argv[17] = int registers saved.
+    let mut stk = *argv.add(2 * ARGV_INT) as *const u64;
+    let nregs = (*argv.add(2 * ARGV_INT + 1) as usize).min(ARGV_INT);
     macro_rules! next_arg {
-        () => {{ let v = if ai < ARGV_INT { *argv.add(ai) } else { 0 }; ai += 1; v }}
+        () => {{
+            let v = if ai < nregs { *argv.add(ai) } else { let v = *stk; stk = stk.add(1); v };
+            ai += 1; v
+        }}
     }
     macro_rules! next_fp_arg {
-        () => {{ let v = if fai < ARGV_FP { f64::from_bits(*fpv.add(fai)) } else { 0.0 }; fai += 1; v }}
+        () => {{
+            let v = if fai < ARGV_FP { f64::from_bits(*fpv.add(fai)) }
+                    else { let v = f64::from_bits(*stk); stk = stk.add(1); v };
+            fai += 1; v
+        }}
     }
 
     loop {
@@ -239,7 +250,6 @@ pub(crate) unsafe fn do_format(sink: &mut Sink<'_>, fmt: *const u8, argv: *const
         let mut is_long = false;
         if *fmt.add(fi) == b'l' { is_long = true; fi += 1; if *fmt.add(fi) == b'l' { fi += 1; } }
         else if *fmt.add(fi) == b'z' { is_long = true; fi += 1; }
-        let _ = is_long;
 
         let spec = *fmt.add(fi); fi += 1;
         let pad  = if zero_pad { b'0' } else { b' ' };
@@ -263,7 +273,7 @@ pub(crate) unsafe fn do_format(sink: &mut Sink<'_>, fmt: *const u8, argv: *const
                 else { emit_padded(sink, core::slice::from_raw_parts(p, strlen(p)), &mut count); }
             }
             b'd' | b'i' => {
-                let v = next_arg!() as i64;
+                let v = if is_long { next_arg!() as i64 } else { next_arg!() as i32 as i64 };
                 let (neg, abs) = if v < 0 { (true, (-v) as u64) } else { (false, v as u64) };
                 let (nb, nl) = fmt_uint(abs, 10, false);
                 let mut tmp = [0u8; 22]; let (s, tl);
@@ -272,17 +282,17 @@ pub(crate) unsafe fn do_format(sink: &mut Sink<'_>, fmt: *const u8, argv: *const
                 emit_padded(sink, &tmp[s..s+tl], &mut count);
             }
             b'u' => {
-                let v = next_arg!();
+                let v = if is_long { next_arg!() } else { next_arg!() as u32 as u64 };
                 let (nb, nl) = fmt_uint(v, 10, false);
                 emit_padded(sink, &nb[..nl], &mut count);
             }
             b'x' => {
-                let v = next_arg!();
+                let v = if is_long { next_arg!() } else { next_arg!() as u32 as u64 };
                 let (nb, nl) = fmt_uint(v, 16, false);
                 emit_padded(sink, &nb[..nl], &mut count);
             }
             b'X' => {
-                let v = next_arg!();
+                let v = if is_long { next_arg!() } else { next_arg!() as u32 as u64 };
                 let (nb, nl) = fmt_uint(v, 16, true);
                 emit_padded(sink, &nb[..nl], &mut count);
             }
@@ -330,14 +340,15 @@ pub(crate) unsafe fn do_format(sink: &mut Sink<'_>, fmt: *const u8, argv: *const
 // to argv[0..8) and the FP/SIMD argument registers (where AAPCS64 and SysV
 // pass variadic doubles; SysV's `al` count is an upper bound, saving all 8 is
 // always safe) to argv[8..16), then call the `_impl` with that array.
-// Arguments that spill to the stack are not supported.
+// argv[16]/argv[17] carry the caller stack-argument pointer and the number of
+// saved integer registers; do_format walks registers first, then the stack.
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
     ".global printf",
     ".type printf, %function",
     "printf:",
-    "   sub  sp,  sp, #144",
-    "   stp  x29, x30, [sp, #128]",
+    "   sub  sp,  sp, #160",
+    "   stp  x29, x30, [sp, #144]",
     "   str  x1, [sp, #0]",
     "   str  x2, [sp, #8]",
     "   str  x3, [sp, #16]",
@@ -349,17 +360,21 @@ core::arch::global_asm!(
     "   stp  d2, d3, [sp, #80]",
     "   stp  d4, d5, [sp, #96]",
     "   stp  d6, d7, [sp, #112]",
+    "   add  x9, sp, #160",
+    "   str  x9, [sp, #128]",
+    "   mov  x9, #7",
+    "   str  x9, [sp, #136]",
     "   mov  x1,  sp",
     "   bl   printf_impl",
-    "   ldp  x29, x30, [sp, #128]",
-    "   add  sp,  sp, #144",
+    "   ldp  x29, x30, [sp, #144]",
+    "   add  sp,  sp, #160",
     "   ret",
 
     ".global fprintf",
     ".type fprintf, %function",
     "fprintf:",
-    "   sub  sp,  sp, #144",
-    "   stp  x29, x30, [sp, #128]",
+    "   sub  sp,  sp, #160",
+    "   stp  x29, x30, [sp, #144]",
     "   str  x2, [sp, #0]",
     "   str  x3, [sp, #8]",
     "   str  x4, [sp, #16]",
@@ -370,17 +385,21 @@ core::arch::global_asm!(
     "   stp  d2, d3, [sp, #80]",
     "   stp  d4, d5, [sp, #96]",
     "   stp  d6, d7, [sp, #112]",
+    "   add  x9, sp, #160",
+    "   str  x9, [sp, #128]",
+    "   mov  x9, #6",
+    "   str  x9, [sp, #136]",
     "   mov  x2,  sp",
     "   bl   fprintf_impl",
-    "   ldp  x29, x30, [sp, #128]",
-    "   add  sp,  sp, #144",
+    "   ldp  x29, x30, [sp, #144]",
+    "   add  sp,  sp, #160",
     "   ret",
 
     ".global sprintf",
     ".type sprintf, %function",
     "sprintf:",
-    "   sub  sp,  sp, #144",
-    "   stp  x29, x30, [sp, #128]",
+    "   sub  sp,  sp, #160",
+    "   stp  x29, x30, [sp, #144]",
     "   str  x2, [sp, #0]",
     "   str  x3, [sp, #8]",
     "   str  x4, [sp, #16]",
@@ -391,17 +410,21 @@ core::arch::global_asm!(
     "   stp  d2, d3, [sp, #80]",
     "   stp  d4, d5, [sp, #96]",
     "   stp  d6, d7, [sp, #112]",
+    "   add  x9, sp, #160",
+    "   str  x9, [sp, #128]",
+    "   mov  x9, #6",
+    "   str  x9, [sp, #136]",
     "   mov  x2,  sp",
     "   bl   sprintf_impl",
-    "   ldp  x29, x30, [sp, #128]",
-    "   add  sp,  sp, #144",
+    "   ldp  x29, x30, [sp, #144]",
+    "   add  sp,  sp, #160",
     "   ret",
 
     ".global snprintf",
     ".type snprintf, %function",
     "snprintf:",
-    "   sub  sp,  sp, #144",
-    "   stp  x29, x30, [sp, #128]",
+    "   sub  sp,  sp, #160",
+    "   stp  x29, x30, [sp, #144]",
     "   str  x3, [sp, #0]",
     "   str  x4, [sp, #8]",
     "   str  x5, [sp, #16]",
@@ -411,10 +434,14 @@ core::arch::global_asm!(
     "   stp  d2, d3, [sp, #80]",
     "   stp  d4, d5, [sp, #96]",
     "   stp  d6, d7, [sp, #112]",
+    "   add  x9, sp, #160",
+    "   str  x9, [sp, #128]",
+    "   mov  x9, #5",
+    "   str  x9, [sp, #136]",
     "   mov  x3,  sp",
     "   bl   snprintf_impl",
-    "   ldp  x29, x30, [sp, #128]",
-    "   add  sp,  sp, #144",
+    "   ldp  x29, x30, [sp, #144]",
+    "   add  sp,  sp, #160",
     "   ret",
 );
 
@@ -426,7 +453,7 @@ core::arch::global_asm!(
     ".global printf",
     ".type printf, @function",
     "printf:",
-    "   sub  rsp, 136",
+    "   sub  rsp, 152",
     "   mov  [rsp+0], rsi",
     "   mov  [rsp+8], rdx",
     "   mov  [rsp+16], rcx",
@@ -440,15 +467,18 @@ core::arch::global_asm!(
     "   movq [rsp+104], xmm5",
     "   movq [rsp+112], xmm6",
     "   movq [rsp+120], xmm7",
+    "   lea  rax, [rsp+160]",
+    "   mov  [rsp+128], rax",
+    "   mov  qword ptr [rsp+136], 5",
     "   mov  rsi, rsp",
     "   call printf_impl",
-    "   add  rsp, 136",
+    "   add  rsp, 152",
     "   ret",
 
     ".global fprintf",
     ".type fprintf, @function",
     "fprintf:",
-    "   sub  rsp, 136",
+    "   sub  rsp, 152",
     "   mov  [rsp+0], rdx",
     "   mov  [rsp+8], rcx",
     "   mov  [rsp+16], r8",
@@ -461,15 +491,18 @@ core::arch::global_asm!(
     "   movq [rsp+104], xmm5",
     "   movq [rsp+112], xmm6",
     "   movq [rsp+120], xmm7",
+    "   lea  rax, [rsp+160]",
+    "   mov  [rsp+128], rax",
+    "   mov  qword ptr [rsp+136], 4",
     "   mov  rdx, rsp",
     "   call fprintf_impl",
-    "   add  rsp, 136",
+    "   add  rsp, 152",
     "   ret",
 
     ".global sprintf",
     ".type sprintf, @function",
     "sprintf:",
-    "   sub  rsp, 136",
+    "   sub  rsp, 152",
     "   mov  [rsp+0], rdx",
     "   mov  [rsp+8], rcx",
     "   mov  [rsp+16], r8",
@@ -482,15 +515,18 @@ core::arch::global_asm!(
     "   movq [rsp+104], xmm5",
     "   movq [rsp+112], xmm6",
     "   movq [rsp+120], xmm7",
+    "   lea  rax, [rsp+160]",
+    "   mov  [rsp+128], rax",
+    "   mov  qword ptr [rsp+136], 4",
     "   mov  rdx, rsp",
     "   call sprintf_impl",
-    "   add  rsp, 136",
+    "   add  rsp, 152",
     "   ret",
 
     ".global snprintf",
     ".type snprintf, @function",
     "snprintf:",
-    "   sub  rsp, 136",
+    "   sub  rsp, 152",
     "   mov  [rsp+0], rcx",
     "   mov  [rsp+8], r8",
     "   mov  [rsp+16], r9",
@@ -502,9 +538,12 @@ core::arch::global_asm!(
     "   movq [rsp+104], xmm5",
     "   movq [rsp+112], xmm6",
     "   movq [rsp+120], xmm7",
+    "   lea  rax, [rsp+160]",
+    "   mov  [rsp+128], rax",
+    "   mov  qword ptr [rsp+136], 3",
     "   mov  rcx, rsp",
     "   call snprintf_impl",
-    "   add  rsp, 136",
+    "   add  rsp, 152",
     "   ret",
 );
 
