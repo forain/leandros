@@ -56,6 +56,12 @@ unsafe fn device_attr_index() -> Option<u64> {
 pub unsafe fn setup(hhdm: usize, kphys: usize, kvirt: usize) {
     crate::exception::init_early();
 
+    // Drop stale TLB entries first: on HVF the physical UART "translates"
+    // only through a TLB entry left over from the firmware's identity map,
+    // which Limine's TTBR0 tables do not contain. The first `tlbi vmalle1is`
+    // anywhere later (the HHDM fill) then turns every early print into a
+    // translation fault whose report faults again (L8.3, lane hhdmfill).
+    core::arch::asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
     let uart = crate::uart::BASE;
     if translates(uart) {
         crate::uart::set_early_mode(crate::uart::EARLY_IDENT);

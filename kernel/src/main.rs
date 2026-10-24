@@ -2397,8 +2397,8 @@ fn a64_table(hhdm: u64, phys: u64) -> Option<*mut u64> {
 /// Normal); valid entries are never touched. Then every usable range is
 /// walked again and what is still unmapped is reported (yellow) and
 /// re-sanitized out as Reserved. MMIO is not the HHDM's job here: drivers
-/// map it Device-nGnRE with `map_mmio_range`. Default = check only (holes
-/// dropped from mm); `mm.hhdmfill=1` fills, `mm.hhdmfill=2m` fills without 1 GiB blocks. Uses no heap.
+/// map it Device-nGnRE with `map_mmio_range`. Default = fill; `mm.hhdmfill=0`
+/// only checks (holes dropped from mm), `mm.hhdmfill=2m` fills without 1 GiB blocks. Uses no heap.
 #[cfg(target_arch = "aarch64")]
 fn early_hhdm_a64(hhdm: u64, reported: usize) {
     use boot::hhdm_a64 as h;
@@ -2417,8 +2417,7 @@ fn early_hhdm_a64(hhdm: u64, reported: usize) {
         let mut top = entries.iter().filter(|e| e.type_ == 0).map(|e| e.base + e.length).max().unwrap_or(0);
         // `unmap4g1`: only the GiB at 4 GiB.
         if test == Some("unmap4g1") { top = top.min((1 << 32) + (1 << 30)); }
-        // A fault in the test must report ESR/FAR, not wedge silently.
-        arch_aarch64::exception::init();
+        // Faults here are reported by the early vectors (`early::setup`).
         let mut a: u64 = 1 << 32;
         while a < top {
             let busy = entries.iter().any(|e| e.type_ != 0 && e.base < a + (1 << 30) && e.base + e.length > a);
@@ -2449,19 +2448,24 @@ fn early_hhdm_a64(hhdm: u64, reported: usize) {
     let knob = cmdline_knob("mm.hhdmfill");
     let mut st = h::FillStats::default();
     let mut pool_used: Option<boot::MemoryRegion> = None;
-    // Report-only by default: the in-place fill is not yet proven in a
-    // guest (earlyfb.test=unmap4g wedges before the first serial line, see
-    // artifacts/notes/lane-hhdmwalk-2026-10-24.md). `mm.hhdmfill=1|2m` opts in.
-    if any_hole && (knob == Some("1") || knob == Some("2m")) {
+    // Fill by default (as on x86_64); `mm.hhdmfill=0` = report-only (holes
+    // dropped from mm), `mm.hhdmfill=2m` = no 1 GiB blocks. Proven with
+    // earlyfb.test=unmap4g1 on HVF and TCG (lane-hhdmfill-2026-10-24.md).
+    if any_hole && knob != Some("0") {
         // Leaf attributes: Limine's own for the first usable page.
         let tmpl = entries.iter().find(|e| e.type_ == 0)
             .map(|e| unsafe { h::walk(root, bits, hhdm + (e.base & !0xFFF), &table) })
             .filter(|w| w.page != 0);
         const POOL: u64 = 256 * 4096;
+        // Pool = the top of the highest usable region the HHDM maps: the
+        // bottom of RAM can hold boot data Limine reports as usable (QEMU
+        // virt: the DTB at 0x4000_0000, found later by `early_dtb_ram_scan`).
         let mut pool = 0u64;
         for r in unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() } {
             if r.kind != boot::MemoryType::Available || r.length < POOL { continue; }
-            if a64_mapped(hhdm + r.base) && a64_mapped(hhdm + r.base + POOL - 4096) { pool = r.base; break; }
+            let b = (r.base + r.length - POOL) & !0xFFF;
+            if b < r.base { continue; }
+            if a64_mapped(hhdm + b) && a64_mapped(hhdm + b + POOL - 4096) && b > pool { pool = b; }
         }
         match tmpl {
             None => serial_print_str("[early] hhdm: no mapped usable page to copy attributes from; holes stay excluded\n"),
