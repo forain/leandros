@@ -221,7 +221,8 @@ pub fn proc_text() -> Option<String> {
     let mut s = String::new();
     let gt = proc_gt(&mut s).is_some();
     let uapi = super::uapi::proc_errors(&mut s);
-    if gt || uapi { Some(s) } else { None }
+    let prime = crate::drm_device_interface::proc_prime(&mut s);
+    if gt || uapi || prime { Some(s) } else { None }
 }
 
 fn proc_gt(s: &mut String) -> Option<()> {
