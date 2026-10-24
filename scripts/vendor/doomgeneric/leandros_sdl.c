@@ -132,7 +132,10 @@ static int audio_open_pipewire(void) {
     if (pid == 0) {
         dup3(fds[0], 0, 0);          // stdin = the pipe (dup3 clears CLOEXEC)
         char *argv[] = {
+            // The rate is explicit: measured on x86 KVM, pw-cat drained this
+            // pipe at ~48.1k frames/s with only the WAV header's 44100 to go by.
             "pw-cat", "--playback", "--media-role", "Game", "--latency", "40ms",
+            "--rate", "44100", "--channels", "2", "--format", "s16",
             "-P", "{ application.name = DOOM node.name = doom node.description = DOOM }",
             "-", 0
         };
@@ -242,12 +245,18 @@ void leandros_audio_pump(void) {
     }
     s_stat_frames += remaining;
     if (s_stats && now - s_stat_t0 >= 10000) {
+        // At most three variadic arguments per call: the x86_64 static libc
+        // DOOM links misreads variadic arguments passed on the stack.
         char line[200];
-        int k = snprintf(line, sizeof line,
-            "[doom] audio: pace=%s %ums frames=%llu (%llu/s) dropped=%lluB pumps=%u max_dt=%ums dry=%u min_fill=%u\n",
-            fill >= 0 ? "fill" : "clock", now - s_stat_t0, (unsigned long long)s_stat_frames,
-            (unsigned long long)(s_stat_frames * 1000 / (now - s_stat_t0)), (unsigned long long)s_pcm_dropped,
-            s_stat_pumps, s_stat_max_dt, s_stat_dry, s_stat_min_fill == 0xFFFFFFFF ? 0 : s_stat_min_fill);
+        uint32_t el = now - s_stat_t0;
+        int k = snprintf(line, sizeof line, "[doom] audio: pace=%s %ums frames=%u",
+            fill >= 0 ? "fill" : "clock", el, (unsigned)s_stat_frames);
+        if (k > 0 && k < (int)sizeof line)
+            k += snprintf(line + k, sizeof line - k, " (%u/s) dropped=%uB pumps=%u",
+                (unsigned)(s_stat_frames * 1000 / el), (unsigned)s_pcm_dropped, s_stat_pumps);
+        if (k > 0 && k < (int)sizeof line)
+            k += snprintf(line + k, sizeof line - k, " max_dt=%ums dry=%u min_fill=%u\n",
+                s_stat_max_dt, s_stat_dry, s_stat_min_fill == 0xFFFFFFFF ? 0 : s_stat_min_fill);
         if (k > 0) write(1, line, (size_t)k < sizeof line ? (size_t)k : sizeof line - 1);
         s_stat_t0 = now; s_stat_frames = 0; s_pcm_dropped = 0; s_stat_pumps = 0;
         s_stat_max_dt = 0; s_stat_dry = 0; s_stat_min_fill = 0xFFFFFFFF;
