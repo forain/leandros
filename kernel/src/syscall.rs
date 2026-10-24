@@ -4053,7 +4053,7 @@ fn sys_clock_gettime(clkid: usize, tp_ptr: usize) -> isize {
 /// exit itself wakes them (invariant 16). Before, a registration waiting for
 /// the hang-up alone (no POLLIN) slept through the reap.
 fn pidfd_reaped_wake(pid: u32) {
-    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PIDFD, pid));
+    sched::wake_poll_key(sched::poll_key(sched::poll_class::PIDFD, pid));
 }
 
 /// sys_clock_settime(clkid, tp_ptr) — step the wall clock (root only). Only

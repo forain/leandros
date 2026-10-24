@@ -224,6 +224,8 @@ pub unsafe extern "C" fn epoll_main(argc: isize, argv: *mut *mut u8, _envp: *mut
         if !arg.is_null() && *arg == b'p' { return abi::pollbench(); }
         // `stat` (lane epattr, see stat.rs).
         if !arg.is_null() && *arg == b's' { return stat::stat_main(); }
+        // `xwake`: the exit-wake guard alone (wake attribution reruns).
+        if !arg.is_null() && *arg == b'x' { return stat::exit_wake_main(); }
         // `cost` / `costbench` (lane epollcost, see cost.rs).
         if !arg.is_null() && *arg == b'c' {
             return if *arg.add(4) == b'b' { cost::costbench() } else { cost::cost_main() };
