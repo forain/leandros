@@ -533,10 +533,35 @@ fn loop_backing(n: u8) -> Option<VnodeKind> {
 /// loop over — the same thing a real block device does.
 const MAX_XFER: usize = 256 * 1024;
 
-/// `read(2)` on a block node: copy `len` bytes at `off` into the caller's
+/// `read(2)` on a block node: loops `MAX_XFER` chunks until `len` is satisfied,
+/// the device ends, or an error (bytes so far win over the error).
+pub fn read_at(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
+    let mut done = 0usize;
+    while done < len {
+        let r = read_chunk(dev, off + done as u64, buf_ptr + done, len - done);
+        if r < 0 { return if done > 0 { done as isize } else { r }; }
+        if r == 0 { break; }
+        done += r as usize;
+    }
+    done as isize
+}
+
+/// `write(2)` on a block node, chunked like `read_at`.
+pub fn write_at(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
+    let mut done = 0usize;
+    while done < len {
+        let r = write_chunk(dev, off + done as u64, buf_ptr + done, len - done);
+        if r < 0 { return if done > 0 { done as isize } else { r }; }
+        if r == 0 { break; }
+        done += r as usize;
+    }
+    done as isize
+}
+
+/// One chunk of `read_at`: copy `len` bytes at `off` into the caller's
 /// buffer. `buf_ptr` is a user pointer and is touched with **no lock held**,
 /// so a demand-paging fault there resolves normally.
-pub fn read_at(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
+fn read_chunk(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
     let (root, base, size) = match resolve(dev) { Some(r) => r, None => return -6 }; // ENXIO
     if off >= size { return 0; }
     let n = len.min((size - off) as usize).min(MAX_XFER);
@@ -564,7 +589,7 @@ pub fn dev_read_only(dev: u16) -> bool {
 /// `write(2)` on a block node. Writes past the end of the device are refused
 /// with ENOSPC rather than silently truncated; a read-only disk (NVMe without
 /// `nvme.rw=1`) answers EROFS.
-pub fn write_at(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
+fn write_chunk(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
     let (root, base, size) = match resolve(dev) { Some(r) => r, None => return -6 };
     if dev_read_only(dev) { return -30; } // EROFS
     if off >= size { return -28; } // ENOSPC
