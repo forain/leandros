@@ -10909,7 +10909,7 @@ pub fn poll_fd_direct(pid: u32, fd: usize, want_ofd: u32) -> Option<(u32, u64, s
 fn poll_vnode_foreign(kind: &VnodeKind) -> bool {
     matches!(kind,
         VnodeKind::SignalFd { .. } | VnodeKind::Pty { .. }
-        | VnodeKind::PidFd { .. } | VnodeKind::Inotify { .. } | VnodeKind::DevVt { .. }
+        | VnodeKind::Inotify { .. } | VnodeKind::DevVt { .. }
         | VnodeKind::DynamicDevice { .. }
         // The static kinds (`static_poll_tag`): no producer at all.
         | VnodeKind::RamFile { .. } | VnodeKind::TmpFile { .. } | VnodeKind::MountedFile { .. }
@@ -10925,6 +10925,8 @@ fn poll_vnode_key(kind: &VnodeKind) -> Option<u64> {
         VnodeKind::Pipe { ring, .. } => Some(pipe_key(*ring)),
         VnodeKind::EventFd { slot } => Some(eventfd_key(*slot)),
         VnodeKind::TimerFd { slot } => Some(timerfd_key(*slot)),
+        // Exit / reap wake it keyed (sched exit paths, pidfd_reaped_wake).
+        VnodeKind::PidFd { pid } => Some(sched::poll_key(sched::poll_class::PIDFD, *pid)),
         _ => None,
     }
 }

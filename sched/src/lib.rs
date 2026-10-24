@@ -489,8 +489,11 @@ fn log_exit(rq: &mut runqueue::RunQueue, pid: Pid, status: ExitStatus, parent_tg
     // on its way out of the run queue, so this is the one edge its park can
     // rely on (lock-free; the next tick pays it). The child's SIGCHLD wakes it
     // too, but only when one is sent.
-    request_poll_wake_tagged(poll_tag(poll_class::WAIT, parent_tgid));
-    if is_process { request_poll_wake_tagged(poll_tag(poll_class::PIDFD, pid)); }
+    // Keyed (lane panelwake): the WAIT park and the pidfd answer name these
+    // objects by bits only (never refined) or by this exact key, so the key
+    // reaches every real waiter and skips pollers that merely share the bit.
+    request_poll_wake_key(poll_key(poll_class::WAIT, parent_tgid));
+    if is_process { request_poll_wake_key(poll_key(poll_class::PIDFD, pid)); }
 }
 
 /// What a pidfd for process `tgid` reports: `(exited, reaped)`. Exited means
@@ -628,8 +631,8 @@ fn group_exit_notice(rq: &RunQueue, tgid: Pid, uid: u32) -> Option<(Pid, ExitSta
 /// Send a settled process's SIGCHLD and wake its waiters (no locks held).
 fn send_group_exit_notice(tgid: Pid, n: (Pid, ExitStatus, u32, u8)) {
     let (parent, status, uid, exit_sig) = n;
-    request_poll_wake_tagged(poll_tag(poll_class::WAIT, parent));
-    wake_poll_tagged(poll_tag(poll_class::PIDFD, tgid));
+    request_poll_wake_key(poll_key(poll_class::WAIT, parent));
+    wake_poll_key(poll_key(poll_class::PIDFD, tgid));
     // The clone's exit signal: SIGCHLD unless clone/clone3 asked for another,
     // 0 for none at all.
     if exit_sig != 0 {
@@ -1302,7 +1305,7 @@ fn reparent_children(dead_tgid: Pid) {
             EXIT_LOG.lock().for_each_pending(|rec| {
                 if rec.parent_tgid == dead_tgid { rec.parent_tgid = init; handed = true; }
             });
-            if handed { request_poll_wake_tagged(poll_tag(poll_class::WAIT, init)); }
+            if handed { request_poll_wake_key(poll_key(poll_class::WAIT, init)); }
         }
         let mut pdeath = [(0 as Pid, 0u8); BATCH];
         let mut npd = 0usize;
@@ -7308,8 +7311,8 @@ fn scheduler_run_loop() -> ! {
                     // SIGCHLD needs task context (it takes RUN_QUEUE and may
                     // wake the parent's threads): a worker sends it. The wait
                     // channel is lock-free and goes now.
-                    request_poll_wake_tagged(poll_tag(poll_class::WAIT, n.0));
-                    request_poll_wake_tagged(poll_tag(poll_class::PIDFD, tgid));
+                    request_poll_wake_key(poll_key(poll_class::WAIT, n.0));
+                    request_poll_wake_key(poll_key(poll_class::PIDFD, tgid));
                     if let Some(wq) = workqueue::system() {
                         let _ = wq.queue_fn(move || send_group_exit_notice(tgid, n));
                     }
@@ -7997,8 +8000,8 @@ pub fn exit(code: i32) -> ! {
     // common last thread out and gets the immediate wake; any other thread's
     // exit may be the last one too (the leader can pthread_exit first), and
     // that rarer case is paid by the next tick. `log_exit` backs both.
-    let pidfd_tag = poll_tag(poll_class::PIDFD, tgid);
-    if pid == tgid { wake_poll_tagged(pidfd_tag); } else { request_poll_wake_tagged(pidfd_tag); }
+    let pidfd_key = poll_key(poll_class::PIDFD, tgid);
+    if pid == tgid { wake_poll_key(pidfd_key); } else { request_poll_wake_key(pidfd_key); }
     if let Some(n) = notice {
         // Process-directed: deliver to any parent thread that hasn't masked
         // SIGCHLD (tokio blocks it on the main thread), not blindly the leader.

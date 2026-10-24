@@ -432,6 +432,9 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         m.data[24..32].copy_from_slice(
             &drivers::drm_device_interface::drm_event_poll_tag(open_id).to_le_bytes());
         m.data[32] = 1;
+        // Its exact key: READY_EVENTS pushes wake keyed (drm_event_wake).
+        sched::poll_reply_put_keys(&mut m.data,
+            &[drivers::drm_device_interface::drm_event_poll_key(open_id)]);
         m
     } else if msg.tag == vfs_server::VFS_CLOSE {
         // The VFS sends this once the LAST fd on this open is gone, with the
