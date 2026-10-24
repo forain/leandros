@@ -4681,6 +4681,8 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
 }
 
 fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize, addrlen: usize) -> Message {
+    // A kernel-range buffer must be EFAULT here: the fault fixup only covers user addresses.
+    if len != 0 && !sched::uaccess::user_range_ok(buf_ptr, len) { return err_reply(-14); }
     // A UDP socket with UDP_SEGMENT set splits a long send (see `udp_send_gso`).
     if GSO_USED.load(Ordering::Relaxed) {
         let seg = fd_ofd(pid, fd).map_or(0, |o| sock_opts(o).gso) as usize;
@@ -5248,6 +5250,7 @@ fn unix_dgram_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
 fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize, addrlen_ptr: usize,
                flags: usize) -> Message {
     let peek = flags & MSG_PEEK != 0;
+    if len != 0 && !sched::uaccess::user_range_ok(buf_ptr, len) { return err_reply(-14); }
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.lock();
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
