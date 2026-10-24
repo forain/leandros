@@ -1767,6 +1767,7 @@ static BACKEND: UapiBackend = UapiBackend {
     date: "20230929",
     desc: "Intel Graphics (LeandrOS i915 UAPI)",
     ioctl,
+    user_args: true,
     gem_close,
     mmap,
     release_open,

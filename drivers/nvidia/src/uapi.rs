@@ -1912,6 +1912,7 @@ static BACKEND: UapiBackend = UapiBackend {
     date: "20120801",
     desc: "nVidia Riva/TNT/GeForce/Quadro/Tesla/Tegra K1+ (OpenRM translation)",
     ioctl,
+    user_args: false,
     gem_close,
     mmap,
     release_open,

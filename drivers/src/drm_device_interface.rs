@@ -5637,7 +5637,7 @@ impl DrmDeviceInterface {
     pub fn handle_ioctl(&mut self, cmd: u32, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         let dir = (cmd >> 30) & 3;
         let size = ((cmd >> 16) & 0x3fff) as usize;
-        if dir == 0 || size == 0 || arg == 0 {
+        if dir == 0 || size == 0 || arg == 0 || backend_takes_user_arg(cmd) {
             return self.handle_ioctl_inner(cmd, arg, open_id);
         }
         let mut kbuf = vec![0u64; (size + 7) / 8 + 1];
@@ -10382,3 +10382,16 @@ impl DrmDumbBuffer {
     }
 }
 
+
+/// A registered GPU backend that does its own user access (`user_args`)
+/// receives its private-block ioctls with the caller's pointer: the bounce
+/// would hand it a kernel address that `sched::uaccess` refuses (the i915
+/// iris probe SIGSEGV, lane irisseg). v3d, dispatched ahead of the backend,
+/// keeps the bounce.
+fn backend_takes_user_arg(cmd: u32) -> bool {
+    let nr = cmd & 0xFF;
+    (cmd >> 8) & 0xFF == 0x64
+        && (DRM_COMMAND_BASE..0xA0).contains(&nr)
+        && !v3d_active()
+        && crate::gpu_uapi::backend().map_or(false, |b| b.user_args)
+}
