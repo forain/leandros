@@ -12,6 +12,7 @@
 #   ports/rtl_nic/fetch.sh --force    re-download everything
 #
 # Pinned to one linux-firmware tag; each file is checked against its sha256.
+sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi; }  # shasum is not on every Linux host
 
 set -euo pipefail
 
@@ -49,7 +50,7 @@ for entry in "${FILES[@]}"; do
     name="${entry%% *}"
     sum="${entry##* }"
     out="$CACHE/$name"
-    if [[ $FORCE == 0 && -f "$out" ]] && [[ "$(shasum -a 256 "$out" | cut -d' ' -f1)" == "$sum" ]]; then
+    if [[ $FORCE == 0 && -f "$out" ]] && [[ "$(sha256_of "$out" | cut -d' ' -f1)" == "$sum" ]]; then
         continue
     fi
     tmp="$out.part"
@@ -57,7 +58,7 @@ for entry in "${FILES[@]}"; do
         echo "rtl_nic: download of $name failed" >&2
         rm -f "$tmp"; fail=1; continue
     fi
-    got="$(shasum -a 256 "$tmp" | cut -d' ' -f1)"
+    got="$(sha256_of "$tmp" | cut -d' ' -f1)"
     if [[ "$got" != "$sum" ]]; then
         echo "rtl_nic: $name sha256 mismatch ($got)" >&2
         rm -f "$tmp"; fail=1; continue

@@ -81,7 +81,7 @@ for arch in aarch64 x86_64; do
   mkdir -p "$SHIP/$arch"
   install -m 0755 "$SRC/target/$target/release/greetd" "$SHIP/$arch/greetd"
   install -m 0755 "$SRC/target/$target/release/fakegreet" "$SHIP/$arch/fakegreet"
-  (cd "$HERE/pam-leandros/src" && LC_ALL=C cat $(LC_ALL=C ls) | shasum -a 256 | cut -d" " -f1) > "$SHIP/$arch/greetd.srchash"
+  (cd "$HERE/pam-leandros/src" && LC_ALL=C cat $(LC_ALL=C ls) | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d" " -f1) > "$SHIP/$arch/greetd.srchash"
   echo "staged $arch: $SHIP/$arch/greetd + fakegreet"
 done
 
