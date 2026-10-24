@@ -26,7 +26,8 @@ while associated (`monitor_once` -> `wait_notif` -> `msleep(1)`). Laptop idle on
 - Trial 1 bug: `rx_rearm` answered "drained" when DEV was held by the driver thread, leaving frames the
   daemon itself had queued in rx_eth until the 1 s idle cap (gaps of exactly 1.07+n s). Fixed in commit 2.
 - Wi-Fi associated + DHCP on every boot (all checks ran over Wi-Fi), MSI vector 0x43, no IRQ storm.
-- QEMU aarch64 regress (incl. wifisimtest, nettag2test, sshsmoke): see merge log below.
+- QEMU aarch64 regress: PASS except nettag2test (known wake-count flake; PASS on rerun at the final commit). wifisimtest PASS in regress; once hit the known Limine "Loading module" own-boot hang, PASS on rerun. x86_64 + aarch64 build clean.
+- Laptop: trial f40d175b8cae PROMOTED as good.
 
 ## Open
 - netd still ~110 passes/s, not 1-2/s: ~30 handled IRQs/s (LAN chatter + beacon-driven notifications) plus
