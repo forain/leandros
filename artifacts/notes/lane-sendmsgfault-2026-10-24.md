@@ -7,7 +7,7 @@ Findings:
   Fix (relibc eb01acd9 + follow-up): those four call the READV/WRITEV/PREADV/PWRITEV syscalls directly (no copy, faster).
 - Worse, on the unfixed tree sendmsg on a stream socket with a kernel-address iov_base took an EL1 Sync Fault in
   the net server (ring.write copy_raw has no range check; the uaccess fixup only covers user addresses).
-  Fix: servers/net/src/lib.rs range-checks each iov (user_range_ok) in the sendmsg/recvmsg iov loops and the
+  Fix (landed on main concurrently with identical checks; main's version kept on merge): servers/net/src/lib.rs range-checks each iov (user_range_ok) in the sendmsg/recvmsg iov loops and the
   SCM_RIGHTS sendmsg pre-read. handle_send/handle_recv cannot check: splice passes kernel buffers to NET_SEND.
 Guard: syscalltest iov_efault_{sendmsg,writev,readv,recvmsg,pwritev,preadv}_{one,kernel} (12 cases, child process,
   EFAULT or short count accepted, signal fails). Red on main: kernel EL1 fault at sendmsg_kernel; green: 12/12.
