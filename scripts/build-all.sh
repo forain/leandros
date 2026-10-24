@@ -713,6 +713,18 @@ build_procmax() {
     "$ROOT_DIR/userland/procmax/build.sh" "$arch"
 }
 
+# Function to build greetd-login -- start a desktop session from a root
+# shell over greetd IPC (userland/greetdlogin). Same shape as procmax.
+build_greetdlogin() {
+    local arch="$1"
+    echo "🔑 Building $arch greetd-login..."
+    if [[ ! -x "$ROOT_DIR/userland/greetdlogin/build.sh" ]]; then
+        echo "⚠️  userland/greetdlogin not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/greetdlogin/build.sh" "$arch"
+}
+
 # Function to build blanktest — Wayland frame callbacks while the outputs are
 # powered off (userland/blanktest). Same shape as procmax.
 build_blanktest() {
@@ -988,6 +1000,7 @@ for arch in "${ARCHS[@]}"; do
     build_nmtest "$arch"
     build_procmax "$arch"
     build_blanktest "$arch"
+    build_greetdlogin "$arch"
     build_claude_run "$arch"
     build_sudo_rs "$arch"
     build_sudotest "$arch"
