@@ -22,6 +22,7 @@ Options:
                                       (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
                                       + host:netroamtest.py (Wi-Fi roaming between two subnets, own boot) + host:netflaptest.py
                                       + host:netidletest.py (idle net-daemon passes < 10/s)
+                                      + host:inloadtest.py (hostfwd connects under bulk load and an unpumped held serial)
                                       + host:udppeertest.py (udptest peer: fragments, ICMP errors, IGMP, broadcast)
                              netroam  host:netroamtest.py alone
                              udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
@@ -183,6 +184,8 @@ SUITES = {
                 "host:netflaptest.py",
                 # Idle net-daemon wake bound (own boot): netidletest.py.
                 "host:netidletest.py",
+                # hostfwd connects under bulk load / a held unpumped serial (own boot).
+                "host:inloadtest.py",
                 # e1000e link monitor on ICR.LSC (set_link flaps, idle wake
                 # bound) + netcheck --put TX bulk (own boot): linkmontest.py.
                 "host:linkmontest.py",
@@ -203,6 +206,7 @@ SUITES = {
     "linkmon": ["host:linkmontest.py"],
     # netidletest.py alone.
     "netidle": ["host:netidletest.py"],
+    "inload": ["host:inloadtest.py"],
     # nettxtest.py alone (shaped upload).
     "nettx": ["host:nettxtest.py --tx --shape eth0:20000:20000:64:256:2",
               "host:nettxtest.py --shape eth0:20000:20000:64:256:2"],
