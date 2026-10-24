@@ -1164,7 +1164,9 @@ pub fn init(cmdline: &str) {
         lq: cmdline_val(cmdline, "iwlwifi.lq") != Some("0"),
         fw: cmdline_val(cmdline, "iwlwifi.fw").map(String::from),
         ssid: cmdline_val(cmdline, "wifi.ssid").map(percent_decode),
-        psk: cmdline_val(cmdline, "wifi.psk").map(percent_decode),
+        // Deprecated: the kernel lifts `wifi.psk=` off its stored command
+        // line at boot (drivers::cmdline_secrets); it is never in `cmdline`.
+        psk: crate::cmdline_secrets::take("wifi.psk").map(|v| percent_decode(core::str::from_utf8(&v).unwrap_or(""))),
         mgr: cmdline_val(cmdline, "iwlwifi.mgr") == Some("1"),
         softdisc: cmdline_val(cmdline, "iwlwifi.softdisc") != Some("0"),
         scanconn: cmdline_val(cmdline, "iwlwifi.scanconn") == Some("1"),
@@ -1963,7 +1965,10 @@ fn load_credentials(opts: &Opts) -> Option<(Vec<u8>, Vec<u8>)> {
         }
     }
     if ssid.is_none() {
-        if let Some(s) = opts.ssid.clone() { ssid = Some(s); psk = opts.psk.clone(); src = "kernel command line"; }
+        if let Some(s) = opts.ssid.clone() {
+            ssid = Some(s); psk = opts.psk.clone(); src = "kernel command line";
+            if psk.is_some() { log("wifi.psk= on the kernel command line is DEPRECATED (it was scrubbed from /proc/cmdline): put ssid=/psk= in /etc/leandros/wifi.conf (mode 0600)"); }
+        }
     }
     match ssid {
         Some(s) if !s.is_empty() && s.len() <= 32 => {

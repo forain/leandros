@@ -6381,10 +6381,12 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
 
     if path == b"/proc/cmdline" {
         let mut p = 0;
-        // Non-root readers get secret knobs (wifi.psk=...) redacted; root
-        // gets the real line (kexec --reuse-cmdline). See cmdline_redact.
+        // Secret knobs (wifi.psk=...) are redacted for EVERY reader. The
+        // kernel already lifts them off its stored line at boot (see
+        // drivers::cmdline_secrets), so this is the second fence. Root sees
+        // the raw line only when the boot opted in with `cmdline.raw=1`.
         if let Some(c) = *KERNEL_CMDLINE.lock() {
-            if root {
+            if root && c.split_ascii_whitespace().any(|t| t == "cmdline.raw=1") {
                 p = write_lit(buf, p, c.as_bytes());
             } else {
                 cmdline_redact::redact(c, |piece| p = write_lit(buf, p, piece.as_bytes()));

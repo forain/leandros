@@ -6,10 +6,12 @@ test-only passphrase) and asserts that FAKE does not appear in:
   serial      the whole serial log of the boot (= what the persistent klog
               partition records: every console byte is copied there)
   klog        `espctl klog` in the guest (the persistent log, when present)
+  proc_root   /proc/cmdline read by root (the kernel lifts secret knobs off
+              its stored command line at boot; /proc/cmdline also redacts
+              them for every reader unless `cmdline.raw=1`)
   proc_user   /proc/cmdline read by the non-root user `leandro`
-              (must show `wifi.psk=<redacted len=N>` instead)
-Positive control: root's /proc/cmdline still has the real value (kexec
---reuse-cmdline depends on it), so the knob really was on the line.
+Positive control: the boot log says the `wifi.psk=` knob was lifted off the
+command line, so the knob really was on the line.
 
 Usage: psklogtest.py [aarch64|x86_64]    (REPO=<checkout> to test another tree)
 """
@@ -25,7 +27,7 @@ DRV = os.path.join(HERE, "driver.py")
 sys.path.insert(0, HERE)
 import imgclone  # noqa: E402
 
-FAKE = "testpsk-0123456789"
+FAKE = "SECRET123-fakepsk"
 CMDLINE = f"wifi.ssid=PskLeakNet wifi.psk={FAKE}"
 
 
@@ -74,9 +76,12 @@ def main(argv):
         with open(driver.SERIAL_FULL_LOG, "rb") as f:
             boot_log = f.read().decode(errors="replace")  # boot + login, before any command of ours
         _, out = sh("cat /proc/cmdline")
-        verdict("proc_root_control", FAKE in out, "(root sees the real knob)" if FAKE in out else "(knob missing: test invalid)")
+        lifted = "secret knob wifi.psk= lifted" in boot_log
+        verdict("lifted_control", lifted, "(boot log: wifi.psk= lifted off the cmdline)" if lifted else "(no lift line: knob missing or not scrubbed)")
+        ok = FAKE not in out and "wifi.ssid=PskLeakNet" in out
+        verdict("proc_root", ok, "(root /proc/cmdline has no PSK)" if ok else "(root sees the PSK, or cmdline missing)")
         _, out = sh("su leandro -c 'id -u; cat /proc/cmdline'")
-        ok = FAKE not in out and "wifi.psk=<redacted len=18>" in out and "1000" in out
+        ok = FAKE not in out and "wifi.ssid=PskLeakNet" in out and "1000" in out
         verdict("proc_user", ok, "(non-root /proc/cmdline redacted)" if ok else "(non-root sees the PSK or no redaction marker)")
         sh("espctl klog > /tmp/psklog-k.txt 2>&1; true", 90)
         def count(c):

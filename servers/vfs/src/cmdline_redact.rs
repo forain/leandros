@@ -13,9 +13,12 @@
 //! key and N stay visible so a wrong-length passphrase can still be told
 //! apart from a missing one. No bytes of the value are emitted.
 //!
-//! Users: the kernel's console echoes of the command line (always
-//! redacted) and `/proc/cmdline` for non-root readers (root gets the real
-//! line: `kexec --reuse-cmdline` must hand the next kernel the real PSK).
+//! Users: the kernel's console echoes of the command line and
+//! `/proc/cmdline` for every reader (root gets the raw line only with the
+//! `cmdline.raw=1` boot knob). The kernel also removes secret knobs from its
+//! stored command line at boot (`drivers::cmdline_secrets`), so in practice
+//! this redaction is a second fence. The Wi-Fi passphrase belongs in the
+//! root-only `/etc/leandros/wifi.conf`, not on the command line.
 
 const EXACT: &[&str] = &["psk", "pmk", "key", "pass", "passwd", "password", "passphrase", "secret", "token"];
 const SUFFIX: &[&str] = &["psk", "passwd", "password", "passphrase", "secret", "token"];

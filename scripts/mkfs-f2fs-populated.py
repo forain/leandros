@@ -2856,7 +2856,9 @@ def main():
             (_slot, b"", 0o100660, (0, GID_NETDEV)))
     for image_dir, name, hostpath in m4_share_files:
         ino = _path_to_ino[image_dir]
-        m4_tree_files_by_ino.setdefault(ino, []).append((name, hostpath, 0o100644))
+        # The Wi-Fi credentials are root-only (0600), like /etc/shadow.
+        _mode = 0o100600 if (image_dir, name) == ("/etc/leandros", "wifi.conf") else 0o100644
+        m4_tree_files_by_ino.setdefault(ino, []).append((name, hostpath, _mode))
     # The synthetic sysfs attributes ride the same packing table; they carry
     # their own mode because one of them (the "subsystem" link) is S_IFLNK and
     # the rest are 0444 like real sysfs.
