@@ -168,11 +168,14 @@ fn lossy_top_rate_steps_down_and_settles() {
     let mut c = RateCtl::new(&cfg(-57));
     c.next_probe_ms = u64::MAX; // the antennas are alike here: no comparison
     let mut now = 1000;
+    let mut at36 = 0;
     c.mark_sent(now);
     for i in 0..2000 {
         now += 25;
         let t = c.sent.unwrap();
-        let p = match rate_r500k(t[0]).unwrap() { 108 => 60, 96 => 75, _ => 97 };
+        let rate = rate_r500k(t[0]).unwrap();
+        if i >= 1000 && rate == 72 { at36 += 1; }
+        let p = match rate { 108 => 60, 96 => 75, _ => 97 };
         // Deterministic "random": frame i succeeds first try if (i*37 % 100) < p,
         // else the second try at the same rate.
         let first_ok = (i * 37 % 100) < p;
@@ -181,7 +184,10 @@ fn lossy_top_rate_steps_down_and_settles() {
         if c.due(now) { c.mark_sent(now); }
     }
     // Expected throughput: 54 M 0.6*186=112, 48 M 0.75*177=133, 36 M 0.97*154=149.
-    assert_eq!(c.cur_r500k(), 72, "{}", c.summary(now));
+    // 48 M's window goes stale while 36 M runs, so it is re-probed every few
+    // seconds (as rs.c re-explores after its stay-in-column timeout): the
+    // controller spends most of the time at 36 M, not all of it.
+    assert!(at36 >= 800, "36 M for {} of the last 1000 frames: {}", at36, c.summary(now));
     assert!(c.downs >= 2);
 }
 
