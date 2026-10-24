@@ -26,7 +26,7 @@
 //! Prints `<name>: PASS` or `<name>: FAIL (...)`, ends with
 //! `--- futextest done --- failures=N`; exit status is the failure count.
 
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering::SeqCst};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -754,6 +754,270 @@ fn kwake_scan_indexed() -> bool {
     report("kwake_scan_indexed", ok, detail)
 }
 
+const FUTEX_CMP_REQUEUE: i64 = 4;
+
+/// Full futex call with uaddr2 and val3. `ts` is passed as a raw integer so
+/// requeue can put val2 in the timeout slot.
+fn futex6(w: *const AtomicU32, op: i64, val: u32, ts: usize, w2: *const AtomicU32, val3: u32) -> i64 {
+    let r = unsafe { syscall(nr::FUTEX, w, op, val as u64, ts, w2, val3 as u64) };
+    if r < 0 { -(errno() as i64) } else { r }
+}
+
+/// /proc/rqhold futex.rs rows `file:line holds ns_held max_ns ns_spun`
+/// as (line, holds, ns_held, ns_spun), plus the `# lock TASKS` row as
+/// (holds, ns_held, ns_spun).
+fn futex_rq_rows() -> Option<(Vec<(String, u64, u64, u64)>, (u64, u64, u64))> {
+    let t = std::fs::read_to_string("/proc/rqhold").ok()?;
+    let mut rows = Vec::new();
+    let mut tasks = None;
+    for l in t.lines() {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if l.starts_with("# lock TASKS") && tasks.is_none() {
+            let g = |k: &str| f.iter().position(|w| *w == k).and_then(|i| f.get(i + 1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            tasks = Some((g("holds"), g("ns_held"), g("ns_spun")));
+        } else if !l.starts_with('#') && f.len() >= 5 {
+            let (file, _) = match f[0].rsplit_once(':') { Some(x) => x, None => continue };
+            if !file.ends_with("futex.rs") { continue; }
+            let p = |i: usize| f[i].parse::<u64>().unwrap_or(0);
+            rows.push((f[0].to_string(), p(1), p(2), p(4)));
+        }
+    }
+    Some((rows, tasks?))
+}
+
+/// Join with a deadline; false if the thread did not finish in `secs`.
+fn join_deadline(h: thread::JoinHandle<()>, t0: Instant, secs: u64) -> bool {
+    while !h.is_finished() {
+        if t0.elapsed() > Duration::from_secs(secs) { return false; }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let _ = h.join();
+    true
+}
+
+/// Microbenchmark: how many RUN_QUEUE (TASKS) holds does a futex wait/wake
+/// ping-pong cost per futex syscall.
+fn pingpong_holds() -> bool {
+    const N: u64 = 20000;
+    static WA: AtomicU32 = AtomicU32::new(0);
+    static WB: AtomicU32 = AtomicU32::new(0);
+    static OPS: AtomicU64 = AtomicU64::new(0);
+    WA.store(0, SeqCst);
+    WB.store(0, SeqCst);
+    OPS.store(0, SeqCst);
+    let before = futex_rq_rows();
+    let t0 = Instant::now();
+    let ha = thread::spawn(|| {
+        let mut ops = 0u64;
+        for _ in 0..N {
+            WB.store(1, SeqCst);
+            futex(&WB, FUTEX_WAKE | FUTEX_PRIVATE, 1, core::ptr::null(), 0);
+            ops += 1;
+            while WA.load(SeqCst) == 0 {
+                futex(&WA, FUTEX_WAIT | FUTEX_PRIVATE, 0, core::ptr::null(), 0);
+                ops += 1;
+            }
+            WA.store(0, SeqCst);
+        }
+        OPS.fetch_add(ops, SeqCst);
+    });
+    let hb = thread::spawn(|| {
+        let mut ops = 0u64;
+        for _ in 0..N {
+            while WB.load(SeqCst) == 0 {
+                futex(&WB, FUTEX_WAIT | FUTEX_PRIVATE, 0, core::ptr::null(), 0);
+                ops += 1;
+            }
+            WB.store(0, SeqCst);
+            WA.store(1, SeqCst);
+            futex(&WA, FUTEX_WAKE | FUTEX_PRIVATE, 1, core::ptr::null(), 0);
+            ops += 1;
+        }
+        OPS.fetch_add(ops, SeqCst);
+    });
+    let oka = join_deadline(ha, t0, 30);
+    let okb = oka && join_deadline(hb, t0, 30);
+    let ns = t0.elapsed().as_nanos() as u64;
+    if !(oka && okb) {
+        println!("pingpong_holds: HANG after {} s", t0.elapsed().as_secs());
+        return report("pingpong_holds", false, "thread hung >30 s".into());
+    }
+    let after = futex_rq_rows();
+    let ops = OPS.load(SeqCst).max(1);
+    match (before, after) {
+        (Some((br, bt)), Some((ar, at))) => {
+            let delta = |r: &Vec<(String, u64, u64, u64)>, k: &str| r.iter().find(|x| x.0 == k).map(|x| (x.1, x.2, x.3)).unwrap_or((0, 0, 0));
+            let (mut h, mut nh, mut sp) = (0u64, 0u64, 0u64);
+            let mut sites = Vec::new();
+            for a in &ar {
+                let b = delta(&br, &a.0);
+                let (dh, dn, ds) = (a.1.saturating_sub(b.0), a.2.saturating_sub(b.1), a.3.saturating_sub(b.2));
+                h += dh; nh += dn; sp += ds;
+                if dh > 0 { sites.push(format!("  site {} +{} +{}", a.0, dh, dn)); }
+            }
+            let th = at.0.saturating_sub(bt.0);
+            println!("pingpong_holds: rounds={} futex_ops={} futex_rq_holds={} holds_per_op={:.2} futex_rq_ns_per_hold={} futex_rq_spun_ns={} tasks_holds_per_round={:.2} ns_per_round={}",
+                     N, ops, h, h as f64 / ops as f64, if h > 0 { nh / h } else { 0 }, sp, th as f64 / N as f64, ns / N);
+            for s in sites { println!("{}", s); }
+        }
+        _ => println!("pingpong_holds: rounds={} futex_ops={} (no /proc/rqhold futex rows) ns_per_round={}", N, ops, ns / N),
+    }
+    report("pingpong_holds", true, String::new())
+}
+
+fn xorshift(s: &mut u64) -> u64 {
+    *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s
+}
+
+/// Correctness guard: a wake the kernel counted must be seen by exactly one
+/// waiter (A); ring hand-offs with long timeouts never lose a wake (B);
+/// CMP_REQUEUE moves waiters that later wake one by one (C).
+fn futex_lost_wake_stress() -> bool {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let mut fail = Vec::new();
+
+    // Phase A
+    static W: AtomicU32 = AtomicU32::new(0);
+    static CLAIMED: AtomicU64 = AtomicU64::new(0);
+    static WOKEN: AtomicU64 = AtomicU64::new(0);
+    static ALIVE: AtomicU32 = AtomicU32::new(0);
+    static STOP: AtomicBool = AtomicBool::new(false);
+    W.store(0, SeqCst);
+    CLAIMED.store(0, SeqCst);
+    WOKEN.store(0, SeqCst);
+    ALIVE.store(0, SeqCst);
+    STOP.store(false, SeqCst);
+    let mut hs = Vec::new();
+    for i in 0..8u64 {
+        ALIVE.fetch_add(1, SeqCst);
+        hs.push(thread::spawn(move || {
+            let mut s = 0x9e3779b97f4a7c15u64 ^ (i + 1).wrapping_mul(0x1234567);
+            let mut woken = 0u64;
+            while !STOP.load(SeqCst) {
+                let us = 200 + xorshift(&mut s) % 2800;
+                let ts = Timespec { tv_sec: 0, tv_nsec: (us * 1000) as i64 };
+                if futex(&W, FUTEX_WAIT | FUTEX_PRIVATE, 0, &ts, 0) == 0 { woken += 1; }
+            }
+            WOKEN.fetch_add(woken, SeqCst);
+            ALIVE.fetch_sub(1, SeqCst);
+        }));
+    }
+    let mut wk = Vec::new();
+    for i in 0..2u64 {
+        wk.push(thread::spawn(move || {
+            let mut s = 0xdeadbeefcafef00du64 ^ (i + 1).wrapping_mul(0x777);
+            let mut c = 0u64;
+            while !STOP.load(SeqCst) {
+                let n = match xorshift(&mut s) % 3 { 0 => 1, 1 => 2, _ => i32::MAX as u32 };
+                let r = futex(&W, FUTEX_WAKE | FUTEX_PRIVATE, n, core::ptr::null(), 0);
+                if r > 0 { c += r as u64; }
+                thread::sleep(Duration::from_micros(100 + xorshift(&mut s) % 400));
+            }
+            CLAIMED.fetch_add(c, SeqCst);
+        }));
+    }
+    thread::sleep(Duration::from_millis(1500));
+    STOP.store(true, SeqCst);
+    for h in wk { let _ = h.join(); }
+    let t0 = Instant::now();
+    while ALIVE.load(SeqCst) > 0 && t0.elapsed() < Duration::from_secs(10) {
+        let r = futex(&W, FUTEX_WAKE | FUTEX_PRIVATE, i32::MAX as u32, core::ptr::null(), 0);
+        if r > 0 { CLAIMED.fetch_add(r as u64, SeqCst); }
+        thread::sleep(Duration::from_millis(1));
+    }
+    for h in hs { let _ = h.join(); }
+    let (claimed, woken) = (CLAIMED.load(SeqCst), WOKEN.load(SeqCst));
+    if claimed != woken { fail.push(format!("A claimed={} woken={}", claimed, woken)); }
+
+    // Phase B
+    const RING: usize = 6;
+    const TOTAL: u64 = 3000;
+    let words: Arc<Vec<AtomicU32>> = Arc::new((0..RING).map(|_| AtomicU32::new(0)).collect());
+    let done = Arc::new(AtomicBool::new(false));
+    let hand = Arc::new(AtomicU64::new(0));
+    let lost = Arc::new(AtomicU64::new(0));
+    words[0].store(1, SeqCst);
+    let tb = Instant::now();
+    let mut rs = Vec::new();
+    for i in 0..RING {
+        let (words, done, hand, lost) = (words.clone(), done.clone(), hand.clone(), lost.clone());
+        rs.push(thread::spawn(move || {
+            let ts = rel(2000);
+            loop {
+                while words[i].load(SeqCst) == 0 {
+                    if done.load(SeqCst) { return; }
+                    // A wait that times out, or sleeps >= 1 s in a ring that
+                    // hands the token on within microseconds, slept through
+                    // (or was delayed past) its wake.
+                    let t0 = Instant::now();
+                    let r = futex(&words[i], FUTEX_WAIT | FUTEX_PRIVATE, 0, &ts, 0);
+                    if r == -(ETIMEDOUT as i64) || t0.elapsed().as_millis() >= 1000 {
+                        lost.fetch_add(1, SeqCst);
+                        done.store(true, SeqCst);
+                        return;
+                    }
+                }
+                words[i].store(0, SeqCst);
+                if hand.fetch_add(1, SeqCst) + 1 >= TOTAL {
+                    done.store(true, SeqCst);
+                    for w in words.iter() {
+                        w.store(1, SeqCst);
+                        futex(w, FUTEX_WAKE | FUTEX_PRIVATE, 1, core::ptr::null(), 0);
+                    }
+                    return;
+                }
+                let n = (i + 1) % RING;
+                words[n].store(1, SeqCst);
+                futex(&words[n], FUTEX_WAKE | FUTEX_PRIVATE, 1, core::ptr::null(), 0);
+            }
+        }));
+    }
+    let mut b_hung = false;
+    for h in rs {
+        if !join_deadline(h, tb, 30) { b_hung = true; break; }
+    }
+    let (handoffs, lost_n) = (hand.load(SeqCst), lost.load(SeqCst));
+    if lost_n > 0 || b_hung || handoffs < TOTAL {
+        fail.push(format!("B handoffs={} lost={} hung={}", handoffs, lost_n, b_hung));
+    }
+
+    // Phase C
+    static C1: AtomicU32 = AtomicU32::new(0);
+    static C2: AtomicU32 = AtomicU32::new(0);
+    static CRES: AtomicU32 = AtomicU32::new(0); // waiters returning 0
+    static CBAD: AtomicU32 = AtomicU32::new(0);
+    C1.store(0, SeqCst);
+    C2.store(0, SeqCst);
+    CRES.store(0, SeqCst);
+    CBAD.store(0, SeqCst);
+    let mut cs = Vec::new();
+    for _ in 0..8 {
+        cs.push(thread::spawn(|| {
+            let ts = rel(5000);
+            if futex(&C1, FUTEX_WAIT | FUTEX_PRIVATE, 0, &ts, 0) == 0 { CRES.fetch_add(1, SeqCst); } else { CBAD.fetch_add(1, SeqCst); }
+        }));
+    }
+    thread::sleep(Duration::from_millis(300));
+    let rq = futex6(&C1, FUTEX_CMP_REQUEUE | FUTEX_PRIVATE, 1, i32::MAX as usize, &C2, 0);
+    let mut c_woken: i64 = if rq >= 1 { 1 } else { 0 };
+    let tc = Instant::now();
+    while c_woken < 8 && tc.elapsed() < Duration::from_secs(3) {
+        let r = futex(&C2, FUTEX_WAKE | FUTEX_PRIVATE, 1, core::ptr::null(), 0);
+        if r > 0 { c_woken += r; }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let tcj = Instant::now();
+    for h in cs { if !join_deadline(h, tcj, 10) { fail.push("C waiter hung".into()); break; } }
+    let c_ret = CRES.load(SeqCst);
+    if c_woken != 8 || c_ret != 8 || CBAD.load(SeqCst) != 0 || rq < 0 {
+        fail.push(format!("C requeue_ret={} woken={} ret0={} bad={}", rq, c_woken, c_ret, CBAD.load(SeqCst)));
+    }
+
+    println!("futex_lost_wake_stress: A claimed={} woken={} B handoffs={} lost={} C woken={}/8", claimed, woken, handoffs, lost_n, c_ret);
+    report("futex_lost_wake_stress", fail.is_empty(), fail.join("; "))
+}
+
 fn main() {
     let only = std::env::args().nth(1);
     let tests: &[(&str, fn() -> bool)] = &[
@@ -769,6 +1033,8 @@ fn main() {
         ("wait4_scan_children_only", wait4_scan_children_only),
         ("kwake_scan_indexed", kwake_scan_indexed),
         ("deadline_short_waiters", deadline_short_waiters),
+        ("pingpong_holds", pingpong_holds),
+        ("futex_lost_wake_stress", futex_lost_wake_stress),
         ("robust_exit", || robust_process("robust_exit", Death::Exit, false)),
         ("robust_exit_waited", || robust_process("robust_exit_waited", Death::ExitWhileWaited, false)),
         ("robust_killed", || robust_process("robust_killed", Death::Killed, false)),

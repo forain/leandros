@@ -407,7 +407,11 @@ fn wait_key(key: FutexKey, uaddr: usize, expected: u32, mono_deadline: Option<u6
             // the race being closed. Ignored signals must not count (POSIX), so
             // this uses the disposition-aware predicate rather than a bare
             // `pending & !mask`.
-            if !handing && super::signal::has_deliverable_signal_locked(&rq, pid) {
+            // A clear sigfast hint proves no pending unmasked signal; it is
+            // only ever set under RUN_QUEUE (held here), so it is exact now
+            // and saves the task + leader lookups (lane playcost6).
+            if !handing && !super::current_sig_quiet()
+                && super::signal::has_deliverable_signal_locked(&rq, pid) {
                 drop(rq);
                 // Un-register: we are not going to sleep after all.
                 clear_slot(&mut tbl, idx, pid);
@@ -420,7 +424,8 @@ fn wait_key(key: FutexKey, uaddr: usize, expected: u32, mono_deadline: Option<u6
                 return FUTEX_INTERRUPTED;
             }
 
-            if let Some(t) = rq.find_pid_mut(pid) {
+            let ti = rq.find_pid_idx(pid);
+            if let Some(t) = ti.and_then(|i| rq.task_at_mut(i, pid)) {
                 t.set_state(TaskState::Blocked);
                 t.blocked_futex = uaddr;
                 // Leave no stale poll-channel registration behind: a thread
@@ -436,7 +441,7 @@ fn wait_key(key: FutexKey, uaddr: usize, expected: u32, mono_deadline: Option<u6
                 t.poll_deadline = if handing { u64::MAX } else { deadline.unwrap_or(u64::MAX) };
                 t.rt_wait = if handing { 0 } else { rt.map_or(0, |r| r.max(1)) };
             }
-            if deadline.is_some() && !handing { rq.note_timed_wait(pid); }
+            if deadline.is_some() && !handing { if let Some(i) = ti { rq.note_timed_wait_idx(i); } }
             handing
         };
 
@@ -592,42 +597,60 @@ fn wake_key(key: FutexKey, n: u32) -> u32 {
             return 0;
         }
         crate::playstat::FWAKE_LOCKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let mut rq  = RUN_QUEUE.lock();
 
+        // Pick the targets BEFORE taking RUN_QUEUE (lane playcost6): the
+        // bucket walk, key compares and claim bookkeeping only need
+        // FUTEX_TABLE, which is held throughout, so the set cannot change.
+        // RUN_QUEUE is then held only for the per-task state transitions and
+        // the wake placement. A wake of more waiters than fit in `cand`
+        // takes the rest in further rounds, still under the same holds.
+        let mut cand = [0u16; 16];
+        let mut rqg = None;
         let mut i = tbl.head[bucket(&key)];
-        while i != NIL {
-            if woken >= n { break; }
-            let cur = i as usize;
-            i = tbl.next[cur];
-            let Some(w) = tbl.slot[cur] else { continue };
-            if w.woken || w.key != key { continue; }
-
-            // The task is gone (killed between registering and being reaped):
-            // drop the stale slot without spending a wake on it.
-            let Some(t) = rq.find_pid_mut(w.pid) else {
-                tbl.free(cur);
-                continue;
-            };
-            let tidy = t.state == TaskState::Blocked;
-            if tidy {
-                t.set_state(TaskState::Ready);
-                t.blocked_futex = 0;
-                t.poll_deadline = u64::MAX;
-                t.rt_wait = 0;
-                resched = true;
+        loop {
+            let mut nc = 0usize;
+            while i != NIL && woken as usize + nc < n as usize && nc < cand.len() {
+                let cur = i as usize;
+                i = tbl.next[cur];
+                if let Some(w) = tbl.slot[cur] {
+                    if !w.woken && w.key == key { cand[nc] = cur as u16; nc += 1; }
+                }
             }
-            if let Some(slot) = tbl.slot[cur].as_mut() { slot.woken = true; slot.tidy = tidy; }
-            woken += 1;
+            if nc == 0 { break; }
+            let rq = rqg.get_or_insert_with(|| RUN_QUEUE.lock());
+            for &c in &cand[..nc] {
+                let cur = c as usize;
+                let Some(w) = tbl.slot[cur] else { continue };
+                // The task is gone (killed between registering and being
+                // reaped): drop the stale slot without spending a wake on it.
+                let Some(t) = rq.find_pid_mut(w.pid) else {
+                    tbl.free(cur);
+                    continue;
+                };
+                let tidy = t.state == TaskState::Blocked;
+                if tidy {
+                    t.set_state(TaskState::Ready);
+                    t.blocked_futex = 0;
+                    t.poll_deadline = u64::MAX;
+                    t.rt_wait = 0;
+                    resched = true;
+                }
+                if let Some(slot) = tbl.slot[cur].as_mut() { slot.woken = true; slot.tidy = tidy; }
+                woken += 1;
+            }
+            if i == NIL || woken >= n { break; }
         }
         // Phase 2 (lane percpu): queue the wakee(s) now. A single wakee of a
         // user thread's FUTEX_WAKE goes on the waker's CPU (sync wake: the
         // waker usually blocks next and this CPU then picks it; if not, the
         // deferred kick at its syscall return lets an idle CPU steal it).
         let me = unsafe { super::cpu_id() };
-        if resched && woken == 1 && super::current_is_user_task(me) {
-            rq.flush_woken_sync(Some(me));
-        } else {
-            rq.flush_woken();
+        if let Some(rq) = rqg.as_mut() {
+            if resched && woken == 1 && super::current_is_user_task(me) {
+                rq.flush_woken_sync(Some(me));
+            } else {
+                rq.flush_woken();
+            }
         }
     }
 
