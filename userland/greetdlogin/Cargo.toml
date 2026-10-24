@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "greetdlogin"
+version = "0.1.0"
+edition = "2021"
+description = "start a desktop session from a root shell over greetd IPC (password on stdin)"
+
+# Standalone std/musl crate, outside the userland workspace, like
+# userland/procmax. No dependencies. Built by build.sh.
+[[bin]]
+name = "greetd-login"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = 2

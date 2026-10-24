@@ -1848,6 +1848,12 @@ def main():
     if os.path.exists(p):
         bin_files.append(("blanktest", p, 0o100755))
 
+    # greetd-login: from a root shell, logs a user in through the running
+    # greeter's greetd (password on stdin) and starts their COSMIC session.
+    p = f"userland/greetdlogin/target/{_musl_triple}/release/greetd-login"
+    if os.path.exists(p):
+        bin_files.append(("greetd-login", p, 0o100755))
+
     # nmtest: drives org.freedesktop.NetworkManager (leandros-sysbus
     # networkmanager) through nmrs 3.4.0, the library the COSMIC network
     # applet uses (userland/nmtest). Run as `dbus-run-session -- nmtest --spawn`
