@@ -1519,13 +1519,19 @@ unsafe fn mnt_pass_once(path: &[u8], mode: u32) -> bool {
         wait4(pid, &mut status, 0, core::ptr::null_mut());
         if status == 0 { sret = 1; }
     }
-    // Churn the mount server's open slots so a freed slot gets reused.
-    let o2 = open(path.as_ptr(), O_RDONLY, 0);
+    // Churn the mount server's open slots with a DIFFERENT file so a freed
+    // slot gets reused by content the guard can tell apart ("OTHER").
+    let mut opath = [0u8; 40];
+    let plen = path.len() - 1;
+    opath[..plen].copy_from_slice(&path[..plen]);
+    opath[plen] = b'2';
+    let o2 = open(opath.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if o2 >= 0 { write(o2, b"OTHER".as_ptr(), 5); lseek(o2, 0, SEEK_SET); }
     let (_n, _f, rfd, _cl) = recv_fd_and_byte(sv[1], 32, 0);
     let mut rbuf = [0u8; 5];
     let got = if rfd >= 0 { read(rfd, rbuf.as_mut_ptr(), 5) } else { -1 };
     dbg2(b"[fd_pass_mnt] mode=%d read via received fd -> %d\n\0", mode as i64, got as i64);
-    if o2 >= 0 { close(o2); }
+    if o2 >= 0 { close(o2); unlink(opath.as_ptr()); }
     if rfd >= 0 { close(rfd); }
     if sv[0] >= 0 { close(sv[0]); }
     close(sv[1]);
