@@ -582,6 +582,17 @@ const VIRTGPU_PARAM_LEANDROS_CTRLQ_STAT: u64 = 0x1000_000A;
 /// without a fragmented allocator or a custom boot. Forcing only changes the
 /// SHAPE of new guest backings, never who can reach them.
 const VIRTGPU_PARAM_LEANDROS_SCATTER: u64 = 0x1000_000B;
+/// LeandrOS extension: how many per-open 3D context slots are free right now
+/// (`MAX_GPU_CTXS` minus the bound ones). venustest's slot-exhaustion phase
+/// sizes itself from this instead of hard-coding the cap.
+const VIRTGPU_PARAM_LEANDROS_FREE_CTXS: u64 = 0x1000_000C;
+/// LeandrOS extension: window offset (in 4 KiB pages) of the most recent
+/// successful host-visible blob MAP. The DRM mmap token is a fake offset
+/// handed out next-fit (deliberately not reused, like Linux), so it cannot
+/// show whether the window allocator hands a released span straight back;
+/// venustest 4c reads this instead to catch a bump allocator.
+const VIRTGPU_PARAM_LEANDROS_HOSTVIS_LAST_OFF: u64 = 0x1000_000D;
+static HOSTVIS_LAST_WIN_OFF: AtomicU64 = AtomicU64::new(0);
 /// EXECBUFFER submissions that waited on an in-fence (syncobj or FENCE_FD_IN).
 pub static EXEC_IN_FENCE_WAITS: AtomicU64 = AtomicU64::new(0);
 
@@ -8766,6 +8777,18 @@ impl DrmDeviceInterface {
             { let o = n.min(u32::MAX as u64) as u32; ucp_out(req.value as u64, &o as *const u32 as *const u8, 4); }
             return Ok(0);
         }
+        if req.param == VIRTGPU_PARAM_LEANDROS_FREE_CTXS {
+            if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            let n = VIRTGPU_CTXS.lock().iter().filter(|c| c.open_id == 0).count() as u32;
+            uwrite_user(req.value as usize, &n)?;
+            return Ok(0);
+        }
+        if req.param == VIRTGPU_PARAM_LEANDROS_HOSTVIS_LAST_OFF {
+            if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            let pages = (HOSTVIS_LAST_WIN_OFF.load(Ordering::Relaxed) >> 12) as u32;
+            uwrite_user(req.value as usize, &pages)?;
+            return Ok(0);
+        }
         if req.param == VIRTGPU_PARAM_LEANDROS_SCATTER {
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
             let sel: u32 = uread_user(req.value as usize)?;
@@ -8960,6 +8983,30 @@ impl DrmDeviceInterface {
 
         let ctx = ctx_lookup(open_id);
         let backing = if guest_backed { Some((phys as u64, size as u32)) } else { None };
+
+        // Upstream parity (virtio_gpu_resource_create_blob_ioctl): `cmd` is a
+        // context command stream submitted BEFORE the create, so the host
+        // object the blob names by `blob_id` exists when CREATE_BLOB looks it
+        // up. virgl's HOST3D blobs need it (a PIPE_RESOURCE_CREATE carrying the
+        // blob_id); Venus creates its object through EXECBUFFER and sends none.
+        // Skipping it made every virgl host-visible blob fail host-side (0x1200).
+        if req.cmd_size != 0 {
+            const MAX_BLOB_CMD: u32 = 64 * 1024;
+            if ctx == 0 || req.cmd == 0 || req.cmd_size > MAX_BLOB_CMD || req.cmd_size % 4 != 0 {
+                if phys != 0 { mm::buddy::free(phys, order); }
+                return Err(DriverError::InvalidParameter);
+            }
+            let mut cmds = vec![0u8; req.cmd_size as usize];
+            unsafe { ucp_in(cmds.as_mut_ptr(), req.cmd, cmds.len()); }
+            let sub = {
+                let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+                match guard.as_mut() { Some(gpu) => gpu.submit_3d(ctx, &cmds, None), None => Err(()) }
+            };
+            if sub.is_err() {
+                if phys != 0 { mm::buddy::free(phys, order); }
+                return Err(DriverError::Io);
+            }
+        }
 
         let res_handle = {
             let mut guard = crate::virtio_gpu::lock_gpu();
@@ -9231,6 +9278,7 @@ impl DrmDeviceInterface {
             return Err(DriverError::InvalidParameter);
         }
 
+        HOSTVIS_LAST_WIN_OFF.store(off as u64, Ordering::Relaxed);
         crate::pci::serial_debug("[DRM] host-visible blob mapped: res=");
         crate::pci::serial_debug_hex(b.res_handle);
         crate::pci::serial_debug(" win_off=");
