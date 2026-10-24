@@ -33,3 +33,10 @@ window (varies per boot/host chatter), hence 8–170 passes/s.
 - iwlwifi rx_irq_driven stays false (poll_receive services the device), so wifi keeps the 10 ms / 1 kHz
   cadence; laptop idle on Wi-Fi is not improved by this lane.
 - Limine own-boot hang ("Loading module") seen 2x in one net-e2e run (harness/firmware, not this lane).
+
+## After merging main (sched/netctl changes), rebuilt
+- netidletest 1.1/s PASS (4th boot). nettest, sshsmoke 5/5, nettag2 9/9 PASS on rerun.
+- First post-merge try: nettest tcp_keepalive_probes FAIL (192.168.105.1:53 connect -1) in the same window as
+  sshsmoke 0/5 (host->guest port 22 timed out) and nettag2 unbound_epollet (known wake-count flake): the
+  host<->guest vmnet path was down for that window; all three passed on rerun. The keepalive_probes case
+  is the same one seen once on the first lane cut — watch it (repro: runtests aarch64 <tag> /bin/nettest).
