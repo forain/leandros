@@ -278,6 +278,8 @@ static IRQS: AtomicU32 = AtomicU32::new(0);
 static IRQ_EMPTY: AtomicU32 = AtomicU32::new(0);
 static IRQ_LAST: AtomicU32 = AtomicU32::new(0);
 static IRQ_VECTOR: AtomicU32 = AtomicU32::new(0);
+/// `rx_rearm` found DEV held (another pass instead of a sleep).
+static RX_REARM_BUSY: AtomicU32 = AtomicU32::new(0);
 /// Driver-thread parks while associated, and how many ended on a kick.
 static THREAD_PARKS: AtomicU32 = AtomicU32::new(0);
 static THREAD_KICKED: AtomicU32 = AtomicU32::new(0);
@@ -327,9 +329,11 @@ fn irq_rearm() {
 pub fn rx_rearm() -> bool {
     if !IRQ_ON.load(Ordering::Acquire) || !link_up() { return false; }
     irq_rearm();
-    // Held by the driver thread: it services the ring itself and kicks the
-    // daemon for every frame it queues.
-    let g = match DEV.try_lock() { Some(g) => g, None => return false };
+    // Held by the driver thread: frames this daemon queued in its own drain
+    // (`rx_eth`) may still wait, and nobody would kick for them; look again
+    // (the holders are short critical sections). Answering false here left
+    // them for the 1 s idle cap: SSH round trips of 2-4 s on the laptop.
+    let g = match DEV.try_lock() { Some(g) => g, None => { RX_REARM_BUSY.fetch_add(1, Ordering::Relaxed); return true; } };
     g.as_ref().map_or(false, |d| !d.rx_eth.is_empty() || d.t.rx_pending())
 }
 
@@ -3083,10 +3087,10 @@ pub fn info_lines(out: &mut String) {
         let _ = writeln!(out, "firmware: {}", i.fw);
         let _ = writeln!(out, "state: {}", i.state);
         let _ = writeln!(out, "rfkill: {}", if i.rfkill { "on" } else { "off" });
-        let _ = writeln!(out, "irq: {} vector {:#04x} irqs {} empty {} last {:08x} wanted {}; thread parks {} kicked {}",
+        let _ = writeln!(out, "irq: {} vector {:#04x} irqs {} empty {} last {:08x} wanted {}; thread parks {} kicked {}; rearm_busy {}",
                          if IRQ_ON.load(Ordering::Relaxed) { "msi" } else { "polled" }, IRQ_VECTOR.load(Ordering::Relaxed),
                          IRQS.load(Ordering::Relaxed), IRQ_EMPTY.load(Ordering::Relaxed), IRQ_LAST.load(Ordering::Relaxed),
-                         tr::IRQ_WANTED.load(Ordering::Relaxed) as u8, THREAD_PARKS.load(Ordering::Relaxed), THREAD_KICKED.load(Ordering::Relaxed));
+                         tr::IRQ_WANTED.load(Ordering::Relaxed) as u8, THREAD_PARKS.load(Ordering::Relaxed), THREAD_KICKED.load(Ordering::Relaxed), RX_REARM_BUSY.load(Ordering::Relaxed));
         if i.mcc != [0, 0] { let _ = writeln!(out, "regulatory: {}{}", i.mcc[0] as char, i.mcc[1] as char); }
         if link_up() {
             let _ = writeln!(out, "ssid: {}", wf::ssid_display(&i.ssid));
