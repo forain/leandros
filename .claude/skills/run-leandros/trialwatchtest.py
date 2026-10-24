@@ -148,10 +148,10 @@ def main(argv):
         slot = re.search(r"booted_slot=(\S+)", st)
         slot = slot.group(1) if slot else "?"
         after = log()[m.end():] if m else ""
-        verdict("loss", bool(m) and int(m.group(2)) >= 40 and slot == "good" and 40 <= elapsed <= 40 + 2 * 5 + 2 and ARMED not in after
+        verdict("loss", bool(m) and int(m.group(2)) >= 40 and slot == "good" and 40 - 5 - 1 <= elapsed <= 40 + 2 * 5 + 2 and ARMED not in after
                 and driver._qemu_pid() == pid,
                 (f"'{m.group(0)[:90]}' after {elapsed:.0f} s; " if m else "no unreachable line; ")
-                + f"reboot at {elapsed:.0f} s (want 40..50); next boot slot={slot} armed_again={ARMED in after} booted={bool(booted)} login={lg2.returncode}")
+                + f"reboot at {elapsed:.0f} s (want 34..52: counted from the last answered probe, up to every=5 s before the cut); next boot slot={slot} armed_again={ARMED in after} booted={bool(booted)} login={lg2.returncode}")
 
         # promote: a promoted trial must never reboot itself (trial_max=1 min would)
         armed1 = log().count(ARMED)
