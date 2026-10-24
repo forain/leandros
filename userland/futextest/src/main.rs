@@ -497,6 +497,106 @@ fn hint_remap_shared() -> bool {
     report("hint_remap_shared", ok, "wake through the remapped address missed the shared waiter".into())
 }
 
+/// `# dlscan` row of /proc/rqhold: [pass, slots, full].
+fn dlscan_row() -> Option<[u64; 3]> {
+    let t = std::fs::read_to_string("/proc/rqhold").ok()?;
+    let l = t.lines().find(|l| l.starts_with("# dlscan "))?;
+    let v: Vec<u64> = l.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+    if v.len() == 3 { Some([v[0], v[1], v[2]]) } else { None }
+}
+
+/// Lane playcost3 guard: a poll-deadline pass that finds one timed waiter due
+/// must not walk every parked task. 64 threads park in long timed futex
+/// waits; 200 short timed waits then expire one at a time. The deadline index
+/// keeps the slots examined per pass near the number due (was O(parked)).
+fn deadline_scan_indexed() -> bool {
+    const T: usize = 64;
+    const N: u64 = 200;
+    static FAR: AtomicU32 = AtomicU32::new(0);
+    static PARKED: AtomicU32 = AtomicU32::new(0);
+    FAR.store(0, SeqCst);
+    PARKED.store(0, SeqCst);
+    let hs: Vec<_> = (0..T).map(|_| thread::spawn(|| {
+        PARKED.fetch_add(1, SeqCst);
+        while FAR.load(SeqCst) == 0 {
+            let ts = rel(30_000);
+            futex(&FAR, FUTEX_WAIT | FUTEX_PRIVATE, 0, &ts, 0);
+        }
+    })).collect();
+    while PARKED.load(SeqCst) < T as u32 { thread::yield_now(); }
+    thread::sleep(std::time::Duration::from_millis(50));
+    let short = AtomicU32::new(0);
+    let before = dlscan_row();
+    for _ in 0..N {
+        let ts = rel(1);
+        futex(&short, FUTEX_WAIT | FUTEX_PRIVATE, 0, &ts, 0);
+    }
+    let after = dlscan_row();
+    FAR.store(1, SeqCst);
+    futex(&FAR, FUTEX_WAKE | FUTEX_PRIVATE, i32::MAX as u32, core::ptr::null(), 0);
+    for h in hs { let _ = h.join(); }
+    let (ok, detail) = match (before, after) {
+        (Some(b), Some(x)) => {
+            let (p, s, f) = (x[0] - b[0], x[1] - b[1], x[2] - b[2]);
+            let per = if p > 0 { s / p } else { u64::MAX };
+            (p >= N / 2 && per <= 16,
+             format!("{} passes, {} slots ({} per pass, {} full scans) with {} parked", p, s, per, f, T))
+        }
+        _ => (false, "no 3-field # dlscan row in /proc/rqhold".into()),
+    };
+    println!("deadline_scan_indexed: {}", detail);
+    report("deadline_scan_indexed", ok, detail)
+}
+
+/// `# w4scan` row of /proc/rqhold: [calls, slots, fallback].
+fn w4scan_row() -> Option<[u64; 3]> {
+    let t = std::fs::read_to_string("/proc/rqhold").ok()?;
+    let l = t.lines().find(|l| l.starts_with("# w4scan "))?;
+    let v: Vec<u64> = l.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+    if v.len() == 3 { Some([v[0], v[1], v[2]]) } else { None }
+}
+
+/// Lane playcost3 guard: wait4 must not dereference every task on the run
+/// queue. With one running child and 64 of the caller's own threads parked,
+/// WNOHANG polls should examine about one slot each (was every live task).
+fn wait4_scan_children_only() -> bool {
+    const T: usize = 64;
+    const N: u64 = 300;
+    static GATE: AtomicU32 = AtomicU32::new(0);
+    GATE.store(0, SeqCst);
+    let child = unsafe { fork() };
+    if child == 0 {
+        thread::sleep(Duration::from_millis(1500));
+        std::process::exit(0);
+    }
+    let hs: Vec<_> = (0..T).map(|_| thread::spawn(|| {
+        while GATE.load(SeqCst) == 0 { futex(&GATE, FUTEX_WAIT | FUTEX_PRIVATE, 0, core::ptr::null(), 0); }
+    })).collect();
+    thread::sleep(Duration::from_millis(50));
+    let before = w4scan_row();
+    let mut running = 0;
+    for _ in 0..N {
+        let mut st = 0;
+        if unsafe { waitpid(child, &mut st, 1) } == 0 { running += 1; }
+    }
+    let after = w4scan_row();
+    GATE.store(1, SeqCst);
+    futex(&GATE, FUTEX_WAKE | FUTEX_PRIVATE, i32::MAX as u32, core::ptr::null(), 0);
+    for h in hs { let _ = h.join(); }
+    let code = wait_child(child);
+    let (ok, detail) = match (before, after) {
+        (Some(b), Some(x)) => {
+            let (c, s) = (x[0] - b[0], x[1] - b[1]);
+            let per = if c > 0 { s / c } else { u64::MAX };
+            (c >= N && per <= 4 && running >= N / 2 && code == 0,
+             format!("{} scans, {} slots ({} per scan), child running {}/{} exit {}", c, s, per, running, N, code))
+        }
+        _ => (false, "no 3-field # w4scan row in /proc/rqhold".into()),
+    };
+    println!("wait4_scan_children_only: {}", detail);
+    report("wait4_scan_children_only", ok, detail)
+}
+
 fn main() {
     let only = std::env::args().nth(1);
     let tests: &[(&str, fn() -> bool)] = &[
@@ -508,6 +608,8 @@ fn main() {
         ("hint_remap_shared", hint_remap_shared),
         ("wake_empty_no_tasks", wake_empty_no_tasks),
         ("wait_woken_single_tasks_hold", wait_woken_single_tasks_hold),
+        ("deadline_scan_indexed", deadline_scan_indexed),
+        ("wait4_scan_children_only", wait4_scan_children_only),
         ("robust_exit", || robust_process("robust_exit", Death::Exit, false)),
         ("robust_exit_waited", || robust_process("robust_exit_waited", Death::ExitWhileWaited, false)),
         ("robust_killed", || robust_process("robust_killed", Death::Killed, false)),
