@@ -55,6 +55,7 @@ pub mod ofd;
 
 /// Alias mounts (proc/devtmpfs/sysfs/bind) — how a chroot gets its /proc.
 pub mod alias;
+pub mod cmdline_redact;
 mod tmppool;
 
 /// PATH_MAX: the longest path string a caller may name, NUL included.
@@ -5768,9 +5769,9 @@ fn proc_net_open(path: &[u8]) -> Option<VnodeKind> {
 }
 
 /// Generate dynamic /proc/ system-wide entries (meminfo, uptime, loadavg, stat).
-fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
+fn gen_proc_system(path: &[u8], root: bool) -> Option<VnodeKind> {
     let mut buf = [0u8; TMP_BUF_SIZE];
-    let len = gen_proc_system_content(path, &mut buf)?;
+    let len = gen_proc_system_content(path, root, &mut buf)?;
     let mut tmp = TMP_FILES.lock();
     let idx = tmp_free_slot(&mut *tmp)?;
     tmp.claim(idx, b"", true);
@@ -6259,7 +6260,7 @@ fn gen_sysfs_bytes(data: &[u8]) -> Option<VnodeKind> {
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
-fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<usize> {
+fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]) -> Option<usize> {
     let ticks = sched::ticks();
     let uptime_sec  = ticks / 100;
     let uptime_frac = (ticks % 100) / 10; // tenths of a second
@@ -6309,8 +6310,14 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
 
     if path == b"/proc/cmdline" {
         let mut p = 0;
+        // Non-root readers get secret knobs (wifi.psk=...) redacted; root
+        // gets the real line (kexec --reuse-cmdline). See cmdline_redact.
         if let Some(c) = *KERNEL_CMDLINE.lock() {
-            p = write_lit(buf, p, c.as_bytes());
+            if root {
+                p = write_lit(buf, p, c.as_bytes());
+            } else {
+                cmdline_redact::redact(c, |piece| p = write_lit(buf, p, piece.as_bytes()));
+            }
         }
         p = write_lit(buf, p, b"\n");
         return Some(p);
@@ -7595,7 +7602,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/etc/resolv.conf"
                || lookup_path == b"/proc/sys/fs/nr_open" || lookup_path == b"/proc/sys/fs/file-max"
                || lookup_path == b"/proc/sys/fs/file-nr" {
-            match gen_proc_system(lookup_path) {
+            match gen_proc_system(lookup_path, sched::fsuid_of(pid) == 0) {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }

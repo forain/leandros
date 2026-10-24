@@ -252,6 +252,8 @@ fn proc_gt(s: &mut String) -> Option<()> {
     put("flips_not_latched", NOT_LATCHED.load(Relaxed));
     put("flip_fence_us", PRES_NS[0].load(Relaxed) / 1000);
     put("flip_clflush_us", PRES_NS[1].load(Relaxed) / 1000);
+    put("flips_clflushed", super::kms::FLUSHED_FLIPS.load(Relaxed) as u64);
+    put("fifo_underruns", super::kms::underruns() as u64);
     put("flip_latch_us", PRES_NS[2].load(Relaxed) / 1000);
     put("uptime_ms", now_ns() / 1_000_000);
     Some(())

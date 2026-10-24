@@ -400,6 +400,13 @@ struct Bo {
     /// treats it as external and renders it with the PTE MOCS, so a
     /// `scanout_uc` object is written uncached and needs no flip clflush.
     prime: bool,
+    /// A CPU mapping was handed out (MMAP_OFFSET of any type: every i915
+    /// mapping is write-back), so CPU stores may sit dirty in the caches at
+    /// any time: each flip of it clflushes. Sticky.
+    cpu_wb: bool,
+    /// A one-shot cached CPU write since the last flip flush (PWRITE through
+    /// the HHDM, SET_DOMAIN with the CPU write domain).
+    cpu_dirty: bool,
     /// `Open::gen` of the open that created it: per-creator accounting for
     /// the test GETPARAMs, so a churn test can check ITS objects come back
     /// while a compositor is churning its own on the same device.
@@ -822,7 +829,7 @@ fn gem_create(a: u64, open_id: u32, ext: bool) -> Result<usize, i32> {
     st.next_obj += 1;
     CREATES.fetch_add(1, Ordering::Relaxed);
     st.bos.insert(obj, Bo { phys, order, size, handles: 1, exports: 0, tiling: 0, stride: 0, caching: CACHING_CACHED,
-                            madv: MADV_WILLNEED, last_fence: Fences::default(), dead: false, scanout_uc: false, prime: false,
+                            madv: MADV_WILLNEED, last_fence: Fences::default(), dead: false, scanout_uc: false, prime: false, cpu_wb: false, cpu_dirty: false,
                             creator: 0 });
     let o = st.open(open_id)?;
     let h = alloc_handle(o);
@@ -855,7 +862,7 @@ fn mmap_offset(a: u64, open_id: u32) -> Result<usize, i32> {
         MMAP_OFFSET_GTT => return Err(ENODEV),
         _ => return Err(EINVAL),
     }
-    let (phys, size) = with_bo(open_id, m.handle, |b| Ok((b.phys, b.size)))?;
+    let (phys, size) = with_bo(open_id, m.handle, |b| { b.cpu_wb = true; Ok((b.phys, b.size)) })?;
     // Opaque offset, never the physical base (resolved in `handle_ioctl_mmap`).
     let off = crate::drm_offset::offset_for(phys as u64, size as u64).ok_or(EINVAL)?;
     write_user::<u64>(a + 8, off);
@@ -864,7 +871,10 @@ fn mmap_offset(a: u64, open_id: u32) -> Result<usize, i32> {
 
 fn gem_rw(a: u64, open_id: u32, write: bool) -> Result<usize, i32> {
     let p: GemPrw = read_user(a);
-    let (phys, size, f) = with_bo(open_id, p.handle, |b| Ok((b.phys, b.size, b.last_fence)))?;
+    let (phys, size, f) = with_bo(open_id, p.handle, |b| {
+        if write { b.cpu_dirty = true; }
+        Ok((b.phys, b.size, b.last_fence))
+    })?;
     if p.offset.checked_add(p.size).map_or(true, |e| e > size) { return Err(EINVAL); }
     if p.size == 0 { return Ok(0); }
     if p.data_ptr == 0 { return Err(EFAULT); }
@@ -894,7 +904,10 @@ fn wait_one(f: u64, timeout_ns: u64) -> Result<(), i32> {
 fn set_domain(a: u64, open_id: u32) -> Result<usize, i32> {
     let d: GemSetDomain = read_user(a);
     if d.write_domain != 0 && d.write_domain != d.read_domains { return Err(EINVAL); }
-    let f = with_bo(open_id, d.handle, |b| Ok(b.last_fence))?;
+    let f = with_bo(open_id, d.handle, |b| {
+        if d.write_domain & GEM_DOMAIN_CPU != 0 { b.cpu_dirty = true; }
+        Ok(b.last_fence)
+    })?;
     // Moving to a CPU-visible domain waits for the GPU (LLC: no flush).
     if d.read_domains & (GEM_DOMAIN_CPU | GEM_DOMAIN_GTT | GEM_DOMAIN_WC) != 0 || d.write_domain != 0 {
         f.wait(u64::MAX)?;
@@ -1856,15 +1869,34 @@ pub(super) fn kms_bo_get(open_id: u32, handle: u32) -> Option<KmsBo> {
 pub(super) fn kms_bo_put(obj: u32) { let _ = bo_release(obj); }
 
 /// Does a flip of `obj` need the CPU clflush? `i915.kms_clflush`: 1 always,
-/// 0 never, default (2) only when the object may hold LLC-dirty GPU writes:
-/// not bound uncached, or never shared through PRIME (iris renders a
-/// non-external object with the cached MOCS entry, which overrides the PTE).
+/// 0 never, 3 the old PRIME rule (bound uncached AND shared through PRIME),
+/// default (2) only when the object may hold cache-dirty lines the display
+/// (which does not snoop the LLC) would miss:
+/// * not bound uncached (`i915.kms_uncached=0`): GPU writes land in the LLC;
+/// * a CPU mapping exists (`cpu_wb`; mappings are write-back), or a cached
+///   CPU write (PWRITE, SET_DOMAIN CPU) happened since the last flip flush.
+/// GPU rendering into a `scanout_uc` object needs nothing: Mesa allocates
+/// every GBM/KMS-shareable buffer with BO_ALLOC_SHARED (gbm_dri always adds
+/// __DRI_IMAGE_USE_SHARE; a handle handed out by EGL/Vulkan export marks it
+/// exported too), so iris/anv render it with the PTE MOCS entry -> the
+/// uncached PPGTT PTE, and the end-of-batch render-cache flush the fence
+/// waits for writes it to memory. What was cached before it went uncached
+/// is flushed once in `kms_bo_get`.
 pub(super) fn kms_bo_needs_clflush(obj: u32) -> bool {
+    let st = STATE.lock();
+    let b = match st.bos.get(&obj) { Some(b) => b, None => return true };
     match super::opt("i915.kms_clflush").unwrap_or(2) {
         0 => false,
         1 => true,
-        _ => STATE.lock().bos.get(&obj).map_or(true, |b| !(b.scanout_uc && b.prime)),
+        3 => !(b.scanout_uc && b.prime),
+        _ => !b.scanout_uc || b.cpu_wb || b.cpu_dirty,
     }
+}
+
+/// The flip is about to clflush `obj`: one-shot CPU dirtiness is consumed
+/// first (a write racing the flush marks it again for the next flip).
+pub(super) fn kms_bo_take_dirty(obj: u32) {
+    if let Some(b) = STATE.lock().bos.get_mut(&obj) { b.cpu_dirty = false; }
 }
 
 /// Implicit sync for a flip: wait (bounded) for the last request that used

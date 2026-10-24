@@ -16,6 +16,7 @@ Options:
                              regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + proctest + chroottest + netctltest + sudotest + nmtest --quick (mock) + evherdtest + pollnarrowtest + listentagtest + vfstagtest + nettag2test + kparkstest + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
+                             psklog   host:psklogtest.py alone (a cmdline wifi.psk= never reaches serial/klog/non-root /proc/cmdline)
                              pcibridge host:pcibridgetest.py alone (root port -> PCI bridge -> virtio-rng, own boot)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
                                       (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
@@ -158,6 +159,7 @@ SUITES = {
     "netctl": ["/bin/netctltest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
     "wifisim": ["host:wifisimtest.py"],
+    "psklog": ["host:psklogtest.py"],
     # lane dtbres: devices behind PCIe root port -> PCI-PCI bridge (own boot).
     "pcibridge": ["host:pcibridgetest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
@@ -181,6 +183,9 @@ SUITES = {
                 "host:netflaptest.py",
                 # Idle net-daemon wake bound (own boot): netidletest.py.
                 "host:netidletest.py",
+                # Bulk upload over a Wi-Fi-like shaped link: no spinning on a
+                # full driver TX queue (own boot): nettxtest.py.
+                "host:nettxtest.py --tx --shape eth0:20000:20000:64:256:2",
                 # IP fragmentation, ICMP errors, IGMP, broadcast, cmsgs against
                 # a frame-level host peer on a second NIC: udppeertest.py.
                 "host:udppeertest.py"],
@@ -190,6 +195,8 @@ SUITES = {
     "udppeer": ["host:udppeertest.py"],
     # netidletest.py alone.
     "netidle": ["host:netidletest.py"],
+    # nettxtest.py alone (shaped upload).
+    "nettx": ["host:nettxtest.py --tx --shape eth0:20000:20000:64:256:2"],
     # gpuprobe gl is what gpu-env runs before COSMIC; RC=0 only on a hardware
     # renderer (2 = software, 139 = the strict-PAN DRM ioctl SIGSEGV of L11.13).
     # i915 UAPI end to end on the fake device (soft command streamer), the
