@@ -3613,6 +3613,19 @@ impl PollSet {
         if t.bits & !keyed != 0 { self.n_unkeyed = self.n_unkeyed.saturating_add(1); }
     }
     /// Add bloom bits with no key (an epoll instance's own tag, a nested set).
+    /// An object only ever woken by its exact key (`wake_poll_key`) and no
+    /// probe answer carries (an epoll instance's own key): its bit plus its
+    /// fingerprint, unkeyed only when the fingerprint table is full.
+    pub fn add_key(&mut self, k: u64) {
+        let b = poll_key_bit(k);
+        if self.nfp >= POLL_FP_MAX { self.add_bits(b); return; }
+        if !self.fps[..self.nfp].contains(&poll_key_fp(k)) {
+            self.fps[self.nfp] = poll_key_fp(k);
+            self.nfp += 1;
+        }
+        self.mask |= b;
+        self.n_keyed = self.n_keyed.saturating_add(1);
+    }
     pub fn add_bits(&mut self, bits: u64) {
         if bits == POLL_TAG_ALL { self.xoff = true; }
         self.mask |= bits;
@@ -4072,9 +4085,9 @@ pub fn try_wake_poll_key(key: u64) -> bool {
 /// waiters (tag `poll_tag(EPOLL, slot)`) computed their masks without the new
 /// fd, and must be reachable by that fd's own later wake. Widening a mask can
 /// only add wakes, never lose one. Task context (takes RUN_QUEUE).
-pub fn widen_poll_masks(match_tag: u64, add: u64) {
+pub fn widen_poll_masks(match_key: u64, add: u64) {
     if add == 0 { return; }
-    RUN_QUEUE.lock().widen_port_masks(POLL_WAIT_CHANNEL, match_tag, add);
+    RUN_QUEUE.lock().widen_port_masks(POLL_WAIT_CHANNEL, match_key, add);
 }
 
 /// A `wake_poll` that has been asked for but not yet paid for, as an OR of the

@@ -12940,11 +12940,17 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     // EPOLL_CTL_GEN, which it re-checks after publishing Blocked.
     if r >= 0 && (op == CTL_ADD || op == CTL_MOD) {
         let (cur, _seq, tag) = probe_fd_events_seq(current_pid(), fd, ev.0);
-        let self_tag = epoll_self_tag(slot);
+        // Keyed (lane epnameless): every filter that watches this instance
+        // names its key (`PollSet::add_key`), so neither the wake nor the
+        // widening reaches a parker that merely shares the tag bit. The
+        // bit-only versions widened unrelated parkers' masks and let the new
+        // fd's wakes through to them (desktop: ~60 % of useless epoll wakes,
+        // a ring naming bits no registration has).
+        let self_key = epoll_self_key(slot);
         if cur != 0 {
-            sched::wake_poll_tagged(self_tag);
+            sched::wake_poll_key(self_key);
         } else {
-            sched::widen_poll_masks(self_tag, tag.bits);
+            sched::widen_poll_masks(self_key, tag.bits);
         }
     }
     if r == -2 && fd < net_server::SOCK_FD_BASE && vfs::fd_epoll_eperm(tgid, fd) {
@@ -13119,7 +13125,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         // event has fired (n > 0), in which case we return before using `mask`,
         // so whenever we reach the park `mask` has seen every armed interest.
         let mut set = sched::PollSet::new();
-        set.add_foreign_bits(epoll_self_tag(slot)); // epoll_ctl wakes it bit-only
+        set.add_key(epoll_self_key(slot)); // epoll_ctl wakes it by this key
         // Re-read the high-water mark on every pass: a CLONE_THREAD sibling
         // sharing this epoll fd may epoll_ctl(ADD) while we are blocked below,
         // and the new interest must be visible to the next probe.
@@ -13386,12 +13392,13 @@ fn ep_hit(t: &sched::PollTag, r: &sched::WakeRing) -> bool {
 
 /// Classify a useless wake for `wakestat::EP_NAMELESS` (see there).
 fn ep_nameless_why(woke_ring: bool, named: bool, r: &sched::WakeRing, self_tag: u64,
-                   others: &[EpSnap]) -> usize {
+                   others: &[EpSnap], ents: &[EpEnt]) -> usize {
     if !woke_ring || r.tags == sched::POLL_TAG_ALL { return 1; }
     if named { return 0; }
     if r.n == 0 && r.tags == 0 { return if r.flags != 0 { 2 } else { 7 }; }
     if others.iter().any(|o| o.ents.iter().any(|e| e.used && e.known && ep_hit(&e.tag, r))) { return 3; }
-    if r.tags & self_tag != 0 { return 4; }
+    if r.tags & self_tag != 0 || r.keys().iter().any(|&k| sched::poll_key_bit(k) == self_tag) { return 4; }
+    if ents.iter().any(|e| e.used && e.known && !e.armed && ep_hit(&e.tag, r)) { return 8; }
     if r.n > 0 { return 5; }
     6
 }
@@ -13456,7 +13463,7 @@ fn ep_diff_kids(k: &mut EpKids, ep: &[EpollInstance]) -> bool {
 /// instance wakes its own tag bit-only, so that bit counts as a hit too.
 fn ep_kids_need(k: &EpKids, ring: Option<&sched::WakeRing>) -> bool {
     if let Some(r) = ring {
-        if r.tags & epoll_self_tag(k.slot) != 0 { return true; }
+        if r.tags & epoll_self_tag(k.slot) != 0 || r.keys().contains(&epoll_self_key(k.slot)) { return true; }
     }
     k.ents.iter().any(|e| e.used && e.armed
         && (!e.known || e.ready || ep_always(&e.tag) || ring.map_or(false, |r| ep_hit(&e.tag, r))))
@@ -13468,7 +13475,7 @@ fn ep_kids_need(k: &EpKids, ring: Option<&sched::WakeRing>) -> bool {
 fn ep_filter_add(set: &mut sched::PollSet, pid: u32, e: &EpEnt) {
     match &e.kids {
         Some(k) => {
-            set.add_foreign_bits(epoll_self_tag(k.slot)); // epoll_ctl wakes it bit-only
+            set.add_key(epoll_self_key(k.slot)); // epoll_ctl wakes it by this key
             for x in k.ents.iter() {
                 if x.used && x.armed && x.known { poll_set_add(set, pid, &x.tag, 1); }
             }
@@ -13775,7 +13782,7 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
         ws::EP_PROBE_NS.fetch_add(t_filt.saturating_sub(t_probe), Relaxed);
         if dirty || listen_all {
             let mut set = sched::PollSet::new();
-            set.add_foreign_bits(self_tag); // epoll_ctl wakes it bit-only
+            set.add_key(epoll_self_key(slot)); // epoll_ctl wakes it by this key
             for e in c.ents.iter_mut() {
                 e.filt = e.used && e.armed && e.known;
                 if let Some(k) = e.kids.as_mut() {
@@ -13785,7 +13792,7 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
             }
             // The kept snapshots' registrations stay covered (see `others`).
             for o in c.others.iter() {
-                set.add_foreign_bits(epoll_self_tag(o.slot));
+                set.add_key(epoll_self_key(o.slot));
                 for e in o.ents.iter() {
                     if e.filt { ep_filter_add(&mut set, pid, e); }
                 }
@@ -13859,7 +13866,7 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
                     if cand[i] && c.ents[i].used { st.note_fd(c.ents[i].fd as u32); named = true; }
                 }
             } else { st.note_fd(ws::EpStat::ALL_FD); }
-            ws::EP_NAMELESS[ep_nameless_why(woke_ring, named, &last_ring, self_tag, &c.others)]
+            ws::EP_NAMELESS[ep_nameless_why(woke_ring, named, &last_ring, self_tag, &c.others, &c.ents)]
                 .fetch_add(1, Relaxed);
         }
         match sched::poll_listen_park(lid, if infinite { u64::MAX } else { deadline }) {
@@ -14525,7 +14532,7 @@ fn poll_set_add(set: &mut sched::PollSet, pid: u32, tag: &sched::PollTag, depth:
 /// `epoll_tag_mask` into a `PollSet`, keeping the inner interests' keys.
 fn epoll_collect(pid: u32, slot: usize, depth: u32, set: &mut sched::PollSet) {
     if depth >= EPOLL_MAX_NEST { set.add_bits(sched::POLL_TAG_ALL); return; }
-    set.add_foreign_bits(epoll_self_tag(slot)); // epoll_ctl wakes it bit-only
+    set.add_key(epoll_self_key(slot)); // epoll_ctl wakes it by this key
     let hi = { EPOLL_INSTANCES.lock()[slot].hi as usize };
     for i in 0..hi {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
@@ -14895,6 +14902,11 @@ fn epoll_tag_mask(pid: u32, slot: usize, depth: u32) -> u64 {
 /// The tag `epoll_ctl` on instance `slot` wakes (see sys_epoll_ctl).
 fn epoll_self_tag(slot: usize) -> u64 {
     sched::poll_tag(sched::poll_class::EPOLL, slot as u32)
+}
+
+/// The key of `epoll_self_tag` (epoll_ctl's wake and widening).
+fn epoll_self_key(slot: usize) -> u64 {
+    sched::poll_key(sched::poll_class::EPOLL, slot as u32)
 }
 
 /// `[CHURN] alltag` census: which interest kinds make an epoll wait mask a

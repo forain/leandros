@@ -72,8 +72,8 @@ pub static EP_USELESS: AtomicU64 = AtomicU64::new(0);
 /// (probed, still not ready), 1 unknown/ALL, 2 deadline flag only, 3 a kept
 /// snapshot's registration (another instance), 4 the instance's own tag bit
 /// (bit-only wake on its epoll_ctl bit), 5 keys none of which is a
-/// registration's, 6 other bits, 7 empty.
-pub static EP_NAMELESS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// registration's, 6 other bits, 7 empty, 8 a disarmed (EPOLLONESHOT) registration.
+pub static EP_NAMELESS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 pub static EP_PROBE_NS: AtomicU64 = AtomicU64::new(0);
 pub static EP_FILT_NS: AtomicU64 = AtomicU64::new(0);
 

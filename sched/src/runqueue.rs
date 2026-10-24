@@ -1160,14 +1160,20 @@ impl RunQueue {
     /// one is widened below like any parked task, with `add` noted in its
     /// ring so the wake the widening lets through re-probes only what it can
     /// concern (the new interest is unprobed, so it always is).
-    pub fn widen_port_masks(&mut self, port: u32, match_tag: u64, add: u64) {
+    pub fn widen_port_masks(&mut self, port: u32, match_key: u64, add: u64) {
+        let match_tag = crate::poll_key_bit(match_key);
+        let fp = crate::poll_key_fp(match_key);
         // No wake epoch bump: widening concerns parkers holding an epoll
         // instance's tag, and a poll() set holding an epoll fd re-checks
         // EPOLL_CTL_GEN instead (every widening follows an epoll_ctl).
         for i in self.parked_slots() {
             if let Some(task) = self.tasks[i].as_deref_mut() {
+                // The parker must watch the instance itself, not only share
+                // its bit: a refined bit needs the key's fingerprint.
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
-                    && (task.poll_mask & match_tag) != 0 {
+                    && (task.poll_mask & match_tag) != 0
+                    && (task.poll_kbits & match_tag == 0
+                        || task.poll_fps[..task.poll_nfp as usize].contains(&fp)) {
                     task.poll_mask |= add;
                     self.pk_mask[i] |= add;
                     // The added interest's key is unknown here: its bits must

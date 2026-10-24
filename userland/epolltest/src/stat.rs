@@ -100,7 +100,8 @@ pub unsafe fn stat_main() -> i32 {
     }
     // Two tries: boot-time ambient wakes (see exit_wake_keyed) can land in the
     // first window; the bug reads 25+ on every try.
-    rep(b"stat_exit_wake_keyed", exit_wake_keyed() || exit_wake_keyed());
+    rep(b"stat_exit_wake_keyed", exit_wake_twice());
+    rep(b"stat_ctl_foreign_keyed", ctl_foreign_twice());
     rep(b"stat_pipe_drain_keyed", pipe_drain_keyed() || pipe_drain_keyed());
     if fail == 0 { write(1, b"SUMMARY stat pass\n".as_ptr(), 18); }
     fail
@@ -116,14 +117,19 @@ pub unsafe fn stat_main() -> i32 {
 /// `epolltest xwake`: run `exit_wake_keyed` by itself, so `/proc/wakestat`
 /// attributes only its wakes.
 pub unsafe fn exit_wake_main() -> i32 {
+    let ok = exit_wake_twice();
+    let msg: &[u8] = if ok { b"stat_exit_wake_keyed: PASS\n" } else { b"stat_exit_wake_keyed: FAIL\n" };
+    write(1, msg.as_ptr(), msg.len());
+    if ok { 0 } else { 1 }
+}
+
+unsafe fn exit_wake_twice() -> bool {
     // One instance across both tries: a retry on a fresh epoll fd could get
     // the closed one's number and read its stale /proc/epollstat row.
     let ep = epoll_create1(0);
     let ok = ep >= 0 && (exit_wake_keyed(ep) || exit_wake_keyed(ep));
     if ep >= 0 { close(ep); }
-    let msg: &[u8] = if ok { b"stat_exit_wake_keyed: PASS\n" } else { b"stat_exit_wake_keyed: FAIL\n" };
-    write(1, msg.as_ptr(), msg.len());
-    if ok { 0 } else { 1 }
+    ok
 }
 
 unsafe fn exit_wake_keyed(ep: c_int) -> bool {
@@ -230,4 +236,79 @@ unsafe fn pipe_drain_keyed() -> bool {
     // Bound 1 for the same inherent fingerprint collision as exit_wake_keyed;
     // the bug reads one useless wake per drain (~NBLIP).
     got == NBLIP && a.1 - b.1 >= 1 && a.2 - b.2 <= 1
+}
+
+/// Lane epnameless guard: an epoll_ctl on ANOTHER instance must not wake, or
+/// widen the filter of, a waiter that only shares that instance's tag bit.
+/// epoll_ctl used to wake bit-only on `poll_tag(EPOLL, slot)` (ADD/MOD of a
+/// ready fd) and, for a not-ready fd, to OR the fd's bits into every parked
+/// mask holding that bit, with the bit's key refinement dropped: the new fd's
+/// later wakes then reached unrelated parkers too, which re-probed nothing
+/// they had registered (desktop: ~60 % of all useless epoll wakes). The
+/// waiter parks on 96 idle eventfds (its mask covers almost every bit); a
+/// helper does NCTL rounds of ADD-not-ready + write, and ADD-ready, on a
+/// second instance nobody waits on. Expect no useless wake.
+const NCTL: usize = 20;
+
+extern "C" fn ctl_helper(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let ep = epoll_create1(0);
+        for i in 0..NCTL {
+            usleep(15_000);
+            let e = syscall(nr::EVENTFD2, 0i64, 0o4000i64) as c_int;
+            if i % 2 == 0 {
+                ep_add(ep, e, EPOLLIN);          // not ready: the widening path
+                usleep(5_000);
+                let one = 1u64;
+                write(e, &one as *const u64 as *const u8, 8);
+            } else {
+                let one = 1u64;
+                write(e, &one as *const u64 as *const u8, 8);
+                ep_add(ep, e, EPOLLIN);          // ready now: the wake path
+            }
+            usleep(5_000);
+            close(e);
+        }
+        close(ep);
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn ctl_foreign_twice() -> bool {
+    let ep = epoll_create1(0); // kept across both tries (stale-row hazard)
+    let ok = ep >= 0 && (ctl_foreign_keyed(ep) || ctl_foreign_keyed(ep));
+    if ep >= 0 { close(ep); }
+    ok
+}
+
+unsafe fn ctl_foreign_keyed(ep: c_int) -> bool {
+    const NFD: usize = 96;
+    let mut fds = [-1 as c_int; NFD];
+    for f in fds.iter_mut() {
+        *f = syscall(nr::EVENTFD2, 0i64, 0o4000i64) as c_int;
+        if *f < 0 || !ep_add(ep, *f, EPOLLIN) { return false; }
+    }
+    let before = row(ep, -1);
+    let mut th: pthread_t = core::ptr::null_mut();
+    pthread_create(&mut th, core::ptr::null(), ctl_helper, core::ptr::null_mut());
+    let mut ev = epoll_event { events: 0, data: epoll_data { fd: 0 } };
+    let n = epoll_wait(ep, &mut ev, 1, (NCTL * 25 + 300) as c_int);
+    pthread_join(th, core::ptr::null_mut());
+    let after = row(ep, -1);
+    for &f in &fds { close(f); }
+    let b = before.unwrap_or((0, 0, 0, false));
+    let Some(a) = after else { return false };
+    write(1, b"  ctl_foreign: useless=".as_ptr(), 23); write_i64(1, a.2 - b.2);
+    write(1, b" parks=".as_ptr(), 7); write_i64(1, a.0 - b.0);
+    write(1, b"\n".as_ptr(), 1);
+    // parks >= 1: a live row. Bound 1: the fingerprint-collision residual of
+    // exit_wake_keyed (96 parked fingerprints).
+    n == 0 && a.0 - b.0 >= 1 && a.2 - b.2 <= 1
+}
+
+pub unsafe fn ctl_foreign_main() -> i32 {
+    let ok = ctl_foreign_twice();
+    let msg: &[u8] = if ok { b"stat_ctl_foreign_keyed: PASS\n" } else { b"stat_ctl_foreign_keyed: FAIL\n" };
+    write(1, msg.as_ptr(), msg.len());
+    if ok { 0 } else { 1 }
 }

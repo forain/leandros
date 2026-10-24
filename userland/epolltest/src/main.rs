@@ -226,6 +226,8 @@ pub unsafe extern "C" fn epoll_main(argc: isize, argv: *mut *mut u8, _envp: *mut
         if !arg.is_null() && *arg == b's' { return stat::stat_main(); }
         // `xwake`: the exit-wake guard alone (wake attribution reruns).
         if !arg.is_null() && *arg == b'x' { return stat::exit_wake_main(); }
+        // `kctl`: the foreign epoll_ctl wake guard alone (lane epnameless).
+        if !arg.is_null() && *arg == b'k' { return stat::ctl_foreign_main(); }
         // `drain`: the pipe drain-wake guard alone (lane panelpipe).
         if !arg.is_null() && *arg == b'd' { return stat::pipe_wake_main(); }
         // `cost` / `costbench` (lane epollcost, see cost.rs).
