@@ -81,7 +81,8 @@ struct PortEntry {
     tail:      u16,
     handler:   Option<HandlerFn>,
     /// Set by `register_user_filter`: which messages user code may send to
-    /// this handler port (see `user_send_allowed`). None = all of them.
+    /// this handler port (see `user_send_allowed`). None = none of them:
+    /// handler ports are deny-by-default for user senders.
     user_filter: Option<UserSendFilter>,
     /// Set by `register_kernel_handler`: the handler trusts pointers in the
     /// message (VFS/f2fs buffers), so only in-kernel callers may reach it.
@@ -435,6 +436,13 @@ pub fn send(port: Port, msg: Message) -> Result<(), SendError> {
 }
 
 /// Register a direct handler function for an IPC port.
+///
+/// User code may not send to the port (`sys_send`/`sys_call` return EPERM)
+/// until `register_user_filter` names the messages it may send: a handler
+/// cannot tell kernel-filled identity (open_id, a pid slot, buffer pointers
+/// the kernel range-checked) from the same message built by a user process,
+/// so a port that nobody audited fails closed. In-kernel `send` (VFS
+/// forwards, replies) is never filtered.
 pub fn register_handler(port: Port, handler: HandlerFn) -> bool {
     let mut table = PORT_TABLE.lock();
     match table.entry_mut(port) {
@@ -527,8 +535,16 @@ pub fn register_user_filter(port: Port, filter: UserSendFilter) -> bool {
     }
 }
 
-/// False when the user-send filter of `port` refuses `msg`.
+/// False when user code may not send `msg` to `port`: a handler port accepts
+/// only what its `register_user_filter` filter allows (none without one, and
+/// never for a `register_kernel_handler` port). Queue ports (no handler) are
+/// governed by the owner credential check alone.
 pub fn user_send_allowed(port: Port, msg: &Message) -> bool {
-    let f = PORT_TABLE.lock().entry(port).and_then(|e| e.user_filter);
-    f.map_or(true, |f| f(msg))
+    let (has_handler, kernel_only, f) = match PORT_TABLE.lock().entry(port) {
+        Some(e) => (e.handler.is_some(), e.kernel_only, e.user_filter),
+        None => return true,
+    };
+    if !has_handler { return true; }
+    if kernel_only { return false; }
+    f.map_or(false, |f| f(msg))
 }

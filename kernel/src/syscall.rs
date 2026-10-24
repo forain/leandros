@@ -2500,9 +2500,10 @@ fn dispatch_inner(
 // ── IPC syscalls ──────────────────────────────────────────────────────────────
 
 /// Credential check for a user send to `port`: 0, -EPERM, or -EBADF when the
-/// port does not exist. Server (handler) ports are open to everyone — the
-/// handler checks the caller per operation; a queue port only to callers that
-/// `sched::cred::ipc_send_check` allows against its owner.
+/// port does not exist. A server (handler) port passes here and is then
+/// deny-by-default: `port::user_send_allowed` admits only the messages its
+/// user filter names (kernel-only ports: none); a queue port only admits
+/// callers that `sched::cred::ipc_send_check` allows against its owner.
 fn ipc_send_permitted(port: u32) -> isize {
     match port::send_target(port) {
         None => -9,
