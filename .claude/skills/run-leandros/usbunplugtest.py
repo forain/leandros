@@ -14,7 +14,7 @@ Phase 2 (not ready, `--notready` or default both): boot with the fault knob
 12 s). The boot must not wait for it; the disk must appear later (logged
 "became ready ... in the background") and read correctly.
 
-Usage: LEANDROS_RUN_ID=<lane> python3 usbunplugtest.py [aarch64|x86_64] [unplug|notready|all]
+Usage: LEANDROS_RUN_ID=<lane> python3 usbunplugtest.py [aarch64|x86_64] [unplug|notready|fastreplug|hub|hid|all]
 """
 import hashlib, json, os, re, subprocess, sys, time
 
@@ -187,6 +187,226 @@ def phase_notready(arch, run_id, env):
     return ok
 
 
+def qmp_multi(cmds, run_id):
+    """Send several QMP commands over ONE connection, back-to-back, then read
+    the replies. Returns (replies, [send timestamps])."""
+    import socket
+    path = open(f"/tmp/leandros-{run_id}-qmp-sockpath").read().strip()
+    sk = socket.socket(socket.AF_UNIX); sk.settimeout(15); sk.connect(path)
+    buf = b""
+    def rd():
+        nonlocal buf
+        while True:
+            if b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if line.strip(): return json.loads(line)
+                continue
+            d = sk.recv(65536)
+            if not d: raise OSError("qmp closed")
+            buf += d
+    rd()
+    sk.sendall(b'{"execute":"qmp_capabilities"}\n')
+    while "return" not in (m := rd()) and "error" not in m: pass
+    ts = []
+    for c, a in cmds:
+        sk.sendall((json.dumps({"execute": c, "arguments": a}) + "\n").encode())
+        ts.append(time.time())
+    reps = []
+    while len(reps) < len(cmds):
+        m = rd()
+        if "return" in m or "error" in m: reps.append(m)
+    sk.close()
+    return reps, ts
+
+
+def phase_fastreplug(arch, run_id, env):
+    ok = True
+    ia, ib, ic = (os.path.join(REPO, f"usbunplug-fr{x}-{run_id}.img") for x in "abc")
+    ha, hb, hc = make_img(ia), make_img(ib), make_img(ic)
+    env = dict(env)
+    env["LEANDROS_QEMU_EXTRA"] = (
+        "-device qemu-xhci,id=xhs "
+        f"-drive if=none,id=sta,format=raw,file={ia} -device usb-storage,bus=xhs.0,port=1,drive=sta,id=usba "
+        f"-drive if=none,id=stb,format=raw,file={ib} -device usb-storage,bus=xhs.0,port=2,drive=stb,id=usbb")
+    try:
+        if not boot(arch, env): return False
+        h = node_hashes()
+        na = next((n for n, x in h.items() if x == ha), None)
+        print(f"nodes before swap: {sorted(h)} A={na}")
+        if not na or hb not in h.values():
+            print("FAIL: sticks not both readable at boot"); return False
+        rc, o = drv("qmp", "blockdev-add", json.dumps({"driver": "raw", "node-name": "stc",
+                    "file": {"driver": "file", "filename": ic}}), timeout=60)
+        print(f"blockdev-add stc rc={rc}")
+        reps, ts = qmp_multi([("device_del", {"id": "usba"}),
+                              ("device_add", {"driver": "usb-storage", "bus": "xhs.0", "port": "1",
+                                              "drive": "stc", "id": "usbc"})], run_id)
+        print(f"fast swap gap between device_del and device_add: {(ts[1] - ts[0]) * 1000:.1f} ms; replies {reps}")
+        if any("error" in r for r in reps):
+            print("FAIL: QEMU rejected the swap commands (test bug)"); return False
+        t0, back, h = time.time(), None, {}
+        while time.time() - t0 < 20:
+            time.sleep(2)
+            h = node_hashes()
+            back = next((n for n, x in h.items() if x == hc), None)
+            if back and ha not in h.values(): break
+        print(f"after swap: C={back} A_present={ha in h.values()} B_present={hb in h.values()} nodes {sorted(h)} ({time.time() - t0:.1f} s)")
+        if ha in h.values(): ok = False; print("FAIL: stale stick A still readable after swap")
+        if not back: ok = False; print("FAIL: stick C never appeared (swap missed)")
+        if hb not in h.values(): ok = False; print("FAIL: stick B broken")
+        for l in [l for l in serial_log(run_id).splitlines() if "[USB" in l][-8:]:
+            print(l.strip()[-160:])
+    finally:
+        try: drv("stop", timeout=60)
+        except subprocess.TimeoutExpired: pass
+        for f in (ia, ib, ic):
+            try: os.unlink(f)
+            except OSError: pass
+    return ok
+
+
+def phase_hub(arch, run_id, env):
+    ok = True
+    ia, ib = (os.path.join(REPO, f"usbunplug-hub{x}-{run_id}.img") for x in "ab")
+    ha, hb = make_img(ia), make_img(ib)
+    env = dict(env)
+    env["LEANDROS_QEMU_EXTRA"] = (
+        "-device qemu-xhci,id=xhs "
+        "-device usb-hub,bus=xhs.0,port=1,id=hub1 "
+        f"-drive if=none,id=sta,format=raw,file={ia} -device usb-storage,bus=xhs.0,port=1.1,drive=sta,id=usba "
+        f"-drive if=none,id=stb,format=raw,file={ib} -device usb-storage,bus=xhs.0,port=2,drive=stb,id=usbb")
+    try:
+        if not boot(arch, env): return False
+        h = node_hashes()
+        na = next((n for n, x in h.items() if x == ha), None)
+        print(f"nodes at boot: {sorted(h)} A(behind hub)={na} B_present={hb in h.values()}")
+        if not na:
+            print("FAIL: stick behind the hub not readable at boot")
+            for l in [l for l in serial_log(run_id).splitlines() if "hub" in l.lower()][-4:]:
+                print(l.strip()[-160:])
+            return False
+        rc, o = drv("qmp", "device_del", json.dumps({"id": "usba"}), timeout=60)
+        print(f"device_del rc={rc}")
+        t0, gone = time.time(), False
+        while time.time() - t0 < 6:
+            time.sleep(1)
+            h = node_hashes()
+            if ha not in h.values(): gone = True; break
+        print(f"A gone={gone} after {time.time() - t0:.1f} s")
+        if not gone: ok = False; print("FAIL: node behind hub still present after unplug")
+        good, rtt = rtt_ok()
+        print(f"shell round trip: {rtt:.1f} s")
+        if not good: ok = False; print("FAIL: shell unresponsive")
+        if hb not in node_hashes().values(): ok = False; print("FAIL: stick B broken")
+        rc1, _ = drv("qmp", "blockdev-add", json.dumps({"driver": "raw", "node-name": "sta2",
+                     "file": {"driver": "file", "filename": ia}}), timeout=60)
+        rc2, o2 = drv("qmp", "device_add", json.dumps({"driver": "usb-storage", "bus": "xhs.0", "port": "1.1",
+                     "drive": "sta2", "id": "usba2"}), timeout=60)
+        print(f"blockdev-add rc={rc1} device_add rc={rc2} {o2.strip()[-100:]}")
+        t_add, back = time.time(), None
+        while time.time() - t_add < REPLUG_S:
+            h = node_hashes()
+            back = next((n for n, x in h.items() if x == ha), None)
+            if back: break
+            time.sleep(1)
+        print(f"after re-plug behind hub: A={back} in {time.time() - t_add:.1f} s")
+        if not back: ok = False; print("FAIL: re-plugged stick behind hub did not come back")
+        for l in [l for l in serial_log(run_id).splitlines() if "[USB" in l][-6:]:
+            print(l.strip()[-160:])
+    finally:
+        try: drv("stop", timeout=60)
+        except subprocess.TimeoutExpired: pass
+        for f in (ia, ib):
+            try: os.unlink(f)
+            except OSError: pass
+    return ok
+
+
+def key_events(run_id, dev, node="/dev/input/event0", secs=1.5, inject=True):
+    """Inject key 'a' down/up (no "device": QEMU routes to the newest keyboard handler; `dev` is informational) while a cat in the guest
+    records `node`; returns the number of bytes captured (24 per input_event)."""
+    sh(f"rm -f /tmp/ev.out; sh -c 'cat {node} > /tmp/ev.out 2>/dev/null & echo $! > /tmp/ev.pid' </dev/null >/dev/null 2>&1; true", 20)
+    time.sleep(0.5)
+    ev = lambda d: {"type": "key", "data": {"down": d, "key": {"type": "qcode", "data": "a"}}}
+    reps, _ = qmp_multi([("input-send-event", {"events": [ev(True)]}),
+                         ("input-send-event", {"events": [ev(False)]})] if inject else [("query-status", {})], run_id)
+    if any("error" in r for r in reps): print(f"  input-send-event {dev} error: {reps}"); return -1
+    time.sleep(secs)
+    out = sh("kill $(cat /tmp/ev.pid) 2>/dev/null; wc -c < /tmp/ev.out", 20)
+    m = re.findall(r"^\s*(\d+)\s*$", out, re.M)
+    return int(m[-1]) if m else -1
+
+
+def mouse_events(run_id, dev, node="/dev/input/event1", secs=1.5):
+    sh(f"rm -f /tmp/ms.out; sh -c 'cat {node} > /tmp/ms.out 2>/dev/null & echo $! > /tmp/ms.pid' </dev/null >/dev/null 2>&1; true", 20)
+    time.sleep(0.5)
+    reps, _ = qmp_multi([("input-send-event", {"events": [
+        {"type": "rel", "data": {"axis": "x", "value": 20}},
+        {"type": "rel", "data": {"axis": "y", "value": 10}}]})], run_id)
+    if any("error" in r for r in reps): print(f"  mouse input-send-event error: {reps}"); return -1
+    time.sleep(secs)
+    out = sh("kill $(cat /tmp/ms.pid) 2>/dev/null; wc -c < /tmp/ms.out", 20)
+    m = re.findall(r"^\s*(\d+)\s*$", out, re.M)
+    return int(m[-1]) if m else -1
+
+
+def hid_log(run_id, words):
+    return [l.strip()[-160:] for l in serial_log(run_id).splitlines()
+            if "[USB-HID]" in l and any(w in l.lower() for w in words)]
+
+
+def phase_hid(arch, run_id, env):
+    ok = True
+    env = dict(env)
+    env["LEANDROS_QEMU_EXTRA"] = ("-device qemu-xhci,id=xhs -device usb-kbd,bus=xhs.0,id=kbd1 "
+                                  "-device usb-kbd,bus=xhs.0,id=kbd2 -device usb-mouse,bus=xhs.0,id=mouse1")
+    try:
+        if not boot(arch, env): return False
+        print("input nodes at boot: " + " ".join(sh("ls /dev/input", 20).split()))
+        ctl = key_events(run_id, "none", inject=False)
+        n1, n2 = key_events(run_id, "kbd1"), key_events(run_id, "kbd2")
+        print(f"(a) control (no injection) bytes: {ctl}")
+        # a cat of event0 reads a fixed initial burst on open (ctl); injected keys add 24 B/event on top
+        if n1 <= ctl or n2 <= ctl:
+            print("FAIL: baseline keys not delivered (step a)"); return False
+        print(f"(a) baseline key bytes on event0: kbd1={n1} kbd2={n2}")
+        rc, o = drv("qmp", "device_del", json.dumps({"id": "kbd1"}), timeout=60)
+        print(f"device_del kbd1 rc={rc}")
+        t0, lines = time.time(), []
+        while time.time() - t0 < 3:
+            time.sleep(0.5)
+            lines = hid_log(run_id, ("removed", "disconnected"))
+            if lines: break
+        print(f"(b) removal log lines: {lines[-2:]}")
+        if not lines: ok = False; print("FAIL: no [USB-HID] removed/disconnected log line within 3 s")
+        print("input nodes after removal: " + " ".join(sh("ls /dev/input", 20).split()))
+        k2 = key_events(run_id, "kbd2")
+        print(f"(b) kbd2 after kbd1 removal: {k2}")
+        if k2 <= ctl: ok = False; print("FAIL: kbd2 keys lost after kbd1 removal")
+        print(f"(b) mouse1 rel motion bytes on event1 (informational): {mouse_events(run_id, 'mouse1')}")
+        def kbd_lines():
+            return [l.strip()[-120:] for l in serial_log(run_id).splitlines()
+                    if "Keyboard" in l and ("[USB]" in l or "[USB-HID]" in l) and "removed" not in l]
+        before = len(kbd_lines())
+        rc, o = drv("qmp", "device_add", json.dumps({"driver": "usb-kbd", "bus": "xhs.0", "id": "kbd1"}), timeout=60)
+        print(f"device_add kbd1 rc={rc} {o.strip()[-100:]}")
+        t0, new = time.time(), []
+        while time.time() - t0 < 10:
+            time.sleep(1)
+            new = kbd_lines()[before:]
+            if new: break
+        print(f"(c) enumeration lines after re-add ({time.time() - t0:.1f} s): {new[-2:]}")
+        if not new:
+            ok = False; print("FAIL: re-added kbd1 never enumerated (no new keyboard [USB]/[USB-HID] line within 10 s)")
+        n1 = key_events(run_id, "kbd1")
+        print(f"(c) kbd1 keys after re-add: {n1}")
+        if n1 <= ctl: ok = False; print("FAIL: re-added kbd1 keys not delivered")
+    finally:
+        try: drv("stop", timeout=60)
+        except subprocess.TimeoutExpired: pass
+    return ok
+
+
 def main():
     arch = sys.argv[1] if len(sys.argv) > 1 else "aarch64"
     which = sys.argv[2] if len(sys.argv) > 2 else "all"
@@ -199,6 +419,10 @@ def main():
     if which in ("notready", "all"):
         r = phase_notready(arch, run_id, env); ok &= r
         print("notready phase: " + ("PASS" if r else "FAIL"))
+    for name, fn in (("fastreplug", phase_fastreplug), ("hub", phase_hub), ("hid", phase_hid)):
+        if which in (name, "all"):
+            r = fn(arch, run_id, env); ok &= r
+            print(f"{name} phase: " + ("PASS" if r else "FAIL"))
     print("PASS usbunplug" if ok else "FAIL usbunplug")
     return 0 if ok else 1
 
