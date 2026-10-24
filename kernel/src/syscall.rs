@@ -11111,6 +11111,54 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     let is_evdev = ioctl_type == 0x45;
     let is_drm = ioctl_type == 0x64;
 
+    // ── i915 legacy GEM_MMAP (lane i915ddb) ──────────────────────────────────
+    // Linux i915_gem_mmap_ioctl returns a CPU address: vm_mmap of the object
+    // (MAP_SHARED, RW) at `offset`, write-combined with I915_MMAP_WC. The DRM
+    // server cannot map into the caller, so the ioctl is answered here, in the
+    // caller's address space: GEM_MMAP_OFFSET (WC, or WB without the flag) on
+    // the same fd, then mmap() of that opaque offset -- the same path (caching,
+    // ownership check, counters) Mesa's MMAP_OFFSET users take.
+    //     struct drm_i915_gem_mmap (40 bytes): handle u32 @0 | pad u32 @4 |
+    //     offset u64 @8 | size u64 @16 | addr_ptr u64 @24 | flags u64 @32
+    // MMAP_OFFSET's 32-byte struct (handle, pad, offset, flags, extensions) is
+    // built in place in the caller's buffer; the fields are restored after.
+    const DRM_IOCTL_I915_GEM_MMAP: usize = 0xC028645E;
+    const DRM_IOCTL_I915_GEM_MMAP_OFFSET: usize = 0xC0206464;
+    if cmd == DRM_IOCTL_I915_GEM_MMAP {
+        use sched::uaccess::{read_user, write_user};
+        if arg == 0 || !validate_user_buf(arg, 40) { return -14; } // EFAULT
+        let mut f = [0u64; 5];
+        for (i, v) in f.iter_mut().enumerate() {
+            match read_user::<u64>(arg + 8 * i) { Some(x) => *v = x, None => return -14 }
+        }
+        let (off, size, flags) = (f[1], f[2], f[4]);
+        const I915_MMAP_WC: u64 = 1;
+        if flags & !I915_MMAP_WC != 0 { return -22; } // EINVAL, as Linux
+        if size == 0 || off & 0xFFF != 0 || off.checked_add(size).is_none() { return -22; }
+        let mo_flags: u64 = if flags & I915_MMAP_WC != 0 { 1 } else { 2 }; // MMAP_OFFSET_WC / _WB
+        let tmp = [f[0] & 0xFFFF_FFFF, 0, mo_flags, 0];
+        for (i, v) in tmp.iter().enumerate() { if !write_user(arg + 8 * i, *v) { return -14; } }
+        let r = sys_ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, arg, frame_ptr);
+        let fake = read_user::<u64>(arg + 8).unwrap_or(0);
+        for (i, v) in f.iter().enumerate().take(4) { let _ = write_user(arg + 8 * i, *v); }
+        if r < 0 { return r; }
+        // range_overflows(offset, size, obj size) -> EINVAL: the last byte must
+        // resolve inside the same object, contiguous with its first.
+        let last = fake.wrapping_add(off).wrapping_add(size - 1);
+        match (drivers::drm_offset::resolve(fake), drivers::drm_offset::resolve(last)) {
+            (Some(a), Some(b)) if b == a + off + size - 1 => {}
+            _ => return -22,
+        }
+        const PROT_RW: usize = 3;
+        const MAP_SHARED: usize = 1;
+        // The device mmap names whole objects (its ownership check is on the
+        // object's token), so map from the object's start and drop the head.
+        let a = sys_mmap(0, (off + size) as usize, PROT_RW, MAP_SHARED, fd, fake as usize);
+        if a < 0 { return a; }
+        if off != 0 { let _ = sys_unmap_mem(a as usize, off as usize); }
+        return if write_user(arg + 24, a as u64 + off) { 0 } else { -14 };
+    }
+
     // Sync files (syncobj <-> sync_file, dma-buf implicit fences, SYNC_IOC_*):
     // they mint or consume fds, so they are answered here. `None` unless the
     // gate in drivers::sync_file is open and the fd/flags are ones it handles.

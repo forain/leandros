@@ -132,7 +132,9 @@ fn write_wm(m: &super::Mmio) {
     m.w(CUR_BUF_CFG, ddb);
     let mut off = false;
     let mut wm = [0u32; 8];
+    let own = PLAN_WM_SET.load(Ordering::Acquire);
     for (i, w) in wm.iter_mut().enumerate() {
+        if own { *w = PLAN_WM[i].load(Ordering::Relaxed); continue; }
         let v = m.r(kms::preg(kms::PLANE_WM_1_A) + 4 * i as u32);
         if off || v >> 31 == 0 { off = true; continue; }
         let blocks = (v & 0x3FF).clamp(1, blocks_ddb - 1);
@@ -253,9 +255,30 @@ fn ddb_range(v: u32) -> Option<(u32, u32)> {
     if v == 0 || e < s { None } else { Some((s, e)) }
 }
 
-/// 32 DDB blocks no live plane uses: the GOP's cursor allocation if it has
-/// one, else the highest free run.
+/// The whole-pipe plan's CUR_BUF_CFG (`kms::ddb_setup`), 0 = none.
+static PLAN_DDB: AtomicU32 = AtomicU32::new(0);
+/// skl_compute_wm for the cursor itself against its DDB (`kms::native_setup`).
+static PLAN_WM: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+static PLAN_WM_SET: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn set_ddb(v: u32) { PLAN_DDB.store(v, Ordering::Relaxed); }
+
+/// Blocks of the planned cursor allocation, if there is a plan.
+pub(super) fn ddb_blocks() -> Option<u32> {
+    let v = PLAN_DDB.load(Ordering::Relaxed);
+    ddb_range(v).map(|(s, e)| e - s + 1)
+}
+
+pub(super) fn set_wm(w: &[u32; 9]) {
+    for i in 0..8 { PLAN_WM[i].store(w[i], Ordering::Relaxed); }
+    PLAN_WM_SET.store(true, Ordering::Release);
+}
+
+/// The planned allocation, else 32 DDB blocks no live plane uses: the GOP's
+/// cursor allocation if it has one, else the highest free run.
 fn find_ddb(m: &super::Mmio) -> Result<u32, alloc::string::String> {
+    let plan = PLAN_DDB.load(Ordering::Relaxed);
+    if plan != 0 { return Ok(plan); }
     let mut used: alloc::vec::Vec<(u32, u32, &'static str)> = alloc::vec::Vec::new();
     for pipe in 0..3u32 {
         let on = m.r(PIPECONF_A + 0x1000 * pipe) >> 31 != 0;

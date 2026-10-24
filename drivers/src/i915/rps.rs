@@ -229,6 +229,10 @@ pub fn proc_text() -> Option<String> {
             let _ = writeln!(s, "{} {}", k, v);
         }
     }
+    // Live display-buffer allocation (raw BUF_CFG values: start | end << 16).
+    if let Some((pl, cur)) = super::kms::ddb_regs() {
+        let _ = writeln!(s, "ddb_plane {}\nddb_cursor {}", pl, cur);
+    }
     let uapi = super::uapi::proc_errors(&mut s);
     let prime = crate::drm_device_interface::proc_prime(&mut s);
     if gt || kms_any || uapi || prime { Some(s) } else { None }

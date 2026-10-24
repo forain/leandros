@@ -29,8 +29,11 @@
 //! POS/STRIDE/OFFSET/WM, PLANE_SURF last — no pipe disable, no link retrain.
 //! `console_restore` puts the GOP state (PIPESRC, saved PS_*, plane size and
 //! watermarks, GOP surface) back the same way. The DDB (PLANE_BUF_CFG) is
-//! kept; the plane watermarks are the GOP's scaled by blocks-per-line
-//! (`i915.native_wm=0`: keep the GOP's), levels that do not fit the DDB off.
+//! re-split for the whole pipe (`ddb_setup`, Linux skl_allocate_plane_ddb:
+//! one active pipe owns all 892 blocks, the cursor its fixed 32 at the top,
+//! plane 1A the rest; `i915.ddb=0` keeps the firmware's allocation) and the
+//! watermarks are recomputed against it (`i915.native_wm=0`: keep the GOP's),
+//! levels that do not fit the DDB off.
 //! `i915.native=0`: the old behaviour (GOP mode, scaler kept).
 //!
 //! Only with `i915.kms=1` (and execution ready on hardware: GPU rendering
@@ -68,6 +71,84 @@ const PIPE_FIFO_UNDERRUN: u32 = 1 << 31;
 pub(super) const PLANE_WM_1_A: u32 = 0x70240;
 const PLANE_WM_TRANS_1_A: u32 = 0x70268;
 pub(super) const PLANE_BUF_CFG_1_A: u32 = 0x7027C;
+
+/// Gen9 (SKL/KBL) display buffer: 896 blocks, 4 kept for the bypass path
+/// (Linux intel_get_ddb_size, display version < 11).
+pub(super) const DDB_SIZE: u32 = 892;
+/// The whole-pipe plan (lane i915ddb): plane 1A's PLANE_BUF_CFG, written
+/// right before the next PLANE_SURF (which arms it with the plane's
+/// watermarks), and its size in blocks (0: no plan, firmware allocation).
+static DDB_PLANE: AtomicU32 = AtomicU32::new(0);
+static DDB_PENDING: AtomicBool = AtomicBool::new(false);
+static DDB_PLANE_BLOCKS: AtomicU32 = AtomicU32::new(0);
+const PIPECONF_A: u32 = 0x70008;
+
+/// skl_ddb_entry_write: start | (end - 1) << 16, end exclusive; 0 = empty.
+pub(super) fn ddb_entry(start: u32, end: u32) -> u32 { if end == 0 { 0 } else { (end - 1) << 16 | start } }
+
+/// skl_ddb_get_pipe_allocation_limits (display 9: no DBuf slices, each
+/// active pipe weighted by its hdisplay; `widths[p] == 0` = pipe off) and
+/// skl_crtc_allocate_plane_ddb for one universal plane plus the cursor: the
+/// cursor gets max(32 with one active pipe else 8, `cursor_min`) blocks at
+/// the top of the pipe's range, the single plane everything below it (the
+/// data-rate split of the left-over blocks gives one plane all of them).
+/// Returns `(plane, cursor)` as `[start, end)`.
+pub(super) fn skl_ddb_plan(ddb_size: u32, widths: &[u32], pipe: usize, cursor_min: u32) -> Option<((u32, u32), (u32, u32))> {
+    let total: u64 = widths.iter().map(|&w| w as u64).sum();
+    if pipe >= widths.len() || widths[pipe] == 0 { return None; }
+    let before: u64 = widths[..pipe].iter().map(|&w| w as u64).sum();
+    let start = (ddb_size as u64 * before / total) as u32;
+    let end = (ddb_size as u64 * (before + widths[pipe] as u64) / total) as u32;
+    let active = widths.iter().filter(|&&w| w != 0).count();
+    let cur = cursor_min.max(if active == 1 { 32 } else { 8 });
+    if end <= start + cur { return None; }
+    Some(((start, end - cur), (end - cur, end)))
+}
+
+/// Plan the whole-pipe DDB for pipe A (plane 1A + cursor). Only when pipe A
+/// is the only lit pipe and plane 1A its only enabled universal plane: a
+/// re-split otherwise reprograms pipes/planes we do not drive. The plan is
+/// also refused when the firmware's plane 1A range reaches into the new
+/// cursor range (the cursor may show before the first flip re-arms 1A).
+fn ddb_setup(m: &Mmio, w: u32) {
+    if opt("i915.ddb") == Some(0) {
+        log("kms: ddb: i915.ddb=0: keeping the firmware's plane 1A allocation (cursor takes free blocks)");
+        return;
+    }
+    let fw = m.r(preg(PLANE_BUF_CFG_1_A));
+    let mut widths = [0u32; 3];
+    widths[0] = w;
+    for p in 1..3u32 {
+        if m.r(PIPECONF_A + 0x1000 * p) >> 31 != 0 {
+            ilog!("kms: ddb: pipe {} is lit too: keeping the firmware allocation (plane 1A BUF_CFG 0x{:08x})", (b'A' + p as u8) as char, fw);
+            return;
+        }
+    }
+    for pl in 1..3u32 {
+        if m.r(reg::plane(reg::PLANE_CTL_1_A, PIPE, pl)) >> 31 != 0 {
+            ilog!("kms: ddb: plane {}A is enabled: keeping the firmware allocation", pl + 1);
+            return;
+        }
+    }
+    let Some(((ps, pe), (cs, ce))) = skl_ddb_plan(DDB_SIZE, &widths, 0, 0) else { return };
+    if fw != 0 && (fw >> 16) & 0x7FF >= cs {
+        ilog!("kms: ddb: firmware plane 1A BUF_CFG 0x{:08x} overlaps the cursor range {}..{}: keeping the firmware allocation", fw, cs, ce);
+        return;
+    }
+    DDB_PLANE.store(ddb_entry(ps, pe), Ordering::Relaxed);
+    DDB_PLANE_BLOCKS.store(pe - ps, Ordering::Relaxed);
+    DDB_PENDING.store(true, Ordering::Release);
+    super::cursor::set_ddb(ddb_entry(cs, ce));
+    ilog!("kms: ddb: whole-pipe allocation (skl_allocate_plane_ddb, {} blocks, pipe A only): plane 1A {}..{} PLANE_BUF_CFG 0x{:08x} (firmware 0x{:08x}), cursor {}..{} CUR_BUF_CFG 0x{:08x}; armed with the next flip; i915.ddb=0 keeps the firmware's",
+          DDB_SIZE, ps, pe, ddb_entry(ps, pe), fw, cs, ce, ddb_entry(cs, ce));
+}
+
+/// Live PLANE_BUF_CFG_1_A / CUR_BUF_CFG_A, for /proc/i915.
+pub(super) fn ddb_regs() -> Option<(u32, u32)> {
+    let m = mmio();
+    if m.va == 0 { return None; }
+    Some((m.r(preg(PLANE_BUF_CFG_1_A)), m.r(0x7017C)))
+}
 
 /// The scanout GGTT window: 16 slots of 32 MiB from 1 GiB (clear of the GOP
 /// surface at 0, the CPU aperture, exec's LRC slots and the G2 window at
@@ -251,6 +332,10 @@ fn program(ctl: u32, stride: u32, offset: u32, surf: u32, wait: bool, native: bo
     m.w(preg(reg::PLANE_CTL_1_A), ctl);
     m.w(preg(reg::PLANE_STRIDE_1_A), stride);
     m.w(preg(reg::PLANE_OFFSET_1_A), offset);
+    // Whole-pipe DDB: double-buffered, armed by this PLANE_SURF together with
+    // the watermarks computed against it (the cursor's range never moves and
+    // the new plane range only grows into blocks no live plane uses).
+    if DDB_PENDING.swap(false, Ordering::AcqRel) { m.w(preg(PLANE_BUF_CFG_1_A), DDB_PLANE.load(Ordering::Relaxed)); }
     m.w(preg(reg::PLANE_SURF_1_A), surf);
     if switch {
         irq_restore(flags);
@@ -600,7 +685,8 @@ fn native_setup(m: &Mmio, gw: u32, gh: u32) -> Option<(u32, u32)> {
     VBL_MARGIN.store(margin.max(8), Ordering::Relaxed);
     let ps = m.r(reg::PS_CTRL_1A);
     let buf = m.r(preg(PLANE_BUF_CFG_1_A));
-    let ddb = if buf == 0 { 0 } else { ((buf >> 16) & 0x7FF).saturating_sub(buf & 0x7FF) + 1 };
+    let fw_ddb = if buf == 0 { 0 } else { ((buf >> 16) & 0x7FF).saturating_sub(buf & 0x7FF) + 1 };
+    let ddb = match DDB_PLANE_BLOCKS.load(Ordering::Relaxed) { 0 => fw_ddb, n => n };
     ilog!("kms: native: transcoder {} active {}x{} total {}x{} vblank start {} (evasion {} lines); DDI port {} DPLL{} rate {} port clock {} kHz LINK M/N {}/{} -> pixel clock {} kHz, {} Hz; GOP {}x{} PS_CTRL1 0x{:08x} WIN_POS 0x{:08x} WIN_SZ 0x{:08x}; plane 1A DDB {} blocks",
           name, hact, vact, htot, vtot, vbs, VBL_MARGIN.load(Ordering::Relaxed), (b'A' + port as u8) as char, pll, rate, port_khz, lm, ln, clk, refresh,
           gw, gh, ps, m.r(reg::PS_WIN_POS_1A), m.r(reg::PS_WIN_SZ_1A), ddb);
@@ -618,7 +704,18 @@ fn native_setup(m: &Mmio, gw: u32, gh: u32) -> Option<(u32, u32)> {
     // when they can be read (`i915.native_wm=2` forces the old scaling).
     let lat = if FAKE_PROBE.load(Ordering::Relaxed) || opt("i915.native_wm") == Some(2) { None } else { skl_wm_latency(m) };
     if let Some(lat) = lat {
-        let nat = skl_plane_wm(&lat, clk, htot, hact, ddb);
+        let mut nat = skl_plane_wm(&lat, clk, htot, hact, ddb);
+        // The cursor's own levels against its fixed DDB (64 px ARGB, linear);
+        // Linux enables a level for the pipe only if every plane fits it, so
+        // both stop at the lower of the two counts.
+        if let Some(cb) = super::cursor::ddb_blocks() {
+            let mut cur = skl_plane_wm(&lat, clk, htot, 64, cb);
+            let n = |w: &[u32; 9]| (0..8).take_while(|&i| w[i] >> 31 != 0).count();
+            let top = n(&nat).min(n(&cur));
+            for i in top..8 { nat[i] = 0; cur[i] = 0; }
+            if cur[0] != 0 { super::cursor::set_wm(&cur); }
+            ilog!("kms: native: cursor 64x64 WM against {} DDB blocks -> {:08x?}; common levels {}", cb, &cur[..8], top);
+        }
         ilog!("kms: native: pcode WM latencies {:?} us; skl_compute_wm for {}x{} linear XRGB8888, {} kHz, htotal {}, DDB {} blocks -> levels {:08x?}",
               lat, hact, vact, clk, htot, ddb, nat);
         if nat[0] != 0 && clk != 0 {
@@ -842,6 +939,7 @@ pub(super) fn init(d: &Device, env: &BootEnv) {
     for i in 0..WM_LEVELS { ORIG_WM[i].store(m.r(preg(PLANE_WM_1_A) + 4 * i as u32), Ordering::Relaxed); }
     ORIG_WM[8].store(m.r(preg(PLANE_WM_TRANS_1_A)), Ordering::Relaxed);
     let (mut mw, mut mh) = (w, h);
+    ddb_setup(m, w);
     if !d.fake {
         if let Some((nw, nh)) = native_setup(m, w, h) { mw = nw; mh = nh; }
     }

@@ -145,6 +145,11 @@ struct UserExt { next: u64, name: u32, flags: u32, rsvd: [u32; 4] }
 struct ExtRegions { base: UserExt, pad: u32, num: u32, regions: u64 }
 #[repr(C)] #[derive(Default)]
 struct MmapOffset { handle: u32, _pad: u32, offset: u64, flags: u64, ext: u64 }
+
+/// drm_i915_gem_mmap (legacy GEM_MMAP, lane i915ddb).
+#[repr(C)] #[derive(Default)]
+struct GemMmap { handle: u32, _pad: u32, offset: u64, size: u64, addr_ptr: u64, flags: u64 }
+const I915_GEM_MMAP: c_ulong = 0xC028_645E;
 #[repr(C)] #[derive(Default)]
 struct Prw { handle: u32, _pad: u32, offset: u64, size: u64, data: u64 }
 #[repr(C)] #[derive(Default)]
@@ -1354,6 +1359,35 @@ unsafe fn kms_async() {
     report(b"proc_i915_counts_wc_mmaps", wcn >= 2);
     // Readback through the WC view of what was stored through it.
     report(b"wc_mapping_reads_back", wmapped && core::ptr::read_volatile((wp as *const u32).add(1024)) == 0x00FF_8000 | 1024);
+    // L8.9 (lane i915ddb): whole-pipe DDB after the flips above — plane 1A
+    // owns blocks 0..860 and the cursor the fixed 32 at the top of gen9's 892
+    // (raw BUF_CFG: start | (end - 1) << 16).
+    let (dp, dc) = (proc_i915(b"ddb_plane"), proc_i915(b"ddb_cursor"));
+    note(b"ddb_plane", dp.unwrap_or(u64::MAX));
+    note(b"ddb_cursor", dc.unwrap_or(u64::MAX));
+    report(b"ddb_plane_whole_pipe_0_860", dp == Some(859 << 16));
+    report(b"ddb_cursor_top_32_860_892", dc == Some(891 << 16 | 860));
+    // Legacy GEM_MMAP + I915_MMAP_WC: a CPU address onto the object's pages
+    // through the WC path (counted as a WC map), honouring `offset`; the
+    // caller's struct comes back intact; unknown flags EINVAL; past the
+    // object EINVAL; MMAP_OFFSET_FIXED is ENODEV on an integrated part.
+    let wc0 = proc_i915(b"mmap_wc").unwrap_or(0);
+    let mut gm = GemMmap { handle: wh, offset: 4096, size: 4096, flags: 1, ..Default::default() };
+    let gm_ok = io(cfd, I915_GEM_MMAP, &mut gm).is_ok() && gm.addr_ptr != 0;
+    report(b"gem_mmap_wc_returns_address", gm_ok);
+    report(b"gem_mmap_struct_preserved", gm.handle == wh && gm.offset == 4096 && gm.size == 4096 && gm.flags == 1);
+    report(b"gem_mmap_wc_counted_as_wc", proc_i915(b"mmap_wc").unwrap_or(0) == wc0 + 1);
+    if gm_ok && wmapped {
+        core::ptr::write_volatile(gm.addr_ptr as *mut u32, 0x5A5A_1234);
+        report(b"gem_mmap_offset_aliases_page_1", core::ptr::read_volatile((wp as *const u32).add(1024)) == 0x5A5A_1234);
+        munmap(gm.addr_ptr as *mut c_void, 4096);
+    }
+    let mut bad = GemMmap { handle: wh, size: 4096, flags: 2, ..Default::default() };
+    report(b"gem_mmap_unknown_flag_einval", io(cfd, I915_GEM_MMAP, &mut bad) == Err(EINVAL));
+    let mut past = GemMmap { handle: wh, offset: (size as u64 + 4095) & !4095, size: 4096, ..Default::default() };
+    report(b"gem_mmap_past_object_einval", io(cfd, I915_GEM_MMAP, &mut past) == Err(EINVAL));
+    let mut fx = MmapOffset { handle: wh, flags: 4, ..Default::default() };
+    report(b"mmap_offset_fixed_enodev_on_integrated", io(cfd, I915_GEM_MMAP_OFFSET, &mut fx) == Err(ENODEV));
     let _ = atomic(cfd, PLANE_PRIMARY, &prim, 0, 0);
     if bp as isize != -1 { munmap(bp, size); }
     if wmapped { munmap(wp, size); }
