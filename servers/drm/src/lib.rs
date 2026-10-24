@@ -322,6 +322,13 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         // No need to switch address space.
         let res = match interface.handle_ioctl(cmd, arg_val, open_id) {
             Ok(result) => {
+                // A GPU backend's WC/UC answer comes back in bit 0 (see
+                // `MMAP_RET_UNCACHED`); the token itself is page aligned.
+                let backend_uc = cmd == DRM_IOCTL_MMAP
+                    && result & drivers::drm_device_interface::MMAP_RET_UNCACHED != 0;
+                let result = if cmd == DRM_IOCTL_MMAP {
+                    result & !drivers::drm_device_interface::MMAP_RET_UNCACHED
+                } else { result };
                 let mut m = val_reply(result as u64);
                 // Slot 0 is the physical token. Slot 1 tells `sys_mmap` how to
                 // map it: a host-visible virtio-gpu blob the host asked to be WC
@@ -334,7 +341,8 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                 // lookup happens with no BO lock held.
                 if cmd == DRM_IOCTL_MMAP {
                     let cache = drivers::drm_device_interface::blob_map_cache_type(result as u64);
-                    let uncached = cache == drivers::virtio_gpu::VIRTIO_GPU_MAP_CACHE_UNCACHED
+                    let uncached = backend_uc
+                        || cache == drivers::virtio_gpu::VIRTIO_GPU_MAP_CACHE_UNCACHED
                         || cache == drivers::virtio_gpu::VIRTIO_GPU_MAP_CACHE_WC;
                     if uncached {
                         m.data[8..16].copy_from_slice(&MMAP_HINT_UNCACHED.to_le_bytes());

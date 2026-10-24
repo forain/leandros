@@ -245,6 +245,26 @@ fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
     if n < 0 { 0 } else { n as usize }
 }
 
+/// `name value` line of /proc/i915.
+fn proc_i915(key: &[u8]) -> Option<u64> {
+    let mut b = [0u8; 8192];
+    let n = read_file(b"/proc/i915\0", &mut b);
+    for line in b[..n].split(|&c| c == b'\n') {
+        if line.len() > key.len() && line.starts_with(key) && line[key.len()] == b' ' {
+            let mut v = 0u64;
+            for &c in &line[key.len() + 1..] { if !c.is_ascii_digit() { break; } v = v * 10 + (c - b'0') as u64; }
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// MMAP_OFFSET with `flags` (1 WC, 2 WB, 3 UC): the fake offset, 0 on error.
+fn mmap_offset(fd: c_int, h: u32, flags: u64) -> u64 {
+    let mut m = MmapOffset { handle: h, flags, ..Default::default() };
+    if io(fd, I915_GEM_MMAP_OFFSET, &mut m).is_err() { 0 } else { m.offset }
+}
+
 fn gem_create(fd: c_int, size: u64) -> u32 {
     let mut c = GemCreate { size, ..Default::default() };
     if io(fd, I915_GEM_CREATE, &mut c).is_ok() { c.handle } else { 0 }
@@ -1280,6 +1300,60 @@ unsafe fn kms_async() {
     let e2 = read_event(cfd, 1000);
     report(b"kms_blocking_commit_waits", p1 && p2 && matches!(e1, Some((2, 0xC1, _))) && matches!(e2, Some((2, 0xC2, _))));
     if let (Some((_, _, s1)), Some((_, _, s2))) = (e1, e2) { report(b"kms_event_sequence_advances", s2 > s1); }
+
+    // L8.9 (lane i915wc): a WC CPU mapping is honoured — a scanout object
+    // written only through MMAP_OFFSET_WC flips without the clflush, while a
+    // WB-mapped one (also mapped WC: mixed counts as WB) still flushes.
+    let size = pitch as usize * hgt as usize;
+    let wh = gem_create(cfd, size as u64);
+    let woff = mmap_offset(cfd, wh, 1);
+    let wp = if woff != 0 { mmap(core::ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, woff as i64) } else { -1isize as *mut c_void };
+    let wmapped = wp as isize != -1;
+    if wmapped {
+        let q = wp as *mut u32;
+        for i in (0..size / 4).step_by(1024) { core::ptr::write_volatile(q.add(i), 0x00FF_8000 | i as u32); }
+    }
+    let wc_again = mmap_offset(cfd, wh, 1);
+    report(b"wc_mmap_offset_stable", wmapped && wc_again == woff);
+    let mut wf = FbCmd2 { width: w, height: hgt, pixel_format: 0x3432_5258, flags: 2, ..Default::default() };
+    wf.handles[0] = wh;
+    wf.pitches[0] = pitch;
+    let wadded = wmapped && io(cfd, DRM_IOCTL_MODE_ADDFB2, &mut wf).is_ok() && wf.fb_id != 0;
+    let wprim = [(P_FB_ID, wf.fb_id as u64), (P_CRTC_ID, 1)];
+    let flip = |pr: &[(u32, u64)], tag: u64| atomic(cfd, PLANE_PRIMARY, pr, FLIP_EVENT | ATOMIC_NONBLOCK, tag).is_ok()
+        && matches!(read_event(cfd, 1000), Some((2, t, _)) if t == tag);
+    let f0 = proc_i915(b"flips_clflushed");
+    let wflips = wadded && flip(&wprim, 0xD1) && flip(&prim, 0xD2) && flip(&wprim, 0xD3);
+    let f1 = proc_i915(b"flips_clflushed");
+    // fbh (never CPU-mapped yet, flushed once at ADDFB2) flips in between.
+    let fb_wb = mmap_offset(cfd, fbh, 2);
+    let fb_wc = mmap_offset(cfd, fbh, 1);
+    let bp = if fb_wb != 0 { mmap(core::ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, fb_wb as i64) } else { -1isize as *mut c_void };
+    if bp as isize != -1 { core::ptr::write_volatile(bp as *mut u32, 0x1234_5678); }
+    let g0 = proc_i915(b"flips_clflushed");
+    let bflip = bp as isize != -1 && flip(&prim, 0xD4) && flip(&wprim, 0xD5) && flip(&prim, 0xD6);
+    let g1 = proc_i915(b"flips_clflushed");
+    match (f0, f1, g0, g1) {
+        (Some(a), Some(b), Some(c), Some(d)) => {
+            note(b"wc flips clflushed", b - a);
+            note(b"wb flips clflushed", d - c);
+            // none in the WC run; both fbh flips once fbh has a WB mapping.
+            report(b"wc_mapped_scanout_flips_no_clflush", wflips && b - a == 0);
+            report(b"wb_mapped_scanout_flips_clflush", bflip && d - c == 2);
+        }
+        _ => out(b"    (no flips_clflushed in /proc/i915: WC flip tests skipped)\n"),
+    }
+    report(b"wc_and_wb_offsets_differ", fb_wb != 0 && fb_wc != 0 && fb_wb != fb_wc);
+    let wcn = proc_i915(b"mmap_wc").unwrap_or(0);
+    report(b"proc_i915_counts_wc_mmaps", wcn >= 2);
+    // Readback through the WC view of what was stored through it.
+    report(b"wc_mapping_reads_back", wmapped && core::ptr::read_volatile((wp as *const u32).add(1024)) == 0x00FF_8000 | 1024);
+    let _ = atomic(cfd, PLANE_PRIMARY, &prim, 0, 0);
+    if bp as isize != -1 { munmap(bp, size); }
+    if wmapped { munmap(wp, size); }
+    let mut id = wf.fb_id;
+    if wadded { let _ = io(cfd, DRM_IOCTL_MODE_RMFB, &mut id); }
+    let _ = gem_close(cfd, wh);
 
     let _ = atomic(cfd, PLANE_CURSOR, &[(P_FB_ID, 0), (P_CRTC_ID, 0)], 0, 0);
     let mut id = cf.fb_id;

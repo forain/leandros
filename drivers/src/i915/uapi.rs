@@ -400,10 +400,15 @@ struct Bo {
     /// treats it as external and renders it with the PTE MOCS, so a
     /// `scanout_uc` object is written uncached and needs no flip clflush.
     prime: bool,
-    /// A CPU mapping was handed out (MMAP_OFFSET of any type: every i915
-    /// mapping is write-back), so CPU stores may sit dirty in the caches at
-    /// any time: each flip of it clflushes. Sticky.
+    /// A write-back CPU mapping was handed out (MMAP_OFFSET_WB), so CPU
+    /// stores may sit dirty in the caches at any time: each flip of it
+    /// clflushes. Sticky — an object mapped both WB and WC stays WB/dirty.
     cpu_wb: bool,
+    /// A WC or UC CPU mapping was handed out (MMAP_OFFSET_WC/UC): those
+    /// stores bypass the caches and need no flip flush. The object was
+    /// clflushed once when the first one was handed out, so no line cached
+    /// before (the GEM_CREATE zeroing) is evicted on top of them later.
+    cpu_wc: bool,
     /// A one-shot cached CPU write since the last flip flush (PWRITE through
     /// the HHDM, SET_DOMAIN with the CPU write domain).
     cpu_dirty: bool,
@@ -566,7 +571,7 @@ impl State {
             if self.bos.get(&obj).map_or(false, |b| b.last_fence.pending()) { i += 1; continue; }
             self.zombies.swap_remove(i);
             let Some(b) = self.bos.remove(&obj) else { continue };
-            crate::drm_offset::release(b.phys as u64);
+            for tag in [MMAP_TAG_WB, MMAP_TAG_WC, MMAP_TAG_UC] { crate::drm_offset::release(b.phys as u64 | tag); }
             for v in self.vms.values_mut() {
                 if let Some((s, l)) = v.map.remove_obj(obj) { unmap_range(&mut v.pt, s, l); }
             }
@@ -829,7 +834,7 @@ fn gem_create(a: u64, open_id: u32, ext: bool) -> Result<usize, i32> {
     st.next_obj += 1;
     CREATES.fetch_add(1, Ordering::Relaxed);
     st.bos.insert(obj, Bo { phys, order, size, handles: 1, exports: 0, tiling: 0, stride: 0, caching: CACHING_CACHED,
-                            madv: MADV_WILLNEED, last_fence: Fences::default(), dead: false, scanout_uc: false, prime: false, cpu_wb: false, cpu_dirty: false,
+                            madv: MADV_WILLNEED, last_fence: Fences::default(), dead: false, scanout_uc: false, prime: false, cpu_wb: false, cpu_wc: false, cpu_dirty: false,
                             creator: 0 });
     let o = st.open(open_id)?;
     let h = alloc_handle(o);
@@ -853,6 +858,20 @@ fn with_bo<R>(open_id: u32, handle: u32, f: impl FnOnce(&mut Bo) -> Result<R, i3
     f(b)
 }
 
+/// Low bits of an i915 mmap token (the object's page-aligned physical base)
+/// naming the CPU caching mode of that mapping.
+const MMAP_TAG_WB: u64 = 0;
+const MMAP_TAG_WC: u64 = 1;
+const MMAP_TAG_UC: u64 = 2;
+const MMAP_TAG_MASK: u64 = 0xfff;
+
+fn mmap_tag(flags: u64) -> u64 {
+    match flags { MMAP_OFFSET_WC => MMAP_TAG_WC, MMAP_OFFSET_UC => MMAP_TAG_UC, _ => MMAP_TAG_WB }
+}
+
+/// MMAP_OFFSET calls per mode (WB, WC, UC), for /proc/i915.
+pub(super) static MMAP_BY_TYPE: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
 fn mmap_offset(a: u64, open_id: u32) -> Result<usize, i32> {
     let m: GemMmapOffset = read_user(a);
     if m.extensions != 0 || m.pad != 0 { return Err(EINVAL); }
@@ -862,9 +881,25 @@ fn mmap_offset(a: u64, open_id: u32) -> Result<usize, i32> {
         MMAP_OFFSET_GTT => return Err(ENODEV),
         _ => return Err(EINVAL),
     }
-    let (phys, size) = with_bo(open_id, m.handle, |b| { b.cpu_wb = true; Ok((b.phys, b.size)) })?;
+    let tag = mmap_tag(m.flags);
+    let (phys, size) = with_bo(open_id, m.handle, |b| {
+        if tag == MMAP_TAG_WB {
+            b.cpu_wb = true;
+        } else if !b.cpu_wc {
+            // First uncached CPU view: write back whatever the cached kernel
+            // view left (zeroing, PWRITE) so a later eviction cannot land on
+            // top of what is stored through this mapping.
+            b.cpu_wc = true;
+            super::kms::flush_for_display(b.phys as u64, b.size as u64);
+        }
+        Ok((b.phys, b.size))
+    })?;
+    MMAP_BY_TYPE[tag as usize].fetch_add(1, Ordering::Relaxed);
     // Opaque offset, never the physical base (resolved in `handle_ioctl_mmap`).
-    let off = crate::drm_offset::offset_for(phys as u64, size as u64).ok_or(EINVAL)?;
+    // One offset per (object, caching mode), as Linux hands out one per mmap
+    // type: the mode rides in the low bits of the page-aligned real token, so
+    // `mmap` below knows which page attributes this mapping asked for.
+    let off = crate::drm_offset::offset_for(phys as u64 | tag, size as u64).ok_or(EINVAL)?;
     write_user::<u64>(a + 8, off);
     Ok(0)
 }
@@ -1534,13 +1569,16 @@ static MMAP_MISSES: AtomicU32 = AtomicU32::new(0);
 /// L1.14: only for an open holding a handle on the token's BO (its own or a
 /// PRIME import); another open's token is refused like an unknown one.
 /// STATE is taken: 0x1007 runs without the DRM device lock.
+/// The answer's `bool` is "map it uncached": a WC/UC token comes out
+/// write-combining (x86 PAT PA5; Normal-NC on AArch64), a WB one write-back.
 fn mmap(token: u64, open_id: u32) -> Option<(u64, bool)> {
-    if MMAP_TOKENS.lock().contains_key(&token) {
+    let (base, tag) = (token & !MMAP_TAG_MASK, token & MMAP_TAG_MASK);
+    if tag <= MMAP_TAG_UC && MMAP_TOKENS.lock().contains_key(&base) {
         let st = STATE.lock();
         let mine = st.opens.get(&open_id).map_or(false, |o| {
-            o.handles.values().any(|obj| st.bos.get(obj).map_or(false, |b| b.phys as u64 == token))
+            o.handles.values().any(|obj| st.bos.get(obj).map_or(false, |b| b.phys as u64 == base))
         });
-        return if mine { Some((token, false)) } else { None };
+        return if mine { Some((base, tag != MMAP_TAG_WB)) } else { None };
     }
     // Not ours. The DRM layer may still own it (dumb/blob); if not, the
     // kernel fails the mmap (it used to hand back a zero private mapping).
@@ -1873,7 +1911,7 @@ pub(super) fn kms_bo_put(obj: u32) { let _ = bo_release(obj); }
 /// default (2) only when the object may hold cache-dirty lines the display
 /// (which does not snoop the LLC) would miss:
 /// * not bound uncached (`i915.kms_uncached=0`): GPU writes land in the LLC;
-/// * a CPU mapping exists (`cpu_wb`; mappings are write-back), or a cached
+/// * a write-back CPU mapping exists (`cpu_wb`; WC/UC ones do not count), or a cached
 ///   CPU write (PWRITE, SET_DOMAIN CPU) happened since the last flip flush.
 /// GPU rendering into a `scanout_uc` object needs nothing: Mesa allocates
 /// every GBM/KMS-shareable buffer with BO_ALLOC_SHARED (gbm_dri always adds
