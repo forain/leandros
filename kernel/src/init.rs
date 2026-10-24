@@ -116,7 +116,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // that already depends on both.
     if let Some(c) = crate::boot_cmdline() {
         serial_print_str("[BLK] kernel cmdline: ");
-        serial_print_str(c);
+        vfs_server::cmdline_redact::redact(c, serial_print_str); // never echo wifi.psk= etc.
         serial_print_str("\n");
     }
     // The disk Limine loaded us from: the /dev/root tie-break when several

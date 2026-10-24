@@ -1294,7 +1294,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     if !is_limine {
         if let Some(c) = boot_cmdline() {
             serial_print_str("[early] cmdline: ");
-            serial_print_str(c);
+            vfs_server::cmdline_redact::redact(c, serial_print_str); // never echo wifi.psk= etc.
             serial_print_str("\n");
         }
     }
