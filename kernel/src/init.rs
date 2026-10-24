@@ -114,6 +114,10 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // backend crosses the boundary as this vtable — the same shape the DRM
     // dmabuf hook uses. Registered here because this crate is the one place
     // that already depends on both.
+    if let Some(n) = crate::boot_cmdline().and_then(|c| c.split_ascii_whitespace()
+        .find_map(|t| t.strip_prefix("sched.check=")?.parse::<u64>().ok())) {
+        sched::set_percpu_check_ticks(n);
+    }
     if let Some(c) = crate::boot_cmdline() {
         serial_print_str("[BLK] kernel cmdline: ");
         vfs_server::cmdline_redact::redact(c, serial_print_str); // never echo wifi.psk= etc.
