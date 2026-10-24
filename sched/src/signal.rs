@@ -608,6 +608,13 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
                     t.signal_pending &= !(1u64 << (sig - 1));
                 }
             }
+            // A default kill: take the group exit in this same hold (see
+            // `claim_fatal_signal_locked`), so the signal is never off the
+            // pending set while unclaimed.
+            let b = 1u64 << (sig - 1);
+            if action.handler == 0 && (SIGDFL_IGNORE | SIGDFL_STOP) & b == 0 {
+                super::claim_fatal_signal_locked(&mut *rq, pid, sig);
+            }
         }
 
         match action.handler {
