@@ -297,6 +297,85 @@ pub struct HtRates {
     pub ldpc: bool,
 }
 
+/// A rate-control column (rs.c `enum rs_column`): streams and guard interval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Col { pub mimo: bool, pub sgi: bool }
+
+impl Col {
+    pub fn label(&self) -> &'static str {
+        match (self.mimo, self.sgi) { (false, false) => "SISO", (false, true) => "SISO-SGI", (true, false) => "MIMO2", (true, true) => "MIMO2-SGI" }
+    }
+}
+
+/// Column search (rs.c rs_switch_to_column / search_better_tbl): every
+/// COL_SEARCH_MS one other column is tried for COL_PROBE_LEN_MS with rate
+/// scaling inside it; kept when its best measured throughput beats the old
+/// column's by COL_KEEP_PCT, else the old column comes back and that
+/// column waits twice as long (up to COL_BACKOFF_MAX_MS).
+pub const COL_SEARCH_MS: u64 = 10_000;
+pub const COL_PROBE_LEN_MS: u64 = 1500;
+pub const COL_PROBE_MAX_MS: u64 = 3000;
+pub const COL_KEEP_PCT: u32 = 108;
+pub const COL_BACKOFF_MAX_MS: u64 = 160_000;
+
+/// What a column probe goes back to.
+#[derive(Clone, Debug)]
+pub struct ColProbe {
+    pub from: usize,
+    pub from_rates: Vec<u8>,
+    pub from_floor: usize,
+    pub from_cur: usize,
+    pub from_win: Vec<RateWin>,
+    pub old_tpt: u32,
+    pub to: usize,
+    pub until_ms: u64,
+}
+
+/// The rate ladder of a column: the legacy rates below the lowest MCS,
+/// then the MCS ladder. `col` None = the start column of `cfg.ht`; Some =
+/// that column (MIMO2: the single-stream MCS below MCS 8, then MCS 8-15).
+/// Returns (rates, floor, start index).
+fn ladder(cfg: &RateCfg, col: Option<Col>) -> (Vec<u8>, usize, usize) {
+        let mut rates: Vec<u8> = cfg.ap_rates.iter().map(|r| r & 0x7f)
+            .filter(|&r| legacy_index(r).is_some() && (cfg.max_r500k == 0 || r <= cfg.max_r500k)).collect();
+        rates.sort_unstable_by_key(|&r| legacy_index(r));
+        rates.dedup();
+        if rates.is_empty() { rates.push(if cfg.band_24 { 2 } else { 12 }); }
+        let mut want_ht = None;
+        if let Some(h) = cfg.ht {
+            // HT: the legacy rates below MCS 0, then the MCS ladder.
+            let cap = |id: u8| cfg.max_r500k == 0 || nominal_r500k(id) <= cfg.max_r500k as u32;
+            let sgi = col.map_or(h.sgi, |c| c.sgi);
+            let mut ht: Vec<u8> = (0..8).map(|m| ht_id_w(m, sgi, h.ht40)).filter(|&id| cap(id)).collect();
+            if col.map_or(false, |c| c.mimo) {
+                let m8 = expected_tpt(ht_id_w(8, sgi, h.ht40));
+                ht.retain(|&id| expected_tpt(id) < m8);
+                ht.extend((8..16).map(|m| ht_id_w(m, sgi, h.ht40)).filter(|&id| cap(id)));
+            } else if col.is_none() && h.mimo {
+                let top = ht.last().map_or(0, |&id| expected_tpt(id));
+                ht.extend((8..16).map(|m| ht_id_w(m, sgi, h.ht40)).filter(|&id| cap(id) && expected_tpt(id) > top));
+            }
+            if let Some(&low) = ht.first() {
+                rates.retain(|&r| expected_tpt(r) < expected_tpt(low));
+                rates.extend_from_slice(&ht);
+                // Unknown signal: MCS 3, the middle of the table.
+                // 40 MHz spreads the power over twice the band: 3 dB less per subcarrier.
+                want_ht = Some(ht_id_w(cfg.rssi.map_or(3, |r| initial_mcs(if h.ht40 { r.saturating_sub(3) } else { r })), sgi, h.ht40));
+            }
+        }
+        let floor = cfg.ap_rates.iter().filter(|r| *r & 0x80 != 0)
+            .filter_map(|r| rates.iter().position(|&x| x == r & 0x7f)).min().unwrap_or(0);
+        let cur = match want_ht {
+            Some(w) => rates.iter().rposition(|&r| expected_tpt(r) <= expected_tpt(w)).unwrap_or(0),
+            None => {
+                // Unknown signal: 24 Mb/s, the middle of the table.
+                let want = cfg.rssi.map_or(48, |s| initial_r500k(s, cfg.band_24));
+                rates.iter().rposition(|&r| legacy_index(r) <= legacy_index(want)).unwrap_or(0)
+            }
+        };
+    (rates, floor, cur)
+}
+
 /// Rate control for one station.
 #[derive(Clone, Debug)]
 pub struct RateCtl {
@@ -347,6 +426,18 @@ pub struct RateCtl {
     pub signal: Option<i8>,
     band_24: bool,
     ht_cfg: Option<HtRates>,
+    /// Column search: the columns (0 = the start column), the one in use,
+    /// the probe in progress, when the next probe is due (0 = not yet
+    /// scheduled), and per column the earliest next try and its back-off.
+    pub cols: Vec<Col>,
+    pub col: usize,
+    pub col_probe: Option<ColProbe>,
+    pub col_next_ms: u64,
+    col_not_before: Vec<u64>,
+    col_backoff: Vec<u64>,
+    pub col_probes: u64,
+    pub col_kept: u64,
+    cfg: RateCfg,
 }
 
 /// What an antenna probe goes back to when the other antenna is not better.
@@ -362,38 +453,7 @@ pub struct AntProbe {
 
 impl RateCtl {
     pub fn new(cfg: &RateCfg) -> RateCtl {
-        let mut rates: Vec<u8> = cfg.ap_rates.iter().map(|r| r & 0x7f)
-            .filter(|&r| legacy_index(r).is_some() && (cfg.max_r500k == 0 || r <= cfg.max_r500k)).collect();
-        rates.sort_unstable_by_key(|&r| legacy_index(r));
-        rates.dedup();
-        if rates.is_empty() { rates.push(if cfg.band_24 { 2 } else { 12 }); }
-        let mut want_ht = None;
-        if let Some(h) = cfg.ht {
-            // HT: the legacy rates below MCS 0, then the MCS ladder.
-            let cap = |id: u8| cfg.max_r500k == 0 || nominal_r500k(id) <= cfg.max_r500k as u32;
-            let mut ht: Vec<u8> = (0..8).map(|m| ht_id_w(m, h.sgi, h.ht40)).filter(|&id| cap(id)).collect();
-            if h.mimo {
-                let top = ht.last().map_or(0, |&id| expected_tpt(id));
-                ht.extend((8..16).map(|m| ht_id_w(m, h.sgi, h.ht40)).filter(|&id| cap(id) && expected_tpt(id) > top));
-            }
-            if let Some(&low) = ht.first() {
-                rates.retain(|&r| expected_tpt(r) < expected_tpt(low));
-                rates.extend_from_slice(&ht);
-                // Unknown signal: MCS 3, the middle of the table.
-                // 40 MHz spreads the power over twice the band: 3 dB less per subcarrier.
-                want_ht = Some(ht_id_w(cfg.rssi.map_or(3, |r| initial_mcs(if h.ht40 { r.saturating_sub(3) } else { r })), h.sgi, h.ht40));
-            }
-        }
-        let floor = cfg.ap_rates.iter().filter(|r| *r & 0x80 != 0)
-            .filter_map(|r| rates.iter().position(|&x| x == r & 0x7f)).min().unwrap_or(0);
-        let cur = match want_ht {
-            Some(w) => rates.iter().rposition(|&r| expected_tpt(r) <= expected_tpt(w)).unwrap_or(0),
-            None => {
-                // Unknown signal: 24 Mb/s, the middle of the table.
-                let want = cfg.rssi.map_or(48, |s| initial_r500k(s, cfg.band_24));
-                rates.iter().rposition(|&r| legacy_index(r) <= legacy_index(want)).unwrap_or(0)
-            }
-        };
+        let (rates, floor, cur) = ladder(cfg, None);
         let both = cfg.valid_ant & (ANT_A | ANT_B) == ANT_A | ANT_B;
         let (ant, ant_fixed) = match cfg.fixed_ant {
             Some(a) if cfg.valid_ant & a != 0 => (a, true),
@@ -403,10 +463,105 @@ impl RateCtl {
         RateCtl { rates, floor, win: alloc::vec![RateWin::default(); n], cur, ant, valid_ant: cfg.valid_ant, ant_fixed,
                   sent: None, sent_ms: 0, pending: true, fail_streak: 0, last_toggle_ms: 0,
                   ups: 0, downs: 0, toggles: 0, lq_sent: 0, mismatched: 0, agg: false, agg_limit: 63, ampdus: 0,
-                  probe: None, next_probe_ms: 0, probes: 0, probes_kept: 0, reseeds: 0, leg_att: [0; 2], leg_ok: [0; 2], signal: None, band_24: cfg.band_24, ht_cfg: cfg.ht }
+                  probe: None, next_probe_ms: 0, probes: 0, probes_kept: 0, reseeds: 0, leg_att: [0; 2], leg_ok: [0; 2], signal: None, band_24: cfg.band_24, ht_cfg: cfg.ht,
+                  cols: alloc::vec![Col { mimo: cfg.ht.map_or(false, |h| h.mimo), sgi: cfg.ht.map_or(false, |h| h.sgi) }], col: 0,
+                  col_probe: None, col_next_ms: 0, col_not_before: alloc::vec![0], col_backoff: alloc::vec![COL_SEARCH_MS],
+                  col_probes: 0, col_kept: 0, cfg: cfg.clone() }
     }
 
     pub fn cur_r500k(&self) -> u8 { self.rates[self.cur] }
+
+    /// Let rate control search the other columns: the other guard interval
+    /// (`sgi`: the AP receives short GI at this width) and two streams
+    /// (`mimo`: the AP receives two streams, not SM power save static, no
+    /// BT coex sharing an antenna). Needs an HT ladder, and two streams
+    /// need both TX chains and no single forced antenna.
+    pub fn enable_col_search(&mut self, sgi: bool, mimo: bool) {
+        let h = match self.ht_cfg { Some(h) if self.rates.iter().any(|&r| is_ht(r)) => h, _ => return };
+        let two = self.valid_ant & ANT_AB == ANT_AB && (!self.ant_fixed || self.ant == ANT_AB);
+        let base = self.cols[0];
+        let mut cols = alloc::vec![base];
+        let sgis: &[bool] = if sgi { &[false, true] } else { &[false] };
+        let mimos: &[bool] = if mimo && two && !h.mimo { &[false, true] } else { &[false] };
+        for &m in mimos { for &g in sgis {
+            let c = Col { mimo: m || base.mimo, sgi: if sgi { g } else { base.sgi } };
+            if !cols.contains(&c) { cols.push(c); }
+        } }
+        let n = cols.len();
+        self.cols = cols;
+        self.col_not_before = alloc::vec![0; n];
+        self.col_backoff = alloc::vec![COL_SEARCH_MS; n];
+    }
+
+    /// The column in use.
+    pub fn cur_col(&self) -> Col { self.cols[self.col] }
+
+    fn start_col_probe(&mut self, to: usize, now: u64) {
+        let c = self.cur;
+        let old_tpt = self.win[c].sr * self.etpt(c);
+        let (rates, floor, _) = ladder(&self.cfg, Some(self.cols[to]));
+        // Start at the slowest rate of the new column that could beat the
+        // old throughput (rs_get_best_rate); rate scaling goes on from there.
+        let start = rates.iter().position(|&r| 1000 * if self.agg { expected_tpt_agg(r) } else { expected_tpt(r) } > old_tpt)
+            .unwrap_or(rates.len() - 1);
+        let n = rates.len();
+        let from_rates = core::mem::replace(&mut self.rates, rates);
+        let from_win = core::mem::replace(&mut self.win, alloc::vec![RateWin::default(); n]);
+        self.col_probe = Some(ColProbe { from: self.col, from_rates, from_floor: self.floor, from_cur: c, from_win, old_tpt, to,
+                                         until_ms: now + COL_PROBE_LEN_MS });
+        self.floor = floor;
+        self.cur = start;
+        self.col = to;
+        self.fail_streak = 0;
+        self.col_probes += 1;
+        self.pending = true;
+    }
+
+    fn end_col_probe(&mut self, now: u64, keep: bool) {
+        let p = match self.col_probe.take() { Some(p) => p, None => return };
+        self.col_next_ms = now + COL_SEARCH_MS;
+        if keep {
+            self.col_kept += 1;
+            for b in self.col_backoff.iter_mut() { *b = COL_SEARCH_MS; }
+            for t in self.col_not_before.iter_mut() { *t = 0; }
+            return;
+        }
+        self.col_backoff[p.to] = (self.col_backoff[p.to] * 2).min(COL_BACKOFF_MAX_MS);
+        self.col_not_before[p.to] = now + self.col_backoff[p.to];
+        self.col = p.from;
+        self.rates = p.from_rates;
+        self.floor = p.from_floor;
+        self.cur = p.from_cur;
+        self.win = p.from_win;
+        for w in self.win.iter_mut() { if w.att > 0 { w.last_ms = now; } }
+        self.fail_streak = 0;
+        self.pending = true;
+    }
+
+    /// The column probe in progress or a new one; true when the table changed.
+    fn column_search(&mut self, now: u64) -> bool {
+        if let Some(p) = self.col_probe.as_ref() {
+            let (until, old) = (p.until_ms, p.old_tpt);
+            if self.fail_streak >= FAIL_STREAK_TOGGLE { self.end_col_probe(now, false); return true; }
+            let valid = self.win[self.cur].valid(now);
+            if (now >= until && valid) || now >= until + COL_PROBE_MAX_MS {
+                let best = (0..self.rates.len()).filter_map(|i| self.tpt(i, now)).max().unwrap_or(0);
+                self.end_col_probe(now, best as u64 * 100 >= old as u64 * COL_KEEP_PCT as u64);
+                return true;
+            }
+            return false;
+        }
+        if self.cols.len() < 2 || self.probe.is_some() { return false; }
+        if self.col_next_ms == 0 { self.col_next_ms = now + COL_SEARCH_MS; return false; }
+        if now < self.col_next_ms || !self.win[self.cur].valid(now) { return false; }
+        // Round robin over the other columns that are not backing off.
+        let n = self.cols.len();
+        let to = (1..n).map(|k| (self.col + k) % n).find(|&k| self.col_not_before[k] <= now);
+        match to {
+            Some(k) => { self.start_col_probe(k, now); true }
+            None => { self.col_next_ms = now + COL_SEARCH_MS; false }
+        }
+    }
 
     /// The retry chain for the current rate and antenna: two tries at the
     /// current rate (and at the two HT rates below it), one at each lower
@@ -678,10 +833,10 @@ impl RateCtl {
     /// True when the table changed (the outcome is then not counted).
     fn reseed_if_idle(&mut self, now: u64) -> bool {
         let dbm = match self.signal { Some(d) => d, None => return false };
-        if self.probe.is_some() || self.win.iter().any(|w| w.fresh(now)) { return false; }
+        if self.probe.is_some() || self.col_probe.is_some() || self.win.iter().any(|w| w.fresh(now)) { return false; }
         let want = match self.ht_cfg.filter(|_| self.rates.iter().any(|&r| is_ht(r))) {
             Some(h) => {
-                let id = ht_id_w(initial_mcs(if h.ht40 { dbm.saturating_sub(3) } else { dbm }), h.sgi, h.ht40);
+                let id = ht_id_w(initial_mcs(if h.ht40 { dbm.saturating_sub(3) } else { dbm }), self.cols[self.col].sgi, h.ht40);
                 self.rates.iter().rposition(|&r| expected_tpt(r) <= expected_tpt(id)).unwrap_or(0)
             }
             None => {
@@ -699,7 +854,8 @@ impl RateCtl {
     fn decide(&mut self, now: u64) -> Action {
         // One step per table that reached the firmware.
         if self.pending { return Action::Stay; }
-        if self.antenna_search(now) { return Action::Stay; }
+        if self.col_probe.is_none() && self.antenna_search(now) { return Action::Stay; }
+        if self.column_search(now) { return Action::Stay; }
         if self.probe.is_none() && self.fail_streak >= FAIL_STREAK_TOGGLE && self.can_toggle(now) {
             self.toggle(now);
             return Action::Stay;
@@ -727,10 +883,11 @@ impl RateCtl {
 
     /// One line: current rate, antenna, per-rate success.
     pub fn summary(&self, now: u64) -> String {
-        let mut s = format!("rc {} ant {} up {} down {} toggles {} lq {} mismatched {} ampdus {} probes {} kept {} reseeds {}; sr",
+        let mut s = format!("rc {} ant {} up {} down {} toggles {} lq {} mismatched {} ampdus {} probes {} kept {} reseeds {} col {} colprobes {} kept {}; sr",
                             self.cur_label(), if self.ant == ANT_B { "B" } else { "A" },
                             self.ups, self.downs, self.toggles, self.lq_sent, self.mismatched, self.ampdus,
-                            self.probes, self.probes_kept, self.reseeds);
+                            self.probes, self.probes_kept, self.reseeds,
+                            self.cur_col().label(), self.col_probes, self.col_kept);
         for (i, w) in self.win.iter().enumerate() {
             if w.fresh(now) { let _ = write!(s, " {}:{}%/{}", rate_label(self.rates[i]), w.sr / 10, w.att); }
         }

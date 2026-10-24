@@ -24,6 +24,8 @@ mod assoc_tests;
 pub mod iwl_rs;
 #[cfg(test)]
 mod rs_tests;
+#[cfg(test)]
+mod col_tests;
 
 #[path = "../../src/iwl_agg.rs"]
 pub mod iwl_agg;
