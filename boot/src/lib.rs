@@ -16,6 +16,7 @@ pub mod fdt_build;
 // ── Memory map types ─────────────────────────────────────────────────────────
 
 pub mod memmap;
+pub mod hhdm_a64;
 pub use memmap::{MemoryRegion, MemoryType};
 
 // ── Unified boot info ─────────────────────────────────────────────────────────
