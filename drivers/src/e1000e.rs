@@ -29,7 +29,9 @@
 //! * Interrupts: MSI (x86_64) for RX timer, link change, overrun; NAPI style
 //!   (`e1000e_hw::irq_service` / `irq_rearm`): the handler masks everything,
 //!   acks what it read and kicks the net daemon, which re-enables the mask
-//!   after draining. Without MSI the data path is polled.
+//!   after draining. Without MSI (aarch64: no GIC ITS) the same handler runs
+//!   on the shared, level-triggered INTx line: the ICR read clears the
+//!   causes and the IMC write drops the line before the dispatcher's EOI.
 //!
 //! PHY accesses (MDIC) are made holding the software flag
 //! (EXTCNF_CTRL.SWFLAG), which arbitrates the PHY with the ME on "LM" (vPro)
@@ -42,7 +44,7 @@
 //! Kernel command line:
 //!   e1000e.disable=1   do not touch the NIC
 //!   e1000e.msi=0       no interrupt (pure polling)
-//!   e1000e.rxirq=0     MSI for link/errors only; RX polled
+//!   e1000e.rxirq=0     MSI/INTx for link/errors only; RX polled
 //!   e1000e.eee=1       advertise Energy-Efficient Ethernet (default: off)
 //!   e1000e.speed=100   advertise 10/100 only
 //!   e1000e.k1=0        force the K1 power state off (PCH)
@@ -1833,20 +1835,15 @@ pub fn init(cmdline: &str) {
                 match v { Some(v) => format!("MSI vector {:#04x} ({})", v, rx), None => format!("MSI ({})", rx) }
             }
             // No MSI (aarch64 without an ITS): the INTx line, level, shared.
-            // The ISR masks (IMC) and acks (ICR read) before returning, so
-            // the line drops until the daemon re-arms IMS.
+            // The ISR reads ICR (clears it) and masks (IMC) before returning,
+            // so the line drops until the daemon re-arms IMS; QEMU re-raises
+            // it on that IMS write if a cause latched meanwhile. RX on INTx
+            // measured 1027 Mbit/s up / 1382 Mbit/s down (lane e1000intx).
             Err(e) => match func.intx_line() {
                 Some(line) => match crate::irq::request_irq(crate::irq::IrqSource::Line(line), isr, 0) {
                     Ok(h) => {
                         core::mem::forget(h);
-                        let _ = arm();
-                        // RX stays polled on the shared INTx line: RX-driven
-                        // INTx stalled a bulk upload to 0.03 Mbit/s in QEMU
-                        // (aarch64, lane linkmon); link/errors are what the
-                        // line is for here.
-                        IRQ_EN.fetch_and(!IRQ_EN_RX, Ordering::SeqCst);
-                        RX_IRQ.store(false, Ordering::SeqCst);
-                        let rx = "link/errors only, RX polled (INTx)";
+                        let rx = arm();
                         func.write16(0x04, func.read16(0x04) & !crate::pci::PCI_CMD_INTX_DISABLE);
                         format!("INTx line {} (MSI {:?}; {})", line, e, rx)
                     }
