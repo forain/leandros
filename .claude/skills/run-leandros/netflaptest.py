@@ -22,6 +22,8 @@ def main(argv):
     arch = "x86_64" if "x86_64" in argv else ("aarch64" if "aarch64" in argv else os.environ.get("LEANDROS_TEST_ARCH", "aarch64"))
     keep = "--keep" in argv
     caller = os.environ.get("LEANDROS_RUN_ID", "")
+    # under runtests the suite VM (caller id) owns the boot image: stop it before booting our own
+    subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
     os.environ["LEANDROS_RUN_ID"] = f"{caller}-netflap" if caller else "netflap"
     sys.path.insert(0, HERE)
     import driver  # noqa: E402
@@ -44,7 +46,7 @@ def main(argv):
 
     try:
         stop()
-        subprocess.run([sys.executable, DRV, "start", arch], capture_output=True, text=True, timeout=900)
+        r0 = subprocess.run([sys.executable, DRV, "start", arch], capture_output=True, text=True, timeout=900)
         lg = subprocess.run([sys.executable, DRV, "login", "root", "root", str(int(120 * scale))],
                             capture_output=True, text=True, timeout=1200)
         t0 = time.time()
@@ -54,6 +56,18 @@ def main(argv):
         marks = {}
 
         def flap():
+            # anchor on the guest's own marker line so serial_run start-up latency (seconds under TCG) drops out
+            t0 = time.time()
+            while time.time() - t0 < 60 * scale:
+                try:
+                    with open(driver.SERIAL_FULL_LOG, "rb") as f:
+                        m = re.search(rb"NFLAP_U0 (\d+\.\d+)", f.read())
+                except FileNotFoundError:
+                    m = None
+                if m:
+                    marks["u0"], marks["t0"] = float(m.group(1)), time.time()
+                    break
+                time.sleep(0.05)
             time.sleep(4)
             marks["off"] = time.time()
             driver._monitor_send("set_link net0 off")
@@ -62,15 +76,15 @@ def main(argv):
             driver._monitor_send("set_link net0 on")
 
         th = threading.Thread(target=flap)
-        t_start = time.time()
+
         th.start()
-        out = sh("read u r < /proc/uptime; echo U0 $u; netctl watch --no-snapshot --for 24 | "
+        out = sh("read u r < /proc/uptime; echo NFLAP_U0 $u; netctl watch --no-snapshot --for 30 | "
                  "while read l; do read u r < /proc/uptime; echo \"S $u $l\"; done", 90)
         th.join()
-        m = re.search(r"^U0 (\d+\.\d+)", out, re.M)
+        m = re.search(r"^NFLAP_U0 (\d+\.\d+)", out, re.M)
         u0 = float(m.group(1)) if m else -1.0
         evs = [(float(x.group(1)) - u0, x.group(2)) for x in re.finditer(r"^S (\d+\.\d+) (.*)$", out, re.M)]
-        t_off, t_on = marks["off"] - t_start, marks["on"] - t_start
+        t_off, t_on = marks["off"] - marks["t0"], marks["on"] - marks["t0"]
         down = [e for e in evs if t_off - 0.5 <= e[0] and re.search(r"carrier|link|down", e[1], re.I)]
         dd = down[0][0] - t_off if down else None
         verdict("down", lg.returncode == 0 and dd is not None and dd <= 1.5,
@@ -82,7 +96,7 @@ def main(argv):
         db = (bound[0][0] - t_on) if bound else None
         verdict("up", bool(carrier) and bool(bound) and db <= 10 * scale,
                 f"carrier event {dc:.2f} s, lease bound event {db:.2f} s after set_link on (latency-offset +-0.3)"
-                if bound and carrier else f"missing carrier/bound event; evs={[e[1][:60] for e in evs]}")
+                if bound and carrier else f"missing carrier/bound event; evs={[(round(e[0],1), e[1][12:60]) for e in evs]} t_on={t_on:.1f}")
     finally:
         if not keep:
             stop()
