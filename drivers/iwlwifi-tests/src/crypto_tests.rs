@@ -211,8 +211,8 @@ fn rc(n: u64) -> [u8; 8] {
     n.to_be_bytes()
 }
 
-fn gtk_kde(key_id: u8, gtk: &[u8; 16]) -> Vec<u8> {
-    let mut v = vec![0xdd, 0x16, 0x00, 0x0f, 0xac, 0x01, key_id, 0x00];
+fn gtk_kde(key_id: u8, gtk: &[u8]) -> Vec<u8> {
+    let mut v = vec![0xdd, 6 + gtk.len() as u8, 0x00, 0x0f, 0xac, 0x01, key_id, 0x00];
     v.extend_from_slice(gtk);
     v
 }
@@ -229,6 +229,8 @@ struct Authenticator {
     pmk: [u8; 32],
     anonce: [u8; 32],
     ptk: Option<Ptk>,
+    /// The station's RSN IE (echoed in message 2, repeated in message 3).
+    own_rsn: Vec<u8>,
 }
 
 impl Authenticator {
@@ -251,15 +253,15 @@ impl Authenticator {
             k.key_info & !key_info::VERSION_MASK,
             key_info::TYPE_PAIRWISE | key_info::MIC
         );
-        assert_eq!(k.key_data, &rsn_ie_psk_ccmp()[..]);
+        assert_eq!(k.key_data, &self.own_rsn[..]);
         let ptk = derive_ptk(&self.pmk, &AP, &STA, &self.anonce, &k.nonce);
         assert!(eapol_mic_ok(&ptk.kck, pdu), "msg2 MIC");
         self.ptk = Some(ptk);
     }
 
-    fn msg3(&self, counter: u64, gtk: &[u8; 16], rsc: [u8; 8]) -> Vec<u8> {
+    fn msg3(&self, counter: u64, gtk: &[u8], rsc: [u8; 8]) -> Vec<u8> {
         let ptk = self.ptk.as_ref().unwrap();
-        let mut kd = rsn_ie_psk_ccmp().to_vec();
+        let mut kd = self.own_rsn.clone();
         kd.extend_from_slice(&gtk_kde(1, gtk));
         let wrapped = aes_key_wrap(&ptk.kek, &pad_key_data(kd));
         let mut m = build_eapol_key(
@@ -280,7 +282,7 @@ impl Authenticator {
         m
     }
 
-    fn group_msg1(&self, counter: u64, key_id: u8, gtk: &[u8; 16]) -> Vec<u8> {
+    fn group_msg1(&self, counter: u64, key_id: u8, gtk: &[u8]) -> Vec<u8> {
         let ptk = self.ptk.as_ref().unwrap();
         let wrapped = aes_key_wrap(&ptk.kek, &pad_key_data(gtk_kde(key_id, gtk)));
         let mut m = build_eapol_key(
@@ -321,6 +323,7 @@ fn setup() -> (Supplicant, Authenticator) {
         pmk,
         anonce,
         ptk: None,
+        own_rsn: rsn_ie_psk_ccmp().to_vec(),
     };
     (sup, auth)
 }
@@ -463,4 +466,65 @@ fn gtk_kde_parsing() {
     assert_eq!(g.key, vec![9u8; 16]);
     assert!(find_gtk_kde(&[0xdd, 0, 0, 0, 0, 0, 0, 0]).is_none());
     assert!(find_gtk_kde(&[0x30, 0x20, 1]).is_none());
+}
+
+/// WPA/WPA2 mixed mode (LEANDRO2026): pairwise CCMP, group TKIP. The station
+/// echoes group TKIP in its RSN IE, the descriptor stays version 2, and the
+/// 32-byte TKIP GTK is unwrapped and handed over with its RSC.
+#[test]
+fn tkip_group_handshake_installs_32_byte_gtk() {
+    let pmk = wpa_psk(b"correct horse", b"LEANDRO2026");
+    let ie = rsn_ie_psk(0x000f_ac02);
+    assert_eq!(&ie[..8], &[0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x02]);
+    assert_eq!(&ie[8..], &rsn_ie_psk_ccmp()[8..]);
+    let mut sup = Supplicant::new(pmk, STA, AP, ie.to_vec(), [0x5a; 32]);
+    sup.set_group_tkip(true);
+    let mut auth = Authenticator { pmk, anonce: [0x11; 32], ptk: None, own_rsn: ie.to_vec() };
+    let mut ev = sup.on_eapol(&auth.msg1(1));
+    let m2 = expect_send(&mut ev);
+    auth.on_msg2(&m2); // asserts descriptor version 2 and our RSN IE
+    let gtk: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(7) ^ 0x5c).collect();
+    let rsc = [0x34, 0x12, 0x78, 0x56, 0x34, 0x12, 0, 0];
+    let mut ev = sup.on_eapol(&auth.msg3(2, &gtk, rsc));
+    assert_eq!(ev.len(), 4, "msg4, PTK, GTK, complete");
+    let m4 = expect_send(&mut ev);
+    auth.check_reply(&m4, 2, key_info::TYPE_PAIRWISE | key_info::MIC | key_info::SECURE);
+    assert!(matches!(ev.remove(0), HsEvent::InstallPtk(_)));
+    match ev.remove(0) {
+        HsEvent::InstallGtk { key_id, key, rsc: r } => {
+            assert_eq!(key_id, 1);
+            assert_eq!(key, gtk);
+            assert_eq!(r, rsc);
+            let k = TkipKey::from_gtk(&key).unwrap();
+            assert_eq!(&k.tk[..], &gtk[..16]);
+            assert_eq!(&k.rx_mic[..], &gtk[16..24], "station RX = authenticator TX MIC key");
+            let d = k.driver_layout();
+            assert_eq!(&d[16..24], &gtk[24..32]);
+            assert_eq!(&d[24..32], &gtk[16..24]);
+            assert_eq!(tkip_rsc_split(&r), (0x1234_5678, 0x1234));
+        }
+        _ => panic!("expected InstallGtk"),
+    }
+    assert!(matches!(ev.remove(0), HsEvent::Complete));
+    // Group rekey with a new TKIP GTK.
+    let g2 = [0x99u8; 32];
+    let mut ev = sup.on_eapol(&auth.group_msg1(3, 2, &g2));
+    assert_eq!(ev.len(), 2);
+    let reply = expect_send(&mut ev);
+    auth.check_reply(&reply, 3, key_info::MIC | key_info::SECURE);
+    assert!(matches!(ev.remove(0), HsEvent::InstallGtk { key_id: 2, ref key, .. } if key[..] == g2[..]));
+    // A CCMP-length GTK is refused on a TKIP-group network.
+    let ev = sup.on_eapol(&auth.group_msg1(4, 1, &[0x42u8; 16]));
+    assert!(matches!(ev[..], [HsEvent::Error(_)]));
+}
+
+/// A CCMP-group network keeps refusing a 32-byte GTK.
+#[test]
+fn ccmp_group_refuses_tkip_gtk() {
+    let (mut sup, mut auth) = setup();
+    let mut ev = sup.on_eapol(&auth.msg1(1));
+    let m2 = expect_send(&mut ev);
+    auth.on_msg2(&m2);
+    let ev = sup.on_eapol(&auth.msg3(2, &[0x77u8; 32], [0; 8]));
+    assert!(matches!(ev[..], [HsEvent::Error("unsupported GTK length")]));
 }

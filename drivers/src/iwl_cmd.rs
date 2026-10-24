@@ -866,9 +866,12 @@ pub const RX_MPDU_STATUS_OVERRUN_OK: u32 = 1 << 1;
 pub const RX_MPDU_STATUS_SRC_STA_FOUND: u32 = 1 << 2;
 pub const RX_MPDU_STATUS_ICV_OK: u32 = 1 << 5;
 pub const RX_MPDU_STATUS_MIC_OK: u32 = 1 << 6;
+/// TKIP: the firmware had the phase-1 key (TTAK) for this frame's IV32.
+pub const RX_MPDU_STATUS_TTAK_OK: u32 = 1 << 7;
 pub const RX_MPDU_STATUS_SEC_MSK: u32 = 7 << 8;
 pub const RX_MPDU_STATUS_SEC_NONE: u32 = 0;
 pub const RX_MPDU_STATUS_SEC_CCM: u32 = 2 << 8;
+pub const RX_MPDU_STATUS_SEC_TKIP: u32 = 3 << 8;
 pub const RX_MPDU_STATUS_SEC_ERR: u32 = 7 << 8;
 
 /// REPLY_RX_MPDU_CMD: (802.11 frame without FCS, rx status word).
@@ -886,6 +889,12 @@ pub fn rx_crypto_lengths(fc: u16, status: u32) -> Option<(usize, usize)> {
     match status & RX_MPDU_STATUS_SEC_MSK {
         RX_MPDU_STATUS_SEC_NONE | RX_MPDU_STATUS_SEC_ERR => None,
         RX_MPDU_STATUS_SEC_CCM => if status & RX_MPDU_STATUS_MIC_OK != 0 { Some((8, 8)) } else { None },
+        // TKIP (group key of a mixed-mode network): IV + Extended IV in
+        // front; the Michael MIC (checked by the host) and the ICV behind.
+        RX_MPDU_STATUS_SEC_TKIP => {
+            let ok = RX_MPDU_STATUS_ICV_OK | RX_MPDU_STATUS_TTAK_OK;
+            if status & ok == ok { Some((8, 12)) } else { None }
+        }
         _ => None,
     }
 }

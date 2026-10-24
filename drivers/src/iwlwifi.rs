@@ -489,6 +489,8 @@ struct Dev {
     notif_dropped: u64,
     /// Receive filtering of the current association (duplicates, replays).
     guard: Option<wf::RxGuard>,
+    /// TKIP group key of a WPA/WPA2 mixed-mode network (receive only).
+    tkip_group: Option<TkipRx>,
     rxs: RxStats,
     /// iwlwifi.csumcheck=1: verify IP/TCP/UDP checksums of received frames.
     csumcheck: bool,
@@ -582,6 +584,10 @@ struct RxStats {
     duplicate: u64,
     replay: u64,
     malformed: u64,
+    /// TKIP group frames decrypted on the host (firmware lacked the TTAK).
+    tkip_sw: u64,
+    /// TKIP Michael MIC failures (dropped, logged; countermeasures not done).
+    mic_fail: u64,
     /// Not convertible to Ethernet (no LLC/SNAP, truncated).
     unconvertible: u64,
     amsdu: u64,
@@ -602,10 +608,21 @@ struct RxStats {
 
 impl RxStats {
     fn line(&self) -> String {
-        format!("undecrypted {} dup {} replay {} foreign {} echo {} frag {} malformed {} unconvertible {} amsdu {} csum ok/bad {}/{}",
+        let mut s = format!("undecrypted {} dup {} replay {} foreign {} echo {} frag {} malformed {} unconvertible {} amsdu {} csum ok/bad {}/{}",
                 self.undecrypted, self.duplicate, self.replay, self.foreign, self.echo, self.fragment, self.malformed,
-                self.unconvertible, self.amsdu, self.csum_ok, self.csum_bad)
+                self.unconvertible, self.amsdu, self.csum_ok, self.csum_bad);
+        if self.tkip_sw != 0 || self.mic_fail != 0 { s.push_str(&format!(" tkip sw {} michael fail {}", self.tkip_sw, self.mic_fail)); }
+        s
     }
+}
+
+/// The receive state of a TKIP group key.
+struct TkipRx {
+    key: crate::wifi_crypto::TkipKey,
+    /// Phase-1 key cache for the host decryption fallback: (IV32, TTAK).
+    p1k: Option<(u32, [u16; 5])>,
+    /// Michael MIC failure times (ms) for the 60 s countermeasure window.
+    mic_fail_ms: [u64; 2],
 }
 
 /// What `send_packet` needs to build frames for the AP.
@@ -881,6 +898,7 @@ impl Dev {
     fn clear_link(&mut self) {
         self.link = None;
         self.guard = None;
+        self.tkip_group = None;
         self.track = None;
         self.rc = None;
         self.erp = None;
@@ -1007,9 +1025,19 @@ impl Dev {
     }
 
     fn rx_data(&mut self, frame: &[u8], fc: u16, status: u32) {
-        let (h, t) = match cmd::rx_crypto_lengths(fc, status) {
-            Some(x) => x,
-            None => { self.rx_dropped += 1; self.rxs.undecrypted += 1; return; }
+        let mut sw: Vec<u8> = Vec::new();
+        let tkip = fc & 0x4000 != 0 && status & cmd::RX_MPDU_STATUS_SEC_MSK == cmd::RX_MPDU_STATUS_SEC_TKIP;
+        let (frame, h, t) = if tkip {
+            match self.rx_tkip(frame, status, &mut sw) {
+                Some(true) => (&sw[..], 8, 12),
+                Some(false) => (frame, 8, 12),
+                None => { self.rx_dropped += 1; return; }
+            }
+        } else {
+            match cmd::rx_crypto_lengths(fc, status) {
+                Some((h, t)) => (frame, h, t),
+                None => { self.rx_dropped += 1; self.rxs.undecrypted += 1; return; }
+            }
         };
         // Null data frames carry nothing (power-save signalling).
         if fc & 0x0040 != 0 { return; }
@@ -1050,6 +1078,57 @@ impl Dev {
         if self.debug {
             ilog!("rx: dropped {:?} data frame fc {:#06x} seq {:#06x} ({} bytes)", r, fc, cmd::le16(frame, 22).unwrap_or(0), frame.len());
         }
+    }
+
+    /// A TKIP-protected frame: only group traffic of a mixed-mode network
+    /// uses TKIP. The firmware decrypts it when it holds the phase-1 key for
+    /// the frame's IV32 (TTAK_OK); otherwise (IV32 moved on since the key was
+    /// installed) the host decrypts, as mac80211 does. Then Michael is
+    /// checked here. Some(true) = decrypted into `sw`, Some(false) = the
+    /// firmware decrypted `frame`, None = dropped.
+    fn rx_tkip(&mut self, frame: &[u8], status: u32, sw: &mut Vec<u8>) -> Option<bool> {
+        let fc = wf::frame_control(frame)?;
+        let hl = wf::hdr_len(fc);
+        let Some(k) = self.tkip_group.as_mut() else { self.rxs.undecrypted += 1; return None; };
+        if frame.len() < hl + 8 + 8 + 4 || frame[4] & 1 == 0 { self.rxs.undecrypted += 1; return None; }
+        let ok = cmd::RX_MPDU_STATUS_ICV_OK | cmd::RX_MPDU_STATUS_TTAK_OK;
+        let by_fw = status & ok == ok;
+        if !by_fw {
+            let (tsc, _) = crate::wifi_crypto::tkip_tsc(&frame[hl..])?;
+            let iv32 = (tsc >> 16) as u32;
+            let p1k = match k.p1k {
+                Some((v, p)) if v == iv32 => p,
+                _ => {
+                    let mut ta = [0u8; 6];
+                    ta.copy_from_slice(&frame[10..16]);
+                    let p = crate::wifi_crypto::tkip_phase1(&k.key.tk, &ta, iv32);
+                    k.p1k = Some((iv32, p));
+                    p
+                }
+            };
+            sw.extend_from_slice(frame);
+            if !crate::wifi_crypto::tkip_decrypt(&k.key.tk, &p1k, tsc as u16, &mut sw[hl + 8..]) {
+                self.rxs.undecrypted += 1;
+                return None;
+            }
+            self.rxs.tkip_sw += 1;
+        }
+        let f: &[u8] = if by_fw { frame } else { &sw[..] };
+        if !crate::wifi_crypto::tkip_frame_mic_ok(&k.key.rx_mic, f, hl, 4) {
+            // IEEE 802.11 12.5.2.4 countermeasures (two failures in 60 s:
+            // report, then 60 s without TKIP) are not implemented: drop and
+            // log only.
+            let now = now_ms();
+            self.rxs.mic_fail += 1;
+            let second = now.saturating_sub(k.mic_fail_ms[1]) < 60_000 && k.mic_fail_ms[1] != 0;
+            k.mic_fail_ms = [k.mic_fail_ms[1], now];
+            if self.rxs.mic_fail <= 20 {
+                ilog!("rx: TKIP Michael MIC failure #{} (group, {} byte frame){}", self.rxs.mic_fail, frame.len(),
+                      if second { "; second within 60 s: countermeasures would apply (not implemented)" } else { "" });
+            }
+            return None;
+        }
+        Some(!by_fw)
     }
 
     /// A data frame in sequence order: duplicate / replay checks, then to
@@ -1306,7 +1385,7 @@ pub fn init(cmdline: &str) {
         scanning: false, scan_results: Vec::new(), rx_eth: VecDeque::new(), in_netd: false, quiet_mark: 0,
         rx_frames: 0, rx_dropped: 0, txs: TxStats::default(), txs_mark: TxStats::default(), rc: None,
         async_cmds: Vec::new(), reg: cmd::Regdom::default(), last_txrsp_ms: [0; 2], fail_logged: 0, erp: None, erp_changed: false, notif_dropped: 0,
-        guard: None, last_service_ms: 0, rxs: RxStats::default(), csumcheck: opts.csumcheck,
+        guard: None, tkip_group: None, last_service_ms: 0, rxs: RxStats::default(), csumcheck: opts.csumcheck,
         link: None, track: None, bcn: None, bcn_rssi: None,
         htl: None, ht_op_mode: None, agg: ht::RxAgg::default(), bas: BaStats::default(),
         tagg: TxAgg::new(true), agg_queue: false, agg_rate: 0, wmm_new: None, wmm_updates: 0,
@@ -2334,7 +2413,10 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
     if aborted() { return Err(Fail::superseded()); }
 
     // Association.
-    let rsn = crate::wifi_crypto::rsn_ie_psk_ccmp();
+    // Echo the AP's group cipher: TKIP on a WPA/WPA2 mixed-mode network.
+    let group_tkip = b.rsn.as_ref().map_or(false, |r| r.group == wf::SUITE_TKIP);
+    let rsn = crate::wifi_crypto::rsn_ie_psk(if group_tkip { wf::SUITE_TKIP } else { 0x000f_ac04 });
+    if group_tkip && pmk.is_some() { log("WPA/WPA2 mixed mode: pairwise CCMP, group TKIP (receive only)"); }
     let cap = 0x0001 | if pmk.is_some() { 0x0010 } else { 0 } | if band_24 { b.capability & 0x0420 } else { 0 };
     // HT Capabilities, then the WMM Information element (vendor elements
     // last, as mac80211 orders them).
@@ -2522,6 +2604,7 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
     let mut snonce = [0u8; 32];
     sched::random::fill(&mut snonce);
     let mut sup = crate::wifi_crypto::Supplicant::new(*pmk, hw.mac, bssid, rsn.to_vec(), snonce);
+    sup.set_group_tkip(group_tkip);
     let t1 = now_ms();
     // EAPOL-Key frames we sent before completion (>= 1: message 2 went out).
     let mut sent = 0u32;
@@ -2591,6 +2674,23 @@ fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8], sent: &mut
                     if let Some(g) = d.guard.as_mut() { g.reset_key(0); }
                 });
                 log("pairwise key (CCMP) installed");
+            }
+            HsEvent::InstallGtk { key_id, key, rsc } if key.len() == crate::wifi_crypto::TKIP_GTK_LEN => {
+                // WPA/WPA2 mixed mode: a TKIP group key. The firmware (ADD_STA_KEY
+                // v1, no TKIP_MIC_KEYS API on 8265) needs the phase-1 key for the
+                // AP's address and the current IV32; Michael is checked on the host.
+                let tk = crate::wifi_crypto::TkipKey::from_gtk(&key).ok_or(Err::Other(String::from("bad TKIP group key")))?;
+                let (iv32, _) = crate::wifi_crypto::tkip_rsc_split(&rsc);
+                let bssid = with_dev(|d| d.link.as_ref().map(|l| l.bssid)).flatten().unwrap_or([0; 6]);
+                let p1k = crate::wifi_crypto::tkip_phase1(&tk.tk, &bssid, iv32);
+                let r = send(cmd::ADD_STA_KEY, None, &asc::add_sta_key_tkip(AP_STA_ID, 1 + (key_id & 1), key_id, &tk.driver_layout(), true, iv32, &p1k))?;
+                let st = cmd::le32(&r, 0).unwrap_or(0) & 0xff;
+                if st != cmd::ADD_STA_SUCCESS { return Err(Err::Status("group key (TKIP)", st)); }
+                with_dev(|d| {
+                    d.tkip_group = Some(TkipRx { key: tk, p1k: Some((iv32, p1k)), mic_fail_ms: [0; 2] });
+                    if let Some(g) = d.guard.as_mut() { g.set_tkip_group(true); g.reset_key(key_id); }
+                });
+                ilog!("group key {} (TKIP) installed", key_id);
             }
             HsEvent::InstallGtk { key_id, key, rsc: _ } => {
                 if key.len() != 16 { return Err(Err::Other(String::from("group key is not CCMP-128"))); }

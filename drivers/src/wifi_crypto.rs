@@ -644,10 +644,19 @@ pub fn build_eapol_key(
 
 /// RSN IE for WPA2-PSK with CCMP pairwise and group ciphers.
 pub fn rsn_ie_psk_ccmp() -> [u8; 22] {
-    [
+    rsn_ie_psk(0x000f_ac04)
+}
+
+/// RSN IE for WPA2-PSK with CCMP pairwise and the given group cipher suite
+/// (CCMP, or TKIP for a WPA/WPA2 mixed-mode network: the station must echo
+/// the AP's group cipher).
+pub fn rsn_ie_psk(group_suite: u32) -> [u8; 22] {
+    let mut ie = [
         0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01,
         0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x00,
-    ]
+    ];
+    ie[4..8].copy_from_slice(&group_suite.to_be_bytes());
+    ie
 }
 
 /// A group temporal key from a GTK KDE.
@@ -697,7 +706,8 @@ pub enum HsEvent {
     /// message 3 is verified, after the `Send(msg4)` event: the caller
     /// transmits message 4 unencrypted first, then installs the key.
     InstallPtk([u8; 16]),
-    /// Install a group key (CCMP GTK) with its key index and receive
+    /// Install a group key (16-byte CCMP GTK, or 32-byte TKIP GTK in the
+    /// KDE layout, see `TkipKey::from_gtk`) with its key index and receive
     /// sequence counter.
     InstallGtk {
         key_id: u8,
@@ -721,6 +731,8 @@ pub struct Supplicant {
     /// Last accepted replay counter.
     replay: Option<u64>,
     complete: bool,
+    /// Expected GTK length: 16 (CCMP group) or 32 (TKIP group).
+    gtk_len: usize,
 }
 
 const GTK_LEN: usize = 16;
@@ -745,7 +757,15 @@ impl Supplicant {
             ptk: None,
             replay: None,
             complete: false,
+            gtk_len: GTK_LEN,
         }
+    }
+
+    /// The network's group cipher is TKIP (WPA/WPA2 mixed mode): expect a
+    /// 32-byte TKIP GTK. The EAPOL-Key descriptor stays version 2
+    /// (HMAC-SHA1 MIC, AES key wrap) because the pairwise cipher is CCMP.
+    pub fn set_group_tkip(&mut self, tkip: bool) {
+        self.gtk_len = if tkip { TKIP_GTK_LEN } else { GTK_LEN };
     }
 
     pub fn is_complete(&self) -> bool {
@@ -835,7 +855,7 @@ impl Supplicant {
         let Some(gtk) = find_gtk_kde(&data) else {
             return Self::err("message 3 has no GTK");
         };
-        if gtk.key.len() != GTK_LEN {
+        if gtk.key.len() != self.gtk_len {
             return Self::err("unsupported GTK length");
         }
         self.replay = Some(u64::from_be_bytes(k.replay_counter));
@@ -884,7 +904,7 @@ impl Supplicant {
         let Some(gtk) = find_gtk_kde(&data) else {
             return Self::err("group message has no GTK");
         };
-        if gtk.key.len() != GTK_LEN {
+        if gtk.key.len() != self.gtk_len {
             return Self::err("unsupported GTK length");
         }
         self.replay = Some(u64::from_be_bytes(k.replay_counter));
@@ -906,4 +926,267 @@ impl Supplicant {
             },
         ]
     }
+}
+
+// ---------------------------------------------------------------------------
+// TKIP (IEEE 802.11-2016 12.5.2), receive side only: a WPA/WPA2 mixed-mode
+// network (pairwise CCMP, group TKIP) sends broadcast/multicast with a TKIP
+// GTK, and a station never transmits with the GTK.
+// ---------------------------------------------------------------------------
+
+/// Length of a TKIP GTK in the GTK KDE: TK (16) | authenticator TX MIC key
+/// (8) | authenticator RX MIC key (8).
+pub const TKIP_GTK_LEN: usize = 32;
+
+/// A TKIP group key from the station's point of view. The station receives
+/// what the authenticator transmits, so its RX Michael key is the
+/// authenticator's TX key (GTK bytes 16..24), as wpa_supplicant swaps them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TkipKey {
+    pub tk: [u8; 16],
+    pub rx_mic: [u8; 8],
+    pub tx_mic: [u8; 8],
+}
+
+impl TkipKey {
+    pub fn from_gtk(gtk: &[u8]) -> Option<TkipKey> {
+        if gtk.len() != TKIP_GTK_LEN {
+            return None;
+        }
+        let mut k = TkipKey { tk: [0; 16], rx_mic: [0; 8], tx_mic: [0; 8] };
+        k.tk.copy_from_slice(&gtk[..16]);
+        k.rx_mic.copy_from_slice(&gtk[16..24]);
+        k.tx_mic.copy_from_slice(&gtk[24..32]);
+        Some(k)
+    }
+
+    /// The 32-byte key as the driver/firmware expects it (the nl80211
+    /// layout iwlmvm copies into ADD_STA_KEY): TK, the station's TX MIC
+    /// key at 16, its RX MIC key at 24.
+    pub fn driver_layout(&self) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k[..16].copy_from_slice(&self.tk);
+        k[16..24].copy_from_slice(&self.tx_mic);
+        k[24..32].copy_from_slice(&self.rx_mic);
+        k
+    }
+}
+
+const TKIP_SBOX: [u16; 256] = [
+    0xC6A5, 0xF884, 0xEE99, 0xF68D, 0xFF0D, 0xD6BD, 0xDEB1, 0x9154,
+    0x6050, 0x0203, 0xCEA9, 0x567D, 0xE719, 0xB562, 0x4DE6, 0xEC9A,
+    0x8F45, 0x1F9D, 0x8940, 0xFA87, 0xEF15, 0xB2EB, 0x8EC9, 0xFB0B,
+    0x41EC, 0xB367, 0x5FFD, 0x45EA, 0x23BF, 0x53F7, 0xE496, 0x9B5B,
+    0x75C2, 0xE11C, 0x3DAE, 0x4C6A, 0x6C5A, 0x7E41, 0xF502, 0x834F,
+    0x685C, 0x51F4, 0xD134, 0xF908, 0xE293, 0xAB73, 0x6253, 0x2A3F,
+    0x080C, 0x9552, 0x4665, 0x9D5E, 0x3028, 0x37A1, 0x0A0F, 0x2FB5,
+    0x0E09, 0x2436, 0x1B9B, 0xDF3D, 0xCD26, 0x4E69, 0x7FCD, 0xEA9F,
+    0x121B, 0x1D9E, 0x5874, 0x342E, 0x362D, 0xDCB2, 0xB4EE, 0x5BFB,
+    0xA4F6, 0x764D, 0xB761, 0x7DCE, 0x527B, 0xDD3E, 0x5E71, 0x1397,
+    0xA6F5, 0xB968, 0x0000, 0xC12C, 0x4060, 0xE31F, 0x79C8, 0xB6ED,
+    0xD4BE, 0x8D46, 0x67D9, 0x724B, 0x94DE, 0x98D4, 0xB0E8, 0x854A,
+    0xBB6B, 0xC52A, 0x4FE5, 0xED16, 0x86C5, 0x9AD7, 0x6655, 0x1194,
+    0x8ACF, 0xE910, 0x0406, 0xFE81, 0xA0F0, 0x7844, 0x25BA, 0x4BE3,
+    0xA2F3, 0x5DFE, 0x80C0, 0x058A, 0x3FAD, 0x21BC, 0x7048, 0xF104,
+    0x63DF, 0x77C1, 0xAF75, 0x4263, 0x2030, 0xE51A, 0xFD0E, 0xBF6D,
+    0x814C, 0x1814, 0x2635, 0xC32F, 0xBEE1, 0x35A2, 0x88CC, 0x2E39,
+    0x9357, 0x55F2, 0xFC82, 0x7A47, 0xC8AC, 0xBAE7, 0x322B, 0xE695,
+    0xC0A0, 0x1998, 0x9ED1, 0xA37F, 0x4466, 0x547E, 0x3BAB, 0x0B83,
+    0x8CCA, 0xC729, 0x6BD3, 0x283C, 0xA779, 0xBCE2, 0x161D, 0xAD76,
+    0xDB3B, 0x6456, 0x744E, 0x141E, 0x92DB, 0x0C0A, 0x486C, 0xB8E4,
+    0x9F5D, 0xBD6E, 0x43EF, 0xC4A6, 0x39A8, 0x31A4, 0xD337, 0xF28B,
+    0xD532, 0x8B43, 0x6E59, 0xDAB7, 0x018C, 0xB164, 0x9CD2, 0x49E0,
+    0xD8B4, 0xACFA, 0xF307, 0xCF25, 0xCAAF, 0xF48E, 0x47E9, 0x1018,
+    0x6FD5, 0xF088, 0x4A6F, 0x5C72, 0x3824, 0x57F1, 0x73C7, 0x9751,
+    0xCB23, 0xA17C, 0xE89C, 0x3E21, 0x96DD, 0x61DC, 0x0D86, 0x0F85,
+    0xE090, 0x7C42, 0x71C4, 0xCCAA, 0x90D8, 0x0605, 0xF701, 0x1C12,
+    0xC2A3, 0x6A5F, 0xAEF9, 0x69D0, 0x1791, 0x9958, 0x3A27, 0x27B9,
+    0xD938, 0xEB13, 0x2BB3, 0x2233, 0xD2BB, 0xA970, 0x0789, 0x33A7,
+    0x2DB6, 0x3C22, 0x1592, 0xC920, 0x8749, 0xAAFF, 0x5078, 0xA57A,
+    0x038F, 0x59F8, 0x0980, 0x1A17, 0x65DA, 0xD731, 0x84C6, 0xD0B8,
+    0x82C3, 0x29B0, 0x5A77, 0x1E11, 0x7BCB, 0xA8FC, 0x6DD6, 0x2C3A,
+];
+
+fn tkip_s(v: u16) -> u16 {
+    TKIP_SBOX[(v & 0xff) as usize] ^ TKIP_SBOX[(v >> 8) as usize].swap_bytes()
+}
+
+fn mk16(hi: u8, lo: u8) -> u16 {
+    (hi as u16) << 8 | lo as u16
+}
+
+/// TKIP phase-1 key mixing: the 80-bit TTAK ("P1K") from the TK, the
+/// transmitter address and the upper 32 bits of the TSC.
+pub fn tkip_phase1(tk: &[u8; 16], ta: &[u8; 6], iv32: u32) -> [u16; 5] {
+    let mut p = [iv32 as u16, (iv32 >> 16) as u16, mk16(ta[1], ta[0]), mk16(ta[3], ta[2]), mk16(ta[5], ta[4])];
+    for i in 0..8usize {
+        let j = 2 * (i & 1);
+        p[0] = p[0].wrapping_add(tkip_s(p[4] ^ mk16(tk[1 + j], tk[j])));
+        p[1] = p[1].wrapping_add(tkip_s(p[0] ^ mk16(tk[5 + j], tk[4 + j])));
+        p[2] = p[2].wrapping_add(tkip_s(p[1] ^ mk16(tk[9 + j], tk[8 + j])));
+        p[3] = p[3].wrapping_add(tkip_s(p[2] ^ mk16(tk[13 + j], tk[12 + j])));
+        p[4] = p[4].wrapping_add(tkip_s(p[3] ^ mk16(tk[1 + j], tk[j]))).wrapping_add(i as u16);
+    }
+    p
+}
+
+/// TKIP phase-2 key mixing: the per-packet 128-bit RC4 key (WEP seed) from
+/// the phase-1 key and the lower 16 bits of the TSC.
+pub fn tkip_phase2(tk: &[u8; 16], p1k: &[u16; 5], iv16: u16) -> [u8; 16] {
+    let le = |i: usize| u16::from_le_bytes([tk[i], tk[i + 1]]);
+    let mut p = [p1k[0], p1k[1], p1k[2], p1k[3], p1k[4], p1k[4].wrapping_add(iv16)];
+    p[0] = p[0].wrapping_add(tkip_s(p[5] ^ le(0)));
+    p[1] = p[1].wrapping_add(tkip_s(p[0] ^ le(2)));
+    p[2] = p[2].wrapping_add(tkip_s(p[1] ^ le(4)));
+    p[3] = p[3].wrapping_add(tkip_s(p[2] ^ le(6)));
+    p[4] = p[4].wrapping_add(tkip_s(p[3] ^ le(8)));
+    p[5] = p[5].wrapping_add(tkip_s(p[4] ^ le(10)));
+    p[0] = p[0].wrapping_add((p[5] ^ le(12)).rotate_right(1));
+    p[1] = p[1].wrapping_add((p[0] ^ le(14)).rotate_right(1));
+    p[2] = p[2].wrapping_add(p[1].rotate_right(1));
+    p[3] = p[3].wrapping_add(p[2].rotate_right(1));
+    p[4] = p[4].wrapping_add(p[3].rotate_right(1));
+    p[5] = p[5].wrapping_add(p[4].rotate_right(1));
+    let mut k = [0u8; 16];
+    k[0] = (iv16 >> 8) as u8;
+    k[1] = ((iv16 >> 8) as u8 | 0x20) & 0x7f;
+    k[2] = iv16 as u8;
+    k[3] = ((p[5] ^ le(0)) >> 1) as u8;
+    for i in 0..6 {
+        k[4 + 2 * i..6 + 2 * i].copy_from_slice(&p[i].to_le_bytes());
+    }
+    k
+}
+
+/// RC4 (ARC4) keystream XOR, in place.
+pub fn rc4(key: &[u8], data: &mut [u8]) {
+    let mut s = [0u8; 256];
+    for (i, v) in s.iter_mut().enumerate() {
+        *v = i as u8;
+    }
+    let mut j = 0u8;
+    for i in 0..256 {
+        j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
+        s.swap(i, j as usize);
+    }
+    let (mut i, mut j) = (0u8, 0u8);
+    for b in data.iter_mut() {
+        i = i.wrapping_add(1);
+        j = j.wrapping_add(s[i as usize]);
+        s.swap(i as usize, j as usize);
+        *b ^= s[s[i as usize].wrapping_add(s[j as usize]) as usize];
+    }
+}
+
+/// IEEE 802.3 CRC-32 (the WEP/TKIP ICV).
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = (c >> 1) ^ (0xedb8_8320 & (c & 1).wrapping_neg());
+        }
+    }
+    !c
+}
+
+/// The 48-bit TSC and key index of a TKIP IV/Extended IV header
+/// (TSC1 WEPSeed TSC0 keyid|ExtIV TSC2..TSC5); None without the ExtIV bit.
+pub fn tkip_tsc(iv: &[u8]) -> Option<(u64, u8)> {
+    let h = iv.get(0..8)?;
+    if h[3] & 0x20 == 0 {
+        return None;
+    }
+    let tsc = h[2] as u64 | (h[0] as u64) << 8 | (u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as u64) << 16;
+    Some((tsc, h[3] >> 6))
+}
+
+/// The TSC of a key RSC field as the EAPOL-Key / GTK KDE carry it
+/// (TSC0 first): (iv32, iv16).
+pub fn tkip_rsc_split(rsc: &[u8; 8]) -> (u32, u16) {
+    (u32::from_le_bytes([rsc[2], rsc[3], rsc[4], rsc[5]]), u16::from_le_bytes([rsc[0], rsc[1]]))
+}
+
+/// Decrypt a TKIP MPDU body (ciphertext followed by the 4-byte ICV) in
+/// place with phase-1 key `p1k`; true when the ICV verifies.
+pub fn tkip_decrypt(tk: &[u8; 16], p1k: &[u16; 5], iv16: u16, body: &mut [u8]) -> bool {
+    if body.len() < 4 {
+        return false;
+    }
+    let key = tkip_phase2(tk, p1k, iv16);
+    rc4(&key, body);
+    let n = body.len() - 4;
+    crc32(&body[..n]).to_le_bytes() == body[n..]
+}
+
+fn michael_block(l: &mut u32, r: &mut u32) {
+    *r ^= l.rotate_left(17);
+    *l = l.wrapping_add(*r);
+    *r ^= ((*l & 0xff00_ff00) >> 8) | ((*l & 0x00ff_00ff) << 8);
+    *l = l.wrapping_add(*r);
+    *r ^= l.rotate_left(3);
+    *l = l.wrapping_add(*r);
+    *r ^= l.rotate_right(2);
+    *l = l.wrapping_add(*r);
+}
+
+/// Michael over `parts` concatenated (no pseudo header), IEEE 802.11
+/// 12.5.2.3: little-endian 32-bit words, padded with 0x5a and zeros.
+pub fn michael_raw(key: &[u8; 8], parts: &[&[u8]]) -> [u8; 8] {
+    let mut l = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+    let mut r = u32::from_le_bytes([key[4], key[5], key[6], key[7]]);
+    let mut w = [0u8; 4];
+    let mut n = 0usize;
+    for p in parts {
+        for &b in p.iter() {
+            w[n] = b;
+            n += 1;
+            if n == 4 {
+                l ^= u32::from_le_bytes(w);
+                michael_block(&mut l, &mut r);
+                n = 0;
+            }
+        }
+    }
+    w[n] = 0x5a;
+    for x in w.iter_mut().skip(n + 1) {
+        *x = 0;
+    }
+    l ^= u32::from_le_bytes(w);
+    michael_block(&mut l, &mut r);
+    michael_block(&mut l, &mut r);
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&l.to_le_bytes());
+    out[4..].copy_from_slice(&r.to_le_bytes());
+    out
+}
+
+/// Michael MIC of an MSDU: pseudo header DA | SA | priority | 0 0 0, then
+/// the MSDU payload.
+pub fn michael(key: &[u8; 8], da: &[u8], sa: &[u8], priority: u8, payload: &[u8]) -> [u8; 8] {
+    michael_raw(key, &[da, sa, &[priority & 0x0f, 0, 0, 0], payload])
+}
+
+/// Check the Michael MIC of a received, decrypted TKIP data frame laid out
+/// as MAC header (`hdr_len`) | 8-byte IV | payload | MIC (8) | ICV
+/// (`icv_len`, 4 when the ICV is still in place, 0 when stripped).
+pub fn tkip_frame_mic_ok(rx_mic: &[u8; 8], frame: &[u8], hdr_len: usize, icv_len: usize) -> bool {
+    if frame.len() < 24 || frame.len() < hdr_len + 8 + 8 + icv_len {
+        return false;
+    }
+    let fc = u16::from_le_bytes([frame[0], frame[1]]);
+    let (to_ds, from_ds) = (fc & 0x0100 != 0, fc & 0x0200 != 0);
+    let a = |i: usize| &frame[4 + 6 * i..10 + 6 * i];
+    let da = if to_ds { a(2) } else { a(0) };
+    let sa = match (to_ds, from_ds) {
+        (false, false) | (true, false) => a(1),
+        (false, true) => a(2),
+        (true, true) => match frame.get(24..30) { Some(x) => x, None => return false },
+    };
+    // QoS data: priority = TID from the QoS Control field.
+    let qos_at = if to_ds && from_ds { 30 } else { 24 };
+    let prio = if fc & 0x008c == 0x0088 && hdr_len >= qos_at + 2 { frame[qos_at] & 0x0f } else { 0 };
+    let end = frame.len() - icv_len;
+    let mic_at = end - 8;
+    michael(rx_mic, da, sa, prio, &frame[hdr_len + 8..mic_at])[..] == frame[mic_at..end]
 }

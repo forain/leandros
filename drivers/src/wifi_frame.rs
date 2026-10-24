@@ -74,6 +74,7 @@ const IE_VENDOR: u8 = 221;
 
 /// Cipher / AKM suite selectors as big-endian `u32` of OUI || type.
 const SUITE_CCMP: u32 = 0x000f_ac04;
+pub const SUITE_TKIP: u32 = 0x000f_ac02;
 const AKM_8021X: u32 = 0x000f_ac01;
 const AKM_PSK: u32 = 0x000f_ac02;
 const AKM_PSK_SHA256: u32 = 0x000f_ac06;
@@ -425,7 +426,9 @@ pub fn supports_wpa2_psk_ccmp(b: &Bss) -> bool {
         Some(r) => {
             (r.akm.contains(&AKM_PSK) || r.akm.contains(&AKM_PSK_SHA256))
                 && r.pairwise.contains(&SUITE_CCMP)
-                && r.group == SUITE_CCMP
+                // Group TKIP (WPA/WPA2 mixed mode) is received with a
+                // firmware TKIP key; pairwise stays CCMP.
+                && (r.group == SUITE_CCMP || r.group == SUITE_TKIP)
         }
         None => false,
     }
@@ -856,6 +859,9 @@ pub struct RxGuard {
     last_seq: [Option<u16>; RX_TID_SLOTS],
     /// Highest accepted PN per key index (0 pairwise, 1-3 group) and TID slot.
     pn: [[Option<u64>; RX_TID_SLOTS]; 4],
+    /// The group key (key index != 0) is TKIP: its frames carry a TKIP
+    /// IV/Extended IV header, whose TSC bytes are ordered differently.
+    tkip_group: bool,
 }
 
 /// The 48-bit packet number of a CCMP header (PN0 PN1 rsvd keyid PN2..PN5)
@@ -869,7 +875,12 @@ pub fn ccmp_pn(hdr: &[u8]) -> Option<(u64, u8)> {
 
 impl RxGuard {
     pub fn new(bssid: [u8; 6], own: [u8; 6]) -> RxGuard {
-        RxGuard { bssid, own, last_seq: [None; RX_TID_SLOTS], pn: [[None; RX_TID_SLOTS]; 4] }
+        RxGuard { bssid, own, last_seq: [None; RX_TID_SLOTS], pn: [[None; RX_TID_SLOTS]; 4], tkip_group: false }
+    }
+
+    /// The group key is TKIP (mixed mode) or CCMP.
+    pub fn set_tkip_group(&mut self, tkip: bool) {
+        self.tkip_group = tkip;
     }
 
     /// A (new) key was installed at `key_idx`: its replay counters restart.
@@ -935,7 +946,9 @@ impl RxGuard {
             self.last_seq[tid] = Some(seq_ctl);
         }
         if ccmp {
-            let (pn, key) = ccmp_pn(&frame[hl..]).ok_or(RxReject::Malformed)?;
+            let iv = &frame[hl..];
+            let tkip = self.tkip_group && iv.len() > 3 && iv[3] >> 6 != 0;
+            let (pn, key) = if tkip { crate::wifi_crypto::tkip_tsc(iv) } else { ccmp_pn(iv) }.ok_or(RxReject::Malformed)?;
             let slot = &mut self.pn[key as usize][tid];
             if let Some(last) = *slot {
                 if pn <= last {

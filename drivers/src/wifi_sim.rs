@@ -524,14 +524,15 @@ fn set_link(up: bool) {
 
 /// The AP side of the WPA2 4-way handshake against the real supplicant.
 /// Returns the pairwise key both sides installed.
-fn four_way(ap_pmk: &[u8; 32], sta_pmk: &[u8; 32], aa: [u8; 6], spa: [u8; 6], cx: &ConnCtx) -> Result<[u8; 16], Fail> {
+fn four_way(ap_pmk: &[u8; 32], sta_pmk: &[u8; 32], aa: [u8; 6], spa: [u8; 6], group_tkip: bool, cx: &ConnCtx) -> Result<[u8; 16], Fail> {
     use wc::key_info as ki;
     let mut anonce = [0u8; 32];
     sched::random::fill(&mut anonce);
     let mut snonce = [0u8; 32];
     sched::random::fill(&mut snonce);
-    let own_rsn = wc::rsn_ie_psk_ccmp();
+    let own_rsn = wc::rsn_ie_psk(if group_tkip { wm::SUITE_TKIP } else { wm::SUITE_CCMP });
     let mut sup = wc::Supplicant::new(*sta_pmk, spa, aa, own_rsn.to_vec(), snonce);
+    sup.set_group_tkip(group_tkip);
     let mut rc: u64 = 1;
     let mut msg2_sent = false;
     for _try in 0..M1_TRIES {
@@ -544,11 +545,13 @@ fn four_way(ap_pmk: &[u8; 32], sta_pmk: &[u8; 32], aa: [u8; 6], spa: [u8; 6], cx
         let ptk = wc::derive_ptk(ap_pmk, &aa, &spa, &anonce, &k2.nonce);
         if wc::eapol_mic_ok(&ptk.kck, &m2) {
             // Message 3: GTK KDE (and our RSN IE) wrapped with the KEK.
-            let mut gtk = [0u8; 16];
-            sched::random::fill(&mut gtk);
+            // A mixed-mode AP hands out a 32-byte TKIP GTK.
+            let mut gtk_buf = [0u8; 32];
+            sched::random::fill(&mut gtk_buf);
+            let gtk = &gtk_buf[..if group_tkip { 32 } else { 16 }];
             let mut kd = Vec::new();
             kd.extend_from_slice(&own_rsn);
-            kd.extend_from_slice(&[0xdd, 22, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00]);
+            kd.extend_from_slice(&[0xdd, 6 + gtk.len() as u8, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00]);
             kd.extend_from_slice(&gtk);
             // Key data padding (IEEE 802.11 12.7.2): 0xdd then zeros to a multiple of 8.
             if kd.len() % 8 != 0 { kd.push(0xdd); while kd.len() % 8 != 0 { kd.push(0); } }
@@ -562,6 +565,8 @@ fn four_way(ap_pmk: &[u8; 32], sta_pmk: &[u8; 32], aa: [u8; 6], spa: [u8; 6], cx
                 match e {
                     wc::HsEvent::Send(p) => m4 = Some(p),
                     wc::HsEvent::InstallPtk(k) => tk = Some(k),
+                    wc::HsEvent::InstallGtk { key, .. } if key[..] != gtk[..] =>
+                        return Err(Fail::new(reason::FW_ERROR, "the station installed a different group key")),
                     wc::HsEvent::Error(e) => return Err(Fail::new(reason::FW_ERROR, alloc::format!("supplicant: {}", e))),
                     _ => {}
                 }
@@ -629,7 +634,7 @@ impl Radio for SimRadio {
             let sta_pmk = wm::pmk_for(ssid, secret);
             slog!("PMK derived (PBKDF2-SHA1, 4096 iterations) in {} ms", now_ms() - t0);
             if cx.aborted() { return Err(Fail::superseded()); }
-            four_way(&ap_pmk, &sta_pmk, bssid, *MAC.lock(), cx)?;
+            four_way(&ap_pmk, &sta_pmk, bssid, *MAC.lock(), a.rsn_var == RsnVar::TkipGroup, cx)?;
             slog!("4-way handshake complete with {} (pairwise key agreed by both sides)", wm::fmt_mac(&bssid));
         }
         with_sim(|s| { s.assoc = Some(i); s.pending_deauth = None; });
@@ -1184,13 +1189,14 @@ fn selftest_main(level: u32) {
     t.check("bss-open", open.map_or(false, |b| b.nm_flags == 0 && b.rsn_flags == 0 && b.ext & bss_ext::JOINABLE != 0),
             alloc::format!("{:?}", open.map(|b| (b.nm_flags, b.ext))));
     t.check("bss-5ghz", cafe.map_or(false, |b| b.freq_mhz == 5180 && b.band == netctl_abi::band::GHZ_5), alloc::format!("{:?}", cafe.map(|b| b.freq_mhz)));
-    // WPA/WPA2 mixed mode: PSK, but a TKIP group cipher: not joinable, and a
-    // connection fails at once with UNSUPPORTED_SECURITY naming the cipher.
+    // WPA/WPA2 mixed mode: PSK with a TKIP group cipher is joinable
+    // (pairwise CCMP, the 32-byte TKIP GTK is only received with).
     let tkip = find_bss("SimTkip");
-    t.check("bss-tkip-group-not-joinable", tkip.map_or(false, |b| b.ext & bss_ext::JOINABLE == 0 && b.ext & bss_ext::AKM_PSK != 0
+    t.check("bss-tkip-group-joinable", tkip.map_or(false, |b| b.ext & bss_ext::JOINABLE != 0 && b.ext & bss_ext::AKM_PSK != 0
             && b.rsn_flags & nm_sec::GROUP_TKIP != 0), alloc::format!("{:?}", tkip.map(|b| (b.ext, b.rsn_flags))));
     let r = do_connect(connect_params(10, "SimTkip", akm::AUTO, "tkip-pass-123", 0));
-    t.check("connect-tkip-unsupported", matches!(r, Err((_, reason::UNSUPPORTED_SECURITY, _))), alloc::format!("{:?}", r));
+    t.check("connect-tkip-group", r.is_ok() && MGR.state().akm == akm::PSK, alloc::format!("{:?}", r));
+    let _ = disconnect(true);
     t.check("bss-hidden", hid.map_or(false, |b| b.ext & bss_ext::HIDDEN != 0 && b.ssid_len == 0), alloc::format!("{:?}", hid.map(|b| (b.ext, b.ssid_len))));
 
     // 2. A request right after a scan is answered from the cache.

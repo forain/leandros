@@ -303,8 +303,9 @@ pub fn select_akm(want: u8, ext: u32, rsn_flags: u32, privacy: bool, caps: u32) 
         // An open network for a secured profile, or WPA1/WEP-only.
         return Err(reason::UNSUPPORTED_SECURITY);
     }
-    // CCMP pairwise and group are what the data path can do.
-    let ccmp = rsn_flags & nm_sec::PAIR_CCMP != 0 && rsn_flags & nm_sec::GROUP_CCMP != 0;
+    // Pairwise CCMP, and a CCMP or TKIP group key (WPA/WPA2 mixed mode:
+    // the group key is only ever received), is what the data path can do.
+    let ccmp = rsn_flags & nm_sec::PAIR_CCMP != 0 && rsn_flags & (nm_sec::GROUP_CCMP | nm_sec::GROUP_TKIP) != 0;
     let mfpr = ext & bss_ext::MFPR != 0;
     let pmf_ok = !mfpr || caps & wifi_caps::PMF != 0;
     let can = |a: u8| -> bool {
@@ -411,15 +412,12 @@ pub fn join_cause(want: u8, b: &wf::Bss, caps: u32) -> Option<String> {
     if mfpr && caps & wifi_caps::PMF == 0 {
         return Some(String::from("the network requires management frame protection (802.11w, MFPR set), which is not supported yet"));
     }
-    if r.group == SUITE_TKIP {
-        return Some(String::from("the network uses the TKIP group cipher (WPA/WPA2 mixed mode); only CCMP is supported: set the router to WPA2-AES (CCMP) only"));
-    }
     if !r.pairwise.contains(&SUITE_CCMP) {
         return Some(alloc::format!("the network offers no CCMP pairwise cipher (pairwise {}); only CCMP is supported",
                                    r.pairwise.iter().map(|&x| suite_name(x)).collect::<Vec<_>>().join(",")));
     }
-    if r.group != SUITE_CCMP {
-        return Some(alloc::format!("the network uses the {} group cipher; only CCMP is supported", suite_name(r.group)));
+    if r.group != SUITE_CCMP && r.group != SUITE_TKIP {
+        return Some(alloc::format!("the network uses the {} group cipher; only CCMP and TKIP (receive) are supported", suite_name(r.group)));
     }
     Some(String::from("the network's security settings are not supported"))
 }
