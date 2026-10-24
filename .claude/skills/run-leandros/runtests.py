@@ -96,6 +96,8 @@ SUITES = {
                 # Input on one evdev device wakes no waiter on another (QMP
                 # tablet motion vs a waiter parked on the keyboard).
                 "host:evherdtest.py",
+                # EVIOCGKEY reports held buttons/keys, also after a SYN_DROPPED.
+                "host:evgkeytest.py",
                 # Blocked /dev/netctl and console readers park narrow and
                 # still wake on a snapshot, a cursor report, a key, a UART byte.
                 "host:pollnarrowtest.py",
