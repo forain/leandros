@@ -8220,9 +8220,9 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         (None, None) => return GroupKillStep::Done,
     };
 
-    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal, had_vfork, sigkill_pending) = {
+    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal, had_vfork, unmasked_pending) = {
         let t = rq.get_mut(idx).unwrap();
-        let sigkill_pending = t.signal_pending & (1u64 << (signal::SIGKILL - 1)) != 0;
+        let unmasked_pending = t.signal_pending & (!t.signal_mask | signal::UNBLOCKABLE);
         t.set_state(TaskState::Zombie);
         t.group_killed = true;
         t.exit_code = exit_code;
@@ -8232,7 +8232,7 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         // `term_signal` is NOT set here: `exit_group_signal` stamps it on
         // every member of the group before this loop starts, so a member
         // reaped through this path already carries it.
-        (t.pid, t.on_cpu(), t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal, had_vfork, sigkill_pending)
+        (t.pid, t.on_cpu(), t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal, had_vfork, unmasked_pending)
     };
     if had_vfork { rq.unblock_port(VFORK_WAIT_CHANNEL); }
     // Lane killexec: a SIGKILL already sent to this member (a process-directed
@@ -8242,11 +8242,31 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
     // complete_signal turns any SIGKILL into a group exit at send time, and
     // de_thread then fails. Without this the exec'd image ran on unkillable
     // by that kill (killmt proclife exec_kill: "child not reaped").
-    if sigkill_pending {
+    // Lane fatalsig: the same holds for any other pending, unblocked signal
+    // whose action is fatal (SIG_DFL terminate/core): Linux's complete_signal
+    // group-exits at send time. Handled, ignored, stop and default-ignore
+    // signals stay dropped with the thread they were directed at.
+    let fatal_sig = {
+        let mut found = 0u32;
+        if unmasked_pending & (1u64 << (signal::SIGKILL - 1)) != 0 {
+            found = signal::SIGKILL;
+        } else if unmasked_pending != 0 {
+            for sig in 1..=64u32 {
+                if unmasked_pending & (1u64 << (sig - 1)) == 0 { continue; }
+                if signal::default_terminates(sig)
+                    && rq.find_pid(tgid).map_or(false, |l| l.signal_actions[(sig - 1) as usize].handler == 0)
+                {
+                    found = sig;
+                    break;
+                }
+            }
+        }
+        found
+    };
+    if fatal_sig != 0 {
         if let Some(me) = rq.find_pid_mut(pid) {
             if me.forced_exit == 0 {
-                let signo = signal::SIGKILL;
-                me.forced_exit = (1u32 << 31) | (signo << 8) | ((128 + signo) & 0xff);
+                me.forced_exit = (1u32 << 31) | (fatal_sig << 8) | ((128 + fatal_sig) & 0xff);
             }
         }
     }
