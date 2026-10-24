@@ -597,6 +597,86 @@ fn wait4_scan_children_only() -> bool {
     report("wait4_scan_children_only", ok, detail)
 }
 
+extern "C" {
+    fn eventfd(init: u32, flags: i32) -> i32;
+    fn epoll_create1(flags: i32) -> i32;
+    fn epoll_ctl(ep: i32, op: i32, fd: i32, ev: *mut EpEvent) -> i32;
+    fn epoll_wait(ep: i32, evs: *mut EpEvent, n: i32, ms: i32) -> i32;
+    #[link_name = "write"] fn c_write(fd: i32, b: *const u8, n: usize) -> isize;
+    #[link_name = "read"] fn c_read(fd: i32, b: *mut u8, n: usize) -> isize;
+}
+
+#[cfg_attr(target_arch = "x86_64", repr(C, packed))]
+#[cfg_attr(not(target_arch = "x86_64"), repr(C))]
+#[derive(Clone, Copy)]
+struct EpEvent { events: u32, data: u64 }
+
+/// A 4-field `# kwake` row or 3-field `# widen` row of /proc/rqhold.
+fn rq_row(tag: &str) -> Option<Vec<u64>> {
+    let t = std::fs::read_to_string("/proc/rqhold").ok()?;
+    let l = t.lines().find(|l| l.starts_with(tag))?;
+    Some(l.split_whitespace().filter_map(|w| w.parse().ok()).collect())
+}
+
+/// Lane playcost4 guard: a keyed poll wake (eventfd write/read) and an
+/// epoll_ctl widening must visit only the parkers that can hold the key, not
+/// every parker whose mask shares the key's 1-of-64 bloom bit (keyed wake)
+/// or every parked task (widen). 32 threads park in epoll_wait on 16 idle
+/// eventfds each (their masks cover ~14 bloom bits apiece).
+fn kwake_scan_indexed() -> bool {
+    const T: usize = 32;
+    const K: usize = 16;
+    const N: u64 = 300;
+    static PARKED: AtomicU32 = AtomicU32::new(0);
+    PARKED.store(0, SeqCst);
+    let stop = unsafe { eventfd(0, 0x800) };
+    let hs: Vec<_> = (0..T).map(|_| thread::spawn(move || unsafe {
+        let ep = epoll_create1(0);
+        let mut fds = vec![stop];
+        for _ in 0..K { fds.push(eventfd(0, 0x800)); }
+        for &f in &fds {
+            let mut ev = EpEvent { events: 1, data: f as u64 };
+            epoll_ctl(ep, 1, f, &mut ev);
+        }
+        PARKED.fetch_add(1, SeqCst);
+        let mut out = [EpEvent { events: 0, data: 0 }; 4];
+        epoll_wait(ep, out.as_mut_ptr(), 4, 30_000);
+        for &f in &fds[1..] { close(f); }
+        close(ep);
+    })).collect();
+    while PARKED.load(SeqCst) < T as u32 { thread::yield_now(); }
+    thread::sleep(Duration::from_millis(100));
+    let (e, ep2) = unsafe { (eventfd(0, 0x800), epoll_create1(0)) };
+    let one = 1u64.to_ne_bytes();
+    let mut buf = [0u8; 8];
+    let kb = rq_row("# kwake ");
+    for _ in 0..N { unsafe { c_write(e, one.as_ptr(), 8); c_read(e, buf.as_mut_ptr(), 8); } }
+    let ka = rq_row("# kwake ");
+    let wb = rq_row("# widen ");
+    for _ in 0..N {
+        let mut ev = EpEvent { events: 1, data: 0 };
+        unsafe { epoll_ctl(ep2, 1, e, &mut ev); epoll_ctl(ep2, 2, e, &mut ev); }
+    }
+    let wa = rq_row("# widen ");
+    unsafe { c_write(stop, one.as_ptr(), 8); }
+    for h in hs { let _ = h.join(); }
+    unsafe { close(e); close(ep2); close(stop); }
+    let (ok, detail) = match (kb, ka, wb, wa) {
+        (Some(b), Some(a), Some(wb), Some(wa)) if b.len() == 4 && a.len() == 4 && wb.len() == 3 && wa.len() == 3 => {
+            let (c, sl, d, f) = (a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]);
+            let (wc, ws, wf) = (wa[0] - wb[0], wa[1] - wb[1], wa[2] - wb[2]);
+            let kp = if c > 0 { sl as f64 / c as f64 } else { f64::MAX };
+            let wp = if wc > 0 { ws as f64 / wc as f64 } else { 0.0 };
+            (c >= N && kp <= 2.0 && f == 0 && wp <= 2.0 && wf == 0,
+             format!("{} keyed wakes, {:.2} slots/wake ({} deref, {} unindexed); {} widens, {:.2} slots/widen ({} unindexed); {}x{} parked",
+                     c, kp, d, f, wc, wp, wf, T, K))
+        }
+        _ => (false, "no # kwake / # widen row in /proc/rqhold".into()),
+    };
+    println!("kwake_scan_indexed: {}", detail);
+    report("kwake_scan_indexed", ok, detail)
+}
+
 fn main() {
     let only = std::env::args().nth(1);
     let tests: &[(&str, fn() -> bool)] = &[
@@ -610,6 +690,7 @@ fn main() {
         ("wait_woken_single_tasks_hold", wait_woken_single_tasks_hold),
         ("deadline_scan_indexed", deadline_scan_indexed),
         ("wait4_scan_children_only", wait4_scan_children_only),
+        ("kwake_scan_indexed", kwake_scan_indexed),
         ("robust_exit", || robust_process("robust_exit", Death::Exit, false)),
         ("robust_exit_waited", || robust_process("robust_exit_waited", Death::ExitWhileWaited, false)),
         ("robust_killed", || robust_process("robust_killed", Death::Killed, false)),
