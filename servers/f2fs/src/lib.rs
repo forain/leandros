@@ -7707,7 +7707,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     let slot_idx = mounts.iter().position(|s| s.is_none())?;
 
     let port = port::create(owner_pid)?;
-    port::register_handler(port, f2fs_dispatch);
+    port::register_kernel_handler(port, f2fs_dispatch);
 
     // Build the mount state directly in its heap allocation, field by field.
     //

@@ -4356,7 +4356,7 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     }
     
     // Register IPC handler to respond to PINGs (prevents deadlocks during discovery scans)
-    port::register_handler(port_id, |msg, pid, _target| {
+    port::register_kernel_handler(port_id, |msg, pid, _target| {
         if msg.tag == 0x1000 {
             let mut reply = Message::empty();
             reply.tag = 0x1001;
