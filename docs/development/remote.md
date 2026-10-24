@@ -82,6 +82,14 @@ From a root SSH login, a COSMIC session can be started without touching the mach
 
 greetd then ends the greeter and starts the session as the user, exactly as a login at the keyboard does. Send `{"type":"cancel_session"}` first if a previous attempt left a session half-created. Pass the password to the client at run time (an environment variable or a prompt); never write it into a script, a log or a commit.
 
+This client exists: `/bin/greetd-login` ([userland/greetdlogin](../../userland/greetdlogin/src/main.rs)) reads the password from stdin and starts the session from `cosmic.desktop`'s `Exec=`. From the Mac, one command logs in and waits until `cosmic-comp` and `cosmic-panel` run as the user:
+
+```sh
+LEANDROS_REMOTE=<ip> scripts/desktop-login.sh <credentials-file>   # file: user=NAME / pass=PASSWORD lines
+```
+
+It pushes the binary if needed and pipes the password over SSH stdin, so it never appears on a command line or in a log.
+
 Once the session is up, programs can be started inside it from the root shell with `su` or `sudo` ([../getting-started/logging-in.md](../getting-started/logging-in.md#switching-user-su-and-sudo)), for example Firefox as `leandro` with `WAYLAND_DISPLAY=wayland-1`.
 
 ## Measuring on the laptop
