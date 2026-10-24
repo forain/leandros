@@ -98,6 +98,7 @@ import time
 import os
 import re
 import select
+import threading
 import platform
 import shutil
 
@@ -1703,7 +1704,16 @@ def wait_scale(arch: str, mode: str = "uefi") -> float:
 
 class _Serial:
     """One held serial connection that answers CPR probes and logs to
-    SERIAL_LOG."""
+    SERIAL_LOG.
+
+    A reader thread drains the socket for as long as the connection is held,
+    also while its owner does something else (a --hostpost subprocess, a
+    sleep). QEMU's socket chardev writes guest output with the big QEMU lock
+    held and retries until the client takes it: a held connection nobody
+    reads fills the socket buffer, and then the vCPU printing on the PL011
+    keeps the lock forever. The whole machine stalls on it (the main loop,
+    hence SLIRP: new hostfwd connects hang, the monitor, serial input) while
+    the guest itself is fine. pump() only waits on what the reader took."""
 
     def __init__(self):
         self.s = _connect_with_retry(SERIAL_SOCK)
@@ -1712,55 +1722,84 @@ class _Serial:
         self.s.setblocking(False)
         self.buf = b""
         self.cpr = 0
+        self.submit_at = 0
+        self.eof = False
+        self.cv = threading.Condition()
+        self.tx = threading.Lock()
+        self.reader = threading.Thread(target=self._drain, name="serial-drain", daemon=True)
+        self.reader.start()
 
     def close(self):
+        self.eof = True
         try:
             self.s.close()
         except Exception:
             pass
 
-    def send(self, data: bytes, pace=True):
-        self.s.setblocking(True)
-        try:
-            if not pace:
-                self.s.sendall(data)
-            else:
-                # PL011 RX FIFO is 16 bytes; see _serial_send.
-                for i in range(0, len(data), 8):
-                    self.s.sendall(data[i:i + 8])
-                    time.sleep(0.02)
-        finally:
-            self.s.setblocking(False)
-
-    def pump(self, timeout, until=None):
-        """Read for up to `timeout` s; stop early once until(self.buf) is true.
-        Returns True if `until` fired."""
-        end = time.time() + timeout
-        while True:
-            if until is not None and until(self.buf):
-                return True
-            left = end - time.time()
-            if left <= 0:
-                return False
-            if not select.select([self.s], [], [], min(0.2, left))[0]:
-                continue
+    def _drain(self):
+        while not self.eof:
             try:
+                if not select.select([self.s], [], [], 0.2)[0]:
+                    continue
                 chunk = self.s.recv(65536)
-            except BlockingIOError:
+            except (BlockingIOError, InterruptedError):
                 continue
+            except (OSError, ValueError):
+                chunk = b""
             if not chunk:
-                return False
-            self.buf += chunk
+                with self.cv:
+                    self.eof = True
+                    self.cv.notify_all()
+                return
             try:
                 with open(SERIAL_LOG, "ab") as lf:
                     lf.write(chunk)
             except Exception:
                 pass
-            # The 4-byte probe can straddle chunks: count over the buffer.
-            total = self.buf.count(b"\x1b[6n")
-            if total > self.cpr:
-                self.send(b"\x1b[24;1R" * (total - self.cpr), pace=False)
-                self.cpr = total
+            with self.cv:
+                self.buf += chunk
+                # The 4-byte probe can straddle chunks: count over the buffer.
+                total = self.buf.count(b"\x1b[6n")
+                owed = total - self.cpr
+                self.cpr = max(self.cpr, total)
+                self.cv.notify_all()
+            if owed > 0:
+                try:
+                    self._sendall(b"\x1b[24;1R" * owed)
+                except OSError:
+                    pass
+
+    def _sendall(self, data: bytes):
+        # The socket stays non-blocking (the reader shares it): wait for room.
+        with self.tx:
+            while data:
+                try:
+                    n = self.s.send(data)
+                    data = data[n:]
+                except (BlockingIOError, InterruptedError):
+                    select.select([], [self.s], [], 0.2)
+
+    def send(self, data: bytes, pace=True):
+        if not pace:
+            self._sendall(data)
+        else:
+            # PL011 RX FIFO is 16 bytes; see _serial_send.
+            for i in range(0, len(data), 8):
+                self._sendall(data[i:i + 8])
+                time.sleep(0.02)
+
+    def pump(self, timeout, until=None):
+        """Wait up to `timeout` s for output; stop early once until(self.buf)
+        is true. Returns True if `until` fired."""
+        end = time.time() + timeout
+        with self.cv:
+            while True:
+                if until is not None and until(self.buf):
+                    return True
+                left = end - time.time()
+                if left <= 0 or self.eof:
+                    return False
+                self.cv.wait(min(0.2, left))
 
 
 def _echo_seen(buf: bytes, line: str) -> bool:
@@ -1782,11 +1821,13 @@ def _type_line(ser, line, echo_timeout, attempts=3):
         mark = len(ser.buf)
         ser.send(("  " + line).encode())
         if ser.pump(echo_timeout, until=lambda b: _echo_seen(b[mark:], line)):
+            ser.submit_at = len(ser.buf)
             ser.send(b"\r")
             return True
         ser.send(b"\x03")               # cancel the mangled line, retry
         ser.pump(1.0)
     # Last resort: submit whatever is there; the sentinel decides.
+    ser.submit_at = len(ser.buf)
     ser.send(b"\r")
     return False
 
@@ -1818,7 +1859,9 @@ def serial_run(command, timeout=120, echo_timeout=None, arch=None, ser=None):
     try:
         ser.pump(0.2)
         echo_ok = _type_line(ser, wrapped, echo_timeout)
-        start = len(ser.buf)
+        # The drain thread may already hold a fast command's output: count
+        # from the submit, not from now.
+        start = ser.submit_at
         got = ser.pump(timeout, until=lambda b: _lrc_find(b[start:][-65536:], "LRC", nonce) is not None)
         raw = ser.buf[start:]
         out = _paste_body(raw)
@@ -1846,7 +1889,7 @@ def serial_run(command, timeout=120, echo_timeout=None, arch=None, ser=None):
             pnonce = os.urandom(4).hex()
             probe = (f'echo "<<LRF:{pnonce}:"$(cat {_LRC_FILE}{nonce} 2>/dev/null)">>"')
             _type_line(ser, probe, echo_timeout)
-            pstart = len(ser.buf)
+            pstart = ser.submit_at
             if ser.pump(echo_timeout * 2, until=lambda b: _lrc_find(b[pstart:], "LRF", pnonce) is not None):
                 m = _lrc_find(ser.buf[pstart:], "LRF", pnonce)
                 if m.group(1):

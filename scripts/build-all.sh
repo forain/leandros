@@ -298,6 +298,14 @@ create_disk_image() {
     # Use uncompressed for now as our simple parser doesn't handle .gz
     mcopy -oi "$temp_fat" "initrd-$arch.cpio" ::/initrd.gz
     mcopy -oi "$temp_fat" limine/limine.conf ::/limine.conf
+    # The remote-debug key (laptop-remote-debug skill): `espctl boot` imports
+    # ::/leandros/authorized_keys as root's key, so ssh into a QEMU guest
+    # works without copying it in by hand. LEANDROS_REMOTE_KEY overrides.
+    local remote_pub="${LEANDROS_REMOTE_KEY:-$HOME/.ssh/leandros_remote}.pub"
+    if [[ -f "$remote_pub" ]]; then
+        mmd -i "$temp_fat" ::/leandros
+        mcopy -oi "$temp_fat" "$remote_pub" ::/leandros/authorized_keys
+    fi
     
     python3 scripts/sparseimg.py inject "$image_name" "$temp_fat" $((2048 * 512))
     rm -f "$temp_fat"
