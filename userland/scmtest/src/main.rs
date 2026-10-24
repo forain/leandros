@@ -1394,6 +1394,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_tcp_connect_refused() { failures += 1; }
     if !test_inet_msg_peek() { failures += 1; }
     if !test_unix_dgram_sizes() { failures += 1; }
+    if !test_fd_pass_mounted_closed() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
@@ -1453,6 +1454,101 @@ unsafe fn test_fd_pass() -> bool {
     close(b);
 
     report(name, sret == 1 && status == 0)
+}
+
+// ── 1a. fd-pass of a MOUNTED-fs file whose last table fd closes in flight ──
+//
+// Firefox hands a Cache Storage body to a content process as
+// `dup; sendmsg(SCM_RIGHTS); close`, so the queued copy is the only reference
+// left when the receiver's recvmsg runs. The VFS closed the mount server's
+// open slot on that close (it only counted fd-table entries), and the
+// received fd read 0 bytes. A tmpfs file never hit this (separate counting).
+#[cfg(target_arch = "aarch64")]
+const SYS_STATFS_MNT: usize = 43;
+#[cfg(not(target_arch = "aarch64"))]
+const SYS_STATFS_MNT: usize = 137;
+const F2FS_SUPER_MAGIC: u64 = 0xF2F5_2010;
+
+/// First candidate directory that statfs(2) reports as F2FS, or None. The guard
+/// must exercise a MOUNTED (mount-server) file: a tmpfs fallback would pass on
+/// the unfixed VFS too, because tmpfs has its own in-flight counting.
+unsafe fn f2fs_scratch_path() -> Option<&'static [u8]> {
+    let dirs: [(&[u8], &'static [u8]); 5] = [
+        (b"/mnt\0", b"/mnt/scmtest_mnt\0"),
+        (b"/var/tmp\0", b"/var/tmp/scmtest_mnt\0"),
+        (b"/root\0", b"/root/scmtest_mnt\0"),
+        (b"/home\0", b"/home/scmtest_mnt\0"),
+        (b"/\0", b"/scmtest_mnt\0"),
+    ];
+    for (d, f) in dirs.iter() {
+        let mut buf = [0u8; 120];
+        if syscall2(SYS_STATFS_MNT, d.as_ptr() as usize, buf.as_mut_ptr() as usize) != 0 { continue; }
+        let ftype = core::ptr::read_unaligned(buf.as_ptr() as *const u64);
+        if ftype == F2FS_SUPER_MAGIC { return Some(*f); }
+    }
+    None
+}
+
+/// mode 0: Firefox's sequence — open, dup, send the dup, close BOTH (handle_close).
+/// mode 1: a forked child opens, sends and exits without closing (release_vnode);
+///         its socket end is gone too before the parent calls recvmsg.
+unsafe fn mnt_pass_once(path: &[u8], mode: u32) -> bool {
+    let wfd = open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if wfd < 0 { dbg0(b"[fd_pass_mnt] create failed\n\0"); return false; }
+    write(wfd, b"MNTOK".as_ptr(), 5);
+    close(wfd);
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 { return false; }
+    let mut sret: isize = -1;
+    if mode == 0 {
+        let fd = open(path.as_ptr(), O_RDONLY, 0);
+        let d = syscall1(nr::DUP, fd as usize) as i32;
+        close(fd);
+        sret = send_fd_and_byte(sv[0], d, b'X') as isize;
+        close(d); // the queued copy is now the only reference
+    } else {
+        let pid = fork();
+        if pid == 0 {
+            close(sv[1]);
+            let fd = open(path.as_ptr(), O_RDONLY, 0);
+            let r = send_fd_and_byte(sv[0], fd, b'X');
+            exit(if r == 1 { 0 } else { 3 }); // fd and sv[0] released by process exit
+        }
+        close(sv[0]); sv[0] = -1;
+        let mut status = 0i32;
+        wait4(pid, &mut status, 0, core::ptr::null_mut());
+        if status == 0 { sret = 1; }
+    }
+    // Churn the mount server's open slots with a DIFFERENT file so a freed
+    // slot gets reused by content the guard can tell apart ("OTHER").
+    let mut opath = [0u8; 40];
+    let plen = path.len() - 1;
+    opath[..plen].copy_from_slice(&path[..plen]);
+    opath[plen] = b'2';
+    let o2 = open(opath.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if o2 >= 0 { write(o2, b"OTHER".as_ptr(), 5); lseek(o2, 0, SEEK_SET); }
+    let (_n, _f, rfd, _cl) = recv_fd_and_byte(sv[1], 32, 0);
+    let mut rbuf = [0u8; 5];
+    let got = if rfd >= 0 { read(rfd, rbuf.as_mut_ptr(), 5) } else { -1 };
+    let same = &rbuf == b"MNTOK";
+    printf(b"[fd_pass_mnt] mode=%d read via received fd -> %d content_ok=%d\n\0".as_ptr(), mode as u64, got as u64, same as u64, 0);
+    if o2 >= 0 { close(o2); unlink(opath.as_ptr()); }
+    if rfd >= 0 { close(rfd); }
+    if sv[0] >= 0 { close(sv[0]); }
+    close(sv[1]);
+    unlink(path.as_ptr());
+    sret == 1 && got == 5 && &rbuf == b"MNTOK"
+}
+
+unsafe fn test_fd_pass_mounted_closed() -> bool {
+    let name = b"fd_pass_mounted_closed\0";
+    let path = match f2fs_scratch_path() {
+        Some(p) => p,
+        None => { dbg0(b"[fd_pass_mnt] no F2FS directory found (statfs)\n\0"); return report(name, false); }
+    };
+    let a = mnt_pass_once(path, 0);
+    let b = mnt_pass_once(path, 1);
+    report(name, a && b)
 }
 
 // ── 1b. fork-child-exit must NOT tear down the parent's connected socket ────

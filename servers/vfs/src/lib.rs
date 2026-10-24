@@ -5271,8 +5271,33 @@ fn tmp_fd_open(idx: usize) -> bool {
     idx < MAX_TMP_FILES && TMP_FDREFS[idx].load(atomic::Ordering::Acquire) != 0
 }
 
+// A mounted-filesystem open (`MountedFile { port, file_id }`) is likewise
+// closed in its mount server once no fd-table entry names it (`handle_close`,
+// `release_vnode`). A descriptor queued on an AF_UNIX socket is in no table,
+// so a sender that does `dup; sendmsg(SCM_RIGHTS); close` — Firefox handing a
+// Cache Storage body file to a content process — closed the server's open
+// slot before the receiver's recvmsg installed its copy, which then read
+// nothing (or whatever file reused the slot). `MOUNT_INFLIGHT` counts the
+// queued copies per (port, file_id) so the last close waits for them.
+static MOUNT_INFLIGHT: Mutex<alloc::vec::Vec<(u32, u32, u32)>> = Mutex::new(alloc::vec::Vec::new());
+
+fn mount_inflight_add(port: u32, file_id: u32, inc: bool) {
+    let mut v = MOUNT_INFLIGHT.lock();
+    if let Some(i) = v.iter().position(|e| e.0 == port && e.1 == file_id) {
+        if inc { v[i].2 += 1; } else { v[i].2 -= 1; if v[i].2 == 0 { v.swap_remove(i); } }
+    } else if inc {
+        v.push((port, file_id, 1));
+    }
+}
+
+/// Is a copy of this mounted-file open queued on some socket?
+fn mount_inflight(port: u32, file_id: u32) -> bool {
+    MOUNT_INFLIGHT.lock().iter().any(|e| e.0 == port && e.1 == file_id)
+}
+
 /// Take an in-flight reference if `kind` is a tmpfs fd. No-op otherwise.
 fn tmp_inflight_inc(kind: &VnodeKind) {
+    if let VnodeKind::MountedFile { port, file_id } = *kind { mount_inflight_add(port, file_id, true); }
     if let VnodeKind::TmpFile { idx, .. } = *kind {
         if idx < MAX_TMP_FILES {
             let mut f = TMP_INFLIGHT.lock();
@@ -5287,6 +5312,7 @@ fn tmp_inflight_inc(kind: &VnodeKind) {
 /// must run *after* the descriptor is installed in the receiver's table, so the
 /// slot is never unreferenced for even an instant.
 fn tmp_inflight_dec(kind: &VnodeKind) {
+    if let VnodeKind::MountedFile { port, file_id } = *kind { mount_inflight_add(port, file_id, false); }
     if let VnodeKind::TmpFile { idx, .. } = *kind {
         if idx < MAX_TMP_FILES {
             let mut f = TMP_INFLIGHT.lock();
@@ -8638,6 +8664,7 @@ fn handle_close(pid: u32, fd: usize) -> Message {
                 let _gate = scan_gate();
                 any_fd(|f| matches!(f.kind,
                     VnodeKind::MountedFile { port: p, file_id: i } if p == port && i == file_id))
+             || mount_inflight(port, file_id)
             };
             if !still_referenced {
                 let mut proxy = Message::empty();
@@ -9182,6 +9209,7 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
                 let _gate = scan_gate();
                 any_fd(|f| matches!(f.kind,
                     VnodeKind::MountedFile { port: p, file_id: i } if p == port && i == file_id))
+             || mount_inflight(port, file_id)
             };
             if !still_referenced {
                 let mut proxy = Message::empty();
