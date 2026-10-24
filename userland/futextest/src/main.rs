@@ -947,7 +947,12 @@ fn futex_lost_wake_stress() -> bool {
             loop {
                 while words[i].load(SeqCst) == 0 {
                     if done.load(SeqCst) { return; }
-                    if futex(&words[i], FUTEX_WAIT | FUTEX_PRIVATE, 0, &ts, 0) == -(ETIMEDOUT as i64) {
+                    // A wait that times out, or sleeps >= 1 s in a ring that
+                    // hands the token on within microseconds, slept through
+                    // (or was delayed past) its wake.
+                    let t0 = Instant::now();
+                    let r = futex(&words[i], FUTEX_WAIT | FUTEX_PRIVATE, 0, &ts, 0);
+                    if r == -(ETIMEDOUT as i64) || t0.elapsed().as_millis() >= 1000 {
                         lost.fetch_add(1, SeqCst);
                         done.store(true, SeqCst);
                         return;
