@@ -745,6 +745,24 @@ unsafe fn test_xattr_acl_malformed_trivial(root: &[u8], name: &[u8]) -> bool {
     report(name, mode >= 0 && (mode & 0o777) == 0o644)
 }
 
+/// L10.1: one read(2) of 8 MiB from the raw disk node must return all 8 MiB
+/// (the block read path used to stop after its 256 KiB bounce chunk).
+static mut BLK_BUF: [u8; 8 << 20] = [0; 8 << 20];
+unsafe fn test_blockdev_full_read() -> bool {
+    let name = b"blockdev_full_read\0";
+    let mut fd = -1;
+    for p in [&b"/dev/vda\0"[..], &b"/dev/nvme0n1\0"[..], &b"/dev/sda\0"[..]] {
+        fd = open(p.as_ptr(), O_RDONLY, 0);
+        if fd >= 0 { break; }
+    }
+    if fd < 0 { return report(name, false); }
+    let want = 8usize << 20;
+    let buf = core::ptr::addr_of_mut!(BLK_BUF) as *mut u8;
+    let n = read(fd, buf, want);
+    close(fd);
+    report(name, n as usize == want)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     let mut failures = 0;
@@ -754,6 +772,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // home volume attached, /home is the root's own and they run there.
     mkdir(F2FS_DIR.as_ptr(), 0o755);
 
+    if !test_blockdev_full_read() { failures += 1; }
     if !test_rmdir() { failures += 1; }
     if !test_rename() { failures += 1; }
     if !test_rename_replace(b"/tmp", b"rename_replace_tmpfs\0") { failures += 1; }
