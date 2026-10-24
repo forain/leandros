@@ -209,6 +209,9 @@ static BA_ON: AtomicBool = AtomicBool::new(true);
 static HTRATE: AtomicBool = AtomicBool::new(true);
 static TXSGI: AtomicBool = AtomicBool::new(false);
 static TXMIMO: AtomicBool = AtomicBool::new(false);
+/// iwlwifi.rscol (default on): rate control searches the other columns
+/// (short GI, two streams on 5 GHz) and keeps a clearly better one.
+static RSCOL: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.txstbc / iwlwifi.txldpc (default on): STBC / LDPC on our HT
 /// transmissions when the AP receives them (Linux rs.c for the 8000 family).
 static TXSTBC: AtomicBool = AtomicBool::new(true);
@@ -1176,6 +1179,7 @@ pub fn init(cmdline: &str) {
     HTRATE.store(cmdline_val(cmdline, "iwlwifi.htrate") != Some("0"), Ordering::Relaxed);
     TXSGI.store(cmdline_val(cmdline, "iwlwifi.txsgi") == Some("1"), Ordering::Relaxed);
     TXMIMO.store(cmdline_val(cmdline, "iwlwifi.txmimo") == Some("1"), Ordering::Relaxed);
+    RSCOL.store(cmdline_val(cmdline, "iwlwifi.rscol") != Some("0"), Ordering::Relaxed);
     TXSTBC.store(cmdline_val(cmdline, "iwlwifi.txstbc") != Some("0"), Ordering::Relaxed);
     TXLDPC.store(cmdline_val(cmdline, "iwlwifi.txldpc") != Some("0"), Ordering::Relaxed);
     MCAST_ALL.store(cmdline_val(cmdline, "iwlwifi.mcast") != Some("0"), Ordering::Relaxed);
@@ -2429,6 +2433,14 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
         let cfg = rs::RateCfg { ap_rates: ap_rates.clone(), max_r500k: maxrate, valid_ant: hw.tx_ant,
                                 fixed_ant: if txant != 0 { Some(txant) } else { None }, band_24, rssi, ht: ht_rates };
         let mut c = RateCtl::new(&cfg);
+        if let (true, Some(h), Some(cap)) = (RSCOL.load(Ordering::Relaxed), htl.as_ref(), ap_ht) {
+            // Two streams: the AP receives them, both chains, no forced
+            // single antenna, and 5 GHz (on 2.4 GHz BT coex shares a chain).
+            let mimo = h.ap_streams >= 2 && h.ap_sm_ps != ht::SM_PS_STATIC && hw.tx_ant & asc::ANT_AB == asc::ANT_AB
+                && (txant == 0 || txant == asc::ANT_AB) && !band_24;
+            c.enable_col_search(if h.ht40.is_some() && TX40.load(Ordering::Relaxed) { cap.sgi40() } else { cap.sgi20() }, mimo);
+            ilog!("rate control: columns {}", c.cols.iter().map(|k| k.label()).collect::<Vec<_>>().join("/"));
+        }
         send(cmd::LQ_CMD, None, &c.lq(AP_STA_ID))?;
         c.mark_sent(now_ms());
         let list: Vec<String> = c.rates.iter().map(|&r| rs::rate_label(r)).collect();
