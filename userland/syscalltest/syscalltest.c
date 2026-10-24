@@ -2396,7 +2396,7 @@ static void kaddr_sendmsg(void) {
         struct iovec v = { (void *)kaddrs[i], 64 };
         struct msghdr m = { 0 }; m.msg_iov = &v; m.msg_iovlen = 1;
         errno = 0;
-        ssize_t r = sendmsg(sv[0], &m, MSG_DONTWAIT);
+        ssize_t r = syscall(SYS_sendmsg, sv[0], &m, MSG_DONTWAIT); /* raw: relibc gathers iovs in user space */
         if (!(r < 0 && errno == EFAULT)) {
             fail(n, "iov_base=%#lx r=%zd errno=%s (want EFAULT)", kaddrs[i], r, strerror(errno)); ok = 0;
         }
@@ -2406,7 +2406,7 @@ static void kaddr_sendmsg(void) {
         struct msghdr m = { 0 }; m.msg_iov = &v; m.msg_iovlen = 1;
         m.msg_control = (void *)kaddrs[i]; m.msg_controllen = 64;
         errno = 0;
-        ssize_t r = sendmsg(sv[0], &m, MSG_DONTWAIT);
+        ssize_t r = syscall(SYS_sendmsg, sv[0], &m, MSG_DONTWAIT); /* raw: relibc gathers iovs in user space */
         if (!(r < 0 && errno == EFAULT)) {
             fail("kaddr_sendmsg_control", "msg_control=%#lx r=%zd errno=%s (want EFAULT)", kaddrs[i], r, strerror(errno)); ok = 0;
         }
@@ -2419,7 +2419,7 @@ static void kaddr_sendmsg(void) {
         struct iovec v = { (void *)kaddrs[i], 64 };
         struct msghdr m = { 0 }; m.msg_iov = &v; m.msg_iovlen = 1;
         errno = 0;
-        ssize_t r = recvmsg(sv[1], &m, MSG_DONTWAIT);
+        ssize_t r = syscall(SYS_recvmsg, sv[1], &m, MSG_DONTWAIT);
         if (!(r < 0 && errno == EFAULT)) {
             fail(rn, "iov_base=%#lx r=%zd errno=%s (want EFAULT)", kaddrs[i], r, strerror(errno)); ok = 0; break;
         }
