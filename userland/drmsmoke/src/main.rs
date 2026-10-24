@@ -1524,6 +1524,172 @@ unsafe fn tokenscope_cases(fd: c_int) -> (i32, i32) {
     (fails, 0)
 }
 
+const FAKE_OFF_BASE: u64 = 1 << 44;
+const FAKE_OFF_END: u64 = 1 << 45;
+fn opaque(off: u64) -> bool { off >= FAKE_OFF_BASE && off < FAKE_OFF_END && off & 0xFFF == 0 }
+const MAP_FAILED_P: isize = -1;
+const DRM_IOCTL_SET_MASTER_T: c_ulong = 0x641E;
+const DRM_IOCTL_DROP_MASTER_T: c_ulong = 0x641F;
+const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB: c_ulong = 0xC030644A;
+const DRM_IOCTL_VIRTGPU_CONTEXT_INIT: c_ulong = 0xC010644B;
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct VgGetParam { param: u64, value: u64 }
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct VgCtxSetParam { param: u64, value: u64 }
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct VgCtxInit { num_params: u32, pad: u32, ctx_set_params: u64 }
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct VgCreateBlob {
+    blob_mem: u32, blob_flags: u32, bo_handle: u32, res_handle: u32,
+    size: u64, pad: u32, cmd_size: u32, cmd: u64, blob_id: u64,
+}
+
+unsafe fn map_at(fd: c_int, len: usize, off: u64) -> *mut c_void {
+    mmap(core::ptr::null_mut(), len as size_t, PROT_READ | PROT_WRITE, MAP_SHARED, fd, off as i64)
+}
+
+unsafe fn fakeoff_cases(fd: c_int) -> i32 {
+    let mut fails = 0;
+    let mut c1 = DrmModeCreateDumb { width: 64, height: 64, bpp: 32, ..Default::default() };
+    let mut c2 = DrmModeCreateDumb { width: 64, height: 64, bpp: 32, ..Default::default() };
+    if ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut c1 as *mut _) != 0
+        || ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut c2 as *mut _) != 0 {
+        report(b"FAKEOFF_SETUP", false);
+        return 1;
+    }
+    let n = (c1.size as usize).max(64 * 64 * 4);
+    let mut m1 = DrmModeMapDumb { handle: c1.handle, ..Default::default() };
+    let r1 = ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut m1 as *mut _);
+    if !report(b"FAKEOFF_DUMB_OPAQUE", r1 == 0 && opaque(m1.offset)) { fails += 1; }
+    print_dec(b"  offset=", m1.offset);
+    let p = if r1 == 0 { map_at(fd, n, m1.offset) } else { MAP_FAILED_P as *mut c_void };
+    let mut ok = p as isize != MAP_FAILED_P;
+    if ok {
+        let w = p as *mut u32;
+        for i in 0..n / 4 { core::ptr::write_volatile(w.add(i), (i as u32).wrapping_mul(0x9E37_79B1) ^ 0xA5); }
+        for i in 0..n / 4 {
+            if core::ptr::read_volatile(w.add(i)) != (i as u32).wrapping_mul(0x9E37_79B1) ^ 0xA5 { ok = false; break; }
+        }
+        munmap(p, n as size_t);
+    }
+    if !report(b"FAKEOFF_DUMB_MAPS", ok) { fails += 1; }
+    let mut m1b = DrmModeMapDumb { handle: c1.handle, ..Default::default() };
+    let rb = ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut m1b as *mut _);
+    if !report(b"FAKEOFF_STABLE", rb == 0 && m1b.offset == m1.offset) { fails += 1; }
+    let mut m2 = DrmModeMapDumb { handle: c2.handle, ..Default::default() };
+    let r2 = ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut m2 as *mut _);
+    let n2 = (c2.size as u64).max(64 * 64 * 4);
+    let disjoint = m2.offset + n2 <= m1.offset || m1.offset + n as u64 <= m2.offset;
+    if !report(b"FAKEOFF_DISTINCT", r2 == 0 && opaque(m2.offset) && m2.offset != m1.offset && disjoint) { fails += 1; }
+    let mut h1 = c1.handle;
+    let mut h2 = c2.handle;
+    ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut h1 as *mut u32);
+    ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut h2 as *mut u32);
+    let s = map_at(fd, n, m1.offset);
+    let refused = s as isize == MAP_FAILED_P;
+    if !refused { munmap(s, n as size_t); }
+    if !report(b"FAKEOFF_STALE_REFUSED", refused) { fails += 1; }
+    fails
+}
+
+unsafe fn fbtoken_cases(fd: c_int) -> i32 {
+    let mut fails = 0;
+    let rfd = open(b"/dev/dri/renderD128\0".as_ptr(), O_RDWR);
+    if rfd < 0 {
+        puts(b"FBTOKEN_RENDER_REFUSED: SKIP (no renderD128)\n\0".as_ptr());
+    } else {
+        let q = map_at(rfd, 4096, 0);
+        let refused = q as isize == MAP_FAILED_P;
+        if !refused { munmap(q, 4096); }
+        if !report(b"FBTOKEN_RENDER_REFUSED", refused) { fails += 1; }
+        close(rfd);
+    }
+    let rc = ioctl(fd, DRM_IOCTL_SET_MASTER_T, 0usize);
+    print_dec(b"  SET_MASTER rc=", rc as i64 as u64);
+    let child = fork();
+    if child == 0 {
+        let b = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if b < 0 { _exit(2); }
+        let q = map_at(b, 4096, 0);
+        _exit(if q as isize == MAP_FAILED_P { 0 } else { 1 });
+    }
+    let mut st: c_int = 0;
+    let crc = if child > 0 && waitpid(child, &mut st, 0) == child && st & 0x7f == 0 { (st >> 8) & 0xff } else { 8 };
+    if !report(b"FBTOKEN_NONMASTER_REFUSED", crc == 0) { fails += 1; }
+    let q = map_at(fd, 4096, 0);
+    if q as isize == MAP_FAILED_P {
+        puts(b"FBTOKEN_MASTER_MAPS: SKIP (no firmware fb)\n\0".as_ptr());
+    } else {
+        munmap(q, 4096);
+        report(b"FBTOKEN_MASTER_MAPS", true);
+    }
+    ioctl(fd, DRM_IOCTL_DROP_MASTER_T, 0usize);
+    fails
+}
+
+unsafe fn hostvis_cases(fd: c_int) -> i32 {
+    const SIZE: usize = 65536;
+    let mut fails = 0;
+    let mut gp = [0u64; 2];
+    for (i, pr) in [3u64, 4u64].iter().enumerate() {
+        let mut g = VgGetParam { param: *pr, value: &mut gp[i] as *mut u64 as u64 };
+        if ioctl(fd, DRM_IOCTL_VIRTGPU_GETPARAM, &mut g as *mut _) != 0 { gp[i] = 0; }
+    }
+    if gp[0] == 0 || gp[1] == 0 {
+        puts(b"HOSTVIS: SKIP (RESOURCE_BLOB/HOST_VISIBLE unsupported)\n\0".as_ptr());
+        return 0;
+    }
+    let mut sp = [VgCtxSetParam { param: 1, value: 2 }];
+    let mut ci = VgCtxInit { num_params: 1, pad: 0, ctx_set_params: sp.as_mut_ptr() as u64 };
+    let rc = ioctl(fd, DRM_IOCTL_VIRTGPU_CONTEXT_INIT, &mut ci as *mut _);
+    print_dec(b"  CONTEXT_INIT rc=", rc as i64 as u64);
+    let cmd: [u32; 12] = [48 | (11 << 16), 0, 64, 1 << 19, SIZE as u32, 1, 1, 1, 0, 0, (1 << 1) | (1 << 2), 1];
+    let mut b = VgCreateBlob {
+        blob_mem: 2, blob_flags: 1, size: SIZE as u64, cmd_size: 48,
+        cmd: cmd.as_ptr() as u64, blob_id: 1, ..Default::default()
+    };
+    let rc = ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, &mut b as *mut _);
+    if rc != 0 { print_dec(b"  create_blob rc=", rc as i64 as u64); }
+    if !report(b"HOSTVIS_CREATE", rc == 0 && b.bo_handle != 0) { return fails + 1; }
+    let mut mp = VirtgpuMap { handle: b.bo_handle, ..Default::default() };
+    let mrc = ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &mut mp as *mut _);
+    if !report(b"HOSTVIS_MAP_OPAQUE", mrc == 0 && opaque(mp.offset)) { fails += 1; }
+    let off = mp.offset;
+    let pat = |i: usize| (i as u32).wrapping_mul(0x9E37_79B1);
+    let p = map_at(fd, SIZE, off);
+    let mut ok = p as isize != MAP_FAILED_P;
+    if ok {
+        let w = p as *mut u32;
+        for i in 0..SIZE / 4 { core::ptr::write_volatile(w.add(i), pat(i)); }
+        munmap(p, SIZE as size_t);
+        let p2 = map_at(fd, SIZE, off);
+        if p2 as isize == MAP_FAILED_P { ok = false; } else {
+            let w = p2 as *mut u32;
+            for i in 0..SIZE / 4 {
+                if core::ptr::read_volatile(w.add(i)) != pat(i) { ok = false; break; }
+            }
+            munmap(p2, SIZE as size_t);
+        }
+    }
+    if !report(b"HOSTVIS_READBACK", ok) { fails += 1; }
+    let q = map_at(fd, 4096, off + 4096);
+    let ok = q as isize != MAP_FAILED_P && core::ptr::read_volatile(q as *const u32) == pat(1024);
+    if q as isize != MAP_FAILED_P { munmap(q, 4096); }
+    if !report(b"HOSTVIS_PARTIAL", ok) { fails += 1; }
+    let mut h = [b.bo_handle, 0u32];
+    ioctl(fd, DRM_IOCTL_GEM_CLOSE_FF, h.as_mut_ptr());
+    let s = map_at(fd, 4096, off);
+    let refused = s as isize == MAP_FAILED_P;
+    if !refused { munmap(s, 4096); }
+    if !report(b"HOSTVIS_STALE_REFUSED", refused) { fails += 1; }
+    fails
+}
+
 unsafe fn maplife_cases(fd: c_int) -> (i32, i32) {
     let pat = |i: usize| ((i as u32).wrapping_mul(2654435761).rotate_right(11) as u8) | 1;
     let mut fails = 0;
@@ -1730,6 +1896,18 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         print_dec(b"drmsmoke: failed=", fails as u64);
         puts(b"--- drmsmoke done ---\n\0".as_ptr());
         return fails;
+    }
+    // `--fakeoff` / `--fbtoken` / `--hostvis`: opaque mmap-token cases.
+    for (flag, which) in [(&b"--fakeoff"[..], 0), (&b"--fbtoken"[..], 1), (&b"--hostvis"[..], 2)] {
+        if argc > 1 && arg_is(*argv.add(1) as *const u8, flag) {
+            let f = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+            if f < 0 { return 1; }
+            let fails = match which { 0 => fakeoff_cases(f), 1 => fbtoken_cases(f), _ => hostvis_cases(f) };
+            close(f);
+            print_dec(b"drmsmoke: failed=", fails as u64);
+            puts(b"--- drmsmoke done ---\n\0".as_ptr());
+            return fails;
+        }
     }
     // `--maplife`: only the L1.14 mapping-lifetime cases.
     if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--maplife") {

@@ -559,6 +559,7 @@ impl State {
             if self.bos.get(&obj).map_or(false, |b| b.last_fence.pending()) { i += 1; continue; }
             self.zombies.swap_remove(i);
             let Some(b) = self.bos.remove(&obj) else { continue };
+            crate::drm_offset::release(b.phys as u64);
             for v in self.vms.values_mut() {
                 if let Some((s, l)) = v.map.remove_obj(obj) { unmap_range(&mut v.pt, s, l); }
             }
@@ -854,8 +855,10 @@ fn mmap_offset(a: u64, open_id: u32) -> Result<usize, i32> {
         MMAP_OFFSET_GTT => return Err(ENODEV),
         _ => return Err(EINVAL),
     }
-    let phys = with_bo(open_id, m.handle, |b| Ok(b.phys))?;
-    write_user::<u64>(a + 8, phys);
+    let (phys, size) = with_bo(open_id, m.handle, |b| Ok((b.phys, b.size)))?;
+    // Opaque offset, never the physical base (resolved in `handle_ioctl_mmap`).
+    let off = crate::drm_offset::offset_for(phys as u64, size as u64).ok_or(EINVAL)?;
+    write_user::<u64>(a + 8, off);
     Ok(0)
 }
 

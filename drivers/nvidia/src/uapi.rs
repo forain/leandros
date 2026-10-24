@@ -896,7 +896,8 @@ fn gem_new(arg: u64, open_id: u32) -> Result<usize, DriverError> {
     g.info.handle = handle;
     g.info.size = size;
     g.info.offset = 0;
-    g.info.map_handle = phys;
+    // Opaque offset, never the physical base (resolved in `handle_ioctl_mmap`).
+    g.info.map_handle = drivers::drm_offset::offset_for(phys as u64, size as u64).unwrap_or(0);
     g.info.domain = domain;
     write_user(arg, g);
     ulog!(1, "open {}: GEM_NEW {} KiB {} (asked {:#x}, align {:#x}, kind {:#x}) -> handle {:#x} obj {} map {:#x}",
@@ -913,7 +914,7 @@ fn gem_info(arg: u64, open_id: u32) -> Result<usize, DriverError> {
     g.domain = b.domain;
     g.size = b.size;
     g.offset = 0;
-    g.map_handle = b.phys;
+    g.map_handle = drivers::drm_offset::offset_for(b.phys as u64, b.size as u64).unwrap_or(0);
     g.tile_mode = b.tile_mode;
     g.tile_flags = b.tile_flags;
     drop(st);
@@ -953,6 +954,7 @@ fn bo_unref(st: &mut State, obj: u32, handle: bool) {
     }
     if b.handles == 0 && b.exports == 0 {
         let b = st.bos.remove(&obj).expect("bo");
+        drivers::drm_offset::release(b.phys as u64);
         if b.keeper_mem != 0 {
             if let Some(k) = KEEPER.lock().as_ref() {
                 let _ = k.c.free(if b.sysmem { k.dev } else { k.sub }, b.keeper_mem);

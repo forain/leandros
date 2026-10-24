@@ -1234,6 +1234,27 @@ fn sg_token_of_obj(obj: u32) -> Option<usize> {
     DUMB_SG.lock().get(&obj).and_then(|f| f.first().map(|&(p, _)| p))
 }
 
+/// A dumb buffer's real mmap token and byte size: its buddy base, or for a
+/// scattered buffer its first frame (see `sg_mmap_runs`) and the frames' sum.
+/// `drm_offset` turns the token into the opaque offset userspace sees.
+fn dumb_token(b: &DumbBuf) -> Option<(u64, u64)> {
+    if b.sg {
+        let sg = DUMB_SG.lock();
+        let f = sg.get(&b.obj)?;
+        let t = f.first()?.0 as u64;
+        Some((t, f.iter().map(|&(_, o)| 4096u64 << o).sum()))
+    } else if b.phys != 0 {
+        Some((b.phys as u64, 4096u64 << b.order))
+    } else {
+        None
+    }
+}
+
+fn dumb_fake_offset(b: &DumbBuf) -> Option<u64> {
+    let (t, size) = dumb_token(b)?;
+    crate::drm_offset::offset_for(t, size)
+}
+
 /// Physically contiguous runs `(phys, bytes)` of the scattered buffer whose
 /// mmap token is `token`, adjacent frames merged. `sys_mmap` maps these one
 /// device VMA per run instead of one range from the token. `None` when `token`
@@ -2988,6 +3009,10 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
     };
     let dead = if zero { m.remove(&obj) } else { None };
     drop(m); // never hold a BO map across the device round-trip
+    if let Some(o) = dead.as_ref() {
+        crate::drm_offset::release(o.phys as u64);
+        crate::drm_offset::release(o.map_phys);
+    }
 
     // L1.14: a host-visible blob still mapped by some process keeps its window
     // span AND its host resource (RESOURCE_UNMAP_BLOB would pull the memory
@@ -6024,7 +6049,9 @@ impl DrmDeviceInterface {
         // Slot [5] carries the physical address used as the mmap offset (< 4 GiB, checked above).
         fb_data[3] = fb_id;
         fb_data[4] = 0;                        // no direct buffer pointer — force mmap
-        fb_data[5] = mmap_offset as u32;       // physical address as mmap offset
+        // Opaque 32-bit offset naming the buffer (`drm_offset::FAKE32_BASE`).
+        fb_data[5] = crate::drm_offset::offset_for32(mmap_offset as u64, (width as u64) * (height as u64) * 4)
+            .ok_or(DriverError::Unsupported)?;
 
 
         Ok(0)
@@ -6501,12 +6528,12 @@ impl DrmDeviceInterface {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         with_user_struct(arg, |map: &mut drm_mode_map_dumb| {
 
-        // Return the actual physical address associated with the dumb buffer handle
+        // An opaque offset naming the buffer (never its physical address);
+        // `handle_ioctl_mmap` resolves it. Scattered: the token is the first
+        // frame and sys_mmap maps the runs.
         match dumb_lookup(map.handle) {
-            Some(b) if !b.sg => { map.offset = b.phys as u64; Ok(0) }
-            // Scattered: the first frame is the token; sys_mmap maps the runs.
-            Some(b) => match sg_token_of_obj(b.obj) {
-                Some(t) => { map.offset = t as u64; Ok(0) }
+            Some(b) => match dumb_fake_offset(&b) {
+                Some(o) => { map.offset = o; Ok(0) }
                 None => Err(DriverError::Unsupported),
             },
             None => Err(DriverError::NotFound),
@@ -6783,6 +6810,7 @@ impl DrmDeviceInterface {
         };
         drop(map);
         if let Some(b) = zero {
+            if let Some((t, _)) = dumb_token(&b) { crate::drm_offset::release(t); }
             dumb_release_host_resource(b.res_id);
             dumb_free_backing(&b);
         }
@@ -7841,8 +7869,24 @@ impl DrmDeviceInterface {
     /// open of the node map any other client's buffer. open_id 0 is the
     /// kernel-internal legacy path (VFS opens are never 0) and stays unscoped.
     fn handle_ioctl_mmap(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
-        // arg contains the requested physical address/offset
-        let requested_phys = arg as u64;
+        // `arg` is the offset the caller passed to mmap(): 0 (the firmware
+        // framebuffer) or a fake offset from `drm_offset` that names a BO.
+        // Translate it to the BO's real token (physical base, scattered-buffer
+        // token or shared-memory window address) first; everything below,
+        // including the per-open ownership check, works on the real token.
+        // A raw physical address is refused: userspace is never told one.
+        // `open_id == 0` (kernel-internal legacy callers) still passes real
+        // tokens and stays unscoped.
+        let raw = arg as u64;
+        let requested_phys = if raw == 0 {
+            0
+        } else if let Some(real) = crate::drm_offset::resolve(raw) {
+            real
+        } else if open_id == 0 {
+            raw
+        } else {
+            return Err(DriverError::InvalidParameter);
+        };
         // A GPU backend's token (its GEM_NEW map_handle): the backend checks
         // that `open_id` holds a handle on the token's object; `None` (not
         // ours, or not this open's) falls through to the DRM layer's check,
@@ -7857,7 +7901,12 @@ impl DrmDeviceInterface {
 
 
         if requested_phys == 0 {
-            // Default: return the hardware framebuffer
+            // Token 0 is the firmware framebuffer — the scanout itself, not a
+            // BO anyone owns. Only the DRM master may map it (granted
+            // implicitly to the first card0 open when no master exists, as
+            // Linux's open-time grant); the render node is refused in
+            // servers/drm before it gets here.
+            if open_id != 0 { master_gate(open_id)?; }
             extern "C" {
                 fn vfs_get_framebuffer_base() -> u64;
             }
@@ -8947,17 +8996,17 @@ impl DrmDeviceInterface {
         // cannot be used to obtain an mmap token for it.
         let blob = blob_lookup(handle, open_id);
 
-        let token: u64 = match blob {
+        let (token, size): (u64, u64) = match blob {
             // ── Host-side blob memory ────────────────────────────────────────
             Some(b) if b.blob_mem == crate::virtio_gpu::VIRTIO_GPU_BLOB_MEM_HOST3D => {
                 if b.map_phys != 0 {
-                    b.map_phys // already mapped — idempotent
+                    (b.map_phys, b.size) // already mapped — idempotent
                 } else {
-                    self.hostvis_map_blob(b)?
+                    (self.hostvis_map_blob(b)?, b.size)
                 }
             }
             // ── Guest-backed blob ────────────────────────────────────────────
-            Some(b) if b.phys != 0 => b.phys as u64,
+            Some(b) if b.phys != 0 => (b.phys as u64, b.size),
             Some(_) => {
                 // A guest-backed blob with no pages cannot happen (creation
                 // allocates or fails), so this is a HOST3D_GUEST/GUEST record
@@ -8969,14 +9018,14 @@ impl DrmDeviceInterface {
                 let b = dumb_lookup(handle).ok_or(DriverError::InvalidParameter)?;
                 // Scattered backing: the first frame is the token (sys_mmap
                 // maps the frame runs, see `sg_mmap_runs`).
-                let phys = if b.sg { sg_token_of_obj(b.obj).unwrap_or(0) } else { b.phys };
-                if phys == 0 { return Err(DriverError::Unsupported); }
-                phys as u64
+                dumb_token(&b).ok_or(DriverError::Unsupported)?
             }
         };
+        // Userspace gets an opaque offset naming the BO, never the token.
+        let off = crate::drm_offset::offset_for(token, size).ok_or(DriverError::Unsupported)?;
 
         // `offset` is the first u64 of drm_virtgpu_map. Written with no lock held.
-        unsafe { (arg as *mut u64).write_volatile(token) };
+        unsafe { (arg as *mut u64).write_volatile(off) };
         Ok(0)
     }
 
@@ -9937,7 +9986,8 @@ impl DrmDeviceInterface {
         // its token is not derived the same way.
         if b.v3d_va == 0 || b.phys == 0 { return Err(DriverError::NotFound); }
 
-        unsafe { ((arg as *mut u8).add(8) as *mut u64).write_unaligned(b.phys as u64) };
+        let off = crate::drm_offset::offset_for(b.phys as u64, b.size).ok_or(DriverError::Unsupported)?;
+        unsafe { ((arg as *mut u8).add(8) as *mut u64).write_unaligned(off) };
         Ok(0)
     }
 
