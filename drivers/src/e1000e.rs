@@ -18,7 +18,8 @@
 //!   e1000e_reset (packet buffer, flow-control thresholds, the SPT/CNP
 //!   descriptor-ring flush, DRV_LOAD for the ME, MAC init, copper link setup
 //!   and autonegotiation, EEE advertisement), rings. Then it stays as the
-//!   link monitor (MAC STATUS every 250 ms; link-up applies the per-speed
+//!   link monitor (MAC STATUS on ICR.LSC, else every 250 ms while traffic
+//!   moves / 2 s idle; link-up applies the per-speed
 //!   PCH settings: TIPG, EMI RX config, PLL clock gate, K1 clock request, the
 //!   SPT 1000 Mb/s pointer gap, LTR, FEXTNVM4/6, flow control, EEE), dumps MAC
 //!   and PHY registers at 10/30/120 s without link, resets a TX ring that
@@ -421,6 +422,13 @@ static IRQ_EN: AtomicU32 = AtomicU32::new(0);
 static IRQS: AtomicU64 = AtomicU64::new(0);
 static IRQ_RX: AtomicU64 = AtomicU64::new(0);
 static IRQ_LSC: AtomicU64 = AtomicU64::new(0);
+/// The link monitor parks here; the ISR wakes it on LSC / ECCER.
+pub static LINKMON: crate::netdev::LinkMon = crate::netdev::LinkMon::new();
+/// Link-monitor cadence: while frames move, while TX is in flight (watchdog)
+/// or when no interrupt is wired, and otherwise (idle; a link change arrives
+/// as ICR.LSC and wakes the monitor at once).
+const MON_FAST_MS: u64 = 250;
+const MON_IDLE_MS: u64 = 2000;
 static IRQ_RXO: AtomicU64 = AtomicU64::new(0);
 static IRQ_EMPTY: AtomicU64 = AtomicU64::new(0);
 static IRQ_LAST: AtomicU32 = AtomicU32::new(0);
@@ -1668,6 +1676,7 @@ extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
     if st & hw::ICR_LSC != 0 { IRQ_LSC.fetch_add(1, Ordering::Relaxed); }
     if st & hw::ICR_RXO != 0 { IRQ_RXO.fetch_add(1, Ordering::Relaxed); }
     if st & ICR_ECCER != 0 { ECC_ERRORS.fetch_add(1, Ordering::Relaxed); }
+    if st & (hw::ICR_LSC | ICR_ECCER) != 0 { LINKMON.notify(); }
     crate::netdev::kick_from_irq();
     crate::irq::IrqReturn::Handled
 }
@@ -1928,8 +1937,11 @@ fn driver_thread(mut hw: Hw) {
     let mut last_mode = (0u32, false);
     let mut lsc_seen = IRQ_LSC.load(Ordering::Relaxed);
     let mut ecc_seen = 0u32;
+    let mut mon_seen = 0u64;
+    let mut period = MON_FAST_MS;
+    let mut traffic = (RX_PKTS.load(Ordering::Relaxed), TX_PKTS.load(Ordering::Relaxed));
     loop {
-        msleep(250);
+        LINKMON.wait(&mut mon_seen, period);
         let now = now_ms();
         let st = hw.m.r32(STATUS);
         LAST_STATUS.store(st, Ordering::Relaxed);
@@ -1943,7 +1955,7 @@ fn driver_thread(mut hw: Hw) {
             continue;
         }
         // Re-run the per-speed work on a renegotiation or a quick
-        // down/up (a link-change interrupt) the 250 ms poll did not see.
+        // down/up (a link-change interrupt) the STATUS read did not see.
         let renegotiated = up && last_up && ((speed, full) != last_mode || lsc != lsc_seen);
         lsc_seen = lsc;
         if renegotiated {
@@ -2052,6 +2064,12 @@ fn driver_thread(mut hw: Hw) {
                 }
             }
         }
+        // Next pass: fast while anything moves or a watchdog needs the
+        // cadence, slow when idle (link changes come in as ICR.LSC).
+        let t = (RX_PKTS.load(Ordering::Relaxed), TX_PKTS.load(Ordering::Relaxed));
+        let busy = t != traffic || tx_stall_since.is_some() || !IRQ_ACTIVE.load(Ordering::Relaxed);
+        traffic = t;
+        period = if busy { MON_FAST_MS } else { MON_IDLE_MS };
         // Periodic line while traffic moves (every 30 s).
         if now - stats_at >= 30_000 {
             let s = (RX_PKTS.load(Ordering::Relaxed), TX_PKTS.load(Ordering::Relaxed), IRQS.load(Ordering::Relaxed));
@@ -2191,6 +2209,7 @@ pub fn info_lines(out: &mut String) {
     let _ = writeln!(out, "phystatus: STATUS={:08x}", st);
     let _ = writeln!(out, "link_changes: {}", LINK_CHANGES.load(Ordering::Relaxed));
     let _ = writeln!(out, "irq: {}", info.irq);
+    let _ = writeln!(out, "{}", LINKMON.line());
     let _ = writeln!(out, "irq_count: {} (rx {} lsc {} rxo {} empty {} last_icr {:08x} mask {:08x})",
                      IRQS.load(Ordering::Relaxed), IRQ_RX.load(Ordering::Relaxed), IRQ_LSC.load(Ordering::Relaxed),
                      IRQ_RXO.load(Ordering::Relaxed), IRQ_EMPTY.load(Ordering::Relaxed), IRQ_LAST.load(Ordering::Relaxed),

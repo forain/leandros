@@ -15,7 +15,8 @@
 //!   PHY patch `/lib/firmware/rtl_nic/<chip>.fw` (`r8169.fw=`), then does what
 //!   Linux's open() does — PHY resume, per-chip PHY configuration, PHY soft
 //!   reset, chip reset + MAC configuration, autonegotiation — marks the data
-//!   path running, and stays as the link monitor (PHYstatus every 250 ms;
+//!   path running, and stays as the link monitor (PHYstatus on LinkChg, else
+//!   every 250 ms while traffic moves / 2 s idle;
 //!   up/down transitions with speed/duplex/flow control are logged, a TX
 //!   ring that stops completing is reset, and a receive path that stopped
 //!   delivering while the chip reports overflows / missed frames is
@@ -295,6 +296,12 @@ static INFO: Mutex<Option<Info>> = Mutex::new(None);
 
 static IRQS: AtomicU64 = AtomicU64::new(0);
 static IRQ_LINKCHG: AtomicU64 = AtomicU64::new(0);
+/// The link monitor parks here; every IntrStatus reader wakes it on LinkChg.
+pub static LINKMON: crate::netdev::LinkMon = crate::netdev::LinkMon::new();
+/// Link-monitor cadence: while frames move, while TX is in flight (watchdog),
+/// during an RX-stall episode or when no interrupt is wired; otherwise (idle).
+const MON_FAST_MS: u64 = 250;
+const MON_IDLE_MS: u64 = 2000;
 /// RxDescUnavail / RxFIFOOver seen latched in IntrStatus (by the ISR or by
 /// the re-arm at the end of a daemon pass), each latch counted once.
 static IRQ_RX_OVERFLOW: AtomicU64 = AtomicU64::new(0);
@@ -1289,7 +1296,7 @@ impl hw::IrqRegs for Mmio {
 /// Count what an IntrStatus value says (each latch is acked, so counted, once).
 fn note_status(st: u16) {
     IRQ_LAST_STATUS.store(st, Ordering::Relaxed);
-    if st & INT_LINK_CHG != 0 { IRQ_LINKCHG.fetch_add(1, Ordering::Relaxed); }
+    if st & INT_LINK_CHG != 0 { IRQ_LINKCHG.fetch_add(1, Ordering::Relaxed); LINKMON.notify(); }
     if st & INT_RX_OVERFLOW != 0 { IRQ_RX_OVERFLOW.fetch_add(1, Ordering::Relaxed); }
     if st & INT_RX_FIFO_OVER != 0 { IRQ_RX_FIFO.fetch_add(1, Ordering::Relaxed); }
     if st & (INT_SYSERR | INT_TX_ERR | INT_RX_ERR) != 0 { IRQ_ERRORS.fetch_add(1, Ordering::Relaxed); }
@@ -1603,8 +1610,17 @@ fn driver_thread(mut hw: Hw) {
     let mut episode: Option<(u8, u64)> = None;
     let mut stats = StatsSnap::take();
     let mut stats_at = now_ms();
+    let mut mon_seen = 0u64;
+    let mut period = MON_FAST_MS;
+    let mut traffic = (RX_PKTS.load(Ordering::Relaxed), TX_PKTS.load(Ordering::Relaxed));
     loop {
-        msleep(250);
+        LINKMON.wait(&mut mon_seen, period);
+        {
+            let t = (RX_PKTS.load(Ordering::Relaxed), TX_PKTS.load(Ordering::Relaxed));
+            let busy = t != traffic || tx_stall_since.is_some() || episode.is_some() || !irq_active();
+            traffic = t;
+            period = if busy { MON_FAST_MS } else { MON_IDLE_MS };
+        }
         {
             let rxp = RX_PKTS.load(Ordering::Relaxed);
             let ovf = IRQ_RX_OVERFLOW.load(Ordering::Relaxed) + IRQ_RX_FIFO.load(Ordering::Relaxed);
@@ -1937,6 +1953,7 @@ pub fn info_lines(out: &mut String) {
                      IRQS.load(Ordering::Relaxed), IRQ_RX.load(Ordering::Relaxed), IRQ_LINKCHG.load(Ordering::Relaxed),
                      IRQ_ERRORS.load(Ordering::Relaxed), IRQ_EMPTY.load(Ordering::Relaxed),
                      IRQ_LAST_STATUS.load(Ordering::Relaxed), IRQ_EN.load(Ordering::Relaxed));
+    let _ = writeln!(out, "{}", LINKMON.line());
     let _ = writeln!(out, "irq_recheck_rescued: {}", IRQ_RECHECK_RESCUED.load(Ordering::Relaxed));
     let _ = writeln!(out, "rx_desc_unavail_seen: {} rx_fifo_over_seen: {}",
                      IRQ_RX_OVERFLOW.load(Ordering::Relaxed), IRQ_RX_FIFO.load(Ordering::Relaxed));

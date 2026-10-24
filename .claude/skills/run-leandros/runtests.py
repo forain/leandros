@@ -183,6 +183,9 @@ SUITES = {
                 "host:netflaptest.py",
                 # Idle net-daemon wake bound (own boot): netidletest.py.
                 "host:netidletest.py",
+                # e1000e link monitor on ICR.LSC (set_link flaps, idle wake
+                # bound) + netcheck --put TX bulk (own boot): linkmontest.py.
+                "host:linkmontest.py",
                 # Bulk upload over a Wi-Fi-like shaped link: no spinning on a
                 # full driver TX queue (own boot): nettxtest.py.
                 "host:nettxtest.py --tx --shape eth0:20000:20000:64:256:2",
@@ -196,6 +199,8 @@ SUITES = {
     "netroam": ["host:netroamtest.py"],
     # udppeertest.py alone (udptest peer against the raw-Ethernet host peer).
     "udppeer": ["host:udppeertest.py"],
+    # linkmontest.py alone.
+    "linkmon": ["host:linkmontest.py"],
     # netidletest.py alone.
     "netidle": ["host:netidletest.py"],
     # nettxtest.py alone (shaped upload).
