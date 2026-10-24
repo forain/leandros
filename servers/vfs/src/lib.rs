@@ -3937,6 +3937,7 @@ fn device_close(port: u32, dev_id: u32, open_id: u32) {
         if refs[i] != 0 { return; }
         refs[i] = DEVICE_OPEN_CLOSING;
     }
+    FDCLOSE[7].fetch_add(1, atomic::Ordering::Relaxed);
     let mut close_msg = Message::empty();
     close_msg.tag = VFS_CLOSE;
     close_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
@@ -5987,6 +5988,17 @@ fn gen_rqhold() -> Option<VnodeKind> {
             let _ = writeln!(s, "# lock {}{} holds {} ns_held {} cont {} ns_spun {}", name, idx, n, ns, cont, spin);
         }
     });
+    {
+        use sched::playstat as ps; let r = |a: &atomic::AtomicU64| a.load(atomic::Ordering::Relaxed);
+        let _ = writeln!(s, "# playcost widen_skip {} widen_deref {} fwake_empty {} fwake_locked {}",
+            r(&ps::WIDEN_SKIP), r(&ps::WIDEN_DEREF), r(&ps::FWAKE_EMPTY), r(&ps::FWAKE_LOCKED));
+        let c: [u64; 8] = core::array::from_fn(|i| r(&FDCLOSE[i]));
+        let d: [u64; 8] = core::array::from_fn(|i| r(&FDDUP[i]));
+        let _ = writeln!(s, "# fdclose pipe {} eventfd {} timerfd {} dyndev {} mounted {} tmp {} other {} dyndev_last {}",
+            c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+        let _ = writeln!(s, "# fddup pipe {} eventfd {} timerfd {} dyndev {} mounted {} tmp {} other {}",
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6]);
+    }
     let _ = writeln!(s, "{}", sched::SchedStatsLine);
     proc_snapshot(b"/tmp/.rqhold", s.as_bytes(), false)
 }
@@ -8552,12 +8564,26 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
     }
 }
 
+/// Lane playcost: close/dup counts by descriptor kind (`# fdclose`/`# fddup`
+/// rows of `/proc/rqhold`): pipe eventfd timerfd dyndev mounted tmp other,
+/// then dyndev closes that reached the driver (last reference).
+pub static FDCLOSE: [atomic::AtomicU64; 8] = [const { atomic::AtomicU64::new(0) }; 8];
+pub static FDDUP:   [atomic::AtomicU64; 8] = [const { atomic::AtomicU64::new(0) }; 8];
+fn fdkind_idx(k: &VnodeKind) -> usize {
+    match k {
+        VnodeKind::Pipe { .. } => 0, VnodeKind::EventFd { .. } => 1, VnodeKind::TimerFd { .. } => 2,
+        VnodeKind::DynamicDevice { .. } => 3, VnodeKind::MountedFile { .. } => 4,
+        VnodeKind::TmpFile { .. } => 5, _ => 6,
+    }
+}
+
 fn handle_close(pid: u32, fd: usize) -> Message {
     let mut tbls = TblSlot::new();
     let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     
     let kind = tbl.fds[fd].kind;
+    FDCLOSE[fdkind_idx(&kind)].fetch_add(1, atomic::Ordering::Relaxed);
     let closed_ofd = tbl.fds[fd].ofd;
     tbl.fds.clear(fd);
     drop(tbls);
@@ -9601,6 +9627,7 @@ fn dup_fd_min(pid: u32, oldfd: usize, minfd: usize, cloexec: bool) -> Message {
     if !tbl.fds.used(oldfd) && !tbl.fds.implicit_console(oldfd) { return err_reply(-9); }
     // See handle_dup2: the kernel duplicates socket/epoll entries itself.
     if handle_of(&tbl.fds[oldfd].kind).is_some() { return err_reply(-9); }
+    FDDUP[fdkind_idx(&tbl.fds[oldfd].kind)].fetch_add(1, atomic::Ordering::Relaxed);
 
     let newfd = match tbl.alloc_fd_from(floor) {
         Some(f) => f, None => return err_reply(-24), // EMFILE

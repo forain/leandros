@@ -553,6 +553,17 @@ pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> isize {
     }
 }
 
+/// Whether `key`'s bucket holds a waiter that a wake could still claim.
+fn bucket_has_waiter(tbl: &FutexTable, key: &FutexKey) -> bool {
+    let mut i = tbl.head[bucket(key)];
+    while i != NIL {
+        let cur = i as usize;
+        i = tbl.next[cur];
+        if let Some(w) = tbl.slot[cur] { if !w.woken && w.key == *key { return true; } }
+    }
+    false
+}
+
 fn wake_key(key: FutexKey, n: u32) -> u32 {
     let mut woken   = 0u32;
     let mut resched = false;
@@ -561,6 +572,14 @@ fn wake_key(key: FutexKey, n: u32) -> u32 {
     // completely against futex_wait's register / commit steps.
     {
         let mut tbl = FUTEX_TABLE.lock();
+        // No unclaimed waiter on this key: nothing to wake, so do not take
+        // RUN_QUEUE (TASKS) at all (lane playcost). FUTEX_TABLE is held, so
+        // no waiter can register in between (futex_wait registers under it).
+        if n == 0 || !bucket_has_waiter(&tbl, &key) {
+            crate::playstat::FWAKE_EMPTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return 0;
+        }
+        crate::playstat::FWAKE_LOCKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let mut rq  = RUN_QUEUE.lock();
 
         let mut i = tbl.head[bucket(&key)];

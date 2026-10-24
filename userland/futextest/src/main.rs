@@ -419,6 +419,35 @@ fn wake_cost() -> bool {
 
 /// L10.11: a slot reused at the same address must be keyed by its new
 /// mapping, not by what the VMA lookup hint saw before.
+/// `# playcost` row of /proc/rqhold: [widen_skip, widen_deref, fwake_empty, fwake_locked].
+fn playcost_row() -> Option<[u64; 4]> {
+    let t = std::fs::read_to_string("/proc/rqhold").ok()?;
+    let l = t.lines().find(|l| l.starts_with("# playcost "))?;
+    let v: Vec<u64> = l.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+    if v.len() == 4 { Some([v[0], v[1], v[2], v[3]]) } else { None }
+}
+
+/// Lane playcost guard: a FUTEX_WAKE with no waiter on its key must not take
+/// RUN_QUEUE (the global TASKS lock): it counts as fwake_empty, not fwake_locked.
+fn wake_empty_no_tasks() -> bool {
+    const N: u64 = 2000;
+    let a = map(4096, MAP_PRIVATE | MAP_ANON, -1);
+    word(a).store(0, SeqCst);
+    let before = playcost_row();
+    for _ in 0..N { futex(word(a), FUTEX_WAKE | FUTEX_PRIVATE, 1, core::ptr::null(), 0); }
+    let after = playcost_row();
+    unsafe { munmap(a, 4096); }
+    let (ok, detail) = match (before, after) {
+        (Some(b), Some(x)) => {
+            let (e, l) = (x[2] - b[2], x[3] - b[3]);
+            (e >= N && l < N / 2, format!("fwake_empty +{} fwake_locked +{} for {} empty wakes", e, l, N))
+        }
+        _ => (false, "no # playcost row in /proc/rqhold".into()),
+    };
+    println!("wake_empty_no_tasks: {}", detail);
+    report("wake_empty_no_tasks", ok, detail)
+}
+
 fn hint_remap_shared() -> bool {
     let a = map(4096, MAP_PRIVATE | MAP_ANON, -1);
     futex(word(a), FUTEX_WAKE, 1, core::ptr::null(), 0);        // warm the hint on a private VMA
@@ -445,6 +474,7 @@ fn main() {
         ("private_not_shared", private_not_shared),
         ("wake_cost", wake_cost),
         ("hint_remap_shared", hint_remap_shared),
+        ("wake_empty_no_tasks", wake_empty_no_tasks),
         ("robust_exit", || robust_process("robust_exit", Death::Exit, false)),
         ("robust_exit_waited", || robust_process("robust_exit_waited", Death::ExitWhileWaited, false)),
         ("robust_killed", || robust_process("robust_killed", Death::Killed, false)),

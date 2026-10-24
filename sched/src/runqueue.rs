@@ -1171,6 +1171,19 @@ impl RunQueue {
         // instance's tag, and a poll() set holding an epoll fd re-checks
         // EPOLL_CTL_GEN instead (every widening follows an epoll_ctl).
         for i in self.parked_slots() {
+            // Park-mirror prefilter (lane playcost): the invariant the wake
+            // walk already relies on (`unblock_port_tagged_inner`) - a task
+            // parked on `port` registered `pk_port`/`pk_mask` (a superset of
+            // its mask) at park time, and every path that changes its mask
+            // out of band also takes it off the port. Skips the Task
+            // dereference (a cache miss each) for parkers that cannot hold
+            // the instance's bit: widening walked every parked Firefox
+            // thread under TASKS, ~15 us per epoll_ctl on the laptop.
+            if self.pk_port[i] != port || self.pk_mask[i] & match_tag == 0 {
+                crate::playstat::WIDEN_SKIP.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            crate::playstat::WIDEN_DEREF.fetch_add(1, Ordering::Relaxed);
             if let Some(task) = self.tasks[i].as_deref_mut() {
                 // The parker must watch the instance itself, not only share
                 // its bit: a refined bit needs the key's fingerprint.
