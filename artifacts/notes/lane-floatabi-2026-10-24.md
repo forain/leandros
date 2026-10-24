@@ -24,3 +24,9 @@ Evidence:
 - Checker: floattest linked against main's soft-float archive FAIL 37/45; fixed: OK 131/131; DOOM OK 133.
 - x86_64 guest, floattest on the soft-float archive: 13 failures (pow..sqrt, powidf2, floattidf, all
   printf cases; main's own userland archive there was a stale pre-kvmaudio build). Fixed: see regress.
+- Fixed tree: regress aarch64 (HVF) PASS and x86_64 (TCG) PASS, floattest 0 failures on both.
+- DOOM x86_64 (doomsession.py, Mac TCG, wav): 0 clipped of 28.7 M samples, peak 22862, RMS 2278,
+  34/36 s loud (kvmaudio fix baseline: 0 clipped, peak 23068, RMS 2246).
+
+Open: printf variadics that spill to the stack (>5-7 int or >8 FP args) are still unsupported; the
+Rust userland stays soft-float on x86_64 (consistent ABI, no bug).
