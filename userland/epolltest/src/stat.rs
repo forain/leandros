@@ -262,12 +262,18 @@ unsafe fn pipe_drain_keyed() -> bool {
 /// waiter parks on 96 idle eventfds (its mask covers almost every bit); a
 /// helper does NCTL rounds of ADD-not-ready + write, and ADD-ready, on a
 /// second instance nobody waits on. Expect no useless wake.
-const NCTL: usize = 20;
+const NCTL: usize = 64;
+const NINST: usize = 64;
 
 extern "C" fn ctl_helper(_arg: *mut c_void) -> *mut c_void {
     unsafe {
-        let ep = epoll_create1(0);
+        // One instance per round: the instance's tag bit (1 of 64) must
+        // collide with the waiter's mask for the old widening to reach it,
+        // so sweep enough instances to cover every bit.
+        let mut eps = [-1 as c_int; NINST];
+        for x in eps.iter_mut() { *x = epoll_create1(0); }
         for i in 0..NCTL {
+            let ep = eps[i % NINST];
             usleep(15_000);
             let e = syscall(nr::EVENTFD2, 0i64, 0o4000i64) as c_int;
             if i % 2 == 0 {
@@ -283,7 +289,7 @@ extern "C" fn ctl_helper(_arg: *mut c_void) -> *mut c_void {
             usleep(5_000);
             close(e);
         }
-        close(ep);
+        for &x in &eps { close(x); }
     }
     core::ptr::null_mut()
 }
