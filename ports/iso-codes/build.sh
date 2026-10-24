@@ -35,7 +35,7 @@ fi
 if command -v sha256sum >/dev/null; then
   echo "$SHA256  $tarball" | sha256sum -c - >/dev/null
 else
-  echo "$SHA256  $tarball" | shasum -a 256 -c - >/dev/null
+  echo "$SHA256  $tarball" | { if command -v sha256sum >/dev/null 2>&1; then sha256sum -c -; else shasum -a 256 -c -; fi; } >/dev/null
 fi
 rm -rf "$WORK/iso-codes-$VERSION"
 tar -C "$WORK" -xJf "$tarball" $(printf "iso-codes-$VERSION/data/%s " "${TABLES[@]}")

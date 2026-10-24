@@ -20,5 +20,5 @@ cargo build -p kernel ${FARG[@]+"${FARG[@]}"} --target "$SPEC" --target-dir "$ST
 mkdir -p target/final-$ARCH
 cp "$STD/$ARCH-unknown-kernel/release/kernel" target/final-$ARCH/kernel
 python3 scripts/check-stack-frames.py target/final-$ARCH/kernel --budget 49152
-shasum -a 256 target/final-$ARCH/kernel
+if command -v sha256sum >/dev/null 2>&1; then sha256sum target/final-$ARCH/kernel; else shasum -a 256 target/final-$ARCH/kernel; fi
 ls -l target/final-$ARCH/kernel
