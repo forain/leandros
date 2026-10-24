@@ -108,6 +108,25 @@ pub unsafe fn is_valid_dtb(dtb_virt: usize) -> bool {
     magic == FDT_MAGIC
 }
 
+/// Look for an FDT header on any 4 KiB page of `[start, start + pages * 4096)`
+/// (virtual addresses). `mapped(va)` is asked before each page is touched, so
+/// a caller running before its own page tables exist (Limine path, pre-mm)
+/// can skip pages the bootloader's HHDM leaves unmapped instead of faulting.
+/// Returns the first hit and how many pages were skipped as unmapped.
+///
+/// # Safety
+/// Every page for which `mapped` returns true must be readable.
+pub unsafe fn scan_for_dtb(start: usize, pages: usize,
+                           mapped: &mut dyn FnMut(usize) -> bool) -> (Option<usize>, usize) {
+    let mut skipped = 0usize;
+    for i in 0..pages {
+        let a = start + i * 0x1000;
+        if !mapped(a) { skipped += 1; continue; }
+        if is_valid_dtb(a) { return (Some(a), skipped); }
+    }
+    (None, skipped)
+}
+
 /// Parse the DTB at `dtb_phys` and populate a `BootInfo`.
 ///
 /// # Safety
@@ -691,6 +710,30 @@ mod tests {
         reserved_ranges(&mut |r| { n += 1; assert!(!r.memreserve); });
         assert_eq!(n, 3);
         assert_eq!(pci_bus_range(), Some((0, 0x3f)));
+    }
+
+    #[test]
+    fn ram_scan_skips_unmapped_pages_and_finds_blob() {
+        // 4 pages; the blob sits at page 2, page 1 also holds the magic but is
+        // reported unmapped, so it must be skipped (never read) and counted.
+        let fdt = blob(&[(0x4800_0000, 0x1000)]);
+        let mut ram: Vec<u64> = std::vec![0; 4 * 512 + 512];
+        let base = (ram.as_mut_ptr() as usize + 0xfff) & !0xfff;
+        let src = fdt.as_ptr() as *const u8;
+        let n = fdt.len() * 8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, (base + 0x2000) as *mut u8, n.min(0x1000 * 2));
+            core::ptr::copy_nonoverlapping(src, (base + 0x1000) as *mut u8, 4);
+        }
+        let (hit, skipped) = unsafe { scan_for_dtb(base, 4, &mut |a| a != base + 0x1000) };
+        assert_eq!(hit, Some(base + 0x2000));
+        assert_eq!(skipped, 1);
+        // the hit is a full blob: its /memreserve/ entry is what the kernel reserves
+        let mut got = Vec::new();
+        assert!(unsafe { for_each_reserved_at(base + 0x2000, &mut |r| got.push(r.base)) });
+        assert_eq!(got.first(), Some(&0x4800_0000));
+        let (none, sk) = unsafe { scan_for_dtb(base, 4, &mut |_| false) };
+        assert_eq!((none, sk), (None, 4));
     }
 
     #[test]
