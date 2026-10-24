@@ -110,10 +110,24 @@ pub struct SchedSlot {
     /// which runs only after the guard was released (AcqRel CAS in
     /// `release`, Acquire load in `on_remove`), so the two never overlap.
     ep_cache: core::cell::UnsafeCell<Option<alloc::boxed::Box<dyn core::any::Any + Send>>>,
+    /// Listener wake mailbox (lane percpu4): the wakes a parked epoll/poll
+    /// listener had received when it was made Ready, moved out of
+    /// `Task::listen.ring` by `Task::set_state` (Blocked -> Ready of a
+    /// listener park, under TASKS) so the woken owner reads them without a
+    /// TASKS hold (`poll_listen_woken`). `lm_full` (Release by the writer,
+    /// Acquire by the owner) guards `lm`. One writer per park: only the
+    /// Blocked -> Ready transition writes, and the owner cannot park again
+    /// before it has read; `listen_park` clears it under TASKS while the
+    /// owner runs, so a mailbox is never carried across parks. Plain data
+    /// (no allocation): an exiting thread leaves nothing to free, and
+    /// `on_insert` clears it for the slot's next task.
+    lm_full: AtomicU8,
+    lm: core::cell::UnsafeCell<(u32, crate::WakeRing)>,
 }
 
-// SAFETY: every field but `ep_cache` is atomic; `ep_cache` is owner-only (see
-// its doc), so no two CPUs ever access it at the same time.
+// SAFETY: every field but `ep_cache` and `lm` is atomic; `ep_cache` is
+// owner-only (see its doc), so no two CPUs ever access it at the same time;
+// `lm` is published through `lm_full` (see its doc).
 unsafe impl Sync for SchedSlot {}
 
 impl SchedSlot {
@@ -132,6 +146,8 @@ impl SchedSlot {
             nvcsw: AtomicU64::new(0), nivcsw: AtomicU64::new(0), minflt: AtomicU64::new(0),
             majflt: AtomicU64::new(0), mm_borrowed: core::sync::atomic::AtomicBool::new(false), io_rd: AtomicU64::new(0), aff: AtomicU64::new(0),
             ep_cache: core::cell::UnsafeCell::new(None),
+            lm_full: AtomicU8::new(0),
+            lm: core::cell::UnsafeCell::new((0, crate::WakeRing::EMPTY)),
         }
     }
 }
@@ -484,6 +500,7 @@ pub(crate) fn on_insert(idx: usize, t: &mut Task) {
     s.sc_t0.store(0, Ordering::Relaxed);
     s.sc_nr.store(crate::NO_SYSCALL, Ordering::Relaxed);
     for c in [&s.nvcsw, &s.nivcsw, &s.minflt, &s.majflt, &s.io_rd] { c.store(0, Ordering::Relaxed); }
+    s.lm_full.store(0, Ordering::Relaxed);
     s.state.store(state_code(t.state), Ordering::Release);
     s.ready_since.store(crate::monotonic_ns(), Ordering::Relaxed);
     publish(t);
@@ -507,6 +524,42 @@ pub(crate) fn on_remove(idx: usize, t: &mut Task) {
     let c = unsafe { (*s.ep_cache.get()).take() };
     if c.is_some() { t.ep_cache = c; }
     t.slot = NO_SLOT;
+}
+
+/// Deliver a woken listener's ring (listener `id`) into slot `idx`'s
+/// mailbox. Caller: `Task::set_state` on the Blocked -> Ready transition of
+/// a listener park, under TASKS. A mailbox still full for the same listener
+/// is merged into (never overwritten: whatever it holds was not read yet).
+pub(crate) fn listen_mail_put(idx: usize, id: u32, r: &crate::WakeRing) {
+    if idx >= MAX_TASKS { return; }
+    let s = &SCHED[idx];
+    // SAFETY: see `SchedSlot::lm_full`: the owner is not reading (it is
+    // still parked, or re-checking before it reads) and writers hold TASKS.
+    let m = unsafe { &mut *s.lm.get() };
+    if s.lm_full.load(Ordering::Acquire) != 0 && m.0 == id {
+        for &k in r.keys() { m.1.push_key(k); }
+        m.1.push_tags(r.tags);
+        m.1.flags |= r.flags;
+    } else {
+        *m = (id, *r);
+    }
+    s.lm_full.store(1, Ordering::Release);
+}
+
+/// Take slot `idx`'s mailbox (`None` = empty). Caller: the task itself,
+/// after its listener park was committed or cancelled.
+pub(crate) fn listen_mail_take(idx: usize) -> Option<(u32, crate::WakeRing)> {
+    let s = &SCHED[idx];
+    if s.lm_full.load(Ordering::Acquire) == 0 { return None; }
+    // SAFETY: full and the owner is past its park: no writer until it parks again.
+    let m = unsafe { *s.lm.get() };
+    s.lm_full.store(0, Ordering::Release);
+    Some(m)
+}
+
+/// Empty slot `idx`'s mailbox (`listen_park`, under TASKS, owner running).
+pub(crate) fn listen_mail_clear(idx: usize) {
+    if idx < MAX_TASKS { SCHED[idx].lm_full.store(0, Ordering::Release); }
 }
 
 /// Replace the running task's epoll snapshot in slot `idx` with `c`,

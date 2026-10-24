@@ -684,6 +684,20 @@ impl Task {
     #[track_caller]
     pub fn set_state(&mut self, new: TaskState) {
         let old = self.state;
+        // A new park is no listener park until `listen_park` says so.
+        if new == TaskState::Blocked { self.listen.parked = false; }
+        // Lane percpu4: a parked listener made Ready gets its ring handed
+        // over in the slot mailbox, before the state is published, so the
+        // woken owner needs no TASKS hold to read it (`poll_listen_woken`).
+        // Later wakes land in the ring again; the next `listen_park` takes
+        // them in its own hold, so none is lost.
+        if old == TaskState::Blocked && new != TaskState::Blocked && self.listen.parked {
+            self.listen.parked = false;
+            if new == TaskState::Ready && self.listen.on && self.slot != crate::slot::NO_SLOT {
+                let r = core::mem::replace(&mut self.listen.ring, crate::WakeRing::EMPTY);
+                crate::slot::listen_mail_put(self.slot as usize, self.listen.id, &r);
+            }
+        }
         self.state = new;
         if old == TaskState::Zombie || new == TaskState::Zombie {
             crate::percpu::pexit_bump();
@@ -700,6 +714,7 @@ impl Task {
     pub(crate) fn set_state_held(&mut self, new: TaskState) {
         debug_assert!(new != TaskState::Ready);
         let old = self.state;
+        if new == TaskState::Blocked || old == TaskState::Blocked { self.listen.parked = false; }
         self.state = new;
         if old == TaskState::Zombie || new == TaskState::Zombie {
             crate::percpu::pexit_bump();
