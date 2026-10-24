@@ -103,7 +103,18 @@ pub struct SchedSlot {
     pub io_rd: AtomicU64,
     /// sched_setaffinity mask mirror (CPU i = bit i; 0 = every CPU).
     pub aff: AtomicU64,
+    /// The thread's epoll snapshot (lane percpu2; was `Task::ep_cache`
+    /// under TASKS: ~11k TASKS holds/s during video playback). OWNER-ONLY:
+    /// read and written only by the task itself while it holds the run
+    /// guard (`ep_cache_swap`, IRQs masked), and moved out by `on_remove`,
+    /// which runs only after the guard was released (AcqRel CAS in
+    /// `release`, Acquire load in `on_remove`), so the two never overlap.
+    ep_cache: core::cell::UnsafeCell<Option<alloc::boxed::Box<dyn core::any::Any + Send>>>,
 }
+
+// SAFETY: every field but `ep_cache` is atomic; `ep_cache` is owner-only (see
+// its doc), so no two CPUs ever access it at the same time.
+unsafe impl Sync for SchedSlot {}
 
 impl SchedSlot {
     const fn new() -> Self {
@@ -120,6 +131,7 @@ impl SchedSlot {
             sc_ns: AtomicU64::new(0), sc_t0: AtomicU64::new(0), sc_nr: AtomicU32::new(0),
             nvcsw: AtomicU64::new(0), nivcsw: AtomicU64::new(0), minflt: AtomicU64::new(0),
             majflt: AtomicU64::new(0), mm_borrowed: core::sync::atomic::AtomicBool::new(false), io_rd: AtomicU64::new(0), aff: AtomicU64::new(0),
+            ep_cache: core::cell::UnsafeCell::new(None),
         }
     }
 }
@@ -489,7 +501,21 @@ pub(crate) fn on_remove(idx: usize, t: &mut Task) {
     }
     s.gen.fetch_add(1, Ordering::Release);
     s.state.store(0, Ordering::Release);
+    // The epoll snapshot goes with the box (dropped by the reaper outside
+    // every lock); the slot is clean for its next task.
+    // SAFETY: the run guard is clear (checked above), so the owner is gone.
+    let c = unsafe { (*s.ep_cache.get()).take() };
+    if c.is_some() { t.ep_cache = c; }
     t.slot = NO_SLOT;
+}
+
+/// Replace the running task's epoll snapshot in slot `idx` with `c`,
+/// returning the old one. Caller: the task itself, holding the run guard of
+/// `idx`, IRQs masked (`with_current_slot`).
+pub(crate) fn ep_cache_swap(idx: usize, c: Option<alloc::boxed::Box<dyn core::any::Any + Send>>)
+    -> Option<alloc::boxed::Box<dyn core::any::Any + Send>> {
+    // SAFETY: owner-only field, see `SchedSlot::ep_cache`.
+    unsafe { core::mem::replace(&mut *SCHED[idx].ep_cache.get(), c) }
 }
 
 /// Dispatch claims the run guard of `idx` for `cpu` (under `RQ[cpu]`).

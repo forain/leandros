@@ -270,6 +270,8 @@ static DEV: Mutex<Option<Dev>> = Mutex::new(None);
 // ── interrupt (MSI) ──
 /// `iwlwifi.irq=0`: never request the MSI.
 static IRQ_KNOB: AtomicBool = AtomicBool::new(true);
+/// `iwlwifi.quiet=0`: keep the 100 ms housekeeping park while idle.
+static QUIET_KNOB: AtomicBool = AtomicBool::new(true);
 /// The MSI is live: RX and notifications kick their consumers.
 static IRQ_ON: AtomicBool = AtomicBool::new(false);
 /// BAR0 (for the handler, which must not take DEV).
@@ -283,6 +285,24 @@ static RX_REARM_BUSY: AtomicU32 = AtomicU32::new(0);
 /// Driver-thread parks while associated, and how many ended on a kick.
 static THREAD_PARKS: AtomicU32 = AtomicU32::new(0);
 static THREAD_KICKED: AtomicU32 = AtomicU32::new(0);
+/// `rx_rearm` found DEV held inside `with_dev` and left the next look to
+/// that holder's release (instead of another daemon pass).
+static RX_REARM_DEFERRED: AtomicU32 = AtomicU32::new(0);
+/// A `with_dev` caller holds DEV (it checks `RX_DEFER` on release).
+static WITH_DEV_HELD: AtomicBool = AtomicBool::new(false);
+/// The daemon wants a look at the ring once DEV is released.
+static RX_DEFER: AtomicBool = AtomicBool::new(false);
+/// The driver thread is in a quiet (long) park: work that needs its
+/// housekeeping (a TX burst, held reorder frames, a rate-table update)
+/// kicks it.
+static THREAD_QUIET: AtomicBool = AtomicBool::new(false);
+static QUIET_PARKS: AtomicU32 = AtomicU32::new(0);
+/// Beacons of the tracked BSS (what the idle interrupts carry).
+static BCN_RX: AtomicU32 = AtomicU32::new(0);
+/// group << 8 | cmd of the last notification the daemon handed the thread.
+static LAST_KICK_NOTIF: AtomicU32 = AtomicU32::new(0);
+/// Housekeeping park while associated and nothing is due.
+const QUIET_PARK_MS: u64 = 1000;
 /// The driver thread's wake key (an interrupt, or the net daemon queueing a
 /// notification for it).
 const IWL_KEY: u64 = sched::poll_key(sched::poll_class::INET, 0xFFFF_FFE0);
@@ -313,7 +333,10 @@ extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
     IRQS.fetch_add(1, Ordering::Relaxed);
     IRQ_LAST.store(v, Ordering::Relaxed);
     crate::netdev::kick_from_irq();
-    iwl_kick_from_irq();
+    // Link up: the daemon is the ring's servicer and hands notifications and
+    // responses to the thread (`service`). Waking both made them race for
+    // DEV: one drained, the other found nothing or spun on the lock.
+    if !LINK_UP.load(Ordering::Relaxed) { iwl_kick_from_irq(); }
     crate::irq::IrqReturn::Handled
 }
 
@@ -333,7 +356,19 @@ pub fn rx_rearm() -> bool {
     // (`rx_eth`) may still wait, and nobody would kick for them; look again
     // (the holders are short critical sections). Answering false here left
     // them for the 1 s idle cap: SSH round trips of 2-4 s on the laptop.
-    let g = match DEV.try_lock() { Some(g) => g, None => { RX_REARM_BUSY.fetch_add(1, Ordering::Relaxed); return true; } };
+    // Held inside `with_dev`: that holder looks at RX_DEFER on release and
+    // kicks the daemon, so no pass is spent spinning on the lock.
+    let g = match DEV.try_lock() {
+        Some(g) => g,
+        None => {
+            RX_DEFER.store(true, Ordering::SeqCst);
+            match DEV.try_lock() {
+                Some(g) => { RX_DEFER.store(false, Ordering::SeqCst); g }
+                None if WITH_DEV_HELD.load(Ordering::SeqCst) => { RX_REARM_DEFERRED.fetch_add(1, Ordering::Relaxed); return false; }
+                None => { RX_REARM_BUSY.fetch_add(1, Ordering::Relaxed); return true; }
+            }
+        }
+    };
     g.as_ref().map_or(false, |d| !d.rx_eth.is_empty() || d.t.rx_pending())
 }
 
@@ -347,7 +382,7 @@ fn wait_event(max_ms: u64) {
     if !IRQ_ON.load(Ordering::Acquire) || !link_up() || max_ms < 2 { msleep(1); return; }
     irq_rearm();
     if with_dev(|d| d.t.rx_pending() || !d.notifs.is_empty()).unwrap_or(true) { return; }
-    let deadline = sched::monotonic_ns() + max_ms.min(100) * 1_000_000;
+    let deadline = sched::monotonic_ns() + max_ms.min(QUIET_PARK_MS) * 1_000_000;
     THREAD_PARKS.fetch_add(1, Ordering::Relaxed);
     sched::block_on_poll_prepare_tag(deadline, &IWL_PARK);
     if IWL_KICKED.load(Ordering::Acquire) { sched::block_on_poll_cancel(); THREAD_KICKED.fetch_add(1, Ordering::Relaxed); return; }
@@ -411,6 +446,8 @@ struct Dev {
     rx_eth: VecDeque<Vec<u8>>,
     /// `service` runs for the net daemon (`poll_receive`).
     in_netd: bool,
+    /// txs.ok at the last housekeeping tick (`quiet_tick`).
+    quiet_mark: u64,
     rx_frames: u64,
     rx_dropped: u64,
     /// TX counters and histograms; `txs_mark` is the copy at the last
@@ -604,8 +641,37 @@ impl Dev {
         // it may have gone to the side that is not running).
         if IRQ_ON.load(Ordering::Relaxed) {
             if !self.in_netd && self.rx_eth.len() > eth0 { crate::netdev::kick(); }
-            if self.in_netd && (self.notifs.len() > notif0 || self.resps.len() > resp0) { iwl_kick(); }
+            if self.in_netd && (self.notifs.len() > notif0 || self.resps.len() > resp0) {
+                if let Some(p) = self.notifs.back().filter(|_| self.notifs.len() > notif0) {
+                    LAST_KICK_NOTIF.store((p.group as u32) << 8 | p.cmd as u32, Ordering::Relaxed);
+                }
+                iwl_kick();
+            }
+            else if self.in_netd && THREAD_QUIET.load(Ordering::Relaxed) && (self.needs_tick() || self.txs.ok != self.quiet_mark) {
+                THREAD_QUIET.store(false, Ordering::Relaxed);
+                iwl_kick();
+            }
         }
+    }
+
+    /// Something the driver thread's 100 ms housekeeping must look after:
+    /// held reorder frames, TX in flight, a rate table or ADDBA due, ERP.
+    fn needs_tick(&self) -> bool {
+        self.agg.stored() > 0 || self.erp_changed
+            || self.t.txq[BSS_QUEUE].as_ref().map_or(false, |t| t.used() > 0)
+            || self.rc.as_ref().map_or(false, |c| c.pending)
+            || !matches!(self.tagg.state, agg::AggState::Off)
+    }
+
+    /// Nothing due and no frames either way since the last call: the
+    /// housekeeping may park for `QUIET_PARK_MS`.
+    fn quiet_tick(&mut self) -> bool {
+        // TX drives the housekeeping (rate table, ADDBA); received
+        // broadcast chatter does not, and held reorder frames are in needs_tick.
+        let mark = self.txs.ok;
+        let quiet = mark == self.quiet_mark && !self.needs_tick();
+        self.quiet_mark = mark;
+        quiet
     }
 
     fn dispatch(&mut self, p: RxPacket) {
@@ -802,6 +868,7 @@ impl Dev {
         if wf::is_mgmt(fc) {
             let st = wf::subtype(fc);
             if st == wf::fc::STYPE_BEACON && self.track.is_some() && wf::addr3(frame) == self.track && frame.len() > 36 {
+                BCN_RX.fetch_add(1, Ordering::Relaxed);
                 let tsf = cmd::le64(frame, 24).unwrap_or(0);
                 let bi = cmd::le16(frame, 32).unwrap_or(100);
                 if let Some((count, period)) = asc::tim_dtim(&frame[36..]) {
@@ -1019,7 +1086,13 @@ impl Dev {
 
 fn with_dev<R>(f: impl FnOnce(&mut Dev) -> R) -> Option<R> {
     let mut g = DEV.lock();
-    g.as_mut().map(f)
+    WITH_DEV_HELD.store(true, Ordering::SeqCst);
+    let r = g.as_mut().map(f);
+    WITH_DEV_HELD.store(false, Ordering::SeqCst);
+    drop(g);
+    // The daemon's re-arm found DEV held by us: look for it now.
+    if RX_DEFER.swap(false, Ordering::SeqCst) { crate::netdev::kick(); }
+    r
 }
 
 // ── probe (W0) ──────────────────────────────────────────────────────────────
@@ -1028,6 +1101,7 @@ fn with_dev<R>(f: impl FnOnce(&mut Dev) -> R) -> Option<R> {
 pub fn init(cmdline: &str) {
     crate::wifi_mgr::set_knobs(cmdline);
     IRQ_KNOB.store(cmdline_val(cmdline, "iwlwifi.irq") != Some("0"), Ordering::Relaxed);
+    QUIET_KNOB.store(cmdline_val(cmdline, "iwlwifi.quiet") != Some("0"), Ordering::Relaxed);
     if cmdline_val(cmdline, "iwlwifi.disable") == Some("1") {
         log("disabled (iwlwifi.disable=1)");
         return;
@@ -1092,6 +1166,7 @@ pub fn init(cmdline: &str) {
         log("iwlwifi.mgr=1 implies iwlwifi.start=1");
     }
     MGR_ON.store(opts.mgr, Ordering::SeqCst);
+    MGR.set_waker(iwl_kick);
     let func = dev.function();
     let subsys = (func.read16(0x2c), func.read16(0x2e));
     ilog!("found {} 8086:{:04x} at {:02x}:{:02x}.{} (rev {:02x}, subsystem {:04x}:{:04x})",
@@ -1186,7 +1261,7 @@ pub fn init(cmdline: &str) {
     });
     *DEV.lock() = Some(Dev {
         t, func, debug: opts.debug, resps: Vec::new(), notifs: VecDeque::new(), last_phy: None,
-        scanning: false, scan_results: Vec::new(), rx_eth: VecDeque::new(), in_netd: false,
+        scanning: false, scan_results: Vec::new(), rx_eth: VecDeque::new(), in_netd: false, quiet_mark: 0,
         rx_frames: 0, rx_dropped: 0, txs: TxStats::default(), txs_mark: TxStats::default(), rc: None,
         async_cmds: Vec::new(), last_txrsp_ms: [0; 2], fail_logged: 0, erp: None, erp_changed: false, notif_dropped: 0,
         guard: None, last_service_ms: 0, rxs: RxStats::default(), csumcheck: opts.csumcheck,
@@ -1283,7 +1358,7 @@ fn wait_notif(timeout_ms: u64, mut pred: impl FnMut(&RxPacket) -> bool, mut othe
         }
         if fwerr { return Err(Err::FwError); }
         let spent = now_ms() - t0;
-        if spent > timeout_ms { return Err(Err::Timeout("notification")); }
+        if spent > timeout_ms || timeout_ms == 0 { return Err(Err::Timeout("notification")); }
         wait_event(timeout_ms - spent);
     }
 }
@@ -2525,7 +2600,17 @@ fn monitor_once(bssid: &[u8; 6], budget_ms: u64) -> Option<Fail> {
         }).unwrap_or(false);
         if erp_changed { update_erp(); }
         poll_tx_agg(bssid);
-        match wait_notif((budget_ms - spent).min(100), |_| true, |_| {}) {
+        // Nothing due and the link idle: one long park (a notification, a TX
+        // burst, a manager command or held frames kick it), then a look.
+        let quiet = IRQ_ON.load(Ordering::Acquire) && QUIET_KNOB.load(Ordering::Relaxed)
+            && with_dev(|d| d.quiet_tick()).unwrap_or(false);
+        if quiet {
+            THREAD_QUIET.store(true, Ordering::Relaxed);
+            QUIET_PARKS.fetch_add(1, Ordering::Relaxed);
+            wait_event(QUIET_PARK_MS);
+            THREAD_QUIET.store(false, Ordering::Relaxed);
+        }
+        match wait_notif(if quiet { 0 } else { (budget_ms - spent).min(100) }, |_| true, |_| {}) {
             Ok(p) => {
                 if p.group == 0xff && p.cmd == 0 {
                     let f = &p.data[4..];
@@ -3087,10 +3172,11 @@ pub fn info_lines(out: &mut String) {
         let _ = writeln!(out, "firmware: {}", i.fw);
         let _ = writeln!(out, "state: {}", i.state);
         let _ = writeln!(out, "rfkill: {}", if i.rfkill { "on" } else { "off" });
-        let _ = writeln!(out, "irq: {} vector {:#04x} irqs {} empty {} last {:08x} wanted {}; thread parks {} kicked {}; rearm_busy {}",
+        let _ = writeln!(out, "irq: {} vector {:#04x} irqs {} empty {} last {:08x} wanted {}; thread parks {} kicked {} quiet {}; rearm_busy {} deferred {}; beacons {} last_notif {:04x}",
                          if IRQ_ON.load(Ordering::Relaxed) { "msi" } else { "polled" }, IRQ_VECTOR.load(Ordering::Relaxed),
                          IRQS.load(Ordering::Relaxed), IRQ_EMPTY.load(Ordering::Relaxed), IRQ_LAST.load(Ordering::Relaxed),
-                         tr::IRQ_WANTED.load(Ordering::Relaxed) as u8, THREAD_PARKS.load(Ordering::Relaxed), THREAD_KICKED.load(Ordering::Relaxed), RX_REARM_BUSY.load(Ordering::Relaxed));
+                         tr::IRQ_WANTED.load(Ordering::Relaxed) as u8, THREAD_PARKS.load(Ordering::Relaxed), THREAD_KICKED.load(Ordering::Relaxed), QUIET_PARKS.load(Ordering::Relaxed),
+                         RX_REARM_BUSY.load(Ordering::Relaxed), RX_REARM_DEFERRED.load(Ordering::Relaxed), BCN_RX.load(Ordering::Relaxed), LAST_KICK_NOTIF.load(Ordering::Relaxed));
         if i.mcc != [0, 0] { let _ = writeln!(out, "regulatory: {}{}", i.mcc[0] as char, i.mcc[1] as char); }
         if link_up() {
             let _ = writeln!(out, "ssid: {}", wf::ssid_display(&i.ssid));

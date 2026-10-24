@@ -72,7 +72,7 @@ fn disposition(sig: i32) -> u64 {
 
 extern "C" fn usr2_handler(_: i32) {}
 
-pub const NAMES: [&str; 10] = ["exit_settle", "exec_kill", "exec_sibkill", "exec_sibterm", "exec_tidkill", "exec_tidterm", "exec_exit", "exec_state", "leaderless_exit", "exec_leaderless"];
+pub const NAMES: [&str; 11] = ["exit_settle", "exec_kill", "exec_sibfault", "exec_sibkill", "exec_sibterm", "exec_tidkill", "exec_tidterm", "exec_exit", "exec_state", "leaderless_exit", "exec_leaderless"];
 
 /// Run proclife mode `name` for `iters` iterations; prints PASS/FAIL.
 pub fn run(name: &str, iters: usize) -> bool {
@@ -83,6 +83,7 @@ pub fn run(name: &str, iters: usize) -> bool {
         "exec_sibterm" => exec_sibkill(iters, true),
         "exec_tidkill" => exec_tidkill(iters.max(300), false),
         "exec_tidterm" => exec_tidkill(iters.max(300), true),
+        "exec_sibfault" => exec_sibfault(iters.max(300)),
         "exec_exit" => exec_exit(iters),
         "exec_state" => exec_state(iters.min(20)),
         "leaderless_exit" => leaderless_exit(iters.min(20)),
@@ -540,6 +541,93 @@ fn exec_tidkill(iters: usize, term: bool) -> Result<String, String> {
         }
     }
     Ok(format!("{}/{}, killed {} / exec won {}", iters, iters, hit, survived))
+}
+
+/// exec_sibfault (lane faultclaim): a sibling thread's NULL store (default
+/// SIGSEGV) races an execve — by the leader on even iterations, by a third
+/// thread on odd ones — with the two delays swept against each other. The
+/// outcome must be one or the other, never both: either the fault ends the
+/// group (WTERMSIG == SIGSEGV, the new image never ran: no `P` line, no
+/// marker file), or the exec won (the image ran, and dies only by the
+/// parent's SIGKILL). The fault path used to decide on the kill in one
+/// RUN_QUEUE hold and claim the group exit in a later one.
+fn exec_sibfault(iters: usize) -> Result<String, String> {
+    let _ = std::fs::create_dir_all(MARK_DIR);
+    let (mut faulted, mut exec_won) = (0usize, 0usize);
+    for it in 0..iters {
+        let mut rp = [0i32; 2];
+        unsafe { pipe(rp.as_mut_ptr()); }
+        let pid = unsafe { fork() };
+        if pid < 0 { return Err(format!("fork failed at {}", it)); }
+        if pid == 0 {
+            unsafe { close(rp[0]); }
+            let res = rp[1];
+            let go = Arc::new(AtomicBool::new(false));
+            for _ in 0..4 { thread::spawn(|| spin_forever()); }
+            let fault_us = (it % 64) as u64 * 8;
+            let exec_us = ((it * 37) % 64) as u64 * 8;
+            {
+                let go = go.clone();
+                thread::spawn(move || {
+                    while !go.load(Ordering::SeqCst) { core::hint::spin_loop(); }
+                    spin_for(Duration::from_micros(fault_us));
+                    unsafe { core::ptr::write_volatile(core::ptr::null_mut::<u32>(), 1); }
+                    spin_forever()
+                });
+            }
+            let do_exec = move || {
+                let path = cstr("/bin/killmt");
+                let args = [cstr("killmt"), cstr("--exec-spin"), cstr(&res.to_string())];
+                let argv: [*const u8; 4] = [args[0].as_ptr(), args[1].as_ptr(), args[2].as_ptr(), core::ptr::null()];
+                let envp: [*const u8; 1] = [core::ptr::null()];
+                spin_for(Duration::from_micros(exec_us));
+                unsafe { execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()); _exit(99); }
+            };
+            spin_for(Duration::from_millis(1));
+            go.store(true, Ordering::SeqCst);
+            if it % 2 == 0 { do_exec(); }
+            let h = thread::spawn(do_exec);
+            let _ = h.join();
+            spin_forever()
+        }
+        unsafe { close(rp[1]); }
+        let mut text = String::new();
+        let t0 = Instant::now();
+        loop {
+            let mut b = [0u8; 64];
+            let n = unsafe { read(rp[0], b.as_mut_ptr(), b.len()) };
+            if n <= 0 { break; }
+            text.push_str(&String::from_utf8_lossy(&b[..n as usize]));
+            if text.contains('P') || t0.elapsed() > Duration::from_secs(10) { break; }
+        }
+        unsafe { close(rp[0]); }
+        let ran = text.contains('P');
+        if ran { unsafe { kill(pid, SIGKILL); } }
+        let st = match wait_bounded(pid, 0, Duration::from_secs(10)) {
+            Some(s) => s,
+            None => {
+                let diag = proc_diag(pid);
+                unsafe { kill(pid, SIGKILL); }
+                let _ = wait_bounded(pid, 0, Duration::from_secs(10));
+                return Err(format!("it {}: child {} neither died nor exec'd [{}]", it, pid, diag));
+            }
+        };
+        let mark = format!("{}/img-{}", MARK_DIR, pid);
+        let marked = std::fs::metadata(&mark).is_ok();
+        let _ = std::fs::remove_file(&mark);
+        if ran || marked {
+            if !(wifsignaled(st) && wtermsig(st) == SIGKILL) {
+                return Err(format!("it {}: new image ran (P {}, mark {}) but status 0x{:x}, expected the parent's SIGKILL", it, ran, marked, st));
+            }
+            exec_won += 1;
+        } else {
+            if !(wifsignaled(st) && wtermsig(st) == SIGSEGV) {
+                return Err(format!("it {}: status 0x{:x}, expected SIGSEGV (no image ran)", it, st));
+            }
+            faulted += 1;
+        }
+    }
+    Ok(format!("{}/{}, fault won {} / exec won {}", iters, iters, faulted, exec_won))
 }
 
 static SIB_TID: AtomicUsize = AtomicUsize::new(0);

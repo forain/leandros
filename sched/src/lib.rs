@@ -3613,6 +3613,19 @@ impl PollSet {
         if t.bits & !keyed != 0 { self.n_unkeyed = self.n_unkeyed.saturating_add(1); }
     }
     /// Add bloom bits with no key (an epoll instance's own tag, a nested set).
+    /// An object only ever woken by its exact key (`wake_poll_key`) and no
+    /// probe answer carries (an epoll instance's own key): its bit plus its
+    /// fingerprint, unkeyed only when the fingerprint table is full.
+    pub fn add_key(&mut self, k: u64) {
+        let b = poll_key_bit(k);
+        if self.nfp >= POLL_FP_MAX { self.add_bits(b); return; }
+        if !self.fps[..self.nfp].contains(&poll_key_fp(k)) {
+            self.fps[self.nfp] = poll_key_fp(k);
+            self.nfp += 1;
+        }
+        self.mask |= b;
+        self.n_keyed = self.n_keyed.saturating_add(1);
+    }
     pub fn add_bits(&mut self, bits: u64) {
         if bits == POLL_TAG_ALL { self.xoff = true; }
         self.mask |= bits;
@@ -3950,55 +3963,49 @@ pub fn poll_listen_end() {
 /// and, when listening, its id and ring — one RUN_QUEUE hold.
 pub fn poll_listen_enter() -> (Option<alloc::boxed::Box<dyn core::any::Any + Send>>, Option<(u32, WakeRing)>) {
     let pid = current_pid();
+    let c = ep_cache_swap_current(None);
     let mut rq = RUN_QUEUE.lock();
-    match rq.find_pid_mut(pid) {
-        Some(t) => {
-            let c = t.ep_cache.take();
-            let l = if t.listen.on {
-                let r = t.listen.ring;
-                t.listen.ring = WakeRing::EMPTY;
-                Some((t.listen.id, r))
-            } else { None };
-            (c, l)
+    let l = match rq.find_pid_mut(pid) {
+        Some(t) if t.listen.on => {
+            let r = t.listen.ring;
+            t.listen.ring = WakeRing::EMPTY;
+            Some((t.listen.id, r))
         }
-        None => (None, None),
-    }
+        _ => None,
+    };
+    (c, l)
+}
+
+/// The running task's epoll snapshot, swapped without RUN_QUEUE (lane
+/// percpu2): it lives in the task's `SchedSlot` and only the task itself
+/// touches it (see `SchedSlot::ep_cache`). With no current slot (cannot
+/// happen in task context) `c` is handed back.
+fn ep_cache_swap_current(c: Option<alloc::boxed::Box<dyn core::any::Any + Send>>)
+    -> Option<alloc::boxed::Box<dyn core::any::Any + Send>> {
+    let fl = ksync::irq_save();
+    let cpu = unsafe { cpu_id() };
+    let i = if cpu < MAX_CPUS { CURRENT_SLOT[cpu].load(Ordering::Relaxed) } else { usize::MAX };
+    let r = if i < runqueue::MAX_TASKS { slot::ep_cache_swap(i, c) } else { c };
+    ksync::irq_restore(fl);
+    r
 }
 
 /// Store the thread's epoll snapshot back (see `poll_listen_enter`).
 pub fn poll_listen_store(c: Option<alloc::boxed::Box<dyn core::any::Any + Send>>) {
-    let pid = current_pid();
-    let old = {
-        let mut rq = RUN_QUEUE.lock();
-        match rq.find_pid_mut(pid) {
-            Some(t) => core::mem::replace(&mut t.ep_cache, c),
-            None => c,
-        }
-    };
-    drop(old); // freed outside RUN_QUEUE
+    drop(ep_cache_swap_current(c)); // freed with IRQs enabled again
 }
 
-/// Park the thread's epoll snapshot in its `Task` for the duration of a sleep:
+/// Park the thread's epoll snapshot in its slot for the duration of a sleep:
 /// a thread killed while blocked is reaped without unwinding its kernel
-/// stack, so a snapshot held only in a local would leak (lane leakres).
+/// stack, so a snapshot held only in a local would leak (lane leakres); the
+/// reap moves it into the Task box (`slot::on_remove`), which frees it.
 pub fn ep_cache_put(c: alloc::boxed::Box<dyn core::any::Any + Send>) {
-    let pid = current_pid();
-    let old = {
-        let mut rq = RUN_QUEUE.lock();
-        match rq.find_pid_mut(pid) {
-            Some(t) => core::mem::replace(&mut t.ep_cache, Some(c)),
-            None => Some(c),
-        }
-    };
-    drop(old);
+    drop(ep_cache_swap_current(Some(c)));
 }
 
-/// Take back what `ep_cache_put` stored (only the snapshot; the listener
-/// ring is untouched).
+/// Take back what `ep_cache_put` stored.
 pub fn ep_cache_get() -> Option<alloc::boxed::Box<dyn core::any::Any + Send>> {
-    let pid = current_pid();
-    let mut rq = RUN_QUEUE.lock();
-    rq.find_pid_mut(pid).and_then(|t| t.ep_cache.take())
+    ep_cache_swap_current(None)
 }
 
 /// Wake every task blocked on the poll wait-channel. Callers (edge publishers
@@ -4072,9 +4079,9 @@ pub fn try_wake_poll_key(key: u64) -> bool {
 /// waiters (tag `poll_tag(EPOLL, slot)`) computed their masks without the new
 /// fd, and must be reachable by that fd's own later wake. Widening a mask can
 /// only add wakes, never lose one. Task context (takes RUN_QUEUE).
-pub fn widen_poll_masks(match_tag: u64, add: u64) {
+pub fn widen_poll_masks(match_key: u64, add: u64) {
     if add == 0 { return; }
-    RUN_QUEUE.lock().widen_port_masks(POLL_WAIT_CHANNEL, match_tag, add);
+    RUN_QUEUE.lock().widen_port_masks(POLL_WAIT_CHANNEL, match_key, add);
 }
 
 /// A `wake_poll` that has been asked for but not yet paid for, as an OR of the

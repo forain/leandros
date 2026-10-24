@@ -6044,6 +6044,12 @@ fn gen_wakestat() -> Option<VnodeKind> {
             sched::wakestat::EP_USELESS.load(Relaxed),
             sched::wakestat::EP_PROBE_NS.load(Relaxed),
             sched::wakestat::EP_FILT_NS.load(Relaxed));
+        {
+            let n = &sched::wakestat::EP_NAMELESS;
+            let _ = writeln!(s, "# epnameless named {} all {} deadline {} others {} self {} keys {} bits {} empty {} disarmed {}",
+                n[0].load(Relaxed), n[1].load(Relaxed), n[2].load(Relaxed), n[3].load(Relaxed),
+                n[4].load(Relaxed), n[5].load(Relaxed), n[6].load(Relaxed), n[7].load(Relaxed), n[8].load(Relaxed));
+        }
         let _ = writeln!(s, "# pollx calls {} probes {} parks {} useless {} exclskip {} preskip {}",
             sched::wakestat::PO_CALLS.load(Relaxed),
             sched::wakestat::PO_PROBES.load(Relaxed),

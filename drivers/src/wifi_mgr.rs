@@ -52,7 +52,7 @@
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use netctl_abi::profiles::Profile;
@@ -560,6 +560,9 @@ pub struct Mgr {
     mac_fn: fn() -> Option<[u8; 6]>,
     ifindex: AtomicU32,
     cmds: Mutex<VecDeque<WifiCmd>>,
+    /// The radio thread's wake-up (`set_waker`): a queued command ends a
+    /// long park instead of waiting for it.
+    waker: AtomicUsize,
     st: Mutex<St>,
     events: Mutex<(u64, VecDeque<(u64, u64, WifiEvent)>)>,
     ifname: Mutex<[u8; 16]>,
@@ -571,6 +574,7 @@ impl Mgr {
             name, prefix, mac_fn,
             ifindex: AtomicU32::new(0),
             cmds: Mutex::new(VecDeque::new()),
+            waker: AtomicUsize::new(0),
             st: Mutex::new(St {
                 ws: NcWifiState {
                     ifindex: 0, state: wifi_state::UNAVAILABLE, reason: reason::NONE, akm: akm::AUTO, pmf: 0,
@@ -708,6 +712,9 @@ impl Mgr {
     }
 
     // ── commands ──
+
+    /// Called after every queued command (the radio thread may be parked).
+    pub fn set_waker(&self, f: fn()) { self.waker.store(f as usize, Ordering::Release); }
 
     fn pop_cmd(&self) -> Option<WifiCmd> { self.cmds.lock().pop_front() }
 
@@ -1044,6 +1051,13 @@ impl WifiBackend for Mgr {
         }
         if q.len() >= CMD_QUEUE_MAX { return Err(11 /* EAGAIN */); }
         q.push_back(cmd);
+        drop(q);
+        let w = self.waker.load(Ordering::Acquire);
+        if w != 0 {
+            // SAFETY: only `set_waker` stores here, and it stores a `fn()`.
+            let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(w) };
+            f();
+        }
         Ok(())
     }
 
