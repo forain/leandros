@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DRV = os.path.join(HERE, "driver.py")
 BOUND = 3000.0  # daemon passes per MB moved
 IMM_BOUND = 100.0  # immediate (poll_delay 0) re-polls per MB moved
+RATE_SHARE = 0.5  # shaped download: share of the link RX rate it must reach
 
 
 class Zeros(http.server.BaseHTTPRequestHandler):
@@ -113,16 +114,28 @@ def main(argv):
         why = re.findall(r"^netd_why: kicked (\d+) rearm (\d+) timer_sleeps (\d+) .*? early (\d+) active (\d+) immediate (\d+) tx_held (\d+) timer_expired (\d+) timer_hist (\d+)/(\d+)/(\d+)/(\d+)", out, re.M)
         st = [l.split() for l in re.findall(r"^ST (.*)$", out, re.M)]
         g = re.search(r"NETCHECK get: (\w+) .*?([\d.]+) MB in ([\d.]+) s = ([\d.]+) Mbit/s", out)
-        print("\n".join(re.findall(r"^(?:netd_(?:why|kick): |NETCHECK|  get\|).*$", out, re.M)[-12:]), flush=True)
+        print("\n".join(re.findall(r"^(?:netd_(?:why|kick): |shape: |tcp_recovery: |tcp_rx: |neighbor: |eth0|NETCHECK|  get\|).*$", out, re.M)[-16:]), flush=True)
         if lg.returncode == 0 and len(s) == 2 and g and g.group(1) == "PASS":
             dt = s[1][0] - s[0][0]
             mb, gsecs, mbit = float(g.group(2)), float(g.group(3)), float(g.group(4))
             passes = s[1][1] - s[0][1]
             ppmb = passes / mb if mb else float("inf")
             ok = ppmb < BOUND and len(why) == 2
+            # Shaped download: the stack must sustain >= half the link's RX rate
+            # (before SACK on active opens it got 0.6 of 20 Mbit/s: one hole
+            # repaired per sender RTO after the slow-start overshoot).
+            rate_ok = True
+            if shape and not tx:
+                f = shape.split(":")
+                rx_kbit = int(f[2]) if len(f) > 2 and f[2].isdigit() else 0
+                if rx_kbit:
+                    rate_ok = mbit >= RATE_SHARE * rx_kbit / 1000.0
+                    print(f"shaped download: {mbit:.1f} Mbit/s of {rx_kbit / 1000.0:.1f} "
+                          f"(need >= {RATE_SHARE * rx_kbit / 1000.0:.1f}): {'PASS' if rate_ok else 'FAIL'}", flush=True)
+            ok = ok and rate_ok
             if len(why) == 2:
                 d = [int(b) - int(a) for a, b in zip(*why)]
-                ok = ok and d[5] / mb < IMM_BOUND
+                ok = ok and d[5] / max(mb, 1e-9) < IMM_BOUND
                 print(f"delta kicked {d[0]} rearm {d[1]} timer_sleeps {d[2]} early {d[3]} active {d[4]} "
                       f"immediate {d[5]} tx_held {d[6]} timer_expired {d[7]} timer_hist(<100us/<1ms/<10ms/>=10ms) {d[8]}/{d[9]}/{d[10]}/{d[11]}", flush=True)
             cpu = ""
@@ -130,7 +143,7 @@ def main(argv):
                 ticks = sum(int(st[1][i]) - int(st[0][i]) for i in (13, 14))
                 cpu = f", netd cpu {ticks / dt:.1f}% (ticks/s at 100 Hz)"
             detail = (f"{mb:.1f} MB in {gsecs:.2f} s = {mbit:.1f} Mbit/s, daemon passes {passes / dt:.0f}/s, "
-                      f"{ppmb:.0f} passes/MB (bound {BOUND:.0f}), immediate {d[5] / mb if len(why) == 2 else -1:.0f}/MB (bound {IMM_BOUND:.0f}){cpu}")
+                      f"{ppmb:.0f} passes/MB (bound {BOUND:.0f}), immediate {d[5] / max(mb, 1e-9) if len(why) == 2 else -1:.0f}/MB (bound {IMM_BOUND:.0f}){cpu}")
         else:
             detail = f"login rc={lg.returncode} samples={s} get={g.group(0) if g else None} out={out[-300:]!r}"
         print(f"bulk: {'PASS' if ok else 'FAIL'} {detail}", flush=True)
