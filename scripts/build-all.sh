@@ -365,6 +365,11 @@ build_doom() {
     # target/doom/), never from the shared ../doomgeneric/doom-$arch, which
     # whichever tree linked last owns. See Makefile.leandros on DOOM_BIN.
     mkdir -p "$ROOT_DIR/target/doom"
+    if [[ "$arch" == "x86_64" ]]; then
+        # C callers pass doubles in xmm0; the soft-float libc must export
+        # trampolines, or DOOM's synth computes garbage and clips.
+        python3 "$ROOT_DIR/scripts/check-c-float-abi.py" "$objdir/doom-$arch" || return 1
+    fi
     cp -f "$objdir/doom-$arch" "$ROOT_DIR/target/doom/doom-$arch"
 }
 
