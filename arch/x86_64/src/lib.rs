@@ -114,9 +114,10 @@ pub fn init(info: &boot::BootInfo) {
         apic::init();
 
         ioapic::init(info.hhdm_offset, root);
-        // Route IRQ 1 (keyboard) -> the BSP, Vector 33. (The BSP's APIC ID is
-        // usually but not necessarily 0.)
-        ioapic::set_irq(1, cpus::bsp_apic_id().min(0xFF) as u8, 33);
+        ioapic::load_overrides(info.rsdp_addr, info.hhdm_offset);
+        // Route IRQ 1 (keyboard) -> the BSP, Vector 33, through the MADT
+        // overrides. (The BSP's APIC ID is usually but not necessarily 0.)
+        ioapic::set_isa_irq(1, cpus::bsp_apic_id().min(0xFF) as u8, 33);
         boot::earlyfb::mark(5);
     }
     #[cfg(target_arch = "x86_64")]

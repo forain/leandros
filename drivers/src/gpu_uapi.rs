@@ -60,6 +60,13 @@ pub struct UapiBackend {
     /// ours (falls through to the generic dispatch and its unknown-ioctl
     /// report). Runs on the caller's thread, in its address space.
     pub ioctl: fn(cmd: u32, arg: usize, open_id: u32) -> Option<Result<usize, DriverError>>,
+    /// The backend does every access to its ioctl argument through
+    /// `sched::uaccess` (range-checked, fault-tolerant), so its private block
+    /// (nr DRM_COMMAND_BASE..DRM_COMMAND_END) gets the caller's pointer, not
+    /// the DRM layer's kernel bounce copy: uaccess refuses a kernel address
+    /// (reads come back zeroed, stores are dropped). false = the backend reads
+    /// the argument struct raw and needs the bounce (SMAP/PAN).
+    pub user_args: bool,
     /// GEM_CLOSE of `handle`, if the handle is ours.
     pub gem_close: fn(handle: u32, open_id: u32) -> Option<Result<usize, DriverError>>,
     /// mmap token -> (physical address, map uncached), if the token is ours.
