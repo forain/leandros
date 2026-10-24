@@ -326,15 +326,53 @@ pub const NETD_KEY: u64 = sched::poll_key(sched::poll_class::INET, 0xFFFF_FFF0);
 static KICKED: AtomicBool = AtomicBool::new(false);
 
 /// Wake the net daemon now (task context, no server lock held).
+#[track_caller]
 pub fn kick() {
-    if !KICKED.swap(true, Ordering::AcqRel) { sched::wake_poll_key(NETD_KEY); }
+    if !KICKED.swap(true, Ordering::AcqRel) {
+        kick_site(core::panic::Location::caller());
+        sched::wake_poll_key(NETD_KEY);
+    }
+}
+
+/// Effective kicks (the ones that set `KICKED` and paid for a wake) by call
+/// site, with the pid that made the last one: /proc/net/nic `netd_kick`.
+const KICK_SITES: usize = 32;
+static KICK_LOC: [AtomicUsize; KICK_SITES] = [const { AtomicUsize::new(0) }; KICK_SITES];
+static KICK_CNT: [core::sync::atomic::AtomicU64; KICK_SITES] = [const { core::sync::atomic::AtomicU64::new(0) }; KICK_SITES];
+static KICK_PID: [AtomicUsize; KICK_SITES] = [const { AtomicUsize::new(0) }; KICK_SITES];
+
+fn kick_site(loc: &'static core::panic::Location<'static>) {
+    let key = loc as *const _ as usize;
+    for i in 0..KICK_SITES {
+        let cur = KICK_LOC[i].load(Ordering::Relaxed);
+        let hit = cur == key || (cur == 0 && KICK_LOC[i]
+            .compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed)
+            .map_or_else(|v| v == key, |_| true));
+        if hit {
+            KICK_CNT[i].fetch_add(1, Ordering::Relaxed);
+            KICK_PID[i].store(sched::current_pid() as usize, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Visit every recorded kick site: (file, line, count, last pid).
+pub fn kick_sites(f: &mut dyn FnMut(&'static str, u32, u64, usize)) {
+    for i in 0..KICK_SITES {
+        let key = KICK_LOC[i].load(Ordering::Acquire);
+        if key == 0 { break; }
+        let loc = unsafe { &*(key as *const core::panic::Location<'static>) };
+        f(loc.file(), loc.line(), KICK_CNT[i].load(Ordering::Relaxed), KICK_PID[i].load(Ordering::Relaxed));
+    }
 }
 
 /// `kick` for interrupt context: a bounded try-lock; when contended the wake
 /// is deferred to the next tick rather than lost.
+#[track_caller]
 pub fn kick_from_irq() {
-    if !KICKED.swap(true, Ordering::AcqRel) && !sched::try_wake_poll_key(NETD_KEY) {
-        sched::request_poll_wake_key(NETD_KEY);
+    if !KICKED.swap(true, Ordering::AcqRel) {
+        kick_site(core::panic::Location::caller());
+        if !sched::try_wake_poll_key(NETD_KEY) { sched::request_poll_wake_key(NETD_KEY); }
     }
 }
 
