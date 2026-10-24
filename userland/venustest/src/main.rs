@@ -1973,7 +1973,11 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
         // reports how many slots are free right now, so the boundary is exact
         // whatever else holds a context. Older kernels: the historical 16.
         const N_MAX: usize = 256;
-        let free = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_FREE_CTXS);
+        // (The main fd is closed by now: ask through a probe open, which
+        // holds no context of its own.)
+        let probe = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let free = if probe >= 0 { getparam_quiet(probe, VIRTGPU_PARAM_LEANDROS_FREE_CTXS) } else { u64::MAX };
+        if probe >= 0 { close(probe); }
         let n_ctx: usize = if free == u64::MAX || free == 0 { 16 } else { (free as usize).min(N_MAX) };
         let n_try: usize = n_ctx + 1;
         out(b"  free context slots = "); out_u64(n_ctx as u64); out(b"\n");
