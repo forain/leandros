@@ -13,5 +13,10 @@ pub mod platform;
 #[path = "../../src/msc/mod.rs"]
 pub mod msc;
 
+#[path = "../../src/hubproto.rs"]
+pub mod hubproto;
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod hubproto_tests;
