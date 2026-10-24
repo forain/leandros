@@ -181,6 +181,9 @@ SUITES = {
                 "host:netflaptest.py",
                 # Idle net-daemon wake bound (own boot): netidletest.py.
                 "host:netidletest.py",
+                # Bulk upload over a Wi-Fi-like shaped link: no spinning on a
+                # full driver TX queue (own boot): nettxtest.py.
+                "host:nettxtest.py --tx --shape eth0:20000:20000:64:256:2",
                 # IP fragmentation, ICMP errors, IGMP, broadcast, cmsgs against
                 # a frame-level host peer on a second NIC: udppeertest.py.
                 "host:udppeertest.py"],
@@ -190,6 +193,8 @@ SUITES = {
     "udppeer": ["host:udppeertest.py"],
     # netidletest.py alone.
     "netidle": ["host:netidletest.py"],
+    # nettxtest.py alone (shaped upload).
+    "nettx": ["host:nettxtest.py --tx --shape eth0:20000:20000:64:256:2"],
     # gpuprobe gl is what gpu-env runs before COSMIC; RC=0 only on a hardware
     # renderer (2 = software, 139 = the strict-PAN DRM ioctl SIGSEGV of L11.13).
     # i915 UAPI end to end on the fake device (soft command streamer), the
