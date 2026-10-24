@@ -21,8 +21,13 @@
 - TCG `mm.hhdmfill=1`: `wrote 1 x 1G ... patched 1`, memtest PASS. TCG `2m`: `512 x 2M, 1 new table page`, memtest PASS.
 - HVF `mm.hhdmfill=1`: `wrote 1 x 1G, patched 1`, memtest 1/1 PASS (35 s); HVF `2m`: `512 x 2M, 1 table`, DTB found, memtest PASS.
 - HVF default boot: `mapped 1 ranges, patched 0`, memtest PASS (unchanged).
-- After making fill the default: see "Final" below.
+- Fill as default (no knob), TCG `earlyfb.test=unmap4g1`: `1 x 1G, patched 1`, DTB found, memtest PASS (151 s).
+- HVF full regress on the final build: 45/45 suites PASS (hhf-reg). x86_64 release build OK.
 - Host walker tests 11/11.
 
 ## Change of default
 - Fill now runs by default on aarch64 (as on x86_64); `mm.hhdmfill=0` = report-only, `2m` = no 1 GiB blocks.
+
+## Open
+- Real-hardware aarch64 HHDM gaps are still unobserved (QEMU's Limine HHDM is complete); the knob only simulates one.
+- Any other early code that relies on an `AT` probe of a lower-half address can be fooled by stale firmware TLB entries in the same way.
