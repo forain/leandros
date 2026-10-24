@@ -1530,7 +1530,8 @@ unsafe fn mnt_pass_once(path: &[u8], mode: u32) -> bool {
     let (_n, _f, rfd, _cl) = recv_fd_and_byte(sv[1], 32, 0);
     let mut rbuf = [0u8; 5];
     let got = if rfd >= 0 { read(rfd, rbuf.as_mut_ptr(), 5) } else { -1 };
-    dbg2(b"[fd_pass_mnt] mode=%d read via received fd -> %d\n\0", mode as i64, got as i64);
+    let same = &rbuf == b"MNTOK";
+    printf(b"[fd_pass_mnt] mode=%d read via received fd -> %d content_ok=%d\n\0".as_ptr(), mode as u64, got as u64, same as u64, 0);
     if o2 >= 0 { close(o2); unlink(opath.as_ptr()); }
     if rfd >= 0 { close(rfd); }
     if sv[0] >= 0 { close(sv[0]); }
