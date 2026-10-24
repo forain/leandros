@@ -855,9 +855,10 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             );
             hhdm_offset = BOOT_INFO.hhdm_offset;
 
-            // aarch64 DTB fallback: deferred to after arch_aarch64::init() because
-            // device_tree::parse emits SIMD instructions (struct zeroing), and SIMD
-            // is not enabled until enable_identity() runs inside arch::init().
+            // aarch64 DTB fallback (no Limine DTB): `early_dtb_ram_scan`, run
+            // just before the allocator is seeded so the blob's reserved
+            // ranges are honoured. The kernel is soft-float (-neon), so
+            // `device_tree::parse` needs no SIMD enable.
         }
     } else {
         #[cfg(target_arch = "aarch64")]
@@ -1299,6 +1300,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     }
     early_reserve_knob();
     #[cfg(target_arch = "aarch64")]
+    if is_limine { early_dtb_ram_scan(hhdm_offset as usize); }
+    #[cfg(target_arch = "aarch64")]
     early_dtb_reserve();
     // A kexec'ing LeandrOS left its final log for us (kexec/prevlog.rs).
     kexec::prevlog::reserve_early(unsafe { &*core::ptr::addr_of!(BOOT_INFO) });
@@ -1407,21 +1410,21 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     unsafe {
         if is_limine && (BOOT_INFO.uart_base == 0 || BOOT_INFO.pci_ecam_base == 0) {
             serial_print_str("[MAIN] DTB not found via Limine, searching in RAM...\n");
-            let start = 0x40000000 + hhdm_offset as usize;
-            let mut found = false;
-            for i in 0..8192 {
-                let addr = start + i * 4096;
-                if boot::device_tree::is_valid_dtb(addr) {
+            // The scan and parse ran before the allocator was seeded
+            // (`early_dtb_ram_scan`), so the blob's reserved ranges are
+            // already out of the buddy; only uart/ecam are applied here, at
+            // the same point in boot as before.
+            let found = match *EARLY_RAM_DTB.lock() {
+                Some((phys, uart, ecam)) => {
                     serial_print_str("[MAIN] Found DTB in RAM at ");
-                    serial_print_hex(addr - hhdm_offset as usize);
+                    serial_print_hex(phys);
                     serial_print_str("\n");
-                    let dtb_info = boot::device_tree::parse(addr);
-                    if BOOT_INFO.uart_base == 0 { BOOT_INFO.uart_base = dtb_info.uart_base; }
-                    if BOOT_INFO.pci_ecam_base == 0 { BOOT_INFO.pci_ecam_base = dtb_info.pci_ecam_base; }
-                    found = true;
-                    break;
+                    if BOOT_INFO.uart_base == 0 { BOOT_INFO.uart_base = uart; }
+                    if BOOT_INFO.pci_ecam_base == 0 { BOOT_INFO.pci_ecam_base = ecam; }
+                    true
                 }
-            }
+                None => false,
+            };
             if !found {
                 serial_print_str("[MAIN] DTB search failed.\n");
                 // UART is always at 0x09000000 on QEMU virt regardless of highmem setting.
@@ -1510,6 +1513,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         #[cfg(target_arch = "aarch64")]
         drivers::pci::set_max_bus(max_bus);
         drivers::pci::init_pci(pci_virt);
+        drivers::usb_hcd::early_quiesce();
     }
     early_mark(14);
 
@@ -1792,6 +1796,8 @@ fn kfacil_init(hhdm_offset: u64) {
     mm::atomic_pool::set_irq_query(sched::irqctx::in_interrupt);
     #[cfg(target_arch = "x86_64")]
     drivers::pci::init_ecam_from_acpi(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr }, hhdm_offset);
+    #[cfg(target_arch = "x86_64")]
+    drivers::usb_hcd::early_quiesce();
     #[cfg(not(target_arch = "x86_64"))]
     let _ = hhdm_offset;
 }
@@ -2373,6 +2379,45 @@ fn early_reserve_knob() {
         serial_print_hex(b as usize);
         serial_print_str("\n");
     }
+}
+
+/// (phys, uart_base, pci_ecam_base) of a DTB found by the pre-mm RAM scan.
+#[cfg(target_arch = "aarch64")]
+static EARLY_RAM_DTB: spin::Mutex<Option<(usize, u64, u64)>> = spin::Mutex::new(None);
+
+/// Limine handed us no DTB (UEFI+ACPI, or a loader that leaves one in RAM):
+/// look for one in the first 32 MiB of RAM *before* `mm::init_with_map`, so
+/// its `/memreserve/` and `/reserved-memory` ranges reach `early_dtb_reserve`
+/// while `buddy::reserve_range` still works. Until 2026-10-23 this scan ran
+/// after the allocator was up and only uart/ecam were taken from it. The
+/// kernel is built soft-float, so `parse` is safe before `arch_aarch64::init`;
+/// the bootloader's HHDM maps only memory-map regions, so every page is
+/// probed with `AT S1E1R` first and unmapped ones are skipped, not faulted on.
+#[cfg(target_arch = "aarch64")]
+fn early_dtb_ram_scan(hhdm: usize) {
+    let bi = unsafe { &*core::ptr::addr_of!(BOOT_INFO) };
+    if bi.uart_base != 0 && bi.pci_ecam_base != 0 { return; }
+    let (hit, skipped) = unsafe {
+        boot::device_tree::scan_for_dtb(0x4000_0000 + hhdm, 8192, &mut |va| {
+            let par: u64;
+            core::arch::asm!("at s1e1r, {va}", "isb", "mrs {par}, par_el1",
+                             va = in(reg) va, par = out(reg) par, options(nostack));
+            par & 1 == 0
+        })
+    };
+    serial_print_str("[early] dtb ram scan: ");
+    match hit {
+        Some(va) => {
+            let info = unsafe { boot::device_tree::parse(va) };
+            *EARLY_RAM_DTB.lock() = Some((va - hhdm, info.uart_base, info.pci_ecam_base));
+            serial_print_str("found at ");
+            serial_print_hex(va - hhdm);
+        }
+        None => serial_print_str("none"),
+    }
+    serial_print_str(" (unmapped pages skipped: ");
+    serial_print_hex(skipped);
+    serial_print_str(")\n");
 }
 
 /// Keep the allocator off every DTB `/memreserve/` entry and `/reserved-memory`

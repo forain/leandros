@@ -60,6 +60,7 @@ use crate::uapi_vm::{Backing, VmOps, VmState};
 const ENOENT: i32 = 2;
 const EINTR: i32 = 4;
 const EIO: i32 = 5;
+const EFAULT: i32 = 14;
 const ENOMEM: i32 = 12;
 const EBUSY: i32 = 16;
 const EEXIST: i32 = 17;
@@ -413,14 +414,23 @@ static MMAP_TOKENS: spin::Mutex<BTreeMap<u64, u64>> = spin::Mutex::new(BTreeMap:
 
 // ---------------------------------------------------------- user copy --
 
+// Every user access goes through `sched::uaccess` (SMAP/PAN-safe: a raw
+// access to user memory faults on x86_64 with SMAP on; fault-tolerant on a
+// bad pointer). The backend registers `user_args: true`, so `arg` is the
+// caller's pointer, never the DRM layer's kernel bounce copy (which uaccess
+// would refuse). The argument layouts are plain integers, so a struct that
+// cannot be read is all zeros (handle 0 / null pointers / count 0 — each
+// rejected by its caller), and a store to an unwritable address is dropped.
 fn read_user<T: Copy + Default>(addr: u64) -> T {
-    unsafe { ptr::read_unaligned(addr as *const T) }
+    sched::uaccess::read_user::<T>(addr as usize).unwrap_or_default()
 }
 
 fn write_user<T: Copy>(addr: u64, v: T) {
-    unsafe { ptr::write_unaligned(addr as *mut T, v) }
+    let _ = sched::uaccess::write_user(addr as usize, v);
 }
 
+/// `n` user structs at `addr`, copied fault-tolerantly (EFAULT on a bad
+/// pointer instead of a kernel fault).
 fn read_array<T: Copy + Default>(addr: u64, n: u32, max: u32) -> Result<Vec<T>, DriverError> {
     if n == 0 {
         return Ok(Vec::new());
@@ -428,10 +438,12 @@ fn read_array<T: Copy + Default>(addr: u64, n: u32, max: u32) -> Result<Vec<T>, 
     if n > max || addr == 0 {
         return Err(err(EINVAL));
     }
-    let mut v = Vec::with_capacity(n as usize);
-    for i in 0..n as u64 {
-        v.push(read_user::<T>(addr + i * core::mem::size_of::<T>() as u64));
+    let bytes = n as usize * core::mem::size_of::<T>();
+    let mut v: Vec<T> = Vec::with_capacity(n as usize);
+    if unsafe { sched::uaccess::copy_from_user(v.as_mut_ptr() as *mut u8, addr as usize, bytes) } != 0 {
+        return Err(err(EFAULT));
     }
+    unsafe { v.set_len(n as usize) };
     Ok(v)
 }
 
@@ -896,7 +908,8 @@ fn gem_new(arg: u64, open_id: u32) -> Result<usize, DriverError> {
     g.info.handle = handle;
     g.info.size = size;
     g.info.offset = 0;
-    g.info.map_handle = phys;
+    // Opaque offset, never the physical base (resolved in `handle_ioctl_mmap`).
+    g.info.map_handle = drivers::drm_offset::offset_for(phys as u64, size as u64).unwrap_or(0);
     g.info.domain = domain;
     write_user(arg, g);
     ulog!(1, "open {}: GEM_NEW {} KiB {} (asked {:#x}, align {:#x}, kind {:#x}) -> handle {:#x} obj {} map {:#x}",
@@ -913,7 +926,7 @@ fn gem_info(arg: u64, open_id: u32) -> Result<usize, DriverError> {
     g.domain = b.domain;
     g.size = b.size;
     g.offset = 0;
-    g.map_handle = b.phys;
+    g.map_handle = drivers::drm_offset::offset_for(b.phys as u64, b.size as u64).unwrap_or(0);
     g.tile_mode = b.tile_mode;
     g.tile_flags = b.tile_flags;
     drop(st);
@@ -953,6 +966,7 @@ fn bo_unref(st: &mut State, obj: u32, handle: bool) {
     }
     if b.handles == 0 && b.exports == 0 {
         let b = st.bos.remove(&obj).expect("bo");
+        drivers::drm_offset::release(b.phys as u64);
         if b.keeper_mem != 0 {
             if let Some(k) = KEEPER.lock().as_ref() {
                 let _ = k.c.free(if b.sysmem { k.dev } else { k.sub }, b.keeper_mem);
@@ -1355,7 +1369,7 @@ fn nvif_mthd(io: &NvifIoctlV0, data: u64, argc: u32, open_id: u32) -> Result<usi
         }
     }
     let infop = data + hs as u64;
-    let mut info: NvDeviceInfoV0 = unsafe { ptr::read_unaligned(infop as *const NvDeviceInfoV0) };
+    let mut info: NvDeviceInfoV0 = sched::uaccess::read_user(infop as usize).ok_or(err(EFAULT))?;
     if info.version != 0 {
         return Err(err(EINVAL));
     }
@@ -1375,7 +1389,7 @@ fn nvif_mthd(io: &NvifIoctlV0, data: u64, argc: u32, open_id: u32) -> Result<usi
         let n = f.name.as_bytes();
         info.name[..n.len().min(63)].copy_from_slice(&n[..n.len().min(63)]);
     }
-    unsafe { ptr::write_unaligned(infop as *mut NvDeviceInfoV0, info) };
+    write_user(infop, info);
     ulog!(1, "open {}: NVIF MTHD DEVICE_INFO: chipset {:#x} family {:#x} VRAM {} MiB '{}' '{}'", open_id, info.chipset,
           info.family, info.ram_size >> 20, cstr(&info.chip), cstr(&info.name));
     Ok(0)
@@ -1910,7 +1924,7 @@ static BACKEND: UapiBackend = UapiBackend {
     date: "20120801",
     desc: "nVidia Riva/TNT/GeForce/Quadro/Tesla/Tegra K1+ (OpenRM translation)",
     ioctl,
-    user_args: false,
+    user_args: true,
     gem_close,
     mmap,
     release_open,

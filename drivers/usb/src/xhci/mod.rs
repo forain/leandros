@@ -1220,6 +1220,42 @@ pub unsafe fn probe(base: usize, len: usize, bus: u8) -> Result<(Arc<Hc>, Vec<En
     Ok((hc, found))
 }
 
+// ── Root-port hot plug (lane usbunplug) ────────────────────────────────────
+
+/// Whether root `port` reports a connected device (PORTSC.CCS) right now.
+pub fn root_port_connected(hc: &Hc, port: u8) -> bool {
+    let x = hc.lock();
+    !x.dead && port >= 1 && port <= x.max_ports && x.regs.portsc(port) & PORTSC_CCS != 0
+}
+
+/// Number of root ports, or 0 for a controller that died.
+pub fn root_ports(hc: &Hc) -> u8 {
+    let x = hc.lock();
+    if x.dead { 0 } else { x.max_ports }
+}
+
+/// Free every device slot on root `port` after its device went away: Disable
+/// Slot, then the slot's contexts and rings are dropped (`disable_slot`).
+/// The caller makes sure no class driver still issues transfers on them.
+pub fn release_root_port(hc: &Hc, port: u8) -> usize {
+    let ids: Vec<u8> = {
+        let x = hc.lock();
+        x.slots.iter().enumerate()
+            .filter_map(|(i, s)| s.as_deref().filter(|s| s.port == port).map(|_| i as u8))
+            .collect()
+    };
+    for &id in &ids { disable_slot(hc, id); }
+    ids.len()
+}
+
+/// Enumerate a device that appeared on root `port` after boot (debounce
+/// first, USB 2.0 §7.1.7.3).
+pub fn enumerate_hotplug(hc: &Arc<Hc>, port: u8) -> Result<Enumerated, &'static str> {
+    sleep_ms(100);
+    if !root_port_connected(hc, port) { return Err("device left during debounce"); }
+    enumerate_port(hc, port)
+}
+
 // ── BulkTransport ───────────────────────────────────────────────────────────
 
 /// A bulk-only mass-storage interface on an xHCI-attached device.
@@ -1235,6 +1271,11 @@ pub struct XhciBulk {
 
 impl XhciBulk {
     pub fn slot(&self) -> u8 { self.slot }
+    /// (controller bus number, root port) of this interface's device.
+    pub fn location(&self) -> (u8, u8) {
+        let x = self.hc.lock();
+        (x.bus, x.slot(self.slot).map_or(0, |s| s.port))
+    }
     /// (bulk IN, bulk OUT) endpoint addresses.
     pub fn endpoints(&self) -> (u8, u8) { (self.ep_in, self.ep_out) }
 
@@ -1246,11 +1287,30 @@ impl XhciBulk {
     }
 }
 
+/// Fault injection (test knob, off at 0): while `now_ns()` is below this,
+/// every bulk transfer queues nothing, waits out its deadline (or the end of
+/// the window) with `platform::relax()` exactly as `wait_td` waits for a
+/// TD that never completes, and returns `Timeout`. Models a stick that stops
+/// answering without stalling the host controller, so the BOT/SCSI error
+/// ladder runs for real in the guest. Armed by the block layer.
+pub static FAULT_STALL_UNTIL_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn fault_stall(timeout_ms: u32) -> Option<UsbErr> {
+    let until = FAULT_STALL_UNTIL_NS.load(core::sync::atomic::Ordering::Relaxed);
+    let t0 = platform::now_ns();
+    if t0 >= until { return None; }
+    let end = until.min(t0.saturating_add(timeout_ms as u64 * 1_000_000));
+    while platform::now_ns() < end { platform::relax(); }
+    Some(UsbErr::Timeout)
+}
+
 impl BulkTransport for XhciBulk {
     fn bulk_out(&mut self, data: &[u8], timeout_ms: u32) -> Result<usize, UsbErr> {
+        if let Some(e) = fault_stall(timeout_ms) { return Err(e); }
         bulk(&self.hc, self.slot, self.dci_out, Some(data), None, timeout_ms)
     }
     fn bulk_in(&mut self, buf: &mut [u8], timeout_ms: u32) -> Result<usize, UsbErr> {
+        if let Some(e) = fault_stall(timeout_ms) { return Err(e); }
         bulk(&self.hc, self.slot, self.dci_in, None, Some(buf), timeout_ms)
     }
     fn class_control_out(&mut self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<(), UsbErr> {

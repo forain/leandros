@@ -585,6 +585,27 @@ const VIRTGPU_PARAM_LEANDROS_SCATTER: u64 = 0x1000_000B;
 /// EXECBUFFER submissions that waited on an in-fence (syncobj or FENCE_FD_IN).
 pub static EXEC_IN_FENCE_WAITS: AtomicU64 = AtomicU64::new(0);
 
+/// Buffer-sharing churn counters (lane epattr), backend-generic: counted on
+/// the way out of the DRM ioctl dispatch whichever handler served the call.
+/// Read through `/proc/i915` (`prime ...`).
+pub static PRIME_EXPORTS: AtomicU64 = AtomicU64::new(0);
+pub static PRIME_EXPORT_ERRS: AtomicU64 = AtomicU64::new(0);
+pub static PRIME_IMPORTS: AtomicU64 = AtomicU64::new(0);
+pub static PRIME_IMPORT_ERRS: AtomicU64 = AtomicU64::new(0);
+pub static GEM_CLOSES: AtomicU64 = AtomicU64::new(0);
+
+/// Append the PRIME / GEM close counters; false (nothing written) while all are 0.
+pub fn proc_prime(s: &mut alloc::string::String) -> bool {
+    use ::core::fmt::Write;
+    let v = [PRIME_EXPORTS.load(Ordering::Relaxed), PRIME_EXPORT_ERRS.load(Ordering::Relaxed),
+             PRIME_IMPORTS.load(Ordering::Relaxed), PRIME_IMPORT_ERRS.load(Ordering::Relaxed),
+             GEM_CLOSES.load(Ordering::Relaxed)];
+    if v.iter().all(|&x| x == 0) { return false; }
+    let _ = writeln!(s, "prime handle_to_fd {} handle_to_fd_err {} fd_to_handle {} fd_to_handle_err {} gem_close {}",
+        v[0], v[1], v[2], v[3], v[4]);
+    true
+}
+
 /// `drm_virtgpu_context_set_param.param` values.
 const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
 const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
@@ -928,6 +949,27 @@ fn user_struct_out<T>(uaddr: usize, src: &T) -> bool {
     unsafe { sched::uaccess::copy_raw(uaddr as *mut u8, src as *const T as *const u8, ::core::mem::size_of::<T>()) == 0 }
 }
 
+// Nested user pointers — addresses read OUT of an ioctl struct (handle arrays,
+// GETPARAM `value`, set_param arrays) — are not the bounced `arg` and must be
+// range-checked: `copy_raw` alone lets a client name a kernel address. These
+// fail with EFAULT on a non-user range or an unresolvable fault.
+fn uread_user<T>(uaddr: usize) -> Result<T, DriverError> {
+    let mut v: T = unsafe { ::core::mem::zeroed() };
+    let n = ::core::mem::size_of::<T>();
+    if unsafe { sched::uaccess::copy_from_user(&mut v as *mut T as *mut u8, uaddr, n) } != 0 {
+        return Err(DriverError::Errno(14));
+    }
+    Ok(v)
+}
+
+fn uwrite_user<T>(uaddr: usize, v: &T) -> Result<(), DriverError> {
+    let n = ::core::mem::size_of::<T>();
+    if unsafe { sched::uaccess::copy_to_user(uaddr, v as *const T as *const u8, n) } != 0 {
+        return Err(DriverError::Errno(14));
+    }
+    Ok(())
+}
+
 /// Run `f` on a kernel copy of the caller's `T` at `arg`, then copy it back
 /// (PAN-safe; a fault on either copy is EINVAL like the other DRM paths).
 fn with_user_struct<T, R>(arg: usize, f: impl FnOnce(&mut T) -> Result<R, DriverError>) -> Result<R, DriverError> {
@@ -942,13 +984,16 @@ fn with_user_struct<T, R>(arg: usize, f: impl FnOnce(&mut T) -> Result<R, Driver
 /// the rest of `dst` as it was — callers pass zeroed buffers).
 fn ucp_in(dst: *mut u8, src: u64, n: usize) {
     if n == 0 { return; }
-    unsafe { sched::uaccess::copy_raw(dst, src as *const u8, n); }
+    // Range-checked: `src` is a pointer nested in the ioctl struct, so it is
+    // user-controlled and must never name kernel memory.
+    unsafe { sched::uaccess::copy_from_user(dst, src as usize, n); }
 }
 
 /// Copy `n` kernel bytes out to user address `dst` (a fault drops the tail).
 fn ucp_out(dst: u64, src: *const u8, n: usize) {
     if n == 0 { return; }
-    unsafe { sched::uaccess::copy_raw(dst as *mut u8, src, n); }
+    // Range-checked, as ucp_in.
+    unsafe { sched::uaccess::copy_to_user(dst as usize, src, n); }
 }
 
 /// Read a `T` from the user address `arg`.
@@ -975,7 +1020,7 @@ fn fill_drm_version(v: &mut drm_version, ver: (i32, i32, i32), name: &str, date:
     fn field(ptr_: u64, len: &mut usize, s: &str) {
         let n = ::core::cmp::min(*len, s.len());
         if ptr_ != 0 && n != 0 {
-            unsafe { sched::uaccess::copy_raw(ptr_ as *mut u8, s.as_ptr(), n); }
+            unsafe { sched::uaccess::copy_to_user(ptr_ as usize, s.as_ptr(), n); }
         }
         *len = s.len();
     }
@@ -1232,6 +1277,27 @@ fn force_scatter() -> bool {
 /// a different allocation). `None` for an object with no scatter backing.
 fn sg_token_of_obj(obj: u32) -> Option<usize> {
     DUMB_SG.lock().get(&obj).and_then(|f| f.first().map(|&(p, _)| p))
+}
+
+/// A dumb buffer's real mmap token and byte size: its buddy base, or for a
+/// scattered buffer its first frame (see `sg_mmap_runs`) and the frames' sum.
+/// `drm_offset` turns the token into the opaque offset userspace sees.
+fn dumb_token(b: &DumbBuf) -> Option<(u64, u64)> {
+    if b.sg {
+        let sg = DUMB_SG.lock();
+        let f = sg.get(&b.obj)?;
+        let t = f.first()?.0 as u64;
+        Some((t, f.iter().map(|&(_, o)| 4096u64 << o).sum()))
+    } else if b.phys != 0 {
+        Some((b.phys as u64, 4096u64 << b.order))
+    } else {
+        None
+    }
+}
+
+fn dumb_fake_offset(b: &DumbBuf) -> Option<u64> {
+    let (t, size) = dumb_token(b)?;
+    crate::drm_offset::offset_for(t, size)
 }
 
 /// Physically contiguous runs `(phys, bytes)` of the scattered buffer whose
@@ -2988,6 +3054,10 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
     };
     let dead = if zero { m.remove(&obj) } else { None };
     drop(m); // never hold a BO map across the device round-trip
+    if let Some(o) = dead.as_ref() {
+        crate::drm_offset::release(o.phys as u64);
+        crate::drm_offset::release(o.map_phys);
+    }
 
     // L1.14: a host-visible blob still mapped by some process keeps its window
     // span AND its host resource (RESOURCE_UNMAP_BLOB would pull the memory
@@ -3724,7 +3794,7 @@ fn syncobj_read_handles(ptr: u64, count: u32) -> Result<Vec<u32>, DriverError> {
     }
     let mut v = vec![0u32; count as usize];
     for i in 0..count as usize {
-        v[i] = uread::<u32>(ptr as usize + 4 * i)?;
+        v[i] = uread_user::<u32>(ptr as usize + 4 * i)?;
     }
     Ok(v)
 }
@@ -3736,7 +3806,7 @@ fn syncobj_read_points(ptr: u64, count: u32) -> Result<Vec<u64>, DriverError> {
     }
     let mut v = vec![0u64; count as usize];
     for i in 0..count as usize {
-        v[i] = uread::<u64>(ptr as usize + 8 * i)?;
+        v[i] = uread_user::<u64>(ptr as usize + 8 * i)?;
     }
     Ok(v)
 }
@@ -5610,8 +5680,10 @@ impl DrmDeviceInterface {
     /// `uread`/`ucp_in`/`ucp_out`. Like Linux, the struct is copied back out
     /// whatever the handler returned.
     pub fn handle_ioctl(&mut self, cmd: u32, arg: usize, open_id: u32) -> Result<usize, DriverError> {
-        let dir = (cmd >> 30) & 3;
-        let size = ((cmd >> 16) & 0x3fff) as usize;
+        let (dir, size) = match legacy_arg_size(cmd) {
+            Some(n) => (3, n),
+            None => ((cmd >> 30) & 3, ((cmd >> 16) & 0x3fff) as usize),
+        };
         if dir == 0 || size == 0 || arg == 0 || backend_takes_user_arg(cmd) {
             return self.handle_ioctl_inner(cmd, arg, open_id);
         }
@@ -5819,6 +5891,12 @@ impl DrmDeviceInterface {
                 Err(DriverError::Unsupported)
             }
         }};
+        match cmd {
+            DRM_IOCTL_PRIME_HANDLE_TO_FD => { (if res.is_ok() { &PRIME_EXPORTS } else { &PRIME_EXPORT_ERRS }).fetch_add(1, Ordering::Relaxed); }
+            DRM_IOCTL_PRIME_FD_TO_HANDLE => { (if res.is_ok() { &PRIME_IMPORTS } else { &PRIME_IMPORT_ERRS }).fetch_add(1, Ordering::Relaxed); }
+            DRM_IOCTL_GEM_CLOSE if res.is_ok() => { GEM_CLOSES.fetch_add(1, Ordering::Relaxed); }
+            _ => {}
+        }
 
         // Re-check master on the way out, not just on the way in. The gate
         // above refuses ioctls that have not started; it cannot recall one that
@@ -6024,7 +6102,9 @@ impl DrmDeviceInterface {
         // Slot [5] carries the physical address used as the mmap offset (< 4 GiB, checked above).
         fb_data[3] = fb_id;
         fb_data[4] = 0;                        // no direct buffer pointer — force mmap
-        fb_data[5] = mmap_offset as u32;       // physical address as mmap offset
+        // Opaque 32-bit offset naming the buffer (`drm_offset::FAKE32_BASE`).
+        fb_data[5] = crate::drm_offset::offset_for32(mmap_offset as u64, (width as u64) * (height as u64) * 4)
+            .ok_or(DriverError::Unsupported)?;
 
 
         Ok(0)
@@ -6282,15 +6362,15 @@ impl DrmDeviceInterface {
             let date = "20180419";
             let desc = "Broadcom V3D graphics";
             if v.name != 0 && v.name_len >= name.len() {
-                unsafe { sched::uaccess::copy_raw(v.name as *mut u8, name.as_ptr(), name.len()); }
+                unsafe { sched::uaccess::copy_to_user(v.name as usize, name.as_ptr(), name.len()); }
             }
             v.name_len = name.len();
             if v.date != 0 && v.date_len >= date.len() {
-                unsafe { sched::uaccess::copy_raw(v.date as *mut u8, date.as_ptr(), date.len()); }
+                unsafe { sched::uaccess::copy_to_user(v.date as usize, date.as_ptr(), date.len()); }
             }
             v.date_len = date.len();
             if v.desc != 0 && v.desc_len >= desc.len() {
-                unsafe { sched::uaccess::copy_raw(v.desc as *mut u8, desc.as_ptr(), desc.len()); }
+                unsafe { sched::uaccess::copy_to_user(v.desc as usize, desc.as_ptr(), desc.len()); }
             }
             v.desc_len = desc.len();
             return Ok(0);
@@ -6352,17 +6432,17 @@ impl DrmDeviceInterface {
         let encoder_ids = [1u32];
 
         if res.crtc_id_ptr != 0 && res.count_crtcs >= 1 {
-            unsafe { sched::uaccess::copy_raw(res.crtc_id_ptr as *mut u8, crtc_ids.as_ptr() as *const u8, (1) * 4); }
+            unsafe { sched::uaccess::copy_to_user(res.crtc_id_ptr as usize, crtc_ids.as_ptr() as *const u8, (1) * 4); }
         }
         res.count_crtcs = 1;
 
         if res.connector_id_ptr != 0 && res.count_connectors >= 1 {
-            unsafe { sched::uaccess::copy_raw(res.connector_id_ptr as *mut u8, connector_ids.as_ptr() as *const u8, (1) * 4); }
+            unsafe { sched::uaccess::copy_to_user(res.connector_id_ptr as usize, connector_ids.as_ptr() as *const u8, (1) * 4); }
         }
         res.count_connectors = 1;
 
         if res.encoder_id_ptr != 0 && res.count_encoders >= 1 {
-            unsafe { sched::uaccess::copy_raw(res.encoder_id_ptr as *mut u8, encoder_ids.as_ptr() as *const u8, (1) * 4); }
+            unsafe { sched::uaccess::copy_to_user(res.encoder_id_ptr as usize, encoder_ids.as_ptr() as *const u8, (1) * 4); }
         }
         res.count_encoders = 1;
 
@@ -6407,7 +6487,7 @@ impl DrmDeviceInterface {
 
         if conn.encoders_ptr != 0 && conn.count_encoders >= 1 {
             let encoders = [1u32];
-            unsafe { sched::uaccess::copy_raw(conn.encoders_ptr as *mut u8, encoders.as_ptr() as *const u8, (1) * 4); }
+            unsafe { sched::uaccess::copy_to_user(conn.encoders_ptr as usize, encoders.as_ptr() as *const u8, (1) * 4); }
         }
         conn.count_encoders = 1;
 
@@ -6436,7 +6516,7 @@ impl DrmDeviceInterface {
             for (i, &(w, h)) in sizes[..fit].iter().enumerate() {
                 let mode = mode_60hz(w, h, i == 0);
                 unsafe {
-                    sched::uaccess::copy_raw((conn.modes_ptr as *mut drm_mode_modeinfo).add(i) as *mut u8, &mode as *const drm_mode_modeinfo as *const u8, ::core::mem::size_of::<drm_mode_modeinfo>());
+                    sched::uaccess::copy_to_user((conn.modes_ptr as *mut drm_mode_modeinfo).add(i) as usize, &mode as *const drm_mode_modeinfo as *const u8, ::core::mem::size_of::<drm_mode_modeinfo>());
                 }
             }
         }
@@ -6501,12 +6581,12 @@ impl DrmDeviceInterface {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         with_user_struct(arg, |map: &mut drm_mode_map_dumb| {
 
-        // Return the actual physical address associated with the dumb buffer handle
+        // An opaque offset naming the buffer (never its physical address);
+        // `handle_ioctl_mmap` resolves it. Scattered: the token is the first
+        // frame and sys_mmap maps the runs.
         match dumb_lookup(map.handle) {
-            Some(b) if !b.sg => { map.offset = b.phys as u64; Ok(0) }
-            // Scattered: the first frame is the token; sys_mmap maps the runs.
-            Some(b) => match sg_token_of_obj(b.obj) {
-                Some(t) => { map.offset = t as u64; Ok(0) }
+            Some(b) => match dumb_fake_offset(&b) {
+                Some(o) => { map.offset = o; Ok(0) }
                 None => Err(DriverError::Unsupported),
             },
             None => Err(DriverError::NotFound),
@@ -6783,6 +6863,7 @@ impl DrmDeviceInterface {
         };
         drop(map);
         if let Some(b) = zero {
+            if let Some((t, _)) = dumb_token(&b) { crate::drm_offset::release(t); }
             dumb_release_host_resource(b.res_id);
             dumb_free_backing(&b);
         }
@@ -6900,7 +6981,7 @@ impl DrmDeviceInterface {
         if props_ptr != 0 && vals_ptr != 0 && cap as usize >= ids.len() {
             for (i, &pid) in ids.iter().enumerate() {
                 unsafe {
-                    sched::uaccess::copy_raw((props_ptr as *mut u32).add(i) as *mut u8, &pid as *const u32 as *const u8, ::core::mem::size_of::<u32>());
+                    sched::uaccess::copy_to_user((props_ptr as *mut u32).add(i) as usize, &pid as *const u32 as *const u8, ::core::mem::size_of::<u32>());
                     let pv: u64 = Self::current_prop_value(obj_id, pid);
                     ucp_out(vals_ptr + 8 * i as u64, &pv as *const u64 as *const u8, 8);
                 }
@@ -7841,8 +7922,24 @@ impl DrmDeviceInterface {
     /// open of the node map any other client's buffer. open_id 0 is the
     /// kernel-internal legacy path (VFS opens are never 0) and stays unscoped.
     fn handle_ioctl_mmap(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
-        // arg contains the requested physical address/offset
-        let requested_phys = arg as u64;
+        // `arg` is the offset the caller passed to mmap(): 0 (the firmware
+        // framebuffer) or a fake offset from `drm_offset` that names a BO.
+        // Translate it to the BO's real token (physical base, scattered-buffer
+        // token or shared-memory window address) first; everything below,
+        // including the per-open ownership check, works on the real token.
+        // A raw physical address is refused: userspace is never told one.
+        // `open_id == 0` (kernel-internal legacy callers) still passes real
+        // tokens and stays unscoped.
+        let raw = arg as u64;
+        let requested_phys = if raw == 0 {
+            0
+        } else if let Some(real) = crate::drm_offset::resolve(raw) {
+            real
+        } else if open_id == 0 {
+            raw
+        } else {
+            return Err(DriverError::InvalidParameter);
+        };
         // A GPU backend's token (its GEM_NEW map_handle): the backend checks
         // that `open_id` holds a handle on the token's object; `None` (not
         // ours, or not this open's) falls through to the DRM layer's check,
@@ -7857,7 +7954,12 @@ impl DrmDeviceInterface {
 
 
         if requested_phys == 0 {
-            // Default: return the hardware framebuffer
+            // Token 0 is the firmware framebuffer — the scanout itself, not a
+            // BO anyone owns. Only the DRM master may map it (granted
+            // implicitly to the first card0 open when no master exists, as
+            // Linux's open-time grant); the render node is refused in
+            // servers/drm before it gets here.
+            if open_id != 0 { master_gate(open_id)?; }
             extern "C" {
                 fn vfs_get_framebuffer_base() -> u64;
             }
@@ -8333,7 +8435,7 @@ impl DrmDeviceInterface {
                 let b = (p + i * SYNCOBJ_DESC as u64) as *const u8;
                 {
                     let ba = b as usize;
-                    v.push((uread::<u32>(ba)?, uread::<u32>(ba + 4)?, uread::<u64>(ba + 8)?));
+                    v.push((uread_user::<u32>(ba)?, uread_user::<u32>(ba + 4)?, uread_user::<u64>(ba + 8)?));
                 }
             }
             Ok(v)
@@ -8531,7 +8633,7 @@ impl DrmDeviceInterface {
         if req.param == VIRTGPU_PARAM_LEANDROS_CTX_ID {
             let ctx = ctx_lookup(open_id) as u64;
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            if !user_struct_out(req.value as usize, &((ctx as u32) as u32)) { return Err(DriverError::InvalidParameter); }
+            uwrite_user(req.value as usize, &((ctx as u32) as u32))?;
             return Ok(0);
         }
         // Same treatment, same reason as CTX_ID: per-open bookkeeping behind a
@@ -8539,7 +8641,7 @@ impl DrmDeviceInterface {
         if req.param == VIRTGPU_PARAM_LEANDROS_LAST_FENCE {
             let f = ctx_lookup_entry(open_id).map(|c| c.last_fence).unwrap_or(0);
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            if !user_struct_out(req.value as usize, &((f as u32) as u32)) { return Err(DriverError::InvalidParameter); }
+            uwrite_user(req.value as usize, &((f as u32) as u32))?;
             return Ok(0);
         }
         // Same treatment, same reason: a leaf lock, no device round-trip, and
@@ -8549,7 +8651,7 @@ impl DrmDeviceInterface {
             hostvis_reap();
             let n = HOSTVIS_SPANS.lock().spans.len() as u32;
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
+            uwrite_user(req.value as usize, &((n) as u32))?;
             return Ok(0);
         }
         // Likewise: BLOB_OBJS is a leaf, the count is copied out of the guard
@@ -8567,7 +8669,7 @@ impl DrmDeviceInterface {
                 (w << 16) | d
             };
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
+            uwrite_user(req.value as usize, &((n) as u32))?;
             return Ok(0);
         }
         // In/out through the user pointer: read the input, answer from a
@@ -8576,20 +8678,20 @@ impl DrmDeviceInterface {
             || req.param == VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_REFS
         {
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            let input = uread::<u32>(req.value as usize)?;
+            let input = uread_user::<u32>(req.value as usize)?;
             let n = if req.param == VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_OF {
                 dumb_obj_of_handle(input)
             } else {
                 dumb_obj_refs(input)
             };
-            if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
+            uwrite_user(req.value as usize, &((n) as u32))?;
             return Ok(0);
         }
         if req.param == VIRTGPU_PARAM_LEANDROS_CTRLQ_STAT {
             use ::core::sync::atomic::Ordering::Relaxed;
             use crate::virtio_gpu as vg;
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            let sel = uread::<u32>(req.value as usize)?;
+            let sel = uread_user::<u32>(req.value as usize)?;
             let n: u64 = match sel {
                 0 => vg::CTX_CHAINS_PARKED.load(Relaxed),
                 1 => vg::CTX_CHAINS_RECLAIMED.load(Relaxed),
@@ -8608,7 +8710,7 @@ impl DrmDeviceInterface {
         }
         if req.param == VIRTGPU_PARAM_LEANDROS_SCATTER {
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            let sel: u32 = uread(req.value as usize)?;
+            let sel: u32 = uread_user(req.value as usize)?;
             let n: u64 = match sel {
                 0 => SCATTER_CREATES.load(Ordering::Relaxed),
                 1 => DUMB_SG.lock().len() as u64,
@@ -8620,13 +8722,13 @@ impl DrmDeviceInterface {
                 }
                 _ => return Err(DriverError::InvalidParameter),
             };
-            uwrite(req.value as usize, &(n.min(u32::MAX as u64) as u32))?;
+            uwrite_user(req.value as usize, &(n.min(u32::MAX as u64) as u32))?;
             return Ok(0);
         }
         if req.param == VIRTGPU_PARAM_LEANDROS_BLOB_OBJS {
             let n = blob_obj_count();
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
+            uwrite_user(req.value as usize, &((n) as u32))?;
             return Ok(0);
         }
 
@@ -8680,7 +8782,7 @@ impl DrmDeviceInterface {
         // reads back that pointee, not the struct field, so writing the value
         // in place made every param read as 0 for Mesa.
         if req.value == 0 { return Err(DriverError::InvalidParameter); }
-        if !user_struct_out(req.value as usize, &((value as u32) as u32)) { return Err(DriverError::InvalidParameter); }
+        uwrite_user(req.value as usize, &((value as u32) as u32))?;
         Ok(0)
     }
 
@@ -8697,7 +8799,7 @@ impl DrmDeviceInterface {
         // Copy the whole param array before locking anything.
         let mut params = [drm_virtgpu_context_set_param { param: 0, value: 0 }; 8];
         for i in 0..n {
-            params[i] = uread::<drm_virtgpu_context_set_param>(
+            params[i] = uread_user::<drm_virtgpu_context_set_param>(
                 init.ctx_set_params as usize + i * ::core::mem::size_of::<drm_virtgpu_context_set_param>(),
             )?;
         }
@@ -8947,17 +9049,17 @@ impl DrmDeviceInterface {
         // cannot be used to obtain an mmap token for it.
         let blob = blob_lookup(handle, open_id);
 
-        let token: u64 = match blob {
+        let (token, size): (u64, u64) = match blob {
             // ── Host-side blob memory ────────────────────────────────────────
             Some(b) if b.blob_mem == crate::virtio_gpu::VIRTIO_GPU_BLOB_MEM_HOST3D => {
                 if b.map_phys != 0 {
-                    b.map_phys // already mapped — idempotent
+                    (b.map_phys, b.size) // already mapped — idempotent
                 } else {
-                    self.hostvis_map_blob(b)?
+                    (self.hostvis_map_blob(b)?, b.size)
                 }
             }
             // ── Guest-backed blob ────────────────────────────────────────────
-            Some(b) if b.phys != 0 => b.phys as u64,
+            Some(b) if b.phys != 0 => (b.phys as u64, b.size),
             Some(_) => {
                 // A guest-backed blob with no pages cannot happen (creation
                 // allocates or fails), so this is a HOST3D_GUEST/GUEST record
@@ -8969,14 +9071,14 @@ impl DrmDeviceInterface {
                 let b = dumb_lookup(handle).ok_or(DriverError::InvalidParameter)?;
                 // Scattered backing: the first frame is the token (sys_mmap
                 // maps the frame runs, see `sg_mmap_runs`).
-                let phys = if b.sg { sg_token_of_obj(b.obj).unwrap_or(0) } else { b.phys };
-                if phys == 0 { return Err(DriverError::Unsupported); }
-                phys as u64
+                dumb_token(&b).ok_or(DriverError::Unsupported)?
             }
         };
+        // Userspace gets an opaque offset naming the BO, never the token.
+        let off = crate::drm_offset::offset_for(token, size).ok_or(DriverError::Unsupported)?;
 
         // `offset` is the first u64 of drm_virtgpu_map. Written with no lock held.
-        unsafe { (arg as *mut u64).write_volatile(token) };
+        unsafe { (arg as *mut u64).write_volatile(off) };
         Ok(0)
     }
 
@@ -9937,7 +10039,8 @@ impl DrmDeviceInterface {
         // its token is not derived the same way.
         if b.v3d_va == 0 || b.phys == 0 { return Err(DriverError::NotFound); }
 
-        unsafe { ((arg as *mut u8).add(8) as *mut u64).write_unaligned(b.phys as u64) };
+        let off = crate::drm_offset::offset_for(b.phys as u64, b.size).ok_or(DriverError::Unsupported)?;
+        unsafe { ((arg as *mut u8).add(8) as *mut u64).write_unaligned(off) };
         Ok(0)
     }
 
@@ -10338,6 +10441,25 @@ impl DrmDumbBuffer {
 /// would hand it a kernel address that `sched::uaccess` refuses (the i915
 /// iris probe SIGSEGV, lane irisseg). v3d, dispatched ahead of the backend,
 /// keeps the bounce.
+/// The LeandrOS-private ioctls (0x1001..0x100A, FBIOGET_VSCREENINFO) carry
+/// no `_IOC` size/direction, but their handlers read and write a fixed array
+/// at `arg` raw: without the bounce that is a SMAP violation (x86_64 panic) /
+/// PAN fault. Size in bytes of each one's argument, bounced in and out.
+/// 0x1007 (mmap) takes a value, not a pointer.
+fn legacy_arg_size(cmd: u32) -> Option<usize> {
+    Some(match cmd {
+        0x1001 | 0x1003 => 3 * 4, // [width, height, refresh]
+        0x1002 => 6 * 4,          // [w, h, format, fb_id, buf, mmap_off]
+        0x4600 => 8 * 4,          // first 8 u32 of fb_var_screeninfo
+        0x1004 => 4 * 4,          // [fb_id, flags, src_w, src_h]
+        0x1005 => 12 * 4,         // plane configuration
+        0x1006 => 2 * 4,          // [capability, value_out]
+        0x1008 => 8 * 8,          // irq stats
+        0x1009 | 0x100A => 8,     // one u64, swapped
+        _ => return None,
+    })
+}
+
 fn backend_takes_user_arg(cmd: u32) -> bool {
     let nr = cmd & 0xFF;
     (cmd >> 8) & 0xFF == 0x64

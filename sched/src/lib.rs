@@ -5782,6 +5782,7 @@ pub fn timer_tick_irq(elapsed: u64) {
     if mine % WD_SCAN_TICKS == 0 && id < MAX_CPUS {
         watchdog_scan(id);
     }
+    softlockup_tick(id);
     if id == 1 && mine == WDOG_SELFTEST_TICK.load(Ordering::Relaxed) {
         wdog_selftest_stall();
     }
@@ -5837,7 +5838,52 @@ pub fn timer_tick_irq(elapsed: u64) {
 #[inline]
 pub fn preempt_disable() {
     let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
-    PREEMPT_DISABLE[id].fetch_add(1, Ordering::Relaxed);
+    if PREEMPT_DISABLE[id].fetch_add(1, Ordering::Relaxed) == 0 {
+        PREEMPT_SECTION_SEQ[id].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// ── Soft-lockup detector (lane usbladder, L8.2) ─────────────────────────────
+//
+// The tick watchdog above only sees a CPU that takes no timer interrupt. A CPU
+// that spins inside ONE `preempt_disable` section and opens `irq_window`s
+// (the USB mass-storage poll loop in a context that may not sleep) keeps
+// ticking, so it looked alive while it held the CPU for the whole retry
+// ladder. Each CPU therefore also counts, in its own tick, how many
+// consecutive ticks found it inside the same preempt-disabled section
+// (`PREEMPT_SECTION_SEQ` changes on every outermost `preempt_disable`), and
+// reports after `SOFTLOCKUP_TICKS`, then every `SOFTLOCKUP_REPEAT_TICKS`.
+static PREEMPT_SECTION_SEQ: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static SOFTLOCKUP_SEEN_SEQ: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static SOFTLOCKUP_STREAK: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+const SOFTLOCKUP_TICKS: u32 = 300;          // 3 s of 100 Hz ticks
+const SOFTLOCKUP_REPEAT_TICKS: u32 = 1000;  // then every 10 s
+fn softlockup_tick(id: usize) {
+    let id = id.min(MAX_CPUS - 1);
+    if PREEMPT_DISABLE[id].load(Ordering::Relaxed) == 0 {
+        SOFTLOCKUP_STREAK[id].store(0, Ordering::Relaxed);
+        return;
+    }
+    let seq = PREEMPT_SECTION_SEQ[id].load(Ordering::Relaxed);
+    if SOFTLOCKUP_SEEN_SEQ[id].swap(seq, Ordering::Relaxed) != seq {
+        SOFTLOCKUP_STREAK[id].store(0, Ordering::Relaxed);
+        return;
+    }
+    let n = SOFTLOCKUP_STREAK[id].fetch_add(1, Ordering::Relaxed) + 1;
+    if n < SOFTLOCKUP_TICKS || (n - SOFTLOCKUP_TICKS) % SOFTLOCKUP_REPEAT_TICKS != 0 { return; }
+    if SYSTEM_DOWN.load(Ordering::Acquire) { return; }
+    extern "C" { fn arch_serial_putc(c: u8); fn print_number(n: u32); fn print_hex(n: usize); }
+    fn s(msg: &str) { for &b in msg.as_bytes() { unsafe { arch_serial_putc(b) } } }
+    s("\n[WDOG] cpu"); unsafe { print_number(id as u32) };
+    s(" soft lockup: one preempt-disabled section for ~"); unsafe { print_number(n / 100) };
+    s(" s (ticks taken, no task switch): pid="); unsafe { print_number(CURRENT_PID[id].load(Ordering::Relaxed)) };
+    let tgid = CURRENT_TGID[id].load(Ordering::Relaxed);
+    if let Some(t) = EXE_PATHS.try_lock() {
+        if let Some(e) = t.get(tgid) { s(" ("); for &b in e { unsafe { arch_serial_putc(b) } } s(")"); }
+    }
+    let sc = CUR_SYSCALL[id].load(Ordering::Relaxed);
+    if sc == NO_SYSCALL { s(" not in a syscall"); } else { s(" last syscall "); unsafe { print_hex(sc as usize) }; }
+    s("\n");
 }
 
 /// True while this CPU is inside a `preempt_disable` section (so an
@@ -8174,8 +8220,9 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         (None, None) => return GroupKillStep::Done,
     };
 
-    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal, had_vfork) = {
+    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal, had_vfork, sigkill_pending) = {
         let t = rq.get_mut(idx).unwrap();
+        let sigkill_pending = t.signal_pending & (1u64 << (signal::SIGKILL - 1)) != 0;
         t.set_state(TaskState::Zombie);
         t.group_killed = true;
         t.exit_code = exit_code;
@@ -8185,9 +8232,24 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         // `term_signal` is NOT set here: `exit_group_signal` stamps it on
         // every member of the group before this loop starts, so a member
         // reaped through this path already carries it.
-        (t.pid, t.on_cpu(), t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal, had_vfork)
+        (t.pid, t.on_cpu(), t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal, had_vfork, sigkill_pending)
     };
     if had_vfork { rq.unblock_port(VFORK_WAIT_CHANNEL); }
+    // Lane killexec: a SIGKILL already sent to this member (a process-directed
+    // kill() picks a Blocked thread and queues it on that thread's own set)
+    // dies with it unless it is handed on. For an `execve` de-thread the
+    // caller lives on, so the kill must still end the process — Linux's
+    // complete_signal turns any SIGKILL into a group exit at send time, and
+    // de_thread then fails. Without this the exec'd image ran on unkillable
+    // by that kill (killmt proclife exec_kill: "child not reaped").
+    if sigkill_pending {
+        if let Some(me) = rq.find_pid_mut(pid) {
+            if me.forced_exit == 0 {
+                let signo = signal::SIGKILL;
+                me.forced_exit = (1u32 << 31) | (signo << 8) | ((128 + signo) & 0xff);
+            }
+        }
+    }
 
     if let Some(cpu) = on_cpu {
         // Still running on another core — cannot touch its kernel stack or

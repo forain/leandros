@@ -465,8 +465,29 @@ static void user_leandros_cases(struct ctx *c) {
     expect("los_ipc_send_root_port_eperm", los_send(c->rootport, 0xffffffffu), EPERM);
     struct lmsg m; memset(&m, 0, sizeof m);
     expect("los_ipc_call_root_port_eperm", syscall(LOS_IPC_CALL, c->rootport, &m, sizeof m), EPERM);
-    /* A server request whose reply would land in root's queue. */
-    expect("los_ipc_send_reply_to_root_port_eperm", los_send((long)getauxval(256), (uint32_t)c->rootport), EPERM);
+    /* A server request whose reply would land in root's queue. The VFS port
+     * itself is kernel-only (below), so aim at the audio server's port. */
+    unsigned long ap = getauxval(258);
+    if (ap == 0 || ap == 0xffffffffUL) skip("los_ipc_send_reply_to_root_port_eperm", "no audio port in auxv");
+    else expect("los_ipc_send_reply_to_root_port_eperm", los_send((long)ap, (uint32_t)c->rootport), EPERM);
+}
+
+/* The VFS server trusts the buffer pointers in its requests: the kernel's own
+ * syscall paths range-check them first and the in-kernel callers pass kernel
+ * buffers. A raw IPC request from user code would skip that check (a VFS_READ
+ * naming a kernel address is a kernel write), so user code may not send to
+ * the VFS port at all. fd = -1 keeps an unfixed kernel from dereferencing. */
+static void vfs_port_kernel_only(void) {
+    if (!on_leandros()) { skip("los_ipc_vfs_port_*", "not LeandrOS"); return; }
+    long vfs = (long)getauxval(256);
+    struct lmsg m; memset(&m, 0, sizeof m);
+    m.tag = 0x11; /* VFS_READ */
+    m.reply_port = 0xffffffffu;
+    uint64_t a[3] = { (uint64_t)-1, 0xffff800000000000ULL, 16 };
+    memcpy(m.data, a, sizeof a);
+    expect("los_ipc_call_vfs_port_eperm", syscall(LOS_IPC_CALL, vfs, &m, sizeof m), EPERM);
+    memset(&m, 0, sizeof m); m.tag = 0x11; m.reply_port = 0xffffffffu; memcpy(m.data, a, sizeof a);
+    expect("los_ipc_send_vfs_port_eperm", syscall(LOS_IPC_SEND, vfs, &m, sizeof m), EPERM);
 }
 
 /* AT_RANDOM must come from a real generator: distinct across execs, even
@@ -899,6 +920,7 @@ static void user_cases(void *arg) {
     user_pgid_cases(c);
     user_dev_net_cases();
     user_leandros_cases(c);
+    vfs_port_kernel_only();
     atrandom_cases();
     user_cred_cases();
     user_session_rlimit_cases();

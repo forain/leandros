@@ -29,6 +29,7 @@ use core::ffi::c_void;
 
 mod cost;
 mod abi;
+mod stat;
 
 type c_int = i32;
 type c_long = i64;
@@ -221,6 +222,8 @@ pub unsafe extern "C" fn epoll_main(argc: isize, argv: *mut *mut u8, _envp: *mut
         // `abi` / `pollbench` (lane epollabi, see abi.rs).
         if !arg.is_null() && *arg == b'a' { return abi::abi_main(); }
         if !arg.is_null() && *arg == b'p' { return abi::pollbench(); }
+        // `stat` (lane epattr, see stat.rs).
+        if !arg.is_null() && *arg == b's' { return stat::stat_main(); }
         // `cost` / `costbench` (lane epollcost, see cost.rs).
         if !arg.is_null() && *arg == b'c' {
             return if *arg.add(4) == b'b' { cost::costbench() } else { cost::cost_main() };

@@ -79,6 +79,8 @@ SUITES = {
                 # cases, and probes per call of a cosmic-comp-shaped set.
                 "/bin/epolltest cost",
                 "/bin/epolltest abi",
+                # /proc/epollstat per-instance attribution (lane epattr).
+                "/bin/epolltest stat",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/udptest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/pstest",

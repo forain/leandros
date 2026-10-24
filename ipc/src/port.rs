@@ -76,6 +76,9 @@ struct PortEntry {
     head:      u16,
     tail:      u16,
     handler:   Option<HandlerFn>,
+    /// Set by `register_kernel_handler`: the handler trusts pointers in the
+    /// message (VFS/f2fs buffers), so only in-kernel callers may reach it.
+    kernel_only: bool,
     queue:     Queue,
 }
 
@@ -316,7 +319,7 @@ fn create_with_depth(pid: u32, depth: usize) -> Option<Port> {
         Some(q) => q,
         None => { report_table_full(PORT_TABLE.lock().live, "out of memory for the queue"); return None; }
     };
-    let mut entry = PortEntry { owner_pid: pid, head: 0, tail: 0, handler: None, queue };
+    let mut entry = PortEntry { owner_pid: pid, head: 0, tail: 0, handler: None, kernel_only: false, queue };
     // A grown slab is allocated with the lock dropped (the allocator is never
     // entered under PORT_TABLE), then swapped in if nobody grew it meanwhile.
     let mut spare: Option<Vec<Slot>> = None;
@@ -483,6 +486,22 @@ pub fn is_owner(port: Port, pid: u32) -> bool {
 /// What a sender's permission check needs to know about `port`: `None` if it
 /// does not exist, else `Some((has_handler, owner_pid))`. A handler port is a
 /// kernel server endpoint; any other port is a queue only its owner reads.
+/// Register a handler that only kernel code may call: user `sys_send` /
+/// `sys_call` to it is EPERM. For servers whose messages carry raw buffer
+/// pointers that the kernel's syscall entries range-check before sending —
+/// a user process sending the message itself would bypass that check and
+/// could name a kernel address.
+pub fn register_kernel_handler(port: Port, handler: HandlerFn) -> bool {
+    if !register_handler(port, handler) { return false; }
+    if let Some(e) = PORT_TABLE.lock().entry_mut(port) { e.kernel_only = true; }
+    true
+}
+
+/// True when user code may not send to `port` (see `register_kernel_handler`).
+pub fn is_kernel_only(port: Port) -> bool {
+    PORT_TABLE.lock().entry(port).map_or(false, |e| e.kernel_only)
+}
+
 pub fn send_target(port: Port) -> Option<(bool, u32)> {
     PORT_TABLE.lock().entry(port).map(|e| (e.handler.is_some(), e.owner_pid))
 }

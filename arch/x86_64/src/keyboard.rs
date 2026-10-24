@@ -79,6 +79,18 @@ fn log(s: &str) {
     unsafe { serial_print(s.as_ptr(), s.len()) };
 }
 
+/// One line per IRQ 1 routing, like PSMOUSE's IRQ 12 line: laptop bring-up
+/// needs to see which GSI the keyboard IRQ landed on after MADT overrides.
+pub fn log_irq1_route() {
+    let mut b = [0u8; 10];
+    let mut i = b.len();
+    let mut v = super::ioapic::isa_route(1).0 as u32;
+    loop { i -= 1; b[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+    log("[I8042] IRQ 1 -> GSI ");
+    log(core::str::from_utf8(&b[i..]).unwrap_or("?"));
+    log(" -> vector 33\n");
+}
+
 /// Whether the PS/2 controller is in use.
 pub fn present() -> bool { PRESENT.load(Ordering::Acquire) }
 
@@ -242,6 +254,7 @@ pub fn recheck(when: &str) {
         if unsafe { probe() }.is_ok() {
             PRESENT.store(true, Ordering::Release);
             unsafe { super::ioapic::set_isa_irq(1, super::cpus::bsp_apic_id().min(0xFF) as u8, 33) };
+            log_irq1_route();
             log("[I8042] PS/2 controller found ");
             log(when);
             log(" (self-test 0x55, kbd port ok)\n");

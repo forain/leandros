@@ -465,7 +465,7 @@ def main():
         with open(f"{OUT}/serial-live.log", "wb") as f:
             f.write(SER.buf[mark:])
     if "--post" in A:
-        o = sh(opt("--post", ""), 120)
+        o = sh(opt("--post", ""), opt("--post-timeout", 120, float))
         open(f"{OUT}/post.txt", "w").write(o); log(o[-4000:])
     if "--hostpost" in A:
         # Host-side command (chords, screenshots) while the session is live.

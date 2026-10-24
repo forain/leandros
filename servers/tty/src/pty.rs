@@ -1247,10 +1247,11 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
             }
             TIOCSIG => {
                 // A master asking for a signal on the slave's foreground job.
-                if arg == 0 {
-                    -14
+                // Linux passes the signal number by value, not by pointer.
+                let s = arg as i32;
+                if !(1..=64).contains(&s) {
+                    -22
                 } else {
-                    let s = unsafe { core::ptr::read(arg as *const i32) };
                     sig = Some((p.pgrp, s as u32));
                     0
                 }

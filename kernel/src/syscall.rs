@@ -2506,6 +2506,7 @@ fn dispatch_inner(
 fn ipc_send_permitted(port: u32) -> isize {
     match port::send_target(port) {
         None => -9,
+        Some((true, _)) if port::is_kernel_only(port) => -1, // EPERM
         Some((true, _)) => 0,
         Some((false, owner)) => sched::cred::ipc_send_check(owner),
     }
@@ -9105,8 +9106,8 @@ fn sys_blkdev_info(index: usize, out_ptr: usize) -> isize {
 
 fn sys_blkdev_name(index: usize, out_ptr: usize) -> isize {
     let d = match drivers::blkdev::describe(index) {
-        Some(d) => d,
-        None => return -19, // ENODEV
+        Some(d) if !d.gone => d,
+        _ => return -19, // ENODEV (never registered, or unplugged)
     };
     let name = d.name();
     if !validate_user_buf(out_ptr, drivers::blkdev::NAME_MAX) { return -14; } // EFAULT
@@ -11569,8 +11570,8 @@ fn tty_ioctl_arg(cmd: usize) -> Option<(usize, bool)> {
         0x5414 => Some((8, false)),                         // TIOCSWINSZ
         // TIOCGPGRP, TIOCOUTQ, FIONREAD, TIOCGSID, TIOCGPTN, TIOCGPTLCK
         0x540F | 0x5411 | 0x541B | 0x5429 | 0x8004_5430 | 0x8004_5439 => Some((4, true)),
-        // TIOCSPGRP, TIOCSPTLCK, TIOCSIG
-        0x5410 | 0x4004_5431 | 0x4004_5436 => Some((4, false)),
+        // TIOCSPGRP, TIOCSPTLCK (TIOCSIG's arg is the signal number by value)
+        0x5410 | 0x4004_5431 => Some((4, false)),
         _ => None,
     }
 }
@@ -13097,7 +13098,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         else if !infinite && deadline - now <= 2_000_000 { gd_inc(K_EP_SHORT); }
     }
     if EPOLL_READY.load(Ordering::Relaxed) {
-        return epoll_wait_ready(pid, slot, events_ptr, maxevents, infinite, deadline);
+        return epoll_wait_ready(pid, epfd, slot, events_ptr, maxevents, infinite, deadline);
     }
     let mut gd_woke = 0u64;
     loop {
@@ -13520,7 +13521,7 @@ fn ep_nested_slot(pid: u32, it: &EpollInterest) -> Option<usize> {
 
 /// epoll_wait on the ready-list path (see above). Same contract as the loop
 /// in `epoll_wait_until`.
-fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
+fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxevents: usize,
                     infinite: bool, deadline: u64) -> isize {
     use core::sync::atomic::Ordering::Relaxed;
     use sched::wakestat as ws;
@@ -13608,6 +13609,8 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
     let mut gd_woke = 0u64;
     let mut churn = 0u32;
     let mut woke = false; // a real sleep ended since the last park (EP_USELESS)
+    let mut woke_ring = false; // that wake named registrations (else: an unattributed full re-probe)
+    let st = ws::ep_stat(c.inst, sched::current_tgid(), epfd as u32);
     loop {
         let gen0 = EPOLL_CTL_GEN.load(Ordering::Acquire);
         let mut dirty = false;
@@ -13655,6 +13658,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
         }
         pending = false;
         let why_now = core::mem::replace(&mut why, EpWhy::Nothing); // the kids are judged by it too
+        woke_ring = matches!(why_now, EpWhy::Ring(_));
         recheck.clear(); changed.clear();
         // ---- PROBE ---- only the candidates; per registration, exactly the
         // probe-everything loop's rules.
@@ -13792,6 +13796,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
             else if interrupted() { gd_inc(K_EP_INTR); }
         }
         if n > 0 || timed_out || interrupted() {
+            if n > 0 && woke { st.useful.fetch_add(1, Relaxed); }
             // Keep the snapshot (and the listener) for the next call: what
             // was not acted on yet is re-probed then.
             for &i in recheck.iter() { if let Some(e) = c.ents.get_mut(i as usize) { e.ready = true; } }
@@ -13826,7 +13831,17 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
         }
         // ---- BLOCK ---- unless a wake is already waiting (one RUN_QUEUE
         // hold, so none falls between the look and the sleep).
-        if woke { ws::EP_USELESS.fetch_add(1, Relaxed); woke = false; }
+        if woke {
+            ws::EP_USELESS.fetch_add(1, Relaxed); woke = false;
+            // Attribute the useless wake: the registrations this pass probed
+            // (the ones the wake's ring named), else the unattributed bucket.
+            st.useless.fetch_add(1, Relaxed);
+            if woke_ring {
+                for i in 0..cand.len().min(c.ents.len()) {
+                    if cand[i] && c.ents[i].used { st.note_fd(c.ents[i].fd as u32); }
+                }
+            } else { st.note_fd(ws::EpStat::ALL_FD); }
+        }
         match sched::poll_listen_park(lid, if infinite { u64::MAX } else { deadline }) {
             sched::ListenPark::Taken(r) => { ep_share(&mut c.others, &r); why = EpWhy::Ring(r); }
             sched::ListenPark::Off => {
@@ -13842,6 +13857,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                     continue;
                 }
                 ws::EP_PARKS.fetch_add(1, Relaxed);
+                st.parks.fetch_add(1, Relaxed);
                 sched::sysacct::note(sched::current_tgid(), sched::sysacct::NR_EPOLL_PARK);
                 if gd_stats() { gd_inc(K_EP_PARK); }
                 // The snapshot lives in the Task while asleep: a thread killed
