@@ -332,6 +332,7 @@ const CACHE_MIN_SLOTS: usize = 1024;
 /// instead. Reported by `cache_backstop_counts`.
 static META_INPLACE: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 static BACKSTOP_CP_WANTED: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+static BACKSTOP_FORCE_TICK: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 
 /// (requests doomed for a checkpoint, metadata blocks written in place) by
 /// the cache backstop since boot.
@@ -413,6 +414,8 @@ struct BlockCache {
     /// current no-I/O request was doomed instead, and `with_mount` runs a
     /// checkpoint before running it again (f2fsdur.md step 8b).
     cp_wanted: bool,
+    /// `f2fs.backstop_force=N` (tests only, 0 = off).
+    backstop_force: u64,
     /// No-I/O request mode (lane nostall, see `with_mount`): `PROBE_OFF`,
     /// `PROBE_ON` (a miss is recorded instead of read) or `PROBE_MISSED`
     /// (a miss happened: the request's result will be discarded and its
@@ -495,6 +498,7 @@ impl BlockCache {
                 _ => 2 * CACHE_MAX_SLOTS,
             },
             cp_wanted: false,
+            backstop_force: drivers::nvidia_probe::cmdline_opt("f2fs.backstop_force").unwrap_or(0) as u64,
             probe: PROBE_OFF,
             misses: [(0, 0); MISS_BATCH],
             nmiss: 0,
@@ -787,6 +791,13 @@ impl BlockCache {
     /// takes a never-used slot (growing up to the cap first), else the least
     /// recently used clean slot.
     fn take_slot(&mut self, dev: usize) -> usize {
+        // `f2fs.backstop_force=N` (tests): every Nth slot a no-I/O request
+        // takes goes down the checkpoint-first backstop path.
+        let force = self.backstop_force;
+        if force > 0 && self.probe == PROBE_ON && CP_MUTEX.owner_raw() != sched::current_pid() as u32 + 1
+            && BACKSTOP_FORCE_TICK.fetch_add(1, atomic::Ordering::Relaxed) % force == force - 1 {
+            return self.backstop_doom();
+        }
         let tail_used = self.tail == NIL || self.meta[self.tail as usize].blk_no != NULL_BLK;
         if tail_used && self.meta.len() < self.cap { let _ = self.grow(); }
         if self.tail == NIL && self.meta.len() < self.grow_max && self.grow() {
@@ -820,13 +831,7 @@ impl BlockCache {
             // Only metadata is left to write back: a block in place would
             // not be crash-atomic. Doom the request (it never installs a
             // block from here on) and let `with_mount` checkpoint first.
-            let n = BACKSTOP_CP_WANTED.fetch_add(1, atomic::Ordering::Relaxed);
-            if n == 0 || n.is_power_of_two() {
-                dbg_str("[F2FS] block cache exhausted: checkpoint requested instead of a metadata write in place\n");
-            }
-            self.doom();
-            self.cp_wanted = true;
-            return usize::MAX;
+            return self.backstop_doom();
         }
         self.probe_abandon();
         self.exhausted += 1;
@@ -854,6 +859,18 @@ impl BlockCache {
         self.meta[i].blk_no = NULL_BLK;
         self.meta[i].uep = 0;
         i
+    }
+
+    /// The backstop would write a metadata block in place: doom the current
+    /// no-I/O request instead and ask `with_mount` for a checkpoint. No slot.
+    fn backstop_doom(&mut self) -> usize {
+        let n = BACKSTOP_CP_WANTED.fetch_add(1, atomic::Ordering::Relaxed);
+        if n == 0 || n.is_power_of_two() {
+            dbg_str("[F2FS] block cache exhausted: checkpoint requested instead of a metadata write in place\n");
+        }
+        self.doom();
+        self.cp_wanted = true;
+        usize::MAX
     }
 
     /// Give the detached slot `i` to block `blk`.
