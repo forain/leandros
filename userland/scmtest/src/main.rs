@@ -48,8 +48,10 @@
 #![allow(non_camel_case_types)]
 
 extern crate leandros_libc;
+
+mod bench;
 use leandros_libc::*;
-use leandros_libc::syscall::{nr, syscall1, syscall2, syscall3, syscall4, syscall6};
+use leandros_libc::syscall::{nr, syscall0, syscall1, syscall2, syscall3, syscall4, syscall6};
 
 // Syscall numbers not yet wrapped by leandros-libc. Values match
 // `kernel/src/syscall.rs`'s `mod nr` tables exactly (AArch64 first,
@@ -1308,7 +1310,24 @@ unsafe fn test_mincore() -> bool {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const *const u8) -> i32 {
+pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *const u8) -> i32 {
+    if argc >= 2 {
+        let a1 = *argv.add(1);
+        if !a1.is_null() && *a1 == b'b' && *a1.add(1) == b'e' {
+            let mut iters = 2000usize;
+            if argc >= 3 {
+                let mut p = *argv.add(2); let mut v = 0usize;
+                while *p >= b'0' && *p <= b'9' { v = v * 10 + (*p - b'0') as usize; p = p.add(1); }
+                if v > 0 { iters = v; }
+            }
+            let mut hogs = 0usize;
+            if argc >= 4 {
+                let mut p = *argv.add(3);
+                while *p >= b'0' && *p <= b'9' { hogs = hogs * 10 + (*p - b'0') as usize; p = p.add(1); }
+            }
+            return bench::run(iters, hogs);
+        }
+    }
     // M7q TASK 1: helper mode is entered ONLY via this test's own self-execve,
     // which sets SCMTEST_INHERIT_FD. A plain `scmtest` invocation never has it,
     // so the full suite runs as before.
