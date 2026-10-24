@@ -35,6 +35,10 @@ pub type Port = u32;
 /// Handler signature: (msg, caller_pid, target_port_id) -> reply
 pub type HandlerFn = fn(&Message, u32, u32) -> Message;
 
+/// User-send filter: true when a message built by user code (`sys_send` /
+/// `sys_call`) may reach the handler. In-kernel senders are never filtered.
+pub type UserSendFilter = fn(&Message) -> bool;
+
 /// Queue slots of a port made by [`create`] (one is kept empty by the ring, so
 /// `QUEUE_DEPTH - 1` messages fit).
 pub const QUEUE_DEPTH: usize = 16;
@@ -76,6 +80,9 @@ struct PortEntry {
     head:      u16,
     tail:      u16,
     handler:   Option<HandlerFn>,
+    /// Set by `register_user_filter`: which messages user code may send to
+    /// this handler port (see `user_send_allowed`). None = all of them.
+    user_filter: Option<UserSendFilter>,
     queue:     Queue,
 }
 
@@ -316,7 +323,7 @@ fn create_with_depth(pid: u32, depth: usize) -> Option<Port> {
         Some(q) => q,
         None => { report_table_full(PORT_TABLE.lock().live, "out of memory for the queue"); return None; }
     };
-    let mut entry = PortEntry { owner_pid: pid, head: 0, tail: 0, handler: None, queue };
+    let mut entry = PortEntry { owner_pid: pid, head: 0, tail: 0, handler: None, user_filter: None, queue };
     // A grown slab is allocated with the lock dropped (the allocator is never
     // entered under PORT_TABLE), then swapped in if nobody grew it meanwhile.
     let mut spare: Option<Vec<Slot>> = None;
@@ -485,4 +492,24 @@ pub fn is_owner(port: Port, pid: u32) -> bool {
 /// kernel server endpoint; any other port is a queue only its owner reads.
 pub fn send_target(port: Port) -> Option<(bool, u32)> {
     PORT_TABLE.lock().entry(port).map(|e| (e.handler.is_some(), e.owner_pid))
+}
+
+/// Restrict which messages user code may send to the handler port `port`.
+///
+/// A server reached through VFS forwards gets kernel-filled identity in the
+/// message (the open's `open_id`, the caller pid): the handler cannot tell
+/// such a message from one a user process built itself with `sys_call`, so a
+/// port that also takes a user protocol names the tags user code may use and
+/// the syscall entries refuse the rest (EPERM) before the handler runs.
+pub fn register_user_filter(port: Port, filter: UserSendFilter) -> bool {
+    match PORT_TABLE.lock().entry_mut(port) {
+        Some(e) if e.handler.is_some() => { e.user_filter = Some(filter); true }
+        _ => false,
+    }
+}
+
+/// False when the user-send filter of `port` refuses `msg`.
+pub fn user_send_allowed(port: Port, msg: &Message) -> bool {
+    let f = PORT_TABLE.lock().entry(port).and_then(|e| e.user_filter);
+    f.map_or(true, |f| f(msg))
 }

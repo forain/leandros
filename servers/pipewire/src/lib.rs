@@ -336,6 +336,11 @@ pub fn init(cmdline: &str) -> Result<u32, i32> {
     if !port::register_handler(server_port, handle_msg) {
         return Err(-1);
     }
+    // The port is in every process's auxv (258) for the legacy PCM protocol,
+    // but the VFS tags carry kernel-filled identity (open_id): user code may
+    // only send the legacy tags, or it could act as another process's open
+    // (claim/release HOLD_OPEN, holder-only SET_PARAMS).
+    port::register_user_filter(server_port, user_may_send);
     state.bound_port = server_port;
 
     vfs_server::register_device_notify_open("/dev/pipewire", server_port, 0, DEV_MAJOR, DEV_MINOR);
@@ -347,6 +352,12 @@ pub fn init(cmdline: &str) -> Result<u32, i32> {
     pci::rdebug_hex(server_port);
     pci::rdebug("\n");
     Ok(server_port)
+}
+
+/// The user-sendable tags: the legacy protocol (0x100 SET_PARAMS, 0x200 PCM,
+/// both arbitrated by the kernel-supplied caller pid), PUMP and PING.
+fn user_may_send(msg: &Message) -> bool {
+    matches!(msg.tag, 0x100 | 0x200 | 0x300 | 0x1000)
 }
 
 fn handle_msg(msg: &Message, caller_pid: u32, _target_port: u32) -> Message {
