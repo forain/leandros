@@ -9,3 +9,8 @@ pub static FWAKE_EMPTY:  AtomicU64 = AtomicU64::new(0);
 pub static FWAKE_LOCKED: AtomicU64 = AtomicU64::new(0);
 /// FUTEX_WAIT returns whose waker already reset the task (no second RUN_QUEUE hold).
 pub static FWAIT_TIDY:   AtomicU64 = AtomicU64::new(0);
+/// Poll-deadline service passes (`wake_due_poll_deadlines_keyed`), the parked
+/// slots they examined, and passes that fell back to the full O(parked) scan.
+pub static DL_PASS:     AtomicU64 = AtomicU64::new(0);
+pub static DL_SLOTS:    AtomicU64 = AtomicU64::new(0);
+pub static DL_FULL:     AtomicU64 = AtomicU64::new(0);
