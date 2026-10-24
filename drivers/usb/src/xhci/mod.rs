@@ -1340,7 +1340,7 @@ pub struct HubPorts {
 impl HubPorts {
     /// Route string of the device on downstream `port`.
     pub fn child_route(&self, port: u8) -> u32 {
-        self.route | ((port.min(15) as u32) << (4 * self.depth as u32))
+        crate::hubproto::child_route(self.route, self.depth, port).unwrap_or(self.route)
     }
 }
 
@@ -1351,37 +1351,38 @@ const HUB_FEAT_PORT_RESET: u16 = 4;
 const HUB_FEAT_PORT_POWER: u16 = 8;
 pub const HUB_FEAT_C_CONNECTION: u16 = 16;
 const HUB_FEAT_C_RESET: u16 = 20;
-pub const HUB_PS_CONNECTION: u16 = 1 << 0;
-const HUB_PS_ENABLE: u16 = 1 << 1;
-const HUB_PS_LOW_SPEED: u16 = 1 << 9;
-const HUB_PS_HIGH_SPEED: u16 = 1 << 10;
-pub const HUB_PC_CONNECTION: u16 = 1 << 0;
-const HUB_PC_RESET: u16 = 1 << 4;
-/// Tiers the 20-bit route string allows below a root port.
-const HUB_MAX_DEPTH: u8 = 5;
-
-fn route_depth(route: u32) -> u8 {
-    (0..5).take_while(|i| (route >> (4 * i)) & 0xF != 0).count() as u8
-}
+pub const HUB_PS_CONNECTION: u16 = hubproto::PS_CONNECTION;
+const HUB_PS_ENABLE: u16 = hubproto::PS_ENABLE;
+pub const HUB_PC_CONNECTION: u16 = hubproto::PC_CONNECTION;
+use crate::hubproto::{self, ChildSpeed};
 
 /// Configure the hub on `slot`: SET_CONFIGURATION, hub descriptor, slot
 /// context Hub bit and port count, then power every downstream port.
+/// A SuperSpeed hub reads the 0x2A descriptor and is told its tier with
+/// SET_HUB_DEPTH; it has no transaction translator.
 fn setup_hub(hc: &Arc<Hc>, slot: u8, speed: u8, config: u8, root_port: u8, route: u32, tt: u32)
     -> Result<HubPorts, &'static str>
 {
-    if speed >= SPEED_SS { return Err("SuperSpeed hubs are not supported"); }
-    let depth = route_depth(route);
-    if depth >= HUB_MAX_DEPTH { return Err("hub nested too deep"); }
+    let ss = speed >= SPEED_SS;
+    let depth = hubproto::route_depth(route);
+    if depth >= hubproto::MAX_DEPTH { return Err("hub nested too deep"); }
     control(hc, slot, 0x00, 9, config as u16, 0, CtrlData::None, ENUM_CTRL_TIMEOUT_MS)
         .map_err(|_| "SET_CONFIGURATION failed")?;
-    let mut hd = [0u8; 9];
-    let n = control(hc, slot, 0xA0, 6, 0x2900, 0, CtrlData::In(&mut hd), ENUM_CTRL_TIMEOUT_MS)
+    let (wvalue, len) = hubproto::descriptor_request(ss);
+    let mut hd = [0u8; 12];
+    let n = control(hc, slot, 0xA0, 6, wvalue, 0, CtrlData::In(&mut hd[..len]), ENUM_CTRL_TIMEOUT_MS)
         .map_err(|_| "GET_DESCRIPTOR(hub) failed")?;
-    if n < 7 || hd[1] != 0x29 || hd[2] == 0 { return Err("bad hub descriptor"); }
-    let nports = hd[2];
-    let chars = u16::from_le_bytes([hd[3], hd[4]]);
-    let power_ms = (hd[5] as u32 * 2).max(100);
-    let ttt = if speed == SPEED_HS { ((chars >> 5) & 3) as u32 } else { 0 };
+    let desc = hubproto::parse_descriptor(ss, &hd[..n.min(len)])?;
+    if desc.reported_ports > desc.nports {
+        usb_log!("[XHCI] slot {}: hub has {} ports, only {} reachable by route string\n",
+                 slot, desc.reported_ports, desc.nports);
+    }
+    if ss {
+        control(hc, slot, 0x20, hubproto::REQ_SET_HUB_DEPTH, depth as u16, 0, CtrlData::None, ENUM_CTRL_TIMEOUT_MS)
+            .map_err(|_| "SET_HUB_DEPTH failed")?;
+    }
+    let (nports, power_ms) = (desc.nports, desc.power_ms);
+    let ttt = if speed == SPEED_HS { ((desc.characteristics >> 5) & 3) as u32 } else { 0 };
     let in_phys = hc.lock().build_hub_input(slot, nports, ttt).ok_or("slot vanished")?;
     match run_cmd(hc, Trb::new(TRB_CONFIGURE_EP, in_phys, 0, (slot as u32) << 24)) {
         Ok((CC_SUCCESS, _)) => {}
@@ -1414,6 +1415,7 @@ pub fn hub_clear_port_feature(hc: &Arc<Hc>, hub: &HubPorts, port: u8, feature: u
 /// through the hub, then Enable Slot + Address Device with the route string
 /// (and the hub's TT for a full/low-speed device behind a high-speed hub).
 pub fn enumerate_hub_port(hc: &Arc<Hc>, hub: &HubPorts, port: u8) -> Result<Enumerated, &'static str> {
+    let ss = hub.speed >= SPEED_SS;
     sleep_ms(100);
     let (st, _) = hub_port_status(hc, hub, port).ok_or("hub GET_STATUS failed")?;
     if st & HUB_PS_CONNECTION == 0 { return Err("device left during debounce"); }
@@ -1422,18 +1424,24 @@ pub fn enumerate_hub_port(hc: &Arc<Hc>, hub: &HubPorts, port: u8) -> Result<Enum
     let d = Deadline::after_ms(500);
     let st = loop {
         if let Some((s, c)) = hub_port_status(hc, hub, port) {
-            if c & HUB_PC_RESET != 0 { break s; }
+            if hubproto::reset_done(ss, c) { break s; }
         }
         if d.expired() { return Err("hub port reset timed out"); }
         sleep_ms(10);
     };
     hub_clear_port_feature(hc, hub, port, HUB_FEAT_C_RESET);
+    if ss {
+        hub_clear_port_feature(hc, hub, port, hubproto::FEAT_C_BH_PORT_RESET);
+        hub_clear_port_feature(hc, hub, port, hubproto::FEAT_C_PORT_LINK_STATE);
+    }
     if st & HUB_PS_CONNECTION == 0 { return Err("device disconnected during reset"); }
     if st & HUB_PS_ENABLE == 0 { return Err("hub port not enabled after reset"); }
     sleep_ms(10); // reset recovery (USB 2.0 §7.1.7.5)
-    let speed = if st & HUB_PS_LOW_SPEED != 0 { SPEED_LS }
-                else if st & HUB_PS_HIGH_SPEED != 0 { SPEED_HS } else { SPEED_FS };
-    let tt = if hub.speed == SPEED_HS {
+    let speed = match hubproto::child_speed(ss, st) {
+        ChildSpeed::Low => SPEED_LS, ChildSpeed::Full => SPEED_FS,
+        ChildSpeed::High => SPEED_HS, ChildSpeed::Super => SPEED_SS,
+    };
+    let tt = if ss { 0 } else if hub.speed == SPEED_HS {
         if speed != SPEED_HS { hub.slot as u32 | (port as u32) << 8 } else { 0 }
     } else { hub.tt };
     let slot_type = hc.lock().port_slot_type[hub.root_port as usize - 1];
