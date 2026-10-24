@@ -19,7 +19,7 @@ Options:
                              pcibridge host:pcibridgetest.py alone (root port -> PCI bridge -> virtio-rng, own boot)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
                                       (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
-                                      + host:netroamtest.py (Wi-Fi roaming between two subnets, own boot)
+                                      + host:netroamtest.py (Wi-Fi roaming between two subnets, own boot) + host:netflaptest.py
                                       + host:udppeertest.py (udptest peer: fragments, ICMP errors, IGMP, broadcast)
                              netroam  host:netroamtest.py alone
                              udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
@@ -174,6 +174,8 @@ SUITES = {
                 # servers across address churn, autoconnect policy, the
                 # not-joinable diagnostics): its own boot, see netroamtest.py.
                 "host:netroamtest.py",
+                # netctl event path on a QMP set_link flap (own boot).
+                "host:netflaptest.py",
                 # IP fragmentation, ICMP errors, IGMP, broadcast, cmsgs against
                 # a frame-level host peer on a second NIC: udppeertest.py.
                 "host:udppeertest.py"],
