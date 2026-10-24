@@ -14188,7 +14188,7 @@ fn gap2_sample_tick() {
 /// diagnostic. Note that `artifacts/m15_serial_stall.py` needs it on: its guard
 /// works by having the timer IRQ print, and with the census off nothing reaches
 /// `putc` from IRQ context for a parked serial reader to back-pressure.
-pub const EV_STATS: bool = false;
+pub const EV_STATS: bool = true;
 
 /// 0.5 Hz `[EVSTAT]` census of every evdev node, one line per device.
 ///
@@ -14214,7 +14214,7 @@ fn evstat_tick() {
     let now = ticks() as usize;                        // 100 Hz
     if now.wrapping_sub(LAST.load(Relaxed)) < 200 { return; }   // 0.5 Hz
     LAST.store(now, Relaxed);
-    for dev in 0..2usize {
+    for dev in 0..3usize {
         let c = evdev_server::census(dev);
         mm::gap2::s("[EVSTAT] t=");   mm::gap2::h(now);
         mm::gap2::kv(" dev=",     dev);
