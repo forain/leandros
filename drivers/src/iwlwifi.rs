@@ -299,6 +299,8 @@ static THREAD_QUIET: AtomicBool = AtomicBool::new(false);
 static QUIET_PARKS: AtomicU32 = AtomicU32::new(0);
 /// Beacons of the tracked BSS (what the idle interrupts carry).
 static BCN_RX: AtomicU32 = AtomicU32::new(0);
+/// group << 8 | cmd of the last notification the daemon handed the thread.
+static LAST_KICK_NOTIF: AtomicU32 = AtomicU32::new(0);
 /// Housekeeping park while associated and nothing is due.
 const QUIET_PARK_MS: u64 = 1000;
 /// The driver thread's wake key (an interrupt, or the net daemon queueing a
@@ -444,7 +446,7 @@ struct Dev {
     rx_eth: VecDeque<Vec<u8>>,
     /// `service` runs for the net daemon (`poll_receive`).
     in_netd: bool,
-    /// rx_frames + txs.ok at the last housekeeping tick (`quiet_tick`).
+    /// txs.ok at the last housekeeping tick (`quiet_tick`).
     quiet_mark: u64,
     rx_frames: u64,
     rx_dropped: u64,
@@ -639,8 +641,13 @@ impl Dev {
         // it may have gone to the side that is not running).
         if IRQ_ON.load(Ordering::Relaxed) {
             if !self.in_netd && self.rx_eth.len() > eth0 { crate::netdev::kick(); }
-            if self.in_netd && (self.notifs.len() > notif0 || self.resps.len() > resp0) { iwl_kick(); }
-            else if self.in_netd && THREAD_QUIET.load(Ordering::Relaxed) && self.needs_tick() {
+            if self.in_netd && (self.notifs.len() > notif0 || self.resps.len() > resp0) {
+                if let Some(p) = self.notifs.back().filter(|_| self.notifs.len() > notif0) {
+                    LAST_KICK_NOTIF.store((p.group as u32) << 8 | p.cmd as u32, Ordering::Relaxed);
+                }
+                iwl_kick();
+            }
+            else if self.in_netd && THREAD_QUIET.load(Ordering::Relaxed) && (self.needs_tick() || self.txs.ok != self.quiet_mark) {
                 THREAD_QUIET.store(false, Ordering::Relaxed);
                 iwl_kick();
             }
@@ -659,7 +666,9 @@ impl Dev {
     /// Nothing due and no frames either way since the last call: the
     /// housekeeping may park for `QUIET_PARK_MS`.
     fn quiet_tick(&mut self) -> bool {
-        let mark = self.rx_frames.wrapping_add(self.txs.ok);
+        // TX drives the housekeeping (rate table, ADDBA); received
+        // broadcast chatter does not, and held reorder frames are in needs_tick.
+        let mark = self.txs.ok;
         let quiet = mark == self.quiet_mark && !self.needs_tick();
         self.quiet_mark = mark;
         quiet
@@ -3163,11 +3172,11 @@ pub fn info_lines(out: &mut String) {
         let _ = writeln!(out, "firmware: {}", i.fw);
         let _ = writeln!(out, "state: {}", i.state);
         let _ = writeln!(out, "rfkill: {}", if i.rfkill { "on" } else { "off" });
-        let _ = writeln!(out, "irq: {} vector {:#04x} irqs {} empty {} last {:08x} wanted {}; thread parks {} kicked {} quiet {}; rearm_busy {} deferred {}; beacons {}",
+        let _ = writeln!(out, "irq: {} vector {:#04x} irqs {} empty {} last {:08x} wanted {}; thread parks {} kicked {} quiet {}; rearm_busy {} deferred {}; beacons {} last_notif {:04x}",
                          if IRQ_ON.load(Ordering::Relaxed) { "msi" } else { "polled" }, IRQ_VECTOR.load(Ordering::Relaxed),
                          IRQS.load(Ordering::Relaxed), IRQ_EMPTY.load(Ordering::Relaxed), IRQ_LAST.load(Ordering::Relaxed),
                          tr::IRQ_WANTED.load(Ordering::Relaxed) as u8, THREAD_PARKS.load(Ordering::Relaxed), THREAD_KICKED.load(Ordering::Relaxed), QUIET_PARKS.load(Ordering::Relaxed),
-                         RX_REARM_BUSY.load(Ordering::Relaxed), RX_REARM_DEFERRED.load(Ordering::Relaxed), BCN_RX.load(Ordering::Relaxed));
+                         RX_REARM_BUSY.load(Ordering::Relaxed), RX_REARM_DEFERRED.load(Ordering::Relaxed), BCN_RX.load(Ordering::Relaxed), LAST_KICK_NOTIF.load(Ordering::Relaxed));
         if i.mcc != [0, 0] { let _ = writeln!(out, "regulatory: {}{}", i.mcc[0] as char, i.mcc[1] as char); }
         if link_up() {
             let _ = writeln!(out, "ssid: {}", wf::ssid_display(&i.ssid));
