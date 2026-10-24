@@ -6,8 +6,8 @@ Boots its own VM with LEANDROS_NIC=e1000e (QEMU's 82574L) and checks:
               monitor polled STATUS every 250 ms: 4/s by construction);
   flap_down / flap_up
               QMP `set_link net0 off|on`: /proc/net/nic shows the new state within LAT_BOUND s
-              of the command, and the monitor counted an interrupt wake (ICR.LSC) for it;
-  tx_bulk     `/bin/netcheck --put 10.0.2.2 PORT 32` reaches a host sink: PASS line, the
+              of the command (up: LAT_UP_BOUND, QEMU's autoneg delay), and the monitor counted an interrupt wake (ICR.LSC) for it;
+  tx_bulk     `/bin/netcheck --put <host> PORT 32` (10.0.2.2 or vmnet 192.168.105.1) reaches a host sink: PASS line, the
               host received every byte, Mbit/s reported.
 Run id `<caller run id>-linkmon`. Exit 0 iff all PASS.
 """
@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DRV = os.path.join(HERE, "driver.py")
 IDLE_BOUND = 1.0
 LAT_BOUND = 1.0
+LAT_UP_BOUND = 1.6  # QEMU e1000e completes autonegotiation ~0.5 s after set_link on
 TX_MIB = 32
 
 
@@ -43,7 +44,9 @@ def main(argv):
         print(f"{name}: {'PASS' if ok else 'FAIL'} {detail}".rstrip(), flush=True)
 
     def sh(cmd, t=30):
-        return driver.serial_run(cmd, timeout=t * scale, arch=arch).get("output", "")
+        r = subprocess.run([sys.executable, DRV, "run", cmd, str(int(t * scale))],
+                           capture_output=True, text=True, timeout=t * scale + 60)
+        return r.stdout
 
     def linkmon():
         m = re.search(r"linkmon: irq_wakes (\d+) timer_wakes (\d+)", sh("cat /proc/net/nic"))
@@ -78,24 +81,37 @@ def main(argv):
             rate = (b[1] - a[1]) / max(tb - ta, 0.1)
             verdict("idle_wakes", rate <= IDLE_BOUND,
                     f"{rate:.2f} timer wakes/s over {tb - ta:.1f} s (irq wakes +{b[0] - a[0]}; old poll = 4/s)")
-        # flaps: a guest loop stamps the uptime at which /proc/net/nic shows the new state
-        for name, cmd, want in (("flap_down", "set_link net0 off", "down"), ("flap_up", "set_link net0 on", "up")):
+        # flaps: a foreground guest loop (serial) stamps the uptime at which /proc/net/nic shows
+        # the new state; the host sends set_link over the monitor meanwhile.
+        for name, cmd, want, bound in (("flap_down", "set_link net0 off", "down", LAT_BOUND),
+                                       ("flap_up", "set_link net0 on", "up", LAT_UP_BOUND)):
             w0 = linkmon()
-            sh(f"rm -f /tmp/lm; (while :; do case \"$(cat /proc/net/nic)\" in *'link: {want}'*) "
-               f"cat /proc/uptime > /tmp/lm; break;; esac; done) >/dev/null 2>&1 &")
-            time.sleep(1)
-            tsend = uptime()
+            tsend0 = uptime()
+            h0 = time.time()
+            out = {}
+
+            def watch():
+                out["o"] = sh(f"while :; do case \"$(cat /proc/net/nic)\" in *'link: {want}'*) break;; esac; done; "
+                              f"echo LMSEEN $(cat /proc/uptime)", 20)
+            th = threading.Thread(target=watch)
+            th.start()
+            time.sleep(3)
+            tsend = tsend0 + (time.time() - h0)
             driver._monitor_send(cmd)
-            time.sleep(LAT_BOUND + 2)
-            m = re.search(r"^(\d+\.\d+)", sh("cat /tmp/lm 2>/dev/null"), re.M)
+            th.join(30)
+            m = re.search(r"LMSEEN (\d+\.\d+)", out.get("o", ""))
             w1 = linkmon()
             lat = float(m.group(1)) - tsend if m else -1
             irq = (w1[0] - w0[0]) if (w0 and w1) else 0
-            verdict(name, m is not None and lat <= LAT_BOUND and irq >= 1,
-                    f"seen {lat:.2f} s after the command (upper bound incl. serial round trip), irq wakes +{irq}")
+            verdict(name, m is not None and lat <= bound and irq >= 1,
+                    f"seen {lat:.2f} s after the command (+- serial latency), irq wakes +{irq}")
         t0 = time.time()
-        while time.time() - t0 < 60 * scale and "dhcp: bound" not in sh("cat /proc/net/nic"):
+        while time.time() - t0 < 60 * scale:
+            nic = sh("cat /proc/net/nic")
+            if "dhcp: bound" in nic and "link: up" in nic:
+                break
             time.sleep(2)
+        time.sleep(3)
         # TX bulk to a host sink
         srv = socket.socket()
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -114,10 +130,13 @@ def main(argv):
             c.close()
         th = threading.Thread(target=sink, daemon=True)
         th.start()
-        out = sh(f"/bin/netcheck --put 10.0.2.2 {port} {TX_MIB}", 120)
+        host = "10.0.2.2" if "10.0.2." in sh("cat /proc/net/nic") else "192.168.105.1"
+        out = sh(f"/bin/netcheck --put {host} {port} {TX_MIB}", 120)
         th.join(10)
         line = next((l for l in out.splitlines() if l.startswith("NETCHECK put:")), out[-200:])
         verdict("tx_bulk", "PASS" in line and got[0] == TX_MIB << 20, f"{line.strip()} | host got {got[0]} B")
+        if not res["tx_bulk"]:
+            print("nic:", " | ".join(l for l in sh("cat /proc/net/nic").splitlines() if re.match(r"(link|carrier|dhcp|address|irq|linkmon)", l)))
     finally:
         if not keep:
             subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)

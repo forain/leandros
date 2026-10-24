@@ -1816,20 +1816,44 @@ pub fn init(cmdline: &str) {
     let irq_desc = if !hwst.opts.msi {
         String::from("none (e1000e.msi=0, polled)")
     } else {
+        let arm = || {
+            let mut en = IRQ_EN_BASE;
+            if pch { en |= ICR_ECCER; }
+            if hwst.opts.rxirq { en |= IRQ_EN_RX; }
+            IRQ_EN.store(en, Ordering::SeqCst);
+            IRQ_ACTIVE.store(true, Ordering::SeqCst);
+            RX_IRQ.store(hwst.opts.rxirq, Ordering::SeqCst);
+            if hwst.opts.rxirq { "RX + link/errors" } else { "link/errors only, RX polled (e1000e.rxirq=0)" }
+        };
         match crate::irq::request_msi(func, isr, 0) {
             Ok(h) => {
                 let v = h.vector();
                 core::mem::forget(h);
-                let mut en = IRQ_EN_BASE;
-                if pch { en |= ICR_ECCER; }
-                if hwst.opts.rxirq { en |= IRQ_EN_RX; }
-                IRQ_EN.store(en, Ordering::SeqCst);
-                IRQ_ACTIVE.store(true, Ordering::SeqCst);
-                RX_IRQ.store(hwst.opts.rxirq, Ordering::SeqCst);
-                let rx = if hwst.opts.rxirq { "RX + link/errors" } else { "link/errors only, RX polled (e1000e.rxirq=0)" };
+                let rx = arm();
                 match v { Some(v) => format!("MSI vector {:#04x} ({})", v, rx), None => format!("MSI ({})", rx) }
             }
-            Err(e) => format!("none ({:?}; polled)", e),
+            // No MSI (aarch64 without an ITS): the INTx line, level, shared.
+            // The ISR masks (IMC) and acks (ICR read) before returning, so
+            // the line drops until the daemon re-arms IMS.
+            Err(e) => match func.intx_line() {
+                Some(line) => match crate::irq::request_irq(crate::irq::IrqSource::Line(line), isr, 0) {
+                    Ok(h) => {
+                        core::mem::forget(h);
+                        let _ = arm();
+                        // RX stays polled on the shared INTx line: RX-driven
+                        // INTx stalled a bulk upload to 0.03 Mbit/s in QEMU
+                        // (aarch64, lane linkmon); link/errors are what the
+                        // line is for here.
+                        IRQ_EN.fetch_and(!IRQ_EN_RX, Ordering::SeqCst);
+                        RX_IRQ.store(false, Ordering::SeqCst);
+                        let rx = "link/errors only, RX polled (INTx)";
+                        func.write16(0x04, func.read16(0x04) & !crate::pci::PCI_CMD_INTX_DISABLE);
+                        format!("INTx line {} (MSI {:?}; {})", line, e, rx)
+                    }
+                    Err(e2) => format!("none (MSI {:?}, INTx {:?}; polled)", e, e2),
+                },
+                None => format!("none ({:?}; polled)", e),
+            },
         }
     };
     elog!("interrupt: {}", irq_desc);
