@@ -78,9 +78,26 @@ static mut UART_BASE_ADDR: usize = BASE;
 
 // ── Register helpers ──────────────────────────────────────────────────────────
 
+/// Early-boot addressing (set by `early::setup` on the Limine path, reset by
+/// `set_base`/`reinit` once `arch_aarch64::init` maps the HHDM alias).
+pub const EARLY_LEGACY: u8 = 0;
+/// The physical address translates (bootloader map or `early` hook): use it.
+pub const EARLY_IDENT: u8 = 1;
+/// Nothing maps the UART yet: drop output instead of faulting.
+pub const EARLY_SILENT: u8 = 2;
+static EARLY_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(EARLY_LEGACY);
+
+pub fn set_early_mode(m: u8) { EARLY_MODE.store(m, core::sync::atomic::Ordering::Relaxed); }
+
+/// Effective register base, or None when the UART is not reachable yet.
 #[inline(always)]
-unsafe fn rd(off: usize) -> u32 {
+unsafe fn reg_base() -> Option<usize> {
     let mut base = UART_BASE_ADDR;
+    match EARLY_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+        EARLY_IDENT => return Some(base),
+        EARLY_SILENT => return None,
+        _ => {}
+    }
     // If MMU is enabled (TTBR1_EL1 is not 0), use the HHDM address
     let ttbr1: u64;
     core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1);
@@ -91,24 +108,25 @@ unsafe fn rd(off: usize) -> u32 {
             base += hhdm;
         }
     }
-    ((base + off) as *const u32).mmio_read()
+    Some(base)
+}
+
+#[inline(always)]
+unsafe fn rd(off: usize) -> u32 {
+    match reg_base() { Some(b) => ((b + off) as *const u32).mmio_read(), None => 0 }
 }
 
 #[inline(always)]
 unsafe fn wr(off: usize, val: u32) {
-    let mut base = UART_BASE_ADDR;
-    let ttbr1: u64;
-    core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1);
-    if ttbr1 != 0 && base < 0xFFFF_0000_0000_0000 {
-        extern "C" { fn mm_get_hhdm_offset() -> u64; }
-        let hhdm = mm_get_hhdm_offset() as usize;
-        if hhdm != 0 {
-            base += hhdm;
-        }
-    }
-    ((base + off) as *mut u32).mmio_write(val)
+    if let Some(b) = reg_base() { ((b + off) as *mut u32).mmio_write(val) }
 }
 
+
+unsafe fn leave_early() {
+    if EARLY_MODE.swap(EARLY_LEGACY, core::sync::atomic::Ordering::Relaxed) != EARLY_LEGACY {
+        crate::early::teardown();
+    }
+}
 
 // ── Initialise ────────────────────────────────────────────────────────────────
 
@@ -119,6 +137,7 @@ pub unsafe fn init() {
 /// Force set the UART base (e.g. to a virtual address).
 pub unsafe fn set_base(base: usize) {
     UART_BASE_ADDR = base;
+    leave_early();
 }
 
 /// The baud programming `reinit` ended up installing, recorded so `arch::init`
@@ -130,6 +149,7 @@ pub static mut UART_FBRD_SEEN: u32 = 0;
 
 pub unsafe fn reinit(base: usize) {
     UART_BASE_ADDR = base;
+    leave_early();
 
     // Keep the firmware's divisor and line control on real hardware. It has
     // demonstrably got 115200 right — its whole boot log arrives clean through
