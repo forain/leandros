@@ -9,6 +9,9 @@ run into `RC=?` (see the comment above serial_run in driver.py).
 Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
+  --cmdline "ARGS"         boot a copy of the image with this kernel command line
+                           (scripts/set-image-cmdline.sh; suite i915fake implies
+                           "i915.fake=2 i915.kms=1")
   --suite NAME             add a named list of commands (repeatable):
                              regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + proctest + chroottest + netctltest + sudotest + nmtest --quick (mock) + evherdtest + pollnarrowtest + listentagtest + vfstagtest + nettag2test + kparkstest + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
@@ -172,6 +175,10 @@ SUITES = {
     "udppeer": ["host:udppeertest.py"],
     # gpuprobe gl is what gpu-env runs before COSMIC; RC=0 only on a hardware
     # renderer (2 = software, 139 = the strict-PAN DRM ioctl SIGSEGV of L11.13).
+    # i915 UAPI end to end on the fake device (soft command streamer), the
+    # path Mesa iris takes on the laptop: catches a DRM-layer change that
+    # breaks i915 ioctl argument access (lane irisseg).
+    "i915fake": ["/bin/i915test"],
     "drm": ["/bin/drmsmoke", "/bin/gpuprobe gl"],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
@@ -217,6 +224,7 @@ def main(argv):
     gpu = "virgl" if os.environ.get("RUNTESTS_VIRGL") else "none"
     repeat, base_timeout, mode, keep = 1, 300.0, "uefi", False
     cmds, suites = [], []
+    cmdline = None
     i = 0
     while i < len(rest):
         a = rest[i]
@@ -234,6 +242,8 @@ def main(argv):
             mode = rest[i + 1]; i += 2
         elif a == "--keep":
             keep = True; i += 1
+        elif a == "--cmdline":
+            cmdline = rest[i + 1]; i += 2
         else:
             cmds.append(a); i += 1
     if not cmds and not suites:
@@ -243,12 +253,27 @@ def main(argv):
             print(f"unknown suite {s!r}; known: {', '.join(SUITES)}")
             return 2
         cmds += SUITES[s]
+    if "i915fake" in suites and cmdline is None:
+        cmdline = "i915.fake=2 i915.kms=1"
 
     scale = driver.wait_scale(arch, mode)
     accel = driver.accel_kind(arch, mode)
     timeout = base_timeout * scale
     out = os.path.join(os.environ.get("FFSESSION_OUT", "/tmp/ffsession"), f"tests-{tag}")
     os.makedirs(out, exist_ok=True)
+    if cmdline is not None:
+        # A private copy (clonefile on APFS) with the requested cmdline; the
+        # driver boots LEANDROS_DISK_IMAGE instead of the build's image.
+        import shutil
+        src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
+        img = os.path.join(out, f"cmdline-{arch}.img")
+        if os.path.exists(img): os.unlink(img)
+        if subprocess.run(["cp", "-c", src, img]).returncode != 0:
+            shutil.copyfile(src, img)
+        subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), img, cmdline],
+                       check=True, stdout=subprocess.DEVNULL)
+        os.environ["LEANDROS_DISK_IMAGE"] = img
+        print(f"runtests: cmdline {cmdline!r}", flush=True)
     print(f"runtests: arch={arch} accel={accel} gpu={gpu} scale={scale} "
           f"timeout={timeout:.0f}s repeat={repeat} out={out}", flush=True)
 
