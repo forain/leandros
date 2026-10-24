@@ -585,6 +585,27 @@ const VIRTGPU_PARAM_LEANDROS_SCATTER: u64 = 0x1000_000B;
 /// EXECBUFFER submissions that waited on an in-fence (syncobj or FENCE_FD_IN).
 pub static EXEC_IN_FENCE_WAITS: AtomicU64 = AtomicU64::new(0);
 
+/// Buffer-sharing churn counters (lane epattr), backend-generic: counted on
+/// the way out of the DRM ioctl dispatch whichever handler served the call.
+/// Read through `/proc/i915` (`prime ...`).
+pub static PRIME_EXPORTS: AtomicU64 = AtomicU64::new(0);
+pub static PRIME_EXPORT_ERRS: AtomicU64 = AtomicU64::new(0);
+pub static PRIME_IMPORTS: AtomicU64 = AtomicU64::new(0);
+pub static PRIME_IMPORT_ERRS: AtomicU64 = AtomicU64::new(0);
+pub static GEM_CLOSES: AtomicU64 = AtomicU64::new(0);
+
+/// Append the PRIME / GEM close counters; false (nothing written) while all are 0.
+pub fn proc_prime(s: &mut alloc::string::String) -> bool {
+    use ::core::fmt::Write;
+    let v = [PRIME_EXPORTS.load(Ordering::Relaxed), PRIME_EXPORT_ERRS.load(Ordering::Relaxed),
+             PRIME_IMPORTS.load(Ordering::Relaxed), PRIME_IMPORT_ERRS.load(Ordering::Relaxed),
+             GEM_CLOSES.load(Ordering::Relaxed)];
+    if v.iter().all(|&x| x == 0) { return false; }
+    let _ = writeln!(s, "prime handle_to_fd {} handle_to_fd_err {} fd_to_handle {} fd_to_handle_err {} gem_close {}",
+        v[0], v[1], v[2], v[3], v[4]);
+    true
+}
+
 /// `drm_virtgpu_context_set_param.param` values.
 const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
 const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
@@ -5819,6 +5840,12 @@ impl DrmDeviceInterface {
                 Err(DriverError::Unsupported)
             }
         }};
+        match cmd {
+            DRM_IOCTL_PRIME_HANDLE_TO_FD => { (if res.is_ok() { &PRIME_EXPORTS } else { &PRIME_EXPORT_ERRS }).fetch_add(1, Ordering::Relaxed); }
+            DRM_IOCTL_PRIME_FD_TO_HANDLE => { (if res.is_ok() { &PRIME_IMPORTS } else { &PRIME_IMPORT_ERRS }).fetch_add(1, Ordering::Relaxed); }
+            DRM_IOCTL_GEM_CLOSE if res.is_ok() => { GEM_CLOSES.fetch_add(1, Ordering::Relaxed); }
+            _ => {}
+        }
 
         // Re-check master on the way out, not just on the way in. The gate
         // above refuses ioctls that have not started; it cannot recall one that
