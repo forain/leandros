@@ -1436,6 +1436,10 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
                         }
                     }
                     if good { readback_ok += 1; } else { explicit = false; }
+                    // Since bf54cc95 a mapped span outlives GEM_CLOSE until
+                    // its last user mapping goes (that case is 4c2): unmap
+                    // first, or the span is legitimately still held.
+                    munmap(p, RING_SIZE);
                 }
             }
 
