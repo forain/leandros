@@ -92,6 +92,17 @@ def main(argv):
                             env=env, capture_output=True, text=True, timeout=1200)
         pid = driver._qemu_pid()
         wait_for(lambda: remote("status", timeout=60)[0] == 0, 180 * scale, 5)
+        # seed: promote a first kernel so a `good` slot exists, as on the laptop
+        for _ in range(3):
+            rc, out = remote("deploy-kernel", "--arch", arch, "--netwatch", "0", "--reboot", "--promote", timeout=1500)
+            if rc == 0 or "NEW KERNEL" in out:
+                break
+            time.sleep(10)
+        subprocess.run([sys.executable, DRV, "login", "root", "root", str(int(180 * scale))],
+                       env=env, capture_output=True, text=True, timeout=1200)
+        wait_for(lambda: remote("status", timeout=60)[0] == 0, 180 * scale, 5)
+        rc, st = remote("espctl", "status", timeout=120)
+        print(f"seed rc={rc} {st.strip()[-200:]!r}", flush=True)
         for _ in range(3):  # sshd may still be settling right after the first login
             rc, out = remote("deploy-kernel", "--arch", arch, "--netwatch", "120",
                              "--append", "netwatch.reach=40 netwatch.every=5", "--reboot", timeout=1500)
@@ -137,10 +148,10 @@ def main(argv):
         slot = re.search(r"booted_slot=(\S+)", st)
         slot = slot.group(1) if slot else "?"
         after = log()[m.end():] if m else ""
-        verdict("loss", bool(m) and int(m.group(2)) >= 40 and slot == "good" and ARMED not in after
+        verdict("loss", bool(m) and int(m.group(2)) >= 40 and slot == "good" and 40 <= elapsed <= 40 + 2 * 5 + 2 and ARMED not in after
                 and driver._qemu_pid() == pid,
                 (f"'{m.group(0)[:90]}' after {elapsed:.0f} s; " if m else "no unreachable line; ")
-                + f"next boot slot={slot} armed_again={ARMED in after} booted={bool(booted)} login={lg2.returncode}")
+                + f"reboot at {elapsed:.0f} s (want 40..50); next boot slot={slot} armed_again={ARMED in after} booted={bool(booted)} login={lg2.returncode}")
 
         # promote: a promoted trial must never reboot itself (trial_max=1 min would)
         armed1 = log().count(ARMED)
