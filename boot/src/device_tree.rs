@@ -136,6 +136,7 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
         return info;
     }
     remember_dtb(dtb_phys);
+    collect_reserved(dtb_phys);
 
     // 64 slots
     static mut MM: [MemoryRegion; 64] = [MemoryRegion {
@@ -221,6 +222,12 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
                     b"reg" if in_pl011 && data_len >= 4 => {
                         let base = if address_cells >= 2 { be64(data_ptr) } else { be32(data_ptr) as u64 };
                         info.uart_base = base;
+                    }
+
+                    b"bus-range" if in_pcie && data_len >= 8
+                        && PCI_BUS_RANGE.load(core::sync::atomic::Ordering::Relaxed) == u64::MAX => {
+                        let (s0, e0) = (be32(data_ptr) as u64 & 0xff, be32(data_ptr.add(4)) as u64 & 0xff);
+                        PCI_BUS_RANGE.store((s0 << 32) | e0, core::sync::atomic::Ordering::Relaxed);
                     }
 
                     b"reg" if in_pcie && data_len >= 8 => {
@@ -416,4 +423,281 @@ fn strlen(s: *const u8) -> usize {
 
 fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
+}
+
+// ── /memreserve/ and /reserved-memory (lane dtbres) ─────────────────────────
+
+/// One physical range the DTB says the OS must not allocate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DtbReserved {
+    pub base: u64,
+    pub size: u64,
+    /// `/reserved-memory` child with `no-map` (never map it cacheable).
+    pub no_map: bool,
+    /// From the header's `/memreserve/` block (else a `/reserved-memory` child).
+    pub memreserve: bool,
+    /// Node name (`/reserved-memory` children), NUL-padded, truncated.
+    pub name: [u8; 24],
+}
+
+impl DtbReserved {
+    pub fn name_str(&self) -> &str {
+        let n = self.name.iter().position(|&b| b == 0).unwrap_or(self.name.len());
+        core::str::from_utf8(&self.name[..n]).unwrap_or("?")
+    }
+}
+
+const DTB_RSV_MAX: usize = 32;
+static mut DTB_RSV: [Option<DtbReserved>; DTB_RSV_MAX] = [None; DTB_RSV_MAX];
+static DTB_RSV_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// `bus-range` of the first `pcie` node, (start, end); end 0xFFFF_FFFF = none.
+static PCI_BUS_RANGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Reserved ranges recorded by the last `parse` (it reads them while the
+/// blob is surely mapped). Early boot: callers reserve these before the
+/// allocator is seeded.
+pub fn reserved_ranges(out: &mut dyn FnMut(&DtbReserved)) -> usize {
+    let n = DTB_RSV_LEN.load(core::sync::atomic::Ordering::Relaxed);
+    for i in 0..n {
+        if let Some(r) = unsafe { (*core::ptr::addr_of!(DTB_RSV))[i] } { out(&r); }
+    }
+    n
+}
+
+/// `bus-range = <start end>` of the DTB's PCIe host node, if `parse` saw one.
+pub fn pci_bus_range() -> Option<(u8, u8)> {
+    let v = PCI_BUS_RANGE.load(core::sync::atomic::Ordering::Relaxed);
+    if v == u64::MAX { return None; }
+    Some(((v >> 32) as u8, v as u8))
+}
+
+unsafe fn collect_reserved(dtb: usize) {
+    let mut n = 0usize;
+    for_each_reserved_at(dtb, &mut |r| {
+        if n < DTB_RSV_MAX {
+            (*core::ptr::addr_of_mut!(DTB_RSV))[n] = Some(*r);
+            n += 1;
+        }
+    });
+    DTB_RSV_LEN.store(n, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn read_cells(p: *const u8, cells: usize) -> u64 {
+    match cells { 0 => 0, 1 => be32(p) as u64, _ => be64(unsafe { p.add((cells - 2) * 4) }) }
+}
+
+/// Call `f` for every `/memreserve/` entry, then for every `reg` entry of
+/// every enabled `/reserved-memory` child (dynamic `size`/`alloc-ranges`
+/// children without `reg` are skipped: nothing to reserve until the OS picks a
+/// spot). Returns `false` if `dtb` is not a valid FDT.
+///
+/// # Safety
+/// `dtb` must be 0 or the address of a readable, complete FDT.
+pub unsafe fn for_each_reserved_at(dtb: usize, f: &mut dyn FnMut(&DtbReserved)) -> bool {
+    if dtb == 0 || !is_valid_dtb(dtb) { return false; }
+    let hdr = dtb as *const FdtHeader;
+    let rsv_off     = be32(core::ptr::addr_of!((*hdr).off_mem_rsvmap) as *const u8) as usize;
+    let struct_off  = be32(core::ptr::addr_of!((*hdr).off_dt_struct)  as *const u8) as usize;
+    let strings_off = be32(core::ptr::addr_of!((*hdr).off_dt_strings) as *const u8) as usize;
+    let total       = be32(core::ptr::addr_of!((*hdr).totalsize)      as *const u8) as usize;
+
+    // /memreserve/: (u64 address, u64 size) pairs up to a (0, 0) terminator.
+    if rsv_off != 0 && rsv_off < total {
+        let mut p = dtb + rsv_off;
+        while p + 16 <= dtb + total {
+            let (base, size) = (be64(p as *const u8), be64((p + 8) as *const u8));
+            if base == 0 && size == 0 { break; }
+            if size != 0 {
+                f(&DtbReserved { base, size, no_map: false, memreserve: true, name: [0; 24] });
+            }
+            p += 16;
+        }
+    }
+
+    let mut ptr = (dtb + struct_off) as *const u8;
+    let end = (dtb + total) as *const u8;
+    let strings = (dtb + strings_off) as *const u8;
+    // Root = depth 1, /reserved-memory = depth 2, its children = depth 3.
+    let mut depth = 0usize;
+    let (mut root_ac, mut root_sc) = (2usize, 1usize);
+    let mut in_rm = false;
+    let (mut rm_ac, mut rm_sc) = (0usize, 0usize);
+    // Current child: name, reg data, no-map, disabled.
+    let mut name = [0u8; 24];
+    let mut reg: (*const u8, usize) = (core::ptr::null(), 0);
+    let mut no_map = false;
+    let mut disabled = false;
+    while ptr < end {
+        match be32(ptr) {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                let np = ptr.add(4);
+                let nl = strlen(np);
+                let nm = core::slice::from_raw_parts(np, nl);
+                if depth == 2 {
+                    in_rm = nm == b"reserved-memory" || nm.starts_with(b"reserved-memory@");
+                    if in_rm { rm_ac = root_ac; rm_sc = root_sc; }
+                } else if depth == 3 && in_rm {
+                    name = [0; 24];
+                    let k = nl.min(23);
+                    name[..k].copy_from_slice(&nm[..k]);
+                    reg = (core::ptr::null(), 0);
+                    no_map = false;
+                    disabled = false;
+                }
+                ptr = ptr.add(4 + align_up(nl + 1, 4));
+            }
+            FDT_END_NODE => {
+                if depth == 3 && in_rm && !disabled && !reg.0.is_null() {
+                    let step = (rm_ac + rm_sc) * 4;
+                    let mut off = 0usize;
+                    while step > 0 && off + step <= reg.1 {
+                        let base = read_cells(reg.0.add(off), rm_ac);
+                        let size = read_cells(reg.0.add(off + rm_ac * 4), rm_sc);
+                        if size != 0 {
+                            f(&DtbReserved { base, size, no_map, memreserve: false, name });
+                        }
+                        off += step;
+                    }
+                }
+                if depth == 2 { in_rm = false; }
+                depth = depth.saturating_sub(1);
+                if depth == 0 { break; }
+                ptr = ptr.add(4);
+            }
+            FDT_PROP => {
+                let len = be32(ptr.add(4)) as usize;
+                let no = be32(ptr.add(8)) as usize;
+                let pn = core::slice::from_raw_parts(strings.add(no), strlen(strings.add(no)));
+                let d = ptr.add(12);
+                match (depth, pn) {
+                    (1, b"#address-cells") if len >= 4 => root_ac = be32(d) as usize,
+                    (1, b"#size-cells") if len >= 4 => root_sc = be32(d) as usize,
+                    (2, b"#address-cells") if in_rm && len >= 4 => rm_ac = be32(d) as usize,
+                    (2, b"#size-cells") if in_rm && len >= 4 => rm_sc = be32(d) as usize,
+                    (3, b"reg") if in_rm => reg = (d, len),
+                    (3, b"no-map") if in_rm => no_map = true,
+                    (3, b"status") if in_rm => {
+                        let s = core::slice::from_raw_parts(d, len);
+                        disabled = !(s.starts_with(b"okay") || s.starts_with(b"ok\0"));
+                    }
+                    _ => {}
+                }
+                ptr = ptr.add(12 + align_up(len, 4));
+            }
+            FDT_NOP => ptr = ptr.add(4),
+            _ => break,
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use std::vec::Vec;
+    use super::*;
+
+    /// Minimal FDT writer: (tokens, strings) assembled into a v17 blob.
+    struct W { s: Vec<u8>, st: Vec<u8> }
+    impl W {
+        fn u32(&mut self, v: u32) { self.s.extend_from_slice(&v.to_be_bytes()); }
+        fn pad(&mut self) { while self.s.len() % 4 != 0 { self.s.push(0); } }
+        fn begin(&mut self, n: &str) { self.u32(1); self.s.extend_from_slice(n.as_bytes()); self.s.push(0); self.pad(); }
+        fn end(&mut self) { self.u32(2); }
+        fn prop(&mut self, n: &str, d: &[u8]) {
+            let off = self.st.len() as u32;
+            self.st.extend_from_slice(n.as_bytes()); self.st.push(0);
+            self.u32(3); self.u32(d.len() as u32); self.u32(off);
+            self.s.extend_from_slice(d); self.pad();
+        }
+    }
+    fn cells(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|c| c.to_be_bytes()).collect() }
+
+    fn blob(rsv: &[(u64, u64)]) -> Vec<u64> {
+        let mut w = W { s: Vec::new(), st: Vec::new() };
+        w.begin("");
+        w.prop("#address-cells", &cells(&[2]));
+        w.prop("#size-cells", &cells(&[2]));
+        w.begin("memory@40000000");
+        w.prop("reg", &cells(&[0, 0x4000_0000, 0, 0x4000_0000]));
+        w.end();
+        w.begin("reserved-memory");
+        w.prop("#address-cells", &cells(&[2]));
+        w.prop("#size-cells", &cells(&[1]));
+        w.prop("ranges", &[]);
+        w.begin("atf@0");
+        w.prop("reg", &cells(&[0, 0x4100_0000, 0x8_0000]));
+        w.prop("no-map", &[]);
+        w.end();
+        w.begin("two@0"); // two reg entries, no no-map
+        w.prop("reg", &cells(&[0, 0x4200_0000, 0x1000, 0x1, 0x0, 0x2000]));
+        w.end();
+        w.begin("off@0");
+        w.prop("reg", &cells(&[0, 0x4300_0000, 0x1000]));
+        w.prop("status", b"disabled\0");
+        w.end();
+        w.begin("cma"); // dynamic: no reg
+        w.prop("size", &cells(&[0x400_0000]));
+        w.begin("nested@0"); // depth 4: ignored
+        w.prop("reg", &cells(&[0, 0x4400_0000, 0x1000]));
+        w.end();
+        w.end();
+        w.end();
+        w.begin("pcie@10000000");
+        w.prop("bus-range", &cells(&[0, 0x3f]));
+        w.end();
+        w.end();
+        w.u32(9);
+        let mut m = Vec::new();
+        for &(a, s) in rsv.iter().chain([(0u64, 0u64)].iter()) {
+            m.extend_from_slice(&a.to_be_bytes()); m.extend_from_slice(&s.to_be_bytes());
+        }
+        let off_rsv = 40usize;
+        let off_struct = off_rsv + m.len();
+        let off_str = off_struct + w.s.len();
+        let total = off_str + w.st.len();
+        let mut b = Vec::new();
+        for v in [FDT_MAGIC, total as u32, off_struct as u32, off_str as u32, off_rsv as u32,
+                  17, 16, 0, w.st.len() as u32, w.s.len() as u32] {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        b.extend_from_slice(&m); b.extend_from_slice(&w.s); b.extend_from_slice(&w.st);
+        while b.len() % 8 != 0 { b.push(0); }
+        b.chunks(8).map(|c| u64::from_ne_bytes(c.try_into().unwrap())).collect() // 8-aligned
+    }
+
+    #[test]
+    fn memreserve_and_reserved_memory() {
+        let b = blob(&[(0x4800_0000, 0x10_0000)]);
+        let mut got = Vec::new();
+        assert!(unsafe { for_each_reserved_at(b.as_ptr() as usize, &mut |r| got.push(*r)) });
+        let v: Vec<(u64, u64, bool, bool, &str)> =
+            got.iter().map(|r| (r.base, r.size, r.no_map, r.memreserve, r.name_str())).collect();
+        assert_eq!(v, std::vec![
+            (0x4800_0000, 0x10_0000, false, true, ""),
+            (0x4100_0000, 0x8_0000, true, false, "atf@0"),
+            (0x4200_0000, 0x1000, false, false, "two@0"),
+            (0x1_0000_0000, 0x2000, false, false, "two@0"),
+        ]);
+    }
+
+    #[test]
+    fn parse_records_reserved_and_bus_range() {
+        let b = blob(&[]);
+        let info = unsafe { parse(b.as_ptr() as usize) };
+        assert_eq!(info.memory_map_len, 1);
+        let mut n = 0;
+        reserved_ranges(&mut |r| { n += 1; assert!(!r.memreserve); });
+        assert_eq!(n, 3);
+        assert_eq!(pci_bus_range(), Some((0, 0x3f)));
+    }
+
+    #[test]
+    fn no_reserved_memory_node() {
+        let mut w = W { s: Vec::new(), st: Vec::new() };
+        w.begin(""); w.end(); w.u32(9);
+        let _ = w; // a garbage pointer must be rejected, not walked
+        assert!(!unsafe { for_each_reserved_at(0, &mut |_| panic!()) });
+    }
 }

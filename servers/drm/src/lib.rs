@@ -312,6 +312,12 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             return render_node_version(arg_val);
         }
 
+        // Token 0 (the firmware framebuffer) is a card0, master-only mapping;
+        // a render node never scans out, so it never maps the scanout.
+        if dev_id == DEV_ID_RENDER && cmd == DRM_IOCTL_MMAP && arg_val == 0 {
+            return val_reply((-13i64) as u64); // EACCES
+        }
+
         // Since we are called via a direct handler, we are in the caller's address space.
         // No need to switch address space.
         let res = match interface.handle_ioctl(cmd, arg_val, open_id) {

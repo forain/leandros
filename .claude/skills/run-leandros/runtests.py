@@ -16,9 +16,10 @@ Options:
                              regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + proctest + chroottest + netctltest + sudotest + nmtest --quick (mock) + evherdtest + pollnarrowtest + listentagtest + vfstagtest + nettag2test + kparkstest + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
+                             pcibridge host:pcibridgetest.py alone (root port -> PCI bridge -> virtio-rng, own boot)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
                                       (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
-                                      + host:netroamtest.py (Wi-Fi roaming between two subnets, own boot)
+                                      + host:netroamtest.py (Wi-Fi roaming between two subnets, own boot) + host:netflaptest.py
                                       + host:udppeertest.py (udptest peer: fragments, ICMP errors, IGMP, broadcast)
                              netroam  host:netroamtest.py alone
                              udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
@@ -154,6 +155,8 @@ SUITES = {
     "netctl": ["/bin/netctltest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
     "wifisim": ["host:wifisimtest.py"],
+    # lane dtbres: devices behind PCIe root port -> PCI-PCI bridge (own boot).
+    "pcibridge": ["host:pcibridgetest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
     # NVMe command timeout: the driver resets the controller and the stalled
@@ -171,6 +174,8 @@ SUITES = {
                 # servers across address churn, autoconnect policy, the
                 # not-joinable diagnostics): its own boot, see netroamtest.py.
                 "host:netroamtest.py",
+                # netctl event path on a QMP set_link flap (own boot).
+                "host:netflaptest.py",
                 # IP fragmentation, ICMP errors, IGMP, broadcast, cmsgs against
                 # a frame-level host peer on a second NIC: udppeertest.py.
                 "host:udppeertest.py"],
@@ -196,7 +201,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"netroamtest.py": 1500, "udppeertest.py": 1500}
+HOST_TIMEOUTS = {"netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600}
 
 
 def host_run(c, timeout, arch=None, scale=1.0):

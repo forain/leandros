@@ -200,13 +200,26 @@ static BACKENDS: Mutex<[Option<Entry>; MAX_WIFI]> = Mutex::new([None; MAX_WIFI])
 /// Register a backend for `ifindex` (from the netif registry). False when
 /// the table is full or the ifindex is taken.
 pub fn register(ifindex: IfIndex, backend: &'static dyn WifiBackend) -> bool {
-    let mut t = BACKENDS.lock();
-    if t.iter().flatten().any(|e| e.ifindex == ifindex) { return false; }
-    match t.iter_mut().find(|e| e.is_none()) {
-        Some(slot) => { *slot = Some(Entry { ifindex, backend }); true }
-        None => false,
+    let ok = {
+        let mut t = BACKENDS.lock();
+        if t.iter().flatten().any(|e| e.ifindex == ifindex) { return false; }
+        match t.iter_mut().find(|e| e.is_none()) {
+            Some(slot) => { *slot = Some(Entry { ifindex, backend }); true }
+            None => false,
+        }
+    };
+    if ok {
+        let f = REGISTER_HOOK.load(core::sync::atomic::Ordering::Acquire);
+        if f != 0 { unsafe { core::mem::transmute::<usize, fn()>(f)() } }
     }
+    ok
 }
+
+static REGISTER_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Called (no lock held) after each successful [`register`]: lets the
+/// netctl model pick a new backend up without polling for it.
+pub fn set_register_hook(f: fn()) { REGISTER_HOOK.store(f as usize, core::sync::atomic::Ordering::Release); }
 
 /// The backend of `ifindex`.
 pub fn backend(ifindex: IfIndex) -> Option<&'static dyn WifiBackend> {

@@ -328,6 +328,7 @@ pub fn set_admin(netif: u8, up: bool) -> bool {
     if (netif as usize) >= netdev::count() { return false; }
     a.store(!up, Ordering::Release);
     netdev::kick();
+    crate::netctl::kick();
     true
 }
 
