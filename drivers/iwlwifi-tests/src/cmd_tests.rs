@@ -322,3 +322,40 @@ fn ht_station_flags() {
     // A single-stream AP.
     assert_eq!(sta_ht_flags(1, 3, 2, 0).0, 2 << 19);
 }
+
+/// v3 MCC update reply for `mcc` with `status` and two channels.
+fn mcc_reply(mcc: [u8; 2], status: u32) -> Vec<u8> {
+    let mut m = vec![0u8; 16];
+    m[0..4].copy_from_slice(&status.to_le_bytes());
+    m[4..6].copy_from_slice(&((mcc[0] as u16) << 8 | mcc[1] as u16).to_le_bytes());
+    m[7] = MCC_SOURCE_WIFI;
+    m[12..16].copy_from_slice(&2u32.to_le_bytes());
+    m.extend_from_slice(&0xfu32.to_le_bytes());
+    m.extend_from_slice(&0xfu32.to_le_bytes());
+    m
+}
+
+#[test]
+fn regdom_follows_chub_update_reply() {
+    // Init query answered world '00'; the firmware then reports 'BR' and the
+    // driver sends MCC_UPDATE without waiting. Its reply (matched by seq) must
+    // become the reported domain; before, the reply was dropped and
+    // /proc/net/nic stayed on '00' although the update had been applied.
+    let mut r = Regdom::default();
+    r.reset(*b"00", false);
+    r.sent(0x1234);
+    assert!(r.on_resp(0x9999, &mcc_reply(*b"BR", 0)).is_none(), "foreign reply consumed");
+    assert_eq!(r.mcc, *b"00");
+    let m = r.on_resp(0x1234, &mcc_reply(*b"BR", MCC_RESP_NEW_CHAN_PROFILE)).expect("reply not matched").expect("not parsed");
+    assert_eq!(m.mcc, *b"BR");
+    assert_eq!(r.mcc, *b"BR");
+    // Consumed once; a refused update leaves the domain alone.
+    assert!(r.on_resp(0x1234, &mcc_reply(*b"BR", 0)).is_none());
+    r.sent(0x1235);
+    assert!(r.on_resp(0x1235, &mcc_reply(*b"US", 4)).unwrap().is_some());
+    assert_eq!(r.mcc, *b"BR");
+    // Garbage still consumes the seq but changes nothing.
+    r.sent(0x1236);
+    assert!(r.on_resp(0x1236, &[0u8; 4]).unwrap().is_none());
+    assert_eq!(r.mcc, *b"BR");
+}
