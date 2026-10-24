@@ -118,6 +118,7 @@ pub fn init(info: &boot::BootInfo) {
         // Route IRQ 1 (keyboard) -> the BSP, Vector 33, through the MADT
         // overrides. (The BSP's APIC ID is usually but not necessarily 0.)
         ioapic::set_isa_irq(1, cpus::bsp_apic_id().min(0xFF) as u8, 33);
+        keyboard::log_irq1_route();
         boot::earlyfb::mark(5);
     }
     #[cfg(target_arch = "x86_64")]

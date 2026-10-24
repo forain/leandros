@@ -114,6 +114,10 @@ impl Endpoint {
 
 struct Slot {
     port: u8,
+    /// The device left (hot-plug scan): transfers fail with `Disconnected`
+    /// at once, even when the root port still reports a connection (a
+    /// device behind a hub, or a re-plug between two scans).
+    gone: bool,
     out_ctx: DmaBuf,
     in_ctx: DmaBuf,
     ctrl_buf: DmaBuf,
@@ -422,7 +426,7 @@ impl Xhci {
 
     fn port_connected(&self, slot: u8) -> bool {
         match self.slot(slot) {
-            Some(s) => self.regs.portsc(s.port) & PORTSC_CCS != 0,
+            Some(s) => !s.gone && self.regs.portsc(s.port) & PORTSC_CCS != 0,
             None => false,
         }
     }
@@ -478,6 +482,24 @@ impl Xhci {
     /// Build the input context for a Configure Endpoint that drops `drop`
     /// and (re-)adds `add` (DCI bitmasks), from each endpoint's stored
     /// parameters and current ring position. Returns its physical address.
+    /// Input context for a Configure Endpoint that only rewrites the slot
+    /// context of a hub: Hub = 1, Number of Ports, TT Think Time (§6.2.2).
+    fn build_hub_input(&mut self, slot: u8, nports: u8, ttt: u32) -> Option<u64> {
+        let csz = self.csz;
+        let s = self.slot(slot)?;
+        let inp = Ctx::input(&s.in_ctx, csz);
+        let out = Ctx::output(&s.out_ctx, csz);
+        s.out_ctx.sync_for_cpu();
+        inp.clear();
+        inp.set_add(1);
+        inp.set_slot(0, out.slot(0) | (1 << 26));
+        inp.set_slot(1, (out.slot(1) & 0x00FF_FFFF) | ((nports as u32) << 24));
+        inp.set_slot(2, (out.slot(2) & !(3 << 16)) | (ttt << 16));
+        inp.set_slot(3, 0);
+        s.in_ctx.sync_for_device();
+        Some(s.in_ctx.phys())
+    }
+
     fn build_configure_input(&mut self, slot: u8, drop: u32, add: u32) -> Option<u64> {
         let csz = self.csz;
         let s = self.slot(slot)?;
@@ -565,7 +587,7 @@ impl Td {
 
 // ── waiting (lock taken and released per poll) ──────────────────────────────
 
-type Hc = Mutex<Xhci>;
+pub type Hc = Mutex<Xhci>;
 
 /// Run one command; returns (completion code, slot id).
 fn run_cmd(hc: &Hc, t: Trb) -> Result<(u8, u8), UsbErr> {
@@ -887,6 +909,8 @@ pub struct Enumerated {
     pub bulk: Option<XhciBulk>,
     /// Configured boot HID interfaces (keyboard / mouse).
     pub hid: Vec<HidPipe>,
+    /// A hub: its downstream ports, for the hot-plug scan.
+    pub hub: Option<HubPorts>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1010,7 +1034,7 @@ fn enumerate_port(hc: &Arc<Hc>, port: u8) -> Result<Enumerated, &'static str> {
         .map_err(|_| "Enable Slot timed out")?;
     if cc != CC_SUCCESS || slot == 0 { return Err("Enable Slot failed"); }
 
-    match enumerate_slot(hc, port, slot, speed) {
+    match enumerate_slot(hc, port, slot, speed, 0, 0) {
         Ok(e) => Ok(e),
         Err(e) => {
             disable_slot(hc, slot);
@@ -1019,7 +1043,11 @@ fn enumerate_port(hc: &Arc<Hc>, port: u8) -> Result<Enumerated, &'static str> {
     }
 }
 
-fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8) -> Result<Enumerated, &'static str> {
+/// `port` is the root port; `route` the route string below it and `tt` the
+/// slot context DW2 (transaction translator) for a device behind a hub.
+fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u32)
+    -> Result<Enumerated, &'static str>
+{
     let (csz, dma32, bus) = {
         let x = hc.lock();
         (x.csz, x.dma32, x.bus)
@@ -1041,13 +1069,14 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8) -> Result<Enumera
         let inp = Ctx::input(&in_ctx, csz);
         inp.clear();
         inp.set_add(0b11);
-        inp.set_slot(0, slot_dw0(0, speed, 1));
+        inp.set_slot(0, slot_dw0(route, speed, 1));
         inp.set_slot(1, slot_dw1(port));
+        inp.set_slot(2, tt);
         inp.write_ep(1, EP_TYPE_CTRL, mps0, 0, 0, 8, 0, deq);
         in_ctx.sync_for_device();
         let in_phys = in_ctx.phys();
         x.dcbaa.write64(slot as usize * 8, out_ctx.phys());
-        x.slots[slot as usize] = Some(Box::new(Slot { port, out_ctx, in_ctx, ctrl_buf, eps }));
+        x.slots[slot as usize] = Some(Box::new(Slot { port, gone: false, out_ctx, in_ctx, ctrl_buf, eps }));
         in_phys
     };
 
@@ -1118,10 +1147,15 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8) -> Result<Enumera
     };
 
     let mut info = crate::UsbDeviceInfo {
-        bus, port, slot, address, vendor, product, speed,
+        bus, port, route, slot, address, vendor, product, speed,
         class: if dev_class != 0 { dev_class } else { ci.first_class },
         manufacturer, product_name, mass_storage: false, interface: 0, hid: 0,
     };
+
+    if dev_class == 0x09 {
+        let hub = setup_hub(hc, slot, speed, ci.value, port, route, tt)?;
+        return Ok(Enumerated { info, bulk: None, hid: Vec::new(), hub: Some(hub) });
+    }
 
     let Some(bot) = ci.bot else {
         if ci.uas_seen {
@@ -1145,7 +1179,7 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8) -> Result<Enumera
             };
             info.interface = p.desc.iface;
         }
-        return Ok(Enumerated { info, bulk: None, hid });
+        return Ok(Enumerated { info, bulk: None, hid, hub: None });
     };
 
     // Configure the two bulk endpoints, then select the configuration (and
@@ -1183,6 +1217,7 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8) -> Result<Enumera
     Ok(Enumerated {
         info,
         hid: Vec::new(),
+        hub: None,
         bulk: Some(XhciBulk {
             hc: hc.clone(), slot, iface: bot.iface,
             ep_in: bot.ep_in.addr, ep_out: bot.ep_out.addr, dci_in, dci_out,
@@ -1256,6 +1291,164 @@ pub fn enumerate_hotplug(hc: &Arc<Hc>, port: u8) -> Result<Enumerated, &'static 
     enumerate_port(hc, port)
 }
 
+/// Take root `port`'s Connect Status Change latch (PORTSC.CSC, RW1C). True
+/// when the connection changed since the last take: a disconnect and
+/// re-connect between two scans leaves CCS at 1, but CSC stays set (the
+/// reset at enumeration clears it).
+pub fn root_port_take_csc(hc: &Hc, port: u8) -> bool {
+    let x = hc.lock();
+    if x.dead || port < 1 || port > x.max_ports { return false; }
+    let sc = x.regs.portsc(port);
+    if sc & PORTSC_CSC == 0 { return false; }
+    x.regs.set_portsc(port, (sc & PORTSC_PRESERVE) | PORTSC_CSC);
+    true
+}
+
+/// The device on `slot` left: every transfer on it fails with
+/// `Disconnected` from now on.
+pub fn mark_slot_gone(hc: &Hc, slot: u8) {
+    if let Some(s) = hc.lock().slot_mut(slot) { s.gone = true; }
+}
+
+/// Disable and free one device slot (after [`mark_slot_gone`] and once no
+/// class driver issues transfers on it). False when it was not allocated.
+pub fn release_slot(hc: &Hc, slot: u8) -> bool {
+    let present = hc.lock().slot(slot).is_some();
+    if present { disable_slot(hc, slot); }
+    present
+}
+
+// ── Hubs (lane usbhot2) ────────────────────────────────────────────────────
+
+/// A configured USB 2.0 hub. The hot-plug scan polls its downstream ports
+/// with GET_STATUS (the status-change interrupt endpoint is not used).
+#[derive(Clone, Copy, Debug)]
+pub struct HubPorts {
+    pub slot: u8,
+    pub root_port: u8,
+    /// Route string of the hub itself (0 = on a root port).
+    pub route: u32,
+    /// Tier of the hub below its root port (0 = on the root port).
+    pub depth: u8,
+    pub nports: u8,
+    pub speed: u8,
+    /// The hub's own slot context DW2 (TT), inherited by the full/low-speed
+    /// devices below a full-speed hub.
+    tt: u32,
+}
+
+impl HubPorts {
+    /// Route string of the device on downstream `port`.
+    pub fn child_route(&self, port: u8) -> u32 {
+        self.route | ((port.min(15) as u32) << (4 * self.depth as u32))
+    }
+}
+
+const HUB_REQ_GET_STATUS: u8 = 0;
+const HUB_REQ_CLEAR_FEATURE: u8 = 1;
+const HUB_REQ_SET_FEATURE: u8 = 3;
+const HUB_FEAT_PORT_RESET: u16 = 4;
+const HUB_FEAT_PORT_POWER: u16 = 8;
+pub const HUB_FEAT_C_CONNECTION: u16 = 16;
+const HUB_FEAT_C_RESET: u16 = 20;
+pub const HUB_PS_CONNECTION: u16 = 1 << 0;
+const HUB_PS_ENABLE: u16 = 1 << 1;
+const HUB_PS_LOW_SPEED: u16 = 1 << 9;
+const HUB_PS_HIGH_SPEED: u16 = 1 << 10;
+pub const HUB_PC_CONNECTION: u16 = 1 << 0;
+const HUB_PC_RESET: u16 = 1 << 4;
+/// Tiers the 20-bit route string allows below a root port.
+const HUB_MAX_DEPTH: u8 = 5;
+
+fn route_depth(route: u32) -> u8 {
+    (0..5).take_while(|i| (route >> (4 * i)) & 0xF != 0).count() as u8
+}
+
+/// Configure the hub on `slot`: SET_CONFIGURATION, hub descriptor, slot
+/// context Hub bit and port count, then power every downstream port.
+fn setup_hub(hc: &Arc<Hc>, slot: u8, speed: u8, config: u8, root_port: u8, route: u32, tt: u32)
+    -> Result<HubPorts, &'static str>
+{
+    if speed >= SPEED_SS { return Err("SuperSpeed hubs are not supported"); }
+    let depth = route_depth(route);
+    if depth >= HUB_MAX_DEPTH { return Err("hub nested too deep"); }
+    control(hc, slot, 0x00, 9, config as u16, 0, CtrlData::None, ENUM_CTRL_TIMEOUT_MS)
+        .map_err(|_| "SET_CONFIGURATION failed")?;
+    let mut hd = [0u8; 9];
+    let n = control(hc, slot, 0xA0, 6, 0x2900, 0, CtrlData::In(&mut hd), ENUM_CTRL_TIMEOUT_MS)
+        .map_err(|_| "GET_DESCRIPTOR(hub) failed")?;
+    if n < 7 || hd[1] != 0x29 || hd[2] == 0 { return Err("bad hub descriptor"); }
+    let nports = hd[2];
+    let chars = u16::from_le_bytes([hd[3], hd[4]]);
+    let power_ms = (hd[5] as u32 * 2).max(100);
+    let ttt = if speed == SPEED_HS { ((chars >> 5) & 3) as u32 } else { 0 };
+    let in_phys = hc.lock().build_hub_input(slot, nports, ttt).ok_or("slot vanished")?;
+    match run_cmd(hc, Trb::new(TRB_CONFIGURE_EP, in_phys, 0, (slot as u32) << 24)) {
+        Ok((CC_SUCCESS, _)) => {}
+        Ok((cc, _)) => usb_log!("[XHCI] slot {}: hub slot context not accepted (cc {}), continuing\n", slot, cc),
+        Err(_) => usb_log!("[XHCI] slot {}: hub Configure Endpoint timed out, continuing\n", slot),
+    }
+    for p in 1..=nports {
+        let _ = control(hc, slot, 0x23, HUB_REQ_SET_FEATURE, HUB_FEAT_PORT_POWER, p as u16,
+                        CtrlData::None, ENUM_CTRL_TIMEOUT_MS);
+    }
+    sleep_ms(power_ms);
+    Ok(HubPorts { slot, root_port, route, depth, nports, speed, tt })
+}
+
+/// GET_STATUS of hub downstream `port`: (wPortStatus, wPortChange).
+pub fn hub_port_status(hc: &Arc<Hc>, hub: &HubPorts, port: u8) -> Option<(u16, u16)> {
+    let mut b = [0u8; 4];
+    match control(hc, hub.slot, 0xA3, HUB_REQ_GET_STATUS, 0, port as u16, CtrlData::In(&mut b), ENUM_CTRL_TIMEOUT_MS) {
+        Ok(4) => Some((u16::from_le_bytes([b[0], b[1]]), u16::from_le_bytes([b[2], b[3]]))),
+        _ => None,
+    }
+}
+
+pub fn hub_clear_port_feature(hc: &Arc<Hc>, hub: &HubPorts, port: u8, feature: u16) {
+    let _ = control(hc, hub.slot, 0x23, HUB_REQ_CLEAR_FEATURE, feature, port as u16,
+                    CtrlData::None, ENUM_CTRL_TIMEOUT_MS);
+}
+
+/// Enumerate the device on hub downstream `port`: debounce, port reset
+/// through the hub, then Enable Slot + Address Device with the route string
+/// (and the hub's TT for a full/low-speed device behind a high-speed hub).
+pub fn enumerate_hub_port(hc: &Arc<Hc>, hub: &HubPorts, port: u8) -> Result<Enumerated, &'static str> {
+    sleep_ms(100);
+    let (st, _) = hub_port_status(hc, hub, port).ok_or("hub GET_STATUS failed")?;
+    if st & HUB_PS_CONNECTION == 0 { return Err("device left during debounce"); }
+    control(hc, hub.slot, 0x23, HUB_REQ_SET_FEATURE, HUB_FEAT_PORT_RESET, port as u16,
+            CtrlData::None, ENUM_CTRL_TIMEOUT_MS).map_err(|_| "hub port reset failed")?;
+    let d = Deadline::after_ms(500);
+    let st = loop {
+        if let Some((s, c)) = hub_port_status(hc, hub, port) {
+            if c & HUB_PC_RESET != 0 { break s; }
+        }
+        if d.expired() { return Err("hub port reset timed out"); }
+        sleep_ms(10);
+    };
+    hub_clear_port_feature(hc, hub, port, HUB_FEAT_C_RESET);
+    if st & HUB_PS_CONNECTION == 0 { return Err("device disconnected during reset"); }
+    if st & HUB_PS_ENABLE == 0 { return Err("hub port not enabled after reset"); }
+    sleep_ms(10); // reset recovery (USB 2.0 §7.1.7.5)
+    let speed = if st & HUB_PS_LOW_SPEED != 0 { SPEED_LS }
+                else if st & HUB_PS_HIGH_SPEED != 0 { SPEED_HS } else { SPEED_FS };
+    let tt = if hub.speed == SPEED_HS {
+        if speed != SPEED_HS { hub.slot as u32 | (port as u32) << 8 } else { 0 }
+    } else { hub.tt };
+    let slot_type = hc.lock().port_slot_type[hub.root_port as usize - 1];
+    let (cc, slot) = run_cmd(hc, Trb::new(TRB_ENABLE_SLOT, 0, 0, (slot_type as u32) << 16))
+        .map_err(|_| "Enable Slot timed out")?;
+    if cc != CC_SUCCESS || slot == 0 { return Err("Enable Slot failed"); }
+    match enumerate_slot(hc, hub.root_port, slot, speed, hub.child_route(port), tt) {
+        Ok(e) => Ok(e),
+        Err(e) => {
+            disable_slot(hc, slot);
+            Err(e)
+        }
+    }
+}
+
 // ── BulkTransport ───────────────────────────────────────────────────────────
 
 /// A bulk-only mass-storage interface on an xHCI-attached device.
@@ -1271,10 +1464,10 @@ pub struct XhciBulk {
 
 impl XhciBulk {
     pub fn slot(&self) -> u8 { self.slot }
-    /// (controller bus number, root port) of this interface's device.
+    /// (controller bus number, slot id) of this interface's device: unique
+    /// per device, also behind hubs.
     pub fn location(&self) -> (u8, u8) {
-        let x = self.hc.lock();
-        (x.bus, x.slot(self.slot).map_or(0, |s| s.port))
+        (self.hc.lock().bus, self.slot)
     }
     /// (bulk IN, bulk OUT) endpoint addresses.
     pub fn endpoints(&self) -> (u8, u8) { (self.ep_in, self.ep_out) }

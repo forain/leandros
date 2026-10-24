@@ -2506,6 +2506,7 @@ fn dispatch_inner(
 fn ipc_send_permitted(port: u32) -> isize {
     match port::send_target(port) {
         None => -9,
+        Some((true, _)) if port::is_kernel_only(port) => -1, // EPERM
         Some((true, _)) => 0,
         Some((false, owner)) => sched::cred::ipc_send_check(owner),
     }

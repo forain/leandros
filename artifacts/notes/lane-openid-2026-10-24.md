@@ -20,8 +20,8 @@ user syscall and the in-kernel VFS forward run in the caller's task.
   by the kernel-supplied caller pid), 0x300 PUMP, 0x1000 PING. Legacy senders
   checked: aplay (0x100, 0x200), privtest.
 - netctl: no user protocol (port not in auxv; NetworkManager uses /dev/netctl
-  through VFS) -> filter refuses everything. Equivalent to copyraw's
-  `register_kernel_handler`; can switch to it once that lands.
+  through VFS) -> made kernel-only with copyraw's `register_kernel_handler`
+  (in the merge of main, after copyraw landed).
 
 ## Guard (63a404f6) — privtest `root_audio_forged_open_cases`
 Root holds /dev/pipewire O_WRONLY; a child dropped to nobody sends, for
