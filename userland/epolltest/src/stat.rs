@@ -101,6 +101,7 @@ pub unsafe fn stat_main() -> i32 {
     // Two tries: boot-time ambient wakes (see exit_wake_keyed) can land in the
     // first window; the bug reads 25+ on every try.
     rep(b"stat_exit_wake_keyed", exit_wake_keyed() || exit_wake_keyed());
+    rep(b"stat_pipe_drain_keyed", pipe_drain_keyed() || pipe_drain_keyed());
     if fail == 0 { write(1, b"SUMMARY stat pass\n".as_ptr(), 18); }
     fail
 }
@@ -160,4 +161,71 @@ unsafe fn exit_wake_keyed() -> bool {
     // collision, inherent to the filter. Bit-only exit/signal wakes (the
     // bug) read 25 here, one per child plus one.
     n == 0 && a.2 - b.2 <= 1
+}
+
+/// Lane panelpipe guard: a pipe reader parked in epoll for POLLIN must be
+/// woken by data (or EOF), never by its own drain. Both pipe ends used to
+/// share one poll key, and every read that did not free a full ring paid a
+/// deferred keyed wake owed to the WRITE end; the reader, re-parked by then,
+/// took it, re-probed an empty pipe and parked again: one useless wake per
+/// drain (cosmic-panel's waker pipe, ~45 per 10 s on the idle desktop).
+/// A helper writes one byte NBLIP times; we drain each to EAGAIN. Expect
+/// NBLIP useful wakes and no useless one.
+pub unsafe fn pipe_wake_main() -> i32 {
+    let ok = pipe_drain_keyed() || pipe_drain_keyed();
+    let msg: &[u8] = if ok { b"stat_pipe_drain_keyed: PASS\n" } else { b"stat_pipe_drain_keyed: FAIL\n" };
+    write(1, msg.as_ptr(), msg.len());
+    if ok { 0 } else { 1 }
+}
+
+const NBLIP: usize = 20;
+
+extern "C" fn pipe_writer(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let fd = *(arg as *const c_int);
+        for _ in 0..NBLIP {
+            usleep(10_000);
+            write(fd, b"x".as_ptr(), 1);
+        }
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn pipe_drain_keyed() -> bool {
+    let ep = epoll_create1(0);
+    let mut p = [-1 as c_int; 2];
+    // O_NONBLOCK | O_CLOEXEC
+    if ep < 0 || pipe2(p.as_mut_ptr(), 0o4000 | 0o2000000) != 0 || !ep_add(ep, p[0], EPOLLIN) { return false; }
+    let before = row(ep, p[0]);
+    let mut wfd = p[1];
+    let mut th: pthread_t = core::ptr::null_mut();
+    pthread_create(&mut th, core::ptr::null(), pipe_writer, &mut wfd as *mut c_int as *mut c_void);
+    let mut ev = epoll_event { events: 0, data: epoll_data { fd: 0 } };
+    let mut got = 0usize;
+    let t0 = now_ms();
+    while got < NBLIP && now_ms() - t0 < 2_000 {
+        if epoll_wait(ep, &mut ev, 1, 500) <= 0 { continue; }
+        let mut b = [0u8; 64];
+        loop {
+            let r = read(p[0], b.as_mut_ptr(), b.len());
+            if r <= 0 { break; }
+            got += r as usize;
+        }
+    }
+    pthread_join(th, core::ptr::null_mut());
+    // Let any deferred wake owed by the last drain land while we are parked.
+    epoll_wait(ep, &mut ev, 1, 50);
+    let after = row(ep, p[0]);
+    // `ep` stays open: a retry reusing its fd number would read the closed
+    // instance's /proc/epollstat row (useful=0 useless=0, a false pass).
+    close(p[0]); close(p[1]);
+    let b = before.unwrap_or((0, 0, 0, false));
+    let Some(a) = after else { return false };
+    write(1, b"  pipe_drain: useful=".as_ptr(), 21); write_i64(1, a.1 - b.1);
+    write(1, b" useless=".as_ptr(), 9); write_i64(1, a.2 - b.2);
+    write(1, b" bytes=".as_ptr(), 7); write_i64(1, got as i64);
+    write(1, b"\n".as_ptr(), 1);
+    // Bound 1 for the same inherent fingerprint collision as exit_wake_keyed;
+    // the bug reads one useless wake per drain (~NBLIP).
+    got == NBLIP && a.1 - b.1 >= 1 && a.2 - b.2 <= 1
 }
