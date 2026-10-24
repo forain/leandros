@@ -363,6 +363,33 @@ pub const MADT_X2APIC: u8 = 0x09;
 /// GIC CPU Interface (Arm; carries the MPIDR).
 pub const MADT_GICC:   u8 = 0x0B;
 
+/// MADT Interrupt Source Override (an ISA IRQ wired to another GSI and/or
+/// with non-ISA polarity/trigger).
+pub const MADT_ISO:    u8 = 0x02;
+
+/// Call `f(source_irq, gsi, mps_inti_flags)` for every ISA (bus 0)
+/// Interrupt Source Override of the MADT, in table order. Returns `false`
+/// when there is no RSDP or no MADT.
+///
+/// # Safety
+/// The ACPI tables must be readable through the HHDM at `hhdm_offset`.
+pub unsafe fn for_each_madt_iso(rsdp_phys: u64, hhdm_offset: u64, f: &mut dyn FnMut(u8, u32, u16)) -> bool {
+    let Some(madt) = find_table(rsdp_phys, hhdm_offset, b"APIC") else { return false; };
+    let len = read_u32(madt.add(4)) as usize;
+    if len < 44 || len > 1 << 20 { return false; }
+    let mut off = 44;
+    while off + 2 <= len {
+        let e = madt.add(off);
+        let elen = *e.add(1) as usize;
+        if elen < 2 || off + elen > len { break; }
+        if *e == MADT_ISO && elen >= 10 && *e.add(2) == 0 {
+            f(*e.add(3), read_u32(e.add(4)), read_u16(e.add(8)));
+        }
+        off += elen;
+    }
+    true
+}
+
 /// Call `f` for every processor entry of the MADT (`APIC` signature), in table
 /// order. Returns `false` when there is no RSDP or no MADT.
 ///
