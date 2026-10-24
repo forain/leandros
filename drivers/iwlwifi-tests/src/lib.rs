@@ -45,6 +45,8 @@ mod pref_tests;
 pub mod wifi_crypto;
 #[cfg(test)]
 mod crypto_tests;
+#[cfg(test)]
+mod tkip_tests;
 
 #[path = "../../src/wifi_frame.rs"]
 pub mod wifi_frame;

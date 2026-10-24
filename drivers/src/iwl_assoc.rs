@@ -168,6 +168,7 @@ pub fn parse_time_event_notif(p: &[u8]) -> Option<(u32, u32, u32)> { Some((le32(
 // ── keys and rates ──────────────────────────────────────────────────────────
 
 pub const STA_KEY_FLG_CCM: u16 = 2;
+pub const STA_KEY_FLG_TKIP: u16 = 3;
 pub const STA_KEY_FLG_WEP_KEY_MAP: u16 = 1 << 3;
 pub const STA_KEY_MULTICAST: u16 = 1 << 14;
 
@@ -181,6 +182,22 @@ pub fn add_sta_key_ccmp(sta_id: u8, offset: u8, key_idx: u8, key: &[u8; 16], mca
     k[..16].copy_from_slice(key);
     b.bytes(&k).zeros(16); // key, rx_secur_seq_cnt
     b.u8(0).u8(0).zeros(10); // TKIP fields
+    b.done()
+}
+
+/// ADD_STA_KEY (v1, 64 bytes) for a TKIP key, as iwlmvm's
+/// iwl_mvm_send_sta_key fills it on firmware without TKIP_MIC_KEYS (8265):
+/// the 32-byte key in driver layout (TK, own TX MIC key, own RX MIC key),
+/// the low byte of the receive IV32 and the phase-1 key (TTAK) for that
+/// IV32 and the transmitter address. The firmware decrypts and checks the
+/// ICV; the host checks Michael.
+pub fn add_sta_key_tkip(sta_id: u8, offset: u8, key_idx: u8, key: &[u8; 32], mcast: bool, iv32: u32, p1k: &[u16; 5]) -> Vec<u8> {
+    let flags = ((key_idx as u16 & 3) << 8) | STA_KEY_FLG_WEP_KEY_MAP | STA_KEY_FLG_TKIP | if mcast { STA_KEY_MULTICAST } else { 0 };
+    let mut b = Buf::new();
+    b.u8(sta_id).u8(offset).u16(flags);
+    b.bytes(key).zeros(16); // key, rx_secur_seq_cnt
+    b.u8(iv32 as u8).u8(0);
+    for &w in p1k { b.u16(w); }
     b.done()
 }
 

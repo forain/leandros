@@ -745,3 +745,32 @@ fn pure_tcp_ack_classification() {
     assert!(!is_pure_tcp_ack(&frag), "fragment");
     assert!(!is_pure_tcp_ack(&tcp_frame(0x10, 5, 0)[..40]), "truncated");
 }
+
+/// The exact security elements of LEANDRO2026 (klog 2026-10-24: "RSN v1 group
+/// TKIP pairwise TKIP,CCMP akm PSK caps 0x0000 +WPA1 element"): WPA/WPA2
+/// mixed mode is joinable with pairwise CCMP and a TKIP group key.
+#[test]
+fn leandro2026_mixed_mode_rsn() {
+    let rsn: [u8; 26] = [
+        0x30, 0x18, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x02, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x0f,
+        0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x00,
+    ];
+    let wpa1: [u8; 24] = [
+        0xdd, 0x16, 0x00, 0x50, 0xf2, 0x01, 0x01, 0x00, 0x00, 0x50, 0xf2, 0x02, 0x01, 0x00, 0x00, 0x50,
+        0xf2, 0x02, 0x01, 0x00, 0x00, 0x50, 0xf2, 0x02,
+    ];
+    let mut ies = ie(0, b"LEANDRO2026");
+    ies.extend_from_slice(&rsn);
+    ies.extend_from_slice(&wpa1);
+    let b = parse_beacon(&beacon(0x0411, &ies), 8).unwrap();
+    let r = b.rsn.as_ref().unwrap();
+    assert_eq!((r.version, r.group, r.caps), (1, TKIP, 0));
+    assert_eq!(r.pairwise, vec![TKIP, CCMP]);
+    assert_eq!(r.akm, vec![PSK]);
+    assert!(b.wpa1);
+    assert!(supports_wpa2_psk_ccmp(&b), "pairwise CCMP + group TKIP is joinable");
+    // Group TKIP with TKIP-only pairwise is still not.
+    let mut tkip_only = ie(0, b"x");
+    tkip_only.extend(rsn_ie(TKIP, &[TKIP], &[PSK]));
+    assert!(!supports_wpa2_psk_ccmp(&parse_beacon(&beacon(0x0411, &tkip_only), 1).unwrap()));
+}
