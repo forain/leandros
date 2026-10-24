@@ -643,7 +643,9 @@ pub fn init(cmdline: &'static str) {
     if UP.swap(true, Ordering::AcqRel) { return; }
     *CMDLINE.lock() = cmdline;
     let p = match port::create(0) { Some(p) => p, None => return };
-    if !port::register_handler(p, handle_msg) { return; }
+    // Reached only through /dev/netctl (VFS forwards fill open_id and the
+    // caller's buffers): no user protocol, so user code may send nothing.
+    if !port::register_kernel_handler(p, handle_msg) { return; }
     // Seed the model so the very first open already lists lo and eth0.
     refresh_links();
     crate::set_iface_hook(iface_hook);

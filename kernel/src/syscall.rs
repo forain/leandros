@@ -2525,6 +2525,7 @@ fn sys_send(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
     let msg: Message = match sched::uaccess::read_user::<Message>(msg_ptr) { Some(m) => m, None => return -14 };
     let r = ipc_send_permitted(port_id as u32);
     if r != 0 { return r; }
+    if !port::user_send_allowed(port_id as u32, &msg) { return -1; } // EPERM
     if msg.reply_port != u32::MAX {
         let r = ipc_send_permitted(msg.reply_port);
         if r != 0 && r != -9 { return r; }
@@ -2610,6 +2611,7 @@ fn sys_call(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
     let mut msg: Message = match sched::uaccess::read_user::<Message>(msg_ptr) { Some(m) => m, None => return -14 };
     let r = ipc_send_permitted(port_id as u32);
     if r != 0 { return r; }
+    if !port::user_send_allowed(port_id as u32, &msg) { return -1; } // EPERM
     msg.reply_port = reply_port;
     match port::send(port_id as u32, msg) {
         Ok(())                              => {}
