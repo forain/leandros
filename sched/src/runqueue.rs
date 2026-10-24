@@ -849,6 +849,9 @@ impl RunQueue {
                 return crate::ListenPark::Taken(core::mem::replace(&mut t.listen.ring, crate::WakeRing::EMPTY));
             }
         }
+        // No mailbox survives into this park (lane percpu4): the owner runs,
+        // so no Blocked -> Ready writer can race this clear.
+        crate::slot::listen_mail_clear(idx);
         self.parked[idx / 64] |= 1u64 << (idx % 64);
         self.pk_port[idx] = port;
         self.pk_mask[idx] = mask;
@@ -864,6 +867,7 @@ impl RunQueue {
             t.poll_nfp      = t.listen.nfp;
             t.poll_xkeys    = t.listen.xkeys;
             t.poll_nx       = t.listen.nx;
+            t.listen.parked = true;
         }
         crate::ListenPark::Parked
     }

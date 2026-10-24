@@ -525,6 +525,13 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.exit_signal = opts.exit_signal;
         let mut rq = super::RUN_QUEUE.lock();
         if opts.share_fs { join_fs_group(&mut rq, parent_pid, &mut child); }
+        if super::group_exiting_locked(&rq, parent_pid) {
+            // Lane exitexec: see `group_exiting_locked`.
+            drop(rq);
+            drop(child);
+            mm::buddy::free(stack_base_phys, stack_pages);
+            return -4; // EINTR: the caller never returns to user space
+        }
         if super::admit_locked(&rq, true) != 0 {
             // Lost a race for the last slot to another CPU's fork. Dropping
             // the child (after the lock) releases its address space and
@@ -858,6 +865,13 @@ pub fn clone_thread(
         child.exit_signal = if flags & CLONE_THREAD == 0 { (flags & 0xff) as u8 } else { 0 };
         let mut rq = super::RUN_QUEUE.lock();
         if flags & CLONE_FS != 0 { join_fs_group(&mut rq, parent_pid, &mut child); }
+        if super::group_exiting_locked(&rq, parent_pid) {
+            // Lane exitexec: see `group_exiting_locked`.
+            drop(rq);
+            drop(child);
+            mm::buddy::free(stack_base_phys, stack_pages);
+            return -4; // EINTR: the caller never returns to user space
+        }
         if super::admit_locked(&rq, flags & CLONE_THREAD == 0) != 0 {
             drop(rq);
             drop(child);

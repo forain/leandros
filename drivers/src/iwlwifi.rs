@@ -114,7 +114,7 @@ use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use spin::Mutex;
 
 use crate::iwl_agg::{self as agg, TxAgg};
@@ -272,6 +272,19 @@ static DEV: Mutex<Option<Dev>> = Mutex::new(None);
 static IRQ_KNOB: AtomicBool = AtomicBool::new(true);
 /// `iwlwifi.quiet=0`: keep the 100 ms housekeeping park while idle.
 static QUIET_KNOB: AtomicBool = AtomicBool::new(true);
+/// iwlwifi.bf=0: no firmware beacon filtering while associated.
+static BF_KNOB: AtomicBool = AtomicBool::new(true);
+/// Firmware beacon filtering: 0 off, 1 on, 2 the command failed.
+static BF_STATE: AtomicU32 = AtomicU32::new(0);
+/// Why a housekeeping tick could not park: TX moved, held reorder frames,
+/// ERP, BSS queue in use, rate table pending, ADDBA outstanding.
+static NOQUIET: [AtomicU32; 6] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+                                   AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+/// Driver-thread drains of the RX ring while the daemon owns it (fallback).
+static THREAD_SVC: AtomicU32 = AtomicU32::new(0);
+/// The thread drains the ring itself at most this often while the daemon owns it.
+const THREAD_SVC_FALLBACK_MS: u64 = 1000;
+static THREAD_SVC_MS: AtomicU64 = AtomicU64::new(0);
 /// The MSI is live: RX and notifications kick their consumers.
 static IRQ_ON: AtomicBool = AtomicBool::new(false);
 /// BAR0 (for the handler, which must not take DEV).
@@ -381,7 +394,9 @@ pub fn rx_irq_driven() -> bool { IRQ_ON.load(Ordering::Relaxed) }
 fn wait_event(max_ms: u64) {
     if !IRQ_ON.load(Ordering::Acquire) || !link_up() || max_ms < 2 { msleep(1); return; }
     irq_rearm();
-    if with_dev(|d| d.t.rx_pending() || !d.notifs.is_empty()).unwrap_or(true) { return; }
+    // The daemon drains the ring and hands notifications over: a pending
+    // ring is its business (looking at it here spun until it ran).
+    if with_dev(|d| !d.notifs.is_empty()).unwrap_or(true) { return; }
     let deadline = sched::monotonic_ns() + max_ms.min(QUIET_PARK_MS) * 1_000_000;
     THREAD_PARKS.fetch_add(1, Ordering::Relaxed);
     sched::block_on_poll_prepare_tag(deadline, &IWL_PARK);
@@ -656,11 +671,16 @@ impl Dev {
 
     /// Something the driver thread's 100 ms housekeeping must look after:
     /// held reorder frames, TX in flight, a rate table or ADDBA due, ERP.
-    fn needs_tick(&self) -> bool {
-        self.agg.stored() > 0 || self.erp_changed
-            || self.t.txq[BSS_QUEUE].as_ref().map_or(false, |t| t.used() > 0)
-            || self.rc.as_ref().map_or(false, |c| c.pending)
-            || !matches!(self.tagg.state, agg::AggState::Off)
+    fn needs_tick(&self) -> bool { self.tick_why() != 0 }
+
+    /// needs_tick's terms as bits 1.. (bit 0 is TX movement, see quiet_tick).
+    /// An established TX Block Ack session needs nothing periodic (its
+    /// frames are in the BSS queue term); only an outstanding ADDBA times out.
+    fn tick_why(&self) -> u32 {
+        (self.agg.stored() > 0) as u32 * 2 | self.erp_changed as u32 * 4
+            | self.t.txq[BSS_QUEUE].as_ref().map_or(false, |t| t.used() > 0) as u32 * 8
+            | self.rc.as_ref().map_or(false, |c| c.pending) as u32 * 16
+            | matches!(self.tagg.state, agg::AggState::Requested { .. }) as u32 * 32
     }
 
     /// Nothing due and no frames either way since the last call: the
@@ -669,9 +689,10 @@ impl Dev {
         // TX drives the housekeeping (rate table, ADDBA); received
         // broadcast chatter does not, and held reorder frames are in needs_tick.
         let mark = self.txs.ok;
-        let quiet = mark == self.quiet_mark && !self.needs_tick();
+        let why = (mark != self.quiet_mark) as u32 | self.tick_why();
+        for (i, c) in NOQUIET.iter().enumerate() { if why & (1 << i) != 0 { c.fetch_add(1, Ordering::Relaxed); } }
         self.quiet_mark = mark;
-        quiet
+        why == 0
     }
 
     fn dispatch(&mut self, p: RxPacket) {
@@ -1102,6 +1123,7 @@ pub fn init(cmdline: &str) {
     crate::wifi_mgr::set_knobs(cmdline);
     IRQ_KNOB.store(cmdline_val(cmdline, "iwlwifi.irq") != Some("0"), Ordering::Relaxed);
     QUIET_KNOB.store(cmdline_val(cmdline, "iwlwifi.quiet") != Some("0"), Ordering::Relaxed);
+    BF_KNOB.store(cmdline_val(cmdline, "iwlwifi.bf") != Some("0"), Ordering::Relaxed);
     if cmdline_val(cmdline, "iwlwifi.disable") == Some("1") {
         log("disabled (iwlwifi.disable=1)");
         return;
@@ -1351,7 +1373,8 @@ fn wait_notif(timeout_ms: u64, mut pred: impl FnMut(&RxPacket) -> bool, mut othe
     let t0 = now_ms();
     loop {
         IWL_KICKED.store(false, Ordering::Release);
-        let (p, fwerr) = with_dev(|d| { d.service(); (d.notifs.pop_front(), d.t.fw_error) }).unwrap_or((None, true));
+        let svc = thread_should_service();
+        let (p, fwerr) = with_dev(|d| { if svc { d.service(); } (d.notifs.pop_front(), d.t.fw_error) }).unwrap_or((None, true));
         match p {
             Some(p) => { if pred(&p) { return Ok(p); } other(p); continue; }
             None => {}
@@ -1361,6 +1384,43 @@ fn wait_notif(timeout_ms: u64, mut pred: impl FnMut(&RxPacket) -> bool, mut othe
         if spent > timeout_ms || timeout_ms == 0 { return Err(Err::Timeout("notification")); }
         wait_event(timeout_ms - spent);
     }
+}
+
+/// Associated with the MSI live the net daemon owns the RX ring (every
+/// interrupt wakes it, it hands notifications and responses over): the
+/// thread drains it itself only once per THREAD_SVC_FALLBACK_MS, in case a
+/// hand-off was missed.
+fn thread_should_service() -> bool {
+    if !IRQ_ON.load(Ordering::Acquire) || !link_up() { return true; }
+    let now = now_ms();
+    if now.saturating_sub(THREAD_SVC_MS.load(Ordering::Relaxed)) < THREAD_SVC_FALLBACK_MS { return false; }
+    THREAD_SVC_MS.store(now, Ordering::Relaxed);
+    THREAD_SVC.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// REPLY_BEACON_FILTERING_CMD (iwl_beacon_filter_cmd without the v4
+/// absolute thresholds, IWL_BF_CMD_CONFIG_DEFAULTS): the firmware passes a
+/// beacon only when its signal or contents changed. Missed beacons are
+/// still the firmware's to count (MISSED_BEACONS_NOTIFICATION).
+fn beacon_filter_on() {
+    if !BF_KNOB.load(Ordering::Relaxed) { BF_STATE.store(0, Ordering::Relaxed); return; }
+    // energy_delta, roaming_energy_delta, roaming_state, temp_threshold,
+    // temp_fast_filter, temp_slow_filter, enable_beacon_filter, debug_flag,
+    // escape_timer, ba_escape_timer, ba_enable_beacon_abort.
+    let v: [u32; 11] = [5, 1, 72, 112, 1, 5, 1, 0, 50, 6, 0];
+    let mut b = Vec::with_capacity(44);
+    for x in v { b.extend_from_slice(&x.to_le_bytes()); }
+    match send(cmd::REPLY_BEACON_FILTERING_CMD, None, &b) {
+        Ok(_) => { BF_STATE.store(1, Ordering::Relaxed); ilog!("beacon filtering on"); }
+        Err(e) => { BF_STATE.store(2, Ordering::Relaxed); ilog!("beacon filtering not enabled: {:?}", e); }
+    }
+}
+
+/// The association goes: beacons pass again (scans, the next BSS's sync).
+fn beacon_filter_off() {
+    if BF_STATE.swap(0, Ordering::Relaxed) != 1 || with_dev(|d| d.t.fw_error).unwrap_or(true) { return; }
+    if let Err(e) = send(cmd::REPLY_BEACON_FILTERING_CMD, None, &[0u8; 44]) { ilog!("beacon filtering not disabled: {:?}", e); }
 }
 
 /// The default handler for notifications nobody waits for.
@@ -2077,6 +2137,7 @@ fn connect(_fw: &Fw, hw: &mut Hw, target: &ScanEntry, ssid: &[u8], psk: &[u8], l
         Err(f) => return Disc::Failed(f.msg),
     }
     // Connected: stay here until the link goes away.
+    beacon_filter_on();
     LINK_UP.store(true, Ordering::SeqCst);
     on_link_up();
     LINK_GEN.fetch_add(1, Ordering::SeqCst);
@@ -2824,6 +2885,7 @@ impl wm::Radio for IwlRadio {
             return r;
         }
         self.fw_errors = 0;
+        beacon_filter_on();
         LINK_UP.store(true, Ordering::SeqCst);
     on_link_up();
         LINK_GEN.fetch_add(1, Ordering::SeqCst);
@@ -2843,6 +2905,7 @@ impl wm::Radio for IwlRadio {
 
     fn leave(&mut self, deauth: bool) {
         LINK_UP.store(false, Ordering::SeqCst);
+        beacon_filter_off();
         if deauth && self.prog.authed {
             // Deauthentication, reason 3 (leaving), before the station goes.
             match tx_mgmt(&wf::build_deauth(&self.prog.bssid, &self.hw.mac, wm::IEEE_REASON_LEAVING), self.prog.channel) {
@@ -3172,11 +3235,14 @@ pub fn info_lines(out: &mut String) {
         let _ = writeln!(out, "firmware: {}", i.fw);
         let _ = writeln!(out, "state: {}", i.state);
         let _ = writeln!(out, "rfkill: {}", if i.rfkill { "on" } else { "off" });
-        let _ = writeln!(out, "irq: {} vector {:#04x} irqs {} empty {} last {:08x} wanted {}; thread parks {} kicked {} quiet {}; rearm_busy {} deferred {}; beacons {} last_notif {:04x}",
+        let _ = writeln!(out, "irq: {} vector {:#04x} irqs {} empty {} last {:08x} wanted {}; thread parks {} kicked {} quiet {}; rearm_busy {} deferred {}; beacons {} last_notif {:04x}; noquiet tx {} agg {} erp {} txq {} rc {} addba {}; thread_svc {} bf {}",
                          if IRQ_ON.load(Ordering::Relaxed) { "msi" } else { "polled" }, IRQ_VECTOR.load(Ordering::Relaxed),
                          IRQS.load(Ordering::Relaxed), IRQ_EMPTY.load(Ordering::Relaxed), IRQ_LAST.load(Ordering::Relaxed),
                          tr::IRQ_WANTED.load(Ordering::Relaxed) as u8, THREAD_PARKS.load(Ordering::Relaxed), THREAD_KICKED.load(Ordering::Relaxed), QUIET_PARKS.load(Ordering::Relaxed),
-                         RX_REARM_BUSY.load(Ordering::Relaxed), RX_REARM_DEFERRED.load(Ordering::Relaxed), BCN_RX.load(Ordering::Relaxed), LAST_KICK_NOTIF.load(Ordering::Relaxed));
+                         RX_REARM_BUSY.load(Ordering::Relaxed), RX_REARM_DEFERRED.load(Ordering::Relaxed), BCN_RX.load(Ordering::Relaxed), LAST_KICK_NOTIF.load(Ordering::Relaxed),
+                         NOQUIET[0].load(Ordering::Relaxed), NOQUIET[1].load(Ordering::Relaxed), NOQUIET[2].load(Ordering::Relaxed),
+                         NOQUIET[3].load(Ordering::Relaxed), NOQUIET[4].load(Ordering::Relaxed), NOQUIET[5].load(Ordering::Relaxed),
+                         THREAD_SVC.load(Ordering::Relaxed), ["off", "on", "failed"][BF_STATE.load(Ordering::Relaxed).min(2) as usize]);
         if i.mcc != [0, 0] { let _ = writeln!(out, "regulatory: {}{}", i.mcc[0] as char, i.mcc[1] as char); }
         if link_up() {
             let _ = writeln!(out, "ssid: {}", wf::ssid_display(&i.ssid));
