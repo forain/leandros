@@ -5649,6 +5649,18 @@ pub fn note_syscall_enter(number: usize) {
         .store(((pid as u64) << 32) | ((number as u64) << 1) | 1, Ordering::Relaxed);
     sysacct::enter(id);
 }
+/// Tag the current syscall with a 12-bit census sub-key (lane rddsys: the
+/// ioctl request), carried in bits 16..28 of the per-CPU syscall number so it
+/// follows the task across switches with `sc_saved`. The syscall's time is
+/// then also recorded under pseudo nr `sysacct::NR_SUB_BASE | sub`.
+#[inline]
+pub fn note_syscall_subkey(sub: u32) {
+    let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    let nr = CUR_SYSCALL[id].load(Ordering::Relaxed);
+    if nr != NO_SYSCALL && sub & 0xfff != 0 {
+        CUR_SYSCALL[id].store((nr & 0xffff) | ((sub & 0xfff) << 16), Ordering::Relaxed);
+    }
+}
 /// Syscall exit; `ret` is the value going back to user space (the census
 /// counts returns of 0 per syscall, see `sysacct`).
 #[inline]
@@ -6212,7 +6224,17 @@ pub(crate) unsafe fn unlock_address_space(as_ptr: *mut mm::vmm::AddressSpace) {
 }
 
 pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
-    page_fault(addr, is_write, false)
+    // Faults taken from user mode (not inside a syscall) are charged as user
+    // time; the census row `sysacct::NR_UFAULT` makes their cost visible.
+    let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    if CUR_SYSCALL[id].load(Ordering::Relaxed) != NO_SYSCALL {
+        return page_fault(addr, is_write, false);
+    }
+    let tgid = CURRENT_TGID[id].load(Ordering::Relaxed);
+    let t0 = unsafe { arch_monotonic_ns() };
+    let r = page_fault(addr, is_write, false);
+    sysacct::note_ns(tgid, sysacct::NR_UFAULT, unsafe { arch_monotonic_ns() }.saturating_sub(t0));
+    r
 }
 
 /// Fault in one page of the current process for a kernel access about to

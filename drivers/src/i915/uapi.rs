@@ -317,10 +317,44 @@ const SEQ_MASK: u64 = (1 << 48) - 1;
 fn fence_id(eng: usize, seq: u64) -> u64 { EXT_FENCE | (eng as u64) << 48 | (seq & SEQ_MASK) }
 
 /// `UapiBackend::fence_done`: lock-free.
+/// `i915.fake_lat_us=<us>` (testing, fake device only): a soft-engine
+/// request still runs synchronously, but its fence reads as pending until
+/// `us` after submission, so CPU fence waits (GEM_WAIT, SYNCOBJ_WAIT) really
+/// wait in QEMU, as on hardware. 0 (default) = complete at submit.
+static FAKE_LAT_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Per engine: the newest fake request not yet published and when it is due.
+static FAKE_DUE_SEQ: [AtomicU64; NENG] = [const { AtomicU64::new(0) }; NENG];
+static FAKE_DUE_AT: [AtomicU64; NENG] = [const { AtomicU64::new(0) }; NENG];
+
+fn fake_lat_ns() -> u64 {
+    let mut v = FAKE_LAT_NS.load(Ordering::Relaxed);
+    if v == u64::MAX {
+        v = super::opt("i915.fake_lat_us").unwrap_or(0).min(1_000_000) * 1000;
+        FAKE_LAT_NS.store(v, Ordering::Relaxed);
+    }
+    v
+}
+
+/// The soft engine finished request `seq` on `eng`: publish it now, or
+/// (fake latency) when due. Requests stay in order: a later one is never
+/// due before an earlier one.
+fn fake_complete(eng: usize, seq: u64) {
+    let lat = fake_lat_ns();
+    if lat == 0 { COMPLETED[eng].fetch_max(seq, Ordering::AcqRel); return; }
+    let due = sched::monotonic_ns().saturating_add(lat).max(FAKE_DUE_AT[eng].load(Ordering::Acquire));
+    FAKE_DUE_AT[eng].store(due, Ordering::Release);
+    FAKE_DUE_SEQ[eng].fetch_max(seq, Ordering::AcqRel);
+}
+
 fn fence_done(f: u64) -> bool {
     let eng = ((f >> 48) & 0x7FFF) as usize;
     if eng >= NENG { return true; }
     let seq = f & SEQ_MASK;
+    if COMPLETED[eng].load(Ordering::Acquire) < seq && FAKE_DUE_SEQ[eng].load(Ordering::Acquire) >= seq
+        && sched::monotonic_ns() >= FAKE_DUE_AT[eng].load(Ordering::Acquire)
+    {
+        COMPLETED[eng].fetch_max(seq, Ordering::AcqRel);
+    }
     // The status page first-hand: no wait for the poll thread's retire.
     COMPLETED[eng].load(Ordering::Acquire) >= seq
         || (seq <= SUBMITTED[eng].load(Ordering::Acquire) && super::exec::hw_done(eng, seq))
@@ -1510,7 +1544,7 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
             if !c.recoverable { c.banned = true; }
         }
     }
-    COMPLETED[eng].fetch_max(seq, Ordering::AcqRel);
+    fake_complete(eng, seq);
     drop(st);
     exec_writeback(&e, &objs, &list, &patches);
     let n = EXECS.fetch_add(1, Ordering::Relaxed) + 1;
