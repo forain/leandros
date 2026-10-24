@@ -1394,6 +1394,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_tcp_connect_refused() { failures += 1; }
     if !test_inet_msg_peek() { failures += 1; }
     if !test_unix_dgram_sizes() { failures += 1; }
+    if !test_fd_pass_mounted_closed() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
@@ -1453,6 +1454,41 @@ unsafe fn test_fd_pass() -> bool {
     close(b);
 
     report(name, sret == 1 && status == 0)
+}
+
+// ── 1a. fd-pass of a MOUNTED-fs file whose last table fd closes in flight ──
+//
+// Firefox hands a Cache Storage body to a content process as
+// `dup; sendmsg(SCM_RIGHTS); close`, so the queued copy is the only reference
+// left when the receiver's recvmsg runs. The VFS closed the mount server's
+// open slot on that close (it only counted fd-table entries), and the
+// received fd read 0 bytes. A tmpfs file never hit this (separate counting).
+unsafe fn test_fd_pass_mounted_closed() -> bool {
+    let name = b"fd_pass_mounted_closed\0";
+    let cands: [&[u8]; 4] = [b"/var/tmp/scmtest_mnt\0", b"/root/scmtest_mnt\0", b"/home/scmtest_mnt\0", b"/scmtest_mnt\0"];
+    let mut wfd = -1; let mut path: &[u8] = cands[0];
+    for c in cands.iter() {
+        wfd = open(c.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+        if wfd >= 0 { path = c; break; }
+    }
+    if wfd < 0 { dbg0(b"[fd_pass_mnt] no writable mounted dir\n\0"); return report(name, false); }
+    write(wfd, b"MNTOK".as_ptr(), 5);
+    lseek(wfd, 0, SEEK_SET);
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 { close(wfd); return report(name, false); }
+    let sret = send_fd_and_byte(sv[0], wfd, b'X');
+    close(wfd); // the queued copy is now the only reference
+    // Churn the mount server's open slots so a freed slot gets reused.
+    let o2 = open(path.as_ptr(), O_RDONLY, 0);
+    let (_n, _f, rfd, _cl) = recv_fd_and_byte(sv[1], 32, 0);
+    let mut rbuf = [0u8; 5];
+    let got = if rfd >= 0 { read(rfd, rbuf.as_mut_ptr(), 5) } else { -1 };
+    dbg2(b"[fd_pass_mnt] sendmsg=%d read via received fd -> %d\n\0", sret as i64, got as i64);
+    if o2 >= 0 { close(o2); }
+    if rfd >= 0 { close(rfd); }
+    close(sv[0]); close(sv[1]);
+    unlink(path.as_ptr());
+    report(name, sret == 1 && got == 5 && &rbuf == b"MNTOK")
 }
 
 // ── 1b. fork-child-exit must NOT tear down the parent's connected socket ────

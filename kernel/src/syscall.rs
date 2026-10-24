@@ -1658,6 +1658,7 @@ pub fn dispatch(
         crate::serial_print_hex(ret as usize);
         crate::serial_print_str("\n");
     }
+    if FFTRACE { fftrace(number, a0, a1, a2, ret); }
     // Fire any expired POSIX timers before returning to user-space.
     tty_server::check_timers(current_pid());
     // Perform any VT switch requested from IRQ context (the Ctrl+Alt+Fn chord
@@ -1670,6 +1671,115 @@ pub fn dispatch(
 
 
 
+
+/// Trial-only diagnostics for the Firefox Cache Storage body-read failure:
+/// syscall errors, morgue opens/EOF reads and SCM_RIGHTS receipts of
+/// processes whose executable path contains "firefox". Capped line count.
+const FFTRACE: bool = false;
+static FFTRACE_LINES: AtomicUsize = AtomicUsize::new(0);
+
+static FF_WATCH: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+fn ff_watched(tgid: u32, fd: u32) -> bool {
+    let k = ((tgid as u64) << 32) | fd as u64 | (1 << 63);
+    FF_WATCH.iter().any(|w| w.load(Ordering::Relaxed) == k)
+}
+fn ff_watch(tgid: u32, fd: u32) {
+    let k = ((tgid as u64) << 32) | fd as u64 | (1 << 63);
+    for w in FF_WATCH.iter() { if w.compare_exchange(0, k, Ordering::Relaxed, Ordering::Relaxed).is_ok() { return; } }
+}
+fn ff_unwatch(tgid: u32, fd: u32) {
+    let k = ((tgid as u64) << 32) | fd as u64 | (1 << 63);
+    for w in FF_WATCH.iter() { let _ = w.compare_exchange(k, 0, Ordering::Relaxed, Ordering::Relaxed); }
+}
+
+fn fftrace(number: usize, a0: usize, a1: usize, a2: usize, ret: isize) {
+    if FFTRACE_LINES.load(Ordering::Relaxed) > 6000 { return; }
+    let tgid0 = sched::current_tgid() as u32;
+    let watched = ff_watched(tgid0, a0 as u32);
+    let interesting_ok = number == OPENAT || number == RECVMSG || number == 2 || number == SENDMSG || watched
+        || ((number == READ || number == PREAD64) && ret == 0 && a2 > 0);
+    let interesting_err = ret < 0 && !matches!(ret, -11 | -4 | -110 | -115 | -2 | -38 | -25) && !(number == 25 && ret == -12) && !(number == 89 && ret == -22);
+    if !interesting_ok && !interesting_err && !(ret == -2 && number == OPENAT) { return; }
+    let tgid = sched::current_tgid();
+    let mut exe = [0u8; 128];
+    let n = match sched::exe_path(tgid, &mut exe) { Some(n) => n.min(128), None => return };
+    if !exe[..n].windows(7).any(|w| w == b"firefox") { return; }
+    let has = |h: &[u8], n: &[u8]| h.windows(n.len()).any(|w| w == n);
+    let pr = |tag: &str, path: Option<&[u8]>| {
+        FFTRACE_LINES.fetch_add(1, Ordering::Relaxed);
+        let _g = TRACE_LOCK.lock();
+        crate::serial_print_str(tag);
+        crate::serial_print_str(" p=");
+        crate::serial_print_hex(current_pid() as usize);
+        crate::serial_print_str(" nr=");
+        crate::serial_print_hex(number);
+        crate::serial_print_str(" a0=");
+        crate::serial_print_hex(a0);
+        crate::serial_print_str(" a2=");
+        crate::serial_print_hex(a2);
+        crate::serial_print_str(" ret=");
+        crate::serial_print_hex(ret as usize);
+        if let Some(p) = path {
+            crate::serial_print_str(" ");
+            for &b in p.iter().rev().take(60).collect::<Vec<_>>().iter().rev() { crate::serial_write_raw(&[*b]); }
+        }
+        crate::serial_print_str("\n");
+    };
+    if number == OPENAT || number == 2 {
+        let path = copy_user_path(if number == 2 { a0 } else { a1 }).unwrap_or_default();
+        if has(&path, b"morgue") || (ret < 0 && ret != -2) {
+            pr("[FFO]", Some(&path));
+            if ret >= 0 { ff_watch(tgid0, ret as u32); }
+        }
+        return;
+    }
+    if watched {
+        pr("[FFW]", None);
+        if number == CLOSE { ff_unwatch(tgid0, a0 as u32); }
+        return;
+    }
+    if number == SENDMSG && ret >= 0 {
+        let mut h = [0u8; 56];
+        if !with_current_address_space(|as_| as_.read_user_buf(a1, &mut h)).unwrap_or(false) { return; }
+        let cptr = u64::from_ne_bytes(h[32..40].try_into().unwrap()) as usize;
+        let clen = u64::from_ne_bytes(h[40..48].try_into().unwrap()) as usize;
+        if clen >= 20 && cptr != 0 {
+            let mut c = [0u8; 20];
+            if with_current_address_space(|as_| as_.read_user_buf(cptr, &mut c)).unwrap_or(false) {
+                let fd0 = u32::from_ne_bytes(c[16..20].try_into().unwrap());
+                if ff_watched(tgid0, fd0) { pr("[FFSEND-MORGUE]", None); }
+            }
+        }
+        return;
+    }
+    if number == RECVMSG && ret >= 0 {
+        let mut h = [0u8; 56];
+        if !with_current_address_space(|as_| as_.read_user_buf(a1, &mut h)).unwrap_or(false) { return; }
+        let clen = u64::from_ne_bytes(h[40..48].try_into().unwrap());
+        let fl = u32::from_ne_bytes(h[48..52].try_into().unwrap());
+        if fl & 0x8 != 0 { pr("[FFCTRUNC]", None); } else if clen > 0 {
+            let cptr = u64::from_ne_bytes(h[32..40].try_into().unwrap()) as usize;
+            let mut c = [0u8; 20];
+            let mut path = None;
+            if clen >= 20 && with_current_address_space(|as_| as_.read_user_buf(cptr, &mut c)).unwrap_or(false) {
+                let fd0 = u32::from_ne_bytes(c[16..20].try_into().unwrap());
+                path = fd_abs_path(fd0 as usize);
+                if let Some(ref p) = path { if has(p, b"morgue") { ff_watch(tgid0, fd0); } }
+            }
+            pr("[FFR]", path.as_deref());
+        }
+        return;
+    }
+    if number == READ || number == PREAD64 || ret == -9 || ret == -14 || ret == -5 {
+        let path = fd_abs_path(a0);
+        if number == READ || number == PREAD64 {
+            if let Some(ref p) = path { if !has(p, b"morgue") && ret == 0 { return; } } else if ret == 0 { return; }
+        }
+        pr("[FFE]", path.as_deref());
+        return;
+    }
+    pr("[FFE]", None);
+}
 
 /// Gate the per-mmap `[MMAP]` device-mapping debug prints. These fire on every
 /// device mmap (e.g. DRM buffer maps) and flood the serial console during
