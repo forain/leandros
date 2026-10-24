@@ -7,16 +7,20 @@
 //! (xmm0/xmm1 in, xmm0 out). Calling the Rust functions directly made every
 //! `pow`/`exp`/`sqrt` read a stale integer register and return garbage in rax,
 //! so the synth's gains were random and DOOM's music clipped on x86_64 only.
-//! The exported C symbols are therefore small asm trampolines that move the
-//! arguments from SSE to integer registers and the result back.
+//! In that soft-float build the exported C symbols are small asm trampolines
+//! that move the arguments from SSE to integer registers and the result back.
+//! The archive C programs actually link on x86_64 is built for the hard-float
+//! leandros target (`target_feature = "sse2"`, build-userland.sh), which fixes
+//! the whole class (compiler-rt float builtins included) and uses the plain
+//! functions below; the trampolines only guard the soft-float archive.
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_arch = "x86_64", not(target_feature = "sse2"))))]
 #[no_mangle]
 pub extern "C" fn pow(x: f64, y: f64) -> f64 {
     libm::pow(x, y)
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_arch = "x86_64", not(target_feature = "sse2"))))]
 macro_rules! unary {
     ($($name:ident),+ $(,)?) => {
         $(
@@ -28,10 +32,10 @@ macro_rules! unary {
     };
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_arch = "x86_64", not(target_feature = "sse2"))))]
 unary!(exp, log, log10, tan, sqrt);
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_feature = "sse2")))]
 mod x86 {
     // Soft-float ABI bodies; only the trampolines below call them.
     #[no_mangle]

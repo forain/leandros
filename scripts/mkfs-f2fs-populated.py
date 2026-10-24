@@ -585,6 +585,10 @@ def main():
     if os.path.exists(p):
         print(f"  doom: {p}")
         bin_files.append(("doom", p, 0o100755))
+    # C float-ABI test linked against libleandros_libc.a like DOOM (lane floatabi).
+    p = f"target/floattest/floattest-{arch}"
+    if os.path.exists(p):
+        bin_files.append(("floattest", p, 0o100755))
     p = "../doomgeneric/doom1.wad"
     if os.path.exists(p):
         bin_files.append(("doom1.wad", p, 0o100644))
