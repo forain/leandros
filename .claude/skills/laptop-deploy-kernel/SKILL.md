@@ -23,11 +23,24 @@ default. With `--reboot` it waits for sshd and prints `NEW KERNEL RUNNING: trial
 <id>` plus `uname -v` (`#1 <build tag>`), or says it is not. `--promote` promotes
 right away when the check passed.
 
-`--netwatch S` appends `netwatch=S` to the **trial** entry's cmdline only: if the
-trial kernel has no IPv4 address S seconds after boot it reboots itself to the
-good entry. Use it whenever the laptop is reachable only over Wi-Fi, so a kernel
-that breaks the network cannot strand it. Example:
-`remote.py deploy-kernel --netwatch 180 --reboot`.
+`--netwatch S` appends `netwatch=S` to the **trial** entry's cmdline only
+(default 180 on real machines, off on QEMU; `--netwatch 0` = off). The trial
+kernel then watches the network for the whole trial, not only at boot
+(`kernel/src/netwatch.rs`):
+- no IPv4 address S seconds after boot -> reboot;
+- trial watch (only when booted as `leandros.slot=trial`): every
+  `netwatch.every=` (10 s) it pings `netwatch.host=a.b.c.d` (default: the
+  default gateway, which must answer ARP first, so an associated-but-dead data
+  path counts as down). No reply for `netwatch.reach=` (300 s; `0` = off) AND
+  the last `netwatch.fails=` (3) probes failed -> reboot. Hysteresis: a Wi-Fi
+  blip shorter than `reach` only logs `[netwatch] <gw> not answering` /
+  `answers again`, so a long measurement survives it;
+- `--trial-max M` (`netwatch.trial_max=M`, minutes; `90s` also works; default
+  off): an un-promoted trial reboots after M minutes regardless.
+The reboot lands on good: `espctl boot` in init already made the fallback the
+default when the trial reached init. The reason line is in the previous boot's
+klog (`remote.py logs`). Tune with `--append 'netwatch.reach=600'`. Example:
+`remote.py deploy-kernel --reboot` (netwatch 180 + reach 300 implied).
 
 **f2fs roll-forward guard.** A kernel older than da51b45e (f2fsync) ignores the
 f2fs roll-forward fsync records, so after an unclean shutdown of a new kernel it
@@ -44,8 +57,10 @@ of a new kernel loses the last <=30 s of fsyncs until the stick is re-flashed.
 
 Promote: `remote.py promote` (or `deploy-kernel --reboot --promote`, which
 promotes only when the check passed). Promoting copies the trial's cmdline to
-the good entry and then strips `netwatch=` from it, so a good kernel never
-reboots itself over a network outage.
+the good entry and then strips `netwatch=`/`netwatch.*` from it, and `espctl
+promote` disarms the running kernel's watchdog (`NETCTL_NETWATCH_DISARM`;
+console: `[netwatch] disarmed (promoted)`), so a promoted kernel never reboots
+itself over a network outage, neither now nor on later boots.
 
 Kernel arguments: `--cmdline 'i915.kmsdump=3 klog.flush=2'` replaces the extra
 arguments of the new entry (default: the good entry's). Same kernel, other knobs:

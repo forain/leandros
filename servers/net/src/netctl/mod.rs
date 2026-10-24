@@ -853,6 +853,7 @@ fn do_ioctl(cmd: u32, ptr: usize, open_id: u32) -> Result<i64, i32> {
             Ok(0)
         }
         nr @ 0x01..=0x05 => query(nr, ptr),
+        0x30 => { crate::netwatch::disarm(); Ok(0) }
         0x06 => {
             let mut st = ST.lock();
             let st_ = &mut *st;

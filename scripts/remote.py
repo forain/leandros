@@ -32,8 +32,12 @@ Commands:
                          ESP); with --reboot boot it and check it is running.
                          --netwatch S appends netwatch=S to the trial entry's
                          cmdline only (never the good entry's): a trial kernel
-                         with no IPv4 address S s after boot reboots itself to
-                         the good entry (Wi-Fi-only machines)
+                         with no IPv4 address S s after boot, or whose gateway
+                         stops answering for 300 s (netwatch.reach=) at any
+                         time, reboots itself to the good entry. Default 180 on
+                         real machines, off on qemu; --netwatch 0 = off.
+                         --trial-max M adds netwatch.trial_max=M (minutes): an
+                         un-promoted trial reboots to good after M minutes
   promote | discard      trial -> good / drop the trial entry
   espctl <args...>       run espctl in the guest
   logs [--out DIR]       console log (all 4 boots), status, /var/log, ... into
@@ -377,14 +381,16 @@ def rf_guard_needed(t):
 
 
 def promote(t):
-    """espctl promote, then drop the trial-only netwatch= knob the good entry inherited."""
+    """espctl promote (which also disarms the running kernel's netwatch), then drop
+    the trial-only netwatch=/netwatch.* knobs the good entry inherited."""
     p = t.run("espctl promote", check=False)
     out = p.stdout.decode(errors="replace") + p.stderr.decode(errors="replace")
     if p.returncode == 0:
         args = espctl_status(t).get("good_cmdline", "").split()
         # netwatch= and the deploy-time f2fs.rf=0 guard are trial-only knobs.
-        if any(x.startswith("netwatch=") or x == "f2fs.rf=0" for x in args):
-            keep = " ".join(shlex.quote(x) for x in args if not (x.startswith("netwatch=") or x == "f2fs.rf=0"))
+        trial_only = lambda x: x.startswith("netwatch=") or x.startswith("netwatch.") or x == "f2fs.rf=0"
+        if any(trial_only(x) for x in args):
+            keep = " ".join(shlex.quote(x) for x in args if not trial_only(x))
             out += t.out(f"espctl cmdline good {keep}".rstrip())
     return p.returncode, out
 
@@ -414,6 +420,10 @@ def cmd_deploy_kernel(t, a):
             base = a.cmdline if a.cmdline is not None else espctl_status(t).get("good_cmdline", "").strip()
             if "f2fs.rf=" not in base:
                 a.cmdline = (base + " " if base else "") + "f2fs.rf=0"
+    if a.netwatch is None:
+        a.netwatch = 0 if t.qemu else 180
+    if a.trial_max:
+        a.append = ((a.append or "") + f" netwatch.trial_max={a.trial_max}").strip()
     if a.netwatch or a.append:
         # Trial entry only: espctl --cmdline is applied to the new (trial) entry;
         # the good entry keeps its own. Base = --cmdline if given, else the good entry's.
@@ -710,7 +720,7 @@ def main():
     p = sub.add_parser("deploy-kernel"); p.add_argument("--arch"); p.add_argument("--kernel")
     p.add_argument("--initrd"); p.add_argument("--no-arm", action="store_true")
     p.add_argument("--cmdline", help="extra kernel arguments for this entry (default: the good entry's); '' = none")
-    p.add_argument("--no-rf-guard", action="store_true", help="do not add f2fs.rf=0 to the trial when the good kernel predates f2fs roll-forward (da51b45e)"); p.add_argument("--netwatch", type=int, metavar="S", help="append netwatch=S to the TRIAL entry's cmdline only: if the trial kernel has no IPv4 address S seconds after boot it reboots itself to the good entry (for machines reachable only over Wi-Fi)")
+    p.add_argument("--no-rf-guard", action="store_true", help="do not add f2fs.rf=0 to the trial when the good kernel predates f2fs roll-forward (da51b45e)"); p.add_argument("--netwatch", type=int, metavar="S", default=None, help="append netwatch=S to the TRIAL entry's cmdline only: if the trial kernel has no IPv4 address S seconds after boot, or its gateway stops answering pings for netwatch.reach= (300 s), it reboots itself to the good entry (default 180 on real machines, off on qemu; 0 = off)"); p.add_argument("--trial-max", type=int, metavar="M", help="append netwatch.trial_max=M: an un-promoted trial reboots to the good entry after M minutes")
     p.add_argument("--append", metavar="ARGS", help="append ARGS (e.g. 'sched.wakestat=1') to the TRIAL entry's cmdline only, keeping the good entry's arguments")
     p.add_argument("--reboot", action="store_true"); p.add_argument("--promote", action="store_true")
     p.add_argument("--timeout", type=int, default=300); p.add_argument("--no-logs", action="store_true")

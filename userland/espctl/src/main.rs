@@ -617,7 +617,22 @@ fn cmd_promote(o: &mut Opts) -> io::Result<()> {
         s.trial_extra.clear();
         s.set_default("good");
         Ok(Some(format!("promoted {} to good; it is the default from now on", trial)))
-    })
+    })?;
+    netwatch_disarm();
+    Ok(())
+}
+
+/// Stop the kernel's trial watchdog (`netwatch=` knobs) for the rest of this
+/// boot: the running kernel is now the good one and must never reboot itself
+/// over a network outage. `NETCTL_NETWATCH_DISARM` = `_IO('N', 0x30)`.
+fn netwatch_disarm() {
+    const NETCTL_NETWATCH_DISARM: libc::c_ulong = 0x4E30;
+    let ok = std::fs::OpenOptions::new().read(true).write(true).open("/dev/netctl").map(|f| {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::ioctl(f.as_raw_fd(), NETCTL_NETWATCH_DISARM as _) == 0 }
+    }).unwrap_or(false);
+    if ok { println!("netwatch disarmed for this boot"); }
+    else { eprintln!("espctl: could not disarm netwatch (/dev/netctl): {}", io::Error::last_os_error()); }
 }
 
 fn cmd_discard(o: &Opts) -> io::Result<()> {
