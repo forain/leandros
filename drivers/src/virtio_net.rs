@@ -667,6 +667,7 @@ unsafe fn arm_rx_irq(idx: usize, d: &VirtioNetDevice) {
                     if core::ptr::addr_of!((*cfg).queue_msix_vector).mmio_read() == 0 {
                         pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, (ctrl | 0x8000) & !0x4000);
                         table.add(3).mmio_write(0);
+                        IRQ_ARMED[idx].store(true, Ordering::Release);
                         crate::pci::serial_debug("[NET] MSI-X armed: RX queue -> vector ");
                         crate::pci::serial_debug_hex(vector as u32);
                         crate::pci::serial_debug("\n");
@@ -698,6 +699,7 @@ unsafe fn arm_rx_irq(idx: usize, d: &VirtioNetDevice) {
         let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
         pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd & !crate::pci::PCI_CMD_INTX_DISABLE);
         let _ = isr.mmio_read();
+        IRQ_ARMED[idx].store(true, Ordering::Release);
         crate::pci::serial_debug("[NET] INTx armed: INTID ");
         crate::pci::serial_debug_hex(intid);
         crate::pci::serial_debug("\n");
@@ -762,6 +764,15 @@ pub fn send_packet(dev_idx: usize, buf: &[u8]) -> bool {
     } else {
         false
     }
+}
+
+/// The RX-queue interrupt of each device is registered and unmasked: every
+/// received frame kicks the net daemon, which may then sleep long when idle.
+static IRQ_ARMED: [core::sync::atomic::AtomicBool; MAX_NET_DEVICES] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_NET_DEVICES];
+
+pub fn rx_irq_armed(dev_idx: usize) -> bool {
+    dev_idx < MAX_NET_DEVICES && IRQ_ARMED[dev_idx].load(Ordering::Acquire)
 }
 
 /// RX interrupts taken by device `dev_idx` (0 when polling only).

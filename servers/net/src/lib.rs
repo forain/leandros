@@ -2616,6 +2616,9 @@ const RX_BATCH: u32 = 64;
 /// daemon polls at 1 kHz for `ACTIVE_NS` after it.
 static LAST_TRAFFIC_NS: AtomicU64 = AtomicU64::new(0);
 const ACTIVE_NS: u64 = 200_000_000;
+/// Longest idle sleep of the net daemon when every NIC's receive path kicks it
+/// (see the end of `net_daemon`).
+const IDLE_CAP_NS: u64 = 1_000_000_000;
 
 impl<'a> smoltcp::phy::Device for NicDevice {
     type RxToken<'b> = RxToken where Self: 'b;
@@ -3184,7 +3187,7 @@ pub fn net_daemon() -> ! {
     let mut last_broadcast = 0u64;
     let mut immediate_streak = 0u32;
     loop {
-        drivers::netdev::take_kick();
+        if drivers::netdev::take_kick() { procnet::NETD_KICK_PASSES.fetch_add(1, Ordering::Relaxed); }
         procnet::NETD_PASSES.fetch_add(1, Ordering::Relaxed);
         let timestamp = stack_now();
 
@@ -3322,19 +3325,30 @@ pub fn net_daemon() -> ! {
         // a frame that arrived meanwhile means another pass right away.
         let mut again = false;
         for nif in drivers::netdev::iter() { again |= nif.rx_rearm(); }
-        if again { continue; }
+        if again { procnet::NETD_REARM_PASSES.fetch_add(1, Ordering::Relaxed); continue; }
 
-        // Sleep until smoltcp's next timer (delayed ACK, retransmit, ...),
-        // capped by the cadence: 1 kHz while frames are flowing (virtio-net
-        // has no receive interrupt here; on the r8169 it is the backstop for
-        // a lost interrupt), 100 Hz when idle. A kick (send, RX interrupt,
-        // window reopened) or a broadcast wake ends the sleep early.
+        // Sleep until smoltcp's next timer (delayed ACK, retransmit, keepalive,
+        // DHCP renew/retry, ARP retry: all of them are in `poll_delay`), or
+        // until a kick: a send, a socket request that changes what the stack
+        // must do (connect, close, shutdown, listen, accept, setsockopt), an
+        // RX or link interrupt, a reopened window, an admin change.
+        //  - Frames flowing: 1 kHz, the backstop for a lost RX interrupt.
+        //  - Idle, every NIC's receive path kicks: `IDLE_CAP_NS`. That cap only
+        //    covers the daemon's own coarse upkeep (carrier grace, rebind
+        //    deadline, orphan reaping, listener backlog) and a lost interrupt
+        //    on real hardware.
+        //  - Idle with a NIC that does not (yet) kick on receive (virtio-net
+        //    before its first RX interrupt, a driver in polled mode): 100 Hz.
         let active = now.saturating_sub(LAST_TRAFFIC_NS.load(Ordering::Relaxed)) < ACTIVE_NS;
-        let cadence_ns: u64 = if active { 1_000_000 } else { 10_000_000 };
+        let cadence_ns: u64 = if active { 1_000_000 }
+            else if drivers::netdev::iter().all(|n| n.rx_irq_driven()) { IDLE_CAP_NS }
+            else { 10_000_000 };
         let mut sleep_ns = match next_poll {
             Some(d) => (d.total_micros() * 1000).min(cadence_ns),
             None => cadence_ns,
         };
+        if sleep_ns < cadence_ns { procnet::NETD_TIMER_SLEEPS.fetch_add(1, Ordering::Relaxed); }
+        procnet::NETD_LAST_SLEEP_US.store(sleep_ns / 1000, Ordering::Relaxed);
         // The netshape link emulator (a test knob) releases its next frame then.
         if let Some(due) = drivers::netshape::next_due_ns() {
             sleep_ns = sleep_ns.min(due.saturating_sub(sched::monotonic_ns()).max(100_000));
@@ -3518,7 +3532,16 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
     // worker threads — with raw task pids the worker found an empty table
     // and every operation failed with EBADF).
     let caller_pid = sched::tgid_of(caller_pid);
-    match msg.tag {
+    // Requests that give an inet stack something to do or a new timer (SYN,
+    // FIN, RST, keepalive, a freed backlog slot) get a daemon pass now: the
+    // daemon sleeps up to `IDLE_CAP_NS` when idle. Unix sockets never need it.
+    let kick = match msg.tag {
+        NET_CONNECT | NET_SHUTDOWN | NET_CLOSE | NET_LISTEN | NET_ACCEPT | NET_SETSOCKOPT | NET_BIND =>
+            sock_entry(caller_pid, arg(msg,0) as usize).map_or(false, |e| e.domain as usize == AF_INET),
+        NET_CLOSE_ALL => true,
+        _ => false,
+    };
+    let reply = match msg.tag {
         NET_SOCKET      => handle_socket(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize),
         NET_BIND        => with_state_wake(caller_pid, arg(msg,0) as usize, false, ||
@@ -3573,7 +3596,9 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         NET_GETFD       => handle_getfd(caller_pid, arg(msg,0) as usize),
         NET_QUEUE_LEN   => handle_queue_len(caller_pid, arg(msg,0) as usize, arg(msg,1) != 0),
         _               => err_reply(-38),
-    }
+    };
+    if kick { drivers::netdev::kick(); }
+    reply
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
