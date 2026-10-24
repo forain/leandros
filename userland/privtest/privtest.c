@@ -943,6 +943,44 @@ static void kill_all_case(void *arg) {
  * gets EBUSY — by open or by IPC — readers are not writers, and the device
  * is free again once the holder's last fd closes). SKIPped while something
  * (a PipeWire session) holds the device. */
+/* A user process must not act as another process's open of /dev/pipewire:
+ * the VFS tags on the audio port (auxv 258) carry the kernel-filled open_id,
+ * so a raw LOS_IPC_CALL naming the holder's open_id — VFS_CLOSE (0x13)
+ * releases its claim, VFS_IOCTL (0x28) SET_PARAMS (0x101) passes the
+ * holder-only check — would forge it. An unprivileged child tries every
+ * small open_id; each call must be EPERM and the device must stay held. */
+static void root_audio_forged_open_cases(void) {
+    unsigned long port = getauxval(258);
+    if (port == 0 || port == 0xffffffffUL) { skip("audio_forged_open_id_*", "no audio port in auxv"); return; }
+    pid_t k = fork();
+    if (k == 0) {
+        if (setgroups(0, NULL) != 0 || setgid(65534) != 0 || setuid(65534) != 0) _exit(3);
+        int bad = 0;
+        uint8_t params[8] = { 0x44, 0xac, 0, 0, 2, 0, 0, 0 };
+        for (uint64_t id = 1; id <= 1024; id++) {
+            struct lmsg m; memset(&m, 0, sizeof m);
+            uint64_t a1[5] = { 0, 0x101, (uint64_t)(uintptr_t)params, 0, id };
+            m.tag = 0x28; memcpy(m.data, a1, sizeof a1);
+            long r = syscall(LOS_IPC_CALL, (long)port, &m, sizeof m);
+            if (!(r < 0 && errno == EPERM)) bad |= 1;
+            memset(&m, 0, sizeof m);
+            uint64_t a2[2] = { 0, id };
+            m.tag = 0x13; memcpy(m.data, a2, sizeof a2);
+            r = syscall(LOS_IPC_CALL, (long)port, &m, sizeof m);
+            if (!(r < 0 && errno == EPERM)) bad |= 2;
+        }
+        _exit(bad);
+    }
+    int st = 0;
+    waitpid(k, &st, 0);
+    int rc = WIFEXITED(st) ? WEXITSTATUS(st) : 99;
+    check("audio_forged_open_id_raw_ipc_eperm", rc == 0,
+          rc == 3 ? "could not drop to nobody" : "raw VFS-tag IPC to the audio port was not refused");
+    int x = open(AUDIO_NODE, O_WRONLY);
+    expect("audio_forged_open_id_holder_kept", x, EBUSY);
+    if (x >= 0) close(x);
+}
+
 static void root_audio_cases(void) {
     struct stat st;
     if (stat(AUDIO_NODE, &st) != 0) { skip("root_audio_*", "no " AUDIO_NODE); return; }
@@ -961,6 +999,7 @@ static void root_audio_cases(void) {
     long ip = audio_ipc_set_params();
     if (ip == -2) skip("root_audio_ipc_while_held_ebusy", "no audio port in auxv");
     else expect("root_audio_ipc_while_held_ebusy", ip, EBUSY);
+    root_audio_forged_open_cases();
     int d = dup(a);
     close(a);
     expect("root_audio_dup_keeps_device", open(AUDIO_NODE, O_WRONLY), EBUSY);
