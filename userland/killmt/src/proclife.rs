@@ -72,7 +72,7 @@ fn disposition(sig: i32) -> u64 {
 
 extern "C" fn usr2_handler(_: i32) {}
 
-pub const NAMES: [&str; 8] = ["exit_settle", "exec_kill", "exec_sibkill", "exec_sibterm", "exec_exit", "exec_state", "leaderless_exit", "exec_leaderless"];
+pub const NAMES: [&str; 10] = ["exit_settle", "exec_kill", "exec_sibkill", "exec_sibterm", "exec_tidkill", "exec_tidterm", "exec_exit", "exec_state", "leaderless_exit", "exec_leaderless"];
 
 /// Run proclife mode `name` for `iters` iterations; prints PASS/FAIL.
 pub fn run(name: &str, iters: usize) -> bool {
@@ -81,6 +81,8 @@ pub fn run(name: &str, iters: usize) -> bool {
         "exec_kill" => exec_kill(iters),
         "exec_sibkill" => exec_sibkill(iters, false),
         "exec_sibterm" => exec_sibkill(iters, true),
+        "exec_tidkill" => exec_tidkill(iters.max(300), false),
+        "exec_tidterm" => exec_tidkill(iters.max(300), true),
         "exec_exit" => exec_exit(iters),
         "exec_state" => exec_state(iters.min(20)),
         "leaderless_exit" => leaderless_exit(iters.min(20)),
@@ -326,6 +328,17 @@ fn exec_kill_child(res: i32, parked: bool) -> ! {
     spin_forever()
 }
 
+/// One-line state of `pid` for a failure message: status fields and tasks.
+fn proc_diag(pid: i32) -> String {
+    let st = std::fs::read_to_string(format!("/proc/{}/status", pid)).unwrap_or_default();
+    let keep: Vec<&str> = st.lines().filter(|l| ["Name", "State", "Threads", "SigPnd", "ShdPnd", "SigBlk", "SigCgt"]
+        .iter().any(|k| l.starts_with(k))).collect();
+    let tasks: Vec<String> = std::fs::read_dir(format!("/proc/{}/task", pid)).map(|d| d.filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string()).collect()).unwrap_or_default();
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).unwrap_or_default();
+    format!("{} tasks={:?} stat={}", keep.join(" "), tasks, stat.trim())
+}
+
 /// Read `fd` until EOF or `bound`; returns (text, reached_eof).
 fn drain(fd: i32, bound: Duration) -> (String, bool) {
     let t0 = Instant::now();
@@ -363,9 +376,10 @@ fn exec_kill(iters: usize) -> Result<String, String> {
         let st = match wait_bounded(pid, 0, Duration::from_secs(5)) {
             Some(st) => st,
             None => {
+                let diag = proc_diag(pid);
                 unsafe { kill(pid, SIGKILL); close(rp[0]); }
                 let late = wait_bounded(pid, 0, Duration::from_secs(10)).is_some();
-                return Err(format!("it {}: child {} not reaped (a second SIGKILL reaped it: {})", it, pid, late));
+                return Err(format!("it {}: child {} not reaped (a second SIGKILL reaped it: {}) [{}]", it, pid, late, diag));
             }
         };
         let (text, eof) = drain(rp[0], Duration::from_secs(3));
@@ -434,6 +448,98 @@ fn exec_sibkill_child(res: i32, spinners: usize, term: bool) -> ! {
         execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
         _exit(99);
     }
+}
+
+/// exec_tidkill / exec_tidterm (lane killexec2): the child runs 6 spinners
+/// and 2 futex-parked threads, reports their tids, and a ninth thread
+/// execve()s. Right after the exec marker the parent, after a jitter that
+/// sweeps the takeover, tgkill()s every sibling with SIGKILL (tidterm:
+/// SIGTERM, SIG_DFL). Once any tgkill has succeeded the process must die by
+/// that signal (the exec'ing thread delays its execve by a per-iteration
+/// jitter after the marker): a sibling dequeuing it while the de-thread reaps it used to
+/// lose it between the dequeue and its group-exit claim, and a SIGTERM aimed
+/// at a sibling already marked dead by the de-thread was dropped. Iterations
+/// are at least 300: the window is microseconds wide.
+fn exec_tidkill(iters: usize, term: bool) -> Result<String, String> {
+    let want = if term { SIGTERM } else { SIGKILL };
+    let (mut hit, mut survived) = (0usize, 0usize);
+    for it in 0..iters {
+        let mut rp = [0i32; 2];
+        unsafe { pipe(rp.as_mut_ptr()); }
+        let pid = unsafe { fork() };
+        if pid < 0 { return Err(format!("fork failed at {}", it)); }
+        if pid == 0 {
+            unsafe { close(rp[0]); }
+            let res = rp[1];
+            let started = Arc::new(AtomicUsize::new(0));
+            for i in 0..8 {
+                let started = started.clone();
+                thread::spawn(move || {
+                    let line = format!("T{}\n", unsafe { syscall(SYS_GETTID) });
+                    unsafe { write(res, line.as_ptr(), line.len()); }
+                    started.fetch_add(1, Ordering::SeqCst);
+                    if i < 2 { park_forever() } else { spin_forever() }
+                });
+            }
+            while started.load(Ordering::SeqCst) < 8 { thread::yield_now(); }
+            let h = thread::spawn(move || {
+                spin_for(Duration::from_millis(1));
+                let path = cstr("/bin/killmt");
+                let args = [cstr("killmt"), cstr("--exec-spin"), cstr(&res.to_string())];
+                let argv: [*const u8; 4] = [args[0].as_ptr(), args[1].as_ptr(), args[2].as_ptr(), core::ptr::null()];
+                let envp: [*const u8; 1] = [core::ptr::null()];
+                // Sweep the takeover across the parent's tgkill burst.
+                unsafe { write(res, b"X".as_ptr(), 1); }
+                spin_for(Duration::from_micros((it % 64) as u64 * 16));
+                unsafe { execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()); _exit(99); }
+            });
+            let _ = h.join();
+            spin_forever()
+        }
+        unsafe { close(rp[1]); }
+        let mut text = String::new();
+        let t0 = Instant::now();
+        while !text.contains('X') {
+            let mut b = [0u8; 64];
+            let n = unsafe { read(rp[0], b.as_mut_ptr(), b.len()) };
+            if n <= 0 || t0.elapsed() > Duration::from_secs(10) {
+                unsafe { kill(pid, SIGKILL); close(rp[0]); }
+                let _ = wait_bounded(pid, 0, Duration::from_secs(10));
+                return Err(format!("it {}: no exec marker", it));
+            }
+            text.push_str(&String::from_utf8_lossy(&b[..n as usize]));
+        }
+        let tids: Vec<usize> = text.lines().filter_map(|l| l.strip_prefix('T')).filter_map(|t| t.trim().parse().ok()).collect();
+        let mut ok = 0usize;
+        for &t in &tids {
+            if unsafe { syscall(SYS_TGKILL, pid as usize, t, want as usize) } == 0 { ok += 1; }
+        }
+        if ok == 0 {
+            // Exec won: every sibling was already gone. Nothing was sent.
+            unsafe { kill(pid, SIGKILL); }
+            let _ = wait_bounded(pid, 0, Duration::from_secs(10));
+            unsafe { close(rp[0]); }
+            survived += 1;
+            continue;
+        }
+        let st = wait_bounded(pid, 0, Duration::from_secs(5));
+        let st = match st {
+            Some(s) => s,
+            None => {
+                let diag = proc_diag(pid);
+                unsafe { kill(pid, SIGKILL); }
+                let _ = wait_bounded(pid, 0, Duration::from_secs(10));
+                unsafe { close(rp[0]); }
+                return Err(format!("it {}: child {} survived {} of {} tgkill({}) [{}]", it, pid, ok, tids.len(), want, diag));
+            }
+        };
+        unsafe { close(rp[0]); }
+        hit += 1;
+        if !(wifsignaled(st) && wtermsig(st) == want) {
+            return Err(format!("it {}: status 0x{:x}, expected signal {} ({} tgkills landed)", it, st, want, ok));
+        }
+    }
+    Ok(format!("{}/{}, killed {} / exec won {}", iters, iters, hit, survived))
 }
 
 static SIB_TID: AtomicUsize = AtomicUsize::new(0);
