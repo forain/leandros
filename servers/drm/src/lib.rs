@@ -479,7 +479,10 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     // drmGetDevices2() classify the device at all are built into the image by
     // scripts/mkfs-f2fs-populated.py.
     vfs_server::register_device("/dev/dri/renderD128", port_id, DEV_ID_RENDER, DRM_MAJOR, RENDER_MINOR);
-    port::register_handler(port_id, handle);
+    // Kernel-only: VFS_READ copies page-flip events to the task named in slot
+    // 3 (copy_to_task). Only the kernel's VFS forward may fill that slot; a raw user IPC naming another pid would read or write
+    // that process's memory (openbugs L1.17).
+    port::register_kernel_handler(port_id, handle);
     // Teach the VFS how to drop the DRM reference an exported dmabuf fd holds.
     //
     // This crate is the one place that already depends on BOTH `vfs_server` and
