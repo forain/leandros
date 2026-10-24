@@ -199,3 +199,23 @@ fn rate_control_steps_down_on_lost_ampdus() {
     assert!(c.cur < start, "a mostly lost link steps down ({} -> {})", start, c.cur);
     assert!(rs::expected_tpt_agg(rs::ht_id(7, false)) > rs::expected_tpt(rs::ht_id(7, false)));
 }
+
+#[test]
+fn ampdu_success_ratio_is_the_window_ratio() {
+    // 24 subframes per A-MPDU, 18 acked: the rate delivers 75 %. The failed
+    // subframes are recorded last; an EWMA over attempts read that as ~45 %
+    // and stepped the rate down on a healthy aggregated link.
+    let mut c = ht_ctl();
+    c.mark_sent(0);
+    c.set_agg(true, 63);
+    c.mark_sent(0);
+    let idx = c.cur;
+    let r = c.table()[0];
+    for k in 0..3 { c.on_ampdu(r, 24, 18, 200 + k * 50); }
+    let w = c.win[idx];
+    assert!((700..=800).contains(&w.sr), "sr {} permille over {} attempts", w.sr, w.att);
+    assert_eq!(w.att, rs::RATE_WINDOW, "the window holds the last 62 attempts");
+    // A fully acked burst moves the ratio up by its share of the window only.
+    c.on_ampdu(r, 24, 24, 400);
+    assert!(c.win[idx].sr < 950, "sr {}", c.win[idx].sr);
+}

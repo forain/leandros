@@ -830,7 +830,22 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     let is_limine = HHDM_REQUEST.response().is_some();
     let mut hhdm_offset = 0xffff800000000000;
     if is_limine {
+        // Vectors + a reachable (or deliberately silent) UART before the very
+        // first print: see arch/aarch64/src/early.rs (L8.12).
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let h = HHDM_REQUEST.response().map_or(0, |h| h.offset as usize);
+            let (kp, kv) = KERNEL_ADDR_REQUEST.response()
+                .map_or((0, 0), |k| (k.physical_base as usize, k.virtual_base as usize));
+            arch_aarch64::early::setup(h, kp, kv);
+        }
         capture_boot_identity();
+        // Test-only: `early.fault=1` takes a kernel data abort before any
+        // subsystem is up, to prove early faults are reported, not silent.
+        if cmdline_knob("early.fault") == Some("1") {
+            serial_print_str("[early] early.fault=1: deliberate fault\n");
+            unsafe { core::ptr::read_volatile(0x7000_0000_0000usize as *const u64); }
+        }
         early_fb_arm();
         // A CPU exception from here to `idt::init` (stage 3) used to vector
         // through the firmware's IDT: a silent hang or reset. See early_idt.rs.

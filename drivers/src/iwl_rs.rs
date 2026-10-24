@@ -203,23 +203,37 @@ pub fn initial_r500k(rssi: i8, band_24: bool) -> u8 {
 pub struct RateWin {
     pub att: u32,
     pub succ: u32,
-    /// Success ratio, permille (EWMA, 1/8 weight; the plain ratio for the
-    /// first 8 attempts).
+    /// Success ratio, permille, over the last `RATE_WINDOW` attempts.
     pub sr: u32,
     pub last_ms: u64,
+    /// One bit per attempt in the window, newest in bit 0 (1 = delivered).
+    pub data: u64,
 }
+
+/// Attempts a rate's window holds (Linux IWL_RATE_MAX_WINDOW). The success
+/// ratio is the plain ratio over the window: an EWMA over single attempts
+/// is order dependent, and the failed subframes of an A-MPDU, recorded
+/// after its delivered ones, would dominate it (25 sent, 19 acked: EWMA
+/// 1/8 gives 45 %, not 76 %), which pushed the rate down under load.
+pub const RATE_WINDOW: u32 = 62;
 
 impl RateWin {
     pub fn record(&mut self, ok: bool, now: u64) {
         if self.att > 0 && now.saturating_sub(self.last_ms) > STALE_MS { *self = RateWin::default(); }
-        self.att = self.att.saturating_add(1);
-        if ok { self.succ = self.succ.saturating_add(1); }
-        let x = if ok { 1000 } else { 0 };
-        self.sr = if self.att <= 8 { self.succ * 1000 / self.att } else { (self.sr * 7 + x) / 8 };
+        // rs.c _rs_collect_tx_data: drop the oldest attempt from a full window.
+        if self.att >= RATE_WINDOW {
+            self.att = RATE_WINDOW - 1;
+            let oldest = 1u64 << (RATE_WINDOW - 1);
+            if self.data & oldest != 0 { self.data &= !oldest; self.succ -= 1; }
+        }
+        self.att += 1;
+        self.data <<= 1;
+        if ok { self.succ += 1; self.data |= 1; }
+        self.sr = self.succ * 1000 / self.att;
         self.last_ms = now;
     }
     pub fn fresh(&self, now: u64) -> bool { self.att > 0 && now.saturating_sub(self.last_ms) <= STALE_MS }
-    /// Enough attempts for a judgment (Linux: 8 successes or 3 failures).
+    /// Enough attempts in the window for a judgment (Linux: 8 successes or 3 failures).
     pub fn valid(&self, now: u64) -> bool { self.fresh(now) && (self.succ >= MIN_SUCCESS || self.att - self.succ >= MIN_FAILURE) }
 }
 

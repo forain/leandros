@@ -25,7 +25,22 @@ extern "C" {
 }
 
 /// Initialize the exception vector table by setting `VBAR_EL1`.
+/// Set by `init_early` (first thing in `kernel_main`), cleared by `init`
+/// (`arch_aarch64::init`): while set, an EL1 synchronous exception is
+/// reported and halts instead of reaching the scheduler's fault paths.
+static EARLY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Install the vector table before anything else can fault (L8.12).
+pub fn init_early() {
+    EARLY.store(true, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let table_addr = exc_vector_table_ptr();
+        core::arch::asm!("msr vbar_el1, {}", "isb", in(reg) table_addr);
+    }
+}
+
 pub fn init() {
+    EARLY.store(false, core::sync::atomic::Ordering::Relaxed);
     unsafe {
         let table_addr = exc_vector_table_ptr();
         core::arch::asm!("msr vbar_el1, {}", in(reg) table_addr);
@@ -282,6 +297,17 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64, frame: *mut u64) {
     //
     //   EC 0x25 = data abort from the current EL (kernel mode).
     //   DFSC 0x04..=0x07 translation fault, 0x0D..=0x0F permission fault.
+    if EARLY.load(core::sync::atomic::Ordering::Relaxed) {
+        serial_print_str("\n[EXC] early EL1 fault ESR=");
+        print_hex(esr as usize);
+        serial_print_str(" ELR=");
+        print_hex(elr as usize);
+        serial_print_str(" FAR=");
+        print_hex(far as usize);
+        serial_print_str(" (before arch init; halted)\n");
+        loop { core::arch::asm!("wfe"); }
+    }
+
     let ec   = (esr >> 26) & 0x3F;
     let dfsc = esr & 0x3F;
     if ec == 0x25 && far >> 48 == 0 {

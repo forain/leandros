@@ -142,3 +142,18 @@ Tests: `test_keep_alive_idle_interval_count`,
 `test_established_dup_syn_challenge_ack` (socket/tcp.rs),
 `test_tcp_dup_syn_prefers_connection_over_listener` (tests/leandros.rs; fails
 on the old `process_tcp`). With the crates.io Cargo.toml: 598/598 pass.
+
+## SACK on active opens, ACK for too-many-holes segments, 3 SACK blocks (lane shapedl)
+
+- `(SynSent, Syn)` (the SYN-ACK of our own connect) now records
+  `remote_has_sack = repr.sack_permitted`. Only the passive open did, so
+  every outbound connection offered `sackOK` and then never sent a SACK
+  block; after a slow-start overshoot into a tail-dropping queue the sender
+  (macOS) repaired one hole per RTO: 0.6 Mbit/s on a 20 Mbit/s netshape link,
+  18.4 with the fix.
+- A segment the assembler cannot hold (too many holes) is now answered with an
+  immediate (duplicate) ACK instead of silently dropped (RFC 5681 4.2).
+- `ack_reply` fills SACK blocks 2 and 3 with the next-lowest assembler ranges
+  (RFC 2018: report as many blocks as fit), not only the first.
+- `RX_STATS` counters (in-order, out-of-order, too-many-holes,
+  out-of-window data segments), shown as `tcp_rx:` in `/proc/net/nic`.
