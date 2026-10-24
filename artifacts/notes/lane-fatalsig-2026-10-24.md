@@ -13,3 +13,5 @@ Core flag is not set (forced_exit carries only signo/status).
 ## Guard
 userland/killmt proclife `exec_sibterm`: tgkill(parked sibling, SIGTERM) then execve; parent must see WTERMSIG==SIGTERM.
 Red on main (aarch64, 20 iters): FAIL. Fixed: `killmt 40 exec_sibterm`, `killmt 40 proclife`, full `killmt` PASS on aarch64.
+
+x86_64 TCG: `killmt 40 proclife` PASS; full killmt PASS on rerun (first run once failed exec_kill it 46 'not reaped' + exec_exit follow-on: intermittent, 100x exec_kill passes after; unconfirmed whether pre-existing). aarch64 full regress PASS.
