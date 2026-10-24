@@ -1291,6 +1291,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         // Verification after the fill (and the fallback if it could not).
         early_hhdm_holes(hhdm_offset, reported, pool);
     }
+    #[cfg(target_arch = "aarch64")]
+    if is_limine { early_hhdm_a64(hhdm_offset as u64, reported); }
     if !is_limine {
         if let Some(c) = boot_cmdline() {
             serial_print_str("[early] cmdline: ");
@@ -2332,6 +2334,216 @@ fn early_hhdm_fill(hhdm: u64) -> Option<boot::MemoryRegion> {
     serial_print_str("\n");
     if used == 0 { return None; }
     Some(boot::MemoryRegion { base: pool, length: used, kind: boot::MemoryType::Reserved })
+}
+
+/// TTBR1_EL1's root table and VA size, if TCR_EL1 describes a format the
+/// HHDM walker handles (4 KiB granule, no LPA2).
+#[cfg(target_arch = "aarch64")]
+fn a64_ttbr1() -> Option<(u64, u32)> {
+    let (ttbr1, tcr): (u64, u64);
+    unsafe {
+        core::arch::asm!("mrs {}, ttbr1_el1", "mrs {}, tcr_el1", out(reg) ttbr1, out(reg) tcr, options(nostack));
+    }
+    match boot::hhdm_a64::va_bits_of(tcr) {
+        Ok(b) => Some((ttbr1 & boot::hhdm_a64::OA_MASK, b)),
+        Err(why) => {
+            serial_print_str("[early] hhdm: walker cannot read TTBR1: ");
+            serial_print_str(why);
+            serial_print_str("\n");
+            None
+        }
+    }
+}
+
+/// Is `va` readable right now? (`AT S1E1R`, no fault.)
+#[cfg(target_arch = "aarch64")]
+fn a64_mapped(va: u64) -> bool {
+    let par: u64;
+    unsafe {
+        core::arch::asm!("at s1e1r, {va}", "isb", "mrs {par}, par_el1",
+                         va = in(reg) va, par = out(reg) par, options(nostack));
+    }
+    par & 1 == 0
+}
+
+/// A table page the walker may use: one the HHDM maps right now.
+#[cfg(target_arch = "aarch64")]
+fn a64_table(hhdm: u64, phys: u64) -> Option<*mut u64> {
+    let va = hhdm.wrapping_add(phys);
+    if a64_mapped(va) { Some(va as *mut u64) } else { None }
+}
+
+/// aarch64 HHDM check + fill (the x86_64 pair is `early_hhdm_fill` +
+/// `early_hhdm_holes`). The kernel keeps Limine's TTBR1 tables forever, so
+/// every memory-map entry Limine itself maps (all but RESERVED, BAD_MEMORY;
+/// the framebuffer keeps its own attributes) must be in them before mm
+/// writes into RAM through `phys + hhdm`. Empty slots are filled in place
+/// with the attributes of Limine's own leaf for the first usable page (WB
+/// Normal); valid entries are never touched. Then every usable range is
+/// walked again and what is still unmapped is reported (yellow) and
+/// re-sanitized out as Reserved. MMIO is not the HHDM's job here: drivers
+/// map it Device-nGnRE with `map_mmio_range`. Default = check only (holes
+/// dropped from mm); `mm.hhdmfill=1` fills, `mm.hhdmfill=2m` fills without 1 GiB blocks. Uses no heap.
+#[cfg(target_arch = "aarch64")]
+fn early_hhdm_a64(hhdm: u64, reported: usize) {
+    use boot::hhdm_a64 as h;
+    let Some((root, bits)) = a64_ttbr1() else { return };
+    let Some(entries) = MEMMAP_REQUEST.response().map(|r| r.entries()) else { return };
+    let table = |p: u64| a64_table(hhdm, p);
+    // `earlyfb.test=unmap4g` (QEMU): clear the HHDM L1 entries at or above
+    // 4 GiB that hold only usable RAM -- the HP's Fast-Boot-OFF shape -- for
+    // the fill below to put back. Limine loads the kernel, its tables and the
+    // boot responses high on aarch64 (QEMU: just below the top of RAM), so a
+    // GiB holding anything but usable RAM stays. Nothing may print between
+    // the clear and the fill (the console path touches high RAM).
+    let mut cleared = 0u32;
+    let test = cmdline_knob("earlyfb.test");
+    if test == Some("unmap4g") || test == Some("unmap4g1") {
+        let mut top = entries.iter().filter(|e| e.type_ == 0).map(|e| e.base + e.length).max().unwrap_or(0);
+        // `unmap4g1`: only the GiB at 4 GiB.
+        if test == Some("unmap4g1") { top = top.min((1 << 32) + (1 << 30)); }
+        // A fault in the test must report ESR/FAR, not wedge silently.
+        arch_aarch64::exception::init();
+        let mut a: u64 = 1 << 32;
+        while a < top {
+            let busy = entries.iter().any(|e| e.type_ != 0 && e.base < a + (1 << 30) && e.base + e.length > a);
+            if !busy && unsafe { h::clear_at(root, bits, hhdm + a, 1, &table) } { cleared += 1; }
+            a += 1 << 30;
+        }
+        unsafe { core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack)); }
+    }
+    const MAXR: usize = 256;
+    let mut ranges = [(0u64, 0u64); MAXR];
+    let mut nr = 0usize;
+    for e in entries.iter() {
+        if e.type_ == 1 || e.type_ == 4 || e.type_ == 7 || e.length == 0 { continue; }
+        let s = e.base & !0xFFF;
+        let t = match e.base.checked_add(e.length) { Some(t) => (t + 0xFFF) & !0xFFF, None => continue };
+        if t > boot::memmap::MAX_PHYS { continue; }
+        if nr > 0 && s >= ranges[nr - 1].0 && s <= ranges[nr - 1].1 {
+            if t > ranges[nr - 1].1 { ranges[nr - 1].1 = t; }
+        } else if nr < MAXR {
+            ranges[nr] = (s, t);
+            nr += 1;
+        }
+    }
+    let mut any_hole = false;
+    for &(s, t) in &ranges[..nr] {
+        if unsafe { h::holes(root, bits, hhdm, s, t, &table, &mut |_, _, _| {}) } != 0 { any_hole = true; break; }
+    }
+    let knob = cmdline_knob("mm.hhdmfill");
+    let mut st = h::FillStats::default();
+    let mut pool_used: Option<boot::MemoryRegion> = None;
+    // Report-only by default: the in-place fill is not yet proven in a
+    // guest (earlyfb.test=unmap4g wedges before the first serial line, see
+    // artifacts/notes/lane-hhdmwalk-2026-10-24.md). `mm.hhdmfill=1|2m` opts in.
+    if any_hole && (knob == Some("1") || knob == Some("2m")) {
+        // Leaf attributes: Limine's own for the first usable page.
+        let tmpl = entries.iter().find(|e| e.type_ == 0)
+            .map(|e| unsafe { h::walk(root, bits, hhdm + (e.base & !0xFFF), &table) })
+            .filter(|w| w.page != 0);
+        const POOL: u64 = 256 * 4096;
+        let mut pool = 0u64;
+        for r in unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() } {
+            if r.kind != boot::MemoryType::Available || r.length < POOL { continue; }
+            if a64_mapped(hhdm + r.base) && a64_mapped(hhdm + r.base + POOL - 4096) { pool = r.base; break; }
+        }
+        match tmpl {
+            None => serial_print_str("[early] hhdm: no mapped usable page to copy attributes from; holes stay excluded\n"),
+            Some(_) if pool == 0 => serial_print_str("[early] hhdm: no mapped pool for page tables; holes stay excluded\n"),
+            Some(w) => {
+                let mut used = 0u64;
+                let mut alloc = || -> Option<u64> {
+                    while used < POOL {
+                        let p = pool + used;
+                        used += 4096;
+                        if a64_mapped(hhdm + p) { return Some(p); }
+                    }
+                    None
+                };
+                st = unsafe { h::fill(root, bits, hhdm, &ranges[..nr], w.desc, knob != Some("2m"), &table, &mut alloc) };
+                unsafe { core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack)); }
+                serial_print_str("[early] hhdm: bootloader HHDM had gaps; wrote ");
+                print_number(st.gib as u32);
+                serial_print_str(" x 1G, ");
+                print_number(st.mib2 as u32);
+                serial_print_str(" x 2M, ");
+                print_number(st.kib4 as u32);
+                serial_print_str(" x 4K, ");
+                print_number(st.tables as u32);
+                serial_print_str(" new table page(s) at ");
+                serial_print_hex(pool as usize);
+                if st.failed != 0 {
+                    serial_print_str("; FAILED to map KiB ");
+                    print_number((st.failed >> 10).min(u32::MAX as u64) as u32);
+                }
+                serial_print_str("\n");
+                if used != 0 {
+                    pool_used = Some(boot::MemoryRegion { base: pool, length: used, kind: boot::MemoryType::Reserved });
+                }
+            }
+        }
+    }
+    if cleared != 0 {
+        serial_print_str("[early] earlyfb.test=unmap4g: cleared ");
+        print_number(cleared);
+        serial_print_str(" L1 HHDM entries above 4 GiB before the fill\n");
+    }
+    serial_print_str("[early] hhdm: mapped ");
+    print_number(nr as u32);
+    serial_print_str(" ranges, patched ");
+    print_number(st.patched as u32);
+    serial_print_str("\n");
+    // Verification (and the fallback): usable RAM still unmapped is dropped.
+    const MAX_HOLES: usize = 64;
+    let mut holes = [boot::MemoryRegion::EMPTY; MAX_HOLES + 1];
+    let mut nh = 0usize;
+    let mut total = 0u64;
+    let mut first: Option<(u64, h::Walk)> = None;
+    for r in unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() } {
+        if r.kind != boot::MemoryType::Available { continue; }
+        unsafe {
+            h::holes(root, bits, hhdm, r.base, r.base + r.length, &table, &mut |b, e, w| {
+                if first.is_none() { first = Some((b, w)); }
+                total += e - b;
+                if nh < MAX_HOLES {
+                    holes[nh] = boot::MemoryRegion { base: b, length: e - b, kind: boot::MemoryType::Reserved };
+                    nh += 1;
+                }
+            });
+        }
+    }
+    if nh != 0 {
+        if boot::earlyfb::armed() && !boot::earlyfb::text_on() { boot::earlyfb::text_enable(2, true); }
+        boot::earlyfb::set_color(boot::earlyfb::YELLOW);
+        serial_print_str("[early] hhdm: usable RAM NOT mapped by the bootloader page tables, excluded from mm:\n");
+        for x in &holes[..nh] {
+            serial_print_str("[early]   ");
+            serial_print_hex(x.base as usize);
+            serial_print_str("-");
+            serial_print_hex((x.base + x.length) as usize);
+            serial_print_str("\n");
+        }
+        if let Some((a, w)) = first {
+            serial_print_str("[early]   first hole ");
+            serial_print_hex(a as usize);
+            serial_print_str(" level ");
+            print_number(w.level as u32);
+            serial_print_str(" desc ");
+            serial_print_hex(w.desc as usize);
+            if w.bad_table { serial_print_str(" (table page not mapped)"); }
+            serial_print_str("\n");
+        }
+        serial_print_str("[early]   total KiB ");
+        print_number((total >> 10).min(u32::MAX as u64) as u32);
+        serial_print_str("\n");
+        boot::earlyfb::set_color(boot::earlyfb::GREY);
+    }
+    if let Some(x) = pool_used { holes[nh] = x; nh += 1; }
+    if nh != 0 {
+        let san = unsafe { boot::sanitize_boot_info(&mut *core::ptr::addr_of_mut!(BOOT_INFO), reported, &holes[..nh]) };
+        early_text_sanitize(&san, reported);
+    }
 }
 
 /// The sanitizer's findings, once, next to the `[MEMMAP]` lines.

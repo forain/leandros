@@ -4,6 +4,9 @@
 #[path = "../../src/memmap.rs"]
 pub mod memmap;
 
+#[path = "../../src/hhdm_a64.rs"]
+pub mod hhdm_a64;
+
 #[cfg(test)]
 mod tests {
     use super::memmap::*;
@@ -258,5 +261,122 @@ mod tests {
         let (out, st) = run(&[r(0x1000, 0, Available), r(0, 0, Reserved)]);
         assert!(out.is_empty());
         assert_eq!(st.zero_len, 2);
+    }
+}
+
+#[cfg(test)]
+mod hhdm_tests {
+    use super::hhdm_a64::*;
+    use std::cell::RefCell;
+
+    const HHDM: u64 = 0xFFFF_0000_0000_0000;
+    const GIB: u64 = 1 << 30;
+    const MIB2: u64 = 2 << 20;
+    const BASE: u64 = 0x1000_0000; // fake physical base of the table arena
+    const ATTR: u64 = 0x0060_0000_0000_0704; // UXN|PXN, AF, ISH, AttrIndx 1
+    const BITS: u32 = 48;
+
+    /// Fake physical memory holding only table pages.
+    struct Arena { pages: RefCell<Vec<Box<[u64; 512]>>>, limit: usize }
+    impl Arena {
+        fn new(limit: usize) -> Self { Arena { pages: RefCell::new(vec![Box::new([0; 512])]), limit } }
+        fn root(&self) -> u64 { BASE }
+        fn ptr(&self, phys: u64) -> Option<*mut u64> {
+            if phys < BASE || phys & 0xFFF != 0 { return None; }
+            let i = ((phys - BASE) >> 12) as usize;
+            self.pages.borrow_mut().get_mut(i).map(|p| p.as_mut_ptr())
+        }
+        fn alloc(&self) -> Option<u64> {
+            let mut v = self.pages.borrow_mut();
+            if v.len() >= self.limit { return None; }
+            v.push(Box::new([0; 512]));
+            Some(BASE + ((v.len() as u64 - 1) << 12))
+        }
+        fn set(&self, phys: u64, i: usize, d: u64) { unsafe { *self.ptr(phys).unwrap().add(i) = d; } }
+    }
+
+    fn do_fill(a: &Arena, r: &[(u64, u64)], gib: bool) -> FillStats {
+        let t = |p| a.ptr(p);
+        let mut al = || a.alloc();
+        unsafe { fill(a.root(), BITS, HHDM, r, ATTR, gib, &t, &mut al) }
+    }
+    fn w(a: &Arena, phys: u64) -> Walk { let t = |p| a.ptr(p); unsafe { walk(a.root(), BITS, HHDM + phys, &t) } }
+    fn mapped_to(a: &Arena, phys: u64) -> Option<u64> {
+        let x = w(a, phys);
+        if x.page == 0 { None } else { Some((x.desc & OA_MASK & !(x.page - 1)) | (phys & (x.page - 1))) }
+    }
+
+    #[test]
+    fn geometry() {
+        // T1SZ=16, TG1=4K
+        assert_eq!(va_bits_of((16 << 16) | (0b10 << 30)), Ok(48));
+        assert_eq!(start_of(48), 0);
+        assert_eq!(start_of(39), 1);
+        assert_eq!(start_of(40), 0);
+        assert_eq!(start_of(30), 2);
+        assert!(va_bits_of((16 << 16) | (0b11 << 30)).is_err());
+        assert!(va_bits_of((16 << 16) | (0b10 << 30) | (1 << 59)).is_err());
+    }
+
+    #[test]
+    fn empty_tables_fill_with_largest_leaves() {
+        let a = Arena::new(64);
+        // 1 GiB aligned block + a 2M-aligned tail + a 4K tail.
+        let r = [(4 * GIB, 5 * GIB + 3 * MIB2 + 0x3000)];
+        let st = do_fill(&a, &r, true);
+        assert_eq!((st.gib, st.mib2, st.kib4, st.failed, st.patched), (1, 3, 3, 0, 1));
+        assert_eq!(st.tables, 3); // L1, L2 (for the tail GiB), L3
+        for p in [4 * GIB, 5 * GIB - 0x1000, 5 * GIB, 5 * GIB + 3 * MIB2 + 0x2000] {
+            assert_eq!(mapped_to(&a, p), Some(p), "phys {p:#x}");
+        }
+        assert_eq!(w(&a, 5 * GIB + 3 * MIB2 + 0x3000).page, 0);
+        assert_eq!(w(&a, 4 * GIB).desc & ATTR_MASK, ATTR);
+        // Idempotent: a second fill writes nothing.
+        let st2 = do_fill(&a, &r, true);
+        assert_eq!((st2.gib + st2.mib2 + st2.kib4 + st2.tables, st2.patched), (0, 0));
+    }
+
+    #[test]
+    fn no_gib_uses_2m_and_existing_entries_untouched() {
+        let a = Arena::new(64);
+        let st = do_fill(&a, &[(0x4000_0000, 0x8000_0000)], false);
+        assert_eq!((st.gib, st.mib2), (0, 512));
+        // Pre-existing 1 GiB block with distinct attributes above 4 GiB.
+        let l1 = w(&a, 0x4000_0000);
+        assert_eq!(l1.level, 2);
+        let a2 = Arena::new(64);
+        let l1p = a2.alloc().unwrap();
+        a2.set(a2.root(), 0, l1p | 3); // HHDM base 0xFFFF_0000_0000_0000 is L0 slot 0
+        let old = 0x1_0000_0000u64 | 0x401 | (7 << 2);
+        a2.set(l1p, 4, old);
+        let st = do_fill(&a2, &[(4 * GIB, 6 * GIB)], true);
+        assert_eq!((st.gib, st.tables, st.patched), (1, 0, 1));
+        assert_eq!(w(&a2, 4 * GIB).desc, old);
+        assert_eq!(mapped_to(&a2, 5 * GIB), Some(5 * GIB));
+    }
+
+    #[test]
+    fn holes_are_merged_and_reported() {
+        let a = Arena::new(64);
+        do_fill(&a, &[(GIB, 2 * GIB), (3 * GIB + MIB2, 3 * GIB + 2 * MIB2)], true);
+        let t = |p| a.ptr(p);
+        let mut v = vec![];
+        let n = unsafe { holes(a.root(), BITS, HHDM, GIB, 4 * GIB, &t, &mut |b, e, _| v.push((b, e))) };
+        assert_eq!(n, 2);
+        assert_eq!(v, vec![(2 * GIB, 3 * GIB + MIB2), (3 * GIB + 2 * MIB2, 4 * GIB)]);
+    }
+
+    #[test]
+    fn pool_exhaustion_and_bad_tables_count_as_failed() {
+        let a = Arena::new(2); // root + one table only
+        let st = do_fill(&a, &[(GIB, GIB + 0x2000)], true);
+        assert_eq!(st.tables, 1);
+        assert_eq!(st.failed, 0x2000);
+        // A table pointer outside the arena: unreadable.
+        let b = Arena::new(8);
+        b.set(b.root(), 0, 0x9999_0000 | 3);
+        let st = do_fill(&b, &[(GIB, 2 * GIB)], true);
+        assert_eq!((st.failed, st.patched), (GIB, 0));
+        assert!(w(&b, GIB).bad_table);
     }
 }
