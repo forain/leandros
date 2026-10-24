@@ -3931,55 +3931,49 @@ pub fn poll_listen_end() {
 /// and, when listening, its id and ring — one RUN_QUEUE hold.
 pub fn poll_listen_enter() -> (Option<alloc::boxed::Box<dyn core::any::Any + Send>>, Option<(u32, WakeRing)>) {
     let pid = current_pid();
+    let c = ep_cache_swap_current(None);
     let mut rq = RUN_QUEUE.lock();
-    match rq.find_pid_mut(pid) {
-        Some(t) => {
-            let c = t.ep_cache.take();
-            let l = if t.listen.on {
-                let r = t.listen.ring;
-                t.listen.ring = WakeRing::EMPTY;
-                Some((t.listen.id, r))
-            } else { None };
-            (c, l)
+    let l = match rq.find_pid_mut(pid) {
+        Some(t) if t.listen.on => {
+            let r = t.listen.ring;
+            t.listen.ring = WakeRing::EMPTY;
+            Some((t.listen.id, r))
         }
-        None => (None, None),
-    }
+        _ => None,
+    };
+    (c, l)
+}
+
+/// The running task's epoll snapshot, swapped without RUN_QUEUE (lane
+/// percpu2): it lives in the task's `SchedSlot` and only the task itself
+/// touches it (see `SchedSlot::ep_cache`). With no current slot (cannot
+/// happen in task context) `c` is handed back.
+fn ep_cache_swap_current(c: Option<alloc::boxed::Box<dyn core::any::Any + Send>>)
+    -> Option<alloc::boxed::Box<dyn core::any::Any + Send>> {
+    let fl = ksync::irq_save();
+    let cpu = unsafe { cpu_id() };
+    let i = if cpu < MAX_CPUS { CURRENT_SLOT[cpu].load(Ordering::Relaxed) } else { usize::MAX };
+    let r = if i < runqueue::MAX_TASKS { slot::ep_cache_swap(i, c) } else { c };
+    ksync::irq_restore(fl);
+    r
 }
 
 /// Store the thread's epoll snapshot back (see `poll_listen_enter`).
 pub fn poll_listen_store(c: Option<alloc::boxed::Box<dyn core::any::Any + Send>>) {
-    let pid = current_pid();
-    let old = {
-        let mut rq = RUN_QUEUE.lock();
-        match rq.find_pid_mut(pid) {
-            Some(t) => core::mem::replace(&mut t.ep_cache, c),
-            None => c,
-        }
-    };
-    drop(old); // freed outside RUN_QUEUE
+    drop(ep_cache_swap_current(c)); // freed with IRQs enabled again
 }
 
-/// Park the thread's epoll snapshot in its `Task` for the duration of a sleep:
+/// Park the thread's epoll snapshot in its slot for the duration of a sleep:
 /// a thread killed while blocked is reaped without unwinding its kernel
-/// stack, so a snapshot held only in a local would leak (lane leakres).
+/// stack, so a snapshot held only in a local would leak (lane leakres); the
+/// reap moves it into the Task box (`slot::on_remove`), which frees it.
 pub fn ep_cache_put(c: alloc::boxed::Box<dyn core::any::Any + Send>) {
-    let pid = current_pid();
-    let old = {
-        let mut rq = RUN_QUEUE.lock();
-        match rq.find_pid_mut(pid) {
-            Some(t) => core::mem::replace(&mut t.ep_cache, Some(c)),
-            None => Some(c),
-        }
-    };
-    drop(old);
+    drop(ep_cache_swap_current(Some(c)));
 }
 
-/// Take back what `ep_cache_put` stored (only the snapshot; the listener
-/// ring is untouched).
+/// Take back what `ep_cache_put` stored.
 pub fn ep_cache_get() -> Option<alloc::boxed::Box<dyn core::any::Any + Send>> {
-    let pid = current_pid();
-    let mut rq = RUN_QUEUE.lock();
-    rq.find_pid_mut(pid).and_then(|t| t.ep_cache.take())
+    ep_cache_swap_current(None)
 }
 
 /// Wake every task blocked on the poll wait-channel. Callers (edge publishers
