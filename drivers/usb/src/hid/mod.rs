@@ -281,16 +281,8 @@ fn repeats(usage: u8) -> bool { !matches!(usage, 0x39 | 0x47 | 0x48 | 0x53) }
 /// own and relies on that; text VTs and evdev clients see one more press of
 /// a key that is already down. (0, _) disables it. IRQ context: try_lock
 /// only, never waits.
-pub static DIAG: [core::sync::atomic::AtomicU32; 5] = [const { core::sync::atomic::AtomicU32::new(0) }; 5];
 pub fn poll(leds: u8, repeat: (u32, u32), out: &mut dyn FnMut(u32, Event)) {
-    use core::sync::atomic::Ordering::Relaxed;
-    let c = DIAG[0].fetch_add(1, Relaxed);
-    if c % 1000 == 0 {
-        usb_log!("[USB-HID-DIAG] polls={} lockfail={} busy={} reports={} devs={}\n", c,
-                 DIAG[1].load(Relaxed), DIAG[2].load(Relaxed), DIAG[3].load(Relaxed), DIAG[4].load(Relaxed));
-    }
-    let Some(mut devs) = DEVS.try_lock() else { DIAG[1].fetch_add(1, Relaxed); return };
-    DIAG[4].store(devs.len() as u32, Relaxed);
+    let Some(mut devs) = DEVS.try_lock() else { return };
     let now = crate::platform::now_ns();
     let mut reports = IntrReports::new();
     for d in devs.iter_mut() {
@@ -302,7 +294,7 @@ pub fn poll(leds: u8, repeat: (u32, u32), out: &mut dyn FnMut(u32, Event)) {
         }
         reports.n = 0;
         match d.hp.pipe.poll(&mut reports) {
-            IntrPoll::Busy => { DIAG[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed); continue }
+            IntrPoll::Busy => continue,
             IntrPoll::Gone => {
                 d.gone = true;
                 usb_log!("[USB-HID] {} (slot {} interface {}) removed\n", d.name, d.hp.pipe.slot(), d.hp.pipe.interface());
@@ -310,11 +302,6 @@ pub fn poll(leds: u8, repeat: (u32, u32), out: &mut dyn FnMut(u32, Event)) {
                 continue;
             }
             IntrPoll::Ok => {}
-        }
-        DIAG[3].fetch_add(reports.n as u32, core::sync::atomic::Ordering::Relaxed);
-        for i in 0..reports.n {
-            let r = reports.get(i);
-            usb_log!("[USB-HID-DIAG] node={} poll={} rep {:02x?}\n", node, c, &r[..r.len().min(8)]);
         }
         for i in 0..reports.n {
             let r = reports.get(i);
