@@ -671,7 +671,9 @@ fn ioctl(cmd: u32, arg: usize, open_id: u32) -> Option<Result<usize, DriverError
         NR_GEM_CREATE => need(16).and_then(|_| gem_create(a, open_id, false)),
         NR_GEM_CREATE_EXT => need(24).and_then(|_| gem_create(a, open_id, true)),
         NR_GEM_MMAP_OFFSET => need(32).and_then(|_| mmap_offset(a, open_id)),
-        NR_GEM_MMAP => Err(why(ENODEV, "legacy GEM_MMAP unsupported", 0)),
+        // Answered in the syscall layer (MMAP_OFFSET + mmap in the caller);
+        // reaching the driver means the caller bypassed it.
+        NR_GEM_MMAP => Err(why(ENODEV, "legacy GEM_MMAP reached the driver", 0)),
         NR_GEM_PWRITE => need(32).and_then(|_| gem_rw(a, open_id, true)),
         NR_GEM_PREAD => need(32).and_then(|_| gem_rw(a, open_id, false)),
         NR_GEM_SET_DOMAIN => need(12).and_then(|_| set_domain(a, open_id)),
@@ -877,8 +879,11 @@ fn mmap_offset(a: u64, open_id: u32) -> Result<usize, i32> {
     if m.extensions != 0 || m.pad != 0 { return Err(EINVAL); }
     match m.flags {
         MMAP_OFFSET_WB | MMAP_OFFSET_WC | MMAP_OFFSET_UC => {}
-        // No aperture (GTT) mappings, no FIXED outside discrete parts.
-        MMAP_OFFSET_GTT => return Err(ENODEV),
+        // No aperture (GTT) mappings. FIXED: Linux __assign_mmap_offset
+        // answers -ENODEV for every object without obj->ops->mmap_offset
+        // (only TTM/lmem objects on discrete parts have one), so on an
+        // integrated part it is ENODEV, not EINVAL.
+        MMAP_OFFSET_GTT | MMAP_OFFSET_FIXED => return Err(ENODEV),
         _ => return Err(EINVAL),
     }
     let tag = mmap_tag(m.flags);
