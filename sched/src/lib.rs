@@ -3325,6 +3325,10 @@ pub mod poll_class {
     /// Vnodes whose readiness never changes (regular files, /dev/null, block
     /// devices, /dev/pipewire): servers/vfs `static_poll_tag`. No producer.
     pub const STATIC: u32 = 23;
+    /// A pipe's WRITE end (space freed, last reader gone), indexed by ring;
+    /// `PIPE` is the read end (data, EOF). Separate so a drain never wakes
+    /// the reader and a write never wakes a parked writer.
+    pub const PIPE_WR: u32 = 24;
 }
 
 /// Bumped by every producer whose object's poll tag itself changes (a
