@@ -3561,7 +3561,10 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
     let kick = match msg.tag {
         NET_CONNECT | NET_SHUTDOWN | NET_CLOSE | NET_LISTEN | NET_ACCEPT | NET_SETSOCKOPT | NET_BIND =>
             sock_entry(caller_pid, arg(msg,0) as usize).map_or(false, |e| e.domain as usize == AF_INET),
-        NET_CLOSE_ALL => true,
+        // Every exit sends CLOSE_ALL; only one that held an inet socket
+        // needs a pass (decided in the arm below). Kicking on all of them
+        // made each short-lived process (a shell pipeline, `cat`) a daemon
+        // pass on an idle system.
         _ => false,
     };
     let reply = match msg.tag {
@@ -3606,7 +3609,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         NET_GETSOCKOPT  => handle_getsockopt(caller_pid, arg(msg,0) as usize,
                                              arg(msg,1) as usize, arg(msg,2) as usize,
                                              arg(msg,3) as usize, arg(msg,4) as usize),
-        NET_CLOSE_ALL   => { handle_close_all(caller_pid); ok_reply() }
+        NET_CLOSE_ALL   => { if handle_close_all(caller_pid) { drivers::netdev::kick(); } ok_reply() }
         NET_CLOSE       => with_state_wake(caller_pid, arg(msg,0) as usize, true, ||
                                handle_close(caller_pid, arg(msg,0) as usize)),
         NET_POLL        => handle_poll(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32),
@@ -7724,7 +7727,9 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
     net_poll_reply(revents, seq, tag)
 }
 
-fn handle_close_all(pid: u32) {
+/// True when the process held an inet socket (its teardown gives a stack
+/// something to do: FIN/RST, a freed port), i.e. the daemon wants a pass.
+fn handle_close_all(pid: u32) -> bool {
     let mut tbls = SOCK_TABLES.lock();
     if let Some(tbl) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
         // Heap-collected, not MAX_SOCKS-sized stack arrays — at 512 those would
@@ -7770,6 +7775,7 @@ fn handle_close_all(pid: u32) {
             if e.in_use && inet_family(e) { *e = SockEntry::empty(); }
         }
         for e in inet_held.iter() { inet_puts.push(inet_put(&mut *tbls, e)); }
+        let had_inet = !inet_held.is_empty();
         drop(tbls);
         for d in ofds { vfs::ofd::put(d); }
         // Process exit parks no TIME_WAIT port (as before).
@@ -7827,7 +7833,9 @@ fn handle_close_all(pid: u32) {
         // The exiting process held roots; what only they kept reachable is
         // garbage now.
         unix_gc();
+        return had_inet;
     }
+    false
 }
 
 fn net_val(m: &Message) -> isize {

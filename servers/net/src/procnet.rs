@@ -113,6 +113,12 @@ fn nic(w: &mut Out) {
         site => sched::gdwake::site_name(site, &mut |f, l| { let _ = write!(w, " early_site {}:{}", f, l); }),
     }
     let _ = writeln!(w);
+    let _ = write!(w, "netd_kick:");
+    drivers::netdev::kick_sites(&mut |f, l, n, pid| {
+        let f = f.rsplit('/').next().unwrap_or(f);
+        let _ = write!(w, " {}:{}={}@{}", f, l, n, pid);
+    });
+    let _ = writeln!(w);
     let _ = writeln!(w, "netd: passes {} max_rx_per_pass {} wakes tagged {} broadcast {} rx_irq {} virtio_rx_irqs {} tcp_rx_buf {} netctl_wakes {}",
                      NETD_PASSES.load(Ordering::Relaxed), NETD_MAX_RX.load(Ordering::Relaxed),
                      NETD_TAG_WAKES.load(Ordering::Relaxed), NETD_BCAST_WAKES.load(Ordering::Relaxed),
