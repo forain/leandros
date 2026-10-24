@@ -5710,7 +5710,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     for i in 0..n_iov {
         let iov = iov_ptr + i * 16;
         iovs[i] = match (rd_usize(iov), rd_usize(iov + 8)) {
-            (Ok(b), Ok(l)) => (b, l),
+            (Ok(b), Ok(l)) if sched::uaccess::user_range_ok(b, l) => (b, l),
             _ => { for tf in batch { xfer_drop(tf); } return err_reply(-14); }
         };
         requested += iovs[i].1;
@@ -6015,6 +6015,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         for i in 0..iovcnt.min(UIO_MAXIOV) {
             let iov = iov_ptr + i * 16;
             let (b, l) = (rd_or_efault!(iov), rd_or_efault!(iov + 8));
+            if !sched::uaccess::user_range_ok(b, l) { return err_reply(-14); }
             iovs.push((b, l));
             cap += l;
         }
@@ -6074,6 +6075,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         for i in 0..iovcnt.min(UIO_MAXIOV) {
             let iov = iov_ptr + i * 16;
             let (b, l) = (rd_or_efault!(iov), rd_or_efault!(iov + 8));
+            if !sched::uaccess::user_range_ok(b, l) { return err_reply(-14); }
             iovs.push((b, l));
             cap = cap.saturating_add(l);
         }
@@ -6158,6 +6160,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     for i in 0..n_iov {
         let iov = iov_ptr + i * 16;
         iovs[i] = (rd_or_efault!(iov), rd_or_efault!(iov + 8));
+        if !sched::uaccess::user_range_ok(iovs[i].0, iovs[i].1) { return err_reply(-14); }
         requested += iovs[i].1;
     }
     // Destination bytes (and the control buffer) faulted in and unshared

@@ -988,6 +988,47 @@ static void pidfd_proc_link(void) {
     close(fd);
 }
 
+/* ── bad iov_base must give EFAULT, never SIGSEGV in the caller ─────────── */
+
+/* mode: 0 sendmsg, 1 writev, 2 readv, 3 recvmsg, 4 pwritev, 5 preadv */
+static int iov_fault_child(void *arg) {
+    long mode = (long)arg / 2, which = (long)arg % 2;
+    void *bad = which ? (void *)0xffff800000001000UL : (void *)1;
+    int sv[2], pp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0 || pipe(pp) < 0) return 90;
+    char ok[8] = "x";
+    write(pp[1], ok, 1);
+    struct iovec iov[2] = { { ok, 1 }, { bad, 16 } };
+    struct msghdr m = { .msg_iov = iov, .msg_iovlen = 2 };
+    errno = 0;
+    ssize_t r;
+    switch (mode) {
+    case 0: r = sendmsg(sv[0], &m, 0); break;
+    case 1: r = writev(sv[0], iov, 2); break;
+    case 2: write(sv[1], "0123456789abcdef0", 17); r = readv(sv[0], iov, 2); break;
+    case 3: write(sv[1], "0123456789abcdef0", 17); r = recvmsg(sv[0], &m, 0); break;
+    case 4: r = pwritev(pp[1], iov, 2, 0); break;
+    default: write(pp[1], "0123456789abcdef0", 17); r = preadv(pp[0], iov, 2, 0); break;
+    }
+    /* Linux: the first iovec may be consumed (short count) before the fault;
+     * either -1/EFAULT or a short count is acceptable, a signal is not. */
+    if (r == -1 && errno == EFAULT) return 0;
+    if (r >= 0 && r < 17) return 0;
+    return 91;
+}
+
+static void iov_fault(void) {
+    static const char *names[] = { "sendmsg", "writev", "readv", "recvmsg", "pwritev", "preadv" };
+    for (long mode = 0; mode < 6; mode++)
+        for (long which = 0; which < 2; which++) {
+            char n[48];
+            snprintf(n, sizeof n, "iov_efault_%s_%s", names[mode], which ? "kernel" : "one");
+            int st = in_child(iov_fault_child, (void *)(mode * 2 + which), 10000);
+            if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) pass(n);
+            else fail(n, "status=%d%s", st, (st >= 0 && WIFSIGNALED(st)) ? " (killed by signal)" : "");
+        }
+}
+
 /* ── one descriptor namespace ────────────────────────────────────────────── */
 
 static int send_fd(int sock, int fd) {
@@ -2440,6 +2481,7 @@ int main(int argc, char **argv) {
     pidfd_clone();
     pidfd_getfd();
     pidfd_proc_link();
+    iov_fault();
     pidfd_namespace();
     pidfd_getfd_inet();
     inet_fork_shared();
