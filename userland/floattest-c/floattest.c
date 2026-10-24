@@ -69,6 +69,32 @@ int main(void) {
     snprintf(buf, sizeof buf, "%8.3f|%-8.1f|", v_two, v_neg);
     check_fmt("printf_width", buf, "   2.000|-1.5    |");
 
+    /* Variadic arguments that spill to the stack (SysV x86_64: >5 ints after
+     * buf/n/fmt, >8 doubles; AAPCS64: >7/8). Each class keeps its own order. */
+    snprintf(buf, sizeof buf, "%d %d %d %d %d %d %d %d", 1, 2, 3, 4, 5, 6, 7, 8);
+    check_fmt("va_8ints", buf, "1 2 3 4 5 6 7 8");
+    snprintf(buf, sizeof buf, "%u %u %u %u %u", 1u, 2u, 3u, 4u, 5u);
+    check_fmt("va_5uints", buf, "1 2 3 4 5");
+    snprintf(buf, sizeof buf, "%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f",
+             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0);
+    check_fmt("va_10doubles", buf, "1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0 10.0");
+    snprintf(buf, sizeof buf,
+             "%d %f %s %ld %g %c %u %e %x %f %d %f %d %f %g %g %f %f %d",
+             -1, 1.5, "str", 123456789012L, 0.25, 'Z', 7u, 12345.0, 0xbeefu, 2.5,
+             -2, 3.5, -3, 4.5, 5.5, 6.5, 7.5, 8.5, -4);
+    check_fmt("va_mixed", buf,
+              "-1 1.500000 str 123456789012 0.25 Z 7 1.234500e+04 beef 2.500000 "
+              "-2 3.500000 -3 4.500000 5.5 6.5 7.500000 8.500000 -4");
+    {
+        long long ll = 0x123456789abcdefLL;
+        int tag = 5;
+        snprintf(buf, sizeof buf, "%lld %lld %lld %x %d %lld %p %s %llx", ll, ll + 1, ll + 2,
+                 0xaau, tag, -ll, (void *)0x1000, "end", (unsigned long long)ll);
+        check_fmt("va_longlong_ptr", buf,
+                  "81985529216486895 81985529216486896 81985529216486897 aa 5 "
+                  "-81985529216486895 0x1000 end 123456789abcdef");
+    }
+
     printf("floattest: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }
