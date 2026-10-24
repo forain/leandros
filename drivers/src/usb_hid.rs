@@ -40,6 +40,7 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// LED state for the keyboards' enumeration-time SET_REPORT. Call before
 /// `usb_hcd::init()` probes.
 pub fn prepare() {
+    usb::hid::set_node_hooks(usb::hid::NodeHooks { attach: node_attach, detach: node_detach });
     usb::hid::set_initial_leds(usb::hid::hid_leds_from_console(console_leds()));
 }
 
@@ -72,11 +73,54 @@ pub fn poll() {
     if !ACTIVE.load(Ordering::Acquire) { return; }
     let leds = wanted_leds();
     let repeat = tty_server::keyboard::repeat_params();
-    usb::hid::poll(leds, repeat, &mut |ev| match ev {
-        Event::Key { code, value } => evdev_server::push_event(EVDEV_KEYBOARD, EV_KEY, code, value),
-        Event::KeySyn => evdev_server::push_event(EVDEV_KEYBOARD, EV_SYN, 0, 0),
-        Event::Mouse { dx, dy, wheel, buttons, .. } => mouse(dx, dy, wheel, buttons),
+    usb::hid::poll(leds, repeat, &mut |node, ev| match ev {
+        Event::Key { code, value } => {
+            evdev_server::push_event(EVDEV_KEYBOARD, EV_KEY, code, value);
+            if node != usb::hid::NO_NODE { evdev_server::push_event(node, EV_KEY, code, value); }
+        }
+        Event::KeySyn => {
+            evdev_server::push_event(EVDEV_KEYBOARD, EV_SYN, 0, 0);
+            if node != usb::hid::NO_NODE { evdev_server::push_event(node, EV_SYN, 0, 0); }
+        }
+        Event::Mouse { dx, dy, wheel, buttons, changed } => {
+            mouse(dx, dy, wheel, buttons);
+            if node != usb::hid::NO_NODE { mouse_node(node, dx, dy, wheel, buttons, changed); }
+        }
     });
+}
+
+/// Every HID interface also gets its own /dev/input/eventN (N >= 2) that
+/// carries only its events and disappears on unplug, as on Linux. event0
+/// (keyboards) and event1 (pointer) keep aggregating all of them: the
+/// libudev shim hands libinput a fixed event0/event1 table and its monitor
+/// never reports hot-plug, so the per-device nodes are for direct readers.
+fn node_attach(protocol: u8, name: &str, vendor: u16, product: u16) -> u32 {
+    let kind = match protocol {
+        usb::hid::HID_PROTO_KEYBOARD => evdev_server::DEVKIND_KEYBOARD,
+        usb::hid::HID_PROTO_MOUSE => evdev_server::DEVKIND_MOUSE,
+        _ => return usb::hid::NO_NODE,
+    };
+    const BUS_USB: u16 = 0x03;
+    evdev_server::register_input_device(kind, name, BUS_USB, vendor, product)
+        .unwrap_or(usb::hid::NO_NODE)
+}
+
+fn node_detach(node: u32) { evdev_server::unregister_input_device(node); }
+
+/// A boot-mouse report on the device's own node: raw REL_X/REL_Y/REL_WHEEL
+/// and button edges, like hid-input on Linux.
+fn mouse_node(node: u32, dx: i32, dy: i32, wheel: i32, buttons: u8, changed: u8) {
+    const EV_REL: u16 = 2;
+    if dx != 0 { evdev_server::push_event(node, EV_REL, 0, dx); }
+    if dy != 0 { evdev_server::push_event(node, EV_REL, 1, dy); }
+    if wheel != 0 { evdev_server::push_event(node, EV_REL, 8, wheel); }
+    for bit in 0..5 {
+        if changed & (1 << bit) != 0 {
+            evdev_server::push_event(node, EV_KEY, usb::hid::mouse_button_code(bit),
+                                     (buttons >> bit & 1) as i32);
+        }
+    }
+    if dx != 0 || dy != 0 || wheel != 0 || changed != 0 { evdev_server::push_event(node, EV_SYN, 0, 0); }
 }
 
 fn mouse(dx: i32, dy: i32, wheel: i32, buttons: u8) {

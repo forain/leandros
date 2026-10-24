@@ -52,7 +52,31 @@ const SYN_DROPPED: u16 = 3;
 
 // ── Device / client state ────────────────────────────────────────────────────
 
-const MAX_DEVICES: usize = 4;
+const MAX_DEVICES: usize = 16;
+
+/// event0 (aggregate keyboard) and event1 (pointer) always exist and keep
+/// their numbers; event2.. are hot-plugged devices (one per USB HID
+/// interface), added and removed at run time like Linux evdev nodes.
+const FIXED_DEVICES: usize = 2;
+
+/// What a node is, for its capability answers (EVIOCGBIT/ID/NAME/PROP).
+const KIND_VIRT_KEYBOARD: u8 = 0;
+const KIND_VIRT_TABLET: u8 = 1;
+/// A hot-plugged keyboard (EV_KEY 1..255 + EV_LED).
+pub const DEVKIND_KEYBOARD: u8 = 2;
+/// A hot-plugged relative mouse (REL_X/Y/WHEEL + BTN_LEFT..BTN_EXTRA).
+pub const DEVKIND_MOUSE: u8 = 3;
+
+const NAME_MAX: usize = 64;
+
+static EVENT_PATHS: [&str; MAX_DEVICES] = [
+    "/dev/input/event0", "/dev/input/event1", "/dev/input/event2", "/dev/input/event3",
+    "/dev/input/event4", "/dev/input/event5", "/dev/input/event6", "/dev/input/event7",
+    "/dev/input/event8", "/dev/input/event9", "/dev/input/event10", "/dev/input/event11",
+    "/dev/input/event12", "/dev/input/event13", "/dev/input/event14", "/dev/input/event15",
+];
+
+static EVDEV_PORT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 // Device classes we surface. Keyboard = event0 (13:64), tablet = event1 (13:65,
 // absolute pointer: ABS_X/ABS_Y + BTN_LEFT, NO INPUT_PROP_DIRECT so libinput
@@ -244,6 +268,13 @@ struct EvdevDevice {
     /// from every EV_KEY value 1/0 so EVIOCGKEY can answer a resync after a
     /// SYN_DROPPED. Value 2 (repeat, serial byte) leaves it untouched.
     keys: [u8; KEY_BITMAP_BYTES],
+    /// KIND_* / DEVKIND_*; identity reported by EVIOCGID / EVIOCGNAME.
+    kind: u8,
+    bus: u16,
+    vendor: u16,
+    product: u16,
+    name: [u8; NAME_MAX],
+    name_len: u8,
 }
 
 const KEY_BITMAP_BYTES: usize = 96; // KEY_MAX 0x2ff
@@ -251,7 +282,8 @@ const KEY_BITMAP_BYTES: usize = 96; // KEY_MAX 0x2ff
 impl EvdevDevice {
     const fn empty() -> Self {
         Self { in_use: false, clockid_override: 0, grab_open: 0, grab_pid: 0, grab_vt: 0,
-               keys: [0; KEY_BITMAP_BYTES] }
+               keys: [0; KEY_BITMAP_BYTES], kind: KIND_VIRT_KEYBOARD, bus: 0, vendor: 0,
+               product: 0, name: [0; NAME_MAX], name_len: 0 }
     }
     fn grabbed(&self) -> bool { self.grab_open != 0 || self.grab_pid != 0 }
     fn ungrab(&mut self) { self.grab_open = 0; self.grab_pid = 0; self.grab_vt = 0; }
@@ -295,6 +327,8 @@ impl EvdevState {
             self.clients[i].touched = self.tick;
             return Some(i);
         }
+        // A removed node takes no new readers (its fds answer ENODEV).
+        if !self.devs.get(dev as usize).map_or(false, |d| d.in_use) { return None; }
         // Pool exhausted: refuse (the callers answer ENOMEM / no events).
         // Every queue in use belongs to an open that is still open (VFS_CLOSE
         // retires it) or to a task still alive (`release_pid` retires a
@@ -1022,6 +1056,22 @@ fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) ->
     const MAXB: usize = 96; // covers the KEY bitmap up to ~KEY code 0x2FF
     let mut buf = [0u8; MAXB];
     let n = core::cmp::min(size, MAXB);
+    if dev_id >= FIXED_DEVICES {
+        let kind = { let f = unsafe { arch_interrupt_save() };
+                     let k = STATE.lock().devs[dev_id].kind;
+                     unsafe { arch_interrupt_restore(f); } k };
+        let mut set = |bit: usize| if bit / 8 < n { buf[bit / 8] |= 1 << (bit % 8); };
+        match (kind, ev) {
+            (DEVKIND_KEYBOARD, 0) => { set(0); set(1); set(EV_LED as usize); }
+            (DEVKIND_KEYBOARD, 1) => { for k in 1..256 { set(k); } }
+            (DEVKIND_KEYBOARD, 0x11) => { set(0); set(1); set(2); }
+            (DEVKIND_MOUSE, 0) => { set(0); set(1); set(2); }
+            (DEVKIND_MOUSE, 1) => { for k in 0x110..0x115 { set(k); } }
+            (DEVKIND_MOUSE, 2) => { set(0); set(1); set(8); } // REL_X, REL_Y, REL_WHEEL
+            _ => {}
+        }
+        return copy_out(pid, arg_ptr, &buf[..n]);
+    }
     match ev {
         0 => { // supported event types
             if n >= 1 {
@@ -1106,8 +1156,29 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
     let dev_id = arg(msg, 0) as usize;
 
     if dev_id >= MAX_DEVICES { return err_reply(-19); } // ENODEV
+    // A hot-unplugged node: every request but the close fails like Linux
+    // evdev after disconnect (read/ioctl/write ENODEV, poll HUP|ERR).
+    let live = {
+        let f = unsafe { arch_interrupt_save() };
+        let l = STATE.lock().devs[dev_id].in_use;
+        unsafe { arch_interrupt_restore(f); }
+        l
+    };
+    if !live && tag != vfs_server::VFS_CLOSE && tag != vfs_server::VFS_POLL {
+        return err_reply(-19);
+    }
 
     match tag {
+        vfs_server::VFS_OPEN => {
+            // Hot-plugged nodes see every open (register_device_notify_open),
+            // so the queue exists from open(2) on: a slot is then reused only
+            // after every fd of the old device is closed.
+            let (open_id, pid) = client_key(msg);
+            let f = unsafe { arch_interrupt_save() };
+            let ok = STATE.lock().find_or_register(dev_id as u32, open_id, pid).is_some();
+            unsafe { arch_interrupt_restore(f); }
+            if ok { val_reply(0) } else { err_reply(-24) } // EMFILE: queue pool full
+        }
         vfs_server::VFS_READ => {
             let buf_ptr = arg(msg, 1) as usize;
             let count = arg(msg, 2) as usize;
@@ -1179,7 +1250,9 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             let revoked = STATE.lock().is_revoked(dev_id as u32, open_id, pid);
             unsafe { arch_interrupt_restore(f); }
             if revoked { return err_reply(-19); } // ENODEV
-            if dev_id == DEV_KEYBOARD { note_led_writes(pid, buf_ptr, count as usize); }
+            if dev_id == DEV_KEYBOARD || dev_kind(dev_id) == DEVKIND_KEYBOARD {
+                note_led_writes(pid, buf_ptr, count as usize);
+            }
             val_reply(count)
         }
         vfs_server::VFS_IOCTL => {
@@ -1270,16 +1343,28 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     if (r.data[0..8].try_into().map(i64::from_le_bytes).unwrap_or(-14)) < 0 { r } else { val_reply(0) }
                 }
                 0x02 => { // EVIOCGID → input_id{bustype,vendor,product,version} (8B)
-                    let (vendor, product) = if dev_id == DEV_TABLET { (0x0627u16, 0x0001u16) }
-                                            else { (0x0627u16, 0x0002u16) };
-                    let ids: [u16; 4] = [BUS_VIRTUAL, vendor, product, 0x0001];
+                    let ids: [u16; 4] = if dev_id >= FIXED_DEVICES {
+                        let f = unsafe { arch_interrupt_save() };
+                        let d = { let st = STATE.lock(); let d = &st.devs[dev_id]; (d.bus, d.vendor, d.product) };
+                        unsafe { arch_interrupt_restore(f); }
+                        [d.0, d.1, d.2, 0x0110]
+                    } else if dev_id == DEV_TABLET { [BUS_VIRTUAL, 0x0627, 0x0001, 0x0001] }
+                    else { [BUS_VIRTUAL, 0x0627, 0x0002, 0x0001] };
                     copy_out(pid, arg_ptr, unsafe {
                         core::slice::from_raw_parts(ids.as_ptr() as *const u8, 8)
                     })
                 }
                 0x06 => { // EVIOCGNAME(len)
-                    let name: &[u8] = if dev_id == DEV_TABLET { b"QEMU Virtio Tablet\0" }
-                                      else { b"QEMU Virtio Keyboard\0" };
+                    let mut dyn_name = [0u8; NAME_MAX + 1];
+                    let name: &[u8] = if dev_id >= FIXED_DEVICES {
+                        let f = unsafe { arch_interrupt_save() };
+                        let len = { let st = STATE.lock(); let d = &st.devs[dev_id];
+                                    let l = d.name_len as usize;
+                                    dyn_name[..l].copy_from_slice(&d.name[..l]); l };
+                        unsafe { arch_interrupt_restore(f); }
+                        &dyn_name[..len + 1]
+                    } else if dev_id == DEV_TABLET { b"QEMU Virtio Tablet\0" }
+                    else { b"QEMU Virtio Keyboard\0" };
                     let n = core::cmp::min(size, name.len());
                     copy_out(pid, arg_ptr, &name[..n])
                 }
@@ -1308,7 +1393,9 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                 }
                 0x19 => { // EVIOCGLED: keyboard LEDs a client last wrote
                     let mut buf = [0u8; 8];
-                    if dev_id == DEV_KEYBOARD { buf[0] = client_leds().unwrap_or(0); }
+                    if dev_id == DEV_KEYBOARD || dev_kind(dev_id) == DEVKIND_KEYBOARD {
+                        buf[0] = client_leds().unwrap_or(0);
+                    }
                     let n = core::cmp::min(size, buf.len());
                     copy_out(pid, arg_ptr, &buf[..n])
                 }
@@ -1394,7 +1481,7 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             unsafe { arch_interrupt_restore(f); }
             // Revoked: POLLERR | POLLHUP, as `evdev_poll` reports for a dead
             // client — the signal libinput takes to drop the device.
-            let revents: u32 = if revoked { 0x8 | 0x10 } else if count > 0 { 0x1 } else { 0 };
+            let revents: u32 = if revoked || !live { 0x8 | 0x10 } else if count > 0 { 0x1 } else { 0 };
             bump(&C_POLLS, dev_id);
             if revents != 0 { bump(&C_POLLIN, dev_id); }
             let mut m = Message::empty();
@@ -1843,7 +1930,8 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     {
         let mut st = STATE.lock();
         st.devs[DEV_KEYBOARD].in_use = true; // event0 (keyboard)
-        st.devs[DEV_TABLET].in_use = true;   // event1 (virtio-tablet absolute pointer)
+        st.devs[DEV_TABLET].in_use = true;
+        st.devs[DEV_TABLET].kind = KIND_VIRT_TABLET;   // event1 (virtio-tablet absolute pointer)
         // The console drain's queue, registered for the lifetime of the system
         // on the keyboard node only: `read_input_byte` is the sole caller of
         // pop_event and only ever asks for device 0, and a tap on the tablet
@@ -1856,6 +1944,89 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     // slot 3 (copy_to_task/copy_from_task). Only the kernel's VFS forward may
     // fill that slot; a raw user IPC naming another pid would read or write
     // that process's memory (openbugs L1.17).
+    EVDEV_PORT.store(port_id, core::sync::atomic::Ordering::Release);
     port::register_kernel_handler(port_id, handle);
     Some(port_id)
+}
+
+fn dev_kind(dev: usize) -> u8 {
+    if dev >= MAX_DEVICES { return KIND_VIRT_KEYBOARD; }
+    let f = unsafe { arch_interrupt_save() };
+    let k = STATE.lock().devs[dev].kind;
+    unsafe { arch_interrupt_restore(f); }
+    k
+}
+
+/// Add a hot-plugged input device (`DEVKIND_*`) as the lowest free
+/// /dev/input/eventN, N >= 2, and return N (the `push_event` device id).
+/// A number is free once its previous device is gone and every fd opened on
+/// it is closed (Linux reuses an evdev minor only after release). Task
+/// context only (takes the VFS device registry lock).
+pub fn register_input_device(kind: u8, name: &str, bus: u16, vendor: u16, product: u16) -> Option<u32> {
+    let port = EVDEV_PORT.load(core::sync::atomic::Ordering::Acquire);
+    if port == u32::MAX { return None; }
+    let f = unsafe { arch_interrupt_save() };
+    let idx = {
+        let mut st = STATE.lock();
+        let free = (FIXED_DEVICES..MAX_DEVICES).find(|&i| !st.devs[i].in_use
+            && !st.clients.iter().any(|c| c.in_use && c.dev_id == i as u32));
+        if let Some(i) = free {
+            let mut d = EvdevDevice::empty();
+            d.in_use = true;
+            d.kind = kind;
+            d.bus = bus;
+            d.vendor = vendor;
+            d.product = product;
+            let b = name.as_bytes();
+            let l = b.len().min(NAME_MAX - 1);
+            d.name[..l].copy_from_slice(&b[..l]);
+            d.name_len = l as u8;
+            st.devs[i] = d;
+        }
+        free
+    };
+    unsafe { arch_interrupt_restore(f); }
+    let i = idx?;
+    vfs_server::register_device_notify_open(EVENT_PATHS[i], port, i as u32, 13, 64 + i as u32);
+    crate_log(b"[EVDEV] added ", EVENT_PATHS[i], name);
+    Some(i as u32)
+}
+
+/// Remove a device added by [`register_input_device`]: its node leaves
+/// /dev/input, open readers are woken and get ENODEV from read/ioctl and
+/// POLLHUP|POLLERR from poll. Task context only.
+pub fn unregister_input_device(dev: u32) {
+    let i = dev as usize;
+    if i < FIXED_DEVICES || i >= MAX_DEVICES { return; }
+    let port = EVDEV_PORT.load(core::sync::atomic::Ordering::Acquire);
+    let f = unsafe { arch_interrupt_save() };
+    let was = {
+        let mut st = STATE.lock();
+        let was = st.devs[i].in_use;
+        st.devs[i].in_use = false;
+        st.devs[i].ungrab();
+        for c in st.clients.iter_mut().filter(|c| c.in_use && c.dev_id == dev) {
+            c.revoked = true;
+            c.head = 0;
+            c.count = 0;
+            c.seq = c.seq.wrapping_add(1);
+        }
+        was
+    };
+    unsafe { arch_interrupt_restore(f); }
+    if !was { return; }
+    vfs_server::unregister_device(port, dev);
+    wake_dev(dev);
+    crate_log(b"[EVDEV] removed ", EVENT_PATHS[i], "");
+}
+
+fn crate_log(what: &[u8], path: &str, name: &str) {
+    for &b in what { unsafe { arch_serial_putc(b) }; }
+    for &b in path.as_bytes() { unsafe { arch_serial_putc(b) }; }
+    if !name.is_empty() {
+        for &b in b" (" { unsafe { arch_serial_putc(b) }; }
+        for &b in name.as_bytes() { unsafe { arch_serial_putc(b) }; }
+        unsafe { arch_serial_putc(b')') };
+    }
+    unsafe { arch_serial_putc(b'\n') };
 }

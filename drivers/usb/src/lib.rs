@@ -146,7 +146,7 @@ fn adopt(bus: u8, e: xhci::Enumerated, hot: bool) -> Option<XhciBulk> {
     }
     if !pipes.is_empty() {
         let name = if i.product_name.is_empty() { "USB HID device" } else { i.product_name.as_str() };
-        hid::register(pipes, name, hid::initial_leds());
+        hid::register(pipes, name, hid::initial_leds(), i.vendor, i.product);
     }
     DEVICES.lock().push(i);
     bulk
