@@ -89,8 +89,12 @@ use crate::usb_hcd::{BulkTransport, XhciBulk};
 
 /// Sleep for `ms` milliseconds without burning the CPU: park on the
 /// scheduler's timed wait channel until the deadline (the same mechanism
-/// `nanosleep` uses), re-checking the clock after every wake.
+/// `nanosleep` uses), re-checking the clock after every wake. A no-op with
+/// preemption disabled (see below).
 fn delay_ms(ms: u32) {
+    // A request in an `IoWindow` (may not sleep, preemption off) must not
+    // stretch its time on the CPU: no back-off there.
+    if sched::preempt_disabled() { return; }
     sleep_until(sched::monotonic_ns().saturating_add(ms as u64 * 1_000_000));
 }
 
@@ -435,6 +439,23 @@ pub fn task_disk_wait_ns(pid: u32) -> u64 {
 /// Every registered disk, for the periodic summary.
 static DISKS: spin::Mutex<Vec<&'static UsbDisk>> = spin::Mutex::new(Vec::new());
 
+/// Log (at most once per reason, and every 1024th time after) that a block
+/// request reached the stick in a context that may not sleep: such a request
+/// spins on the CPU for as long as the stick takes, retry ladder included.
+fn note_atomic_io() {
+    static N: AtomicU64 = AtomicU64::new(0);
+    static LAST_REASON: AtomicU64 = AtomicU64::new(0);
+    let reason = sched::irqctx::sleep_forbidden_reason().unwrap_or("?");
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let key = reason.as_ptr() as u64;
+    if LAST_REASON.swap(key, Ordering::Relaxed) != key || n % 1024 == 0 {
+        extern "C" { fn arch_serial_putc(c: u8); }
+        let line = alloc::format!("[USB-MSC] block I/O in atomic context ({}), pid {}: it spins while the stick works (#{})\n",
+                                  reason, sched::current_pid(), n + 1);
+        for &b in line.as_bytes() { unsafe { arch_serial_putc(b) } }
+    }
+}
+
 /// Preemption disabled for one block request when it runs with IRQs masked
 /// in a context that may NOT sleep, so the `irq_window`s the poll loop opens
 /// take the tick but never switch tasks. Released without a resched on every
@@ -447,7 +468,10 @@ impl IoWindow {
         let masked = sched::irqs_masked() && sched::current_pid() != 0;
         let sleepable = masked && sched::irqctx::can_sleep();
         let open = masked && !sleepable;
-        if open { sched::preempt_disable(); }
+        if open {
+            note_atomic_io();
+            sched::preempt_disable();
+        }
         IoWindow { open, sleepable }
     }
 }

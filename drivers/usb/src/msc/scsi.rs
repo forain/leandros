@@ -181,6 +181,12 @@ impl<T: BulkTransport> ScsiDisk<T> {
                                     self.lun, cdb[0], ms(t0), last);
                     return Err(last);
                 }
+                // Back off before the next try (50, 100, 200, 400, 800 ms):
+                // a stick that timed out is usually busy (a merge, a
+                // wear-levelling pass), and hammering it with CBWs only
+                // lengthens the stall. `delay_ms` parks the task, or does
+                // nothing where the caller may not sleep.
+                (self.delay_ms)(50u32 << (attempt - 1).min(4));
             }
             if round == 0 {
                 crate::usb_log!("[USB-MSC] lun {}: Bulk-Only reset recovery after 3 failed attempts ({} ms)\n",

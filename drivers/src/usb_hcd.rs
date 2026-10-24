@@ -138,6 +138,129 @@ pub fn init() {
     crate::usb_hid::init();
 }
 
+/// Early quiesce of every xHCI controller (lane usbladder, L8.3).
+///
+/// Firmware (UEFI's USB stack, or a BIOS doing legacy keyboard emulation) can
+/// leave an xHCI running at hand-off: its schedules, event ring and scratchpad
+/// buffers live in memory the firmware owned, which this kernel's frame
+/// allocator hands out again long before `usb_hcd::init` (task context, after
+/// the block layer) halts the controller. A controller still walking those
+/// structures DMAs into reused pages. So as soon as PCI config space is
+/// reachable (right after `pci::init_pci` / `init_ecam_from_acpi`) every
+/// controller that decodes memory and masters the bus is taken from the BIOS
+/// (USBLEGSUP), stopped (USBCMD.R/S = 0, wait USBSTS.HCH), reset (HCRST), and
+/// its PCI bus mastering is turned off; `probe_one` turns it back on.
+///
+/// Runs in early boot: no scheduler, maybe no calibrated clock. Every wait is
+/// bounded by an iteration count as well as by `monotonic_ns`.
+pub fn early_quiesce() {
+    for pci in &pci::find_by_class(0x0C, 0x03, 0x30) {
+        unsafe { early_quiesce_one(pci) };
+    }
+}
+
+/// Wait until `cond` or `us` microseconds (by `monotonic_ns`, or ~`us * 64`
+/// polls when the clock does not advance yet).
+fn early_wait(us: u64, mut cond: impl FnMut() -> bool) -> bool {
+    let t0 = sched::monotonic_ns();
+    for _ in 0..us.saturating_mul(64) {
+        if cond() { return true; }
+        if sched::monotonic_ns().saturating_sub(t0) >= us * 1000 { break; }
+        core::hint::spin_loop();
+    }
+    cond()
+}
+
+unsafe fn early_quiesce_one(pci: &PciDevice) {
+    let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
+    if cmd & 0x4 == 0 {
+        return; // not a bus master: it cannot DMA
+    }
+    let raw = pci.bars[0];
+    let is64 = raw & 0x6 == 0x4;
+    let phys = (raw & !0xF) as u64 | if is64 { (pci.bars[1] as u64) << 32 } else { 0 };
+    let mut what = "bus mastering off";
+    if raw & 1 == 0 && phys != 0 && cmd & 0x2 != 0 {
+        pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd & !0x3);
+        let size = bar_size(pci, 0, is64);
+        pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd);
+        let map = if (0x1000..=16 << 20).contains(&size) {
+            mm::paging::map_kernel_device(
+                phys as usize, size as usize,
+                mm::paging::PageFlags::PRESENT | mm::paging::PageFlags::WRITABLE | mm::paging::PageFlags::MMIO)
+        } else { None };
+        if let Some(base) = map {
+            what = early_halt_reset(base, size as usize);
+        }
+    }
+    // Halted or not, nothing DMAs without bus mastering.
+    pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd & !0x4);
+    console_log(&alloc::format!("[XHCI] {:02x}:{:02x}.{} early quiesce: {}\n", pci.bus, pci.dev, pci.func, what));
+}
+
+/// BIOS handoff, halt, HCRST on the controller mapped at `base`. Returns
+/// what was done (for the log line).
+unsafe fn early_halt_reset(base: usize, len: usize) -> &'static str {
+    let r = |off: usize| core::ptr::read_volatile((base + off) as *const u32);
+    let w = |off: usize, v: u32| core::ptr::write_volatile((base + off) as *mut u32, v);
+    let cap = r(0);
+    if cap == 0xFFFF_FFFF { return "no response (all-ones), bus mastering off"; }
+    let op = (cap & 0xFF) as usize;
+    if op < 0x20 || op + 8 > len { return "bad CAPLENGTH, bus mastering off"; }
+    // USB Legacy Support: take ownership, mask the BIOS's SMIs.
+    let mut off = ((r(0x10) >> 16) as usize) * 4;
+    let mut guard = 0;
+    while off != 0 && off + 8 <= len && guard < 64 {
+        let dw0 = r(off);
+        if dw0 & 0xFF == 1 {
+            if dw0 & (1 << 16) != 0 {
+                w(off, dw0 | (1 << 24));
+                if !early_wait(1_000_000, || r(off) & (1 << 16) == 0) {
+                    w(off, (r(off) & !(1 << 16)) | (1 << 24));
+                }
+            }
+            // SMI enables off (bits 0, 4, 13..15), write-1-to-clear events (29..31).
+            let c = r(off + 4);
+            w(off + 4, (c & 0x000E_1FEE) | 0xE000_0000);
+            break;
+        }
+        let next = ((dw0 >> 8) & 0xFF) as usize;
+        if next == 0 { break; }
+        off += next * 4;
+        guard += 1;
+    }
+    const CMD_RUN: u32 = 1 << 0;
+    const CMD_HCRST: u32 = 1 << 1;
+    const CMD_INTE: u32 = 1 << 2;
+    const CMD_HSEE: u32 = 1 << 3;
+    const STS_HCH: u32 = 1 << 0;
+    const STS_CNR: u32 = 1 << 11;
+    let running = r(op + 4) & STS_HCH == 0;
+    if running {
+        w(op, r(op) & !(CMD_RUN | CMD_INTE | CMD_HSEE));
+        if !early_wait(100_000, || r(op + 4) & STS_HCH != 0) {
+            return "was RUNNING and did not halt; bus mastering off";
+        }
+    }
+    if !early_wait(1_000_000, || r(op + 4) & STS_CNR == 0) {
+        return if running { "was running, halted; not ready for reset" } else { "halted; not ready for reset" };
+    }
+    w(op, CMD_HCRST);
+    // Some Intel controllers hang if USBCMD is read too soon after HCRST.
+    let t0 = sched::monotonic_ns();
+    for _ in 0..200_000u32 {
+        if sched::monotonic_ns().saturating_sub(t0) >= 1_000_000 { break; }
+        core::hint::spin_loop();
+    }
+    let done = early_wait(1_000_000, || r(op) & CMD_HCRST == 0 && r(op + 4) & STS_CNR == 0);
+    match (running, done) {
+        (true, true) => "was RUNNING (firmware left it on): halted + reset",
+        (true, false) => "was RUNNING: halted, reset timed out",
+        (false, true) => "halted + reset",
+        (false, false) => "halted, reset timed out",
+    }
+}
+
 /// Size BAR `idx` (and its upper half if 64-bit) with decoding disabled.
 unsafe fn bar_size(pci: &PciDevice, idx: usize, is64: bool) -> u64 {
     let off = 0x10 + 4 * idx as u8;
