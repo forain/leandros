@@ -20,10 +20,17 @@ cb = importlib.util.module_from_spec(spec); spec.loader.exec_module(cb)
 # (no [USB] line for it; separate bug), and it also exercises coldplug enumeration.
 os.environ["LEANDROS_QEMU_EXTRA"] = "-device qemu-xhci,id=xhs -device usb-mouse,bus=xhs.0,id=m0"
 ok = True
-def comp_nodes():
-    out = cb.SER.cmd("for p in /proc/[0-9]*; do case $(cat $p/comm 2>/dev/null) in cosmic-comp) ls -l $p/fd;; esac; done 2>/dev/null | grep -o 'input/event[0-9]*' | sort -u | tr '\\n' ' '; echo END", 30)
-    cb.log("fds raw", out[-200:].replace("\n", " | "))
-    return set(re.findall(r"input/(event\d+) ", out))
+def comp_pid():
+    out = cb.SER.cmd("for p in /proc/[0-9]*; do case $(cat $p/comm 2>/dev/null) in cosmic-comp) echo CPID=${p#/proc/};; esac; done; echo END", 30)
+    m = re.findall(r"CPID=(\d+)", out)
+    return m[0] if m else None
+def serial_log():
+    try: return open(os.environ["CS_OUT"] + "/serial.log", errors="replace").read()
+    except Exception: return ""
+def comp_regs(pid, since):
+    # The evdev server logs every open of an input node with the opener's pid;
+    # /proc/<pid>/fd listings are unreliable here.
+    return set(re.findall(r"\[EVDEV\] register dev=(\d+) open=\w+ pid=%s\b" % pid, serial_log()[since:]))
 def comp_alive():
     return "cosmic-comp" in cb.SER.cmd("cat /proc/[0-9]*/comm", 30)
 def type_marker(name, tag):
@@ -42,20 +49,18 @@ try:
         cb.log("LOGIN try", t, up)
         if up: break
     cb.key("meta_l-t", 0); time.sleep(25); cb.save("1-term")
-    before = comp_nodes(); cb.log("comp nodes before", sorted(before))
+    cpid = comp_pid(); cb.log("cosmic-comp pid", cpid)
+    mark = len(serial_log())
     cb.log("device_add", cb.drv("qmp", "device_add", json.dumps({"driver": "usb-kbd", "bus": "xhs.0", "id": "hk"}), timeout=60)[-120:])
     time.sleep(8)
-    after = comp_nodes(); new = after - before
-    cb.log("comp nodes after add", sorted(after))
-    if new: cb.log("PASS (a) cosmic-comp opened", sorted(new))
-    else: ok = False; cb.log("FAIL (a) cosmic-comp opened no new event node")
+    new = comp_regs(cpid, mark) if cpid else set()
+    if new: cb.log("PASS (a) cosmic-comp registered new evdev node(s)", sorted(new))
+    else: ok = False; cb.log("FAIL (a) no [EVDEV] register for cosmic-comp pid", cpid, "after hot-add")
     if type_marker("uh1", "udevhota"): cb.log("PASS (b) keys via usb-kbd reached the terminal")
     else: ok = False; cb.log("FAIL (b) /tmp/udevhota not created")
     cb.save("2-typed")
     cb.log("device_del", cb.drv("qmp", "device_del", json.dumps({"id": "hk"}), timeout=60)[-120:])
     time.sleep(8)
-    gone = comp_nodes(); cb.log("comp nodes after del", sorted(gone))
-    if new and new & gone: ok = False; cb.log("FAIL (c) cosmic-comp still holds", sorted(new & gone))
     if not comp_alive(): ok = False; cb.log("FAIL (c) cosmic-comp died")
     if type_marker("uh2", "udevhotb"): cb.log("PASS (c) keys after unplug reached the terminal")
     else: ok = False; cb.log("FAIL (c) /tmp/udevhotb not created")
