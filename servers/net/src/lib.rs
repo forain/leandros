@@ -2619,6 +2619,9 @@ const ACTIVE_NS: u64 = 200_000_000;
 /// Longest idle sleep of the net daemon when every NIC's receive path kicks it
 /// (see the end of `net_daemon`).
 const IDLE_CAP_NS: u64 = 1_000_000_000;
+/// Fallback sleep while a NIC refuses frames (`tx_ready` false) and smoltcp
+/// only wants to transmit: the driver's drain kick normally ends it first.
+const TX_HELD_FALLBACK_NS: u64 = 10_000_000;
 
 impl<'a> smoltcp::phy::Device for NicDevice {
     type RxToken<'b> = RxToken where Self: 'b;
@@ -3245,7 +3248,19 @@ pub fn net_daemon() -> ! {
                     }
                     None => None,
                 };
-                if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
+                if let Some(mut d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
+                    // smoltcp asks for another pass at once because it has
+                    // segments to send, but the driver's queue is past its
+                    // high-water mark: a pass now sends nothing. The driver
+                    // kicks when the queue drains (iwlwifi TXQ_LOW, netshape
+                    // half-empty), and that kick starts the next pass; the
+                    // delay is only the fallback. Re-polling at once spun 8
+                    // empty passes per 200 us (31 k passes/s on a 20 Mbit/s
+                    // shaped upload).
+                    if d.total_micros() == 0 && !nif.tx_ready() {
+                        procnet::NETD_TX_HELD_SLEEPS.fetch_add(1, Ordering::Relaxed);
+                        d = smoltcp::time::Duration::from_micros(TX_HELD_FALLBACK_NS / 1000);
+                    }
                     next_poll = Some(next_poll.map_or(d, |n| n.min(d)));
                 }
                 ev
@@ -3354,7 +3369,12 @@ pub fn net_daemon() -> ! {
             Some(d) => (d.total_micros() * 1000).min(cadence_ns),
             None => cadence_ns,
         };
-        if sleep_ns < cadence_ns { procnet::NETD_TIMER_SLEEPS.fetch_add(1, Ordering::Relaxed); }
+        let timer_limited = sleep_ns < cadence_ns;
+        if timer_limited {
+            procnet::NETD_TIMER_SLEEPS.fetch_add(1, Ordering::Relaxed);
+            let b = match sleep_ns { 0..=99_999 => 0, 100_000..=999_999 => 1, 1_000_000..=9_999_999 => 2, _ => 3 };
+            procnet::NETD_SLEEP_HIST[b].fetch_add(1, Ordering::Relaxed);
+        }
         if active { procnet::NETD_ACTIVE_SLEEPS.fetch_add(1, Ordering::Relaxed); }
         procnet::NETD_LAST_SLEEP_US.store(sleep_ns / 1000, Ordering::Relaxed);
         // The netshape link emulator (a test knob) releases its next frame then.
@@ -3366,6 +3386,7 @@ pub fn net_daemon() -> ! {
             // back to back, then sleep a little so a socket that keeps asking
             // cannot spin this CPU.
             immediate_streak += 1;
+            procnet::NETD_IMMEDIATE.fetch_add(1, Ordering::Relaxed);
             if immediate_streak < 8 { continue; }
             sleep_ns = 200_000;
         }
@@ -3381,7 +3402,9 @@ pub fn net_daemon() -> ! {
             continue;
         }
         sched::block_on_poll_commit();
-        if !drivers::netdev::kicked() && sched::monotonic_ns() < deadline {
+        let woke_kicked = drivers::netdev::kicked();
+        if !woke_kicked && timer_limited { procnet::NETD_TIMER_EXPIRED.fetch_add(1, Ordering::Relaxed); }
+        if !woke_kicked && sched::monotonic_ns() < deadline {
             procnet::NETD_EARLY_WAKES.fetch_add(1, Ordering::Relaxed);
             let site = sched::gdwake::take(sched::current_pid());
             if site != 0 { procnet::NETD_EARLY_SITE.store(site, Ordering::Relaxed); }

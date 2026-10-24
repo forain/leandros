@@ -42,6 +42,17 @@ pub(crate) static NETD_LAST_SLEEP_US: core::sync::atomic::AtomicU64 = core::sync
 /// someone else (a broadcast, or a bit-only wake on NETD_TAG's bit).
 /// `NETD_EARLY_SITE`: that waker's call site when `sched.wakestat=1`.
 /// Sleeps at the 1 kHz cadence of a polled NIC that saw traffic recently.
+/// Passes that smoltcp asked for at once (`poll_delay` 0): back-to-back
+/// re-polls plus the 200 us anti-spin sleeps after a streak.
+/// Timer-limited sleeps that actually ran to their deadline (no kick ended
+/// them): the passes smoltcp's timers themselves cost.
+pub(crate) static NETD_TIMER_EXPIRED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Passes where smoltcp wanted to send at once but the driver queue was full:
+/// slept until the drain kick instead of re-polling.
+pub(crate) static NETD_TX_HELD_SLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static NETD_IMMEDIATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Timer-limited sleeps by length: <100 us, <1 ms, <10 ms, >= 10 ms.
+pub(crate) static NETD_SLEEP_HIST: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
 pub(crate) static NETD_ACTIVE_SLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static NETD_EARLY_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static NETD_EARLY_SITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -108,6 +119,10 @@ fn nic(w: &mut Out) {
                    NETD_KICK_PASSES.load(Ordering::Relaxed), NETD_REARM_PASSES.load(Ordering::Relaxed),
                    NETD_TIMER_SLEEPS.load(Ordering::Relaxed), NETD_LAST_SLEEP_US.load(Ordering::Relaxed),
                    NETD_EARLY_WAKES.load(Ordering::Relaxed), NETD_ACTIVE_SLEEPS.load(Ordering::Relaxed));
+    let _ = write!(w, " immediate {} tx_held {} timer_expired {} timer_hist {}/{}/{}/{}", NETD_IMMEDIATE.load(Ordering::Relaxed),
+                   NETD_TX_HELD_SLEEPS.load(Ordering::Relaxed), NETD_TIMER_EXPIRED.load(Ordering::Relaxed),
+                   NETD_SLEEP_HIST[0].load(Ordering::Relaxed), NETD_SLEEP_HIST[1].load(Ordering::Relaxed),
+                   NETD_SLEEP_HIST[2].load(Ordering::Relaxed), NETD_SLEEP_HIST[3].load(Ordering::Relaxed));
     match NETD_EARLY_SITE.load(Ordering::Relaxed) {
         0 => {}
         site => sched::gdwake::site_name(site, &mut |f, l| { let _ = write!(w, " early_site {}:{}", f, l); }),
