@@ -2506,6 +2506,7 @@ fn dispatch_inner(
 fn ipc_send_permitted(port: u32) -> isize {
     match port::send_target(port) {
         None => -9,
+        Some((true, _)) if port::is_kernel_only(port) => -1, // EPERM
         Some((true, _)) => 0,
         Some((false, owner)) => sched::cred::ipc_send_check(owner),
     }
@@ -9105,8 +9106,8 @@ fn sys_blkdev_info(index: usize, out_ptr: usize) -> isize {
 
 fn sys_blkdev_name(index: usize, out_ptr: usize) -> isize {
     let d = match drivers::blkdev::describe(index) {
-        Some(d) => d,
-        None => return -19, // ENODEV
+        Some(d) if !d.gone => d,
+        _ => return -19, // ENODEV (never registered, or unplugged)
     };
     let name = d.name();
     if !validate_user_buf(out_ptr, drivers::blkdev::NAME_MAX) { return -14; } // EFAULT
@@ -11569,8 +11570,8 @@ fn tty_ioctl_arg(cmd: usize) -> Option<(usize, bool)> {
         0x5414 => Some((8, false)),                         // TIOCSWINSZ
         // TIOCGPGRP, TIOCOUTQ, FIONREAD, TIOCGSID, TIOCGPTN, TIOCGPTLCK
         0x540F | 0x5411 | 0x541B | 0x5429 | 0x8004_5430 | 0x8004_5439 => Some((4, true)),
-        // TIOCSPGRP, TIOCSPTLCK, TIOCSIG
-        0x5410 | 0x4004_5431 | 0x4004_5436 => Some((4, false)),
+        // TIOCSPGRP, TIOCSPTLCK (TIOCSIG's arg is the signal number by value)
+        0x5410 | 0x4004_5431 => Some((4, false)),
         _ => None,
     }
 }

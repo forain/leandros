@@ -949,6 +949,27 @@ fn user_struct_out<T>(uaddr: usize, src: &T) -> bool {
     unsafe { sched::uaccess::copy_raw(uaddr as *mut u8, src as *const T as *const u8, ::core::mem::size_of::<T>()) == 0 }
 }
 
+// Nested user pointers — addresses read OUT of an ioctl struct (handle arrays,
+// GETPARAM `value`, set_param arrays) — are not the bounced `arg` and must be
+// range-checked: `copy_raw` alone lets a client name a kernel address. These
+// fail with EFAULT on a non-user range or an unresolvable fault.
+fn uread_user<T>(uaddr: usize) -> Result<T, DriverError> {
+    let mut v: T = unsafe { ::core::mem::zeroed() };
+    let n = ::core::mem::size_of::<T>();
+    if unsafe { sched::uaccess::copy_from_user(&mut v as *mut T as *mut u8, uaddr, n) } != 0 {
+        return Err(DriverError::Errno(14));
+    }
+    Ok(v)
+}
+
+fn uwrite_user<T>(uaddr: usize, v: &T) -> Result<(), DriverError> {
+    let n = ::core::mem::size_of::<T>();
+    if unsafe { sched::uaccess::copy_to_user(uaddr, v as *const T as *const u8, n) } != 0 {
+        return Err(DriverError::Errno(14));
+    }
+    Ok(())
+}
+
 /// Run `f` on a kernel copy of the caller's `T` at `arg`, then copy it back
 /// (PAN-safe; a fault on either copy is EINVAL like the other DRM paths).
 fn with_user_struct<T, R>(arg: usize, f: impl FnOnce(&mut T) -> Result<R, DriverError>) -> Result<R, DriverError> {
@@ -3773,7 +3794,7 @@ fn syncobj_read_handles(ptr: u64, count: u32) -> Result<Vec<u32>, DriverError> {
     }
     let mut v = vec![0u32; count as usize];
     for i in 0..count as usize {
-        v[i] = uread::<u32>(ptr as usize + 4 * i)?;
+        v[i] = uread_user::<u32>(ptr as usize + 4 * i)?;
     }
     Ok(v)
 }
@@ -3785,7 +3806,7 @@ fn syncobj_read_points(ptr: u64, count: u32) -> Result<Vec<u64>, DriverError> {
     }
     let mut v = vec![0u64; count as usize];
     for i in 0..count as usize {
-        v[i] = uread::<u64>(ptr as usize + 8 * i)?;
+        v[i] = uread_user::<u64>(ptr as usize + 8 * i)?;
     }
     Ok(v)
 }
@@ -8432,7 +8453,7 @@ impl DrmDeviceInterface {
                 let b = (p + i * SYNCOBJ_DESC as u64) as *const u8;
                 {
                     let ba = b as usize;
-                    v.push((uread::<u32>(ba)?, uread::<u32>(ba + 4)?, uread::<u64>(ba + 8)?));
+                    v.push((uread_user::<u32>(ba)?, uread_user::<u32>(ba + 4)?, uread_user::<u64>(ba + 8)?));
                 }
             }
             Ok(v)
@@ -8630,7 +8651,7 @@ impl DrmDeviceInterface {
         if req.param == VIRTGPU_PARAM_LEANDROS_CTX_ID {
             let ctx = ctx_lookup(open_id) as u64;
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            if !user_struct_out(req.value as usize, &((ctx as u32) as u32)) { return Err(DriverError::InvalidParameter); }
+            uwrite_user(req.value as usize, &((ctx as u32) as u32))?;
             return Ok(0);
         }
         // Same treatment, same reason as CTX_ID: per-open bookkeeping behind a
@@ -8638,7 +8659,7 @@ impl DrmDeviceInterface {
         if req.param == VIRTGPU_PARAM_LEANDROS_LAST_FENCE {
             let f = ctx_lookup_entry(open_id).map(|c| c.last_fence).unwrap_or(0);
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            if !user_struct_out(req.value as usize, &((f as u32) as u32)) { return Err(DriverError::InvalidParameter); }
+            uwrite_user(req.value as usize, &((f as u32) as u32))?;
             return Ok(0);
         }
         // Same treatment, same reason: a leaf lock, no device round-trip, and
@@ -8648,7 +8669,7 @@ impl DrmDeviceInterface {
             hostvis_reap();
             let n = HOSTVIS_SPANS.lock().spans.len() as u32;
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
+            uwrite_user(req.value as usize, &((n) as u32))?;
             return Ok(0);
         }
         // Likewise: BLOB_OBJS is a leaf, the count is copied out of the guard
@@ -8666,7 +8687,7 @@ impl DrmDeviceInterface {
                 (w << 16) | d
             };
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
+            uwrite_user(req.value as usize, &((n) as u32))?;
             return Ok(0);
         }
         // In/out through the user pointer: read the input, answer from a
@@ -8675,20 +8696,20 @@ impl DrmDeviceInterface {
             || req.param == VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_REFS
         {
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            let input = uread::<u32>(req.value as usize)?;
+            let input = uread_user::<u32>(req.value as usize)?;
             let n = if req.param == VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_OF {
                 dumb_obj_of_handle(input)
             } else {
                 dumb_obj_refs(input)
             };
-            if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
+            uwrite_user(req.value as usize, &((n) as u32))?;
             return Ok(0);
         }
         if req.param == VIRTGPU_PARAM_LEANDROS_CTRLQ_STAT {
             use ::core::sync::atomic::Ordering::Relaxed;
             use crate::virtio_gpu as vg;
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            let sel = uread::<u32>(req.value as usize)?;
+            let sel = uread_user::<u32>(req.value as usize)?;
             let n: u64 = match sel {
                 0 => vg::CTX_CHAINS_PARKED.load(Relaxed),
                 1 => vg::CTX_CHAINS_RECLAIMED.load(Relaxed),
@@ -8707,7 +8728,7 @@ impl DrmDeviceInterface {
         }
         if req.param == VIRTGPU_PARAM_LEANDROS_SCATTER {
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            let sel: u32 = uread(req.value as usize)?;
+            let sel: u32 = uread_user(req.value as usize)?;
             let n: u64 = match sel {
                 0 => SCATTER_CREATES.load(Ordering::Relaxed),
                 1 => DUMB_SG.lock().len() as u64,
@@ -8719,13 +8740,13 @@ impl DrmDeviceInterface {
                 }
                 _ => return Err(DriverError::InvalidParameter),
             };
-            uwrite(req.value as usize, &(n.min(u32::MAX as u64) as u32))?;
+            uwrite_user(req.value as usize, &(n.min(u32::MAX as u64) as u32))?;
             return Ok(0);
         }
         if req.param == VIRTGPU_PARAM_LEANDROS_BLOB_OBJS {
             let n = blob_obj_count();
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
+            uwrite_user(req.value as usize, &((n) as u32))?;
             return Ok(0);
         }
 
@@ -8779,7 +8800,7 @@ impl DrmDeviceInterface {
         // reads back that pointee, not the struct field, so writing the value
         // in place made every param read as 0 for Mesa.
         if req.value == 0 { return Err(DriverError::InvalidParameter); }
-        if !user_struct_out(req.value as usize, &((value as u32) as u32)) { return Err(DriverError::InvalidParameter); }
+        uwrite_user(req.value as usize, &((value as u32) as u32))?;
         Ok(0)
     }
 
@@ -8796,7 +8817,7 @@ impl DrmDeviceInterface {
         // Copy the whole param array before locking anything.
         let mut params = [drm_virtgpu_context_set_param { param: 0, value: 0 }; 8];
         for i in 0..n {
-            params[i] = uread::<drm_virtgpu_context_set_param>(
+            params[i] = uread_user::<drm_virtgpu_context_set_param>(
                 init.ctx_set_params as usize + i * ::core::mem::size_of::<drm_virtgpu_context_set_param>(),
             )?;
         }
