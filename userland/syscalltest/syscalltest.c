@@ -2431,8 +2431,8 @@ static void kaddr_sendmsg(void) {
 
 /*KADDR_MORE*/
 static void kaddr_efault(void) {
-    kaddr_sendmsg();
     kaddr_drm_nested();
+    kaddr_sendmsg();
 }
 
 static void affinity_placement(void) {
