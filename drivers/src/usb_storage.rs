@@ -89,8 +89,12 @@ use crate::usb_hcd::{BulkTransport, XhciBulk};
 
 /// Sleep for `ms` milliseconds without burning the CPU: park on the
 /// scheduler's timed wait channel until the deadline (the same mechanism
-/// `nanosleep` uses), re-checking the clock after every wake.
+/// `nanosleep` uses), re-checking the clock after every wake. A no-op with
+/// preemption disabled (see below).
 fn delay_ms(ms: u32) {
+    // A request in an `IoWindow` (may not sleep, preemption off) must not
+    // stretch its time on the CPU: no back-off there.
+    if sched::preempt_disabled() { return; }
     sleep_until(sched::monotonic_ns().saturating_add(ms as u64 * 1_000_000));
 }
 
@@ -135,6 +139,27 @@ static AU_HIT_US: AtomicU64 = AtomicU64::new(4000);
 /// Most open units the model tracks.
 const AU_MAX_OPEN: usize = 16;
 
+// Stall fault knob (test only, lane usbladder). `usbms.stall_lba=L
+// usbms.stall_ms=N`: the first read/write request covering sector L opens an
+// N ms window in which every bulk transfer waits out its deadline and times
+// out (`usb::xhci::FAULT_STALL_UNTIL_NS`), so the retry ladder runs in the
+// guest the way it does for a stick that stopped answering. One shot.
+static STALL_LBA: AtomicU64 = AtomicU64::new(u64::MAX);
+static STALL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn maybe_arm_stall(lba: u64, nsec: u64) {
+    let l = STALL_LBA.load(Ordering::Relaxed);
+    if l == u64::MAX || l < lba || l >= lba.saturating_add(nsec.max(1)) { return; }
+    if STALL_LBA.compare_exchange(l, u64::MAX, Ordering::AcqRel, Ordering::Relaxed).is_err() { return; }
+    let ms = STALL_MS.load(Ordering::Relaxed);
+    let now = sched::monotonic_ns();
+    usb::xhci::FAULT_STALL_UNTIL_NS.store(now.saturating_add(ms * 1_000_000), Ordering::Relaxed);
+    let line = alloc::format!("[USB-MSC] fault: stalling every bulk transfer for {} ms (sector {}, atomic={})\n",
+                              ms, l, !sched::irqctx::can_sleep());
+    extern "C" { fn serial_print(s: *const u8, len: usize); }
+    unsafe { serial_print(line.as_ptr(), line.len()) };
+}
+
 /// Parse `usbms.*` options from the kernel command line. Call before `init`.
 pub fn set_cmdline(cmdline: &str) {
     for tok in cmdline.split_ascii_whitespace() {
@@ -148,6 +173,10 @@ pub fn set_cmdline(cmdline: &str) {
             if let Ok(n) = v.parse::<u64>() { AU_OPEN.store(n.clamp(1, AU_MAX_OPEN as u64), Ordering::Relaxed); }
         } else if let Some(v) = tok.strip_prefix("usbms.merge_us=") {
             if let Ok(n) = v.parse::<u64>() { AU_MERGE_US.store(n, Ordering::Relaxed); }
+        } else if let Some(v) = tok.strip_prefix("usbms.stall_lba=") {
+            if let Ok(n) = v.parse::<u64>() { STALL_LBA.store(n, Ordering::Relaxed); }
+        } else if let Some(v) = tok.strip_prefix("usbms.stall_ms=") {
+            if let Ok(n) = v.parse::<u64>() { STALL_MS.store(n, Ordering::Relaxed); }
         } else if let Some(v) = tok.strip_prefix("usbms.au_hit_us=") {
             if let Ok(n) = v.parse::<u64>() { AU_HIT_US.store(n, Ordering::Relaxed); }
         }
@@ -435,6 +464,23 @@ pub fn task_disk_wait_ns(pid: u32) -> u64 {
 /// Every registered disk, for the periodic summary.
 static DISKS: spin::Mutex<Vec<&'static UsbDisk>> = spin::Mutex::new(Vec::new());
 
+/// Log (at most once per reason, and every 1024th time after) that a block
+/// request reached the stick in a context that may not sleep: such a request
+/// spins on the CPU for as long as the stick takes, retry ladder included.
+fn note_atomic_io() {
+    static N: AtomicU64 = AtomicU64::new(0);
+    static LAST_REASON: AtomicU64 = AtomicU64::new(0);
+    let reason = sched::irqctx::sleep_forbidden_reason().unwrap_or("?");
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let key = reason.as_ptr() as u64;
+    if LAST_REASON.swap(key, Ordering::Relaxed) != key || n % 1024 == 0 {
+        extern "C" { fn arch_serial_putc(c: u8); }
+        let line = alloc::format!("[USB-MSC] block I/O in atomic context ({}), pid {}: it spins while the stick works (#{})\n",
+                                  reason, sched::current_pid(), n + 1);
+        for &b in line.as_bytes() { unsafe { arch_serial_putc(b) } }
+    }
+}
+
 /// Preemption disabled for one block request when it runs with IRQs masked
 /// in a context that may NOT sleep, so the `irq_window`s the poll loop opens
 /// take the tick but never switch tasks. Released without a resched on every
@@ -447,7 +493,10 @@ impl IoWindow {
         let masked = sched::irqs_masked() && sched::current_pid() != 0;
         let sleepable = masked && sched::irqctx::can_sleep();
         let open = masked && !sleepable;
-        if open { sched::preempt_disable(); }
+        if open {
+            note_atomic_io();
+            sched::preempt_disable();
+        }
         IoWindow { open, sleepable }
     }
 }
@@ -607,6 +656,7 @@ impl UsbDisk {
     }
 
     fn begin(&self, op: u8, lba: u64, bytes: usize) {
+        maybe_arm_stall(lba, bytes as u64 / self.sector_size.max(1) as u64);
         self.inflight_lba.store(lba, Ordering::Relaxed);
         self.inflight_bytes.store(bytes as u32, Ordering::Relaxed);
         self.inflight_pid.store(sched::current_pid(), Ordering::Relaxed);
@@ -866,6 +916,7 @@ pub fn init() -> usize {
     for t in crate::usb_hcd::mass_storage_devices() {
         let iface = t.interface_number();
         let mut disk = ScsiDisk::new(t, delay_ms);
+        disk.set_atomic_probe(|| !sched::irqctx::can_sleep());
         if let Err(e) = disk.init() {
             log_err("no usable LUN", e);
             continue;

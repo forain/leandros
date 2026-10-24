@@ -1513,6 +1513,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         #[cfg(target_arch = "aarch64")]
         drivers::pci::set_max_bus(max_bus);
         drivers::pci::init_pci(pci_virt);
+        drivers::usb_hcd::early_quiesce();
     }
     early_mark(14);
 
@@ -1795,6 +1796,8 @@ fn kfacil_init(hhdm_offset: u64) {
     mm::atomic_pool::set_irq_query(sched::irqctx::in_interrupt);
     #[cfg(target_arch = "x86_64")]
     drivers::pci::init_ecam_from_acpi(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr }, hhdm_offset);
+    #[cfg(target_arch = "x86_64")]
+    drivers::usb_hcd::early_quiesce();
     #[cfg(not(target_arch = "x86_64"))]
     let _ = hhdm_offset;
 }
