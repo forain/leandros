@@ -20,8 +20,14 @@
 //!   scan config), adds the station MAC context and scans; with credentials
 //!   (/etc/leandros/wifi.conf or `wifi.ssid=`/`wifi.psk=`) it associates,
 //!   runs the WPA2 4-way handshake, installs the keys and opens the data path.
-//! * Everything is polled (no interrupt is delivered): the thread at 1 ms
-//!   while it waits for the firmware, the net daemon through `poll_receive`.
+//! * Interrupts: MSI (x86_64; `iwlwifi.irq=0` keeps everything polled). The
+//!   handler masks CSR_INT_MASK and kicks the net daemon and the driver
+//!   thread; whoever drained the RX ring re-opens the mask (`irq_rearm`) and
+//!   looks once more, so a packet landing in between is not stranded. While
+//!   associated the driver thread parks on its key between notifications
+//!   (bounded by its 100 ms housekeeping budget) instead of polling at 1 ms;
+//!   before association (firmware bring-up, scan, handshake) it polls at
+//!   1 ms as before. Without MSI the net daemon polls through `poll_receive`.
 //!
 //! A failure at any step is logged with the registers and the firmware error
 //! tables and leaves the NIC down; boot never waits for this driver.
@@ -260,6 +266,93 @@ static LINK_UP: AtomicBool = AtomicBool::new(false);
 static LINK_GEN: AtomicU32 = AtomicU32::new(0);
 static MAC: Mutex<[u8; 6]> = Mutex::new([0; 6]);
 static DEV: Mutex<Option<Dev>> = Mutex::new(None);
+
+// ── interrupt (MSI) ──
+/// `iwlwifi.irq=0`: never request the MSI.
+static IRQ_KNOB: AtomicBool = AtomicBool::new(true);
+/// The MSI is live: RX and notifications kick their consumers.
+static IRQ_ON: AtomicBool = AtomicBool::new(false);
+/// BAR0 (for the handler, which must not take DEV).
+static IRQ_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static IRQS: AtomicU32 = AtomicU32::new(0);
+static IRQ_EMPTY: AtomicU32 = AtomicU32::new(0);
+static IRQ_LAST: AtomicU32 = AtomicU32::new(0);
+static IRQ_VECTOR: AtomicU32 = AtomicU32::new(0);
+/// Driver-thread parks while associated, and how many ended on a kick.
+static THREAD_PARKS: AtomicU32 = AtomicU32::new(0);
+static THREAD_KICKED: AtomicU32 = AtomicU32::new(0);
+/// The driver thread's wake key (an interrupt, or the net daemon queueing a
+/// notification for it).
+const IWL_KEY: u64 = sched::poll_key(sched::poll_class::INET, 0xFFFF_FFE0);
+static IWL_KICKED: AtomicBool = AtomicBool::new(false);
+static IWL_PARK: sched::PollTag = sched::PollTag {
+    bits: sched::poll_key_bit(IWL_KEY), n: 1, keys: [IWL_KEY, 0, 0], nested: 0, foreign: false,
+};
+
+fn iwl_kick() {
+    if !IWL_KICKED.swap(true, Ordering::AcqRel) { sched::wake_poll_key(IWL_KEY); }
+}
+
+fn iwl_kick_from_irq() {
+    if !IWL_KICKED.swap(true, Ordering::AcqRel) && !sched::try_wake_poll_key(IWL_KEY) {
+        sched::request_poll_wake_key(IWL_KEY);
+    }
+}
+
+extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
+    let base = IRQ_BASE.load(Ordering::Relaxed);
+    if base == 0 { return crate::irq::IrqReturn::None; }
+    let m = Mmio(base);
+    let v = m.r32(tr::CSR_INT);
+    if v == 0 || v == 0xffff_ffff { IRQ_EMPTY.fetch_add(1, Ordering::Relaxed); return crate::irq::IrqReturn::None; }
+    // Mask until a consumer has drained the ring; CSR_INT itself is read
+    // and acknowledged by `poll_int` (firmware-error detection lives there).
+    m.w32(tr::CSR_INT_MASK, 0);
+    IRQS.fetch_add(1, Ordering::Relaxed);
+    IRQ_LAST.store(v, Ordering::Relaxed);
+    crate::netdev::kick_from_irq();
+    iwl_kick_from_irq();
+    crate::irq::IrqReturn::Handled
+}
+
+/// Re-open the interrupt mask after draining (no lock: one MMIO write).
+fn irq_rearm() {
+    if !IRQ_ON.load(Ordering::Acquire) || !tr::IRQ_WANTED.load(Ordering::Acquire) { return; }
+    let base = IRQ_BASE.load(Ordering::Relaxed);
+    if base != 0 { core::sync::atomic::fence(Ordering::SeqCst); Mmio(base).w32(tr::CSR_INT_MASK, tr::INI_SET_MASK); }
+}
+
+/// The net daemon drained this netif: re-arm, then say whether something
+/// arrived meanwhile (another pass then, instead of a sleep).
+pub fn rx_rearm() -> bool {
+    if !IRQ_ON.load(Ordering::Acquire) || !link_up() { return false; }
+    irq_rearm();
+    // Held by the driver thread: it services the ring itself and kicks the
+    // daemon for every frame it queues.
+    let g = match DEV.try_lock() { Some(g) => g, None => return false };
+    g.as_ref().map_or(false, |d| !d.rx_eth.is_empty() || d.t.rx_pending())
+}
+
+/// Every received frame kicks the net daemon (MSI live).
+pub fn rx_irq_driven() -> bool { IRQ_ON.load(Ordering::Relaxed) }
+
+/// The driver thread's wait between polls of a notification: 1 ms polling
+/// unless the MSI is live and the link is up, then a keyed park (an
+/// interrupt or a queued notification ends it) for at most `max_ms`.
+fn wait_event(max_ms: u64) {
+    if !IRQ_ON.load(Ordering::Acquire) || !link_up() || max_ms < 2 { msleep(1); return; }
+    irq_rearm();
+    if with_dev(|d| d.t.rx_pending() || !d.notifs.is_empty()).unwrap_or(true) { return; }
+    let deadline = sched::monotonic_ns() + max_ms.min(100) * 1_000_000;
+    THREAD_PARKS.fetch_add(1, Ordering::Relaxed);
+    sched::block_on_poll_prepare_tag(deadline, &IWL_PARK);
+    if IWL_KICKED.load(Ordering::Acquire) { sched::block_on_poll_cancel(); THREAD_KICKED.fetch_add(1, Ordering::Relaxed); return; }
+    sched::block_on_poll_commit();
+    if IWL_KICKED.load(Ordering::Acquire) { THREAD_KICKED.fetch_add(1, Ordering::Relaxed); }
+}
+
+/// The data path opened: re-arm and let the daemon look.
+fn on_link_up() { irq_rearm(); crate::netdev::kick(); }
 static INFO: Mutex<Option<Info>> = Mutex::new(None);
 /// iwlwifi.mgr=1 was given (the netctl seam is served).
 static MGR_ON: AtomicBool = AtomicBool::new(false);
@@ -312,6 +405,8 @@ struct Dev {
     scan_results: Vec<ScanEntry>,
     // Data path (W3).
     rx_eth: VecDeque<Vec<u8>>,
+    /// `service` runs for the net daemon (`poll_receive`).
+    in_netd: bool,
     rx_frames: u64,
     rx_dropped: u64,
     /// TX counters and histograms; `txs_mark` is the copy at the last
@@ -489,6 +584,7 @@ impl Dev {
             self.rxs.svc_gap_max_ms = self.rxs.svc_gap_max_ms.max(now - self.last_service_ms);
         }
         self.last_service_ms = now;
+        let (eth0, notif0, resp0) = (self.rx_eth.len(), self.notifs.len(), self.resps.len());
         self.t.poll_int();
         let mut pkts = Vec::new();
         self.t.rx_poll(&mut pkts);
@@ -498,6 +594,13 @@ impl Dev {
             let mut out = Vec::new();
             self.agg.tick(now, &mut out);
             self.rx_release(out);
+        }
+        // With the MSI live each side sleeps until kicked: hand over what
+        // this drain found for the other one (the interrupt that announced
+        // it may have gone to the side that is not running).
+        if IRQ_ON.load(Ordering::Relaxed) {
+            if !self.in_netd && self.rx_eth.len() > eth0 { crate::netdev::kick(); }
+            if self.in_netd && (self.notifs.len() > notif0 || self.resps.len() > resp0) { iwl_kick(); }
         }
     }
 
@@ -920,6 +1023,7 @@ fn with_dev<R>(f: impl FnOnce(&mut Dev) -> R) -> Option<R> {
 /// Probe the first supported Intel Wi-Fi function. Boot context, quick.
 pub fn init(cmdline: &str) {
     crate::wifi_mgr::set_knobs(cmdline);
+    IRQ_KNOB.store(cmdline_val(cmdline, "iwlwifi.irq") != Some("0"), Ordering::Relaxed);
     if cmdline_val(cmdline, "iwlwifi.disable") == Some("1") {
         log("disabled (iwlwifi.disable=1)");
         return;
@@ -1008,7 +1112,7 @@ pub fn init(cmdline: &str) {
     // No retry timeout (Linux: keeps PCI TX retries from interfering with C3).
     func.write8(0x41, 0);
     func.enable_mem_and_bus_master();
-    // Interrupts are polled: INTx off, MSI never enabled.
+    // INTx off; the MSI (when available) is requested once BAR0 is mapped.
     func.set_intx_disable(true);
 
     let (va, size) = match func.map_bar(0, mm::kva::CacheMode::Uncached) {
@@ -1027,6 +1131,20 @@ pub fn init(cmdline: &str) {
     };
     t.hw_rev = hw_rev;
     t.disable_interrupts();
+    if IRQ_KNOB.load(Ordering::Relaxed) {
+        IRQ_BASE.store(va, Ordering::SeqCst);
+        match crate::irq::request_msi(PciFunction { bus: func.bus, dev: func.dev, func: func.func }, isr, 0) {
+            Ok(h) => {
+                IRQ_VECTOR.store(h.vector().map_or(0, |v| v as u32), Ordering::Relaxed);
+                core::mem::forget(h);
+                IRQ_ON.store(true, Ordering::SeqCst);
+                ilog!("MSI enabled (vector {:#04x}): RX and notifications interrupt-driven", IRQ_VECTOR.load(Ordering::Relaxed));
+            }
+            Err(e) => { IRQ_BASE.store(0, Ordering::SeqCst); ilog!("no MSI ({:?}): polled", e); }
+        }
+    } else {
+        log("iwlwifi.irq=0: polled");
+    }
     ilog!("BAR0 {} KiB, CSR_HW_REV {:08x} (type {:#x}, step {}), HW_IF_CONFIG {:08x}, GP_CNTRL {:08x}",
           size / 1024, hw_rev, (hw_rev >> 4) & 0xfff, hw_rev & 0xf, m.r32(tr::CSR_HW_IF_CONFIG_REG), m.r32(tr::CSR_GP_CNTRL));
 
@@ -1064,7 +1182,7 @@ pub fn init(cmdline: &str) {
     });
     *DEV.lock() = Some(Dev {
         t, func, debug: opts.debug, resps: Vec::new(), notifs: VecDeque::new(), last_phy: None,
-        scanning: false, scan_results: Vec::new(), rx_eth: VecDeque::new(),
+        scanning: false, scan_results: Vec::new(), rx_eth: VecDeque::new(), in_netd: false,
         rx_frames: 0, rx_dropped: 0, txs: TxStats::default(), txs_mark: TxStats::default(), rc: None,
         async_cmds: Vec::new(), last_txrsp_ms: [0; 2], fail_logged: 0, erp: None, erp_changed: false, notif_dropped: 0,
         guard: None, last_service_ms: 0, rxs: RxStats::default(), csumcheck: opts.csumcheck,
@@ -1153,14 +1271,16 @@ fn send_status0(id: u8, payload: &[u8], what: &'static str) -> Res<()> {
 fn wait_notif(timeout_ms: u64, mut pred: impl FnMut(&RxPacket) -> bool, mut other: impl FnMut(RxPacket)) -> Res<RxPacket> {
     let t0 = now_ms();
     loop {
+        IWL_KICKED.store(false, Ordering::Release);
         let (p, fwerr) = with_dev(|d| { d.service(); (d.notifs.pop_front(), d.t.fw_error) }).unwrap_or((None, true));
         match p {
             Some(p) => { if pred(&p) { return Ok(p); } other(p); continue; }
             None => {}
         }
         if fwerr { return Err(Err::FwError); }
-        if now_ms() - t0 > timeout_ms { return Err(Err::Timeout("notification")); }
-        msleep(1);
+        let spent = now_ms() - t0;
+        if spent > timeout_ms { return Err(Err::Timeout("notification")); }
+        wait_event(timeout_ms - spent);
     }
 }
 
@@ -1879,6 +1999,7 @@ fn connect(_fw: &Fw, hw: &mut Hw, target: &ScanEntry, ssid: &[u8], psk: &[u8], l
     }
     // Connected: stay here until the link goes away.
     LINK_UP.store(true, Ordering::SeqCst);
+    on_link_up();
     LINK_GEN.fetch_add(1, Ordering::SeqCst);
     set_state("connected");
     ilog!("wlan: link up — '{}' {} channel {} (wifi0)",
@@ -2615,6 +2736,7 @@ impl wm::Radio for IwlRadio {
         }
         self.fw_errors = 0;
         LINK_UP.store(true, Ordering::SeqCst);
+    on_link_up();
         LINK_GEN.fetch_add(1, Ordering::SeqCst);
         LAST_STATS_MS.store(now_ms(), Ordering::Relaxed);
         set_state("connected");
@@ -2792,7 +2914,9 @@ pub fn poll_receive(buf: &mut [u8]) -> Option<usize> {
     if !link_up() { return None; }
     let mut g = DEV.try_lock()?;
     let d = g.as_mut()?;
+    d.in_netd = true;
     d.service();
+    d.in_netd = false;
     let f = d.rx_eth.pop_front()?;
     let n = f.len().min(buf.len());
     buf[..n].copy_from_slice(&f[..n]);
@@ -2959,6 +3083,10 @@ pub fn info_lines(out: &mut String) {
         let _ = writeln!(out, "firmware: {}", i.fw);
         let _ = writeln!(out, "state: {}", i.state);
         let _ = writeln!(out, "rfkill: {}", if i.rfkill { "on" } else { "off" });
+        let _ = writeln!(out, "irq: {} vector {:#04x} irqs {} empty {} last {:08x} wanted {}; thread parks {} kicked {}",
+                         if IRQ_ON.load(Ordering::Relaxed) { "msi" } else { "polled" }, IRQ_VECTOR.load(Ordering::Relaxed),
+                         IRQS.load(Ordering::Relaxed), IRQ_EMPTY.load(Ordering::Relaxed), IRQ_LAST.load(Ordering::Relaxed),
+                         tr::IRQ_WANTED.load(Ordering::Relaxed) as u8, THREAD_PARKS.load(Ordering::Relaxed), THREAD_KICKED.load(Ordering::Relaxed));
         if i.mcc != [0, 0] { let _ = writeln!(out, "regulatory: {}{}", i.mcc[0] as char, i.mcc[1] as char); }
         if link_up() {
             let _ = writeln!(out, "ssid: {}", wf::ssid_display(&i.ssid));
