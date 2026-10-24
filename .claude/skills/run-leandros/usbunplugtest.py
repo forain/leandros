@@ -60,7 +60,7 @@ def boot(arch, env):
 
 def node_hashes():
     """{node: sha256 of its first 4 MiB} for every /dev/sd? disk."""
-    out = sh("for d in /dev/sd?; do [ -e $d ] && echo \"N $d $(dd if=$d bs=256k count=16 2>/dev/null | sha256sum)\"; done", 90)
+    out = sh("for d in /dev/sd?; do [ -e $d ] && echo \"N $d $(dd if=$d bs=256k count=16 iflag=fullblock 2>/dev/null | sha256sum)\"; done", 90)
     return {m.group(1): m.group(2) for m in re.finditer(r"N (/dev/sd\w) ([0-9a-f]{64})", out)}
 
 
@@ -94,8 +94,8 @@ def phase_unplug(arch, run_id, env):
         print(f"nodes before unplug: {sorted(h)} A={na} B={nb}")
         if not na or not nb:
             print("FAIL: sticks not both readable at boot"); return False
-        sh(f"sh -c 'rm -f /tmp/src; while dd if={na} of=/dev/null bs=64k 2>/tmp/sd.err; do :; done; "
-           f"echo SRC=$? > /tmp/src' </dev/null >/dev/null 2>&1 & true", 20)
+        sh(f"sh -c 'rm -f /tmp/src; while :; do dd if={na} of=/dev/null bs=64k 2>/tmp/sd.err || "
+           f"{{ echo SRC=$? > /tmp/src; break; }}; done' </dev/null >/dev/null 2>&1 & true", 20)
         time.sleep(2)
         t_del = time.time()
         rc, out = drv("qmp", "device_del", json.dumps({"id": "usba"}), timeout=60)
