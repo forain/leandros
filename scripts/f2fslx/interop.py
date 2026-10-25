@@ -181,7 +181,26 @@ INLW = ("cd /mnt/{l} && echo more >> small/inl && cat small/inl && dd if=big/b3m
 EXCL = "small/inl$|small/inl3000$|^[0-9a-f]+  ./(upg|inl2)"
 
 
-def inline_verify(v, tmp, outs_inl):
+ACLA = "02000000" "01000600ffffffff" "0200" "0600" "d2040000" "04000400ffffffff" "10000600ffffffff" "20000000ffffffff"
+ACLD = "02000000" "01000700ffffffff" "0200" "0700" "4d000000" "04000500ffffffff" "10000700ffffffff" "20000500ffffffff"
+# xattr step (design f2fslxrw S8): verify every Linux-set xattr/ACL via /bin/xattr (hex), then set ours
+XA = ("cd /mnt/{l}; ok=0; bad=0; while read f n h; do g=$(xattr -X $n $f); if [ \"$g\" = \"$h\" ]; then ok=$((ok+1)); "
+      "else bad=$((bad+1)); echo BAD $f $n; fi; done < xexp.txt; echo XA_OK=$ok XA_BAD=$bad; "
+      "echo 1 > ours_acl; mkdir -p ours_dir; xattr -w user.ours hello small/f5000; xattr -W user.ourbig " + "62" * 600 + " small/f5000; echo BIG_RC=$?; "
+      "xattr -w user.small v ours_acl; xattr -W system.posix_acl_access " + ACLA + " ours_acl; xattr -W system.posix_acl_default " + ACLD + " ours_dir; "
+      "xattr -w user.one 1 small/empty; xattr -d user.inl small/empty; echo XA_SET_RC=$?; "
+      ": > xours.txt; for e in small/f5000:user.ours small/f5000:user.ourbig small/f5000:user.small ours_acl:user.small "
+      "ours_acl:system.posix_acl_access ours_dir:system.posix_acl_default small/empty:user.one; do f=${{e%%:*}}; n=${{e##*:}}; "
+      "echo $f $n $(xattr -X $n $f) >> xours.txt; done; xattr small/f5000; sync; cd /; echo XA_DONE")
+# Linux check of what we wrote (runs inside the mounted image dir `m`)
+XLINUX = ("while read f n h; do g=$(sudo getfattr --only-values -n $n m/$f | xxd -p | tr -d '\\n'); [ \"$g\" = \"$h\" ] || echo XBAD $f $n; done < m/xours.txt; "
+          "sudo getfattr --only-values -n user.ourbig m/small/f5000 | wc -c; sudo getfattr -n user.inl m/small/empty 2>&1 | grep -c 'No such attr'; "
+          "sudo getfacl -c m/ours_acl | grep -c 'user:1234:rw-'; sudo getfacl -c m/ours_dir | grep -c 'default:user:77:rwx'; "
+          "for e in small/f5000:user.small small/f5000:user.mid small/f5000:user.big small/f5000:system.posix_acl_access small/empty:user.one dir1/sub:user.dirk dir1/sub:system.posix_acl_default; do f=${e%%:*}; n=${e##*:}; "
+          "sudo getfattr --only-values -n $n m/$f >/dev/null 2>&1 || echo XGONE $f $n; done; echo LXX_DONE")
+
+
+def inline_verify(v, tmp, outs_inl, outs_xa=""):
     """Ship the guest-written image to the box: fsck rc 0, Linux mount, ours2.md5 + MANIFEST (minus
     what the step modified), stat every created name, Linux write, umount, fsck rc 0 again."""
     ok_g = "INLW_DONE" in outs_inl and "RMDIR_EMPTY_RC=0" in outs_inl and "RMDIR_NONEMPTY_RC=0" not in outs_inl \
@@ -199,12 +218,17 @@ def inline_verify(v, tmp, outs_inl):
         script = f"""cd {rd}; mkdir -p m; if sudo mount -o loop {v}.img m; then
  (cd m && md5sum -c ours2.md5 > /tmp/mm.$$ 2>&1; echo LXMD5A_RC=$?; grep -vE '{EXCL}' MANIFEST > /tmp/mf.$$; md5sum -c /tmp/mf.$$ > /tmp/mm2.$$ 2>&1; echo LXMD5B_RC=$?; tail -n 2 /tmp/mm2.$$
  ls dir1/sub | wc -l; stat -c %n small/newd/a dir1/sub/inline_dir_overflow_entry_name_120 >/dev/null; echo LXSTAT_RC=$?; stat -c %s small/inl3000; ls inl2 upg 2>&1 | head -n 3; rm -f /tmp/mm.$$ /tmp/mm2.$$ /tmp/mf.$$)
+ {XLINUX}
  sudo sh -c 'echo fromlinux > m/dir1/sub/lx_new_entry; echo fromlinux >> m/small/inl3000'; sync; sudo umount m && echo LX_UMOUNT_OK
 else echo LX_MOUNT_FAIL; sudo dmesg | tail -n 3 | cut -c1-150; fi"""
         rc, out = box(script)
         ok = ("LXMD5A_RC=0" in out and "LXMD5B_RC=0" in out and "LXSTAT_RC=0" in out and "LX_UMOUNT_OK" in out
               and "\n123\n" in out and "\n5000\n" in out)
         step(v, "A.inline-linux", ok, "Linux mounts, reads and extends our inline writes" if ok else out.strip()[-200:].replace("\n", " "))
+        lxx = "LXX_DONE" in out and "XBAD" not in out and "XGONE" not in out and "\n600\n" in out
+        step(v, "A.xattr-linux", lxx, "Linux reads our xattrs, spilled value and ACLs" if lxx else out.split("LXMD5B_RC")[-1].strip()[-420:].replace("\n", " "))
+        xok = "XA_DONE" in outs_xa and "XA_BAD=0" in outs_xa and "XA_SET_RC=0" in outs_xa and "XA_OK=7" in outs_xa
+        step(v, "A.xattr-guest", xok, "LeandrOS reads all 7 Linux xattrs/ACLs, sets ours" if xok else outs_xa.strip()[-160:].replace("\n", " "))
         rc, out = box(fsck(2))
         step(v, "A.inline-fsck2", "FSCK_RC=0" in out and "\n0\n" in out, "fsck.f2fs rc 0 after Linux write" if "FSCK_RC=0" in out else out.strip()[-140:].replace("\n", " "))
     finally:
@@ -229,6 +253,11 @@ for i in 1 2 3; do echo s$i > dir1/sub/s$i; done
 head -c 3M /dev/urandom > big/b3m; head -c 12M /dev/urandom > big/b12m
 dd if=/dev/urandom of=big/sparse bs=4k count=1 seek=2000 status=none
 ln -s ../small/inl small/sym; ln big/b3m big/hard; setfattr -n user.k -v val small/inl 2>/dev/null || true
+setfattr -n user.small -v abc small/f5000; setfattr -n user.mid -v "$(head -c 150 /dev/zero | tr '\\0' m)" small/f5000
+setfattr -n user.big -v "$(head -c 3000 /dev/zero | tr '\\0' a)" small/f5000; setfacl -m u:1234:rw,g:55:r small/f5000
+setfattr -n user.inl -v hello small/empty; setfattr -n user.dirk -v dv dir1/sub; setfacl -d -m u:77:rwx dir1/sub
+for e in small/f5000:user.small small/f5000:user.mid small/f5000:user.big small/f5000:system.posix_acl_access small/empty:user.inl dir1/sub:user.dirk dir1/sub:system.posix_acl_default; do
+  f=${{e%%:*}}; n=${{e##*:}}; getfattr --only-values -n $n $f 2>/dev/null | xxd -p | tr -d '\\n' > /tmp/xv.$$; echo "$f $n $(cat /tmp/xv.$$)" >> xexp.txt; done; rm -f /tmp/xv.$$
 find . -type f ! -name MANIFEST -print0 | sort -z | xargs -0 md5sum > MANIFEST
 cd ..; sync; sudo umount m
 set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"""
@@ -248,13 +277,13 @@ set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"
     for v in imgs:
         cmds += [MNT.format(l=v), md5chk(v, "MANIFEST"),
                  f"echo leandros > /mnt/{v}/ours.txt && cat /mnt/{v}/ours.txt; echo WRITE_RC=$?; sync",
-                 INLW.format(l=v),
+                 INLW.format(l=v), XA.format(l=v),
                  f"umount /mnt/{v}; echo UMOUNT_RC=$?"]
     outs = guest([os.path.join(tmp, v + ".img") for v in imgs], cmds, "A")
     for i, v in enumerate(imgs):
         if outs is None:
             step(v, "A.mount", False, "guest run failed"); continue
-        m, md, w, il, u = outs[5 * i:5 * i + 5]
+        m, md, w, il, xa, u = outs[6 * i:6 * i + 6]
         mounted = "MNT_RW" in m or "MNT_RO" in m
         step(v, "A.mount", mounted, "mounted" if mounted else "mount failed")
         if not mounted:
@@ -266,7 +295,7 @@ set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"
         step(v, "A.write", wok, "write ok" if wok else "write refused (ro/EROFS)" if "Read-only" in w else "write failed")
         if wok:
             skip(v, "A.ro-unchanged", "volume was written")
-            inline_verify(v, tmp, il)
+            inline_verify(v, tmp, il, xa)
         else:
             same = shas[v] is None or sha(os.path.join(tmp, v + ".img")) == shas[v]
             step(v, "A.ro-unchanged", same, "image bit-identical" if same else "image CHANGED by refused write/ro mount")
