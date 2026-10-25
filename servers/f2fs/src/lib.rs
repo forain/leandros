@@ -139,8 +139,8 @@ const SB_FEAT_INODE_CHKSUM: u32 = 0x20;
 const SB_DEVS0_PATH:       usize = 2201;
 /// Superblock features of a Linux volume that we can write safely: ATOMIC_WRITE,
 /// EXTRA_ATTR, PRJQUOTA, FLEXIBLE_INLINE_XATTR, INODE_CRTIME, LOST_FOUND,
-/// SB_CHKSUM. INODE_CHKSUM (0x20) is NOT here until inode checksums are kept.
-const FEAT_RW_OK: u32 = 0x4 | 0x8 | 0x10 | 0x40 | 0x100 | 0x200 | 0x800;
+/// SB_CHKSUM, INODE_CHKSUM (kept at write-back since lane f2fslxcsum).
+const FEAT_RW_OK: u32 = 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x100 | 0x200 | 0x800;
 /// Flip once linux_import preserves Linux's current-segment summaries.
 const NATIVE_IMPORT_SAFE: bool = false;
 const FEAT_BLKZONED: u32 = 0x2;
@@ -8458,8 +8458,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
     if sb.native {
         // Policy for volumes Linux made (design f2fslxrw section 3): anything
         // we cannot write back faithfully is mounted read-only. Inode
-        // checksums (feature 0x20) are not maintained yet: one write would
-        // invalidate every inode it touches.
+        // checksums (feature 0x20) are stamped at write-back (icsum_stamp).
         let bad = sb.feat & !FEAT_RW_OK;
         if bad != 0 || sb.segs_per_sec != 1 {
             dbg_str("[F2FS] Linux volume: feature mask ");
