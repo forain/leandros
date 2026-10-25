@@ -45,6 +45,7 @@
 //! | SimHidden | psk, h   | hidden-pass-1   | -58 | 6  |
 //! | SimFull   | psk, r   | full-pass-123   | -75 | 40 |
 //! | SimTkip   | psk, t   | tkip-pass-123   | -72 | 1  |
+//! | SimTkipOnly | psk, k | tkip-only-123   | -73 | 1  |
 //!
 //! Data paths: every virtio-net NIC whose MAC starts with 02:57:53 is one,
 //! in MAC order (`...:01` is path 1). An AP uses path 1 unless its flags
@@ -97,6 +98,8 @@ enum RsnVar {
     Plain,
     /// Group cipher TKIP, pairwise CCMP + TKIP (WPA/WPA2 mixed mode).
     TkipGroup,
+    /// Pure WPA/TKIP: group and pairwise TKIP only (not joinable).
+    TkipOnly,
     /// AKM 00-0f-ac:6 (PSK-SHA256) only, MFP capable.
     Sha256Only,
     /// PSK with management frame protection required (MFPC + MFPR).
@@ -226,6 +229,7 @@ fn apply_flags(a: &mut SimAp, flags: &str) {
             'r' => a.refuse_assoc = true,
             '1'..='4' => a.path = c as u8 - b'1',
             't' => a.rsn_var = RsnVar::TkipGroup,
+            'k' => a.rsn_var = RsnVar::TkipOnly,
             's' => a.rsn_var = RsnVar::Sha256Only,
             'm' => a.rsn_var = RsnVar::MfpRequired,
             'x' => a.rsn_var = RsnVar::FtOnly,
@@ -246,6 +250,7 @@ fn default_aps() -> Vec<SimAp> {
         ap(5, "SimHidden", Sec::Psk, "hidden-pass-1", -58, 6, "h"),
         ap(6, "SimFull", Sec::Psk, "full-pass-123", -75, 40, "r"),
         ap(7, "SimTkip", Sec::Psk, "tkip-pass-123", -72, 1, "t"),
+        ap(8, "SimTkipOnly", Sec::Psk, "tkip-only-123", -73, 1, "k"),
     ]
 }
 
@@ -296,6 +301,8 @@ fn ap_bss(a: &SimAp, reveal: bool) -> wf::Bss {
             RsnVar::TkipGroup => wf::RsnInfo { version: 1, group: wm::SUITE_TKIP,
                                                pairwise: alloc::vec![wm::SUITE_CCMP, wm::SUITE_TKIP],
                                                akm: alloc::vec![wm::AKM_PSK], caps: 0 },
+            RsnVar::TkipOnly => wf::RsnInfo { version: 1, group: wm::SUITE_TKIP, pairwise: alloc::vec![wm::SUITE_TKIP],
+                                              akm: alloc::vec![wm::AKM_PSK], caps: 0 },
             RsnVar::Sha256Only => wf::RsnInfo { version: 1, group: wm::SUITE_CCMP, pairwise: alloc::vec![wm::SUITE_CCMP],
                                                 akm: alloc::vec![wm::AKM_PSK_SHA256], caps: wm::RSN_CAP_MFPC },
             RsnVar::MfpRequired => wf::RsnInfo { version: 1, group: wm::SUITE_CCMP, pairwise: alloc::vec![wm::SUITE_CCMP],
@@ -395,7 +402,7 @@ pub fn init(cmdline: &str) {
               if a.ht { "" } else { "legacy " },
               if a.hidden { "hidden " } else { "" },
               if a.refuse_assoc { "refuses-assoc " } else if a.deauth_hs { "deauths-in-handshake " } else { "" },
-              match a.rsn_var { RsnVar::Plain => "", RsnVar::TkipGroup => "tkip-group ", RsnVar::Sha256Only => "psk-sha256-only ",
+              match a.rsn_var { RsnVar::Plain => "", RsnVar::TkipGroup => "tkip-group ", RsnVar::TkipOnly => "tkip-only ", RsnVar::Sha256Only => "psk-sha256-only ",
                                 RsnVar::MfpRequired => "mfp-required ", RsnVar::FtOnly => "ft-psk-only " },
               if a.path > 0 { alloc::format!("path {} ", a.path + 1) } else { String::new() }, wf::ssid_display(&a.ssid));
     }
@@ -1197,6 +1204,8 @@ fn selftest_main(level: u32) {
     let r = do_connect(connect_params(10, "SimTkip", akm::AUTO, "tkip-pass-123", 0));
     t.check("connect-tkip-group", r.is_ok() && MGR.state().akm == akm::PSK, alloc::format!("{:?}", r));
     let _ = disconnect(true);
+    let tko = find_bss("SimTkipOnly");
+    t.check("bss-tkip-only-not-joinable", tko.map_or(false, |b| b.ext & bss_ext::JOINABLE == 0), alloc::format!("{:?}", tko.map(|b| (b.ext, b.rsn_flags))));
     t.check("bss-hidden", hid.map_or(false, |b| b.ext & bss_ext::HIDDEN != 0 && b.ssid_len == 0), alloc::format!("{:?}", hid.map(|b| (b.ext, b.ssid_len))));
 
     // 2. A request right after a scan is answered from the cache.
