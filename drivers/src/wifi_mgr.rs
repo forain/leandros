@@ -101,8 +101,19 @@ pub const IEEE_REASON_8021X_FAILED: u16 = 23;
 
 /// Periodic background scan while disconnected and the radio is on.
 pub const IDLE_SCAN_MS: u64 = 30_000;
-/// Background scan while connected (only radios with SCAN_CONNECTED).
+/// Background (roaming) scan interval while connected (only radios with
+/// SCAN_CONNECTED), and only while the signal is below `ROAM_SCAN_DBM`:
+/// like Linux (no periodic scan while associated without a roaming
+/// trigger; NetworkManager's bgscan "simple" is signal-gated too).
 pub const CONNECTED_SCAN_MS: u64 = 120_000;
+/// A connected background scan needs the signal below this (dBm).
+pub const ROAM_SCAN_DBM: i32 = -75;
+
+/// Whether the connected loop should start a background scan `since_ms`
+/// after the last one, with the current signal `signal_dbm` (0 = unknown).
+pub fn connected_bg_scan_due(since_ms: u64, signal_dbm: i32) -> bool {
+    since_ms >= CONNECTED_SCAN_MS && signal_dbm != 0 && signal_dbm < ROAM_SCAN_DBM
+}
 /// FORCE still runs at most one fresh scan per this interval.
 pub const FORCE_MIN_MS: u64 = 2_000;
 /// Autoconnect uses the cache when it is this fresh, else scans first.
@@ -1523,7 +1534,8 @@ fn connected<R: Radio>(mgr: &Mgr, r: &mut R, req: &Req, bssid: [u8; 6]) -> After
         let cmd = match mgr.pop_cmd() {
             Some(c) => c,
             None => {
-                if r.caps() & wifi_caps::SCAN_CONNECTED != 0 && now - last_bg >= CONNECTED_SCAN_MS {
+                let dbm = mgr.st.lock().ws.signal_dbm as i32;
+                if r.caps() & wifi_caps::SCAN_CONNECTED != 0 && connected_bg_scan_due(now - last_bg, dbm) {
                     last_bg = now;
                     do_scan(mgr, r, &[], true, true, Some(bssid));
                 }

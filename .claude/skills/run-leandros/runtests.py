@@ -18,6 +18,7 @@ Options:
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              psklog   host:psklogtest.py alone (a cmdline wifi.psk= never reaches serial/klog/root or non-root /proc/cmdline)
                              pcibridge host:pcibridgetest.py alone (root port -> PCI bridge -> virtio-rng, own boot)
+                             blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
                                       (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
                                       + host:netroamtest.py (Wi-Fi roaming between two subnets, own boot) + host:netflaptest.py
@@ -163,6 +164,7 @@ SUITES = {
     "psklog": ["host:psklogtest.py"],
     # lane dtbres: devices behind PCIe root port -> PCI-PCI bridge (own boot).
     "pcibridge": ["host:pcibridgetest.py"],
+    "blkslow": ["host:blkslowtest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
     # NVMe command timeout: the driver resets the controller and the stalled
