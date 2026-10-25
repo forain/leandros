@@ -1818,6 +1818,11 @@ def main():
     p = f"../disks-rs/target/{_musl_triple}/release/disktester"
     if os.path.exists(p):
         bin_files.append(("disktester", p, 0o100755))
+    # ripgrep (`rg`), built UNMODIFIED from the sibling checkout; the image
+    # has no grep.
+    p = f"../ripgrep/target/{_musl_triple}/release/rg"
+    if os.path.exists(p):
+        bin_files.append(("rg", p, 0o100755))
 
     # spawnwedge: the musl thread/fork lock-handoff regression test (the
     # cosmic-comp keybinding wedge). A std/musl crate with its own build.sh

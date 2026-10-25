@@ -89,6 +89,8 @@ SUITES = {
                 "/bin/procmax", "/bin/syscalltest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/pstest",
                 # kexec tool: load + unload only (non-destructive).
                 "/bin/sh -c '/bin/kexec -l /boot/kexec --initrd=/boot/kexec-initrd --append=x && /bin/kexec -u'",
+                # ripgrep (rg): file match, recursive dir walk, stdin, exit codes 0/1.
+                "/bin/sh -c 'rg --version >/dev/null && rg -n root /etc/passwd >/dev/null && rg -l root /etc >/dev/null && echo foo | rg -q foo && { echo foo | rg -q zzz; [ $? -eq 1 ]; }'",
                 # su + sudo (sudo-rs): identity, groups, env, auth, policy.
                 "/bin/sudotest",
                 # Scheduler stress (lane percpu): lost wakes, stop/cont, group
