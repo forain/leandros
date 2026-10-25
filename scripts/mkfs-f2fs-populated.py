@@ -10,6 +10,8 @@ import os
 import subprocess
 import soundfont
 
+LX = os.environ.get("LEANDROS_F2FS_LX") == "1"
+
 BLOCK_SIZE     = 4096
 BLOCKS_PER_SEG = 512       # 2 MB segments (log_blocks_per_seg = 9)
 F2FS_MAGIC     = 0xF2F52010
@@ -2882,6 +2884,9 @@ def main():
         ino = _path_to_ino[image_dir]
         m4_tree_files_by_ino.setdefault(ino, []).append((name, content, mode))
 
+    if LX:
+        import f2fslxpop
+        lx_pop = f2fslxpop.Pop(max(dir_nodes) + 1)
     inode_blocks = {}
     data_blocks = {}
     
@@ -2902,6 +2907,9 @@ def main():
     
     def add_files_to_dir(parent_ino, files):
         nonlocal next_nid, next_blk
+        if LX:
+            lx_pop.add(parent_ino, files)
+            return
         for entry in files:
             # (name, host path or bytes, mode[, (uid, gid)]); root:root unless
             # the owner is given.
@@ -3115,6 +3123,13 @@ def main():
             m5_exec_by_ino.setdefault(ino, []).append((name, hostpath, 0o100755))
         for ino in sorted(m5_exec_by_ino):
             add_files_to_dir(ino, m5_exec_by_ino[ino])
+
+    if LX:
+        import time
+        t0 = time.time()
+        info = lx_pop.finish(out_file, total_segs, dir_nodes, dir_owner, subdirs, BUILD_TIME)
+        print(f"Created lx populated F2FS image at {out_file} in {time.time() - t0:.1f}s: {info}")
+        return
 
     # 5. Write directory blocks and inodes
     # Build dentry blocks list for each directory
