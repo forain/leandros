@@ -145,6 +145,7 @@ fn scan(ifarg: Option<&[u8]>) -> i32 {
     let ix = match ifarg { Some(a) => match n.resolve_if(a) { Ok(i) => i, Err(e) => return fail("interface", e) }, None => 0 };
     let mut s = NcScan::new();
     s.ifindex = ix;
+    s.flags = netctl_abi::scan_req_flags::USER;
     if let Err(e) = n.ioctl(NETCTL_SCAN, &mut s) { return fail("scan", e); }
     // Wait for SCAN_DONE (after the snapshot, which may carry an old one).
     let mut r = Reassembler::new();
