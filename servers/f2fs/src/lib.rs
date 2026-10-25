@@ -134,11 +134,13 @@ const SB_LOG_BLOCKSIZE:    usize = 16;
 const SB_SEGS_PER_SEC:     usize = 24;
 const SB_CP_PAYLOAD:       usize = 1664;
 const SB_FEATURE:          usize = 2180;
+const SB_UUID:             usize = 108;
+const SB_FEAT_INODE_CHKSUM: u32 = 0x20;
 const SB_DEVS0_PATH:       usize = 2201;
 /// Superblock features of a Linux volume that we can write safely: ATOMIC_WRITE,
 /// EXTRA_ATTR, PRJQUOTA, FLEXIBLE_INLINE_XATTR, INODE_CRTIME, LOST_FOUND,
-/// SB_CHKSUM. INODE_CHKSUM (0x20) is NOT here until inode checksums are kept.
-const FEAT_RW_OK: u32 = 0x4 | 0x8 | 0x10 | 0x40 | 0x100 | 0x200 | 0x800;
+/// SB_CHKSUM, INODE_CHKSUM (kept at write-back since lane f2fslxcsum).
+const FEAT_RW_OK: u32 = 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x100 | 0x200 | 0x800;
 /// Flip once linux_import preserves Linux's current-segment summaries.
 const NATIVE_IMPORT_SAFE: bool = false;
 const FEAT_BLKZONED: u32 = 0x2;
@@ -598,6 +600,9 @@ struct BlockCache {
     /// (a miss happened: the request's result will be discarded and its
     /// changes undone, so from here on nothing real is changed).
     probe: u8,
+    /// Linux INODE_CHKSUM volume: (checksum seed, NAT start block). Inode blocks get
+    /// their checksum stamped at write-back and verified when read (lane f2fslxcsum).
+    icsum: Option<(u32, u32)>,
     /// The misses of the current request (lane fsyncbatch): the first one,
     /// then every further distinct block the doomed run asked for, up to
     /// `MISS_BATCH`, as `(first block, block count)`. `with_mount` fetches
@@ -677,6 +682,7 @@ impl BlockCache {
             cp_wanted: false,
             backstop_force: drivers::nvidia_probe::cmdline_opt("f2fs.backstop_force").unwrap_or(0) as u64,
             probe: PROBE_OFF,
+            icsum: None,
             misses: [(0, 0); MISS_BATCH],
             nmiss: 0,
             dev_blocks: u64::MAX,
@@ -833,6 +839,7 @@ impl BlockCache {
         if i == usize::MAX { return false; }
         self.data_mut(i).copy_from_slice(&data[..BLOCK_SIZE]);
         self.install(i, blk);
+        if self.icsum.is_some() { self.icsum_verify(dev, i); }
         true
     }
 
@@ -1028,6 +1035,7 @@ impl BlockCache {
             }
         }
         let blk = self.meta[i].blk_no;
+        self.icsum_stamp(dev, i);
         io_write_block(dev, blk, self.data(i));
         // A later roll-forward record must not outrun this write.
         durable::EVICT_UNFLUSHED.store(true, atomic::Ordering::Release);
@@ -1082,7 +1090,60 @@ impl BlockCache {
             return None;
         }
         self.install(i, blk);
+        if self.icsum.is_some() { self.icsum_verify(dev, i); }
         Some(i)
+    }
+
+    /// Is slot `i` (a Linux node block) a checksummed inode block: the
+    /// footer names itself (nid == ino, offset 0), the inode has the extra
+    /// area, and the NAT maps that nid to this very block? Returns the
+    /// checksum seed. The NAT is peeked without loading anything into the
+    /// cache (no re-entrancy: no reference into the cache is kept).
+    fn icsum_is_inode(&self, dev: usize, i: usize) -> Option<u32> {
+        let (seed, nat) = self.icsum?;
+        let b = self.data(i);
+        let nid = r32(b, 4072);
+        if nid == 0 || nid != r32(b, 4076) || (r32(b, 4080) >> 3) != 0 { return None; }
+        if b[INO_INLINE] & F2FS_EXTRA_ATTR == 0 || r16(b, 360) < 12 { return None; }
+        let nb = nat as u64 + (nid / NAT_ENTRY_PER_BLK as u32) as u64;
+        let off = (nid % NAT_ENTRY_PER_BLK as u32) as usize * NAT_ENTRY_SIZE + 5;
+        let addr = match self.find(nb) {
+            Some(j) => r32(self.data(j), off),
+            None => {
+                let mut tmp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                tmp.try_reserve_exact(BLOCK_SIZE).ok()?;
+                tmp.resize(BLOCK_SIZE, 0);
+                let arr: &mut [u8; BLOCK_SIZE] = (&mut tmp[..]).try_into().ok()?;
+                if !io_read_block(IO_READ_MISS, dev, nb, arr) { return None; }
+                r32(arr, off)
+            }
+        };
+        if addr as u64 != self.meta[i].blk_no { return None; }
+        Some(seed)
+    }
+
+    /// Stamp the inode checksum into slot `i` if it holds a checksummed inode.
+    fn icsum_stamp(&mut self, dev: usize, i: usize) {
+        if self.icsum.is_none() { return; }
+        if let Some(seed) = self.icsum_is_inode(dev, i) {
+            let c = icsum_calc(seed, self.data(i));
+            w32(self.data_mut(i), ICSUM_OFF, c);
+        }
+    }
+
+    /// Verify the checksum of a freshly read inode block (counted; the first
+    /// mismatches are logged).
+    fn icsum_verify(&mut self, dev: usize, i: usize) {
+        if let Some(seed) = self.icsum_is_inode(dev, i) {
+            let b = self.data(i);
+            if icsum_calc(seed, b) == r32(b, ICSUM_OFF) {
+                let n = ICSUM_OK.fetch_add(1, atomic::Ordering::Relaxed) + 1;
+                if n.is_power_of_two() { dbg_str("[F2FS] inode checksum: verified ok "); dbg_dec(n as usize); dbg_str("\n"); }
+            } else {
+                let n = ICSUM_BAD.fetch_add(1, atomic::Ordering::Relaxed) + 1;
+                if n <= 8 { dbg_str("[F2FS] inode checksum MISMATCH nid "); dbg_dec(r32(b, 4072) as usize); dbg_str("\n"); }
+            }
+        }
     }
 
     fn read(&mut self, dev: usize, blk: u64) -> &[u8; BLOCK_SIZE] {
@@ -1125,6 +1186,7 @@ impl BlockCache {
             (0..self.meta.len()).filter(|&i| self.pinned(i)).collect();
         if idx.is_empty() { return; }
         idx.sort_unstable_by_key(|&i| self.meta[i].blk_no);
+        for &i in &idx { self.icsum_stamp(dev, i); }
         ACT_WB_TOTAL.store(idx.len() as u32, atomic::Ordering::Relaxed);
         ACT_WB_DONE.store(0, atomic::Ordering::Relaxed);
         let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -1180,6 +1242,27 @@ impl BlockCache {
     }
 }
 
+
+// ── Inode checksum (INODE_CHKSUM feature; lane f2fslxcsum) ───────────────────
+
+/// Offset of `i_inode_checksum` in a Linux inode (after i_extra_isize, i_inline_xattr_size, i_projid).
+const ICSUM_OFF: usize = 368;
+static ICSUM_OK: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+static ICSUM_BAD: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
+/// Linux `crc32_le(seed, data)` (no pre/post inversion).
+fn icsum_raw(seed: u32, data: &[u8]) -> u32 { !durable::crc32_upd(!seed, data) }
+
+/// Checksum of inode block `b`: crc(ino, i_generation @68, block with the
+/// checksum field read as zero).
+fn icsum_calc(seed: u32, b: &[u8; BLOCK_SIZE]) -> u32 {
+    let c = icsum_raw(seed, &b[4076..4080]);   // footer ino
+    let c = icsum_raw(c, &b[68..72]);
+    let c = icsum_raw(c, &b[..ICSUM_OFF]);
+    let c = icsum_raw(c, &[0u8; 4]);
+    icsum_raw(c, &b[ICSUM_OFF + 4..])
+}
+
 // ── Superblock info (parsed) ──────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
@@ -1201,6 +1284,8 @@ struct SbInfo {
     fmt: Fmt,
     /// Made by Linux's mkfs.f2fs (`init_version` starts "Linux version").
     native: bool,
+    /// Inode checksum seed: crc32_le(~0, sb.uuid).
+    icsum_seed: u32,
     /// Superblock `feature` bits.
     feat: u32,
     segs_per_sec: u32,
@@ -1219,6 +1304,7 @@ impl SbInfo {
         let native = sb[SB_INIT_VERSION..].starts_with(b"Linux version");
         Some(Self {
             native,
+            icsum_seed:      icsum_raw(!0, &sb[SB_UUID..SB_UUID + 16]),
             feat:            r32(sb, SB_FEATURE),
             segs_per_sec:    r32(sb, SB_SEGS_PER_SEC),
             cp_payload:      r32(sb, SB_CP_PAYLOAD),
@@ -3896,6 +3982,11 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
 /// recount free_segment_count (segments with no valid block, not a head).
 pub(crate) fn lx_cp_prep(ms: &mut MountState) {
     if !ms.sb.fmt.lx { return; }
+    if ms.cache.icsum.is_some() {
+        for i in 0..ms.cache.meta.len() {
+            if ms.cache.meta[i].dirty { let d = ms.dev; ms.cache.icsum_stamp(d, i); }
+        }
+    }
     let logs = linux_logs(ms, &[]);
     let mut free = 0u32;
     for seg in 0..ms.sb.seg_cnt_main {
@@ -8462,8 +8553,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
     if sb.native {
         // Policy for volumes Linux made (design f2fslxrw section 3): anything
         // we cannot write back faithfully is mounted read-only. Inode
-        // checksums (feature 0x20) are not maintained yet: one write would
-        // invalidate every inode it touches.
+        // checksums (feature 0x20) are stamped at write-back (icsum_stamp).
         let bad = sb.feat & !FEAT_RW_OK;
         if bad != 0 || sb.segs_per_sec != 1 {
             dbg_str("[F2FS] Linux volume: feature mask ");
@@ -8656,6 +8746,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
         core::ptr::addr_of_mut!((*p).open_paths).write(alloc::vec::Vec::new());
         core::ptr::addr_of_mut!((*p).cache).write(BlockCache::new(cache_cap()));
         (*p).cache.dev_blocks = sb.block_count;
+        if sb.fmt.lx && sb.feat & SB_FEAT_INODE_CHKSUM != 0 { (*p).cache.icsum = Some((sb.icsum_seed, sb.nat_blkaddr)); }
         // The emergency checkpoint's index arrays (never allocated later).
         let ecap = (*p).cache.cap * 2;
         let _ = (*p).dur.emerg_a.try_reserve_exact(ecap);
@@ -8806,6 +8897,13 @@ pub fn unmount(mount_point: &str) -> bool {
             if !ms.read_only {
                 for ino in core::mem::take(&mut ms.orphans) { reclaim_orphan(&mut ms, ino, true); }
                 write_checkpoint(&mut ms, true);
+            }
+            if ms.cache.icsum.is_some() {
+                dbg_str("[F2FS] inode checksums at unmount: ok ");
+                dbg_dec(ICSUM_OK.load(atomic::Ordering::Relaxed) as usize);
+                dbg_str(" bad ");
+                dbg_dec(ICSUM_BAD.load(atomic::Ordering::Relaxed) as usize);
+                dbg_str("\n");
             }
             let (cpw, inpl) = cache_backstop_counts();
             if cpw + inpl > 0 {
