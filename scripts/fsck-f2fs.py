@@ -49,7 +49,42 @@ CPJ_ORPHAN_CNT_OFF, CPJ_ORPHAN_OFF, CPJ_ORPHAN_MAX = 3364, 3368, (4092 - 3368) /
 
 
 def cp_crc_ok(b):
+    if r32(b, 164) == 4092:
+        return linux_crc(b[:4092]) == r32(b, 4092)
     return zlib.crc32(b[:4092]) == r32(b, 4092)
+
+
+def cp_legacy(b):
+    """A commit block from before lane f2fscrc: checksum_offset 0, zlib CRC,
+    journal and records may use the whole pack."""
+    return r32(b, 164) != 4092
+
+
+F2FS_MAGIC = 0xF2F52010
+LINUX_TAIL = 7      # 6 curseg summaries + the cp footer at the end of the pack
+LINUX_TAIL_V1 = 6   # lane f2fscrc packs with cp_pack_total_block_count 1
+
+
+def cp_tail(b):
+    """Blocks at the end of the pack the journal and records stay out of."""
+    if cp_legacy(b):
+        return 0
+    return LINUX_TAIL_V1 if r32(b, 136) <= 2 else LINUX_TAIL
+
+
+def linux_crc(data):
+    """Linux f2fs_crc32: crc32_le seeded with the magic, no inversion."""
+    return (~zlib.crc32(bytes(data), (~F2FS_MAGIC) & 0xFFFFFFFF)) & 0xFFFFFFFF
+
+
+def linux_crc_bitwise(data):
+    """The same, bit by bit (independent of zlib), for the guard."""
+    c = F2FS_MAGIC
+    for x in bytes(data):
+        c ^= x
+        for _ in range(8):
+            c = (c >> 1) ^ (0xEDB88320 if c & 1 else 0)
+    return c
 
 
 def r16(b, o): return struct.unpack_from("<H", b, o)[0]
@@ -113,8 +148,16 @@ class Vol:
             self.journal_blocks = len(jn)
             self.overlay = jn
         self.cp_ver = r64(cp, 0)
+        self.cp_raw = cp
+        self.cp_addr = self.cp_blk + (pack if pick1 else 0)
+        self.sb_raw = sb
         self.cur_node = (r32(cp, 36), r16(cp, 68))
         self.cur_data = (r32(cp, 84), r16(cp, 116))
+        if r32(cp, 164) == 4092:
+            # Linux-CRC checkpoint (lane f2fscrc3): the kernel's own log heads
+            # live at 3348; the standard fields hold heads Linux accepts.
+            self.cur_data = (r32(cp, 3348), r16(cp, 3356))
+            self.cur_node = (r32(cp, 3352), r16(cp, 3358))
         self.next_nid = r32(cp, 152)
         self.flags = r32(cp, 132)
         self.incompat = r32(cp, CPJ_INCOMPAT_OFF) if r32(cp, CPJ_MAGIC_OFF) == CPJ_MAGIC else 0
@@ -129,7 +172,7 @@ class Vol:
             return {}
         total, j, nx = r32(cpb, 3076), r32(cpb, 3080), r32(cpb, 3088)
         ext = [r32(cpb, 3092 + 4 * q) for q in range(min(nx, 64))]
-        cap = self.pack - 1
+        cap = self.pack - 1 - cp_tail(cpb)
         h = (j + 1019) // 1020
         if h + j != total or total > cap + 512 * len(ext):
             return None
@@ -169,6 +212,11 @@ class Vol:
         b = self.blk(self.nat_blk + nid // NAT_PER_BLK)
         o = (nid % NAT_PER_BLK) * NAT_ENTRY
         return r32(b, o + 5)
+
+    def sit_raw(self, seg):
+        b = self.blk(self.sit_blk + seg // SIT_PER_BLK)
+        o = (seg % SIT_PER_BLK) * SIT_ENTRY
+        return b[o:o + SIT_ENTRY]
 
     def sit(self, seg):
         b = self.blk(self.sit_blk + seg // SIT_PER_BLK)
@@ -408,16 +456,100 @@ class Fsck:
         print(f"churn data: {nfiles} files, {nbytes >> 10} KiB match their pattern")
 
 
+def linux_check(v):
+    """What Linux (6.12 f2fs_get_valid_checkpoint, sanity_check_ckpt,
+    restore_curseg_summaries, build_sit_entries, sanity_check_curseg) checks
+    of the checkpoint it would mount. [] if it would accept it."""
+    cp, sb, bps, main = v.cp_raw, v.sb_raw, v.bps, v.seg_cnt_main
+    bad = []
+    off = r32(cp, 164)
+    if off != 4092:
+        return [f"invalid crc_offset: {off}"]
+    if linux_crc_bitwise(cp[:4092]) != r32(cp, 4092):
+        bad.append("invalid crc value")
+    total = r32(cp, 136)
+    if total <= 2 or total > bps:  # F2FS_CP_PACKS < total <= blocks_per_seg
+        bad.append(f"invalid cp_pack_total_block_count: {total}")
+    else:
+        foot = v.raw(v.cp_addr + total - 1)
+        if r64(foot, 0) != r64(cp, 0) or r32(foot, 164) != 4092 or linux_crc(foot[:4092]) != r32(foot, 4092):
+            bad.append("cp footer does not match the header")
+    segs, ssa, sit, nat, ckpt = r32(sb, 48), r32(sb, 64), r32(sb, 56), r32(sb, 60), r32(sb, 52)
+    rsvd, ovp = r32(cp, 24), r32(cp, 28)
+    fsmeta = ckpt + sit + nat + rsvd + ssa
+    if fsmeta >= segs or fsmeta < 8 or ovp == 0 or rsvd == 0:
+        bad.append(f"Wrong layout (fsmeta {fsmeta}, ovp {ovp}, rsvd {rsvd})")
+    user, valid = r64(cp, 8), r64(cp, 16)
+    if user == 0 or user >= main * bps:
+        bad.append(f"Wrong user_block_count: {user}")
+    if valid > user:
+        bad.append(f"Wrong valid_user_blocks: {valid}, user_block_count: {user}")
+    node = [(r32(cp, 36 + 4 * i), r16(cp, 68 + 2 * i)) for i in range(3)]
+    data = [(r32(cp, 84 + 4 * i), r16(cp, 116 + 2 * i)) for i in range(3)]
+    for name, logs in (("Node", node), ("Data", data)):
+        for s_, o in logs:
+            if s_ >= main or o >= bps:
+                bad.append(f"{name} curseg out of range: ({s_}, {o})")
+    segnos = [s_ for s_, _ in node + data]
+    if len(set(segnos)) != 6:
+        bad.append(f"cursegs share a segment: {segnos}")
+    if r32(cp, 156) != ((sit // 2) * bps) // 8 or r32(cp, 160) != ((nat // 2) * bps) // 8:
+        bad.append("Wrong bitmap size")
+    # Linux 7.2 sanity_check_ckpt: the SIT version bitmap must cover every
+    # SIT block, which a single (unmirrored) SIT segment cannot give.
+    sit_blk_cnt = -(-main // 55)
+    if r32(cp, 156) * 8 < sit_blk_cnt:
+        bad.append(f"Wrong bitmap size: sit: {r32(cp, 156)}, sit_blk_cnt:{sit_blk_cnt}")
+    if 192 + r32(cp, 156) + r32(cp, 160) > 3072:
+        bad.append("version bitmaps overlap the LPJ1 extension")
+    ss = r32(cp, 140)
+    if ss < 1 or ss > bps - 1 - 6:
+        bad.append(f"Wrong cp_pack_start_sum: {ss}")
+    flags = r32(cp, 132)
+    if flags & 0x16:
+        bad.append(f"unsupported ckpt_flags {flags:#x} (orphan/compact/error)")
+    base = 6 if flags & 0x401 else 3
+    if 0 < total <= bps:
+        for t, lim, name in ((0, 38, "nat"), (2, 6, "sit")):
+            b = v.raw(v.cp_addr + total - (base + 1) + t)
+            if r16(b, 3584) > lim:
+                bad.append(f"invalid journal entries ({name} {r16(b, 3584)})")
+    nodes = tot = 0
+    for seg in range(main):
+        e = v.sit_raw(seg)
+        vb, ty = r16(e, 0) & 0x3FF, r16(e, 0) >> 10
+        tot += vb
+        if 3 <= ty <= 5:
+            nodes += vb
+    if nodes != r32(cp, 144):
+        bad.append(f"SIT is corrupted node# {nodes} vs {r32(cp, 144)}")
+    if tot > valid:
+        bad.append(f"SIT is corrupted data# {tot} vs {valid}")
+    for t, (s_, o) in enumerate(data + node):
+        at = cp[176 + t]
+        if at not in (0, 1) or s_ >= main or o >= bps:
+            bad.append(f"curseg {t}: alloc_type {at}") if at not in (0, 1) else None
+            continue
+        vm = v.sit_raw(s_)[2:66]
+        bit = lambda k: vm[k // 8] >> (7 - k % 8) & 1
+        if bit(o) or (at == 0 and any(bit(k) for k in range(o + 1, bps))):
+            bad.append(f"curseg {t} ({s_}, {o}) points at a valid block")
+    return bad
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 2
     img, churn, strict, strict_links = argv[0], None, False, False
+    linux = False
     i = 1
     while i < len(argv):
         if argv[i] == "--churn":
             churn = argv[i + 1]
             i += 2
+        elif argv[i] == "--linux":
+            linux = True
         elif argv[i] == "--strict-leaks":
             strict = True
             i += 1
@@ -456,6 +588,12 @@ def main(argv):
               f"(first {f.leaked[:8]})")
         if strict:
             f.errors.append("leaks")
+    lbad = linux_check(v)
+    for w in lbad[:10]:
+        print(("ERROR" if linux else "warning") + ": linux:", w)
+    print("linux checkpoint: " + ("ok" if not lbad else f"REJECTED ({len(lbad)})"))
+    if linux and lbad:
+        f.errors.append("linux")
     print("fsck-f2fs: " + ("PASS" if not f.errors else f"FAIL ({len(f.errors)} errors)"))
     return 0 if not f.errors else 1
 
