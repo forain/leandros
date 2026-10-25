@@ -489,9 +489,20 @@ pub struct TeTrack {
 impl TeTrack {
     pub const fn new() -> Self { TeTrack { running: None, last_end: None } }
     /// TIME_EVENT_CMD ADD answered status 0 with `uid`.
-    pub fn on_add(&mut self, uid: u32) { self.running = Some(uid); }
-    /// TIME_EVENT_NOTIFICATION (unique_id, action, status).
-    pub fn on_notif(&mut self, _uid: u32, _action: u32, _status: u32) {}
+    /// An END already seen for `uid` (dispatched while the response was
+    /// awaited) means it is not running.
+    pub fn on_add(&mut self, uid: u32) {
+        self.running = if self.last_end == Some(uid) { None } else { Some(uid) };
+    }
+    /// TIME_EVENT_NOTIFICATION (unique_id, action, status): an END, or a
+    /// START that failed (status != 1), means the firmware dropped the event
+    /// (iwl_mvm_te_handle_notif -> iwl_mvm_te_clear_data).
+    pub fn on_notif(&mut self, uid: u32, action: u32, status: u32) {
+        let gone = action & 2 != 0 || (action & 1 != 0 && status != 1);
+        if !gone { return; }
+        self.last_end = Some(uid);
+        if self.running == Some(uid) { self.running = None; }
+    }
     /// The unique id a TIME_EVENT_CMD REMOVE may name (None: nothing to remove).
     pub fn remove_uid(&self) -> Option<u32> { self.running }
     pub fn removed(&mut self) { self.running = None; }
@@ -520,10 +531,14 @@ pub enum TeardownStep {
 pub fn teardown_plan(bound: bool, sta: bool, te: Option<u32>) -> Vec<TeardownStep> {
     use TeardownStep::*;
     let mut v = Vec::new();
-    if let Some(u) = te { v.push(RemoveTimeEvent(u)); }
-    if sta { v.push(FlushTx); }
+    // iwlmvm: mac80211 flushes, iwl_mvm_rm_sta flushes + drains and
+    // disables the queues (BA sessions are gone with them), the AP station
+    // is removed only once the MAC is unassociated (firmware refuses it
+    // before), the time event only while running, the binding last.
+    if sta { v.push(FlushTx); v.push(DisableQueues); }
     if bound { v.push(MacUnassoc); }
-    if sta { v.push(DisableQueues); v.push(RemoveSta); }
+    if sta { v.push(RemoveSta); }
+    if let Some(u) = te { v.push(RemoveTimeEvent(u)); }
     if bound { v.push(Unbind); }
     v
 }
