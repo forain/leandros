@@ -157,6 +157,35 @@ unsafe fn cmd_delete(name: *const u8, path: *const u8) -> i32 {
     0
 }
 
+/// `xattr -X NAME FILE`: print the value as lowercase hex on one line.
+unsafe fn cmd_print_hex(name: *const u8, path: *const u8) -> i32 {
+    let need = raw_getxattr(path, name, core::ptr::null_mut(), 0);
+    if need < 0 { return fail(b"getxattr"); }
+    let buf = malloc(need as usize + 1);
+    if buf.is_null() { errw(b"xattr: out of memory\n"); return 1; }
+    let got = raw_getxattr(path, name, buf, need as usize);
+    if got < 0 { return fail(b"getxattr"); }
+    let d = core::slice::from_raw_parts(buf, got as usize);
+    let hex = b"0123456789abcdef";
+    for &b in d { out(&[hex[(b >> 4) as usize], hex[(b & 15) as usize]]); }
+    out(b"\n");
+    0
+}
+
+/// `xattr -W NAME HEX FILE`: set an attribute from a hex string (binary values).
+unsafe fn cmd_write_hex(name: *const u8, hexs: *const u8, path: *const u8) -> i32 {
+    let n = strlen(hexs);
+    if n % 2 != 0 { errw(b"xattr: odd hex length\n"); return 1; }
+    let buf = malloc(n / 2 + 1);
+    if buf.is_null() { errw(b"xattr: out of memory\n"); return 1; }
+    let nib = |c: u8| -> u8 { match c { b'0'..=b'9' => c - b'0', b'a'..=b'f' => c - b'a' + 10, b'A'..=b'F' => c - b'A' + 10, _ => 0 } };
+    for i in 0..n / 2 {
+        *buf.add(i) = (nib(*hexs.add(2 * i)) << 4) | nib(*hexs.add(2 * i + 1));
+    }
+    if raw_setxattr(path, name, buf, n / 2) != 0 { return fail(b"setxattr"); }
+    0
+}
+
 const USAGE: &[u8] =
     b"usage: xattr FILE | xattr -p NAME FILE | xattr -w NAME VALUE FILE | xattr -d NAME FILE\n";
 
@@ -172,6 +201,14 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if ceq(a1, b"-p\0") {
         if argc != 4 { errw(USAGE); return 1; }
         return cmd_print(arg(argv, argc, 2), arg(argv, argc, 3));
+    }
+    if ceq(a1, b"-X\0") {
+        if argc != 4 { errw(USAGE); return 1; }
+        return cmd_print_hex(arg(argv, argc, 2), arg(argv, argc, 3));
+    }
+    if ceq(a1, b"-W\0") {
+        if argc != 5 { errw(USAGE); return 1; }
+        return cmd_write_hex(arg(argv, argc, 2), arg(argv, argc, 3), arg(argv, argc, 4));
     }
     if ceq(a1, b"-w\0") {
         if argc != 5 { errw(USAGE); return 1; }
