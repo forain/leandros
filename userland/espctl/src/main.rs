@@ -686,6 +686,53 @@ fn cmd_timeout(o: &Opts) -> io::Result<()> {
     })
 }
 
+/// Remove `wifi.psk=` / `iwlwifi.psk=` tokens from every line of a conf.
+/// The PSK lives in /etc/leandros/wifi.conf; it must not sit on the ESP.
+fn strip_psk(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if !line.contains(".psk=") {
+            out.push_str(line);
+            continue;
+        }
+        let nl = line.ends_with('\n');
+        let body = line.trim_end_matches('\n');
+        let kept: Vec<&str> = body
+            .split(' ')
+            .filter(|t| !(t.starts_with("wifi.psk=") || t.starts_with("iwlwifi.psk=")))
+            .collect();
+        out.push_str(&kept.join(" "));
+        if nl {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Scrub PSK tokens from /leandros/factory.conf and limine.conf (old stick
+/// layouts carried `wifi.psk=` in the flashed cmdline).
+fn cmd_scrub_psk(o: &Opts) -> io::Result<()> {
+    let esp = open_esp(o, true)?;
+    let st = load_state(&esp)?;
+    if st.factory_saved {
+        let f = esp.read(|fs| read_file(fs, FACTORY_CONF))?;
+        let f = String::from_utf8_lossy(&f).into_owned();
+        let clean = strip_psk(&f);
+        if clean != f {
+            esp.step(|fs| write_file(fs, FACTORY_CONF, clean.as_bytes()))?;
+            println!("factory.conf: psk tokens removed");
+        }
+    }
+    let clean = strip_psk(&st.text);
+    if clean != st.text {
+        commit_conf(&esp, &st, &clean)?;
+        println!("limine.conf: psk tokens removed");
+    } else {
+        println!("limine.conf: no psk tokens");
+    }
+    Ok(())
+}
+
 /// Put the flashed limine.conf back and remove every slot.
 fn cmd_reset(o: &Opts) -> io::Result<()> {
     let esp = open_esp(o, true)?;
@@ -994,6 +1041,7 @@ const USAGE: &str = "usage: espctl [--dev /dev/<esp>] <command>
   oneshot <entry> <save> boot a foreign Limine entry once (it must restore <save>)
   oneshot-restore <save> put a config saved by oneshot back
   reset                  restore the flashed limine.conf, remove all slots
+  scrub-psk              remove wifi.psk= tokens from limine.conf and factory.conf
   boot                   init's per-boot hook (one-shot disarm, key import)
   import-keys            ESP /leandros/authorized_keys -> /root/.ssh/authorized_keys
   parts                  partitions of every disk (esp, log, home, ...)
@@ -1028,6 +1076,7 @@ fn main() {
         "oneshot-restore" => cmd_oneshot_restore(&o),
         "cmdline" => cmd_cmdline(&o),
         "reset" => cmd_reset(&o),
+        "scrub-psk" => cmd_scrub_psk(&o),
         "boot" => cmd_boot(&o),
         "import-keys" => cmd_import_keys(&o),
         "parts" => cmd_parts(&o),

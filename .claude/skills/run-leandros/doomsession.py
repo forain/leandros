@@ -61,6 +61,11 @@ VT_KEY = os.environ.get("DOOMSESSION_VT_KEY", "esc")
 # --assert-vt: exit 1 unless the game drew on the text VT, the desktop came
 # back on its VT, and the game came back after the round trip (L12 #56).
 ASSERT_VT = "--assert-vt" in A
+# How the text-VT phase gets there (L12 #56): "chord" = Ctrl+Alt+Fn and a
+# console login, as a user does; "chvt" = root on the serial shell runs
+# `vttest chvt N` and starts the game itself, as the laptop check (gv.sh over
+# ssh) does. The game then has no controlling tty on the VT.
+VT_VIA = os.environ.get("DOOMSESSION_VT_VIA", "chord")
 VT_MIN = 0.1
 DOOM_ENV = opt("--doom-env", "")
 DOOM_ARGS = opt("--doom-args", "")  # e.g. "-nosfx" for a music-only capture
@@ -317,17 +322,24 @@ def main():
         desk_vt = int(m.group(1)) if m else 1
         tvt = 2 if desk_vt == 1 else 1
         log(f"COSMIC is on VT {desk_vt}; text VT is {tvt}")
-        driver.qmp_inject_chord(["ctrl", "alt", f"f{tvt}"])
+        if VT_VIA == "chvt":
+            sh(f"/bin/vttest chvt {tvt}", 30)
+        else:
+            driver.qmp_inject_chord(["ctrl", "alt", f"f{tvt}"])
         SER.pump(3 * SCALE)
-        # Console login on the text VT, as the user does. The VT's getty is
-        # already at "login:"; an extra Enter here would answer it empty.
-        typ("leandro"); key("ret")
-        SER.pump(2 * SCALE)
-        typ("leandro"); key("ret")
-        SER.pump(5 * SCALE)
+        if VT_VIA != "chvt":
+            # Console login on the text VT, as the user does. The VT's getty is
+            # already at "login:"; an extra Enter here would answer it empty.
+            typ("leandro"); key("ret")
+            SER.pump(2 * SCALE)
+            typ("leandro"); key("ret")
+            SER.pump(5 * SCALE)
         tv = shot("textvt")
         vtstat("textvt")
-        typ(VT_CMD + " >/tmp/doom2.log 2>&1"); key("ret")
+        if VT_VIA == "chvt":
+            sh("(cd /; exec /bin/" + VT_CMD + " </dev/null >/tmp/doom2.log 2>&1 &)", 30)
+        else:
+            typ(VT_CMD + " >/tmp/doom2.log 2>&1"); key("ret")
         a1 = wav_mark()
         SER.pump(12 * SCALE)
         tvd = shot("textvt-doom")
@@ -338,14 +350,22 @@ def main():
         SER.pump(2 * SCALE)
         tvm = shot("textvt-doom-menu")
         analyse("textvt-doom-menu-vs-prev", tvm, tvd)
-        vtstat("textvt-doom")
-        driver.qmp_inject_chord(["ctrl", "alt", f"f{desk_vt}"])
+        vt_game = vtstat("textvt-doom")
+        m = re.search(r"^active (\d+)", vt_game, re.M)
+        RESULT["textvt-active"] = int(m.group(1)) if m else -1
+        if VT_VIA == "chvt":
+            sh(f"/bin/vttest chvt {desk_vt}", 30)
+        else:
+            driver.qmp_inject_chord(["ctrl", "alt", f"f{desk_vt}"])
         SER.pump(5 * SCALE)
         back = shot("desktop-back")
         analyse("desktop-back-vs-textvtdoom", back, tvd)
         analyse("desktop-back-vs-term", back, term)
         vtstat("desktop-back")
-        driver.qmp_inject_chord(["ctrl", "alt", f"f{tvt}"])
+        if VT_VIA == "chvt":
+            sh(f"/bin/vttest chvt {tvt}", 30)
+        else:
+            driver.qmp_inject_chord(["ctrl", "alt", f"f{tvt}"])
         SER.pump(5 * SCALE)
         again = shot("textvt-doom-again")
         analyse("textvt-doom-again", again, tv)
@@ -371,6 +391,8 @@ def main():
         def frac(k):
             return RESULT.get(k, {}).get("changed_frac", -1)
         checks = [
+            ("text VT stayed on screen while the game ran",
+             RESULT.get("textvt-active") == tvt),
             ("game drew on the text VT", frac("textvt-doom") > VT_MIN),
             ("game back after VT round trip", frac("textvt-doom-again") > VT_MIN),
             ("desktop VT differs from game", frac("desktop-back-vs-textvtdoom") > VT_MIN),
