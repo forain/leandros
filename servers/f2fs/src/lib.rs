@@ -382,7 +382,55 @@ fn inode_addr_end(f: Fmt, blk: &[u8]) -> usize {
     if !f.lx { return f.nids(); }
     let fl = blk[INO_INLINE];
     if fl & (F2FS_INLINE_DATA | F2FS_INLINE_DENTRY) != 0 { return 0; }
-    if fl & F2FS_INLINE_XATTR != 0 { f.nids() - 50 * 4 } else { f.nids() }
+    f.nids() - inline_xattr_bytes(blk)
+}
+
+/// Bytes of inline xattr area at the end of the i_addr area: 50 slots by
+/// default, `i_inline_xattr_size` (union+2) with FLEXIBLE_INLINE_XATTR.
+fn inline_xattr_bytes(blk: &[u8]) -> usize {
+    if blk[INO_INLINE] & F2FS_INLINE_XATTR == 0 { return 0; }
+    // lx only (callers check). The size field exists only with an extra area.
+    let sz = if blk[INO_INLINE] & F2FS_EXTRA_ATTR != 0 && r16(blk, 360 + 0) >= 8 { r16(blk, 360 + 2) as usize } else { 50 };
+    if sz == 0 || sz > 200 { 50 * 4 } else { sz * 4 }
+}
+
+/// The inline area of a Linux inode (design f2fslxrw S1): after i_addr[0],
+/// before the inline xattrs. (start, end).
+fn inline_area(f: Fmt, blk: &[u8]) -> (usize, usize) {
+    let st = inode_addr_base(f, blk) + 4;
+    let en = f.nids() - inline_xattr_bytes(blk);
+    (st, en.max(st))
+}
+
+/// Inline dentry layout of an area of `len` bytes: (NR, bitmap bytes,
+/// dentry array offset, name array offset), offsets relative to the area.
+fn inline_dentry_layout(len: usize) -> (usize, usize, usize, usize) {
+    let nr = len * 8 / (19 * 8 + 1);
+    let bm = nr.div_ceil(8);
+    let reserved = len - bm - nr * 19;
+    (nr, bm, bm + reserved, bm + reserved + nr * 11)
+}
+
+/// `iblk` is a Linux inode with inline dentries.
+fn lx_inline_dir(f: Fmt, iblk: &[u8]) -> bool { f.lx && iblk[INO_INLINE] & F2FS_INLINE_DENTRY != 0 }
+
+/// Lookup in an inline directory.
+fn inline_dir_find(f: Fmt, iblk: &[u8], name: &[u8]) -> (u32, u8) {
+    let (st, en) = inline_area(f, iblk);
+    let a = &iblk[st..en];
+    let (nr, _bm, eo, no) = inline_dentry_layout(a.len());
+    let mut slot = 0usize;
+    while slot < nr {
+        if a[slot / 8] & (1 << (slot % 8)) == 0 { slot += 1; continue; }
+        let e = eo + slot * 11;
+        let nl = r16(a, e + 8) as usize;
+        let n = no + slot * 8;
+        if nl == name.len() && n + nl <= a.len() && &a[n..n + nl] == name {
+            return (r32(a, e + 4), f.dentry_dt(a[e + 10]));
+        }
+        slot += nl.div_ceil(8).max(1);
+    }
+    (0, 0)
 }
 
 fn inode_get_blkaddr(f: Fmt, blk: &[u8], idx: usize) -> u32 {
@@ -1604,6 +1652,7 @@ fn io_charge(kind: usize, t0: u64) {
 fn io_read_block(kind: usize, dev: usize, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool {
     let t0 = sched::monotonic_ns();
     let r = virtio_blk::read_block(dev, blk, buf);
+    if r { ro_overlay_patch(dev, blk, &mut buf[..]); }
     io_charge(kind, t0);
     r
 }
@@ -2038,6 +2087,7 @@ fn fetch_read(dev: usize, r: FetchRange) -> Option<(alloc::vec::Vec<u8>, bool)> 
     } else {
         virtio_blk::read_blocks(dev, r.blk, &mut buf)
     };
+    if ok { ro_overlay_patch(dev, r.blk, &mut buf); }
     NOIO_FETCHES.fetch_add(1, atomic::Ordering::Relaxed);
     NOIO_FETCH_MAX_NS.fetch_max(sched::monotonic_ns().saturating_sub(t0), atomic::Ordering::Relaxed);
     Some((buf, ok))
@@ -3285,7 +3335,40 @@ fn cp_is_foreign(sb: &SbInfo, b: &[u8; BLOCK_SIZE]) -> bool {
 /// leaves the Linux checkpoint newest and this runs again on the same input.
 /// Returns the number of blocks copied plus journal entries applied.
 macro_rules! bail { ($s:literal) => {{ dbg_str(concat!("[F2FS] linux_import gave up at ", $s, "\n")); return None; }} }
-fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64) -> Option<usize> {
+/// Read-only import of a Linux checkpoint (design f2fslxrw S6): the SIT/NAT
+/// blocks `linux_import` patches live here, never on the device. Every cache
+/// fill goes through `ro_overlay_patch`, so an evicted block comes back
+/// patched; nothing in the overlay is ever dirty, so nothing is written back.
+static RO_OVERLAY: Mutex<alloc::collections::BTreeMap<(usize, u64), Box<[u8; BLOCK_SIZE]>>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+
+fn ro_overlay_clear(dev: usize) { RO_OVERLAY.lock().retain(|k, _| k.0 != dev); }
+
+fn ro_overlay_put(dev: usize, blk: u64, b: &[u8; BLOCK_SIZE]) {
+    RO_OVERLAY.lock().insert((dev, blk), Box::new(*b));
+}
+
+/// Patch `buf` (the blocks `blk..` just read from the device) from the overlay.
+fn ro_overlay_patch(dev: usize, blk: u64, buf: &mut [u8]) {
+    let m = RO_OVERLAY.lock();
+    if m.is_empty() { return; }
+    for (i, c) in buf.chunks_exact_mut(BLOCK_SIZE).enumerate() {
+        if let Some(p) = m.get(&(dev, blk + i as u64)) { c.copy_from_slice(&p[..]); }
+    }
+}
+
+fn ro_overlay_read(dev: usize, blk: u64, b: &mut [u8; BLOCK_SIZE]) -> bool {
+    if !virtio_blk::read_block(dev, blk, b) { return false; }
+    ro_overlay_patch(dev, blk, b);
+    true
+}
+
+fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro: bool) -> Option<usize> {
+    // ro: the patched SIT/NAT blocks go to the RO_OVERLAY (read back by every
+    // cache fill, never written); the device is not written at all.
+    if ro { ro_overlay_clear(dev); }
+    let rd = |a: u64, b: &mut [u8; BLOCK_SIZE]| if ro { ro_overlay_read(dev, a, b) } else { virtio_blk::read_block(dev, a, b) };
+    let wr = |a: u64, b: &[u8; BLOCK_SIZE]| if ro { ro_overlay_put(dev, a, b); true } else { virtio_blk::write_block(dev, a, b) };
     let bps = sb.blocks_per_seg as u64;
     let flags = r32(cp, CP_CKPT_FLAGS);
     let sit_sz = r32(cp, CP_SIT_BM_SIZE) as usize;
@@ -3299,7 +3382,7 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64) ->
     let mut blk = [0u8; BLOCK_SIZE];
     let mut n = 0usize;
     let copy = |from: u64, to: u64, blk: &mut [u8; BLOCK_SIZE]| -> bool {
-        virtio_blk::read_block(dev, from, blk) && virtio_blk::write_block(dev, to, blk)
+        rd(from, blk) && wr(to, blk)
     };
     let sit_half = (sb.seg_cnt_sit / 2) as u64 * bps;
     for i in 0..(sit_sz * 8).min(sit_half as usize) {
@@ -3342,9 +3425,9 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64) ->
         if nid as u64 >= bps * NAT_ENTRY_PER_BLK as u64 { bail!("nat-nid-range"); }
         let a = sb.nat_blkaddr as u64 + (nid / NAT_ENTRY_PER_BLK as u32) as u64;
         let o = (nid % NAT_ENTRY_PER_BLK as u32) as usize * NAT_ENTRY_SIZE;
-        if !virtio_blk::read_block(dev, a, &mut blk) { bail!("nat-read"); }
+        if !rd(a, &mut blk) { bail!("nat-read"); }
         blk[o..o + NAT_ENTRY_SIZE].copy_from_slice(&nat_j[e + 4..e + 4 + NAT_ENTRY_SIZE]);
-        if !virtio_blk::write_block(dev, a, &blk) { bail!("nat-write"); }
+        if !wr(a, &blk) { bail!("nat-write"); }
         n += 1;
     }
     let n_sits = (r16(&sit_j, 0) as usize).min((JSZ - 2) / (4 + SIT_ENTRY_SIZE));
@@ -3354,12 +3437,12 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64) ->
         if seg >= sb.seg_cnt_main { bail!("sit-seg-range"); }
         let a = sb.sit_blkaddr as u64 + (seg / SIT_PER_BLK as u32) as u64;
         let o = (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE;
-        if !virtio_blk::read_block(dev, a, &mut blk) { bail!("sit-read"); }
+        if !rd(a, &mut blk) { bail!("sit-read"); }
         blk[o..o + SIT_ENTRY_SIZE].copy_from_slice(&sit_j[e + 4..e + 4 + SIT_ENTRY_SIZE]);
-        if !virtio_blk::write_block(dev, a, &blk) { bail!("sit-write"); }
+        if !wr(a, &blk) { bail!("sit-write"); }
         n += 1;
     }
-    if !virtio_blk::flush(dev) { bail!("flush"); }
+    if !ro && !virtio_blk::flush(dev) { bail!("flush"); }
     Some(n)
 }
 
@@ -5190,6 +5273,23 @@ fn read_file_data_planned(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8,
     if pos >= fsize { return 0; }
     let readable = (fsize - pos).min(count as u64) as usize;
     let mut done = 0usize;
+    if ms.sb.fmt.lx && iblk_copy[INO_INLINE] & F2FS_INLINE_DATA != 0 {
+        // Inline data: the bytes live in the inode block (design f2fslxrw S1).
+        let (st, en) = inline_area(ms.sb.fmt, &iblk_copy);
+        let have = if iblk_copy[INO_INLINE] & 0x08 != 0 { (en - st) as u64 } else { 0 };
+        while done < readable {
+            let o = pos + done as u64;
+            let c = (readable - done).min(512);
+            let mut tmp = [0u8; 512];
+            if o < have {
+                let n = c.min((have - o) as usize);
+                tmp[..n].copy_from_slice(&iblk_copy[st + o as usize..st + o as usize + n]);
+            }
+            unsafe { sched::uaccess::copy_raw(buf.add(done), tmp.as_ptr(), c); }
+            done += c;
+        }
+        return done;
+    }
 
     while done < readable {
         let file_off = pos + done as u64;
@@ -5657,6 +5757,7 @@ fn dir_lookup_ft(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> (u32, u8) {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
         let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
     };
+    if lx_inline_dir(ms.sb.fmt, &iblk_copy) { return inline_dir_find(ms.sb.fmt, &iblk_copy, name); }
     if lx_inline_refused(ms.sb.fmt, &iblk_copy, dir_ino) { ms.walk_err = -5; return (0, 0); } // EIO, not ENOENT
     let fsize = inode_size(&iblk_copy);
     let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
@@ -6344,8 +6445,8 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         if ms.sb.fmt.lx {
             let ia = nat_lookup(ms, ino);
             if ia != 0 {
-                let refused = { let b = ms.cache.read(ms.dev, ia as u64); lx_inline_refused(ms.sb.fmt, b, ino) };
-                if refused { return err_reply(-5); } // EIO
+                let refused = (writable || (flags & O_TRUNC) != 0) && { let b = ms.cache.read(ms.dev, ia as u64); lx_inline_refused(ms.sb.fmt, b, ino) };
+                if refused && (writable || (flags & O_TRUNC) != 0) { return err_reply(-5); } // EIO (inline write: S2)
             }
         }
         // Permission gate for opening an *existing* object. handle_open used to
@@ -6566,12 +6667,15 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64,
     };
     if !inode_is_dir(&iblk_copy) { return (err_reply(-20), current_pos); } // ENOTDIR
 
+    let inl = lx_inline_dir(ms.sb.fmt, &iblk_copy);
+    let (ist, ien) = inline_area(ms.sb.fmt, &iblk_copy);
+    let (inr, ibm, ieo, ino_) = inline_dentry_layout(ien - ist);
     let fsize = inode_size(&iblk_copy);
-    let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
+    let n_data_blks = if inl { 1 } else { fsize.div_ceil(BLOCK_SIZE as u64) as usize };
 
     let mut written = 0usize;
     let max = count as usize;
-    let per_blk = NR_DENTRY_IN_BLK as u64;
+    let per_blk = if inl { inr as u64 } else { NR_DENTRY_IN_BLK as u64 };
     let first_blk = (current_pos / per_blk) as usize;
     let mut pos = current_pos;
 
@@ -6581,22 +6685,26 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64,
         let blk_base = blk_idx as u64 * per_blk;
         let mut slot_idx = if blk_idx == first_blk { (current_pos - blk_base) as usize } else { 0 };
         pos = blk_base + slot_idx as u64;
-        let phys = inode_logical_to_phys(ms, dir_ino, blk_idx as u64);
+        let phys = if inl { 1 } else { inode_logical_to_phys(ms, dir_ino, blk_idx as u64) };
         if phys == 0 { pos = blk_base + per_blk; continue; }
-        let dblk = ms.cache.read(ms.dev, phys as u64);
-        let dblk = unsafe { &*(dblk as *const [u8; BLOCK_SIZE]) };
+        let dblk: &[u8; BLOCK_SIZE] = if inl { &iblk_copy } else {
+            let d = ms.cache.read(ms.dev, phys as u64);
+            unsafe { &*(d as *const [u8; BLOCK_SIZE]) }
+        };
+        let (bm_base, ent_base, nm_base, nbm) = if inl { (ist, ist + ieo, ist + ino_, ibm) }
+            else { (0, DENTRY_ENTRIES_OFF, DENTRY_NAMES_OFF, DENTRY_BITMAP_SIZE) };
 
-        while slot_idx < NR_DENTRY_IN_BLK {
+        while (slot_idx as u64) < per_blk {
             let byte = slot_idx / 8;
             let bit  = slot_idx % 8;
-            if byte >= DENTRY_BITMAP_SIZE { break; }
-            if (dblk[byte] & (1 << bit)) == 0 { slot_idx += 1; continue; }
+            if byte >= nbm { break; }
+            if (dblk[bm_base + byte] & (1 << bit)) == 0 { slot_idx += 1; continue; }
 
-            let e_off    = DENTRY_ENTRIES_OFF + slot_idx * DENTRY_ENTRY_SIZE;
+            let e_off    = ent_base + slot_idx * DENTRY_ENTRY_SIZE;
             let child_ino = r32(dblk, e_off + 4) as u64;
             let name_len  = r16(dblk, e_off + 8) as usize;
             let ftype     = ms.sb.fmt.dentry_dt(dblk[e_off + 10]);
-            let n_off     = DENTRY_NAMES_OFF + slot_idx * DENTRY_SLOT_LEN;
+            let n_off     = nm_base + slot_idx * DENTRY_SLOT_LEN;
             // A used slot with no name is the tail of a long name (a position
             // can land there if the entry was created after it was handed out):
             // step over it the way Linux f2fs does.
@@ -8361,25 +8469,23 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
             read_only = true;
         }
     }
-    if foreign && sb.native && !NATIVE_IMPORT_SAFE {
-        // Measured (lane f2fslxsafe): even a mount that only reads makes
-        // `linux_import` commit a checkpoint that drops Linux's six current
-        // segment summaries, and fsck.f2fs then fails on the volume. Until
-        // those are carried over (design f2fslxrw S4) and a real read-only
-        // path exists (S6), a Linux-made volume is not mounted at all.
+    if sb.native && !NATIVE_IMPORT_SAFE && !read_only {
+        // Writing a Linux-made volume still corrupts it (Linux's current
+        // segment summaries are not carried over, design f2fslxrw S4): a plain
+        // mount is downgraded to the true read-only mount (S6).
         dbg_str("[F2FS] ");
         dbg_str(virtio_blk::dev_path(dev_idx));
-        dbg_str(": Linux-made volume not supported yet (mounting would corrupt it); refusing the mount. Use it on Linux\n");
-        return None;
+        dbg_str(": Linux-made volume; read-write is not supported yet, mounting read-only\n");
+        read_only = true;
     }
     if foreign {
-        if read_only || unknown != 0 {
-            dbg_str("[F2FS] the newest checkpoint was written by Linux; mount read-write once to import it\n");
+        if unknown != 0 {
+            dbg_str("[F2FS] the newest checkpoint carries unknown features; not mounting\n");
             return None;
         }
         let cp_addr = (sb.cp_blkaddr + if pick1 { pack_blks } else { 0 }) as u64;
-        match linux_import(dev_idx, &sb, pbuf, cp_addr) {
-            Some(n) => { dbg_str("[F2FS] imported a Linux checkpoint: "); dbg_dec(n); dbg_str(" SIT/NAT block(s)/entries\n"); }
+        match linux_import(dev_idx, &sb, pbuf, cp_addr, read_only) {
+            Some(n) => { dbg_str("[F2FS] imported a Linux checkpoint: "); dbg_dec(n); dbg_str(" SIT/NAT block(s)/entries"); dbg_str(if read_only { " (read-only, in memory)\n" } else { "\n" }); }
             None => { dbg_str("[F2FS] cannot import the Linux checkpoint; not mounting\n"); return None; }
         }
     }
@@ -8612,6 +8718,7 @@ pub fn unmount(mount_point: &str) -> bool {
                 dbg_str("\n");
             }
             CP_SEQ[slot_idx].port.store(0, atomic::Ordering::Release);
+            ro_overlay_clear(ms.dev);
             // Close IPC port (implicitly unregisters handler)
             port::close(ms.port);
             // Unregister from VFS
@@ -8638,6 +8745,8 @@ pub fn remount_by_port(port: u32, ro: bool) -> bool {
                 if ro && !ms.read_only {
                     write_checkpoint(ms, true);
                     ms.read_only = true;
+                } else if !ro && ms.read_only && ms.sb.native && !NATIVE_IMPORT_SAFE {
+                    // Linux-made volume: stays read-only (design f2fslxrw).
                 } else if !ro && ms.read_only {
                     ms.read_only = false;
                     // Lane f2fsorph3: the committed orphan list a read-only
