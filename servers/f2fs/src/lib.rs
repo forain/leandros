@@ -142,7 +142,7 @@ const SB_DEVS0_PATH:       usize = 2201;
 /// SB_CHKSUM, INODE_CHKSUM (kept at write-back since lane f2fslxcsum).
 const FEAT_RW_OK: u32 = 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x100 | 0x200 | 0x800;
 /// Flip once linux_import preserves Linux's current-segment summaries.
-const NATIVE_IMPORT_SAFE: bool = false;
+const NATIVE_IMPORT_SAFE: bool = true;
 const FEAT_BLKZONED: u32 = 0x2;
 const CP_ERROR_FLAG:     u32 = 0x0000_0008;
 const CP_FSCK_FLAG:      u32 = 0x0000_0010;
@@ -3126,11 +3126,13 @@ fn nat_update_owned(ms: &mut MountState, nid: u32, owner: Option<u32>, blk_addr:
             (true, Some(o)) => o,
             (true, None) => { let k = r32(cur, off + 1); if k != 0 { k } else { nid } }
         };
-        if cur[off] == 1 && r32(cur, off + 1) == ino && r32(cur, off + 5) == blk_addr { return; }
+        if (cur[off] == 1 || ms.sb.fmt.lx) && r32(cur, off + 1) == ino && r32(cur, off + 5) == blk_addr { return; }
         ino
     };
     let blk = ms.cache.get_mut(ms.dev, nat_blk as u64);
-    blk[off] = 1;                          // version bump
+    // lx: the version belongs to the summaries already on disk (Linux's are
+    // version 0); it is never changed, the SSA writers read it back.
+    if !ms.sb.fmt.lx { blk[off] = 1; }     // version bump
     w32(blk, off + 1, ino);               // ino
     w32(blk, off + 5, blk_addr);          // block_addr
 }
@@ -3626,6 +3628,60 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
         blk[o..o + SIT_ENTRY_SIZE].copy_from_slice(&sit_j[e + 4..e + 4 + SIT_ENTRY_SIZE]);
         if !wr(a, &blk) { bail!("sit-write"); }
         n += 1;
+    }
+    // Linux keeps the summaries of its six open segments only in the
+    // checkpoint pack; our SSA readers (and fsck) look in the SSA area, so
+    // copy them there before our first checkpoint drops the pack (S4).
+    if !ro && sb.seg_cnt_ssa as u64 * bps >= sb.seg_cnt_main as u64 {
+        let ssa0 = sb.main_blkaddr as u64 - sb.seg_cnt_ssa as u64 * bps;
+        let umount = flags & CP_UMOUNT_FLAG != 0;
+        let sums = |t: usize| -> (u32, usize) {
+            if t < 3 { (r32(cp, CP_CUR_DATA_SEGNO + 4 * t), r16(cp, CP_CUR_DATA_BLKOFF + 2 * t) as usize) }
+            else { (r32(cp, CP_CUR_NODE_SEGNO + 4 * (t - 3)), r16(cp, CP_CUR_NODE_BLKOFF + 2 * (t - 3)) as usize) }
+        };
+        let mut put = |t: usize, ents: &[u8], n_ent: usize| -> bool {
+            let (seg, _) = sums(t);
+            if seg >= sb.seg_cnt_main || n_ent == 0 { return true; }
+            let mut sb_blk = [0u8; BLOCK_SIZE];
+            if !rd(ssa0 + seg as u64, &mut sb_blk) { return false; }
+            sb_blk[..n_ent * SSA_ENTRY].copy_from_slice(&ents[..n_ent * SSA_ENTRY]);
+            sb_blk[SSA_FOOTER] = (t >= 3) as u8;
+            wr(ssa0 + seg as u64, &sb_blk)
+        };
+        if flags & CP_COMPACT_SUM != 0 {
+            let mut blkn = cp_addr + r32(cp, CP_START_SUM) as u64;
+            let mut off = 2 * JSZ;
+            if !virtio_blk::read_block(dev, blkn, &mut blk) { bail!("compact-read"); }
+            for t in 0..3 {
+                let (_, cnt) = sums(t);
+                let cnt = cnt.min(bps as usize);
+                let mut ents = alloc::vec![0u8; cnt * SSA_ENTRY];
+                for j in 0..cnt {
+                    ents[j * SSA_ENTRY..(j + 1) * SSA_ENTRY].copy_from_slice(&blk[off..off + SSA_ENTRY]);
+                    off += SSA_ENTRY;
+                    if off + SSA_ENTRY > SSA_FOOTER {
+                        blkn += 1; off = 0;
+                        if j + 1 < cnt || t < 2 {
+                            if !virtio_blk::read_block(dev, blkn, &mut blk) { bail!("compact-read"); }
+                        }
+                    }
+                }
+                if !put(t, &ents, cnt) { bail!("ssa-write"); }
+            }
+        } else if total >= 7 {
+            for t in 0..3 {
+                if !virtio_blk::read_block(dev, cp_addr + total - 7 + t as u64, &mut blk) { bail!("data-sum-read"); }
+                let cnt = sums(t).1.min(bps as usize);
+                if !put(t, &blk[..cnt * SSA_ENTRY], cnt) { bail!("ssa-write"); }
+            }
+        }
+        if umount && total >= 4 {
+            for t in 3..6 {
+                if !virtio_blk::read_block(dev, cp_addr + total - 4 + (t - 3) as u64, &mut blk) { bail!("node-sum-read"); }
+                let cnt = sums(t).1.min(bps as usize);
+                if !put(t, &blk[..cnt * SSA_ENTRY], cnt) { bail!("ssa-write"); }
+            }
+        }
     }
     if !ro && !virtio_blk::flush(dev) { bail!("flush"); }
     Some(n)

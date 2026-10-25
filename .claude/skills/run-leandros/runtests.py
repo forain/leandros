@@ -262,6 +262,19 @@ def host_run(c, timeout, arch=None, scale=1.0):
         return {"rc": None, "status": "timeout", "output": out, "secs": round(time.time() - t0, 1)}
 
 
+def self_boots(c):
+    """True for a `host:` script that starts (and stops) its own VM under its own
+    LEANDROS_RUN_ID. Such a script must not run while runtests' VM is up: both
+    would open the same disk image and QEMU's write lock fails the second boot."""
+    if not c.startswith("host:"):
+        return False
+    try:
+        with open(os.path.join(HERE, c.split()[0][len("host:"):])) as f:
+            return '"start"' in f.read()
+    except OSError:
+        return False
+
+
 def main(argv):
     if len(argv) < 2 or argv[0] in ("-h", "--help"):
         print(__doc__)
@@ -343,9 +356,13 @@ def main(argv):
         summary["runs"].append(entry)
         if driver._qemu_pid() is not None:
             subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
-        start = [sys.executable, DRV, "start", arch, mode] + ([f"--{gpu}"] if gpu != "none" else [])
         booted = False
+        if cmds and all(self_boots(c) for c in cmds):
+            booted = True  # every command boots its own VM: runtests boots none
+        start = [sys.executable, DRV, "start", arch, mode] + ([f"--{gpu}"] if gpu != "none" else [])
         for attempt in range(2):
+            if booted:
+                break
             r = subprocess.run(start, capture_output=True, text=True, timeout=900)
             if r.returncode == 0:
                 lg = subprocess.run([sys.executable, DRV, "login", "root", "root",
@@ -365,6 +382,8 @@ def main(argv):
         with open(os.path.join(rdir, "results.txt"), "w") as res:
             for c in cmds:
                 try:
+                    if self_boots(c) and driver._qemu_pid() is not None:
+                        subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
                     if c.startswith("host:"):
                         r = host_run(c, timeout, arch, scale)
                     else:
@@ -381,7 +400,8 @@ def main(argv):
                 res.flush()
                 entry["results"].append({"cmd": c, "rc": r["rc"], "status": r["status"],
                                          "secs": r["secs"], "fails": fails})
-        subprocess.run(["cp", driver.SERIAL_LOG, os.path.join(rdir, "serial.log")])
+        if os.path.exists(driver.SERIAL_LOG):
+            subprocess.run(["cp", driver.SERIAL_LOG, os.path.join(rdir, "serial.log")])
         if os.path.exists(driver.SERIAL_FULL_LOG):
             subprocess.run(["cp", driver.SERIAL_FULL_LOG, os.path.join(rdir, "serial-full.log")])
             # A shared interrupt line masked by the kernel's storm guard starves

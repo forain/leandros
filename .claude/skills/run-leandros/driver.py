@@ -2310,13 +2310,26 @@ def cmd_stop():
         print("QEMU not running.")
         return
     _monitor_send("quit")
-    time.sleep(1)
-    try:
-        os.kill(pid, 0)
-        os.kill(pid, 15)
-        time.sleep(2)
-    except ProcessLookupError:
-        pass
+    # Wait for QEMU to really exit: it holds the write lock on the disk images
+    # until then, and the next boot of the same image fails with 'Failed to get
+    # "write" lock'.
+    def _gone():
+        try:
+            os.kill(pid, 0)
+            return False
+        except ProcessLookupError:
+            return True
+    for sig, wait in ((None, 10), (15, 10), (9, 10)):
+        if sig:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                break
+        end = time.time() + wait
+        while time.time() < end and not _gone():
+            time.sleep(0.1)
+        if _gone():
+            break
     for f in [PID_FILE, _scratch_home("aarch64"), _scratch_home("x86_64")]:
         try:
             os.unlink(f)

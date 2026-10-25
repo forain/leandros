@@ -1,9 +1,13 @@
 //! Edge cases for the kernel's x86_64 mem* bodies: every length 0..=LEN, every
 //! source/destination misalignment 0..8, overlap in both directions at every
 //! distance, and DF left clear afterwards. Compared against a byte reference.
-#![cfg(target_arch = "x86_64")]
+//! The same cases run against kernel/src/mem_a64.rs on an aarch64 host.
 
+#[cfg(target_arch = "x86_64")]
 #[path = "../../src/mem_x86.rs"]
+mod x86;
+#[cfg(target_arch = "aarch64")]
+#[path = "../../src/mem_a64.rs"]
 mod x86;
 
 const LEN: usize = 80;
@@ -13,6 +17,10 @@ fn pattern(seed: u8) -> Vec<u8> {
     (0..BUF).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed) ^ 0x5a).collect()
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+fn df_clear() -> bool { true }
+
+#[cfg(target_arch = "x86_64")]
 fn df_clear() -> bool {
     let f: u64;
     unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) f) };
