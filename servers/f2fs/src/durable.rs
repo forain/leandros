@@ -738,7 +738,7 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     ms.dur.inflight_rf_start = rf_start;
     let ext = ext_segs.iter().map(|&s| ms.sb.main_blkaddr as u64 + s as u64 * ms.sb.blocks_per_seg as u64).collect();
     let zero_tail = core::mem::replace(&mut ms.dur.tail_dirty[pack as usize], false);
-    let tail_sums = crate::lx_tail_sums(ms, &logs);
+    let tail_sums = crate::lx_tail_sums(ms, &logs, umount);
     Ok(CpJob {
         dev: ms.dev, ver: ms.cp.ver, direct, direct_reg, jhome, jimg,
         pack_base: pack_base(ms, pack), pack_cap, ext, cp_blkno, cp_buf, umount, reg_blocks, zero_tail, tail_sums,
@@ -1349,7 +1349,7 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
     // Commit block and the snapshot bookkeeping, in cp_prepare's order.
     let pack = 1 - ms.dur.durable_pack;
     let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack, &logs);
-    let sums = crate::lx_tail_sums(ms, &logs);
+    let sums = crate::lx_tail_sums(ms, &logs, umount);
     w32(&mut cp_buf, CPJ_MAGIC_OFF, CPJ_MAGIC);
     w32(&mut cp_buf, CPJ_INCOMPAT_OFF, if rf_enabled() { CPJ_INCOMPAT_RF } else { 0 });
     put_orphans(ms, &mut cp_buf);

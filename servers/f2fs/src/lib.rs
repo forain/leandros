@@ -3425,12 +3425,18 @@ pub(crate) fn ssa_set_kind(ms: &mut MountState, seg: u32, node: bool) {
 /// The six summary blocks of a checkpoint pack tail: the cached SSA block of
 /// each current log, footer by log class. None when the volume cannot hold
 /// summaries (the tail stays zero).
-pub(crate) fn lx_tail_sums(ms: &mut MountState, logs: &LinuxLogs) -> Option<alloc::vec::Vec<u8>> {
+///
+/// Where Linux reads them (`sum_blk_addr`): a umount pack has the three data
+/// summaries at total-7 and the three node summaries at total-4; any other
+/// pack has the data summaries at total-4 (node cursegs then come from the
+/// SSA area). So a non-umount tail is node, node, node, data, data, data.
+pub(crate) fn lx_tail_sums(ms: &mut MountState, logs: &LinuxLogs, umount: bool) -> Option<alloc::vec::Vec<u8>> {
     if !ms.sb.fmt.lx { return None; }
     let mut out = alloc::vec![0u8; 6 * BLOCK_SIZE];
     for t in 0..6 {
         let blkno = ssa_blk(ms, logs[t].0)?;
-        let d = &mut out[t * BLOCK_SIZE..(t + 1) * BLOCK_SIZE];
+        let slot = if umount { t } else { (t + 3) % 6 };
+        let d = &mut out[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE];
         d.copy_from_slice(ms.cache.read(ms.dev, blkno));
         d[SSA_FOOTER] = (t >= 3) as u8;
     }
