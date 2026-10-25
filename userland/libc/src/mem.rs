@@ -88,20 +88,84 @@ static ALLOCATOR: LibcAllocator = LibcAllocator;
 
 // ── Core memory operations (also used by string.rs) ──────────────────────────
 
+// These three are the libc's only bulk-copy primitives: every C program
+// linked against this libc (DOOM, ports) and `string.rs` funnel through them.
+// They used to be byte-at-a-time loops (`movb`/`ldrb` per byte, the compiler
+// will not vectorise or idiom-replace a loop inside a function *named*
+// memcpy), which capped a 256 KiB wl_shm frame copy at ~600 MB/s on the
+// laptop (lane shmslow). x86_64 now uses the fast-string `rep movsq`/`rep stosq`
+// plus a byte tail; other arches copy whole
+// machine words with an unrolled loop.
+//
+// Do NOT move the word loops into helper functions with other names: LLVM's
+// loop-idiom pass only stays away from functions called memcpy/memset, and a
+// helper's loop would be rewritten into a call to memcpy -- i.e. into itself.
+
+const W: usize = core::mem::size_of::<usize>();
+
 /// Copy `n` bytes from `src` to `dst` (non-overlapping).
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: size_t) -> *mut u8 {
-    for i in 0..n { *dst.add(i) = *src.add(i); }
-    dst
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Quadwords then the tail: as fast as ERMSB `rep movsb` on hardware,
+        // and 8x fewer iterations under TCG, which emulates string ops per
+        // element (plain `rep movsb` there was slower than the byte loop).
+        core::arch::asm!("rep movsq", "mov rcx, {t}", "rep movsb",
+            t = in(reg) n & 7,
+            inout("rcx") n >> 3 => _, inout("rdi") dst => _, inout("rsi") src => _,
+            options(nostack, preserves_flags));
+        return dst;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Inline asm, not read_unaligned: aarch64-unknown-none is built
+        // +strict-align, so the compiler splits every unaligned word access
+        // into bytes. EL0 Normal memory takes unaligned ldp/stp fine.
+        core::arch::asm!(
+            "cmp {n}, #64", "b.lo 2f",
+            "1:",
+            "ldp {a}, {b}, [{s}], #16", "ldp {c}, {d}, [{s}], #16",
+            "stp {a}, {b}, [{d0}], #16", "stp {c}, {d}, [{d0}], #16",
+            "ldp {a}, {b}, [{s}], #16", "ldp {c}, {d}, [{s}], #16",
+            "stp {a}, {b}, [{d0}], #16", "stp {c}, {d}, [{d0}], #16",
+            "sub {n}, {n}, #64", "cmp {n}, #64", "b.hs 1b",
+            "2:", "cmp {n}, #8", "b.lo 3f",
+            "ldr {a}, [{s}], #8", "str {a}, [{d0}], #8", "sub {n}, {n}, #8", "b 2b",
+            "3:", "cbz {n}, 4f",
+            "ldrb {a:w}, [{s}], #1", "strb {a:w}, [{d0}], #1", "sub {n}, {n}, #1", "b 3b",
+            "4:",
+            n = inout(reg) n => _, s = inout(reg) src => _, d0 = inout(reg) dst => _,
+            a = out(reg) _, b = out(reg) _, c = out(reg) _, d = out(reg) _,
+            options(nostack));
+        return dst;
+    }
+    #[allow(unreachable_code)]
+    {
+        for i in 0..n { *dst.add(i) = *src.add(i); }
+        dst
+    }
 }
 
 /// Copy `n` bytes from `src` to `dst` (may overlap).
 #[no_mangle]
 pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: size_t) -> *mut u8 {
     if (dst as usize) <= (src as usize) || (dst as usize) >= (src as usize + n) {
+        // A forward copy is safe when dst is below src: memcpy reads every
+        // byte (or word) before it writes anything at a higher address than
+        // it has read, for both `rep movsb` and the ascending word loop.
         memcpy(dst, src, n)
     } else {
-        for i in (0..n).rev() { *dst.add(i) = *src.add(i); }
+        // Overlap with dst above src: copy descending, whole words first.
+        // Volatile accesses keep the loop from being idiom-rewritten into a
+        // call to memmove (this function).
+        let mut i = n;
+        while i >= W {
+            i -= W;
+            let v = core::ptr::read_volatile(src.add(i) as *const [u8; W]);
+            core::ptr::write_volatile(dst.add(i) as *mut [u8; W], v);
+        }
+        while i > 0 { i -= 1; core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i))); }
         dst
     }
 }
@@ -109,8 +173,38 @@ pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: size_t) -> *mu
 /// Fill `n` bytes at `s` with byte value `c`.
 #[no_mangle]
 pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: size_t) -> *mut u8 {
-    for i in 0..n { *s.add(i) = c as u8; }
-    s
+    #[cfg(target_arch = "x86_64")]
+    {
+        core::arch::asm!("rep stosq", "mov rcx, {t}", "rep stosb",
+            t = in(reg) n & 7,
+            inout("rcx") n >> 3 => _, inout("rdi") s => _,
+            in("rax") (c as u8 as u64).wrapping_mul(0x0101_0101_0101_0101),
+            options(nostack, preserves_flags));
+        return s;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v = (c as u8 as u64).wrapping_mul(0x0101_0101_0101_0101);
+        core::arch::asm!(
+            "cmp {n}, #64", "b.lo 2f",
+            "1:",
+            "stp {v}, {v}, [{p}], #16", "stp {v}, {v}, [{p}], #16",
+            "stp {v}, {v}, [{p}], #16", "stp {v}, {v}, [{p}], #16",
+            "sub {n}, {n}, #64", "cmp {n}, #64", "b.hs 1b",
+            "2:", "cmp {n}, #8", "b.lo 3f",
+            "str {v}, [{p}], #8", "sub {n}, {n}, #8", "b 2b",
+            "3:", "cbz {n}, 4f",
+            "strb {v:w}, [{p}], #1", "sub {n}, {n}, #1", "b 3b",
+            "4:",
+            n = inout(reg) n => _, p = inout(reg) s => _, v = in(reg) v,
+            options(nostack));
+        return s;
+    }
+    #[allow(unreachable_code)]
+    {
+        for i in 0..n { *s.add(i) = c as u8; }
+        s
+    }
 }
 
 /// Map memory into the process address space.

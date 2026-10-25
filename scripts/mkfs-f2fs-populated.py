@@ -598,6 +598,10 @@ def main():
     p = f"target/floattest/floattest-{arch}"
     if os.path.exists(p):
         bin_files.append(("floattest", p, 0o100755))
+    # wl_shm frame-copy benchmark linked like DOOM (lane shmslow).
+    p = f"target/memcpybench/memcpybench-{arch}"
+    if os.path.exists(p):
+        bin_files.append(("memcpybench", p, 0o100755))
     p = "../doomgeneric/doom1.wad"
     if os.path.exists(p):
         bin_files.append(("doom1.wad", p, 0o100644))
