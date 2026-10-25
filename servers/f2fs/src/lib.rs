@@ -364,6 +364,14 @@ const SYMLINK_MAX_HOPS: u32 = 40;
 #[inline] fn w32(b: &mut [u8], off: usize, v: u32) { b[off..off+4].copy_from_slice(&v.to_le_bytes()); }
 #[inline] fn w64(b: &mut [u8], off: usize, v: u64) { b[off..off+8].copy_from_slice(&v.to_le_bytes()); }
 
+/// `struct f2fs_extent i_ext` (fofs, blk_addr, len = 12 B) of a Linux inode: a
+/// read-extent hint Linux trusts at mount. Any change that frees or moves a
+/// block must clear it, or Linux follows a stale extent to reused blocks.
+const I_EXT_OFF: usize = 348;
+fn lx_zero_ext(f: Fmt, blk: &mut [u8]) {
+    if f.lx { blk[I_EXT_OFF..I_EXT_OFF + 12].fill(0); }
+}
+
 fn inode_addr_base(f: Fmt, blk: &[u8]) -> usize {
     if blk[INO_INLINE] & F2FS_EXTRA_ATTR != 0 {
         let extra_sz = r16(blk, f.union()) as usize;
@@ -446,6 +454,7 @@ fn inode_set_blkaddr(f: Fmt, blk: &mut [u8], idx: usize, addr: u32) {
     let base = inode_addr_base(f, blk);
     let off = base + idx * 4;
     if off + 4 > inode_addr_end(f, blk) { return; }
+    lx_zero_ext(f, blk);
     w32(blk, off, addr);
 }
 
@@ -461,6 +470,7 @@ fn inode_get_nid(f: Fmt, blk: &[u8], n: usize) -> u32 {
 }
 
 fn inode_set_nid(f: Fmt, blk: &mut [u8], n: usize, val: u32) {
+    lx_zero_ext(f, blk);
     w32(blk, f.nids() + n * 4, val);
 }
 
@@ -838,8 +848,11 @@ impl BlockCache {
         let i = self.take_slot(dev);
         if i == usize::MAX { return false; }
         self.data_mut(i).copy_from_slice(&data[..BLOCK_SIZE]);
+        self.meta[i].blk_no = blk;
+        // A bad inode checksum is never cached (the caller's own read then
+        // reports EIO, like Linux's EFSBADCRC).
+        if self.icsum.is_some() && !self.icsum_verify(dev, i) { return false; }
         self.install(i, blk);
-        if self.icsum.is_some() { self.icsum_verify(dev, i); }
         true
     }
 
@@ -1089,8 +1102,16 @@ impl BlockCache {
             self.scratch_r.fill(0);
             return None;
         }
+        self.meta[i].blk_no = blk;
+        if self.icsum.is_some() && !self.icsum_verify(dev, i) {
+            // Corrupt inode (checksum mismatch): EIO for this request only,
+            // the block is not cached and the mount stays as it is.
+            self.data_mut(i).fill(0);
+            self.read_failed = true;
+            self.scratch_r.fill(0);
+            return None;
+        }
         self.install(i, blk);
-        if self.icsum.is_some() { self.icsum_verify(dev, i); }
         Some(i)
     }
 
@@ -1126,6 +1147,10 @@ impl BlockCache {
     fn icsum_stamp(&mut self, dev: usize, i: usize) {
         if self.icsum.is_none() { return; }
         if let Some(seed) = self.icsum_is_inode(dev, i) {
+            // Linux's read extent hint (i_ext, +348) must never outlive a change
+            // of the block addresses we make: zero it on every write-back
+            // (a zero extent is "none"; Linux rebuilds it on demand).
+            self.data_mut(i)[I_EXT_OFF..I_EXT_OFF + 12].fill(0);
             let c = icsum_calc(seed, self.data(i));
             w32(self.data_mut(i), ICSUM_OFF, c);
         }
@@ -1133,7 +1158,7 @@ impl BlockCache {
 
     /// Verify the checksum of a freshly read inode block (counted; the first
     /// mismatches are logged).
-    fn icsum_verify(&mut self, dev: usize, i: usize) {
+    fn icsum_verify(&mut self, dev: usize, i: usize) -> bool {
         if let Some(seed) = self.icsum_is_inode(dev, i) {
             let b = self.data(i);
             if icsum_calc(seed, b) == r32(b, ICSUM_OFF) {
@@ -1142,8 +1167,10 @@ impl BlockCache {
             } else {
                 let n = ICSUM_BAD.fetch_add(1, atomic::Ordering::Relaxed) + 1;
                 if n <= 8 { dbg_str("[F2FS] inode checksum MISMATCH nid "); dbg_dec(r32(b, 4072) as usize); dbg_str("\n"); }
+                return false;
             }
         }
+        true
     }
 
     fn read(&mut self, dev: usize, blk: u64) -> &[u8; BLOCK_SIZE] {
@@ -5390,6 +5417,7 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
 
     inode_add_blocks(ms.sb.fmt, &mut iblk, -(freed as i64));
     w64(&mut iblk, INO_SIZE, new_len);
+    lx_zero_ext(ms.sb.fmt, &mut iblk);
     ms.cache.write(ms.dev, iblkaddr as u64, &iblk);
     nat_update(ms, ino, iblkaddr);
     // Pages past the new end leave the page cache, the new last page's tail
@@ -6191,8 +6219,8 @@ fn dir_add_entry_lx(ms: &mut MountState, dir_ino: u32, name: &[u8], child_ino: u
     let hash = f2fs_dentry_hash(name);
     let iblkaddr = nat_lookup(ms, dir_ino);
     if iblkaddr == 0 { return false; }
+    if !lx_convert_inline(ms, dir_ino) { return false; }
     let mut iblk = *ms.cache.read(ms.dev, iblkaddr as u64);
-    if lx_inline_refused(f, &iblk, dir_ino) { return false; }
     let max_direct = inode_max_direct(f, &iblk);
     let mut level = 0usize;
     let (bidx, slot) = 'found: loop {
@@ -6259,8 +6287,62 @@ fn lx_inline_refused(f: Fmt, iblk: &[u8], ino: u32) -> bool {
     true
 }
 
+/// Convert a Linux inline-data file or inline-dentry directory to ordinary
+/// block storage, the way Linux does (`f2fs_convert_inline_inode` /
+/// `f2fs_convert_inline_dir`): allocate block 0, copy the bytes (or the dentry
+/// bitmap, entries and names at the same slot indices into the 214-slot dentry
+/// block), clear the inline flags, zero the inline area, point i_addr[0] at
+/// the block, i_blocks += 1 (dirs: i_current_depth 1, i_size 4096). True if the
+/// inode is (now) not inline; false when no block could be allocated.
+fn lx_convert_inline(ms: &mut MountState, ino: u32) -> bool {
+    let f = ms.sb.fmt;
+    if !f.lx { return true; }
+    let iblkaddr = nat_lookup(ms, ino);
+    if iblkaddr == 0 { return true; }
+    let mut iblk = read_block_copy(ms, iblkaddr);
+    let fl = iblk[INO_INLINE];
+    if fl & (F2FS_INLINE_DATA | F2FS_INLINE_DENTRY) == 0 { return true; }
+    let (st, en) = inline_area(f, &iblk);
+    let p = match alloc_data_owned(ms, ino, 0) { Some(p) => p, None => return false };
+    let mut dblk = [0u8; BLOCK_SIZE];
+    if fl & F2FS_INLINE_DATA != 0 {
+        if fl & 0x08 != 0 {
+            let n = (inode_size(&iblk) as usize).min(en - st);
+            dblk[..n].copy_from_slice(&iblk[st..st + n]);
+        }
+        iblk[INO_INLINE] &= !(F2FS_INLINE_DATA | 0x08);
+    } else {
+        let a = &iblk[st..en];
+        let (nr, bm, eo, no) = inline_dentry_layout(a.len());
+        let nr = nr.min(NR_DENTRY_IN_BLK);
+        let bm = bm.min(DENTRY_BITMAP_SIZE);
+        dblk[..bm].copy_from_slice(&a[..bm]);
+        for slot in 0..nr {
+            let src = eo + slot * DENTRY_ENTRY_SIZE;
+            let dst = DENTRY_ENTRIES_OFF + slot * DENTRY_ENTRY_SIZE;
+            dblk[dst..dst + DENTRY_ENTRY_SIZE].copy_from_slice(&a[src..src + DENTRY_ENTRY_SIZE]);
+            let src = no + slot * DENTRY_SLOT_LEN;
+            let dst = DENTRY_NAMES_OFF + slot * DENTRY_SLOT_LEN;
+            dblk[dst..dst + DENTRY_SLOT_LEN].copy_from_slice(&a[src..src + DENTRY_SLOT_LEN]);
+        }
+        iblk[INO_INLINE] &= !F2FS_INLINE_DENTRY;
+        w32(&mut iblk, INO_CUR_DEPTH, 1);
+        w64(&mut iblk, INO_SIZE, BLOCK_SIZE as u64);
+    }
+    iblk[st..en].fill(0);
+    inode_set_blkaddr(f, &mut iblk, 0, p);
+    inode_add_blocks(f, &mut iblk, 1);
+    lx_zero_ext(f, &mut iblk);
+    ms.cache.write(ms.dev, p as u64, &dblk);
+    ms.cache.write(ms.dev, iblkaddr as u64, &iblk);
+    nat_update(ms, ino, iblkaddr);
+    maybe_flush(ms);
+    !ms.cache.poisoned()
+}
+
 /// Remove the directory entry for `name` from `dir_ino`. Returns true if found.
 fn dir_remove_entry(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> bool {
+    if !lx_convert_inline(ms, dir_ino) { return false; }
     let iblkaddr = nat_lookup(ms, dir_ino);
     let iblk_copy = {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
@@ -6687,8 +6769,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         if ms.sb.fmt.lx {
             let ia = nat_lookup(ms, ino);
             if ia != 0 {
-                let refused = (writable || (flags & O_TRUNC) != 0) && { let b = ms.cache.read(ms.dev, ia as u64); lx_inline_refused(ms.sb.fmt, b, ino) };
-                if refused && (writable || (flags & O_TRUNC) != 0) { return err_reply(-5); } // EIO (inline write: S2)
+                if (writable || (flags & O_TRUNC) != 0) && !lx_convert_inline(ms, ino) { return err_reply(-28); } // ENOSPC
             }
         }
         // Permission gate for opening an *existing* object. handle_open used to
@@ -7560,6 +7641,22 @@ fn dir_is_empty(ms: &mut MountState, dir_ino: u32) -> bool {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
         let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
     };
+    if lx_inline_dir(ms.sb.fmt, &iblk_copy) {
+        let (st, en) = inline_area(ms.sb.fmt, &iblk_copy);
+        let a = &iblk_copy[st..en];
+        let (nr, _bm, eo, no) = inline_dentry_layout(a.len());
+        let mut slot = 0usize;
+        while slot < nr {
+            if a[slot / 8] & (1 << (slot % 8)) == 0 { slot += 1; continue; }
+            let nl = r16(a, eo + slot * 11 + 8) as usize;
+            let n = no + slot * 8;
+            let dot = nl == 1 && a[n] == b'.';
+            let dotdot = nl == 2 && &a[n..n + 2] == b"..";
+            if !dot && !dotdot { return false; }
+            slot += nl.div_ceil(8).max(1);
+        }
+        return true;
+    }
     let fsize = inode_size(&iblk_copy);
     let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
 
