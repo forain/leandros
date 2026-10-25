@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-arch = sys.argv[1] if len(sys.argv) > 1 else "aarch64"
+arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
 tag = sys.argv[2] if len(sys.argv) > 2 else f"blanktest-{arch}"
 out = os.environ.setdefault("FFSESSION_OUT", "/tmp/ffsession")
 os.environ.setdefault("LEANDROS_RUN_ID", "blanktest")

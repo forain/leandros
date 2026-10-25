@@ -276,7 +276,7 @@ assert len(TESTS) == 105, f"expected 105 tests, have {len(TESTS)}"
 
 
 def main():
-    arch = sys.argv[1] if len(sys.argv) > 1 else "aarch64"
+    arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
     print(f"== LeandrOS coreutils test (arch={arch}) ==", flush=True)
 
     print("-- fixtures --", flush=True)

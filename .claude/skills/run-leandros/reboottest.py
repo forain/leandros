@@ -27,7 +27,7 @@ DRV = os.path.join(HERE, "driver.py")
 
 
 def main(argv):
-    arch, keep = "aarch64", False
+    arch, keep = os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), False
     for a in argv:
         if a in ("aarch64", "x86_64"):
             arch = a

@@ -33,7 +33,7 @@ def relabel(img):
 
 
 def main():
-    arch = sys.argv[1] if len(sys.argv) > 1 else "aarch64"
+    arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
     run_id = os.environ.get("LEANDROS_RUN_ID", "x")
     img = os.path.join(REPO, f"blkfault-{run_id}.img")
     if os.path.exists(img):

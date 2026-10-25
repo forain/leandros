@@ -50,7 +50,7 @@ def stop_caller_vm(caller):
 
 
 def main(argv):
-    arch, factor, cmdline, size, keep = "aarch64", 8, None, "64M", False
+    arch, factor, cmdline, size, keep = os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), 8, None, "64M", False
     i = 0
     while i < len(argv):
         a = argv[i]

@@ -88,7 +88,7 @@ def fsck_out(img):
 
 def main(argv):
     stop_caller_vm(caller)
-    arch = "aarch64"
+    arch = os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
     for a in argv:
         if a in ("aarch64", "x86_64"):
             arch = a
