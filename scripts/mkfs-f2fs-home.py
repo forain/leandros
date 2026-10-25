@@ -365,12 +365,13 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    # `--lx` (opt-in, lane f2fsnode): make the volume in Linux's on-disk node
-    # format instead (scripts/mkfs-f2fs-home-lx.py, `LeandrOS lxnode2`). The
-    # default stays the legacy layout until an lx root boots to a shell.
-    if "--lx" in sys.argv[1:]:
+    # New volumes use Linux's on-disk node format (scripts/mkfs-f2fs-home-lx.py,
+    # `LeandrOS lxnode2`). The legacy layout below is only for compat fixtures:
+    # `--legacy` or LEANDROS_F2FS_LEGACY=1.
+    legacy = "--legacy" in sys.argv[1:] or os.environ.get("LEANDROS_F2FS_LEGACY") == "1"
+    sys.argv = [a for a in sys.argv if a not in ("--legacy", "--lx")]
+    if not legacy:
         import runpy
-        sys.argv = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "mkfs-f2fs-home-lx.py")] + \
-            [a for a in sys.argv[1:] if a != "--lx"]
+        sys.argv = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "mkfs-f2fs-home-lx.py")] + sys.argv[1:]
         runpy.run_path(sys.argv[0], run_name="__main__")
     sys.exit(main(sys.argv[1:]))

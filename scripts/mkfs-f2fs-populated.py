@@ -10,7 +10,9 @@ import os
 import subprocess
 import soundfont
 
-LX = os.environ.get("LEANDROS_F2FS_LX") == "1"
+# Linux-compatible ("lxnode2") is the only format for new volumes; the legacy
+# writer survives solely for compat fixtures (LEANDROS_F2FS_LEGACY=1).
+LX = os.environ.get("LEANDROS_F2FS_LEGACY") != "1"
 
 BLOCK_SIZE     = 4096
 BLOCKS_PER_SEG = 512       # 2 MB segments (log_blocks_per_seg = 9)
