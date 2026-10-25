@@ -42,7 +42,7 @@ use crate::partscan::{self, PartType, PartUuid, Table};
 use crate::pci::{serial_debug as log, serial_debug_dec as log_dec};
 
 /// Registry capacity: disks plus their partitions.
-pub const MAX_ENTRIES: usize = 64;
+pub const MAX_ENTRIES: usize = 128;
 const BLOCK: usize = 4096;
 
 #[derive(Clone, Copy)]

@@ -41,9 +41,9 @@
 
 use super::*;
 
-/// Registry capacity: 3 virtio disks + 8 loop devices + partitions (the
-/// kernel-scanned ones, a hot-plugged USB disk's, and BLKPG-added ones).
-pub const MAX_BDEV: usize = 48;
+/// Registry capacity: up to 32 virtio disks + 8 loop devices + partitions
+/// (the kernel-scanned ones, a hot-plugged USB disk's, and BLKPG-added ones).
+pub const MAX_BDEV: usize = 96;
 /// Loop devices created at boot. Linux's `max_loop` default is 8 and every
 /// node exists whether or not a backing file is attached, which is precisely
 /// the contract `LOOP_CTL_GET_FREE` + `open("/dev/loopN")` relies on.

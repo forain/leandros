@@ -61,7 +61,7 @@ ROOT_DIR="$PWD"
 # Install them once at a fixed path beside the checkouts and use that instead.
 TOOLS_DIR="$(cd "$ROOT_DIR/.." && pwd)/.leandros-tools"
 mkdir -p "$TOOLS_DIR"
-for _w in "$ROOT_DIR"/scripts/linker-*-musl.sh "$ROOT_DIR"/scripts/cc-*-musl.sh "$ROOT_DIR"/scripts/ar-musl.sh; do
+for _w in "$ROOT_DIR"/scripts/linker-*-musl.sh "$ROOT_DIR"/scripts/cc-*-musl.sh "$ROOT_DIR"/scripts/ar-musl.sh "$ROOT_DIR"/scripts/musl-mem-obj.sh "$ROOT_DIR"/scripts/memset-*-musl.S "$ROOT_DIR"/scripts/memset-*.S; do
     [[ -f "$_w" ]] || continue
     cmp -s "$_w" "$TOOLS_DIR/$(basename "$_w")" || { cp "$_w" "$TOOLS_DIR/.$$.tmp" && chmod +x "$TOOLS_DIR/.$$.tmp" && mv "$TOOLS_DIR/.$$.tmp" "$TOOLS_DIR/$(basename "$_w")"; }
 done
@@ -397,6 +397,25 @@ build_floattest() {
     if [[ "$arch" == "x86_64" && -z "${FLOATTEST_LIBC:-}" ]]; then
         python3 "$ROOT_DIR/scripts/check-c-float-abi.py" "$out/floattest-$arch" || return 1
     fi
+}
+
+# memcpybench: a C program linked against libleandros_libc.a like DOOM that
+# times a 256000-byte frame copy into a MAP_SHARED memfd (lane shmslow).
+build_memcpybench() {
+    local arch="$1"
+    local libc
+    if [[ "$arch" == "x86_64" ]]; then
+        libc="$ROOT_DIR/userland/target/x86_64-unknown-leandros/release/libleandros_libc.a"
+    else
+        libc="$ROOT_DIR/userland/target/aarch64-unknown-none/release/libleandros_libc.a"
+    fi
+    local out="$ROOT_DIR/target/memcpybench"
+    mkdir -p "$out"
+    local lld
+    lld=$(find "$(rustc --print sysroot)" -name rust-lld | head -n 1)
+    clang --target="$arch-unknown-none" -ffreestanding -nostdlib -fno-stack-protector -static -O2 \
+        -fno-builtin -c "$ROOT_DIR/userland/memcpybench-c/memcpybench.c" -o "$out/memcpybench-$arch.o" || return 1
+    "$lld" -flavor gnu -static -nostdlib -o "$out/memcpybench-$arch" "$out/memcpybench-$arch.o" "$libc" || return 1
 }
 
 # Function to build MAME
@@ -1056,6 +1075,7 @@ for arch in "${ARCHS[@]}"; do
     build_userland "$arch"
     build_doom "$arch"
     build_floattest "$arch" || exit 1
+    build_memcpybench "$arch" || exit 1
     build_mame "$arch"
     build_firefox "$arch"
     build_portal "$arch"

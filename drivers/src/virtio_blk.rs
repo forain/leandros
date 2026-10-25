@@ -104,7 +104,10 @@ const DATA_BUF_ORDER: usize = 6; // 2^6 pages = MAX_IO_BLOCKS
 /// Largest single request in bytes (the size of the DMA bounce buffer).
 const MAX_IO_BYTES: usize = MAX_IO_BLOCKS * BLOCK_SIZE;
 
-const MAX_BLK_DEVICES: usize = 8;
+/// Virtio disks probed at boot. Was 8, which silently dropped the 9th and
+/// later disks (openbugs #83: 3 default disks + 8 data volumes left the last
+/// three unmounted). Each disk only costs its leaked queue + bounce buffer.
+const MAX_BLK_DEVICES: usize = 32;
 
 // ── On-device register layout ────────────────────────────────────────────────
 
@@ -672,7 +675,12 @@ pub fn probe_all() -> alloc::vec::Vec<&'static VirtioDisk> {
     let mut out = alloc::vec::Vec::new();
     for device_id in [VIRTIO_PCI_DEVICE_BLK_MODERN, VIRTIO_PCI_DEVICE_BLK_LEGACY] {
         for pci in find_all_devices(VIRTIO_PCI_VENDOR, device_id) {
-            if out.len() >= MAX_BLK_DEVICES { break; }
+            if out.len() >= MAX_BLK_DEVICES {
+                crate::pci::serial_debug("[VIRTIO-BLK] device limit reached (");
+                crate::pci::serial_debug_dec(MAX_BLK_DEVICES as u64);
+                crate::pci::serial_debug("); skipping a virtio-blk PCI function\n");
+                continue;
+            }
             if let Some(d) = unsafe { VirtioBlkDevice::new(pci, true) } {
                 let capacity_sectors = d.capacity_sectors;
                 let disk: &'static VirtioDisk = alloc::boxed::Box::leak(alloc::boxed::Box::new(

@@ -523,7 +523,7 @@ def main():
         "pthreadtest", "timertest", "sigtest", "polltest", "fdmaxtest", "ptytest", "forktest", "shmtest", "racetest",
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
-        "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "nettest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
+        "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
         "sndtest", "syscalltest", "proctest", "proctest-cold.bin", "chroottest", "kexectest", "kexec", "netctl", "netctltest", "ps", "pstest",
     ]
     for b in bins:
@@ -598,6 +598,10 @@ def main():
     p = f"target/floattest/floattest-{arch}"
     if os.path.exists(p):
         bin_files.append(("floattest", p, 0o100755))
+    # wl_shm frame-copy benchmark linked like DOOM (lane shmslow).
+    p = f"target/memcpybench/memcpybench-{arch}"
+    if os.path.exists(p):
+        bin_files.append(("memcpybench", p, 0o100755))
     p = "../doomgeneric/doom1.wad"
     if os.path.exists(p):
         bin_files.append(("doom1.wad", p, 0o100644))

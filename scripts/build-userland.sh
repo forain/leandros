@@ -101,6 +101,8 @@ if command -v zig >/dev/null 2>&1; then
     esac
     echo "[userland] Building privtest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/privtest" userland/privtest/privtest.c
+    # memcpybench-musl: memcpybench built against zig's static musl (its compiler_rt mem*), to compare with the libc/relibc/musl-dynamic mem* (lane relibcmem).
+    zig cc -target "$ZT" -static -O2 -fno-builtin -s -o "${OUT}/memcpybench-musl" userland/memcpybench-c/memcpybench.c "$(scripts/musl-mem-obj.sh "${ZT%%-*}")"
     # nettest: same idea (ICMP/UDP/TCP basics, checked against a host kernel).
     echo "[userland] Building nettest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nettest" userland/nettest/nettest.c
