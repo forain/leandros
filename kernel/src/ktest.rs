@@ -20,6 +20,8 @@ use sched::ksync::{KCompletion, KMutex, KRwLock, KSemaphore, KSpinLock, KWaitQue
 use sched::{irqctx, kthread};
 
 const ALL: [&str; 11] = ["irqctx", "sync", "kthread", "workqueue", "hrtimer", "atomicpool", "kva", "pci", "msi", "firmware", "gpulock"];
+/// Opt-in only (not in `all`): a timing report, not a pass/fail facility test.
+const EXTRA: [&str; 1] = ["memperf"];
 
 /// UART only (`arch_serial_putc`), never the framebuffer console: a console
 /// print flushes the framebuffer through virtio-gpu, and a test thread
@@ -52,7 +54,7 @@ pub fn maybe_start() {
     let mut names: Vec<&'static str> = Vec::new();
     for n in list.split(',') {
         if n == "all" { names.extend_from_slice(&ALL); continue; }
-        if let Some(k) = ALL.iter().find(|k| **k == n) { names.push(k); } else { say!("unknown test '{}'", n); }
+        if let Some(k) = ALL.iter().chain(EXTRA.iter()).find(|k| **k == n) { names.push(k); } else { say!("unknown test '{}'", n); }
     }
     let fw = opt(cmd, "ktest.fw").map(String::from);
     if kthread::spawn("ktest", move || run(names, fw)).is_none() {
@@ -73,6 +75,7 @@ fn run(names: Vec<&'static str>, fw: Option<String>) {
             "hrtimer" => t_hrtimer(),
             "atomicpool" => t_atomicpool(),
             "kva" => t_kva(),
+            "memperf" => t_memperf(),
             "pci" => t_pci(),
             "msi" => t_msi(),
             "firmware" => t_firmware(fw.as_deref()),
@@ -966,5 +969,59 @@ fn t_firmware(path: Option<&str>) -> T {
     }
     let (free0, _) = (mm::buddy::free_pages(), 0);
     say!("firmware: buddy free pages after release {}", free0);
+    t
+}
+
+/// `ktest=memperf`: throughput of the kernel memcpy/memset/memmove on RAM
+/// (HHDM, write-back), aligned and misaligned, plus a content check.
+fn t_memperf() -> T {
+    use core::hint::black_box;
+    let mut t = T::new("memperf");
+    const ORDER: usize = 8; // 1 MiB
+    const SZ: usize = 4096 << ORDER;
+    let (pa, pb) = match (mm::buddy::alloc(ORDER), mm::buddy::alloc(ORDER)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => { t.skip("no 1 MiB block"); return t; }
+    };
+    let a = mm::phys_to_virt(pa) as *mut u8;
+    let b = mm::phys_to_virt(pb) as *mut u8;
+    for i in 0..SZ { unsafe { a.add(i).write_volatile((i * 7 + 3) as u8); } }
+    let bench = |what: &str, reps: usize, bytes: usize, f: &mut dyn FnMut()| {
+        f();
+        let t0 = now();
+        for _ in 0..reps { f(); }
+        let ns = (now() - t0).max(1);
+        say!("memperf {:<22} {:>6} MB/s", what, (reps * bytes) as u64 * 1000 / ns);
+    };
+    unsafe {
+        bench("memcpy 4K aligned", 4096, 4096, &mut || {
+            core::ptr::copy_nonoverlapping(black_box(a as *const u8), black_box(b), black_box(4096));
+        });
+        bench("memcpy 1M aligned", 32, SZ, &mut || {
+            core::ptr::copy_nonoverlapping(black_box(a as *const u8), black_box(b), black_box(SZ));
+        });
+        bench("memcpy 1M src+3", 32, SZ - 8, &mut || {
+            core::ptr::copy_nonoverlapping(black_box(a.add(3) as *const u8), black_box(b), black_box(SZ - 8));
+        });
+        bench("memset 1M", 32, SZ, &mut || {
+            core::ptr::write_bytes(black_box(b), black_box(0x5a), black_box(SZ));
+        });
+        bench("memmove 1M up+8", 32, SZ - 8, &mut || {
+            core::ptr::copy(black_box(a as *const u8), black_box(a.add(8)), black_box(SZ - 8));
+        });
+        bench("memmove 1M down+5", 32, SZ - 8, &mut || {
+            core::ptr::copy(black_box(a.add(5) as *const u8), black_box(a), black_box(SZ - 8));
+        });
+        // Content check: misaligned copy, then compare byte by byte.
+        for i in 0..SZ { a.add(i).write_volatile((i * 13 + 1) as u8); }
+        core::ptr::copy_nonoverlapping(black_box(a.add(5) as *const u8), black_box(b.add(2)), black_box(SZ - 16));
+        let mut bad = 0usize;
+        for i in 0..SZ - 16 {
+            if b.add(2 + i).read_volatile() != a.add(5 + i).read_volatile() { bad += 1; }
+        }
+        t.check(bad == 0, "misaligned 1 MiB memcpy content");
+    }
+    mm::buddy::free(pa, ORDER);
+    mm::buddy::free(pb, ORDER);
     t
 }
