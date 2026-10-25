@@ -535,10 +535,19 @@ fn set_link(up: bool) {
 /// so the self-test can run a group rekey (EAPOL group message 1).
 struct SimHs { sup: wc::Supplicant, kek: [u8; 16], kck: [u8; 16], rc: u64, tkip: bool }
 static HS: Mutex<Option<SimHs>> = Mutex::new(None);
+/// Key index + 1 of a group message 1 the next connected scan receives.
+static M1_DURING_SCAN: AtomicU32 = AtomicU32::new(0);
+static SIM_HELD: wm::gk::Held<Vec<u8>> = wm::gk::Held::new();
 
 /// The AP sends a group-key handshake message 1 with a fresh GTK at `key_id`;
 /// the supplicant unwraps it and the install is recorded like a real one.
 fn sim_group_rekey(key_id: u8) -> Result<(), String> {
+    let m1 = sim_group_m1(key_id)?;
+    sim_group_deliver(&m1)
+}
+
+/// Group message 1 for a fresh GTK at `key_id`, as the AP would send it.
+fn sim_group_m1(key_id: u8) -> Result<Vec<u8>, String> {
     use wc::key_info as ki;
     let mut g = HS.lock();
     let h = g.as_mut().ok_or_else(|| String::from("no handshake state"))?;
@@ -553,10 +562,17 @@ fn sim_group_rekey(key_id: u8) -> Result<(), String> {
     h.rc += 1;
     let mut m1 = wc::build_eapol_key(2, 2 | ki::ACK | ki::MIC | ki::SECURE | ki::ENCRYPTED_KEY_DATA, 0, &h.rc.to_be_bytes(), &[0u8; 32], &wrapped);
     wc::eapol_set_mic(&h.kck, &mut m1);
+    Ok(m1)
+}
+
+/// The supplicant receives a group message 1: the install is recorded like a real one.
+fn sim_group_deliver(m1: &[u8]) -> Result<(), String> {
+    let mut g = HS.lock();
+    let h = g.as_mut().ok_or_else(|| String::from("no handshake state"))?;
     let mut done = false;
-    for e in h.sup.on_eapol(&m1) {
+    for e in h.sup.on_eapol(m1) {
         match e {
-            wc::HsEvent::InstallGtk { key_id: k, key, .. } if key[..] == gtk[..] => { wm::gk::note_install(k, h.tkip); done = true; }
+            wc::HsEvent::InstallGtk { key_id: k, .. } => { wm::gk::note_install(k, h.tkip); done = true; }
             wc::HsEvent::Error(e) => return Err(alloc::format!("supplicant: {}", e)),
             _ => {}
         }
@@ -634,7 +650,13 @@ impl Radio for SimRadio {
         wifi_caps::PSK | wifi_caps::BAND_2GHZ | wifi_caps::BAND_5GHZ | wifi_caps::SCAN_CONNECTED | wifi_caps::DIRECTED_SCAN
     }
 
-    fn scan(&mut self, ssids: &[Vec<u8>], _connected: bool) -> Result<Vec<ScanHit>, Fail> {
+    fn scan(&mut self, ssids: &[Vec<u8>], connected: bool) -> Result<Vec<ScanHit>, Fail> {
+        // The AP's group message 1 arrives while the scan waits for its
+        // completion: the wait does not claim it (iwlwifi's scan() path).
+        let k = M1_DURING_SCAN.swap(0, Ordering::Relaxed);
+        if k != 0 && connected {
+            if let Ok(m1) = sim_group_m1(k as u8 - 1) { SIM_HELD.unclaimed(m1, true, connected); }
+        }
         msleep(SCAN_MS);
         let hits = with_sim(|s| {
             if !s.radio_on { return Vec::new(); }
@@ -689,6 +711,10 @@ impl Radio for SimRadio {
     }
 
     fn poll_connected(&mut self, budget_ms: u64) -> Option<Fail> {
+        // Frames a scan popped meanwhile reach the supplicant now.
+        while let Some(m1) = SIM_HELD.pop() {
+            if let Err(e) = sim_group_deliver(&m1) { log(&alloc::format!("held group message 1: {}", e)); }
+        }
         msleep(budget_ms.min(50));
         with_sim(|s| {
             let i = s.assoc?;
@@ -1320,9 +1346,17 @@ fn selftest_main(level: u32) {
 
     // 7. Scanning while associated keeps the link.
     msleep(2_100);
+    let (i0, k0) = (wm::gk::installs(), wm::gk::key_id());
+    let nk = if k0 == 1 { 2 } else { 1 };
+    M1_DURING_SCAN.store(nk as u32 + 1, Ordering::Relaxed);
     let s = scan(true, &[]);
     t.check("scan-while-connected", s.map_or(false, |(_, i)| i.flags & scan_flags::COALESCED == 0) && MGR.state().state == wifi_state::CONNECTED,
             alloc::format!("{:?} state {}", s.map(|(ms, i)| (ms, i.flags)), wm::state_name(MGR.state().state)));
+    // Group message 1 popped by the scan's wait still installs the key (lane eapoldrop).
+    let t1 = now_ms();
+    while now_ms() - t1 < 2_000 && wm::gk::installs() == i0 { msleep(20); }
+    let (i1, k1, ec) = (wm::gk::installs(), wm::gk::key_id(), wm::gk::eapol_counts());
+    t.check("gtk-rekey-during-scan", i1 == i0 + 1 && k1 == nk, alloc::format!("installs {}->{} key {}->{} (want {}) eapol rx/held/dropped {:?}", i0, i1, k0, k1, nk, ec));
 
     // 7b. Two explicit user scans (netctl's flags) while associated are both
     // fresh: the scan generation advances each time.
