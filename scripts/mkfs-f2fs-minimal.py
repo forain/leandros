@@ -17,7 +17,9 @@ CP_UMOUNT_FLAG = 0x00000008
 # Segment 0 (blk 0–511)  : reserved / superblock
 SEGMENT0_BLKADDR = BLOCKS_PER_SEG      # 512
 SEG_CNT_CKPT = 2   # 2 segs → 2 packs (1 seg each)
-SEG_CNT_SIT  = 1
+# Linux mirrors the SIT and the NAT: two copies each, the live one per block
+# chosen by the checkpoint's version bitmaps (lane f2fslayout).
+SEG_CNT_SIT  = 2
 SEG_CNT_NAT  = 2
 SEG_CNT_SSA  = 1
 
@@ -63,7 +65,7 @@ def write_superblock(image, base):
     w32(image, s + 32, 0)     # checksum_offset
     w64(image, s + 36, TOTAL_BLOCKS)
     w32(image, s + 44, MAIN_SEGS)
-    w32(image, s + 48, TOTAL_SEGS)
+    w32(image, s + 48, TOTAL_SEGS - 1)   # from segment0_blkaddr on
     w32(image, s + 52, SEG_CNT_CKPT)
     w32(image, s + 56, SEG_CNT_SIT)
     w32(image, s + 60, SEG_CNT_NAT)

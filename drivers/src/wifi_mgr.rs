@@ -168,6 +168,50 @@ pub mod gk {
         INSTALLS.fetch_add(1, Relaxed);
     }
     pub fn note_rx(kind: usize) { RX[kind].fetch_add(1, Relaxed); }
+
+    // EAPOL frames (the group-key handshake after association) and frames a
+    // driver wait did not claim (scan, session protection, auth/assoc wait).
+    static EAPOL_RX: AtomicU64 = AtomicU64::new(0);
+    static EAPOL_HELD: AtomicU64 = AtomicU64::new(0);
+    static EAPOL_DROPPED: AtomicU64 = AtomicU64::new(0);
+    static EAPOL_QFULL: AtomicU64 = AtomicU64::new(0);
+    static EAPOL_TID: AtomicU64 = AtomicU64::new(0xff);
+    static HELD_DROPPED: AtomicU64 = AtomicU64::new(0);
+    /// RX Block Ack reorder drops of frames older than the window, per TID.
+    static BA_OLD: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    /// One EAPOL frame received (`tid` 0xff: non-QoS).
+    pub fn note_eapol_rx(tid: u8) { EAPOL_RX.fetch_add(1, Relaxed); EAPOL_TID.store(tid as u64, Relaxed); }
+    /// One EAPOL frame lost because the driver's notification queue was full.
+    pub fn note_eapol_qfull() { EAPOL_QFULL.fetch_add(1, Relaxed); }
+    pub fn note_ba_old(tid: u8, n: u64) { if n != 0 { BA_OLD[(tid & 7) as usize].fetch_add(n, Relaxed); } }
+    pub fn eapol_counts() -> (u64, u64, u64) { (EAPOL_RX.load(Relaxed), EAPOL_HELD.load(Relaxed), EAPOL_DROPPED.load(Relaxed)) }
+
+    /// Received frames a wait for something else popped (a scan waits up to
+    /// 20 s): held here for the connected loop instead of being discarded.
+    pub struct Held<T> { q: spin::Mutex<alloc::collections::VecDeque<T>> }
+    pub const HELD_CAP: usize = 64;
+    impl<T> Held<T> {
+        pub const fn new() -> Self { Held { q: spin::Mutex::new(alloc::collections::VecDeque::new()) } }
+        pub fn pop(&self) -> Option<T> { self.q.lock().pop_front() }
+        pub fn is_empty(&self) -> bool { self.q.lock().is_empty() }
+        pub fn clear(&self) { self.q.lock().clear(); }
+        /// A frame no wait claimed: `eapol` for an EAPOL frame, `associated`
+        /// while a link is up (the connected loop will drain the queue).
+        pub fn unclaimed(&self, p: T, eapol: bool, associated: bool) {
+            // EAPOL is always kept (group message 1 of a rekey, or the
+            // 4-way's message 1 behind the association response); other
+            // frames only while associated (deauth, Block Ack requests).
+            if !eapol && !associated { return; }
+            let mut q = self.q.lock();
+            if q.len() >= HELD_CAP {
+                HELD_DROPPED.fetch_add(1, Relaxed);
+                if eapol { EAPOL_DROPPED.fetch_add(1, Relaxed); }
+                return;
+            }
+            q.push_back(p);
+            if eapol { EAPOL_HELD.fetch_add(1, Relaxed); }
+        }
+    }
     /// A protected data frame the firmware did not decrypt: [unicast,
     /// multicast] x CCMP key index from its header, and the status' cipher
     /// field (0 none, 2 CCM with a MIC failure, 7 error, other).
@@ -201,6 +245,12 @@ pub mod gk {
         let _ = writeln!(out, "gtk_rx: tkip_fw {} tkip_sw {} michael_fail {} replay_drop {} undecryptable {}",
                          rx(FW), rx(SW), rx(MIC), rx(REPLAY), rx(UNDECRYPTED));
         let u = |i: usize| UNDEC[i].load(Relaxed);
+        let tid = EAPOL_TID.load(Relaxed);
+        let o = |i: usize| BA_OLD[i].load(Relaxed);
+        let _ = writeln!(out, "eapol: rx {} held {} dropped {} qfull {} held_overflow {} last_tid {}; ba_old t0 {} t1 {} t2 {} t3 {} t4 {} t5 {} t6 {} t7 {}",
+                         EAPOL_RX.load(Relaxed), EAPOL_HELD.load(Relaxed), EAPOL_DROPPED.load(Relaxed), EAPOL_QFULL.load(Relaxed),
+                         HELD_DROPPED.load(Relaxed), if tid == 0xff { alloc::string::String::from("none") } else { alloc::format!("{}", tid) },
+                         o(0), o(1), o(2), o(3), o(4), o(5), o(6), o(7));
         let ul = UNDEC_LAST_MS.load(Relaxed);
         let _ = writeln!(out, "rx_undecrypted: uc k0 {} k1 {} k2 {} k3 {} mc k0 {} k1 {} k2 {} k3 {} sec none {} mic {} err {} other {} foreign {} last {}",
                          u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7),
