@@ -32,11 +32,16 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 BOX = os.environ.get("F2FSINTEROP_BOX", "forain@172.16.158.150")
 LOCK = os.environ.get("F2FSINTEROP_LOCK", "")
 SSH = ["ssh", "-o", "BatchMode=yes", BOX]
-# name -> (mkfs options, mount options used while populating)
+# name -> (mkfs options, mount options used while populating[, image size])
 VARIANTS = {
     "lxdef": ("", ""),
     "lxnoi": ("", "noinline_data"),
     "lxext": ("-O extra_attr,inode_checksum,flexible_inline_xattr", ""),
+    # design f2fslxrw S5: multi-segment NAT (2G: segment_count_nat 6) and a
+    # volume whose version bitmaps overflow the commit block's private area
+    # (32G sparse: SIT+NAT bitmaps past offset 2048). Images stay sparse.
+    "lx2g": ("", "", "2G"),
+    "lx32g": ("", "", "32G"),
 }
 SIZE = "128M"
 results = []
@@ -80,15 +85,27 @@ def box(script, timeout=1800):
 
 
 def fetch(remote, local):
+    """gzip over ssh, written sparse (all-zero MiB chunks become holes)."""
+    p1 = subprocess.Popen(SSH + [f"gzip -1c {remote}"], stdout=subprocess.PIPE)
+    p2 = subprocess.Popen(["gunzip"], stdin=p1.stdout, stdout=subprocess.PIPE)
+    p1.stdout.close()
     with open(local, "wb") as f:
-        p1 = subprocess.Popen(SSH + [f"gzip -1c {remote}"], stdout=subprocess.PIPE)
-        p2 = subprocess.Popen(["gunzip"], stdin=p1.stdout, stdout=f)
-        p1.stdout.close(); p2.wait(); return p1.wait() == 0 and p2.returncode == 0
+        zero = bytes(1 << 20)
+        while True:
+            c = p2.stdout.read(1 << 20)
+            if not c:
+                break
+            if c == zero[:len(c)]:
+                f.seek(len(c), 1)
+            else:
+                f.write(c)
+        f.truncate(f.tell())
+    p2.wait(); return p1.wait() == 0 and p2.returncode == 0
 
 
 def push(local, remote):
     p1 = subprocess.Popen(["gzip", "-1c", local], stdout=subprocess.PIPE)
-    p2 = subprocess.run(SSH + [f"gunzip > {remote}"], stdin=p1.stdout)
+    p2 = subprocess.run(SSH + [f"gunzip | dd of={remote} bs=1M conv=sparse status=none"], stdin=p1.stdout)
     p1.stdout.close(); return p1.wait() == 0 and p2.returncode == 0
 
 
@@ -199,10 +216,11 @@ def direction_a(variants, tmp):
     imgs, shas = [], {}
     try:
         for v in variants:
-            mo, mnt = VARIANTS[v]
+            mo, mnt, *sz = VARIANTS[v]
+            size = sz[0] if sz else SIZE
             mnt = f",{mnt}" if mnt else ""
             script = f"""set -e; D={rd}; mkdir -p $D/m; cd $D; N={v}; rm -f $N.img
-truncate -s {SIZE} $N.img; mkfs.f2fs -q -f -l $N {mo} $N.img
+truncate -s {size} $N.img; mkfs.f2fs -q -f -l $N {mo} $N.img
 sudo mount -o loop{mnt} $N.img m; cd m; sudo chown $(id -u) .
 mkdir -p upg small dir1/sub big inl2/x; echo one > inl2/x/f; echo hello > small/inl; printf 'x%.0s' $(seq 3000) > small/inl3000
 head -c 5000 /dev/urandom > small/f5000; : > small/empty
@@ -221,7 +239,7 @@ set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"
             local = os.path.join(tmp, v + ".img")
             if not fetch(f"{rd}/{v}.img", local):
                 step(v, "A.ship", False, "image transfer failed"); continue
-            imgs.append(v); shas[v] = sha(local)
+            imgs.append(v); shas[v] = sha(local) if not sz else None
     finally:
         box(f"rm -rf {rd}")
     if not imgs:
@@ -250,7 +268,7 @@ set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"
             skip(v, "A.ro-unchanged", "volume was written")
             inline_verify(v, tmp, il)
         else:
-            same = sha(os.path.join(tmp, v + ".img")) == shas[v]
+            same = shas[v] is None or sha(os.path.join(tmp, v + ".img")) == shas[v]
             step(v, "A.ro-unchanged", same, "image bit-identical" if same else "image CHANGED by refused write/ro mount")
 
 
