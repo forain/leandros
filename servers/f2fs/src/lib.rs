@@ -3465,6 +3465,58 @@ pub(crate) fn ssa_set(ms: &mut MountState, phys: u32, nid: u32, ofs: u16, ver: O
     w16(blk, e + 5, ofs);
 }
 
+/// Owner (nid, ofs_in_node) recorded in the SSA for main-area block `phys`.
+pub(crate) fn ssa_get(ms: &mut MountState, phys: u32) -> Option<(u32, u16)> {
+    if !ms.sb.fmt.lx || phys < ms.sb.main_blkaddr { return None; }
+    let rel = phys - ms.sb.main_blkaddr;
+    let (seg, b) = (rel / ms.sb.blocks_per_seg, (rel % ms.sb.blocks_per_seg) as usize);
+    let blkno = ssa_blk(ms, seg)?;
+    let cur = ms.cache.read(ms.dev, blkno);
+    let e = b * SSA_ENTRY;
+    Some((r32(cur, e), r16(cur, e + 5)))
+}
+
+/// Is `phys` marked valid in the SIT (as the cache currently has it)?
+pub(crate) fn sit_valid(ms: &mut MountState, phys: u32) -> bool {
+    let (seg, b) = match blkaddr_to_seg(ms, phys) { Some(x) => x, None => return false };
+    if seg >= ms.sb.seg_cnt_main { return false; }
+    let fmt = ms.sb.fmt;
+    let blkno = ms.sb.sit_addr(seg / SIT_PER_BLK as u32);
+    let off = (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE + SIT_VMAP_OFF + b as usize / 8;
+    let blk = ms.cache.read(ms.dev, blkno as u64);
+    off < BLOCK_SIZE && blk[off] & sit_vbit(fmt, b as usize) != 0
+}
+
+/// Linux check_index_in_prev_nodes: data block `a` is about to be owned by
+/// (`nid`, `ofs`). If the checkpoint had it valid under a different slot, drop
+/// that stale pointer (and refund the owner inode's i_blocks) so that no two
+/// slots reference one block.
+pub(crate) fn drop_prev_owner(ms: &mut MountState, a: u32, nid: u32, ofs: u16) -> bool {
+    if !sit_valid(ms, a) { return false; }
+    let (onid, oofs) = match ssa_get(ms, a) { Some(x) => x, None => return false };
+    if onid == 0 || (onid == nid && oofs == ofs) { return false; }
+    let na = nat_lookup(ms, onid);
+    if na == 0 { return false; }
+    let f = ms.sb.fmt;
+    let (cur, oino) = {
+        let b = ms.cache.read(ms.dev, na as u64);
+        let oino = f.footer_ino(b);
+        let isino = oino == onid;
+        let idx = oofs as usize;
+        let cur = if isino { if idx < inode_max_direct(f, b) { inode_get_blkaddr(f, b, idx) } else { 0 } }
+                  else if idx < f.per_block() { dnode_get_blkaddr(f, b, idx) } else { 0 };
+        (cur, oino)
+    };
+    if cur != a { return false; }
+    {
+        let b = ms.cache.get_mut(ms.dev, na as u64);
+        if oino == onid { inode_set_blkaddr(f, b, oofs as usize, 0); lx_zero_ext(f, b); } else { dnode_set_blkaddr(f, b, oofs as usize, 0); }
+    }
+    let ia = nat_lookup(ms, oino);
+    if ia != 0 { let b = ms.cache.get_mut(ms.dev, ia as u64); inode_add_blocks(f, b, -1); }
+    true
+}
+
 /// Set segment `seg`'s summary footer: node (true) or data segment.
 pub(crate) fn ssa_set_kind(ms: &mut MountState, seg: u32, node: bool) {
     let blkno = match ssa_blk(ms, seg) { Some(x) => x, None => return };

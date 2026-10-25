@@ -1338,6 +1338,15 @@ pub(crate) fn recover_linux(ms: &mut MountState, chain: &[LxChain]) -> u32 {
             lx_type_class(ms, a, true);
             crate::ssa_set(ms, a, nid, 0, None);
         }
+        // Linux check_index_in_prev_nodes: a recovered data block the
+        // checkpoint had under another slot loses that stale pointer first.
+        for &(a, nid, ofs) in &new_d {
+            if old_a.contains(&a) { continue; }
+            if crate::drop_prev_owner(ms, a, nid, ofs) {
+                dbg_str("[F2FS] roll-forward: block "); dbg_dec(a as usize);
+                dbg_str(" taken from its checkpoint owner\n");
+            }
+        }
         for &(a, nid, ofs) in &new_d {
             if old_a.contains(&a) { continue; }
             lx_type_class(ms, a, false);
