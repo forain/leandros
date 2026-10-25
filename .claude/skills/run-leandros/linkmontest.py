@@ -28,7 +28,7 @@ TX_MIB = 32
 
 
 def main(argv):
-    arch = "x86_64" if "x86_64" in argv else "aarch64"
+    arch = "x86_64" if "x86_64" in argv else ("aarch64" if "aarch64" in argv else os.environ.get("LEANDROS_TEST_ARCH", "aarch64"))
     keep = "--keep" in argv
     caller = os.environ.get("LEANDROS_RUN_ID", "")
     subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
@@ -57,9 +57,10 @@ def main(argv):
         return float(m.group(1)) if m else -1.0
 
     try:
-        subprocess.run([sys.executable, DRV, "start", arch], capture_output=True, text=True, timeout=900)
-        subprocess.run([sys.executable, DRV, "login", "root", "root", str(int(120 * scale))],
-                       capture_output=True, text=True, timeout=1200)
+        st = subprocess.run([sys.executable, DRV, "start", arch], capture_output=True, text=True, timeout=900)
+        lg = subprocess.run([sys.executable, DRV, "login", "root", "root", str(int(120 * scale))],
+                            capture_output=True, text=True, timeout=1200)
+        boot = f"start rc={st.returncode} {(st.stdout + st.stderr)[-300:]!r} login rc={lg.returncode} {(lg.stdout + lg.stderr)[-200:]!r}"
         t0 = time.time()
         nic = ""
         while time.time() - t0 < 120 * scale:
@@ -68,7 +69,7 @@ def main(argv):
                 break
             time.sleep(2)
         if "driver: e1000e" not in nic or "dhcp: bound" not in nic:
-            verdict("setup", False, f"no e1000e lease: {nic[-300:]!r}")
+            verdict("setup", False, f"no e1000e lease: {nic[-300:]!r}; {boot}")
             return 1
         time.sleep(3)
         # idle wakes

@@ -1,5 +1,6 @@
 //! Memory utility functions for kernel linkage
 
+#[cfg(not(target_arch = "x86_64"))]
 #[no_mangle]
 pub unsafe extern "C" fn memset(dest: *mut u8, val: i32, count: usize) -> *mut u8 {
     let val = val as u8;
@@ -11,6 +12,7 @@ pub unsafe extern "C" fn memset(dest: *mut u8, val: i32, count: usize) -> *mut u
     dest
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, count: usize) -> *mut u8 {
     let mut dst_ptr = dest;
@@ -23,6 +25,7 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, count: usize) -> 
     dest
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 #[no_mangle]
 pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, count: usize) -> *mut u8 {
     if dest == src as *mut u8 {
@@ -47,6 +50,32 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, count: usize) ->
         }
         dest
     }
+}
+
+
+// x86_64: string instructions (rep movsq/stosq + byte tail), see mem_x86.rs.
+// Kept in its own file so the host test (kernel/memtest, run under Rosetta)
+// exercises exactly this code.
+#[cfg(target_arch = "x86_64")]
+#[path = "mem_x86.rs"]
+mod x86;
+
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn memset(dest: *mut u8, val: i32, count: usize) -> *mut u8 {
+    x86::fill(dest, val as u8, count)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, count: usize) -> *mut u8 {
+    x86::copy_forward(dest, src, count)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, count: usize) -> *mut u8 {
+    x86::copy_overlapping(dest, src, count)
 }
 
 #[no_mangle]
