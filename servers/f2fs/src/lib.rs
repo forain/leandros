@@ -130,6 +130,22 @@ const SB_ROOT_INO:          usize = 96;
 /// `LX_TAG` uses Linux's exact node/inode/dentry layout (`Fmt::lx`); every
 /// other volume (all older images: empty string) keeps the legacy layout.
 const SB_INIT_VERSION:      usize = 1924;
+const SB_LOG_BLOCKSIZE:    usize = 16;
+const SB_SEGS_PER_SEC:     usize = 24;
+const SB_CP_PAYLOAD:       usize = 1664;
+const SB_FEATURE:          usize = 2180;
+const SB_DEVS0_PATH:       usize = 2201;
+/// Superblock features of a Linux volume that we can write safely: ATOMIC_WRITE,
+/// EXTRA_ATTR, PRJQUOTA, FLEXIBLE_INLINE_XATTR, INODE_CRTIME, LOST_FOUND,
+/// SB_CHKSUM. INODE_CHKSUM (0x20) is NOT here until inode checksums are kept.
+const FEAT_RW_OK: u32 = 0x4 | 0x8 | 0x10 | 0x40 | 0x100 | 0x200 | 0x800;
+/// Flip once linux_import preserves Linux's current-segment summaries.
+const NATIVE_IMPORT_SAFE: bool = false;
+const FEAT_BLKZONED: u32 = 0x2;
+const CP_ERROR_FLAG:     u32 = 0x0000_0008;
+const CP_FSCK_FLAG:      u32 = 0x0000_0010;
+const CP_QUOTA_NEED_FSCK: u32 = 0x0000_0400;
+const CP_DISABLED_FLAG:  u32 = 0x0000_1000;
 const LX_TAG: &[u8] = b"LeandrOS lxnode";
 
 // Checkpoint offsets (within a checkpoint block)
@@ -1135,6 +1151,16 @@ struct SbInfo {
     root_ino: u32,
     /// Node-block format of this volume, from `init_version` (see `Fmt`).
     fmt: Fmt,
+    /// Made by Linux's mkfs.f2fs (`init_version` starts "Linux version").
+    native: bool,
+    /// Superblock `feature` bits.
+    feat: u32,
+    segs_per_sec: u32,
+    /// `cp_payload` (checkpoint blocks holding bitmap overflow).
+    cp_payload: u32,
+    /// `devs[0].path[0] != 0`: a multi-device volume.
+    multi_dev: bool,
+    log_blocksize: u32,
 }
 
 impl SbInfo {
@@ -1142,7 +1168,14 @@ impl SbInfo {
         let sb = &block0[F2FS_SB_OFFSET..];
         if r32(sb, SB_MAGIC) != F2FS_MAGIC { return None; }
         let log_bps = r32(sb, SB_LOG_BLK_PER_SEG);
+        let native = sb[SB_INIT_VERSION..].starts_with(b"Linux version");
         Some(Self {
+            native,
+            feat:            r32(sb, SB_FEATURE),
+            segs_per_sec:    r32(sb, SB_SEGS_PER_SEC),
+            cp_payload:      r32(sb, SB_CP_PAYLOAD),
+            multi_dev:       sb[SB_DEVS0_PATH] != 0,
+            log_blocksize:   r32(sb, SB_LOG_BLOCKSIZE),
             blocks_per_seg:  1u32 << log_bps,
             block_count:     r64(sb, SB_BLOCK_COUNT),
             seg_cnt_ckpt:    r32(sb, SB_SEG_CNT_CKPT),
@@ -1156,7 +1189,7 @@ impl SbInfo {
             nat_blkaddr:     r32(sb, SB_NAT_BLKADDR),
             main_blkaddr:    r32(sb, SB_MAIN_BLKADDR),
             root_ino:        r32(sb, SB_ROOT_INO),
-            fmt:             Fmt { lx: sb[SB_INIT_VERSION..].starts_with(LX_TAG) },
+            fmt:             Fmt { lx: native || sb[SB_INIT_VERSION..].starts_with(LX_TAG) },
         })
     }
 }
@@ -5624,6 +5657,7 @@ fn dir_lookup_ft(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> (u32, u8) {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
         let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
     };
+    if lx_inline_refused(ms.sb.fmt, &iblk_copy, dir_ino) { ms.walk_err = -5; return (0, 0); } // EIO, not ENOENT
     let fsize = inode_size(&iblk_copy);
     let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
 
@@ -8206,7 +8240,7 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
 /// every mutating request answers EROFS. The only way to look at an f2fs
 /// volume on a disk the block layer refuses to write (an NVMe disk without
 /// `nvme.rw=1`).
-pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, read_only: bool) -> Option<u32> {
+pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut read_only: bool) -> Option<u32> {
     // Read and parse superblock
     let mut block0 = [0u8; BLOCK_SIZE];
     if !virtio_blk::read_block(dev_idx, 0, &mut block0) { return None; }
@@ -8217,6 +8251,23 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     if sb.blocks_per_seg != 512 {
         dbg_str("[F2FS] unsupported segment size (log_blocks_per_seg != 9); not mounting\n");
         return None;
+    }
+    if sb.log_blocksize != 12 || sb.multi_dev || sb.feat & FEAT_BLKZONED != 0 {
+        dbg_str("[F2FS] unsupported volume (block size, multi-device or zoned); not mounting\n");
+        return None;
+    }
+    if sb.native {
+        // Policy for volumes Linux made (design f2fslxrw section 3): anything
+        // we cannot write back faithfully is mounted read-only. Inode
+        // checksums (feature 0x20) are not maintained yet: one write would
+        // invalidate every inode it touches.
+        let bad = sb.feat & !FEAT_RW_OK;
+        if bad != 0 || sb.segs_per_sec != 1 {
+            dbg_str("[F2FS] Linux volume: feature mask ");
+            dbg_dec(bad as usize);
+            dbg_str(" / segs_per_sec not supported for writing; mounting read-only\n");
+            read_only = true;
+        }
     }
 
     // Read both checkpoint packs; select the one with higher version
@@ -8293,6 +8344,34 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     let incompat = if durable::cp_block_has_journal(pbuf) { r32(pbuf, durable::CPJ_INCOMPAT_OFF) } else { 0 };
     let unknown = incompat & !durable::CPJ_INCOMPAT_KNOWN;
     let foreign = if pick1 { foreign1 } else { foreign0 };
+    if foreign || sb.native {
+        let fl = cp.flags;
+        let why = if fl & (CP_FSCK_FLAG | CP_ERROR_FLAG | CP_DISABLED_FLAG | CP_QUOTA_NEED_FSCK) != 0 {
+            Some("checkpoint flags ask for fsck or report an error")
+        } else if foreign && fl & CP_UMOUNT_FLAG == 0 {
+            Some("unclean Linux shutdown; mount it on Linux once to recover")
+        } else if fl & CP_ORPHAN_PRESENT != 0 {
+            Some("orphan inodes are not reaped yet")
+        } else if sb.seg_cnt_nat != 2 || sb.cp_payload > 0
+            || CP_VER_BITMAP + r32(pbuf, CP_SIT_BM_SIZE) as usize + r32(pbuf, CP_NAT_BM_SIZE) as usize > 2048 {
+            Some("volume too large for import yet")
+        } else { None };
+        if let Some(w) = why {
+            dbg_str("[F2FS] Linux volume ("); dbg_str(w); dbg_str("); mounting read-only\n");
+            read_only = true;
+        }
+    }
+    if foreign && sb.native && !NATIVE_IMPORT_SAFE {
+        // Measured (lane f2fslxsafe): even a mount that only reads makes
+        // `linux_import` commit a checkpoint that drops Linux's six current
+        // segment summaries, and fsck.f2fs then fails on the volume. Until
+        // those are carried over (design f2fslxrw S4) and a real read-only
+        // path exists (S6), a Linux-made volume is not mounted at all.
+        dbg_str("[F2FS] ");
+        dbg_str(virtio_blk::dev_path(dev_idx));
+        dbg_str(": Linux-made volume not supported yet (mounting would corrupt it); refusing the mount. Use it on Linux\n");
+        return None;
+    }
     if foreign {
         if read_only || unknown != 0 {
             dbg_str("[F2FS] the newest checkpoint was written by Linux; mount read-write once to import it\n");
