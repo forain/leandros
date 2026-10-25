@@ -297,9 +297,10 @@ fn dw(dev: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
 /// Write `data` (whole blocks) at `blk` in requests of `WB_IO_BLOCKS`.
 /// Write a pack's Linux tail at `at` (LINUX_TAIL blocks): six zero summary
 /// blocks when `zero`, and always the footer copy of the sealed commit block.
-fn write_tail(dev: usize, at: u64, cp: &[u8; BLOCK_SIZE], zero: bool, cmds: &mut u32) -> bool {
-    if !zero { *cmds += 1; return dw(dev, at + LINUX_TAIL as u64 - 1, cp); }
+fn write_tail(dev: usize, at: u64, cp: &[u8; BLOCK_SIZE], zero: bool, sums: Option<&[u8]>, cmds: &mut u32) -> bool {
+    if sums.is_none() && !zero { *cmds += 1; return dw(dev, at + LINUX_TAIL as u64 - 1, cp); }
     let mut t = alloc::vec![0u8; LINUX_TAIL as usize * BLOCK_SIZE];
+    if let Some(s) = sums { t[..s.len()].copy_from_slice(s); }
     t[(LINUX_TAIL as usize - 1) * BLOCK_SIZE..].copy_from_slice(cp);
     dws(dev, at, &t, cmds)
 }
@@ -543,6 +544,8 @@ pub(crate) struct CpJob {
     /// Zero the six summary blocks of the Linux tail with this commit (the
     /// footer copy of the commit block is written every time).
     pub zero_tail: bool,
+    /// lx: the six summary blocks (SSA copies of the current logs), written every commit.
+    pub tail_sums: Option<Vec<u8>>,
     pub reg_blocks: [u32; REGS],
 }
 
@@ -735,9 +738,10 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     ms.dur.inflight_rf_start = rf_start;
     let ext = ext_segs.iter().map(|&s| ms.sb.main_blkaddr as u64 + s as u64 * ms.sb.blocks_per_seg as u64).collect();
     let zero_tail = core::mem::replace(&mut ms.dur.tail_dirty[pack as usize], false);
+    let tail_sums = crate::lx_tail_sums(ms, &logs);
     Ok(CpJob {
         dev: ms.dev, ver: ms.cp.ver, direct, direct_reg, jhome, jimg,
-        pack_base: pack_base(ms, pack), pack_cap, ext, cp_blkno, cp_buf, umount, reg_blocks, zero_tail,
+        pack_base: pack_base(ms, pack), pack_cap, ext, cp_blkno, cp_buf, umount, reg_blocks, zero_tail, tail_sums,
     })
 }
 
@@ -812,7 +816,7 @@ pub(crate) fn cp_write(job: &mut CpJob, port: u32) -> CpIo {
     io.reg_cmds[REG_CP] += 1;
     // Linux's view of the pack, in the same flush as the commit block. This
     // kernel never reads it, so a failed write does not fail the commit.
-    io.home_ok &= write_tail(dev, job.pack_base + 1 + job.pack_cap as u64, &job.cp_buf, job.zero_tail,
+    io.home_ok &= write_tail(dev, job.pack_base + 1 + job.pack_cap as u64, &job.cp_buf, job.zero_tail, job.tail_sums.as_deref(),
                              &mut io.reg_cmds[REG_CP]);
     let tf = sched::monotonic_ns();
     io.reg_ns[REG_CP] += tf.saturating_sub(t);
@@ -886,7 +890,7 @@ pub(crate) fn read_journal(dev: usize, sb: &SbInfo, base: u64, cpb: &[u8; BLOCK_
     let job_like = CpJob {
         dev, ver: 0, direct: Vec::new(), direct_reg: Vec::new(), jhome: Vec::new(), jimg: Vec::new(),
         pack_base: base, pack_cap: pack_blks - 1 - cp_tail(cpb), ext, cp_blkno: 0, cp_buf: [0; BLOCK_SIZE],
-        umount: false, reg_blocks: [0; REGS], zero_tail: false,
+        umount: false, reg_blocks: [0; REGS], zero_tail: false, tail_sums: None,
     };
     if total > job_like.pack_cap + 512 * next as u32 { return Err(()); }
     let h = (j + JIX_PER_BLK - 1) / JIX_PER_BLK;
@@ -1345,6 +1349,7 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
     // Commit block and the snapshot bookkeeping, in cp_prepare's order.
     let pack = 1 - ms.dur.durable_pack;
     let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack, &logs);
+    let sums = crate::lx_tail_sums(ms, &logs);
     w32(&mut cp_buf, CPJ_MAGIC_OFF, CPJ_MAGIC);
     w32(&mut cp_buf, CPJ_INCOMPAT_OFF, if rf_enabled() { CPJ_INCOMPAT_RF } else { 0 });
     put_orphans(ms, &mut cp_buf);
@@ -1404,7 +1409,7 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
         ok &= dw(dev, cp_blkno, &cp_buf);
         let zero = core::mem::replace(&mut ms.dur.tail_dirty[pack as usize], false);
         let mut cmds = 0;
-        if !write_tail(dev, pbase + pack_room(ms) as u64, &cp_buf, zero, &mut cmds) {
+        if !write_tail(dev, pbase + pack_room(ms) as u64, &cp_buf, zero, sums.as_deref(), &mut cmds) {
             ms.dur.tail_dirty[pack as usize] = true;
         }
         ok &= dflush(dev);

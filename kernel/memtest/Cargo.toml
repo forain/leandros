@@ -1,0 +1,10 @@
+[package]
+name = "kernel-memtest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Host check of kernel/src/mem_x86.rs (the x86_64 kernel memcpy/memset/memmove).
+# On an Apple-silicon Mac run it under Rosetta:
+#   cargo test --manifest-path kernel/memtest/Cargo.toml --target x86_64-apple-darwin
+[workspace]
