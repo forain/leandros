@@ -33,7 +33,7 @@ import sys
 import time
 
 os.environ.setdefault("LEANDROS_RUN_ID", "doom")
-os.environ.setdefault("LEANDROS_VNC_PORT", "5938")
+os.environ.setdefault("LEANDROS_VNC_BASE", "5938")
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get("REPO", os.path.abspath(os.path.join(HERE, "../../..")))
 DRV = os.path.join(HERE, "driver.py")

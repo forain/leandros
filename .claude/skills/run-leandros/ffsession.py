@@ -61,7 +61,7 @@ import sys
 import time
 
 os.environ.setdefault("LEANDROS_RUN_ID", "firefox")
-os.environ.setdefault("LEANDROS_VNC_PORT", "5937")
+os.environ.setdefault("LEANDROS_VNC_BASE", "5937")
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get("REPO", os.path.abspath(os.path.join(HERE, "../../..")))
 DRV = os.path.join(HERE, "driver.py")

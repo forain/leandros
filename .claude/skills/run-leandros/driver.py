@@ -328,8 +328,56 @@ VENUS_GPU_DEV = "virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,id=venusgpu"
 # The listener and the port the photograph is taken from are derived from ONE
 # value: they used to be separate (the listener hardcoded to :9), so a
 # LEANDROS_VNC_PORT other than 5909 grabbed from a port nothing listened on.
-VENUS_VNC_PORT = int(os.environ.get("LEANDROS_VNC_PORT", "5909"))
+# An explicit LEANDROS_VNC_PORT is always honoured. Without one, cmd_start picks
+# the first free port from LEANDROS_VNC_BASE (default 5909) under a host-wide
+# flock (_pick_vnc_port), so concurrent sessions never collide; every later
+# consumer reads the chosen port from VNC_STATE_FILE.
+VNC_EXPLICIT = "LEANDROS_VNC_PORT" in os.environ
+VENUS_VNC_PORT = int(os.environ.get("LEANDROS_VNC_PORT",
+                                    os.environ.get("LEANDROS_VNC_BASE", "5909")))
 VENUS_VNC_ADDR = f"127.0.0.1:{VENUS_VNC_PORT - 5900}"
+_VNC_PICK_LOCK = None
+
+
+def _vnc_port_free(p):
+    import socket
+    for host in ("127.0.0.1", "0.0.0.0"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((host, p))
+        except OSError:
+            return False
+        finally:
+            s.close()
+    return True
+
+
+def _pick_vnc_port():
+    """Pick a free VNC port (>= base) and keep the host-wide pick lock until
+    _release_vnc_pick() (after QEMU has bound it), so two starts cannot choose
+    the same port."""
+    global VENUS_VNC_PORT, VENUS_VNC_ADDR, _VNC_PICK_LOCK
+    if VNC_EXPLICIT:
+        return
+    import fcntl
+    _VNC_PICK_LOCK = open("/tmp/leandros-vnc-pick.lock", "w")
+    fcntl.flock(_VNC_PICK_LOCK, fcntl.LOCK_EX)
+    for p in range(VENUS_VNC_PORT, VENUS_VNC_PORT + 200):
+        if _vnc_port_free(p):
+            VENUS_VNC_PORT = p
+            VENUS_VNC_ADDR = f"127.0.0.1:{p - 5900}"
+            return
+    sys.exit("no free VNC port found")
+
+
+def _release_vnc_pick():
+    global _VNC_PICK_LOCK
+    if _VNC_PICK_LOCK is not None:
+        deadline = time.time() + 5
+        while _vnc_port_free(VENUS_VNC_PORT) and time.time() < deadline:
+            time.sleep(0.1)
+        _VNC_PICK_LOCK.close()
+        _VNC_PICK_LOCK = None
 
 
 # Written at `start` when this run has a VNC listener on a GL console, so a
@@ -1328,6 +1376,7 @@ def cmd_start(arch="aarch64", mode="uefi", venus=False, virgl=False):
         sys.exit(1)
 
     _cleanup_socks()
+    _pick_vnc_port()
     open(SERIAL_LOG, "wb").close()
 
     qemu_cmd = _build_cmd(arch, mode, venus=venus, virgl=virgl)
@@ -1396,6 +1445,7 @@ def cmd_start(arch="aarch64", mode="uefi", venus=False, virgl=False):
             sys.exit(f"ERROR: serial socket did not appear.\nQEMU stderr:\n{err}")
         time.sleep(0.1)
 
+    _release_vnc_pick()
     # Only now is it true that a guest actually started.
     print(f"QEMU started (PID {proc.pid}, arch={arch}{', venus' if venus else ''})")
     print("Serial socket up. Waiting for login/shell prompt (up to 120s)...")
