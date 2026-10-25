@@ -1317,8 +1317,19 @@ pub(crate) fn recover_linux(ms: &mut MountState, chain: &[LxChain]) -> u32 {
                 dentry = Some(r32(b, 84));
             }
         }
+        // Dnodes below the inode's own i_nid slots hang off indirect nodes
+        // Linux never flushed (an fsync writes only the inode and dnodes):
+        // build the path to each (Linux's get_dnode_of_data(ALLOC_NODE)).
+        let mut pre: Vec<u32> = Vec::new();
+        for e in chain.iter().filter(|e| e.ino == ino && e.ofs > 2 && e.ofs != crate::NODE_OFS_XATTR) {
+            if let Err(why) = lx_attach(ms, ino, e.ofs, e.nid, &mut pre) {
+                dbg_str("[F2FS] roll-forward: dnode "); dbg_dec(e.nid as usize);
+                dbg_str(" not linked: "); dbg_str(why); dbg_str("\n");
+            }
+        }
         let (new_n, new_d) = tree(ms, ino);
-        let old_a: BTreeSet<u32> = old_n.iter().map(|x| x.1).chain(old_d.iter().map(|x| x.0)).collect();
+        // `pre`: allocated (SIT, SSA, segment type done by the allocator) above.
+        let old_a: BTreeSet<u32> = old_n.iter().map(|x| x.1).chain(old_d.iter().map(|x| x.0)).chain(pre.iter().copied()).collect();
         let new_a: BTreeSet<u32> = new_n.iter().map(|x| x.1).chain(new_d.iter().map(|x| x.0)).collect();
         frees.extend(old_a.difference(&new_a).copied());
         uses.extend(new_a.difference(&old_a).copied());
@@ -1345,6 +1356,59 @@ pub(crate) fn recover_linux(ms: &mut MountState, chain: &[LxChain]) -> u32 {
     dbg_dec(inos.len());
     dbg_str(" file(s) recovered\n");
     chain.len() as u32
+}
+
+/// Link dnode `nid` (node offset `ofs` > 2) into the tree of `ino`: walk from
+/// the inode's i_nid slot through the indirect node(s), creating the ones
+/// Linux had not flushed (their nids are already in the fsynced inode) and
+/// storing the child nid at the last level. Allocated blocks go to `pre`.
+fn lx_attach(ms: &mut MountState, ino: u32, ofs: u32, nid: u32, pre: &mut Vec<u32>) -> Result<(), &'static str> {
+    let n = LX_N;
+    let f = ms.sb.fmt;
+    // (i_nid slot, [(offset of the indirect node, child index)])
+    let slot: usize;
+    let lv: [(u32, usize); 2];
+    let depth: usize;
+    if ofs >= NODE_OFS_IND1 + 1 && ofs < NODE_OFS_IND2 {
+        slot = 2; lv = [(NODE_OFS_IND1, (ofs - NODE_OFS_IND1 - 1) as usize), (0, 0)]; depth = 1;
+    } else if ofs > NODE_OFS_IND2 && ofs < NODE_OFS_DIND {
+        slot = 3; lv = [(NODE_OFS_IND2, (ofs - NODE_OFS_IND2 - 1) as usize), (0, 0)]; depth = 1;
+    } else if ofs > NODE_OFS_DIND {
+        let r = ofs - NODE_OFS_DIND - 1;
+        let (j, rr) = (r / (n + 1), r % (n + 1));
+        if rr == 0 || j >= n { return Err("not a dnode offset"); }
+        slot = 4; lv = [(NODE_OFS_DIND, j as usize), (NODE_OFS_DIND + 1 + j * (n + 1), (rr - 1) as usize)]; depth = 2;
+    } else { return Err("bad node offset"); }
+    let ia = nat_lookup(ms, ino);
+    if ia == 0 { return Err("inode gone"); }
+    let mut cur = { let b = ms.cache.read(ms.dev, ia as u64); inode_get_nid(f, b, slot) };
+    if cur == 0 {
+        cur = take_nid(ms).ok_or("no nid")?;
+        let b = ms.cache.get_mut(ms.dev, ia as u64);
+        inode_set_nid(f, b, slot, cur);
+    }
+    for k in 0..depth {
+        let (nofs, idx) = lv[k];
+        let mut a = nat_lookup(ms, cur);
+        if a == 0 {
+            a = crate::alloc_node_block(ms).ok_or("no space")?;
+            let mut buf = [0u8; BLOCK_SIZE];
+            f.write_footer(&mut buf, cur, ino, nofs);
+            ms.cache.write(ms.dev, a as u64, &buf);
+            crate::nat_update_owned(ms, cur, Some(ino), a);
+            if cur >= ms.cp.next_free_nid { ms.cp.next_free_nid = cur + 1; }
+            crate::ssa_set(ms, a, cur, 0, None);
+            pre.push(a);
+        }
+        let child = if k + 1 == depth { nid } else {
+            let c = { let b = ms.cache.read(ms.dev, a as u64); dnode_get_blkaddr(f, b, idx) };
+            if c != 0 { c } else { take_nid(ms).ok_or("no nid")? }
+        };
+        let b = ms.cache.get_mut(ms.dev, a as u64);
+        if dnode_get_blkaddr(f, b, idx) != child { dnode_set_blkaddr(f, b, idx, child); }
+        cur = child;
+    }
+    Ok(())
 }
 
 /// A file created after the checkpoint: put its name back in its parent.
@@ -1385,7 +1449,8 @@ fn recover_dentry_in(ms: &mut MountState, ino: u32, pino: u32) -> Result<(), &'s
             node_freed(ms, cur);
         }
     }
-    if !dir_add_entry(ms, pino, &name, ino, DT_REG) { return Err("dir_add_entry failed"); }
+    let dt = match inode_mode(&ib) & S_IFMT { 0o040000 => 4, 0o120000 => 10, 0o020000 => 2, 0o060000 => 6, 0o010000 => 1, 0o140000 => 12, _ => DT_REG };
+    if !dir_add_entry(ms, pino, &name, ino, dt) { return Err("dir_add_entry failed"); }
     Ok(())
 }
 
