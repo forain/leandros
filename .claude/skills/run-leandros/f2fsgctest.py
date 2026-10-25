@@ -39,6 +39,16 @@ def relabel(img):
             f.write(name + bytes(1024 - len(name)))
 
 
+
+def stop_caller_vm(caller):
+    """Under `runtests host:` the caller's VM still holds the write lock on the
+    root image, so this test's own QEMU would exit at once ("Failed to get
+    write lock", seen as "shell prompt not seen"). Stop it first."""
+    if caller:
+        subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py"), "stop"],
+                       env=dict(os.environ, LEANDROS_RUN_ID=caller), capture_output=True, timeout=120)
+
+
 def main(argv):
     arch, factor, cmdline, size, keep = "aarch64", 8, None, "64M", False
     i = 0
@@ -58,6 +68,7 @@ def main(argv):
             sys.exit(__doc__)
         i += 1
     caller = os.environ.get("LEANDROS_RUN_ID", "")
+    stop_caller_vm(caller)
     run_id = f"{caller}-f2fsgc" if caller else "f2fsgc"
     out = os.environ.get("F2FSGC_OUT", f"/tmp/f2fsgc-{arch}")
     os.makedirs(out, exist_ok=True)

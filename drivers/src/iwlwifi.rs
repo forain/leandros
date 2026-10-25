@@ -57,7 +57,9 @@
 //!                           unbind); the default tears down and falls back to
 //!                           a restart on any error
 //!   iwlwifi.scanconn=0      (mgr=1) do not scan while associated (default 1:
-//!                           UMAC scan on the associated MAC, as iwlmvm does);
+//!                           UMAC scan on the associated MAC, as iwlmvm does,
+//!                           fragmented: at most 120 ms off-channel, then
+//!                           120 ms back on the operating channel);
 //!                           with 0 scan requests while associated are
 //!                           answered from the cache
 //!   iwlwifi.rc=0            no rate control: the fixed LQ table (every AP
@@ -896,6 +898,7 @@ impl Dev {
 
     /// The association's data path is gone: forget its per-link state.
     fn clear_link(&mut self) {
+        HELD.clear();
         self.link = None;
         self.guard = None;
         self.tkip_group = None;
@@ -1036,7 +1039,7 @@ impl Dev {
         } else {
             match cmd::rx_crypto_lengths(fc, status) {
                 Some((h, t)) => (frame, h, t),
-                None => { self.rx_dropped += 1; self.rxs.undecrypted += 1; return; }
+                None => { self.rx_dropped += 1; self.rxs.undecrypted += 1; let foreign = self.guard.as_ref().map_or(false, |g| g.check_addr(frame).is_err()); wm::gk::note_undecrypted(frame, fc, status, foreign); return; }
             }
         };
         // Null data frames carry nothing (power-save signalling).
@@ -1048,12 +1051,14 @@ impl Dev {
         // (duplicates and replays are judged in sequence order after it).
         if let Some((tid, sn)) = ht::qos_tid_seq(frame) {
             if let Some(Some(r)) = self.agg.tids.get_mut(tid as usize) {
+                let old0 = r.stats.old;
                 match r.fast(sn) {
                     Some(ht::Fate::Direct) | Some(ht::Fate::PreSession) => {}
-                    Some(_) => return,
+                    Some(_) => { wm::gk::note_ba_old(tid, r.stats.old - old0); return; }
                     None => {
                         let mut out = Vec::new();
                         r.rx(sn, RxItem { frame: frame.to_vec(), h, t }, now_ms(), &mut out);
+                        wm::gk::note_ba_old(tid, r.stats.old - old0);
                         self.rx_release(out);
                         return;
                     }
@@ -1174,7 +1179,9 @@ impl Dev {
         if wf::is_eapol(eth) {
             let mut v = Vec::with_capacity(n);
             v.extend_from_slice(eth);
+            wm::gk::note_eapol_rx(ht::qos_tid_seq(frame).map_or(0xff, |(t, _)| t));
             if self.notifs.len() < 512 { self.notifs.push_back(RxPacket { cmd: 1, group: 0xff, seq: 0x8000, data: v }); }
+            else { wm::gk::note_eapol_qfull(); }
             return;
         }
         if !LINK_UP.load(Ordering::Relaxed) { return; }
@@ -1537,10 +1544,15 @@ fn log_async(p: RxPacket) {
                   p.data.get(4).copied().unwrap_or(0), cmd::le32(&p.data, 0).unwrap_or(0),
                   cmd::le16(&p.data, 6).unwrap_or(0), p.data.len());
         }
-        (0xff, _) => {}
+        // A received frame (0 management, 1 EAPOL) a wait did not claim:
+        // held for the connected loop / the handshake.
+        (0xff, c) if c <= 1 => HELD.unclaimed(p, c == 1, link_up()),
         _ => {}
     }
 }
+
+/// Frames popped by waits for something else (scan, time event, wait_mgmt).
+static HELD: wm::gk::Held<RxPacket> = wm::gk::Held::new();
 
 // ── firmware bring-up (W1) ──────────────────────────────────────────────────
 
@@ -1600,6 +1612,7 @@ fn start_image(fw: &Fw, img: usize, func: &PciFunction) -> Res<cmd::Alive> {
     let cpu2 = chunks(fw, img, &plan.cpu2);
     let what = if img == iwl_fw::IMG_INIT { "INIT" } else { "runtime" };
     with_dev(|d| { d.notifs.clear(); d.resps.clear(); d.last_phy = None; });
+    HELD.clear();
     let r = with_dev(|d| d.t.start_fw(func, &cpu1, &cpu2, img == iwl_fw::IMG_INIT)).unwrap();
     if let Err(e) = r {
         ilog!("{} image download failed: {:?}; {}", what, e, with_dev(|d| d.t.csr_dump()).unwrap_or_default());
@@ -1832,7 +1845,8 @@ fn run_rt(fw: &Fw, func: &PciFunction, hw: &mut Hw) -> Res<()> {
     }
     let n = fw.info.n_scan_channels as usize;
     send(cmd::SCAN_CFG_CMD, Some((cmd::LONG_GROUP, 0)),
-         &cmd::scan_config_v1(hw.tx_ant, hw.rx_ant, &hw.mac, AUX_STA_ID, &hw.channels, n))?;
+         &cmd::scan_config_v1(hw.tx_ant, hw.rx_ant, &hw.mac, AUX_STA_ID, &hw.channels, n, cmd::ScanTiming::UNASSOC))?;
+    SCAN_CFG_ASSOC.store(false, Ordering::Relaxed);
     // The station MAC context (unassociated) the scans and the association use.
     mac_ctxt(cmd::FW_CTXT_ACTION_ADD, &MacState::unassoc(hw.mac))?;
     Ok(())
@@ -1862,9 +1876,21 @@ fn mac_ctxt(action: u32, st: &MacState) -> Res<()> {
 
 // ── scan (W2) ───────────────────────────────────────────────────────────────
 
-fn scan(fw: &Fw, hw: &Hw, ssids: &[&[u8]]) -> Res<Vec<ScanEntry>> {
+/// Whether the last SCAN_CFG_CMD carried the associated timing.
+static SCAN_CFG_ASSOC: AtomicBool = AtomicBool::new(false);
+
+fn scan(fw: &Fw, hw: &Hw, ssids: &[&[u8]], associated: bool) -> Res<Vec<ScanEntry>> {
+    let timing = cmd::ScanTiming::for_assoc(associated);
+    let n = fw.info.n_scan_channels as usize;
+    // iwlmvm (iwl_mvm_config_scan) re-sends the scan config when the scan
+    // type changes; the request below carries the same budget.
+    if SCAN_CFG_ASSOC.load(Ordering::Relaxed) != associated {
+        send(cmd::SCAN_CFG_CMD, Some((cmd::LONG_GROUP, 0)),
+             &cmd::scan_config_v1(hw.tx_ant, hw.rx_ant, &hw.mac, AUX_STA_ID, &hw.channels, n, timing))?;
+        SCAN_CFG_ASSOC.store(associated, Ordering::Relaxed);
+    }
     with_dev(|d| { d.scan_results.clear(); d.scanning = true; });
-    let req = cmd::scan_req_umac_v7(0, MAC_ID as u8, &hw.mac, &hw.channels, fw.info.n_scan_channels as usize, ssids, false);
+    let req = cmd::scan_req_umac_v7(0, MAC_ID as u8, &hw.mac, &hw.channels, n, ssids, false, timing);
     let t0 = now_ms();
     let r = send(cmd::SCAN_REQ_UMAC, Some((cmd::LONG_GROUP, 0)), &req);
     if let Err(e) = r {
@@ -1965,7 +1991,7 @@ fn driver_thread(opts: Opts, path: String) {
     loop {
         set_state("scanning");
         let ssids: Vec<&[u8]> = creds.as_ref().map(|c| alloc::vec![&c.0[..]]).unwrap_or_default();
-        match scan(&fw, &hw, &ssids) {
+        match scan(&fw, &hw, &ssids, false) {
             Ok(mut list) => {
                 log_bss_list(&mut list);
                 if let Some(i) = INFO.lock().as_mut() { i.bss = list.clone(); i.scan_at_ms = now_ms(); }
@@ -2015,6 +2041,7 @@ fn restart_rt(fw: &Fw, func: &PciFunction, hw: &mut Hw, after_error: bool) -> bo
     *GROUP_REKEY.lock() = None;
     for attempt in 1..=3 {
         with_dev(|d| { d.t.stop_device(); d.clear_link(); d.async_cmds.clear(); d.notifs.clear(); d.resps.clear(); });
+        HELD.clear();
         set_state("restarting firmware");
         match run_rt(fw, func, hw) {
             Ok(()) => { if after_error { log("runtime firmware restarted after the error"); } return true; }
@@ -2625,7 +2652,8 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
             ilog!("4-way handshake timed out after {} message(s) to the AP", sent);
             return Err(wm::handshake_failure(sent > 0, None));
         }
-        let p = match wait_notif(left.min(100), |p| p.group == 0xff && (p.cmd == 1 || p.cmd == 0), log_async) {
+        let held = HELD.pop();
+        let p = match held.map(Ok).unwrap_or_else(|| wait_notif(left.min(100), |p| p.group == 0xff && (p.cmd == 1 || p.cmd == 0), log_async)) {
             Ok(p) => p,
             Err(Err::Timeout(_)) => continue,
             Err(e) => return Err(e.into()),
@@ -2805,7 +2833,7 @@ fn monitor_once(bssid: &[u8; 6], budget_ms: u64) -> Option<Fail> {
         poll_tx_agg(bssid);
         // Nothing due and the link idle: one long park (a notification, a TX
         // burst, a manager command or held frames kick it), then a look.
-        let quiet = IRQ_ON.load(Ordering::Acquire) && QUIET_KNOB.load(Ordering::Relaxed)
+        let quiet = IRQ_ON.load(Ordering::Acquire) && QUIET_KNOB.load(Ordering::Relaxed) && HELD.is_empty()
             && with_dev(|d| d.quiet_tick()).unwrap_or(false);
         if quiet {
             THREAD_QUIET.store(true, Ordering::Relaxed);
@@ -2813,7 +2841,9 @@ fn monitor_once(bssid: &[u8; 6], budget_ms: u64) -> Option<Fail> {
             wait_event(QUIET_PARK_MS);
             THREAD_QUIET.store(false, Ordering::Relaxed);
         }
-        match wait_notif(if quiet { 0 } else { (budget_ms - spent).min(100) }, |_| true, |_| {}) {
+        // Frames a scan or another wait popped meanwhile come first.
+        let held = HELD.pop();
+        match held.map(Ok).unwrap_or_else(|| wait_notif(if quiet { 0 } else { (budget_ms - spent).min(100) }, |_| true, |_| {})) {
             Ok(p) => {
                 if p.group == 0xff && p.cmd == 0 {
                     let f = &p.data[4..];
@@ -2999,7 +3029,7 @@ impl wm::Radio for IwlRadio {
     fn scan(&mut self, ssids: &[Vec<u8>], connected: bool) -> Result<Vec<wm::ScanHit>, Fail> {
         set_state(if connected { "connected (scanning)" } else { "scanning" });
         let refs: Vec<&[u8]> = ssids.iter().map(|s| &s[..]).collect();
-        let r = scan(&self.fw, &self.hw, &refs);
+        let r = scan(&self.fw, &self.hw, &refs, connected);
         set_state(if connected { "connected" } else { "up (manager)" });
         match r {
             Ok(mut list) => {
@@ -3108,6 +3138,7 @@ impl wm::Radio for IwlRadio {
         if on == !self.radio_off { return true; }
         if !on {
             with_dev(|d| { d.t.stop_device(); d.clear_link(); d.async_cmds.clear(); d.notifs.clear(); d.resps.clear(); });
+            HELD.clear();
             LINK_UP.store(false, Ordering::SeqCst);
             self.radio_off = true;
             self.prog = Prog::default();

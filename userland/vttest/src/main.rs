@@ -1380,6 +1380,9 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
             cmd_trap(tty0, if argc > 2 { arg_num(argv, 2) as i64 } else { 30000 })
         } else if arg_eq(argv, 1, b"state") {
             cmd_state(tty0)
+        } else if arg_eq(argv, 1, b"chvt") && argc > 2 {
+            // chvt <vt>: synchronous switch, for scripted VT checks (lane gamevt).
+            if switch_to(tty0, arg_num(argv, 2)) { 0 } else { out(b"vttest chvt: switch failed\n"); 1 }
         } else if arg_eq(argv, 1, b"kbdrep") {
             // kbdrate: set delay/period (ms), print what is in force.
             let mut r = kbd_repeat { delay: if argc > 2 { arg_num(argv, 2) as c_int } else { 0 },

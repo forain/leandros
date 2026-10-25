@@ -111,6 +111,8 @@ const SB_LOG_BLK_PER_SEG:  usize = 20;
 /// metadata areas. Offset 36 in `struct f2fs_super_block`.
 const SB_BLOCK_COUNT:      usize = 36;
 const SB_SEG_CNT_CKPT:     usize = 52;
+const SB_SEG_CNT_SIT:       usize = 56;
+const SB_SEG_CNT_SSA_RAW:   usize = 64;
 const SB_SEG_CNT_NAT:       usize = 60;
 /// `__le32 segment_count_main` — segments in the main (user data) area. This
 /// times `blocks_per_seg` is Linux's `sbi->user_block_count`.
@@ -132,7 +134,7 @@ const CP_CUR_NODE_SEGNO: usize = 36;   // u32 [0] of node log
 const CP_CUR_NODE_BLKOFF:usize = 68;   // u16 [0] of node log
 const CP_CUR_DATA_SEGNO: usize = 84;   // u32 [0] of data log
 const CP_CUR_DATA_BLKOFF:usize = 116;  // u16 [0] of data log
-const CP_PACK_TOTAL:     usize = 136;
+pub(crate) const CP_PACK_TOTAL: usize = 136;
 const CP_NEXT_FREE_NID:  usize = 152;
 /// `__le32 ckpt_flags`. Only `CP_UMOUNT_FLAG` is used here: Linux sets it on
 /// the checkpoint written by a clean unmount (`f2fs_put_super` ->
@@ -140,6 +142,35 @@ const CP_NEXT_FREE_NID:  usize = 152;
 /// newest pack at mount time is exactly "the volume was not shut down
 /// cleanly" (Linux then runs roll-forward recovery).
 const CP_CKPT_FLAGS:     usize = 132;
+// Fields only Linux reads (lane f2fscrc): its sanity_check_ckpt rejects a
+// checkpoint without them.
+const CP_USER_BLOCK_CNT: usize = 8;
+const CP_VALID_BLOCK_CNT:usize = 16;
+const CP_RSVD_SEG_CNT:   usize = 24;
+const CP_OVP_SEG_CNT:    usize = 28;
+const CP_START_SUM:      usize = 140;
+const CP_VALID_NODE_CNT: usize = 144;
+const CP_SIT_BM_SIZE:    usize = 156;
+const CP_NAT_BM_SIZE:    usize = 160;
+const CP_ALLOC_TYPE:     usize = 176;
+const CP_ALLOC_SSR:      u8    = 1;
+/// This kernel's data/node log heads in a checkpoint that carries the Linux
+/// CRC (`!cp_is_legacy`): data segno u32, node segno u32, data blkoff u16,
+/// node blkoff u16, in the 12 bytes between the journal extension list and
+/// CPJ_INCOMPAT_OFF. The standard curseg fields hold heads Linux accepts
+/// (lane f2fscrc3); a legacy checkpoint's heads are its standard fields.
+const CP_OWN_HEADS:      usize = 3348;
+/// This kernel's copy of `checkpoint_ver` (u64). Linux's f2fs rewrites the
+/// commit block from the bytes it loaded, so a block Linux wrote keeps the
+/// old value here while bumping `checkpoint_ver`: that tells a Linux-written
+/// checkpoint apart (`cp_is_foreign`). Past the version bitmaps (192..) and
+/// before the journal header (3072).
+const CP_OWN_VER:        usize = 2048;
+/// `sit_nat_version_bitmap`: the SIT bitmap, then the NAT bitmap (cp_payload 0).
+const CP_VER_BITMAP:     usize = 192;
+const CP_ORPHAN_PRESENT: u32   = 0x0000_0002;
+const CP_COMPACT_SUM:    u32   = 0x0000_0004;
+const CP_LARGE_NAT_BM:   u32   = 0x0000_0200;
 const CP_UMOUNT_FLAG:    u32   = 0x0000_0001;
 
 // Inode (node block) field offsets
@@ -1010,6 +1041,8 @@ struct SbInfo {
     blocks_per_seg: u32,
     block_count: u64,
     seg_cnt_ckpt: u32,
+    seg_cnt_sit: u32,
+    seg_cnt_ssa: u32,
     seg_cnt_nat: u32,
     seg_cnt_main: u32,
     segment0_blkaddr: u32,
@@ -1029,6 +1062,8 @@ impl SbInfo {
             blocks_per_seg:  1u32 << log_bps,
             block_count:     r64(sb, SB_BLOCK_COUNT),
             seg_cnt_ckpt:    r32(sb, SB_SEG_CNT_CKPT),
+            seg_cnt_sit:     r32(sb, SB_SEG_CNT_SIT),
+            seg_cnt_ssa:     r32(sb, SB_SEG_CNT_SSA_RAW),
             seg_cnt_nat:     r32(sb, SB_SEG_CNT_NAT),
             seg_cnt_main:    r32(sb, SB_SEG_CNT_MAIN),
             segment0_blkaddr: r32(sb, SB_SEGMENT0_BLKADDR),
@@ -1073,6 +1108,13 @@ impl CpInfo {
             active_pack:     0,
             flags:           r32(blk, CP_CKPT_FLAGS),
         };
+        let mut cp = cp;
+        if !durable::cp_is_legacy(blk) {
+            cp.cur_data_segno  = r32(blk, CP_OWN_HEADS);
+            cp.cur_node_segno  = r32(blk, CP_OWN_HEADS + 4);
+            cp.cur_data_blkoff = r16(blk, CP_OWN_HEADS + 8);
+            cp.cur_node_blkoff = r16(blk, CP_OWN_HEADS + 10);
+        }
         (ver, cp)
     }
 }
@@ -1174,6 +1216,9 @@ struct MountState {
     /// `sit_mark_block_used` / `sit_mark_block_free`, the only writers of a
     /// vblocks field. `statfs` reads it instead of re-summing the whole SIT.
     valid_blocks: u64,
+    /// The part of `valid_blocks` in segments whose SIT type is a node type
+    /// (Linux's valid_node_count must equal it, lane f2fscrc).
+    valid_nodes: u64,
     /// Open-file slots; `file_id` indexes it. Grows (never shrinks) in
     /// `OF_CHUNK` steps, each backed by a `SLOT_FAST` chunk.
     open_files:   alloc::vec::Vec<OpenFile>,
@@ -1687,6 +1732,7 @@ struct ProbeSnap {
     first_dirty_ns: u64,
     last_cp_pos: [u32; 6],
     valid_blocks: u64,
+    valid_nodes: u64,
     walk_err: i32,
 }
 
@@ -1696,7 +1742,7 @@ fn probe_begin(ms: &mut MountState) -> ProbeSnap {
     ProbeSnap {
         cp: ms.cp, dirty_writes: ms.dirty_writes, last_cp_ns: ms.last_cp_ns,
         first_dirty_ns: ms.first_dirty_ns, last_cp_pos: ms.last_cp_pos,
-        valid_blocks: ms.valid_blocks, walk_err: ms.walk_err,
+        valid_blocks: ms.valid_blocks, valid_nodes: ms.valid_nodes, walk_err: ms.walk_err,
     }
 }
 
@@ -1715,6 +1761,7 @@ fn probe_end(ms: &mut MountState, snap: &ProbeSnap) -> Option<MissList> {
         ms.first_dirty_ns = snap.first_dirty_ns;
         ms.last_cp_pos = snap.last_cp_pos;
         ms.valid_blocks = snap.valid_blocks;
+        ms.valid_nodes = snap.valid_nodes;
         ms.walk_err = snap.walk_err;
     }
     ms.of_undo_n = 0;
@@ -2873,6 +2920,9 @@ fn sit_mark_block_used(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
     // so `valid_blocks` always equals a full SIT sum.
     ms.valid_blocks = (ms.valid_blocks + (new_v & SIT_VBLOCKS_MASK) as u64)
         .wrapping_sub(old_cnt as u64);
+    if sit_is_node(v) {
+        ms.valid_nodes = (ms.valid_nodes + (new_v & SIT_VBLOCKS_MASK) as u64).wrapping_sub(old_cnt as u64);
+    }
     // NOTE: the checkpoint's free_seg_cnt is not maintained (statfs uses
     // `valid_blocks`). The "vblocks lower than the segment holds" seen on
     // older volumes was the mkfs SIT shift described above; `sit_repair`
@@ -2917,6 +2967,7 @@ fn sit_mark_block_free(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
     let cnt = old_cnt.saturating_sub(1);
     w16(blk, entry_off, (v & !SIT_VBLOCKS_MASK) | cnt);
     ms.valid_blocks = (ms.valid_blocks + cnt as u64).wrapping_sub(old_cnt as u64);
+    if sit_is_node(v) { ms.valid_nodes = (ms.valid_nodes + cnt as u64).wrapping_sub(old_cnt as u64); }
     // The newest durable checkpoint may still reference this block: keep it
     // out of the allocator until a checkpoint records the free (lane f2fsgc).
     prot_note_free(ms, seg, blk_in_seg);
@@ -3053,6 +3104,99 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
 }
 
 /// Where segment `seg`'s SIT entry lives: (SIT block, byte offset in it).
+/// A commit block Linux's f2fs wrote over one of ours (see CP_OWN_VER). Only
+/// volumes with the mirrored SIT (segment_count_sit >= 2, mkfs since lane
+/// f2fslayout) can be mounted by Linux at all; the older one-copy volumes
+/// never take this path.
+fn cp_is_foreign(sb: &SbInfo, b: &[u8; BLOCK_SIZE]) -> bool {
+    sb.seg_cnt_sit >= 2 && !durable::cp_is_legacy(b) && r64(b, CP_OWN_VER) != r64(b, CP_VER)
+}
+
+/// Bring a Linux-written checkpoint into the form this kernel reads, on the
+/// device, before anything is cached: (1) every SIT/NAT block whose version
+/// bit is set lives in copy 1 — copy it over copy 0; (2) apply the NAT and
+/// SIT journals Linux keeps in the current-segment summaries. The caller
+/// then commits with zero bitmaps. Idempotent: a crash before that commit
+/// leaves the Linux checkpoint newest and this runs again on the same input.
+/// Returns the number of blocks copied plus journal entries applied.
+fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64) -> Option<usize> {
+    let bps = sb.blocks_per_seg as u64;
+    let flags = r32(cp, CP_CKPT_FLAGS);
+    let sit_sz = r32(cp, CP_SIT_BM_SIZE) as usize;
+    let nat_sz = r32(cp, CP_NAT_BM_SIZE) as usize;
+    if flags & CP_LARGE_NAT_BM != 0 || CP_VER_BITMAP + sit_sz + nat_sz > durable::CPJ_MAGIC_OFF
+        || sb.seg_cnt_nat != 2 { return None; }
+    if flags & CP_ORPHAN_PRESENT != 0 {
+        dbg_str("[F2FS] Linux checkpoint carries orphan blocks; they are not reaped\n");
+    }
+    let bit = |off: usize, i: usize| cp[off + i / 8] & (0x80u8 >> (i % 8)) != 0;
+    let mut blk = [0u8; BLOCK_SIZE];
+    let mut n = 0usize;
+    let copy = |from: u64, to: u64, blk: &mut [u8; BLOCK_SIZE]| -> bool {
+        virtio_blk::read_block(dev, from, blk) && virtio_blk::write_block(dev, to, blk)
+    };
+    let sit_half = (sb.seg_cnt_sit / 2) as u64 * bps;
+    for i in 0..(sit_sz * 8).min(sit_half as usize) {
+        if !bit(CP_VER_BITMAP, i) { continue; }
+        let a = sb.sit_blkaddr as u64 + i as u64;
+        if !copy(a + sit_half, a, &mut blk) { return None; }
+        n += 1;
+    }
+    for i in 0..(nat_sz * 8).min(bps as usize) {
+        if !bit(CP_VER_BITMAP + sit_sz, i) { continue; }
+        let a = sb.nat_blkaddr as u64 + i as u64;
+        if !copy(a + bps, a, &mut blk) { return None; }
+        n += 1;
+    }
+    // Journals: compacted (NAT journal, SIT journal, data entries, from
+    // start_sum) or normal (NAT in the hot data summary, SIT in the cold
+    // one; Linux sum_blk_addr = cp + total - (base + 1) + type, base 6 on
+    // an unmount checkpoint, else 3).
+    const JSZ: usize = 507;           // SUM_JOURNAL_SIZE
+    const SUM_JOFF: usize = 3584;     // ENTRIES_IN_SUM * SUMMARY_SIZE
+    let total = r32(cp, CP_PACK_TOTAL) as u64;
+    let mut nat_j = [0u8; JSZ];
+    let mut sit_j = [0u8; JSZ];
+    if flags & CP_COMPACT_SUM != 0 {
+        if !virtio_blk::read_block(dev, cp_addr + r32(cp, CP_START_SUM) as u64, &mut blk) { return None; }
+        nat_j.copy_from_slice(&blk[..JSZ]);
+        sit_j.copy_from_slice(&blk[JSZ..2 * JSZ]);
+    } else {
+        let base = if flags & CP_UMOUNT_FLAG != 0 { 7 } else { 4 };
+        if total < base + 2 { return None; }
+        if !virtio_blk::read_block(dev, cp_addr + total - base, &mut blk) { return None; }
+        nat_j.copy_from_slice(&blk[SUM_JOFF..SUM_JOFF + JSZ]);
+        if !virtio_blk::read_block(dev, cp_addr + total - base + 2, &mut blk) { return None; }
+        sit_j.copy_from_slice(&blk[SUM_JOFF..SUM_JOFF + JSZ]);
+    }
+    let n_nats = (r16(&nat_j, 0) as usize).min((JSZ - 2) / 13);
+    for k in 0..n_nats {
+        let e = 2 + k * 13;
+        let nid = r32(&nat_j, e);
+        if nid as u64 >= bps * NAT_ENTRY_PER_BLK as u64 { return None; }
+        let a = sb.nat_blkaddr as u64 + (nid / NAT_ENTRY_PER_BLK as u32) as u64;
+        let o = (nid % NAT_ENTRY_PER_BLK as u32) as usize * NAT_ENTRY_SIZE;
+        if !virtio_blk::read_block(dev, a, &mut blk) { return None; }
+        blk[o..o + NAT_ENTRY_SIZE].copy_from_slice(&nat_j[e + 4..e + 4 + NAT_ENTRY_SIZE]);
+        if !virtio_blk::write_block(dev, a, &blk) { return None; }
+        n += 1;
+    }
+    let n_sits = (r16(&sit_j, 0) as usize).min((JSZ - 2) / (4 + SIT_ENTRY_SIZE));
+    for k in 0..n_sits {
+        let e = 2 + k * (4 + SIT_ENTRY_SIZE);
+        let seg = r32(&sit_j, e);
+        if seg >= sb.seg_cnt_main { return None; }
+        let a = sb.sit_blkaddr as u64 + (seg / SIT_PER_BLK as u32) as u64;
+        let o = (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE;
+        if !virtio_blk::read_block(dev, a, &mut blk) { return None; }
+        blk[o..o + SIT_ENTRY_SIZE].copy_from_slice(&sit_j[e + 4..e + 4 + SIT_ENTRY_SIZE]);
+        if !virtio_blk::write_block(dev, a, &blk) { return None; }
+        n += 1;
+    }
+    if !virtio_blk::flush(dev) { return None; }
+    Some(n)
+}
+
 fn sit_entry_loc(ms: &MountState, seg: u32) -> (u64, usize) {
     let sit_blkno = ms.sb.sit_blkaddr + seg / SIT_PER_BLK as u32;
     (sit_blkno as u64, (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE)
@@ -3196,8 +3340,12 @@ fn prot_committed(ms: &mut MountState, ok: bool) {
 /// lost), while the vblocks of a segment a log wrote into after such a
 /// shift counted blocks twice and could wrap to 0. A read-only mount only
 /// counts.
+/// SIT entry type (top 6 bits of vblocks) is a node log (Linux IS_NODESEG)?
+fn sit_is_node(v: u16) -> bool { (3..=5).contains(&(v >> 10)) }
+
 fn sit_repair(ms: &mut MountState) -> u64 {
     let mut valid = 0u64;
+    let mut nodes = 0u64;
     let mut fixed = 0u32;
     for seg in 0..ms.sb.seg_cnt_main {
         let (blkno, off) = sit_entry_loc(ms, seg);
@@ -3207,6 +3355,7 @@ fn sit_repair(ms: &mut MountState) -> u64 {
             (r16(blk, off), pop as u16)
         };
         valid += pop as u64;
+        if sit_is_node(v) { nodes += pop as u64; }
         if v & SIT_VBLOCKS_MASK != pop {
             fixed += 1;
             if !ms.read_only {
@@ -3220,6 +3369,7 @@ fn sit_repair(ms: &mut MountState) -> u64 {
         dbg_dec(fixed as usize);
         dbg_str(" segment valid counts did not match their valid maps; repaired from the maps\n");
     }
+    ms.valid_nodes = nodes;
     valid
 }
 
@@ -3283,7 +3433,7 @@ fn write_checkpoint(ms: &mut MountState, umount: bool) -> bool {
 /// The next checkpoint's commit block (and the in-memory state that records
 /// it as written: version, active pack, flags). Shared by the locked
 /// `write_checkpoint` and the unlocked `checkpoint_unlocked`.
-fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8) -> (u64, [u8; BLOCK_SIZE]) {
+fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8, logs: &LinuxLogs) -> (u64, [u8; BLOCK_SIZE]) {
     let bps = ms.sb.blocks_per_seg;
     // CP area: two packs of (seg_cnt_ckpt/2 * blocks_per_seg) blocks each.
     // `pack` is the one not holding the durable checkpoint (lane f2fsync:
@@ -3297,15 +3447,112 @@ fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8) -> (u64, [u8; BLO
     let mut buf = [0u8; BLOCK_SIZE];
     w64(&mut buf, CP_VER,             ms.cp.ver);
     w32(&mut buf, CP_FREE_SEG_CNT,    ms.cp.free_seg_cnt);
-    w32(&mut buf, CP_CUR_NODE_SEGNO,  ms.cp.cur_node_segno);
-    w16(&mut buf, CP_CUR_NODE_BLKOFF, ms.cp.cur_node_blkoff);
-    w32(&mut buf, CP_CUR_DATA_SEGNO,  ms.cp.cur_data_segno);
-    w16(&mut buf, CP_CUR_DATA_BLKOFF, ms.cp.cur_data_blkoff);
-    w32(&mut buf, CP_PACK_TOTAL,      ms.cp.pack_total.max(1));
     w32(&mut buf, CP_NEXT_FREE_NID,   ms.cp.next_free_nid);
+    // Linux's log heads in the standard fields, this kernel's in CP_OWN_HEADS.
+    linux_cp_fields(ms, &mut buf, logs);
     ms.cp.flags = if umount { CP_UMOUNT_FLAG } else { 0 };
     w32(&mut buf, CP_CKPT_FLAGS,      ms.cp.flags);
     (cp_blkno as u64, buf)
+}
+
+/// The rest of what Linux's sanity_check_ckpt and curseg checks want (lane
+/// f2fscrc, L12 #46); `checksum_offset` and the CRC come in `durable::cp_seal`.
+/// The pack is one block (its own footer). Six distinct logs, each at a block
+/// its SIT valid map has clear (in either bit order), all SSR: ours are hot data and hot node; the
+/// other four sit at block 0 of free segments. A full log of ours is written
+/// at a free segment, where `log_alloc` would move it next anyway.
+/// Checkpoints that moved a log head to a Linux-valid position (debug count).
+static CP_HEAD_MOVES: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+
+/// Linux's six log heads for the next commit block (`linux_cp_fields`).
+pub(crate) type LinuxLogs = [(u32, u16); 6];
+
+/// Pick them. It reads SIT blocks, so the checkpoint writers call it before
+/// they change any state (next to `pick_ext`): a cache miss there aborts a
+/// no-I/O run cleanly. Read inside `build_cp_block`, after the snapshot was
+/// taken, a miss doomed a run that had already moved the fresh/protected
+/// bookkeeping, and the redo lost track of blocks (f2fscrashtest --seed
+/// 1792903575: blocks with two owners after recovery; lane f2fscrc3).
+pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
+    let bps = ms.sb.blocks_per_seg;
+    let main = ms.sb.seg_cnt_main;
+    // Linux log types: 0..2 = hot/warm/cold data, 3..5 = hot/warm/cold node.
+    let mut logs: LinuxLogs = [(u32::MAX, 0u16); 6];
+    for (t, seg, off) in [(0usize, ms.cp.cur_data_segno, ms.cp.cur_data_blkoff),
+                          (3usize, ms.cp.cur_node_segno, ms.cp.cur_node_blkoff)] {
+        if seg < main && (off as u32) < bps {
+            // Linux tests valid-map bit b MSB-first (f2fs_test_bit), this
+            // kernel LSB-first: the block must be free under both readings.
+            let m = seg_busy_map(ms, seg);
+            let free = |b: u32| m[b as usize / 64] & (1u64 << (b % 64)) == 0;
+            if let Some(b) = (off as u32..bps).find(|&b| free(b) && free((b & !7) | (7 - (b & 7)))) {
+                logs[t] = (seg, b as u16);
+            }
+        }
+    }
+    let mut after = ms.cp.cur_data_segno;
+    for t in 0..6 {
+        if logs[t].0 != u32::MAX { continue; }
+        let mut pick = None;
+        for k in 1..=main {
+            let seg = (after.wrapping_add(k)) % main.max(1);
+            if logs.iter().any(|l| l.0 == seg) || seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno { continue; }
+            // Never this checkpoint's journal extension segments nor a
+            // segment the durable checkpoint still points into: the
+            // allocator may be moved there (below).
+            if avoid.contains(&seg) || prot_any(ms, seg) { continue; }
+            let (blkno, off) = sit_entry_loc(ms, seg);
+            if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0 { pick = Some(seg); break; }
+        }
+        let seg = pick.unwrap_or(t as u32);
+        logs[t] = (seg, 0);
+        after = seg;
+    }
+    logs
+}
+
+fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE], logs: &LinuxLogs) {
+    let bps = ms.sb.blocks_per_seg;
+    let main = ms.sb.seg_cnt_main;
+    w64(buf, CP_USER_BLOCK_CNT,  main.saturating_sub(1) as u64 * bps as u64);
+    w64(buf, CP_VALID_BLOCK_CNT, ms.valid_blocks);
+    // Linux wants ckpt+sit+nat+ssa+reserved >= F2FS_MIN_META_SEGMENTS (8).
+    let meta = ms.sb.seg_cnt_ckpt + ms.sb.seg_cnt_sit + ms.sb.seg_cnt_nat + ms.sb.seg_cnt_ssa;
+    w32(buf, CP_RSVD_SEG_CNT,    8u32.saturating_sub(meta).max(1));
+    w32(buf, CP_OVP_SEG_CNT,     1);
+    // The whole pack is the Linux pack: footer in its last block, the six
+    // normal summaries before it (durable::LINUX_TAIL). start_sum is only
+    // read for compacted summaries and orphans (neither flag is set) and
+    // must lie in [cp_payload + 1, blocks_per_seg - 7] (sanity_check_ckpt).
+    let pack = (ms.sb.seg_cnt_ckpt / 2) * bps;
+    w32(buf, CP_PACK_TOTAL,      pack);
+    w32(buf, CP_START_SUM,       pack - durable::LINUX_TAIL);
+    w32(buf, CP_VALID_NODE_CNT,  ms.valid_nodes as u32);
+    w32(buf, CP_SIT_BM_SIZE,     (ms.sb.seg_cnt_sit / 2) * bps / 8);
+    w32(buf, CP_NAT_BM_SIZE,     (ms.sb.seg_cnt_nat / 2) * bps / 8);
+    // This kernel's own heads go to CP_OWN_HEADS, verbatim: a remount
+    // resumes exactly where the allocator stopped. Making the allocator
+    // follow a moved head (or resume at the head Linux is shown) broke crash
+    // recovery: a head at block 0 of a fresh segment, a state this
+    // allocator never records itself, came back as a block with two owners
+    // (f2fscrashtest --seed 1792903575, lanes f2fscrc2/f2fscrc3).
+    if logs[0] != (ms.cp.cur_data_segno, ms.cp.cur_data_blkoff)
+        || logs[3] != (ms.cp.cur_node_segno, ms.cp.cur_node_blkoff) {
+        CP_HEAD_MOVES.fetch_add(1, atomic::Ordering::Relaxed);
+    }
+    let own_ver = r64(buf, CP_VER);
+    w64(buf, CP_OWN_VER,        own_ver);
+    w32(buf, CP_OWN_HEADS,      ms.cp.cur_data_segno);
+    w32(buf, CP_OWN_HEADS + 4,  ms.cp.cur_node_segno);
+    w16(buf, CP_OWN_HEADS + 8,  ms.cp.cur_data_blkoff);
+    w16(buf, CP_OWN_HEADS + 10, ms.cp.cur_node_blkoff);
+    for (t, &(seg, off)) in logs.iter().enumerate() {
+        let (so, bo) = if t < 3 { (CP_CUR_DATA_SEGNO + 4 * t, CP_CUR_DATA_BLKOFF + 2 * t) }
+                       else     { (CP_CUR_NODE_SEGNO + 4 * (t - 3), CP_CUR_NODE_BLKOFF + 2 * (t - 3)) };
+        w32(buf, so, seg);
+        w16(buf, bo, off);
+        buf[CP_ALLOC_TYPE + t] = CP_ALLOC_SSR;
+    }
 }
 
 // ── Unlocked checkpoints (lane loginhang, 2026-10-10) ─────────────────────────
@@ -7640,6 +7887,21 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         return None;
     }
 
+    // Lane f2fslayout: a checkpoint Linux's f2fs wrote. Its copy of our
+    // private area (journal header, own heads, orphans) is stale: drop the
+    // journal and take Linux's hot logs as this kernel's heads.
+    let foreign0 = rd0 && cp_is_foreign(&sb, &cp_buf0);
+    let foreign1 = rd1 && cp_is_foreign(&sb, &cp_buf1);
+    for (f, b) in [(foreign0, &mut cp_buf0), (foreign1, &mut cp_buf1)] {
+        if !f { continue; }
+        w32(b, durable::CPJ_MAGIC_OFF, 0);
+        let (ds, ns) = (r32(b, CP_CUR_DATA_SEGNO), r32(b, CP_CUR_NODE_SEGNO));
+        let (db, nb) = (r16(b, CP_CUR_DATA_BLKOFF), r16(b, CP_CUR_NODE_BLKOFF));
+        w32(b, CP_OWN_HEADS, ds);
+        w32(b, CP_OWN_HEADS + 4, ns);
+        w16(b, CP_OWN_HEADS + 8, db);
+        w16(b, CP_OWN_HEADS + 10, nb);
+    }
     let (ver0, mut cp0) = CpInfo::parse_pack(&cp_buf0);
     let (ver1, mut cp1) = CpInfo::parse_pack(&cp_buf1);
     cp0.active_pack = 0;
@@ -7680,8 +7942,21 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     // Unknown-feature mask (lane f2fsrf): a newer kernel wrote a feature this
     // one does not understand; do not modify the volume.
     let pbuf = if pick1 { &cp_buf1 } else { &cp_buf0 };
+    let cp_tail = durable::cp_tail(pbuf);
     let incompat = if durable::cp_block_has_journal(pbuf) { r32(pbuf, durable::CPJ_INCOMPAT_OFF) } else { 0 };
     let unknown = incompat & !durable::CPJ_INCOMPAT_KNOWN;
+    let foreign = if pick1 { foreign1 } else { foreign0 };
+    if foreign {
+        if read_only || unknown != 0 {
+            dbg_str("[F2FS] the newest checkpoint was written by Linux; mount read-write once to import it\n");
+            return None;
+        }
+        let cp_addr = (sb.cp_blkaddr + if pick1 { pack_blks } else { 0 }) as u64;
+        match linux_import(dev_idx, &sb, pbuf, cp_addr) {
+            Some(n) => { dbg_str("[F2FS] imported a Linux checkpoint: "); dbg_dec(n); dbg_str(" SIT/NAT block(s)/entries\n"); }
+            None => { dbg_str("[F2FS] cannot import the Linux checkpoint; not mounting\n"); return None; }
+        }
+    }
     let read_only = if unknown != 0 {
         dbg_str("[F2FS] volume uses unknown features (mask ");
         dbg_dec(unknown as usize);
@@ -7736,6 +8011,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         core::ptr::addr_of_mut!((*p).first_dirty_ns).write(0);
         core::ptr::addr_of_mut!((*p).last_cp_pos).write([u32::MAX; 6]);
         core::ptr::addr_of_mut!((*p).valid_blocks).write(0);
+        core::ptr::addr_of_mut!((*p).valid_nodes).write(0);
         core::ptr::addr_of_mut!((*p).cred).write(xattr::Cred::ROOT);
         core::ptr::addr_of_mut!((*p).walk_err).write(0);
         core::ptr::addr_of_mut!((*p).read_only).write(read_only);
@@ -7777,7 +8053,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
             dbg_str(" block(s) were not home yet; replayed\n");
         }
         ms.valid_blocks = sit_repair(ms);
-        let recovered = durable::recover(ms, rf_start);
+        let recovered = durable::recover(ms, rf_start, cp_tail);
         // Lane f2fsorphan: inodes unlinked while open when that checkpoint
         // was cut; nothing holds them now. After roll-forward, so a record
         // can no longer bring one back over freed blocks.
@@ -7795,7 +8071,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
             dbg_dec(reaped);
             dbg_str("\n");
         }
-        if (recovered > 0 || reaped > 0) && !ms.read_only { write_checkpoint(ms, false); }
+        if (recovered > 0 || reaped > 0 || foreign) && !ms.read_only { write_checkpoint(ms, false); }
         ms.dur.ext_free = durable::count_ext_free(ms);
     }
 

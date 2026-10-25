@@ -1,0 +1,99 @@
+#!/bin/busybox sh
+# linuxcmp one-shot: restore limine.conf, measure Wi-Fi RX on two BSSIDs, report, reboot. Never prints the PSK.
+/bin/busybox mkdir -p /proc /sys /dev /tmp /run /var/run /mnt/esp /mnt/root /sbin /usr/bin /usr/sbin
+/bin/busybox --install -s /bin
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev 2>/dev/null; mount -t tmpfs tmp /tmp
+KV=$(uname -r); MAC=172.16.166.21:9470; AP2=74:83:c2:ba:21:df; APC=84:78:48:d8:7e:79
+TIMER=480; HANG=0
+for a in $(cat /proc/cmdline); do case $a in lcmp.timer=*) TIMER=${a#*=};; lcmp.hang=*) HANG=${a#*=};; lcmp.selftest=*) SELFTEST=${a#*=};; esac; done
+R=/tmp/res.txt
+log() { echo "[$(cut -d' ' -f1 /proc/uptime)] $*" >> $R; echo "linuxcmp: $*" > /dev/console; }
+WDPID=
+finish() {
+  log "finish: $1"
+  [ -n "$WDPID" ] && kill $WDPID 2>/dev/null; sleep 1
+  dmesg | tail -n 150 > /tmp/dmesg.txt
+  if [ -n "$ESP" ] && mount -t vfat $ESP /mnt/esp 2>/dev/null; then
+    cp $R /mnt/esp/linuxcmp/result.txt; cp /tmp/dmesg.txt /mnt/esp/linuxcmp/dmesg.txt
+    [ -f /tmp/scan.txt ] && cp /tmp/scan.txt /mnt/esp/linuxcmp/scan.txt
+    sync; umount /mnt/esp; log "results on ESP"
+  fi
+  sync; echo "linuxcmp: reboot -f" > /dev/console; reboot -f; sleep 5; echo b > /proc/sysrq-trigger
+}
+# (a) hard timer, independent of everything below
+( sleep $TIMER; echo "linuxcmp: ${TIMER} s timer -> reboot -f" > /dev/console; [ -f /tmp/wd.pid ] && kill $(cat /tmp/wd.pid); sleep 1; sync; reboot -f; sleep 5; echo b > /proc/sysrq-trigger ) &
+log "start $KV timer=$TIMER"
+for m in $(cat /modlist); do insmod /lib/modules/$KV/$m 2>/dev/null; done
+log "modules loaded: $(wc -l < /proc/modules)"
+if [ -e /dev/watchdog ]; then watchdog -F -T 540 -t 20 /dev/watchdog & WDPID=$!; echo $WDPID > /tmp/wd.pid; log "watchdog armed pid $WDPID ($(cat /sys/class/watchdog/watchdog0/identity 2>/dev/null))"; else log "no /dev/watchdog"; fi
+# find the ESP (marker file) and restore the good limine.conf first
+ESP=
+for i in $(seq 1 20); do
+  for p in /dev/sd?1; do [ -b $p ] || continue
+    if mount -t vfat $p /mnt/esp 2>/dev/null; then
+      if [ -f /mnt/esp/linuxcmp/good.conf ]; then ESP=$p; fi
+      [ -n "$ESP" ] && break; umount /mnt/esp
+    fi
+  done
+  [ -n "$ESP" ] && break; sleep 1
+done
+if [ -n "$ESP" ]; then
+  cp /mnt/esp/linuxcmp/good.conf /mnt/esp/limine.lcm && sync && mv /mnt/esp/limine.lcm /mnt/esp/limine.conf && sync
+  log "ESP $ESP: limine.conf restored rc=$? sha=$(sha256sum /mnt/esp/limine.conf | cut -c1-12) good=$(sha256sum /mnt/esp/linuxcmp/good.conf | cut -c1-12)"
+  umount /mnt/esp
+else log "ESP not found"; fi
+[ "$SELFTEST" = 1 ] && log "selftest f2rd passwd md5: $(f2rd ${ESP%1}2 /etc/passwd 2>&1 | md5sum)"
+[ "$SELFTEST" = 1 ] && log "selftest: $(iw --version 2>&1) | $(wpa_supplicant -v 2>&1 | head -n1) | $(udhcpc --help 2>&1 | head -n1) | $(ls /lib/firmware)"
+[ "$HANG" = 1 ] && { log "hang test: sleeping forever"; while :; do sleep 60; done; }
+# (b) credentials from the stick root, read-only
+ROOTP=${ESP%1}2; SSID=; PSK=
+# Linux f2fs refuses LeandrOS volumes (openbugs #46): parse the raw partition
+# with the static read-only reader f2rd; the file only ever lives in shell vars.
+uq() { sed -n "s/^[[:space:]]*$1=//p" | head -n1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"\(.*\)"$/\1/'; }
+if [ -n "$ESP" ] && [ -b $ROOTP ]; then
+  SSID=$(f2rd $ROOTP /etc/leandros/wifi.conf 2>/tmp/m.err | uq ssid); PSK=$(f2rd $ROOTP /etc/leandros/wifi.conf 2>/dev/null | uq psk)
+  log "root $ROOTP raw f2rd: ssid=$SSID psk_len=${#PSK} $(head -c 100 /tmp/m.err)"
+else log "root partition $ROOTP missing"; fi
+if [ -z "$PSK" ] && [ -n "$ESP" ] && mount -t vfat -o ro $ESP /mnt/esp 2>/dev/null; then
+  C=$(grep -m1 'wifi.psk=' /mnt/esp/linuxcmp/good.conf); umount /mnt/esp
+  for t in $C; do case $t in wifi.ssid=*) SSID=${t#wifi.ssid=};; wifi.psk=*) PSK=${t#wifi.psk=};; esac; done
+  log "creds from ESP good.conf cmdline: ssid=$SSID psk_len=${#PSK}"
+fi
+[ -n "$SSID" ] && [ -n "$PSK" ] || finish "no credentials"
+for i in $(seq 1 15); do [ -d /sys/class/net/wlan0 ] && break; sleep 1; done
+[ -d /sys/class/net/wlan0 ] || finish "no wlan0"
+mount -t debugfs none /sys/kernel/debug 2>/dev/null
+ip link set lo up; ip link set wlan0 up; sleep 2
+log "fw: $(dmesg | grep -m1 'loaded firmware version')"
+iw dev wlan0 scan > /tmp/scanraw.txt 2>&1; iw dev wlan0 scan > /tmp/scanraw.txt 2>&1
+awk '/^BSS /{p=0} /^BSS (74:83:c2:ba:21:df|84:78:48:d8:7e:79)/{p=1} p' /tmp/scanraw.txt > /tmp/scan.txt
+log "scan: $(grep -c '^BSS' /tmp/scanraw.txt) BSS, kept $(grep -c '^BSS' /tmp/scan.txt)"
+post() { wget -q -T 15 -O /dev/null --post-file=$1 http://$MAC/result/$2 2>/dev/null; }
+run_ap() {
+  B=$1; L=$2; N=$3; SZ=$4; TO=$5
+  killall wpa_supplicant 2>/dev/null; sleep 1; ip addr flush dev wlan0
+  case "$PSK" in ????????????????????????????????????????????????????????????????) P="$PSK";; *) P="\"$PSK\"";; esac
+  printf 'ctrl_interface=/run/wpa\nnetwork={\n ssid="%s"\n bssid=%s\n key_mgmt=WPA-PSK\n psk=%s\n}\n' "$SSID" "$B" "$P" > /tmp/w.conf; chmod 600 /tmp/w.conf
+  wpa_supplicant -B -i wlan0 -c /tmp/w.conf > /tmp/wpa.out 2>&1
+  for i in $(seq 1 30); do iw dev wlan0 link | grep -qi "Connected to $B" && break; sleep 1; done
+  iw dev wlan0 link | grep -qi "Connected to $B" || { log "$L: NOT associated to $B"; return 1; }
+  udhcpc -i wlan0 -n -q -t 6 -T 2 -s /etc/udhcpc.sh > /dev/null 2>&1 || { log "$L: DHCP failed"; return 1; }
+  log "$L: associated $B, $(ip -4 addr show wlan0 | grep -m1 inet)"
+  log "$L: power_save $(iw dev wlan0 get power_save)"
+  { echo "== $L link before"; iw dev wlan0 link; echo "== $L station before"; iw dev wlan0 station dump; } >> $R
+  for f in /sys/kernel/debug/ieee80211/phy0/netdev:wlan0/stations/*/*; do case ${f##*/} in agg_status|ht_capa|vht_capa|flags|rs_data) echo "== $L dbg ${f##*/}"; cat $f 2>/dev/null | head -n 40;; esac; done >> $R
+  grep Tcp: /proc/net/snmp > /tmp/snmp.a
+  for r in $(seq 1 $N); do
+    ( ping -c 12 -i 1 ${MAC%:*} 2>&1 | tail -n1 > /tmp/ping.$r ) & PP=$!
+    t1=$(cut -d' ' -f1 /proc/uptime); timeout $TO wget -q -O /dev/null "http://$MAC/blob/$SZ?l=$L-$r"; rc=$?; t2=$(cut -d' ' -f1 /proc/uptime)
+    wait $PP; log "$L run$r: $SZ B in $(awk "BEGIN{print $t2-$t1}") s = $(awk "BEGIN{printf \"%.2f\", $SZ*8/($t2-$t1)/1e6}") Mbit/s rc=$rc; load ping $(cat /tmp/ping.$r)"
+  done
+  grep Tcp: /proc/net/snmp > /tmp/snmp.b; { echo "== $L tcp snmp before/after"; cat /tmp/snmp.a /tmp/snmp.b; } >> $R
+  { echo "== $L link after"; iw dev wlan0 link; echo "== $L station after"; iw dev wlan0 station dump; } >> $R
+  post $R $L; post /tmp/scan.txt scan
+}
+run_ap $AP2 ap2 3 6291456 60
+run_ap $APC ctl 2 25165824 45
+killall wpa_supplicant 2>/dev/null; rm -f /tmp/w.conf
+finish done

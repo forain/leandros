@@ -2044,6 +2044,12 @@ pub mod stats {
     pub static MASTER_IMPLICIT: AtomicU64 = AtomicU64::new(0);
     pub static MASTER_GATE_REFUSED: AtomicU64 = AtomicU64::new(0);
     pub static MASTER_CLEARED: AtomicU64 = AtomicU64::new(0);
+    /// Legacy FLIP_PAGE (0x1004) presents that succeeded, and the fb id /
+    /// card0 open of the last one: a scanout observable that needs no
+    /// screenshot (lane gamevt, L12 #56).
+    pub static FLIP_PRESENTS: AtomicU64 = AtomicU64::new(0);
+    pub static FLIP_LAST_FB: AtomicU32 = AtomicU32::new(0);
+    pub static FLIP_LAST_OPEN: AtomicU32 = AtomicU32::new(0);
     /// Last grant or release (card0 open id, 0 = none) and the VT it was on.
     pub static MASTER_HOLDER: AtomicU32 = AtomicU32::new(0);
     pub static MASTER_HOLDER_VT: AtomicU32 = AtomicU32::new(0);
@@ -2120,6 +2126,8 @@ pub fn stats_text(buf: &mut [u8]) -> usize {
         "master set_ok={} set_ebusy={} set_eacces={} drop_ok={} drop_einval={} implicit={} refused_eacces={} cleared={}",
         r(&MASTER_SET_OK), r(&MASTER_SET_BUSY), r(&MASTER_SET_ACCES), r(&MASTER_DROP_OK),
         r(&MASTER_DROP_INVAL), r(&MASTER_IMPLICIT), r(&MASTER_GATE_REFUSED), r(&MASTER_CLEARED));
+    let _ = writeln!(w, "flip presents={} last_fb={} last_open={}", r(&FLIP_PRESENTS),
+        FLIP_LAST_FB.load(Ordering::Relaxed), FLIP_LAST_OPEN.load(Ordering::Relaxed));
     let _ = writeln!(w, "evdev revokes={} revoked_refusals={} grab_filtered={} vt_filtered={}",
         r(&EV_REVOKES), r(&EV_REVOKED_REFUSALS), r(&EV_GRAB_FILTERED), r(&EV_VT_FILTERED));
     let _ = writeln!(w, "mirror_drops {}", mirror_drops());
