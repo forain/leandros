@@ -723,9 +723,105 @@ fn console_room() -> usize {
     CLIENT_EVENTS.saturating_sub(n)
 }
 
+// THE SERIAL LINE IS A TTY, NOT A KEYBOARD (openbugs L12 #67). Each byte
+// reaches the in-kernel console queue only (`push_event_console`): it rides the
+// keyboard node as `EV_KEY code=<byte> value=2` because that queue is where
+// `read_input_byte` pops console input, but no userspace open of event0 ever
+// sees it. It used to be broadcast to every reader, where the raw ASCII byte
+// read as a Linux keycode that was pressed and never released — '*' (42) as a
+// held KEY_LEFTSHIFT, '=' (61) as KEY_F3 — giving libinput, MAME and DOOM
+// ghost, stuck and modifier keys whenever anything was typed on the serial line.
+//
+// A headless run that wants serial typing to reach evdev clients opts in with
+// `evdev.serialkbd=1` on the kernel command line or, at run time, root's
+// SERIALKBD_IOCTL on /dev/input/hotplug. That adds a separate virtual keyboard
+// node named "serial-kbd" (never mixed into event0) that gets each byte as a
+// proper US-layout key: Shift held around it when needed, a press and its
+// release, each in its own SYN frame.
+
+/// No serial-kbd node (opt-in off).
+const SERIAL_KBD_NONE: u32 = u32::MAX;
+/// The serial-kbd node's device id, or `SERIAL_KBD_NONE`.
+static SERIAL_KBD_DEV: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(SERIAL_KBD_NONE);
+/// Name the opt-in node reports to EVIOCGNAME.
+pub const SERIAL_KBD_NAME: &str = "serial-kbd";
+/// /dev/input/hotplug ioctl (`_IO('E', 0xf0)`, arg by value): 1 adds the
+/// serial-kbd node, 0 removes it. Root only. Returns the node number (or 0).
+pub const SERIALKBD_IOCTL: usize = 0x45f0;
+
+const KEY_LEFTSHIFT: u16 = 42;
+const KEY_LEFTCTRL: u16 = 29;
+
+/// US-layout keycode for an ASCII byte: (KEY_*, shift, ctrl). None for bytes
+/// with no key (DEL is Backspace, ESC Escape, ^A..^Z ctrl+letter).
+pub fn ascii_to_key(b: u8) -> Option<(u16, bool, bool)> {
+    const LETTERS: [u16; 26] = [30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50,
+                                49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44];
+    const DIGITS: [u16; 10] = [11, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    Some(match b {
+        b'a'..=b'z' => (LETTERS[(b - b'a') as usize], false, false),
+        b'A'..=b'Z' => (LETTERS[(b - b'A') as usize], true, false),
+        b'0'..=b'9' => (DIGITS[(b - b'0') as usize], false, false),
+        b'\r' | b'\n' => (28, false, false),
+        b'\t' => (15, false, false),
+        b' ' => (57, false, false),
+        0x1b => (1, false, false),
+        0x08 | 0x7f => (14, false, false),
+        0x01..=0x1a => (LETTERS[(b - 1) as usize], false, true),
+        b'!' => (2, true, false), b'@' => (3, true, false), b'#' => (4, true, false),
+        b'$' => (5, true, false), b'%' => (6, true, false), b'^' => (7, true, false),
+        b'&' => (8, true, false), b'*' => (9, true, false), b'(' => (10, true, false),
+        b')' => (11, true, false),
+        b'-' => (12, false, false), b'_' => (12, true, false),
+        b'=' => (13, false, false), b'+' => (13, true, false),
+        b'[' => (26, false, false), b'{' => (26, true, false),
+        b']' => (27, false, false), b'}' => (27, true, false),
+        b';' => (39, false, false), b':' => (39, true, false),
+        b'\'' => (40, false, false), b'"' => (40, true, false),
+        b'`' => (41, false, false), b'~' => (41, true, false),
+        b'\\' => (43, false, false), b'|' => (43, true, false),
+        b',' => (51, false, false), b'<' => (51, true, false),
+        b'.' => (52, false, false), b'>' => (52, true, false),
+        b'/' => (53, false, false), b'?' => (53, true, false),
+        _ => return None,
+    })
+}
+
 fn push_serial_byte(b: u8) {
-    push_event(DEV_KEYBOARD as u32, EV_KEY, b as u16, 2); // 2 = serial byte
-    push_event(DEV_KEYBOARD as u32, EV_SYN, SYN_REPORT, 0);
+    push_event_ex(DEV_KEYBOARD as u32, EV_KEY, b as u16, 2, false); // 2 = serial byte
+    push_event_ex(DEV_KEYBOARD as u32, EV_SYN, SYN_REPORT, 0, false);
+    let dev = SERIAL_KBD_DEV.load(core::sync::atomic::Ordering::Acquire);
+    if dev == SERIAL_KBD_NONE { return; }
+    let Some((code, shift, ctrl)) = ascii_to_key(b) else { return };
+    let key = |c: u16, v: i32| {
+        push_event(dev, EV_KEY, c, v);
+        push_event(dev, EV_SYN, SYN_REPORT, 0);
+    };
+    if ctrl { key(KEY_LEFTCTRL, 1); }
+    if shift { key(KEY_LEFTSHIFT, 1); }
+    key(code, 1);
+    key(code, 0);
+    if shift { key(KEY_LEFTSHIFT, 0); }
+    if ctrl { key(KEY_LEFTCTRL, 0); }
+}
+
+/// Add (`on`) or remove the opt-in serial-kbd node. Task context only.
+/// Returns its /dev/input/eventN number, 0 when off or it could not be added.
+pub fn set_serial_kbd(on: bool) -> u32 {
+    use core::sync::atomic::Ordering::AcqRel;
+    let cur = SERIAL_KBD_DEV.load(core::sync::atomic::Ordering::Acquire);
+    if on {
+        if cur != SERIAL_KBD_NONE { return cur; }
+        match register_input_device(DEVKIND_KEYBOARD, SERIAL_KBD_NAME, BUS_VIRTUAL, 0x0627, 0x0003) {
+            Some(d) => { SERIAL_KBD_DEV.store(d, core::sync::atomic::Ordering::Release); d }
+            None => 0,
+        }
+    } else {
+        let old = SERIAL_KBD_DEV.swap(SERIAL_KBD_NONE, AcqRel);
+        if old != SERIAL_KBD_NONE { unregister_input_device(old); }
+        0
+    }
 }
 
 /// The serial input drain (UART RX → console tap) with flow control — see
@@ -2210,6 +2306,10 @@ fn hp_handle(msg: &Message) -> Message {
             }
             unsafe { arch_interrupt_restore(f); }
             val_reply(0)
+        }
+        vfs_server::VFS_IOCTL if arg(msg, 1) as usize == SERIALKBD_IOCTL => {
+            if sched::euid_of(pid) != 0 { return err_reply(-1); } // EPERM
+            val_reply(set_serial_kbd(arg(msg, 2) != 0) as u64)
         }
         vfs_server::VFS_IOCTL => err_reply(-25), // ENOTTY
         _ => err_reply(-38),

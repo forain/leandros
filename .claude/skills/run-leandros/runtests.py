@@ -108,6 +108,9 @@ SUITES = {
                 "host:evherdtest.py",
                 # EVIOCGKEY reports held buttons/keys, also after a SYN_DROPPED.
                 "host:evgkeytest.py",
+                # Serial-console bytes reach no event0 reader; the opt-in
+                # serial-kbd node gets mapped press+release pairs (L12 #67).
+                "host:serialkbdtest.py",
                 # Blocked /dev/netctl and console readers park narrow and
                 # still wake on a snapshot, a cursor report, a key, a UART byte.
                 "host:pollnarrowtest.py",
