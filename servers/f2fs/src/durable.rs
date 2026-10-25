@@ -447,6 +447,10 @@ fn nat_clear(ms: &mut MountState, nid: u32) {
     {
         let cur = ms.cache.read(ms.dev, nat_blk as u64);
         if r32(cur, off + 1) == 0 && r32(cur, off + 5) == 0 { return; }
+        // lx: an inode's NAT entry names itself as owner.
+        if ms.sb.fmt.lx && nid >= 3 && r32(cur, off + 1) == nid && r32(cur, off + 5) != 0 {
+            ms.cp.valid_inodes = ms.cp.valid_inodes.saturating_sub(1);
+        }
     }
     let blk = ms.cache.get_mut(ms.dev, nat_blk as u64);
     w32(blk, off + 1, 0);
@@ -603,6 +607,7 @@ fn pick_ext(ms: &mut MountState, out: &mut [u32; CPJ_EXT_MAX], n: usize) -> bool
     while cnt < n && seg > 0 {
         seg -= 1;
         if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno || prot_any(ms, seg) { continue; }
+        if ms.sb.fmt.lx && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
         let (blkno, off) = sit_entry_loc(ms, seg);
         let vb = r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK;
         if vb == 0 { out[cnt] = seg; cnt += 1; }
@@ -621,6 +626,7 @@ pub(crate) fn journal_room(ms: &MountState) -> usize {
 /// memory or journal space ran out (nothing changed then).
 pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Result<CpJob, ()> {
     settle(ms);
+    crate::lx_cp_prep(ms);
     if CPFAIL_DEV.load(atomic::Ordering::Relaxed) == ms.dev
         && CPFAIL_N.fetch_add(1, atomic::Ordering::Relaxed) % 3 == 2 { return Err(()); }
     let c = &ms.cache;
@@ -1275,6 +1281,7 @@ pub(crate) fn cp_emergency(ms: &mut MountState, umount: bool) -> bool {
         dbg_str("\n");
     }
     settle(ms);
+    crate::lx_cp_prep(ms);
     let mut a = core::mem::take(&mut ms.dur.emerg_a);
     let mut b = core::mem::take(&mut ms.dur.emerg_b);
     let ok = cp_emergency_in(ms, umount, &mut a, &mut b);

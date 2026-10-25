@@ -218,11 +218,7 @@ impl Framebuffer {
         for row in y..(y + h).min(self.height) {
             let off = row * stride + x;
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    self.shadow.add(off),
-                    self.base.add(off),
-                    w.min(self.width.saturating_sub(x)),
-                );
+                copy_px_wide(self.base.add(off), self.shadow.add(off), w.min(self.width.saturating_sub(x)));
             }
         }
     }
@@ -1158,6 +1154,36 @@ static FLUSH_DEFER: core::sync::atomic::AtomicUsize =
 ///
 /// Hold this around a whole `write()` worth of output, not longer: the point at
 /// which it drops is the point at which the user sees the text.
+
+/// Copy `n` pixels to the linear surface eight bytes per store.
+///
+/// The kernel's `memcpy` (kernel/src/mem.rs) is a byte loop, and under QEMU
+/// TCG every store into the x86_64 boot framebuffer is a separate access to
+/// the VGA BAR: a full 1920x1080x4 blit after each scroll ran at ~52 MB/s
+/// (~160 ms), 90% of what a console `write(2)` cost, and capped a shell
+/// `echo` loop at ~40 lines/s (openbugs #69). `rep movsq` cuts the access
+/// count eightfold. `cld` is explicit: an interrupt taken from user mode does
+/// not clear DF.
+#[inline]
+unsafe fn copy_px_wide(dst: *mut u32, src: *const u32, n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        core::arch::asm!(
+            "cld",
+            "rep movsq",
+            inout("rcx") n / 2 => _,
+            inout("rdi") dst => _,
+            inout("rsi") src => _,
+            options(nostack),
+        );
+        if n & 1 != 0 {
+            core::ptr::write_volatile(dst.add(n - 1), core::ptr::read(src.add(n - 1)));
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    core::ptr::copy_nonoverlapping(src, dst, n);
+}
+
 pub struct FlushBatch(());
 
 impl FlushBatch {

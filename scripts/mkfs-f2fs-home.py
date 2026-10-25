@@ -366,7 +366,7 @@ def main(argv):
 
 if __name__ == "__main__":
     # `--lx` (opt-in, lane f2fsnode): make the volume in Linux's on-disk node
-    # format instead (scripts/mkfs-f2fs-home-lx.py, `LeandrOS lxnode1`). The
+    # format instead (scripts/mkfs-f2fs-home-lx.py, `LeandrOS lxnode2`). The
     # default stays the legacy layout until an lx root boots to a shell.
     if "--lx" in sys.argv[1:]:
         import runpy

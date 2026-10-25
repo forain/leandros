@@ -171,6 +171,7 @@ const CP_RSVD_SEG_CNT:   usize = 24;
 const CP_OVP_SEG_CNT:    usize = 28;
 const CP_START_SUM:      usize = 140;
 const CP_VALID_NODE_CNT: usize = 144;
+const CP_VALID_INODE_CNT: usize = 148;
 const CP_SIT_BM_SIZE:    usize = 156;
 const CP_NAT_BM_SIZE:    usize = 160;
 const CP_ALLOC_TYPE:     usize = 176;
@@ -1205,6 +1206,10 @@ struct CpInfo {
     cur_data_blkoff:  u16,
     pack_total:       u32,
     next_free_nid:    u32,
+    /// Checkpoint `valid_inode_count` (lx volumes maintain it).
+    valid_inodes:     u32,
+    /// Linux's six log heads as last chosen (`linux_logs`); lx only.
+    logs:             LinuxLogs,
     active_pack:      u8,  // 0 or 1
     /// `ckpt_flags` of the pack this was parsed from.
     flags:            u32,
@@ -1222,6 +1227,8 @@ impl CpInfo {
             cur_data_blkoff: r16(blk, CP_CUR_DATA_BLKOFF),
             pack_total:      r32(blk, CP_PACK_TOTAL),
             next_free_nid:   r32(blk, CP_NEXT_FREE_NID),
+            valid_inodes:    r32(blk, CP_VALID_INODE_CNT),
+            logs:            [(u32::MAX, 0); 6],
             active_pack:     0,
             flags:           r32(blk, CP_CKPT_FLAGS),
         };
@@ -1231,6 +1238,11 @@ impl CpInfo {
             cp.cur_node_segno  = r32(blk, CP_OWN_HEADS + 4);
             cp.cur_data_blkoff = r16(blk, CP_OWN_HEADS + 8);
             cp.cur_node_blkoff = r16(blk, CP_OWN_HEADS + 10);
+            for t in 0..6 {
+                let (so, bo) = if t < 3 { (CP_CUR_DATA_SEGNO + 4 * t, CP_CUR_DATA_BLKOFF + 2 * t) }
+                               else     { (CP_CUR_NODE_SEGNO + 4 * (t - 3), CP_CUR_NODE_BLKOFF + 2 * (t - 3)) };
+                cp.logs[t] = (r32(blk, so), r16(blk, bo));
+            }
         }
         (ver, cp)
     }
@@ -2996,8 +3008,13 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
     // permanently unreachable.
     let total = ms.sb.seg_cnt_main.max(1);
     let start_seg = (after + 1) % total;
+    // lx: the checkpoint's filler logs stay empty and typed (`linux_logs`)
+    // unless nothing else is left (second pass).
+    for pass in 0..2 {
+    if pass == 1 && !ms.sb.fmt.lx { break; }
     for seg_off in 0..total {
         let seg = (start_seg + seg_off) % total;
+        if pass == 0 && ms.sb.fmt.lx && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
         // Never hand back a segment one of the logs is *currently* writing
         // into. Before reclaim existed this could not happen — vblocks only
         // ever grew — but once a segment can drop back to zero valid blocks
@@ -3019,7 +3036,23 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
             return Some(seg);
         }
     }
+    }
     None
+}
+
+/// lx: set segment `seg`'s SIT type (0..2 data, 3..5 node logs), keeping
+/// `valid_nodes` equal to the sum over node-typed segments.
+fn sit_set_type(ms: &mut MountState, seg: u32, t: u16) {
+    if !ms.sb.fmt.lx || seg >= ms.sb.seg_cnt_main { return; }
+    let (blkno, off) = sit_entry_loc(ms, seg);
+    let v = r16(ms.cache.read(ms.dev, blkno), off);
+    if v >> 10 == t { return; }
+    let cnt = (v & SIT_VBLOCKS_MASK) as u64;
+    let (was, now) = (sit_is_node(v), (3..=5).contains(&t));
+    let blk = ms.cache.get_mut(ms.dev, blkno);
+    w16(blk, off, (v & SIT_VBLOCKS_MASK) | (t << 10));
+    if was && !now { ms.valid_nodes = ms.valid_nodes.wrapping_sub(cnt); }
+    if now && !was { ms.valid_nodes = ms.valid_nodes.wrapping_add(cnt); }
 }
 
 fn sit_mark_block_used(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
@@ -3221,13 +3254,14 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
         }
         let next = match sit_find_free_seg(ms, seg) {
             Some(n) => Some(n),
-            None if ssr_enabled() => ssr_pick(ms),
+            None if ssr_enabled() => ssr_pick(ms, node),
             None => None,
         };
         let next = match next {
             Some(n) => n,
             None => { space_exhausted(ms); return None; }
         };
+        sit_set_type(ms, next, if node { 3 } else { 0 });
         if node { ms.cp.cur_node_segno = next; ms.cp.cur_node_blkoff = 0; }
         else    { ms.cp.cur_data_segno = next; ms.cp.cur_data_blkoff = 0; }
     }
@@ -3360,11 +3394,18 @@ fn seg_first_usable(ms: &mut MountState, seg: u32, from: u32) -> Option<u32> {
 
 /// SSR victim (lane f2fsgc): the segment, other than the two logs' own,
 /// with the most usable blocks (greedy, like upstream's foreground SSR).
-fn ssr_pick(ms: &mut MountState) -> Option<u32> {
+fn ssr_pick(ms: &mut MountState, node: bool) -> Option<u32> {
     let bps = ms.sb.blocks_per_seg;
     let mut best: Option<(u32, u32)> = None;
     for seg in 0..ms.sb.seg_cnt_main {
         if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno { continue; }
+        if ms.sb.fmt.lx {
+            // A data block in a node segment (or the reverse) is something
+            // fsck.f2fs cannot repair: reuse only a segment of the same class.
+            let (blkno, off) = sit_entry_loc(ms, seg);
+            let v = r16(ms.cache.read(ms.dev, blkno), off);
+            if v & SIT_VBLOCKS_MASK != 0 && sit_is_node(v) != node { continue; }
+        }
         let m = seg_busy_map(ms, seg);
         let busy: u32 = m.iter().map(|w| w.count_ones()).sum();
         let usable = bps.saturating_sub(busy);
@@ -3628,6 +3669,20 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
     let mut after = ms.cp.cur_data_segno;
     for t in 0..6 {
         if logs[t].0 != u32::MAX { continue; }
+        // lx: keep the previous pick while it is still empty (stable cursegs).
+        if ms.sb.fmt.lx {
+            let (seg, off) = ms.cp.logs[t];
+            if seg < main && off == 0 && !logs.iter().any(|l| l.0 == seg)
+                && seg != ms.cp.cur_data_segno && seg != ms.cp.cur_node_segno
+                && !avoid.contains(&seg) && !prot_any(ms, seg) {
+                let (blkno, o) = sit_entry_loc(ms, seg);
+                if r16(ms.cache.read(ms.dev, blkno), o) & SIT_VBLOCKS_MASK == 0 {
+                    logs[t] = (seg, 0);
+                    after = seg;
+                    continue;
+                }
+            }
+        }
         let mut pick = None;
         for k in 1..=main {
             let seg = (after.wrapping_add(k)) % main.max(1);
@@ -3643,7 +3698,36 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
         logs[t] = (seg, 0);
         after = seg;
     }
+    if ms.sb.fmt.lx {
+        // Type the six heads so fsck.f2fs finds each curseg in a segment of
+        // its own type; a non-empty fallback segment keeps its type.
+        for t in 0..6 {
+            let seg = logs[t].0;
+            if seg >= main { continue; }
+            let (blkno, off) = sit_entry_loc(ms, seg);
+            let empty = r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0;
+            if empty || (t == 0 && seg == ms.cp.cur_data_segno) || (t == 3 && seg == ms.cp.cur_node_segno) {
+                sit_set_type(ms, seg, t as u16);
+            }
+        }
+        ms.cp.logs = logs;
+    }
     logs
+}
+
+/// lx, at the start of a checkpoint (before its dirty set is collected, so
+/// the SIT type changes ride in it): pick and type the six log heads and
+/// recount free_segment_count (segments with no valid block, not a head).
+pub(crate) fn lx_cp_prep(ms: &mut MountState) {
+    if !ms.sb.fmt.lx { return; }
+    let logs = linux_logs(ms, &[]);
+    let mut free = 0u32;
+    for seg in 0..ms.sb.seg_cnt_main {
+        if logs.iter().any(|l| l.0 == seg) { continue; }
+        let (blkno, off) = sit_entry_loc(ms, seg);
+        if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0 { free += 1; }
+    }
+    ms.cp.free_seg_cnt = free;
 }
 
 fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE], logs: &LinuxLogs) {
@@ -3667,6 +3751,7 @@ fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE], logs: &Linux
     w32(buf, CP_PACK_TOTAL,      pack);
     w32(buf, CP_START_SUM,       pack - durable::LINUX_TAIL);
     w32(buf, CP_VALID_NODE_CNT,  ms.valid_nodes as u32);
+    if ms.sb.fmt.lx { w32(buf, CP_VALID_INODE_CNT, ms.cp.valid_inodes); }
     w32(buf, CP_SIT_BM_SIZE,     (ms.sb.seg_cnt_sit / 2) * bps / 8);
     w32(buf, CP_NAT_BM_SIZE,     (ms.sb.seg_cnt_nat / 2) * bps / 8);
     // This kernel's own heads go to CP_OWN_HEADS, verbatim: a remount
@@ -4676,6 +4761,7 @@ fn create_inode(ms: &mut MountState, mode: u16, uid: u32, gid: u32,
 
     ms.cache.write(ms.dev, phys as u64, &buf);
     nat_update(ms, ino, phys);
+    if f.lx { ms.cp.valid_inodes = ms.cp.valid_inodes.wrapping_add(1); }
     // Its name is not durable before a checkpoint: a roll-forward fsync
     // carries the dentry mark (lane f2fsync).
     durable::ns_note(ms, ino, true);
@@ -8159,7 +8245,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
     let mut block0 = [0u8; BLOCK_SIZE];
     if !virtio_blk::read_block(dev_idx, 0, &mut block0) { return None; }
     let sb = SbInfo::parse(&block0)?;
-    if sb.fmt.lx { dbg_str("[F2FS] Linux node format (lxnode1)\n"); }
+    if sb.fmt.lx { dbg_str("[F2FS] Linux node format (lxnode)\n"); }
     // Every per-segment bitmap here (SIT valid maps, `SegMap`) is 512 bits,
     // which is what f2fs segments are (log_blocks_per_seg = 9).
     if sb.blocks_per_seg != 512 {

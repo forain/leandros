@@ -19,7 +19,7 @@ indirect node, xattr node and data block reachable from it:
   - every dentry names an inode the NAT maps, and directory link counts.
 
 Both node formats are understood: legacy (footer at 4076, 1019 slots per
-node) and lx (the `LeandrOS lxnode1` superblock marker: Linux's layout, see
+node) and lx (the `LeandrOS lxnode` superblock marker: Linux's layout, see
 scripts/f2fslx.py). On lx volumes it also checks every node footer's ino and
 node offset, i_blocks, i_current_depth, inline flags, each dentry's hash and
 that the name sits in a block of the bucket Linux would search.
