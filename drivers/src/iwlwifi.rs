@@ -1038,7 +1038,7 @@ impl Dev {
         } else {
             match cmd::rx_crypto_lengths(fc, status) {
                 Some((h, t)) => (frame, h, t),
-                None => { self.rx_dropped += 1; self.rxs.undecrypted += 1; return; }
+                None => { self.rx_dropped += 1; self.rxs.undecrypted += 1; let foreign = self.guard.as_ref().map_or(false, |g| g.check_addr(frame).is_err()); wm::gk::note_undecrypted(frame, fc, status, foreign); return; }
             }
         };
         // Null data frames carry nothing (power-save signalling).
