@@ -1301,7 +1301,9 @@ impl SbInfo {
     /// NAT block `b`'s copy-0 address.
     fn nat_addr(&self, b: u32) -> u32 { meta_copy0_addr(self.nat_blkaddr, b) }
     /// SIT block `b`'s copy-0 address.
-    fn sit_addr(&self, b: u32) -> u32 { meta_copy0_addr(self.sit_blkaddr, b) }
+    /// Unlike the NAT, the SIT is not interleaved: copy 0 is the first half of
+    /// the area, copy 1 the second (Linux `current_sit_addr`, `sit_blocks`).
+    fn sit_addr(&self, b: u32) -> u32 { self.sit_blkaddr + b }
     /// Size of the SIT and NAT version bitmaps Linux's mkfs gave this volume.
     fn ver_bitmap_bytes(&self) -> usize {
         (self.seg_cnt_sit / 2 + self.seg_cnt_nat / 2) as usize * (self.blocks_per_seg as usize / 8)
@@ -3683,29 +3685,48 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
     let flags = r32(cp, CP_CKPT_FLAGS);
     let sit_sz = r32(cp, CP_SIT_BM_SIZE) as usize;
     let nat_sz = r32(cp, CP_NAT_BM_SIZE) as usize;
-    if flags & CP_LARGE_NAT_BM != 0 || CP_VER_BITMAP + sit_sz + nat_sz > durable::CP_CRC_OFF
-        || sb.cp_payload > 0 || sb.seg_cnt_nat < 2 { bail!("bitmap-layout"); }
+    // cp_payload > 0: the NAT bitmap stays in the commit block, the SIT bitmap
+    // moves to the payload blocks after it (Linux `__bitmap_ptr`).
+    let payload = sb.cp_payload as usize;
+    if flags & CP_LARGE_NAT_BM != 0 || sb.seg_cnt_nat < 2 { bail!("bitmap-layout"); }
+    if payload > 0 {
+        if CP_VER_BITMAP + nat_sz > durable::CP_CRC_OFF || sit_sz > payload * BLOCK_SIZE { bail!("bitmap-layout"); }
+    } else if CP_VER_BITMAP + sit_sz + nat_sz > durable::CP_CRC_OFF { bail!("bitmap-layout"); }
+    let mut sit_bm = alloc::vec![0u8; sit_sz];
+    if payload > 0 {
+        let mut pb = alloc::vec![0u8; payload * BLOCK_SIZE];
+        for k in 0..payload {
+            let mut one = [0u8; BLOCK_SIZE];
+            if !virtio_blk::read_block(dev, cp_addr + 1 + k as u64, &mut one) { bail!("payload-read"); }
+            pb[k * BLOCK_SIZE..(k + 1) * BLOCK_SIZE].copy_from_slice(&one);
+        }
+        sit_bm.copy_from_slice(&pb[..sit_sz]);
+    } else {
+        sit_bm.copy_from_slice(&cp[CP_VER_BITMAP..CP_VER_BITMAP + sit_sz]);
+    }
+    let nat_off = if payload > 0 { CP_VER_BITMAP } else { CP_VER_BITMAP + sit_sz };
     if flags & CP_ORPHAN_PRESENT != 0 {
         dbg_str("[F2FS] Linux checkpoint carries orphan blocks; the mount reaps them\n");
     }
     let bit = |off: usize, i: usize| cp[off + i / 8] & (0x80u8 >> (i % 8)) != 0;
+    let sbit = |i: usize| sit_bm[i / 8] & (0x80u8 >> (i % 8)) != 0;
     let mut blk = [0u8; BLOCK_SIZE];
     let mut n = 0usize;
     let copy = |from: u64, to: u64, blk: &mut [u8; BLOCK_SIZE]| -> bool {
         rd(from, blk) && wr(to, blk)
     };
-    // Copy 1 of block i sits one segment after copy 0 (the copies alternate
-    // segment by segment, `meta_copy0_addr`).
+    // SIT copy 1 of block i sits one half-area after copy 0 (the NAT copies
+    // alternate segment by segment instead, `meta_copy0_addr`).
     let sit_half = (sb.seg_cnt_sit / 2) as u64 * bps;
     for i in 0..(sit_sz * 8).min(sit_half as usize) {
-        if !bit(CP_VER_BITMAP, i) { continue; }
+        if !sbit(i) { continue; }
         let a = sb.sit_addr(i as u32) as u64;
-        if !copy(a + bps, a, &mut blk) { bail!("sit-copy"); }
+        if !copy(a + sit_half, a, &mut blk) { bail!("sit-copy"); }
         n += 1;
     }
     let nat_half = (sb.seg_cnt_nat / 2) as u64 * bps;
     for i in 0..(nat_sz * 8).min(nat_half as usize) {
-        if !bit(CP_VER_BITMAP + sit_sz, i) { continue; }
+        if !bit(nat_off, i) { continue; }
         let a = sb.nat_addr(i as u32) as u64;
         if !copy(a + bps, a, &mut blk) { bail!("nat-copy"); }
         n += 1;
@@ -6195,6 +6216,43 @@ fn dir_lookup(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> u32 {
     dir_lookup_ft(ms, dir_ino, name).0
 }
 
+/// Linux multi-level hash directory geometry (`dir_buckets`, `bucket_blocks`,
+/// `dir_block_index` with `i_dir_level` 0; `MAX_DIR_HASH_DEPTH` 63).
+const LX_MAX_DIR_HASH_DEPTH: usize = 63;
+fn lx_dir_buckets(level: usize) -> u64 {
+    if level < LX_MAX_DIR_HASH_DEPTH / 2 { 1u64 << level } else { 1u64 << (LX_MAX_DIR_HASH_DEPTH / 2 - 1) }
+}
+fn lx_bucket_blocks(level: usize) -> u64 { if level < LX_MAX_DIR_HASH_DEPTH / 2 { 2 } else { 4 } }
+/// (first logical block, block count) of the bucket `hash` selects at `level`.
+fn lx_dir_bucket(level: usize, hash: u32) -> (u64, u64) {
+    let mut bidx = 0u64;
+    for i in 0..level { bidx += lx_dir_buckets(i) * lx_bucket_blocks(i); }
+    let idx = hash as u64 % lx_dir_buckets(level);
+    (bidx + idx * lx_bucket_blocks(level), lx_bucket_blocks(level))
+}
+
+/// Find `name` in one dentry block.
+fn dblk_find(f: Fmt, dblk: &[u8; BLOCK_SIZE], name: &[u8]) -> Option<(u32, u8)> {
+    let mut slot = 0usize;
+    while slot < NR_DENTRY_IN_BLK {
+        let byte = slot / 8;
+        let bit  = slot % 8;
+        if byte < DENTRY_BITMAP_SIZE && (dblk[byte] & (1 << bit)) == 0 { slot += 1; continue; }
+        let e_off = DENTRY_ENTRIES_OFF + slot * DENTRY_ENTRY_SIZE;
+        if e_off + DENTRY_ENTRY_SIZE > BLOCK_SIZE { break; }
+        let ino      = r32(dblk, e_off + 4);
+        let name_len = r16(dblk, e_off + 8) as usize;
+        if name_len == name.len() {
+            let n_off = DENTRY_NAMES_OFF + slot * DENTRY_SLOT_LEN;
+            if n_off + name_len <= BLOCK_SIZE && &dblk[n_off..n_off + name_len] == name {
+                return Some((ino, f.dentry_dt(dblk[e_off + 10])));
+            }
+        }
+        slot += ((name_len + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN).max(1);
+    }
+    None
+}
+
 /// `dir_lookup` that also reports the dentry's type byte.
 ///
 /// The type byte is what lets path resolution decide whether a component is a
@@ -6209,6 +6267,22 @@ fn dir_lookup_ft(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> (u32, u8) {
     };
     if lx_inline_dir(ms.sb.fmt, &iblk_copy) { return inline_dir_find(ms.sb.fmt, &iblk_copy, name); }
     if lx_inline_refused(ms.sb.fmt, &iblk_copy, dir_ino) { ms.walk_err = -5; return (0, 0); } // EIO, not ENOENT
+    if ms.sb.fmt.lx {
+        // Linux looks a name up only in its hash bucket at each level.
+        let hash = f2fs_dentry_hash(name);
+        let depth = (r32(&iblk_copy, INO_CUR_DEPTH) as usize).clamp(1, LX_MAX_DIR_HASH_DEPTH);
+        for level in 0..depth {
+            let (b0, cnt) = lx_dir_bucket(level, hash);
+            for bidx in b0..b0 + cnt {
+                if ms.cache.poisoned() { return (0, 0); }
+                let phys = inode_logical_to_phys(ms, dir_ino, bidx);
+                if phys == 0 { continue; }
+                let dblk = *ms.cache.read(ms.dev, phys as u64);
+                if let Some(r) = dblk_find(ms.sb.fmt, &dblk, name) { return r; }
+            }
+        }
+        return (0, 0);
+    }
     let fsize = inode_size(&iblk_copy);
     let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
 
@@ -6391,8 +6465,8 @@ fn dentry_room(dblk: &[u8], slots: usize) -> Option<usize> {
 /// must be placed exactly where `f2fs_add_regular_entry` would put it (level
 /// L: 1 << L buckets of 2 blocks, bucket `hash % (1 << L)` at block
 /// `2 * ((1 << L) - 1) + 2 * bucket`). Missing bucket blocks are allocated;
-/// the directory may have holes. Only the in-inode i_addr slots are used for
-/// new dentry blocks (a full directory answers ENOSPC past them).
+/// the directory may have holes. Blocks past i_addr go through the inode's
+/// direct/indirect node blocks like any file.
 fn dir_add_entry_lx(ms: &mut MountState, dir_ino: u32, name: &[u8], child_ino: u32, ftype: u8) -> bool {
     let f = ms.sb.fmt;
     let slots_needed = (name.len() + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN;
@@ -6401,33 +6475,27 @@ fn dir_add_entry_lx(ms: &mut MountState, dir_ino: u32, name: &[u8], child_ino: u
     if iblkaddr == 0 { return false; }
     if !lx_convert_inline(ms, dir_ino) { return false; }
     let mut iblk = *ms.cache.read(ms.dev, iblkaddr as u64);
-    let max_direct = inode_max_direct(f, &iblk);
     let mut level = 0usize;
     let (bidx, slot) = 'found: loop {
         if ms.cache.poisoned() { return false; }
-        let first = 2 * ((1usize << level) - 1);
-        if first >= max_direct { return false; } // ENOSPC
-        let nbucket = 1usize << level;
-        let bidx0 = first + 2 * (hash as usize % nbucket);
-        for bidx in bidx0..bidx0 + 2 {
-            if bidx >= max_direct { break; }
-            let phys = inode_logical_to_phys(ms, dir_ino, bidx as u64);
+        if level >= LX_MAX_DIR_HASH_DEPTH { return false; } // ENOSPC
+        let (b0, cnt) = lx_dir_bucket(level, hash);
+        for bidx in b0..b0 + cnt {
+            let phys = inode_logical_to_phys(ms, dir_ino, bidx);
             if phys != 0 {
                 let room = { let d = ms.cache.read(ms.dev, phys as u64); dentry_room(d, slots_needed) };
                 if let Some(slot) = room { break 'found (bidx, slot); }
             } else {
-                // `alloc_data_block` hands the block back zeroed: every slot free.
-                let p = match alloc_data_owned(ms, dir_ino, bidx) { Some(p) => p, None => return false };
-                inode_add_blocks(f, &mut iblk, 1);
-                inode_set_blkaddr(f, &mut iblk, bidx, p);
-                // Make the new address visible to inode_logical_to_phys.
-                ms.cache.write(ms.dev, iblkaddr as u64, &iblk);
+                // Allocates the block (and any dnode/indirect nodes above it);
+                // `alloc_data_block` hands it back zeroed: every slot free.
+                let p = inode_logical_to_phys_for_write(ms, &mut iblk, dir_ino, iblkaddr, bidx);
+                if p == 0 { return false; }
                 break 'found (bidx, 0);
             }
         }
         level += 1;
     };
-    let phys = inode_logical_to_phys(ms, dir_ino, bidx as u64);
+    let phys = inode_logical_to_phys(ms, dir_ino, bidx);
     if phys == 0 { return false; }
     {
         let dblk = ms.cache.get_mut(ms.dev, phys as u64);
@@ -6442,7 +6510,7 @@ fn dir_add_entry_lx(ms: &mut MountState, dir_ino: u32, name: &[u8], child_ino: u
     }
     let depth = r32(&iblk, INO_CUR_DEPTH).max(level as u32 + 1);
     w32(&mut iblk, INO_CUR_DEPTH, depth);
-    let size = inode_size(&iblk).max((bidx as u64 + 1) * BLOCK_SIZE as u64);
+    let size = inode_size(&iblk).max((bidx + 1) * BLOCK_SIZE as u64);
     w64(&mut iblk, INO_SIZE, size);
     ms.cache.write(ms.dev, iblkaddr as u64, &iblk);
     nat_update(ms, dir_ino, iblkaddr);
@@ -6528,12 +6596,29 @@ fn dir_remove_entry(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> bool {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
         let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
     };
+    let lx = ms.sb.fmt.lx;
+    let hash = if lx { f2fs_dentry_hash(name) } else { 0 };
+    let depth = (r32(&iblk_copy, INO_CUR_DEPTH) as usize).clamp(1, LX_MAX_DIR_HASH_DEPTH);
+    let mut cand: (usize, u64, u64) = (0, 0, 0); // (level, bucket start, bucket count)
     let fsize = inode_size(&iblk_copy);
-    let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
+    let n_data_blks = if lx { usize::MAX } else { fsize.div_ceil(BLOCK_SIZE as u64) as usize };
 
-    for blk_idx in 0..n_data_blks {
+    let mut blk_idx = 0usize;
+    loop {
+        // Linux-format dirs: walk only the hash bucket at each level.
+        let bidx = if lx {
+            if cand.2 == 0 {
+                if cand.0 >= depth { break; }
+                let (b0, c) = lx_dir_bucket(cand.0, hash);
+                cand = (cand.0 + 1, b0, c);
+            }
+            let b = cand.1; cand.1 += 1; cand.2 -= 1; b
+        } else {
+            if blk_idx >= n_data_blks { break; }
+            blk_idx += 1; (blk_idx - 1) as u64
+        };
         if ms.cache.poisoned() { break; }
-        let phys = inode_logical_to_phys(ms, dir_ino, blk_idx as u64);
+        let phys = inode_logical_to_phys(ms, dir_ino, bidx);
         if phys == 0 { continue; }
         // Scan a copy and dirty only the block that holds the entry (every
         // scanned block used to be dirtied: one more scattered write each at
@@ -9076,8 +9161,11 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
             Some("unclean Linux shutdown; mount it on Linux once to recover")
         } else if orphan_unread {
             Some("orphan blocks unreadable")
-        } else if sb.seg_cnt_nat < 2 || sb.cp_payload > 0
-            || CP_VER_BITMAP + r32(pbuf, CP_SIT_BM_SIZE) as usize + r32(pbuf, CP_NAT_BM_SIZE) as usize > durable::CP_CRC_OFF {
+        } else if sb.seg_cnt_nat < 2 || (sb.cp_payload > 0
+            && (CP_VER_BITMAP + r32(pbuf, CP_NAT_BM_SIZE) as usize > durable::CP_CRC_OFF
+                || r32(pbuf, CP_SIT_BM_SIZE) as usize > sb.cp_payload as usize * BLOCK_SIZE))
+            || (sb.cp_payload == 0
+                && CP_VER_BITMAP + r32(pbuf, CP_SIT_BM_SIZE) as usize + r32(pbuf, CP_NAT_BM_SIZE) as usize > durable::CP_CRC_OFF) {
             Some("volume too large for import yet")
         } else { None };
         if let Some(w) = why {
