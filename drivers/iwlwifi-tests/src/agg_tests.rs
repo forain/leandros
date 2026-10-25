@@ -117,7 +117,7 @@ fn stats_line() {
     a.on_addba_resp(1, 0, 0, 64, 1);
     a.on_agg_rsp(10);
     a.on_agg_rsp(5);
-    a.on_ba(&parse_ba_notif(&ba_bytes(1, 0, 4, 10, 15, 14)).unwrap());
+    a.on_ba(&parse_ba_notif(&ba_bytes(1, 0, 4, 10, 15, 14)).unwrap(), 10);
     let l = a.line();
     assert!(l.starts_with("on win64; addba 1 accepted 1"), "{}", l);
     assert!(l.contains("ampdu 2 frames 15 avg 7.5 max 10; ba 1 txed 15 acked 14"), "{}", l);
@@ -218,4 +218,53 @@ fn ampdu_success_ratio_is_the_window_ratio() {
     // A fully acked burst moves the ratio up by its share of the window only.
     c.on_ampdu(r, 24, 24, 400);
     assert!(c.win[idx].sr < 950, "sr {}", c.win[idx].sr);
+}
+
+#[test]
+fn sn_of_ring_index() {
+    assert_eq!(sn_of_index(141, 141 & 0xff), 141);
+    assert_eq!(sn_of_index(300, 40), 296);
+    assert_eq!(sn_of_index(300, 50), 50);
+    assert_eq!(sn_of_index(5, 250), 4090);
+}
+
+/// Guard (L12 #63): a router that holds its window at a hole until a BAR
+/// must get data again within 1 s after silently given-up subframes.
+#[test]
+fn ba_hole_resumes_within_1s() {
+    let r = sim_bar_hole(3, 300_000, true, 3_000);
+    assert!(r.bars > 0, "{:?}", r);
+    assert!(r.resume_ms.map_or(false, |t| t < 1000), "{:?}", r);
+    assert!(!r.teardown, "{:?}", r);
+}
+
+#[test]
+fn bar_rate_limited_and_single_fail_ssn() {
+    let mut a = TxAgg::new(true);
+    a.poll_request(0, true, true, true, 0).unwrap();
+    a.on_addba_resp(1, 0, 0, 64, 1);
+    a.on_single_fail(4095);
+    assert_eq!(a.next_bar(10), Some(0));
+    assert_eq!(a.next_bar(11), None); // status pending
+    assert!(!a.on_bar_status(true, 12));
+    a.on_single_fail(7);
+    assert_eq!(a.next_bar(20), None); // < BAR_MIN_INTERVAL_MS
+    assert_eq!(a.next_bar(60), Some(8));
+}
+
+#[test]
+fn failing_bars_tear_down_the_session() {
+    let r = sim_bar_hole(3, 300_000, false, 3_000);
+    assert!(r.teardown && r.bars == BAR_MAX_FAILS as u64, "{:?}", r);
+    let mut a = TxAgg::new(true);
+    a.poll_request(0, true, true, true, 0).unwrap();
+    a.on_addba_resp(1, 0, 0, 64, 1);
+    for i in 0..BAR_MAX_FAILS {
+        a.on_single_fail(10);
+        let t = 100 * (i as u64 + 1);
+        assert!(a.next_bar(t).is_some());
+        assert_eq!(a.on_bar_status(false, t), i + 1 == BAR_MAX_FAILS);
+    }
+    assert!(!a.on() && a.st.bar_teardowns == 1 && a.st.bars_failed == 3);
+    assert!(a.line().contains("bar_fail 3 bar_teardown 1"), "{}", a.line());
 }

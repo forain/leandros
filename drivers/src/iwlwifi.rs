@@ -514,6 +514,8 @@ struct Dev {
     bas: BaStats,
     /// TX aggregation session (TID 0) and the BSS queue's scheduler mode.
     tagg: TxAgg,
+    /// Ring index of the BAR on the management queue (its TX status).
+    bar_idx: Option<usize>,
     /// The BSS queue is an aggregation queue: sequence number == ring index.
     agg_queue: bool,
     /// Initial rate of the last A-MPDU's TX response (for its BA notification).
@@ -822,14 +824,18 @@ impl Dev {
             ilog!("TX status queue {} index {}: {:#06x} after {} retries (rate {:#x})", q, index, r.status, r.failure_frame,
                   r.initial_rate);
         }
+        if q == MGMT_QUEUE && self.bar_idx == Some(index) {
+            self.bar_idx = None;
+            if self.tagg.on_bar_status(r.ok(), now) { self.bar_teardown(); }
+        }
         if !data { return; }
         self.txq_drained();
-        if self.tagg.on() && !r.ok() && r.air_fail() {
+        if self.tagg.on() && !r.ok() && r.bar_after_fail() {
             // A frame of the aggregation TID failed alone: move the AP's
             // reorder window past it (mac80211's BAR after AMPDU_NO_BACK).
-            self.tagg.st.single_fail += 1;
-            self.send_bar(ht::sn_add(r.seq_ctl >> 4, 1));
+            self.tagg.on_single_fail(r.seq_ctl >> 4);
         }
+        self.poll_bar(now);
         if !r.ok() && self.fail_logged < FAIL_LOG_MAX && !self.debug {
             self.fail_logged += 1;
             let b = rs::status_bucket(r.status);
@@ -864,7 +870,44 @@ impl Dev {
         let p = TxParams { sta_id: AP_STA_ID, rate: Some(asc::mgmt_rate(ch)), tid: agg::AGG_TID, retries: 15,
                            pm_frame_timeout: asc::PM_FRAME_NONE, ccmp_key: None };
         let txc = asc::tx_cmd(&p, f.len(), &f[..16]);
-        if self.t.tx(MGMT_QUEUE, &txc, &f[16..], f.len(), AP_STA_ID).is_ok() { self.tagg.st.bars_sent += 1; }
+        match self.t.tx(MGMT_QUEUE, &txc, &f[16..], f.len(), AP_STA_ID) {
+            Ok(i) => self.bar_idx = Some(i),
+            Err(_) => self.tagg.bar_not_sent(),
+        }
+    }
+
+    /// Send the BAR TxAgg wants now, if any (partial BA, single failure,
+    /// or a failed BAR being retried).
+    fn poll_bar(&mut self, now: u64) {
+        if let Some(ssn) = self.tagg.next_bar(now) {
+            if self.tagg.st.bars_sent <= 8 || self.debug {
+                ilog!("TX Block Ack: BAR TID {} SSN {} (partial BAs {}, single failures {})", agg::AGG_TID, ssn,
+                      self.tagg.st.ba_partial, self.tagg.st.single_fail);
+            }
+            self.send_bar(ssn);
+        }
+    }
+
+    /// BARs kept failing: end the session (DELBA as initiator, TID 0 off in
+    /// the firmware, rate control without aggregation). TxAgg is Off already
+    /// and renegotiates after ADDBA_RETRY_MS.
+    fn bar_teardown(&mut self) {
+        let (bssid, own, ch) = match self.link.as_ref() { Some(l) => (l.bssid, l.own, l.channel), None => return };
+        ilog!("TX Block Ack TID {}: {} BARs in a row not acknowledged; sending DELBA, A-MPDU off", agg::AGG_TID, agg::BAR_MAX_FAILS);
+        self.bar_idx = None;
+        if let Some(c) = self.rc.as_mut() { c.set_agg(false, agg::LQ_AGG_FRAME_LIMIT_MAX); }
+        let queues = (1u32 << BSS_QUEUE) | (1 << MGMT_QUEUE);
+        let a = cmd::add_sta_tx_agg(AP_STA_ID, cmd::id_and_color(MAC_ID, 0), queues, 0xffff);
+        if let Ok(seq) = self.t.send_cmd(cmd::ADD_STA, None, &a) {
+            if self.async_cmds.len() >= 16 { self.async_cmds.remove(0); }
+            self.async_cmds.push(seq);
+        }
+        let f = ht::build_delba(&bssid, &own, &bssid, agg::AGG_TID, true, ht::REASON_END_BA);
+        let p = TxParams { sta_id: AP_STA_ID, rate: Some(asc::mgmt_rate(ch)), tid: asc::TID_MGMT, retries: 15,
+                           pm_frame_timeout: asc::PM_FRAME_NONE, ccmp_key: None };
+        let txc = asc::tx_cmd(&p, f.len(), &f[..24]);
+        let _ = self.t.tx(MGMT_QUEUE, &txc, &f[24..], f.len(), AP_STA_ID);
+        self.send_lq_if_due(now_ms());
     }
 
     /// BA notification: reclaim the aggregation queue up to the window
@@ -873,11 +916,13 @@ impl Dev {
         self.last_txrsp_ms[0] = now_ms();
         if n.sta_id != AP_STA_ID || n.scd_flow as usize != BSS_QUEUE { return; }
         self.t.tx_reclaim(BSS_QUEUE, n.scd_ssn as usize);
-        self.tagg.on_ba(n);
+        let next_sn = self.link.as_ref().map_or(0, |l| l.seq);
+        self.tagg.on_ba(n, next_sn);
         self.txs.ok += n.txed_2_done as u64;
         self.txs.rate_ok[rs::rate_bucket(self.agg_rate)] += n.txed_2_done as u64;
         self.txq_drained();
         let now = now_ms();
+        self.poll_bar(now);
         if self.link.as_ref().map_or(false, |l| l.lq) {
             let rate = self.agg_rate;
             if let Some(c) = self.rc.as_mut() { c.on_ampdu(rate, n.txed, n.txed_2_done, now); }
@@ -915,6 +960,7 @@ impl Dev {
         let mut dropped = Vec::new();
         self.agg.stop_all(&mut dropped);
         self.tagg.reset();
+        self.bar_idx = None;
         self.agg_queue = false;
         TXQ_DEPTH.store(0, Ordering::Relaxed);
         if TX_HELD.swap(false, Ordering::AcqRel) { crate::netdev::kick(); }
@@ -1402,7 +1448,7 @@ pub fn init(cmdline: &str) {
         guard: None, tkip_group: None, last_service_ms: 0, rxs: RxStats::default(), csumcheck: opts.csumcheck,
         link: None, track: None, bcn: None, bcn_rssi: None,
         htl: None, ht_op_mode: None, agg: ht::RxAgg::default(), bas: BaStats::default(),
-        tagg: TxAgg::new(true), agg_queue: false, agg_rate: 0, wmm_new: None, wmm_updates: 0,
+        tagg: TxAgg::new(true), bar_idx: None, agg_queue: false, agg_rate: 0, wmm_new: None, wmm_updates: 0,
         fw_stats: None, stats_n: 0, stats_bad_len: None, chain_dbm16: [0; 2],
     });
     PRESENT.store(true, Ordering::SeqCst);
@@ -2905,6 +2951,8 @@ fn monitor_once(bssid: &[u8; 6], budget_ms: u64) -> Option<Fail> {
 /// Start TX aggregation when it is due (see `TxAgg::poll_request`): an
 /// ADDBA request for TID 0 with the next sequence number as SSN.
 fn poll_tx_agg(bssid: &[u8; 6]) {
+    // A BAR deferred by the rate limit, or a failed one to retry.
+    with_dev(|d| d.poll_bar(now_ms()));
     let req = with_dev(|d| {
         let ht_link = d.htl.map_or(false, |h| h.ht) && d.agg_queue;
         let empty = d.t.txq[BSS_QUEUE].as_ref().map_or(true, |t| t.used() == 0);
