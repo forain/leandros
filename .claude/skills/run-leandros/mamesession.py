@@ -8,6 +8,12 @@ its log and checks it:
 
   mame-wayland   the log says MAME drew in a Wayland window (not KMS)
   mame-speed     MAME's "Average speed: N%" >= MAME_MIN_SPEED (default 90)
+  mame-audio     the QEMU-captured audio device output (LEANDROS_AUDIO_WAV, the
+                 end of the PipeWire sink chain) has loud seconds while MAME runs
+                 (the desktop's PipeWire holds the device; MAME must go through
+                 pw-cat -- openbugs #56). With --vt, the same on the text VT:
+                 root runs `vttest chvt 2` and starts MAME while the desktop
+                 runs on VT1 (mame-vt-audio).
 
 Exit code != 0 when either fails. Output: $MAMESESSION_OUT
 (default /tmp/mamesession)/run-<tag>/{mame.log,analysis.json}.
@@ -60,6 +66,7 @@ def check(text):
         # Keys come from the compositor while MAME's window has focus: the
         # session presses "5" (KEY_5 = 6) once MAME runs.
         "mame-wl-key": {"pass": "[mame] key src=wayland code=6 value=1" in text},
+        "pipewire-route": {"pass": "PipeWire stream via pw-cat" in text},
         "keys": [l for l in text.splitlines() if l.startswith("[mame] key ")][:12],
     }
     return res
@@ -85,20 +92,39 @@ def main():
     ds.key("meta_l-t")
     ds.wait_for("terminal", ds.have("cosmic-term"), 60 * ds.SCALE)
     ds.SER.pump(4 * ds.SCALE)
-    ds.typ(f"LEANDROS_MAME_KEYLOG=1 mame {ROM} -rompath / -str {SECS}{' ' + EXTRA if EXTRA else ''} 2>&1 | tee /tmp/mame.log"); ds.key("ret")
+    a0 = ds.wav_mark()
+    ds.typ(f"LEANDROS_MAME_KEYLOG=1 {os.environ.get("MAME_ENV", "")} mame {ROM} -rompath / -str {SECS}{' ' + EXTRA if EXTRA else ''} 2>&1 | tee /tmp/mame.log"); ds.key("ret")
     ds.wait_for("mame-start", lambda: ds.count("mame") >= 1, 60 * ds.SCALE)
     ds.SER.pump(8 * ds.SCALE)
     ds.key("5")
     ds.wait_for("mame-exit", lambda: ds.count("mame") == 0, (SECS + 120) * ds.SCALE, every=10)
+    ds.wav_rms("desktop-mame", a0, ds.wav_mark())
     text = ds.sh("cat /tmp/mame.log", 30)
     open(f"{OUT}/mame.log", "w").write(text)
     res = check(text)
+    res["mame-audio"] = {"pass": ds.AUDIO["desktop-mame"]["loud_seconds"] >= 3, **ds.AUDIO["desktop-mame"]}
+    if "--vt" in A:
+        vt = ds.sh("cat /proc/vtstat", 30)
+        m = re.search(r"^active (\d+)", vt, re.M)
+        desk = int(m.group(1)) if m else 1
+        tvt = 2 if desk == 1 else 1
+        ds.sh(f"/bin/vttest chvt {tvt}", 30)
+        ds.SER.pump(3 * ds.SCALE)
+        ds.sh(f"(cd /; exec env {os.environ.get("MAME_ENV", "")} /bin/mame {ROM} -rompath / -str {SECS} </dev/null >/tmp/mame2.log 2>&1 &)", 30)
+        a1 = ds.wav_mark()
+        ds.SER.pump(min(SECS, 25) * ds.SCALE)
+        ds.wav_rms("textvt-mame", a1, ds.wav_mark())
+        res["mame-vt-audio"] = {"pass": ds.AUDIO["textvt-mame"]["loud_seconds"] >= 3, **ds.AUDIO["textvt-mame"],
+                                "log": ds.sh("tail -n 3 /tmp/mame2.log", 30)[-300:]}
+        ds.sh("killall mame; true", 30)
+        ds.sh(f"/bin/vttest chvt {desk}", 30)
     res["steps"] = ds.STEPS
     res["mame-single-run"]["pass"] &= ds.STEPS.get("mame-exit") is not None
     json.dump(res, open(f"{OUT}/analysis.json", "w"), indent=1)
-    ds.log("RESULT", json.dumps({k: res[k] for k in ("mame-wayland", "mame-speed", "mame-single-run", "mame-wl-key", "keys")}))
+    gates = ["mame-wayland", "mame-speed", "mame-single-run", "mame-wl-key", "mame-audio"] + (["mame-vt-audio"] if "--vt" in A else [])
+    ds.log("RESULT", json.dumps({k: res[k] for k in gates + ["keys"]}))
     ds.drv("stop", t=120)
-    sys.exit(0 if all(res[k]["pass"] for k in ("mame-wayland", "mame-speed", "mame-single-run", "mame-wl-key")) else 1)
+    sys.exit(0 if all(res[k]["pass"] for k in gates) else 1)
 
 
 if __name__ == "__main__":

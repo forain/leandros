@@ -3185,7 +3185,7 @@ fn nat_update_owned(ms: &mut MountState, nid: u32, owner: Option<u32>, blk_addr:
 
 // ── SIT: find a free segment ──────────────────────────────────────────────────
 
-fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
+fn sit_find_free_seg(ms: &mut MountState, after: u32, heads: bool) -> Option<u32> {
     // Bound the scan by the real main-area segment count, not a hardcoded
     // 1024: on a volume with fewer segments the modulo wrapped onto segments
     // past the end of SIT, and on a larger one it left everything above 1024
@@ -3195,7 +3195,7 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
     // lx: the checkpoint's filler logs stay empty and typed (`linux_logs`)
     // unless nothing else is left (second pass).
     for pass in 0..2 {
-    if pass == 1 && !ms.sb.fmt.lx { break; }
+    if pass == 1 && (!ms.sb.fmt.lx || !heads) { break; }
     for seg_off in 0..total {
         let seg = (start_seg + seg_off) % total;
         if pass == 0 && ms.sb.fmt.lx && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
@@ -3226,7 +3226,7 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
 
 /// lx: set segment `seg`'s SIT type (0..2 data, 3..5 node logs), keeping
 /// `valid_nodes` equal to the sum over node-typed segments.
-fn sit_set_type(ms: &mut MountState, seg: u32, t: u16) {
+pub(crate) fn sit_set_type(ms: &mut MountState, seg: u32, t: u16) {
     if !ms.sb.fmt.lx || seg >= ms.sb.seg_cnt_main { return; }
     ssa_set_kind(ms, seg, (3..=5).contains(&t));
     let (blkno, off) = sit_entry_loc(ms, seg);
@@ -3473,12 +3473,18 @@ pub(crate) fn ssa_set_kind(ms: &mut MountState, seg: u32, node: bool) {
 /// The six summary blocks of a checkpoint pack tail: the cached SSA block of
 /// each current log, footer by log class. None when the volume cannot hold
 /// summaries (the tail stays zero).
-pub(crate) fn lx_tail_sums(ms: &mut MountState, logs: &LinuxLogs) -> Option<alloc::vec::Vec<u8>> {
+///
+/// Where Linux reads them (`sum_blk_addr`): a umount pack has the three data
+/// summaries at total-7 and the three node summaries at total-4; any other
+/// pack has the data summaries at total-4 (node cursegs then come from the
+/// SSA area). So a non-umount tail is node, node, node, data, data, data.
+pub(crate) fn lx_tail_sums(ms: &mut MountState, logs: &LinuxLogs, umount: bool) -> Option<alloc::vec::Vec<u8>> {
     if !ms.sb.fmt.lx { return None; }
     let mut out = alloc::vec![0u8; 6 * BLOCK_SIZE];
     for t in 0..6 {
         let blkno = ssa_blk(ms, logs[t].0)?;
-        let d = &mut out[t * BLOCK_SIZE..(t + 1) * BLOCK_SIZE];
+        let slot = if umount { t } else { (t + 3) % 6 };
+        let d = &mut out[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE];
         d.copy_from_slice(ms.cache.read(ms.dev, blkno));
         d[SSA_FOOTER] = (t >= 3) as u8;
     }
@@ -3529,10 +3535,17 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
                 return Some(ms.sb.main_blkaddr + seg * bps + b);
             }
         }
-        let next = match sit_find_free_seg(ms, seg) {
+        // lx: Linux's four extra log heads (`linux_logs`) need segments
+        // that are empty or of their own type; filling them left no valid
+        // curseg position on a full volume (fsck.f2fs "Incorrect curseg",
+        // "Next block offset is not free"). They are the last resort, after
+        // SSR, like upstream's reserved segments.
+        let next = match sit_find_free_seg(ms, seg, false) {
             Some(n) => Some(n),
-            None if ssr_enabled() => ssr_pick(ms, node),
-            None => None,
+            None if ssr_enabled() => ssr_pick(ms, node, false)
+                .or_else(|| sit_find_free_seg(ms, seg, true))
+                .or_else(|| ssr_pick(ms, node, true)),
+            None => sit_find_free_seg(ms, seg, true),
         };
         let next = match next {
             Some(n) => n,
@@ -3552,6 +3565,19 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
 /// never take this path.
 fn cp_is_foreign(sb: &SbInfo, b: &[u8; BLOCK_SIZE]) -> bool {
     sb.seg_cnt_sit >= 2 && !durable::cp_is_legacy(b) && r64(b, CP_OWN_VER) != r64(b, CP_VER)
+}
+
+/// Linux's roll-forward (recover_fsync_data) starts at the hot node head: a
+/// node block there whose footer cp_ver equals the checkpoint's was fsynced
+/// after it and must be replayed, which this mount cannot do for a Linux
+/// volume.
+fn fsync_chain_pending(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE]) -> bool {
+    let seg = r32(cp, CP_CUR_NODE_SEGNO) as u64;
+    let off = r16(cp, CP_CUR_NODE_BLKOFF) as u64;
+    if seg >= sb.seg_cnt_main as u64 || off >= sb.blocks_per_seg as u64 { return true; }
+    let mut b = [0u8; BLOCK_SIZE];
+    if !virtio_blk::read_block(dev, sb.main_blkaddr as u64 + seg * sb.blocks_per_seg as u64 + off, &mut b) { return true; }
+    r64(&b, sb.fmt.footer() + 12) == r64(cp, CP_VER)
 }
 
 /// Bring a Linux-written checkpoint into the form this kernel reads, on the
@@ -3620,7 +3646,7 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
     if flags & CP_LARGE_NAT_BM != 0 || CP_VER_BITMAP + sit_sz + nat_sz > durable::CP_CRC_OFF
         || sb.cp_payload > 0 || sb.seg_cnt_nat < 2 { bail!("bitmap-layout"); }
     if flags & CP_ORPHAN_PRESENT != 0 {
-        dbg_str("[F2FS] Linux checkpoint carries orphan blocks; they are not reaped\n");
+        dbg_str("[F2FS] Linux checkpoint carries orphan blocks; the mount reaps them\n");
     }
     let bit = |off: usize, i: usize| cp[off + i / 8] & (0x80u8 >> (i % 8)) != 0;
     let mut blk = [0u8; BLOCK_SIZE];
@@ -3728,11 +3754,29 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
                 }
                 if !put(t, &ents, cnt) { bail!("ssa-write"); }
             }
-        } else if total >= 7 {
+        } else if total >= if umount { 7 } else { 4 } {
+            // A sync checkpoint (no umount flag) holds the three data summaries only.
+            let sbase = if umount { 7 } else { 4 };
             for t in 0..3 {
-                if !virtio_blk::read_block(dev, cp_addr + total - 7 + t as u64, &mut blk) { bail!("data-sum-read"); }
+                if !virtio_blk::read_block(dev, cp_addr + total - sbase + t as u64, &mut blk) { bail!("data-sum-read"); }
                 let cnt = sums(t).1.min(bps as usize);
                 if !put(t, &blk[..cnt * SSA_ENTRY], cnt) { bail!("ssa-write"); }
+            }
+        }
+        if !umount {
+            // Linux writes no node summaries in a sync checkpoint and rebuilds
+            // them from the node footers at mount (restore_node_summary).
+            for t in 3..6 {
+                let (seg, cnt) = sums(t);
+                let cnt = cnt.min(bps as usize);
+                if seg >= sb.seg_cnt_main || cnt == 0 { continue; }
+                let mut ents = alloc::vec![0u8; cnt * SSA_ENTRY];
+                for j in 0..cnt {
+                    if !rd(sb.main_blkaddr as u64 + seg as u64 * bps + j as u64, &mut blk) { bail!("node-scan"); }
+                    let nid = sb.fmt.footer_nid(&blk);
+                    ents[j * SSA_ENTRY..j * SSA_ENTRY + 4].copy_from_slice(&nid.to_le_bytes());
+                }
+                if !put(t, &ents, cnt) { bail!("ssa-write"); }
             }
         }
         if umount && total >= 4 {
@@ -3747,7 +3791,7 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
     Some(n)
 }
 
-fn sit_entry_loc(ms: &MountState, seg: u32) -> (u64, usize) {
+pub(crate) fn sit_entry_loc(ms: &MountState, seg: u32) -> (u64, usize) {
     let sit_blkno = ms.sb.sit_addr(seg / SIT_PER_BLK as u32);
     (sit_blkno as u64, (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE)
 }
@@ -3778,11 +3822,12 @@ fn seg_first_usable(ms: &mut MountState, seg: u32, from: u32) -> Option<u32> {
 
 /// SSR victim (lane f2fsgc): the segment, other than the two logs' own,
 /// with the most usable blocks (greedy, like upstream's foreground SSR).
-fn ssr_pick(ms: &mut MountState, node: bool) -> Option<u32> {
+fn ssr_pick(ms: &mut MountState, node: bool, heads: bool) -> Option<u32> {
     let bps = ms.sb.blocks_per_seg;
     let mut best: Option<(u32, u32)> = None;
     for seg in 0..ms.sb.seg_cnt_main {
         if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno { continue; }
+        if ms.sb.fmt.lx && !heads && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
         if ms.sb.fmt.lx {
             // A data block in a node segment (or the reverse) is something
             // fsck.f2fs cannot repair: reuse only a segment of the same class.
@@ -4045,12 +4090,14 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
             // kernel LSB-first: the block must be free under both readings.
             let m = seg_busy_map(ms, seg);
             let free = |b: u32| m[b as usize / 64] & (1u64 << (b % 64)) == 0;
-            if let Some(b) = (off as u32..bps).find(|&b| free(b) && free((b & !7) | (7 - (b & 7)))) {
-                logs[t] = (seg, b as u16);
-            }
+            let ok = |b: &u32| free(*b) && free((*b & !7) | (7 - (*b & 7)));
+            // Every head is SSR: lx takes a free block before `off` too.
+            let b = (off as u32..bps).find(ok).or_else(|| if ms.sb.fmt.lx { (0..off as u32).find(ok) } else { None });
+            if let Some(b) = b { logs[t] = (seg, b as u16); }
         }
     }
     let mut after = ms.cp.cur_data_segno;
+    let mut ssr = [false; 6];
     for t in 0..6 {
         if logs[t].0 != u32::MAX { continue; }
         // lx: keep the previous pick while it is still empty (stable cursegs).
@@ -4078,25 +4125,76 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
             let (blkno, off) = sit_entry_loc(ms, seg);
             if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0 { pick = Some(seg); break; }
         }
-        let seg = pick.unwrap_or(t as u32);
-        logs[t] = (seg, 0);
+        // No empty segment (near-full volume): lx heads go SSR into a
+        // segment of the same class at a block that is free (pack writes
+        // every log as SSR, so only that block must be free). The old
+        // fallback, segment `t` at block 0, put the warm-data curseg on a
+        // valid block of a hot-data segment (fsck.f2fs: "Next block offset
+        // is not free" + "Incorrect curseg [1] type(SIT) [0]").
+        let (seg, off) = match pick {
+            Some(s) => (s, 0),
+            None if ms.sb.fmt.lx => match lx_ssr_head(ms, &logs, t, avoid) {
+                Some(h) => { ssr[t] = true; h }
+                // Nothing valid exists: at least not a segment another head has.
+                None => ((0..main).find(|&g| !logs.iter().any(|l| l.0 == g)
+                    && g != ms.cp.cur_data_segno && g != ms.cp.cur_node_segno).unwrap_or(t as u32), 0),
+            },
+            None => (t as u32, 0),
+        };
+        logs[t] = (seg, off);
         after = seg;
     }
     if ms.sb.fmt.lx {
         // Type the six heads so fsck.f2fs finds each curseg in a segment of
-        // its own type; a non-empty fallback segment keeps its type.
+        // its own type; a non-empty fallback segment keeps its type unless it
+        // was chosen as an SSR head (same class, so only data<->data or
+        // node<->node changes).
         for t in 0..6 {
             let seg = logs[t].0;
             if seg >= main { continue; }
             let (blkno, off) = sit_entry_loc(ms, seg);
             let empty = r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0;
-            if empty || (t == 0 && seg == ms.cp.cur_data_segno) || (t == 3 && seg == ms.cp.cur_node_segno) {
+            if empty || ssr[t] || (t == 0 && seg == ms.cp.cur_data_segno) || (t == 3 && seg == ms.cp.cur_node_segno) {
                 sit_set_type(ms, seg, t as u16);
             }
         }
         ms.cp.logs = logs;
     }
     logs
+}
+
+/// lx: an SSR log head of type `t` when no free segment qualifies. Linux
+/// only reads this checkpoint's SIT, so a block is free here when its valid
+/// bit is clear in the SIT this checkpoint writes (both bit orders); blocks
+/// freed since the durable checkpoint count as free, unlike for our own
+/// allocator, which never moves to these heads. Order: a segment already of
+/// type `t`, then one of `t`'s class (data or node), then any segment with no
+/// valid block (a pre-free one: retyping it is safe).
+fn lx_ssr_head(ms: &mut MountState, logs: &LinuxLogs, t: usize, avoid: &[u32]) -> Option<(u32, u16)> {
+    let bps = ms.sb.blocks_per_seg;
+    let node = t >= 3;
+    for pass in 0..3 {
+        for seg in 0..ms.sb.seg_cnt_main {
+            if logs.iter().any(|l| l.0 == seg) || seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno
+                || avoid.contains(&seg) { continue; }
+            let (blkno, o) = sit_entry_loc(ms, seg);
+            let v = r16(ms.cache.read(ms.dev, blkno), o);
+            let ok = match pass {
+                0 => (v >> 10) as usize == t,
+                1 => sit_is_node(v) == node,
+                _ => v & SIT_VBLOCKS_MASK == 0,
+            };
+            if !ok { continue; }
+            let blk = ms.cache.read(ms.dev, blkno);
+            let map = &blk[o + SIT_VMAP_OFF..o + SIT_VMAP_OFF + (bps as usize).div_ceil(8)];
+            // On-disk lx map is MSB-first; also require the LSB-first twin.
+            let set = |b: u32| map[b as usize / 8] & (0x80u8 >> (b % 8)) != 0;
+            if let Some(b) = (0..bps).find(|&b| !set(b) && !set((b & !7) | (7 - (b & 7)))) {
+                return Some((seg, b as u16));
+            }
+        }
+    }
+    None
 }
 
 /// lx, at the start of a checkpoint (before its dirty set is collected, so
@@ -6504,9 +6602,9 @@ fn may_access_ino(ms: &mut MountState, ino: u32, mask: u8) -> bool {
     if cred.euid == 0 && !(mask & xattr::MAY_EXEC != 0 && !xattr::is_dir(meta.mode)) {
         return true; // root: skip the xattr read entirely
     }
-    let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, xnid)) } else { None };
+    let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, ino, xnid)) } else { None };
     let acl = match &xbuf {
-        Some(b) => xattr::find(&b[..ms.sb.fmt.footer()], xattr::IDX_ACL_ACCESS, b""),
+        Some(b) => xattr::find(&b[..xarena(ms)], xattr::IDX_ACL_ACCESS, b""),
         None => None,
     };
     xattr::may_access(&meta, &cred, acl, mask)
@@ -6827,9 +6925,9 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
             // an O_RDONLY open (Linux may_open: O_TRUNC implies MAY_WRITE).
             let want_write = writable || flags & O_TRUNC != 0;
             let (meta, xnid) = load_meta_xnid(ms, ino);
-            let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, xnid)) } else { None };
+            let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, ino, xnid)) } else { None };
             let acl = match &xbuf {
-                Some(b) => xattr::find(&b[..ms.sb.fmt.footer()], xattr::IDX_ACL_ACCESS, b""),
+                Some(b) => xattr::find(&b[..xarena(ms)], xattr::IDX_ACL_ACCESS, b""),
                 None => None,
             };
             if !xattr::access_check(&meta, cred, acl, want_read, want_write, false) {
@@ -7583,10 +7681,10 @@ fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32, cred: &xattr::Cred) -> 
     // ACL exists, and the write-back mirrors the setxattr read-modify-write.
     let xnid = { let iblk = ms.cache.read(ms.dev, addr as u64); r32(iblk, ms.sb.fmt.xattr()) };
     if xnid != 0 {
-        let mut blkbuf = read_xattr_arena(ms, xnid);
+        let mut blkbuf = read_xattr_arena(ms, ino, xnid);
         let mut vbuf = [0u8; xattr::F2FS_XATTR_ARENA];
         let vlen = {
-            let arena = &blkbuf[..ms.sb.fmt.footer()];
+            let arena = &blkbuf[..xarena(ms)];
             match xattr::find(arena, xattr::IDX_ACL_ACCESS, b"") {
                 Some(v) => { vbuf[..v.len()].copy_from_slice(v); Some(v.len()) }
                 None => None,
@@ -7594,7 +7692,7 @@ fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32, cred: &xattr::Cred) -> 
         };
         if let Some(vlen) = vlen {
             xattr::acl_chmod_rewrite(&mut vbuf[..vlen], new_mode);
-            let arena = &mut blkbuf[..ms.sb.fmt.footer()];
+            let arena = &mut blkbuf[..xarena(ms)];
             let _ = xattr::set(arena, xattr::IDX_ACL_ACCESS, b"", &vbuf[..vlen], 0);
             persist_xattr_block(ms, ino, xnid, &blkbuf);
         }
@@ -8063,16 +8161,58 @@ fn load_meta_xnid(ms: &mut MountState, ino: u32) -> (xattr::FileMeta, u32) {
         uid:  inode_uid(iblk),
         gid:  inode_gid(iblk),
     };
-    (meta, r32(iblk, ms.sb.fmt.xattr()))
+    let mut xnid = r32(iblk, ms.sb.fmt.xattr());
+    if xnid == 0 && ms.sb.fmt.lx && inline_xattr_bytes(iblk) > 0 { xnid = XNID_INLINE; }
+    (meta, xnid)
 }
 
 /// Copy the whole xattr node block (arena + footer) onto the stack. Copying
 /// (rather than holding a `&` into the cache) is mandatory: the write-back path
 /// takes `get_mut` on NAT/SIT blocks through the same 4-slot cache and can evict
 /// the node block being edited.
-fn read_xattr_arena(ms: &mut MountState, xnid: u32) -> [u8; BLOCK_SIZE] {
-    let addr = nat_lookup(ms, xnid);
-    read_block_copy(ms, addr)
+fn read_xattr_arena(ms: &mut MountState, ino: u32, xnid: u32) -> [u8; XBUF_LEN] {
+    let mut out = [0u8; XBUF_LEN];
+    if !ms.sb.fmt.lx {
+        let addr = nat_lookup(ms, xnid);
+        out[..BLOCK_SIZE].copy_from_slice(&read_block_copy(ms, addr));
+        return out;
+    }
+    // Linux layout: raw = inline area ++ xnode[0..4072], decoded to an arena.
+    let mut raw = [0u8; LX_RAW_MAX];
+    let (off, ib) = lx_inline_span(ms, ino);
+    if ib > 0 {
+        let iaddr = nat_lookup(ms, ino);
+        let iblk = ms.cache.read(ms.dev, iaddr as u64);
+        raw[..ib].copy_from_slice(&iblk[off..off + ib]);
+    }
+    if xnid != 0 && xnid != XNID_INLINE {
+        let addr = nat_lookup(ms, xnid);
+        let blk = read_block_copy(ms, addr);
+        raw[ib..ib + xattr::LX_XNODE].copy_from_slice(&blk[..xattr::LX_XNODE]);
+    }
+    xattr::lx_decode(&raw[..ib + xattr::LX_XNODE], &mut out);
+    out
+}
+
+/// Max raw lx store: 200 inline slots + the xnode body.
+const LX_RAW_MAX: usize = 800 + xattr::LX_XNODE;
+/// Size of the in-memory arena buffer the xattr handlers work on (lx ACLs
+/// grow when decoded to posix_acl_xattr form).
+const XBUF_LEN: usize = 10240;
+/// Pseudo xnid on lx volumes: no xnode, but the inode has an inline xattr area.
+const XNID_INLINE: u32 = u32::MAX;
+
+/// Usable arena length for the handlers' slices.
+fn xarena(ms: &MountState) -> usize { if ms.sb.fmt.lx { XBUF_LEN } else { ms.sb.fmt.footer() } }
+
+/// (byte offset in the inode block, length) of the inline xattr area; 0 length
+/// when the inode has none or the volume is legacy.
+fn lx_inline_span(ms: &mut MountState, ino: u32) -> (usize, usize) {
+    if !ms.sb.fmt.lx { return (0, 0); }
+    let iaddr = nat_lookup(ms, ino);
+    let iblk = ms.cache.read(ms.dev, iaddr as u64);
+    let ib = inline_xattr_bytes(iblk);
+    (ms.sb.fmt.nids() - ib, ib)
 }
 
 /// Write a full xattr node-block image back, allocating the node lazily when the
@@ -8081,8 +8221,31 @@ fn read_xattr_arena(ms: &mut MountState, xnid: u32) -> [u8; BLOCK_SIZE] {
 /// allocated, zero-filled buffer becomes a self-identifying node block. Returns
 /// the effective nid, or 0 if a lazy allocation failed (ENOSPC) — callers treat
 /// 0 as "nothing was stored".
-fn persist_xattr_block(ms: &mut MountState, ino: u32, xnid: u32, blkbuf: &[u8; BLOCK_SIZE]) -> u32 {
-    let xnid = if xnid != 0 {
+fn persist_xattr_block(ms: &mut MountState, ino: u32, xnid: u32, xbuf: &[u8; XBUF_LEN]) -> u32 {
+    let mut xnid = if xnid == XNID_INLINE { 0 } else { xnid };
+    let mut blkbuf = [0u8; BLOCK_SIZE];
+    let mut inline_raw = [0u8; 800];
+    let (ioff, ib) = lx_inline_span(ms, ino);
+    if !ms.sb.fmt.lx {
+        blkbuf.copy_from_slice(&xbuf[..BLOCK_SIZE]);
+    } else {
+        let mut raw = [0u8; LX_RAW_MAX];
+        let end = match xattr::lx_encode(&xbuf[..], &mut raw[..ib + xattr::LX_XNODE]) {
+            Ok(n) => n,
+            Err(_) => return 0, // ENOSPC
+        };
+        inline_raw[..ib].copy_from_slice(&raw[..ib]);
+        blkbuf[..xattr::LX_XNODE].copy_from_slice(&raw[ib..ib + xattr::LX_XNODE]);
+        if end <= ib && xnid == 0 {
+            // Everything fits inline: no xnode needed.
+            let iaddr = nat_lookup(ms, ino);
+            { let iblk = ms.cache.get_mut(ms.dev, iaddr as u64); iblk[ioff..ioff + ib].copy_from_slice(&inline_raw[..ib]); }
+            nat_update(ms, ino, iaddr);
+            return XNID_INLINE;
+        }
+    }
+    let blkbuf = &blkbuf;
+    xnid = if xnid != 0 {
         xnid
     } else {
         // Allocate the node first and hold no cache borrow across it — the
@@ -8106,6 +8269,11 @@ fn persist_xattr_block(ms: &mut MountState, ino: u32, xnid: u32, blkbuf: &[u8; B
     ms.sb.fmt.write_footer(&mut out, xnid, ino, NODE_OFS_XATTR);
     ms.cache.write(ms.dev, xaddr as u64, &out);
     nat_update_owned(ms, xnid, Some(ino), xaddr);
+    if ib > 0 {
+        let iaddr = nat_lookup(ms, ino);
+        { let iblk = ms.cache.get_mut(ms.dev, iaddr as u64); iblk[ioff..ioff + ib].copy_from_slice(&inline_raw[..ib]); }
+        nat_update(ms, ino, iaddr);
+    }
     xnid
 }
 
@@ -8187,8 +8355,8 @@ fn xattr_get(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
         if let Err(e) = xattr::may_read_xattr(idx, &meta, cred, None) { return err_reply(-e); }
         return err_reply(-61); // ENODATA
     }
-    let blkbuf = read_xattr_arena(ms, xnid);
-    let arena = &blkbuf[..ms.sb.fmt.footer()];
+    let blkbuf = read_xattr_arena(ms, ino, xnid);
+    let arena = &blkbuf[..xarena(ms)];
     let acl = xattr::find(arena, xattr::IDX_ACL_ACCESS, b"");
     if let Err(e) = xattr::may_read_xattr(idx, &meta, cred, acl) { return err_reply(-e); }
     let val = match xattr::find(arena, idx, suf) {
@@ -8206,8 +8374,8 @@ fn xattr_list(ms: &mut MountState, ino: u32, list_ptr: u64, size: u64, euid: u32
     // ls -l fast path: no xattr node means an empty list, answered without a
     // block read.
     if xnid == 0 { return val_reply(0); }
-    let blkbuf = read_xattr_arena(ms, xnid);
-    let arena = &blkbuf[..ms.sb.fmt.footer()];
+    let blkbuf = read_xattr_arena(ms, ino, xnid);
+    let arena = &blkbuf[..xarena(ms)];
     let empty: &mut [u8] = &mut [];
     let out = if size == 0 {
         empty
@@ -8235,9 +8403,9 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
 
     // The current arena (all-zero when no node exists yet) — both the gate and
     // the read-modify-write operate on it.
-    let mut blkbuf = if xnid != 0 { read_xattr_arena(ms, xnid) } else { [0u8; BLOCK_SIZE] };
+    let mut blkbuf = if xnid != 0 { read_xattr_arena(ms, ino, xnid) } else { [0u8; XBUF_LEN] };
     {
-        let arena = &blkbuf[..ms.sb.fmt.footer()];
+        let arena = &blkbuf[..xarena(ms)];
         let acl = if xnid != 0 { xattr::find(arena, xattr::IDX_ACL_ACCESS, b"") } else { None };
         if let Err(e) = xattr::may_write_xattr(idx, &meta, cred, acl) { return err_reply(-e); }
     }
@@ -8250,7 +8418,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
         if size == 0 {
             if xnid != 0 {
                 {
-                    let arena = &mut blkbuf[..ms.sb.fmt.footer()];
+                    let arena = &mut blkbuf[..xarena(ms)];
                     let _ = xattr::remove(arena, idx, suf);
                 }
                 persist_xattr_block(ms, ino, xnid, &blkbuf);
@@ -8270,7 +8438,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
                 set_inode_perm_bits(ms, ino, perm);
                 if xnid != 0 {
                     {
-                        let arena = &mut blkbuf[..ms.sb.fmt.footer()];
+                        let arena = &mut blkbuf[..xarena(ms)];
                         let _ = xattr::remove(arena, xattr::IDX_ACL_ACCESS, b"");
                     }
                     persist_xattr_block(ms, ino, xnid, &blkbuf);
@@ -8280,7 +8448,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
             }
             // Non-trivial: store the ACL, then sync i_mode's perm bits to it.
             {
-                let arena = &mut blkbuf[..ms.sb.fmt.footer()];
+                let arena = &mut blkbuf[..xarena(ms)];
                 if let Err(e) = xattr::set(arena, idx, suf, val, flags as u32) { return err_reply(-e); }
             }
             if persist_xattr_block(ms, ino, xnid, &blkbuf) == 0 { return err_reply(-28); } // ENOSPC
@@ -8290,7 +8458,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
         }
         // Default ACL: directories only (enforced by the gate), stored verbatim.
         {
-            let arena = &mut blkbuf[..ms.sb.fmt.footer()];
+            let arena = &mut blkbuf[..xarena(ms)];
             if let Err(e) = xattr::set(arena, idx, suf, val, flags as u32) { return err_reply(-e); }
         }
         if persist_xattr_block(ms, ino, xnid, &blkbuf) == 0 { return err_reply(-28); }
@@ -8300,7 +8468,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
 
     // Non-ACL namespace: a plain arena insert/replace.
     {
-        let arena = &mut blkbuf[..ms.sb.fmt.footer()];
+        let arena = &mut blkbuf[..xarena(ms)];
         if let Err(e) = xattr::set(arena, idx, suf, val, flags as u32) { return err_reply(-e); }
     }
     if persist_xattr_block(ms, ino, xnid, &blkbuf) == 0 { return err_reply(-28); }
@@ -8319,15 +8487,15 @@ fn xattr_remove(ms: &mut MountState, ino: u32, name_ptr: u64, cred: &xattr::Cred
         None => return err_reply(-95), // EOPNOTSUPP
     };
     let (meta, xnid) = load_meta_xnid(ms, ino);
-    let mut blkbuf = if xnid != 0 { read_xattr_arena(ms, xnid) } else { [0u8; BLOCK_SIZE] };
+    let mut blkbuf = if xnid != 0 { read_xattr_arena(ms, ino, xnid) } else { [0u8; XBUF_LEN] };
     {
-        let arena = &blkbuf[..ms.sb.fmt.footer()];
+        let arena = &blkbuf[..xarena(ms)];
         let acl = if xnid != 0 { xattr::find(arena, xattr::IDX_ACL_ACCESS, b"") } else { None };
         if let Err(e) = xattr::may_write_xattr(idx, &meta, cred, acl) { return err_reply(-e); }
     }
     if xnid == 0 { return err_reply(-61); } // ENODATA
     let removed = {
-        let arena = &mut blkbuf[..ms.sb.fmt.footer()];
+        let arena = &mut blkbuf[..xarena(ms)];
         xattr::remove(arena, idx, suf)
     };
     match removed {
@@ -8351,9 +8519,9 @@ fn xattr_access(ms: &mut MountState, path_ptr: u64, amode: u64, cred: &xattr::Cr
     };
     if amode == 0 { return ok_reply(); }
     let (meta, xnid) = load_meta_xnid(ms, ino);
-    let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, xnid)) } else { None };
+    let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, ino, xnid)) } else { None };
     let acl = match &xbuf {
-        Some(b) => xattr::find(&b[..ms.sb.fmt.footer()], xattr::IDX_ACL_ACCESS, b""),
+        Some(b) => xattr::find(&b[..xarena(ms)], xattr::IDX_ACL_ACCESS, b""),
         None => None,
     };
     if xattr::access_check(&meta, cred, acl, amode & 4 != 0, amode & 2 != 0, amode & 1 != 0) {
@@ -8369,8 +8537,8 @@ fn xattr_access(ms: &mut MountState, path_ptr: u64, amode: u64, cred: &xattr::Cr
 fn parent_default_acl(ms: &mut MountState, parent_ino: u32, out: &mut [u8; xattr::ACL_INHERIT_MAX]) -> usize {
     let (_, xnid) = load_meta_xnid(ms, parent_ino);
     if xnid == 0 { return 0; }
-    let blk = read_xattr_arena(ms, xnid);
-    match xattr::find(&blk[..ms.sb.fmt.footer()], xattr::IDX_ACL_DEFAULT, b"") {
+    let blk = read_xattr_arena(ms, parent_ino, xnid);
+    match xattr::find(&blk[..xarena(ms)], xattr::IDX_ACL_DEFAULT, b"") {
         Some(v) if v.len() <= out.len() => { out[..v.len()].copy_from_slice(v); v.len() }
         _ => 0,
     }
@@ -8393,9 +8561,9 @@ fn store_inherited_acls(ms: &mut MountState, ino: u32, parent_ino: u32, c: &xatt
     let mut dbuf = [0u8; xattr::ACL_INHERIT_MAX];
     let dlen = if c.inherit_default { parent_default_acl(ms, parent_ino, &mut dbuf) } else { 0 };
     if c.access_len == 0 && dlen == 0 { return; }
-    let mut blkbuf = [0u8; BLOCK_SIZE];
+    let mut blkbuf = [0u8; XBUF_LEN];
     {
-        let arena = &mut blkbuf[..ms.sb.fmt.footer()];
+        let arena = &mut blkbuf[..xarena(ms)];
         if c.access_len > 0 {
             let _ = xattr::set(arena, xattr::IDX_ACL_ACCESS, b"", &c.access[..c.access_len], 0);
         }
@@ -8416,9 +8584,9 @@ fn utimens_inode(ms: &mut MountState, ino: u32, at: (i64, i64), mt: (i64, i64), 
     let (meta, xnid) = load_meta_xnid(ms, ino);
     if cred.euid != 0 && cred.euid != meta.uid {
         if explicit { return err_reply(-1); } // EPERM
-        let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, xnid)) } else { None };
+        let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, ino, xnid)) } else { None };
         let acl = match &xbuf {
-            Some(b) => xattr::find(&b[..ms.sb.fmt.footer()], xattr::IDX_ACL_ACCESS, b""),
+            Some(b) => xattr::find(&b[..xarena(ms)], xattr::IDX_ACL_ACCESS, b""),
             None => None,
         };
         if !xattr::may_access(&meta, cred, acl, xattr::MAY_WRITE) { return err_reply(-13); } // EACCES
@@ -8827,7 +8995,29 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
         (alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)
     });
     let cp = if pick1 { cp1 } else { cp0 };
-    let cp_orphans = durable::orphans_of(if pick1 { &cp_buf1 } else { &cp_buf0 });
+    let mut cp_orphans = durable::orphans_of(if pick1 { &cp_buf1 } else { &cp_buf0 });
+    // Linux orphan blocks (design f2fslxrw S7): `f2fs_orphan_block` = ino[1020],
+    // reserved, blk_addr u16, blk_count u16 @4086, entry_count u32 @4088,
+    // check_sum; they sit at pack + 1 + cp_payload, `start_sum - 1 - cp_payload`
+    // of them. Their inodes join the reaper list, and the first checkpoint
+    // (which never sets CP_ORPHAN_PRESENT) clears the flag as Linux would.
+    let mut orphan_unread = false;
+    if (if pick1 { foreign1 } else { foreign0 }) && cp.flags & CP_ORPHAN_PRESENT != 0 {
+        let pb = if pick1 { &cp_buf1 } else { &cp_buf0 };
+        let base = (sb.cp_blkaddr + if pick1 { pack_blks } else { 0 }) as u64 + 1 + sb.cp_payload as u64;
+        let nblk = (r32(pb, CP_START_SUM) as u64).saturating_sub(1 + sb.cp_payload as u64);
+        if nblk == 0 || nblk > 512 { orphan_unread = true; }
+        let mut ob = [0u8; BLOCK_SIZE];
+        for k in 0..nblk.min(512) {
+            if !virtio_blk::read_block(dev_idx, base + k, &mut ob) { orphan_unread = true; break; }
+            let ec = r32(&ob, 4088) as usize;
+            if ec > 1020 { orphan_unread = true; break; }
+            for q in 0..ec { cp_orphans.push(r32(&ob, 4 * q)); }
+        }
+        if !orphan_unread {
+            dbg_str("[F2FS] Linux orphan inodes to reap: "); dbg_dec(cp_orphans.len()); dbg_str("\n");
+        }
+    }
     // Unknown-feature mask (lane f2fsrf): a newer kernel wrote a feature this
     // one does not understand; do not modify the volume.
     let pbuf = if pick1 { &cp_buf1 } else { &cp_buf0 };
@@ -8839,10 +9029,10 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
         let fl = cp.flags;
         let why = if fl & (CP_FSCK_FLAG | CP_ERROR_FLAG | CP_DISABLED_FLAG | CP_QUOTA_NEED_FSCK) != 0 {
             Some("checkpoint flags ask for fsck or report an error")
-        } else if foreign && fl & CP_UMOUNT_FLAG == 0 {
+        } else if foreign && fl & CP_UMOUNT_FLAG == 0 && !(fl & CP_ORPHAN_PRESENT != 0 && !orphan_unread && !fsync_chain_pending(dev_idx, &sb, pbuf)) {
             Some("unclean Linux shutdown; mount it on Linux once to recover")
-        } else if fl & CP_ORPHAN_PRESENT != 0 {
-            Some("orphan inodes are not reaped yet")
+        } else if orphan_unread {
+            Some("orphan blocks unreadable")
         } else if sb.seg_cnt_nat < 2 || sb.cp_payload > 0
             || CP_VER_BITMAP + r32(pbuf, CP_SIT_BM_SIZE) as usize + r32(pbuf, CP_NAT_BM_SIZE) as usize > durable::CP_CRC_OFF {
             Some("volume too large for import yet")
