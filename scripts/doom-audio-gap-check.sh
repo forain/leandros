@@ -17,5 +17,5 @@ LEANDROS_ROOT_IMAGE=$D/data0.img LEANDROS_DISK_IMAGE=$D/limine.img DOOMSESSION_O
 grep -a "audio:" $O/run-guard/doom.log 2>/dev/null | head -4
 python3 scripts/wav-gaps.py $O/run-guard/audio.wav --max-gaps "$MAX"; rc=$?
 [ -s $O/run-guard/audio.wav ] || { echo "FAIL: no WAV captured (see $D/session.log)"; rc=2; }
-rm -rf $O/run-guard/*.wav $O/run-guard/*.ppm $D/data0.img $D/limine.img
+[ -n "${KEEP_WAV:-}" ] && cp $O/run-guard/audio.wav "$KEEP_WAV"; cp $O/run-guard/doom.log $O/run-guard/audio.json /tmp/ 2>/dev/null; rm -rf $O/run-guard/*.wav $O/run-guard/*.ppm $D/data0.img $D/limine.img
 exit $rc
