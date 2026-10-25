@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Linux <-> LeandrOS f2fs interop test (aarch64 QEMU + the Linux box).
+
+Usage (see scripts/f2fslx/interop.sh, the wrapper):
+  interop.sh [--list] <variant...>        variants: lxdef lxnoi lxext (direction A)
+                                          home (direction B)   all = every variant
+  F2FSINTEROP_LOCK=<path>/lock.sh         if set, box work runs under `lock.sh box`
+                                          and QEMU boots under `lock.sh qemu`.
+  F2FSINTEROP_BOX=user@host               default forain@172.16.158.150
+  LEANDROS_RUN_ID                         default f2fsinterop-aarch64
+
+Direction A (Linux -> LeandrOS): on the box mkfs.f2fs + populate + MANIFEST md5,
+fsck rc 0, image shipped gzipped; LeandrOS boots with it attached, mounts it by
+label (rw, else ro), `md5sum -c MANIFEST`, attempts a write; a volume mounted ro
+must be bit-identical afterwards.
+Direction B (LeandrOS -> Linux): scripts/mkfs-f2fs-home-lx.py volume -> LeandrOS
+workload -> box `fsck.f2fs --dry-run` -> Linux rw mount, verify, write a file,
+umount, fsck -> LeandrOS mounts again and verifies the Linux file.
+
+Each step prints one line: PASS | FAIL | EXPECTED-FAIL | UNEXPECTED-PASS | SKIP.
+Exit code = number of FAIL + UNEXPECTED-PASS.  Known gaps live in
+scripts/f2fslx/interop-known-failures.txt (patterns `variant:step`, fnmatch,
+`#` comments); the lane that fixes a gap deletes its entry (a step that then
+passes while still listed is UNEXPECTED-PASS, so stale entries are caught).
+Guest images/disks are scratch under $TMPDIR; box scratch is /tmp/f2fsinterop-$$
+and always removed.
+"""
+import fnmatch, hashlib, json, os, shutil, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
+BOX = os.environ.get("F2FSINTEROP_BOX", "forain@172.16.158.150")
+LOCK = os.environ.get("F2FSINTEROP_LOCK", "")
+SSH = ["ssh", "-o", "BatchMode=yes", BOX]
+# name -> (mkfs options, mount options used while populating)
+VARIANTS = {
+    "lxdef": ("", ""),
+    "lxnoi": ("", "noinline_data"),
+    "lxext": ("-O extra_attr,inode_checksum,flexible_inline_xattr", ""),
+}
+SIZE = "128M"
+results = []
+
+
+def known():
+    pats = []
+    try:
+        for l in open(os.path.join(HERE, "interop-known-failures.txt")):
+            l = l.split("#")[0].strip()
+            if l:
+                pats.append(l)
+    except OSError:
+        pass
+    return pats
+
+
+KNOWN = known()
+
+
+def step(variant, name, ok, why=""):
+    key = f"{variant}:{name}"
+    exp = any(fnmatch.fnmatch(key, p) for p in KNOWN)
+    st = ("UNEXPECTED-PASS" if exp else "PASS") if ok else ("EXPECTED-FAIL" if exp else "FAIL")
+    print(f"{st:15} {key:28} {why}"[:200], flush=True)
+    results.append(st)
+    return ok
+
+
+def skip(variant, name, why):
+    print(f"{'SKIP':15} {variant}:{name:20} {why}", flush=True)
+
+
+def locked(kind, argv):
+    return ([LOCK, kind] if LOCK else []) + argv
+
+
+def box(script, timeout=1800):
+    r = subprocess.run(locked("box", SSH + ["bash", "-s"]), input=script, capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout + r.stderr
+
+
+def fetch(remote, local):
+    with open(local, "wb") as f:
+        p1 = subprocess.Popen(SSH + [f"gzip -1c {remote}"], stdout=subprocess.PIPE)
+        p2 = subprocess.Popen(["gunzip"], stdin=p1.stdout, stdout=f)
+        p1.stdout.close(); p2.wait(); return p1.wait() == 0 and p2.returncode == 0
+
+
+def push(local, remote):
+    p1 = subprocess.Popen(["gzip", "-1c", local], stdout=subprocess.PIPE)
+    p2 = subprocess.run(SSH + [f"gunzip > {remote}"], stdin=p1.stdout)
+    p1.stdout.close(); return p1.wait() == 0 and p2.returncode == 0
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while b := f.read(1 << 20):
+            h.update(b)
+    return h.hexdigest()
+
+
+def guest(imgs, cmds, tag):
+    """Boot aarch64 with imgs attached, run cmds, return list of outputs."""
+    env = dict(os.environ, LEANDROS_RUN_ID=os.environ.get("LEANDROS_RUN_ID", "f2fsinterop-aarch64"))
+    r = subprocess.run(locked("qemu", [sys.executable, os.path.abspath(__file__), "--guest", json.dumps(imgs)]),
+                       input=json.dumps(cmds), capture_output=True, text=True, env=env, timeout=3000)
+    for l in r.stdout.splitlines():
+        if l.startswith("@@JSON@@"):
+            outs = json.loads(l[8:])
+            if os.environ.get("F2FSINTEROP_VERBOSE"):
+                for c, o in zip(cmds, outs):
+                    print(f"  $ {c[:90]}\n    {o.strip()[-400:]}", file=sys.stderr)
+            return outs
+    print(f"guest run {tag} failed rc={r.returncode}: {(r.stdout + r.stderr)[-300:]}", file=sys.stderr)
+    return None
+
+
+def guest_main(imgs):
+    sys.path.insert(0, os.path.join(REPO, ".claude/skills/run-leandros"))
+    os.chdir(REPO)
+    os.environ["LEANDROS_QEMU_EXTRA"] = " ".join(
+        f"-drive if=none,id=up{i},format=raw,file={m} -device virtio-blk-pci,drive=up{i},disable-legacy=on"
+        for i, m in enumerate(json.loads(imgs)))
+    import driver
+    cmds = json.loads(sys.stdin.read()); outs = []
+    driver.cmd_start("aarch64"); driver.cmd_login("root", "root", timeout=180)
+    try:
+        for c in cmds:
+            r = driver.serial_run(c, timeout=300, arch="aarch64")
+            outs.append(r["output"] if isinstance(r, dict) else str(r))
+    finally:
+        driver.cmd_stop()
+    print("@@JSON@@" + json.dumps(outs))
+
+
+MNT = ("mkdir -p /mnt/{l}; if mount -t f2fs LABEL={l} /mnt/{l}; then echo MNT_RW; "
+       "elif mount -t f2fs -o ro LABEL={l} /mnt/{l}; then echo MNT_RO; else echo MNT_FAIL; fi")
+
+
+# the default QEMU config already carries a leandros-home disk (vdc); ours is the next one
+MNTH = "mkdir -p /mnt/h; if mount -t f2fs /dev/vdd /mnt/h; then echo MNT_RW; elif mount -t f2fs -o ro /dev/vdd /mnt/h; then echo MNT_RO; else echo MNT_FAIL; fi"
+
+
+def md5chk(l, f):
+    return f"cd /mnt/{l} && md5sum -c {f} > /tmp/m.out 2>&1; echo MD5RC=$?; tail -n 2 /tmp/m.out; cd /"
+
+
+def md5_ok(out):
+    return "MD5RC=0" in out and "WARNING" not in out and "FAILED" not in out
+
+
+def direction_a(variants, tmp):
+    rd = f"/tmp/f2fsinterop-{os.getpid()}"
+    imgs, shas = [], {}
+    try:
+        for v in variants:
+            mo, mnt = VARIANTS[v]
+            mnt = f",{mnt}" if mnt else ""
+            script = f"""set -e; D={rd}; mkdir -p $D/m; cd $D; N={v}; rm -f $N.img
+truncate -s {SIZE} $N.img; mkfs.f2fs -q -f -l $N {mo} $N.img
+sudo mount -o loop{mnt} $N.img m; cd m; sudo chown $(id -u) .
+mkdir -p upg small dir1/sub big; echo hello > small/inl; printf 'x%.0s' $(seq 3000) > small/inl3000
+head -c 5000 /dev/urandom > small/f5000; : > small/empty
+for i in $(seq 1 300); do echo "entry $i" > dir1/file_with_long_name_$i; done
+for i in 1 2 3; do echo s$i > dir1/sub/s$i; done
+head -c 3M /dev/urandom > big/b3m; head -c 12M /dev/urandom > big/b12m
+dd if=/dev/urandom of=big/sparse bs=4k count=1 seek=2000 status=none
+ln -s ../small/inl small/sym; ln big/b3m big/hard; setfattr -n user.k -v val small/inl 2>/dev/null || true
+find . -type f ! -name MANIFEST -print0 | sort -z | xargs -0 md5sum > MANIFEST
+cd ..; sync; sudo umount m
+set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"""
+            rc, out = box(script)
+            ok = rc == 0 and "FSCK0_RC=0" in out
+            if not step(v, "A.linux-mkfs+fsck0", ok, "box mkfs/populate/fsck rc 0" if ok else out.strip()[-120:]):
+                continue
+            local = os.path.join(tmp, v + ".img")
+            if not fetch(f"{rd}/{v}.img", local):
+                step(v, "A.ship", False, "image transfer failed"); continue
+            imgs.append(v); shas[v] = sha(local)
+    finally:
+        box(f"rm -rf {rd}")
+    if not imgs:
+        return
+    cmds = []
+    for v in imgs:
+        cmds += [MNT.format(l=v), md5chk(v, "MANIFEST"),
+                 f"echo leandros > /mnt/{v}/ours.txt && cat /mnt/{v}/ours.txt; echo WRITE_RC=$?; sync",
+                 f"umount /mnt/{v}; echo UMOUNT_RC=$?"]
+    outs = guest([os.path.join(tmp, v + ".img") for v in imgs], cmds, "A")
+    for i, v in enumerate(imgs):
+        if outs is None:
+            step(v, "A.mount", False, "guest run failed"); continue
+        m, md, w, u = outs[4 * i:4 * i + 4]
+        mounted = "MNT_RW" in m or "MNT_RO" in m
+        step(v, "A.mount", mounted, "mounted" if mounted else "mount failed")
+        if not mounted:
+            for s_ in ("A.md5", "A.write", "A.ro-unchanged"):
+                step(v, s_, False, "not mounted")
+            continue
+        step(v, "A.md5", md5_ok(md), "MANIFEST ok" if md5_ok(md) else md.strip()[-100:])
+        wok = "WRITE_RC=0" in w and "leandros" in w
+        step(v, "A.write", wok, "write ok" if wok else "write refused (ro/EROFS)" if "Read-only" in w else "write failed")
+        if wok:
+            skip(v, "A.ro-unchanged", "volume was written")
+        else:
+            same = sha(os.path.join(tmp, v + ".img")) == shas[v]
+            step(v, "A.ro-unchanged", same, "image bit-identical" if same else "image CHANGED by refused write/ro mount")
+
+
+def direction_b(tmp):
+    v = "home"
+    img = os.path.join(tmp, "home.img")
+    r = subprocess.run([sys.executable, os.path.join(REPO, "scripts/mkfs-f2fs-home-lx.py"), "create", img, "--size", "256M"],
+                       capture_output=True, text=True)
+    if not step(v, "B.lx-mkfs", r.returncode == 0, "mkfs-f2fs-home-lx create" if r.returncode == 0 else r.stderr.strip()[-100:]):
+        return
+    W = ("cd /mnt/h && mkdir -p w/d1/d2 w/many && dd if=/dev/urandom of=w/big bs=4096 count=3000 2>/dev/null && "
+         "for i in $(seq 1 300); do echo f$i > w/many/file_with_long_name_$i; done && echo hi > w/d1/d2/s && "
+         "ln w/d1/d2/s w/hard && ln -s d1/d2/s w/sym && mv w/many/file_with_long_name_7 w/d1/moved && "
+         "rm w/many/file_with_long_name_1* && dd if=/dev/urandom of=w/big bs=4096 count=10 seek=5 conv=notrunc 2>/dev/null && "
+         "(cd w && md5sum big d1/moved d1/d2/s > ours.md5); ls w/many | wc -l; sync; cd /; echo WORK_OK")
+    outs = guest([img], [MNTH, W, "umount /mnt/h; echo UMOUNT_RC=$?"], "B1")
+    if outs is None or "MNT_RW" not in outs[0] or "WORK_OK" not in outs[1] or "UMOUNT_RC=0" not in outs[2]:
+        step(v, "B.work", False, "LeandrOS mount/workload/umount failed"); return
+    step(v, "B.work", True, "workload + umount ok")
+    rd = f"/tmp/f2fsinterop-{os.getpid()}"
+    try:
+        box(f"mkdir -p {rd}")
+        if not push(img, f"{rd}/home.img"):
+            step(v, "B.ship", False, "push failed"); return
+        fsck = lambda n: ("cd %s; timeout 180 fsck.f2fs --dry-run home.img </dev/null >f%s.txt 2>&1; echo FSCK_RC=$?; "
+                          "grep -ciE '\\[Fail\\]|ASSERT' f%s.txt; grep -iE 'fail|ASSERT|wrong|invalid' f%s.txt | head -n 2" % (rd, n, n, n))
+        rc, out = box(fsck(1))
+        step(v, "B.fsck1", "FSCK_RC=0" in out and "\n0\n" in out, "fsck.f2fs rc 0" if "FSCK_RC=0" in out else out.strip()[-120:].replace("\n", " "))
+        script = f"""cd {rd}; mkdir -p m; if sudo mount -o loop home.img m; then
+ (cd m/w && md5sum -c ours.md5 > /tmp/mm.$$ 2>&1; echo LXMD5_RC=$?; tail -n 2 /tmp/mm.$$; ls many | wc -l; stat -c %n many/file_with_long_name_299 d1/moved >/dev/null; echo LXSTAT_RC=$?; rm -f /tmp/mm.$$)
+ sudo sh -c 'echo fromlinux > m/w/linux.txt; head -c 1M /dev/urandom > m/w/lbig; md5sum m/w/lbig | sed s,m/w/,, > m/w/linux.md5'; sync; sudo umount m && echo LX_UMOUNT_OK
+else echo LX_MOUNT_FAIL; sudo dmesg | tail -n 3 | cut -c1-150; fi"""
+        rc, out = box(script)
+        ok = "LXMD5_RC=0" in out and "LXSTAT_RC=0" in out and "LX_UMOUNT_OK" in out
+        step(v, "B.linux-rw", ok, "Linux mount+verify+write+umount" if ok else out.strip()[-140:].replace("\n", " "))
+        rc, out = box(fsck(2))
+        step(v, "B.fsck2", "FSCK_RC=0" in out and "\n0\n" in out, "fsck.f2fs rc 0 after Linux write" if "FSCK_RC=0" in out else out.strip()[-120:].replace("\n", " "))
+        if not ok:
+            skip(v, "B.back-verify", "Linux write step failed"); return
+        if not fetch(f"{rd}/home.img", img):
+            step(v, "B.ship-back", False, "fetch failed"); return
+    finally:
+        box(f"rm -rf {rd}")
+    outs = guest([img], [MNTH,
+                         "cd /mnt/h/w && cat linux.txt; md5sum -c linux.md5 2>&1; md5sum -c ours.md5 2>&1; echo END; cd /; umount /mnt/h"], "B2")
+    if outs is None or "MNT_FAIL" in outs[0]:
+        step(v, "B.back-verify", False, "LeandrOS cannot mount the Linux-written volume"); return
+    ok = outs is not None and "fromlinux" in outs[1] and "FAILED" not in outs[1] and "WARNING" not in outs[1] and outs[1].count(": OK") >= 4
+    step(v, "B.back-verify", ok, "LeandrOS reads Linux's files" if ok else "verify failed: " + (outs[1].strip()[-100:] if outs else "no guest"))
+
+
+def main(argv):
+    if argv[:1] == ["--guest"]:
+        return guest_main(argv[1])
+    allv = list(VARIANTS) + ["home"]
+    if not argv or argv[0] in ("-h", "--help", "--list"):
+        print(__doc__ if argv[:1] != ["--list"] else " ".join(allv)); return 0
+    vs = allv if argv == ["all"] else argv
+    bad = [v for v in vs if v not in allv]
+    if bad:
+        print("unknown variant:", bad, "known:", allv); return 2
+    tmp = tempfile.mkdtemp(prefix="f2fsinterop-")
+    try:
+        a = [v for v in vs if v in VARIANTS]
+        if a:
+            direction_a(a, tmp)
+        if "home" in vs:
+            direction_b(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    bad = sum(1 for r in results if r in ("FAIL", "UNEXPECTED-PASS"))
+    print(f"summary: {results.count('PASS')} PASS, {results.count('EXPECTED-FAIL')} EXPECTED-FAIL, {bad} FAIL/UNEXPECTED-PASS")
+    return bad
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
