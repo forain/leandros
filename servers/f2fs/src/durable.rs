@@ -1290,6 +1290,63 @@ pub(crate) fn recover(ms: &mut MountState, rf_start: u32, tail: u32) -> u32 {
     recs.len() as u32
 }
 
+/// One node block of a Linux fsync chain (see `linux_chain` in lib.rs).
+#[derive(Clone, Copy)]
+pub(crate) struct LxChain { pub addr: u32, pub nid: u32, pub ino: u32, pub ofs: u32, pub dent: bool }
+
+/// Roll a Linux fsync chain forward (Linux's recover_data): each chained node
+/// block already holds the file's state at its fsync, so it is adopted in
+/// place (NAT -> its address) instead of being copied into a fresh node. The
+/// SIT/SSA follow from the old and new trees exactly as in `recover`; a new
+/// file's name is restored from its DENT-marked inode page. Returns the number
+/// of node blocks adopted.
+pub(crate) fn recover_linux(ms: &mut MountState, chain: &[LxChain]) -> u32 {
+    let mut inos: Vec<u32> = Vec::new();
+    for e in chain { if !inos.contains(&e.ino) { inos.push(e.ino); } }
+    let mut frees: Vec<u32> = Vec::new();
+    let mut uses: Vec<u32> = Vec::new();
+    let mut dentries: Vec<(u32, u32)> = Vec::new();
+    for &ino in &inos {
+        let (old_n, old_d) = tree(ms, ino);
+        let mut dentry = None;
+        for e in chain.iter().filter(|e| e.ino == ino) {
+            crate::nat_update_owned(ms, e.nid, Some(e.ino), e.addr);
+            if e.nid >= ms.cp.next_free_nid { ms.cp.next_free_nid = e.nid + 1; }
+            if e.dent {
+                let b = ms.cache.read(ms.dev, e.addr as u64);
+                dentry = Some(r32(b, 84));
+            }
+        }
+        let (new_n, new_d) = tree(ms, ino);
+        let old_a: BTreeSet<u32> = old_n.iter().map(|x| x.1).chain(old_d.iter().map(|x| x.0)).collect();
+        let new_a: BTreeSet<u32> = new_n.iter().map(|x| x.1).chain(new_d.iter().map(|x| x.0)).collect();
+        frees.extend(old_a.difference(&new_a).copied());
+        uses.extend(new_a.difference(&old_a).copied());
+        for &(nid, a) in &new_n {
+            if old_a.contains(&a) { continue; }
+            lx_type_class(ms, a, true);
+            crate::ssa_set(ms, a, nid, 0, None);
+        }
+        for &(a, nid, ofs) in &new_d {
+            if old_a.contains(&a) { continue; }
+            lx_type_class(ms, a, false);
+            crate::ssa_set(ms, a, nid, ofs, None);
+        }
+        let new_ids: BTreeSet<u32> = new_n.iter().map(|x| x.0).collect();
+        for &(nid, _) in &old_n { if !new_ids.contains(&nid) { nat_clear(ms, nid); } }
+        if let Some(p) = dentry { dentries.push((ino, p)); }
+    }
+    for &a in &frees { sit_set(ms, a, false); }
+    for &a in &uses { sit_set(ms, a, true); }
+    for &(ino, p) in &dentries { recover_dentry(ms, ino, p); }
+    dbg_str("[F2FS] Linux roll-forward: ");
+    dbg_dec(chain.len());
+    dbg_str(" node(s) of ");
+    dbg_dec(inos.len());
+    dbg_str(" file(s) recovered\n");
+    chain.len() as u32
+}
+
 /// A file created after the checkpoint: put its name back in its parent.
 fn recover_dentry(ms: &mut MountState, ino: u32, pino: u32) {
     if let Err(why) = recover_dentry_in(ms, ino, pino) {

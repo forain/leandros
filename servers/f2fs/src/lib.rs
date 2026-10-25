@@ -3609,17 +3609,52 @@ fn cp_is_foreign(sb: &SbInfo, b: &[u8; BLOCK_SIZE]) -> bool {
     sb.seg_cnt_sit >= 2 && !durable::cp_is_legacy(b) && r64(b, CP_OWN_VER) != r64(b, CP_VER)
 }
 
-/// Linux's roll-forward (recover_fsync_data) starts at the hot node head: a
-/// node block there whose footer cp_ver equals the checkpoint's was fsynced
-/// after it and must be replayed, which this mount cannot do for a Linux
-/// volume.
-fn fsync_chain_pending(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE]) -> bool {
-    let seg = r32(cp, CP_CUR_NODE_SEGNO) as u64;
-    let off = r16(cp, CP_CUR_NODE_BLKOFF) as u64;
-    if seg >= sb.seg_cnt_main as u64 || off >= sb.blocks_per_seg as u64 { return true; }
+/// Linux's roll-forward (recover_fsync_data / find_fsync_dnodes): from the
+/// warm node log head, follow next_blkaddr while the node footer's cp_ver is
+/// the checkpoint's (with the checkpoint crc in the high half when
+/// CP_CRC_RECOVERY_FLAG is set). A file is recovered when one of its nodes
+/// carries an FSYNC or DENT mark; its nodes up to the last marked one are
+/// replayed. Returns those nodes in chain order, or None when the chain holds
+/// something this mount cannot replay (nodes below the first indirect level,
+/// a corrupt footer, I/O error): the volume then stays read-only.
+fn linux_chain(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], flags: u32) -> Option<alloc::vec::Vec<durable::LxChain>> {
+    let seg = r32(cp, CP_CUR_NODE_SEGNO + 4) as u64;
+    let off = r16(cp, CP_CUR_NODE_BLKOFF + 2) as u64;
+    let bps = sb.blocks_per_seg as u64;
+    if seg >= sb.seg_cnt_main as u64 || off >= bps { return None; }
+    let mut want = r64(cp, CP_VER);
+    if flags & 0x40 != 0 {
+        let co = r32(cp, durable::CP_CHKSUM_FIELD) as usize;
+        if co + 4 > BLOCK_SIZE { return None; }
+        want |= (r32(cp, co) as u64) << 32;
+    }
+    let main = sb.main_blkaddr as u64;
+    let end = main + sb.seg_cnt_main as u64 * bps;
+    let ft = sb.fmt.footer();
+    let mut addr = main + seg * bps + off;
+    let mut all: alloc::vec::Vec<(durable::LxChain, bool)> = alloc::vec::Vec::new();
     let mut b = [0u8; BLOCK_SIZE];
-    if !virtio_blk::read_block(dev, sb.main_blkaddr as u64 + seg * sb.blocks_per_seg as u64 + off, &mut b) { return true; }
-    r64(&b, sb.fmt.footer() + 12) == r64(cp, CP_VER)
+    while addr >= main && addr < end {
+        if all.len() > 100_000 { return None; }
+        if !virtio_blk::read_block(dev, addr, &mut b) { return None; }
+        if r64(&b, ft + 12) != want { break; }
+        let (nid, ino, fl) = (r32(&b, ft), r32(&b, ft + 4), r32(&b, ft + 8));
+        let ofs = fl >> 3;
+        all.push((durable::LxChain { addr: addr as u32, nid, ino, ofs, dent: fl & 4 != 0 && nid == ino }, fl & 6 != 0));
+        addr = r32(&b, ft + 20) as u64;
+    }
+    let mut out = alloc::vec::Vec::new();
+    for (i, (e, _)) in all.iter().enumerate() {
+        let last = all.iter().rposition(|(x, m)| *m && x.ino == e.ino);
+        if last.map_or(true, |l| i > l) { continue; }
+        if ofs_bad(e) { return None; }
+        out.push(durable::LxChain { ..*e });
+    }
+    Some(out)
+}
+
+fn ofs_bad(e: &durable::LxChain) -> bool {
+    e.ofs > 2 || e.nid == 0 || (e.ofs == 0) != (e.nid == e.ino)
 }
 
 /// Bring a Linux-written checkpoint into the form this kernel reads, on the
@@ -9153,11 +9188,20 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
     let incompat = if durable::cp_block_has_journal(pbuf) { r32(pbuf, durable::CPJ_INCOMPAT_OFF) } else { 0 };
     let unknown = incompat & !durable::CPJ_INCOMPAT_KNOWN;
     let foreign = if pick1 { foreign1 } else { foreign0 };
+    let mut lx_chain: alloc::vec::Vec<durable::LxChain> = alloc::vec::Vec::new();
     if foreign || sb.native {
         let fl = cp.flags;
         let why = if fl & (CP_FSCK_FLAG | CP_ERROR_FLAG | CP_DISABLED_FLAG | CP_QUOTA_NEED_FSCK) != 0 {
             Some("checkpoint flags ask for fsck or report an error")
-        } else if foreign && fl & CP_UMOUNT_FLAG == 0 && !(fl & CP_ORPHAN_PRESENT != 0 && !orphan_unread && !fsync_chain_pending(dev_idx, &sb, pbuf)) {
+        } else if foreign && fl & CP_UMOUNT_FLAG == 0 && !{
+            // Unclean Linux shutdown: fine when the fsync chain (if any) can
+            // be rolled forward here, and an orphan checkpoint needs no chain.
+            match linux_chain(dev_idx, &sb, pbuf, fl) {
+                Some(c) if !c.is_empty() => { lx_chain = c; true }
+                Some(_) => fl & CP_ORPHAN_PRESENT != 0 && !orphan_unread,
+                None => false,
+            }
+        } {
             Some("unclean Linux shutdown; mount it on Linux once to recover")
         } else if orphan_unread {
             Some("orphan blocks unreadable")
@@ -9290,7 +9334,8 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
             dbg_str(" block(s) were not home yet; replayed\n");
         }
         ms.valid_blocks = sit_repair(ms);
-        let recovered = durable::recover(ms, rf_start, cp_tail);
+        let mut recovered = durable::recover(ms, rf_start, cp_tail);
+        if !lx_chain.is_empty() && !ms.read_only { recovered += durable::recover_linux(ms, &lx_chain); }
         // lx: valid_inode_count drifts across a crash (roll-forward recreates
         // inodes without counting them): recount from the NAT, which is exact.
         if ms.sb.fmt.lx && !ms.read_only { ms.cp.valid_inodes = nat_count_inodes(ms); }
