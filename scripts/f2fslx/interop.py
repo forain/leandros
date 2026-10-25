@@ -347,10 +347,11 @@ set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"
         box(f"rm -rf {rd}")
     if not imgs:
         return
-    # at most 4 disks per guest boot: 8 attached virtio-blk disks left the last three unmounted
+    # up to 16 disks per guest boot (blkmanytest covers 16 extra virtio-blk disks;
+    # the old 8-device probe cap that forced batches of 4 is gone, openbugs #83)
     allimgs = imgs
-    for ci in range(0, len(allimgs), 4):
-        imgs = allimgs[ci:ci + 4]
+    for ci in range(0, len(allimgs), 16):
+        imgs = allimgs[ci:ci + 16]
         cmds = []
         for v in imgs:
             cmds += [MNT.format(l=v), md5chk(v, "MANIFEST"),
