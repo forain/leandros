@@ -3183,6 +3183,25 @@ fn alloc_node_block(ms: &mut MountState) -> Option<u32> {
     log_alloc(ms, true)
 }
 
+/// Number of live inodes: NAT entries (nid >= 3) that name themselves as
+/// owner and have a block address. Scans up to the next free nid.
+fn nat_count_inodes(ms: &mut MountState) -> u32 {
+    let last = ms.cp.next_free_nid.min(ms.sb.seg_cnt_nat / 2 * ms.sb.blocks_per_seg * NAT_ENTRY_PER_BLK as u32);
+    let mut n = 0u32;
+    let mut nid = ms.sb.root_ino;
+    while nid < last {
+        let blk = ms.cache.read(ms.dev, (ms.sb.nat_blkaddr + nid / NAT_ENTRY_PER_BLK as u32) as u64);
+        let first = (nid % NAT_ENTRY_PER_BLK as u32) as usize;
+        let end = ((last - nid) as usize + first).min(NAT_ENTRY_PER_BLK);
+        for i in first..end {
+            let off = i * NAT_ENTRY_SIZE;
+            if r32(blk, off + 5) != 0 && r32(blk, off + 1) == nid + (i - first) as u32 { n += 1; }
+        }
+        nid += (end - first) as u32;
+    }
+    n
+}
+
 /// Shared SSA (segment summary area) writer, lx volumes only. Block `seg` of
 /// the SSA area holds one 7-byte entry per block of main-area segment `seg`
 /// (`<IBH`: nid, version, ofs_in_node) and, in its footer (byte 4091), the
@@ -8477,6 +8496,9 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         }
         ms.valid_blocks = sit_repair(ms);
         let recovered = durable::recover(ms, rf_start, cp_tail);
+        // lx: valid_inode_count drifts across a crash (roll-forward recreates
+        // inodes without counting them): recount from the NAT, which is exact.
+        if ms.sb.fmt.lx && !ms.read_only { ms.cp.valid_inodes = nat_count_inodes(ms); }
         // Lane f2fsorphan: inodes unlinked while open when that checkpoint
         // was cut; nothing holds them now. After roll-forward, so a record
         // can no longer bring one back over freed blocks.
