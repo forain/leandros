@@ -938,20 +938,19 @@ fn tree(ms: &mut MountState, ino: u32) -> (Vec<(u32, u32)>, Vec<u32>) {
     if ia == 0 { return (nodes, data); }
     nodes.push((ino, ia));
     let ib = read_block_copy(ms, ia);
-    for i in 0..inode_max_direct(&ib) {
-        let a = inode_get_blkaddr(&ib, i);
+    for i in 0..inode_max_direct(ms.sb.fmt, &ib) {
+        let a = inode_get_blkaddr(ms.sb.fmt, &ib, i);
         if a != 0 { data.push(a); }
     }
-    let x = r32(&ib, INO_XATTR);
+    let x = r32(&ib, ms.sb.fmt.xattr());
     if x != 0 { let a = nat_lookup(ms, x); if a != 0 { nodes.push((x, a)); } }
-    const PER: usize = NODE_FOOTER_OFF / 4;
     fn dnode(ms: &mut MountState, nid: u32, nodes: &mut Vec<(u32, u32)>, data: &mut Vec<u32>) {
         if nid == 0 { return; }
         let a = nat_lookup(ms, nid);
         if a == 0 { return; }
         nodes.push((nid, a));
         let b = read_block_copy(ms, a);
-        for i in 0..PER { let d = dnode_get_blkaddr(&b, i); if d != 0 { data.push(d); } }
+        for i in 0..ms.sb.fmt.per_block() { let d = dnode_get_blkaddr(ms.sb.fmt, &b, i); if d != 0 { data.push(d); } }
     }
     fn indirect(ms: &mut MountState, nid: u32, nodes: &mut Vec<(u32, u32)>, data: &mut Vec<u32>) {
         if nid == 0 { return; }
@@ -959,19 +958,19 @@ fn tree(ms: &mut MountState, ino: u32) -> (Vec<(u32, u32)>, Vec<u32>) {
         if a == 0 { return; }
         nodes.push((nid, a));
         let b = read_block_copy(ms, a);
-        for i in 0..PER { dnode(ms, dnode_get_blkaddr(&b, i), nodes, data); }
+        for i in 0..ms.sb.fmt.per_block() { dnode(ms, dnode_get_blkaddr(ms.sb.fmt, &b, i), nodes, data); }
     }
-    dnode(ms, inode_get_nid(&ib, 0), &mut nodes, &mut data);
-    dnode(ms, inode_get_nid(&ib, 1), &mut nodes, &mut data);
-    indirect(ms, inode_get_nid(&ib, 2), &mut nodes, &mut data);
-    indirect(ms, inode_get_nid(&ib, 3), &mut nodes, &mut data);
-    let dn = inode_get_nid(&ib, 4);
+    dnode(ms, inode_get_nid(ms.sb.fmt, &ib, 0), &mut nodes, &mut data);
+    dnode(ms, inode_get_nid(ms.sb.fmt, &ib, 1), &mut nodes, &mut data);
+    indirect(ms, inode_get_nid(ms.sb.fmt, &ib, 2), &mut nodes, &mut data);
+    indirect(ms, inode_get_nid(ms.sb.fmt, &ib, 3), &mut nodes, &mut data);
+    let dn = inode_get_nid(ms.sb.fmt, &ib, 4);
     if dn != 0 {
         let a = nat_lookup(ms, dn);
         if a != 0 {
             nodes.push((dn, a));
             let b = read_block_copy(ms, a);
-            for i in 0..PER { indirect(ms, dnode_get_blkaddr(&b, i), &mut nodes, &mut data); }
+            for i in 0..ms.sb.fmt.per_block() { indirect(ms, dnode_get_blkaddr(ms.sb.fmt, &b, i), &mut nodes, &mut data); }
         }
     }
     (nodes, data)
@@ -1016,7 +1015,7 @@ pub(crate) fn fsync_rf(port: u32, ino: u32) -> Option<Result<(), ()>> {
                 if m.owner == ino && sit_valid(ms, m.blk_no) { data_idx.push(i); }
                 continue;
             }
-            let (nid, own) = { let d = ms.cache.data(i); (r32(d, NODE_FOOTER_OFF), r32(d, NODE_FOOTER_OFF + 4)) };
+            let (nid, own) = { let f = ms.sb.fmt; let d = ms.cache.data(i); (f.footer_nid(d), f.footer_ino(d)) };
             if own == ino && nid != 0 && nat_lookup(ms, nid) as u64 == m.blk_no { node_idx.push((i, nid)); }
         }
         if node_idx.is_empty() && data_idx.is_empty() && !dentry { return Some(Ok(())); }
