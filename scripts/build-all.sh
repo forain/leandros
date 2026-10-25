@@ -938,7 +938,8 @@ build_ripgrep() {
         # is restored below so the checkout stays clean).
         RUSTFLAGS="-C linker=$TOOLS_DIR/linker-$arch-musl.sh -C link-self-contained=no" \
         cargo "$PINNED_TOOLCHAIN" build --target "$target_triple" --release \
-            --config "patch.crates-io.tikv-jemallocator.path=\"$ROOT_DIR/ports/ripgrep/jemalloc-stub\""
+            --config "patch.crates-io.tikv-jemallocator.path=\"$ROOT_DIR/ports/ripgrep/jemalloc-stub\"" \
+            --config 'profile.release.strip="symbols"'
         local rc=$?
         git checkout -q -- Cargo.lock 2>/dev/null
         exit $rc
