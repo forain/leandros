@@ -3,7 +3,7 @@
 
 Usage (see scripts/f2fslx/interop.sh, the wrapper):
   interop.sh [--list] <variant...>        variants: lxdef lxnoi lxext (direction A)
-                                          home (direction B)   all = every variant
+                                          home (direction B)   orph (Linux orphan CP, S7)   all = every variant
   F2FSINTEROP_LOCK=<path>/lock.sh         if set, box work runs under `lock.sh box`
                                           and QEMU boots under `lock.sh qemu`.
   F2FSINTEROP_BOX=user@host               default forain@172.16.158.150
@@ -25,7 +25,7 @@ passes while still listed is UNEXPECTED-PASS, so stale entries are caught).
 Guest images/disks are scratch under $TMPDIR; box scratch is /tmp/f2fsinterop-$$
 and always removed.
 """
-import fnmatch, hashlib, json, os, shutil, subprocess, sys, tempfile
+import fnmatch, hashlib, json, os, shutil, struct, subprocess, sys, tempfile, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -302,6 +302,78 @@ set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"
             step(v, "A.ro-unchanged", same, "image bit-identical" if same else "image CHANGED by refused write/ro mount")
 
 
+def f2fs_crc(d):
+    """Linux f2fs_crc32: crc32_le seeded with the f2fs magic, no final xor."""
+    return (~zlib.crc32(d, ~0xF2F52010 & 0xFFFFFFFF)) & 0xFFFFFFFF
+
+
+def orphan_cp(path):
+    """(CP_ORPHAN_PRESENT set, entry count of the first orphan block) of the
+    newest checkpoint of a Linux image.  A Linux `sync` with an unlinked but
+    open file writes exactly that (and no CP_UMOUNT_FLAG: a real umount reaps
+    the orphan first), so LeandrOS sees the unclean-shutdown form."""
+    with open(path, "rb") as f:
+        f.seek(1024)
+        sb = f.read(256)
+        cp_blk = struct.unpack_from("<I", sb, 76)[0]
+        bps = 1 << struct.unpack_from("<I", sb, 20)[0]
+        best = None
+        for pack in (0, 1):
+            f.seek((cp_blk + pack * bps) * 4096)
+            h = f.read(4096)
+            ver = struct.unpack_from("<Q", h, 0)[0]
+            if best is None or ver > best[0]:
+                best = (ver, pack, h)
+        _, pack, h = best
+        flags = struct.unpack_from("<I", h, 132)[0]
+        if not flags & 2 or flags & 1:
+            return False, 0
+        f.seek((cp_blk + pack * bps + 1) * 4096)
+        return True, struct.unpack_from("<I", f.read(4096), 4088)[0]
+
+
+def direction_orph(tmp):
+    """Design f2fslxrw S7: a Linux sync checkpoint with CP_ORPHAN_PRESENT.  On the
+    box a file is held open across `rm` and `sync`; the backing image is copied
+    while mounted.  LeandrOS must mount it rw, reap the orphan at mount, and
+    leave a volume that fsck.f2fs accepts and Linux mounts."""
+    v = "orph"
+    rd = f"/tmp/f2fsinterop-{os.getpid()}"
+    img = os.path.join(tmp, "orph.img")
+    script = f"""set -e; D={rd}; mkdir -p $D/m; cd $D; rm -f o.img
+truncate -s {SIZE} o.img; mkfs.f2fs -q -f -l orph o.img
+sudo mount -o loop o.img m; cd m; sudo chown $(id -u) .
+mkdir keep; echo keepme > keep/k; head -c 600000 /dev/urandom > keep/big; head -c 300000 /dev/urandom > victim
+( cd keep && md5sum k big > ../MANIFEST ); exec 3<victim; rm victim; sync; sleep 1; sync
+cp ../o.img ../snap.img; exec 3<&-; cd ..; sudo umount m; mv snap.img o.img; echo SNAP_OK"""
+    rc, out = box(script)
+    if not step(v, "C.linux-orphan", rc == 0 and "SNAP_OK" in out, "box: rm while open + sync, image copied" if rc == 0 else out.strip()[-120:]):
+        box(f"rm -rf {rd}"); return
+    try:
+        if not fetch(f"{rd}/o.img", img):
+            step(v, "C.ship", False, "fetch failed"); return
+        had, n = orphan_cp(img)
+        if not step(v, "C.has-orphan-cp", had and n >= 1, f"CP_ORPHAN_PRESENT, {n} orphan(s), no umount flag" if had else "no orphan flag in the Linux checkpoint"):
+            return
+        outs = guest([img], [MNT.format(l="orph"), "cd /mnt/orph/keep && md5sum -c ../MANIFEST; echo keepme2 > k2; ls /mnt/orph | tr '\\n' ' '; sync; cd /; umount /mnt/orph; echo UMOUNT_RC=$?"], "C1")
+        ok = outs is not None and "MNT_RW" in outs[0] and "UMOUNT_RC=0" in outs[1] and "victim" not in outs[1] and "FAILED" not in outs[1] and outs[1].count(": OK") >= 2
+        if not step(v, "C.leandros-rw", ok, "mounted rw, orphan reaped path" if ok else (outs[0] + outs[1]).strip()[-120:] if outs else "no guest"):
+            return
+        box(f"mkdir -p {rd}"); push(img, f"{rd}/o.img")
+        rc, out = box(f"""cd {rd}; timeout 180 fsck.f2fs --dry-run o.img </dev/null >f.txt 2>&1; echo FSCK_RC=$?
+grep -ciE 'is unreachable|\\[Fail\\]|ASSERT' f.txt; grep -iE 'is unreachable|fail|ASSERT' f.txt | head -n 8""")
+        ok = "FSCK_RC=0" in out and "\n0\n" in out
+        if os.environ.get("F2FSINTEROP_VERBOSE"):
+            print(out[-1200:], file=sys.stderr)
+        step(v, "C.fsck", ok, "fsck.f2fs rc 0, no unreachable NIDs" if ok else out.strip()[-140:].replace("\n", " "))
+        rc, out = box(f"""cd {rd}; mkdir -p m; if sudo mount -o loop o.img m; then (cd m/keep && md5sum -c ../MANIFEST 2>&1 | tail -n 2; cat k2; echo LXREAD_RC=$?); ls m | tr '\\n' ' '; sync; sudo umount m && echo LX_UMOUNT_OK; else echo LX_MOUNT_FAIL; fi
+timeout 180 fsck.f2fs --dry-run o.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?""")
+        ok = "LX_UMOUNT_OK" in out and "FAILED" not in out and "keepme2" in out and "FSCK2_RC=0" in out and "victim" not in out
+        step(v, "C.linux-mount", ok, "Linux mounts, reads, fsck rc 0" if ok else out.strip()[-140:].replace("\n", " "))
+    finally:
+        box(f"rm -rf {rd}")
+
+
 def direction_b(tmp):
     v = "home"
     img = os.path.join(tmp, "home.img")
@@ -353,7 +425,7 @@ else echo LX_MOUNT_FAIL; sudo dmesg | tail -n 3 | cut -c1-150; fi"""
 def main(argv):
     if argv[:1] == ["--guest"]:
         return guest_main(argv[1])
-    allv = list(VARIANTS) + ["home"]
+    allv = list(VARIANTS) + ["home", "orph"]
     if not argv or argv[0] in ("-h", "--help", "--list"):
         print(__doc__ if argv[:1] != ["--list"] else " ".join(allv)); return 0
     vs = allv if argv == ["all"] else argv
@@ -367,6 +439,8 @@ def main(argv):
             direction_a(a, tmp)
         if "home" in vs:
             direction_b(tmp)
+        if "orph" in vs:
+            direction_orph(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     bad = sum(1 for r in results if r in ("FAIL", "UNEXPECTED-PASS"))
