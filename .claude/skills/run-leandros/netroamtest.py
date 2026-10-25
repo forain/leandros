@@ -10,7 +10,7 @@ The simulated Wi-Fi gets two data paths (LEANDROS_NIC2=wifisim on SLIRP
                                                 (wifi.ssid= on the cmdline)
   NetB     WPA2-PSK  -40 dBm  path 2 (10.0.4.x)  stronger than NetA
   Flaky    WPA2-PSK  -35 dBm  path 1             deauths (reason 6) in every handshake
-  TkipNet  WPA/WPA2 mixed, TKIP group cipher     not joinable
+  TkipNet  pure TKIP (pairwise TKIP only)      not joinable
   ShaNet   PSK-SHA256 only                       not joinable
   MfpNet   PSK with MFP required                 not joinable
   FtNet    FT-PSK only                           not joinable
@@ -62,7 +62,7 @@ APS = ",".join([
     "NetA:psk:neta-pass-123:-50:6",
     "NetB:psk:netb-pass-123:-40:36::2",
     "Flaky:psk:flaky-pass-123:-35:1::d",
-    "TkipNet:psk:tkip-pass-123:-60:11::t",
+    "TkipNet:psk:tkip-pass-123:-60:11::k",
     "ShaNet:psk:sha-pass-1234:-61:40::s",
     "MfpNet:psk:mfp-pass-1234:-62:44::m",
     "FtNet:psk:ft-pass-12345:-63:48::x",
@@ -371,14 +371,14 @@ def main(argv):
         if only in (None, "sec"):
             full = log_since(0)
             rows = {s: re.findall(rf"not joinable: '{s}'[^\n]*", full) for s in ("TkipNet", "ShaNet", "MfpNet", "FtNet")}
-            want = {"TkipNet": "group TKIP", "ShaNet": "PSK-SHA256", "MfpNet": "MFPR 1", "FtNet": "FT-PSK"}
+            want = {"TkipNet": "no CCMP pairwise", "ShaNet": "PSK-SHA256", "MfpNet": "MFPR 1", "FtNet": "FT-PSK"}
             bad = [f"{s}: {r[:2]}" for s, r in rows.items() if len(r) != 1 or want[s] not in r[0]]
             verdict("rsn_log", not bad, "; ".join(bad) or "one RSN line per rejected BSS")
             _, wt = sh("cat /proc/net/wifi", 30)
             joins = {m.group(2): m.group(1) for m in re.finditer(r"^\S+\s+\d+\s+-?\d+\s+\S.*?\s(yes|no)\s+\d+s (\S+)\s*$", wt, re.M)}
             ok = joins.get("NetA") == "yes" and all(joins.get(s) == "no" for s in ("TkipNet", "ShaNet", "MfpNet", "FtNet"))
             verdict("join_col", ok, f"{joins}")
-            causes = {"TkipNet": "TKIP group cipher", "ShaNet": "PSK-SHA256", "MfpNet": "management frame protection",
+            causes = {"TkipNet": "no CCMP pairwise", "ShaNet": "PSK-SHA256", "MfpNet": "management frame protection",
                       "FtNet": "FT-PSK"}
             bad = []
             for s, why in causes.items():

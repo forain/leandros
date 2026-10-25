@@ -37,7 +37,8 @@
 //!   SimOpen    open
 //!   SimHidden  hidden SSID                (not exported)
 //!   SimFull    refuses association        (fails, never hangs)
-//!   SimTkip    WPA2-PSK, TKIP group cipher (must be hidden: not JOINABLE)
+//!   SimTkip    WPA/WPA2 mixed, TKIP group + CCMP pairwise (joinable)
+//!   SimTkipOnly pure TKIP (must be hidden: not JOINABLE)
 //!
 //! (Fixtures of the simulator, not real credentials.) The run ends with
 //! SimHome saved and connected, so a reboot checks autoconnect:
@@ -884,7 +885,8 @@ async fn real_stack(t: &mut T, bus: &zbus::Connection, cleanup: bool) {
             ensure(names.contains(&want), format!("{want} missing from {names:?}"))?;
         }
         ensure(!names.contains(&"SimWPA3"), "SAE-only SimWPA3 is listed (no WPA3 yet)")?;
-        ensure(!names.contains(&"SimTkip"), "SimTkip (TKIP group cipher, not joinable) is listed")?;
+        ensure(names.contains(&"SimTkip"), format!("SimTkip (mixed mode, TKIP group + CCMP pairwise, joinable) missing from {names:?}"))?;
+        ensure(!names.contains(&"SimTkipOnly"), "SimTkipOnly (pure TKIP, not joinable) is listed")?;
         ensure(!names.contains(&"SimHidden"), "hidden SimHidden is listed")?;
         ensure(!names.iter().any(|n| n.is_empty()), "an AP with an empty SSID is listed")?;
         let mixed = s.access_points.iter().find(|a| a.ssid == "SimMixed").ok_or("no SimMixed")?;
