@@ -80,6 +80,8 @@ const CPJ_EXT_MAX: usize = 64;
 /// finds a set bit outside `CPJ_INCOMPAT_KNOWN` mounts the volume read-only.
 /// Kernels older than this lane ignore the field.
 pub(crate) const CPJ_INCOMPAT_OFF: usize = 3360;
+// The own-heads field (lane f2fscrc3) sits between the extension list and the incompat word.
+const _: () = assert!(CPJ_EXT_OFF + 4 * CPJ_EXT_MAX <= crate::CP_OWN_HEADS && crate::CP_OWN_HEADS + 12 <= CPJ_INCOMPAT_OFF);
 pub(crate) const CPJ_INCOMPAT_RF: u32 = 1;
 pub(crate) const CPJ_INCOMPAT_KNOWN: u32 = CPJ_INCOMPAT_RF;
 // Every dirty/write-back slot fits: the cache holds at most 2 * CACHE_MAX_SLOTS
@@ -630,6 +632,7 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     let mut ext_arr = [0u32; CPJ_EXT_MAX];
     if ext_n > 0 && !pick_ext(ms, &mut ext_arr, ext_n) { return Err(()); }
     let ext_segs = &ext_arr[..ext_n];
+    let logs = crate::linux_logs(ms, ext_segs);
     // Buffers (all allocations before any slot changes).
     let mut jimg: Vec<u8> = Vec::new();
     jimg.try_reserve_exact(j * BLOCK_SIZE).map_err(|_| ())?;
@@ -676,7 +679,7 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     }
     // Commit block.
     let pack = 1 - ms.dur.durable_pack;
-    let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack, ext_segs);
+    let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack, &logs);
     w32(&mut cp_buf, CPJ_MAGIC_OFF, CPJ_MAGIC);
     w32(&mut cp_buf, CPJ_INCOMPAT_OFF, if rf_enabled() { CPJ_INCOMPAT_RF } else { 0 });
     put_orphans(ms, &mut cp_buf);
@@ -1306,13 +1309,14 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
         return false;
     }
     let ext_segs = &ext_arr[..ext_n];
+    let logs = crate::linux_logs(ms, ext_segs);
     let mut ext = [0u64; CPJ_EXT_MAX];
     for (q, &sg) in ext_segs.iter().enumerate() {
         ext[q] = main + sg as u64 * ms.sb.blocks_per_seg as u64;
     }
     // Commit block and the snapshot bookkeeping, in cp_prepare's order.
     let pack = 1 - ms.dur.durable_pack;
-    let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack, ext_segs);
+    let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack, &logs);
     w32(&mut cp_buf, CPJ_MAGIC_OFF, CPJ_MAGIC);
     w32(&mut cp_buf, CPJ_INCOMPAT_OFF, if rf_enabled() { CPJ_INCOMPAT_RF } else { 0 });
     put_orphans(ms, &mut cp_buf);

@@ -145,6 +145,11 @@ class Vol:
         self.sb_raw = sb
         self.cur_node = (r32(cp, 36), r16(cp, 68))
         self.cur_data = (r32(cp, 84), r16(cp, 116))
+        if r32(cp, 164) == 4092:
+            # Linux-CRC checkpoint (lane f2fscrc3): the kernel's own log heads
+            # live at 3348; the standard fields hold heads Linux accepts.
+            self.cur_data = (r32(cp, 3348), r16(cp, 3356))
+            self.cur_node = (r32(cp, 3352), r16(cp, 3358))
         self.next_nid = r32(cp, 152)
         self.flags = r32(cp, 132)
         self.incompat = r32(cp, CPJ_INCOMPAT_OFF) if r32(cp, CPJ_MAGIC_OFF) == CPJ_MAGIC else 0

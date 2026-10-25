@@ -154,6 +154,12 @@ const CP_SIT_BM_SIZE:    usize = 156;
 const CP_NAT_BM_SIZE:    usize = 160;
 const CP_ALLOC_TYPE:     usize = 176;
 const CP_ALLOC_SSR:      u8    = 1;
+/// This kernel's data/node log heads in a checkpoint that carries the Linux
+/// CRC (`!cp_is_legacy`): data segno u32, node segno u32, data blkoff u16,
+/// node blkoff u16, in the 12 bytes between the journal extension list and
+/// CPJ_INCOMPAT_OFF. The standard curseg fields hold heads Linux accepts
+/// (lane f2fscrc3); a legacy checkpoint's heads are its standard fields.
+const CP_OWN_HEADS:      usize = 3348;
 const CP_UMOUNT_FLAG:    u32   = 0x0000_0001;
 
 // Inode (node block) field offsets
@@ -1091,6 +1097,13 @@ impl CpInfo {
             active_pack:     0,
             flags:           r32(blk, CP_CKPT_FLAGS),
         };
+        let mut cp = cp;
+        if !durable::cp_is_legacy(blk) {
+            cp.cur_data_segno  = r32(blk, CP_OWN_HEADS);
+            cp.cur_node_segno  = r32(blk, CP_OWN_HEADS + 4);
+            cp.cur_data_blkoff = r16(blk, CP_OWN_HEADS + 8);
+            cp.cur_node_blkoff = r16(blk, CP_OWN_HEADS + 10);
+        }
         (ver, cp)
     }
 }
@@ -3316,7 +3329,7 @@ fn write_checkpoint(ms: &mut MountState, umount: bool) -> bool {
 /// The next checkpoint's commit block (and the in-memory state that records
 /// it as written: version, active pack, flags). Shared by the locked
 /// `write_checkpoint` and the unlocked `checkpoint_unlocked`.
-fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8, avoid: &[u32]) -> (u64, [u8; BLOCK_SIZE]) {
+fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8, logs: &LinuxLogs) -> (u64, [u8; BLOCK_SIZE]) {
     let bps = ms.sb.blocks_per_seg;
     // CP area: two packs of (seg_cnt_ckpt/2 * blocks_per_seg) blocks each.
     // `pack` is the one not holding the durable checkpoint (lane f2fsync:
@@ -3330,13 +3343,9 @@ fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8, avoid: &[u32]) ->
     let mut buf = [0u8; BLOCK_SIZE];
     w64(&mut buf, CP_VER,             ms.cp.ver);
     w32(&mut buf, CP_FREE_SEG_CNT,    ms.cp.free_seg_cnt);
-    // Before the heads are written: it may move the allocator's own heads.
-    linux_cp_fields(ms, &mut buf, avoid);
-    w32(&mut buf, CP_CUR_NODE_SEGNO,  ms.cp.cur_node_segno);
-    w16(&mut buf, CP_CUR_NODE_BLKOFF, ms.cp.cur_node_blkoff);
-    w32(&mut buf, CP_CUR_DATA_SEGNO,  ms.cp.cur_data_segno);
-    w16(&mut buf, CP_CUR_DATA_BLKOFF, ms.cp.cur_data_blkoff);
     w32(&mut buf, CP_NEXT_FREE_NID,   ms.cp.next_free_nid);
+    // Linux's log heads in the standard fields, this kernel's in CP_OWN_HEADS.
+    linux_cp_fields(ms, &mut buf, logs);
     ms.cp.flags = if umount { CP_UMOUNT_FLAG } else { 0 };
     w32(&mut buf, CP_CKPT_FLAGS,      ms.cp.flags);
     (cp_blkno as u64, buf)
@@ -3351,22 +3360,20 @@ fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8, avoid: &[u32]) ->
 /// Checkpoints that moved a log head to a Linux-valid position (debug count).
 static CP_HEAD_MOVES: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 
-fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE], avoid: &[u32]) {
+/// Linux's six log heads for the next commit block (`linux_cp_fields`).
+pub(crate) type LinuxLogs = [(u32, u16); 6];
+
+/// Pick them. It reads SIT blocks, so the checkpoint writers call it before
+/// they change any state (next to `pick_ext`): a cache miss there aborts a
+/// no-I/O run cleanly. Read inside `build_cp_block`, after the snapshot was
+/// taken, a miss doomed a run that had already moved the fresh/protected
+/// bookkeeping, and the redo lost track of blocks (f2fscrashtest --seed
+/// 1792903575: blocks with two owners after recovery; lane f2fscrc3).
+pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
     let bps = ms.sb.blocks_per_seg;
     let main = ms.sb.seg_cnt_main;
-    w64(buf, CP_USER_BLOCK_CNT,  main.saturating_sub(1) as u64 * bps as u64);
-    w64(buf, CP_VALID_BLOCK_CNT, ms.valid_blocks);
-    // Linux wants ckpt+sit+nat+ssa+reserved >= F2FS_MIN_META_SEGMENTS (8).
-    let meta = ms.sb.seg_cnt_ckpt + ms.sb.seg_cnt_sit + ms.sb.seg_cnt_nat + ms.sb.seg_cnt_ssa;
-    w32(buf, CP_RSVD_SEG_CNT,    8u32.saturating_sub(meta).max(1));
-    w32(buf, CP_OVP_SEG_CNT,     1);
-    w32(buf, CP_PACK_TOTAL,      1);
-    w32(buf, CP_START_SUM,       1);
-    w32(buf, CP_VALID_NODE_CNT,  ms.valid_nodes as u32);
-    w32(buf, CP_SIT_BM_SIZE,     (ms.sb.seg_cnt_sit / 2) * bps / 8);
-    w32(buf, CP_NAT_BM_SIZE,     (ms.sb.seg_cnt_nat / 2) * bps / 8);
     // Linux log types: 0..2 = hot/warm/cold data, 3..5 = hot/warm/cold node.
-    let mut logs = [(u32::MAX, 0u16); 6];
+    let mut logs: LinuxLogs = [(u32::MAX, 0u16); 6];
     for (t, seg, off) in [(0usize, ms.cp.cur_data_segno, ms.cp.cur_data_blkoff),
                           (3usize, ms.cp.cur_node_segno, ms.cp.cur_node_blkoff)] {
         if seg < main && (off as u32) < bps {
@@ -3397,17 +3404,37 @@ fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE], avoid: &[u32
         logs[t] = (seg, 0);
         after = seg;
     }
-    // The allocator follows (lane f2fscrc2): the heads this checkpoint
-    // records are exactly where this kernel allocates next. A recorded head
-    // that differed from the in-memory one broke crash recovery
-    // (f2fscrashtest: a rewritten block came back with a gen never written
-    // there). Skipping ahead to a block free in both bit orders, or to a free
-    // segment, only leaves free blocks unused.
-    let moved = (logs[0] != (ms.cp.cur_data_segno, ms.cp.cur_data_blkoff),
-                 logs[3] != (ms.cp.cur_node_segno, ms.cp.cur_node_blkoff));
-    if moved.0 && logs[0].0 < main { ms.cp.cur_data_segno = logs[0].0; ms.cp.cur_data_blkoff = logs[0].1; }
-    if moved.1 && logs[3].0 < main { ms.cp.cur_node_segno = logs[3].0; ms.cp.cur_node_blkoff = logs[3].1; }
-    if moved.0 || moved.1 { CP_HEAD_MOVES.fetch_add(1, atomic::Ordering::Relaxed); }
+    logs
+}
+
+fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE], logs: &LinuxLogs) {
+    let bps = ms.sb.blocks_per_seg;
+    let main = ms.sb.seg_cnt_main;
+    w64(buf, CP_USER_BLOCK_CNT,  main.saturating_sub(1) as u64 * bps as u64);
+    w64(buf, CP_VALID_BLOCK_CNT, ms.valid_blocks);
+    // Linux wants ckpt+sit+nat+ssa+reserved >= F2FS_MIN_META_SEGMENTS (8).
+    let meta = ms.sb.seg_cnt_ckpt + ms.sb.seg_cnt_sit + ms.sb.seg_cnt_nat + ms.sb.seg_cnt_ssa;
+    w32(buf, CP_RSVD_SEG_CNT,    8u32.saturating_sub(meta).max(1));
+    w32(buf, CP_OVP_SEG_CNT,     1);
+    w32(buf, CP_PACK_TOTAL,      1);
+    w32(buf, CP_START_SUM,       1);
+    w32(buf, CP_VALID_NODE_CNT,  ms.valid_nodes as u32);
+    w32(buf, CP_SIT_BM_SIZE,     (ms.sb.seg_cnt_sit / 2) * bps / 8);
+    w32(buf, CP_NAT_BM_SIZE,     (ms.sb.seg_cnt_nat / 2) * bps / 8);
+    // This kernel's own heads go to CP_OWN_HEADS, verbatim: a remount
+    // resumes exactly where the allocator stopped. Making the allocator
+    // follow a moved head (or resume at the head Linux is shown) broke crash
+    // recovery: a head at block 0 of a fresh segment, a state this
+    // allocator never records itself, came back as a block with two owners
+    // (f2fscrashtest --seed 1792903575, lanes f2fscrc2/f2fscrc3).
+    if logs[0] != (ms.cp.cur_data_segno, ms.cp.cur_data_blkoff)
+        || logs[3] != (ms.cp.cur_node_segno, ms.cp.cur_node_blkoff) {
+        CP_HEAD_MOVES.fetch_add(1, atomic::Ordering::Relaxed);
+    }
+    w32(buf, CP_OWN_HEADS,      ms.cp.cur_data_segno);
+    w32(buf, CP_OWN_HEADS + 4,  ms.cp.cur_node_segno);
+    w16(buf, CP_OWN_HEADS + 8,  ms.cp.cur_data_blkoff);
+    w16(buf, CP_OWN_HEADS + 10, ms.cp.cur_node_blkoff);
     for (t, &(seg, off)) in logs.iter().enumerate() {
         let (so, bo) = if t < 3 { (CP_CUR_DATA_SEGNO + 4 * t, CP_CUR_DATA_BLKOFF + 2 * t) }
                        else     { (CP_CUR_NODE_SEGNO + 4 * (t - 3), CP_CUR_NODE_BLKOFF + 2 * (t - 3)) };
