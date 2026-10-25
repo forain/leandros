@@ -19,6 +19,8 @@ mod cmd_tests;
 pub mod iwl_assoc;
 #[cfg(test)]
 mod assoc_tests;
+#[cfg(test)]
+mod teardown_tests;
 
 #[path = "../../src/iwl_rs.rs"]
 pub mod iwl_rs;
