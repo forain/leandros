@@ -361,7 +361,7 @@ cp ../o.img ../snap.img; exec 3<&-; cd ..; sudo umount m; mv snap.img o.img; ech
             return
         box(f"mkdir -p {rd}"); push(img, f"{rd}/o.img")
         rc, out = box(f"""cd {rd}; timeout 180 fsck.f2fs --dry-run o.img </dev/null >f.txt 2>&1; echo FSCK_RC=$?
-grep -ciE 'is unreachable|\\[Fail\\]|ASSERT' f.txt; grep -iE 'is unreachable|fail|ASSERT' f.txt | head -n 8""")
+grep -ciE 'is unreachable|\\[Fail\\]|ASSERT' f.txt; grep -iE "unreachable|fail|ASSERT|mismatch|invalid|wrong|SIT|node count|valid" f.txt | head -n 30""")
         ok = "FSCK_RC=0" in out and "\n0\n" in out
         if os.environ.get("F2FSINTEROP_VERBOSE"):
             print(out[-1200:], file=sys.stderr)
@@ -425,7 +425,7 @@ cp ../f.img ../snap.img; cd ..; sudo umount m; mv snap.img f.img; echo SNAP_OK""
             return
         box(f"mkdir -p {rd}"); push(img, f"{rd}/f.img")
         rc, out = box(f"""cd {rd}; timeout 180 fsck.f2fs --dry-run f.img </dev/null >f.txt 2>&1; echo FSCK_RC=$?
-grep -ciE 'is unreachable|\\[Fail\\]|ASSERT' f.txt; grep -iE 'is unreachable|fail|ASSERT' f.txt | head -n 8""")
+grep -ciE 'is unreachable|\\[Fail\\]|ASSERT' f.txt; grep -iE "unreachable|fail|ASSERT|mismatch|invalid|wrong|SIT|node count|valid" f.txt | head -n 30""")
         ok = "FSCK_RC=0" in out and "\n0\n" in out
         if os.environ.get("F2FSINTEROP_VERBOSE"):
             print(out[-1200:], file=sys.stderr)

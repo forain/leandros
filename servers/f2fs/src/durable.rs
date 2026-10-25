@@ -1299,7 +1299,7 @@ pub(crate) fn recover_linux(ms: &mut MountState, chain: &[LxChain]) -> u32 {
         let (old_n, old_d) = tree(ms, ino);
         let mut dentry = None;
         for e in chain.iter().filter(|e| e.ino == ino) {
-            nat_update(ms, e.nid, e.addr);
+            crate::nat_update_owned(ms, e.nid, Some(e.ino), e.addr);
             if e.nid >= ms.cp.next_free_nid { ms.cp.next_free_nid = e.nid + 1; }
             if e.dent {
                 let b = ms.cache.read(ms.dev, e.addr as u64);
