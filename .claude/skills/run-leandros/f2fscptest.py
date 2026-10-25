@@ -65,7 +65,10 @@ def patch(img, blkno, buf):
 
 
 def recrc(buf):
-    struct.pack_into("<I", buf, 4092, zlib.crc32(bytes(buf[:4092])) & 0xFFFFFFFF)
+    if struct.unpack_from("<I", buf, 164)[0] == 4092:
+        struct.pack_into("<I", buf, 4092, fsckmod.linux_crc(buf[:4092]))
+    else:
+        struct.pack_into("<I", buf, 4092, zlib.crc32(bytes(buf[:4092])) & 0xFFFFFFFF)
 
 
 def fsck_out(img):
