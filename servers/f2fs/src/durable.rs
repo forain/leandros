@@ -940,8 +940,9 @@ pub(crate) fn replay_journal(ms: &mut MountState, homes: &[u32], imgs: &[u8]) ->
 // ── Roll-forward fsync ───────────────────────────────────────────────────────
 
 /// The block tree of `ino` as the cache has it: (nid, address) of every node
-/// (inode, xattr, dnodes, indirect nodes) and every data block address.
-fn tree(ms: &mut MountState, ino: u32) -> (Vec<(u32, u32)>, Vec<u32>) {
+/// (inode, xattr, dnodes, indirect nodes) and every data block as (address,
+/// owner nid, slot in the owner: the SSA entry's ofs_in_node).
+fn tree(ms: &mut MountState, ino: u32) -> (Vec<(u32, u32)>, Vec<(u32, u32, u16)>) {
     let mut nodes = Vec::new();
     let mut data = Vec::new();
     let ia = nat_lookup(ms, ino);
@@ -950,19 +951,19 @@ fn tree(ms: &mut MountState, ino: u32) -> (Vec<(u32, u32)>, Vec<u32>) {
     let ib = read_block_copy(ms, ia);
     for i in 0..inode_max_direct(ms.sb.fmt, &ib) {
         let a = inode_get_blkaddr(ms.sb.fmt, &ib, i);
-        if a != 0 { data.push(a); }
+        if a != 0 { data.push((a, ino, i as u16)); }
     }
     let x = r32(&ib, ms.sb.fmt.xattr());
     if x != 0 { let a = nat_lookup(ms, x); if a != 0 { nodes.push((x, a)); } }
-    fn dnode(ms: &mut MountState, nid: u32, nodes: &mut Vec<(u32, u32)>, data: &mut Vec<u32>) {
+    fn dnode(ms: &mut MountState, nid: u32, nodes: &mut Vec<(u32, u32)>, data: &mut Vec<(u32, u32, u16)>) {
         if nid == 0 { return; }
         let a = nat_lookup(ms, nid);
         if a == 0 { return; }
         nodes.push((nid, a));
         let b = read_block_copy(ms, a);
-        for i in 0..ms.sb.fmt.per_block() { let d = dnode_get_blkaddr(ms.sb.fmt, &b, i); if d != 0 { data.push(d); } }
+        for i in 0..ms.sb.fmt.per_block() { let d = dnode_get_blkaddr(ms.sb.fmt, &b, i); if d != 0 { data.push((d, nid, i as u16)); } }
     }
-    fn indirect(ms: &mut MountState, nid: u32, nodes: &mut Vec<(u32, u32)>, data: &mut Vec<u32>) {
+    fn indirect(ms: &mut MountState, nid: u32, nodes: &mut Vec<(u32, u32)>, data: &mut Vec<(u32, u32, u16)>) {
         if nid == 0 { return; }
         let a = nat_lookup(ms, nid);
         if a == 0 { return; }
@@ -1152,6 +1153,18 @@ fn read_records(dev: usize, base: u64, start: u32, end: u32, ver: u64) -> (Vec<R
     (out, pos, seq)
 }
 
+/// lx: make the segment of main-area block `a` a node (hot node) or data
+/// (hot data) segment unless it already is one of that class.
+fn lx_type_class(ms: &mut MountState, a: u32, node: bool) {
+    if a < ms.sb.main_blkaddr { return; }
+    let seg = (a - ms.sb.main_blkaddr) / ms.sb.blocks_per_seg;
+    if seg >= ms.sb.seg_cnt_main { return; }
+    let (blkno, off) = crate::sit_entry_loc(ms, seg);
+    let t = r16(ms.cache.read(ms.dev, blkno), off) >> 10;
+    if (3..=5).contains(&t) != node { crate::sit_set_type(ms, seg, if node { 3 } else { 0 }); }
+    else { crate::ssa_set_kind(ms, seg, node); }
+}
+
 fn sit_set(ms: &mut MountState, a: u32, used: bool) {
     if a < ms.sb.main_blkaddr { return; }
     if let Some((seg, b)) = blkaddr_to_seg(ms, a) {
@@ -1202,10 +1215,26 @@ pub(crate) fn recover(ms: &mut MountState, rf_start: u32, tail: u32) -> u32 {
             if r.dentry { dentry = Some(r.pino); }
         }
         let (new_n, new_d) = tree(ms, ino);
-        let old_a: BTreeSet<u32> = old_n.iter().map(|x| x.1).chain(old_d.iter().copied()).collect();
-        let new_a: BTreeSet<u32> = new_n.iter().map(|x| x.1).chain(new_d.iter().copied()).collect();
+        let old_a: BTreeSet<u32> = old_n.iter().map(|x| x.1).chain(old_d.iter().map(|x| x.0)).collect();
+        let new_a: BTreeSet<u32> = new_n.iter().map(|x| x.1).chain(new_d.iter().map(|x| x.0)).collect();
         frees.extend(old_a.difference(&new_a).copied());
         uses.extend(new_a.difference(&old_a).copied());
+        // lx: the summaries and segment types of the replayed blocks. They
+        // were set in the cache when the blocks were allocated and lost with
+        // it; fsck.f2fs checks every valid block's SSA entry (owner nid,
+        // ofs_in_node, version) and each segment's SIT type class.
+        if ms.sb.fmt.lx {
+            for &(nid, a) in &new_n {
+                if old_a.contains(&a) { continue; }
+                lx_type_class(ms, a, true);
+                crate::ssa_set(ms, a, nid, 0, None);
+            }
+            for &(a, nid, ofs) in &new_d {
+                if old_a.contains(&a) { continue; }
+                lx_type_class(ms, a, false);
+                crate::ssa_set(ms, a, nid, ofs, None);
+            }
+        }
         let new_ids: BTreeSet<u32> = new_n.iter().map(|x| x.0).collect();
         for &(nid, _) in &old_n { if !new_ids.contains(&nid) { nat_clear(ms, nid); } }
         if let Some(p) = dentry { dentries.push((ino, p)); }
