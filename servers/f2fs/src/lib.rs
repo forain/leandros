@@ -3654,7 +3654,10 @@ fn linux_chain(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], flags: u32) -> Op
 }
 
 fn ofs_bad(e: &durable::LxChain) -> bool {
-    e.ofs > 2 || e.nid == 0 || (e.ofs == 0) != (e.nid == e.ino)
+    let dn = |o: u32| o != NODE_OFS_IND1 && o != NODE_OFS_IND2 && o != NODE_OFS_DIND
+        && !(o > NODE_OFS_DIND && (o - NODE_OFS_DIND - 1) % (LX_N + 1) == 0);
+    e.nid == 0 || (e.ofs == 0) != (e.nid == e.ino)
+        || (e.ofs != 0 && e.ofs != NODE_OFS_XATTR && !dn(e.ofs))
 }
 
 /// Bring a Linux-written checkpoint into the form this kernel reads, on the

@@ -471,24 +471,41 @@ def cp_flags(path):
         return struct.unpack_from("<I", best[1], 132)[0]
 
 
+FSYNC_SCENARIOS = [
+    # (name, shell ops run in the mount root after a checkpoint, files in the MANIFEST)
+    ("base", "dd if=/dev/urandom of=keep/newbig bs=1k count=5000 conv=fsync 2>/dev/null\n"
+             "echo small-inline > keep/newsmall; fs keep/newsmall\n"
+             "dd if=/dev/urandom of=keep/big bs=4k count=10 seek=5 conv=notrunc,fsync 2>/dev/null", "k big newbig newsmall"),
+    ("indirect", "dd if=/dev/urandom of=keep/huge bs=1M count=40 conv=fsync 2>/dev/null", "k big huge"),
+    ("xattr", 'V=$(printf "x%.0s" $(seq 1 700)); setfattr -n user.big -v "$V" keep/k; fs keep/k\n'
+              'getfattr -n user.big --only-values keep/k | md5sum > ../xa.md5', "k big"),
+    ("rename", "echo moved > keep/r0; sync; sleep 1; sync; mv keep/r0 keep/r1; fs keep/r1", "k big r1"),
+    ("newdir", "mkdir keep/nd; echo indir > keep/nd/f; fs keep/nd/f", "k big nd/f"),
+]
+
+
 def direction_fsync(tmp):
+    for name, ops, files in FSYNC_SCENARIOS:
+        fsync_scenario(tmp, name, ops, files)
+
+
+def fsync_scenario(tmp, name, ops, files):
     """Linux roll-forward (recover_fsync_data): after a checkpoint, files are created
     and fsynced on the box (new files with a DENT mark, an in-place overwrite
     of a checkpointed file) and the backing image is copied while still mounted
     (no sysrq, no umount).  LeandrOS must mount it rw, roll the node chain
     forward (data present, md5), and leave a volume that fsck.f2fs accepts and
     Linux mounts."""
-    v = "fsync"
+    v = f"fsync-{name}"
     rd = f"/tmp/f2fsinterop-{os.getpid()}"
-    img = os.path.join(tmp, "fsync.img")
+    img = os.path.join(tmp, f"fsync-{name}.img")
     script = f"""set -e; D={rd}; mkdir -p $D/m; cd $D; rm -f f.img
 truncate -s {SIZE} f.img; mkfs.f2fs -q -f -l fsync f.img
 sudo mount -o loop f.img m; cd m; sudo chown $(id -u) .
 mkdir keep; echo keepme > keep/k; head -c 600000 /dev/urandom > keep/big; sync; sleep 1; sync
-dd if=/dev/urandom of=keep/newbig bs=1k count=5000 conv=fsync 2>/dev/null
-echo small-inline > keep/newsmall; python3 -c "import os; f=os.open('keep/newsmall', os.O_RDONLY); os.fsync(f)"
-dd if=/dev/urandom of=keep/big bs=4k count=10 seek=5 conv=notrunc,fsync 2>/dev/null
-( cd keep && md5sum k big newbig newsmall | dd of=../MANIFEST conv=fsync 2>/dev/null )
+fs() {{ python3 -c "import os,sys; f=os.open(sys.argv[1], os.O_RDONLY); os.fsync(f)" "$1"; }}
+{ops}
+( cd keep && md5sum {files} | dd of=../MANIFEST conv=fsync 2>/dev/null )
 cp ../f.img ../snap.img; cd ..; sudo umount m; mv snap.img f.img; echo SNAP_OK"""
     rc, out = box(script)
     if not step(v, "D.linux-fsync", rc == 0 and "SNAP_OK" in out, "box: files created+fsynced after a checkpoint, image copied mounted" if rc == 0 else out.strip()[-120:]):
@@ -500,7 +517,7 @@ cp ../f.img ../snap.img; cd ..; sudo umount m; mv snap.img f.img; echo SNAP_OK""
         if not step(v, "D.unclean-cp", not fl & 1, "newest checkpoint has no CP_UMOUNT_FLAG" if not fl & 1 else "clean checkpoint"):
             return
         outs = guest([img], [MNT.format(l="fsync"), "cd /mnt/fsync/keep && md5sum -c ../MANIFEST 2>&1 ; echo LS=$(ls /mnt/fsync); echo keepme2 > k2; ls /mnt/fsync | tr '\\n' ' '; sync; cd /; umount /mnt/fsync; echo UMOUNT_RC=$?"], "D1")
-        ok = outs is not None and "MNT_RW" in outs[0] and "UMOUNT_RC=0" in outs[1] and "FAILED" not in outs[1] and outs[1].count(": OK") >= 4
+        ok = outs is not None and "MNT_RW" in outs[0] and "UMOUNT_RC=0" in outs[1] and "FAILED" not in outs[1] and outs[1].count(": OK") >= len(files.split())
         if not step(v, "D.leandros-rw", ok, "mounted rw, fsynced files present" if ok else (outs[0] + outs[1]).strip()[-120:] if outs else "no guest"):
             return
         box(f"mkdir -p {rd}"); push(img, f"{rd}/f.img")
@@ -510,9 +527,9 @@ grep -ciE 'is unreachable|\\[Fail\\]|ASSERT' f.txt; grep -iE "unreachable|fail|A
         if os.environ.get("F2FSINTEROP_VERBOSE"):
             print(out[-1200:], file=sys.stderr)
         step(v, "D.fsck", ok, "fsck.f2fs rc 0, no unreachable NIDs" if ok else out.strip()[-140:].replace("\n", " "))
-        rc, out = box(f"""cd {rd}; mkdir -p m; if sudo mount -o loop f.img m; then (cd m/keep && md5sum -c ../MANIFEST 2>&1 | tail -n 2; cat k2; echo LXREAD_RC=$?); ls m | tr '\\n' ' '; sync; sudo umount m && echo LX_UMOUNT_OK; else echo LX_MOUNT_FAIL; fi
+        rc, out = box(f"""cd {rd}; mkdir -p m; if sudo mount -o loop f.img m; then (cd m/keep && md5sum -c ../MANIFEST 2>&1 | tail -n 2; cat k2; echo LXREAD_RC=$?; getfattr -n user.big --only-values k | md5sum | cmp - ../../xa.md5 && echo LX_XATTR_OK; ls nd); ls m | tr '\\n' ' '; sync; sudo umount m && echo LX_UMOUNT_OK; else echo LX_MOUNT_FAIL; fi
 timeout 180 fsck.f2fs --dry-run f.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?""")
-        ok = "LX_UMOUNT_OK" in out and "FAILED" not in out and "keepme2" in out and "FSCK2_RC=0" in out
+        ok = "LX_UMOUNT_OK" in out and "FAILED" not in out and "keepme2" in out and "FSCK2_RC=0" in out and ("LX_XATTR_OK" in out or "xattr" not in name)
         step(v, "D.linux-mount", ok, "Linux mounts, reads, fsck rc 0" if ok else out.strip()[-140:].replace("\n", " "))
     finally:
         box(f"rm -rf {rd}")
