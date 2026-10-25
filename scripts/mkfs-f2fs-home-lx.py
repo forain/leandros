@@ -36,7 +36,7 @@ the volume (one SIT block covers 55 segments, i.e. 110 MiB), and SIT entries
 are indexed by main-area segment number, which is how the server reads them.
 
 Inodes, nodes and directories use Linux's on-disk layout ("lx", the
-`LeandrOS lxnode1` marker in the superblock's version and init_version;
+`LeandrOS lxnode2` marker in the superblock's version and init_version;
 scripts/f2fslx.py). A home volume made before that format keeps the legacy
 layout: `ensure` never rewrites an existing volume.
 
@@ -105,7 +105,8 @@ def build(size):
     sit_blocks = -(-total_segs // SIT_PER_BLK)
     # Two SIT copies (Linux mirrors SIT and NAT; lane f2fslayout).
     sit_segs = 2 * -(-sit_blocks // BPS)
-    ckpt_segs, nat_segs, ssa_segs = 2, 2, 1
+    ckpt_segs, nat_segs = 2, 2
+    ssa_segs = f2fslx.ssa_segs_for(total_segs, 1 + ckpt_segs + sit_segs + nat_segs)
     seg0 = BPS
     cp_blk = seg0
     sit_blk = cp_blk + ckpt_segs * BPS
@@ -167,7 +168,9 @@ def build(size):
         children[os.path.dirname(p)].append(p)
     n = len(dirs)
     inode_at = {p: main_blk + i for i, (p, *_r) in enumerate(dirs)}
-    data_at = {p: main_blk + n + i for i, (p, *_r) in enumerate(dirs)}
+    # Node blocks in main segment 0 (HOT_NODE), dentry blocks in segment 1
+    # (HOT_DATA): fsck.f2fs wants a segment to hold one class only.
+    data_at = {p: main_blk + BPS + i for i, (p, *_r) in enumerate(dirs)}
 
     for p, mode, uid, gid in dirs:
         ino = ino_of[p]
@@ -206,16 +209,38 @@ def build(size):
         w32(nb, o + 1, ino)
         w32(nb, o + 5, inode_at[p])
 
-    # SIT: main segment 0 holds the 2n seeded blocks; everything else is free.
+    # NAT entries for the node and meta inodes (Linux keeps them at blkaddr 1).
+    per = BLOCK // NAT_ENTRY_SIZE
+    for dino in (1, 2):
+        nb = blk(nat_blk + dino // per)
+        o = (dino % per) * NAT_ENTRY_SIZE
+        nb[o] = 0
+        w32(nb, o + 1, dino)
+        w32(nb, o + 5, 1)
+
+    # Six typed current segments (fsck.f2fs wants one per log): HOT_NODE on
+    # segment 0 and HOT_DATA on segment 1 at offset n, the others empty on
+    # segments 2..5 (WARM_DATA, COLD_DATA, WARM_NODE, COLD_NODE).
+    log_seg = {0: 1, 1: 2, 2: 3, 3: 0, 4: 4, 5: 5}      # log type -> segment
+    log_off = {0: n, 3: n}
+    seg_type = {seg: t for t, seg in log_seg.items()}
     used = 2 * n
     sb_ = blk(sit_blk)
-    w16(sb_, 0, used)
-    for k in range(used):
-        sb_[2 + k // 8] |= 0x80 >> (k % 8)   # lx: Linux f2fs_test_bit is MSB-first
+    for seg, t in seg_type.items():
+        used_here = n if seg in (0, 1) else 0
+        sb_[seg * SIT_ENTRY_SIZE:(seg + 1) * SIT_ENTRY_SIZE] = \
+            f2fslx.sit_entry(used_here, t, range(used_here))
 
-    # Checkpoint packs. The runtime logs start on fresh segments 1 (node) and
-    # 2 (data), past the seeded blocks, exactly as mkfs-f2fs-populated.py does.
+    # SSA: owner of every seeded block, footer = segment class.
+    owners = [(ino_of[p], 1, 0) for p, *_r in dirs]
+    for seg, t in seg_type.items():
+        blocks[ssa_blk + seg] = f2fslx.summary_block(owners if seg in (0, 1) else [], t >= 3)
+
+    # Checkpoint packs: Linux layout, whole pack (512 blocks), six normal
+    # summaries at pack-7..pack-2 and the commit block's copy as the last block.
     rsvd, ovp = f2fslx.checkpoint_reserve(ckpt_segs + sit_segs + nat_segs + ssa_segs)
+    pack = (ckpt_segs // 2) * BPS
+    free_segs = main_segs - 6
 
     def checkpoint(at, ver):
         c = blk(at)
@@ -224,21 +249,38 @@ def build(size):
         w64(c, 16, used)
         w32(c, 24, rsvd)
         w32(c, 28, ovp)
-        w32(c, 32, main_segs - 1)
-        for i in range(MAX_ACTIVE_LOGS):
-            w32(c, 36 + i * 4, 1 if i == 0 else 0xFFFFFFFF)
-            w32(c, 84 + i * 4, 2 if i == 0 else 0xFFFFFFFF)
+        w32(c, 32, free_segs)
+        for t in range(6):
+            seg = log_seg[t]
+            if t < 3:
+                w32(c, 84 + t * 4, seg); w16(c, 116 + t * 2, log_off.get(t, 0))
+            else:
+                w32(c, 36 + (t - 3) * 4, seg); w16(c, 68 + (t - 3) * 2, log_off.get(t, 0))
+        for i in range(6, MAX_ACTIVE_LOGS):
+            w32(c, 36 + i * 4, 0xFFFFFFFF)
+            w32(c, 84 + i * 4, 0xFFFFFFFF)
         w32(c, 132, CP_UMOUNT_FLAG)
-        w32(c, 136, 5)
+        w32(c, 136, pack)
+        w32(c, 140, pack - 7)              # cp_pack_start_sum
+        w32(c, 144, n)                     # valid_node_count
+        w32(c, 148, n)                     # valid_inode_count
+        w32(c, 152, 3 + n)                 # next_free_nid
         w32(c, 156, (sit_segs // 2) * BPS // 8)
         w32(c, 160, (nat_segs // 2) * BPS // 8)
+        for t in range(16):
+            c[176 + t] = 1                 # alloc_type: SSR, as the kernel writes
         w64(c, 2048, ver)                  # servers/f2fs CP_OWN_VER
-        w32(c, 140, 1)
-        w32(c, 144, n)
-        w32(c, 148, n)
-        w32(c, 152, 3 + n)
+        w32(c, 3348, log_seg[0])           # CP_OWN_HEADS: data seg, node seg,
+        w32(c, 3352, log_seg[3])           # data blkoff, node blkoff
+        w16(c, 3356, n)
+        w16(c, 3358, n)
+        f2fslx.seal_cp(c)
+        for t in range(6):
+            ents = owners if t in (0, 3) else []
+            blocks[at + pack - 7 + t] = f2fslx.summary_block(ents, t >= 3)
+        blocks[at + pack - 1] = bytearray(c)
     checkpoint(cp_blk, 1)
-    checkpoint(cp_blk + BPS, 0)
+    checkpoint(cp_blk + pack, 0)
     return blocks, total_blocks
 
 

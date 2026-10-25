@@ -130,7 +130,7 @@ const SB_ROOT_INO:          usize = 96;
 /// `LX_TAG` uses Linux's exact node/inode/dentry layout (`Fmt::lx`); every
 /// other volume (all older images: empty string) keeps the legacy layout.
 const SB_INIT_VERSION:      usize = 1924;
-const LX_TAG: &[u8] = b"LeandrOS lxnode1";
+const LX_TAG: &[u8] = b"LeandrOS lxnode";
 
 // Checkpoint offsets (within a checkpoint block)
 const CP_VER:            usize = 0;
