@@ -560,13 +560,25 @@ SDL_Window* SDL_CreateWindow(const char* title, int x, int y, int w, int h, uint
                 }
                 return (SDL_Window*)0x1234;
             }
+            // A KMS display exists (GET_MODE answered) but DOOM got no
+            // framebuffer on it. /dev/fb0 is no fallback here: a KMS driver
+            // (i915, nouveau, virtio-gpu) scans out its own CRTC framebuffer,
+            // not fb0, so DOOM would run on a black screen (L12 #56). Fail
+            // loudly instead.
+            {
+                char msg[160];
+                int n = snprintf(msg, sizeof msg,
+                    "[SDL] DRM CREATE_FB failed (errno %d); not falling back to /dev/fb0, "
+                    "which a KMS display does not scan out\n", errno);
+                write(2, msg, n > 0 ? (size_t)n : 0);
+                exit(1);
+            }
         }
     }
     
-    // Fallback: the framebuffer device. card0 itself is no fallback — it is
-    // still open here when GET_MODE or CREATE_FB failed (CREATE_FB refuses a
-    // buffer above 4 GiB, which a 4 GiB guest hands out), and the legacy path
-    // below would then write() frames into the DRM node instead of fb0.
+    // Fallback: the framebuffer device, only when there is no KMS display
+    // (no card0, or GET_MODE refused). card0 itself is no fallback: the
+    // legacy path below would write() frames into the DRM node instead of fb0.
     if (s_drm_fd >= 0) { close(s_drm_fd); s_drm_fd = -1; }
     s_drm_fd = open("/dev/fb0", O_RDWR, 0);
     if (s_drm_fd >= 0) {

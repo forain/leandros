@@ -53,6 +53,15 @@ def opt(name, default, conv=str):
 GPU = opt("--gpu", "virgl")
 SCALE = opt("--scale", None, float) or driver.wait_scale(ARCH)
 DO_VT = "--no-vt" not in A
+# What is typed on the text VT (lane gamevt: also `mame -rompath / captcomm`).
+VT_CMD = os.environ.get("DOOMSESSION_VT_CMD", "doom")
+# Key pressed once the VT game runs ("" = none). Esc opens DOOM's menu but
+# QUITS MAME, so a MAME run must set DOOMSESSION_VT_KEY="" or e.g. "5".
+VT_KEY = os.environ.get("DOOMSESSION_VT_KEY", "esc")
+# --assert-vt: exit 1 unless the game drew on the text VT, the desktop came
+# back on its VT, and the game came back after the round trip (L12 #56).
+ASSERT_VT = "--assert-vt" in A
+VT_MIN = 0.1
 DOOM_ENV = opt("--doom-env", "")
 OUT = os.path.join(os.environ.get("DOOMSESSION_OUT", "/tmp/doomsession"), f"run-{TAG}")
 os.makedirs(OUT, exist_ok=True)
@@ -240,7 +249,7 @@ def fps_check(text):
 
 def kill_doom():
     sh('for p in /proc/[0-9]*; do c=$(tr "\\0" " " < $p/cmdline 2>/dev/null); '
-       'case "$c" in doom*|/bin/doom*) kill ${p#/proc/};; esac; done; true', 30)
+       'case "$c" in doom*|/bin/doom*|mame*|/bin/mame*) kill ${p#/proc/};; esac; done; true', 30)
 
 
 def main():
@@ -317,13 +326,14 @@ def main():
         SER.pump(5 * SCALE)
         tv = shot("textvt")
         vtstat("textvt")
-        typ("doom >/tmp/doom2.log 2>&1"); key("ret")
+        typ(VT_CMD + " >/tmp/doom2.log 2>&1"); key("ret")
         a1 = wav_mark()
         SER.pump(12 * SCALE)
         tvd = shot("textvt-doom")
         wav_rms("textvt-doom", a1, wav_mark())
         analyse("textvt-doom", tvd, tv)
-        key("esc")
+        if VT_KEY:
+            key(VT_KEY)
         SER.pump(2 * SCALE)
         tvm = shot("textvt-doom-menu")
         analyse("textvt-doom-menu-vs-prev", tvm, tvd)
@@ -332,6 +342,7 @@ def main():
         SER.pump(5 * SCALE)
         back = shot("desktop-back")
         analyse("desktop-back-vs-textvtdoom", back, tvd)
+        analyse("desktop-back-vs-term", back, term)
         vtstat("desktop-back")
         driver.qmp_inject_chord(["ctrl", "alt", f"f{tvt}"])
         SER.pump(5 * SCALE)
@@ -355,6 +366,21 @@ def main():
     log("DONE", OUT, STEPS)
     log(json.dumps(RESULT, indent=1))
     log(json.dumps(AUDIO, indent=1))
+    if ASSERT_VT and DO_VT:
+        def frac(k):
+            return RESULT.get(k, {}).get("changed_frac", -1)
+        checks = [
+            ("game drew on the text VT", frac("textvt-doom") > VT_MIN),
+            ("game back after VT round trip", frac("textvt-doom-again") > VT_MIN),
+            ("desktop VT differs from game", frac("desktop-back-vs-textvtdoom") > VT_MIN),
+            ("desktop restored (close to pre-game desktop)", 0 <= frac("desktop-back-vs-term") < 0.5),
+        ]
+        bad = [n for n, ok in checks if not ok]
+        log("VT ASSERT " + ("PASS" if not bad else "FAIL: " + "; ".join(bad)),
+            {k: frac(k) for k in ("textvt-doom", "textvt-doom-again",
+                                  "desktop-back-vs-textvtdoom", "desktop-back-vs-term")})
+        if bad:
+            FPS_FAIL.extend("VT: " + n for n in bad)
     if FPS_FAIL:
         sys.exit("FAIL: " + "; ".join(FPS_FAIL))
 

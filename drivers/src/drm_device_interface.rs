@@ -5836,7 +5836,16 @@ impl DrmDeviceInterface {
             0x1003 => self.handle_get_mode_safe(arg),
             0x1002 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_create_framebuffer(&mut g, arg) },
             0x4600 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_fbioget_vscreeninfo(&mut g, arg) },
-            0x1004 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_flip_page(&mut g, arg) },
+            0x1004 => {
+                let fb = unsafe { (arg as *const u32).read_volatile() };
+                let r = { let d = get_drm_device(); let mut g = d.lock(); self.handle_flip_page(&mut g, arg) };
+                if r.is_ok() {
+                    vtstats::FLIP_PRESENTS.fetch_add(1, Ordering::Relaxed);
+                    vtstats::FLIP_LAST_FB.store(fb, Ordering::Relaxed);
+                    vtstats::FLIP_LAST_OPEN.store(open_id, Ordering::Relaxed);
+                }
+                r
+            },
             0x1005 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_set_plane(&mut g, arg) },
             0x1006 => self.handle_get_capabilities(arg),
             0x1008 => Self::handle_gpu_irq_stats(arg),
@@ -6118,10 +6127,12 @@ impl DrmDeviceInterface {
         // exactly as before.
         let buffer = DrmDumbBuffer::create(width, height, 32, 0)?;
         let mmap_offset = buffer.mmap_offset;
-        // This legacy ABI returns the physical address in a u32 slot. Refuse a
-        // frame that does not fit rather than hand the caller the low half —
-        // on a guest with RAM above 4 GiB that is somebody else's memory.
-        if mmap_offset > u32::MAX as usize { return Err(DriverError::Io); }
+        // No 4 GiB limit here: slot [5] is an opaque FAKE32 token
+        // (`drm_offset::offset_for32`), not the physical address. The old
+        // `mmap_offset > u32::MAX` refusal outlived that change and failed every
+        // frame the allocator placed above 4 GiB: MAME's display-sized FB on
+        // QEMU, and DOOM's too on the 16 GiB laptop, which then fell back to
+        // /dev/fb0 — not what i915 scans out — so a text VT stayed black.
 
         // Create framebuffer object
         let mut fb = DrmFramebuffer::new(
