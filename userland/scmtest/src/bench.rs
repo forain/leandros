@@ -266,7 +266,7 @@ pub unsafe fn run(iters: usize, hogs: usize) -> i32 {
 }
 
 /// `(acquisitions, contended, spin_us)` of the named lock in /proc/lockstat.
-unsafe fn lockstat(name: &[u8]) -> (u64, u64, u64) {
+pub(crate) unsafe fn lockstat(name: &[u8]) -> (u64, u64, u64) {
     let fd = open(b"/proc/lockstat\0".as_ptr(), 0, 0);
     if fd < 0 { return (0, 0, 0); }
     let n = read(fd, STAT.as_mut_ptr(), 8192);

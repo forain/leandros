@@ -964,6 +964,44 @@ const ALIAS_FD: i32 = 100;
 const FD_SWEEP_END: i32 = 0x400;
 const O_CLOEXEC_FL: i32 = 0x80000;
 
+/// Guard (lane ipcregress): a long AF_UNIX stream copy runs with UNIX_CONNS
+/// released (`TrackedGuard::unlocked`, lane ipcfast). Its force_unlock did not
+/// give back the held-spin::Mutex count the re-take added, so every long
+/// write/read leaked one: the CPU then looked atomic to `might_sleep` for
+/// good and every later wait on it spun — the desktop login livelocked all
+/// CPUs. The summed count (/proc/lockstat `spin_held`) must not grow with
+/// the number of long copies.
+unsafe fn test_unlocked_copy_no_spin_leak() -> bool {
+    let name = b"unlocked_copy_no_spin_leak\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM | O_CLOEXEC_FL, 0, sv.as_mut_ptr()) != 0 {
+        return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+    static mut BIG: [u8; 4096] = [0x5a; 4096];
+    let big = core::ptr::addr_of_mut!(BIG) as *mut u8;
+    let h0 = bench::lockstat(b"spin_held").0;
+    let mut ok = true;
+    for _ in 0..256 {
+        if raw_send(a, big, 4096, 0) != 4096 { ok = false; break; }
+        let mut got = 0isize;
+        while got < 4096 {
+            let r = raw_recv(b, big.add(got as usize), 4096 - got as usize, 0);
+            if r <= 0 { break; }
+            got += r;
+        }
+        if got != 4096 { ok = false; break; }
+    }
+    let h1 = bench::lockstat(b"spin_held").0;
+    close(a); close(b);
+    // 512 long copies; a leak adds ~1 each. Transient holds stay tiny.
+    if h1 > h0 + 32 {
+        dbg1(b"[spinleak] spin_held grew by %ld over 512 long copies\n\0", (h1 - h0) as i64);
+        ok = false;
+    }
+    report(name, ok)
+}
+
 unsafe fn test_socket_dup2_low_fd() -> bool {
     let name = b"socket_dup2_low_fd\0";
     const FIONREAD: usize = 0x541B;
@@ -1399,6 +1437,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
 
     // ── dup2 of a socket onto a low fd (Firefox's child launch) ──
     if !test_socket_dup2_low_fd() { failures += 1; }
+    if !test_unlocked_copy_no_spin_leak() { failures += 1; }
     if !test_fork_dup2_low_exec() { failures += 1; }
     if !test_socket_alias_epoll_close() { failures += 1; }
     if !test_pass_connected_socket() { failures += 1; }
