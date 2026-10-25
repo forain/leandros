@@ -495,6 +495,11 @@ def linux_check(v):
         bad.append(f"cursegs share a segment: {segnos}")
     if r32(cp, 156) != ((sit // 2) * bps) // 8 or r32(cp, 160) != ((nat // 2) * bps) // 8:
         bad.append("Wrong bitmap size")
+    # Linux 7.2 sanity_check_ckpt: the SIT version bitmap must cover every
+    # SIT block, which a single (unmirrored) SIT segment cannot give.
+    sit_blk_cnt = -(-main // 55)
+    if r32(cp, 156) * 8 < sit_blk_cnt:
+        bad.append(f"Wrong bitmap size: sit: {r32(cp, 156)}, sit_blk_cnt:{sit_blk_cnt}")
     if 192 + r32(cp, 156) + r32(cp, 160) > 3072:
         bad.append("version bitmaps overlap the LPJ1 extension")
     ss = r32(cp, 140)
