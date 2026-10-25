@@ -531,6 +531,39 @@ fn set_link(up: bool) {
 
 /// The AP side of the WPA2 4-way handshake against the real supplicant.
 /// Returns the pairwise key both sides installed.
+/// The supplicant of the current association with the AP's side of its keys,
+/// so the self-test can run a group rekey (EAPOL group message 1).
+struct SimHs { sup: wc::Supplicant, kek: [u8; 16], kck: [u8; 16], rc: u64, tkip: bool }
+static HS: Mutex<Option<SimHs>> = Mutex::new(None);
+
+/// The AP sends a group-key handshake message 1 with a fresh GTK at `key_id`;
+/// the supplicant unwraps it and the install is recorded like a real one.
+fn sim_group_rekey(key_id: u8) -> Result<(), String> {
+    use wc::key_info as ki;
+    let mut g = HS.lock();
+    let h = g.as_mut().ok_or_else(|| String::from("no handshake state"))?;
+    let mut buf = [0u8; 32];
+    sched::random::fill(&mut buf);
+    let gtk = &buf[..if h.tkip { 32 } else { 16 }];
+    let mut kd = Vec::new();
+    kd.extend_from_slice(&[0xdd, 6 + gtk.len() as u8, 0x00, 0x0f, 0xac, 0x01, key_id & 3, 0x00]);
+    kd.extend_from_slice(gtk);
+    if kd.len() % 8 != 0 { kd.push(0xdd); while kd.len() % 8 != 0 { kd.push(0); } }
+    let wrapped = wc::aes_key_wrap(&h.kek, &kd);
+    h.rc += 1;
+    let mut m1 = wc::build_eapol_key(2, 2 | ki::ACK | ki::MIC | ki::SECURE | ki::ENCRYPTED_KEY_DATA, 0, &h.rc.to_be_bytes(), &[0u8; 32], &wrapped);
+    wc::eapol_set_mic(&h.kck, &mut m1);
+    let mut done = false;
+    for e in h.sup.on_eapol(&m1) {
+        match e {
+            wc::HsEvent::InstallGtk { key_id: k, key, .. } if key[..] == gtk[..] => { wm::gk::note_install(k, h.tkip); done = true; }
+            wc::HsEvent::Error(e) => return Err(alloc::format!("supplicant: {}", e)),
+            _ => {}
+        }
+    }
+    if done { Ok(()) } else { Err(String::from("no GTK install event")) }
+}
+
 fn four_way(ap_pmk: &[u8; 32], sta_pmk: &[u8; 32], aa: [u8; 6], spa: [u8; 6], group_tkip: bool, cx: &ConnCtx) -> Result<[u8; 16], Fail> {
     use wc::key_info as ki;
     let mut anonce = [0u8; 32];
@@ -575,6 +608,7 @@ fn four_way(ap_pmk: &[u8; 32], sta_pmk: &[u8; 32], aa: [u8; 6], spa: [u8; 6], gr
                     wc::HsEvent::InstallGtk { key, .. } if key[..] != gtk[..] =>
                         return Err(Fail::new(reason::FW_ERROR, "the station installed a different group key")),
                     wc::HsEvent::Error(e) => return Err(Fail::new(reason::FW_ERROR, alloc::format!("supplicant: {}", e))),
+                    wc::HsEvent::InstallGtk { key_id, .. } => wm::gk::note_install(key_id, group_tkip),
                     _ => {}
                 }
             }
@@ -582,6 +616,7 @@ fn four_way(ap_pmk: &[u8; 32], sta_pmk: &[u8; 32], aa: [u8; 6], spa: [u8; 6], gr
             if !wc::eapol_mic_ok(&ptk.kck, &m4) { return Err(Fail::new(reason::FW_ERROR, "message 4 MIC failure")); }
             let tk = tk.ok_or_else(|| Fail::new(reason::FW_ERROR, "no pairwise key"))?;
             if tk != ptk.tk { return Err(Fail::new(reason::FW_ERROR, "the two sides derived different keys")); }
+            *HS.lock() = Some(SimHs { sup, kek: ptk.kek, kck: ptk.kck, rc: rc + 1, tkip: group_tkip });
             return Ok(tk);
         }
         // Message 2's MIC does not verify: a different PMK. The AP drops it
@@ -1203,6 +1238,19 @@ fn selftest_main(level: u32) {
             && b.rsn_flags & nm_sec::GROUP_TKIP != 0), alloc::format!("{:?}", tkip.map(|b| (b.ext, b.rsn_flags))));
     let r = do_connect(connect_params(10, "SimTkip", akm::AUTO, "tkip-pass-123", 0));
     t.check("connect-tkip-group", r.is_ok() && MGR.state().akm == akm::PSK, alloc::format!("{:?}", r));
+    // The AP rekeys the group key (new key index): the install is counted
+    // and the key index changes; the TKIP receive counters move.
+    let (i0, k0) = (wm::gk::installs(), wm::gk::key_id());
+    let rk = sim_group_rekey(2);
+    let (i1, k1) = (wm::gk::installs(), wm::gk::key_id());
+    t.check("gtk-rekey-counted", rk.is_ok() && i1 == i0 + 1 && k1 == 2 && k0 != 2, alloc::format!("{:?} installs {}->{} key {}->{}", rk, i0, i1, k0, k1));
+    let mut gl = String::new();
+    wm::gk::lines(&mut gl);
+    t.check("gtk-proc-line", gl.contains("cipher tkip key_index 2 installs") && gl.contains("gtk_rx: tkip_fw"), gl.replace('\n', " | "));
+    let r0 = [wm::gk::rx(wm::gk::FW), wm::gk::rx(wm::gk::SW), wm::gk::rx(wm::gk::MIC), wm::gk::rx(wm::gk::REPLAY), wm::gk::rx(wm::gk::UNDECRYPTED)];
+    for k in [wm::gk::FW, wm::gk::SW, wm::gk::MIC, wm::gk::REPLAY, wm::gk::UNDECRYPTED] { wm::gk::note_rx(k); }
+    let r1 = [wm::gk::rx(wm::gk::FW), wm::gk::rx(wm::gk::SW), wm::gk::rx(wm::gk::MIC), wm::gk::rx(wm::gk::REPLAY), wm::gk::rx(wm::gk::UNDECRYPTED)];
+    t.check("gtk-rx-counters-move", (0..5).all(|i| r1[i] == r0[i] + 1), alloc::format!("{:?} -> {:?}", r0, r1));
     let _ = disconnect(true);
     let tko = find_bss("SimTkipOnly");
     t.check("bss-tkip-only-not-joinable", tko.map_or(false, |b| b.ext & bss_ext::JOINABLE == 0), alloc::format!("{:?}", tko.map(|b| (b.ext, b.rsn_flags))));
