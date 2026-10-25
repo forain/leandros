@@ -3139,7 +3139,7 @@ fn nat_update_owned(ms: &mut MountState, nid: u32, owner: Option<u32>, blk_addr:
 
 // ── SIT: find a free segment ──────────────────────────────────────────────────
 
-fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
+fn sit_find_free_seg(ms: &mut MountState, after: u32, heads: bool) -> Option<u32> {
     // Bound the scan by the real main-area segment count, not a hardcoded
     // 1024: on a volume with fewer segments the modulo wrapped onto segments
     // past the end of SIT, and on a larger one it left everything above 1024
@@ -3149,7 +3149,7 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
     // lx: the checkpoint's filler logs stay empty and typed (`linux_logs`)
     // unless nothing else is left (second pass).
     for pass in 0..2 {
-    if pass == 1 && !ms.sb.fmt.lx { break; }
+    if pass == 1 && (!ms.sb.fmt.lx || !heads) { break; }
     for seg_off in 0..total {
         let seg = (start_seg + seg_off) % total;
         if pass == 0 && ms.sb.fmt.lx && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
@@ -3489,10 +3489,17 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
                 return Some(ms.sb.main_blkaddr + seg * bps + b);
             }
         }
-        let next = match sit_find_free_seg(ms, seg) {
+        // lx: Linux's four extra log heads (`linux_logs`) need segments
+        // that are empty or of their own type; filling them left no valid
+        // curseg position on a full volume (fsck.f2fs "Incorrect curseg",
+        // "Next block offset is not free"). They are the last resort, after
+        // SSR, like upstream's reserved segments.
+        let next = match sit_find_free_seg(ms, seg, false) {
             Some(n) => Some(n),
-            None if ssr_enabled() => ssr_pick(ms, node),
-            None => None,
+            None if ssr_enabled() => ssr_pick(ms, node, false)
+                .or_else(|| sit_find_free_seg(ms, seg, true))
+                .or_else(|| ssr_pick(ms, node, true)),
+            None => sit_find_free_seg(ms, seg, true),
         };
         let next = match next {
             Some(n) => n,
@@ -3718,11 +3725,12 @@ fn seg_first_usable(ms: &mut MountState, seg: u32, from: u32) -> Option<u32> {
 
 /// SSR victim (lane f2fsgc): the segment, other than the two logs' own,
 /// with the most usable blocks (greedy, like upstream's foreground SSR).
-fn ssr_pick(ms: &mut MountState, node: bool) -> Option<u32> {
+fn ssr_pick(ms: &mut MountState, node: bool, heads: bool) -> Option<u32> {
     let bps = ms.sb.blocks_per_seg;
     let mut best: Option<(u32, u32)> = None;
     for seg in 0..ms.sb.seg_cnt_main {
         if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno { continue; }
+        if ms.sb.fmt.lx && !heads && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
         if ms.sb.fmt.lx {
             // A data block in a node segment (or the reverse) is something
             // fsck.f2fs cannot repair: reuse only a segment of the same class.
@@ -3985,9 +3993,10 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
             // kernel LSB-first: the block must be free under both readings.
             let m = seg_busy_map(ms, seg);
             let free = |b: u32| m[b as usize / 64] & (1u64 << (b % 64)) == 0;
-            if let Some(b) = (off as u32..bps).find(|&b| free(b) && free((b & !7) | (7 - (b & 7)))) {
-                logs[t] = (seg, b as u16);
-            }
+            let ok = |b: &u32| free(*b) && free((*b & !7) | (7 - (*b & 7)));
+            // Every head is SSR: lx takes a free block before `off` too.
+            let b = (off as u32..bps).find(ok).or_else(|| if ms.sb.fmt.lx { (0..off as u32).find(ok) } else { None });
+            if let Some(b) = b { logs[t] = (seg, b as u16); }
         }
     }
     let mut after = ms.cp.cur_data_segno;
@@ -4029,7 +4038,9 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
             Some(s) => (s, 0),
             None if ms.sb.fmt.lx => match lx_ssr_head(ms, &logs, t, avoid) {
                 Some(h) => { ssr[t] = true; h }
-                None => (t as u32, 0),
+                // Nothing valid exists: at least not a segment another head has.
+                None => ((0..main).find(|&g| !logs.iter().any(|l| l.0 == g)
+                    && g != ms.cp.cur_data_segno && g != ms.cp.cur_node_segno).unwrap_or(t as u32), 0),
             },
             None => (t as u32, 0),
         };
