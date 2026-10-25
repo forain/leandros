@@ -30,6 +30,48 @@ const VIRTIO_STATUS_FAILED: u8 = 0x80;
 /// TCG; 30 s matches nvme's I/O timeout and only ever fires on a dead device.
 const IO_TIMEOUT_NS: u64 = 30_000_000_000;
 
+/// Test knobs (kernel command line), read once the command line is known:
+/// `virtio_blk.inject_delay=N:MS` holds back the doorbell of the N-th request
+/// since boot (all virtio-blk disks, counted from 1) for MS milliseconds,
+/// i.e. a device that answers MS late; `virtio_blk.slow_ms=MS` replaces the
+/// 30 s slow-request threshold.
+struct Knobs { delay_n: u64, delay_ns: u64, slow_ns: u64 }
+static KNOBS_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static mut KNOBS: Knobs = Knobs { delay_n: 0, delay_ns: 0, slow_ns: IO_TIMEOUT_NS };
+static REQ_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn knobs() -> &'static Knobs {
+    use core::sync::atomic::Ordering;
+    if KNOBS_STATE.load(Ordering::Acquire) == 0 && crate::nvidia_probe::cmdline_known() {
+        let mut k = Knobs { delay_n: 0, delay_ns: 0, slow_ns: IO_TIMEOUT_NS };
+        if let Some((n, ms)) = crate::nvidia_probe::cmdline_word("virtio_blk.inject_delay")
+            .and_then(|w| w.split_once(':'))
+            .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))) {
+            k.delay_n = n; k.delay_ns = ms * 1_000_000;
+        }
+        if let Some(ms) = crate::nvidia_probe::cmdline_opt("virtio_blk.slow_ms") {
+            if ms > 0 { k.slow_ns = ms * 1_000_000; }
+        }
+        // Requests run one at a time per disk; two disks racing here write
+        // the same values.
+        unsafe { KNOBS = k; }
+        KNOBS_STATE.store(1, Ordering::Release);
+    }
+    unsafe { &*core::ptr::addr_of!(KNOBS) }
+}
+
+/// One step of a bounded busy-wait: on a syscall or page-fault path with
+/// IRQs masked, open an IRQ window so the tick still runs (never switching
+/// tasks while the caller holds the device lock). Boot-time requests (pid 0,
+/// before the scheduler) stay fully masked, as in nvme's IoWindow.
+fn irq_window_if_masked() {
+    if sched::irqs_masked() && sched::current_pid() != 0 {
+        sched::preempt_disable();
+        sched::irq_window();
+        sched::preempt_enable_no_resched();
+    }
+}
+
 /// Why a request never completed (`device_status` at the time).
 #[derive(Clone, Copy)]
 enum WaitErr { Status(u8), Timeout(u8) }
@@ -208,22 +250,14 @@ impl VirtQueue {
     /// or NEEDS_RESET/FAILED fails at once; otherwise we give up after
     /// `timeout_ns`. On failure the request is still owned by the device,
     /// so the caller must not touch the ring or DMA pages again.
-    unsafe fn wait_for_completion(&mut self, cfg: *mut VirtioPciCommonCfg, timeout_ns: u64) -> Result<(), WaitErr> {
-        let t0 = sched::monotonic_ns();
+    unsafe fn wait_for_completion(&mut self, cfg: *mut VirtioPciCommonCfg, t0: u64, timeout_ns: u64) -> Result<(), WaitErr> {
         let mut spins: u32 = 0;
         while self.last_used_idx == core::ptr::addr_of!((*self.used).idx).read_volatile() {
             spins = spins.wrapping_add(1);
             if spins % 256 == 0 {
                 // A syscall (aarch64 reads run IRQ-masked with preemption
-                // enabled) or a page fault: take the tick, never switch
-                // tasks while the caller holds the device lock. Boot-time
-                // reads (pid 0, before the scheduler) stay fully masked,
-                // as in nvme's IoWindow.
-                if sched::irqs_masked() && sched::current_pid() != 0 {
-                    sched::preempt_disable();
-                    sched::irq_window();
-                    sched::preempt_enable_no_resched();
-                }
+                // enabled) or a page fault: take the tick.
+                irq_window_if_masked();
                 let st = core::ptr::addr_of!((*cfg).device_status).mmio_read();
                 if st == 0xFF || st & (VIRTIO_STATUS_NEEDS_RESET | VIRTIO_STATUS_FAILED) != 0 {
                     return Err(WaitErr::Status(st));
@@ -498,8 +532,22 @@ impl VirtioBlkDevice {
                 q.submit(d0);
                 d0
             };
+            let t0 = sched::monotonic_ns();
+            let k = knobs();
+            let seq = REQ_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            if k.delay_n != 0 && seq == k.delay_n {
+                // Injected slow device: the request sits in the ring, unseen,
+                // for delay_ns. The wait below counts from t0.
+                crate::pci::serial_debug(&alloc::format!(
+                    "[VIRTIO-BLK] inject: request #{} (type {} sector {}) delayed {} ms\n",
+                    seq, type_, sector, k.delay_ns / 1_000_000));
+                while sched::monotonic_ns().saturating_sub(t0) < k.delay_ns {
+                    irq_window_if_masked();
+                    for _ in 0..256 { core::hint::spin_loop(); }
+                }
+            }
             self.notify();
-            if let Err(e) = self.queue.wait_for_completion(self.common_cfg, IO_TIMEOUT_NS) {
+            if let Err(e) = self.queue.wait_for_completion(self.common_cfg, t0, k.slow_ns) {
                 // The descriptors and DMA pages stay with the device forever:
                 // it may still complete (and DMA) later, so never reuse them.
                 self.dead = true;

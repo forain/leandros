@@ -4745,6 +4745,29 @@ pub fn clear_comm(tid: Pid) {
     COMMS.lock().remove(&tid);
 }
 
+/// Test knob `mm.pagein_eio=<comm>`: every file page-in of a thread named
+/// `<comm>` fails as a device read error would (guard for SIGBUS on page-in
+/// I/O errors, lane/blkdead). Empty = off.
+static PAGEIN_EIO: Mutex<([u8; 15], usize)> = Mutex::new(([0; 15], 0));
+static PAGEIN_EIO_ON: AtomicBool = AtomicBool::new(false);
+
+pub fn set_pagein_eio(comm: &str) {
+    let n = comm.len().min(15);
+    if n == 0 { return; }
+    let mut g = PAGEIN_EIO.lock();
+    g.0[..n].copy_from_slice(&comm.as_bytes()[..n]);
+    g.1 = n;
+    PAGEIN_EIO_ON.store(true, Ordering::Release);
+}
+
+fn pagein_eio_injected(tid: Pid) -> bool {
+    if !PAGEIN_EIO_ON.load(Ordering::Acquire) { return false; }
+    let (want, n) = *PAGEIN_EIO.lock();
+    let mut c = [0u8; 15];
+    let m = comm_of(tid, &mut c);
+    m == n && c[..m] == want[..n]
+}
+
 /// Thread `tid`'s name into `out` (<= 15 bytes); returns the length.
 pub fn comm_of(tid: Pid, out: &mut [u8; 15]) -> usize {
     let set = COMMS.lock().get(&tid).copied();
@@ -6338,7 +6361,9 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
             // Major only if the read reached a device: a page-cache hit (or
             // a memory-backed file) is a minor fault, as on Linux.
             let io0 = current_block_reads();
-            let got = if p.len == 0 { 0 } else {
+            let got = if p.len == 0 { 0 } else if pagein_eio_injected(pid) {
+                -5 // EIO, injected (mm.pagein_eio=<comm>)
+            } else {
                 mm::vmm::file_read(p.cap, p.pos, bounce.as_mut_ptr(), p.len)
             };
             let major = current_block_reads() != io0;
