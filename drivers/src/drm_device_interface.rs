@@ -5836,7 +5836,16 @@ impl DrmDeviceInterface {
             0x1003 => self.handle_get_mode_safe(arg),
             0x1002 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_create_framebuffer(&mut g, arg) },
             0x4600 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_fbioget_vscreeninfo(&mut g, arg) },
-            0x1004 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_flip_page(&mut g, arg) },
+            0x1004 => {
+                let fb = unsafe { (arg as *const u32).read_volatile() };
+                let r = { let d = get_drm_device(); let mut g = d.lock(); self.handle_flip_page(&mut g, arg) };
+                if r.is_ok() {
+                    vtstats::FLIP_PRESENTS.fetch_add(1, Ordering::Relaxed);
+                    vtstats::FLIP_LAST_FB.store(fb, Ordering::Relaxed);
+                    vtstats::FLIP_LAST_OPEN.store(open_id, Ordering::Relaxed);
+                }
+                r
+            },
             0x1005 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_set_plane(&mut g, arg) },
             0x1006 => self.handle_get_capabilities(arg),
             0x1008 => Self::handle_gpu_irq_stats(arg),
