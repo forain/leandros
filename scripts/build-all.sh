@@ -61,7 +61,7 @@ ROOT_DIR="$PWD"
 # Install them once at a fixed path beside the checkouts and use that instead.
 TOOLS_DIR="$(cd "$ROOT_DIR/.." && pwd)/.leandros-tools"
 mkdir -p "$TOOLS_DIR"
-for _w in "$ROOT_DIR"/scripts/linker-*-musl.sh "$ROOT_DIR"/scripts/cc-*-musl.sh "$ROOT_DIR"/scripts/ar-musl.sh; do
+for _w in "$ROOT_DIR"/scripts/linker-*-musl.sh "$ROOT_DIR"/scripts/cc-*-musl.sh "$ROOT_DIR"/scripts/ar-musl.sh "$ROOT_DIR"/scripts/musl-mem-obj.sh "$ROOT_DIR"/scripts/memset-*-musl.S "$ROOT_DIR"/scripts/memset-*.S; do
     [[ -f "$_w" ]] || continue
     cmp -s "$_w" "$TOOLS_DIR/$(basename "$_w")" || { cp "$_w" "$TOOLS_DIR/.$$.tmp" && chmod +x "$TOOLS_DIR/.$$.tmp" && mv "$TOOLS_DIR/.$$.tmp" "$TOOLS_DIR/$(basename "$_w")"; }
 done
