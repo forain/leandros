@@ -331,13 +331,65 @@ fn commit_conf(esp: &Esp, st: &State, text: &str) -> io::Result<()> {
     }
 }
 
+/// A fresh arm nonce: 6 hex digits, never reused in practice, so no
+/// LimineLastBootedEntry written before this arm names an entry of it.
+fn fresh_nonce(trial: &str) -> String {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let mut seed = std::fs::read("/proc/uptime").unwrap_or_default();
+    seed.extend_from_slice(format!("{} {} {}", t, std::process::id(), trial).as_bytes());
+    sha256(&seed)[..6].to_uppercase()
+}
+
 fn write_slots(esp: &Esp, st: &mut State, slots: &Slots) -> io::Result<()> {
     ensure_factory(esp, st)?;
-    let text = conf::generate(&st.factory, slots).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut slots = slots.clone();
+    // Every write of an armed config gets a new nonce (see conf.rs): a
+    // nonce Limine may already have recorded would make the arm a no-op.
+    slots.nonce = None;
+    if slots.trial.is_some() && slots.default_slot() == "trial" {
+        slots.nonce = Some(fresh_nonce(slots.trial.as_deref().unwrap_or("")));
+    }
+    let to_io = |e: String| io::Error::new(io::ErrorKind::Other, e);
+    if let (Some(chain), Some(n)) = (conf::generate_chain(&st.factory, &slots).map_err(to_io)?, slots.nonce.as_deref()) {
+        // The chained Limine copy and its config go to a directory of their
+        // own (nothing referenced is overwritten), verified before the main
+        // config points at them.
+        let dir = conf::chain_dir(n);
+        let src = format!("EFI/BOOT/{}", conf::EFI_NAME);
+        let bin = esp.read(|fs| read_file(fs, &src))?;
+        let bin_path = format!("{}/{}", dir, conf::EFI_NAME);
+        let conf_path = format!("{}/limine.conf", dir);
+        esp.step(|fs| {
+            write_file(fs, &bin_path, &bin)?;
+            write_file(fs, &conf_path, chain.as_bytes())
+        })?;
+        esp.dev.invalidate()?;
+        let (b2, c2) = esp.read(|fs| Ok((read_file(fs, &bin_path)?, read_file(fs, &conf_path)?)))?;
+        if sha256(&b2) != sha256(&bin) || c2 != chain.as_bytes() {
+            return err(format!("one-shot chain in /{} read-back mismatch", dir));
+        }
+    }
+    let text = conf::generate(&st.factory, &slots).map_err(to_io)?;
     commit_conf(esp, st, &text)?;
     st.text = text;
     st.conf_path = PRIMARY;
     st.slots = slots.clone();
+    // Chain copies the committed config no longer references.
+    let keep = slots.nonce.as_ref().map(|n| conf::chain_dir(n));
+    let stale: Vec<String> = esp.read(|fs| Ok(list_dir(fs, "EFI").unwrap_or_default()))?
+        .into_iter()
+        .filter(|(n, d, _)| *d && n.len() == 8 && n.to_uppercase().starts_with("LT"))
+        .map(|(n, _, _)| format!("EFI/{}", n))
+        .filter(|p| keep.as_deref().map_or(true, |k| !k.eq_ignore_ascii_case(p)))
+        .collect();
+    if !stale.is_empty() {
+        let _ = esp.step(|fs| {
+            for p in &stale {
+                remove_tree(fs, p)?;
+            }
+            Ok(())
+        });
+    }
     Ok(())
 }
 
@@ -409,6 +461,11 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 fn open_esp(o: &Opts, writable: bool) -> io::Result<Esp> {
     let p = find_esp(o.dev.as_deref())?;
     Esp::open(&p, writable)
+}
+
+/// True when the kernel command line carries `name=1`.
+fn cmdline_flag(name: &str) -> bool {
+    conf::cmdline_value(&cmdline(), name).as_deref() == Some("1")
 }
 
 fn booted() -> (Option<String>, Option<String>) {
@@ -824,11 +881,24 @@ fn cmd_boot(o: &Opts) -> io::Result<()> {
         let mut s = st.slots.clone();
         let fb = s.fallback();
         s.set_default(fb);
-        write_slots(&esp, &mut st, &s)?;
+        let r = if cmdline_flag("espctl.fault_boot") {
+            // Test hook (espresettest): the first reset attempt of this boot
+            // fails as if the ESP had returned an I/O error.
+            Err(io::Error::new(io::ErrorKind::Other, "injected fault (espctl.fault_boot)"))
+        } else {
+            write_slots(&esp, &mut st, &s)
+        };
+        if let Err(e) = r {
+            println!(
+                "espctl: one-shot reset FAILED ({}): {}", e,
+                if st.slots.nonce.is_some() { "harmless, the trial was chained (Limine already recorded the fallback entry)" }
+                else { "the trial kernel is still the default" });
+            return Err(e);
+        }
         if slot.as_deref() == Some("trial") {
             println!("espctl: one-shot trial: the next boot defaults to the {} kernel again (`espctl promote` keeps this one)", fb);
         } else {
-            println!("espctl: the armed trial kernel was NOT booted (picked {} in the menu?): disarmed, next boot: {}", slot.as_deref().unwrap_or("another entry"), fb);
+            println!("espctl: the armed trial kernel did not reach userland (consumed by the bootloader, or {} picked in the menu): disarmed, next boot: {}", slot.as_deref().unwrap_or("another entry"), fb);
         }
     }
     match import_keys(&esp) {

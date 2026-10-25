@@ -188,14 +188,14 @@ XA = ("cd /mnt/{l}; ok=0; bad=0; while read f n h; do g=$(xattr -X $n $f); if [ 
       "else bad=$((bad+1)); echo BAD $f $n; fi; done < xexp.txt; echo XA_OK=$ok XA_BAD=$bad; "
       "echo 1 > ours_acl; mkdir -p ours_dir; xattr -w user.ours hello small/f5000; xattr -W user.ourbig " + "62" * 600 + " small/f5000; echo BIG_RC=$?; "
       "xattr -w user.small v ours_acl; xattr -W system.posix_acl_access " + ACLA + " ours_acl; xattr -W system.posix_acl_default " + ACLD + " ours_dir; "
-      "xattr -w user.one 1 small/empty; xattr -d user.inl small/empty; echo XA_SET_RC=$?; "
+      "xattr -W security.capability 0100000200200000000000000000000000000000 ours_acl; xattr -w user.one 1 small/empty; xattr -d user.inl small/empty; echo XA_SET_RC=$?; "
       ": > xours.txt; for e in small/f5000:user.ours small/f5000:user.ourbig small/f5000:user.small ours_acl:user.small "
-      "ours_acl:system.posix_acl_access ours_dir:system.posix_acl_default small/empty:user.one; do f=${{e%%:*}}; n=${{e##*:}}; "
+      "ours_acl:system.posix_acl_access ours_dir:system.posix_acl_default small/empty:user.one ours_acl:security.capability; do f=${{e%%:*}}; n=${{e##*:}}; "
       "echo $f $n $(xattr -X $n $f) >> xours.txt; done; xattr small/f5000; sync; cd /; echo XA_DONE")
 # Linux check of what we wrote (runs inside the mounted image dir `m`)
 XLINUX = ("while read f n h; do g=$(sudo getfattr --only-values -n $n m/$f | xxd -p | tr -d '\\n'); [ \"$g\" = \"$h\" ] || echo XBAD $f $n; done < m/xours.txt; "
           "sudo getfattr --only-values -n user.ourbig m/small/f5000 | wc -c; sudo getfattr -n user.inl m/small/empty 2>&1 | grep -c 'No such attr'; "
-          "sudo getfacl -c m/ours_acl | grep -c 'user:1234:rw-'; sudo getfacl -c m/ours_dir | grep -c 'default:user:77:rwx'; "
+          "sudo getfacl -c m/ours_acl | grep -c 'user:1234:rw-'; sudo getfacl -c m/ours_dir | grep -c 'default:user:77:rwx'; sudo getcap m/ours_acl | grep -c cap_net_raw | sed 's/^/CAPOK=/'; "
           "for e in small/f5000:user.small small/f5000:user.mid small/f5000:user.big small/f5000:system.posix_acl_access small/empty:user.one dir1/sub:user.dirk dir1/sub:system.posix_acl_default; do f=${e%%:*}; n=${e##*:}; "
           "sudo getfattr --only-values -n $n m/$f >/dev/null 2>&1 || echo XGONE $f $n; done; echo LXX_DONE")
 
@@ -225,10 +225,10 @@ else echo LX_MOUNT_FAIL; sudo dmesg | tail -n 3 | cut -c1-150; fi"""
         ok = ("LXMD5A_RC=0" in out and "LXMD5B_RC=0" in out and "LXSTAT_RC=0" in out and "LX_UMOUNT_OK" in out
               and "\n123\n" in out and "\n5000\n" in out)
         step(v, "A.inline-linux", ok, "Linux mounts, reads and extends our inline writes" if ok else out.strip()[-200:].replace("\n", " "))
-        lxx = "LXX_DONE" in out and "XBAD" not in out and "XGONE" not in out and "\n600\n" in out
+        lxx = "LXX_DONE" in out and "XBAD" not in out and "XGONE" not in out and "\n600\n" in out and "CAPOK=1" in out
         step(v, "A.xattr-linux", lxx, "Linux reads our xattrs, spilled value and ACLs" if lxx else out.split("LXMD5B_RC")[-1].strip()[-420:].replace("\n", " "))
-        xok = "XA_DONE" in outs_xa and "XA_BAD=0" in outs_xa and "XA_SET_RC=0" in outs_xa and "XA_OK=7" in outs_xa
-        step(v, "A.xattr-guest", xok, "LeandrOS reads all 7 Linux xattrs/ACLs, sets ours" if xok else outs_xa.strip()[-160:].replace("\n", " "))
+        xok = "XA_DONE" in outs_xa and "XA_BAD=0" in outs_xa and "XA_SET_RC=0" in outs_xa and "XA_OK=8" in outs_xa
+        step(v, "A.xattr-guest", xok, "LeandrOS reads all 8 Linux xattrs/ACLs, sets ours" if xok else outs_xa.strip()[-160:].replace("\n", " "))
         rc, out = box(fsck(2))
         step(v, "A.inline-fsck2", "FSCK_RC=0" in out and "\n0\n" in out, "fsck.f2fs rc 0 after Linux write" if "FSCK_RC=0" in out else out.strip()[-140:].replace("\n", " "))
     finally:
@@ -256,7 +256,8 @@ ln -s ../small/inl small/sym; ln big/b3m big/hard; setfattr -n user.k -v val sma
 setfattr -n user.small -v abc small/f5000; setfattr -n user.mid -v "$(head -c 150 /dev/zero | tr '\\0' m)" small/f5000
 setfattr -n user.big -v "$(head -c 3000 /dev/zero | tr '\\0' a)" small/f5000; setfacl -m u:1234:rw,g:55:r small/f5000
 setfattr -n user.inl -v hello small/empty; setfattr -n user.dirk -v dv dir1/sub; setfacl -d -m u:77:rwx dir1/sub
-for e in small/f5000:user.small small/f5000:user.mid small/f5000:user.big small/f5000:system.posix_acl_access small/empty:user.inl dir1/sub:user.dirk dir1/sub:system.posix_acl_default; do
+sudo setcap cap_net_raw+ep small/f5000 || sudo setfattr -n security.capability -v 0x0100000200200000000000000000000000000000 small/f5000
+for e in small/f5000:user.small small/f5000:user.mid small/f5000:user.big small/f5000:system.posix_acl_access small/empty:user.inl dir1/sub:user.dirk dir1/sub:system.posix_acl_default small/f5000:security.capability; do
   f=${{e%%:*}}; n=${{e##*:}}; getfattr --only-values -n $n $f 2>/dev/null | xxd -p | tr -d '\\n' > /tmp/xv.$$; echo "$f $n $(cat /tmp/xv.$$)" >> xexp.txt; done; rm -f /tmp/xv.$$
 find . -type f ! -name MANIFEST -print0 | sort -z | xargs -0 md5sum > MANIFEST
 cd ..; sync; sudo umount m

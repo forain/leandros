@@ -130,6 +130,15 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         serial_print_str("[BLK] kernel cmdline: ");
         vfs_server::cmdline_redact::redact(c, serial_print_str); // never echo wifi.psk= etc.
         serial_print_str("\n");
+        // Test hook (espresettest, openbugs #80): a kernel that never reaches
+        // userland -- it hangs before init runs, so this boot cannot change
+        // anything on the boot medium.
+        if c.split_ascii_whitespace().any(|t| t == "leandros.testhang=1") {
+            serial_print_str("[BOOT] leandros.testhang=1: hanging before userland\n");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
     }
     drivers::cmdline_secrets::stashed_keys(|k| {
         serial_print_str("[BLK] kernel cmdline: secret knob ");

@@ -3521,6 +3521,31 @@ fn alloc_data_owned(ms: &mut MountState, nid: u32, ofs: usize) -> Option<u32> {
 /// None: no usable block anywhere. If only blocks freed since the last
 /// checkpoint are left, the request is doomed (`space_exhausted`) and
 /// `with_mount` checkpoints and runs it again.
+/// Empty segments an lx volume keeps out of the general allocator: the four
+/// filler heads plus one spare for each of our two own heads.
+const LX_RESERVE_SEGS: u32 = 6;
+
+/// The checkpoint's overprovision (`linux_cp_fields`).
+fn lx_ovp_segs(ms: &MountState) -> u32 {
+    let meta = ms.sb.seg_cnt_ckpt + ms.sb.seg_cnt_sit + ms.sb.seg_cnt_nat + ms.sb.seg_cnt_ssa;
+    9u32.saturating_sub(meta).max(1)
+}
+
+/// Segments with no valid block that no allocator head uses and the
+/// durable checkpoint does not point into, counted up to `limit`.
+fn lx_empty_segs(ms: &mut MountState, limit: u32) -> u32 {
+    let mut n = 0;
+    for seg in 0..ms.sb.seg_cnt_main {
+        if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno || prot_any(ms, seg) { continue; }
+        let (blkno, off) = sit_entry_loc(ms, seg);
+        if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0 {
+            n += 1;
+            if n >= limit { break; }
+        }
+    }
+    n
+}
+
 fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
     let bps = ms.sb.blocks_per_seg;
     for _ in 0..4 {
@@ -3535,17 +3560,32 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
                 return Some(ms.sb.main_blkaddr + seg * bps + b);
             }
         }
-        // lx: Linux's four extra log heads (`linux_logs`) need segments
-        // that are empty or of their own type; filling them left no valid
-        // curseg position on a full volume (fsck.f2fs "Incorrect curseg",
-        // "Next block offset is not free"). They are the last resort, after
-        // SSR, like upstream's reserved segments.
-        let next = match sit_find_free_seg(ms, seg, false) {
+        // lx: Linux's six log heads (`linux_logs`) each need a valid position
+        // at every checkpoint (fsck.f2fs "Incorrect curseg", "Next block
+        // offset is not free"; Linux refuses valid blocks > user_block_count).
+        // Like Linux's reserved segments, LX_RESERVE_SEGS empty segments are
+        // never handed to the general allocator (the four filler heads plus
+        // a spare for each of our own two heads), and valid blocks stay
+        // below user_block_count. Dirty segments are still reused by SSR.
+        let next = if ms.sb.fmt.lx {
+            let cap = (ms.sb.seg_cnt_main.saturating_sub(lx_ovp_segs(ms)) as u64) * bps as u64;
+            if ms.valid_blocks >= cap { None }
+            else {
+                let spare = lx_empty_segs(ms, LX_RESERVE_SEGS + 1) > LX_RESERVE_SEGS;
+                match if spare { sit_find_free_seg(ms, seg, false) } else { None } {
+                    Some(n) => Some(n),
+                    None if ssr_enabled() => ssr_pick(ms, node, false),
+                    None => None,
+                }
+            }
+        } else {
+        match sit_find_free_seg(ms, seg, false) {
             Some(n) => Some(n),
             None if ssr_enabled() => ssr_pick(ms, node, false)
                 .or_else(|| sit_find_free_seg(ms, seg, true))
                 .or_else(|| ssr_pick(ms, node, true)),
             None => sit_find_free_seg(ms, seg, true),
+        }
         };
         let next = match next {
             Some(n) => n,
@@ -3869,6 +3909,9 @@ fn ssr_pick(ms: &mut MountState, node: bool, heads: bool) -> Option<u32> {
             let (blkno, off) = sit_entry_loc(ms, seg);
             let v = r16(ms.cache.read(ms.dev, blkno), off);
             if v & SIT_VBLOCKS_MASK != 0 && sit_is_node(v) != node { continue; }
+            // An empty segment belongs to the reserve (`LX_RESERVE_SEGS`);
+            // only `log_alloc`'s spare check may hand it out.
+            if !heads && v & SIT_VBLOCKS_MASK == 0 { continue; }
         }
         let m = seg_busy_map(ms, seg);
         let busy: u32 = m.iter().map(|w| w.count_ones()).sum();
