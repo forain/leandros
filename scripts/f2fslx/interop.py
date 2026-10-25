@@ -25,7 +25,7 @@ passes while still listed is UNEXPECTED-PASS, so stale entries are caught).
 Guest images/disks are scratch under $TMPDIR; box scratch is /tmp/f2fsinterop-$$
 and always removed.
 """
-import fnmatch, hashlib, json, os, shutil, subprocess, sys, tempfile
+import fnmatch, hashlib, json, os, shutil, struct, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -42,7 +42,15 @@ VARIANTS = {
     # (32G sparse: SIT+NAT bitmaps past offset 2048). Images stay sparse.
     "lx2g": ("", "", "2G"),
     "lx32g": ("", "", "32G"),
+    # design f2fslxrw S9: Linux-created 100k-entry dir read by us + a 100k-entry dir we create
+    # (dentry blocks past i_addr: hash level >= 9), then Linux ls/stat + fsck rc 0.
+    "lxdir": ("", "", "4G"),
+    # S9b: 256G (cp_payload 0, bitmaps 3840 B in the commit block) and 4T (mkfs gives cp_payload 2:
+    # the SIT version bitmap lives in payload blocks after the commit block). Images stay sparse.
+    "lx256g": ("", "", "256G"),
+    "lx4t": ("", "", "4T"),
 }
+BIGDIR = ("lxdir",)
 SIZE = "128M"
 results = []
 
@@ -84,28 +92,77 @@ def box(script, timeout=1800):
     return r.returncode, r.stdout + r.stderr
 
 
+_BOX_DUMP = r"""
+import os,sys,struct
+f=os.open(sys.argv[1],os.O_RDONLY); size=os.fstat(f).st_size; off=0; out=sys.stdout.buffer
+while True:
+    try: d=os.lseek(f,off,os.SEEK_DATA)
+    except OSError: break
+    h=os.lseek(f,d,os.SEEK_HOLE)
+    while d<h:
+        b=os.pread(f,min(1<<20,h-d),d)
+        if not b: break
+        out.write(struct.pack("<QQ",d,len(b))); out.write(b); d+=len(b)
+    off=h
+out.write(struct.pack("<QQ",size,0)); out.flush()
+"""
+_BOX_LOAD = r"""
+import os,sys,struct
+inp=sys.stdin.buffer; f=open(sys.argv[1],"wb")
+while True:
+    h=inp.read(16)
+    if len(h)<16: sys.exit(1)
+    o,n=struct.unpack("<QQ",h)
+    if n==0: f.truncate(o); break
+    f.seek(o); f.write(inp.read(n))
+"""
+
+
+def _rd(p, n):
+    b = b""
+    while len(b) < n:
+        c = p.read(n - len(b))
+        if not c:
+            break
+        b += c
+    return b
+
+
 def fetch(remote, local):
-    """gzip over ssh, written sparse (all-zero MiB chunks become holes)."""
-    p1 = subprocess.Popen(SSH + [f"gzip -1c {remote}"], stdout=subprocess.PIPE)
+    """Data extents only (SEEK_DATA on the box), gzipped over ssh, written sparse."""
+    p1 = subprocess.Popen(SSH + [f"python3 -c '{_BOX_DUMP}' {remote} | gzip -1c"], stdout=subprocess.PIPE)
     p2 = subprocess.Popen(["gunzip"], stdin=p1.stdout, stdout=subprocess.PIPE)
     p1.stdout.close()
+    ok = False
     with open(local, "wb") as f:
-        zero = bytes(1 << 20)
         while True:
-            c = p2.stdout.read(1 << 20)
-            if not c:
+            h = _rd(p2.stdout, 16)
+            if len(h) < 16:
                 break
-            if c == zero[:len(c)]:
-                f.seek(len(c), 1)
-            else:
-                f.write(c)
-        f.truncate(f.tell())
-    p2.wait(); return p1.wait() == 0 and p2.returncode == 0
+            o, n = struct.unpack("<QQ", h)
+            if n == 0:
+                f.truncate(o); ok = True; break
+            c = _rd(p2.stdout, n)
+            if c != bytes(len(c)):
+                f.seek(o); f.write(c)
+    p2.wait(); return p1.wait() == 0 and ok
 
 
 def push(local, remote):
-    p1 = subprocess.Popen(["gzip", "-1c", local], stdout=subprocess.PIPE)
-    p2 = subprocess.run(SSH + [f"gunzip | dd of={remote} bs=1M conv=sparse status=none"], stdin=p1.stdout)
+    src = ('import os,sys,struct,gzip\n'
+           'f=os.open(sys.argv[1],os.O_RDONLY); size=os.fstat(f).st_size; off=0; out=gzip.GzipFile(fileobj=sys.stdout.buffer,mode="wb",compresslevel=1)\n'
+           'while True:\n'
+           '    try: d=os.lseek(f,off,os.SEEK_DATA)\n'
+           '    except OSError: break\n'
+           '    h=os.lseek(f,d,os.SEEK_HOLE)\n'
+           '    while d<h:\n'
+           '        b=os.pread(f,min(1<<20,h-d),d)\n'
+           '        if not b: break\n'
+           '        out.write(struct.pack("<QQ",d,len(b))); out.write(b); d+=len(b)\n'
+           '    off=h\n'
+           'out.write(struct.pack("<QQ",size,0)); out.close()\n')
+    p1 = subprocess.Popen([sys.executable, "-c", src, local], stdout=subprocess.PIPE)
+    p2 = subprocess.run(SSH + [f"gunzip | python3 -c '{_BOX_LOAD}' {remote}"], stdin=p1.stdout)
     p1.stdout.close(); return p1.wait() == 0 and p2.returncode == 0
 
 
@@ -144,7 +201,7 @@ def guest_main(imgs):
     driver.cmd_start("aarch64"); driver.cmd_login("root", "root", timeout=180)
     try:
         for c in cmds:
-            r = driver.serial_run(c, timeout=300, arch="aarch64")
+            r = driver.serial_run(c, timeout=3000 if "BIGD_DONE" in c else 300, arch="aarch64")
             outs.append(r["output"] if isinstance(r, dict) else str(r))
     finally:
         driver.cmd_stop()
@@ -178,10 +235,14 @@ INLW = ("cd /mnt/{l} && echo more >> small/inl && cat small/inl && dd if=big/b3m
         "ls dir1/sub | wc -l; cat small/inl3000 | wc -c; "
         "md5sum small/inl small/inl3000 small/newd/a dir1/sub/inline_dir_overflow_entry_name_* > ours2.md5; "
         "md5sum -c ours2.md5 2>&1 | tail -n 1; sync; cd /; echo INLW_DONE")
+BIGD = ("cd /mnt/{l} && echo BIGD_LS=$(ls bigdir | wc -l); i=0; bad=0; while [ $i -lt 1500 ]; do n=$(( (i*7919+13) % 100000 + 1 )); "
+        "[ -e bigdir/e_$n ] || bad=$((bad+1)); i=$((i+1)); done; echo BIGD_BAD=$bad; [ -e bigdir/e_100001 ] && echo BIGD_PHANTOM; "
+        "mkdir newbig; i=1; while [ $i -le 100000 ]; do : > newbig/f_$i; i=$((i+1)); done; echo BIGD_NEWLS=$(ls newbig | wc -l); "
+        "rm newbig/f_7; [ -e newbig/f_7 ] && echo BIGD_RM_FAILED; sync; cd /; echo BIGD_DONE")
 EXCL = "small/inl$|small/inl3000$|^[0-9a-f]+  ./(upg|inl2)"
 
 
-def inline_verify(v, tmp, outs_inl):
+def inline_verify(v, tmp, outs_inl, bigd=""):
     """Ship the guest-written image to the box: fsck rc 0, Linux mount, ours2.md5 + MANIFEST (minus
     what the step modified), stat every created name, Linux write, umount, fsck rc 0 again."""
     ok_g = "INLW_DONE" in outs_inl and "RMDIR_EMPTY_RC=0" in outs_inl and "RMDIR_NONEMPTY_RC=0" not in outs_inl \
@@ -201,14 +262,25 @@ def inline_verify(v, tmp, outs_inl):
  ls dir1/sub | wc -l; stat -c %n small/newd/a dir1/sub/inline_dir_overflow_entry_name_120 >/dev/null; echo LXSTAT_RC=$?; stat -c %s small/inl3000; ls inl2 upg 2>&1 | head -n 3; rm -f /tmp/mm.$$ /tmp/mm2.$$ /tmp/mf.$$)
  sudo sh -c 'echo fromlinux > m/dir1/sub/lx_new_entry; echo fromlinux >> m/small/inl3000'; sync; sudo umount m && echo LX_UMOUNT_OK
 else echo LX_MOUNT_FAIL; sudo dmesg | tail -n 3 | cut -c1-150; fi"""
+        if bigd:
+            okb = "BIGD_LS=100000" in bigd and "BIGD_BAD=0" in bigd and "BIGD_PHANTOM" not in bigd and "BIGD_NEWLS=100000" in bigd \
+                and "BIGD_RM_FAILED" not in bigd and "BIGD_DONE" in bigd
+            step(v, "A.bigdir-guest", okb, "Linux 100k dir read (ls + 1500 lookups), 100k created by us" if okb else bigd.strip()[-200:].replace("\n", " "))
+            extra = ("echo NB_LS=$(ls m/newbig | wc -l); nb=0; for i in 1 5 99 4096 7777 12345 50000 65535 99999 100000; do "
+                     "stat m/newbig/f_$i >/dev/null 2>&1 || nb=$((nb+1)); done; echo NB_BAD=$nb; "
+                     "stat m/newbig/f_7 >/dev/null 2>&1 && echo NB_F7_PRESENT; echo OB_LS=$(ls m/bigdir | wc -l)\n ")
+            script = script.replace("sudo sh -c 'echo fromlinux", extra + "sudo sh -c 'echo fromlinux", 1)
         rc, out = box(script)
+        if bigd:
+            okl = "NB_LS=99999" in out and "NB_BAD=0" in out and "NB_F7_PRESENT" not in out and "OB_LS=100000" in out
+            step(v, "A.bigdir-linux", okl, "Linux lists 99999 entries, stats names we hashed" if okl else out.strip()[-200:].replace("\n", " "))
         ok = ("LXMD5A_RC=0" in out and "LXMD5B_RC=0" in out and "LXSTAT_RC=0" in out and "LX_UMOUNT_OK" in out
               and "\n123\n" in out and "\n5000\n" in out)
         step(v, "A.inline-linux", ok, "Linux mounts, reads and extends our inline writes" if ok else out.strip()[-200:].replace("\n", " "))
         rc, out = box(fsck(2))
         step(v, "A.inline-fsck2", "FSCK_RC=0" in out and "\n0\n" in out, "fsck.f2fs rc 0 after Linux write" if "FSCK_RC=0" in out else out.strip()[-140:].replace("\n", " "))
     finally:
-        box(f"rm -rf {rd}")
+        if not os.environ.get("F2FSINTEROP_KEEP"): box(f"rm -rf {rd}")
 
 
 def direction_a(variants, tmp):
@@ -228,6 +300,7 @@ for i in $(seq 1 300); do echo "entry $i" > dir1/file_with_long_name_$i; done
 for i in 1 2 3; do echo s$i > dir1/sub/s$i; done
 head -c 3M /dev/urandom > big/b3m; head -c 12M /dev/urandom > big/b12m
 dd if=/dev/urandom of=big/sparse bs=4k count=1 seek=2000 status=none
+if [ "$N" = lxdir ]; then mkdir bigdir; (cd bigdir; seq 1 100000 | sed 's/^/e_/' | xargs -n 5000 touch); fi
 ln -s ../small/inl small/sym; ln big/b3m big/hard; setfattr -n user.k -v val small/inl 2>/dev/null || true
 find . -type f ! -name MANIFEST -print0 | sort -z | xargs -0 md5sum > MANIFEST
 cd ..; sync; sudo umount m
@@ -248,13 +321,17 @@ set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"
     for v in imgs:
         cmds += [MNT.format(l=v), md5chk(v, "MANIFEST"),
                  f"echo leandros > /mnt/{v}/ours.txt && cat /mnt/{v}/ours.txt; echo WRITE_RC=$?; sync",
-                 INLW.format(l=v),
+                 INLW.format(l=v)] + ([BIGD.format(l=v)] if v in BIGDIR else []) + [
                  f"umount /mnt/{v}; echo UMOUNT_RC=$?"]
     outs = guest([os.path.join(tmp, v + ".img") for v in imgs], cmds, "A")
     for i, v in enumerate(imgs):
         if outs is None:
             step(v, "A.mount", False, "guest run failed"); continue
-        m, md, w, il, u = outs[5 * i:5 * i + 5]
+        k = 5 + sum(1 for x in imgs[:i] if x in BIGDIR)
+        st = 5 + (1 if v in BIGDIR else 0)
+        row = outs[sum(5 + (1 if x in BIGDIR else 0) for x in imgs[:i]):][:st]
+        m, md, w, il = row[:4]; u = row[-1]; bd = row[4] if v in BIGDIR else ""
+        k = 0
         mounted = "MNT_RW" in m or "MNT_RO" in m
         step(v, "A.mount", mounted, "mounted" if mounted else "mount failed")
         if not mounted:
@@ -266,7 +343,7 @@ set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"
         step(v, "A.write", wok, "write ok" if wok else "write refused (ro/EROFS)" if "Read-only" in w else "write failed")
         if wok:
             skip(v, "A.ro-unchanged", "volume was written")
-            inline_verify(v, tmp, il)
+            inline_verify(v, tmp, il, bd)
         else:
             same = shas[v] is None or sha(os.path.join(tmp, v + ".img")) == shas[v]
             step(v, "A.ro-unchanged", same, "image bit-identical" if same else "image CHANGED by refused write/ro mount")

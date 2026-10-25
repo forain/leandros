@@ -312,11 +312,18 @@ fn write_tail(dev: usize, at: u64, cp: &[u8; BLOCK_SIZE], zero: bool, sums: Opti
 /// (Linux only needs the footer's version and CRC): the footer goes first and
 /// is flushed, then the commit block, with the area zeroed (= every SIT/NAT
 /// block is in copy 0) and resealed. The commit block stays the atomic step.
-fn commit_pack(dev: usize, big: bool, cp_blkno: u64, cp_buf: &[u8; BLOCK_SIZE], tail_at: u64, zero: bool,
+fn commit_pack(dev: usize, big: bool, cp_blkno: u64, payload: u32, cp_buf: &[u8; BLOCK_SIZE], tail_at: u64, zero: bool,
                 sums: Option<&[u8]>, cmds: &mut u32) -> (bool, bool) {
     if !big {
         let c = dw(dev, cp_blkno, cp_buf);
         return (c, write_tail(dev, tail_at, cp_buf, zero, sums, cmds));
+    }
+    // cp_payload blocks hold Linux's SIT version bitmap: all zero = every SIT
+    // block is in copy 0 (rewritten each time: the other pack may hold the
+    // bits a Linux checkpoint left there).
+    if payload > 0 {
+        let z = alloc::vec![0u8; payload as usize * BLOCK_SIZE];
+        if !dws(dev, cp_blkno + 1, &z, cmds) { return (false, false); }
     }
     if !(write_tail(dev, tail_at, cp_buf, zero, sums, cmds) && dflush(dev)) { return (false, false); }
     let mut real = *cp_buf;
@@ -420,8 +427,11 @@ pub(crate) fn committed_init(slot: usize, ver: u64) { COMMITTED[slot].store(ver,
 
 fn pack_blocks(ms: &MountState) -> u32 { (ms.sb.seg_cnt_ckpt / 2) * ms.sb.blocks_per_seg }
 /// The part of a pack this kernel writes (journal, roll-forward records).
-fn pack_room(ms: &MountState) -> u32 { pack_blocks(ms) - LINUX_TAIL }
-fn pack_base(ms: &MountState, pack: u8) -> u64 { (ms.sb.cp_blkaddr + pack as u32 * pack_blocks(ms)) as u64 }
+fn pack_room(ms: &MountState) -> u32 { pack_blocks(ms) - ms.sb.cp_payload - LINUX_TAIL }
+/// Where this kernel's journal and records start (minus one): the commit block
+/// is followed by the `cp_payload` blocks Linux keeps the SIT version bitmap in
+/// (and its orphan blocks after them), so records begin past those.
+fn pack_base(ms: &MountState, pack: u8) -> u64 { (ms.sb.cp_blkaddr + pack as u32 * pack_blocks(ms) + ms.sb.cp_payload) as u64 }
 
 /// A block was allocated (log_alloc).
 pub(crate) fn note_alloc(ms: &mut MountState, seg: u32, b: u32) {
@@ -562,6 +572,7 @@ pub(crate) struct CpJob {
     pub cp_buf: [u8; BLOCK_SIZE],
     /// `SbInfo::big_cp`: the private fields travel in the footer (`commit_pack`).
     pub big: bool,
+    pub payload: u32,
     pub umount: bool,
     /// Zero the six summary blocks of the Linux tail with this commit (the
     /// footer copy of the commit block is written every time).
@@ -763,7 +774,7 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     let tail_sums = crate::lx_tail_sums(ms, &logs);
     Ok(CpJob {
         dev: ms.dev, ver: ms.cp.ver, direct, direct_reg, jhome, jimg,
-        pack_base: pack_base(ms, pack), pack_cap, ext, cp_blkno, cp_buf, big: ms.sb.big_cp(), umount, reg_blocks, zero_tail, tail_sums,
+        pack_base: pack_base(ms, pack), pack_cap, ext, cp_blkno, cp_buf, big: ms.sb.big_cp(), payload: ms.sb.cp_payload, umount, reg_blocks, zero_tail, tail_sums,
     })
 }
 
@@ -837,7 +848,7 @@ pub(crate) fn cp_write(job: &mut CpJob, port: u32) -> CpIo {
     io.reg_cmds[REG_CP] += 1;
     // Linux's view of the pack, in the same flush as the commit block. Only a
     // big_cp volume reads it back, so elsewhere a failed write does not fail the commit.
-    let (c_ok, t_ok) = commit_pack(dev, job.big, job.cp_blkno, &job.cp_buf, job.pack_base + 1 + job.pack_cap as u64,
+    let (c_ok, t_ok) = commit_pack(dev, job.big, job.cp_blkno, job.payload, &job.cp_buf, job.pack_base + 1 + job.pack_cap as u64,
                                    job.zero_tail, job.tail_sums.as_deref(), &mut io.reg_cmds[REG_CP]);
     io.ok &= c_ok;
     io.home_ok &= t_ok;
@@ -912,7 +923,7 @@ pub(crate) fn read_journal(dev: usize, sb: &SbInfo, base: u64, cpb: &[u8; BLOCK_
         + r32(cpb, CPJ_EXT_OFF + 4 * q) as u64 * sb.blocks_per_seg as u64).collect();
     let job_like = CpJob {
         dev, ver: 0, direct: Vec::new(), direct_reg: Vec::new(), jhome: Vec::new(), jimg: Vec::new(),
-        pack_base: base, pack_cap: pack_blks - 1 - cp_tail(cpb), ext, cp_blkno: 0, cp_buf: [0; BLOCK_SIZE], big: false,
+        pack_base: base + sb.cp_payload as u64, pack_cap: pack_blks - sb.cp_payload - 1 - cp_tail(cpb), ext, cp_blkno: 0, cp_buf: [0; BLOCK_SIZE], big: false, payload: 0,
         umount: false, reg_blocks: [0; REGS], zero_tail: false, tail_sums: None,
     };
     if total > job_like.pack_cap + 512 * next as u32 { return Err(()); }
@@ -1188,7 +1199,7 @@ fn sit_set(ms: &mut MountState, a: u32, used: bool) {
 /// records were applied.
 pub(crate) fn recover(ms: &mut MountState, rf_start: u32, tail: u32) -> u32 {
     let base = pack_base(ms, ms.dur.durable_pack);
-    let end = pack_blocks(ms) - tail;
+    let end = pack_blocks(ms) - ms.sb.cp_payload - tail;
     let (recs, next, seq) = read_records(ms.dev, base, rf_start, end, ms.dur.durable_ver);
     ms.dur.rf_next = if rf_start == 0 { 0 } else { next };
     ms.dur.rf_end = if rf_start == 0 { 0 } else { end };
@@ -1431,7 +1442,7 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
         cp_seal(&mut cp_buf);
         let zero = core::mem::replace(&mut ms.dur.tail_dirty[pack as usize], false);
         let mut cmds = 0;
-        let (c_ok, t_ok) = commit_pack(dev, ms.sb.big_cp(), cp_blkno, &cp_buf, pbase + pack_room(ms) as u64, zero,
+        let (c_ok, t_ok) = commit_pack(dev, ms.sb.big_cp(), cp_blkno, ms.sb.cp_payload, &cp_buf, pbase + pack_room(ms) as u64, zero,
                                        sums.as_deref(), &mut cmds);
         ok &= c_ok;
         if !t_ok { ms.dur.tail_dirty[pack as usize] = true; }
