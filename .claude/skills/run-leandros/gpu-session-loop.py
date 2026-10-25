@@ -14,7 +14,7 @@ host GPU, and this is the soak that checks it.
 """
 import os, sys, time, re, subprocess
 os.environ.setdefault("LEANDROS_RUN_ID", "gpuloop")
-os.environ.setdefault("LEANDROS_VNC_PORT", "5941")
+os.environ.setdefault("LEANDROS_VNC_BASE", "5941")
 REPO = os.environ.get("REPO", os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../..")))
 sys.path.insert(0, f"{REPO}/.claude/skills/run-leandros")
 os.chdir(REPO)

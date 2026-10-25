@@ -886,6 +886,70 @@ fn cmd_get(o: &Opts) -> io::Result<()> {
     Ok(())
 }
 
+/// Boot a foreign entry (e.g. a stock Linux for a hardware baseline) exactly once.
+/// The current config is saved to <save> on the ESP, the entry goes first and becomes
+/// the default. `espctl boot` never runs under a foreign OS, so whatever the entry boots
+/// must copy <save> back to /limine.conf as its first action; if it never gets that far,
+/// pick a LeandrOS entry in the Limine menu and run `espctl oneshot-restore <save>`.
+fn cmd_oneshot(o: &Opts) -> io::Result<()> {
+    if o.args.len() != 2 {
+        return err("usage: espctl oneshot <local-entry-file> <esp-save-path>");
+    }
+    let entry = String::from_utf8_lossy(&read_local(&o.args[0])?).into_owned();
+    let save = norm(&o.args[1]).to_string();
+    if !entry.starts_with('/') || entry.lines().any(|l| l.trim_start().starts_with("default_entry")) {
+        return err("entry must start with '/<name>' and must not set default_entry");
+    }
+    if CONF_SEARCH.contains(&save.as_str()) || save.starts_with(SLOT_ROOT) || save == FACTORY_CONF || save.starts_with("EFI") {
+        return err("refusing that save path");
+    }
+    let esp = open_esp(o, true)?;
+    let st = load_state(&esp)?;
+    if !conf::is_managed(&st.text) || st.conf_path != PRIMARY {
+        return err("oneshot needs an espctl-managed /limine.conf");
+    }
+    let mut out = String::new();
+    let (mut set_default, mut inserted) = (false, false);
+    for l in st.text.split_inclusive('\n') {
+        if !set_default && l.starts_with("default_entry:") {
+            out.push_str("default_entry: 1\n");
+            set_default = true;
+            continue;
+        }
+        if !inserted && l.starts_with('/') {
+            out.push_str(entry.trim_end());
+            out.push_str("\n\n");
+            inserted = true;
+        }
+        out.push_str(l);
+    }
+    if !set_default || !inserted {
+        return err("could not place the entry (no default_entry or no entries)");
+    }
+    esp.step(|fs| write_file(fs, &save, st.text.as_bytes()))?;
+    esp.dev.invalidate()?;
+    if esp.read(|fs| read_file(fs, &save))? != st.text.as_bytes() {
+        return err("save read-back mismatch; config untouched");
+    }
+    commit_conf(&esp, &st, &out)?;
+    println!("oneshot: entry is the default; previous config saved to /{} sha256={}", save, sha256(st.text.as_bytes()));
+    Ok(())
+}
+
+/// Put a config saved by `oneshot` back (recovery when the foreign entry did not).
+fn cmd_oneshot_restore(o: &Opts) -> io::Result<()> {
+    let save = norm(o.args.get(0).map(|s| s.as_str()).unwrap_or("")).to_string();
+    let esp = open_esp(o, true)?;
+    let st = load_state(&esp)?;
+    let text = String::from_utf8(esp.read(|fs| read_file(fs, &save))?).map_err(|_| io::Error::new(io::ErrorKind::Other, "saved config is not UTF-8"))?;
+    if !conf::is_managed(&text) {
+        return err("saved config is not espctl-managed");
+    }
+    commit_conf(&esp, &st, &text)?;
+    println!("restored /{} as /limine.conf", save);
+    Ok(())
+}
+
 fn cmd_put(o: &Opts) -> io::Result<()> {
     if o.args.len() != 2 {
         return err("usage: espctl put <local> <esp-path>");
@@ -927,6 +991,8 @@ const USAGE: &str = "usage: espctl [--dev /dev/<esp>] <command>
   discard                drop the trial slot
   default <trial|good|factory>
   timeout <seconds>      Limine menu timeout of the managed config
+  oneshot <entry> <save> boot a foreign Limine entry once (it must restore <save>)
+  oneshot-restore <save> put a config saved by oneshot back
   reset                  restore the flashed limine.conf, remove all slots
   boot                   init's per-boot hook (one-shot disarm, key import)
   import-keys            ESP /leandros/authorized_keys -> /root/.ssh/authorized_keys
@@ -958,6 +1024,8 @@ fn main() {
         "discard" => cmd_discard(&o),
         "default" => cmd_default(&o),
         "timeout" => cmd_timeout(&o),
+        "oneshot" => cmd_oneshot(&o),
+        "oneshot-restore" => cmd_oneshot_restore(&o),
         "cmdline" => cmd_cmdline(&o),
         "reset" => cmd_reset(&o),
         "boot" => cmd_boot(&o),

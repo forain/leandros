@@ -20,7 +20,9 @@ CP_UMOUNT_FLAG = 0x00000001
 # Segment layout
 SEGMENT0_BLKADDR = BLOCKS_PER_SEG      # 512
 SEG_CNT_CKPT = 2
-SEG_CNT_SIT  = 1
+# Linux mirrors the SIT and the NAT: two copies each, the live one per block
+# chosen by the checkpoint's version bitmaps (lane f2fslayout).
+SEG_CNT_SIT  = 2
 SEG_CNT_NAT  = 2
 SEG_CNT_SSA  = 1
 
@@ -142,7 +144,9 @@ def write_superblock(image, base, total_blocks, total_segs, main_segs):
     w32(image, s + 32, 0)     # checksum_offset
     w64(image, s + 36, total_blocks)
     w32(image, s + 44, main_segs)
-    w32(image, s + 48, total_segs)
+    # segment_count covers segment0_blkaddr onwards: block 0..511 (the
+    # superblocks) is not a segment (Linux sanity_check_area_boundary).
+    w32(image, s + 48, total_segs - 1)
     w32(image, s + 52, SEG_CNT_CKPT)
     w32(image, s + 56, SEG_CNT_SIT)
     w32(image, s + 60, SEG_CNT_NAT)
@@ -239,6 +243,9 @@ def write_checkpoint(image, blkaddr, ver, valid_blocks, valid_nodes, free_segs, 
         w16(image, o + 116 + i * 2, cur_data_blkoff if i == 0 else 0)
     w32(image, o + 132, CP_UMOUNT_FLAG)
     w32(image, o + 136, 5)
+    w32(image, o + 156, (SEG_CNT_SIT // 2) * BLOCKS_PER_SEG // 8)   # sit_ver_bitmap_bytesize
+    w32(image, o + 160, (SEG_CNT_NAT // 2) * BLOCKS_PER_SEG // 8)   # nat_ver_bitmap_bytesize
+    image[o + 2048:o + 2056] = image[o:o + 8]                       # servers/f2fs CP_OWN_VER
     w32(image, o + 140, 1)
     w32(image, o + 144, valid_nodes)
     w32(image, o + 148, valid_nodes)
@@ -3171,7 +3178,7 @@ def main():
         valid_map_per_seg[seg][blk // 8] |= (1 << (blk % 8))
 
     # Main segments
-    assert main_segs <= SEG_CNT_SIT * BLOCKS_PER_SEG * SIT_PER_BLK
+    assert main_segs <= (SEG_CNT_SIT // 2) * BLOCKS_PER_SEG * SIT_PER_BLK
     for seg in range(main_segs):
         o = (SIT_BLKADDR + seg // SIT_PER_BLK) * BLOCK_SIZE + (seg % SIT_PER_BLK) * SIT_ENTRY_SIZE
         w16(image, o, valid_blocks_per_seg[seg])

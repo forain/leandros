@@ -160,6 +160,17 @@ const CP_ALLOC_SSR:      u8    = 1;
 /// CPJ_INCOMPAT_OFF. The standard curseg fields hold heads Linux accepts
 /// (lane f2fscrc3); a legacy checkpoint's heads are its standard fields.
 const CP_OWN_HEADS:      usize = 3348;
+/// This kernel's copy of `checkpoint_ver` (u64). Linux's f2fs rewrites the
+/// commit block from the bytes it loaded, so a block Linux wrote keeps the
+/// old value here while bumping `checkpoint_ver`: that tells a Linux-written
+/// checkpoint apart (`cp_is_foreign`). Past the version bitmaps (192..) and
+/// before the journal header (3072).
+const CP_OWN_VER:        usize = 2048;
+/// `sit_nat_version_bitmap`: the SIT bitmap, then the NAT bitmap (cp_payload 0).
+const CP_VER_BITMAP:     usize = 192;
+const CP_ORPHAN_PRESENT: u32   = 0x0000_0002;
+const CP_COMPACT_SUM:    u32   = 0x0000_0004;
+const CP_LARGE_NAT_BM:   u32   = 0x0000_0200;
 const CP_UMOUNT_FLAG:    u32   = 0x0000_0001;
 
 // Inode (node block) field offsets
@@ -3093,6 +3104,99 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
 }
 
 /// Where segment `seg`'s SIT entry lives: (SIT block, byte offset in it).
+/// A commit block Linux's f2fs wrote over one of ours (see CP_OWN_VER). Only
+/// volumes with the mirrored SIT (segment_count_sit >= 2, mkfs since lane
+/// f2fslayout) can be mounted by Linux at all; the older one-copy volumes
+/// never take this path.
+fn cp_is_foreign(sb: &SbInfo, b: &[u8; BLOCK_SIZE]) -> bool {
+    sb.seg_cnt_sit >= 2 && !durable::cp_is_legacy(b) && r64(b, CP_OWN_VER) != r64(b, CP_VER)
+}
+
+/// Bring a Linux-written checkpoint into the form this kernel reads, on the
+/// device, before anything is cached: (1) every SIT/NAT block whose version
+/// bit is set lives in copy 1 — copy it over copy 0; (2) apply the NAT and
+/// SIT journals Linux keeps in the current-segment summaries. The caller
+/// then commits with zero bitmaps. Idempotent: a crash before that commit
+/// leaves the Linux checkpoint newest and this runs again on the same input.
+/// Returns the number of blocks copied plus journal entries applied.
+fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64) -> Option<usize> {
+    let bps = sb.blocks_per_seg as u64;
+    let flags = r32(cp, CP_CKPT_FLAGS);
+    let sit_sz = r32(cp, CP_SIT_BM_SIZE) as usize;
+    let nat_sz = r32(cp, CP_NAT_BM_SIZE) as usize;
+    if flags & CP_LARGE_NAT_BM != 0 || CP_VER_BITMAP + sit_sz + nat_sz > durable::CPJ_MAGIC_OFF
+        || sb.seg_cnt_nat != 2 { return None; }
+    if flags & CP_ORPHAN_PRESENT != 0 {
+        dbg_str("[F2FS] Linux checkpoint carries orphan blocks; they are not reaped\n");
+    }
+    let bit = |off: usize, i: usize| cp[off + i / 8] & (0x80u8 >> (i % 8)) != 0;
+    let mut blk = [0u8; BLOCK_SIZE];
+    let mut n = 0usize;
+    let copy = |from: u64, to: u64, blk: &mut [u8; BLOCK_SIZE]| -> bool {
+        virtio_blk::read_block(dev, from, blk) && virtio_blk::write_block(dev, to, blk)
+    };
+    let sit_half = (sb.seg_cnt_sit / 2) as u64 * bps;
+    for i in 0..(sit_sz * 8).min(sit_half as usize) {
+        if !bit(CP_VER_BITMAP, i) { continue; }
+        let a = sb.sit_blkaddr as u64 + i as u64;
+        if !copy(a + sit_half, a, &mut blk) { return None; }
+        n += 1;
+    }
+    for i in 0..(nat_sz * 8).min(bps as usize) {
+        if !bit(CP_VER_BITMAP + sit_sz, i) { continue; }
+        let a = sb.nat_blkaddr as u64 + i as u64;
+        if !copy(a + bps, a, &mut blk) { return None; }
+        n += 1;
+    }
+    // Journals: compacted (NAT journal, SIT journal, data entries, from
+    // start_sum) or normal (NAT in the hot data summary, SIT in the cold
+    // one; Linux sum_blk_addr = cp + total - (base + 1) + type, base 6 on
+    // an unmount checkpoint, else 3).
+    const JSZ: usize = 507;           // SUM_JOURNAL_SIZE
+    const SUM_JOFF: usize = 3584;     // ENTRIES_IN_SUM * SUMMARY_SIZE
+    let total = r32(cp, CP_PACK_TOTAL) as u64;
+    let mut nat_j = [0u8; JSZ];
+    let mut sit_j = [0u8; JSZ];
+    if flags & CP_COMPACT_SUM != 0 {
+        if !virtio_blk::read_block(dev, cp_addr + r32(cp, CP_START_SUM) as u64, &mut blk) { return None; }
+        nat_j.copy_from_slice(&blk[..JSZ]);
+        sit_j.copy_from_slice(&blk[JSZ..2 * JSZ]);
+    } else {
+        let base = if flags & CP_UMOUNT_FLAG != 0 { 7 } else { 4 };
+        if total < base + 2 { return None; }
+        if !virtio_blk::read_block(dev, cp_addr + total - base, &mut blk) { return None; }
+        nat_j.copy_from_slice(&blk[SUM_JOFF..SUM_JOFF + JSZ]);
+        if !virtio_blk::read_block(dev, cp_addr + total - base + 2, &mut blk) { return None; }
+        sit_j.copy_from_slice(&blk[SUM_JOFF..SUM_JOFF + JSZ]);
+    }
+    let n_nats = (r16(&nat_j, 0) as usize).min((JSZ - 2) / 13);
+    for k in 0..n_nats {
+        let e = 2 + k * 13;
+        let nid = r32(&nat_j, e);
+        if nid as u64 >= bps * NAT_ENTRY_PER_BLK as u64 { return None; }
+        let a = sb.nat_blkaddr as u64 + (nid / NAT_ENTRY_PER_BLK as u32) as u64;
+        let o = (nid % NAT_ENTRY_PER_BLK as u32) as usize * NAT_ENTRY_SIZE;
+        if !virtio_blk::read_block(dev, a, &mut blk) { return None; }
+        blk[o..o + NAT_ENTRY_SIZE].copy_from_slice(&nat_j[e + 4..e + 4 + NAT_ENTRY_SIZE]);
+        if !virtio_blk::write_block(dev, a, &blk) { return None; }
+        n += 1;
+    }
+    let n_sits = (r16(&sit_j, 0) as usize).min((JSZ - 2) / (4 + SIT_ENTRY_SIZE));
+    for k in 0..n_sits {
+        let e = 2 + k * (4 + SIT_ENTRY_SIZE);
+        let seg = r32(&sit_j, e);
+        if seg >= sb.seg_cnt_main { return None; }
+        let a = sb.sit_blkaddr as u64 + (seg / SIT_PER_BLK as u32) as u64;
+        let o = (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE;
+        if !virtio_blk::read_block(dev, a, &mut blk) { return None; }
+        blk[o..o + SIT_ENTRY_SIZE].copy_from_slice(&sit_j[e + 4..e + 4 + SIT_ENTRY_SIZE]);
+        if !virtio_blk::write_block(dev, a, &blk) { return None; }
+        n += 1;
+    }
+    if !virtio_blk::flush(dev) { return None; }
+    Some(n)
+}
+
 fn sit_entry_loc(ms: &MountState, seg: u32) -> (u64, usize) {
     let sit_blkno = ms.sb.sit_blkaddr + seg / SIT_PER_BLK as u32;
     (sit_blkno as u64, (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE)
@@ -3436,6 +3540,8 @@ fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE], logs: &Linux
         || logs[3] != (ms.cp.cur_node_segno, ms.cp.cur_node_blkoff) {
         CP_HEAD_MOVES.fetch_add(1, atomic::Ordering::Relaxed);
     }
+    let own_ver = r64(buf, CP_VER);
+    w64(buf, CP_OWN_VER,        own_ver);
     w32(buf, CP_OWN_HEADS,      ms.cp.cur_data_segno);
     w32(buf, CP_OWN_HEADS + 4,  ms.cp.cur_node_segno);
     w16(buf, CP_OWN_HEADS + 8,  ms.cp.cur_data_blkoff);
@@ -7781,6 +7887,21 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         return None;
     }
 
+    // Lane f2fslayout: a checkpoint Linux's f2fs wrote. Its copy of our
+    // private area (journal header, own heads, orphans) is stale: drop the
+    // journal and take Linux's hot logs as this kernel's heads.
+    let foreign0 = rd0 && cp_is_foreign(&sb, &cp_buf0);
+    let foreign1 = rd1 && cp_is_foreign(&sb, &cp_buf1);
+    for (f, b) in [(foreign0, &mut cp_buf0), (foreign1, &mut cp_buf1)] {
+        if !f { continue; }
+        w32(b, durable::CPJ_MAGIC_OFF, 0);
+        let (ds, ns) = (r32(b, CP_CUR_DATA_SEGNO), r32(b, CP_CUR_NODE_SEGNO));
+        let (db, nb) = (r16(b, CP_CUR_DATA_BLKOFF), r16(b, CP_CUR_NODE_BLKOFF));
+        w32(b, CP_OWN_HEADS, ds);
+        w32(b, CP_OWN_HEADS + 4, ns);
+        w16(b, CP_OWN_HEADS + 8, db);
+        w16(b, CP_OWN_HEADS + 10, nb);
+    }
     let (ver0, mut cp0) = CpInfo::parse_pack(&cp_buf0);
     let (ver1, mut cp1) = CpInfo::parse_pack(&cp_buf1);
     cp0.active_pack = 0;
@@ -7824,6 +7945,18 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     let cp_tail = durable::cp_tail(pbuf);
     let incompat = if durable::cp_block_has_journal(pbuf) { r32(pbuf, durable::CPJ_INCOMPAT_OFF) } else { 0 };
     let unknown = incompat & !durable::CPJ_INCOMPAT_KNOWN;
+    let foreign = if pick1 { foreign1 } else { foreign0 };
+    if foreign {
+        if read_only || unknown != 0 {
+            dbg_str("[F2FS] the newest checkpoint was written by Linux; mount read-write once to import it\n");
+            return None;
+        }
+        let cp_addr = (sb.cp_blkaddr + if pick1 { pack_blks } else { 0 }) as u64;
+        match linux_import(dev_idx, &sb, pbuf, cp_addr) {
+            Some(n) => { dbg_str("[F2FS] imported a Linux checkpoint: "); dbg_dec(n); dbg_str(" SIT/NAT block(s)/entries\n"); }
+            None => { dbg_str("[F2FS] cannot import the Linux checkpoint; not mounting\n"); return None; }
+        }
+    }
     let read_only = if unknown != 0 {
         dbg_str("[F2FS] volume uses unknown features (mask ");
         dbg_dec(unknown as usize);
@@ -7938,7 +8071,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
             dbg_dec(reaped);
             dbg_str("\n");
         }
-        if (recovered > 0 || reaped > 0) && !ms.read_only { write_checkpoint(ms, false); }
+        if (recovered > 0 || reaped > 0 || foreign) && !ms.read_only { write_checkpoint(ms, false); }
         ms.dur.ext_free = durable::count_ext_free(ms);
     }
 

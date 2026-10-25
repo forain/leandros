@@ -479,6 +479,11 @@ def linux_check(v):
     fsmeta = ckpt + sit + nat + rsvd + ssa
     if fsmeta >= segs or fsmeta < 8 or ovp == 0 or rsvd == 0:
         bad.append(f"Wrong layout (fsmeta {fsmeta}, ovp {ovp}, rsvd {rsvd})")
+    # Linux sanity_check_area_boundary: segment_count counts from
+    # segment0_blkaddr and must end where the main area ends.
+    seg0, mainblk = r32(sb, 72), r32(sb, 92)
+    if mainblk + main * bps != seg0 + segs * bps:
+        bad.append(f"Fix alignment: segment_count {segs}, {(mainblk + main * bps - seg0) // bps} laid out")
     user, valid = r64(cp, 8), r64(cp, 16)
     if user == 0 or user >= main * bps:
         bad.append(f"Wrong user_block_count: {user}")
