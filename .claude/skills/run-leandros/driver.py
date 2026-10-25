@@ -370,11 +370,17 @@ def _pick_vnc_port():
     sys.exit("no free VNC port found")
 
 
-def _release_vnc_pick():
+def _release_vnc_pick(wait_bind=True):
+    """Drop the pick lock. With `wait_bind` (QEMU has a -vnc listener), first
+    give QEMU up to 5 s to bind the chosen port. Without a listener nothing
+    ever binds it, and waiting there delayed the serial connect by 5 s: the
+    socket chardev drops output while no client is attached, so a guest that
+    reached "login: " within 5 s left `start` waiting 120 s for a prompt it
+    had already printed ("boot failed", openbugs L12 #68)."""
     global _VNC_PICK_LOCK
     if _VNC_PICK_LOCK is not None:
         deadline = time.time() + 5
-        while _vnc_port_free(VENUS_VNC_PORT) and time.time() < deadline:
+        while wait_bind and _vnc_port_free(VENUS_VNC_PORT) and time.time() < deadline:
             time.sleep(0.1)
         _VNC_PICK_LOCK.close()
         _VNC_PICK_LOCK = None
@@ -1445,7 +1451,7 @@ def cmd_start(arch="aarch64", mode="uefi", venus=False, virgl=False):
             sys.exit(f"ERROR: serial socket did not appear.\nQEMU stderr:\n{err}")
         time.sleep(0.1)
 
-    _release_vnc_pick()
+    _release_vnc_pick(wait_bind="-vnc" in qemu_cmd)
     # Only now is it true that a guest actually started.
     print(f"QEMU started (PID {proc.pid}, arch={arch}{', venus' if venus else ''})")
     print("Serial socket up. Waiting for login/shell prompt (up to 120s)...")
@@ -1453,6 +1459,15 @@ def cmd_start(arch="aarch64", mode="uefi", venus=False, virgl=False):
     # "[INPUT] -> keyboard (event0)" and declared the guest ready ~40 s into a
     # boot that had not yet mounted its root. Only a real prompt counts now.
     text = _read_serial_until(["login: "], timeout=120, at_prompt=True)
+    if text is None:
+        # The serial client may have attached after the prompt went by (the
+        # socket chardev drops unread output); QEMU's own logfile has it all.
+        try:
+            with open(SERIAL_FULL_LOG, "rb") as ff:
+                if b"login: " in ff.read():
+                    text = "login: "
+        except OSError:
+            pass
 
     if text is None:
         # Try to report what QEMU said

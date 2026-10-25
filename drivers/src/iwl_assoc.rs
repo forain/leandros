@@ -475,3 +475,70 @@ pub fn tim_dtim(ies: &[u8]) -> Option<(u8, u8)> {
     }
     None
 }
+
+// ── soft teardown (leaving a BSS without a firmware restart) ────────────────
+
+/// Session-protection time event bookkeeping (Linux's `iwl_mvm_time_event_data`
+/// `running`/`uid`): which unique id, if any, the firmware still runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TeTrack {
+    running: Option<u32>,
+    last_end: Option<u32>,
+}
+
+impl TeTrack {
+    pub const fn new() -> Self { TeTrack { running: None, last_end: None } }
+    /// TIME_EVENT_CMD ADD answered status 0 with `uid`.
+    /// An END already seen for `uid` (dispatched while the response was
+    /// awaited) means it is not running.
+    pub fn on_add(&mut self, uid: u32) {
+        self.running = if self.last_end == Some(uid) { None } else { Some(uid) };
+    }
+    /// TIME_EVENT_NOTIFICATION (unique_id, action, status): an END, or a
+    /// START that failed (status != 1), means the firmware dropped the event
+    /// (iwl_mvm_te_handle_notif -> iwl_mvm_te_clear_data).
+    pub fn on_notif(&mut self, uid: u32, action: u32, status: u32) {
+        let gone = action & 2 != 0 || (action & 1 != 0 && status != 1);
+        if !gone { return; }
+        self.last_end = Some(uid);
+        if self.running == Some(uid) { self.running = None; }
+    }
+    /// The unique id a TIME_EVENT_CMD REMOVE may name (None: nothing to remove).
+    pub fn remove_uid(&self) -> Option<u32> { self.running }
+    pub fn removed(&mut self) { self.running = None; }
+}
+
+/// One firmware command (group) of a soft teardown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeardownStep {
+    /// TXPATH_FLUSH of the station's queues, then wait until they drained.
+    FlushTx,
+    /// SCD_QUEUE_CFG disable of the data (aggregation: ends the TX BA
+    /// session) and management queues.
+    DisableQueues,
+    /// MAC context MODIFY to unassociated, TIME_QUOTA without the binding.
+    MacUnassoc,
+    /// REMOVE_STA of the AP station.
+    RemoveSta,
+    /// TIME_EVENT_CMD REMOVE of a session-protection event still running.
+    RemoveTimeEvent(u32),
+    /// BINDING_CONTEXT REMOVE (MAC off the PHY context).
+    Unbind,
+}
+
+/// The ordered commands that undo an attempt: `bound` (MAC bound to the PHY),
+/// `sta` (AP station added), `te` (TeTrack::remove_uid).
+pub fn teardown_plan(bound: bool, sta: bool, te: Option<u32>) -> Vec<TeardownStep> {
+    use TeardownStep::*;
+    let mut v = Vec::new();
+    // iwlmvm: mac80211 flushes, iwl_mvm_rm_sta flushes + drains and
+    // disables the queues (BA sessions are gone with them), the AP station
+    // is removed only once the MAC is unassociated (firmware refuses it
+    // before), the time event only while running, the binding last.
+    if sta { v.push(FlushTx); v.push(DisableQueues); }
+    if bound { v.push(MacUnassoc); }
+    if sta { v.push(RemoveSta); }
+    if let Some(u) = te { v.push(RemoveTimeEvent(u)); }
+    if bound { v.push(Unbind); }
+    v
+}
