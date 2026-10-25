@@ -47,6 +47,16 @@ pub fn take(key: &str) -> Option<alloc::vec::Vec<u8>> {
     Some(v)
 }
 
+/// Copy the secret stashed under `key` without wiping it. The two in-kernel
+/// consumers of the legacy Wi-Fi credentials (iwlwifi and the netctl legacy
+/// profile) both need it and start in no fixed order; it never leaves the
+/// kernel (/proc/cmdline and the klog stay redacted).
+pub fn peek(key: &str) -> Option<alloc::vec::Vec<u8>> {
+    let s = STASH.lock();
+    let slot = s.iter().find(|x| x.klen != 0 && &x.key[..x.klen] == key.as_bytes())?;
+    Some(slot.val[..slot.vlen].to_vec())
+}
+
 /// Was any secret lifted off the command line (key names only)?
 pub fn stashed_keys(mut f: impl FnMut(&str)) {
     let s = STASH.lock();

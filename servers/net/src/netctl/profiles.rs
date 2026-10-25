@@ -89,7 +89,12 @@ fn legacy(cmdline: &str) -> Option<Profile> {
         }
     }
     let ssid = percent_decode(cmdline_val(cmdline, "wifi.ssid")?);
-    let psk = cmdline_val(cmdline, "wifi.psk").map(percent_decode).unwrap_or_default();
+    // The kernel scrubs wifi.psk= from the stored cmdline at boot and parks
+    // it in drivers::cmdline_secrets (the same source iwlwifi uses).
+    let psk = match drivers::cmdline_secrets::peek("wifi.psk") {
+        Some(v) => percent_decode(core::str::from_utf8(&v).unwrap_or("")),
+        None => cmdline_val(cmdline, "wifi.psk").map(percent_decode).unwrap_or_default(),
+    };
     let p = pf::legacy_profile(&ssid, &psk);
     // Our copies of the secret: wipe them (the profile keeps its own).
     let mut psk = psk;
