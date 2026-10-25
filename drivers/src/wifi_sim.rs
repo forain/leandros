@@ -1232,6 +1232,12 @@ fn selftest_main(level: u32) {
     slog!("selftest: level {} starting", level);
     // Ready: the manager reports DISCONNECTED and the boot scan is in.
     let ready = wait(10_000, || MGR.state().state == wifi_state::DISCONNECTED && MGR.last_scan().is_some());
+    // Uplink Block Ack: a router holding its reorder window at a hole gets
+    // data again within 1 s through our BAR (lane bssidbar, L12 #63).
+    let h = crate::iwl_agg::sim_bar_hole(3, 300_000, true, 3_000);
+    t.check("ba-hole-bar", h.bars > 0 && h.resume_ms.map_or(false, |ms| ms < 1000) && !h.teardown, alloc::format!("{:?}", h));
+    let h = crate::iwl_agg::sim_bar_hole(3, 300_000, false, 3_000);
+    t.check("ba-bar-fail-teardown", h.teardown && h.bars == crate::iwl_agg::BAR_MAX_FAILS as u64, alloc::format!("{:?}", h));
     t.check("ready", ready.is_some(), alloc::format!("state {} after {} ms", wm::state_name(MGR.state().state), now_ms() - t_start));
     if ready.is_none() { finish(t); return; }
 

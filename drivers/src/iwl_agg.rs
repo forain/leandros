@@ -22,6 +22,21 @@
 //!   least once before giving up on it, so failures arrive as single TX
 //!   responses; for those mac80211 sends a BAR so the AP's reorder buffer
 //!   does not wait for the frame (IEEE80211_TX_STAT_AMPDU_NO_BACK).
+//! * Block Ack Requests (lane bssidbar, L12 #63). Linux trusts the firmware
+//!   here: iwl_mvm_tx_reclaim marks every frame a BA notification reclaims
+//!   as acked, and only single-frame failures (AMPDU_NO_BACK) get a BAR,
+//!   SSN = failed SN + 1, from mac80211; a BAR that is not acked is kept
+//!   pending and re-sent after the next successful transmission
+//!   (ieee80211_set_bar_pending / ieee80211_check_pending_bar). A router
+//!   (84:78:48:d8:7e:79) held its reorder window at a hole after a burst of
+//!   partially acked A-MPDUs and dropped everything above it until it
+//!   deauthenticated us 5 min later, with no single failure and no BAR. So we
+//!   also send a BAR after a partial BA, with SSN = the SN of the BA's
+//!   scd_ssn: the first frame the firmware has not finished, so the BAR
+//!   never skips a frame still being retried, only closes holes below it.
+//!   BARs are rate limited (BAR_MIN_INTERVAL_MS), a failed one is retried,
+//!   and after BAR_MAX_FAILS unacked BARs in a row the session is torn down
+//!   (DELBA, as 802.11-2016 10.24.7 allows) and renegotiated later.
 //! * A DELBA from the AP (recipient) ends the session; tid_disable_tx is
 //!   set again. A missing ADDBA response (1 s) is retried twice, 10 s apart.
 
@@ -39,6 +54,12 @@ pub const LQ_AGG_FRAME_LIMIT_MAX: u8 = 63;
 pub const ADDBA_TIMEOUT_MS: u64 = 1000;
 pub const ADDBA_RETRY_MS: u64 = 10_000;
 pub const ADDBA_MAX_TRIES: u32 = 3;
+/// At most one BAR per this interval (a lossy burst gives many partial BAs).
+pub const BAR_MIN_INTERVAL_MS: u64 = 50;
+/// A BAR whose TX status never came counts as failed after this long.
+pub const BAR_STATUS_TIMEOUT_MS: u64 = 1000;
+/// Unacknowledged BARs in a row after which the session is torn down.
+pub const BAR_MAX_FAILS: u32 = 3;
 
 /// BA_NOTIF (REPLY_COMPRESSED_BA, struct iwl_mvm_ba_notif, 28 bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +126,12 @@ pub struct AggStats {
     pub ba_txed: u64,
     pub ba_acked: u64,
     pub bars_sent: u64,
+    /// BA notifications that acked fewer frames than were sent.
+    pub ba_partial: u64,
+    /// BARs the AP did not acknowledge (or whose status never came).
+    pub bars_failed: u64,
+    /// Sessions we ended because BARs kept failing.
+    pub bar_teardowns: u64,
     /// Frames on the aggregation TID that failed alone (a BAR follows).
     pub single_fail: u64,
     /// Frames whose sequence number did not match the ring index (the
@@ -120,12 +147,28 @@ pub struct TxAgg {
     pub tries: u32,
     pub next_try_ms: u64,
     next_dialog: u8,
+    /// SSN a BAR should carry (a hole to close), not sent yet.
+    bar_want: Option<u16>,
+    /// The BAR on air (SSN, sent at), waiting for its TX status.
+    bar_inflight: Option<(u16, u64)>,
+    last_bar_ms: Option<u64>,
+    bar_fails: u32,
     pub st: AggStats,
 }
 
+/// The sequence number of ring index `idx` on the aggregation queue, from
+/// the next sequence number to assign (the numbering keeps SN = index mod
+/// 256, see tx_data).
+pub fn sn_of_index(next_sn: u16, idx: u16) -> u16 {
+    next_sn.wrapping_sub(next_sn.wrapping_sub(idx) & 0xff) & 0xfff
+}
+
+fn sn_before(a: u16, b: u16) -> bool { (a.wrapping_sub(b) & 0xfff) > 0x800 }
+
 impl TxAgg {
     pub fn new(enabled: bool) -> TxAgg {
-        TxAgg { state: AggState::Off, enabled, tries: 0, next_try_ms: 0, next_dialog: 1, st: AggStats::default() }
+        TxAgg { state: AggState::Off, enabled, tries: 0, next_try_ms: 0, next_dialog: 1, bar_want: None, bar_inflight: None,
+                last_bar_ms: None, bar_fails: 0, st: AggStats::default() }
     }
 
     /// A new association: no session, tries reset (counters kept).
@@ -133,6 +176,14 @@ impl TxAgg {
         self.state = AggState::Off;
         self.tries = 0;
         self.next_try_ms = 0;
+        self.clear_bar();
+    }
+
+    fn clear_bar(&mut self) {
+        self.bar_want = None;
+        self.bar_inflight = None;
+        self.last_bar_ms = None;
+        self.bar_fails = 0;
     }
 
     /// A new association with TX aggregation `enabled` or not.
@@ -215,11 +266,79 @@ impl TxAgg {
         self.st.agg_max = self.st.agg_max.max(frames);
     }
 
-    pub fn on_ba(&mut self, n: &BaNotif) {
+    /// A BA notification; `next_sn` is the next sequence number to assign.
+    /// A partial BA (or an open hole) asks for a BAR at the SN of scd_ssn.
+    pub fn on_ba(&mut self, n: &BaNotif, next_sn: u16) {
         self.st.ba_notifs += 1;
         self.st.ba_txed += n.txed as u64;
         self.st.ba_acked += n.txed_2_done as u64;
+        let partial = n.txed_2_done < n.txed;
+        if partial { self.st.ba_partial += 1; }
+        if self.on() && (partial || self.bar_want.is_some()) {
+            self.want_bar(sn_of_index(next_sn, n.scd_ssn));
+        }
     }
+
+    /// A frame of the session failed alone (sequence number `sn`): the AP's
+    /// window must move past it (mac80211, AMPDU_NO_BACK: SSN = SN + 1).
+    pub fn on_single_fail(&mut self, sn: u16) {
+        self.st.single_fail += 1;
+        if self.on() { self.want_bar((sn + 1) & 0xfff); }
+    }
+
+    fn want_bar(&mut self, ssn: u16) {
+        self.bar_want = Some(match self.bar_want { Some(w) if sn_before(ssn, w) => w, _ => ssn });
+    }
+
+    /// The BAR to send now, if one is due (and the previous one is done).
+    pub fn next_bar(&mut self, now: u64) -> Option<u16> {
+        if !self.on() { return None; }
+        if let Some((ssn, at)) = self.bar_inflight {
+            if now.saturating_sub(at) < BAR_STATUS_TIMEOUT_MS { return None; }
+            // No TX status: count it as a failure (the teardown follows from
+            // on_bar_status at the next one).
+            self.bar_inflight = None;
+            self.st.bars_failed += 1;
+            self.bar_fails += 1;
+            self.want_bar(ssn);
+        }
+        let ssn = self.bar_want?;
+        if self.last_bar_ms.map_or(false, |t| now.saturating_sub(t) < BAR_MIN_INTERVAL_MS) { return None; }
+        self.bar_want = None;
+        self.bar_inflight = Some((ssn, now));
+        self.last_bar_ms = Some(now);
+        self.st.bars_sent += 1;
+        Some(ssn)
+    }
+
+    /// The BAR could not be queued: keep it wanted.
+    pub fn bar_not_sent(&mut self) {
+        if let Some((ssn, _)) = self.bar_inflight.take() { self.st.bars_sent -= 1; self.want_bar(ssn); }
+    }
+
+    /// The BAR's TX status. True when the session must be torn down now
+    /// (BAR_MAX_FAILS in a row): the state is already Off and a new ADDBA
+    /// may follow after ADDBA_RETRY_MS; the caller sends the DELBA.
+    pub fn on_bar_status(&mut self, acked: bool, now: u64) -> bool {
+        let (ssn, _) = match self.bar_inflight.take() { Some(b) => b, None => return false };
+        if acked { self.bar_fails = 0; return false; }
+        self.st.bars_failed += 1;
+        self.bar_fails += 1;
+        if self.bar_fails >= BAR_MAX_FAILS && self.on() {
+            self.st.bar_teardowns += 1;
+            self.state = AggState::Off;
+            self.next_try_ms = now + ADDBA_RETRY_MS;
+            self.tries = 0;
+            self.clear_bar();
+            return true;
+        }
+        // Retried after the next transmission (ieee80211_set_bar_pending).
+        self.want_bar(ssn);
+        false
+    }
+
+    /// Whether a BAR's TX status is awaited.
+    pub fn bar_inflight(&self) -> bool { self.bar_inflight.is_some() }
 
     pub fn line(&self) -> String {
         let s = &self.st;
@@ -230,8 +349,101 @@ impl TxAgg {
             AggState::On { buf } => format!("on win{}", buf),
         };
         let avg10 = if s.agg_rsps > 0 { s.agg_frames * 10 / s.agg_rsps } else { 0 };
-        format!("{}; addba {} accepted {} refused {} (last status {}) timeouts {} delba {}; ampdu {} frames {} avg {}.{} max {}; ba {} txed {} acked {}; single_fail {} bars {} misaligned {}",
+        format!("{}; addba {} accepted {} refused {} (last status {}) timeouts {} delba {}; ampdu {} frames {} avg {}.{} max {}; ba {} txed {} acked {}; single_fail {} partial {} bars {} bar_fail {} bar_teardown {} misaligned {}",
                 state, s.addba_sent, s.accepted, s.refused, s.last_refusal, s.timeouts, s.delba_rx, s.agg_rsps, s.agg_frames,
-                avg10 / 10, avg10 % 10, s.agg_max, s.ba_notifs, s.ba_txed, s.ba_acked, s.single_fail, s.bars_sent, s.misaligned)
+                avg10 / 10, avg10 % 10, s.agg_max, s.ba_notifs, s.ba_txed, s.ba_acked, s.single_fail, s.ba_partial, s.bars_sent, s.bars_failed,
+                s.bar_teardowns, s.misaligned)
     }
+}
+
+/// Outcome of [`sim_bar_hole`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HoleSim {
+    /// Time (ms) from the hole to the first in-order delivery past it.
+    pub resume_ms: Option<u64>,
+    pub delivered: u64,
+    /// Frames the recipient dropped (beyond its stuck window).
+    pub dropped: u64,
+    pub bars: u64,
+    pub teardown: bool,
+}
+
+/// Uplink Block Ack guard (lane bssidbar, L12 #63; wifisim `ba-hole-bar`
+/// and drivers/iwlwifi-tests). Our TxAgg is the originator; the "firmware"
+/// sends A-MPDUs of up to 16 frames every 2 ms within a 64-frame scheduler
+/// window and, in the burst at 100 ms, gives up on `lost` subframes
+/// silently (never block acked, reclaimed by the next BA's scd_ssn: the
+/// partial BAs seen on the laptop). The recipient behaves like the router:
+/// it holds its reorder window at a hole until a BAR moves it, or for
+/// `hold_ms`, and drops (after the MAC ACK) every frame beyond the window.
+/// The sender is ACK clocked, so a stuck window stalls it (no SN wrap).
+/// `bar_acked` false: the AP never acks a BAR. Runs `run_ms` of sim time.
+pub fn sim_bar_hole(lost: u16, hold_ms: u64, bar_acked: bool, run_ms: u64) -> HoleSim {
+    let mut a = TxAgg::new(true);
+    a.poll_request(0, true, true, true, 0);
+    a.on_addba_resp(1, 0, AGG_TID, AGG_WINDOW, 0);
+    let mut r = HoleSim::default();
+    let (mut next_sn, mut fw_head) = (0u16, 0u16); // fw_head: first frame not finished
+    let (mut rx_head, mut rx_got) = (0u16, [false; 4096]);
+    let mut hole_at: Option<(u64, u16)> = None; // (when, first lost SN)
+    let mut held_since: Option<u64> = None;
+    let (mut now, mut sent) = (0u64, 0u64);
+    while now < run_ms {
+        // Keep the 64-frame scheduler window full, as a bulk TCP flow with
+        // 256 packets in flight does (it stalls when nothing is delivered).
+        while next_sn.wrapping_sub(fw_head) & 0xfff < AGG_WINDOW && sent < r.delivered + 256 {
+            next_sn = (next_sn + 1) & 0xfff;
+            sent += 1;
+        }
+        if !a.on() { r.teardown = true; break; }
+        // One A-MPDU of up to 16 frames from the window start.
+        let n = (next_sn.wrapping_sub(fw_head) & 0xfff).min(16);
+        let lose = now == 100;
+        let mut done = 0u8;
+        for i in 0..n {
+            let sn = (fw_head + i) & 0xfff;
+            if lose && i >= 4 && i < 4 + lost {
+                if hole_at.is_none() { hole_at = Some((now, sn)); }
+                continue;
+            }
+            done += 1;
+            // Recipient: inside the window -> buffered/delivered, else dropped.
+            if sn.wrapping_sub(rx_head) & 0xfff >= AGG_WINDOW { r.dropped += 1; continue; }
+            rx_got[sn as usize] = true;
+        }
+        fw_head = (fw_head + n) & 0xfff; // all finished (the lost ones given up)
+        let ba = BaNotif { sta_addr: [0; 6], sta_id: 0, tid: AGG_TID, seq_ctl: 0, bitmap: 0, scd_flow: 0,
+                           scd_ssn: fw_head & 0xff, txed: n as u8, txed_2_done: done, reduced_txp: 0 };
+        if n > 0 { a.on_ba(&ba, next_sn); }
+        if let Some(ssn) = a.next_bar(now) {
+            r.bars += 1;
+            if bar_acked {
+                if ssn.wrapping_sub(rx_head) & 0xfff < 0x800 {
+                    while rx_head != ssn { rx_got[rx_head as usize] = false; rx_head = (rx_head + 1) & 0xfff; }
+                }
+            }
+            if a.on_bar_status(bar_acked, now) { r.teardown = true; break; }
+        }
+        // In-order release; a hole is held for hold_ms.
+        loop {
+            if rx_got[rx_head as usize] {
+                rx_got[rx_head as usize] = false;
+                r.delivered += 1;
+                if let Some((t, hsn)) = hole_at {
+                    if r.resume_ms.is_none() && rx_head.wrapping_sub(hsn) & 0xfff < 0x800 { r.resume_ms = Some(now - t); }
+                }
+                rx_head = (rx_head + 1) & 0xfff;
+                held_since = None;
+                continue;
+            }
+            let waiting = (1..AGG_WINDOW).any(|k| rx_got[((rx_head + k) & 0xfff) as usize]);
+            if !waiting { break; }
+            let t = *held_since.get_or_insert(now);
+            if now - t < hold_ms { break; }
+            rx_head = (rx_head + 1) & 0xfff;
+            held_since = None;
+        }
+        now += 2;
+    }
+    r
 }
