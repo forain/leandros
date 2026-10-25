@@ -317,7 +317,8 @@ def main():
                 print(f"  {n}: cmd={cmd!r}")
                 print(f"    output: {block!r}")
     print("Smoke-tested only (not behaviorally asserted):", sorted(smoke_names))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

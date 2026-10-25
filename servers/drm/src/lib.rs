@@ -212,7 +212,8 @@ fn render_node_version(arg: usize) -> Message {
 ///     ioctls, no syncobj handler returns either for any other reason, and the
 ///     syncobj table is consulted BEFORE the master one.
 ///
-/// Everything else keeps the historical -1, deliberately.
+/// Everything else keeps the historical -1, deliberately (InvalidParameter
+/// is EINVAL on every path, as on Linux).
 fn drm_errno(cmd: u32, e: drivers::DriverError) -> i32 {
     use drivers::DriverError as E;
     // An exact errno chosen by the handler (a GPU backend's UAPI, whose
@@ -272,6 +273,9 @@ fn drm_errno(cmd: u32, e: drivers::DriverError) -> i32 {
         E::Access    => -13, // EACCES
         E::Busy      => -16, // EBUSY
         E::NotMaster => -22, // EINVAL
+        // Linux answers a bad argument with EINVAL; EPERM (-1) made callers
+        // read a malformed request as a permission problem (openbugs #88).
+        E::InvalidParameter => -22, // EINVAL
         _            => -1,
     }
 }
