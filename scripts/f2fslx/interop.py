@@ -481,15 +481,53 @@ FSYNC_SCENARIOS = [
               'getfattr -n user.big --only-values keep/k | md5sum > ../xa.md5', "k big"),
     ("rename", "echo moved > keep/r0; sync; sleep 1; sync; mv keep/r0 keep/r1; fs keep/r1", "k big r1"),
     ("newdir", "mkdir keep/nd; echo indir > keep/nd/f; fs keep/nd/f", "k big nd/f"),
+    # Linux check_index_in_prev_nodes: pa is checkpointed, then pb is fsynced and the image is forged so
+    # that pb's chained inode points its first block at pa's first block (Linux itself will not reuse a
+    # checkpoint-valid block before the next checkpoint, so the overlap cannot be produced honestly).
+    # LeandrOS must drop pa's stale pointer: pa reads a hole there, pb reads pa's old block, fsck rc 0.
+    ("prevowner", "head -c 1048576 /dev/urandom > keep/pa; sync; sleep 1; sync\n"
+                  "head -c 40960 /dev/urandom > keep/pb; fs keep/pb\n"
+                  "{ head -c 4096 keep/pa; tail -c +4097 keep/pb; } | md5sum | awk '{print $1\"  pb\"}' > ../EXP\n"
+                  "{ head -c 4096 /dev/zero; tail -c +4097 keep/pa; } | md5sum | awk '{print $1\"  pa\"}' >> ../EXP", "k big", "forge_prevowner"),
 ]
 
 
+def forge_prevowner(img):
+    """Point the newest 'pb' inode's i_addr[0] at the newest 'pa' inode's i_addr[0]."""
+    best = {}
+    with open(img, "rb") as f:
+        n = os.path.getsize(img) // 4096
+        for i in range(n):
+            f.seek(i * 4096)
+            b = f.read(4096)
+            nid, ino = struct.unpack_from("<II", b, 4072)
+            if nid < 3 or nid != ino or b[88:92] != b"\x02\0\0\0" or b[92:94] not in (b"pa", b"pb"):
+                continue
+            ver = struct.unpack_from("<Q", b, 4084)[0]
+            k = b[92:94]
+            if k not in best or ver > best[k][0]:
+                best[k] = (ver, i, b)
+        if b"pa" not in best or b"pb" not in best:
+            return False
+        a0 = struct.unpack_from("<I", best[b"pa"][2], 360)[0]
+        if a0 == 0:
+            return False
+        bb = bytearray(best[b"pb"][2])
+        struct.pack_into("<I", bb, 360, a0)
+        bb[348:360] = bytes(12)  # drop pb's i_ext hint, which still describes its old block
+        f.close()
+    with open(img, "r+b") as f:
+        f.seek(best[b"pb"][1] * 4096)
+        f.write(bytes(bb))
+    return True
+
+
 def direction_fsync(tmp):
-    for name, ops, files in FSYNC_SCENARIOS:
-        fsync_scenario(tmp, name, ops, files)
+    for name, ops, files, *forge in FSYNC_SCENARIOS:
+        fsync_scenario(tmp, name, ops, files, globals()[forge[0]] if forge else None)
 
 
-def fsync_scenario(tmp, name, ops, files):
+def fsync_scenario(tmp, name, ops, files, forge=None):
     """Linux roll-forward (recover_fsync_data): after a checkpoint, files are created
     and fsynced on the box (new files with a DENT mark, an in-place overwrite
     of a checkpointed file) and the backing image is copied while still mounted
@@ -505,7 +543,7 @@ sudo mount -o loop f.img m; cd m; sudo chown $(id -u) .
 mkdir keep; echo keepme > keep/k; head -c 600000 /dev/urandom > keep/big; sync; sleep 1; sync
 fs() {{ python3 -c "import os,sys; f=os.open(sys.argv[1], os.O_RDONLY); os.fsync(f)" "$1"; }}
 {ops}
-( cd keep && md5sum {files} | dd of=../MANIFEST conv=fsync 2>/dev/null )
+( cd keep && {{ md5sum {files}; cat ../EXP 2>/dev/null || true; }} | dd of=../MANIFEST conv=fsync 2>/dev/null )
 cp ../f.img ../snap.img; cd ..; sudo umount m; mv snap.img f.img; echo SNAP_OK"""
     rc, out = box(script)
     if not step(v, "D.linux-fsync", rc == 0 and "SNAP_OK" in out, "box: files created+fsynced after a checkpoint, image copied mounted" if rc == 0 else out.strip()[-120:]):
@@ -513,6 +551,8 @@ cp ../f.img ../snap.img; cd ..; sudo umount m; mv snap.img f.img; echo SNAP_OK""
     try:
         if not fetch(f"{rd}/f.img", img):
             step(v, "D.ship", False, "fetch failed"); return
+        if forge is not None and not step(v, "D.forge", forge(img), "forged: pb's first block now also pa's"):
+            return
         fl = cp_flags(img)
         if not step(v, "D.unclean-cp", not fl & 1, "newest checkpoint has no CP_UMOUNT_FLAG" if not fl & 1 else "clean checkpoint"):
             return
