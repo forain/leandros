@@ -1265,6 +1265,20 @@ fn selftest_main(level: u32) {
     t.check("scan-while-connected", s.map_or(false, |(_, i)| i.flags & scan_flags::COALESCED == 0) && MGR.state().state == wifi_state::CONNECTED,
             alloc::format!("{:?} state {}", s.map(|(ms, i)| (ms, i.flags)), wm::state_name(MGR.state().state)));
 
+    // 7b. Two explicit user scans (netctl's flags) while associated are both
+    // fresh: the scan generation advances each time.
+    {
+        let ufo = netctl_abi::scan_req_flags::USER & netctl_abi::scan_req_flags::FORCE != 0;
+        msleep(2_100);
+        let g0 = MGR.last_scan().map_or(0, |i| i.scan_gen);
+        let a = scan(ufo, &[]);
+        msleep(2_100);
+        let b = scan(ufo, &[]);
+        let (ga, gb) = (a.map_or(0, |x| x.1.scan_gen), b.map_or(0, |x| x.1.scan_gen));
+        t.check("scan-user-twice-connected", ga != g0 && gb != ga && MGR.state().state == wifi_state::CONNECTED,
+                alloc::format!("gen {} -> {} -> {}", g0, ga, gb));
+    }
+
     // 8. Disconnect: DISCONNECTED(user) well within 2 s, autoconnect blocked.
     let ms = disconnect(true);
     let st = MGR.state();

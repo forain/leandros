@@ -56,10 +56,10 @@
 //!                           (flush, unassociated MAC context, REMOVE_STA,
 //!                           unbind); the default tears down and falls back to
 //!                           a restart on any error
-//!   iwlwifi.scanconn=1      (mgr=1) scan while associated (UMAC scan on the
-//!                           associated MAC, as iwlmvm does); default 0: scan
-//!                           requests while associated are answered from the
-//!                           cache
+//!   iwlwifi.scanconn=0      (mgr=1) do not scan while associated (default 1:
+//!                           UMAC scan on the associated MAC, as iwlmvm does);
+//!                           with 0 scan requests while associated are
+//!                           answered from the cache
 //!   iwlwifi.rc=0            no rate control: the fixed LQ table (every AP
 //!                           rate fastest first, two tries each, antenna A);
 //!                           default 1: `iwl_rs` (Linux rs.c, legacy rates)
@@ -1248,7 +1248,7 @@ pub fn init(cmdline: &str) {
         psk: crate::cmdline_secrets::peek("wifi.psk").map(|v| percent_decode(core::str::from_utf8(&v).unwrap_or(""))),
         mgr: cmdline_val(cmdline, "iwlwifi.mgr") == Some("1"),
         softdisc: cmdline_val(cmdline, "iwlwifi.softdisc") != Some("0"),
-        scanconn: cmdline_val(cmdline, "iwlwifi.scanconn") == Some("1"),
+        scanconn: cmdline_val(cmdline, "iwlwifi.scanconn") != Some("0"),
     };
     RC_ON.store(cmdline_val(cmdline, "iwlwifi.rc") != Some("0"), Ordering::Relaxed);
     TXANT.store(match cmdline_val(cmdline, "iwlwifi.txant") {
