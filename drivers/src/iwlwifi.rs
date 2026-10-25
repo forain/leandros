@@ -1245,7 +1245,7 @@ pub fn init(cmdline: &str) {
         ssid: cmdline_val(cmdline, "wifi.ssid").map(percent_decode),
         // Deprecated: the kernel lifts `wifi.psk=` off its stored command
         // line at boot (drivers::cmdline_secrets); it is never in `cmdline`.
-        psk: crate::cmdline_secrets::take("wifi.psk").map(|v| percent_decode(core::str::from_utf8(&v).unwrap_or(""))),
+        psk: crate::cmdline_secrets::peek("wifi.psk").map(|v| percent_decode(core::str::from_utf8(&v).unwrap_or(""))),
         mgr: cmdline_val(cmdline, "iwlwifi.mgr") == Some("1"),
         softdisc: cmdline_val(cmdline, "iwlwifi.softdisc") != Some("0"),
         scanconn: cmdline_val(cmdline, "iwlwifi.scanconn") == Some("1"),
