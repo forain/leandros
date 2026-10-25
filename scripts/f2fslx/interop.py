@@ -347,34 +347,38 @@ set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"
         box(f"rm -rf {rd}")
     if not imgs:
         return
-    cmds = []
-    for v in imgs:
-        cmds += [MNT.format(l=v), md5chk(v, "MANIFEST"),
-                 f"echo leandros > /mnt/{v}/ours.txt && cat /mnt/{v}/ours.txt; echo WRITE_RC=$?; sync",
-                 INLW.format(l=v), XA.format(l=v)] + ([BIGD.format(l=v)] if v in BIGDIR else []) + [
-                 f"umount /mnt/{v}; echo UMOUNT_RC=$?"]
-    outs = guest([os.path.join(tmp, v + ".img") for v in imgs], cmds, "A")
-    for i, v in enumerate(imgs):
-        if outs is None:
-            step(v, "A.mount", False, "guest run failed"); continue
-        st = 6 + (1 if v in BIGDIR else 0)
-        row = outs[sum(6 + (1 if x in BIGDIR else 0) for x in imgs[:i]):][:st]
-        m, md, w, il, xa = row[:5]; u = row[-1]; bd = row[5] if v in BIGDIR else ""
-        mounted = "MNT_RW" in m or "MNT_RO" in m
-        step(v, "A.mount", mounted, "mounted" if mounted else "mount failed")
-        if not mounted:
-            for s_ in ("A.md5", "A.write", "A.ro-unchanged"):
-                step(v, s_, False, "not mounted")
-            continue
-        step(v, "A.md5", md5_ok(md), "MANIFEST ok" if md5_ok(md) else md.strip()[-100:])
-        wok = "WRITE_RC=0" in w and "leandros" in w
-        step(v, "A.write", wok, "write ok" if wok else "write refused (ro/EROFS)" if "Read-only" in w else "write failed")
-        if wok:
-            skip(v, "A.ro-unchanged", "volume was written")
-            inline_verify(v, tmp, il, xa, bd)
-        else:
-            same = shas[v] is None or sha(os.path.join(tmp, v + ".img")) == shas[v]
-            step(v, "A.ro-unchanged", same, "image bit-identical" if same else "image CHANGED by refused write/ro mount")
+    # at most 4 disks per guest boot: 8 attached virtio-blk disks left the last three unmounted
+    allimgs = imgs
+    for ci in range(0, len(allimgs), 4):
+        imgs = allimgs[ci:ci + 4]
+        cmds = []
+        for v in imgs:
+            cmds += [MNT.format(l=v), md5chk(v, "MANIFEST"),
+                     f"echo leandros > /mnt/{v}/ours.txt && cat /mnt/{v}/ours.txt; echo WRITE_RC=$?; sync",
+                     INLW.format(l=v), XA.format(l=v)] + ([BIGD.format(l=v)] if v in BIGDIR else []) + [
+                     f"umount /mnt/{v}; echo UMOUNT_RC=$?"]
+        outs = guest([os.path.join(tmp, v + ".img") for v in imgs], cmds, "A")
+        for i, v in enumerate(imgs):
+            if outs is None:
+                step(v, "A.mount", False, "guest run failed"); continue
+            st = 6 + (1 if v in BIGDIR else 0)
+            row = outs[sum(6 + (1 if x in BIGDIR else 0) for x in imgs[:i]):][:st]
+            m, md, w, il, xa = row[:5]; u = row[-1]; bd = row[5] if v in BIGDIR else ""
+            mounted = "MNT_RW" in m or "MNT_RO" in m
+            step(v, "A.mount", mounted, "mounted" if mounted else "mount failed")
+            if not mounted:
+                for s_ in ("A.md5", "A.write", "A.ro-unchanged"):
+                    step(v, s_, False, "not mounted")
+                continue
+            step(v, "A.md5", md5_ok(md), "MANIFEST ok" if md5_ok(md) else md.strip()[-100:])
+            wok = "WRITE_RC=0" in w and "leandros" in w
+            step(v, "A.write", wok, "write ok" if wok else "write refused (ro/EROFS)" if "Read-only" in w else "write failed")
+            if wok:
+                skip(v, "A.ro-unchanged", "volume was written")
+                inline_verify(v, tmp, il, xa, bd)
+            else:
+                same = shas[v] is None or sha(os.path.join(tmp, v + ".img")) == shas[v]
+                step(v, "A.ro-unchanged", same, "image bit-identical" if same else "image CHANGED by refused write/ro mount")
 
 
 def f2fs_crc(d):
