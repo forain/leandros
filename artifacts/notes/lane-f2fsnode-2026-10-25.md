@@ -30,8 +30,17 @@ format of main's root and /home volumes unchanged.
 - `cp /bin/brush /home/b`: cksum is identical (2323322844, 6140688 bytes).
 - 40 files created in /home/d, `ls | wc -l` = 40, and the contents read back after `sync`.
 
-## Gates (aarch64, d2a6fe12 + main 2f3cd221)
-RED/UNRUN: every runtests boot gives up at driver.py start (prompt not detected), on the legacy root too; see handoff. compat old: fsck PASS but write 0/4 marks.
+## Gates (aarch64, rebuilt on main b8a9ef77 incl. harness fix #68): ALL GREEN
+- f2fscrashtest seed 1792903575: PASS; random seed (r1): PASS.
+- f2fscptest, f2fsorphantest, f2fsgctest (host:): PASS.
+- compat.sh old: write/verify marks all present, lane and main fsck PASS before/after/final.
+- lx /home data volume (--lx --reset): mounts as lxnode1, cp+cksum of /bin/brush identical, 40 files read back.
+- full aarch64 regress: PASS (boots failed 0/1).
+- The earlier boot failures were harness bug #68 (serial attached 5 s late), not the kernel.
+
+## Status
+- lx is OPT-IN (mkfs-f2fs-home.py --lx); root and /home stay legacy by default.
+- Linux 7.2.7 mounts lx images read-write.
 
 ## Remaining open: fsck.f2fs cleanliness needs a mkfs/allocator redesign, not a patch
 - mkfs (home and populated) puts inodes AND dentry data in main segment 0 (`used = 2*n`).
@@ -43,3 +52,6 @@ RED/UNRUN: every runtests boot gives up at driver.py start (prompt not detected)
 - Not yet run: a Linux-written lx image mounting on LeandrOS (`linux_import gave up at <step>`
   labels are in place; run $SP/f2fsnode/proof.sh box on the KVM box).
 - lx root image login failure, above.
+
+- Superseded: the lx-root login-failure claim above was a boot-detection artifact (harness #68); lx root was not re-tested.
+- Still open: fsck.f2fs cleanliness (mkfs/allocator redesign: SSA, SIT types, cursegs) and LeandrOS mounting a Linux-written lx image.
