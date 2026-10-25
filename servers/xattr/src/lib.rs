@@ -56,6 +56,7 @@ pub const IDX_USER: u8 = 1;
 pub const IDX_ACL_ACCESS: u8 = 2; // full name "system.posix_acl_access", empty suffix
 pub const IDX_ACL_DEFAULT: u8 = 3; // full name "system.posix_acl_default", empty suffix
 pub const IDX_TRUSTED: u8 = 4;
+pub const IDX_SECURITY: u8 = 6;
 
 pub const ACL_ACCESS_NAME: &[u8] = b"system.posix_acl_access";
 pub const ACL_DEFAULT_NAME: &[u8] = b"system.posix_acl_default";
@@ -146,6 +147,8 @@ pub fn split_name(full: &[u8]) -> Option<(u8, &[u8])> {
         Some((IDX_ACL_DEFAULT, b""))
     } else if let Some(suf) = full.strip_prefix(b"trusted.") {
         Some((IDX_TRUSTED, suf))
+    } else if let Some(suf) = full.strip_prefix(b"security.") {
+        Some((IDX_SECURITY, suf))
     } else {
         None
     }
@@ -159,6 +162,7 @@ pub fn join_name(idx: u8, suf: &[u8], out: &mut [u8]) -> Option<usize> {
         IDX_ACL_ACCESS => ACL_ACCESS_NAME,
         IDX_ACL_DEFAULT => ACL_DEFAULT_NAME,
         IDX_TRUSTED => b"trusted.",
+        IDX_SECURITY => b"security.",
         _ => return None,
     };
     let total = prefix.len() + suf.len();
@@ -330,6 +334,7 @@ pub fn remove(arena: &mut [u8], idx: u8, suf: &[u8]) -> Result<usize, i32> {
 //            read/write file permission (ACL-aware) applies.
 //   system.posix_acl_*  reads are unrestricted; writes need owner-or-root;
 //            default ACLs only on directories; never on symlinks.
+//   security.* readable by all, writable by root (CAP_SYS_ADMIN/CAP_SETFCAP).
 //   trusted.* root only; hidden (ENODATA / filtered) from others.
 
 /// Gate for getxattr. `acl` = the stored access ACL, if any.
@@ -346,6 +351,7 @@ pub fn may_read_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>)
             }
         }
         IDX_ACL_ACCESS | IDX_ACL_DEFAULT => Ok(()),
+        IDX_SECURITY => Ok(()), // readable by all, on any inode type
         IDX_TRUSTED => {
             if cred.euid == 0 {
                 Ok(())
@@ -359,6 +365,11 @@ pub fn may_read_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>)
 
 /// Gate for setxattr/removexattr.
 pub fn may_write_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>) -> Result<(), i32> {
+    if idx == IDX_SECURITY {
+        // security.* (incl. security.capability, CAP_SETFCAP): root only,
+        // allowed on every inode type (labels on symlinks are legal).
+        return if cred.euid == 0 { Ok(()) } else { Err(EPERM) };
+    }
     if is_lnk(meta.mode) {
         return Err(EPERM); // no user.* and no ACLs on symlinks
     }
