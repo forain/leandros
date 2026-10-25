@@ -22,7 +22,7 @@ env: CS_REPO (worktree) CS_OUT (output dir) CS_ARCH [CS_GPU=virgl]
 out: results.json, events.log, serial.log (host-timestamped, nothing dropped),
      host-cpu.log, dump-<step>.txt, <step>-shown.png
 """
-import os, sys, time, select, threading, subprocess, re, json, platform, collections
+import os, sys, time, select, signal, threading, subprocess, re, json, platform, collections
 
 REPO = os.environ["CS_REPO"]
 OUT = os.environ["CS_OUT"]
@@ -376,18 +376,84 @@ def portal(step):
     return r
 
 
+QPID = None      # this run's QEMU, once started
+STARTED = False  # a start was attempted (it may have timed out with QEMU up)
+SER = None
+
+
+def _kill_qemu(why):
+    """Stop this run's QEMU on every exit path (lane/blkdead, openbugs L12 #51).
+    Until 2026-10-25 an exception (a failed login: "no shell prompt within
+    20s") or a signal left it running, holding the image lock and the VNC
+    port, so later runs of either arch failed to start."""
+    global QPID, STARTED
+    if not STARTED:
+        return  # never started one (e.g. another run already holds this id)
+    STARTED = False
+    qpid, QPID = QPID, None
+    if SER is not None:
+        SER.stop = True
+    try:
+        log("stop", why, drv("stop", timeout=90)[-100:])
+    except Exception as e:
+        log("stop failed", repr(e))
+    if qpid is None:
+        return
+    try:
+        os.kill(qpid, 0)
+    except OSError:
+        return
+    log("qemu", qpid, "survived driver stop; killing")
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(qpid, sig)
+        except OSError:
+            return
+        for _ in range(50):
+            try:
+                os.kill(qpid, 0)
+            except OSError:
+                return
+            time.sleep(0.1)
+
+
+def _on_signal(signum, _frame):
+    raise SystemExit(128 + signum)  # unwinds into main()'s finally
+
+
 def main():
+    for sg in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sg, _on_signal)
+    ok = False
+    try:
+        _main()
+        ok = True
+    finally:
+        # CS_KEEP=1 keeps the VM of a successful run only.
+        if not (ok and os.environ.get("CS_KEEP") == "1"):
+            _kill_qemu("ok" if ok else "after failure")
+
+
+def _main():
+    global QPID, STARTED
+    if driver._qemu_pid():
+        sys.exit("QEMU already running for this run id")
+    STARTED = True
     r = drv("start", ARCH, f"--{GPU}")
     log("start", r[-300:].replace("\n", " | "))
     if "already" in r.lower():
+        STARTED = False
         sys.exit("QEMU already running for this run id")
     qpid = driver._qemu_pid()
+    QPID = qpid
     open(f"{OUT}/qemu.pid", "w").write(str(qpid))
     global HS, SER
     HS = HostSampler(qpid)
     log("qemu pid", qpid)
     log("login", drv("login", "root", "root", timeout=240)[-120:].replace("\n", " | "))
     SER = Serial()
+    if os.environ.get("CS_FORCE_FAIL") == "login":
+        raise RuntimeError("CS_FORCE_FAIL=login: simulated login failure")
     tb = time.time()
     # greeter: wait for it to settle
     time.sleep(20)
@@ -426,9 +492,6 @@ def main():
     res["counts"] = dict(pf=len(re.findall(r"\[PF\]", s)), segv=s.count("SEGV"),
                          panic=len(re.findall(r"(?i)panic", s)), wdog=s.count("[WDOG]"))
     json.dump(res, open(f"{OUT}/results.json", "w"), indent=1)
-    if os.environ.get("CS_KEEP") != "1":
-        SER.stop = True
-        log("stop", drv("stop")[-100:])
     log("DONE")
 
 
