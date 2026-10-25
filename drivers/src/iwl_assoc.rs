@@ -475,3 +475,55 @@ pub fn tim_dtim(ies: &[u8]) -> Option<(u8, u8)> {
     }
     None
 }
+
+// ── soft teardown (leaving a BSS without a firmware restart) ────────────────
+
+/// Session-protection time event bookkeeping (Linux's `iwl_mvm_time_event_data`
+/// `running`/`uid`): which unique id, if any, the firmware still runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TeTrack {
+    running: Option<u32>,
+    last_end: Option<u32>,
+}
+
+impl TeTrack {
+    pub const fn new() -> Self { TeTrack { running: None, last_end: None } }
+    /// TIME_EVENT_CMD ADD answered status 0 with `uid`.
+    pub fn on_add(&mut self, uid: u32) { self.running = Some(uid); }
+    /// TIME_EVENT_NOTIFICATION (unique_id, action, status).
+    pub fn on_notif(&mut self, _uid: u32, _action: u32, _status: u32) {}
+    /// The unique id a TIME_EVENT_CMD REMOVE may name (None: nothing to remove).
+    pub fn remove_uid(&self) -> Option<u32> { self.running }
+    pub fn removed(&mut self) { self.running = None; }
+}
+
+/// One firmware command (group) of a soft teardown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeardownStep {
+    /// TXPATH_FLUSH of the station's queues, then wait until they drained.
+    FlushTx,
+    /// SCD_QUEUE_CFG disable of the data (aggregation: ends the TX BA
+    /// session) and management queues.
+    DisableQueues,
+    /// MAC context MODIFY to unassociated, TIME_QUOTA without the binding.
+    MacUnassoc,
+    /// REMOVE_STA of the AP station.
+    RemoveSta,
+    /// TIME_EVENT_CMD REMOVE of a session-protection event still running.
+    RemoveTimeEvent(u32),
+    /// BINDING_CONTEXT REMOVE (MAC off the PHY context).
+    Unbind,
+}
+
+/// The ordered commands that undo an attempt: `bound` (MAC bound to the PHY),
+/// `sta` (AP station added), `te` (TeTrack::remove_uid).
+pub fn teardown_plan(bound: bool, sta: bool, te: Option<u32>) -> Vec<TeardownStep> {
+    use TeardownStep::*;
+    let mut v = Vec::new();
+    if let Some(u) = te { v.push(RemoveTimeEvent(u)); }
+    if sta { v.push(FlushTx); }
+    if bound { v.push(MacUnassoc); }
+    if sta { v.push(DisableQueues); v.push(RemoveSta); }
+    if bound { v.push(Unbind); }
+    v
+}
