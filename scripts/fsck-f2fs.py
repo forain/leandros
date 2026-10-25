@@ -281,7 +281,7 @@ class Fsck:
         self.link_errors = []
         self.unknown_links = 0
         self.nodes_seen = 0
-        self.dt_types = 0        # lx dentries carrying DT_* rather than F2FS_FT_*
+        self.lx_ftypes = []      # lx dentries: (dir, name, child, ft) checked against i_mode
         self.lx_checked = 0
 
     def err(self, m):
@@ -457,6 +457,7 @@ class Fsck:
                         kids.append((name, child, ft))
                         if v.lx:
                             self.check_lx_dentry(ino, pgofs, dir_level, name, r32(d, e), ft)
+                            self.lx_ftypes.append((ino, name, child, ft))
                         slot += max(1, (nlen + 7) // 8)
                 self.dir_children[ino] = kids
                 for name, child, ft in kids:
@@ -471,7 +472,7 @@ class Fsck:
             if not v.lx:
                 return ft == 4
             m = self.inodes.get(c)
-            return (m[0] & S_IFMT == S_IFDIR) if m else ft in (4, F2FS_FT_DIR)
+            return (m[0] & S_IFMT == S_IFDIR) if m else ft == F2FS_FT_DIR
         for ino, kids in self.dir_children.items():
             subdirs = sum(1 for n, c, ft in kids if kid_is_dir(c, ft) and n not in (b".", b".."))
             links = self.inodes[ino][1]
@@ -479,6 +480,11 @@ class Fsck:
                 self.unknown_links += 1     # pre-f2fsync mkdir: "unknown"
             elif links != 2 + subdirs:
                 self.link_errors.append(f"dir {ino}: i_links {links} != {2 + subdirs}")
+        for dino, name, c, ft in self.lx_ftypes:
+            m = self.inodes.get(c)
+            if m and 0 < ft < F2FS_FT_MAX and ft != f2fslx.mode_to_ft(m[0]):
+                self.err(f"dir {dino}: {name!r} file type {ft} != {f2fslx.mode_to_ft(m[0])} "
+                         f"(F2FS_FT_* of inode {c}'s i_mode)")
         valid = sum(sum(bin(x).count("1") for x in m) for m in self.valid.values())
         self.leaked = []
         for seg, m in self.valid.items():
@@ -497,8 +503,8 @@ class Fsck:
         lo, hi = f2fslx.bucket_range(want, pgofs, dir_level)
         if not lo <= pgofs < hi:
             self.err(f"dir {dino}: {name!r} in block {pgofs}, Linux searches blocks [{lo}, {hi})")
-        if not 0 < ft < F2FS_FT_MAX or ft == 4:
-            self.dt_types += 1
+        if not 0 < ft < F2FS_FT_MAX:
+            self.err(f"dir {dino}: {name!r} file type {ft} is not an F2FS_FT_* value")
 
     def lookup(self, path):
         ino = self.v.root
@@ -675,9 +681,6 @@ def main(argv):
     if v.lx:
         print(f"node format: lx (Linux layout), {f.lx_checked} inodes checked for footer ofs, "
               f"i_blocks, dentry hash and bucket")
-        if f.dt_types:
-            print(f"note: {f.dt_types} dentries carry a DT_* file type (servers/f2fs convention), "
-                  f"not F2FS_FT_*")
     else:
         print("node format: legacy")
     if v.orphans:

@@ -206,8 +206,24 @@ def bucket_range(name_hash, pgofs, dir_level=0):
     return b, b + bucket_blocks(level)
 
 
+# Dentry file type: Linux stores F2FS_FT_* (UNKNOWN 0, REG_FILE 1, DIR 2,
+# CHRDEV 3, BLKDEV 4, FIFO 5, SOCK 6, SYMLINK 7); legacy volumes store DT_*.
+DT_TO_FT = {8: 1, 4: 2, 2: 3, 6: 4, 1: 5, 12: 6, 10: 7}
+F2FS_FT_MAX = 8
+
+
+def dt_to_ft(dt):
+    return DT_TO_FT.get(dt, 0)
+
+
+def mode_to_ft(mode):
+    """F2FS_FT_* for an i_mode (Linux fs_umode_to_ftype)."""
+    return {0o100000: 1, 0o040000: 2, 0o020000: 3, 0o060000: 4,
+            0o010000: 5, 0o140000: 6, 0o120000: 7}.get(mode & 0o170000, 0)
+
+
 def place_dentries(entries, max_level=8):
-    """Lay out (name bytes, ino, ftype) entries the way Linux's
+    """Lay out (name bytes, ino, DT_* type) entries the way Linux's
     f2fs_add_regular_entry would: each name in the first block of its hash
     bucket, level by level, that has room. "." and ".." go first.
 
@@ -232,7 +248,7 @@ def place_dentries(entries, max_level=8):
                 for k in range(at, at + slots):
                     d[k // 8] |= 1 << (k % 8)
                 e = DENTRY_ENTRIES + at * 11
-                struct.pack_into("<IIHB", d, e, h, ino, len(name), ftype)
+                struct.pack_into("<IIHB", d, e, h, ino, len(name), dt_to_ft(ftype))
                 d[DENTRY_NAMES + at * 8:DENTRY_NAMES + at * 8 + len(name)] = name
                 used[bi] = at + slots
                 depth = max(depth, level + 1)
