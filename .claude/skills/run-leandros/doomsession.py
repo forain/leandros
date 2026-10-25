@@ -63,6 +63,7 @@ VT_KEY = os.environ.get("DOOMSESSION_VT_KEY", "esc")
 ASSERT_VT = "--assert-vt" in A
 VT_MIN = 0.1
 DOOM_ENV = opt("--doom-env", "")
+DOOM_ARGS = opt("--doom-args", "")  # e.g. "-nosfx" for a music-only capture
 OUT = os.path.join(os.environ.get("DOOMSESSION_OUT", "/tmp/doomsession"), f"run-{TAG}")
 os.makedirs(OUT, exist_ok=True)
 WAV = os.path.join(OUT, "audio.wav")
@@ -277,7 +278,7 @@ def main():
     # DOOM prints an audio pacing line every 10 s (frames/s, pipe dry count);
     # --doom-env adds variables, e.g. LEANDROS_DOOM_AUDIO_PACE=clock for an A/B.
     env = " ".join(["LEANDROS_DOOM_AUDIO_STATS=1"] + ([DOOM_ENV] if DOOM_ENV else []))
-    typ(f"{env} doom 2>&1 | tee /tmp/doom.log"); key("ret")
+    typ(f"{env} doom {DOOM_ARGS} 2>&1 | tee /tmp/doom.log"); key("ret")
     wait_for("doom", lambda: count("doom") >= 1, 60 * SCALE)
     a0 = wav_mark()
     SER.pump(8 * SCALE)
