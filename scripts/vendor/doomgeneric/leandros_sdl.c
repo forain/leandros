@@ -767,27 +767,9 @@ int SDL_PollEvent(SDL_Event* event) {
         if (ev.type == 1) {
             event->type = (ev.value == 0) ? SDL_KEYUP : SDL_KEYDOWN;
             uint32_t sym = 0;
-            if (ev.value == 2) { // Auto-repeat or Serial ASCII input
-                if (ev.code >= 'a' && ev.code <= 'z') sym = ev.code;
-                else if (ev.code >= 'A' && ev.code <= 'Z') sym = ev.code - 'A' + 'a';
-                else if (ev.code >= '0' && ev.code <= '9') sym = ev.code;
-                else {
-                    switch (ev.code) {
-                        case '\r':
-                        case '\n': sym = SDLK_RETURN; break;
-                        case 0x1B: sym = SDLK_ESCAPE; break;
-                        case '\t': sym = SDLK_TAB; break;
-                        case 0x08:
-                        case 0x7F: sym = SDLK_BACKSPACE; break;
-                        case ' ': sym = SDLK_SPACE; break;
-                        case 21: sym = SDLK_y; break; // Some drivers send scancode 21 with value 2
-                        case 49: sym = SDLK_n; break; // Some drivers send scancode 49 with value 2
-                        default: sym = 0; break;
-                    }
-                }
-            } else { // Keyboard scancode input (ev.value 0 or 1)
-                sym = leandros_evdev_to_sdlk(ev.code);
-            }
+            // value 2 is autorepeat of a real keycode: serial-console bytes no
+            // longer reach event0 (openbugs L12 #67).
+            sym = leandros_evdev_to_sdlk(ev.code);
             if (sym == 0) return 0;
             event->key.keysym.sym = sym;
             return 1;
