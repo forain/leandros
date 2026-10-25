@@ -3217,13 +3217,14 @@ fn cp_is_foreign(sb: &SbInfo, b: &[u8; BLOCK_SIZE]) -> bool {
 /// then commits with zero bitmaps. Idempotent: a crash before that commit
 /// leaves the Linux checkpoint newest and this runs again on the same input.
 /// Returns the number of blocks copied plus journal entries applied.
+macro_rules! bail { ($s:literal) => {{ dbg_str(concat!("[F2FS] linux_import gave up at ", $s, "\n")); return None; }} }
 fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64) -> Option<usize> {
     let bps = sb.blocks_per_seg as u64;
     let flags = r32(cp, CP_CKPT_FLAGS);
     let sit_sz = r32(cp, CP_SIT_BM_SIZE) as usize;
     let nat_sz = r32(cp, CP_NAT_BM_SIZE) as usize;
     if flags & CP_LARGE_NAT_BM != 0 || CP_VER_BITMAP + sit_sz + nat_sz > durable::CPJ_MAGIC_OFF
-        || sb.seg_cnt_nat != 2 { return None; }
+        || sb.seg_cnt_nat != 2 { bail!("bitmap-layout"); }
     if flags & CP_ORPHAN_PRESENT != 0 {
         dbg_str("[F2FS] Linux checkpoint carries orphan blocks; they are not reaped\n");
     }
@@ -3237,13 +3238,13 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64) ->
     for i in 0..(sit_sz * 8).min(sit_half as usize) {
         if !bit(CP_VER_BITMAP, i) { continue; }
         let a = sb.sit_blkaddr as u64 + i as u64;
-        if !copy(a + sit_half, a, &mut blk) { return None; }
+        if !copy(a + sit_half, a, &mut blk) { bail!("sit-copy"); }
         n += 1;
     }
     for i in 0..(nat_sz * 8).min(bps as usize) {
         if !bit(CP_VER_BITMAP + sit_sz, i) { continue; }
         let a = sb.nat_blkaddr as u64 + i as u64;
-        if !copy(a + bps, a, &mut blk) { return None; }
+        if !copy(a + bps, a, &mut blk) { bail!("nat-copy"); }
         n += 1;
     }
     // Journals: compacted (NAT journal, SIT journal, data entries, from
@@ -3256,42 +3257,42 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64) ->
     let mut nat_j = [0u8; JSZ];
     let mut sit_j = [0u8; JSZ];
     if flags & CP_COMPACT_SUM != 0 {
-        if !virtio_blk::read_block(dev, cp_addr + r32(cp, CP_START_SUM) as u64, &mut blk) { return None; }
+        if !virtio_blk::read_block(dev, cp_addr + r32(cp, CP_START_SUM) as u64, &mut blk) { bail!("compact-read"); }
         nat_j.copy_from_slice(&blk[..JSZ]);
         sit_j.copy_from_slice(&blk[JSZ..2 * JSZ]);
     } else {
         let base = if flags & CP_UMOUNT_FLAG != 0 { 7 } else { 4 };
-        if total < base + 2 { return None; }
-        if !virtio_blk::read_block(dev, cp_addr + total - base, &mut blk) { return None; }
+        if total < base + 2 { bail!("short-pack"); }
+        if !virtio_blk::read_block(dev, cp_addr + total - base, &mut blk) { bail!("hot-sum-read"); }
         nat_j.copy_from_slice(&blk[SUM_JOFF..SUM_JOFF + JSZ]);
-        if !virtio_blk::read_block(dev, cp_addr + total - base + 2, &mut blk) { return None; }
+        if !virtio_blk::read_block(dev, cp_addr + total - base + 2, &mut blk) { bail!("cold-sum-read"); }
         sit_j.copy_from_slice(&blk[SUM_JOFF..SUM_JOFF + JSZ]);
     }
     let n_nats = (r16(&nat_j, 0) as usize).min((JSZ - 2) / 13);
     for k in 0..n_nats {
         let e = 2 + k * 13;
         let nid = r32(&nat_j, e);
-        if nid as u64 >= bps * NAT_ENTRY_PER_BLK as u64 { return None; }
+        if nid as u64 >= bps * NAT_ENTRY_PER_BLK as u64 { bail!("nat-nid-range"); }
         let a = sb.nat_blkaddr as u64 + (nid / NAT_ENTRY_PER_BLK as u32) as u64;
         let o = (nid % NAT_ENTRY_PER_BLK as u32) as usize * NAT_ENTRY_SIZE;
-        if !virtio_blk::read_block(dev, a, &mut blk) { return None; }
+        if !virtio_blk::read_block(dev, a, &mut blk) { bail!("nat-read"); }
         blk[o..o + NAT_ENTRY_SIZE].copy_from_slice(&nat_j[e + 4..e + 4 + NAT_ENTRY_SIZE]);
-        if !virtio_blk::write_block(dev, a, &blk) { return None; }
+        if !virtio_blk::write_block(dev, a, &blk) { bail!("nat-write"); }
         n += 1;
     }
     let n_sits = (r16(&sit_j, 0) as usize).min((JSZ - 2) / (4 + SIT_ENTRY_SIZE));
     for k in 0..n_sits {
         let e = 2 + k * (4 + SIT_ENTRY_SIZE);
         let seg = r32(&sit_j, e);
-        if seg >= sb.seg_cnt_main { return None; }
+        if seg >= sb.seg_cnt_main { bail!("sit-seg-range"); }
         let a = sb.sit_blkaddr as u64 + (seg / SIT_PER_BLK as u32) as u64;
         let o = (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE;
-        if !virtio_blk::read_block(dev, a, &mut blk) { return None; }
+        if !virtio_blk::read_block(dev, a, &mut blk) { bail!("sit-read"); }
         blk[o..o + SIT_ENTRY_SIZE].copy_from_slice(&sit_j[e + 4..e + 4 + SIT_ENTRY_SIZE]);
-        if !virtio_blk::write_block(dev, a, &blk) { return None; }
+        if !virtio_blk::write_block(dev, a, &blk) { bail!("sit-write"); }
         n += 1;
     }
-    if !virtio_blk::flush(dev) { return None; }
+    if !virtio_blk::flush(dev) { bail!("flush"); }
     Some(n)
 }
 
