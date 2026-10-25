@@ -1368,8 +1368,10 @@ impl AddressSpace {
             // raises SIGBUS (or reads data the file has grown into).
             (valid, ((valid + PAGE_SIZE - 1) / PAGE_SIZE).min(p.window))
         } else {
-            // ELF segment: the file extent is exact; a short read is an error.
-            if p.len != 0 && got != p.len as isize { return Fault::Segv; }
+            // ELF segment: the file extent is exact, so a read error or a
+            // short read (file shrunk under the mapping) is SIGBUS
+            // (BUS_ADRERR), as on Linux. Until 2026-10-25 it was SIGSEGV.
+            if p.len != 0 && got != p.len as isize { return Fault::Bus; }
             (p.len.min(data.len()), p.window)
         };
 

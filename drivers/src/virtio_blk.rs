@@ -26,8 +26,13 @@ const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
 const VIRTIO_STATUS_NEEDS_RESET: u8 = 0x40;
 const VIRTIO_STATUS_FAILED: u8 = 0x80;
 
-/// Upper bound on one request. QEMU answers in micro- to milliseconds even on
-/// TCG; 30 s matches nvme's I/O timeout and only ever fires on a dead device.
+/// A request still unanswered after this long is reported as slow (and again
+/// at 2x, 4x, ...). It is never abandoned for being slow: like Linux
+/// virtio-blk (no request timeout), we keep waiting, and only a device that
+/// reports NEEDS_RESET/FAILED (or reads all-ones: gone) is declared dead.
+/// Until 2026-10-25 a 30 s stall marked the disk dead for good; a loaded
+/// host running x86_64 TCG hit that, f2fs went read-only and the root shell
+/// died on its next page-in (openbugs L12 #50).
 const IO_TIMEOUT_NS: u64 = 30_000_000_000;
 
 /// Test knobs (kernel command line), read once the command line is known:
@@ -74,7 +79,7 @@ fn irq_window_if_masked() {
 
 /// Why a request never completed (`device_status` at the time).
 #[derive(Clone, Copy)]
-enum WaitErr { Status(u8), Timeout(u8) }
+enum WaitErr { Status(u8) }
 
 const VIRTIO_BLK_T_IN:  u32 = 0; // read from device
 const VIRTIO_BLK_T_OUT: u32 = 1; // write to device
@@ -241,17 +246,22 @@ impl VirtQueue {
         }
     }
 
-    /// Poll the used ring for the one in-flight request, bounded.
+    /// Poll the used ring for the one in-flight request.
     ///
-    /// Callers include the page-fault path with IRQs masked, so an unbounded
-    /// spin on a device that never answers (hung host backend, surprise
-    /// removal, NEEDS_RESET) wedges the CPU for good. Every 256 polls we open
-    /// an IRQ window (as nvme does) and read `device_status`: all-ones (gone)
-    /// or NEEDS_RESET/FAILED fails at once; otherwise we give up after
-    /// `timeout_ns`. On failure the request is still owned by the device,
-    /// so the caller must not touch the ring or DMA pages again.
-    unsafe fn wait_for_completion(&mut self, cfg: *mut VirtioPciCommonCfg, t0: u64, timeout_ns: u64) -> Result<(), WaitErr> {
+    /// The driver takes no completion interrupt: it reads the used ring
+    /// itself, so a lost IRQ cannot strand a request. Callers include the
+    /// page-fault path with IRQs masked, so every 256 polls we open an IRQ
+    /// window (as nvme does) and read `device_status`: all-ones (gone) or
+    /// NEEDS_RESET/FAILED fails at once. A request that is merely slow (a
+    /// host too loaded to schedule QEMU's block backend) is waited for, with
+    /// a warning at `slow_ns` and each doubling after. Returns whether it was
+    /// slow. On failure the request is still owned by the device, so the
+    /// caller must not touch the ring or DMA pages again.
+    unsafe fn wait_for_completion(&mut self, cfg: *mut VirtioPciCommonCfg, t0: u64, slow_ns: u64,
+                                  type_: u32, sector: u64) -> Result<bool, WaitErr> {
         let mut spins: u32 = 0;
+        let mut warn_at = slow_ns;
+        let mut slow = false;
         while self.last_used_idx == core::ptr::addr_of!((*self.used).idx).read_volatile() {
             spins = spins.wrapping_add(1);
             if spins % 256 == 0 {
@@ -262,15 +272,20 @@ impl VirtQueue {
                 if st == 0xFF || st & (VIRTIO_STATUS_NEEDS_RESET | VIRTIO_STATUS_FAILED) != 0 {
                     return Err(WaitErr::Status(st));
                 }
-                if sched::monotonic_ns().saturating_sub(t0) > timeout_ns {
-                    return Err(WaitErr::Timeout(st));
+                let el = sched::monotonic_ns().saturating_sub(t0);
+                if el > warn_at {
+                    while warn_at <= el && warn_at != u64::MAX { warn_at = warn_at.saturating_mul(2); }
+                    slow = true;
+                    crate::pci::serial_debug(&alloc::format!(
+                        "[VIRTIO-BLK] slow request: type {} sector {} unanswered for {} ms (device_status {:#04x}); still waiting\n",
+                        type_, sector, el / 1_000_000, st));
                 }
             }
             core::hint::spin_loop();
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
-        Ok(())
+        Ok(slow)
     }
 }
 
@@ -547,18 +562,21 @@ impl VirtioBlkDevice {
                 }
             }
             self.notify();
-            if let Err(e) = self.queue.wait_for_completion(self.common_cfg, t0, k.slow_ns) {
-                // The descriptors and DMA pages stay with the device forever:
-                // it may still complete (and DMA) later, so never reuse them.
-                self.dead = true;
-                let (why, st) = match e {
-                    WaitErr::Status(st) => ("device failed", st),
-                    WaitErr::Timeout(st) => ("timed out", st),
-                };
-                crate::pci::serial_debug(&alloc::format!(
-                    "[VIRTIO-BLK] request type {} sector {} {} (device_status {:#04x}); disk marked dead\n",
-                    type_, sector, why, st));
-                return false;
+            match self.queue.wait_for_completion(self.common_cfg, t0, k.slow_ns, type_, sector) {
+                Ok(false) => {}
+                Ok(true) => crate::pci::serial_debug(&alloc::format!(
+                    "[VIRTIO-BLK] slow request: type {} sector {} completed after {} ms (status {})\n",
+                    type_, sector, sched::monotonic_ns().saturating_sub(t0) / 1_000_000, *status_ptr)),
+                Err(WaitErr::Status(st)) => {
+                    // The descriptors and DMA pages stay with the device
+                    // forever: it may still complete (and DMA) later, so
+                    // never reuse them.
+                    self.dead = true;
+                    crate::pci::serial_debug(&alloc::format!(
+                        "[VIRTIO-BLK] request type {} sector {} device failed (device_status {:#04x}); disk marked dead\n",
+                        type_, sector, st));
+                    return false;
+                }
             }
             self.queue.free_chain(d0);
 
