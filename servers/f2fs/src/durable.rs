@@ -95,11 +95,22 @@ pub(crate) const CP_CRC_OFF: usize = 4092;
 /// whose field is 0 was written before this lane: zlib CRC32 there, and its
 /// journal and roll-forward records may use the whole pack.
 pub(crate) const CP_CHKSUM_FIELD: usize = 164;
-/// Blocks at the end of every pack kept zero for Linux. The commit block says
-/// `cp_pack_total_block_count` = 1 (it is its own footer), so Linux reads a
-/// pack's six curseg summaries from the six blocks just before it: the end of
-/// the superblock segment for pack 0, the end of pack 0 for pack 1.
-pub(crate) const LINUX_TAIL: u32 = 6;
+/// Blocks at the end of every pack this kernel's journal and records stay out
+/// of (lane f2fscrc4, L12 #46). Linux's validate_checkpoint wants
+/// `F2FS_CP_PACKS < cp_pack_total_block_count <= blocks_per_seg` and a copy
+/// of the commit block (same version, valid CRC) as the pack's last block,
+/// and restore_curseg_summaries reads normal summaries from the blocks just
+/// before it (data at total-7..-5 and node at total-4..-2 on an unmount
+/// checkpoint, data at total-4..-2 otherwise). So the commit block says
+/// total = the whole pack, the last block is the footer, and the six blocks
+/// before it stay zero (empty summaries and journals).
+pub(crate) const LINUX_TAIL: u32 = 7;
+/// Lane f2fscrc packs before f2fscrc4 said total = 1 and kept six blocks free.
+pub(crate) const LINUX_TAIL_V1: u32 = 6;
+/// The tail the pack of commit block `b` reserves (0: pre-f2fscrc, whole pack).
+pub(crate) fn cp_tail(b: &[u8; BLOCK_SIZE]) -> u32 {
+    if cp_is_legacy(b) { 0 } else if r32(b, crate::CP_PACK_TOTAL) <= 2 { LINUX_TAIL_V1 } else { LINUX_TAIL }
+}
 /// Linux's f2fs_crc32 over `data`.
 pub(crate) fn linux_crc(data: &[u8]) -> u32 { !crc32_upd(!F2FS_MAGIC, data) }
 /// Commit block written before lane f2fscrc (zlib CRC, full-size pack)?
@@ -284,6 +295,15 @@ fn dw(dev: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
 }
 
 /// Write `data` (whole blocks) at `blk` in requests of `WB_IO_BLOCKS`.
+/// Write a pack's Linux tail at `at` (LINUX_TAIL blocks): six zero summary
+/// blocks when `zero`, and always the footer copy of the sealed commit block.
+fn write_tail(dev: usize, at: u64, cp: &[u8; BLOCK_SIZE], zero: bool, cmds: &mut u32) -> bool {
+    if !zero { *cmds += 1; return dw(dev, at + LINUX_TAIL as u64 - 1, cp); }
+    let mut t = alloc::vec![0u8; LINUX_TAIL as usize * BLOCK_SIZE];
+    t[(LINUX_TAIL as usize - 1) * BLOCK_SIZE..].copy_from_slice(cp);
+    dws(dev, at, &t, cmds)
+}
+
 fn dws(dev: usize, blk: u64, data: &[u8], cmds: &mut u32) -> bool {
     let mut ok = true;
     for (p, piece) in data.chunks(WB_IO_BLOCKS * BLOCK_SIZE).enumerate() {
@@ -309,8 +329,9 @@ fn dflush(dev: usize) -> bool {
 // ── Per-mount state ──────────────────────────────────────────────────────────
 
 pub(crate) struct Durable {
-    /// Pack 0's Linux tail may hold pre-f2fscrc data (cleared by the first pack-1 commit).
-    pub tail_dirty: bool,
+    /// The pack's Linux tail may hold older data (a pre-f2fscrc journal or
+    /// records, a lane-f2fscrc V1 footer gap): zeroed by its first commit.
+    pub tail_dirty: [bool; 2],
     /// Main-area blocks allocated since the last checkpoint snapshot (free
     /// in the durable checkpoint): written in place before the commit.
     pub fresh_pending: BTreeMap<u32, SegMap>,
@@ -354,7 +375,7 @@ pub(crate) struct Durable {
 impl Durable {
     pub(crate) fn new(ver: u64, pack: u8) -> Self {
         Durable {
-            tail_dirty: true,
+            tail_dirty: [true; 2],
             fresh_pending: BTreeMap::new(), fresh_inflight: BTreeMap::new(), nid_pending: BTreeSet::new(), nid_inflight: Vec::new(),
             nid_pool: Vec::new(), inflight_ver: 0, inflight_pack: 0, inflight_rf_start: 0,
             durable_ver: ver, durable_pack: pack, rf_next: 0, rf_end: 0, rf_start: 0, rf_seq: 0,
@@ -511,9 +532,9 @@ pub(crate) struct CpJob {
     pub cp_blkno: u64,
     pub cp_buf: [u8; BLOCK_SIZE],
     pub umount: bool,
-    /// Pack 0's Linux tail to zero once this commit (pack 1) is durable: a
-    /// pre-f2fscrc kernel may have left journal or records there (0 = none).
-    pub zero_tail: u64,
+    /// Zero the six summary blocks of the Linux tail with this commit (the
+    /// footer copy of the commit block is written every time).
+    pub zero_tail: bool,
     pub reg_blocks: [u32; REGS],
 }
 
@@ -703,10 +724,7 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     ms.dur.inflight_pack = pack;
     ms.dur.inflight_rf_start = rf_start;
     let ext = ext_segs.iter().map(|&s| ms.sb.main_blkaddr as u64 + s as u64 * ms.sb.blocks_per_seg as u64).collect();
-    let zero_tail = if pack == 1 && ms.dur.tail_dirty {
-        ms.dur.tail_dirty = false;
-        pack_base(ms, 0) + pack_room(ms) as u64
-    } else { 0 };
+    let zero_tail = core::mem::replace(&mut ms.dur.tail_dirty[pack as usize], false);
     Ok(CpJob {
         dev: ms.dev, ver: ms.cp.ver, direct, direct_reg, jhome, jimg,
         pack_base: pack_base(ms, pack), pack_cap, ext, cp_blkno, cp_buf, umount, reg_blocks, zero_tail,
@@ -782,16 +800,16 @@ pub(crate) fn cp_write(job: &mut CpJob, port: u32) -> CpIo {
     let t = sched::monotonic_ns();
     io.ok &= dw(dev, job.cp_blkno, &job.cp_buf);
     io.reg_cmds[REG_CP] += 1;
+    // Linux's view of the pack, in the same flush as the commit block. This
+    // kernel never reads it, so a failed write does not fail the commit.
+    io.home_ok &= write_tail(dev, job.pack_base + 1 + job.pack_cap as u64, &job.cp_buf, job.zero_tail,
+                             &mut io.reg_cmds[REG_CP]);
     let tf = sched::monotonic_ns();
     io.reg_ns[REG_CP] += tf.saturating_sub(t);
     io.ok &= dflush(dev);
     io.flush_ns += sched::monotonic_ns().saturating_sub(tf);
     if !io.ok { io.home_ok = false; return io; }
     if let Some(c) = committed_slot(port) { c.fetch_max(job.ver, atomic::Ordering::SeqCst); }
-    if job.zero_tail != 0 {
-        let z = alloc::vec![0u8; LINUX_TAIL as usize * BLOCK_SIZE];
-        io.home_ok &= dws(dev, job.zero_tail, &z, &mut io.reg_cmds[REG_CP]);
-    }
     // Home writes, adjacent homes merged (the images are in home order).
     let mut q = 0;
     while q < j {
@@ -857,8 +875,8 @@ pub(crate) fn read_journal(dev: usize, sb: &SbInfo, base: u64, cpb: &[u8; BLOCK_
         + r32(cpb, CPJ_EXT_OFF + 4 * q) as u64 * sb.blocks_per_seg as u64).collect();
     let job_like = CpJob {
         dev, ver: 0, direct: Vec::new(), direct_reg: Vec::new(), jhome: Vec::new(), jimg: Vec::new(),
-        pack_base: base, pack_cap: pack_blks - 1 - if cp_is_legacy(cpb) { 0 } else { LINUX_TAIL }, ext, cp_blkno: 0, cp_buf: [0; BLOCK_SIZE],
-        umount: false, reg_blocks: [0; REGS], zero_tail: 0,
+        pack_base: base, pack_cap: pack_blks - 1 - cp_tail(cpb), ext, cp_blkno: 0, cp_buf: [0; BLOCK_SIZE],
+        umount: false, reg_blocks: [0; REGS], zero_tail: false,
     };
     if total > job_like.pack_cap + 512 * next as u32 { return Err(()); }
     let h = (j + JIX_PER_BLK - 1) / JIX_PER_BLK;
@@ -1132,9 +1150,9 @@ fn sit_set(ms: &mut MountState, a: u32, used: bool) {
 /// Roll the durable pack's records forward into the cache (called at mount,
 /// after the journal replay, before the mount checkpoint). Returns how many
 /// records were applied.
-pub(crate) fn recover(ms: &mut MountState, rf_start: u32, legacy: bool) -> u32 {
+pub(crate) fn recover(ms: &mut MountState, rf_start: u32, tail: u32) -> u32 {
     let base = pack_base(ms, ms.dur.durable_pack);
-    let end = if legacy { pack_blocks(ms) } else { pack_room(ms) };
+    let end = pack_blocks(ms) - tail;
     let (recs, next, seq) = read_records(ms.dev, base, rf_start, end, ms.dur.durable_ver);
     ms.dur.rf_next = if rf_start == 0 { 0 } else { next };
     ms.dur.rf_end = if rf_start == 0 { 0 } else { end };
@@ -1374,6 +1392,11 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
         w32(&mut cp_buf, CPJ_CRC_OFF, crc);
         cp_seal(&mut cp_buf);
         ok &= dw(dev, cp_blkno, &cp_buf);
+        let zero = core::mem::replace(&mut ms.dur.tail_dirty[pack as usize], false);
+        let mut cmds = 0;
+        if !write_tail(dev, pbase + pack_room(ms) as u64, &cp_buf, zero, &mut cmds) {
+            ms.dur.tail_dirty[pack as usize] = true;
+        }
         ok &= dflush(dev);
     }
     if ok {

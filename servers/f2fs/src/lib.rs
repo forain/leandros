@@ -134,7 +134,7 @@ const CP_CUR_NODE_SEGNO: usize = 36;   // u32 [0] of node log
 const CP_CUR_NODE_BLKOFF:usize = 68;   // u16 [0] of node log
 const CP_CUR_DATA_SEGNO: usize = 84;   // u32 [0] of data log
 const CP_CUR_DATA_BLKOFF:usize = 116;  // u16 [0] of data log
-const CP_PACK_TOTAL:     usize = 136;
+pub(crate) const CP_PACK_TOTAL: usize = 136;
 const CP_NEXT_FREE_NID:  usize = 152;
 /// `__le32 ckpt_flags`. Only `CP_UMOUNT_FLAG` is used here: Linux sets it on
 /// the checkpoint written by a clean unmount (`f2fs_put_super` ->
@@ -3416,8 +3416,13 @@ fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE], logs: &Linux
     let meta = ms.sb.seg_cnt_ckpt + ms.sb.seg_cnt_sit + ms.sb.seg_cnt_nat + ms.sb.seg_cnt_ssa;
     w32(buf, CP_RSVD_SEG_CNT,    8u32.saturating_sub(meta).max(1));
     w32(buf, CP_OVP_SEG_CNT,     1);
-    w32(buf, CP_PACK_TOTAL,      1);
-    w32(buf, CP_START_SUM,       1);
+    // The whole pack is the Linux pack: footer in its last block, the six
+    // normal summaries before it (durable::LINUX_TAIL). start_sum is only
+    // read for compacted summaries and orphans (neither flag is set) and
+    // must lie in [cp_payload + 1, blocks_per_seg - 7] (sanity_check_ckpt).
+    let pack = (ms.sb.seg_cnt_ckpt / 2) * bps;
+    w32(buf, CP_PACK_TOTAL,      pack);
+    w32(buf, CP_START_SUM,       pack - durable::LINUX_TAIL);
     w32(buf, CP_VALID_NODE_CNT,  ms.valid_nodes as u32);
     w32(buf, CP_SIT_BM_SIZE,     (ms.sb.seg_cnt_sit / 2) * bps / 8);
     w32(buf, CP_NAT_BM_SIZE,     (ms.sb.seg_cnt_nat / 2) * bps / 8);
@@ -7816,7 +7821,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     // Unknown-feature mask (lane f2fsrf): a newer kernel wrote a feature this
     // one does not understand; do not modify the volume.
     let pbuf = if pick1 { &cp_buf1 } else { &cp_buf0 };
-    let cp_legacy = durable::cp_is_legacy(pbuf);
+    let cp_tail = durable::cp_tail(pbuf);
     let incompat = if durable::cp_block_has_journal(pbuf) { r32(pbuf, durable::CPJ_INCOMPAT_OFF) } else { 0 };
     let unknown = incompat & !durable::CPJ_INCOMPAT_KNOWN;
     let read_only = if unknown != 0 {
@@ -7915,7 +7920,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
             dbg_str(" block(s) were not home yet; replayed\n");
         }
         ms.valid_blocks = sit_repair(ms);
-        let recovered = durable::recover(ms, rf_start, cp_legacy);
+        let recovered = durable::recover(ms, rf_start, cp_tail);
         // Lane f2fsorphan: inodes unlinked while open when that checkpoint
         // was cut; nothing holds them now. After roll-forward, so a record
         // can no longer bring one back over freed blocks.

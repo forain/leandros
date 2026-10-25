@@ -61,7 +61,15 @@ def cp_legacy(b):
 
 
 F2FS_MAGIC = 0xF2F52010
-LINUX_TAIL = 6
+LINUX_TAIL = 7      # 6 curseg summaries + the cp footer at the end of the pack
+LINUX_TAIL_V1 = 6   # lane f2fscrc packs with cp_pack_total_block_count 1
+
+
+def cp_tail(b):
+    """Blocks at the end of the pack the journal and records stay out of."""
+    if cp_legacy(b):
+        return 0
+    return LINUX_TAIL_V1 if r32(b, 136) <= 2 else LINUX_TAIL
 
 
 def linux_crc(data):
@@ -164,7 +172,7 @@ class Vol:
             return {}
         total, j, nx = r32(cpb, 3076), r32(cpb, 3080), r32(cpb, 3088)
         ext = [r32(cpb, 3092 + 4 * q) for q in range(min(nx, 64))]
-        cap = self.pack - 1 - (0 if cp_legacy(cpb) else LINUX_TAIL)
+        cap = self.pack - 1 - cp_tail(cpb)
         h = (j + 1019) // 1020
         if h + j != total or total > cap + 512 * len(ext):
             return None
@@ -460,7 +468,7 @@ def linux_check(v):
     if linux_crc_bitwise(cp[:4092]) != r32(cp, 4092):
         bad.append("invalid crc value")
     total = r32(cp, 136)
-    if total == 0 or total > bps:
+    if total <= 2 or total > bps:  # F2FS_CP_PACKS < total <= blocks_per_seg
         bad.append(f"invalid cp_pack_total_block_count: {total}")
     else:
         foot = v.raw(v.cp_addr + total - 1)
