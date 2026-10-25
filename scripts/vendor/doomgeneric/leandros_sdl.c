@@ -110,17 +110,29 @@ static uint64_t s_pcm_written;     // bytes accepted by the pipe (frame alignmen
 static uint64_t s_pcm_dropped;     // bytes dropped because the pipe was full
 static void audio_pipe_write(const uint8_t *p, size_t len);
 
+static const char *s_pw_xdg;       // set when pw-cat must be told where PipeWire is
+
 // Start pw-cat on this session's PipeWire. 1 = PCM now goes there.
 static int audio_open_pipewire(void) {
     const char *dir = wl_getenv("XDG_RUNTIME_DIR");
-    if (!dir || !*dir) return 0;
     char sock[200];
-    size_t dl = strlen(dir);
-    if (dl + 12 >= sizeof sock) return 0;
-    memcpy(sock, dir, dl);
-    memcpy(sock + dl, "/pipewire-0", 12);
-    if (wl_sys(A_NR_FACCESSAT, -100 /* AT_FDCWD */, (long)sock, 0 /* F_OK */, 0, 0) != 0)
-        return 0;
+    int found = 0;
+    if (dir && *dir) {
+        size_t dl = strlen(dir);
+        if (dl + 12 >= sizeof sock) return 0;
+        memcpy(sock, dir, dl);
+        memcpy(sock + dl, "/pipewire-0", 12);
+        found = wl_sys(A_NR_FACCESSAT, -100 /* AT_FDCWD */, (long)sock, 0 /* F_OK */, 0, 0) == 0;
+    }
+    if (!found) {
+        // A root shell on a text VT (KMS mode) has no XDG_RUNTIME_DIR, but the
+        // desktop session's PipeWire is running as the first user: join it.
+        static const char fb[] = "/run/user/1000";
+        memcpy(sock, fb, sizeof fb - 1);
+        memcpy(sock + sizeof fb - 1, "/pipewire-0", 12);
+        if (wl_sys(A_NR_FACCESSAT, -100, (long)sock, 0, 0, 0) != 0) return 0;
+        s_pw_xdg = "XDG_RUNTIME_DIR=/run/user/1000";
+    }
     if (wl_sys(A_NR_FACCESSAT, -100, (long)"/usr/bin/pw-cat", 1 /* X_OK */, 0, 0) != 0) {
         wl_say("PipeWire is running (", sock, ") but /usr/bin/pw-cat is missing: no sound");
         return 0;
@@ -140,7 +152,17 @@ static int audio_open_pipewire(void) {
             "-P", "{ application.name = DOOM node.name = doom node.description = DOOM }",
             "-", 0
         };
-        execve("/usr/bin/pw-cat", argv, wl_envp());
+        char **envp = wl_envp();
+        static char *envbuf[260];
+        if (s_pw_xdg) {
+            int n = 0;
+            envbuf[n++] = (char *)s_pw_xdg;
+            for (char **e = envp; e && *e && n < 258; e++)
+                if (strncmp(*e, "XDG_RUNTIME_DIR=", 16) != 0) envbuf[n++] = *e;
+            envbuf[n] = 0;
+            envp = envbuf;
+        }
+        execve("/usr/bin/pw-cat", argv, envp);
         wl_sys(A_NR_EXIT_GROUP, 127, 0, 0, 0, 0);
     }
     close(fds[0]);
