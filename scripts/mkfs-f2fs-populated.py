@@ -3087,7 +3087,7 @@ def main():
         seg = b // BLOCKS_PER_SEG
         blk = b % BLOCKS_PER_SEG
         valid_blocks_per_seg[seg] += 1
-        valid_map_per_seg[seg][blk // 8] |= (1 << (blk % 8))
+        valid_map_per_seg[seg][blk // 8] |= (0x80 >> (blk % 8))   # lx: MSB-first like Linux
 
     # Main segments
     assert main_segs <= (SEG_CNT_SIT // 2) * BLOCKS_PER_SEG * SIT_PER_BLK

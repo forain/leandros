@@ -297,6 +297,9 @@ const NAT_ENTRY_PER_BLK:  usize = 4096 / NAT_ENTRY_SIZE; // 455
 const SIT_ENTRY_SIZE:     usize = 74;
 const SIT_PER_BLK:        usize = 4096 / SIT_ENTRY_SIZE; // 55
 const SIT_VMAP_OFF:       usize = 2;   // valid_map offset within sit entry
+/// Mask of block `i`'s bit in its SIT valid_map byte. Linux's f2fs_test_bit
+/// is MSB-first; legacy volumes were written LSB-first and keep that.
+#[inline] fn sit_vbit(f: Fmt, i: usize) -> u8 { if f.lx { 0x80 >> (i % 8) } else { 1 << (i % 8) } }
 const SIT_VBLOCKS_MASK:   u16   = 0x03FF;
 
 // Directory block constants (f2fs_dentry_block)
@@ -2922,17 +2925,29 @@ fn nat_lookup(ms: &mut MountState, ino: u32) -> u32 {
     r32(blk, off)
 }
 
-fn nat_update(ms: &mut MountState, ino: u32, blk_addr: u32) {
-    let nat_blk = ms.sb.nat_blkaddr + ino / NAT_ENTRY_PER_BLK as u32;
-    let idx     = (ino % NAT_ENTRY_PER_BLK as u32) as usize;
+fn nat_update(ms: &mut MountState, nid: u32, blk_addr: u32) { nat_update_owned(ms, nid, None, blk_addr) }
+
+/// `nid`'s NAT entry. Legacy volumes record the nid itself as the entry's
+/// ino (unchanged). On lx volumes the entry names the OWNING inode, as Linux
+/// and fsck.f2fs require for direct/indirect/xattr nodes: a new node passes
+/// its owner, a relocation (owner None) keeps the ino already recorded.
+fn nat_update_owned(ms: &mut MountState, nid: u32, owner: Option<u32>, blk_addr: u32) {
+    let nat_blk = ms.sb.nat_blkaddr + nid / NAT_ENTRY_PER_BLK as u32;
+    let idx     = (nid % NAT_ENTRY_PER_BLK as u32) as usize;
     let off     = idx * NAT_ENTRY_SIZE;
     // Most calls re-record an unchanged entry (an inode rewritten in place
     // after every write): leave the NAT block clean then, or every fsync's
     // checkpoint pays one more scattered write for it (lane f2fsperf).
-    {
+    let ino = {
         let cur = ms.cache.read(ms.dev, nat_blk as u64);
+        let ino = match (ms.sb.fmt.lx, owner) {
+            (false, _) => nid,
+            (true, Some(o)) => o,
+            (true, None) => { let k = r32(cur, off + 1); if k != 0 { k } else { nid } }
+        };
         if cur[off] == 1 && r32(cur, off + 1) == ino && r32(cur, off + 5) == blk_addr { return; }
-    }
+        ino
+    };
     let blk = ms.cache.get_mut(ms.dev, nat_blk as u64);
     blk[off] = 1;                          // version bump
     w32(blk, off + 1, ino);               // ino
@@ -2975,6 +2990,7 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
 }
 
 fn sit_mark_block_used(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
+    let fmt = ms.sb.fmt;
     let sit_blk_idx = seg / SIT_PER_BLK as u32;
     let sit_entry   = (seg % SIT_PER_BLK as u32) as usize;
     let sit_blkno   = ms.sb.sit_blkaddr + sit_blk_idx;
@@ -2988,10 +3004,10 @@ fn sit_mark_block_used(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
     // full of live blocks. With the bit test vblocks == popcount(valid_map)
     // always (the mount repairs older volumes, `sit_repair`).
     let byte_idx = blk_in_seg as usize / 8;
-    let bit      = blk_in_seg as usize % 8;
+    let bit      = sit_vbit(fmt, blk_in_seg as usize);
     let map_off  = entry_off + SIT_VMAP_OFF + byte_idx;
-    if map_off >= BLOCK_SIZE || blk[map_off] & (1 << bit) != 0 { return; }
-    blk[map_off] |= 1 << bit;
+    if map_off >= BLOCK_SIZE || blk[map_off] & bit != 0 { return; }
+    blk[map_off] |= bit;
     let v = r16(blk, entry_off);
     let old_cnt = v & SIT_VBLOCKS_MASK;
     let cnt = old_cnt + 1;
@@ -3031,18 +3047,19 @@ fn blkaddr_to_seg(ms: &MountState, phys: u32) -> Option<(u32, u32)> {
 /// shared indirect structures a block *can* be reached twice, so this is not
 /// theoretical.
 fn sit_mark_block_free(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
+    let fmt = ms.sb.fmt;
     let sit_blk_idx = seg / SIT_PER_BLK as u32;
     let sit_entry   = (seg % SIT_PER_BLK as u32) as usize;
     let sit_blkno   = ms.sb.sit_blkaddr + sit_blk_idx;
     let blk = ms.cache.get_mut(ms.dev, sit_blkno as u64);
     let entry_off = sit_entry * SIT_ENTRY_SIZE;
     let byte_idx = blk_in_seg as usize / 8;
-    let bit      = blk_in_seg as usize % 8;
+    let bit      = sit_vbit(fmt, blk_in_seg as usize);
     let map_off  = entry_off + SIT_VMAP_OFF + byte_idx;
     if map_off >= BLOCK_SIZE { return; }
-    let was_set = blk[map_off] & (1 << bit) != 0;
+    let was_set = blk[map_off] & bit != 0;
     if !was_set { return; }
-    blk[map_off] &= !(1 << bit);
+    blk[map_off] &= !bit;
     let v = r16(blk, entry_off);
     let old_cnt = v & SIT_VBLOCKS_MASK;
     let cnt = old_cnt.saturating_sub(1);
@@ -3291,7 +3308,10 @@ fn seg_busy_map(ms: &mut MountState, seg: u32) -> SegMap {
     let mut m: SegMap = [0; 8];
     for (w, word) in m.iter_mut().enumerate() {
         let o = off + SIT_VMAP_OFF + w * 8;
-        *word = u64::from_le_bytes(blk[o..o + 8].try_into().unwrap());
+        let mut bytes: [u8; 8] = blk[o..o + 8].try_into().unwrap();
+        // In-memory SegMap is LSB-first; lx's on-disk map is MSB-first.
+        if ms.sb.fmt.lx { for x in bytes.iter_mut() { *x = x.reverse_bits(); } }
+        *word = u64::from_le_bytes(bytes);
     }
     for (w, word) in m.iter_mut().enumerate() { *word |= prot_word(ms, seg, w); }
     m
@@ -5494,7 +5514,7 @@ fn create_node_block(ms: &mut MountState, owner_ino: u32, ofs: u32) -> Option<(u
     let mut buf = [0u8; BLOCK_SIZE];
     ms.sb.fmt.write_footer(&mut buf, nid, owner_ino, ofs);
     ms.cache.write(ms.dev, phys as u64, &buf);
-    nat_update(ms, nid, phys);
+    nat_update_owned(ms, nid, Some(owner_ino), phys);
     Some((nid, phys))
 }
 
@@ -7478,7 +7498,7 @@ fn persist_xattr_block(ms: &mut MountState, ino: u32, xnid: u32, blkbuf: &[u8; B
     let mut out = *blkbuf;
     ms.sb.fmt.write_footer(&mut out, xnid, ino, NODE_OFS_XATTR);
     ms.cache.write(ms.dev, xaddr as u64, &out);
-    nat_update(ms, xnid, xaddr);
+    nat_update_owned(ms, xnid, Some(ino), xaddr);
     xnid
 }
 

@@ -415,7 +415,7 @@ fn sit_valid(ms: &mut MountState, blk: u64) -> bool {
     if seg >= ms.sb.seg_cnt_main { return true; }
     let (blkno, off) = sit_entry_loc(ms, seg);
     let sit = ms.cache.read(ms.dev, blkno);
-    sit[off + SIT_VMAP_OFF + b as usize / 8] & (1 << (b % 8)) != 0
+    sit[off + SIT_VMAP_OFF + b as usize / 8] & sit_vbit(ms.sb.fmt, b as usize) != 0
 }
 
 fn is_fresh(ms: &MountState, blk: u64) -> bool {

@@ -211,7 +211,7 @@ def build(size):
     sb_ = blk(sit_blk)
     w16(sb_, 0, used)
     for k in range(used):
-        sb_[2 + k // 8] |= 1 << (k % 8)
+        sb_[2 + k // 8] |= 0x80 >> (k % 8)   # lx: Linux f2fs_test_bit is MSB-first
 
     # Checkpoint packs. The runtime logs start on fresh segments 1 (node) and
     # 2 (data), past the seeded blocks, exactly as mkfs-f2fs-populated.py does.

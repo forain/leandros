@@ -293,7 +293,7 @@ class Fsck:
         off = a - self.v.main_blk
         seg, b = divmod(off, self.v.bps)
         m = self.valid[seg]
-        return (m[b // 8] >> (b % 8)) & 1
+        return (m[b // 8] >> ((7 - b % 8) if self.v.lx else (b % 8))) & 1
 
     def ref(self, a, what):
         v = self.v
@@ -489,7 +489,7 @@ class Fsck:
         self.leaked = []
         for seg, m in self.valid.items():
             for b in range(v.bps):
-                if (m[b // 8] >> (b % 8)) & 1:
+                if (m[b // 8] >> ((7 - b % 8) if self.v.lx else (b % 8))) & 1:
                     a = v.main_blk + seg * v.bps + b
                     if a not in self.owner:
                         self.leaked.append(a)
