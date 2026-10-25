@@ -3,6 +3,9 @@
 D=/tmp/dp; mkdir -p $D
 SESS="XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1"
 URL=https://www.youtube.com/watch?v=aqz-KE-bpKQ
+# Marionette (port 2828) on by default so the Mac side can query page state
+# (ytd-app, readyState) instead of taking screenshots; DP_MARIONETTE=0 disables it.
+MARI=--marionette; [ "${DP_MARIONETTE:-1}" = 0 ] && MARI=
 ffpids() { for p in /proc/[0-9]*; do k=$(cat $p/comm 2>/dev/null); case "$k" in *irefox*|*Content*|RDD*|Socket*|Utility*|Privileged*|WebExt*|Isolated*|forkserver) echo ${p#/proc/};; esac; done; }
 snap() {
   f=$D/$1; { echo "=== up $(cut -d' ' -f1 /proc/uptime)"
@@ -15,7 +18,7 @@ snap() {
   for p in /proc/[0-9]*; do s=$(cat $p/stat 2>/dev/null) || continue; r=${s##*) }; set -- $r; echo "P ${p#/proc/} $(tr ' ' '_' < $p/comm) ${12} ${13}"; done
   echo "=== sysstat"; cat /proc/sysstat; } > $f.tmp 2>&1; mv $f.tmp $f; }
 case $1 in
-launch) nohup su leandro -c "env $SESS LIBVA_MESSAGING_LEVEL=0 MOZ_AV_LOG_LEVEL=0 firefox $URL" > $D/ff.log 2>&1 < /dev/null &
+launch) nohup su leandro -c "env $SESS LIBVA_MESSAGING_LEVEL=0 MOZ_AV_LOG_LEVEL=0 firefox $MARI $URL" > $D/ff.log 2>&1 < /dev/null &
         echo launched;;
 kill) for i in 1 2 3; do for p in $(ffpids); do kill -9 $p 2>/dev/null; done; sleep 2; done; echo left: $(ffpids);;
 snap) snap $2;;

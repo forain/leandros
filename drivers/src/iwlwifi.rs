@@ -57,7 +57,9 @@
 //!                           unbind); the default tears down and falls back to
 //!                           a restart on any error
 //!   iwlwifi.scanconn=0      (mgr=1) do not scan while associated (default 1:
-//!                           UMAC scan on the associated MAC, as iwlmvm does);
+//!                           UMAC scan on the associated MAC, as iwlmvm does,
+//!                           fragmented: at most 120 ms off-channel, then
+//!                           120 ms back on the operating channel);
 //!                           with 0 scan requests while associated are
 //!                           answered from the cache
 //!   iwlwifi.rc=0            no rate control: the fixed LQ table (every AP
@@ -1827,7 +1829,8 @@ fn run_rt(fw: &Fw, func: &PciFunction, hw: &mut Hw) -> Res<()> {
     }
     let n = fw.info.n_scan_channels as usize;
     send(cmd::SCAN_CFG_CMD, Some((cmd::LONG_GROUP, 0)),
-         &cmd::scan_config_v1(hw.tx_ant, hw.rx_ant, &hw.mac, AUX_STA_ID, &hw.channels, n))?;
+         &cmd::scan_config_v1(hw.tx_ant, hw.rx_ant, &hw.mac, AUX_STA_ID, &hw.channels, n, cmd::ScanTiming::UNASSOC))?;
+    SCAN_CFG_ASSOC.store(false, Ordering::Relaxed);
     // The station MAC context (unassociated) the scans and the association use.
     mac_ctxt(cmd::FW_CTXT_ACTION_ADD, &MacState::unassoc(hw.mac))?;
     Ok(())
@@ -1857,9 +1860,21 @@ fn mac_ctxt(action: u32, st: &MacState) -> Res<()> {
 
 // ── scan (W2) ───────────────────────────────────────────────────────────────
 
-fn scan(fw: &Fw, hw: &Hw, ssids: &[&[u8]]) -> Res<Vec<ScanEntry>> {
+/// Whether the last SCAN_CFG_CMD carried the associated timing.
+static SCAN_CFG_ASSOC: AtomicBool = AtomicBool::new(false);
+
+fn scan(fw: &Fw, hw: &Hw, ssids: &[&[u8]], associated: bool) -> Res<Vec<ScanEntry>> {
+    let timing = cmd::ScanTiming::for_assoc(associated);
+    let n = fw.info.n_scan_channels as usize;
+    // iwlmvm (iwl_mvm_config_scan) re-sends the scan config when the scan
+    // type changes; the request below carries the same budget.
+    if SCAN_CFG_ASSOC.load(Ordering::Relaxed) != associated {
+        send(cmd::SCAN_CFG_CMD, Some((cmd::LONG_GROUP, 0)),
+             &cmd::scan_config_v1(hw.tx_ant, hw.rx_ant, &hw.mac, AUX_STA_ID, &hw.channels, n, timing))?;
+        SCAN_CFG_ASSOC.store(associated, Ordering::Relaxed);
+    }
     with_dev(|d| { d.scan_results.clear(); d.scanning = true; });
-    let req = cmd::scan_req_umac_v7(0, MAC_ID as u8, &hw.mac, &hw.channels, fw.info.n_scan_channels as usize, ssids, false);
+    let req = cmd::scan_req_umac_v7(0, MAC_ID as u8, &hw.mac, &hw.channels, n, ssids, false, timing);
     let t0 = now_ms();
     let r = send(cmd::SCAN_REQ_UMAC, Some((cmd::LONG_GROUP, 0)), &req);
     if let Err(e) = r {
@@ -1960,7 +1975,7 @@ fn driver_thread(opts: Opts, path: String) {
     loop {
         set_state("scanning");
         let ssids: Vec<&[u8]> = creds.as_ref().map(|c| alloc::vec![&c.0[..]]).unwrap_or_default();
-        match scan(&fw, &hw, &ssids) {
+        match scan(&fw, &hw, &ssids, false) {
             Ok(mut list) => {
                 log_bss_list(&mut list);
                 if let Some(i) = INFO.lock().as_mut() { i.bss = list.clone(); i.scan_at_ms = now_ms(); }
@@ -2992,7 +3007,7 @@ impl wm::Radio for IwlRadio {
     fn scan(&mut self, ssids: &[Vec<u8>], connected: bool) -> Result<Vec<wm::ScanHit>, Fail> {
         set_state(if connected { "connected (scanning)" } else { "scanning" });
         let refs: Vec<&[u8]> = ssids.iter().map(|s| &s[..]).collect();
-        let r = scan(&self.fw, &self.hw, &refs);
+        let r = scan(&self.fw, &self.hw, &refs, connected);
         set_state(if connected { "connected" } else { "up (manager)" });
         match r {
             Ok(mut list) => {
