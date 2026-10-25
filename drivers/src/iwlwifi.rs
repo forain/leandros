@@ -56,10 +56,12 @@
 //!                           (flush, unassociated MAC context, REMOVE_STA,
 //!                           unbind); the default tears down and falls back to
 //!                           a restart on any error
-//!   iwlwifi.scanconn=1      (mgr=1) scan while associated (UMAC scan on the
-//!                           associated MAC, as iwlmvm does); default 0: scan
-//!                           requests while associated are answered from the
-//!                           cache
+//!   iwlwifi.scanconn=0      (mgr=1) do not scan while associated (default 1:
+//!                           UMAC scan on the associated MAC, as iwlmvm does,
+//!                           fragmented: at most 120 ms off-channel, then
+//!                           120 ms back on the operating channel);
+//!                           with 0 scan requests while associated are
+//!                           answered from the cache
 //!   iwlwifi.rc=0            no rate control: the fixed LQ table (every AP
 //!                           rate fastest first, two tries each, antenna A);
 //!                           default 1: `iwl_rs` (Linux rs.c, legacy rates)
@@ -1036,7 +1038,7 @@ impl Dev {
         } else {
             match cmd::rx_crypto_lengths(fc, status) {
                 Some((h, t)) => (frame, h, t),
-                None => { self.rx_dropped += 1; self.rxs.undecrypted += 1; return; }
+                None => { self.rx_dropped += 1; self.rxs.undecrypted += 1; let foreign = self.guard.as_ref().map_or(false, |g| g.check_addr(frame).is_err()); wm::gk::note_undecrypted(frame, fc, status, foreign); return; }
             }
         };
         // Null data frames carry nothing (power-save signalling).
@@ -1075,6 +1077,7 @@ impl Dev {
             wf::RxReject::Malformed => &mut self.rxs.malformed,
         };
         *c += 1;
+        if r == wf::RxReject::Replay { wm::gk::note_rx(wm::gk::REPLAY); }
         if self.debug {
             ilog!("rx: dropped {:?} data frame fc {:#06x} seq {:#06x} ({} bytes)", r, fc, cmd::le16(frame, 22).unwrap_or(0), frame.len());
         }
@@ -1089,8 +1092,8 @@ impl Dev {
     fn rx_tkip(&mut self, frame: &[u8], status: u32, sw: &mut Vec<u8>) -> Option<bool> {
         let fc = wf::frame_control(frame)?;
         let hl = wf::hdr_len(fc);
-        let Some(k) = self.tkip_group.as_mut() else { self.rxs.undecrypted += 1; return None; };
-        if frame.len() < hl + 8 + 8 + 4 || frame[4] & 1 == 0 { self.rxs.undecrypted += 1; return None; }
+        let Some(k) = self.tkip_group.as_mut() else { self.rxs.undecrypted += 1; wm::gk::note_rx(wm::gk::UNDECRYPTED); return None; };
+        if frame.len() < hl + 8 + 8 + 4 || frame[4] & 1 == 0 { self.rxs.undecrypted += 1; wm::gk::note_rx(wm::gk::UNDECRYPTED); return None; }
         let ok = cmd::RX_MPDU_STATUS_ICV_OK | cmd::RX_MPDU_STATUS_TTAK_OK;
         let by_fw = status & ok == ok;
         if !by_fw {
@@ -1109,9 +1112,11 @@ impl Dev {
             sw.extend_from_slice(frame);
             if !crate::wifi_crypto::tkip_decrypt(&k.key.tk, &p1k, tsc as u16, &mut sw[hl + 8..]) {
                 self.rxs.undecrypted += 1;
+                wm::gk::note_rx(wm::gk::UNDECRYPTED);
                 return None;
             }
             self.rxs.tkip_sw += 1;
+            wm::gk::note_rx(wm::gk::SW);
         }
         let f: &[u8] = if by_fw { frame } else { &sw[..] };
         if !crate::wifi_crypto::tkip_frame_mic_ok(&k.key.rx_mic, f, hl, 4) {
@@ -1120,6 +1125,7 @@ impl Dev {
             // log only.
             let now = now_ms();
             self.rxs.mic_fail += 1;
+            wm::gk::note_rx(wm::gk::MIC);
             let second = now.saturating_sub(k.mic_fail_ms[1]) < 60_000 && k.mic_fail_ms[1] != 0;
             k.mic_fail_ms = [k.mic_fail_ms[1], now];
             if self.rxs.mic_fail <= 20 {
@@ -1128,6 +1134,7 @@ impl Dev {
             }
             return None;
         }
+        if by_fw { wm::gk::note_rx(wm::gk::FW); }
         Some(!by_fw)
     }
 
@@ -1248,7 +1255,7 @@ pub fn init(cmdline: &str) {
         psk: crate::cmdline_secrets::peek("wifi.psk").map(|v| percent_decode(core::str::from_utf8(&v).unwrap_or(""))),
         mgr: cmdline_val(cmdline, "iwlwifi.mgr") == Some("1"),
         softdisc: cmdline_val(cmdline, "iwlwifi.softdisc") != Some("0"),
-        scanconn: cmdline_val(cmdline, "iwlwifi.scanconn") == Some("1"),
+        scanconn: cmdline_val(cmdline, "iwlwifi.scanconn") != Some("0"),
     };
     RC_ON.store(cmdline_val(cmdline, "iwlwifi.rc") != Some("0"), Ordering::Relaxed);
     TXANT.store(match cmdline_val(cmdline, "iwlwifi.txant") {
@@ -1827,7 +1834,8 @@ fn run_rt(fw: &Fw, func: &PciFunction, hw: &mut Hw) -> Res<()> {
     }
     let n = fw.info.n_scan_channels as usize;
     send(cmd::SCAN_CFG_CMD, Some((cmd::LONG_GROUP, 0)),
-         &cmd::scan_config_v1(hw.tx_ant, hw.rx_ant, &hw.mac, AUX_STA_ID, &hw.channels, n))?;
+         &cmd::scan_config_v1(hw.tx_ant, hw.rx_ant, &hw.mac, AUX_STA_ID, &hw.channels, n, cmd::ScanTiming::UNASSOC))?;
+    SCAN_CFG_ASSOC.store(false, Ordering::Relaxed);
     // The station MAC context (unassociated) the scans and the association use.
     mac_ctxt(cmd::FW_CTXT_ACTION_ADD, &MacState::unassoc(hw.mac))?;
     Ok(())
@@ -1857,9 +1865,21 @@ fn mac_ctxt(action: u32, st: &MacState) -> Res<()> {
 
 // ── scan (W2) ───────────────────────────────────────────────────────────────
 
-fn scan(fw: &Fw, hw: &Hw, ssids: &[&[u8]]) -> Res<Vec<ScanEntry>> {
+/// Whether the last SCAN_CFG_CMD carried the associated timing.
+static SCAN_CFG_ASSOC: AtomicBool = AtomicBool::new(false);
+
+fn scan(fw: &Fw, hw: &Hw, ssids: &[&[u8]], associated: bool) -> Res<Vec<ScanEntry>> {
+    let timing = cmd::ScanTiming::for_assoc(associated);
+    let n = fw.info.n_scan_channels as usize;
+    // iwlmvm (iwl_mvm_config_scan) re-sends the scan config when the scan
+    // type changes; the request below carries the same budget.
+    if SCAN_CFG_ASSOC.load(Ordering::Relaxed) != associated {
+        send(cmd::SCAN_CFG_CMD, Some((cmd::LONG_GROUP, 0)),
+             &cmd::scan_config_v1(hw.tx_ant, hw.rx_ant, &hw.mac, AUX_STA_ID, &hw.channels, n, timing))?;
+        SCAN_CFG_ASSOC.store(associated, Ordering::Relaxed);
+    }
     with_dev(|d| { d.scan_results.clear(); d.scanning = true; });
-    let req = cmd::scan_req_umac_v7(0, MAC_ID as u8, &hw.mac, &hw.channels, fw.info.n_scan_channels as usize, ssids, false);
+    let req = cmd::scan_req_umac_v7(0, MAC_ID as u8, &hw.mac, &hw.channels, n, ssids, false, timing);
     let t0 = now_ms();
     let r = send(cmd::SCAN_REQ_UMAC, Some((cmd::LONG_GROUP, 0)), &req);
     if let Err(e) = r {
@@ -1960,7 +1980,7 @@ fn driver_thread(opts: Opts, path: String) {
     loop {
         set_state("scanning");
         let ssids: Vec<&[u8]> = creds.as_ref().map(|c| alloc::vec![&c.0[..]]).unwrap_or_default();
-        match scan(&fw, &hw, &ssids) {
+        match scan(&fw, &hw, &ssids, false) {
             Ok(mut list) => {
                 log_bss_list(&mut list);
                 if let Some(i) = INFO.lock().as_mut() { i.bss = list.clone(); i.scan_at_ms = now_ms(); }
@@ -2695,6 +2715,7 @@ fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8], sent: &mut
                     d.tkip_group = Some(TkipRx { key: tk, p1k: Some((iv32, p1k)), mic_fail_ms: [0; 2] });
                     if let Some(g) = d.guard.as_mut() { g.set_tkip_group(true); g.reset_key(key_id); }
                 });
+                wm::gk::note_install(key_id, true);
                 ilog!("group key {} (TKIP) installed", key_id);
             }
             HsEvent::InstallGtk { key_id, key, rsc: _ } => {
@@ -2705,6 +2726,7 @@ fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8], sent: &mut
                 let st = cmd::le32(&r, 0).unwrap_or(0) & 0xff;
                 if st != cmd::ADD_STA_SUCCESS { return Err(Err::Status("group key", st)); }
                 with_dev(|d| if let Some(g) = d.guard.as_mut() { g.reset_key(key_id); });
+                wm::gk::note_install(key_id, false);
                 ilog!("group key {} (CCMP) installed", key_id);
             }
             HsEvent::Complete => {}
@@ -2992,7 +3014,7 @@ impl wm::Radio for IwlRadio {
     fn scan(&mut self, ssids: &[Vec<u8>], connected: bool) -> Result<Vec<wm::ScanHit>, Fail> {
         set_state(if connected { "connected (scanning)" } else { "scanning" });
         let refs: Vec<&[u8]> = ssids.iter().map(|s| &s[..]).collect();
-        let r = scan(&self.fw, &self.hw, &refs);
+        let r = scan(&self.fw, &self.hw, &refs, connected);
         set_state(if connected { "connected" } else { "up (manager)" });
         match r {
             Ok(mut list) => {

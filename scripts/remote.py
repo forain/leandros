@@ -481,7 +481,9 @@ def cmd_status(t, a):
 
 def redact(b):
     """Blank secrets (the Wi-Fi PSK rides on the kernel cmdline) before a log hits disk."""
-    return re.sub(rb"((?:wifi|iwlwifi)\.psk=)\S+", rb"\1<redacted>", b)
+    b = re.sub(rb"((?:wifi|iwlwifi)\.psk=)\S+", rb"\1<redacted>", b)
+    # Passwords/secrets passed as assignments on a command line (GC_PW=..., PASS=..., password=...).
+    return re.sub(rb"(?i)\b(GC_PW|[A-Z_]*PASS(?:WORD|WD)?|[A-Z_]*SECRET|[A-Z_]*TOKEN)=(?:'[^']*'|\"[^\"]*\"|\S+)", rb"\1=<redacted>", b)
 
 
 def fetch_logs(t, out=None):

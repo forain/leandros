@@ -22,7 +22,8 @@
  *                           poll(); 4/4 replies required
  *   icmp_nonblock           MSG_DONTWAIT recvfrom on an idle ICMP socket is
  *                           EAGAIN at once
- *   icmp_poll_timeout       poll() for a reply that never comes (TEST-NET-1)
+ *   icmp_poll_timeout       poll() for a reply that never comes (TEST-NET-1;
+ *                           echo replies with another seq are strays, ignored)
  *                           returns 0 after its timeout, not early, not never
  *   icmp_recv_eintr         a blocking recvfrom with nothing to read is ended
  *                           by SIGALRM with EINTR (handler without SA_RESTART)
@@ -62,6 +63,9 @@
  *   tcp_keepalive_probes    an idle connection to the DNS server sends >= 3
  *                           more packets in 4 s with a 1 s keepalive than
  *                           without one
+ *   ping_tool               /bin/ping -c 2 GATEWAY gets 2 replies and writes
+ *                           nothing to stderr (its SOCK_RAW reads carry the
+ *                           IPv4 header; relibc's startup prints no debug)
  *   proc_net_route          /proc/net/route has an UP|GATEWAY default route
  *   proc_net_dev            the default route's interface is in /proc/net/dev
  *                           and its tx_packets grew across the ICMP cases
@@ -91,6 +95,7 @@
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -209,12 +214,30 @@ static void icmp_timeout_cases(void) {
     if (n < 0 && errno == EAGAIN && dt < 200) pass("icmp_nonblock");
     else fail("icmp_nonblock", "n=%zd errno=%s after %lld ms (want EAGAIN at once)", n, strerror(errno), dt);
 
+    /* A reply with our id but another seq is not ours: QEMU's user-mode net on
+     * a macOS host hands the guest every echo reply its host ICMP socket sees
+     * (a host `ping` running alongside), rewritten to our id and to the
+     * 192.0.2.1 source. Linux demuxes ping sockets by id only, so such a
+     * reply is readable there too; drop it and keep waiting, as ping(8)
+     * does. Only an answer to seq 7 itself means TEST-NET-1 replied. */
     struct pollfd pfd = { fd, POLLIN, 0 };
+    int r, strays = 0, ours = 0;
     t0 = now_ms();
-    int r = poll(&pfd, 1, 700);
+    for (;;) {
+        long long left = 700 - (now_ms() - t0);
+        pfd.revents = 0;
+        r = poll(&pfd, 1, left > 0 ? (int)left : 0);
+        if (r <= 0) break;
+        ssize_t m = recvfrom(fd, b, sizeof b, MSG_DONTWAIT, NULL, NULL);
+        if (m >= 8 && b[0] == 0 && (b[6] << 8 | b[7]) != 7) { strays++; continue; }
+        ours = 1;
+        break;
+    }
     dt = now_ms() - t0;
-    if (r == 0 && dt >= 650 && dt < 2000) pass("icmp_poll_timeout");
-    else fail("icmp_poll_timeout", "poll=%d revents=%#x after %lld ms (want 0 after ~700)", r, pfd.revents, dt);
+    if (r == 0 && !ours && dt >= 650 && dt < 2000) {
+        if (strays) printf("icmp_poll_timeout: ignored %d stray echo replies (not seq 7)\n", strays);
+        pass("icmp_poll_timeout");
+    } else fail("icmp_poll_timeout", "poll=%d revents=%#x after %lld ms (want 0 after ~700; %d strays)", r, pfd.revents, dt, strays);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -223,11 +246,19 @@ static void icmp_timeout_cases(void) {
     struct itimerval it = { {0, 0}, {0, 500000} };
     setitimer(ITIMER_REAL, &it, NULL);
     t0 = now_ms();
-    n = recvfrom(fd, b, sizeof b, 0, NULL, NULL);
-    int e = errno;
+    int e = 0;
+    strays = 0;
+    for (;;) {
+        n = recvfrom(fd, b, sizeof b, 0, NULL, NULL);
+        e = errno;
+        if (n >= 8 && b[0] == 0 && (b[6] << 8 | b[7]) != 7 && now_ms() - t0 < 3000) { strays++; continue; }
+        break;
+    }
     dt = now_ms() - t0;
-    if (n < 0 && e == EINTR && dt >= 400 && dt < 3000) pass("icmp_recv_eintr");
-    else fail("icmp_recv_eintr", "n=%zd errno=%s after %lld ms (want EINTR after ~500)", n, strerror(e), dt);
+    if (n < 0 && e == EINTR && dt >= 400 && dt < 3000) {
+        if (strays) printf("icmp_recv_eintr: ignored %d stray echo replies (not seq 7)\n", strays);
+        pass("icmp_recv_eintr");
+    } else fail("icmp_recv_eintr", "n=%zd errno=%s after %lld ms (want EINTR after ~500; %d strays)", n, strerror(e), dt, strays);
     signal(SIGALRM, SIG_DFL);
     close(fd);
 }
@@ -843,6 +874,43 @@ static void tcp_keepalive_probes(const char *dns, const char *ifn) {
 
 /* ---- /proc/net ---------------------------------------------------------- */
 
+/* Run the shipped /bin/ping (relibc-linked, SOCK_RAW as root) against the
+ * gateway: it must parse the replies the kernel hands it, and the C runtime
+ * must not write anything of its own to stderr. */
+static void ping_tool(const char *gw) {
+    const char *N = "ping_tool";
+    if (access("/bin/ping", X_OK) != 0) { skip(N, "(no /bin/ping)"); return; }
+    int out[2], err[2];
+    if (pipe(out) || pipe(err)) { fail(N, "pipe: %s", strerror(errno)); return; }
+    pid_t pid = fork();
+    if (pid < 0) { fail(N, "fork: %s", strerror(errno)); return; }
+    if (pid == 0) {
+        dup2(out[1], 1); dup2(err[1], 2);
+        close(out[0]); close(err[0]); close(out[1]); close(err[1]);
+        execl("/bin/ping", "ping", "-c", "2", "-W", "2", gw, (char *)0);
+        _exit(127);
+    }
+    close(out[1]); close(err[1]);
+    char ob[2048], eb[512]; size_t on = 0, en = 0;
+    struct pollfd p[2] = { { out[0], POLLIN, 0 }, { err[0], POLLIN, 0 } };
+    int open_fds = 2;
+    while (open_fds > 0 && poll(p, 2, 10000) > 0) {
+        for (int i = 0; i < 2; i++) {
+            if (p[i].fd < 0 || !(p[i].revents & (POLLIN | POLLHUP))) continue;
+            char *b = i ? eb : ob; size_t *n = i ? &en : &on; size_t cap = i ? sizeof eb : sizeof ob;
+            ssize_t r = read(p[i].fd, b + *n, cap - 1 - *n);
+            if (r <= 0) { close(p[i].fd); p[i].fd = -1; open_fds--; } else *n += (size_t)r;
+        }
+    }
+    ob[on] = 0; eb[en] = 0;
+    for (int i = 0; i < 2; i++) if (p[i].fd >= 0) close(p[i].fd);
+    int st = 0; waitpid(pid, &st, 0);
+    if (en) { char *nl = strchr(eb, '\n'); if (nl) *nl = 0; fail(N, "stderr not empty: \"%.60s\"", eb); return; }
+    if (!strstr(ob, " 2 received")) { char *s = strstr(ob, "packets transmitted"); fail(N, "%s", s ? s : "no statistics line"); return; }
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { fail(N, "exit status %d", st); return; }
+    pass(N);
+}
+
 /* The default route as `route -n` reads it: Destination 0, flags UP|GATEWAY. */
 static int default_route(char *gw, size_t gwn, char *ifname, size_t ifn) {
     FILE *f = fopen("/proc/net/route", "r");
@@ -1060,6 +1128,7 @@ int main(int argc, char **argv) {
     icmp_echo_case("icmp_dgram", SOCK_DGRAM, gw);
     icmp_timeout_cases();
     icmp_peek_cases(gw);
+    ping_tool(gw);
     udp_dns_raw(dns, name);
     udp_getaddrinfo(name);
     tcp_dns(dns, name);

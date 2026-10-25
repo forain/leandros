@@ -25,8 +25,8 @@ fn command_sizes_match_the_firmware_structs() {
     // Scan: config v1 = 36 bytes + the channel array; request v7 = 48 +
     // channel configs + tail v1 (8 + 4 + 528 + 20 * 34).
     let ch = [1u8, 6, 11, 36];
-    assert_eq!(scan_config_v1(3, 3, &[0; 6], 0, &ch, 52).len(), 36 + 52);
-    let r = scan_req_umac_v7(0, 0, &[2; 6], &ch, 52, &[b"home"], false);
+    assert_eq!(scan_config_v1(3, 3, &[0; 6], 0, &ch, 52, ScanTiming::UNASSOC).len(), 36 + 52);
+    let r = scan_req_umac_v7(0, 0, &[2; 6], &ch, 52, &[b"home"], false, ScanTiming::UNASSOC);
     assert_eq!(r.len(), 48 + 52 * 8 + 8 + 4 + 528 + 680);
 }
 
@@ -47,7 +47,7 @@ fn phy_ctxt_layout() {
 #[test]
 fn scan_request_layout() {
     let ch = [1u8, 6, 11];
-    let r = scan_req_umac_v7(3, 0, &[2, 0, 0, 0, 0, 1], &ch, 52, &[b"myssid"], false);
+    let r = scan_req_umac_v7(3, 0, &[2, 0, 0, 0, 0, 1], &ch, 52, &[b"myssid"], false, ScanTiming::UNASSOC);
     assert_eq!(&r[4..8], &3u32.to_le_bytes()); // uid
     let gen = u16::from_le_bytes([r[12], r[13]]);
     assert_eq!(gen, SCAN_GEN_FLAGS_PASS_ALL | SCAN_GEN_FLAGS_ADAPTIVE_DWELL);
@@ -69,9 +69,27 @@ fn scan_request_layout() {
     assert_eq!(&r[ssids..ssids + 2], &[0, 0]); // wildcard
     assert_eq!(&r[ssids + 34..ssids + 42], &[0, 6, b'm', b'y', b's', b's', b'i', b'd']);
     // Passive: no SSID bitmap, PASSIVE flag.
-    let p = scan_req_umac_v7(0, 0, &[2; 6], &ch, 52, &[], true);
+    let p = scan_req_umac_v7(0, 0, &[2; 6], &ch, 52, &[], true, ScanTiming::UNASSOC);
     assert_ne!(u16::from_le_bytes([p[12], p[13]]) & SCAN_GEN_FLAGS_PASSIVE, 0);
     assert_eq!(&p[48..52], &[0, 0, 0, 0]);
+}
+
+#[test]
+fn scan_timing_associated() {
+    // iwlmvm: an associated scan is fragmented, returning to the operating
+    // channel between dwells (max_out_time / suspend_time nonzero).
+    let ch = [1u8, 6, 11];
+    let le = |r: &[u8], o: usize| u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]]);
+    let a = scan_req_umac_v7(0, 0, &[2; 6], &ch, 52, &[], false, ScanTiming::for_assoc(true));
+    for o in [24, 28] { assert!(le(&a, o) > 0 && le(&a, o) <= 120, "max_out_time at {}", o); }
+    for o in [32, 36] { assert!(le(&a, o) > 0, "suspend_time at {}", o); }
+    assert_eq!(le(&a, 40), 6); // scan_priority still follows
+    assert!(a[17] as u32 <= le(&a, 24)); // passive dwell fits in one excursion
+    let c = scan_config_v1(3, 3, &[0; 6], 0, &ch, 52, ScanTiming::for_assoc(true));
+    assert!(le(&c, 16) > 0 && le(&c, 20) > 0);
+    // Unassociated: no budget.
+    let u = scan_req_umac_v7(0, 0, &[2; 6], &ch, 52, &[], false, ScanTiming::for_assoc(false));
+    assert_eq!(&u[24..40], &[0u8; 16]);
 }
 
 #[test]

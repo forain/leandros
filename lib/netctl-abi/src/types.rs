@@ -396,6 +396,9 @@ pub mod scan_req_flags {
     /// Bypass coalescing: always run a fresh scan (rate-limited by the kernel
     /// to one per 2 s).
     pub const FORCE: u32 = 1 << 0;
+    /// The flags of an explicit user scan (`netctl scan`): always fresh, also
+    /// while associated (a background scan on the firmware's channel set).
+    pub const USER: u32 = FORCE;
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────

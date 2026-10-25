@@ -57,7 +57,14 @@ pub fn set_cmdline(s: &str) {
         buf[..n].copy_from_slice(&s.as_bytes()[..n]);
         CMDLINE_LEN = n;
     }
+    CMDLINE_SET.store(true, core::sync::atomic::Ordering::Release);
 }
+
+/// The command line has been handed over ([`set_cmdline`] ran).
+pub fn cmdline_known() -> bool {
+    CMDLINE_SET.load(core::sync::atomic::Ordering::Acquire)
+}
+static CMDLINE_SET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn cmdline() -> &'static str {
     unsafe {
