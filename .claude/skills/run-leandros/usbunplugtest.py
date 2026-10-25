@@ -588,7 +588,7 @@ def phase_readers(arch, run_id, env):
 
 
 def main():
-    arch = sys.argv[1] if len(sys.argv) > 1 else "aarch64"
+    arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
     which = sys.argv[2] if len(sys.argv) > 2 else "all"
     run_id = os.environ.get("LEANDROS_RUN_ID", "x")
     sys.path.insert(0, HERE)

@@ -136,7 +136,7 @@ def main(argv):
         i += 1
     caller = os.environ.get("LEANDROS_RUN_ID", "")
     detected = running_arch()
-    arch = arch or detected or os.environ.get("LEANDROS_TEST_ARCH") or "aarch64"
+    arch = arch or os.environ.get("LEANDROS_TEST_ARCH") or detected or "aarch64"
     if detected is not None:
         print(f"netroamtest: stopping the running VM (run id '{caller}')", flush=True)
         subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)

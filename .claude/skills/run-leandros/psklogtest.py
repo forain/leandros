@@ -32,7 +32,7 @@ CMDLINE = f"wifi.ssid=PskLeakNet wifi.psk={FAKE}"
 
 
 def main(argv):
-    arch = argv[0] if argv and argv[0] in ("aarch64", "x86_64") else "aarch64"
+    arch = argv[0] if argv and argv[0] in ("aarch64", "x86_64") else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
     caller = os.environ.get("LEANDROS_RUN_ID", "")
     run_id = f"{caller}-psklog" if caller else "psklog"
     tmp = tempfile.mkdtemp(prefix="psklog-")

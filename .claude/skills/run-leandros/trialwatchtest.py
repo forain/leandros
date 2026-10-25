@@ -37,7 +37,7 @@ ARMED = "[netwatch] armed"
 
 
 def main(argv):
-    arch = next((a for a in argv if a in ("aarch64", "x86_64")), "aarch64")
+    arch = next((a for a in argv if a in ("aarch64", "x86_64")), os.environ.get("LEANDROS_TEST_ARCH", "aarch64"))
     keep = "--keep" in argv
     caller = os.environ.get("LEANDROS_RUN_ID", "")
     run_id = f"{caller}-trialwatch" if caller else "trialwatch"
