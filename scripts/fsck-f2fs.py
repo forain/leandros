@@ -18,6 +18,12 @@ indirect node, xattr node and data block reachable from it:
   - every segment's vblocks equals the population of its valid map,
   - every dentry names an inode the NAT maps, and directory link counts.
 
+Both node formats are understood: legacy (footer at 4076, 1019 slots per
+node) and lx (the `LeandrOS lxnode1` superblock marker: Linux's layout, see
+scripts/f2fslx.py). On lx volumes it also checks every node footer's ino and
+node offset, i_blocks, i_current_depth, inline flags, each dentry's hash and
+that the name sits in a block of the bucket Linux would search.
+
 Blocks the SIT marks valid that nothing reaches are reported as leaked (an
 error with --strict-leaks). With --churn DIR (a volume path such as
 /gc), DIR/MANIFEST written by `f2fstest churn` is read and every file it
@@ -25,9 +31,13 @@ lists is checked for size and content, word by word.
 
 Exit 0 iff no errors.
 """
+import os
 import struct
 import sys
 import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import f2fslx  # noqa: E402
 
 BLOCK = 4096
 NAT_ENTRY = 9
@@ -39,6 +49,19 @@ ADDRS_PER_DNODE = NODE_FOOTER // 4      # 1019
 INODE_UNION = 364
 INODE_NIDS = 4056
 S_IFMT, S_IFDIR = 0o170000, 0o040000
+F2FS_FT_DIR, F2FS_FT_MAX = 2, 8
+
+
+class Layout:
+    """Node-format offsets of one volume."""
+    def __init__(self, lx):
+        self.lx = lx
+        if lx:
+            self.footer, self.per = f2fslx.FOOTER, f2fslx.ADDRS_PER_BLOCK
+            self.union, self.nids, self.xattr = f2fslx.I_ADDR, f2fslx.I_NID, f2fslx.I_XATTR_NID
+        else:
+            self.footer, self.per = NODE_FOOTER, ADDRS_PER_DNODE
+            self.union, self.nids, self.xattr = INODE_UNION, INODE_NIDS, 24
 
 
 CPJ_MAGIC, CPJ_MAGIC_OFF = 0x314A504C, 3072
@@ -113,6 +136,8 @@ class Vol:
         sb = self.blk(0)[1024:]
         if r32(sb, 0) != 0xF2F52010:
             raise SystemExit("not an f2fs volume")
+        self.lx = f2fslx.is_lx_superblock(sb)
+        self.L = Layout(self.lx)
         self.bps = 1 << r32(sb, 20)
         self.block_count = r64(sb, 36)
         self.seg_cnt_ckpt = r32(sb, 52)
@@ -213,6 +238,10 @@ class Vol:
         o = (nid % NAT_PER_BLK) * NAT_ENTRY
         return r32(b, o + 5)
 
+    def nat_ino(self, nid):
+        b = self.blk(self.nat_blk + nid // NAT_PER_BLK)
+        return r32(b, (nid % NAT_PER_BLK) * NAT_ENTRY + 1)
+
     def sit_raw(self, seg):
         b = self.blk(self.sit_blk + seg // SIT_PER_BLK)
         o = (seg % SIT_PER_BLK) * SIT_ENTRY
@@ -224,11 +253,19 @@ class Vol:
         return r16(b, o) & 0x3FF, b[o + 2:o + 66]
 
 
-def inode_addrs(ib):
-    base = INODE_UNION
+def inode_addrs(ib, L=None):
+    """The inode's i_addr slots, or None for an lx inode whose data or
+    dentries are inline (not implemented; never misread them as addresses)."""
+    L = L or Layout(False)
+    base, end = L.union, L.nids
+    if L.lx:
+        if ib[3] & (f2fslx.F2FS_INLINE_DATA | f2fslx.F2FS_INLINE_DENTRY):
+            return None
+        if ib[3] & f2fslx.F2FS_INLINE_XATTR:
+            end -= 4 * f2fslx.DEFAULT_INLINE_XATTR_ADDRS
     if ib[3] & 0x20:
-        base = INODE_UNION + min(r16(ib, INODE_UNION) // 4, 64) * 4
-    n = (INODE_NIDS - base) // 4
+        base = L.union + min(r16(ib, L.union) // 4, 64) * 4
+    n = (end - base) // 4
     return [r32(ib, base + 4 * i) for i in range(n)]
 
 
@@ -243,6 +280,9 @@ class Fsck:
         self.dir_children = {}
         self.link_errors = []
         self.unknown_links = 0
+        self.nodes_seen = 0
+        self.lx_ftypes = []      # lx dentries: (dir, name, child, ft) checked against i_mode
+        self.lx_checked = 0
 
     def err(self, m):
         if len(self.errors) < 50:
@@ -253,7 +293,7 @@ class Fsck:
         off = a - self.v.main_blk
         seg, b = divmod(off, self.v.bps)
         m = self.valid[seg]
-        return (m[b // 8] >> (b % 8)) & 1
+        return (m[b // 8] >> ((7 - b % 8) if self.v.lx else (b % 8))) & 1
 
     def ref(self, a, what):
         v = self.v
@@ -268,61 +308,80 @@ class Fsck:
             self.err(f"{what}: block {a} is in use but the SIT marks it free")
         return True
 
-    def node(self, nid, what):
+    def node(self, nid, what, ino=None, ofs=None):
+        """The node block of `nid`; on lx volumes its footer must also name
+        owner `ino` and node offset `ofs` (Linux get_node_path numbering)."""
         a = self.v.nat(nid)
         if a == 0:
             self.err(f"{what}: nid {nid} has no NAT entry")
             return None
         if not self.ref(a, f"{what} (nid {nid})"):
             return None
+        self.nodes_seen += 1
         b = self.v.blk(a)
-        if r32(b, NODE_FOOTER) != nid:
-            self.err(f"{what}: node block {a} footer nid {r32(b, NODE_FOOTER)} != {nid}")
+        F = self.v.L.footer
+        if r32(b, F) != nid:
+            self.err(f"{what}: node block {a} footer nid {r32(b, F)} != {nid}")
+        if self.v.lx and ino is not None:
+            _n, fino, fofs, _bits, _cp = f2fslx.footer(b)
+            if fino != ino:
+                self.err(f"{what}: node block {a} footer ino {fino} != {ino}")
+            if self.v.nat_ino(nid) != ino:
+                self.err(f"{what}: NAT entry of nid {nid} names ino {self.v.nat_ino(nid)} != {ino}")
+            if ofs is not None and fofs != ofs:
+                self.err(f"{what}: node block {a} footer ofs {fofs:#x} != {ofs:#x}")
         return b
 
     def file_blocks(self, ino, ib):
         """Logical-order data block addresses (0 = hole) of inode `ino`."""
+        L = self.v.L
+        PER = L.per
         out = []
-        for a in inode_addrs(ib):
-            out.append(a)
-        def dnode(nid, tag):
+        addrs = inode_addrs(ib, L)
+        if addrs is None:
+            self.err(f"ino {ino}: inline data/dentry flags {ib[3]:#x} (not supported)")
+            return out
+        out.extend(addrs)
+        def dnode(nid, tag, ofs):
             if nid == 0:
-                out.extend([0] * ADDRS_PER_DNODE)
+                out.extend([0] * PER)
                 return
-            b = self.node(nid, f"ino {ino} {tag}")
+            b = self.node(nid, f"ino {ino} {tag}", ino, ofs)
             if b is None:
-                out.extend([0] * ADDRS_PER_DNODE)
+                out.extend([0] * PER)
                 return
-            out.extend(r32(b, 4 * i) for i in range(ADDRS_PER_DNODE))
-        def indirect(nid, tag):
+            out.extend(r32(b, 4 * i) for i in range(PER))
+        def indirect(nid, tag, ofs, kid_ofs):
             if nid == 0:
                 return False
-            b = self.node(nid, f"ino {ino} {tag}")
+            b = self.node(nid, f"ino {ino} {tag}", ino, ofs)
             if b is None:
                 return False
-            kids = [r32(b, 4 * i) for i in range(ADDRS_PER_DNODE)]
+            kids = [r32(b, 4 * i) for i in range(PER)]
             last = max([i for i, k in enumerate(kids) if k] or [-1])
             for i in range(last + 1):
-                dnode(kids[i], f"{tag}[{i}] dnode")
+                dnode(kids[i], f"{tag}[{i}] dnode", kid_ofs(i))
             return True
-        nids = [r32(ib, INODE_NIDS + 4 * k) for k in range(5)]
+        nids = [r32(ib, L.nids + 4 * k) for k in range(5)]
+        X = f2fslx
         if any(nids):
-            dnode(nids[0], "dnode0")
-            dnode(nids[1], "dnode1")
+            dnode(nids[0], "dnode0", X.ofs_dnode(0))
+            dnode(nids[1], "dnode1", X.ofs_dnode(1))
             if nids[2] or nids[3] or nids[4]:
-                if not indirect(nids[2], "ind0"):
-                    out.extend([0] * ADDRS_PER_DNODE * ADDRS_PER_DNODE)
+                if not indirect(nids[2], "ind0", X.ofs_ind(0), lambda i: X.ofs_ind_child(0, i)):
+                    out.extend([0] * PER * PER)
                 if nids[3] or nids[4]:
-                    if not indirect(nids[3], "ind1"):
-                        out.extend([0] * ADDRS_PER_DNODE * ADDRS_PER_DNODE)
+                    if not indirect(nids[3], "ind1", X.ofs_ind(1), lambda i: X.ofs_ind_child(1, i)):
+                        out.extend([0] * PER * PER)
                     if nids[4]:
-                        b = self.node(nids[4], f"ino {ino} dind")
+                        b = self.node(nids[4], f"ino {ino} dind", ino, X.OFS_DIND)
                         if b is not None:
-                            kids = [r32(b, 4 * i) for i in range(ADDRS_PER_DNODE)]
+                            kids = [r32(b, 4 * i) for i in range(PER)]
                             last = max([i for i, k in enumerate(kids) if k] or [-1])
                             for i in range(last + 1):
-                                if not indirect(kids[i], f"dind[{i}]"):
-                                    out.extend([0] * ADDRS_PER_DNODE * ADDRS_PER_DNODE)
+                                if not indirect(kids[i], f"dind[{i}]", X.ofs_dind_ind(i),
+                                                lambda k, j=i: X.ofs_dind_dnode(j, k)):
+                                    out.extend([0] * PER * PER)
         for i, a in enumerate(out):
             if a:
                 self.ref(a, f"ino {ino} data[{i}]")
@@ -344,7 +403,8 @@ class Fsck:
             a = v.nat(o)
             if o > v.root and a and self.is_valid(a):
                 b = v.blk(a)
-                if r32(b, 4076) == o and r32(b, 4080) == o and r32(b, 12) == 0 and r16(b, 0):
+                F = v.L.footer
+                if r32(b, F) == o and r32(b, F + 4) == o and r32(b, 12) == 0 and r16(b, 0):
                     self.orphans.append(o)
         todo += self.orphans
         seen = set()
@@ -353,21 +413,38 @@ class Fsck:
             if ino in seen:
                 continue
             seen.add(ino)
-            ib = self.node(ino, f"inode {ino}")
+            n0 = self.nodes_seen
+            ib = self.node(ino, f"inode {ino}", ino, 0)
             if ib is None:
                 continue
-            xnid = r32(ib, 24)
+            xnid = r32(ib, v.L.xattr)
             if xnid:
-                self.node(xnid, f"ino {ino} xattr")
+                self.node(xnid, f"ino {ino} xattr", ino, f2fslx.XATTR_NODE_OFFSET)
             mode, links, size = r16(ib, 0), r32(ib, 12), r64(ib, 16)
             blocks = self.file_blocks(ino, ib)
             self.inodes[ino] = (mode, links, size, blocks)
-            if mode & S_IFMT == S_IFDIR:
+            is_dir = mode & S_IFMT == S_IFDIR
+            if v.lx:
+                self.lx_checked += 1
+                want = (self.nodes_seen - n0) + sum(1 for a in blocks if a)
+                if r64(ib, f2fslx.I_BLOCKS) != want:
+                    self.err(f"ino {ino}: i_blocks {r64(ib, f2fslx.I_BLOCKS)} != {want} "
+                             f"(inode + node + data blocks)")
+                if ib[f2fslx.I_ADVISE] & 0x80:
+                    self.warnings.append(f"ino {ino}: i_advise bit 0x80 (FADVISE_TRUNC on Linux)")
+            if is_dir:
                 kids = []
                 nblk = (size + BLOCK - 1) // BLOCK
-                for a in blocks[:nblk]:
+                depth = r32(ib, f2fslx.I_CURRENT_DEPTH) if v.lx else 0
+                dir_level = ib[f2fslx.I_DIR_LEVEL] if v.lx else 0
+                if v.lx and depth < 1:
+                    self.err(f"dir {ino}: i_current_depth {depth} < 1")
+                for pgofs, a in enumerate(blocks[:nblk]):
                     if a == 0:
                         continue
+                    if v.lx and f2fslx.block_level(pgofs, dir_level) >= depth:
+                        self.err(f"dir {ino}: block {pgofs} lies past i_current_depth {depth}: "
+                                 f"Linux never looks there")
                     d = v.blk(a)
                     slot = 0
                     while slot < 214:
@@ -378,6 +455,9 @@ class Fsck:
                         child, nlen, ft = r32(d, e + 4), r16(d, e + 8), d[e + 10]
                         name = d[2384 + slot * 8:2384 + slot * 8 + nlen]
                         kids.append((name, child, ft))
+                        if v.lx:
+                            self.check_lx_dentry(ino, pgofs, dir_level, name, r32(d, e), ft)
+                            self.lx_ftypes.append((ino, name, child, ft))
                         slot += max(1, (nlen + 7) // 8)
                 self.dir_children[ino] = kids
                 for name, child, ft in kids:
@@ -388,22 +468,43 @@ class Fsck:
                         continue
                     todo.append(child)
         # Link counts of directories: 2 + subdirectories.
+        def kid_is_dir(c, ft):
+            if not v.lx:
+                return ft == 4
+            m = self.inodes.get(c)
+            return (m[0] & S_IFMT == S_IFDIR) if m else ft == F2FS_FT_DIR
         for ino, kids in self.dir_children.items():
-            subdirs = sum(1 for n, c, ft in kids if ft == 4 and n not in (b".", b".."))
+            subdirs = sum(1 for n, c, ft in kids if kid_is_dir(c, ft) and n not in (b".", b".."))
             links = self.inodes[ino][1]
             if links == 1:
                 self.unknown_links += 1     # pre-f2fsync mkdir: "unknown"
             elif links != 2 + subdirs:
                 self.link_errors.append(f"dir {ino}: i_links {links} != {2 + subdirs}")
+        for dino, name, c, ft in self.lx_ftypes:
+            m = self.inodes.get(c)
+            if m and 0 < ft < F2FS_FT_MAX and ft != f2fslx.mode_to_ft(m[0]):
+                self.err(f"dir {dino}: {name!r} file type {ft} != {f2fslx.mode_to_ft(m[0])} "
+                         f"(F2FS_FT_* of inode {c}'s i_mode)")
         valid = sum(sum(bin(x).count("1") for x in m) for m in self.valid.values())
         self.leaked = []
         for seg, m in self.valid.items():
             for b in range(v.bps):
-                if (m[b // 8] >> (b % 8)) & 1:
+                if (m[b // 8] >> ((7 - b % 8) if self.v.lx else (b % 8))) & 1:
                     a = v.main_blk + seg * v.bps + b
                     if a not in self.owner:
                         self.leaked.append(a)
         self.valid_total = valid
+
+    def check_lx_dentry(self, dino, pgofs, dir_level, name, h, ft):
+        want = f2fslx.dentry_hash(name)
+        if h != want:
+            self.err(f"dir {dino}: {name!r} hash {h:#010x} != f2fs_dentry_hash {want:#010x}")
+            return
+        lo, hi = f2fslx.bucket_range(want, pgofs, dir_level)
+        if not lo <= pgofs < hi:
+            self.err(f"dir {dino}: {name!r} in block {pgofs}, Linux searches blocks [{lo}, {hi})")
+        if not 0 < ft < F2FS_FT_MAX:
+            self.err(f"dir {dino}: {name!r} file type {ft} is not an F2FS_FT_* value")
 
     def lookup(self, path):
         ino = self.v.root
@@ -477,7 +578,7 @@ def linux_check(v):
     segs, ssa, sit, nat, ckpt = r32(sb, 48), r32(sb, 64), r32(sb, 56), r32(sb, 60), r32(sb, 52)
     rsvd, ovp = r32(cp, 24), r32(cp, 28)
     fsmeta = ckpt + sit + nat + rsvd + ssa
-    if fsmeta >= segs or fsmeta < 8 or ovp == 0 or rsvd == 0:
+    if fsmeta >= segs or fsmeta < 9 or ovp == 0 or rsvd == 0:   # fsck.f2fs F2FS_MIN_SEGMENT
         bad.append(f"Wrong layout (fsmeta {fsmeta}, ovp {ovp}, rsvd {rsvd})")
     # Linux sanity_check_area_boundary: segment_count counts from
     # segment0_blkaddr and must end where the main area ends.
@@ -555,6 +656,7 @@ def main(argv):
             i += 2
         elif argv[i] == "--linux":
             linux = True
+            i += 1
         elif argv[i] == "--strict-leaks":
             strict = True
             i += 1
@@ -576,6 +678,11 @@ def main(argv):
         unk = v.incompat & ~CPJ_INCOMPAT_KNOWN
         print(f"feature mask {v.incompat:#x}: known bits {v.incompat & CPJ_INCOMPAT_KNOWN:#x}, "
               f"unknown bits {unk:#x}" + (" (a kernel mounts this volume read-only)" if unk else ""))
+    if v.lx:
+        print(f"node format: lx (Linux layout), {f.lx_checked} inodes checked for footer ofs, "
+              f"i_blocks, dentry hash and bucket")
+    else:
+        print("node format: legacy")
     if v.orphans:
         print(f"orphan list: {len(v.orphans)} nid(s), {len(f.orphans)} still unlinked inodes (reaped at mount)")
     if v.journal_blocks:
