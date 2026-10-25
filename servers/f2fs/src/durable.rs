@@ -87,6 +87,27 @@ pub(crate) const CPJ_INCOMPAT_KNOWN: u32 = CPJ_INCOMPAT_RF;
 const _: () = assert!(2 * crate::CACHE_MAX_SLOTS + (2 * crate::CACHE_MAX_SLOTS + JIX_PER_BLK - 1) / JIX_PER_BLK
                       <= 511 + CPJ_EXT_MAX * 512);
 pub(crate) const CP_CRC_OFF: usize = 4092;
+/// Linux layout (lane f2fscrc, L12 #46): `checksum_offset` holds
+/// CP_CHKSUM_OFFSET (4092) and the CRC at `CP_CRC_OFF` is Linux's f2fs_crc32
+/// (crc32_le seeded with the superblock magic, no inversion). A commit block
+/// whose field is 0 was written before this lane: zlib CRC32 there, and its
+/// journal and roll-forward records may use the whole pack.
+pub(crate) const CP_CHKSUM_FIELD: usize = 164;
+/// Blocks at the end of every pack kept zero for Linux. The commit block says
+/// `cp_pack_total_block_count` = 1 (it is its own footer), so Linux reads a
+/// pack's six curseg summaries from the six blocks just before it: the end of
+/// the superblock segment for pack 0, the end of pack 0 for pack 1.
+pub(crate) const LINUX_TAIL: u32 = 6;
+/// Linux's f2fs_crc32 over `data`.
+pub(crate) fn linux_crc(data: &[u8]) -> u32 { !crc32_upd(!F2FS_MAGIC, data) }
+/// Commit block written before lane f2fscrc (zlib CRC, full-size pack)?
+pub(crate) fn cp_is_legacy(b: &[u8; BLOCK_SIZE]) -> bool { r32(b, CP_CHKSUM_FIELD) != CP_CRC_OFF as u32 }
+/// Stamp `checksum_offset` and the Linux CRC into a finished commit block.
+pub(crate) fn cp_seal(b: &mut [u8; BLOCK_SIZE]) {
+    w32(b, CP_CHKSUM_FIELD, CP_CRC_OFF as u32);
+    let c = linux_crc(&b[..CP_CRC_OFF]);
+    w32(b, CP_CRC_OFF, c);
+}
 /// Orphan list (lane f2fsorphan): a u32 count at `CPJ_ORPHAN_CNT_OFF`, then
 /// the nids of inodes whose last name was gone while a descriptor or mapping
 /// still held them when the checkpoint was cut (Linux's orphan area). Inside
@@ -151,7 +172,8 @@ pub(crate) fn crc32_upd(crc: u32, data: &[u8]) -> u32 {
 
 /// A commit block with the journal extension: is its CRC right?
 pub(crate) fn cp_block_valid(b: &[u8; BLOCK_SIZE]) -> bool {
-    crc32_upd(0, &b[..CP_CRC_OFF]) == r32(b, CP_CRC_OFF)
+    let want = r32(b, CP_CRC_OFF);
+    if cp_is_legacy(b) { crc32_upd(0, &b[..CP_CRC_OFF]) == want } else { linux_crc(&b[..CP_CRC_OFF]) == want }
 }
 
 pub(crate) fn cp_block_has_journal(b: &[u8; BLOCK_SIZE]) -> bool {
@@ -285,6 +307,8 @@ fn dflush(dev: usize) -> bool {
 // ── Per-mount state ──────────────────────────────────────────────────────────
 
 pub(crate) struct Durable {
+    /// Pack 0's Linux tail may hold pre-f2fscrc data (cleared by the first pack-1 commit).
+    pub tail_dirty: bool,
     /// Main-area blocks allocated since the last checkpoint snapshot (free
     /// in the durable checkpoint): written in place before the commit.
     pub fresh_pending: BTreeMap<u32, SegMap>,
@@ -328,6 +352,7 @@ pub(crate) struct Durable {
 impl Durable {
     pub(crate) fn new(ver: u64, pack: u8) -> Self {
         Durable {
+            tail_dirty: true,
             fresh_pending: BTreeMap::new(), fresh_inflight: BTreeMap::new(), nid_pending: BTreeSet::new(), nid_inflight: Vec::new(),
             nid_pool: Vec::new(), inflight_ver: 0, inflight_pack: 0, inflight_rf_start: 0,
             durable_ver: ver, durable_pack: pack, rf_next: 0, rf_end: 0, rf_start: 0, rf_seq: 0,
@@ -350,6 +375,8 @@ fn committed_slot(port: u32) -> Option<&'static atomic::AtomicU64> {
 pub(crate) fn committed_init(slot: usize, ver: u64) { COMMITTED[slot].store(ver, atomic::Ordering::SeqCst); }
 
 fn pack_blocks(ms: &MountState) -> u32 { (ms.sb.seg_cnt_ckpt / 2) * ms.sb.blocks_per_seg }
+/// The part of a pack this kernel writes (journal, roll-forward records).
+fn pack_room(ms: &MountState) -> u32 { pack_blocks(ms) - LINUX_TAIL }
 fn pack_base(ms: &MountState, pack: u8) -> u64 { (ms.sb.cp_blkaddr + pack as u32 * pack_blocks(ms)) as u64 }
 
 /// A block was allocated (log_alloc).
@@ -482,6 +509,9 @@ pub(crate) struct CpJob {
     pub cp_blkno: u64,
     pub cp_buf: [u8; BLOCK_SIZE],
     pub umount: bool,
+    /// Pack 0's Linux tail to zero once this commit (pack 1) is durable: a
+    /// pre-f2fscrc kernel may have left journal or records there (0 = none).
+    pub zero_tail: u64,
     pub reg_blocks: [u32; REGS],
 }
 
@@ -503,7 +533,7 @@ pub(crate) fn settle(ms: &mut MountState) {
         let st = ms.dur.inflight_rf_start;
         ms.dur.rf_next = st;
         ms.dur.rf_start = st;
-        ms.dur.rf_end = if st == 0 { 0 } else { pack_blocks(ms) };
+        ms.dur.rf_end = if st == 0 { 0 } else { pack_room(ms) };
         ms.dur.rf_seq = 0;
         ms.dur.rf_last.clear();
         let done = cp_seq(ms.port).map_or(0, |s| s.done.load(atomic::Ordering::SeqCst));
@@ -556,7 +586,7 @@ fn pick_ext(ms: &mut MountState, out: &mut [u32; CPJ_EXT_MAX], n: usize) -> bool
 /// Upper bound of the blocks a checkpoint journal can hold: the pack's spare
 /// blocks plus half the (stale-high) free whole segments, 512 blocks each.
 pub(crate) fn journal_room(ms: &MountState) -> usize {
-    (pack_blocks(ms) as usize).saturating_sub(1) + 512 * (ms.dur.ext_free as usize / 2)
+    (pack_room(ms) as usize).saturating_sub(1) + 512 * (ms.dur.ext_free as usize / 2)
 }
 
 /// Phase 1 (lock held): snapshot every dirty slot (and, `with_wb`, every
@@ -594,7 +624,7 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     let j = jidx.len();
     let h = (j + JIX_PER_BLK - 1) / JIX_PER_BLK;
     let total = (h + j) as u32;
-    let pack_cap = pack_blocks(ms) - 1;
+    let pack_cap = pack_room(ms) - 1;
     let ext_n = if total > pack_cap { ((total - pack_cap) as usize + 511) / 512 } else { 0 };
     if ext_n > CPJ_EXT_MAX { return Err(()); }
     let mut ext_arr = [0u32; CPJ_EXT_MAX];
@@ -654,7 +684,7 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     w32(&mut cp_buf, CPJ_COUNT_OFF, j as u32);
     w32(&mut cp_buf, CPJ_NEXT_OFF, ext_segs.len() as u32);
     for (q, &s) in ext_segs.iter().enumerate() { w32(&mut cp_buf, CPJ_EXT_OFF + 4 * q, s); }
-    let rf_start = if ext_n == 0 && 1 + total < pack_blocks(ms) { 1 + total } else { 0 };
+    let rf_start = if ext_n == 0 && 1 + total < pack_room(ms) { 1 + total } else { 0 };
     // The snapshot: frees, fresh blocks and ids up to now belong to it.
     prot_snapshot(ms);
     for &s in ext_segs {
@@ -670,9 +700,13 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     ms.dur.inflight_pack = pack;
     ms.dur.inflight_rf_start = rf_start;
     let ext = ext_segs.iter().map(|&s| ms.sb.main_blkaddr as u64 + s as u64 * ms.sb.blocks_per_seg as u64).collect();
+    let zero_tail = if pack == 1 && ms.dur.tail_dirty {
+        ms.dur.tail_dirty = false;
+        pack_base(ms, 0) + pack_room(ms) as u64
+    } else { 0 };
     Ok(CpJob {
         dev: ms.dev, ver: ms.cp.ver, direct, direct_reg, jhome, jimg,
-        pack_base: pack_base(ms, pack), pack_cap, ext, cp_blkno, cp_buf, umount, reg_blocks,
+        pack_base: pack_base(ms, pack), pack_cap, ext, cp_blkno, cp_buf, umount, reg_blocks, zero_tail,
     })
 }
 
@@ -741,8 +775,7 @@ pub(crate) fn cp_write(job: &mut CpJob, port: u32) -> CpIo {
     io.flush_ns += sched::monotonic_ns().saturating_sub(tf);
     if !io.ok { io.home_ok = false; return io; }
     w32(&mut job.cp_buf, CPJ_CRC_OFF, crc);
-    let c = crc32_upd(0, &job.cp_buf[..CP_CRC_OFF]);
-    w32(&mut job.cp_buf, CP_CRC_OFF, c);
+    cp_seal(&mut job.cp_buf);
     let t = sched::monotonic_ns();
     io.ok &= dw(dev, job.cp_blkno, &job.cp_buf);
     io.reg_cmds[REG_CP] += 1;
@@ -752,6 +785,10 @@ pub(crate) fn cp_write(job: &mut CpJob, port: u32) -> CpIo {
     io.flush_ns += sched::monotonic_ns().saturating_sub(tf);
     if !io.ok { io.home_ok = false; return io; }
     if let Some(c) = committed_slot(port) { c.fetch_max(job.ver, atomic::Ordering::SeqCst); }
+    if job.zero_tail != 0 {
+        let z = alloc::vec![0u8; LINUX_TAIL as usize * BLOCK_SIZE];
+        io.home_ok &= dws(dev, job.zero_tail, &z, &mut io.reg_cmds[REG_CP]);
+    }
     // Home writes, adjacent homes merged (the images are in home order).
     let mut q = 0;
     while q < j {
@@ -817,8 +854,8 @@ pub(crate) fn read_journal(dev: usize, sb: &SbInfo, base: u64, cpb: &[u8; BLOCK_
         + r32(cpb, CPJ_EXT_OFF + 4 * q) as u64 * sb.blocks_per_seg as u64).collect();
     let job_like = CpJob {
         dev, ver: 0, direct: Vec::new(), direct_reg: Vec::new(), jhome: Vec::new(), jimg: Vec::new(),
-        pack_base: base, pack_cap: pack_blks - 1, ext, cp_blkno: 0, cp_buf: [0; BLOCK_SIZE],
-        umount: false, reg_blocks: [0; REGS],
+        pack_base: base, pack_cap: pack_blks - 1 - if cp_is_legacy(cpb) { 0 } else { LINUX_TAIL }, ext, cp_blkno: 0, cp_buf: [0; BLOCK_SIZE],
+        umount: false, reg_blocks: [0; REGS], zero_tail: 0,
     };
     if total > job_like.pack_cap + 512 * next as u32 { return Err(()); }
     let h = (j + JIX_PER_BLK - 1) / JIX_PER_BLK;
@@ -1092,9 +1129,9 @@ fn sit_set(ms: &mut MountState, a: u32, used: bool) {
 /// Roll the durable pack's records forward into the cache (called at mount,
 /// after the journal replay, before the mount checkpoint). Returns how many
 /// records were applied.
-pub(crate) fn recover(ms: &mut MountState, rf_start: u32) -> u32 {
+pub(crate) fn recover(ms: &mut MountState, rf_start: u32, legacy: bool) -> u32 {
     let base = pack_base(ms, ms.dur.durable_pack);
-    let end = pack_blocks(ms);
+    let end = if legacy { pack_blocks(ms) } else { pack_room(ms) };
     let (recs, next, seq) = read_records(ms.dev, base, rf_start, end, ms.dur.durable_ver);
     ms.dur.rf_next = if rf_start == 0 { 0 } else { next };
     ms.dur.rf_end = if rf_start == 0 { 0 } else { end };
@@ -1261,7 +1298,7 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
     let j = b.len();
     let h = (j + JIX_PER_BLK - 1) / JIX_PER_BLK;
     let total = (h + j) as u32;
-    let pack_cap = pack_blocks(ms) - 1;
+    let pack_cap = pack_room(ms) - 1;
     let ext_n = if total > pack_cap { ((total - pack_cap) as usize + 511) / 512 } else { 0 };
     let mut ext_arr = [0u32; CPJ_EXT_MAX];
     if ext_n > CPJ_EXT_MAX || (ext_n > 0 && !pick_ext(ms, &mut ext_arr, ext_n)) {
@@ -1283,7 +1320,7 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
     w32(&mut cp_buf, CPJ_COUNT_OFF, j as u32);
     w32(&mut cp_buf, CPJ_NEXT_OFF, ext_n as u32);
     for (q, &sg) in ext_segs.iter().enumerate() { w32(&mut cp_buf, CPJ_EXT_OFF + 4 * q, sg); }
-    let rf_start = if ext_n == 0 && 1 + total < pack_blocks(ms) { 1 + total } else { 0 };
+    let rf_start = if ext_n == 0 && 1 + total < pack_room(ms) { 1 + total } else { 0 };
     prot_snapshot(ms);
     for &sg in ext_segs {
         let e = ms.prot_pending.entry(sg).or_insert([0; 8]);
@@ -1331,8 +1368,7 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
     if ok {
         // Phase 2: the commit block.
         w32(&mut cp_buf, CPJ_CRC_OFF, crc);
-        let c = crc32_upd(0, &cp_buf[..CP_CRC_OFF]);
-        w32(&mut cp_buf, CP_CRC_OFF, c);
+        cp_seal(&mut cp_buf);
         ok &= dw(dev, cp_blkno, &cp_buf);
         ok &= dflush(dev);
     }
