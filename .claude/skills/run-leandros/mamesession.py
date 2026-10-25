@@ -19,7 +19,6 @@ import sys
 import time
 
 os.environ.setdefault("LEANDROS_RUN_ID", "mame")
-os.environ.setdefault("LEANDROS_VNC_PORT", "5939")
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import driver  # noqa: E402

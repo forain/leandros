@@ -64,7 +64,8 @@ static uint32_t s_last_pump_ticks;
 static uint32_t s_pump_remainder;
 // Pipe lead kept ahead of pw-cat: two 1024-frame PipeWire quanta at 48 kHz,
 // expressed at DOOM's 44.1 kHz (2 x 941 frames, rounded up).
-#define PIPE_LEAD_FRAMES 2048u
+#define PIPE_LEAD_FRAMES 3072u  // 70 ms: 2048 (46 ms) ran dry on single 47 ms frames (aarch64 HVF, dry=1)
+static float s_stat_music_peak;
 static int s_pace_clock;           // LEANDROS_DOOM_AUDIO_PACE=clock: old pacing (A/B)
 static int s_stats;                // LEANDROS_DOOM_AUDIO_STATS=1: a stats line every 10 s
 static uint32_t s_stat_t0, s_stat_pumps, s_stat_max_dt, s_stat_dry, s_stat_min_fill = 0xFFFFFFFF;
@@ -211,6 +212,29 @@ void leandros_audio_send_pcm(const void* data, size_t len) {
     }
 }
 
+// Music bus. FluidR3 through TinySoundFont at its -10 dB output gain renders
+// DOOM's level music at about -30 dBFS RMS (host render of D_E1M3: RMS 1400;
+// in-game E1M5 peak 2151 of 32767 at the default music volume), far under the
+// sound effects, so on laptop speakers the music seemed not to play. Boost it
+// and keep the loud songs (D_INTRO renders at RMS 7300 before the boost) out
+// of clipping with a peak limiter: instant attack, ~0.3 s release.
+#define MUSIC_GAIN 6.0f
+#define MUSIC_CEIL 0.70f
+static float s_music_env;
+static void music_bus(float *buf, uint32_t frames) {
+    const float release = 1.0f - 1.0f / (0.3f * SAMPLE_RATE);
+    for (uint32_t i = 0; i < frames; ++i) {
+        float l = buf[i * 2] * MUSIC_GAIN, r = buf[i * 2 + 1] * MUSIC_GAIN;
+        float peak = l < 0 ? -l : l, pr = r < 0 ? -r : r;
+        if (pr > peak) peak = pr;
+        s_music_env = peak > s_music_env ? peak : s_music_env * release;
+        float g = s_music_env > MUSIC_CEIL ? MUSIC_CEIL / s_music_env : 1.0f;
+        buf[i * 2] = l * g;
+        buf[i * 2 + 1] = r * g;
+        if (s_stats && peak * g * 32767.0f > s_stat_music_peak) s_stat_music_peak = peak * g * 32767.0f;
+    }
+}
+
 void leandros_audio_pump(void) {
     if (!s_audio_open || (s_pcm_pipe < 0 && s_pw_port == 0xFFFFFFFF)) return;
     uint32_t now = SDL_GetTicks();
@@ -256,15 +280,21 @@ void leandros_audio_pump(void) {
         if (k > 0 && k < (int)sizeof line)
             k += snprintf(line + k, sizeof line - k, " max_dt=%ums dry=%u min_fill=%u\n",
                 s_stat_max_dt, s_stat_dry, s_stat_min_fill == 0xFFFFFFFF ? 0 : s_stat_min_fill);
+        // Music level over the window (0..32767): proves the synth produced
+        // sound where no one can listen (laptop, WAV-less runs).
+        if (k > 0 && k < (int)sizeof line && line[k - 1] == '\n')
+            k += snprintf(line + k - 1, sizeof line - k + 1, " music_peak=%u playing=%d\n",
+                (unsigned)s_stat_music_peak, GM_Playing()) - 1;
         if (k > 0) write(1, line, (size_t)k < sizeof line ? (size_t)k : sizeof line - 1);
         s_stat_t0 = now; s_stat_frames = 0; s_pcm_dropped = 0; s_stat_pumps = 0;
-        s_stat_max_dt = 0; s_stat_dry = 0; s_stat_min_fill = 0xFFFFFFFF;
+        s_stat_max_dt = 0; s_stat_dry = 0; s_stat_music_peak = 0; s_stat_min_fill = 0xFFFFFFFF;
     }
     float music_buf[512 * 2];
     int16_t stereo_buf[512 * 2];
     while (remaining) {
         uint32_t frames = remaining > 512 ? 512 : remaining;
         GM_Render(music_buf, frames);
+        music_bus(music_buf, frames);
         for (uint32_t frame = 0; frame < frames; ++frame) {
             float left = music_buf[frame * 2] * 32767.0f;
             float right = music_buf[frame * 2 + 1] * 32767.0f;
