@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""espresettest.py [aarch64|x86_64] -- the one-shot trial reset survives a
-failed first attempt and a power cut (openbugs #80, lane espdur).
-
-On a copy of the boot image:
+"""espresettest.py [aarch64|x86_64] -- a one-shot trial kernel is booted at
+most once even when it never gets to undo the default itself (openbugs #80,
+lanes espdur/espdur2). On a copy of the boot image:
   setup  promote a first kernel (good slot), then deploy the same build as
          the one-shot `trial` with `espctl.fault_boot=1`: in the trial boot
-         the first attempt of `espctl boot` to make good the default again
-         fails as if the ESP had answered EIO (console: `one-shot reset
-         FAILED`).
-  retry  espctl must keep retrying in the background until the reset is on
-         the medium (console: `one-shot reset done on retry`).
-  cut    `system_reset` (a power cut: no reboot(2), no sync, no flush); the
-         next boot must be the good slot (`espctl: booted good kernel`).
-         Before the retry existed the trial stayed the default and booted
+         `espctl boot`'s reset of the default fails as if the ESP had
+         answered EIO (console: `one-shot reset FAILED`).
+  fault  `system_reset` (a power cut); the next boot must be the good slot.
+         Limine consumed the one-shot (chain form, conf.rs), so the failed
+         userland reset does not matter.
+  hang   deploy a trial with `leandros.testhang=1` (the kernel hangs before
+         userland: nothing on the medium can change), reboot into it, cut
+         the power once it hangs; the next boot must be the good slot and
+         `espctl boot` must report the trial as not reaching userland.
+         Before the chain form the trial stayed the default and booted
          again -- the laptop's 2026-10-25 symptom.
 Exit 0 iff every case PASSes. Run id `<caller run id>-espreset`.
 """
@@ -72,10 +73,15 @@ def main(argv):
         p = subprocess.run([sys.executable, REMOTE, *args], env=env, capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout + p.stderr
 
-    def deploy(*extra):
+    def deploy(*extra, reboot=True):
         out = ""
         for _ in range(3):
-            rc, out = remote("deploy-kernel", "--arch", arch, "--netwatch", "0", "--reboot", *extra, timeout=1500)
+            rc, out = remote("deploy-kernel", "--arch", arch, "--netwatch", "0", *(["--reboot"] if reboot else []), *extra, timeout=1500)
+            if not reboot:
+                if rc == 0:
+                    return rc, out
+                time.sleep(10)
+                continue
             if rc == 0 or "NEW KERNEL" in out:
                 return rc, out
             time.sleep(10)
@@ -98,15 +104,30 @@ def main(argv):
                 f"deploy rc={rc} injected={bool(failed)}" + ("" if failed else f" ({out[-300:]!r})"))
         if not results["setup"]:
             return 1
-        done = wait_for(lambda: "one-shot reset done on retry" in log()[mark:], 120 * scale)
-        verdict("retry", bool(done))
-        if not done:
-            time.sleep(30 * scale)  # give an unfixed build the same chance to write
+        time.sleep(10 * scale)
         cut = len(log())
         driver._monitor_send("system_reset")
         m = wait_for(lambda: re.search(r"espctl: booted (\S+) kernel", log()[cut:]), 400 * scale)
         slot = m.group(1) if m else None
-        verdict("cut", slot == "good", f"next boot: {slot}")
+        verdict("fault", slot == "good", f"next boot: {slot}")
+
+        subprocess.run([sys.executable, DRV, "login", "root", "root", str(int(180 * scale))],
+                       env=env, capture_output=True, text=True, timeout=1200)
+        wait_for(lambda: remote("status", timeout=60)[0] == 0, 180 * scale, 5)
+        rc, out = deploy("--append", "leandros.testhang=1", reboot=False)
+        mark = len(log())
+        remote("reboot", "--no-wait", timeout=120)
+        hung = wait_for(lambda: "leandros.testhang=1: hanging before userland" in log()[mark:], 400 * scale)
+        if not hung:
+            verdict("hang", False, f"trial never hung (deploy rc={rc} {out[-200:]!r})")
+            return 1
+        time.sleep(5)
+        cut = len(log())
+        driver._monitor_send("system_reset")
+        m = wait_for(lambda: re.search(r"espctl: booted (\S+) kernel", log()[cut:]), 400 * scale)
+        slot = m.group(1) if m else None
+        noted = wait_for(lambda: "did not reach userland" in log()[cut:], 60 * scale)
+        verdict("hang", slot == "good" and bool(noted), f"next boot: {slot} disarm-noted={bool(noted)}")
     finally:
         stop()
     return 0 if results and all(results.values()) else 1
