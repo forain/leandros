@@ -309,6 +309,14 @@ impl DrmDevice {
         // We therefore always CPU-scale into resource 1 and keep the scanout
         // permanently pointed at it.
         for plane_state in state.plane_states {
+            // A pure mode set (private SET_MODE 0x1001) carries no framebuffer:
+            // there is nothing to scale or flush, and the plane keeps what it
+            // had. This used to fall into perform_software_scaling, fail with
+            // InvalidParameter and reach userspace as EPERM (errno 1) even
+            // though the CRTC mode had been applied above.
+            if plane_state.fb_id.is_none() {
+                continue;
+            }
             if self.fb_integration {
                 crate::pci::rdebug("[DRM] atomic_commit: calling perform_software_scaling\n");
                 match self.perform_software_scaling(&plane_state) {

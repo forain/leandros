@@ -116,12 +116,15 @@ def main():
         ds.wav_rms("textvt-mame", a1, ds.wav_mark())
         res["mame-vt-audio"] = {"pass": ds.AUDIO["textvt-mame"]["loud_seconds"] >= 3, **ds.AUDIO["textvt-mame"],
                                 "log": ds.sh("tail -n 3 /tmp/mame2.log", 30)[-300:]}
+        l2 = ds.sh("cat /tmp/mame2.log", 30)
+        bad = [x for x in l2.splitlines() if "SET_MODE failed" in x]
+        res["mame-vt-setmode"] = {"pass": not bad, "errors": bad[:3]}
         ds.sh("killall mame; true", 30)
         ds.sh(f"/bin/vttest chvt {desk}", 30)
     res["steps"] = ds.STEPS
     res["mame-single-run"]["pass"] &= ds.STEPS.get("mame-exit") is not None
     json.dump(res, open(f"{OUT}/analysis.json", "w"), indent=1)
-    gates = ["mame-wayland", "mame-speed", "mame-single-run", "mame-wl-key", "mame-audio"] + (["mame-vt-audio"] if "--vt" in A else [])
+    gates = ["mame-wayland", "mame-speed", "mame-single-run", "mame-wl-key", "mame-audio"] + (["mame-vt-audio", "mame-vt-setmode"] if "--vt" in A else [])
     ds.log("RESULT", json.dumps({k: res[k] for k in gates + ["keys"]}))
     ds.drv("stop", t=120)
     sys.exit(0 if all(res[k]["pass"] for k in gates) else 1)
