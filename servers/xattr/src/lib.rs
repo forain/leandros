@@ -809,3 +809,142 @@ pub fn acl_create(default_acl: Option<&[u8]>, mode: u16, umask: u16, is_dir: boo
     out.inherit_default = is_dir;
     out
 }
+
+// ── Linux-format (lx) f2fs xattr codec ───────────────────────────────────────
+//
+// On Linux-made and lx volumes the xattr store is `inline area ++ xnode[0..4072]`
+// holding a 24-byte header (magic 0xF2F52011, refcount, 16 reserved bytes) then
+// the same entry shape as the arena above, ended by 4 zero bytes. ACLs (name
+// index 2/3) are stored in the f2fs ACL format (version 1; USER_OBJ, GROUP_OBJ,
+// MASK, OTHER carry no id) while userspace sees posix_acl_xattr (version 2, all
+// entries 8 bytes). `lx_decode` turns the raw store into an ordinary arena
+// (with posix-format ACLs) so every gate/evaluator above keeps working;
+// `lx_encode` is the inverse.
+
+pub const LX_MAGIC: u32 = 0xF2F5_2011;
+pub const LX_HDR: usize = 24;
+/// Bytes of an xattr node block usable for entries (4096 - 24 B footer).
+pub const LX_XNODE: usize = 4072;
+
+const ACL_F2FS_VERSION: u32 = 1;
+const ACL_POSIX_VERSION: u32 = 2;
+
+fn acl_short_tag(tag: u16) -> bool {
+    matches!(tag, 0x01 | 0x04 | 0x10 | 0x20)
+}
+
+/// f2fs ACL value -> posix_acl_xattr value. Returns the new length.
+fn acl_f2fs_to_posix(v: &[u8], out: &mut [u8]) -> Option<usize> {
+    if v.len() < 4 || u32::from_le_bytes([v[0], v[1], v[2], v[3]]) != ACL_F2FS_VERSION {
+        return None;
+    }
+    out.get_mut(..4)?.copy_from_slice(&ACL_POSIX_VERSION.to_le_bytes());
+    let (mut r, mut w) = (4usize, 4usize);
+    while r < v.len() {
+        let tag = u16::from_le_bytes([*v.get(r)?, *v.get(r + 1)?]);
+        let perm = [*v.get(r + 2)?, *v.get(r + 3)?];
+        let id = if acl_short_tag(tag) {
+            r += 4;
+            0xFFFF_FFFFu32
+        } else {
+            let id = u32::from_le_bytes([*v.get(r + 4)?, *v.get(r + 5)?, *v.get(r + 6)?, *v.get(r + 7)?]);
+            r += 8;
+            id
+        };
+        let o = out.get_mut(w..w + 8)?;
+        o[0..2].copy_from_slice(&tag.to_le_bytes());
+        o[2..4].copy_from_slice(&perm);
+        o[4..8].copy_from_slice(&id.to_le_bytes());
+        w += 8;
+    }
+    Some(w)
+}
+
+/// posix_acl_xattr value -> f2fs ACL value. Returns the new length.
+fn acl_posix_to_f2fs(v: &[u8], out: &mut [u8]) -> Option<usize> {
+    if v.len() < 4 || u32::from_le_bytes([v[0], v[1], v[2], v[3]]) != ACL_POSIX_VERSION || (v.len() - 4) % 8 != 0 {
+        return None;
+    }
+    out.get_mut(..4)?.copy_from_slice(&ACL_F2FS_VERSION.to_le_bytes());
+    let mut w = 4usize;
+    for e in v[4..].chunks_exact(8) {
+        let tag = u16::from_le_bytes([e[0], e[1]]);
+        let n = if acl_short_tag(tag) { 4 } else { 8 };
+        out.get_mut(w..w + n)?.copy_from_slice(&e[..n]);
+        w += n;
+    }
+    Some(w)
+}
+
+/// Decode a raw lx store (`inline ++ xnode`) into `out`, a zeroed arena.
+/// A missing/odd header or malformed tail yields what parsed so far.
+pub fn lx_decode(raw: &[u8], out: &mut [u8]) {
+    if raw.len() < LX_HDR + 4 || u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) != LX_MAGIC {
+        return;
+    }
+    let (mut pos, mut w) = (LX_HDR, 0usize);
+    while pos + 4 <= raw.len() && raw[pos] != 0 {
+        let idx = raw[pos];
+        let nl = raw[pos + 1] as usize;
+        let vs = u16::from_le_bytes([raw[pos + 2], raw[pos + 3]]) as usize;
+        let elen = align4(4 + nl + vs);
+        if pos + 4 + nl + vs > raw.len() {
+            break;
+        }
+        let name = &raw[pos + 4..pos + 4 + nl];
+        let val = &raw[pos + 4 + nl..pos + 4 + nl + vs];
+        if w + 4 + nl + 4 > out.len() {
+            break;
+        }
+        out[w] = idx;
+        out[w + 1] = nl as u8;
+        out[w + 4..w + 4 + nl].copy_from_slice(name);
+        let vo = w + 4 + nl;
+        let vlen = if idx == IDX_ACL_ACCESS || idx == IDX_ACL_DEFAULT {
+            match acl_f2fs_to_posix(val, &mut out[vo..]) {
+                Some(n) => n,
+                None => break,
+            }
+        } else if vo + vs <= out.len() {
+            out[vo..vo + vs].copy_from_slice(val);
+            vs
+        } else {
+            break;
+        };
+        out[w + 2..w + 4].copy_from_slice(&(vlen as u16).to_le_bytes());
+        w += align4(4 + nl + vlen);
+        pos += elen;
+    }
+}
+
+/// Encode an arena into `raw` (zeroed, `inline ++ xnode` sized). Returns the
+/// used length including the 4-byte terminator, or ENOSPC when it won't fit.
+pub fn lx_encode(arena: &[u8], raw: &mut [u8]) -> Result<usize, i32> {
+    if raw.len() < LX_HDR + 4 {
+        return Err(ENOSPC);
+    }
+    raw[0..4].copy_from_slice(&LX_MAGIC.to_le_bytes());
+    raw[4..8].copy_from_slice(&1u32.to_le_bytes());
+    let mut pos = LX_HDR;
+    for (_, idx, name, val) in entries(arena) {
+        if pos + align4(4 + name.len() + val.len()) + 4 > raw.len() {
+            return Err(ENOSPC);
+        }
+        raw[pos] = idx;
+        raw[pos + 1] = name.len() as u8;
+        raw[pos + 4..pos + 4 + name.len()].copy_from_slice(name);
+        let vo = pos + 4 + name.len();
+        let vlen = if idx == IDX_ACL_ACCESS || idx == IDX_ACL_DEFAULT {
+            acl_posix_to_f2fs(val, &mut raw[vo..]).ok_or(EINVAL)?
+        } else {
+            raw[vo..vo + val.len()].copy_from_slice(val);
+            val.len()
+        };
+        raw[pos + 2..pos + 4].copy_from_slice(&(vlen as u16).to_le_bytes());
+        pos += align4(4 + name.len() + vlen);
+        if pos + 4 > raw.len() {
+            return Err(ENOSPC);
+        }
+    }
+    Ok(pos + 4)
+}
