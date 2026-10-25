@@ -3,7 +3,7 @@
 
 Usage (see scripts/f2fslx/interop.sh, the wrapper):
   interop.sh [--list] <variant...>        variants: lxdef lxnoi lxext (direction A)
-                                          home (direction B)   orph (Linux orphan CP, S7)   all = every variant
+                                          home (direction B)   orph (Linux orphan CP, S7)   fsync (Linux roll-forward)   all = every variant
   F2FSINTEROP_LOCK=<path>/lock.sh         if set, box work runs under `lock.sh box`
                                           and QEMU boots under `lock.sh qemu`.
   F2FSINTEROP_BOX=user@host               default forain@172.16.158.150
@@ -127,7 +127,7 @@ def guest(imgs, cmds, tag):
             outs = json.loads(l[8:])
             if os.environ.get("F2FSINTEROP_VERBOSE"):
                 for c, o in zip(cmds, outs):
-                    print(f"  $ {c[:90]}\n    {o.strip()[-400:]}", file=sys.stderr)
+                    print(f"  $ {c[:90]}\n    {o.strip()[-1500:]}", file=sys.stderr)
             return outs
     print(f"guest run {tag} failed rc={r.returncode}: {(r.stdout + r.stderr)[-300:]}", file=sys.stderr)
     return None
@@ -373,6 +373,72 @@ timeout 180 fsck.f2fs --dry-run o.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?"
         box(f"rm -rf {rd}")
 
 
+def cp_flags(path):
+    """ckpt_flags of the newest checkpoint of a Linux image."""
+    with open(path, "rb") as f:
+        f.seek(1024)
+        sb = f.read(256)
+        cp_blk = struct.unpack_from("<I", sb, 76)[0]
+        bps = 1 << struct.unpack_from("<I", sb, 20)[0]
+        best = None
+        for pack in (0, 1):
+            f.seek((cp_blk + pack * bps) * 4096)
+            h = f.read(4096)
+            ver = struct.unpack_from("<Q", h, 0)[0]
+            if best is None or ver > best[0]:
+                best = (ver, h)
+        return struct.unpack_from("<I", best[1], 132)[0]
+
+
+def direction_fsync(tmp):
+    """Linux roll-forward (recover_fsync_data): after a checkpoint, files are created
+    and fsynced on the box (new files with a DENT mark, an in-place overwrite
+    of a checkpointed file) and the backing image is copied while still mounted
+    (no sysrq, no umount).  LeandrOS must mount it rw, roll the node chain
+    forward (data present, md5), and leave a volume that fsck.f2fs accepts and
+    Linux mounts."""
+    v = "fsync"
+    rd = f"/tmp/f2fsinterop-{os.getpid()}"
+    img = os.path.join(tmp, "fsync.img")
+    script = f"""set -e; D={rd}; mkdir -p $D/m; cd $D; rm -f f.img
+truncate -s {SIZE} f.img; mkfs.f2fs -q -f -l fsync f.img
+sudo mount -o loop f.img m; cd m; sudo chown $(id -u) .
+mkdir keep; echo keepme > keep/k; head -c 600000 /dev/urandom > keep/big; sync; sleep 1; sync
+dd if=/dev/urandom of=keep/newbig bs=1k count=5000 conv=fsync 2>/dev/null
+echo small-inline > keep/newsmall; python3 -c "import os; f=os.open('keep/newsmall', os.O_RDONLY); os.fsync(f)"
+dd if=/dev/urandom of=keep/big bs=4k count=10 seek=5 conv=notrunc,fsync 2>/dev/null
+( cd keep && md5sum k big newbig newsmall | dd of=../MANIFEST conv=fsync 2>/dev/null )
+cp ../f.img ../snap.img; cd ..; sudo umount m; mv snap.img f.img; echo SNAP_OK"""
+    rc, out = box(script)
+    if not step(v, "D.linux-fsync", rc == 0 and "SNAP_OK" in out, "box: files created+fsynced after a checkpoint, image copied mounted" if rc == 0 else out.strip()[-120:]):
+        box(f"rm -rf {rd}"); return
+    try:
+        if not fetch(f"{rd}/f.img", img):
+            step(v, "D.ship", False, "fetch failed"); return
+        fl = cp_flags(img)
+        if not step(v, "D.unclean-cp", not fl & 1, "newest checkpoint has no CP_UMOUNT_FLAG" if not fl & 1 else "clean checkpoint"):
+            return
+        outs = guest([img], [MNT.format(l="fsync"), "cd /mnt/fsync/keep && md5sum -c ../MANIFEST 2>&1 ; echo LS=$(ls /mnt/fsync); echo keepme2 > k2; ls /mnt/fsync | tr '\\n' ' '; sync; cd /; umount /mnt/fsync; echo UMOUNT_RC=$?"], "D1")
+        ok = outs is not None and "MNT_RW" in outs[0] and "UMOUNT_RC=0" in outs[1] and "FAILED" not in outs[1] and outs[1].count(": OK") >= 4
+        if not step(v, "D.leandros-rw", ok, "mounted rw, fsynced files present" if ok else (outs[0] + outs[1]).strip()[-120:] if outs else "no guest"):
+            return
+        box(f"mkdir -p {rd}"); push(img, f"{rd}/f.img")
+        rc, out = box(f"""cd {rd}; timeout 180 fsck.f2fs --dry-run f.img </dev/null >f.txt 2>&1; echo FSCK_RC=$?
+grep -ciE 'is unreachable|\\[Fail\\]|ASSERT' f.txt; grep -iE 'is unreachable|fail|ASSERT' f.txt | head -n 8""")
+        ok = "FSCK_RC=0" in out and "\n0\n" in out
+        if os.environ.get("F2FSINTEROP_VERBOSE"):
+            print(out[-1200:], file=sys.stderr)
+        step(v, "D.fsck", ok, "fsck.f2fs rc 0, no unreachable NIDs" if ok else out.strip()[-140:].replace("\n", " "))
+        rc, out = box(f"""cd {rd}; mkdir -p m; if sudo mount -o loop f.img m; then (cd m/keep && md5sum -c ../MANIFEST 2>&1 | tail -n 2; cat k2; echo LXREAD_RC=$?); ls m | tr '\\n' ' '; sync; sudo umount m && echo LX_UMOUNT_OK; else echo LX_MOUNT_FAIL; fi
+timeout 180 fsck.f2fs --dry-run f.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?""")
+        ok = "LX_UMOUNT_OK" in out and "FAILED" not in out and "keepme2" in out and "FSCK2_RC=0" in out
+        step(v, "D.linux-mount", ok, "Linux mounts, reads, fsck rc 0" if ok else out.strip()[-140:].replace("\n", " "))
+    finally:
+        box(f"rm -rf {rd}")
+
+
+
+
 def direction_b(tmp):
     v = "home"
     img = os.path.join(tmp, "home.img")
@@ -424,7 +490,7 @@ else echo LX_MOUNT_FAIL; sudo dmesg | tail -n 3 | cut -c1-150; fi"""
 def main(argv):
     if argv[:1] == ["--guest"]:
         return guest_main(argv[1])
-    allv = list(VARIANTS) + ["home", "orph"]
+    allv = list(VARIANTS) + ["home", "orph", "fsync"]
     if not argv or argv[0] in ("-h", "--help", "--list"):
         print(__doc__ if argv[:1] != ["--list"] else " ".join(allv)); return 0
     vs = allv if argv == ["all"] else argv
@@ -440,6 +506,8 @@ def main(argv):
             direction_b(tmp)
         if "orph" in vs:
             direction_orph(tmp)
+        if "fsync" in vs:
+            direction_fsync(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     bad = sum(1 for r in results if r in ("FAIL", "UNEXPECTED-PASS"))
