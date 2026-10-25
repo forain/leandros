@@ -125,6 +125,10 @@ class Claims:
                 sa[v[0]] = v[1]
             elif tag == "SA_BAD":
                 errs.append(f"a{v[0]}: content wrong at byte {v[2]} (size {v[1]})")
+            elif tag in ("SO_MISSING", "SO_SIZE") and not (self.setup or self.min_gen is not None):
+                # The crash hit setup before its final fsync (no SETUP line,
+                # no rewrite): an o file need not exist or be whole yet.
+                pass
             elif tag in ("SO_BAD", "SO_MISSING", "SO_SIZE"):
                 errs.append(f"o: {raw.strip()}")
             elif tag == "SO":
