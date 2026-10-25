@@ -283,6 +283,7 @@ class Fsck:
         self.nodes_seen = 0
         self.lx_ftypes = []      # lx dentries: (dir, name, child, ft) checked against i_mode
         self.lx_checked = 0
+        self.exp = {}            # blkaddr -> (nid, ofs_in_node, is_node): the SSA owner it needs
 
     def err(self, m):
         if len(self.errors) < 50:
@@ -318,6 +319,7 @@ class Fsck:
         if not self.ref(a, f"{what} (nid {nid})"):
             return None
         self.nodes_seen += 1
+        self.exp[a] = (nid, 0, True)
         b = self.v.blk(a)
         F = self.v.L.footer
         if r32(b, F) != nid:
@@ -337,20 +339,25 @@ class Fsck:
         L = self.v.L
         PER = L.per
         out = []
+        own = []                 # (nid, ofs_in_node) of every slot in `out`
         addrs = inode_addrs(ib, L)
         if addrs is None:
             self.err(f"ino {ino}: inline data/dentry flags {ib[3]:#x} (not supported)")
             return out
         out.extend(addrs)
+        own.extend((ino, k) for k in range(len(addrs)))
         def dnode(nid, tag, ofs):
             if nid == 0:
                 out.extend([0] * PER)
+                own.extend([(0, 0)] * PER)
                 return
             b = self.node(nid, f"ino {ino} {tag}", ino, ofs)
             if b is None:
                 out.extend([0] * PER)
+                own.extend([(0, 0)] * PER)
                 return
             out.extend(r32(b, 4 * i) for i in range(PER))
+            own.extend((nid, i) for i in range(PER))
         def indirect(nid, tag, ofs, kid_ofs):
             if nid == 0:
                 return False
@@ -370,9 +377,11 @@ class Fsck:
             if nids[2] or nids[3] or nids[4]:
                 if not indirect(nids[2], "ind0", X.ofs_ind(0), lambda i: X.ofs_ind_child(0, i)):
                     out.extend([0] * PER * PER)
+                    own.extend([(0, 0)] * PER * PER)
                 if nids[3] or nids[4]:
                     if not indirect(nids[3], "ind1", X.ofs_ind(1), lambda i: X.ofs_ind_child(1, i)):
                         out.extend([0] * PER * PER)
+                        own.extend([(0, 0)] * PER * PER)
                     if nids[4]:
                         b = self.node(nids[4], f"ino {ino} dind", ino, X.OFS_DIND)
                         if b is not None:
@@ -382,9 +391,10 @@ class Fsck:
                                 if not indirect(kids[i], f"dind[{i}]", X.ofs_dind_ind(i),
                                                 lambda k, j=i: X.ofs_dind_dnode(j, k)):
                                     out.extend([0] * PER * PER)
+                                    own.extend([(0, 0)] * PER * PER)
         for i, a in enumerate(out):
-            if a:
-                self.ref(a, f"ino {ino} data[{i}]")
+            if a and self.ref(a, f"ino {ino} data[{i}]"):
+                self.exp[a] = (own[i][0], own[i][1], False)
         return out
 
     def run(self):
@@ -494,6 +504,86 @@ class Fsck:
                     if a not in self.owner:
                         self.leaked.append(a)
         self.valid_total = valid
+        if v.lx:
+            self.lx_ssa_checks()
+
+    def lx_ssa_checks(self):
+        """What fsck.f2fs checks of an lx volume beyond the tree walk: SIT
+        segment types, curseg types, SSA owner entries and footers, curseg
+        summaries in the cp tail, NAT ino 1/2 and the cp counters."""
+        v = self.v
+        cp = v.cp_raw
+        ssa_blk, bps = r32(v.sb_raw, 88), v.bps
+        cur = [r32(cp, 84 + 4 * i) for i in range(3)] + [r32(cp, 36 + 4 * i) for i in range(3)]
+        offs = [r16(cp, 116 + 2 * i) for i in range(3)] + [r16(cp, 68 + 2 * i) for i in range(3)]
+        segs = {}
+        for a, (nid, ofs, isnode) in self.exp.items():
+            segs.setdefault((a - v.main_blk) // bps, {})[(a - v.main_blk) % bps] = (nid, ofs, isnode)
+        bad = 0
+
+        def e(m):
+            nonlocal bad
+            bad += 1
+            if bad <= 20:
+                self.err("lx: " + m)
+        for t, seg in enumerate(cur):
+            if seg >= v.seg_cnt_main:
+                continue
+            ty = r16(v.sit_raw(seg), 0) >> 10
+            if ty != t:
+                e(f"curseg {t} segment {seg}: SIT type {ty} != {t}")
+        node_valid = 0
+        for seg in range(v.seg_cnt_main):
+            vb, _m = v.sit(seg)
+            ty = r16(v.sit_raw(seg), 0) >> 10
+            ents = segs.get(seg, {})
+            kinds = {en[2] for en in ents.values()}
+            if len(kinds) > 1:
+                e(f"segment {seg} mixes node and data blocks")
+            if ty > 5:
+                e(f"segment {seg}: SIT type {ty} invalid")
+            if 3 <= ty <= 5:
+                node_valid += vb
+            if kinds and (True in kinds) != (3 <= ty <= 5) :
+                e(f"segment {seg}: SIT type {ty} but holds {'node' if True in kinds else 'data'} blocks")
+            if not ents:
+                continue
+            sb = v.blk(ssa_blk + seg)
+            want_node = True in kinds
+            if sb[4091] != (1 if want_node else 0):
+                e(f"segment {seg}: SSA footer type {sb[4091]} not for {'node' if want_node else 'data'} segment")
+            for off, (nid, ofs, isnode) in ents.items():
+                gnid, gver, gofs = struct.unpack_from("<IBH", sb, off * 7)
+                wver = 0 if isnode else v.blk(v.nat_blk + nid // NAT_PER_BLK)[(nid % NAT_PER_BLK) * NAT_ENTRY]
+                if (gnid, gofs) != (nid, ofs) or (not isnode and gver != wver):  # fsck.f2fs ignores node versions
+                    e(f"segment {seg} off {off}: SSA (nid {gnid} ver {gver} ofs {gofs}) != "
+                      f"(nid {nid} ver {wver} ofs {ofs})")
+        # curseg summaries in the cp tail
+        ssum = r32(cp, 140)
+        for t, seg in enumerate(cur):
+            if seg >= v.seg_cnt_main:
+                continue
+            tb = v.raw(v.cp_addr + ssum + t)
+            if tb[4091] != (1 if t >= 3 else 0):
+                e(f"cp tail summary {t}: footer type {tb[4091]} not for {'node' if t >= 3 else 'data'} segment")
+            for off, (nid, ofs, isnode) in segs.get(seg, {}).items():
+                if off < offs[t] and struct.unpack_from("<IH", tb, off * 7)[0] != nid:
+                    e(f"cp tail summary {t} off {off}: nid {struct.unpack_from('<I', tb, off * 7)[0]} != {nid}")
+        for n in (1, 2):
+            if v.nat(n) == 0 or v.nat_ino(n) != n:
+                e(f"NAT entry of ino {n} is empty (block {v.nat(n)}, ino {v.nat_ino(n)})")
+        nnodes = sum(1 for en in self.exp.values() if en[2])
+        ninodes = len(self.inodes)
+        for name, got, want in (("valid_node_count", r32(cp, 144), nnodes),
+                                ("SIT node blocks", node_valid, nnodes),
+                                ("valid_inode_count", r32(cp, 148), ninodes),
+                                ("valid_block_count", r64(cp, 16), self.valid_total)):
+            if got != want:
+                e(f"{name} {got} != {want}")
+        nfree = sum(1 for s_ in range(v.seg_cnt_main) if s_ not in cur and (r16(v.sit_raw(s_), 0) & 0x3FF) == 0)
+        if r32(cp, 32) != nfree:
+            e(f"free_segment_count {r32(cp, 32)} != {nfree}")
+        self.lx_ssa_bad = bad
 
     def check_lx_dentry(self, dino, pgofs, dir_level, name, h, ft):
         want = f2fslx.dentry_hash(name)
@@ -680,7 +770,7 @@ def main(argv):
               f"unknown bits {unk:#x}" + (" (a kernel mounts this volume read-only)" if unk else ""))
     if v.lx:
         print(f"node format: lx (Linux layout), {f.lx_checked} inodes checked for footer ofs, "
-              f"i_blocks, dentry hash and bucket")
+              f"i_blocks, dentry hash and bucket; SSA/SIT-type/counter problems {f.lx_ssa_bad}")
     else:
         print("node format: legacy")
     if v.orphans:
