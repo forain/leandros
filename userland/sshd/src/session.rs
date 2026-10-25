@@ -266,7 +266,8 @@ impl Conn {
         };
         let what = match &kind {
             Kind::Shell => "shell".to_string(),
-            Kind::Exec(c) => format!("exec {:?}", c),
+            // Never log the full command line: scripted logins have put secrets there.
+            Kind::Exec(c) => format!("exec {:?} ({} bytes, args redacted)", c.split_whitespace().next().unwrap_or(""), c.len()),
             Kind::Subsystem(p) => format!("subsystem {p}"),
         };
         let groups = accounts::groups_of(&user);

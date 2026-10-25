@@ -1251,6 +1251,17 @@ fn selftest_main(level: u32) {
     for k in [wm::gk::FW, wm::gk::SW, wm::gk::MIC, wm::gk::REPLAY, wm::gk::UNDECRYPTED] { wm::gk::note_rx(k); }
     let r1 = [wm::gk::rx(wm::gk::FW), wm::gk::rx(wm::gk::SW), wm::gk::rx(wm::gk::MIC), wm::gk::rx(wm::gk::REPLAY), wm::gk::rx(wm::gk::UNDECRYPTED)];
     t.check("gtk-rx-counters-move", (0..5).all(|i| r1[i] == r0[i] + 1), alloc::format!("{:?} -> {:?}", r0, r1));
+    // An undecrypted group frame under key index 2 is classified by its
+    // CCMP header's key index; a foreign one is counted apart.
+    let mut uf = alloc::vec![0u8; 24 + 8 + 8];
+    uf[0] = 0x08; uf[1] = 0x42; uf[4..10].copy_from_slice(&[0xff; 6]); uf[24 + 3] = 0x20 | (2 << 6);
+    let (u0, f0) = (wm::gk::undecrypted(true, 2), wm::gk::undecrypted(false, 2));
+    wm::gk::note_undecrypted(&uf, 0x4208, 0, false);
+    wm::gk::note_undecrypted(&uf, 0x4208, 0, true);
+    let mut ul = String::new();
+    wm::gk::lines(&mut ul);
+    t.check("undecrypted-classified", wm::gk::undecrypted(true, 2) == u0 + 1 && wm::gk::undecrypted(false, 2) == f0
+            && ul.contains("rx_undecrypted: uc k0") && ul.contains("foreign "), ul.replace('\n', " | "));
     let _ = disconnect(true);
     let tko = find_bss("SimTkipOnly");
     t.check("bss-tkip-only-not-joinable", tko.map_or(false, |b| b.ext & bss_ext::JOINABLE == 0), alloc::format!("{:?}", tko.map(|b| (b.ext, b.rsn_flags))));
