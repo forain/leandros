@@ -6118,10 +6118,12 @@ impl DrmDeviceInterface {
         // exactly as before.
         let buffer = DrmDumbBuffer::create(width, height, 32, 0)?;
         let mmap_offset = buffer.mmap_offset;
-        // This legacy ABI returns the physical address in a u32 slot. Refuse a
-        // frame that does not fit rather than hand the caller the low half —
-        // on a guest with RAM above 4 GiB that is somebody else's memory.
-        if mmap_offset > u32::MAX as usize { return Err(DriverError::Io); }
+        // No 4 GiB limit here: slot [5] is an opaque FAKE32 token
+        // (`drm_offset::offset_for32`), not the physical address. The old
+        // `mmap_offset > u32::MAX` refusal outlived that change and failed every
+        // frame the allocator placed above 4 GiB: MAME's display-sized FB on
+        // QEMU, and DOOM's too on the 16 GiB laptop, which then fell back to
+        // /dev/fb0 — not what i915 scans out — so a text VT stayed black.
 
         // Create framebuffer object
         let mut fb = DrmFramebuffer::new(

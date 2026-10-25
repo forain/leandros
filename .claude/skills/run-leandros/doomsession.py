@@ -53,6 +53,8 @@ def opt(name, default, conv=str):
 GPU = opt("--gpu", "virgl")
 SCALE = opt("--scale", None, float) or driver.wait_scale(ARCH)
 DO_VT = "--no-vt" not in A
+# What is typed on the text VT (lane gamevt: also `mame -rompath / captcomm`).
+VT_CMD = os.environ.get("DOOMSESSION_VT_CMD", "doom")
 DOOM_ENV = opt("--doom-env", "")
 OUT = os.path.join(os.environ.get("DOOMSESSION_OUT", "/tmp/doomsession"), f"run-{TAG}")
 os.makedirs(OUT, exist_ok=True)
@@ -220,7 +222,7 @@ def wav_rms(name, start, end):
 
 def kill_doom():
     sh('for p in /proc/[0-9]*; do c=$(tr "\\0" " " < $p/cmdline 2>/dev/null); '
-       'case "$c" in doom*|/bin/doom*) kill ${p#/proc/};; esac; done; true', 30)
+       'case "$c" in doom*|/bin/doom*|mame*|/bin/mame*) kill ${p#/proc/};; esac; done; true', 30)
 
 
 def main():
@@ -296,7 +298,7 @@ def main():
         SER.pump(5 * SCALE)
         tv = shot("textvt")
         vtstat("textvt")
-        typ("doom >/tmp/doom2.log 2>&1"); key("ret")
+        typ(VT_CMD + " >/tmp/doom2.log 2>&1"); key("ret")
         a1 = wav_mark()
         SER.pump(12 * SCALE)
         tvd = shot("textvt-doom")
