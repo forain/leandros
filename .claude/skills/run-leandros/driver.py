@@ -1413,6 +1413,14 @@ def cmd_start(arch="aarch64", mode="uefi", venus=False, virgl=False):
             tail = "(no log)"
         print("WARNING: shell prompt not seen. Serial tail:", file=sys.stderr)
         print(tail, file=sys.stderr)
+        if _qemu_pid() is None:
+            # QEMU itself exited (e.g. another VM holds the image's write lock).
+            try:
+                with open(QEMU_STDERR_LOG, "rb") as ef:
+                    err = ef.read()[-1024:].decode(errors="replace")
+            except Exception:
+                err = "(no stderr log)"
+            print(f"QEMU exited. QEMU stderr:\n{err}", file=sys.stderr)
         sys.exit(1)
 
     if "login: " in text:

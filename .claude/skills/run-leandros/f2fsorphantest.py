@@ -36,6 +36,15 @@ os.environ.pop("LEANDROS_USB_STICK", None)
 sys.path.insert(0, HERE)
 import driver  # noqa: E402
 
+
+def stop_caller_vm(caller):
+    """Under `runtests host:` the caller's VM still holds the write lock on the
+    root image, so this test's own QEMU would exit at once ("Failed to get
+    write lock", seen as "shell prompt not seen"). Stop it first."""
+    if caller:
+        subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py"), "stop"],
+                       env=dict(os.environ, LEANDROS_RUN_ID=caller), capture_output=True, timeout=120)
+
 spec = importlib.util.spec_from_file_location("fsckf2fs", os.path.join(REPO, "scripts", "fsck-f2fs.py"))
 fsckmod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fsckmod)
@@ -58,6 +67,7 @@ def fsck_out(img, strict=False):
 
 
 def main(argv):
+    stop_caller_vm(caller)
     arch = "aarch64"
     for a in argv:
         if a in ("aarch64", "x86_64"):

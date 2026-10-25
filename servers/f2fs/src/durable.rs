@@ -470,7 +470,11 @@ pub(crate) fn take_nid(ms: &mut MountState) -> Option<u32> {
     while let Some(n) = ms.dur.nid_pool.pop() {
         if !ms.dur.nid_pending.contains(&n) && nat_lookup(ms, n) == 0 { return Some(n); }
     }
-    let max = (ms.sb.seg_cnt_nat as u64 * ms.sb.blocks_per_seg as u64 * NAT_ENTRY_PER_BLK as u64)
+    // Linux: total_node_count = (segment_count_nat / 2) * blocks_per_seg *
+    // NAT_ENTRY_PER_BLOCK (the second half is the mirror). One-copy-SIT
+    // volumes predate the Linux layout and keep their whole range.
+    let nat_copies = if ms.sb.seg_cnt_sit >= 2 { 2 } else { 1 };
+    let max = (ms.sb.seg_cnt_nat as u64 / nat_copies * ms.sb.blocks_per_seg as u64 * NAT_ENTRY_PER_BLK as u64)
         .min(u32::MAX as u64).min(if ms.mount_prefix.starts_with("/mnt/") { nid_cap() } else { u64::MAX });
     let nid = ms.cp.next_free_nid;
     if (nid as u64) < max {
