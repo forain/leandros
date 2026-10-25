@@ -68,3 +68,4 @@ try:
 finally:
     cb.log("stop", cb.drv("stop")[-100:])
     cb.log("RESULT", "PASS" if ok else "FAIL")
+sys.exit(0 if ok else 1)

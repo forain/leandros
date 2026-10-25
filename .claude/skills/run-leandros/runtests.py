@@ -396,6 +396,13 @@ def main(argv):
                 fails = re.findall(r"^\s*(\S+): FAIL\b", r["output"], re.M)
                 rc = r["rc"] if r["rc"] is not None else "?"
                 ok = r["rc"] == 0 and r["status"] in ("ok", "rc-file")
+                # Belt and braces for session/gate scripts: a RESULT line that
+                # reports a failed gate is a failure whatever the exit status.
+                if ok and c.startswith("host:") and re.search(
+                        r'RESULT.*("pass": false|\bFAIL\b)', r["output"]):
+                    ok = False
+                    r["rc"] = 1
+                    fails.append("RESULT-gate")
                 all_ok &= ok
                 print(f"=== {c}: RC={rc} [{r['status']}, {r['secs']}s] fails={len(fails)}"
                       + (f" {','.join(fails)}" if fails else ""), flush=True)

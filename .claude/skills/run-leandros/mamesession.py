@@ -117,6 +117,8 @@ def main():
         res["mame-vt-audio"] = {"pass": ds.AUDIO["textvt-mame"]["loud_seconds"] >= 3, **ds.AUDIO["textvt-mame"],
                                 "log": ds.sh("tail -n 3 /tmp/mame2.log", 30)[-300:]}
         l2 = ds.sh("cat /tmp/mame2.log", 30)
+        if os.environ.get("MAMESESSION_INJECT_SETMODE_FAIL"):  # gate self-test: fake failing line
+            l2 += "\n[mame] SET_MODE failed (injected)\n"
         bad = [x for x in l2.splitlines() if "SET_MODE failed" in x]
         res["mame-vt-setmode"] = {"pass": not bad, "errors": bad[:3]}
         ds.sh("killall mame; true", 30)
