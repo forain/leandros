@@ -411,6 +411,11 @@ fn open_esp(o: &Opts, writable: bool) -> io::Result<Esp> {
     Esp::open(&p, writable)
 }
 
+/// True when the kernel command line carries `name=1`.
+fn cmdline_flag(name: &str) -> bool {
+    conf::cmdline_value(&cmdline(), name).as_deref() == Some("1")
+}
+
 fn booted() -> (Option<String>, Option<String>) {
     let cl = cmdline();
     (conf::cmdline_value(&cl, "leandros.slot"), conf::cmdline_value(&cl, "leandros.kid"))
@@ -824,7 +829,17 @@ fn cmd_boot(o: &Opts) -> io::Result<()> {
         let mut s = st.slots.clone();
         let fb = s.fallback();
         s.set_default(fb);
-        write_slots(&esp, &mut st, &s)?;
+        let r = if cmdline_flag("espctl.fault_boot") {
+            // Test hook (espresettest): the first reset attempt of this boot
+            // fails as if the ESP had returned an I/O error.
+            Err(io::Error::new(io::ErrorKind::Other, "injected fault (espctl.fault_boot)"))
+        } else {
+            write_slots(&esp, &mut st, &s)
+        };
+        if let Err(e) = r {
+            println!("espctl: one-shot reset FAILED ({}): the trial kernel is still the default", e);
+            return Err(e);
+        }
         if slot.as_deref() == Some("trial") {
             println!("espctl: one-shot trial: the next boot defaults to the {} kernel again (`espctl promote` keeps this one)", fb);
         } else {

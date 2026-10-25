@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""espresettest.py [aarch64|x86_64] -- the one-shot trial reset survives a
+failed first attempt and a power cut (openbugs #80, lane espdur).
+
+On a copy of the boot image:
+  setup  promote a first kernel (good slot), then deploy the same build as
+         the one-shot `trial` with `espctl.fault_boot=1`: in the trial boot
+         the first attempt of `espctl boot` to make good the default again
+         fails as if the ESP had answered EIO (console: `one-shot reset
+         FAILED`).
+  retry  espctl must keep retrying in the background until the reset is on
+         the medium (console: `one-shot reset done on retry`).
+  cut    `system_reset` (a power cut: no reboot(2), no sync, no flush); the
+         next boot must be the good slot (`espctl: booted good kernel`).
+         Before the retry existed the trial stayed the default and booted
+         again -- the laptop's 2026-10-25 symptom.
+Exit 0 iff every case PASSes. Run id `<caller run id>-espreset`.
+"""
+import os, re, subprocess, sys, tempfile, time
+import imgclone
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DRV = os.path.join(HERE, "driver.py")
+REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+REMOTE = os.path.join(REPO, "scripts", "remote.py")
+
+
+def main(argv):
+    arch = next((a for a in argv if a in ("aarch64", "x86_64")), os.environ.get("LEANDROS_TEST_ARCH", "aarch64"))
+    caller = os.environ.get("LEANDROS_RUN_ID", "")
+    run_id = f"{caller}-espreset" if caller else "espreset"
+    os.environ["LEANDROS_RUN_ID"] = run_id
+    os.environ.pop("LEANDROS_NO_REBOOT", None)
+    sys.path.insert(0, HERE)
+    import driver  # noqa: E402
+    scale = driver.wait_scale(arch, "uefi")
+    results = {}
+
+    def verdict(name, ok, detail=""):
+        results[name] = ok
+        print(f"{name}: {'PASS' if ok else 'FAIL'} {detail}".rstrip(), flush=True)
+
+    def log():
+        try:
+            with open(driver.SERIAL_FULL_LOG, "rb") as f:
+                return f.read().decode(errors="replace")
+        except FileNotFoundError:
+            return ""
+
+    def wait_for(pred, secs, step=1.0):
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            v = pred()
+            if v:
+                return v
+            time.sleep(step)
+        return None
+
+    tmp = tempfile.mkdtemp(prefix="espreset-")
+    img = os.path.join(tmp, f"boot-{arch}.img")
+    src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
+    subprocess.run(["cp", "-c", src, img], check=False)
+    if not os.path.exists(img):
+        imgclone.clone_file(src, img)
+    env = dict(os.environ, LEANDROS_DISK_IMAGE=img, LEANDROS_REMOTE=f"qemu:{run_id}")
+    os.environ["LEANDROS_DISK_IMAGE"] = img
+
+    def stop():
+        subprocess.run([sys.executable, DRV, "stop"], env=env, capture_output=True, timeout=120)
+
+    def remote(*args, timeout=600):
+        p = subprocess.run([sys.executable, REMOTE, *args], env=env, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout + p.stderr
+
+    def deploy(*extra):
+        out = ""
+        for _ in range(3):
+            rc, out = remote("deploy-kernel", "--arch", arch, "--netwatch", "0", "--reboot", *extra, timeout=1500)
+            if rc == 0 or "NEW KERNEL" in out:
+                return rc, out
+            time.sleep(10)
+        return rc, out
+
+    try:
+        stop()
+        subprocess.run([sys.executable, DRV, "start", arch], env=env, capture_output=True, text=True, timeout=900)
+        subprocess.run([sys.executable, DRV, "login", "root", "root", str(int(120 * scale))],
+                       env=env, capture_output=True, text=True, timeout=1200)
+        wait_for(lambda: remote("status", timeout=60)[0] == 0, 180 * scale, 5)
+        deploy("--promote")
+        subprocess.run([sys.executable, DRV, "login", "root", "root", str(int(180 * scale))],
+                       env=env, capture_output=True, text=True, timeout=1200)
+        wait_for(lambda: remote("status", timeout=60)[0] == 0, 180 * scale, 5)
+        mark = len(log())
+        rc, out = deploy("--append", "espctl.fault_boot=1")
+        failed = wait_for(lambda: "one-shot reset FAILED" in log()[mark:], 120 * scale)
+        verdict("setup", "NEW KERNEL RUNNING: trial" in out and bool(failed),
+                f"deploy rc={rc} injected={bool(failed)}" + ("" if failed else f" ({out[-300:]!r})"))
+        if not results["setup"]:
+            return 1
+        done = wait_for(lambda: "one-shot reset done on retry" in log()[mark:], 120 * scale)
+        verdict("retry", bool(done))
+        if not done:
+            time.sleep(30 * scale)  # give an unfixed build the same chance to write
+        cut = len(log())
+        driver._monitor_send("system_reset")
+        m = wait_for(lambda: re.search(r"espctl: booted (\S+) kernel", log()[cut:]), 400 * scale)
+        slot = m.group(1) if m else None
+        verdict("cut", slot == "good", f"next boot: {slot}")
+    finally:
+        stop()
+    return 0 if results and all(results.values()) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
