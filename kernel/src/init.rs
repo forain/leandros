@@ -66,6 +66,14 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         serial_print_str("[INIT] evdev server port: ");
         crate::print_number(p);
         serial_print_str("\n");
+        // Opt-in: serial-console bytes also typed on a "serial-kbd" evdev
+        // node (openbugs L12 #67; off by default, the serial line is a tty).
+        if crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "evdev.serialkbd=1")) {
+            let n = evdev_server::set_serial_kbd(true);
+            serial_print_str("[INIT] evdev.serialkbd=1: serial-kbd is event");
+            crate::print_number(n as _);
+            serial_print_str("\n");
+        }
     }
     drivers::virtio_keyboard::init();
 

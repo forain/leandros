@@ -427,6 +427,83 @@ unsafe fn held_main() -> i32 {
     failures
 }
 
+// ── `evtest2 serial <ms>`: serial-console bytes vs evdev (openbugs L12 #67) ──
+// Watches event0 and, if present, the opt-in "serial-kbd" node for <ms>.
+// Prints every key event of the serial-kbd node as `+code`/`-code` (repeats as
+// `*code`), then one summary line: event0 key events, serial-kbd presses /
+// releases and keys still held at the end. The host side checks the codes.
+unsafe fn now_ms() -> u64 {
+    let mut ts = timespec::default();
+    clock_gettime(1, &mut ts);
+    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
+}
+
+unsafe fn serial_main(ms: c_int) -> i32 {
+    let kfd = open(b"/dev/input/event0\0".as_ptr(), O_RDONLY | O_NONBLOCK);
+    if kfd < 0 { report(b"serial_open_event0", false); return 1; }
+    let mut sfd: c_int = -1;
+    let mut snode = 0u64;
+    let mut path = *b"/dev/input/event00\0";
+    for n in 2..16u8 {
+        if n < 10 { path[16] = b'0' + n; path[17] = 0; } else { path[16] = b'1'; path[17] = b'0' + n - 10; }
+        let fd = open(path.as_ptr(), O_RDONLY | O_NONBLOCK);
+        if fd < 0 { continue; }
+        let mut name = [0u8; 64];
+        let nr = ioctl(fd, EVIOCGNAME_64, name.as_mut_ptr());
+        if nr > 0 && name.starts_with(b"serial-kbd\0") { sfd = fd; snode = n as u64; break; }
+        close(fd);
+    }
+    drain(kfd);
+    if sfd >= 0 { drain(sfd); }
+    let mut o = Out::new();
+    o.s(b"evtest2 serial: waiting node=");
+    if sfd >= 0 { o.dec(snode); } else { o.s(b"none"); }
+    o.flush();
+    let (mut k0, mut press, mut rel, mut rep) = (0u64, 0u64, 0u64, 0u64);
+    let mut held = [false; 256];
+    let mut line = Out::new();
+    let mut inline = 0;
+    let end = now_ms() + ms as u64;
+    let mut buf = [0u8; 24 * 64];
+    while now_ms() < end {
+        let mut fds = [pollfd { fd: kfd, events: 1, revents: 0 }, pollfd { fd: sfd, events: 1, revents: 0 }];
+        poll(fds.as_mut_ptr(), if sfd >= 0 { 2 } else { 1 }, 100);
+        loop {
+            let n = read(kfd, buf.as_mut_ptr() as *mut c_void, buf.len());
+            if n <= 0 { break; }
+            for i in 0..(n as usize) / 24 {
+                let e = core::ptr::read_unaligned(buf.as_ptr().add(i * 24) as *const input_event);
+                if e.type_ == 1 { k0 += 1; }
+            }
+        }
+        if sfd < 0 { continue; }
+        loop {
+            let n = read(sfd, buf.as_mut_ptr() as *mut c_void, buf.len());
+            if n <= 0 { break; }
+            for i in 0..(n as usize) / 24 {
+                let e = core::ptr::read_unaligned(buf.as_ptr().add(i * 24) as *const input_event);
+                if e.type_ != 1 { continue; }
+                let c = (e.code & 0xff) as usize;
+                match e.value { 1 => { press += 1; held[c] = true; line.s(b"+"); }
+                                0 => { rel += 1; held[c] = false; line.s(b"-"); }
+                                _ => { rep += 1; line.s(b"*"); } }
+                line.dec(e.code as u64); line.s(b" ");
+                inline += 1;
+                if inline == 16 { line.flush(); inline = 0; }
+            }
+        }
+    }
+    if inline > 0 { line.flush(); }
+    let nheld = held.iter().filter(|&&h| h).count() as u64;
+    o.s(b"evtest2 serial: event0_keys="); o.dec(k0);
+    o.s(b" presses="); o.dec(press); o.s(b" releases="); o.dec(rel);
+    o.s(b" repeats="); o.dec(rep); o.s(b" held="); o.dec(nheld);
+    o.flush();
+    close(kfd);
+    if sfd >= 0 { close(sfd); }
+    0
+}
+
 // ── `evtest2 info <node>` / `evtest2 gone <node> <secs>`: per-device nodes ──
 
 struct Out { b: [u8; 160], n: usize }
@@ -602,6 +679,20 @@ pub unsafe extern "C" fn ev_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
             b"info" => return info_main(argc, argv),
             b"gone" => return gone_main(argc, argv),
             b"cap" => return cap_main(argc, argv),
+            b"serial" => {
+                let ms = parse_u64(arg_bytes(argc, argv, 2)).unwrap_or(8000) as c_int;
+                // `on`: opt in for the run (SERIALKBD_IOCTL on the hotplug node).
+                let on = arg_bytes(argc, argv, 3) == b"on";
+                let hp = if on { open(b"/dev/input/hotplug\0".as_ptr(), O_RDONLY) } else { -1 };
+                if on {
+                    let r = ioctl(hp, 0x45f0, 1 as c_ulong);
+                    if !report(b"serial_optin_ioctl", r > 0) { return 1; }
+                }
+                let f = serial_main(ms);
+                if on { ioctl(hp, 0x45f0, 0 as c_ulong); close(hp); }
+                puts(b"--- evtest2 serial done ---\0".as_ptr());
+                return f;
+            }
             _ => {}
         }
         if !a1.is_null() && core::ffi::CStr::from_ptr(a1 as *const core::ffi::c_char).to_bytes() == b"btn" {

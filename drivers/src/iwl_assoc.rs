@@ -425,6 +425,12 @@ impl TxResp {
     /// The frame went out and was never acknowledged (retry limits): the
     /// failures rate control learns from. Postponed, flushed, dropped frames
     /// say nothing about the rate.
+    /// A failure after which mac80211 sends a BAR for an aggregation-session
+    /// frame (iwl_mvm_rx_tx_cmd_single: every non-ACK except a flushed
+    /// frame, FIFO_FLUSHED / DRAIN_FLOW, and a filtered one, DEST_PS).
+    pub fn bar_after_fail(&self) -> bool {
+        !self.ok() && !matches!((self.status & 0xff) as u8, 0x85 | 0x88 | 0x8e)
+    }
     pub fn air_fail(&self) -> bool { matches!((self.status & 0xff) as u8, TX_STATUS_FAIL_SHORT_LIMIT | TX_STATUS_FAIL_LONG_LIMIT) }
 }
 
