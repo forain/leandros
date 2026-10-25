@@ -596,6 +596,19 @@ static GRID: AtomicU64 = AtomicU64::new(0);
 /// from the input drain, consumed by [`poll_deferred`].
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 
+/// Who asked for the switch now in flight: `(source << 28) | tgid`, read by
+/// [`complete_switch`] into [`stats::SWITCH_LOG`]. Measurement only (L12 #56:
+/// "the active VT went back to 1 by itself" — this names who moved it).
+static SWITCH_ORIGIN: AtomicU32 = AtomicU32::new(0);
+const SRC_IOCTL: u32 = 1; // VT_ACTIVATE, tgid = caller
+const SRC_KEY: u32 = 2; // Ctrl+Alt+Fn chord or a keymap Console_N entry
+const SRC_RESCUE: u32 = 3; // Ctrl+Alt+Esc
+const SRC_WATCHDOG: u32 = 4; // a stalled VT_PROCESS release forced through
+
+fn set_origin(src: u32, tgid: u32) {
+    SWITCH_ORIGIN.store((src << 28) | (tgid & 0x0fff_ffff), Ordering::Relaxed);
+}
+
 /// The VT that was on screen before the current one (zero-based), for the
 /// keymap's `Last_Console` (Alt+PrintScreen in the default map).
 static LAST_ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -868,6 +881,7 @@ pub fn poll_deferred() {
     let n = PENDING.load(Ordering::Relaxed);
     if n == 0 { return; }
     if PENDING.compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() { return; }
+    set_origin(SRC_KEY, 0);
     if switch_to(n) == EBUSY {
         // A handshake was still outstanding. Re-arm rather than drop it: the
         // request came from a keypress, and silently losing the one chord a
@@ -913,6 +927,7 @@ fn rescue() {
     PHASE.store(PHASE_IDLE, Ordering::Relaxed);
     PHASE_FROM.store(ACTIVE.load(Ordering::Relaxed), Ordering::Relaxed);
     PHASE_TO.store(0, Ordering::Relaxed);
+    set_origin(SRC_RESCUE, 0);
     // Straight to `complete_switch`, not `switch_to`: the release handshake is
     // the thing being bypassed. It repaints VT 1, revokes the scanout claim and
     // — through `evdev_vt_activated` — releases every input grab a second time.
@@ -943,6 +958,8 @@ fn watchdog() {
         m[stuck].owner = 0;
     }
     if phase == PHASE_WAIT_REL {
+        let o = SWITCH_ORIGIN.load(Ordering::Relaxed);
+        set_origin(SRC_WATCHDOG, o & 0x0fff_ffff);
         complete_switch(to);
     } else {
         PHASE.store(PHASE_IDLE, Ordering::Relaxed);
@@ -1021,6 +1038,7 @@ fn complete_switch(to: usize) {
 
     let prev = ACTIVE.swap(to, Ordering::Relaxed);
     if prev != to { LAST_ACTIVE.store(prev, Ordering::Relaxed); }
+    stats::log_switch(prev, to, SWITCH_ORIGIN.load(Ordering::Relaxed));
     ACTIVE_GRAPHICS.store(graphics, Ordering::Relaxed);
     ACTIVE_KB_P1.store(kb_p1 as u32, Ordering::Relaxed);
     // A key held across the switch does not keep repeating into the new VT,
@@ -1509,7 +1527,7 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
             reldisp(idx, arg)
         }
 
-        VT_ACTIVATE => switch_to(arg),
+        VT_ACTIVATE => { set_origin(SRC_IOCTL, sched::current_tgid()); switch_to(arg) }
         VT_WAITACTIVE => wait_active(arg),
         VT_DISALLOCATE => disallocate(arg),
 
@@ -2028,7 +2046,7 @@ fn render(idx: usize, bytes: &[u8], replies: &mut [u8; 64], rn: &mut usize) {
 /// (`drivers/src/drm_device_interface.rs`) and by the evdev server; the VFS
 /// renders them. Measurement, not policy: nothing reads them to decide.
 pub mod stats {
-    use core::sync::atomic::{AtomicU32, AtomicU64};
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     pub static KBD_ROUTED: [AtomicU64; super::VT_COUNT] =
         [const { AtomicU64::new(0) }; super::VT_COUNT];
     pub static KBD_NOSESSION: AtomicU64 = AtomicU64::new(0);
@@ -2066,6 +2084,18 @@ pub mod stats {
     pub static EV_VT_FILTERED: AtomicU64 = AtomicU64::new(0);
     /// Completed VT switches.
     pub static SWITCHES: AtomicU64 = AtomicU64::new(0);
+    /// The last 8 completed switches: `tick << 24 | from << 20 | to << 16`
+    /// in word 0 and the origin word in word 1 (see `SWITCH_ORIGIN`).
+    pub static SWITCH_LOG: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+    pub fn log_switch(from: usize, to: usize, origin: u32) {
+        let n = SWITCHES.load(Ordering::Relaxed) as usize; // already counted
+        let i = (n.wrapping_sub(1) % 8) * 2;
+        let t = sched::ticks();
+        SWITCH_LOG[i].store((t << 24) | ((from as u64 & 0xf) << 20) | ((to as u64 & 0xf) << 16),
+            Ordering::Relaxed);
+        SWITCH_LOG[i + 1].store(origin as u64, Ordering::Relaxed);
+    }
     /// `KDSETMODE` transitions: [to KD_TEXT, to KD_GRAPHICS].
     pub static KD_SETS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     /// VTs put back in KD_TEXT because their KD_GRAPHICS owner died.
@@ -2096,6 +2126,21 @@ pub fn stats_text(buf: &mut [u8]) -> usize {
     let mut w = SliceWriter { buf, len: 0 };
     let _ = writeln!(w, "active {}", active());
     let _ = writeln!(w, "switches {}", r(&SWITCHES));
+    {
+        // Oldest first: "switch_log tick:from>to:src:tgid ...", 1-based VTs,
+        // src ioctl|key|rescue|watchdog|-.
+        let n = r(&SWITCHES) as usize;
+        let _ = write!(w, "switch_log");
+        for k in n.saturating_sub(8)..n {
+            let i = (k % 8) * 2;
+            let a = SWITCH_LOG[i].load(Ordering::Relaxed);
+            let o = SWITCH_LOG[i + 1].load(Ordering::Relaxed) as u32;
+            let src = match o >> 28 { 1 => "ioctl", 2 => "key", 3 => "rescue", 4 => "watchdog", _ => "-" };
+            let _ = write!(w, " {}:{}>{}:{}:{}", a >> 24, ((a >> 20) & 0xf) + 1, ((a >> 16) & 0xf) + 1,
+                src, o & 0x0fff_ffff);
+        }
+        let _ = writeln!(w);
+    }
     {
         let m = MODES.lock();
         for i in 0..VT_COUNT {
