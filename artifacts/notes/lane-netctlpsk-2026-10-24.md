@@ -14,3 +14,6 @@ and klog stay redacted.
 
 ## Evidence
 See commit message / final report for test results.
+After fix (aarch64): netroamtest fails=0 (133 s); psklogtest 5/5 pass; regress overall PASS (92 entries);
+net-e2e (nmtest, nmrealtest, netroam, ...) all PASS. Note: running netroam concurrently with regress
+(2 HVF VMs) made its first boot fail twice (no prompt); alone it passes.
