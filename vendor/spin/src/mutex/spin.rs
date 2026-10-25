@@ -217,6 +217,10 @@ impl<T: ?Sized, R> SpinMutex<T, R> {
     /// lock to FFI that doesn't know how to deal with RAII.
     #[inline(always)]
     pub unsafe fn force_unlock(&self) {
+        // LeandrOS: the release half of a forgotten guard (lock_api's
+        // try_lock+forget / unlock, a guard re-taken around a section):
+        // without it every forget/force_unlock pair leaked one count.
+        crate::held::released();
         self.lock.store(false, Ordering::Release);
     }
 

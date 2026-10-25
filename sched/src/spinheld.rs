@@ -62,6 +62,12 @@ pub fn init() {
 #[inline]
 pub fn held() -> u32 { HELD[cpu()].load(Ordering::Relaxed) }
 
+/// Sum of the per-CPU counts (`/proc/lockstat` `spin_held` line). Holds are
+/// short, so a quiet system reads near zero; a count that only grows is a
+/// leaked acquire (an unbalanced forget/force_unlock), which leaves its CPU
+/// looking atomic to `might_sleep` for good.
+pub fn held_total() -> u32 { HELD.iter().map(|c| c.load(Ordering::Relaxed)).sum() }
+
 /// Voluntary switches made with a `spin::Mutex` held, since boot.
 pub fn switch_violations() -> u32 { SWITCH_VIOLATIONS.load(Ordering::Relaxed) }
 

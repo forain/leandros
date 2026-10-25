@@ -5907,6 +5907,11 @@ fn gen_lockstat() -> Option<VnodeKind> {
         let (a, c, ns) = sched::lockwatch::lock_stats(id);
         let _ = writeln!(s, "{} {} {} {}", sched::lockwatch::name(id), a, c, ns / 1000);
     }
+    // Held spin::Mutex count summed over CPUs, then the voluntary switches
+    // and sleeps made with one held (lane ipcregress: a leaked count made a
+    // CPU look atomic for good, so every wait on it spun).
+    let _ = writeln!(s, "spin_held {} {} {}", sched::spinheld::held_total(),
+                     sched::spinheld::switch_violations(), sched::irqctx::sleep_violations());
     proc_snapshot(b"/tmp/.lockstat", s.as_bytes(), false)
 }
 
