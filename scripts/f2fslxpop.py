@@ -1,4 +1,4 @@
-"""lx-format populated root image writer (opt-in: LEANDROS_F2FS_LX=1).
+"""lx-format populated root image writer (the default; LEANDROS_F2FS_LEGACY=1 selects the legacy writer).
 
 Used by scripts/mkfs-f2fs-populated.py in place of its legacy tail. Writes the
 same tree as the legacy path, but in Linux's on-disk layout (scripts/f2fslx.py)
