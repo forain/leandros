@@ -913,6 +913,38 @@ build_disktester() {
     )
 }
 
+# Function to build ripgrep (`rg`) -- the guest image ships no grep. The
+# checkout is a sibling repo pinned at release tag 15.2.0 (e89fff8) and stays
+# UNMODIFIED, built like disktester: same pinned nightly, same musl linker
+# wrapper, skipped with a warning when the checkout is absent.
+build_ripgrep() {
+    local arch="$1"
+    echo "🔎 Building $arch ripgrep..."
+    local rg_dir="$ROOT_DIR/../ripgrep"
+    if [[ ! -d "$rg_dir" ]]; then
+        echo "⚠️  ripgrep source not found at $rg_dir, skipping"
+        return 0
+    fi
+    local target_triple
+    if [[ "$arch" == "aarch64" ]]; then
+        target_triple="aarch64-unknown-linux-musl"
+    else
+        target_triple="x86_64-unknown-linux-musl"
+    fi
+    (
+        cd "$rg_dir" || exit 1
+        # ports/ripgrep/jemalloc-stub stands in for tikv-jemallocator, whose C
+        # build does not cross-compile here (the patch edits Cargo.lock, which
+        # is restored below so the checkout stays clean).
+        RUSTFLAGS="-C linker=$TOOLS_DIR/linker-$arch-musl.sh -C link-self-contained=no" \
+        cargo "$PINNED_TOOLCHAIN" build --target "$target_triple" --release \
+            --config "patch.crates-io.tikv-jemallocator.path=\"$ROOT_DIR/ports/ripgrep/jemalloc-stub\""
+        local rc=$?
+        git checkout -q -- Cargo.lock 2>/dev/null
+        exit $rc
+    )
+}
+
 # Function to build the input-stack ABI shims (libseat, libudev). These are
 # tracked C source (ports/input-stack/shims) that the image previously packed
 # as a prebuilt blob from ~/code/leandros-artifacts/m4-input-ship because
@@ -1048,6 +1080,7 @@ for arch in "${ARCHS[@]}"; do
     build_espctl "$arch"
     build_git "$arch"
     build_disktester "$arch"
+    build_ripgrep "$arch"
     stage_dbus_session "$arch"
     create_initrd "$arch"
     build_kernel "$arch"
