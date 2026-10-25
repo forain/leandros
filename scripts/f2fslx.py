@@ -10,7 +10,8 @@ keep it forever.
 """
 import struct
 
-MARKER = b"LeandrOS lxnode1"
+MARKER = b"LeandrOS lxnode2"     # SSA + SIT types + counters maintained
+MARKER_PREFIX = b"LeandrOS lxnode"   # lxnode1 images (test-only) still mount
 SB_VERSION_OFF = 1668          # struct f2fs_super_block: version[256]
 SB_INIT_VERSION_OFF = 1924     # init_version[256]; the format flag
 
@@ -94,7 +95,7 @@ def mark_superblock(b, sb_off=1024):
 
 def is_lx_superblock(sb):
     """`sb` is the superblock struct (block 0 from byte 1024 on)."""
-    return bytes(sb[SB_INIT_VERSION_OFF:SB_INIT_VERSION_OFF + len(MARKER)]) == MARKER
+    return bytes(sb[SB_INIT_VERSION_OFF:SB_INIT_VERSION_OFF + len(MARKER_PREFIX)]) == MARKER_PREFIX
 
 
 def checkpoint_reserve(meta_segs):
@@ -103,6 +104,56 @@ def checkpoint_reserve(meta_segs):
     superblock segment."""
     rsvd = max(9 - meta_segs, 1)
     return rsvd, rsvd
+
+
+# ---- checkpoint / summary / SIT / SSA helpers (fsck.f2fs-clean images) ----
+
+F2FS_MAGIC = 0xF2F52010
+CP_CHKSUM_FIELD = 164          # checksum_offset
+CP_CRC_OFF = 4092
+
+
+def f2fs_crc32(data):
+    """Linux f2fs_crc32: raw crc32_le seeded with the magic, no inversion."""
+    import zlib
+    return ~zlib.crc32(bytes(data), ~F2FS_MAGIC & 0xFFFFFFFF) & 0xFFFFFFFF
+
+
+def seal_cp(b):
+    """Stamp checksum_offset and the Linux CRC into a commit block."""
+    struct.pack_into("<I", b, CP_CHKSUM_FIELD, CP_CRC_OFF)
+    struct.pack_into("<I", b, CP_CRC_OFF, f2fs_crc32(b[:CP_CRC_OFF]))
+
+
+def summary_block(entries, node):
+    """One f2fs_summary_block: entries = [(nid, version, ofs_in_node)], the
+    journal empty, footer entry_type (byte 4091) 1 for node segments."""
+    b = bytearray(4096)
+    for i, (nid, ver, ofs) in enumerate(entries):
+        struct.pack_into("<IBH", b, i * 7, nid, ver, ofs)
+    b[4091] = 1 if node else 0
+    return b
+
+
+SIT_ENTRY_SIZE = 74
+
+
+def sit_entry(vblocks, typ, valid_bits=()):
+    """One 74-byte SIT entry: vblocks | type << 10, MSB-first bitmap, mtime 0."""
+    e = bytearray(SIT_ENTRY_SIZE)
+    struct.pack_into("<H", e, 0, vblocks | (typ << 10))
+    for k in valid_bits:
+        e[2 + k // 8] |= 0x80 >> (k % 8)
+    return e
+
+
+def ssa_segs_for(total_segs, fixed_meta_segs, bps=512):
+    """SSA segments for a volume: one SSA block per main segment.
+    `fixed_meta_segs` = superblock seg + ckpt + sit + nat segments."""
+    ssa = 1
+    while ssa * bps < total_segs - fixed_meta_segs - ssa:
+        ssa += 1
+    return ssa
 
 
 # ---- dentry hash (lib/libf2fs.c, fs/f2fs/hash.c) -------------------------
