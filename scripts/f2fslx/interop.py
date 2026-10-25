@@ -150,6 +150,50 @@ def md5_ok(out):
     return "MD5RC=0" in out and "WARNING" not in out and "FAILED" not in out
 
 
+# Inline write step (design f2fslxrw S2): append to inline files (one stays
+# inline-sized, one outgrows the inode), overflow an inline dir with 120 long
+# names, add into an empty inline dir, rmdir a non-empty inline dir (must fail)
+# and an empty one (must work), then record md5s of what we wrote.
+INLW = ("cd /mnt/{l} && echo more >> small/inl && cat small/inl && dd if=big/b3m bs=2000 count=1 >> small/inl3000 2>/dev/null && "
+        "for i in $(seq 1 120); do echo d$i > dir1/sub/inline_dir_overflow_entry_name_$i; done; "
+        "mkdir small/newd; echo x > small/newd/a; echo y > upg/u1; rm upg/u1; rmdir upg; echo RMDIR_EMPTY_RC=$?; "
+        "rmdir inl2/x 2>/dev/null; echo RMDIR_NONEMPTY_RC=$?; rm inl2/x/f; rmdir inl2/x; echo RMDIR_AFTER_RC=$?; "
+        "ls dir1/sub | wc -l; cat small/inl3000 | wc -c; "
+        "md5sum small/inl small/inl3000 small/newd/a dir1/sub/inline_dir_overflow_entry_name_* > ours2.md5; "
+        "md5sum -c ours2.md5 2>&1 | tail -n 1; sync; cd /; echo INLW_DONE")
+EXCL = "small/inl$|small/inl3000$|^[0-9a-f]+  ./(upg|inl2)"
+
+
+def inline_verify(v, tmp, outs_inl):
+    """Ship the guest-written image to the box: fsck rc 0, Linux mount, ours2.md5 + MANIFEST (minus
+    what the step modified), stat every created name, Linux write, umount, fsck rc 0 again."""
+    ok_g = "INLW_DONE" in outs_inl and "RMDIR_EMPTY_RC=0" in outs_inl and "RMDIR_NONEMPTY_RC=0" not in outs_inl \
+        and "RMDIR_AFTER_RC=0" in outs_inl and "123" in outs_inl.split("RMDIR_AFTER_RC=0")[-1] and "5000" in outs_inl.split("RMDIR_AFTER_RC=0")[-1].replace("5000", "5000")
+    step(v, "A.inline-write", ok_g, "append/overflow/rmdir ok in guest" if ok_g else outs_inl.strip()[-160:].replace("\n", " "))
+    rd = f"/tmp/f2fsinterop-{os.getpid()}"
+    try:
+        box(f"mkdir -p {rd}")
+        if not push(os.path.join(tmp, v + ".img"), f"{rd}/{v}.img"):
+            step(v, "A.inline-ship", False, "push failed"); return
+        fsck = lambda n: ("cd %s; timeout 180 fsck.f2fs --dry-run %s.img </dev/null >f%s.txt 2>&1; echo FSCK_RC=$?; "
+                          "grep -ciE '\\[Fail\\]|ASSERT' f%s.txt; grep -iE 'fail|ASSERT|wrong|invalid' f%s.txt | head -n 2" % (rd, v, n, n, n))
+        rc, out = box(fsck(1))
+        step(v, "A.inline-fsck1", "FSCK_RC=0" in out and "\n0\n" in out, "fsck.f2fs rc 0 after inline writes" if "FSCK_RC=0" in out else out.strip()[-140:].replace("\n", " "))
+        script = f"""cd {rd}; mkdir -p m; if sudo mount -o loop {v}.img m; then
+ (cd m && md5sum -c ours2.md5 > /tmp/mm.$$ 2>&1; echo LXMD5A_RC=$?; grep -vE '{EXCL}' MANIFEST > /tmp/mf.$$; md5sum -c /tmp/mf.$$ > /tmp/mm2.$$ 2>&1; echo LXMD5B_RC=$?; tail -n 2 /tmp/mm2.$$
+ ls dir1/sub | wc -l; stat -c %n small/newd/a dir1/sub/inline_dir_overflow_entry_name_120 >/dev/null; echo LXSTAT_RC=$?; stat -c %s small/inl3000; ls inl2 upg 2>&1 | head -n 3; rm -f /tmp/mm.$$ /tmp/mm2.$$ /tmp/mf.$$)
+ sudo sh -c 'echo fromlinux > m/dir1/sub/lx_new_entry; echo fromlinux >> m/small/inl3000'; sync; sudo umount m && echo LX_UMOUNT_OK
+else echo LX_MOUNT_FAIL; sudo dmesg | tail -n 3 | cut -c1-150; fi"""
+        rc, out = box(script)
+        ok = ("LXMD5A_RC=0" in out and "LXMD5B_RC=0" in out and "LXSTAT_RC=0" in out and "LX_UMOUNT_OK" in out
+              and "\n123\n" in out and "\n5000\n" in out)
+        step(v, "A.inline-linux", ok, "Linux mounts, reads and extends our inline writes" if ok else out.strip()[-200:].replace("\n", " "))
+        rc, out = box(fsck(2))
+        step(v, "A.inline-fsck2", "FSCK_RC=0" in out and "\n0\n" in out, "fsck.f2fs rc 0 after Linux write" if "FSCK_RC=0" in out else out.strip()[-140:].replace("\n", " "))
+    finally:
+        box(f"rm -rf {rd}")
+
+
 def direction_a(variants, tmp):
     rd = f"/tmp/f2fsinterop-{os.getpid()}"
     imgs, shas = [], {}
@@ -160,7 +204,7 @@ def direction_a(variants, tmp):
             script = f"""set -e; D={rd}; mkdir -p $D/m; cd $D; N={v}; rm -f $N.img
 truncate -s {SIZE} $N.img; mkfs.f2fs -q -f -l $N {mo} $N.img
 sudo mount -o loop{mnt} $N.img m; cd m; sudo chown $(id -u) .
-mkdir -p upg small dir1/sub big; echo hello > small/inl; printf 'x%.0s' $(seq 3000) > small/inl3000
+mkdir -p upg small dir1/sub big inl2/x; echo one > inl2/x/f; echo hello > small/inl; printf 'x%.0s' $(seq 3000) > small/inl3000
 head -c 5000 /dev/urandom > small/f5000; : > small/empty
 for i in $(seq 1 300); do echo "entry $i" > dir1/file_with_long_name_$i; done
 for i in 1 2 3; do echo s$i > dir1/sub/s$i; done
@@ -186,12 +230,13 @@ set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"
     for v in imgs:
         cmds += [MNT.format(l=v), md5chk(v, "MANIFEST"),
                  f"echo leandros > /mnt/{v}/ours.txt && cat /mnt/{v}/ours.txt; echo WRITE_RC=$?; sync",
+                 INLW.format(l=v),
                  f"umount /mnt/{v}; echo UMOUNT_RC=$?"]
     outs = guest([os.path.join(tmp, v + ".img") for v in imgs], cmds, "A")
     for i, v in enumerate(imgs):
         if outs is None:
             step(v, "A.mount", False, "guest run failed"); continue
-        m, md, w, u = outs[4 * i:4 * i + 4]
+        m, md, w, il, u = outs[5 * i:5 * i + 5]
         mounted = "MNT_RW" in m or "MNT_RO" in m
         step(v, "A.mount", mounted, "mounted" if mounted else "mount failed")
         if not mounted:
@@ -203,6 +248,7 @@ set +e; timeout 120 fsck.f2fs --dry-run $N.img >$N.fsck0 2>&1; echo FSCK0_RC=$?"
         step(v, "A.write", wok, "write ok" if wok else "write refused (ro/EROFS)" if "Read-only" in w else "write failed")
         if wok:
             skip(v, "A.ro-unchanged", "volume was written")
+            inline_verify(v, tmp, il)
         else:
             same = sha(os.path.join(tmp, v + ".img")) == shas[v]
             step(v, "A.ro-unchanged", same, "image bit-identical" if same else "image CHANGED by refused write/ro mount")
