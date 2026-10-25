@@ -99,7 +99,8 @@ def build(size):
     if total_segs < 32:
         die(f"{size} bytes is too small for a home volume (64 MiB minimum)")
     sit_blocks = -(-total_segs // SIT_PER_BLK)
-    sit_segs = -(-sit_blocks // BPS)
+    # Two SIT copies (Linux mirrors SIT and NAT; lane f2fslayout).
+    sit_segs = 2 * -(-sit_blocks // BPS)
     ckpt_segs, nat_segs, ssa_segs = 2, 2, 1
     seg0 = BPS
     cp_blk = seg0
@@ -134,7 +135,7 @@ def build(size):
         w32(b, s + 28, 1)
         w64(b, s + 36, total_blocks)
         w32(b, s + 44, main_segs)
-        w32(b, s + 48, total_segs)
+        w32(b, s + 48, total_segs - 1)     # from segment0_blkaddr on
         w32(b, s + 52, ckpt_segs)
         w32(b, s + 56, sit_segs)
         w32(b, s + 60, nat_segs)
@@ -225,6 +226,9 @@ def build(size):
             w32(c, 84 + i * 4, 2 if i == 0 else 0xFFFFFFFF)
         w32(c, 132, CP_UMOUNT_FLAG)
         w32(c, 136, 5)
+        w32(c, 156, (sit_segs // 2) * BPS // 8)
+        w32(c, 160, (nat_segs // 2) * BPS // 8)
+        w64(c, 2048, ver)                  # servers/f2fs CP_OWN_VER
         w32(c, 140, 1)
         w32(c, 144, n)
         w32(c, 148, n)
