@@ -19,7 +19,7 @@ sys.path.insert(0, HERE)
 os.chdir(WT)
 import driver  # noqa
 
-arch = sys.argv[1]
+arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
 fails = []
 
 
