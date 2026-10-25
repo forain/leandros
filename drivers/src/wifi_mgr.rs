@@ -134,6 +134,44 @@ extern "C" {
 }
 
 fn now_ms() -> u64 { sched::monotonic_ns() / 1_000_000 }
+
+/// Group-key state and TKIP receive counters, shared by the Intel driver and
+/// the simulated radio; shown by /proc/net/wifi (`# Group key`).
+pub mod gk {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static TKIP: AtomicU64 = AtomicU64::new(0);
+    static KEY_ID: AtomicU64 = AtomicU64::new(0);
+    static INSTALLS: AtomicU64 = AtomicU64::new(0);
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    /// 0 fw-decrypted, 1 host-decrypted, 2 Michael failures, 3 replay drops, 4 undecryptable.
+    static RX: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    pub const FW: usize = 0;
+    pub const SW: usize = 1;
+    pub const MIC: usize = 2;
+    pub const REPLAY: usize = 3;
+    pub const UNDECRYPTED: usize = 4;
+    pub fn note_install(key_id: u8, tkip: bool) {
+        TKIP.store(tkip as u64 + 1, Relaxed);
+        KEY_ID.store(key_id as u64, Relaxed);
+        LAST_MS.store(super::now_ms().max(1), Relaxed);
+        INSTALLS.fetch_add(1, Relaxed);
+    }
+    pub fn note_rx(kind: usize) { RX[kind].fetch_add(1, Relaxed); }
+    pub fn installs() -> u64 { INSTALLS.load(Relaxed) }
+    pub fn key_id() -> u64 { KEY_ID.load(Relaxed) }
+    pub fn rx(kind: usize) -> u64 { RX[kind].load(Relaxed) }
+    pub fn lines(out: &mut alloc::string::String) {
+        use core::fmt::Write;
+        let _ = writeln!(out);
+        let _ = writeln!(out, "# Group key (since boot)");
+        let c = match TKIP.load(Relaxed) { 1 => "ccmp", 2 => "tkip", _ => "none" };
+        let last = LAST_MS.load(Relaxed);
+        let _ = writeln!(out, "gtk: cipher {} key_index {} installs {} last_install {}", c, KEY_ID.load(Relaxed), INSTALLS.load(Relaxed),
+                         if last == 0 { alloc::string::String::from("never") } else { alloc::format!("{} s ago", super::now_ms().saturating_sub(last) / 1000) });
+        let _ = writeln!(out, "gtk_rx: tkip_fw {} tkip_sw {} michael_fail {} replay_drop {} undecryptable {}",
+                         rx(FW), rx(SW), rx(MIC), rx(REPLAY), rx(UNDECRYPTED));
+    }
+}
 fn msleep(ms: u64) { sched::kthread::msleep(ms) }
 
 // ── what a radio reports ────────────────────────────────────────────────────
@@ -752,6 +790,8 @@ impl Mgr {
                              wf::security_summary(&e.hit.bss), if e.nc.ext & bss_ext::JOINABLE != 0 { "yes" } else { "no" },
                              (now - e.seen_ms) / 1000, wf::ssid_display(&e.hit.bss.ssid));
         }
+        drop(st);
+        gk::lines(out);
     }
 
     // ── state machine pieces used by `run` ──

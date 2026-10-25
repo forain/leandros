@@ -1075,6 +1075,7 @@ impl Dev {
             wf::RxReject::Malformed => &mut self.rxs.malformed,
         };
         *c += 1;
+        if r == wf::RxReject::Replay { wm::gk::note_rx(wm::gk::REPLAY); }
         if self.debug {
             ilog!("rx: dropped {:?} data frame fc {:#06x} seq {:#06x} ({} bytes)", r, fc, cmd::le16(frame, 22).unwrap_or(0), frame.len());
         }
@@ -1089,8 +1090,8 @@ impl Dev {
     fn rx_tkip(&mut self, frame: &[u8], status: u32, sw: &mut Vec<u8>) -> Option<bool> {
         let fc = wf::frame_control(frame)?;
         let hl = wf::hdr_len(fc);
-        let Some(k) = self.tkip_group.as_mut() else { self.rxs.undecrypted += 1; return None; };
-        if frame.len() < hl + 8 + 8 + 4 || frame[4] & 1 == 0 { self.rxs.undecrypted += 1; return None; }
+        let Some(k) = self.tkip_group.as_mut() else { self.rxs.undecrypted += 1; wm::gk::note_rx(wm::gk::UNDECRYPTED); return None; };
+        if frame.len() < hl + 8 + 8 + 4 || frame[4] & 1 == 0 { self.rxs.undecrypted += 1; wm::gk::note_rx(wm::gk::UNDECRYPTED); return None; }
         let ok = cmd::RX_MPDU_STATUS_ICV_OK | cmd::RX_MPDU_STATUS_TTAK_OK;
         let by_fw = status & ok == ok;
         if !by_fw {
@@ -1109,9 +1110,11 @@ impl Dev {
             sw.extend_from_slice(frame);
             if !crate::wifi_crypto::tkip_decrypt(&k.key.tk, &p1k, tsc as u16, &mut sw[hl + 8..]) {
                 self.rxs.undecrypted += 1;
+                wm::gk::note_rx(wm::gk::UNDECRYPTED);
                 return None;
             }
             self.rxs.tkip_sw += 1;
+            wm::gk::note_rx(wm::gk::SW);
         }
         let f: &[u8] = if by_fw { frame } else { &sw[..] };
         if !crate::wifi_crypto::tkip_frame_mic_ok(&k.key.rx_mic, f, hl, 4) {
@@ -1120,6 +1123,7 @@ impl Dev {
             // log only.
             let now = now_ms();
             self.rxs.mic_fail += 1;
+            wm::gk::note_rx(wm::gk::MIC);
             let second = now.saturating_sub(k.mic_fail_ms[1]) < 60_000 && k.mic_fail_ms[1] != 0;
             k.mic_fail_ms = [k.mic_fail_ms[1], now];
             if self.rxs.mic_fail <= 20 {
@@ -1128,6 +1132,7 @@ impl Dev {
             }
             return None;
         }
+        if by_fw { wm::gk::note_rx(wm::gk::FW); }
         Some(!by_fw)
     }
 
@@ -2695,6 +2700,7 @@ fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8], sent: &mut
                     d.tkip_group = Some(TkipRx { key: tk, p1k: Some((iv32, p1k)), mic_fail_ms: [0; 2] });
                     if let Some(g) = d.guard.as_mut() { g.set_tkip_group(true); g.reset_key(key_id); }
                 });
+                wm::gk::note_install(key_id, true);
                 ilog!("group key {} (TKIP) installed", key_id);
             }
             HsEvent::InstallGtk { key_id, key, rsc: _ } => {
@@ -2705,6 +2711,7 @@ fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8], sent: &mut
                 let st = cmd::le32(&r, 0).unwrap_or(0) & 0xff;
                 if st != cmd::ADD_STA_SUCCESS { return Err(Err::Status("group key", st)); }
                 with_dev(|d| if let Some(g) = d.guard.as_mut() { g.reset_key(key_id); });
+                wm::gk::note_install(key_id, false);
                 ilog!("group key {} (CCMP) installed", key_id);
             }
             HsEvent::Complete => {}
