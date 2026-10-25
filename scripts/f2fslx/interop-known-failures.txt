@@ -1,0 +1,6 @@
+# Known interop gaps: `variant:step` fnmatch patterns. Delete an entry when the
+# lane that closes the gap lands; a listed step that passes is UNEXPECTED-PASS.
+*:A.write          # rw of Linux-made volumes refused until S4 (f2fslxrw)
+home:B.fsck1       # fsck.f2fs SSA/summary errors on LeandrOS-written volumes until lxssa lands
+home:B.fsck2
+home:B.back-verify  # LeandrOS cannot re-mount after Linux wrote ("linux_import gave up at short-pack"); needs the Linux-checkpoint import to accept Linux-written packs (S4)
