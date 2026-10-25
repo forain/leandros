@@ -1,6 +1,6 @@
 """The "lx" f2fs node format: Linux's exact on-disk inode, node and dentry
 layout (include/linux/f2fs_fs.h), used by volumes whose superblock carries the
-`LeandrOS lxnode1` marker. Shared by scripts/mkfs-f2fs-home.py,
+`LeandrOS lxnode2` marker. Shared by scripts/mkfs-f2fs-home.py,
 scripts/mkfs-f2fs-populated.py and scripts/fsck-f2fs.py; servers/f2fs reads
 the same layout when it finds the marker.
 
