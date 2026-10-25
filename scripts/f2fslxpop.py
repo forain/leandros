@@ -151,11 +151,11 @@ class Pop:
                 struct.pack_into("<IBH", b, off * 7, nid, 1, ofs)
                 b[4091] = 1 if node else 0
 
-            def put_node(addr, b, nid):
+            def put_node(addr, b, nid, ino):
                 if dry:
                     return
                 meta[addr] = b
-                nat[nid] = addr
+                nat[nid] = (addr, ino)
 
             for ino_rec in inodes:
                 nid = ino_rec["nid"]
@@ -227,7 +227,7 @@ class Pop:
                     for k2, a in enumerate(ch):
                         w32(db, 4 * k2, a)
                     f2fslx.write_footer(db, dn_nid, nid, ofs)
-                    put_node(dn_at, db, dn_nid)
+                    put_node(dn_at, db, dn_nid, nid)
                     sum_set(dn_at, dn_nid, 0, True)
                     owner_sums(ch, dn_nid)
                     if parent_ind is None:
@@ -241,7 +241,7 @@ class Pop:
                         ind_state[parent_ind][2][4 * i:4 * i + 4] = struct.pack("<I", dn_nid)
                 for k, (ind_nid, ind_at, ibk) in ind_state.items():
                     f2fslx.write_footer(ibk, ind_nid, nid, f2fslx.ofs_ind(k))
-                    put_node(ind_at, ibk, ind_nid)
+                    put_node(ind_at, ibk, ind_nid, nid)
                     sum_set(ind_at, ind_nid, 0, True)
                 for k, v in enumerate(i_nids):
                     w32(ib, f2fslx.I_NID + 4 * k, v)
@@ -262,7 +262,7 @@ class Pop:
                 w32(ib, f2fslx.I_NAMELEN, len(nm))
                 ib[f2fslx.I_NAME:f2fslx.I_NAME + len(nm)] = nm
                 f2fslx.write_footer(ib, nid, nid, 0)
-                put_node(inode_at, ib, nid)
+                put_node(inode_at, ib, nid, nid)
                 sum_set(inode_at, nid, 0, True)
             return node_n, data_n, nat
 
@@ -310,11 +310,11 @@ class Pop:
                 f2fslx.mark_superblock(b, s)
 
             # NAT.
-            for nid, addr in nat.items():
+            for nid, (addr, owner) in nat.items():
                 nb = blk(nat_blk + nid // nat_per)
                 o = (nid % nat_per) * NAT_ENTRY_SIZE
                 nb[o] = 1
-                w32(nb, o + 1, nid)
+                w32(nb, o + 1, owner)
                 w32(nb, o + 5, addr)
             for dino in (1, 2):
                 nb = blk(nat_blk + dino // nat_per)
