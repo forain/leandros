@@ -516,6 +516,8 @@ struct Dev {
     tagg: TxAgg,
     /// The BSS queue is an aggregation queue: sequence number == ring index.
     agg_queue: bool,
+    /// Session-protection time event the firmware still runs (L12 #66).
+    te: asc::TeTrack,
     /// Initial rate of the last A-MPDU's TX response (for its BA notification).
     agg_rate: u32,
     /// A WMM Parameter element with a new parameter set count seen in the
@@ -795,6 +797,10 @@ impl Dev {
                         }
                     }
                     return;
+                }
+                cmd::TIME_EVENT_NOTIFICATION => {
+                    // Track it wherever it lands (the connect waits still see it).
+                    if let Some((u, a, st)) = asc::parse_time_event_notif(&p.data) { self.te.on_notif(u, a, st); }
                 }
                 cmd::DTS_MEASUREMENT_NOTIFICATION | cmd::DEBUG_LOG_MSG
                 | cmd::BEACON_NOTIFICATION => {
@@ -1402,7 +1408,7 @@ pub fn init(cmdline: &str) {
         guard: None, tkip_group: None, last_service_ms: 0, rxs: RxStats::default(), csumcheck: opts.csumcheck,
         link: None, track: None, bcn: None, bcn_rssi: None,
         htl: None, ht_op_mode: None, agg: ht::RxAgg::default(), bas: BaStats::default(),
-        tagg: TxAgg::new(true), agg_queue: false, agg_rate: 0, wmm_new: None, wmm_updates: 0,
+        tagg: TxAgg::new(true), agg_queue: false, te: asc::TeTrack::new(), agg_rate: 0, wmm_new: None, wmm_updates: 0,
         fw_stats: None, stats_n: 0, stats_bad_len: None, chain_dbm16: [0; 2],
     });
     PRESENT.store(true, Ordering::SeqCst);
@@ -2413,6 +2419,7 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
     match asc::parse_time_event_resp(&r) {
         Some((0, uid)) => {
             prog.time_event = Some(uid);
+            with_dev(|d| d.te.on_add(uid));
             match wait_notif(1000, |p| p.group <= 1 && p.cmd == cmd::TIME_EVENT_NOTIFICATION, log_async) {
                 Ok(p) => {
                     let (u, action, status) = asc::parse_time_event_notif(&p.data).unwrap_or((0, 0, 0));
@@ -2972,47 +2979,65 @@ fn manager(fw: Fw, hw: Hw, func: PciFunction, opts: Opts) {
 
 impl IwlRadio {
     /// Undo what `prog` says an attempt set up, the way iwlmvm leaves a BSS:
-    /// end the session-protection event, flush the station's queues, MAC
-    /// context back to unassociated, no quota, disable the queues, remove
-    /// the station, unbind the MAC from the PHY context.
+    /// asc::teardown_plan — flush and drain the station's queues, disable
+    /// them, MAC context unassociated + no quota, remove the station, end
+    /// the session-protection event only if still running, unbind.
     fn soft_teardown(&mut self) -> Res<()> {
+        use asc::TeardownStep as S;
         let p = self.prog;
-        if let Some(uid) = p.time_event {
-            // It may have ended on its own; the firmware then answers an error.
-            if let Err(e) = send(cmd::TIME_EVENT_CMD, None, &asc::time_event_cmd(MAC_ID, cmd::FW_CTXT_ACTION_REMOVE, uid, 0, 0)) {
-                if matches!(e, Err::FwError) { return Err(e); }
+        // Only an event the firmware still runs: REMOVE of one that already
+        // ended (it lasts 2000 TU) is NMI_INTERRUPT_DATA_ACTION_PT on -36.
+        let te = if p.time_event.is_some() { with_dev(|d| d.te.remove_uid()).flatten() } else { None };
+        for step in asc::teardown_plan(p.bound, p.sta, te) {
+            match step {
+                S::FlushTx => {
+                    // TXPATH_FLUSH v1: queues, flush_ctl DUMP_TX_FIFO_FLUSH, reserved.
+                    let mut f = Vec::with_capacity(8);
+                    f.extend_from_slice(&((1u32 << BSS_QUEUE) | (1 << MGMT_QUEUE)).to_le_bytes());
+                    f.extend_from_slice(&2u16.to_le_bytes());
+                    f.extend_from_slice(&0u16.to_le_bytes());
+                    send(cmd::TXPATH_FLUSH, None, &f)?;
+                    // iwl_mvm_wait_sta_queues_empty: the flushed frames come back as TX responses.
+                    let t0 = now_ms();
+                    loop {
+                        let busy = with_dev(|d| { d.service(); [BSS_QUEUE, MGMT_QUEUE].iter().any(|&q| d.t.txq[q].as_ref().map_or(false, |t| t.read != t.write)) }).unwrap_or(false);
+                        if !busy { break; }
+                        if now_ms() - t0 > 200 { ilog!("teardown: TX queues not drained after the flush"); break; }
+                        msleep(2);
+                    }
+                }
+                S::DisableQueues => {
+                    for (q, tid, fifo) in [(BSS_QUEUE, asc::TID_NON_QOS, cmd::TX_FIFO_BE), (MGMT_QUEUE, asc::TID_MGMT, cmd::TX_FIFO_VO)] {
+                        let ssn = with_dev(|d| d.t.txq[q].as_ref().map_or(0, |t| t.write) as u16).unwrap_or(0);
+                        send(cmd::SCD_QUEUE_CFG, None, &cmd::scd_queue_cfg_cmd(q as u8, false, AP_STA_ID, tid, fifo, ssn))?;
+                    }
+                }
+                S::MacUnassoc => {
+                    mac_ctxt(cmd::FW_CTXT_ACTION_MODIFY, &MacState::unassoc(self.hw.mac))?;
+                    send(cmd::TIME_QUOTA_CMD, None, &asc::time_quota_cmd(None))?;
+                }
+                S::RemoveSta => { send(cmd::REMOVE_STA, None, &[AP_STA_ID, 0, 0, 0])?; }
+                S::RemoveTimeEvent(uid) => {
+                    // It can still end between the check and the command; the firmware then answers an error.
+                    let r = send(cmd::TIME_EVENT_CMD, None, &asc::time_event_cmd(MAC_ID, cmd::FW_CTXT_ACTION_REMOVE, uid, 0, 0));
+                    with_dev(|d| d.te.removed());
+                    if let Err(e) = r { if matches!(e, Err::FwError) { return Err(e); } }
+                }
+                S::Unbind => {
+                    let r = send(cmd::BINDING_CONTEXT_CMD, None, &asc::binding_cmd(PHY_ID, cmd::FW_CTXT_ACTION_REMOVE, &[]))?;
+                    let st = cmd::le32(&r, 0).unwrap_or(0);
+                    if st != 0 { return Err(Err::Status("unbind", st)); }
+                }
             }
         }
-        if p.sta {
-            // TXPATH_FLUSH v1: queues, flush_ctl DUMP_TX_FIFO_FLUSH, reserved.
-            let mut f = Vec::with_capacity(8);
-            f.extend_from_slice(&((1u32 << BSS_QUEUE) | (1 << MGMT_QUEUE)).to_le_bytes());
-            f.extend_from_slice(&2u16.to_le_bytes());
-            f.extend_from_slice(&0u16.to_le_bytes());
-            send(cmd::TXPATH_FLUSH, None, &f)?;
-        }
-        if p.bound {
-            mac_ctxt(cmd::FW_CTXT_ACTION_MODIFY, &MacState::unassoc(self.hw.mac))?;
-            send(cmd::TIME_QUOTA_CMD, None, &asc::time_quota_cmd(None))?;
-        }
-        if p.sta {
-            for (q, tid, fifo) in [(BSS_QUEUE, asc::TID_NON_QOS, cmd::TX_FIFO_BE), (MGMT_QUEUE, asc::TID_MGMT, cmd::TX_FIFO_VO)] {
-                let ssn = with_dev(|d| d.t.txq[q].as_ref().map_or(0, |t| t.write) as u16).unwrap_or(0);
-                send(cmd::SCD_QUEUE_CFG, None, &cmd::scd_queue_cfg_cmd(q as u8, false, AP_STA_ID, tid, fifo, ssn))?;
-            }
-            send(cmd::REMOVE_STA, None, &[AP_STA_ID, 0, 0, 0])?;
-        }
-        if p.bound {
-            let r = send(cmd::BINDING_CONTEXT_CMD, None, &asc::binding_cmd(PHY_ID, cmd::FW_CTXT_ACTION_REMOVE, &[]))?;
-            let st = cmd::le32(&r, 0).unwrap_or(0);
-            if st != 0 { return Err(Err::Status("unbind", st)); }
-        }
+        if p.time_event.is_some() && te.is_none() { ilog!("teardown: session protection already ended; not removed"); }
         Ok(())
     }
 
     fn restart(&mut self, after_error: bool) -> bool {
         let ok = restart_rt(&self.fw, &self.func, &mut self.hw, after_error);
         self.prog = Prog::default();
+        with_dev(|d| d.te = asc::TeTrack::new());
         if ok { set_state("up (manager)"); }
         ok
     }
