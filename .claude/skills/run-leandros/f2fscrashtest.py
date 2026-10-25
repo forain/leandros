@@ -75,6 +75,8 @@ class Claims:
         self.t = {}            # (k, g) -> size
         self.max_gen = 0       # newest rewrite gen whose W line arrived
         self.inflight = 0      # blocks of a newer gen (its W line was lost with the kill)
+        self.min_gen = None    # oldest rewrite gen whose W line arrived (gens start at 1)
+        self.uncaptured = 0    # blocks of a gen older than the capture's first W line
         self.setup = False
 
     def parse(self, text):
@@ -93,6 +95,7 @@ class Claims:
                 self.a[v[0]] = max(self.a.get(v[0], 0), v[1])
             elif tag == "W" and len(v) == 4:
                 self.max_gen = max(self.max_gen, v[1])
+                self.min_gen = v[1] if self.min_gen is None else min(self.min_gen, v[1])
                 for b in range(v[2], v[2] + v[3]):
                     self.o_allowed.setdefault((v[0], b), {0}).add(v[1])
             elif tag == "O" and len(v) == 4:
@@ -131,6 +134,11 @@ class Claims:
                     # The rewrite after the last W line that reached the host:
                     # the kill lost its line on the serial port, not the write.
                     self.inflight += 1
+                elif self.min_gen is not None and 0 < g < self.min_gen:
+                    # The serial capture began after the workload's first W
+                    # lines (seen: it started at W gen 13 while the workload
+                    # numbers rewrites from 1), so where gen g went is unknown.
+                    self.uncaptured += 1
                 elif g not in allowed:
                     errs.append(f"o{k} block {b}: gen {g} was never written there (newest W gen {self.max_gen})")
                 elif g < self.o_sync.get((k, b), 0):
@@ -255,6 +263,9 @@ def main(argv):
                 errs = claims.check(scan)
                 nclaims = len(claims.a) + len(claims.o_sync) + len(claims.n)
                 extra = f"; {claims.inflight} blocks of the in-flight rewrite" if claims.inflight else ""
+                if claims.uncaptured:
+                    extra += (f"; {claims.uncaptured} blocks of a rewrite older than the capture's "
+                              f"first W line (gen {claims.min_gen})")
                 print(f"iter {it - 1}: recovered: {'PASS' if not errs else 'FAIL'} "
                       f"({nclaims} durability claims checked{extra})", flush=True)
                 for e in errs[:12]:
@@ -284,8 +295,8 @@ def main(argv):
         ser = driver._Serial()
         try:
             ser.pump(0.2)
-            driver._type_line(ser, f"/bin/f2fstest crash {d} {wseed}", 10.0 * driver.wait_scale(arch))
             start = len(ser.buf)
+            driver._type_line(ser, f"/bin/f2fstest crash {d} {wseed}", 10.0 * driver.wait_scale(arch))
             if how == "kill":
                 secs = rnd.uniform(4, 20)
                 ser.pump(secs)
@@ -293,9 +304,15 @@ def main(argv):
                 ser.pump(180, until=lambda b: b"FSYNC_FAIL" in b[start:] or b"WRITE_FAIL" in b[start:]
                          or b"CRASH " in b[start:])
             text = driver._lrc_clean(ser.buf[start:], True)
+            if os.environ.get("F2FSCR_OUT"):
+                with open(os.path.join(os.environ["F2FSCR_OUT"], f"raw-{it}.bin"), "wb") as f:
+                    f.write(bytes(ser.buf[max(0, start - 400):]))
         finally:
             ser.close()
         hard_kill()
+        if os.environ.get("F2FSCR_OUT"):
+            with open(os.path.join(os.environ["F2FSCR_OUT"], f"work-{it}.txt"), "w") as f:
+                f.write(text)
         claims = Claims()
         claims.parse(text)
         ops = text.count("\n")
