@@ -50,7 +50,7 @@ def main(argv):
     img = os.path.join(out, "full.img")
     if os.path.exists(img): os.unlink(img)
     subprocess.run([sys.executable, os.path.join(REPO, "scripts", "mkfs-f2fs-home.py"), "create", img,
-                    "--size", "64M"], check=True, stdout=subprocess.DEVNULL)
+                    "--size", "64M"] + (["--lx"] if os.environ.get("F2FS_TEST_LX") else []), check=True, stdout=subprocess.DEVNULL)
     cr.relabel(img)
     pci = "virtio-blk-pci,drive=crdisk" + (",disable-legacy=on" if arch == "aarch64" else "")
     os.environ["LEANDROS_QEMU_EXTRA"] = (f" -drive if=none,id=crdisk,format=raw,file={img} -device {pci}").strip()
