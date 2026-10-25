@@ -220,6 +220,26 @@ def wav_rms(name, start, end):
     log(f"audio {name}: {AUDIO[name]}")
 
 
+# Frame-rate guard: DOOM's Wayland path logs "[doom] fps=F calls=C ..." every
+# 5 s. Once the window is up, every window must keep DOOM near its 35 Hz tic
+# rate (the first one is skipped: it includes startup and the attract wipe).
+DOOM_MIN_FPS = float(os.environ.get("DOOM_MIN_FPS", "30"))
+FPS_FAIL = []
+
+
+def fps_check(text):
+    fps = [float(m.group(1)) for m in re.finditer(r"\[doom\] fps=([0-9.]+)", text)]
+    lines = [l for l in text.splitlines() if l.startswith("[doom] fps=")]
+    steady = fps[1:] or fps
+    res = {"windows": fps, "lines": lines[-4:], "min_fps": DOOM_MIN_FPS,
+           "steady_min": min(steady) if steady else None}
+    res["pass"] = bool(steady) and min(steady) >= DOOM_MIN_FPS
+    if not res["pass"]:
+        FPS_FAIL.append(f"desktop DOOM fps {steady} < {DOOM_MIN_FPS}")
+    RESULT["desktop-doom-fps"] = res
+    log("FPS", res)
+
+
 def kill_doom():
     sh('for p in /proc/[0-9]*; do c=$(tr "\\0" " " < $p/cmdline 2>/dev/null); '
        'case "$c" in doom*|/bin/doom*|mame*|/bin/mame*) kill ${p#/proc/};; esac; done; true', 30)
@@ -274,6 +294,7 @@ def main():
     analyse("desktop-doom-menu-vs-prev", km, d1)
     analyse("desktop-doom-newgame-vs-menu", kg, km)
     open(f"{OUT}/doom.log", "w").write(sh("cat /tmp/doom.log", 30))
+    fps_check(open(f"{OUT}/doom.log").read())
     vt_doom = vtstat("doom")
     # Quit the desktop DOOM, so whatever plays during the text-VT phase can
     # only be the second DOOM; the gap in between must be silent.
@@ -336,6 +357,8 @@ def main():
     log("DONE", OUT, STEPS)
     log(json.dumps(RESULT, indent=1))
     log(json.dumps(AUDIO, indent=1))
+    if FPS_FAIL:
+        sys.exit("FAIL: " + "; ".join(FPS_FAIL))
 
 
 if __name__ == "__main__":

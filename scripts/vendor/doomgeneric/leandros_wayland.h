@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include "doomgeneric.h"
 
 /* Integer upscale of the 320x200 frame: 960x600 fits a 1280x800 output with
@@ -136,6 +137,7 @@ static void wl_say_errno(const char *what, long err) {
 
 /* ── Connection state ────────────────────────────────────────────────────── */
 
+static void wl_fps_cb_done(void);
 static struct {
     int fd;
     int active;            /* window is up; DOOM presents here */
@@ -145,9 +147,10 @@ static struct {
     int out_fd;            /* one fd to pass with the next flush, or -1 */
     uint8_t in[8192]; size_t in_len;
     /* globals */
-    uint32_t compositor_name, compositor_ver, shm_name, wm_name, seat_name, seat_ver;
+    uint32_t compositor_name, compositor_ver, shm_name, wm_name, seat_name, seat_ver, vp_name;
     /* objects */
-    uint32_t registry, sync_cb, compositor, shm, wm, seat, keyboard;
+    uint32_t registry, sync_cb, compositor, shm, wm, seat, keyboard, viewporter, viewport;
+    int scale;             /* CPU upscale factor of the shm buffer: 1 with wp_viewporter */
     uint32_t surface, xdg_surface, toplevel, pool, buffer[2], frame_cb;
     int sync_done, configured, buffer_busy[2], seat_caps;
     uint8_t *pixels;       /* both buffers, back to back */
@@ -252,11 +255,12 @@ static void wl_event(uint32_t obj, uint32_t op, const uint8_t *a, uint32_t len) 
         if (!strcmp(iface, "wl_compositor")) { wl.compositor_name = v0; wl.compositor_ver = ver; }
         else if (!strcmp(iface, "wl_shm")) wl.shm_name = v0;
         else if (!strcmp(iface, "xdg_wm_base")) wl.wm_name = v0;
+        else if (!strcmp(iface, "wp_viewporter")) wl.vp_name = v0;
         else if (!strcmp(iface, "wl_seat") && !wl.seat_name) { wl.seat_name = v0; wl.seat_ver = ver; }
         return;
     }
     if (obj == wl.sync_cb && op == 0) { wl.sync_done = 1; return; }
-    if (obj == wl.frame_cb && op == 0) { wl.frame_cb = 0; return; }
+    if (obj == wl.frame_cb && op == 0) { wl.frame_cb = 0; wl_fps_cb_done(); return; }
     if (obj == wl.wm && op == 0) {                    /* ping -> pong */
         wl_begin(wl.wm, 3); wl_u32(v0); wl_end();
         return;
@@ -434,6 +438,22 @@ static int wl_open(void) {
 
     wl.surface = wl_new_id();
     wl_begin(wl.compositor, 0); wl_u32(wl.surface); wl_end();
+    /* The window is WL_W x WL_H. With wp_viewporter the compositor scales the
+     * 320x200 frame up on the GPU, so each frame uploads 256 KiB instead of a
+     * CPU-upscaled 2.3 MiB (the upload is what made cosmic-comp miss vblank).
+     * LEANDROS_DOOM_WL_SCALE=3 keeps the old CPU upscale for an A/B. */
+    wl.scale = WL_SCALE;
+    {
+        const char *e = wl_getenv("LEANDROS_DOOM_WL_SCALE");
+        if (wl.vp_name && !(e && *e == '3')) {
+            wl.viewporter = wl_new_id();
+            wl_bind(wl.vp_name, "wp_viewporter", 1, wl.viewporter);
+            wl.viewport = wl_new_id();
+            wl_begin(wl.viewporter, 1); wl_u32(wl.viewport); wl_u32(wl.surface); wl_end(); /* get_viewport */
+            wl_begin(wl.viewport, 2); wl_u32(WL_W); wl_u32(WL_H); wl_end();               /* set_destination */
+            wl.scale = 1;
+        }
+    }
     wl.xdg_surface = wl_new_id();
     wl_begin(wl.wm, 2); wl_u32(wl.xdg_surface); wl_u32(wl.surface); wl_end();
     wl.toplevel = wl_new_id();
@@ -477,7 +497,8 @@ static int wl_open(void) {
         wl.buffer[i] = wl_new_id();
         wl_begin(wl.pool, 0);
         wl_u32(wl.buffer[i]); wl_u32((uint32_t)(i * WL_BUFSZ));
-        wl_u32(WL_W); wl_u32(WL_H); wl_u32(WL_STRIDE); wl_u32(1 /* XRGB8888 */);
+        wl_u32(DOOMGENERIC_RESX * wl.scale); wl_u32(DOOMGENERIC_RESY * wl.scale);
+        wl_u32(DOOMGENERIC_RESX * wl.scale * 4); wl_u32(1 /* XRGB8888 */);
         wl_end();
     }
     wl_flush();
@@ -490,7 +511,56 @@ static int wl_open(void) {
 
     wl.active = 1;
     write(1, "[doom] drawing in a Wayland window\n", 35);
+    if (wl.scale == 1) write(1, "[doom] window scaled by the compositor (wp_viewporter)\n", 55);
     return 1;
+}
+
+/* Frame-rate stats: one "[doom] fps" line every 5 s on stdout (DOOM's log),
+ * so a session can check the window keeps DOOM's 35 Hz tic rate:
+ *   fps     frames committed to the compositor per second
+ *   calls   frames DOOM offered per second (D_Display rate)
+ *   tics    game tics per second (35 when DOOM runs at full speed)
+ *   cb/busy offers dropped while a frame callback / both buffers were pending
+ *   cb_ms   mean commit -> frame-callback latency
+ *   copy_us mean time to fill the shm buffer */
+extern int gametic;
+static struct { uint64_t t0, commit_ns, cb_ns, copy_ns; uint32_t calls, sent, skip_cb, skip_busy, cbs; int tic0; } wl_fps;
+/* Appends label + v (v / 10 "." v % 10 when tenths): no printf, whose stack
+ * varargs the x86_64 static libc misreads. */
+static void wl_fps_put(char *buf, size_t *n, const char *label, uint32_t v, int tenths) {
+    while (*label) buf[(*n)++] = *label++;
+    char d[12]; int k = 0;
+    uint32_t w = tenths ? v / 10 : v;
+    do { d[k++] = (char)('0' + w % 10); w /= 10; } while (w);
+    while (k) buf[(*n)++] = d[--k];
+    if (tenths) { buf[(*n)++] = '.'; buf[(*n)++] = (char)('0' + v % 10); }
+}
+static uint64_t wl_now_ns(void) {
+    struct timespec ts; clock_gettime(1 /* CLOCK_MONOTONIC */, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+static void wl_fps_cb_done(void) {
+    if (wl_fps.commit_ns) { wl_fps.cb_ns += wl_now_ns() - wl_fps.commit_ns; wl_fps.cbs++; wl_fps.commit_ns = 0; }
+}
+static void wl_fps_tick(void) {
+    uint64_t now = wl_now_ns();
+    if (!wl_fps.t0) { wl_fps.t0 = now; wl_fps.tic0 = gametic; return; }
+    uint64_t dt = now - wl_fps.t0;
+    if (dt < 5000000000ull) return;
+    unsigned ms = (unsigned)(dt / 1000000ull);
+    char line[160]; size_t n = 0;
+    wl_fps_put(line, &n, "[doom] fps=", (uint32_t)((uint64_t)wl_fps.sent * 10000ull / ms), 1);
+    wl_fps_put(line, &n, " calls=", (uint32_t)((uint64_t)wl_fps.calls * 10000ull / ms), 1);
+    wl_fps_put(line, &n, " tics=", (uint32_t)((uint64_t)(uint32_t)(gametic - wl_fps.tic0) * 10000ull / ms), 1);
+    wl_fps_put(line, &n, " cb=", wl_fps.skip_cb, 0);
+    wl_fps_put(line, &n, " busy=", wl_fps.skip_busy, 0);
+    wl_fps_put(line, &n, " cb_ms=", wl_fps.cbs ? (uint32_t)(wl_fps.cb_ns / wl_fps.cbs / 1000000ull) : 0, 0);
+    wl_fps_put(line, &n, " copy_us=", wl_fps.sent ? (uint32_t)(wl_fps.copy_ns / wl_fps.sent / 1000ull) : 0, 0);
+    line[n++] = '\n';
+    write(1, line, n);
+    memset(&wl_fps, 0, sizeof wl_fps);
+    wl_fps.t0 = now;
+    wl_fps.tic0 = gametic;
 }
 
 /* Present one 320x200 XRGB frame. A frame is dropped rather than queued while
@@ -499,12 +569,17 @@ static int wl_open(void) {
  * carries everything this one would have. */
 static void wl_present(const uint32_t *src) {
     wl_dispatch(0);
-    if (!wl.active || wl.closed || wl.frame_cb) return;
+    if (!wl.active || wl.closed) return;
+    wl_fps.calls++;
+    wl_fps_tick();
+    if (wl.frame_cb) { wl_fps.skip_cb++; return; }
     int b = !wl.buffer_busy[0] ? 0 : !wl.buffer_busy[1] ? 1 : -1;
-    if (b < 0) return;
+    if (b < 0) { wl_fps.skip_busy++; return; }
+    uint64_t c0 = wl_now_ns();
 
     uint32_t *dst = (uint32_t *)(wl.pixels + (size_t)b * WL_BUFSZ);
-    for (int y = 0; y < DOOMGENERIC_RESY; y++) {
+    if (wl.scale == 1) memcpy(dst, src, DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4);
+    else for (int y = 0; y < DOOMGENERIC_RESY; y++) {
         uint32_t *row = dst + (size_t)y * WL_SCALE * WL_W;
         const uint32_t *s = src + (size_t)y * DOOMGENERIC_RESX;
         for (int x = 0; x < DOOMGENERIC_RESX; x++) {
@@ -514,6 +589,8 @@ static void wl_present(const uint32_t *src) {
         for (int k = 1; k < WL_SCALE; k++) memcpy(row + (size_t)k * WL_W, row, WL_STRIDE);
     }
 
+    wl_fps.copy_ns += wl_now_ns() - c0;
+
     wl_begin(wl.surface, 1); wl_u32(wl.buffer[b]); wl_u32(0); wl_u32(0); wl_end();  /* attach */
     wl_begin(wl.surface, 2); wl_u32(0); wl_u32(0); wl_u32(WL_W); wl_u32(WL_H); wl_end(); /* damage */
     wl.frame_cb = wl_new_id();
@@ -521,6 +598,8 @@ static void wl_present(const uint32_t *src) {
     wl_begin(wl.surface, 6); wl_end();                                              /* commit */
     wl.buffer_busy[b] = 1;
     wl_flush();
+    wl_fps.sent++;
+    wl_fps.commit_ns = wl_now_ns();
 }
 
 /* Next key event as (pressed << 16) | evdev code; -1 when none, -2 when the

@@ -101,8 +101,19 @@ pub const IEEE_REASON_8021X_FAILED: u16 = 23;
 
 /// Periodic background scan while disconnected and the radio is on.
 pub const IDLE_SCAN_MS: u64 = 30_000;
-/// Background scan while connected (only radios with SCAN_CONNECTED).
+/// Background (roaming) scan interval while connected (only radios with
+/// SCAN_CONNECTED), and only while the signal is below `ROAM_SCAN_DBM`:
+/// like Linux (no periodic scan while associated without a roaming
+/// trigger; NetworkManager's bgscan "simple" is signal-gated too).
 pub const CONNECTED_SCAN_MS: u64 = 120_000;
+/// A connected background scan needs the signal below this (dBm).
+pub const ROAM_SCAN_DBM: i32 = -75;
+
+/// Whether the connected loop should start a background scan `since_ms`
+/// after the last one, with the current signal `signal_dbm` (0 = unknown).
+pub fn connected_bg_scan_due(since_ms: u64, signal_dbm: i32) -> bool {
+    since_ms >= CONNECTED_SCAN_MS && signal_dbm != 0 && signal_dbm < ROAM_SCAN_DBM
+}
 /// FORCE still runs at most one fresh scan per this interval.
 pub const FORCE_MIN_MS: u64 = 2_000;
 /// Autoconnect uses the cache when it is this fresh, else scans first.
@@ -157,6 +168,25 @@ pub mod gk {
         INSTALLS.fetch_add(1, Relaxed);
     }
     pub fn note_rx(kind: usize) { RX[kind].fetch_add(1, Relaxed); }
+    /// A protected data frame the firmware did not decrypt: [unicast,
+    /// multicast] x CCMP key index from its header, and the status' cipher
+    /// field (0 none, 2 CCM with a MIC failure, 7 error, other).
+    static UNDEC: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static UNDEC_SEC: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static UNDEC_LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static UNDEC_FOREIGN: AtomicU64 = AtomicU64::new(0);
+    /// `foreign`: the frame is not from our AP to us / the group (a frame
+    /// the address check would have refused anyway).
+    pub fn note_undecrypted(frame: &[u8], fc: u16, status: u32, foreign: bool) {
+        if foreign { UNDEC_FOREIGN.fetch_add(1, Relaxed); return; }
+        let mc = frame.get(4).map_or(false, |b| b & 1 != 0) as usize;
+        let ki = frame.get(crate::wifi_frame::hdr_len(fc) + 3).map_or(0, |b| b >> 6) as usize;
+        UNDEC[mc * 4 + ki].fetch_add(1, Relaxed);
+        let sec = match (status >> 8) & 7 { 0 => 0, 2 => 1, 7 => 2, _ => 3 };
+        UNDEC_SEC[sec].fetch_add(1, Relaxed);
+        UNDEC_LAST_MS.store(super::now_ms().max(1), Relaxed);
+    }
+    pub fn undecrypted(mcast: bool, key_idx: usize) -> u64 { UNDEC[mcast as usize * 4 + (key_idx & 3)].load(Relaxed) }
     pub fn installs() -> u64 { INSTALLS.load(Relaxed) }
     pub fn key_id() -> u64 { KEY_ID.load(Relaxed) }
     pub fn rx(kind: usize) -> u64 { RX[kind].load(Relaxed) }
@@ -170,6 +200,12 @@ pub mod gk {
                          if last == 0 { alloc::string::String::from("never") } else { alloc::format!("{} s ago", super::now_ms().saturating_sub(last) / 1000) });
         let _ = writeln!(out, "gtk_rx: tkip_fw {} tkip_sw {} michael_fail {} replay_drop {} undecryptable {}",
                          rx(FW), rx(SW), rx(MIC), rx(REPLAY), rx(UNDECRYPTED));
+        let u = |i: usize| UNDEC[i].load(Relaxed);
+        let ul = UNDEC_LAST_MS.load(Relaxed);
+        let _ = writeln!(out, "rx_undecrypted: uc k0 {} k1 {} k2 {} k3 {} mc k0 {} k1 {} k2 {} k3 {} sec none {} mic {} err {} other {} foreign {} last {}",
+                         u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7),
+                         UNDEC_SEC[0].load(Relaxed), UNDEC_SEC[1].load(Relaxed), UNDEC_SEC[2].load(Relaxed), UNDEC_SEC[3].load(Relaxed), UNDEC_FOREIGN.load(Relaxed),
+                         if ul == 0 { alloc::string::String::from("never") } else { alloc::format!("{} ms ago", super::now_ms().saturating_sub(ul)) });
     }
 }
 fn msleep(ms: u64) { sched::kthread::msleep(ms) }
@@ -1523,7 +1559,8 @@ fn connected<R: Radio>(mgr: &Mgr, r: &mut R, req: &Req, bssid: [u8; 6]) -> After
         let cmd = match mgr.pop_cmd() {
             Some(c) => c,
             None => {
-                if r.caps() & wifi_caps::SCAN_CONNECTED != 0 && now - last_bg >= CONNECTED_SCAN_MS {
+                let dbm = mgr.st.lock().ws.signal_dbm as i32;
+                if r.caps() & wifi_caps::SCAN_CONNECTED != 0 && connected_bg_scan_due(now - last_bg, dbm) {
                     last_bg = now;
                     do_scan(mgr, r, &[], true, true, Some(bssid));
                 }
