@@ -1301,7 +1301,9 @@ impl SbInfo {
     /// NAT block `b`'s copy-0 address.
     fn nat_addr(&self, b: u32) -> u32 { meta_copy0_addr(self.nat_blkaddr, b) }
     /// SIT block `b`'s copy-0 address.
-    fn sit_addr(&self, b: u32) -> u32 { meta_copy0_addr(self.sit_blkaddr, b) }
+    /// Unlike the NAT, the SIT is not interleaved: copy 0 is the first half of
+    /// the area, copy 1 the second (Linux `current_sit_addr`, `sit_blocks`).
+    fn sit_addr(&self, b: u32) -> u32 { self.sit_blkaddr + b }
     /// Size of the SIT and NAT version bitmaps Linux's mkfs gave this volume.
     fn ver_bitmap_bytes(&self) -> usize {
         (self.seg_cnt_sit / 2 + self.seg_cnt_nat / 2) as usize * (self.blocks_per_seg as usize / 8)
@@ -3647,13 +3649,13 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
     let copy = |from: u64, to: u64, blk: &mut [u8; BLOCK_SIZE]| -> bool {
         rd(from, blk) && wr(to, blk)
     };
-    // Copy 1 of block i sits one segment after copy 0 (the copies alternate
-    // segment by segment, `meta_copy0_addr`).
+    // SIT copy 1 of block i sits one half-area after copy 0 (the NAT copies
+    // alternate segment by segment instead, `meta_copy0_addr`).
     let sit_half = (sb.seg_cnt_sit / 2) as u64 * bps;
     for i in 0..(sit_sz * 8).min(sit_half as usize) {
         if !sbit(i) { continue; }
         let a = sb.sit_addr(i as u32) as u64;
-        if !copy(a + bps, a, &mut blk) { bail!("sit-copy"); }
+        if !copy(a + sit_half, a, &mut blk) { bail!("sit-copy"); }
         n += 1;
     }
     let nat_half = (sb.seg_cnt_nat / 2) as u64 * bps;
