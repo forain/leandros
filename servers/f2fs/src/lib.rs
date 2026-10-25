@@ -3554,6 +3554,19 @@ fn cp_is_foreign(sb: &SbInfo, b: &[u8; BLOCK_SIZE]) -> bool {
     sb.seg_cnt_sit >= 2 && !durable::cp_is_legacy(b) && r64(b, CP_OWN_VER) != r64(b, CP_VER)
 }
 
+/// Linux's roll-forward (recover_fsync_data) starts at the hot node head: a
+/// node block there whose footer cp_ver equals the checkpoint's was fsynced
+/// after it and must be replayed, which this mount cannot do for a Linux
+/// volume.
+fn fsync_chain_pending(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE]) -> bool {
+    let seg = r32(cp, CP_CUR_NODE_SEGNO) as u64;
+    let off = r16(cp, CP_CUR_NODE_BLKOFF) as u64;
+    if seg >= sb.seg_cnt_main as u64 || off >= sb.blocks_per_seg as u64 { return true; }
+    let mut b = [0u8; BLOCK_SIZE];
+    if !virtio_blk::read_block(dev, sb.main_blkaddr as u64 + seg * sb.blocks_per_seg as u64 + off, &mut b) { return true; }
+    r64(&b, sb.fmt.footer() + 12) == r64(cp, CP_VER)
+}
+
 /// Bring a Linux-written checkpoint into the form this kernel reads, on the
 /// device, before anything is cached: (1) every SIT/NAT block whose version
 /// bit is set lives in copy 1 — copy it over copy 0; (2) apply the NAT and
@@ -3620,7 +3633,7 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
     if flags & CP_LARGE_NAT_BM != 0 || CP_VER_BITMAP + sit_sz + nat_sz > durable::CP_CRC_OFF
         || sb.cp_payload > 0 || sb.seg_cnt_nat < 2 { bail!("bitmap-layout"); }
     if flags & CP_ORPHAN_PRESENT != 0 {
-        dbg_str("[F2FS] Linux checkpoint carries orphan blocks; they are not reaped\n");
+        dbg_str("[F2FS] Linux checkpoint carries orphan blocks; the mount reaps them\n");
     }
     let bit = |off: usize, i: usize| cp[off + i / 8] & (0x80u8 >> (i % 8)) != 0;
     let mut blk = [0u8; BLOCK_SIZE];
@@ -3728,11 +3741,29 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
                 }
                 if !put(t, &ents, cnt) { bail!("ssa-write"); }
             }
-        } else if total >= 7 {
+        } else if total >= if umount { 7 } else { 4 } {
+            // A sync checkpoint (no umount flag) holds the three data summaries only.
+            let sbase = if umount { 7 } else { 4 };
             for t in 0..3 {
-                if !virtio_blk::read_block(dev, cp_addr + total - 7 + t as u64, &mut blk) { bail!("data-sum-read"); }
+                if !virtio_blk::read_block(dev, cp_addr + total - sbase + t as u64, &mut blk) { bail!("data-sum-read"); }
                 let cnt = sums(t).1.min(bps as usize);
                 if !put(t, &blk[..cnt * SSA_ENTRY], cnt) { bail!("ssa-write"); }
+            }
+        }
+        if !umount {
+            // Linux writes no node summaries in a sync checkpoint and rebuilds
+            // them from the node footers at mount (restore_node_summary).
+            for t in 3..6 {
+                let (seg, cnt) = sums(t);
+                let cnt = cnt.min(bps as usize);
+                if seg >= sb.seg_cnt_main || cnt == 0 { continue; }
+                let mut ents = alloc::vec![0u8; cnt * SSA_ENTRY];
+                for j in 0..cnt {
+                    if !rd(sb.main_blkaddr as u64 + seg as u64 * bps + j as u64, &mut blk) { bail!("node-scan"); }
+                    let nid = sb.fmt.footer_nid(&blk);
+                    ents[j * SSA_ENTRY..j * SSA_ENTRY + 4].copy_from_slice(&nid.to_le_bytes());
+                }
+                if !put(t, &ents, cnt) { bail!("ssa-write"); }
             }
         }
         if umount && total >= 4 {
@@ -8827,7 +8858,29 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
         (alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)
     });
     let cp = if pick1 { cp1 } else { cp0 };
-    let cp_orphans = durable::orphans_of(if pick1 { &cp_buf1 } else { &cp_buf0 });
+    let mut cp_orphans = durable::orphans_of(if pick1 { &cp_buf1 } else { &cp_buf0 });
+    // Linux orphan blocks (design f2fslxrw S7): `f2fs_orphan_block` = ino[1020],
+    // reserved, blk_addr u16, blk_count u16 @4086, entry_count u32 @4088,
+    // check_sum; they sit at pack + 1 + cp_payload, `start_sum - 1 - cp_payload`
+    // of them. Their inodes join the reaper list, and the first checkpoint
+    // (which never sets CP_ORPHAN_PRESENT) clears the flag as Linux would.
+    let mut orphan_unread = false;
+    if (if pick1 { foreign1 } else { foreign0 }) && cp.flags & CP_ORPHAN_PRESENT != 0 {
+        let pb = if pick1 { &cp_buf1 } else { &cp_buf0 };
+        let base = (sb.cp_blkaddr + if pick1 { pack_blks } else { 0 }) as u64 + 1 + sb.cp_payload as u64;
+        let nblk = (r32(pb, CP_START_SUM) as u64).saturating_sub(1 + sb.cp_payload as u64);
+        if nblk == 0 || nblk > 512 { orphan_unread = true; }
+        let mut ob = [0u8; BLOCK_SIZE];
+        for k in 0..nblk.min(512) {
+            if !virtio_blk::read_block(dev_idx, base + k, &mut ob) { orphan_unread = true; break; }
+            let ec = r32(&ob, 4088) as usize;
+            if ec > 1020 { orphan_unread = true; break; }
+            for q in 0..ec { cp_orphans.push(r32(&ob, 4 * q)); }
+        }
+        if !orphan_unread {
+            dbg_str("[F2FS] Linux orphan inodes to reap: "); dbg_dec(cp_orphans.len()); dbg_str("\n");
+        }
+    }
     // Unknown-feature mask (lane f2fsrf): a newer kernel wrote a feature this
     // one does not understand; do not modify the volume.
     let pbuf = if pick1 { &cp_buf1 } else { &cp_buf0 };
@@ -8839,10 +8892,10 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
         let fl = cp.flags;
         let why = if fl & (CP_FSCK_FLAG | CP_ERROR_FLAG | CP_DISABLED_FLAG | CP_QUOTA_NEED_FSCK) != 0 {
             Some("checkpoint flags ask for fsck or report an error")
-        } else if foreign && fl & CP_UMOUNT_FLAG == 0 {
+        } else if foreign && fl & CP_UMOUNT_FLAG == 0 && !(fl & CP_ORPHAN_PRESENT != 0 && !orphan_unread && !fsync_chain_pending(dev_idx, &sb, pbuf)) {
             Some("unclean Linux shutdown; mount it on Linux once to recover")
-        } else if fl & CP_ORPHAN_PRESENT != 0 {
-            Some("orphan inodes are not reaped yet")
+        } else if orphan_unread {
+            Some("orphan blocks unreadable")
         } else if sb.seg_cnt_nat < 2 || sb.cp_payload > 0
             || CP_VER_BITMAP + r32(pbuf, CP_SIT_BM_SIZE) as usize + r32(pbuf, CP_NAT_BM_SIZE) as usize > durable::CP_CRC_OFF {
             Some("volume too large for import yet")
