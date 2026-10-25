@@ -1337,6 +1337,17 @@ fn selftest_main(level: u32) {
         t.check("scan-user-twice-connected", ga != g0 && gb != ga && MGR.state().state == wifi_state::CONNECTED,
                 alloc::format!("gen {} -> {} -> {}", g0, ga, gb));
     }
+    // 7c. No periodic background scan while associated with a good signal
+    // (the 120 s scan cost the laptop 2 s heartbeat gaps): only a weak
+    // signal (roaming trigger) starts one; user scans stay fresh (7b).
+    {
+        let good = wm::connected_bg_scan_due(wm::CONNECTED_SCAN_MS * 2, -50);
+        let unknown = wm::connected_bg_scan_due(wm::CONNECTED_SCAN_MS * 2, 0);
+        let weak = wm::connected_bg_scan_due(wm::CONNECTED_SCAN_MS, wm::ROAM_SCAN_DBM - 10);
+        let weak_soon = wm::connected_bg_scan_due(wm::CONNECTED_SCAN_MS - 1, wm::ROAM_SCAN_DBM - 10);
+        t.check("no-periodic-scan-connected", !good && !unknown && weak && !weak_soon,
+                alloc::format!("good {} unknown {} weak {} weak_soon {}", good, unknown, weak, weak_soon));
+    }
 
     // 8. Disconnect: DISCONNECTED(user) well within 2 s, autoconnect blocked.
     let ms = disconnect(true);

@@ -692,9 +692,25 @@ pub const MAC_INDEX_AUX: u32 = 4;
 
 // ── scan ────────────────────────────────────────────────────────────────────
 
+/// Off-channel budget of a scan (iwlmvm `scan_timing[]`): the firmware stays
+/// off the operating channel for at most `max_out_ms`, then returns to it for
+/// `suspend_ms` before the next dwell. Zero (unassociated) = no limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanTiming { pub max_out_ms: u32, pub suspend_ms: u32 }
+
+impl ScanTiming {
+    /// IWL_SCAN_TYPE_UNASSOC.
+    pub const UNASSOC: ScanTiming = ScanTiming { max_out_ms: 0, suspend_ms: 0 };
+    /// IWL_SCAN_TYPE_MILD (associated, traffic): 120 ms out, 120 ms back.
+    pub const ASSOC: ScanTiming = ScanTiming { max_out_ms: 120, suspend_ms: 120 };
+    pub fn for_assoc(associated: bool) -> ScanTiming { if associated { Self::ASSOC } else { Self::UNASSOC } }
+}
+
 /// SCAN_CFG_CMD (legacy v1 layout + channel array): the per-device scan
 /// configuration. `channels` are the channel numbers the device may scan.
-pub fn scan_config_v1(tx_ant: u8, rx_ant: u8, mac: &[u8; 6], aux_sta: u8, channels: &[u8], n_scan_channels: usize) -> Vec<u8> {
+/// iwlmvm re-sends it whenever the scan type (timing) changes.
+pub fn scan_config_v1(tx_ant: u8, rx_ant: u8, mac: &[u8; 6], aux_sta: u8, channels: &[u8], n_scan_channels: usize,
+                      timing: ScanTiming) -> Vec<u8> {
     let n = channels.len().min(n_scan_channels);
     let flags: u32 = (1 << 0) | (1 << 3) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 14) | (1 << 15)
         | (1 << 13) | (1 << 17) | ((n as u32) << 26);
@@ -702,7 +718,7 @@ pub fn scan_config_v1(tx_ant: u8, rx_ant: u8, mac: &[u8; 6], aux_sta: u8, channe
     let rates: u32 = 0x0fff | (0x0fff << 16);
     let mut b = Buf::new();
     b.u32(flags).u32(tx_ant as u32).u32(rx_ant as u32).u32(rates);
-    b.u32(0).u32(0); // out_of_channel_time, suspend_time (unassociated)
+    b.u32(timing.max_out_ms).u32(timing.suspend_ms); // out_of_channel_time, suspend_time
     b.u8(10).u8(110).u8(44).u8(90); // dwell: active, passive, fragmented, extended
     b.bytes(mac).u8(aux_sta).u8(0x1 | 0x2 | 0x4 | 0x8);
     let mut chans = [0u8; 256];
@@ -720,7 +736,7 @@ pub const SCAN_GEN_FLAGS_ADAPTIVE_DWELL: u16 = 1 << 13;
 /// SCAN_REQ_UMAC v7 (adaptive dwell, single LMAC, legacy channel config
 /// and probe template). `ssids` are probed for in addition to the wildcard.
 pub fn scan_req_umac_v7(uid: u32, mac_id: u8, mac: &[u8; 6], channels: &[u8], n_scan_channels: usize,
-                        ssids: &[&[u8]], passive: bool) -> Vec<u8> {
+                        ssids: &[&[u8]], passive: bool, timing: ScanTiming) -> Vec<u8> {
     let mut b = Buf::new();
     b.u32(0).u32(uid).u32(6); // flags, uid, ooc_priority EXT_6
     let mut gen = SCAN_GEN_FLAGS_PASS_ALL | SCAN_GEN_FLAGS_ADAPTIVE_DWELL;
@@ -728,7 +744,9 @@ pub fn scan_req_umac_v7(uid: u32, mac_id: u8, mac: &[u8; 6], channels: &[u8], n_
     b.u16(gen).u8(0).u8(mac_id);
     // v7: active, passive, fragmented dwell, adwell n_aps, n_aps_social, reserved, max budget
     b.u8(10).u8(110).u8(44).u8(2).u8(10).u8(0).u16(300);
-    b.u32(0).u32(0).u32(0).u32(0); // max_out_time[2], suspend_time[2]
+    // max_out_time[2], suspend_time[2]: while associated the firmware
+    // returns to the operating channel between dwells (iwlmvm umac_dwell).
+    b.u32(timing.max_out_ms).u32(timing.max_out_ms).u32(timing.suspend_ms).u32(timing.suspend_ms);
     b.u32(6); // scan_priority EXT_6
     let n = channels.len().min(n_scan_channels);
     b.u8(0).u8(n as u8).u16(0); // channel params: flags (no EBS), count
