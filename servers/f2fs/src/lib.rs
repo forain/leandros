@@ -309,6 +309,11 @@ const F2FS_INLINE_DENTRY: u8 = 0x04;
 const F2FS_ADVISE_IBLOCKS: u8 = 0x80;
 
 // NAT
+/// Block `b` (0-based index in a copy) of a SIT/NAT area that starts at
+/// `base`: Linux lays the two copies out segment pair by segment pair
+/// (copy 0 segment, copy 1 segment, ...). For the one-segment-per-copy areas
+/// this kernel's mkfs makes, this is `base + b`.
+fn meta_copy0_addr(base: u32, b: u32) -> u32 { base + ((b >> 9) << 10) + (b & 511) }
 const NAT_ENTRY_SIZE:     usize = 9;   // version(1) + ino(4) + blkaddr(4)
 const NAT_ENTRY_PER_BLK:  usize = 4096 / NAT_ENTRY_SIZE; // 455
 
@@ -363,6 +368,14 @@ const SYMLINK_MAX_HOPS: u32 = 40;
 #[inline] fn w16(b: &mut [u8], off: usize, v: u16) { b[off..off+2].copy_from_slice(&v.to_le_bytes()); }
 #[inline] fn w32(b: &mut [u8], off: usize, v: u32) { b[off..off+4].copy_from_slice(&v.to_le_bytes()); }
 #[inline] fn w64(b: &mut [u8], off: usize, v: u64) { b[off..off+8].copy_from_slice(&v.to_le_bytes()); }
+
+/// `struct f2fs_extent i_ext` (fofs, blk_addr, len = 12 B) of a Linux inode: a
+/// read-extent hint Linux trusts at mount. Any change that frees or moves a
+/// block must clear it, or Linux follows a stale extent to reused blocks.
+const I_EXT_OFF: usize = 348;
+fn lx_zero_ext(f: Fmt, blk: &mut [u8]) {
+    if f.lx { blk[I_EXT_OFF..I_EXT_OFF + 12].fill(0); }
+}
 
 fn inode_addr_base(f: Fmt, blk: &[u8]) -> usize {
     if blk[INO_INLINE] & F2FS_EXTRA_ATTR != 0 {
@@ -446,6 +459,7 @@ fn inode_set_blkaddr(f: Fmt, blk: &mut [u8], idx: usize, addr: u32) {
     let base = inode_addr_base(f, blk);
     let off = base + idx * 4;
     if off + 4 > inode_addr_end(f, blk) { return; }
+    lx_zero_ext(f, blk);
     w32(blk, off, addr);
 }
 
@@ -461,6 +475,7 @@ fn inode_get_nid(f: Fmt, blk: &[u8], n: usize) -> u32 {
 }
 
 fn inode_set_nid(f: Fmt, blk: &mut [u8], n: usize, val: u32) {
+    lx_zero_ext(f, blk);
     w32(blk, f.nids() + n * 4, val);
 }
 
@@ -838,8 +853,11 @@ impl BlockCache {
         let i = self.take_slot(dev);
         if i == usize::MAX { return false; }
         self.data_mut(i).copy_from_slice(&data[..BLOCK_SIZE]);
+        self.meta[i].blk_no = blk;
+        // A bad inode checksum is never cached (the caller's own read then
+        // reports EIO, like Linux's EFSBADCRC).
+        if self.icsum.is_some() && !self.icsum_verify(dev, i) { return false; }
         self.install(i, blk);
-        if self.icsum.is_some() { self.icsum_verify(dev, i); }
         true
     }
 
@@ -1089,8 +1107,16 @@ impl BlockCache {
             self.scratch_r.fill(0);
             return None;
         }
+        self.meta[i].blk_no = blk;
+        if self.icsum.is_some() && !self.icsum_verify(dev, i) {
+            // Corrupt inode (checksum mismatch): EIO for this request only,
+            // the block is not cached and the mount stays as it is.
+            self.data_mut(i).fill(0);
+            self.read_failed = true;
+            self.scratch_r.fill(0);
+            return None;
+        }
         self.install(i, blk);
-        if self.icsum.is_some() { self.icsum_verify(dev, i); }
         Some(i)
     }
 
@@ -1105,7 +1131,7 @@ impl BlockCache {
         let nid = r32(b, 4072);
         if nid == 0 || nid != r32(b, 4076) || (r32(b, 4080) >> 3) != 0 { return None; }
         if b[INO_INLINE] & F2FS_EXTRA_ATTR == 0 || r16(b, 360) < 12 { return None; }
-        let nb = nat as u64 + (nid / NAT_ENTRY_PER_BLK as u32) as u64;
+        let nb = meta_copy0_addr(nat, nid / NAT_ENTRY_PER_BLK as u32) as u64;
         let off = (nid % NAT_ENTRY_PER_BLK as u32) as usize * NAT_ENTRY_SIZE + 5;
         let addr = match self.find(nb) {
             Some(j) => r32(self.data(j), off),
@@ -1126,6 +1152,10 @@ impl BlockCache {
     fn icsum_stamp(&mut self, dev: usize, i: usize) {
         if self.icsum.is_none() { return; }
         if let Some(seed) = self.icsum_is_inode(dev, i) {
+            // Linux's read extent hint (i_ext, +348) must never outlive a change
+            // of the block addresses we make: zero it on every write-back
+            // (a zero extent is "none"; Linux rebuilds it on demand).
+            self.data_mut(i)[I_EXT_OFF..I_EXT_OFF + 12].fill(0);
             let c = icsum_calc(seed, self.data(i));
             w32(self.data_mut(i), ICSUM_OFF, c);
         }
@@ -1133,7 +1163,7 @@ impl BlockCache {
 
     /// Verify the checksum of a freshly read inode block (counted; the first
     /// mismatches are logged).
-    fn icsum_verify(&mut self, dev: usize, i: usize) {
+    fn icsum_verify(&mut self, dev: usize, i: usize) -> bool {
         if let Some(seed) = self.icsum_is_inode(dev, i) {
             let b = self.data(i);
             if icsum_calc(seed, b) == r32(b, ICSUM_OFF) {
@@ -1142,8 +1172,10 @@ impl BlockCache {
             } else {
                 let n = ICSUM_BAD.fetch_add(1, atomic::Ordering::Relaxed) + 1;
                 if n <= 8 { dbg_str("[F2FS] inode checksum MISMATCH nid "); dbg_dec(r32(b, 4072) as usize); dbg_str("\n"); }
+                return false;
             }
         }
+        true
     }
 
     fn read(&mut self, dev: usize, blk: u64) -> &[u8; BLOCK_SIZE] {
@@ -1264,6 +1296,20 @@ fn icsum_calc(seed: u32, b: &[u8; BLOCK_SIZE]) -> u32 {
 }
 
 // ── Superblock info (parsed) ──────────────────────────────────────────────────
+
+impl SbInfo {
+    /// NAT block `b`'s copy-0 address.
+    fn nat_addr(&self, b: u32) -> u32 { meta_copy0_addr(self.nat_blkaddr, b) }
+    /// SIT block `b`'s copy-0 address.
+    fn sit_addr(&self, b: u32) -> u32 { meta_copy0_addr(self.sit_blkaddr, b) }
+    /// Size of the SIT and NAT version bitmaps Linux's mkfs gave this volume.
+    fn ver_bitmap_bytes(&self) -> usize {
+        (self.seg_cnt_sit / 2 + self.seg_cnt_nat / 2) as usize * (self.blocks_per_seg as usize / 8)
+    }
+    /// The version bitmaps reach the private area of the commit block
+    /// (offset 2048..): the private fields live in the pack's footer instead.
+    fn big_cp(&self) -> bool { CP_VER_BITMAP + self.ver_bitmap_bytes() > CP_OWN_VER }
+}
 
 #[derive(Clone, Copy)]
 struct SbInfo {
@@ -3099,7 +3145,7 @@ fn make_reply(v: i64) -> Message {
 // ── NAT operations ────────────────────────────────────────────────────────────
 
 fn nat_lookup(ms: &mut MountState, ino: u32) -> u32 {
-    let nat_blk = ms.sb.nat_blkaddr + ino / NAT_ENTRY_PER_BLK as u32;
+    let nat_blk = ms.sb.nat_addr(ino / NAT_ENTRY_PER_BLK as u32);
     let idx     = (ino % NAT_ENTRY_PER_BLK as u32) as usize;
     let blk     = ms.cache.read(ms.dev, nat_blk as u64);
     let off     = idx * NAT_ENTRY_SIZE + 5; // +1 version +4 ino_field → +5 for blkaddr
@@ -3113,7 +3159,7 @@ fn nat_update(ms: &mut MountState, nid: u32, blk_addr: u32) { nat_update_owned(m
 /// and fsck.f2fs require for direct/indirect/xattr nodes: a new node passes
 /// its owner, a relocation (owner None) keeps the ino already recorded.
 fn nat_update_owned(ms: &mut MountState, nid: u32, owner: Option<u32>, blk_addr: u32) {
-    let nat_blk = ms.sb.nat_blkaddr + nid / NAT_ENTRY_PER_BLK as u32;
+    let nat_blk = ms.sb.nat_addr(nid / NAT_ENTRY_PER_BLK as u32);
     let idx     = (nid % NAT_ENTRY_PER_BLK as u32) as usize;
     let off     = idx * NAT_ENTRY_SIZE;
     // Most calls re-record an unchanged entry (an inode rewritten in place
@@ -3165,7 +3211,7 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32, heads: bool) -> Option<u32
         if prot_any(ms, seg) { continue; }
         let sit_blk_idx = seg / SIT_PER_BLK as u32;
         let sit_entry   = (seg % SIT_PER_BLK as u32) as usize;
-        let sit_blkno   = ms.sb.sit_blkaddr + sit_blk_idx;
+        let sit_blkno   = ms.sb.sit_addr(sit_blk_idx);
         let sit_blk = ms.cache.read(ms.dev, sit_blkno as u64);
         let entry_off = sit_entry * SIT_ENTRY_SIZE;
         if entry_off + 2 > BLOCK_SIZE { continue; }
@@ -3198,7 +3244,7 @@ fn sit_mark_block_used(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
     let fmt = ms.sb.fmt;
     let sit_blk_idx = seg / SIT_PER_BLK as u32;
     let sit_entry   = (seg % SIT_PER_BLK as u32) as usize;
-    let sit_blkno   = ms.sb.sit_blkaddr + sit_blk_idx;
+    let sit_blkno   = ms.sb.sit_addr(sit_blk_idx);
     let blk = ms.cache.get_mut(ms.dev, sit_blkno as u64);
     let entry_off = sit_entry * SIT_ENTRY_SIZE;
     // Set the bit in valid_map; count it only if it was clear. Counting a
@@ -3255,7 +3301,7 @@ fn sit_mark_block_free(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
     let fmt = ms.sb.fmt;
     let sit_blk_idx = seg / SIT_PER_BLK as u32;
     let sit_entry   = (seg % SIT_PER_BLK as u32) as usize;
-    let sit_blkno   = ms.sb.sit_blkaddr + sit_blk_idx;
+    let sit_blkno   = ms.sb.sit_addr(sit_blk_idx);
     let blk = ms.cache.get_mut(ms.dev, sit_blkno as u64);
     let entry_off = sit_entry * SIT_ENTRY_SIZE;
     let byte_idx = blk_in_seg as usize / 8;
@@ -3314,7 +3360,7 @@ fn sit_count_valid_blocks(ms: &mut MountState) -> u64 {
     for seg in 0..total {
         let sit_blk_idx = seg / SIT_PER_BLK as u32;
         let sit_entry   = (seg % SIT_PER_BLK as u32) as usize;
-        let sit_blkno   = ms.sb.sit_blkaddr + sit_blk_idx;
+        let sit_blkno   = ms.sb.sit_addr(sit_blk_idx);
         let sit_blk = ms.cache.read(ms.dev, sit_blkno as u64);
         let entry_off = sit_entry * SIT_ENTRY_SIZE;
         valid += (r16(sit_blk, entry_off) & SIT_VBLOCKS_MASK) as u64;
@@ -3361,7 +3407,7 @@ fn nat_count_inodes(ms: &mut MountState) -> u32 {
     let mut n = 0u32;
     let mut nid = ms.sb.root_ino;
     while nid < last {
-        let blk = ms.cache.read(ms.dev, (ms.sb.nat_blkaddr + nid / NAT_ENTRY_PER_BLK as u32) as u64);
+        let blk = ms.cache.read(ms.dev, (ms.sb.nat_addr(nid / NAT_ENTRY_PER_BLK as u32)) as u64);
         let first = (nid % NAT_ENTRY_PER_BLK as u32) as usize;
         let end = ((last - nid) as usize + first).min(NAT_ENTRY_PER_BLK);
         for i in first..end {
@@ -3393,7 +3439,7 @@ pub(crate) fn ssa_blk(ms: &MountState, seg: u32) -> Option<u64> {
 
 /// NAT version byte of `nid` (what Linux compares with the summary's).
 fn nat_version(ms: &mut MountState, nid: u32) -> u8 {
-    let nat_blk = ms.sb.nat_blkaddr + nid / NAT_ENTRY_PER_BLK as u32;
+    let nat_blk = ms.sb.nat_addr(nid / NAT_ENTRY_PER_BLK as u32);
     let off = (nid % NAT_ENTRY_PER_BLK as u32) as usize * NAT_ENTRY_SIZE;
     ms.cache.read(ms.dev, nat_blk as u64)[off]
 }
@@ -3557,6 +3603,23 @@ fn ro_overlay_read(dev: usize, blk: u64, b: &mut [u8; BLOCK_SIZE]) -> bool {
     true
 }
 
+/// `b`, the commit block of the pack at `base` on a `big_cp` volume: check its
+/// CRC, then take the private area from the pack's footer (same version, valid
+/// CRC), and reseal. A Linux-written pack's footer is a copy of its commit
+/// block, so nothing changes there. False: the pack is torn or absent.
+fn cp_merge_footer(dev: usize, sb: &SbInfo, base: u64, b: &mut [u8; BLOCK_SIZE]) -> bool {
+    if durable::linux_crc(&b[..durable::CP_CRC_OFF]) != r32(b, durable::CP_CRC_OFF) { return false; }
+    let total = r32(b, CP_PACK_TOTAL) as u64;
+    if total < 3 || total > sb.blocks_per_seg as u64 { return false; }
+    let mut f = [0u8; BLOCK_SIZE];
+    if !virtio_blk::read_block(dev, base + total - 1, &mut f)
+        || durable::linux_crc(&f[..durable::CP_CRC_OFF]) != r32(&f, durable::CP_CRC_OFF)
+        || r64(&f, CP_VER) != r64(b, CP_VER) { return false; }
+    b[CP_OWN_VER..durable::CP_CRC_OFF].copy_from_slice(&f[CP_OWN_VER..durable::CP_CRC_OFF]);
+    durable::cp_seal(b);
+    true
+}
+
 fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro: bool) -> Option<usize> {
     // ro: the patched SIT/NAT blocks go to the RO_OVERLAY (read back by every
     // cache fill, never written); the device is not written at all.
@@ -3567,8 +3630,8 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
     let flags = r32(cp, CP_CKPT_FLAGS);
     let sit_sz = r32(cp, CP_SIT_BM_SIZE) as usize;
     let nat_sz = r32(cp, CP_NAT_BM_SIZE) as usize;
-    if flags & CP_LARGE_NAT_BM != 0 || CP_VER_BITMAP + sit_sz + nat_sz > durable::CPJ_MAGIC_OFF
-        || sb.seg_cnt_nat != 2 { bail!("bitmap-layout"); }
+    if flags & CP_LARGE_NAT_BM != 0 || CP_VER_BITMAP + sit_sz + nat_sz > durable::CP_CRC_OFF
+        || sb.cp_payload > 0 || sb.seg_cnt_nat < 2 { bail!("bitmap-layout"); }
     if flags & CP_ORPHAN_PRESENT != 0 {
         dbg_str("[F2FS] Linux checkpoint carries orphan blocks; they are not reaped\n");
     }
@@ -3578,16 +3641,19 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
     let copy = |from: u64, to: u64, blk: &mut [u8; BLOCK_SIZE]| -> bool {
         rd(from, blk) && wr(to, blk)
     };
+    // Copy 1 of block i sits one segment after copy 0 (the copies alternate
+    // segment by segment, `meta_copy0_addr`).
     let sit_half = (sb.seg_cnt_sit / 2) as u64 * bps;
     for i in 0..(sit_sz * 8).min(sit_half as usize) {
         if !bit(CP_VER_BITMAP, i) { continue; }
-        let a = sb.sit_blkaddr as u64 + i as u64;
-        if !copy(a + sit_half, a, &mut blk) { bail!("sit-copy"); }
+        let a = sb.sit_addr(i as u32) as u64;
+        if !copy(a + bps, a, &mut blk) { bail!("sit-copy"); }
         n += 1;
     }
-    for i in 0..(nat_sz * 8).min(bps as usize) {
+    let nat_half = (sb.seg_cnt_nat / 2) as u64 * bps;
+    for i in 0..(nat_sz * 8).min(nat_half as usize) {
         if !bit(CP_VER_BITMAP + sit_sz, i) { continue; }
-        let a = sb.nat_blkaddr as u64 + i as u64;
+        let a = sb.nat_addr(i as u32) as u64;
         if !copy(a + bps, a, &mut blk) { bail!("nat-copy"); }
         n += 1;
     }
@@ -3616,8 +3682,8 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
     for k in 0..n_nats {
         let e = 2 + k * 13;
         let nid = r32(&nat_j, e);
-        if nid as u64 >= bps * NAT_ENTRY_PER_BLK as u64 { bail!("nat-nid-range"); }
-        let a = sb.nat_blkaddr as u64 + (nid / NAT_ENTRY_PER_BLK as u32) as u64;
+        if nid as u64 >= nat_half * NAT_ENTRY_PER_BLK as u64 { bail!("nat-nid-range"); }
+        let a = sb.nat_addr(nid / NAT_ENTRY_PER_BLK as u32) as u64;
         let o = (nid % NAT_ENTRY_PER_BLK as u32) as usize * NAT_ENTRY_SIZE;
         if !rd(a, &mut blk) { bail!("nat-read"); }
         blk[o..o + NAT_ENTRY_SIZE].copy_from_slice(&nat_j[e + 4..e + 4 + NAT_ENTRY_SIZE]);
@@ -3629,7 +3695,7 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
         let e = 2 + k * (4 + SIT_ENTRY_SIZE);
         let seg = r32(&sit_j, e);
         if seg >= sb.seg_cnt_main { bail!("sit-seg-range"); }
-        let a = sb.sit_blkaddr as u64 + (seg / SIT_PER_BLK as u32) as u64;
+        let a = sb.sit_addr(seg / SIT_PER_BLK as u32) as u64;
         let o = (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE;
         if !rd(a, &mut blk) { bail!("sit-read"); }
         blk[o..o + SIT_ENTRY_SIZE].copy_from_slice(&sit_j[e + 4..e + 4 + SIT_ENTRY_SIZE]);
@@ -3695,7 +3761,7 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
 }
 
 pub(crate) fn sit_entry_loc(ms: &MountState, seg: u32) -> (u64, usize) {
-    let sit_blkno = ms.sb.sit_blkaddr + seg / SIT_PER_BLK as u32;
+    let sit_blkno = ms.sb.sit_addr(seg / SIT_PER_BLK as u32);
     (sit_blkno as u64, (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE)
 }
 
@@ -4355,7 +4421,7 @@ fn block_region(ms: &MountState, blk: u64, data: &[u8; BLOCK_SIZE]) -> usize {
     if blk >= sb.main_blkaddr as u64 {
         let nid = sb.fmt.footer_nid(data);
         if nid != 0 {
-            let nat_blk = sb.nat_blkaddr as u64 + (nid / NAT_ENTRY_PER_BLK as u32) as u64;
+            let nat_blk = sb.nat_addr(nid / NAT_ENTRY_PER_BLK as u32) as u64;
             if let Some(i) = ms.cache.find(nat_blk) {
                 let off = (nid % NAT_ENTRY_PER_BLK as u32) as usize * NAT_ENTRY_SIZE + 5;
                 if r32(ms.cache.data(i), off) as u64 == blk { return REG_NODE; }
@@ -5457,6 +5523,7 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
 
     inode_add_blocks(ms.sb.fmt, &mut iblk, -(freed as i64));
     w64(&mut iblk, INO_SIZE, new_len);
+    lx_zero_ext(ms.sb.fmt, &mut iblk);
     ms.cache.write(ms.dev, iblkaddr as u64, &iblk);
     nat_update(ms, ino, iblkaddr);
     // Pages past the new end leave the page cache, the new last page's tail
@@ -6258,8 +6325,8 @@ fn dir_add_entry_lx(ms: &mut MountState, dir_ino: u32, name: &[u8], child_ino: u
     let hash = f2fs_dentry_hash(name);
     let iblkaddr = nat_lookup(ms, dir_ino);
     if iblkaddr == 0 { return false; }
+    if !lx_convert_inline(ms, dir_ino) { return false; }
     let mut iblk = *ms.cache.read(ms.dev, iblkaddr as u64);
-    if lx_inline_refused(f, &iblk, dir_ino) { return false; }
     let max_direct = inode_max_direct(f, &iblk);
     let mut level = 0usize;
     let (bidx, slot) = 'found: loop {
@@ -6326,8 +6393,62 @@ fn lx_inline_refused(f: Fmt, iblk: &[u8], ino: u32) -> bool {
     true
 }
 
+/// Convert a Linux inline-data file or inline-dentry directory to ordinary
+/// block storage, the way Linux does (`f2fs_convert_inline_inode` /
+/// `f2fs_convert_inline_dir`): allocate block 0, copy the bytes (or the dentry
+/// bitmap, entries and names at the same slot indices into the 214-slot dentry
+/// block), clear the inline flags, zero the inline area, point i_addr[0] at
+/// the block, i_blocks += 1 (dirs: i_current_depth 1, i_size 4096). True if the
+/// inode is (now) not inline; false when no block could be allocated.
+fn lx_convert_inline(ms: &mut MountState, ino: u32) -> bool {
+    let f = ms.sb.fmt;
+    if !f.lx { return true; }
+    let iblkaddr = nat_lookup(ms, ino);
+    if iblkaddr == 0 { return true; }
+    let mut iblk = read_block_copy(ms, iblkaddr);
+    let fl = iblk[INO_INLINE];
+    if fl & (F2FS_INLINE_DATA | F2FS_INLINE_DENTRY) == 0 { return true; }
+    let (st, en) = inline_area(f, &iblk);
+    let p = match alloc_data_owned(ms, ino, 0) { Some(p) => p, None => return false };
+    let mut dblk = [0u8; BLOCK_SIZE];
+    if fl & F2FS_INLINE_DATA != 0 {
+        if fl & 0x08 != 0 {
+            let n = (inode_size(&iblk) as usize).min(en - st);
+            dblk[..n].copy_from_slice(&iblk[st..st + n]);
+        }
+        iblk[INO_INLINE] &= !(F2FS_INLINE_DATA | 0x08);
+    } else {
+        let a = &iblk[st..en];
+        let (nr, bm, eo, no) = inline_dentry_layout(a.len());
+        let nr = nr.min(NR_DENTRY_IN_BLK);
+        let bm = bm.min(DENTRY_BITMAP_SIZE);
+        dblk[..bm].copy_from_slice(&a[..bm]);
+        for slot in 0..nr {
+            let src = eo + slot * DENTRY_ENTRY_SIZE;
+            let dst = DENTRY_ENTRIES_OFF + slot * DENTRY_ENTRY_SIZE;
+            dblk[dst..dst + DENTRY_ENTRY_SIZE].copy_from_slice(&a[src..src + DENTRY_ENTRY_SIZE]);
+            let src = no + slot * DENTRY_SLOT_LEN;
+            let dst = DENTRY_NAMES_OFF + slot * DENTRY_SLOT_LEN;
+            dblk[dst..dst + DENTRY_SLOT_LEN].copy_from_slice(&a[src..src + DENTRY_SLOT_LEN]);
+        }
+        iblk[INO_INLINE] &= !F2FS_INLINE_DENTRY;
+        w32(&mut iblk, INO_CUR_DEPTH, 1);
+        w64(&mut iblk, INO_SIZE, BLOCK_SIZE as u64);
+    }
+    iblk[st..en].fill(0);
+    inode_set_blkaddr(f, &mut iblk, 0, p);
+    inode_add_blocks(f, &mut iblk, 1);
+    lx_zero_ext(f, &mut iblk);
+    ms.cache.write(ms.dev, p as u64, &dblk);
+    ms.cache.write(ms.dev, iblkaddr as u64, &iblk);
+    nat_update(ms, ino, iblkaddr);
+    maybe_flush(ms);
+    !ms.cache.poisoned()
+}
+
 /// Remove the directory entry for `name` from `dir_ino`. Returns true if found.
 fn dir_remove_entry(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> bool {
+    if !lx_convert_inline(ms, dir_ino) { return false; }
     let iblkaddr = nat_lookup(ms, dir_ino);
     let iblk_copy = {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
@@ -6754,8 +6875,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         if ms.sb.fmt.lx {
             let ia = nat_lookup(ms, ino);
             if ia != 0 {
-                let refused = (writable || (flags & O_TRUNC) != 0) && { let b = ms.cache.read(ms.dev, ia as u64); lx_inline_refused(ms.sb.fmt, b, ino) };
-                if refused && (writable || (flags & O_TRUNC) != 0) { return err_reply(-5); } // EIO (inline write: S2)
+                if (writable || (flags & O_TRUNC) != 0) && !lx_convert_inline(ms, ino) { return err_reply(-28); } // ENOSPC
             }
         }
         // Permission gate for opening an *existing* object. handle_open used to
@@ -7627,6 +7747,22 @@ fn dir_is_empty(ms: &mut MountState, dir_ino: u32) -> bool {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
         let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
     };
+    if lx_inline_dir(ms.sb.fmt, &iblk_copy) {
+        let (st, en) = inline_area(ms.sb.fmt, &iblk_copy);
+        let a = &iblk_copy[st..en];
+        let (nr, _bm, eo, no) = inline_dentry_layout(a.len());
+        let mut slot = 0usize;
+        while slot < nr {
+            if a[slot / 8] & (1 << (slot % 8)) == 0 { slot += 1; continue; }
+            let nl = r16(a, eo + slot * 11 + 8) as usize;
+            let n = no + slot * 8;
+            let dot = nl == 1 && a[n] == b'.';
+            let dotdot = nl == 2 && &a[n..n + 2] == b"..";
+            if !dot && !dotdot { return false; }
+            slot += nl.div_ceil(8).max(1);
+        }
+        return true;
+    }
     let fsize = inode_size(&iblk_copy);
     let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
 
@@ -8694,6 +8830,12 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
     // is treated as absent, and with neither readable the mount fails.
     let rd0 = virtio_blk::read_block(dev_idx, sb.cp_blkaddr as u64, &mut cp_buf0);
     let rd1 = virtio_blk::read_block(dev_idx, (sb.cp_blkaddr + pack_blks) as u64, &mut cp_buf1);
+    // Big volumes: the version bitmaps fill the commit block's private area,
+    // so our fields come from the pack's footer (durable::commit_pack).
+    let (rd0, rd1) = if sb.big_cp() {
+        (rd0 && cp_merge_footer(dev_idx, &sb, sb.cp_blkaddr as u64, &mut cp_buf0),
+         rd1 && cp_merge_footer(dev_idx, &sb, (sb.cp_blkaddr + pack_blks) as u64, &mut cp_buf1))
+    } else { (rd0, rd1) };
     if !rd0 { cp_buf0 = [0u8; BLOCK_SIZE]; }
     if !rd1 { cp_buf1 = [0u8; BLOCK_SIZE]; }
     if !rd0 && !rd1 {
@@ -8768,8 +8910,8 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
             Some("unclean Linux shutdown; mount it on Linux once to recover")
         } else if fl & CP_ORPHAN_PRESENT != 0 {
             Some("orphan inodes are not reaped yet")
-        } else if sb.seg_cnt_nat != 2 || sb.cp_payload > 0
-            || CP_VER_BITMAP + r32(pbuf, CP_SIT_BM_SIZE) as usize + r32(pbuf, CP_NAT_BM_SIZE) as usize > 2048 {
+        } else if sb.seg_cnt_nat < 2 || sb.cp_payload > 0
+            || CP_VER_BITMAP + r32(pbuf, CP_SIT_BM_SIZE) as usize + r32(pbuf, CP_NAT_BM_SIZE) as usize > durable::CP_CRC_OFF {
             Some("volume too large for import yet")
         } else { None };
         if let Some(w) = why {

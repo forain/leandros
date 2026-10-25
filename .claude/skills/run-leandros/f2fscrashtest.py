@@ -171,7 +171,7 @@ class Claims:
 
 
 def main(argv):
-    arch, iters, mode, seed, keep = "aarch64", 6, "mix", None, False
+    arch, iters, mode, seed, keep = os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), 6, "mix", None, False
     extra_cmd = ""
     i = 0
     while i < len(argv):

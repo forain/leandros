@@ -24,7 +24,7 @@ def drv(*args, timeout=200, env=None):
 
 
 def main():
-    arch = sys.argv[1] if len(sys.argv) > 1 else "aarch64"
+    arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
     img = os.path.join(REPO, f"blkhang-{os.environ.get('LEANDROS_RUN_ID', 'x')}.img")
     with open(img, "wb") as f:
         f.truncate(16 << 20)

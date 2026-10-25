@@ -34,7 +34,7 @@ def unsplice(s):
 
 
 def main(argv):
-    arch, iters, seed = "aarch64", 4, int(time.time())
+    arch, iters, seed = os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), 4, int(time.time())
     i = 0
     while i < len(argv):
         a = argv[i]

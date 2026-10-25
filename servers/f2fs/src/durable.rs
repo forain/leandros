@@ -305,6 +305,26 @@ fn write_tail(dev: usize, at: u64, cp: &[u8; BLOCK_SIZE], zero: bool, sums: Opti
     dws(dev, at, &t, cmds)
 }
 
+/// Write a sealed commit block `cp_buf` and the pack's Linux tail.
+/// Returns (commit written, tail written). On a volume whose version bitmaps
+/// reach the private area (`SbInfo::big_cp`), Linux owns that area of the
+/// commit block, so the private fields live in the footer copy instead
+/// (Linux only needs the footer's version and CRC): the footer goes first and
+/// is flushed, then the commit block, with the area zeroed (= every SIT/NAT
+/// block is in copy 0) and resealed. The commit block stays the atomic step.
+fn commit_pack(dev: usize, big: bool, cp_blkno: u64, cp_buf: &[u8; BLOCK_SIZE], tail_at: u64, zero: bool,
+                sums: Option<&[u8]>, cmds: &mut u32) -> (bool, bool) {
+    if !big {
+        let c = dw(dev, cp_blkno, cp_buf);
+        return (c, write_tail(dev, tail_at, cp_buf, zero, sums, cmds));
+    }
+    if !(write_tail(dev, tail_at, cp_buf, zero, sums, cmds) && dflush(dev)) { return (false, false); }
+    let mut real = *cp_buf;
+    real[crate::CP_OWN_VER..CP_CRC_OFF].fill(0);
+    cp_seal(&mut real);
+    (dw(dev, cp_blkno, &real), true)
+}
+
 fn dws(dev: usize, blk: u64, data: &[u8], cmds: &mut u32) -> bool {
     let mut ok = true;
     for (p, piece) in data.chunks(WB_IO_BLOCKS * BLOCK_SIZE).enumerate() {
@@ -443,7 +463,7 @@ pub(crate) fn node_freed(ms: &mut MountState, nid: u32) {
 }
 
 fn nat_clear(ms: &mut MountState, nid: u32) {
-    let nat_blk = ms.sb.nat_blkaddr + nid / NAT_ENTRY_PER_BLK as u32;
+    let nat_blk = ms.sb.nat_addr(nid / NAT_ENTRY_PER_BLK as u32);
     let off = (nid % NAT_ENTRY_PER_BLK as u32) as usize * NAT_ENTRY_SIZE;
     {
         let cur = ms.cache.read(ms.dev, nat_blk as u64);
@@ -540,6 +560,8 @@ pub(crate) struct CpJob {
     pub ext: Vec<u64>,
     pub cp_blkno: u64,
     pub cp_buf: [u8; BLOCK_SIZE],
+    /// `SbInfo::big_cp`: the private fields travel in the footer (`commit_pack`).
+    pub big: bool,
     pub umount: bool,
     /// Zero the six summary blocks of the Linux tail with this commit (the
     /// footer copy of the commit block is written every time).
@@ -741,7 +763,7 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     let tail_sums = crate::lx_tail_sums(ms, &logs, umount);
     Ok(CpJob {
         dev: ms.dev, ver: ms.cp.ver, direct, direct_reg, jhome, jimg,
-        pack_base: pack_base(ms, pack), pack_cap, ext, cp_blkno, cp_buf, umount, reg_blocks, zero_tail, tail_sums,
+        pack_base: pack_base(ms, pack), pack_cap, ext, cp_blkno, cp_buf, big: ms.sb.big_cp(), umount, reg_blocks, zero_tail, tail_sums,
     })
 }
 
@@ -812,12 +834,13 @@ pub(crate) fn cp_write(job: &mut CpJob, port: u32) -> CpIo {
     w32(&mut job.cp_buf, CPJ_CRC_OFF, crc);
     cp_seal(&mut job.cp_buf);
     let t = sched::monotonic_ns();
-    io.ok &= dw(dev, job.cp_blkno, &job.cp_buf);
     io.reg_cmds[REG_CP] += 1;
-    // Linux's view of the pack, in the same flush as the commit block. This
-    // kernel never reads it, so a failed write does not fail the commit.
-    io.home_ok &= write_tail(dev, job.pack_base + 1 + job.pack_cap as u64, &job.cp_buf, job.zero_tail, job.tail_sums.as_deref(),
-                             &mut io.reg_cmds[REG_CP]);
+    // Linux's view of the pack, in the same flush as the commit block. Only a
+    // big_cp volume reads it back, so elsewhere a failed write does not fail the commit.
+    let (c_ok, t_ok) = commit_pack(dev, job.big, job.cp_blkno, &job.cp_buf, job.pack_base + 1 + job.pack_cap as u64,
+                                   job.zero_tail, job.tail_sums.as_deref(), &mut io.reg_cmds[REG_CP]);
+    io.ok &= c_ok;
+    io.home_ok &= t_ok;
     let tf = sched::monotonic_ns();
     io.reg_ns[REG_CP] += tf.saturating_sub(t);
     io.ok &= dflush(dev);
@@ -889,7 +912,7 @@ pub(crate) fn read_journal(dev: usize, sb: &SbInfo, base: u64, cpb: &[u8; BLOCK_
         + r32(cpb, CPJ_EXT_OFF + 4 * q) as u64 * sb.blocks_per_seg as u64).collect();
     let job_like = CpJob {
         dev, ver: 0, direct: Vec::new(), direct_reg: Vec::new(), jhome: Vec::new(), jimg: Vec::new(),
-        pack_base: base, pack_cap: pack_blks - 1 - cp_tail(cpb), ext, cp_blkno: 0, cp_buf: [0; BLOCK_SIZE],
+        pack_base: base, pack_cap: pack_blks - 1 - cp_tail(cpb), ext, cp_blkno: 0, cp_buf: [0; BLOCK_SIZE], big: false,
         umount: false, reg_blocks: [0; REGS], zero_tail: false, tail_sums: None,
     };
     if total > job_like.pack_cap + 512 * next as u32 { return Err(()); }
@@ -1435,12 +1458,12 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
         // Phase 2: the commit block.
         w32(&mut cp_buf, CPJ_CRC_OFF, crc);
         cp_seal(&mut cp_buf);
-        ok &= dw(dev, cp_blkno, &cp_buf);
         let zero = core::mem::replace(&mut ms.dur.tail_dirty[pack as usize], false);
         let mut cmds = 0;
-        if !write_tail(dev, pbase + pack_room(ms) as u64, &cp_buf, zero, sums.as_deref(), &mut cmds) {
-            ms.dur.tail_dirty[pack as usize] = true;
-        }
+        let (c_ok, t_ok) = commit_pack(dev, ms.sb.big_cp(), cp_blkno, &cp_buf, pbase + pack_room(ms) as u64, zero,
+                                       sums.as_deref(), &mut cmds);
+        ok &= c_ok;
+        if !t_ok { ms.dur.tail_dirty[pack as usize] = true; }
         ok &= dflush(dev);
     }
     if ok {
