@@ -35,11 +35,6 @@ pack per segment, NAT 2 segments), with two differences: the SIT grows with
 the volume (one SIT block covers 55 segments, i.e. 110 MiB), and SIT entries
 are indexed by main-area segment number, which is how the server reads them.
 
-Inodes, nodes and directories use Linux's on-disk layout ("lx", the
-`LeandrOS lxnode1` marker in the superblock's version and init_version;
-scripts/f2fslx.py). A home volume made before that format keeps the legacy
-layout: `ensure` never rewrites an existing volume.
-
 The seed is the home skeleton the root image also carries (the fallback when
 no home volume is attached): /home/leandro 0700 1000:1000 and
 /home/cosmic-greeter 0700 990:990 with .config/.cache/.local. Accounts added
@@ -53,8 +48,6 @@ import subprocess
 import sys
 import uuid
 
-import f2fslx
-
 LABEL = "leandros-home"
 DEFAULT_SIZE = 8 << 30
 
@@ -65,7 +58,10 @@ CP_UMOUNT_FLAG = 0x1
 NAT_ENTRY_SIZE = 9
 SIT_ENTRY_SIZE = 74
 SIT_PER_BLK = BLOCK // SIT_ENTRY_SIZE      # 55
+NODE_FOOTER_OFF = 4076
 MAX_ACTIVE_LOGS = 8
+DENTRY_ENTRIES_OFF = 30
+DENTRY_NAMES_OFF = 30 + 214 * 11
 DT_DIR = 4
 SB_LABEL_OFF = 124                         # __le16 volume_name[512]
 
@@ -157,7 +153,6 @@ def build(size):
         b[s + 108:s + 124] = vol_uuid
         name = LABEL.encode("utf-16-le")
         b[s + SB_LABEL_OFF:s + SB_LABEL_OFF + len(name)] = name
-        f2fslx.mark_superblock(b, s)
 
     # Directories: ino 3 is the root, the skeleton follows from ino 4.
     dirs = [("", 0o040755, 0, 0)] + SKELETON
@@ -174,10 +169,19 @@ def build(size):
         parent = ino_of[os.path.dirname(p)] if p else ino
         ents = [(b".", ino), (b"..", parent)]
         ents += [(os.path.basename(c).encode(), ino_of[c]) for c in children[p]]
-        # Linux hash-bucket placement; the skeleton fits bucket 0 of level 0.
-        dblocks, depth = f2fslx.place_dentries([(nm, c, DT_DIR) for nm, c in ents])
-        assert list(dblocks) == [0] and depth == 1
-        blocks[data_at[p]] = dblocks[0]
+        d = blk(data_at[p])
+        slot = 0
+        for nm, cino in ents:
+            used = (len(nm) + 7) // 8
+            for k in range(used):
+                d[(slot + k) // 8] |= 1 << ((slot + k) % 8)
+            e = DENTRY_ENTRIES_OFF + slot * 11
+            w32(d, e + 4, cino)
+            w16(d, e + 8, len(nm))
+            d[e + 10] = DT_DIR
+            o = DENTRY_NAMES_OFF + slot * 8
+            d[o:o + len(nm)] = nm
+            slot += used
 
         node = blk(inode_at[p])
         w16(node, 0, mode)
@@ -185,18 +189,14 @@ def build(size):
         w32(node, 8, gid)
         w32(node, 12, 2 + len(children[p]))      # links: self, parent, each child's ..
         w64(node, 16, BLOCK)                     # size: one dentry block
-        w64(node, f2fslx.I_BLOCKS, 2)            # inode + dentry block
-        w32(node, f2fslx.I_CURRENT_DEPTH, 1)
-        w32(node, f2fslx.I_PINO, parent)
-        nm = os.path.basename(p).encode()
-        w32(node, f2fslx.I_NAMELEN, len(nm))
-        node[f2fslx.I_NAME:f2fslx.I_NAME + len(nm)] = nm
-        w32(node, f2fslx.I_ADDR, data_at[p])
-        # atime/mtime/ctime = now, not the epoch.
+        w32(node, 364, data_at[p])
+        # atime/mtime/ctime = now (servers/f2fs INO_ATIME/INO_MTIME/INO_CTIME:
+        # {u64 sec, u32 nsec} at 36/48/60), not the epoch.
         now = int(os.environ.get("SOURCE_DATE_EPOCH") or __import__("time").time())
-        for off in (f2fslx.I_ATIME, f2fslx.I_CTIME, f2fslx.I_MTIME):
+        for off in (36, 48, 60):
             w64(node, off, now)
-        f2fslx.write_footer(node, ino, ino, 0, cp_ver=1)
+        for k, v in enumerate((ino, ino, 0, 0, 1)):
+            w32(node, NODE_FOOTER_OFF + 4 * k, v)
 
         # NAT entry.
         per = BLOCK // NAT_ENTRY_SIZE
@@ -211,19 +211,15 @@ def build(size):
     sb_ = blk(sit_blk)
     w16(sb_, 0, used)
     for k in range(used):
-        sb_[2 + k // 8] |= 0x80 >> (k % 8)   # lx: Linux f2fs_test_bit is MSB-first
+        sb_[2 + k // 8] |= 1 << (k % 8)
 
     # Checkpoint packs. The runtime logs start on fresh segments 1 (node) and
     # 2 (data), past the seeded blocks, exactly as mkfs-f2fs-populated.py does.
-    rsvd, ovp = f2fslx.checkpoint_reserve(ckpt_segs + sit_segs + nat_segs + ssa_segs)
-
     def checkpoint(at, ver):
         c = blk(at)
         w64(c, 0, ver)
-        w64(c, 8, (main_segs - ovp) * BPS)     # user_block_count
         w64(c, 16, used)
-        w32(c, 24, rsvd)
-        w32(c, 28, ovp)
+        w32(c, 28, 1)
         w32(c, 32, main_segs - 1)
         for i in range(MAX_ACTIVE_LOGS):
             w32(c, 36 + i * 4, 1 if i == 0 else 0xFFFFFFFF)
@@ -369,4 +365,12 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    # `--lx` (opt-in, lane f2fsnode): make the volume in Linux's on-disk node
+    # format instead (scripts/mkfs-f2fs-home-lx.py, `LeandrOS lxnode1`). The
+    # default stays the legacy layout until an lx root boots to a shell.
+    if "--lx" in sys.argv[1:]:
+        import runpy
+        sys.argv = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "mkfs-f2fs-home-lx.py")] + \
+            [a for a in sys.argv[1:] if a != "--lx"]
+        runpy.run_path(sys.argv[0], run_name="__main__")
     sys.exit(main(sys.argv[1:]))

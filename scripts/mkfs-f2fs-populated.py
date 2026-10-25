@@ -9,7 +9,6 @@ import sys
 import os
 import subprocess
 import soundfont
-import f2fslx
 
 BLOCK_SIZE     = 4096
 BLOCKS_PER_SEG = 512       # 2 MB segments (log_blocks_per_seg = 9)
@@ -43,8 +42,7 @@ NAT_ENTRY_SIZE = 9
 SIT_ENTRY_SIZE = 74
 SIT_PER_BLK    = BLOCK_SIZE // SIT_ENTRY_SIZE
 MAX_ACTIVE_LOGS = 8
-# Node format: Linux's on-disk inode/node/dentry layout ("lx"), flagged by the
-# `LeandrOS lxnode1` superblock marker; offsets and helpers in scripts/f2fslx.py.
+NODE_FOOTER_OFF = 4076
 
 # Directory constants
 NR_DENTRY_IN_BLK   = 214
@@ -116,29 +114,21 @@ def w16(b, o, v): struct.pack_into('<H', b, o, v & 0xFFFF)
 def w32(b, o, v): struct.pack_into('<I', b, o, v & 0xFFFFFFFF)
 def w64(b, o, v): struct.pack_into('<Q', b, o, v & 0xFFFFFFFFFFFFFFFF)
 
-# Inode timestamps (struct f2fs_inode: u64 seconds at 32/40/48, u32 nsec at
-# 56/60/64 for atime/ctime/mtime). Left zero, every staged file stat'ed as
+# Inode timestamps. The f2fs server keeps `{u64 sec, u32 nsec}` for atime,
+# mtime and ctime at these offsets (servers/f2fs INO_ATIME..INO_CTIME_NS; this
+# volume format is not Linux's). Left zero, every staged file stat'ed as
 # 1970-01-01 00:00. Files copied from the host carry their source's mtime;
 # directories and generated content the build time (SOURCE_DATE_EPOCH when
 # set, for a reproducible image).
+INO_ATIME, INO_MTIME, INO_CTIME = 36, 48, 60
 BUILD_TIME = int(os.environ.get("SOURCE_DATE_EPOCH") or __import__("time").time())
 
 def stamp_inode_times(block, mtime=None):
     """atime = mtime = `mtime` (default: the build time), ctime = build time."""
     m = int(BUILD_TIME if mtime is None else mtime)
-    X = f2fslx
-    for off, ns, sec in ((X.I_ATIME, X.I_ATIME_NS, m), (X.I_MTIME, X.I_MTIME_NS, m),
-                         (X.I_CTIME, X.I_CTIME_NS, max(m, BUILD_TIME))):
+    for off, sec in ((INO_ATIME, m), (INO_MTIME, m), (INO_CTIME, max(m, BUILD_TIME))):
         w64(block, off, sec)
-        w32(block, ns, 0)
-
-
-def set_inode_name(block, pino, name):
-    """i_pino and i_name (Linux keeps the first link's parent and name)."""
-    w32(block, f2fslx.I_PINO, pino)
-    name = name[:f2fslx.NAME_LEN]
-    w32(block, f2fslx.I_NAMELEN, len(name))
-    block[f2fslx.I_NAME:f2fslx.I_NAME + len(name)] = name
+        w32(block, off + 8, 0)
 
 def write_superblock(image, base, total_blocks, total_segs, main_segs):
     s = base + 1024
@@ -171,21 +161,66 @@ def write_superblock(image, base, total_blocks, total_segs, main_segs):
     w32(image, s + 96, ROOT_INO)
     w32(image, s +100, NODE_INO)
     w32(image, s +104, META_INO)
-    f2fslx.mark_superblock(image, s)
+
+def build_dentry_blocks(entries):
+    """Lay out directory entries across as many 4096-byte blocks as needed.
+
+    Returns a list of blocks. Spilling matters now that /bin holds the ~100
+    hardlinked coreutils names: a single block fits only NR_DENTRY_IN_BLK
+    slots, and long names burn two slots each. The f2fs server already reads
+    multi-block directories (it loops over blocks derived from the inode
+    size), so the image writer was the only single-block component.
+    """
+    blocks = []
+    block = bytearray(4096)
+    bitmap = bytearray(27)
+    current_slot = 0
+
+    def flush():
+        block[0:27] = bitmap
+        blocks.append(block)
+
+    for name, ino, ftype in entries:
+        name_len = len(name)
+        slots_used = (name_len + DENTRY_SLOT_LEN - 1) // DENTRY_SLOT_LEN
+        if slots_used > NR_DENTRY_IN_BLK:
+            raise ValueError(f"Directory entry name too long: {name!r}")
+        if current_slot + slots_used > NR_DENTRY_IN_BLK:
+            flush()
+            block = bytearray(4096)
+            bitmap = bytearray(27)
+            current_slot = 0
+        for i in range(slots_used):
+            slot = current_slot + i
+            byte = slot // 8
+            bit = slot % 8
+            bitmap[byte] |= (1 << bit)
+        e_off = DENTRY_ENTRIES_OFF + current_slot * DENTRY_ENTRY_SIZE
+        w32(block, e_off + 0, 0)
+        w32(block, e_off + 4, ino)
+        w16(block, e_off + 8, name_len)
+        block[e_off + 10] = ftype
+        n_off = DENTRY_NAMES_OFF + current_slot * DENTRY_SLOT_LEN
+        block[n_off : n_off + name_len] = name
+        current_slot += slots_used
+
+    flush()
+    return blocks
 
 def build_inode_block(mode, links, size, block_addrs, nid):
-    """A directory inode: i_addr only (0 = hole), no inline flags."""
-    assert len(block_addrs) <= f2fslx.ADDRS_PER_INODE
     block = bytearray(4096)
     w16(block, 0, mode)
     w8 (block, 2, 0)
     w8 (block, 3, 0)
     w32(block, 12, links)
     w64(block, 16, size)
-    w64(block, f2fslx.I_BLOCKS, 1 + sum(1 for a in block_addrs if a))
     for idx, addr in enumerate(block_addrs):
-        w32(block, f2fslx.I_ADDR + idx * 4, addr)
-    f2fslx.write_footer(block, nid, nid, 0)
+        w32(block, 364 + idx * 4, addr)
+    w32(block, NODE_FOOTER_OFF + 0, nid)
+    w32(block, NODE_FOOTER_OFF + 4, nid)
+    w32(block, NODE_FOOTER_OFF + 8, 0)
+    w32(block, NODE_FOOTER_OFF + 12, 0)
+    w32(block, NODE_FOOTER_OFF + 16, 1)
     stamp_inode_times(block)
     return block
 
@@ -193,11 +228,10 @@ def write_checkpoint(image, blkaddr, ver, valid_blocks, valid_nodes, free_segs, 
                       cur_node_segno, cur_node_blkoff, cur_data_segno, cur_data_blkoff):
     o = blkaddr * BLOCK_SIZE
     w64(image, o +  0, ver)
-    rsvd, ovp = f2fslx.checkpoint_reserve(SEG_CNT_CKPT + SEG_CNT_SIT + SEG_CNT_NAT + SEG_CNT_SSA)
-    w64(image, o +  8, (main_segs - ovp) * BLOCKS_PER_SEG)   # user_block_count
+    w64(image, o +  8, 0)
     w64(image, o + 16, valid_blocks)
-    w32(image, o + 24, rsvd)
-    w32(image, o + 28, ovp)
+    w32(image, o + 24, 0)
+    w32(image, o + 28, 1)
     w32(image, o + 32, free_segs)
     for i in range(MAX_ACTIVE_LOGS):
         w32(image, o + 36 + i * 4, 0xFFFFFFFF if i > 0 else cur_node_segno)
@@ -217,14 +251,12 @@ def write_checkpoint(image, blkaddr, ver, valid_blocks, valid_nodes, free_segs, 
     w32(image, o + 148, valid_nodes)
     w32(image, o + 152, next_nid)
 
-def write_nat_entry(image, nid, blk_addr, ino=None):
-    """NAT entry of `nid`; `ino` is the owning inode (the nid itself for an
-    inode block)."""
-    nat_blk = NAT_BLKADDR + nid // (BLOCK_SIZE // NAT_ENTRY_SIZE)
-    idx     = nid % (BLOCK_SIZE // NAT_ENTRY_SIZE)
+def write_nat_entry(image, ino, blk_addr):
+    nat_blk = NAT_BLKADDR + ino // (BLOCK_SIZE // NAT_ENTRY_SIZE)
+    idx     = ino % (BLOCK_SIZE // NAT_ENTRY_SIZE)
     o = nat_blk * BLOCK_SIZE + idx * NAT_ENTRY_SIZE
     w8 (image, o + 0, 1)
-    w32(image, o + 1, nid if ino is None else ino)
+    w32(image, o + 1, ino)
     w32(image, o + 5, blk_addr)
 
 def coreutils_command_names(coreutils_dir):
@@ -2686,9 +2718,12 @@ def main():
             _sized.add(path)
         size = content_size(path)
         k = (size + BLOCK_SIZE - 1) // BLOCK_SIZE
-        # Inode block + data blocks + potential direct nodes (an upper
-        # bound: lx direct nodes hold 1018 addresses, ADDRS_PER_BLOCK).
-        required_blocks += k + 1 + (k + 1017) // 1018 + 1
+        # Inode block + data blocks + potential direct nodes.
+        # ADDRS_PER_DNODE is 1019 in this simplified F2FS: the node footer
+        # sits at byte 4076 (5xu32 = 20 bytes), leaving 4076/4 = 1019 slots.
+        # This MUST match servers/f2fs/src/lib.rs (NODE_FOOTER_OFF / 4);
+        # a 1018 here shifted every block past ~7.9 MB when read back.
+        required_blocks += k + 1 + (k + 1018) // 1019
     # Reserve two full segments beyond the statically-populated content for the
     # runtime node/data allocator curseg pointers (see below) so first writes
     # never land on blocks already occupied by pre-populated files/directories.
@@ -2910,48 +2945,105 @@ def main():
                 chunk = data[j*BLOCK_SIZE : (j+1)*BLOCK_SIZE]
                 image[start : start + len(chunk)] = chunk
                 
-            # Map the data the way Linux get_node_path does: 923 addresses in
-            # the inode, i_nid[0] and i_nid[1] direct nodes, then indirect
-            # node i_nid[2] over up to 1018 direct nodes. Every node footer
-            # names the owner inode and its node offset.
-            file_nid = next_nid
-            next_nid += 1
-            PER = f2fslx.ADDRS_PER_BLOCK
-            direct_blks = file_data_blks[:f2fslx.ADDRS_PER_INODE]
-            rem_blks = file_data_blks[f2fslx.ADDRS_PER_INODE:]
+            # Build addresses for inode direct/indirect mapping
+            direct_limit = 923
+            direct_blks = file_data_blks[:direct_limit]
+            rem_blks = file_data_blks[direct_limit:]
             i_nids = [0, 0, 0, 0, 0]
             dnode_info = []
-
-            def new_node(entries, ofs):
-                nonlocal next_nid, next_blk
-                nid, blkaddr = next_nid, next_blk
+            
+            if rem_blks:
+                # Direct node 0 (i_nid[0])
+                dnode_nid = next_nid
                 next_nid += 1
+                dnode_blkaddr = next_blk
                 next_blk += 1
-                nb = bytearray(4096)
-                for idx, v in enumerate(entries):
-                    w32(nb, idx * 4, v)
-                f2fslx.write_footer(nb, nid, file_nid, ofs)
-                dnode_info.append((nid, blkaddr, nb))
-                return nid
-
-            for kk in (0, 1):
-                if rem_blks:
-                    i_nids[kk] = new_node(rem_blks[:PER], f2fslx.ofs_dnode(kk))
-                    rem_blks = rem_blks[PER:]
+                i_nids[0] = dnode_nid
+                
+                dnode_blks = rem_blks[:1019]
+                rem_blks = rem_blks[1019:]
+                
+                dnode_bytes = bytearray(4096)
+                for idx, addr in enumerate(dnode_blks):
+                    w32(dnode_bytes, idx * 4, addr)
+                w32(dnode_bytes, NODE_FOOTER_OFF + 0, dnode_nid)
+                w32(dnode_bytes, NODE_FOOTER_OFF + 4, dnode_nid)
+                w32(dnode_bytes, NODE_FOOTER_OFF + 8, 0)
+                w32(dnode_bytes, NODE_FOOTER_OFF + 12, 0)
+                w32(dnode_bytes, NODE_FOOTER_OFF + 16, 1)
+                
+                dnode_info.append((dnode_nid, dnode_blkaddr, dnode_bytes))
+                
             if rem_blks:
-                kids = []
-                while rem_blks and len(kids) < f2fslx.NIDS_PER_BLOCK:
-                    kids.append(new_node(rem_blks[:PER], f2fslx.ofs_ind_child(0, len(kids))))
-                    rem_blks = rem_blks[PER:]
-                i_nids[2] = new_node(kids, f2fslx.ofs_ind(0))
-
+                # Direct node 1 (i_nid[1])
+                dnode_nid = next_nid
+                next_nid += 1
+                dnode_blkaddr = next_blk
+                next_blk += 1
+                i_nids[1] = dnode_nid
+                
+                dnode_blks = rem_blks[:1019]
+                rem_blks = rem_blks[1019:]
+                
+                dnode_bytes = bytearray(4096)
+                for idx, addr in enumerate(dnode_blks):
+                    w32(dnode_bytes, idx * 4, addr)
+                w32(dnode_bytes, NODE_FOOTER_OFF + 0, dnode_nid)
+                w32(dnode_bytes, NODE_FOOTER_OFF + 4, dnode_nid)
+                w32(dnode_bytes, NODE_FOOTER_OFF + 8, 0)
+                w32(dnode_bytes, NODE_FOOTER_OFF + 12, 0)
+                w32(dnode_bytes, NODE_FOOTER_OFF + 16, 1)
+                
+                dnode_info.append((dnode_nid, dnode_blkaddr, dnode_bytes))
+                
             if rem_blks:
-                raise ValueError(f"File {name} is too large (> 4 GB), double-indirect nodes not supported!")
-
+                # Indirect node 0 (i_nid[2])
+                ind_nid = next_nid
+                next_nid += 1
+                ind_blkaddr = next_blk
+                next_blk += 1
+                i_nids[2] = ind_nid
+                
+                ind_bytes = bytearray(4096)
+                chunk_idx = 0
+                while rem_blks:
+                    chunk_blks = rem_blks[:1019]
+                    rem_blks = rem_blks[1019:]
+                    
+                    dn_nid = next_nid
+                    next_nid += 1
+                    dn_blkaddr = next_blk
+                    next_blk += 1
+                    
+                    dn_bytes = bytearray(4096)
+                    for idx, addr in enumerate(chunk_blks):
+                        w32(dn_bytes, idx * 4, addr)
+                    w32(dn_bytes, NODE_FOOTER_OFF + 0, dn_nid)
+                    w32(dn_bytes, NODE_FOOTER_OFF + 4, dn_nid)
+                    w32(dn_bytes, NODE_FOOTER_OFF + 8, 0)
+                    w32(dn_bytes, NODE_FOOTER_OFF + 12, 0)
+                    w32(dn_bytes, NODE_FOOTER_OFF + 16, 1)
+                    
+                    dnode_info.append((dn_nid, dn_blkaddr, dn_bytes))
+                    w32(ind_bytes, chunk_idx * 4, dn_nid)
+                    chunk_idx += 1
+                    
+                w32(ind_bytes, NODE_FOOTER_OFF + 0, ind_nid)
+                w32(ind_bytes, NODE_FOOTER_OFF + 4, ind_nid)
+                w32(ind_bytes, NODE_FOOTER_OFF + 8, 0)
+                w32(ind_bytes, NODE_FOOTER_OFF + 12, 0)
+                w32(ind_bytes, NODE_FOOTER_OFF + 16, 1)
+                
+                dnode_info.append((ind_nid, ind_blkaddr, ind_bytes))
+                
+            if rem_blks:
+                raise ValueError(f"File {name} is too large (> 4 GB), indirect blocks not supported!")
+                
             # Allocate inode block
             file_inode_blk = next_blk
             next_blk += 1
-
+            
+            # Write inode block to image
             inode_bytes = bytearray(4096)
             w16(inode_bytes, 0, mode)
             w8 (inode_bytes, 2, 0)
@@ -2960,15 +3052,18 @@ def main():
             w32(inode_bytes, 8, f_gid)  # i_gid
             w32(inode_bytes, 12, 1) # links
             w64(inode_bytes, 16, size)
-            # i_blocks: the inode, its node blocks and its data blocks.
-            w64(inode_bytes, f2fslx.I_BLOCKS, 1 + len(dnode_info) + k)
-            set_inode_name(inode_bytes, parent_ino, name.encode('utf-8'))
             for idx, addr in enumerate(direct_blks):
-                w32(inode_bytes, f2fslx.I_ADDR + idx * 4, addr)
+                w32(inode_bytes, 364 + idx * 4, addr)
             for idx, nid in enumerate(i_nids):
-                w32(inode_bytes, f2fslx.I_NID + idx * 4, nid)
-            f2fslx.write_footer(inode_bytes, file_nid, file_nid, 0)
-
+                w32(inode_bytes, 4056 + idx * 4, nid)
+            file_nid = next_nid
+            next_nid += 1
+            w32(inode_bytes, NODE_FOOTER_OFF + 0, file_nid)
+            w32(inode_bytes, NODE_FOOTER_OFF + 4, file_nid)
+            w32(inode_bytes, NODE_FOOTER_OFF + 8, 0)
+            w32(inode_bytes, NODE_FOOTER_OFF + 12, 0)
+            w32(inode_bytes, NODE_FOOTER_OFF + 16, 1)
+            
             # Write blocks to image
             src_mtime = None
             if not isinstance(path, (bytes, bytearray)):
@@ -2982,7 +3077,7 @@ def main():
             
             for dn_nid, dn_blk, dn_bytes in dnode_info:
                 image[dn_blk * BLOCK_SIZE : (dn_blk + 1) * BLOCK_SIZE] = dn_bytes
-                write_nat_entry(image, dn_nid, dn_blk, file_nid)
+                write_nat_entry(image, dn_nid, dn_blk)
                 
             if key is not None:
                 packed_by_path[key] = (file_nid, file_inode_blk)
@@ -3040,21 +3135,16 @@ def main():
         
     # Write directory data blocks and directory inodes
     for ino, name in dir_nodes.items():
-        # Linux hash-bucket placement (f2fs_add_regular_entry): a name lives
-        # in a block of its hash bucket, level by level, so blocks a bucket
-        # never needed stay holes. Block 0 (holding . and ..) is the
-        # statically pre-allocated one; a directory that outgrows it (/bin,
-        # once the coreutils names land) takes its other blocks from the
-        # same bump allocator the files used.
-        placed, depth = f2fslx.place_dentries(dentry_entries[ino])
-        db_addrs = [0] * (max(placed) + 1)
-        for bi in sorted(placed):
-            if bi == 0:
-                db_addrs[bi] = data_blocks[ino]
-            else:
-                db_addrs[bi] = next_blk
-                next_blk += 1
-            image[db_addrs[bi] * BLOCK_SIZE : (db_addrs[bi] + 1) * BLOCK_SIZE] = placed[bi]
+        db_blocks = build_dentry_blocks(dentry_entries[ino])
+        # Each directory has one statically pre-allocated data block; a
+        # directory that outgrows it (/bin, once the coreutils names land)
+        # takes its extra blocks from the same bump allocator the files used.
+        db_addrs = [data_blocks[ino]]
+        for _ in range(len(db_blocks) - 1):
+            db_addrs.append(next_blk)
+            next_blk += 1
+        for db_addr, db_bytes in zip(db_addrs, db_blocks):
+            image[db_addr * BLOCK_SIZE : (db_addr + 1) * BLOCK_SIZE] = db_bytes
 
         in_addr = inode_blocks[ino]
         # Inodes point to their data block. Link count is 2 (self + parent's
@@ -3064,8 +3154,6 @@ def main():
         links = 2 + len(subdirs.get(ino, []))
 
         inode_bytes = build_inode_block(mode, links, len(db_addrs) * BLOCK_SIZE, db_addrs, ino)
-        w32(inode_bytes, f2fslx.I_CURRENT_DEPTH, depth)
-        set_inode_name(inode_bytes, parent_of[ino], os.path.basename(name).encode('utf-8'))
         w32(inode_bytes, 4, uid)  # i_uid — see servers/f2fs/src/lib.rs INO_UID
         w32(inode_bytes, 8, gid)  # i_gid — see servers/f2fs/src/lib.rs INO_GID
         image[in_addr * BLOCK_SIZE : (in_addr + 1) * BLOCK_SIZE] = inode_bytes
@@ -3087,7 +3175,7 @@ def main():
         seg = b // BLOCKS_PER_SEG
         blk = b % BLOCKS_PER_SEG
         valid_blocks_per_seg[seg] += 1
-        valid_map_per_seg[seg][blk // 8] |= (0x80 >> (blk % 8))   # lx: MSB-first like Linux
+        valid_map_per_seg[seg][blk // 8] |= (1 << (blk % 8))
 
     # Main segments
     assert main_segs <= (SEG_CNT_SIT // 2) * BLOCKS_PER_SEG * SIT_PER_BLK
