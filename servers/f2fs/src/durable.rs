@@ -676,7 +676,7 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     }
     // Commit block.
     let pack = 1 - ms.dur.durable_pack;
-    let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack);
+    let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack, ext_segs);
     w32(&mut cp_buf, CPJ_MAGIC_OFF, CPJ_MAGIC);
     w32(&mut cp_buf, CPJ_INCOMPAT_OFF, if rf_enabled() { CPJ_INCOMPAT_RF } else { 0 });
     put_orphans(ms, &mut cp_buf);
@@ -1312,7 +1312,7 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
     }
     // Commit block and the snapshot bookkeeping, in cp_prepare's order.
     let pack = 1 - ms.dur.durable_pack;
-    let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack);
+    let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack, ext_segs);
     w32(&mut cp_buf, CPJ_MAGIC_OFF, CPJ_MAGIC);
     w32(&mut cp_buf, CPJ_INCOMPAT_OFF, if rf_enabled() { CPJ_INCOMPAT_RF } else { 0 });
     put_orphans(ms, &mut cp_buf);

@@ -3316,7 +3316,7 @@ fn write_checkpoint(ms: &mut MountState, umount: bool) -> bool {
 /// The next checkpoint's commit block (and the in-memory state that records
 /// it as written: version, active pack, flags). Shared by the locked
 /// `write_checkpoint` and the unlocked `checkpoint_unlocked`.
-fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8) -> (u64, [u8; BLOCK_SIZE]) {
+fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8, avoid: &[u32]) -> (u64, [u8; BLOCK_SIZE]) {
     let bps = ms.sb.blocks_per_seg;
     // CP area: two packs of (seg_cnt_ckpt/2 * blocks_per_seg) blocks each.
     // `pack` is the one not holding the durable checkpoint (lane f2fsync:
@@ -3330,6 +3330,8 @@ fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8) -> (u64, [u8; BLO
     let mut buf = [0u8; BLOCK_SIZE];
     w64(&mut buf, CP_VER,             ms.cp.ver);
     w32(&mut buf, CP_FREE_SEG_CNT,    ms.cp.free_seg_cnt);
+    // Before the heads are written: it may move the allocator's own heads.
+    linux_cp_fields(ms, &mut buf, avoid);
     w32(&mut buf, CP_CUR_NODE_SEGNO,  ms.cp.cur_node_segno);
     w16(&mut buf, CP_CUR_NODE_BLKOFF, ms.cp.cur_node_blkoff);
     w32(&mut buf, CP_CUR_DATA_SEGNO,  ms.cp.cur_data_segno);
@@ -3337,7 +3339,6 @@ fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8) -> (u64, [u8; BLO
     w32(&mut buf, CP_NEXT_FREE_NID,   ms.cp.next_free_nid);
     ms.cp.flags = if umount { CP_UMOUNT_FLAG } else { 0 };
     w32(&mut buf, CP_CKPT_FLAGS,      ms.cp.flags);
-    linux_cp_fields(ms, &mut buf);
     (cp_blkno as u64, buf)
 }
 
@@ -3347,7 +3348,10 @@ fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8) -> (u64, [u8; BLO
 /// its SIT valid map has clear (in either bit order), all SSR: ours are hot data and hot node; the
 /// other four sit at block 0 of free segments. A full log of ours is written
 /// at a free segment, where `log_alloc` would move it next anyway.
-fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE]) {
+/// Checkpoints that moved a log head to a Linux-valid position (debug count).
+static CP_HEAD_MOVES: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+
+fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE], avoid: &[u32]) {
     let bps = ms.sb.blocks_per_seg;
     let main = ms.sb.seg_cnt_main;
     w64(buf, CP_USER_BLOCK_CNT,  main.saturating_sub(1) as u64 * bps as u64);
@@ -3382,6 +3386,10 @@ fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE]) {
         for k in 1..=main {
             let seg = (after.wrapping_add(k)) % main.max(1);
             if logs.iter().any(|l| l.0 == seg) || seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno { continue; }
+            // Never this checkpoint's journal extension segments nor a
+            // segment the durable checkpoint still points into: the
+            // allocator may be moved there (below).
+            if avoid.contains(&seg) || prot_any(ms, seg) { continue; }
             let (blkno, off) = sit_entry_loc(ms, seg);
             if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0 { pick = Some(seg); break; }
         }
@@ -3389,6 +3397,17 @@ fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE]) {
         logs[t] = (seg, 0);
         after = seg;
     }
+    // The allocator follows (lane f2fscrc2): the heads this checkpoint
+    // records are exactly where this kernel allocates next. A recorded head
+    // that differed from the in-memory one broke crash recovery
+    // (f2fscrashtest: a rewritten block came back with a gen never written
+    // there). Skipping ahead to a block free in both bit orders, or to a free
+    // segment, only leaves free blocks unused.
+    let moved = (logs[0] != (ms.cp.cur_data_segno, ms.cp.cur_data_blkoff),
+                 logs[3] != (ms.cp.cur_node_segno, ms.cp.cur_node_blkoff));
+    if moved.0 && logs[0].0 < main { ms.cp.cur_data_segno = logs[0].0; ms.cp.cur_data_blkoff = logs[0].1; }
+    if moved.1 && logs[3].0 < main { ms.cp.cur_node_segno = logs[3].0; ms.cp.cur_node_blkoff = logs[3].1; }
+    if moved.0 || moved.1 { CP_HEAD_MOVES.fetch_add(1, atomic::Ordering::Relaxed); }
     for (t, &(seg, off)) in logs.iter().enumerate() {
         let (so, bo) = if t < 3 { (CP_CUR_DATA_SEGNO + 4 * t, CP_CUR_DATA_BLKOFF + 2 * t) }
                        else     { (CP_CUR_NODE_SEGNO + 4 * (t - 3), CP_CUR_NODE_BLKOFF + 2 * (t - 3)) };
