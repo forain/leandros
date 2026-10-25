@@ -2294,7 +2294,21 @@ fn early_hhdm_holes(hhdm: u64, reported: usize, extra: Option<boot::MemoryRegion
 /// On the HP with Fast Boot OFF, Limine 11.4.1 handed over page tables whose
 /// HHDM maps nothing above 4 GiB (PML4E present, PDPTE 0), although its
 /// memory map reports 13 GiB usable there -- without this the kernel could
-/// only exclude that RAM (2.8 GB MemTotal). This maps every memory-map entry
+/// only exclude that RAM (2.8 GB MemTotal).
+///
+/// Permanent design, not a stopgap (lane hhdmfb, 2026-10-25): the Limine
+/// protocol is the contract we rely on (base revision >= 4: every memmap entry
+/// but RESERVED/BAD_MEMORY is in the HHDM, and Limine 11.4.1's
+/// `build_pagemap` does exactly that, after ExitBootServices, from the same
+/// array the memmap response is made from), yet a real firmware broke it.
+/// It happened only on boots 13-18 of the stick (2026-10-16 09:47 to
+/// 2026-10-17 13:20, always the whole 0x1_0000_0000-0x4_3F80_0000 block);
+/// the 60+ Fast-Boot-OFF boots since (same Limine, same 56/58-entry memmap,
+/// unchanged kernel boot path) and every Fast-Boot-ON boot had a complete
+/// HHDM. Cause outside our code, not reproducible: so check (a quick walk,
+/// silent when complete) and repair, and log the first hole's raw walk so a
+/// recurrence tells "never mapped" (zero entry) from corruption (garbage).
+/// This maps every memory-map entry
 /// Limine itself would map in the HHDM (all but RESERVED, BAD_MEMORY; the
 /// framebuffer is left alone for its cache attributes) into the empty slots
 /// of the live tables, in place -- same VA base, nothing already present is
@@ -2325,16 +2339,24 @@ fn early_hhdm_fill(hhdm: u64) -> Option<boot::MemoryRegion> {
     }
     // Quick exit: everything already mapped (every machine so far but the HP
     // with Fast Boot OFF).
-    let mut any_hole = false;
+    let mut first_hole: Option<(u64, arch_x86_64::early_idt::Walk)> = None;
     'outer: for &(s, t) in &ranges[..nr] {
         let mut a = s;
         while a < t {
             let w = arch_x86_64::early_idt::walk(hhdm + a);
-            if w.page == 0 { any_hole = true; break 'outer; }
+            if w.page == 0 { first_hole = Some((a, w)); break 'outer; }
             a = (a & !(w.page - 1)) + w.page;
         }
     }
-    if !any_hole { return None; }
+    let Some((hole_at, hole_walk)) = first_hole else { return None; };
+    // Before anything is written: the bootloader's own entries for the first
+    // hole (zero = never mapped; anything else = a corrupted table).
+    serial_print_str("[early] HHDM fill: first bootloader hole ");
+    serial_print_hex(hole_at as usize);
+    serial_print_str(" walk:");
+    for d in 0..hole_walk.depth { serial_print_str(" "); serial_print_hex(hole_walk.e[d] as usize); }
+    if hole_walk.bad_table { serial_print_str(" (table pointer outside mapped RAM)"); }
+    serial_print_str("\n");
     // The table pool.
     const POOL: u64 = 256 * 4096;
     let mapped = |p: u64| arch_x86_64::early_idt::walk(hhdm + p).page != 0;
