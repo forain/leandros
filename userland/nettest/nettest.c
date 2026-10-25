@@ -22,7 +22,8 @@
  *                           poll(); 4/4 replies required
  *   icmp_nonblock           MSG_DONTWAIT recvfrom on an idle ICMP socket is
  *                           EAGAIN at once
- *   icmp_poll_timeout       poll() for a reply that never comes (TEST-NET-1)
+ *   icmp_poll_timeout       poll() for a reply that never comes (TEST-NET-1;
+ *                           echo replies with another seq are strays, ignored)
  *                           returns 0 after its timeout, not early, not never
  *   icmp_recv_eintr         a blocking recvfrom with nothing to read is ended
  *                           by SIGALRM with EINTR (handler without SA_RESTART)
@@ -213,12 +214,30 @@ static void icmp_timeout_cases(void) {
     if (n < 0 && errno == EAGAIN && dt < 200) pass("icmp_nonblock");
     else fail("icmp_nonblock", "n=%zd errno=%s after %lld ms (want EAGAIN at once)", n, strerror(errno), dt);
 
+    /* A reply with our id but another seq is not ours: QEMU's user-mode net on
+     * a macOS host hands the guest every echo reply its host ICMP socket sees
+     * (a host `ping` running alongside), rewritten to our id and to the
+     * 192.0.2.1 source. Linux demuxes ping sockets by id only, so such a
+     * reply is readable there too; drop it and keep waiting, as ping(8)
+     * does. Only an answer to seq 7 itself means TEST-NET-1 replied. */
     struct pollfd pfd = { fd, POLLIN, 0 };
+    int r, strays = 0, ours = 0;
     t0 = now_ms();
-    int r = poll(&pfd, 1, 700);
+    for (;;) {
+        long long left = 700 - (now_ms() - t0);
+        pfd.revents = 0;
+        r = poll(&pfd, 1, left > 0 ? (int)left : 0);
+        if (r <= 0) break;
+        ssize_t m = recvfrom(fd, b, sizeof b, MSG_DONTWAIT, NULL, NULL);
+        if (m >= 8 && b[0] == 0 && (b[6] << 8 | b[7]) != 7) { strays++; continue; }
+        ours = 1;
+        break;
+    }
     dt = now_ms() - t0;
-    if (r == 0 && dt >= 650 && dt < 2000) pass("icmp_poll_timeout");
-    else fail("icmp_poll_timeout", "poll=%d revents=%#x after %lld ms (want 0 after ~700)", r, pfd.revents, dt);
+    if (r == 0 && !ours && dt >= 650 && dt < 2000) {
+        if (strays) printf("icmp_poll_timeout: ignored %d stray echo replies (not seq 7)\n", strays);
+        pass("icmp_poll_timeout");
+    } else fail("icmp_poll_timeout", "poll=%d revents=%#x after %lld ms (want 0 after ~700; %d strays)", r, pfd.revents, dt, strays);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -227,11 +246,19 @@ static void icmp_timeout_cases(void) {
     struct itimerval it = { {0, 0}, {0, 500000} };
     setitimer(ITIMER_REAL, &it, NULL);
     t0 = now_ms();
-    n = recvfrom(fd, b, sizeof b, 0, NULL, NULL);
-    int e = errno;
+    int e = 0;
+    strays = 0;
+    for (;;) {
+        n = recvfrom(fd, b, sizeof b, 0, NULL, NULL);
+        e = errno;
+        if (n >= 8 && b[0] == 0 && (b[6] << 8 | b[7]) != 7 && now_ms() - t0 < 3000) { strays++; continue; }
+        break;
+    }
     dt = now_ms() - t0;
-    if (n < 0 && e == EINTR && dt >= 400 && dt < 3000) pass("icmp_recv_eintr");
-    else fail("icmp_recv_eintr", "n=%zd errno=%s after %lld ms (want EINTR after ~500)", n, strerror(e), dt);
+    if (n < 0 && e == EINTR && dt >= 400 && dt < 3000) {
+        if (strays) printf("icmp_recv_eintr: ignored %d stray echo replies (not seq 7)\n", strays);
+        pass("icmp_recv_eintr");
+    } else fail("icmp_recv_eintr", "n=%zd errno=%s after %lld ms (want EINTR after ~500; %d strays)", n, strerror(e), dt, strays);
     signal(SIGALRM, SIG_DFL);
     close(fd);
 }
