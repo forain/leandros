@@ -26,8 +26,10 @@ QMP `sendkey`/`input-send-event`; pollnarrow's UART case reads fd 0, not event0.
 - Green: `event0_keys=0` in both modes; opt-in presses=10 releases=10 repeats=0 held=0, codes
   `+42 +4 -4 -42 +42 +30 -30 -42 +48 -48 +42 +9 -9 -42 +13 -13 +2 -2`.
 
-**Note.** Testing needed the lane/bootfail driver.py patch (openbugs #68, harness reported "boot
-failed" though the guest reached `login:`), applied locally only, not committed here.
+**Runs (aarch64, HVF).** Full regress PASS (94 suites RC=0) on the lane before merging main.
+After `git merge main` (with the #68 fix b8a9ef77): serialkbd + evgkey + evherd PASS; evbtn and
+evclock PASS; mamesession (keyboard on) PASS: speed 100%, one run that exits at -str, wl key seen.
+clickmovetest was not applicable (it needs a virgl COSMIC session and exits at once without one).
 
 **Open.** The cmdline knob path calls the same `set_serial_kbd` as the ioctl, but was not booted with
 `evdev.serialkbd=1` in this lane.
