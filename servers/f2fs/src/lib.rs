@@ -3185,7 +3185,7 @@ fn nat_update_owned(ms: &mut MountState, nid: u32, owner: Option<u32>, blk_addr:
 
 // ── SIT: find a free segment ──────────────────────────────────────────────────
 
-fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
+fn sit_find_free_seg(ms: &mut MountState, after: u32, heads: bool) -> Option<u32> {
     // Bound the scan by the real main-area segment count, not a hardcoded
     // 1024: on a volume with fewer segments the modulo wrapped onto segments
     // past the end of SIT, and on a larger one it left everything above 1024
@@ -3195,7 +3195,7 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
     // lx: the checkpoint's filler logs stay empty and typed (`linux_logs`)
     // unless nothing else is left (second pass).
     for pass in 0..2 {
-    if pass == 1 && !ms.sb.fmt.lx { break; }
+    if pass == 1 && (!ms.sb.fmt.lx || !heads) { break; }
     for seg_off in 0..total {
         let seg = (start_seg + seg_off) % total;
         if pass == 0 && ms.sb.fmt.lx && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
@@ -3226,7 +3226,7 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
 
 /// lx: set segment `seg`'s SIT type (0..2 data, 3..5 node logs), keeping
 /// `valid_nodes` equal to the sum over node-typed segments.
-fn sit_set_type(ms: &mut MountState, seg: u32, t: u16) {
+pub(crate) fn sit_set_type(ms: &mut MountState, seg: u32, t: u16) {
     if !ms.sb.fmt.lx || seg >= ms.sb.seg_cnt_main { return; }
     ssa_set_kind(ms, seg, (3..=5).contains(&t));
     let (blkno, off) = sit_entry_loc(ms, seg);
@@ -3473,12 +3473,18 @@ pub(crate) fn ssa_set_kind(ms: &mut MountState, seg: u32, node: bool) {
 /// The six summary blocks of a checkpoint pack tail: the cached SSA block of
 /// each current log, footer by log class. None when the volume cannot hold
 /// summaries (the tail stays zero).
-pub(crate) fn lx_tail_sums(ms: &mut MountState, logs: &LinuxLogs) -> Option<alloc::vec::Vec<u8>> {
+///
+/// Where Linux reads them (`sum_blk_addr`): a umount pack has the three data
+/// summaries at total-7 and the three node summaries at total-4; any other
+/// pack has the data summaries at total-4 (node cursegs then come from the
+/// SSA area). So a non-umount tail is node, node, node, data, data, data.
+pub(crate) fn lx_tail_sums(ms: &mut MountState, logs: &LinuxLogs, umount: bool) -> Option<alloc::vec::Vec<u8>> {
     if !ms.sb.fmt.lx { return None; }
     let mut out = alloc::vec![0u8; 6 * BLOCK_SIZE];
     for t in 0..6 {
         let blkno = ssa_blk(ms, logs[t].0)?;
-        let d = &mut out[t * BLOCK_SIZE..(t + 1) * BLOCK_SIZE];
+        let slot = if umount { t } else { (t + 3) % 6 };
+        let d = &mut out[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE];
         d.copy_from_slice(ms.cache.read(ms.dev, blkno));
         d[SSA_FOOTER] = (t >= 3) as u8;
     }
@@ -3529,10 +3535,17 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
                 return Some(ms.sb.main_blkaddr + seg * bps + b);
             }
         }
-        let next = match sit_find_free_seg(ms, seg) {
+        // lx: Linux's four extra log heads (`linux_logs`) need segments
+        // that are empty or of their own type; filling them left no valid
+        // curseg position on a full volume (fsck.f2fs "Incorrect curseg",
+        // "Next block offset is not free"). They are the last resort, after
+        // SSR, like upstream's reserved segments.
+        let next = match sit_find_free_seg(ms, seg, false) {
             Some(n) => Some(n),
-            None if ssr_enabled() => ssr_pick(ms, node),
-            None => None,
+            None if ssr_enabled() => ssr_pick(ms, node, false)
+                .or_else(|| sit_find_free_seg(ms, seg, true))
+                .or_else(|| ssr_pick(ms, node, true)),
+            None => sit_find_free_seg(ms, seg, true),
         };
         let next = match next {
             Some(n) => n,
@@ -3747,7 +3760,7 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
     Some(n)
 }
 
-fn sit_entry_loc(ms: &MountState, seg: u32) -> (u64, usize) {
+pub(crate) fn sit_entry_loc(ms: &MountState, seg: u32) -> (u64, usize) {
     let sit_blkno = ms.sb.sit_addr(seg / SIT_PER_BLK as u32);
     (sit_blkno as u64, (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE)
 }
@@ -3778,11 +3791,12 @@ fn seg_first_usable(ms: &mut MountState, seg: u32, from: u32) -> Option<u32> {
 
 /// SSR victim (lane f2fsgc): the segment, other than the two logs' own,
 /// with the most usable blocks (greedy, like upstream's foreground SSR).
-fn ssr_pick(ms: &mut MountState, node: bool) -> Option<u32> {
+fn ssr_pick(ms: &mut MountState, node: bool, heads: bool) -> Option<u32> {
     let bps = ms.sb.blocks_per_seg;
     let mut best: Option<(u32, u32)> = None;
     for seg in 0..ms.sb.seg_cnt_main {
         if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno { continue; }
+        if ms.sb.fmt.lx && !heads && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
         if ms.sb.fmt.lx {
             // A data block in a node segment (or the reverse) is something
             // fsck.f2fs cannot repair: reuse only a segment of the same class.
@@ -4045,12 +4059,14 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
             // kernel LSB-first: the block must be free under both readings.
             let m = seg_busy_map(ms, seg);
             let free = |b: u32| m[b as usize / 64] & (1u64 << (b % 64)) == 0;
-            if let Some(b) = (off as u32..bps).find(|&b| free(b) && free((b & !7) | (7 - (b & 7)))) {
-                logs[t] = (seg, b as u16);
-            }
+            let ok = |b: &u32| free(*b) && free((*b & !7) | (7 - (*b & 7)));
+            // Every head is SSR: lx takes a free block before `off` too.
+            let b = (off as u32..bps).find(ok).or_else(|| if ms.sb.fmt.lx { (0..off as u32).find(ok) } else { None });
+            if let Some(b) = b { logs[t] = (seg, b as u16); }
         }
     }
     let mut after = ms.cp.cur_data_segno;
+    let mut ssr = [false; 6];
     for t in 0..6 {
         if logs[t].0 != u32::MAX { continue; }
         // lx: keep the previous pick while it is still empty (stable cursegs).
@@ -4078,25 +4094,76 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
             let (blkno, off) = sit_entry_loc(ms, seg);
             if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0 { pick = Some(seg); break; }
         }
-        let seg = pick.unwrap_or(t as u32);
-        logs[t] = (seg, 0);
+        // No empty segment (near-full volume): lx heads go SSR into a
+        // segment of the same class at a block that is free (pack writes
+        // every log as SSR, so only that block must be free). The old
+        // fallback, segment `t` at block 0, put the warm-data curseg on a
+        // valid block of a hot-data segment (fsck.f2fs: "Next block offset
+        // is not free" + "Incorrect curseg [1] type(SIT) [0]").
+        let (seg, off) = match pick {
+            Some(s) => (s, 0),
+            None if ms.sb.fmt.lx => match lx_ssr_head(ms, &logs, t, avoid) {
+                Some(h) => { ssr[t] = true; h }
+                // Nothing valid exists: at least not a segment another head has.
+                None => ((0..main).find(|&g| !logs.iter().any(|l| l.0 == g)
+                    && g != ms.cp.cur_data_segno && g != ms.cp.cur_node_segno).unwrap_or(t as u32), 0),
+            },
+            None => (t as u32, 0),
+        };
+        logs[t] = (seg, off);
         after = seg;
     }
     if ms.sb.fmt.lx {
         // Type the six heads so fsck.f2fs finds each curseg in a segment of
-        // its own type; a non-empty fallback segment keeps its type.
+        // its own type; a non-empty fallback segment keeps its type unless it
+        // was chosen as an SSR head (same class, so only data<->data or
+        // node<->node changes).
         for t in 0..6 {
             let seg = logs[t].0;
             if seg >= main { continue; }
             let (blkno, off) = sit_entry_loc(ms, seg);
             let empty = r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0;
-            if empty || (t == 0 && seg == ms.cp.cur_data_segno) || (t == 3 && seg == ms.cp.cur_node_segno) {
+            if empty || ssr[t] || (t == 0 && seg == ms.cp.cur_data_segno) || (t == 3 && seg == ms.cp.cur_node_segno) {
                 sit_set_type(ms, seg, t as u16);
             }
         }
         ms.cp.logs = logs;
     }
     logs
+}
+
+/// lx: an SSR log head of type `t` when no free segment qualifies. Linux
+/// only reads this checkpoint's SIT, so a block is free here when its valid
+/// bit is clear in the SIT this checkpoint writes (both bit orders); blocks
+/// freed since the durable checkpoint count as free, unlike for our own
+/// allocator, which never moves to these heads. Order: a segment already of
+/// type `t`, then one of `t`'s class (data or node), then any segment with no
+/// valid block (a pre-free one: retyping it is safe).
+fn lx_ssr_head(ms: &mut MountState, logs: &LinuxLogs, t: usize, avoid: &[u32]) -> Option<(u32, u16)> {
+    let bps = ms.sb.blocks_per_seg;
+    let node = t >= 3;
+    for pass in 0..3 {
+        for seg in 0..ms.sb.seg_cnt_main {
+            if logs.iter().any(|l| l.0 == seg) || seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno
+                || avoid.contains(&seg) { continue; }
+            let (blkno, o) = sit_entry_loc(ms, seg);
+            let v = r16(ms.cache.read(ms.dev, blkno), o);
+            let ok = match pass {
+                0 => (v >> 10) as usize == t,
+                1 => sit_is_node(v) == node,
+                _ => v & SIT_VBLOCKS_MASK == 0,
+            };
+            if !ok { continue; }
+            let blk = ms.cache.read(ms.dev, blkno);
+            let map = &blk[o + SIT_VMAP_OFF..o + SIT_VMAP_OFF + (bps as usize).div_ceil(8)];
+            // On-disk lx map is MSB-first; also require the LSB-first twin.
+            let set = |b: u32| map[b as usize / 8] & (0x80u8 >> (b % 8)) != 0;
+            if let Some(b) = (0..bps).find(|&b| !set(b) && !set((b & !7) | (7 - (b & 7)))) {
+                return Some((seg, b as u16));
+            }
+        }
+    }
+    None
 }
 
 /// lx, at the start of a checkpoint (before its dirty set is collected, so
