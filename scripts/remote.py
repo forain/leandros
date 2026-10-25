@@ -21,8 +21,12 @@ Commands:
   run <cmd...>           run a command (exit status passed through)
   shell                  interactive shell
   push <local> <remote>  upload a file or directory, sha256-verified,
-                         atomically (temp name + rename), skipping
-                         identical files
+                         atomically, skipping identical files. Never writes
+                         the target in place: chunks go to <dest>.part.<id>,
+                         resumed after stalls/drops from the verified prefix
+                         (LEANDROS_PUSH_STALL s, _RETRIES, _CHUNK), full-file
+                         sha256 checked, then mv over <dest>; a mismatch
+                         deletes the part and leaves the old file intact
   pull <remote> <local>  download a file or directory, sha256-verified
   deploy-files <pairs|--manifest F>  upload many files: LOCAL:REMOTE[:MODE]
   deploy-kernel [--arch A] [--kernel F] [--initrd F] [--cmdline ARGS] [--netwatch S] [--no-arm]
@@ -59,6 +63,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -230,7 +235,8 @@ def remote_shas(t, paths):
     res = {}
     for i in range(0, len(paths), 100):
         chunk = paths[i:i + 100]
-        p = t.run("sha256sum -- " + " ".join(shlex.quote(x) for x in chunk) + " 2>/dev/null", check=False)
+        p = rrun(t, "sha256sum -- " + " ".join(shlex.quote(x) for x in chunk) + " 2>/dev/null",
+                 timeout=900, tries=4, what="sha256sum")
         for line in p.stdout.decode(errors="replace").splitlines():
             parts = line.split(None, 1)
             if len(parts) == 2 and len(parts[0]) == 64:
@@ -238,9 +244,206 @@ def remote_shas(t, paths):
     return res
 
 
+# ── Robust file upload: .part + resume + verify + atomic rename ─────────────
+#
+# Never writes the destination in place. Each file goes to <dest>.part.<id>
+# (id = first 12 hex of the NEW content's sha256, so a later run of the same
+# push resumes the same part file), in chunks over `ssh ... cat >> part`, each
+# chunk with a stall watchdog and a remote-side offset check + chunk hash.
+# After any failure the remote part is re-measured, its un-verified tail is
+# hash-compared with the local file, and the transfer resumes from there. Only a
+# part whose full sha256 matches is renamed over <dest> (the old file stays
+# until that rename); on a mismatch the part is deleted and <dest> is untouched.
+
+CHUNK = int(os.environ.get("LEANDROS_PUSH_CHUNK", 4 << 20))
+STALL_S = float(os.environ.get("LEANDROS_PUSH_STALL", 30))      # no progress for this long = stalled
+MAX_FAILS = int(os.environ.get("LEANDROS_PUSH_RETRIES", 10))    # consecutive failures without progress
+BACKOFF_MAX = 30
+
+
+def sha256_range(path, a, b):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        f.seek(a)
+        left = b - a
+        while left > 0:
+            d = f.read(min(1 << 20, left))
+            if not d:
+                break
+            h.update(d)
+            left -= len(d)
+    return h.hexdigest()
+
+
+def rrun(t, cmd, timeout=60, tries=6, what=None):
+    """t.run with a timeout and bounded retries (exponential backoff) for the
+    small control commands. Returns the CompletedProcess of the first run that
+    got a real answer from the remote shell (rc != 255, no timeout)."""
+    for i in range(tries):
+        try:
+            p = subprocess.run(t.ssh_argv(cmd), capture_output=True, timeout=timeout)
+            if p.returncode != 255:
+                return p
+        except subprocess.TimeoutExpired:
+            pass
+        t.close_master()
+        time.sleep(min(BACKOFF_MAX, 2 ** i))
+    die(f"remote unreachable: {what or cmd[:60]} failed {tries} times")
+
+
+def remote_size(t, path):
+    p = rrun(t, f"stat -c %s {shlex.quote(path)} 2>/dev/null || echo -1", what="stat")
+    try:
+        return int(p.stdout.decode().split()[-1])
+    except (ValueError, IndexError):
+        return -1
+
+
+def send_chunk(t, part, off, data, stall_s):
+    """Append `data` at remote offset `off` of `part`. Returns True only if the
+    remote saw exactly `off` bytes before, and hashes the appended bytes to the
+    same sha256 afterwards. Kills ssh when no byte moved for stall_s seconds."""
+    q = shlex.quote(part)
+    n = len(data)
+    cmd = (f'[ "$(stat -c %s {q} 2>/dev/null || echo 0)" = {off} ] || exit 42; '
+           f"cat >> {q} || exit 43; tail -c {n} {q} | sha256sum")
+    p = subprocess.Popen(t.ssh_argv(cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+    st = {"last": time.time(), "done": False}
+
+    def writer():
+        try:
+            for i in range(0, n, 65536):
+                p.stdin.write(data[i:i + 65536])
+                p.stdin.flush()
+                st["last"] = time.time()
+            p.stdin.close()
+            st["last"] = time.time()
+            st["done"] = True
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    th = threading.Thread(target=writer, daemon=True)
+    th.start()
+    while p.poll() is None:
+        if time.time() - st["last"] > stall_s:
+            p.kill()
+            p.wait()
+            return False, "stalled"
+        time.sleep(0.1)
+    th.join(2)
+    out = p.stdout.read().decode(errors="replace").split()
+    if p.returncode != 0:
+        return False, f"rc {p.returncode}"
+    if not out or out[0] != hashlib.sha256(data).hexdigest():
+        return False, "chunk hash mismatch"
+    return True, ""
+
+
+def stabilize(t, part):
+    """After a failed chunk the remote cat may still be draining: wait until the
+    part's size stops changing, then return it."""
+    last = remote_size(t, part)
+    for _ in range(10):
+        time.sleep(1.5)
+        cur = remote_size(t, part)
+        if cur == last:
+            return cur
+        last = cur
+    return last
+
+
+class Progress:
+    def __init__(self, name, total):
+        self.name, self.total, self.t0, self.last = name, total, time.time(), 0
+        self.base = 0
+        self.retries = 0
+
+    def show(self, done, force=False):
+        now = time.time()
+        if not force and now - self.last < 2:
+            return
+        self.last = now
+        rate = (done - self.base) / max(now - self.t0, 1e-3) / 1e6
+        pct = 100 * done / self.total if self.total else 100
+        sys.stderr.write(f"  {self.name}: {done / 1e6:.1f}/{self.total / 1e6:.1f} MB {pct:.0f}%  "
+                         f"{rate:.2f} MB/s  retries {self.retries}\n")
+        sys.stderr.flush()
+
+
+def upload_one(t, local, dest, sha, mode, quiet=False):
+    """Returns after dest has been atomically replaced by `local`, verified."""
+    total = os.path.getsize(local)
+    part = f"{dest}.part.{sha[:12]}"
+    qp, qd = shlex.quote(part), shlex.quote(dest)
+    prog = Progress(os.path.basename(dest), total)
+    for restart in range(3):
+        verified = 0
+        fails = 0
+        S = remote_size(t, part)
+        if S > total:
+            rrun(t, f"rm -f {qp}")
+            S = 0
+        # resume: hash-check the un-verified remote prefix against the local file
+        if S > 0:
+            got = rrun(t, f"head -c {S} {qp} | sha256sum", timeout=max(60, S / 1e6)).stdout.decode().split()
+            if got and got[0] == sha256_range(local, 0, S):
+                verified = S
+                prog.base = S
+                if not quiet:
+                    sys.stderr.write(f"  {prog.name}: resuming at {S} bytes (prefix sha256 verified)\n")
+            else:
+                rrun(t, f"rm -f {qp}")
+                S = 0
+        with open(local, "rb") as f:
+            while verified < total:
+                f.seek(verified)
+                data = f.read(min(CHUNK, total - verified))
+                ok, why = send_chunk(t, part, verified, data, STALL_S)
+                if ok:
+                    verified += len(data)
+                    fails = 0
+                    if not quiet:
+                        prog.show(verified)
+                    continue
+                fails += 1
+                prog.retries += 1
+                t.close_master()
+                if fails > MAX_FAILS:
+                    die(f"{dest}: {fails} consecutive failures ({why}); gave up. "
+                        f"Old file untouched; partial upload kept as {part} (rerun to resume)")
+                wait = min(BACKOFF_MAX, 2 ** fails)
+                sys.stderr.write(f"  {prog.name}: chunk at {verified} failed ({why}); retry {fails}/{MAX_FAILS} "
+                                 f"in {wait}s\n")
+                time.sleep(wait)
+                S = stabilize(t, part)
+                if S == verified:
+                    continue
+                if S < verified or S > total:
+                    # remote lost data (or grew weirdly): re-verify from scratch
+                    verified = 0
+                    rrun(t, f"rm -f {qp}")
+                    continue
+                # S > verified: a partial chunk landed; hash-check [verified, S)
+                got = rrun(t, f"tail -c +{verified + 1} {qp} | head -c {S - verified} | sha256sum").stdout.decode().split()
+                if got and got[0] == sha256_range(local, verified, S):
+                    verified = S
+                else:
+                    rrun(t, f"truncate -s {verified} {qp}")
+        # whole-file check, then atomic rename
+        got = rrun(t, f"sha256sum -- {qp}", timeout=max(120, total / 1e6)).stdout.decode().split()
+        if got and got[0] == sha:
+            rrun(t, f"chmod {mode} {qp} && mv -f {qp} {qd} && rm -f {qd}.part.* ; sync")
+            return got[0]
+        sys.stderr.write(f"  {prog.name}: FINAL sha256 MISMATCH (remote {got[0][:16] if got else '?'} != {sha[:16]}); "
+                         f"deleting part, {dest} left untouched\n")
+        rrun(t, f"rm -f {qp}")
+    die(f"{dest}: final sha256 mismatch after 3 attempts; refused to rename, old file intact")
+
+
 def upload(t, pairs, force=False, quiet=False):
     """pairs: [(local, remote, mode or None)]. Changed files only, each via
-    <remote>.remdbg-tmp, verified, then renamed over the target."""
+    <remote>.part.<id> (resumable, sha256-verified), then atomically renamed."""
     local = {r: (l, sha256_file(l), m) for l, r, m in pairs}
     have = {} if force else remote_shas(t, list(local))
     todo = [(r, l, s, m) for r, (l, s, m) in local.items() if have.get(r) != s]
@@ -251,25 +454,15 @@ def upload(t, pairs, force=False, quiet=False):
         return 0
     dirs = sorted({os.path.dirname(r) for r, *_ in todo if os.path.dirname(r)})
     if dirs:
-        t.run("mkdir -p -- " + " ".join(shlex.quote(d) for d in dirs))
+        rrun(t, "mkdir -p -- " + " ".join(shlex.quote(d) for d in dirs))
     t0 = time.time()
     total = sum(os.path.getsize(l) for _, l, _, _ in todo)
-    lines = [f"put {shlex.quote(l)} {shlex.quote(r + '.remdbg-tmp')}" for r, l, _, _ in todo]
-    for i in range(0, len(lines), 200):
-        t.sftp_batch(lines[i:i + 200])
-    dt = time.time() - t0
-    got = remote_shas(t, [r + ".remdbg-tmp" for r, *_ in todo])
-    bad = [r for r, _, s, _ in todo if got.get(r + ".remdbg-tmp") != s]
-    if bad:
-        t.run("rm -f -- " + " ".join(shlex.quote(r + ".remdbg-tmp") for r in bad), check=False)
-        die("checksum mismatch after upload (targets left untouched): " + ", ".join(bad))
-    cmds = []
     for r, l, s, m in todo:
         mode = m if m is not None else oct(os.stat(l).st_mode & 0o7777)[2:]
-        tmp = shlex.quote(r + ".remdbg-tmp")
-        cmds.append(f"chmod {mode} {tmp} && mv -f {tmp} {shlex.quote(r)}")
-    for i in range(0, len(cmds), 50):
-        t.run(" && ".join(cmds[i:i + 50]) + " && sync")
+        got = upload_one(t, l, r, s, mode, quiet=quiet)
+        if not quiet:
+            print(f"{r}: sha256 {got} OK")
+    dt = time.time() - t0
     if not quiet:
         rate = total / dt / 1e6 if dt > 0 else 0
         print(f"uploaded {len(todo)} file(s), {total} bytes in {dt:.1f} s ({rate:.1f} MB/s), "
