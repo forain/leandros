@@ -558,12 +558,14 @@ class Fsck:
                 if (gnid, gofs) != (nid, ofs) or (not isnode and gver != wver):  # fsck.f2fs ignores node versions
                     e(f"segment {seg} off {off}: SSA (nid {gnid} ver {gver} ofs {gofs}) != "
                       f"(nid {nid} ver {wver} ofs {ofs})")
-        # curseg summaries in the cp tail
-        ssum = r32(cp, 140)
+        # curseg summaries in the cp tail, where fsck.f2fs reads them
+        # (sum_blk_addr): umount pack: data at total-7, node at total-4;
+        # any other pack: data at total-4, node from the SSA area.
+        tot, umount = r32(cp, 136), r32(cp, 132) & 1
         for t, seg in enumerate(cur):
-            if seg >= v.seg_cnt_main:
+            if seg >= v.seg_cnt_main or (t >= 3 and not umount):
                 continue
-            tb = v.raw(v.cp_addr + ssum + t)
+            tb = v.raw(v.cp_addr + tot - (7 if umount else 4 + 3 * (t >= 3)) + t)
             if tb[4091] != (1 if t >= 3 else 0):
                 e(f"cp tail summary {t}: footer type {tb[4091]} not for {'node' if t >= 3 else 'data'} segment")
             for off, (nid, ofs, isnode) in segs.get(seg, {}).items():
