@@ -93,8 +93,8 @@ static ALLOCATOR: LibcAllocator = LibcAllocator;
 // They used to be byte-at-a-time loops (`movb`/`ldrb` per byte, the compiler
 // will not vectorise or idiom-replace a loop inside a function *named*
 // memcpy), which capped a 256 KiB wl_shm frame copy at ~600 MB/s on the
-// laptop (lane shmslow). x86_64 now uses the fast-string `rep movsb` /
-// `rep stosb` (ERMSB on everything since Ivy Bridge); other arches copy whole
+// laptop (lane shmslow). x86_64 now uses the fast-string `rep movsq`/`rep stosq`
+// plus a byte tail; other arches copy whole
 // machine words with an unrolled loop.
 //
 // Do NOT move the word loops into helper functions with other names: LLVM's
@@ -108,8 +108,12 @@ const W: usize = core::mem::size_of::<usize>();
 pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: size_t) -> *mut u8 {
     #[cfg(target_arch = "x86_64")]
     {
-        core::arch::asm!("rep movsb",
-            inout("rcx") n => _, inout("rdi") dst => _, inout("rsi") src => _,
+        // Quadwords then the tail: as fast as ERMSB `rep movsb` on hardware,
+        // and 8x fewer iterations under TCG, which emulates string ops per
+        // element (plain `rep movsb` there was slower than the byte loop).
+        core::arch::asm!("rep movsq", "mov rcx, {t}", "rep movsb",
+            t = in(reg) n & 7,
+            inout("rcx") n >> 3 => _, inout("rdi") dst => _, inout("rsi") src => _,
             options(nostack, preserves_flags));
         return dst;
     }
@@ -171,8 +175,10 @@ pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: size_t) -> *mu
 pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: size_t) -> *mut u8 {
     #[cfg(target_arch = "x86_64")]
     {
-        core::arch::asm!("rep stosb",
-            inout("rcx") n => _, inout("rdi") s => _, in("al") c as u8,
+        core::arch::asm!("rep stosq", "mov rcx, {t}", "rep stosb",
+            t = in(reg) n & 7,
+            inout("rcx") n >> 3 => _, inout("rdi") s => _,
+            in("rax") (c as u8 as u64).wrapping_mul(0x0101_0101_0101_0101),
             options(nostack, preserves_flags));
         return s;
     }

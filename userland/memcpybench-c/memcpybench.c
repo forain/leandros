@@ -52,8 +52,7 @@ static unsigned long now_ns(void) {
  * byte-loop reference. Returns the number of mismatches. */
 static unsigned char ra[1024], rb[1024], rc[1024];
 static int check_mem(void) {
-    int memerr = check_mem();
-    int bad = memerr != 0;
+    int bad = 0;
     for (int so = 0; so < 16; so++) for (int dof = 0; dof < 16; dof++) for (int n = 0; n <= 300; n += (n < 80 ? 1 : 7)) {
         for (int i = 0; i < 1024; i++) { ra[i] = (unsigned char)(i * 13 + 1); rb[i] = rc[i] = (unsigned char)(i * 5 + 3); }
         memcpy(rb + dof, ra + so, (size_t)n);
