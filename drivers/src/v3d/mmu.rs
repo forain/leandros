@@ -365,6 +365,18 @@ mod hw {
     }
 
     static HW: Mutex<Option<HwMmu>> = Mutex::new(None);
+    /// Page table and scratch page, kept for the post-reset re-enable (phase C), lock-free because
+    /// a reset runs from the queue's interrupt/tick context.
+    static PT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static SCRATCH_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// After a GPU reset: program the same page table again and flush. False if never enabled or
+    /// the flush timed out.
+    pub fn reenable(regs: &dyn V3dRegs) -> bool {
+        let pt = PT_PA.load(Ordering::Acquire);
+        if pt == 0 { return false; }
+        enable(regs, pt, SCRATCH_PA.load(Ordering::Acquire), &CntClock).is_ok()
+    }
     static ACTIVE: AtomicBool = AtomicBool::new(false);
     /// Map/unmap calls whose flush failed (the GPU may hold a stale TLB entry).
     pub static FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
@@ -437,6 +449,8 @@ mod hw {
         // From here the hardware may hold the table's address: on failure the 4 MiB and the
         // scratch page are deliberately leaked rather than handed back to the allocator.
         enable(regs, pt_pa as u64, scratch_pa as u64, &CntClock)?;
+        PT_PA.store(pt_pa as u64, Ordering::Release);
+        SCRATCH_PA.store(scratch_pa as u64, Ordering::Release);
         *HW.lock() = Some(HwMmu { regs, pt_va, pa_limit });
         ACTIVE.store(true, Ordering::Release);
         Ok(pt_pa as u64)
