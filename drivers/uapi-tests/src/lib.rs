@@ -498,3 +498,196 @@ mod sync_file_tests {
         assert_eq!(syncobj_export(t.links(), t.base(), &d.f()), Some(Fence::Signaled));
     }
 }
+
+#[path = "../../nvidia/src/mmap_tokens.rs"]
+pub mod mmap_tokens;
+
+#[cfg(test)]
+mod mmap_tokens_tests {
+    //! L11.9: an NVIDIA mmap must lie wholly inside one live buffer the
+    //! caller's ioctl authorized, whatever the length or the timing.
+    use super::mmap_tokens::*;
+    const B: u64 = 0x1_0000_0000; // buffer base
+    const S: u64 = 16 * PAGE; // buffer size
+
+    fn one() -> Tokens {
+        let mut t = Tokens::new();
+        t.insert(B, S);
+        t
+    }
+
+    #[test]
+    fn whole_buffer_and_inner_ranges_accepted() {
+        let t = one();
+        assert_eq!(t.check(B, S), Range::Ok { start: B, pages: 16 });
+        assert_eq!(t.check(B, 1), Range::Ok { start: B, pages: 1 });
+        assert_eq!(t.check(B + 15 * PAGE, PAGE), Range::Ok { start: B + 15 * PAGE, pages: 1 });
+        assert_eq!(t.check(B + 4 * PAGE, 8 * PAGE - 5), Range::Ok { start: B + 4 * PAGE, pages: 8 });
+    }
+
+    #[test]
+    fn overlong_ranges_rejected() {
+        let t = one();
+        assert_eq!(t.check(B, S + 1), Range::Bad);
+        assert_eq!(t.check(B + PAGE, S), Range::Bad);
+        assert_eq!(t.check(B + 15 * PAGE, PAGE + 1), Range::Bad);
+    }
+
+    #[test]
+    fn empty_misaligned_and_overflowing_rejected() {
+        let t = one();
+        assert_eq!(t.check(B, 0), Range::Bad);
+        assert_eq!(t.check(B + 8, PAGE), Range::Bad);
+        assert_eq!(t.check(B, u64::MAX), Range::Bad);
+        assert_eq!(t.check(B, u64::MAX - PAGE + 2), Range::Bad);
+        assert_eq!(t.check(B + PAGE, u64::MAX - B), Range::Bad);
+        // A buffer at the top of the address space: every end overflows, no wrap.
+        let mut t = Tokens::new();
+        t.insert(u64::MAX - PAGE + 1, PAGE);
+        assert_eq!(t.check(u64::MAX - PAGE + 1, 2 * PAGE), Range::Bad);
+        assert_eq!(t.check(u64::MAX - PAGE + 1, PAGE), Range::Bad); // its end is not representable
+    }
+
+    #[test]
+    fn outside_every_buffer_is_not_ours() {
+        let t = one();
+        assert_eq!(t.check(B - PAGE, PAGE), Range::NotOurs);
+        assert_eq!(t.check(B + S, PAGE), Range::NotOurs);
+        assert_eq!(t.check(0, PAGE), Range::NotOurs);
+    }
+
+    #[test]
+    fn neighbour_buffer_not_reachable_by_length() {
+        let mut t = one();
+        t.insert(B + S, S); // adjacent, another client's
+        assert_eq!(t.check(B, 2 * S), Range::Bad);
+        assert_eq!(t.check(B + S - PAGE, 2 * PAGE), Range::Bad);
+    }
+
+    #[test]
+    fn authorized_then_freed_is_refused_not_fallthrough() {
+        let mut t = one();
+        assert!(t.authorize(B));
+        t.remove(B); // GEM_CLOSE on another thread between ioctl and pin
+        assert_eq!(t.claim(B, S), Range::Bad);
+        assert_eq!(t.pending(), 0);
+    }
+
+    #[test]
+    fn authorized_then_freed_and_reused_is_refused() {
+        let mut t = one();
+        assert!(t.authorize(B));
+        t.remove(B);
+        t.insert(B, 4 * S); // the pages went to a new (other client's) buffer
+        assert_eq!(t.claim(B, PAGE), Range::Bad);
+        assert_eq!(t.pending(), 0);
+    }
+
+    #[test]
+    fn claim_consumes_one_authorization_and_checks_length() {
+        let mut t = one();
+        assert!(t.authorize(B + PAGE));
+        assert!(t.authorize(B + PAGE));
+        assert_eq!(t.claim(B + PAGE, S), Range::Bad);
+        assert_eq!(t.claim(B + PAGE, S - PAGE), Range::Ok { start: B + PAGE, pages: 15 });
+        assert_eq!(t.pending(), 0);
+        assert!(!t.authorize(B + S)); // nothing live there
+    }
+
+    #[test]
+    fn authorizations_are_bounded() {
+        let mut t = one();
+        for _ in 0..5000 { t.authorize(B); }
+        for i in 0..2000u64 { t.insert(B + S + i * PAGE, PAGE); t.authorize(B + S + i * PAGE); }
+        assert!(t.pending() <= 5000 + 1024);
+    }
+}
+
+/// Stand-in for `mm::buddy` under `mm/src/pageref.rs`: records frees.
+pub mod buddy {
+    pub const PAGE_SIZE: usize = 4096;
+    pub static FREED: spin::Mutex<alloc::vec::Vec<(usize, usize)>> = spin::Mutex::new(alloc::vec::Vec::new());
+    pub fn free(phys: usize, order: usize) {
+        FREED.lock().push((phys, order));
+    }
+}
+
+#[path = "../../../mm/src/pageref.rs"]
+pub mod pageref;
+
+#[cfg(test)]
+mod pageref_tests {
+    //! bomapref (0b341556): a mapping pins every mapped frame; the BO's
+    //! teardown (`free_block_pinned`, NVIDIA `free_run`) must not free a pinned
+    //! page, and each page is freed exactly once, by its last holder.
+    //! Each test uses its own physical range (PAGE_REFS is global).
+    use super::{buddy, pageref};
+    const P: usize = 4096;
+
+    fn freed_in(lo: usize, hi: usize) -> alloc::vec::Vec<(usize, usize)> {
+        let mut v: alloc::vec::Vec<_> = buddy::FREED.lock().iter().copied().filter(|&(p, _)| p >= lo && p < hi).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn unmapped_block_frees_whole() {
+        let b = 0x10_0000_0000;
+        assert!(!pageref::free_block_pinned(b, 3));
+        assert_eq!(freed_in(b, b + 8 * P), [(b, 3)]);
+    }
+
+    #[test]
+    fn mapping_outlives_buffer_then_last_unmap_frees() {
+        let b = 0x20_0000_0000;
+        let pins: alloc::vec::Vec<usize> = (0..8).map(|i| b + i * P).collect();
+        pageref::inc_many(&pins); // mmap of the whole BO
+        assert!(pageref::free_block_pinned(b, 3)); // GEM_CLOSE / RM free while mapped
+        assert!(freed_in(b, b + 8 * P).is_empty(), "pinned pages were freed under a live mapping");
+        for &p in &pins { assert_eq!(pageref::get(p), 1); }
+        for &p in &pins { pageref::unref_or_free(p, 0); } // munmap
+        let want: alloc::vec::Vec<_> = pins.iter().map(|&p| (p, 0)).collect();
+        assert_eq!(freed_in(b, b + 8 * P), want);
+        assert!(!pageref::any_tracked(b, 8 * P));
+    }
+
+    #[test]
+    fn partial_mapping_and_partial_munmap() {
+        let b = 0x30_0000_0000;
+        let pins: alloc::vec::Vec<usize> = (2..6).map(|i| b + i * P).collect();
+        pageref::inc_many(&pins); // mmap of pages 2..6 only
+        assert!(pageref::free_block_pinned(b, 3));
+        // Unpinned pages go at once, the mapped ones stay.
+        let mut want: alloc::vec::Vec<_> = [0, 1, 6, 7].iter().map(|&i| (b + i * P, 0)).collect();
+        assert_eq!(freed_in(b, b + 8 * P), want);
+        pageref::unref_or_free(pins[0], 0); // partial munmap of page 2
+        want.push((pins[0], 0));
+        want.sort();
+        assert_eq!(freed_in(b, b + 8 * P), want);
+        for &p in &pins[1..] { pageref::unref_or_free(p, 0); }
+        assert_eq!(freed_in(b, b + 8 * P).len(), 8);
+    }
+
+    #[test]
+    fn unmap_before_close_leaves_owner_to_free_once() {
+        let b = 0x40_0000_0000;
+        let pins: alloc::vec::Vec<usize> = (0..4).map(|i| b + i * P).collect();
+        pageref::inc_many(&pins);
+        for &p in &pins { pageref::unref_or_free(p, 0); } // munmap first
+        assert!(freed_in(b, b + 4 * P).is_empty());
+        assert!(!pageref::free_block_pinned(b, 2));
+        assert_eq!(freed_in(b, b + 4 * P), [(b, 2)]);
+    }
+
+    #[test]
+    fn two_mappings_of_one_page() {
+        let b = 0x50_0000_0000;
+        pageref::inc_many(&[b]);
+        pageref::inc_many(&[b]); // fork / second mmap
+        assert!(pageref::free_block_pinned(b, 0));
+        pageref::unref_or_free(b, 0);
+        assert!(freed_in(b, b + P).is_empty());
+        pageref::unref_or_free(b, 0);
+        assert_eq!(freed_in(b, b + P), [(b, 0)]);
+    }
+}

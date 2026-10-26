@@ -1,6 +1,8 @@
 # Host unit tests for the GPU-UAPI logic that does not need hardware:
 # drivers/src/syncobj_core.rs (binary + timeline DRM sync objects) and
-# drivers/nvidia/src/uapi_vm.rs (nouveau VM_BIND range bookkeeping). Its own
+# drivers/nvidia/src/uapi_vm.rs (nouveau VM_BIND range bookkeeping),
+# drivers/nvidia/src/mmap_tokens.rs (NVIDIA mmap range checks, L11.9) and
+# mm/src/pageref.rs (BO pages pinned by a mapping, L1.14/L11.9). Its own
 # workspace so it builds for the host, outside the no_std kernel workspace:
 #
 #   cd drivers/uapi-tests && cargo test --target "$(rustc -vV | sed -n "s/host: //p")"
@@ -16,3 +18,6 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+spin = { path = "../../vendor/spin" }
