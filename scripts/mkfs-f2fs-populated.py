@@ -514,6 +514,8 @@ def main():
         
     out_file = sys.argv[1]
     arch = sys.argv[2]
+    if os.path.exists(out_file + ".gpu"):
+        os.remove(out_file + ".gpu")  # stale stamp from a previous build
     
     # 1. Gather files to place in F2FS
     target_arch = "aarch64-unknown-none" if arch == "aarch64" else "x86_64-unknown-none"
@@ -830,6 +832,19 @@ def main():
         gpu_stage = os.path.join(os.path.expanduser(os.environ["LEANDROS_GPU_STAGE"]), f"gpu-stage-{arch}")
         print(f"  GPU ship-set override: {gpu_stage}")
     gpu_lib_dir = f"{gpu_stage}/usr/lib"
+    # Intel ship-set check: iris in the megadriver plus ANV and its ICD json.
+    # Requested (INTEL=1) but missing is fatal; otherwise the flavour is
+    # stamped next to the image (<img>.gpu) so write-usb.sh can refuse a
+    # laptop stick built from a generic image.
+    _gal = f"{gpu_lib_dir}/libgallium-25.3.6.so"
+    _has_intel = (os.path.exists(_gal) and b"iris_screen_create" in open(_gal, "rb").read()
+                  and os.path.exists(f"{gpu_lib_dir}/libvulkan_intel.so")
+                  and os.path.exists(f"{gpu_stage}/usr/share/vulkan/icd.d/intel_icd.{arch}.json"))
+    if arch == "x86_64" and "1" in (os.environ.get("INTEL"), os.environ.get("LEANDROS_GPU_INTEL")) and not _has_intel:
+        sys.exit(f"❌ INTEL=1 but {gpu_stage} lacks iris/libvulkan_intel/intel_icd json "
+                 f"(build: INTEL=1 OUT_SUFFIX=-intel ports/mesa/build-gpu-stack.sh x86_64)")
+    GPU_FLAVOR = "intel" if _has_intel else "generic"
+    print(f"  GPU flavour: {GPU_FLAVOR}")
     if not os.path.exists(f"{gpu_lib_dir}/libgallium-25.3.6.so"):
         print(f"⚠️  no GPU Mesa ship-set at {gpu_stage} — COSMIC will have NO GPU "
               f"renderer in this image (build it: ports/mesa/build-gpu-stack.sh {arch})")
@@ -3134,6 +3149,7 @@ def main():
         import time
         t0 = time.time()
         info = lx_pop.finish(out_file, total_segs, dir_nodes, dir_owner, subdirs, BUILD_TIME)
+        open(out_file + ".gpu", "w").write(GPU_FLAVOR + "\n")
         print(f"Created lx populated F2FS image at {out_file} in {time.time() - t0:.1f}s: {info}")
         return
 
@@ -3237,6 +3253,7 @@ def main():
     from sparseimg import write_sparse
     write_sparse(out_file, image)
         
+    open(out_file + ".gpu", "w").write(GPU_FLAVOR + "\n")
     print(f"🎉 Created populated F2FS image at {out_file} (size: {len(image)} bytes)")
     print(f"   Allocated {valid_blocks_count} blocks starting at MAIN_BLKADDR {MAIN_BLKADDR}")
 

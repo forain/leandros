@@ -230,6 +230,16 @@ if [[ "$F2FS_IMG" -ot "$KERNEL" ]]; then
     die "$F2FS_IMG is older than $KERNEL — rerun ./scripts/build-all.sh"
 fi
 
+# x86_64 sticks boot Intel laptops: the root image must carry the Intel GPU
+# ship-set (iris + ANV), else gpuprobe falls back to softpipe and greetd refuses
+# COSMIC. mkfs-f2fs-populated.py stamps the flavour in <img>.gpu; build with
+# `INTEL=1 ./scripts/build-all.sh`. LEANDROS_USB_ALLOW_GENERIC_GPU=1 overrides.
+if [[ "$ARCH" == x86_64 && "${LEANDROS_USB_ALLOW_GENERIC_GPU:-0}" != 1 ]]; then
+    if [[ "$(cat "$F2FS_IMG.gpu" 2>/dev/null)" != intel ]]; then
+        die "$F2FS_IMG has no Intel GPU ship-set (iris/ANV) — rebuild with INTEL=1 ./scripts/build-all.sh (or LEANDROS_USB_ALLOW_GENERIC_GPU=1 to override)"
+    fi
+fi
+
 if [[ "$ARCH" == x86_64 ]]; then
     [[ -f "$LIMINE_DIR/limine-bios.sys" ]] || die "missing $LIMINE_DIR/limine-bios.sys — run ./scripts/build-all.sh first"
 fi
