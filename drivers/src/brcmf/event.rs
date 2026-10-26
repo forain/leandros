@@ -1,1 +1,1 @@
-//! brcmf event: not written yet.
+//! Firmware event parsing (lane pibrcmf-net).

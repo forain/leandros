@@ -38,7 +38,12 @@ pub const KEXEC_FILE_NO_INITRAMFS: usize = 4;
 
 #[cfg(target_arch = "x86_64")]
 const INITRD_PHYS: u64 = 0x1000_0000;
-#[cfg(target_arch = "aarch64")]
+// Where the next kernel looks for its initrd: the Pi 5 kernel probes
+// 0x1000_0000 (the firmware's `initramfs ... 0x10000000`, main.rs) and would
+// otherwise find the OLD initrd still sitting there.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+const INITRD_PHYS: u64 = 0x1000_0000;
+#[cfg(all(target_arch = "aarch64", not(feature = "rpi5")))]
 const INITRD_PHYS: u64 = 0x4800_0000;
 
 #[cfg(target_arch = "x86_64")]
@@ -198,6 +203,18 @@ fn do_load(kfd: usize, initrd_fd: Option<usize>, cmdline: &[u8]) -> Result<Image
         }
     }
 
+    // ...and none may land on a firmware-reserved range (BL31 on the Pi 5).
+    #[cfg(target_arch = "aarch64")]
+    {
+        let g = crate::DTB_RESERVED.lock();
+        for &(s, e) in &footprint {
+            if let Some(&(rs, re)) = g.0[..g.1].iter().find(|&&(rs, re)| s < re && rs < e) {
+                crate::serial_print_str(&alloc::format!(
+                    "[KEXEC] destination {}-{} overlaps DTB reserved {}-{}\n", hex(s), hex(e), hex(rs), hex(re)));
+                return Err(EADDRNOTAVAIL);
+            }
+        }
+    }
     let mut forbidden = footprint.clone();
     #[cfg(target_arch = "x86_64")]
     forbidden.push((0, 0x10_0000));

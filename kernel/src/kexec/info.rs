@@ -186,6 +186,15 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, a: &mut Alloc) -> R
         .map(|r| MemoryRegion { base: r.base, length: r.length, kind: boot::mb2_build::mb2_kind(r.raw_type) })
         .collect();
     work.push(MemoryRegion { base: dtb as u64, length: dtb_len, kind: boot::MemoryType::Reserved });
+    // The firmware DTB's reserved ranges (BL31 on the Pi 5): this FDT has no
+    // `/reserved-memory`, so they must not appear in its `/memory` at all.
+    {
+        let g = crate::DTB_RESERVED.lock();
+        for &(s, e) in &g.0[..g.1] {
+            work.push(MemoryRegion { base: s, length: e - s, kind: boot::MemoryType::Reserved });
+            crate::serial_print_str(&alloc::format!("[KEXEC] carrying DTB reserved {:#x}-{:#x} (left out of /memory)\n", s, e));
+        }
+    }
     let n = work.len();
     let mut bounds = alloc::vec![0u64; 2 * n + 2];
     let mut out = alloc::vec![MemoryRegion::EMPTY; 2 * n + 2];

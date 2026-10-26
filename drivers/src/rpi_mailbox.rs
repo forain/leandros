@@ -404,6 +404,16 @@ unsafe fn spin_until(mut still_blocked: impl FnMut() -> bool) -> bool {
 
 // ── The protocol ──────────────────────────────────────────────────────────────
 
+/// Kernel virtual address of the mailbox registers for calls made after
+/// boot, when the HHDM no longer maps them (0 = use `MBOX_BASE_PHYS + hhdm`).
+static MBOX_VIRT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Routes later [`property_call`]s through an ioremapped mailbox window
+/// (`virt` maps `MBOX_BASE_PHYS`). Used by the V3D clock bring-up.
+pub fn set_mbox_virt(virt: usize) {
+    MBOX_VIRT.store(virt, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Send one complete property message and wait for the reply.
 ///
 /// `words` must already be a whole message — total size in bytes at `[0]`,
@@ -442,7 +452,10 @@ pub unsafe fn property_call(
         dst.add(i).mmio_write(*w);
     }
 
-    let mbox = MBOX_BASE_PHYS + hhdm_offset;
+    let mbox = match MBOX_VIRT.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => MBOX_BASE_PHYS + hhdm_offset,
+        v => v,
+    };
 
     // Push the request out of our caches so the VideoCore, reading around them,
     // sees it. `dsb sy` then orders that against the doorbell store below.
@@ -497,7 +510,10 @@ pub unsafe fn property_call(
     arch_dcache_clean_inval_range(buf_virt, BUF_WORDS * 4);
 
     let reply = core::slice::from_raw_parts(buf_virt as *const u32, BUF_WORDS);
-    log_dump(reply);
+    // Late callers (set_mbox_virt) log their own decoded values instead.
+    if MBOX_VIRT.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        log_dump(reply);
+    }
 
     if reply[1] != RESP_SUCCESS {
         return Err(MboxError::BadCode(reply[1]));

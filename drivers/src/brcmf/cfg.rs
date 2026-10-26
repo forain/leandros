@@ -1,1 +1,1 @@
-//! brcmf cfg: not written yet.
+//! cfg80211-style connect/scan logic (lane pibrcmf-net).
