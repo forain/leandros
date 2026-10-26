@@ -30,7 +30,7 @@ pub mod drm_console;
 pub mod console_commands;
 pub mod console_properties;
 pub mod drm_device_interface;
-pub mod drm_mmap_policy;
+pub mod device_mmap_policy;
 pub mod drm_offset;
 /// Pure DRM sync-object state (binary + timeline); host-tested in drivers/uapi-tests.
 pub mod syncobj_core;
