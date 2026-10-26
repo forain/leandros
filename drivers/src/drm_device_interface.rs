@@ -1401,15 +1401,29 @@ static BO_FREES_DEFERRED: AtomicU64 = AtomicU64::new(0);
 /// A GPU backend's own pin for its mmap tokens (same contract as
 /// `mmap_pin_frames`), registered by a backend whose buffers are guest RAM it
 /// frees with `mm::pageref::free_block_pinned` (NVIDIA sysmem, L11.9).
-pub static BACKEND_MMAP_PIN: spin::Mutex<Option<fn(usize, usize) -> Option<alloc::vec::Vec<usize>>>> =
+pub static BACKEND_MMAP_PIN: spin::Mutex<Option<fn(usize, usize, u32) -> Option<alloc::vec::Vec<usize>>>> =
     spin::Mutex::new(None);
 
-pub fn mmap_pin_frames(token: usize, len: usize) -> Option<alloc::vec::Vec<usize>> {
+///
+/// `open_id` is the mapping open (the VFS cookie the mmap ioctl saw; 0 =
+/// kernel-internal, unscoped). The buffer must still be one that open may map
+/// when the frames are pinned: the ioctl's ownership check ran earlier, and
+/// the buffer it vouched for may have been freed (GEM_CLOSE on another thread)
+/// and its frames handed to another client's buffer since (openbugs #94).
+/// Dumb buffers are checked under the same lock as the pin; scattered and
+/// blob buffers are pinned first and verified after (pinned frames cannot be
+/// reused), and released again if the open does not own them.
+pub fn mmap_pin_frames(token: usize, len: usize, open_id: u32) -> Option<alloc::vec::Vec<usize>> {
     if token == 0 || len == 0 || token & 0xFFF != 0 { return None; }
     let ext = *BACKEND_MMAP_PIN.lock();
     if let Some(f) = ext {
-        if let Some(v) = f(token, len) { return Some(v); }
+        if let Some(v) = f(token, len, open_id) { return Some(v); }
     }
+    let unpin = |frames: alloc::vec::Vec<usize>| -> alloc::vec::Vec<usize> {
+        for &p in frames.iter() { mm::pageref::unref_or_free(p, 0); }
+        alloc::vec::Vec::new()
+    };
+    let dumb_ok = |b: &DumbBuf| b.handle_live && (open_id == 0 || b.owner == 0 || b.owner == open_id);
     let pages = (len + 4095) / 4096;
     let pin = |frames: alloc::vec::Vec<usize>| -> alloc::vec::Vec<usize> {
         mm::pageref::inc_many(&frames);
@@ -1418,7 +1432,7 @@ pub fn mmap_pin_frames(token: usize, len: usize) -> Option<alloc::vec::Vec<usize
     // Scattered: the token is the first frame, the mapping starts there.
     {
         let sg = DUMB_SG.lock();
-        if let Some(runs) = sg.values().find(|f| f.first().map(|&(p, _)| p) == Some(token)) {
+        if let Some((&obj, runs)) = sg.iter().find(|(_, f)| f.first().map(|&(p, _)| p) == Some(token)) {
             let mut v = alloc::vec::Vec::with_capacity(pages);
             'outer: for &(p, o) in runs.iter() {
                 for i in 0..(1usize << o) {
@@ -1427,7 +1441,10 @@ pub fn mmap_pin_frames(token: usize, len: usize) -> Option<alloc::vec::Vec<usize
                 }
             }
             if v.len() < pages { return Some(alloc::vec::Vec::new()); }
-            return Some(pin(v));
+            let v = pin(v);
+            drop(sg);
+            let owned = DUMB_BUFFERS.lock().values().any(|b| b.sg && b.obj == obj && dumb_ok(b));
+            return Some(if owned { v } else { unpin(v) });
         }
     }
     // 0 = not this BO, 1 = range inside it, 2 = starts inside, runs past.
@@ -1439,14 +1456,27 @@ pub fn mmap_pin_frames(token: usize, len: usize) -> Option<alloc::vec::Vec<usize
     let range = || (0..pages).map(|i| token + i * 4096).collect::<alloc::vec::Vec<usize>>();
     {
         let m = DUMB_BUFFERS.lock();
-        if let Some(c) = m.values().filter(|b| !b.sg).map(|b| contained(b.phys, b.order)).find(|&c| c != 0) {
+        let mut hit = false;
+        if let Some(c) = m.values().filter(|b| !b.sg).filter(|b| {
+            let c = contained(b.phys, b.order);
+            hit |= c != 0;
+            c != 0 && dumb_ok(b)
+        }).map(|b| contained(b.phys, b.order)).next() {
             return Some(if c == 1 { pin(range()) } else { alloc::vec::Vec::new() });
         }
+        // A dumb buffer, but not one this open may map (another client's,
+        // or a retired handle kept only for an exported fd).
+        if hit { return Some(alloc::vec::Vec::new()); }
     }
     {
         let m = BLOB_OBJS.lock();
-        if let Some(c) = m.values().map(|o| contained(o.phys, o.order)).find(|&c| c != 0) {
-            return Some(if c == 1 { pin(range()) } else { alloc::vec::Vec::new() });
+        if let Some((obj, c)) = m.iter().map(|(&k, o)| (k, contained(o.phys, o.order))).find(|&(_, c)| c != 0) {
+            if c != 1 { return Some(alloc::vec::Vec::new()); }
+            let v = pin(range());
+            drop(m);
+            let owned = BLOB_BUFFERS.lock().values()
+                .any(|h| h.obj == obj && (open_id == 0 || h.owner == 0 || h.owner == open_id));
+            return Some(if owned { v } else { unpin(v) });
         }
     }
     None

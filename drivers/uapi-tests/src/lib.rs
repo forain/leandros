@@ -691,3 +691,45 @@ mod pageref_tests {
         assert_eq!(freed_in(b, b + P), [(b, 0)]);
     }
 }
+
+#[path = "../../src/drm_mmap_policy.rs"]
+pub mod drm_mmap_policy;
+
+#[cfg(test)]
+mod drm_mmap_policy_tests {
+    //! L1.14 (openbugs #94): a DRM mmap whose pin finds no live buffer must
+    //! never become an unreferenced device mapping of RAM.
+    use super::drm_mmap_policy::*;
+
+    #[test]
+    fn freed_between_ioctl_and_pin_is_refused() {
+        // GEM_CLOSE on another thread after the ioctl: the pin finds nothing,
+        // the token is a physical address of (now free) RAM.
+        assert_eq!(decide(true, Pin::NotGuestRam, Window::NotWindow, true), Decision::Refuse);
+    }
+
+    #[test]
+    fn pinned_buffer_maps_its_frames() {
+        assert_eq!(decide(true, Pin::Pinned, Window::NotWindow, true), Decision::MapPinned);
+    }
+
+    #[test]
+    fn refusals_win() {
+        assert_eq!(decide(true, Pin::Refused, Window::NotWindow, true), Decision::Refuse);
+        assert_eq!(decide(true, Pin::NotGuestRam, Window::Refused, false), Decision::Refuse);
+        assert_eq!(decide(false, Pin::Refused, Window::NotWindow, false), Decision::Refuse);
+    }
+
+    #[test]
+    fn apertures_and_windows_keep_device_mappings() {
+        // Firmware framebuffer, i915 GTT aperture, NVIDIA BAR: not RAM.
+        assert_eq!(decide(true, Pin::NotGuestRam, Window::NotWindow, false), Decision::MapDevice);
+        // virtio-gpu host-visible blob: a held window span.
+        assert_eq!(decide(true, Pin::NotGuestRam, Window::Held, false), Decision::MapDevice);
+    }
+
+    #[test]
+    fn other_device_servers_unchanged() {
+        assert_eq!(decide(false, Pin::NotGuestRam, Window::NotWindow, true), Decision::MapDevice);
+    }
+}

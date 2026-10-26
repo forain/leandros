@@ -3013,9 +3013,13 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         // framebuffer, host-visible window, GPU apertures) keep the plain
         // device mapping. Asked before the AS hold (the BO maps are never
         // taken under it).
-        let pinned = if matches!(kind, Some(vfs::VnodeKind::DynamicDevice { .. })) {
-            drivers::drm_device_interface::mmap_pin_frames(phys_addr, len)
-        } else { None };
+        let (pinned, drm_node) = match kind {
+            Some(vfs::VnodeKind::DynamicDevice { port, dev_id, open_id }) => (
+                drivers::drm_device_interface::mmap_pin_frames(phys_addr, len, open_id as u32),
+                vfs::dynamic_device_major(port, dev_id) == Some(226),
+            ),
+            _ => (None, false),
+        };
         if pinned.as_ref().map_or(false, |f| f.is_empty()) { return -22; }
         // L1.14, host-visible window (no guest RAM to pin): the window span is
         // held by its map count until this VMA goes (munmap / exit release it
@@ -3024,6 +3028,25 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         // names no live span, or a length running past it, is refused.
         let win_pin = drivers::drm_device_interface::mmap_pin_window(phys_addr, len);
         if win_pin == Some(false) { return -22; } // (window tokens are never RAM: `pinned` is None)
+        // openbugs #94: a DRM token that pinned nothing and is no window span
+        // is mapped unreferenced -- only acceptable for MMIO / BAR / firmware
+        // framebuffer. RAM here means the buffer the ioctl vouched for was
+        // freed (GEM_CLOSE on another thread) before the pin, and its frames
+        // may already belong to someone else (drivers/src/drm_mmap_policy.rs).
+        {
+            use drivers::drm_mmap_policy::{decide, Decision, Pin, Window};
+            let p = match &pinned { None => Pin::NotGuestRam, Some(f) if f.is_empty() => Pin::Refused, Some(_) => Pin::Pinned };
+            let w = match win_pin { None => Window::NotWindow, Some(false) => Window::Refused, Some(true) => Window::Held };
+            let ram = drm_node && p == Pin::NotGuestRam && w == Window::NotWindow && mm::buddy::is_ram(phys_addr, len);
+            if decide(drm_node, p, w, ram) == Decision::Refuse {
+                if MMAP_DRM_REFUSED.fetch_add(1, Ordering::Relaxed) < 32 {
+                    crate::serial_print_str("[MMAP] DRM token names RAM but no live buffer (freed before pin) ");
+                    crate::serial_print_hex(phys_addr);
+                    crate::serial_print_str("\n");
+                }
+                return -22;
+            }
+        }
         let release_pins = |f: &alloc::vec::Vec<usize>| {
             for &p in f.iter() { mm::pageref::unref_or_free(p, 0); }
         };

@@ -610,7 +610,9 @@ impl State {
                 if let Some((s, l)) = v.map.remove_obj(obj) { unmap_range(&mut v.pt, s, l); }
             }
             MMAP_TOKENS.lock().remove(&b.phys);
-            mm::buddy::free(b.phys as usize, b.order);
+            // A CPU mapping pins each frame it maps (`mmap_pin`): those pages
+            // go back to the allocator when the last mapping does.
+            mm::pageref::free_block_pinned(b.phys as usize, b.order);
             ulog!(2, "bo {} freed ({} KiB)", obj, b.size >> 10);
         }
     }
@@ -1627,6 +1629,30 @@ fn mmap(token: u64, open_id: u32) -> Option<(u64, bool)> {
     None
 }
 
+/// sys_mmap's page pin for an i915 token (`BACKEND_MMAP_PIN`). i915 objects
+/// are guest RAM: an unpinned device mapping of one outlived GEM_CLOSE (the
+/// frames went back to the allocator under a live user mapping), and a
+/// buffer freed between the mmap ioctl and this pin made the kernel map the
+/// freed frames (openbugs #94). Under STATE, as `reap` frees: the range must
+/// lie inside one live object this open (`open_id`, 0 = unscoped) holds a
+/// handle on; each frame then carries a reference the VMA drops on unmap.
+/// None: not an i915 object (the DRM layer decides); Some(empty): refused.
+fn mmap_pin(token: usize, len: usize, open_id: u32) -> Option<Vec<usize>> {
+    let st = STATE.lock();
+    let t = token as u64;
+    let (&obj, b) = st.bos.iter().find(|(_, b)| t >= b.phys && t - b.phys < b.size)?;
+    let mine = open_id == 0 || st.opens.get(&open_id)
+        .map_or(false, |o| o.handles.values().any(|&h| h == obj));
+    let pages = ((len as u64).checked_add(4095)? / 4096) as usize;
+    let end = t.checked_add(pages as u64 * 4096)?;
+    if b.dead || !mine || t & 0xFFF != 0 || len == 0 || end > b.phys + b.size {
+        return Some(Vec::new());
+    }
+    let v: Vec<usize> = (0..pages).map(|i| token + i * 4096).collect();
+    mm::pageref::inc_many(&v);
+    Some(v)
+}
+
 /// GEM_CLOSE: ours only if this open has the handle; anything else falls
 /// through to the DRM layer (dumb/blob handles, or its unknown-handle answer).
 fn gem_close(handle: u32, open_id: u32) -> Option<Result<usize, DriverError>> {
@@ -1896,6 +1922,7 @@ pub(crate) fn register(d: &super::Device, mode: Mode, sseu: Sseu, cs_hz: u32) {
     *INFO.lock() = Some(Info { facts, mode, mmio: d.mmio.va, slot, subsys, revision });
     MODE_FAKE.store((mode == Mode::Fake) as u32, Ordering::Relaxed);
     crate::gpu_uapi::register(&BACKEND);
+    *crate::drm_device_interface::BACKEND_MMAP_PIN.lock() = Some(mmap_pin);
     ilog!("==== G3 UAPI registered: /dev/dri/card0 + renderD128 answer 'i915' 1.6.0 for 8086:{:04x} rev {:02x} at {:02x}:{:02x}.{}; \
            engines rcs0+bcs0{}, {} EUs, CS timestamp {} Hz; execution: {} ====",
           d.platform.device, revision, slot.0, slot.1, slot.2, if vcs { "+vcs0" } else { "" }, sseu.eu_total, cs_hz,
