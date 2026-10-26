@@ -446,7 +446,7 @@ fn sit_valid(ms: &mut MountState, blk: u64) -> bool {
     if seg >= ms.sb.seg_cnt_main { return true; }
     let (blkno, off) = sit_entry_loc(ms, seg);
     let sit = ms.cache.read(ms.dev, blkno);
-    sit[off + SIT_VMAP_OFF + b as usize / 8] & sit_vbit(ms.sb.fmt, b as usize) != 0
+    sit[off + SIT_VMAP_OFF + b as usize / 8] & sit_vbit(b as usize) != 0
 }
 
 fn is_fresh(ms: &MountState, blk: u64) -> bool {
@@ -479,7 +479,7 @@ fn nat_clear(ms: &mut MountState, nid: u32) {
         let cur = ms.cache.read(ms.dev, nat_blk as u64);
         if r32(cur, off + 1) == 0 && r32(cur, off + 5) == 0 { return; }
         // lx: an inode's NAT entry names itself as owner.
-        if ms.sb.fmt.lx && nid >= 3 && r32(cur, off + 1) == nid && r32(cur, off + 5) != 0 {
+        if nid >= 3 && r32(cur, off + 1) == nid && r32(cur, off + 5) != 0 {
             ms.cp.valid_inodes = ms.cp.valid_inodes.saturating_sub(1);
         }
     }
@@ -643,7 +643,7 @@ fn pick_ext(ms: &mut MountState, out: &mut [u32; CPJ_EXT_MAX], n: usize) -> bool
     while cnt < n && seg > 0 {
         seg -= 1;
         if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno || prot_any(ms, seg) { continue; }
-        if ms.sb.fmt.lx && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
+        if ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
         let (blkno, off) = sit_entry_loc(ms, seg);
         let vb = r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK;
         if vb == 0 { out[cnt] = seg; cnt += 1; }
@@ -983,11 +983,11 @@ fn tree(ms: &mut MountState, ino: u32) -> (Vec<(u32, u32)>, Vec<(u32, u32, u16)>
     if ia == 0 { return (nodes, data); }
     nodes.push((ino, ia));
     let ib = read_block_copy(ms, ia);
-    for i in 0..inode_max_direct(ms.sb.fmt, &ib) {
-        let a = inode_get_blkaddr(ms.sb.fmt, &ib, i);
+    for i in 0..inode_max_direct(&ib) {
+        let a = inode_get_blkaddr(&ib, i);
         if a != 0 { data.push((a, ino, i as u16)); }
     }
-    let x = r32(&ib, ms.sb.fmt.xattr());
+    let x = r32(&ib, I_XATTR_NID);
     if x != 0 { let a = nat_lookup(ms, x); if a != 0 { nodes.push((x, a)); } }
     fn dnode(ms: &mut MountState, nid: u32, nodes: &mut Vec<(u32, u32)>, data: &mut Vec<(u32, u32, u16)>) {
         if nid == 0 { return; }
@@ -995,7 +995,7 @@ fn tree(ms: &mut MountState, ino: u32) -> (Vec<(u32, u32)>, Vec<(u32, u32, u16)>
         if a == 0 { return; }
         nodes.push((nid, a));
         let b = read_block_copy(ms, a);
-        for i in 0..ms.sb.fmt.per_block() { let d = dnode_get_blkaddr(ms.sb.fmt, &b, i); if d != 0 { data.push((d, nid, i as u16)); } }
+        for i in 0..ADDRS_PER_BLOCK { let d = dnode_get_blkaddr(&b, i); if d != 0 { data.push((d, nid, i as u16)); } }
     }
     fn indirect(ms: &mut MountState, nid: u32, nodes: &mut Vec<(u32, u32)>, data: &mut Vec<(u32, u32, u16)>) {
         if nid == 0 { return; }
@@ -1003,19 +1003,19 @@ fn tree(ms: &mut MountState, ino: u32) -> (Vec<(u32, u32)>, Vec<(u32, u32, u16)>
         if a == 0 { return; }
         nodes.push((nid, a));
         let b = read_block_copy(ms, a);
-        for i in 0..ms.sb.fmt.per_block() { dnode(ms, dnode_get_blkaddr(ms.sb.fmt, &b, i), nodes, data); }
+        for i in 0..ADDRS_PER_BLOCK { dnode(ms, dnode_get_blkaddr(&b, i), nodes, data); }
     }
-    dnode(ms, inode_get_nid(ms.sb.fmt, &ib, 0), &mut nodes, &mut data);
-    dnode(ms, inode_get_nid(ms.sb.fmt, &ib, 1), &mut nodes, &mut data);
-    indirect(ms, inode_get_nid(ms.sb.fmt, &ib, 2), &mut nodes, &mut data);
-    indirect(ms, inode_get_nid(ms.sb.fmt, &ib, 3), &mut nodes, &mut data);
-    let dn = inode_get_nid(ms.sb.fmt, &ib, 4);
+    dnode(ms, inode_get_nid(&ib, 0), &mut nodes, &mut data);
+    dnode(ms, inode_get_nid(&ib, 1), &mut nodes, &mut data);
+    indirect(ms, inode_get_nid(&ib, 2), &mut nodes, &mut data);
+    indirect(ms, inode_get_nid(&ib, 3), &mut nodes, &mut data);
+    let dn = inode_get_nid(&ib, 4);
     if dn != 0 {
         let a = nat_lookup(ms, dn);
         if a != 0 {
             nodes.push((dn, a));
             let b = read_block_copy(ms, a);
-            for i in 0..ms.sb.fmt.per_block() { indirect(ms, dnode_get_blkaddr(ms.sb.fmt, &b, i), &mut nodes, &mut data); }
+            for i in 0..ADDRS_PER_BLOCK { indirect(ms, dnode_get_blkaddr(&b, i), &mut nodes, &mut data); }
         }
     }
     (nodes, data)
@@ -1060,7 +1060,7 @@ pub(crate) fn fsync_rf(port: u32, ino: u32) -> Option<Result<(), ()>> {
                 if m.owner == ino && sit_valid(ms, m.blk_no) { data_idx.push(i); }
                 continue;
             }
-            let (nid, own) = { let f = ms.sb.fmt; let d = ms.cache.data(i); (f.footer_nid(d), f.footer_ino(d)) };
+            let (nid, own) = { let d = ms.cache.data(i); (footer_nid(d), footer_ino(d)) };
             if own == ino && nid != 0 && nat_lookup(ms, nid) as u64 == m.blk_no { node_idx.push((i, nid)); }
         }
         if node_idx.is_empty() && data_idx.is_empty() && !dentry { return Some(Ok(())); }
@@ -1257,17 +1257,15 @@ pub(crate) fn recover(ms: &mut MountState, rf_start: u32, tail: u32) -> u32 {
         // were set in the cache when the blocks were allocated and lost with
         // it; fsck.f2fs checks every valid block's SSA entry (owner nid,
         // ofs_in_node, version) and each segment's SIT type class.
-        if ms.sb.fmt.lx {
-            for &(nid, a) in &new_n {
-                if old_a.contains(&a) { continue; }
-                lx_type_class(ms, a, true);
-                crate::ssa_set(ms, a, nid, 0, None);
-            }
-            for &(a, nid, ofs) in &new_d {
-                if old_a.contains(&a) { continue; }
-                lx_type_class(ms, a, false);
-                crate::ssa_set(ms, a, nid, ofs, None);
-            }
+        for &(nid, a) in &new_n {
+            if old_a.contains(&a) { continue; }
+            lx_type_class(ms, a, true);
+            crate::ssa_set(ms, a, nid, 0, None);
+        }
+        for &(a, nid, ofs) in &new_d {
+            if old_a.contains(&a) { continue; }
+            lx_type_class(ms, a, false);
+            crate::ssa_set(ms, a, nid, ofs, None);
         }
         let new_ids: BTreeSet<u32> = new_n.iter().map(|x| x.0).collect();
         for &(nid, _) in &old_n { if !new_ids.contains(&nid) { nat_clear(ms, nid); } }
@@ -1373,7 +1371,6 @@ pub(crate) fn recover_linux(ms: &mut MountState, chain: &[LxChain]) -> u32 {
 /// storing the child nid at the last level. Allocated blocks go to `pre`.
 fn lx_attach(ms: &mut MountState, ino: u32, ofs: u32, nid: u32, pre: &mut Vec<u32>) -> Result<(), &'static str> {
     let n = LX_N;
-    let f = ms.sb.fmt;
     // (i_nid slot, [(offset of the indirect node, child index)])
     let slot: usize;
     let lv: [(u32, usize); 2];
@@ -1390,11 +1387,11 @@ fn lx_attach(ms: &mut MountState, ino: u32, ofs: u32, nid: u32, pre: &mut Vec<u3
     } else { return Err("bad node offset"); }
     let ia = nat_lookup(ms, ino);
     if ia == 0 { return Err("inode gone"); }
-    let mut cur = { let b = ms.cache.read(ms.dev, ia as u64); inode_get_nid(f, b, slot) };
+    let mut cur = { let b = ms.cache.read(ms.dev, ia as u64); inode_get_nid(b, slot) };
     if cur == 0 {
         cur = take_nid(ms).ok_or("no nid")?;
         let b = ms.cache.get_mut(ms.dev, ia as u64);
-        inode_set_nid(f, b, slot, cur);
+        inode_set_nid(b, slot, cur);
     }
     for k in 0..depth {
         let (nofs, idx) = lv[k];
@@ -1402,7 +1399,7 @@ fn lx_attach(ms: &mut MountState, ino: u32, ofs: u32, nid: u32, pre: &mut Vec<u3
         if a == 0 {
             a = crate::alloc_node_block(ms).ok_or("no space")?;
             let mut buf = [0u8; BLOCK_SIZE];
-            f.write_footer(&mut buf, cur, ino, nofs);
+            write_footer(&mut buf, cur, ino, nofs);
             ms.cache.write(ms.dev, a as u64, &buf);
             crate::nat_update_owned(ms, cur, Some(ino), a);
             if cur >= ms.cp.next_free_nid { ms.cp.next_free_nid = cur + 1; }
@@ -1410,11 +1407,11 @@ fn lx_attach(ms: &mut MountState, ino: u32, ofs: u32, nid: u32, pre: &mut Vec<u3
             pre.push(a);
         }
         let child = if k + 1 == depth { nid } else {
-            let c = { let b = ms.cache.read(ms.dev, a as u64); dnode_get_blkaddr(f, b, idx) };
+            let c = { let b = ms.cache.read(ms.dev, a as u64); dnode_get_blkaddr(b, idx) };
             if c != 0 { c } else { take_nid(ms).ok_or("no nid")? }
         };
         let b = ms.cache.get_mut(ms.dev, a as u64);
-        if dnode_get_blkaddr(f, b, idx) != child { dnode_set_blkaddr(f, b, idx, child); }
+        if dnode_get_blkaddr(b, idx) != child { dnode_set_blkaddr(b, idx, child); }
         cur = child;
     }
     Ok(())
