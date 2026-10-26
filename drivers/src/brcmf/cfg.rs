@@ -1,0 +1,825 @@
+//! FullMAC control: the init sequence, escan, WPA2-PSK join through the
+//! firmware supplicant, link tracking, disconnect and reconnect. Written
+//! only against the frozen [`Fwil`] / [`RxSink`] seam, so it runs the same
+//! over the real BCDC/SDPCM stack and over the host tests' mock.
+//!
+//! The firmware does the MLME and the 4-way handshake ("sup_wpa"); the host
+//! only configures security, asks to join, and follows the events:
+//!
+//! * join done = `LINK` with the link flag, plus (keyed networks) `PSK_SUP`
+//!   with status FWSUP_COMPLETED;
+//! * join failed = `SET_SSID` with a non-success status, a `PSK_SUP` failure,
+//!   or a deauth/disassoc/link-down before both of the above;
+//! * link lost = `DEAUTH(_IND)`, `DISASSOC(_IND)` or `LINK` without the flag.
+//!
+//! Every wait is bounded by the caller's timeout and services the bus
+//! through [`Fwil::poll`]; nothing here can hang.
+
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+
+use super::event::{self, ev, status, EventMask};
+use super::fwil::{FwError, Fwil, RxSink};
+
+/// WLC ioctl numbers (`BRCMF_C_*`).
+pub mod cmd {
+    pub const UP: u32 = 2;
+    pub const DOWN: u32 = 3;
+    pub const GET_RATE: u32 = 12;
+    pub const SET_INFRA: u32 = 20;
+    pub const SET_AUTH: u32 = 22;
+    pub const GET_BSSID: u32 = 23;
+    pub const SET_SSID: u32 = 26;
+    pub const SET_PASSIVE_SCAN: u32 = 49;
+    pub const DISASSOC: u32 = 52;
+    pub const GET_RSSI: u32 = 127;
+    pub const SET_WSEC: u32 = 134;
+    pub const SET_WPA_AUTH: u32 = 165;
+    pub const SET_WSEC_PMK: u32 = 268;
+}
+
+pub const WSEC_NONE: u32 = 0;
+pub const WSEC_AES: u32 = 0x4;
+pub const WPA_AUTH_DISABLED: u32 = 0;
+pub const WPA2_AUTH_PSK: u32 = 0x80;
+/// `brcmf_wsec_pmk_le.flags`: the key is an ASCII passphrase (the firmware
+/// runs PBKDF2 itself).
+pub const WSEC_PASSPHRASE: u16 = 1;
+pub const PMK_STRUCT_LEN: usize = 70;
+pub const ESCAN_REQ_VERSION: u32 = 1;
+pub const ESCAN_ACTION_START: u16 = 1;
+pub const ESCAN_ACTION_ABORT: u16 = 3;
+pub const BSS_INFO_MIN: usize = 128;
+/// 802.11 reason "leaving" for our own disassociation.
+pub const REASON_LEAVING: u32 = 3;
+/// Received data frames held before the net server takes them.
+pub const RX_QUEUE_MAX: usize = 256;
+
+/// What the driver needs from its environment (kernel or test).
+#[derive(Clone, Copy)]
+pub struct Env {
+    pub now_ms: fn() -> u64,
+    pub sleep_ms: fn(u64),
+    /// One line, no `[brcmf]` prefix, no newline. Never given secrets.
+    pub log: fn(&str),
+}
+
+fn le16(b: &[u8], o: usize) -> u16 { u16::from_le_bytes([b[o], b[o + 1]]) }
+fn le32(b: &[u8], o: usize) -> u32 { u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) }
+
+// ── scan results ───────────────────────────────────────────────────────────
+
+/// One BSS from an `ESCAN_RESULT` (`brcmf_bss_info_le`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BssEntry {
+    pub bssid: [u8; 6],
+    pub ssid: Vec<u8>,
+    pub channel: u8,
+    pub chanspec: u16,
+    pub rssi: i8,
+    pub capability: u16,
+    pub beacon_period: u16,
+    pub ies: Vec<u8>,
+}
+
+impl BssEntry {
+    /// The BSS as a beacon MPDU (header + fixed fields + IEs), so the shared
+    /// 802.11 parser (`wifi_frame::parse_beacon`) reads its RSN, rates, HT.
+    pub fn beacon_frame(&self) -> Vec<u8> {
+        let mut f = Vec::with_capacity(36 + self.ies.len());
+        f.extend_from_slice(&[0x80, 0x00, 0, 0]);
+        f.extend_from_slice(&[0xff; 6]);
+        f.extend_from_slice(&self.bssid);
+        f.extend_from_slice(&self.bssid);
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(&[0; 8]);
+        f.extend_from_slice(&self.beacon_period.to_le_bytes());
+        f.extend_from_slice(&self.capability.to_le_bytes());
+        f.extend_from_slice(&self.ies);
+        f
+    }
+
+    /// Encode as `brcmf_bss_info_le` (tests and mocks).
+    pub fn to_bss_info(&self) -> Vec<u8> {
+        let mut b = alloc::vec![0u8; BSS_INFO_MIN];
+        let len = BSS_INFO_MIN + self.ies.len();
+        b[0..4].copy_from_slice(&109u32.to_le_bytes());
+        b[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+        b[8..14].copy_from_slice(&self.bssid);
+        b[14..16].copy_from_slice(&self.beacon_period.to_le_bytes());
+        b[16..18].copy_from_slice(&self.capability.to_le_bytes());
+        let sl = self.ssid.len().min(32);
+        b[18] = sl as u8;
+        b[19..19 + sl].copy_from_slice(&self.ssid[..sl]);
+        b[72..74].copy_from_slice(&self.chanspec.to_le_bytes());
+        b[78..80].copy_from_slice(&(self.rssi as i16).to_le_bytes());
+        b[88] = self.channel;
+        b[116..118].copy_from_slice(&(BSS_INFO_MIN as u16).to_le_bytes());
+        b[120..124].copy_from_slice(&(self.ies.len() as u32).to_le_bytes());
+        b.extend_from_slice(&self.ies);
+        b
+    }
+}
+
+/// Parse one `brcmf_bss_info_le` record.
+pub fn parse_bss_info(r: &[u8]) -> Option<BssEntry> {
+    if r.len() < BSS_INFO_MIN { return None; }
+    let len = (le32(r, 4) as usize).min(r.len());
+    let mut bssid = [0u8; 6];
+    bssid.copy_from_slice(&r[8..14]);
+    let sl = (r[18] as usize).min(32);
+    let chanspec = le16(r, 72);
+    let ctl = r[88];
+    let ie_off = le16(r, 116) as usize;
+    let ie_len = le32(r, 120) as usize;
+    let ies = if ie_off >= BSS_INFO_MIN && ie_off.checked_add(ie_len).map_or(false, |e| e <= len) {
+        r[ie_off..ie_off + ie_len].to_vec()
+    } else {
+        Vec::new()
+    };
+    let rssi = (le16(r, 78) as i16).clamp(-128, 127) as i8;
+    Some(BssEntry {
+        bssid,
+        ssid: r[19..19 + sl].to_vec(),
+        channel: if ctl != 0 { ctl } else { (chanspec & 0xff) as u8 },
+        chanspec,
+        rssi,
+        capability: le16(r, 16),
+        beacon_period: le16(r, 14),
+        ies,
+    })
+}
+
+/// Parse the data of an `ESCAN_RESULT` event (`brcmf_escan_result_le`):
+/// (sync id, the BSSs in it).
+pub fn parse_escan(d: &[u8]) -> Option<(u16, Vec<BssEntry>)> {
+    if d.len() < 12 { return None; }
+    let sync = le16(d, 8);
+    let count = le16(d, 10) as usize;
+    let mut out = Vec::new();
+    let mut off = 12;
+    for _ in 0..count {
+        let r = match d.get(off..) { Some(r) if r.len() >= BSS_INFO_MIN => r, _ => break };
+        let len = le32(r, 4) as usize;
+        if len < BSS_INFO_MIN { break; }
+        if let Some(b) = parse_bss_info(&r[..len.min(r.len())]) { out.push(b); }
+        off += len;
+    }
+    Some((sync, out))
+}
+
+/// Encode an `ESCAN_RESULT` payload (tests and mocks).
+pub fn build_escan(sync: u16, bss: &[BssEntry]) -> Vec<u8> {
+    let mut recs = Vec::new();
+    for b in bss { recs.extend_from_slice(&b.to_bss_info()); }
+    let mut d = Vec::new();
+    d.extend_from_slice(&((12 + recs.len()) as u32).to_le_bytes());
+    d.extend_from_slice(&109u32.to_le_bytes());
+    d.extend_from_slice(&sync.to_le_bytes());
+    d.extend_from_slice(&(bss.len() as u16).to_le_bytes());
+    d.extend_from_slice(&recs);
+    d
+}
+
+/// Add a BSS to a result list: one entry per BSSID, the strongest sighting
+/// wins, and a hidden-SSID sighting never erases a known SSID.
+pub fn merge_bss(list: &mut Vec<BssEntry>, b: BssEntry) {
+    match list.iter_mut().find(|x| x.bssid == b.bssid) {
+        Some(x) => {
+            let keep_ssid = if b.ssid.is_empty() { Some(core::mem::take(&mut x.ssid)) } else { None };
+            if b.rssi > x.rssi || (x.ies.is_empty() && !b.ies.is_empty()) {
+                *x = b;
+            }
+            if let Some(s) = keep_ssid { if x.ssid.is_empty() { x.ssid = s; } }
+        }
+        None => list.push(b),
+    }
+}
+
+// ── request encoders ───────────────────────────────────────────────────────
+
+/// `brcmf_escan_params_le` (version 1): wildcard scan, plus a wildcard and
+/// one directed entry per SSID when `ssids` is non-empty; all channels.
+pub fn escan_params(sync_id: u16, action: u16, ssids: &[&[u8]]) -> Vec<u8> {
+    let mut p = alloc::vec![0u8; 8 + 64];
+    p[0..4].copy_from_slice(&ESCAN_REQ_VERSION.to_le_bytes());
+    p[4..6].copy_from_slice(&action.to_le_bytes());
+    p[6..8].copy_from_slice(&sync_id.to_le_bytes());
+    let s = &mut p[8..];
+    s[36..42].copy_from_slice(&[0xff; 6]);
+    s[42] = 2; // DOT11_BSSTYPE_ANY
+    s[43] = 0; // active
+    for o in [44, 48, 52, 56] { s[o..o + 4].copy_from_slice(&(-1i32).to_le_bytes()); }
+    if ssids.is_empty() { return p; }
+    let n = ssids.len() + 1;
+    s[60..64].copy_from_slice(&((n as u32) << 16).to_le_bytes());
+    let push = |p: &mut Vec<u8>, ssid: &[u8]| {
+        let l = ssid.len().min(32);
+        p.extend_from_slice(&(l as u32).to_le_bytes());
+        let mut b = [0u8; 32];
+        b[..l].copy_from_slice(&ssid[..l]);
+        p.extend_from_slice(&b);
+    };
+    push(&mut p, b"");
+    for s in ssids { push(&mut p, s); }
+    p
+}
+
+/// d11ac 20 MHz chanspec of a channel number.
+pub fn chanspec20(ch: u8) -> u16 {
+    let band = if ch <= 14 { 0x0000 } else { 0xc000 };
+    ch as u16 | 0x1000 | band
+}
+
+fn ssid_le(out: &mut Vec<u8>, ssid: &[u8]) {
+    let l = ssid.len().min(32);
+    out.extend_from_slice(&(l as u32).to_le_bytes());
+    let mut b = [0u8; 32];
+    b[..l].copy_from_slice(&ssid[..l]);
+    out.extend_from_slice(&b);
+}
+
+fn assoc_le(out: &mut Vec<u8>, bssid: Option<[u8; 6]>, channel: u8) {
+    out.extend_from_slice(&bssid.unwrap_or([0xff; 6]));
+    out.extend_from_slice(&[0, 0]);
+    let n: u32 = if channel != 0 { 1 } else { 0 };
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&(if channel != 0 { chanspec20(channel) } else { 0 }).to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+}
+
+/// `brcmf_ext_join_params_le` for the "join" iovar (72 bytes).
+pub fn ext_join_params(ssid: &[u8], bssid: Option<[u8; 6]>, channel: u8) -> Vec<u8> {
+    let mut p = Vec::with_capacity(72);
+    ssid_le(&mut p, ssid);
+    p.extend_from_slice(&[0xff, 0, 0, 0]); // scan_type -1 (default)
+    let (np, act, pas) = if channel != 0 { (8i32, 320i32, 400i32) } else { (-1, -1, -1) };
+    for v in [np, act, pas, -1] { p.extend_from_slice(&v.to_le_bytes()); }
+    assoc_le(&mut p, bssid, channel);
+    p
+}
+
+/// `brcmf_join_params` for the WLC_SET_SSID fallback (52 bytes).
+pub fn join_params(ssid: &[u8], bssid: Option<[u8; 6]>, channel: u8) -> Vec<u8> {
+    let mut p = Vec::with_capacity(52);
+    ssid_le(&mut p, ssid);
+    assoc_le(&mut p, bssid, channel);
+    p
+}
+
+/// `brcmf_wsec_pmk_le` (70 bytes).
+pub fn wsec_pmk(key: &Key) -> [u8; PMK_STRUCT_LEN] {
+    let mut p = [0u8; PMK_STRUCT_LEN];
+    match key {
+        Key::Open => {}
+        Key::Passphrase(s) => {
+            let l = s.len().min(64);
+            p[0..2].copy_from_slice(&(l as u16).to_le_bytes());
+            p[2..4].copy_from_slice(&WSEC_PASSPHRASE.to_le_bytes());
+            p[4..4 + l].copy_from_slice(&s[..l]);
+        }
+        Key::Pmk(k) => {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            p[0..2].copy_from_slice(&64u16.to_le_bytes());
+            for (i, b) in k.iter().enumerate() {
+                p[4 + 2 * i] = HEX[(b >> 4) as usize];
+                p[5 + 2 * i] = HEX[(b & 15) as usize];
+            }
+        }
+    }
+    p
+}
+
+/// `brcmf_fil_country_le`: abbrev, rev -1 (the firmware's default
+/// revision for that country), ccode.
+pub fn country_params(cc: [u8; 2]) -> [u8; 12] {
+    let mut p = [0u8; 12];
+    p[0..2].copy_from_slice(&cc);
+    p[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+    p[8..10].copy_from_slice(&cc);
+    p
+}
+
+/// Country from the command line (`brcmf.country=XX`, else the generic
+/// `wifi.country=XX`), default "PT". Two ASCII letters, upper-cased.
+pub fn country_from_cmdline(cmdline: &str) -> [u8; 2] {
+    let val = |k: &str| cmdline.split_ascii_whitespace().filter_map(|t| t.strip_prefix(k).and_then(|r| r.strip_prefix('='))).last();
+    let v = val("brcmf.country").or_else(|| val("wifi.country"));
+    match v.map(|s| s.as_bytes()) {
+        Some(&[a, b]) if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() => [a.to_ascii_uppercase(), b.to_ascii_uppercase()],
+        _ => *b"PT",
+    }
+}
+
+// ── keys and join requests ─────────────────────────────────────────────────
+
+/// What the firmware supplicant gets. Wiped on drop; never logged.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Key {
+    Open,
+    /// 8..63 ASCII characters; PBKDF2 runs in the firmware.
+    Passphrase(Vec<u8>),
+    /// A precomputed PMK (also how a 64-hex-digit PSK arrives).
+    Pmk([u8; 32]),
+}
+
+impl Key {
+    /// From a netctl secret: empty = open, 64 hex digits = PMK, else passphrase.
+    pub fn from_secret(s: &[u8]) -> Key {
+        if s.is_empty() { return Key::Open; }
+        if s.len() == 64 && s.iter().all(|c| c.is_ascii_hexdigit()) {
+            let h = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+            let mut k = [0u8; 32];
+            for i in 0..32 { k[i] = (h(s[2 * i]) << 4) | h(s[2 * i + 1]); }
+            return Key::Pmk(k);
+        }
+        Key::Passphrase(s.to_vec())
+    }
+}
+
+impl Drop for Key {
+    fn drop(&mut self) {
+        match self {
+            Key::Open => {}
+            Key::Passphrase(v) => for b in v.iter_mut() { unsafe { core::ptr::write_volatile(b, 0) } },
+            Key::Pmk(k) => for b in k.iter_mut() { unsafe { core::ptr::write_volatile(b, 0) } },
+        }
+    }
+}
+
+impl core::fmt::Debug for Key {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self { Key::Open => "Open", Key::Passphrase(_) => "Passphrase(<redacted>)", Key::Pmk(_) => "Pmk(<redacted>)" })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct JoinReq {
+    pub ssid: Vec<u8>,
+    pub bssid: Option<[u8; 6]>,
+    /// 0 = let the firmware scan for it.
+    pub channel: u8,
+    pub key: Key,
+}
+
+/// Why a join did not complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinFail {
+    Fw(FwError),
+    /// `SET_SSID` status NO_NETWORKS: the SSID was not found.
+    NoNetwork,
+    /// `SET_SSID` failed (auth/assoc refused, timeout) with this event status.
+    Assoc { status: u32, reason: u32 },
+    /// The handshake did not complete: `msg2` when we were associated (the
+    /// AP had started it), `reason` the AP's deauth/disassoc reason.
+    Handshake { msg2: bool, reason: Option<u16> },
+    /// No outcome within the timeout, before association.
+    Timeout,
+    /// The caller preempted the attempt.
+    Aborted,
+}
+
+/// How an established link ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Down {
+    /// Deauthenticated (`by_ap` = the _IND form, sent by the AP).
+    Deauth { reason: u16, by_ap: bool },
+    Disassoc { reason: u16, by_ap: bool },
+    /// LINK event without the link flag (beacon loss and similar).
+    LinkLost { reason: u32 },
+    /// The firmware supplicant failed (e.g. a group rekey).
+    SupFailed { status: u32, reason: u32 },
+    JoinFailed { status: u32, reason: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step { Associating, Handshake }
+
+/// Progress and preemption for [`Brcmf::join`].
+pub trait JoinObserver {
+    fn aborted(&self) -> bool { false }
+    fn step(&mut self, _s: Step) {}
+}
+
+pub struct NoObserver;
+impl JoinObserver for NoObserver {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link { Down, Joining, Up }
+
+// ── the event/data sink ────────────────────────────────────────────────────
+
+/// Everything the firmware sends up, folded into state. This is the
+/// [`RxSink`] the driver passes to [`Fwil::poll`].
+pub struct Rx {
+    escan_sync: u16,
+    escan_active: bool,
+    pub escan_done: Option<u32>,
+    pub results: Vec<BssEntry>,
+    joining: bool,
+    pub assoc_status: Option<u32>,
+    pub link_up: bool,
+    /// Associated at least once during the current attempt.
+    pub link_seen: bool,
+    pub keyed: bool,
+    pub sup_done: bool,
+    /// Furthest supplicant state seen in this attempt.
+    pub sup_max: u32,
+    pub down: Option<Down>,
+    pub bssid: [u8; 6],
+    pub rx: VecDeque<Vec<u8>>,
+    pub rx_dropped: u64,
+    pub rx_frames: u64,
+    pub events: u64,
+    pub bad_events: u64,
+    pub if_events: u32,
+    /// The last 16 events (type, status, reason).
+    pub recent: VecDeque<(u32, u32, u32)>,
+}
+
+impl Rx {
+    pub fn new() -> Rx {
+        Rx {
+            escan_sync: 0, escan_active: false, escan_done: None, results: Vec::new(),
+            joining: false, assoc_status: None, link_up: false, link_seen: false, keyed: false, sup_done: false,
+            sup_max: 0, down: None, bssid: [0; 6], rx: VecDeque::new(), rx_dropped: 0, rx_frames: 0,
+            events: 0, bad_events: 0, if_events: 0, recent: VecDeque::new(),
+        }
+    }
+
+    fn begin_join(&mut self, keyed: bool) {
+        self.joining = true;
+        self.assoc_status = None;
+        self.link_up = false;
+        self.link_seen = false;
+        self.keyed = keyed;
+        self.sup_done = false;
+        self.sup_max = 0;
+        self.down = None;
+    }
+
+    /// The join finished: link up and, if keyed, the supplicant done.
+    pub fn joined(&self) -> bool { self.link_up && (!self.keyed || self.sup_done) }
+}
+
+impl Default for Rx {
+    fn default() -> Self { Rx::new() }
+}
+
+impl RxSink for Rx {
+    fn on_event(&mut self, frame: &[u8]) {
+        let e = match event::parse(frame) { Some(e) => e, None => { self.bad_events += 1; return; } };
+        self.events += 1;
+        if self.recent.len() == 16 { self.recent.pop_front(); }
+        self.recent.push_back((e.event_type, e.status, e.reason));
+        if e.event_type == ev::IF { self.if_events += 1; return; }
+        if e.ifidx != 0 { return; }
+        match e.event_type {
+            ev::ESCAN_RESULT => {
+                if !self.escan_active { return; }
+                if e.status == status::PARTIAL {
+                    if let Some((sync, list)) = parse_escan(e.data) {
+                        if sync != self.escan_sync { return; }
+                        for b in list { merge_bss(&mut self.results, b); }
+                    }
+                } else {
+                    self.escan_done = Some(e.status);
+                    self.escan_active = false;
+                }
+            }
+            ev::SET_SSID => {
+                self.assoc_status = Some(e.status);
+                if e.status != status::SUCCESS && self.joining && self.down.is_none() {
+                    self.down = Some(Down::JoinFailed { status: e.status, reason: e.reason });
+                }
+            }
+            ev::LINK => {
+                if e.flags & event::FLAG_LINK != 0 {
+                    self.link_up = true;
+                    self.link_seen = true;
+                    self.bssid = e.addr;
+                } else {
+                    let was = self.link_up || self.joining;
+                    self.link_up = false;
+                    if was && self.down.is_none() { self.down = Some(Down::LinkLost { reason: e.reason }); }
+                }
+            }
+            ev::ROAM => {
+                if e.status == status::SUCCESS && e.addr != [0; 6] { self.bssid = e.addr; }
+            }
+            ev::PSK_SUP => {
+                match e.status {
+                    status::FWSUP_COMPLETED => { self.sup_done = true; self.sup_max = e.status; }
+                    status::FWSUP_WAIT_M1 | status::FWSUP_PREP_M2 | status::FWSUP_WAIT_M3 | status::FWSUP_PREP_M4
+                    | status::FWSUP_WAIT_G1 | status::FWSUP_PREP_G2 if e.reason == 0 => {
+                        if !self.sup_done { self.sup_max = self.sup_max.max(e.status); }
+                    }
+                    _ => {
+                        if e.status != status::FWSUP_TIMEOUT && e.status != status::FAIL { self.sup_max = self.sup_max.max(e.status); }
+                        if (self.joining || self.link_up) && self.down.is_none() {
+                            self.down = Some(Down::SupFailed { status: e.status, reason: e.reason });
+                        }
+                        self.link_up = false;
+                    }
+                }
+            }
+            ev::DEAUTH | ev::DEAUTH_IND | ev::DISASSOC | ev::DISASSOC_IND => {
+                let by_ap = matches!(e.event_type, ev::DEAUTH_IND | ev::DISASSOC_IND);
+                let r = e.reason as u16;
+                let d = if matches!(e.event_type, ev::DEAUTH | ev::DEAUTH_IND) {
+                    Down::Deauth { reason: r, by_ap }
+                } else {
+                    Down::Disassoc { reason: r, by_ap }
+                };
+                if (self.link_up || self.joining) && self.down.is_none() { self.down = Some(d); }
+                self.link_up = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn on_data(&mut self, frame: &[u8]) {
+        self.rx_frames += 1;
+        if self.rx.len() >= RX_QUEUE_MAX {
+            self.rx.pop_front();
+            self.rx_dropped += 1;
+        }
+        self.rx.push_back(frame.to_vec());
+    }
+}
+
+// ── the driver object ──────────────────────────────────────────────────────
+
+enum Wait { Done, Timeout, Aborted }
+
+/// Counters for /proc/net/nic and the boot line.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    pub scans: u32,
+    pub joins: u32,
+    pub join_fails: u32,
+    pub link_downs: u32,
+    pub tx_frames: u64,
+    pub tx_errors: u64,
+}
+
+/// One CYW43455 FullMAC interface over a [`Fwil`].
+pub struct Brcmf<F: Fwil> {
+    pub fw: F,
+    pub rx: Rx,
+    env: Env,
+    pub mac: [u8; 6],
+    pub country: [u8; 2],
+    connected: bool,
+    radio_on: bool,
+    sync_id: u16,
+    last: Option<JoinReq>,
+    pub stats: Stats,
+}
+
+impl<F: Fwil> Brcmf<F> {
+    pub fn new(fw: F, env: Env) -> Self {
+        Brcmf { fw, rx: Rx::new(), env, mac: [0; 6], country: *b"PT", connected: false, radio_on: false,
+                sync_id: 0, last: None, stats: Stats::default() }
+    }
+
+    fn log(&self, s: &str) { (self.env.log)(s) }
+
+    fn set_u32(&mut self, c: u32, v: u32) -> Result<(), FwError> { self.fw.cmd_set(c, &v.to_le_bytes()) }
+    fn iovar_u32(&mut self, name: &str, v: u32) -> Result<(), FwError> { self.fw.iovar_set(name, &v.to_le_bytes()) }
+
+    /// The init sequence: MAC, country, mpc 0, txglom off, event mask, UP.
+    /// Only the MAC read, the event mask and UP are fatal.
+    pub fn init(&mut self, country: [u8; 2]) -> Result<[u8; 6], FwError> {
+        let mut b = [0u8; 6];
+        let n = self.fw.iovar_get("cur_etheraddr", &mut b)?;
+        if n < 6 { return Err(FwError::TooLong); }
+        self.mac = b;
+        self.country = country;
+        if let Err(e) = self.fw.iovar_set("country", &country_params(country)) {
+            self.log(&alloc::format!("country {}{} refused: {:?}; firmware default kept", country[0] as char, country[1] as char, e));
+        }
+        if let Err(e) = self.iovar_u32("mpc", 0) { self.log(&alloc::format!("mpc 0 refused: {:?}", e)); }
+        if let Err(e) = self.iovar_u32("bus:txglom", 0) { self.log(&alloc::format!("bus:txglom 0 refused: {:?}", e)); }
+        self.fw.iovar_set("event_msgs", EventMask::station().bytes())?;
+        self.set_u32(cmd::UP, 1)?;
+        self.radio_on = true;
+        if let Err(e) = self.set_u32(cmd::SET_INFRA, 1) { self.log(&alloc::format!("infra 1 refused: {:?}", e)); }
+        Ok(self.mac)
+    }
+
+    pub fn link(&self) -> Link {
+        if self.connected && self.rx.link_up { Link::Up } else if self.rx.joining { Link::Joining } else { Link::Down }
+    }
+    pub fn connected(&self) -> bool { self.connected }
+    pub fn bssid(&self) -> Option<[u8; 6]> { if self.connected { Some(self.rx.bssid) } else { None } }
+    pub fn last_join(&self) -> Option<&JoinReq> { self.last.as_ref() }
+
+    /// Service the bus once.
+    pub fn pump(&mut self, budget_us: u32) -> Result<(), FwError> { self.fw.poll(&mut self.rx, budget_us) }
+
+    fn wait(&mut self, timeout_ms: u64, obs: &mut dyn JoinObserver, done: fn(&Rx) -> bool,
+            mut on_poll: impl FnMut(&Rx, &mut dyn JoinObserver)) -> Result<Wait, FwError> {
+        let t0 = (self.env.now_ms)();
+        loop {
+            let before = self.rx.events;
+            self.fw.poll(&mut self.rx, 2_000)?;
+            on_poll(&self.rx, obs);
+            if done(&self.rx) { return Ok(Wait::Done); }
+            if obs.aborted() { return Ok(Wait::Aborted); }
+            if (self.env.now_ms)().saturating_sub(t0) >= timeout_ms { return Ok(Wait::Timeout); }
+            if self.rx.events == before { (self.env.sleep_ms)(1); }
+        }
+    }
+
+    /// Escan: wildcard plus directed probes for `ssids`. Returns the BSSs
+    /// (one per BSSID, strongest first). A scan that times out is aborted and
+    /// returns what it collected.
+    pub fn scan(&mut self, ssids: &[&[u8]], timeout_ms: u64, obs: &mut dyn JoinObserver) -> Result<Vec<BssEntry>, FwError> {
+        self.sync_id = self.sync_id.wrapping_add(1).max(1);
+        self.rx.escan_sync = self.sync_id;
+        self.rx.escan_active = true;
+        self.rx.escan_done = None;
+        self.rx.results.clear();
+        let _ = self.set_u32(cmd::SET_PASSIVE_SCAN, 0);
+        if let Err(e) = self.fw.iovar_set("escan", &escan_params(self.sync_id, ESCAN_ACTION_START, ssids)) {
+            self.rx.escan_active = false;
+            return Err(e);
+        }
+        self.stats.scans += 1;
+        let w = self.wait(timeout_ms, obs, |r| r.escan_done.is_some(), |_, _| {})?;
+        if !matches!(w, Wait::Done) {
+            let _ = self.fw.iovar_set("escan", &escan_params(self.sync_id, ESCAN_ACTION_ABORT, &[]));
+            self.rx.escan_active = false;
+            if matches!(w, Wait::Timeout) && self.rx.results.is_empty() { return Err(FwError::Timeout); }
+        }
+        let mut v = core::mem::take(&mut self.rx.results);
+        v.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+        Ok(v)
+    }
+
+    fn configure_security(&mut self, key: &Key) -> Result<(), FwError> {
+        self.set_u32(cmd::SET_AUTH, 0)?; // open system
+        match key {
+            Key::Open => {
+                self.set_u32(cmd::SET_WSEC, WSEC_NONE)?;
+                self.set_u32(cmd::SET_WPA_AUTH, WPA_AUTH_DISABLED)?;
+                let _ = self.iovar_u32("sup_wpa", 0);
+            }
+            _ => {
+                self.set_u32(cmd::SET_WSEC, WSEC_AES)?;
+                self.set_u32(cmd::SET_WPA_AUTH, WPA2_AUTH_PSK)?;
+                self.iovar_u32("sup_wpa", 1)?;
+                let mut pmk = wsec_pmk(key);
+                let r = self.fw.cmd_set(cmd::SET_WSEC_PMK, &pmk);
+                for b in pmk.iter_mut() { unsafe { core::ptr::write_volatile(b, 0) } }
+                r?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Join `req` (WPA2-PSK through the firmware supplicant, or open) and
+    /// wait for the outcome. On success the data path is open.
+    pub fn join(&mut self, req: JoinReq, obs: &mut dyn JoinObserver, timeout_ms: u64) -> Result<(), JoinFail> {
+        self.connected = false;
+        self.stats.joins += 1;
+        let keyed = req.key != Key::Open;
+        self.rx.begin_join(keyed);
+        let r = self.join_inner(&req, obs, timeout_ms);
+        self.rx.joining = false;
+        match r {
+            Ok(()) => {
+                self.connected = true;
+                self.last = Some(req);
+                Ok(())
+            }
+            Err(e) => {
+                self.stats.join_fails += 1;
+                let _ = self.fw.cmd_set(cmd::DISASSOC, &scb_val(REASON_LEAVING, [0; 6]));
+                self.rx.link_up = false;
+                self.rx.down = None;
+                // Keep the request for a later reconnect unless it was refused for good.
+                self.last = Some(req);
+                Err(e)
+            }
+        }
+    }
+
+    fn join_inner(&mut self, req: &JoinReq, obs: &mut dyn JoinObserver, timeout_ms: u64) -> Result<(), JoinFail> {
+        self.set_u32(cmd::SET_INFRA, 1).map_err(JoinFail::Fw)?;
+        self.configure_security(&req.key).map_err(JoinFail::Fw)?;
+        obs.step(Step::Associating);
+        if let Err(e) = self.fw.iovar_set("join", &ext_join_params(&req.ssid, req.bssid, req.channel)) {
+            self.log(&alloc::format!("join iovar refused ({:?}); falling back to WLC_SET_SSID", e));
+            self.fw.cmd_set(cmd::SET_SSID, &join_params(&req.ssid, req.bssid, req.channel)).map_err(JoinFail::Fw)?;
+        }
+        let keyed = self.rx.keyed;
+        let mut stepped = false;
+        let w = self.wait(timeout_ms, obs, |r| r.joined() || r.down.is_some(), |r, o| {
+            if keyed && r.link_seen && !stepped { stepped = true; o.step(Step::Handshake); }
+        }).map_err(JoinFail::Fw)?;
+        if self.rx.joined() && self.rx.down.is_none() { return Ok(()); }
+        let msg2 = self.rx.link_seen && keyed;
+        match (w, self.rx.down) {
+            (_, Some(Down::JoinFailed { status, .. })) if status == status::NO_NETWORKS => Err(JoinFail::NoNetwork),
+            (_, Some(Down::JoinFailed { status, reason })) => Err(JoinFail::Assoc { status, reason }),
+            (_, Some(Down::Deauth { reason, .. })) | (_, Some(Down::Disassoc { reason, .. })) => {
+                if keyed && self.rx.link_seen { Err(JoinFail::Handshake { msg2, reason: Some(reason) }) }
+                else { Err(JoinFail::Assoc { status: status::FAIL, reason: reason as u32 }) }
+            }
+            (_, Some(Down::SupFailed { reason, .. })) => {
+                Err(JoinFail::Handshake { msg2: msg2 || self.rx.sup_max >= status::FWSUP_WAIT_M3,
+                                          reason: if reason != 0 { Some(reason as u16) } else { None } })
+            }
+            (_, Some(Down::LinkLost { .. })) => {
+                if keyed { Err(JoinFail::Handshake { msg2, reason: None }) } else { Err(JoinFail::Timeout) }
+            }
+            (Wait::Aborted, None) => Err(JoinFail::Aborted),
+            (_, None) => {
+                if keyed && self.rx.link_seen { Err(JoinFail::Handshake { msg2, reason: None }) } else { Err(JoinFail::Timeout) }
+            }
+        }
+    }
+
+    /// Rejoin the last network (same SSID, BSSID, key).
+    pub fn reconnect(&mut self, obs: &mut dyn JoinObserver, timeout_ms: u64) -> Result<(), JoinFail> {
+        match self.last.clone() {
+            Some(req) => self.join(req, obs, timeout_ms),
+            None => Err(JoinFail::NoNetwork),
+        }
+    }
+
+    /// Leave the network (WLC_DISASSOC, reason 3). The data path closes at once.
+    pub fn disconnect(&mut self) -> Result<(), FwError> {
+        let was = self.connected;
+        self.connected = false;
+        self.rx.link_up = false;
+        self.rx.down = None;
+        if was { self.fw.cmd_set(cmd::DISASSOC, &scb_val(REASON_LEAVING, self.rx.bssid)) } else { Ok(()) }
+    }
+
+    /// Associated: service the bus; `Some` when the link went away.
+    pub fn poll_link(&mut self, budget_us: u32) -> Result<Option<Down>, FwError> {
+        self.fw.poll(&mut self.rx, budget_us)?;
+        if self.connected {
+            if let Some(d) = self.rx.down.take() {
+                self.connected = false;
+                self.rx.link_up = false;
+                self.stats.link_downs += 1;
+                return Ok(Some(d));
+            }
+        } else {
+            self.rx.down = None;
+        }
+        Ok(None)
+    }
+
+    /// Send one 802.3 frame; refused while not connected.
+    pub fn tx(&mut self, frame: &[u8]) -> Result<(), FwError> {
+        if !self.connected {
+            self.stats.tx_errors += 1;
+            return Err(FwError::Status(-1));
+        }
+        match self.fw.tx_data(frame) {
+            Ok(()) => { self.stats.tx_frames += 1; Ok(()) }
+            Err(e) => { self.stats.tx_errors += 1; Err(e) }
+        }
+    }
+
+    /// Next received data frame.
+    pub fn take_rx(&mut self) -> Option<Vec<u8>> { self.rx.rx.pop_front() }
+
+    /// RSSI of the associated BSS (dBm).
+    pub fn rssi(&mut self) -> Option<i8> {
+        if !self.connected { return None; }
+        let mut b = [0u8; 10];
+        match self.fw.cmd_get(cmd::GET_RSSI, &mut b) {
+            Ok(n) if n >= 4 => Some((le32(&b, 0) as i32).clamp(-128, 0) as i8),
+            _ => None,
+        }
+    }
+
+    /// Current TX rate in kbit/s (the firmware reports 500 kbit/s units).
+    pub fn rate_kbps(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        match self.fw.cmd_get(cmd::GET_RATE, &mut b) { Ok(4) => le32(&b, 0).saturating_mul(500), _ => 0 }
+    }
+
+    /// Soft radio switch (WLC_UP / WLC_DOWN).
+    pub fn set_radio(&mut self, on: bool) -> Result<(), FwError> {
+        if !on && self.connected { let _ = self.disconnect(); }
+        self.set_u32(if on { cmd::UP } else { cmd::DOWN }, 1)?;
+        self.radio_on = on;
+        Ok(())
+    }
+    pub fn radio_on(&self) -> bool { self.radio_on }
+}
+
+/// `brcmf_scb_val_le`: reason + peer.
+pub fn scb_val(reason: u32, ea: [u8; 6]) -> [u8; 10] {
+    let mut b = [0u8; 10];
+    b[0..4].copy_from_slice(&reason.to_le_bytes());
+    b[4..10].copy_from_slice(&ea);
+    b
+}

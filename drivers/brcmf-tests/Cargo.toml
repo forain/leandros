@@ -1,0 +1,12 @@
+# Host unit tests for the brcmf FullMAC control layer (drivers/src/brcmf):
+# cfg.rs and event.rs against a mock Fwil. Run: cargo test (in this dir).
+[package]
+name = "brcmf-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

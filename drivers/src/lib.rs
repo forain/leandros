@@ -59,6 +59,8 @@ pub mod e1000e_hw;
 /// The NIC behind `eth0`: virtio-net, r8169 or e1000e.
 pub mod netdev;
 pub mod netshape;
+/// Broadcom/Cypress FullMAC Wi-Fi (CYW43455, Raspberry Pi 5).
+pub mod brcmf;
 /// Intel Wireless 8265/8275 (iwlwifi, MVM firmware) and its pieces: PCIe
 /// transport, firmware file parser, firmware command codec, 802.11 frames,
 /// WPA2 crypto (the last four host-tested in drivers/iwlwifi-tests).
