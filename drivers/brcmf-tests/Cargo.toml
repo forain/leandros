@@ -1,0 +1,14 @@
+[package]
+name = "brcmf-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Host-only test crate: compiles drivers/src/brcmf/{bus,fwil,chip,fw,sdpcm,bcdc}.rs
+# via #[path] and runs them against a scripted CYW43455 (mock SDIO backplane +
+# fake firmware). Detached from the kernel workspace.
+# Run: cargo test --manifest-path drivers/brcmf-tests/Cargo.toml --target <host-triple>
+[workspace]
+
+[lib]
+path = "src/lib.rs"

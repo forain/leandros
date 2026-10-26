@@ -83,6 +83,8 @@ pub mod wifi_crypto;
 pub mod wifi_api;
 /// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).
 pub mod wifi_mgr;
+/// Broadcom/Cypress FullMAC Wi-Fi (CYW43455, Raspberry Pi 5).
+pub mod brcmf;
 pub mod wifi_pref;
 /// A simulated Wi-Fi interface for QEMU tests (opt-in; see its header).
 pub mod wifi_sim;
@@ -111,6 +113,9 @@ pub mod brcmstb_hw;
 pub mod brcmstb_pcie;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod rp1;
+/// Broadcom V3D 7.1 GPU (Pi 5): register map, power-up, MMU. Pure logic
+/// everywhere; the hardware probe is rpi5-only.
+pub mod v3d;
 
 /// Block-device trait and types every backend implements (always built).
 pub mod blockdev;
