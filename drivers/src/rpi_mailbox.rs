@@ -349,6 +349,8 @@ fn log_dump(words: &[u32]) {
     }
 }
 
+use leandros_lib::mmio::{MmioRd, MmioWr};
+
 // ── MMIO + timing ─────────────────────────────────────────────────────────────
 
 #[inline(always)]

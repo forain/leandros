@@ -275,13 +275,32 @@ fetch_gpu_firmware() {
     cp "$src_dir/fixup4.dat" "$MOUNT_DIR/fixup4.dat"
 }
 
+# The Pi 5 device tree for direct boot. target/rpi5-uefi/ only exists when the
+# UEFI firmware bundle was vendored by hand; nothing in the build creates it,
+# so a fresh checkout falls back to the stock DTB from the firmware repo
+# (the same file the firmware would otherwise pick itself).
+direct_boot_dtb() {
+    local f
+    for f in "$UEFI_DIR/bcm2712-rpi-5-b.dtb" "${FIRMWARE_DIR:+$FIRMWARE_DIR/bcm2712-rpi-5-b.dtb}"; do
+        [[ -n "$f" && -f "$f" ]] && { echo "$f"; return; }
+    done
+    mkdir -p "$FW_CACHE_DIR"
+    f="$FW_CACHE_DIR/bcm2712-rpi-5-b.dtb"
+    if [[ ! -f "$f" ]]; then
+        info "Downloading RPi 5 device tree (bcm2712-rpi-5-b.dtb)..." >&2
+        curl -fsSL -o "$f" "$FW_BASE_URL/bcm2712-rpi-5-b.dtb" || \
+            die "Failed to download bcm2712-rpi-5-b.dtb from $FW_BASE_URL"
+    fi
+    echo "$f"
+}
+
 fetch_gpu_firmware
 
 # ── Populate for the selected boot mode ──────────────────────────────────────
 
 if [[ "$BOOT_MODE" == "direct" ]]; then
     info "Copying direct-boot kernel + initrd..."
-    cp "$UEFI_DIR/bcm2712-rpi-5-b.dtb" "$MOUNT_DIR/bcm2712-rpi-5-b.dtb"
+    cp "$(direct_boot_dtb)" "$MOUNT_DIR/bcm2712-rpi-5-b.dtb"
     # The *flat* image, not the ELF. The Raspberry Pi firmware does not parse
     # ELF for `kernel=`; it copies the file verbatim to `kernel_address` and
     # branches to the first byte. build-all.sh already emits this via
