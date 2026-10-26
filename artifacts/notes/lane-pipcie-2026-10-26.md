@@ -46,7 +46,7 @@ Failure forms: `[pcie] FAIL ioremap|rescal timeout|mdio timeout`, `[pcie] FAIL l
 ## Evidence
 - Host tests `drivers/brcmstb-tests` 8/8 (window values derived from the firmware DTB pcie2 `ranges`/`dma-ranges`).
 - `scripts/check-rpi5.sh` rpi5 + raspi4b clean (no warnings in new files).
-- aarch64 QEMU virt regress PASS (before and after `git merge main`).
+- aarch64 QEMU virt regress PASS before merging main; after merging main 48 suites RC=0, memtest timed out only because the Mac hibernated (1% battery), and a memtest rerun PASSED.
 
 ## Open / unverified
 - RP1 clocks (pclk/hclk/tsu/clk_eth): NOT programmed (needs an RP1 clock driver, clk-rp1.c). If RP1's
