@@ -364,6 +364,12 @@ enable_uart=1
 uart_2ndstage=1
 EOF
 
+    # Name the root ourselves. Without cmdline.txt the firmware appends its
+    # Raspberry Pi OS default, `root=/dev/mmcblk0p2 rootfstype=ext4 rootwait`,
+    # a name this kernel does not use. The f2fs root image carries the label
+    # leandros-root (scripts/mkfs-f2fs-populated.py), as on QEMU.
+    printf 'root=LABEL=leandros-root\n' > "$MOUNT_DIR/cmdline.txt"
+
 else
     info "Copying UEFI firmware + Limine + kernel + initrd..."
     cp "$UEFI_DIR/RPI_EFI.fd" "$MOUNT_DIR/RPI_EFI.fd"
