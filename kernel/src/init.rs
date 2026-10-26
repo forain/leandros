@@ -116,6 +116,10 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::blkdev::init();
+    // Raspberry Pi 5: power the CYW43455 and bring sdio2 up as an SDIO host.
+    // One `[sdio]` line either way; inert on failure, bounded to ~2 s.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    drivers::brcmf::sdio_host::boot_probe();
     // Publish the disks to the VFS, which owns /dev/vd*, /dev/loopN and the
     // synthesized /sys/class/block tree. `vfs-server` deliberately does not
     // depend on `drivers` (the VFS sits below the device layer), so the
