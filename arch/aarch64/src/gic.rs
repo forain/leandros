@@ -938,6 +938,7 @@ pub fn kexec_quiesce() {
                 gicd_w32(GICD_ICPENDR0 + w * 4, 0xFFFF_FFFF);
                 gicd_w32(GICD_ICACTIVER0 + w * 4, 0xFFFF_FFFF);
             }
+            gicv2_clear_sgis();
             gicd_w32(GICD_CTLR, 0);
             gicc_w32(GICC_CTLR, 0);
         }
@@ -945,9 +946,28 @@ pub fn kexec_quiesce() {
     }
 }
 
+/// GICv2 (GIC-400, Pi 5 / raspi4b): a pending SGI is NOT cleared by
+/// GICD_ICPENDR0 (its SGI bits are write-ignored); GICD_CPENDSGIRn (banked:
+/// this CPU's pending SGIs, one byte per SGI = source-CPU mask) is the way.
+/// The GIC-400 distributor stays powered across PSCI CPU_OFF/ON, so whatever
+/// is left pending here is delivered to the next kernel's fresh vector table.
+const GICD_CPENDSGIR0: usize = 0xF10;
+unsafe fn gicv2_clear_sgis() {
+    for i in 0..4 { gicd_w32(GICD_CPENDSGIR0 + i * 4, 0xFFFF_FFFF); }
+}
+
 /// This CPU's interface off (an AP on its way to CPU_OFF).
 pub fn kexec_cpu_off() {
     unsafe {
-        if is_v3() { icc::igrpen1_el1::write(0); isb(); } else { gicc_w32(GICC_CTLR, 0); }
+        if is_v3() { icc::igrpen1_el1::write(0); isb(); } else {
+            // This CPU's banked SGI/PPI state lives in the always-on
+            // distributor: disable, unpend and deactivate it before CPU_OFF.
+            gicd_w32(GICD_ICENABLER0, 0xFFFF_FFFF);
+            gicd_w32(GICD_ICPENDR0, 0xFFFF_FFFF);
+            gicd_w32(GICD_ICACTIVER0, 0xFFFF_FFFF);
+            gicv2_clear_sgis();
+            gicc_w32(GICC_CTLR, 0);
+            dsb_st();
+        }
     }
 }
