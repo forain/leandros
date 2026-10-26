@@ -34,14 +34,14 @@ Status: DELIVERED (host-tested; no hardware run yet, the chip/SDIO lanes are sep
   caller's thread.
 
 ## Evidence
-- `cd drivers/brcmf-tests && cargo test --target aarch64-apple-darwin`: 22/22 pass (mock Fwil
+- `cd drivers/brcmf-tests && cargo test --target aarch64-apple-darwin`: 22 net tests pass, 44 in the crate with the core lane's (mock Fwil
   recording ioctls/iovars, canned events: init order, refusals, scan dedup/stale sync/timeout,
   scan -> join -> LINK up -> data in/out -> deauth -> reconnect, wrong key (deauth 15 after M3
   wait), supplicant timeout, no network, assoc refused, join-iovar fallback, timeout/abort, link
   loss, open network). Guards shown to fail on mutants: LE event header (12 fail), no ifidx
   filter (1 fails).
 - `scripts/check-rpi5.sh` rpi5 and CHECK_FEATURE=raspi4b: clean (no brcmf warnings).
-- aarch64 release build + QEMU virt regress: see the merge commit message / final report.
+- aarch64 release build + QEMU virt regress: PASS twice (before and after merging main with pisdio + pibrcmf-core); virt shows only `[NET] netif eth0 = virtio-net`, no wifi0.
 
 ## Next Pi boot should show (once integration calls `start`)
 - `[NET] netif wifi0 = brcmfmac` at netdev init (rpi5 only; nothing on virt or the laptop).
