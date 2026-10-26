@@ -65,6 +65,15 @@ pub fn enabled() -> bool {
     if crate::gpu_uapi::active() {
         return true;
     }
+    // The v3d backend is a native-UAPI driver like the gpu_uapi ones: Mesa's
+    // v3d driver creates every pipe fence with
+    // `drmSyncobjExportSyncFile(out_sync)` (v3d_fence.c) and treats a failure
+    // as "no fence", so the first eglSwapBuffers has no front buffer and
+    // kmscube dies with "Failed to get a new framebuffer BO". Only while
+    // armed; the virtio paths keep the old answer.
+    if crate::drm_device_interface::v3d_active() {
+        return true;
+    }
     let mut f = FORCE.load(Ordering::Relaxed);
     if f == 0 {
         f = if crate::nvidia_probe::cmdline_opt("drm.syncfile") == Some(1) { 2 } else { 1 };
