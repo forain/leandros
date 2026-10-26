@@ -230,3 +230,93 @@ pub unsafe fn clear_at(root: u64, bits: u32, va: u64, level: u8,
         l += 1;
     }
 }
+
+/// What an [`unmap`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnmapStats {
+    /// Leaves (any size) zeroed because the range covered them whole.
+    pub cleared: u32,
+    /// Blocks replaced by a next-level table (through `bbm`).
+    pub splits: u32,
+    /// New table pages taken from `alloc`.
+    pub tables: u32,
+    /// Bytes of the range left mapped: `bbm` refused a split, `alloc` or
+    /// `table` failed.
+    pub left: u64,
+}
+
+/// Take `[s, t)` (physical, 4 KiB aligned) out of the HHDM: leave no valid
+/// translation for `hhdm + s .. hhdm + t`, and every other page mapped as it
+/// was. For DTB `/reserved-memory` `no-map` ranges, which must never sit
+/// behind a cacheable alias (a non-coherent agent owns them).
+///
+/// A leaf wholly inside the range is zeroed (valid -> invalid needs no
+/// break-before-make). A block only partly inside is split: a new table
+/// (from `alloc`) gets 512 next-level leaves with the block's output and
+/// attributes, and `bbm(slot, table_desc, block_phys, block_size)` swaps it
+/// in. That swap changes the block size of a live mapping, so the caller
+/// must do break-before-make (zero, TLBI, write) and must refuse (return
+/// false) when the block holds anything the swap itself touches -- code,
+/// stack, the table holding `slot`. A refused block stays mapped, counted in
+/// `left`. Unmapped parts of the range are skipped.
+///
+/// # Safety
+/// As for [`fill`]; the caller invalidates the TLB afterwards.
+pub unsafe fn unmap(root: u64, bits: u32, hhdm: u64, s: u64, t: u64,
+                    table: &dyn Fn(u64) -> Option<*mut u64>,
+                    alloc: &mut dyn FnMut() -> Option<u64>,
+                    bbm: &mut dyn FnMut(*mut u64, u64, u64, u64) -> bool) -> UnmapStats {
+    let start = start_of(bits);
+    let mut st = UnmapStats::default();
+    let mut a = s;
+    'range: while a < t {
+        let va = hhdm.wrapping_add(a);
+        let mut tp = root & OA_MASK;
+        let mut level = start;
+        loop {
+            let size = leaf_size(level);
+            let next = ((a & !(size - 1)) + size).min(t);
+            let p = match table(tp) {
+                Some(p) => p,
+                None => { st.left += next - a; a = next; continue 'range; }
+            };
+            let slot = p.add(index(va, level, start, bits));
+            let d = core::ptr::read_volatile(slot);
+            if d & 1 == 0 { a = next; continue 'range; }
+            if d & 2 != 0 && level < 3 { tp = d & OA_MASK; level += 1; continue; }
+            if level == 0 { st.left += next - a; a = next; continue 'range; }
+            // A leaf. Whole: zero it. Partial: split it, then descend.
+            if a & (size - 1) == 0 && a + size <= t {
+                core::ptr::write_volatile(slot, 0);
+                st.cleared += 1;
+                a += size;
+                continue 'range;
+            }
+            if level == 3 { st.left += next - a; a = next; continue 'range; }
+            let np = match alloc() {
+                Some(np) => np,
+                None => { st.left += next - a; a = next; continue 'range; }
+            };
+            let q = match table(np) {
+                Some(q) => q,
+                None => { st.left += next - a; a = next; continue 'range; }
+            };
+            st.tables += 1;
+            let sub = leaf_size(level + 1);
+            let out = d & OA_MASK & !(size - 1);
+            let ty = if level + 1 == 3 { 0b11 } else { 0b01 };
+            for i in 0..512u64 {
+                core::ptr::write_volatile(q.add(i as usize), (out + i * sub) | (d & ATTR_MASK) | ty);
+            }
+            if !bbm(slot, (np & OA_MASK) | 0b11, out, size) {
+                st.left += next - a;
+                a = next;
+                continue 'range;
+            }
+            st.splits += 1;
+            tp = np;
+            level += 1;
+        }
+    }
+    st
+}

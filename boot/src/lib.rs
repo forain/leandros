@@ -8,6 +8,7 @@
 pub mod acpi;
 pub mod earlyfb;
 pub mod device_tree;
+pub mod mpidr;
 pub mod limine;
 pub mod multiboot2;
 pub mod mb2_build;

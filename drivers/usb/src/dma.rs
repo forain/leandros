@@ -102,14 +102,13 @@ impl DmaBuf {
         }
     }
 
-    /// Make CPU writes visible to the device. x86 PCIe is always
-    /// DMA-coherent and so is QEMU `virt`, so this is an ordering barrier
-    /// only. A non-coherent aarch64 platform (to be verified per board — see
-    /// artifacts/notes/lane-xhci-2026-10-05.md) would clean the range to the
-    /// point of coherency here, and invalidate it in `sync_for_cpu`.
-    #[inline] pub fn sync_for_device(&self) { dma_wmb(); }
-    /// Make device writes visible to the CPU (see `sync_for_device`).
-    #[inline] pub fn sync_for_cpu(&self) { dma_rmb(); }
+    /// Make CPU writes visible to the device: an ordering barrier where DMA
+    /// snoops the caches (x86 PCIe, QEMU `virt`), a clean to the point of
+    /// coherency of the whole buffer on a non-coherent aarch64 platform
+    /// (Pi 5; `mm::dma_cache`, chosen from the DTB's `dma-coherent`).
+    #[inline] pub fn sync_for_device(&self) { mm::dma_cache::sync_for_device(self.virt, self.len); }
+    /// Make device writes visible to the CPU (barrier, or invalidate).
+    #[inline] pub fn sync_for_cpu(&self) { mm::dma_cache::sync_for_cpu(self.virt, self.len); }
 }
 
 impl Drop for DmaBuf {

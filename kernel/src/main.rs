@@ -1358,6 +1358,10 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     mm::init_with_map(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() }, hhdm_offset as usize);
     mm::buddy::set_verbose(false);
     early_mark(2);
+    #[cfg(target_arch = "aarch64")]
+    early_nomap_a64(hhdm_offset as u64);
+    #[cfg(target_arch = "aarch64")]
+    early_dma_cache(hhdm_offset as u64);
     kexec::prevlog::replay();
 
     // `sched.wakestat=1`: per-thread wake census and the useful/spurious
@@ -2730,6 +2734,166 @@ fn early_dtb_reserve() {
         serial_print_str("\n");
     });
     if n == 0 { serial_print_str("[early] dtb reserved: none\n"); }
+    nomap_test_ranges(&mut |s, t| mm::buddy::reserve_range(s as usize, t as usize));
+}
+
+/// `mm.nomaptest=0xSTART-0xEND[,...]` (QEMU guard): treat these ranges as DTB
+/// `/reserved-memory` `no-map` children -- reserved from the allocator and
+/// taken out of the HHDM by `early_nomap_a64`.
+#[cfg(target_arch = "aarch64")]
+fn nomap_test_ranges(f: &mut dyn FnMut(u64, u64)) {
+    let Some(v) = cmdline_knob("mm.nomaptest") else { return };
+    for part in v.split(',') {
+        let mut it = part.splitn(2, '-');
+        if let (Some(a), Some(b)) = (it.next().and_then(parse_num), it.next().and_then(parse_num)) {
+            if a < b { f(a, b); }
+        }
+    }
+}
+
+/// Physical address behind `va` (`AT S1E1R`), if it is mapped.
+#[cfg(target_arch = "aarch64")]
+fn a64_pa(va: u64) -> Option<u64> {
+    let par: u64;
+    unsafe {
+        core::arch::asm!("at s1e1r, {va}", "isb", "mrs {par}, par_el1",
+                         va = in(reg) va, par = out(reg) par, options(nostack));
+    }
+    if par & 1 != 0 { None } else { Some((par & boot::hhdm_a64::OA_MASK) | (va & 0xFFF)) }
+}
+
+/// Break-before-make swap of a live HHDM block for the table `d` that maps
+/// the same output in finer leaves (`hhdm_a64::unmap`). Refused when the
+/// block `[base, base + size)` holds this code, the stack or the table
+/// holding `slot`: between the zeroing and the rewrite every access to the
+/// block faults. Interrupts are masked across the window; the APs are not up.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn a64_bbm(slot: *mut u64, d: u64, base: u64, size: u64) -> bool {
+    let inside = |va: u64| a64_pa(va).map_or(true, |p| p >= base && p - base < size);
+    let sp: u64;
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack)); }
+    let pc = a64_bbm as usize as u64;
+    if inside(sp) || inside(sp.wrapping_sub(256)) || inside(pc) || inside(pc + 0x400) || inside(slot as u64) {
+        return false;
+    }
+    unsafe {
+        core::arch::asm!(
+            "mrs {f}, daif",
+            "msr daifset, #0xf",
+            "str xzr, [{s}]",
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            "str {d}, [{s}]",
+            "dsb ishst",
+            "isb",
+            "msr daif, {f}",
+            s = in(reg) slot, d = in(reg) d, f = out(reg) _, options(nostack));
+    }
+    true
+}
+
+/// Pick the DMA coherency mode (`mm::dma_cache`): the DTB's `dma-coherent`
+/// (none = UEFI/ACPI QEMU: coherent), overridden by `dma.coherent=0|1`; then
+/// self-test the non-coherent range maintenance on a scratch page whatever
+/// the mode: line counts at alignment edges, and bytes beside an unaligned
+/// invalidate range (dirty in the cache) must survive it.
+#[cfg(target_arch = "aarch64")]
+fn early_dma_cache(hhdm: u64) {
+    use mm::dma_cache as dc;
+    let dt = unsafe { boot::device_tree::has_property_name(b"dma-coherent") };
+    let c = match cmdline_knob("dma.coherent") { Some("0") => false, Some("1") => true, _ => dt.unwrap_or(true) };
+    dc::set_coherent(c);
+    let line = dc::dline();
+    let Some(pg) = mm::buddy::alloc(0) else { return };
+    let va = (hhdm + pg as u64) as usize;
+    let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, 4096) };
+    let (mut cases, mut bad) = (0u32, 0u32);
+    for off in [0usize, 1, line / 2, line - 1, line, 3 * line + 5] {
+        for len in [0usize, 1, line - 1, line, line + 1, 2 * line - 1, 5 * line + 3, 1024] {
+            for (i, b) in buf.iter_mut().enumerate() { *b = (i as u8) ^ 0x5A; }
+            dc::clean_range(va + off, len);
+            if dc::last_lines() != dc::clean_lines(va + off, len, line) { bad += 1; }
+            // Dirty the bytes just outside, then invalidate the range.
+            if off > 0 { buf[off - 1] = 0xEE; }
+            if off + len < 4096 { buf[off + len] = 0xEE; }
+            dc::invalidate_range(va + off, len);
+            let p = dc::plan(va + off, len, line);
+            let want = p.head.is_some() as usize + p.tail.is_some() as usize + (p.body.1 - p.body.0) / line;
+            if dc::last_lines() != want || want != dc::clean_lines(va + off, len, line) { bad += 1; }
+            if off > 0 && buf[off - 1] != 0xEE { bad += 1; }
+            if off + len < 4096 && buf[off + len] != 0xEE { bad += 1; }
+            if (off..off + len).any(|i| buf[i] != (i as u8) ^ 0x5A) { bad += 1; }
+            cases += 1;
+        }
+    }
+    mm::buddy::free(pg, 0);
+    serial_print_str(if c { "[early] dma: coherent" } else { "[early] dma: NON-COHERENT (cache maintenance on sync)" });
+    serial_print_str(match dt { Some(true) => ", dtb dma-coherent", Some(false) => ", dtb without dma-coherent", None => ", no dtb" });
+    serial_print_str(", line ");
+    print_number(line as u32);
+    serial_print_str(", selftest ");
+    print_number(cases - bad.min(cases));
+    serial_print_str("/");
+    print_number(cases);
+    serial_print_str(if bad == 0 { " ok\n" } else { " \x1b[31mFAIL\x1b[0m\n" });
+}
+
+/// DTB `/reserved-memory` children marked `no-map` (and `mm.nomaptest`
+/// ranges) must have no cacheable alias: on a non-coherent SoC (Pi 5) a
+/// speculative line fill or a dirty eviction through the HHDM corrupts what
+/// the firmware or a device keeps there. Both the bootloader HHDM (Limine)
+/// and the direct-boot 1 GiB blocks map them Normal WB, so take them out
+/// here, after mm is up (split tables come from the buddy allocator), as
+/// Linux leaves them out of its linear map. Each range is rounded out to
+/// pages, then verified with `AT`. `mm.nomap=0` skips the unmap (A/B: the
+/// verification then reports the range still mapped).
+#[cfg(target_arch = "aarch64")]
+fn early_nomap_a64(hhdm: u64) {
+    let mut ranges = [(0u64, 0u64); 32];
+    let mut n = 0;
+    let mut push = |s: u64, t: u64| if n < ranges.len() { ranges[n] = (s & !0xFFF, (t + 0xFFF) & !0xFFF); n += 1; };
+    boot::device_tree::reserved_ranges(&mut |r| if r.no_map { push(r.base, r.base.saturating_add(r.size)); });
+    nomap_test_ranges(&mut |s, t| push(s, t));
+    if n == 0 { return; }
+    let Some((root, bits)) = a64_ttbr1() else { return };
+    let skip = cmdline_knob("mm.nomap") == Some("0");
+    let table = |p: u64| a64_table(hhdm, p);
+    for &(s, t) in &ranges[..n] {
+        serial_print_str("[early] nomap: ");
+        serial_print_hex(s as usize);
+        serial_print_str("-");
+        serial_print_hex(t as usize);
+        if !skip {
+            let mut alloc = || mm::buddy::alloc(0).map(|p| p as u64);
+            let mut bbm = |slot: *mut u64, d: u64, b: u64, z: u64| a64_bbm(slot, d, b, z);
+            let st = unsafe { boot::hhdm_a64::unmap(root, bits, hhdm, s, t, &table, &mut alloc, &mut bbm) };
+            unsafe { core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack)); }
+            serial_print_str(" cleared ");
+            print_number(st.cleared);
+            serial_print_str(" split ");
+            print_number(st.splits);
+            serial_print_str(" left ");
+            serial_print_hex(st.left as usize);
+        }
+        // Verify: the first and last page gone, a cheap sample in between.
+        let mut still = 0u32;
+        let mut a = s;
+        while a < t {
+            if a64_mapped(hhdm + a) { still += 1; }
+            a += if t - s > (64 << 20) { 1 << 20 } else { 4096 };
+        }
+        if a64_mapped(hhdm + t - 4096) { still += 1; }
+        if still == 0 {
+            serial_print_str(" -> unmapped\n");
+        } else {
+            serial_print_str(" -> \x1b[33mSTILL MAPPED\x1b[0m (");
+            print_number(still);
+            serial_print_str(" probes)\n");
+        }
+    }
 }
 
 fn early_fb_report() {
