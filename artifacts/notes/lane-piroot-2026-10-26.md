@@ -23,4 +23,4 @@
 ## Not verified
 - Real Pi boot (not touched by this lane). QEMU raspi4b gets no firmware cmdline, so the foreign-root= case
   cannot be reproduced there; the generic (non-SD) resolver is unchanged — explicit root= that matches nothing
-  still waits, as intended for USB enumeration. aarch64 regress: see merge.
+  still waits, as intended for USB enumeration. aarch64 regress (generic build): overall PASS, 0/1 boots failed.
