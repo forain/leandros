@@ -99,6 +99,9 @@ pub mod sdhci;
 /// protocol can be exercised without hardware.
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod rpi_mailbox;
+/// Broadcom V3D 7.1 GPU (Pi 5): register map, power-up, MMU. Pure logic
+/// everywhere; the hardware probe is rpi5-only.
+pub mod v3d;
 
 /// Block-device trait and types every backend implements (always built).
 pub mod blockdev;
