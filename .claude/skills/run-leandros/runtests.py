@@ -432,7 +432,13 @@ def main(argv):
             # A shared interrupt line masked by the kernel's storm guard starves
             # every device on it (L5.13): treat it as a failure of the run.
             with open(os.path.join(rdir, "serial-full.log"), "rb") as lf:
-                storms = re.findall(rb"\[IRQ\] line \S+ fired \d+ times[^\n]*", lf.read())
+                full = lf.read()
+            storms = re.findall(rb"\[IRQ\] line \S+ fired \d+ times[^\n]*", full)
+            # init's stray sweep after a greeter exit must not take sshd with
+            # it: its tokio threads report init as their parent (lane pihw2).
+            if re.search(rb"sshd exited \(status 9\)", full):
+                all_ok = False
+                print("=== kernel-log: sshd was SIGKILLed (init stray sweep?)", flush=True)
             if storms:
                 all_ok = False
                 print(f"=== kernel-log: {len(storms)} IRQ line(s) masked by the storm guard: "
