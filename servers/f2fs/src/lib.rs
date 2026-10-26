@@ -127,8 +127,8 @@ const SB_NAT_BLKADDR:       usize = 84;
 const SB_MAIN_BLKADDR:      usize = 92;
 const SB_ROOT_INO:          usize = 96;
 /// `__u8 init_version[256]`. A volume whose `init_version` starts with
-/// `LX_TAG` uses Linux's exact node/inode/dentry layout (`Fmt::lx`); every
-/// other volume (all older images: empty string) keeps the legacy layout.
+/// `LX_TAG` uses Linux's exact node/inode/dentry layout; any other volume
+/// not made by Linux (the retired legacy layout) is refused at mount.
 const SB_INIT_VERSION:      usize = 1924;
 const SB_LOG_BLOCKSIZE:    usize = 16;
 const SB_SEGS_PER_SEC:     usize = 24;
@@ -209,62 +209,41 @@ const INO_UID:       usize = 4;
 const INO_GID:       usize = 8;
 const INO_LINKS:     usize = 12;
 const INO_SIZE:      usize = 16;
-/// `i_advise` — one byte of per-inode flags, zero on every inode mkfs writes.
-const INO_ADVISE:    usize = 2;
 const INO_NAMELEN:   usize = 88;
 const INO_NAME:      usize = 92;   // [u8; 255]
 /// `__le32 i_current_depth` (Linux): number of hash levels in a directory.
 const INO_CUR_DEPTH: usize = 72;
 
-/// Node-block format of one volume. Every offset that differs between the
-/// legacy LeandrOS layout and Linux's `struct f2fs_inode` / `struct
-/// f2fs_node` lives here, so no code can touch a node block without naming
-/// the format of the volume it came from (`ms.sb.fmt`).
-///
-/// Legacy (`lx == false`, every pre-lxnode image, byte-for-byte as before):
-/// - `i_xattr_nid` @24, `i_blocks` @28 (only kept when `i_advise` carries
-///   `F2FS_ADVISE_IBLOCKS`), `{u64 sec, u32 nsec}` atime/mtime/ctime @36/48/60.
-///   Bytes 24..84 are never written by the old mkfs scripts, so old inodes
-///   read back "no xattrs, no counter, epoch".
-/// - i_addr @364, i_nid[5] @4056, footer @4076 = nid, ino, ofs, flag, cp_ver
-///   (5 × u32); 1019 addresses / nids per direct / indirect node.
-/// Linux (`lx == true`): `i_blocks` @24 (always maintained), i_atime @32,
-/// i_ctime @40, i_mtime @48, nsecs @56/60/64, `i_xattr_nid` @76, i_addr @360,
-/// i_nid[5] @4052, `struct node_footer` @4072 = nid u32, ino u32,
-/// flag u32 = (ofs << 3) | bits, cp_ver u64, next_blkaddr u32; 1018 per node.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Fmt { lx: bool }
+/// Node-block layout: Linux's `struct f2fs_inode` / `struct f2fs_node`, the
+/// only format this server mounts (lx or made by Linux's mkfs.f2fs).
+/// `i_blocks` @24, i_atime @32, i_ctime @40, i_mtime @48, nsecs @56/60/64,
+/// `i_xattr_nid` @76, i_addr @360, i_nid[5] @4052, `struct node_footer`
+/// @4072 = nid u32, ino u32, flag u32 = (ofs << 3) | bits, cp_ver u64,
+/// next_blkaddr u32; 1018 addresses / nids per direct / indirect node.
+const NODE_FOOTER: usize = 4072;
+/// Addresses per direct node == nids per (double) indirect node.
+const ADDRS_PER_BLOCK: usize = NODE_FOOTER / 4;
+const I_ADDR:      usize = 360;
+const I_NID:       usize = 4052;
+const I_XATTR_NID: usize = 76;
+const I_BLOCKS:    usize = 24;
+const I_ATIME:     usize = 32;
+const I_ATIME_NS:  usize = 56;
+const I_MTIME:     usize = 48;
+const I_MTIME_NS:  usize = 64;
+const I_CTIME:     usize = 40;
+const I_CTIME_NS:  usize = 60;
 
-impl Fmt {
-    #[inline] const fn footer(self) -> usize { if self.lx { 4072 } else { 4076 } }
-    /// Addresses per direct node == nids per (double) indirect node.
-    #[inline] const fn per_block(self) -> usize { self.footer() / 4 }
-    #[inline] const fn union(self) -> usize { if self.lx { 360 } else { 364 } }
-    #[inline] const fn nids(self) -> usize { if self.lx { 4052 } else { 4056 } }
-    #[inline] const fn xattr(self) -> usize { if self.lx { 76 } else { 24 } }
-    #[inline] const fn blocks(self) -> usize { if self.lx { 24 } else { 28 } }
-    #[inline] const fn atime(self) -> usize { if self.lx { 32 } else { 36 } }
-    #[inline] const fn atime_ns(self) -> usize { if self.lx { 56 } else { 44 } }
-    #[inline] const fn mtime(self) -> usize { 48 }
-    #[inline] const fn mtime_ns(self) -> usize { if self.lx { 64 } else { 56 } }
-    #[inline] const fn ctime(self) -> usize { if self.lx { 40 } else { 60 } }
-    #[inline] const fn ctime_ns(self) -> usize { if self.lx { 60 } else { 68 } }
-
-    /// Write a fresh node footer. `ofs` is the Linux node offset (inode 0,
-    /// dnode1 1, ... see `node_ofs_*`); the legacy footer never carried it.
-    fn write_footer(self, blk: &mut [u8], nid: u32, ino: u32, ofs: u32) {
-        let f = self.footer();
-        w32(blk, f, nid);
-        w32(blk, f + 4, ino);
-        if self.lx { w32(blk, f + 8, ofs << 3); }
-    }
-    #[inline] fn footer_nid(self, blk: &[u8]) -> u32 { r32(blk, self.footer()) }
-    #[inline] fn footer_ino(self, blk: &[u8]) -> u32 { r32(blk, self.footer() + 4) }
-    #[inline] fn set_footer_ino(self, blk: &mut [u8], ino: u32) { w32(blk, self.footer() + 4, ino); }
-    /// A dentry's type byte as a `DT_*` value: legacy volumes store `DT_*`,
-    /// Linux-format volumes `F2FS_FT_*`.
-    #[inline] fn dentry_dt(self, b: u8) -> u8 { if self.lx { ft_to_dt(b) } else { b } }
+/// Write a fresh node footer. `ofs` is the Linux node offset (inode 0,
+/// dnode1 1, ... see `node_ofs_*`).
+fn write_footer(blk: &mut [u8], nid: u32, ino: u32, ofs: u32) {
+    w32(blk, NODE_FOOTER, nid);
+    w32(blk, NODE_FOOTER + 4, ino);
+    w32(blk, NODE_FOOTER + 8, ofs << 3);
 }
+#[inline] fn footer_nid(blk: &[u8]) -> u32 { r32(blk, NODE_FOOTER) }
+#[inline] fn footer_ino(blk: &[u8]) -> u32 { r32(blk, NODE_FOOTER + 4) }
+#[inline] fn set_footer_ino(blk: &mut [u8], ino: u32) { w32(blk, NODE_FOOTER + 4, ino); }
 
 /// `DT_*` -> Linux `F2FS_FT_*` (UNKNOWN 0, REG 1, DIR 2, CHR 3, BLK 4,
 /// FIFO 5, SOCK 6, SYMLINK 7).
@@ -300,13 +279,6 @@ const F2FS_INLINE_XATTR:  u8 = 0x01;
 const F2FS_INLINE_DATA:   u8 = 0x02;
 const F2FS_INLINE_DENTRY: u8 = 0x04;
 
-/// `i_advise` bit meaning "`i_blocks` at `INO_BLOCKS` is maintained for this
-/// inode". Inodes this server creates set it; the ones the two mkfs scripts
-/// bake into the image do not, and those are all fully allocated, so `stat`
-/// falls back to deriving the count from `i_size` for them — which for a dense
-/// file is the right answer anyway. Without the bit there is no way to tell
-/// "sparse file, 3 blocks" from "pre-existing inode, count never kept".
-const F2FS_ADVISE_IBLOCKS: u8 = 0x80;
 
 // NAT
 /// Block `b` (0-based index in a copy) of a SIT/NAT area that starts at
@@ -322,8 +294,8 @@ const SIT_ENTRY_SIZE:     usize = 74;
 const SIT_PER_BLK:        usize = 4096 / SIT_ENTRY_SIZE; // 55
 const SIT_VMAP_OFF:       usize = 2;   // valid_map offset within sit entry
 /// Mask of block `i`'s bit in its SIT valid_map byte. Linux's f2fs_test_bit
-/// is MSB-first; legacy volumes were written LSB-first and keep that.
-#[inline] fn sit_vbit(f: Fmt, i: usize) -> u8 { if f.lx { 0x80 >> (i % 8) } else { 1 << (i % 8) } }
+/// is MSB-first.
+#[inline] fn sit_vbit(i: usize) -> u8 { 0x80 >> (i % 8) }
 const SIT_VBLOCKS_MASK:   u16   = 0x03FF;
 
 // Directory block constants (f2fs_dentry_block)
@@ -373,17 +345,17 @@ const SYMLINK_MAX_HOPS: u32 = 40;
 /// read-extent hint Linux trusts at mount. Any change that frees or moves a
 /// block must clear it, or Linux follows a stale extent to reused blocks.
 const I_EXT_OFF: usize = 348;
-fn lx_zero_ext(f: Fmt, blk: &mut [u8]) {
-    if f.lx { blk[I_EXT_OFF..I_EXT_OFF + 12].fill(0); }
+fn lx_zero_ext(blk: &mut [u8]) {
+    blk[I_EXT_OFF..I_EXT_OFF + 12].fill(0);
 }
 
-fn inode_addr_base(f: Fmt, blk: &[u8]) -> usize {
+fn inode_addr_base(blk: &[u8]) -> usize {
     if blk[INO_INLINE] & F2FS_EXTRA_ATTR != 0 {
-        let extra_sz = r16(blk, f.union()) as usize;
+        let extra_sz = r16(blk, I_ADDR) as usize;
         let slots = (extra_sz / 4).min(64);
-        f.union() + slots * 4
+        I_ADDR + slots * 4
     } else {
-        f.union()
+        I_ADDR
     }
 }
 
@@ -393,11 +365,10 @@ fn inode_addr_base(f: Fmt, blk: &[u8]) -> usize {
 /// `lx_inline_refused`) has no address slots at all: its i_addr area holds
 /// file bytes or dentries, never block addresses, so nothing (read, truncate,
 /// unlink's block release) may interpret it.
-fn inode_addr_end(f: Fmt, blk: &[u8]) -> usize {
-    if !f.lx { return f.nids(); }
+fn inode_addr_end(blk: &[u8]) -> usize {
     let fl = blk[INO_INLINE];
     if fl & (F2FS_INLINE_DATA | F2FS_INLINE_DENTRY) != 0 { return 0; }
-    f.nids() - inline_xattr_bytes(blk)
+    I_NID - inline_xattr_bytes(blk)
 }
 
 /// Bytes of inline xattr area at the end of the i_addr area: 50 slots by
@@ -411,9 +382,9 @@ fn inline_xattr_bytes(blk: &[u8]) -> usize {
 
 /// The inline area of a Linux inode (design f2fslxrw S1): after i_addr[0],
 /// before the inline xattrs. (start, end).
-fn inline_area(f: Fmt, blk: &[u8]) -> (usize, usize) {
-    let st = inode_addr_base(f, blk) + 4;
-    let en = f.nids() - inline_xattr_bytes(blk);
+fn inline_area(blk: &[u8]) -> (usize, usize) {
+    let st = inode_addr_base(blk) + 4;
+    let en = I_NID - inline_xattr_bytes(blk);
     (st, en.max(st))
 }
 
@@ -427,11 +398,11 @@ fn inline_dentry_layout(len: usize) -> (usize, usize, usize, usize) {
 }
 
 /// `iblk` is a Linux inode with inline dentries.
-fn lx_inline_dir(f: Fmt, iblk: &[u8]) -> bool { f.lx && iblk[INO_INLINE] & F2FS_INLINE_DENTRY != 0 }
+fn lx_inline_dir(iblk: &[u8]) -> bool { iblk[INO_INLINE] & F2FS_INLINE_DENTRY != 0 }
 
 /// Lookup in an inline directory.
-fn inline_dir_find(f: Fmt, iblk: &[u8], name: &[u8]) -> (u32, u8) {
-    let (st, en) = inline_area(f, iblk);
+fn inline_dir_find(iblk: &[u8], name: &[u8]) -> (u32, u8) {
+    let (st, en) = inline_area(iblk);
     let a = &iblk[st..en];
     let (nr, _bm, eo, no) = inline_dentry_layout(a.len());
     let mut slot = 0usize;
@@ -441,55 +412,55 @@ fn inline_dir_find(f: Fmt, iblk: &[u8], name: &[u8]) -> (u32, u8) {
         let nl = r16(a, e + 8) as usize;
         let n = no + slot * 8;
         if nl == name.len() && n + nl <= a.len() && &a[n..n + nl] == name {
-            return (r32(a, e + 4), f.dentry_dt(a[e + 10]));
+            return (r32(a, e + 4), ft_to_dt(a[e + 10]));
         }
         slot += nl.div_ceil(8).max(1);
     }
     (0, 0)
 }
 
-fn inode_get_blkaddr(f: Fmt, blk: &[u8], idx: usize) -> u32 {
-    let base = inode_addr_base(f, blk);
+fn inode_get_blkaddr(blk: &[u8], idx: usize) -> u32 {
+    let base = inode_addr_base(blk);
     let off = base + idx * 4;
-    if off + 4 > inode_addr_end(f, blk) { return 0; }
+    if off + 4 > inode_addr_end(blk) { return 0; }
     r32(blk, off)
 }
 
-fn inode_set_blkaddr(f: Fmt, blk: &mut [u8], idx: usize, addr: u32) {
-    let base = inode_addr_base(f, blk);
+fn inode_set_blkaddr(blk: &mut [u8], idx: usize, addr: u32) {
+    let base = inode_addr_base(blk);
     let off = base + idx * 4;
-    if off + 4 > inode_addr_end(f, blk) { return; }
-    lx_zero_ext(f, blk);
+    if off + 4 > inode_addr_end(blk) { return; }
+    lx_zero_ext(blk);
     w32(blk, off, addr);
 }
 
-fn inode_max_direct(f: Fmt, blk: &[u8]) -> usize {
-    let base = inode_addr_base(f, blk);
-    let end = inode_addr_end(f, blk);
+fn inode_max_direct(blk: &[u8]) -> usize {
+    let base = inode_addr_base(blk);
+    let end = inode_addr_end(blk);
     if end <= base { return 0; }
     (end - base) / 4
 }
 
-fn inode_get_nid(f: Fmt, blk: &[u8], n: usize) -> u32 {
-    r32(blk, f.nids() + n * 4)
+fn inode_get_nid(blk: &[u8], n: usize) -> u32 {
+    r32(blk, I_NID + n * 4)
 }
 
-fn inode_set_nid(f: Fmt, blk: &mut [u8], n: usize, val: u32) {
-    lx_zero_ext(f, blk);
-    w32(blk, f.nids() + n * 4, val);
+fn inode_set_nid(blk: &mut [u8], n: usize, val: u32) {
+    lx_zero_ext(blk);
+    w32(blk, I_NID + n * 4, val);
 }
 
-// In a direct_node block, the 1019 (legacy) / 1018 (lx) block addresses start
+// In a direct_node block, the 1018 block addresses start
 // at offset 0.
-fn dnode_get_blkaddr(f: Fmt, blk: &[u8], idx: usize) -> u32 {
+fn dnode_get_blkaddr(blk: &[u8], idx: usize) -> u32 {
     let off = idx * 4;
-    if off + 4 > f.footer() { return 0; }
+    if off + 4 > NODE_FOOTER { return 0; }
     r32(blk, off)
 }
 
-fn dnode_set_blkaddr(f: Fmt, blk: &mut [u8], idx: usize, addr: u32) {
+fn dnode_set_blkaddr(blk: &mut [u8], idx: usize, addr: u32) {
     let off = idx * 4;
-    if off + 4 > f.footer() { return; }
+    if off + 4 > NODE_FOOTER { return; }
     w32(blk, off, addr);
 }
 
@@ -1328,8 +1299,9 @@ struct SbInfo {
     nat_blkaddr: u32,
     main_blkaddr: u32,
     root_ino: u32,
-    /// Node-block format of this volume, from `init_version` (see `Fmt`).
-    fmt: Fmt,
+    /// `init_version` names the Linux node layout (lx or Linux-made); a
+    /// volume without it is the retired legacy layout and is not mounted.
+    lxnode: bool,
     /// Made by Linux's mkfs.f2fs (`init_version` starts "Linux version").
     native: bool,
     /// Inode checksum seed: crc32_le(~0, sb.uuid).
@@ -1371,7 +1343,7 @@ impl SbInfo {
             nat_blkaddr:     r32(sb, SB_NAT_BLKADDR),
             main_blkaddr:    r32(sb, SB_MAIN_BLKADDR),
             root_ino:        r32(sb, SB_ROOT_INO),
-            fmt:             Fmt { lx: native || sb[SB_INIT_VERSION..].starts_with(LX_TAG) },
+            lxnode:          native || sb[SB_INIT_VERSION..].starts_with(LX_TAG),
         })
     }
 }
@@ -3156,8 +3128,7 @@ fn nat_lookup(ms: &mut MountState, ino: u32) -> u32 {
 
 fn nat_update(ms: &mut MountState, nid: u32, blk_addr: u32) { nat_update_owned(ms, nid, None, blk_addr) }
 
-/// `nid`'s NAT entry. Legacy volumes record the nid itself as the entry's
-/// ino (unchanged). On lx volumes the entry names the OWNING inode, as Linux
+/// `nid`'s NAT entry. The entry names the OWNING inode, as Linux
 /// and fsck.f2fs require for direct/indirect/xattr nodes: a new node passes
 /// its owner, a relocation (owner None) keeps the ino already recorded.
 fn nat_update_owned(ms: &mut MountState, nid: u32, owner: Option<u32>, blk_addr: u32) {
@@ -3169,18 +3140,16 @@ fn nat_update_owned(ms: &mut MountState, nid: u32, owner: Option<u32>, blk_addr:
     // checkpoint pays one more scattered write for it (lane f2fsperf).
     let ino = {
         let cur = ms.cache.read(ms.dev, nat_blk as u64);
-        let ino = match (ms.sb.fmt.lx, owner) {
-            (false, _) => nid,
-            (true, Some(o)) => o,
-            (true, None) => { let k = r32(cur, off + 1); if k != 0 { k } else { nid } }
+        let ino = match owner {
+            Some(o) => o,
+            None => { let k = r32(cur, off + 1); if k != 0 { k } else { nid } }
         };
-        if (cur[off] == 1 || ms.sb.fmt.lx) && r32(cur, off + 1) == ino && r32(cur, off + 5) == blk_addr { return; }
+        if r32(cur, off + 1) == ino && r32(cur, off + 5) == blk_addr { return; }
         ino
     };
     let blk = ms.cache.get_mut(ms.dev, nat_blk as u64);
     // lx: the version belongs to the summaries already on disk (Linux's are
     // version 0); it is never changed, the SSA writers read it back.
-    if !ms.sb.fmt.lx { blk[off] = 1; }     // version bump
     w32(blk, off + 1, ino);               // ino
     w32(blk, off + 5, blk_addr);          // block_addr
 }
@@ -3197,10 +3166,10 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32, heads: bool) -> Option<u32
     // lx: the checkpoint's filler logs stay empty and typed (`linux_logs`)
     // unless nothing else is left (second pass).
     for pass in 0..2 {
-    if pass == 1 && (!ms.sb.fmt.lx || !heads) { break; }
+    if pass == 1 && !heads { break; }
     for seg_off in 0..total {
         let seg = (start_seg + seg_off) % total;
-        if pass == 0 && ms.sb.fmt.lx && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
+        if pass == 0 && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
         // Never hand back a segment one of the logs is *currently* writing
         // into. Before reclaim existed this could not happen — vblocks only
         // ever grew — but once a segment can drop back to zero valid blocks
@@ -3229,7 +3198,7 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32, heads: bool) -> Option<u32
 /// lx: set segment `seg`'s SIT type (0..2 data, 3..5 node logs), keeping
 /// `valid_nodes` equal to the sum over node-typed segments.
 pub(crate) fn sit_set_type(ms: &mut MountState, seg: u32, t: u16) {
-    if !ms.sb.fmt.lx || seg >= ms.sb.seg_cnt_main { return; }
+    if seg >= ms.sb.seg_cnt_main { return; }
     ssa_set_kind(ms, seg, (3..=5).contains(&t));
     let (blkno, off) = sit_entry_loc(ms, seg);
     let v = r16(ms.cache.read(ms.dev, blkno), off);
@@ -3243,7 +3212,6 @@ pub(crate) fn sit_set_type(ms: &mut MountState, seg: u32, t: u16) {
 }
 
 fn sit_mark_block_used(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
-    let fmt = ms.sb.fmt;
     let sit_blk_idx = seg / SIT_PER_BLK as u32;
     let sit_entry   = (seg % SIT_PER_BLK as u32) as usize;
     let sit_blkno   = ms.sb.sit_addr(sit_blk_idx);
@@ -3257,7 +3225,7 @@ fn sit_mark_block_used(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
     // full of live blocks. With the bit test vblocks == popcount(valid_map)
     // always (the mount repairs older volumes, `sit_repair`).
     let byte_idx = blk_in_seg as usize / 8;
-    let bit      = sit_vbit(fmt, blk_in_seg as usize);
+    let bit      = sit_vbit(blk_in_seg as usize);
     let map_off  = entry_off + SIT_VMAP_OFF + byte_idx;
     if map_off >= BLOCK_SIZE || blk[map_off] & bit != 0 { return; }
     blk[map_off] |= bit;
@@ -3300,14 +3268,13 @@ fn blkaddr_to_seg(ms: &MountState, phys: u32) -> Option<(u32, u32)> {
 /// shared indirect structures a block *can* be reached twice, so this is not
 /// theoretical.
 fn sit_mark_block_free(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
-    let fmt = ms.sb.fmt;
     let sit_blk_idx = seg / SIT_PER_BLK as u32;
     let sit_entry   = (seg % SIT_PER_BLK as u32) as usize;
     let sit_blkno   = ms.sb.sit_addr(sit_blk_idx);
     let blk = ms.cache.get_mut(ms.dev, sit_blkno as u64);
     let entry_off = sit_entry * SIT_ENTRY_SIZE;
     let byte_idx = blk_in_seg as usize / 8;
-    let bit      = sit_vbit(fmt, blk_in_seg as usize);
+    let bit      = sit_vbit(blk_in_seg as usize);
     let map_off  = entry_off + SIT_VMAP_OFF + byte_idx;
     if map_off >= BLOCK_SIZE { return; }
     let was_set = blk[map_off] & bit != 0;
@@ -3434,7 +3401,7 @@ const SSA_FOOTER: usize = 4091;
 /// summaries for it (lx, and the SSA area covers every main segment).
 pub(crate) fn ssa_blk(ms: &MountState, seg: u32) -> Option<u64> {
     let sb = &ms.sb;
-    if !sb.fmt.lx || seg >= sb.seg_cnt_main { return None; }
+    if seg >= sb.seg_cnt_main { return None; }
     if (sb.seg_cnt_ssa as u64) * (sb.blocks_per_seg as u64) < sb.seg_cnt_main as u64 { return None; }
     Some(sb.main_blkaddr as u64 - (sb.seg_cnt_ssa as u64) * (sb.blocks_per_seg as u64) + seg as u64)
 }
@@ -3449,7 +3416,7 @@ fn nat_version(ms: &mut MountState, nid: u32) -> u8 {
 /// Record the owner of main-area block `phys`: nid, offset in the owning
 /// node (0 for a node block) and the owner's NAT version (None: read it).
 pub(crate) fn ssa_set(ms: &mut MountState, phys: u32, nid: u32, ofs: u16, ver: Option<u8>) {
-    if !ms.sb.fmt.lx || phys < ms.sb.main_blkaddr { return; }
+    if phys < ms.sb.main_blkaddr { return; }
     let rel = phys - ms.sb.main_blkaddr;
     let (seg, b) = (rel / ms.sb.blocks_per_seg, (rel % ms.sb.blocks_per_seg) as usize);
     let blkno = match ssa_blk(ms, seg) { Some(x) => x, None => return };
@@ -3467,7 +3434,7 @@ pub(crate) fn ssa_set(ms: &mut MountState, phys: u32, nid: u32, ofs: u16, ver: O
 
 /// Owner (nid, ofs_in_node) recorded in the SSA for main-area block `phys`.
 pub(crate) fn ssa_get(ms: &mut MountState, phys: u32) -> Option<(u32, u16)> {
-    if !ms.sb.fmt.lx || phys < ms.sb.main_blkaddr { return None; }
+    if phys < ms.sb.main_blkaddr { return None; }
     let rel = phys - ms.sb.main_blkaddr;
     let (seg, b) = (rel / ms.sb.blocks_per_seg, (rel % ms.sb.blocks_per_seg) as usize);
     let blkno = ssa_blk(ms, seg)?;
@@ -3480,11 +3447,10 @@ pub(crate) fn ssa_get(ms: &mut MountState, phys: u32) -> Option<(u32, u16)> {
 pub(crate) fn sit_valid(ms: &mut MountState, phys: u32) -> bool {
     let (seg, b) = match blkaddr_to_seg(ms, phys) { Some(x) => x, None => return false };
     if seg >= ms.sb.seg_cnt_main { return false; }
-    let fmt = ms.sb.fmt;
     let blkno = ms.sb.sit_addr(seg / SIT_PER_BLK as u32);
     let off = (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE + SIT_VMAP_OFF + b as usize / 8;
     let blk = ms.cache.read(ms.dev, blkno as u64);
-    off < BLOCK_SIZE && blk[off] & sit_vbit(fmt, b as usize) != 0
+    off < BLOCK_SIZE && blk[off] & sit_vbit(b as usize) != 0
 }
 
 /// Linux check_index_in_prev_nodes: data block `a` is about to be owned by
@@ -3497,23 +3463,22 @@ pub(crate) fn drop_prev_owner(ms: &mut MountState, a: u32, nid: u32, ofs: u16) -
     if onid == 0 || (onid == nid && oofs == ofs) { return false; }
     let na = nat_lookup(ms, onid);
     if na == 0 { return false; }
-    let f = ms.sb.fmt;
     let (cur, oino) = {
         let b = ms.cache.read(ms.dev, na as u64);
-        let oino = f.footer_ino(b);
+        let oino = footer_ino(b);
         let isino = oino == onid;
         let idx = oofs as usize;
-        let cur = if isino { if idx < inode_max_direct(f, b) { inode_get_blkaddr(f, b, idx) } else { 0 } }
-                  else if idx < f.per_block() { dnode_get_blkaddr(f, b, idx) } else { 0 };
+        let cur = if isino { if idx < inode_max_direct(b) { inode_get_blkaddr(b, idx) } else { 0 } }
+                  else if idx < ADDRS_PER_BLOCK { dnode_get_blkaddr(b, idx) } else { 0 };
         (cur, oino)
     };
     if cur != a { return false; }
     {
         let b = ms.cache.get_mut(ms.dev, na as u64);
-        if oino == onid { inode_set_blkaddr(f, b, oofs as usize, 0); lx_zero_ext(f, b); } else { dnode_set_blkaddr(f, b, oofs as usize, 0); }
+        if oino == onid { inode_set_blkaddr(b, oofs as usize, 0); lx_zero_ext(b); } else { dnode_set_blkaddr(b, oofs as usize, 0); }
     }
     let ia = nat_lookup(ms, oino);
-    if ia != 0 { let b = ms.cache.get_mut(ms.dev, ia as u64); inode_add_blocks(f, b, -1); }
+    if ia != 0 { let b = ms.cache.get_mut(ms.dev, ia as u64); inode_add_blocks(b, -1); }
     true
 }
 
@@ -3533,7 +3498,6 @@ pub(crate) fn ssa_set_kind(ms: &mut MountState, seg: u32, node: bool) {
 /// pack has the data summaries at total-4 (node cursegs then come from the
 /// SSA area). So a non-umount tail is node, node, node, data, data, data.
 pub(crate) fn lx_tail_sums(ms: &mut MountState, logs: &LinuxLogs, umount: bool) -> Option<alloc::vec::Vec<u8>> {
-    if !ms.sb.fmt.lx { return None; }
     let mut out = alloc::vec![0u8; 6 * BLOCK_SIZE];
     for t in 0..6 {
         let blkno = ssa_blk(ms, logs[t].0)?;
@@ -3621,7 +3585,7 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
         // never handed to the general allocator (the four filler heads plus
         // a spare for each of our own two heads), and valid blocks stay
         // below user_block_count. Dirty segments are still reused by SSR.
-        let next = if ms.sb.fmt.lx {
+        let next = {
             let cap = (ms.sb.seg_cnt_main.saturating_sub(lx_ovp_segs(ms)) as u64) * bps as u64;
             if ms.valid_blocks >= cap { None }
             else {
@@ -3632,14 +3596,6 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
                     None => None,
                 }
             }
-        } else {
-        match sit_find_free_seg(ms, seg, false) {
-            Some(n) => Some(n),
-            None if ssr_enabled() => ssr_pick(ms, node, false)
-                .or_else(|| sit_find_free_seg(ms, seg, true))
-                .or_else(|| ssr_pick(ms, node, true)),
-            None => sit_find_free_seg(ms, seg, true),
-        }
         };
         let next = match next {
             Some(n) => n,
@@ -3682,7 +3638,7 @@ fn linux_chain(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], flags: u32) -> Op
     }
     let main = sb.main_blkaddr as u64;
     let end = main + sb.seg_cnt_main as u64 * bps;
-    let ft = sb.fmt.footer();
+    let ft = NODE_FOOTER;
     let mut addr = main + seg * bps + off;
     let mut all: alloc::vec::Vec<(durable::LxChain, bool)> = alloc::vec::Vec::new();
     let mut b = [0u8; BLOCK_SIZE];
@@ -3924,7 +3880,7 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
                 let mut ents = alloc::vec![0u8; cnt * SSA_ENTRY];
                 for j in 0..cnt {
                     if !rd(sb.main_blkaddr as u64 + seg as u64 * bps + j as u64, &mut blk) { bail!("node-scan"); }
-                    let nid = sb.fmt.footer_nid(&blk);
+                    let nid = footer_nid(&blk);
                     ents[j * SSA_ENTRY..j * SSA_ENTRY + 4].copy_from_slice(&nid.to_le_bytes());
                 }
                 if !put(t, &ents, cnt) { bail!("ssa-write"); }
@@ -3957,7 +3913,7 @@ fn seg_busy_map(ms: &mut MountState, seg: u32) -> SegMap {
         let o = off + SIT_VMAP_OFF + w * 8;
         let mut bytes: [u8; 8] = blk[o..o + 8].try_into().unwrap();
         // In-memory SegMap is LSB-first; lx's on-disk map is MSB-first.
-        if ms.sb.fmt.lx { for x in bytes.iter_mut() { *x = x.reverse_bits(); } }
+        for x in bytes.iter_mut() { *x = x.reverse_bits(); }
         *word = u64::from_le_bytes(bytes);
     }
     for (w, word) in m.iter_mut().enumerate() { *word |= prot_word(ms, seg, w); }
@@ -3978,17 +3934,15 @@ fn ssr_pick(ms: &mut MountState, node: bool, heads: bool) -> Option<u32> {
     let mut best: Option<(u32, u32)> = None;
     for seg in 0..ms.sb.seg_cnt_main {
         if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno { continue; }
-        if ms.sb.fmt.lx && !heads && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
-        if ms.sb.fmt.lx {
-            // A data block in a node segment (or the reverse) is something
-            // fsck.f2fs cannot repair: reuse only a segment of the same class.
-            let (blkno, off) = sit_entry_loc(ms, seg);
-            let v = r16(ms.cache.read(ms.dev, blkno), off);
-            if v & SIT_VBLOCKS_MASK != 0 && sit_is_node(v) != node { continue; }
-            // An empty segment belongs to the reserve (`LX_RESERVE_SEGS`);
-            // only `log_alloc`'s spare check may hand it out.
-            if !heads && v & SIT_VBLOCKS_MASK == 0 { continue; }
-        }
+        if !heads && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
+        // A data block in a node segment (or the reverse) is something
+        // fsck.f2fs cannot repair: reuse only a segment of the same class.
+        let (blkno, off) = sit_entry_loc(ms, seg);
+        let v = r16(ms.cache.read(ms.dev, blkno), off);
+        if v & SIT_VBLOCKS_MASK != 0 && sit_is_node(v) != node { continue; }
+        // An empty segment belongs to the reserve (`LX_RESERVE_SEGS`);
+        // only `log_alloc`'s spare check may hand it out.
+        if !heads && v & SIT_VBLOCKS_MASK == 0 { continue; }
         let m = seg_busy_map(ms, seg);
         let busy: u32 = m.iter().map(|w| w.count_ones()).sum();
         let usable = bps.saturating_sub(busy);
@@ -4246,7 +4200,7 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
             let free = |b: u32| m[b as usize / 64] & (1u64 << (b % 64)) == 0;
             let ok = |b: &u32| free(*b) && free((*b & !7) | (7 - (*b & 7)));
             // Every head is SSR: lx takes a free block before `off` too.
-            let b = (off as u32..bps).find(ok).or_else(|| if ms.sb.fmt.lx { (0..off as u32).find(ok) } else { None });
+            let b = (off as u32..bps).find(ok).or_else(|| (0..off as u32).find(ok));
             if let Some(b) = b { logs[t] = (seg, b as u16); }
         }
     }
@@ -4255,17 +4209,15 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
     for t in 0..6 {
         if logs[t].0 != u32::MAX { continue; }
         // lx: keep the previous pick while it is still empty (stable cursegs).
-        if ms.sb.fmt.lx {
-            let (seg, off) = ms.cp.logs[t];
-            if seg < main && off == 0 && !logs.iter().any(|l| l.0 == seg)
-                && seg != ms.cp.cur_data_segno && seg != ms.cp.cur_node_segno
-                && !avoid.contains(&seg) && !prot_any(ms, seg) {
-                let (blkno, o) = sit_entry_loc(ms, seg);
-                if r16(ms.cache.read(ms.dev, blkno), o) & SIT_VBLOCKS_MASK == 0 {
-                    logs[t] = (seg, 0);
-                    after = seg;
-                    continue;
-                }
+        let (seg, off) = ms.cp.logs[t];
+        if seg < main && off == 0 && !logs.iter().any(|l| l.0 == seg)
+            && seg != ms.cp.cur_data_segno && seg != ms.cp.cur_node_segno
+            && !avoid.contains(&seg) && !prot_any(ms, seg) {
+            let (blkno, o) = sit_entry_loc(ms, seg);
+            if r16(ms.cache.read(ms.dev, blkno), o) & SIT_VBLOCKS_MASK == 0 {
+                logs[t] = (seg, 0);
+                after = seg;
+                continue;
             }
         }
         let mut pick = None;
@@ -4287,33 +4239,30 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
         // is not free" + "Incorrect curseg [1] type(SIT) [0]").
         let (seg, off) = match pick {
             Some(s) => (s, 0),
-            None if ms.sb.fmt.lx => match lx_ssr_head(ms, &logs, t, avoid) {
+            None => match lx_ssr_head(ms, &logs, t, avoid) {
                 Some(h) => { ssr[t] = true; h }
                 // Nothing valid exists: at least not a segment another head has.
                 None => ((0..main).find(|&g| !logs.iter().any(|l| l.0 == g)
                     && g != ms.cp.cur_data_segno && g != ms.cp.cur_node_segno).unwrap_or(t as u32), 0),
             },
-            None => (t as u32, 0),
         };
         logs[t] = (seg, off);
         after = seg;
     }
-    if ms.sb.fmt.lx {
-        // Type the six heads so fsck.f2fs finds each curseg in a segment of
-        // its own type; a non-empty fallback segment keeps its type unless it
-        // was chosen as an SSR head (same class, so only data<->data or
-        // node<->node changes).
-        for t in 0..6 {
-            let seg = logs[t].0;
-            if seg >= main { continue; }
-            let (blkno, off) = sit_entry_loc(ms, seg);
-            let empty = r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0;
-            if empty || ssr[t] || (t == 0 && seg == ms.cp.cur_data_segno) || (t == 3 && seg == ms.cp.cur_node_segno) {
-                sit_set_type(ms, seg, t as u16);
-            }
+    // Type the six heads so fsck.f2fs finds each curseg in a segment of
+    // its own type; a non-empty fallback segment keeps its type unless it
+    // was chosen as an SSR head (same class, so only data<->data or
+    // node<->node changes).
+    for t in 0..6 {
+        let seg = logs[t].0;
+        if seg >= main { continue; }
+        let (blkno, off) = sit_entry_loc(ms, seg);
+        let empty = r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0;
+        if empty || ssr[t] || (t == 0 && seg == ms.cp.cur_data_segno) || (t == 3 && seg == ms.cp.cur_node_segno) {
+            sit_set_type(ms, seg, t as u16);
         }
-        ms.cp.logs = logs;
     }
+    ms.cp.logs = logs;
     logs
 }
 
@@ -4355,7 +4304,6 @@ fn lx_ssr_head(ms: &mut MountState, logs: &LinuxLogs, t: usize, avoid: &[u32]) -
 /// the SIT type changes ride in it): pick and type the six log heads and
 /// recount free_segment_count (segments with no valid block, not a head).
 pub(crate) fn lx_cp_prep(ms: &mut MountState) {
-    if !ms.sb.fmt.lx { return; }
     if ms.cache.icsum.is_some() {
         for i in 0..ms.cache.meta.len() {
             if ms.cache.meta[i].dirty { let d = ms.dev; ms.cache.icsum_stamp(d, i); }
@@ -4392,7 +4340,7 @@ fn linux_cp_fields(ms: &mut MountState, buf: &mut [u8; BLOCK_SIZE], logs: &Linux
     w32(buf, CP_PACK_TOTAL,      pack);
     w32(buf, CP_START_SUM,       pack - durable::LINUX_TAIL);
     w32(buf, CP_VALID_NODE_CNT,  ms.valid_nodes as u32);
-    if ms.sb.fmt.lx { w32(buf, CP_VALID_INODE_CNT, ms.cp.valid_inodes); }
+    w32(buf, CP_VALID_INODE_CNT, ms.cp.valid_inodes);
     w32(buf, CP_SIT_BM_SIZE,     (ms.sb.seg_cnt_sit / 2) * bps / 8);
     w32(buf, CP_NAT_BM_SIZE,     (ms.sb.seg_cnt_nat / 2) * bps / 8);
     // This kernel's own heads go to CP_OWN_HEADS, verbatim: a remount
@@ -4604,7 +4552,7 @@ fn block_region(ms: &MountState, blk: u64, data: &[u8; BLOCK_SIZE]) -> usize {
     let sb = &ms.sb;
     let nat_end = sb.nat_blkaddr as u64 + sb.seg_cnt_nat as u64 * sb.blocks_per_seg as u64;
     if blk >= sb.main_blkaddr as u64 {
-        let nid = sb.fmt.footer_nid(data);
+        let nid = footer_nid(data);
         if nid != 0 {
             let nat_blk = sb.nat_addr(nid / NAT_ENTRY_PER_BLK as u32) as u64;
             if let Some(i) = ms.cache.find(nat_blk) {
@@ -5257,14 +5205,14 @@ fn inode_links(blk: &[u8]) -> u32 { r32(blk, INO_LINKS) }
 fn inode_is_dir(blk: &[u8]) -> bool { (inode_mode(blk) & S_IFMT) == S_IFDIR }
 
 /// `(atime, mtime, ctime)` as `(sec, nsec)` pairs.
-fn inode_times(f: Fmt, blk: &[u8]) -> ((i64, i64), (i64, i64), (i64, i64)) {
-    ((r64(blk, f.atime()) as i64, r32(blk, f.atime_ns()) as i64),
-     (r64(blk, f.mtime()) as i64, r32(blk, f.mtime_ns()) as i64),
-     (r64(blk, f.ctime()) as i64, r32(blk, f.ctime_ns()) as i64))
+fn inode_times(blk: &[u8]) -> ((i64, i64), (i64, i64), (i64, i64)) {
+    ((r64(blk, I_ATIME) as i64, r32(blk, I_ATIME_NS) as i64),
+     (r64(blk, I_MTIME) as i64, r32(blk, I_MTIME_NS) as i64),
+     (r64(blk, I_CTIME) as i64, r32(blk, I_CTIME_NS) as i64))
 }
-fn inode_set_atime(f: Fmt, blk: &mut [u8], t: (i64, i64)) { w64(blk, f.atime(), t.0 as u64); w32(blk, f.atime_ns(), t.1 as u32); }
-fn inode_set_mtime(f: Fmt, blk: &mut [u8], t: (i64, i64)) { w64(blk, f.mtime(), t.0 as u64); w32(blk, f.mtime_ns(), t.1 as u32); }
-fn inode_set_ctime(f: Fmt, blk: &mut [u8], t: (i64, i64)) { w64(blk, f.ctime(), t.0 as u64); w32(blk, f.ctime_ns(), t.1 as u32); }
+fn inode_set_atime(blk: &mut [u8], t: (i64, i64)) { w64(blk, I_ATIME, t.0 as u64); w32(blk, I_ATIME_NS, t.1 as u32); }
+fn inode_set_mtime(blk: &mut [u8], t: (i64, i64)) { w64(blk, I_MTIME, t.0 as u64); w32(blk, I_MTIME_NS, t.1 as u32); }
+fn inode_set_ctime(blk: &mut [u8], t: (i64, i64)) { w64(blk, I_CTIME, t.0 as u64); w32(blk, I_CTIME_NS, t.1 as u32); }
 /// Strip the set-ID bits of `ino` as a write/truncate by `ms.cred` (the
 /// caller of the current request) requires — see `xattr::setid_kill_bits`.
 /// A no-op (one cached inode read) for the common file without them.
@@ -5276,11 +5224,11 @@ fn kill_setid(ms: &mut MountState, ino: u32) {
     if kill == 0 { return; }
     let iblk = ms.cache.get_mut(ms.dev, addr as u64);
     w16(iblk, INO_MODE, mode & !kill);
-    inode_set_ctime(ms.sb.fmt, iblk, sched::clock_ts());
+    inode_set_ctime(iblk, sched::clock_ts());
     nat_update(ms, ino, addr);
 }
 /// Data changed: mtime and ctime = now.
-fn inode_touch_mtime(f: Fmt, blk: &mut [u8]) { let n = sched::clock_ts(); inode_set_mtime(f, blk, n); inode_set_ctime(f, blk, n); }
+fn inode_touch_mtime(blk: &mut [u8]) { let n = sched::clock_ts(); inode_set_mtime(blk, n); inode_set_ctime(blk, n); }
 /// Metadata changed: ctime = now, on the live inode block of `ino`.
 fn touch_ctime(ms: &mut MountState, ino: u32) {
     mm::pagecache::note_ctime(page_cache_key(ms.port, ino));
@@ -5288,7 +5236,7 @@ fn touch_ctime(ms: &mut MountState, ino: u32) {
     if addr == 0 { return; }
     {
         let iblk = ms.cache.get_mut(ms.dev, addr as u64);
-        inode_set_ctime(ms.sb.fmt, iblk, sched::clock_ts());
+        inode_set_ctime(iblk, sched::clock_ts());
     }
     nat_update(ms, ino, addr);
 }
@@ -5312,7 +5260,7 @@ fn touch_atime_relatime(ms: &mut MountState, ino: u32) {
     let now = sched::clock_ts();
     let needs = {
         let iblk = ms.cache.read(ms.dev, addr as u64);
-        let (at, mt, ct) = inode_times(ms.sb.fmt, iblk);
+        let (at, mt, ct) = inode_times(iblk);
         relatime_needs_update(at, mt, ct, now)
     };
     if !needs { return; }
@@ -5327,39 +5275,28 @@ fn touch_atime_relatime(ms: &mut MountState, ino: u32) {
     // atime (it reads through the cache). The inode stays at `addr`, so the
     // NAT entry needs no update either.
     let iblk = ms.cache.get_clean_mut(ms.dev, addr as u64);
-    inode_set_atime(ms.sb.fmt, iblk, now);
+    inode_set_atime(iblk, now);
 }
 
-/// Blocks charged to this inode, or `None` when the inode predates the counter
-/// (see `F2FS_ADVISE_IBLOCKS`).
-fn inode_blocks(f: Fmt, blk: &[u8]) -> Option<u64> {
-    // Linux-format inodes always carry i_blocks (there 0x80 is FADVISE_TRUNC_BIT).
-    if f.lx || blk[INO_ADVISE] & F2FS_ADVISE_IBLOCKS != 0 { Some(r64(blk, f.blocks())) } else { None }
-}
+/// Blocks charged to this inode (Linux inodes always carry i_blocks).
+fn inode_blocks(blk: &[u8]) -> u64 { r64(blk, I_BLOCKS) }
 
-/// `st_blocks` (512-byte units) for an inode, from the real count when it is
-/// kept and from `i_size` otherwise. Saturating rather than wrapping: a bad
+/// `st_blocks` (512-byte units) for an inode. Saturating rather than wrapping: a bad
 /// count must not report a file as astronomically large, and it must never
 /// underflow to `u64::MAX`.
-fn inode_stat_blocks(f: Fmt, blk: &[u8]) -> u64 {
-    match inode_blocks(f, blk) {
-        Some(b) => b.saturating_mul((BLOCK_SIZE / 512) as u64),
-        None    => inode_size(blk).div_ceil(512),
-    }
+fn inode_stat_blocks(blk: &[u8]) -> u64 {
+    inode_blocks(blk).saturating_mul((BLOCK_SIZE / 512) as u64)
 }
 
 /// Charge (`delta > 0`) or refund (`delta < 0`) blocks on an inode image.
-/// No-op on an inode that does not carry the counter, so an old inode is never
-/// given a half-maintained one.
-fn inode_add_blocks(f: Fmt, blk: &mut [u8], delta: i64) {
-    if !f.lx && blk[INO_ADVISE] & F2FS_ADVISE_IBLOCKS == 0 { return; }
-    let cur = r64(blk, f.blocks());
+fn inode_add_blocks(blk: &mut [u8], delta: i64) {
+    let cur = r64(blk, I_BLOCKS);
     let new = if delta >= 0 {
         cur.saturating_add(delta as u64)
     } else {
         cur.saturating_sub(delta.unsigned_abs())
     };
-    w64(blk, f.blocks(), new);
+    w64(blk, I_BLOCKS, new);
 }
 
 /// Allocate and initialize a new inode block; returns (ino, phys_blkaddr).
@@ -5378,32 +5315,27 @@ fn create_inode(ms: &mut MountState, mode: u16, uid: u32, gid: u32,
     w32(&mut buf, INO_GID,     gid);
     w32(&mut buf, INO_LINKS,   1);
     w64(&mut buf, INO_SIZE,    0);
-    // Opt this inode into real block accounting, starting at 1 for the inode
-    // block itself — same convention as Linux F2FS, where i_blocks counts the
-    // node blocks too.
-    // A Linux-format inode always keeps the counter, and there 0x80 means
-    // something else (FADVISE_TRUNC_BIT), so the opt-in bit is legacy-only.
-    let f = ms.sb.fmt;
-    if !f.lx { buf[INO_ADVISE] |= F2FS_ADVISE_IBLOCKS; }
-    w64(&mut buf, f.blocks(),  1);
+    // Block accounting starts at 1 for the inode block itself, as in Linux
+    // F2FS, where i_blocks counts the node blocks too.
+    w64(&mut buf, I_BLOCKS,  1);
     // Linux: a directory starts with one hash level (i_current_depth 1).
-    if f.lx && mode & S_IFMT == S_IFDIR { w32(&mut buf, INO_CUR_DEPTH, 1); }
+    if mode & S_IFMT == S_IFDIR { w32(&mut buf, INO_CUR_DEPTH, 1); }
     let now = sched::clock_ts();
-    inode_set_atime(ms.sb.fmt, &mut buf, now);
-    inode_set_mtime(ms.sb.fmt, &mut buf, now);
-    inode_set_ctime(ms.sb.fmt, &mut buf, now);
+    inode_set_atime(&mut buf, now);
+    inode_set_mtime(&mut buf, now);
+    inode_set_ctime(&mut buf, now);
     w32(&mut buf, 84, parent_ino); // i_pino
     let namelen = name.len().min(255) as u32;
     w32(&mut buf, INO_NAMELEN, namelen);
     buf[INO_NAME..INO_NAME + namelen as usize].copy_from_slice(&name[..namelen as usize]);
 
     // node footer: nid + ino (an inode is node offset 0)
-    f.write_footer(&mut buf, ino, ino, 0);
+    write_footer(&mut buf, ino, ino, 0);
 
     ms.cache.write(ms.dev, phys as u64, &buf);
     nat_update(ms, ino, phys);
     ssa_set(ms, phys, ino, 0, None);
-    if f.lx { ms.cp.valid_inodes = ms.cp.valid_inodes.wrapping_add(1); }
+    ms.cp.valid_inodes = ms.cp.valid_inodes.wrapping_add(1);
     // Its name is not durable before a checkpoint: a roll-forward fsync
     // carries the dentry mark (lane f2fsync).
     durable::ns_note(ms, ino, true);
@@ -5435,88 +5367,88 @@ fn inode_logical_to_phys(ms: &mut MountState, ino: u32, idx: u64) -> u32 {
     let iblk = ms.cache.read(ms.dev, iblkaddr as u64);
     let iblk = unsafe { &*(iblk as *const [u8; BLOCK_SIZE]) }; // detach lifetime
 
-    let max_direct = inode_max_direct(ms.sb.fmt, iblk) as u64;
+    let max_direct = inode_max_direct(iblk) as u64;
     if idx < max_direct {
-        return inode_get_blkaddr(ms.sb.fmt, iblk, idx as usize);
+        return inode_get_blkaddr(iblk, idx as usize);
     }
 
     let mut rem = idx - max_direct;
-    let apd = ms.sb.fmt.per_block() as u64;
-    let npb = ms.sb.fmt.per_block() as u64;  // 1019
+    let apd = ADDRS_PER_BLOCK as u64;
+    let npb = ADDRS_PER_BLOCK as u64;  // 1019
 
     // Direct node 0: i_nid[0]
     if rem < apd {
-        let nid = inode_get_nid(ms.sb.fmt, iblk, 0);
+        let nid = inode_get_nid(iblk, 0);
         if nid == 0 { return 0; }
         let dblkaddr = nat_lookup(ms, nid);
         let dblk = ms.cache.read(ms.dev, dblkaddr as u64);
-        return dnode_get_blkaddr(ms.sb.fmt, dblk, rem as usize);
+        return dnode_get_blkaddr(dblk, rem as usize);
     }
     rem -= apd;
 
     // Direct node 1: i_nid[1]
     if rem < apd {
-        let nid = inode_get_nid(ms.sb.fmt, iblk, 1);
+        let nid = inode_get_nid(iblk, 1);
         if nid == 0 { return 0; }
         let dblkaddr = nat_lookup(ms, nid);
         let dblk = ms.cache.read(ms.dev, dblkaddr as u64);
-        return dnode_get_blkaddr(ms.sb.fmt, dblk, rem as usize);
+        return dnode_get_blkaddr(dblk, rem as usize);
     }
     rem -= apd;
 
     // Indirect node 0: i_nid[2]
     let blocks_per_indirect = npb * apd;
     if rem < blocks_per_indirect {
-        let nid = inode_get_nid(ms.sb.fmt, iblk, 2);
+        let nid = inode_get_nid(iblk, 2);
         if nid == 0 { return 0; }
         let ind_blkaddr = nat_lookup(ms, nid);
         let ind_blk = ms.cache.read(ms.dev, ind_blkaddr as u64);
         let dnode_idx = rem / apd;
         let dnode_off = rem % apd;
-        let dnid = dnode_get_blkaddr(ms.sb.fmt, ind_blk, dnode_idx as usize);
+        let dnid = dnode_get_blkaddr(ind_blk, dnode_idx as usize);
         if dnid == 0 { return 0; }
         let dblkaddr = nat_lookup(ms, dnid);
         let dblk = ms.cache.read(ms.dev, dblkaddr as u64);
-        return dnode_get_blkaddr(ms.sb.fmt, dblk, dnode_off as usize);
+        return dnode_get_blkaddr(dblk, dnode_off as usize);
     }
     rem -= blocks_per_indirect;
 
     // Indirect node 1: i_nid[3]
     if rem < blocks_per_indirect {
-        let nid = inode_get_nid(ms.sb.fmt, iblk, 3);
+        let nid = inode_get_nid(iblk, 3);
         if nid == 0 { return 0; }
         let ind_blkaddr = nat_lookup(ms, nid);
         let ind_blk = ms.cache.read(ms.dev, ind_blkaddr as u64);
         let dnode_idx = rem / apd;
         let dnode_off = rem % apd;
-        let dnid = dnode_get_blkaddr(ms.sb.fmt, ind_blk, dnode_idx as usize);
+        let dnid = dnode_get_blkaddr(ind_blk, dnode_idx as usize);
         if dnid == 0 { return 0; }
         let dblkaddr = nat_lookup(ms, dnid);
         let dblk = ms.cache.read(ms.dev, dblkaddr as u64);
-        return dnode_get_blkaddr(ms.sb.fmt, dblk, dnode_off as usize);
+        return dnode_get_blkaddr(dblk, dnode_off as usize);
     }
     rem -= blocks_per_indirect;
 
     // Double indirect node: i_nid[4]
     let blocks_per_dindirect = npb * blocks_per_indirect;
     if rem < blocks_per_dindirect {
-        let nid = inode_get_nid(ms.sb.fmt, iblk, 4);
+        let nid = inode_get_nid(iblk, 4);
         if nid == 0 { return 0; }
         let dind_blkaddr = nat_lookup(ms, nid);
         let dind_blk = ms.cache.read(ms.dev, dind_blkaddr as u64);
         let ind_idx = rem / blocks_per_indirect;
         let ind_rem = rem % blocks_per_indirect;
-        let ind_nid = dnode_get_blkaddr(ms.sb.fmt, dind_blk, ind_idx as usize);
+        let ind_nid = dnode_get_blkaddr(dind_blk, ind_idx as usize);
         if ind_nid == 0 { return 0; }
         let ind_blkaddr = nat_lookup(ms, ind_nid);
         let ind_blk = ms.cache.read(ms.dev, ind_blkaddr as u64);
         let dnode_idx = ind_rem / apd;
         let dnode_off = ind_rem % apd;
-        let dnid = dnode_get_blkaddr(ms.sb.fmt, ind_blk, dnode_idx as usize);
+        let dnid = dnode_get_blkaddr(ind_blk, dnode_idx as usize);
         if dnid == 0 { return 0; }
         let dblkaddr = nat_lookup(ms, dnid);
         let dblk = ms.cache.read(ms.dev, dblkaddr as u64);
-        return dnode_get_blkaddr(ms.sb.fmt, dblk, dnode_off as usize);
+        return dnode_get_blkaddr(dblk, dnode_off as usize);
     }
 
     0
@@ -5542,9 +5474,9 @@ fn free_dnode(ms: &mut MountState, nid: u32) {
     let dblkaddr = nat_lookup(ms, nid);
     if dblkaddr == 0 { return; }
     let dblk = read_block_copy(ms, dblkaddr);
-    let apd = ms.sb.fmt.per_block();
+    let apd = ADDRS_PER_BLOCK;
     for i in 0..apd {
-        free_block(ms, dnode_get_blkaddr(ms.sb.fmt, &dblk, i));
+        free_block(ms, dnode_get_blkaddr(&dblk, i));
     }
     free_block(ms, dblkaddr);
     durable::node_freed(ms, nid);
@@ -5569,45 +5501,45 @@ fn free_inode_data_and_nodes(ms: &mut MountState, ino: u32) {
     let iblk = read_block_copy(ms, iblkaddr);
 
     // Inline direct addresses.
-    let max_direct = inode_max_direct(ms.sb.fmt, &iblk);
+    let max_direct = inode_max_direct(&iblk);
     for i in 0..max_direct {
-        free_block(ms, inode_get_blkaddr(ms.sb.fmt, &iblk, i));
+        free_block(ms, inode_get_blkaddr(&iblk, i));
     }
 
     // i_nid[0], i_nid[1]: direct nodes.
-    free_dnode(ms, inode_get_nid(ms.sb.fmt, &iblk, 0));
-    free_dnode(ms, inode_get_nid(ms.sb.fmt, &iblk, 1));
+    free_dnode(ms, inode_get_nid(&iblk, 0));
+    free_dnode(ms, inode_get_nid(&iblk, 1));
 
-    let npb = ms.sb.fmt.per_block();
+    let npb = ADDRS_PER_BLOCK;
 
     // i_nid[2], i_nid[3]: single-indirect — a block of dnode nids.
     for slot in 2..=3usize {
-        let ind_nid = inode_get_nid(ms.sb.fmt, &iblk, slot);
+        let ind_nid = inode_get_nid(&iblk, slot);
         if ind_nid == 0 { continue; }
         let ind_blkaddr = nat_lookup(ms, ind_nid);
         if ind_blkaddr == 0 { continue; }
         let ind_blk = read_block_copy(ms, ind_blkaddr);
         for i in 0..npb {
-            free_dnode(ms, dnode_get_blkaddr(ms.sb.fmt, &ind_blk, i));
+            free_dnode(ms, dnode_get_blkaddr(&ind_blk, i));
         }
         free_block(ms, ind_blkaddr);
         durable::node_freed(ms, ind_nid);
     }
 
     // i_nid[4]: double-indirect — a block of indirect-node nids.
-    let dind_nid = inode_get_nid(ms.sb.fmt, &iblk, 4);
+    let dind_nid = inode_get_nid(&iblk, 4);
     if dind_nid != 0 {
         let dind_blkaddr = nat_lookup(ms, dind_nid);
         if dind_blkaddr != 0 {
             let dind_blk = read_block_copy(ms, dind_blkaddr);
             for i in 0..npb {
-                let ind_nid = dnode_get_blkaddr(ms.sb.fmt, &dind_blk, i);
+                let ind_nid = dnode_get_blkaddr(&dind_blk, i);
                 if ind_nid == 0 { continue; }
                 let ind_blkaddr = nat_lookup(ms, ind_nid);
                 if ind_blkaddr == 0 { continue; }
                 let ind_blk = read_block_copy(ms, ind_blkaddr);
                 for j in 0..npb {
-                    free_dnode(ms, dnode_get_blkaddr(ms.sb.fmt, &ind_blk, j));
+                    free_dnode(ms, dnode_get_blkaddr(&ind_blk, j));
                 }
                 free_block(ms, ind_blkaddr);
                 durable::node_freed(ms, ind_nid);
@@ -5622,7 +5554,7 @@ fn free_inode_data_and_nodes(ms: &mut MountState, ino: u32) {
     // allocator. Like every other nid here its NAT entry is left stale (nids are
     // never recycled without a free list), and the inode block itself — which
     // still carries INO_XATTR — is discarded by the caller.
-    let xnid = r32(&iblk, ms.sb.fmt.xattr());
+    let xnid = r32(&iblk, I_XATTR_NID);
     if xnid != 0 {
         let xaddr = nat_lookup(ms, xnid);
         if xaddr != 0 { free_block(ms, xaddr); durable::node_freed(ms, xnid); }
@@ -5671,44 +5603,44 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
         }
     }
 
-    let apd = ms.sb.fmt.per_block() as u64;
-    let npb = ms.sb.fmt.per_block() as u64;
+    let apd = ADDRS_PER_BLOCK as u64;
+    let npb = ADDRS_PER_BLOCK as u64;
 
     let mut iblk = read_block_copy(ms, iblkaddr);
 
     // Inline direct addresses: logical index == slot.
-    let max_direct = inode_max_direct(ms.sb.fmt, &iblk);
+    let max_direct = inode_max_direct(&iblk);
     let mut freed = 0u64;
     for i in 0..max_direct {
         if i as u64 >= keep {
-            if free_block(ms, inode_get_blkaddr(ms.sb.fmt, &iblk, i)) { freed += 1; }
-            inode_set_blkaddr(ms.sb.fmt, &mut iblk, i, 0);
+            if free_block(ms, inode_get_blkaddr(&iblk, i)) { freed += 1; }
+            inode_set_blkaddr(&mut iblk, i, 0);
         }
     }
     let mut base = max_direct as u64;
 
     // i_nid[0], i_nid[1]: direct nodes.
     for slot in 0..=1usize {
-        let nid = inode_get_nid(ms.sb.fmt, &iblk, slot);
-        if truncate_dnode(ms, ino, nid, base, keep, &mut freed) { inode_set_nid(ms.sb.fmt, &mut iblk, slot, 0); }
+        let nid = inode_get_nid(&iblk, slot);
+        if truncate_dnode(ms, ino, nid, base, keep, &mut freed) { inode_set_nid(&mut iblk, slot, 0); }
         base += apd;
     }
 
     // i_nid[2], i_nid[3]: single-indirect.
     let per_ind = npb * apd;
     for slot in 2..=3usize {
-        let nid = inode_get_nid(ms.sb.fmt, &iblk, slot);
-        if truncate_indirect(ms, ino, nid, base, keep, &mut freed) { inode_set_nid(ms.sb.fmt, &mut iblk, slot, 0); }
+        let nid = inode_get_nid(&iblk, slot);
+        if truncate_indirect(ms, ino, nid, base, keep, &mut freed) { inode_set_nid(&mut iblk, slot, 0); }
         base += per_ind;
     }
 
     // i_nid[4]: double-indirect.
-    let dind_nid = inode_get_nid(ms.sb.fmt, &iblk, 4);
-    if truncate_dindirect(ms, ino, dind_nid, base, keep, &mut freed) { inode_set_nid(ms.sb.fmt, &mut iblk, 4, 0); }
+    let dind_nid = inode_get_nid(&iblk, 4);
+    if truncate_dindirect(ms, ino, dind_nid, base, keep, &mut freed) { inode_set_nid(&mut iblk, 4, 0); }
 
-    inode_add_blocks(ms.sb.fmt, &mut iblk, -(freed as i64));
+    inode_add_blocks(&mut iblk, -(freed as i64));
     w64(&mut iblk, INO_SIZE, new_len);
-    lx_zero_ext(ms.sb.fmt, &mut iblk);
+    lx_zero_ext(&mut iblk);
     ms.cache.write(ms.dev, iblkaddr as u64, &iblk);
     nat_update(ms, ino, iblkaddr);
     // Pages past the new end leave the page cache, the new last page's tail
@@ -5721,7 +5653,7 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
 /// node block itself was freed because nothing live remained, so the caller
 /// must clear its pointer.
 fn truncate_dnode(ms: &mut MountState, ino: u32, nid: u32, base: u64, keep: u64, freed: &mut u64) -> bool {
-    let apd = ms.sb.fmt.per_block();
+    let apd = ADDRS_PER_BLOCK;
     if nid == 0 { return false; }
     // Wholly within the kept region: nothing to do, and skipping avoids reading
     // (and re-dirtying) every node block of a large file on a small shrink.
@@ -5732,14 +5664,14 @@ fn truncate_dnode(ms: &mut MountState, ino: u32, nid: u32, base: u64, keep: u64,
     let mut any_kept = false;
     for i in 0..apd {
         if base + i as u64 >= keep {
-            if free_block(ms, dnode_get_blkaddr(ms.sb.fmt, &dblk, i)) { *freed += 1; }
-            dnode_set_blkaddr(ms.sb.fmt, &mut dblk, i, 0);
-        } else if dnode_get_blkaddr(ms.sb.fmt, &dblk, i) != 0 {
+            if free_block(ms, dnode_get_blkaddr(&dblk, i)) { *freed += 1; }
+            dnode_set_blkaddr(&mut dblk, i, 0);
+        } else if dnode_get_blkaddr(&dblk, i) != 0 {
             any_kept = true;
         }
     }
     if any_kept {
-        ms.sb.fmt.set_footer_ino(&mut dblk, ino);
+        set_footer_ino(&mut dblk, ino);
         ms.cache.write(ms.dev, dblkaddr as u64, &dblk);
         false
     } else {
@@ -5752,8 +5684,8 @@ fn truncate_dnode(ms: &mut MountState, ino: u32, nid: u32, base: u64, keep: u64,
 /// One level up from `truncate_dnode`: an indirect node holding up to 1019
 /// direct-node nids, each covering 1019 logical indices.
 fn truncate_indirect(ms: &mut MountState, ino: u32, nid: u32, base: u64, keep: u64, freed: &mut u64) -> bool {
-    let npb = ms.sb.fmt.per_block();
-    let apd = ms.sb.fmt.per_block() as u64;
+    let npb = ADDRS_PER_BLOCK;
+    let apd = ADDRS_PER_BLOCK as u64;
     if nid == 0 { return false; }
     if base + npb as u64 * apd <= keep { return false; }
     let ind_blkaddr = nat_lookup(ms, nid);
@@ -5761,17 +5693,17 @@ fn truncate_indirect(ms: &mut MountState, ino: u32, nid: u32, base: u64, keep: u
     let mut ind_blk = read_block_copy(ms, ind_blkaddr);
     let mut any_kept = false;
     for i in 0..npb {
-        let child_nid = dnode_get_blkaddr(ms.sb.fmt, &ind_blk, i);
+        let child_nid = dnode_get_blkaddr(&ind_blk, i);
         if child_nid == 0 { continue; }
         let child_base = base + i as u64 * apd;
         if truncate_dnode(ms, ino, child_nid, child_base, keep, freed) {
-            dnode_set_blkaddr(ms.sb.fmt, &mut ind_blk, i, 0);
+            dnode_set_blkaddr(&mut ind_blk, i, 0);
         } else {
             any_kept = true;
         }
     }
     if any_kept {
-        ms.sb.fmt.set_footer_ino(&mut ind_blk, ino); ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
+        set_footer_ino(&mut ind_blk, ino); ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
         false
     } else {
         if free_block(ms, ind_blkaddr) { *freed += 1; }
@@ -5783,8 +5715,8 @@ fn truncate_indirect(ms: &mut MountState, ino: u32, nid: u32, base: u64, keep: u
 /// One more level up: a double-indirect node holding up to 1019 indirect-node
 /// nids.
 fn truncate_dindirect(ms: &mut MountState, ino: u32, nid: u32, base: u64, keep: u64, freed: &mut u64) -> bool {
-    let npb = ms.sb.fmt.per_block();
-    let apd = ms.sb.fmt.per_block() as u64;
+    let npb = ADDRS_PER_BLOCK;
+    let apd = ADDRS_PER_BLOCK as u64;
     let per_ind = npb as u64 * apd;
     if nid == 0 { return false; }
     if base + npb as u64 * per_ind <= keep { return false; }
@@ -5793,17 +5725,17 @@ fn truncate_dindirect(ms: &mut MountState, ino: u32, nid: u32, base: u64, keep: 
     let mut dind_blk = read_block_copy(ms, dind_blkaddr);
     let mut any_kept = false;
     for i in 0..npb {
-        let child_nid = dnode_get_blkaddr(ms.sb.fmt, &dind_blk, i);
+        let child_nid = dnode_get_blkaddr(&dind_blk, i);
         if child_nid == 0 { continue; }
         let child_base = base + i as u64 * per_ind;
         if truncate_indirect(ms, ino, child_nid, child_base, keep, freed) {
-            dnode_set_blkaddr(ms.sb.fmt, &mut dind_blk, i, 0);
+            dnode_set_blkaddr(&mut dind_blk, i, 0);
         } else {
             any_kept = true;
         }
     }
     if any_kept {
-        ms.sb.fmt.set_footer_ino(&mut dind_blk, ino); ms.cache.write(ms.dev, dind_blkaddr as u64, &dind_blk);
+        set_footer_ino(&mut dind_blk, ino); ms.cache.write(ms.dev, dind_blkaddr as u64, &dind_blk);
         false
     } else {
         if free_block(ms, dind_blkaddr) { *freed += 1; }
@@ -5833,9 +5765,9 @@ fn read_file_data_planned(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8,
     if pos >= fsize { return 0; }
     let readable = (fsize - pos).min(count as u64) as usize;
     let mut done = 0usize;
-    if ms.sb.fmt.lx && iblk_copy[INO_INLINE] & F2FS_INLINE_DATA != 0 {
+    if iblk_copy[INO_INLINE] & F2FS_INLINE_DATA != 0 {
         // Inline data: the bytes live in the inode block (design f2fslxrw S1).
-        let (st, en) = inline_area(ms.sb.fmt, &iblk_copy);
+        let (st, en) = inline_area(&iblk_copy);
         let have = if iblk_copy[INO_INLINE] & 0x08 != 0 { (en - st) as u64 } else { 0 };
         while done < readable {
             let o = pos + done as u64;
@@ -6045,7 +5977,7 @@ fn write_file_data(ms: &mut MountState, ino: u32, pos: u64, src: *const u8, coun
     // rewritten anyway, so the stamp is free).
     let new_size = (pos + done as u64).max(inode_size(&iblk_copy));
     w64(&mut iblk_copy, INO_SIZE, new_size);
-    inode_touch_mtime(ms.sb.fmt, &mut iblk_copy);
+    inode_touch_mtime(&mut iblk_copy);
     ms.cache.write(ms.dev, iblkaddr as u64, &iblk_copy);
     nat_update(ms, ino, iblkaddr);
 
@@ -6066,13 +5998,13 @@ fn inode_logical_to_phys_for_write(
     iblkaddr: u32,
     idx: u64,
 ) -> u32 {
-    let max_direct = inode_max_direct(ms.sb.fmt, iblk) as u64;
+    let max_direct = inode_max_direct(iblk) as u64;
     if idx < max_direct {
-        let phys = inode_get_blkaddr(ms.sb.fmt, iblk, idx as usize);
+        let phys = inode_get_blkaddr(iblk, idx as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_owned(ms, ino, idx as usize) {
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
-            inode_set_blkaddr(ms.sb.fmt, iblk, idx as usize, new_phys);
+            inode_add_blocks(iblk, 1);
+            inode_set_blkaddr(iblk, idx as usize, new_phys);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
             return new_phys;
         }
@@ -6080,30 +6012,30 @@ fn inode_logical_to_phys_for_write(
     }
 
     let mut rem = idx - max_direct;
-    let apd = ms.sb.fmt.per_block() as u64;
-    let npb = ms.sb.fmt.per_block() as u64;  // 1019
+    let apd = ADDRS_PER_BLOCK as u64;
+    let npb = ADDRS_PER_BLOCK as u64;  // 1019
 
     // Direct node 0: i_nid[0]
     if rem < apd {
-        let mut nid = inode_get_nid(ms.sb.fmt, iblk, 0);
+        let mut nid = inode_get_nid(iblk, 0);
         if nid == 0 {
             let (new_nid, _) = match create_node_block(ms, ino, node_ofs_dnode(0)) {
                 Some(v) => v,
                 None => return 0,
             };
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
+            inode_add_blocks(iblk, 1);
             nid = new_nid;
-            inode_set_nid(ms.sb.fmt, iblk, 0, nid);
+            inode_set_nid(iblk, 0, nid);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
         }
         let dnblkaddr = nat_lookup(ms, nid);
         let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
-        let phys = dnode_get_blkaddr(ms.sb.fmt, &dnblk_copy, rem as usize);
+        let phys = dnode_get_blkaddr(&dnblk_copy, rem as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_owned(ms, nid, rem as usize) {
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
-            dnode_set_blkaddr(ms.sb.fmt, &mut dnblk_copy, rem as usize, new_phys);
-            ms.sb.fmt.set_footer_ino(&mut dnblk_copy, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            inode_add_blocks(iblk, 1);
+            dnode_set_blkaddr(&mut dnblk_copy, rem as usize, new_phys);
+            set_footer_ino(&mut dnblk_copy, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
         }
         return 0;
@@ -6112,25 +6044,25 @@ fn inode_logical_to_phys_for_write(
 
     // Direct node 1: i_nid[1]
     if rem < apd {
-        let mut nid = inode_get_nid(ms.sb.fmt, iblk, 1);
+        let mut nid = inode_get_nid(iblk, 1);
         if nid == 0 {
             let (new_nid, _) = match create_node_block(ms, ino, node_ofs_dnode(1)) {
                 Some(v) => v,
                 None => return 0,
             };
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
+            inode_add_blocks(iblk, 1);
             nid = new_nid;
-            inode_set_nid(ms.sb.fmt, iblk, 1, nid);
+            inode_set_nid(iblk, 1, nid);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
         }
         let dnblkaddr = nat_lookup(ms, nid);
         let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
-        let phys = dnode_get_blkaddr(ms.sb.fmt, &dnblk_copy, rem as usize);
+        let phys = dnode_get_blkaddr(&dnblk_copy, rem as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_owned(ms, nid, rem as usize) {
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
-            dnode_set_blkaddr(ms.sb.fmt, &mut dnblk_copy, rem as usize, new_phys);
-            ms.sb.fmt.set_footer_ino(&mut dnblk_copy, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            inode_add_blocks(iblk, 1);
+            dnode_set_blkaddr(&mut dnblk_copy, rem as usize, new_phys);
+            set_footer_ino(&mut dnblk_copy, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
         }
         return 0;
@@ -6140,40 +6072,40 @@ fn inode_logical_to_phys_for_write(
     // Indirect node 0: i_nid[2]
     let blocks_per_indirect = npb * apd;
     if rem < blocks_per_indirect {
-        let mut nid = inode_get_nid(ms.sb.fmt, iblk, 2);
+        let mut nid = inode_get_nid(iblk, 2);
         if nid == 0 {
             let (new_nid, _) = match create_node_block(ms, ino, NODE_OFS_IND1) {
                 Some(v) => v,
                 None => return 0,
             };
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
+            inode_add_blocks(iblk, 1);
             nid = new_nid;
-            inode_set_nid(ms.sb.fmt, iblk, 2, nid);
+            inode_set_nid(iblk, 2, nid);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
         }
         let ind_blkaddr = nat_lookup(ms, nid);
         let mut ind_blk = *ms.cache.read(ms.dev, ind_blkaddr as u64);
         let dnode_idx = rem / apd;
         let dnode_off = rem % apd;
-        let mut dnid = dnode_get_blkaddr(ms.sb.fmt, &ind_blk, dnode_idx as usize);
+        let mut dnid = dnode_get_blkaddr(&ind_blk, dnode_idx as usize);
         if dnid == 0 {
             let (new_nid, _) = match create_node_block(ms, ino, node_ofs_ind_child(2, dnode_idx as usize)) {
                 Some(v) => v,
                 None => return 0,
             };
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
+            inode_add_blocks(iblk, 1);
             dnid = new_nid;
-            dnode_set_blkaddr(ms.sb.fmt, &mut ind_blk, dnode_idx as usize, dnid);
-            ms.sb.fmt.set_footer_ino(&mut ind_blk, ino); ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
+            dnode_set_blkaddr(&mut ind_blk, dnode_idx as usize, dnid);
+            set_footer_ino(&mut ind_blk, ino); ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
         }
         let dnblkaddr = nat_lookup(ms, dnid);
         let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
-        let phys = dnode_get_blkaddr(ms.sb.fmt, &dnblk_copy, dnode_off as usize);
+        let phys = dnode_get_blkaddr(&dnblk_copy, dnode_off as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_owned(ms, dnid, dnode_off as usize) {
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
-            dnode_set_blkaddr(ms.sb.fmt, &mut dnblk_copy, dnode_off as usize, new_phys);
-            ms.sb.fmt.set_footer_ino(&mut dnblk_copy, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            inode_add_blocks(iblk, 1);
+            dnode_set_blkaddr(&mut dnblk_copy, dnode_off as usize, new_phys);
+            set_footer_ino(&mut dnblk_copy, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
         }
         return 0;
@@ -6182,40 +6114,40 @@ fn inode_logical_to_phys_for_write(
 
     // Indirect node 1: i_nid[3]
     if rem < blocks_per_indirect {
-        let mut nid = inode_get_nid(ms.sb.fmt, iblk, 3);
+        let mut nid = inode_get_nid(iblk, 3);
         if nid == 0 {
             let (new_nid, _) = match create_node_block(ms, ino, NODE_OFS_IND2) {
                 Some(v) => v,
                 None => return 0,
             };
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
+            inode_add_blocks(iblk, 1);
             nid = new_nid;
-            inode_set_nid(ms.sb.fmt, iblk, 3, nid);
+            inode_set_nid(iblk, 3, nid);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
         }
         let ind_blkaddr = nat_lookup(ms, nid);
         let mut ind_blk = *ms.cache.read(ms.dev, ind_blkaddr as u64);
         let dnode_idx = rem / apd;
         let dnode_off = rem % apd;
-        let mut dnid = dnode_get_blkaddr(ms.sb.fmt, &ind_blk, dnode_idx as usize);
+        let mut dnid = dnode_get_blkaddr(&ind_blk, dnode_idx as usize);
         if dnid == 0 {
             let (new_nid, _) = match create_node_block(ms, ino, node_ofs_ind_child(3, dnode_idx as usize)) {
                 Some(v) => v,
                 None => return 0,
             };
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
+            inode_add_blocks(iblk, 1);
             dnid = new_nid;
-            dnode_set_blkaddr(ms.sb.fmt, &mut ind_blk, dnode_idx as usize, dnid);
-            ms.sb.fmt.set_footer_ino(&mut ind_blk, ino); ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
+            dnode_set_blkaddr(&mut ind_blk, dnode_idx as usize, dnid);
+            set_footer_ino(&mut ind_blk, ino); ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
         }
         let dnblkaddr = nat_lookup(ms, dnid);
         let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
-        let phys = dnode_get_blkaddr(ms.sb.fmt, &dnblk_copy, dnode_off as usize);
+        let phys = dnode_get_blkaddr(&dnblk_copy, dnode_off as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_owned(ms, dnid, dnode_off as usize) {
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
-            dnode_set_blkaddr(ms.sb.fmt, &mut dnblk_copy, dnode_off as usize, new_phys);
-            ms.sb.fmt.set_footer_ino(&mut dnblk_copy, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            inode_add_blocks(iblk, 1);
+            dnode_set_blkaddr(&mut dnblk_copy, dnode_off as usize, new_phys);
+            set_footer_ino(&mut dnblk_copy, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
         }
         return 0;
@@ -6225,55 +6157,55 @@ fn inode_logical_to_phys_for_write(
     // Double indirect node: i_nid[4]
     let blocks_per_dindirect = npb * blocks_per_indirect;
     if rem < blocks_per_dindirect {
-        let mut nid = inode_get_nid(ms.sb.fmt, iblk, 4);
+        let mut nid = inode_get_nid(iblk, 4);
         if nid == 0 {
             let (new_nid, _) = match create_node_block(ms, ino, NODE_OFS_DIND) {
                 Some(v) => v,
                 None => return 0,
             };
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
+            inode_add_blocks(iblk, 1);
             nid = new_nid;
-            inode_set_nid(ms.sb.fmt, iblk, 4, nid);
+            inode_set_nid(iblk, 4, nid);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
         }
         let dind_blkaddr = nat_lookup(ms, nid);
         let mut dind_blk = *ms.cache.read(ms.dev, dind_blkaddr as u64);
         let ind_idx = rem / blocks_per_indirect;
         let ind_rem = rem % blocks_per_indirect;
-        let mut ind_nid = dnode_get_blkaddr(ms.sb.fmt, &dind_blk, ind_idx as usize);
+        let mut ind_nid = dnode_get_blkaddr(&dind_blk, ind_idx as usize);
         if ind_nid == 0 {
             let (new_nid, _) = match create_node_block(ms, ino, node_ofs_dind_ind(ind_idx as usize)) {
                 Some(v) => v,
                 None => return 0,
             };
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
+            inode_add_blocks(iblk, 1);
             ind_nid = new_nid;
-            dnode_set_blkaddr(ms.sb.fmt, &mut dind_blk, ind_idx as usize, ind_nid);
-            ms.sb.fmt.set_footer_ino(&mut dind_blk, ino); ms.cache.write(ms.dev, dind_blkaddr as u64, &dind_blk);
+            dnode_set_blkaddr(&mut dind_blk, ind_idx as usize, ind_nid);
+            set_footer_ino(&mut dind_blk, ino); ms.cache.write(ms.dev, dind_blkaddr as u64, &dind_blk);
         }
         let ind_blkaddr = nat_lookup(ms, ind_nid);
         let mut ind_blk = *ms.cache.read(ms.dev, ind_blkaddr as u64);
         let dnode_idx = ind_rem / apd;
         let dnode_off = ind_rem % apd;
-        let mut dnid = dnode_get_blkaddr(ms.sb.fmt, &ind_blk, dnode_idx as usize);
+        let mut dnid = dnode_get_blkaddr(&ind_blk, dnode_idx as usize);
         if dnid == 0 {
             let (new_nid, _) = match create_node_block(ms, ino, node_ofs_dind_dnode(ind_idx as usize, dnode_idx as usize)) {
                 Some(v) => v,
                 None => return 0,
             };
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
+            inode_add_blocks(iblk, 1);
             dnid = new_nid;
-            dnode_set_blkaddr(ms.sb.fmt, &mut ind_blk, dnode_idx as usize, dnid);
-            ms.sb.fmt.set_footer_ino(&mut ind_blk, ino); ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
+            dnode_set_blkaddr(&mut ind_blk, dnode_idx as usize, dnid);
+            set_footer_ino(&mut ind_blk, ino); ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
         }
         let dnblkaddr = nat_lookup(ms, dnid);
         let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
-        let phys = dnode_get_blkaddr(ms.sb.fmt, &dnblk_copy, dnode_off as usize);
+        let phys = dnode_get_blkaddr(&dnblk_copy, dnode_off as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_owned(ms, dnid, dnode_off as usize) {
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
-            dnode_set_blkaddr(ms.sb.fmt, &mut dnblk_copy, dnode_off as usize, new_phys);
-            ms.sb.fmt.set_footer_ino(&mut dnblk_copy, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            inode_add_blocks(iblk, 1);
+            dnode_set_blkaddr(&mut dnblk_copy, dnode_off as usize, new_phys);
+            set_footer_ino(&mut dnblk_copy, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
         }
         return 0;
@@ -6292,7 +6224,7 @@ fn create_node_block(ms: &mut MountState, owner_ino: u32, ofs: u32) -> Option<(u
     let nid = take_nid(ms)?;
     let phys = alloc_node_block(ms)?;
     let mut buf = [0u8; BLOCK_SIZE];
-    ms.sb.fmt.write_footer(&mut buf, nid, owner_ino, ofs);
+    write_footer(&mut buf, nid, owner_ino, ofs);
     ms.cache.write(ms.dev, phys as u64, &buf);
     nat_update_owned(ms, nid, Some(owner_ino), phys);
     ssa_set(ms, phys, nid, 0, None);
@@ -6322,7 +6254,7 @@ fn lx_dir_bucket(level: usize, hash: u32) -> (u64, u64) {
 }
 
 /// Find `name` in one dentry block.
-fn dblk_find(f: Fmt, dblk: &[u8; BLOCK_SIZE], name: &[u8]) -> Option<(u32, u8)> {
+fn dblk_find(dblk: &[u8; BLOCK_SIZE], name: &[u8]) -> Option<(u32, u8)> {
     let mut slot = 0usize;
     while slot < NR_DENTRY_IN_BLK {
         let byte = slot / 8;
@@ -6335,7 +6267,7 @@ fn dblk_find(f: Fmt, dblk: &[u8; BLOCK_SIZE], name: &[u8]) -> Option<(u32, u8)> 
         if name_len == name.len() {
             let n_off = DENTRY_NAMES_OFF + slot * DENTRY_SLOT_LEN;
             if n_off + name_len <= BLOCK_SIZE && &dblk[n_off..n_off + name_len] == name {
-                return Some((ino, f.dentry_dt(dblk[e_off + 10])));
+                return Some((ino, ft_to_dt(dblk[e_off + 10])));
             }
         }
         slot += ((name_len + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN).max(1);
@@ -6355,56 +6287,19 @@ fn dir_lookup_ft(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> (u32, u8) {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
         let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
     };
-    if lx_inline_dir(ms.sb.fmt, &iblk_copy) { return inline_dir_find(ms.sb.fmt, &iblk_copy, name); }
-    if lx_inline_refused(ms.sb.fmt, &iblk_copy, dir_ino) { ms.walk_err = -5; return (0, 0); } // EIO, not ENOENT
-    if ms.sb.fmt.lx {
-        // Linux looks a name up only in its hash bucket at each level.
-        let hash = f2fs_dentry_hash(name);
-        let depth = (r32(&iblk_copy, INO_CUR_DEPTH) as usize).clamp(1, LX_MAX_DIR_HASH_DEPTH);
-        for level in 0..depth {
-            let (b0, cnt) = lx_dir_bucket(level, hash);
-            for bidx in b0..b0 + cnt {
-                if ms.cache.poisoned() { return (0, 0); }
-                let phys = inode_logical_to_phys(ms, dir_ino, bidx);
-                if phys == 0 { continue; }
-                let dblk = *ms.cache.read(ms.dev, phys as u64);
-                if let Some(r) = dblk_find(ms.sb.fmt, &dblk, name) { return r; }
-            }
-        }
-        return (0, 0);
-    }
-    let fsize = inode_size(&iblk_copy);
-    let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
-
-    for blk_idx in 0..n_data_blks {
-        if ms.cache.poisoned() { break; }
-        let phys = inode_logical_to_phys(ms, dir_ino, blk_idx as u64);
-        if phys == 0 { continue; }
-        let dblk = ms.cache.read(ms.dev, phys as u64);
-        let dblk = unsafe { &*(dblk as *const [u8; BLOCK_SIZE]) };
-
-        let mut slot = 0usize;
-        while slot < NR_DENTRY_IN_BLK {
-            let byte = slot / 8;
-            let bit  = slot % 8;
-            if byte < DENTRY_BITMAP_SIZE && (dblk[byte] & (1 << bit)) == 0 {
-                slot += 1;
-                continue;
-            }
-            let e_off = DENTRY_ENTRIES_OFF + slot * DENTRY_ENTRY_SIZE;
-            if e_off + DENTRY_ENTRY_SIZE > BLOCK_SIZE { break; }
-            let ino      = r32(dblk, e_off + 4);
-            let name_len = r16(dblk, e_off + 8) as usize;
-            if name_len == name.len() {
-                let n_off = DENTRY_NAMES_OFF + slot * DENTRY_SLOT_LEN;
-                if n_off + name_len <= BLOCK_SIZE
-                    && &dblk[n_off..n_off + name_len] == name
-                {
-                    return (ino, ms.sb.fmt.dentry_dt(dblk[e_off + 10]));
-                }
-            }
-            let slots_used = (name_len + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN;
-            slot += slots_used.max(1);
+    if lx_inline_dir(&iblk_copy) { return inline_dir_find(&iblk_copy, name); }
+    if lx_inline_refused(&iblk_copy, dir_ino) { ms.walk_err = -5; return (0, 0); } // EIO, not ENOENT
+    // Linux looks a name up only in its hash bucket at each level.
+    let hash = f2fs_dentry_hash(name);
+    let depth = (r32(&iblk_copy, INO_CUR_DEPTH) as usize).clamp(1, LX_MAX_DIR_HASH_DEPTH);
+    for level in 0..depth {
+        let (b0, cnt) = lx_dir_bucket(level, hash);
+        for bidx in b0..b0 + cnt {
+            if ms.cache.poisoned() { return (0, 0); }
+            let phys = inode_logical_to_phys(ms, dir_ino, bidx);
+            if phys == 0 { continue; }
+            let dblk = *ms.cache.read(ms.dev, phys as u64);
+            if let Some(r) = dblk_find(&dblk, name) { return r; }
         }
     }
     (0, 0)
@@ -6413,81 +6308,7 @@ fn dir_lookup_ft(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> (u32, u8) {
 /// Add a directory entry `(name, child_ino, file_type)` to `dir_ino`.
 fn dir_add_entry(ms: &mut MountState, dir_ino: u32, name: &[u8], child_ino: u32, ftype: u8) -> bool {
     if name.is_empty() || name.len() > NAME_MAX { return false; }
-    if ms.sb.fmt.lx { return dir_add_entry_lx(ms, dir_ino, name, child_ino, ftype); }
-    let slots_needed = (name.len() + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN;
-    let iblkaddr = nat_lookup(ms, dir_ino);
-    let mut iblk_copy = {
-        let b = ms.cache.read(ms.dev, iblkaddr as u64);
-        let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
-    };
-    let fsize = inode_size(&iblk_copy);
-    let mut n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
-
-    // Try to find free slots in existing blocks first, then allocate new
-    'outer: for blk_pass in 0..=n_data_blks {
-        if ms.cache.poisoned() { break; }
-        let phys = if blk_pass < n_data_blks {
-            let p = inode_logical_to_phys(ms, dir_ino, blk_pass as u64);
-            if p == 0 { continue; }
-            p
-        } else {
-            // Allocate a new data block
-            // `alloc_data_block` hands the block back already zeroed, which a
-            // dentry block relies on: every slot must read as "free" and every
-            // name byte as NUL.
-            let p = match alloc_data_owned(ms, dir_ino, blk_pass) { Some(p) => p, None => return false };
-            // Update inode
-            inode_add_blocks(ms.sb.fmt, &mut iblk_copy, 1);
-            inode_set_blkaddr(ms.sb.fmt, &mut iblk_copy, blk_pass, p);
-            n_data_blks += 1;
-            p
-        };
-
-        let dblk = ms.cache.get_mut(ms.dev, phys as u64);
-        // Find `slots_needed` consecutive free slots
-        let mut free_run = 0usize;
-        let mut start_slot = 0usize;
-        let mut scan = 0usize;
-        while scan < NR_DENTRY_IN_BLK {
-            let byte = scan / 8;
-            let bit  = scan % 8;
-            if byte >= DENTRY_BITMAP_SIZE { break; }
-            if (dblk[byte] & (1 << bit)) == 0 {
-                if free_run == 0 { start_slot = scan; }
-                free_run += 1;
-                if free_run >= slots_needed {
-                    // Write entry at start_slot
-                    let e_off = DENTRY_ENTRIES_OFF + start_slot * DENTRY_ENTRY_SIZE;
-                    w32(dblk, e_off,     0); // hash (skip for MVP)
-                    w32(dblk, e_off + 4, child_ino);
-                    w16(dblk, e_off + 8, name.len() as u16);
-                    dblk[e_off + 10] = ftype;
-                    // Copy filename
-                    let n_off = DENTRY_NAMES_OFF + start_slot * DENTRY_SLOT_LEN;
-                    if n_off + name.len() <= BLOCK_SIZE {
-                        dblk[n_off..n_off + name.len()].copy_from_slice(name);
-                    }
-                    // Set bitmap bits
-                    for s in start_slot..start_slot + slots_needed {
-                        let b = s / 8; let bit = s % 8;
-                        if b < DENTRY_BITMAP_SIZE { dblk[b] |= 1 << bit; }
-                    }
-                    break 'outer;
-                }
-            } else {
-                free_run = 0;
-            }
-            scan += 1;
-        }
-    }
-
-    // Update inode size and write back
-    let new_size = n_data_blks as u64 * BLOCK_SIZE as u64;
-    w64(&mut iblk_copy, INO_SIZE, new_size);
-    ms.cache.write(ms.dev, iblkaddr as u64, &iblk_copy);
-    nat_update(ms, dir_ino, iblkaddr);
-    maybe_flush(ms);
-    true
+    dir_add_entry_lx(ms, dir_ino, name, child_ino, ftype)
 }
 
 /// Linux `f2fs_dentry_hash` (TEA, adapted from ext3; lib/libf2fs.c in
@@ -6558,7 +6379,6 @@ fn dentry_room(dblk: &[u8], slots: usize) -> Option<usize> {
 /// the directory may have holes. Blocks past i_addr go through the inode's
 /// direct/indirect node blocks like any file.
 fn dir_add_entry_lx(ms: &mut MountState, dir_ino: u32, name: &[u8], child_ino: u32, ftype: u8) -> bool {
-    let f = ms.sb.fmt;
     let slots_needed = (name.len() + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN;
     let hash = f2fs_dentry_hash(name);
     let iblkaddr = nat_lookup(ms, dir_ino);
@@ -6613,8 +6433,8 @@ fn dir_add_entry_lx(ms: &mut MountState, dir_ino: u32, name: &[u8], child_ino: u
 /// noinline_data / noinline_dentry). Not implemented: its i_addr area is not
 /// block addresses, so every user refuses it rather than misreading it.
 /// Logged once per boot.
-fn lx_inline_refused(f: Fmt, iblk: &[u8], ino: u32) -> bool {
-    if !f.lx || iblk[INO_INLINE] & (F2FS_INLINE_DATA | F2FS_INLINE_DENTRY) == 0 { return false; }
+fn lx_inline_refused(iblk: &[u8], ino: u32) -> bool {
+    if iblk[INO_INLINE] & (F2FS_INLINE_DATA | F2FS_INLINE_DENTRY) == 0 { return false; }
     static LOGGED: atomic::AtomicBool = atomic::AtomicBool::new(false);
     if !LOGGED.swap(true, atomic::Ordering::Relaxed) {
         dbg_str("[F2FS] inode "); dbg_dec(ino as usize);
@@ -6633,14 +6453,12 @@ fn lx_inline_refused(f: Fmt, iblk: &[u8], ino: u32) -> bool {
 /// the block, i_blocks += 1 (dirs: i_current_depth 1, i_size 4096). True if the
 /// inode is (now) not inline; false when no block could be allocated.
 fn lx_convert_inline(ms: &mut MountState, ino: u32) -> bool {
-    let f = ms.sb.fmt;
-    if !f.lx { return true; }
     let iblkaddr = nat_lookup(ms, ino);
     if iblkaddr == 0 { return true; }
     let mut iblk = read_block_copy(ms, iblkaddr);
     let fl = iblk[INO_INLINE];
     if fl & (F2FS_INLINE_DATA | F2FS_INLINE_DENTRY) == 0 { return true; }
-    let (st, en) = inline_area(f, &iblk);
+    let (st, en) = inline_area(&iblk);
     let p = match alloc_data_owned(ms, ino, 0) { Some(p) => p, None => return false };
     let mut dblk = [0u8; BLOCK_SIZE];
     if fl & F2FS_INLINE_DATA != 0 {
@@ -6668,9 +6486,9 @@ fn lx_convert_inline(ms: &mut MountState, ino: u32) -> bool {
         w64(&mut iblk, INO_SIZE, BLOCK_SIZE as u64);
     }
     iblk[st..en].fill(0);
-    inode_set_blkaddr(f, &mut iblk, 0, p);
-    inode_add_blocks(f, &mut iblk, 1);
-    lx_zero_ext(f, &mut iblk);
+    inode_set_blkaddr(&mut iblk, 0, p);
+    inode_add_blocks(&mut iblk, 1);
+    lx_zero_ext(&mut iblk);
     ms.cache.write(ms.dev, p as u64, &dblk);
     ms.cache.write(ms.dev, iblkaddr as u64, &iblk);
     nat_update(ms, ino, iblkaddr);
@@ -6686,26 +6504,18 @@ fn dir_remove_entry(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> bool {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
         let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
     };
-    let lx = ms.sb.fmt.lx;
-    let hash = if lx { f2fs_dentry_hash(name) } else { 0 };
+    let hash = f2fs_dentry_hash(name);
     let depth = (r32(&iblk_copy, INO_CUR_DEPTH) as usize).clamp(1, LX_MAX_DIR_HASH_DEPTH);
     let mut cand: (usize, u64, u64) = (0, 0, 0); // (level, bucket start, bucket count)
-    let fsize = inode_size(&iblk_copy);
-    let n_data_blks = if lx { usize::MAX } else { fsize.div_ceil(BLOCK_SIZE as u64) as usize };
-
-    let mut blk_idx = 0usize;
     loop {
         // Linux-format dirs: walk only the hash bucket at each level.
-        let bidx = if lx {
+        let bidx = {
             if cand.2 == 0 {
                 if cand.0 >= depth { break; }
                 let (b0, c) = lx_dir_bucket(cand.0, hash);
                 cand = (cand.0 + 1, b0, c);
             }
             let b = cand.1; cand.1 += 1; cand.2 -= 1; b
-        } else {
-            if blk_idx >= n_data_blks { break; }
-            blk_idx += 1; (blk_idx - 1) as u64
         };
         if ms.cache.poisoned() { break; }
         let phys = inode_logical_to_phys(ms, dir_ino, bidx);
@@ -6822,7 +6632,7 @@ fn may_access_ino(ms: &mut MountState, ino: u32, mask: u8) -> bool {
     }
     let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, ino, xnid)) } else { None };
     let acl = match &xbuf {
-        Some(b) => xattr::find(&b[..xarena(ms)], xattr::IDX_ACL_ACCESS, b""),
+        Some(b) => xattr::find(&b[..XBUF_LEN], xattr::IDX_ACL_ACCESS, b""),
         None => None,
     };
     xattr::may_access(&meta, &cred, acl, mask)
@@ -7121,11 +6931,9 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         // lockfile idiom. Checked before O_TRUNC so a losing racer cannot
         // destroy the winner's file on its way to the error.
         if create && flags & O_EXCL != 0 { return err_reply(-17); } // EEXIST
-        if ms.sb.fmt.lx {
-            let ia = nat_lookup(ms, ino);
-            if ia != 0 {
-                if (writable || (flags & O_TRUNC) != 0) && !lx_convert_inline(ms, ino) { return err_reply(-28); } // ENOSPC
-            }
+        let ia = nat_lookup(ms, ino);
+        if ia != 0 {
+            if (writable || (flags & O_TRUNC) != 0) && !lx_convert_inline(ms, ino) { return err_reply(-28); } // ENOSPC
         }
         // Permission gate for opening an *existing* object. handle_open used to
         // grant access purely on path resolution — mode bits were recorded but
@@ -7145,7 +6953,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
             let (meta, xnid) = load_meta_xnid(ms, ino);
             let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, ino, xnid)) } else { None };
             let acl = match &xbuf {
-                Some(b) => xattr::find(&b[..xarena(ms)], xattr::IDX_ACL_ACCESS, b""),
+                Some(b) => xattr::find(&b[..XBUF_LEN], xattr::IDX_ACL_ACCESS, b""),
                 None => None,
             };
             if !xattr::access_check(&meta, cred, acl, want_read, want_write, false) {
@@ -7270,8 +7078,8 @@ fn handle_fstat(ms: &mut MountState, file_id: u64, stat_ptr: u64) -> Message {
     let links = inode_links(iblk);
     let uid   = inode_uid(iblk);
     let gid   = inode_gid(iblk);
-    let blks  = inode_stat_blocks(ms.sb.fmt, iblk);
-    let (at, mt, ct) = inode_times(ms.sb.fmt, iblk);
+    let blks  = inode_stat_blocks(iblk);
+    let (at, mt, ct) = inode_times(iblk);
     vfs_server::write_stat_full_blocks(stat_ptr as usize, mode, links as u64, size,
                                        ino as u64, uid, gid, blks);
     vfs_server::write_stat_times(stat_ptr as usize, at, mt, ct);
@@ -7304,8 +7112,8 @@ fn stat_common(ms: &mut MountState, path_ptr: u64, stat_ptr: u64, follow: bool) 
     let links = inode_links(iblk);
     let uid   = inode_uid(iblk);
     let gid   = inode_gid(iblk);
-    let blks  = inode_stat_blocks(ms.sb.fmt, iblk);
-    let (at, mt, ct) = inode_times(ms.sb.fmt, iblk);
+    let blks  = inode_stat_blocks(iblk);
+    let (at, mt, ct) = inode_times(iblk);
 
     // Emit the stat struct in the target's native layout. This used to
     // open-code the x86-64 offsets, which put st_mode and st_nlink in the
@@ -7345,8 +7153,8 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64,
     };
     if !inode_is_dir(&iblk_copy) { return (err_reply(-20), current_pos); } // ENOTDIR
 
-    let inl = lx_inline_dir(ms.sb.fmt, &iblk_copy);
-    let (ist, ien) = inline_area(ms.sb.fmt, &iblk_copy);
+    let inl = lx_inline_dir(&iblk_copy);
+    let (ist, ien) = inline_area(&iblk_copy);
     let (inr, ibm, ieo, ino_) = inline_dentry_layout(ien - ist);
     let fsize = inode_size(&iblk_copy);
     let n_data_blks = if inl { 1 } else { fsize.div_ceil(BLOCK_SIZE as u64) as usize };
@@ -7381,7 +7189,7 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64,
             let e_off    = ent_base + slot_idx * DENTRY_ENTRY_SIZE;
             let child_ino = r32(dblk, e_off + 4) as u64;
             let name_len  = r16(dblk, e_off + 8) as usize;
-            let ftype     = ms.sb.fmt.dentry_dt(dblk[e_off + 10]);
+            let ftype     = ft_to_dt(dblk[e_off + 10]);
             let n_off     = nm_base + slot_idx * DENTRY_SLOT_LEN;
             // A used slot with no name is the tail of a long name (a position
             // can land there if the entry was created after it was handed out):
@@ -7620,7 +7428,7 @@ fn reap_persisted_orphans(ms: &mut MountState, list: &[u32]) -> usize {
         if a == 0 { continue; }
         let orphan = {
             let b = ms.cache.read(ms.dev, a as u64);
-            ms.sb.fmt.footer_nid(b) == ino && ms.sb.fmt.footer_ino(b) == ino
+            footer_nid(b) == ino && footer_ino(b) == ino
                 && inode_links(b) == 0 && inode_mode(b) != 0
         };
         if !orphan { continue; }
@@ -7889,7 +7697,7 @@ fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32, cred: &xattr::Cred) -> 
         let cur = inode_mode(iblk);
         new_mode = (cur & S_IFMT) | (mode as u16 & !S_IFMT);
         w16(iblk, INO_MODE, new_mode);
-        inode_set_ctime(ms.sb.fmt, iblk, sched::clock_ts());
+        inode_set_ctime(iblk, sched::clock_ts());
     }
     nat_update(ms, ino, addr);
 
@@ -7897,12 +7705,12 @@ fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32, cred: &xattr::Cred) -> 
     // USER_OBJ←owner, OTHER←other, MASK-or-GROUP_OBJ←group. Named entries are
     // untouched. Trivial ACLs are never stored, so this only fires when a real
     // ACL exists, and the write-back mirrors the setxattr read-modify-write.
-    let xnid = { let iblk = ms.cache.read(ms.dev, addr as u64); r32(iblk, ms.sb.fmt.xattr()) };
+    let xnid = { let iblk = ms.cache.read(ms.dev, addr as u64); r32(iblk, I_XATTR_NID) };
     if xnid != 0 {
         let mut blkbuf = read_xattr_arena(ms, ino, xnid);
         let mut vbuf = [0u8; xattr::F2FS_XATTR_ARENA];
         let vlen = {
-            let arena = &blkbuf[..xarena(ms)];
+            let arena = &blkbuf[..XBUF_LEN];
             match xattr::find(arena, xattr::IDX_ACL_ACCESS, b"") {
                 Some(v) => { vbuf[..v.len()].copy_from_slice(v); Some(v.len()) }
                 None => None,
@@ -7910,7 +7718,7 @@ fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32, cred: &xattr::Cred) -> 
         };
         if let Some(vlen) = vlen {
             xattr::acl_chmod_rewrite(&mut vbuf[..vlen], new_mode);
-            let arena = &mut blkbuf[..xarena(ms)];
+            let arena = &mut blkbuf[..XBUF_LEN];
             let _ = xattr::set(arena, xattr::IDX_ACL_ACCESS, b"", &vbuf[..vlen], 0);
             persist_xattr_block(ms, ino, xnid, &blkbuf);
         }
@@ -7983,7 +7791,7 @@ fn chown_inode(ms: &mut MountState, ino: u32, uid: u32, gid: u32,
             if mode & kill != 0 { w16(iblk, INO_MODE, mode & !kill); }
         }
     }
-    inode_set_ctime(ms.sb.fmt, iblk, sched::clock_ts());
+    inode_set_ctime(iblk, sched::clock_ts());
     nat_update(ms, ino, addr);
     maybe_flush(ms);
     ok_reply()
@@ -7996,8 +7804,8 @@ fn dir_is_empty(ms: &mut MountState, dir_ino: u32) -> bool {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
         let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
     };
-    if lx_inline_dir(ms.sb.fmt, &iblk_copy) {
-        let (st, en) = inline_area(ms.sb.fmt, &iblk_copy);
+    if lx_inline_dir(&iblk_copy) {
+        let (st, en) = inline_area(&iblk_copy);
         let a = &iblk_copy[st..en];
         let (nr, _bm, eo, no) = inline_dentry_layout(a.len());
         let mut slot = 0usize;
@@ -8230,12 +8038,12 @@ fn handle_ftruncate(ms: &mut MountState, file_id: u64, length: u64) -> Message {
         truncate_to(ms, ino, length);
         let iblkaddr = nat_lookup(ms, ino);
         let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
-        inode_touch_mtime(ms.sb.fmt, iblk);
+        inode_touch_mtime(iblk);
         nat_update(ms, ino, iblkaddr);
     } else {
         let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
         w64(iblk, INO_SIZE, length);
-        inode_touch_mtime(ms.sb.fmt, iblk);
+        inode_touch_mtime(iblk);
         nat_update(ms, ino, iblkaddr);
         // Growing: the old last page's bytes past the old end must read
         // zeros (a shared mapping may have stored there), then the size.
@@ -8379,8 +8187,8 @@ fn load_meta_xnid(ms: &mut MountState, ino: u32) -> (xattr::FileMeta, u32) {
         uid:  inode_uid(iblk),
         gid:  inode_gid(iblk),
     };
-    let mut xnid = r32(iblk, ms.sb.fmt.xattr());
-    if xnid == 0 && ms.sb.fmt.lx && inline_xattr_bytes(iblk) > 0 { xnid = XNID_INLINE; }
+    let mut xnid = r32(iblk, I_XATTR_NID);
+    if xnid == 0 && inline_xattr_bytes(iblk) > 0 { xnid = XNID_INLINE; }
     (meta, xnid)
 }
 
@@ -8390,11 +8198,6 @@ fn load_meta_xnid(ms: &mut MountState, ino: u32) -> (xattr::FileMeta, u32) {
 /// the node block being edited.
 fn read_xattr_arena(ms: &mut MountState, ino: u32, xnid: u32) -> [u8; XBUF_LEN] {
     let mut out = [0u8; XBUF_LEN];
-    if !ms.sb.fmt.lx {
-        let addr = nat_lookup(ms, xnid);
-        out[..BLOCK_SIZE].copy_from_slice(&read_block_copy(ms, addr));
-        return out;
-    }
     // Linux layout: raw = inline area ++ xnode[0..4072], decoded to an arena.
     let mut raw = [0u8; LX_RAW_MAX];
     let (off, ib) = lx_inline_span(ms, ino);
@@ -8420,17 +8223,14 @@ const XBUF_LEN: usize = 10240;
 /// Pseudo xnid on lx volumes: no xnode, but the inode has an inline xattr area.
 const XNID_INLINE: u32 = u32::MAX;
 
-/// Usable arena length for the handlers' slices.
-fn xarena(ms: &MountState) -> usize { if ms.sb.fmt.lx { XBUF_LEN } else { ms.sb.fmt.footer() } }
 
 /// (byte offset in the inode block, length) of the inline xattr area; 0 length
-/// when the inode has none or the volume is legacy.
+/// when the inode has none.
 fn lx_inline_span(ms: &mut MountState, ino: u32) -> (usize, usize) {
-    if !ms.sb.fmt.lx { return (0, 0); }
     let iaddr = nat_lookup(ms, ino);
     let iblk = ms.cache.read(ms.dev, iaddr as u64);
     let ib = inline_xattr_bytes(iblk);
-    (ms.sb.fmt.nids() - ib, ib)
+    (I_NID - ib, ib)
 }
 
 /// Write a full xattr node-block image back, allocating the node lazily when the
@@ -8444,23 +8244,19 @@ fn persist_xattr_block(ms: &mut MountState, ino: u32, xnid: u32, xbuf: &[u8; XBU
     let mut blkbuf = [0u8; BLOCK_SIZE];
     let mut inline_raw = [0u8; 800];
     let (ioff, ib) = lx_inline_span(ms, ino);
-    if !ms.sb.fmt.lx {
-        blkbuf.copy_from_slice(&xbuf[..BLOCK_SIZE]);
-    } else {
-        let mut raw = [0u8; LX_RAW_MAX];
-        let end = match xattr::lx_encode(&xbuf[..], &mut raw[..ib + xattr::LX_XNODE]) {
-            Ok(n) => n,
-            Err(_) => return 0, // ENOSPC
-        };
-        inline_raw[..ib].copy_from_slice(&raw[..ib]);
-        blkbuf[..xattr::LX_XNODE].copy_from_slice(&raw[ib..ib + xattr::LX_XNODE]);
-        if end <= ib && xnid == 0 {
-            // Everything fits inline: no xnode needed.
-            let iaddr = nat_lookup(ms, ino);
-            { let iblk = ms.cache.get_mut(ms.dev, iaddr as u64); iblk[ioff..ioff + ib].copy_from_slice(&inline_raw[..ib]); }
-            nat_update(ms, ino, iaddr);
-            return XNID_INLINE;
-        }
+    let mut raw = [0u8; LX_RAW_MAX];
+    let end = match xattr::lx_encode(&xbuf[..], &mut raw[..ib + xattr::LX_XNODE]) {
+        Ok(n) => n,
+        Err(_) => return 0, // ENOSPC
+    };
+    inline_raw[..ib].copy_from_slice(&raw[..ib]);
+    blkbuf[..xattr::LX_XNODE].copy_from_slice(&raw[ib..ib + xattr::LX_XNODE]);
+    if end <= ib && xnid == 0 {
+        // Everything fits inline: no xnode needed.
+        let iaddr = nat_lookup(ms, ino);
+        { let iblk = ms.cache.get_mut(ms.dev, iaddr as u64); iblk[ioff..ioff + ib].copy_from_slice(&inline_raw[..ib]); }
+        nat_update(ms, ino, iaddr);
+        return XNID_INLINE;
     }
     let blkbuf = &blkbuf;
     xnid = if xnid != 0 {
@@ -8476,15 +8272,15 @@ fn persist_xattr_block(ms: &mut MountState, ino: u32, xnid: u32, xbuf: &[u8; XBU
         let iaddr = nat_lookup(ms, ino);
         {
             let iblk = ms.cache.get_mut(ms.dev, iaddr as u64);
-            w32(iblk, ms.sb.fmt.xattr(), new_nid);
-            inode_add_blocks(ms.sb.fmt, iblk, 1);
+            w32(iblk, I_XATTR_NID, new_nid);
+            inode_add_blocks(iblk, 1);
         }
         nat_update(ms, ino, iaddr);
         new_nid
     };
     let xaddr = nat_lookup(ms, xnid);
     let mut out = *blkbuf;
-    ms.sb.fmt.write_footer(&mut out, xnid, ino, NODE_OFS_XATTR);
+    write_footer(&mut out, xnid, ino, NODE_OFS_XATTR);
     ms.cache.write(ms.dev, xaddr as u64, &out);
     nat_update_owned(ms, xnid, Some(ino), xaddr);
     if ib > 0 {
@@ -8574,7 +8370,7 @@ fn xattr_get(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
         return err_reply(-61); // ENODATA
     }
     let blkbuf = read_xattr_arena(ms, ino, xnid);
-    let arena = &blkbuf[..xarena(ms)];
+    let arena = &blkbuf[..XBUF_LEN];
     let acl = xattr::find(arena, xattr::IDX_ACL_ACCESS, b"");
     if let Err(e) = xattr::may_read_xattr(idx, &meta, cred, acl) { return err_reply(-e); }
     let val = match xattr::find(arena, idx, suf) {
@@ -8593,7 +8389,7 @@ fn xattr_list(ms: &mut MountState, ino: u32, list_ptr: u64, size: u64, euid: u32
     // block read.
     if xnid == 0 { return val_reply(0); }
     let blkbuf = read_xattr_arena(ms, ino, xnid);
-    let arena = &blkbuf[..xarena(ms)];
+    let arena = &blkbuf[..XBUF_LEN];
     let empty: &mut [u8] = &mut [];
     let out = if size == 0 {
         empty
@@ -8623,7 +8419,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
     // the read-modify-write operate on it.
     let mut blkbuf = if xnid != 0 { read_xattr_arena(ms, ino, xnid) } else { [0u8; XBUF_LEN] };
     {
-        let arena = &blkbuf[..xarena(ms)];
+        let arena = &blkbuf[..XBUF_LEN];
         let acl = if xnid != 0 { xattr::find(arena, xattr::IDX_ACL_ACCESS, b"") } else { None };
         if let Err(e) = xattr::may_write_xattr(idx, &meta, cred, acl) { return err_reply(-e); }
     }
@@ -8636,7 +8432,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
         if size == 0 {
             if xnid != 0 {
                 {
-                    let arena = &mut blkbuf[..xarena(ms)];
+                    let arena = &mut blkbuf[..XBUF_LEN];
                     let _ = xattr::remove(arena, idx, suf);
                 }
                 persist_xattr_block(ms, ino, xnid, &blkbuf);
@@ -8656,7 +8452,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
                 set_inode_perm_bits(ms, ino, perm);
                 if xnid != 0 {
                     {
-                        let arena = &mut blkbuf[..xarena(ms)];
+                        let arena = &mut blkbuf[..XBUF_LEN];
                         let _ = xattr::remove(arena, xattr::IDX_ACL_ACCESS, b"");
                     }
                     persist_xattr_block(ms, ino, xnid, &blkbuf);
@@ -8666,7 +8462,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
             }
             // Non-trivial: store the ACL, then sync i_mode's perm bits to it.
             {
-                let arena = &mut blkbuf[..xarena(ms)];
+                let arena = &mut blkbuf[..XBUF_LEN];
                 if let Err(e) = xattr::set(arena, idx, suf, val, flags as u32) { return err_reply(-e); }
             }
             if persist_xattr_block(ms, ino, xnid, &blkbuf) == 0 { return err_reply(-28); } // ENOSPC
@@ -8676,7 +8472,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
         }
         // Default ACL: directories only (enforced by the gate), stored verbatim.
         {
-            let arena = &mut blkbuf[..xarena(ms)];
+            let arena = &mut blkbuf[..XBUF_LEN];
             if let Err(e) = xattr::set(arena, idx, suf, val, flags as u32) { return err_reply(-e); }
         }
         if persist_xattr_block(ms, ino, xnid, &blkbuf) == 0 { return err_reply(-28); }
@@ -8686,7 +8482,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
 
     // Non-ACL namespace: a plain arena insert/replace.
     {
-        let arena = &mut blkbuf[..xarena(ms)];
+        let arena = &mut blkbuf[..XBUF_LEN];
         if let Err(e) = xattr::set(arena, idx, suf, val, flags as u32) { return err_reply(-e); }
     }
     if persist_xattr_block(ms, ino, xnid, &blkbuf) == 0 { return err_reply(-28); }
@@ -8707,13 +8503,13 @@ fn xattr_remove(ms: &mut MountState, ino: u32, name_ptr: u64, cred: &xattr::Cred
     let (meta, xnid) = load_meta_xnid(ms, ino);
     let mut blkbuf = if xnid != 0 { read_xattr_arena(ms, ino, xnid) } else { [0u8; XBUF_LEN] };
     {
-        let arena = &blkbuf[..xarena(ms)];
+        let arena = &blkbuf[..XBUF_LEN];
         let acl = if xnid != 0 { xattr::find(arena, xattr::IDX_ACL_ACCESS, b"") } else { None };
         if let Err(e) = xattr::may_write_xattr(idx, &meta, cred, acl) { return err_reply(-e); }
     }
     if xnid == 0 { return err_reply(-61); } // ENODATA
     let removed = {
-        let arena = &mut blkbuf[..xarena(ms)];
+        let arena = &mut blkbuf[..XBUF_LEN];
         xattr::remove(arena, idx, suf)
     };
     match removed {
@@ -8739,7 +8535,7 @@ fn xattr_access(ms: &mut MountState, path_ptr: u64, amode: u64, cred: &xattr::Cr
     let (meta, xnid) = load_meta_xnid(ms, ino);
     let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, ino, xnid)) } else { None };
     let acl = match &xbuf {
-        Some(b) => xattr::find(&b[..xarena(ms)], xattr::IDX_ACL_ACCESS, b""),
+        Some(b) => xattr::find(&b[..XBUF_LEN], xattr::IDX_ACL_ACCESS, b""),
         None => None,
     };
     if xattr::access_check(&meta, cred, acl, amode & 4 != 0, amode & 2 != 0, amode & 1 != 0) {
@@ -8756,7 +8552,7 @@ fn parent_default_acl(ms: &mut MountState, parent_ino: u32, out: &mut [u8; xattr
     let (_, xnid) = load_meta_xnid(ms, parent_ino);
     if xnid == 0 { return 0; }
     let blk = read_xattr_arena(ms, parent_ino, xnid);
-    match xattr::find(&blk[..xarena(ms)], xattr::IDX_ACL_DEFAULT, b"") {
+    match xattr::find(&blk[..XBUF_LEN], xattr::IDX_ACL_DEFAULT, b"") {
         Some(v) if v.len() <= out.len() => { out[..v.len()].copy_from_slice(v); v.len() }
         _ => 0,
     }
@@ -8781,7 +8577,7 @@ fn store_inherited_acls(ms: &mut MountState, ino: u32, parent_ino: u32, c: &xatt
     if c.access_len == 0 && dlen == 0 { return; }
     let mut blkbuf = [0u8; XBUF_LEN];
     {
-        let arena = &mut blkbuf[..xarena(ms)];
+        let arena = &mut blkbuf[..XBUF_LEN];
         if c.access_len > 0 {
             let _ = xattr::set(arena, xattr::IDX_ACL_ACCESS, b"", &c.access[..c.access_len], 0);
         }
@@ -8804,7 +8600,7 @@ fn utimens_inode(ms: &mut MountState, ino: u32, at: (i64, i64), mt: (i64, i64), 
         if explicit { return err_reply(-1); } // EPERM
         let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, ino, xnid)) } else { None };
         let acl = match &xbuf {
-            Some(b) => xattr::find(&b[..xarena(ms)], xattr::IDX_ACL_ACCESS, b""),
+            Some(b) => xattr::find(&b[..XBUF_LEN], xattr::IDX_ACL_ACCESS, b""),
             None => None,
         };
         if !xattr::may_access(&meta, cred, acl, xattr::MAY_WRITE) { return err_reply(-13); } // EACCES
@@ -8813,9 +8609,9 @@ fn utimens_inode(ms: &mut MountState, ino: u32, at: (i64, i64), mt: (i64, i64), 
     if addr == 0 { return err_reply(-2); }
     {
         let iblk = ms.cache.get_mut(ms.dev, addr as u64);
-        if at.1 != vfs_server::UTIME_OMIT { inode_set_atime(ms.sb.fmt, iblk, at); }
-        if mt.1 != vfs_server::UTIME_OMIT { inode_set_mtime(ms.sb.fmt, iblk, mt); }
-        inode_set_ctime(ms.sb.fmt, iblk, sched::clock_ts());
+        if at.1 != vfs_server::UTIME_OMIT { inode_set_atime(iblk, at); }
+        if mt.1 != vfs_server::UTIME_OMIT { inode_set_mtime(iblk, mt); }
+        inode_set_ctime(iblk, sched::clock_ts());
     }
     mm::pagecache::note_ctime(page_cache_key(ms.port, ino));
     nat_update(ms, ino, addr);
@@ -9121,7 +8917,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
     // lxdefault, `init_version` neither "LeandrOS lxnode" nor "Linux
     // version") is no longer read or written: refuse it before touching
     // anything, so it is never misread as the Linux layout.
-    if !sb.fmt.lx {
+    if !sb.lxnode {
         dbg_str("[F2FS] unsupported legacy LeandrOS f2fs format (no lxnode marker): reformat the volume; not mounting\n");
         return None;
     }
@@ -9372,7 +9168,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
         core::ptr::addr_of_mut!((*p).open_paths).write(alloc::vec::Vec::new());
         core::ptr::addr_of_mut!((*p).cache).write(BlockCache::new(cache_cap()));
         (*p).cache.dev_blocks = sb.block_count;
-        if sb.fmt.lx && sb.feat & SB_FEAT_INODE_CHKSUM != 0 { (*p).cache.icsum = Some((sb.icsum_seed, sb.nat_blkaddr)); }
+        if sb.feat & SB_FEAT_INODE_CHKSUM != 0 { (*p).cache.icsum = Some((sb.icsum_seed, sb.nat_blkaddr)); }
         // The emergency checkpoint's index arrays (never allocated later).
         let ecap = (*p).cache.cap * 2;
         let _ = (*p).dur.emerg_a.try_reserve_exact(ecap);
@@ -9401,7 +9197,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
         if !lx_chain.is_empty() && !ms.read_only { recovered += durable::recover_linux(ms, &lx_chain); }
         // lx: valid_inode_count drifts across a crash (roll-forward recreates
         // inodes without counting them): recount from the NAT, which is exact.
-        if ms.sb.fmt.lx && !ms.read_only { ms.cp.valid_inodes = nat_count_inodes(ms); }
+        if !ms.read_only { ms.cp.valid_inodes = nat_count_inodes(ms); }
         // Lane f2fsorphan: inodes unlinked while open when that checkpoint
         // was cut; nothing holds them now. After roll-forward, so a record
         // can no longer bring one back over freed blocks.
