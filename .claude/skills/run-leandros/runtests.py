@@ -88,6 +88,12 @@ SUITES = {
                 "/bin/epolltest abi",
                 # /proc/epollstat per-instance attribution (lane epattr).
                 "/bin/epolltest stat",
+                # kmscube on the v3d UAPI stub (lane kmscube2, openbugs L11.8):
+                # sync-file fence export + ADDFB2 of a v3d BO. The override is
+                # needed only in QEMU, where Mesa names the driver from the
+                # virtio-gpu PCI id before DRM_IOCTL_VERSION. Always disarmed.
+                # aarch64 only: the x86_64 megadriver has no v3d.
+                "if [ \"$(uname -m)\" = aarch64 ]; then drmsmoke --arm-v3d && MESA_LOADER_DRIVER_OVERRIDE=v3d kmscube -c 30; __k=$?; drmsmoke --disarm-v3d; test $__k = 0; fi",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/udptest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/pstest",

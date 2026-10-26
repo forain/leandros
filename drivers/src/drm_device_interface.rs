@@ -2585,6 +2585,55 @@ fn virtio_format_for(fourcc: u32) -> u32 {
 /// and every other consumer that reads it as a resource keep working. No lock
 /// is held on return, and `VIRTIO_GPU` is never taken: there is nothing to
 /// create.
+/// Host 2D resource standing in for the scanout engine over a v3d BO, keyed by
+/// blob object: one per BO however many framebuffers name it, released by
+/// `blob_unref` when the object dies.
+static V3D_SCANOUT_RES: Mutex<BTreeMap<u32, u32>> = Mutex::new(BTreeMap::new());
+
+/// ADDFB2 on a v3d BO (`CREATE_BO` handle). Mesa's v3d is a single-device
+/// driver (`ro == NULL`): a GBM scanout surface is a v3d BO and its handle goes
+/// straight to ADDFB2 (`v3d_resource.c`, `WINSYS_HANDLE_TYPE_KMS`). Every other
+/// path here refused it (`blob_framebuffer` skips v3d objects, the dumb lookup
+/// misses), so kmscube on the v3d backend died at its first framebuffer with
+/// ENOENT. A v3d BO is one physically contiguous block, so it scans out like
+/// a dumb BO: a host 2D resource whose backing is the BO's pages.
+/// Linear, tightly packed XRGB/ARGB8888 only — what v3d allocates for
+/// `PIPE_BIND_SCANOUT` (`v3d_resource.c`: linear forced, stride = width * cpp).
+fn v3d_framebuffer(
+    handle: u32,
+    open_id: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    offset: u32,
+    modifier: u64,
+) -> Option<Result<DrmFramebuffer, DriverError>> {
+    let b = blob_lookup(handle, open_id)?;
+    if b.v3d_va == 0 { return None; }
+    if b.phys == 0 || offset != 0 || modifier != 0 || pitch != width * 4
+        || (pitch as u64) * (height as u64) > b.size
+    {
+        return Some(Err(DriverError::InvalidParameter));
+    }
+    let mut fb = DrmFramebuffer::new(width, height, DrmFormat::Xrgb8888, handle, pitch);
+    fb.physical_addresses[0] = b.phys as u64;
+    let existing = V3D_SCANOUT_RES.lock().get(&b.obj).copied();
+    if let Some(gpu) = &mut crate::virtio_gpu::lock_gpu() {
+        let res = match existing {
+            Some(r) => r,
+            None => {
+                let r = gpu.alloc_resource_id();
+                gpu.create_resource_2d(r, width, height);
+                gpu.attach_backing(r, b.phys as u64, width * height * 4);
+                V3D_SCANOUT_RES.lock().insert(b.obj, r);
+                r
+            }
+        };
+        fb.handles[0] = res;
+    }
+    Some(Ok(fb))
+}
+
 fn blob_framebuffer(
     handle: u32,
     open_id: u32,
@@ -3158,6 +3207,15 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
         // here, unconditionally, from the one place the object dies.
         if o.v3d_va != 0 {
             v3d_va_free(o.v3d_va);
+            // The 2D scanout resource ADDFB2 put over this BO's pages, if any:
+            // released before the pages go back, so the host never holds a
+            // backing that is about to be reused.
+            let res = V3D_SCANOUT_RES.lock().remove(&obj);
+            if let Some(r) = res {
+                if let Some(gpu) = &mut crate::virtio_gpu::lock_gpu() {
+                    gpu.resource_unref(r);
+                }
+            }
         }
         if o.phys != 0 {
             bo_free_block(o.phys, o.order);
@@ -7862,6 +7920,21 @@ impl DrmDeviceInterface {
         };
         if let Some(r) = ext_framebuffer(&ext_req, open_id) {
             let fb = r?;
+            let fb_id = fb.id().0;
+            {
+                let dev = get_drm_device();
+                let mut g = dev.lock();
+                g.framebuffers.insert(fb.id(), fb);
+            }
+            cmd2.fb_id = fb_id;
+            uwrite(arg, &cmd2)?;
+            return Ok(0);
+        }
+        if let Some(r) = v3d_framebuffer(handle, open_id, width, height, pitch,
+                                         cmd2.offsets[0], modifier) {
+            let mut fb = r?;
+            fb.bo_obj = fb_bo_ref(handle, open_id).ok_or(DriverError::NotFound)?;
+            fb.owner = open_id;
             let fb_id = fb.id().0;
             {
                 let dev = get_drm_device();
