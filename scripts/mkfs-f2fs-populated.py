@@ -1173,6 +1173,23 @@ def main():
         _kexec_initrd = f"initrd-{arch}.cpio"
         if os.path.isfile(_kexec_initrd):
             m4_share_files.append(("/boot", "kexec-initrd", _kexec_initrd))
+            # Pi 5 slots (scripts/remote.py pi-*): the flashed kernel is also the
+            # starting `good` and `trial`, so a serial-console kexec works at once.
+            if arch == "aarch64":
+                import subprocess as _sp, tempfile as _tf, time as _tm
+                try:
+                    _rev = _sp.check_output(["git", "rev-parse", "--short=8", "HEAD"], text=True).strip()
+                except Exception:
+                    _rev = "unknown"
+                _info = _tf.NamedTemporaryFile("w", suffix=".info", delete=False)
+                _info.write(f"{_rev} {_tm.strftime('%Y-%m-%dT%H:%M:%S')} flashed\n")
+                _info.close()
+                for _slot in ("good", "trial"):
+                    _d = f"/boot/pi/{_slot}"
+                    m4_share_dirs.update(("/boot/pi", _d))
+                    m4_share_files.append((_d, "kernel", _kexec_img))
+                    m4_share_files.append((_d, "initrd", _kexec_initrd))
+                    m4_share_files.append((_d, "info", _info.name))
 
     # ── M5 session/compositor ship set (cosmic-comp + D-Bus session + fonts) ──
     # cosmic-comp (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) reuses the exact

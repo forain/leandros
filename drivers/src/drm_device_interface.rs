@@ -3206,6 +3206,9 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
         // record is gone nothing else can return the span, so it is returned
         // here, unconditionally, from the one place the object dies.
         if o.v3d_va != 0 {
+            // PTEs go before the span is reusable and before the pages go back below.
+            #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+            crate::v3d::mmu::unmap_bo(o.v3d_va, o.size);
             v3d_va_free(o.v3d_va);
             // The 2D scanout resource ADDFB2 put over this BO's pages, if any:
             // released before the pages go back, so the host never holds a
@@ -10199,6 +10202,17 @@ impl DrmDeviceInterface {
                 return Err(DriverError::Io);
             }
         };
+
+        // Real V3D (Pi 5, probed): back the GPU address with PTEs. Inactive (QEMU, stub, failed
+        // probe) leaves this path exactly as it was.
+        #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+        if crate::v3d::mmu::active() {
+            if crate::v3d::mmu::map_bo(va, phys as u64, alloc_bytes).is_err() {
+                v3d_va_free(va);
+                mm::buddy::free(phys, order);
+                return Err(DriverError::Io);
+            }
+        }
 
         // Object then handle, exactly as RESOURCE_CREATE_BLOB does it: the
         // handle IS the object's one initial reference (`BO LIFETIME`).
