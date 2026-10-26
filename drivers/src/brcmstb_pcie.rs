@@ -222,9 +222,9 @@ pub fn init() {
     let lnksta = (rd(hw::RC_LNKSTA & !3) >> 16) as u16;
     let (gen, width) = hw::lnksta_decode(lnksta);
     log("[pcie] rc link up gen");
-    print_hex(gen as u64);
+    crate::pci::serial_debug_dec(gen as u64);
     log(" x");
-    print_hex(width as u64);
+    crate::pci::serial_debug_dec(width as u64);
     log("\n");
     rmw(hw::RC_RTCTL, 0, hw::RTCTL_CRSSVE);
 

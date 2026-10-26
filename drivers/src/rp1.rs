@@ -69,6 +69,36 @@ pub fn probe() {
         Some(n) => { log("[rp1] msix vectors="); hex(n as u64); log(" via mip0 spi 128\n"); }
         None => log("[rp1] FAIL msix\n"),
     }
+    attach_gem(va);
+}
+
+/// `rp1.irq=1`: deliver the GEM interrupt over MSI-X → MIP → GIC instead of
+/// polling (default polled until the MSI path is hardware-verified).
+pub static GEM_IRQ: AtomicBool = AtomicBool::new(false);
+
+/// Pulses the BCM54213PE reset (RP1 GPIO 32, active low, 5 ms) and hands the
+/// GEM to `macb`. RP1 clocks are left as RP1 comes out of reset.
+fn attach_gem(bar1: usize) {
+    if let Some((ctrl, rio, pad, bit)) = hw::rp1_gpio_regs(hw::RP1_ETH_PHY_RESET_GPIO) {
+        let w = |o: usize, v: u32| unsafe { leandros_lib::mmio::write((bar1 + o) as *mut u32, v) };
+        let r = |o: usize| unsafe { leandros_lib::mmio::read((bar1 + o) as *const u32) };
+        w(rio + hw::RIO_SET + hw::RIO_OUT, bit); // deasserted (high) before driving
+        w(rio + hw::RIO_SET + hw::RIO_OE, bit);
+        w(pad, (r(pad) & !hw::RP1_PAD_OD) | hw::RP1_PAD_IE);
+        w(ctrl, (r(ctrl) & !0x1f) | hw::RP1_FSEL_SYS_RIO);
+        w(rio + hw::RIO_CLR + hw::RIO_OUT, bit);
+        sched::kthread::msleep(5);
+        w(rio + hw::RIO_SET + hw::RIO_OUT, bit);
+        sched::kthread::msleep(5);
+        log("[rp1] eth phy reset pulsed (gpio32)\n");
+    }
+    let irq_wired = GEM_IRQ.load(Ordering::Relaxed)
+        && request_irq(crate::macb::RP1_GEM_IRQ, true, crate::macb::rp1_isr, 0).map(core::mem::forget).is_ok();
+    crate::macb::rp1_attach(crate::macb::Rp1Gem {
+        mmio_va: bar1 + crate::macb::RP1_GEM_OFFSET as usize,
+        dma_offset: crate::macb::RP1_DMA_OFFSET,
+        irq_wired,
+    });
 }
 
 /// MIP0: every vector edge-triggered, delivered to the host, masked for the

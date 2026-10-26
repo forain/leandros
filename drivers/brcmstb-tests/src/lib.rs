@@ -102,4 +102,12 @@ mod tests {
         assert_eq!(rp1_msix_cfg(6, RP1_REG_SET), 0x10_8820);
         assert_eq!(rp1_msix_cfg(30, RP1_REG_CLR), 0x10_8c80);
     }
+
+    #[test]
+    fn rp1_gpio_layout() {
+        assert_eq!(rp1_gpio_regs(32), Some((0xd_4024, 0xe_4000, 0xf_4014, 1 << 4)));
+        assert_eq!(rp1_gpio_regs(0), Some((0xd_0004, 0xe_0000, 0xf_0004, 1)));
+        assert_eq!(rp1_gpio_regs(34), Some((0xd_8004, 0xe_8000, 0xf_8004, 1)));
+        assert_eq!(rp1_gpio_regs(54), None);
+    }
 }

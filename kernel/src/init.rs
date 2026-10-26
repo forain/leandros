@@ -120,6 +120,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // hardware-verified; bounded (<= ~0.4 s) and inert on failure.
     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
     if crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "pcie.rpi5=1")) {
+        drivers::rp1::GEM_IRQ.store(crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "rp1.irq=1")),
+            core::sync::atomic::Ordering::Relaxed);
         drivers::brcmstb_pcie::init();
         drivers::rp1::probe();
         drivers::pci::serial_debug("[pcie] state=");

@@ -276,3 +276,25 @@ pub const fn rp1_msix_cfg(n: u32, alias: usize) -> usize { RP1_PCIE_APBS + alias
 pub const RP1_INT_ETH: u32 = 6;
 pub const RP1_INT_USBHOST0: u32 = 30;
 pub const RP1_INT_USBHOST1: u32 = 35;
+
+// ── RP1 GPIO (SYS_RIO software control), Linux `pinctrl-rp1.c` ──────────────
+/// FUNCSEL value that hands a pin to the RIO (software GPIO) block.
+pub const RP1_FSEL_SYS_RIO: u32 = 5;
+pub const RP1_PAD_OD: u32 = 1 << 7;
+pub const RP1_PAD_IE: u32 = 1 << 6;
+/// BAR1 offsets for RP1 GPIO `g`: (CTRL, RIO bank base, PAD, bit). Banks
+/// hold 28, 6 and 20 pins; each bank is 0x4000 apart in IO (0xd0000), RIO
+/// (0xe0000; +0x2000 SET, +0x3000 CLR alias) and PADS (0xf0000, +4 skip).
+pub const fn rp1_gpio_regs(g: u32) -> Option<(usize, usize, usize, u32)> {
+    let (bank, pin) = if g < 28 { (0, g) } else if g < 34 { (1, g - 28) } else if g < 54 { (2, g - 34) } else { return None };
+    Some((0xd_0000 + bank * 0x4000 + 8 * pin as usize + 4,
+          0xe_0000 + bank * 0x4000,
+          0xf_0000 + bank * 0x4000 + 4 + 4 * pin as usize,
+          1 << pin))
+}
+pub const RIO_OUT: usize = 0x0;
+pub const RIO_OE: usize = 0x4;
+pub const RIO_SET: usize = 0x2000;
+pub const RIO_CLR: usize = 0x3000;
+/// GEM PHY reset: `phy-reset-gpios = <&rp1_gpio 32 GPIO_ACTIVE_LOW>`, 5 ms.
+pub const RP1_ETH_PHY_RESET_GPIO: u32 = 32;
