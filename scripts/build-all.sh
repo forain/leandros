@@ -297,7 +297,16 @@ create_disk_image() {
     mcopy -oi "$temp_fat" "target/final-$arch/kernel" ::/kernel.elf
     # Use uncompressed for now as our simple parser doesn't handle .gz
     mcopy -oi "$temp_fat" "initrd-$arch.cpio" ::/initrd.gz
-    mcopy -oi "$temp_fat" limine/limine.conf ::/limine.conf
+    # The QEMU boot image names its root volume by label (the f2fs label
+    # mkfs-f2fs-populated.py writes), so extra virtio disks a test adds
+    # cannot reorder which disk becomes /dev/root. Only this image's copy:
+    # write-usb.sh adds root=PARTUUID= to the stick's copy of the repo file.
+    local qemu_conf="limine-qemu-$arch.conf"
+    awk '{ print } /^[ \t]*path:.*kernel/ && !done { print "\tcmdline: root=LABEL=leandros-root"; done = 1 }' \
+        limine/limine.conf > "$qemu_conf"
+    grep -q "root=LABEL=leandros-root" "$qemu_conf" || { echo "limine.conf: no kernel path line" >&2; exit 1; }
+    mcopy -oi "$temp_fat" "$qemu_conf" ::/limine.conf
+    rm -f "$qemu_conf"
     # The remote-debug key (laptop-remote-debug skill): `espctl boot` imports
     # ::/leandros/authorized_keys as root's key, so ssh into a QEMU guest
     # works without copying it in by hand. LEANDROS_REMOTE_KEY overrides.

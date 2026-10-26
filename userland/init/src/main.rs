@@ -1851,7 +1851,7 @@ unsafe fn mount_root() -> bool {
             // disk or the partition type (the kernel log lists them). Mounting
             // a guess read-write could damage someone else's stick: stop.
             write_str("More than one disk could be the root filesystem (see the [BLK] line above).\n");
-            write_str("Remove the extra USB disks, or put root=PARTUUID=<id> or root=/dev/<name>\n");
+            write_str("Remove the extra USB disks, or put root=PARTUUID=<id>, root=LABEL=<label> or root=/dev/<name>\n");
             write_str("in the boot entry's cmdline (write-usb.sh does this by default).\n");
         }
         return false;

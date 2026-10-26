@@ -46,7 +46,12 @@ def main():
                      f"-device virtio-blk-pci,drive=bm{i},disable-legacy=on")
     env = dict(os.environ)
     env["LEANDROS_QEMU_EXTRA"] = " ".join(extra)
-    names = [vdname(BASE_DISKS + i) for i in range(n)]
+    # x86's base disks are transitional (legacy 0x1001) and the kernel probes
+    # modern (0x1042) virtio-blk first, so there these disable-legacy=on
+    # extras are vda.. and the base disks follow them. The root is found by
+    # root=LABEL= either way (lane/rootpick); only the names differ.
+    first = 0 if arch == "x86_64" else BASE_DISKS
+    names = [vdname(first + i) for i in range(n)]
     ok = True
     try:
         rc, out = drv("start", arch, timeout=300, env=env)

@@ -17,6 +17,7 @@ LX = os.environ.get("LEANDROS_F2FS_LEGACY") != "1"
 BLOCK_SIZE     = 4096
 BLOCKS_PER_SEG = 512       # 2 MB segments (log_blocks_per_seg = 9)
 F2FS_MAGIC     = 0xF2F52010
+ROOT_LABEL     = "leandros-root"
 # Linux include/linux/f2fs_fs.h: CP_UMOUNT_FLAG is 0x1 (0x8 is CP_ERROR_FLAG).
 # The kernel's f2fs reports a newest checkpoint without it as an unclean shutdown.
 CP_UMOUNT_FLAG = 0x00000001
@@ -165,6 +166,11 @@ def write_superblock(image, base, total_blocks, total_segs, main_segs):
     w32(image, s + 96, ROOT_INO)
     w32(image, s +100, NODE_INO)
     w32(image, s +104, META_INO)
+    # volume_name (__le16[512] at 124): the QEMU boot image's limine.conf
+    # names this volume as `root=LABEL=leandros-root` (build-all.sh), so the
+    # root no longer depends on virtio probe order.
+    name = ROOT_LABEL.encode("utf-16-le")
+    image[s + 124:s + 124 + len(name)] = name
 
 def build_dentry_blocks(entries):
     """Lay out directory entries across as many 4096-byte blocks as needed.
@@ -3148,7 +3154,8 @@ def main():
     if LX:
         import time
         t0 = time.time()
-        info = lx_pop.finish(out_file, total_segs, dir_nodes, dir_owner, subdirs, BUILD_TIME)
+        info = lx_pop.finish(out_file, total_segs, dir_nodes, dir_owner, subdirs, BUILD_TIME,
+                             label=ROOT_LABEL)
         open(out_file + ".gpu", "w").write(GPU_FLAVOR + "\n")
         print(f"Created lx populated F2FS image at {out_file} in {time.time() - t0:.1f}s: {info}")
         return
