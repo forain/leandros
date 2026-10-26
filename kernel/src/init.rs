@@ -116,6 +116,18 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::blkdev::init();
+    // Raspberry Pi 5: PCIe root complex for RP1 (Ethernet, USB). Opt-in until
+    // hardware-verified; bounded (<= ~0.4 s) and inert on failure.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    if crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "pcie.rpi5=1")) {
+        drivers::rp1::GEM_IRQ.store(crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "rp1.irq=1")),
+            core::sync::atomic::Ordering::Relaxed);
+        drivers::brcmstb_pcie::init();
+        drivers::rp1::probe();
+        drivers::pci::serial_debug("[pcie] state=");
+        drivers::pci::serial_debug(drivers::brcmstb_pcie::state());
+        drivers::pci::serial_debug("\n");
+    }
     // Raspberry Pi 5: power the CYW43455 and bring sdio2 up as an SDIO host.
     // One `[sdio]` line either way; inert on failure, bounded to ~2 s.
     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
