@@ -30,6 +30,7 @@ Options:
                              udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
+                             straysweep host:straysweeptest.py (greetd exit spares detached ssh jobs, own boot)
                              net      /bin/nettest alone
                              udp      /bin/udptest alone
                              pollnarrow host:pollnarrowtest.py alone
@@ -235,6 +236,7 @@ SUITES = {
     # sshfull adds key auth, root refusal, window change, sftp/scp, and git
     # over ssh and https.
     "ssh": ["host:sshsmoke.py"],
+    "straysweep": ["host:straysweeptest.py"],
     "sshfull": ["host:sshsmoke.py --full"],
 }
 

@@ -1065,7 +1065,15 @@ unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
                     let protected = match login_sid { Some(s) => s == sid, None => false }
                         || is_vt_session(sid);
                     // A zombie is already dead and waiting for the wait4 loop.
-                    if ppid == me && !protected && state != b'Z' {
+                    if ppid == me && !protected && state != b'Z' && !from_ssh(pid) {
+                        // Name each victim: a silent kill is undiagnosable.
+                        let mut comm = [0u8; 16];
+                        let len = proc_comm(pid, &mut comm);
+                        write_str("init: killing stray pid ");
+                        write_u32(pid);
+                        write_str(" (");
+                        write(STDOUT_FILENO, comm.as_ptr(), len);
+                        write_str(")\n");
                         syscall2(nr::KILL, pid as usize, SIGKILL);
                         killed_this_pass += 1;
                     }
@@ -1083,6 +1091,25 @@ unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
         write_u32(killed);
         write_str(" stray process(es) left by the graphical login\n");
     }
+}
+
+/// `pid` runs on behalf of an ssh login: sshd puts SSH_CONNECTION into the
+/// environment of every session it starts, and children inherit it. Such a
+/// process is no part of the graphical login even after the kernel has
+/// reparented it to init: `nohup job &` over ssh is orphaned as soon as its
+/// session closes, and `sweep_strays` used to SIGKILL it (with nothing in
+/// klog) the next time greetd exited, e.g. a migration script that stops the
+/// desktop and then runs a long `dd` (openbugs #89, lane ddkill).
+unsafe fn from_ssh(pid: u32) -> bool {
+    static mut ENV_BUF: [u8; 16384] = [0; 16384];
+    let mut path = [0u8; 32];
+    let mut p = 0;
+    for &b in b"/proc/" { path[p] = b; p += 1; }
+    p += fmt_u32(&mut path[p..], pid);
+    for &b in b"/environ\0" { path[p] = b; p += 1; }
+    let buf = &mut *core::ptr::addr_of_mut!(ENV_BUF);
+    let n = read_file(&path[..p], buf);
+    buf[..n].split(|&b| b == 0).any(|e| e.starts_with(b"SSH_CONNECTION="))
 }
 
 /// `/proc/loadavg`'s last field: the highest pid allocated so far.
@@ -1555,6 +1582,7 @@ unsafe fn pick_victim(dm_pid: i32, login_pid: i32, logger_pid: i32) -> Option<Vi
         let (state, _ppid, _pgid, sid) = match proc_stat(cur) { Some(v) => v, None => continue };
         if state == b'Z' || login_sid == Some(sid) || is_vt_session(sid) { continue; }
         let rss_kib = match proc_rss_kib(cur) { Some(r) if r > 0 => r, _ => continue };
+        if from_ssh(cur) { continue; }
         let mut v = Victim { pid: cur, rss_kib, comm: [0; 16], comm_len: 0 };
         v.comm_len = proc_comm(cur, &mut v.comm);
         let is_last = MEM_GUARD_LAST.iter().any(|n| &v.comm[..v.comm_len] == *n);
