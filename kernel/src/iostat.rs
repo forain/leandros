@@ -122,6 +122,9 @@ fn uart_rx_report() {
     {
         use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
         static SEEN: AtomicU64 = AtomicU64::new(0);
+        // One-shot GIC/PL011 snapshot the tick took while RX data sat
+        // un-taken by the interrupt (openbugs #101).
+        arch_aarch64::gic::uart_irq_diag_report();
         let oe = arch_aarch64::uart::UART_RX_OVERRUNS.load(Relaxed);
         let er = arch_aarch64::uart::UART_RX_ERRORS.load(Relaxed);
         // `irqs` proves the RX interrupt fires (printed once when the first

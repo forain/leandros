@@ -199,6 +199,20 @@ pub unsafe fn set_rx_irq(on: bool) {
     wr(IMSC, if on { (1 << 4) | (1 << 6) } else { 0 });
 }
 
+/// Diagnostic snapshot of the console PL011's interrupt state:
+/// `(IMSC, RIS, MIS, FR, CR)`; zeros before the port is mapped.
+pub fn irq_regs() -> (u32, u32, u32, u32, u32) {
+    unsafe {
+        if UART_BASE_ADDR == 0 { return (0, 0, 0, 0, 0); }
+        (rd(IMSC), rd(0x03C), rd(0x040), rd(FR), rd(CR))
+    }
+}
+
+/// True when the RX FIFO holds at least one byte (FR.RXFE clear).
+pub fn rx_pending() -> bool {
+    unsafe { UART_BASE_ADDR != 0 && rd(FR) & FR_RXFE == 0 }
+}
+
 pub unsafe fn clear_irq() {
     if UART_BASE_ADDR == 0 { return; }
     wr(ICR, (1 << 4) | (1 << 6));
