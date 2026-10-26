@@ -685,8 +685,89 @@ pub fn init() {
     // SPI 1 / INTID 33: the PL011 UART. Now just the first customer of the
     // generic path rather than a hand-unrolled special case.
     enable_spi(SPI_PL011);
+    #[cfg(any(feature = "rpi5", feature = "raspi4b"))]
+    probe_uart_line();
     UART_IRQ_LIVE.store(true, Ordering::Release);
     print_uart_irq_diag("init", &uart_irq_diag());
+}
+
+/// INTID the console UART actually raises. `SPI_PL011` unless the rpi5 line
+/// probe found it elsewhere (BCM2712 D0 moved uart10 from SPI 121 to SPI 120:
+/// raspberrypi/linux bcm2712d0-rpi-5-b.dts `&uart10 { interrupts = <GIC_SPI
+/// 120 ...> }`, while our card only carries the C1 bcm2712-rpi-5-b.dtb).
+static UART_INTID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(SPI_PL011);
+
+pub fn uart_intid() -> u32 { UART_INTID.load(Ordering::Relaxed) }
+
+/// Bounded busy wait on the generic counter (no timer interrupt needed).
+#[cfg(any(feature = "rpi5", feature = "raspi4b"))]
+fn spin_us(us: u64) {
+    let (f, t0): (u64, u64);
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack));
+        core::arch::asm!("isb; mrs {}, cntvct_el0", out(reg) t0, options(nomem, nostack));
+    }
+    let ticks = (f.max(1_000_000) / 1_000_000) * us;
+    loop {
+        let t: u64;
+        unsafe { core::arch::asm!("isb; mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack)); }
+        if t.wrapping_sub(t0) >= ticks { return; }
+    }
+}
+
+/// Raspberry Pi 5: find which GIC input the uart10 interrupt line drives.
+///
+/// Runs once in `init` with IRQs still masked at EL1. Candidate INTIDs 152
+/// (SPI 120, BCM2712 D0) and 153 (SPI 121, C1). For a level SPI the GIC's
+/// pending bit follows the input line whether or not it is enabled, so the
+/// probe toggles the PL011 output via `UARTIMSC` and watches `GICD_ISPENDR4`:
+/// mask all (line low) -> unmask the bits `UARTRIS` already latches (line
+/// high) -> restore. The INTID whose bit reads 0/1/0 is the UART. Prints one
+/// `[uartirq] probe` line; on no match it keeps `SPI_PL011`. Inert: touches
+/// only IMSC (restored) and the enable/pending state of 152/153.
+/// Also built for QEMU raspi4b (BCM2711 uart0 is INTID 153 too), where it
+/// exercises the method against QEMU's GIC-400 model and must print `-> 99`.
+#[cfg(any(feature = "rpi5", feature = "raspi4b"))]
+fn probe_uart_line() {
+    use crate::uart::{serial_print_str as s, print_hex as h};
+    const CANDS: [u32; 2] = [32 + 120, 32 + 121];
+    let word = || unsafe { gicd_r32(GICD_ISPENDR0 + (CANDS[0] as usize / 32) * 4) };
+    let bits = |w: u32| -> [u32; 2] { [(w >> (CANDS[0] % 32)) & 1, (w >> (CANDS[1] % 32)) & 1] };
+    let (imsc0, ris, _, _, _) = super::uart::irq_regs();
+    let assert_mask = ris & 0x7FF;
+    unsafe { super::uart::write_imsc(0); }
+    spin_us(50);
+    let lo = bits(word());
+    unsafe { super::uart::write_imsc(assert_mask); }
+    spin_us(50);
+    let hi = bits(word());
+    unsafe { super::uart::write_imsc(0); }
+    spin_us(50);
+    let lo2 = bits(word());
+    unsafe { super::uart::write_imsc(imsc0); }
+    let mut found = None;
+    for i in 0..2 {
+        if lo[i] == 0 && hi[i] == 1 && lo2[i] == 0 { found = Some(CANDS[i]); break; }
+    }
+    s("[uartirq] probe ris "); h(ris as usize);
+    for i in 0..2 {
+        s(" i"); h(CANDS[i] as usize); s(" ");
+        h(lo[i] as usize); s("/"); h(hi[i] as usize); s("/"); h(lo2[i] as usize);
+    }
+    s(" -> ");
+    match found {
+        Some(id) => h(id as usize),
+        None => s("none"),
+    }
+    s("\n");
+    if let Some(id) = found {
+        if id != SPI_PL011 {
+            register_handler(id, super::exception::uart_irq);
+            UART_INTID.store(id, Ordering::Release);
+            enable_spi(id);
+            disable_spi(SPI_PL011);
+        }
+    }
 }
 
 /// Set once the console UART's SPI is enabled; `pend_uart_irq` is a no-op
@@ -698,7 +779,7 @@ static UART_IRQ_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// drains `uart::RX_RING`) as soon as the target CPU opens IRQs.
 pub fn pend_uart_irq() {
     if !UART_IRQ_LIVE.load(Ordering::Acquire) { return; }
-    let id = SPI_PL011 as usize;
+    let id = uart_intid() as usize;
     unsafe { gicd_w32(GICD_ISPENDR0 + (id / 32) * 4, 1 << (id % 32)); }
 }
 
@@ -713,13 +794,15 @@ pub struct UartIrqDiag {
     pub target: u32, pub prio: u32, pub cfg: u32,
     pub gicc_ctlr: u32, pub gicc_pmr: u32, pub gicc_rpr: u32, pub gicc_hppir: u32,
     pub imsc: u32, pub ris: u32, pub mis: u32, pub fr: u32, pub cr: u32,
+    /// `GICD_ISPENDR0..15` (word 0 is the reading CPU's banked SGI/PPI word).
+    pub spend: [u32; 16],
 }
 
 /// Read the distributor/CPU-interface/PL011 state of the console UART SPI.
 /// Read-only: no IAR read, so nothing is acknowledged. GICv2 only (on v3 the
 /// GICC fields stay 0).
 pub fn uart_irq_diag() -> UartIrqDiag {
-    let id = SPI_PL011 as usize;
+    let id = uart_intid() as usize;
     let bit = |base: usize| unsafe { (gicd_r32(base + (id / 32) * 4) >> (id % 32)) & 1 };
     let byte = |base: usize| unsafe { (gicd_r32(base + (id / 4) * 4) >> ((id % 4) * 8)) & 0xFF };
     let el: u64;
@@ -736,6 +819,8 @@ pub fn uart_irq_diag() -> UartIrqDiag {
         d.target = byte(GICD_ITARGETSR);
         d.prio = byte(GICD_IPRIORITYR);
         d.cfg = (gicd_r32(GICD_ICFGR + (id / 16) * 4) >> ((id % 16) * 2)) & 3;
+        let words = (((d.gicd_typer & 0x1F) + 1) as usize).min(d.spend.len());
+        for w in 0..words { d.spend[w] = gicd_r32(GICD_ISPENDR0 + w * 4); }
         if !is_v3() {
             d.gicc_ctlr = gicc_r32(GICC_CTLR);
             d.gicc_pmr = gicc_r32(GICC_PMR);
@@ -749,7 +834,7 @@ pub fn uart_irq_diag() -> UartIrqDiag {
 /// Print a snapshot as one `[uartirq]` line, tagged with `when`.
 pub fn print_uart_irq_diag(when: &str, d: &UartIrqDiag) {
     use crate::uart::{serial_print_str as s, print_hex as h};
-    s("[uartirq] "); s(when); s(" intid "); h(SPI_PL011 as usize);
+    s("[uartirq] "); s(when); s(" intid "); h(uart_intid() as usize);
     s(" EL "); h(d.el as usize);
     s(" D.ctlr "); h(d.gicd_ctlr as usize); s(" D.typer "); h(d.gicd_typer as usize);
     s(" en "); h(d.enabled as usize); s(" pend "); h(d.pending as usize);
@@ -760,6 +845,11 @@ pub fn print_uart_irq_diag(when: &str, d: &UartIrqDiag) {
     s(" C.rpr "); h(d.gicc_rpr as usize); s(" C.hppir "); h(d.gicc_hppir as usize);
     s(" imsc "); h(d.imsc as usize); s(" ris "); h(d.ris as usize);
     s(" mis "); h(d.mis as usize); s(" fr "); h(d.fr as usize); s(" cr "); h(d.cr as usize);
+    // Every non-zero ISPENDR word, `wN=bits` (INTID = 32*N + bit).
+    s(" spend");
+    for (w, &v) in d.spend.iter().enumerate() {
+        if v != 0 { s(" w"); h(w); s("="); h(v as usize); }
+    }
     s("\n");
 }
 
@@ -769,7 +859,7 @@ pub fn print_uart_irq_diag(when: &str, d: &UartIrqDiag) {
 pub static mut UART_IRQ_PENDING_DIAG: UartIrqDiag = UartIrqDiag {
     el: 0, gicd_ctlr: 0, gicd_typer: 0, enabled: 0, pending: 0, active: 0, group: 0,
     target: 0, prio: 0, cfg: 0, gicc_ctlr: 0, gicc_pmr: 0, gicc_rpr: 0, gicc_hppir: 0,
-    imsc: 0, ris: 0, mis: 0, fr: 0, cr: 0,
+    imsc: 0, ris: 0, mis: 0, fr: 0, cr: 0, spend: [0; 16],
 };
 /// 0 = not taken, 1 = taken (readable), 2 = printed.
 pub static UART_IRQ_PENDING_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -784,9 +874,43 @@ pub fn uart_irq_diag_tick() {
 
 /// Task-context hook: print the tick snapshot once it exists.
 pub fn uart_irq_diag_report() {
+    uart_irq_swpend_test();
     if UART_IRQ_PENDING_STATE.compare_exchange(1, 2, Ordering::Acquire, Ordering::Relaxed).is_ok() {
         let d = unsafe { *core::ptr::addr_of!(UART_IRQ_PENDING_DIAG) };
         print_uart_irq_diag("rx-pending", &d);
+    }
+}
+
+/// Two-step one-shot: the first report call sets the console UART INTID
+/// pending in `GICD_ISPENDR`; the next call (one kiostat window later, so the
+/// caller's own IRQ-masked context cannot hide the delivery) checks whether
+/// `exception::uart_irq` counted it. `taken 1` proves distributor -> CPU
+/// interface -> CPU -> handler works for that INTID, so a dead RX interrupt is
+/// the device line, not the GIC path. Prints
+/// `[uartirq] swpend intid N irqs A->B taken T pend P`.
+fn uart_irq_swpend_test() {
+    use core::sync::atomic::{AtomicU64, AtomicU8};
+    use crate::uart::{serial_print_str as s, print_hex as h};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    static BEFORE: AtomicU64 = AtomicU64::new(0);
+    if !cfg!(any(feature = "rpi5", feature = "raspi4b")) || !UART_IRQ_LIVE.load(Ordering::Acquire) { return; }
+    let id = uart_intid() as usize;
+    let irqs = &super::uart::UART_RX_IRQS;
+    match STATE.load(Ordering::Acquire) {
+        0 => {
+            BEFORE.store(irqs.load(Ordering::Relaxed), Ordering::Relaxed);
+            STATE.store(1, Ordering::Release);
+            pend_uart_irq();
+        }
+        1 => {
+            STATE.store(2, Ordering::Release);
+            let before = BEFORE.load(Ordering::Relaxed);
+            let after = irqs.load(Ordering::Relaxed);
+            let pend = unsafe { (gicd_r32(GICD_ISPENDR0 + (id / 32) * 4) >> (id % 32)) & 1 };
+            s("[uartirq] swpend intid "); h(id); s(" irqs "); h(before as usize); s("->"); h(after as usize);
+            s(" taken "); h((after != before) as usize); s(" pend "); h(pend as usize); s("\n");
+        }
+        _ => {}
     }
 }
 
