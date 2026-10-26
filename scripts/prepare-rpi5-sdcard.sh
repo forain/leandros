@@ -327,22 +327,30 @@ fetch_gpu_firmware() {
     cp "$src_dir/fixup4.dat" "$MOUNT_DIR/fixup4.dat"
 }
 
-# The Pi 5 device tree for direct boot. target/rpi5-uefi/ only exists when the
-# UEFI firmware bundle was vendored by hand; nothing in the build creates it,
-# so a fresh checkout falls back to the stock DTB from the firmware repo
-# (the same file the firmware would otherwise pick itself).
+# The Pi 5 device trees for direct boot, one per BCM2712 stepping. The
+# firmware picks bcm2712d0-rpi-5-b.dtb itself on a D0 board (it moved uart10
+# to SPI 120 and has a different pin-mux layout, `brcm,bcm2712d0-pinctrl`) and
+# bcm2712-rpi-5-b.dtb on C1; config.txt names no device_tree, so both go on
+# the card. target/rpi5-uefi/ only exists when the UEFI firmware bundle was
+# vendored by hand; nothing in the build creates it, so a fresh checkout
+# fetches them from the firmware repo at a pinned commit, sha256-checked.
+DTB_COMMIT="88a0ae8876e800801ee5c27624138b3d02a21c63"   # raspberrypi/firmware master, 2026-10-21
+DTB_SHA256_C1="03ce4742452ad52e3e8ec2259a0c705b496970e2b75e6e0b4e5446475ea1b926"
+DTB_SHA256_D0="d01e2104a8b747e99e310bfb22aeac8100e3b98df29951b296b5cdc2e95afb53"
 direct_boot_dtb() {
-    local f
-    for f in "$UEFI_DIR/bcm2712-rpi-5-b.dtb" "${FIRMWARE_DIR:+$FIRMWARE_DIR/bcm2712-rpi-5-b.dtb}"; do
+    local name="$1" sum="$2" f
+    for f in "$UEFI_DIR/$name" "${FIRMWARE_DIR:+$FIRMWARE_DIR/$name}"; do
         [[ -n "$f" && -f "$f" ]] && { echo "$f"; return; }
     done
-    mkdir -p "$FW_CACHE_DIR"
-    f="$FW_CACHE_DIR/bcm2712-rpi-5-b.dtb"
+    mkdir -p "$FW_CACHE_DIR/dtb-$DTB_COMMIT"
+    f="$FW_CACHE_DIR/dtb-$DTB_COMMIT/$name"
     if [[ ! -f "$f" ]]; then
-        info "Downloading RPi 5 device tree (bcm2712-rpi-5-b.dtb)..." >&2
-        curl -fsSL -o "$f" "$FW_BASE_URL/bcm2712-rpi-5-b.dtb" || \
-            die "Failed to download bcm2712-rpi-5-b.dtb from $FW_BASE_URL"
+        info "Downloading RPi 5 device tree ($name)..." >&2
+        curl -fsSL -o "$f.part" "https://raw.githubusercontent.com/raspberrypi/firmware/$DTB_COMMIT/boot/$name" || \
+            die "Failed to download $name at raspberrypi/firmware $DTB_COMMIT"
+        mv "$f.part" "$f"
     fi
+    [[ "$(shasum -a 256 "$f" | cut -d' ' -f1)" == "$sum" ]] || { rm -f "$f"; die "sha256 mismatch for $name"; }
     echo "$f"
 }
 
@@ -352,7 +360,8 @@ fetch_gpu_firmware
 
 if [[ "$BOOT_MODE" == "direct" ]]; then
     info "Copying direct-boot kernel + initrd..."
-    cp "$(direct_boot_dtb)" "$MOUNT_DIR/bcm2712-rpi-5-b.dtb"
+    cp "$(direct_boot_dtb bcm2712-rpi-5-b.dtb "$DTB_SHA256_C1")" "$MOUNT_DIR/bcm2712-rpi-5-b.dtb"
+    cp "$(direct_boot_dtb bcm2712d0-rpi-5-b.dtb "$DTB_SHA256_D0")" "$MOUNT_DIR/bcm2712d0-rpi-5-b.dtb"
     # The *flat* image, not the ELF. The Raspberry Pi firmware does not parse
     # ELF for `kernel=`; it copies the file verbatim to `kernel_address` and
     # branches to the first byte. build-all.sh already emits this via
