@@ -792,7 +792,19 @@ mod hw {
             let v = rd32(cfg + SDIO_CFG_SD_PIN_SEL);
             wr32(cfg + SDIO_CFG_SD_PIN_SEL, (v & !3) | 2);
         }
-        // WL_REG_ON low → high, then the regulator's startup delay.
+        // The CYW43455 keeps running across kexec, and so may this host. Always
+        // quiesce the host (full reset, SD clock and bus power off), then pulse
+        // WL_REG_ON low (≥ 10 ms) → high and wait the regulator's startup delay,
+        // even when the chip already looks powered. host_init resets again.
+        {
+            let mut q = Mmio { host };
+            q.w16(REG_NORMAL_SIG_ENABLE, 0);
+            q.w16(REG_ERROR_SIG_ENABLE, 0);
+            q.w8(REG_SOFTWARE_RESET, SWRST_ALL);
+            sched::kthread::udelay(1_000);
+            q.w16(REG_CLOCK_CONTROL, 0);
+            q.w8(REG_POWER_CONTROL, 0);
+        }
         wl_reg_on(gio, false);
         sched::kthread::udelay(20_000);
         wl_reg_on(gio, true);
