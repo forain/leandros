@@ -17,3 +17,12 @@ writes run at ~750 kB/s. None of them print file contents.
 Gotchas: guest `dd` needs `iflag=fullblock` with `count=`; readback counts must use a block size
 that divides the image; the root image for an Intel laptop must be built with `INTEL=1`
 (iris + ANV ship-set), else greetd refuses to start COSMIC (gpuprobe falls back to softpipe).
+
+## Intel GPU stage knob (INTEL=1)
+
+`INTEL=1 ./scripts/build-all.sh` (or `INTEL=1 python3 scripts/mkfs-f2fs-populated.py <img> x86_64`) selects
+`gpu-stage-x86_64-intel` (build it with `INTEL=1 OUT_SUFFIX=-intel ports/mesa/build-gpu-stack.sh x86_64`).
+mkfs fails if INTEL=1 is set and the stage lacks iris / `libvulkan_intel.so` / `intel_icd.x86_64.json`, and it
+stamps `<img>.gpu` (`intel` or `generic`). `scripts/write-usb.sh x86_64` refuses an image whose stamp is not `intel`
+(override: `LEANDROS_USB_ALLOW_GENERIC_GPU=1`). Before staging an image for migration (`s0v2.sh`), run
+`cat f2fs-data0-x86_64.img.gpu` and expect `intel`. QEMU default builds are unchanged.
