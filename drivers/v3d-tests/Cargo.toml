@@ -1,0 +1,15 @@
+# Host unit tests for the hardware-independent V3D (Pi 5 GPU) driver pieces: MMU PTE encoding,
+# table fill/clear, the enable/flush register sequences, and the IRQ handlers and self-test,
+# all against a mock register file. Its own workspace so it builds for the host:
+#
+#   cd drivers/v3d-tests && cargo test --target aarch64-apple-darwin
+[package]
+name = "v3d-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

@@ -366,6 +366,13 @@ pub extern "C" fn arch_irq_line_enable(id: u32, edge: bool) -> bool {
     true
 }
 
+/// Distributor state of GIC line `id` for `drivers` self-tests: bit0 pending,
+/// bit1 active, bit2 enabled. Read-only (nothing is acknowledged).
+#[no_mangle]
+pub extern "C" fn arch_irq_line_state(id: u32) -> u32 {
+    gic::spi_state(id)
+}
+
 /// Mask GIC line `id` again (last `drivers::irq` sharer gone, or storm).
 #[no_mangle]
 pub extern "C" fn arch_irq_line_disable(id: u32) {

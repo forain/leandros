@@ -608,6 +608,21 @@ pub fn disable_spi(id: u32) {
     }
 }
 
+/// Read-only distributor state of SPI `id`: bit0 pending, bit1 active, bit2 enabled.
+/// Used by device self-tests that raise their own interrupt in software, to tell
+/// "the line never reached the GIC" from "the GIC has it but the CPU never took it".
+pub fn spi_state(id: u32) -> u32 {
+    if id < 32 || (id as usize) >= NUM_IRQS { return 0; }
+    let word = (id as usize / 32) * 4;
+    let bit = 1u32 << (id % 32);
+    unsafe {
+        let p = (gicd_r32(GICD_ISPENDR0 + word) & bit != 0) as u32;
+        let a = (gicd_r32(GICD_ISACTIVER0 + word) & bit != 0) as u32;
+        let e = (gicd_r32(GICD_ISENABLER0 + word) & bit != 0) as u32;
+        p | (a << 1) | (e << 2)
+    }
+}
+
 /// Initialise GICv2 and enable PPI #27 (EL1 virtual timer).
 /// GICv3 distributor bring-up, BSP only. Affinity routing on, every SPI in
 /// Group 1, then enable.
