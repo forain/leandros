@@ -116,6 +116,16 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::blkdev::init();
+    // Raspberry Pi 5: PCIe root complex for RP1 (Ethernet, USB). Opt-in until
+    // hardware-verified; bounded (<= ~0.4 s) and inert on failure.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    if crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "pcie.rpi5=1")) {
+        drivers::brcmstb_pcie::init();
+        drivers::rp1::probe();
+        drivers::pci::serial_debug("[pcie] state=");
+        drivers::pci::serial_debug(drivers::brcmstb_pcie::state());
+        drivers::pci::serial_debug("\n");
+    }
     // Publish the disks to the VFS, which owns /dev/vd*, /dev/loopN and the
     // synthesized /sys/class/block tree. `vfs-server` deliberately does not
     // depend on `drivers` (the VFS sits below the device layer), so the

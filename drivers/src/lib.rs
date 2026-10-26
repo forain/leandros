@@ -99,6 +99,14 @@ pub mod sdhci;
 /// protocol can be exercised without hardware.
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod rpi_mailbox;
+/// BCM2712 PCIe root complex (pcie2) register math, RC bring-up, and the RP1
+/// south bridge behind it. Opt-in at boot with `pcie.rpi5=1`.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod brcmstb_hw;
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod brcmstb_pcie;
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rp1;
 
 /// Block-device trait and types every backend implements (always built).
 pub mod blockdev;
