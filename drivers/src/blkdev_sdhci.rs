@@ -50,10 +50,40 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
     })
 }
 
-/// `root=/dev/vdX` when given, else the card at index 1 if it holds f2fs.
+static HINT_WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// True if the card at `idx` is f2fs with volume label `label` (UTF-16LE
+/// `volume_name`, byte 124 of the superblock; ASCII labels only).
+fn label_is(idx: usize, label: &str) -> bool {
+    const NAME: usize = 1024 + 124;
+    let l = label.as_bytes();
+    if l.is_empty() || l.len() >= 512 || idx >= device_count() { return false; }
+    let mut buf = alloc::vec![0u8; 4096];
+    if !read_blocks(idx, 0, &mut buf) || !is_f2fs_block0(&buf) { return false; }
+    let u = |i: usize| u16::from_le_bytes([buf[NAME + 2 * i], buf[NAME + 2 * i + 1]]);
+    l.iter().enumerate().all(|(i, &c)| u(i) == c as u16) && u(l.len()) == 0
+}
+
+/// `/dev/root` on this board: `root=/dev/vdX` or `root=LABEL=<f2fs label>`
+/// when it names the card, else the card at index 1 if it holds f2fs.
+///
+/// The card is probed synchronously in `sdhci::init`, before userspace runs,
+/// and nothing hotplugs here, so a `root=` that names nothing now never will.
+/// Answering `NotFound` for it made init wait its full 30 s for a root that
+/// was already present: with no cmdline.txt the Pi firmware appends its own
+/// default `root=/dev/mmcblk0p2 rootfstype=ext4 rootwait`. Such a hint is
+/// logged once and the card is used.
 pub fn resolve_root(cmdline: Option<&str>, _boot: Option<BootDisk>) -> Result<usize, RootErr> {
-    if let Some(name) = cmdline.and_then(parse_root_arg).and_then(|s| s.strip_prefix("/dev/")) {
-        return lookup_name(name).ok_or(RootErr::NotFound);
+    if let Some(spec) = cmdline.and_then(parse_root_arg) {
+        if let Some(i) = spec.strip_prefix("/dev/").and_then(lookup_name) { return Ok(i); }
+        if let Some(label) = spec.strip_prefix("LABEL=") {
+            if label_is(1, label) { return Ok(1); }
+        }
+        if !HINT_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            crate::pci::serial_debug("[BLK] root=");
+            crate::pci::serial_debug(spec);
+            crate::pci::serial_debug(" names no device on this board; using the SD card\n");
+        }
     }
     if 1 < device_count() && has_f2fs(1) { Ok(1) } else { Err(RootErr::NotFound) }
 }
