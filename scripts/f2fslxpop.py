@@ -3,7 +3,7 @@
 Used by scripts/mkfs-f2fs-populated.py in place of its legacy tail. Writes the
 same tree as the legacy path, but in Linux's on-disk layout (scripts/f2fslx.py)
 and the way mkfs.f2fs/the kernel lay a volume out so `fsck.f2fs --dry-run`
-accepts it (mirrors scripts/mkfs-f2fs-home-lx.py):
+accepts it (mirrors scripts/mkfs-f2fs-home.py):
 
 * two allocators: node blocks (inodes, direct/indirect nodes) fill HOT_NODE
   segments from the start of the main area; data blocks (file contents,
@@ -78,7 +78,7 @@ class Pop:
             self.entries.append((parent_ino, name.encode(), nid, dt))
 
     def finish(self, out_path, total_segs, dir_nodes, dir_owner, subdirs, build_time, label=None):
-        # ---- geometry (mirrors mkfs-f2fs-home-lx.py) ----
+        # ---- geometry (mirrors mkfs-f2fs-home.py) ----
         sit_blocks = -(-total_segs // SIT_PER_BLK)
         sit_segs = 2 * -(-sit_blocks // BPS)
         ckpt_segs, nat_segs = 2, 2

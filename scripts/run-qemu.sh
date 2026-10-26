@@ -752,7 +752,7 @@ if [ "$BOOT_MODE" = "uefi" ] && [ -f "$DISK_IMAGE" ] \
     SRC_TS=$(git -C "$(dirname "$0")/.." log -1 --format=%ct -- \
         arch boot capability drivers elf ipc kernel lib mm ports sched servers userland \
         scripts/build-all.sh scripts/build-userland.sh scripts/mkfs-f2fs-populated.py \
-        scripts/f2fslx.py scripts/f2fslxpop.py scripts/mkfs-f2fs-home-lx.py 2>/dev/null)
+        scripts/f2fslx.py scripts/f2fslxpop.py scripts/mkfs-f2fs-home.py 2>/dev/null)
     if [ "$OS" = "Darwin" ]; then IMG_TS=$(stat -f %m "$DISK_IMAGE"); else IMG_TS=$(stat -c %Y "$DISK_IMAGE"); fi
     if [ -n "$SRC_TS" ] && [ -n "$IMG_TS" ] && [ "$IMG_TS" -lt "$SRC_TS" ]; then
         _fmt_ts() { if [ "$OS" = "Darwin" ]; then date -r "$1" '+%F %R'; else date -d "@$1" '+%F %R'; fi; }

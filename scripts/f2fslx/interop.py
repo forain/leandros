@@ -13,7 +13,7 @@ Direction A (Linux -> LeandrOS): on the box mkfs.f2fs + populate + MANIFEST md5,
 fsck rc 0, image shipped gzipped; LeandrOS boots with it attached, mounts it by
 label (rw, else ro), `md5sum -c MANIFEST`, attempts a write; a volume mounted ro
 must be bit-identical afterwards.
-Direction B (LeandrOS -> Linux): scripts/mkfs-f2fs-home-lx.py volume -> LeandrOS
+Direction B (LeandrOS -> Linux): scripts/mkfs-f2fs-home.py volume -> LeandrOS
 workload -> box `fsck.f2fs --dry-run` -> Linux rw mount, verify, write a file,
 umount, fsck -> LeandrOS mounts again and verifies the Linux file.
 
@@ -580,9 +580,9 @@ timeout 180 fsck.f2fs --dry-run f.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?"
 def direction_b(tmp):
     v = "home"
     img = os.path.join(tmp, "home.img")
-    r = subprocess.run([sys.executable, os.path.join(REPO, "scripts/mkfs-f2fs-home-lx.py"), "create", img, "--size", "256M"],
+    r = subprocess.run([sys.executable, os.path.join(REPO, "scripts/mkfs-f2fs-home.py"), "create", img, "--size", "256M"],
                        capture_output=True, text=True)
-    if not step(v, "B.lx-mkfs", r.returncode == 0, "mkfs-f2fs-home-lx create" if r.returncode == 0 else r.stderr.strip()[-100:]):
+    if not step(v, "B.lx-mkfs", r.returncode == 0, "mkfs-f2fs-home create" if r.returncode == 0 else r.stderr.strip()[-100:]):
         return
     W = ("cd /mnt/h && mkdir -p w/d1/d2 w/many && dd if=/dev/urandom of=w/big bs=4096 count=3000 2>/dev/null && "
          "for i in $(seq 1 300); do echo f$i > w/many/file_with_long_name_$i; done && echo hi > w/d1/d2/s && "
