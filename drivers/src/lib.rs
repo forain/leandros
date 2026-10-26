@@ -83,6 +83,8 @@ pub mod wifi_crypto;
 pub mod wifi_api;
 /// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).
 pub mod wifi_mgr;
+/// Broadcom/Cypress FullMAC Wi-Fi (CYW43455, Raspberry Pi 5).
+pub mod brcmf;
 pub mod wifi_pref;
 /// A simulated Wi-Fi interface for QEMU tests (opt-in; see its header).
 pub mod wifi_sim;
