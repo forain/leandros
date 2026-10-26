@@ -202,6 +202,7 @@ pub fn init(cmdline: &str) {
     crate::virtio_net::init();
     crate::r8169::init(cmdline);
     crate::e1000e::init(cmdline);
+    crate::macb::init(cmdline);
     crate::iwlwifi::init(cmdline);
     // The simulated Wi-Fi (QEMU only, opt-in) may claim a virtio-net device
     // as its data path; that device is then wifi0, not an ethN.
@@ -214,6 +215,7 @@ pub fn init(cmdline: &str) {
     }
     if crate::r8169::present() { register(Kind::Wired, "eth", &R8169_OPS, 0); }
     if crate::e1000e::present() { register(Kind::Wired, "eth", &E1000E_OPS, 0); }
+    if crate::macb::present() { register(Kind::Wired, "eth", &MACB_OPS, 0); }
     // Wi-Fi netifs, then their control side on the /dev/netctl seam
     // (iwlwifi serves it only with iwlwifi.mgr=1).
     if crate::wifi_sim::present() {
@@ -264,6 +266,7 @@ static VIRTIO_OPS: NetifOps = NetifOps {
         let _ = writeln!(out, "link: {}", if crate::virtio_net::link_up(d as usize) { "up" } else { "down" });
         let _ = writeln!(out, "realtek: {}", crate::r8169::chip_name().unwrap_or("none"));
         let _ = writeln!(out, "intel: {}", crate::e1000e::chip_name().unwrap_or("none"));
+        let _ = writeln!(out, "macb: {}", crate::macb::state());
     },
 };
 
@@ -291,6 +294,19 @@ static E1000E_OPS: NetifOps = NetifOps {
     link: |_| crate::e1000e::link(),
     link_gen: |_| crate::e1000e::link_generation(),
     info: |_, out| crate::e1000e::info_lines(out),
+};
+
+static MACB_OPS: NetifOps = NetifOps {
+    driver: |_| "macb",
+    send: |_, b| crate::macb::send_packet(b),
+    tx_ready: |_| crate::macb::tx_ready(),
+    recv: |_, b| crate::macb::poll_receive(b),
+    rx_rearm: |_| crate::macb::rx_rearm(),
+    rx_irq_driven: |_| crate::macb::rx_irq_driven(),
+    mac: |_| crate::macb::mac_address(),
+    link: |_| crate::macb::link(),
+    link_gen: |_| crate::macb::link_generation(),
+    info: |_, out| crate::macb::info_lines(out),
 };
 
 static WIFISIM_OPS: NetifOps = NetifOps {
