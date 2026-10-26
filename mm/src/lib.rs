@@ -11,6 +11,7 @@
 pub mod atomic_pool;
 pub mod buddy;
 pub mod cow;
+pub mod dma_cache;
 pub mod gap2;
 pub mod kva;
 pub mod pagecache;

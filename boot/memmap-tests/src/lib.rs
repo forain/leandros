@@ -6,6 +6,10 @@ pub mod memmap;
 
 #[path = "../../src/hhdm_a64.rs"]
 pub mod hhdm_a64;
+#[path = "../../../mm/src/dma_cache.rs"]
+pub mod dma_cache;
+#[path = "../../src/mpidr.rs"]
+pub mod mpidr;
 
 #[cfg(test)]
 mod tests {
@@ -378,5 +382,123 @@ mod hhdm_tests {
         let st = do_fill(&b, &[(GIB, 2 * GIB)], true);
         assert_eq!((st.failed, st.patched), (GIB, 0));
         assert!(w(&b, GIB).bad_table);
+    }
+
+    fn do_unmap(a: &Arena, s: u64, t: u64, allow: bool) -> UnmapStats {
+        let tt = |p| a.ptr(p);
+        let mut al = || a.alloc();
+        let mut bbm = |slot: *mut u64, d: u64, _b: u64, _n: u64| {
+            if allow { unsafe { *slot = d; } }
+            allow
+        };
+        unsafe { unmap(a.root(), BITS, HHDM, s, t, &tt, &mut al, &mut bbm) }
+    }
+
+    #[test]
+    fn unmap_splits_blocks_and_keeps_neighbours() {
+        let a = Arena::new(64);
+        do_fill(&a, &[(4 * GIB, 5 * GIB)], true);
+        // Partial 2M block (split to 4K) + one whole 2M block.
+        let (s, t) = (4 * GIB + 0x3000, 4 * GIB + 2 * MIB2);
+        let st = do_unmap(&a, s, t, true);
+        assert_eq!((st.splits, st.tables, st.left), (2, 2, 0));
+        assert_eq!(st.cleared, 509 + 1);
+        for p in [s, s + 0x1000, MIB2 + 4 * GIB - 0x1000, 4 * GIB + MIB2, t - 0x1000] {
+            assert_eq!(mapped_to(&a, p), None, "phys {p:#x} still mapped");
+        }
+        for p in [4 * GIB, s - 0x1000, t, t + MIB2, 5 * GIB - 0x1000] {
+            assert_eq!(mapped_to(&a, p), Some(p), "phys {p:#x}");
+            assert_eq!(w(&a, p).desc & ATTR_MASK, ATTR & ATTR_MASK, "attrs at {p:#x}");
+        }
+        // Idempotent; a hole is skipped.
+        let st2 = do_unmap(&a, s, t, true);
+        assert_eq!((st2.cleared, st2.splits, st2.left), (0, 0, 0));
+    }
+
+    #[test]
+    fn unmap_refused_split_leaves_block_mapped() {
+        let a = Arena::new(64);
+        do_fill(&a, &[(4 * GIB, 5 * GIB)], true);
+        let (s, t) = (4 * GIB + GIB / 2, 4 * GIB + GIB / 2 + 0x5000);
+        let st = do_unmap(&a, s, t, false);
+        assert_eq!((st.cleared, st.splits, st.left), (0, 0, t - s));
+        assert_eq!(mapped_to(&a, s), Some(s));
+        assert_eq!(w(&a, s).page, GIB);
+    }
+
+    #[test]
+    fn unmap_whole_gib_needs_no_split() {
+        let a = Arena::new(64);
+        do_fill(&a, &[(4 * GIB, 6 * GIB)], true);
+        let st = do_unmap(&a, 4 * GIB, 5 * GIB, false);
+        assert_eq!((st.cleared, st.splits, st.left), (1, 0, 0));
+        assert_eq!(mapped_to(&a, 4 * GIB), None);
+        assert_eq!(mapped_to(&a, 5 * GIB), Some(5 * GIB));
+    }
+}
+
+#[cfg(test)]
+mod dma_cache_tests {
+    use super::dma_cache::*;
+    const L: usize = 64;
+
+    /// Brute force: every line the range touches is covered exactly once, the
+    /// partial ones by head/tail (civac), the whole ones by body (ivac).
+    fn check(va: usize, len: usize) {
+        let p = plan(va, len, L);
+        let mut cover = std::collections::BTreeMap::new();
+        for e in [p.head, p.tail].into_iter().flatten() { *cover.entry(e).or_insert(0) += 1; }
+        let mut a = p.body.0;
+        while a < p.body.1 { *cover.entry(a).or_insert(0) += 1; a += L; }
+        let mut n = 0;
+        if len > 0 {
+            let mut a = va & !(L - 1);
+            while a < va + len {
+                let whole = a >= va && a + L <= va + len;
+                assert_eq!(cover.get(&a), Some(&1), "va {va:#x} len {len} line {a:#x}");
+                let in_body = a >= p.body.0 && a < p.body.1;
+                assert_eq!(in_body, whole, "va {va:#x} len {len} line {a:#x} whole {whole}");
+                a += L; n += 1;
+            }
+        }
+        assert_eq!(cover.len(), n, "va {va:#x} len {len}: lines outside the range");
+        assert_eq!(clean_lines(va, len, L), n);
+    }
+
+    #[test]
+    fn plan_edges() {
+        for va in [0x1000usize, 0x1001, 0x103F, 0x1040, 0x1020] {
+            for len in [0usize, 1, 31, 32, 63, 64, 65, 127, 128, 129, 4096, 4097] { check(va, len); }
+        }
+        assert_eq!(plan(0x1000, 64, L), Plan { head: None, body: (0x1000, 0x1040), tail: None });
+        assert_eq!(plan(0x1010, 8, L), Plan { head: Some(0x1000), body: (0, 0), tail: None });
+        assert_eq!(plan(0x1010, 0x80, L), Plan { head: Some(0x1000), body: (0x1040, 0x1080), tail: Some(0x1080) });
+    }
+}
+
+#[cfg(test)]
+mod mpidr_tests {
+    use super::mpidr::*;
+
+    #[test]
+    fn election_uses_all_affinity_levels() {
+        // QEMU virt / raspi4b: Aff0 = core.
+        assert!(is_boot_cpu(0x8000_0000));
+        assert!(!is_boot_cpu(0x8000_0001));
+        // Cortex-A76 (Pi 5): MT set, core in Aff1, Aff0 = 0 on every core.
+        assert!(is_boot_cpu(0x8100_0000));
+        for c in 1..4u64 { assert!(!is_boot_cpu(0x8100_0000 | c << 8), "core {c}"); }
+        // Multi-cluster: Aff2 cluster, Aff3 die; U bit (30) is not affinity.
+        assert!(!is_boot_cpu(0x8001_0000));
+        assert!(!is_boot_cpu(0x01_8000_0000));
+        assert!(is_boot_cpu(0xC000_0000));
+    }
+
+    #[test]
+    fn entry_asm_matches() {
+        let s = include_str!("../../../kernel/src/entry_aarch64.s");
+        let gate: Vec<&str> = s.lines().map(str::trim)
+            .skip_while(|l| !l.starts_with("mrs     x4, mpidr_el1")).take(5).collect();
+        assert_eq!(gate, ASM_GATE, "entry_aarch64.s park gate differs from boot/src/mpidr.rs");
     }
 }
