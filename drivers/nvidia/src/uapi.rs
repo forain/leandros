@@ -910,7 +910,7 @@ fn gem_new(arg: u64, open_id: u32) -> Result<usize, DriverError> {
     g.info.size = size;
     g.info.offset = 0;
     // Opaque offset, never the physical base (resolved in `handle_ioctl_mmap`).
-    g.info.map_handle = drivers::drm_offset::offset_for(phys as u64, size as u64).unwrap_or(0);
+    g.info.map_handle = crate::mmap_tokens::map_handle(if sysmem { drivers::drm_offset::offset_for(phys as u64, size as u64) } else { None });
     g.info.domain = domain;
     write_user(arg, g);
     ulog!(1, "open {}: GEM_NEW {} KiB {} (asked {:#x}, align {:#x}, kind {:#x}) -> handle {:#x} obj {} map {:#x}",
@@ -927,7 +927,7 @@ fn gem_info(arg: u64, open_id: u32) -> Result<usize, DriverError> {
     g.domain = b.domain;
     g.size = b.size;
     g.offset = 0;
-    g.map_handle = drivers::drm_offset::offset_for(b.phys as u64, b.size as u64).unwrap_or(0);
+    g.map_handle = crate::mmap_tokens::map_handle(if b.sysmem { drivers::drm_offset::offset_for(b.phys as u64, b.size as u64) } else { None });
     g.tile_mode = b.tile_mode;
     g.tile_flags = b.tile_flags;
     drop(st);

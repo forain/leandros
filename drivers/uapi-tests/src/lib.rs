@@ -601,6 +601,33 @@ mod mmap_tokens_tests {
         for i in 0..2000u64 { t.insert(B + S + i * PAGE, PAGE); t.authorize(B + S + i * PAGE); }
         assert!(t.pending() <= 5000 + 1024);
     }
+
+    // openbugs #96: a buffer with no CPU mapping (vidmem: no BAR1 user
+    // mappings exist; or sysmem whose fake offset could not be minted) used
+    // to get map_handle 0 -- the DRM firmware-framebuffer token, so a card0
+    // master's mmap of it mapped the live scanout behind BAR1.
+    #[test]
+    fn unmappable_buffer_handle_is_not_the_framebuffer_token() {
+        assert_ne!(map_handle(None), 0);
+        assert_ne!(map_handle(Some(0)), 0);
+    }
+
+    #[test]
+    fn unmappable_handle_never_resolves() {
+        let h = map_handle(None);
+        assert_eq!(h & (PAGE - 1), 0);
+        assert!(!(h >= 1 << 44 && h < 1 << 45), "inside drm_offset FAKE window");
+        assert!(!(h >= 0xE000_0000 && h < 0xF000_0000), "inside drm_offset FAKE32 window");
+        // Not something the 0x1007 ioctl could take as a buffer token either.
+        assert_eq!(one().containing(h), None);
+        assert_eq!(one().check(h, PAGE), Range::NotOurs);
+    }
+
+    #[test]
+    fn mappable_buffer_keeps_its_fake_offset() {
+        assert_eq!(map_handle(Some(1 << 44)), 1 << 44);
+        assert_eq!(map_handle(Some((1 << 44) + 5 * PAGE)), (1 << 44) + 5 * PAGE);
+    }
 }
 
 /// Stand-in for `mm::buddy` under `mm/src/pageref.rs`: records frees.

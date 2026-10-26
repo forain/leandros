@@ -114,3 +114,24 @@ impl Tokens {
         self.auth.values().map(|&n| n as usize).sum()
     }
 }
+
+/// The `map_handle` GEM_NEW / GEM_INFO hand out when a buffer has no CPU
+/// mapping (openbugs #96): a vidmem buffer (no BAR1 user mappings exist, see
+/// `uapi::prime_export`), or a sysmem one whose fake offset could not be
+/// minted. Page aligned and outside both `drm_offset` fake windows
+/// (`[1 << 44, 1 << 45)`, `[0xE000_0000, 0xF000_0000)`), so the DRM mmap ioctl
+/// cannot resolve it and refuses the mmap with EINVAL.
+///
+/// It must not be 0: offset 0 is the DRM firmware-framebuffer token, so a
+/// card0 master mmapping a VRAM buffer's handle used to get the live scanout
+/// (the GOP surface behind BAR1) instead of an error.
+pub const UNMAPPABLE: u64 = 0xFFFF_F000_0000_0000;
+
+/// `map_handle` for a buffer: its fake offset if it has one, else
+/// [`UNMAPPABLE`], never 0.
+pub fn map_handle(fake: Option<u64>) -> u64 {
+    match fake {
+        Some(o) if o != 0 => o,
+        _ => UNMAPPABLE,
+    }
+}
