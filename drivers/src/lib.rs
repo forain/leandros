@@ -56,6 +56,10 @@ pub mod r8169_hw;
 pub mod e1000e;
 /// Hardware-independent e1000e pieces (host-tested in drivers/e1000e-tests).
 pub mod e1000e_hw;
+/// Cadence GEM (macb) in the Raspberry Pi 5's RP1, BCM54213PE PHY; inert until the RP1 probe attaches it.
+pub mod macb;
+/// Hardware-independent macb pieces (host-tested in drivers/macb-tests).
+pub mod macb_hw;
 /// The NIC behind `eth0`: virtio-net, r8169 or e1000e.
 pub mod netdev;
 pub mod netshape;
@@ -79,6 +83,8 @@ pub mod wifi_crypto;
 pub mod wifi_api;
 /// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).
 pub mod wifi_mgr;
+/// Broadcom/Cypress FullMAC Wi-Fi (CYW43455, Raspberry Pi 5).
+pub mod brcmf;
 pub mod wifi_pref;
 /// A simulated Wi-Fi interface for QEMU tests (opt-in; see its header).
 pub mod wifi_sim;

@@ -51,6 +51,20 @@ Commands:
                          fetch logs
   wait [--timeout S]     wait until sshd answers
   forget-host            drop the target's host key (after a re-flash)
+
+Raspberry Pi 5 (LEANDROS_REMOTE=pi, host from LEANDROS_PI_HOST, or pi:<host>).
+The Pi's boot FAT is not reachable from LeandrOS (the SD driver exposes only
+the f2fs root partition), so kernels live in the root at /boot/pi/<slot>/ and
+are entered by kexec. The card's kernel.img (what the firmware boots after a
+power cycle) is never written: a bad trial is recovered by power-cycling.
+  pi-deploy [--kernel F] [--initrd F] [--append ARGS] [--no-exec] [--timeout S]
+                         upload the rpi5 build (target/final-aarch64/kernel-direct
+                         + initrd-aarch64.cpio) to /boot/pi/trial, kexec into it,
+                         wait for sshd and check uname -v changed
+  pi-boot <good|prev|trial> [--append ARGS]   kexec into a slot (e.g. back to
+                         good after a power cycle booted the card's kernel.img)
+  pi-promote             trial -> good (old good -> prev), in the root only
+  pi-status              slots, running kernel, cmdline
 """
 
 import argparse
@@ -95,6 +109,12 @@ class Target:
         if not spec:
             die("no target: set LEANDROS_REMOTE=host[:port] (the laptop's address; "
                 "`remote.py discover` finds it) or LEANDROS_REMOTE=qemu for a VM")
+        self.pi = False
+        if spec == "pi" or spec.startswith("pi:"):
+            spec = spec[3:] if spec.startswith("pi:") else os.environ.get("LEANDROS_PI_HOST", "")
+            if not spec:
+                die("LEANDROS_REMOTE=pi needs the Pi's address: LEANDROS_PI_HOST=<ip> or LEANDROS_REMOTE=pi:<ip>")
+            self.pi = True
         if spec == "qemu" or spec.startswith("qemu:"):
             run_id = spec[5:] if spec.startswith("qemu:") else os.environ.get("LEANDROS_RUN_ID", "")
             state = f"/tmp/leandros{'-' + run_id if run_id else ''}-ssh"
@@ -796,6 +816,112 @@ def do_reboot(t, timeout, expect_kid=None, logs=True, wait=True):
     return ok
 
 
+# ── Raspberry Pi 5: kernels in the root, entered by kexec ─────────────────
+PI_DIR = "/boot/pi"
+PI_KERNEL_PHYS = 0x20_0000  # build-all.sh --rpi5 links kernel-direct here
+
+
+def pi_check_elf(path):
+    """Refuse anything but an rpi5 direct-boot ELF (lowest PT_LOAD at 0x200000,
+    arm64 Image magic): a QEMU-virt kernel (0x40080000) would kexec into a
+    machine it cannot drive."""
+    import struct
+    b = open(path, "rb").read()
+    if b[:4] != b"\x7fELF" or b[4] != 2:
+        die(f"{path}: not an ELF64")
+    phoff, = struct.unpack_from("<Q", b, 0x20)
+    phentsz, phnum = struct.unpack_from("<HH", b, 0x36)
+    loads = []
+    for i in range(phnum):
+        o = phoff + i * phentsz
+        typ, = struct.unpack_from("<I", b, o)
+        if typ == 1:
+            off, _va, pa = struct.unpack_from("<QQQ", b, o + 8)
+            loads.append((pa, off))
+    if not loads:
+        die(f"{path}: no PT_LOAD")
+    pa, off = min(loads)
+    if pa != PI_KERNEL_PHYS:
+        die(f"{path}: lowest PT_LOAD at {pa:#x}, not {PI_KERNEL_PHYS:#x}: not an rpi5 build "
+            f"(./scripts/build-all.sh --arch aarch64 --rpi5)")
+    if b[off + 0x38:off + 0x3c] != b"ARM\x64":
+        die(f"{path}: no arm64 Image header")
+
+
+def pi_kexec(t, slot, append, timeout):
+    if not t.pi:
+        die("pi-* commands need LEANDROS_REMOTE=pi (or pi:<host>)")
+    d = f"{PI_DIR}/{slot}"
+    if t.run(f"test -s {d}/kernel && test -s {d}/initrd", check=False).returncode != 0:
+        die(f"no kernel/initrd in {d}")
+    before = t.out("uname -v").strip()
+    ap = f" --append={shlex.quote(append)}" if append else ""
+    t.out(f"/bin/kexec -l {d}/kernel --initrd={d}/initrd --reuse-cmdline{ap}")
+    t.run("echo remdbg > /tmp/.remdbg-alive && sync", check=False, timeout=60)
+    print(f"kexec into {slot} on {t.label()} (was: {before})")
+    t0 = time.time()
+    # Detached: the ssh session dies with the old kernel.
+    t.run("(sleep 1; /bin/kexec -e) </dev/null >/dev/null 2>&1 &", check=False, timeout=15)
+    t.close_master()
+    back = False
+    while time.time() - t0 < timeout:
+        r = probe(t, "test -e /tmp/.remdbg-alive")
+        if r is not None and r != 0:
+            back = True
+            break
+        time.sleep(2)
+    if not back:
+        print(f"\nKEXEC FAILED: nothing new answering on {t.host} after {timeout} s.\n"
+              f"Power-cycle the Pi: the firmware boots the card's kernel.img (never touched by\n"
+              f"remote.py). The serial console (uart10) shows how far the new kernel got.", file=sys.stderr)
+        return False
+    after = t.out("uname -v").strip()
+    print(f"back after {time.time() - t0:.0f} s: uname -v: {after}")
+    t.run(f"echo {slot} > /tmp/.pi-booted-slot", check=False)
+    if after == before:
+        print("WARNING: uname -v unchanged (same build, or the old kernel came back)", file=sys.stderr)
+    return True
+
+
+def cmd_pi_deploy(t, a):
+    if not t.pi:
+        die("pi-deploy needs LEANDROS_REMOTE=pi (or pi:<host>)")
+    k = a.kernel or os.path.join(REPO, "target/final-aarch64/kernel-direct")
+    i = a.initrd or os.path.join(REPO, "initrd-aarch64.cpio")
+    pi_check_elf(k)
+    t.run(f"mkdir -p {PI_DIR}/trial")
+    upload(t, [(k, f"{PI_DIR}/trial/kernel", None), (i, f"{PI_DIR}/trial/initrd", None)])
+    rev = subprocess.run(["git", "-C", REPO, "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True).stdout.strip()
+    t.run(f"echo {shlex.quote(rev + ' ' + time.strftime('%Y-%m-%dT%H:%M:%S'))} > {PI_DIR}/trial/info && sync")
+    if a.no_exec:
+        print(f"staged in {PI_DIR}/trial (not booted)")
+        return
+    sys.exit(0 if pi_kexec(t, "trial", a.append, a.timeout) else 1)
+
+
+def cmd_pi_boot(t, a):
+    sys.exit(0 if pi_kexec(t, a.slot, a.append, a.timeout) else 1)
+
+
+def cmd_pi_promote(t, a):
+    if not t.pi:
+        die("pi-promote needs LEANDROS_REMOTE=pi")
+    booted = t.out(f"cat /tmp/.pi-booted-slot 2>/dev/null; true").strip()
+    if booted != "trial":
+        die(f"the running kernel was not kexec'd from trial (booted slot: {booted or 'card kernel.img'}); "
+            f"run pi-deploy first")
+    t.out(f"cd {PI_DIR} && rm -rf prev.tmp && (test -d good && mv good prev.tmp || true) && "
+          f"mkdir good && cp trial/kernel trial/initrd trial/info good/ && sync && "
+          f"rm -rf prev && (test -d prev.tmp && mv prev.tmp prev || true) && sync")
+    print(t.out(f"cat {PI_DIR}/good/info").strip() + " is now good. NOTE: the card's kernel.img is unchanged; "
+          "after a power cycle run `remote.py pi-boot good`.")
+
+
+def cmd_pi_status(t, a):
+    print(t.out(f"uname -v; cat /proc/cmdline; echo booted slot: $(cat /tmp/.pi-booted-slot 2>/dev/null || echo card); "
+                f"for s in trial good prev; do echo \"$s: $(cat {PI_DIR}/$s/info 2>/dev/null || echo -)\"; done").rstrip())
+
+
 def cmd_reboot(t, a):
     ok = do_reboot(t, timeout=a.timeout, logs=not a.no_logs, wait=not a.no_wait)
     sys.exit(0 if ok else 1)
@@ -926,6 +1052,11 @@ def main():
     p.add_argument("--no-wait", action="store_true"); p.add_argument("--no-logs", action="store_true")
     p = sub.add_parser("wait"); p.add_argument("--timeout", type=int, default=300)
     sub.add_parser("forget-host")
+    p = sub.add_parser("pi-deploy"); p.add_argument("--kernel"); p.add_argument("--initrd"); p.add_argument("--append")
+    p.add_argument("--no-exec", action="store_true"); p.add_argument("--timeout", type=int, default=240)
+    p = sub.add_parser("pi-boot"); p.add_argument("slot", choices=["good", "prev", "trial"]); p.add_argument("--append")
+    p.add_argument("--timeout", type=int, default=240)
+    sub.add_parser("pi-promote"); sub.add_parser("pi-status")
     a = ap.parse_args()
 
     if a.cmd == "keygen":
@@ -955,6 +1086,7 @@ def main():
         "status": cmd_status, "push": cmd_push, "pull": cmd_pull, "deploy-files": cmd_deploy_files,
         "deploy-kernel": cmd_deploy_kernel, "espctl": cmd_espctl, "logs": cmd_logs,
         "reboot": cmd_reboot, "wait": cmd_wait, "forget-host": cmd_forget_host,
+        "pi-deploy": cmd_pi_deploy, "pi-boot": cmd_pi_boot, "pi-promote": cmd_pi_promote, "pi-status": cmd_pi_status,
     }[a.cmd](t, a)
 
 
