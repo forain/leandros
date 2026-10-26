@@ -89,18 +89,22 @@ fn report_large_fork(tgid: u32, ns: u64) {
     let copied = mm::cow::LAST_COPIED_PAGES.load(Ordering::Relaxed);
     let private_rw = mm::cow::LAST_PRIVATE_RW_PAGES.load(Ordering::Relaxed);
     if shared + copied < 256 { return; }
-    extern "C" {
-        fn arch_serial_putc(c: u8);
-        fn print_number(n: u32);
+    extern "C" { fn kernel_stat_line(p: *const u8, len: usize); }
+    struct Buf { b: [u8; 160], n: usize }
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let k = s.len().min(self.b.len() - self.n);
+            self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
+            self.n += k;
+            Ok(())
+        }
     }
-    let put = |s: &[u8]| for &b in s { unsafe { arch_serial_putc(b) }; };
-    put(b"[FORK] tgid=");        unsafe { print_number(tgid) };
-    put(b" shared_pages=");      unsafe { print_number(shared as u32) };
-    put(b" private_rw_pages=");  unsafe { print_number(private_rw as u32) };
-    put(b" copied_pages=");      unsafe { print_number(copied as u32) };
-    put(b" clone_us=");          unsafe { print_number((ns / 1000) as u32) };
-    put(b" holds=");             unsafe { print_number(FORK_HOLDS.load(Ordering::Relaxed) as u32) };
-    put(b"\n");
+    // One line, routed like the other periodic stats (klog-only on the Pi).
+    let mut w = Buf { b: [0; 160], n: 0 };
+    let _ = core::fmt::Write::write_fmt(&mut w, format_args!(
+        "[FORK] tgid={} shared_pages={} private_rw_pages={} copied_pages={} clone_us={} holds={}\n",
+        tgid, shared, private_rw, copied, ns / 1000, FORK_HOLDS.load(Ordering::Relaxed)));
+    unsafe { kernel_stat_line(w.b.as_ptr(), w.n) };
 }
 
 /// Copy the signal-disposition table of thread group `parent_tgid` into a
