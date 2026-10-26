@@ -22,3 +22,7 @@ Status: PARTIAL (code + tooling done; nothing hardware-verified; QEMU raspi4b ca
 ## Open
 - Expose the FAT partition (raw sdhci access in blkdev_sdhci raw_read/raw_write + espctl-style FAT tool) so `pi-promote` can write kernel.img.
 - Optional boot-time auto-kexec into `good` (needs a one-shot guard).
+
+## Evidence
+- aarch64 virt (HVF) build with these changes: `/bin/kexectest` 1/1 PASS; a real jump (`kexec /boot/kexec --initrd=... --reuse-cmdline`) reached `[KEXEC] cpu0: other CPUs off ... -> entry 0x40080000` and the next kernel booted and replayed it as `[prevkexec] kexec_core: Starting new kernel` (the runtests "FAIL" is only the command never returning).
+- check-rpi5.sh clean for rpi5 and raspi4b. remote.py ELF guard refuses the virt kernel (PT_LOAD 0x40080000).
