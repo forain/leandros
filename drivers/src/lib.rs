@@ -56,6 +56,10 @@ pub mod r8169_hw;
 pub mod e1000e;
 /// Hardware-independent e1000e pieces (host-tested in drivers/e1000e-tests).
 pub mod e1000e_hw;
+/// Cadence GEM (macb) in the Raspberry Pi 5's RP1, BCM54213PE PHY; inert until the RP1 probe attaches it.
+pub mod macb;
+/// Hardware-independent macb pieces (host-tested in drivers/macb-tests).
+pub mod macb_hw;
 /// The NIC behind `eth0`: virtio-net, r8169 or e1000e.
 pub mod netdev;
 pub mod netshape;
@@ -79,6 +83,8 @@ pub mod wifi_crypto;
 pub mod wifi_api;
 /// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).
 pub mod wifi_mgr;
+/// Broadcom/Cypress FullMAC Wi-Fi (CYW43455, Raspberry Pi 5).
+pub mod brcmf;
 pub mod wifi_pref;
 /// A simulated Wi-Fi interface for QEMU tests (opt-in; see its header).
 pub mod wifi_sim;
@@ -99,7 +105,8 @@ pub mod sdhci;
 /// protocol can be exercised without hardware.
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod rpi_mailbox;
-#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+/// Broadcom V3D 7.1 GPU (Pi 5): register map, power-up, MMU. Pure logic
+/// everywhere; the hardware probe is rpi5-only.
 pub mod v3d;
 
 /// Block-device trait and types every backend implements (always built).

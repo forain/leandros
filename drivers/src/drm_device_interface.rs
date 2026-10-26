@@ -4458,10 +4458,12 @@ const V3D_PARAM_CONTEXT_RESET_COUNTER: u32 = 16;
 const V3D_IDENT0: u64 = 0x0744_3356;
 const V3D_IDENT1: u64 = 0x2000_0421;
 const V3D_HUB_IDENT3: u64 = 0x0004_0600;
-/// 1 core, hub revision 1, TVER 7. Read by Linux's debugfs and by nothing in
-/// Mesa; answered rather than refused so a probe of the whole param block does
-/// not have to special-case which ids exist.
-const V3D_HUB_IDENT1: u64 = 0x0700_0101;
+/// What a BCM2712 reports: TVER 7 [3:0], REV 1 [7:4] (ver 71), NCORES 1
+/// [11:8], WITH_TFU bit 17 (Linux `v3d_regs.h` layout; the old 0x0700_0101
+/// decoded as "V3D 1.0"). Read by Linux's debugfs and by nothing in Mesa;
+/// answered rather than refused so a probe of the whole param block does not
+/// have to special-case which ids exist. The real driver forwards the register.
+const V3D_HUB_IDENT1: u64 = 0x0002_0117;
 
 /// **Zero on purpose, and load-bearing.** `v3d_get_device_info` stores this in
 /// `devinfo->max_perfcnt`, and `v3dx_counter.c:41` then reads the performance
