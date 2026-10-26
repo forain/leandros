@@ -819,6 +819,24 @@ pub extern "C" fn klog_write_only(s: *const u8, len: usize) {
     for &b in bytes { klog::push(b); }
 }
 
+/// Periodic statistics lines (`[fslock]`, `[pcache]`, `[FORK]`, ...). On the
+/// Pi 5 the console is a 115200-baud UART the user types into; a few hundred
+/// bytes of stats every 5 s there cost ~25 ms of TX each and bury the shell,
+/// so they go to the kernel log only. Elsewhere: the console, line-atomic.
+pub fn stat_line(b: &[u8]) {
+    #[cfg(feature = "rpi5")]
+    klog::push_bytes(b);
+    #[cfg(not(feature = "rpi5"))]
+    console_print_bytes(b);
+}
+
+/// C-ABI entry for crates below the kernel (sched's `[FORK]` line).
+#[no_mangle]
+pub extern "C" fn kernel_stat_line(p: *const u8, len: usize) {
+    if p.is_null() { return; }
+    stat_line(unsafe { core::slice::from_raw_parts(p, len) });
+}
+
 pub fn serial_print_str(msg: &str) {
     console_print_bytes(msg.as_bytes());
 }

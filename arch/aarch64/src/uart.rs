@@ -68,6 +68,13 @@ const LCRH: usize = 0x02C;
 const CR:   usize = 0x030;
 const IMSC: usize = 0x038;
 const ICR:  usize = 0x044;
+const RSR:  usize = 0x004; // RSR on read, ECR on write
+const IFLS: usize = 0x034;
+/// LCRH.FEN: enable the 32-entry FIFOs. Without it the PL011 holds ONE byte.
+const LCRH_FEN: u32 = 1 << 4;
+/// DR error bits that travel with each received byte.
+const DR_OE: u32 = 1 << 11;
+const DR_ERR: u32 = 0xF << 8; // OE | BE | PE | FE
 
 // ── Flag register bits ────────────────────────────────────────────────────────
 const FR_RXFE: u32 = 1 << 4;
@@ -157,7 +164,7 @@ pub unsafe fn reinit(base: usize) {
     // recompute one from. Overwriting it with a divisor derived from the DTB's
     // clk_uart turned every marker into noise.
     #[cfg(feature = "rpi5")]
-    let (ibrd, fbrd, lcrh) = (rd(IBRD), rd(FBRD), rd(LCRH));
+    let (ibrd, fbrd, lcrh) = (rd(IBRD), rd(FBRD), rd(LCRH) | LCRH_FEN);
     #[cfg(not(feature = "rpi5"))]
     let (ibrd, fbrd, lcrh) = (IBRD_VAL, FBRD_VAL, (0b11 << 5) | (1 << 4));
 
@@ -168,8 +175,13 @@ pub unsafe fn reinit(base: usize) {
     wr(IBRD, ibrd);
     wr(FBRD, fbrd);
     wr(LCRH, lcrh);
+    // RX interrupt at 1/2 full (16 bytes), TX at 1/8; leftovers below the
+    // trigger raise the receive-timeout interrupt (RTIM) instead. Explicit,
+    // because on the Pi the firmware owns the port before us.
+    wr(IFLS, (0b010 << 3) | 0b000);
+    wr(RSR, 0); // clear latched errors
     wr(CR,   (1 << 0) | (1 << 8) | (1 << 9));
-    
+
     // Enable RX interrupt (bit 4) and RT interrupt (bit 6)
     wr(IMSC, (1 << 4) | (1 << 6));
 }
@@ -288,9 +300,25 @@ pub unsafe fn getc() -> Option<u8> {
     if rd(FR) & FR_RXFE != 0 {
         None
     } else {
-        Some((rd(DR) & 0xFF) as u8)
+        let d = rd(DR);
+        if d & DR_ERR != 0 {
+            use core::sync::atomic::Ordering::Relaxed;
+            if d & DR_OE != 0 { UART_RX_OVERRUNS.fetch_add(1, Relaxed); }
+            else { UART_RX_ERRORS.fetch_add(1, Relaxed); }
+            wr(RSR, 0);
+        }
+        Some((d & 0xFF) as u8)
     }
 }
+
+/// Receive overruns: the RX FIFO was full when a byte arrived, so at least
+/// one byte was lost (flagged on the next byte read). Nonzero means the RX
+/// drain is too slow — see the `[uart]` line in kernel/src/iostat.rs.
+pub static UART_RX_OVERRUNS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Framing / parity / break errors on received bytes.
+pub static UART_RX_ERRORS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 pub unsafe fn has_data() -> bool {
     if UART_BASE_ADDR == 0 { return false; }

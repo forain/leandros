@@ -119,8 +119,14 @@ pub const PPI_VIRT_TIMER: u32 = 27;
 /// PPI carrying the EL1 *physical* timer (CNTP). Not enabled by us, but
 /// firmware/QEMU can leave it live, so it is dispatched to the same handler.
 pub const PPI_PHYS_TIMER: u32 = 30;
-/// SPI 1 / INTID 33: the PL011 UART, on every board this kernel targets.
+/// The console PL011's INTID. QEMU virt: SPI 1 / INTID 33.
+#[cfg(not(feature = "rpi5"))]
 pub const SPI_PL011: u32 = 33;
+/// Raspberry Pi 5 uart10 (0x10_7D001000): DTB `interrupts = <0 121 4>`, i.e.
+/// SPI 121 / INTID 153, level-high. Until 2026-10-26 the Pi enabled INTID 33,
+/// so RX was only polled at tick rate and line-speed input overran the FIFO.
+#[cfg(feature = "rpi5")]
+pub const SPI_PL011: u32 = 32 + 121;
 
 /// Priority every interrupt this kernel enables runs at.
 ///

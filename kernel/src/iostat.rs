@@ -44,6 +44,7 @@ fn task() -> ! {
         for _ in 0..(PERIOD_NS / KICK_NS) {
             next += KICK_NS;
             sleep_until(next);
+            uart_rx_report();
             crate::console_drain_outbox();
             drivers::framebuffer::fb_flush_deferred();
             // Commit f2fs changes older than its checkpoint spacing (lane fsio:
@@ -72,11 +73,11 @@ fn task() -> ! {
                 w.hold_ns / 1_000_000, w.hold_max_ns / 1_000_000, locked_io,
                 fetches, fetch_max_ms, fshared, stale, gave_up, abandoned, batched, miss_extra, cps, fsyncs, shared, fsync_pid, throttled,
                 crate::klog::LAST_FLUSH_NS.load(core::sync::atomic::Ordering::Relaxed) / 1_000_000));
-            crate::serial_print_str(&s);
+            crate::stat_line(s.as_bytes());
         }
         // Who fsyncs what, and what the checkpoints wrote (lane fsyncbatch).
         if let Some(s) = f2fs_server::fsync_report(window) {
-            crate::serial_print_str(&s);
+            crate::stat_line(s.as_bytes());
         }
         pcache_report(window, &mut pc_last);
     }
@@ -103,12 +104,30 @@ fn pcache_report(window: u64, last: &mut mm::pagecache::Stats) {
         "[pcache] {} s: hits {} misses {} ra {} evict {} cached {} MiB (dirty {} KiB, written back {}, fill waits {}, uncached reads {}, cap {} MiB, free {} MiB)\n",
         (window + 500_000_000) / 1_000_000_000, hits, misses, ra, evict, st.cached * 4 / 1024,
         st.dirty * 4, wb, waits, bypass, st.cap * 4 / 1024, mm::buddy::free_pages() * 4 / 1024));
-    crate::serial_print_str(&s);
+    crate::stat_line(s.as_bytes());
 }
 
 /// Start the summary task (kernel init, task context).
 pub fn init() {
     if sched::spawn(task, 0).map(|p| sched::set_comm(p, b"kiostat")).is_none() {
         crate::serial_print_str("[IOSTAT] could not start the I/O summary task\n");
+    }
+}
+
+/// One `[uart]` line whenever the console UART lost input since the last
+/// window (RX overruns / framing errors). Printed on the console itself: it
+/// is rare, and it is the one place a user typing at the serial port sees it.
+fn uart_rx_report() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let oe = arch_aarch64::uart::UART_RX_OVERRUNS.load(Relaxed);
+        let er = arch_aarch64::uart::UART_RX_ERRORS.load(Relaxed);
+        if oe + er != SEEN.swap(oe + er, Relaxed) {
+            crate::serial_print_str(&alloc::format!(
+                "[uart] rx overruns {} errors {} throttled {}\n", oe, er,
+                evdev_server::SERIAL_RX_THROTTLED.load(Relaxed)));
+        }
     }
 }
