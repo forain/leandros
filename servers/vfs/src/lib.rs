@@ -2353,6 +2353,11 @@ pub fn makedev(major: u32, minor: u32) -> u64 {
     ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12)
 }
 
+/// Inverse of [`makedev`] (glibc `major()`/`minor()` for the low 32 bits).
+pub fn dev_major_minor(dev: u64) -> (u32, u32) {
+    (((dev >> 8) & 0xfff) as u32, ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32)
+}
+
 /// Look up the rdev (as dev_t) for a registered dynamic device by (port, dev_id).
 /// Returns 0 if the node has no device number registered.
 fn lookup_device_rdev(port: u32, dev_id: u32) -> u64 {
@@ -2418,12 +2423,41 @@ pub struct MountEntry {
     /// and statfs reports ST_RDONLY. The filesystem server keeps it current
     /// (`set_mount_rdonly_by_port`).
     pub rdonly: bool,
+    /// `st_dev` of every inode on this mount, in [`makedev`]'s encoding: the
+    /// backing block device's dev_t (as Linux reports it), or an anonymous
+    /// `0:<n>` when the device is not in the block registry. Unique among
+    /// mounts so (st_dev, st_ino) identifies a file across volumes.
+    pub dev: u64,
 }
 
 impl MountEntry {
     const fn empty() -> Self {
-        Self { prefix: "", port: 0, in_use: false, device: "", fstype: "", nosuid: false, rdonly: false }
+        Self { prefix: "", port: 0, in_use: false, device: "", fstype: "", nosuid: false, rdonly: false, dev: 0 }
     }
+}
+
+/// `st_dev` of everything served by the VFS itself that is not a tmpfs
+/// (initrd, ramfs pseudo-directories, /proc, /dev nodes): anonymous 0:1.
+pub const VFS_ANON_DEV: u64 = 1;
+
+/// Anonymous `st_dev` of the `i`-th built-in tmpfs root (TMPFS_ROOTS order),
+/// matching the minor /proc/self/mountinfo prints for it.
+fn tmpfs_root_dev(i: usize) -> u64 { makedev(0, 10 + i as u32) }
+
+/// `st_dev` of the tmpfs root owning `path`, if any.
+fn tmpfs_dev_of(path: &[u8]) -> Option<u64> {
+    let r = tmpfs_root_of(path)?;
+    TMPFS_ROOTS.iter().position(|&x| x == r).map(tmpfs_root_dev)
+}
+
+/// `st_dev` of the mount served on `port` (`VFS_ANON_DEV` if none).
+pub fn mount_dev_by_port(port: u32) -> u64 {
+    MOUNTS.lock().iter().find(|e| e.in_use && e.port == port).map_or(VFS_ANON_DEV, |e| e.dev)
+}
+
+/// Overwrite `st_dev` (offset 0 on both arches) in a filled user stat buffer.
+fn set_stat_dev(stat_ptr: usize, dev: u64) {
+    unsafe { sched::uaccess::copy_raw(stat_ptr as *mut u8, &dev as *const u64 as *const u8, 8); }
 }
 
 static MOUNTS: Mutex<[MountEntry; MAX_MOUNTS]> =
@@ -2431,9 +2465,16 @@ static MOUNTS: Mutex<[MountEntry; MAX_MOUNTS]> =
 
 /// Register a mounted filesystem at `prefix` (e.g. "/mnt") to an IPC `port`.
 pub fn register_mount(prefix: &'static str, port: u32, device: &'static str, fstype: &'static str) {
+    // Linux reports the backing device's major:minor as st_dev. Two volumes
+    // cloned from one image share every inode number, so a shared st_dev made
+    // `cp -a /a/f /b/f` refuse "are the same file" and broke -xdev walks.
+    let bdev = block::lookup_dev_node(device.as_bytes())
+        .map(block::dev_rdev).filter(|&d| d != 0);
     let mut m = MOUNTS.lock();
-    if let Some(slot) = m.iter_mut().find(|e| !e.in_use) {
-        *slot = MountEntry { prefix, port, in_use: true, device, fstype, nosuid: false, rdonly: false };
+    if let Some(i) = m.iter().position(|e| !e.in_use) {
+        let dev = bdev.filter(|&d| !m.iter().any(|e| e.in_use && e.dev == d))
+            .unwrap_or(makedev(0, 32 + i as u32));
+        m[i] = MountEntry { prefix, port, in_use: true, device, fstype, nosuid: false, rdonly: false, dev };
     }
 }
 
@@ -5679,8 +5720,11 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         if !m.in_use { continue; }
         let start = p;
         p = write_u32(buf, p, mount_id);
-        p = write_lit(buf, p, b" 1 0:");
-        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" 1 ");
+        let (maj, min) = dev_major_minor(m.dev);
+        p = write_u32(buf, p, maj);
+        p = write_lit(buf, p, b":");
+        p = write_u32(buf, p, min);
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, m.prefix.as_bytes());
         p = write_lit(buf, p, b" ");
@@ -5695,11 +5739,11 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
     }
     // tmpfs roots — see write_mtab_lines. Each gets its own minor so `df`
     // (which de-duplicates mounts by device number) lists all of them.
-    for root in TMPFS_ROOTS.iter() {
+    for (ri, root) in TMPFS_ROOTS.iter().enumerate() {
         let start = p;
         p = write_u32(buf, p, mount_id);
         p = write_lit(buf, p, b" 1 0:");
-        p = write_u32(buf, p, mount_id);
+        p = write_u32(buf, p, dev_major_minor(tmpfs_root_dev(ri)).1);
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, root);
         p = write_lit(buf, p, b" ");
@@ -13218,7 +13262,9 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         proxy.tag = VFS_FSTAT;
         proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
         proxy.data[8..16].copy_from_slice(&(stat_ptr as u64).to_le_bytes());
-        return call_port(port, proxy);
+        let r = call_port(port, proxy);
+        if reply_val(&r) == 0 { set_stat_dev(stat_ptr, mount_dev_by_port(port)); }
+        return r;
     }
 
     // A block device node. `S_IFBLK` is load-bearing: `fs::metadata().is_file()`
@@ -13349,6 +13395,10 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         if let Some(b) = blocks {
             unsafe { sched::uaccess::copy_raw((stat_ptr as *mut u8).add(64), &b as *const u64 as *const u8, 8); }
         }
+        let t = TMP_FILES.lock();
+        let dev = tmpfs_dev_of(t[owner].path());
+        drop(t);
+        if let Some(d) = dev { set_stat_dev(stat_ptr, d); }
     }
     ok_reply()
 }
@@ -13412,6 +13462,21 @@ fn dev_node_rdev(path: &[u8]) -> u64 {
 /// its target as `st_size` (which is what `ls -l` prints after the `->`), and
 /// the query is forwarded to mount servers as VFS_LSTAT rather than VFS_STAT.
 fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
+    let r = stat_common_inner(path_ptr, stat_ptr, follow);
+    // A path answered from a built-in tmpfs root carries that root's
+    // anonymous st_dev (mount-served paths are stamped at the proxy site).
+    if reply_val(&r) == 0 {
+        if let Some((pbuf, plen)) = read_cstr_raw(path_ptr) {
+            let path = &pbuf[..plen];
+            if !mounted_inside_tmpfs(path) {
+                if let Some(d) = tmpfs_dev_of(path) { set_stat_dev(stat_ptr, d); }
+            }
+        }
+    }
+    r
+}
+
+fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
     if stat_ptr == 0 { return err_reply(-14); }
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let path = &pbuf[..plen];
@@ -13638,7 +13703,7 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         proxy.tag = if follow { VFS_STAT } else { VFS_LSTAT };
         proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
         proxy.data[8..16].copy_from_slice(&(stat_ptr as u64).to_le_bytes());
-        let r = call_port(port, proxy);
+        let mut r = call_port(port, proxy);
         // A mount server that predates VFS_LSTAT answers ENOSYS; degrade to
         // stat rather than failing the call outright.
         if !follow && reply_val(&r) == -38 {
@@ -13646,8 +13711,9 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
             retry.tag = VFS_STAT;
             retry.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
             retry.data[8..16].copy_from_slice(&(stat_ptr as u64).to_le_bytes());
-            return call_port(port, retry);
+            r = call_port(port, retry);
         }
+        if reply_val(&r) == 0 { set_stat_dev(stat_ptr, mount_dev_by_port(port)); }
         return r;
     }
 
