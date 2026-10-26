@@ -77,9 +77,10 @@ _start:
     // concurrent BSS-zero/page-table-build races, not a fixed bad address).
     // Every step below assumes single-threaded execution by one core.
     //
-    // Gated on MPIDR_EL1.Aff0 (bits [7:0], the same field
-    // arch/aarch64/src/smp.rs's arch_cpu_id()/record_own_mpidr() already use
-    // as the logical CPU index) — confirmed via QEMU's GDB stub reading each
+    // Gated on the whole MPIDR_EL1 affinity, Aff3:Aff2:Aff1:Aff0 = 0
+    // (boot/src/mpidr.rs, whose host tests check this sequence). Aff0 alone
+    // let every Cortex-A76 core through (Pi 5: core in Aff1, Aff0 = 0) and
+    // one core per cluster on multi-cluster parts. On raspi4b, confirmed via QEMU's GDB stub reading each
     // vCPU's VMPIDR_EL2 as 0/1/2/3 respectively before any of our code runs.
     // An earlier version of this gate used a first-core-wins LDAXR/STLXR
     // election instead, reasoning that QEMU's raspi4b MPIDR encoding was
@@ -99,7 +100,9 @@ _start:
     // for the raspi4b QEMU test target (a stepping stone for the sdhci
     // driver, not a hardware target) — parked cores here are never released.
     mrs     x4, mpidr_el1
-    and     x4, x4, #0xFF
+    and     x5, x4, #0xffffff           // Aff2:Aff1:Aff0
+    ubfx    x6, x4, #32, #8             // Aff3
+    orr     x4, x5, x6
     cbz     x4, _start_primary
 
 park_secondary_core:

@@ -358,6 +358,36 @@ fn remember_dtb(addr: usize) {
     }
 }
 
+/// Does any property of the recorded DTB have this name? (The strings block
+/// holds exactly the names properties use.) `None` without a recorded DTB.
+/// Used for `dma-coherent`: present on QEMU `virt`'s PCIe host, absent on
+/// the Pi 5 (BCM2712/RP1), whose DMA does not snoop the CPU caches.
+///
+/// # Safety
+/// The DTB recorded by `parse` must still be mapped.
+pub unsafe fn has_property_name(name: &[u8]) -> Option<bool> {
+    let dtb = DTB_VIRT.load(core::sync::atomic::Ordering::Relaxed);
+    if dtb == 0 { return None; }
+    let rd = |o: usize| u32::from_be(core::ptr::read_unaligned((dtb + o) as *const u32)) as usize;
+    let (off, len) = (rd(12), rd(32));
+    let strs = core::slice::from_raw_parts((dtb + off) as *const u8, len);
+    Some(strs.split(|&b| b == 0).any(|s| s == name))
+}
+
+/// Does the recorded DTB's structure block (node names and property values,
+/// e.g. a `compatible` string) contain `pat`? `None` without a recorded DTB.
+///
+/// # Safety
+/// As for [`has_property_name`].
+pub unsafe fn struct_contains(pat: &[u8]) -> Option<bool> {
+    let dtb = DTB_VIRT.load(core::sync::atomic::Ordering::Relaxed);
+    if dtb == 0 || pat.is_empty() { return None; }
+    let rd = |o: usize| u32::from_be(core::ptr::read_unaligned((dtb + o) as *const u32)) as usize;
+    let (off, len) = (rd(8), rd(36));
+    let st = core::slice::from_raw_parts((dtb + off) as *const u8, len);
+    Some(st.windows(pat.len()).any(|w| w == pat))
+}
+
 /// Call `f(mpidr)` for every available `/cpus/cpu@*` node (`device_type =
 /// "cpu"`, `status` absent or "okay"), in tree order; the value is the
 /// node's `reg`, which on Arm is the MPIDR affinity. Returns `false` if no

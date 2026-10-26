@@ -12,7 +12,7 @@
 //! [`on_ipi`]: CPU 0 runs [`final_cpu0`], every other one turns its MMU off
 //! from the AP park page (a copy of the purgatory in the FDT block, which
 //! the next kernel keeps) and calls PSCI CPU_OFF there (`park_off`). The
-//! new kernel parks any CPU whose MPIDR.Aff0 != 0 (entry_aarch64.s), so the
+//! new kernel parks any CPU whose MPIDR affinity != 0 (entry_aarch64.s), so the
 //! jump must be made by the boot CPU; when the caller is not CPU 0 it powers
 //! itself off after the IPIs and CPU 0 takes over.
 
