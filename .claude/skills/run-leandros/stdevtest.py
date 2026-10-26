@@ -67,7 +67,7 @@ def main():
                   "cp -a /mnt/sda/f /mnt/sdb/f && echo CP_OK; echo C $(cat /mnt/sdb/f); "
                   "exec 3</mnt/sda/f; echo D $(stat -L -c '%d' /proc/self/fd/3); exec 3<&-; "
                   "echo T $(stat -c '%d' / /tmp /dev/shm); "
-                  "grep -E ' /mnt/sd[ab] ' /proc/self/mountinfo | sed 's/^/MI /'; "
+                  "cat /proc/self/mountinfo; "
                   "umount /mnt/sda; umount /mnt/sdb; echo DONE")
         rc, out = drv("run", script, "120", timeout=200)
         g = lambda tag: (re.search(rf"^{tag} (.*)$", out, re.M) or [None, ""])[1].split()
@@ -83,7 +83,7 @@ def main():
         check("cp_a_between_mounts", "CP_OK" in out and g("C") == ["one"], str(g("C")))
         check("fstat_dev_matches", len(r) == 4 and g("D") == [r[0]], f"{g('D')} vs {r[:1]}")
         check("tmpfs_distinct_dev", len(t) == 3 and len(set(t)) == 3, str(t))
-        mi = re.findall(r"^MI \d+ \d+ (\d+):(\d+) / (/mnt/sd[ab]) ", out, re.M)
+        mi = re.findall(r"^\d+ \d+ (\d+):(\d+) / (/mnt/sd[ab]) ", out, re.M)
         want = {}
         if len(r) == 4:
             for d, mp in ((int(r[0]), "/mnt/sda"), (int(r[2]), "/mnt/sdb")):

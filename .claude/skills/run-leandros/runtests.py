@@ -20,6 +20,7 @@ Options:
                              pcibridge host:pcibridgetest.py alone (root port -> PCI bridge -> virtio-rng, own boot)
                              blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
                              blkmany  host:blkmanytest.py alone (12 extra virtio-blk disks: all in /dev, all mount)
+                             stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
                                       (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
                                       + host:netroamtest.py (Wi-Fi roaming between two subnets, own boot) + host:netflaptest.py
@@ -174,6 +175,7 @@ SUITES = {
     "blkslow": ["host:blkslowtest.py"],
     # 12 extra virtio-blk data disks all appear in /dev and mount (own boot, openbugs #83).
     "blkmany": ["host:blkmanytest.py"],
+    "stdev": ["host:stdevtest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
     # NVMe command timeout: the driver resets the controller and the stalled
