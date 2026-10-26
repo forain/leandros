@@ -18,7 +18,8 @@ Design: `artifacts/notes/lane-piv3d-design-2026-10-26.md` section 5, row B.
     (`MMU_DEBUG_INFO[11:8]+30`) is refused. Super pages stay off (`SUPPORTS_SUPER_PAGES` is still 0);
     64 KiB big pages are on, as in Linux.
   - `active()`, `map_bo(va, pa, len)` (cleans and invalidates the BO's cacheable alias first) and
-    `unmap_bo(va, len)`. `after_probe(regs, ver, va_width)` prints the one combined `[v3d] mmu ...;
+    `unmap_bo(va, len)`. `after_probe(regs, ver, va_width)` is called from pv3d-power's `probe_boot`
+    success branch only (a failed/skipped probe never reaches it) and prints the one combined `[v3d] mmu ...;
     irq ...` line.
 - `drivers/src/v3d/irq.rs`: hub (INTID 282) and core (INTID 281) masks (7.1 and 4.2), and
   Linux's enable order (CLR, MSK_SET=~m, MSK_CLR=m; core first, then hub). Also the core and hub
@@ -68,7 +69,6 @@ Failures (each is inert; the line is the whole effect):
 Later: `[v3d] mmu fault bits=0x.. axi=0x.. va=0x..` (at most 8), `[v3d] mmu unmap ... fail <tag>`.
 
 ## Open
-- The `after_probe` call has to sit in pv3d-power's `probe_boot` success branch (see the report).
 - Phase C drives `irq::poll()` from a tick when `polled()`, and sets the hooks.
 - MMU PA width vs buddy placement: a BO above `1<<pa_width` fails CREATE_BO with EIO (logged by
   nothing); Linux avoids it with a DMA mask. Revisit if the Pi reports a small `pa=`.
