@@ -208,6 +208,13 @@ pub fn irq_regs() -> (u32, u32, u32, u32, u32) {
     }
 }
 
+/// Raw `UARTIMSC` write, for `gic::probe_uart_line` only (it restores the
+/// value it read from `irq_regs`, so the RX-mask bookkeeping stays valid).
+pub unsafe fn write_imsc(v: u32) {
+    if UART_BASE_ADDR == 0 { return; }
+    wr(IMSC, v);
+}
+
 /// True when the RX FIFO holds at least one byte (FR.RXFE clear).
 pub fn rx_pending() -> bool {
     unsafe { UART_BASE_ADDR != 0 && rd(FR) & FR_RXFE == 0 }
