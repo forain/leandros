@@ -1,0 +1,18 @@
+# Host tests for the brcmf SDIO host core (drivers/src/brcmf/sdio_host.rs)
+# against a simulated SDHCI controller + SDIO card. Own workspace:
+#
+#   cd drivers/sdio-tests && cargo test
+[package]
+name = "sdio-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+# Never enabled: lets the included sdio_host.rs keep its `rpi5` hardware half cfg'd out without warnings.
+[features]
+rpi5 = []

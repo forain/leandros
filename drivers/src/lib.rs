@@ -99,6 +99,7 @@ pub mod sdhci;
 /// protocol can be exercised without hardware.
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod rpi_mailbox;
+pub mod brcmf;
 
 /// Block-device trait and types every backend implements (always built).
 pub mod blockdev;
