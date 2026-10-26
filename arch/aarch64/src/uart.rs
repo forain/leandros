@@ -175,10 +175,12 @@ pub unsafe fn reinit(base: usize) {
     wr(IBRD, ibrd);
     wr(FBRD, fbrd);
     wr(LCRH, lcrh);
-    // RX interrupt at 1/2 full (16 bytes), TX at 1/8; leftovers below the
-    // trigger raise the receive-timeout interrupt (RTIM) instead. Explicit,
-    // because on the Pi the firmware owns the port before us.
-    wr(IFLS, (0b010 << 3) | 0b000);
+    // RX interrupt at 1/8 full (4 bytes), TX at 1/8; leftovers below the
+    // trigger raise the receive-timeout interrupt (RTIM) instead. A low RX
+    // trigger leaves 28 of the 32 FIFO slots as headroom for IRQ latency
+    // (~2.4 ms at 115200; the kernel runs syscalls with IRQs masked).
+    // Explicit, because on the Pi the firmware owns the port before us.
+    wr(IFLS, (0b000 << 3) | 0b000);
     wr(RSR, 0); // clear latched errors
     wr(CR,   (1 << 0) | (1 << 8) | (1 << 9));
 
@@ -265,7 +267,13 @@ unsafe fn putc_within(c: u8, wait_ticks: u64, wedged: &core::sync::atomic::Atomi
         wedged.store(false, Relaxed);
     } else {
         let deadline = cntvct_raw().wrapping_add(wait_ticks);
-        while rd(FR) & FR_TXFF != 0 {
+        loop {
+            let fr = rd(FR);
+            if fr & FR_TXFF == 0 { break; }
+            // Waiting out the TX FIFO (~87 us a byte at 115200) usually runs
+            // with IRQs masked (syscalls do), long enough for a pasted line
+            // to overrun the 32-byte RX FIFO. Keep RX moving meanwhile.
+            if fr & FR_RXFE == 0 { rx_rescue(); }
             if cntvct_raw().wrapping_sub(deadline) < (1u64 << 63) {
                 wedged.store(true, Relaxed);
                 UART_TX_DROPPED.fetch_add(1, Relaxed);
@@ -276,6 +284,73 @@ unsafe fn putc_within(c: u8, wait_ticks: u64, wedged: &core::sync::atomic::Atomi
     }
     wr(DR, c as u32);
 }
+
+/// Software extension of the RX FIFO. `rx_rescue` (TX wait loop, any CPU,
+/// any IRQ state) moves hardware bytes in; `getc` takes them out first, so
+/// byte order is kept. Both hold `RX_LOCK` for a few MMIO reads at most.
+const RX_RING_LEN: usize = 1024;
+static mut RX_RING: [u8; RX_RING_LEN] = [0; RX_RING_LEN];
+static mut RX_HEAD: usize = 0; // next pop
+static mut RX_TAIL: usize = 0; // next push
+static RX_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Take `RX_LOCK` with IRQs masked (returns the saved DAIF): `uart_irq` ->
+/// `getc` spins on it, so the holder must not be interruptible on its CPU.
+#[inline(always)]
+fn rx_try_lock() -> Option<u64> {
+    use core::sync::atomic::Ordering::*;
+    let daif: u64;
+    unsafe { core::arch::asm!("mrs {}, daif", "msr daifset, #2", out(reg) daif, options(nomem, nostack)); }
+    if RX_LOCK.compare_exchange(false, true, Acquire, Relaxed).is_ok() { return Some(daif); }
+    unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack)); }
+    None
+}
+#[inline(always)]
+fn rx_unlock(daif: u64) {
+    RX_LOCK.store(false, core::sync::atomic::Ordering::Release);
+    unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack)); }
+}
+
+/// Read one byte from the hardware FIFO (caller saw RXFE clear), counting
+/// overrun / framing errors.
+unsafe fn rx_hw_byte() -> u8 {
+    use core::sync::atomic::Ordering::Relaxed;
+    let d = rd(DR);
+    if d & DR_ERR != 0 {
+        if d & DR_OE != 0 { UART_RX_OVERRUNS.fetch_add(1, Relaxed); }
+        else { UART_RX_ERRORS.fetch_add(1, Relaxed); }
+        wr(RSR, 0);
+    }
+    (d & 0xFF) as u8
+}
+
+/// Move the RX FIFO into `RX_RING` and pend the UART interrupt so the normal
+/// drain (`uart_irq` -> `getc`) delivers the bytes as soon as IRQs open.
+unsafe fn rx_rescue() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let Some(daif) = rx_try_lock() else { return };
+    let mut n = 0u64;
+    while RX_TAIL.wrapping_sub(RX_HEAD) < RX_RING_LEN && rd(FR) & FR_RXFE == 0 {
+        RX_RING[RX_TAIL % RX_RING_LEN] = rx_hw_byte();
+        RX_TAIL = RX_TAIL.wrapping_add(1);
+        n += 1;
+    }
+    rx_unlock(daif);
+    if n != 0 {
+        UART_RX_RESCUED.fetch_add(n, Relaxed);
+        super::gic::pend_uart_irq();
+    }
+}
+
+/// Interrupts taken by the console UART (`exception::uart_irq`).
+pub static UART_RX_IRQS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Bytes the cpu0 tick fallback drained, i.e. bytes the RX IRQ did not take.
+pub static UART_RX_TICK_BYTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Bytes moved out of the RX FIFO while a console write waited for TX room.
+pub static UART_RX_RESCUED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Blocking putc for the explicit, human-triggered Ctrl-T task dump — see
 /// `arch_x86_64::putc_dump` for why this exists as a separate path from the
@@ -297,18 +372,23 @@ pub unsafe fn putc_dump(c: u8) {
 
 pub unsafe fn getc() -> Option<u8> {
     if UART_BASE_ADDR == 0 { return None; }
-    if rd(FR) & FR_RXFE != 0 {
+    // Short hold on the other side (a few MMIO reads); spin for it so a
+    // rescued byte is never overtaken by a later hardware byte.
+    let daif = loop {
+        if let Some(d) = rx_try_lock() { break d; }
+        core::hint::spin_loop();
+    };
+    let r = if RX_HEAD != RX_TAIL {
+        let b = RX_RING[RX_HEAD % RX_RING_LEN];
+        RX_HEAD = RX_HEAD.wrapping_add(1);
+        Some(b)
+    } else if rd(FR) & FR_RXFE != 0 {
         None
     } else {
-        let d = rd(DR);
-        if d & DR_ERR != 0 {
-            use core::sync::atomic::Ordering::Relaxed;
-            if d & DR_OE != 0 { UART_RX_OVERRUNS.fetch_add(1, Relaxed); }
-            else { UART_RX_ERRORS.fetch_add(1, Relaxed); }
-            wr(RSR, 0);
-        }
-        Some((d & 0xFF) as u8)
-    }
+        Some(rx_hw_byte())
+    };
+    rx_unlock(daif);
+    r
 }
 
 /// Receive overruns: the RX FIFO was full when a byte arrived, so at least
@@ -322,7 +402,8 @@ pub static UART_RX_ERRORS: core::sync::atomic::AtomicU64 =
 
 pub unsafe fn has_data() -> bool {
     if UART_BASE_ADDR == 0 { return false; }
-    rd(FR) & FR_RXFE == 0
+    core::ptr::read_volatile(&raw const RX_HEAD) != core::ptr::read_volatile(&raw const RX_TAIL)
+        || rd(FR) & FR_RXFE == 0
 }
 
 pub fn serial_print_str(s: &str) {

@@ -124,10 +124,18 @@ fn uart_rx_report() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
         let oe = arch_aarch64::uart::UART_RX_OVERRUNS.load(Relaxed);
         let er = arch_aarch64::uart::UART_RX_ERRORS.load(Relaxed);
-        if oe + er != SEEN.swap(oe + er, Relaxed) {
+        // `irqs` proves the RX interrupt fires (printed once when the first
+        // one arrives, then with every loss); `tick` counts bytes only the
+        // cpu0 tick fallback drained; `rescued` bytes a TX wait pulled out.
+        static IRQ_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        let irqs = arch_aarch64::uart::UART_RX_IRQS.load(Relaxed);
+        let first_irq = irqs != 0 && !IRQ_SEEN.swap(true, Relaxed);
+        if oe + er != SEEN.swap(oe + er, Relaxed) || first_irq {
             crate::serial_print_str(&alloc::format!(
-                "[uart] rx overruns {} errors {} throttled {}\n", oe, er,
-                evdev_server::SERIAL_RX_THROTTLED.load(Relaxed)));
+                "[uart] rx overruns {} errors {} throttled {} irqs {} tick {} rescued {}\n", oe, er,
+                evdev_server::SERIAL_RX_THROTTLED.load(Relaxed), irqs,
+                arch_aarch64::uart::UART_RX_TICK_BYTES.load(Relaxed),
+                arch_aarch64::uart::UART_RX_RESCUED.load(Relaxed)));
         }
     }
 }
