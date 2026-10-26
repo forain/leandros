@@ -2734,6 +2734,25 @@ fn early_dtb_ram_scan(hhdm: usize) {
     serial_print_str(" us)\n");
 }
 
+/// The DTB `/memreserve/` and `/reserved-memory` ranges this boot honoured
+/// (`early_dtb_reserve`). They are reserved in the buddy allocator only; the
+/// BootInfo memory map still calls them RAM, so kexec carves them out of the
+/// next kernel's `/memory` (`kexec::info::build`), which never sees the
+/// firmware's DTB. On the Pi 5 this is BL31 at 0..0x80000 (`atf@0`, no-map):
+/// a next kernel that allocated it would overwrite the PSCI firmware.
+#[cfg(target_arch = "aarch64")]
+pub const DTB_RESERVED_MAX: usize = 32;
+#[cfg(target_arch = "aarch64")]
+pub static DTB_RESERVED: spin::Mutex<([(u64, u64); DTB_RESERVED_MAX], usize)> =
+    spin::Mutex::new(([(0, 0); DTB_RESERVED_MAX], 0));
+#[cfg(target_arch = "aarch64")]
+fn dtb_reserved_record(base: u64, end: u64) {
+    if end <= base { return; }
+    let mut g = DTB_RESERVED.lock();
+    let n = g.1;
+    if n < DTB_RESERVED_MAX { g.0[n] = (base, end); g.1 = n + 1; }
+    else { serial_print_str("[early] dtb reserved: table full, range not passed to kexec\n"); }
+}
 /// Keep the allocator off every DTB `/memreserve/` entry and `/reserved-memory`
 /// child (firmware, ATF/BL31, mailboxes, CMA). Limine's UEFI map usually
 /// already excludes them; a direct DTB boot (Pi 5) calls that RAM usable.
@@ -2742,6 +2761,7 @@ fn early_dtb_reserve() {
     let n = boot::device_tree::reserved_ranges(&mut |r| {
         let end = r.base.saturating_add(r.size);
         mm::buddy::reserve_range(r.base as usize, end as usize);
+        dtb_reserved_record(r.base, end);
         serial_print_str("[early] dtb reserved: ");
         serial_print_hex(r.base as usize);
         serial_print_str("-");
