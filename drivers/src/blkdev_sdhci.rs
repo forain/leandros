@@ -44,6 +44,7 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
         sector_size: 512,
         removable: false,
         read_only: false,
+        gone: false,
         class: "vd",
         ordinal: idx as u16,
     })
@@ -70,3 +71,38 @@ pub fn raw_write(_idx: usize, _byte_off: u64, _buf: &[u8], _panic_path: bool) ->
 pub fn raw_flush(_idx: usize) -> bool { false }
 /// The SD card is never read-only here.
 pub fn read_only(_idx: usize) -> bool { false }
+/// The SD card is fixed and USB disks never register on this build, so
+/// there is nothing to unplug.
+pub fn remove_disk(_idx: usize) -> usize { 0 }
+
+/// Multi-block write: the controller is driven one block at a time (PIO),
+/// so this is a loop over `write_block`. `false` on a short buffer or the
+/// first failing block.
+pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
+    const BS: usize = 4096;
+    if buf.is_empty() || buf.len() % BS != 0 { return false; }
+    buf.chunks_exact(BS).enumerate().all(|(i, b)| {
+        write_block(dev_idx, blk + i as u64, b.try_into().unwrap())
+    })
+}
+
+/// Nothing is ever unplugged on this build (see `remove_disk`).
+pub fn removed_generation() -> usize { 0 }
+
+/// Flush every SD device before reboot/poweroff: `(ok, failed)`.
+pub fn flush_all_disks() -> (usize, usize) {
+    let (mut ok, mut bad) = (0, 0);
+    for i in 0..device_count() {
+        if flush(i) { ok += 1; } else { bad += 1; }
+    }
+    (ok, bad)
+}
+
+/// `LABEL=` / `PARTUUID=` mount sources are not resolved on the SD-card
+/// build (no partition registry): `None` lets the caller fall back to a
+/// plain device path.
+pub fn resolve_source(_spec: &str, _cmdline: Option<&str>, _boot: Option<BootDisk>)
+    -> Option<Result<usize, RootErr>>
+{
+    None
+}
