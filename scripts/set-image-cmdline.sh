@@ -4,7 +4,7 @@
 # partition build-all.sh puts at sector 2048).
 #
 #   scripts/set-image-cmdline.sh leandros-limine-x86_64.img "i915.fake=2"
-#   scripts/set-image-cmdline.sh leandros-limine-x86_64.img ""     # clear
+#   scripts/set-image-cmdline.sh leandros-limine-x86_64.img ""     # clear (keeps root=)
 #
 # Needs mtools (mcopy). The next build-all.sh run rewrites the image anyway.
 set -euo pipefail
@@ -17,8 +17,17 @@ mcopy -n -i "$img@@$off" ::/limine.conf "$tmp/limine.conf"
 python3 - "$tmp/limine.conf" "$line" <<'EOF'
 import sys
 p, line = sys.argv[1], sys.argv[2]
+# Keep the image's root= (build-all.sh names the QEMU root by label) unless
+# the new line brings its own, so a test knob cannot drop the root hint.
+lines = open(p).read().splitlines()
+if not any(t.startswith("root=") for t in line.split()):
+    for l in lines:
+        if l.strip().startswith("cmdline:"):
+            roots = [t for t in l.split() if t.startswith("root=")]
+            if roots:
+                line = (roots[-1] + " " + line).strip()
 out, inserted = [], False
-for l in open(p).read().splitlines():
+for l in lines:
     if l.strip().startswith("cmdline:"):
         continue
     out.append(l)

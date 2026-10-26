@@ -616,12 +616,42 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
 
 // ── /dev/root ────────────────────────────────────────────────────────────────
 
+static NO_HINT_WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `root=LABEL=<f2fs label>`: the volume carrying that label. QEMU boot
+/// images name their root this way (`leandros-root`), so extra virtio disks
+/// cannot reorder it. A tie (e.g. a USB stick written from the same root
+/// image) goes to the one whole virtio disk among them, else `Ambiguous`.
+/// No match is `NotFound`: the disk may still be enumerating.
+fn resolve_root_label(label: &str) -> Result<usize, RootErr> {
+    let mut cands: alloc::vec::Vec<usize> =
+        (0..device_count()).filter(|&i| f2fs_label_is(i, label)).collect();
+    if cands.len() > 1 {
+        let vd: alloc::vec::Vec<usize> = cands.iter().copied()
+            .filter(|&i| get(i).map_or(false, |e| e.parent.is_none() && e.class == "vd")).collect();
+        if vd.len() == 1 { cands = vd; }
+    }
+    match cands.len() {
+        0 => Err(RootErr::NotFound),
+        1 => Ok(cands[0]),
+        _ => {
+            log("[BLK] root=LABEL=");
+            log(label);
+            log(" is ambiguous between:");
+            for &i in &cands { log(" "); log(dev_path(i)); }
+            log("\n");
+            Err(RootErr::Ambiguous)
+        }
+    }
+}
+
 /// Resolve `/dev/root`, in order:
 ///
-/// 1. `root=` on the kernel command line: `/dev/<name>` or `PARTUUID=<id>`.
+/// 1. `root=` on the kernel command line: `/dev/<name>`, `PARTUUID=<id>` or
+///    `LABEL=<f2fs label>` (what QEMU boot images pass).
 ///    An explicit `root=` that matches nothing is `NotFound` (the disk may
 ///    still be enumerating), never a silent fall-through to a guess.
-/// 2. Legacy: index 1 when it is a whole virtio disk with f2fs magic — QEMU's
+/// 2. No hint (old images; logged once as a warning). Legacy: index 1 when it is a whole virtio disk with f2fs magic — QEMU's
 ///    vdb, so the default boot is unchanged.
 /// 3. The unique removable or `sd*` disk/partition with f2fs magic that is not
 ///    the home volume (label `HOME_LABEL`). Ties are
@@ -639,9 +669,15 @@ pub fn resolve_root(cmdline: Option<&str>, boot: Option<BootDisk>) -> Result<usi
                 .position(|e| e.and_then(|e| e.partuuid).map_or(false, |u| u.matches(id)))
                 .ok_or(RootErr::NotFound);
         }
+        if let Some(label) = spec.strip_prefix("LABEL=") {
+            return resolve_root_label(label);
+        }
         log("[BLK] root=");
         log(spec);
-        log(" not understood (want /dev/<name> or PARTUUID=), auto-detecting\n");
+        log(" not understood (want /dev/<name>, PARTUUID= or LABEL=), auto-detecting\n");
+    } else if !NO_HINT_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        log("[BLK] warning: no root= on the kernel command line; guessing /dev/root \
+             from probe order (pass root=LABEL=, PARTUUID= or /dev/<name>)\n");
     }
 
     if let Some(e) = get(1) {

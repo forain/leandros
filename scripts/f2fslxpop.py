@@ -77,7 +77,7 @@ class Pop:
                 self.by_path[key] = nid
             self.entries.append((parent_ino, name.encode(), nid, dt))
 
-    def finish(self, out_path, total_segs, dir_nodes, dir_owner, subdirs, build_time):
+    def finish(self, out_path, total_segs, dir_nodes, dir_owner, subdirs, build_time, label=None):
         # ---- geometry (mirrors mkfs-f2fs-home-lx.py) ----
         sit_blocks = -(-total_segs // SIT_PER_BLK)
         sit_segs = 2 * -(-sit_blocks // BPS)
@@ -307,6 +307,9 @@ class Pop:
                 w32(b, s + 92, main_blk)
                 w32(b, s + 96, 3); w32(b, s + 100, 1); w32(b, s + 104, 2)
                 b[s + 108:s + 124] = vol_uuid
+                if label:   # volume_name, __le16[512] (root=LABEL=)
+                    name = label.encode("utf-16-le")
+                    b[s + 124:s + 124 + len(name)] = name
                 f2fslx.mark_superblock(b, s)
 
             # NAT.
