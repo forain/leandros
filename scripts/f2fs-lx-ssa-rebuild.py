@@ -40,9 +40,6 @@ def main(argv):
         return 2
     img, check = argv[0], "--check" in argv[1:]
     v = fsck.Vol(img)
-    if not v.lx:
-        print("not an lx volume (legacy images keep their own layout)")
-        return 2
     if v.journal_blocks:
         print("the checkpoint carries a journal: mount and unmount the volume cleanly first")
         return 2

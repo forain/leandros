@@ -4,9 +4,9 @@ layout (include/linux/f2fs_fs.h), used by volumes whose superblock carries the
 scripts/mkfs-f2fs-populated.py and scripts/fsck-f2fs.py; servers/f2fs reads
 the same layout when it finds the marker.
 
-Volumes without the marker use the legacy LeandrOS layout (footer at 4076,
-i_addr at 364, 1019 slots per node, dentry hash 0, linear directories) and
-keep it forever.
+Volumes without the marker (the legacy LeandrOS-private layout, made before
+lane lxdefault) are no longer supported: the kernel refuses to mount them and
+scripts/fsck-f2fs.py refuses to check them.
 """
 import struct
 
@@ -258,7 +258,7 @@ def bucket_range(name_hash, pgofs, dir_level=0):
 
 
 # Dentry file type: Linux stores F2FS_FT_* (UNKNOWN 0, REG_FILE 1, DIR 2,
-# CHRDEV 3, BLKDEV 4, FIFO 5, SOCK 6, SYMLINK 7); legacy volumes store DT_*.
+# CHRDEV 3, BLKDEV 4, FIFO 5, SOCK 6, SYMLINK 7).
 DT_TO_FT = {8: 1, 4: 2, 2: 3, 6: 4, 1: 5, 12: 6, 10: 7}
 F2FS_FT_MAX = 8
 

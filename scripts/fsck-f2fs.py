@@ -18,9 +18,9 @@ indirect node, xattr node and data block reachable from it:
   - every segment's vblocks equals the population of its valid map,
   - every dentry names an inode the NAT maps, and directory link counts.
 
-Both node formats are understood: legacy (footer at 4076, 1019 slots per
-node) and lx (the `LeandrOS lxnode` superblock marker: Linux's layout, see
-scripts/f2fslx.py). On lx volumes it also checks every node footer's ino and
+Volumes use the lx node format (the `LeandrOS lxnode` superblock marker:
+Linux's layout, see scripts/f2fslx.py); a legacy LeandrOS-format volume is
+refused. It also checks every node footer's ino and
 node offset, i_blocks, i_current_depth, inline flags, each dentry's hash and
 that the name sits in a block of the bucket Linux would search.
 
@@ -45,9 +45,6 @@ NAT_PER_BLK = BLOCK // NAT_ENTRY
 SIT_ENTRY = 74
 SIT_PER_BLK = BLOCK // SIT_ENTRY
 NODE_FOOTER = 4076
-ADDRS_PER_DNODE = NODE_FOOTER // 4      # 1019
-INODE_UNION = 364
-INODE_NIDS = 4056
 S_IFMT, S_IFDIR = 0o170000, 0o040000
 F2FS_FT_DIR, F2FS_FT_MAX = 2, 8
 
@@ -56,12 +53,8 @@ class Layout:
     """Node-format offsets of one volume."""
     def __init__(self, lx):
         self.lx = lx
-        if lx:
-            self.footer, self.per = f2fslx.FOOTER, f2fslx.ADDRS_PER_BLOCK
-            self.union, self.nids, self.xattr = f2fslx.I_ADDR, f2fslx.I_NID, f2fslx.I_XATTR_NID
-        else:
-            self.footer, self.per = NODE_FOOTER, ADDRS_PER_DNODE
-            self.union, self.nids, self.xattr = INODE_UNION, INODE_NIDS, 24
+        self.footer, self.per = f2fslx.FOOTER, f2fslx.ADDRS_PER_BLOCK
+        self.union, self.nids, self.xattr = f2fslx.I_ADDR, f2fslx.I_NID, f2fslx.I_XATTR_NID
 
 
 CPJ_MAGIC, CPJ_MAGIC_OFF = 0x314A504C, 3072
@@ -136,7 +129,10 @@ class Vol:
         sb = self.blk(0)[1024:]
         if r32(sb, 0) != 0xF2F52010:
             raise SystemExit("not an f2fs volume")
-        self.lx = f2fslx.is_lx_superblock(sb)
+        self.lx = (f2fslx.is_lx_superblock(sb)
+                   or bytes(sb[f2fslx.SB_INIT_VERSION_OFF:]).startswith(b"Linux version"))
+        if not self.lx:
+            raise SystemExit("unsupported legacy LeandrOS f2fs format (no lxnode marker): reformat the volume")
         self.L = Layout(self.lx)
         self.bps = 1 << r32(sb, 20)
         self.block_count = r64(sb, 36)
@@ -258,11 +254,10 @@ def inode_addrs(ib, L=None):
     dentries are inline (not implemented; never misread them as addresses)."""
     L = L or Layout(False)
     base, end = L.union, L.nids
-    if L.lx:
-        if ib[3] & (f2fslx.F2FS_INLINE_DATA | f2fslx.F2FS_INLINE_DENTRY):
-            return None
-        if ib[3] & f2fslx.F2FS_INLINE_XATTR:
-            end -= 4 * f2fslx.DEFAULT_INLINE_XATTR_ADDRS
+    if ib[3] & (f2fslx.F2FS_INLINE_DATA | f2fslx.F2FS_INLINE_DENTRY):
+        return None
+    if ib[3] & f2fslx.F2FS_INLINE_XATTR:
+        end -= 4 * f2fslx.DEFAULT_INLINE_XATTR_ADDRS
     if ib[3] & 0x20:
         base = L.union + min(r16(ib, L.union) // 4, 64) * 4
     n = (end - base) // 4
@@ -294,7 +289,7 @@ class Fsck:
         off = a - self.v.main_blk
         seg, b = divmod(off, self.v.bps)
         m = self.valid[seg]
-        return (m[b // 8] >> ((7 - b % 8) if self.v.lx else (b % 8))) & 1
+        return (m[b // 8] >> (7 - b % 8)) & 1
 
     def ref(self, a, what):
         v = self.v
@@ -324,7 +319,7 @@ class Fsck:
         F = self.v.L.footer
         if r32(b, F) != nid:
             self.err(f"{what}: node block {a} footer nid {r32(b, F)} != {nid}")
-        if self.v.lx and ino is not None:
+        if ino is not None:
             _n, fino, fofs, _bits, _cp = f2fslx.footer(b)
             if fino != ino:
                 self.err(f"{what}: node block {a} footer ino {fino} != {ino}")
@@ -434,25 +429,24 @@ class Fsck:
             blocks = self.file_blocks(ino, ib)
             self.inodes[ino] = (mode, links, size, blocks)
             is_dir = mode & S_IFMT == S_IFDIR
-            if v.lx:
-                self.lx_checked += 1
-                want = (self.nodes_seen - n0) + sum(1 for a in blocks if a)
-                if r64(ib, f2fslx.I_BLOCKS) != want:
-                    self.err(f"ino {ino}: i_blocks {r64(ib, f2fslx.I_BLOCKS)} != {want} "
-                             f"(inode + node + data blocks)")
-                if ib[f2fslx.I_ADVISE] & 0x80:
-                    self.warnings.append(f"ino {ino}: i_advise bit 0x80 (FADVISE_TRUNC on Linux)")
+            self.lx_checked += 1
+            want = (self.nodes_seen - n0) + sum(1 for a in blocks if a)
+            if r64(ib, f2fslx.I_BLOCKS) != want:
+                self.err(f"ino {ino}: i_blocks {r64(ib, f2fslx.I_BLOCKS)} != {want} "
+                         f"(inode + node + data blocks)")
+            if ib[f2fslx.I_ADVISE] & 0x80:
+                self.warnings.append(f"ino {ino}: i_advise bit 0x80 (FADVISE_TRUNC on Linux)")
             if is_dir:
                 kids = []
                 nblk = (size + BLOCK - 1) // BLOCK
-                depth = r32(ib, f2fslx.I_CURRENT_DEPTH) if v.lx else 0
-                dir_level = ib[f2fslx.I_DIR_LEVEL] if v.lx else 0
-                if v.lx and depth < 1:
+                depth = r32(ib, f2fslx.I_CURRENT_DEPTH)
+                dir_level = ib[f2fslx.I_DIR_LEVEL]
+                if depth < 1:
                     self.err(f"dir {ino}: i_current_depth {depth} < 1")
                 for pgofs, a in enumerate(blocks[:nblk]):
                     if a == 0:
                         continue
-                    if v.lx and f2fslx.block_level(pgofs, dir_level) >= depth:
+                    if f2fslx.block_level(pgofs, dir_level) >= depth:
                         self.err(f"dir {ino}: block {pgofs} lies past i_current_depth {depth}: "
                                  f"Linux never looks there")
                     d = v.blk(a)
@@ -465,9 +459,8 @@ class Fsck:
                         child, nlen, ft = r32(d, e + 4), r16(d, e + 8), d[e + 10]
                         name = d[2384 + slot * 8:2384 + slot * 8 + nlen]
                         kids.append((name, child, ft))
-                        if v.lx:
-                            self.check_lx_dentry(ino, pgofs, dir_level, name, r32(d, e), ft)
-                            self.lx_ftypes.append((ino, name, child, ft))
+                        self.check_lx_dentry(ino, pgofs, dir_level, name, r32(d, e), ft)
+                        self.lx_ftypes.append((ino, name, child, ft))
                         slot += max(1, (nlen + 7) // 8)
                 self.dir_children[ino] = kids
                 for name, child, ft in kids:
@@ -479,8 +472,6 @@ class Fsck:
                     todo.append(child)
         # Link counts of directories: 2 + subdirectories.
         def kid_is_dir(c, ft):
-            if not v.lx:
-                return ft == 4
             m = self.inodes.get(c)
             return (m[0] & S_IFMT == S_IFDIR) if m else ft == F2FS_FT_DIR
         for ino, kids in self.dir_children.items():
@@ -499,13 +490,12 @@ class Fsck:
         self.leaked = []
         for seg, m in self.valid.items():
             for b in range(v.bps):
-                if (m[b // 8] >> ((7 - b % 8) if self.v.lx else (b % 8))) & 1:
+                if (m[b // 8] >> (7 - b % 8)) & 1:
                     a = v.main_blk + seg * v.bps + b
                     if a not in self.owner:
                         self.leaked.append(a)
         self.valid_total = valid
-        if v.lx:
-            self.lx_ssa_checks()
+        self.lx_ssa_checks()
 
     def lx_ssa_checks(self):
         """What fsck.f2fs checks of an lx volume beyond the tree walk: SIT
@@ -770,11 +760,8 @@ def main(argv):
         unk = v.incompat & ~CPJ_INCOMPAT_KNOWN
         print(f"feature mask {v.incompat:#x}: known bits {v.incompat & CPJ_INCOMPAT_KNOWN:#x}, "
               f"unknown bits {unk:#x}" + (" (a kernel mounts this volume read-only)" if unk else ""))
-    if v.lx:
-        print(f"node format: lx (Linux layout), {f.lx_checked} inodes checked for footer ofs, "
-              f"i_blocks, dentry hash and bucket; SSA/SIT-type/counter problems {f.lx_ssa_bad}")
-    else:
-        print("node format: legacy")
+    print(f"node format: lx (Linux layout), {f.lx_checked} inodes checked for footer ofs, "
+          f"i_blocks, dentry hash and bucket; SSA/SIT-type/counter problems {f.lx_ssa_bad}")
     if v.orphans:
         print(f"orphan list: {len(v.orphans)} nid(s), {len(f.orphans)} still unlinked inodes (reaped at mount)")
     if v.journal_blocks:
