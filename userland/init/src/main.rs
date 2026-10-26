@@ -1051,21 +1051,34 @@ unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
         let last = proc_last_pid();
         let mut killed_this_pass = 0u32;
         let mut pid = 1u32;
+        let is_exempt = |p: u32| {
+            let q = p as i32;
+            p == me || q == login_pid || q == logger_pid || q == AUTORUN_PID
+                || q == NET_AUTORUN_PID || q == AUTORUN_SND_PID
+                || q == AUTORUN_I915_PID || q == SSHD_PID
+        };
         while pid <= last {
             // The log writer is spared: it exits by itself on EOF, once the
             // last process holding the chain's stdout is gone, and killing it
             // would lose the dying chain's last lines.
-            if pid != me && pid as i32 != login_pid && pid as i32 != logger_pid
-                && pid as i32 != AUTORUN_PID && pid as i32 != NET_AUTORUN_PID
-                && pid as i32 != AUTORUN_SND_PID
-                && pid as i32 != AUTORUN_I915_PID
-                && pid as i32 != SSHD_PID
-            {
+            if !is_exempt(pid) {
                 if let Some((state, ppid, _pgid, sid)) = proc_stat(pid) {
                     let protected = match login_sid { Some(s) => s == sid, None => false }
                         || is_vt_session(sid);
                     // A zombie is already dead and waiting for the wait4 loop.
-                    if ppid == me && !protected && state != b'Z' && !from_ssh(pid) {
+                    // A non-leader thread reports its process's parent as its
+                    // own, so sshd's tokio workers looked like init's orphans
+                    // and SIGKILL to one took the whole of sshd down (Pi 5 and
+                    // every no-GPU QEMU boot: "sshd exited (status 9)" right
+                    // after the greeter gave up). Only thread-group leaders are
+                    // candidates; their threads die with them.
+                    // A thread whose leader is still running is left to the
+                    // leader's own verdict (exempt pids are checked first).
+                    let owner = proc_tgid(pid).unwrap_or(pid);
+                    let leader_decides = owner != pid && is_exempt(owner)
+                        || owner != pid && proc_stat(owner).map_or(false, |(st, ..)| st != b'Z');
+                    if ppid == me && !protected && state != b'Z'
+                        && !leader_decides && !from_ssh(pid) {
                         // Name each victim: a silent kill is undiagnosable.
                         let mut comm = [0u8; 16];
                         let len = proc_comm(pid, &mut comm);
@@ -1144,6 +1157,22 @@ unsafe fn proc_stat(pid: u32) -> Option<(u8, u32, u32, u32)> {
     let pgid = parse_u32(fields.next()?)?;
     let sid = parse_u32(fields.next()?)?;
     Some((state, ppid, pgid, sid))
+}
+
+/// The thread-group id from `/proc/<pid>/status` (`Tgid:`), or `None` when
+/// the entry is gone or unreadable.
+unsafe fn proc_tgid(pid: u32) -> Option<u32> {
+    let mut path = [0u8; 32];
+    let mut p = 0;
+    for &b in b"/proc/" { path[p] = b; p += 1; }
+    p += fmt_u32(&mut path[p..], pid);
+    for &b in b"/status\0" { path[p] = b; p += 1; }
+    let mut buf = [0u8; 256];
+    let n = read_file(&path[..p], &mut buf);
+    let line = buf[..n].split(|&b| b == b'\n').find(|l| l.starts_with(b"Tgid:"))?;
+    let v: &[u8] = &line[5..];
+    let start = v.iter().position(|&b| b != b'\t' && b != b' ')?;
+    parse_u32(&v[start..])
 }
 
 /// `/proc/nvrm_state` (absent | probing | ready | failed) equals `want`.
