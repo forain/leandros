@@ -2795,16 +2795,28 @@ fn a64_bbm(slot: *mut u64, d: u64, base: u64, size: u64) -> bool {
     true
 }
 
-/// Pick the DMA coherency mode (`mm::dma_cache`): the DTB's `dma-coherent`
-/// (none = UEFI/ACPI QEMU: coherent), overridden by `dma.coherent=0|1`; then
+/// Pick the DMA coherency mode (`mm::dma_cache`): non-coherent on a BCM2711/
+/// BCM2712 DTB without `dma-coherent`, coherent otherwise, overridden by
+/// `dma.coherent=0|1`; then
 /// self-test the non-coherent range maintenance on a scratch page whatever
 /// the mode: line counts at alignment edges, and bytes beside an unaligned
 /// invalidate range (dirty in the cache) must survive it.
 #[cfg(target_arch = "aarch64")]
 fn early_dma_cache(hhdm: u64) {
     use mm::dma_cache as dc;
+    // Per-device `dma-coherent` is not reliable as a platform signal: the DTB
+    // QEMU virt hands over through UEFI carries none, yet its DMA snoops.
+    // Non-coherent = a Broadcom BCM2711/BCM2712 board (Pi 4/5, RP1 behind a
+    // non-snooping PCIe root) whose DTB does not mark anything coherent.
     let dt = unsafe { boot::device_tree::has_property_name(b"dma-coherent") };
-    let c = match cmdline_knob("dma.coherent") { Some("0") => false, Some("1") => true, _ => dt.unwrap_or(true) };
+    let bcm = unsafe {
+        boot::device_tree::struct_contains(b"brcm,bcm2712").unwrap_or(false)
+            || boot::device_tree::struct_contains(b"brcm,bcm2711").unwrap_or(false)
+    };
+    let c = match cmdline_knob("dma.coherent") {
+        Some("0") => false, Some("1") => true,
+        _ => !(bcm && dt != Some(true)),
+    };
     dc::set_coherent(c);
     let line = dc::dline();
     let Some(pg) = mm::buddy::alloc(0) else { return };
@@ -2832,6 +2844,7 @@ fn early_dma_cache(hhdm: u64) {
     mm::buddy::free(pg, 0);
     serial_print_str(if c { "[early] dma: coherent" } else { "[early] dma: NON-COHERENT (cache maintenance on sync)" });
     serial_print_str(match dt { Some(true) => ", dtb dma-coherent", Some(false) => ", dtb without dma-coherent", None => ", no dtb" });
+    if bcm { serial_print_str(", bcm27xx"); }
     serial_print_str(", line ");
     print_number(line as u32);
     serial_print_str(", selftest ");
