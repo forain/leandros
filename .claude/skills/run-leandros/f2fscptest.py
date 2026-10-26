@@ -14,8 +14,13 @@ by the kernel (several checkpoints), then edited on the host between boots:
   bothbad  both packs' CRCs are corrupted: the kernel must not panic; it
            logs "both checkpoint packs fail their checks" and mounts the
            newer (or refuses); the machine stays alive either way.
+  legacy   a fresh volume whose superblock `init_version` (both copies) is
+           blanked, i.e. a legacy LeandrOS-format volume: the mount must be
+           refused with the "unsupported legacy LeandrOS f2fs format" log
+           line, no panic, and the image must be byte-for-byte unchanged.
 Exit 0 iff every scenario passes.
 """
+import hashlib
 import importlib.util
 import os
 import struct
@@ -99,9 +104,13 @@ def main(argv):
     img = os.path.join(out, "cp.img")
     if os.path.exists(img):
         os.unlink(img)
-    subprocess.run([sys.executable, os.path.join(REPO, "scripts", "mkfs-f2fs-home.py"), "create", img,
-                    "--size", "64M"] + (["--legacy"] if os.environ.get("F2FS_TEST_LEGACY") else []), check=True, stdout=subprocess.DEVNULL)
-    relabel(img)
+    def mkfs():
+        if os.path.exists(img):
+            os.unlink(img)
+        subprocess.run([sys.executable, os.path.join(REPO, "scripts", "mkfs-f2fs-home.py"), "create", img,
+                        "--size", "64M"], check=True, stdout=subprocess.DEVNULL)
+        relabel(img)
+    mkfs()
     pci = "virtio-blk-pci,drive=cpdisk" + (",disable-legacy=on" if arch == "aarch64" else "")
     os.environ["LEANDROS_QEMU_EXTRA"] = (os.environ.get("LEANDROS_QEMU_EXTRA", "") +
                                          f" -drive if=none,id=cpdisk,format=raw,file={img} -device {pci}").strip()
@@ -197,6 +206,23 @@ def main(argv):
     check("bothbad: no panic, machine alive", alive and "panic" not in lg.lower(), r[-80:])
     check("bothbad: logged", "both checkpoint packs fail their checks" in lg or "MOUNT_FAIL" in r, lg[-160:])
     driver.cmd_stop()
+
+    # ---- legacy LeandrOS format: refused, untouched ----
+    mkfs()
+    with open(img, "r+b") as f:
+        for base in (0, 4096):
+            f.seek(base + 1024 + 1924)  # f2fs_super_block.init_version[256]
+            f.write(bytes(256))
+    h0 = hashlib.sha256(open(img, "rb").read()).hexdigest()
+    boot()
+    r = mount()
+    lg = dmesg()
+    alive = "ALIVE" in run("echo ALIVE")
+    check("legacy: refused", "MOUNT_FAIL" in r and "MOUNT_OK" not in r, r[-80:])
+    check("legacy: logged", "unsupported legacy LeandrOS f2fs format" in lg, lg[-160:])
+    check("legacy: no panic, machine alive", alive and "panic" not in lg.lower())
+    driver.cmd_stop()
+    check("legacy: image untouched", hashlib.sha256(open(img, "rb").read()).hexdigest() == h0)
 
     print("f2fscptest: " + ("PASS" if not fails else f"FAIL {fails}"))
     return 0 if not fails else 1

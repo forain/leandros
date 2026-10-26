@@ -14,7 +14,7 @@ import os, re, shutil, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 DRV = [sys.executable, os.path.join(HERE, "driver.py")]
-MKFS = os.path.join(REPO, "scripts", "mkfs-f2fs-home-lx.py")
+MKFS = os.path.join(REPO, "scripts", "mkfs-f2fs-home.py")
 BASE_DISKS = 3  # vda, vdb, vdc in the default config
 
 
