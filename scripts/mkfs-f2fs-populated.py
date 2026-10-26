@@ -1128,11 +1128,32 @@ def main():
                 m4_share_files.append(("/lib/firmware", _f, os.path.join(_iwl_cache, _f)))
             if _iwl:
                 print(f"  iwlwifi firmware: {', '.join(_iwl)} in /lib/firmware")
-        _wifi_conf = os.environ.get("LEANDROS_WIFI_CONF")
-        if _wifi_conf and os.path.isfile(os.path.expanduser(_wifi_conf)):
-            m4_share_dirs.add("/etc/leandros")
-            m4_share_files.append(("/etc/leandros", "wifi.conf", os.path.expanduser(_wifi_conf)))
-            print("  Wi-Fi credentials: /etc/leandros/wifi.conf (from $LEANDROS_WIFI_CONF)")
+    # Raspberry Pi 5 Wi-Fi (CYW43455, brcmfmac family): /lib/firmware/brcm/
+    # {cyw43455-sdio.bin, cyw43455-sdio.clm_blob, brcmfmac43455-sdio.raspberrypi,
+    # 5-model-b.txt} from the cache ports/brcmfmac/fetch.sh fills
+    # ($BRCMFMAC_CACHE, default ~/.cache/leandros/brcmfmac). Absent -> skipped.
+    if arch == "aarch64":
+        _brc_cache = os.path.expanduser(os.environ.get("BRCMFMAC_CACHE", "~/.cache/leandros/brcmfmac"))
+        if os.path.isdir(_brc_cache):
+            _brc = sorted(f for f in os.listdir(_brc_cache)
+                          if (f.startswith("cyw43455-sdio.") or f.startswith("brcmfmac43455-sdio.")) and not f.endswith(".part"))
+            for _f in _brc:
+                m4_share_dirs.update(("/lib/firmware", "/lib/firmware/brcm"))
+                m4_share_files.append(("/lib/firmware/brcm", _f, os.path.join(_brc_cache, _f)))
+            if _brc:
+                print(f"  brcmfmac firmware: {len(_brc)} files in /lib/firmware/brcm")
+    _wifi_conf = os.environ.get("LEANDROS_WIFI_CONF")
+    if _wifi_conf and os.path.isfile(os.path.expanduser(_wifi_conf)):
+        m4_share_dirs.add("/etc/leandros")
+        m4_share_files.append(("/etc/leandros", "wifi.conf", os.path.expanduser(_wifi_conf)))
+        print("  Wi-Fi credentials: /etc/leandros/wifi.conf (from $LEANDROS_WIFI_CONF)")
+    # Root's SSH keys for images with no ESP key import (Raspberry Pi 5 card):
+    # $LEANDROS_AUTHORIZED_KEYS names a host file staged as /root/.ssh/authorized_keys.
+    _auth_keys = os.environ.get("LEANDROS_AUTHORIZED_KEYS")
+    if _auth_keys and os.path.isfile(os.path.expanduser(_auth_keys)):
+        m4_share_dirs.add("/root/.ssh")
+        m4_share_files.append(("/root/.ssh", "authorized_keys", os.path.expanduser(_auth_keys)))
+        print("  SSH keys: /root/.ssh/authorized_keys (from $LEANDROS_AUTHORIZED_KEYS)")
 
     # Saved network connections (/dev/netctl, docs/servers/netctl.md): the
     # directory root:netdev 0770 and both A/B slots pre-created empty,
@@ -1152,6 +1173,23 @@ def main():
         _kexec_initrd = f"initrd-{arch}.cpio"
         if os.path.isfile(_kexec_initrd):
             m4_share_files.append(("/boot", "kexec-initrd", _kexec_initrd))
+            # Pi 5 slots (scripts/remote.py pi-*): the flashed kernel is also the
+            # starting `good` and `trial`, so a serial-console kexec works at once.
+            if arch == "aarch64":
+                import subprocess as _sp, tempfile as _tf, time as _tm
+                try:
+                    _rev = _sp.check_output(["git", "rev-parse", "--short=8", "HEAD"], text=True).strip()
+                except Exception:
+                    _rev = "unknown"
+                _info = _tf.NamedTemporaryFile("w", suffix=".info", delete=False)
+                _info.write(f"{_rev} {_tm.strftime('%Y-%m-%dT%H:%M:%S')} flashed\n")
+                _info.close()
+                for _slot in ("good", "trial"):
+                    _d = f"/boot/pi/{_slot}"
+                    m4_share_dirs.update(("/boot/pi", _d))
+                    m4_share_files.append((_d, "kernel", _kexec_img))
+                    m4_share_files.append((_d, "initrd", _kexec_initrd))
+                    m4_share_files.append((_d, "info", _info.name))
 
     # ── M5 session/compositor ship set (cosmic-comp + D-Bus session + fonts) ──
     # cosmic-comp (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) reuses the exact
@@ -2732,7 +2770,7 @@ def main():
     for image_dir, name, hostpath in m4_share_files:
         ino = _path_to_ino[image_dir]
         # The Wi-Fi credentials are root-only (0600), like /etc/shadow.
-        _mode = 0o100600 if (image_dir, name) == ("/etc/leandros", "wifi.conf") else 0o100644
+        _mode = 0o100600 if (image_dir, name) in (("/etc/leandros", "wifi.conf"), ("/root/.ssh", "authorized_keys")) else 0o100644
         m4_tree_files_by_ino.setdefault(ino, []).append((name, hostpath, _mode))
     # The synthetic sysfs attributes ride the same packing table; they carry
     # their own mode because one of them (the "subsystem" link) is S_IFLNK and

@@ -1,0 +1,15 @@
+# Host unit tests for drivers/src/brcmstb_hw.rs (BCM2712 PCIe root complex
+# window / inbound-BAR / config-address / BAR-assignment math, RP1 + MIP
+# interrupt routing constants). Its own workspace so it builds for the host:
+#
+#   cd drivers/brcmstb-tests && cargo test --target aarch64-apple-darwin
+[package]
+name = "brcmstb-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

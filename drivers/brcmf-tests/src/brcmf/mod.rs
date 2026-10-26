@@ -11,3 +11,7 @@ pub mod fw;
 pub mod sdpcm;
 #[path = "../../../src/brcmf/bcdc.rs"]
 pub mod bcdc;
+#[path = "../../../src/brcmf/event.rs"]
+pub mod event;
+#[path = "../../../src/brcmf/cfg.rs"]
+pub mod cfg;

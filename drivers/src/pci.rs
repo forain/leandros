@@ -50,8 +50,39 @@ pub fn init_pci(ecam_base: usize) {
     unsafe { PCI_ECAM_BASE = ecam_base; }
 }
 
+/// Config-space accessor of a host bridge without ECAM (aarch64 `rpi5`: the
+/// BCM2712 brcmstb root complex, `brcmstb_pcie.rs`):
+/// `f(bus, dev, func, offset, size 1/2/4, Some(value) = write) -> value`.
+pub type CfgAccess = fn(u8, u8, u8, u16, u8, Option<u32>) -> u32;
+static CFG_BACKEND: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// CPU physical address = PCI bus address + this, for memory BARs behind the
+/// backend (0 on ECAM hosts, where the two coincide).
+static MEM_CPU_OFFSET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Routes all config access through `f` instead of ECAM, sets the bus range
+/// and the bus→CPU memory offset, and drops any cached scan. The backend owns
+/// BAR placement (the scan then never re-assigns BARs).
+pub fn set_cfg_backend(f: CfgAccess, mem_cpu_offset: u64, max_bus: u8) {
+    MEM_CPU_OFFSET.store(mem_cpu_offset, core::sync::atomic::Ordering::Relaxed);
+    set_max_bus(max_bus);
+    CFG_BACKEND.store(f as usize, core::sync::atomic::Ordering::Release);
+    *PCI_DEVICES.lock() = None;
+}
+
+#[inline]
+fn cfg_backend() -> Option<CfgAccess> {
+    let p = CFG_BACKEND.load(core::sync::atomic::Ordering::Acquire);
+    if p == 0 { None } else { Some(unsafe { core::mem::transmute::<usize, CfgAccess>(p) }) }
+}
+
+/// CPU physical address of PCI bus memory address `bus_addr`.
+pub fn bus_to_cpu(bus_addr: u64) -> u64 {
+    bus_addr + MEM_CPU_OFFSET.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(target_arch = "aarch64")]
 unsafe fn pci_read_config(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
+    if let Some(f) = cfg_backend() { return f(bus, dev, func, (offset & 0xFC) as u16, 4, None); }
     let ecam_base = PCI_ECAM_BASE;
     if ecam_base == 0 { return 0xFFFF_FFFF; }
     
@@ -199,6 +230,7 @@ pub unsafe fn pci_write_config_16(bus: u8, dev: u8, func: u8, offset: u8, val: u
 
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn pci_write_config_16(bus: u8, dev: u8, func: u8, offset: u8, val: u16) {
+    if let Some(f) = cfg_backend() { f(bus, dev, func, (offset & 0xFE) as u16, 2, Some(val as u32)); return; }
     let ecam_base = PCI_ECAM_BASE;
     if ecam_base == 0 { return; }
     
@@ -241,6 +273,7 @@ pub unsafe fn pci_write_config_32(bus: u8, dev: u8, func: u8, offset: u8, val: u
 
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn pci_write_config_32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
+    if let Some(f) = cfg_backend() { f(bus, dev, func, (offset & 0xFC) as u16, 4, Some(val)); return; }
     let ecam_base = PCI_ECAM_BASE;
     if ecam_base == 0 { return; }
     let addr = ecam_base +
@@ -430,7 +463,7 @@ fn probe_function(c: &mut ScanCtx, bus: u8, dev: u8, func: u8, recurse: bool) {
 
             // Direct boot: size and assign any unprogrammed memory BAR.
             #[cfg(target_arch = "aarch64")]
-            if !already_assigned {
+            if !already_assigned && cfg_backend().is_none() {
                 unsafe {
                     pci_write_config_32(bus, dev, func, off, 0xFFFF_FFFF);
                     let sz_lo = pci_read_config(bus, dev, func, off) & 0xFFFF_FFF0;
@@ -624,7 +657,7 @@ impl PciFunction {
     }
 
     /// True if offsets >= 0x100 are reachable.
-    pub fn has_extended_config(&self) -> bool { self.ecam_page() != 0 }
+    pub fn has_extended_config(&self) -> bool { self.ecam_page() != 0 || cfg_backend().is_some() }
 
     /// Legacy 0xCF8/0xCFC access; `size` = 1/2/4, `write` = Some(value).
     #[cfg(target_arch = "x86_64")]
@@ -653,6 +686,8 @@ impl PciFunction {
         // every existing driver uses), ECAM above. aarch64: ECAM always.
         #[cfg(target_arch = "x86_64")]
         if off < 0x100 { return self.legacy(off, size, write); }
+        #[cfg(target_arch = "aarch64")]
+        if let Some(f) = cfg_backend() { return f(self.bus, self.dev, self.func, off, size, write); }
         let page = self.ecam_page();
         if page == 0 { return ones; }
         let a = page + off as usize;
@@ -850,8 +885,11 @@ impl PciFunction {
     /// Returns `(virtual address, size)`. Task context.
     pub fn map_bar(&self, i: usize, mode: mm::kva::CacheMode) -> Option<(usize, u64)> {
         let s = self.size_bars();
-        let b = s.bars.iter().find(|b| b.index == i && !b.io && b.base != 0 && b.size != 0)?;
-        let va = mm::kva::ioremap(b.base, b.size as usize, mode)?;
+        // Behind a non-ECAM backend bus address 0 is a real placement (RP1's
+        // BAR1); `bus_to_cpu` turns the bus address into the CPU one.
+        let zero_ok = cfg_backend().is_some();
+        let b = s.bars.iter().find(|b| b.index == i && !b.io && (b.base != 0 || zero_ok) && b.size != 0)?;
+        let va = mm::kva::ioremap(bus_to_cpu(b.base), b.size as usize, mode)?;
         Some((va, b.size))
     }
 

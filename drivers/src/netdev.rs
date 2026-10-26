@@ -40,7 +40,8 @@
 //! Every device is its own netif, registered by [`init`] in this order:
 //! every virtio-net device (QEMU), a Realtek RTL8168-family NIC (real PCs),
 //! an Intel e1000e (I219 laptops, QEMU's `-device e1000e`) — the wired ones,
-//! named `eth0`, `eth1`, ... — then Intel Wi-Fi (`iwlwifi`) as `wifi0`.
+//! named `eth0`, `eth1`, ... — then Intel Wi-Fi (`iwlwifi`) as `wifi0`, or on the Raspberry Pi 5 the
+//! CYW43455 (`brcmf`).
 //! Wi-Fi registers at probe time, before its firmware loads, so its stack
 //! and every INADDR_ANY listener exist from boot; its MAC address is picked
 //! up when it associates (the link generation changes). Routing between the
@@ -206,6 +207,8 @@ pub fn init(cmdline: &str) {
     // The simulated Wi-Fi (QEMU only, opt-in) may claim a virtio-net device
     // as its data path; that device is then wifi0, not an ethN.
     crate::wifi_sim::init(cmdline);
+    // CYW43455 (Raspberry Pi 5 only; inert in every other build).
+    crate::brcmf::netdev::init(cmdline);
     for i in 0..crate::virtio_net::device_count() {
         if crate::wifi_sim::claims_virtio(i) { continue; }
         register(Kind::Wired, "eth", &VIRTIO_OPS, i as u8);
@@ -223,6 +226,11 @@ pub fn init(cmdline: &str) {
     if crate::iwlwifi::present() {
         if let Some(n) = register(Kind::Wifi, "wifi", &IWL_OPS, 0).and_then(|id| get(id as usize)) {
             crate::iwlwifi::attach(n.ifindex(), n.name());
+        }
+    }
+    if crate::brcmf::netdev::present() {
+        if let Some(n) = register(Kind::Wifi, "wifi", &BRCMF_OPS, 0).and_then(|id| get(id as usize)) {
+            crate::brcmf::netdev::attach(n.ifindex(), n.name());
         }
     }
     crate::netshape::init(cmdline);
@@ -325,6 +333,19 @@ static IWL_OPS: NetifOps = NetifOps {
     link: |_| (crate::iwlwifi::link_up(), 0, true),
     link_gen: |_| crate::iwlwifi::link_generation(),
     info: |_, out| crate::iwlwifi::info_lines(out),
+};
+
+static BRCMF_OPS: NetifOps = NetifOps {
+    driver: |_| "brcmfmac",
+    send: |_, b| crate::brcmf::netdev::send_packet(b),
+    tx_ready: |_| crate::brcmf::netdev::tx_ready(),
+    recv: |_, b| crate::brcmf::netdev::poll_receive(b),
+    rx_rearm: |_| crate::brcmf::netdev::rx_rearm(),
+    rx_irq_driven: |_| crate::brcmf::netdev::rx_irq_driven(),
+    mac: |_| crate::brcmf::netdev::mac_address(),
+    link: |_| (crate::brcmf::netdev::link_up(), crate::brcmf::netdev::link_speed(), true),
+    link_gen: |_| crate::brcmf::netdev::link_generation(),
+    info: |_, out| crate::brcmf::netdev::info_lines(out),
 };
 
 /// The poll-channel tag the net daemon parks on (besides its deadline and

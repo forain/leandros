@@ -277,11 +277,11 @@ extern "C" {
     fn arch_irq_line_disable(id: u32);
 }
 
-fn line_enable(id: u32) -> bool {
+fn line_enable(id: u32, edge: bool) -> bool {
     #[cfg(target_arch = "aarch64")]
-    { unsafe { arch_irq_line_enable(id, false) } }
+    { unsafe { arch_irq_line_enable(id, edge) } }
     #[cfg(not(target_arch = "aarch64"))]
-    { let _ = id; false }
+    { let _ = (id, edge); false }
 }
 
 fn line_disable(id: u32) {
@@ -301,7 +301,19 @@ pub fn request_irq(src: IrqSource, handler: IrqHandler, ctx: usize) -> Result<Ir
             set_vector_handler(v, handler, ctx)?;
             Ok(IrqHandle { kind: HandleKind::Vector { vector: v } })
         }
-        IrqSource::Line(id) => {
+        IrqSource::Line(id) => request_line(id, handler, ctx, false),
+    }
+}
+
+/// Like `request_irq(IrqSource::Line(id), ..)` but configures the GIC SPI
+/// edge-triggered (MSI doorbells such as the BCM2712 MIP raise edges).
+pub fn request_irq_edge(id: u32, handler: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
+    request_line(id, handler, ctx, true)
+}
+
+fn request_line(id: u32, handler: IrqHandler, ctx: usize, edge: bool) -> Result<IrqHandle, IrqError> {
+    {
+        {
             if !cfg!(target_arch = "aarch64") || id < 32 || id as usize >= NUM_LINES {
                 return Err(IrqError::Unsupported);
             }
@@ -318,7 +330,7 @@ pub fn request_irq(src: IrqSource, handler: IrqHandler, ctx: usize) -> Result<Ir
             }
             if slot == SHARERS { return Err(IrqError::NoSpace); }
             l.masked.store(0, Ordering::Release);
-            if !line_enable(id) {
+            if !line_enable(id, edge) {
                 l.handler[slot].store(0, Ordering::Release);
                 return Err(IrqError::Unsupported);
             }

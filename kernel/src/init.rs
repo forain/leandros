@@ -116,6 +116,18 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::blkdev::init();
+    // Raspberry Pi 5: PCIe root complex for RP1 (Ethernet, USB). Opt-in until
+    // hardware-verified; bounded (<= ~0.4 s) and inert on failure.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    if crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "pcie.rpi5=1")) {
+        drivers::rp1::GEM_IRQ.store(crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "rp1.irq=1")),
+            core::sync::atomic::Ordering::Relaxed);
+        drivers::brcmstb_pcie::init();
+        drivers::rp1::probe();
+        drivers::pci::serial_debug("[pcie] state=");
+        drivers::pci::serial_debug(drivers::brcmstb_pcie::state());
+        drivers::pci::serial_debug("\n");
+    }
     // Raspberry Pi 5: power the CYW43455 and bring sdio2 up as an SDIO host.
     // One `[sdio]` line either way; inert on failure, bounded to ~2 s.
     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
@@ -229,7 +241,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // the bring-up diagnostics reach the stick's log partition.
     drivers::nvme::init(crate::boot_cmdline().unwrap_or(""));
     drivers::i915::run(&drivers::i915::BootEnv { fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32 }); // Intel Gen9 GPU probe (+ `i915.*` bring-up)
-    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] drivers::v3d::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset); // Pi 5 V3D power-up + ident (one [v3d] line)
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] drivers::v3d::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset); #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] drivers::brcmf_boot::start(crate::boot_cmdline().unwrap_or("")); // Pi 5 V3D power-up + ident (one [v3d] line); CYW43455 firmware bring-up on a kthread ([brcmf] lines)
     // Persist the console log on the boot disk's log partition, if it has one.
     crate::klog::init(); crate::iostat::init(); crate::hungtask::init(); // + the 5 s [usbms]/[fslock] summary task
     #[cfg(all(feature = "nvidia", target_arch = "x86_64"))] nvidia_rm::init(&nvidia_rm::BootEnv { cmdline: crate::boot_cmdline().unwrap_or(""), fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32, log_flush: crate::klog::flush_now, rsdp_phys: boot_info.rsdp_addr }); // OpenRM; one line so the default kernel's panic line numbers (and bytes) stay unchanged
