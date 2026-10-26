@@ -343,6 +343,7 @@ pub fn on_tick() {
         // Flow-controlled (evdev_server::serial_rx_drain). The RX interrupt
         // is masked while the backlog is full; once a drain gets through
         // without throttling, unmask it again.
+        super::gic::uart_irq_diag_tick();
         let throttled = evdev_server::serial_rx_drain(&mut || {
             let b = unsafe { super::uart::getc() };
             if b.is_some() {

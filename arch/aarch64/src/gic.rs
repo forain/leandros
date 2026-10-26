@@ -90,6 +90,7 @@ const GICD_ISENABLER0:  usize = 0x100; // set-enable   for IRQs 0-31 (banked per
 const GICD_ICENABLER0:  usize = 0x180; // clear-enable for IRQs 0-31
 const GICD_ISPENDR0:    usize = 0x200; // set-pending for IRQs 0-31
 const GICD_ICPENDR0:    usize = 0x280; // clear-pending for IRQs 0-31
+const GICD_ISACTIVER0:  usize = 0x300; // set-active (read: active state)
 const GICD_IPRIORITYR:  usize = 0x400; // priority    (1 byte / IRQ)
 const GICD_ITARGETSR:   usize = 0x800; // target CPUs (1 byte / IRQ)
 const GICD_ICFGR:       usize = 0xC00; // configuration (2 bits / IRQ)
@@ -153,6 +154,8 @@ const GICC_CTLR: usize = 0x000; // CPU interface control
 const GICC_PMR:  usize = 0x004; // priority mask
 const GICC_IAR:  usize = 0x00C; // interrupt acknowledge (read)
 const GICC_EOIR: usize = 0x010; // end-of-interrupt (write)
+const GICC_RPR:   usize = 0x014; // running priority (read)
+const GICC_HPPIR: usize = 0x018; // highest-priority pending interrupt (read, no ack)
 
 /// Spurious interrupt — IAR returns this value when there is no pending IRQ.
 pub const SPURIOUS: u32 = 1023;
@@ -639,6 +642,7 @@ pub fn init() {
         unsafe { init_dist_v3(); init_cpu_v3(); }
         enable_spi(SPI_PL011);
         UART_IRQ_LIVE.store(true, Ordering::Release);
+        print_uart_irq_diag("init", &uart_irq_diag());
         return;
     }
 
@@ -667,6 +671,7 @@ pub fn init() {
     // generic path rather than a hand-unrolled special case.
     enable_spi(SPI_PL011);
     UART_IRQ_LIVE.store(true, Ordering::Release);
+    print_uart_irq_diag("init", &uart_irq_diag());
 }
 
 /// Set once the console UART's SPI is enabled; `pend_uart_irq` is a no-op
@@ -680,6 +685,94 @@ pub fn pend_uart_irq() {
     if !UART_IRQ_LIVE.load(Ordering::Acquire) { return; }
     let id = SPI_PL011 as usize;
     unsafe { gicd_w32(GICD_ISPENDR0 + (id / 32) * 4, 1 << (id % 32)); }
+}
+
+// ── Console-UART interrupt diagnostic (openbugs #101, Pi 5 RX IRQ never fires) ──
+
+/// One snapshot of everything that decides whether `SPI_PL011` reaches a CPU.
+#[derive(Clone, Copy, Default)]
+pub struct UartIrqDiag {
+    pub el: u64,
+    pub gicd_ctlr: u32, pub gicd_typer: u32,
+    pub enabled: u32, pub pending: u32, pub active: u32, pub group: u32,
+    pub target: u32, pub prio: u32, pub cfg: u32,
+    pub gicc_ctlr: u32, pub gicc_pmr: u32, pub gicc_rpr: u32, pub gicc_hppir: u32,
+    pub imsc: u32, pub ris: u32, pub mis: u32, pub fr: u32, pub cr: u32,
+}
+
+/// Read the distributor/CPU-interface/PL011 state of the console UART SPI.
+/// Read-only: no IAR read, so nothing is acknowledged. GICv2 only (on v3 the
+/// GICC fields stay 0).
+pub fn uart_irq_diag() -> UartIrqDiag {
+    let id = SPI_PL011 as usize;
+    let bit = |base: usize| unsafe { (gicd_r32(base + (id / 32) * 4) >> (id % 32)) & 1 };
+    let byte = |base: usize| unsafe { (gicd_r32(base + (id / 4) * 4) >> ((id % 4) * 8)) & 0xFF };
+    let el: u64;
+    unsafe { core::arch::asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack)); }
+    let (imsc, ris, mis, fr, cr) = super::uart::irq_regs();
+    let mut d = UartIrqDiag { el: (el >> 2) & 3, imsc, ris, mis, fr, cr, ..Default::default() };
+    unsafe {
+        d.gicd_ctlr = gicd_r32(GICD_CTLR);
+        d.gicd_typer = gicd_r32(GICD_TYPER);
+        d.enabled = bit(GICD_ISENABLER0);
+        d.pending = bit(GICD_ISPENDR0);
+        d.active = bit(GICD_ISACTIVER0);
+        d.group = bit(GICD_IGROUPR);
+        d.target = byte(GICD_ITARGETSR);
+        d.prio = byte(GICD_IPRIORITYR);
+        d.cfg = (gicd_r32(GICD_ICFGR + (id / 16) * 4) >> ((id % 16) * 2)) & 3;
+        if !is_v3() {
+            d.gicc_ctlr = gicc_r32(GICC_CTLR);
+            d.gicc_pmr = gicc_r32(GICC_PMR);
+            d.gicc_rpr = gicc_r32(GICC_RPR);
+            d.gicc_hppir = gicc_r32(GICC_HPPIR);
+        }
+    }
+    d
+}
+
+/// Print a snapshot as one `[uartirq]` line, tagged with `when`.
+pub fn print_uart_irq_diag(when: &str, d: &UartIrqDiag) {
+    use crate::uart::{serial_print_str as s, print_hex as h};
+    s("[uartirq] "); s(when); s(" intid "); h(SPI_PL011 as usize);
+    s(" EL "); h(d.el as usize);
+    s(" D.ctlr "); h(d.gicd_ctlr as usize); s(" D.typer "); h(d.gicd_typer as usize);
+    s(" en "); h(d.enabled as usize); s(" pend "); h(d.pending as usize);
+    s(" act "); h(d.active as usize); s(" grp "); h(d.group as usize);
+    s(" tgt "); h(d.target as usize); s(" prio "); h(d.prio as usize);
+    s(" cfg "); h(d.cfg as usize);
+    s(" C.ctlr "); h(d.gicc_ctlr as usize); s(" C.pmr "); h(d.gicc_pmr as usize);
+    s(" C.rpr "); h(d.gicc_rpr as usize); s(" C.hppir "); h(d.gicc_hppir as usize);
+    s(" imsc "); h(d.imsc as usize); s(" ris "); h(d.ris as usize);
+    s(" mis "); h(d.mis as usize); s(" fr "); h(d.fr as usize); s(" cr "); h(d.cr as usize);
+    s("\n");
+}
+
+/// Snapshot taken by the cpu0 tick the first time it finds RX bytes the
+/// interrupt has not taken yet (i.e. while SPI_PL011 should be pending).
+/// Written once from IRQ context, printed later by task context.
+pub static mut UART_IRQ_PENDING_DIAG: UartIrqDiag = UartIrqDiag {
+    el: 0, gicd_ctlr: 0, gicd_typer: 0, enabled: 0, pending: 0, active: 0, group: 0,
+    target: 0, prio: 0, cfg: 0, gicc_ctlr: 0, gicc_pmr: 0, gicc_rpr: 0, gicc_hppir: 0,
+    imsc: 0, ris: 0, mis: 0, fr: 0, cr: 0,
+};
+/// 0 = not taken, 1 = taken (readable), 2 = printed.
+pub static UART_IRQ_PENDING_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Tick hook: capture the snapshot once, before the fallback drains the FIFO.
+pub fn uart_irq_diag_tick() {
+    if UART_IRQ_PENDING_STATE.load(Ordering::Relaxed) != 0 || !super::uart::rx_pending() { return; }
+    let d = uart_irq_diag();
+    unsafe { *core::ptr::addr_of_mut!(UART_IRQ_PENDING_DIAG) = d; }
+    UART_IRQ_PENDING_STATE.store(1, Ordering::Release);
+}
+
+/// Task-context hook: print the tick snapshot once it exists.
+pub fn uart_irq_diag_report() {
+    if UART_IRQ_PENDING_STATE.compare_exchange(1, 2, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        let d = unsafe { *core::ptr::addr_of!(UART_IRQ_PENDING_DIAG) };
+        print_uart_irq_diag("rx-pending", &d);
+    }
 }
 
 /// GICv2 CPU-interface mask of each dense CPU index (0 = not recorded).
