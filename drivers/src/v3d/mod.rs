@@ -174,8 +174,15 @@ mod hw {
                     rep.pm_before, rep.pm_after, (sched::monotonic_ns() - t0) / 1000
                 ));
                 *REPORT.lock() = Some(rep);
+                // Phase B (pv3d-mmu): MMU + IRQ lines, only after a successful probe. The
+                // register block is copied into a leaked 'static so the IRQ handlers and the
+                // CREATE_BO path can reach it without taking DEVICE.
+                let (ver, va_width) = (dev.ver, dev.va_width);
+                let regs: &'static MmioRegs = alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                    MmioRegs { hub: dev.regs.hub, core: dev.regs.core, sms: dev.regs.sms }));
                 *DEVICE.lock() = Some(dev);
                 PROBE_STATE.store(PROBE_UP, Ordering::Relaxed);
+                super::mmu::after_probe(regs, ver, va_width);
             }
             Err((e, rep)) => {
                 serial_debug(&fail_line(e, &rep));
