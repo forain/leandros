@@ -370,6 +370,7 @@ fn kernel_restart() -> ! {
 fn kernel_kexec() -> isize {
     if let Err(e) = crate::kexec::exec_prepare() { return e; }
     shutdown_prepare(SYSTEM_KEXEC);
+    nvidia_kexec_unload();
     let mut cfg = RebootCfg::from_cmdline();
     cfg.usb_vbus_off = false;
     cfg.hda_crst = !matches!(opt("reboot.hda_crst"), Some("0") | Some("off") | Some("no"));
@@ -383,6 +384,26 @@ fn kernel_kexec() -> isize {
     if cfg.quiesce { kexec_hooks(); }
     quiesce_all_pci();
     crate::kexec::exec_jump()
+}
+
+/// kexec only, right after the filesystems are synced and before phase 1
+/// clears bus mastering on display functions: GSP-RM must be unloaded while
+/// interrupts, the scheduler and DMA still work (its RPC queues live in
+/// system memory). Bounded by `nvidia.kexec_timeout_ms`; a failure makes
+/// devreset reset the GPU instead (drivers/nvidia/src/kexec.rs).
+fn nvidia_kexec_unload() {
+    #[cfg(all(feature = "nvidia", target_arch = "x86_64"))]
+    {
+        let r = nvidia_rm::kexec::kexec_unload();
+        for l in &r.lines {
+            serial_print_str("[KEXEC] ");
+            serial_print_str(l);
+            serial_print_str("\n");
+        }
+        if let Some((b, d, f)) = r.force_reset {
+            crate::kexec::devreset::force_reset(b, d, f);
+        }
+    }
 }
 
 /// kexec only, interrupts off, after the last disk write: the drivers whose

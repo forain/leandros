@@ -355,6 +355,21 @@ fn rehearse_adapter(opts: &Opts) -> bool {
 
 // ------------------------------------------------------------- the thread --
 
+/// kexec unload, between rm_disable_adapter and rm_shutdown_adapter (Linux
+/// nv_shutdown_adapter): stop the bottom half, then free the MSI; from here
+/// RM polls GSP's message queue.
+pub(crate) fn kexec_stop_irq() {
+    unsafe {
+        if let (Some(q), Some(w)) = (&*core::ptr::addr_of!(BH_QUEUE), *core::ptr::addr_of!(BH_WORK)) {
+            q.cancel(w as *const Work);
+            q.flush();
+        }
+    }
+    if let Some(h) = MSI.lock().take() {
+        irq::free_irq(h);
+    }
+}
+
 pub(crate) fn spawn(opts: Opts, gpu: Option<PciFunction>) {
     if sched::kthread::spawn("nvrm", move || main(opts, gpu)).is_none() {
         nvlog!("[nvrm] could not start the [nvrm] kernel thread\n");
@@ -598,6 +613,9 @@ fn start(opts: &Opts, f: PciFunction) -> &'static str {
     let ms = now_ms(t0);
     if ok {
         nvlog!("[nvrm] +{}ms ==== rm_init_adapter OK in {} ms: GSP-RM is up (INIT_DONE) ====\n", crate::ms(), ms);
+        if !fake {
+            crate::kexec::gsp_started(nv, f.bus, f.dev, f.func);
+        }
         let name = unsafe { rm::rm_get_device_name(f.device_id(), f.read16(0x2C), f.read16(0x2E)) };
         if !name.is_null() {
             let s = unsafe { core::ffi::CStr::from_ptr(name) }.to_str().unwrap_or("?");

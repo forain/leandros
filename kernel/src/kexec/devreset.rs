@@ -219,6 +219,19 @@ const PM_NO_SOFT_RESET: u16 = 1 << 3;
 const BRIDGE_CTL: u16 = 0x3E;
 const BRIDGE_CTL_SBR: u16 = 1 << 6;
 
+/// A driver's kexec hook failed to stop its device (NVIDIA: GSP-RM did not
+/// unload): reset this function even if it owns the boot framebuffer.
+/// bus << 16 | dev << 8 | func, u32::MAX = none.
+static FORCE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+pub fn force_reset(bus: u8, dev: u8, func: u8) {
+    FORCE.store(((bus as u32) << 16) | ((dev as u32) << 8) | func as u32, core::sync::atomic::Ordering::Release);
+}
+
+fn forced(bus: u8, dev: u8, func: u8) -> bool {
+    FORCE.load(core::sync::atomic::Ordering::Acquire) == ((bus as u32) << 16) | ((dev as u32) << 8) | func as u32
+}
+
 /// Does the plan keep bus mastering on this function (the Intel IGD
 /// scanning out the handed-over framebuffer)? power.rs `quiesce_all_pci`
 /// asks before clearing it.
@@ -257,12 +270,13 @@ pub fn plan(fb: Option<u64>) {
         e.af = f.find_capability(AF_CAP_ID).unwrap_or(0);
         e.resettable = reset_class(d.class, d.subclass);
         let is_owner = owner.map_or(false, |o| o.bus == f.bus && o.dev == f.dev && o.func == f.func);
-        e.keep_bm = is_owner && d.vendor_id == 0x8086 && !off("kexec.fbbm")
+        let force = forced(d.bus, d.dev, d.func);
+        e.keep_bm = is_owner && !force && d.vendor_id == 0x8086 && !off("kexec.fbbm")
             && f.command() & drivers::pci::CMD_BUS_MASTER != 0;
         let no_flr = NO_FLR.iter().any(|&(v, i)| v == d.vendor_id && i == d.device_id);
         (e.how, e.why) = if !enabled { (How::Keep, "kexec.devreset=0") }
             else if !e.resettable { (How::Keep, "class not reset") }
-            else if is_owner { (How::Keep, "boot framebuffer for the next kernel") }
+            else if is_owner && !force { (How::Keep, "boot framebuffer for the next kernel") }
             else if d.vendor_id == 0x1AF4 { (How::Keep, "virtio: status reset") }
             else if !no_flr && e.pcie != 0 && f.read32(e.pcie + 4) & EXP_DEVCAP_FLR != 0 { (How::Flr, "FLR") }
             else if !no_flr && e.af != 0 && f.read8(e.af + 3) & 3 == 3 { (How::AfFlr, "AF FLR") }

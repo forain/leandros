@@ -1,0 +1,11 @@
+[package]
+name = "nvidia-kexec-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Host-only test crate: compiles drivers/nvidia/src/kexec_sm.rs via #[path]
+# and drives the GSP kexec unload with a fake RM transport. Detached from the
+# kernel workspace. Run:
+#   cargo test --manifest-path drivers/nvidia/kexec-tests/Cargo.toml --target <host-triple>
+[workspace]

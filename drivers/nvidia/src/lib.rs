@@ -48,6 +48,8 @@ mod basic;
 pub mod client;
 mod device;
 mod edutest;
+pub mod kexec;
+pub mod kexec_sm;
 mod fw;
 mod mem;
 pub mod params;
