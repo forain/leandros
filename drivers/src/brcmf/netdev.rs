@@ -11,9 +11,8 @@
 //!
 //! Life cycle: [`init`] (kernel init, rpi5 builds only) marks the device
 //! present so wifi0 exists from boot, like iwlwifi before its firmware loads.
-//! Once the SDIO host, chip and firmware are up, the integration code calls
-//! [`start`] (spawns the `brcmf` thread) or [`run`] (on its own thread) with
-//! the BCDC `Fwil`. Every failure logs one `[brcmf] ...` line and leaves
+//! Once the SDIO host, chip and firmware are up, `brcmf_boot` calls [`run`]
+//! on its own `brcmf` thread with the BCDC `Fwil` ([`start`] spawns one). Every failure logs one `[brcmf] ...` line and leaves
 //! wifi0 down; nothing here panics or blocks boot.
 
 use alloc::collections::VecDeque;
@@ -126,11 +125,40 @@ pub fn run<F: Fwil>(fw: F) {
             return;
         }
     }
+    // Same as iwlwifi.mgr=1: the legacy network is the autoconnect profile
+    // until netctl publishes the stored ones (which then include it).
+    MGR.set_fallback_profiles(legacy_fallback());
     let mut r = BrcmfRadio { dev, bus_errs: 0 };
     wm::run(&MGR, &mut r);
     *STATE.lock() = "stopped";
     log("manager loop ended");
     RUNNING.store(false, Ordering::Release);
+}
+
+const WIFI_CONF: &str = "/etc/leandros/wifi.conf";
+
+/// /etc/leandros/wifi.conf (`ssid=` / `psk=`) as the fallback profile list.
+/// Logs the SSID only; the file buffer is wiped after parsing.
+fn legacy_fallback() -> Vec<netctl_abi::profiles::Profile> {
+    let mut v = match crate::firmware::request_firmware(WIFI_CONF, 64 * 1024).ok().and_then(|f| f.to_vec()) {
+        Some(v) => v,
+        None => { log("no /etc/leandros/wifi.conf: autoconnect waits for netctl profiles"); return Vec::new(); }
+    };
+    let out = match netctl_abi::profiles::parse_legacy_wifi_conf(&v) {
+        Some((ssid, psk)) => {
+            let name = wf::ssid_display(ssid);
+            match netctl_abi::profiles::legacy_profile(ssid, psk) {
+                Some(p) => {
+                    log(&alloc::format!("credentials from {}: SSID '{}' (passphrase not logged)", WIFI_CONF, name));
+                    alloc::vec![p]
+                }
+                None => { log("wifi.conf: passphrase must be 8..63 characters (or 64 hex digits); not connecting"); Vec::new() }
+            }
+        }
+        None => { log("wifi.conf: no usable ssid= line"); Vec::new() }
+    };
+    for b in v.iter_mut() { unsafe { core::ptr::write_volatile(b, 0) }; }
+    out
 }
 
 // ── data path (NetifOps) ───────────────────────────────────────────────────
