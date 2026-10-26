@@ -88,6 +88,39 @@ fn check_links(node: usize, order: usize, next: usize, prev: usize) {
     if !link_ok(prev) { report_bad_link(node, order, b"prev", prev); }
 }
 
+// ── RAM ranges ───────────────────────────────────────────────────────────────
+// Every `Available` region of the boot memory map, as handed to the allocator
+// (adjacent regions coalesced). `is_ram` answers "could the allocator ever
+// hand these frames to someone": a device mapping of such a range that holds
+// no page reference is a use-after-free waiting to happen (a DRM token whose
+// buffer was freed between the mmap ioctl and the page pin, L1.14), whereas
+// MMIO/BAR apertures and the firmware framebuffer are never in this table.
+const MAX_RAM_RANGES: usize = 256;
+static RAM_RANGES: Mutex<([(usize, usize); MAX_RAM_RANGES], usize)> =
+    Mutex::new(([(0, 0); MAX_RAM_RANGES], 0));
+
+fn note_ram(start: usize, end: usize) {
+    if start >= end { return; }
+    let mut g = RAM_RANGES.lock();
+    let (ref mut r, ref mut n) = *g;
+    if *n > 0 && r[*n - 1].1 == start { r[*n - 1].1 = end; return; }
+    if *n == MAX_RAM_RANGES {
+        // Out of slots: widen the last entry (errs towards "RAM", i.e. refusing).
+        r[*n - 1].1 = r[*n - 1].1.max(end);
+        return;
+    }
+    r[*n] = (start, end);
+    *n += 1;
+}
+
+/// True if any byte of `[phys, phys + len)` lies in RAM the allocator manages
+/// (or may later be given). False for MMIO, BARs and firmware-owned memory.
+pub fn is_ram(phys: usize, len: usize) -> bool {
+    let end = phys.saturating_add(len.max(1));
+    let g = RAM_RANGES.lock();
+    g.0[..g.1].iter().any(|&(s, e)| phys < e && s < end)
+}
+
 /// One past the highest physical address the allocator manages.
 pub fn phys_end() -> usize { PHYS_END.load(Ordering::Relaxed) }
 
@@ -389,6 +422,7 @@ pub fn init_from_map(regions: &[boot::MemoryRegion]) {
             dbg_str(b"-"); dbg_hex(end); dbg_str(b"\n");
         }
         if end > PHYS_END.load(Ordering::Relaxed) { PHYS_END.store(end, Ordering::Relaxed); }
+        note_ram(region_start(region), end);
 
         // Walk from start to end, releasing the largest aligned block each time.
         let mut addr = start;

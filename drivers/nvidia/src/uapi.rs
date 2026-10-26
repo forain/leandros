@@ -1647,7 +1647,7 @@ fn exec(arg: u64, open_id: u32) -> Result<usize, DriverError> {
 /// was freed (or freed and its pages reused) since is refused here, never
 /// handed back as "not ours" (that would fall back to an unpinned device
 /// mapping of any length).
-fn mmap_pin(token: usize, len: usize) -> Option<Vec<usize>> {
+fn mmap_pin(token: usize, len: usize, _open_id: u32) -> Option<Vec<usize>> {
     use crate::mmap_tokens::{Range, PAGE};
     let mut t = MMAP_TOKENS.lock();
     match t.claim(token as u64, len as u64) {
