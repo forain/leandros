@@ -40,8 +40,13 @@ def main():
         img = os.path.join(tmp, f"d{i}.img")
         if subprocess.run(["cp", "-c", base, img], capture_output=True).returncode != 0:
             shutil.copyfile(base, img)
+        # x86's base disks are transitional (legacy 0x1001) devices and the
+        # kernel probes modern (0x1042) virtio-blk BEFORE legacy ones, so
+        # extras with disable-legacy=on would become vda/vdb and the kernel
+        # would mount a 64M test image as root. Match the base disks there.
+        legacy = "" if arch == "x86_64" else ",disable-legacy=on"
         extra.append(f"-drive if=none,id=sd{i},format=raw,file={img} "
-                     f"-device virtio-blk-pci,drive=sd{i},disable-legacy=on")
+                     f"-device virtio-blk-pci,drive=sd{i}{legacy}")
     env = dict(os.environ)
     env["LEANDROS_QEMU_EXTRA"] = " ".join(extra)
     da, db = "vd" + chr(ord("a") + BASE_DISKS), "vd" + chr(ord("a") + BASE_DISKS + 1)
