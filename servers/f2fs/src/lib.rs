@@ -9117,7 +9117,15 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut
     let mut block0 = [0u8; BLOCK_SIZE];
     if !virtio_blk::read_block(dev_idx, 0, &mut block0) { return None; }
     let sb = SbInfo::parse(&block0)?;
-    if sb.fmt.lx { dbg_str("[F2FS] Linux node format (lxnode)\n"); }
+    // The legacy LeandrOS-private node layout (volumes made before lane
+    // lxdefault, `init_version` neither "LeandrOS lxnode" nor "Linux
+    // version") is no longer read or written: refuse it before touching
+    // anything, so it is never misread as the Linux layout.
+    if !sb.fmt.lx {
+        dbg_str("[F2FS] unsupported legacy LeandrOS f2fs format (no lxnode marker): reformat the volume; not mounting\n");
+        return None;
+    }
+    dbg_str("[F2FS] Linux node format (lxnode)\n");
     // Every per-segment bitmap here (SIT valid maps, `SegMap`) is 512 bits,
     // which is what f2fs segments are (log_blocks_per_seg = 9).
     if sb.blocks_per_seg != 512 {
