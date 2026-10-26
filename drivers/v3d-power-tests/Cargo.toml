@@ -1,0 +1,15 @@
+# Host unit tests for the V3D register map and power-up sequence
+# (drivers/src/v3d/regs.rs, power.rs). Its own workspace so it builds for the
+# host, outside the no_std kernel workspace:
+#
+#   cd drivers/v3d-power-tests && cargo test --target aarch64-apple-darwin
+[package]
+name = "v3d-power-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
