@@ -410,7 +410,8 @@ fn is_our_handle(h: u32) -> bool {
 /// mmap tokens (physical base -> size) of sysmem buffers, a spin-locked leaf:
 /// the token is resolved from inside the DRM device lock, where nothing may
 /// sleep.
-static MMAP_TOKENS: spin::Mutex<BTreeMap<u64, u64>> = spin::Mutex::new(BTreeMap::new());
+/// Range checks live in `mmap_tokens` (host-tested in drivers/uapi-tests).
+static MMAP_TOKENS: spin::Mutex<crate::mmap_tokens::Tokens> = spin::Mutex::new(crate::mmap_tokens::Tokens::new());
 
 // ---------------------------------------------------------- user copy --
 
@@ -973,7 +974,7 @@ fn bo_unref(st: &mut State, obj: u32, handle: bool) {
             }
         }
         if b.sysmem {
-            MMAP_TOKENS.lock().remove(&b.phys);
+            MMAP_TOKENS.lock().remove(b.phys);
         }
         ulog!(2, "bo {} freed", obj);
     }
@@ -1640,24 +1641,39 @@ fn exec(arg: u64, open_id: u32) -> Result<usize, DriverError> {
 /// under MMAP_TOKENS, which `gem_close` removes the token from before RM frees
 /// the pages, so a pin either lands first or finds nothing. The pages are
 /// freed through `mm::pageref::free_block_pinned` (mem.rs `free_run`).
+///
+/// The whole `[token, token + len)` must lie inside one live buffer (L11.9:
+/// the ioctl only saw the address). A token the ioctl authorized whose buffer
+/// was freed (or freed and its pages reused) since is refused here, never
+/// handed back as "not ours" (that would fall back to an unpinned device
+/// mapping of any length).
 fn mmap_pin(token: usize, len: usize) -> Option<Vec<usize>> {
-    let t = MMAP_TOKENS.lock();
-    let size = *t.get(&(token as u64))? as usize;
-    let pages = (len + 4095) / 4096;
-    if pages * 4096 > size { return Some(Vec::new()); }
-    let v: Vec<usize> = (0..pages).map(|i| token + i * 4096).collect();
-    mm::pageref::inc_many(&v);
-    Some(v)
+    use crate::mmap_tokens::{Range, PAGE};
+    let mut t = MMAP_TOKENS.lock();
+    match t.claim(token as u64, len as u64) {
+        Range::NotOurs => None,
+        Range::Bad => Some(Vec::new()),
+        Range::Ok { start, pages } => {
+            let v: Vec<usize> = (0..pages).map(|i| (start + i * PAGE) as usize).collect();
+            mm::pageref::inc_many(&v);
+            Some(v)
+        }
+    }
 }
 
 /// L1.14: only for an open holding a handle on the token's BO (its own or a
 /// PRIME import). Not this open's: `None`, and the DRM layer refuses it.
+/// `token` may lie anywhere inside the buffer (a fake offset plus a delta);
+/// the length is checked by `mmap_pin`. Lock order STATE -> MMAP_TOKENS, as
+/// in `gem_close`, so the buffer cannot be freed between the ownership check
+/// and the authorization.
 fn mmap(token: u64, open_id: u32) -> Option<(u64, bool)> {
-    if !MMAP_TOKENS.lock().contains_key(&token) { return None; }
     let st = STATE.lock();
+    let mut t = MMAP_TOKENS.lock();
+    let (base, _) = t.containing(token)?;
     let o = st.opens.get(&open_id)?;
-    let mine = o.handles.values().any(|obj| st.bos.get(obj).map_or(false, |b| b.sysmem && b.phys == token));
-    if mine { Some((token, false)) } else { None }
+    let mine = o.handles.values().any(|obj| st.bos.get(obj).map_or(false, |b| b.sysmem && b.phys == base));
+    if mine && t.authorize(token) { Some((token, false)) } else { None }
 }
 
 fn prime_export(handle: u32, open_id: u32) -> Option<UapiPrime> {

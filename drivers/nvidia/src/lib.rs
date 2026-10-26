@@ -60,6 +60,7 @@ mod uapi;
 mod uapi_abi;
 mod uapi_kms;
 mod uapi_vm;
+mod mmap_tokens;
 mod work;
 pub mod glue;
 pub mod rm;
