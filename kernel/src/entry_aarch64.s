@@ -348,6 +348,33 @@ pud_ram_loop:
     str     x8,  [x6, #512]             // entry 64
     add     x8,  x8, x11                // + 1GiB
     str     x8,  [x6, #520]             // entry 65
+    // The GiB holding this image — 2 MiB blocks, not one 1 GiB block.
+    //
+    // `early_nomap_a64` takes DTB `no-map` ranges out of the HHDM by
+    // splitting the block that covers them, and refuses to split a block
+    // the running code, stack or parent table lives in (break-before-make
+    // would unmap them under its own feet). With a 1 GiB block that refusal
+    // covered the whole GiB the kernel was loaded into — on a Pi 5 RAM GiB 0,
+    // where the firmware's own no-map carve-outs sit — so those ranges stayed
+    // mapped Normal cacheable. Mapping that GiB through an L2 table here
+    // shrinks the refusal to the 2 MiB blocks the image really occupies.
+    // Same attributes as the block it replaces (descriptor + n * 2 MiB);
+    // the L2 table is early_pgtables page 2 (pages 0/1 are L0/L1).
+    // x12-x14 only: x9/x10 belong to EARLY_PUTC, x19 holds the DTB.
+    adr     x12, .                      // physical PC (MMU still off)
+    lsr     x12, x12, #30               // GiB index of the running image
+    ldr     x5,  [x6, x12, lsl #3]      // its 1 GiB block descriptor
+    add     x13, x0, #0x2000            // L2 table
+    movz    x14, #0x20, lsl #16         // 2 MiB stride
+    mov     x7,  #0
+l2_image_loop:
+    str     x5,  [x13, x7, lsl #3]      // block (bits[1:0] = 01 at L2 too)
+    add     x5,  x5, x14
+    add     x7,  x7, #1
+    cmp     x7,  #512
+    b.lt    l2_image_loop
+    orr     x5,  x13, #3                // table descriptor
+    str     x5,  [x6, x12, lsl #3]
 
     // Set page tables
     msr     ttbr0_el1, x0
