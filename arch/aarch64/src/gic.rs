@@ -88,6 +88,7 @@ const GICD_CTLR:        usize = 0x000; // distributor control
 const GICD_TYPER:       usize = 0x004; // controller type (ITLinesNumber)
 const GICD_ISENABLER0:  usize = 0x100; // set-enable   for IRQs 0-31 (banked per CPU for SGIs/PPIs)
 const GICD_ICENABLER0:  usize = 0x180; // clear-enable for IRQs 0-31
+const GICD_ISPENDR0:    usize = 0x200; // set-pending for IRQs 0-31
 const GICD_ICPENDR0:    usize = 0x280; // clear-pending for IRQs 0-31
 const GICD_IPRIORITYR:  usize = 0x400; // priority    (1 byte / IRQ)
 const GICD_ITARGETSR:   usize = 0x800; // target CPUs (1 byte / IRQ)
@@ -637,6 +638,7 @@ pub fn init() {
         BSP_ROUTE.store(mpidr_to_irouter(read_mpidr()), Ordering::Release);
         unsafe { init_dist_v3(); init_cpu_v3(); }
         enable_spi(SPI_PL011);
+        UART_IRQ_LIVE.store(true, Ordering::Release);
         return;
     }
 
@@ -664,6 +666,20 @@ pub fn init() {
     // SPI 1 / INTID 33: the PL011 UART. Now just the first customer of the
     // generic path rather than a hand-unrolled special case.
     enable_spi(SPI_PL011);
+    UART_IRQ_LIVE.store(true, Ordering::Release);
+}
+
+/// Set once the console UART's SPI is enabled; `pend_uart_irq` is a no-op
+/// before (early prints run before the distributor is mapped/programmed).
+static UART_IRQ_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Software-pend the console UART interrupt. Level-sensitive SPIs keep a
+/// software-set pending state until acknowledged, so `uart_irq` runs (and
+/// drains `uart::RX_RING`) as soon as the target CPU opens IRQs.
+pub fn pend_uart_irq() {
+    if !UART_IRQ_LIVE.load(Ordering::Acquire) { return; }
+    let id = SPI_PL011 as usize;
+    unsafe { gicd_w32(GICD_ISPENDR0 + (id / 32) * 4, 1 << (id % 32)); }
 }
 
 /// GICv2 CPU-interface mask of each dense CPU index (0 = not recorded).

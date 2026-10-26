@@ -343,7 +343,13 @@ pub fn on_tick() {
         // Flow-controlled (evdev_server::serial_rx_drain). The RX interrupt
         // is masked while the backlog is full; once a drain gets through
         // without throttling, unmask it again.
-        let throttled = evdev_server::serial_rx_drain(&mut || unsafe { super::uart::getc() });
+        let throttled = evdev_server::serial_rx_drain(&mut || {
+            let b = unsafe { super::uart::getc() };
+            if b.is_some() {
+                super::uart::UART_RX_TICK_BYTES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            b
+        });
         unsafe { super::uart::set_rx_irq(!throttled); }
 
         // One poll wake for everything this tick drained — virtio input above

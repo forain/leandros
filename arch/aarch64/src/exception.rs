@@ -101,6 +101,7 @@ fn resched_ipi() {}
 /// memory, and clears the device condition before returning — required,
 /// because INTID 33 is level-triggered and EOI follows immediately.
 fn uart_irq() {
+    super::uart::UART_RX_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // Flow-controlled (evdev_server::serial_rx_drain). If it stopped with the
     // backlog full the FIFO may still hold bytes, and INTID 33 is level-
     // triggered: mask RX until the cpu0 tick drains without throttling.
