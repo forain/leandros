@@ -55,7 +55,7 @@ The deadline and FLR fallback bound a hang, but they cannot catch a panic inside
   - with the deadline removed, the suite hangs (killed by `timeout 20`).
 - x86_64 `build-all.sh --arch x86_64 --nvidia` is clean, with no warnings from nvidia-rm or the kernel.
 - x86_64 TCG kexec chain on that `--nvidia` kernel with `nvidia.kexec_unload=1`: gen0, gen1 and gen2 each reach login, with nproc 4 and `/proc/cmdline` `kexec.gen=2`. The hook is a no-op without an NVIDIA GPU (`no NVIDIA display controller present`), and the devreset plan is unchanged.
-- aarch64 regress: see the merge report. The nvidia feature is x86_64-only, so on aarch64 only the devreset `force_reset` plumbing is new code.
+- aarch64 regress: 48 suites, all green except nettag2test unbound_recv (known flake), which passed on the rerun (1/1). The nvidia feature is x86_64-only, so on aarch64 only the devreset `force_reset` plumbing is new code.
 
 ## 3070 validation step (exact)
 Run this on the PC from the USB stick, with a kernel built by `./scripts/build-all.sh --arch x86_64 --nvidia` and a cmdline containing `nvidia.kexec_unload=1`:
