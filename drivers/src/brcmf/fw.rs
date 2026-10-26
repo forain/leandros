@@ -13,11 +13,12 @@ use super::bus::{BusError, SdioBus, FUNC_BACKPLANE, FUNC_BUS, FUNC_WLAN};
 use super::chip::{self, Chip, ChipError};
 use super::fwil::{FwError, Fwil};
 
-pub const FW_PATH: &str = "/lib/firmware/brcm/brcmfmac43455-sdio.bin";
+/// Names as staged on the Pi 5 image (Infineon/Raspberry Pi firmware package).
+pub const FW_PATH: &str = "/lib/firmware/brcm/cyw43455-sdio.bin";
 pub const NVRAM_PATH: &str = "/lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,5-model-b.txt";
 /// Generic fallback name for the nvram file.
 pub const NVRAM_FALLBACK_PATH: &str = "/lib/firmware/brcm/brcmfmac43455-sdio.txt";
-pub const CLM_PATH: &str = "/lib/firmware/brcm/brcmfmac43455-sdio.clm_blob";
+pub const CLM_PATH: &str = "/lib/firmware/brcm/cyw43455-sdio.clm_blob";
 
 /// F2 block size brcmfmac uses for the 4345 family.
 pub const F2_BLOCKSIZE: u16 = 512;

@@ -85,6 +85,9 @@ pub mod wifi_api;
 pub mod wifi_mgr;
 /// Broadcom/Cypress FullMAC Wi-Fi (CYW43455, Raspberry Pi 5).
 pub mod brcmf;
+/// Pi 5 Wi-Fi boot bring-up: sdio2 host → firmware → "ver" (rpi5 only).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod brcmf_boot;
 pub mod wifi_pref;
 /// A simulated Wi-Fi interface for QEMU tests (opt-in; see its header).
 pub mod wifi_sim;
