@@ -374,6 +374,18 @@ pub unsafe fn has_property_name(name: &[u8]) -> Option<bool> {
     Some(strs.split(|&b| b == 0).any(|s| s == name))
 }
 
+/// The recorded DTB as bytes (its header `totalsize`), `None` without one.
+///
+/// # Safety
+/// As for [`has_property_name`].
+pub unsafe fn recorded_dtb() -> Option<&'static [u8]> {
+    let dtb = DTB_VIRT.load(core::sync::atomic::Ordering::Relaxed);
+    if dtb == 0 { return None; }
+    let size = u32::from_be(core::ptr::read_unaligned((dtb + 4) as *const u32)) as usize;
+    if !(40..=(8 << 20)).contains(&size) { return None; }
+    Some(core::slice::from_raw_parts(dtb as *const u8, size))
+}
+
 /// Does the recorded DTB's structure block (node names and property values,
 /// e.g. a `compatible` string) contain `pat`? `None` without a recorded DTB.
 ///
