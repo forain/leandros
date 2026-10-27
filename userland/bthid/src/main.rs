@@ -589,6 +589,7 @@ fn cli(args: &[&[u8]]) -> i32 {
             write_file(LIST, t.as_bytes(), O_TRUNC);
             0
         }
+        [b"selftest", secs] => selftest(core::str::from_utf8(secs).ok().and_then(|s| s.parse().ok()).unwrap_or(10)),
         [b"list"] => {
             for a in listed() {
                 let info = load_cache(&a).map(|(v, p, d)| alloc::format!("{:04x}:{:04x} desc {} B", v, p, d.len()))
@@ -599,6 +600,31 @@ fn cli(args: &[&[u8]]) -> i32 {
         }
         _ => { eprintln!("usage: bthid [daemon] | connect ADDR | forget ADDR | list"); 2 }
     }
+}
+
+/// No radio involved: a DualShock 4 fed with synthetic BT 0x11 reports
+/// through the real parser and /dev/uinput, Cross toggling every second and
+/// the left stick sweeping, for `secs` seconds. For in-guest checks that a
+/// Bluetooth pad reaches evdev consumers (MAME, evtest).
+fn selftest(secs: u32) -> i32 {
+    let mut h = HidDevice::new(0x054c, 0x05c4, &[]);
+    let fd = match uinput_create(Role::Gamepad, "Wireless Controller (bthid selftest)", 0x054c, 0x05c4) {
+        Ok(fd) => fd, Err(e) => { eprintln!("bthid: uinput: {}", errname(e)); return 1; }
+    };
+    sayln!("bthid: selftest pad up");
+    let mut n = 0usize;
+    for t in 0..secs * 10 {
+        let mut r = [0u8; 78];
+        r[0] = 0x11; r[3] = (t * 25 % 256) as u8; r[4] = 0x80; r[5] = 0x80; r[6] = 0x80;
+        r[7] = 0x08 | if (t / 10) % 2 == 1 { 0x20 } else { 0 };
+        let evs = h.input(&r);
+        n += evs.len();
+        uinput_write(fd, &evs);
+        sleep_ms(100);
+    }
+    uinput_destroy(fd);
+    sayln!("bthid: selftest done, {} events", n);
+    0
 }
 
 #[no_mangle]

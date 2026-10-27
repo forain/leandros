@@ -585,7 +585,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // The Bluetooth HID host (userland/bthid). It waits for btd's socket
     // itself, so it is harmless on machines without a controller.
     if exists(BTHID_PATH) && !cmdline_has(b"bthid=0") {
-        write_str("starting bthid (/usr/bin/bthid)\n");
+        write_str("starting bthid (/bin/bthid)\n");
         spawn_daemon(BTHID_PATH);
     }
     let _ = usb_summary();
@@ -886,7 +886,7 @@ const SSHD_STABLE_SECS: u64 = 60;
 /// Is the SSH server wanted this boot? It is when the image carries it,
 /// `/etc/ssh/sshd_not_to_be_run` does not exist and the kernel command line
 /// does not say `sshd=0`.
-const BTHID_PATH: &[u8] = b"/usr/bin/bthid\0";
+const BTHID_PATH: &[u8] = b"/bin/bthid\0";
 
 /// Start a plain daemon in its own session, stdin on /dev/null, stdout/stderr
 /// on the console. Not restarted.
