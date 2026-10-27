@@ -65,7 +65,13 @@ pub struct Rp1Gem {
     pub dma_offset: u64,
     /// The RP1 interrupt demux will call [`rp1_isr`] for RP1 IRQ 6.
     pub irq_wired: bool,
+    /// Kernel VA of RP1's eth_cfg block (RP1 0x4010_4000), read for the
+    /// diagnostics only; 0 when BAR1 does not reach it.
+    pub eth_cfg_va: usize,
 }
+
+/// eth_cfg sits right after the GEM's 16 KiB window.
+pub const RP1_ETH_CFG_OFFSET: u64 = 0x10_4000;
 
 const NUM_RX: usize = 256;
 const NUM_TX: usize = 256;
@@ -124,6 +130,16 @@ static RX_FRAGS: AtomicU64 = AtomicU64::new(0);
 static TX_PKTS: AtomicU64 = AtomicU64::new(0);
 static TX_BYTES: AtomicU64 = AtomicU64::new(0);
 static TX_FULL: AtomicU64 = AtomicU64::new(0);
+/// MAC-side counters (clear-on-read registers, accumulated) and, when no
+/// interrupt is wired, the ISR bits the driver thread saw.
+static HW_STATS: Mutex<hw::HwStats> = Mutex::new(hw::HwStats {
+    tx_frames: 0, tx_octets: 0, tx_underruns: 0, rx_frames: 0, rx_octets: 0, rx_fcs: 0, rx_symbol: 0,
+    rx_align: 0, rx_undersize: 0, rx_jabber: 0, rx_resource: 0, rx_overrun: 0 });
+static ISR_SEEN: Mutex<hw::IsrCounts> = Mutex::new(hw::IsrCounts {
+    tcomp: 0, rcomp: 0, txubr: 0, rxubr: 0, hresp: 0, rovr: 0, txerr: 0 });
+static PHY_DIAG: Mutex<Option<hw::PhyDiag>> = Mutex::new(None);
+static PHY_MODE_NOW: Mutex<&'static str> = Mutex::new("");
+static ETH_CFG_VA: AtomicUsize = AtomicUsize::new(0);
 
 struct Rings {
     rx: RxRing,
@@ -237,9 +253,14 @@ pub fn init(cmdline: &str) {
     PRESENT.store(true, Ordering::SeqCst);
     RUNNING.store(true, Ordering::SeqCst);
     set_state("phy");
-    let phy_mode = dt.phy_mode.unwrap_or(PhyMode::RgmiiId);
+    // `macb.phy=rgmii|rgmii-id|rgmii-rxid|rgmii-txid` pins the PHY delays
+    // (no automatic RX-delay retry then).
+    let pinned = cmdline_val(cmdline, "macb.phy").and_then(|v| PhyMode::parse(v.as_bytes()));
+    let phy_mode = pinned.or(dt.phy_mode).unwrap_or(PhyMode::RgmiiId);
     let phy_addr = dt.phy_addr.unwrap_or(1);
-    if sched::kthread::spawn("macb", move || driver_thread(Mmio(res.mmio_va), phy_addr, phy_mode)).is_none() {
+    ETH_CFG_VA.store(res.eth_cfg_va, Ordering::Relaxed);
+    let polled = !res.irq_wired;
+    if sched::kthread::spawn("macb", move || driver_thread(Mmio(res.mmio_va), phy_addr, phy_mode, pinned.is_some(), polled)).is_none() {
         log("could not start the driver thread; link stays down");
         set_state("no thread");
     }
@@ -288,7 +309,7 @@ fn alloc_rings(off: u64) -> Option<(Rings, u64, u64, u64)> {
     Some((Rings { rx, tx, rx_va, tx_va }, rxp as u64 + off, txp as u64 + off, dmyp as u64 + off))
 }
 
-fn driver_thread(mut m: Mmio, want: u8, mode: PhyMode) {
+fn driver_thread(mut m: Mmio, want: u8, mut mode: PhyMode, pinned: bool, polled: bool) {
     let (addr, id) = match hw::find_phy(&mut m, want) {
         Ok(x) => x,
         Err(e) => { mlog!("no PHY on MDIO ({:?}); link stays down", e); set_state("no phy"); return; }
@@ -300,15 +321,56 @@ fn driver_thread(mut m: Mmio, want: u8, mode: PhyMode) {
     }
     if let Some(i) = INFO.lock().as_mut() { let _ = write!(i, "phy: {} {:#010x} @{} {}\n", known, id, addr, mode.name()); }
     set_state("no link");
+    *PHY_MODE_NOW.lock() = mode.name();
     let mut w = LinkWatch::default();
     let t0 = now_ms();
     let mut said_nolink = false;
+    // Diagnostics / RX-delay retry state, per link-up.
+    let mut up_at: Option<u64> = None;
+    let mut diag_done = false;
+    let mut win_start = (0u64, hw::HwStats::default());
+    let mut flips = 0u32;
+    let mut rx_ok_said = false;
     loop {
         let res = { let _g = NCR_LOCK.lock(); w.poll(&mut m, addr) };
         match res {
             Ok(Some(l)) => on_link(&mut m, l),
             Ok(None) => {}
             Err(e) => mlog!("MDIO error {:?}", e),
+        }
+        sample(&mut m, polled);
+        if w.cur.up {
+            let now = now_ms();
+            let t_up = *up_at.get_or_insert_with(|| { win_start = (now, *HW_STATS.lock()); now });
+            if !diag_done && now - t_up >= 10_000 {
+                diag_done = true;
+                let pd = { let _g = NCR_LOCK.lock(); hw::phy_diag(&mut m, addr).ok() };
+                *PHY_DIAG.lock() = pd;
+                log(&diag_line(&m, mode, pd));
+            }
+            if now - win_start.0 >= 6_000 {
+                let cur = *HW_STATS.lock();
+                let d = cur.delta(&win_start.1);
+                match hw::rx_verdict(&d) {
+                    hw::RxVerdict::BadTiming if !pinned && flips < 3 => {
+                        let next = mode.flip_rx_delay();
+                        mlog!("rx: {} line errors (fcs {} sym {} align {}) and no good frame under {}; trying {}",
+                              d.rx_line_errors(), d.rx_fcs, d.rx_symbol, d.rx_align, mode.name(), next.name());
+                        let r = { let _g = NCR_LOCK.lock(); hw::bcm_set_delays(&mut m, addr, next) };
+                        if r.is_ok() { mode = next; *PHY_MODE_NOW.lock() = mode.name(); }
+                        flips += 1;
+                    }
+                    hw::RxVerdict::Good if flips > 0 && !rx_ok_said => {
+                        rx_ok_said = true;
+                        mlog!("rx: clean frames under {}", mode.name());
+                    }
+                    _ => {}
+                }
+                win_start = (now, cur);
+            }
+        } else {
+            up_at = None;
+            diag_done = false;
         }
         if !w.cur.up && !said_nolink && now_ms() - t0 > 10_000 {
             log("no link after 10 s (cable?)");
@@ -449,4 +511,76 @@ pub fn info_lines(out: &mut String) {
     let _ = write!(out, "irqs: {}\nrx_overruns: {}\nrx_used_bit_read: {}\nhresp: {}\ntx_irq_errors: {}\ntx_desc_errors: {}\n",
         IRQS.load(Ordering::Relaxed), RX_OVR.load(Ordering::Relaxed), RX_UBR.load(Ordering::Relaxed),
         HRESP.load(Ordering::Relaxed), IRQ_ERR.load(Ordering::Relaxed), tx_err);
+    let base = BASE.load(Ordering::Relaxed);
+    if base == 0 { return; }
+    let mut m = Mmio(base);
+    sample(&mut m, !IRQ_ACTIVE.load(Ordering::Relaxed));
+    let s = *HW_STATS.lock();
+    let i = *ISR_SEEN.lock();
+    let _ = write!(out, "hw_tx_frames: {}\nhw_tx_octets: {}\nhw_tx_underruns: {}\nhw_rx_frames: {}\nhw_rx_octets: {}\n\
+hw_rx_fcs_errors: {}\nhw_rx_symbol_errors: {}\nhw_rx_align_errors: {}\nhw_rx_undersize: {}\nhw_rx_jabbers: {}\n\
+hw_rx_resource_errors: {}\nhw_rx_overruns: {}\n",
+        s.tx_frames, s.tx_octets, s.tx_underruns, s.rx_frames, s.rx_octets, s.rx_fcs, s.rx_symbol, s.rx_align,
+        s.rx_undersize, s.rx_jabber, s.rx_resource, s.rx_overrun);
+    let _ = write!(out, "isr_tcomp: {}\nisr_rcomp: {}\nisr_txubr: {}\nisr_rxubr: {}\nisr_hresp: {}\nisr_rovr: {}\nisr_txerr: {}\n",
+        i.tcomp, i.rcomp, i.txubr, i.rxubr, i.hresp, i.rovr, i.txerr);
+    for (n, o) in [("ncr", hw::NCR), ("ncfgr", hw::NCFGR), ("nsr", hw::NSR), ("usrio", hw::USRIO), ("dmacfg", hw::DMACFG),
+                   ("tsr", hw::TSR), ("rsr", hw::RSR), ("tbqp", hw::TBQP), ("rbqp", hw::RBQP), ("tbqph", hw::TBQPH),
+                   ("rbqph", hw::RBQPH), ("amp", hw::AMP), ("imr", hw::IMR)] {
+        let _ = write!(out, "reg_{}: {:#010x}\n", n, m.r32(o));
+    }
+    let _ = write!(out, "phy_mode: {}\n", *PHY_MODE_NOW.lock());
+    if let Some(p) = *PHY_DIAG.lock() {
+        let _ = write!(out, "phy_rx_err: {}\nphy_false_carrier: {}\nphy_rx_notok: {:#06x}\nphy_aux_status: {:#06x}\nphy_misc: {:#06x}\nphy_clk_ctl: {:#06x}\n",
+            p.rx_err, p.false_carrier, p.rx_notok, p.aux_status, p.misc, p.clk_ctl);
+    }
+    let _ = write!(out, "eth_cfg: {}\n", eth_cfg_words());
+}
+
+/// Folds the clear-on-read statistics into [`HW_STATS`]; without a wired
+/// interrupt also reads (clears) ISR into [`ISR_SEEN`].
+fn sample(m: &mut Mmio, polled: bool) {
+    HW_STATS.lock().accumulate(m);
+    if polled {
+        let st = m.r32(hw::ISR);
+        if st != 0 {
+            m.w32(hw::ISR, st);
+            ISR_SEEN.lock().add(st);
+            if st & hw::INT_HRESP != 0 { HRESP.fetch_add(1, Ordering::Relaxed); }
+            if st & hw::INT_RXUBR != 0 { RX_UBR.fetch_add(1, Ordering::Relaxed); }
+        }
+    }
+}
+
+/// RP1 eth_cfg words 0x00..0x1c (read-only peek; "-" when not mapped).
+fn eth_cfg_words() -> String {
+    let va = ETH_CFG_VA.load(Ordering::Relaxed);
+    if va == 0 { return String::from("-"); }
+    let mut s = String::new();
+    for k in 0..8 {
+        let v = unsafe { core::ptr::read_volatile((va + 4 * k) as *const u32) };
+        let _ = write!(s, "{}{:08x}", if k == 0 { "" } else { " " }, v);
+    }
+    s
+}
+
+/// One line that tells, ten seconds after link-up, which side of the wire
+/// the frames stop at: MAC counters, polled ISR bits, DMA/queue registers,
+/// PHY counters with the latched delay bits, and RP1 eth_cfg.
+fn diag_line(m: &Mmio, mode: PhyMode, pd: Option<hw::PhyDiag>) -> String {
+    let s = *HW_STATS.lock();
+    let i = *ISR_SEEN.lock();
+    let mut l = format!("diag +10s: hw tx {} urun {} | hw rx {} fcs {} sym {} align {} short {} res {} ovr {} | \
+isr tcomp {} rcomp {} txubr {} hresp {} | sw tx {} rx {} | TSR {:#x} RSR {:#x} NSR {:#x} NCR {:#x} USRIO {:#x} DMACFG {:#x} TBQP {:#x} RBQP {:#x} | {}",
+        s.tx_frames, s.tx_underruns, s.rx_frames, s.rx_fcs, s.rx_symbol, s.rx_align, s.rx_undersize, s.rx_resource,
+        s.rx_overrun, i.tcomp, i.rcomp, i.txubr, i.hresp, TX_PKTS.load(Ordering::Relaxed), RX_PKTS.load(Ordering::Relaxed),
+        m.r32(hw::TSR), m.r32(hw::RSR), m.r32(hw::NSR), m.r32(hw::NCR), m.r32(hw::USRIO), m.r32(hw::DMACFG),
+        m.r32(hw::TBQP), m.r32(hw::RBQP), mode.name());
+    match pd {
+        Some(p) => { let _ = write!(l, " phy rxerr {} fcar {} notok {:#x} aux {:#x} rxskew {} txdly {}", p.rx_err,
+                                     p.false_carrier, p.rx_notok, p.aux_status, p.rx_skew() as u8, p.gtxclk_delay() as u8); }
+        None => l.push_str(" phy diag failed"),
+    }
+    let _ = write!(l, " | eth_cfg {}", eth_cfg_words());
+    l
 }

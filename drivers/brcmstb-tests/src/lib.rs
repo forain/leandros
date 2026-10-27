@@ -319,4 +319,18 @@ mod tests {
         assert_eq!(m.bar[1] & !0xf, 0);
         assert_eq!(OB_MEM_CPU - OB_MEM_PCI + l.bar(1).unwrap().0, 0x1f_0000_0000);
     }
+
+    #[test]
+    fn sub_dword_command_write_sets_bus_master_and_spares_status() {
+        // RP1 as seen on the Pi: command 0x0002 (MEM only), status 0x0010 with
+        // an RW1C error bit (bit 13, received master abort) set.
+        let cur = 0x2010_0002u32;
+        let v = sub_dword_write(cur, 0x04, 2, 0x0006);
+        assert_eq!(v & 0xffff, 0x0006, "bus master + memory");
+        assert_eq!(v >> 16, 0, "Status written as zero: no RW1C bit cleared by accident");
+        // Byte write into the upper byte of another dword keeps the rest.
+        assert_eq!(sub_dword_write(0x1122_3344, 0x3f, 1, 0xab), 0xab22_3344);
+        // 16-bit write at offset 2 of a non-status dword.
+        assert_eq!(sub_dword_write(0x1122_3344, 0x52, 2, 0xbeef), 0xbeef_3344);
+    }
 }

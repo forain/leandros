@@ -529,3 +529,14 @@ pub fn setup_rp1_bars<C: CfgSpace>(c: &mut C) -> Rp1Layout {
     l.rp1_cmd = c.rd(1, 0x04) & 0xffff;
     l
 }
+
+/// The dword to write for a 1- or 2-byte config write of `w` at `off`, given
+/// the dword `cur` read back from `off & !3`. The controller drops sub-dword
+/// writes, so they become a dword read-modify-write; in the Command/Status
+/// dword (0x04) the RW1C Status half is written as zero.
+pub const fn sub_dword_write(cur: u32, off: u16, size: u8, w: u32) -> u32 {
+    let sh = 8 * (off & 3) as u32;
+    let mask = (if size == 1 { 0xffu32 } else { 0xffff }) << sh;
+    let cur = if off & !3 == 0x04 { cur & 0x0000_ffff } else { cur };
+    (cur & !mask) | ((w << sh) & mask)
+}

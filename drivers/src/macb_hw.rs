@@ -600,3 +600,148 @@ pub fn fdt_find_gem(dtb: &[u8]) -> GemDt {
     }
     out
 }
+
+// ── Statistics and diagnostics ──────────────────────────────────────────────
+
+/// GEM statistics registers (Linux macb.h); they clear on read.
+pub const STAT_OCT_TX_LO: usize = 0x0100;
+pub const STAT_OCT_TX_HI: usize = 0x0104;
+pub const STAT_TX_FRAMES: usize = 0x0108;
+pub const STAT_TX_UNDERRUN: usize = 0x0134;
+pub const STAT_OCT_RX_LO: usize = 0x0150;
+pub const STAT_OCT_RX_HI: usize = 0x0154;
+pub const STAT_RX_FRAMES: usize = 0x0158;
+pub const STAT_RX_UNDERSIZE: usize = 0x0184;
+pub const STAT_RX_JABBER: usize = 0x018c;
+pub const STAT_RX_FCS: usize = 0x0190;
+pub const STAT_RX_SYMBOL: usize = 0x0198;
+pub const STAT_RX_ALIGN: usize = 0x019c;
+pub const STAT_RX_RESOURCE: usize = 0x01a0;
+pub const STAT_RX_OVERRUN: usize = 0x01a4;
+
+/// What the MAC itself counted, accumulated across clear-on-read snapshots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HwStats {
+    pub tx_frames: u64,
+    pub tx_octets: u64,
+    pub tx_underruns: u64,
+    pub rx_frames: u64,
+    pub rx_octets: u64,
+    pub rx_fcs: u64,
+    pub rx_symbol: u64,
+    pub rx_align: u64,
+    pub rx_undersize: u64,
+    pub rx_jabber: u64,
+    pub rx_resource: u64,
+    pub rx_overrun: u64,
+}
+
+impl HwStats {
+    /// Reads every counter once (clearing it) and adds it in.
+    pub fn accumulate(&mut self, r: &mut dyn Regs) {
+        let oct = |r: &mut dyn Regs, lo: usize, hi: usize| r.r32(lo) as u64 | ((r.r32(hi) as u64 & 0xffff) << 32);
+        self.tx_octets += oct(r, STAT_OCT_TX_LO, STAT_OCT_TX_HI);
+        self.tx_frames += r.r32(STAT_TX_FRAMES) as u64;
+        self.tx_underruns += r.r32(STAT_TX_UNDERRUN) as u64;
+        self.rx_octets += oct(r, STAT_OCT_RX_LO, STAT_OCT_RX_HI);
+        self.rx_frames += r.r32(STAT_RX_FRAMES) as u64;
+        self.rx_undersize += r.r32(STAT_RX_UNDERSIZE) as u64;
+        self.rx_jabber += r.r32(STAT_RX_JABBER) as u64;
+        self.rx_fcs += r.r32(STAT_RX_FCS) as u64;
+        self.rx_symbol += r.r32(STAT_RX_SYMBOL) as u64;
+        self.rx_align += r.r32(STAT_RX_ALIGN) as u64;
+        self.rx_resource += r.r32(STAT_RX_RESOURCE) as u64;
+        self.rx_overrun += r.r32(STAT_RX_OVERRUN) as u64;
+    }
+    /// Line-level receive errors: the signature of a wrong RGMII RX skew.
+    pub fn rx_line_errors(&self) -> u64 {
+        self.rx_fcs + self.rx_symbol + self.rx_align + self.rx_undersize + self.rx_jabber
+    }
+}
+
+/// Interrupt-status bits seen while the GEM runs without a wired interrupt
+/// (the driver thread reads, and thereby clears, ISR).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IsrCounts { pub tcomp: u64, pub rcomp: u64, pub txubr: u64, pub rxubr: u64, pub hresp: u64, pub rovr: u64, pub txerr: u64 }
+
+impl IsrCounts {
+    pub fn add(&mut self, isr: u32) {
+        let b = |m: u32| (isr & m != 0) as u64;
+        self.tcomp += b(INT_TCOMP);
+        self.rcomp += b(INT_RCOMP);
+        self.txubr += b(INT_TXUBR);
+        self.rxubr += b(INT_RXUBR);
+        self.hresp += b(INT_HRESP);
+        self.rovr += b(INT_ROVR);
+        self.txerr += b(INT_TUND | INT_RLE | INT_TXERR);
+    }
+}
+
+/// Receive-path verdict over one observation window (stats deltas).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RxVerdict {
+    /// The MAC counted error-free frames.
+    Good,
+    /// Only errored frames (FCS/symbol/alignment): RGMII RX timing is off.
+    BadTiming,
+    /// Nothing arrived at the MAC at all.
+    Silent,
+}
+
+pub fn rx_verdict(delta: &HwStats) -> RxVerdict {
+    if delta.rx_frames > 0 { RxVerdict::Good }
+    else if delta.rx_line_errors() > 0 { RxVerdict::BadTiming }
+    else { RxVerdict::Silent }
+}
+
+impl HwStats {
+    pub fn delta(&self, earlier: &HwStats) -> HwStats {
+        HwStats {
+            tx_frames: self.tx_frames - earlier.tx_frames, tx_octets: self.tx_octets - earlier.tx_octets,
+            tx_underruns: self.tx_underruns - earlier.tx_underruns, rx_frames: self.rx_frames - earlier.rx_frames,
+            rx_octets: self.rx_octets - earlier.rx_octets, rx_fcs: self.rx_fcs - earlier.rx_fcs,
+            rx_symbol: self.rx_symbol - earlier.rx_symbol, rx_align: self.rx_align - earlier.rx_align,
+            rx_undersize: self.rx_undersize - earlier.rx_undersize, rx_jabber: self.rx_jabber - earlier.rx_jabber,
+            rx_resource: self.rx_resource - earlier.rx_resource, rx_overrun: self.rx_overrun - earlier.rx_overrun,
+        }
+    }
+}
+
+impl PhyMode {
+    /// The same TX delay with the PHY's RX delay flipped (the retry when the
+    /// MAC sees only line errors).
+    pub fn flip_rx_delay(self) -> PhyMode {
+        match self {
+            PhyMode::RgmiiId => PhyMode::RgmiiTxid,
+            PhyMode::RgmiiTxid => PhyMode::RgmiiId,
+            PhyMode::RgmiiRxid => PhyMode::Rgmii,
+            PhyMode::Rgmii => PhyMode::RgmiiRxid,
+        }
+    }
+}
+
+/// BCM54xx counters and the delay bits as latched in the PHY.
+pub const MII_BCM_RXERR: u8 = 0x12;
+pub const MII_BCM_FALSE_CARRIER: u8 = 0x13;
+pub const MII_BCM_RX_NOTOK: u8 = 0x14;
+pub const MII_BCM_AUX_STATUS: u8 = 0x19;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhyDiag { pub rx_err: u16, pub false_carrier: u16, pub rx_notok: u16, pub aux_status: u16, pub misc: u16, pub clk_ctl: u16 }
+
+impl PhyDiag {
+    pub fn rx_skew(&self) -> bool { self.misc & AUXCTL_MISC_RGMII_SKEW_EN != 0 }
+    pub fn gtxclk_delay(&self) -> bool { self.clk_ctl & SHD_CLK_GTXCLK_EN != 0 }
+}
+
+pub fn phy_diag(r: &mut dyn Regs, phy: u8) -> Result<PhyDiag, MdioError> {
+    let rx_err = mdio_read(r, phy, MII_BCM_RXERR)?;
+    let false_carrier = mdio_read(r, phy, MII_BCM_FALSE_CARRIER)?;
+    let rx_notok = mdio_read(r, phy, MII_BCM_RX_NOTOK)?;
+    let aux_status = mdio_read(r, phy, MII_BCM_AUX_STATUS)?;
+    mdio_write(r, phy, MII_BCM_AUXCTL, (AUXCTL_SHDW_MISC << 12) | 0x7)?;
+    let misc = mdio_read(r, phy, MII_BCM_AUXCTL)?;
+    mdio_write(r, phy, MII_BCM_SHD1C, (SHD_CLK_CTL & 0x1f) << 10)?;
+    let clk_ctl = mdio_read(r, phy, MII_BCM_SHD1C)? & 0x3ff;
+    Ok(PhyDiag { rx_err, false_carrier, rx_notok, aux_status, misc, clk_ctl })
+}
