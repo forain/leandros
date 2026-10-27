@@ -19,9 +19,10 @@ pub const LAST_CHAN: u8 = 11;
 pub const DT_CHANNEL_MASK: u32 = 0x7c0;
 /// Channel the HDMI audio path uses (the pisound-design note).
 pub const AUDIO_CHAN: u8 = 10;
-/// HDMI0/HDMI1 MAI DREQ cells from the DT (`dmas = <&dma40 0x41fa000c>` / `0x41fa000d`).
-pub const DREQ_CELL_HDMI0: u32 = 0x41fa_000c;
-pub const DREQ_CELL_HDMI1: u32 = 0x41fa_000d;
+/// HDMI0/HDMI1 MAI DREQ cells from the Pi 5 DTB (`dmas = <&dma40 0x41fa000a>` / `0x41fa0011`):
+/// DREQ 10 and 17. The pisound design note's 12/13 (from the vc4 sources) is wrong for this DTB.
+pub const DREQ_CELL_HDMI0: u32 = 0x41fa_000a;
+pub const DREQ_CELL_HDMI1: u32 = 0x41fa_0011;
 
 // Channel registers.
 pub const CS: u32 = 0x00;

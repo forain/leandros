@@ -44,14 +44,14 @@ mod tests {
 
     #[test]
     fn hdmi_dreq_cells_decode_like_linux() {
-        // 0x41fa000c: BURST(30) | WIDE_SOURCE(24) | QOS 0xa | PANIC_QOS 0xf | DREQ 12.
+        // 0x41fa000a (DTB): BURST(30) | WIDE_SOURCE(24) | QOS 0xa | PANIC_QOS 0xf | DREQ 10.
         let d = DreqCfg::from_cell(DREQ_CELL_HDMI0);
-        assert_eq!(d.per_map, 12);
+        assert_eq!(d.per_map, 10);
         assert_eq!(d.cs_flags, cs_qos(0xa) | cs_panic_qos(0xf));
-        assert_eq!(d.ti, TI_WAIT_RESP | (12 << 9));
+        assert_eq!(d.ti, TI_WAIT_RESP | (10 << 9));
         assert_eq!(d.src_xi, XI_SIZE_128 | (3 << 8));
         assert_eq!(d.dst_xi, 3 << 8);
-        assert_eq!(DreqCfg::from_cell(DREQ_CELL_HDMI1).per_map, 13);
+        assert_eq!(DreqCfg::from_cell(DREQ_CELL_HDMI1).per_map, 17);
         // NO_WAIT_RESP drops WAIT_RESP; a plain cell has no burst/width.
         let p = DreqCfg::from_cell((1 << 27) | 5);
         assert_eq!((p.ti, p.src_xi, p.dst_xi, p.cs_flags), (5 << 9, 0, 0, 0));
@@ -94,7 +94,7 @@ mod tests {
             assert_eq!(s.src_addr(), ring + 8192 * i as u64);
             assert_eq!(s.dst_addr(), 0x10_7c72_001c, "fixed FIFO address");
             assert_eq!(s.len, 8192);
-            assert_eq!(s.ti, TI_WAIT_RESP | TI_D_DREQ | TI_INTEN | ti_per_map(12));
+            assert_eq!(s.ti, TI_WAIT_RESP | TI_D_DREQ | TI_INTEN | ti_per_map(10));
             assert_eq!(s.srci & !0xff, XI_INC | XI_SIZE_128 | xi_burst_len(3));
             assert_eq!(s.dsti & !0xff & XI_INC, 0, "destination must not increment");
             let next = if i + 1 == n { 0x10_0000 } else { 0x10_0000 + 32 * (i as u64 + 1) };
