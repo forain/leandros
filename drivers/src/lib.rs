@@ -132,6 +132,11 @@ pub mod brcmstb_hw;
 pub mod brcmstb_pcie;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod rp1;
+/// Pi 5 USB: RP1's two DWC3 controllers in xHCI host mode (glue + attach).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rp1_usb;
+/// DWC3 global-register math (host-tested in drivers/dwc3-tests).
+pub mod dwc3_hw;
 /// RP1 clock/GPIO/PWM register math (host-tested in drivers/rp1-tests).
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod rp1_hw;
