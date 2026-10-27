@@ -33,7 +33,7 @@ probe, bracketed by `serror_checkpoint()` like pv3dpwr2). `hdmi.probe=0` disable
   incl. 59.94; the full HDMI 1.4b tables 7-1..7-3 + HDMI 2.0 594 MHz N/CTS (35 rows); DVP/MAI/CRP
   decoders; EDID HDMI-VSDB detection). With the gen-4 HFP shift and a wrong 297 MHz N row: 3 fail.
 - `scripts/check-rpi5.sh` and `CHECK_FEATURE=raspi4b`: clean, no warnings in touched files.
-- aarch64 virt boot + suites: see the merge report (the probe is not compiled for virt).
+- aarch64 virt (HVF, Mac): boot + /bin/vfstest PASS. Box full aarch64 regress (TCG) on 169f4846: 49 suites, 0 bad, PASS.
 
 ## Open / for later lanes
 - **DREQ correction for lane 5:** this DTB has `dmas = <&dma40 0x41fa000a>` (hdmi0) and
