@@ -116,6 +116,19 @@ const JMAGIC: &[u8; 8] = b"LEANLOGJ";
 
 /// Record one console byte. Called from every console write path, in any
 /// context (interrupts, panic): one atomic add and one store.
+/// The newest `max` bytes of the RAM log ring, oldest first: `/proc/klog`
+/// and `/bin/dmesg` on boards with no ESP to flush the ring to (the Pi 5).
+pub fn tail(max: usize) -> alloc::vec::Vec<u8> {
+    let head = HEAD.load(Ordering::SeqCst);
+    let n = head.min(RING).min(max);
+    let base = core::ptr::addr_of!(RING_BUF) as *const u8;
+    let mut v = alloc::vec::Vec::with_capacity(n);
+    // SAFETY: indices are taken modulo RING; concurrent writers may race a
+    // byte or two at the head, which a log reader tolerates.
+    for i in head - n..head { v.push(unsafe { *base.add(i % RING) }); }
+    v
+}
+
 #[inline]
 pub fn push(b: u8) {
     WRITERS.fetch_add(1, Ordering::SeqCst);

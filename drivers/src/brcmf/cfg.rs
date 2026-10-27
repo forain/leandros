@@ -590,6 +590,9 @@ impl<F: Fwil> Brcmf<F> {
 
     /// The init sequence: MAC, country, mpc 0, txglom off, event mask, UP.
     /// Only the MAC read, the event mask and UP are fatal.
+    /// Gives the bus back (for a full re-probe).
+    pub fn into_fw(self) -> F { self.fw }
+
     pub fn init(&mut self, country: [u8; 2]) -> Result<[u8; 6], FwError> {
         let mut b = [0u8; 6];
         let n = self.fw.iovar_get("cur_etheraddr", &mut b)?;
@@ -822,4 +825,82 @@ pub fn scb_val(reason: u32, ea: [u8; 6]) -> [u8; 10] {
     b[0..4].copy_from_slice(&reason.to_le_bytes());
     b[4..10].copy_from_slice(&ea);
     b
+}
+
+// ── bring-up and control helpers (shared with brcmf_boot / netdev; host-tested) ──
+
+/// `xx:xx:xx:xx:xx:xx` (or `-` separated) as a usable unicast MAC.
+pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut m = [0u8; 6];
+    let mut n = 0;
+    for part in s.split(|c| c == ':' || c == '-') {
+        if n == 6 || part.len() != 2 { return None; }
+        m[n] = u8::from_str_radix(part, 16).ok()?;
+        n += 1;
+    }
+    let usable = n == 6 && m[0] & 1 == 0 && m.iter().any(|&b| b != 0) && m.iter().any(|&b| b != 0xff);
+    if usable { Some(m) } else { None }
+}
+
+/// The Pi's Wi-Fi MAC from its Ethernet MAC: NIC part + 1 (what the Pi
+/// firmware assigns; same rule as `bcm2712_otp::wifi_from_eth`).
+pub fn wifi_from_eth(e: &[u8; 6]) -> [u8; 6] {
+    let nic = (((e[3] as u32) << 16) | ((e[4] as u32) << 8) | e[5] as u32).wrapping_add(1) & 0xff_ffff;
+    [e[0], e[1], e[2], (nic >> 16) as u8, (nic >> 8) as u8, nic as u8]
+}
+
+/// Wi-Fi MAC from the kernel command line: `brcmf.mac=` as given, else the
+/// Pi firmware's `smsc95xx.macaddr=` (the board Ethernet MAC) + 1. Unlike the
+/// DTB's `local-mac-address`, the command line survives a kexec
+/// (`--reuse-cmdline`); the kexec'd kernel gets a synthetic DTB without the
+/// Wi-Fi node.
+pub fn mac_from_cmdline(cmdline: &str) -> Option<([u8; 6], &'static str)> {
+    let val = |k: &str| cmdline.split_ascii_whitespace().filter_map(|t| t.strip_prefix(k).and_then(|r| r.strip_prefix('='))).last();
+    if let Some(m) = val("brcmf.mac").and_then(parse_mac) { return Some((m, "cmdline brcmf.mac")); }
+    val("smsc95xx.macaddr").and_then(parse_mac).map(|e| (wifi_from_eth(&e), "cmdline smsc95xx.macaddr+1"))
+}
+
+/// One `/etc/brcmf.ctl` command (`seq=<n>` tokens from `brcmfctl` ignored).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CtlCmd<'a> {
+    Status,
+    Scan,
+    /// `join [ssid=<rest of line>]`: None = the wifi.conf network.
+    Join(Option<&'a str>),
+    Diag(usize),
+    /// `retry [knobs]`: the knob words, `seq=` dropped.
+    Retry(alloc::vec::Vec<&'a str>),
+    /// Anything else (peek/poke, unknown): the command word.
+    Other(&'a str),
+}
+
+pub fn parse_ctl(text: &str) -> CtlCmd<'_> {
+    let mut words = text.split_ascii_whitespace().filter(|w| !w.starts_with("seq="));
+    let cmd = words.next().unwrap_or("");
+    match cmd {
+        "" | "status" => CtlCmd::Status,
+        "scan" => CtlCmd::Scan,
+        "join" => CtlCmd::Join(text.find("ssid=").map(|i| text[i + 5..].trim()).filter(|s| !s.is_empty())),
+        "diag" => CtlCmd::Diag(words.find_map(|w| w.strip_prefix("lines=")).and_then(|v| v.parse().ok()).unwrap_or(32)),
+        "retry" => CtlCmd::Retry(words.collect()),
+        other => CtlCmd::Other(other),
+    }
+}
+
+impl<F: Fwil> Brcmf<F> {
+    /// One status line of driver counters and the last few firmware events
+    /// (`type/status/reason`), for /proc/net/nic and `brcmfctl status`.
+    pub fn counters_line(&self) -> alloc::string::String {
+        use core::fmt::Write;
+        let s = &self.stats;
+        let r = &self.rx;
+        let mut out = alloc::format!("scans {} joins {} join_fails {} link_downs {} events {} bad_events {} if_events {} rx_frames {} rx_dropped {} tx {} tx_err {}",
+            s.scans, s.joins, s.join_fails, s.link_downs, r.events, r.bad_events, r.if_events, r.rx_frames, r.rx_dropped,
+            s.tx_frames, s.tx_errors);
+        if !r.recent.is_empty() {
+            out.push_str(" recent");
+            for (t, st, rs) in r.recent.iter().rev().take(8) { let _ = write!(out, " {}/{}/{}", t, st, rs); }
+        }
+        out
+    }
 }

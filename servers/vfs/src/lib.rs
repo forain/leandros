@@ -6264,6 +6264,20 @@ pub fn set_proc_i915(f: fn() -> Option<alloc::string::String>) {
     PROC_I915.store(f as usize, core::sync::atomic::Ordering::Release);
 }
 
+/// `/proc/klog` source: the newest part of the kernel's RAM log ring.
+static PROC_KLOG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_proc_klog(f: fn() -> alloc::vec::Vec<u8>) {
+    PROC_KLOG.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn gen_klog() -> Option<VnodeKind> {
+    let f = PROC_KLOG.load(core::sync::atomic::Ordering::Acquire);
+    if f == 0 { return None; }
+    let f: fn() -> alloc::vec::Vec<u8> = unsafe { core::mem::transmute(f) };
+    proc_snapshot(b"/tmp/.klog", &f(), false)
+}
+
 /// `/proc/pcipm` text source (drivers::pci::pm_report), set by the kernel.
 static PROC_PCIPM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -6999,7 +7013,7 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/epollstat", b"/proc/pcipm"];
+                                     b"/proc/pcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ"];
 
@@ -7723,6 +7737,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/i915" {
             match gen_i915() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/klog" {
+            match gen_klog() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
