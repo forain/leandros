@@ -275,3 +275,137 @@ fn queue_capacity_is_enforced() {
     for f in 0..MAX_JOBS as u64 { q.push(job(f + 1, false)).unwrap(); }
     assert_eq!(q.push(job(99, false)).unwrap_err(), PushError::Full);
 }
+
+// ── phase D: TFU and CSD jobs ──
+
+fn tfu_job(fence: u64) -> ClJob {
+    let t = TfuRegs { icfg: 0x001d_0000, iia: 0x10, iis: 0x20, ica: 0x30, iua: 0x40, ioa: 0x50, ioc: 0x8_6000,
+                      ios: 0x0040_0040, coef: [1, 2, 3, 4] };
+    ClJob { fence, kind: JobKind::Tfu(t), ..Default::default() }
+}
+fn csd_job(fence: u64, wgs: u32) -> ClJob {
+    let cfg = [wgs << 16, 1 << 16, 1 << 16, 0x33, 0x44, 0x5550, 0x6660];
+    ClJob { fence, kind: JobKind::Csd(cfg), ..Default::default() }
+}
+
+#[test]
+fn tfu_register_sequence_7_1() {
+    let (g, e, mut q) = (Gpu::new(), Env::new(), q());
+    q.push(tfu_job(3)).unwrap();
+    q.service(&g, &e, 0);
+    assert_eq!(q.phase(), Some(Phase::Tfu));
+    let hub: Vec<(u32, u32)> = g.log.borrow().iter().filter(|w| w.0 == B::Hub).map(|w| (w.1, w.2)).collect();
+    assert_eq!(hub, vec![
+        (0x70c, 0x10), (0x714, 0x20), (0x710, 0x30), (0x718, 0x40), (0x720, 0x50), (0x71c, 0x8_6000),
+        (0x724, 0x0040_0040), (0x728, 1), (0x72c, 2), (0x730, 3), (0x734, 4), (0x708, 0x001d_0001),
+    ], "Linux v3d_tfu_job_run order, 7.1 offsets (ICA 0x710, IIS 0x714), IOC, ICFG|IOC last");
+    assert!(g.core_writes().is_empty(), "TFU touches only the hub");
+    q.service(&g, &e, INT_FRDONE); // not ours
+    assert!(e.signalled.borrow().is_empty());
+    q.service(&g, &e, EV_TFU_DONE);
+    assert_eq!(*e.signalled.borrow(), vec![3]);
+    assert_eq!(q.stats.tfu_done, 1);
+}
+
+#[test]
+fn csd_register_sequence_and_clean_after() {
+    let (g, e, mut q) = (Gpu::new(), Env::new(), q());
+    q.push(csd_job(4, 2)).unwrap();
+    q.service(&g, &e, 0);
+    assert_eq!(q.phase(), Some(Phase::Csd));
+    let w = g.core_writes();
+    assert_eq!(&w[..2], &[(CTL_L2TCACTL, L2TCACTL_L2TFLS), (CTL_SLCACTL, 0x0F0F_0F0F)], "invalidate first");
+    assert_eq!(&w[2..], &[(0x934, 1 << 16), (0x938, 1 << 16), (0x93c, 0x33), (0x940, 0x44), (0x944, 0x5550),
+                          (0x948, 0x6660), (0x94c, 0), (0x930, 2 << 16)], "CFG1..6, CFG7=0, CFG0 last");
+    g.clear();
+    q.service(&g, &e, INT_FLDONE | EV_TFU_DONE); // wrong done bits
+    assert!(e.signalled.borrow().is_empty());
+    q.service(&g, &e, INT_CSDDONE_71);
+    let w = g.core_writes();
+    assert_eq!(w[0], (CTL_L2TCACTL, L2TCACTL_TMUWCF), "clean job after the CSD");
+    assert_eq!(w[1], (CTL_L2TCACTL, L2TCACTL_L2TFLS | (L2TCACTL_FLM_CLEAN << L2TCACTL_FLM_SHIFT)));
+    assert_eq!(*e.signalled.borrow(), vec![4], "fence only after the clean");
+}
+
+#[test]
+fn csd_clean_timeout_fails_job() {
+    let (g, e, mut q) = (Gpu::new(), Env::new(), q());
+    q.push(csd_job(1, 1)).unwrap();
+    q.service(&g, &e, 0);
+    g.stuck.set(true);
+    q.service(&g, &e, INT_CSDDONE_71);
+    assert_eq!(*e.signalled.borrow(), vec![1]);
+    assert!(!q.take_retired().unwrap().ok);
+    assert_eq!(q.stats.clean_fail, 1);
+}
+
+#[test]
+fn csd_zero_workgroups_not_dispatched_but_cleaned() {
+    let (g, e, mut q) = (Gpu::new(), Env::new(), q());
+    q.push(csd_job(9, 0)).unwrap();
+    q.service(&g, &e, 0);
+    assert!(!g.wrote(B::Core, 0x930), "HW reads 0 workgroups as 65536: never start");
+    assert!(g.wrote(B::Core, CTL_L2TCACTL));
+    assert_eq!(*e.signalled.borrow(), vec![9]);
+    assert!(q.idle());
+}
+
+#[test]
+fn fences_retire_in_order_across_cl_tfu_csd() {
+    let (g, e, mut q) = (Gpu::new(), Env::new(), q());
+    q.push(job(1, true)).unwrap();
+    q.push(tfu_job(2)).unwrap();
+    q.push(csd_job(3, 1)).unwrap();
+    q.push(job(4, false)).unwrap();
+    q.service(&g, &e, 0);
+    assert_eq!(q.phase(), Some(Phase::Bin));
+    assert!(!g.wrote(B::Hub, TFU_ICFG), "TFU waits for the CL job (one job in flight)");
+    // Early/stray completions of later queues must not retire anything out of order.
+    q.service(&g, &e, EV_TFU_DONE | INT_CSDDONE_71);
+    assert!(e.signalled.borrow().is_empty());
+    q.service(&g, &e, INT_FLDONE);
+    q.service(&g, &e, INT_FRDONE);
+    assert_eq!(q.phase(), Some(Phase::Tfu));
+    assert!(!g.wrote(B::Core, 0x930));
+    q.service(&g, &e, EV_TFU_DONE);
+    assert_eq!(q.phase(), Some(Phase::Csd));
+    q.service(&g, &e, INT_CSDDONE_71);
+    assert_eq!(q.phase(), Some(Phase::Render));
+    q.service(&g, &e, INT_FRDONE);
+    assert_eq!(*e.signalled.borrow(), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn tfu_csd_wait_for_deps() {
+    let (g, e, mut q) = (Gpu::new(), Env::new(), q());
+    let mut t = tfu_job(5);
+    t.bin_deps = vec![77];
+    q.push(t).unwrap();
+    q.service(&g, &e, 0);
+    assert_eq!(q.phase(), None);
+    assert!(!g.wrote(B::Hub, TFU_ICFG));
+    e.done.borrow_mut().insert(77);
+    q.tick(&g, &e);
+    assert_eq!(q.phase(), Some(Phase::Tfu));
+}
+
+#[test]
+fn csd_hang_check_uses_batch_counter_and_tfu_resets() {
+    let (g, e, mut q) = (Gpu::new(), Env::new(), q());
+    q.push(csd_job(1, 1)).unwrap();
+    q.service(&g, &e, 0);
+    g.set(1, CSD_CURRENT_CFG4, 5);
+    e.adv(HANG_TIMEOUT_NS + 1);
+    q.tick(&g, &e);
+    assert_eq!(q.stats.resets, 0, "batch counter moved: progress");
+    e.adv(HANG_TIMEOUT_NS + 1);
+    q.tick(&g, &e);
+    assert_eq!(q.stats.resets, 1, "no progress: reset");
+    assert_eq!(*e.signalled.borrow(), vec![1]);
+    q.push(tfu_job(2)).unwrap();
+    q.service(&g, &e, 0);
+    e.adv(HANG_TIMEOUT_NS + 1);
+    q.tick(&g, &e);
+    assert_eq!(q.stats.resets, 2);
+    assert!(!q.take_retired().unwrap().ok && !q.take_retired().unwrap().ok);
+}

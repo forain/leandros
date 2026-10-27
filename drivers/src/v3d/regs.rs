@@ -77,14 +77,18 @@ pub const TFU_CS: u32 = 0x0700;
 pub const TFU_ICFG: u32 = 0x0708;
 pub const TFU_ICFG_IOC: u32 = bit(0);
 pub const TFU_IIA: u32 = 0x070c;
-pub const TFU_IIS: u32 = 0x0710;
-pub const TFU_ICA: u32 = 0x0714;
+/// Linux v3d_regs.h (7.1): ICA (input chroma address) is 0x710, IIS (input image stride) 0x714.
+pub const TFU_ICA: u32 = 0x0710;
+pub const TFU_IIS: u32 = 0x0714;
 pub const TFU_IUA: u32 = 0x0718;
 /// 7.1 only.
 pub const TFU_IOC: u32 = 0x071c;
 pub const TFU_IOA: u32 = 0x0720;
 pub const TFU_IOS: u32 = 0x0724;
 pub const TFU_COEF0: u32 = 0x0728;
+pub const TFU_COEF1: u32 = 0x072c;
+pub const TFU_COEF2: u32 = 0x0730;
+pub const TFU_COEF3: u32 = 0x0734;
 
 pub const MMUC_CONTROL: u32 = 0x1000;
 pub const MMUC_CONTROL_ENABLE: u32 = bit(0);
@@ -180,6 +184,10 @@ pub const PTB_BPOS: u32 = 0x030c;
 pub const CSD_STATUS: u32 = 0x0900;
 pub const CSD_QUEUED_CFG0: u32 = 0x0930;
 pub const CSD_QUEUED_CFG7: u32 = 0x094c;
+/// `QUEUED_CFGn`, n = 0..=6 (CFG0 starts the dispatch).
+pub const fn csd_queued_cfg(n: u32) -> u32 { CSD_QUEUED_CFG0 + 4 * n }
+/// Batch counter the hang check watches (Linux `V3D_CSD_CURRENT_CFG4`, 7.1).
+pub const CSD_CURRENT_CFG4: u32 = 0x0968;
 
 // ── SMS (7.1 power/reset state machine). REE and TEE share the bit layout. ──
 pub const SMS_REE_CS: u32 = 0x0000;

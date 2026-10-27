@@ -4807,6 +4807,103 @@ fn v3d_real_submit_cl(arg: usize, open_id: u32) -> Result<usize, DriverError> {
     Ok(0)
 }
 
+/// Real V3D, phase D: in-sync handles -> fence ids (0 = already signalled, skipped).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+fn v3d_real_deps(hs: &[u32], open_id: u32) -> Result<Vec<u64>, DriverError> {
+    let mut v = Vec::with_capacity(hs.len());
+    for &h in hs {
+        match syncobj_fence(h, open_id) {
+            Some(0) => {}
+            Some(f) => v.push(f),
+            None => return Err(DriverError::NotFound),
+        }
+    }
+    Ok(v)
+}
+
+/// Real V3D, phase D: the common tail of SUBMIT_TFU / SUBMIT_CSD. Takes the BO references,
+/// queues the job (in order with bin/render, see `v3d::queue`), attaches the fence.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+fn v3d_real_enqueue(mut job: crate::v3d::queue::ClJob, plan: &crate::v3d::submit::SyncPlan,
+                    handles: &[u32], open_id: u32) -> Result<usize, DriverError> {
+    job.bin_deps = v3d_real_deps(&plan.bin_in, open_id)?;
+    for &h in plan.out.iter() {
+        if syncobj_fence(h, open_id).is_none() { return Err(DriverError::NotFound); }
+    }
+    let mut held = Vec::with_capacity(handles.len());
+    for &h in handles.iter() {
+        match v3d_bo_hold(h, open_id) {
+            Some(o) => held.push(o),
+            None if dumb_lookup(h).is_some() => {}
+            None => {
+                for &o in held.iter() { blob_unref(o, 0); }
+                return Err(DriverError::NotFound);
+            }
+        }
+    }
+    job.bos = held;
+    let t0 = sched::monotonic_ns();
+    let fence = loop {
+        match crate::v3d::submit::submit(job, &mut || v3d_alloc_fence_id()) {
+            Ok(f) => break f,
+            Err(j) => job = j,
+        }
+        v3d_real_reap();
+        let now = sched::monotonic_ns();
+        if now - t0 > 2_000_000_000 || sched::has_deliverable_signal() {
+            for &o in job.bos.iter() { blob_unref(o, 0); }
+            return Err(DriverError::Busy);
+        }
+        SYNCOBJ_WAITERS.fetch_add(1, Ordering::Relaxed);
+        syncobj_park(now + 1_000_000);
+        sched::block_on_poll_commit();
+        SYNCOBJ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    };
+    for &h in plan.out.iter() { syncobj_attach_fence(h, open_id, fence); }
+    for &h in handles.iter() { bo_attach_fence(h, open_id, fence); }
+    Ok(0)
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+fn v3d_submit_err(e: crate::v3d::submit::SubmitError) -> DriverError {
+    match e {
+        crate::v3d::submit::SubmitError::Inval => DriverError::InvalidParameter,
+        crate::v3d::submit::SubmitError::Fault => DriverError::Errno(14),
+    }
+}
+
+/// Real V3D SUBMIT_TFU (7.1 register block incl. `v71.ioc`), MULTI_SYNC or legacy syncs.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+fn v3d_real_submit_tfu(arg: usize, open_id: u32) -> Result<usize, DriverError> {
+    use crate::v3d::submit::{plan_syncs_single, TfuArgs, SUBMIT_TFU_SIZE};
+    v3d_real_reap();
+    if arg == 0 { return Err(DriverError::InvalidParameter); }
+    let a = TfuArgs::parse(&uread::<[u8; SUBMIT_TFU_SIZE]>(arg)?);
+    a.validate().map_err(v3d_submit_err)?;
+    let plan = plan_syncs_single(a.flags, a.extensions, a.in_sync, a.out_sync, &mut |p, buf| unsafe {
+        sched::uaccess::copy_from_user(buf.as_mut_ptr(), p as usize, buf.len()) == 0
+    }).map_err(v3d_submit_err)?;
+    let job = crate::v3d::queue::ClJob { kind: crate::v3d::queue::JobKind::Tfu(a.regs), ..Default::default() };
+    v3d_real_enqueue(job, &plan, &a.handles(), open_id)
+}
+
+/// Real V3D SUBMIT_CSD: dispatch + the cache clean (one job), MULTI_SYNC or legacy syncs.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+fn v3d_real_submit_csd(arg: usize, open_id: u32) -> Result<usize, DriverError> {
+    use crate::v3d::submit::{plan_syncs_single, CsdArgs, SUBMIT_CSD_SIZE};
+    v3d_real_reap();
+    if arg == 0 { return Err(DriverError::InvalidParameter); }
+    let a = CsdArgs::parse(&uread::<[u8; SUBMIT_CSD_SIZE]>(arg)?);
+    a.validate().map_err(v3d_submit_err)?;
+    if a.perfmon_id != 0 { return Err(DriverError::NotFound); }
+    let plan = plan_syncs_single(a.flags, a.extensions, a.in_sync, a.out_sync, &mut |p, buf| unsafe {
+        sched::uaccess::copy_from_user(buf.as_mut_ptr(), p as usize, buf.len()) == 0
+    }).map_err(v3d_submit_err)?;
+    let handles = if a.bo_handle_count == 0 { Vec::new() } else { syncobj_read_handles(a.bo_handles, a.bo_handle_count)? };
+    let job = crate::v3d::queue::ClJob { kind: crate::v3d::queue::JobKind::Csd(a.cfg), ..Default::default() };
+    v3d_real_enqueue(job, &plan, &handles, open_id)
+}
+
 // ── DRM page-flip event channel ──────────────────────────────────────────────
 // PAGE_FLIP-with-event completions are NOT delivered at submission: doing so
 // lets a compositor's render loop resubmit with zero delay and peg the CPU
@@ -10130,9 +10227,8 @@ impl DrmDeviceInterface {
             DRM_IOCTL_V3D_GET_BO_OFFSET => self.v3d_handle_get_bo_offset(arg, open_id),
             DRM_IOCTL_V3D_WAIT_BO => self.v3d_handle_wait_bo(arg, open_id),
             DRM_IOCTL_V3D_SUBMIT_CL => self.v3d_handle_submit_cl(arg, open_id),
-            DRM_IOCTL_V3D_SUBMIT_TFU
-            | DRM_IOCTL_V3D_SUBMIT_CSD
-            | DRM_IOCTL_V3D_SUBMIT_CPU
+            DRM_IOCTL_V3D_SUBMIT_TFU | DRM_IOCTL_V3D_SUBMIT_CSD => self.v3d_handle_submit_tfu_csd(cmd, arg, open_id),
+            DRM_IOCTL_V3D_SUBMIT_CPU
             | DRM_IOCTL_V3D_PERFMON_CREATE
             | DRM_IOCTL_V3D_PERFMON_DESTROY
             | DRM_IOCTL_V3D_PERFMON_GET_VALUES
@@ -10189,6 +10285,16 @@ impl DrmDeviceInterface {
     /// Logged once per code per boot, through the same `UNKNOWN_IOCTLS` note set
     /// the unimplemented-ioctl reporter uses, so a client that retries in a loop
     /// cannot flood the console.
+    /// SUBMIT_TFU / SUBMIT_CSD: the real Pi 5 queue (phase D) once it is up; ENOSYS on the stub.
+    fn v3d_handle_submit_tfu_csd(&mut self, cmd: u32, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+        if crate::v3d::submit::active() {
+            return if cmd == DRM_IOCTL_V3D_SUBMIT_TFU { v3d_real_submit_tfu(arg, open_id) } else { v3d_real_submit_csd(arg, open_id) };
+        }
+        let _ = (arg, open_id);
+        Self::v3d_enosys(cmd)
+    }
+
     fn v3d_enosys(cmd: u32) -> Result<usize, DriverError> {
         if UNKNOWN_IOCTLS.lock().first(cmd) {
             crate::pci::serial_debug("[DRM] v3d ioctl not implemented (ENOSYS) cmd=");
