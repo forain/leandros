@@ -111,10 +111,14 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         Ok(fd) => fd,
         Err(e) => { eprintln!("[btd] cannot listen on /run/bluetooth/btd.sock: errno {}", e); return 1; }
     };
-    // Any local user may drive Bluetooth, as with BlueZ's default D-Bus
-    // policy: the session's org.bluez shim (leandros-sysbus bluez) runs as
-    // the desktop user. /dev/hci0 and the link keys stay root-only.
-    sys::chmod(sock, 0o666);
+    // Members of the `bluetooth` group may drive Bluetooth (pair, connect):
+    // the session's org.bluez shim (leandros-sysbus bluez) runs as the
+    // desktop user, who is a member. Everyone else is refused at connect().
+    // /dev/hci0 and the link keys stay root-only.
+    if let Err(e) = sys::chown(sock, 0, sys::GID_BLUETOOTH) {
+        eprintln!("[btd] chown btd.sock root:bluetooth failed: errno {} (socket stays root-only)", e);
+    }
+    sys::chmod(sock, 0o660);
     match dev_fd {
         Some(fd) => eprintln!("[btd] controller on fd {}, initialising", fd),
         None => eprintln!("[btd] controller {} open, initialising", shown),

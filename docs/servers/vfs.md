@@ -10,7 +10,7 @@
 | open file descriptions | [`ofd.rs`](../../servers/vfs/src/ofd.rs) | the identity shared by `dup`/`fork`/SCM_RIGHTS copies; what epoll keys by |
 | path resolution | [`kernel/src/syscall.rs`](../../kernel/src/syscall.rs) (`resolve_user_path`, `resolve_at_path`) plus each backend's walk | one kernel resolver for every path syscall; symlinks and permissions in the backend |
 | mount routing | `MOUNTS`, `find_mount_port` | up to 8 mount servers (f2fs at `/` and `/data`) |
-| tmpfs | `TMP_FILES`, `TMP_VMOS`, `TMP_OFDS` | `/tmp`, `/dev/shm`, `/run/user`; page-granular, budget = half of RAM |
+| tmpfs | `TMP_FILES`, `TMP_VMOS`, `TMP_OFDS` | `/tmp`, `/dev/shm`, `/run/user`, `/run`; page-granular, budget = half of RAM |
 | shared memory | memfd + tmpfs VMO promotion | `wl_shm` pools are shared memfd mappings |
 | pipes | `PIPE_RINGS` | 128 rings of 16 KiB, endpoint-refcounted |
 | `/proc` | `gen_proc_*` | synthesised into ephemeral snapshots at open time |
@@ -53,7 +53,7 @@ Symlink following and **permission checks happen in the backend's walk**, which 
 
 After resolution the VFS picks a backend in a fixed order (`should_lookup_ramfs`, then `find_mount_port`):
 
-1. Intercepted namespaces: `/dev/…`, `/proc/…`, `/tmp/…`, `/etc/…`, `/run/user…` and `/sys/class/block/…`. These are answered by the VFS itself — tmpfs, device nodes, synthesised files, or static RamFS entries.
+1. Intercepted namespaces: `/dev/…`, `/proc/…`, `/tmp/…`, `/etc/…`, `/run` and `/run/…` and `/sys/class/block/…`. These are answered by the VFS itself — tmpfs, device nodes, synthesised files, or static RamFS entries.
 2. Everything else goes to the mount table. After `init` pivots the f2fs root onto `/`, `find_mount_port` matches every absolute path, which is exactly why the intercepts must run first.
 
 Static RamFS entries **shadow** same-path files on the mounted root. The built-in `/etc/passwd` and `/etc/group` were removed for that reason once real ones were seeded on disk; `/etc/motd`, `/etc/hostname`, `/etc/hosts`, `/etc/resolv.conf` (rewritten by the DHCP client via `set_dhcp_dns`), `/etc/services`, `/etc/protocols`, `/etc/nsswitch.conf` and `/etc/os-release` still come from RamFS.
@@ -78,11 +78,11 @@ tmpfs keeps its **file offset** per description too (`TMP_OFDS`). It used to liv
 
 ### tmpfs
 
-The tmpfs roots are `/tmp`, `/dev/shm` and `/run/user` (`TMPFS_ROOTS`). `/run/user` is the root rather than `/run/user/0`, so each `/run/user/<uid>` is an ordinary pool directory with its own owner and mode `0700`; the VFS seeds `/run/user/0` at boot and `init` seeds one per passwd account (see [security.md](security.md)). `/tmp` and `/dev/shm` are `1777`, `/run/user` is `0755 root`, and since creation is now permission-checked these modes are load-bearing.
+The tmpfs roots are `/tmp`, `/dev/shm`, `/run/user` and `/run` (`TMPFS_ROOTS`). `/run` is a tmpfs as on Linux: everything under it (pid and lock files, `/run/cosmic-greeter`, `/run/bluetooth`) is recreated at boot by the service that owns it, and the root volume's own `/run` directory is shadowed. `/run/user` stays a separate root nested in it (listed before `/run`, since the first matching root owns a path). `/run/user` is the root rather than `/run/user/0`, so each `/run/user/<uid>` is an ordinary pool directory with its own owner and mode `0700`; the VFS seeds `/run/user/0` at boot and `init` seeds one per passwd account (see [security.md](security.md)). `/tmp` and `/dev/shm` are `1777`, `/run` and `/run/user` are `0755 root`, and since creation is now permission-checked these modes are load-bearing.
 
 - **Storage.** Regular-file bytes live in the inode's `TmpVmo`: a lazily-grown, page-granular frame list where a missing page is a hole. There is no per-file inline buffer any more; the old one capped every tmpfs file at 32 KiB and silently cut logs. Budget: `TMP_PAGES_USED` against half of physical memory (`ENOSPC`), 16 GiB per file (`EFBIG`), up to 512 entries (`MAX_TMP_FILES`).
 - **Semantics.** Sparse files, `SEEK_DATA`/`SEEK_HOLE`, real `st_blocks`, `statfs` from the budget, `truncate`/`ftruncate`/`O_TRUNC` through one `tmp_set_size` (frees and zeroes the tail, honours `F_SEAL_SHRINK`), reads of up to 1 MiB per call, `fallocate` modes 0, `KEEP_SIZE` and `PUNCH_HOLE|KEEP_SIZE`, `atime` under Linux's `relatime` rule, full `atime`/`mtime`/`ctime`, xattrs in a 2 KiB per-inode arena.
-- **AF_UNIX sockets bind only here.** A pathname `bind` creates an `S_IFSOCK` pool entry tagged with the net server's socket id (`unix_bind_node`), and `connect` resolves the path back through the same walk. f2fs has no `S_IFSOCK`, so a bind anywhere under `/` or `/data` returns `EOPNOTSUPP`. The socket-capable places are `/tmp`, `/dev/shm` and `/run/user` — worth knowing before pointing a daemon that hardcodes `/run` at this system; greetd's control socket and init's `/run/user/initctl` both live under `/run/user` for this reason.
+- **AF_UNIX sockets bind only here.** A pathname `bind` creates an `S_IFSOCK` pool entry tagged with the net server's socket id (`unix_bind_node`), and `connect` resolves the path back through the same walk. f2fs has no `S_IFSOCK`, so a bind anywhere under `/` or `/data` returns `EOPNOTSUPP`. The socket-capable places are `/tmp`, `/dev/shm`, `/run` and `/run/user` (btd listens on `/run/bluetooth/btd.sock`). Binding on f2fs would need an `S_IFSOCK` inode type in the f2fs server plus a VFS map from (dev, ino) to the live socket id; Linux allows it, nothing here needs it yet.
 
 ### Shared memory, memfd and `wl_shm`
 

@@ -54,8 +54,19 @@ pub(crate) fn log(service: &str, msg: std::fmt::Arguments<'_>) {
     eprintln!("leandros-sysbus[{service}]: {msg}");
 }
 
+/// Every subcommand this binary implements (bus services and clients), as a
+/// marker the image build reads out of the staged binary
+/// (scripts/mkfs-f2fs-populated.py) and compares with THIS line in the tree
+/// being packed: any difference means the staged binary was built from
+/// another tree and mkfs refuses the image. ~/code/leandros-artifacts is
+/// shared by every worktree, so a sysbus rebuilt by a lane on an older tree
+/// would otherwise silently drop e.g. `bluez` or `power`. Add every new
+/// subcommand here.
+const SERVICES: &str = "leandros-sysbus-services:login1,locale1,upower,power-profiles,polkit,rtkit,networkmanager,bluez,bluez-test,probe,power,portal;";
+
 fn usage() -> ExitCode {
     eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|networkmanager|bluez|bluez-test|probe|power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>|portal [settings|screenshot|open-file|all] [timeout_s]>");
+    eprintln!("{SERVICES}");
     ExitCode::from(2)
 }
 
