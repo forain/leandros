@@ -1229,6 +1229,14 @@ def main():
                 m4_share_files.append(("/lib/firmware/brcm", _f, os.path.join(_brc_cache, _f)))
             if _brc:
                 print(f"  brcmfmac firmware: {len(_brc)} files in /lib/firmware/brcm")
+        # Pi 5 Bluetooth patch (BCM4345C0.hcd) from ports/bluez-firmware/fetch.sh's
+        # cache ($BTFW_CACHE, default ~/.cache/leandros/bluez-firmware). Absent -> skipped.
+        _bt_cache = os.path.expanduser(os.environ.get("BTFW_CACHE", "~/.cache/leandros/bluez-firmware"))
+        _bt_hcd = os.path.join(_bt_cache, "BCM4345C0.hcd")
+        if os.path.isfile(_bt_hcd):
+            m4_share_dirs.update(("/lib/firmware", "/lib/firmware/brcm"))
+            m4_share_files.append(("/lib/firmware/brcm", "BCM4345C0.hcd", _bt_hcd))
+            print("  Bluetooth firmware: /lib/firmware/brcm/BCM4345C0.hcd")
     _wifi_conf = os.environ.get("LEANDROS_WIFI_CONF")
     if _wifi_conf and os.path.isfile(os.path.expanduser(_wifi_conf)):
         m4_share_dirs.add("/etc/leandros")

@@ -260,6 +260,18 @@ populate_f2fs_root() {
             || info "WARNING: ports/brcmfmac/fetch.sh failed; the card will lack /lib/firmware/brcm"
     fi
     export BRCMFMAC_CACHE="$brc_cache"
+    # Bluetooth patch firmware (BCM4345C0.hcd, pinned) -> /lib/firmware/brcm/.
+    local bt_cache
+    if [[ -n "$cache_owner" ]]; then
+        bt_cache="${BTFW_CACHE:-$(eval echo "~$cache_owner")/.cache/leandros/bluez-firmware}"
+        sudo -u "$cache_owner" env BTFW_CACHE="$bt_cache" "$REPO_ROOT/ports/bluez-firmware/fetch.sh" >/dev/null \
+            || info "WARNING: ports/bluez-firmware/fetch.sh failed; the card will lack BCM4345C0.hcd"
+    else
+        bt_cache="${BTFW_CACHE:-$HOME/.cache/leandros/bluez-firmware}"
+        BTFW_CACHE="$bt_cache" "$REPO_ROOT/ports/bluez-firmware/fetch.sh" >/dev/null \
+            || info "WARNING: ports/bluez-firmware/fetch.sh failed; the card will lack BCM4345C0.hcd"
+    fi
+    export BTFW_CACHE="$bt_cache"
 
     # Wi-Fi credentials: ssid= from the psk file's basename, psk= from its first line.
     # Written to a 0600 temp file that only mkfs reads; nothing is echoed.
