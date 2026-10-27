@@ -115,6 +115,9 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     sched::register_timer_dequeue_hook(tty_server::timer_dequeued);
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
+    // SD-card boards: `sdhci.multi=1` / `sdhci.multitest=1` before the probe.
+    #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
+    drivers::sdhci::configure(crate::boot_cmdline().unwrap_or(""));
     drivers::blkdev::init();
     // Raspberry Pi 5: ACT LED on SD I/O and the power button (KEY_POWER);
     // BCM2712 GPIO only, no PCIe. `pi5.board=0` disables it.
