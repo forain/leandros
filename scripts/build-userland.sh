@@ -37,7 +37,7 @@ fi
 # pthread/timer syscalls) rather than the minimal leandros-libc, and so need
 # the custom leandros target JSON + build-std instead of the bare
 # *-unknown-none target the rest of userland uses.
-RELIBC_LINKED=(pthreadtest timertest sigtest polltest fdmaxtest ptytest forktest shmtest racetest ping waittest sigchldtest sigtest2 jobtest exectest epolltest wakepolltest smpwaketest idletest drmsmoke gpuqtest evtest2 evsplit vttest venustest uptrtest i915test strtest)
+RELIBC_LINKED=(pthreadtest timertest sigtest polltest fdmaxtest ptytest forktest shmtest racetest ping waittest sigchldtest sigtest2 jobtest exectest epolltest wakepolltest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest)
 
 EXCLUDE_ARGS=()
 for prog in "${RELIBC_LINKED[@]}"; do
@@ -134,6 +134,9 @@ if command -v zig >/dev/null 2>&1; then
     # syscalltest: splice/tee/vmsplice, rseq and pidfd (checked against a host kernel).
     echo "[userland] Building syscalltest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/syscalltest" userland/syscalltest/syscalltest.c
+    # uaccesstest: read(2)/write(2) on never-touched user pages (console, pipe, file, socket, pty).
+    echo "[userland] Building uaccesstest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/uaccesstest" userland/uaccesstest/uaccesstest.c
     # proctest: rusage/faults, /proc links, clone3/pdeathsig/CLONE_FS (checked against a host kernel).
     echo "[userland] Building proctest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/proctest" userland/proctest/proctest.c

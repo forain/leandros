@@ -3376,6 +3376,9 @@ pub mod poll_class {
     /// `PIPE` is the read end (data, EOF). Separate so a drain never wakes
     /// the reader and a write never wakes a parked writer.
     pub const PIPE_WR: u32 = 24;
+    /// The raw HCI node /dev/hci0 (drivers/src/bt/hcidev): a packet queued
+    /// for the reader, TX room, or the controller died.
+    pub const BT: u32 = 25;
 }
 
 /// Bumped by every producer whose object's poll tag itself changes (a

@@ -336,3 +336,128 @@ fn fdt_local_bd_address_found_and_zero_ignored() {
     assert_eq!(bringup::fdt_local_bd_address(&fdt([0; 6])), None);
     assert_eq!(bringup::fdt_local_bd_address(&[0u8; 64]), None);
 }
+
+// ── /dev/hci0 queues + pump (lane pibt-hci0) ────────────────────────────────
+
+mod hci0 {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    use crate::bringup::Transport;
+    use crate::h4::H4Parser;
+    use crate::hcidev_core::*;
+
+    struct Cell(RefCell<HciQueues>);
+    impl QueueLock for Cell {
+        fn with<R>(&self, f: impl FnOnce(&mut HciQueues) -> R) -> R { f(&mut self.0.borrow_mut()) }
+    }
+    fn opened() -> Cell { let c = Cell(RefCell::new(HciQueues::new())); c.0.borrow_mut().open(); c }
+
+    /// Fake H4 controller: answers every command with Command Complete
+    /// (status 0) for its opcode; `alive = false` refuses bytes.
+    struct FakeCtl { rx: VecDeque<u8>, sent: Vec<Vec<u8>>, alive: bool }
+    impl FakeCtl { fn new() -> Self { Self { rx: VecDeque::new(), sent: Vec::new(), alive: true } } }
+    impl Transport for FakeCtl {
+        fn send(&mut self, b: &[u8]) -> bool {
+            if !self.alive { return false; }
+            self.sent.push(b.to_vec());
+            if b[0] == 0x01 {
+                self.rx.extend([0x04, 0x0e, 0x04, 0x01, b[1], b[2], 0x00]);
+            }
+            true
+        }
+        fn recv(&mut self, _t: u32) -> Option<u8> { self.rx.pop_front() }
+        fn set_baud(&mut self, _b: u32) -> bool { true }
+        fn sleep_ms(&mut self, _ms: u32) {}
+    }
+
+    const RESET: [u8; 4] = [0x01, 0x03, 0x0c, 0x00];
+    const RESET_CC: [u8; 7] = [0x04, 0x0e, 0x04, 0x01, 0x03, 0x0c, 0x00];
+
+    #[test]
+    fn reset_loopback_through_node_with_poll_readiness() {
+        let q = opened();
+        let (mut ctl, mut p) = (FakeCtl::new(), H4Parser::new());
+        assert_eq!(q.with(|q| q.poll_mask()), POLLOUT, "idle: writable, nothing to read");
+        assert_eq!(q.with(|q| q.read(4096)), Err(EAGAIN));
+        assert_eq!(q.with(|q| q.write(&RESET)), Ok(4));
+        let out = pump_once(&q, &mut ctl, &mut p, 1000, 4096);
+        assert_eq!((out.sent, out.received, out.changed()), (1, 1, true));
+        assert_eq!(ctl.sent, vec![RESET.to_vec()]);
+        assert_eq!(q.with(|q| q.poll_mask()), POLLIN | POLLOUT);
+        assert_eq!(q.with(|q| q.read(4096)), Ok(RESET_CC.to_vec()), "one whole packet, type byte first");
+        assert_eq!(q.with(|q| q.poll_mask()), POLLOUT);
+        assert!(!pump_once(&q, &mut ctl, &mut p, 1000, 4096).changed());
+    }
+
+    #[test]
+    fn read_too_small_is_emsgsize_and_keeps_packet() {
+        let q = opened();
+        q.with(|q| q.push_rx(RESET_CC.to_vec()));
+        assert_eq!(q.with(|q| q.read(6)), Err(EMSGSIZE));
+        assert_eq!(q.with(|q| q.read(7)), Ok(RESET_CC.to_vec()));
+    }
+
+    #[test]
+    fn two_packets_are_two_reads() {
+        let q = opened();
+        let (mut ctl, mut p) = (FakeCtl::new(), H4Parser::new());
+        q.with(|q| { q.write(&RESET).unwrap(); q.write(&[0x01, 0x01, 0x10, 0x00]).unwrap(); });
+        assert_eq!(pump_once(&q, &mut ctl, &mut p, 1000, 4096).received, 2);
+        assert_eq!(q.with(|q| q.read(4096)), Ok(RESET_CC.to_vec()));
+        assert_eq!(q.with(|q| q.read(4096)).unwrap()[4..6], [0x01, 0x10]);
+        assert_eq!(q.with(|q| q.read(4096)), Err(EAGAIN));
+    }
+
+    #[test]
+    fn write_validation() {
+        assert_eq!(validate_h4_write(&RESET), Ok(()));
+        assert_eq!(validate_h4_write(&[0x01, 0x03, 0x0c, 0x01, 0xaa]), Ok(()));
+        assert_eq!(validate_h4_write(&[0x01, 0x03, 0x0c, 0x01]), Err(EINVAL), "short params");
+        assert_eq!(validate_h4_write(&[0x01, 0x03, 0x0c, 0x00, 0x00]), Err(EINVAL), "trailing byte (two packets)");
+        assert_eq!(validate_h4_write(&[0x02, 0x01, 0x20, 0x02, 0x00, 1, 2]), Ok(()));
+        assert_eq!(validate_h4_write(&[0x02, 0x01, 0x20, 0x02]), Err(EINVAL));
+        assert_eq!(validate_h4_write(&[0x03, 0x01, 0x00, 0x01, 9]), Ok(()));
+        assert_eq!(validate_h4_write(&[0x04, 0x0e, 0x00]), Err(EINVAL), "events are not host->controller");
+        assert_eq!(validate_h4_write(&[]), Err(EINVAL));
+    }
+
+    #[test]
+    fn tx_full_is_eagain_and_clears_pollout() {
+        let q = opened();
+        for _ in 0..TX_CAP { assert_eq!(q.with(|q| q.write(&RESET)), Ok(4)); }
+        assert_eq!(q.with(|q| q.write(&RESET)), Err(EAGAIN));
+        assert_eq!(q.with(|q| q.poll_mask()) & POLLOUT, 0);
+        pump_once(&q, &mut FakeCtl::new(), &mut H4Parser::new(), 0, 0);
+        assert_ne!(q.with(|q| q.poll_mask()) & POLLOUT, 0);
+    }
+
+    #[test]
+    fn rx_overflow_drops_newest_and_counts() {
+        let q = opened();
+        for i in 0..RX_CAP + 3 { q.with(|q| q.push_rx(vec![0x04, 0xff, 0x01, i as u8])); }
+        q.with(|q| { assert_eq!(q.rx_len(), RX_CAP); assert_eq!(q.rx_drops, 3); });
+        assert_eq!(q.with(|q| q.read(4096)).unwrap()[3], 0, "oldest kept");
+    }
+
+    #[test]
+    fn closed_node_discards_and_reopen_is_clean() {
+        let q = Cell(RefCell::new(HciQueues::new()));
+        assert!(!q.with(|q| q.push_rx(RESET_CC.to_vec())));
+        q.with(|q| { q.open(); q.push_rx(RESET_CC.to_vec()); q.write(&RESET).unwrap(); q.close(); q.open(); });
+        assert_eq!(q.with(|q| q.read(4096)), Err(EAGAIN));
+        assert!(q.with(|q| q.pop_tx()).is_none());
+    }
+
+    #[test]
+    fn dead_controller_is_hup_err_then_eio() {
+        let q = opened();
+        q.with(|q| { q.push_rx(RESET_CC.to_vec()); q.write(&RESET).unwrap(); });
+        let mut ctl = FakeCtl::new(); ctl.alive = false;
+        assert!(pump_once(&q, &mut ctl, &mut H4Parser::new(), 0, 16).died);
+        assert_eq!(q.with(|q| q.poll_mask()), POLLIN | POLLHUP | POLLERR);
+        assert_eq!(q.with(|q| q.write(&RESET)), Err(EIO));
+        assert_eq!(q.with(|q| q.read(4096)), Ok(RESET_CC.to_vec()), "queued packets still drain");
+        assert_eq!(q.with(|q| q.read(4096)), Err(EIO));
+    }
+}
