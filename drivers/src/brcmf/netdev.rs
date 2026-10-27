@@ -259,6 +259,7 @@ pub fn info_lines(out: &mut String) {
     let _ = writeln!(out, "rx: {} frames, {} dropped", RX_N.load(Ordering::Relaxed), RX_DROP.load(Ordering::Relaxed));
     let _ = writeln!(out, "tx: {} frames, {} dropped", TX_N.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed));
     let _ = writeln!(out, "bus errors: {}", BUS_ERR.load(Ordering::Relaxed));
+    let _ = writeln!(out, "{}", datapath_line());
     let _ = writeln!(out, "stage: {}", *STAGE.lock());
     let e = LAST_ERR.lock();
     let _ = writeln!(out, "last_error: {}", if e.is_empty() { "none" } else { e.as_str() });
@@ -280,6 +281,66 @@ pub fn info_lines(out: &mut String) {
     if RUNNING.load(Ordering::Acquire) { MGR.info_lines(out); }
     let _ = writeln!(out, "log (last {} [brcmf] lines):", LOG_KEEP);
     for l in LOG_RING.lock().iter() { let _ = writeln!(out, "  {}", l); }
+}
+
+// ── data-path diagnostics ──────────────────────────────────────────────────
+// Where the manager kthread is in `service()` and how long its slowest bus
+// operation took: /proc/net/nic `datapath:` and one `[brcmf] data path slow`
+// line for any single operation over SLOW_OP_MS.
+
+const TX_BURST: usize = 16;
+const SLOW_OP_MS: u64 = 500;
+static TX_ERR: AtomicU32 = AtomicU32::new(0);
+static DP_STAGE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static DP_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+static DP_MAX_MS: AtomicU64 = AtomicU64::new(0);
+static DP_SLOW: AtomicU32 = AtomicU32::new(0);
+static DP_SLOW_LOGGED_MS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
+enum DpStage { Idle = 0, Tx = 1, Poll = 2, Rx = 3, Sleep = 4, Ctl = 5 }
+
+fn dp_stage_name(v: u8) -> &'static str {
+    match v { 1 => "tx", 2 => "poll", 3 => "rx", 4 => "sleep", 5 => "ctl", _ => "idle" }
+}
+
+fn dp_enter(s: DpStage) -> u64 {
+    let t = now_ms();
+    DP_SINCE_MS.store(t, Ordering::Relaxed);
+    DP_STAGE.store(s as u8, Ordering::Relaxed);
+    t
+}
+
+fn dp_leave(s: DpStage, t0: u64) {
+    let now = now_ms();
+    let dt = now.saturating_sub(t0);
+    DP_MAX_MS.fetch_max(dt, Ordering::Relaxed);
+    if dt >= SLOW_OP_MS {
+        DP_SLOW.fetch_add(1, Ordering::Relaxed);
+        let last = DP_SLOW_LOGGED_MS.load(Ordering::Relaxed);
+        if last == 0 || now.saturating_sub(last) >= 5_000 {
+            DP_SLOW_LOGGED_MS.store(now, Ordering::Relaxed);
+            log(&alloc::format!("data path slow: {} took {} ms ({})", dp_stage_name(s as u8), dt, dp_counters()));
+        }
+    }
+    DP_STAGE.store(DpStage::Idle as u8, Ordering::Relaxed);
+}
+
+fn dp_counters() -> String {
+    use crate::brcmf::bcdc::dp;
+    let w = dp::WINDOW.load(Ordering::Relaxed);
+    alloc::format!("tx {} drop {} err {} rx {} credit_waits {} credit_timeouts {} ctl_timeouts {} max_wait_us {} seq {} max {} fc {:#x}{} slow {} max_op_ms {}",
+        TX_N.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed), TX_ERR.load(Ordering::Relaxed), RX_N.load(Ordering::Relaxed),
+        dp::CREDIT_WAITS.load(Ordering::Relaxed), dp::CREDIT_TIMEOUTS.load(Ordering::Relaxed), dp::CTL_TIMEOUTS.load(Ordering::Relaxed),
+        dp::MAX_WAIT_US.load(Ordering::Relaxed), w & 0xff, (w >> 8) & 0xff, (w >> 16) & 0xff, if w >> 24 != 0 { " fcstate" } else { "" },
+        DP_SLOW.load(Ordering::Relaxed), DP_MAX_MS.load(Ordering::Relaxed))
+}
+
+fn datapath_line() -> String {
+    let st = DP_STAGE.load(Ordering::Relaxed);
+    let age = if st == DpStage::Idle as u8 || st == DpStage::Sleep as u8 { 0 } else { now_ms().saturating_sub(DP_SINCE_MS.load(Ordering::Relaxed)) };
+    alloc::format!("datapath: stage {} for {} ms; {}", dp_stage_name(st), age, dp_counters())
 }
 
 fn set_link(up: bool) {
@@ -443,13 +504,33 @@ impl<F: Fwil> BrcmfRadio<F> {
     fn service(&mut self, ms: u64) -> Option<Fail> {
         let t0 = sched::monotonic_ns() / 1_000_000;
         loop {
+            // The kthread runs with IRQs masked and is preempted only where it
+            // parks: under steady traffic the msleep below never runs, so let
+            // interrupts (UART, timer, IPIs) in on every pass.
+            sched::kthread::cond_resched();
             self.check_ctl();
             if self.retry.is_some() { return None; }
-            while let Some(f) = { let x = TXQ.lock().pop_front(); x } {
-                if self.dev.tx(&f).is_ok() { TX_N.fetch_add(1, Ordering::Relaxed); } else { TX_DROP.fetch_add(1, Ordering::Relaxed); }
+            // At most TX_BURST frames per pass: a TXQ that the net stack
+            // refills as fast as frames fail must not pin this loop.
+            let mut burst = 0;
+            while burst < TX_BURST {
+                let Some(f) = ({ let x = TXQ.lock().pop_front(); x }) else { break };
+                burst += 1;
+                let t = dp_enter(DpStage::Tx);
+                match self.dev.tx(&f) {
+                    Ok(()) => { TX_N.fetch_add(1, Ordering::Relaxed); }
+                    Err(e) => {
+                        TX_DROP.fetch_add(1, Ordering::Relaxed);
+                        if TX_ERR.fetch_add(1, Ordering::Relaxed) == 0 { log(&alloc::format!("data tx failed: {:?} ({})", e, dp_counters())); }
+                    }
+                }
+                dp_leave(DpStage::Tx, t);
             }
             let before = self.dev.rx.events + self.dev.rx.rx_frames;
-            match self.dev.poll_link(2_000) {
+            let t = dp_enter(DpStage::Poll);
+            let polled = self.dev.poll_link(2_000);
+            dp_leave(DpStage::Poll, t);
+            match polled {
                 Ok(Some(d)) => { set_link(false); return Some(down_fail(d)); }
                 Ok(None) => self.bus_errs = 0,
                 Err(e) => {
@@ -471,10 +552,11 @@ impl<F: Fwil> BrcmfRadio<F> {
                 q.push_back(f);
                 got = true;
             }
-            if got { crate::netdev::kick(); }
+            if got { DP_STAGE.store(DpStage::Rx as u8, Ordering::Relaxed); crate::netdev::kick(); }
             let now = sched::monotonic_ns() / 1_000_000;
             if now.saturating_sub(t0) >= ms { return None; }
             if self.dev.rx.events + self.dev.rx.rx_frames == before && TXQ.lock().is_empty() {
+                DP_STAGE.store(DpStage::Sleep as u8, Ordering::Relaxed);
                 sched::kthread::msleep(1);
             }
         }
@@ -562,10 +644,17 @@ impl<F: Fwil> Radio for BrcmfRadio<F> {
         self.dev.set_radio(on).is_ok()
     }
 
-    fn signal(&mut self) -> Option<i8> { self.dev.rssi() }
+    fn signal(&mut self) -> Option<i8> {
+        let t = dp_enter(DpStage::Ctl);
+        let r = self.dev.rssi();
+        dp_leave(DpStage::Ctl, t);
+        r
+    }
 
     fn tx_rate_kbps(&mut self) -> u32 {
+        let t = dp_enter(DpStage::Ctl);
         let k = self.dev.rate_kbps();
+        dp_leave(DpStage::Ctl, t);
         RATE_MBPS.store(k / 1000, Ordering::Relaxed);
         k
     }
