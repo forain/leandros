@@ -150,6 +150,16 @@ fn handle_irq(frame: *mut UserFrame) {
         sched::pcsample::sample(f.elr_el1, f.spsr_el1 & 0xf == 0);
     }
 
+    // Wedge trail (rpi5 default, wedge=1 elsewhere): last INTID / count / PC
+    // per CPU, and mask an SPI that storms.
+    let storm = sched::wedge::enabled() && irq_id != super::gic::SPURIOUS && {
+        let f = unsafe { &*frame };
+        let now: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) now, options(nomem, nostack)); }
+        let cpu = unsafe { super::smp::arch_cpu_id() };
+        sched::wedge::irq_note(cpu, irq_id, f.elr_el1, now, super::timer::freq())
+    };
+
     sched::irqctx::irq_enter();
     // Evaluate both: an INTID must never be in both tables (the line table's
     // storm guard only sees its own sharers' verdicts; shared PCI INTx lines
@@ -171,6 +181,7 @@ fn handle_irq(frame: *mut UserFrame) {
         super::gic::disable_spi(irq_id);
     }
 
+    if storm { super::gic::disable_spi(irq_id); }
     super::gic::eoi(iar);
     sched::irqctx::irq_exit();
     sched::preempt_check();

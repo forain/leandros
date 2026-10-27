@@ -119,6 +119,15 @@ pub fn init(cmdline: &str) {
         return;
     }
     *COUNTRY.lock() = cfg::country_from_cmdline(cmdline);
+    if let Some(v) = cmdline_val(cmdline, "brcmf.dp") {
+        match cfg::parse_dp(&alloc::format!("dp {}", v.replace(',', " "))) {
+            Some((m, y)) => apply_dp(m, y, "cmdline"),
+            None => log(&alloc::format!("brcmf.dp={}: expected on|off|rx[,yield]", v)),
+        }
+    }
+    sched::wedge::set_namer(sched::wedge::SLOT_BRCMF, |c| dp_stage_name(c as u8));
+    sched::wedge::set_namer(sched::wedge::SLOT_NET, |c| match c { 1 => "netd-recv", 2 => "netd-send", _ => "idle" });
+    sched::wedge::set_namer(sched::wedge::SLOT_SDIO, |c| match c { 1 => "cmd", 2 => "cmd53-data", _ => "idle" });
     crate::wifi_mgr::set_knobs(cmdline);
     MGR.set_caps(CAPS);
     PRESENT.store(true, Ordering::Release);
@@ -229,14 +238,34 @@ fn legacy_fallback() -> Vec<netctl_abi::profiles::Profile> {
 
 pub fn send_packet(frame: &[u8]) -> bool {
     if !LINK_UP.load(Ordering::Acquire) { TX_DROP.fetch_add(1, Ordering::Relaxed); return false; }
-    let mut q = TXQ.lock();
-    if q.len() >= TXQ_MAX { TX_DROP.fetch_add(1, Ordering::Relaxed); return false; }
-    q.push_back(frame.to_vec());
-    true
+    if DP_MODE.load(Ordering::Relaxed) == cfg::DP_RX { DP_RX_DROPS.fetch_add(1, Ordering::Relaxed); return true; }
+    sched::wedge::mark(sched::wedge::SLOT_NET, 2, frame.len() as u64);
+    let ok = {
+        let mut q = TXQ.lock();
+        if q.len() >= TXQ_MAX { TX_DROP.fetch_add(1, Ordering::Relaxed); false } else { q.push_back(frame.to_vec()); true }
+    };
+    sched::wedge::mark(sched::wedge::SLOT_NET, 0, 0);
+    ok
+}
+
+// ── dp knob (lane piwedge): `dp on|off|rx [yield|noyield]` in /etc/brcmf.ctl
+// or brcmf.dp=off[,yield] on the command line. See cfg::parse_dp.
+static DP_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(cfg::DP_ON);
+static DP_YIELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Association up but the carrier is being held down by dp=off.
+static CARRIER_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DP_RX_DROPS: AtomicU64 = AtomicU64::new(0);
+static DP_HELD_RX: AtomicU64 = AtomicU64::new(0);
+
+fn apply_dp(m: Option<u8>, y: Option<bool>, from: &str) {
+    if let Some(m) = m { DP_MODE.store(m, Ordering::Relaxed); }
+    if let Some(y) = y { DP_YIELD.store(y, Ordering::Relaxed); }
+    log(&alloc::format!("dp={} yield={} ({})", cfg::dp_mode_name(DP_MODE.load(Ordering::Relaxed)),
+        if DP_YIELD.load(Ordering::Relaxed) { 1 } else { 0 }, from));
 }
 pub fn tx_ready() -> bool { TXQ.lock().len() < TXQ_MAX * 3 / 4 }
 pub fn poll_receive(buf: &mut [u8]) -> Option<usize> {
-    let f = RXQ.lock().pop_front()?;
+    let f = { sched::wedge::mark(sched::wedge::SLOT_NET, 1, 0); let x = RXQ.lock().pop_front(); sched::wedge::mark(sched::wedge::SLOT_NET, 0, 0); x }?;
     let n = f.len().min(buf.len());
     buf[..n].copy_from_slice(&f[..n]);
     Some(n)
@@ -307,12 +336,14 @@ fn dp_stage_name(v: u8) -> &'static str {
 
 fn dp_enter(s: DpStage) -> u64 {
     let t = now_ms();
+    sched::wedge::mark(sched::wedge::SLOT_BRCMF, s as u32, 0);
     DP_SINCE_MS.store(t, Ordering::Relaxed);
     DP_STAGE.store(s as u8, Ordering::Relaxed);
     t
 }
 
 fn dp_leave(s: DpStage, t0: u64) {
+    sched::wedge::mark(sched::wedge::SLOT_BRCMF, 0, 0);
     let now = now_ms();
     let dt = now.saturating_sub(t0);
     DP_MAX_MS.fetch_max(dt, Ordering::Relaxed);
@@ -340,10 +371,17 @@ fn dp_counters() -> String {
 fn datapath_line() -> String {
     let st = DP_STAGE.load(Ordering::Relaxed);
     let age = if st == DpStage::Idle as u8 || st == DpStage::Sleep as u8 { 0 } else { now_ms().saturating_sub(DP_SINCE_MS.load(Ordering::Relaxed)) };
-    alloc::format!("datapath: stage {} for {} ms; {}", dp_stage_name(st), age, dp_counters())
+    alloc::format!("datapath: stage {} for {} ms; dp={} yield={} held={} rx_dropped_held {} tx_dropped_rx {}; {}", dp_stage_name(st), age,
+        cfg::dp_mode_name(DP_MODE.load(Ordering::Relaxed)), DP_YIELD.load(Ordering::Relaxed) as u8,
+        CARRIER_HELD.load(Ordering::Relaxed) as u8, DP_HELD_RX.load(Ordering::Relaxed), DP_RX_DROPS.load(Ordering::Relaxed), dp_counters())
 }
 
 fn set_link(up: bool) {
+    if up && DP_MODE.load(Ordering::Relaxed) == cfg::DP_OFF {
+        if !CARRIER_HELD.swap(true, Ordering::Relaxed) { log("dp=off: associated, carrier held down (data frames dropped)"); }
+        return;
+    }
+    CARRIER_HELD.store(false, Ordering::Relaxed);
     let was = LINK_UP.swap(up, Ordering::AcqRel);
     if up && !was { LINK_GEN.fetch_add(1, Ordering::AcqRel); }
     if !up {
@@ -421,6 +459,7 @@ impl<F: Fwil> BrcmfRadio<F> {
         *RSN_INFO.lock() = self.dev.rsn.lines().iter().map(|(k, v)| (*k, String::clone(v))).collect();
         let Some(text) = self.ctl.as_mut().and_then(|c| c.poll()) else { return };
         let text = String::from(text.trim());
+        if let Some((m, y)) = cfg::parse_dp(&text) { apply_dp(m, y, "ctl"); return; }
         match cfg::parse_ctl(&text) {
             cfg::CtlCmd::Status => {
                 let mut s = String::new();
@@ -510,6 +549,16 @@ impl<F: Fwil> BrcmfRadio<F> {
             sched::kthread::cond_resched();
             self.check_ctl();
             if self.retry.is_some() { return None; }
+            // dp knob changes take effect on the next pass.
+            let mode = DP_MODE.load(Ordering::Relaxed);
+            if mode == cfg::DP_OFF && link_up() {
+                set_link(false);
+                CARRIER_HELD.store(true, Ordering::Relaxed);
+                log("dp=off: carrier dropped, association kept");
+            } else if mode != cfg::DP_OFF && CARRIER_HELD.load(Ordering::Relaxed) && self.dev.connected() {
+                log(&alloc::format!("dp={}: carrier released", cfg::dp_mode_name(mode)));
+                set_link(true);
+            }
             // At most TX_BURST frames per pass: a TXQ that the net stack
             // refills as fast as frames fail must not pin this loop.
             let mut burst = 0;
@@ -545,7 +594,10 @@ impl<F: Fwil> BrcmfRadio<F> {
             }
             let mut got = false;
             while let Some(f) = self.dev.take_rx() {
-                if !link_up() { continue; }
+                if !link_up() {
+                    if CARRIER_HELD.load(Ordering::Relaxed) { DP_HELD_RX.fetch_add(1, Ordering::Relaxed); }
+                    continue;
+                }
                 RX_N.fetch_add(1, Ordering::Relaxed);
                 let mut q = RXQ.lock();
                 if q.len() >= RXQ_MAX { q.pop_front(); RX_DROP.fetch_add(1, Ordering::Relaxed); }
@@ -555,7 +607,8 @@ impl<F: Fwil> BrcmfRadio<F> {
             if got { DP_STAGE.store(DpStage::Rx as u8, Ordering::Relaxed); crate::netdev::kick(); }
             let now = sched::monotonic_ns() / 1_000_000;
             if now.saturating_sub(t0) >= ms { return None; }
-            if self.dev.rx.events + self.dev.rx.rx_frames == before && TXQ.lock().is_empty() {
+            if DP_YIELD.load(Ordering::Relaxed)
+                || (self.dev.rx.events + self.dev.rx.rx_frames == before && TXQ.lock().is_empty()) {
                 DP_STAGE.store(DpStage::Sleep as u8, Ordering::Relaxed);
                 sched::kthread::msleep(1);
             }

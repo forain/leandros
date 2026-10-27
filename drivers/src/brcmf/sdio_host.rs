@@ -46,6 +46,9 @@ pub trait HostIo {
     fn w32(&mut self, off: usize, v: u32);
     fn now_us(&mut self) -> u64;
     fn delay_us(&mut self, us: u32);
+    /// Stage marker for the kernel's wedge reports (code 0 = idle; 1 = command
+    /// in flight, arg = idx << 32 | argument; 2 = CMD53 data phase, arg = bytes).
+    fn mark(&mut self, _code: u32, _arg: u64) {}
 }
 
 // ── SDHCI 3.0 registers ─────────────────────────────────────────────────────
@@ -399,6 +402,7 @@ impl<H: HostIo> SdioHost<H> {
             self.reset_cmd_dat();
             if self.io.r32(REG_PRESENT_STATE) & mask != 0 { return Err(BusError::Timeout); }
         }
+        self.io.mark(1, ((idx as u64) << 32) | arg as u64);
         // Stale completion bits would satisfy the next wait falsely (see sdhci.rs).
         self.io.w16(REG_NORMAL_INT_STATUS, !NI_CARD_INT);
         self.io.w16(REG_ERROR_INT_STATUS, 0xFFFF);
@@ -439,6 +443,7 @@ impl<H: HostIo> SdioHost<H> {
                              RESP_48 | CMD_CRC_CHECK | CMD_IDX_CHECK | CMD_DATA_PRESENT)?;
         if let Err(e) = self.check_r5(r) { self.reset_cmd_dat(); return Err(e); }
         let ready = if write { NI_BUF_WRITE_READY } else { NI_BUF_READ_READY };
+        self.io.mark(2, len as u64);
         let mut done = 0usize;
         for _ in 0..bcnt {
             self.wait_int(ready)?;
@@ -627,16 +632,26 @@ impl<H: HostIo> SdioHost<H> {
 }
 
 impl<H: HostIo> SdioBus for SdioHost<H> {
-    fn read8(&mut self, func: u8, addr: u32) -> Result<u8, BusError> { self.cmd52(false, func, addr, 0) }
+    fn read8(&mut self, func: u8, addr: u32) -> Result<u8, BusError> {
+        let r = self.cmd52(false, func, addr, 0);
+        self.io.mark(0, 0);
+        r
+    }
     fn write8(&mut self, func: u8, addr: u32, val: u8) -> Result<(), BusError> {
-        self.cmd52(true, func, addr, val).map(|_| ())
+        let r = self.cmd52(true, func, addr, val).map(|_| ());
+        self.io.mark(0, 0);
+        r
     }
     fn read_bytes(&mut self, func: u8, addr: u32, incr: bool, buf: &mut [u8]) -> Result<(), BusError> {
-        self.rw_ext(false, func, addr, incr, buf.as_mut_ptr(), buf.len())
+        let r = self.rw_ext(false, func, addr, incr, buf.as_mut_ptr(), buf.len());
+        self.io.mark(0, 0);
+        r
     }
     fn write_bytes(&mut self, func: u8, addr: u32, incr: bool, buf: &[u8]) -> Result<(), BusError> {
         // Writes only read from the pointer.
-        self.rw_ext(true, func, addr, incr, buf.as_ptr() as *mut u8, buf.len())
+        let r = self.rw_ext(true, func, addr, incr, buf.as_ptr() as *mut u8, buf.len());
+        self.io.mark(0, 0);
+        r
     }
     fn set_block_size(&mut self, func: u8, size: u16) -> Result<(), BusError> {
         if func > 7 || size == 0 || size > 2048 { return Err(BusError::Io); }
@@ -733,6 +748,7 @@ mod hw {
         fn w32(&mut self, o: usize, v: u32) { unsafe { ((self.host + o) as *mut u32).mmio_write(v) } }
         fn now_us(&mut self) -> u64 { sched::monotonic_ns() / 1_000 }
         fn delay_us(&mut self, us: u32) { sched::kthread::udelay(us as u64) }
+        fn mark(&mut self, code: u32, arg: u64) { sched::wedge::mark(sched::wedge::SLOT_SDIO, code, arg) }
     }
 
     unsafe impl Send for Mmio {}
