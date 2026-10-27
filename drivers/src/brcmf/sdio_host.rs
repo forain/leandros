@@ -698,7 +698,7 @@ pub fn read_chip_id<B: SdioBus>(bus: &mut B) -> Result<(u32, bool), BusError> {
 
 // ── Raspberry Pi 5 hardware: power path, pin mux, MMIO, boot probe ───────────
 #[cfg(feature = "rpi5")]
-pub use hw::{boot_probe, gio_drive, probe, take_host, Mmio, GIO_PHYS, PINCTRL_PHYS, PROBE_STATE};
+pub use hw::{boot_probe, gio_drive, probe, probe_with, take_host, Mmio, GIO_PHYS, PINCTRL_PHYS, PROBE_STATE};
 
 #[cfg(feature = "rpi5")]
 mod hw {
