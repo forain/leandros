@@ -1,7 +1,7 @@
 use crate::brcmf::bcdc::{self, Brcmf};
 use crate::brcmf::bus::SdioBus;
 use crate::brcmf::chip::*;
-use crate::brcmf::fw::{self, nvram_normalize, nvram_token_words, DlFail, FwLoadError, Knobs};
+use crate::brcmf::fw::{self, nvram_normalize, nvram_token_words, DlFail, FwLoadError, Knobs, Mismatch};
 use crate::brcmf::fwil::{FwError, Fwil, RxSink};
 use crate::brcmf::sdpcm::{self, Sdpcm, SdpcmError};
 use crate::mock::*;
@@ -257,7 +257,7 @@ fn download_rejects_bad_images() {
     let mut cm = Corrupt(m);
     // No firmware, no HT: bounded at the 1 s PMU limit, stage named.
     let e = fw::download_with(&mut cm, &mut c, &code, NVRAM, &Knobs::default()).unwrap_err();
-    assert_eq!(e, DlFail { err: FwLoadError::Chip(ChipError::HtTimeout), stage: "ht" });
+    assert_eq!(e, DlFail { err: FwLoadError::Chip(ChipError::HtTimeout), stage: "ht", mismatch: None });
     assert!(cm.0.now_us <= 1_200_000, "{}", cm.0.now_us);
     let d = fw::diag(&mut cm, &mut c, 8);
     assert!(d.line.contains("fw=not-started") && d.line.contains("run"), "{}", d.line);
@@ -422,7 +422,7 @@ fn download_uses_alp_only_like_brcmfmac() {
     let (mut m, mut c) = attached();
     let k = Knobs { dl_ht: true, ..Knobs::default() };
     let e = fw::download_with(&mut m, &mut c, &fake_code(4096), NVRAM, &k).unwrap_err();
-    assert_eq!(e, DlFail { err: FwLoadError::Chip(ChipError::HtTimeout), stage: "dl-clk-ht" });
+    assert_eq!(e, DlFail { err: FwLoadError::Chip(ChipError::HtTimeout), stage: "dl-clk-ht", mismatch: None });
     assert!(!m.fw_running);
     // Default: ALP for the download, HT once the firmware runs.
     let (mut m, mut c) = attached();
@@ -506,4 +506,77 @@ fn knob_parsing() {
 fn console_tail_lines() {
     let t = fw::console_tail(b"\0\0a\r\nbb\n\n\x01\x02\nccc", 2);
     assert_eq!(t, vec!["bb".to_string(), "ccc".to_string()]);
+}
+
+// ---- lane pibrcmf-dl: RAM read-back on the real 43455 ---------------------------
+
+#[test]
+fn odd_length_image_verifies_on_a_word_granular_core() {
+    // Real Pi 5 (boot4): cyw43455-sdio.bin is 609309 bytes, so the tail sample
+    // started at an odd address; the 2/4-byte backplane access ignores addr[1:0].
+    for len in [609309usize, 4097, 4098, 4099, 300] {
+        for verify in [1u8, 2] {
+            let (mut m, mut c) = attached();
+            let code = fake_code(len);
+            let k = Knobs { verify, ..Knobs::default() };
+            let r = fw::download_with(&mut m, &mut c, &code, NVRAM, &k);
+            assert!(r.is_ok(), "len {} verify {}: {:?}", len, verify, r.err());
+            assert_eq!(m.ram_at(RAMBASE_4345, len), &code[..], "len {}", len);
+        }
+    }
+}
+
+#[test]
+fn unaligned_ram_access_is_word_safe() {
+    let (mut m, mut c) = attached();
+    let a = RAMBASE_4345 + 0x7ffd; // crosses a window and starts mid-word
+    let data: Vec<u8> = (0..11u8).map(|i| 0xa0 + i).collect();
+    c.bp.ram_write(&mut m, a - 1, &[0x55]).unwrap();
+    c.bp.ram_write(&mut m, a, &data).unwrap();
+    c.bp.ram_write(&mut m, a + 11, &[0x66]).unwrap();
+    assert_eq!(m.ram_at(a - 1, 13)[0], 0x55);
+    assert_eq!(&m.ram_at(a, 11)[..], &data[..]);
+    assert_eq!(m.ram_at(a + 11, 1)[0], 0x66);
+    let mut back = [0u8; 11];
+    c.bp.ram_read(&mut m, a, &mut back).unwrap();
+    assert_eq!(&back[..], &data[..]);
+}
+
+#[test]
+fn verify_mismatch_is_self_describing() {
+    let (mut m, mut c) = attached();
+    m.corrupt_at = Some(RAMBASE_4345 + 0x8003);
+    let code = fake_code(0x10000);
+    let e = fw::download_with(&mut m, &mut c, &code, NVRAM, &Knobs::default()).unwrap_err();
+    assert_eq!((e.err, e.stage), (FwLoadError::Verify, "code"));
+    let mm: Mismatch = e.mismatch.unwrap();
+    assert_eq!((mm.off, mm.addr, mm.n, mm.nbad), (0x8003, RAMBASE_4345 + 0x8003, 8, 1));
+    assert_eq!(mm.exp[..], code[0x8003..0x800b]);
+    assert_eq!(mm.got[0], code[0x8003] ^ 1);
+    assert!(mm.line().starts_with("off=0x8003 addr=0x1a0003 exp="), "{}", mm.line());
+    // verify=1 samples only the ends and misses it; verify=0 skips the read-back.
+    for verify in [0u8, 1] {
+        let (mut m, mut c) = attached();
+        m.corrupt_at = Some(RAMBASE_4345 + 0x8003);
+        let k = Knobs { verify, ..Knobs::default() };
+        assert!(fw::download_with(&mut m, &mut c, &code, NVRAM, &k).is_ok());
+    }
+}
+
+#[test]
+fn win4b_off_uses_byte_access_for_ram_only() {
+    let (mut m, mut c) = attached();
+    let k = Knobs { win4b: false, ..Knobs::default() };
+    let code = fake_code(4099);
+    fw::download_with(&mut m, &mut c, &code, NVRAM, &k).unwrap();
+    assert_eq!(m.ram_at(RAMBASE_4345, 4099), &code[..]);
+    assert!(!c.bp.no_4b, "the flag comes back for everything after the download");
+}
+
+#[test]
+fn dl_knobs_parse() {
+    let mut k = Knobs::default();
+    assert_eq!((k.verify, k.win4b), (2, true));
+    assert!(k.set("verify", "1") && k.set("win4b", "0"));
+    assert_eq!((k.verify, k.win4b), (1, false));
 }
