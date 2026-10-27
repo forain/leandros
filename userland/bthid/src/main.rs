@@ -535,7 +535,7 @@ fn daemon() -> i32 {
     let mut bt = loop {
         match Btd::open() {
             Ok(b) => break b,
-            Err(_) => sleep_ms(2000), // btd not up yet
+            Err(_) => sleep_ms(10_000), // btd not up (or no controller)
         }
     };
     for psm in [report::HID_CONTROL_PSM, report::HID_INTERRUPT_PSM] {

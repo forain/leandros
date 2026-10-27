@@ -582,6 +582,12 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
         write_str("starting sshd (/usr/sbin/sshd)\n");
         spawn_sshd();
     }
+    // The Bluetooth HID host (userland/bthid). It waits for btd's socket
+    // itself, so it is harmless on machines without a controller.
+    if exists(BTHID_PATH) && !cmdline_has(b"bthid=0") {
+        write_str("starting bthid (/usr/bin/bthid)\n");
+        spawn_daemon(BTHID_PATH);
+    }
     let _ = usb_summary();
     let mut login_pid: i32 = spawn_login();
     for i in 0..VT_LOGINS { start_vt_login(i); }
@@ -880,6 +886,28 @@ const SSHD_STABLE_SECS: u64 = 60;
 /// Is the SSH server wanted this boot? It is when the image carries it,
 /// `/etc/ssh/sshd_not_to_be_run` does not exist and the kernel command line
 /// does not say `sshd=0`.
+const BTHID_PATH: &[u8] = b"/usr/bin/bthid\0";
+
+/// Start a plain daemon in its own session, stdin on /dev/null, stdout/stderr
+/// on the console. Not restarted.
+unsafe fn spawn_daemon(path: &[u8]) -> i32 {
+    let pid = fork();
+    if pid == 0 {
+        setsid();
+        let null = open(b"/dev/null\0".as_ptr(), O_RDONLY, 0);
+        if null >= 0 {
+            dup3(null, 0, 0);
+            if null > 2 { close(null); }
+        }
+        let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let env = b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\0";
+        let envp: [*const u8; 2] = [env.as_ptr(), core::ptr::null()];
+        execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    pid
+}
+
 unsafe fn sshd_wanted() -> bool {
     exists(SSHD_PATH) && !exists(SSHD_DISABLE_MARKER) && !cmdline_has(b"sshd=0")
 }
