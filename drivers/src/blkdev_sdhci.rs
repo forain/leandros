@@ -131,9 +131,8 @@ pub fn remove_disk(_idx: usize) -> usize { 0 }
 pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
     const BS: usize = 4096;
     if buf.is_empty() || buf.len() % BS != 0 { return false; }
-    buf.chunks_exact(BS).enumerate().all(|(i, b)| {
-        write_block(dev_idx, blk + i as u64, b.try_into().unwrap())
-    })
+    act();
+    crate::sdhci::write_blocks(dev_idx, blk, buf)
 }
 
 /// Nothing is ever unplugged on this build (see `remove_disk`).
