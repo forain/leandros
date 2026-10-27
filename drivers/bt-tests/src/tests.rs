@@ -142,6 +142,12 @@ struct Fake {
     ignore_resets: u32,
     noisy: bool,
     sleeps: Vec<u32>,
+    /// Like the real BCM4345C0: after answering Reset the controller
+    /// re-initialises and drops every command until the host has waited.
+    reboot_window: bool,
+    rebooting: bool,
+    /// A rate mismatch puts garbage on the wire instead of silence.
+    garble: bool,
 }
 
 impl Fake {
@@ -169,6 +175,7 @@ impl Fake {
         let params = &data[3..];
         assert_eq!(params.len(), data[2] as usize);
         self.log.push(op);
+        if self.rebooting { return; }
         if self.noisy { self.evt(0xff, &[0x12, 0x34]); }
         if self.mute == Some(op) { return; }
         if let Some((o, s)) = self.fail_status { if o == op { return self.cc(op, &[s]); } }
@@ -176,6 +183,7 @@ impl Fake {
             h4::OP_RESET => {
                 if self.ignore_resets > 0 { self.ignore_resets -= 1; return; }
                 self.cc(op, &[0]);
+                self.rebooting = self.reboot_window;
             }
             h4::OP_READ_LOCAL_VERSION => {
                 let sub: u16 = if self.patched { 0x6119 } else { 0x2105 };
@@ -203,13 +211,17 @@ impl Transport for Fake {
             if let Some(p) = self.tx.feed(b) {
                 assert_eq!(p.kind, h4::H4_CMD);
                 if self.host_baud == self.ctrl_baud { self.command(&p.data); }
+                else if self.garble { self.rx.extend([0xf0, 0x0f, 0x00, 0xff]); }
             }
         }
         true
     }
     fn recv(&mut self, _timeout_us: u32) -> Option<u8> { self.rx.pop_front() }
     fn set_baud(&mut self, baud: u32) -> bool { self.host_baud = baud; true }
-    fn sleep_ms(&mut self, ms: u32) { self.sleeps.push(ms); }
+    fn sleep_ms(&mut self, ms: u32) {
+        if ms >= bringup::RESET_SETTLE_MS { self.rebooting = false; }
+        self.sleeps.push(ms);
+    }
 }
 
 const DT_ADDR: BdAddr = BdAddr([0x11, 0x22, 0x33, 0x3a, 0xdd, 0xd8]);
@@ -230,7 +242,7 @@ fn bring_up_patch_baud_bdaddr_transcript() {
     let o = Options { hcd: Some(&img), oper_baud: Some(3_000_000), bdaddr: Some(DT_ADDR), cmd_timeout_us: 0 };
     let r = bringup::bring_up(&mut f, &o).unwrap();
     assert_eq!(f.log, expected_transcript(&ops));
-    assert_eq!(f.sleeps, [50, 250, 10]);
+    assert_eq!(f.sleeps, [100, 50, 250, 100, 10]);
     assert_eq!((r.rom.lmp_subver, r.ver.lmp_subver), (0x2105, 0x6119));
     assert_eq!(r.baud, 3_000_000);
     assert_eq!(f.ctrl_baud, 3_000_000);
@@ -305,6 +317,49 @@ fn baud_mismatch_is_bounded_no_answer() {
     let o = Options { oper_baud: Some(3_000_000), cmd_timeout_us: 5_000, ..Options::default() };
     let e = bringup::bring_up(&mut s, &o).unwrap_err();
     assert_eq!((e.stage, e.kind), ("version-final", ErrorKind::NoAnswer(0x1001)));
+    assert_eq!((e.diag.baud, e.diag.rx_len, e.diag.rx_hex().as_str()), (3_000_000, 0, "-"));
+}
+
+/// Real Pi 5 (main c6f5fc63): Reset answered, the Read Local Version sent
+/// right after it got nothing. The controller is still re-initialising; the
+/// 100 ms btbcm_reset() settle must come before the next command, after the
+/// patched-firmware Reset too.
+#[test]
+fn reset_settle_before_next_command() {
+    let img = synthetic_hcd();
+    let mut f = Fake::new();
+    f.reboot_window = true;
+    let o = Options { hcd: Some(&img), oper_baud: Some(3_000_000), bdaddr: None, cmd_timeout_us: 5_000 };
+    let r = bringup::bring_up(&mut f, &o).unwrap();
+    assert_eq!((r.reset_tries, r.version_tries), (1, 1));
+    assert_eq!(f.log.iter().filter(|&&op| op == 0x1001).count(), 2, "no lost version command");
+    assert_eq!(r.ver.lmp_subver, 0x6119);
+}
+
+/// Controller still at another rate (e.g. left at 3 Mbaud): the failure line
+/// must show the host rate and the raw garbage, not just NoAnswer.
+#[test]
+fn rate_mismatch_failure_reports_baud_and_raw_bytes() {
+    let mut f = Fake::new();
+    f.ctrl_baud = 3_000_000;
+    f.garble = true;
+    let e = bringup::bring_up(&mut f, &Options { cmd_timeout_us: 5_000, ..Options::default() }).unwrap_err();
+    assert_eq!((e.stage, e.kind), ("reset", ErrorKind::NoAnswer(0x0c03)));
+    assert_eq!((e.diag.baud, e.diag.rx_len, e.diag.reset_tries), (INIT_BAUD, 4, 2));
+    assert_eq!(e.diag.rx_hex(), "f0 0f 00 ff");
+}
+
+/// Answer for Reset, then silence: the stage is `version`, after one retry,
+/// with an empty receive window.
+#[test]
+fn silent_after_reset_is_version_no_answer_with_empty_rx() {
+    let mut f = Fake::new();
+    f.mute = Some(h4::OP_READ_LOCAL_VERSION);
+    let e = bringup::bring_up(&mut f, &Options { cmd_timeout_us: 5_000, ..Options::default() }).unwrap_err();
+    assert_eq!((e.stage, e.kind), ("version", ErrorKind::NoAnswer(0x1001)));
+    assert_eq!((e.diag.baud, e.diag.rx_len, e.diag.reset_tries, e.diag.version_tries), (INIT_BAUD, 0, 1, 2));
+    assert_eq!(f.log, [0x0c03, 0x1001, 0x1001]);
+    assert_eq!(f.sleeps, [100, 100]);
 }
 
 // ── Device tree ──────────────────────────────────────────────────────────────

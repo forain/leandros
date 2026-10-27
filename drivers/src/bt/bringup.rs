@@ -9,6 +9,7 @@
 //! placeholder and the device tree supplies one].
 //!
 //! Every wait is bounded; the first failure aborts with the stage name.
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::h4::{self, BdAddr, Event, H4Parser, LocalVersion};
@@ -44,6 +45,39 @@ pub enum ErrorKind {
 pub struct Error {
     pub stage: &'static str,
     pub kind: ErrorKind,
+    /// What the wire looked like when the stage failed (filled by `bring_up`).
+    pub diag: Diag,
+}
+
+/// Bytes kept from the failing command's receive window.
+pub const DIAG_RX: usize = 24;
+
+/// Wire state at a failure: the host rate in force, every byte the failing
+/// command's wait received (first [`DIAG_RX`] kept), and how many Resets were
+/// sent. `rx_len == 0` = the controller sent nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Diag {
+    pub baud: u32,
+    pub rx_len: u32,
+    pub rx: [u8; DIAG_RX],
+    pub reset_tries: u32,
+    pub version_tries: u32,
+}
+
+impl Diag {
+    pub const NONE: Diag = Diag { baud: 0, rx_len: 0, rx: [0; DIAG_RX], reset_tries: 0, version_tries: 0 };
+    /// The kept bytes as hex, `-` when nothing arrived.
+    pub fn rx_hex(&self) -> String {
+        use core::fmt::Write;
+        let n = (self.rx_len as usize).min(DIAG_RX);
+        if n == 0 { return String::from("-"); }
+        let mut s = String::with_capacity(n * 3);
+        for (i, b) in self.rx[..n].iter().enumerate() {
+            let _ = write!(s, "{}{:02x}", if i == 0 { "" } else { " " }, b);
+        }
+        if self.rx_len as usize > n { s.push_str(" .."); }
+        s
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -70,6 +104,10 @@ pub struct Report {
     pub bdaddr: BdAddr,
     /// `true` if we wrote the address with 0xfc01.
     pub bdaddr_set: bool,
+    /// HCI Resets sent before the ROM answered (1 = first try).
+    pub reset_tries: u32,
+    /// Read Local Version attempts after that Reset (1 = first try).
+    pub version_tries: u32,
     /// Events that were not the awaited command's answer (vendor events etc.).
     pub stray_events: u32,
     /// Bytes dropped while resynchronising the H4 stream.
@@ -81,6 +119,11 @@ const DEFAULT_CMD_TIMEOUT_US: u32 = 1_000_000;
 /// One received-byte poll slice; the overall deadline is counted in these.
 const POLL_US: u32 = 1_000;
 const MAX_BYTES_PER_CMD: u32 = 64 * 1024;
+/// btbcm_reset(): "100 msec delay for module to complete reset process".
+/// The controller re-initialises after answering Reset and drops a command
+/// sent inside this window (real Pi 5: Reset answered, the next Read Local
+/// Version got no byte back).
+pub const RESET_SETTLE_MS: u32 = 100;
 
 struct Hci<'t, T: Transport> {
     t: &'t mut T,
@@ -88,6 +131,13 @@ struct Hci<'t, T: Transport> {
     tx: Vec<u8>,
     timeout_us: u32,
     stray: u32,
+    /// Host rate in force (for the failure diagnostics).
+    baud: u32,
+    /// Receive window of the most recent command.
+    rx: [u8; DIAG_RX],
+    rx_len: u32,
+    reset_tries: u32,
+    version_tries: u32,
 }
 
 impl<'t, T: Transport> Hci<'t, T> {
@@ -95,16 +145,19 @@ impl<'t, T: Transport> Hci<'t, T> {
     /// return parameters. A non-zero status (first return byte, or the Command
     /// Status event) is an error.
     fn cmd(&mut self, stage: &'static str, op: u16, params: &[u8]) -> Result<Vec<u8>, Error> {
-        let err = |kind| Error { stage, kind };
+        let err = |kind| Error { stage, diag: Diag::NONE, kind };
         self.tx.clear();
         h4::encode_cmd(op, params, &mut self.tx);
         if !self.t.send(&self.tx) { return Err(err(ErrorKind::Tx(op))); }
         let mut waited = 0u32;
         // A chatty controller must not keep us here forever either.
         let mut bytes = 0u32;
+        self.rx_len = 0;
         while waited < self.timeout_us && bytes < MAX_BYTES_PER_CMD {
             let Some(b) = self.t.recv(POLL_US) else { waited += POLL_US; continue; };
             bytes += 1;
+            if (self.rx_len as usize) < DIAG_RX { self.rx[self.rx_len as usize] = b; }
+            self.rx_len = self.rx_len.saturating_add(1);
             let Some(pkt) = self.p.feed(b) else { continue };
             if pkt.kind != h4::H4_EVT { self.stray += 1; continue; }
             match h4::parse_event(&pkt.data) {
@@ -126,19 +179,31 @@ impl<'t, T: Transport> Hci<'t, T> {
 
     fn check(&mut self, stage: &'static str) -> Result<(), Error> {
         match self.t.checkpoint() {
-            Some(syn) => Err(Error { stage, kind: ErrorKind::SError(syn) }),
+            Some(syn) => Err(Error { stage, diag: Diag::NONE, kind: ErrorKind::SError(syn) }),
             None => Ok(()),
         }
     }
 
+    /// HCI Reset, then the settle delay btbcm_reset() keeps.
+    fn reset(&mut self, stage: &'static str) -> Result<(), Error> {
+        self.reset_tries += 1;
+        self.cmd(stage, h4::OP_RESET, &[])?;
+        self.t.sleep_ms(RESET_SETTLE_MS);
+        Ok(())
+    }
+
+    fn diag(&self) -> Diag {
+        Diag { baud: self.baud, rx_len: self.rx_len, rx: self.rx, reset_tries: self.reset_tries, version_tries: self.version_tries }
+    }
+
     fn version(&mut self, stage: &'static str) -> Result<LocalVersion, Error> {
         let r = self.cmd(stage, h4::OP_READ_LOCAL_VERSION, &[])?;
-        h4::parse_local_version(&r).ok_or(Error { stage, kind: ErrorKind::Malformed(h4::OP_READ_LOCAL_VERSION) })
+        h4::parse_local_version(&r).ok_or(Error { stage, diag: Diag::NONE, kind: ErrorKind::Malformed(h4::OP_READ_LOCAL_VERSION) })
     }
 
     fn bdaddr(&mut self, stage: &'static str) -> Result<BdAddr, Error> {
         let r = self.cmd(stage, h4::OP_READ_BD_ADDR, &[])?;
-        h4::parse_bdaddr(&r).ok_or(Error { stage, kind: ErrorKind::Malformed(h4::OP_READ_BD_ADDR) })
+        h4::parse_bdaddr(&r).ok_or(Error { stage, diag: Diag::NONE, kind: ErrorKind::Malformed(h4::OP_READ_BD_ADDR) })
     }
 }
 
@@ -147,40 +212,63 @@ impl<'t, T: Transport> Hci<'t, T> {
 pub fn bring_up<T: Transport>(t: &mut T, o: &Options) -> Result<Report, Error> {
     // Validate the image before the controller is touched at all.
     let patch = match o.hcd {
-        Some(img) => Some((img, hcd::validate(img).map_err(|e| Error { stage: "hcd", kind: ErrorKind::Hcd(e) })?)),
+        Some(img) => Some((img, hcd::validate(img).map_err(|e| Error { stage: "hcd", diag: Diag::NONE, kind: ErrorKind::Hcd(e) })?)),
         None => None,
     };
     let timeout_us = if o.cmd_timeout_us == 0 { DEFAULT_CMD_TIMEOUT_US } else { o.cmd_timeout_us };
-    let mut h = Hci { t, p: H4Parser::new(), tx: Vec::with_capacity(260), timeout_us, stray: 0 };
+    let mut h = Hci {
+        t, p: H4Parser::new(), tx: Vec::with_capacity(260), timeout_us, stray: 0,
+        baud: INIT_BAUD, rx: [0; DIAG_RX], rx_len: 0, reset_tries: 0, version_tries: 0,
+    };
     let mut rep = Report { baud: INIT_BAUD, ..Report::default() };
-
-    // A controller fresh out of BT_ON can miss the first command: one retry.
-    if h.cmd("reset", h4::OP_RESET, &[]).is_err() {
-        h.p.reset();
-        h.cmd("reset", h4::OP_RESET, &[])?;
+    match sequence(&mut h, o, patch, &mut rep) {
+        Ok(()) => Ok(rep),
+        Err(mut e) => { e.diag = h.diag(); Err(e) }
     }
+}
+
+fn sequence<T: Transport>(h: &mut Hci<'_, T>, o: &Options, patch: Option<(&[u8], Summary)>, rep: &mut Report) -> Result<(), Error> {
+    // A controller fresh out of BT_ON can miss the first command: one retry.
+    if h.reset("reset").is_err() {
+        h.p.reset();
+        h.reset("reset")?;
+    }
+    rep.reset_tries = h.reset_tries;
     h.check("reset")?;
-    rep.rom = h.version("version")?;
+    // The settle delay is the fix; one more try (after another settle) only
+    // keeps a slow controller from failing the whole bring-up.
+    h.version_tries = 1;
+    rep.rom = match h.version("version") {
+        Err(Error { kind: ErrorKind::NoAnswer(_), .. }) => {
+            h.p.reset();
+            h.t.sleep_ms(RESET_SETTLE_MS);
+            h.version_tries = 2;
+            h.version("version")?
+        }
+        r => r?,
+    };
+    rep.version_tries = h.version_tries;
     rep.ver = rep.rom;
 
     if let Some((img, sum)) = patch {
         h.cmd("minidriver", h4::OP_BCM_DOWNLOAD_MINIDRV, &[])?;
         h.t.sleep_ms(50);
         for r in hcd::records(img) {
-            let (_, op, p) = r.map_err(|e| Error { stage: "hcd", kind: ErrorKind::Hcd(e) })?;
+            let (_, op, p) = r.map_err(|e| Error { stage: "hcd", diag: Diag::NONE, kind: ErrorKind::Hcd(e) })?;
             h.cmd("patch", op, p)?;
         }
         h.check("patch")?;
         // Launch RAM: the patched firmware boots; btbcm waits 250 ms.
         h.t.sleep_ms(250);
         h.p.reset();
-        h.cmd("reset-patched", h4::OP_RESET, &[])?;
+        h.reset("reset-patched")?;
         rep.patch = Some(sum);
     }
 
     if let Some(baud) = o.oper_baud.filter(|&b| b != INIT_BAUD) {
         h.cmd("baud", h4::OP_BCM_UPDATE_BAUD, &h4::bcm_baud_params(baud))?;
-        if !h.t.set_baud(baud) { return Err(Error { stage: "baud", kind: ErrorKind::BaudRejected(baud) }); }
+        if !h.t.set_baud(baud) { return Err(Error { stage: "baud", diag: Diag::NONE, kind: ErrorKind::BaudRejected(baud) }); }
+        h.baud = baud;
         h.t.sleep_ms(10);
         h.p.reset();
         rep.baud = baud;
@@ -198,7 +286,7 @@ pub fn bring_up<T: Transport>(t: &mut T, o: &Options) -> Result<Report, Error> {
     }
     rep.stray_events = h.stray;
     rep.garbage = h.p.garbage;
-    Ok(rep)
+    Ok(())
 }
 
 /// Finds the first `local-bd-address` property (6 bytes) in a flattened device
