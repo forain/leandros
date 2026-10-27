@@ -197,10 +197,10 @@ mod hw {
             Ok((dev, rep)) => {
                 serial_debug(&ident_line(&rep));
                 serial_debug(&alloc::format!(
-                    "[v3d] regs hub_ident=0x{:08x},0x{:08x},0x{:08x},0x{:08x} core_ident=0x{:08x},0x{:08x},0x{:08x} mmu_debug=0x{:08x} pm=0x{:08x}->0x{:08x} t={}us\n",
+                    "[v3d] regs hub_ident=0x{:08x},0x{:08x},0x{:08x},0x{:08x} core_ident=0x{:08x},0x{:08x},0x{:08x} mmu_debug=0x{:08x} grafx=0x{:08x}->0x{:08x} pm=0x{:08x}->0x{:08x} t={}us\n",
                     rep.hub_ident0, rep.hub_ident1, rep.hub_ident2, rep.hub_ident3,
                     rep.core_ident0, rep.core_ident1, rep.core_ident2, rep.mmu_debug,
-                    rep.pm_before, rep.pm_after, (sched::monotonic_ns() - t0) / 1000
+                    rep.grafx_before, rep.grafx_after, rep.pm_before, rep.pm_after, (sched::monotonic_ns() - t0) / 1000
                 ));
                 *REPORT.lock() = Some(rep);
                 // Phase B (pv3d-mmu): MMU + IRQ lines, only after a successful probe. The
