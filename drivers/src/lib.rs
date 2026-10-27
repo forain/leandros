@@ -90,6 +90,8 @@ pub mod bcm2712_id;
 /// Pi 5 Wi-Fi boot bring-up: sdio2 host → firmware → "ver" (rpi5 only).
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod brcmf_boot;
+/// Bluetooth: H4 transport + Broadcom bring-up (CYW43455 BT half on the Pi 5 uarta).
+pub mod bt;
 pub mod wifi_pref;
 /// A simulated Wi-Fi interface for QEMU tests (opt-in; see its header).
 pub mod wifi_sim;
