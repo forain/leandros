@@ -42,7 +42,7 @@ Lane 5 of `lane-pisound-design-2026-10-26.md`. Builds on pihdmi-probe (pixel clo
   ring geometry through the real dma40 `build_cyclic_tx` for both FIFO addresses; advance/wrap/refill/
   underrun; conversion). Mutation check: gen-5 THR on D0, parity over bit 31, misplaced Z preamble -> 3 fail.
 - `scripts/check-rpi5.sh` and `CHECK_FEATURE=raspi4b`: clean, no warnings in touched files.
-- aarch64 virt regress: see the merge commit message / report.
+- aarch64 virt regress (HVF, Mac, tag pihdmiaud): overall PASS, boots failed 0/1, all listed suites RC=0 (virtio-sound/HDA paths unchanged).
 
 ## Expected next Pi boot (HDMI screen with speakers on hdmi0)
 - `[hdmiaud] ready: hdmi0 pix=148500 kHz N=6144 CTS=148500 gate=open|opened thr=d0 dma ch10 fifo=cpu|bus(0x..) irq|poll edid=hdmi`
