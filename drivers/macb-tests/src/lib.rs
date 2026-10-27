@@ -469,4 +469,54 @@ mod tests {
         i.add(INT_TCOMP | INT_HRESP);
         assert_eq!((i.tcomp, i.hresp, i.rcomp), (1, 1, 0));
     }
+
+    // ── lane pigem-tx ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ep_devctl_follows_root_port_mps_and_caps_mrrs() {
+        // Root port at 512 B, RP1 supports 512 B but sits at 128 B with the
+        // spec-default 512 B read request: reads would come back in 512 B
+        // completions RP1 must reject.
+        let ep_dc: u16 = (2 << 12) | 0x0010; // MRRS 512, MPS 128, relaxed ordering
+        assert_eq!(pcie_ep_devctl(2 << 5, 2, ep_dc), (2 << 12) | (2 << 5) | 0x0010);
+        // Root port larger than what RP1 supports: both drop to RP1's 256 B.
+        assert_eq!(pcie_ep_devctl(2 << 5, 1, ep_dc), (1 << 12) | (1 << 5) | 0x0010);
+        // Root port at 128 B: MRRS follows down to 128 B.
+        assert_eq!(pcie_ep_devctl(0, 2, ep_dc), 0x0010);
+    }
+
+    #[test]
+    fn tsr_names_decode_the_pi_boot_value() {
+        let mut s = String::new();
+        tsr_names(0x110, &mut s);
+        assert_eq!(s, "tfc|hresp");
+        let mut s = String::new();
+        tsr_names(0, &mut s);
+        assert_eq!(s, "-");
+        assert!(0x110 & TSR_TX_HALT_ERR != 0 && 0x21 & TSR_TX_HALT_ERR == 0);
+    }
+
+    #[test]
+    fn burst_replaces_only_fbldo() {
+        assert_eq!(dmacfg_with_burst(0x4020_0710, 4), 0x4020_0704);
+        assert_eq!(dmacfg_with_burst(0x4020_0704, 7), 0x4020_0710);
+        assert_eq!((shorter_burst(16), shorter_burst(8), shorter_burst(4), shorter_burst(1)), (8, 4, 1, 1));
+    }
+
+    #[test]
+    fn tx_reset_returns_every_slot_and_rewinds() {
+        let mut d = vec![Desc::default(); 4];
+        let mut t = unsafe { TxRing::init(d.as_mut_ptr(), 4, &|i| DMA_OFF + 0x20000 + i as u64 * 2048) };
+        let a = t.slot().unwrap();
+        t.post(a, 60);
+        let b = t.slot().unwrap();
+        t.post(b, 60);
+        assert_eq!(t.in_flight(), 2);
+        assert_eq!(t.reset(), 2);
+        assert_eq!((t.in_flight(), t.slot(), t.tail()), (0, Some(0), 0));
+        for (i, x) in d.iter().enumerate() {
+            assert_eq!(x.ctrl, TX_USED | if i == 3 { TX_WRAP } else { 0 });
+            assert_eq!(x.addr_hi, 0x10);
+        }
+    }
 }

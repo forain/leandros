@@ -159,6 +159,59 @@ pub fn dmacfg_value(old: u32, rx_buf: usize, addr64: bool) -> u32 {
     v
 }
 
+/// DMACFG with the AXI fixed-burst length replaced: 1 (single), 4, 8 or
+/// 16 beats (the FBLDO encodings are the beat counts themselves).
+pub fn dmacfg_with_burst(v: u32, burst: u32) -> u32 {
+    let b = match burst { 1 | 4 | 8 | 16 => burst, _ => 16 };
+    (v & !DMACFG_FBLDO_MASK) | b
+}
+
+/// Next shorter burst for the TX-DMA-error step-down (16 -> 8 -> 4 -> 1).
+pub fn shorter_burst(b: u32) -> u32 { match b { 16 => 8, 8 => 4, _ => 1 } }
+
+// TSR bits (GEM).
+pub const TSR_UBR: u32 = 1 << 0;
+pub const TSR_COL: u32 = 1 << 1;
+pub const TSR_RLE: u32 = 1 << 2;
+pub const TSR_TGO: u32 = 1 << 3;
+/// Transmit frame corruption: an AXI/AHB error mid-frame.
+pub const TSR_TFC: u32 = 1 << 4;
+pub const TSR_COMP: u32 = 1 << 5;
+pub const TSR_UND: u32 = 1 << 6;
+pub const TSR_LCO: u32 = 1 << 7;
+/// The DMA got a bus error response (HRESP/RRESP not OK).
+pub const TSR_HRESP: u32 = 1 << 8;
+/// TSR bits after which the transmitter has halted and needs a TE cycle.
+pub const TSR_TX_HALT_ERR: u32 = TSR_TFC | TSR_HRESP | TSR_RLE | TSR_UND;
+
+/// "ubr|tfc|hresp" style names of the set TSR bits ("-" when none).
+pub fn tsr_names(tsr: u32, out: &mut dyn core::fmt::Write) {
+    const N: [&str; 9] = ["ubr", "col", "rle", "tgo", "tfc", "comp", "und", "lco", "hresp"];
+    let mut first = true;
+    for (i, n) in N.iter().enumerate() {
+        if tsr & (1 << i) != 0 {
+            let _ = out.write_str(if first { "" } else { "|" });
+            let _ = out.write_str(n);
+            first = false;
+        }
+    }
+    if first { let _ = out.write_str("-"); }
+}
+
+/// PCIe Device Control for the endpoint (RP1) so that no TLP it receives or
+/// sends exceeds what the other side accepts: MPS = min(root port MPS,
+/// endpoint MPS supported), and MRRS = that MPS, so even a root complex that
+/// splits read completions at its own (larger) MPS never sends the
+/// endpoint a completion bigger than its MPS (a malformed TLP, which the
+/// GEM sees as a DMA read error). Linux gets the same effect from
+/// `pci_configure_mps`. Returns the new DEVCTL value.
+pub fn pcie_ep_devctl(rc_devctl: u16, ep_devcap: u32, ep_devctl: u16) -> u16 {
+    let rc_mps = (rc_devctl >> 5) & 7;
+    let ep_mpss = (ep_devcap & 7) as u16;
+    let mps = rc_mps.min(ep_mpss).min(5);
+    (ep_devctl & !((7 << 5) | (7 << 12))) | (mps << 5) | (mps << 12)
+}
+
 /// Speed/duplex fields for a resolved link (Linux `macb_mac_link_up`).
 pub fn ncfgr_for_link(ncfgr: u32, speed: u32, full: bool) -> u32 {
     let mut v = ncfgr & !(NCFGR_SPD | NCFGR_FD | NCFGR_GBE);
@@ -304,6 +357,7 @@ impl TxRing {
     fn wrap_of(n: usize, i: usize) -> u32 { if i == n - 1 { TX_WRAP } else { 0 } }
     pub fn len(&self) -> usize { self.n }
     pub fn in_flight(&self) -> usize { (self.head + self.n - self.tail) % self.n }
+    pub fn tail(&self) -> usize { self.tail }
     /// Next free slot; one slot always stays idle so head never catches tail.
     pub fn slot(&self) -> Option<usize> {
         if self.in_flight() >= self.n - 1 { None } else { Some(self.head) }
@@ -315,6 +369,21 @@ impl TxRing {
         unsafe { wr_word(self.descs, idx, 1, (len as u32 & TX_LEN_MASK) | TX_LAST | Self::wrap_of(self.n, idx)); }
         fence(Ordering::SeqCst);
         self.head = (idx + 1) % self.n;
+    }
+    /// Descriptor `i` as the controller sees it (diagnostics).
+    pub fn desc(&self, i: usize) -> Desc { unsafe { rd(self.descs, i % self.n) } }
+    /// After the transmitter halted on an error and TE was cycled (which
+    /// moves the controller back to the ring base): every slot back to
+    /// USED, head = tail = 0. Returns the frames dropped.
+    pub fn reset(&mut self) -> usize {
+        let dropped = self.in_flight();
+        for i in 0..self.n {
+            unsafe { wr_word(self.descs, i, 1, TX_USED | Self::wrap_of(self.n, i)); }
+        }
+        fence(Ordering::SeqCst);
+        self.head = 0;
+        self.tail = 0;
+        dropped
     }
     /// Retire slots the controller finished; returns how many.
     pub fn reclaim(&mut self) -> usize {

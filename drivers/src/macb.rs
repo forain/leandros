@@ -140,6 +140,18 @@ static ISR_SEEN: Mutex<hw::IsrCounts> = Mutex::new(hw::IsrCounts {
 static PHY_DIAG: Mutex<Option<hw::PhyDiag>> = Mutex::new(None);
 static PHY_MODE_NOW: Mutex<&'static str> = Mutex::new("");
 static ETH_CFG_VA: AtomicUsize = AtomicUsize::new(0);
+// TX error recovery (lane pigem-tx): halts seen in TSR, frames dropped by
+// the ring resets, current AXI burst, the first failed descriptor, and the
+// PCIe payload fixup summary.
+static TX_ERRS: AtomicU64 = AtomicU64::new(0);
+static TX_DROPS: AtomicU64 = AtomicU64::new(0);
+static TX_ERR_TSR: AtomicU32 = AtomicU32::new(0);
+static BURST: AtomicU32 = AtomicU32::new(16);
+static BURST_AUTO: AtomicBool = AtomicBool::new(false);
+static TX_RECOVER: AtomicBool = AtomicBool::new(true);
+static QUEUES: AtomicUsize = AtomicUsize::new(1);
+static TXD_AT_ERR: Mutex<Option<hw::Desc>> = Mutex::new(None);
+static PCIE_FIX: Mutex<Option<String>> = Mutex::new(None);
 
 struct Rings {
     rx: RxRing,
@@ -232,7 +244,20 @@ pub fn init(cmdline: &str) {
         Some(r) => r,
         None => { log("out of DMA memory for the rings; Ethernet stays off"); set_state("no memory"); return; }
     };
-    m.w32(hw::DMACFG, hw::dmacfg_value(m.r32(hw::DMACFG), BUF_SIZE, true));
+    // RP1 PCIe payload sizes before any DMA (`macb.mps=0` leaves them).
+    let fix = pcie_fixup(cmdline);
+    mlog!("pcie payload: {}", fix);
+    *PCIE_FIX.lock() = Some(fix);
+    // `macb.burst=1|4|8|16` pins the AXI burst (default 16, as Linux);
+    // `macb.burstauto=1` steps it down after repeated TX DMA errors;
+    // `macb.txrecover=0` leaves a halted transmitter halted.
+    let burst = cmdline_val(cmdline, "macb.burst").and_then(|v| v.parse::<u32>().ok())
+        .filter(|b| matches!(b, 1 | 4 | 8 | 16)).unwrap_or(16);
+    BURST.store(burst, Ordering::Relaxed);
+    BURST_AUTO.store(cmdline_val(cmdline, "macb.burstauto") == Some("1"), Ordering::Relaxed);
+    TX_RECOVER.store(cmdline_val(cmdline, "macb.txrecover") != Some("0"), Ordering::Relaxed);
+    QUEUES.store(queues, Ordering::Relaxed);
+    m.w32(hw::DMACFG, hw::dmacfg_with_burst(hw::dmacfg_value(m.r32(hw::DMACFG), BUF_SIZE, true), burst));
     m.w32(hw::RBQPH, (rx_dma >> 32) as u32);
     m.w32(hw::TBQPH, (tx_dma >> 32) as u32);
     m.w32(hw::RBQP, rx_dma as u32);
@@ -327,7 +352,7 @@ fn driver_thread(mut m: Mmio, want: u8, mut mode: PhyMode, pinned: bool, polled:
     let mut said_nolink = false;
     // Diagnostics / RX-delay retry state, per link-up.
     let mut up_at: Option<u64> = None;
-    let mut diag_done = false;
+    let mut diag_n = 0u32;
     let mut win_start = (0u64, hw::HwStats::default());
     let mut flips = 0u32;
     let mut rx_ok_said = false;
@@ -342,11 +367,12 @@ fn driver_thread(mut m: Mmio, want: u8, mut mode: PhyMode, pinned: bool, polled:
         if w.cur.up {
             let now = now_ms();
             let t_up = *up_at.get_or_insert_with(|| { win_start = (now, *HW_STATS.lock()); now });
-            if !diag_done && now - t_up >= 10_000 {
-                diag_done = true;
+            // Diag at +10 s and again at +40 s (after any TX recovery).
+            if diag_n < 2 && now - t_up >= if diag_n == 0 { 10_000 } else { 40_000 } {
+                diag_n += 1;
                 let pd = { let _g = NCR_LOCK.lock(); hw::phy_diag(&mut m, addr).ok() };
                 *PHY_DIAG.lock() = pd;
-                log(&diag_line(&m, mode, pd));
+                log(&diag_line(&m, mode, pd, if diag_n == 1 { 10 } else { 40 }));
             }
             if now - win_start.0 >= 6_000 {
                 let cur = *HW_STATS.lock();
@@ -370,12 +396,13 @@ fn driver_thread(mut m: Mmio, want: u8, mut mode: PhyMode, pinned: bool, polled:
             }
         } else {
             up_at = None;
-            diag_done = false;
+            diag_n = 0;
         }
         if !w.cur.up && !said_nolink && now_ms() - t0 > 10_000 {
             log("no link after 10 s (cable?)");
             said_nolink = true;
         }
+        tx_check(&mut m);
         // TX doorbell retry: frames posted while the controller was halting.
         if let Some(r) = RINGS.lock().as_mut() {
             r.tx.reclaim();
@@ -567,12 +594,12 @@ fn eth_cfg_words() -> String {
 /// One line that tells, ten seconds after link-up, which side of the wire
 /// the frames stop at: MAC counters, polled ISR bits, DMA/queue registers,
 /// PHY counters with the latched delay bits, and RP1 eth_cfg.
-fn diag_line(m: &Mmio, mode: PhyMode, pd: Option<hw::PhyDiag>) -> String {
+fn diag_line(m: &Mmio, mode: PhyMode, pd: Option<hw::PhyDiag>, secs: u32) -> String {
     let s = *HW_STATS.lock();
     let i = *ISR_SEEN.lock();
-    let mut l = format!("diag +10s: hw tx {} urun {} | hw rx {} fcs {} sym {} align {} short {} res {} ovr {} | \
+    let mut l = format!("diag +{}s: hw tx {} urun {} | hw rx {} fcs {} sym {} align {} short {} res {} ovr {} | \
 isr tcomp {} rcomp {} txubr {} hresp {} | sw tx {} rx {} | TSR {:#x} RSR {:#x} NSR {:#x} NCR {:#x} USRIO {:#x} DMACFG {:#x} TBQP {:#x} RBQP {:#x} | {}",
-        s.tx_frames, s.tx_underruns, s.rx_frames, s.rx_fcs, s.rx_symbol, s.rx_align, s.rx_undersize, s.rx_resource,
+        secs, s.tx_frames, s.tx_underruns, s.rx_frames, s.rx_fcs, s.rx_symbol, s.rx_align, s.rx_undersize, s.rx_resource,
         s.rx_overrun, i.tcomp, i.rcomp, i.txubr, i.hresp, TX_PKTS.load(Ordering::Relaxed), RX_PKTS.load(Ordering::Relaxed),
         m.r32(hw::TSR), m.r32(hw::RSR), m.r32(hw::NSR), m.r32(hw::NCR), m.r32(hw::USRIO), m.r32(hw::DMACFG),
         m.r32(hw::TBQP), m.r32(hw::RBQP), mode.name());
@@ -582,5 +609,83 @@ isr tcomp {} rcomp {} txubr {} hresp {} | sw tx {} rx {} | TSR {:#x} RSR {:#x} N
         None => l.push_str(" phy diag failed"),
     }
     let _ = write!(l, " | eth_cfg {}", eth_cfg_words());
+    l.push_str(" | tsr ");
+    hw::tsr_names(m.r32(hw::TSR), &mut l);
+    let _ = write!(l, " TBQPH {:#x} RBQPH {:#x}", m.r32(hw::TBQPH), m.r32(hw::RBQPH));
+    if QUEUES.load(Ordering::Relaxed) > 1 { let _ = write!(l, " Q1TBQP {:#x}", m.r32(hw::TBQPQ1)); }
+    let _ = write!(l, " | txerr {} drop {} burst {} errtsr ", TX_ERRS.load(Ordering::Relaxed),
+                   TX_DROPS.load(Ordering::Relaxed), BURST.load(Ordering::Relaxed));
+    hw::tsr_names(TX_ERR_TSR.load(Ordering::Relaxed), &mut l);
+    if let Some(d) = *TXD_AT_ERR.lock() {
+        let _ = write!(l, " errtxd {:08x} {:08x} {:08x}", d.addr, d.ctrl, d.addr_hi);
+    }
+    if let Some(r) = RINGS.lock().as_ref() {
+        let d = r.tx.desc(0);
+        let _ = write!(l, " txd0 {:08x} {:08x} {:08x}", d.addr, d.ctrl, d.addr_hi);
+    }
+    if let Some(p) = PCIE_FIX.lock().as_ref() { let _ = write!(l, " | pcie {}", p); }
     l
+}
+
+/// RP1's PCIe Device Control: MPS = min(root port MPS, RP1 MPS supported)
+/// and MRRS = MPS (see `hw::pcie_ep_devctl`). Returns a log summary.
+fn pcie_fixup(cmdline: &str) -> String {
+    let ep = match crate::pci::find_function(0x1de4, 0x0001) { Some(f) => f, None => return String::from("no rp1 function") };
+    let Some(ec) = ep.find_capability(0x10) else { return String::from("rp1 has no pcie cap") };
+    let rc = crate::pci::PciFunction { bus: 0, dev: 0, func: 0 };
+    let rcap = rc.find_capability(0x10).unwrap_or(0xac);
+    let rc_dc = rc.read16(rcap + 8);
+    let cap = ep.read32(ec + 4);
+    let old = ep.read16(ec + 8);
+    if rc_dc == 0xffff || cap == 0xffff_ffff || old == 0xffff {
+        return format!("unreadable (rc devctl {:#x} rp1 devcap {:#x} devctl {:#x})", rc_dc, cap, old);
+    }
+    let off = cmdline_val(cmdline, "macb.mps") == Some("0");
+    let new = hw::pcie_ep_devctl(rc_dc, cap, old);
+    if new != old && !off { ep.write16(ec + 8, new); }
+    let now = ep.read16(ec + 8);
+    format!("rc devctl {:#06x} (mps {}) rp1 devcap {:#x} devctl {:#06x}->{:#06x} (mps {} mrrs {}){}", rc_dc,
+            128u32 << ((rc_dc >> 5) & 7), cap, old, now, 128u32 << ((now >> 5) & 7), 128u32 << ((now >> 12) & 7),
+            if off { " [macb.mps=0]" } else { "" })
+}
+
+/// A transmitter that halted on an error (TSR tfc/hresp/rle/und) stays
+/// halted: Linux's `macb_tx_error_task` cycles TE (which moves the queue
+/// back to its base), gives every slot back, clears TSR and restarts.
+fn tx_check(m: &mut Mmio) {
+    let tsr = m.r32(hw::TSR);
+    if tsr & hw::TSR_TX_HALT_ERR == 0 { return; }
+    let n = TX_ERRS.fetch_add(1, Ordering::Relaxed) + 1;
+    TX_ERR_TSR.fetch_or(tsr, Ordering::Relaxed);
+    let mut g = RINGS.lock();
+    let Some(r) = g.as_mut() else { return };
+    let d = r.tx.desc(r.tx.tail());
+    TXD_AT_ERR.lock().get_or_insert(d);
+    if !TX_RECOVER.load(Ordering::Relaxed) {
+        m.w32(hw::TSR, tsr);
+        return;
+    }
+    ncr_set(m, 0, hw::NCR_TE);
+    let mut spins = 0;
+    while m.r32(hw::TSR) & hw::TSR_TGO != 0 && spins < 100 { sched::kthread::udelay(10); spins += 1; }
+    let dropped = r.tx.reset();
+    TX_DROPS.fetch_add(dropped as u64, Ordering::Relaxed);
+    m.w32(hw::TSR, tsr);
+    let mut note = String::new();
+    if BURST_AUTO.load(Ordering::Relaxed) && tsr & (hw::TSR_TFC | hw::TSR_HRESP) != 0 && n % 2 == 0 {
+        let b = BURST.load(Ordering::Relaxed);
+        let nb = hw::shorter_burst(b);
+        if nb != b {
+            m.w32(hw::DMACFG, hw::dmacfg_with_burst(m.r32(hw::DMACFG), nb));
+            BURST.store(nb, Ordering::Relaxed);
+            let _ = write!(note, ", burst {} -> {}", b, nb);
+        }
+    }
+    ncr_set(m, hw::NCR_TE, 0);
+    if n <= 3 || !note.is_empty() {
+        let mut names = String::new();
+        hw::tsr_names(tsr, &mut names);
+        mlog!("tx halted (TSR {:#x} {}), desc {:08x} {:08x} {:08x}; TE cycled, {} frame(s) dropped{}",
+              tsr, names, d.addr, d.ctrl, d.addr_hi, dropped, note);
+    }
 }
