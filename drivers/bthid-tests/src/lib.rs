@@ -1,6 +1,6 @@
 extern crate alloc;
 
-#[path = "../../src/bthid/report.rs"]
+#[path = "../../../userland/bthid/src/report.rs"]
 pub mod report;
 
 #[cfg(test)]

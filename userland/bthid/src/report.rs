@@ -283,7 +283,7 @@ pub enum Quirk {
     /// Sony DualSense / DualSense Edge (054c:0ce6, 054c:0df2).
     DualSense,
     /// Nintendo Switch Pro controller (057e:2009), which 8BitDo pads in
-    /// Switch mode (Start+Y on most models) also claim to be.
+    /// Switch mode (Start+Y on the SN30 Pro / Pro 2; check the model manual) also claim to be.
     SwitchPro,
 }
 
@@ -641,22 +641,45 @@ pub const SDP_PSM: u16 = 0x0001;
 pub const HID_CONTROL_PSM: u16 = 0x0011;
 pub const HID_INTERRUPT_PSM: u16 = 0x0013;
 
-/// SDP_ServiceSearchAttributeRequest for UUID16 0x1124 (HID), attributes
-/// 0x0201 (vendor) .. 0x0206 (HIDDescriptorList) plus PnP is a separate
-/// service, so this asks for the whole 0x0000-0xFFFF range of the HID record.
-/// `cont` is the continuation state from the previous response (empty first).
-pub fn sdp_hid_request(tid: u16, cont: &[u8]) -> Vec<u8> {
+/// SDP_ServiceSearchAttributeRequest for the HID service (UUID16 0x1124),
+/// all attributes. `cont` is the continuation state from the previous
+/// response (empty first).
+pub fn sdp_hid_request(tid: u16, cont: &[u8]) -> Vec<u8> { sdp_request(tid, 0x1124, cont) }
+
+/// SDP_ServiceSearchAttributeRequest for the records of class `uuid16`
+/// (0x1124 HID, 0x1200 PnP Information), attribute range 0x0000-0xFFFF.
+pub fn sdp_request(tid: u16, uuid16: u16, cont: &[u8]) -> Vec<u8> {
     let mut p = Vec::new();
     p.push(0x06);
     p.extend_from_slice(&tid.to_be_bytes());
     let params_len = 5 + 2 + 7 + 1 + cont.len();
     p.extend_from_slice(&(params_len as u16).to_be_bytes());
-    p.extend_from_slice(&[0x35, 0x03, 0x19, 0x11, 0x24]); // seq{UUID16 0x1124}
-    p.extend_from_slice(&0x0400u16.to_be_bytes());       // max attribute bytes
+    p.extend_from_slice(&[0x35, 0x03, 0x19]);
+    p.extend_from_slice(&uuid16.to_be_bytes());               // seq{UUID16}
+    p.extend_from_slice(&0x0400u16.to_be_bytes());             // max attribute bytes
     p.extend_from_slice(&[0x35, 0x05, 0x0A, 0x00, 0x00, 0xFF, 0xFF]); // seq{range 0000-FFFF}
     p.push(cont.len() as u8);
     p.extend_from_slice(cont);
     p
+}
+
+/// (VendorID 0x0201, ProductID 0x0202) from reassembled PnP Information
+/// attribute lists.
+pub fn sdp_pnp_ids(lists: &[u8]) -> Option<(u16, u16)> {
+    for rec in de_seq(lists) {
+        let attrs = de_seq(rec);
+        let (mut v, mut p) = (None, None);
+        for pair in attrs.chunks(2) {
+            if pair.len() != 2 { continue; }
+            match de_uint(pair[0]) {
+                Some(0x0201) => v = de_uint(pair[1]),
+                Some(0x0202) => p = de_uint(pair[1]),
+                _ => {}
+            }
+        }
+        if let (Some(v), Some(p)) = (v, p) { return Some((v as u16, p as u16)); }
+    }
+    None
 }
 
 /// One SDP_ServiceSearchAttributeResponse PDU: append its attribute-list
