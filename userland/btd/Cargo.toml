@@ -1,0 +1,30 @@
+[package]
+name = "btd"
+version.workspace = true
+edition.workspace = true
+
+# `btd`: the Bluetooth host daemon. It owns /dev/hci0 and runs the bt-host
+# core (lib/bt-host); profiles talk to it over /run/bluetooth/btd.sock.
+# `btctl`: bluetoothctl-style CLI. The `btd` library is the blocking client
+# (`btd::client::Bt`) that profile daemons (bthid, later A2DP) link.
+# Contract: docs/servers/bluetooth.md.
+[lib]
+name = "btd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "btd"
+path = "src/main.rs"
+
+[[bin]]
+name = "btctl"
+path = "src/btctl.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }
+bt-host = { path = "../../lib/bt-host" }
+
+# In-guest end-to-end test: real btd against a scripted controller on a socketpair.
+[[bin]]
+name = "bttest"
+path = "src/bttest.rs"

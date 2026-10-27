@@ -13,7 +13,7 @@ Options:
                            (scripts/set-image-cmdline.sh; suite i915fake implies
                            "i915.fake=2 i915.kms=1")
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + proctest + chroottest + netctltest + sudotest + nmtest --quick (mock) + evherdtest + pollnarrowtest + listentagtest + vfstagtest + nettag2test + kparkstest + sshsmoke
+                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + proctest + chroottest + netctltest + bttest + sudotest + nmtest --quick (mock) + evherdtest + pollnarrowtest + listentagtest + vfstagtest + nettag2test + kparkstest + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              psklog   host:psklogtest.py alone (a cmdline wifi.psk= never reaches serial/klog/root or non-root /proc/cmdline)
@@ -97,7 +97,7 @@ SUITES = {
                 "if [ \"$(uname -m)\" = aarch64 ]; then drmsmoke --arm-v3d && MESA_LOADER_DRIVER_OVERRIDE=v3d kmscube -c 30; __k=$?; drmsmoke --disarm-v3d; test $__k = 0; fi",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/udptest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/pstest",
+                "/bin/procmax", "/bin/syscalltest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/bttest", "/bin/pstest",
                 # kexec tool: load + unload only (non-destructive).
                 "/bin/sh -c '/bin/kexec -l /boot/kexec --initrd=/boot/kexec-initrd --append=x && /bin/kexec -u'",
                 # ripgrep (rg): file match, recursive dir walk, stdin, exit codes 0/1.
