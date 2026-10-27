@@ -1,0 +1,17 @@
+[package]
+name = "net-host-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Host-only tests for the net daemon's receive policy (servers/net/src/rxpolicy.rs,
+# via #[path]) driving the vendored smoltcp with the kernel's feature set and
+# real access-point traffic. Detached from the kernel workspace.
+# Run: cargo test --manifest-path servers/net/host-tests/Cargo.toml --target <host-triple>
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+smoltcp = { path = "../vendor/smoltcp", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-dhcpv4", "socket-raw", "socket-icmp", "assembler-max-segment-count-32", "async", "proto-igmp", "proto-ipv4-fragmentation", "reassembly-buffer-count-16", "iface-max-multicast-group-count-32"] }

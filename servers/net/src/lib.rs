@@ -3003,6 +3003,7 @@ fn mcast_if_sid(ofd: u32, dst: IpAddress) -> Option<Sid> {
 }
 
 mod listen;
+pub mod rxpolicy;
 mod mcast;
 mod udpany;
 mod syngate;
@@ -3250,6 +3251,22 @@ fn deconfigure(nif: drivers::netdev::Netif, why: &str) {
     sched::wake_poll();
 }
 
+/// Passes where `rx_rearm` stayed pending past `rxpolicy::REARM_MAX`.
+pub static REARM_CAPS: AtomicU64 = AtomicU64::new(0);
+/// Frames dropped because their netif had no stack or was admin down.
+pub static RX_NO_STACK_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Drop up to `DISCARD_MAX` frames a netif received that no stack will read.
+fn discard_rx(nif: drivers::netdev::Netif) {
+    let mut buf = [0u8; 2048];
+    let mut n = 0u64;
+    while (n as usize) < rxpolicy::DISCARD_MAX && nif.recv(&mut buf).is_some() { n += 1; }
+    if n > 0 {
+        RX_NO_STACK_DROPS.fetch_add(n, Ordering::Relaxed);
+        iface::STATS[nif.id as usize].rx_drop.fetch_add(n as _, Ordering::Relaxed);
+    }
+}
+
 /// Carrier bookkeeping for one netif, once per pass, no lock held.
 fn track_carrier(nif: drivers::netdev::Netif, t: &mut NicTrack, now: u64) {
     let (up, speed, _) = nif.link();
@@ -3308,7 +3325,14 @@ pub fn net_daemon() -> ! {
     for nif in drivers::netdev::iter() { track[nif.id as usize].carrier = iface::rt(nif.id).carrier; }
     let mut last_broadcast = 0u64;
     let mut immediate_streak = 0u32;
+    let mut rearm = rxpolicy::RearmGuard::new();
+    let mut busy_marked = false;
     loop {
+        // This task runs with IRQs masked between parks: let the tick in on
+        // every pass, so a pass that keeps restarting cannot starve the CPU
+        // and the wedge scan / watchdog can still run on it (1-CPU boots).
+        sched::kthread::cond_resched();
+        if !busy_marked { busy_marked = true; sched::wedge::mark(sched::wedge::SLOT_NETD, 1, 0); }
         if drivers::netdev::take_kick() { procnet::NETD_KICK_PASSES.fetch_add(1, Ordering::Relaxed); }
         procnet::NETD_PASSES.fetch_add(1, Ordering::Relaxed);
         let timestamp = stack_now();
@@ -3321,8 +3345,21 @@ pub fn net_daemon() -> ! {
         for nif in drivers::netdev::iter() {
             let sid = iface::sid_of(nif.id);
             let tr = &mut track[nif.id as usize];
-            if track_admin(nif, tr) { continue; }
-            track_carrier(nif, tr, sched::monotonic_ns());
+            let admin_down = track_admin(nif, tr);
+            if !admin_down { track_carrier(nif, tr, sched::monotonic_ns()); }
+            // A netif without a stack (Wi-Fi: the MAC comes from the firmware
+            // after `init_nic` ran) gets one as soon as its MAC is known;
+            // until then, and while admin down, its frames are dropped here
+            // so `rx_rearm` below does not report them forever.
+            let has_stack = stack_for(sid).is_some();
+            match rxpolicy::nif_action(has_stack, admin_down, !has_stack && nif.mac().is_some()) {
+                rxpolicy::NifAction::Poll => {}
+                rxpolicy::NifAction::InitStack => {
+                    init_nic(nif);
+                    if stack_for(sid).is_none() { discard_rx(nif); continue; }
+                }
+                rxpolicy::NifAction::Discard => { discard_rx(nif); continue; }
+            }
             let mut device = NicDevice::new(nif);
             let ev = {
                 let mut stack = stack_for(sid);
@@ -3459,7 +3496,12 @@ pub fn net_daemon() -> ! {
         // a frame that arrived meanwhile means another pass right away.
         let mut again = false;
         for nif in drivers::netdev::iter() { again |= nif.rx_rearm(); }
-        if again { procnet::NETD_REARM_PASSES.fetch_add(1, Ordering::Relaxed); continue; }
+        if rearm.again(again) { procnet::NETD_REARM_PASSES.fetch_add(1, Ordering::Relaxed); continue; }
+        // Still pending after REARM_MAX passes in a row: no pass is making
+        // the ring empty, so park briefly instead of spinning IRQ-off.
+        if again && REARM_CAPS.fetch_add(1, Ordering::Relaxed) == 0 {
+            iface::serial(&[b"[NET] rx rearm capped: a netif kept reporting frames no pass consumed\r\n"]);
+        }
 
         // Sleep until smoltcp's next timer (delayed ACK, retransmit, keepalive,
         // DHCP renew/retry, ARP retry: all of them are in `poll_delay`), or
@@ -3497,6 +3539,7 @@ pub fn net_daemon() -> ! {
         if active { procnet::NETD_ACTIVE_SLEEPS.fetch_add(1, Ordering::Relaxed); }
         procnet::NETD_LAST_SLEEP_US.store(sleep_ns / 1000, Ordering::Relaxed);
         // The netshape link emulator (a test knob) releases its next frame then.
+        if again { sleep_ns = sleep_ns.min(rxpolicy::REARM_PARK_NS); }
         if let Some(due) = drivers::netshape::next_due_ns() {
             sleep_ns = sleep_ns.min(due.saturating_sub(sched::monotonic_ns()).max(100_000));
         }
@@ -3514,6 +3557,9 @@ pub fn net_daemon() -> ! {
         // refines its bit to that key's fingerprint and a keyed wake of some
         // other object whose key shares the bit no longer cuts the sleep
         // short. The deadline is the bounded fallback.
+        rearm.parked();
+        busy_marked = false;
+        sched::wedge::mark(sched::wedge::SLOT_NETD, 0, 0);
         let deadline = sched::monotonic_ns() + sleep_ns;
         sched::block_on_poll_prepare_tag(deadline, &NETD_PARK);
         if drivers::netdev::kicked() {

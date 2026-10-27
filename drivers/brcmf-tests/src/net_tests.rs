@@ -856,3 +856,29 @@ fn profile_and_inline_secret_give_the_same_pmk() {
     let k = Key::from_secret(b"password").psk(b"IEEE").unwrap();
     assert_eq!(&k[..4], &[0xf4, 0x2c, 0x6f, 0xc5]);
 }
+
+// ── lane pirxwedge: `dump N` capture for host replay ─────────────────────────
+
+#[test]
+fn dump_ctl_parses_count_default_and_cap() {
+    assert_eq!(parse_dump("seq=7.123 dump 5"), Some(5));
+    assert_eq!(parse_dump("dump"), Some(8));
+    assert_eq!(parse_dump("dump 9999"), Some(DUMP_MAX));
+    assert_eq!(parse_dump("dump x"), None);
+    assert_eq!(parse_dump("dp off"), None);
+    assert_eq!(parse_dp("seq=1 dump 4"), None, "dump must not be taken for a dp command");
+}
+
+#[test]
+fn dump_line_round_trips_first_64_bytes_and_length() {
+    let frame: Vec<u8> = (0..100u8).collect();
+    let line = fmt_dump_line(3, &frame);
+    assert!(line.starts_with("rxdump 3 len 100 000102"));
+    let (len, bytes) = parse_dump_line(&format!("[brcmf] {}", line)).unwrap();
+    assert_eq!(len, 100);
+    assert_eq!(bytes, frame[..DUMP_BYTES].to_vec());
+    let (len, bytes) = parse_dump_line(&fmt_dump_line(0, &[])).unwrap();
+    assert_eq!((len, bytes.len()), (0, 0));
+    let (len, bytes) = parse_dump_line(&fmt_dump_line(1, &[0xab; 10])).unwrap();
+    assert_eq!((len, bytes), (10, vec![0xab; 10]));
+}

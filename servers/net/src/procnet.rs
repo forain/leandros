@@ -119,6 +119,8 @@ fn nic(w: &mut Out) {
                    NETD_KICK_PASSES.load(Ordering::Relaxed), NETD_REARM_PASSES.load(Ordering::Relaxed),
                    NETD_TIMER_SLEEPS.load(Ordering::Relaxed), NETD_LAST_SLEEP_US.load(Ordering::Relaxed),
                    NETD_EARLY_WAKES.load(Ordering::Relaxed), NETD_ACTIVE_SLEEPS.load(Ordering::Relaxed));
+    let _ = write!(w, " rearm_capped {} nostack_drop {}", crate::REARM_CAPS.load(Ordering::Relaxed),
+                   crate::RX_NO_STACK_DROPS.load(Ordering::Relaxed));
     let _ = write!(w, " immediate {} tx_held {} timer_expired {} timer_hist {}/{}/{}/{}", NETD_IMMEDIATE.load(Ordering::Relaxed),
                    NETD_TX_HELD_SLEEPS.load(Ordering::Relaxed), NETD_TIMER_EXPIRED.load(Ordering::Relaxed),
                    NETD_SLEEP_HIST[0].load(Ordering::Relaxed), NETD_SLEEP_HIST[1].load(Ordering::Relaxed),
