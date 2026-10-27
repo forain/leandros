@@ -63,6 +63,7 @@ pub fn version() -> String { VERSION.lock().clone() }
 extern "C" { fn serial_print_str_raw(s: *const u8, len: usize); }
 
 fn log(msg: &str) {
+    crate::brcmf::netdev::note_log(msg);
     let mut s = String::with_capacity(msg.len() + 9);
     s.push_str("[brcmf] ");
     s.push_str(msg);
@@ -72,6 +73,8 @@ fn log(msg: &str) {
 
 fn fail(msg: &str) {
     STATE.store(STATE_FAILED, Ordering::Release);
+    crate::brcmf::netdev::set_stage("bring-up failed (brcmfctl diag|retry)");
+    crate::brcmf::netdev::set_error(msg);
     log(&format!("fail {}", msg));
 }
 
@@ -91,7 +94,10 @@ pub fn start(cmdline: &str) {
     // Read the MAC now, while the boot DTB is certainly mapped.
     // Fallback: the board OTP's Ethernet MAC + 1 (bcm2712_otp), as the Pi firmware assigns it.
     let mac = unsafe { boot::device_tree::recorded_dtb() }.and_then(fdt_fmac_mac).map(|m| (m, "dtb"))
-        .or_else(|| crate::bcm2712_otp::wifi_mac().map(|m| (m, "otp")));
+        .or_else(|| crate::bcm2712_otp::wifi_mac().map(|m| (m, "otp")))
+        // After a kexec the DTB is synthetic (no Wi-Fi node); the Pi firmware's
+        // smsc95xx.macaddr= survives on the reused command line.
+        .or_else(|| crate::brcmf::cfg::mac_from_cmdline(cmdline));
     if sched::kthread::spawn("brcmf", move || run(host, mac)).is_none() {
         fail("thread-spawn");
     }
@@ -215,6 +221,7 @@ fn attempt(mut host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>, o:
                  u32::from_le_bytes([code[0], code[1], code[2], code[3]]), fwver));
 
     let t = now_ms();
+    crate::brcmf::netdev::set_stage("chip attach");
     let mut chip = match Chip::attach(&mut host) {
         Ok(c) => c,
         Err(e) => { fail(&format!("chip {}", e.as_str())); return Outcome::Failed(None) }
@@ -222,6 +229,7 @@ fn attempt(mut host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>, o:
     log(&format!("chip {:x} rev {} cores {} ram {:#x}@{:#x} sr {}", chip.chip_id, chip.chip_rev,
                  chip.core_count(), chip.ram_size, chip.ram_base, chip.sr_capable as u8));
 
+    crate::brcmf::netdev::set_stage("firmware download");
     let rep = match fw::download_with(&mut host, &mut chip, &code, &nvram, &o.k) {
         Ok(r) => r,
         Err(e) => {
@@ -242,6 +250,7 @@ fn attempt(mut host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>, o:
         let Brcmf { bus, chip, .. } = dev;
         Outcome::Failed(Some((bus, chip)))
     };
+    crate::brcmf::netdev::set_stage("clm load");
     if clm.is_empty() {
         log("clm skipped");
     } else {
@@ -253,19 +262,26 @@ fn attempt(mut host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>, o:
 
     // The nvram carries a placeholder macaddr; the real one is the DTB's
     // local-mac-address (filled by the Pi firmware). Keep the nvram one if absent.
-    let src = match dt_mac {
+    crate::brcmf::netdev::set_stage("mac (cur_etheraddr)");
+    let src: String = match dt_mac {
         Some((m, from)) => match dev.iovar_set("cur_etheraddr", &m) {
-            Ok(()) => from,
-            Err(e) => { log(&format!("mac set failed {:?}, keeping nvram", e)); "nvram" }
+            Ok(()) => String::from(from),
+            Err(e) => { log(&format!("mac set failed {:?}, keeping nvram", e)); format!("nvram (set of the {} MAC failed: {:?})", from, e) }
         },
-        None => "nvram (no dtb local-mac-address, no otp)",
+        None => String::from("nvram placeholder (no dtb local-mac-address, otp tag failed, no smsc95xx.macaddr/brcmf.mac)"),
     };
     let mut mbuf = [0u8; 6];
     match dev.iovar_get("cur_etheraddr", &mut mbuf) {
-        Ok(_) => log(&format!("mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} {}",
-                              mbuf[0], mbuf[1], mbuf[2], mbuf[3], mbuf[4], mbuf[5], src)),
+        Ok(_) => {
+            let differs = matches!(dt_mac, Some((m, _)) if m != mbuf);
+            let src = if differs { format!("{} BUT the firmware still reports another MAC", src) } else { src };
+            let line = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} {}", mbuf[0], mbuf[1], mbuf[2], mbuf[3], mbuf[4], mbuf[5], src);
+            crate::brcmf::netdev::set_mac_src(&line);
+            log(&format!("mac {}", line));
+        }
         Err(e) => return failed(dev, format!("mac {:?}", e), o.lines),
     }
+    crate::brcmf::netdev::set_stage("ver");
 
     let mut buf = [0u8; VER_BUF];
     let ver = match dev.iovar_get("ver", &mut buf) {
@@ -279,6 +295,7 @@ fn attempt(mut host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>, o:
         Err(e) => return failed(dev, format!("ver {:?}", e), o.lines),
     };
     log(&format!("ver {}", ver));
+    crate::brcmf::netdev::set_fw_version(&ver);
     *VERSION.lock() = ver;
     Outcome::Ready(dev)
 }
@@ -363,7 +380,7 @@ fn ctl_command(text: &str, parked: &mut Option<(SdioHost<Mmio>, Chip)>, tries: u
             None
         }
         _ => {
-            log(&format!("ctl: unknown command '{}' (retry|diag|status|peek|poke)", cmd));
+            log(&format!("ctl: unknown command '{}' (retry|diag|status|peek|poke; scan/join need a running chip)", cmd));
             None
         }
     }
@@ -371,6 +388,7 @@ fn ctl_command(text: &str, parked: &mut Option<(SdioHost<Mmio>, Chip)>, tries: u
 
 fn run(host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>) {
     let t0 = now_ms();
+    crate::brcmf::netdev::set_stage("waiting for the root filesystem");
     while !crate::firmware::root_ready() {
         if now_ms() - t0 > ROOT_WAIT_MS { return fail("root-not-mounted 120s"); }
         sched::kthread::msleep(250);
@@ -381,12 +399,17 @@ fn run(host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>) {
     let mut next = Some(host);
     let mut tries = 0u32;
     let mut parked: Option<(SdioHost<Mmio>, Chip)> = None;
+    // A `retry` received while wifi0 was running.
+    let mut pending: Option<String> = None;
     loop {
         if let Some(h) = next.take() {
             STATE.store(STATE_RUNNING, Ordering::Release);
             parked = None;
             match attempt(h, dt_mac, &opts) {
-                Outcome::Ready(dev) => return hand_off(dev),
+                Outcome::Ready(dev) => match hand_off(dev) {
+                    None => return,
+                    Some(text) => { seen = read_ctl(); pending = Some(text); }
+                },
                 Outcome::Failed(p) => {
                     parked = p;
                     STATE.store(STATE_FAILED, Ordering::Release);
@@ -396,13 +419,18 @@ fn run(host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>) {
                 }
             }
         }
-        sched::kthread::msleep(CTL_POLL_MS);
-        let cur = read_ctl();
-        if cur.is_none() || cur == seen {
-            continue;
-        }
-        seen = cur.clone();
-        let text = String::from_utf8_lossy(cur.as_deref().unwrap_or(&[])).into_owned();
+        let text = match pending.take() {
+            Some(t) => t,
+            None => {
+                sched::kthread::msleep(CTL_POLL_MS);
+                let cur = read_ctl();
+                if cur.is_none() || cur == seen {
+                    continue;
+                }
+                seen = cur.clone();
+                String::from_utf8_lossy(cur.as_deref().unwrap_or(&[])).into_owned()
+            }
+        };
         if let Some(o) = ctl_command(text.trim(), &mut parked, tries) {
             tries += 1;
             opts = o;
@@ -416,7 +444,22 @@ fn run(host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>) {
     }
 }
 
-fn hand_off(dev: Device) {
+/// The ctl file and bus diagnostics for the running driver (netdev::run_ctl).
+struct BootCtl { seen: Option<Vec<u8>> }
+
+impl crate::brcmf::netdev::Ctl<Device> for BootCtl {
+    fn poll(&mut self) -> Option<String> {
+        let cur = read_ctl();
+        if cur.is_none() || cur == self.seen { return None; }
+        self.seen = cur.clone();
+        Some(String::from_utf8_lossy(cur.as_deref().unwrap_or(&[])).into_owned())
+    }
+    fn diag(&mut self, dev: &mut Device, lines: usize) { dump_diag(&mut dev.bus, &mut dev.chip, lines); }
+}
+
+/// Runs wifi0 on this thread. Returns the `retry ...` text when the running
+/// driver was asked for a full re-probe (the device is dropped here).
+fn hand_off(dev: Device) -> Option<String> {
     STATE.store(STATE_READY, Ordering::Release);
     // Hand-off to wifi0. `netdev::init` ran at kernel init, long before this
     // thread could get here (the root is mounted by userspace init and we
@@ -424,10 +467,12 @@ fn hand_off(dev: Device) {
     // becomes the wifi0 driver thread: BCDC init, then the connection
     // manager (autoconnect to /etc/leandros/wifi.conf or netctl profiles).
     if crate::brcmf::netdev::present() {
-        crate::brcmf::netdev::run(dev);
+        let ctl = alloc::boxed::Box::new(BootCtl { seen: read_ctl() });
+        crate::brcmf::netdev::run_ctl(dev, Some(ctl)).map(|(dev, text)| { drop(dev); text })
     } else {
         log("wifi0 not registered (brcmf.disable=1); device parked");
         *DEVICE.lock() = Some(dev);
+        None
     }
 }
 

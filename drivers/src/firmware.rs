@@ -137,7 +137,9 @@ pub fn request_firmware(path: &str, max_len: usize) -> Result<Firmware, FwError>
     let _ = core::fmt::Write::write_fmt(&mut line, format_args!(
         "[FW] {}: {} bytes crc32={:#010x} (read {} ms, crc {} ms)\n", path, size, fw.crc,
         (t1 - t0) / 1_000_000, (sched::monotonic_ns() - t1) / 1_000_000));
-    crate::pci::serial_debug(&line);
+    // Config files under /etc (brcmf.ctl is polled once a second, wifi.conf)
+    // are not firmware: no integrity line.
+    if !path.starts_with("/etc/") { crate::pci::serial_debug(&line); }
     Ok(fw)
 }
 

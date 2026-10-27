@@ -489,3 +489,32 @@ fn rx_queue_is_bounded_and_foreign_ifs_ignored() {
     rx.on_event(&[0u8; 10]);
     assert_eq!(rx.bad_events, 1);
 }
+
+// ── pibrcmf-up: MAC source and ctl parsing ─────────────────────────────────
+
+#[test]
+fn mac_from_cmdline_prefers_brcmf_mac_then_board_eth_plus_one() {
+    let pi = "reboot=w smsc95xx.macaddr=2C:CF:67:D8:CA:1A vc_mem.mem_base=0x3fc00000 root=LABEL=leandros-root";
+    assert_eq!(mac_from_cmdline(pi), Some(([0x2c, 0xcf, 0x67, 0xd8, 0xca, 0x1b], "cmdline smsc95xx.macaddr+1")));
+    let both = "smsc95xx.macaddr=2C:CF:67:D8:CA:1A brcmf.mac=02:11:22:33:44:55";
+    assert_eq!(mac_from_cmdline(both).map(|m| m.1), Some("cmdline brcmf.mac"));
+    // NIC part wraps within 24 bits; OUI untouched.
+    assert_eq!(wifi_from_eth(&[0xd8, 0x3a, 0xdd, 0xff, 0xff, 0xff]), [0xd8, 0x3a, 0xdd, 0, 0, 0]);
+    assert_eq!(mac_from_cmdline("root=x"), None);
+    assert_eq!(parse_mac("01:00:5e:00:00:01"), None, "multicast is not a station MAC");
+    assert_eq!(parse_mac("00:00:00:00:00:00"), None);
+    assert_eq!(parse_mac("2c:cf:67:d8:ca"), None);
+}
+
+#[test]
+fn ctl_commands_parse_in_every_state() {
+    assert_eq!(parse_ctl("seq=3 status"), CtlCmd::Status);
+    assert_eq!(parse_ctl(""), CtlCmd::Status);
+    assert_eq!(parse_ctl("seq=4 scan"), CtlCmd::Scan);
+    assert_eq!(parse_ctl("seq=5 join"), CtlCmd::Join(None));
+    assert_eq!(parse_ctl("seq=6 join ssid=My Home Net"), CtlCmd::Join(Some("My Home Net")));
+    assert_eq!(parse_ctl("seq=7 diag lines=8"), CtlCmd::Diag(8));
+    assert_eq!(parse_ctl("diag"), CtlCmd::Diag(32));
+    assert_eq!(parse_ctl("seq=8 retry sdclk=25000 hs=0"), CtlCmd::Retry(vec!["sdclk=25000", "hs=0"]));
+    assert_eq!(parse_ctl("seq=9 peek addr=0x18000000"), CtlCmd::Other("peek"));
+}

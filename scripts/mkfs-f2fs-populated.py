@@ -1172,6 +1172,11 @@ def main():
     if os.path.isfile(_net_auto):
         bin_files.append(("net-autotest", _net_auto, 0o100755))
 
+    # /bin/dmesg: the kernel's RAM log ring (/proc/klog), optional substring filter.
+    _dmesg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                          "userland", "dmesg", "dmesg.sh")
+    if os.path.isfile(_dmesg):
+        bin_files.append(("dmesg", _dmesg, 0o100755))
     # /bin/wifiscan: the iwlwifi driver's last scan (/proc/net/wifi).
     _wifiscan = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                              "userland", "wifiscan", "wifiscan.sh")
