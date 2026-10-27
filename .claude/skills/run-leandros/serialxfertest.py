@@ -10,6 +10,7 @@ guest shell over QEMU's serial socket, /bin/serrx receives. Cases:
 The VM ends up in the kexec'd kernel: run this test alone (runtests serialxfer).
 """
 import os
+import re
 import subprocess
 import sys
 import time
@@ -44,8 +45,27 @@ def main():
                LEANDROS_SERRX="/tmp/serrx-boot")
     if run([os.path.join(REPO, "scripts/pi-serial-kexec.sh"),
             os.path.join(REPO, "target/final-aarch64/kernel-direct"),
-            os.path.join(REPO, "initrd-aarch64.cpio"), "serialxfer=1"], env=env) != 0:
+            os.path.join(REPO, "initrd-aarch64.cpio"), "serialxfer=1", "kexec.cpuoff=0"], env=env) != 0:
         fails.append("kexec flow")
+    # lane pikexeccpu: the kernel above carries kexec.cpuoff=0 (the rpi5
+    # default), so this second kexec parks the secondaries without PSCI
+    # CPU_OFF; the next kernel must start all of them from the mailbox.
+    print("case kexec park mode (no CPU_OFF) keeps every CPU", flush=True)
+    mark = os.path.getsize(driver.SERIAL_FULL_LOG) if os.path.exists(driver.SERIAL_FULL_LOG) else 0
+    if run([os.path.join(REPO, "scripts/pi-serial-kexec.sh"),
+            os.path.join(REPO, "target/final-aarch64/kernel-direct"),
+            os.path.join(REPO, "initrd-aarch64.cpio"), "serialxfer=2"], env=env) != 0:
+        fails.append("kexec park flow")
+    else:
+        with open(driver.SERIAL_FULL_LOG, "rb") as f:
+            f.seek(mark)
+            log = f.read().decode("latin-1")
+        parked = "no PSCI CPU_OFF" in log
+        mbox = len(re.findall(r"\[SMP\] cpu\d+ mpidr 0x[0-9a-fA-F]+ psci rc -4 \(ALREADY_ON", log))
+        online = re.findall(r"\[SMP\] (\d+) CPUs online", log)
+        print(f"  parked={parked} mailbox_starts={mbox} online={online[-1:] }", flush=True)
+        if not parked or mbox < 1 or not online or int(online[-1]) < 2:
+            fails.append("kexec park mode")
     print("RESULT:", "PASS" if not fails else "FAIL " + ", ".join(fails))
     return 1 if fails else 0
 

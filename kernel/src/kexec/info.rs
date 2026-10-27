@@ -164,6 +164,9 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, _a: &mut Alloc) -> 
 pub const AP_PARK_OFF: u64 = 0x3000;
 #[cfg(target_arch = "aarch64")]
 pub const AP_MAILBOX_OFF: u64 = 0x800;
+/// Per-CPU arrival words (8 B per dense CPU index) in the AP park page:
+/// a parked CPU stores 1 once it is off old-kernel memory (purgatory_aarch64.s).
+pub const AP_ARRIVED_OFF: u64 = 0x900;
 
 /// aarch64: the FDT lives in buddy pages outside every destination range and
 /// is omitted from its own `/memory`.
