@@ -365,9 +365,11 @@ impl Host {
                     save_cache(&d.addr, d.vid, d.pid, &desc);
                     d.desc = Some(desc);
                 } else if d.desc.is_none() {
-                    eprintln!("bthid: {}: no HID descriptor in SDP; quirk-only", A(d.addr));
+                    // Not cached: the next connection asks SDP again. Quirk
+                    // devices (DS4, DualSense, Switch Pro / 8BitDo Switch
+                    // mode) work without a descriptor.
+                    eprintln!("bthid: {}: no HID descriptor in SDP; quirk-only this time", A(d.addr));
                     d.desc = Some(Vec::new());
-                    save_cache(&d.addr, d.vid, d.pid, &[]);
                 }
                 if let Some(c) = d.sdp.take() { self.bt.close(c); }
                 let a = self.devs[i].addr;
@@ -430,6 +432,8 @@ impl Host {
         }
         d.nodes = [-1; 3];
         d.hid = None;
+        // An SDP failure is retried on the next connection.
+        if d.desc.as_ref().map_or(false, |v| v.is_empty()) { d.desc = None; }
         for c in [d.ctrl.take(), d.intr.take(), d.sdp.take()].into_iter().flatten() { self.bt.close(c); }
         let d = &mut self.devs[i];
         d.stage = Sdp::Idle; d.outgoing = false; d.busy = false; d.acc.clear();
@@ -535,7 +539,7 @@ fn daemon() -> i32 {
     let mut bt = loop {
         match Btd::open() {
             Ok(b) => break b,
-            Err(_) => sleep_ms(10_000), // btd not up (or no controller)
+            Err(_) => sleep_ms(1000), // btd still starting
         }
     };
     for psm in [report::HID_CONTROL_PSM, report::HID_INTERRUPT_PSM] {

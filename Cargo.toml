@@ -21,6 +21,7 @@ members = [
     "boot",
     "lib",
     "lib/netctl-abi",
+    "lib/bt-host",
     "arch/x86_64",
     "arch/aarch64",
 ]

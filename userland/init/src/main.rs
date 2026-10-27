@@ -582,12 +582,6 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
         write_str("starting sshd (/usr/sbin/sshd)\n");
         spawn_sshd();
     }
-    // The Bluetooth HID host (userland/bthid). It waits for btd's socket
-    // itself, so it is harmless on machines without a controller.
-    if exists(BTHID_PATH) && !cmdline_has(b"bthid=0") {
-        write_str("starting bthid (/bin/bthid)\n");
-        spawn_daemon(BTHID_PATH);
-    }
     let _ = usb_summary();
     let mut login_pid: i32 = spawn_login();
     for i in 0..VT_LOGINS { start_vt_login(i); }
@@ -609,6 +603,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
         const WNOHANG: i32 = 1;
         let pid = wait4(-1, &mut status, WNOHANG, core::ptr::null_mut());
         if pid == 0 {
+            bt_services();
             if dm_pid > 0 { mem_guard(&mut guard, dm_pid, login_pid, dm_logger); }
             usleep(250_000);
             continue;
@@ -887,6 +882,21 @@ const SSHD_STABLE_SECS: u64 = 60;
 /// `/etc/ssh/sshd_not_to_be_run` does not exist and the kernel command line
 /// does not say `sshd=0`.
 const BTHID_PATH: &[u8] = b"/bin/bthid\0";
+const BTD_PATH: &[u8] = b"/bin/btd\0";
+static mut BT_STARTED: bool = false;
+
+/// Bluetooth: once the kernel has published /dev/hci0 (it appears only after
+/// the controller's vendor init, possibly well after boot), start the host
+/// daemon btd and the HID host bthid, so a paired gamepad/keyboard/mouse
+/// reconnects with no shell commands. `bt=0` on the command line disables.
+unsafe fn bt_services() {
+    if BT_STARTED || !exists(b"/dev/hci0\0") { return; }
+    BT_STARTED = true;
+    if !exists(BTD_PATH) || cmdline_has(b"bt=0") { return; }
+    write_str("starting btd and bthid (/dev/hci0 is up)\n");
+    spawn_daemon(BTD_PATH);
+    if exists(BTHID_PATH) && !cmdline_has(b"bthid=0") { spawn_daemon(BTHID_PATH); }
+}
 
 /// Start a plain daemon in its own session, stdin on /dev/null, stdout/stderr
 /// on the console. Not restarted.
