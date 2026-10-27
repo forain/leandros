@@ -1025,6 +1025,9 @@ stage_dbus_session() {
     # Needs the m6 cross toolchain; without it the panel has no Network entry.
     ./ports/cosmic-applet-network/build.sh "$arch" || \
         echo "⚠️  ports/cosmic-applet-network/build.sh FAILED for $arch (no Network applet)"
+    # The panel's Bluetooth applet (bluer -> libdbus-1 -> `leandros-sysbus bluez`).
+    ./ports/cosmic-applet-bluetooth/build.sh "$arch" || \
+        echo "⚠️  ports/cosmic-applet-bluetooth/build.sh FAILED for $arch (no Bluetooth applet)"
     # iso-codes tables for cosmic-settings' Region & language page (data only).
     ./ports/iso-codes/build.sh "$arch" || \
         echo "⚠️  ports/iso-codes/build.sh FAILED for $arch (Region page stays empty)"

@@ -54,8 +54,17 @@ pub(crate) fn log(service: &str, msg: std::fmt::Arguments<'_>) {
     eprintln!("leandros-sysbus[{service}]: {msg}");
 }
 
+/// The bus services this binary serves, as a marker the image build reads out
+/// of the staged binary (scripts/mkfs-f2fs-populated.py): every
+/// `Exec=/usr/libexec/leandros-sysbus <name>` in ports/dbus/session-pkg/services
+/// must be listed here, or mkfs refuses the image. ~/code/leandros-artifacts is
+/// shared by every worktree, so a sysbus rebuilt from an older tree would
+/// otherwise silently drop a service. Keep it in sync with the match in main().
+const SERVICES: &str = "leandros-sysbus-services:login1,locale1,upower,power-profiles,polkit,rtkit,networkmanager,bluez;";
+
 fn usage() -> ExitCode {
     eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|networkmanager|bluez|bluez-test|probe|portal [settings|screenshot|open-file|all] [timeout_s]>");
+    eprintln!("{SERVICES}");
     ExitCode::from(2)
 }
 
