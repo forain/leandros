@@ -118,6 +118,21 @@ pub mod brcmstb_hw;
 pub mod brcmstb_pcie;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod rp1;
+/// RP1 clock/GPIO/PWM register math (host-tested in drivers/rp1-tests).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rp1_hw;
+/// RP1 clock manager: PLL readback, GEM and PWM clock enables.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rp1_clk;
+/// RP1 GPIO/pinctrl and its small kernel API.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rp1_gpio;
+/// Pi 5 cooling fan on RP1 PWM1.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rp1_fan;
+/// Pi 5 ACT/PWR LEDs and the power button (KEY_POWER).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod pi5_board;
 /// Broadcom V3D 7.1 GPU (Pi 5): register map, power-up, MMU. Pure logic
 /// everywhere; the hardware probe is rpi5-only.
 pub mod v3d;

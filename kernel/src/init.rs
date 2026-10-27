@@ -116,6 +116,12 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::blkdev::init();
+    // Raspberry Pi 5: ACT LED on SD I/O and the power button (KEY_POWER);
+    // BCM2712 GPIO only, no PCIe. `pi5.board=0` disables it.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    if !crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "pi5.board=0")) {
+        drivers::pi5_board::init();
+    }
     // Raspberry Pi 5: PCIe root complex for RP1 (Ethernet, USB). Opt-in until
     // hardware-verified; bounded (<= ~0.4 s) and inert on failure.
     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
