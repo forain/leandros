@@ -5,11 +5,15 @@
 #   brcmfctl retry [knob=val ...]   re-pulse WL_REG_ON, redo SDIO init, re-download
 #   brcmfctl diag [lines=N]         chip/PMU/CR4 state + firmware console tail
 #   brcmfctl status
+#   brcmfctl peek addr=0x...        16 bytes at a backplane address (word reads + one bulk read)
+#   brcmfctl poke addr=0x... val=0x...   one 32-bit backplane write
 # Knobs (each retry starts from the defaults): clk_ms dl_ht=0|1 post_ms ht_ms f2_ms
 #   sr=auto|0|1 kso=0|1 wm=N f2wm=0|1 mesbusy=N force_ht=0|1 noclm=1
 #   wloff_ms wlon_ms lines=N fw=PATH nvram=PATH clm=PATH
+#   verify=0|1|2 (off, head/tail, whole image) win4b=0|1
+#   SDIO bus: sdclk=kHz hs=0|1 blk=0|1 blksz=N (F1) chunk=N (max bytes per CMD53)
 if [ $# -eq 0 ]; then
-    echo "usage: brcmfctl retry [knob=val ...] | diag [lines=N] | status"
+    echo "usage: brcmfctl retry [knob=val ...] | diag [lines=N] | status | peek addr=0x.. | poke addr=0x.. val=0x.."
     exit 2
 fi
 # A fresh sequence number makes a repeated command count as new.
