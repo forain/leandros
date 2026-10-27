@@ -1,0 +1,14 @@
+[package]
+name = "bthid"
+version.workspace = true
+edition.workspace = true
+
+# Bluetooth HID host daemon (btd client -> /dev/uinput). The report parser
+# (src/report.rs) is host-tested by drivers/bthid-tests.
+[[bin]]
+name = "bthid"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }
+netctl-abi = { path = "../../lib/netctl-abi" }

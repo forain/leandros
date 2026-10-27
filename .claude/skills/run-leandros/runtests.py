@@ -82,7 +82,7 @@ import driver  # noqa: E402
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/pthreadtest", "/bin/futextest",
-                "/bin/epolltest", "/bin/strtest", "/bin/floattest",
+                "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest",
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
                 "/bin/f2fstest mmaporphan /root",
                 # Nested epoll sets on the ready list: LT/ET/ONESHOT/close/dup

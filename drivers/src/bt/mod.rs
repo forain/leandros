@@ -4,5 +4,8 @@
 pub mod h4;
 pub mod hcd;
 pub mod bringup;
+pub mod hcidev_core;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod boot;
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod hcidev;
