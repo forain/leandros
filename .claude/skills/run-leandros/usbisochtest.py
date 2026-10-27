@@ -14,7 +14,7 @@ Pass criteria (on the host-side WAV):
 
 Usage: LEANDROS_RUN_ID=<id> python3 usbisochtest.py [aarch64|x86_64]
 """
-import os, re, subprocess, sys, time
+import json, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
@@ -82,7 +82,7 @@ def main():
     if os.path.exists(wav): os.unlink(wav)
     env = dict(os.environ)
     env["LEANDROS_AUDIO_WAV"] = wav
-    env["LEANDROS_QEMU_EXTRA"] = "-device qemu-xhci,id=xha -device usb-audio,bus=xha.0,audiodev=snd0"
+    env["LEANDROS_QEMU_EXTRA"] = "-device qemu-xhci,id=xha -device usb-audio,bus=xha.0,audiodev=snd0,id=usbaud"
     boot_img = cmdline_image(arch, run_id)
     env["LEANDROS_DISK_IMAGE"] = boot_img
     bad = []
@@ -105,7 +105,16 @@ def main():
         m = re.search(r"underrun (\d+), missed (\d+), silence (\d+), errors (\d+)", done.group(0))
         if not m or int(m.group(1)) or int(m.group(4)):
             bad.append("kernel reported underruns or errors")
-        time.sleep(1)
+        # Unplug with the pipe still open: the slot is released, no panic.
+        rc, out = drv("qmp", "device_del", json.dumps({"id": "usbaud"}), timeout=60)
+        gone = False
+        for _ in range(20):
+            time.sleep(1)
+            log = serial_log(run_id)
+            if re.search(r"\[USB\] bus \d+ slot \d+: released", log): gone = True; break
+        if not gone: bad.append(f"unplug: no slot release logged (device_del rc={rc})")
+        if re.search(r"panic|PANIC|Synchronous exception|page fault", log): bad.append("kernel fault after unplug")
+        print("unplug: slot released" if gone else "unplug: FAILED")
     finally:
         drv("stop", timeout=60)
         for p in (boot_img,):
