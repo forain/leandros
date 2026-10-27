@@ -9,6 +9,8 @@ pub mod regs;
 pub mod mmu;
 #[path = "../../src/v3d/irq.rs"]
 pub mod irq;
+#[path = "../../src/kms_v3d.rs"]
+pub mod kms_v3d;
 
 /// Same paths as in the kernel (`crate::v3d::mmu`, ...).
 pub mod v3d {

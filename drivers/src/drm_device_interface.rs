@@ -2617,6 +2617,13 @@ fn v3d_framebuffer(
     }
     let mut fb = DrmFramebuffer::new(width, height, DrmFormat::Xrgb8888, handle, pitch);
     fb.physical_addresses[0] = b.phys as u64;
+    // Pi 5: no virtio-gpu; the present copies into the firmware framebuffer (`kms_v3d`).
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    {
+        fb.v3d_scanout = true;
+        return Some(Ok(fb));
+    }
+    #[allow(unreachable_code)]
     let existing = V3D_SCANOUT_RES.lock().get(&b.obj).copied();
     if let Some(gpu) = &mut crate::virtio_gpu::lock_gpu() {
         let res = match existing {
