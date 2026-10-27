@@ -649,6 +649,131 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
     }
 }
 
+// ── SError (asynchronous external abort) ────────────────────────────────────
+//
+// The kernel runs with DAIF.A masked, so an abort raised by a device access
+// (e.g. a register of an unpowered block) stays pending until the next eret to
+// EL0 unmasks it, where it used to land in exc_unexpected and spin cpu0 with
+// IRQs masked. Now it is logged (ESR, DISR, optionally the RAS error records)
+// and execution continues. Drivers bracket risky probes with
+// [`serror_checkpoint`] so the abort is attributed to them, not to init.
+
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering as SeOrd};
+
+/// SErrors taken through the vectors or consumed by [`serror_checkpoint`].
+static SERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Syndrome of the most recent one (ESR_EL1 or DISR_EL1).
+static SERROR_LAST: AtomicU64 = AtomicU64::new(0);
+/// SERROR_COUNT as of the previous checkpoint.
+static SERROR_SEEN: AtomicU64 = AtomicU64::new(0);
+/// Also dump the RAS error records (ERR<n>STATUS/ADDR/MISC0) and clear them.
+/// Off by default: firmware may trap ERR* accesses to EL3 (SCR_EL3.TERR), which
+/// would turn the log into an undefined-instruction fault. `serror.errrec=1`.
+pub static SERROR_ERRREC: AtomicBool = AtomicBool::new(false);
+
+pub fn serror_count() -> u64 {
+    SERROR_COUNT.load(SeOrd::Relaxed)
+}
+
+fn has_ras() -> bool {
+    let pfr0: u64;
+    unsafe { core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0) };
+    (pfr0 >> 28) & 0xf != 0
+}
+
+unsafe fn serror_dump_records() {
+    if !has_ras() || !SERROR_ERRREC.load(SeOrd::Relaxed) {
+        return;
+    }
+    let erridr: u64;
+    core::arch::asm!("mrs {}, s3_0_c5_c3_0", out(reg) erridr); // ERRIDR_EL1
+    let n = (erridr & 0xffff).min(8);
+    for i in 0..n {
+        let (st, addr, misc0): (u64, u64, u64);
+        core::arch::asm!("msr s3_0_c5_c3_1, {}", "isb", in(reg) i); // ERRSELR_EL1
+        core::arch::asm!("mrs {}, s3_0_c5_c4_2", out(reg) st); // ERXSTATUS_EL1
+        if st & (1 << 30) == 0 {
+            continue; // V: record not valid
+        }
+        core::arch::asm!("mrs {}, s3_0_c5_c4_3", out(reg) addr); // ERXADDR_EL1
+        core::arch::asm!("mrs {}, s3_0_c5_c5_0", out(reg) misc0); // ERXMISC0_EL1
+        serial_print_str("[SERROR]   err");
+        print_hex(i as usize);
+        serial_print_str(" status=");
+        print_hex(st as usize);
+        serial_print_str(" addr=");
+        print_hex(addr as usize);
+        serial_print_str(" misc0=");
+        print_hex(misc0 as usize);
+        serial_print_str("\n");
+        core::arch::asm!("msr s3_0_c5_c4_2, {}", "isb", in(reg) st); // write-1-to-clear
+    }
+}
+
+fn serror_should_log(n: u64) -> bool {
+    n <= 16 || n % 1024 == 0
+}
+
+/// SError vector (EL1 and EL0 entries). Logs and returns; never spins.
+#[no_mangle]
+unsafe extern "C" fn exc_serror_handler(frame: *mut UserFrame, from_el0: u64) {
+    let esr: u64;
+    core::arch::asm!("mrs {}, esr_el1", out(reg) esr);
+    let n = SERROR_COUNT.fetch_add(1, SeOrd::Relaxed) + 1;
+    SERROR_LAST.store(esr, SeOrd::Relaxed);
+    if serror_should_log(n) {
+        serial_print_str("\n[SERROR] from=");
+        serial_print_str(if from_el0 != 0 { "el0" } else { "el1" });
+        serial_print_str(" ESR=");
+        print_hex(esr as usize);
+        serial_print_str(" ELR=");
+        print_hex(*(frame as *const u64).add(32) as usize); // frame+256 = ELR_EL1
+        serial_print_str(" n=");
+        print_hex(n as usize);
+        serial_print_str(" (logged, continuing)\n");
+        serror_dump_records();
+    }
+}
+
+/// Consumes any SError raised since the previous checkpoint: `Some(syndrome)`
+/// if there was one (DISR_EL1 via ESB on a RAS CPU, else ESR from a briefly
+/// unmasked take, or one the vectors already took), `None` if clean.
+pub fn serror_checkpoint() -> Option<u64> {
+    unsafe {
+        core::arch::asm!("dsb sy", "isb");
+        let mut hit: Option<u64> = None;
+        if has_ras() {
+            let disr: u64;
+            // ESB defers a pending, masked SError into DISR_EL1 and clears it.
+            core::arch::asm!("hint #16", "isb", "mrs {}, s3_0_c12_c1_1", out(reg) disr);
+            if disr & (1 << 31) != 0 {
+                core::arch::asm!("msr s3_0_c12_c1_1, xzr", "isb");
+                let n = SERROR_COUNT.fetch_add(1, SeOrd::Relaxed) + 1;
+                SERROR_LAST.store(disr, SeOrd::Relaxed);
+                if serror_should_log(n) {
+                    serial_print_str("[SERROR] deferred DISR=");
+                    print_hex(disr as usize);
+                    serial_print_str(" (logged, continuing)\n");
+                    serror_dump_records();
+                }
+                hit = Some(disr);
+            }
+        }
+        let isr: u64;
+        core::arch::asm!("mrs {}, isr_el1", out(reg) isr);
+        if isr & (1 << 8) != 0 {
+            // Pending and not deferrable (no RAS): take it now through the vector.
+            core::arch::asm!("msr daifclr, #4", "isb", "msr daifset, #4", "isb");
+        }
+        let now = SERROR_COUNT.load(SeOrd::Relaxed);
+        let before = SERROR_SEEN.swap(now, SeOrd::Relaxed);
+        if hit.is_none() && now != before {
+            hit = Some(SERROR_LAST.load(SeOrd::Relaxed));
+        }
+        hit
+    }
+}
+
 #[no_mangle]
 unsafe extern "C" fn exc_unexpected_handler(esr: u64, elr: u64) {
     serial_print_str("\n[EXC] Unexpected Exception! ESR=");

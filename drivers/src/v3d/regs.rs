@@ -197,7 +197,9 @@ pub const SMS_POWER_OFF: u32 = bit(30);
 pub const SMS_CLEAR_POWER_OFF: u32 = bit(29);
 pub const SMS_LOCK: u32 = bit(28);
 pub const SMS_CLEAR_LOCK: u32 = bit(27);
-pub const fn sms_state(v: u32) -> u32 { field(v, 4, 0) }
+/// STATE is bits [3:0] (Linux `V3D_SMS_STATE_MASK`); [5:4] is OLD_MODE, so a
+/// 5-bit decode turned an idle `0x50` into a bogus state 0x10 (Pi boot 2026-10-26).
+pub const fn sms_state(v: u32) -> u32 { field(v, 3, 0) }
 pub const SMS_STATE_IDLE: u32 = 0x0;
 /// Writing this state to SMS_REE_CS requests a reset.
 pub const SMS_STATE_RESET_REQ: u32 = 0x4;
@@ -211,6 +213,21 @@ pub const PM_PHYS: u64 = 0x10_7D20_0000;
 pub const PM_SIZE: usize = 0x308;
 /// Every PM write carries this password in [31:24].
 pub const PM_PASSWORD: u32 = 0x5a00_0000;
+/// GRAFX power island (Linux `PM_GRAFX`): the parent domain of GRAFX_V3D.
+/// Linux genpd powers it before GRAFX_V3D (bcm2835-power `domain_deps`).
+pub const PM_GRAFX: u32 = 0x10c;
+pub const PM_POWUP: u32 = bit(0);
+pub const PM_POWOK: u32 = bit(1);
+pub const PM_ISPOW: u32 = bit(2);
+pub const PM_MEMREP: u32 = bit(3);
+pub const PM_MRDONE: u32 = bit(4);
+pub const PM_ISFUNC: u32 = bit(5);
+pub const PM_INRUSH_SHIFT: u32 = 13;
+pub const PM_INRUSH_MASK: u32 = 3 << PM_INRUSH_SHIFT;
+/// 3.5 mA .. 20 mA, ramped up until POWOK.
+pub const PM_INRUSH_MAX: u32 = 3;
+/// Island fully on: power OK, electrical and functional isolation off.
+pub const PM_GRAFX_ON: u32 = PM_POWUP | PM_POWOK | PM_ISPOW | PM_ISFUNC;
 /// BCM2712 GRAFX_V3D domain control (no ASB on the 2712).
 pub const PM_GRAFX_2712: u32 = 0x304;
 /// Reset deassert (1 = out of reset).

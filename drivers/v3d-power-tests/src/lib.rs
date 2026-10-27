@@ -85,7 +85,13 @@ mod tests {
     struct MockEnv {
         log: Log,
         pm: u32,
-        /// PM ignores writes (models a wrong password or a locked PM).
+        /// PM_GRAFX (the GRAFX island). Starts off, as the Pi 5 firmware leaves it.
+        grafx: u32,
+        /// Lowest inrush step at which POWOK comes up (None = never).
+        grafx_powok_at: Option<u32>,
+        /// MEMREP completes (MRDONE).
+        grafx_mrdone: bool,
+        /// PM_GRAFX_2712 ignores writes (models a wrong password or a locked PM).
         pm_ignores: bool,
         clk_state_reply: Option<u32>,
         clk_max: Option<u32>,
@@ -98,15 +104,28 @@ mod tests {
 
     impl MockEnv {
         fn pi5(log: Log) -> Self {
-            MockEnv { log, pm: 0x0000_1000, pm_ignores: false, clk_state_reply: Some(CLK_STATE_ON), clk_max: Some(960_000_000), clk_rate_ok: true, now: 0, tick: 1, delays: 0 }
+            MockEnv { log, pm: 0x0000_1000, grafx: 0x0000_1000, grafx_powok_at: Some(1), grafx_mrdone: true, pm_ignores: false, clk_state_reply: Some(CLK_STATE_ON), clk_max: Some(960_000_000), clk_rate_ok: true, now: 0, tick: 1, delays: 0 }
         }
     }
 
     impl PowerEnv for MockEnv {
-        fn pm_r(&mut self, off: u32) -> u32 { self.log.borrow_mut().push(Ev::PmR(off)); self.pm }
+        fn pm_r(&mut self, off: u32) -> u32 {
+            self.log.borrow_mut().push(Ev::PmR(off));
+            if off == PM_GRAFX { self.grafx } else { self.pm }
+        }
         fn pm_w(&mut self, off: u32, v: u32) {
             self.log.borrow_mut().push(Ev::PmW(off, v));
-            if !self.pm_ignores && v & 0xff00_0000 == PM_PASSWORD { self.pm = v & 0x00ff_ffff; }
+            if v & 0xff00_0000 != PM_PASSWORD { return; }
+            let v = v & 0x00ff_ffff;
+            if off == PM_GRAFX {
+                let inrush = (v & PM_INRUSH_MASK) >> PM_INRUSH_SHIFT;
+                let mut g = v & !(PM_POWOK | PM_MRDONE);
+                if v & PM_POWUP != 0 && self.grafx_powok_at.map_or(false, |l| inrush >= l) { g |= PM_POWOK; }
+                if v & PM_MEMREP != 0 && self.grafx_mrdone { g |= PM_MRDONE; }
+                self.grafx = g;
+            } else if !self.pm_ignores {
+                self.pm = v;
+            }
         }
         fn clk_set_state(&mut self, id: u32, on: bool) -> Option<u32> { self.log.borrow_mut().push(Ev::ClkState(id, on)); self.clk_state_reply }
         fn clk_get_max_rate(&mut self, id: u32) -> Option<u32> { self.log.borrow_mut().push(Ev::ClkMax(id)); self.clk_max }
@@ -144,7 +163,7 @@ mod tests {
         let (log, regs, mut env) = setup();
         power_on(regs, &mut env).expect("power_on");
         let l = log.borrow();
-        let pm_w = pos(&l, |e| matches!(e, Ev::PmW(..)));
+        let pm_w = pos(&l, |e| matches!(e, Ev::PmW(PM_GRAFX_2712, _)));
         let clk_on = pos(&l, |e| matches!(e, Ev::ClkState(..)));
         let clk_max = pos(&l, |e| matches!(e, Ev::ClkMax(_)));
         let clk_rate = pos(&l, |e| matches!(e, Ev::ClkRate(..)));
@@ -170,7 +189,7 @@ mod tests {
         env.pm = 0x0000_1003;
         power_on(regs, &mut env).expect("power_on");
         let l = log.borrow();
-        let w: Vec<_> = l.iter().filter_map(|e| if let Ev::PmW(o, v) = e { Some((*o, *v)) } else { None }).collect();
+        let w: Vec<_> = l.iter().filter_map(|e| if let Ev::PmW(o, v) = e { if *o == PM_GRAFX_2712 { Some((*o, *v)) } else { None } } else { None }).collect();
         assert_eq!(w, vec![(PM_GRAFX_2712, 0x5a00_1043)]);
         assert!(env.delays >= 2, "1 us settle on either side of the deassert");
     }
@@ -182,7 +201,7 @@ mod tests {
         env.pm = 0x7f00_0001;
         let _ = power_on(regs, &mut env);
         let l = log.borrow();
-        let v = l.iter().find_map(|e| if let Ev::PmW(_, v) = e { Some(*v) } else { None }).unwrap();
+        let v = l.iter().find_map(|e| if let Ev::PmW(PM_GRAFX_2712, v) = e { Some(*v) } else { None }).unwrap();
         assert_eq!(v, 0x5a00_0041);
     }
 
@@ -242,6 +261,7 @@ mod tests {
         let (_log, mut regs, mut env) = setup();
         regs.tee_stuck = true;
         env.tick = 0;
+        env.grafx_powok_at = Some(0);
         // delay_us still advances `now` in the mock; freeze it completely.
         struct Frozen(MockEnv);
         impl PowerEnv for Frozen {
@@ -298,6 +318,106 @@ mod tests {
         assert_eq!(hub_ident1_tver(old) * 10 + hub_ident1_rev(old), 10);
         let src = include_str!("../../src/drm_device_interface.rs");
         assert!(src.contains("const V3D_HUB_IDENT1: u64 = 0x0002_0117;"), "stub must carry the fixed encoding");
+    }
+
+    fn grafx_writes(l: &[Ev]) -> Vec<u32> {
+        l.iter().filter_map(|e| if let Ev::PmW(PM_GRAFX, v) = e { Some(*v) } else { None }).collect()
+    }
+
+    #[test]
+    fn grafx_island_on_before_v3drstn_clock_and_any_v3d_access() {
+        let (log, regs, mut env) = setup();
+        let (_, rep) = power_on(regs, &mut env).expect("power_on");
+        let l = log.borrow();
+        // Inrush ramp: 3.5 mA (no POWOK) then the next step; stop at the first POWOK.
+        let w = grafx_writes(&l);
+        let p = PM_PASSWORD | 0x1000;
+        assert_eq!(w, vec![
+            p | PM_POWUP,
+            p | (1 << PM_INRUSH_SHIFT) | PM_POWUP,
+            p | (1 << PM_INRUSH_SHIFT) | PM_POWUP | PM_POWOK | PM_ISPOW,
+            p | (1 << PM_INRUSH_SHIFT) | PM_POWUP | PM_POWOK | PM_ISPOW | PM_MEMREP,
+            p | (1 << PM_INRUSH_SHIFT) | PM_POWUP | PM_POWOK | PM_ISPOW | PM_MEMREP | PM_MRDONE | PM_ISFUNC,
+        ]);
+        let isfunc = pos(&l, |e| matches!(e, Ev::PmW(PM_GRAFX, v) if v & PM_ISFUNC != 0));
+        let rstn = pos(&l, |e| matches!(e, Ev::PmW(PM_GRAFX_2712, _)));
+        let clk = pos(&l, |e| matches!(e, Ev::ClkRate(..)));
+        let first_v3d = pos(&l, is_v3d);
+        // The confirm re-read of both PM registers sits between the clock and the first V3D access.
+        let confirm_g = l[clk..].iter().position(|e| *e == Ev::PmR(PM_GRAFX)).map(|i| i + clk).expect("re-read GRAFX");
+        let confirm_v = l[clk..].iter().position(|e| *e == Ev::PmR(PM_GRAFX_2712)).map(|i| i + clk).expect("re-read 2712");
+        assert!(isfunc < rstn && rstn < clk && clk < confirm_g && confirm_g < confirm_v && confirm_v < first_v3d);
+        assert_eq!(rep.grafx_before, 0x1000);
+        assert_eq!(rep.grafx_after & PM_GRAFX_ON, PM_GRAFX_ON);
+    }
+
+    #[test]
+    fn grafx_already_on_is_left_alone() {
+        let (log, regs, mut env) = setup();
+        env.grafx = 0x1000 | PM_GRAFX_ON | PM_MRDONE;
+        power_on(regs, &mut env).expect("power_on");
+        assert!(grafx_writes(&log.borrow()).is_empty(), "firmware-powered island untouched (Linux: POWUP set => return)");
+    }
+
+    #[test]
+    fn grafx_no_powok_is_inert_and_undone() {
+        let (log, regs, mut env) = setup();
+        env.grafx_powok_at = None;
+        let (e, _) = power_on(regs, &mut env).err().expect("must fail");
+        assert_eq!(e.step(), Step::Grafx);
+        let l = log.borrow();
+        assert!(!l.iter().any(is_v3d), "no V3D access");
+        assert!(!l.iter().any(|e| matches!(e, Ev::ClkState(..) | Ev::PmW(PM_GRAFX_2712, _))));
+        assert_eq!(grafx_writes(&l).len(), 5, "4 inrush steps + POWUP undo");
+        assert_eq!(env.grafx & (PM_POWUP | PM_INRUSH_MASK), 0);
+    }
+
+    #[test]
+    fn grafx_no_mrdone_is_inert_and_undone() {
+        let (log, regs, mut env) = setup();
+        env.grafx_mrdone = false;
+        let (e, _) = power_on(regs, &mut env).err().expect("must fail");
+        assert_eq!(e.step(), Step::Grafx);
+        assert!(!log.borrow().iter().any(is_v3d));
+        assert_eq!(env.grafx & (PM_POWUP | PM_ISPOW | PM_ISFUNC), 0);
+    }
+
+    #[test]
+    fn pm_confirm_blocks_v3d_access_when_island_drops() {
+        // POWOK comes up, but a re-read after the clock shows isolation back on.
+        let (log, regs, mut env) = setup();
+        env.grafx = 0x1000 | PM_POWUP | PM_POWOK; // firmware set POWUP but left isolation on
+        let (e, _) = power_on(regs, &mut env).err().expect("must fail");
+        assert_eq!(e, PowerError::Mismatch { step: Step::PmConfirm, value: 0x1000 | PM_POWUP | PM_POWOK });
+        assert!(!log.borrow().iter().any(is_v3d));
+    }
+
+    #[test]
+    fn grafx_poll_bounded_with_frozen_clock() {
+        let (_log, regs, mut env) = setup();
+        env.grafx_powok_at = None;
+        env.tick = 0;
+        struct Frozen(MockEnv);
+        impl PowerEnv for Frozen {
+            fn pm_r(&mut self, o: u32) -> u32 { self.0.pm_r(o) }
+            fn pm_w(&mut self, o: u32, v: u32) { self.0.pm_w(o, v) }
+            fn clk_set_state(&mut self, i: u32, on: bool) -> Option<u32> { self.0.clk_set_state(i, on) }
+            fn clk_get_max_rate(&mut self, i: u32) -> Option<u32> { self.0.clk_get_max_rate(i) }
+            fn clk_set_rate(&mut self, i: u32, h: u32) -> Option<u32> { self.0.clk_set_rate(i, h) }
+            fn delay_us(&mut self, us: u32) { self.0.delays += us as u64; }
+            fn now_us(&mut self) -> u64 { 0 }
+        }
+        let mut f = Frozen(env);
+        let (e, _) = power_on(regs, &mut f).err().expect("must fail");
+        assert_eq!(e.step(), Step::Grafx);
+        assert_eq!(f.0.delays, 4 * (POWOK_TIMEOUT_US + 1));
+    }
+
+    #[test]
+    fn sms_state_is_four_bits() {
+        // Pi 5 boot 2026-10-26: TEE_CS read 0x50 (OLD_MODE=1, NEW_MODE=1, STATE=IDLE).
+        assert_eq!(sms_state(0x50), SMS_STATE_IDLE);
+        assert_eq!(sms_state(0x5d), SMS_STATE_POWER_OFF);
     }
 
     #[test]
