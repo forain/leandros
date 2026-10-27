@@ -11,6 +11,9 @@ pub mod hcd;
 #[allow(dead_code)]
 #[path = "../../src/bt/bringup.rs"]
 pub mod bringup;
+#[allow(dead_code)]
+#[path = "../../src/bt/hcidev_core.rs"]
+pub mod hcidev_core;
 
 #[cfg(test)]
 mod tests;
