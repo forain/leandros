@@ -126,6 +126,19 @@ fn cfg_access(bus: u8, dev: u8, func: u8, off: u16, size: u8, write: Option<u32>
         wr(hw::EXT_CFG_INDEX, hw::cfg_index(bus, dev, func));
     }
     let a = base + o;
+    // The controller drops sub-dword config writes (lane pirp1-bar: the
+    // root port's 16-bit command write never landed; RP1's bus-master bit
+    // stayed clear, so no RP1 DMA reached DRAM). Read-modify-write the
+    // aligned dword, as Linux's pci_generic_config_write32 does, with the
+    // RW1C Status half written as zero so no error bit is cleared by accident.
+    if let (1 | 2, Some(w)) = (size, write) {
+        let ad = (a & !3) as *mut u32;
+        unsafe {
+            let cur = leandros_lib::mmio::read(ad as *const u32);
+            leandros_lib::mmio::write(ad, hw::sub_dword_write(cur, off, size, w));
+        }
+        return 0;
+    }
     unsafe {
         match (size, write) {
             (1, None) => leandros_lib::mmio::read(a as *const u8) as u32,

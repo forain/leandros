@@ -438,4 +438,35 @@ mod tests {
         t.truncate(120);
         let _ = fdt_find_gem(&t); // truncated: must not panic
     }
+
+    struct StatRegs { v: std::cell::RefCell<std::collections::HashMap<usize, u32>> }
+    impl Regs for StatRegs {
+        fn r32(&self, off: usize) -> u32 { self.v.borrow_mut().remove(&off).unwrap_or(0) } // clear on read
+        fn w32(&mut self, _off: usize, _v: u32) {}
+        fn delay_us(&mut self, _us: u32) {}
+    }
+
+    #[test]
+    fn hw_stats_accumulate_clear_on_read_and_rx_verdict() {
+        let mut r = StatRegs { v: Default::default() };
+        let mut s = HwStats::default();
+        r.v.borrow_mut().extend([(STAT_TX_FRAMES, 4), (STAT_RX_FCS, 3), (STAT_OCT_TX_LO, 100), (STAT_OCT_TX_HI, 1)]);
+        s.accumulate(&mut r);
+        let w0 = s;
+        assert_eq!((s.tx_frames, s.rx_fcs, s.tx_octets), (4, 3, (1 << 32) + 100));
+        assert_eq!(rx_verdict(&s), RxVerdict::BadTiming);
+        s.accumulate(&mut r); // registers cleared: nothing added
+        assert_eq!(s, w0);
+        r.v.borrow_mut().extend([(STAT_RX_FRAMES, 2), (STAT_TX_FRAMES, 1)]);
+        s.accumulate(&mut r);
+        let d = s.delta(&w0);
+        assert_eq!((d.tx_frames, d.rx_frames, d.rx_fcs), (1, 2, 0));
+        assert_eq!(rx_verdict(&d), RxVerdict::Good);
+        assert_eq!(rx_verdict(&HwStats::default()), RxVerdict::Silent);
+        assert_eq!(PhyMode::RgmiiId.flip_rx_delay(), PhyMode::RgmiiTxid);
+        assert!(!PhyMode::RgmiiId.flip_rx_delay().rx_delay() && PhyMode::RgmiiId.flip_rx_delay().tx_delay());
+        let mut i = IsrCounts::default();
+        i.add(INT_TCOMP | INT_HRESP);
+        assert_eq!((i.tcomp, i.hresp, i.rcomp), (1, 1, 0));
+    }
 }

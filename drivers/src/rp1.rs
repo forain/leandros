@@ -52,6 +52,9 @@ pub fn probe() {
     if !crate::brcmstb_pcie::is_up() || PROBED.swap(true, Ordering::AcqRel) { return; }
     let Some(f) = rp1() else { log("[rp1] FAIL not enumerated\n"); return };
     f.enable_mem_and_bus_master();
+    log("[rp1] command=");
+    hex(f.command() as u64);
+    log(if f.command() & 0x6 == 0x6 { " (mem+bus master)\n" } else { " (FAIL bus master off: no RP1 DMA)\n" });
     // BAR1 as stage 15 placed and read it back (no live re-sizing here).
     let Some((pa, size)) = crate::brcmstb_pcie::rp1_bar1() else { log("[rp1] FAIL bar1 outside rc window\n"); return };
     let Some(va) = mm::kva::ioremap(pa, size as usize, mm::kva::CacheMode::Uncached) else { log("[rp1] FAIL bar1 map\n"); return };
@@ -100,6 +103,9 @@ fn attach_gem(bar1: usize, clocks_ok: bool) {
         mmio_va: bar1 + crate::macb::RP1_GEM_OFFSET as usize,
         dma_offset: crate::macb::RP1_DMA_OFFSET,
         irq_wired,
+        eth_cfg_va: if BAR1_SIZE.load(Ordering::Relaxed) as u64 >= crate::macb::RP1_ETH_CFG_OFFSET + 0x20 {
+            bar1 + crate::macb::RP1_ETH_CFG_OFFSET as usize
+        } else { 0 },
     });
 }
 
