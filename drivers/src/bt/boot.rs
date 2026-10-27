@@ -12,6 +12,11 @@
 //! the RX trigger level, so the controller stops sending while we sleep and no
 //! byte is lost (the uart10 RX loss of #101 has no flow control). An IRQ-fed
 //! ring is for the HCI core lane that keeps the link up after boot.
+//! Real Pi 5 (910d71e7): Reset (7-byte answer) worked, Read Local Version
+//! (15 bytes, past the 8-byte trigger) got nothing in auto mode; bring-up then
+//! falls back to `Flow::Soft`: AFE off, RTS asserted only while `recv` polls,
+//! TX gated on MSR.CTS here. `[bt] flow fallback` / `lines` show the windows
+//! and the RTS/CTS pad levels (gio 24/25).
 //!
 //! Sequence (bringup.rs): power-cycle via BT_ON, 115200 8N1 + RTS/CTS, HCI
 //! Reset, Read Local Version, Broadcom patchram from
@@ -28,7 +33,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use leandros_lib::mmio::{MmioRd, MmioWr};
 
-use super::bringup::{self, Options, Transport};
+use super::bringup::{self, Flow, Lines, Options, Transport};
 use super::h4::BdAddr;
 use crate::bcm2712_gpio::{self as gpio, Block, Chip, BT_ON};
 
@@ -74,7 +79,12 @@ const LSR_DR: u32 = 0x01;
 const LSR_ERR: u32 = 0x1e; // OE | PE | FE | BI
 const LSR_THRE: u32 = 0x20;
 const LSR_TEMT: u32 = 0x40;
+const MSR_DCTS: u32 = 0x01;
+const MSR_CTS: u32 = 0x10;
 const TX_CHUNK: usize = 16;
+/// uarta RTS / CTS pads (gio lines; DATA reads the pad level whatever the mux).
+const RTS_GPIO: u32 = 24;
+const CTS_GPIO: u32 = 25;
 
 extern "C" { fn serial_print_str_raw(s: *const u8, len: usize); }
 pub(crate) fn log(msg: &str) {
@@ -90,6 +100,11 @@ struct Uart {
     base: usize,
     serror: SerrorCheck,
     line_errors: u32,
+    /// `Flow::Soft`: MCR.AFE off, RTS asserted only while `recv` polls, TX
+    /// gated on MSR.CTS by the driver.
+    soft: bool,
+    rts_on: bool,
+    dcts: u32,
 }
 
 unsafe impl Send for Uart {}
@@ -97,6 +112,21 @@ unsafe impl Send for Uart {}
 impl Uart {
     fn r(&self, reg: usize) -> u32 { unsafe { ((self.base + (reg << 2)) as *const u32).mmio_read() } }
     fn w(&self, reg: usize, v: u32) { unsafe { ((self.base + (reg << 2)) as *mut u32).mmio_write(v) } }
+
+    /// MSR read that keeps the CTS-change count (reading clears MSR.DCTS).
+    fn msr(&mut self) -> u32 {
+        let m = self.r(MSR);
+        if m & MSR_DCTS != 0 { self.dcts += 1; }
+        m
+    }
+
+    /// Soft flow: drive RTS (no write when unchanged).
+    fn rts(&mut self, on: bool) {
+        if self.soft && self.rts_on != on {
+            self.w(MCR, MCR_DTR | if on { MCR_RTS } else { 0 });
+            self.rts_on = on;
+        }
+    }
 
     fn divisor(baud: u32) -> u32 { (UART_CLK_HZ + 8 * baud) / (16 * baud) }
 
@@ -117,6 +147,8 @@ impl Uart {
         self.w(FCR, FCR_ENABLE | FCR_CLR_RX | FCR_CLR_TX | FCR_RX_TRIG_01);
         if !self.program_divisor(baud) { return false; }
         self.w(MCR, MCR_DTR | MCR_RTS | MCR_AFE);
+        self.soft = false;
+        self.rts_on = true;
         for _ in 0..64 {
             if self.r(LSR) & LSR_DR == 0 { break; }
             let _ = self.r(RBR_THR_DLL);
@@ -128,28 +160,56 @@ impl Uart {
 impl Transport for Uart {
     fn send(&mut self, bytes: &[u8]) -> bool {
         for chunk in bytes.chunks(TX_CHUNK) {
-            // CTS-gated by AFE: the controller may hold us off; 100 ms per chunk.
+            // CTS-gated by AFE (or by us in soft mode): the controller may hold
+            // us off; 100 ms per chunk.
             let t0 = now_us();
             while self.r(LSR) & LSR_THRE == 0 {
                 if now_us() - t0 > 100_000 { return false; }
                 sched::kthread::udelay(10);
             }
-            for &b in chunk { self.w(RBR_THR_DLL, b as u32); }
+            for &b in chunk {
+                while self.soft && self.msr() & MSR_CTS == 0 {
+                    if now_us() - t0 > 100_000 { return false; }
+                    sched::kthread::udelay(10);
+                }
+                self.w(RBR_THR_DLL, b as u32);
+            }
         }
         true
     }
 
     fn recv(&mut self, timeout_us: u32) -> Option<u8> {
         let t0 = now_us();
+        self.rts(true);
         loop {
             let lsr = self.r(LSR);
             if lsr & LSR_ERR != 0 { self.line_errors += 1; }
             if lsr & LSR_DR != 0 { return Some(self.r(RBR_THR_DLL) as u8); }
             let el = now_us() - t0;
-            if el >= timeout_us as u64 { return None; }
-            // Spin briefly (back-to-back bytes), then sleep: RTS holds the sender off.
-            if el < 200 { sched::kthread::udelay(10) } else { sched::kthread::msleep(1) }
+            if el >= timeout_us as u64 { self.rts(false); return None; }
+            // Spin briefly (back-to-back bytes), then sleep: RTS (auto, or
+            // dropped by us in soft mode) holds the sender off meanwhile; the
+            // 32-byte FIFO takes what was already in flight.
+            if el < 200 { sched::kthread::udelay(if self.soft { 2 } else { 10 }) } else {
+                self.rts(false);
+                sched::kthread::msleep(1);
+                self.rts(true);
+            }
         }
+    }
+
+    fn set_flow(&mut self, f: Flow) -> bool {
+        self.soft = f == Flow::Soft;
+        self.rts_on = !self.soft;
+        // Soft: AFE off and RTS deasserted until the next recv asserts it.
+        self.w(MCR, MCR_DTR | if self.soft { 0 } else { MCR_RTS | MCR_AFE });
+        true
+    }
+
+    fn lines(&mut self) -> Lines {
+        let pad = |l| gpio::gpio_get(Chip::Gio, l).ok();
+        let msr = self.msr();
+        Lines { mcr: self.r(MCR) as u8, msr: msr as u8, rts_pad: pad(RTS_GPIO), cts_pad: pad(CTS_GPIO), dcts: self.dcts }
     }
 
     fn set_baud(&mut self, baud: u32) -> bool {
@@ -161,7 +221,7 @@ impl Transport for Uart {
         self.program_divisor(baud)
     }
 
-    fn sleep_ms(&mut self, ms: u32) { sched::kthread::msleep(ms as u64) }
+    fn sleep_ms(&mut self, ms: u32) { self.rts(false); sched::kthread::msleep(ms as u64) }
 
     fn checkpoint(&mut self) -> Option<u64> { (self.serror)() }
 }
@@ -223,7 +283,7 @@ pub fn start(cmdline: &str, serror: SerrorCheck, on_ready: fn(port: u32)) {
         Ok(m) => m,
         Err(m) => { bt_on(false); STATE.store(STATE_FAILED, Ordering::Release); return log(&format!("fail stage=pinmux {}", m)); }
     };
-    let uart = Uart { base, serror, line_errors: 0 };
+    let uart = Uart { base, serror, line_errors: 0, soft: false, rts_on: true, dcts: 0 };
     let lsr = uart.r(LSR);
     if let Some(syn) = serror() {
         STATE.store(STATE_FAILED, Ordering::Release);
@@ -238,6 +298,8 @@ pub fn start(cmdline: &str, serror: SerrorCheck, on_ready: fn(port: u32)) {
         log("fail thread-spawn");
     }
 }
+
+fn flow_name(f: Flow) -> &'static str { match f { Flow::Auto => "auto", Flow::Soft => "soft" } }
 
 fn load_hcd() -> Result<(Vec<u8>, &'static str), String> {
     use crate::firmware::FwError as E;
@@ -290,9 +352,12 @@ fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready
             };
             let addr = if r.bdaddr_set { "set-from-dt" } else if r.bdaddr.is_placeholder() { "placeholder" } else { "controller" };
             log(&format!(
-                "hci ver={} rev={:#x} lmp_ver={} lmp_subver={:#06x} rom_subver={:#06x} manuf={} fw={} baud={} bdaddr={} ({}) {} ms resets={} vers={} stray={} garbage={} lsr_err={}",
+                "hci ver={} rev={:#x} lmp_ver={} lmp_subver={:#06x} rom_subver={:#06x} manuf={} fw={} baud={} bdaddr={} ({}) {} ms resets={} vers={} flow={} stray={} garbage={} lsr_err={}",
                 r.ver.hci_ver, r.ver.hci_rev, r.ver.lmp_ver, r.ver.lmp_subver, r.rom.lmp_subver, r.ver.manufacturer,
-                fw, r.baud, r.bdaddr, addr, (now_us() - t1) / 1000, r.reset_tries, r.version_tries, r.stray_events, r.garbage, uart.line_errors));
+                fw, r.baud, r.bdaddr, addr, (now_us() - t1) / 1000, r.reset_tries, r.version_tries, flow_name(r.flow),
+                r.stray_events, r.garbage, uart.line_errors));
+            if let Some((w, l)) = r.v1 { log(&format!("flow fallback: auto-RTS version window rx={}[{}] {}", w.len, w.hex(), l)); }
+            log(&format!("lines {}", uart.lines()));
             // Vendor init is done: publish /dev/hci0 and become its pump.
             match super::hcidev::create_port() {
                 Some(port) => {
@@ -303,11 +368,18 @@ fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready
                 None => log("fail stage=hci0-port"),
             }
         }
-        // lsr/msr: THRE (0x20) stuck clear with MSR.CTS (0x10) clear = flow control held.
-        // baud = host rate in force; rx = bytes the failing command's wait got
-        // (`-` = none at all); resets/vers = attempts.
-        Err(e) => fail(&format!("stage={} err={:?} baud={} rx={}[{}] resets={} vers={} lsr_err={} lsr={:#x} msr={:#x}",
-            e.stage, e.kind, e.diag.baud, e.diag.rx_len, e.diag.rx_hex(), e.diag.reset_tries, e.diag.version_tries,
-            uart.line_errors, uart.r(LSR), uart.r(MSR))),
+        // lsr: THRE (0x20) stuck clear = TX held. baud = host rate in force;
+        // rx = bytes the failing command's wait got (`-` = none at all);
+        // resets/vers = attempts; flow + lines (mcr/msr, RTS/CTS pad levels,
+        // low = asserted) at the failure; v1 = the first, auto-RTS version window.
+        Err(e) => {
+            let v1 = match e.diag.v1 {
+                Some((w, l)) => format!(" v1=rx:{}[{}] v1_{}", w.len, w.hex(), l),
+                None => String::new(),
+            };
+            fail(&format!("stage={} err={:?} baud={} rx={}[{}] resets={} vers={} flow={} lsr_err={} lsr={:#x} {}{}",
+                e.stage, e.kind, e.diag.baud, e.diag.rx_len, e.diag.rx_hex(), e.diag.reset_tries, e.diag.version_tries,
+                flow_name(e.diag.flow), uart.line_errors, uart.r(LSR), e.diag.lines, v1))
+        }
     }
 }

@@ -148,6 +148,12 @@ struct Fake {
     rebooting: bool,
     /// A rate mismatch puts garbage on the wire instead of silence.
     garble: bool,
+    /// Real Pi 5 suspect: with the UART's auto RTS the host's RTS stays
+    /// deasserted once an answer reaches the 8-byte RX trigger, so the
+    /// controller sends 8 bytes and holds the rest (and everything after).
+    auto_rts_stall: bool,
+    soft: bool,
+    held: VecDeque<u8>,
 }
 
 impl Fake {
@@ -159,10 +165,12 @@ impl Fake {
             self.rx.extend([0xf0, 0x0f, 0x00, 0xff]); // what a rate mismatch looks like
             return;
         }
-        self.rx.push_back(h4::H4_EVT);
-        self.rx.push_back(code);
-        self.rx.push_back(p.len() as u8);
-        self.rx.extend(p);
+        let mut b = vec![h4::H4_EVT, code, p.len() as u8];
+        b.extend_from_slice(p);
+        for x in b {
+            let stalled = self.auto_rts_stall && !self.soft && (!self.held.is_empty() || self.rx.len() >= 8);
+            if stalled { self.held.push_back(x) } else { self.rx.push_back(x) }
+        }
     }
     fn cc(&mut self, op: u16, ret: &[u8]) {
         let mut p = vec![1];
@@ -218,6 +226,14 @@ impl Transport for Fake {
     }
     fn recv(&mut self, _timeout_us: u32) -> Option<u8> { self.rx.pop_front() }
     fn set_baud(&mut self, baud: u32) -> bool { self.host_baud = baud; true }
+    fn set_flow(&mut self, f: bringup::Flow) -> bool {
+        self.soft = f == bringup::Flow::Soft;
+        if self.soft { let h: Vec<u8> = self.held.drain(..).collect(); self.rx.extend(h); }
+        true
+    }
+    fn lines(&mut self) -> bringup::Lines {
+        bringup::Lines { mcr: if self.soft { 0x03 } else { 0x23 }, msr: 0x10, rts_pad: Some(!self.held.is_empty()), cts_pad: Some(false), dcts: 0 }
+    }
     fn sleep_ms(&mut self, ms: u32) {
         if ms >= bringup::RESET_SETTLE_MS { self.rebooting = false; }
         self.sleeps.push(ms);
@@ -357,9 +373,44 @@ fn silent_after_reset_is_version_no_answer_with_empty_rx() {
     f.mute = Some(h4::OP_READ_LOCAL_VERSION);
     let e = bringup::bring_up(&mut f, &Options { cmd_timeout_us: 5_000, ..Options::default() }).unwrap_err();
     assert_eq!((e.stage, e.kind), ("version", ErrorKind::NoAnswer(0x1001)));
-    assert_eq!((e.diag.baud, e.diag.rx_len, e.diag.reset_tries, e.diag.version_tries), (INIT_BAUD, 0, 1, 2));
-    assert_eq!(f.log, [0x0c03, 0x1001, 0x1001]);
+    assert_eq!((e.diag.baud, e.diag.rx_len, e.diag.reset_tries, e.diag.version_tries), (INIT_BAUD, 0, 2, 2));
+    assert_eq!(f.log, [0x0c03, 0x1001, 0x0c03, 0x1001]);
     assert_eq!(f.sleeps, [100, 100]);
+    assert_eq!((e.diag.flow, e.diag.reset_tries), (bringup::Flow::Soft, 2));
+    let (w, l) = e.diag.v1.expect("first window kept");
+    assert_eq!((w.hex().as_str(), l.rts_pad), ("-", Some(false)));
+}
+
+/// Real Pi 5 (main 910d71e7): Reset answered (7 bytes, below the 8-byte RX
+/// trigger), both Read Local Version attempts got nothing. With auto RTS
+/// stuck deasserted at the trigger the controller holds the 15-byte answer;
+/// the bring-up must fall back to driver-driven RTS/CTS and finish there
+/// (patch, 3 Mbaud, BD_ADDR), reporting the stalled first window.
+#[test]
+fn auto_rts_stall_falls_back_to_soft_flow() {
+    let img = synthetic_hcd();
+    let mut f = Fake::new();
+    f.auto_rts_stall = true;
+    f.reboot_window = true;
+    let o = Options { hcd: Some(&img), oper_baud: Some(3_000_000), bdaddr: Some(DT_ADDR), cmd_timeout_us: 5_000 };
+    let r = bringup::bring_up(&mut f, &o).unwrap();
+    assert_eq!(r.flow, bringup::Flow::Soft);
+    assert_eq!((r.reset_tries, r.version_tries), (2, 2));
+    let (w, l) = r.v1.expect("stalled window reported");
+    assert_eq!(w.hex(), "04 0e 0c 01 01 10 00 09");
+    assert_eq!((l.rts_pad, l.mcr), (Some(true), 0x23));
+    assert_eq!(r.ver.lmp_subver, 0x6119);
+    assert_eq!((r.baud, r.bdaddr, r.bdaddr_set), (3_000_000, DT_ADDR, true));
+    assert_eq!(&f.log[..4], [0x0c03, 0x1001, 0x0c03, 0x1001]);
+}
+
+/// A controller that answers in auto mode never sees the fallback.
+#[test]
+fn healthy_controller_stays_in_auto_flow() {
+    let mut f = Fake::new();
+    let r = bringup::bring_up(&mut f, &Options { cmd_timeout_us: 5_000, ..Options::default() }).unwrap();
+    assert_eq!((r.flow, r.v1, r.reset_tries, r.version_tries), (bringup::Flow::Auto, None, 1, 1));
+    assert!(!f.soft);
 }
 
 // ── Device tree ──────────────────────────────────────────────────────────────

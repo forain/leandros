@@ -2,7 +2,8 @@
 //! the byte transport so the whole sequence runs on the host against a
 //! scripted controller:
 //!
-//! HCI Reset → Read Local Version → [Download Minidriver (0xfc2e), 50 ms, every
+//! HCI Reset → Read Local Version (unanswered: driver-driven RTS/CTS, Reset,
+//! again) → [Download Minidriver (0xfc2e), 50 ms, every
 //! `.hcd` record, 250 ms, HCI Reset] → [Update UART Baud Rate (0xfc18), switch
 //! our UART, Read Local Version at the new rate] → Read Local Version →
 //! Read BD_ADDR → [Write BD_ADDR (0xfc01) if the controller still has its
@@ -25,6 +26,69 @@ pub trait Transport {
     fn sleep_ms(&mut self, ms: u32);
     /// SError check after a hardware phase: `Some(syndrome)` aborts the bring-up.
     fn checkpoint(&mut self) -> Option<u64> { None }
+    /// Switches the host UART's flow control; `false` = not supported (kept as is).
+    fn set_flow(&mut self, _f: Flow) -> bool { false }
+    /// Modem-line snapshot for the diagnostics.
+    fn lines(&mut self) -> Lines { Lines::default() }
+}
+
+/// Host-side RTS/CTS handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Flow {
+    /// The UART's own auto RTS/CTS (16550 MCR.AFE; RTS drops at the RX trigger level).
+    #[default]
+    Auto,
+    /// RTS/CTS driven by the driver: RTS asserted only while it polls RX, TX gated
+    /// on MSR.CTS. Fallback when the controller goes silent in `Auto` (pibt-rts:
+    /// Reset's 7-byte answer is below the 8-byte RX trigger, Read Local Version's
+    /// 15 bytes are not).
+    Soft,
+}
+
+/// Modem lines: MCR/MSR as read, the RTS (GPIO 24, ours) / CTS (GPIO 25, the
+/// controller's) pad levels (`None` = unreadable; low = asserted), and how many
+/// CTS changes (MSR.DCTS) the transport has seen so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Lines {
+    pub mcr: u8,
+    pub msr: u8,
+    pub rts_pad: Option<bool>,
+    pub cts_pad: Option<bool>,
+    pub dcts: u32,
+}
+
+impl core::fmt::Display for Lines {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let pad = |v: Option<bool>| match v { Some(true) => '1', Some(false) => '0', None => '?' };
+        write!(f, "mcr={:#x} msr={:#x} rts_pad={} cts_pad={} dcts={}", self.mcr, self.msr, pad(self.rts_pad), pad(self.cts_pad), self.dcts)
+    }
+}
+
+/// Bytes one command's receive window got (first [`DIAG_RX`] kept).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    pub len: u32,
+    pub b: [u8; DIAG_RX],
+}
+
+impl Default for Window { fn default() -> Self { Window::NONE } }
+
+impl Window {
+    pub const NONE: Window = Window { len: 0, b: [0; DIAG_RX] };
+    /// The kept bytes as hex, `-` when nothing arrived.
+    pub fn hex(&self) -> String { hex(&self.b, self.len) }
+}
+
+fn hex(b: &[u8; DIAG_RX], len: u32) -> String {
+    use core::fmt::Write;
+    let n = (len as usize).min(DIAG_RX);
+    if n == 0 { return String::from("-"); }
+    let mut s = String::with_capacity(n * 3);
+    for (i, x) in b[..n].iter().enumerate() {
+        let _ = write!(s, "{}{:02x}", if i == 0 { "" } else { " " }, x);
+    }
+    if len as usize > n { s.push_str(" .."); }
+    s
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,22 +126,22 @@ pub struct Diag {
     pub rx: [u8; DIAG_RX],
     pub reset_tries: u32,
     pub version_tries: u32,
+    /// Flow mode in force at the failure.
+    pub flow: Flow,
+    /// Modem lines at the failure.
+    pub lines: Lines,
+    /// The first Read Local Version window (in `Auto`) and its lines, when it
+    /// went unanswered and the bring-up fell back to [`Flow::Soft`].
+    pub v1: Option<(Window, Lines)>,
 }
 
 impl Diag {
-    pub const NONE: Diag = Diag { baud: 0, rx_len: 0, rx: [0; DIAG_RX], reset_tries: 0, version_tries: 0 };
+    pub const NONE: Diag = Diag {
+        baud: 0, rx_len: 0, rx: [0; DIAG_RX], reset_tries: 0, version_tries: 0,
+        flow: Flow::Auto, lines: Lines { mcr: 0, msr: 0, rts_pad: None, cts_pad: None, dcts: 0 }, v1: None,
+    };
     /// The kept bytes as hex, `-` when nothing arrived.
-    pub fn rx_hex(&self) -> String {
-        use core::fmt::Write;
-        let n = (self.rx_len as usize).min(DIAG_RX);
-        if n == 0 { return String::from("-"); }
-        let mut s = String::with_capacity(n * 3);
-        for (i, b) in self.rx[..n].iter().enumerate() {
-            let _ = write!(s, "{}{:02x}", if i == 0 { "" } else { " " }, b);
-        }
-        if self.rx_len as usize > n { s.push_str(" .."); }
-        s
-    }
+    pub fn rx_hex(&self) -> String { hex(&self.rx, self.rx_len) }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -112,6 +176,10 @@ pub struct Report {
     pub stray_events: u32,
     /// Bytes dropped while resynchronising the H4 stream.
     pub garbage: u32,
+    /// Flow mode the bring-up finished in.
+    pub flow: Flow,
+    /// See [`Diag::v1`]: set when the bring-up fell back to [`Flow::Soft`].
+    pub v1: Option<(Window, Lines)>,
 }
 
 pub const INIT_BAUD: u32 = 115_200;
@@ -138,6 +206,8 @@ struct Hci<'t, T: Transport> {
     rx_len: u32,
     reset_tries: u32,
     version_tries: u32,
+    flow: Flow,
+    v1: Option<(Window, Lines)>,
 }
 
 impl<'t, T: Transport> Hci<'t, T> {
@@ -192,8 +262,21 @@ impl<'t, T: Transport> Hci<'t, T> {
         Ok(())
     }
 
-    fn diag(&self) -> Diag {
-        Diag { baud: self.baud, rx_len: self.rx_len, rx: self.rx, reset_tries: self.reset_tries, version_tries: self.version_tries }
+    fn diag(&mut self) -> Diag {
+        Diag {
+            baud: self.baud, rx_len: self.rx_len, rx: self.rx, reset_tries: self.reset_tries,
+            version_tries: self.version_tries, flow: self.flow, lines: self.t.lines(), v1: self.v1,
+        }
+    }
+
+    /// Reads and drops whatever is still arriving (a stalled answer released by
+    /// a flow change) until the line has been idle for `idle_ms`.
+    fn drain(&mut self, idle_ms: u32) -> u32 {
+        let (mut idle, mut n) = (0u32, 0u32);
+        while idle < idle_ms * 1000 && n < MAX_BYTES_PER_CMD {
+            match self.t.recv(POLL_US) { Some(_) => { n += 1; idle = 0; } None => idle += POLL_US }
+        }
+        n
     }
 
     fn version(&mut self, stage: &'static str) -> Result<LocalVersion, Error> {
@@ -219,6 +302,7 @@ pub fn bring_up<T: Transport>(t: &mut T, o: &Options) -> Result<Report, Error> {
     let mut h = Hci {
         t, p: H4Parser::new(), tx: Vec::with_capacity(260), timeout_us, stray: 0,
         baud: INIT_BAUD, rx: [0; DIAG_RX], rx_len: 0, reset_tries: 0, version_tries: 0,
+        flow: Flow::Auto, v1: None,
     };
     let mut rep = Report { baud: INIT_BAUD, ..Report::default() };
     match sequence(&mut h, o, patch, &mut rep) {
@@ -235,19 +319,27 @@ fn sequence<T: Transport>(h: &mut Hci<'_, T>, o: &Options, patch: Option<(&[u8],
     }
     rep.reset_tries = h.reset_tries;
     h.check("reset")?;
-    // The settle delay is the fix; one more try (after another settle) only
-    // keeps a slow controller from failing the whole bring-up.
+    // Real Pi 5: Reset (7-byte answer) works, Read Local Version (15 bytes)
+    // gets nothing with the UART's auto RTS. Keep that window and the line
+    // state, switch to driver-driven RTS/CTS, release whatever the stalled
+    // controller still holds, then Reset (resync) and ask again.
     h.version_tries = 1;
     rep.rom = match h.version("version") {
         Err(Error { kind: ErrorKind::NoAnswer(_), .. }) => {
+            let w = Window { len: h.rx_len, b: h.rx };
+            let lines = h.t.lines();
+            h.v1 = Some((w, lines));
+            if h.t.set_flow(Flow::Soft) { h.flow = Flow::Soft; }
+            h.drain(20);
             h.p.reset();
-            h.t.sleep_ms(RESET_SETTLE_MS);
             h.version_tries = 2;
+            h.reset("reset-resync")?;
             h.version("version")?
         }
         r => r?,
     };
     rep.version_tries = h.version_tries;
+    rep.reset_tries = h.reset_tries;
     rep.ver = rep.rom;
 
     if let Some((img, sum)) = patch {
@@ -286,6 +378,8 @@ fn sequence<T: Transport>(h: &mut Hci<'_, T>, o: &Options, patch: Option<(&[u8],
     }
     rep.stray_events = h.stray;
     rep.garbage = h.p.garbage;
+    rep.flow = h.flow;
+    rep.v1 = h.v1;
     Ok(())
 }
 
