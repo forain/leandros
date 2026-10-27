@@ -20,7 +20,7 @@
 //!  7. link-up poll (<= 300 ms), CRS visibility, bus numbers and window.
 
 use crate::brcmstb_hw as hw;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 /// Virtual address of the register block (0 until `init` mapped it).
@@ -353,54 +353,49 @@ fn init_inner() {
         return;
     }
     if !stage(15) { REGS.store(0, Ordering::Release); return; }
-    let end = assign_rp1_bars();
-    cfgw32(0, 0x20, hw::bridge_mem_window(hw::OB_MEM_PCI, end));
-    cfgw32(0, 0x24, 0x0000_fff0); // prefetchable window closed
-    cfg_access(0, 0, 0, 0x1c, 2, Some(0x00f0)); // I/O window closed
-    cfg_access(0, 0, 0, 0x04, 2, Some(0x0006));
+    let l = hw::setup_rp1_bars(&mut Cfg);
+    if let Some((at, size)) = l.bar(1) {
+        RP1_BAR1.store(hw::OB_MEM_CPU - hw::OB_MEM_PCI + at, Ordering::Relaxed);
+        RP1_BAR1_SIZE.store(size, Ordering::Release);
+    }
 
     crate::pci::set_cfg_backend(cfg_access, hw::OB_MEM_CPU - hw::OB_MEM_PCI, 1);
     STATE.store(1, Ordering::Relaxed);
     log("[pcie] 0000:01:00.0 1de4:0001");
-    for i in 0..6u16 {
-        let v = cfg32(1, 0x10 + 4 * i);
-        if v & 1 == 0 && (v & !0xf) != 0 || i == 1 {
-            let n = [b' ', b'b', b'a', b'r', b'0' + i as u8, b'='];
-            log(core::str::from_utf8(&n).unwrap_or(" bar?="));
-            print_hex(hw::OB_MEM_CPU + (v & !0xf) as u64);
-        }
+    for (i, b) in l.bars.iter().enumerate() {
+        let n = [b' ', b'b', b'a', b'r', b'0' + i as u8, b'='];
+        log(core::str::from_utf8(&n).unwrap_or(" bar?="));
+        print_hex(hw::OB_MEM_CPU + b.at);
+        log("/");
+        print_hex(b.size);
+        if b.fallback { log("(mask="); print_hex(b.mask as u64); log(")"); }
+        if b.moved { log("(nowrite orig="); print_hex(b.orig as u64); log(")"); }
     }
+    log("\n[pcie] rc window=");
+    match l.win {
+        Some((lo, hi)) => { print_hex(lo); log("-"); print_hex(hi); }
+        None => log("closed"),
+    }
+    log(" rc_win="); print_hex(l.rc_win as u64);
+    log(" rc_cmd="); print_hex(l.rc_cmd as u64);
+    log(" rp1_cmd="); print_hex(l.rp1_cmd as u64);
     log("\n");
 }
 
-/// Sizes RP1's memory BARs and places them largest-first from PCI 0 (BAR1,
-/// the peripheral block, lands at 0 exactly as the firmware DTB's `rp1`
-/// `ranges` assume). Returns the end of the used space.
-fn assign_rp1_bars() -> u64 {
-    let mut reqs = alloc::vec::Vec::new();
-    let cmd = cfg32(1, 0x04);
-    cfgw32(1, 0x04, cmd & !0x7);
-    let mut i = 0u16;
-    while i < 6 {
-        let off = 0x10 + 4 * i;
-        let orig = cfg32(1, off);
-        if orig & 1 != 0 { i += 1; continue; }
-        let is64 = orig & 6 == 4;
-        cfgw32(1, off, 0xffff_ffff);
-        let lo = cfg32(1, off);
-        let hi = if is64 { let h = cfg32(1, off + 4); cfgw32(1, off + 4, 0xffff_ffff); let s = cfg32(1, off + 4); cfgw32(1, off + 4, h); Some(s) } else { None };
-        cfgw32(1, off, orig);
-        let size = hw::bar_size(lo, hi);
-        if size != 0 { reqs.push(hw::BarReq { index: i as usize, size, is64 }); }
-        i += if is64 { 2 } else { 1 };
-    }
-    let (placed, end) = hw::assign_bars(&reqs, hw::OB_MEM_PCI, hw::OB_MEM_PCI + hw::OB_MEM_SIZE);
-    for (idx, at) in placed {
-        let off = 0x10 + 4 * idx as u16;
-        let flags = cfg32(1, off) & 0xf;
-        cfgw32(1, off, at as u32 | flags);
-        if reqs.iter().any(|r| r.index == idx && r.is64) { cfgw32(1, off + 4, (at >> 32) as u32); }
-    }
-    cfgw32(1, 0x04, cmd | 0x2); // memory decode on (bus master is the driver's call)
-    end
+/// Dword config accessor for the stage-15 BAR/window setup.
+struct Cfg;
+impl hw::CfgSpace for Cfg {
+    fn rd(&mut self, bus: u8, off: u16) -> u32 { cfg32(bus, off) }
+    fn wr(&mut self, bus: u8, off: u16, v: u32) { cfgw32(bus, off, v) }
 }
+
+static RP1_BAR1: AtomicU64 = AtomicU64::new(0);
+static RP1_BAR1_SIZE: AtomicU64 = AtomicU64::new(0);
+
+/// CPU physical address and size of RP1's BAR1 as placed and read back at
+/// bring-up (inside the open root-port window), or None.
+pub fn rp1_bar1() -> Option<(u64, u64)> {
+    let size = RP1_BAR1_SIZE.load(Ordering::Acquire);
+    if size == 0 { None } else { Some((RP1_BAR1.load(Ordering::Relaxed), size)) }
+}
+

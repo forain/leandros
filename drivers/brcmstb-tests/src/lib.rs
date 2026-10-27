@@ -231,4 +231,92 @@ mod tests {
             assert!(m.rc_writes().is_empty());
         }
     }
+
+    /// Recording mock of root-port + RP1 config space. RP1 BARs decode with
+    /// the real sizes; `drop_bar_writes` models BAR writes that never land
+    /// (the first Pi 5 boot showed BAR1=0x80_0000 BAR0=0x84_0000).
+    struct CfgMock { rc: std::collections::HashMap<u16, u32>, bar: [u32; 6], cmd: u32, drop_bar_writes: bool, log: Vec<(u8, u16, u32)> }
+    const RP1_MASKS: [u32; 6] = [0xffff_c000, 0xffc0_0000, 0xffff_0000, 0, 0, 0];
+    impl CfgMock {
+        fn new(bar: [u32; 6], drop_bar_writes: bool) -> Self {
+            CfgMock { rc: Default::default(), bar, cmd: 0, drop_bar_writes, log: Vec::new() }
+        }
+        /// CPU address → does RP1 BAR1 answer it (window open, decode on, inside BAR1)?
+        fn bar1_answers(&self, cpu: u64) -> bool {
+            let w = *self.rc.get(&0x20).unwrap_or(&0);
+            let (base, lim) = (((w & 0xfff0) as u64) << 16, (((w >> 16) & 0xfff0) as u64) << 16 | 0xf_ffff);
+            let pci = cpu - OB_MEM_CPU + OB_MEM_PCI;
+            let rc_mem = self.rc.get(&0x04).map_or(false, |c| c & 2 != 0);
+            let b1 = self.bar[1] as u64 & !0xf;
+            rc_mem && self.cmd & 2 != 0 && base <= lim && pci >= base && pci <= lim && pci >= b1 && pci < b1 + 0x40_0000
+        }
+    }
+    impl CfgSpace for CfgMock {
+        fn rd(&mut self, bus: u8, off: u16) -> u32 {
+            assert!(off & 3 == 0);
+            if bus == 0 { return *self.rc.get(&off).unwrap_or(&0); }
+            match off { 0x04 => self.cmd, 0x10..=0x24 => self.bar[(off as usize - 0x10) / 4], _ => 0 }
+        }
+        fn wr(&mut self, bus: u8, off: u16, v: u32) {
+            assert!(off & 3 == 0);
+            self.log.push((bus, off, v));
+            if bus == 0 { self.rc.insert(off, v); return; }
+            match off {
+                0x04 => self.cmd = v & 0xffff,
+                0x10..=0x24 => {
+                    let i = (off as usize - 0x10) / 4;
+                    if !self.drop_bar_writes { self.bar[i] = v & RP1_MASKS[i]; }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn rp1_bars_land_at_dtb_layout_and_window_opens() {
+        let mut m = CfgMock::new([0; 6], false);
+        let l = setup_rp1_bars(&mut m);
+        assert_eq!([l.bars[0].at, l.bars[1].at, l.bars[2].at], [0x41_0000, 0, 0x40_0000]);
+        assert_eq!([l.bars[0].size, l.bars[1].size, l.bars[2].size], [0x4000, 0x40_0000, 0x1_0000]);
+        assert!(l.bars.iter().all(|b| !b.fallback && !b.moved));
+        assert_eq!(l.win, Some((0, 0x4f_ffff)));
+        assert_eq!(l.rc_win, 0x0040_0000);
+        assert_eq!(l.rc_cmd & 6, 6);
+        assert_eq!(l.rp1_cmd & 2, 2);
+        assert_eq!(l.bar(1), Some((0, 0x40_0000)));
+        // chip id = BAR1 + 0 = CPU 0x1f_0000_0000 reaches RP1.
+        assert!(m.bar1_answers(OB_MEM_CPU + l.bar(1).unwrap().0 + RP1_SYSINFO_CHIP_ID as u64));
+        // Every config write is a dword at a dword offset (asserted in the mock).
+        assert!(m.log.iter().any(|&(b, o, _)| b == 0 && o == 0x20));
+    }
+
+    #[test]
+    fn rp1_window_covers_bars_even_when_bar_writes_do_not_land() {
+        // First Pi 5 boot: BARs read 0x84_0000 / 0x80_0000 / 0 and the old code
+        // derived the window from the (empty) assignment → closed → all-ones.
+        let pre = [0x84_0000, 0x80_0000, 0, 0, 0, 0];
+        let old_reqs: Vec<BarReq> = (0..3).filter_map(|i| {
+            let s = bar_size(pre[i], None); // sizing read-back == orig
+            (s != 0).then_some(BarReq { index: i, size: s, is64: false })
+        }).collect();
+        let (_, old_end) = assign_bars(&old_reqs, 0, 0xffff_fffc);
+        assert_eq!(bridge_mem_window(0, old_end), 0x0000_fff0, "old code: window closed");
+
+        let mut m = CfgMock::new(pre, true);
+        let l = setup_rp1_bars(&mut m);
+        assert!(l.bars[1].fallback && l.bars[1].moved);
+        assert_eq!(l.bar(1), Some((0x80_0000, 0x40_0000)));
+        let (lo, hi) = l.win.unwrap();
+        assert!(lo <= 0x80_0000 && hi >= 0xbf_ffff);
+        assert!(m.bar1_answers(OB_MEM_CPU + 0x80_0000));
+    }
+
+    #[test]
+    fn rp1_bar_print_is_cpu_address_bar_is_pci_address() {
+        let mut m = CfgMock::new([0; 6], false);
+        let l = setup_rp1_bars(&mut m);
+        // The BAR register holds the PCI address (window translation 0x1f_0000_0000 → 0).
+        assert_eq!(m.bar[1] & !0xf, 0);
+        assert_eq!(OB_MEM_CPU - OB_MEM_PCI + l.bar(1).unwrap().0, 0x1f_0000_0000);
+    }
 }

@@ -52,12 +52,16 @@ pub fn probe() {
     if !crate::brcmstb_pcie::is_up() || PROBED.swap(true, Ordering::AcqRel) { return; }
     let Some(f) = rp1() else { log("[rp1] FAIL not enumerated\n"); return };
     f.enable_mem_and_bus_master();
-    let Some((va, size)) = f.map_bar(1, mm::kva::CacheMode::Uncached) else { log("[rp1] FAIL bar1 map\n"); return };
+    // BAR1 as stage 15 placed and read it back (no live re-sizing here).
+    let Some((pa, size)) = crate::brcmstb_pcie::rp1_bar1() else { log("[rp1] FAIL bar1 outside rc window\n"); return };
+    let Some(va) = mm::kva::ioremap(pa, size as usize, mm::kva::CacheMode::Uncached) else { log("[rp1] FAIL bar1 map\n"); return };
     let (chip, plat) = unsafe {
         (leandros_lib::mmio::read((va + hw::RP1_SYSINFO_CHIP_ID) as *const u32),
          leandros_lib::mmio::read((va + hw::RP1_SYSINFO_PLATFORM) as *const u32))
     };
-    log("[rp1] chip_id=");
+    log("[rp1] bar1=");
+    hex(pa);
+    log(" chip_id=");
     hex(chip as u64);
     log(" platform=");
     hex(plat as u64);

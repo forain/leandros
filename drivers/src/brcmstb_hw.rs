@@ -416,3 +416,116 @@ pub fn perst_serdes<B: PcieBus>(b: &mut B) {
     b.wr(Blk::Rc, HARD_DEBUG, hd & !HARD_DEBUG_SERDES_IDDQ);
     b.udelay(150);
 }
+
+// ── RP1 BAR placement + root-port window (stage 15) ─────────────────────────
+// Every config write here is a full dword (sub-word writes into the
+// EXT_CFG_DATA window are avoided) and every placement is read back: the
+// root-port memory window is computed from where the BARs really are, never
+// from what was asked for. On the first Pi 5 boot the window was derived from
+// the assignment's `end`; nothing got placed, `end` stayed 0, the window was
+// written closed and every BAR access came back all-ones.
+
+/// Dword config access to `bus` 0 (root port) or 1 (RP1), device 0.
+pub trait CfgSpace {
+    fn rd(&mut self, bus: u8, off: u16) -> u32;
+    fn wr(&mut self, bus: u8, off: u16, v: u32);
+}
+
+/// RP1 BAR sizes (BAR0 MSI-X/config 16 KiB, BAR1 peripherals 4 MiB, BAR2
+/// shared SRAM 64 KiB). Used only when a sizing read-back is not a valid mask.
+pub const RP1_BAR_SIZES: [u64; 3] = [0x4000, 0x40_0000, 0x1_0000];
+pub const CMD_MEM: u32 = 1 << 1;
+pub const CMD_MASTER: u32 = 1 << 2;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rp1Bar {
+    /// Original value, sizing read-back, size used, PCI address read back.
+    pub orig: u32, pub mask: u32, pub size: u64, pub at: u64,
+    /// The sizing read-back was not a valid mask (size taken from RP1_BAR_SIZES).
+    pub fallback: bool,
+    /// The placement write did not read back.
+    pub moved: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rp1Layout {
+    pub bars: [Rp1Bar; 3],
+    /// Root-port window [base, limit] as PCI addresses, None = closed.
+    pub win: Option<(u64, u64)>,
+    /// Root-port command and window dwords read back.
+    pub rc_cmd: u32, pub rc_win: u32,
+    pub rp1_cmd: u32,
+}
+
+impl Rp1Layout {
+    /// PCI address and size of BAR `i`, if it is mapped inside the window.
+    pub fn bar(&self, i: usize) -> Option<(u64, u64)> {
+        let b = self.bars.get(i)?;
+        let (lo, hi) = self.win?;
+        (b.size != 0 && b.at >= lo && b.at + b.size - 1 <= hi).then_some((b.at, b.size))
+    }
+}
+
+fn valid_mask_size(mask: u32, orig: u32) -> u64 {
+    if mask == orig || mask == 0xffff_ffff { return 0; }
+    let s = bar_size(mask, None);
+    if s.is_power_of_two() && s >= 16 && s <= 0x1000_0000 { s } else { 0 }
+}
+
+/// Stage 15: size RP1's three 32-bit memory BARs, place them at the DTB
+/// layout (BAR1 at PCI 0, BAR2 after it, BAR0 after that), read every BAR
+/// back, then open the root port's memory window over the BARs as they really
+/// are, enable root-port memory + bus master and RP1 memory decode.
+pub fn setup_rp1_bars<C: CfgSpace>(c: &mut C) -> Rp1Layout {
+    let mut l = Rp1Layout::default();
+    let cmd = c.rd(1, 0x04) & 0xffff;
+    c.wr(1, 0x04, cmd & !(CMD_MEM | CMD_MASTER | 1));
+    let mut reqs = alloc::vec::Vec::new();
+    for i in 0..3 {
+        let off = 0x10 + 4 * i as u16;
+        let orig = c.rd(1, off);
+        c.wr(1, off, 0xffff_ffff);
+        let mask = c.rd(1, off);
+        c.wr(1, off, orig);
+        let b = &mut l.bars[i];
+        b.orig = orig;
+        b.mask = mask;
+        if orig & 1 != 0 { continue; } // I/O: RP1 has none
+        b.size = valid_mask_size(mask, orig);
+        if b.size == 0 { b.size = RP1_BAR_SIZES[i]; b.fallback = true; }
+        reqs.push(BarReq { index: i, size: b.size, is64: false });
+    }
+    let (placed, _) = assign_bars(&reqs, OB_MEM_PCI, OB_MEM_PCI + OB_MEM_SIZE);
+    for (i, at) in placed {
+        let off = 0x10 + 4 * i as u16;
+        c.wr(1, off, at as u32 | (l.bars[i].orig & 0xf));
+        let rb = c.rd(1, off);
+        if rb & !0xf != at as u32 { l.bars[i].moved = true; }
+    }
+    let (mut lo, mut hi) = (u64::MAX, 0u64);
+    for i in 0..3 {
+        let off = 0x10 + 4 * i as u16;
+        let b = &mut l.bars[i];
+        if b.orig & 1 != 0 || b.size == 0 { continue; }
+        b.at = (c.rd(1, off) & !0xf) as u64;
+        lo = lo.min(b.at);
+        hi = hi.max(b.at + b.size - 1);
+    }
+    if lo != u64::MAX {
+        let end = (hi | 0xf_ffff) + 1;
+        if end <= 1 << 32 { l.win = Some((lo & !0xf_ffff, end - 1)); }
+    }
+    let w = match l.win { Some((b, lim)) => bridge_mem_window(b, lim + 1), None => 0x0000_fff0 };
+    c.wr(0, 0x20, w);
+    c.wr(0, 0x24, 0x0000_fff0); // prefetchable window closed
+    c.wr(0, 0x28, 0);
+    c.wr(0, 0x2c, 0);
+    c.wr(0, 0x1c, 0x0000_00f0); // I/O window closed, secondary status untouched
+    let rc = c.rd(0, 0x04) & 0xffff;
+    c.wr(0, 0x04, rc | CMD_MEM | CMD_MASTER);
+    c.wr(1, 0x04, cmd | CMD_MEM);
+    l.rc_cmd = c.rd(0, 0x04) & 0xffff;
+    l.rc_win = c.rd(0, 0x20);
+    l.rp1_cmd = c.rd(1, 0x04) & 0xffff;
+    l
+}
