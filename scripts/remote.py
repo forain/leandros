@@ -860,9 +860,19 @@ def pi_kexec(t, slot, append, timeout):
     t.run("echo remdbg > /tmp/.remdbg-alive && sync", check=False, timeout=60)
     print(f"kexec into {slot} on {t.label()} (was: {before})")
     t0 = time.time()
-    # Detached: the ssh session dies with the old kernel.
-    t.run("(sleep 1; /bin/kexec -e) </dev/null >/dev/null 2>&1 &", check=False, timeout=15)
+    # In the FOREGROUND, like `/bin/reboot` in do_reboot: the syscall never
+    # returns on success and the ssh call just times out. A backgrounded
+    # `(sleep 1; kexec -e) &` does not survive: our sshd SIGHUPs the session's
+    # process group when the channel closes (userland/sshd/src/session.rs
+    # channel_close), and a non-interactive shell keeps `&` jobs in that group.
+    # This must also work against the old, already-deployed userland.
+    r = t.run("/bin/kexec -e </dev/null 2>&1", check=False, timeout=20, master=False)
     t.close_master()
+    if r is not None and r.returncode != 255:
+        msg = (r.stdout or b"").decode(errors="replace").strip()
+        print(f"\nKEXEC NOT EXECUTED: kexec loaded but `kexec -e` returned rc={r.returncode} "
+              f"on the old kernel ({before}): {msg[-400:] or '(no output)'}", file=sys.stderr)
+        return False
     back = False
     while time.time() - t0 < timeout:
         r = probe(t, "test -e /tmp/.remdbg-alive")
@@ -871,6 +881,13 @@ def pi_kexec(t, slot, append, timeout):
             break
         time.sleep(2)
     if not back:
+        if probe(t, "test -e /tmp/.remdbg-alive") == 0:
+            u = t.run("uname -v", check=False, timeout=15, master=False)
+            same = u is not None and u.stdout.decode(errors="replace").strip() == before
+            print(f"\nKEXEC NOT EXECUTED: kexec loaded but the old kernel is still answering on {t.host} "
+                  f"after {timeout} s ({'same uname -v' if same else 'uname -v changed?'}, /tmp/.remdbg-alive "
+                  f"still present). Run `/bin/kexec -e` on the serial console, or retry pi-boot.", file=sys.stderr)
+            return False
         print(f"\nKEXEC FAILED: nothing new answering on {t.host} after {timeout} s.\n"
               f"Power-cycle the Pi: the firmware boots the card's kernel.img (never touched by\n"
               f"remote.py). The serial console (uart10) shows how far the new kernel got.", file=sys.stderr)

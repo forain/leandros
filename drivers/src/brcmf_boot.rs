@@ -19,7 +19,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::Mutex;
 
 use crate::brcmf::bcdc::Brcmf;
@@ -71,7 +71,34 @@ fn log(msg: &str) {
     unsafe { serial_print_str_raw(s.as_ptr(), s.len()); }
 }
 
+/// Text of the last `[brcmf] fail ...` line (drives the automatic retry).
+static LAST_FAIL: Mutex<String> = Mutex::new(String::new());
+/// Set by [`shutdown`]: no more probes or retries, the thread parks.
+static SHUT: AtomicBool = AtomicBool::new(false);
+
+/// Reboot/kexec quiesce (kernel `power::quiesce_phase1`, task context, IRQs
+/// on): disassociate + WLC_DOWN through the driver thread (bounded wait),
+/// then power the chip off and hold WL_REG_ON low across the jump, so the
+/// next kernel finds a chip in power-on reset. None when sdio2 was never
+/// probed (not a Pi 5, or brcmf=0).
+pub fn shutdown() -> Option<String> {
+    SHUT.store(true, Ordering::Release);
+    let t0 = now_ms();
+    let polite = if crate::brcmf::netdev::request_shutdown() {
+        while !crate::brcmf::netdev::shutdown_done() && now_ms() - t0 < SHUTDOWN_WAIT_MS {
+            sched::kthread::msleep(10);
+        }
+        if crate::brcmf::netdev::shutdown_done() { "disassoc+down" } else { "driver busy (no answer), forced" }
+    } else {
+        "driver not running"
+    };
+    let hw = sdio_host::power_off()?;
+    Some(format!("brcmf: {} in {} ms; {}", polite, now_ms() - t0, hw))
+}
+const SHUTDOWN_WAIT_MS: u64 = 500;
+
 fn fail(msg: &str) {
+    *LAST_FAIL.lock() = String::from(msg);
     STATE.store(STATE_FAILED, Ordering::Release);
     crate::brcmf::netdev::set_stage("bring-up failed (brcmfctl diag|retry)");
     crate::brcmf::netdev::set_error(msg);
@@ -146,7 +173,7 @@ impl Default for Opts {
             fw: String::from(fw::FW_PATH),
             nvram: None,
             clm: String::from(fw::CLM_PATH),
-            wloff_ms: 20,
+            wloff_ms: crate::brcmf::power::WL_OFF_BOOT_US / 1000,
             wlon_ms: 150,
             lines: 12,
             sd: SdioTune::default(),
@@ -400,6 +427,7 @@ fn run(host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>) {
     let mut opts = Opts::default();
     let mut next = Some(host);
     let mut tries = 0u32;
+    let mut auto = 0u32;
     let mut parked: Option<(SdioHost<Mmio>, Chip)> = None;
     // A `retry` received while wifi0 was running.
     let mut pending: Option<String> = None;
@@ -410,14 +438,28 @@ fn run(host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>) {
             match attempt(h, dt_mac, &opts) {
                 Outcome::Ready(dev) => match hand_off(dev) {
                     None => return,
+                    Some(_) if SHUT.load(Ordering::Acquire) => { log("shutdown: driver stopped, chip parked"); return; }
                     Some(text) => { seen = read_ctl(); pending = Some(text); }
                 },
                 Outcome::Failed(p) => {
                     parked = p;
                     STATE.store(STATE_FAILED, Ordering::Release);
-                    if tries == 0 {
-                        log(&format!("ctl: waiting for commands in {} (brcmfctl retry|diag|status)", CTL_PATH));
+                    if SHUT.load(Ordering::Acquire) { return; }
+                    let why = LAST_FAIL.lock().clone();
+                    if let Some(off) = crate::brcmf::power::auto_retry_off_us(&why, auto) {
+                        auto += 1;
+                        log(&format!("auto-retry #{}: '{}' looks like stale chip state; power-cycling (WL_REG_ON low {} ms)",
+                                     auto, why, off / 1000));
+                        parked = None;
+                        sdio_host::probe_with(off, opts.wlon_ms.saturating_mul(1000), opts.sd);
+                        next = sdio_host::take_host();
+                        if next.is_none() {
+                            fail("no-sdio-host (sdio probe failed; see the [sdio] line)");
+                        } else {
+                            continue;
+                        }
                     }
+                    log(&format!("ctl: waiting for commands in {} (brcmfctl retry|diag|status)", CTL_PATH));
                 }
             }
         }
@@ -433,6 +475,7 @@ fn run(host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>) {
                 String::from_utf8_lossy(cur.as_deref().unwrap_or(&[])).into_owned()
             }
         };
+        if SHUT.load(Ordering::Acquire) { return; }
         if let Some(o) = ctl_command(text.trim(), &mut parked, tries) {
             tries += 1;
             opts = o;

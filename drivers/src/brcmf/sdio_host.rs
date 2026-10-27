@@ -713,7 +713,7 @@ pub fn read_chip_id<B: SdioBus>(bus: &mut B) -> Result<(u32, bool), BusError> {
 
 // ── Raspberry Pi 5 hardware: power path, pin mux, MMIO, boot probe ───────────
 #[cfg(feature = "rpi5")]
-pub use hw::{boot_probe, probe, probe_with, take_host, Mmio, PROBE_STATE};
+pub use hw::{boot_probe, power_off, probe, probe_with, take_host, Mmio, PROBE_STATE};
 
 #[cfg(feature = "rpi5")]
 mod hw {
@@ -802,7 +802,23 @@ mod hw {
     /// Mappings made once (the probe re-runs from `brcmfctl retry`).
     static MAPS: Mutex<Option<(usize, usize)>> = Mutex::new(None);
 
-    pub fn boot_probe() { probe(20_000, WL_ON_STARTUP_US as u32) }
+    pub fn boot_probe() { probe(crate::brcmf::power::WL_OFF_BOOT_US, WL_ON_STARTUP_US as u32) }
+
+    /// Reboot/kexec quiesce: SDIO host reset with clock and bus power off,
+    /// then WL_REG_ON low, held across the jump (the next kernel's probe
+    /// drives it high again). Only touches the hardware when a probe mapped
+    /// it; lock-free against a wedged brcmf thread (try_lock).
+    pub fn power_off() -> Option<&'static str> {
+        let (host, _cfg) = (*MAPS.try_lock()?)?;
+        let mut q = Mmio { host };
+        q.w16(REG_NORMAL_SIG_ENABLE, 0);
+        q.w16(REG_ERROR_SIG_ENABLE, 0);
+        q.w16(REG_CLOCK_CONTROL, 0);
+        q.w8(REG_POWER_CONTROL, 0);
+        q.w8(REG_SOFTWARE_RESET, SWRST_ALL);
+        wl_reg_on(false);
+        Some("sdio2 host reset, SD clock + bus power off, WL_REG_ON low")
+    }
 
     pub fn probe(off_us: u32, on_us: u32) { probe_with(off_us, on_us, SdioTune::default()) }
 
@@ -833,7 +849,7 @@ mod hw {
         }
         // The CYW43455 keeps running across kexec, and so may this host. Always
         // quiesce the host (full reset, SD clock and bus power off), then pulse
-        // WL_REG_ON low (≥ 10 ms) → high and wait the regulator's startup delay,
+        // WL_REG_ON low (≥ 100 ms, brcmf::power) → high and wait the regulator's startup delay,
         // even when the chip already looks powered. host_init resets again.
         {
             let mut q = Mmio { host };
@@ -844,8 +860,9 @@ mod hw {
             q.w16(REG_CLOCK_CONTROL, 0);
             q.w8(REG_POWER_CONTROL, 0);
         }
+        let off_us = crate::brcmf::power::off_us(off_us);
         wl_reg_on(false);
-        sched::kthread::udelay(off_us.max(1_000) as u64);
+        sched::kthread::udelay(off_us as u64);
         wl_reg_on(true);
         sched::kthread::udelay(on_us as u64);
 
@@ -866,9 +883,9 @@ mod hw {
                 return;
             }
         };
-        slog!("sdio2 base={:#x} ocr={:#08x} rca={:#06x} cccr={:#04x} caps={:#04x} funcs={} manf={:#06x}:{:#06x} bus={}bit {}kHz{} {}",
+        slog!("sdio2 base={:#x} ocr={:#08x} rca={:#06x} cccr={:#04x} caps={:#04x} funcs={} manf={:#06x}:{:#06x} bus={}bit {}kHz{} {} wloff={}ms",
               SDIO2_HOST_PHYS, ci.ocr, ci.rca, ci.cccr_rev, ci.caps, ci.nfuncs, ci.manf, ci.card,
-              if ci.width4 { 4 } else { 1 }, ci.clk_khz, if ci.high_speed { " hs" } else { "" }, mux);
+              if ci.width4 { 4 } else { 1 }, ci.clk_khz, if ci.high_speed { " hs" } else { "" }, mux, off_us / 1000);
         if tune != SdioTune::default() {
             slog!("tune sdclk={} hs={} blk={} blksz={} chunk={}", tune.sdclk_khz, tune.hs as u8, tune.blk as u8, tune.f1_blksz, tune.chunk);
         }
