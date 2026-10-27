@@ -1,0 +1,14 @@
+[package]
+name = "bthid-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Host-only test crate: compiles drivers/src/bthid/report.rs via #[path] and
+# runs it against HID descriptors and report streams. Detached from the kernel
+# workspace.
+# Run: cargo test --manifest-path drivers/bthid-tests/Cargo.toml --target <host-triple>
+[workspace]
+
+[lib]
+path = "src/lib.rs"
