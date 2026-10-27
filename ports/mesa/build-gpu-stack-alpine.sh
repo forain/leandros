@@ -59,6 +59,8 @@ fi
     libdisplay-info=0.3.0-r1 libdisplay-info-dev=0.3.0-r1
   NVK="${NVK:-1}"
   VKDRV=virtio
+  # v3dv (libvulkan_broadcom.so): the Raspberry Pi 5's Vulkan ICD. No LLVM.
+  [ "$ARCH" = aarch64 ] && VKDRV=$VKDRV,broadcom
   [ "$INTEL" = 1 ] && VKDRV=$VKDRV,intel
   NEEDCLC=0
   if [ "$NVK" = 1 ] || [ "$INTEL" = 1 ]; then NEEDCLC=1; fi
@@ -153,6 +155,13 @@ fi
   cc -O2 -fno-stack-protector -o "$S/usr/bin/gpuprobe" /src/gpuprobe.c \
     -I"$S/usr/include" -L"$S/usr/lib" -Wl,-rpath-link,"$S/usr/lib" \
     -lEGL -lGLESv2 -lgbm /tmp/ssp_guard.o
+  # Pi GPU smoke tests (scripts/pi-gpu-smoke.sh): GLES 3.1 compute, and a
+  # Vulkan fill through the Khronos loader. Both print one PASS/FAIL line.
+  cc -O2 -fno-stack-protector -o "$S/usr/bin/es31test" /src/es31test.c \
+    -I"$S/usr/include" -L"$S/usr/lib" -Wl,-rpath-link,"$S/usr/lib" \
+    -lEGL -lGLESv2 -lgbm /tmp/ssp_guard.o
+  cc -O2 -fno-stack-protector -o "$S/usr/bin/vkprobe" /src/vkprobe.c \
+    /usr/lib/libvulkan.so.1 /tmp/ssp_guard.o
   # The loader zink dlopen()s, and the zstd runtime the shader cache needs
   # (the older softpipe-only sysroots never had it).
   cp -L /usr/lib/libvulkan.so.1 "$S/usr/lib/"
@@ -187,6 +196,11 @@ fi
     cat "$S/usr/share/vulkan/icd.d/"nouveau_icd*.json
     NVKLIB=libvulkan_nouveau.so ;;
   esac
+  case "$VKDRV" in *broadcom*)
+    ls -l libvulkan_broadcom.so
+    cat "$S/usr/share/vulkan/icd.d/"broadcom_icd*.json
+    NVKLIB="$NVKLIB libvulkan_broadcom.so" ;;
+  esac
   if [ "$INTEL" = 1 ]; then
     ls -l libvulkan_intel.so
     cat "$S/usr/share/vulkan/icd.d/"intel_icd*.json
@@ -203,6 +217,12 @@ fi
   if readelf -d libgallium-25.3.6.so libvulkan_virtio.so $NVKLIB | grep -E 'NEEDED.*(libLLVM|libclang|libSPIRV|libLLVMSPIRV)'; then
     echo "toolchain library leaked into NEEDED"; exit 6
   fi
+  # Mesa's disk cache keys on the GNU build-id of the driver it runs from
+  # (build_id_find_nhdr_for_addr); a megadriver/ICD linked without one
+  # dereferences NULL+0x10 at screen creation (lane kmscube2, FAR=0x10).
+  for f in libgallium-25.3.6.so libvulkan_virtio.so $NVKLIB; do
+    readelf -n "$f" | grep -q 'Build ID' || { echo "no GNU build-id note: $f"; exit 7; }
+  done
   # Every shipped ELF that imports __stack_chk_guard must be able to find it.
   for f in $(find . ../bin -type f); do
     file "$f" | grep -q ELF || continue

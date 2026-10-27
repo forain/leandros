@@ -4534,7 +4534,28 @@ pub fn v3d_active() -> bool {
 /// Arm or disarm the v3d backend. Called from `SET_CLIENT_CAP`, and intended to
 /// be called from a real Pi 5 GPU probe once one exists.
 pub fn v3d_set_enabled(on: bool) {
+    // A real, probed V3D stays armed: the QEMU guard (`drmsmoke --arm-v3d`) always
+    // disarms when it finishes, and on a Pi that would silently drop every later
+    // Mesa client to software.
+    if !on && V3D_HW_ARMED.load(Ordering::Relaxed) {
+        return;
+    }
     V3D_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Set once by the Pi 5 probe (`v3d::hw::probe_boot`, phase F) when the real GPU's MMU and
+/// CL queue are up. Never set on QEMU virt: that probe is `rpi5`-only.
+static V3D_HW_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Arm the v3d backend for real hardware, latched for the rest of the boot.
+pub fn v3d_arm_hw() {
+    V3D_HW_ARMED.store(true, Ordering::Relaxed);
+    V3D_ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// Was the backend armed by the hardware probe (as opposed to the QEMU client cap)?
+pub fn v3d_hw_armed() -> bool {
+    V3D_HW_ARMED.load(Ordering::Relaxed)
 }
 
 // ── GPU virtual address space ────────────────────────────────────────────────
@@ -7324,7 +7345,8 @@ impl DrmDeviceInterface {
                 crate::pci::serial_debug(if cap.value != 0 {
                     "[DRM] v3d backend ARMED (card0 and renderD128 now report \"v3d\")\n"
                 } else {
-                    "[DRM] v3d backend disarmed\n"
+                    if v3d_hw_armed() { "[DRM] v3d disarm ignored (real hardware, latched)\n" }
+                    else { "[DRM] v3d backend disarmed\n" }
                 });
                 Ok(0)
             }

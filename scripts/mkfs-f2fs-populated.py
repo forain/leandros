@@ -45,6 +45,43 @@ DT_LNK = 10
 
 S_IFLNK = 0o120000
 
+
+# The Pi 5 V3D's uevent as Linux's v3d platform driver exposes it (libdrm
+# reads OF_FULLNAME for the bus info and OF_COMPATIBLE_N/_<i> for the device
+# info; both must parse or the device is skipped).
+RPI5_V3D_UEVENT = (
+    "DRIVER=v3d\n"
+    "OF_NAME=v3d\n"
+    "OF_FULLNAME=/axi/v3d@2000000\n"
+    "OF_COMPATIBLE_0=brcm,2712-v3d\n"
+    "OF_COMPATIBLE_N=1\n"
+    "MODALIAS=of:Nv3dT(null)Cbrcm,2712-v3d\n"
+)
+
+
+def elf_has_gnu_build_id(path):
+    """True if the ELF64 file carries an NT_GNU_BUILD_ID note in any PT_NOTE."""
+    import struct as _st
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:4] != b"\x7fELF" or data[4] != 2:
+        return False
+    e_phoff, = _st.unpack_from("<Q", data, 0x20)
+    e_phentsize, e_phnum = _st.unpack_from("<HH", data, 0x36)
+    for i in range(e_phnum):
+        p_type, _flags, p_off, _va, _pa, p_filesz = _st.unpack_from("<IIQQQQ", data, e_phoff + i * e_phentsize)
+        if p_type != 4:  # PT_NOTE
+            continue
+        off, end = p_off, p_off + p_filesz
+        while off + 12 <= end:
+            namesz, descsz, ntype = _st.unpack_from("<III", data, off)
+            name = data[off + 12: off + 12 + namesz]
+            if ntype == 3 and name.rstrip(b"\0") == b"GNU" and descsz > 0:
+                return True
+            off += 12 + ((namesz + 3) & ~3) + ((descsz + 3) & ~3)
+    return False
+
+
 def _greetd_src_hash():
     """sha256 over the pam-leandros sources (sorted by name, concatenated).
     ports/greetd/build.sh writes the same value to greetd.srchash."""
@@ -694,6 +731,22 @@ def main():
     _gpuprobe = f"{gpu_stage}/usr/bin/gpuprobe"
     if os.path.exists(_gpuprobe):
         bin_files.append(("gpuprobe", _gpuprobe, 0o100755))
+    # Pi GPU smoke tests (scripts/pi-gpu-smoke.sh), built with the stage:
+    # es31test = GLES 3.1 compute (V3D SUBMIT_CSD), vkprobe = Vulkan fill via
+    # the Khronos loader. Absent from older stages: simply not packed.
+    for _smoke in ("es31test", "vkprobe"):
+        _sp = f"{gpu_stage}/usr/bin/{_smoke}"
+        if os.path.exists(_sp):
+            bin_files.append((_smoke, _sp, 0o100755))
+    # Mesa's disk cache dereferences the driver's NT_GNU_BUILD_ID note; a
+    # megadriver/ICD linked without one faults at screen creation with
+    # FAR=0x10 (lane kmscube2, #98 tail). Refuse to pack one.
+    for _bid in ("libgallium-25.3.6.so", "libvulkan_virtio.so", "libvulkan_broadcom.so",
+                 "libvulkan_nouveau.so", "libvulkan_intel.so"):
+        _bp = f"{gpu_lib_dir}/{_bid}"
+        if os.path.exists(_bp) and not elf_has_gnu_build_id(_bp):
+            sys.exit(f"❌ {_bp} has no GNU build-id note (Mesa faults at FAR=0x10 without one); "
+                     f"relink with -Wl,--build-id (ports/mesa/build-gpu-stack.sh {arch})")
     gbm_files = []
     for so in ("libEGL.so.1", "libGLESv2.so.2", "libgbm.so.1", "libdrm.so.2",
                "libgallium-25.3.6.so", "libexpat.so.1", "libz.so.1",
@@ -911,6 +964,8 @@ def main():
     # synthesizes the *contents* of /sys/class/block (see block::is_sysfs_path),
     # so the directories themselves must exist on disk for `ls /sys/class` to
     # list `block` at all.
+    if os.environ.get("LEANDROS_BOARD") == "rpi5":
+        m4_share_dirs.add("/sys/bus/platform")
     for d in ("/sys", "/sys/bus", "/sys/bus/pci", "/sys/bus/pci/devices",
               "/sys/class", "/sys/class/block"):
         m4_share_dirs.add(d)
@@ -928,6 +983,17 @@ def main():
             m4_share_dirs.add(d)
         # `../../../../bus/pci`: from /sys/dev/char/<maj>:<min>/device, four
         # levels up is /sys. Only the trailing "/pci" is ever inspected.
+        if os.environ.get("LEANDROS_BOARD") == "rpi5":
+            # Raspberry Pi 5: the DRM device is the V3D 7.1 platform device
+            # (DT /axi/v3d@2000000). libdrm's drmGetDevices2 classifies it from
+            # the `subsystem` link name and reads OF_FULLNAME + OF_COMPATIBLE_*
+            # from uevent; v3dv only accepts DRM_BUS_PLATFORM devices, and
+            # Mesa's GL loader falls back to DRM_IOCTL_VERSION ("v3d") only
+            # when there is no PCI id. The PCI virtio identity below would send
+            # GL to virtio_gpu and hide the GPU from Vulkan.
+            _sysfs_attr(_dev, "subsystem", "../../../../bus/platform", 0o120777)
+            _sysfs_attr(_dev, "uevent", RPI5_V3D_UEVENT)
+            continue
         _sysfs_attr(_dev, "subsystem", "../../../../bus/pci", 0o120777)
         _sysfs_attr(_dev, "uevent",           _uevent)
         _sysfs_attr(_dev, "vendor",           f"0x{PCI_VENDOR:04x}\n")
@@ -1012,6 +1078,21 @@ def main():
             m4_share_dirs.add(d)
         m4_share_files.append(("/usr/share/vulkan/icd.d",
                                f"intel_icd.{arch}.json", _anv_json))
+
+    # v3dv (Raspberry Pi 5 V3D 7.1 Vulkan) from the same ship-set; aarch64
+    # stages only. On a non-Pi guest it finds no DRM_BUS_PLATFORM v3d device,
+    # enumerates zero physical devices and the loader moves on.
+    _v3dv_so = f"{gpu_stage}/usr/lib/libvulkan_broadcom.so"
+    _v3dv_json = f"{gpu_stage}/usr/share/vulkan/icd.d/broadcom_icd.{arch}.json"
+    if os.path.exists(_v3dv_so) and os.path.exists(_v3dv_json):
+        usr_lib_files.append(("libvulkan_broadcom.so", _v3dv_so, 0o100755))
+        for d in ("/usr/share", "/usr/share/vulkan", "/usr/share/vulkan/icd.d"):
+            m4_share_dirs.add(d)
+        m4_share_files.append(("/usr/share/vulkan/icd.d",
+                               f"broadcom_icd.{arch}.json", _v3dv_json))
+    elif os.environ.get("LEANDROS_BOARD") == "rpi5":
+        print(f"⚠️  LEANDROS_BOARD=rpi5 but {gpu_stage} lacks libvulkan_broadcom.so + broadcom ICD json: "
+              f"no Vulkan on the Pi (rebuild: ports/mesa/build-gpu-stack.sh aarch64)")
 
     # nvktest — the NVK bring-up test (ports/nvk-tests/build.sh), dlopen()s
     # /usr/lib/libvulkan_nouveau.so directly like vkrender does the Venus ICD;

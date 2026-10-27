@@ -186,8 +186,18 @@ mod hw {
                 *DEVICE.lock() = Some(dev);
                 PROBE_STATE.store(PROBE_UP, Ordering::Relaxed);
                 // Phase C (pv3d-cl): the CL queue + boot self-test, only once the MMU is up.
-                if super::mmu::after_probe(regs, ver, va_width) {
+                let mmu_up = super::mmu::after_probe(regs, ver, va_width);
+                if mmu_up {
                     super::submit::after_mmu(regs, ver, cmdline);
+                }
+                // Phase F (pv3d-mesa): the hardware is real and usable, so card0 and
+                // renderD128 answer as `v3d` from now on; no client cap or env needed.
+                if super::submit::auto_arm_decision(mmu_up, cmdline) {
+                    crate::drm_device_interface::v3d_arm_hw();
+                    serial_debug("[v3d] armed: card0+renderD128 report v3d (auto, probe ok)\n");
+                } else {
+                    serial_debug(&alloc::format!("[v3d] not armed mmu={} (v3d.arm=0 or MMU down)\n",
+                        if mmu_up { "up" } else { "down" }));
                 }
             }
             Err((e, rep)) => {

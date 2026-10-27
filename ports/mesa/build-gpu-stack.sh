@@ -67,7 +67,7 @@ echo "building GPU Mesa for $ARCH with $ALPINE_TOOL (log: $LOG)"
 # Run a private COPY of the container scripts: sh reads a script as it goes,
 # so editing the checkout mid-build would otherwise change the running build.
 SNAP=$(mktemp -d "${TMPDIR:-/tmp}/gpu-stack-src.XXXXXX")
-cp "$HERE/build-gpu-stack-alpine.sh" "$HERE/gpuprobe.c" "$HERE/ssp_guard.c" "$SNAP/"
+cp "$HERE/build-gpu-stack-alpine.sh" "$HERE/gpuprobe.c" "$HERE/es31test.c" "$HERE/vkprobe.c" "$HERE/ssp_guard.c" "$SNAP/"
 # LeandrOS Mesa patches (applied to a private copy inside the container; the
 # shared Mesa checkout is never modified).
 [ -d "$HERE/patches" ] && cp -R "$HERE/patches" "$SNAP/patches"
