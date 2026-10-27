@@ -9,12 +9,20 @@ pub mod regs;
 pub mod mmu;
 #[path = "../../src/v3d/irq.rs"]
 pub mod irq;
+#[path = "../../src/v3d/queue.rs"]
+pub mod queue;
+#[path = "../../src/v3d/submit.rs"]
+pub mod submit;
+#[path = "../../src/v3d/selftest_cl.rs"]
+pub mod selftest_cl;
+
+extern crate alloc;
 #[path = "../../src/kms_v3d.rs"]
 pub mod kms_v3d;
 
 /// Same paths as in the kernel (`crate::v3d::mmu`, ...).
 pub mod v3d {
-    pub use super::{irq, mmu, regs};
+    pub use super::{irq, mmu, queue, regs, selftest_cl, submit};
 }
 
 #[cfg(test)]
@@ -23,3 +31,7 @@ mod mock;
 mod mmu_tests;
 #[cfg(test)]
 mod irq_tests;
+#[cfg(test)]
+mod queue_tests;
+#[cfg(test)]
+mod submit_tests;

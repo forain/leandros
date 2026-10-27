@@ -13,6 +13,9 @@ pub mod regs;
 pub mod power;
 pub mod mmu;
 pub mod irq;
+pub mod queue;
+pub mod submit;
+pub mod selftest_cl;
 
 pub use regs::{V3d, V3dRegs};
 
@@ -182,7 +185,10 @@ mod hw {
                     MmioRegs { hub: dev.regs.hub, core: dev.regs.core, sms: dev.regs.sms }));
                 *DEVICE.lock() = Some(dev);
                 PROBE_STATE.store(PROBE_UP, Ordering::Relaxed);
-                super::mmu::after_probe(regs, ver, va_width);
+                // Phase C (pv3d-cl): the CL queue + boot self-test, only once the MMU is up.
+                if super::mmu::after_probe(regs, ver, va_width) {
+                    super::submit::after_mmu(regs, ver, cmdline);
+                }
             }
             Err((e, rep)) => {
                 serial_debug(&fail_line(e, &rep));

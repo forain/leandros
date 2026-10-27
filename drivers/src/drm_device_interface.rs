@@ -4673,6 +4673,9 @@ fn v3d_submit_fence() -> Option<u64> {
 /// comparison is on a monotonic tick counter, and the queue is short, so this
 /// is a couple of compares per tick in the worst case.
 fn v3d_tick() {
+    // Real V3D (Pi 5): polled IRQ fallback, hang timer, dependency re-checks.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    crate::v3d::submit::tick();
     if V3D_INFLIGHT_N.load(Ordering::Relaxed) == 0 { return; }
     let now = sched::ticks();
     let mut highest = 0u64;
@@ -4699,6 +4702,109 @@ fn v3d_tick() {
 /// WAIT_BO and SYNCOBJ_WAIT can never disagree about one fence.
 fn v3d_fence_done(fence: u64) -> bool {
     fence == 0 || fence <= SYNCOBJ_FENCE_DONE.load(Ordering::Acquire)
+}
+
+/// Phase C (pv3d-cl) seams for `crate::v3d::submit`: the shared fence namespace and V3D VA space.
+pub(crate) fn v3d_fence_signalled(fence: u64) -> bool { v3d_fence_done(fence) }
+pub(crate) fn v3d_alloc_fence_id() -> u64 { V3D_FENCE_NEXT.fetch_add(1, Ordering::Relaxed) }
+pub(crate) fn v3d_kernel_va_alloc(bytes: u64) -> Option<u64> { v3d_va_alloc(bytes) }
+pub(crate) fn v3d_kernel_va_free(va: u64) { v3d_va_free(va) }
+
+/// Real V3D (Pi 5): release the BO references of jobs whose fences have signalled.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+fn v3d_real_reap() {
+    crate::v3d::submit::reap(&mut |obj| { blob_unref(obj, 0); });
+}
+
+/// Real V3D: one reference on a blob BO for the lifetime of a job. `None` = not a blob this open
+/// may reach.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+fn v3d_bo_hold(handle: u32, open_id: u32) -> Option<u32> {
+    let obj = {
+        let blobs = BLOB_BUFFERS.lock();
+        match blobs.get(&handle) {
+            Some(h) if open_may_reach(open_id, h.owner) => h.obj,
+            _ => return None,
+        }
+    };
+    let mut objs = BLOB_OBJS.lock();
+    let o = objs.get_mut(&obj)?;
+    o.refs = o.refs.saturating_add(1);
+    Some(obj)
+}
+
+/// Real V3D SUBMIT_CL: bin/render job on the hardware queue, MULTI_SYNC, BO refs held until the
+/// fence, out-syncs and BO fences attached for WAIT_BO / syncobj waits.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+fn v3d_real_submit_cl(arg: usize, open_id: u32) -> Result<usize, DriverError> {
+    use crate::v3d::submit::{plan_syncs, ClArgs, SubmitError, SUBMIT_CL_FLUSH_CACHE};
+    v3d_real_reap();
+    if arg == 0 { return Err(DriverError::InvalidParameter); }
+    let raw = uread::<[u8; crate::v3d::submit::SUBMIT_CL_SIZE]>(arg)?;
+    let a = ClArgs::parse(&raw);
+    let map = |e: SubmitError| match e {
+        SubmitError::Inval => DriverError::InvalidParameter,
+        SubmitError::Fault => DriverError::Errno(14),
+    };
+    a.validate().map_err(map)?;
+    if a.perfmon_id != 0 { return Err(DriverError::NotFound); }
+    let plan = plan_syncs(&a, &mut |p, buf| unsafe {
+        sched::uaccess::copy_from_user(buf.as_mut_ptr(), p as usize, buf.len()) == 0
+    }).map_err(map)?;
+    let deps = |hs: &[u32]| -> Result<Vec<u64>, DriverError> {
+        let mut v = Vec::with_capacity(hs.len());
+        for &h in hs {
+            match syncobj_fence(h, open_id) {
+                Some(0) => {}
+                Some(f) => v.push(f),
+                None => return Err(DriverError::NotFound),
+            }
+        }
+        Ok(v)
+    };
+    let bin_deps = deps(&plan.bin_in)?;
+    let render_deps = deps(&plan.render_in)?;
+    for &h in plan.out.iter() {
+        if syncobj_fence(h, open_id).is_none() { return Err(DriverError::NotFound); }
+    }
+    let handles = if a.bo_handle_count == 0 { Vec::new() } else { syncobj_read_handles(a.bo_handles, a.bo_handle_count)? };
+    let mut held = Vec::with_capacity(handles.len());
+    for &h in handles.iter() {
+        match v3d_bo_hold(h, open_id) {
+            Some(o) => held.push(o),
+            None if dumb_lookup(h).is_some() => {}
+            None => {
+                for &o in held.iter() { blob_unref(o, 0); }
+                return Err(DriverError::NotFound);
+            }
+        }
+    }
+    let mut job = crate::v3d::queue::ClJob {
+        bcl_start: a.bcl_start, bcl_end: a.bcl_end, rcl_start: a.rcl_start, rcl_end: a.rcl_end,
+        qma: a.qma, qms: a.qms, qts: a.qts, bin_deps, render_deps,
+        flush_cache: a.flags & SUBMIT_CL_FLUSH_CACHE != 0, bos: held, ..Default::default()
+    };
+    // A full queue (64 jobs in flight) waits for room, bounded at 2 s.
+    let t0 = sched::monotonic_ns();
+    let fence = loop {
+        match crate::v3d::submit::submit(job, &mut || v3d_alloc_fence_id()) {
+            Ok(f) => break f,
+            Err(j) => job = j,
+        }
+        v3d_real_reap();
+        let now = sched::monotonic_ns();
+        if now - t0 > 2_000_000_000 || sched::has_deliverable_signal() {
+            for &o in job.bos.iter() { blob_unref(o, 0); }
+            return Err(DriverError::Busy);
+        }
+        SYNCOBJ_WAITERS.fetch_add(1, Ordering::Relaxed);
+        syncobj_park(now + 1_000_000);
+        sched::block_on_poll_commit();
+        SYNCOBJ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    };
+    for &h in plan.out.iter() { syncobj_attach_fence(h, open_id, fence); }
+    for &h in handles.iter() { bo_attach_fence(h, open_id, fence); }
+    Ok(0)
 }
 
 // ── DRM page-flip event channel ──────────────────────────────────────────────
@@ -10113,6 +10219,15 @@ impl DrmDeviceInterface {
         let pad = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
         if pad != 0 { return Err(DriverError::InvalidParameter); }
 
+        // Real V3D (Pi 5): identity from the registers, real feature bits, live reset counter.
+        #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+        if crate::v3d::submit::active() {
+            if let Some(v) = crate::v3d::submit::param(param) {
+                unsafe { ((arg as *mut u8).add(8) as *mut u64).write_unaligned(v) };
+                return Ok(0);
+            }
+        }
+
         let value: u64 = match param {
             V3D_PARAM_CORE0_IDENT0 => V3D_IDENT0,
             V3D_PARAM_CORE0_IDENT1 => V3D_IDENT1,
@@ -10325,6 +10440,8 @@ impl DrmDeviceInterface {
     /// v3d table only for v3d ioctls). An unknown handle is EINVAL, matching
     /// upstream's `drm_gem_dma_resv_wait`, not ENOENT.
     fn v3d_handle_wait_bo(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+        if crate::v3d::submit::active() { v3d_real_reap(); }
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let handle = uread::<u32>(arg)?;
         let pad = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
@@ -10408,6 +10525,8 @@ impl DrmDeviceInterface {
     /// therefore retires first. A second queue (TFU, CSD) would break that and
     /// is exactly why neither exists yet.
     fn v3d_handle_submit_cl(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+        if crate::v3d::submit::active() { return v3d_real_submit_cl(arg, open_id); }
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let u32_at = |i: usize| -> u32 { unsafe { ptr::read_unaligned((arg as *const u32).add(i)) } };
         let u64_at = |b: usize| -> u64 { unsafe { ((arg as *const u8).add(b) as *const u64).read_unaligned() } };
