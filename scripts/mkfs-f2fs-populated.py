@@ -415,7 +415,7 @@ def main():
     # path makes all three names hardlinks to one inode.
     p = os.path.join(userland_dir, "poweroff")
     if os.path.exists(p):
-        for name in ("poweroff", "reboot", "halt"):
+        for name in ("poweroff", "reboot", "halt", "systemctl"):
             bin_files.append((name, p, 0o100755))
 
     # exectest's `#!` fixtures. The modes are the test: exectest-noexec.sh must
