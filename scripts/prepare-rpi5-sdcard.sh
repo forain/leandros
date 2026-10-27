@@ -23,8 +23,9 @@
 #
 # Wi-Fi and SSH (optional, for the CYW43455 on the Pi 5):
 #   --wifi-psk FILE         (or $RPI5_WIFI_PSK) a file holding the WPA2 passphrase
-#                           on its first line. The SSID is the file's basename
-#                           without ".psk" (leandro2026.psk -> SSID leandro2026).
+#                           on its first line, or `ssid=NAME` and `psk=PASS` lines.
+#   --wifi-ssid NAME        (or $RPI5_WIFI_SSID) the exact, case-sensitive SSID;
+#                           required unless the file has an ssid= line (this wins).
 #                           Staged as /etc/leandros/wifi.conf (root, 0600) on the
 #                           root partition. The passphrase is never printed or logged.
 #   --authorized-keys FILE  (or $RPI5_AUTHORIZED_KEYS) public key(s) staged as
@@ -58,11 +59,12 @@ DEVICE=""
 FIRMWARE_DIR=""
 ASSUME_YES="false"
 WIFI_PSK_FILE="${RPI5_WIFI_PSK:-}"
+WIFI_SSID="${RPI5_WIFI_SSID:-}"
 AUTH_KEYS_FILE="${RPI5_AUTHORIZED_KEYS:-}"
 ORIG_ARGS=("$@")
 
 show_usage() {
-    sed -n '2,37p' "${BASH_SOURCE[0]}"
+    sed -n '2,38p' "${BASH_SOURCE[0]}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -70,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --boot-mode) BOOT_MODE="$2"; shift 2 ;;
         --firmware-dir) FIRMWARE_DIR="$2"; shift 2 ;;
         --wifi-psk) WIFI_PSK_FILE="$2"; shift 2 ;;
+        --wifi-ssid) WIFI_SSID="$2"; shift 2 ;;
         --authorized-keys) AUTH_KEYS_FILE="$2"; shift 2 ;;
         -y|--yes) ASSUME_YES="true"; shift ;;
         -h|--help) show_usage; exit 0 ;;
@@ -273,15 +276,29 @@ populate_f2fs_root() {
     fi
     export BTFW_CACHE="$bt_cache"
 
-    # Wi-Fi credentials: ssid= from the psk file's basename, psk= from its first line.
+    # Wi-Fi credentials: the SSID from --wifi-ssid (or an ssid= line in the file),
+    # never from the file name (SSIDs are case-sensitive); psk= from the file.
     # Written to a 0600 temp file that only mkfs reads; nothing is echoed.
     local wifi_tmp=""
     if [[ -n "$WIFI_PSK_FILE" ]]; then
         [[ -r "$WIFI_PSK_FILE" ]] || die "--wifi-psk: cannot read $WIFI_PSK_FILE"
-        local ssid psk
-        ssid="$(basename "$WIFI_PSK_FILE")"; ssid="${ssid%.psk}"
-        IFS= read -r psk < "$WIFI_PSK_FILE" || [[ -n "$psk" ]]
-        psk="${psk%$'\r'}"
+        local ssid="" psk="" line file_ssid="" file_psk="" first=""
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line%$'\r'}"
+            case "$line" in
+                ssid=*) file_ssid="${line#ssid=}" ;;
+                psk=*) file_psk="${line#psk=}" ;;
+                *) [[ -n "$first" ]] || first="$line" ;;
+            esac
+        done < "$WIFI_PSK_FILE"
+        if [[ -n "$file_psk" ]]; then psk="$file_psk"; else psk="$first"; fi
+        unset file_psk first line
+        ssid="${WIFI_SSID:-$file_ssid}"
+        [[ -n "$ssid" ]] || die "--wifi-psk needs --wifi-ssid NAME (or an ssid= line in the file); the SSID is case-sensitive"
+        if [[ -n "$WIFI_SSID" && -n "$file_ssid" && "$WIFI_SSID" != "$file_ssid" ]]; then
+            info "WARNING: --wifi-ssid '$WIFI_SSID' overrides ssid= '$file_ssid' from the file"
+        fi
+        (( ${#ssid} >= 1 && ${#ssid} <= 32 )) || die "--wifi-ssid: SSID must be 1..32 characters"
         (( ${#psk} >= 8 && ${#psk} <= 63 )) || die "--wifi-psk: passphrase must be 8..63 characters"
         wifi_tmp="$(mktemp -t rpi5-wifi-conf)"; chmod 600 "$wifi_tmp"
         printf 'ssid=%s\npsk=%s\n' "$ssid" "$psk" > "$wifi_tmp"

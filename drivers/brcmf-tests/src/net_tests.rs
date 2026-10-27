@@ -12,7 +12,7 @@ use crate::wifi_frame;
 thread_local! { static NOW: Cell<u64> = Cell::new(0); }
 fn now() -> u64 { NOW.with(|n| n.get()) }
 fn advance(ms: u64) { NOW.with(|n| n.set(n.get() + ms)) }
-fn env() -> Env { Env { now_ms: now, sleep_ms: advance, log: |_| {} } }
+fn env() -> Env { Env { now_ms: now, sleep_ms: advance, log: |_| {}, random: |b| b.fill(7) } }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Call {
@@ -33,6 +33,8 @@ struct Mock {
     react: HashMap<String, VecDeque<Vec<Frame>>>,
     refuse: Vec<String>,
     rssi: i32,
+    /// Frames the "air" answers a transmitted data frame with (the AP side of the 4-way handshake).
+    on_tx: Option<Box<dyn FnMut(&[u8]) -> Vec<Frame>>>,
 }
 
 impl Mock {
@@ -77,7 +79,11 @@ impl Fwil for Mock {
         self.fire(name);
         Ok(())
     }
-    fn tx_data(&mut self, frame: &[u8]) -> Result<(), FwError> { self.calls.push(Call::Tx(frame.to_vec())); Ok(()) }
+    fn tx_data(&mut self, frame: &[u8]) -> Result<(), FwError> {
+        self.calls.push(Call::Tx(frame.to_vec()));
+        if let Some(f) = self.on_tx.as_mut() { let v = f(frame); self.pending.extend(v); }
+        Ok(())
+    }
     fn poll(&mut self, sink: &mut dyn RxSink, _budget_us: u32) -> Result<(), FwError> {
         advance(1);
         // Drains everything received, as the real BCDC/SDPCM poll does.
@@ -232,19 +238,42 @@ fn join_params_layout() {
 }
 
 #[test]
-fn pmk_struct_passphrase_and_hex() {
-    let p = wsec_pmk(&Key::from_secret(b"password1"));
+fn pmk_struct_forms() {
+    let k = Key::from_secret(b"password1");
+    let p = wsec_pmk(&k, SSID, PmkForm::Passphrase).unwrap();
     assert_eq!(p.len(), 70);
     assert_eq!(&p[0..4], &[9, 0, 1, 0]);
     assert_eq!(&p[4..13], b"password1");
+    let psk = crate::wifi_crypto::wpa_psk(b"password1", SSID);
+    // Raw = Linux brcmf_set_pmk: 32 bytes, flags 0.
+    let p = wsec_pmk(&k, SSID, PmkForm::Raw).unwrap();
+    assert_eq!(&p[0..4], &[32, 0, 0, 0]);
+    assert_eq!(&p[4..36], &psk);
     let hex = "00112233445566778899aabbccddeeff00112233445566778899AABBCCDDEEFF";
     let k = Key::from_secret(hex.as_bytes());
     assert!(matches!(k, Key::Pmk(_)));
-    let p = wsec_pmk(&k);
-    assert_eq!(&p[0..4], &[64, 0, 0, 0]);
+    // Hex = Linux 4.13: 64 hex digits with WSEC_PASSPHRASE.
+    let p = wsec_pmk(&k, SSID, PmkForm::Hex).unwrap();
+    assert_eq!(&p[0..4], &[64, 0, 1, 0]);
     assert_eq!(&p[4..68], hex.to_ascii_lowercase().as_bytes());
+    assert!(wsec_pmk(&k, SSID, PmkForm::Passphrase).is_none());
     assert_eq!(format!("{:?}", Key::from_secret(b"secretpw")), "Passphrase(<redacted>)");
     assert!(matches!(Key::from_secret(b""), Key::Open));
+}
+
+#[test]
+fn wsec_key_layout_matches_brcmf_wsec_key_le() {
+    let tk = [0x11u8; 16];
+    let p = wsec_key(0, &tk, Some(AP));
+    assert_eq!(p.len(), 164);
+    assert_eq!(&p[0..8], &[0, 0, 0, 0, 16, 0, 0, 0]);
+    assert_eq!(&p[8..24], &tk);
+    assert_eq!(&p[112..120], &[4, 0, 0, 0, 0, 0, 0, 0]); // AES_CCM, pairwise: no flags
+    assert_eq!(&p[156..162], &AP);
+    let g = wsec_key(1, &[0x22; 16], None);
+    assert_eq!(&g[0..4], &[1, 0, 0, 0]);
+    assert_eq!(&g[116..120], &[2, 0, 0, 0]); // BRCMF_PRIMARY_KEY
+    assert_eq!(&g[156..162], &[0; 6]);
 }
 
 #[test]
@@ -263,7 +292,9 @@ fn country_selection() {
 fn init_sequence() {
     let mut d = Brcmf::new(Mock::default(), env());
     assert_eq!(d.init(*b"PT").unwrap(), [0xb8, 0x27, 0xeb, 1, 2, 3]);
-    let c = &d.fw.calls;
+    let mut c = d.fw.calls.clone();
+    assert_eq!(c.remove(1), Call::IovarGet("cap".into()));
+    let c = &c;
     assert_eq!(c[0], Call::IovarGet("cur_etheraddr".into()));
     assert_eq!(c[1], Call::IovarSet("country".into(), country_params(*b"PT").to_vec()));
     assert_eq!(c[2], Call::IovarSet("mpc".into(), vec![0, 0, 0, 0]));
@@ -348,7 +379,9 @@ fn scan_join_data_deauth_reconnect() {
     assert_eq!(f.cmd(cmd::SET_WPA_AUTH), Some(&vec![0x80, 0, 0, 0]));
     assert_eq!(f.iovar("sup_wpa"), Some(&vec![1, 0, 0, 0]));
     let pmk = f.cmd(cmd::SET_WSEC_PMK).unwrap();
-    assert_eq!(&pmk[0..4], &[21, 0, 1, 0]);
+    // Default PMK form = Linux brcmf_set_pmk: the 32-byte PSK, flags 0.
+    assert_eq!(&pmk[0..4], &[32, 0, 0, 0]);
+    assert_eq!(&pmk[4..36], &crate::wifi_crypto::wpa_psk(b"correct horse battery", SSID));
     assert_eq!(f.iovar("join"), Some(&ext_join_params(SSID, Some(AP), 36)));
     // Order: security first, then join.
     let names = f.iovars_set();
@@ -511,10 +544,144 @@ fn ctl_commands_parse_in_every_state() {
     assert_eq!(parse_ctl("seq=3 status"), CtlCmd::Status);
     assert_eq!(parse_ctl(""), CtlCmd::Status);
     assert_eq!(parse_ctl("seq=4 scan"), CtlCmd::Scan);
-    assert_eq!(parse_ctl("seq=5 join"), CtlCmd::Join(None));
-    assert_eq!(parse_ctl("seq=6 join ssid=My Home Net"), CtlCmd::Join(Some("My Home Net")));
+    assert_eq!(parse_ctl("seq=5 join"), CtlCmd::Join { ssid: None, knobs: vec![] });
+    assert_eq!(parse_ctl("seq=6 join ssid=My Home Net"), CtlCmd::Join { ssid: Some("My Home Net"), knobs: vec![] });
+    assert_eq!(parse_ctl("seq=6 join method=setssid supwpa=0 ssid=a b=c"),
+               CtlCmd::Join { ssid: Some("a b=c"), knobs: vec!["method=setssid", "supwpa=0"] });
+    let mut o = JoinOpts::default();
+    assert_eq!(o.apply(&["method=setssid", "supwpa=0", "pmk=hex", "sec=iovar", "mfp=1", "wpaie=0", "bogus=1"]), vec!["bogus=1"]);
+    assert_eq!(o.describe(), "method=setssid supwpa=0 pmk=hex sec=iovar mfp=1 wpaie=0");
+    o.apply(&["reset"]);
+    assert_eq!(o, JoinOpts::default());
     assert_eq!(parse_ctl("seq=7 diag lines=8"), CtlCmd::Diag(8));
     assert_eq!(parse_ctl("diag"), CtlCmd::Diag(32));
     assert_eq!(parse_ctl("seq=8 retry sdclk=25000 hs=0"), CtlCmd::Retry(vec!["sdclk=25000", "hs=0"]));
     assert_eq!(parse_ctl("seq=9 peek addr=0x18000000"), CtlCmd::Other("peek"));
+}
+
+// ── join variants (pibrcmf-join: Pi 5 firmware 7.45.265 answered -23) ───────
+
+const STA: [u8; 6] = [0xb8, 0x27, 0xeb, 1, 2, 3];
+
+fn eth(dst: [u8; 6], src: [u8; 6], pdu: &[u8]) -> Vec<u8> {
+    let mut f = dst.to_vec();
+    f.extend_from_slice(&src);
+    f.extend_from_slice(&[0x88, 0x8e]);
+    f.extend_from_slice(pdu);
+    f
+}
+
+/// A minimal WPA2-PSK authenticator for the mock "air": M1 on join, M3 on M2.
+fn ap_handshake(d: &mut Brcmf<Mock>, pass: &[u8], gtk: [u8; 16]) -> std::rc::Rc<std::cell::RefCell<Option<[u8; 16]>>> {
+    use crate::wifi_crypto as wc;
+    use wc::key_info as ki;
+    let pmk = wc::wpa_psk(pass, SSID);
+    let anonce = [0x5au8; 32];
+    let m1 = wc::build_eapol_key(2, 2 | ki::TYPE_PAIRWISE | ki::ACK, 16, &1u64.to_be_bytes(), &anonce, &[]);
+    d.fw.on("join", vec![
+        evf(ev::ASSOC, status::SUCCESS, 0, 0, &[]),
+        evf(ev::LINK, status::SUCCESS, 0, event::FLAG_LINK, &[]),
+        Frame::Data(eth(STA, AP, &m1)),
+    ]);
+    let tk_out = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let tk2 = tk_out.clone();
+    d.fw.on_tx = Some(Box::new(move |f: &[u8]| {
+        if f.len() < 14 + 99 || f[12..14] != [0x88, 0x8e] { return vec![]; }
+        assert_eq!(&f[0..6], &AP);
+        let pdu = &f[14..];
+        let info = u16::from_be_bytes([pdu[5], pdu[6]]);
+        if info & ki::SECURE != 0 { return vec![]; } // M4
+        let mut snonce = [0u8; 32];
+        snonce.copy_from_slice(&pdu[17..49]);
+        let ptk = wc::derive_ptk(&pmk, &AP, &STA, &anonce, &snonce);
+        assert!(wc::eapol_mic_ok(&ptk.kck, pdu), "M2 MIC");
+        *tk2.borrow_mut() = Some(ptk.tk);
+        let mut kd = wc::rsn_ie_psk_ccmp().to_vec();
+        kd.extend_from_slice(&[0xdd, 22, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00]);
+        kd.extend_from_slice(&gtk);
+        while kd.len() % 8 != 0 || kd.len() < 16 { kd.push(if kd.len() == 46 { 0xdd } else { 0 }); }
+        let wrapped = wc::aes_key_wrap(&ptk.kek, &kd);
+        let mut m3 = wc::build_eapol_key(2, 2 | ki::TYPE_PAIRWISE | ki::INSTALL | ki::ACK | ki::MIC | ki::SECURE | ki::ENCRYPTED_KEY_DATA,
+                                         16, &2u64.to_be_bytes(), &anonce, &wrapped);
+        wc::eapol_set_mic(&ptk.kck, &mut m3);
+        vec![Frame::Data(eth(STA, AP, &m3))]
+    }));
+    tk_out
+}
+
+fn wsec_keys(m: &Mock) -> Vec<Vec<u8>> {
+    m.calls.iter().filter_map(|c| match c { Call::IovarSet(n, d) if n == "wsec_key" => Some(d.clone()), _ => None }).collect()
+}
+
+#[test]
+fn sup_wpa_unsupported_falls_back_to_host_handshake() {
+    let mut d = up();
+    d.fw.refuse = vec!["sup_wpa".into()]; // firmware without idsup: BCME_UNSUPPORTED (-23)
+    let gtk = [0x33u8; 16];
+    let tk = ap_handshake(&mut d, b"correct horse battery", gtk);
+    let r = d.join(psk_req(), &mut Steps::default(), 5_000);
+    assert_eq!(r, Ok(()), "fail_cmd {}", d.fail_cmd);
+    assert_eq!(d.sup_used, "host");
+    assert!(d.fail_cmd.contains("sup_wpa=1 -> Status(-23)"));
+    // No firmware PMK in host mode; our RSN IE went to the firmware first.
+    assert!(d.fw.cmd(cmd::SET_WSEC_PMK).is_none());
+    assert_eq!(d.fw.iovar("wpaie").map(|v| v[0]), Some(0x30));
+    let keys = wsec_keys(&d.fw);
+    assert_eq!(keys.len(), 2, "pairwise + group");
+    assert_eq!(keys[0], wsec_key(0, &tk.borrow().unwrap(), Some(AP)).to_vec());
+    assert_eq!(keys[1], wsec_key(1, &gtk, None).to_vec());
+    let tx = d.fw.calls.iter().filter(|c| matches!(c, Call::Tx(_))).count();
+    assert_eq!(tx, 2, "M2 + M4");
+    assert_eq!((d.stats.eapol_rx, d.stats.eapol_tx), (2, 2));
+    // EAPOL never reaches the net stack.
+    assert!(d.rx.rx.iter().all(|f| f[12..14] != [0x88, 0x8e]));
+}
+
+#[test]
+fn forced_firmware_supplicant_reports_the_refused_command() {
+    let mut d = up();
+    d.fw.refuse = vec!["sup_wpa".into()];
+    d.opts.apply(&["supwpa=1"]);
+    let r = d.join(psk_req(), &mut Steps::default(), 2_000);
+    assert_eq!(r, Err(JoinFail::Fw(FwError::Status(-23))));
+    assert_eq!(d.fail_cmd, "iovar sup_wpa=1 -> Status(-23)");
+    assert!(!d.fw.iovars_set().contains(&"join"));
+}
+
+#[test]
+fn pmk_forms_are_tried_in_order_and_the_last_refusal_is_reported() {
+    let mut d = up();
+    d.fw.refuse = vec![format!("cmd:{}", cmd::SET_WSEC_PMK)];
+    let r = d.join(psk_req(), &mut Steps::default(), 2_000);
+    assert_eq!(r, Err(JoinFail::Fw(FwError::Status(-23))));
+    let pmks: Vec<u16> = d.fw.calls.iter().filter_map(|c| match c {
+        Call::CmdSet(n, b) if *n == cmd::SET_WSEC_PMK => Some(u16::from_le_bytes([b[0], b[1]])), _ => None }).collect();
+    assert_eq!(pmks, vec![32, 21, 64], "raw, passphrase, hex");
+    assert_eq!(d.fail_cmd, "WLC_SET_WSEC_PMK pmk=hex -> Status(-23)");
+    // A single form when pinned, and a working one joins.
+    let mut d = up();
+    d.opts.apply(&["pmk=passphrase"]);
+    d.fw.on("join", join_ok());
+    assert_eq!(d.join(psk_req(), &mut Steps::default(), 2_000), Ok(()));
+    assert_eq!(d.fw.cmd(cmd::SET_WSEC_PMK).map(|b| b[2]), Some(1));
+    assert_eq!(d.sup_used, "firmware");
+}
+
+#[test]
+fn join_method_and_sec_path_knobs() {
+    let mut d = up();
+    d.opts.apply(&["method=setssid", "sec=iovar", "mfp=0", "wpaie=0"]);
+    d.fw.on(&format!("cmd:{}", cmd::SET_SSID), join_ok());
+    assert_eq!(d.join(psk_req(), &mut Steps::default(), 2_000), Ok(()));
+    let iov = d.fw.iovars_set();
+    assert!(!iov.contains(&"join") && !iov.contains(&"wpaie"));
+    for n in ["wpa_auth", "auth", "wsec", "mfp"] { assert!(iov.contains(&n), "{}", n); }
+    assert!(d.fw.cmd(cmd::SET_WPA_AUTH).is_none());
+    // joiniovar only: a refused join iovar is the failure, no SET_SSID.
+    let mut d = up();
+    d.opts.apply(&["method=joiniovar"]);
+    d.fw.refuse = vec!["join".into()];
+    assert_eq!(d.join(psk_req(), &mut Steps::default(), 2_000), Err(JoinFail::Fw(FwError::Status(-23))));
+    assert!(d.fw.cmd(cmd::SET_SSID).is_none());
+    assert_eq!(d.fail_cmd, "iovar join (ext join params) -> Status(-23)");
 }
