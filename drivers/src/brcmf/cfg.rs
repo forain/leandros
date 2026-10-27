@@ -1519,6 +1519,46 @@ pub fn parse_dp(text: &str) -> Option<(Option<u8>, Option<bool>)> {
     Some((mode, y))
 }
 
+/// Bytes of each frame `dump` prints.
+pub const DUMP_BYTES: usize = 64;
+/// Most frames one `dump` arms.
+pub const DUMP_MAX: u32 = 64;
+
+/// Parses `dump [N]` (ctl, after an optional `seq=` token): hex-dump the next
+/// N received data frames (default 8, at most [`DUMP_MAX`]) to the kernel log.
+pub fn parse_dump(text: &str) -> Option<u32> {
+    let mut words = text.split_ascii_whitespace().filter(|w| !w.starts_with("seq="));
+    if words.next()? != "dump" { return None; }
+    let n = match words.next() { Some(w) => w.parse::<u32>().ok()?, None => 8 };
+    Some(n.min(DUMP_MAX))
+}
+
+/// One `dump` line: `rxdump <idx> len <L> <hex of the first DUMP_BYTES>`.
+/// `parse_dump_line` reads it back (host replay tests).
+pub fn fmt_dump_line(idx: u32, frame: &[u8]) -> alloc::string::String {
+    let mut s = alloc::format!("rxdump {} len {} ", idx, frame.len());
+    for b in frame.iter().take(DUMP_BYTES) {
+        let d = b"0123456789abcdef";
+        s.push(d[(b >> 4) as usize] as char);
+        s.push(d[(b & 15) as usize] as char);
+    }
+    s
+}
+
+/// Inverse of [`fmt_dump_line`] (accepts the `[brcmf] ` log prefix):
+/// (full length, captured bytes).
+pub fn parse_dump_line(line: &str) -> Option<(usize, Vec<u8>)> {
+    let i = line.find("rxdump ")?;
+    let mut w = line[i..].split_ascii_whitespace();
+    w.next()?; w.next()?;
+    if w.next()? != "len" { return None; }
+    let len = w.next()?.parse().ok()?;
+    let hex = w.next().unwrap_or("");
+    if hex.len() % 2 != 0 { return None; }
+    let bytes = (0..hex.len() / 2).map(|k| u8::from_str_radix(&hex[2 * k..2 * k + 2], 16).ok()).collect::<Option<Vec<u8>>>()?;
+    Some((len, bytes))
+}
+
 pub fn dp_mode_name(m: u8) -> &'static str {
     match m { DP_OFF => "off", DP_RX => "rx", _ => "on" }
 }

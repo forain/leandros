@@ -183,8 +183,11 @@ pub const SLOT_BRCMF: usize = 0;
 pub const SLOT_SDIO: usize = 1;
 pub const SLOT_NET: usize = 2;
 pub const SLOT_WM: usize = 3;
-pub const N_SLOTS: usize = 4;
-const SLOT_NAMES: [&str; N_SLOTS] = ["brcmf", "sdio", "net", "wm"];
+/// The net daemon: 1 = in a run of passes without parking (arg unused).
+/// Cleared at every park, so "stuck" means it has not parked for STUCK_MS.
+pub const SLOT_NETD: usize = 4;
+pub const N_SLOTS: usize = 5;
+const SLOT_NAMES: [&str; N_SLOTS] = ["brcmf", "sdio", "net", "wm", "netd"];
 
 /// Code 0 = idle. The rest is the driver's own stage numbering, decoded at
 /// print time by the namer it registered (or printed in hex).

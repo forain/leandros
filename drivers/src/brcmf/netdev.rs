@@ -256,6 +256,9 @@ static DP_YIELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 static CARRIER_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static DP_RX_DROPS: AtomicU64 = AtomicU64::new(0);
 static DP_HELD_RX: AtomicU64 = AtomicU64::new(0);
+/// `dump N` (ctl): received data frames still to hex-dump to the log.
+static DUMP_LEFT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static DUMP_IDX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn apply_dp(m: Option<u8>, y: Option<bool>, from: &str) {
     if let Some(m) = m { DP_MODE.store(m, Ordering::Relaxed); }
@@ -460,6 +463,11 @@ impl<F: Fwil> BrcmfRadio<F> {
         let Some(text) = self.ctl.as_mut().and_then(|c| c.poll()) else { return };
         let text = String::from(text.trim());
         if let Some((m, y)) = cfg::parse_dp(&text) { apply_dp(m, y, "ctl"); return; }
+        if let Some(n) = cfg::parse_dump(&text) {
+            DUMP_LEFT.store(n, Ordering::Relaxed);
+            log(&alloc::format!("ctl: dump: logging the next {} received data frames (first {} bytes)", n, cfg::DUMP_BYTES));
+            return;
+        }
         match cfg::parse_ctl(&text) {
             cfg::CtlCmd::Status => {
                 let mut s = String::new();
@@ -496,7 +504,7 @@ impl<F: Fwil> BrcmfRadio<F> {
                 self.retry = Some(text);
                 self.retry_phase = 1;
             }
-            cfg::CtlCmd::Other(c) => log(&alloc::format!("ctl: '{}' is not available while the driver runs (status|scan|join|diag|retry)", c)),
+            cfg::CtlCmd::Other(c) => log(&alloc::format!("ctl: '{}' is not available while the driver runs (status|scan|join|diag|retry|dp|dump)", c)),
         }
     }
 
@@ -594,6 +602,10 @@ impl<F: Fwil> BrcmfRadio<F> {
             }
             let mut got = false;
             while let Some(f) = self.dev.take_rx() {
+                if DUMP_LEFT.load(Ordering::Relaxed) > 0 {
+                    DUMP_LEFT.fetch_sub(1, Ordering::Relaxed);
+                    log(&cfg::fmt_dump_line(DUMP_IDX.fetch_add(1, Ordering::Relaxed), &f));
+                }
                 if !link_up() {
                     if CARRIER_HELD.load(Ordering::Relaxed) { DP_HELD_RX.fetch_add(1, Ordering::Relaxed); }
                     continue;

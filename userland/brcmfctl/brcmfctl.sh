@@ -7,6 +7,8 @@
 #   brcmfctl status
 #   brcmfctl dp off|rx|on [yield]  data-path bisection: off = associate but hold wifi0's carrier down,
 #                                   rx = carrier up, drop every transmit; yield = sleep 1 ms per pass
+#   brcmfctl dump [N]               hex-dump the next N received data frames (first 64 bytes + length,
+#                                   default 8, max 64) as `[brcmf] rxdump` lines; works in every dp mode
 #   brcmfctl peek addr=0x...        16 bytes at a backplane address (word reads + one bulk read)
 #   brcmfctl poke addr=0x... val=0x...   one 32-bit backplane write
 # Knobs (each retry starts from the defaults): clk_ms dl_ht=0|1 post_ms ht_ms f2_ms
@@ -15,7 +17,7 @@
 #   verify=0|1|2 (off, head/tail, whole image) win4b=0|1
 #   SDIO bus: sdclk=kHz hs=0|1 blk=0|1 blksz=N (F1) chunk=N (max bytes per CMD53)
 if [ $# -eq 0 ]; then
-    echo "usage: brcmfctl status | scan | join [ssid=NAME] | diag [lines=N] | retry [knob=val ...] | peek addr=0x.. | poke addr=0x.. val=0x.. | dp on|off|rx [yield|noyield]"
+    echo "usage: brcmfctl status | scan | join [ssid=NAME] | diag [lines=N] | retry [knob=val ...] | peek addr=0x.. | poke addr=0x.. val=0x.. | dp on|off|rx [yield|noyield] | dump [N]"
     exit 2
 fi
 # A fresh sequence number makes a repeated command count as new.
