@@ -1,0 +1,37 @@
+A sender match on an unowned well-known name matches nothing.
+
+busd 0.5.0 resolves a match rule's well-known `sender` through the name
+registry, but when the name has no owner the lookup returns None and the
+sender check is skipped, so the rule matches signals from EVERY peer. The
+reference dbus-daemon matches such a rule against no one until the name is
+owned.
+
+Symptom: cosmic-applet-bluetooth (bluer 0.17) subscribes to InterfacesAdded
+with sender='org.bluez' while org.bluez is still being activated, receives
+another service's InterfacesAdded for a one-component object path, and
+panics in bluer's parent_path() ("Object path was not valid: ''"), so the
+applet never shows an adapter.
+
+--- a/src/match_rules.rs	2026-10-27 02:33:55
++++ b/src/match_rules.rs	2026-10-27 02:33:55
+@@ -31,13 +31,13 @@
+             }
+ 
+             // Then match sender and destination involving well-known names, manually.
+-            if let Some(sender) = rule.sender().cloned().and_then(|name| match name {
+-                BusName::WellKnown(name) => name_registry.lookup(name).as_deref().cloned(),
+-                // Unique name is already taken care of by the zbus API.
+-                BusName::Unique(_) => None,
+-            }) {
+-                if sender != hdr.sender().expect("SENDER field unset").clone() {
+-                    return false;
++            // A well-known name nobody owns matches no sender at all (as in
++            // dbus-daemon): before, the failed lookup skipped the check and
++            // the rule matched EVERY sender.
++            if let Some(BusName::WellKnown(name)) = rule.sender().cloned() {
++                match name_registry.lookup(name).as_deref().cloned() {
++                    Some(owner) if owner == hdr.sender().expect("SENDER field unset").clone() => (),
++                    _ => return false,
+                 }
+             }
+ 
