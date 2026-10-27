@@ -152,6 +152,9 @@ pub mod rp1_fan;
 /// Pi 5 ACT/PWR LEDs and the power button (KEY_POWER).
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod pi5_board;
+/// BCM2712 dma40 DMA engine (Pi 5): SCB encoding and rings everywhere, the
+/// channel driver and boot self-test rpi5-only.
+pub mod bcm2712_dma40;
 /// Broadcom V3D 7.1 GPU (Pi 5): register map, power-up, MMU. Pure logic
 /// everywhere; the hardware probe is rpi5-only.
 pub mod v3d;
