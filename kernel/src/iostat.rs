@@ -133,12 +133,30 @@ fn uart_rx_report() {
         static IRQ_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
         let irqs = arch_aarch64::uart::UART_RX_IRQS.load(Relaxed);
         let first_irq = irqs != 0 && !IRQ_SEEN.swap(true, Relaxed);
+        let (txgap, late) = arch_aarch64::uart::irqoff_stats_us();
         if oe + er != SEEN.swap(oe + er, Relaxed) || first_irq {
             crate::serial_print_str(&alloc::format!(
-                "[uart] rx overruns {} errors {} throttled {} irqs {} tick {} rescued {}\n", oe, er,
+                "[uart] rx overruns {} errors {} throttled {} irqs {} tick {} rescued {} txgap_us {} irqlate_us {}\n", oe, er,
                 evdev_server::SERIAL_RX_THROTTLED.load(Relaxed), irqs,
                 arch_aarch64::uart::UART_RX_TICK_BYTES.load(Relaxed),
-                arch_aarch64::uart::UART_RX_RESCUED.load(Relaxed)));
+                arch_aarch64::uart::UART_RX_RESCUED.load(Relaxed), txgap, late));
         }
     }
+}
+
+/// `[txgap_us, irqlate_us, rescued, overruns]` for /proc/sysstat's `# uart`
+/// line (servers/vfs `gen_sysstat`). Zeros where there is no PL011 console.
+#[no_mangle]
+pub extern "C" fn kernel_uart_rx_stats(out: *mut u64) {
+    if out.is_null() { return; }
+    #[allow(unused_mut)]
+    let mut v = [0u64; 4];
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let (g, l) = arch_aarch64::uart::irqoff_stats_us();
+        v = [g, l, arch_aarch64::uart::UART_RX_RESCUED.load(Relaxed),
+             arch_aarch64::uart::UART_RX_OVERRUNS.load(Relaxed)];
+    }
+    unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), out, 4); }
 }

@@ -116,6 +116,12 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::blkdev::init();
+    // Raspberry Pi 5: ACT LED on SD I/O and the power button (KEY_POWER);
+    // BCM2712 GPIO only, no PCIe. `pi5.board=0` disables it.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    if !crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "pi5.board=0")) {
+        drivers::pi5_board::init();
+    }
     // Raspberry Pi 5: PCIe root complex for RP1 (Ethernet, USB). Opt-in until
     // hardware-verified; bounded (<= ~0.4 s) and inert on failure.
     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
@@ -250,6 +256,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             drivers::pci::serial_debug(&alloc::format!("[SERROR] pending before the v3d probe syn=0x{:016x} (an earlier probe)\n", syn));
         }
         drivers::v3d::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset, arch_aarch64::exception::serror_checkpoint);
+        // RNG, firmware RTC, PM watchdog, thermal, ARM clock: one line each (lane pimisc).
+        drivers::rpi_misc::boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset);
     }
      #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] { drivers::brcmf_boot::start(crate::boot_cmdline().unwrap_or("")); drivers::bt::boot::start(crate::boot_cmdline().unwrap_or(""), arch_aarch64::exception::serror_checkpoint); } // Pi 5 V3D power-up + ident (one [v3d] line); CYW43455 firmware bring-up on a kthread ([brcmf] lines)
     // Persist the console log on the boot disk's log partition, if it has one.
