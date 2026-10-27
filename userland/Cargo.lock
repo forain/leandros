@@ -29,6 +29,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bthid"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
+ "netctl-abi",
+]
+
+[[package]]
 name = "dbusprobe"
 version = "0.1.0"
 dependencies = [
@@ -338,6 +346,10 @@ version = "0.1.0"
 dependencies = [
  "leandros-libc",
 ]
+
+[[package]]
+name = "uinputtest"
+version = "0.1.0"
 
 [[package]]
 name = "umount"
