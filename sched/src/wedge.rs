@@ -186,8 +186,10 @@ pub const SLOT_WM: usize = 3;
 /// The net daemon: 1 = in a run of passes without parking (arg unused).
 /// Cleared at every park, so "stuck" means it has not parked for STUCK_MS.
 pub const SLOT_NETD: usize = 4;
-pub const N_SLOTS: usize = 5;
-const SLOT_NAMES: [&str; N_SLOTS] = ["brcmf", "sdio", "net", "wm", "netd"];
+/// Pi 5 pcie2/RP1 bring-up stage (`drivers::brcmstb_pcie`).
+pub const SLOT_PCIE: usize = 5;
+pub const N_SLOTS: usize = 6;
+const SLOT_NAMES: [&str; N_SLOTS] = ["brcmf", "sdio", "net", "wm", "netd", "pcie"];
 
 /// Code 0 = idle. The rest is the driver's own stage numbering, decoded at
 /// print time by the namer it registered (or printed in hex).

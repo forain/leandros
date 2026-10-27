@@ -43,6 +43,7 @@ pub fn state() -> &'static str {
         3 => "rescal-timeout",
         4 => "mdio-timeout",
         5 => "link-down",
+        7 => "stopped",
         _ => "no-rp1",
     }
 }
@@ -139,10 +140,58 @@ fn print_hex(v: u64) {
     log(core::str::from_utf8(&b[..2 + digits]).unwrap_or("?"));
 }
 
+/// `pcie.stop=N` (stages 1..=N run). Set by [`configure`] before [`init`].
+static STOP: AtomicU32 = AtomicU32::new(hw::LAST_STAGE);
+/// `pcie.reuse=1`: keep a link the firmware already trained.
+static REUSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Reads the bring-up knobs from the kernel command line.
+pub fn configure(cmdline: &str) {
+    STOP.store(hw::parse_stop(cmdline), Ordering::Relaxed);
+    REUSE.store(cmdline.split_ascii_whitespace().any(|t| t == "pcie.reuse=1"), Ordering::Relaxed);
+    sched::wedge::set_namer(sched::wedge::SLOT_PCIE, hw::stage_name);
+}
+
+/// Unbuffered console line straight to the UART FIFO (no per-CPU stage, no
+/// lock): once queued, the bytes go out even if the next load stalls the CPU.
+fn raw(s: &str) { sched::wedge::raw_str(s) }
+
+/// Enters stage `n`: honours `pcie.stop`, records the stage in the wedge
+/// `pcie` slot and prints `[pcie] stage N name` before the stage's first
+/// access. Returns false (and leaves everything as is) when stopped.
+pub fn stage(n: u32) -> bool {
+    let name = hw::stage_name(n);
+    if n > STOP.load(Ordering::Relaxed) {
+        raw("[pcie] stop before stage ");
+        sched::wedge::raw_dec(n as u64);
+        raw(" "); raw(name); raw(" (pcie.stop)\n");
+        sched::wedge::mark(sched::wedge::SLOT_PCIE, 0, n as u64);
+        // Stopping before the RP1 probe keeps a finished bus "up".
+        if STATE.load(Ordering::Relaxed) != 1 { STATE.store(7, Ordering::Relaxed); }
+        return false;
+    }
+    sched::wedge::mark(sched::wedge::SLOT_PCIE, n, 0);
+    raw("[pcie] stage "); sched::wedge::raw_dec(n as u64); raw(" "); raw(name); raw("\n");
+    true
+}
+
+/// Bring-up finished or abandoned: the wedge slot goes idle.
+pub fn stage_done() { sched::wedge::mark(sched::wedge::SLOT_PCIE, 0, 0); }
+
+fn raw_hex(label: &str, v: u64) { raw(label); sched::wedge::raw_hex(v); }
+
 /// Brings pcie2 up and registers it with `pci.rs`. Task context, once.
-/// Never hangs: every poll is bounded; failures leave the bus unregistered.
+/// Never hangs on a poll: every poll is bounded; failures leave the bus
+/// unregistered. A stalled AXI access cannot be bounded in software, so every
+/// risky step is announced first (see [`stage`]).
 pub fn init() {
     if STATE.load(Ordering::Relaxed) != 0 { return; }
+    init_inner();
+    if !is_up() { stage_done(); }
+}
+
+fn init_inner() {
+    if !stage(1) { return; }
     let regs = map(hw::PCIE2_REGS, hw::REG_SIZE);
     let rescal = map(hw::RESCAL_REGS & !0xfff, 0x1000);
     let swinit = map(hw::SW_INIT_REGS & !0xfff, 0x1000);
@@ -150,28 +199,60 @@ pub fn init() {
     let rescal = rescal + (hw::RESCAL_REGS & 0xfff) as usize;
     let swinit = swinit + (hw::SW_INIT_REGS & 0xfff) as usize;
 
-    // 1. Resets.
+    // Reset-controller status: is the bridge held in reset at hand-over?
+    if !stage(2) { return; }
+    let (bank, bit) = hw::sw_init_set(hw::PCIE2_BRIDGE_RESET_ID);
+    let st = unsafe { leandros_lib::mmio::read((swinit + bank + hw::SW_INIT_STATUS) as *const u32) };
+    raw_hex("[pcie] swinit status=", st as u64);
+    raw(if st & bit != 0 { " bridge=in-reset\n" } else { " bridge=released\n" });
+
+    let mut reuse = false;
+    if !stage(3) { return; }
     if !rescal_reset(rescal) { return fail(3, "rescal timeout"); }
     REGS.store(regs, Ordering::Release);
-    bridge_reset(swinit, true);
-    perst(true);
-    sched::kthread::udelay(200);
-    bridge_reset(swinit, false);
-    // 2. SerDes power-up.
-    rmw(hw::HARD_DEBUG, hw::HARD_DEBUG_SERDES_IDDQ, 0);
-    sched::kthread::udelay(200);
-    log("[pcie] rc rev ");
-    print_hex(rd(hw::MISC_REVISION) as u64);
-    log("\n");
 
-    // 3. 54 MHz reference-clock PLL, L1SS PM clock period (18.52 ns).
-    let mut ok = mdio_write(hw::MDIO_SET_ADDR_OFFSET, hw::PLL_54MHZ_BLOCK);
-    for &(r, d) in hw::PLL_54MHZ_REGS.iter() { ok &= mdio_write(r, d); }
-    if !ok { REGS.store(0, Ordering::Release); return fail(4, "mdio timeout"); }
-    sched::kthread::udelay(200);
-    rmw(hw::RC_PL_PHY_CTL_15, hw::PHY_CTL_15_PM_CLK_PERIOD_MASK, 0x12);
+    // First RC reads, before touching anything: tells whether the RC
+    // register block is clocked at all and whether the firmware left a link.
+    if !stage(4) { REGS.store(0, Ordering::Release); return; }
+    let rev = rd(hw::MISC_REVISION);
+    let status = rd(hw::MISC_PCIE_STATUS);
+    let ctrl = rd(hw::MISC_PCIE_CTRL);
+    raw_hex("[pcie] rc rev=", rev as u64);
+    raw_hex(" status=", status as u64);
+    raw_hex(" ctrl=", ctrl as u64);
+    raw(if hw::link_up(status) { " link=up\n" } else { " link=down\n" });
+    if REUSE.load(Ordering::Relaxed) && hw::link_up(status) {
+        raw("[pcie] reusing the firmware link (pcie.reuse=1)\n");
+        reuse = true;
+    }
+
+    if !reuse {
+        // 1. Resets (Linux brcm_pcie_setup order for BCM2712).
+        if !stage(5) { REGS.store(0, Ordering::Release); return; }
+        bridge_reset(swinit, true);
+        perst(true);
+        sched::kthread::udelay(200);
+        if !stage(6) { REGS.store(0, Ordering::Release); return; }
+        bridge_reset(swinit, false);
+        // 2. SerDes power-up.
+        if !stage(7) { REGS.store(0, Ordering::Release); return; }
+        rmw(hw::HARD_DEBUG, hw::HARD_DEBUG_SERDES_IDDQ, 0);
+        sched::kthread::udelay(200);
+        log("[pcie] rc rev ");
+        print_hex(rd(hw::MISC_REVISION) as u64);
+        log("\n");
+
+        // 3. 54 MHz reference-clock PLL, L1SS PM clock period (18.52 ns).
+        if !stage(8) { REGS.store(0, Ordering::Release); return; }
+        let mut ok = mdio_write(hw::MDIO_SET_ADDR_OFFSET, hw::PLL_54MHZ_BLOCK);
+        for &(r, d) in hw::PLL_54MHZ_REGS.iter() { ok &= mdio_write(r, d); }
+        if !ok { REGS.store(0, Ordering::Release); return fail(4, "mdio timeout"); }
+        sched::kthread::udelay(200);
+        rmw(hw::RC_PL_PHY_CTL_15, hw::PHY_CTL_15_PM_CLK_PERIOD_MASK, 0x12);
+    }
 
     // 4. Bus behaviour and error suppression.
+    if !stage(9) { REGS.store(0, Ordering::Release); return; }
     rmw(hw::MISC_CTRL, hw::MISC_CTRL_MAX_BURST_MASK,
         hw::MISC_CTRL_SCB_ACCESS_EN | hw::MISC_CTRL_CFG_READ_UR_MODE
         | hw::MISC_CTRL_RCB_MPS_MODE | hw::MISC_CTRL_RCB_64B_MODE
@@ -182,6 +263,7 @@ pub fn init() {
     wr(hw::MISC_RC_CONFIG_RETRY_TIMEOUT, 0x0aba_0000);
 
     // 5. Inbound: BAR1 = RAM, BAR2 = MIP doorbell, BAR3 off. Outbound windows.
+    if !stage(10) { REGS.store(0, Ordering::Release); return; }
     for (o, v) in hw::inbound_win_regs(1, hw::IB_RAM_PCI, hw::IB_RAM_CPU, hw::IB_RAM_SIZE) { wr(o, v); }
     for (o, v) in hw::inbound_win_regs(2, hw::MSI_PCI_ADDR, hw::MIP0_REGS, 0x1000) { wr(o, v); }
     for (o, v) in hw::inbound_win_regs(3, 0, 0, 0) { wr(o, v); }
@@ -190,21 +272,25 @@ pub fn init() {
     let bl1 = rd(hw::MISC_CPU2PCIE_WIN0_BASE_LIMIT + 4);
     for (o, v) in hw::outbound_win_regs(1, hw::OB_PREF_CPU, hw::OB_PREF_PCI, hw::OB_PREF_SIZE, bl1) { wr(o, v); }
 
-    // 6. Root port identity and link parameters, then release PERST#.
-    rmw(hw::RC_PRIV1_ID_VAL3, hw::PRIV1_ID_VAL3_CLASS_MASK, 0x06_0400);
-    rmw(hw::RC_VENDOR_SPECIFIC_REG1, hw::VENDOR_REG1_ENDIAN_MODE_BAR2_MASK, 0);
-    // x4, ASPM L1 only (`aspm-no-l0s`).
-    rmw(hw::RC_PRIV1_LINK_CAPABILITY, hw::PRIV1_LINKCAP_WIDTH_MASK | hw::PRIV1_LINKCAP_ASPM_MASK, (4 << 4) | (2 << 10));
-    // max-link-speed = 2.
-    rmw(hw::RC_LNKCAP, 0xf, 2);
-    let l2 = rd(hw::RC_LNKCTL2 & !3);
-    wr(hw::RC_LNKCTL2 & !3, (l2 & !0xf) | 2);
-    rmw(hw::HARD_DEBUG, hw::HARD_DEBUG_L1SS_ENABLE, hw::HARD_DEBUG_CLKREQ_DEBUG_ENABLE);
-    sched::kthread::udelay(200);
-    perst(false);
+    if !reuse {
+        // 6. Root port identity and link parameters, then release PERST#.
+        if !stage(11) { REGS.store(0, Ordering::Release); return; }
+        rmw(hw::RC_PRIV1_ID_VAL3, hw::PRIV1_ID_VAL3_CLASS_MASK, 0x06_0400);
+        rmw(hw::RC_VENDOR_SPECIFIC_REG1, hw::VENDOR_REG1_ENDIAN_MODE_BAR2_MASK, 0);
+        // x4, ASPM L1 only (`aspm-no-l0s`).
+        rmw(hw::RC_PRIV1_LINK_CAPABILITY, hw::PRIV1_LINKCAP_WIDTH_MASK | hw::PRIV1_LINKCAP_ASPM_MASK, (4 << 4) | (2 << 10));
+        // max-link-speed = 2.
+        rmw(hw::RC_LNKCAP, 0xf, 2);
+        let l2 = rd(hw::RC_LNKCTL2 & !3);
+        wr(hw::RC_LNKCTL2 & !3, (l2 & !0xf) | 2);
+        rmw(hw::HARD_DEBUG, hw::HARD_DEBUG_L1SS_ENABLE, hw::HARD_DEBUG_CLKREQ_DEBUG_ENABLE);
+        sched::kthread::udelay(200);
+        perst(false);
+    }
 
     // 7. Link-up: 100 ms PERST settle (PCIe T_PVPERL), then poll up to 200 ms.
-    sched::kthread::msleep(100);
+    if !stage(12) { REGS.store(0, Ordering::Release); return; }
+    if !reuse { sched::kthread::msleep(100); }
     let mut up = false;
     for _ in 0..40 {
         if hw::link_up(rd(hw::MISC_PCIE_STATUS)) { up = true; break; }
@@ -229,7 +315,9 @@ pub fn init() {
     rmw(hw::RC_RTCTL, 0, hw::RTCTL_CRSSVE);
 
     // Root port: bus 0 → 1..1, memory decode + bus master.
+    if !stage(13) { REGS.store(0, Ordering::Release); return; }
     cfgw32(0, 0x18, (cfg32(0, 0x18) & 0xff00_0000) | (1 << 16) | (1 << 8));
+    if !stage(14) { REGS.store(0, Ordering::Release); return; }
     let id = cfg32(1, 0);
     if id & 0xffff != hw::RP1_VENDOR as u32 || id >> 16 != hw::RP1_DEVICE as u32 {
         log("[pcie] FAIL no RP1 at 01:00.0 id=");
@@ -238,6 +326,7 @@ pub fn init() {
         STATE.store(6, Ordering::Relaxed);
         return;
     }
+    if !stage(15) { REGS.store(0, Ordering::Release); return; }
     let end = assign_rp1_bars();
     cfgw32(0, 0x20, hw::bridge_mem_window(hw::OB_MEM_PCI, end));
     cfgw32(0, 0x24, 0x0000_fff0); // prefetchable window closed

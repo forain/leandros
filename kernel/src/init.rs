@@ -128,8 +128,12 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     if crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "pcie.rpi5=1")) {
         drivers::rp1::GEM_IRQ.store(crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "rp1.irq=1")),
             core::sync::atomic::Ordering::Relaxed);
+        drivers::brcmstb_pcie::configure(crate::boot_cmdline().unwrap_or(""));
         drivers::brcmstb_pcie::init();
-        drivers::rp1::probe();
+        if drivers::brcmstb_pcie::is_up() && drivers::brcmstb_pcie::stage(16) {
+            drivers::rp1::probe();
+        }
+        drivers::brcmstb_pcie::stage_done();
         drivers::pci::serial_debug("[pcie] state=");
         drivers::pci::serial_debug(drivers::brcmstb_pcie::state());
         drivers::pci::serial_debug("\n");
