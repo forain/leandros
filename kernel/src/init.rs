@@ -276,6 +276,10 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         drivers::v3d::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset, arch_aarch64::exception::serror_checkpoint);
         // RNG, firmware RTC, PM watchdog, thermal, ARM clock: one line each (lane pimisc).
         drivers::rpi_misc::boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset);
+        // Serial reset sequence on uart10 (lane piwdt): 5x Ctrl-] in 2 s or BREAK 'b'.
+        if let Some(h) = drivers::rpi_misc::serial_reset_hook() {
+            arch_aarch64::uart::RX_BYTE_HOOK.store(h as usize, core::sync::atomic::Ordering::Release);
+        }
         // BCM2712 GPIO/pinctrl/l2-intc (one [gpio] line) and OTP serial + MACs (one [otp] line), lane pigio.
         drivers::bcm2712_gpio::boot(arch_aarch64::exception::serror_checkpoint);
         drivers::bcm2712_otp::boot();

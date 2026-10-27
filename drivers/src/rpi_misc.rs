@@ -5,7 +5,7 @@
 //! Boot lines (one each):
 //!   `[rng] iproc-rng200 ...`   entropy source registered with `sched::random`
 //!   `[RTC] rpi ...`            firmware RTC → CLOCK_REALTIME
-//!   `[wdt] bcm2712-pm ...`     watchdog (opt-in `pi.wdt=<1..15 s>`)
+//!   `[WDT] bcm2712-pm ...`     wedge watchdog, on by default (`wdt.off=1`)
 //!   `[thermal] ...`            AVS monitor (firmware GET_TEMPERATURE fallback)
 //!   `[cpufreq] rpi ...`        ARM clock min/cur/max + governor (`pi.cpufreq=0` off,
 //!                              `pi.cpufreq=max` pins the max rate)
@@ -36,7 +36,6 @@ static CPU_CUR: AtomicU32 = AtomicU32::new(0);
 static CPU_SETS: AtomicU32 = AtomicU32::new(0);
 /// 0 = no driver, 1 = ondemand, 2 = fixed (governor off / pinned).
 static GOV_MODE: AtomicU32 = AtomicU32::new(0);
-static WDT_SECS: AtomicU32 = AtomicU32::new(0);
 
 struct Win(usize);
 impl Regs32 for Win {
@@ -191,14 +190,12 @@ fn cpufreq_init(cmdline: &str) {
     });
 }
 
-/// Housekeeping thread: governor samples every 100 ms, watchdog kicks.
+/// Housekeeping thread: governor samples every 100 ms.
 fn housekeeping() {
     let mut g = Governor::new(CPU_MIN.load(Ordering::Relaxed), CPU_MAX.load(Ordering::Relaxed),
                               CPU_CUR.load(Ordering::Relaxed));
     loop {
         sched::kthread::msleep(100);
-        let wdt = WDT_SECS.load(Ordering::Relaxed);
-        if wdt != 0 { crate::rpi_pm::wdt_kick(wdt); }
         if GOV_MODE.load(Ordering::Relaxed) == 1 {
             let busy = crate::rpi_misc_logic::busy_from_nr_running(sched::nr_running());
             if let Some(hz) = g.sample(busy) {
@@ -226,18 +223,72 @@ pub fn cpufreq_report(out: &mut [u8]) -> usize {
 
 // ── Watchdog ─────────────────────────────────────────────────────────────────
 
-fn wdt_init(cmdline: &str) {
-    let Some(_) = crate::rpi_pm::base() else { return serial_debug("[wdt] bcm2712-pm fail map\n") };
-    let secs = opt(cmdline, "pi.wdt").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0)
-        .min(crate::rpi_misc_logic::pm::MAX_SECS);
-    let was = crate::rpi_pm::with(|r| crate::rpi_misc_logic::pm::is_running(r)).unwrap_or(false);
-    if secs == 0 {
-        if was { crate::rpi_pm::wdt_stop(); }
-        return line(|b| { b.s("[wdt] bcm2712-pm ready (off; pi.wdt=<1..15> arms it)").s(if was { ", firmware watchdog stopped" } else { "" }); });
+// Wedge recovery (lane piwdt). The board is powered from a port that cannot
+// be switched, so a wedged kernel must reset the board itself; the firmware
+// then boots the card's kernel.img. The PM watchdog is armed with its 15 s
+// maximum and re-fed from cpu0's tick watchdog scan (every 0.5 s, IRQ
+// context) only while every busy online CPU took a timer tick within
+// `wdt::STUCK_SECS`: a CPU stuck with IRQs masked (spinning on a lock) stops
+// the feeding, and the board resets ~60 s into the stall. A stuck cpu0
+// stops it too (no scan runs). `wdt.off=1` disables it.
+
+static PM_OK: AtomicBool = AtomicBool::new(false);
+/// The serial reset handler for the console UART's RX path, once the PM
+/// block is known to exist (DTB node + mapped). None elsewhere.
+pub fn serial_reset_hook() -> Option<fn(u8, bool, u64)> {
+    PM_OK.load(Ordering::Acquire).then_some(serial_magic as fn(u8, bool, u64))
+}
+static WDT_FED: AtomicBool = AtomicBool::new(true);
+
+fn wdt_feed_hook() {
+    use crate::rpi_misc_logic::wdt;
+    let n = sched::active_cpu_count();
+    let stuck = wdt::stuck_cpu((1..n).map(|c| (c, sched::wdog_tick_age_secs(c), sched::cpu_idle(c))), wdt::STUCK_SECS);
+    match stuck {
+        None => {
+            if crate::rpi_pm::wdt_kick_try(wdt::HW_SECS) && !WDT_FED.swap(true, Ordering::Relaxed) {
+                serial_debug("[WDT] all CPUs ticking again: feeding resumed\n");
+            }
+        }
+        Some((cpu, secs)) => {
+            if WDT_FED.swap(false, Ordering::Relaxed) {
+                line(|b| { b.s("[WDT] cpu").u(cpu as u64).s(" stuck ").u(secs as u64).s("s: letting hardware watchdog reset"); });
+            }
+        }
     }
-    crate::rpi_pm::wdt_start(secs);
-    WDT_SECS.store(secs, Ordering::Relaxed);
-    line(|b| { b.s("[wdt] bcm2712-pm armed ").u(secs as u64).s(" s, kicked every 100 ms"); });
+}
+
+/// Serial reset matcher state. Only touched from `uart::rx_hw_byte`, which
+/// runs under the UART's RX_LOCK, so accesses never overlap.
+static mut MAGIC: crate::rpi_misc_logic::wdt::Magic = crate::rpi_misc_logic::wdt::Magic::new();
+
+/// Every byte read from the console PL011 (any CPU, IRQs masked, no lock
+/// taken here): 5x Ctrl-] within 2 s, or BREAK then 'b', resets the board.
+pub fn serial_magic(b: u8, brk: bool, now_ms: u64) {
+    let hit = unsafe { (*core::ptr::addr_of_mut!(MAGIC)).feed(b, brk, now_ms) };
+    if !hit { return; }
+    serial_debug("\n[WDT] serial reset sequence: full reset now\n");
+    crate::rpi_pm::restart();
+    loop { core::hint::spin_loop(); }
+}
+
+fn wdt_init(cmdline: &str) {
+    use crate::rpi_misc_logic::wdt;
+    let dt_pm = unsafe { boot::device_tree::recorded_dtb() }.map(wdt::dtb_has_pm).unwrap_or(false);
+    if !dt_pm { return serial_debug("[WDT] no bcm2712-pm node in the DTB: watchdog off\n"); }
+    let Some(_) = crate::rpi_pm::base() else { return serial_debug("[WDT] bcm2712-pm fail map\n") };
+    PM_OK.store(true, Ordering::Release);
+    let was = crate::rpi_pm::with(|r| crate::rpi_misc_logic::pm::is_running(r)).unwrap_or(false);
+    if opt(cmdline, "wdt.off") == Some("1") {
+        if was { crate::rpi_pm::wdt_stop(); }
+        return line(|b| { b.s("[WDT] off (wdt.off=1)").s(if was { ", running watchdog stopped" } else { "" }); });
+    }
+    crate::rpi_pm::wdt_start(wdt::HW_SECS);
+    sched::set_hw_watchdog_hook(wdt_feed_hook);
+    line(|b| {
+        b.s("[WDT] bcm2712-pm armed ").u(wdt::HW_SECS as u64).s(" s, fed while all CPUs tick; reset ~")
+            .u((wdt::STUCK_SECS + wdt::HW_SECS) as u64).s(" s into a stall (wdt.off=1 disables); serial reset: 5x Ctrl-] or BREAK b");
+    });
 }
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
@@ -257,9 +308,8 @@ pub fn boot(cmdline: &str, hhdm_offset: u64) {
     wdt_init(cmdline);
     thermal_init();
     cpufreq_init(cmdline);
-    let want_thread = GOV_MODE.load(Ordering::Relaxed) == 1 || WDT_SECS.load(Ordering::Relaxed) != 0;
+    let want_thread = GOV_MODE.load(Ordering::Relaxed) == 1;
     if want_thread && sched::kthread::spawn("pi-house", housekeeping).is_none() {
         serial_debug("[cpufreq] rpi fail kthread\n");
-        if WDT_SECS.load(Ordering::Relaxed) != 0 { crate::rpi_pm::wdt_stop(); }
     }
 }
