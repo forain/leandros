@@ -91,6 +91,9 @@ pub mod bcm2712_id;
 pub mod bcm2712_gpio;
 /// Pi 5 board serial and factory MACs from the OTP (firmware mailbox).
 pub mod bcm2712_otp;
+/// Pi 5 read-only HDMI0/1 boot probe (HDMI vs DVI, pixel clock, audio gate, MAI); rpi5 only.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod hdmi_probe;
 /// Pi 5 Wi-Fi boot bring-up: sdio2 host → firmware → "ver" (rpi5 only).
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod brcmf_boot;
@@ -133,6 +136,11 @@ pub mod brcmstb_hw;
 pub mod brcmstb_pcie;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod rp1;
+/// Pi 5 USB: RP1's two DWC3 controllers in xHCI host mode (glue + attach).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rp1_usb;
+/// DWC3 global-register math (host-tested in drivers/dwc3-tests).
+pub mod dwc3_hw;
 /// RP1 clock/GPIO/PWM register math (host-tested in drivers/rp1-tests).
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod rp1_hw;
@@ -148,6 +156,9 @@ pub mod rp1_fan;
 /// Pi 5 ACT/PWR LEDs and the power button (KEY_POWER).
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod pi5_board;
+/// BCM2712 dma40 DMA engine (Pi 5): SCB encoding and rings everywhere, the
+/// channel driver and boot self-test rpi5-only.
+pub mod bcm2712_dma40;
 /// Broadcom V3D 7.1 GPU (Pi 5): register map, power-up, MMU. Pure logic
 /// everywhere; the hardware probe is rpi5-only.
 pub mod v3d;
