@@ -362,7 +362,7 @@ pub async fn hold_link(sh: &Sh, a: Addr) -> Result<(), u8> {
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = std::future::ready(()) => { let _ = &mut rx; let _ = b.send(&Msg::Close { cid }).await; break; }
+                _ = &mut rx => { let _ = b.send(&Msg::Close { cid }).await; break; }
                 m = b.next() => match m {
                     Ok(Msg::Closed { cid: c, .. }) if c == cid => break,
                     Ok(_) => {}
