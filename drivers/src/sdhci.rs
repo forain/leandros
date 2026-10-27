@@ -331,11 +331,34 @@ const CMD_TYPE_ABORT:    u16 = 0b11 << 6;
 const MULTI_MAX_SECTORS: usize = 128;
 /// Blocks (4 KiB) per multi-block command.
 const MULTI_MAX_BLOCKS: usize = MULTI_MAX_SECTORS / SECTORS_PER_BLOCK;
-/// Multi-block CMD18/CMD25 in use. Cleared (for good) after
+/// Multi-block CMD18/CMD25 in use. OFF by default: on the real Pi 5 it
+/// broke inbound SSH with no transfer ever reporting an error (suspected
+/// silent data corruption; QEMU's SD model never showed it). `sdhci.multi=1`
+/// opts in (see `configure`). Also cleared (for good) after
 /// `MULTI_FALLBACK_LIMIT` transfers failed multi-block but then succeeded
-/// sector by sector: the card or controller does not do multi-block right,
-/// and the old single-sector path is known to work.
-static MULTI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// sector by sector.
+static MULTI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `sdhci.multitest=1`: at probe, compare a single-sector read and a
+/// multi-block read of the first `MULTITEST_BLOCKS` blocks. Read-only.
+static MULTITEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+const MULTITEST_BLOCKS: usize = 1024; // 4 MiB
+
+/// Kernel command-line knobs, read before `init` probes the card:
+/// `sdhci.multi=1` (multi-block I/O) and `sdhci.multitest=1` (boot self-test).
+///
+/// QEMU `-M raspi4b` boots with no DTB and so no command line: a build with
+/// `LEANDROS_SDHCI_KNOBS="sdhci.multitest=1"` in the environment bakes them in.
+pub fn configure(cmdline: &str) {
+    let baked = option_env!("LEANDROS_SDHCI_KNOBS").unwrap_or("");
+    for w in baked.split_ascii_whitespace().chain(cmdline.split_ascii_whitespace()) {
+        match w {
+            "sdhci.multi=1" => MULTI_ON.store(true, Ordering::Relaxed),
+            "sdhci.multi=0" => MULTI_ON.store(false, Ordering::Relaxed),
+            "sdhci.multitest=1" => MULTITEST.store(true, Ordering::Relaxed),
+            _ => {}
+        }
+    }
+}
 static MULTI_FALLBACKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 const MULTI_FALLBACK_LIMIT: u32 = 3;
 
@@ -582,6 +605,71 @@ impl SdhciDevice {
         // Transfer Complete follows the auto CMD12 (and, for a write, the
         // card's busy on DAT0).
         self.wait_normal_int(NI_XFER_COMPLETE)
+    }
+
+    /// `sdhci.multitest=1`: read the first `MULTITEST_BLOCKS` blocks of the
+    /// partition single-sector and multi-block (spans of 16, 1 and 7 blocks,
+    /// the shapes `span_io`/`read_block` issue) and compare. Read-only. One line:
+    /// `[sdhci] multitest <n> blocks crc single=.. multi=.. fails=.. match|MISMATCH at block B sector S (+K more sectors) s=.. m=..`.
+    unsafe fn multitest(&self) {
+        const SHAPES: [usize; 3] = [16, 1, 7];
+        let mut a = alloc::vec![0u8; MULTI_MAX_BLOCKS * BLOCK_SIZE];
+        let mut b = alloc::vec![0u8; MULTI_MAX_BLOCKS * BLOCK_SIZE];
+        let (mut crc_s, mut crc_m) = (!0u32, !0u32);
+        let mut first: Option<(u64, usize, u32, u32)> = None;
+        let (mut bad_sectors, mut fails, mut single_fail) = (0u32, 0u32, false);
+        let (mut blk, mut k) = (0usize, 0usize);
+        while blk < MULTITEST_BLOCKS {
+            let n = SHAPES[k % SHAPES.len()].min(MULTITEST_BLOCKS - blk);
+            k += 1;
+            let len = n * BLOCK_SIZE;
+            for x in b[..len].iter_mut() { *x = 0xa5; }
+            for j in 0..n {
+                if !self.do_io(false, (blk + j) as u64, a.as_mut_ptr().add(j * BLOCK_SIZE)) { single_fail = true; }
+            }
+            let sector = (blk as u64 + self.partition_offset) * SECTORS_PER_BLOCK as u64;
+            if !self.do_io_multi(false, sector, n * SECTORS_PER_BLOCK, b.as_mut_ptr()) {
+                fails += 1;
+                self.abort_multi();
+            }
+            crc_s = crc32_update(crc_s, &a[..len]);
+            crc_m = crc32_update(crc_m, &b[..len]);
+            for s in 0..n * SECTORS_PER_BLOCK {
+                let r = s * SECTOR_SIZE..(s + 1) * SECTOR_SIZE;
+                if a[r.clone()] != b[r.clone()] {
+                    bad_sectors += 1;
+                    if first.is_none() {
+                        let w = (0..SECTOR_SIZE / 4).find(|&w| a[r.start + 4 * w..r.start + 4 * w + 4] != b[r.start + 4 * w..r.start + 4 * w + 4]).unwrap_or(0);
+                        let rd = |v: &[u8]| u32::from_le_bytes([v[r.start + 4 * w], v[r.start + 4 * w + 1], v[r.start + 4 * w + 2], v[r.start + 4 * w + 3]]);
+                        first = Some(((blk + s / SECTORS_PER_BLOCK) as u64, s + (w << 16), rd(&a), rd(&b)));
+                    }
+                }
+            }
+            blk += n;
+        }
+        let hex = |v: u64, digits: usize| {
+            let mut o = [0u8; 16];
+            for i in 0..digits { let nib = ((v >> (4 * (digits - 1 - i))) & 0xf) as u8; o[i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 }; }
+            o
+        };
+        let p = |s: &str| crate::pci::serial_debug(s);
+        let ph = |v: u64, d: usize| { let o = hex(v, d); crate::pci::serial_debug(core::str::from_utf8(&o[..d]).unwrap_or("?")); };
+        p("[sdhci] multitest 1024 blocks (4 MiB, spans 16/1/7) crc single="); ph(!crc_s as u64, 8);
+        p(" multi="); ph(!crc_m as u64, 8);
+        p(" multifails="); ph(fails as u64, 4);
+        if single_fail { p(" SINGLE-SECTOR-READ-FAILED"); }
+        match first {
+            None => p(" match\n"),
+            Some((fb, sw, sv, mv)) => {
+                p(" MISMATCH at block "); ph(fb, 8);
+                p(" span-sector "); ph((sw & 0xffff) as u64, 4);
+                p(" word "); ph((sw >> 16) as u64, 4);
+                p(" single="); ph(sv as u64, 8);
+                p(" multi="); ph(mv as u64, 8);
+                p(" badsectors="); ph(bad_sectors as u64, 8);
+                p("\n");
+            }
+        }
     }
 
     /// After a failed multi-block transfer: reset CMD/DAT, send a manual
@@ -1322,7 +1410,14 @@ pub fn init() {
         Some(d) => {
             devs[1] = Some(d);
             dbg(b']');
-            crate::pci::serial_debug("[sdhci] I/O mode: PIO multi-block CMD18/CMD25 + auto-CMD12, up to 64 KiB per command (single-sector fallback)\n");
+            if MULTITEST.load(Ordering::Relaxed) {
+                if let Some(ref d) = devs[1] { unsafe { d.multitest(); } }
+            }
+            crate::pci::serial_debug(if MULTI_ON.load(Ordering::Relaxed) {
+                "[sdhci] I/O mode: PIO multi-block CMD18/CMD25 + auto-CMD12, up to 64 KiB per command (single-sector fallback) (sdhci.multi=1)\n"
+            } else {
+                "[sdhci] I/O mode: PIO single-sector CMD17/CMD24 (multi-block off; sdhci.multi=1 enables it)\n"
+            });
             2
         }
         None => { dbg(b'-'); 0 }
@@ -1369,6 +1464,18 @@ pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
 fn span_io(dev_idx: usize, is_write: bool, blk: u64, buf: *mut u8, len: usize) -> bool {
     if len == 0 || len % BLOCK_SIZE != 0 { return false; }
     let total = len / BLOCK_SIZE;
+    if !MULTI_ON.load(Ordering::Relaxed) {
+        // Exactly the pre-multi-block behaviour: one 4 KiB block (8 single
+        // sectors) per `DEVICES` hold, no reschedule point.
+        for i in 0..total {
+            let devs = DEVICES.lock();
+            let dev = match devs.get(dev_idx) { Some(Some(d)) => d, _ => return false };
+            let ok = dev.do_io(is_write, blk + i as u64, unsafe { buf.add(i * BLOCK_SIZE) });
+            drop(devs);
+            if !ok { return false; }
+        }
+        return true;
+    }
     let mut i = 0;
     while i < total {
         let n = (total - i).min(MULTI_MAX_BLOCKS);
@@ -1435,4 +1542,13 @@ pub fn info(dev_idx: usize) -> Option<crate::BlkDevInfo> {
         block_size: BLOCK_SIZE as u32,
         fstype: if has_f2fs(dev_idx) { Some("f2fs") } else { None },
     })
+}
+
+/// Bitwise CRC-32 (IEEE, reflected); only the boot self-test uses it.
+fn crc32_update(mut c: u32, data: &[u8]) -> u32 {
+    for &x in data {
+        c ^= x as u32;
+        for _ in 0..8 { c = if c & 1 != 0 { (c >> 1) ^ 0xedb8_8320 } else { c >> 1 }; }
+    }
+    c
 }
