@@ -694,7 +694,7 @@ pub fn init() {
 /// INTID the console UART actually raises. `SPI_PL011` unless the rpi5 line
 /// probe found it elsewhere (BCM2712 D0 moved uart10 from SPI 121 to SPI 120:
 /// raspberrypi/linux bcm2712d0-rpi-5-b.dts `&uart10 { interrupts = <GIC_SPI
-/// 120 ...> }`; the card carries both dtbs and the firmware picks per stepping).
+/// 120 ...> }`, applied by the firmware as overlays/bcm2712d0.dtbo on a D0 board).
 static UART_INTID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(SPI_PL011);
 
 pub fn uart_intid() -> u32 { UART_INTID.load(Ordering::Relaxed) }
@@ -755,14 +755,17 @@ fn probe_uart_line() {
         h(lo[i] as usize); s("/"); h(hi[i] as usize); s("/"); h(lo2[i] as usize);
     }
     // No line match (RIS had nothing latched to raise the line): fall back on
-    // the live DT. The firmware loads bcm2712d0-rpi-5-b.dtb on a D0 board,
-    // where uart10 is SPI 120; its pinctrl compatible names the stepping.
+    // the stepping. D0 moved uart10 to SPI 120. The chip id decides; the DT
+    // only when the chip id does not decode (a card without
+    // overlays/bcm2712d0.dtbo boots a D0 chip with the C1 tree).
     #[cfg(feature = "rpi5")]
-    if found.is_none()
-        && unsafe { boot::device_tree::struct_contains(b"brcm,bcm2712d0-pinctrl") } == Some(true)
-    {
-        found = Some(CANDS[0]);
-        s(" dt=d0");
+    if found.is_none() {
+        use drivers::bcm2712_id::{Source, Stepping};
+        let st = drivers::bcm2712_id::stepping();
+        if st.stepping == Stepping::D0 {
+            found = Some(CANDS[0]);
+            s(if st.source == Source::Hw { " hw=d0" } else { " dt=d0" });
+        }
     }
     s(" -> ");
     match found {

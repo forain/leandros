@@ -173,3 +173,64 @@ fn clock_divider_v3() {
     assert_eq!(clock_divider(200_000, 50_000, true), (2 << 8, 50_000));
     assert_eq!(clock_divider(200_000, 25_000, true), (4 << 8, 25_000));
 }
+
+// ── BCM2712 stepping (drivers/src/bcm2712_id.rs) ────────────────────────────
+mod bcm2712 {
+    use crate::bcm2712_id::*;
+
+    #[test]
+    fn chip_id_decodes_c1_and_d0() {
+        // Linux brcmstb/common.c: revision = ((id & 0xf0) >> 4) + 'A', id & 0xf.
+        assert_eq!(decode_chip_id(0x2712_0000, 0x2712_0021), Some((Stepping::C0, 0x21)));
+        assert_eq!(decode_chip_id(0x2712_0000, 0x2712_0030), Some((Stepping::D0, 0x30)));
+        assert_eq!(decode_chip_id(0x2712_0030, 0x0000_0000), Some((Stepping::D0, 0x30)));
+        assert_eq!(decode_chip_id(0x2712_0010, 0x2712_0010), Some((Stepping::Unknown, 0x10)));
+        assert_eq!(decode_chip_id(0, 0), None);
+        assert_eq!(decode_chip_id(0xffff_ffff, 0xffff_ffff), None);
+        assert_eq!(decode_chip_id(0x2711_0020, 0x2711_0020), None);
+    }
+
+    /// The real-board case of 2026-10-26: D0 chip, C1 tree (no overlay).
+    #[test]
+    fn hardware_beats_device_tree() {
+        assert_eq!(select(Some(Stepping::D0), Stepping::C0), (Stepping::D0, Source::Hw));
+        assert_eq!(select(Some(Stepping::C0), Stepping::D0), (Stepping::C0, Source::Hw));
+        assert_eq!(select(Some(Stepping::Unknown), Stepping::D0), (Stepping::D0, Source::Dt));
+        assert_eq!(select(None, Stepping::C0), (Stepping::C0, Source::Dt));
+        assert_eq!(select(None, Stepping::Unknown), (Stepping::Unknown, Source::None));
+    }
+
+    /// Rows re-checked against raspberrypi/linux rpi-6.12.y pinctrl-bcm2712.c:
+    /// bcm2712_{c0,d0}_gpio_pin_regs GPIO_REGS(28..35) and the sd2 position in
+    /// bcm2712_{c0,d0}_gpio_pin_funcs (fsel = 1-based function index).
+    #[test]
+    fn pin_tables_match_linux() {
+        let lin_c0 = [(28, 3, 4, 9, 5), (30, 3, 6, 9, 7), (31, 3, 7, 9, 8), (32, 4, 0, 9, 9),
+                      (33, 4, 1, 9, 10), (34, 4, 2, 9, 11), (35, 4, 3, 9, 12)];
+        let lin_d0 = [(28, 2, 4, 5, 10), (30, 2, 6, 5, 12), (31, 2, 7, 5, 13), (32, 3, 0, 5, 14),
+                      (33, 3, 1, 6, 0), (34, 3, 2, 6, 1), (35, 3, 3, 6, 2)];
+        let c0_sd2 = [0, 4, 4, 4, 3, 4, 3];
+        for i in 0..7 {
+            let (p, mr, mb, pr, pb, f, _) = C0_PINS[i];
+            assert_eq!((p, mr, mb, pr, pb), lin_c0[i]);
+            assert_eq!(f, c0_sd2[i]);
+            let (p, mr, mb, pr, pb, f, _) = D0_PINS[i];
+            assert_eq!((p, mr, mb, pr, pb), lin_d0[i]);
+            assert_eq!(f, if p == 28 { 0 } else { 1 });
+        }
+        assert!(pin_rows(Stepping::Unknown).is_none());
+    }
+
+    /// The C0 mux slots of pins 30..35 (reg 3 nibbles 6-7, reg 4 nibbles 0-3) are
+    /// not D0 pin-mux fields at all: D0 muxes stop at reg 3 nibble 3 (gpio35),
+    /// and D0 reg 4 is the first pad register. So the logged
+    /// sd2-fsel-before=569900 never described sdio2 on the D0 board.
+    #[test]
+    fn c0_slots_miss_d0_sd2_fields() {
+        let d0_mux: Vec<(usize, u32)> = D0_PINS.iter().map(|r| (r.1, r.2)).collect();
+        for r in &C0_PINS[1..] {
+            assert!(!d0_mux.contains(&(r.1, r.2)), "C0 slot {:?} aliases a D0 sd2 mux field", (r.1, r.2));
+        }
+        assert!(D0_PINS.iter().all(|r| r.1 <= 3) && D0_PINS.iter().any(|r| r.3 == 5));
+    }
+}

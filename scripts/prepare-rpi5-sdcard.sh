@@ -327,23 +327,30 @@ fetch_gpu_firmware() {
     cp "$src_dir/fixup4.dat" "$MOUNT_DIR/fixup4.dat"
 }
 
-# The Pi 5 device trees for direct boot, one per BCM2712 stepping. The
-# firmware picks bcm2712d0-rpi-5-b.dtb itself on a D0 board (it moved uart10
-# to SPI 120 and has a different pin-mux layout, `brcm,bcm2712d0-pinctrl`) and
-# bcm2712-rpi-5-b.dtb on C1; config.txt names no device_tree, so both go on
-# the card. target/rpi5-uefi/ only exists when the UEFI firmware bundle was
-# vendored by hand; nothing in the build creates it, so a fresh checkout
-# fetches them from the firmware repo at a pinned commit, sha256-checked.
+# The Pi 5 device tree for direct boot. The firmware loads the base
+# bcm2712-rpi-5-b.dtb on EVERY Pi 5 (C1 layout) and, on a BCM2712 D0 chip,
+# turns it into the D0 tree itself by applying overlays/bcm2712d0.dtbo (looked
+# up through overlays/overlay_map.dtb): uart10 on SPI 120 and
+# `brcm,bcm2712d0-pinctrl`. Seen on the real D0 board 2026-10-26: "Read
+# bcm2712-rpi-5-b.dtb", then "/overlays/overlay_map.dtb", "/overlays/bcm2712d0.dtbo";
+# with no overlays/ dir the live tree stayed C1. bcm2712d0-rpi-5-b.dtb is not
+# read by the firmware (it only serves an explicit device_tree=), so it is not
+# shipped. config.txt names no device_tree. target/rpi5-uefi/ only exists when
+# the UEFI firmware bundle was vendored by hand; nothing in the build creates
+# it, so a fresh checkout fetches these from the firmware repo at a pinned
+# commit, sha256-checked. The kernel reads the stepping from the chip id
+# anyway (drivers/src/bcm2712_id.rs); the overlay keeps the DT honest.
 DTB_COMMIT="88a0ae8876e800801ee5c27624138b3d02a21c63"   # raspberrypi/firmware master, 2026-10-21
 DTB_SHA256_C1="03ce4742452ad52e3e8ec2259a0c705b496970e2b75e6e0b4e5446475ea1b926"
-DTB_SHA256_D0="d01e2104a8b747e99e310bfb22aeac8100e3b98df29951b296b5cdc2e95afb53"
+OVERLAY_MAP_SHA256="2d4617de880e377a6a63ee1a642ec69b22700ed1b74d0e89bc5e7653b333121a"
+OVERLAY_D0_SHA256="b73210c9256ff4b4963365f9acc49c0f7449f17eeddf21355e23dd011da899ec"
 direct_boot_dtb() {
     local name="$1" sum="$2" f
     for f in "$UEFI_DIR/$name" "${FIRMWARE_DIR:+$FIRMWARE_DIR/$name}"; do
         [[ -n "$f" && -f "$f" ]] && { echo "$f"; return; }
     done
-    mkdir -p "$FW_CACHE_DIR/dtb-$DTB_COMMIT"
     f="$FW_CACHE_DIR/dtb-$DTB_COMMIT/$name"
+    mkdir -p "$(dirname "$f")"
     if [[ ! -f "$f" ]]; then
         info "Downloading RPi 5 device tree ($name)..." >&2
         curl -fsSL -o "$f.part" "https://raw.githubusercontent.com/raspberrypi/firmware/$DTB_COMMIT/boot/$name" || \
@@ -361,7 +368,11 @@ fetch_gpu_firmware
 if [[ "$BOOT_MODE" == "direct" ]]; then
     info "Copying direct-boot kernel + initrd..."
     cp "$(direct_boot_dtb bcm2712-rpi-5-b.dtb "$DTB_SHA256_C1")" "$MOUNT_DIR/bcm2712-rpi-5-b.dtb"
-    cp "$(direct_boot_dtb bcm2712d0-rpi-5-b.dtb "$DTB_SHA256_D0")" "$MOUNT_DIR/bcm2712d0-rpi-5-b.dtb"
+    mkdir -p "$MOUNT_DIR/overlays"
+    cp "$(direct_boot_dtb overlays/overlay_map.dtb "$OVERLAY_MAP_SHA256")" "$MOUNT_DIR/overlays/overlay_map.dtb"
+    cp "$(direct_boot_dtb overlays/bcm2712d0.dtbo "$OVERLAY_D0_SHA256")" "$MOUNT_DIR/overlays/bcm2712d0.dtbo"
+    # A card prepared by an older script may still carry the unused D0 dtb.
+    rm -f "$MOUNT_DIR/bcm2712d0-rpi-5-b.dtb"
     # The *flat* image, not the ELF. The Raspberry Pi firmware does not parse
     # ELF for `kernel=`; it copies the file verbatim to `kernel_address` and
     # branches to the first byte. build-all.sh already emits this via

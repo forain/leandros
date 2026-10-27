@@ -7,6 +7,9 @@ pub mod bus;
 #[path = "../../src/brcmf/sdio_host.rs"]
 pub mod sdio_host;
 
+#[path = "../../src/bcm2712_id.rs"]
+pub mod bcm2712_id;
+
 pub mod mock;
 
 #[cfg(test)]
