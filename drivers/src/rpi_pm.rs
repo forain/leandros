@@ -55,6 +55,18 @@ fn with_nolock<R>(f: impl FnOnce(&mut PmRegs) -> R) -> Option<R> {
 pub fn wdt_start(secs: u32) -> bool { with(|r| pm::arm(r, pm::secs_to_ticks(secs))).is_some() }
 pub fn wdt_kick(secs: u32) { let _ = with(|r| pm::arm(r, pm::secs_to_ticks(secs))); }
 pub fn wdt_stop() { let _ = with(|r| pm::disarm(r)); }
+/// Feed from IRQ context: skips (false) when the PM lock is held — the next
+/// feed comes 0.5 s later, well inside the hardware timeout.
+pub fn wdt_kick_try(secs: u32) -> bool {
+    let Some(b) = base() else { return false };
+    let Some(_g) = LOCK.try_lock() else { return false };
+    pm::arm(&mut PmRegs(b), pm::secs_to_ticks(secs));
+    true
+}
+/// Re-arm without the lock (kexec hand-off: every other CPU is stopped).
+pub fn wdt_kick_nolock(secs: u32) -> bool { with_nolock(|r| pm::arm(r, pm::secs_to_ticks(secs))).is_some() }
+/// True if the watchdog is armed (RSTC WRCFG = full reset), lock-free.
+pub fn wdt_running_nolock() -> bool { with_nolock(|r| pm::is_running(r)).unwrap_or(false) }
 
 /// Reset through the watchdog (fallback when PSCI SYSTEM_RESET returns).
 pub fn restart() -> bool { with_nolock(|r| pm::restart(r)).is_some() }

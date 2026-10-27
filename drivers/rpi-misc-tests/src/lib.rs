@@ -161,4 +161,43 @@ mod tests {
         let n = w.n;
         assert_eq!(std::str::from_utf8(&b[..n]).unwrap(), "50.1 -3 -1.5");
     }
+
+    #[test]
+    fn wdt_feeds_only_while_every_busy_cpu_ticks() {
+        use super::logic::wdt::*;
+        assert_eq!(stuck_cpu([(1, 0, false), (2, 3, false), (3, 44, false)].into_iter(), STUCK_SECS), None);
+        // an idle CPU whose timer sleeps never stops the feeding
+        assert_eq!(stuck_cpu([(1, 0, false), (2, 300, true)].into_iter(), STUCK_SECS), None);
+        // the worst stuck CPU is named
+        assert_eq!(stuck_cpu([(1, 45, false), (2, 50, false), (3, 0, false)].into_iter(), STUCK_SECS), Some((2, 50)));
+        assert_eq!(stuck_cpu(core::iter::empty(), STUCK_SECS), None);
+    }
+
+    #[test]
+    fn wdt_serial_magic() {
+        use super::logic::wdt::*;
+        let mut m = Magic::new();
+        for i in 0..4 { assert!(!m.feed(0x1d, false, 100 * i)); }
+        assert!(m.feed(0x1d, false, 500));
+        // an intervening byte restarts the count
+        let mut m = Magic::new();
+        for i in 0..4 { m.feed(0x1d, false, i); }
+        assert!(!m.feed(b'x', false, 5));
+        assert!(!m.feed(0x1d, false, 6));
+        // too slow: five presses spread over more than 2 s
+        let mut m = Magic::new();
+        for i in 0..5 { assert!(!m.feed(0x1d, false, 600 * i)); }
+        // BREAK then 'b'
+        let mut m = Magic::new();
+        assert!(!m.feed(0, true, 10));
+        assert!(m.feed(b'b', false, 20));
+        let mut m = Magic::new();
+        assert!(!m.feed(0, true, 10));
+        assert!(!m.feed(b'b', false, 5000));
+        assert!(!m.feed(b'b', false, 5001));
+        // plain 'b' never resets
+        assert!(!Magic::new().feed(b'b', false, 0));
+        assert!(dtb_has_pm(b"xx\0brcm,bcm2712-pm\0yy"));
+        assert!(!dtb_has_pm(b"brcm,bcm2712-pmx"));
+    }
 }

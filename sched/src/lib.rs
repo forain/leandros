@@ -5824,7 +5824,28 @@ fn wdog_selftest_stall() {
     }
 }
 
+/// Hardware-watchdog policy hook (rpi5 PM watchdog, lane piwdt): run by
+/// cpu0's `watchdog_scan` every 0.5 s, in IRQ context, before the
+/// system-down check (shutdown with a live cpu0 keeps feeding). It decides
+/// from [`wdog_tick_age_secs`] / [`cpu_idle`] whether to feed; it must take no
+/// blocking lock. 0 = none registered (every other board).
+static HW_WDOG_HOOK: AtomicUsize = AtomicUsize::new(0);
+pub fn set_hw_watchdog_hook(f: fn()) { HW_WDOG_HOOK.store(f as usize, Ordering::Release); }
+/// Seconds since `cpu` last took a timer tick, as cpu0's watchdog scans saw
+/// it (0.5 s resolution; 0 for cpu0 itself and out-of-range ids).
+pub fn wdog_tick_age_secs(cpu: usize) -> u32 {
+    if cpu == 0 || cpu >= MAX_CPUS { return 0; }
+    WD_AGE[0][cpu].load(Ordering::Relaxed).saturating_mul(WD_SCAN_TICKS) / 100
+}
+/// True while `cpu` is parked in its idle loop.
+pub fn cpu_idle(cpu: usize) -> bool {
+    cpu < MAX_CPUS && IDLE_SINCE[cpu].load(Ordering::Relaxed) != 0
+}
 fn watchdog_scan(me: usize) {
+    if me == 0 {
+        let h = HW_WDOG_HOOK.load(Ordering::Acquire);
+        if h != 0 { let f: fn() = unsafe { core::mem::transmute(h) }; f(); }
+    }
     if SYSTEM_DOWN.load(Ordering::Acquire) { return; }
     extern "C" {
         fn arch_serial_putc(c: u8);

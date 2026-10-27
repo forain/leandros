@@ -335,9 +335,20 @@ fn rx_unlock(daif: u64) {
 
 /// Read one byte from the hardware FIFO (caller saw RXFE clear), counting
 /// overrun / framing errors.
+/// Optional `fn(byte, is_break, now_ms)` run on every byte read from the
+/// hardware FIFO, under RX_LOCK with IRQs masked, on whichever CPU drains it
+/// (rpi5 serial reset sequence, lane piwdt). Must take no lock. 0 = none.
+pub static RX_BYTE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+const DR_BE: u32 = 1 << 10;
+
 unsafe fn rx_hw_byte() -> u8 {
     use core::sync::atomic::Ordering::Relaxed;
     let d = rd(DR);
+    let h = RX_BYTE_HOOK.load(Relaxed);
+    if h != 0 {
+        let f: fn(u8, bool, u64) = core::mem::transmute(h);
+        f((d & 0xFF) as u8, d & DR_BE != 0, ticks_to_us(cntvct_raw()) / 1000);
+    }
     if d & DR_ERR != 0 {
         if d & DR_OE != 0 { UART_RX_OVERRUNS.fetch_add(1, Relaxed); }
         else { UART_RX_ERRORS.fetch_add(1, Relaxed); }
@@ -473,6 +484,10 @@ pub unsafe fn getc() -> Option<u8> {
 /// one byte was lost (flagged on the next byte read). Nonzero means the RX
 /// drain is too slow — see the `[uart]` line in kernel/src/iostat.rs.
 pub static UART_RX_OVERRUNS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Bytes read and dropped while the console reader was throttled for over
+/// 1 s (rpi5 only: the serial reset matcher must still see them).
+pub static UART_RX_DISCARDED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 /// Framing / parity / break errors on received bytes.
 pub static UART_RX_ERRORS: core::sync::atomic::AtomicU64 =

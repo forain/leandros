@@ -357,6 +357,24 @@ pub fn on_tick() {
             b
         });
         unsafe { super::uart::set_rx_irq(!throttled); }
+        // Serial reset sequence (lane piwdt): with a reader that stopped
+        // draining (a wedged shell), the backlog stays full and the RX bytes
+        // would sit in the FIFO forever, so the reset sequence is never seen.
+        // After 1 s of continuous throttling, read the FIFO anyway (the bytes
+        // pass the reset matcher in `rx_hw_byte`) and drop them: a full FIFO
+        // would overrun and lose them regardless. Only when a matcher is set.
+        {
+            use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+            static THROTTLED_TICKS: AtomicU32 = AtomicU32::new(0);
+            if !throttled { THROTTLED_TICKS.store(0, Relaxed); }
+            else if THROTTLED_TICKS.fetch_add(1, Relaxed) >= 100
+                && super::uart::RX_BYTE_HOOK.load(Relaxed) != 0
+            {
+                let mut n = 0;
+                while n < 64 && unsafe { super::uart::getc() }.is_some() { n += 1; }
+                super::uart::UART_RX_DISCARDED.fetch_add(n, Relaxed);
+            }
+        }
 
         // One poll wake for everything this tick drained — virtio input above
         // and the UART bytes just now. Must come after BOTH, which is why it is

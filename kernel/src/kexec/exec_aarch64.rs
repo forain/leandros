@@ -253,6 +253,14 @@ pub fn stop_and_jump() -> ! {
 
 fn final_cpu0() -> ! {
     timers_off();
+    // rpi5 wedge watchdog (lane piwdt): if armed, give the next kernel the
+    // full 15 s to reach its own watchdog init (`rpi_misc::boot` re-arms it,
+    // or an older kernel stops it); a next kernel that hangs before that is
+    // reset to the card's kernel.img instead of needing a power cycle.
+    #[cfg(feature = "rpi5")]
+    if drivers::rpi_pm::wdt_running_nolock() {
+        drivers::rpi_pm::wdt_kick_nolock(drivers::rpi_misc_logic::wdt::HW_SECS);
+    }
     // Wait for every other CPU to be OFF: the next kernel's CPU_ON of a CPU
     // still ON fails with ALREADY_ON.
     let n = arch_aarch64::smp::assigned();

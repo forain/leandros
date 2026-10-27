@@ -258,3 +258,68 @@ impl<'a> Buf<'a> {
         self.u((a / 1000) as u64).s(".").u(((a % 1000) / 100) as u64)
     }
 }
+
+// ── Wedge-recovery watchdog policy (lane piwdt) ──────────────────────────────
+
+/// When to stop feeding the PM watchdog, and the serial "reset now" sequence.
+/// The Pi 5 sits on a USB-C port that cannot be power-switched, so a wedged
+/// kernel must take the board down itself; the firmware then boots the
+/// card's kernel.img again.
+pub mod wdt {
+    /// Hardware timeout re-armed on every feed (the PM WDOG maximum).
+    pub const HW_SECS: u32 = 15;
+    /// A CPU without a timer tick this long stops the feeding; the hardware
+    /// fires `HW_SECS` later, so the board resets ~60 s into the stall.
+    pub const STUCK_SECS: u32 = 45;
+    /// Serial sequence: this many Ctrl-] (0x1d) in a row ...
+    pub const MAGIC_BYTE: u8 = 0x1d;
+    pub const MAGIC_COUNT: u32 = 5;
+    /// ... within this window; also the BREAK -> 'b' window.
+    pub const MAGIC_WINDOW_MS: u64 = 2000;
+
+    /// The feed decision. `cpus` yields (cpu, seconds since it last took a
+    /// timer tick, idle) for every online CPU other than the feeder. Returns
+    /// the first CPU stuck for `stuck_secs` or more (feeding must stop), or
+    /// None (every busy CPU ticked recently: feed). Idle CPUs are skipped: a
+    /// parked CPU's timer may legitimately sleep.
+    pub fn stuck_cpu(cpus: impl Iterator<Item = (usize, u32, bool)>, stuck_secs: u32) -> Option<(usize, u32)> {
+        let mut worst: Option<(usize, u32)> = None;
+        for (cpu, age, idle) in cpus {
+            if idle || age < stuck_secs { continue; }
+            if worst.map_or(true, |(_, a)| age > a) { worst = Some((cpu, age)); }
+        }
+        worst
+    }
+
+    /// Serial magic matcher: `MAGIC_COUNT` consecutive Ctrl-] within
+    /// `MAGIC_WINDOW_MS`, or a BREAK followed by 'b' within the window.
+    /// Pure state machine; the caller supplies a monotonic millisecond clock.
+    #[derive(Clone, Copy, Default)]
+    pub struct Magic { count: u32, first_ms: u64, brk_ms: Option<u64> }
+
+    impl Magic {
+        pub const fn new() -> Self { Magic { count: 0, first_ms: 0, brk_ms: None } }
+        /// One received byte (`brk`: the PL011 flagged it as a BREAK).
+        /// True = reset now.
+        pub fn feed(&mut self, b: u8, brk: bool, now_ms: u64) -> bool {
+            if brk { self.brk_ms = Some(now_ms); self.count = 0; return false; }
+            if let Some(t) = self.brk_ms.take() {
+                if b == b'b' && now_ms.wrapping_sub(t) <= MAGIC_WINDOW_MS { return true; }
+            }
+            if b != MAGIC_BYTE { self.count = 0; return false; }
+            if self.count == 0 || now_ms.wrapping_sub(self.first_ms) > MAGIC_WINDOW_MS {
+                self.count = 0;
+                self.first_ms = now_ms;
+            }
+            self.count += 1;
+            if self.count >= MAGIC_COUNT { self.count = 0; return true; }
+            false
+        }
+    }
+
+    /// True if the DTB carries a BCM2835-style PM / watchdog node.
+    pub fn dtb_has_pm(dtb: &[u8]) -> bool {
+        let has = |pat: &[u8]| dtb.windows(pat.len()).any(|w| w == pat);
+        has(b"brcm,bcm2712-pm\0") || has(b"brcm,bcm2835-pm\0") || has(b"brcm,bcm2835-pm-wdt\0")
+    }
+}
