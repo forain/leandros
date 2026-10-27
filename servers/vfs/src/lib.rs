@@ -6282,12 +6282,13 @@ fn gen_i915() -> Option<VnodeKind> {
 /// frequency over the last APERF/MPERF window (`arch_x86_64::cpufreq`).
 fn gen_cpufreq() -> Option<VnodeKind> {
     let mut out = alloc::vec![0u8; 8192];
-    #[cfg(target_arch = "x86_64")]
+    // x86_64: arch_x86_64::cpufreq; aarch64: drivers::thermal (Pi 5 firmware clock).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let n = {
         extern "C" { fn arch_cpufreq_report(buf: *mut u8, cap: usize) -> usize; }
         unsafe { arch_cpufreq_report(out.as_mut_ptr(), out.len()) }
     };
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let n = {
         let m = b"cpufreq: not implemented on this architecture\n";
         out[..m.len()].copy_from_slice(m);
@@ -6295,6 +6296,15 @@ fn gen_cpufreq() -> Option<VnodeKind> {
     };
     out.truncate(n);
     proc_snapshot(b"/tmp/.cpufreq", &out, false)
+}
+
+/// `/proc/thermal`: SoC temperature in millidegrees (`drivers::thermal`).
+fn gen_thermal() -> Option<VnodeKind> {
+    let mut out = alloc::vec![0u8; 256];
+    extern "C" { fn arch_thermal_report(buf: *mut u8, cap: usize) -> usize; }
+    let n = unsafe { arch_thermal_report(out.as_mut_ptr(), out.len()) };
+    out.truncate(n);
+    proc_snapshot(b"/tmp/.thermal", &out, false)
 }
 
 /// `/proc/pcache`: the unified page cache (`mm::pagecache`), one
@@ -6979,7 +6989,7 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// Synthesized at open (see handle_open) and not in RAMFS: stat must know them.
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
-                                     b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq",
+                                     b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
                                      b"/proc/pcache", b"/proc/epollstat", b"/proc/pcipm"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ"];
@@ -7714,6 +7724,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/cpufreq" {
             match gen_cpufreq() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/thermal" {
+            match gen_thermal() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
