@@ -1,0 +1,14 @@
+# Host unit tests for the Pi 5 SoC housekeeping logic (drivers/src/rpi_misc_logic.rs):
+# iproc-rng200, PM watchdog/reset, AVS temperature, firmware tags, cpufreq governor.
+#
+#   cd drivers/rpi-misc-tests && cargo test --target aarch64-apple-darwin
+[package]
+name = "rpi-misc-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

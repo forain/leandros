@@ -1,0 +1,242 @@
+//! Broadcom UART controller bring-up (btbcm.c + hci_bcm.c order), generic over
+//! the byte transport so the whole sequence runs on the host against a
+//! scripted controller:
+//!
+//! HCI Reset → Read Local Version → [Download Minidriver (0xfc2e), 50 ms, every
+//! `.hcd` record, 250 ms, HCI Reset] → [Update UART Baud Rate (0xfc18), switch
+//! our UART, Read Local Version at the new rate] → Read Local Version →
+//! Read BD_ADDR → [Write BD_ADDR (0xfc01) if the controller still has its
+//! placeholder and the device tree supplies one].
+//!
+//! Every wait is bounded; the first failure aborts with the stage name.
+use alloc::vec::Vec;
+
+use super::h4::{self, BdAddr, Event, H4Parser, LocalVersion};
+use super::hcd::{self, HcdError, Summary};
+
+pub trait Transport {
+    /// Writes all bytes (bounded wait; `false` if the controller never took them).
+    fn send(&mut self, bytes: &[u8]) -> bool;
+    /// One received byte, or `None` after `timeout_us` without one.
+    fn recv(&mut self, timeout_us: u32) -> Option<u8>;
+    /// Switches the host side to a new rate (after the controller acknowledged it).
+    fn set_baud(&mut self, baud: u32) -> bool;
+    fn sleep_ms(&mut self, ms: u32);
+    /// SError check after a hardware phase: `Some(syndrome)` aborts the bring-up.
+    fn checkpoint(&mut self) -> Option<u64> { None }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// No Command Complete/Status for this opcode in time.
+    NoAnswer(u16),
+    /// Command Complete/Status with a non-zero status.
+    Status(u16, u8),
+    /// Return parameters too short to decode.
+    Malformed(u16),
+    Tx(u16),
+    BaudRejected(u32),
+    Hcd(HcdError),
+    SError(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Error {
+    pub stage: &'static str,
+    pub kind: ErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options<'a> {
+    /// `.hcd` image; `None` skips the patch download.
+    pub hcd: Option<&'a [u8]>,
+    /// Operational baud rate; `None` stays at the initial rate.
+    pub oper_baud: Option<u32>,
+    /// Address to program when the controller reports a placeholder.
+    pub bdaddr: Option<BdAddr>,
+    /// Per-command answer timeout (µs); 0 means the default (1 s).
+    pub cmd_timeout_us: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Report {
+    /// Version before the patch (ROM firmware).
+    pub rom: LocalVersion,
+    /// Version after everything (patched firmware when `patch` is `Some`).
+    pub ver: LocalVersion,
+    pub patch: Option<Summary>,
+    /// The rate both sides ended at.
+    pub baud: u32,
+    pub bdaddr: BdAddr,
+    /// `true` if we wrote the address with 0xfc01.
+    pub bdaddr_set: bool,
+    /// Events that were not the awaited command's answer (vendor events etc.).
+    pub stray_events: u32,
+    /// Bytes dropped while resynchronising the H4 stream.
+    pub garbage: u32,
+}
+
+pub const INIT_BAUD: u32 = 115_200;
+const DEFAULT_CMD_TIMEOUT_US: u32 = 1_000_000;
+/// One received-byte poll slice; the overall deadline is counted in these.
+const POLL_US: u32 = 1_000;
+const MAX_BYTES_PER_CMD: u32 = 64 * 1024;
+
+struct Hci<'t, T: Transport> {
+    t: &'t mut T,
+    p: H4Parser,
+    tx: Vec<u8>,
+    timeout_us: u32,
+    stray: u32,
+}
+
+impl<'t, T: Transport> Hci<'t, T> {
+    /// Sends one command and waits for its Command Complete; returns the
+    /// return parameters. A non-zero status (first return byte, or the Command
+    /// Status event) is an error.
+    fn cmd(&mut self, stage: &'static str, op: u16, params: &[u8]) -> Result<Vec<u8>, Error> {
+        let err = |kind| Error { stage, kind };
+        self.tx.clear();
+        h4::encode_cmd(op, params, &mut self.tx);
+        if !self.t.send(&self.tx) { return Err(err(ErrorKind::Tx(op))); }
+        let mut waited = 0u32;
+        // A chatty controller must not keep us here forever either.
+        let mut bytes = 0u32;
+        while waited < self.timeout_us && bytes < MAX_BYTES_PER_CMD {
+            let Some(b) = self.t.recv(POLL_US) else { waited += POLL_US; continue; };
+            bytes += 1;
+            let Some(pkt) = self.p.feed(b) else { continue };
+            if pkt.kind != h4::H4_EVT { self.stray += 1; continue; }
+            match h4::parse_event(&pkt.data) {
+                Some(Event::CommandComplete { opcode, ret, .. }) if opcode == op => {
+                    return match ret.first() {
+                        Some(0) => Ok(ret.to_vec()),
+                        Some(&s) => Err(err(ErrorKind::Status(op, s))),
+                        None => Err(err(ErrorKind::Malformed(op))),
+                    };
+                }
+                Some(Event::CommandStatus { status, opcode, .. }) if opcode == op && status != 0 => {
+                    return Err(err(ErrorKind::Status(op, status)));
+                }
+                _ => self.stray += 1,
+            }
+        }
+        Err(err(ErrorKind::NoAnswer(op)))
+    }
+
+    fn check(&mut self, stage: &'static str) -> Result<(), Error> {
+        match self.t.checkpoint() {
+            Some(syn) => Err(Error { stage, kind: ErrorKind::SError(syn) }),
+            None => Ok(()),
+        }
+    }
+
+    fn version(&mut self, stage: &'static str) -> Result<LocalVersion, Error> {
+        let r = self.cmd(stage, h4::OP_READ_LOCAL_VERSION, &[])?;
+        h4::parse_local_version(&r).ok_or(Error { stage, kind: ErrorKind::Malformed(h4::OP_READ_LOCAL_VERSION) })
+    }
+
+    fn bdaddr(&mut self, stage: &'static str) -> Result<BdAddr, Error> {
+        let r = self.cmd(stage, h4::OP_READ_BD_ADDR, &[])?;
+        h4::parse_bdaddr(&r).ok_or(Error { stage, kind: ErrorKind::Malformed(h4::OP_READ_BD_ADDR) })
+    }
+}
+
+/// Runs the whole sequence. The transport must already be at [`INIT_BAUD`]
+/// with the controller freshly powered.
+pub fn bring_up<T: Transport>(t: &mut T, o: &Options) -> Result<Report, Error> {
+    // Validate the image before the controller is touched at all.
+    let patch = match o.hcd {
+        Some(img) => Some((img, hcd::validate(img).map_err(|e| Error { stage: "hcd", kind: ErrorKind::Hcd(e) })?)),
+        None => None,
+    };
+    let timeout_us = if o.cmd_timeout_us == 0 { DEFAULT_CMD_TIMEOUT_US } else { o.cmd_timeout_us };
+    let mut h = Hci { t, p: H4Parser::new(), tx: Vec::with_capacity(260), timeout_us, stray: 0 };
+    let mut rep = Report { baud: INIT_BAUD, ..Report::default() };
+
+    // A controller fresh out of BT_ON can miss the first command: one retry.
+    if h.cmd("reset", h4::OP_RESET, &[]).is_err() {
+        h.p.reset();
+        h.cmd("reset", h4::OP_RESET, &[])?;
+    }
+    h.check("reset")?;
+    rep.rom = h.version("version")?;
+    rep.ver = rep.rom;
+
+    if let Some((img, sum)) = patch {
+        h.cmd("minidriver", h4::OP_BCM_DOWNLOAD_MINIDRV, &[])?;
+        h.t.sleep_ms(50);
+        for r in hcd::records(img) {
+            let (_, op, p) = r.map_err(|e| Error { stage: "hcd", kind: ErrorKind::Hcd(e) })?;
+            h.cmd("patch", op, p)?;
+        }
+        h.check("patch")?;
+        // Launch RAM: the patched firmware boots; btbcm waits 250 ms.
+        h.t.sleep_ms(250);
+        h.p.reset();
+        h.cmd("reset-patched", h4::OP_RESET, &[])?;
+        rep.patch = Some(sum);
+    }
+
+    if let Some(baud) = o.oper_baud.filter(|&b| b != INIT_BAUD) {
+        h.cmd("baud", h4::OP_BCM_UPDATE_BAUD, &h4::bcm_baud_params(baud))?;
+        if !h.t.set_baud(baud) { return Err(Error { stage: "baud", kind: ErrorKind::BaudRejected(baud) }); }
+        h.t.sleep_ms(10);
+        h.p.reset();
+        rep.baud = baud;
+        h.check("baud")?;
+    }
+
+    rep.ver = h.version("version-final")?;
+    rep.bdaddr = h.bdaddr("bdaddr")?;
+    if rep.bdaddr.is_placeholder() {
+        if let Some(a) = o.bdaddr.filter(|a| !a.is_placeholder()) {
+            h.cmd("bdaddr-set", h4::OP_BCM_WRITE_BD_ADDR, &a.0)?;
+            rep.bdaddr = h.bdaddr("bdaddr")?;
+            rep.bdaddr_set = true;
+        }
+    }
+    rep.stray_events = h.stray;
+    rep.garbage = h.p.garbage;
+    Ok(rep)
+}
+
+/// Finds the first `local-bd-address` property (6 bytes) in a flattened device
+/// tree. `None` if absent, malformed or all zeros (the firmware fills it on a
+/// real boot; the stock .dtb carries zeros).
+pub fn fdt_local_bd_address(dtb: &[u8]) -> Option<BdAddr> {
+    let be32 = |o: usize| dtb.get(o..o + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    if be32(0)? != 0xd00d_feed { return None; }
+    let st = be32(8)? as usize;
+    let strs = be32(12)? as usize;
+    let end = (st + be32(36).unwrap_or(0) as usize).min(dtb.len());
+    let mut o = st;
+    while o + 4 <= end {
+        let tok = be32(o)?;
+        o += 4;
+        match tok {
+            1 => {
+                let n = dtb.get(o..end)?.iter().position(|&c| c == 0)?;
+                o = (o + n + 1 + 3) & !3;
+            }
+            3 => {
+                let len = be32(o)? as usize;
+                let nameoff = be32(o + 4)? as usize;
+                let val = o + 8;
+                o = (val + len + 3) & !3;
+                let name = dtb.get(strs + nameoff..)?;
+                let nl = name.iter().position(|&c| c == 0)?;
+                if &name[..nl] == b"local-bd-address" && len == 6 {
+                    let mut a = [0u8; 6];
+                    a.copy_from_slice(dtb.get(val..val + 6)?);
+                    let a = BdAddr(a);
+                    return if a.is_zero() { None } else { Some(a) };
+                }
+            }
+            2 | 4 => {}
+            9 => break,
+            _ => return None,
+        }
+    }
+    None
+}

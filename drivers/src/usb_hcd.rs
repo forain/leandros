@@ -120,7 +120,11 @@ fn console_log(s: &str) {
 
 pub fn init() {
     let ctrls = pci::find_by_class(0x0C, 0x03, 0x30);
-    if ctrls.is_empty() {
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    let rp1 = crate::rp1_usb::any_pending();
+    #[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
+    let rp1 = false;
+    if ctrls.is_empty() && !rp1 {
         return;
     }
     usb::platform::install(usb::platform::Hooks {
@@ -135,6 +139,9 @@ pub fn init() {
     for pci in &ctrls {
         unsafe { probe_one(pci) };
     }
+    // Pi 5: RP1's DWC3 controllers (their own DMA offset; nothing else on that SoC uses xHCI).
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    if rp1 && ctrls.is_empty() { crate::rp1_usb::probe_pending(); }
     crate::usb_hid::init();
 }
 
@@ -375,6 +382,13 @@ pub fn device_info(index: usize) -> Option<UsbDevInfo> {
 /// Every xHCI the driver mapped, for [`quiesce_all`].
 struct Ctrl { bus: u8, dev: u8, func: u8, vendor: u16, base: usize }
 static CONTROLLERS: spin::Mutex<alloc::vec::Vec<Ctrl>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Registers a non-PCI-class xHCI (the Pi 5's RP1 DWC3s; `bus:dev.func` is the
+/// PCI function whose bus mastering carries its DMA) so `quiesce_all` halts
+/// and resets it before kexec like any other controller.
+pub fn register_platform_controller(bus: u8, dev: u8, func: u8, vendor: u16, base: usize) {
+    CONTROLLERS.lock().push(Ctrl { bus, dev, func, vendor, base });
+}
 
 // xHCI register offsets/bits used below (xHCI 1.2 §5; same values as
 // drivers/usb/src/xhci/regs.rs).

@@ -174,6 +174,9 @@ pub struct Backplane {
     window: Option<u32>,
     /// Number of SBADDR window programmings (for tests / stats).
     pub window_sets: u32,
+    /// Bulk RAM transfers without SBSDIO_SB_ACCESS_2_4B_FLAG (`brcmfctl retry win4b=0`).
+    /// Register accesses always use the flag.
+    pub no_4b: bool,
 }
 
 impl Backplane {
@@ -232,35 +235,94 @@ impl Backplane {
         r
     }
 
-    /// Bulk RAM write, split at window boundaries (brcmf_sdiod_ramrw).
-    pub fn ram_write(&mut self, bus: &mut dyn SdioBus, mut addr: u32, mut data: &[u8]) -> Result<(), BusError> {
-        while !data.is_empty() {
-            let off = addr & SB_OFT_ADDR_MASK;
-            let n = core::cmp::min((SB_WINDOW_SIZE - off) as usize, data.len());
-            self.set_window(bus, addr)?;
-            if let Err(e) = bus.write_bytes(FUNC_BACKPLANE, off | SB_ACCESS_2_4B_FLAG, true, &data[..n]) {
-                self.invalidate();
-                return Err(e);
+    /// One window-bounded raw transfer: the caller keeps it inside one 32 KiB window.
+    fn raw(&mut self, bus: &mut dyn SdioBus, write: bool, addr: u32, buf: *mut u8, len: usize) -> Result<(), BusError> {
+        let flag = if self.no_4b { 0 } else { SB_ACCESS_2_4B_FLAG };
+        let r = self.set_window(bus, addr).and_then(|_| {
+            let a = (addr & SB_OFT_ADDR_MASK) | flag;
+            // SAFETY: the callers pass a live slice of `len` bytes.
+            if write {
+                bus.write_bytes(FUNC_BACKPLANE, a, true, unsafe { core::slice::from_raw_parts(buf, len) })
+            } else {
+                bus.read_bytes(FUNC_BACKPLANE, a, true, unsafe { core::slice::from_raw_parts_mut(buf, len) })
             }
-            data = &data[n..];
+        });
+        if r.is_err() {
+            self.invalidate();
+        }
+        r
+    }
+
+    /// Splits at window boundaries (brcmf_sdiod_ramrw).
+    fn raw_split(&mut self, bus: &mut dyn SdioBus, write: bool, mut addr: u32, buf: *mut u8, len: usize) -> Result<(), BusError> {
+        let mut off = 0usize;
+        while off < len {
+            let n = core::cmp::min((SB_WINDOW_SIZE - (addr & SB_OFT_ADDR_MASK)) as usize, len - off);
+            self.raw(bus, write, addr, unsafe { buf.add(off) }, n)?;
+            off += n;
             addr = addr.wrapping_add(n as u32);
         }
         Ok(())
     }
 
-    /// Bulk RAM read, split at window boundaries.
-    pub fn ram_read(&mut self, bus: &mut dyn SdioBus, mut addr: u32, mut out: &mut [u8]) -> Result<(), BusError> {
-        while !out.is_empty() {
-            let off = addr & SB_OFT_ADDR_MASK;
-            let n = core::cmp::min((SB_WINDOW_SIZE - off) as usize, out.len());
-            self.set_window(bus, addr)?;
-            let (head, tail) = core::mem::take(&mut out).split_at_mut(n);
-            if let Err(e) = bus.read_bytes(FUNC_BACKPLANE, off | SB_ACCESS_2_4B_FLAG, true, head) {
-                self.invalidate();
-                return Err(e);
-            }
-            out = tail;
+    /// Bulk RAM write. With the 2/4-byte access flag the SDIO core moves whole
+    /// 32-bit backplane words, so an unaligned head or a partial tail word is
+    /// done as a read-modify-write of the enclosing word (brcmfmac only ever
+    /// issues 4-byte aligned RAM transfers).
+    pub fn ram_write(&mut self, bus: &mut dyn SdioBus, addr: u32, data: &[u8]) -> Result<(), BusError> {
+        if self.no_4b {
+            return self.raw_split(bus, true, addr, data.as_ptr() as *mut u8, data.len());
+        }
+        let (mut addr, mut data) = (addr, data);
+        if addr & 3 != 0 && !data.is_empty() {
+            let a = addr & !3;
+            let s = (addr - a) as usize;
+            let n = core::cmp::min(4 - s, data.len());
+            let mut w = [0u8; 4];
+            self.raw(bus, false, a, w.as_mut_ptr(), 4)?;
+            w[s..s + n].copy_from_slice(&data[..n]);
+            self.raw(bus, true, a, w.as_mut_ptr(), 4)?;
+            data = &data[n..];
             addr = addr.wrapping_add(n as u32);
+        }
+        let body = data.len() & !3;
+        self.raw_split(bus, true, addr, data.as_ptr() as *mut u8, body)?;
+        let rest = &data[body..];
+        if !rest.is_empty() {
+            let a = addr.wrapping_add(body as u32);
+            let mut w = [0u8; 4];
+            self.raw(bus, false, a, w.as_mut_ptr(), 4)?;
+            w[..rest.len()].copy_from_slice(rest);
+            self.raw(bus, true, a, w.as_mut_ptr(), 4)?;
+        }
+        Ok(())
+    }
+
+    /// Bulk RAM read; an unaligned head or partial tail is read as whole words.
+    pub fn ram_read(&mut self, bus: &mut dyn SdioBus, addr: u32, out: &mut [u8]) -> Result<(), BusError> {
+        if self.no_4b {
+            let n = out.len();
+            return self.raw_split(bus, false, addr, out.as_mut_ptr(), n);
+        }
+        let (mut addr, mut out) = (addr, out);
+        if addr & 3 != 0 && !out.is_empty() {
+            let a = addr & !3;
+            let s = (addr - a) as usize;
+            let n = core::cmp::min(4 - s, out.len());
+            let mut w = [0u8; 4];
+            self.raw(bus, false, a, w.as_mut_ptr(), 4)?;
+            out[..n].copy_from_slice(&w[s..s + n]);
+            out = &mut out[n..];
+            addr = addr.wrapping_add(n as u32);
+        }
+        let body = out.len() & !3;
+        self.raw_split(bus, false, addr, out.as_mut_ptr(), body)?;
+        let rest = &mut out[body..];
+        if !rest.is_empty() {
+            let mut w = [0u8; 4];
+            self.raw(bus, false, addr.wrapping_add(body as u32), w.as_mut_ptr(), 4)?;
+            let n = rest.len();
+            rest.copy_from_slice(&w[..n]);
         }
         Ok(())
     }
