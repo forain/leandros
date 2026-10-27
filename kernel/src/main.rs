@@ -851,7 +851,20 @@ pub fn serial_write_raw(bytes: &[u8]) {
     let _batch = drivers::framebuffer::FlushBatch::new();
     // One klog run per write (lane loginhang), not one reservation per byte.
     klog::push_bytes(bytes);
-    for &b in bytes { serial_write_byte_patient_noklog(b); }
+    #[cfg(target_arch = "aarch64")]
+    arch_aarch64::uart::tx_window_begin();
+    for (i, &b) in bytes.iter().enumerate() {
+        serial_write_byte_patient_noklog(b);
+        // The write runs with IRQs masked: keep the console RX FIFO moving
+        // between bytes (each byte may draw, and a newline may scroll), so
+        // no stretch of it outlasts the 32-byte FIFO (openbugs #101).
+        #[cfg(target_arch = "aarch64")]
+        if i % 8 == 7 { arch_aarch64::uart::rx_poll(); }
+        let _ = i;
+    }
+    drop(_batch);
+    #[cfg(target_arch = "aarch64")]
+    arch_aarch64::uart::tx_window_end();
 }
 
 pub fn serial_has_data() -> bool {
@@ -885,6 +898,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             let (kp, kv) = KERNEL_ADDR_REQUEST.response()
                 .map_or((0, 0), |k| (k.physical_base as usize, k.virtual_base as usize));
             arch_aarch64::early::setup(h, kp, kv);
+            // Long framebuffer loops keep the console RX FIFO drained (#101).
+            drivers::framebuffer::set_rx_poll_hook(arch_aarch64::uart::rx_poll);
         }
         capture_boot_identity();
         // Test-only: `early.fault=1` takes a kernel data abort before any
@@ -1927,6 +1942,10 @@ fn time_init() {
             print_number(s as u32); // 2038-safe enough for a boot line
             serial_print_str("\n");
         }
+        // The Pi 5 RTC is a firmware mailbox device, read later by drivers::rpi_misc ([RTC] rpi: ...).
+        #[cfg(feature = "rpi5")]
+        None => {}
+        #[cfg(not(feature = "rpi5"))]
         None => serial_print_str("[RTC] no battery clock; CLOCK_REALTIME starts at boot\n"),
     }
 }

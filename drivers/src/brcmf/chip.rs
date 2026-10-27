@@ -62,6 +62,13 @@ pub const CC_PMUCONTROL: u32 = 0x600;
 pub const CC_CHIPCONTROL_ADDR: u32 = 0x650;
 pub const CC_CHIPCONTROL_DATA: u32 = 0x654;
 pub const PMU_CTL_RES_RELOAD: u32 = 2 << 13;
+pub const CC_PMUSTATUS: u32 = 0x608;
+pub const CC_RES_STATE: u32 = 0x60C;
+pub const CC_RES_PENDING: u32 = 0x610;
+pub const CC_MIN_RES_MASK: u32 = 0x618;
+pub const CC_MAX_RES_MASK: u32 = 0x61C;
+pub const SBSDIO_FUNC1_MESBUSYCTRL: u32 = 0x1001D;
+pub const SBSDIO_DEVCTL_F2WM_ENAB: u8 = 0x10;
 
 // BCMA core ids.
 pub const CORE_CHIPCOMMON: u16 = 0x800;
@@ -104,8 +111,9 @@ pub const CHIP_4345: u16 = 0x4345;
 /// TCM base of the 4345 family (brcmf_chip_tcm_rambase).
 pub const RAMBASE_4345: u32 = 0x198000;
 
-/// PMU transitions are bounded by 15 ms (PMU_MAX_TRANSITION_DLY).
-pub const PMU_MAX_TRANSITION_US: u32 = 15_000;
+/// PMU clock transitions: brcmfmac's PMU_MAX_TRANSITION_DLY is 1 s (sdio.c);
+/// the HT PLL of a freshly started 43455 takes far longer than 15 ms.
+pub const PMU_MAX_TRANSITION_US: u32 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChipError {
@@ -543,7 +551,7 @@ impl Chip {
     }
 
     /// brcmf_chip_sr_capable for the 4345: PMU chipcontrol 3, bit 2.
-    fn sr_capable_probe(&mut self, bus: &mut dyn SdioBus) -> Result<bool, ChipError> {
+    pub fn sr_capable_probe(&mut self, bus: &mut dyn SdioBus) -> Result<bool, ChipError> {
         let pmu = self.pmu_base();
         self.write32(bus, pmu + CC_CHIPCONTROL_ADDR, 3)?;
         let v = self.read32(bus, pmu + CC_CHIPCONTROL_DATA)?;
@@ -628,11 +636,16 @@ impl Chip {
 
     /// brcmf_sdio_htclk(on): request HT (or ALP only) and poll for it.
     pub fn clk_request(&mut self, bus: &mut dyn SdioBus, ht: bool) -> Result<u8, ChipError> {
+        self.clk_request_t(bus, ht, PMU_MAX_TRANSITION_US)
+    }
+
+    /// `clk_request` with an explicit wait bound.
+    pub fn clk_request_t(&mut self, bus: &mut dyn SdioBus, ht: bool, timeout_us: u32) -> Result<u8, ChipError> {
         let req = if ht { SBSDIO_HT_AVAIL_REQ } else { SBSDIO_ALP_AVAIL_REQ };
         bus.write8(FUNC_BACKPLANE, SBSDIO_FUNC1_CHIPCLKCSR, req)?;
         let want = if ht { SBSDIO_HT_AVAIL | SBSDIO_ALP_AVAIL } else { SBSDIO_ALP_AVAIL };
         let mut last = 0u8;
-        let ok = spin_until(bus, PMU_MAX_TRANSITION_US, 500, |b| {
+        let ok = spin_until(bus, timeout_us, 500, |b| {
             last = b.read8(FUNC_BACKPLANE, SBSDIO_FUNC1_CHIPCLKCSR)?;
             Ok(last & want == want)
         })?;
