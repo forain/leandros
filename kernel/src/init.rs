@@ -251,6 +251,13 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         }
         drivers::v3d::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset, arch_aarch64::exception::serror_checkpoint);
     }
+    // dma40 engine self-test (64 KiB mem-to-mem copy, one [dma40] line), checkpointed like v3d.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] {
+        if let Some(syn) = arch_aarch64::exception::serror_checkpoint() {
+            drivers::pci::serial_debug(&alloc::format!("[SERROR] pending before the dma40 selftest syn=0x{:016x} (an earlier probe)\n", syn));
+        }
+        drivers::bcm2712_dma40::boot(crate::boot_cmdline().unwrap_or(""), arch_aarch64::exception::serror_checkpoint);
+    }
      #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] drivers::brcmf_boot::start(crate::boot_cmdline().unwrap_or("")); // Pi 5 V3D power-up + ident (one [v3d] line); CYW43455 firmware bring-up on a kthread ([brcmf] lines)
     // Persist the console log on the boot disk's log partition, if it has one.
     crate::klog::init(); crate::iostat::init(); crate::hungtask::init(); // + the 5 s [usbms]/[fslock] summary task
