@@ -393,7 +393,8 @@ mod hw {
     }
 
     fn core_hook(bits: u32) {
-        PENDING.fetch_or(bits, Ordering::AcqRel);
+        // Bit 31 of the pending word is the hub's TFUC (`EV_TFU_DONE`), never a core bit.
+        PENDING.fetch_or(bits & !EV_TFU_DONE, Ordering::AcqRel);
         service();
     }
 
