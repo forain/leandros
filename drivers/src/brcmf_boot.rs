@@ -26,7 +26,7 @@ use crate::brcmf::bcdc::Brcmf;
 use crate::brcmf::chip::Chip;
 use crate::brcmf::fw;
 use crate::brcmf::fwil::Fwil;
-use crate::brcmf::sdio_host::{self, Mmio, SdioHost};
+use crate::brcmf::sdio_host::{self, Mmio, SdioHost, SdioTune};
 // Runtime retry: see `CTL_PATH` and `/bin/brcmfctl`.
 
 /// The firmware-ready CYW43455: BCDC/SDPCM over pisdio's sdio2 host.
@@ -128,6 +128,7 @@ struct Opts {
     wloff_ms: u32,
     wlon_ms: u32,
     lines: usize,
+    sd: SdioTune,
 }
 
 impl Default for Opts {
@@ -140,6 +141,7 @@ impl Default for Opts {
             wloff_ms: 20,
             wlon_ms: 150,
             lines: 12,
+            sd: SdioTune::default(),
         }
     }
 }
@@ -154,6 +156,7 @@ impl Opts {
             ("wloff_ms", Some(n)) => self.wloff_ms = n,
             ("wlon_ms", Some(n)) => self.wlon_ms = n,
             ("lines", Some(n)) => self.lines = n.clamp(1, 64) as usize,
+            ("sdclk" | "hs" | "blk" | "blksz" | "chunk", _) => return self.sd.set(key, val),
             _ => return self.k.set(key, val),
         }
         true
@@ -220,7 +223,8 @@ fn attempt(mut host: SdioHost<Mmio>, dt_mac: Option<[u8; 6]>, o: &Opts) -> Outco
     let rep = match fw::download_with(&mut host, &mut chip, &code, &nvram, &o.k) {
         Ok(r) => r,
         Err(e) => {
-            fail(&format!("fw {} stage={} t={}ms", e.err.as_str(), e.stage, now_ms() - t));
+            let mm = e.mismatch.map(|m| format!(" {}", m.line())).unwrap_or_default();
+            fail(&format!("fw {} stage={}{} t={}ms", e.err.as_str(), e.stage, mm, now_ms() - t));
             dump_diag(&mut host, &mut chip, o.lines);
             return Outcome::Failed(Some((host, chip)));
         }
@@ -298,7 +302,7 @@ fn ctl_command(text: &str, parked: &mut Option<(SdioHost<Mmio>, Chip)>, tries: u
                 log(&format!("ctl: unknown knob(s) {:?}; retry not run", bad));
                 return None;
             }
-            log(&format!("ctl: retry #{} wloff_ms={} wlon_ms={} {:?}", tries + 1, o.wloff_ms, o.wlon_ms, o.k));
+            log(&format!("ctl: retry #{} wloff_ms={} wlon_ms={} {:?} {:?}", tries + 1, o.wloff_ms, o.wlon_ms, o.sd, o.k));
             Some(o)
         }
         "diag" => {
@@ -309,13 +313,55 @@ fn ctl_command(text: &str, parked: &mut Option<(SdioHost<Mmio>, Chip)>, tries: u
             }
             None
         }
+        "peek" | "poke" => {
+            let mut addr = None;
+            let mut val = None;
+            for w in words {
+                let num = |v: &str| match v.strip_prefix("0x") {
+                    Some(h) => u32::from_str_radix(h, 16).ok(),
+                    None => v.parse::<u32>().ok(),
+                };
+                if let Some(v) = w.strip_prefix("addr=") { addr = num(v); }
+                if let Some(v) = w.strip_prefix("val=") { val = num(v); }
+            }
+            let Some((bus, chip)) = parked.as_mut() else {
+                log("ctl: peek/poke: no chip (failed before attach)");
+                return None;
+            };
+            let Some(a) = addr else { log("ctl: peek/poke needs addr=0x..."); return None; };
+            let a = a & !3;
+            if cmd == "poke" {
+                let Some(v) = val else { log("ctl: poke needs val=0x..."); return None; };
+                let r = chip.write32(bus, a, v);
+                let back = chip.read32(bus, a);
+                log(&format!("ctl: poke {:#010x} <- {:#010x} {:?} readback {:x?}", a, v, r, back));
+            } else {
+                // Word by word (4-byte CMD53s, the chip-id path) and as one bulk
+                // read (the download path): a difference points at the bulk path.
+                let mut words = String::new();
+                for i in 0..4 {
+                    match chip.read32(bus, a + 4 * i) {
+                        Ok(v) => words.push_str(&format!("{:08x} ", v)),
+                        Err(e) => words.push_str(&format!("{:?} ", e)),
+                    }
+                }
+                let mut b = [0u8; 16];
+                let bulk = match chip.bp.ram_read(bus, a, &mut b) {
+                    Ok(()) => b.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                        .collect::<Vec<_>>().join(" "),
+                    Err(e) => format!("{:?}", e),
+                };
+                log(&format!("ctl: peek {:#010x} w32 {}bulk {}", a, words, bulk));
+            }
+            None
+        }
         "status" | "" => {
             log(&format!("ctl: state {} tries {} sdio {} chip {}", state(), tries,
                          sdio_host::PROBE_STATE.load(Ordering::Relaxed), parked.is_some() as u8));
             None
         }
         _ => {
-            log(&format!("ctl: unknown command '{}' (retry|diag|status)", cmd));
+            log(&format!("ctl: unknown command '{}' (retry|diag|status|peek|poke)", cmd));
             None
         }
     }
@@ -359,7 +405,7 @@ fn run(host: SdioHost<Mmio>, dt_mac: Option<[u8; 6]>) {
             tries += 1;
             opts = o;
             parked = None;
-            sdio_host::probe(opts.wloff_ms.saturating_mul(1000), opts.wlon_ms.saturating_mul(1000));
+            sdio_host::probe_with(opts.wloff_ms.saturating_mul(1000), opts.wlon_ms.saturating_mul(1000), opts.sd);
             next = sdio_host::take_host();
             if next.is_none() {
                 fail("no-sdio-host (sdio probe failed; see the [sdio] line)");
