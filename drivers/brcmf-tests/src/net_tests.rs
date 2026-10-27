@@ -822,3 +822,37 @@ fn akm6_host_handshake_echoes_the_firmware_assoc_ie_and_installs_igtk() {
     o.apply(&["msg2ie=ours"]);
     assert_eq!(o.msg2ie, Msg2Ie::Ours);
 }
+
+/// The netctl profile path (`netctl save` -> slot file -> kernel load ->
+/// autoconnect) and the inline path (`netctl connect <ssid> <pass>` ->
+/// NcConnect) hand the radio the same secret bytes, so the same PMK.
+#[test]
+fn profile_and_inline_secret_give_the_same_pmk() {
+    use netctl_abi::profiles::{self as pf, Profile};
+    use netctl_abi::types::NcConnect;
+    let ssid = b"Anvara";
+    for pass in [&b"correct horse battery"[..], b"12345678", b"pa$$ word with spaces ",
+                 b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"] {
+        // Profile path: build, store in a slot image, load it back.
+        let p = Profile::new_wifi([7; 16], ssid, netctl_abi::akm::AUTO, pass).unwrap();
+        let mut img = vec![0u8; 64 * 1024];
+        let n = pf::serialize(5, 0, &[p], &mut img).unwrap();
+        let (_, view) = pf::select(Some(&img[..n]), None).unwrap();
+        let loaded: Vec<Profile> = view.profiles().collect();
+        assert_eq!(loaded.len(), 1);
+        let from_profile = loaded[0].secret().to_vec();
+        // Inline path.
+        let mut c = NcConnect::new();
+        c.secret[..pass.len()].copy_from_slice(pass);
+        c.secret_len = pass.len() as u16;
+        let inline = c.secret().to_vec();
+        assert_eq!(from_profile, inline);
+        assert_eq!(from_profile, pass);
+        let a = Key::from_secret(&from_profile).psk(ssid).unwrap();
+        let b = Key::from_secret(&inline).psk(ssid).unwrap();
+        assert_eq!(a, b);
+    }
+    // IEEE 802.11i H.4 vector: the PBKDF2 the host supplicant uses is right.
+    let k = Key::from_secret(b"password").psk(b"IEEE").unwrap();
+    assert_eq!(&k[..4], &[0xf4, 0x2c, 0x6f, 0xc5]);
+}

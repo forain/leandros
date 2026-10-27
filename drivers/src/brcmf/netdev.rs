@@ -596,7 +596,10 @@ impl<F: Fwil> Radio for BrcmfRadio<F> {
         let timeout = cx.left_ms().clamp(1_000, JOIN_TIMEOUT_MS);
         let name = wf::ssid_display(ssid);
         if let Err(e) = self.dev.join(req, &mut Obs { cx: Some(cx) }, timeout) {
-            let f = join_fail(e);
+            let f = match (e, self.dev.handshake_evidence()) {
+                (JoinFail::Handshake { reason: r, .. }, Some((sent, mic))) => wm::handshake_failure_ev(sent, Some(mic), r),
+                _ => join_fail(e),
+            };
             *JOIN_INFO.lock() = alloc::format!("at {} s: '{}' via {} FAILED {:?}: {}", now_ms() / 1000, name, wm::fmt_mac(&hit.bss.bssid), e, f.msg);
             log(&alloc::format!("join '{}' failed: {:?}: {}", name, e, f.msg));
             return Err(f);

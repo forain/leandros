@@ -303,7 +303,20 @@ impl Fail {
 /// some APs with 14 (MIC failure) or 23 (802.1X failed), others just go
 /// quiet. Without a message 1 at all it is a timeout, not the key.
 pub fn handshake_failure(msg2_sent: bool, deauth_reason: Option<u16>) -> Fail {
+    handshake_failure_ev(msg2_sent, None, deauth_reason)
+}
+
+/// `handshake_failure` with EAPOL evidence from a host supplicant:
+/// `mic_suspect` = Some(true) when the AP re-sent message 1 after our
+/// message 2 (it could not verify the MIC), Some(false) when it did not.
+/// Reasons 1 (unspecified) and 2 (previous authentication no longer valid)
+/// are not specific to the key: without that evidence they mean the AP
+/// rejected us, a fault of that BSS (backed off, autoconnect moves on),
+/// not a wrong passphrase (which blocks the profile).
+pub fn handshake_failure_ev(msg2_sent: bool, mic_suspect: Option<bool>, deauth_reason: Option<u16>) -> Fail {
     match deauth_reason {
+        Some(r) if msg2_sent && mic_suspect == Some(false) && matches!(r, IEEE_REASON_PREV_AUTH_INVALID | IEEE_REASON_UNSPECIFIED) =>
+            Fail::new(reason::DEAUTH_BY_AP, alloc::format!("AP rejected (reason {}) after message 2; the AP did not re-send message 1, so probably not a wrong passphrase", r)).ieee_reason(r),
         Some(r) if msg2_sent && matches!(r, IEEE_REASON_4WAY_TIMEOUT | IEEE_REASON_MIC_FAILURE | IEEE_REASON_8021X_FAILED
             | IEEE_REASON_PREV_AUTH_INVALID | IEEE_REASON_UNSPECIFIED) =>
             Fail::new(reason::WRONG_KEY, alloc::format!("the AP ended the handshake (reason {}): wrong passphrase", r)).ieee_reason(r),

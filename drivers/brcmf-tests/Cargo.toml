@@ -12,3 +12,6 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+netctl-abi = { path = "../../lib/netctl-abi" }
