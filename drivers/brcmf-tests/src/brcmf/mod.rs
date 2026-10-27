@@ -15,3 +15,5 @@ pub mod bcdc;
 pub mod event;
 #[path = "../../../src/brcmf/cfg.rs"]
 pub mod cfg;
+#[path = "../../../src/brcmf/power.rs"]
+pub mod power;

@@ -638,3 +638,91 @@ fn ioctl_wait_is_bounded_by_the_real_clock() {
     assert_eq!(d.iovar_get("ver", &mut b).unwrap_err(), FwError::Timeout);
     assert!(d.bus.now_us - t0 < 100_000, "virtual wait {} us", d.bus.now_us - t0);
 }
+
+// ---- power sequencing after kexec (brcmf::power) ------------------------------
+
+/// A CYW43455 a kexec left running associated firmware: HT never comes until a
+/// power cycle holds WL_REG_ON low for at least `needs_off_us`.
+struct StaleChip { m: MockChip, needs_off_us: u32, reset: bool, cycles: u32 }
+
+impl StaleChip {
+    fn power_cycle(&mut self, off_us: u32) {
+        self.cycles += 1;
+        if off_us >= self.needs_off_us { self.reset = true; }
+    }
+}
+
+impl SdioBus for StaleChip {
+    fn read8(&mut self, f: u8, a: u32) -> Result<u8, crate::brcmf::bus::BusError> {
+        let v = self.m.read8(f, a)?;
+        Ok(if !self.reset && f == 1 && a == SBSDIO_FUNC1_CHIPCLKCSR { v & !SBSDIO_HT_AVAIL } else { v })
+    }
+    fn write8(&mut self, f: u8, a: u32, v: u8) -> Result<(), crate::brcmf::bus::BusError> { self.m.write8(f, a, v) }
+    fn read_bytes(&mut self, f: u8, a: u32, i: bool, b: &mut [u8]) -> Result<(), crate::brcmf::bus::BusError> { self.m.read_bytes(f, a, i, b) }
+    fn write_bytes(&mut self, f: u8, a: u32, i: bool, b: &[u8]) -> Result<(), crate::brcmf::bus::BusError> { self.m.write_bytes(f, a, i, b) }
+    fn set_block_size(&mut self, f: u8, s: u16) -> Result<(), crate::brcmf::bus::BusError> { self.m.set_block_size(f, s) }
+    fn wait_card_irq(&mut self, t: u32) -> bool { self.m.wait_card_irq(t) }
+    fn delay_us(&mut self, u: u32) { self.m.delay_us(u) }
+}
+
+/// brcmf_boot's sequence reduced to the clock step: power-cycle, HT request,
+/// on failure the `fail fw ...` text decides an automatic retry. `fixed` =
+/// the brcmf::power policy; otherwise the pre-fix one (20 ms, no auto-retry).
+fn bring_up(needs_off_us: u32, first_off_us: u32, fixed: bool) -> (Result<(), String>, u32) {
+    use crate::brcmf::power;
+    let (mut m, mut c) = attached();
+    m.ht_needs_fw = false;
+    let mut s = StaleChip { m, needs_off_us, reset: false, cycles: 0 };
+    let mut off = if fixed { power::off_us(first_off_us) } else { first_off_us };
+    let mut done = 0;
+    loop {
+        s.power_cycle(off);
+        match c.clk_request(&mut s, true) {
+            Ok(_) => return (Ok(()), s.cycles),
+            Err(e) => {
+                let msg = format!("fw {} stage=ht", e.as_str());
+                match if fixed { power::auto_retry_off_us(&msg, done) } else { None } {
+                    Some(o) => { done += 1; off = o; }
+                    None => return (Err(msg), s.cycles),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn kexec_stale_chip_old_policy_fails() {
+    // The Pi 5 report: kexec from a kernel whose brcmf was associated, 20 ms off.
+    let (r, n) = bring_up(500_000, 20_000, false);
+    assert_eq!(r.unwrap_err(), "fw HT clock timeout stage=ht");
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn kexec_stale_chip_auto_retry_recovers() {
+    use crate::brcmf::power;
+    // Boot probe (200 ms) is not enough; the one auto-retry (1 s) is.
+    assert_eq!(bring_up(500_000, power::WL_OFF_BOOT_US, true), (Ok(()), 2));
+    // A chip that needs more than 100 ms but less than the boot time: first try.
+    assert_eq!(bring_up(150_000, power::WL_OFF_BOOT_US, true), (Ok(()), 1));
+    // `brcmfctl retry wloff_ms=20` is floored to 100 ms.
+    assert_eq!(bring_up(100_000, 20_000, true), (Ok(()), 1));
+    // Old kernel quiesced (WL_REG_ON held low across the ~3 s kexec): any chip.
+    assert_eq!(bring_up(2_000_000, 3_000_000, true), (Ok(()), 1));
+    // Only one automatic retry: a chip that never recovers fails after 2 cycles.
+    let (r, n) = bring_up(u32::MAX, power::WL_OFF_BOOT_US, true);
+    assert!(r.is_err() && n == 2);
+}
+
+#[test]
+fn auto_retry_policy() {
+    use crate::brcmf::power::*;
+    assert_eq!(off_us(20_000), WL_OFF_MIN_US);
+    assert_eq!(off_us(WL_OFF_BOOT_US), WL_OFF_BOOT_US);
+    assert!(WL_OFF_MIN_US >= 100_000 && WL_OFF_RETRY_US > WL_OFF_BOOT_US);
+    assert_eq!(auto_retry_off_us("fw HT clock timeout stage=ht", 0), Some(WL_OFF_RETRY_US));
+    assert_eq!(auto_retry_off_us("chip ALP clock timeout", 0), Some(WL_OFF_RETRY_US));
+    assert_eq!(auto_retry_off_us("fw HT clock timeout stage=ht", 1), None);
+    assert_eq!(auto_retry_off_us("firmware-missing /lib/firmware/brcm/x.bin", 0), None);
+    assert_eq!(auto_retry_off_us("no-sdio-host", 0), None);
+}

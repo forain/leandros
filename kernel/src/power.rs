@@ -249,6 +249,10 @@ fn quiesce_phase1(cfg: &RebootCfg, what: &str) -> alloc::vec::Vec<drivers::pci::
     plog(&alloc::format!("audio: {}", audio));
     if let Some(f) = f { bm.push(f); }
     if let Some(s) = drivers::e1000e::shutdown() { plog(&s); }
+    // Pi 5 Wi-Fi: leave the AP, WLC_DOWN, chip off with WL_REG_ON held low
+    // across a kexec (the CYW43455 otherwise keeps running into the next kernel).
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    if let Some(s) = drivers::brcmf_boot::shutdown() { plog(&s); }
     if cfg.busmaster_off {
         // Network (02xx: e1000e, iwlwifi, virtio-net, r8169) and display
         // (03xx: i915, NVIDIA, virtio-gpu) functions; xHCI is done by its

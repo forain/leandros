@@ -138,6 +138,19 @@ pub fn present() -> bool { PRESENT.load(Ordering::Acquire) }
 /// Register the control side for the netif `drivers/src/netdev.rs` gave us.
 pub fn attach(ifindex: u32, name: &str) -> bool { MGR.attach(ifindex, name) }
 
+static SHUTDOWN_REQ: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Ask the running driver to disassociate and WLC_DOWN (served by its own
+/// thread at the next ctl check). False when no driver loop is running.
+pub fn request_shutdown() -> bool {
+    SHUTDOWN_REQ.store(true, Ordering::Release);
+    RUNNING.load(Ordering::Acquire)
+}
+
+/// The driver thread finished the [`request_shutdown`] sequence.
+pub fn shutdown_done() -> bool { SHUTDOWN_DONE.load(Ordering::Acquire) }
+
 /// Integration entry point: spawn the `brcmf` thread around a ready `Fwil`
 /// (chip powered, firmware running, BCDC up). False when not started.
 pub fn start<F: Fwil + Send + 'static>(fw: F) -> bool {
@@ -453,6 +466,23 @@ impl<F: Fwil> BrcmfRadio<F> {
     /// Services `/etc/brcmf.ctl` (about once a second) and refreshes the
     /// counters line.
     fn check_ctl(&mut self) {
+        // Reboot/kexec quiesce (brcmf_boot::shutdown): leave the network and
+        // take the radio down, then wind the manager loop down like `retry`.
+        if SHUTDOWN_REQ.load(Ordering::Acquire) && self.retry.is_none() {
+            set_link(false);
+            if self.dev.radio_on() {
+                let d = self.dev.disconnect();
+                let r = self.dev.set_radio(false);
+                log(&alloc::format!("shutdown: disassoc {} WLC_DOWN {}",
+                    if d.is_ok() { "ok" } else { "err" }, if r.is_ok() { "ok" } else { "err" }));
+            } else {
+                log("shutdown: radio already off / init failed");
+            }
+            SHUTDOWN_DONE.store(true, Ordering::Release);
+            self.retry = Some(String::from("shutdown"));
+            self.retry_phase = 1;
+            return;
+        }
         let now = now_ms();
         if now < self.next_ctl_ms { return; }
         self.next_ctl_ms = now + CTL_POLL_MS;
