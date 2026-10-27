@@ -654,7 +654,6 @@ mod hw {
 
     pub const SDIO2_HOST_PHYS: u64 = 0x10_0110_0000;
     pub const SDIO2_CFG_PHYS: u64 = 0x10_0110_0400;
-    pub const WL_REG_ON_GPIO: u32 = crate::bcm2712_gpio::WL_ON;
     /// wl_on_reg `startup-delay-us`.
     pub const WL_ON_STARTUP_US: u32 = 150_000;
     /// Hard probe budget, all waits included.
