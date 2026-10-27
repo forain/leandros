@@ -16,6 +16,16 @@
 //!   controller can no longer reach the buffer before dropping it (the xHCI
 //!   driver halts the controller, or disables the slot, first).
 //!
+//! * **Device address = `phys()`**, which adds the platform DMA offset
+//!   ([`crate::platform::dma_offset`], 0 except behind the Pi 5's RP1).
+//! * **Non-coherent platforms** (Pi 5, `mm::dma_cache::coherent()` false): a
+//!   buffer made with [`DmaBuf::new`] is the equivalent of Linux
+//!   `dma_alloc_coherent` — the HHDM alias is cleaned+invalidated once after
+//!   zeroing, and the CPU then uses a Normal Non-cacheable KVA mapping, so
+//!   rings, contexts and the DCBAA need no per-access cache maintenance.
+//!   [`DmaBuf::new_streaming`] (bulk bounce buffers) stays cacheable and relies
+//!   on the callers' `sync_for_device` / `sync_for_cpu`.
+//!
 //! The CPU accesses the buffer through its HHDM alias with volatile
 //! accesses; [`dma_wmb`]/[`dma_rmb`] order those against MMIO doorbells and
 //! controller-written completion records.
@@ -27,6 +37,8 @@ pub struct DmaBuf {
     virt: usize,
     order: usize,
     len: usize,
+    /// `virt` is a KVA Non-cacheable mapping (unmapped on Drop).
+    nc: bool,
 }
 
 // The buffer is plain memory owned by this value; the raw address is an
@@ -41,6 +53,17 @@ impl DmaBuf {
     /// bytes (rounded up to a power-of-two number of pages).
     #[track_caller]
     pub fn new(len: usize, dma32: bool) -> Option<Self> {
+        Self::alloc(len, dma32, !mm::dma_cache::coherent())
+    }
+
+    /// Cacheable even on non-coherent platforms: the owner brackets every
+    /// device access with `sync_for_device` / `sync_for_cpu`.
+    #[track_caller]
+    pub fn new_streaming(len: usize, dma32: bool) -> Option<Self> {
+        Self::alloc(len, dma32, false)
+    }
+
+    fn alloc(len: usize, dma32: bool, want_nc: bool) -> Option<Self> {
         let pages = len.max(1).div_ceil(buddy::PAGE_SIZE).next_power_of_two();
         let order = pages.trailing_zeros() as usize;
         let size = buddy::PAGE_SIZE << order;
@@ -51,13 +74,27 @@ impl DmaBuf {
         } else {
             buddy::alloc(order)?
         };
-        let virt = mm::phys_to_virt(phys);
+        let mut virt = mm::phys_to_virt(phys);
         unsafe { core::ptr::write_bytes(virt as *mut u8, 0, size); }
+        let mut nc = false;
+        if want_nc {
+            // No dirty (or clean) line of the cacheable alias may outlive the
+            // switch: the controller and the NC alias both go to memory.
+            mm::dma_cache::sync_for_device(virt, size);
+            mm::dma_cache::sync_for_cpu(virt, size);
+            match mm::kva::ioremap(phys as u64, size, mm::kva::CacheMode::WriteCombining) {
+                Some(va) => { virt = va; nc = true; }
+                None => { buddy::free(phys, order); return None; }
+            }
+        }
         dma_wmb();
-        Some(DmaBuf { phys, virt, order, len: size })
+        Some(DmaBuf { phys, virt, order, len: size, nc })
     }
 
-    #[inline] pub fn phys(&self) -> u64 { self.phys as u64 }
+    /// Device (bus) address of the buffer: CPU physical + platform DMA offset.
+    #[inline] pub fn phys(&self) -> u64 { self.phys as u64 + crate::platform::dma_offset() }
+    /// True when the CPU view is Non-cacheable (no cache maintenance needed).
+    #[inline] pub fn is_nc(&self) -> bool { self.nc }
     #[inline] pub fn len(&self) -> usize { self.len }
     #[inline] pub fn as_ptr(&self) -> *mut u8 { self.virt as *mut u8 }
 
@@ -109,10 +146,22 @@ impl DmaBuf {
     #[inline] pub fn sync_for_device(&self) { mm::dma_cache::sync_for_device(self.virt, self.len); }
     /// Make device writes visible to the CPU (barrier, or invalidate).
     #[inline] pub fn sync_for_cpu(&self) { mm::dma_cache::sync_for_cpu(self.virt, self.len); }
+    /// [`sync_for_device`](Self::sync_for_device) for `n` bytes at `off`
+    /// only. Keep `off`/`n` cache-line aligned when the device writes there.
+    pub fn sync_range_for_device(&self, off: usize, n: usize) {
+        assert!(off + n <= self.len);
+        mm::dma_cache::sync_for_device(self.virt + off, n);
+    }
+    /// [`sync_for_cpu`](Self::sync_for_cpu) for `n` bytes at `off` only.
+    pub fn sync_range_for_cpu(&self, off: usize, n: usize) {
+        assert!(off + n <= self.len);
+        mm::dma_cache::sync_for_cpu(self.virt + off, n);
+    }
 }
 
 impl Drop for DmaBuf {
     fn drop(&mut self) {
+        if self.nc { mm::kva::iounmap(self.virt); }
         buddy::free(self.phys, self.order);
     }
 }

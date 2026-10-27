@@ -75,6 +75,7 @@ fn wanted_leds() -> u8 {
 
 /// Timer-tick hook (BSP, IRQ context).
 pub fn poll() {
+    usb::xhci::isoch::tick();
     if !ACTIVE.load(Ordering::Acquire) { return; }
     let leds = wanted_leds();
     let repeat = tty_server::keyboard::repeat_params();

@@ -13,12 +13,13 @@ Options:
                            (scripts/set-image-cmdline.sh; suite i915fake implies
                            "i915.fake=2 i915.kms=1")
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + proctest + chroottest + netctltest + sudotest + nmtest --quick (mock) + evherdtest + pollnarrowtest + listentagtest + vfstagtest + nettag2test + kparkstest + sshsmoke
+                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + proctest + chroottest + netctltest + bttest + sudotest + nmtest --quick (mock) + evherdtest + pollnarrowtest + listentagtest + vfstagtest + nettag2test + kparkstest + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              serialxfer host:serialxfertest.py alone (serial push + kexec, scripts/pi-serial-*)
                              psklog   host:psklogtest.py alone (a cmdline wifi.psk= never reaches serial/klog/root or non-root /proc/cmdline)
                              pcibridge host:pcibridgetest.py alone (root port -> PCI bridge -> virtio-rng, own boot)
+                             usbisoch host:usbisochtest.py alone (xHCI isoch OUT: 2 s 1 kHz sine to usb-audio, WAV checked)
                              blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
                              blkmany  host:blkmanytest.py alone (12 extra virtio-blk disks: all in /dev, all mount)
                              rpi5check host:rpi5checktest.py (cargo check of the --features rpi5 kernel)
@@ -98,7 +99,7 @@ SUITES = {
                 "if [ \"$(uname -m)\" = aarch64 ]; then drmsmoke --arm-v3d && MESA_LOADER_DRIVER_OVERRIDE=v3d kmscube -c 30; __k=$?; drmsmoke --disarm-v3d; test $__k = 0; fi",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/udptest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/pstest",
+                "/bin/procmax", "/bin/syscalltest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/bttest", "/bin/pstest",
                 # kexec tool: load + unload only (non-destructive).
                 "/bin/sh -c '/bin/kexec -l /boot/kexec --initrd=/boot/kexec-initrd --append=x && /bin/kexec -u'",
                 # ripgrep (rg): file match, recursive dir walk, stdin, exit codes 0/1.
@@ -183,6 +184,7 @@ SUITES = {
     "serialxfer": ["host:serialxfertest.py"],
     # lane dtbres: devices behind PCIe root port -> PCI-PCI bridge (own boot).
     "pcibridge": ["host:pcibridgetest.py"],
+    "usbisoch": ["host:usbisochtest.py"],
     "blkslow": ["host:blkslowtest.py"],
     # 12 extra virtio-blk data disks all appear in /dev and mount (own boot, openbugs #83).
     "blkmany": ["host:blkmanytest.py"],
@@ -259,7 +261,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600}
+HOST_TIMEOUTS = {"netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "usbisochtest.py": 900}
 
 
 def host_run(c, timeout, arch=None, scale=1.0):

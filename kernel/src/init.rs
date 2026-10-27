@@ -214,6 +214,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     vfs_server::block::init(&DISK_OPS);
 
     // ── USB ───────────────────────────────────────────────────────────────────
+    usb::xhci::isoch::set_cmdline(crate::boot_cmdline().unwrap_or(""));
     drivers::usb_hcd::init();
     // The xHCI BIOS handoff above ends the firmware's USB legacy (PS/2)
     // emulation: an i8042 that was only ever that emulation is gone now.
@@ -258,6 +259,21 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         drivers::v3d::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset, arch_aarch64::exception::serror_checkpoint);
         // RNG, firmware RTC, PM watchdog, thermal, ARM clock: one line each (lane pimisc).
         drivers::rpi_misc::boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset);
+    }
+    // HDMI0/1 read-only probe (hdmi.probe=0 disables): no display-register writes,
+    // SError checkpoint after each block read.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] {
+        if let Some(syn) = arch_aarch64::exception::serror_checkpoint() {
+            drivers::pci::serial_debug(&alloc::format!("[SERROR] pending before the hdmi probe syn=0x{:016x} (an earlier probe)\n", syn));
+        }
+        drivers::hdmi_probe::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset, arch_aarch64::exception::serror_checkpoint);
+    }
+    // dma40 engine self-test (64 KiB mem-to-mem copy, one [dma40] line), checkpointed like v3d.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] {
+        if let Some(syn) = arch_aarch64::exception::serror_checkpoint() {
+            drivers::pci::serial_debug(&alloc::format!("[SERROR] pending before the dma40 selftest syn=0x{:016x} (an earlier probe)\n", syn));
+        }
+        drivers::bcm2712_dma40::boot(crate::boot_cmdline().unwrap_or(""), arch_aarch64::exception::serror_checkpoint);
     }
      #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] { drivers::brcmf_boot::start(crate::boot_cmdline().unwrap_or("")); drivers::bt::boot::start(crate::boot_cmdline().unwrap_or(""), arch_aarch64::exception::serror_checkpoint); } // Pi 5 V3D power-up + ident (one [v3d] line); CYW43455 firmware bring-up on a kthread ([brcmf] lines)
     // Persist the console log on the boot disk's log partition, if it has one.
