@@ -20,8 +20,8 @@
 //! The host-side "cfg" window programming (force card presence, SD pin select)
 //! follows Linux `sdhci-brcmstb.c` (`sdhci_brcmstb_cfginit_2712`,
 //! `sdhci_bcm2712_set_clock`); the pin-mux and pad tables follow Linux
-//! `pinctrl-bcm2712.c` (c0 and d0 tables differ, so the stepping is taken from
-//! the live device tree's pinctrl `compatible`; an unknown stepping leaves the
+//! `pinctrl-bcm2712.c` (c0 and d0 tables differ; the stepping comes from the
+//! chip id, `crate::bcm2712_id`, with the DT as fallback; an unknown stepping leaves the
 //! mux untouched).
 //!
 //! ## Why this does not share `sdhci.rs`
@@ -704,45 +704,14 @@ mod hw {
     unsafe fn rd32(a: usize) -> u32 { (a as *const u32).mmio_read() }
     unsafe fn wr32(a: usize, v: u32) { (a as *mut u32).mmio_write(v) }
 
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    enum Stepping { C0, D0, Unknown }
-
-    /// (pin, mux reg, mux nibble, pad reg, pad slot, fsel, pull) per Linux
-    /// `pinctrl-bcm2712.c`. pull: 0 none, 2 up.
-    type PinRow = (u32, usize, u32, usize, u32, u32, u32);
-    const C0_PINS: [PinRow; 7] = [
-        (28, 3, 4, 9, 5, 0, 0),
-        (30, 3, 6, 9, 7, 4, 0),
-        (31, 3, 7, 9, 8, 4, 2),
-        (32, 4, 0, 9, 9, 4, 2),
-        (33, 4, 1, 9, 10, 3, 2),
-        (34, 4, 2, 9, 11, 4, 2),
-        (35, 4, 3, 9, 12, 3, 2),
-    ];
-    const D0_PINS: [PinRow; 7] = [
-        (28, 2, 4, 5, 10, 0, 0),
-        (30, 2, 6, 5, 12, 1, 0),
-        (31, 2, 7, 5, 13, 1, 2),
-        (32, 3, 0, 5, 14, 1, 2),
-        (33, 3, 1, 6, 0, 1, 2),
-        (34, 3, 2, 6, 1, 1, 2),
-        (35, 3, 3, 6, 2, 1, 2),
-    ];
-
-    fn stepping() -> Stepping {
-        unsafe {
-            if boot::device_tree::struct_contains(b"brcm,bcm2712d0-pinctrl") == Some(true) { return Stepping::D0; }
-            if boot::device_tree::struct_contains(b"brcm,bcm2712c0-pinctrl") == Some(true) { return Stepping::C0; }
-        }
-        Stepping::Unknown
-    }
+    use crate::bcm2712_id::{self, Stepping};
 
     /// Mux gpio28 to GPIO and gpio30..35 to sd2 with the dts pulls. Returns a
     /// short description for the log. Writes only registers whose value changes.
     fn pinmux(pc: usize, st: Stepping) -> alloc::string::String {
-        let rows = match st { Stepping::C0 => &C0_PINS, Stepping::D0 => &D0_PINS, Stepping::Unknown => {
+        let Some(rows) = bcm2712_id::pin_rows(st) else {
             return alloc::string::String::from("pinmux=skip(unknown stepping)");
-        } };
+        };
         let mut changed = 0u32;
         let mut before = 0u32; // packed fsel nibbles of pins 30..35 as found
         for (i, &(_pin, mr, mb, pr, pb, fsel, pull)) in rows.iter().enumerate() {
@@ -783,7 +752,7 @@ mod hw {
             (Some(h), Some(c), Some(g), Some(p)) => (h, c, g, p),
             _ => { PROBE_STATE.store(4, Ordering::Relaxed); log("FAIL stage=map"); return; }
         };
-        let st = stepping();
+        let st = bcm2712_id::stepping().stepping;
         let mux = pinmux(pc, st);
         // Force card presence (non-removable) and select SD pin timing.
         unsafe {
