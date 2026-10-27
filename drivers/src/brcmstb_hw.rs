@@ -311,9 +311,9 @@ pub const STAGES: [&str; 17] = [
     "swinit-read",   // 2  read the brcmstb-reset SW_INIT status (reset block, not the RC)
     "rescal",        // 3  rescal START/STATUS (SATA/PCIe rescal block)
     "rc-read",       // 4  first RC register reads: REVISION, PCIE_STATUS, PCIE_CTRL
-    "bridge-assert", // 5  bridge SW_INIT assert + PERST# assert (RC write while bridge in reset)
-    "bridge-release",// 6  bridge SW_INIT deassert
-    "serdes",        // 7  HARD_DEBUG SerDes IDDQ off, RC REVISION read
+    "bridge-assert", // 5  bridge SW_INIT assert + status read (reset block only, NO RC access)
+    "bridge-release",// 6  bridge SW_INIT clear, poll status released, then one RC REVISION read
+    "perst-serdes",  // 7  first RC writes: PERST# assert (if released), HARD_DEBUG SerDes IDDQ off
     "pll",           // 8  MDIO 54 MHz PLL, PHY_CTL_15
     "misc",          // 9  MISC_CTRL, UBUS error suppression, timeouts
     "windows",       // 10 inbound + outbound windows
@@ -344,4 +344,75 @@ pub fn parse_stop(cmdline: &str) -> u32 {
 /// when asked (`pcie.reuse=1`) and the RC reports the link up.
 pub fn reuse_link(cmdline: &str, pcie_status: u32) -> bool {
     cmdline.split_ascii_whitespace().any(|t| t == "pcie.reuse=1") && link_up(pcie_status)
+}
+
+// ── Bridge reset + first RC writes (stages 5–7), host-tested ───────────────
+// On BCM2712 the pcie2 "bridge" reset is bit 44 of the brcmstb-reset
+// controller (DT `resets = <&pcie_rescal>, <&bcm_reset 44>`), and while it is
+// asserted the RC register block does not answer: an AXI read of e.g.
+// MISC_PCIE_CTRL never completes and the CPU stalls with no SError (Pi 5,
+// 2026-10-27: cpu0 hung in stage 5 after `bridge_reset(assert)` + `perst`).
+// Linux `brcm_pcie_setup()` therefore touches nothing between
+// `bridge_sw_init_set(1)` and `bridge_sw_init_set(0)` except a 100–200 us
+// sleep (PERST# is asserted there only for BCM2711, whose PERST# lives in the
+// RGR1 block), and BCM2712 sets CFG_QUIRK_AVOID_BRIDGE_SHUTDOWN so
+// `brcm_pcie_turn_off()` never re-asserts it. The sequence below mirrors that
+// and refuses to touch the RC unless the reset controller reports the bridge
+// released and the RC answers a REVISION read with a plausible value.
+
+/// Register blocks the bring-up touches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blk { Rc, SwInit }
+
+/// MMIO + delay seam so the sequencing runs against a recording mock on the host.
+pub trait PcieBus {
+    fn rd(&mut self, blk: Blk, off: usize) -> u32;
+    fn wr(&mut self, blk: Blk, off: usize, v: u32);
+    fn udelay(&mut self, us: u32);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BridgeErr {
+    /// SW_INIT status still shows the bridge in reset after CLEAR (RC untouched).
+    StuckInReset,
+    /// RC REVISION read back 0 or all-ones after release (no further RC access).
+    RcDead(u32),
+}
+
+/// Stage 5: assert the bridge reset. Reset-controller accesses only; returns
+/// the SW_INIT status read back (bit set = held in reset).
+pub fn bridge_assert<B: PcieBus>(b: &mut B) -> u32 {
+    let (bank, bit) = sw_init_set(PCIE2_BRIDGE_RESET_ID);
+    b.wr(Blk::SwInit, bank, bit);
+    let st = b.rd(Blk::SwInit, bank + SW_INIT_STATUS);
+    b.udelay(150); // Linux: usleep_range(100, 200)
+    st
+}
+
+/// Stage 6: release the bridge, wait (<= 1 ms) for SW_INIT status to confirm,
+/// then prove the RC answers with one read of MISC_REVISION.
+pub fn bridge_release<B: PcieBus>(b: &mut B) -> Result<u32, BridgeErr> {
+    let (bank, bit) = sw_init_set(PCIE2_BRIDGE_RESET_ID);
+    b.wr(Blk::SwInit, bank + SW_INIT_CLEAR, bit);
+    let mut released = false;
+    for _ in 0..100 {
+        if b.rd(Blk::SwInit, bank + SW_INIT_STATUS) & bit == 0 { released = true; break; }
+        b.udelay(10);
+    }
+    if !released { return Err(BridgeErr::StuckInReset); }
+    b.udelay(100);
+    let rev = b.rd(Blk::Rc, MISC_REVISION);
+    if rev == 0 || rev == 0xffff_ffff { return Err(BridgeErr::RcDead(rev)); }
+    Ok(rev)
+}
+
+/// Stage 7: the first RC writes. PERST# asserted (BCM7278-style PERSTB in
+/// MISC_PCIE_CTRL, written only if the firmware left it released), then the
+/// SerDes out of IDDQ (Linux: right after the bridge leaves reset).
+pub fn perst_serdes<B: PcieBus>(b: &mut B) {
+    let ctrl = b.rd(Blk::Rc, MISC_PCIE_CTRL);
+    if ctrl & PCIE_CTRL_PERSTB != 0 { b.wr(Blk::Rc, MISC_PCIE_CTRL, ctrl & !PCIE_CTRL_PERSTB); }
+    let hd = b.rd(Blk::Rc, HARD_DEBUG);
+    b.wr(Blk::Rc, HARD_DEBUG, hd & !HARD_DEBUG_SERDES_IDDQ);
+    b.udelay(150);
 }
