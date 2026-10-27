@@ -304,7 +304,12 @@ pub fn check_alive() -> bool {
 pub fn on_tick() {
     let cpu = unsafe { super::smp::arch_cpu_id() }.min(TIMER_MAX_CPUS - 1);
     let now = cntvct();
+    let due = GRID_CPU[cpu].load(Ordering::Relaxed).wrapping_add(interval());
     let passed = advance_grid(cpu, now);
+    if cpu == 0 && passed != 0 && GRID_CPU[0].load(Ordering::Relaxed) != 0 {
+        // How long this tick waited behind masked IRQs (#101 diagnostics).
+        super::uart::IRQ_LATE_MAX_TICKS.fetch_max(now.wrapping_sub(due), Ordering::Relaxed);
+    }
     LAST_TICK_CNT_CPU[cpu].store(now, Ordering::Relaxed);
 
     // One-shot deadline: service it if due (any CPU), then fold the next

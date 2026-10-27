@@ -5997,6 +5997,15 @@ fn gen_sysstat() -> Option<VnodeKind> {
                          sched::FOREIGN_TASK_COPIES.load(Relaxed),
                          sched::take_as_hold_max_us());
     }
+    // Console UART RX health (openbugs #101): longest RX-unserviced stretch
+    // of a console write, longest cpu0 tick lateness, bytes pulled out of the
+    // RX FIFO during IRQ-masked sections, hardware overruns. aarch64 only.
+    {
+        extern "C" { fn kernel_uart_rx_stats(out: *mut u64); }
+        let mut u = [0u64; 4];
+        unsafe { kernel_uart_rx_stats(u.as_mut_ptr()); }
+        let _ = writeln!(s, "# uart txgap_us {} irqlate_us {} rescued {} overruns {}", u[0], u[1], u[2], u[3]);
+    }
     let _ = writeln!(s, "# t pid tgid cpu_ns sys_ns");
     for (pid, tgid, c, y) in tasks {
         let _ = writeln!(s, "t {} {} {} {}", pid, tgid, c, y);

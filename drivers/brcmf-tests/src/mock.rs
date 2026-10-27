@@ -91,7 +91,23 @@ pub struct MockChip {
     pub corrupt_next: bool,
     /// Firmware swallows control requests.
     pub mute: bool,
+    /// HT (PLL) is only available once the firmware runs, `ht_delay_us` after
+    /// its start (the real 43455: an HT request before the download times out).
+    pub ht_needs_fw: bool,
+    pub ht_delay_us: u64,
+    pub fw_start_us: u64,
+    /// The SR engine bit appears in chipcontrol 3 once the firmware runs.
+    pub sr_after_fw: bool,
+    /// The fake firmware traps right after start (console says why).
+    pub fw_trap: bool,
 }
+
+/// Where the fake firmware puts sdpcm_shared and its console (RAM offsets).
+/// (Below the nvram at the top, above any test image.)
+pub const SHARED_OFF: usize = RAM_SIZE - 0x3000;
+pub const CONSOLE_OFF: usize = SHARED_OFF + 0x100;
+pub const CONSOLE_BUF_OFF: usize = SHARED_OFF + 0x200;
+pub const CONSOLE_SIZE: usize = 0x400;
 
 impl MockChip {
     pub fn new() -> Self {
@@ -113,6 +129,11 @@ impl MockChip {
             sr: true,
             corrupt_next: false,
             mute: false,
+            ht_needs_fw: true,
+            ht_delay_us: 50_000,
+            fw_start_us: 0,
+            sr_after_fw: false,
+            fw_trap: false,
         };
         m.regs.insert(CC_BASE + CC_CHIPID, 0x4345 | (6 << 16) | (1 << 28));
         m.regs.insert(CC_BASE + CC_EROMPTR, EROM_BASE);
@@ -145,7 +166,7 @@ impl MockChip {
             return if self.bankidx == 0 { 0x3F } else { 0x23 }; // 512K + 288K = 800K
         }
         if a == CC_BASE + CC_CHIPCONTROL_DATA {
-            return if self.sr { 1 << 2 } else { 0 };
+            return if self.sr || (self.sr_after_fw && self.fw_running) { 1 << 2 } else { 0 };
         }
         *self.regs.get(&a).unwrap_or(&0)
     }
@@ -179,11 +200,50 @@ impl MockChip {
             self.fw_nvram_ok = tok >> 16 == (!words & 0xFFFF) && words > 0;
             if rstvec == img && self.fw_nvram_ok {
                 self.fw_running = true;
+                self.fw_start_us = self.now_us;
+                self.fw_console();
+                if self.fw_trap {
+                    return;
+                }
                 // Firmware announces itself through the host mailbox.
                 self.regs.insert(SDIO_BASE + SD_TOHOSTMAILBOXDATA, (4 << 16) | sdpcm::HMB_DATA_FWREADY);
                 self.raise(sdpcm::I_HMB_HOST_INT);
             }
         }
+    }
+
+    fn put32(&mut self, off: usize, v: u32) {
+        self.ram[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// What a real firmware leaves for brcmf_sdio_readshared: the
+    /// sdpcm_shared address in the last RAM word, the console ring with its
+    /// write index (wrapped once here, to exercise the ring order).
+    fn fw_console(&mut self) {
+        let base = 0x198000u32;
+        let text: &[u8] = if self.fw_trap {
+            b"\r\nRTE (SDIO-CDC) 7.45.241 (mock) on BCM4345 r6 @ 37.4/81.6/81.6MHz\r\nwl0: mock pll fail\r\nTRAP 4(23fd68): pc 1b2e4, lr 1b2c1\r\n"
+        } else {
+            b"\r\nRTE (SDIO-CDC) 7.45.241 (mock) on BCM4345 r6 @ 37.4/81.6/81.6MHz\r\nwl0: Broadcom BCM4345 802.11 Wireless Controller 7.45.241\r\n"
+        };
+        // Start near the end so the text wraps around the ring.
+        let start = CONSOLE_SIZE - 40;
+        for (i, &c) in text.iter().enumerate() {
+            self.ram[CONSOLE_BUF_OFF + (start + i) % CONSOLE_SIZE] = c;
+        }
+        let idx = (start + text.len()) % CONSOLE_SIZE;
+        let flags = 3 | if self.fw_trap { 0x400 } else { 0 };
+        self.put32(SHARED_OFF, flags);
+        self.put32(SHARED_OFF + 4, if self.fw_trap { base + 0x2000 } else { 0 });
+        self.put32(SHARED_OFF + 20, base + CONSOLE_OFF as u32);
+        self.put32(CONSOLE_OFF + 8, base + CONSOLE_BUF_OFF as u32);
+        self.put32(CONSOLE_OFF + 12, CONSOLE_SIZE as u32);
+        self.put32(CONSOLE_OFF + 16, idx as u32);
+        self.put32(RAM_SIZE - 4, base + SHARED_OFF as u32);
+    }
+
+    fn ht_ok(&self) -> bool {
+        !self.ht_needs_fw || (self.fw_running && !self.fw_trap && self.now_us >= self.fw_start_us + self.ht_delay_us)
     }
 
     fn raise(&mut self, bits: u32) {
@@ -282,6 +342,14 @@ impl SdioBus for MockChip {
                 (en & 0x02) | if self.fw_running { en & 0x04 } else { 0 }
             }
             0 => *self.f0.get(&addr).unwrap_or(&0),
+            1 if addr == SBSDIO_FUNC1_CHIPCLKCSR => {
+                let v = *self.f1.get(&addr).unwrap_or(&0);
+                if v & (SBSDIO_HT_AVAIL_REQ | SBSDIO_FORCE_HT) != 0 && self.ht_ok() {
+                    v | SBSDIO_HT_AVAIL
+                } else {
+                    v & !SBSDIO_HT_AVAIL
+                }
+            }
             1 => *self.f1.get(&addr).unwrap_or(&0),
             _ => return Err(BusError::Io),
         })
@@ -299,7 +367,7 @@ impl SdioBus for MockChip {
                         if val & (SBSDIO_ALP_AVAIL_REQ | SBSDIO_FORCE_ALP | SBSDIO_HT_AVAIL_REQ | SBSDIO_FORCE_HT) != 0 {
                             v |= SBSDIO_ALP_AVAIL;
                         }
-                        if val & (SBSDIO_HT_AVAIL_REQ | SBSDIO_FORCE_HT) != 0 {
+                        if val & (SBSDIO_HT_AVAIL_REQ | SBSDIO_FORCE_HT) != 0 && self.ht_ok() {
                             v |= SBSDIO_HT_AVAIL;
                         }
                         v

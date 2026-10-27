@@ -1178,6 +1178,12 @@ def main():
     if os.path.isfile(_wifiscan):
         bin_files.append(("wifiscan", _wifiscan, 0o100755))
 
+    # /bin/brcmfctl: runtime retry/diag of the Pi 5 Wi-Fi bring-up (/etc/brcmf.ctl).
+    _brcmfctl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                             "userland", "brcmfctl", "brcmfctl.sh")
+    if os.path.isfile(_brcmfctl):
+        bin_files.append(("brcmfctl", _brcmfctl, 0o100755))
+
     # Realtek RTL8168-family PHY/MAC patches for the r8169 driver (x86_64
     # PCs): /lib/firmware/rtl_nic/*.fw from the cache ports/rtl_nic/fetch.sh
     # fills ($RTL_NIC_CACHE, default ~/.cache/leandros/rtl_nic).
