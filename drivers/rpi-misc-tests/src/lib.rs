@@ -199,5 +199,15 @@ mod tests {
         assert!(!Magic::new().feed(b'b', false, 0));
         assert!(dtb_has_pm(b"xx\0brcm,bcm2712-pm\0yy"));
         assert!(!dtb_has_pm(b"brcm,bcm2712-pmx"));
+        // chip-id fallback sanity read (kexec FDT has no PM node)
+        assert!(pm_regs_plausible(0, 0x1000, 0));
+        assert!(pm_regs_plausible(0x20, 0, 0x000f_0000));
+        assert!(!pm_regs_plausible(u32::MAX, u32::MAX, u32::MAX));
+        assert!(!pm_regs_plausible(0, 0, 0x0010_0000));
+        assert!(!pm_regs_plausible(0x5a00_0020, 0, 0));
+        let mut t = [0u8; 32];
+        let mut b = Buf::new(&mut t);
+        b.x(0).s(" ").x(0x1f_ab00);
+        assert_eq!(&b.b[..b.n], b"0x0 0x1fab00");
     }
 }
