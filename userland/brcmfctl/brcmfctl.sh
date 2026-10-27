@@ -13,7 +13,7 @@
 #   verify=0|1|2 (off, head/tail, whole image) win4b=0|1
 #   SDIO bus: sdclk=kHz hs=0|1 blk=0|1 blksz=N (F1) chunk=N (max bytes per CMD53)
 if [ $# -eq 0 ]; then
-    echo "usage: brcmfctl retry [knob=val ...] | diag [lines=N] | status | peek addr=0x.. | poke addr=0x.. val=0x.."
+    echo "usage: brcmfctl status | scan | join [ssid=NAME] | diag [lines=N] | retry [knob=val ...] | peek addr=0x.. | poke addr=0x.. val=0x.."
     exit 2
 fi
 # A fresh sequence number makes a repeated command count as new.
@@ -21,4 +21,4 @@ n=$(cat /etc/brcmf.ctl.n 2>/dev/null)
 n=$((${n:-0} + 1))
 echo "$n" > /etc/brcmf.ctl.n
 echo "seq=$n.$RANDOM $*" > /etc/brcmf.ctl || exit 1
-echo "brcmfctl: queued '$*' (answer within ~1 s as [brcmf] lines)"
+echo "brcmfctl: queued '$*' (answer within ~1 s as [brcmf] lines: see the log section of /proc/net/nic)"
