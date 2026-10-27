@@ -13,7 +13,7 @@ Options:
                            (scripts/set-image-cmdline.sh; suite i915fake implies
                            "i915.fake=2 i915.kms=1")
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + proctest + chroottest + netctltest + bttest + sudotest + nmtest --quick (mock) + evherdtest + pollnarrowtest + listentagtest + vfstagtest + nettag2test + kparkstest + sshsmoke
+                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + proctest + chroottest + netctltest + bttest + sudotest + nmtest --quick (mock) + blueztest (org.bluez shim) + evherdtest + pollnarrowtest + listentagtest + vfstagtest + nettag2test + kparkstest + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              serialxfer host:serialxfertest.py alone (serial push + kexec, scripts/pi-serial-*)
@@ -118,6 +118,9 @@ SUITES = {
                 # applet's library; --quick skips the 25 s snapshot storm.
                 # dbus-run-session is a script: the kernel has no #! binfmt.
                 "/bin/sh /usr/bin/dbus-run-session -- /bin/nmtest --spawn --quick",
+                # org.bluez shim (COSMIC Bluetooth applet/Settings) over btd on
+                # bttest's scripted controller: scan, pair, connect, remove.
+                "/bin/sh /usr/bin/dbus-run-session -- /usr/libexec/leandros-sysbus bluez-test",
                 # Input on one evdev device wakes no waiter on another (QMP
                 # tablet motion vs a waiter parked on the keyboard).
                 "host:evherdtest.py",
