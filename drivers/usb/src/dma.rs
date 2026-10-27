@@ -109,6 +109,17 @@ impl DmaBuf {
     #[inline] pub fn sync_for_device(&self) { mm::dma_cache::sync_for_device(self.virt, self.len); }
     /// Make device writes visible to the CPU (barrier, or invalidate).
     #[inline] pub fn sync_for_cpu(&self) { mm::dma_cache::sync_for_cpu(self.virt, self.len); }
+    /// [`sync_for_device`](Self::sync_for_device) for `n` bytes at `off`
+    /// only. Keep `off`/`n` cache-line aligned when the device writes there.
+    pub fn sync_range_for_device(&self, off: usize, n: usize) {
+        assert!(off + n <= self.len);
+        mm::dma_cache::sync_for_device(self.virt + off, n);
+    }
+    /// [`sync_for_cpu`](Self::sync_for_cpu) for `n` bytes at `off` only.
+    pub fn sync_range_for_cpu(&self, off: usize, n: usize) {
+        assert!(off + n <= self.len);
+        mm::dma_cache::sync_for_cpu(self.virt + off, n);
+    }
 }
 
 impl Drop for DmaBuf {

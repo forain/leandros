@@ -208,6 +208,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     vfs_server::block::init(&DISK_OPS);
 
     // ── USB ───────────────────────────────────────────────────────────────────
+    usb::xhci::isoch::set_cmdline(crate::boot_cmdline().unwrap_or(""));
     drivers::usb_hcd::init();
     // The xHCI BIOS handoff above ends the firmware's USB legacy (PS/2)
     // emulation: an i8042 that was only ever that emulation is gone now.
