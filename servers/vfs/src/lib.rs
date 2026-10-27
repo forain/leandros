@@ -12692,6 +12692,8 @@ fn dyn_dev_meta(major: u32, minor: u32) -> xattr::FileMeta {
     const S_IFCHR: u16 = 0o020000;
     match (major, minor) {
         (13, _) => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_INPUT },
+        // /dev/uinput: root only (Linux default) - it can forge any input.
+        (10, 223) => xattr::FileMeta { mode: S_IFCHR | 0o600, uid: 0, gid: 0 },
         (SOUND_MAJOR, _) => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_AUDIO },
         (226, m) if m < 128 => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_VIDEO },
         // /dev/netctl: everyone reads state, root and netdev may manage. The

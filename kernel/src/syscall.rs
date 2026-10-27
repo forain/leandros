@@ -11552,7 +11552,9 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
        cmd == DRM_IOCTL_SET_PLANE || cmd == DRM_IOCTL_GET_CAPS ||
        cmd == DRM_IOCTL_GPU_IRQ_STATS || cmd == DRM_IOCTL_GPU_PARK_SPIN ||
        cmd == DRM_IOCTL_CTX_DRAIN_US ||
-       is_evdev || is_drm {
+       is_evdev || is_drm ||
+       // /dev/uinput ('U'): only on a device-server fd, never on other fd kinds.
+       (ioctl_type == 0x55 && matches!(vfs::vfs_get_node_kind(pid, fd), Some(vfs::VnodeKind::DynamicDevice { .. }))) {
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
         let reply = vfs::handle(&msg, pid);
         return u64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8])) as isize;
