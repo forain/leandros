@@ -34,7 +34,7 @@ Inventory: `artifacts/notes/pi5-device-inventory-2026-10-26.md`.
   failed on the halt test (RSTS 0x20 aliases the rng FIFO offset in a shared mock); fixed in the mock.
 - `scripts/check-rpi5.sh` and `CHECK_FEATURE=raspi4b`: clean, no warnings in the new files.
 - Mac HVF: `cat /proc/thermal`, `cat /proc/cpufreq`, /bin/sigtest PASS; virt still prints its PL031 `[RTC] epoch seconds`.
-- Box aarch64 full regress: see the merge report.
+- Box aarch64 full regress (TCG, 8121dce8): 49 suites, 0 bad.
 
 ## Expected on the next Pi boot
 ```
