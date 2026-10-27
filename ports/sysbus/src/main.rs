@@ -31,6 +31,7 @@
 //! anything that needs root (powering off, writing /etc as uid 1000) is
 //! reported as an error instead of pretending to succeed. See each module.
 
+mod bluez;
 mod locale1;
 mod login1;
 mod nm;
@@ -54,7 +55,7 @@ pub(crate) fn log(service: &str, msg: std::fmt::Arguments<'_>) {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|networkmanager|probe|power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>|portal [settings|screenshot|open-file|all] [timeout_s]>");
+    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|networkmanager|bluez|bluez-test|probe|power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>|portal [settings|screenshot|open-file|all] [timeout_s]>");
     ExitCode::from(2)
 }
 
@@ -111,6 +112,10 @@ fn main() -> ExitCode {
             conn.call_method(dest, path, iface, method.as_str(), &(false,)).await?;
             return Ok(Some(true));
         }
+        if which == "bluez-test" {
+            let (_pass, fail) = bluez::test::run(builder.build().await?).await;
+            return Ok(Some(fail == 0));
+        }
         if which == "probe" {
             let (_pass, fail) = probe::run(builder.build().await?).await;
             return Ok(Some(fail == 0));
@@ -123,6 +128,7 @@ fn main() -> ExitCode {
             "polkit" => polkit::serve(builder).await?,
             "rtkit" => rtkit::serve(builder).await?,
             "networkmanager" => nm::serve(builder).await?,
+            "bluez" => bluez::serve(builder).await?,
             _ => return Ok::<_, zbus::Error>(None),
         };
         log(&which, format_args!("serving on {address}"));

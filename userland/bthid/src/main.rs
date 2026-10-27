@@ -546,6 +546,13 @@ fn daemon() -> i32 {
         let _ = bt.frame(OP_LISTEN, &psm.to_le_bytes());
     }
     let _ = bt.frame(OP_DEVICES, &[]);
+    // The request spool is writable by every local user: the desktop's
+    // org.bluez shim (leandros-sysbus bluez, running as the session user)
+    // appends `AA:BB:CC:DD:EE:FF` lines for Device1.Connect on input devices.
+    write_file(REQ, b"", O_TRUNC);
+    #[cfg(target_arch = "aarch64")] const SYS_FCHMODAT: usize = 53;
+    #[cfg(target_arch = "x86_64")] const SYS_FCHMODAT: usize = 268;
+    unsafe { syscall3(SYS_FCHMODAT, -100isize as usize, REQ.as_ptr() as usize, 0o666); }
     sayln!("bthid: listening for HID devices");
     let mut h = Host { bt, devs: Vec::new(), names: Vec::new(), next_req: 0, reqs: Vec::new(), tid: 0 };
     for a in listed() { h.start(a); }
@@ -567,7 +574,12 @@ fn daemon() -> i32 {
         if let Some(t) = read_file(REQ) {
             if !t.is_empty() {
                 write_file(REQ, b"", O_TRUNC);
-                for l in t.split(|&c| c == b'\n') { if let Some(a) = parse_addr(l) { h.start(a); } }
+                for l in t.split(|&c| c == b'\n') {
+                    let Some(a) = parse_addr(l) else { continue };
+                    // Remembered, so it is reconnected after a restart too.
+                    if !listed().contains(&a) { write_file(LIST, alloc::format!("{}\n", A(a)).as_bytes(), O_APPEND); }
+                    h.start(a);
+                }
             }
         }
     }

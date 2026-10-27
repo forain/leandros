@@ -40,7 +40,8 @@ Layering:
 
 ## B. btd client API `/run/bluetooth/btd.sock` (btd implements; bthid/btctl consume)
 
-AF_UNIX `SOCK_STREAM`. Every message is a frame: `len:u16 LE | op:u8 | payload` where `len` counts
+AF_UNIX `SOCK_STREAM`, mode 0666 (any local user, like BlueZ's default D-Bus policy; the
+desktop's org.bluez shim runs as the session user). Every message is a frame: `len:u16 LE | op:u8 | payload` where `len` counts
 `op + payload`. All integers little-endian. `bdaddr` = 6 bytes in **HCI order** (LSB first, i.e.
 reversed from the printed `AA:BB:CC:DD:EE:FF`). Encode/decode is `bt_host::api` (lib/bt-host,
 no_std, host-tested); the blocking client is `btd::client` (userland/btd, `[lib]`):
@@ -107,3 +108,18 @@ Semantics:
   `AA:BB:CC:DD:EE:FF <32 hex key> <key type> <name>`; written atomically (tmp + rename).
 - LE: scan only (advertising reports -> DEVICE with flag 4). Incoming LE links get ATT (MTU 23,
   everything else "request not supported") and SMP ("pairing not supported") stubs. HOGP later.
+
+## C. org.bluez for the desktop (`leandros-sysbus bluez`, ports/sysbus/src/bluez)
+
+The COSMIC Bluetooth applet (bluer 0.17) and Settings > Bluetooth (bluez-zbus) talk BlueZ 5 D-Bus.
+`leandros-sysbus bluez` (D-Bus activated from `org.bluez.service` on the session busd, which also
+serves as the system bus) exports `/org/bluez` (AgentManager1, ProfileManager1), `/org/bluez/hci0`
+(Adapter1, only while btd reports a ready controller) and `/org/bluez/hci0/dev_AA_BB_..` (Device1),
+ObjectManager at `/`. StartDiscovery = btd SCAN in 30 s rounds (Discovering stays true) until
+StopDiscovery (10 min cap); Pair = PAIR; RemoveDevice = REMOVE; Disconnect = DISCONNECT.
+Connect on an input-class device (major class 5) appends `AA:BB:CC:DD:EE:FF` to bthid's spool
+`/run/bluetooth/bthid.connect` (bthid creates it 0666) and waits up to 15 s for the link; other
+devices get an SDP channel held open until Disconnect. Connected/Paired come from btd DEVICES,
+polled every 1.5 s. Powered is a soft switch (btd keeps the controller up). Agents are accepted
+and never called (btd pairs just-works). Test: `dbus-run-session -- leandros-sysbus bluez-test`
+(regress), which runs `bttest serve SOCK KEYS` (btd on the scripted controller).

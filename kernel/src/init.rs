@@ -236,6 +236,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     arch_x86_64::psmouse::init();
     vfs_server::set_kernel_cmdline(crate::boot_cmdline().unwrap_or("")); // /proc/cmdline
     vfs_server::set_proc_pcipm(drivers::pci::pm_report); // /proc/pcipm
+    vfs_server::set_proc_klog(|| crate::klog::tail(256 << 10)); // /proc/klog (dmesg; boards with no ESP)
     if crate::boot_cmdline().unwrap_or("").split_ascii_whitespace().any(|t| t == "wdog.selftest=1") {
         sched::wdog_selftest_arm();
     }

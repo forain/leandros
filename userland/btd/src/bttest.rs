@@ -46,6 +46,7 @@ fn with_pad(code: u8, pre: &[u8], post: &[u8]) -> Vec<u8> {
 
 /// The scripted controller: answers one H4 packet.
 fn respond(pkt: &[u8]) -> Vec<Vec<u8>> {
+    if pkt[0] == hci::H4_ACL { return respond_acl(pkt); }
     if pkt[0] != hci::H4_CMD { return Vec::new(); }
     let o = u16::from_le_bytes([pkt[1], pkt[2]]);
     let h = [0x0b, 0x00];
@@ -79,6 +80,42 @@ fn respond(pkt: &[u8]) -> Vec<Vec<u8>> {
         op::REMOTE_NAME_REQ | op::ACCEPT_CONN => alloc::vec![cs(o)],
         _ => alloc::vec![cc(o, &[0])],
     }
+}
+
+/// The remote's L2CAP signalling (BR/EDR, cid 1): accepts any channel (as
+/// dcid 0x0040+), sends its own config request (MTU 672), answers config and
+/// disconnect requests; data on other cids is dropped. Every host ACL packet
+/// is acknowledged with Number_Of_Completed_Packets so credits never run out.
+static mut HOST_CID: [u8; 2] = [0, 0];
+fn respond_acl(pkt: &[u8]) -> Vec<Vec<u8>> {
+    let h = [0x0b, 0x00];
+    let mut out = alloc::vec![hci::event(ev::NUM_COMPLETED, &[1, h[0], h[1], 1, 0])];
+    if pkt.len() < 13 || u16::from_le_bytes([pkt[7], pkt[8]]) != 1 { return out; }
+    let (code, id) = (pkt[9], pkt[10]);
+    let d = &pkt[13..];
+    let sig = |code: u8, id: u8, body: &[u8]| {
+        let mut l2 = Vec::new();
+        l2.extend_from_slice(&((4 + body.len()) as u16).to_le_bytes());
+        l2.extend_from_slice(&[1, 0, code, id]);
+        l2.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        l2.extend_from_slice(body);
+        hci::acl(0x000b, 0b10, &l2)
+    };
+    match code {
+        0x02 if d.len() >= 4 => {
+            let scid = [d[2], d[3]];
+            unsafe { HOST_CID = scid; }
+            out.push(sig(0x03, id, &[0x40, 0x00, scid[0], scid[1], 0, 0, 0, 0]));
+            out.push(sig(0x04, 0x77, &[scid[0], scid[1], 0, 0, 0x01, 0x02, 0xa0, 0x02]));
+        }
+        // Config request from the host: answer success for its (our dcid) channel.
+        0x04 if d.len() >= 2 => { let c = unsafe { HOST_CID }; out.push(sig(0x05, id, &[c[0], c[1], 0, 0, 0, 0])) }
+        0x06 if d.len() >= 4 => out.push(sig(0x07, id, &d[..4])),
+        0x0a if d.len() >= 2 => out.push(sig(0x0b, id, &[d[0], d[1], 1, 0])),
+        0x08 => out.push(sig(0x09, id, d)),
+        _ => {}
+    }
+    out
 }
 
 fn controller(fd: i32) -> ! {
@@ -126,8 +163,44 @@ unsafe fn wait_exit(pid: i32) -> i32 {
     (st >> 8) & 0xff
 }
 
+unsafe fn arg(argv: *const *const u8, i: usize) -> Vec<u8> {
+    let p = *argv.add(i);
+    let mut n = 0;
+    while *p.add(n) != 0 { n += 1; }
+    let mut v = core::slice::from_raw_parts(p, n).to_vec();
+    v.push(0);
+    v
+}
+
+/// `bttest serve SOCK KEYS`: run btd on the scripted controller (with the
+/// test pad behind it) at SOCK until stdin reaches EOF, then stop both. For
+/// clients that test against a known adapter (the org.bluez shim's test).
+unsafe fn serve(sock: &[u8], keys: &[u8]) -> i32 {
+    sys::unlink(keys);
+    let Ok(sv) = sys::socketpair() else { return 1 };
+    let ctl = leandros_libc::fork();
+    if ctl == 0 { sys::close(sv[1]); controller(sv[0]); }
+    sys::close(sv[0]);
+    leandros_libc::dup3(sv[1], 9, 0);
+    let btd_pid = spawn_btd(&[b"btd\0", b"--fd\0", b"9\0", b"--sock\0", sock, b"--keys\0", keys, b"--name\0", b"bttest\0"]);
+    sys::close(sv[1]);
+    sys::close(9);
+    sayln!("bttest serve: btd pid {} on the scripted controller", btd_pid);
+    let mut b = [0u8; 64];
+    while let Ok(n) = sys::read(0, &mut b) { if n == 0 { break; } }
+    syscall3(nr::KILL, btd_pid as usize, 15, 0);
+    wait_exit(btd_pid);
+    syscall3(nr::KILL, ctl as usize, 15, 0);
+    wait_exit(ctl);
+    sys::unlink(sock);
+    0
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
+pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
+    if argc == 4 && arg(argv, 1) == b"serve\0" {
+        return serve(&arg(argv, 2), &arg(argv, 3));
+    }
     // Case 0: no controller.
     let pid = spawn_btd(&[b"btd\0", b"--dev\0", b"/dev/hci-none\0", b"--sock\0", SOCK, b"--keys\0", KEYS]);
     check("no_controller_exits_1", wait_exit(pid) == 1, "btd without a controller must exit 1");
