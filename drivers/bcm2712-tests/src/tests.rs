@@ -235,3 +235,53 @@ fn otp_decode_and_wifi_mac() {
     assert_eq!(wifi_mac(), Some([0x2c, 0xcf, 0x67, 0x12, 0x34, 0x57]));
     assert_eq!(serial(), Some(7));
 }
+
+/// Regs that also append to a log shared across blocks, so the order of
+/// pinctrl and gio writes can be checked together.
+struct Tagged<'a> { r: [u32; 64], tag: char, log: &'a std::cell::RefCell<Vec<(char, usize, u32)>> }
+impl Regs for &mut Tagged<'_> {
+    fn rd(&mut self, off: usize) -> u32 { self.r[off / 4] }
+    fn wr(&mut self, off: usize, v: u32) { self.log.borrow_mut().push((self.tag, off, v)); self.r[off / 4] = v }
+}
+
+/// Real Pi 5 D0 boot state (main 4b975f56): 24-27 fsel 0, BT_ON an input.
+/// bt_pins_prepare must leave 24-27 on uart0 (fsel 4) with CTS/RXD pulled
+/// up and RTS/TXD unbiased, BT_ON a low output, and drive BT_ON low before
+/// the first uart mux write (the controller never sees a powered, unmuxed UART).
+#[test]
+fn bt_pins_prepare_from_d0_boot_state() {
+    for st in [Stepping::D0, Stepping::C0] {
+        let log = std::cell::RefCell::new(vec![]);
+        let tab = table(Block::Main, st).unwrap();
+        let mut pm = Tagged { r: [0; 64], tag: 'p', log: &log };
+        let mut gm = Tagged { r: [0; 64], tag: 'g', log: &log };
+        let (b29, bit29) = locate(bank_widths(Chip::Gio, st), BT_ON).unwrap();
+        gm.r[(b29 + GIO_IODIR) / 4] = 1 << bit29; // input at reset
+        gm.r[(b29 + GIO_DATA) / 4] = 1 << bit29; // stale high latch
+        {
+            let mut pc = Pinctrl::new(&mut pm, tab);
+            let mut g = Gpio::new(&mut gm, bank_widths(Chip::Gio, st));
+            let f = bt_pins_prepare(&mut pc, &mut g).unwrap();
+            if st == Stepping::D0 { assert_eq!(f, [4, 4, 4, 4]); }
+            for p in 24..28 { assert_eq!(pc.get_function(p), Some("uart0"), "{:?} {}", st, p); }
+            let pulls: Vec<_> = (24..28).map(|p| pc.get_pull(p).unwrap()).collect();
+            assert_eq!(pulls, [Pull::None as u32, Pull::Up as u32, Pull::None as u32, Pull::Up as u32]);
+            assert_eq!(pc.get_function(29), Some("gpio"));
+            assert_eq!((g.is_output(BT_ON).unwrap(), g.get(BT_ON).unwrap()), (true, false));
+        }
+        let log = log.borrow();
+        let first_mux = log.iter().position(|e| e.0 == 'p').unwrap();
+        let gpio_low = log.iter().position(|e| e.0 == 'g').unwrap();
+        assert!(gpio_low < first_mux, "{:?}: BT_ON must go low before 24-27 are muxed: {:?}", st, *log);
+        // Idempotent: a second run (kexec) writes no pinctrl register.
+        let n = log.len();
+        drop(log);
+        let mut pc = Pinctrl::new(&mut pm, tab);
+        let mut g = Gpio::new(&mut gm, bank_widths(Chip::Gio, st));
+        bt_pins_prepare(&mut pc, &mut g).unwrap();
+        assert!(log_borrow_tail(&pm, n).iter().all(|e| e.0 == 'g'));
+    }
+    assert!(BT_OFF_MS >= 10 && BT_ON_SETTLE_MS >= 100);
+}
+
+fn log_borrow_tail(t: &Tagged<'_>, from: usize) -> Vec<(char, usize, u32)> { t.log.borrow()[from..].to_vec() }

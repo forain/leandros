@@ -2,9 +2,11 @@
 //!
 //! `uarta: serial@7d50c000` is `brcm,bcm7271-uart`: a 16550A-style MMIO UART
 //! (reg-shift 2, 32-bit access, 96 MHz clock, 32-byte FIFOs, MCR.AFE auto
-//! RTS/CTS), SPI 0x114. The firmware already muxed GPIO 24-27 to it
-//! (`skip-init`); we only read the mux back for the log. BT_ON is gio 29,
-//! driven through the shared BCM2712 GPIO driver (`crate::bcm2712_gpio`).
+//! RTS/CTS), SPI 0x114. The firmware does NOT mux GPIO 24-27 to it on D0
+//! (real Pi 5: all four read fsel 0 = gpio), so with AFE the unconnected CTS
+//! held the TX FIFO and HCI Reset failed with `Tx`. We apply the uarta
+//! `default` pinctrl state ourselves (`bcm2712_gpio::bt_pins_prepare`: BT_ON
+//! low GPIO first, then uart0 + dts pulls on 24-27). BT_ON is gio 29.
 //!
 //! RX is polled, not IRQ-driven: with auto flow control the UART drops RTS at
 //! the RX trigger level, so the controller stops sending while we sleep and no
@@ -58,6 +60,7 @@ const FCR: usize = 2;
 const LCR: usize = 3;
 const MCR: usize = 4;
 const LSR: usize = 5;
+const MSR: usize = 6;
 const LCR_DLAB: u32 = 0x80;
 const LCR_8N1: u32 = 0x03;
 const FCR_ENABLE: u32 = 0x01;
@@ -165,16 +168,26 @@ impl Transport for Uart {
 
 fn map(phys: u64, len: usize) -> Option<usize> { mm::kva::ioremap(phys, len, mm::kva::CacheMode::Uncached) }
 
-/// Reads the function selects of GPIO 24-27 (uarta) and makes GPIO 29 a plain
-/// GPIO (BT_ON) if it is not already, through the shared pinctrl driver.
-fn pinmux() -> String {
+/// Muxes the BT pins (BT_ON low GPIO, 24-27 uart0 + pulls) and describes the
+/// result: `D0 mux24-27=0000->4444 pull24-27=0202 gpio29-fsel=0 bt_on=out:0`.
+/// `Err` (nothing usable to log as muxed) means the bring-up must not run.
+fn pinmux() -> Result<String, String> {
     let st = gpio::stepping();
     let f = |p| gpio::pin_get_fsel(Block::Main, p);
-    let (Ok(a), Ok(b), Ok(c), Ok(d), Ok(g29)) = (f(24), f(25), f(26), f(27), f(BT_ON_GPIO)) else {
-        return String::from("mux=skip(unknown stepping)");
+    let (Ok(a), Ok(b), Ok(c), Ok(d)) = (f(24), f(25), f(26), f(27)) else {
+        return Err(format!("{:?} mux=unknown-stepping", st));
     };
-    if g29 != 0 { let _ = gpio::pin_set_function(Block::Main, BT_ON_GPIO, "gpio"); }
-    format!("{:?} mux24-27={:x}{:x}{:x}{:x} gpio29-fsel={}", st, a, b, c, d, g29)
+    let pre = format!("{:x}{:x}{:x}{:x}", a, b, c, d);
+    let post = gpio::bt_pins_prepare_hw().map_err(|e| format!("{:?} mux24-27={} mux-err={:?}", st, pre, e))?;
+    let pull: String = (24..28).map(|p| match gpio::pin_get_pull(Block::Main, p) {
+        Ok(v) => char::from_digit(v, 10).unwrap_or('?'), Err(_) => '?' }).collect();
+    let g29 = f(BT_ON_GPIO).map(|v| v as i32).unwrap_or(-1);
+    let on = match (gpio::gpio_is_output(Chip::Gio, BT_ON_GPIO), gpio::gpio_get(Chip::Gio, BT_ON_GPIO)) {
+        (Ok(o), Ok(v)) => format!("{}:{}", if o { "out" } else { "in" }, v as u8),
+        _ => String::from("?"),
+    };
+    Ok(format!("{:?} mux24-27={}->{:x}{:x}{:x}{:x} pull24-27={} gpio29-fsel={} bt_on={}",
+        st, pre, post[0], post[1], post[2], post[3], pull, g29, on))
 }
 
 /// Drive BT_ON (gio 29).
@@ -206,7 +219,10 @@ pub fn start(cmdline: &str, serror: SerrorCheck, on_ready: fn(port: u32)) {
     if let Some(syn) = serror() {
         log(&format!("SError pending before the bt probe syn=0x{:016x} (an earlier probe)", syn));
     }
-    let mux = pinmux();
+    let mux = match pinmux() {
+        Ok(m) => m,
+        Err(m) => { bt_on(false); STATE.store(STATE_FAILED, Ordering::Release); return log(&format!("fail stage=pinmux {}", m)); }
+    };
     let uart = Uart { base, serror, line_errors: 0 };
     let lsr = uart.r(LSR);
     if let Some(syn) = serror() {
@@ -257,9 +273,9 @@ fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready
 
     // Power-cycle: the controller may still run (kexec) at another rate.
     bt_on(false);
-    sched::kthread::msleep(10);
+    sched::kthread::msleep(gpio::BT_OFF_MS as u64);
     bt_on(true);
-    sched::kthread::msleep(100);
+    sched::kthread::msleep(gpio::BT_ON_SETTLE_MS as u64);
     if !uart.init(bringup::INIT_BAUD) { return fail("stage=uart-init"); }
     if let Some(syn) = (uart.serror)() { return fail(&format!("stage=uart-init serror=0x{:016x}", syn)); }
 
@@ -287,6 +303,7 @@ fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready
                 None => log("fail stage=hci0-port"),
             }
         }
-        Err(e) => fail(&format!("stage={} err={:?} lsr_err={}", e.stage, e.kind, uart.line_errors)),
+        // lsr/msr: THRE (0x20) stuck clear with MSR.CTS (0x10) clear = flow control held.
+        Err(e) => fail(&format!("stage={} err={:?} lsr_err={} lsr={:#x} msr={:#x}", e.stage, e.kind, uart.line_errors, uart.r(LSR), uart.r(MSR))),
     }
 }

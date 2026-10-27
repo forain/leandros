@@ -265,6 +265,27 @@ pub const GROUP_UARTA: [PinConf; 4] = [
 /// BT_ON as GPIO (`bt_shutdown_pins`, no bias).
 pub const GROUP_BT_SHUTDOWN: [PinConf; 1] = [pc(29, "gpio", None)];
 
+/// Bluetooth controller power timing (Linux hci_bcm + btbcm): BT_ON held low
+/// long enough for the CYW43455 BT core to reset, then high and a settle
+/// before the first HCI command.
+pub const BT_OFF_MS: u32 = 50;
+pub const BT_ON_SETTLE_MS: u32 = 200;
+
+/// Bluetooth pins before power-up, as Linux applies the uarta `default`
+/// pinctrl state (`bt_shutdown_pins` + `uarta_24_pins`) while hci_bcm holds
+/// the shutdown line low: BT_ON becomes a GPIO driven low first (controller
+/// off, no glitch high), then GPIO 24-27 go to uart0 with the dts pulls.
+/// The firmware does not do this on D0 (all four read fsel 0 = gpio at boot).
+/// Returns the post-mux fsel of 24..27.
+pub fn bt_pins_prepare<P: Regs, G: Regs>(pc: &mut Pinctrl<P>, g: &mut Gpio<G>) -> Result<[u32; 4], PinError> {
+    pc.apply(&GROUP_BT_SHUTDOWN)?;
+    g.set_output(BT_ON, false).map_err(|_| PinError::Unavailable)?;
+    pc.apply(&GROUP_UARTA)?;
+    let mut f = [0; 4];
+    for (i, p) in (24..28).enumerate() { f[i] = pc.get_fsel(p).ok_or(PinError::NoPin)?; }
+    Ok(f)
+}
+
 pub struct Pinctrl<R: Regs> {
     pub regs: R,
     pub tab: &'static [Pin],
@@ -490,10 +511,19 @@ mod hw {
     pub fn pin_get_fsel(block: Block, pin: u32) -> Result<u32, PinError> {
         pinctrl(block)?.get_fsel(pin).ok_or(PinError::NoPin)
     }
+    pub fn pin_get_pull(block: Block, pin: u32) -> Result<u32, PinError> {
+        pinctrl(block)?.get_pull(pin).ok_or(PinError::NoPad)
+    }
     pub fn pin_get_function(block: Block, pin: u32) -> Result<&'static str, PinError> {
         pinctrl(block)?.get_function(pin).ok_or(PinError::NoPin)
     }
     /// Apply a pin group (e.g. [`GROUP_UARTA`]); returns the register writes made.
+    /// [`bt_pins_prepare`] on the live main pinctrl + gio blocks.
+    pub fn bt_pins_prepare_hw() -> Result<[u32; 4], PinError> {
+        let mut pc = pinctrl(Block::Main)?;
+        let mut g = gpio(Chip::Gio).map_err(|_| PinError::Unavailable)?;
+        bt_pins_prepare(&mut pc, &mut g)
+    }
     pub fn pin_apply(block: Block, group: &[PinConf]) -> Result<u32, PinError> {
         let mut p = pinctrl(block)?;
         let _l = RMW.lock();
