@@ -16,6 +16,7 @@ Options:
                              regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + proctest + chroottest + netctltest + sudotest + nmtest --quick (mock) + evherdtest + pollnarrowtest + listentagtest + vfstagtest + nettag2test + kparkstest + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
+                             serialxfer host:serialxfertest.py alone (serial push + kexec, scripts/pi-serial-*)
                              psklog   host:psklogtest.py alone (a cmdline wifi.psk= never reaches serial/klog/root or non-root /proc/cmdline)
                              pcibridge host:pcibridgetest.py alone (root port -> PCI bridge -> virtio-rng, own boot)
                              blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
@@ -178,6 +179,8 @@ SUITES = {
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
     "wifisim": ["host:wifisimtest.py"],
     "psklog": ["host:psklogtest.py"],
+    # lane piserialxfer: serial-console push (bootstrap + 5.6 MB) and kexec; leaves the VM kexec'd.
+    "serialxfer": ["host:serialxfertest.py"],
     # lane dtbres: devices behind PCIe root port -> PCI-PCI bridge (own boot).
     "pcibridge": ["host:pcibridgetest.py"],
     "blkslow": ["host:blkslowtest.py"],
