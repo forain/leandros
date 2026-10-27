@@ -50,7 +50,7 @@ died at the first clock request; nothing was ever written to TCM.
     [brcmf] files fw /lib/firmware/brcm/cyw43455-sdio.bin 609309B nvram 2074B clm 2676B rstvec 0x... <trailer>
     [brcmf] chip 4345 rev 6 cores 7 ram 0xc8000@0x198000 sr 0
     [brcmf] fw 609309 nvram ...@0x... rstvec 0x... sr 1 F2 ready t=...ms
-    [brcmf] clm 1 chunks / mac ... / ver wl0: ... 7.45.x
+    [brcmf] clm 2 chunks / mac ... / ver wl0: ... 7.45.x
 or `[brcmf] fail fw <err> stage=<kso|dl-clk-alp|passive|code|nvram|active|ht|sr-probe|f2>` +
 `[brcmf] diag ...` + `[brcmf] con: ...` lines + `[brcmf] ctl: waiting for commands in /etc/brcmf.ctl`.
 
