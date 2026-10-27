@@ -3004,6 +3004,7 @@ fn mcast_if_sid(ofd: u32, dst: IpAddress) -> Option<Sid> {
 
 mod listen;
 pub mod rxpolicy;
+pub mod latestack;
 mod mcast;
 mod udpany;
 mod syngate;
@@ -3066,10 +3067,18 @@ fn init_nic(nif: drivers::netdev::Netif) {
         listens: alloc::vec::Vec::new(),
         inet_seq: alloc::collections::BTreeMap::new(),
     };
-    *stack_for(iface::sid_of(nif.id)) = Some(stack);
+    let sid = iface::sid_of(nif.id);
+    *stack_for(sid) = Some(stack);
+    // A stack built after sockets that belong on every stack (wifi0: the
+    // MAC comes late) takes them over; at boot there are none yet.
+    let (nl, nu) = (listen::adopt(sid), udpany::adopt(sid));
 
     iface::serial(&[b"[NET] ", nif.name().as_bytes(), b": stack up (", nif.driver().as_bytes(),
                     if prelease { b", 10.0.2.15/24 until the lease)\r\n" as &[u8] } else { b")\r\n" }]);
+    if nl + nu != 0 {
+        let line = alloc::format!("[NET] {}: adopted {} listener(s), {} udp server(s)\r\n", nif.name(), nl, nu);
+        iface::serial(&[line.as_bytes()]);
+    }
 }
 
 /// Stand up the loopback stack. Unconditional, unlike the NICs': 127.0.0.1 has
@@ -4088,10 +4097,13 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
         // `listen`). NIC stacks exist from boot whether or not they hold an
         // address, so a listener follows every later lease, address change
         // and roam without being touched.
+        // Registered first: a stack built after this point (wifi0, once
+        // its MAC is known) adopts the listener (`listen::adopt`).
         let lid = listen::new_lid();
+        listen::register(lid, local);
         let mut any = false;
         for sid in listen::stacks_for(local) { any |= listen::create(sid, lid, local); }
-        if !any { return err_reply(-100); } // ENETDOWN
+        if !any { listen::destroy_all(lid); return err_reply(-100); } // ENETDOWN
 
         tbl.socks[slot].state = SockState::InetListening { lid, local };
         share_state(&mut *tbls, pid, slot);

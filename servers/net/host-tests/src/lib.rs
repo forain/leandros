@@ -5,11 +5,17 @@
 //! smoltcp with the kernel's feature set. The frames are what a Wi-Fi AP puts
 //! on the air right after association (brcmf hands them up as 802.3).
 
+extern crate alloc;
+
 #[path = "../../src/rxpolicy.rs"]
 pub mod rxpolicy;
+#[path = "../../src/latestack.rs"]
+pub mod latestack;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod latestack_tests;
 
 pub mod frames {
     pub const AP: [u8; 6] = [0x02, 0xa0, 0xb1, 0xc2, 0xd3, 0xe4];

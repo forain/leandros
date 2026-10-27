@@ -4197,6 +4197,7 @@ static RAMFS: &[RamEntry] = &[
     // as procfs reports).
     RamEntry { path: b"/proc/net/route", data: b"" },
     RamEntry { path: b"/proc/net/nic",   data: b"" },
+    RamEntry { path: b"/proc/net/listen", data: b"" },
     RamEntry { path: b"/proc/net/wifi",  data: b"" },
     RamEntry { path: b"/proc/net/tcp",   data: b"" },
     RamEntry { path: b"/proc/net/udp",   data: b"" },

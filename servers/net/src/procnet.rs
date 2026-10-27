@@ -172,6 +172,7 @@ pub fn generate(name: &[u8], out: &mut Vec<u8>) -> bool {
         b"udp"   => inet(&mut w, false),
         b"unix"  => unix(&mut w),
         b"nic"   => nic(&mut w),
+        b"listen" => super::listen::proc_listen(&mut w),
         b"igmp"  => {
             let mut t = alloc::string::String::new();
             crate::mcast::proc_igmp(&mut t);

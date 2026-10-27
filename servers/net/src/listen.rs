@@ -33,13 +33,16 @@
 //! NIC), a 127/8 one on loopback only, any other explicit address on every
 //! NIC stack with that address as smoltcp's listen filter — so it follows
 //! the address to whichever interface holds it, as on Linux. NIC stacks exist
-//! from boot (registration is write-once), so a listener needs no update when
+//! from boot (registration is write-once) except Wi-Fi's, built once its MAC
+//! is known, which adopts every registered listener (`adopt`, `latestack`);
+//! so a listener needs no update when
 //! an interface gains, loses or changes its address; and whatever happens to
 //! its sockets (a reset on address loss, a stuck handshake) `maintain` puts a
 //! LISTEN socket back.
 
 use super::*;
 use smoltcp::wire::IpListenEndpoint;
+use core::fmt::Write as _;
 
 /// Connections a listener holds before accept() takes them (handshakes in
 /// progress included), per stack. A SYN beyond that gets an RST.
@@ -114,10 +117,28 @@ fn new_arm(set: &mut SocketSet<'static>, ep: IpListenEndpoint) -> Option<SocketH
 pub(crate) fn create(sid: Sid, lid: u32, local: IpEndpoint) -> bool {
     let mut stack = stack_for(sid);
     let Some(s) = stack.as_mut() else { return false };
+    // Idempotent: listen() and a late stack's `adopt` may both get here.
+    if s.listens.iter().any(|l| l.lid == lid) { return true; }
     let ep = listen_ep(local);
     let Some(arm) = new_arm(&mut s.socket_set, ep) else { return false };
     s.listens.push(Listen { lid, ep, arm: Some(arm), queue: alloc::vec::Vec::new(), seq: 0, seen: alloc::vec::Vec::new() });
     true
+}
+
+/// Every live listener, for stacks built after it (`latestack`).
+static REGISTRY: Mutex<crate::latestack::Registry<IpEndpoint>> = Mutex::new(crate::latestack::Registry::new());
+
+/// Record listener `lid` before it is put on the existing stacks.
+pub(crate) fn register(lid: u32, local: IpEndpoint) { REGISTRY.lock().register(lid, local); }
+
+/// Stack `sid` was just built: put every registered listener that belongs
+/// on it there. Returns how many it carries. Caller holds no net lock.
+pub(crate) fn adopt(sid: Sid) -> usize {
+    let snap = REGISTRY.lock().snapshot();
+    crate::latestack::adopt(&snap, |local| stacks_for(*local).contains(&sid),
+        |lid, local| create(sid, lid, *local),
+        |lid| REGISTRY.lock().contains(lid),
+        |lid| destroy(sid, lid))
 }
 
 /// Take listener `lid` off every stack and wake its pollers: whoever is
@@ -125,6 +146,7 @@ pub(crate) fn create(sid: Sid, lid: u32, local: IpEndpoint) -> bool {
 /// connect(AF_UNSPEC)) re-probes and sees the socket's new state. Takes one
 /// stack lock at a time; none is held across the wake.
 pub(crate) fn destroy_all(lid: u32) {
+    REGISTRY.lock().unregister(lid);
     for sid in all_sids() { destroy(sid, lid); }
     sched::wake_poll_key(wake_key(lid));
 }
@@ -309,4 +331,37 @@ pub(crate) fn backlog(lid: u32) -> (usize, usize) {
         }
     }
     (syn, est)
+}
+
+/// `/proc/net/listen`: every listener on every stack, then each registered
+/// listener with how many of the stacks it belongs on carry it. A line
+/// `missing` names a stack that should hold a listener and does not (the
+/// symptom lane pisshrace fixed: SYNs on that interface get an RST).
+pub(crate) fn proc_listen(w: &mut dyn core::fmt::Write) {
+    let name = |sid: Sid| -> alloc::string::String {
+        if sid == LO { return "lo".into(); }
+        drivers::netdev::iter().find(|n| iface::sid_of(n.id) == sid)
+            .map(|n| alloc::string::String::from(n.name())).unwrap_or_else(|| alloc::format!("sid{}", sid))
+    };
+    let mut have: alloc::vec::Vec<(Sid, u32)> = alloc::vec::Vec::new();
+    for sid in all_sids() {
+        let nm = name(sid);
+        let mut stack = stack_for(sid);
+        let Some(s) = stack.as_mut() else { let _ = writeln!(w, "{} nostack", nm); continue };
+        for l in s.listens.iter() {
+            have.push((sid, l.lid));
+            let arm = match l.arm {
+                Some(h) => alloc::format!("{:?}", s.socket_set.get::<tcp::Socket>(h).state()),
+                None => "none".into(),
+            };
+            let _ = writeln!(w, "{} lid {} port {} arm {} queue {}", nm, l.lid, l.ep.port, arm, l.queue.len());
+        }
+    }
+    for (lid, local) in REGISTRY.lock().snapshot() {
+        let want = stacks_for(local);
+        let on = want.iter().filter(|sid| have.contains(&(**sid, lid))).count();
+        let _ = write!(w, "registered lid {} {} on {}/{}", lid, local, on, want.len());
+        for sid in want.iter().filter(|sid| !have.contains(&(**sid, lid))) { let _ = write!(w, " missing {}", name(*sid)); }
+        let _ = writeln!(w);
+    }
 }
