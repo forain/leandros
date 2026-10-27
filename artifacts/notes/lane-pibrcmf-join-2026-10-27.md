@@ -38,7 +38,7 @@ What changed (drivers/src/brcmf/cfg.rs, netdev.rs):
   against an in-test authenticator (M2 MIC checked, PTK/GTK in wsec_key match); forcing `supwpa=1` on the same
   mock fails exactly as the Pi did, with `fail_cmd` = `iovar sup_wpa=1 -> Status(-23)`; PMK form order; the
   method and sec knobs; wsec_key layout; ctl parse.
-- check-rpi5.sh rpi5 + raspi4b clean (no brcmf warnings). aarch64 Mac nettest PASS; box aarch64 full regress: see merge.
+- check-rpi5.sh rpi5 + raspi4b clean (no brcmf warnings). aarch64 Mac nettest PASS; box aarch64 full regress 53 suites, 0 bad (incl. wifisimtest).
 
 ## Open
 - Unproven on hardware: whether the -23 is `sup_wpa` (expected) or WLC_SET_WSEC_PMK, and the wsec_key layout
