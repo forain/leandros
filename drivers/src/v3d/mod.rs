@@ -170,7 +170,7 @@ mod hw {
             map(HUB_PHYS, HUB_SIZE),
             map(CORE0_PHYS, CORE0_SIZE),
             map(SMS_PHYS, SMS_SIZE),
-            map(PM_PHYS, PM_SIZE),
+            crate::rpi_pm::base(), // shared PM window (rpi_pm.rs)
             map(crate::rpi_mailbox::MBOX_BASE_PHYS as u64, 0x40),
         ) {
             (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, c, d, e),

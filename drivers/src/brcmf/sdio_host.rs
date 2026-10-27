@@ -642,7 +642,7 @@ pub fn read_chip_id<B: SdioBus>(bus: &mut B) -> Result<(u32, bool), BusError> {
 
 // ── Raspberry Pi 5 hardware: power path, pin mux, MMIO, boot probe ───────────
 #[cfg(feature = "rpi5")]
-pub use hw::{boot_probe, take_host, Mmio, PROBE_STATE};
+pub use hw::{boot_probe, gio_drive, probe, take_host, Mmio, GIO_PHYS, PINCTRL_PHYS, PROBE_STATE};
 
 #[cfg(feature = "rpi5")]
 mod hw {
@@ -730,8 +730,15 @@ mod hw {
         alloc::format!("pinmux={:?} sd2-fsel-before={:06x} writes={}", st, before, changed)
     }
 
-    fn wl_reg_on(gio: usize, on: bool) {
-        let bit = 1u32 << WL_REG_ON_GPIO;
+    /// Serialises read-modify-write of the shared gio bank (WL_REG_ON here,
+    /// BT_ON in `bt::boot`, possibly on different threads).
+    static GIO_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Drives `gio` bank pin `pin` (0..31) as an output, high or low. `gio` is
+    /// the mapped [`GIO_PHYS`] window.
+    pub fn gio_drive(gio: usize, pin: u32, on: bool) {
+        let bit = 1u32 << pin;
+        let _g = GIO_LOCK.lock();
         unsafe {
             let d = rd32(gio + GIO_DATA);
             wr32(gio + GIO_DATA, if on { d | bit } else { d & !bit });
@@ -740,18 +747,34 @@ mod hw {
         }
     }
 
+    fn wl_reg_on(gio: usize, on: bool) { gio_drive(gio, WL_REG_ON_GPIO, on) }
+
     fn map(phys: u64, len: usize) -> Option<usize> { mm::kva::ioremap(phys, len, mm::kva::CacheMode::Uncached) }
 
     /// Boot probe: power the CYW43455, bring sdio2 up as an SDIO host, print the
     /// card identity and the chip id. Inert on failure (one line, WL_REG_ON
     /// dropped again, host left in reset); never waits more than ~2 s.
-    pub fn boot_probe() {
+    /// Mappings made once (the probe re-runs from `brcmfctl retry`).
+    static MAPS: Mutex<Option<(usize, usize, usize, usize)>> = Mutex::new(None);
+
+    pub fn boot_probe() { probe(20_000, WL_ON_STARTUP_US as u32) }
+
+    /// The whole probe: host quiesce, WL_REG_ON low for `off_us`, high and
+    /// `on_us` settle, SDIO init, chip id, host parked. Re-runnable: a parked
+    /// host from an earlier run is dropped first.
+    pub fn probe(off_us: u32, on_us: u32) {
         let t0 = sched::monotonic_ns() / 1_000;
-        let (host, cfg, gio, pc) = match (map(SDIO2_HOST_PHYS, 0x100), map(SDIO2_CFG_PHYS, 0x100),
-                                          map(GIO_PHYS, 0x40), map(PINCTRL_PHYS, 0x30)) {
-            (Some(h), Some(c), Some(g), Some(p)) => (h, c, g, p),
-            _ => { PROBE_STATE.store(4, Ordering::Relaxed); log("FAIL stage=map"); return; }
+        drop(HOST.lock().take());
+        let cached = *MAPS.lock();
+        let maps = cached.or_else(|| match (map(SDIO2_HOST_PHYS, 0x100), map(SDIO2_CFG_PHYS, 0x100),
+                                            map(GIO_PHYS, 0x40), map(PINCTRL_PHYS, 0x30)) {
+            (Some(h), Some(c), Some(g), Some(p)) => Some((h, c, g, p)),
+            _ => None,
+        });
+        let Some((host, cfg, gio, pc)) = maps else {
+            PROBE_STATE.store(4, Ordering::Relaxed); log("FAIL stage=map"); return;
         };
+        *MAPS.lock() = Some((host, cfg, gio, pc));
         let st = bcm2712_id::stepping().stepping;
         let mux = pinmux(pc, st);
         // Force card presence (non-removable) and select SD pin timing.
@@ -775,9 +798,9 @@ mod hw {
             q.w8(REG_POWER_CONTROL, 0);
         }
         wl_reg_on(gio, false);
-        sched::kthread::udelay(20_000);
+        sched::kthread::udelay(off_us.max(1_000) as u64);
         wl_reg_on(gio, true);
-        sched::kthread::udelay(WL_ON_STARTUP_US as u64);
+        sched::kthread::udelay(on_us as u64);
 
         let mut h = SdioHost::new(Mmio { host });
         h.deadline_us = Some(t0 + PROBE_BUDGET_US);

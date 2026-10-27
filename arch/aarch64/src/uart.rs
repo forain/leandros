@@ -295,6 +295,7 @@ unsafe fn putc_within(c: u8, wait_ticks: u64, wedged: &core::sync::atomic::Atomi
             // with IRQs masked (syscalls do), long enough for a pasted line
             // to overrun the 32-byte RX FIFO. Keep RX moving meanwhile.
             if fr & FR_RXFE == 0 { rx_rescue(); }
+            gap_mark();
             if cntvct_raw().wrapping_sub(deadline) < (1u64 << 63) {
                 wedged.store(true, Relaxed);
                 UART_TX_DROPPED.fetch_add(1, Relaxed);
@@ -361,6 +362,62 @@ unsafe fn rx_rescue() {
         UART_RX_RESCUED.fetch_add(n, Relaxed);
         super::gic::pend_uart_irq();
     }
+}
+
+/// Service the RX FIFO from inside a long IRQ-masked section (console write,
+/// framebuffer scroll/blit): one FR read, and `rx_rescue` when bytes wait.
+/// Also a service point for the `txgap` measurement.
+pub fn rx_poll() {
+    unsafe {
+        if UART_BASE_ADDR == 0 { return; }
+        gap_mark();
+        if rd(FR) & FR_RXFE == 0 { rx_rescue(); }
+    }
+}
+
+/// `txgap`: the longest stretch of a console write (`tx_window_begin` ..
+/// `tx_window_end`) that went without an RX service point (`rx_poll`, or a
+/// TX-wait iteration, which also samples RX). Console writes run with IRQs
+/// masked, so this is the IRQ-off window the console output path imposes on
+/// RX; it must stay well under one RX FIFO (32 bytes = ~2.8 ms at 115200).
+/// CNTVCT ticks; 0 = no window open.
+static TXGAP_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TXGAP_MAX_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Longest cpu0 timer-interrupt lateness (the tick fired this long after its
+/// grid point): an upper bound on any IRQ-masked section on the CPU the RX
+/// interrupt targets, console or not. CNTVCT ticks; see `timer::on_tick`.
+pub static IRQ_LATE_MAX_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[inline(always)]
+fn gap_mark() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let last = TXGAP_LAST.load(Relaxed);
+    if last == 0 { return; }
+    let now = unsafe { cntvct_raw() };
+    TXGAP_MAX_TICKS.fetch_max(now.wrapping_sub(last), Relaxed);
+    TXGAP_LAST.store(now, Relaxed);
+}
+
+pub fn tx_window_begin() {
+    TXGAP_LAST.store(unsafe { cntvct_raw() } | 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn tx_window_end() {
+    gap_mark();
+    TXGAP_LAST.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// CNTVCT ticks -> microseconds.
+pub fn ticks_to_us(t: u64) -> u64 {
+    let f: u64;
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack)); }
+    if f == 0 { 0 } else { (t as u128 * 1_000_000 / f as u128) as u64 }
+}
+
+/// `(txgap_max_us, irq_late_max_us)` for the `[uart]` line and /proc/kiostat.
+pub fn irqoff_stats_us() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (ticks_to_us(TXGAP_MAX_TICKS.load(Relaxed)), ticks_to_us(IRQ_LATE_MAX_TICKS.load(Relaxed)))
 }
 
 /// Interrupts taken by the console UART (`exception::uart_irq`).

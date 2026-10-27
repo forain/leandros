@@ -12,7 +12,8 @@
 //!
 //! API:
 //! - `probe()` — after `brcmstb_pcie::init`; maps BAR1, prints `[rp1] chip_id=..`,
-//!   sets up MIP0 and the MSI-X table (all vectors masked). Idempotent.
+//!   sets up MIP0 and the MSI-X table (all vectors masked), then the clocks
+//!   (`rp1_clk`), GPIO (`rp1_gpio`), PWR LED, fan (`rp1_fan`) and the GEM. Idempotent.
 //! - `bar1() -> Option<(usize, u64)>` — VA and size of the peripheral BAR;
 //!   a peripheral at DTB address 0xc0_4000_0000 + X is at `bar1().0 + X`.
 //! - `request_irq(n, level, handler, ctx) -> Result<IrqHandle, IrqError>`
@@ -69,7 +70,12 @@ pub fn probe() {
         Some(n) => { log("[rp1] msix vectors="); hex(n as u64); log(" via mip0 spi 128\n"); }
         None => log("[rp1] FAIL msix\n"),
     }
-    attach_gem(va);
+    crate::rp1_gpio::init(va);
+    let clocks_ok = crate::rp1_clk::init(va);
+    crate::pi5_board::rp1_ready();
+    crate::rp1_fan::init(va);
+    attach_gem(va, clocks_ok);
+    crate::rp1_usb::attach(va, size);
 }
 
 /// `rp1.irq=1`: deliver the GEM interrupt over MSI-X → MIP → GIC instead of
@@ -77,19 +83,11 @@ pub fn probe() {
 pub static GEM_IRQ: AtomicBool = AtomicBool::new(false);
 
 /// Pulses the BCM54213PE reset (RP1 GPIO 32, active low, 5 ms) and hands the
-/// GEM to `macb`. RP1 clocks are left as RP1 comes out of reset.
-fn attach_gem(bar1: usize) {
-    if let Some((ctrl, rio, pad, bit)) = hw::rp1_gpio_regs(hw::RP1_ETH_PHY_RESET_GPIO) {
-        let w = |o: usize, v: u32| unsafe { leandros_lib::mmio::write((bar1 + o) as *mut u32, v) };
-        let r = |o: usize| unsafe { leandros_lib::mmio::read((bar1 + o) as *const u32) };
-        w(rio + hw::RIO_SET + hw::RIO_OUT, bit); // deasserted (high) before driving
-        w(rio + hw::RIO_SET + hw::RIO_OE, bit);
-        w(pad, (r(pad) & !hw::RP1_PAD_OD) | hw::RP1_PAD_IE);
-        w(ctrl, (r(ctrl) & !0x1f) | hw::RP1_FSEL_SYS_RIO);
-        w(rio + hw::RIO_CLR + hw::RIO_OUT, bit);
-        sched::kthread::msleep(5);
-        w(rio + hw::RIO_SET + hw::RIO_OUT, bit);
-        sched::kthread::msleep(5);
+/// GEM to `macb`, unless its clocks could not be enabled (an unclocked GEM
+/// would stall the bus on the first register read).
+fn attach_gem(bar1: usize, clocks_ok: bool) {
+    if !clocks_ok { log("[rp1] FAIL gem clocks off, macb not attached\n"); return; }
+    if crate::rp1_gpio::reset_pulse_active_low(crate::rp1_hw::ETH_PHY_RESET_GPIO, 5) {
         log("[rp1] eth phy reset pulsed (gpio32)\n");
     }
     let irq_wired = GEM_IRQ.load(Ordering::Relaxed)
