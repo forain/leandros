@@ -24,6 +24,7 @@ extern crate alloc;
 use ipc::{Message, port};
 use drivers::snd::VirtioSnd;
 use drivers::hda::Hda;
+use drivers::hdmi_audio::HdmiAudio;
 use drivers::Driver;
 use drivers::pci;
 
@@ -34,38 +35,46 @@ enum Backend {
     None,
     Virtio(VirtioSnd),
     Hda(Hda),
+    Hdmi(HdmiAudio),
 }
 
 impl Backend {
     fn reconfigure_stream(&mut self, id: u32, freq: u32, ch: u8) {
         match self { Backend::Virtio(d) => d.reconfigure_stream(id, freq, ch),
-                     Backend::Hda(d) => d.reconfigure_stream(id, freq, ch), Backend::None => {} }
+                     Backend::Hda(d) => d.reconfigure_stream(id, freq, ch),
+                     Backend::Hdmi(d) => d.reconfigure_stream(id, freq, ch), Backend::None => {} }
     }
     fn send_pcm_data(&mut self, data: &[u8]) -> usize {
         match self { Backend::Virtio(d) => d.send_pcm_data(data),
-                     Backend::Hda(d) => d.send_pcm_data(data), Backend::None => 0 }
+                     Backend::Hda(d) => d.send_pcm_data(data),
+                     Backend::Hdmi(d) => d.send_pcm_data(data), Backend::None => 0 }
     }
     fn tx_used_idx(&self) -> u16 {
-        match self { Backend::Virtio(d) => d.tx_used_idx(), Backend::Hda(d) => d.tx_used_idx(), Backend::None => 0 }
+        match self { Backend::Virtio(d) => d.tx_used_idx(), Backend::Hda(d) => d.tx_used_idx(),
+                     Backend::Hdmi(d) => d.tx_used_idx(), Backend::None => 0 }
     }
     /// Bytes queued in the device ahead of the DAC.
     fn queued_bytes(&self) -> usize {
         match self {
             Backend::Virtio(d) => d.tx_level() as usize * drivers::snd::TX_BUF_BYTES,
             Backend::Hda(d) => d.queued_bytes() as usize,
+            Backend::Hdmi(d) => d.queued_bytes() as usize,
             Backend::None => 0,
         }
     }
     fn top_up_silence(&mut self) {
-        match self { Backend::Virtio(d) => d.top_up_silence(), Backend::Hda(d) => d.top_up_silence(), Backend::None => {} }
+        match self { Backend::Virtio(d) => d.top_up_silence(), Backend::Hda(d) => d.top_up_silence(),
+                     Backend::Hdmi(d) => d.top_up_silence(), Backend::None => {} }
     }
     fn recover_stream(&mut self) {
-        match self { Backend::Virtio(d) => d.recover_stream(), Backend::Hda(d) => d.recover_stream(), Backend::None => {} }
+        match self { Backend::Virtio(d) => d.recover_stream(), Backend::Hda(d) => d.recover_stream(),
+                     Backend::Hdmi(d) => d.recover_stream(), Backend::None => {} }
     }
     fn info(&mut self) -> alloc::string::String {
         match self {
             Backend::Virtio(_) => alloc::string::String::from("backend: virtio-sound\n"),
             Backend::Hda(d) => d.info(),
+            Backend::Hdmi(d) => d.info(),
             Backend::None => alloc::string::String::from("backend: none\n"),
         }
     }
@@ -309,6 +318,9 @@ fn err_reply(e: i32) -> Message { make_reply(e as i64) }
 
 /// `cmdline`: the kernel command line. `snd.backend=auto` (default:
 /// virtio-sound when present, else Intel HD Audio), `virtio` or `hda`.
+/// True once `init` found a device and registered the server.
+pub fn is_initialized() -> bool { STATE.lock().initialized }
+
 pub fn init(cmdline: &str) -> Result<u32, i32> {
     let mut state = STATE.lock();
 
@@ -327,8 +339,15 @@ pub fn init(cmdline: &str) -> Result<u32, i32> {
             state.snd_driver = Backend::Hda(h);
         }
     }
+    if matches!(state.snd_driver, Backend::None) && (want == "auto" || want == "hdmi") {
+        let mut h = HdmiAudio::new();
+        if h.probe(cmdline).is_ok() {
+            pci::serial_debug("[PW] playback device: HDMI audio (hdmi0)\n");
+            state.snd_driver = Backend::Hdmi(h);
+        }
+    }
     if matches!(state.snd_driver, Backend::None) {
-        pci::serial_debug("[PW] no sound device (virtio-sound or HD Audio)\n");
+        pci::serial_debug("[PW] no sound device (virtio-sound, HD Audio or HDMI)\n");
         return Err(-19); // ENODEV
     }
 
@@ -427,6 +446,7 @@ pub fn shutdown(link_reset: bool) -> (alloc::string::String, Option<drivers::pci
             (alloc::format!("HD Audio: {}", h.shutdown(link_reset, 300_000)), f)
         }
         Backend::Virtio(_) => (alloc::string::String::from("virtio-sound: nothing to do"), None),
+        Backend::Hdmi(_) => (alloc::string::String::from("hdmi audio: nothing to do"), None),
         Backend::None => (alloc::string::String::from("no sound device"), None),
     }
 }
