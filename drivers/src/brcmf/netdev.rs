@@ -64,6 +64,8 @@ static FW_VER: Mutex<String> = Mutex::new(String::new());
 static SCAN_INFO: Mutex<String> = Mutex::new(String::new());
 static JOIN_INFO: Mutex<String> = Mutex::new(String::new());
 static COUNTERS: Mutex<String> = Mutex::new(String::new());
+static FW_CAPS: Mutex<String> = Mutex::new(String::new());
+static JOIN_OPTS: Mutex<String> = Mutex::new(String::new());
 /// The last `[brcmf]` lines (boot lines included), so they can be read with
 /// no serial capture and no grep.
 static LOG_RING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
@@ -103,6 +105,7 @@ pub fn kernel_env() -> Env {
         now_ms: || sched::monotonic_ns() / 1_000_000,
         sleep_ms: |ms| sched::kthread::msleep(ms),
         log,
+        random: |b| sched::random::fill(b),
     }
 }
 
@@ -265,11 +268,11 @@ pub fn info_lines(out: &mut String) {
     let ms = MAC_SRC.lock();
     let _ = writeln!(out, "mac_source: {}", if ms.is_empty() { "unknown (not reached)" } else { ms.as_str() });
     drop(ms);
-    for (k, m) in [("last_scan", &SCAN_INFO), ("last_join", &JOIN_INFO), ("counters", &COUNTERS)] {
+    for (k, m) in [("caps", &FW_CAPS), ("join_opts", &JOIN_OPTS), ("last_scan", &SCAN_INFO), ("last_join", &JOIN_INFO), ("counters", &COUNTERS)] {
         let g = m.lock();
         let _ = writeln!(out, "{}: {}", k, if g.is_empty() { "none" } else { g.as_str() });
     }
-    let _ = writeln!(out, "ctl: /etc/brcmf.ctl (brcmfctl status|scan|join [ssid=..]|diag|retry)");
+    let _ = writeln!(out, "ctl: /etc/brcmf.ctl (brcmfctl status|scan|join [method=auto|joiniovar|setssid supwpa=auto|1|0 pmk=auto|raw|hex|passphrase sec=auto|ioctl|iovar mfp=auto|0|1|2 wpaie=1|0 reset] [ssid=..]|diag|retry)");
     if RUNNING.load(Ordering::Acquire) { MGR.info_lines(out); }
     let _ = writeln!(out, "log (last {} [brcmf] lines):", LOG_KEEP);
     for l in LOG_RING.lock().iter() { let _ = writeln!(out, "  {}", l); }
@@ -348,6 +351,8 @@ impl<F: Fwil> BrcmfRadio<F> {
         if now < self.next_ctl_ms { return; }
         self.next_ctl_ms = now + CTL_POLL_MS;
         *COUNTERS.lock() = self.dev.counters_line();
+        *FW_CAPS.lock() = self.dev.caps.clone().unwrap_or_else(|| String::from("unknown (cap refused)"));
+        *JOIN_OPTS.lock() = self.dev.opts.describe();
         let Some(text) = self.ctl.as_mut().and_then(|c| c.poll()) else { return };
         let text = String::from(text.trim());
         match cfg::parse_ctl(&text) {
@@ -369,7 +374,13 @@ impl<F: Fwil> BrcmfRadio<F> {
                     Err(f) => log(&alloc::format!("ctl: scan failed: {}", f.msg)),
                 }
             }
-            cfg::CtlCmd::Join(ssid) => self.ctl_join(ssid),
+            cfg::CtlCmd::Join { ssid, knobs } => {
+                let bad = self.dev.opts.apply(&knobs);
+                if !bad.is_empty() { log(&alloc::format!("ctl: join: unknown knob(s) {:?} ignored", bad)); }
+                *JOIN_OPTS.lock() = self.dev.opts.describe();
+                log(&alloc::format!("ctl: join opts: {}", self.dev.opts.describe()));
+                self.ctl_join(ssid)
+            }
             cfg::CtlCmd::Diag(lines) => {
                 log(&alloc::format!("ctl: diag: {}", self.dev.counters_line()));
                 if let Some(c) = self.ctl.as_mut() { c.diag(&mut self.dev.fw, lines); }
@@ -411,7 +422,10 @@ impl<F: Fwil> BrcmfRadio<F> {
         let r = self.dev.join(req, &mut Obs { cx: None }, JOIN_TIMEOUT_MS);
         let line = match &r {
             Ok(()) => alloc::format!("ctl join '{}': OK (rate {} kbit/s); left again, autoconnect takes over", name, self.dev.rate_kbps()),
-            Err(e) => alloc::format!("ctl join '{}': FAILED {:?} -> {}", name, e, join_fail(*e).msg),
+            Err(e @ JoinFail::Fw(_)) => alloc::format!("ctl join '{}': FAILED {:?} at '{}' [{}] -> {}", name, e, self.dev.fail_cmd,
+                                                       self.dev.opts.describe(), join_fail(*e).msg),
+            Err(e) => alloc::format!("ctl join '{}': FAILED {:?} (handshake: {}) [{}] -> {}", name, e, self.dev.sup_used,
+                                     self.dev.opts.describe(), join_fail(*e).msg),
         };
         log(&line);
         *JOIN_INFO.lock() = line;

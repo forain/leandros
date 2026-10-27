@@ -3,8 +3,11 @@
 //! only against the frozen [`Fwil`] / [`RxSink`] seam, so it runs the same
 //! over the real BCDC/SDPCM stack and over the host tests' mock.
 //!
-//! The firmware does the MLME and the 4-way handshake ("sup_wpa"); the host
-//! only configures security, asks to join, and follows the events:
+//! The firmware does the MLME. The 4-way handshake runs in the firmware
+//! ("sup_wpa" 1, when the firmware has `idsup`) or on the host
+//! ([`crate::wifi_crypto::Supplicant`] over EAPOL data frames, keys installed
+//! with "wsec_key"); see [`JoinOpts`]. The host configures security, asks to
+//! join, and follows the events:
 //!
 //! * join done = `LINK` with the link flag, plus (keyed networks) `PSK_SUP`
 //!   with status FWSUP_COMPLETED;
@@ -46,6 +49,12 @@ pub const WPA2_AUTH_PSK: u32 = 0x80;
 /// runs PBKDF2 itself).
 pub const WSEC_PASSPHRASE: u16 = 1;
 pub const PMK_STRUCT_LEN: usize = 70;
+/// `brcmf_wsec_key_le` (164 bytes) and its constants.
+pub const WSEC_KEY_LEN: usize = 164;
+pub const CRYPTO_ALGO_TKIP: u32 = 2;
+pub const CRYPTO_ALGO_AES_CCM: u32 = 4;
+pub const BRCMF_PRIMARY_KEY: u32 = 1 << 1;
+const ETH_P_PAE: [u8; 2] = [0x88, 0x8e];
 pub const ESCAN_REQ_VERSION: u32 = 1;
 pub const ESCAN_ACTION_START: u16 = 1;
 pub const ESCAN_ACTION_ABORT: u16 = 3;
@@ -62,6 +71,8 @@ pub struct Env {
     pub sleep_ms: fn(u64),
     /// One line, no `[brcmf]` prefix, no newline. Never given secrets.
     pub log: fn(&str),
+    /// Fill with random bytes (the host supplicant's SNonce).
+    pub random: fn(&mut [u8]),
 }
 
 fn le16(b: &[u8], o: usize) -> u16 { u16::from_le_bytes([b[o], b[o + 1]]) }
@@ -267,27 +278,150 @@ pub fn join_params(ssid: &[u8], bssid: Option<[u8; 6]>, channel: u8) -> Vec<u8> 
     p
 }
 
-/// `brcmf_wsec_pmk_le` (70 bytes).
-pub fn wsec_pmk(key: &Key) -> [u8; PMK_STRUCT_LEN] {
+/// `brcmf_wsec_pmk_le` (70 bytes) for WLC_SET_WSEC_PMK in the given form:
+/// * `Raw`: the 32-byte PSK, flags 0 (Linux `brcmf_set_pmk` since 4.18);
+/// * `Hex`: the PSK as 64 hex digits with WSEC_PASSPHRASE (Linux 4.13..4.17);
+/// * `Passphrase`: the ASCII passphrase with WSEC_PASSPHRASE (the firmware
+///   runs PBKDF2; Linux uses this form only for SAE).
+/// None when the form needs a passphrase the key does not have.
+pub fn wsec_pmk(key: &Key, ssid: &[u8], form: PmkForm) -> Option<[u8; PMK_STRUCT_LEN]> {
     let mut p = [0u8; PMK_STRUCT_LEN];
-    match key {
-        Key::Open => {}
-        Key::Passphrase(s) => {
+    match (key, form) {
+        (Key::Open, _) => {}
+        (Key::Passphrase(s), PmkForm::Passphrase) => {
             let l = s.len().min(64);
             p[0..2].copy_from_slice(&(l as u16).to_le_bytes());
             p[2..4].copy_from_slice(&WSEC_PASSPHRASE.to_le_bytes());
             p[4..4 + l].copy_from_slice(&s[..l]);
         }
-        Key::Pmk(k) => {
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            p[0..2].copy_from_slice(&64u16.to_le_bytes());
-            for (i, b) in k.iter().enumerate() {
-                p[4 + 2 * i] = HEX[(b >> 4) as usize];
-                p[5 + 2 * i] = HEX[(b & 15) as usize];
+        (Key::Pmk(_), PmkForm::Passphrase) => return None,
+        (k, f) => {
+            let mut psk = k.psk(ssid)?;
+            if f == PmkForm::Hex {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                p[0..2].copy_from_slice(&64u16.to_le_bytes());
+                p[2..4].copy_from_slice(&WSEC_PASSPHRASE.to_le_bytes());
+                for (i, b) in psk.iter().enumerate() {
+                    p[4 + 2 * i] = HEX[(b >> 4) as usize];
+                    p[5 + 2 * i] = HEX[(b & 15) as usize];
+                }
+            } else {
+                p[0..2].copy_from_slice(&32u16.to_le_bytes());
+                p[4..36].copy_from_slice(&psk);
             }
+            for b in psk.iter_mut() { unsafe { core::ptr::write_volatile(b, 0) } }
         }
     }
+    Some(p)
+}
+
+/// `brcmf_wsec_key_le` for the "wsec_key" iovar: a pairwise key (`ea` = the
+/// AP, flags 0) or a group key (`ea` zero, BRCMF_PRIMARY_KEY), as Linux
+/// `brcmf_add_keyext` / `brcmf_cfg80211_add_key` send them. A 32-byte TKIP
+/// key has its MIC halves swapped (station mode), as brcmfmac does.
+pub fn wsec_key(index: u32, key: &[u8], ea: Option<[u8; 6]>) -> [u8; WSEC_KEY_LEN] {
+    let mut p = [0u8; WSEC_KEY_LEN];
+    let l = key.len().min(32);
+    p[0..4].copy_from_slice(&index.to_le_bytes());
+    p[4..8].copy_from_slice(&(l as u32).to_le_bytes());
+    p[8..8 + l].copy_from_slice(&key[..l]);
+    let algo = if l == 32 {
+        p[24..32].copy_from_slice(&key[24..32]);
+        p[32..40].copy_from_slice(&key[16..24]);
+        CRYPTO_ALGO_TKIP
+    } else { CRYPTO_ALGO_AES_CCM };
+    p[112..116].copy_from_slice(&algo.to_le_bytes());
+    let flags = if ea.is_some() { 0 } else { BRCMF_PRIMARY_KEY };
+    p[116..120].copy_from_slice(&flags.to_le_bytes());
+    if let Some(ea) = ea { p[156..162].copy_from_slice(&ea); }
     p
+}
+
+// ── join options (live-tunable over /etc/brcmf.ctl) ────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinMethod { Auto, JoinIovar, SetSsid }
+/// Who runs the 4-way handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupMode { Auto, Firmware, Host }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PmkForm { Auto, Raw, Hex, Passphrase }
+/// How auth / wsec / wpa_auth are set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecPath { Auto, Ioctl, Iovar }
+
+/// Join knobs. `Auto` = what Linux brcmfmac does, with logged fallbacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinOpts {
+    pub method: JoinMethod,
+    pub sup: SupMode,
+    pub pmk: PmkForm,
+    pub sec: SecPath,
+    /// None = set "mfp" 0 only if the firmware advertises `mfp`.
+    pub mfp: Option<u32>,
+    /// Set "wpaie" (our RSN IE) before joining.
+    pub wpaie: bool,
+}
+
+impl Default for JoinOpts {
+    fn default() -> Self {
+        JoinOpts { method: JoinMethod::Auto, sup: SupMode::Auto, pmk: PmkForm::Auto, sec: SecPath::Auto, mfp: None, wpaie: true }
+    }
+}
+
+impl JoinOpts {
+    /// Apply knob words (`method= supwpa= pmk= sec= mfp= wpaie=`); `reset`
+    /// starts from the defaults. Unknown words are returned.
+    pub fn apply<'a>(&mut self, words: &[&'a str]) -> Vec<&'a str> {
+        let mut bad = Vec::new();
+        for w in words {
+            let (k, v) = match w.split_once('=') { Some(kv) => kv, None => (*w, "") };
+            let ok = match (k, v) {
+                ("reset", _) => { *self = JoinOpts::default(); true }
+                ("method", "auto") => { self.method = JoinMethod::Auto; true }
+                ("method", "joiniovar") | ("method", "join") => { self.method = JoinMethod::JoinIovar; true }
+                ("method", "setssid") => { self.method = JoinMethod::SetSsid; true }
+                ("supwpa", "auto") => { self.sup = SupMode::Auto; true }
+                ("supwpa", "1") | ("sup", "fw") => { self.sup = SupMode::Firmware; true }
+                ("supwpa", "0") | ("sup", "host") => { self.sup = SupMode::Host; true }
+                ("pmk", "auto") => { self.pmk = PmkForm::Auto; true }
+                ("pmk", "raw") => { self.pmk = PmkForm::Raw; true }
+                ("pmk", "hex") => { self.pmk = PmkForm::Hex; true }
+                ("pmk", "passphrase") => { self.pmk = PmkForm::Passphrase; true }
+                ("sec", "auto") => { self.sec = SecPath::Auto; true }
+                ("sec", "ioctl") => { self.sec = SecPath::Ioctl; true }
+                ("sec", "iovar") => { self.sec = SecPath::Iovar; true }
+                ("mfp", "auto") => { self.mfp = None; true }
+                ("mfp", n) => match n.parse::<u32>() { Ok(n) if n <= 2 => { self.mfp = Some(n); true } _ => false },
+                ("wpaie", "1") => { self.wpaie = true; true }
+                ("wpaie", "0") => { self.wpaie = false; true }
+                _ => false,
+            };
+            if !ok { bad.push(*w); }
+        }
+        bad
+    }
+
+    pub fn describe(&self) -> alloc::string::String {
+        let m = match self.method { JoinMethod::Auto => "auto", JoinMethod::JoinIovar => "joiniovar", JoinMethod::SetSsid => "setssid" };
+        let s = match self.sup { SupMode::Auto => "auto", SupMode::Firmware => "1", SupMode::Host => "0" };
+        let p = match self.pmk { PmkForm::Auto => "auto", PmkForm::Raw => "raw", PmkForm::Hex => "hex", PmkForm::Passphrase => "passphrase" };
+        let c = match self.sec { SecPath::Auto => "auto", SecPath::Ioctl => "ioctl", SecPath::Iovar => "iovar" };
+        let f = match self.mfp { None => alloc::string::String::from("auto"), Some(n) => alloc::format!("{}", n) };
+        alloc::format!("method={} supwpa={} pmk={} sec={} mfp={} wpaie={}", m, s, p, c, f, self.wpaie as u8)
+    }
+}
+
+/// Host 4-way handshake state for one join (sup_wpa 0).
+struct HostSup {
+    pmk: [u8; 32],
+    rsn_ie: Vec<u8>,
+    sup: Option<crate::wifi_crypto::Supplicant>,
+    ap: [u8; 6],
+}
+
+impl Drop for HostSup {
+    fn drop(&mut self) { for b in self.pmk.iter_mut() { unsafe { core::ptr::write_volatile(b, 0) } } }
 }
 
 /// `brcmf_fil_country_le`: abbrev, rev -1 (the firmware's default
@@ -324,6 +458,15 @@ pub enum Key {
 }
 
 impl Key {
+    /// The 32-byte PSK (PBKDF2 of a passphrase over the SSID); None if open.
+    pub fn psk(&self, ssid: &[u8]) -> Option<[u8; 32]> {
+        match self {
+            Key::Open => None,
+            Key::Passphrase(p) => Some(crate::wifi_crypto::wpa_psk(p, ssid)),
+            Key::Pmk(k) => Some(*k),
+        }
+    }
+
     /// From a netctl secret: empty = open, 64 hex digits = PMK, else passphrase.
     pub fn from_secret(s: &[u8]) -> Key {
         if s.is_empty() { return Key::Open; }
@@ -561,6 +704,8 @@ pub struct Stats {
     pub link_downs: u32,
     pub tx_frames: u64,
     pub tx_errors: u64,
+    pub eapol_rx: u32,
+    pub eapol_tx: u32,
 }
 
 /// One CYW43455 FullMAC interface over a [`Fwil`].
@@ -575,12 +720,22 @@ pub struct Brcmf<F: Fwil> {
     sync_id: u16,
     last: Option<JoinReq>,
     pub stats: Stats,
+    /// Join knobs (persist across joins; set by `join <knobs>` on the ctl).
+    pub opts: JoinOpts,
+    /// The firmware's "cap" string, if it answered.
+    pub caps: Option<alloc::string::String>,
+    /// The last firmware command that refused during a join, with its error.
+    pub fail_cmd: alloc::string::String,
+    /// Who ran the last keyed join's handshake ("firmware" / "host").
+    pub sup_used: &'static str,
+    host: Option<HostSup>,
 }
 
 impl<F: Fwil> Brcmf<F> {
     pub fn new(fw: F, env: Env) -> Self {
         Brcmf { fw, rx: Rx::new(), env, mac: [0; 6], country: *b"PT", connected: false, radio_on: false,
-                sync_id: 0, last: None, stats: Stats::default() }
+                sync_id: 0, last: None, stats: Stats::default(), opts: JoinOpts::default(), caps: None,
+                fail_cmd: alloc::string::String::new(), sup_used: "-", host: None }
     }
 
     fn log(&self, s: &str) { (self.env.log)(s) }
@@ -599,6 +754,16 @@ impl<F: Fwil> Brcmf<F> {
         if n < 6 { return Err(FwError::TooLong); }
         self.mac = b;
         self.country = country;
+        let mut cap = [0u8; 512];
+        match self.fw.iovar_get("cap", &mut cap) {
+            Ok(n) => {
+                let n = cap[..n.min(cap.len())].iter().position(|&c| c == 0).unwrap_or(n.min(cap.len()));
+                let c = alloc::string::String::from_utf8_lossy(&cap[..n]).trim().into();
+                self.log(&alloc::format!("caps: {}", c));
+                self.caps = Some(c);
+            }
+            Err(e) => self.log(&alloc::format!("cap refused: {:?}", e)),
+        }
         if let Err(e) = self.fw.iovar_set("country", &country_params(country)) {
             self.log(&alloc::format!("country {}{} refused: {:?}; firmware default kept", country[0] as char, country[1] as char, e));
         }
@@ -627,6 +792,7 @@ impl<F: Fwil> Brcmf<F> {
         loop {
             let before = self.rx.events;
             self.fw.poll(&mut self.rx, 2_000)?;
+            self.host_eapol();
             on_poll(&self.rx, obs);
             if done(&self.rx) { return Ok(Wait::Done); }
             if obs.aborted() { return Ok(Wait::Aborted); }
@@ -661,25 +827,158 @@ impl<F: Fwil> Brcmf<F> {
         Ok(v)
     }
 
-    fn configure_security(&mut self, key: &Key) -> Result<(), FwError> {
-        self.set_u32(cmd::SET_AUTH, 0)?; // open system
-        match key {
-            Key::Open => {
-                self.set_u32(cmd::SET_WSEC, WSEC_NONE)?;
-                self.set_u32(cmd::SET_WPA_AUTH, WPA_AUTH_DISABLED)?;
-                let _ = self.iovar_u32("sup_wpa", 0);
+    /// The firmware supports its own supplicant (`idsup` in "cap").
+    pub fn has_cap(&self, c: &str) -> bool {
+        self.caps.as_deref().map_or(false, |s| s.split_ascii_whitespace().any(|w| w == c))
+    }
+
+    /// One join step: log and remember the exact command when it is refused.
+    fn step(&mut self, what: &str, r: Result<(), FwError>) -> Result<(), FwError> {
+        if let Err(e) = r {
+            self.fail_cmd = alloc::format!("{} -> {:?}", what, e);
+            self.log(&alloc::format!("join: {} refused: {:?}", what, e));
+        }
+        r
+    }
+
+    /// auth / wsec / wpa_auth through the WLC ioctl or the iovar Linux uses
+    /// ("auth", "wsec", "wpa_auth"; bsscfg 0 = no prefix).
+    fn set_sec(&mut self, ioctl: u32, ioctl_name: &str, iovar: &str, v: u32) -> Result<(), FwError> {
+        let path = self.opts.sec;
+        if path != SecPath::Iovar {
+            let r = self.set_u32(ioctl, v);
+            let r = self.step(&alloc::format!("{} {}", ioctl_name, v), r);
+            if r.is_ok() || path == SecPath::Ioctl { return r; }
+        }
+        let r = self.iovar_u32(iovar, v);
+        self.step(&alloc::format!("iovar {}={}", iovar, v), r)
+    }
+
+    /// Security for a join. Returns true when the host runs the handshake.
+    fn configure_security(&mut self, req: &JoinReq) -> Result<bool, FwError> {
+        let key = &req.key;
+        let o = self.opts;
+        if *key == Key::Open {
+            self.set_sec(cmd::SET_AUTH, "WLC_SET_AUTH", "auth", 0)?;
+            self.set_sec(cmd::SET_WSEC, "WLC_SET_WSEC", "wsec", WSEC_NONE)?;
+            self.set_sec(cmd::SET_WPA_AUTH, "WLC_SET_WPA_AUTH", "wpa_auth", WPA_AUTH_DISABLED)?;
+            let _ = self.iovar_u32("sup_wpa", 0);
+            return Ok(false);
+        }
+        // Linux brcmf_cfg80211_connect order: wpaie, wpa_auth, auth, wsec,
+        // key mgmt (+ mfp), sup_wpa, PMK, join.
+        let mfp = match o.mfp { Some(m) => Some(m), None if self.has_cap("mfp") => Some(0), None => None };
+        let mut ie = crate::wifi_crypto::rsn_ie_psk_ccmp().to_vec();
+        if let Some(m) = mfp { if m >= 1 { ie[20] |= 0x80; } if m == 2 { ie[20] |= 0x40; } }
+        if o.wpaie {
+            let r = self.fw.iovar_set("wpaie", &ie);
+            let _ = self.step("iovar wpaie (RSN PSK CCMP)", r); // optional
+        }
+        self.set_sec(cmd::SET_WPA_AUTH, "WLC_SET_WPA_AUTH", "wpa_auth", WPA2_AUTH_PSK)?;
+        self.set_sec(cmd::SET_AUTH, "WLC_SET_AUTH", "auth", 0)?;
+        self.set_sec(cmd::SET_WSEC, "WLC_SET_WSEC", "wsec", WSEC_AES)?;
+        if let Some(m) = mfp {
+            let r = self.iovar_u32("mfp", m);
+            let r = self.step(&alloc::format!("iovar mfp={}", m), r);
+            if r.is_err() && o.mfp.is_some() { return r.map(|_| false); }
+        }
+        let host = match o.sup {
+            SupMode::Host => true,
+            SupMode::Firmware => {
+                let r = self.iovar_u32("sup_wpa", 1);
+                self.step("iovar sup_wpa=1", r)?;
+                false
             }
-            _ => {
-                self.set_u32(cmd::SET_WSEC, WSEC_AES)?;
-                self.set_u32(cmd::SET_WPA_AUTH, WPA2_AUTH_PSK)?;
-                self.iovar_u32("sup_wpa", 1)?;
-                let mut pmk = wsec_pmk(key);
-                let r = self.fw.cmd_set(cmd::SET_WSEC_PMK, &pmk);
-                for b in pmk.iter_mut() { unsafe { core::ptr::write_volatile(b, 0) } }
-                r?;
+            SupMode::Auto => {
+                let r = self.iovar_u32("sup_wpa", 1);
+                if self.step("iovar sup_wpa=1", r).is_err() {
+                    self.log(&alloc::format!("join: no firmware supplicant (idsup {}); running the 4-way handshake on the host",
+                                             if self.has_cap("idsup") { "advertised" } else { "not in caps" }));
+                    true
+                } else { false }
+            }
+        };
+        let Some(pmk) = key.psk(&req.ssid) else { return Ok(false) };
+        if host {
+            let _ = self.iovar_u32("sup_wpa", 0);
+            self.host = Some(HostSup { pmk, rsn_ie: ie, sup: None, ap: req.bssid.unwrap_or([0; 6]) });
+            self.sup_used = "host";
+            return Ok(true);
+        }
+        let mut pmk = pmk;
+        for b in pmk.iter_mut() { unsafe { core::ptr::write_volatile(b, 0) } }
+        self.sup_used = "firmware";
+        let forms: &[PmkForm] = match o.pmk {
+            PmkForm::Auto => &[PmkForm::Raw, PmkForm::Passphrase, PmkForm::Hex],
+            PmkForm::Raw => &[PmkForm::Raw],
+            PmkForm::Hex => &[PmkForm::Hex],
+            PmkForm::Passphrase => &[PmkForm::Passphrase],
+        };
+        let mut last = Err(FwError::Status(-1));
+        for f in forms {
+            let Some(mut p) = wsec_pmk(key, &req.ssid, *f) else { continue };
+            let r = self.fw.cmd_set(cmd::SET_WSEC_PMK, &p);
+            for b in p.iter_mut() { unsafe { core::ptr::write_volatile(b, 0) } }
+            let name = match f { PmkForm::Raw => "raw", PmkForm::Hex => "hex", _ => "passphrase" };
+            last = self.step(&alloc::format!("WLC_SET_WSEC_PMK pmk={}", name), r);
+            if last.is_ok() { break; }
+        }
+        last.map(|_| false)
+    }
+
+    /// Host supplicant: take EAPOL frames off the RX queue, answer them and
+    /// install the keys ("wsec_key"). No-op unless a host-handshake join is active.
+    fn host_eapol(&mut self) {
+        let Some(mut h) = self.host.take() else { return };
+        let mut eap: Vec<Vec<u8>> = Vec::new();
+        self.rx.rx.retain(|f| {
+            if f.len() >= 18 && f[12..14] == ETH_P_PAE { eap.push(f.to_vec()); false } else { true }
+        });
+        for f in eap {
+            self.stats.eapol_rx += 1;
+            if h.sup.is_none() {
+                let mut ap = [0u8; 6];
+                ap.copy_from_slice(&f[6..12]);
+                if h.ap == [0; 6] { h.ap = ap; }
+                let mut snonce = [0u8; 32];
+                (self.env.random)(&mut snonce);
+                h.sup = Some(crate::wifi_crypto::Supplicant::new(h.pmk, self.mac, h.ap, h.rsn_ie.clone(), snonce));
+            }
+            let evs = h.sup.as_mut().map(|s| s.on_eapol(&f[14..])).unwrap_or_default();
+            for e in evs {
+                use crate::wifi_crypto::HsEvent;
+                match e {
+                    HsEvent::Send(pdu) => {
+                        let mut fr = Vec::with_capacity(14 + pdu.len());
+                        fr.extend_from_slice(&h.ap);
+                        fr.extend_from_slice(&self.mac);
+                        fr.extend_from_slice(&ETH_P_PAE);
+                        fr.extend_from_slice(&pdu);
+                        match self.fw.tx_data(&fr) {
+                            Ok(()) => self.stats.eapol_tx += 1,
+                            Err(e) => self.log(&alloc::format!("host supplicant: EAPOL tx failed: {:?}", e)),
+                        }
+                    }
+                    HsEvent::InstallPtk(tk) => {
+                        // Message 4 must leave unencrypted before the key is in.
+                        let _ = self.fw.poll(&mut self.rx, 2_000);
+                        (self.env.sleep_ms)(20);
+                        let r = self.fw.iovar_set("wsec_key", &wsec_key(0, &tk, Some(h.ap)));
+                        let _ = self.step("iovar wsec_key (pairwise)", r);
+                    }
+                    HsEvent::InstallGtk { key_id, key, .. } => {
+                        let r = self.fw.iovar_set("wsec_key", &wsec_key(key_id as u32, &key, None));
+                        let _ = self.step(&alloc::format!("iovar wsec_key (group {})", key_id), r);
+                    }
+                    HsEvent::Complete => {
+                        if !self.rx.sup_done { self.log("host supplicant: 4-way handshake complete"); }
+                        self.rx.sup_done = true;
+                    }
+                    HsEvent::Error(m) => self.log(&alloc::format!("host supplicant: {}", m)),
+                }
             }
         }
-        Ok(())
+        self.host = Some(h);
     }
 
     /// Join `req` (WPA2-PSK through the firmware supplicant, or open) and
@@ -691,6 +990,7 @@ impl<F: Fwil> Brcmf<F> {
         self.rx.begin_join(keyed);
         let r = self.join_inner(&req, obs, timeout_ms);
         self.rx.joining = false;
+        if r.is_err() { self.host = None; }
         match r {
             Ok(()) => {
                 self.connected = true;
@@ -710,12 +1010,25 @@ impl<F: Fwil> Brcmf<F> {
     }
 
     fn join_inner(&mut self, req: &JoinReq, obs: &mut dyn JoinObserver, timeout_ms: u64) -> Result<(), JoinFail> {
-        self.set_u32(cmd::SET_INFRA, 1).map_err(JoinFail::Fw)?;
-        self.configure_security(&req.key).map_err(JoinFail::Fw)?;
+        self.fail_cmd.clear();
+        self.host = None;
+        self.sup_used = "-";
+        let r = self.set_u32(cmd::SET_INFRA, 1);
+        self.step("WLC_SET_INFRA 1", r).map_err(JoinFail::Fw)?;
+        self.configure_security(req).map_err(JoinFail::Fw)?;
+        self.log(&alloc::format!("join: security set ({}; handshake: {})", self.opts.describe(), self.sup_used));
         obs.step(Step::Associating);
-        if let Err(e) = self.fw.iovar_set("join", &ext_join_params(&req.ssid, req.bssid, req.channel)) {
-            self.log(&alloc::format!("join iovar refused ({:?}); falling back to WLC_SET_SSID", e));
-            self.fw.cmd_set(cmd::SET_SSID, &join_params(&req.ssid, req.bssid, req.channel)).map_err(JoinFail::Fw)?;
+        let method = self.opts.method;
+        let mut joined = false;
+        if method != JoinMethod::SetSsid {
+            let r = self.fw.iovar_set("join", &ext_join_params(&req.ssid, req.bssid, req.channel));
+            let r = self.step("iovar join (ext join params)", r);
+            if r.is_ok() { joined = true; } else if method == JoinMethod::JoinIovar { return r.map_err(JoinFail::Fw); }
+        }
+        if !joined {
+            let r = self.fw.cmd_set(cmd::SET_SSID, &join_params(&req.ssid, req.bssid, req.channel));
+            self.step("WLC_SET_SSID (join params)", r).map_err(JoinFail::Fw)?;
+            self.fail_cmd.clear();
         }
         let keyed = self.rx.keyed;
         let mut stepped = false;
@@ -757,6 +1070,7 @@ impl<F: Fwil> Brcmf<F> {
     pub fn disconnect(&mut self) -> Result<(), FwError> {
         let was = self.connected;
         self.connected = false;
+        self.host = None;
         self.rx.link_up = false;
         self.rx.down = None;
         if was { self.fw.cmd_set(cmd::DISASSOC, &scb_val(REASON_LEAVING, self.rx.bssid)) } else { Ok(()) }
@@ -765,6 +1079,7 @@ impl<F: Fwil> Brcmf<F> {
     /// Associated: service the bus; `Some` when the link went away.
     pub fn poll_link(&mut self, budget_us: u32) -> Result<Option<Down>, FwError> {
         self.fw.poll(&mut self.rx, budget_us)?;
+        self.host_eapol();
         if self.connected {
             if let Some(d) = self.rx.down.take() {
                 self.connected = false;
@@ -865,8 +1180,9 @@ pub fn mac_from_cmdline(cmdline: &str) -> Option<([u8; 6], &'static str)> {
 pub enum CtlCmd<'a> {
     Status,
     Scan,
-    /// `join [ssid=<rest of line>]`: None = the wifi.conf network.
-    Join(Option<&'a str>),
+    /// `join [knobs..] [ssid=<rest of line>]`: ssid None = the wifi.conf
+    /// network; knobs as in [`JoinOpts::apply`] (they persist).
+    Join { ssid: Option<&'a str>, knobs: alloc::vec::Vec<&'a str> },
     Diag(usize),
     /// `retry [knobs]`: the knob words, `seq=` dropped.
     Retry(alloc::vec::Vec<&'a str>),
@@ -880,7 +1196,12 @@ pub fn parse_ctl(text: &str) -> CtlCmd<'_> {
     match cmd {
         "" | "status" => CtlCmd::Status,
         "scan" => CtlCmd::Scan,
-        "join" => CtlCmd::Join(text.find("ssid=").map(|i| text[i + 5..].trim()).filter(|s| !s.is_empty())),
+        "join" => {
+            // Knob words come before `ssid=`, which takes the rest of the line.
+            let head = text.find("ssid=").map_or(text, |i| &text[..i]);
+            let knobs = head.split_ascii_whitespace().filter(|w| !w.starts_with("seq=")).skip(1).collect();
+            CtlCmd::Join { ssid: text.find("ssid=").map(|i| text[i + 5..].trim()).filter(|s| !s.is_empty()), knobs }
+        }
         "diag" => CtlCmd::Diag(words.find_map(|w| w.strip_prefix("lines=")).and_then(|v| v.parse().ok()).unwrap_or(32)),
         "retry" => CtlCmd::Retry(words.collect()),
         other => CtlCmd::Other(other),
@@ -897,6 +1218,7 @@ impl<F: Fwil> Brcmf<F> {
         let mut out = alloc::format!("scans {} joins {} join_fails {} link_downs {} events {} bad_events {} if_events {} rx_frames {} rx_dropped {} tx {} tx_err {}",
             s.scans, s.joins, s.join_fails, s.link_downs, r.events, r.bad_events, r.if_events, r.rx_frames, r.rx_dropped,
             s.tx_frames, s.tx_errors);
+        out.push_str(&alloc::format!(" eapol_rx {} eapol_tx {} handshake {}", s.eapol_rx, s.eapol_tx, self.sup_used));
         if !r.recent.is_empty() {
             out.push_str(" recent");
             for (t, st, rs) in r.recent.iter().rev().take(8) { let _ = write!(out, " {}/{}/{}", t, st, rs); }
