@@ -64,7 +64,7 @@ static FW_VER: Mutex<String> = Mutex::new(String::new());
 static SCAN_INFO: Mutex<String> = Mutex::new(String::new());
 static JOIN_INFO: Mutex<String> = Mutex::new(String::new());
 static COUNTERS: Mutex<String> = Mutex::new(String::new());
-static CAPS: Mutex<String> = Mutex::new(String::new());
+static FW_CAPS: Mutex<String> = Mutex::new(String::new());
 static JOIN_OPTS: Mutex<String> = Mutex::new(String::new());
 /// The last `[brcmf]` lines (boot lines included), so they can be read with
 /// no serial capture and no grep.
@@ -268,7 +268,7 @@ pub fn info_lines(out: &mut String) {
     let ms = MAC_SRC.lock();
     let _ = writeln!(out, "mac_source: {}", if ms.is_empty() { "unknown (not reached)" } else { ms.as_str() });
     drop(ms);
-    for (k, m) in [("caps", &CAPS), ("join_opts", &JOIN_OPTS), ("last_scan", &SCAN_INFO), ("last_join", &JOIN_INFO), ("counters", &COUNTERS)] {
+    for (k, m) in [("caps", &FW_CAPS), ("join_opts", &JOIN_OPTS), ("last_scan", &SCAN_INFO), ("last_join", &JOIN_INFO), ("counters", &COUNTERS)] {
         let g = m.lock();
         let _ = writeln!(out, "{}: {}", k, if g.is_empty() { "none" } else { g.as_str() });
     }
@@ -351,7 +351,7 @@ impl<F: Fwil> BrcmfRadio<F> {
         if now < self.next_ctl_ms { return; }
         self.next_ctl_ms = now + CTL_POLL_MS;
         *COUNTERS.lock() = self.dev.counters_line();
-        *CAPS.lock() = self.dev.caps.clone().unwrap_or_else(|| String::from("unknown (cap refused)"));
+        *FW_CAPS.lock() = self.dev.caps.clone().unwrap_or_else(|| String::from("unknown (cap refused)"));
         *JOIN_OPTS.lock() = self.dev.opts.describe();
         let Some(text) = self.ctl.as_mut().and_then(|c| c.poll()) else { return };
         let text = String::from(text.trim());
