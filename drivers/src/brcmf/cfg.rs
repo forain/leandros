@@ -45,6 +45,9 @@ pub const WSEC_NONE: u32 = 0;
 pub const WSEC_AES: u32 = 0x4;
 pub const WPA_AUTH_DISABLED: u32 = 0;
 pub const WPA2_AUTH_PSK: u32 = 0x80;
+/// AKM 6 (PSK-SHA256), Linux brcmfmac `WPA2_AUTH_PSK_SHA256`.
+pub const WPA2_AUTH_PSK_SHA256: u32 = 0x8000;
+pub const WSEC_TKIP: u32 = 0x2;
 /// `brcmf_wsec_pmk_le.flags`: the key is an ASCII passphrase (the firmware
 /// runs PBKDF2 itself).
 pub const WSEC_PASSPHRASE: u16 = 1;
@@ -361,11 +364,92 @@ pub struct JoinOpts {
     pub mfp: Option<u32>,
     /// Set "wpaie" (our RSN IE) before joining.
     pub wpaie: bool,
+    /// AKM suite type we advertise: None = auto (6 if the AP offers it, else 2).
+    pub akm: Option<u8>,
+    /// RSN capability MFPC / MFPR we advertise: None = auto (MFPC if the AP
+    /// has MFPC and the firmware has `mfp`, or with AKM 6; MFPR 0).
+    pub mfpc: Option<bool>,
+    pub mfpr: Option<bool>,
+    /// RSN IE put in message 2: the firmware's association request IE
+    /// ("assoc_req_ies") when it reports one (auto/fw), or the IE we built.
+    pub msg2ie: Msg2Ie,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Msg2Ie { Auto, Ours, Fw }
+
+/// The AP's RSN element from the scan, decoded (802.11-2016 9.4.2.25).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApRsn {
+    pub raw: Vec<u8>,
+    pub group: u32,
+    pub pairwise: Vec<u32>,
+    pub akm: Vec<u32>,
+    pub caps: u16,
+    pub pmkids: usize,
+    pub group_mgmt: Option<u32>,
+}
+
+impl ApRsn {
+    pub fn mfpc(&self) -> bool { self.caps & crate::wifi_crypto::RSN_CAP_MFPC != 0 }
+    pub fn mfpr(&self) -> bool { self.caps & crate::wifi_crypto::RSN_CAP_MFPR != 0 }
+    pub fn has_akm(&self, t: u8) -> bool { self.akm.contains(&(0x000f_ac00 | t as u32)) }
+    pub fn describe(&self) -> alloc::string::String {
+        let suite = |v: u32| if v >> 8 == 0x000fac { alloc::format!("{}", v & 0xff) } else { alloc::format!("{:08x}", v) };
+        let list = |v: &[u32]| v.iter().map(|x| suite(*x)).collect::<Vec<_>>().join(",");
+        alloc::format!("group={} pairwise={} akm={} caps=0x{:04x} mfpc={} mfpr={} pmkids={} group_mgmt={} ie={}",
+            suite(self.group), list(&self.pairwise), list(&self.akm), self.caps, self.mfpc() as u8, self.mfpr() as u8,
+            self.pmkids, self.group_mgmt.map(suite).unwrap_or_else(|| "absent(6)".into()), hex(&self.raw))
+    }
+}
+
+pub fn hex(b: &[u8]) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::with_capacity(b.len() * 2);
+    for x in b { let _ = write!(s, "{:02x}", x); }
+    s
+}
+
+/// Find the RSN element (id 48) in an IE list; returns the whole element.
+pub fn find_rsn_ie(ies: &[u8]) -> Option<&[u8]> {
+    let mut p = 0usize;
+    while p + 2 <= ies.len() {
+        let end = p + 2 + ies[p + 1] as usize;
+        if end > ies.len() { return None; }
+        if ies[p] == 48 { return Some(&ies[p..end]); }
+        p = end;
+    }
+    None
+}
+
+/// Decode a whole RSN element (id, len, body).
+pub fn parse_ap_rsn(ie: &[u8]) -> Option<ApRsn> {
+    if ie.len() < 4 || ie[0] != 48 { return None; }
+    let d = &ie[2..];
+    let be32 = |o: usize| d.get(o..o + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let le16o = |o: usize| d.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let mut r = ApRsn { raw: ie.to_vec(), group: 0x000f_ac04, pairwise: alloc::vec![0x000f_ac04], akm: alloc::vec![0x000f_ac01],
+                        caps: 0, pmkids: 0, group_mgmt: None };
+    let mut o = 2;
+    if o < d.len() { r.group = be32(o)?; o += 4; }
+    let list = |o: &mut usize| -> Option<Vec<u32>> {
+        let n = le16o(*o)? as usize; *o += 2;
+        let mut v = Vec::new();
+        for _ in 0..n { v.push(be32(*o)?); *o += 4; }
+        Some(v)
+    };
+    if o < d.len() { r.pairwise = list(&mut o)?; }
+    if o < d.len() { r.akm = list(&mut o)?; }
+    if o < d.len() { r.caps = le16o(o)?; o += 2; }
+    if o < d.len() { r.pmkids = le16o(o)? as usize; o += 2 + 16 * r.pmkids; }
+    if o < d.len() { r.group_mgmt = be32(o); }
+    Some(r)
 }
 
 impl Default for JoinOpts {
     fn default() -> Self {
-        JoinOpts { method: JoinMethod::Auto, sup: SupMode::Auto, pmk: PmkForm::Auto, sec: SecPath::Auto, mfp: None, wpaie: true }
+        JoinOpts { method: JoinMethod::Auto, sup: SupMode::Auto, pmk: PmkForm::Auto, sec: SecPath::Auto, mfp: None, wpaie: true,
+                   akm: None, mfpc: None, mfpr: None, msg2ie: Msg2Ie::Auto }
     }
 }
 
@@ -395,6 +479,18 @@ impl JoinOpts {
                 ("mfp", n) => match n.parse::<u32>() { Ok(n) if n <= 2 => { self.mfp = Some(n); true } _ => false },
                 ("wpaie", "1") => { self.wpaie = true; true }
                 ("wpaie", "0") => { self.wpaie = false; true }
+                ("akm", "auto") => { self.akm = None; true }
+                ("akm", "2") => { self.akm = Some(2); true }
+                ("akm", "6") => { self.akm = Some(6); true }
+                ("mfpc", "auto") => { self.mfpc = None; true }
+                ("mfpc", "0") => { self.mfpc = Some(false); true }
+                ("mfpc", "1") => { self.mfpc = Some(true); true }
+                ("mfpr", "auto") => { self.mfpr = None; true }
+                ("mfpr", "0") => { self.mfpr = Some(false); true }
+                ("mfpr", "1") => { self.mfpr = Some(true); true }
+                ("msg2ie", "auto") => { self.msg2ie = Msg2Ie::Auto; true }
+                ("msg2ie", "ours") => { self.msg2ie = Msg2Ie::Ours; true }
+                ("msg2ie", "fw") => { self.msg2ie = Msg2Ie::Fw; true }
                 _ => false,
             };
             if !ok { bad.push(*w); }
@@ -408,7 +504,11 @@ impl JoinOpts {
         let p = match self.pmk { PmkForm::Auto => "auto", PmkForm::Raw => "raw", PmkForm::Hex => "hex", PmkForm::Passphrase => "passphrase" };
         let c = match self.sec { SecPath::Auto => "auto", SecPath::Ioctl => "ioctl", SecPath::Iovar => "iovar" };
         let f = match self.mfp { None => alloc::string::String::from("auto"), Some(n) => alloc::format!("{}", n) };
-        alloc::format!("method={} supwpa={} pmk={} sec={} mfp={} wpaie={}", m, s, p, c, f, self.wpaie as u8)
+        let ob = |v: Option<bool>| match v { None => "auto", Some(true) => "1", Some(false) => "0" };
+        let a = match self.akm { None => alloc::string::String::from("auto"), Some(n) => alloc::format!("{}", n) };
+        let i = match self.msg2ie { Msg2Ie::Auto => "auto", Msg2Ie::Ours => "ours", Msg2Ie::Fw => "fw" };
+        alloc::format!("method={} supwpa={} pmk={} sec={} mfp={} wpaie={} akm={} mfpc={} mfpr={} msg2ie={}",
+                       m, s, p, c, f, self.wpaie as u8, a, ob(self.mfpc), ob(self.mfpr), i)
     }
 }
 
@@ -416,6 +516,8 @@ impl JoinOpts {
 struct HostSup {
     pmk: [u8; 32],
     rsn_ie: Vec<u8>,
+    akm: u8,
+    group_tkip: bool,
     sup: Option<crate::wifi_crypto::Supplicant>,
     ap: [u8; 6],
 }
@@ -464,6 +566,20 @@ impl Key {
             Key::Open => None,
             Key::Passphrase(p) => Some(crate::wifi_crypto::wpa_psk(p, ssid)),
             Key::Pmk(k) => Some(*k),
+        }
+    }
+
+    /// Shape of the secret for diagnostics: kind and length, and whether it
+    /// has leading/trailing whitespace (a classic provisioning slip). Never the value.
+    pub fn describe_shape(&self) -> alloc::string::String {
+        match self {
+            Key::Open => "open".into(),
+            Key::Pmk(_) => "pmk (64 hex digits)".into(),
+            Key::Passphrase(p) => {
+                let ws = |c: Option<&u8>| c.is_some_and(|c| c.is_ascii_whitespace() || *c < 0x20);
+                alloc::format!("passphrase len={} edge_whitespace={} non_ascii={}", p.len(),
+                               (ws(p.first()) || ws(p.last())) as u8, p.iter().any(|c| *c >= 0x7f || *c < 0x20) as u8)
+            }
         }
     }
 
@@ -729,13 +845,40 @@ pub struct Brcmf<F: Fwil> {
     /// Who ran the last keyed join's handshake ("firmware" / "host").
     pub sup_used: &'static str,
     host: Option<HostSup>,
+    /// BSSs from the last scan (for the AP's RSN element at join time).
+    pub last_bss: Vec<BssEntry>,
+    /// RSN/EAPOL diagnostics for /proc/net/nic (never key material).
+    pub rsn: RsnDiag,
+}
+
+/// What the last keyed join negotiated, for /proc/net/nic. Holds element
+/// bytes and EAPOL header fields only; never keys, PMK, PTK or the passphrase.
+#[derive(Clone, Debug, Default)]
+pub struct RsnDiag {
+    pub ap: alloc::string::String,
+    pub chosen: alloc::string::String,
+    pub assoc_ours: alloc::string::String,
+    pub assoc_fw: alloc::string::String,
+    pub msg2_ie: alloc::string::String,
+    pub msg1: alloc::string::String,
+    pub last: alloc::string::String,
+    pub secret: alloc::string::String,
+}
+
+impl RsnDiag {
+    pub fn lines(&self) -> [(&'static str, &alloc::string::String); 8] {
+        [("rsn_ap", &self.ap), ("rsn_chosen", &self.chosen), ("rsn_assoc_ours", &self.assoc_ours),
+         ("rsn_assoc_fw", &self.assoc_fw), ("rsn_msg2_ie", &self.msg2_ie), ("eapol_msg1", &self.msg1),
+         ("eapol_last", &self.last), ("secret", &self.secret)]
+    }
 }
 
 impl<F: Fwil> Brcmf<F> {
     pub fn new(fw: F, env: Env) -> Self {
         Brcmf { fw, rx: Rx::new(), env, mac: [0; 6], country: *b"PT", connected: false, radio_on: false,
                 sync_id: 0, last: None, stats: Stats::default(), opts: JoinOpts::default(), caps: None,
-                fail_cmd: alloc::string::String::new(), sup_used: "-", host: None }
+                fail_cmd: alloc::string::String::new(), sup_used: "-", host: None,
+                last_bss: Vec::new(), rsn: RsnDiag::default() }
     }
 
     fn log(&self, s: &str) { (self.env.log)(s) }
@@ -824,6 +967,7 @@ impl<F: Fwil> Brcmf<F> {
         }
         let mut v = core::mem::take(&mut self.rx.results);
         v.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+        self.last_bss = v.clone();
         Ok(v)
     }
 
@@ -855,6 +999,68 @@ impl<F: Fwil> Brcmf<F> {
     }
 
     /// Security for a join. Returns true when the host runs the handshake.
+    /// The target AP's RSN element from the last scan (by BSSID, else the
+    /// strongest BSS with the SSID).
+    fn ap_rsn(&self, req: &JoinReq) -> Option<ApRsn> {
+        let b = match req.bssid {
+            Some(id) => self.last_bss.iter().find(|b| b.bssid == id),
+            None => self.last_bss.iter().find(|b| b.ssid == req.ssid),
+        }?;
+        parse_ap_rsn(find_rsn_ie(&b.ies)?)
+    }
+
+    /// The RSN IE we advertise, the AKM, the "mfp" iovar value (if any) and
+    /// whether the group cipher is TKIP. Knobs override each auto choice.
+    fn choose_rsn(&mut self, ap: Option<&ApRsn>) -> (Vec<u8>, u8, Option<u32>, bool) {
+        use crate::wifi_crypto::{rsn_ie_psk_akm, RSN_CAP_MFPC, RSN_CAP_MFPR};
+        let o = self.opts;
+        let fw_mfp = self.has_cap("mfp");
+        let akm = o.akm.unwrap_or(match ap { Some(a) if a.has_akm(6) => 6, _ => 2 });
+        // Legacy mfp=N knob maps onto the IE bits unless mfpc/mfpr are set.
+        let mfpc = o.mfpc.or(o.mfp.map(|m| m >= 1)).unwrap_or(akm == 6 || (fw_mfp && ap.is_some_and(|a| a.mfpc())));
+        let mfpr = o.mfpr.or(o.mfp.map(|m| m == 2)).unwrap_or(false);
+        let mfpc = mfpc || mfpr;
+        let group_tkip = ap.is_some_and(|a| a.group == 0x000f_ac02);
+        let group = if group_tkip { 0x000f_ac02 } else { 0x000f_ac04 };
+        let caps = if mfpc { RSN_CAP_MFPC } else { 0 } | if mfpr { RSN_CAP_MFPR } else { 0 };
+        let ie = rsn_ie_psk_akm(group, akm, caps).to_vec();
+        let mfp = match o.mfp {
+            Some(m) => Some(m),
+            None if fw_mfp || mfpc => Some(if mfpr { 2 } else if mfpc { 1 } else { 0 }),
+            None => None,
+        };
+        if let Some(a) = ap {
+            if !a.has_akm(akm) { self.log(&alloc::format!("join: AKM {} not offered by the AP (akm list {:?})", akm, a.akm)); }
+            if a.mfpr() && !mfpc { self.log("join: the AP requires MFP (MFPR) but MFPC is off"); }
+            if mfpc && a.group_mgmt.is_some_and(|g| g != 0x000f_ac06) { self.log("join: AP group management cipher is not BIP-CMAC-128"); }
+        }
+        self.rsn.chosen = alloc::format!("akm={} mfpc={} mfpr={} mfp_iovar={} group={} wpa_auth=0x{:x}",
+            akm, mfpc as u8, mfpr as u8, mfp.map(|m| alloc::format!("{}", m)).unwrap_or_else(|| "unset".into()),
+            if group_tkip { "tkip" } else { "ccmp" }, if akm == 6 { WPA2_AUTH_PSK_SHA256 } else { WPA2_AUTH_PSK });
+        (ie, akm, mfp, group_tkip)
+    }
+
+    /// The RSN IE of the association request the firmware sent ("assoc_info"
+    /// lengths, then "assoc_req_ies"), as Linux brcmf_get_assoc_ies reads it.
+    fn assoc_req_rsn(&mut self) -> Option<Vec<u8>> {
+        let mut li = [0u8; 8];
+        let n = self.fw.iovar_get("assoc_info", &mut li).ok()?;
+        if n < 4 { return None; }
+        let req_len = (le32(&li, 0) as usize).min(512);
+        if req_len == 0 { return None; }
+        let mut buf = alloc::vec![0u8; 512];
+        let n = self.fw.iovar_get("assoc_req_ies", &mut buf).ok()?.min(512);
+        let b = &buf[..n.max(req_len).min(512)];
+        // Usually the IEs start at 0 (SSID first); some builds keep the fixed
+        // fields (capability + listen interval, + current AP for reassoc).
+        for off in [0usize, 4, 10] {
+            if b.get(off) == Some(&0) {
+                if let Some(ie) = find_rsn_ie(&b[off..]) { return Some(ie.to_vec()); }
+            }
+        }
+        None
+    }
+
     fn configure_security(&mut self, req: &JoinReq) -> Result<bool, FwError> {
         let key = &req.key;
         let o = self.opts;
@@ -867,20 +1073,25 @@ impl<F: Fwil> Brcmf<F> {
         }
         // Linux brcmf_cfg80211_connect order: wpaie, wpa_auth, auth, wsec,
         // key mgmt (+ mfp), sup_wpa, PMK, join.
-        let mfp = match o.mfp { Some(m) => Some(m), None if self.has_cap("mfp") => Some(0), None => None };
-        let mut ie = crate::wifi_crypto::rsn_ie_psk_ccmp().to_vec();
-        if let Some(m) = mfp { if m >= 1 { ie[20] |= 0x80; } if m == 2 { ie[20] |= 0x40; } }
+        // The AP's RSN element (scan) decides the AKM and MFP bits we advertise.
+        let ap = self.ap_rsn(req);
+        self.rsn = RsnDiag::default();
+        self.rsn.ap = ap.as_ref().map(|a| a.describe()).unwrap_or_else(|| "unknown (BSS not in the last scan)".into());
+        self.rsn.secret = key.describe_shape();
+        let (ie, akm, mfp, group_tkip) = self.choose_rsn(ap.as_ref());
+        self.rsn.assoc_ours = hex(&ie);
         if o.wpaie {
             let r = self.fw.iovar_set("wpaie", &ie);
-            let _ = self.step("iovar wpaie (RSN PSK CCMP)", r); // optional
+            let _ = self.step(&alloc::format!("iovar wpaie (RSN PSK AKM {})", akm), r); // optional
         }
-        self.set_sec(cmd::SET_WPA_AUTH, "WLC_SET_WPA_AUTH", "wpa_auth", WPA2_AUTH_PSK)?;
+        let wpa_auth = if akm == 6 { WPA2_AUTH_PSK_SHA256 } else { WPA2_AUTH_PSK };
+        self.set_sec(cmd::SET_WPA_AUTH, "WLC_SET_WPA_AUTH", "wpa_auth", wpa_auth)?;
         self.set_sec(cmd::SET_AUTH, "WLC_SET_AUTH", "auth", 0)?;
-        self.set_sec(cmd::SET_WSEC, "WLC_SET_WSEC", "wsec", WSEC_AES)?;
+        self.set_sec(cmd::SET_WSEC, "WLC_SET_WSEC", "wsec", if group_tkip { WSEC_AES | WSEC_TKIP } else { WSEC_AES })?;
         if let Some(m) = mfp {
             let r = self.iovar_u32("mfp", m);
             let r = self.step(&alloc::format!("iovar mfp={}", m), r);
-            if r.is_err() && o.mfp.is_some() { return r.map(|_| false); }
+            if r.is_err() && (o.mfp.is_some() || o.mfpc.is_some() || o.mfpr.is_some()) { return r.map(|_| false); }
         }
         let host = match o.sup {
             SupMode::Host => true,
@@ -901,7 +1112,7 @@ impl<F: Fwil> Brcmf<F> {
         let Some(pmk) = key.psk(&req.ssid) else { return Ok(false) };
         if host {
             let _ = self.iovar_u32("sup_wpa", 0);
-            self.host = Some(HostSup { pmk, rsn_ie: ie, sup: None, ap: req.bssid.unwrap_or([0; 6]) });
+            self.host = Some(HostSup { pmk, rsn_ie: ie, akm, group_tkip, sup: None, ap: req.bssid.unwrap_or([0; 6]) });
             self.sup_used = "host";
             return Ok(true);
         }
@@ -942,7 +1153,32 @@ impl<F: Fwil> Brcmf<F> {
                 if h.ap == [0; 6] { h.ap = ap; }
                 let mut snonce = [0u8; 32];
                 (self.env.random)(&mut snonce);
-                h.sup = Some(crate::wifi_crypto::Supplicant::new(h.pmk, self.mac, h.ap, h.rsn_ie.clone(), snonce));
+                // Message 2 must carry the RSN IE of the association request
+                // byte for byte: take the one the firmware actually sent.
+                let fw_ie = self.assoc_req_rsn();
+                self.rsn.assoc_fw = match &fw_ie { Some(i) => hex(i), None => "unavailable".into() };
+                let (ie, src) = match (self.opts.msg2ie, fw_ie) {
+                    (Msg2Ie::Ours, _) | (_, None) => (h.rsn_ie.clone(), "ours"),
+                    (_, Some(i)) => (i, "fw"),
+                };
+                if src == "fw" && ie != h.rsn_ie {
+                    self.log(&alloc::format!("join: firmware association RSN IE differs from ours (fw {} ours {}); message 2 uses the firmware's",
+                                             hex(&ie), hex(&h.rsn_ie)));
+                }
+                let akm = parse_ap_rsn(&ie).and_then(|r| r.akm.first().copied()).map(|a| (a & 0xff) as u8).unwrap_or(h.akm);
+                self.rsn.msg2_ie = alloc::format!("{} akm={} {}", src, akm, hex(&ie));
+                let mut sup = crate::wifi_crypto::Supplicant::new(h.pmk, self.mac, h.ap, ie, snonce);
+                sup.set_akm(akm);
+                sup.set_group_tkip(h.group_tkip);
+                h.sup = Some(sup);
+            }
+            if let Some(k) = crate::wifi_crypto::parse_eapol_key(&f[14..]) {
+                let ki = k.key_info;
+                let line = alloc::format!("eapol_ver={} desc={} key_info=0x{:04x} (ver={} pairwise={} install={} ack={} mic={} secure={} encdata={}) key_len={} replay={} key_data_len={}",
+                    k.version, k.descriptor_type, ki, ki & 7, (ki >> 3) & 1, (ki >> 6) & 1, (ki >> 7) & 1, (ki >> 8) & 1,
+                    (ki >> 9) & 1, (ki >> 12) & 1, k.key_len, u64::from_be_bytes(k.replay_counter), k.key_data.len());
+                if ki & 0x0108 == 0x0008 && self.rsn.msg1.is_empty() { self.rsn.msg1 = line.clone(); }
+                self.rsn.last = line;
             }
             let evs = h.sup.as_mut().map(|s| s.on_eapol(&f[14..])).unwrap_or_default();
             for e in evs {
@@ -970,11 +1206,19 @@ impl<F: Fwil> Brcmf<F> {
                         let r = self.fw.iovar_set("wsec_key", &wsec_key(key_id as u32, &key, None));
                         let _ = self.step(&alloc::format!("iovar wsec_key (group {})", key_id), r);
                     }
+                    HsEvent::InstallIgtk { key_id, key, .. } => {
+                        // As Linux brcmfmac: BIP key through "wsec_key" at index 4/5.
+                        let r = self.fw.iovar_set("wsec_key", &wsec_key(key_id as u32, &key, None));
+                        let _ = self.step(&alloc::format!("iovar wsec_key (igtk {})", key_id), r);
+                    }
                     HsEvent::Complete => {
                         if !self.rx.sup_done { self.log("host supplicant: 4-way handshake complete"); }
                         self.rx.sup_done = true;
                     }
-                    HsEvent::Error(m) => self.log(&alloc::format!("host supplicant: {}", m)),
+                    HsEvent::Error(m) => {
+                        self.rsn.last = alloc::format!("{} -> {}", self.rsn.last, m);
+                        self.log(&alloc::format!("host supplicant: {}", m))
+                    }
                 }
             }
         }

@@ -232,28 +232,240 @@ pub fn derive_ptk(
     anonce: &[u8; 32],
     snonce: &[u8; 32],
 ) -> Ptk {
+    let data = ptk_context(aa, spa, anonce, snonce);
+    let mut out = [0u8; 48];
+    prf_sha1(pmk, b"Pairwise key expansion", &data, &mut out);
+    split_ptk(&out)
+}
+
+// ---------------------------------------------------------------------------
+// SHA-256, HMAC-SHA256, the IEEE 802.11 KDF (AKM 6, PSK-SHA256), AES-CMAC
+// ---------------------------------------------------------------------------
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+/// Incremental SHA-256 (FIPS 180-4).
+#[derive(Clone)]
+pub struct Sha256 {
+    h: [u32; 8],
+    buf: [u8; 64],
+    buf_len: usize,
+    total: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn sha256_compress(h: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([block[4 * i], block[4 * i + 1], block[4 * i + 2], block[4 * i + 3]]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ (!e & g);
+        let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(SHA256_K[i]).wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    for (x, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+        *x = x.wrapping_add(v);
+    }
+}
+
+impl Sha256 {
+    pub fn new() -> Self {
+        Sha256 {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buf: [0; 64],
+            buf_len: 0,
+            total: 0,
+        }
+    }
+
+    pub fn update(&mut self, mut d: &[u8]) {
+        self.total = self.total.wrapping_add(d.len() as u64);
+        while !d.is_empty() {
+            let take = (64 - self.buf_len).min(d.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&d[..take]);
+            self.buf_len += take;
+            d = &d[take..];
+            if self.buf_len == 64 {
+                let b = self.buf;
+                sha256_compress(&mut self.h, &b);
+                self.buf_len = 0;
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> [u8; 32] {
+        let bits = self.total.wrapping_mul(8);
+        self.update(&[0x80]);
+        while self.buf_len != 56 {
+            self.update(&[0]);
+        }
+        self.update(&bits.to_be_bytes());
+        let mut out = [0u8; 32];
+        for (i, w) in self.h.iter().enumerate() {
+            out[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        out
+    }
+}
+
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut s = Sha256::new();
+    s.update(data);
+    s.finish()
+}
+
+/// HMAC-SHA256 (RFC 2104) over the concatenation of `parts`.
+pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&sha256(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0u8; 64];
+    let mut opad = [0u8; 64];
+    for i in 0..64 {
+        ipad[i] = k[i] ^ 0x36;
+        opad[i] = k[i] ^ 0x5c;
+    }
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    for p in parts {
+        inner.update(p);
+    }
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(&inner.finish());
+    outer.finish()
+}
+
+/// IEEE 802.11 KDF-SHA256-Length (802.11-2016 12.7.1.6.2): `out.len()` bytes
+/// of HMAC-SHA256(key, i || label || context || Length) for i = 1, 2, ...,
+/// with i and Length (in bits) as 16-bit little-endian values.
+pub fn kdf_sha256(key: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) {
+    let bits = ((out.len() * 8) as u16).to_le_bytes();
+    for (i, chunk) in out.chunks_mut(32).enumerate() {
+        let ctr = ((i + 1) as u16).to_le_bytes();
+        let t = hmac_sha256(key, &[&ctr, label, context, &bits]);
+        chunk.copy_from_slice(&t[..chunk.len()]);
+    }
+}
+
+/// PTK for AKM 6 (PSK-SHA256) with CCMP = KDF-SHA256-384(PMK, "Pairwise key
+/// expansion", min(AA,SPA) || max(AA,SPA) || min(ANonce,SNonce) || max(ANonce,SNonce)).
+pub fn derive_ptk_sha256(
+    pmk: &[u8; 32],
+    aa: &[u8; 6],
+    spa: &[u8; 6],
+    anonce: &[u8; 32],
+    snonce: &[u8; 32],
+) -> Ptk {
+    let data = ptk_context(aa, spa, anonce, snonce);
+    let mut out = [0u8; 48];
+    kdf_sha256(pmk, b"Pairwise key expansion", &data, &mut out);
+    split_ptk(&out)
+}
+
+fn ptk_context(aa: &[u8; 6], spa: &[u8; 6], anonce: &[u8; 32], snonce: &[u8; 32]) -> [u8; 76] {
     let mut data = [0u8; 76];
     let (a_lo, a_hi) = if aa <= spa { (aa, spa) } else { (spa, aa) };
-    let (n_lo, n_hi) = if anonce <= snonce {
-        (anonce, snonce)
-    } else {
-        (snonce, anonce)
-    };
+    let (n_lo, n_hi) = if anonce <= snonce { (anonce, snonce) } else { (snonce, anonce) };
     data[0..6].copy_from_slice(a_lo);
     data[6..12].copy_from_slice(a_hi);
     data[12..44].copy_from_slice(n_lo);
     data[44..76].copy_from_slice(n_hi);
-    let mut out = [0u8; 48];
-    prf_sha1(pmk, b"Pairwise key expansion", &data, &mut out);
-    let mut ptk = Ptk {
-        kck: [0; 16],
-        kek: [0; 16],
-        tk: [0; 16],
-    };
+    data
+}
+
+fn split_ptk(out: &[u8; 48]) -> Ptk {
+    let mut ptk = Ptk { kck: [0; 16], kek: [0; 16], tk: [0; 16] };
     ptk.kck.copy_from_slice(&out[0..16]);
     ptk.kek.copy_from_slice(&out[16..32]);
     ptk.tk.copy_from_slice(&out[32..48]);
     ptk
+}
+
+/// AES-128-CMAC (RFC 4493 / NIST SP 800-38B) over the concatenation of `parts`.
+pub fn aes_cmac(key: &[u8; 16], parts: &[&[u8]]) -> [u8; 16] {
+    let aes = Aes128::new(key);
+    let dbl = |b: [u8; 16]| -> [u8; 16] {
+        let mut o = [0u8; 16];
+        for i in 0..16 {
+            o[i] = (b[i] << 1) | if i < 15 { b[i + 1] >> 7 } else { 0 };
+        }
+        if b[0] & 0x80 != 0 {
+            o[15] ^= 0x87;
+        }
+        o
+    };
+    let mut l = [0u8; 16];
+    aes.encrypt_block(&mut l);
+    let k1 = dbl(l);
+    let k2 = dbl(k1);
+    let mut x = [0u8; 16];
+    let mut blk = [0u8; 16];
+    let mut fill = 0usize;
+    for b in parts.iter().flat_map(|p| p.iter()) {
+        if fill == 16 {
+            for i in 0..16 {
+                x[i] ^= blk[i];
+            }
+            aes.encrypt_block(&mut x);
+            fill = 0;
+        }
+        blk[fill] = *b;
+        fill += 1;
+    }
+    // Last block: complete -> XOR K1; partial or empty -> pad 10* and XOR K2.
+    let k = if fill == 16 {
+        k1
+    } else {
+        blk[fill] = 0x80;
+        for v in blk.iter_mut().skip(fill + 1) {
+            *v = 0;
+        }
+        k2
+    };
+    for i in 0..16 {
+        x[i] ^= blk[i] ^ k[i];
+    }
+    aes.encrypt_block(&mut x);
+    x
 }
 
 // ---------------------------------------------------------------------------
@@ -581,17 +793,20 @@ pub fn parse_eapol_key(pdu: &[u8]) -> Option<EapolKey<'_>> {
     })
 }
 
-/// MIC for key descriptor version 2: HMAC-SHA1(KCK, PDU with the MIC field
-/// zeroed), truncated to 16 bytes.
+/// EAPOL-Key MIC over the PDU with the MIC field zeroed, by the key
+/// descriptor version in its Key Information: 2 = HMAC-SHA1-128,
+/// 3 = AES-128-CMAC (AKM 6 / PMF SHA-256 AKMs).
 fn compute_mic(kck: &[u8; 16], pdu: &[u8]) -> Option<[u8; 16]> {
     let total = eapol_pdu_len(pdu)?;
     let pdu = &pdu[..total];
-    let full = hmac_sha1(
-        kck,
-        &[&pdu[..MIC_OFFSET], &[0u8; 16], &pdu[MIC_OFFSET + 16..]],
-    );
+    let ver = be16(&pdu[5..7]) & key_info::VERSION_MASK;
+    let parts: [&[u8]; 3] = [&pdu[..MIC_OFFSET], &[0u8; 16], &pdu[MIC_OFFSET + 16..]];
     let mut mic = [0u8; 16];
-    mic.copy_from_slice(&full[..16]);
+    match ver {
+        2 => mic.copy_from_slice(&hmac_sha1(kck, &parts)[..16]),
+        3 => mic = aes_cmac(kck, &parts),
+        _ => return None,
+    }
     Some(mic)
 }
 
@@ -659,6 +874,57 @@ pub fn rsn_ie_psk(group_suite: u32) -> [u8; 22] {
     ie
 }
 
+/// RSN IE for a PSK network: CCMP pairwise, `group_suite` group cipher, one
+/// AKM (`akm` = suite type: 2 PSK, 6 PSK-SHA256) and the RSN capabilities
+/// (`caps`, little-endian on the wire; bit 7 MFPC, bit 6 MFPR). Without a
+/// PMKID list or group management cipher (BIP-CMAC-128 is the default).
+pub fn rsn_ie_psk_akm(group_suite: u32, akm: u8, caps: u16) -> [u8; 22] {
+    let mut ie = rsn_ie_psk(group_suite);
+    ie[19] = akm;
+    ie[20..22].copy_from_slice(&caps.to_le_bytes());
+    ie
+}
+
+/// RSN capability bits.
+pub const RSN_CAP_MFPR: u16 = 1 << 6;
+pub const RSN_CAP_MFPC: u16 = 1 << 7;
+
+/// An integrity group temporal key (PMF/BIP) from an IGTK KDE.
+pub struct Igtk {
+    /// 4 or 5.
+    pub key_id: u16,
+    /// IGTK packet number, little-endian (IPN[0] is the low byte).
+    pub ipn: [u8; 6],
+    pub key: [u8; 16],
+}
+
+/// Find the IGTK KDE (`dd len 00-0f-ac 09 {keyid(2, LE), ipn(6), igtk(16)}`)
+/// in decrypted key data.
+pub fn find_igtk_kde(key_data: &[u8]) -> Option<Igtk> {
+    let mut p = 0usize;
+    while p + 2 <= key_data.len() {
+        let tag = key_data[p];
+        let len = key_data[p + 1] as usize;
+        if tag == 0xdd && len == 0 {
+            return None;
+        }
+        let end = p + 2 + len;
+        if end > key_data.len() {
+            return None;
+        }
+        let body = &key_data[p + 2..end];
+        if tag == 0xdd && body.len() >= 4 + 24 && body[..4] == [0x00, 0x0f, 0xac, 0x09] {
+            let mut ipn = [0u8; 6];
+            ipn.copy_from_slice(&body[6..12]);
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&body[12..28]);
+            return Some(Igtk { key_id: u16::from_le_bytes([body[4], body[5]]), ipn, key });
+        }
+        p = end;
+    }
+    None
+}
+
 /// A group temporal key from a GTK KDE.
 pub struct Gtk {
     pub key_id: u8,
@@ -714,6 +980,13 @@ pub enum HsEvent {
         key: Vec<u8>,
         rsc: [u8; 8],
     },
+    /// Install an integrity group key (PMF, BIP-CMAC-128): key id 4 or 5,
+    /// the 16-byte IGTK and its 6-byte packet number (little-endian).
+    InstallIgtk {
+        key_id: u16,
+        key: [u8; 16],
+        ipn: [u8; 6],
+    },
     /// The 4-way handshake completed (port authorized).
     Complete,
     /// A protocol error the caller should log.
@@ -733,6 +1006,11 @@ pub struct Supplicant {
     complete: bool,
     /// Expected GTK length: 16 (CCMP group) or 32 (TKIP group).
     gtk_len: usize,
+    /// Negotiated AKM suite type (2 PSK, 6 PSK-SHA256); 0 = unknown, the
+    /// descriptor version of message 1 decides.
+    akm: u8,
+    /// Key descriptor version in use (from message 1): 2 or 3.
+    ver: u16,
 }
 
 const GTK_LEN: usize = 16;
@@ -758,6 +1036,8 @@ impl Supplicant {
             replay: None,
             complete: false,
             gtk_len: GTK_LEN,
+            akm: 0,
+            ver: 0,
         }
     }
 
@@ -766,6 +1046,18 @@ impl Supplicant {
     /// (HMAC-SHA1 MIC, AES key wrap) because the pairwise cipher is CCMP.
     pub fn set_group_tkip(&mut self, tkip: bool) {
         self.gtk_len = if tkip { TKIP_GTK_LEN } else { GTK_LEN };
+    }
+
+    /// The negotiated AKM (from the association request's RSN IE): 6
+    /// (PSK-SHA256) derives the PTK with KDF-SHA256 even if message 1 were
+    /// to carry descriptor version 2.
+    pub fn set_akm(&mut self, akm: u8) {
+        self.akm = akm;
+    }
+
+    /// Key descriptor version seen in message 1 (0 before it).
+    pub fn descriptor_version(&self) -> u16 {
+        self.ver
     }
 
     pub fn is_complete(&self) -> bool {
@@ -791,8 +1083,12 @@ impl Supplicant {
         if k.descriptor_type != DESC_RSN {
             return Self::err("unsupported key descriptor (WPA1)");
         }
-        if k.key_info & key_info::VERSION_MASK != 2 {
+        let ver = k.key_info & key_info::VERSION_MASK;
+        if ver != 2 && ver != 3 {
             return Self::err("unsupported key descriptor version");
+        }
+        if self.ver != 0 && ver != self.ver {
+            return Self::err("key descriptor version changed mid-handshake");
         }
         let ki = k.key_info;
         let has = |f: u16| ki & f == f;
@@ -815,12 +1111,18 @@ impl Supplicant {
         if self.complete {
             return Self::err("pairwise rekey not supported");
         }
-        let ptk = derive_ptk(&self.pmk, &self.ap_addr, &self.own_addr, &k.nonce, &self.snonce);
+        let ver = k.key_info & key_info::VERSION_MASK;
+        let ptk = if self.akm == 6 || ver == 3 {
+            derive_ptk_sha256(&self.pmk, &self.ap_addr, &self.own_addr, &k.nonce, &self.snonce)
+        } else {
+            derive_ptk(&self.pmk, &self.ap_addr, &self.own_addr, &k.nonce, &self.snonce)
+        };
+        self.ver = ver;
         self.anonce = Some(k.nonce);
         self.replay = Some(u64::from_be_bytes(k.replay_counter));
         let mut msg2 = build_eapol_key(
             k.version,
-            2 | key_info::TYPE_PAIRWISE | key_info::MIC,
+            self.ver | key_info::TYPE_PAIRWISE | key_info::MIC,
             0,
             &k.replay_counter,
             &self.snonce,
@@ -862,7 +1164,7 @@ impl Supplicant {
 
         let mut msg4 = build_eapol_key(
             k.version,
-            2 | key_info::TYPE_PAIRWISE | key_info::MIC | key_info::SECURE,
+            self.ver | key_info::TYPE_PAIRWISE | key_info::MIC | key_info::SECURE,
             0,
             &k.replay_counter,
             &[0u8; 32],
@@ -878,6 +1180,9 @@ impl Supplicant {
                 key: gtk.key,
                 rsc: k.rsc,
             });
+            if let Some(ig) = find_igtk_kde(&data) {
+                ev.push(HsEvent::InstallIgtk { key_id: ig.key_id, key: ig.key, ipn: ig.ipn });
+            }
             ev.push(HsEvent::Complete);
         }
         ev
@@ -910,21 +1215,25 @@ impl Supplicant {
         self.replay = Some(u64::from_be_bytes(k.replay_counter));
         let mut reply = build_eapol_key(
             k.version,
-            2 | key_info::MIC | key_info::SECURE,
+            self.ver | key_info::MIC | key_info::SECURE,
             0,
             &k.replay_counter,
             &[0u8; 32],
             &[],
         );
         eapol_set_mic(&ptk.kck, &mut reply);
-        vec![
+        let mut ev = vec![
             HsEvent::Send(reply),
             HsEvent::InstallGtk {
                 key_id: gtk.key_id,
                 key: gtk.key,
                 rsc: k.rsc,
             },
-        ]
+        ];
+        if let Some(ig) = find_igtk_kde(&data) {
+            ev.push(HsEvent::InstallIgtk { key_id: ig.key_id, key: ig.key, ipn: ig.ipn });
+        }
+        ev
     }
 }
 
