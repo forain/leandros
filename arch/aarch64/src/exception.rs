@@ -100,7 +100,7 @@ fn resched_ipi() {}
 /// MMIO, hands bytes to the tty/evdev servers' own queues, touches no user
 /// memory, and clears the device condition before returning — required,
 /// because INTID 33 is level-triggered and EOI follows immediately.
-fn uart_irq() {
+pub(crate) fn uart_irq() {
     super::uart::UART_RX_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // Flow-controlled (evdev_server::serial_rx_drain). If it stopped with the
     // backlog full the FIFO may still hold bytes, and INTID 33 is level-

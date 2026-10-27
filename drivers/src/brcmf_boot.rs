@@ -13,7 +13,9 @@
 //! MAC: the DTB's `local-mac-address` on the fmac node is written with
 //! `cur_etheraddr` (the nvram's macaddr is a placeholder); `[brcmf] mac ...`.
 //!
-//! The ready device is parked for the netdev layer: [`take_device`].
+//! The ready device then drives wifi0 on this same thread
+//! (`brcmf::netdev::run`); only when wifi0 was not registered is it parked
+//! for [`take_device`].
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
@@ -173,8 +175,18 @@ fn run(mut host: SdioHost<Mmio>, dt_mac: Option<[u8; 6]>) {
     };
     log(&format!("ver {}", ver));
     *VERSION.lock() = ver;
-    *DEVICE.lock() = Some(dev);
     STATE.store(STATE_READY, Ordering::Release);
+    // Hand-off to wifi0. `netdev::init` ran at kernel init, long before this
+    // thread could get here (the root is mounted by userspace init and we
+    // waited for it above), so `present()` is already final. This thread
+    // becomes the wifi0 driver thread: BCDC init, then the connection
+    // manager (autoconnect to /etc/leandros/wifi.conf or netctl profiles).
+    if crate::brcmf::netdev::present() {
+        crate::brcmf::netdev::run(dev);
+    } else {
+        log("wifi0 not registered (brcmf.disable=1); device parked");
+        *DEVICE.lock() = Some(dev);
+    }
 }
 
 fn be32(b: &[u8], o: usize) -> Option<u32> {

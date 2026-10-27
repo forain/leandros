@@ -22,6 +22,7 @@ pub mod snd;
 pub mod hda;
 pub mod framebuffer;
 pub mod kms;
+pub mod kms_v3d;
 pub mod vector_font;
 pub mod glyphs;
 pub mod drm;
