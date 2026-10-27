@@ -234,3 +234,49 @@ mod bcm2712 {
         assert!(D0_PINS.iter().all(|r| r.1 <= 3) && D0_PINS.iter().any(|r| r.3 == 5));
     }
 }
+
+// ---- lane pibrcmf-dl: runtime bus knobs (brcmfctl retry sdclk/hs/blk/blksz/chunk) ----
+
+#[test]
+fn capped_split_never_exceeds_cap() {
+    for (cap, len) in [(256usize, 32768usize), (100, 1000), (32, 200), (4096, 609309 % 32768), (0, 70000)] {
+        let mut total = 0;
+        let mut next = 0x8000u32;
+        split_cmd53_capped(0x8000, true, len, 64, true, cap, |c| -> Result<(), ()> {
+            let n = c.bytes(64);
+            assert_eq!(c.addr, next);
+            if cap != 0 { assert!(n <= cap, "cap {} chunk {}", cap, n); }
+            if cap != 0 && cap < 64 { assert!(!c.block); }
+            if !c.block { assert!(n <= 64); }
+            next += n as u32;
+            total += n;
+            Ok(())
+        }).unwrap();
+        assert_eq!(total, len);
+    }
+}
+
+#[test]
+fn tune_knobs_reach_the_bus() {
+    let mut t = SdioTune::default();
+    assert!(t.set("sdclk", "25000") && t.set("blk", "0") && t.set("blksz", "512") && t.set("chunk", "128"));
+    assert!(!t.set("blksz", "63") && !t.set("sdclk", "99999") && !t.set("nope", "1"));
+    let mut h = SdioHost::new(MockHost::new());
+    h.tune = t;
+    h.host_init().unwrap();
+    let ci = h.init_card(true).unwrap();
+    assert!(ci.high_speed);
+    assert_eq!(ci.clk_khz, 25_000);
+    assert_eq!((h.io.byte(0, 0x110), h.io.byte(0, 0x111)), (0, 2)); // F1 512 via FBR1
+    h.io.ops53.clear();
+    let buf = vec![0x5au8; 1000];
+    h.write_bytes(FUNC_BACKPLANE, 0x8000, true, &buf).unwrap();
+    assert!(h.io.ops53.iter().all(|o| !o.block && o.count <= 128), "{:?}", h.io.ops53.len());
+    assert_eq!(h.io.ops53.iter().map(|o| if o.count == 0 { 512 } else { o.count }).sum::<u32>(), 1000);
+    // hs=0 caps the clock at default speed.
+    let mut h = SdioHost::new(MockHost::new());
+    h.tune.hs = false;
+    h.host_init().unwrap();
+    let ci = h.init_card(h.tune.hs).unwrap();
+    assert_eq!((ci.high_speed, ci.clk_khz), (false, 25_000));
+}
