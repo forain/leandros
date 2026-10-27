@@ -66,6 +66,11 @@ const KIND_VIRT_TABLET: u8 = 1;
 pub const DEVKIND_KEYBOARD: u8 = 2;
 /// A hot-plugged relative mouse (REL_X/Y/WHEEL + BTN_LEFT..BTN_EXTRA).
 pub const DEVKIND_MOUSE: u8 = 3;
+/// uinput-created devices (caps from the creator): keyboard-like, gamepad, mouse.
+pub const DEVKIND_UINPUT: u8 = 4;
+pub const DEVKIND_UINPUT_PAD: u8 = 5;
+pub const DEVKIND_UINPUT_MOUSE: u8 = 6;
+pub mod uinput;
 
 const NAME_MAX: usize = 64;
 
@@ -1157,6 +1162,10 @@ fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) ->
         let kind = { let f = unsafe { arch_interrupt_save() };
                      let k = STATE.lock().devs[dev_id].kind;
                      unsafe { arch_interrupt_restore(f); } k };
+        if uinput::is_kind(kind) {
+            uinput::fill_bits(dev_id, ev, &mut buf[..n]);
+            return copy_out(pid, arg_ptr, &buf[..n]);
+        }
         let mut set = |bit: usize| if bit / 8 < n { buf[bit / 8] |= 1 << (bit % 8); };
         match (kind, ev) {
             (DEVKIND_KEYBOARD, 0) => { set(0); set(1); set(EV_LED as usize); }
@@ -1219,6 +1228,12 @@ fn eviocgabs(dev_id: usize, abs: usize, arg_ptr: usize, pid: u32) -> Message {
     // input_absinfo{ value, min, max, fuzz, flat, resolution } = 6×i32 = 24B.
     // Both axes: 0..32767, resolution 0 (libinput rejects X-xor-Y and mismatched
     // resolution).
+    if dev_id >= FIXED_DEVICES && uinput::is_kind(dev_kind(dev_id)) {
+        let info = uinput::absinfo(dev_id, abs).unwrap_or([0; 6]);
+        return copy_out(pid, arg_ptr, unsafe {
+            core::slice::from_raw_parts(info.as_ptr() as *const u8, 24)
+        });
+    }
     if dev_id == DEV_TABLET && (abs == ABS_X || abs == ABS_Y) {
         let info: [i32; 6] = [0, 0, 32767, 0, 0, 0];
         copy_out(pid, arg_ptr, unsafe {
@@ -1253,6 +1268,7 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
     let dev_id = arg(msg, 0) as usize;
 
     if dev_id == HOTPLUG_DEV_ID as usize { return hp_handle(msg); }
+    if dev_id == uinput::UINPUT_DEV_ID as usize { return uinput::handle(msg); }
     if dev_id >= MAX_DEVICES { return err_reply(-19); } // ENODEV
     // A hot-unplugged node: every request but the close fails like Linux
     // evdev after disconnect (read/ioctl/write ENODEV, poll HUP|ERR).
@@ -2054,6 +2070,7 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     vfs_server::register_device("/dev/input/event0", port_id, 0, 13, 64);
     vfs_server::register_device("/dev/input/event1", port_id, 1, 13, 65);
     vfs_server::register_device_notify_open("/dev/input/hotplug", port_id, HOTPLUG_DEV_ID, 10, 240);
+    vfs_server::register_device_notify_open("/dev/uinput", port_id, uinput::UINPUT_DEV_ID, 10, 223);
     // Kernel-only: VFS_READ / VFS_IOCTL copy to and from the task named in
     // slot 3 (copy_to_task/copy_from_task). Only the kernel's VFS forward may
     // fill that slot; a raw user IPC naming another pid would read or write
@@ -2214,7 +2231,8 @@ fn hp_format(r: &HpRec, out: &mut [u8; 64]) -> usize {
     put(out, &mut n, EVENT_PATHS[r.dev as usize].trim_start_matches("/dev/input/").as_bytes());
     let kind: &[u8] = match r.kind {
         KIND_VIRT_TABLET => b" tablet ",
-        DEVKIND_MOUSE => b" mouse ",
+        DEVKIND_MOUSE | DEVKIND_UINPUT_MOUSE => b" mouse ",
+        DEVKIND_UINPUT_PAD => b" pad ",
         _ => b" kbd ",
     };
     put(out, &mut n, kind);
