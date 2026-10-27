@@ -1485,3 +1485,60 @@ impl<F: Fwil> Brcmf<F> {
         out
     }
 }
+
+// ── data-path bisection knob (lane piwedge) ────────────────────────────────
+
+/// `dp=on`: normal. `dp=off`: keep the association but never raise wifi0's
+/// carrier (received data is drained from the bus and dropped, nothing is
+/// sent). `dp=rx`: carrier up and frames delivered, but every transmit is
+/// dropped (no DHCP/ARP leaves the box).
+pub const DP_ON: u8 = 0;
+pub const DP_OFF: u8 = 1;
+pub const DP_RX: u8 = 2;
+
+/// Parses `dp <on|off|rx> [yield|noyield]` (ctl) or `dp=<..>` (cmdline form).
+/// `yield` makes the manager loop sleep 1 ms on every pass. Returns
+/// (mode, yield change), or None if `text` is not a dp command.
+pub fn parse_dp(text: &str) -> Option<(Option<u8>, Option<bool>)> {
+    // brcmfctl prefixes a `seq=<n>` token; `dp=off,yield` is the cmdline form.
+    let mut words = text.split_ascii_whitespace().filter(|w| !w.starts_with("seq="))
+        .flat_map(|w| w.split(|c: char| c == ',' || c == '=')).filter(|w| !w.is_empty());
+    if words.next() != Some("dp") { return None; }
+    let mut mode = None;
+    let mut y = None;
+    for w in words {
+        match w {
+            "on" => mode = Some(DP_ON),
+            "off" => mode = Some(DP_OFF),
+            "rx" => mode = Some(DP_RX),
+            "yield" => y = Some(true),
+            "noyield" => y = Some(false),
+            _ => return None,
+        }
+    }
+    Some((mode, y))
+}
+
+pub fn dp_mode_name(m: u8) -> &'static str {
+    match m { DP_OFF => "off", DP_RX => "rx", _ => "on" }
+}
+
+#[cfg(test)]
+mod dp_tests {
+    use super::*;
+    #[test]
+    fn dp_knob_parses() {
+        assert_eq!(parse_dp("dp off"), Some((Some(DP_OFF), None)));
+        assert_eq!(parse_dp("dp=rx"), Some((Some(DP_RX), None)));
+        assert_eq!(parse_dp("dp on yield"), Some((Some(DP_ON), Some(true))));
+        assert_eq!(parse_dp("dp=off,yield"), Some((Some(DP_OFF), Some(true))));
+        assert_eq!(parse_dp("dp noyield"), Some((None, Some(false))));
+        assert_eq!(parse_dp("dp"), Some((None, None)));
+        assert_eq!(parse_dp("dp bogus"), None);
+        assert_eq!(parse_dp("diag"), None);
+        assert_eq!(parse_dp("dpx off"), None);
+        assert_eq!(parse_dp("seq=3.1234 dp off"), Some((Some(DP_OFF), None)));
+        assert_eq!(parse_dp("seq=4.9 dp rx yield"), Some((Some(DP_RX), Some(true))));
+        assert_eq!(parse_dp("seq=5.1 diag"), None);
+    }
+}

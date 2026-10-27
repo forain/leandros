@@ -23,6 +23,7 @@
 extern crate alloc;
 
 pub mod clone;
+pub mod wedge;
 pub mod fdkey;
 pub mod playstat;
 pub mod context;
@@ -5830,7 +5831,12 @@ fn watchdog_scan(me: usize) {
         fn print_number(n: u32);
         fn print_hex(n: usize);
     }
-    fn s(msg: &str) { for &b in msg.as_bytes() { unsafe { arch_serial_putc(b) } } }
+    // With wedge diagnostics on (rpi5), straight to the UART: the console
+    // stage and its OUTBOX lock may be exactly what the stalled CPU holds.
+    fn s(msg: &str) { if wedge::enabled() { wedge::raw_str(msg) } else { for &b in msg.as_bytes() { unsafe { arch_serial_putc(b) } } } }
+    fn pn(v: u32) { if wedge::enabled() { wedge::raw_dec(v as u64) } else { unsafe { print_number(v) } } }
+    fn ph(v: usize) { if wedge::enabled() { wedge::raw_hex(v as u64) } else { unsafe { print_hex(v) } } }
+    wedge::scan_slots();
     let n = active_cpu_count();
     // Pass 1: age every other CPU's counter as seen from here.
     for j in 0..n {
@@ -5862,34 +5868,35 @@ fn watchdog_scan(me: usize) {
         // If it is spinning with IRQs masked the IPI just stays pending.
         unsafe { arch_send_resched_ipi(j); }
         if (age - WD_STALL_SCANS) % WD_REPEAT_SCANS != 0 { continue; }
-        s("\n[WDOG] cpu"); unsafe { print_number(j as u32) };
-        s(" took no timer tick for ~"); unsafe { print_number(age * WD_SCAN_TICKS / 100) };
-        s(" s (IRQs masked or timer dead): pid="); unsafe { print_number(CURRENT_PID[j].load(Ordering::Relaxed)) };
+        s("\n[WDOG] cpu"); pn(j as u32);
+        s(" took no timer tick for ~"); pn(age * WD_SCAN_TICKS / 100);
+        s(" s (IRQs masked or timer dead): pid="); pn(CURRENT_PID[j].load(Ordering::Relaxed));
         // Name the process if the path table is free (try_lock: this is IRQ
         // context on a CPU that may itself be the one holding it).
         let tgid = CURRENT_TGID[j].load(Ordering::Relaxed);
         if let Some(t) = EXE_PATHS.try_lock() {
             if let Some(e) = t.get(tgid) {
-                s(" ("); for &b in e { unsafe { arch_serial_putc(b) } } s(")");
+                s(" ("); if let Ok(t) = core::str::from_utf8(e) { s(t) } s(")");
             }
         }
         let sc = CUR_SYSCALL[j].load(Ordering::Relaxed);
-        if sc == NO_SYSCALL { s(" not in a syscall"); } else { s(" last syscall "); unsafe { print_hex(sc as usize) }; }
-        s(" preempt_disable="); unsafe { print_number(PREEMPT_DISABLE[j].load(Ordering::Relaxed)) };
+        if sc == NO_SYSCALL { s(" not in a syscall"); } else { s(" last syscall "); ph(sc as usize); }
+        s(" preempt_disable="); pn(PREEMPT_DISABLE[j].load(Ordering::Relaxed));
         let want = lockwatch::wanted_by(j);
         if want != 0 {
             s(" spinning for "); s(lockwatch::name(want));
             match lockwatch::holder(want) {
-                Some(h) => { s(" held by cpu"); unsafe { print_number(h as u32) }; }
+                Some(h) => { s(" held by cpu"); pn(h as u32); }
                 None => s(" (free now)"),
             }
         }
-        s(" local_ticks="); unsafe { print_number(WD_SEEN[me][j].load(Ordering::Relaxed)) };
-        s(" (seen from cpu"); unsafe { print_number(me as u32) }; s(")\n");
+        wedge::wdog_extra(j);
+        s(" local_ticks="); pn(WD_SEEN[me][j].load(Ordering::Relaxed));
+        s(" (seen from cpu"); pn(me as u32); s(")\n");
         // Every tracked lock this CPU holds: the other half of a deadlock.
         for id in 1..lockwatch::N_LOCKS as u8 {
             if lockwatch::holder(id) == Some(j) {
-                s("[WDOG]   cpu"); unsafe { print_number(j as u32) }; s(" holds "); s(lockwatch::name(id)); s("\n");
+                s("[WDOG]   cpu"); pn(j as u32); s(" holds "); s(lockwatch::name(id)); s("\n");
             }
         }
         // Where exactly it is (x86_64: an NMI gets through masked IRQs).

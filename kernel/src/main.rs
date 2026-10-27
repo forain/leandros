@@ -387,6 +387,16 @@ pub unsafe extern "C" fn arch_serial_putc(c: u8) {
     }
 }
 
+/// One console byte for `sched::wedge`: the UART data register after a
+/// bounded FIFO wait, with no klog, stage, lock or framebuffer on the way.
+#[no_mangle]
+pub unsafe extern "C" fn arch_wedge_putc(c: u8) {
+    #[cfg(target_arch = "x86_64")]
+    arch_x86_64::putc_dump(c);
+    #[cfg(target_arch = "aarch64")]
+    arch_aarch64::uart::putc_dump(c);
+}
+
 /// Serial write for the Ctrl-T task dump only (`sched::dump_tasks`) — see
 /// `arch_x86_64::putc_dump` / `arch_aarch64::uart::putc_dump` for why this
 /// bypasses the sticky TX_WEDGED drop latch that `arch_serial_putc` uses.
@@ -570,7 +580,7 @@ fn stage_bytes(cpu: usize, bytes: &[u8], direct: bool) {
             let mut lb = [0u8; STAGE_CAP];
             for k in 0..n { lb[k] = out[k] as u8; }
             klog::push_bytes(&lb[..n]);
-            let mut ob = OUTBOX.lock();
+            let mut ob = outbox_lock();
             if ob.len + n <= OUTBOX_CAP {
                 for k in 0..n {
                     let at = (ob.head + ob.len) % OUTBOX_CAP;
@@ -595,6 +605,17 @@ fn stage_bytes(cpu: usize, bytes: &[u8], direct: bool) {
     if queued { console_drain_outbox(); }
 }
 
+/// `OUTBOX.lock()` with the wedge spin probe: a CPU stuck behind a stalled
+/// holder says so on the raw UART instead of going silent.
+fn outbox_lock() -> spin::MutexGuard<'static, Outbox> {
+    let mut sp = sched::wedge::Spin::new();
+    loop {
+        if let Some(g) = OUTBOX.try_lock() { return g; }
+        sp.tick("OUTBOX");
+        core::hint::spin_loop();
+    }
+}
+
 /// Lines dropped from the UART/screen (not from the klog ring) since the last
 /// drain reported them.
 static OUTBOX_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -603,7 +624,7 @@ static OUTBOX_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// outbox. Returns how many entries were copied; 0 when it is empty.
 fn outbox_pop_line(out: &mut [u16; STAGE_CAP]) -> usize {
     let f = unsafe { arch_interrupt_save() };
-    let mut ob = OUTBOX.lock();
+    let mut ob = outbox_lock();
     let mut n = 0;
     while ob.len > 0 && n < out.len() {
         let x = ob.buf[ob.head];

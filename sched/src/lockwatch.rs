@@ -573,11 +573,13 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
         // Spin with try_lock rather than `inner.lock()` so a CPU waiting here
         // with IRQs masked still answers TLB-shootdown requests: the holder
         // (or a third CPU) may be spinning for this CPU's acknowledgement.
+        let mut sp = crate::wedge::Spin::new();
         let guard = loop {
             if !self.inner.is_locked() {
                 if let Some(g) = self.inner.try_lock() { break g; }
             }
             mm::paging::tlb_service_pending();
+            sp.tick(name(self.lock_id()));
             core::hint::spin_loop();
         };
         WANT[cpu].store(0, Ordering::Relaxed);
