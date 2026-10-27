@@ -580,3 +580,61 @@ fn dl_knobs_parse() {
     assert!(k.set("verify", "1") && k.set("win4b", "0"));
     assert_eq!((k.verify, k.win4b), (1, false));
 }
+
+// ---- lane piwifi-up: waits stay bounded once data frames flow -------------------
+
+fn flooded() -> Brcmf<MockChip> {
+    let mut d = booted();
+    let f = eth(0x0800, &[0x45; 300]);
+    d.bus.flood = Some(f.clone());
+    d.bus.fw_send_eth(sdpcm::CHAN_DATA, &f, 0);
+    d
+}
+
+#[test]
+fn ioctl_times_out_under_steady_rx() {
+    // Link up: the firmware keeps sending data frames but never answers a
+    // control request. Each pump then reads frames and never waits, so a wait
+    // that only charged idle polls looped forever with IRQs masked.
+    let mut d = flooded();
+    d.ctl_timeout_us = 200_000;
+    d.bus.mute = true;
+    let mut b = [0u8; 4];
+    assert_eq!(d.iovar_get("ver", &mut b).unwrap_err(), FwError::Timeout);
+    assert_eq!(d.stats.ctl_timeouts, 1);
+    assert!(d.bus.flood_reads >= 1000, "only {} frames read", d.bus.flood_reads);
+    assert!(d.stats.max_wait_us >= 200_000);
+    // Frames read while waiting are kept for the next poll (up to MAX_PENDING).
+    assert_eq!(d.pending_frames(), bcdc::MAX_PENDING);
+}
+
+#[test]
+fn data_tx_gives_up_when_window_stays_closed_under_rx() {
+    let mut d = flooded();
+    d.bus.window_adv = 0; // every header advertises window == tx_seq - 1: no credit
+    let mut s = Sink::default();
+    d.poll(&mut s, 2_000).unwrap();
+    assert!(!d.sdpcm.tx_credit());
+    let f = eth(0x0800, &[1; 100]);
+    assert_eq!(d.tx_data(&f).unwrap_err(), FwError::Timeout);
+    assert_eq!((d.stats.credit_waits, d.stats.credit_timeouts), (1, 1));
+    // The window reopens: the next frame goes out.
+    d.bus.window_adv = 8;
+    d.bus.fw_send_eth(sdpcm::CHAN_DATA, &f, 0);
+    d.tx_data(&f).unwrap();
+}
+
+static FAKE_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[test]
+fn ioctl_wait_is_bounded_by_the_real_clock() {
+    // The kernel's clock: each reading is 0.5 s later. A muted firmware must
+    // time out on real time even though the virtual budget is far from spent.
+    let mut d = booted();
+    d.clock = Some(|| FAKE_CLOCK.fetch_add(500_000, std::sync::atomic::Ordering::Relaxed));
+    d.bus.mute = true;
+    let t0 = d.bus.now_us;
+    let mut b = [0u8; 4];
+    assert_eq!(d.iovar_get("ver", &mut b).unwrap_err(), FwError::Timeout);
+    assert!(d.bus.now_us - t0 < 100_000, "virtual wait {} us", d.bus.now_us - t0);
+}

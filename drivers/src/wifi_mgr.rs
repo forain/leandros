@@ -1547,9 +1547,13 @@ fn attempt<R: Radio>(mgr: &Mgr, r: &mut R, req: Req) -> After {
     // Connected.
     mgr.note_success(&req.uuid, nc.bssid);
     {
+        // Ask the radio before taking the state lock: a firmware query can
+        // take up to its control timeout, and every status reader spins on
+        // `st` with IRQs masked meanwhile.
+        let rate = r.tx_rate_kbps();
         let mut st = mgr.st.lock();
         st.ws.akm = a;
-        st.ws.tx_rate_kbps = r.tx_rate_kbps();
+        st.ws.tx_rate_kbps = rate;
         st.last_signal = (now_ms(), nc.signal_dbm);
     }
     mgr.set_state(wifi_state::CONNECTED, reason::NONE);

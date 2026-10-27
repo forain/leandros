@@ -244,6 +244,8 @@ fn attempt(mut host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>, o:
                  rep.nvram_addr, rep.rstvec, rep.sr_enabled as u8, now_ms() - t));
 
     let mut dev: Device = Brcmf::new(host, chip);
+    // Real-time bound on every credit / control wait (see bcdc::FRAME_COST_US).
+    dev.clock = Some(|| sched::monotonic_ns() / 1_000);
     let failed = |mut dev: Device, msg: String, lines: usize| {
         fail(&msg);
         dump_diag(&mut dev.bus, &mut dev.chip, lines);

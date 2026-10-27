@@ -97,6 +97,11 @@ pub struct MockChip {
     pub corrupt_next: bool,
     /// Firmware swallows control requests.
     pub mute: bool,
+    /// Steady RX: every data frame the host reads is replaced by a new copy
+    /// (link-up traffic). `flood_reads` counts them; past FLOOD_LIMIT the
+    /// mock panics, so an unbounded host wait fails instead of hanging.
+    pub flood: Option<Vec<u8>>,
+    pub flood_reads: u64,
     /// HT (PLL) is only available once the firmware runs, `ht_delay_us` after
     /// its start (the real 43455: an HT request before the download times out).
     pub ht_needs_fw: bool,
@@ -107,6 +112,8 @@ pub struct MockChip {
     /// The fake firmware traps right after start (console says why).
     pub fw_trap: bool,
 }
+
+pub const FLOOD_LIMIT: u64 = 1_000_000;
 
 /// Where the fake firmware puts sdpcm_shared and its console (RAM offsets).
 /// (Below the nvram at the top, above any test image.)
@@ -137,6 +144,8 @@ impl MockChip {
             sr: true,
             corrupt_next: false,
             mute: false,
+            flood: None,
+            flood_reads: 0,
             ht_needs_fw: true,
             ht_delay_us: 50_000,
             fw_start_us: 0,
@@ -431,6 +440,12 @@ impl SdioBus for MockChip {
                     if self.rx_cursor >= f.len() {
                         self.rxq.pop_front();
                         self.rx_cursor = 0;
+                        if let Some(e) = self.flood.clone() {
+                            self.flood_reads += 1;
+                            assert!(self.flood_reads < FLOOD_LIMIT, "host wait unbounded under steady RX");
+                            self.now_us += 20;
+                            if self.rxq.is_empty() { self.fw_send_eth(sdpcm::CHAN_DATA, &e, 0); }
+                        }
                     }
                 }
             }

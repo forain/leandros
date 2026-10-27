@@ -34,6 +34,11 @@ pub const MAX_TX_MSG: usize = 1518;
 pub const CTL_TIMEOUT_US: u32 = 2_500_000;
 /// Queued event/data frames received while waiting for a control response.
 pub const MAX_PENDING: usize = 64;
+/// Bus time charged per frame a wait loop reads instead of sleeping. A
+/// firmware that keeps sending frames (data traffic once the link is up)
+/// must not stretch a bounded wait forever: before this, a pump that read
+/// frames charged nothing, so a control wait under steady RX never timed out.
+pub const FRAME_COST_US: u32 = 50;
 pub const ETH_P_LINK_CTL: u16 = 0x886c;
 
 impl From<SdpcmError> for FwError {
@@ -45,6 +50,18 @@ impl From<SdpcmError> for FwError {
             _ => FwError::Bus(super::bus::BusError::Io),
         }
     }
+}
+
+/// Data-path counters mirrored from the live device for /proc/net/nic (the
+/// device itself lives on the brcmf kthread; these are lock-free snapshots).
+pub mod dp {
+    use core::sync::atomic::AtomicU32;
+    pub static CREDIT_WAITS: AtomicU32 = AtomicU32::new(0);
+    pub static CREDIT_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+    pub static CTL_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+    pub static MAX_WAIT_US: AtomicU32 = AtomicU32::new(0);
+    /// tx_seq | tx_max << 8 | flowcontrol << 16 | fcstate << 24
+    pub static WINDOW: AtomicU32 = AtomicU32::new(0);
 }
 
 /// Builds the dcmd header.
@@ -61,6 +78,13 @@ pub struct BcdcStats {
     pub rx_dropped: u32,
     pub rx_badhdr: u32,
     pub sdpcm_errors: u32,
+    /// Control requests that got no answer in `ctl_timeout_us`.
+    pub ctl_timeouts: u32,
+    /// Data frames that had to wait for a tx credit / gave up waiting.
+    pub credit_waits: u32,
+    pub credit_timeouts: u32,
+    /// Longest single wait (credit or control response), microseconds.
+    pub max_wait_us: u32,
 }
 
 /// The SDIO Wi-Fi device: owns the bus, the chip state and the protocol state.
@@ -76,6 +100,9 @@ pub struct Brcmf<B: SdioBus> {
     rxbuf: Vec<u8>,
     msg: Vec<u8>,
     ctl_resp: Option<Vec<u8>>,
+    /// Monotonic microsecond clock. When set, every wait is also bounded in
+    /// real time (the kernel sets it; host tests run on virtual time only).
+    pub clock: Option<fn() -> u64>,
 }
 
 impl<B: SdioBus> Brcmf<B> {
@@ -93,7 +120,37 @@ impl<B: SdioBus> Brcmf<B> {
             rxbuf: Vec::new(),
             msg: Vec::new(),
             ctl_resp: None,
+            clock: None,
         }
+    }
+
+    fn now(&self) -> Option<u64> { self.clock.map(|c| c()) }
+
+    /// Mirror the data-path counters into [`dp`].
+    pub fn publish(&self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let s = &self.stats;
+        dp::CREDIT_WAITS.store(s.credit_waits, Relaxed);
+        dp::CREDIT_TIMEOUTS.store(s.credit_timeouts, Relaxed);
+        dp::CTL_TIMEOUTS.store(s.ctl_timeouts, Relaxed);
+        dp::MAX_WAIT_US.store(s.max_wait_us, Relaxed);
+        let p = &self.sdpcm;
+        dp::WINDOW.store(p.tx_seq as u32 | (p.tx_max as u32) << 8 | (p.flowcontrol as u32) << 16 | (p.fcstate as u32) << 24, Relaxed);
+    }
+
+    /// Charge one wait-loop pass: `n` frames read, else a card-interrupt wait.
+    /// Returns the elapsed time in the larger of virtual and real terms.
+    fn charge(&mut self, elapsed: &mut u32, n: usize, t0: Option<u64>) -> u32 {
+        if n == 0 {
+            self.wait(elapsed, 1000);
+        } else {
+            *elapsed = elapsed.saturating_add((n as u32).saturating_mul(FRAME_COST_US));
+        }
+        let real = match (t0, self.now()) {
+            (Some(a), Some(b)) => b.saturating_sub(a).min(u32::MAX as u64) as u32,
+            _ => 0,
+        };
+        (*elapsed).max(real)
     }
 
     /// One service pass: interrupt status, then up to `max_frames` frames.
@@ -153,15 +210,23 @@ impl<B: SdioBus> Brcmf<B> {
     }
 
     fn wait_credit(&mut self, timeout_us: u32) -> Result<(), FwError> {
+        if self.sdpcm.tx_credit() {
+            return Ok(());
+        }
+        self.stats.credit_waits += 1;
+        let t0 = self.now();
         let mut elapsed = 0;
+        let mut spent = 0;
         while !self.sdpcm.tx_credit() {
-            if elapsed >= timeout_us {
+            if spent >= timeout_us {
+                self.stats.credit_timeouts += 1;
+                self.stats.max_wait_us = self.stats.max_wait_us.max(spent);
                 return Err(FwError::Timeout);
             }
-            if self.pump(8, None)? == 0 {
-                self.wait(&mut elapsed, 1000);
-            }
+            let n = self.pump(8, None)?;
+            spent = self.charge(&mut elapsed, n, t0);
         }
+        self.stats.max_wait_us = self.stats.max_wait_us.max(spent);
         Ok(())
     }
 
@@ -191,18 +256,26 @@ impl<B: SdioBus> Brcmf<B> {
         self.msg = msg;
         r?;
 
+        let t0 = self.now();
         let mut elapsed = 0u32;
+        let mut spent = 0u32;
         let rsp = loop {
             if let Some(r) = self.ctl_resp.take() {
                 break r;
             }
-            if elapsed >= self.ctl_timeout_us {
+            if spent >= self.ctl_timeout_us {
+                self.stats.ctl_timeouts += 1;
+                self.stats.max_wait_us = self.stats.max_wait_us.max(spent);
+                self.publish();
                 return Err(FwError::Timeout);
             }
-            if self.pump(16, Some(id))? == 0 && self.ctl_resp.is_none() {
-                self.wait(&mut elapsed, 1000);
+            let n = self.pump(16, Some(id))?;
+            if self.ctl_resp.is_none() {
+                spent = self.charge(&mut elapsed, n, t0);
             }
         };
+        self.stats.max_wait_us = self.stats.max_wait_us.max(spent);
+        self.publish();
         let rflags = u32::from_le_bytes([rsp[8], rsp[9], rsp[10], rsp[11]]);
         if rflags & BCDC_DCMD_ERROR != 0 {
             let st = i32::from_le_bytes([rsp[12], rsp[13], rsp[14], rsp[15]]);
@@ -256,7 +329,9 @@ impl<B: SdioBus> Fwil for Brcmf<B> {
         if frame.len() > sdpcm::MAX_RX_DATASZ {
             return Err(FwError::TooLong);
         }
-        self.wait_credit(10_000)?;
+        let w = self.wait_credit(10_000);
+        self.publish();
+        w?;
         let mut msg = core::mem::take(&mut self.msg);
         msg.clear();
         msg.extend_from_slice(&[BCDC_PROTO_VER << BCDC_FLAG_VER_SHIFT, 0, self.ifidx, 0]);
