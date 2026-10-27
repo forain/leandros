@@ -4795,10 +4795,11 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
     if path.starts_with(b"/dev/") || path.starts_with(b"/proc/")
        || path.starts_with(b"/tmp/") || path.starts_with(b"/etc/")
        || path == b"/dev" || path == b"/proc" || path == b"/tmp" || path == b"/etc"
-       // The /run/user tmpfs mount (Wayland + D-Bus sockets). /dev/shm rides
-       // the /dev/ prefix above; /tmp rides /tmp/. Intercept /run/user before
-       // the mount table so it lands on tmpfs, not the pivoted F2FS root.
-       || path.starts_with(b"/run/user") || path == b"/run"
+       // The /run and /run/user tmpfs mounts (pid/lock files, Wayland, D-Bus
+       // and service sockets). /dev/shm rides the /dev/ prefix above; /tmp
+       // rides /tmp/. Intercept /run before the mount table so it lands on
+       // tmpfs, not the pivoted F2FS root.
+       || path == b"/run" || path.starts_with(b"/run/")
        // Only the synthesized `/sys/class/block` subtree. Like /proc it is not
        // a mount and must be intercepted before `find_mount_port()`, which
        // matches every absolute path once init has pivot_root'ed the F2FS
@@ -4837,7 +4838,13 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
 /// dir (`/run/user/<uid>`) is an ordinary pool directory a login session can
 /// `mkdir` with its own uid/gid and 0700 mode. Root's `/run/user/0` is seeded
 /// into the pool by `init()` so it exists from boot.
-static TMPFS_ROOTS: &[&[u8]] = &[b"/tmp", b"/dev/shm", b"/run/user"];
+// `/run` is a tmpfs like on Linux (runtime state: pid files, lock files,
+// service sockets such as /run/bluetooth/btd.sock); nothing under it survives
+// a reboot, and the F2FS root's own /run is shadowed. `/run/user` stays its
+// own root nested inside it -- it must precede `/run` here, because
+// `tmpfs_root_of` takes the first match and the per-root index is the
+// anonymous st_dev (appending keeps the older roots' device numbers).
+static TMPFS_ROOTS: &[&[u8]] = &[b"/tmp", b"/dev/shm", b"/run/user", b"/run"];
 
 /// Owner, group and permission bits of each `/dev/pts/N`, as devpts keeps
 /// them: a new pair's slave belongs to whoever opened `/dev/ptmx`, group tty,

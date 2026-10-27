@@ -37,7 +37,7 @@ pub mod report;
 use alloc::string::String;
 use alloc::vec::Vec;
 use common::*;
-use leandros_libc::syscall::{syscall3, syscall4};
+use leandros_libc::syscall::{syscall3, syscall4, syscall5};
 use report::{HidDevice, Role, Ev};
 
 // ── btd client (docs/servers/bluetooth.md section B) ───────────────────────
@@ -546,13 +546,20 @@ fn daemon() -> i32 {
         let _ = bt.frame(OP_LISTEN, &psm.to_le_bytes());
     }
     let _ = bt.frame(OP_DEVICES, &[]);
-    // The request spool is writable by every local user: the desktop's
-    // org.bluez shim (leandros-sysbus bluez, running as the session user)
-    // appends `AA:BB:CC:DD:EE:FF` lines for Device1.Connect on input devices.
+    // The request spool is root:bluetooth 0660: the desktop's org.bluez shim
+    // (leandros-sysbus bluez, running as the session user, a member of
+    // `bluetooth`) appends `AA:BB:CC:DD:EE:FF` lines for Device1.Connect on
+    // input devices; users outside the group cannot ask for a connection.
     write_file(REQ, b"", O_TRUNC);
     #[cfg(target_arch = "aarch64")] const SYS_FCHMODAT: usize = 53;
     #[cfg(target_arch = "x86_64")] const SYS_FCHMODAT: usize = 268;
-    unsafe { syscall3(SYS_FCHMODAT, -100isize as usize, REQ.as_ptr() as usize, 0o666); }
+    #[cfg(target_arch = "aarch64")] const SYS_FCHOWNAT: usize = 54;
+    #[cfg(target_arch = "x86_64")] const SYS_FCHOWNAT: usize = 260;
+    const GID_BLUETOOTH: usize = 112; // = btd::sys::GID_BLUETOOTH, /etc/group
+    unsafe {
+        syscall5(SYS_FCHOWNAT, -100isize as usize, REQ.as_ptr() as usize, 0, GID_BLUETOOTH, 0);
+        syscall3(SYS_FCHMODAT, -100isize as usize, REQ.as_ptr() as usize, 0o660);
+    }
     sayln!("bthid: listening for HID devices");
     let mut h = Host { bt, devs: Vec::new(), names: Vec::new(), next_req: 0, reqs: Vec::new(), tid: 0 };
     for a in listed() { h.start(a); }

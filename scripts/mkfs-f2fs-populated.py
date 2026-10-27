@@ -4,6 +4,7 @@
 Matches the on-disk layout expected by servers/f2fs/src/lib.rs.
 """
 import hashlib
+import re
 import struct
 import sys
 import os
@@ -362,6 +363,26 @@ def verify_dbus_staging(arch):
                 problems.append(f"  MISSING  {exec_line[0]} (Exec= of services/{fn})\n"
                                 f"           build it: ./ports/sysbus/build.sh {arch}")
             elif exec_line[0].endswith("/leandros-sysbus"):
+                # Feature check, not just mtime: the staged binary lives in the
+                # SHARED ~/code/leandros-artifacts, so a lane that rebuilds
+                # sysbus from another tree overwrites it with a NEWER binary
+                # that lacks a subcommand (bluez, power, ...) and the mtime
+                # test below passes. The binary carries the subcommand list
+                # "leandros-sysbus-services:a,b,...;" (ports/sysbus/src/main.rs
+                # SERVICES); it must equal this tree's, and name this .service.
+                _pat = rb"leandros-sysbus-services:([a-z0-9,-]*);"
+                with open(staged_bin, "rb") as _bf:
+                    _m = re.search(_pat, _bf.read())
+                with open(os.path.join(repo, "ports", "sysbus", "src", "main.rs"), "rb") as _sf:
+                    _t = re.search(_pat, _sf.read())
+                _have = _m.group(1).decode() if _m else "no marker"
+                _tree = _t.group(1).decode() if _t else ""
+                _want = exec_line[1] if len(exec_line) > 1 else ""
+                if _have != _tree or _want not in _tree.split(","):
+                    problems.append(f"  STALE    {exec_line[0]} ({arch}) was built from another tree:\n"
+                                    f"           staged serves [{_have}], this tree [{_tree}] "
+                                    f"(services/{fn} needs '{_want}').\n"
+                                    f"           rebuild from this tree: ./ports/sysbus/build.sh {arch}")
                 # lib/netctl-abi too: the NetworkManager shim links it, and an
                 # ABI change the staged binary predates is exactly the stale
                 # build this check exists for.
@@ -597,6 +618,9 @@ def main():
     # the network: /dev/netctl is root:netdev 0664 and only root and members
     # may open it for writing (docs/servers/netctl.md); the saved connections
     # in /etc/leandros/network are root:netdev too. The greeter only reads.
+    # `bluetooth` (112, a Debian-style system group) may drive Bluetooth:
+    # btd.sock and /run/bluetooth/bthid.connect are root:bluetooth 0660
+    # (userland/btd, userland/bthid); the desktop user's org.bluez shim needs it.
     etc_files.append(("group", (
         b"root:x:0:\n"
         b"tty:x:5:\n"
@@ -605,6 +629,7 @@ def main():
         b"video:x:44:leandro,cosmic-greeter\n"
         b"input:x:104:leandro,cosmic-greeter\n"
         b"netdev:x:108:leandro\n"
+        b"bluetooth:x:112:leandro\n"
         b"cosmic-greeter:x:990:\n"
         b"leandro:x:1000:\n"
     ), 0o100644))
@@ -1576,6 +1601,25 @@ def main():
     else:
         print(f"  WARNING: {_netapplet} absent, no Network applet in the panel: "
               f"./ports/cosmic-applet-network/build.sh {arch}")
+
+    # cosmic-applet-bluetooth, the panel's Bluetooth applet (already named in
+    # upstream's default plugins_wings): unmodified upstream, built by
+    # ports/cosmic-applet-bluetooth/build.sh. It reaches leandros-sysbus bluez
+    # through bluer 0.17.4, i.e. the C libdbus-1 (ports/libdbus) -- its only
+    # DT_NEEDED beyond libxkbcommon/libc, so binary, library and .desktop are
+    # staged together or not at all (a binary without the library dies in the
+    # loader and the panel just respawns it).
+    _btapplet = m6_pick(f"{m6_out}/cosmic-applet-bluetooth-{arch}")
+    _libdbus = os.path.expanduser(f"~/code/leandros-artifacts/libdbus/out/{arch}/libdbus-1.so.3")
+    if os.path.exists(_btapplet) and os.path.exists(_libdbus):
+        bin_files.append(("cosmic-applet-bluetooth", _btapplet, 0o100755))
+        usr_lib_files.append(("libdbus-1.so.3", _libdbus, 0o100755))
+        m4_share_dirs.add("/usr/share/applications")
+        m4_share_files.append(("/usr/share/applications", "com.system76.CosmicAppletBluetooth.desktop",
+                               "ports/cosmic-applet-bluetooth/com.system76.CosmicAppletBluetooth.desktop"))
+    else:
+        print(f"  WARNING: {_btapplet} or {_libdbus} absent, no Bluetooth applet in the panel: "
+              f"./ports/cosmic-applet-bluetooth/build.sh {arch}")
 
     # leandros-applet — a minimal dependency-free wl_shm xdg_toplevel panel applet.
     # cosmic-panel refuses to render its bar with no applet content (render()

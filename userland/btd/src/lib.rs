@@ -77,6 +77,15 @@ pub mod sys {
     pub fn chmod(path: &[u8], mode: u32) {
         unsafe { syscall4(nr::FCHMODAT, AT_FDCWD, path.as_ptr() as usize, mode as usize, 0); }
     }
+    /// The `bluetooth` group (Debian convention; /etc/group in the image):
+    /// members may drive btd and ask bthid to connect. Same number as mkfs.
+    pub const GID_BLUETOOTH: u32 = 112;
+    /// chown(path, uid, gid) via fchownat(AT_FDCWD, ...); errno on failure.
+    pub fn chown(path: &[u8], uid: u32, gid: u32) -> Result<(), i32> {
+        #[cfg(target_arch = "aarch64")] const SYS_FCHOWNAT: usize = 54;
+        #[cfg(target_arch = "x86_64")]  const SYS_FCHOWNAT: usize = 260;
+        res(unsafe { syscall5(SYS_FCHOWNAT, AT_FDCWD, path.as_ptr() as usize, uid as usize, gid as usize, 0) }).map(|_| ())
+    }
     pub fn fsync(fd: i32) {
         #[cfg(target_arch = "aarch64")] const SYS_FSYNC: usize = 82;
         #[cfg(target_arch = "x86_64")]  const SYS_FSYNC: usize = 74;

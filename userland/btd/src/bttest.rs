@@ -157,6 +157,18 @@ fn read_file(path: &[u8]) -> Vec<u8> {
 }
 fn contains(h: &[u8], n: &[u8]) -> bool { h.windows(n.len()).any(|w| w == n) }
 
+/// Exit code of `f` run in a child that dropped to uid/gid/groups (99: drop failed).
+unsafe fn as_user(uid: u32, gid: u32, groups: &[u32], f: impl FnOnce() -> i32) -> i32 {
+    let pid = leandros_libc::fork();
+    if pid == 0 {
+        let ok = leandros_libc::setgroups(groups.len(), groups.as_ptr()) == 0
+            && leandros_libc::setresgid(gid, gid, gid) == 0
+            && leandros_libc::setresuid(uid, uid, uid) == 0;
+        leandros_libc::exit(if ok { f() } else { 99 });
+    }
+    wait_exit(pid)
+}
+
 unsafe fn wait_exit(pid: i32) -> i32 {
     let mut st = 0i32;
     leandros_libc::wait4(pid, &mut st, 0, core::ptr::null_mut());
@@ -225,6 +237,17 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     }
     let ready = bt.is_some();
     check("btd_ready", ready, "no ready INFO within 20 s");
+    // btd.sock is root:bluetooth 0660: a member of `bluetooth` (the desktop
+    // user's org.bluez shim) gets in, a user outside the group is refused.
+    if ready {
+        let member = as_user(1000, 1000, &[1000, sys::GID_BLUETOOTH], || match Bt::open_at(SOCK) {
+            Ok(mut b) => if matches!(b.info(), Ok(Msg::InfoRsp { .. })) { 0 } else { 2 },
+            Err(_) => 1,
+        });
+        check("sock_group_member_allowed", member == 0, "uid 1000 in group bluetooth could not use btd.sock");
+        let outsider = as_user(1001, 1001, &[1001], || if Bt::open_at(SOCK).is_ok() { 1 } else { 0 });
+        check("sock_outsider_refused", outsider == 0, "uid 1001 outside group bluetooth could connect to btd.sock");
+    }
     if let Some(mut bt) = bt {
         if let Ok(Msg::InfoRsp { addr, lmp_subver, name, .. }) = bt.info() {
             check("info_fields", addr == Addr::parse("11:22:33:44:55:66").unwrap() && lmp_subver == 0x6119 && name == "bttest", "");
