@@ -110,6 +110,15 @@ pub mod sdhci;
 /// protocol can be exercised without hardware.
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod rpi_mailbox;
+/// Pi 5 SoC housekeeping: RNG, firmware RTC, PM watchdog, thermal, ARM clock (lane pimisc).
+pub mod rpi_misc_logic;
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rpi_misc;
+/// Shared BCM2712 PM block accessor (V3D power + watchdog/reset).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rpi_pm;
+/// SoC temperature API (`thermal::soc_millicelsius`) and /proc hooks.
+pub mod thermal;
 /// BCM2712 PCIe root complex (pcie2) register math, RC bring-up, and the RP1
 /// south bridge behind it. Opt-in at boot with `pcie.rpi5=1`.
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
@@ -118,6 +127,21 @@ pub mod brcmstb_hw;
 pub mod brcmstb_pcie;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod rp1;
+/// RP1 clock/GPIO/PWM register math (host-tested in drivers/rp1-tests).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rp1_hw;
+/// RP1 clock manager: PLL readback, GEM and PWM clock enables.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rp1_clk;
+/// RP1 GPIO/pinctrl and its small kernel API.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rp1_gpio;
+/// Pi 5 cooling fan on RP1 PWM1.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rp1_fan;
+/// Pi 5 ACT/PWR LEDs and the power button (KEY_POWER).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod pi5_board;
 /// BCM2712 dma40 DMA engine (Pi 5): SCB encoding and rings everywhere, the
 /// channel driver and boot self-test rpi5-only.
 pub mod bcm2712_dma40;

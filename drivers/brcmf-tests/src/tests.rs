@@ -1,7 +1,7 @@
 use crate::brcmf::bcdc::{self, Brcmf};
 use crate::brcmf::bus::SdioBus;
 use crate::brcmf::chip::*;
-use crate::brcmf::fw::{self, nvram_normalize, nvram_token_words, FwLoadError};
+use crate::brcmf::fw::{self, nvram_normalize, nvram_token_words, DlFail, FwLoadError, Knobs};
 use crate::brcmf::fwil::{FwError, Fwil, RxSink};
 use crate::brcmf::sdpcm::{self, Sdpcm, SdpcmError};
 use crate::mock::*;
@@ -23,7 +23,12 @@ fn fake_code(len: usize) -> Vec<u8> {
 }
 
 fn attached() -> (MockChip, Chip) {
+    attached_with(|_| {})
+}
+
+fn attached_with(f: impl FnOnce(&mut MockChip)) -> (MockChip, Chip) {
     let mut m = MockChip::new();
+    f(&mut m);
     let c = Chip::attach(&mut m).expect("attach");
     (m, c)
 }
@@ -149,6 +154,7 @@ fn core_reset_and_disable() {
 #[test]
 fn clocks_and_kso() {
     let (mut m, mut c) = attached();
+    m.ht_needs_fw = false;
     let v = c.clk_request(&mut m, true).unwrap();
     assert_eq!(v & SBSDIO_AVBITS, SBSDIO_AVBITS);
     c.kso_control(&mut m, true).unwrap();
@@ -170,7 +176,8 @@ fn clocks_and_kso() {
     }
     let mut n = NoHt(m);
     assert_eq!(c.clk_request(&mut n, true).unwrap_err(), ChipError::HtTimeout);
-    assert!(n.0.now_us < 100_000);
+    // brcmfmac's PMU_MAX_TRANSITION_DLY: 1 s, bounded.
+    assert!(n.0.now_us >= 1_000_000 && n.0.now_us < 1_100_000, "{}", n.0.now_us);
 }
 
 #[test]
@@ -208,7 +215,8 @@ fn download_places_code_nvram_and_starts_fw() {
     assert_eq!(m.ram_at(RAMBASE_4345, code.len()), &code[..]);
     let nv = nvram_normalize(NVRAM);
     assert_eq!(rep.nvram_addr, RAMBASE_4345 + 0xC8000 - nv.len() as u32);
-    assert_eq!(m.ram_at(rep.nvram_addr, nv.len()), &nv[..]);
+    // The running firmware replaced the token (last word) with its sdpcm_shared address.
+    assert_eq!(m.ram_at(rep.nvram_addr, nv.len() - 4), &nv[..nv.len() - 4]);
     assert_eq!(rep.rstvec, 0xB8000);
     assert!(rep.sr_enabled);
     assert_eq!(m.f0[&CCCR_IOEN] & 0x06, 0x06);
@@ -247,8 +255,12 @@ fn download_rejects_bad_images() {
         fn delay_us(&mut self, u: u32) { self.0.delay_us(u) }
     }
     let mut cm = Corrupt(m);
-    assert_eq!(fw::download(&mut cm, &mut c, &code, NVRAM).unwrap_err(), FwLoadError::F2Timeout);
-    assert!(cm.0.now_us <= 3_100_000);
+    // No firmware, no HT: bounded at the 1 s PMU limit, stage named.
+    let e = fw::download_with(&mut cm, &mut c, &code, NVRAM, &Knobs::default()).unwrap_err();
+    assert_eq!(e, DlFail { err: FwLoadError::Chip(ChipError::HtTimeout), stage: "ht" });
+    assert!(cm.0.now_us <= 1_200_000, "{}", cm.0.now_us);
+    let d = fw::diag(&mut cm, &mut c, 8);
+    assert!(d.line.contains("fw=not-started") && d.line.contains("run"), "{}", d.line);
 }
 
 #[test]
@@ -400,4 +412,98 @@ fn ioctl_times_out_when_fw_silent() {
     assert_eq!(d.iovar_get("ver", &mut b).unwrap_err(), FwError::Timeout);
     let dt = d.bus.now_us - t0;
     assert!((50_000..60_000).contains(&dt), "waited {dt} us");
+}
+
+// ---- lane pibrcmf-fw2: the brcmfmac post-download order -------------------------
+
+#[test]
+fn download_uses_alp_only_like_brcmfmac() {
+    // Real Pi 5 (boot3): HT requested before the download -> "HT clock timeout".
+    let (mut m, mut c) = attached();
+    let k = Knobs { dl_ht: true, ..Knobs::default() };
+    let e = fw::download_with(&mut m, &mut c, &fake_code(4096), NVRAM, &k).unwrap_err();
+    assert_eq!(e, DlFail { err: FwLoadError::Chip(ChipError::HtTimeout), stage: "dl-clk-ht" });
+    assert!(!m.fw_running);
+    // Default: ALP for the download, HT once the firmware runs.
+    let (mut m, mut c) = attached();
+    fw::download_with(&mut m, &mut c, &fake_code(4096), NVRAM, &Knobs::default()).unwrap();
+    assert!(m.fw_running);
+    assert!(m.now_us >= m.fw_start_us + m.ht_delay_us, "waited for HT after the firmware start");
+}
+
+#[test]
+fn ht_wait_bound_is_a_knob() {
+    // The old 15 ms bound misses a PLL that settles after 50 ms.
+    let (mut m, mut c) = attached();
+    let k = Knobs { ht_us: 15_000, ..Knobs::default() };
+    let e = fw::download_with(&mut m, &mut c, &fake_code(4096), NVRAM, &k).unwrap_err();
+    assert_eq!(e.stage, "ht");
+    let (mut m, mut c) = attached();
+    m.ht_delay_us = 900_000;
+    fw::download_with(&mut m, &mut c, &fake_code(4096), NVRAM, &Knobs::default()).unwrap();
+}
+
+#[test]
+fn sr_reprobed_after_firmware_start() {
+    let (mut m, mut c) = attached_with(|m| {
+        m.sr = false;
+        m.sr_after_fw = true;
+    });
+    assert!(!c.sr_capable, "attach sees the pre-firmware PMU (Pi: sr 0)");
+    let rep = fw::download(&mut m, &mut c, &fake_code(4096), NVRAM).unwrap();
+    assert!(rep.sr_enabled && c.sr_capable);
+    assert_eq!(m.f1[&SBSDIO_FUNC1_WAKEUPCTRL] & WCTRL_HTWAIT, WCTRL_HTWAIT);
+    assert_eq!(m.f0[&CCCR_BRCM_CARDCAP], CARDCAP_CMD14_SUPPORT | CARDCAP_CMD14_EXT);
+    assert_eq!(m.f1[&SBSDIO_FUNC1_CHIPCLKCSR] & !SBSDIO_AVBITS, SBSDIO_FORCE_HT);
+    // sr=0 forces it off: the saved clock is restored, no CMD14.
+    let (mut m, mut c) = attached_with(|m| {
+        m.sr = false;
+        m.sr_after_fw = true;
+    });
+    let k = Knobs { sr: Some(false), ..Knobs::default() };
+    let rep = fw::download_with(&mut m, &mut c, &fake_code(4096), NVRAM, &k).unwrap();
+    assert!(!rep.sr_enabled);
+    assert!(!m.f0.contains_key(&CCCR_BRCM_CARDCAP));
+}
+
+#[test]
+fn f2_watermark_knobs() {
+    let (mut m, mut c) = attached();
+    let k = Knobs { wm: 0x60, f2wm: true, mesbusy: 0xE0, ..Knobs::default() };
+    fw::download_with(&mut m, &mut c, &fake_code(4096), NVRAM, &k).unwrap();
+    assert_eq!(m.f1[&SBSDIO_WATERMARK], 0x60);
+    assert_eq!(m.f1[&SBSDIO_DEVICE_CTL] & SBSDIO_DEVCTL_F2WM_ENAB, SBSDIO_DEVCTL_F2WM_ENAB);
+    assert_eq!(m.f1[&SBSDIO_FUNC1_MESBUSYCTRL], 0xE0);
+}
+
+#[test]
+fn diag_reads_the_console_of_a_trapped_firmware() {
+    let (mut m, mut c) = attached();
+    m.fw_trap = true;
+    let e = fw::download(&mut m, &mut c, &fake_code(4096), NVRAM).unwrap_err();
+    assert_eq!(e, FwLoadError::Chip(ChipError::HtTimeout));
+    let d = fw::diag(&mut m, &mut c, 2);
+    assert!(d.line.contains("ver=3") && d.line.contains("TRAP@19a000") && d.line.contains(" run"), "{}", d.line);
+    assert!(d.line.contains("clkcsr=") && d.line.contains("pmust=") && d.line.contains("cr4 ioctl="), "{}", d.line);
+    assert_eq!(d.console, vec!["wl0: mock pll fail".to_string(), "TRAP 4(23fd68): pc 1b2e4, lr 1b2c1".to_string()]);
+    let d = fw::diag(&mut m, &mut c, 10);
+    assert!(d.console[0].starts_with("RTE (SDIO-CDC) 7.45.241"), "{:?}", d.console);
+}
+
+#[test]
+fn knob_parsing() {
+    let mut k = Knobs::default();
+    assert!(!k.dl_ht && k.ht_us == 1_000_000 && k.sr.is_none() && k.wm == 8);
+    for (key, v) in [("ht_ms", "2000"), ("dl_ht", "1"), ("sr", "0"), ("wm", "0x60"), ("post_us", "5000"), ("noclm", "1")] {
+        assert!(k.set(key, v), "{}", key);
+    }
+    assert_eq!((k.ht_us, k.dl_ht, k.sr, k.wm, k.post_us, k.noclm), (2_000_000, true, Some(false), 0x60, 5000, true));
+    assert!(k.set("sr", "auto") && k.sr.is_none());
+    assert!(!k.set("bogus", "1") && !k.set("wm", "x"));
+}
+
+#[test]
+fn console_tail_lines() {
+    let t = fw::console_tail(b"\0\0a\r\nbb\n\n\x01\x02\nccc", 2);
+    assert_eq!(t, vec!["bb".to_string(), "ccc".to_string()]);
 }
