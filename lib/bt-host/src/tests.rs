@@ -177,7 +177,7 @@ impl Vc {
 }
 
 fn ready(vc: &mut Vc, keys: KeyStore) -> Host {
-    let mut h = Host::new("LeandrOS", keys);
+    let mut h = Host::new("LeandrOS", keys, 0);
     vc.run(&mut h);
     assert_eq!(h.state, State::Ready);
     while h.take_log().is_some() {}
@@ -446,4 +446,16 @@ fn keys_file_roundtrip_and_h4_reframing() {
     assert_eq!(hci::h4_len(&hx("02 0b 20 0c 00")), Some(Ok(17)));
     assert_eq!(hci::h4_len(&hx("02 0b")), None);
     assert_eq!(hci::h4_len(&hx("07")), Some(Err(())));
+}
+
+/// Regression: btd creates the host long after boot; the first tick must not
+/// see the initial HCI_Reset as already timed out (uptime > 4 s).
+#[test]
+fn init_with_late_clock_does_not_time_out_reset() {
+    let mut h = Host::new("LeandrOS", KeyStore::default(), 600_000);
+    h.tick(600_050);
+    assert!(std::iter::from_fn(|| h.take_log()).all(|l| !l.contains("timed out")));
+    let mut vc = Vc::new();
+    vc.run(&mut h);
+    assert_eq!(h.state, State::Ready);
 }

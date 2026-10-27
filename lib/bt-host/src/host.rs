@@ -143,10 +143,11 @@ pub struct Host {
 }
 
 impl Host {
-    pub fn new(name: &str, keys: KeyStore) -> Host {
+    /// `now`: the same monotonic ms clock later passed to [`Host::tick`].
+    pub fn new(name: &str, keys: KeyStore, now: u64) -> Host {
         let mut h = Host {
             state: State::Init, info: Info::default(), name: String::from(name), devices: Vec::new(), keys,
-            now: 0, init_step: 0, cmdq: VecDeque::new(), inflight: None, credits: 1, out: VecDeque::new(),
+            now, init_step: 0, cmdq: VecDeque::new(), inflight: None, credits: 1, out: VecDeque::new(),
             events: VecDeque::new(), logs: VecDeque::new(), links: Vec::new(), chans: Vec::new(),
             listens: Vec::new(), keys_dirty: false, scan: None, pairs: Vec::new(), next_cid: FIRST_DYN_CID,
             next_ident: 1, acl_txq: VecDeque::new(), acl_avail: 0, le_avail: 0,

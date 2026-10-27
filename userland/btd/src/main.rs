@@ -117,7 +117,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         None => eprintln!("[btd] controller {} open, initialising", shown),
     }
 
-    let mut host = Host::new(name, load_keys(keys));
+    let mut host = Host::new(name, load_keys(keys), sys::now_ms());
     let mut clients: Vec<Client> = Vec::new();
     let mut next_id: Owner = 1;
     let mut rx: Vec<u8> = Vec::new();

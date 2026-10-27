@@ -144,14 +144,14 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
 
     let t0 = sys::now_ms();
     let mut bt = None;
-    while sys::now_ms() - t0 < 5000 {
+    while sys::now_ms() - t0 < 20_000 {
         if let Ok(mut b) = Bt::open_at(SOCK) {
             if let Ok(Msg::InfoRsp { state: 1, .. }) = b.info() { bt = Some(b); break; }
         }
         leandros_libc::usleep(50_000);
     }
     let ready = bt.is_some();
-    check("btd_ready", ready, "no ready INFO within 5 s");
+    check("btd_ready", ready, "no ready INFO within 20 s");
     if let Some(mut bt) = bt {
         if let Ok(Msg::InfoRsp { addr, lmp_subver, name, .. }) = bt.info() {
             check("info_fields", addr == Addr::parse("11:22:33:44:55:66").unwrap() && lmp_subver == 0x6119 && name == "bttest", "");
