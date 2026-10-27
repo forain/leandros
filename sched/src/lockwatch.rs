@@ -529,6 +529,54 @@ pub fn name(id: u8) -> &'static str {
 /// static whose payload is all zero stays all zero and lands in .bss rather
 /// than the kernel image (a 16 MB table in .data is 16 MB of image to load).
 /// With `ID == 0` the runtime `id` field is used, as before.
+/// Per CPU and lock id: the `spin::Mutex` this CPU last took under that id
+/// and a type-erased force-unlock for it, so a context that can never drop
+/// its guards (a task killed by the EL1 user-pointer fault path, which does
+/// not unwind) can still release what it holds: see `force_release_held`.
+static OWN_PTR: [[AtomicUsize; N_LOCKS]; super::MAX_CPUS] = [const { [const { AtomicUsize::new(0) }; N_LOCKS] }; super::MAX_CPUS];
+static OWN_FN:  [[AtomicUsize; N_LOCKS]; super::MAX_CPUS] = [const { [const { AtomicUsize::new(0) }; N_LOCKS] }; super::MAX_CPUS];
+
+unsafe fn force_unlock_erased<T>(p: usize) {
+    (*(p as *const spin::Mutex<T>)).force_unlock();
+}
+
+#[inline(always)]
+fn note_owner<T>(cpu: usize, id: u8, m: &spin::Mutex<T>) {
+    if cpu < super::MAX_CPUS && (id as usize) < N_LOCKS {
+        OWN_PTR[cpu][id as usize].store(m as *const _ as usize, Ordering::Relaxed);
+        OWN_FN[cpu][id as usize].store(force_unlock_erased::<T> as unsafe fn(usize) as usize, Ordering::Relaxed);
+    }
+}
+
+/// Force-release every tracked lock this CPU holds, for a kernel context that
+/// will never run its guards' drops: the EL1 fault path kills the current
+/// task (`exit_group_signal`) from inside a syscall without unwinding, and
+/// the exit path takes these same locks again -- a self-deadlock (Pi 5,
+/// a9a61b2b: a fault under EPOLL wedged all four CPUs). The protected data
+/// may be mid-update; that is still better than a machine-wide wedge.
+/// Returns the bitmask of lock ids released. Never call it from a context
+/// that still owns a live guard it will drop.
+pub fn force_release_held() -> u32 {
+    let cpu = me();
+    if cpu >= super::MAX_CPUS { return 0; }
+    let mut released = 0u32;
+    for id in 1..N_LOCKS {
+        if HOLDER[id].load(Ordering::Relaxed) as usize != cpu + 1 { continue; }
+        let p = OWN_PTR[cpu][id].load(Ordering::Relaxed);
+        let f = OWN_FN[cpu][id].load(Ordering::Relaxed);
+        if p == 0 || f == 0 { continue; }
+        HOLDER[id].store(0, Ordering::Relaxed);
+        // SAFETY: `f` is `force_unlock_erased::<T>` for the `spin::Mutex<T>`
+        // at `p` (a static), recorded by this CPU when it took the lock.
+        unsafe {
+            let f: unsafe fn(usize) = core::mem::transmute(f);
+            f(p);
+        }
+        released |= 1 << id;
+    }
+    released
+}
+
 pub struct TrackedMutex<T, const ID: u8 = 0> {
     id: u8,
     inner: spin::Mutex<T>,
@@ -565,6 +613,7 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
         ACQ[cpu][id].fetch_add(1, Ordering::Relaxed);
         if let Some(guard) = self.inner.try_lock() {
             HOLDER[self.lock_id() as usize].store(cpu as u8 + 1, Ordering::Relaxed);
+            note_owner(cpu, self.lock_id(), &self.inner);
             let (site1, since) = on_acquire(self.lock_id(), loc);
             return TrackedGuard { id: self.lock_id(), site1, since, lock: &self.inner, guard };
         }
@@ -586,6 +635,7 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
         CONT[cpu][id].fetch_add(1, Ordering::Relaxed);
         CONT_NS[cpu][id].fetch_add(now_ns().saturating_sub(w0), Ordering::Relaxed);
         HOLDER[self.lock_id() as usize].store(cpu as u8 + 1, Ordering::Relaxed);
+        note_owner(cpu, self.lock_id(), &self.inner);
         let (site1, since) = on_acquire(self.lock_id(), loc);
         if id == L_RUN_QUEUE as usize {
             spin_census(loc as *const _ as usize, since.saturating_sub(w0));
@@ -603,7 +653,9 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
     pub fn try_lock(&self) -> Option<TrackedGuard<'_, T>> {
         assert_no_rq(self.lock_id());
         let guard = self.inner.try_lock()?;
-        HOLDER[self.lock_id() as usize].store(me() as u8 + 1, Ordering::Relaxed);
+        let cpu = me();
+        HOLDER[self.lock_id() as usize].store(cpu as u8 + 1, Ordering::Relaxed);
+        note_owner(cpu, self.lock_id(), &self.inner);
         let (site1, since) = on_acquire(self.lock_id(), core::panic::Location::caller());
         Some(TrackedGuard { id: self.lock_id(), site1, since, lock: &self.inner, guard })
     }
@@ -701,6 +753,7 @@ impl<'a, T> TrackedGuard<'a, T> {
         let lock = self.lock;
         core::mem::forget(spin_acquire(self.id, || lock.try_lock(), || lock.is_locked()));
         HOLDER[self.id as usize].store(me() as u8 + 1, Ordering::Relaxed);
+        note_owner(me(), self.id, lock);
         let (site1, since) = on_acquire(self.id, core::panic::Location::caller());
         self.site1 = site1;
         self.since = since;

@@ -29,6 +29,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/epoll.h>
+#include <pthread.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/auxv.h>
@@ -910,6 +912,72 @@ static void pan_probe_child(void *a) {
     _exit(r == 1 ? 0 : 1);   /* 1: PAN trapped it (audit); 0: unhindered */
 }
 #endif
+#if defined(__aarch64__)
+/* Lane piepollnull (Pi 5 wedge, a9a61b2b): a multi-threaded /bin/sh took an
+ * EL1 fault inside epoll_pwait with EPOLL held; the fault-kill path re-took
+ * EPOLL on exit and all four CPUs spun on it. Both cases run with a second
+ * thread parked in epoll_pwait, as the shell had. */
+static int ep_parked_fd = -1;
+static void *ep_parker(void *a) {
+    (void)a;
+    struct epoll_event ev;
+    for (;;) epoll_wait(ep_parked_fd, &ev, 1, -1);
+    return NULL;
+}
+static int ep_start_parker(void) {
+    pthread_t t;
+    ep_parked_fd = epoll_create1(0);
+    if (ep_parked_fd < 0 || pthread_create(&t, NULL, ep_parker, NULL) != 0) return -1;
+    struct timespec ts = { 0, 20 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    return 0;
+}
+static void epoll_fault_cases(void) {
+    /* 1: an unwritable events buffer on a ready instance is EFAULT, never a
+     * kernel fault and never "1 event" with nothing written. */
+    fflush(stdout);
+    pid_t k = fork();
+    if (k == 0) {
+        if (ep_start_parker() != 0) _exit(3);
+        int p[2], ep = epoll_create1(0);
+        if (ep < 0 || pipe(p) != 0 || write(p[1], "x", 1) != 1) _exit(3);
+        struct epoll_event ev = { .events = EPOLLIN, .data.u64 = 7 };
+        if (epoll_ctl(ep, EPOLL_CTL_ADD, p[0], &ev) != 0) _exit(3);
+        void *hole = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        munmap(hole, 4096);
+        int bad = 0;
+        for (int i = 0; i < 4; i++) {
+            errno = 0;
+            long r = syscall(SYS_epoll_pwait, ep, hole, 4L, 0L, NULL, 8L);
+            if (!(r == -1 && errno == EFAULT)) { printf("   epoll_pwait(unmapped events) = %ld errno %d\n", r, errno); bad = 1; }
+        }
+        struct epoll_event got = { 0 };
+        long r = epoll_wait(ep, &got, 1, 0);
+        _exit(bad ? 1 : (r == 1 && got.data.u64 == 7) ? 0 : 2);
+    }
+    int st = wait_ms(k, 10000);
+    check("epoll_pwait_unwritable_events_efault", st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+          "epoll_pwait into an unmapped events buffer did not answer EFAULT (or lost the event)");
+    /* 2: a kernel fault on a user address while EPOLL is held kills only
+     * the caller; EPOLL must be free afterwards. */
+    fflush(stdout);
+    k = fork();
+    if (k == 0) {
+        if (ep_start_parker() != 0) _exit(3);
+        long r = syscall(LOS_SECPROBE, 4L, 0L);
+        printf("   secprobe store under EPOLL returned %ld\n", r);
+        _exit(1);
+    }
+    st = wait_ms(k, 10000);
+    int killed = st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV;
+    int ep = epoll_create1(0);
+    struct epoll_event ev;
+    int free_after = ep >= 0 && epoll_wait(ep, &ev, 1, 0) == 0;
+    if (ep >= 0) close(ep);
+    check("kernel_fault_under_epoll_lock_releases_it", killed && free_after,
+          "fault-kill under EPOLL did not SIGSEGV the caller or left EPOLL held");
+}
+#endif
 static void root_hardening_cases(void) {
     if (!on_leandros()) { skip("kernel_pan_*", "not LeandrOS"); return; }
 #if defined(__aarch64__)
@@ -972,6 +1040,7 @@ static void root_hardening_cases(void) {
     check("kernel_pxn_refuses_user_code", st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV,
           "kernel executed a user code page (PXN clear)");
     munmap(code, 4096); munmap(page, 4096);
+    epoll_fault_cases();
 #elif defined(__x86_64__)
     /* x86_64: SMAP is the PAN counterpart, SMEP the PXN one. */
     long mode = syscall(LOS_SECPROBE, 0L, 0L);
