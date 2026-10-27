@@ -58,6 +58,12 @@ pub const CRYPTO_ALGO_TKIP: u32 = 2;
 pub const CRYPTO_ALGO_AES_CCM: u32 = 4;
 pub const BRCMF_PRIMARY_KEY: u32 = 1 << 1;
 const ETH_P_PAE: [u8; 2] = [0x88, 0x8e];
+
+/// The netctl ifindex wifi0 was registered under (0 before attach). Only for
+/// the handshake log line: the EAPOL frames never pass through the IP stack
+/// or any netif queue, they go straight to the firmware (BDC ifidx 0) with the
+/// firmware's own MAC as source, so a second NIC cannot reroute them.
+pub static NETCTL_IFINDEX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub const ESCAN_REQ_VERSION: u32 = 1;
 pub const ESCAN_ACTION_START: u16 = 1;
 pub const ESCAN_ACTION_ABORT: u16 = 3;
@@ -76,6 +82,10 @@ pub struct Env {
     pub log: fn(&str),
     /// Fill with random bytes (the host supplicant's SNonce).
     pub random: fn(&mut [u8]),
+}
+
+fn fmt_mac6(m: &[u8; 6]) -> alloc::string::String {
+    alloc::format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5])
 }
 
 fn le16(b: &[u8], o: usize) -> u16 { u16::from_le_bytes([b[o], b[o + 1]]) }
@@ -865,6 +875,8 @@ pub struct RsnDiag {
     pub secret: alloc::string::String,
     /// Host supplicant, this join: EAPOL frames we sent (message 2 first).
     pub eapol_sent: u32,
+    /// Host supplicant, this join: EAPOL frames received.
+    pub eapol_rx_join: u32,
     /// Host supplicant, this join: message 1 frames received after our
     /// message 2 (the AP retransmitting message 1 = it could not verify the
     /// message 2 MIC, the signature of a wrong PMK).
@@ -1153,6 +1165,7 @@ impl<F: Fwil> Brcmf<F> {
         });
         for f in eap {
             self.stats.eapol_rx += 1;
+            self.rsn.eapol_rx_join += 1;
             if h.sup.is_none() {
                 let mut ap = [0u8; 6];
                 ap.copy_from_slice(&f[6..12]);
@@ -1173,6 +1186,9 @@ impl<F: Fwil> Brcmf<F> {
                 }
                 let akm = parse_ap_rsn(&ie).and_then(|r| r.akm.first().copied()).map(|a| (a & 0xff) as u8).unwrap_or(h.akm);
                 self.rsn.msg2_ie = alloc::format!("{} akm={} {}", src, akm, hex(&ie));
+                self.log(&alloc::format!("host supplicant: message 1 from {}; EAPOL tx via firmware data path (BDC ifidx 0, not the IP stack), own MAC {} (fw cur_etheraddr), wifi0 netctl ifindex {}, data frames rx {} dropped {} (since boot)",
+                    fmt_mac6(&h.ap), fmt_mac6(&self.mac), NETCTL_IFINDEX.load(core::sync::atomic::Ordering::Relaxed),
+                    self.rx.rx_frames, self.rx.rx_dropped));
                 let mut sup = crate::wifi_crypto::Supplicant::new(h.pmk, self.mac, h.ap, ie, snonce);
                 sup.set_akm(akm);
                 sup.set_group_tkip(h.group_tkip);
@@ -1258,6 +1274,10 @@ impl<F: Fwil> Brcmf<F> {
             }
             Err(e) => {
                 self.stats.join_fails += 1;
+                if self.sup_used == "host" {
+                    self.log(&alloc::format!("host supplicant: join ended without keys: eapol rx {} tx {} (this join), message 1 after message 2: {}, data frames rx {} dropped {} (since boot)",
+                        self.rsn.eapol_rx_join, self.rsn.eapol_sent, self.rsn.msg1_after_msg2, self.rx.rx_frames, self.rx.rx_dropped));
+                }
                 let _ = self.fw.cmd_set(cmd::DISASSOC, &scb_val(REASON_LEAVING, [0; 6]));
                 self.rx.link_up = false;
                 self.rx.down = None;
