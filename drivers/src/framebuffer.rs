@@ -220,6 +220,7 @@ impl Framebuffer {
             unsafe {
                 copy_px_wide(self.base.add(off), self.shadow.add(off), w.min(self.width.saturating_sub(x)));
             }
+            if (row - y) % BLIT_POLL_ROWS == BLIT_POLL_ROWS - 1 { rx_poll(); }
         }
     }
 
@@ -266,16 +267,19 @@ impl Framebuffer {
         if self.base.is_null() { return; }
         let total_words = self.height * (self.pitch / 4);
         let dst = self.surface();
-        if color == 0 {
+        let chunk = MEM_POLL_ROWS * (self.pitch / 4);
+        let mut i = 0;
+        while i < total_words {
+            let n = (total_words - i).min(chunk);
             unsafe {
-                core::ptr::write_bytes(dst, 0, total_words);
-            }
-        } else {
-            unsafe {
-                for i in 0..total_words {
-                    dst.add(i).write_volatile(color);
+                if color == 0 {
+                    core::ptr::write_bytes(dst.add(i), 0, n);
+                } else {
+                    for k in i..i + n { dst.add(k).write_volatile(color); }
                 }
             }
+            i += n;
+            rx_poll();
         }
         self.cursor_x = 0;
         self.cursor_y = 0;
@@ -739,12 +743,23 @@ impl Framebuffer {
         let words_per_row = self.pitch / 4;
         let rows_to_copy = self.height - shift_px;
         let dst = self.surface();
+        // In row chunks, lowest first (dst < src, so an ascending chunked
+        // move never reads a row it already overwrote), with an RX poll in
+        // between: a 1080p scroll moves ~8 MiB with IRQs masked.
+        let mut r = 0;
+        while r < rows_to_copy {
+            let n = (rows_to_copy - r).min(MEM_POLL_ROWS);
+            unsafe {
+                core::ptr::copy(
+                    dst.add((shift_px + r) * words_per_row),
+                    dst.add(r * words_per_row),
+                    n * words_per_row,
+                );
+            }
+            r += n;
+            rx_poll();
+        }
         unsafe {
-            core::ptr::copy(
-                dst.add(shift_px * words_per_row),
-                dst,
-                rows_to_copy * words_per_row,
-            );
             core::ptr::write_bytes(
                 dst.add(rows_to_copy * words_per_row),
                 0,
@@ -1201,6 +1216,32 @@ impl Drop for FlushBatch {
         if FLUSH_DEFER.fetch_sub(1, core::sync::atomic::Ordering::SeqCst) == 1 {
             fb_flush();
         }
+    }
+}
+
+/// Console RX service for the long framebuffer loops (scroll, clear, blit).
+/// They run under `KERNEL_FB`, usually inside a syscall with IRQs masked; a
+/// 1080p scroll plus its full-screen blit is ~16 MiB of memory traffic, far
+/// longer than the console UART's 32-byte RX FIFO lasts at 115200 baud
+/// (~2.8 ms), so a line typed during a scroll overran (openbugs #101). The
+/// kernel points this at `arch_aarch64::uart::rx_poll`, which moves waiting
+/// RX bytes into a software ring; it must not take `KERNEL_FB`.
+static RX_POLL_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Rows between RX polls in the shadow (cached) loops: ~240 KiB at 1080p.
+const MEM_POLL_ROWS: usize = 32;
+/// Rows between RX polls in the blit to the (write-combining) scanout.
+const BLIT_POLL_ROWS: usize = 8;
+
+pub fn set_rx_poll_hook(f: fn()) {
+    RX_POLL_HOOK.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn rx_poll() {
+    let p = RX_POLL_HOOK.load(core::sync::atomic::Ordering::Relaxed);
+    if p != 0 {
+        let f: fn() = unsafe { core::mem::transmute(p) };
+        f();
     }
 }
 
