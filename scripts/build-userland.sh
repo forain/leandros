@@ -148,6 +148,9 @@ if command -v zig >/dev/null 2>&1; then
     # kexec: kexec-tools style front end (-l/-u/-e) over kexec_file_load + reboot(KEXEC).
     echo "[userland] Building kexec (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kexec" userland/kexec/kexec.c
+    # serrx: framed, ACKed file receiver over the serial console (scripts/pi-serial-push.py).
+    echo "[userland] Building serrx (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -Os -s -Wall -o "${OUT}/serrx" userland/serrx/serrx.c
 else
     echo "[userland] WARNING: zig not found — privtest/nettest/udptest/netcheck/sndtest/syscalltest/chroottest/kexectest/kexec not built"
 fi
