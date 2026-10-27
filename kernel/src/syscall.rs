@@ -1870,6 +1870,8 @@ const DBG_SERIAL_WRITE: bool = false;
 ///         fetch, which kills the caller (SIGSEGV); a return means the
 ///         kernel ran user code, and its x0 is passed back.
 ///   op 3: raw user accesses PAN has trapped since boot (both modes).
+///   op 4: a raw store to null-page `addr` (< 0x10000) with EPOLL_INSTANCES
+///         held. Kills the caller (SIGSEGV); the lock must be released.
 /// x86_64: the same ops with SMAP for PAN and SMEP for PXN.
 fn sys_secprobe(op: usize, addr: usize) -> isize {
     if !sched::cred::current_is_root() { return -1; }
@@ -1902,6 +1904,22 @@ fn sys_secprobe(op: usize, addr: usize) -> isize {
                 r
             }
             3 => ua::PAN_FAULTS.load(SeqCst) as isize,
+            4 => {
+                // A raw store to the (never mapped) null page with
+                // EPOLL_INSTANCES held: the fault-kill path must release the
+                // lock, or the exit path and every other epoll caller spin
+                // on it forever (Pi 5 wedge, a9a61b2b).
+                if addr >= 0x10000 { return -22; }
+                let g = EPOLL_INSTANCES.lock();
+                unsafe {
+                    #[cfg(target_arch = "aarch64")]
+                    core::arch::asm!("str xzr, [{0}]", in(reg) addr, options(nostack));
+                    #[cfg(target_arch = "x86_64")]
+                    core::arch::asm!("mov qword ptr [{0}], 0", in(reg) addr, options(nostack));
+                }
+                drop(g);
+                -14
+            }
             _ => -22,
         }
     }
@@ -13642,6 +13660,17 @@ fn ep_nested_slot(pid: u32, it: &EpollInterest) -> Option<usize> {
 
 /// epoll_wait on the ready-list path (see above). Same contract as the loop
 /// in `epoll_wait_until`.
+/// Whether a kept epoll snapshot's vectors still look like vectors: a
+/// buffer pointer in the kernel half (or none at all), len <= capacity.
+fn ep_vec_sane<T>(v: &alloc::vec::Vec<T>) -> bool {
+    let (p, len, cap) = (v.as_ptr() as usize, v.len(), v.capacity());
+    len <= cap && cap < (1 << 24) && (cap == 0 || core::mem::size_of::<T>() == 0 || (p >> 48) == 0xffff)
+}
+
+fn ep_cache_sane(c: &EpCache) -> bool {
+    ep_vec_sane(&c.ents) && ep_vec_sane(&c.others) && c.others.iter().all(|o| ep_vec_sane(&o.ents))
+}
+
 fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxevents: usize,
                     infinite: bool, deadline: u64) -> isize {
     use core::sync::atomic::Ordering::Relaxed;
@@ -13652,7 +13681,19 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
     let inst_id = { EPOLL_INSTANCES.lock()[slot].id };
     let fresh = cbox.is_none();
     let mut c: alloc::boxed::Box<EpCache> = match cbox.and_then(|b| b.downcast::<EpCache>().ok()) {
-        Some(c) => c,
+        Some(c) if ep_cache_sane(&c) => c,
+        Some(c) => {
+            // A torn snapshot (Pi 5, a9a61b2b: `ents` with a NULL buffer
+            // and a capacity, so ep_diff's resize memset address 0 under
+            // EPOLL_INSTANCES). Never touch it again: leak it and start over.
+            serial_print_str("[EPOLL] corrupt wait snapshot dropped (leaked): pid=");
+            mmap_print_dec(pid as usize);
+            serial_print_str("\n");
+            core::mem::forget(c);
+            alloc::boxed::Box::new(EpCache { slot, inst: 0, lid: 0, ents: alloc::vec::Vec::new(),
+                                             carry: sched::WakeRing::EMPTY, cgen: 0,
+                                             others: alloc::vec::Vec::new(), scratch: Default::default() })
+        }
         None => alloc::boxed::Box::new(EpCache { slot, inst: 0, lid: 0, ents: alloc::vec::Vec::new(),
                                                  carry: sched::WakeRing::EMPTY, cgen: 0,
                                                  others: alloc::vec::Vec::new(), scratch: Default::default() }),
@@ -13786,6 +13827,7 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
         // ---- PROBE ---- only the candidates; per registration, exactly the
         // probe-everything loop's rules.
         let mut n = 0usize;
+        let mut efault = false; // the events buffer could not be written
         let nested_stale = c.cgen != gen0;
         ws::EP_PASSES.fetch_add(1, Relaxed);
         let t_probe = monotonic_ns();
@@ -13828,8 +13870,12 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
                 let cur = if fire { POLLIN_EP & it.events } else { 0 };
                 if cur != 0 {
                     let off = n * EPOLL_EVENT_SIZE;
-                    let _ = ua::write_user::<u32>(events_ptr + off, cur)
-                        && ua::write_user::<u64>(events_ptr + off + EPOLL_EVENT_DATA_OFF, it.data);
+                    if !(ua::write_user::<u32>(events_ptr + off, cur)
+                        && ua::write_user::<u64>(events_ptr + off + EPOLL_EVENT_DATA_OFF, it.data)) {
+                        // Unwritable events buffer: EFAULT (or the events
+                        // already delivered); the entry stays ready.
+                        efault = true; c.ents[i].ready = true; break;
+                    }
                     if gd_stats() { gd_fd(it.fd as usize, 0); }
                     if it.events & EPOLLONESHOT != 0 {
                         let mut ep = EPOLL_INSTANCES.lock();
@@ -13859,8 +13905,10 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
             });
             if fire {
                 let off = n * EPOLL_EVENT_SIZE;
-                let _ = ua::write_user::<u32>(events_ptr + off, cur)
-                    && ua::write_user::<u64>(events_ptr + off + EPOLL_EVENT_DATA_OFF, it.data);
+                if !(ua::write_user::<u32>(events_ptr + off, cur)
+                    && ua::write_user::<u64>(events_ptr + off + EPOLL_EVENT_DATA_OFF, it.data)) {
+                    efault = true; c.ents[i].ready = true; break;
+                }
                 if gd_stats() { gd_fd(it.fd as usize, 0); }
                 let mut ep = EPOLL_INSTANCES.lock();
                 if let Some(j) = ep[slot].interests.iter().position(|x| x.is(it.fd, it.ofd)) {
@@ -13918,13 +13966,13 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
             if n > 0 { gd_inc(K_EP_EV); } else if timed_out { gd_inc(K_EP_TMO); }
             else if interrupted() { gd_inc(K_EP_INTR); }
         }
-        if n > 0 || timed_out || interrupted() {
+        if n > 0 || efault || timed_out || interrupted() {
             if n > 0 && woke { st.useful.fetch_add(1, Relaxed); }
             // Keep the snapshot (and the listener) for the next call: what
             // was not acted on yet is re-probed then.
             for &i in recheck.iter() { if let Some(e) = c.ents.get_mut(i as usize) { e.ready = true; } }
             c.carry = carry;
-            let r = if n > 0 { n as isize } else if timed_out { 0 } else { -4 };
+            let r = if n > 0 { n as isize } else if efault { -14 } else if timed_out { 0 } else { -4 };
             sched::poll_listen_store(Some(c));
             return r;
         }

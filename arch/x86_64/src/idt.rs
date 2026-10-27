@@ -719,6 +719,13 @@ extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, e
             serial_str(b" err=0x"); serial_hex64(error_code);
             serial_str(b": killing PID=0x"); serial_hex64(sched::current_pid() as u64);
             serial_str(b" (unresolvable user-pointer fault in kernel)\r\n");
+            // This context never unwinds: release the tracked locks it holds
+            // so the exit path does not self-deadlock on them.
+            let held = sched::lockwatch::force_release_held();
+            if held != 0 {
+                serial_str(b"[EXC] released locks held at the fault: mask=0x"); serial_hex64(held as u64);
+                serial_str(b"\r\n");
+            }
             sched::exit_group_signal(SIGSEGV);
         }
     }

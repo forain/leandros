@@ -404,6 +404,15 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64, frame: *mut u64) {
         serial_print_str("[EXC] killing PID=");
         print_number(sched::current_pid());
         serial_print_str(" (unresolvable user-pointer fault in kernel)\n");
+        // This context never unwinds: whatever tracked lock it holds (the
+        // Pi 5 fault was under EPOLL) would be re-taken by the exit path and
+        // wedge every CPU. Release them first.
+        let held = sched::lockwatch::force_release_held();
+        if held != 0 {
+            serial_print_str("[EXC] released locks held at the fault: mask=");
+            print_hex(held as usize);
+            serial_print_str("\n");
+        }
         // Always SIGSEGV, not a decode of this ESR: the faulting access was
         // the *kernel's*, and what the task did wrong was hand over a bad
         // pointer — exactly what a userspace dereference of the same pointer
