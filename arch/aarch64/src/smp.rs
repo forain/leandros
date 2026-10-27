@@ -464,9 +464,9 @@ pub unsafe fn psci_call(fid: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 /// `/chosen/leandros,kexec-ap-mailbox`, if any, and clean it to the point of
 /// coherency: the parked CPU reads it with its MMU off.
 #[cfg(target_arch = "aarch64")]
-unsafe fn kexec_mailbox_post(mpidr: u64, entry: u64, context: u64) {
+unsafe fn kexec_mailbox_post(mpidr: u64, entry: u64, context: u64) -> bool {
     let phys = boot::device_tree::kexec_ap_mailbox();
-    if phys == 0 || phys & 63 != 0 { return; }
+    if phys == 0 || phys & 63 != 0 { return false; }
     let m = mm::phys_to_virt(phys as usize) as *mut u64;
     m.write_volatile(0);
     m.add(1).write_volatile(entry);
@@ -474,6 +474,7 @@ unsafe fn kexec_mailbox_post(mpidr: u64, entry: u64, context: u64) {
     core::arch::asm!("dmb ish", options(nostack));
     m.write_volatile((mpidr & MPIDR_AFF_MASK) | (1 << 63));
     core::arch::asm!("dc civac, {}", "dsb sy", in(reg) m as usize, options(nostack));
+    true
 }
 
 // ── smp_init — bring up all listed APs ───────────────────────────────────────
@@ -578,21 +579,31 @@ pub unsafe fn smp_init(mpidrs: &[u64], overflow: usize) {
         // QEMU HVF the CPU_ON below wakes it after that CPU_OFF instead of at
         // `entry_phys`, and it then takes the same request from this mailbox
         // (kernel/src/kexec/purgatory_aarch64.s). Harmless anywhere else.
-        kexec_mailbox_post(mpidr, entry_phys as u64, slot as u64);
+        let posted = kexec_mailbox_post(mpidr, entry_phys as u64, slot as u64);
 
         // Issue PSCI CPU_ON: entry = aarch64_ap_entry (physical), context = stack slot.
         let rc = cpu_on(mpidr, entry_phys, slot as u64);
         core::arch::asm!("sev", options(nomem, nostack));
-        if rc != 0 {
+        // ALREADY_ON with a mailbox: a kexec'ing LeandrOS left this CPU in
+        // its park loop without CPU_OFF (rpi5), and the mailbox starts it.
+        let how = boot::mpidr::ap_start(rc, posted);
+        log("[SMP] cpu");
+        print_number(next as u32);
+        log(" mpidr 0x");
+        super::uart::print_hex(mpidr as usize);
+        log(" psci rc ");
+        if rc < 0 { log("-"); }
+        print_number(rc.unsigned_abs() as u32);
+        log(match how {
+            boot::mpidr::ApStart::Started => " (started)\n",
+            boot::mpidr::ApStart::Mailbox => " (ALREADY_ON: kexec park mailbox)\n",
+            boot::mpidr::ApStart::Failed => " (failed)\n",
+        });
+        if how == boot::mpidr::ApStart::Failed {
             // PSCI error codes: -1=NOT_SUPPORTED, -2=INVALID_PARAMS,
             // -3=DENIED, -4=ALREADY_ON, -5=ON_PENDING, -6=INTERNAL_FAILURE,
             // -7=NOT_PRESENT. The CPU will not run our stub: give its index
             // and stack back. (ALREADY_ON means something else owns it.)
-            log("[SMP] CPU_ON mpidr=0x");
-            super::uart::print_hex(mpidr as usize);
-            log(" failed rc=-");
-            print_number(rc.unsigned_abs() as u32);
-            log("\n");
             unassign(next, prev_key);
             mm::buddy::free(stack_phys, 4);
             ap_stack_table[slot] = 0;

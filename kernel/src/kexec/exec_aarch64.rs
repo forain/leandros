@@ -11,7 +11,9 @@
 //! hook and sends SGI 1 to every other CPU. Each CPU's next interrupt ends in
 //! [`on_ipi`]: CPU 0 runs [`final_cpu0`], every other one turns its MMU off
 //! from the AP park page (a copy of the purgatory in the FDT block, which
-//! the next kernel keeps) and calls PSCI CPU_OFF there (`park_off`). The
+//! the next kernel keeps) and calls PSCI CPU_OFF there (`park_off`), or on
+//! rpi5 stays in that page's mailbox loop (TF-A never restarts a CPU it
+//! powered off; `boot::mpidr::kexec_cpu_off`). The
 //! new kernel parks any CPU whose MPIDR affinity != 0 (entry_aarch64.s), so the
 //! jump must be made by the boot CPU; when the caller is not CPU 0 it powers
 //! itself off after the IPIs and CPU 0 takes over.
@@ -44,9 +46,12 @@ struct Plan {
     nranges: u64,
     /// AP park page (FDT block + `info::AP_PARK_OFF`), 0 = none.
     park: u64,
+    /// 1 = secondaries call PSCI CPU_OFF, 0 = they stay in the park loop
+    /// (`boot::mpidr::kexec_cpu_off`).
+    cpu_off: u64,
 }
 
-static mut PLAN: Plan = Plan { purgatory: 0, ttbr0: 0, tcr: 0, head: 0, entry: 0, fdt: 0, ranges: 0, nranges: 0, park: 0 };
+static mut PLAN: Plan = Plan { purgatory: 0, ttbr0: 0, tcr: 0, head: 0, entry: 0, fdt: 0, ranges: 0, nranges: 0, park: 0, cpu_off: 1 };
 static ARMED: AtomicBool = AtomicBool::new(false);
 
 fn log(s: &str) {
@@ -127,6 +132,12 @@ pub fn prepare(img: &Loaded, map: &[super::info::Raw]) -> Result<(), isize> {
     // A second copy in the AP park page: the secondaries call CPU_OFF from
     // there, in memory the next kernel keeps (purgatory_aarch64.s, HVF).
     let park = img.bootinfo + super::info::AP_PARK_OFF;
+    let cpu_off = boot::mpidr::kexec_cpu_off(cfg!(feature = "rpi5"), crate::boot_cmdline().unwrap_or(""));
+    crate::serial_print_str(if cpu_off {
+        "[KEXEC] secondaries: PSCI CPU_OFF, then the park loop\n"
+    } else {
+        "[KEXEC] secondaries: park loop, no PSCI CPU_OFF (next kernel starts them from the mailbox)\n"
+    });
     let kv = mm::phys_to_virt(park as usize);
     unsafe {
         core::ptr::copy_nonoverlapping(code as *const u8, pv as *mut u8, len);
@@ -151,6 +162,7 @@ pub fn prepare(img: &Loaded, map: &[super::info::Raw]) -> Result<(), isize> {
             head: img.head, entry: img.entry, fdt: img.bootinfo,
             ranges: (purg + RANGES_OFF) as u64, nranges: img.footprint.len() as u64,
             park,
+            cpu_off: cpu_off as u64,
         };
     }
     crate::serial_print_str(&alloc::format!(
@@ -181,7 +193,8 @@ fn park_off() -> ! {
     let smc = cfg!(feature = "rpi5")
         || unsafe { core::ptr::read_volatile(core::ptr::addr_of!(boot_entered_el2)) } != 0;
     let off = kexec_purgatory_off as *const () as u64 - kexec_purgatory_start as *const () as u64;
-    enter_idmap(p.park + off, [0, smc as u64, 0, 0, 0])
+    let me = unsafe { arch_aarch64::smp::arch_cpu_id() } as u64;
+    enter_idmap(p.park + off, [0, smc as u64, (p.cpu_off == 0) as u64, me, 0])
 }
 
 /// Switch TTBR0 to the identity map and branch to physical `target` with
@@ -243,7 +256,29 @@ fn final_cpu0() -> ! {
     // Wait for every other CPU to be OFF: the next kernel's CPU_ON of a CPU
     // still ON fails with ALREADY_ON.
     let n = arch_aarch64::smp::assigned();
+    let p = unsafe { core::ptr::addr_of!(PLAN).read() };
+    // Every other CPU first reports that it runs from the park page with its
+    // caches flushed: nothing it does after that touches old-kernel memory.
     for i in 1..n {
+        let w = mm::phys_to_virt((p.park + super::info::AP_ARRIVED_OFF) as usize + 8 * i) as *const u64;
+        let t0 = arch_aarch64::timer::monotonic_ns();
+        let arrived = || unsafe {
+            core::arch::asm!("dc civac, {}", "dsb sy", in(reg) w as usize, options(nostack));
+            w.read_volatile() != 0
+        };
+        let mut ok = arrived();
+        while !ok && arch_aarch64::timer::monotonic_ns().wrapping_sub(t0) < 2_000_000_000 {
+            core::hint::spin_loop();
+            ok = arrived();
+        }
+        if !ok {
+            log("[KEXEC] cpu");
+            dec(i as u64);
+            log(" never reached the park page; jumping anyway\n");
+        }
+    }
+    for i in 1..n {
+        if p.cpu_off == 0 { break; }
         let Some(m) = arch_aarch64::smp::mpidr_of(i) else { continue };
         let t0 = arch_aarch64::timer::monotonic_ns();
         let mut st = arch_aarch64::smp::affinity_info(m);
@@ -264,8 +299,7 @@ fn final_cpu0() -> ! {
     arch_aarch64::gic::kexec_quiesce();
     // One CPU left, interrupts masked: reset the PCI functions.
     super::devreset::execute(log);
-    let p = unsafe { core::ptr::addr_of!(PLAN).read() };
-    log("[KEXEC] cpu0: other CPUs off; purgatory ");
+    log(if p.cpu_off != 0 { "[KEXEC] cpu0: other CPUs off; purgatory " } else { "[KEXEC] cpu0: other CPUs parked; purgatory " });
     hex(p.purgatory);
     log(" -> entry ");
     hex(p.entry);

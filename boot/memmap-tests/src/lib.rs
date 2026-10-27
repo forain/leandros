@@ -502,3 +502,51 @@ mod mpidr_tests {
         assert_eq!(gate, ASM_GATE, "entry_aarch64.s park gate differs from boot/src/mpidr.rs");
     }
 }
+
+#[cfg(test)]
+mod psci_ap_tests {
+    use super::mpidr::*;
+
+    #[test]
+    fn cpu_on_success_starts() {
+        assert_eq!(ap_start(0, false), ApStart::Started);
+        assert_eq!(ap_start(0, true), ApStart::Started);
+    }
+
+    #[test]
+    fn already_on_uses_mailbox_only_when_posted() {
+        // A kexec-parked CPU is still on as far as the firmware knows.
+        assert_eq!(ap_start(PSCI_ALREADY_ON, true), ApStart::Mailbox);
+        assert_eq!(ap_start(PSCI_ALREADY_ON, false), ApStart::Failed);
+    }
+
+    #[test]
+    fn other_errors_fail() {
+        for rc in [-1, -2, -3, -5, -6, -7, 1] {
+            assert_eq!(ap_start(rc, true), ApStart::Failed, "rc {rc}");
+        }
+    }
+
+    #[test]
+    fn kexec_cpu_off_defaults_and_knob() {
+        assert!(kexec_cpu_off(false, ""));
+        assert!(!kexec_cpu_off(true, "console=ttyAMA0 root=x"));
+        assert!(kexec_cpu_off(true, "a kexec.cpuoff=1 b"));
+        assert!(!kexec_cpu_off(false, "kexec.cpuoff=0"));
+        assert!(kexec_cpu_off(true, "kexec.cpuoff=0 kexec.cpuoff=1"), "last wins");
+        assert!(!kexec_cpu_off(true, "kexec.cpuoff=10"));
+    }
+
+    /// The park path must skip CPU_OFF when asked and flush this CPU's
+    /// caches by set/way before reporting arrival.
+    #[test]
+    fn purgatory_park_skips_cpu_off() {
+        let s = include_str!("../../../kernel/src/kexec/purgatory_aarch64.s");
+        let off = &s[s.find("kexec_purgatory_off:").expect("label")..];
+        let park = off.find("cbnz    x15, 2f").expect("park branch past CPU_OFF");
+        let cisw = off.find("dc      cisw").expect("set/way flush");
+        let arrive = off.find("str     x12, [x11, x16, lsl #3]").expect("arrival marker");
+        let psci = off.find("#0x8400, lsl #16").expect("CPU_OFF fid");
+        assert!(cisw < arrive && arrive < park && park < psci);
+    }
+}

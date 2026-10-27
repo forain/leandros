@@ -20,3 +20,44 @@ pub const ASM_GATE: [&str; 5] = [
     "orr     x4, x5, x6",
     "cbz     x4, _start_primary",
 ];
+
+/// PSCI `ALREADY_ON`: CPU_ON of a CPU the firmware still counts as on.
+pub const PSCI_ALREADY_ON: i64 = -4;
+
+/// What a CPU_ON return code means for AP bring-up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApStart {
+    /// The firmware starts the CPU at the entry point.
+    Started,
+    /// The CPU is still on, spinning in a kexec'ing kernel's park loop: it
+    /// takes the entry point from the mailbox posted before CPU_ON.
+    Mailbox,
+    /// The CPU will not run the entry point.
+    Failed,
+}
+
+/// Classify CPU_ON's `rc`; `mailbox` = a kexec AP mailbox was posted for it.
+pub const fn ap_start(rc: i64, mailbox: bool) -> ApStart {
+    match rc {
+        0 => ApStart::Started,
+        PSCI_ALREADY_ON if mailbox => ApStart::Mailbox,
+        _ => ApStart::Failed,
+    }
+}
+
+/// Does a kexec'ing kernel power its secondaries off with PSCI CPU_OFF
+/// (`true`), or leave them in the park page's mailbox loop (`false`)?
+/// The Pi 5's TF-A accepts CPU_ON for a CPU it powered off but never
+/// restarts it, so the rpi5 build parks by default. `kexec.cpuoff=1|0` on
+/// the kexec'ing kernel's command line overrides either way.
+pub fn kexec_cpu_off(rpi5: bool, cmdline: &str) -> bool {
+    let mut off = !rpi5;
+    for t in cmdline.split_ascii_whitespace() {
+        match t {
+            "kexec.cpuoff=1" => off = true,
+            "kexec.cpuoff=0" => off = false,
+            _ => {}
+        }
+    }
+    off
+}
