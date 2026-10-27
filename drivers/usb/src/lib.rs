@@ -131,7 +131,7 @@ fn loc_name(port: u8, route: u32) -> String {
 /// pipes to the HID poll and its hub ports to the hot-plug scan. Returns its
 /// mass-storage transport.
 fn adopt(bus: u8, e: xhci::Enumerated, hot: bool) -> Option<XhciBulk> {
-    let xhci::Enumerated { info: i, bulk, hid: pipes, hub } = e;
+    let xhci::Enumerated { info: i, bulk, hid: pipes, hub, audio } = e;
     let hid_role = hid::role_name(i.hid);
     usb_log!("[USB] Bus {:03} Device {:03}: ID {:04x}:{:04x} {} {} [{}{}, {}, class {:02x}{}{}{}]\n",
              i.bus, i.address, i.vendor, i.product,
@@ -150,6 +150,11 @@ fn adopt(bus: u8, e: xhci::Enumerated, hot: bool) -> Option<XhciBulk> {
         hid::register(pipes, name, hid::initial_leds(), i.vendor, i.product);
     }
     DEVICES.lock().push(i);
+    if let Some(f) = audio {
+        usb_log!("[USB] bus {} slot {}: audio function, {} isochronous endpoint(s)\n",
+                 bus, f.slot, f.isoch_endpoints().len());
+        xhci::isoch::register_audio(f);
+    }
     bulk
 }
 
@@ -197,6 +202,7 @@ fn detach(bus: u8, hc: &Controller, port: u8, route: u32, ev: &mut Vec<HotEvent>
             ev.push(HotEvent::Gone { bus, slot: i.slot });
         } else {
             if i.hid != 0 { hid::detach(hc, i.slot); }
+            xhci::isoch::detach(hc, i.slot);
             xhci::release_slot(hc, i.slot);
             usb_log!("[USB] bus {} slot {}: released\n", bus, i.slot);
         }

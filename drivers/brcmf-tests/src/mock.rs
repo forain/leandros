@@ -84,6 +84,12 @@ pub struct MockChip {
     rx_cursor: usize,
     fw_seq: u8,
     pub window_adv: u8,
+    /// The SDIO core with SBSDIO_SB_ACCESS_2_4B_FLAG moves whole 32-bit backplane
+    /// words: address bits [1:0] are ignored (an unaligned RAM access starts at the
+    /// enclosing word). False: byte-exact (the old, optimistic mock).
+    pub word_granular: bool,
+    /// Flip bit 0 of the RAM byte at this backplane address on every bulk write.
+    pub corrupt_at: Option<u32>,
     pub log: Log,
     /// sr engine bit in PMU chipcontrol 3
     pub sr: bool,
@@ -125,6 +131,8 @@ impl MockChip {
             rx_cursor: 0,
             fw_seq: 0,
             window_adv: 8,
+            word_granular: true,
+            corrupt_at: None,
             log: Log::default(),
             sr: true,
             corrupt_next: false,
@@ -399,14 +407,16 @@ impl SdioBus for MockChip {
     fn read_bytes(&mut self, func: u8, addr: u32, incr: bool, buf: &mut [u8]) -> Result<(), BusError> {
         match func {
             1 => {
-                assert!(incr && addr & SB_ACCESS_2_4B_FLAG != 0);
-                let a = self.window() | (addr & SB_OFT_ADDR_MASK);
+                assert!(incr);
+                let mut a = self.window() | (addr & SB_OFT_ADDR_MASK);
                 assert!((addr & SB_OFT_ADDR_MASK) as usize + buf.len() <= 0x8000, "crossed window");
+                if self.word_granular && addr & SB_ACCESS_2_4B_FLAG != 0 { a &= !3; }
                 if Self::in_ram(a) {
                     let o = (a - RAMBASE_4345) as usize;
                     buf.copy_from_slice(&self.ram[o..o + buf.len()]);
                 } else {
                     assert_eq!(buf.len(), 4, "register access must be 32-bit");
+                    assert!(addr & SB_ACCESS_2_4B_FLAG != 0, "register access without the 4-byte flag");
                     buf.copy_from_slice(&self.bp_read32(a).to_le_bytes());
                 }
             }
@@ -432,12 +442,16 @@ impl SdioBus for MockChip {
     fn write_bytes(&mut self, func: u8, addr: u32, incr: bool, buf: &[u8]) -> Result<(), BusError> {
         match func {
             1 => {
-                assert!(incr && addr & SB_ACCESS_2_4B_FLAG != 0);
+                assert!(incr);
                 assert!((addr & SB_OFT_ADDR_MASK) as usize + buf.len() <= 0x8000, "crossed window");
-                let a = self.window() | (addr & SB_OFT_ADDR_MASK);
+                let mut a = self.window() | (addr & SB_OFT_ADDR_MASK);
+                if self.word_granular && addr & SB_ACCESS_2_4B_FLAG != 0 { a &= !3; }
                 if Self::in_ram(a) {
                     let o = (a - RAMBASE_4345) as usize;
                     self.ram[o..o + buf.len()].copy_from_slice(buf);
+                    if let Some(c) = self.corrupt_at {
+                        if (a..a + buf.len() as u32).contains(&c) { self.ram[(c - RAMBASE_4345) as usize] ^= 1; }
+                    }
                 } else {
                     assert_eq!(buf.len(), 4, "register access must be 32-bit");
                     self.bp_write32(a, u32::from_le_bytes(buf.try_into().unwrap()));

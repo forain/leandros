@@ -214,6 +214,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     vfs_server::block::init(&DISK_OPS);
 
     // ── USB ───────────────────────────────────────────────────────────────────
+    usb::xhci::isoch::set_cmdline(crate::boot_cmdline().unwrap_or(""));
     drivers::usb_hcd::init();
     // The xHCI BIOS handoff above ends the firmware's USB legacy (PS/2)
     // emulation: an i8042 that was only ever that emulation is gone now.
@@ -258,6 +259,9 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         drivers::v3d::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset, arch_aarch64::exception::serror_checkpoint);
         // RNG, firmware RTC, PM watchdog, thermal, ARM clock: one line each (lane pimisc).
         drivers::rpi_misc::boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset);
+        // BCM2712 GPIO/pinctrl/l2-intc (one [gpio] line) and OTP serial + MACs (one [otp] line), lane pigio.
+        drivers::bcm2712_gpio::boot(arch_aarch64::exception::serror_checkpoint);
+        drivers::bcm2712_otp::boot();
     }
     // HDMI0/1 read-only probe (hdmi.probe=0 disables): no display-register writes,
     // SError checkpoint after each block read.

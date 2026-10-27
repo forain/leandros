@@ -195,15 +195,30 @@ impl Chunk {
 /// Calls `f` for each chunk in order; stops at the first error.
 pub fn split_cmd53<E>(
     addr: u32, incr: bool, len: usize, blksz: usize, multi_block: bool,
+    f: impl FnMut(Chunk) -> Result<(), E>,
+) -> Result<(), E> {
+    split_cmd53_capped(addr, incr, len, blksz, multi_block, 0, f)
+}
+
+/// `split_cmd53` with at most `cap` bytes per CMD53 (0 = no cap; a cap below
+/// one block turns block mode off).
+pub fn split_cmd53_capped<E>(
+    addr: u32, incr: bool, len: usize, blksz: usize, multi_block: bool, cap: usize,
     mut f: impl FnMut(Chunk) -> Result<(), E>,
 ) -> Result<(), E> {
-    let max_byte = if blksz == 0 { MAX_BYTE_MODE } else { blksz.min(MAX_BYTE_MODE) };
+    let mut max_byte = if blksz == 0 { MAX_BYTE_MODE } else { blksz.min(MAX_BYTE_MODE) };
+    let mut max_blocks = MAX_BLOCKS_PER_CMD53;
+    let mut multi_block = multi_block;
+    if cap != 0 {
+        max_byte = max_byte.min(cap);
+        if blksz == 0 || cap < blksz { multi_block = false; } else { max_blocks = max_blocks.min(cap / blksz); }
+    }
     let mut off = 0usize;
     let mut left = len;
     let at = |off: usize| if incr { addr.wrapping_add(off as u32) } else { addr };
     if multi_block && blksz > 0 && left > max_byte {
         while left >= blksz {
-            let blocks = (left / blksz).min(MAX_BLOCKS_PER_CMD53);
+            let blocks = (left / blksz).min(max_blocks);
             f(Chunk { addr: at(off), off, block: true, count: blocks })?;
             off += blocks * blksz;
             left -= blocks * blksz;
@@ -273,12 +288,50 @@ pub struct SdioHost<H: HostIo> {
     /// `(NORMAL_INT_STATUS << 16) | ERROR_INT_STATUS` at the last failure.
     pub last_fail: u32,
     pub card_irq_enabled: bool,
+    /// Runtime bring-up knobs (`brcmfctl retry sdclk= hs= blk= blksz= chunk=`).
+    pub tune: SdioTune,
+}
+
+/// Bus knobs the brcmf retry path can vary without a new kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SdioTune {
+    /// SD clock target in kHz (capped at 25 MHz without high speed).
+    pub sdclk_khz: u32,
+    /// Try SDIO high-speed (EHS + host HS bit).
+    pub hs: bool,
+    /// Block-mode CMD53 (false: byte mode only).
+    pub blk: bool,
+    /// F1 block size override (0: whatever the driver asks, 64).
+    pub f1_blksz: u16,
+    /// Max bytes per CMD53 (0: no cap).
+    pub chunk: u32,
+}
+
+impl Default for SdioTune {
+    fn default() -> Self { SdioTune { sdclk_khz: 50_000, hs: true, blk: true, f1_blksz: 0, chunk: 0 } }
+}
+
+impl SdioTune {
+    /// One `k=v` retry knob; false if the key is not a bus knob or the value is bad.
+    pub fn set(&mut self, key: &str, val: &str) -> bool {
+        let Ok(n) = val.parse::<u32>() else { return false };
+        match key {
+            "sdclk" if (400..=50_000).contains(&n) => self.sdclk_khz = n,
+            "hs" => self.hs = n != 0,
+            "blk" => self.blk = n != 0,
+            "blksz" if n == 0 || (4..=2048).contains(&n) && n % 4 == 0 => self.f1_blksz = n as u16,
+            "chunk" if n == 0 || (4..=0x8000).contains(&n) => self.chunk = n,
+            _ => return false,
+        }
+        true
+    }
 }
 
 impl<H: HostIo> SdioHost<H> {
     pub fn new(io: H) -> Self {
         SdioHost { io, rca: 0, blksz: [0; 8], multi_block: false, base_khz: 0, v3: true,
-                   deadline_us: None, last_fail: 0, card_irq_enabled: false }
+                   deadline_us: None, last_fail: 0, card_irq_enabled: false,
+                   tune: SdioTune::default() }
     }
 
     fn expired(&mut self, start: u64, timeout_us: u64) -> bool {
@@ -411,8 +464,9 @@ impl<H: HostIo> SdioHost<H> {
     {
         if func > 7 { return Err(BusError::Io); }
         let blksz = self.blksz[func as usize] as usize;
-        let mb = self.multi_block;
-        split_cmd53(addr, incr, len, blksz, mb, |c| {
+        let mb = self.multi_block && self.tune.blk;
+        let cap = self.tune.chunk as usize;
+        split_cmd53_capped(addr, incr, len, blksz, mb, cap, |c| {
             let n = c.bytes(blksz);
             self.cmd53_pio(write, func, c, incr, blksz, unsafe { buf.add(c.off) }, n)
         })
@@ -519,11 +573,12 @@ impl<H: HostIo> SdioHost<H> {
                 }
             }
         }
-        ci.clk_khz = self.set_bus(if hs { 50_000 } else { 25_000 }, ci.width4, hs);
+        let want_khz = self.tune.sdclk_khz.min(if hs { 50_000 } else { 25_000 });
+        ci.clk_khz = self.set_bus(want_khz, ci.width4, hs);
         // Prove the faster bus; retreat to 25 MHz default speed if it does not hold.
         if self.cmd52(false, FUNC_BUS, CCCR_SDIO_REV, 0) != Ok(ci.cccr_rev) {
             self.reset_cmd_dat();
-            ci.clk_khz = self.set_bus(25_000, ci.width4, false);
+            ci.clk_khz = self.set_bus(want_khz.min(25_000), ci.width4, false);
             if hs { let _ = self.cmd52(true, FUNC_BUS, CCCR_SPEED, 0); }
             hs = false;
             if self.cmd52(false, FUNC_BUS, CCCR_SDIO_REV, 0) != Ok(ci.cccr_rev) {
@@ -532,7 +587,7 @@ impl<H: HostIo> SdioHost<H> {
         }
         ci.high_speed = hs;
         self.enable_func(FUNC_BACKPLANE).map_err(|e| InitError { stage: "f1-enable", err: e })?;
-        self.set_block_size(FUNC_BACKPLANE, 64).map_err(|e| InitError { stage: "f1-blksz", err: e })?;
+        SdioBus::set_block_size(self, FUNC_BACKPLANE, 64).map_err(|e| InitError { stage: "f1-blksz", err: e })?;
         Ok(ci)
     }
 
@@ -585,6 +640,7 @@ impl<H: HostIo> SdioBus for SdioHost<H> {
     }
     fn set_block_size(&mut self, func: u8, size: u16) -> Result<(), BusError> {
         if func > 7 || size == 0 || size > 2048 { return Err(BusError::Io); }
+        let size = if func == FUNC_BACKPLANE && self.tune.f1_blksz != 0 { self.tune.f1_blksz } else { size };
         let fbr = (func as u32) * 0x100; // F0 → CCCR 0x10/0x11, Fn → FBR n 0x10/0x11
         self.cmd52(true, FUNC_BUS, fbr + 0x10, size as u8)?;
         self.cmd52(true, FUNC_BUS, fbr + 0x11, (size >> 8) as u8)?;
@@ -642,7 +698,7 @@ pub fn read_chip_id<B: SdioBus>(bus: &mut B) -> Result<(u32, bool), BusError> {
 
 // ── Raspberry Pi 5 hardware: power path, pin mux, MMIO, boot probe ───────────
 #[cfg(feature = "rpi5")]
-pub use hw::{boot_probe, gio_drive, probe, take_host, Mmio, GIO_PHYS, PINCTRL_PHYS, PROBE_STATE};
+pub use hw::{boot_probe, probe, probe_with, take_host, Mmio, PROBE_STATE};
 
 #[cfg(feature = "rpi5")]
 mod hw {
@@ -654,9 +710,6 @@ mod hw {
 
     pub const SDIO2_HOST_PHYS: u64 = 0x10_0110_0000;
     pub const SDIO2_CFG_PHYS: u64 = 0x10_0110_0400;
-    pub const GIO_PHYS: u64 = 0x10_7d50_8500;
-    pub const PINCTRL_PHYS: u64 = 0x10_7d50_4100;
-    pub const WL_REG_ON_GPIO: u32 = 28;
     /// wl_on_reg `startup-delay-us`.
     pub const WL_ON_STARTUP_US: u32 = 150_000;
     /// Hard probe budget, all waits included.
@@ -664,8 +717,6 @@ mod hw {
 
     const SDIO_CFG_CTRL: usize = 0x00;
     const SDIO_CFG_SD_PIN_SEL: usize = 0x44;
-    const GIO_DATA: usize = 0x04;
-    const GIO_IODIR: usize = 0x08; // 1 = input
 
     /// 0 = not run, 1 = ok (chip id 0x4345 seen), 2 = card up but chip id mismatch/unreadable,
     /// 3 = failed before card init finished, 4 = MMIO mapping failed.
@@ -706,48 +757,26 @@ mod hw {
 
     use crate::bcm2712_id::{self, Stepping};
 
-    /// Mux gpio28 to GPIO and gpio30..35 to sd2 with the dts pulls. Returns a
-    /// short description for the log. Writes only registers whose value changes.
-    fn pinmux(pc: usize, st: Stepping) -> alloc::string::String {
-        let Some(rows) = bcm2712_id::pin_rows(st) else {
+    use crate::bcm2712_gpio::{self as gpio, Block, Chip, GROUP_SDIO2_WL_ON, WL_ON};
+
+    /// Mux gpio28 to GPIO and gpio30..35 to sd2 with the dts pulls, through the
+    /// shared BCM2712 pinctrl driver. Returns a short description for the log.
+    /// Writes only registers whose value changes.
+    fn pinmux(st: Stepping) -> alloc::string::String {
+        if bcm2712_id::pin_rows(st).is_none() {
             return alloc::string::String::from("pinmux=skip(unknown stepping)");
-        };
-        let mut changed = 0u32;
+        }
         let mut before = 0u32; // packed fsel nibbles of pins 30..35 as found
-        for (i, &(_pin, mr, mb, pr, pb, fsel, pull)) in rows.iter().enumerate() {
-            unsafe {
-                let ma = pc + mr * 4;
-                let v = rd32(ma);
-                let cur = (v >> (mb * 4)) & 0xF;
-                if i > 0 { before |= cur << ((i as u32 - 1) * 4); }
-                if cur != fsel { wr32(ma, (v & !(0xF << (mb * 4))) | (fsel << (mb * 4))); changed += 1; }
-                let pa = pc + pr * 4;
-                let p = rd32(pa);
-                let curp = (p >> (pb * 2)) & 3;
-                if curp != pull { wr32(pa, (p & !(3 << (pb * 2))) | (pull << (pb * 2))); changed += 1; }
-            }
+        for (i, p) in (30..=35).enumerate() {
+            before |= (gpio::pin_get_fsel(Block::Main, p).unwrap_or(0) & 0xF) << (i as u32 * 4);
         }
-        alloc::format!("pinmux={:?} sd2-fsel-before={:06x} writes={}", st, before, changed)
-    }
-
-    /// Serialises read-modify-write of the shared gio bank (WL_REG_ON here,
-    /// BT_ON in `bt::boot`, possibly on different threads).
-    static GIO_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Drives `gio` bank pin `pin` (0..31) as an output, high or low. `gio` is
-    /// the mapped [`GIO_PHYS`] window.
-    pub fn gio_drive(gio: usize, pin: u32, on: bool) {
-        let bit = 1u32 << pin;
-        let _g = GIO_LOCK.lock();
-        unsafe {
-            let d = rd32(gio + GIO_DATA);
-            wr32(gio + GIO_DATA, if on { d | bit } else { d & !bit });
-            let dir = rd32(gio + GIO_IODIR);
-            if dir & bit != 0 { wr32(gio + GIO_IODIR, dir & !bit); }
+        match gpio::pin_apply(Block::Main, &GROUP_SDIO2_WL_ON) {
+            Ok(w) => alloc::format!("pinmux={:?} sd2-fsel-before={:06x} writes={}", st, before, w),
+            Err(e) => alloc::format!("pinmux=fail({:?})", e),
         }
     }
 
-    fn wl_reg_on(gio: usize, on: bool) { gio_drive(gio, WL_REG_ON_GPIO, on) }
+    fn wl_reg_on(on: bool) { let _ = gpio::gpio_set_output(Chip::Gio, WL_ON, on); }
 
     fn map(phys: u64, len: usize) -> Option<usize> { mm::kva::ioremap(phys, len, mm::kva::CacheMode::Uncached) }
 
@@ -755,28 +784,30 @@ mod hw {
     /// card identity and the chip id. Inert on failure (one line, WL_REG_ON
     /// dropped again, host left in reset); never waits more than ~2 s.
     /// Mappings made once (the probe re-runs from `brcmfctl retry`).
-    static MAPS: Mutex<Option<(usize, usize, usize, usize)>> = Mutex::new(None);
+    static MAPS: Mutex<Option<(usize, usize)>> = Mutex::new(None);
 
     pub fn boot_probe() { probe(20_000, WL_ON_STARTUP_US as u32) }
+
+    pub fn probe(off_us: u32, on_us: u32) { probe_with(off_us, on_us, SdioTune::default()) }
 
     /// The whole probe: host quiesce, WL_REG_ON low for `off_us`, high and
     /// `on_us` settle, SDIO init, chip id, host parked. Re-runnable: a parked
     /// host from an earlier run is dropped first.
-    pub fn probe(off_us: u32, on_us: u32) {
+    pub fn probe_with(off_us: u32, on_us: u32, tune: SdioTune) {
         let t0 = sched::monotonic_ns() / 1_000;
         drop(HOST.lock().take());
         let cached = *MAPS.lock();
-        let maps = cached.or_else(|| match (map(SDIO2_HOST_PHYS, 0x100), map(SDIO2_CFG_PHYS, 0x100),
-                                            map(GIO_PHYS, 0x40), map(PINCTRL_PHYS, 0x30)) {
-            (Some(h), Some(c), Some(g), Some(p)) => Some((h, c, g, p)),
+        let maps = cached.or_else(|| match (map(SDIO2_HOST_PHYS, 0x100), map(SDIO2_CFG_PHYS, 0x100)) {
+            (Some(h), Some(c)) => Some((h, c)),
             _ => None,
         });
-        let Some((host, cfg, gio, pc)) = maps else {
+        // WL_REG_ON and the pin mux go through the shared BCM2712 GPIO driver.
+        let Some((host, cfg)) = maps.filter(|_| gpio::gpio_is_output(Chip::Gio, WL_ON).is_ok()) else {
             PROBE_STATE.store(4, Ordering::Relaxed); log("FAIL stage=map"); return;
         };
-        *MAPS.lock() = Some((host, cfg, gio, pc));
+        *MAPS.lock() = Some((host, cfg));
         let st = bcm2712_id::stepping().stepping;
-        let mux = pinmux(pc, st);
+        let mux = pinmux(st);
         // Force card presence (non-removable) and select SD pin timing.
         unsafe {
             let v = rd32(cfg + SDIO_CFG_CTRL);
@@ -797,14 +828,15 @@ mod hw {
             q.w16(REG_CLOCK_CONTROL, 0);
             q.w8(REG_POWER_CONTROL, 0);
         }
-        wl_reg_on(gio, false);
+        wl_reg_on(false);
         sched::kthread::udelay(off_us.max(1_000) as u64);
-        wl_reg_on(gio, true);
+        wl_reg_on(true);
         sched::kthread::udelay(on_us as u64);
 
         let mut h = SdioHost::new(Mmio { host });
         h.deadline_us = Some(t0 + PROBE_BUDGET_US);
-        let res = h.host_init().and_then(|_| h.init_card(true));
+        h.tune = tune;
+        let res = h.host_init().and_then(|_| h.init_card(tune.hs));
         let ci = match res {
             Ok(ci) => ci,
             Err(e) => {
@@ -813,7 +845,7 @@ mod hw {
                       e.stage, e.err, h.last_fail, ps, mux, (sched::monotonic_ns() / 1_000 - t0) / 1_000);
                 h.io.w8(REG_POWER_CONTROL, 0);
                 h.io.w8(REG_SOFTWARE_RESET, SWRST_ALL);
-                wl_reg_on(gio, false);
+                wl_reg_on(false);
                 PROBE_STATE.store(3, Ordering::Relaxed);
                 return;
             }
@@ -821,6 +853,9 @@ mod hw {
         slog!("sdio2 base={:#x} ocr={:#08x} rca={:#06x} cccr={:#04x} caps={:#04x} funcs={} manf={:#06x}:{:#06x} bus={}bit {}kHz{} {}",
               SDIO2_HOST_PHYS, ci.ocr, ci.rca, ci.cccr_rev, ci.caps, ci.nfuncs, ci.manf, ci.card,
               if ci.width4 { 4 } else { 1 }, ci.clk_khz, if ci.high_speed { " hs" } else { "" }, mux);
+        if tune != SdioTune::default() {
+            slog!("tune sdclk={} hs={} blk={} blksz={} chunk={}", tune.sdclk_khz, tune.hs as u8, tune.blk as u8, tune.f1_blksz, tune.chunk);
+        }
         let t = (sched::monotonic_ns() / 1_000 - t0) / 1_000;
         match read_chip_id(&mut h) {
             Ok((id, alp)) if id & 0xFFFF == 0x4345 => {
