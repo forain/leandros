@@ -35,6 +35,7 @@ pub mod context;
 pub mod regs;
 pub mod ring;
 mod intr;
+pub mod isoch;
 
 pub use intr::{HidPipe, IntrPipe, Poll as IntrPoll, Reports as IntrReports, REPORT_MAX};
 
@@ -62,6 +63,11 @@ pub const CC_TRANSACTION: u8 = 4;
 pub const CC_TRB: u8 = 5;
 pub const CC_STALL: u8 = 6;
 pub const CC_SHORT: u8 = 13;
+pub const CC_RING_UNDERRUN: u8 = 14;
+pub const CC_RING_OVERRUN: u8 = 15;
+pub const CC_BANDWIDTH: u8 = 11;
+pub const CC_ISOCH_BUFFER_OVERRUN: u8 = 22;
+pub const CC_MISSED_SERVICE: u8 = 23;
 pub const CC_CONTEXT_STATE: u8 = 19;
 pub const CC_EVENT_RING_FULL: u8 = 21;
 pub const CC_CMD_RING_STOPPED: u8 = 24;
@@ -374,7 +380,7 @@ impl Xhci {
                     let dci = ((ev.control >> 16) & 0x1F) as usize;
                     let rec = Ev { ptr: ev.param, cc: ev.cc(), residual: ev.status & 0xFF_FFFF };
                     match self.ep_mut(ev.slot(), dci) {
-                        Some(ep) if ep.events.len() < EP_EVENTS_MAX => ep.events.push(rec),
+                        Some(ep) if ep.events.len() < ep.events.capacity().max(EP_EVENTS_MAX) => ep.events.push(rec),
                         Some(_) => {}
                         None => usb_dbg!("[XHCI] stray transfer event slot {} dci {} cc {}\n", ev.slot(), dci, ev.cc()),
                     }
@@ -820,7 +826,7 @@ fn bulk(hc: &Hc, slot: u8, dci: usize, out: Option<&[u8]>, mut inb: Option<&mut 
                 // endpoint (transfers are synchronous and a failed TD is
                 // always cancelled before its call returns).
                 ep.bounce = None;
-                let b = DmaBuf::new(want, dma32).ok_or(UsbErr::Other(0xFF))?;
+                let b = DmaBuf::new_streaming(want, dma32).ok_or(UsbErr::Other(0xFF))?;
                 usb_dbg!("[XHCI] slot {} dci {}: bounce buffer {} KiB at {:#x}\n", slot, dci, want / 1024, b.phys());
                 ep.bounce = Some(b);
             }
@@ -911,6 +917,9 @@ pub struct Enumerated {
     pub hid: Vec<HidPipe>,
     /// A hub: its downstream ports, for the hot-plug scan.
     pub hub: Option<HubPorts>,
+    /// A configured function with audio streaming (isochronous) interfaces,
+    /// for a class driver to open [`isoch::IsochPipe`]s on.
+    pub audio: Option<isoch::UsbFunction>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1154,7 +1163,7 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
 
     if dev_class == 0x09 {
         let hub = setup_hub(hc, slot, speed, ci.value, port, route, tt)?;
-        return Ok(Enumerated { info, bulk: None, hid: Vec::new(), hub: Some(hub) });
+        return Ok(Enumerated { info, bulk: None, hid: Vec::new(), hub: Some(hub), audio: None });
     }
 
     let Some(bot) = ci.bot else {
@@ -1179,7 +1188,22 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
             };
             info.interface = p.desc.iface;
         }
-        return Ok(Enumerated { info, bulk: None, hid, hub: None });
+        // No boot HID either: an audio function (isochronous streaming
+        // interfaces)? Select its configuration; a class driver opens the
+        // streams later with `isoch::IsochPipe::open`.
+        let mut audio = None;
+        if hid.is_empty() && isoch::has_audio_streaming(&cfg) {
+            match control(hc, slot, 0x00, 9, ci.value as u16, 0, CtrlData::None, ENUM_CTRL_TIMEOUT_MS) {
+                Ok(_) => {
+                    info.class = 0x01;
+                    audio = Some(isoch::UsbFunction {
+                        hc: hc.clone(), slot, speed, config_value: ci.value, cfg: cfg.clone(),
+                    });
+                }
+                Err(e) => usb_log!("[XHCI] slot {}: audio SET_CONFIGURATION failed ({:?})\n", slot, e),
+            }
+        }
+        return Ok(Enumerated { info, bulk: None, hid, hub: None, audio });
     };
 
     // Configure the two bulk endpoints, then select the configuration (and
@@ -1218,6 +1242,7 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
         info,
         hid: Vec::new(),
         hub: None,
+        audio: None,
         bulk: Some(XhciBulk {
             hc: hc.clone(), slot, iface: bot.iface,
             ep_in: bot.ep_in.addr, ep_out: bot.ep_out.addr, dci_in, dci_out,

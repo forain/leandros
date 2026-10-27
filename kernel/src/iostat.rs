@@ -58,6 +58,7 @@ fn task() -> ! {
         last = now;
         let f = unsafe { arch_interrupt_save() };
         drivers::usb_storage::stats_report(window);
+        isoch_report(window);
         let w = f2fs_server::mount_lock_window();
         unsafe { arch_interrupt_restore(f) };
         let (cps, fsyncs, shared, throttled, fsync_pid) = f2fs_server::checkpoint_window();
@@ -142,6 +143,21 @@ fn uart_rx_report() {
                 arch_aarch64::uart::UART_RX_RESCUED.load(Relaxed), txgap, late));
         }
     }
+}
+
+/// `[usbisoch]` line for a window in which isochronous TDs completed.
+fn isoch_report(window_ns: u64) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static LAST: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    let s = usb::xhci::isoch::stats();
+    let now = [s.tds, s.underrun, s.missed, s.silence, s.errors];
+    let mut d = [0u64; 5];
+    for i in 0..5 { d[i] = now[i] - LAST[i].swap(now[i], Ordering::Relaxed); }
+    if d[0] == 0 && d[1] == 0 && d[2] == 0 { return; }
+    let line = alloc::format!(
+        "[usbisoch] {} ms: {} TDs, isoch_underrun {} (total {}), isoch_missed {} (total {}), silence {}, errors {}\n",
+        window_ns / 1_000_000, d[0], d[1], now[1], d[2], now[2], d[3], d[4]);
+    crate::serial_print_str(&line);
 }
 
 /// `[txgap_us, irqlate_us, rescued, overruns]` for /proc/sysstat's `# uart`

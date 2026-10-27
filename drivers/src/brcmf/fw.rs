@@ -137,17 +137,64 @@ pub struct DownloadReport {
     pub sr_enabled: bool,
 }
 
-/// Bytes read back after the download to catch a broken data path cheaply.
+/// Bytes read back per sample (`verify=1`) and per read (`verify=2`).
 const VERIFY_SAMPLE: usize = 256;
 
-fn verify(chip: &mut Chip, bus: &mut dyn SdioBus, addr: u32, data: &[u8]) -> Result<(), FwLoadError> {
+/// The first read-back difference, for the `[brcmf] fail fw` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Mismatch {
+    /// Offset into the image.
+    pub off: u32,
+    /// Backplane address of `off`.
+    pub addr: u32,
+    /// Up to 8 bytes from `off` (`n` valid).
+    pub exp: [u8; 8],
+    pub got: [u8; 8],
+    pub n: u8,
+    /// Differing bytes in the read that held the first difference.
+    pub nbad: u32,
+    /// Bytes compared up to and including that read.
+    pub checked: u32,
+}
+
+impl Mismatch {
+    pub fn line(&self) -> alloc::string::String {
+        let hex = |b: &[u8]| b.iter().map(|x| alloc::format!("{:02x}", x)).collect::<alloc::string::String>();
+        alloc::format!("off={:#x} addr={:#x} exp={} got={} nbad={} checked={}",
+                       self.off, self.addr, hex(&self.exp[..self.n as usize]),
+                       hex(&self.got[..self.n as usize]), self.nbad, self.checked)
+    }
+}
+
+/// Reads `data` back from `addr`: `mode` 0 = off, 1 = head and tail samples,
+/// 2 = the whole image. Records the first difference in `mm`.
+fn verify(chip: &mut Chip, bus: &mut dyn SdioBus, addr: u32, data: &[u8], mode: u8,
+          mm: &mut Option<Mismatch>) -> Result<(), FwLoadError> {
+    if mode == 0 || data.is_empty() {
+        return Ok(());
+    }
     let mut buf = [0u8; VERIFY_SAMPLE];
     let n = core::cmp::min(VERIFY_SAMPLE, data.len());
-    for (off, src) in [(0usize, &data[..n]), (data.len() - n, &data[data.len() - n..])] {
-        chip.bp.ram_read(bus, addr + off as u32, &mut buf[..n])?;
-        if &buf[..n] != src {
+    // Samples start word-aligned: the 2/4-byte backplane access moves whole words.
+    let tail = (data.len() - n) & !3;
+    let mut checked = 0u32;
+    let mut off = 0usize;
+    while off < data.len() {
+        let len = core::cmp::min(VERIFY_SAMPLE, data.len() - off);
+        let src = &data[off..off + len];
+        chip.bp.ram_read(bus, addr + off as u32, &mut buf[..len])?;
+        checked += len as u32;
+        if &buf[..len] != src {
+            let i = (0..len).find(|&i| buf[i] != src[i]).unwrap_or(0);
+            let k = core::cmp::min(8, len - i);
+            let mut m = Mismatch { off: (off + i) as u32, addr: addr + (off + i) as u32, n: k as u8, checked, ..Default::default() };
+            m.exp[..k].copy_from_slice(&src[i..i + k]);
+            m.got[..k].copy_from_slice(&buf[i..i + k]);
+            m.nbad = (0..len).filter(|&j| buf[j] != src[j]).count() as u32;
+            *mm = Some(m);
             return Err(FwLoadError::Verify);
         }
+        off = if mode == 1 && off < tail { tail.max(off + len) } else { off + len };
     }
     Ok(())
 }
@@ -182,6 +229,10 @@ pub struct Knobs {
     pub force_ht: bool,
     /// Skip the CLM blob (boot layer).
     pub noclm: bool,
+    /// RAM read-back after the download: 0 off, 1 head/tail samples, 2 whole image.
+    pub verify: u8,
+    /// Bulk RAM transfers with SBSDIO_SB_ACCESS_2_4B_FLAG (brcmfmac always sets it).
+    pub win4b: bool,
 }
 
 impl Default for Knobs {
@@ -199,6 +250,8 @@ impl Default for Knobs {
             mesbusy: 0,
             force_ht: true,
             noclm: false,
+            verify: 2,
+            win4b: true,
         }
     }
 }
@@ -241,6 +294,8 @@ impl Knobs {
             "mesbusy" => self.mesbusy = n as u8,
             "force_ht" => self.force_ht = n != 0,
             "noclm" => self.noclm = n != 0,
+            "verify" => self.verify = n.min(2) as u8,
+            "win4b" => self.win4b = n != 0,
             _ => return false,
         }
         true
@@ -252,6 +307,8 @@ impl Knobs {
 pub struct DlFail {
     pub err: FwLoadError,
     pub stage: &'static str,
+    /// First read-back difference when `err` is `Verify`.
+    pub mismatch: Option<Mismatch>,
 }
 
 /// brcmf_sdio_download_firmware + brcmf_sdio_firmware_callback with the
@@ -279,8 +336,10 @@ pub fn download_with(
     k: &Knobs,
 ) -> Result<DownloadReport, DlFail> {
     let mut stage = "image";
-    let r = download_inner(bus, chip, code, nvram_text, k, &mut stage);
-    r.map_err(|err| DlFail { err, stage })
+    let mut mismatch = None;
+    let r = download_inner(bus, chip, code, nvram_text, k, &mut stage, &mut mismatch);
+    chip.bp.no_4b = false;
+    r.map_err(|err| DlFail { err, stage, mismatch })
 }
 
 fn download_inner(
@@ -290,6 +349,7 @@ fn download_inner(
     nvram_text: &[u8],
     k: &Knobs,
     stage: &mut &'static str,
+    mm: &mut Option<Mismatch>,
 ) -> Result<DownloadReport, FwLoadError> {
     if code.len() < 4 {
         return Err(FwLoadError::EmptyImage);
@@ -310,13 +370,15 @@ fn download_inner(
     chip.set_passive(bus)?;
 
     *stage = "code";
+    chip.bp.no_4b = !k.win4b;
     chip.bp.ram_write(bus, chip.ram_base, code)?;
-    verify(chip, bus, chip.ram_base, code)?;
+    verify(chip, bus, chip.ram_base, code, k.verify, mm)?;
 
     *stage = "nvram";
     let nvram_addr = chip.ram_base + chip.ram_size - nvram.len() as u32;
     chip.bp.ram_write(bus, nvram_addr, &nvram)?;
-    verify(chip, bus, nvram_addr, &nvram)?;
+    verify(chip, bus, nvram_addr, &nvram, k.verify, mm)?;
+    chip.bp.no_4b = false;
 
     *stage = "active";
     chip.set_active(bus, rstvec)?;

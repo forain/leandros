@@ -51,6 +51,13 @@ pub fn selftest() -> bool { SELFTEST.load(Ordering::Relaxed) }
 pub fn set_force_dma32(on: bool) { FORCE_DMA32.store(on, Ordering::Relaxed); }
 pub fn force_dma32() -> bool { FORCE_DMA32.load(Ordering::Relaxed) }
 
+/// Device (bus) address = CPU physical address + this offset. 0 (identity) on
+/// x86_64 and QEMU `virt`; the Pi 5's RP1 sees RAM at PCI 0x10_0000_0000.
+/// Set once before the first controller that needs it is probed.
+static DMA_OFFSET: AtomicU64 = AtomicU64::new(0);
+pub fn set_dma_offset(off: u64) { DMA_OFFSET.store(off, Ordering::Relaxed); }
+#[inline] pub fn dma_offset() -> u64 { DMA_OFFSET.load(Ordering::Relaxed) }
+
 pub fn now_ns() -> u64 {
     let f = NOW_NS.load(Ordering::Acquire);
     if f != 0 {

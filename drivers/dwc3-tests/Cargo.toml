@@ -1,0 +1,14 @@
+# Host unit tests for drivers/src/dwc3_hw.rs (DWC3 host-mode glue register
+# math and the RP1 quirk set). Its own workspace so it builds for the host:
+#
+#   cd drivers/dwc3-tests && cargo test --target aarch64-apple-darwin
+[package]
+name = "dwc3-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

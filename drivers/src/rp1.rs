@@ -75,7 +75,7 @@ pub fn probe() {
     crate::pi5_board::rp1_ready();
     crate::rp1_fan::init(va);
     attach_gem(va, clocks_ok);
-    // Further RP1 function attaches (xHCI) go here, after clocks and GPIO.
+    crate::rp1_usb::attach(va, size);
 }
 
 /// `rp1.irq=1`: deliver the GEM interrupt over MSI-X → MIP → GIC instead of
