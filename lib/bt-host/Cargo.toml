@@ -1,0 +1,16 @@
+# Bluetooth host core: HCI, ACL, L2CAP (basic mode), SSP pairing, link-key
+# store and the btd client wire format. Sans-IO and no_std + alloc, so the
+# whole state machine is driven by host unit tests (recorded HCI traces and a
+# loopback virtual controller). Used by userland/btd. Seam: docs/servers/bluetooth.md.
+#
+# No dependencies and no workspace inheritance on purpose (userland/* path-depends on it).
+# Host tests (the repo's .cargo config defaults to the kernel target):
+#   cargo test -p bt-host --target aarch64-apple-darwin
+[package]
+name = "bt-host"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[dependencies]
