@@ -2795,7 +2795,7 @@ fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8], sent: &mut
                 wm::gk::note_install(key_id, false);
                 ilog!("group key {} (CCMP) installed", key_id);
             }
-            HsEvent::Complete => {}
+            HsEvent::Complete | HsEvent::InstallIgtk { .. } => {}
             HsEvent::Error(e) => ilog!("EAPOL: {}", e),
         }
     }
