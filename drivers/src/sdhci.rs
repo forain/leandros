@@ -168,6 +168,24 @@ fn dbg_dec(mut v: u32) {
 /// bug report rather than a mystery.
 const SPIN_LIMIT: u32 = 20_000_000;
 
+/// Open an IRQ window from inside a polled transfer, so this CPU keeps taking
+/// its timer tick and IPIs. Every request is driven by PIO with IRQs masked
+/// (syscall / fault / kthread context), one 512-byte sector at a time; a
+/// multi-megabyte span, or a wait that runs to `SPIN_LIMIT` (~10-20 s of MMIO
+/// reads on BCM2712), otherwise leaves the CPU deaf for that long — the
+/// `[WDOG] cpuN took no timer tick for ~12 s` seen on the Pi under heavy SD
+/// traffic. Same contract as `virtio_blk::irq_window_if_masked`: never a task
+/// switch (the caller may hold `DEVICES`), never in IRQ context, and boot-time
+/// requests (pid 0, before the scheduler) stay fully masked.
+#[inline]
+fn tick_window() {
+    if sched::irqs_masked() && sched::current_pid() != 0 && !sched::irqctx::in_irq() {
+        sched::preempt_disable();
+        sched::irq_window();
+        sched::preempt_enable_no_resched();
+    }
+}
+
 /// `(NORMAL_INT_STATUS << 16) | ERROR_INT_STATUS` as they stood at the moment
 /// the last transfer gave up, latched before they are cleared.
 static LAST_FAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -386,6 +404,7 @@ impl SdhciDevice {
                 return true;
             }
             spins += 1;
+            if spins & 1023 == 0 { tick_window(); }
             if spins > SPIN_LIMIT {
                 let err = self.r16(REG_ERROR_INT_STATUS);
                 LAST_FAIL.store(((status as u32) << 16) | err as u32, Ordering::Relaxed);
@@ -408,6 +427,7 @@ impl SdhciDevice {
         let mut spins: u32 = 0;
         while self.r8(REG_SOFTWARE_RESET) & (SWRST_CMD | SWRST_DAT) != 0 {
             spins += 1;
+            if spins & 1023 == 0 { tick_window(); }
             if spins > SPIN_LIMIT { break; }
             core::hint::spin_loop();
         }
@@ -420,6 +440,7 @@ impl SdhciDevice {
         let mut spins: u32 = 0;
         while self.r32(REG_PRESENT_STATE) & mask != 0 {
             spins += 1;
+            if spins & 1023 == 0 { tick_window(); }
             if spins > SPIN_LIMIT { dbg(b'i'); return; }
             core::hint::spin_loop();
         }
@@ -554,6 +575,7 @@ impl SdhciDevice {
         let abs_blk = blk + self.partition_offset;
         for i in 0..SECTORS_PER_BLOCK {
             let sector = abs_blk * SECTORS_PER_BLOCK as u64 + i as u64;
+            tick_window();
             let ok = unsafe { self.do_io_sector(is_write, sector, buf.add(i * SECTOR_SIZE)) };
             if !ok {
                 // Report the sector and the controller's own account of what
@@ -1215,11 +1237,16 @@ pub fn read_block(dev_idx: usize, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool 
 /// way. One lock acquisition covers the whole span, matching virtio_blk.
 pub fn read_blocks(dev_idx: usize, blk: u64, buf: &mut [u8]) -> bool {
     if buf.is_empty() || buf.len() % BLOCK_SIZE != 0 { return false; }
-    let devs = DEVICES.lock();
-    let dev = match devs[dev_idx] { Some(ref d) => d, None => return false };
+    // The lock is taken per block, not across the span: a multi-megabyte PIO
+    // read holds it for seconds, and a waiter on another CPU spins on this
+    // `spin::Mutex` with IRQs masked (deaf) for all of it. Blocks are
+    // independent requests, exactly as `write_blocks` already issues them.
     let total = buf.len() / BLOCK_SIZE;
     for i in 0..total {
+        let devs = DEVICES.lock();
+        let dev = match devs[dev_idx] { Some(ref d) => d, None => return false };
         let ok = dev.do_io(false, blk + i as u64, unsafe { buf.as_mut_ptr().add(i * BLOCK_SIZE) });
+        drop(devs);
         if !ok { return false; }
     }
     true
