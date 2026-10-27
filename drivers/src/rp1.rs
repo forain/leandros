@@ -70,6 +70,7 @@ pub fn probe() {
         None => log("[rp1] FAIL msix\n"),
     }
     attach_gem(va);
+    crate::rp1_usb::attach(va, size);
 }
 
 /// `rp1.irq=1`: deliver the GEM interrupt over MSI-X → MIP → GIC instead of
