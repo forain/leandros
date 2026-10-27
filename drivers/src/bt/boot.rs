@@ -4,7 +4,7 @@
 //! (reg-shift 2, 32-bit access, 96 MHz clock, 32-byte FIFOs, MCR.AFE auto
 //! RTS/CTS), SPI 0x114. The firmware already muxed GPIO 24-27 to it
 //! (`skip-init`); we only read the mux back for the log. BT_ON is gio 29,
-//! driven through sdio_host's gio accessor (the bank that holds WL_REG_ON).
+//! driven through the shared BCM2712 GPIO driver (`crate::bcm2712_gpio`).
 //!
 //! RX is polled, not IRQ-driven: with auto flow control the UART drops RTS at
 //! the RX trigger level, so the controller stops sending while we sleep and no
@@ -28,12 +28,11 @@ use leandros_lib::mmio::{MmioRd, MmioWr};
 
 use super::bringup::{self, Options, Transport};
 use super::h4::BdAddr;
-use crate::bcm2712_id;
-use crate::brcmf::sdio_host::{gio_drive, GIO_PHYS, PINCTRL_PHYS};
+use crate::bcm2712_gpio::{self as gpio, Block, Chip, BT_ON};
 
 pub const UARTA_PHYS: u64 = 0x10_7d50_c000;
 pub const UART_CLK_HZ: u32 = 96_000_000;
-pub const BT_ON_GPIO: u32 = 29;
+pub const BT_ON_GPIO: u32 = BT_ON;
 pub const OPER_BAUD: u32 = 3_000_000;
 /// Linux's order: board-specific name first, then the chip name.
 pub const HCD_PATHS: [&str; 2] = [
@@ -166,36 +165,27 @@ impl Transport for Uart {
 
 fn map(phys: u64, len: usize) -> Option<usize> { mm::kva::ioremap(phys, len, mm::kva::CacheMode::Uncached) }
 
-fn fsel(pc: usize, mr: usize, mb: u32) -> u32 {
-    unsafe { (((pc + mr * 4) as *const u32).mmio_read() >> (mb * 4)) & 0xf }
+/// Reads the function selects of GPIO 24-27 (uarta) and makes GPIO 29 a plain
+/// GPIO (BT_ON) if it is not already, through the shared pinctrl driver.
+fn pinmux() -> String {
+    let st = gpio::stepping();
+    let f = |p| gpio::pin_get_fsel(Block::Main, p);
+    let (Ok(a), Ok(b), Ok(c), Ok(d), Ok(g29)) = (f(24), f(25), f(26), f(27), f(BT_ON_GPIO)) else {
+        return String::from("mux=skip(unknown stepping)");
+    };
+    if g29 != 0 { let _ = gpio::pin_set_function(Block::Main, BT_ON_GPIO, "gpio"); }
+    format!("{:?} mux24-27={:x}{:x}{:x}{:x} gpio29-fsel={}", st, a, b, c, d, g29)
 }
 
-/// Reads the function selects of GPIO 24-27 (uarta) and makes GPIO 29 a plain
-/// GPIO (BT_ON) if it is not already. Mux register/nibble come from the
-/// stepping's gpio28 row: pins 24..31 share that register, nibble = pin - 24.
-fn pinmux(pc: usize) -> String {
-    let st = bcm2712_id::stepping().stepping;
-    let Some(rows) = bcm2712_id::pin_rows(st) else { return String::from("mux=skip(unknown stepping)"); };
-    let (pin, mr, mb28, ..) = rows[0];
-    if pin != 28 || mb28 != 4 { return String::from("mux=skip(layout)"); }
-    let uart: Vec<u32> = (0..4).map(|i| fsel(pc, mr, i)).collect();
-    let g29 = fsel(pc, mr, 5);
-    if g29 != 0 {
-        unsafe {
-            let a = (pc + mr * 4) as *mut u32;
-            let v = (a as *const u32).mmio_read();
-            a.mmio_write(v & !(0xf << 20));
-        }
-    }
-    format!("{:?} mux24-27={:x}{:x}{:x}{:x} gpio29-fsel={}", st, uart[0], uart[1], uart[2], uart[3], g29)
-}
+/// Drive BT_ON (gio 29).
+fn bt_on(on: bool) { let _ = gpio::gpio_set_output(Chip::Gio, BT_ON_GPIO, on); }
 
 fn opt<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
     cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
 }
 
-fn fail(gio: usize, msg: &str) {
-    gio_drive(gio, BT_ON_GPIO, false);
+fn fail(msg: &str) {
+    bt_on(false);
     STATE.store(STATE_FAILED, Ordering::Release);
     log(&format!("fail {}", msg));
 }
@@ -209,14 +199,14 @@ pub fn start(cmdline: &str, serror: SerrorCheck, on_ready: fn(port: u32)) {
     }
     let oper = opt(cmdline, "bt.baud").and_then(|v| v.parse::<u32>().ok()).unwrap_or(OPER_BAUD);
     let patch = opt(cmdline, "bt.fw") != Some("0");
-    let (base, gio, pc) = match (map(UARTA_PHYS, 0x20), map(GIO_PHYS, 0x40), map(PINCTRL_PHYS, 0x30)) {
-        (Some(u), Some(g), Some(p)) => (u, g, p),
+    let base = match (map(UARTA_PHYS, 0x20), gpio::gpio_is_output(Chip::Gio, BT_ON_GPIO)) {
+        (Some(u), Ok(_)) => u,
         _ => { STATE.store(STATE_FAILED, Ordering::Release); return log("fail stage=map"); }
     };
     if let Some(syn) = serror() {
         log(&format!("SError pending before the bt probe syn=0x{:016x} (an earlier probe)", syn));
     }
-    let mux = pinmux(pc);
+    let mux = pinmux();
     let uart = Uart { base, serror, line_errors: 0 };
     let lsr = uart.r(LSR);
     if let Some(syn) = serror() {
@@ -227,7 +217,7 @@ pub fn start(cmdline: &str, serror: SerrorCheck, on_ready: fn(port: u32)) {
     // Read the address now, while the boot DTB is certainly mapped.
     let dt_addr = unsafe { boot::device_tree::recorded_dtb() }.and_then(bringup::fdt_local_bd_address);
     STATE.store(STATE_RUNNING, Ordering::Release);
-    if sched::kthread::spawn("bt", move || run(uart, gio, oper, patch, dt_addr, on_ready)).is_none() {
+    if sched::kthread::spawn("bt", move || run(uart, oper, patch, dt_addr, on_ready)).is_none() {
         STATE.store(STATE_FAILED, Ordering::Release);
         log("fail thread-spawn");
     }
@@ -251,7 +241,7 @@ fn load_hcd() -> Result<(Vec<u8>, &'static str), String> {
     Err(last)
 }
 
-fn run(mut uart: Uart, gio: usize, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready: fn(port: u32)) {
+fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready: fn(port: u32)) {
     let t0 = now_us();
     let hcd = if patch {
         while !crate::firmware::root_ready() {
@@ -266,12 +256,12 @@ fn run(mut uart: Uart, gio: usize, oper: u32, patch: bool, dt_addr: Option<BdAdd
     } else { None };
 
     // Power-cycle: the controller may still run (kexec) at another rate.
-    gio_drive(gio, BT_ON_GPIO, false);
+    bt_on(false);
     sched::kthread::msleep(10);
-    gio_drive(gio, BT_ON_GPIO, true);
+    bt_on(true);
     sched::kthread::msleep(100);
-    if !uart.init(bringup::INIT_BAUD) { return fail(gio, "stage=uart-init"); }
-    if let Some(syn) = (uart.serror)() { return fail(gio, &format!("stage=uart-init serror=0x{:016x}", syn)); }
+    if !uart.init(bringup::INIT_BAUD) { return fail("stage=uart-init"); }
+    if let Some(syn) = (uart.serror)() { return fail(&format!("stage=uart-init serror=0x{:016x}", syn)); }
 
     let t1 = now_us();
     let o = Options { hcd: hcd.as_deref(), oper_baud: Some(oper), bdaddr: dt_addr, cmd_timeout_us: 0 };
@@ -297,6 +287,6 @@ fn run(mut uart: Uart, gio: usize, oper: u32, patch: bool, dt_addr: Option<BdAdd
                 None => log("fail stage=hci0-port"),
             }
         }
-        Err(e) => fail(gio, &format!("stage={} err={:?} lsr_err={}", e.stage, e.kind, uart.line_errors)),
+        Err(e) => fail(&format!("stage={} err={:?} lsr_err={}", e.stage, e.kind, uart.line_errors)),
     }
 }

@@ -405,7 +405,7 @@ def main():
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
-        "sndtest", "syscalltest", "proctest", "proctest-cold.bin", "chroottest", "kexectest", "kexec", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest",
+        "sndtest", "syscalltest", "proctest", "proctest-cold.bin", "chroottest", "kexectest", "kexec", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)

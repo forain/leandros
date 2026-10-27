@@ -192,10 +192,12 @@ pub fn init(cmdline: &str) {
     m.w32(hw::USRIO, 1); // RGMII
     m.w32(hw::AMP, 8 | (8 << 8) | (1 << 16));
 
-    // MAC: DTB (firmware fills local-mac-address), else what the boot
+    // MAC: DTB (firmware fills local-mac-address), else the board OTP
+    // (firmware mailbox, Pi 5), else what the boot
     // firmware left in SA1, else a locally administered one.
     let sa = hw::mac_from_sa(m.r32(hw::SA1B), m.r32(hw::SA1T));
     let (mac, src) = if let Some(mac) = dt.mac { (mac, "dtb") }
+        else if let Some(mac) = crate::bcm2712_otp::eth_mac() { (mac, "otp") }
         else if hw::mac_valid(&sa) { (sa, "SA1 registers") }
         else {
             let t = (sched::monotonic_ns() as u32).to_le_bytes();
