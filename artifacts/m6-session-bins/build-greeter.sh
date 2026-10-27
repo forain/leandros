@@ -16,4 +16,4 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I$S/usr/include"
 export VERGEN_GIT_SHA=leandros
 export VERGEN_GIT_COMMIT_DATE=2026-07-26
 
-sh "$D/build-rust.sh" src/cosmic-greeter "$arch" --no-default-features
+sh "$D/build-rust.sh" src/cosmic-greeter "$arch" --no-default-features --features logind

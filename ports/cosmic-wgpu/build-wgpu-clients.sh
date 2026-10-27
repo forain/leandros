@@ -89,7 +89,7 @@ for a in "${apps[@]}"; do
             mkdir -p "$stub"; [ -f "$stub/libpam_misc.a" ] || printf '!<arch>\n' > "$stub/libpam_misc.a"
             extra=(--config "target.$triple.rustflags=[\"-L\",\"$stub\"]")
         fi
-        build cosmic-greeter --no-default-features --features libcosmic/wgpu "${extra[@]}" \
+        build cosmic-greeter --no-default-features --features logind,libcosmic/wgpu ${extra[@]+"${extra[@]}"} \
             && copy cosmic-greeter cosmic-greeter cosmic-greeter ;;
     launcher)
         build cosmic-launcher --features wgpu && copy cosmic-launcher cosmic-launcher cosmic-launcher ;;

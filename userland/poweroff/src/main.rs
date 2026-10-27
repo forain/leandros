@@ -11,9 +11,16 @@
 //!   halt -p | --poweroff          power off instead of halting
 //!   reboot|halt --reboot / poweroff --halt  override the action
 //!
-//! init grants the request to root and to processes in a local session (the
-//! console logins and the graphical session), as logind's default policy
-//! does; reboot(2) itself stays root-only.
+//!   systemctl poweroff|reboot|halt   the same, systemctl-style
+//!
+//! A non-root caller with a D-Bus system bus (the graphical session, the
+//! greeter) goes through login1 like systemctl does: this execs
+//! `/usr/libexec/leandros-sysbus power PowerOff|Reboot|Halt`, and login1
+//! forwards to init. Without a bus (console, ssh) it asks init directly.
+//! Either way init grants the request to root and to processes in a local
+//! session (the console logins and the graphical session), as logind's
+//! default polkit policy (`allow_active`) does; reboot(2) itself stays
+//! root-only.
 
 #![no_std]
 #![no_main]
@@ -102,17 +109,57 @@ unsafe fn ask_init(a: Action) -> Result<(), &'static [u8]> {
     }
 }
 
+/// True when the environment names a D-Bus system (or session) bus.
+unsafe fn has_bus(envp: *const *const u8) -> bool {
+    if envp.is_null() { return false; }
+    let mut i = 0;
+    loop {
+        let e = *envp.add(i);
+        if e.is_null() { return false; }
+        let v = cstr(e);
+        for k in [&b"DBUS_SYSTEM_BUS_ADDRESS="[..], &b"DBUS_SESSION_BUS_ADDRESS="[..]] {
+            if v.len() > k.len() && v.starts_with(k) { return true; }
+        }
+        i += 1;
+    }
+}
+
+/// Exec the login1 client; returns only if the exec failed.
+unsafe fn via_login1(a: Action, envp: *const *const u8) {
+    let method: &[u8] = match a {
+        Action::PowerOff => b"PowerOff\0",
+        Action::Reboot => b"Reboot\0",
+        Action::Halt => b"Halt\0",
+    };
+    let bin = b"/usr/libexec/leandros-sysbus\0";
+    let args = [bin.as_ptr(), b"power\0".as_ptr(), method.as_ptr(), core::ptr::null()];
+    leandros_libc::process::execve(bin.as_ptr(), args.as_ptr(), envp);
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
+pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *const u8) -> i32 {
     let arg0 = cstr(*argv);
     let base = match arg0.iter().rposition(|&b| b == b'/') { Some(i) => &arg0[i + 1..], None => arg0 };
+    let mut first = 1isize;
     let mut action = match base {
         b"reboot" => Action::Reboot,
         b"halt" => Action::Halt,
+        b"systemctl" => {
+            first = 2;
+            match if argc > 1 { cstr(*argv.offset(1)) } else { &[] } {
+                b"poweroff" => Action::PowerOff,
+                b"reboot" => Action::Reboot,
+                b"halt" => Action::Halt,
+                _ => {
+                    out(STDERR_FILENO, b"usage: systemctl poweroff|reboot|halt [-f|--force]\n");
+                    return 2;
+                }
+            }
+        }
         _ => Action::PowerOff,
     };
     let mut force = false;
-    for i in 1..argc as isize {
+    for i in first..argc as isize {
         match cstr(*argv.offset(i)) {
             b"-f" | b"--force" | b"-ff" => force = true,
             b"-p" | b"--poweroff" => action = Action::PowerOff,
@@ -132,6 +179,10 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
                 return 2;
             }
         }
+    }
+
+    if !force && leandros_libc::process::getuid() != 0 && has_bus(envp) {
+        via_login1(action, envp);
     }
 
     if !force {

@@ -54,7 +54,7 @@ pub(crate) fn log(service: &str, msg: std::fmt::Arguments<'_>) {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|networkmanager|probe|portal [settings|screenshot|open-file|all] [timeout_s]>");
+    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|networkmanager|probe|power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>|portal [settings|screenshot|open-file|all] [timeout_s]>");
     ExitCode::from(2)
 }
 
@@ -86,6 +86,30 @@ fn main() -> ExitCode {
             let t = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(30);
             let (_pass, fail) = portal_probe::run(builder.build().await?, &what, t).await;
             return Ok(Some(fail == 0));
+        }
+        if which == "power" {
+            // Client: `leandros-sysbus power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>`
+            // calls login1 on the system bus the way systemctl/loginctl do;
+            // /bin/poweroff, reboot, halt and systemctl use it for a non-root
+            // caller. Can* print logind's answer ("yes", "na", ...).
+            let method = std::env::args().nth(2).unwrap_or_default();
+            if !matches!(
+                method.as_str(),
+                "PowerOff" | "Reboot" | "Halt" | "CanPowerOff" | "CanReboot" | "CanHalt"
+            ) {
+                return Ok(None);
+            }
+            let conn = builder.build().await?;
+            let (dest, path, iface) =
+                (Some("org.freedesktop.login1"), "/org/freedesktop/login1", Some("org.freedesktop.login1.Manager"));
+            if method.starts_with("Can") {
+                let reply = conn.call_method(dest, path, iface, method.as_str(), &()).await?;
+                let answer: String = reply.body().deserialize()?;
+                println!("{answer}");
+                return Ok(Some(answer == "yes"));
+            }
+            conn.call_method(dest, path, iface, method.as_str(), &(false,)).await?;
+            return Ok(Some(true));
         }
         if which == "probe" {
             let (_pass, fail) = probe::run(builder.build().await?).await;

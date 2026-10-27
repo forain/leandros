@@ -114,7 +114,10 @@ export XDG_VTNR
 # user_data_fallback(), which reads /etc/passwd.
 #
 # greetd never sets it (nothing is inherited), so this is belt-and-braces
-# against something else in the chain exporting it.
+# against something else in the chain exporting it. /bin/greeter-launch then
+# gives the greeter its OWN bus (dbus-run-session at /run/user/<greeter
+# uid>/bus, ServiceUnknown is now answered at once) as its system bus, where
+# the Restart / Shut down buttons reach login1.
 unset DBUS_SYSTEM_BUS_ADDRESS
 
 # ---- compositor backend ----------------------------------------------------

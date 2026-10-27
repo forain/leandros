@@ -48,6 +48,11 @@ const GREETER_USER: &[u8] = b"cosmic-greeter";
 /// The greeter binary, staged under a name cosmic-session does not spawn so that
 /// the in-session lock-screen role is never started at all.
 const GREETER_BIN: &[u8] = b"/bin/cosmic-greeter-login\0";
+/// The greeter's bus: `sh /usr/bin/dbus-run-session -- <greeter>` (the kernel
+/// runs no `#!` scripts, so the interpreter is named).
+const SH_BIN: &[u8] = b"/bin/sh\0";
+const DBUS_RUN_SESSION: &[u8] = b"/usr/bin/dbus-run-session\0";
+const DASHDASH: &[u8] = b"--\0";
 
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 const GROUP_PATH: &[u8] = b"/etc/group\0";
@@ -57,12 +62,15 @@ const MAX_GROUPS: usize = 32;
 /// verbatim — XDG_RUNTIME_DIR and WAYLAND_DISPLAY name the compositor's socket,
 /// GREETD_SOCK names the daemon's, and the render settings are load-bearing.
 ///
-/// DBUS_SYSTEM_BUS_ADDRESS is dropped rather than replaced. greeter::main calls
-/// user_data_dbus() before it builds any window, against a bus name owned only
-/// by cosmic-greeter-daemon, which is not built; busd never replies to an
-/// unowned name and neither side has a timeout, so a set value is a permanent
-/// hang on a blank screen. Unset, the connection fails fast and the greeter
-/// falls through to reading /etc/passwd.
+/// DBUS_SYSTEM_BUS_ADDRESS is replaced by the greeter's own bus: the greeter
+/// runs under `dbus-run-session`, whose busd (bound at
+/// `$XDG_RUNTIME_DIR/bus`, the greeter account's runtime dir) doubles as its
+/// system bus. That is where cosmic-greeter's Restart / Shut down buttons find
+/// org.freedesktop.login1 (leandros-sysbus login1, activated there, which
+/// forwards to init). greeter::main's early user_data_dbus() call against
+/// com.system76.CosmicGreeter (cosmic-greeter-daemon, not built) gets
+/// ServiceUnknown at once (ports/busd/service-unknown-reply.patch) and the
+/// greeter falls through to reading /etc/passwd.
 const REPLACED: &[&[u8]] = &[
     b"DBUS_SYSTEM_BUS_ADDRESS=",
     b"HOME=",
@@ -368,6 +376,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     let mut arena = Arena::new();
     let mut env: [*const u8; MAX_ENV] = [core::ptr::null(); MAX_ENV];
     let mut nenv = 0usize;
+    let mut runtime_dir: &[u8] = b"";
 
     if !envp.is_null() {
         let mut i = 0usize;
@@ -383,6 +392,9 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
                 len += 1;
             }
             let entry = core::slice::from_raw_parts(e, len);
+            if entry.starts_with(b"XDG_RUNTIME_DIR=") {
+                runtime_dir = &entry[16..];
+            }
             let mut replaced = false;
             for pfx in REPLACED {
                 if entry.len() >= pfx.len() && &entry[..pfx.len()] == *pfx {
@@ -401,7 +413,9 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
         }
     }
 
-    let added: [*const u8; 8] = [
+    let bus_dir: &[u8] = if runtime_dir.is_empty() { b"/run/user/0" } else { runtime_dir };
+    let added: [*const u8; 9] = [
+        arena.push(&[b"DBUS_SYSTEM_BUS_ADDRESS=unix:path=", bus_dir, b"/bus"]),
         arena.push(&[b"HOME=", home]),
         arena.push(&[b"USER=", GREETER_USER]),
         arena.push(&[b"LOGNAME=", GREETER_USER]),
@@ -425,8 +439,11 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     // command line, and cosmic-greeter's own argument loop ignores what it does
     // not recognise, so they are passed straight through.
     let mut args: [*const u8; MAX_ARGV] = [core::ptr::null(); MAX_ARGV];
-    args[0] = GREETER_BIN.as_ptr();
-    let mut nargs = 1usize;
+    args[0] = SH_BIN.as_ptr();
+    args[1] = DBUS_RUN_SESSION.as_ptr();
+    args[2] = DASHDASH.as_ptr();
+    args[3] = GREETER_BIN.as_ptr();
+    let mut nargs = 4usize;
     if !argv.is_null() {
         let mut i = 1i32;
         while i < argc && nargs + 1 < MAX_ARGV {
@@ -483,8 +500,8 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     emit_u32(now);
     emit(b" gid ");
     emit_u32(acct.gid);
-    emit(b", exec /bin/cosmic-greeter-login\n");
+    emit(b", exec dbus-run-session -- /bin/cosmic-greeter-login\n");
 
-    execve(GREETER_BIN.as_ptr(), args.as_ptr(), env.as_ptr());
-    fail(b"execve of /bin/cosmic-greeter-login failed");
+    execve(SH_BIN.as_ptr(), args.as_ptr(), env.as_ptr());
+    fail(b"execve of /bin/sh /usr/bin/dbus-run-session failed");
 }
