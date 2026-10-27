@@ -464,6 +464,15 @@ fn user_buf_writable(ptr: usize, len: usize) -> bool {
     with_current_address_space(|as_| as_.range_writable(ptr, len)).unwrap_or(false)
 }
 
+/// Copy `src` to the current task's user address `dst` through the user
+/// mapping, faulting absent pages in (demand-zero, file-backed, CoW) like the
+/// task's own store would. False for a range no access can make valid
+/// (unmapped, read-only, PROT_NONE): the caller answers EFAULT. Must not be
+/// called with a filesystem lock held (a file-backed fault reads the file).
+fn copy_to_user_bytes(dst: usize, src: &[u8]) -> bool {
+    unsafe { ua::copy_to_user(dst, src.as_ptr(), src.len()) == 0 }
+}
+
 fn prefault_user(ptr: usize, len: usize) {
     // Absent file-backed pages (exec image, private mmap) are read with the
     // address space unlocked; the locked walk does the rest (anonymous
@@ -3838,7 +3847,7 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
                 buf[16..20].copy_from_slice(&pid.to_ne_bytes());   // si_pid
                 buf[24..28].copy_from_slice(&si_status.to_ne_bytes());
             }
-            with_current_address_space_mut(|as_| as_.write_user_buf(infop, &buf));
+            copy_to_user_bytes(infop, &buf);
         }
     };
 
@@ -4585,7 +4594,7 @@ fn sys_times(buf_ptr: usize) -> isize {
         let mut out = [0u8; 32];
         for (i, x) in v.iter().enumerate() { out[i * 8..i * 8 + 8].copy_from_slice(&x.to_ne_bytes()); }
         prefault_user(buf_ptr, 32);
-        with_current_address_space_mut(|as_| as_.write_user_buf(buf_ptr, &out));
+        copy_to_user_bytes(buf_ptr, &out);
     }
     ticks() as isize
 }
@@ -7338,12 +7347,14 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
             if is_kernel {
                 unsafe { core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf_ptr as *mut u8, n); }
             } else {
-                let ok = with_current_address_space_mut(|as_| {
-                    as_.write_user_buf(buf_ptr, &kbuf[..n])
-                }).unwrap_or(false);
-                if !ok { return -14; }
+                // Fault-tolerant copy through the user mapping: a destination
+                // page never touched yet (demand-zero .bss, or a .data page of
+                // the exec image still absent) is faulted in like a user store
+                // would. `write_user_buf` only fills pages already present and
+                // answered EFAULT for those. No lock is held here.
+                if !copy_to_user_bytes(buf_ptr, &kbuf[..n]) { return -14; }
             }
-            
+
             n as isize
         }
         // read(2) on a socket ≡ recv(fd, buf, len, 0) — see the matching
@@ -9730,7 +9741,7 @@ fn sys_getgroups(size: usize, list_ptr: usize) -> isize {
         if !validate_user_buf(list_ptr, n * 4) { return -14; }
         prefault_user(list_ptr, n * 4);
         let bytes = unsafe { core::slice::from_raw_parts(groups.as_ptr() as *const u8, n * 4) };
-        let ok = with_current_address_space_mut(|as_| as_.write_user_buf(list_ptr, bytes)).unwrap_or(false);
+        let ok = copy_to_user_bytes(list_ptr, bytes);
         if !ok { return -14; }
     }
     n as isize
@@ -15911,7 +15922,7 @@ fn sys_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize {
 
     if old_ptr != 0 {
         let obuf = itimerval_bytes(old_interval_ns, old_value_ns);
-        if !with_current_address_space_mut(|as_| as_.write_user_buf(old_ptr, &obuf)).unwrap_or(false) {
+        if !copy_to_user_bytes(old_ptr, &obuf) {
             return -14;
         }
     }
@@ -15928,7 +15939,7 @@ fn sys_getitimer(which: usize, cur_ptr: usize) -> isize {
         None => return -22,
     };
     let buf = itimerval_bytes(interval_ns, value_ns);
-    if with_current_address_space_mut(|as_| as_.write_user_buf(cur_ptr, &buf)).unwrap_or(false) { 0 } else { -14 }
+    if copy_to_user_bytes(cur_ptr, &buf) { 0 } else { -14 }
 }
 
 /// sys_sigpending(set_ptr) — return the set of pending signals.
@@ -15938,7 +15949,7 @@ fn sys_sigpending(set_ptr: usize) -> isize {
     // that every thread currently masks is parked on the leader
     // (shared_signal_pending) but is still "pending" to sigpending(2).
     let pending = pending_signals() | sched::shared_pending_signals();
-    if with_current_address_space_mut(|as_| as_.write_user_buf(set_ptr, &pending.to_ne_bytes())).unwrap_or(false) {
+    if copy_to_user_bytes(set_ptr, &pending.to_ne_bytes()) {
         0
     } else {
         -14

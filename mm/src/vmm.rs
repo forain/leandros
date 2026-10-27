@@ -2430,6 +2430,15 @@ impl AddressSpace {
         let mut offset = 0;
         while offset < src.len() {
             let va = user_va + offset;
+            // A never-touched anonymous page (demand-zero .bss, heap, stack)
+            // is a valid destination: populate it as the user's own store
+            // would. Safe under this lock (`prefault_range` does the same).
+            // An absent file-backed page needs file I/O with the address
+            // space unlocked and is left to the caller's prefault — or to a
+            // fault-tolerant copy (`uaccess::copy_to_user`) instead of this.
+            if self.virt_to_phys(va).is_none() && !self.is_absent_file_page(va) {
+                self.handle_user_page_fault(va, true);
+            }
             if !self.unshare_cow_page(va, false) { return false; }
             // Never store into a page-cache frame through a mapping that may
             // not write it: the frame is every other mapper's file data too.
