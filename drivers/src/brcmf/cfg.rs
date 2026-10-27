@@ -863,6 +863,12 @@ pub struct RsnDiag {
     pub msg1: alloc::string::String,
     pub last: alloc::string::String,
     pub secret: alloc::string::String,
+    /// Host supplicant, this join: EAPOL frames we sent (message 2 first).
+    pub eapol_sent: u32,
+    /// Host supplicant, this join: message 1 frames received after our
+    /// message 2 (the AP retransmitting message 1 = it could not verify the
+    /// message 2 MIC, the signature of a wrong PMK).
+    pub msg1_after_msg2: u32,
 }
 
 impl RsnDiag {
@@ -1178,6 +1184,7 @@ impl<F: Fwil> Brcmf<F> {
                     k.version, k.descriptor_type, ki, ki & 7, (ki >> 3) & 1, (ki >> 6) & 1, (ki >> 7) & 1, (ki >> 8) & 1,
                     (ki >> 9) & 1, (ki >> 12) & 1, k.key_len, u64::from_be_bytes(k.replay_counter), k.key_data.len());
                 if ki & 0x0108 == 0x0008 && self.rsn.msg1.is_empty() { self.rsn.msg1 = line.clone(); }
+                if ki & 0x0108 == 0x0008 && self.rsn.eapol_sent > 0 { self.rsn.msg1_after_msg2 += 1; }
                 self.rsn.last = line;
             }
             let evs = h.sup.as_mut().map(|s| s.on_eapol(&f[14..])).unwrap_or_default();
@@ -1191,7 +1198,7 @@ impl<F: Fwil> Brcmf<F> {
                         fr.extend_from_slice(&ETH_P_PAE);
                         fr.extend_from_slice(&pdu);
                         match self.fw.tx_data(&fr) {
-                            Ok(()) => self.stats.eapol_tx += 1,
+                            Ok(()) => { self.stats.eapol_tx += 1; self.rsn.eapol_sent += 1; }
                             Err(e) => self.log(&alloc::format!("host supplicant: EAPOL tx failed: {:?}", e)),
                         }
                     }
@@ -1227,6 +1234,14 @@ impl<F: Fwil> Brcmf<F> {
 
     /// Join `req` (WPA2-PSK through the firmware supplicant, or open) and
     /// wait for the outcome. On success the data path is open.
+    /// After a failed keyed join: (message 2 really sent, whether a wrong
+    /// PMK is the likely cause). Only the host supplicant sees the EAPOL
+    /// exchange; with the firmware one both are unknown (None).
+    pub fn handshake_evidence(&self) -> Option<(bool, bool)> {
+        if self.sup_used != "host" { return None; }
+        Some((self.rsn.eapol_sent > 0, self.rsn.msg1_after_msg2 > 0))
+    }
+
     pub fn join(&mut self, req: JoinReq, obs: &mut dyn JoinObserver, timeout_ms: u64) -> Result<(), JoinFail> {
         self.connected = false;
         self.stats.joins += 1;
