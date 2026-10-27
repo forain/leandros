@@ -165,6 +165,7 @@ pub const PCIE2_BRIDGE_RESET_ID: u32 = 44;
 /// (offset of SW_INIT_SET for that bank, bit) of a brcmstb-reset line.
 pub const fn sw_init_set(id: u32) -> (usize, u32) { ((id as usize >> 5) * 0x18, 1 << (id & 31)) }
 pub const SW_INIT_CLEAR: usize = 0x4;
+pub const SW_INIT_STATUS: usize = 0x8;
 
 /// Outbound window 0: 32-bit non-prefetchable memory, CPU 0x1f_0000_0000 → PCI 0.
 pub const OB_MEM_CPU: u64 = 0x1f_0000_0000;
@@ -298,3 +299,49 @@ pub const RIO_SET: usize = 0x2000;
 pub const RIO_CLR: usize = 0x3000;
 /// GEM PHY reset: `phy-reset-gpios = <&rp1_gpio 32 GPIO_ACTIVE_LOW>`, 5 ms.
 pub const RP1_ETH_PHY_RESET_GPIO: u32 = 32;
+
+// ── Bring-up stages (lane pipcie2) ──────────────────────────────────────────
+// `pcie.stop=N` runs stages 1..=N and stops before N+1 (inert: no further MMIO).
+// Each stage prints `[pcie] stage N name` straight to the UART *before* its
+// first access and stores N in the wedge `pcie` slot, so a stalled AXI read
+// names itself in the `[WDOG]` line seen from another CPU.
+pub const STAGES: [&str; 17] = [
+    "idle",          // 0
+    "map",           // 1  ioremap only, no access
+    "swinit-read",   // 2  read the brcmstb-reset SW_INIT status (reset block, not the RC)
+    "rescal",        // 3  rescal START/STATUS (SATA/PCIe rescal block)
+    "rc-read",       // 4  first RC register reads: REVISION, PCIE_STATUS, PCIE_CTRL
+    "bridge-assert", // 5  bridge SW_INIT assert + PERST# assert (RC write while bridge in reset)
+    "bridge-release",// 6  bridge SW_INIT deassert
+    "serdes",        // 7  HARD_DEBUG SerDes IDDQ off, RC REVISION read
+    "pll",           // 8  MDIO 54 MHz PLL, PHY_CTL_15
+    "misc",          // 9  MISC_CTRL, UBUS error suppression, timeouts
+    "windows",       // 10 inbound + outbound windows
+    "link-params",   // 11 class code, x4/ASPM, gen2, PERST# release
+    "link-poll",     // 12 bounded link-up poll (MISC_PCIE_STATUS only)
+    "bus-numbers",   // 13 RC config (bus 0) primary/secondary/subordinate
+    "rp1-id",        // 14 first config TLP: bus 1 dev 0 vendor/device
+    "rp1-bars",      // 15 RP1 BAR sizing/placement + bridge windows + enable
+    "rp1-probe",     // 16 RP1 BAR1 MMIO (SYSINFO, MIP0, GEM, USB)
+];
+pub const LAST_STAGE: u32 = STAGES.len() as u32 - 1;
+
+pub fn stage_name(n: u32) -> &'static str {
+    STAGES.get(n as usize).copied().unwrap_or("?")
+}
+
+/// `pcie.stop=N` from the command line; absent or malformed = run everything.
+pub fn parse_stop(cmdline: &str) -> u32 {
+    for t in cmdline.split_ascii_whitespace() {
+        if let Some(v) = t.strip_prefix("pcie.stop=") {
+            return v.parse::<u32>().unwrap_or(LAST_STAGE);
+        }
+    }
+    LAST_STAGE
+}
+
+/// Reuse a link the firmware already trained (skip resets, PLL, PERST#) only
+/// when asked (`pcie.reuse=1`) and the RC reports the link up.
+pub fn reuse_link(cmdline: &str, pcie_status: u32) -> bool {
+    cmdline.split_ascii_whitespace().any(|t| t == "pcie.reuse=1") && link_up(pcie_status)
+}

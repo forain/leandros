@@ -110,4 +110,35 @@ mod tests {
         assert_eq!(rp1_gpio_regs(34), Some((0xd_8004, 0xe_8000, 0xf_8004, 1)));
         assert_eq!(rp1_gpio_regs(54), None);
     }
+
+    #[test]
+    fn stop_knob_and_stage_names() {
+        assert_eq!(parse_stop(""), LAST_STAGE);
+        assert_eq!(parse_stop("console=ttyAMA10 pcie.rpi5=1 pcie.stop=4"), 4);
+        assert_eq!(parse_stop("pcie.stop=0"), 0);
+        assert_eq!(parse_stop("pcie.stop=x"), LAST_STAGE);
+        assert_eq!(stage_name(0), "idle");
+        assert_eq!(stage_name(4), "rc-read");
+        assert_eq!(stage_name(12), "link-poll");
+        assert_eq!(stage_name(LAST_STAGE), "rp1-probe");
+        assert_eq!(stage_name(LAST_STAGE + 1), "?");
+        // Every stage name is distinct (the WDOG marker must name one step).
+        for a in 0..STAGES.len() { for b in a + 1..STAGES.len() { assert_ne!(STAGES[a], STAGES[b]); } }
+    }
+
+    #[test]
+    fn reuse_needs_knob_and_live_link() {
+        let up = STATUS_PHYLINKUP | STATUS_DL_ACTIVE;
+        assert!(reuse_link("pcie.rpi5=1 pcie.reuse=1", up));
+        assert!(!reuse_link("pcie.rpi5=1", up));
+        assert!(!reuse_link("pcie.reuse=1", STATUS_PHYLINKUP));
+        assert!(!reuse_link("pcie.reuse=1", 0));
+    }
+
+    #[test]
+    fn swinit_bridge_line_is_bank1_bit12() {
+        // brcmstb-reset: bank = id / 32, 0x18 per bank; SET/CLEAR/STATUS at +0/+4/+8.
+        assert_eq!(sw_init_set(PCIE2_BRIDGE_RESET_ID), (0x18, 1 << 12));
+        assert_eq!((SW_INIT_CLEAR, SW_INIT_STATUS), (0x4, 0x8));
+    }
 }
