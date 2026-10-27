@@ -152,13 +152,145 @@ fn verify(chip: &mut Chip, bus: &mut dyn SdioBus, addr: u32, data: &[u8]) -> Res
     Ok(())
 }
 
-/// brcmf_sdio_download_firmware + brcmf_sdio_firmware_callback: holds the
-/// ARM in reset, writes code at the RAM base and the normalised nvram at the
-/// top of RAM, releases the CR4, enables F2 and waits for it to come ready,
-/// then arms the host interrupt mask and the card interrupt.
+/// Bring-up knobs. `Default` is what brcmfmac does for a 43455 on SDIO; the
+/// Pi's runtime `brcmfctl retry k=v ...` overrides them one by one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Knobs {
+    /// Clock wait bound for the download clock (µs).
+    pub clk_us: u32,
+    /// Request HT (not just ALP) for the download. brcmfmac downloads with
+    /// `alp_only = true`: before the firmware runs, HT may never come up.
+    pub dl_ht: bool,
+    /// Delay between releasing the CR4 and asking for HT (µs).
+    pub post_us: u32,
+    /// HT wait after the firmware started (µs).
+    pub ht_us: u32,
+    /// F2 IORDY wait (µs).
+    pub f2_us: u32,
+    /// Save/restore: None = re-probe PMU chipcontrol 3 after the firmware
+    /// started (brcmfmac evaluates brcmf_chip_sr_capable there), Some = forced.
+    pub sr: Option<bool>,
+    /// KSO wake before the download when SR is enabled.
+    pub kso: bool,
+    /// F2 watermark (SBSDIO_WATERMARK); brcmfmac's default is 8.
+    pub wm: u8,
+    /// Set SBSDIO_DEVCTL_F2WM_ENAB in SBSDIO_DEVICE_CTL.
+    pub f2wm: bool,
+    /// SBSDIO_FUNC1_MESBUSYCTRL value; 0 = not written.
+    pub mesbusy: u8,
+    /// Request FORCE_HT while F2 comes up (brcmfmac does).
+    pub force_ht: bool,
+    /// Skip the CLM blob (boot layer).
+    pub noclm: bool,
+}
+
+impl Default for Knobs {
+    fn default() -> Self {
+        Knobs {
+            clk_us: chip::PMU_MAX_TRANSITION_US,
+            dl_ht: false,
+            post_us: 0,
+            ht_us: chip::PMU_MAX_TRANSITION_US,
+            f2_us: F2_READY_TIMEOUT_US,
+            sr: None,
+            kso: true,
+            wm: DEFAULT_F2_WATERMARK,
+            f2wm: false,
+            mesbusy: 0,
+            force_ht: true,
+            noclm: false,
+        }
+    }
+}
+
+pub const DEFAULT_F2_WATERMARK: u8 = 8;
+
+fn parse_num(v: &str) -> Option<u32> {
+    let v = v.trim();
+    if let Some(h) = v.strip_prefix("0x") {
+        u32::from_str_radix(h, 16).ok()
+    } else {
+        v.parse().ok()
+    }
+}
+
+impl Knobs {
+    /// Applies one `key=value`. Durations take `us`; `*_ms` keys take ms.
+    /// Returns false for an unknown key or a bad value.
+    pub fn set(&mut self, key: &str, val: &str) -> bool {
+        let Some(n) = parse_num(val) else {
+            return key == "sr" && val == "auto" && {
+                self.sr = None;
+                true
+            };
+        };
+        let ms = n.saturating_mul(1000);
+        match key {
+            "clk_us" => self.clk_us = n,
+            "clk_ms" => self.clk_us = ms,
+            "dl_ht" => self.dl_ht = n != 0,
+            "post_us" => self.post_us = n,
+            "post_ms" => self.post_us = ms,
+            "ht_us" => self.ht_us = n,
+            "ht_ms" => self.ht_us = ms,
+            "f2_ms" => self.f2_us = ms,
+            "sr" => self.sr = Some(n != 0),
+            "kso" => self.kso = n != 0,
+            "wm" => self.wm = n as u8,
+            "f2wm" => self.f2wm = n != 0,
+            "mesbusy" => self.mesbusy = n as u8,
+            "force_ht" => self.force_ht = n != 0,
+            "noclm" => self.noclm = n != 0,
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// A failed bring-up: what went wrong and in which step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DlFail {
+    pub err: FwLoadError,
+    pub stage: &'static str,
+}
+
+/// brcmf_sdio_download_firmware + brcmf_sdio_firmware_callback with the
+/// default (brcmfmac) knobs.
 ///
 /// `nvram_text` is the raw `.txt` file; it is normalised here.
 pub fn download(bus: &mut dyn SdioBus, chip: &mut Chip, code: &[u8], nvram_text: &[u8]) -> Result<DownloadReport, FwLoadError> {
+    download_with(bus, chip, code, nvram_text, &Knobs::default()).map_err(|f| f.err)
+}
+
+/// The brcmfmac order for a CR4 chip on SDIO:
+/// 1. clock for the download: ALP only (`alp_only = true`), unless `dl_ht`;
+/// 2. ARM CR4 halted + D11 in reset, code at the RAM base, nvram (with its
+///    `~len|len` token as the last word) at the top of RAM, both read back;
+/// 3. reset vector at backplane 0, CR4 released; the clock request dropped
+///    (CLK_SDONLY);
+/// 4. firmware_callback: HT request with the 1 s PMU bound, SR re-evaluated,
+///    FORCE_HT, tosbmailboxdata = SDPCM v4, F2 on and IORDY, hostintmask,
+///    watermark, then sr_init (or restore the saved clock), card IRQ on.
+pub fn download_with(
+    bus: &mut dyn SdioBus,
+    chip: &mut Chip,
+    code: &[u8],
+    nvram_text: &[u8],
+    k: &Knobs,
+) -> Result<DownloadReport, DlFail> {
+    let mut stage = "image";
+    let r = download_inner(bus, chip, code, nvram_text, k, &mut stage);
+    r.map_err(|err| DlFail { err, stage })
+}
+
+fn download_inner(
+    bus: &mut dyn SdioBus,
+    chip: &mut Chip,
+    code: &[u8],
+    nvram_text: &[u8],
+    k: &Knobs,
+    stage: &mut &'static str,
+) -> Result<DownloadReport, FwLoadError> {
     if code.len() < 4 {
         return Err(FwLoadError::EmptyImage);
     }
@@ -168,20 +300,28 @@ pub fn download(bus: &mut dyn SdioBus, chip: &mut Chip, code: &[u8], nvram_text:
     }
     let rstvec = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
 
-    if chip.sr_capable {
+    if chip.sr_capable && k.kso {
+        *stage = "kso";
         chip.kso_control(bus, true)?;
     }
-    chip.clk_request(bus, true)?;
+    *stage = if k.dl_ht { "dl-clk-ht" } else { "dl-clk-alp" };
+    chip.clk_request_t(bus, k.dl_ht, k.clk_us)?;
+    *stage = "passive";
     chip.set_passive(bus)?;
 
+    *stage = "code";
     chip.bp.ram_write(bus, chip.ram_base, code)?;
     verify(chip, bus, chip.ram_base, code)?;
 
+    *stage = "nvram";
     let nvram_addr = chip.ram_base + chip.ram_size - nvram.len() as u32;
     chip.bp.ram_write(bus, nvram_addr, &nvram)?;
     verify(chip, bus, nvram_addr, &nvram)?;
 
+    *stage = "active";
     chip.set_active(bus, rstvec)?;
+    // CLK_SDONLY: drop the download clock request.
+    chip.clk_release(bus)?;
     let mut rep = DownloadReport {
         code_len: code.len() as u32,
         nvram_len: nvram.len() as u32,
@@ -189,32 +329,210 @@ pub fn download(bus: &mut dyn SdioBus, chip: &mut Chip, code: &[u8], nvram_text:
         rstvec,
         sr_enabled: false,
     };
-    start_f2(bus, chip)?;
-    if chip.sr_capable {
-        chip.sr_init(bus)?;
-        rep.sr_enabled = true;
+    if k.post_us != 0 {
+        bus.delay_us(k.post_us);
     }
+    *stage = "ht";
+    chip.clk_request_t(bus, true, k.ht_us)?;
+    *stage = "sr-probe";
+    chip.sr_capable = match k.sr {
+        Some(v) => v,
+        None => chip.sr_capable_probe(bus)?,
+    };
+    *stage = "f2";
+    start_f2(bus, chip, k)?;
+    rep.sr_enabled = chip.sr_capable;
     Ok(rep)
 }
 
 /// The F2 half of brcmf_sdio_firmware_callback.
-fn start_f2(bus: &mut dyn SdioBus, chip: &mut Chip) -> Result<(), FwLoadError> {
+fn start_f2(bus: &mut dyn SdioBus, chip: &mut Chip, k: &Knobs) -> Result<(), FwLoadError> {
     let sd = chip.sdio_core()?;
     let saveclk = bus.read8(FUNC_BACKPLANE, chip::SBSDIO_FUNC1_CHIPCLKCSR)?;
-    bus.write8(FUNC_BACKPLANE, chip::SBSDIO_FUNC1_CHIPCLKCSR, saveclk | chip::SBSDIO_FORCE_HT)?;
+    if k.force_ht {
+        bus.write8(FUNC_BACKPLANE, chip::SBSDIO_FUNC1_CHIPCLKCSR, saveclk | chip::SBSDIO_FORCE_HT)?;
+    }
     chip.write32(bus, sd.base + chip::SD_TOSBMAILBOXDATA, SDPCM_PROT_VERSION << SMB_DATA_VERSION_SHIFT)?;
     bus.set_block_size(FUNC_WLAN, F2_BLOCKSIZE)?;
-    if !chip::enable_func(bus, FUNC_WLAN, F2_READY_TIMEOUT_US)? {
+    if !chip::enable_func(bus, FUNC_WLAN, k.f2_us)? {
+        let _ = chip::disable_func(bus, FUNC_WLAN);
         bus.write8(FUNC_BACKPLANE, chip::SBSDIO_FUNC1_CHIPCLKCSR, saveclk)?;
         return Err(FwLoadError::F2Timeout);
     }
     chip.write32(bus, sd.base + chip::SD_HOSTINTMASK, HOSTINTMASK)?;
-    bus.write8(FUNC_BACKPLANE, chip::SBSDIO_WATERMARK, 8)?;
-    bus.write8(FUNC_BACKPLANE, chip::SBSDIO_FUNC1_CHIPCLKCSR, saveclk)?;
+    bus.write8(FUNC_BACKPLANE, chip::SBSDIO_WATERMARK, k.wm)?;
+    if k.f2wm {
+        let d = bus.read8(FUNC_BACKPLANE, chip::SBSDIO_DEVICE_CTL)?;
+        bus.write8(FUNC_BACKPLANE, chip::SBSDIO_DEVICE_CTL, d | chip::SBSDIO_DEVCTL_F2WM_ENAB)?;
+    }
+    if k.mesbusy != 0 {
+        bus.write8(FUNC_BACKPLANE, chip::SBSDIO_FUNC1_MESBUSYCTRL, k.mesbusy)?;
+    }
+    if chip.sr_capable {
+        chip.sr_init(bus)?;
+    } else {
+        bus.write8(FUNC_BACKPLANE, chip::SBSDIO_FUNC1_CHIPCLKCSR, saveclk)?;
+    }
     // Card interrupt: master enable + F1 + F2 (what sdio_claim_irq does).
     let ien = bus.read8(FUNC_BUS, chip::CCCR_IENX)?;
     bus.write8(FUNC_BUS, chip::CCCR_IENX, ien | 0x07)?;
     Ok(())
+}
+
+// ---- Failure diagnostics ---------------------------------------------------------
+
+/// sdpcm_shared flags: protocol version in the low byte.
+pub const SDPCM_SHARED_VERSION_MASK: u32 = 0xFF;
+pub const SDPCM_SHARED_ASSERT: u32 = 0x0200;
+pub const SDPCM_SHARED_TRAP: u32 = 0x0400;
+/// Console ring bytes read at most.
+pub const CONSOLE_MAX: u32 = 8192;
+
+/// What the chip looks like after a failed bring-up.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Diag {
+    pub line: alloc::string::String,
+    /// Last console lines of a running firmware (oldest first).
+    pub console: Vec<alloc::string::String>,
+}
+
+fn rd(chip: &mut Chip, bus: &mut dyn SdioBus, a: u32) -> Option<u32> {
+    chip.read32(bus, a).ok()
+}
+
+fn hx(v: Option<u32>) -> alloc::string::String {
+    match v {
+        Some(v) => alloc::format!("{:08x}", v),
+        None => alloc::string::String::from("err"),
+    }
+}
+
+/// The end-of-RAM word: the nvram token before the firmware runs, the
+/// sdpcm_shared address once it does (brcmf_sdio_readshared).
+pub fn shared_addr(chip: &mut Chip, bus: &mut dyn SdioBus) -> Option<u32> {
+    let mut w = [0u8; 4];
+    chip.bp.ram_read(bus, chip.ram_base + chip.ram_size - 4, &mut w).ok()?;
+    let a = u32::from_le_bytes(w);
+    let token = a != 0 && (!a >> 16) & 0xFFFF == a & 0xFFFF;
+    let in_ram = a >= chip.ram_base && a < chip.ram_base + chip.ram_size;
+    if a == 0 || token || !in_ram {
+        None
+    } else {
+        Some(a)
+    }
+}
+
+/// One-line chip state plus the firmware console tail (`max_lines`).
+pub fn diag(bus: &mut dyn SdioBus, chip: &mut Chip, max_lines: usize) -> Diag {
+    use core::fmt::Write;
+    let mut d = Diag::default();
+    let clk = bus.read8(FUNC_BACKPLANE, chip::SBSDIO_FUNC1_CHIPCLKCSR).ok();
+    let slp = bus.read8(FUNC_BACKPLANE, chip::SBSDIO_FUNC1_SLEEPCSR).ok();
+    let ior = bus.read8(FUNC_BUS, chip::CCCR_IORDY).ok();
+    // Backplane reads need at least ALP.
+    if clk.map_or(true, |c| c & chip::SBSDIO_ALP_AVAIL == 0) {
+        let _ = bus.write8(FUNC_BACKPLANE, chip::SBSDIO_FUNC1_CHIPCLKCSR, chip::SBSDIO_ALP_AVAIL_REQ);
+        bus.delay_us(2000);
+    }
+    let pmu = chip.pmu_base();
+    let b8 = |v: Option<u8>| v.map_or(alloc::string::String::from("err"), |v| alloc::format!("{:02x}", v));
+    let _ = write!(d.line, "clkcsr={} sleepcsr={} iordy={}", b8(clk), b8(slp), b8(ior));
+    let _ = write!(
+        d.line,
+        " pmuctl={} pmust={} res={} pend={} min={} max={}",
+        hx(rd(chip, bus, pmu + chip::CC_PMUCONTROL)),
+        hx(rd(chip, bus, pmu + chip::CC_PMUSTATUS)),
+        hx(rd(chip, bus, pmu + chip::CC_RES_STATE)),
+        hx(rd(chip, bus, pmu + chip::CC_RES_PENDING)),
+        hx(rd(chip, bus, pmu + chip::CC_MIN_RES_MASK)),
+        hx(rd(chip, bus, pmu + chip::CC_MAX_RES_MASK)),
+    );
+    if let Some(cr4) = chip.core(chip::CORE_ARM_CR4) {
+        let io = rd(chip, bus, cr4.wrap + chip::BCMA_IOCTL);
+        let halt = io.map_or("?", |v| if v & chip::ARMCR4_IOCTL_CPUHALT != 0 { "halt" } else { "run" });
+        let _ = write!(
+            d.line,
+            " cr4 ioctl={} rst={} iost={} {}",
+            hx(io),
+            hx(rd(chip, bus, cr4.wrap + chip::BCMA_RESET_CTL)),
+            hx(rd(chip, bus, cr4.wrap + chip::BCMA_IOST)),
+            halt
+        );
+    }
+    if let Some(sd) = chip.core(chip::CORE_SDIO_DEV) {
+        let _ = write!(
+            d.line,
+            " sd int={} mb={}",
+            hx(rd(chip, bus, sd.base + chip::SD_INTSTATUS)),
+            hx(rd(chip, bus, sd.base + chip::SD_TOHOSTMAILBOXDATA))
+        );
+    }
+    let mut w = [0u8; 4];
+    let last = chip.bp.ram_read(bus, chip.ram_base + chip.ram_size - 4, &mut w).ok().map(|_| u32::from_le_bytes(w));
+    let _ = write!(d.line, " ramtop={}", hx(last));
+    let Some(sh) = shared_addr(chip, bus) else {
+        d.line.push_str(" fw=not-started");
+        return d;
+    };
+    // struct sdpcm_shared_le: flags, trap_addr, assert_exp_addr,
+    // assert_file_addr, assert_line, console_addr, msgtrace_addr, ...
+    let mut s = [0u8; 28];
+    if chip.bp.ram_read(bus, sh, &mut s).is_err() {
+        d.line.push_str(" shared=err");
+        return d;
+    }
+    let f = |i: usize| u32::from_le_bytes([s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3]]);
+    let (flags, trap, aline, con) = (f(0), f(1), f(4), f(5));
+    let _ = write!(d.line, " shared@{:x} ver={} flags={:x}", sh, flags & SDPCM_SHARED_VERSION_MASK, flags);
+    if flags & SDPCM_SHARED_TRAP != 0 {
+        let _ = write!(d.line, " TRAP@{:x}", trap);
+    }
+    if flags & SDPCM_SHARED_ASSERT != 0 {
+        let _ = write!(d.line, " ASSERT line {}", aline);
+    }
+    // struct rte_console: vcons_in, vcons_out, then rte_log_le {buf, buf_size, idx}.
+    let mut lg = [0u8; 12];
+    if con == 0 || chip.bp.ram_read(bus, con + 8, &mut lg).is_err() {
+        let _ = write!(d.line, " con={:x}", con);
+        return d;
+    }
+    let g = |i: usize| u32::from_le_bytes([lg[i * 4], lg[i * 4 + 1], lg[i * 4 + 2], lg[i * 4 + 3]]);
+    let (buf, size, idx) = (g(0), g(1), g(2));
+    let _ = write!(d.line, " con={:x} buf={:x} size={} idx={}", con, buf, size, idx);
+    if size == 0 || size > 0x10000 || idx >= size || buf < chip.ram_base || buf + size > chip.ram_base + chip.ram_size {
+        return d;
+    }
+    // Read the newest CONSOLE_MAX bytes of the ring in order.
+    let n = core::cmp::min(size, CONSOLE_MAX);
+    let start = (idx + size - n) % size;
+    let mut ring = alloc::vec![0u8; n as usize];
+    let first = core::cmp::min(n, size - start);
+    if chip.bp.ram_read(bus, buf + start, &mut ring[..first as usize]).is_err()
+        || (first < n && chip.bp.ram_read(bus, buf, &mut ring[first as usize..]).is_err())
+    {
+        d.line.push_str(" ring=err");
+        return d;
+    }
+    d.console = console_tail(&ring, max_lines);
+    d
+}
+
+/// Splits console ring bytes into printable lines and keeps the last `max`.
+pub fn console_tail(ring: &[u8], max: usize) -> Vec<alloc::string::String> {
+    let mut out: Vec<alloc::string::String> = Vec::new();
+    for l in ring.split(|&c| c == b'\n' || c == 0) {
+        let t: alloc::string::String = l
+            .iter()
+            .filter(|&&c| c != b'\r')
+            .map(|&c| if (0x20..0x7F).contains(&c) { c as char } else { '.' })
+            .collect();
+        let t = t.trim();
+        if !t.is_empty() && t.bytes().any(|c| c != b'.') {
+            out.push(alloc::string::String::from(t));
+        }
+    }
+    let skip = out.len().saturating_sub(max);
+    out.split_off(skip)
 }
 
 // ---- CLM blob -------------------------------------------------------------------
