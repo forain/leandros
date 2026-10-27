@@ -20,6 +20,7 @@ pub const TRB_NORMAL: u32 = 1;
 pub const TRB_SETUP: u32 = 2;
 pub const TRB_DATA: u32 = 3;
 pub const TRB_STATUS: u32 = 4;
+pub const TRB_ISOCH: u32 = 5;
 pub const TRB_LINK: u32 = 6;
 pub const TRB_ENABLE_SLOT: u32 = 9;
 pub const TRB_DISABLE_SLOT: u32 = 10;
@@ -44,6 +45,8 @@ pub const TRB_IOC: u32 = 1 << 5;
 pub const TRB_IDT: u32 = 1 << 6;
 pub const TRB_BSR: u32 = 1 << 9;  // Address Device: block SET_ADDRESS
 pub const TRB_DIR_IN: u32 = 1 << 16;
+/// Isoch TRB: Start Isoch ASAP (the Frame ID field is ignored).
+pub const TRB_SIA: u32 = 1 << 31;
 
 /// One TRB as four dwords: parameter lo/hi, status, control.
 #[derive(Clone, Copy, Default, Debug)]
