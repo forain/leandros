@@ -259,6 +259,9 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         drivers::v3d::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset, arch_aarch64::exception::serror_checkpoint);
         // RNG, firmware RTC, PM watchdog, thermal, ARM clock: one line each (lane pimisc).
         drivers::rpi_misc::boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset);
+        // BCM2712 GPIO/pinctrl/l2-intc (one [gpio] line) and OTP serial + MACs (one [otp] line), lane pigio.
+        drivers::bcm2712_gpio::boot(arch_aarch64::exception::serror_checkpoint);
+        drivers::bcm2712_otp::boot();
     }
     // HDMI0/1 read-only probe (hdmi.probe=0 disables): no display-register writes,
     // SError checkpoint after each block read.
@@ -275,7 +278,19 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         }
         drivers::bcm2712_dma40::boot(crate::boot_cmdline().unwrap_or(""), arch_aarch64::exception::serror_checkpoint);
     }
-     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] { drivers::brcmf_boot::start(crate::boot_cmdline().unwrap_or("")); drivers::bt::boot::start(crate::boot_cmdline().unwrap_or(""), arch_aarch64::exception::serror_checkpoint); } // Pi 5 V3D power-up + ident (one [v3d] line); CYW43455 firmware bring-up on a kthread ([brcmf] lines)
+    // HDMI audio binds late: PipeWire's first init ran before the HDMI probe, so retry once now.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] {
+        drivers::hdmi_audio::set_serror_check(arch_aarch64::exception::serror_checkpoint);
+        if !pipewire_server::is_initialized() {
+            if let Ok(p) = pipewire_server::init(crate::boot_cmdline().unwrap_or("")) {
+                serial_print_str("[INIT] PipeWire server port (HDMI audio): ");
+                crate::print_number(p);
+                serial_print_str("\n");
+                crate::syscall::set_audio_server_port(p);
+            }
+        }
+    }
+     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] { drivers::brcmf_boot::start(crate::boot_cmdline().unwrap_or("")); drivers::bt::boot::start(crate::boot_cmdline().unwrap_or(""), arch_aarch64::exception::serror_checkpoint, |port| vfs_server::register_device_notify_open("/dev/hci0", port, 0, vfs_server::HCI_MAJOR, vfs_server::HCI_MINOR)); } // Pi 5 V3D power-up + ident (one [v3d] line); CYW43455 firmware bring-up on a kthread ([brcmf] lines)
     // Persist the console log on the boot disk's log partition, if it has one.
     crate::klog::init(); crate::iostat::init(); crate::hungtask::init(); // + the 5 s [usbms]/[fslock] summary task
     #[cfg(all(feature = "nvidia", target_arch = "x86_64"))] nvidia_rm::init(&nvidia_rm::BootEnv { cmdline: crate::boot_cmdline().unwrap_or(""), fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32, log_flush: crate::klog::flush_now, rsdp_phys: boot_info.rsdp_addr }); // OpenRM; one line so the default kernel's panic line numbers (and bytes) stay unchanged

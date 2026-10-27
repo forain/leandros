@@ -1,0 +1,18 @@
+# Host tests for the BCM2712 GPIO / pinctrl / l2-intc driver
+# (drivers/src/bcm2712_gpio.rs) and the OTP helpers (drivers/src/bcm2712_otp.rs).
+#
+#   cd drivers/bcm2712-tests && cargo test
+[package]
+name = "bcm2712-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+# Never enabled: keeps the kernel halves cfg'd out.
+[features]
+rpi5 = []
