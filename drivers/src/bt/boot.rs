@@ -290,9 +290,9 @@ fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready
             };
             let addr = if r.bdaddr_set { "set-from-dt" } else if r.bdaddr.is_placeholder() { "placeholder" } else { "controller" };
             log(&format!(
-                "hci ver={} rev={:#x} lmp_ver={} lmp_subver={:#06x} rom_subver={:#06x} manuf={} fw={} baud={} bdaddr={} ({}) {} ms stray={} garbage={} lsr_err={}",
+                "hci ver={} rev={:#x} lmp_ver={} lmp_subver={:#06x} rom_subver={:#06x} manuf={} fw={} baud={} bdaddr={} ({}) {} ms resets={} vers={} stray={} garbage={} lsr_err={}",
                 r.ver.hci_ver, r.ver.hci_rev, r.ver.lmp_ver, r.ver.lmp_subver, r.rom.lmp_subver, r.ver.manufacturer,
-                fw, r.baud, r.bdaddr, addr, (now_us() - t1) / 1000, r.stray_events, r.garbage, uart.line_errors));
+                fw, r.baud, r.bdaddr, addr, (now_us() - t1) / 1000, r.reset_tries, r.version_tries, r.stray_events, r.garbage, uart.line_errors));
             // Vendor init is done: publish /dev/hci0 and become its pump.
             match super::hcidev::create_port() {
                 Some(port) => {
@@ -304,6 +304,10 @@ fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready
             }
         }
         // lsr/msr: THRE (0x20) stuck clear with MSR.CTS (0x10) clear = flow control held.
-        Err(e) => fail(&format!("stage={} err={:?} lsr_err={} lsr={:#x} msr={:#x}", e.stage, e.kind, uart.line_errors, uart.r(LSR), uart.r(MSR))),
+        // baud = host rate in force; rx = bytes the failing command's wait got
+        // (`-` = none at all); resets/vers = attempts.
+        Err(e) => fail(&format!("stage={} err={:?} baud={} rx={}[{}] resets={} vers={} lsr_err={} lsr={:#x} msr={:#x}",
+            e.stage, e.kind, e.diag.baud, e.diag.rx_len, e.diag.rx_hex(), e.diag.reset_tries, e.diag.version_tries,
+            uart.line_errors, uart.r(LSR), uart.r(MSR))),
     }
 }
