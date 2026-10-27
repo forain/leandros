@@ -154,6 +154,12 @@ struct Fake {
     auto_rts_stall: bool,
     soft: bool,
     held: VecDeque<u8>,
+    /// Real Pi 5 (main dd54cdcd): the BCM43xx samples CTS_N (= host RTS) when
+    /// BT_ON rises; asserted there it answers HCI Reset and nothing after.
+    rts_strap: bool,
+    rts_held: bool,
+    powered: bool,
+    strapped: bool,
 }
 
 impl Fake {
@@ -184,6 +190,7 @@ impl Fake {
         assert_eq!(params.len(), data[2] as usize);
         self.log.push(op);
         if self.rebooting { return; }
+        if self.strapped && op != h4::OP_RESET { return; }
         if self.noisy { self.evt(0xff, &[0x12, 0x34]); }
         if self.mute == Some(op) { return; }
         if let Some((o, s)) = self.fail_status { if o == op { return self.cc(op, &[s]); } }
@@ -232,12 +239,74 @@ impl Transport for Fake {
         true
     }
     fn lines(&mut self) -> bringup::Lines {
-        bringup::Lines { mcr: if self.soft { 0x03 } else { 0x23 }, msr: 0x10, rts_pad: Some(!self.held.is_empty()), cts_pad: Some(false), dcts: 0 }
+        bringup::Lines { mcr: if self.soft { 0x03 } else { 0x23 }, msr: 0x10, rts_pad: Some(self.rts_held || !self.held.is_empty()), cts_pad: Some(false), dcts: 0 }
     }
     fn sleep_ms(&mut self, ms: u32) {
         if ms >= bringup::RESET_SETTLE_MS { self.rebooting = false; }
         self.sleeps.push(ms);
     }
+    fn set_power(&mut self, on: bool) {
+        if on && !self.powered {
+            // Power-on: ROM at 115200, unpatched, RTS sampled now.
+            self.ctrl_baud = INIT_BAUD;
+            self.patched = false;
+            self.minidriver = false;
+            self.rebooting = false;
+            self.rx.clear();
+            self.strapped = self.rts_strap && !self.rts_held;
+        }
+        self.powered = on;
+    }
+    fn hold_rts_deasserted(&mut self, hold: bool) { self.rts_held = hold; }
+}
+
+/// The pre-fix power-up: BT_ON toggled while the UART keeps RTS asserted.
+struct NoRtsHold<'a>(&'a mut Fake);
+
+impl Transport for NoRtsHold<'_> {
+    fn send(&mut self, b: &[u8]) -> bool { self.0.send(b) }
+    fn recv(&mut self, t: u32) -> Option<u8> { self.0.recv(t) }
+    fn set_baud(&mut self, b: u32) -> bool { self.0.set_baud(b) }
+    fn sleep_ms(&mut self, ms: u32) { self.0.sleep_ms(ms) }
+    fn set_flow(&mut self, f: bringup::Flow) -> bool { self.0.set_flow(f) }
+    fn lines(&mut self) -> bringup::Lines { self.0.lines() }
+    fn set_power(&mut self, on: bool) { self.0.set_power(on) }
+}
+
+/// Real Pi 5 (D0, main dd54cdcd, kexec): Reset answered twice, Read Local
+/// Version never, with RTS and CTS both asserted (flow control ruled out).
+/// Linux hci_bcm (`brcm,bcm43438-bt` => drive_rts_on_open) holds RTS
+/// deasserted across the BT_ON edge; without that the controller is strapped.
+#[test]
+fn rts_asserted_at_power_on_answers_only_reset() {
+    let mut f = Fake::new();
+    f.rts_strap = true;
+    let pw = bringup::power_cycle(&mut NoRtsHold(&mut f), 50);
+    assert_eq!(pw.rts_pad_at_on, Some(false));
+    let e = bringup::bring_up(&mut NoRtsHold(&mut f), &Options { cmd_timeout_us: 5_000, ..Options::default() }).unwrap_err();
+    assert_eq!((e.stage, e.kind), ("version", ErrorKind::NoAnswer(0x1001)));
+    assert_eq!((e.diag.rx_len, e.diag.reset_tries, e.diag.version_tries), (0, 2, 2));
+    assert_eq!(f.log, [0x0c03, 0x1001, 0x0c03, 0x1001]);
+}
+
+#[test]
+fn power_cycle_holds_rts_deasserted_across_bt_on_edge() {
+    let img = real_hcd().unwrap_or_else(synthetic_hcd);
+    let ops: Vec<u16> = hcd::records(&img).map(|r| r.unwrap().1).collect();
+    let mut f = Fake::new();
+    f.rts_strap = true;
+    // State a previous kernel left behind (kexec): patched, at 3 Mbaud.
+    f.patched = true;
+    f.ctrl_baud = 3_000_000;
+    f.powered = true;
+    let pw = bringup::power_cycle(&mut f, 50);
+    assert_eq!(pw, bringup::PowerDiag { off_ms: 50, rts_pad_at_on: Some(true) });
+    assert!(!f.rts_held && !f.strapped && f.powered);
+    assert_eq!(f.sleeps, [50, bringup::POWER_ON_SETTLE_MS]);
+    let o = Options { hcd: Some(&img), oper_baud: Some(3_000_000), bdaddr: Some(DT_ADDR), cmd_timeout_us: 0 };
+    let r = bringup::bring_up(&mut f, &o).unwrap();
+    assert_eq!(f.log, expected_transcript(&ops));
+    assert_eq!((r.rom.lmp_subver, r.ver.lmp_subver, r.baud, r.flow), (0x2105, 0x6119, 3_000_000, bringup::Flow::Auto));
 }
 
 const DT_ADDR: BdAddr = BdAddr([0x11, 0x22, 0x33, 0x3a, 0xdd, 0xd8]);

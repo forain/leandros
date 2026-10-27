@@ -270,6 +270,9 @@ pub const GROUP_BT_SHUTDOWN: [PinConf; 1] = [pc(29, "gpio", None)];
 /// before the first HCI command.
 pub const BT_OFF_MS: u32 = 50;
 pub const BT_ON_SETTLE_MS: u32 = 200;
+/// BT_ON low time for the one retry after a failed bring-up (a "cold" cycle:
+/// rules out controller state surviving a short pulse, e.g. across kexec).
+pub const BT_COLD_OFF_MS: u32 = 1000;
 
 /// Bluetooth pins before power-up, as Linux applies the uarta `default`
 /// pinctrl state (`bt_shutdown_pins` + `uarta_24_pins`) while hci_bcm holds

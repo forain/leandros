@@ -30,6 +30,40 @@ pub trait Transport {
     fn set_flow(&mut self, _f: Flow) -> bool { false }
     /// Modem-line snapshot for the diagnostics.
     fn lines(&mut self) -> Lines { Lines::default() }
+    /// Drives the controller's power/shutdown line (BT_ON). Default: not controllable.
+    fn set_power(&mut self, _on: bool) {}
+    /// `true`: host RTS forced deasserted with flow control off (16550 MCR = 0);
+    /// `false`: back to the normal flow control.
+    fn hold_rts_deasserted(&mut self, _hold: bool) {}
+}
+
+/// Power-on settle with RTS still deasserted (Linux `bcm_gpio_set_power`: 100-120 ms;
+/// 200 ms as the earlier BT_ON_SETTLE_MS).
+pub const POWER_ON_SETTLE_MS: u32 = 200;
+
+/// What the power cycle saw: BT_ON low time and the RTS pad (true = high =
+/// deasserted) just before BT_ON went high.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PowerDiag {
+    pub off_ms: u32,
+    pub rts_pad_at_on: Option<bool>,
+}
+
+/// Power-cycles the controller the way Linux hci_bcm does for the Pi DT's
+/// `brcm,bcm43438-bt` (`drive_rts_on_open`): the BCM43xx samples its CTS_N
+/// (= our RTS) when BT_ON rises, and an asserted RTS there starts it in a
+/// mode that answers HCI Reset and then ignores the following commands. So
+/// RTS is held deasserted (flow control off) across the edge and the settle,
+/// and only then handed back to the UART's flow control.
+pub fn power_cycle<T: Transport>(t: &mut T, off_ms: u32) -> PowerDiag {
+    t.hold_rts_deasserted(true);
+    t.set_power(false);
+    t.sleep_ms(off_ms);
+    let rts_pad_at_on = t.lines().rts_pad;
+    t.set_power(true);
+    t.sleep_ms(POWER_ON_SETTLE_MS);
+    t.hold_rts_deasserted(false);
+    PowerDiag { off_ms, rts_pad_at_on }
 }
 
 /// Host-side RTS/CTS handling.

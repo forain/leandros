@@ -206,6 +206,19 @@ impl Transport for Uart {
         true
     }
 
+    fn set_power(&mut self, on: bool) { bt_on(on) }
+
+    fn hold_rts_deasserted(&mut self, hold: bool) {
+        if hold {
+            self.w(MCR, 0);
+            self.rts_on = false;
+        } else {
+            // Drop what the power-up put on RX, then the normal flow control.
+            self.w(FCR, FCR_ENABLE | FCR_CLR_RX | FCR_RX_TRIG_01);
+            let _ = self.set_flow(if self.soft { Flow::Soft } else { Flow::Auto });
+        }
+    }
+
     fn lines(&mut self) -> Lines {
         let pad = |l| gpio::gpio_get(Chip::Gio, l).ok();
         let msr = self.msr();
@@ -333,53 +346,72 @@ fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready
         }
     } else { None };
 
-    // Power-cycle: the controller may still run (kexec) at another rate.
-    bt_on(false);
-    sched::kthread::msleep(gpio::BT_OFF_MS as u64);
-    bt_on(true);
-    sched::kthread::msleep(gpio::BT_ON_SETTLE_MS as u64);
-    if !uart.init(bringup::INIT_BAUD) { return fail("stage=uart-init"); }
-    if let Some(syn) = (uart.serror)() { return fail(&format!("stage=uart-init serror=0x{:016x}", syn)); }
-
-    let t1 = now_us();
-    let o = Options { hcd: hcd.as_deref(), oper_baud: Some(oper), bdaddr: dt_addr, cmd_timeout_us: 0 };
-    match bringup::bring_up(&mut uart, &o) {
-        Ok(r) => {
-            STATE.store(STATE_READY, Ordering::Release);
-            let fw = match r.patch {
-                Some(s) => format!("patched({} records, {} bytes)", s.records, s.payload_bytes),
-                None => String::from("rom"),
-            };
-            let addr = if r.bdaddr_set { "set-from-dt" } else if r.bdaddr.is_placeholder() { "placeholder" } else { "controller" };
-            log(&format!(
-                "hci ver={} rev={:#x} lmp_ver={} lmp_subver={:#06x} rom_subver={:#06x} manuf={} fw={} baud={} bdaddr={} ({}) {} ms resets={} vers={} flow={} stray={} garbage={} lsr_err={}",
-                r.ver.hci_ver, r.ver.hci_rev, r.ver.lmp_ver, r.ver.lmp_subver, r.rom.lmp_subver, r.ver.manufacturer,
-                fw, r.baud, r.bdaddr, addr, (now_us() - t1) / 1000, r.reset_tries, r.version_tries, flow_name(r.flow),
-                r.stray_events, r.garbage, uart.line_errors));
-            if let Some((w, l)) = r.v1 { log(&format!("flow fallback: auto-RTS version window rx={}[{}] {}", w.len, w.hex(), l)); }
-            log(&format!("lines {}", uart.lines()));
-            // Vendor init is done: publish /dev/hci0 and become its pump.
-            match super::hcidev::create_port() {
-                Some(port) => {
-                    on_ready(port);
-                    log("/dev/hci0 ready");
-                    super::hcidev::pump(&mut uart);
+    // Power-cycle (the controller may still run, kexec, at another rate) with
+    // RTS held deasserted across the BT_ON edge, as Linux hci_bcm does for this
+    // DT compatible. Attempt 2 (only after a failure) keeps BT_ON low for
+    // BT_COLD_OFF_MS: separates "strap at power-on" from "kexec state survived".
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let off = if attempt == 1 { gpio::BT_OFF_MS } else { gpio::BT_COLD_OFF_MS };
+        if !uart.init(bringup::INIT_BAUD) { return fail("stage=uart-init"); }
+        let pw = bringup::power_cycle(&mut uart, off);
+        if let Some(syn) = (uart.serror)() { return fail(&format!("stage=uart-init serror=0x{:016x}", syn)); }
+        let power = format!("attempt={} off={}ms rts_at_on={}", attempt, pw.off_ms, pad01(pw.rts_pad_at_on));
+        let t1 = now_us();
+        let o = Options { hcd: hcd.as_deref(), oper_baud: Some(oper), bdaddr: dt_addr, cmd_timeout_us: 0 };
+        match bringup::bring_up(&mut uart, &o) {
+            Ok(r) => return ready(&mut uart, r, t1, &power, on_ready),
+            Err(e) => {
+                let msg = fail_msg(&mut uart, &e, &power);
+                if attempt == 1 && e.stage != "hcd" {
+                    log(&format!("retry {}", msg));
+                    continue;
                 }
-                None => log("fail stage=hci0-port"),
+                return fail(&msg);
             }
         }
-        // lsr: THRE (0x20) stuck clear = TX held. baud = host rate in force;
-        // rx = bytes the failing command's wait got (`-` = none at all);
-        // resets/vers = attempts; flow + lines (mcr/msr, RTS/CTS pad levels,
-        // low = asserted) at the failure; v1 = the first, auto-RTS version window.
-        Err(e) => {
-            let v1 = match e.diag.v1 {
-                Some((w, l)) => format!(" v1=rx:{}[{}] v1_{}", w.len, w.hex(), l),
-                None => String::new(),
-            };
-            fail(&format!("stage={} err={:?} baud={} rx={}[{}] resets={} vers={} flow={} lsr_err={} lsr={:#x} {}{}",
-                e.stage, e.kind, e.diag.baud, e.diag.rx_len, e.diag.rx_hex(), e.diag.reset_tries, e.diag.version_tries,
-                flow_name(e.diag.flow), uart.line_errors, uart.r(LSR), e.diag.lines, v1))
-        }
     }
+}
+
+fn pad01(p: Option<bool>) -> &'static str { match p { Some(true) => "1", Some(false) => "0", None => "?" } }
+
+fn ready(uart: &mut Uart, r: bringup::Report, t1: u64, power: &str, on_ready: fn(port: u32)) {
+    STATE.store(STATE_READY, Ordering::Release);
+    let fw = match r.patch {
+        Some(s) => format!("patched({} records, {} bytes)", s.records, s.payload_bytes),
+        None => String::from("rom"),
+    };
+    let addr = if r.bdaddr_set { "set-from-dt" } else if r.bdaddr.is_placeholder() { "placeholder" } else { "controller" };
+    log(&format!(
+        "hci ver={} rev={:#x} lmp_ver={} lmp_subver={:#06x} rom_subver={:#06x} manuf={} fw={} baud={} bdaddr={} ({}) {} ms resets={} vers={} flow={} stray={} garbage={} lsr_err={} {}",
+        r.ver.hci_ver, r.ver.hci_rev, r.ver.lmp_ver, r.ver.lmp_subver, r.rom.lmp_subver, r.ver.manufacturer,
+        fw, r.baud, r.bdaddr, addr, (now_us() - t1) / 1000, r.reset_tries, r.version_tries, flow_name(r.flow),
+        r.stray_events, r.garbage, uart.line_errors, power));
+    if let Some((w, l)) = r.v1 { log(&format!("flow fallback: auto-RTS version window rx={}[{}] {}", w.len, w.hex(), l)); }
+    log(&format!("lines {}", uart.lines()));
+    // Vendor init is done: publish /dev/hci0 and become its pump.
+    match super::hcidev::create_port() {
+        Some(port) => {
+            on_ready(port);
+            log("/dev/hci0 ready");
+            super::hcidev::pump(uart);
+        }
+        None => log("fail stage=hci0-port"),
+    }
+}
+
+// lsr: THRE (0x20) stuck clear = TX held. baud = host rate in force;
+// rx = bytes the failing command's wait got (`-` = none at all);
+// resets/vers = attempts; flow + lines (mcr/msr, RTS/CTS pad levels,
+// low = asserted) at the failure; v1 = the first, auto-RTS version window;
+// power = attempt, BT_ON low time, RTS pad when BT_ON rose (1 = deasserted).
+fn fail_msg(uart: &mut Uart, e: &bringup::Error, power: &str) -> String {
+    let v1 = match e.diag.v1 {
+        Some((w, l)) => format!(" v1=rx:{}[{}] v1_{}", w.len, w.hex(), l),
+        None => String::new(),
+    };
+    format!("stage={} err={:?} baud={} rx={}[{}] resets={} vers={} flow={} lsr_err={} lsr={:#x} {}{} {}",
+        e.stage, e.kind, e.diag.baud, e.diag.rx_len, e.diag.rx_hex(), e.diag.reset_tries, e.diag.version_tries,
+        flow_name(e.diag.flow), uart.line_errors, uart.r(LSR), e.diag.lines, v1, power)
 }
