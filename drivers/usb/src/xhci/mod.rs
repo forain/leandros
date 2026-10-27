@@ -820,7 +820,7 @@ fn bulk(hc: &Hc, slot: u8, dci: usize, out: Option<&[u8]>, mut inb: Option<&mut 
                 // endpoint (transfers are synchronous and a failed TD is
                 // always cancelled before its call returns).
                 ep.bounce = None;
-                let b = DmaBuf::new(want, dma32).ok_or(UsbErr::Other(0xFF))?;
+                let b = DmaBuf::new_streaming(want, dma32).ok_or(UsbErr::Other(0xFF))?;
                 usb_dbg!("[XHCI] slot {} dci {}: bounce buffer {} KiB at {:#x}\n", slot, dci, want / 1024, b.phys());
                 ep.bounce = Some(b);
             }

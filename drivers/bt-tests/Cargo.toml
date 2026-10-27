@@ -1,0 +1,16 @@
+[package]
+name = "bt-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Host-only test crate: compiles drivers/src/bt/{h4,hcd,bringup}.rs via #[path]
+# and runs the Broadcom bring-up against a scripted controller. The real
+# BCM4345C0.hcd is used when ports/bluez-firmware/fetch.sh has cached it
+# ($BTFW_CACHE, default ~/.cache/leandros/bluez-firmware); otherwise those
+# cases fall back to a synthetic image.
+# Run: cargo test --manifest-path drivers/bt-tests/Cargo.toml --target <host-triple>
+[workspace]
+
+[lib]
+path = "src/lib.rs"

@@ -87,9 +87,14 @@ pub mod wifi_mgr;
 /// Broadcom/Cypress FullMAC Wi-Fi (CYW43455, Raspberry Pi 5).
 pub mod brcmf;
 pub mod bcm2712_id;
+/// Pi 5 read-only HDMI0/1 boot probe (HDMI vs DVI, pixel clock, audio gate, MAI); rpi5 only.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod hdmi_probe;
 /// Pi 5 Wi-Fi boot bring-up: sdio2 host → firmware → "ver" (rpi5 only).
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod brcmf_boot;
+/// Bluetooth: H4 transport + Broadcom bring-up (CYW43455 BT half on the Pi 5 uarta).
+pub mod bt;
 pub mod wifi_pref;
 /// A simulated Wi-Fi interface for QEMU tests (opt-in; see its header).
 pub mod wifi_sim;
@@ -127,6 +132,11 @@ pub mod brcmstb_hw;
 pub mod brcmstb_pcie;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod rp1;
+/// Pi 5 USB: RP1's two DWC3 controllers in xHCI host mode (glue + attach).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rp1_usb;
+/// DWC3 global-register math (host-tested in drivers/dwc3-tests).
+pub mod dwc3_hw;
 /// RP1 clock/GPIO/PWM register math (host-tested in drivers/rp1-tests).
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod rp1_hw;
