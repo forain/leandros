@@ -134,6 +134,9 @@ if command -v zig >/dev/null 2>&1; then
     # syscalltest: splice/tee/vmsplice, rseq and pidfd (checked against a host kernel).
     echo "[userland] Building syscalltest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/syscalltest" userland/syscalltest/syscalltest.c
+    # uaccesstest: read(2)/write(2) on never-touched user pages (console, pipe, file, socket, pty).
+    echo "[userland] Building uaccesstest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/uaccesstest" userland/uaccesstest/uaccesstest.c
     # proctest: rusage/faults, /proc links, clone3/pdeathsig/CLONE_FS (checked against a host kernel).
     echo "[userland] Building proctest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/proctest" userland/proctest/proctest.c
