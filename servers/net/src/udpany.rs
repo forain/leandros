@@ -36,6 +36,42 @@ fn new_mirror_socket() -> udp::Socket<'static> {
 static MIRRORS: Mutex<alloc::collections::BTreeMap<u32, [Option<SocketHandle>; MAX_STACKS]>> =
     Mutex::new(alloc::collections::BTreeMap::new());
 
+/// Port of each wildcard server in MIRRORS, for a stack built after it
+/// (`adopt`). Leaf lock, taken after MIRRORS when both are needed.
+static PORTS: Mutex<crate::latestack::Registry<u16>> = Mutex::new(crate::latestack::Registry::new());
+
+/// Stack `sid` was just built (wifi0, once its MAC is known): give every
+/// wildcard server a mirror there. Returns how many it carries. Caller
+/// holds no net lock.
+pub(crate) fn adopt(sid: Sid) -> usize {
+    let snap = PORTS.lock().snapshot();
+    // The commit below checks, under MIRRORS, that the server still is one;
+    // from then on `release`/`collapse` own the mirror like any other.
+    crate::latestack::adopt(&snap, |_| true,
+        |ofd, port| {
+            let h = {
+                let mut stack = stack_for(sid);
+                let Some(s) = stack.as_mut() else { return false };
+                let mut socket = new_mirror_socket();
+                if socket.bind(*port).is_err() { return false; }
+                socket.set_reuseport(sock_opts(ofd).reuseport);
+                s.socket_set.add(socket)
+            };
+            // Commit only into a server that is still a wildcard one and
+            // has no socket there yet; otherwise the new one goes again.
+            let kept = match MIRRORS.lock().get_mut(&ofd) {
+                Some(hs) if hs[sid as usize].is_none() => { hs[sid as usize] = Some(h); true }
+                _ => false,
+            };
+            if !kept {
+                let mut stack = stack_for(sid);
+                if let Some(s) = stack.as_mut() { release_inet_socket(s, h); }
+            }
+            kept
+        },
+        |_| true, |_| {})
+}
+
 /// The per-stack sockets of description `ofd` (`None` = not a wildcard
 /// server: one stack only).
 pub(crate) fn of(ofd: u32) -> Option<[Option<SocketHandle>; MAX_STACKS]> {
@@ -60,12 +96,14 @@ pub(crate) fn create(ofd: u32, psid: Sid, primary: SocketHandle, port: u16) {
         hs[sid as usize] = Some(s.socket_set.add(socket));
     }
     MIRRORS.lock().insert(ofd, hs);
+    PORTS.lock().register(ofd, port);
 }
 
 /// The socket is gone (its last holder let go): remove the mirrors (the
 /// primary is released by the caller). No lock held.
 pub(crate) fn release(ofd: u32, primary_sid: Option<Sid>) {
     if ofd == 0 { return; }
+    PORTS.lock().unregister(ofd);
     let Some(hs) = MIRRORS.lock().remove(&ofd) else { return };
     for (sid, h) in hs.iter().enumerate() {
         let Some(h) = *h else { continue };
@@ -84,6 +122,7 @@ pub(crate) fn release(ofd: u32, primary_sid: Option<Sid>) {
 pub(crate) fn collapse(ofd: u32, keep: Sid) -> Option<Option<SocketHandle>> {
     if ofd == 0 { return None; }
     let hs = MIRRORS.lock().remove(&ofd)?;
+    PORTS.lock().unregister(ofd);
     let mut kept = None;
     for (sid, h) in hs.iter().enumerate() {
         let Some(h) = *h else { continue };
