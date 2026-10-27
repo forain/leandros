@@ -52,9 +52,10 @@ def main():
     # CPU_OFF; the next kernel must start all of them from the mailbox.
     print("case kexec park mode (no CPU_OFF) keeps every CPU", flush=True)
     mark = os.path.getsize(driver.SERIAL_FULL_LOG) if os.path.exists(driver.SERIAL_FULL_LOG) else 0
-    if run([os.path.join(REPO, "scripts/pi-serial-kexec.sh"),
-            os.path.join(REPO, "target/final-aarch64/kernel-direct"),
-            os.path.join(REPO, "initrd-aarch64.cpio"), "serialxfer=2"], env=env) != 0:
+    extra = f"serialxfer=2 sxk={int(time.time())}"  # the files pushed above are still in /boot/pi/trial
+    if run(PUSH + ["--timeout", "60", "--cmd", "/bin/kexec -l /boot/pi/trial/kernel --initrd=/boot/pi/trial/initrd "
+                   f"--reuse-cmdline --append='{extra}'"], env=env) != 0 \
+            or run(PUSH + ["--timeout", "180", "--kexec-exec", extra], env=env) != 0:
         fails.append("kexec park flow")
     else:
         with open(driver.SERIAL_FULL_LOG, "rb") as f:
