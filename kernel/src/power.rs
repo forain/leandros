@@ -325,6 +325,11 @@ fn kernel_power_off() -> ! {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         arch_aarch64::power::system_off();
+        #[cfg(feature = "rpi5")]
+        if drivers::rpi_pm::power_off() {
+            serial_print_str("reboot: PSCI SYSTEM_OFF refused; PM halt partition + reset\n");
+            for _ in 0..100_000_000u64 { core::hint::spin_loop(); }
+        }
         serial_print_str("reboot: PSCI SYSTEM_OFF failed; System halted\n");
         arch_aarch64::power::halt_forever();
     }
@@ -355,6 +360,11 @@ fn kernel_restart() -> ! {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         arch_aarch64::power::system_reset();
+        #[cfg(feature = "rpi5")]
+        if drivers::rpi_pm::restart() {
+            serial_print_str("reboot: PSCI SYSTEM_RESET refused; PM watchdog reset\n");
+            for _ in 0..100_000_000u64 { core::hint::spin_loop(); }
+        }
         serial_print_str("reboot: PSCI SYSTEM_RESET failed; System halted\n");
         arch_aarch64::power::halt_forever();
     }

@@ -110,6 +110,15 @@ pub mod sdhci;
 /// protocol can be exercised without hardware.
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod rpi_mailbox;
+/// Pi 5 SoC housekeeping: RNG, firmware RTC, PM watchdog, thermal, ARM clock (lane pimisc).
+pub mod rpi_misc_logic;
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rpi_misc;
+/// Shared BCM2712 PM block accessor (V3D power + watchdog/reset).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod rpi_pm;
+/// SoC temperature API (`thermal::soc_millicelsius`) and /proc hooks.
+pub mod thermal;
 /// BCM2712 PCIe root complex (pcie2) register math, RC bring-up, and the RP1
 /// south bridge behind it. Opt-in at boot with `pcie.rpi5=1`.
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
