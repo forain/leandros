@@ -66,6 +66,7 @@ static JOIN_INFO: Mutex<String> = Mutex::new(String::new());
 static COUNTERS: Mutex<String> = Mutex::new(String::new());
 static FW_CAPS: Mutex<String> = Mutex::new(String::new());
 static JOIN_OPTS: Mutex<String> = Mutex::new(String::new());
+static RSN_INFO: Mutex<Vec<(&'static str, String)>> = Mutex::new(Vec::new());
 /// The last `[brcmf]` lines (boot lines included), so they can be read with
 /// no serial capture and no grep.
 static LOG_RING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
@@ -272,7 +273,10 @@ pub fn info_lines(out: &mut String) {
         let g = m.lock();
         let _ = writeln!(out, "{}: {}", k, if g.is_empty() { "none" } else { g.as_str() });
     }
-    let _ = writeln!(out, "ctl: /etc/brcmf.ctl (brcmfctl status|scan|join [method=auto|joiniovar|setssid supwpa=auto|1|0 pmk=auto|raw|hex|passphrase sec=auto|ioctl|iovar mfp=auto|0|1|2 wpaie=1|0 reset] [ssid=..]|diag|retry)");
+    for (k, v) in RSN_INFO.lock().iter() {
+        let _ = writeln!(out, "{}: {}", k, if v.is_empty() { "none" } else { v.as_str() });
+    }
+    let _ = writeln!(out, "ctl: /etc/brcmf.ctl (brcmfctl status|scan|join [method=auto|joiniovar|setssid supwpa=auto|1|0 pmk=auto|raw|hex|passphrase sec=auto|ioctl|iovar mfp=auto|0|1|2 wpaie=1|0 akm=auto|2|6 mfpc=auto|0|1 mfpr=auto|0|1 msg2ie=auto|ours|fw reset] [ssid=..]|diag|retry)");
     if RUNNING.load(Ordering::Acquire) { MGR.info_lines(out); }
     let _ = writeln!(out, "log (last {} [brcmf] lines):", LOG_KEEP);
     for l in LOG_RING.lock().iter() { let _ = writeln!(out, "  {}", l); }
@@ -353,6 +357,7 @@ impl<F: Fwil> BrcmfRadio<F> {
         *COUNTERS.lock() = self.dev.counters_line();
         *FW_CAPS.lock() = self.dev.caps.clone().unwrap_or_else(|| String::from("unknown (cap refused)"));
         *JOIN_OPTS.lock() = self.dev.opts.describe();
+        *RSN_INFO.lock() = self.dev.rsn.lines().iter().map(|(k, v)| (*k, v.clone())).collect();
         let Some(text) = self.ctl.as_mut().and_then(|c| c.poll()) else { return };
         let text = String::from(text.trim());
         match cfg::parse_ctl(&text) {
@@ -378,6 +383,7 @@ impl<F: Fwil> BrcmfRadio<F> {
                 let bad = self.dev.opts.apply(&knobs);
                 if !bad.is_empty() { log(&alloc::format!("ctl: join: unknown knob(s) {:?} ignored", bad)); }
                 *JOIN_OPTS.lock() = self.dev.opts.describe();
+        *RSN_INFO.lock() = self.dev.rsn.lines().iter().map(|(k, v)| (*k, v.clone())).collect();
                 log(&alloc::format!("ctl: join opts: {}", self.dev.opts.describe()));
                 self.ctl_join(ssid)
             }

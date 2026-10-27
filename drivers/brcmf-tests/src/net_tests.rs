@@ -35,6 +35,8 @@ struct Mock {
     rssi: i32,
     /// Frames the "air" answers a transmitted data frame with (the AP side of the 4-way handshake).
     on_tx: Option<Box<dyn FnMut(&[u8]) -> Vec<Frame>>>,
+    /// Canned answers for iovar gets ("assoc_info", "assoc_req_ies", ...).
+    gets: HashMap<String, Vec<u8>>,
 }
 
 impl Mock {
@@ -71,6 +73,7 @@ impl Fwil for Mock {
     fn iovar_get(&mut self, name: &str, buf: &mut [u8]) -> Result<usize, FwError> {
         self.calls.push(Call::IovarGet(name.into()));
         if name == "cur_etheraddr" { buf[..6].copy_from_slice(&[0xb8, 0x27, 0xeb, 1, 2, 3]); return Ok(6); }
+        if let Some(v) = self.gets.get(name) { let n = v.len().min(buf.len()); buf[..n].copy_from_slice(&v[..n]); return Ok(n); }
         Err(FwError::Status(-23))
     }
     fn iovar_set(&mut self, name: &str, buf: &[u8]) -> Result<(), FwError> {
@@ -550,7 +553,7 @@ fn ctl_commands_parse_in_every_state() {
                CtlCmd::Join { ssid: Some("a b=c"), knobs: vec!["method=setssid", "supwpa=0"] });
     let mut o = JoinOpts::default();
     assert_eq!(o.apply(&["method=setssid", "supwpa=0", "pmk=hex", "sec=iovar", "mfp=1", "wpaie=0", "bogus=1"]), vec!["bogus=1"]);
-    assert_eq!(o.describe(), "method=setssid supwpa=0 pmk=hex sec=iovar mfp=1 wpaie=0");
+    assert_eq!(o.describe(), "method=setssid supwpa=0 pmk=hex sec=iovar mfp=1 wpaie=0 akm=auto mfpc=auto mfpr=auto msg2ie=auto");
     o.apply(&["reset"]);
     assert_eq!(o, JoinOpts::default());
     assert_eq!(parse_ctl("seq=7 diag lines=8"), CtlCmd::Diag(8));
@@ -684,4 +687,138 @@ fn join_method_and_sec_path_knobs() {
     assert_eq!(d.join(psk_req(), &mut Steps::default(), 2_000), Err(JoinFail::Fw(FwError::Status(-23))));
     assert!(d.fw.cmd(cmd::SET_SSID).is_none());
     assert_eq!(d.fail_cmd, "iovar join (ext join params) -> Status(-23)");
+}
+
+// ── pibrcmf-4way: AP RSN element, AKM 6 / MFP choice, msg2 IE = assoc IE ──
+
+/// AP RSN IE: CCMP/CCMP, AKMs 2 and 6, given caps, optional group mgmt cipher.
+fn ap_rsn_ie(caps: u16, gmgmt: bool) -> Vec<u8> {
+    let mut b = vec![1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 2, 0, 0x00, 0x0f, 0xac, 2, 0x00, 0x0f, 0xac, 6];
+    b.extend_from_slice(&caps.to_le_bytes());
+    if gmgmt { b.extend_from_slice(&[0, 0, 0x00, 0x0f, 0xac, 6]); }
+    let mut ie = vec![48, b.len() as u8];
+    ie.extend_from_slice(&b);
+    ie
+}
+
+fn bss_with_rsn(rsn: &[u8]) -> BssEntry {
+    let mut ies = vec![0, SSID.len() as u8];
+    ies.extend_from_slice(SSID);
+    ies.extend_from_slice(rsn);
+    BssEntry { bssid: AP, ssid: SSID.to_vec(), channel: 36, chanspec: chanspec20(36), rssi: -38, capability: 0x0411, beacon_period: 100, ies }
+}
+
+#[test]
+fn ap_rsn_element_is_decoded() {
+    let r = parse_ap_rsn(&ap_rsn_ie(0x00cc, true)).unwrap();
+    assert_eq!(r.akm, vec![0x000f_ac02, 0x000f_ac06]);
+    assert!(r.mfpc() && r.mfpr() && r.has_akm(6));
+    assert_eq!(r.group_mgmt, Some(0x000f_ac06));
+    assert!(r.describe().starts_with("group=4 pairwise=4 akm=2,6 caps=0x00cc mfpc=1 mfpr=1 pmkids=0 group_mgmt=6 ie=30"));
+    assert_eq!(find_rsn_ie(&bss_with_rsn(&ap_rsn_ie(0, false)).ies).map(|i| i[0]), Some(48));
+}
+
+#[test]
+fn akm_and_mfp_knobs_shape_the_advertised_ie() {
+    // Auto against an AP offering AKM 6 with MFPC: AKM 6, MFPC=1, wpa_auth PSK_SHA256, mfp 1.
+    let mut d = up();
+    d.last_bss = vec![bss_with_rsn(&ap_rsn_ie(0x0080, true))];
+    d.fw.on("join", join_ok());
+    assert_eq!(d.join(psk_req(), &mut Steps::default(), 2_000), Ok(()));
+    assert_eq!(d.fw.iovar("wpaie").unwrap(), &crate::wifi_crypto::rsn_ie_psk_akm(0x000f_ac04, 6, 0x0080).to_vec());
+    let wa = d.fw.cmd(cmd::SET_WPA_AUTH).or(d.fw.iovar("wpa_auth")).unwrap();
+    assert_eq!(wa[..4], WPA2_AUTH_PSK_SHA256.to_le_bytes());
+    assert_eq!(d.fw.iovar("mfp").unwrap()[..4], 1u32.to_le_bytes());
+    assert!(d.rsn.ap.contains("akm=2,6") && d.rsn.chosen.starts_with("akm=6 mfpc=1 mfpr=0 mfp_iovar=1"), "{:?}", d.rsn);
+    assert!(d.rsn.secret.starts_with("passphrase len=21 edge_whitespace=0"));
+    // Knobs: AKM 2 with MFPC=1 MFPR=0.
+    let mut d = up();
+    d.last_bss = vec![bss_with_rsn(&ap_rsn_ie(0x0080, false))];
+    assert!(d.opts.apply(&["akm=2", "mfpc=1", "mfpr=0"]).is_empty());
+    d.fw.on("join", join_ok());
+    assert_eq!(d.join(psk_req(), &mut Steps::default(), 2_000), Ok(()));
+    assert_eq!(d.fw.iovar("wpaie").unwrap(), &crate::wifi_crypto::rsn_ie_psk_akm(0x000f_ac04, 2, 0x0080).to_vec());
+    let wa = d.fw.cmd(cmd::SET_WPA_AUTH).or(d.fw.iovar("wpa_auth")).unwrap();
+    assert_eq!(wa[..4], WPA2_AUTH_PSK.to_le_bytes());
+    // An AP without RSN info and no knobs keeps the old IE (AKM 2, caps 0).
+    let mut d = up();
+    d.fw.on("join", join_ok());
+    assert_eq!(d.join(psk_req(), &mut Steps::default(), 2_000), Ok(()));
+    assert_eq!(d.fw.iovar("wpaie").unwrap(), &crate::wifi_crypto::rsn_ie_psk_ccmp().to_vec());
+    assert!(d.opts.apply(&["akm=5", "mfpc=2"]).len() == 2);
+}
+
+/// AKM 6 host handshake (descriptor v3: KDF-SHA256 PTK, AES-CMAC MIC) with
+/// PMF: the firmware reports an association RSN IE that differs from ours
+/// (Broadcom firmware may set PTKSA replay-counter bits); message 2 must echo
+/// the firmware's bytes. PTK, GTK and IGTK (index 4) go in through wsec_key.
+#[test]
+fn akm6_host_handshake_echoes_the_firmware_assoc_ie_and_installs_igtk() {
+    use crate::wifi_crypto as wc;
+    use wc::key_info as ki;
+    let mut d = up();
+    d.fw.refuse = vec!["sup_wpa".into()];
+    d.last_bss = vec![bss_with_rsn(&ap_rsn_ie(0x0080, true))];
+    let fw_ie = wc::rsn_ie_psk_akm(0x000f_ac04, 6, 0x008c).to_vec();
+    let mut req_ies = vec![0, SSID.len() as u8];
+    req_ies.extend_from_slice(SSID);
+    req_ies.extend_from_slice(&[1, 2, 0x82, 0x84]);
+    req_ies.extend_from_slice(&fw_ie);
+    let mut info = (req_ies.len() as u32 + 4).to_le_bytes().to_vec();
+    info.extend_from_slice(&0u32.to_le_bytes());
+    d.fw.gets.insert("assoc_info".into(), info);
+    d.fw.gets.insert("assoc_req_ies".into(), req_ies);
+    let pmk = wc::wpa_psk(b"correct horse battery", SSID);
+    let anonce = [0x6bu8; 32];
+    let m1 = wc::build_eapol_key(2, 3 | ki::TYPE_PAIRWISE | ki::ACK, 16, &1u64.to_be_bytes(), &anonce, &[]);
+    d.fw.on("join", vec![
+        evf(ev::ASSOC, status::SUCCESS, 0, 0, &[]),
+        evf(ev::LINK, status::SUCCESS, 0, event::FLAG_LINK, &[]),
+        Frame::Data(eth(STA, AP, &m1)),
+    ]);
+    let (gtk, igtk) = ([0x33u8; 16], [0x44u8; 16]);
+    let tk_out = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let tk2 = tk_out.clone();
+    let want_ie = fw_ie.clone();
+    d.fw.on_tx = Some(Box::new(move |f: &[u8]| {
+        let pdu = &f[14..];
+        let k = wc::parse_eapol_key(pdu).unwrap();
+        assert_eq!(k.key_info & 7, 3, "descriptor v3");
+        if k.key_info & ki::SECURE != 0 { return vec![]; }
+        assert_eq!(k.key_data, &want_ie[..], "M2 RSN IE = firmware assoc IE");
+        let ptk = wc::derive_ptk_sha256(&pmk, &AP, &STA, &anonce, &k.nonce);
+        let mut z = pdu.to_vec();
+        z[81..97].fill(0);
+        assert_eq!(wc::aes_cmac(&ptk.kck, &[&z])[..], pdu[81..97], "M2 CMAC");
+        *tk2.borrow_mut() = Some(ptk.tk);
+        let mut kd = want_ie.clone();
+        kd.extend_from_slice(&[0xdd, 22, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00]);
+        kd.extend_from_slice(&gtk);
+        kd.extend_from_slice(&[0xdd, 28, 0x00, 0x0f, 0xac, 0x09, 4, 0, 1, 0, 0, 0, 0, 0]);
+        kd.extend_from_slice(&igtk);
+        kd.push(0xdd);
+        while kd.len() % 8 != 0 { kd.push(0); }
+        let wrapped = wc::aes_key_wrap(&ptk.kek, &kd);
+        let mut m3 = wc::build_eapol_key(2, 3 | ki::TYPE_PAIRWISE | ki::INSTALL | ki::ACK | ki::MIC | ki::SECURE | ki::ENCRYPTED_KEY_DATA,
+                                         16, &2u64.to_be_bytes(), &anonce, &wrapped);
+        wc::eapol_set_mic(&ptk.kck, &mut m3);
+        vec![Frame::Data(eth(STA, AP, &m3))]
+    }));
+    let r = d.join(psk_req(), &mut Steps::default(), 5_000);
+    assert_eq!(r, Ok(()), "fail_cmd {} rsn {:?}", d.fail_cmd, d.rsn);
+    let keys = wsec_keys(&d.fw);
+    assert_eq!(keys.len(), 3, "pairwise + group + igtk");
+    assert_eq!(keys[0], wsec_key(0, &tk_out.borrow().unwrap(), Some(AP)).to_vec());
+    assert_eq!(keys[1], wsec_key(1, &gtk, None).to_vec());
+    assert_eq!(keys[2], wsec_key(4, &igtk, None).to_vec());
+    assert!(d.rsn.msg1.starts_with("eapol_ver=2 desc=2 key_info=0x008b (ver=3 pairwise=1"), "{}", d.rsn.msg1);
+    assert!(d.rsn.msg2_ie.starts_with("fw akm=6 30140100"), "{}", d.rsn.msg2_ie);
+    assert_eq!(d.rsn.assoc_fw, hex(&fw_ie));
+    // Nothing secret in the diagnostics: no PMK bytes anywhere.
+    let all: String = d.rsn.lines().iter().map(|(_, v)| v.as_str()).collect();
+    assert!(!all.contains(&hex(&pmk[..8])) && !all.contains("correct horse"));
+    // msg2ie=ours would have sent our IE instead.
+    let mut o = JoinOpts::default();
+    o.apply(&["msg2ie=ours"]);
+    assert_eq!(o.msg2ie, Msg2Ie::Ours);
 }
