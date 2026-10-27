@@ -12,9 +12,11 @@
 use crate::dma::DmaBuf;
 
 // Endpoint types (EP context DW1 [5:3]).
+pub const EP_TYPE_ISOCH_OUT: u32 = 1;
 pub const EP_TYPE_BULK_OUT: u32 = 2;
 pub const EP_TYPE_INTR_OUT: u32 = 3;
 pub const EP_TYPE_CTRL: u32 = 4;
+pub const EP_TYPE_ISOCH_IN: u32 = 5;
 pub const EP_TYPE_BULK_IN: u32 = 6;
 pub const EP_TYPE_INTR_IN: u32 = 7;
 
@@ -106,7 +108,8 @@ impl<'a> Ctx<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn write_ep(&self, dci: usize, ep_type: u32, mps: u16, max_burst: u8,
                     interval: u32, avg_trb_len: u16, max_esit: u32, deq: u64) {
-        let cerr = 3u32;
+        // Isochronous endpoints are never retried: CErr must be 0 (xHCI §6.2.3).
+        let cerr = if ep_type == EP_TYPE_ISOCH_OUT || ep_type == EP_TYPE_ISOCH_IN { 0 } else { 3u32 };
         self.set_ep(dci, 0, (interval & 0xFF) << 16 | ((max_esit >> 16) & 0xFF) << 24);
         self.set_ep(dci, 1, cerr << 1 | ep_type << 3 | (max_burst as u32) << 8 | (mps as u32) << 16);
         self.set_ep(dci, 2, deq as u32);

@@ -642,7 +642,7 @@ pub fn read_chip_id<B: SdioBus>(bus: &mut B) -> Result<(u32, bool), BusError> {
 
 // ── Raspberry Pi 5 hardware: power path, pin mux, MMIO, boot probe ───────────
 #[cfg(feature = "rpi5")]
-pub use hw::{boot_probe, probe, take_host, Mmio, PROBE_STATE};
+pub use hw::{boot_probe, gio_drive, probe, take_host, Mmio, GIO_PHYS, PINCTRL_PHYS, PROBE_STATE};
 
 #[cfg(feature = "rpi5")]
 mod hw {
@@ -730,8 +730,15 @@ mod hw {
         alloc::format!("pinmux={:?} sd2-fsel-before={:06x} writes={}", st, before, changed)
     }
 
-    fn wl_reg_on(gio: usize, on: bool) {
-        let bit = 1u32 << WL_REG_ON_GPIO;
+    /// Serialises read-modify-write of the shared gio bank (WL_REG_ON here,
+    /// BT_ON in `bt::boot`, possibly on different threads).
+    static GIO_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Drives `gio` bank pin `pin` (0..31) as an output, high or low. `gio` is
+    /// the mapped [`GIO_PHYS`] window.
+    pub fn gio_drive(gio: usize, pin: u32, on: bool) {
+        let bit = 1u32 << pin;
+        let _g = GIO_LOCK.lock();
         unsafe {
             let d = rd32(gio + GIO_DATA);
             wr32(gio + GIO_DATA, if on { d | bit } else { d & !bit });
@@ -739,6 +746,8 @@ mod hw {
             if dir & bit != 0 { wr32(gio + GIO_IODIR, dir & !bit); }
         }
     }
+
+    fn wl_reg_on(gio: usize, on: bool) { gio_drive(gio, WL_REG_ON_GPIO, on) }
 
     fn map(phys: u64, len: usize) -> Option<usize> { mm::kva::ioremap(phys, len, mm::kva::CacheMode::Uncached) }
 

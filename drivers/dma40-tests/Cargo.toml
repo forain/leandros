@@ -1,0 +1,14 @@
+# Host unit tests for the BCM2712 dma40 SCB encoding, cyclic rings and channel sequences
+# (drivers/src/bcm2712_dma40/cb.rs). Its own workspace so it builds for the host:
+#
+#   cd drivers/dma40-tests && cargo test --target aarch64-apple-darwin
+[package]
+name = "dma40-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

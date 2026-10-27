@@ -116,6 +116,12 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::blkdev::init();
+    // Raspberry Pi 5: ACT LED on SD I/O and the power button (KEY_POWER);
+    // BCM2712 GPIO only, no PCIe. `pi5.board=0` disables it.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    if !crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "pi5.board=0")) {
+        drivers::pi5_board::init();
+    }
     // Raspberry Pi 5: PCIe root complex for RP1 (Ethernet, USB). Opt-in until
     // hardware-verified; bounded (<= ~0.4 s) and inert on failure.
     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
@@ -208,6 +214,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     vfs_server::block::init(&DISK_OPS);
 
     // ── USB ───────────────────────────────────────────────────────────────────
+    usb::xhci::isoch::set_cmdline(crate::boot_cmdline().unwrap_or(""));
     drivers::usb_hcd::init();
     // The xHCI BIOS handoff above ends the firmware's USB legacy (PS/2)
     // emulation: an i8042 that was only ever that emulation is gone now.
@@ -250,8 +257,25 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             drivers::pci::serial_debug(&alloc::format!("[SERROR] pending before the v3d probe syn=0x{:016x} (an earlier probe)\n", syn));
         }
         drivers::v3d::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset, arch_aarch64::exception::serror_checkpoint);
+        // RNG, firmware RTC, PM watchdog, thermal, ARM clock: one line each (lane pimisc).
+        drivers::rpi_misc::boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset);
     }
-     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] drivers::brcmf_boot::start(crate::boot_cmdline().unwrap_or("")); // Pi 5 V3D power-up + ident (one [v3d] line); CYW43455 firmware bring-up on a kthread ([brcmf] lines)
+    // HDMI0/1 read-only probe (hdmi.probe=0 disables): no display-register writes,
+    // SError checkpoint after each block read.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] {
+        if let Some(syn) = arch_aarch64::exception::serror_checkpoint() {
+            drivers::pci::serial_debug(&alloc::format!("[SERROR] pending before the hdmi probe syn=0x{:016x} (an earlier probe)\n", syn));
+        }
+        drivers::hdmi_probe::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset, arch_aarch64::exception::serror_checkpoint);
+    }
+    // dma40 engine self-test (64 KiB mem-to-mem copy, one [dma40] line), checkpointed like v3d.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] {
+        if let Some(syn) = arch_aarch64::exception::serror_checkpoint() {
+            drivers::pci::serial_debug(&alloc::format!("[SERROR] pending before the dma40 selftest syn=0x{:016x} (an earlier probe)\n", syn));
+        }
+        drivers::bcm2712_dma40::boot(crate::boot_cmdline().unwrap_or(""), arch_aarch64::exception::serror_checkpoint);
+    }
+     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] { drivers::brcmf_boot::start(crate::boot_cmdline().unwrap_or("")); drivers::bt::boot::start(crate::boot_cmdline().unwrap_or(""), arch_aarch64::exception::serror_checkpoint); } // Pi 5 V3D power-up + ident (one [v3d] line); CYW43455 firmware bring-up on a kthread ([brcmf] lines)
     // Persist the console log on the boot disk's log partition, if it has one.
     crate::klog::init(); crate::iostat::init(); crate::hungtask::init(); // + the 5 s [usbms]/[fslock] summary task
     #[cfg(all(feature = "nvidia", target_arch = "x86_64"))] nvidia_rm::init(&nvidia_rm::BootEnv { cmdline: crate::boot_cmdline().unwrap_or(""), fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32, log_flush: crate::klog::flush_now, rsdp_phys: boot_info.rsdp_addr }); // OpenRM; one line so the default kernel's panic line numbers (and bytes) stay unchanged

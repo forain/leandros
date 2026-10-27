@@ -1942,6 +1942,10 @@ fn time_init() {
             print_number(s as u32); // 2038-safe enough for a boot line
             serial_print_str("\n");
         }
+        // The Pi 5 RTC is a firmware mailbox device, read later by drivers::rpi_misc ([RTC] rpi: ...).
+        #[cfg(feature = "rpi5")]
+        None => {}
+        #[cfg(not(feature = "rpi5"))]
         None => serial_print_str("[RTC] no battery clock; CLOCK_REALTIME starts at boot\n"),
     }
 }

@@ -4107,6 +4107,9 @@ fn step_realtime_ns(ns: u64) {
     // still expires at its wall-clock instant (Linux `clock_was_set`).
     tty_server::timers_clock_was_set(old, new);
     sched::realtime_waiters_clock_was_set();
+    // Raspberry Pi 5: keep the firmware RTC in step (Linux rtc-rpi via hwclock -w).
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    drivers::rpi_misc::rtc_set_secs(ns / 1_000_000_000);
 }
 
 /// sys_settimeofday(tv_ptr, tz_ptr) — step the wall clock from a `struct
