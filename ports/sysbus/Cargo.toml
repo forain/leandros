@@ -2,7 +2,7 @@
 name = "leandros-sysbus"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal org.freedesktop system services (login1, locale1, UPower, NetworkManager) for LeandrOS"
+description = "Minimal org.freedesktop system services (login1, locale1, UPower, NetworkManager, BlueZ) for LeandrOS"
 license = "MIT"
 publish = false
 
@@ -19,6 +19,8 @@ serde = "1"
 futures-util = { version = "0.3", default-features = false }
 # The /dev/netctl contract (shared with the kernel), for the NetworkManager shim.
 netctl-abi = { path = "../../lib/netctl-abi" }
+# The btd.sock wire format (docs/servers/bluetooth.md), for the org.bluez shim.
+bt-host = { path = "../../lib/bt-host" }
 
 [profile.release]
 opt-level = "s"

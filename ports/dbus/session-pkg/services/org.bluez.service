@@ -1,0 +1,9 @@
+# org.bluez for the COSMIC session (Bluetooth applet, Settings > Bluetooth):
+# ports/sysbus (leandros-sysbus bluez), a façade over btd's
+# /run/bluetooth/btd.sock (docs/servers/bluetooth.md). LeandrOS has no system
+# bus; start-cosmic-leandros aliases DBUS_SYSTEM_BUS_ADDRESS to the session
+# busd, so this "system" service is activated there, as the session user, on
+# the first message to the name. Without btd it exports no adapter.
+[D-BUS Service]
+Name=org.bluez
+Exec=/usr/libexec/leandros-sysbus bluez
