@@ -20,7 +20,7 @@ Status: DELIVERED (host-tested; unproven on hardware until the next Pi boot). Se
 - drivers/bt-tests 23/23 (8 new, fake H4 controller answering every command with Command Complete):
   HCI Reset `01 03 0c 00` → `04 0e 04 01 03 0c 00` read whole; poll POLLOUT → POLLIN|POLLOUT → POLLOUT.
   Mutation check (newest→oldest drop, EMSGSIZE off by one, queue while closed): 3 tests fail.
-- check-rpi5.sh rpi5 + raspi4b clean (no warnings in bt/). aarch64 virt build + regress: see merge.
+- check-rpi5.sh rpi5 + raspi4b clean (no warnings in bt/). aarch64 box regress 49 suites, 0 bad (d9e4fa75); Mac HVF vfstest PASS.
 
 ## Open
 - No QEMU path for the UART; the blocking-read/epoll path through the VFS is exercised only on the Pi
