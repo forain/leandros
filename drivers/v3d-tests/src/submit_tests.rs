@@ -124,3 +124,88 @@ fn selftest_cl_layout_and_patching() {
     assert_eq!(RCL[RCL.len() - 1], 13);
     assert!(IMG_OFF + (STRIDE * H) as usize <= BO_SIZE);
 }
+
+// ── phase D: SUBMIT_TFU / SUBMIT_CSD ──
+
+fn le(buf: &mut [u8], o: usize, v: u32) { buf[o..o + 4].copy_from_slice(&v.to_le_bytes()); }
+
+#[test]
+fn tfu_args_layout() {
+    let mut b = [0u8; SUBMIT_TFU_SIZE];
+    for i in 0..7 { le(&mut b, 4 * i, 0x100 + i as u32); }
+    for i in 0..4 { le(&mut b, 28 + 4 * i, 0x200 + i as u32); }
+    le(&mut b, 44, 11); le(&mut b, 48, 12); le(&mut b, 52, 0); le(&mut b, 56, 14);
+    le(&mut b, 60, 21); le(&mut b, 64, 22); le(&mut b, 68, SUBMIT_EXTENSION); le(&mut b, 72, 0xdead0);
+    le(&mut b, 80, 0x8_6000);
+    let a = TfuArgs::parse(&b);
+    let r = a.regs;
+    assert_eq!((r.icfg, r.iia, r.iis, r.ica, r.iua, r.ioa, r.ios), (0x100, 0x101, 0x102, 0x103, 0x104, 0x105, 0x106));
+    assert_eq!(r.coef, [0x200, 0x201, 0x202, 0x203]);
+    assert_eq!(r.ioc, 0x8_6000, "v71.ioc at 80");
+    assert_eq!(a.handles(), vec![11, 12], "list ends at the first 0");
+    assert_eq!((a.in_sync, a.out_sync, a.extensions), (21, 22, 0xdead0));
+    assert!(a.validate().is_ok());
+    le(&mut b, 68, 1); // FLUSH_CACHE is not a TFU flag
+    assert_eq!(TfuArgs::parse(&b).validate(), Err(SubmitError::Inval));
+    le(&mut b, 68, 0); // extension pointer without the flag
+    assert_eq!(TfuArgs::parse(&b).validate(), Err(SubmitError::Inval));
+}
+
+#[test]
+fn csd_args_layout() {
+    let mut b = [0u8; SUBMIT_CSD_SIZE];
+    for i in 0..7 { le(&mut b, 4 * i, 0x300 + i as u32); }
+    le(&mut b, 44, 0xffff_ffff); // padding after coef[4]: ignored
+    le(&mut b, 48, 0x1234_5678); le(&mut b, 52, 0x9);
+    le(&mut b, 56, 3); le(&mut b, 60, 5); le(&mut b, 64, 6); le(&mut b, 68, 0); le(&mut b, 80, 0);
+    let a = CsdArgs::parse(&b);
+    assert_eq!(a.cfg, [0x300, 0x301, 0x302, 0x303, 0x304, 0x305, 0x306]);
+    assert_eq!((a.bo_handles, a.bo_handle_count, a.in_sync, a.out_sync), (0x9_1234_5678, 3, 5, 6));
+    assert!(a.validate().is_ok());
+    le(&mut b, 80, 4);
+    assert_eq!(CsdArgs::parse(&b).validate(), Err(SubmitError::Inval));
+}
+
+#[test]
+fn single_queue_sync_plans() {
+    let mut nomem = |_p: u64, _b: &mut [u8]| -> bool { false };
+    let p = plan_syncs_single(0, 0, 3, 4, &mut nomem).unwrap();
+    assert_eq!((p.bin_in.clone(), p.out.clone(), p.multisync), (vec![3], vec![4], false));
+    // MULTI_SYNC with wait_stage = CACHE_CLEAN still gates the whole job; legacy fields ignored.
+    let mut mem = std::collections::HashMap::<u64, u8>::new();
+    let mut put = |a: u64, bytes: &[u8]| for (i, &x) in bytes.iter().enumerate() { mem.insert(a + i as u64, x); };
+    let mut ext = [0u8; MULTI_SYNC_SIZE];
+    le(&mut ext, 8, EXT_ID_MULTI_SYNC);
+    ext[16..24].copy_from_slice(&0x2000u64.to_le_bytes());
+    ext[24..32].copy_from_slice(&0x3000u64.to_le_bytes());
+    le(&mut ext, 32, 1); le(&mut ext, 36, 1); le(&mut ext, 40, QUEUE_CACHE_CLEAN);
+    put(0x1000, &ext);
+    let mut s = [0u8; SEM_SIZE]; le(&mut s, 0, 8); put(0x2000, &s);
+    le(&mut s, 0, 9); put(0x3000, &s);
+    let mut rd = |p: u64, b: &mut [u8]| -> bool {
+        for (i, x) in b.iter_mut().enumerate() { match mem.get(&(p + i as u64)) { Some(&v) => *x = v, None => return false } }
+        true
+    };
+    let p = plan_syncs_single(SUBMIT_EXTENSION, 0x1000, 3, 4, &mut rd).unwrap();
+    assert_eq!((p.bin_in, p.out, p.multisync), (vec![8], vec![9], true));
+    assert_eq!(plan_syncs_single(SUBMIT_EXTENSION, 0x7000, 0, 0, &mut rd), Err(SubmitError::Fault));
+}
+
+#[test]
+fn tfu_selftest_block_and_check() {
+    let r = tfu_selftest_regs(0x40_0000);
+    assert_eq!(r.icfg, 29 << 16, "raster in, R32F");
+    assert_eq!((r.iia, r.ioa, r.iis, r.ios), (0x40_0000, 0x40_4000, 64, 0x0040_0040));
+    assert_eq!(r.ioc, (6 << 12) | (8 << 16), "UIF_NO_XOR, stride 8 UIF blocks");
+    let mut bo = vec![0u8; TFU_BO_SIZE];
+    tfu_selftest_fill(&mut bo);
+    // A plain copy and a reversed copy are both full permutations.
+    let src = bo[..0x4000].to_vec();
+    assert_eq!(tfu_selftest_check(&src), (4096, 0, 0));
+    let mut rev: Vec<u8> = src.chunks_exact(4).rev().flatten().copied().collect();
+    assert_eq!(tfu_selftest_check(&rev), (4096, 0, 0));
+    let w1 = rev[4..8].to_vec();
+    rev[0..4].copy_from_slice(&w1);
+    assert_eq!(tfu_selftest_check(&rev), (4095, 1, 0));
+    assert_eq!(tfu_selftest_check(&bo[0x4000..]), (0, 0, 4096), "untouched destination");
+}

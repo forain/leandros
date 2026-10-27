@@ -1,6 +1,10 @@
-//! V3D 7.1 control-list queue (openbugs #98 phase C): one bin (CT0) + render (CT1) pipeline, one job
-//! in flight, strictly in submission order, so fences retire in order and the global fence
-//! watermark (`syncobj_retire_fence`) stays correct.
+//! V3D 7.1 job queue (openbugs #98 phases C + D): bin (CT0) + render (CT1) control-list jobs, TFU
+//! jobs and CSD (compute) jobs share ONE pipeline: one job in flight across all of them, strictly
+//! in submission order, so fences retire in order and the global fence watermark
+//! (`syncobj_retire_fence`) stays exact. Phase D chose this over per-queue retirement: a
+//! watermark cannot express "fence 7 (TFU) done, fence 6 (render) not yet", and every in-sync a
+//! job can name is an older fence, so in-order execution never deadlocks; the cost is no TFU/CSD
+//! overlap with bin/render (a throughput item, like bin/render overlap).
 //!
 //! Pure logic over the `V3dRegs` seam; the kernel glue (`submit.rs`, `aarch64 + rpi5`) owns the
 //! lock, the fence ids and the BO references. Nothing here allocates while servicing an interrupt:
@@ -14,6 +18,12 @@
 //! - OUTOMEM: hand the binner a 256 KiB overflow chunk (`PTB_BPOA`, `PTB_BPOS`); the chunk stays
 //!   attached to the job until render is done, then goes back to the pool.
 //! - FLUSH_CACHE: the clean sequence (TMUWCF, then L2T clean) on the CPU before the fence signals.
+//! - TFU (hub): IIA, IIS, ICA, IUA, IOA, IOC (7.1), IOS, COEF0-3 (7.1 always writes all four),
+//!   then `ICFG = icfg | IOC` starts it. Done = hub TFUC (delivered here as `EV_TFU_DONE`).
+//! - CSD (core): invalidate caches; `QUEUED_CFG1..6`; `CFG7 = 0` (7.1); `QUEUED_CFG0` starts it.
+//!   Done = CSDDONE (bit 6 on 7.1). Every CSD job is followed by the cache clean (TMUWCF, L2T
+//!   clean) before its fence signals: Linux's separate CACHE_CLEAN job, run on the CPU in order.
+//!   A dispatch with zero workgroups in any dimension is not started (HW reads 0 as 65536).
 //! - hang: every `HANG_TIMEOUT_NS` the running CT's CA/RA must have moved, else reset (GMP stop,
 //!   SMS reset, re-init) and the job's fence signals with the job marked failed.
 use super::regs::*;
@@ -21,6 +31,8 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 pub const HANG_TIMEOUT_NS: u64 = 500_000_000;
+/// Hub TFUC, remapped into the core-bit word `service` takes (core INT bits stop at bit 6).
+pub const EV_TFU_DONE: u32 = 1 << 31;
 pub const OVERFLOW_BYTES: u32 = 256 * 1024;
 /// Jobs queued + retired-but-not-reaped; the submit path waits for space beyond this.
 pub const MAX_JOBS: usize = 64;
@@ -50,8 +62,38 @@ pub trait QueueEnv {
     fn reinit(&self, regs: &dyn V3dRegs) -> bool;
 }
 
+/// `drm_v3d_submit_tfu` register values (7.1).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TfuRegs {
+    pub icfg: u32,
+    pub iia: u32,
+    pub iis: u32,
+    pub ica: u32,
+    pub iua: u32,
+    pub ioa: u32,
+    pub ioc: u32,
+    pub ios: u32,
+    pub coef: [u32; 4],
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    /// Bin + render control lists (the `bcl_*`/`rcl_*` fields).
+    #[default]
+    Cl,
+    Tfu(TfuRegs),
+    /// `cfg[0..7]` of `drm_v3d_submit_csd`.
+    Csd([u32; 7]),
+}
+
+/// Whether a CSD config dispatches anything (Linux `v3d_csd_job_run`).
+pub fn csd_has_work(cfg: &[u32; 7]) -> bool {
+    cfg[0] >> 16 != 0 && cfg[1] >> 16 != 0 && cfg[2] >> 16 != 0
+}
+
 #[derive(Debug, Default)]
 pub struct ClJob {
+    pub kind: JobKind,
     pub fence: u64,
     pub bcl_start: u32,
     pub bcl_end: u32,
@@ -60,6 +102,7 @@ pub struct ClJob {
     pub qma: u32,
     pub qms: u32,
     pub qts: u32,
+    /// Gate the bin job (or, with no bin, the render job). TFU/CSD jobs: gate the whole job.
     pub bin_deps: Vec<u64>,
     pub render_deps: Vec<u64>,
     pub flush_cache: bool,
@@ -82,6 +125,8 @@ pub enum Phase {
     /// Bin done (or absent); render waits for its dependencies.
     WaitRender,
     Render,
+    Tfu,
+    Csd,
 }
 
 struct Running {
@@ -105,6 +150,8 @@ pub struct Stats {
     pub reset_fail: u64,
     pub clean_fail: u64,
     pub stray_irq: u64,
+    pub tfu_done: u64,
+    pub csd_done: u64,
 }
 
 pub struct ClQueue {
@@ -168,7 +215,7 @@ impl ClQueue {
     pub const fn new() -> Self {
         ClQueue { pending: VecDeque::new(), run: None, retired: VecDeque::new(), chunks: Vec::new(), stats: Stats {
             submitted: 0, completed: 0, bin_done: 0, render_done: 0, outomem: 0, overflow_fail: 0,
-            timeouts: 0, resets: 0, reset_fail: 0, clean_fail: 0, stray_irq: 0 } }
+            timeouts: 0, resets: 0, reset_fail: 0, clean_fail: 0, stray_irq: 0, tfu_done: 0, csd_done: 0 } }
     }
 
     /// Task context, once: reserves the rings so interrupt-time work never allocates.
@@ -220,6 +267,18 @@ impl ClQueue {
                 _ => self.stats.stray_irq += 1,
             }
         }
+        if bits & EV_TFU_DONE != 0 {
+            match self.run.as_ref() {
+                Some(r) if r.phase == Phase::Tfu => { self.stats.tfu_done += 1; self.finish(regs, env, true); }
+                _ => self.stats.stray_irq += 1,
+            }
+        }
+        if bits & INT_CSDDONE_71 != 0 {
+            match self.run.as_ref() {
+                Some(r) if r.phase == Phase::Csd => { self.stats.csd_done += 1; self.finish(regs, env, true); }
+                _ => self.stats.stray_irq += 1,
+            }
+        }
         self.pump(regs, env);
     }
 
@@ -227,9 +286,14 @@ impl ClQueue {
     pub fn tick(&mut self, regs: &dyn V3dRegs, env: &dyn QueueEnv) {
         let now = env.now_ns();
         let hung = match self.run.as_mut() {
+            // TFU has no progress register (Linux resets on the first timeout).
+            Some(r) if r.phase == Phase::Tfu && now >= r.deadline => true,
             Some(r) if r.phase != Phase::WaitRender && now >= r.deadline => {
-                let (ca, ra) = if r.phase == Phase::Bin { (CLE_CT0CA, CLE_CT0RA) } else { (CLE_CT1CA, CLE_CT1RA) };
-                let (ca, ra) = (regs.core_r(ca), regs.core_r(ra));
+                let (ca, ra) = match r.phase {
+                    Phase::Bin => (regs.core_r(CLE_CT0CA), regs.core_r(CLE_CT0RA)),
+                    Phase::Csd => (regs.core_r(CSD_CURRENT_CFG4), r.ra),
+                    _ => (regs.core_r(CLE_CT1CA), regs.core_r(CLE_CT1RA)),
+                };
                 if ca != r.ca || ra != r.ra {
                     r.ca = ca;
                     r.ra = ra;
@@ -282,8 +346,27 @@ impl ClQueue {
     fn arm(&mut self, regs: &dyn V3dRegs, env: &dyn QueueEnv, phase: Phase) {
         let r = self.run.as_mut().unwrap();
         let j = &r.job;
-        invalidate_caches(regs);
-        if phase == Phase::Bin {
+        if let (Phase::Tfu, JobKind::Tfu(t)) = (phase, &j.kind) {
+            // Linux `v3d_tfu_job_run` order; ICFG last starts the conversion.
+            regs.hub_w(TFU_IIA, t.iia);
+            regs.hub_w(TFU_IIS, t.iis);
+            regs.hub_w(TFU_ICA, t.ica);
+            regs.hub_w(TFU_IUA, t.iua);
+            regs.hub_w(TFU_IOA, t.ioa);
+            regs.hub_w(TFU_IOC, t.ioc);
+            regs.hub_w(TFU_IOS, t.ios);
+            regs.hub_w(TFU_COEF0, t.coef[0]);
+            regs.hub_w(TFU_COEF1, t.coef[1]);
+            regs.hub_w(TFU_COEF2, t.coef[2]);
+            regs.hub_w(TFU_COEF3, t.coef[3]);
+            regs.hub_w(TFU_ICFG, t.icfg | TFU_ICFG_IOC);
+        } else if let (Phase::Csd, JobKind::Csd(c)) = (phase, &j.kind) {
+            invalidate_caches(regs);
+            for i in 1..=6 { regs.core_w(csd_queued_cfg(i), c[i as usize]); }
+            regs.core_w(CSD_QUEUED_CFG7, 0);
+            regs.core_w(CSD_QUEUED_CFG0, c[0]);
+        } else if phase == Phase::Bin {
+            invalidate_caches(regs);
             // Drop the previous job's overflow so the binner cannot reuse it.
             regs.core_w(PTB_BPOS, 0);
             if j.qma != 0 {
@@ -294,6 +377,7 @@ impl ClQueue {
             regs.core_w(CLE_CT0QBA, j.bcl_start);
             regs.core_w(CLE_CT0QEA, j.bcl_end);
         } else {
+            invalidate_caches(regs);
             regs.core_w(CLE_CT1QBA, j.rcl_start);
             regs.core_w(CLE_CT1QEA, j.rcl_end);
         }
@@ -322,6 +406,23 @@ impl ClQueue {
                 Some(_) => return,
                 None => {
                     let head = match self.pending.front() { Some(j) => j, None => return };
+                    if head.kind != JobKind::Cl {
+                        if !Self::deps_done(env, &head.bin_deps) { return; }
+                        let job = self.pending.pop_front().unwrap();
+                        let (phase, start) = match job.kind {
+                            JobKind::Tfu(_) => (Phase::Tfu, true),
+                            JobKind::Csd(c) => (Phase::Csd, csd_has_work(&c)),
+                            JobKind::Cl => unreachable!(),
+                        };
+                        self.run = Some(Running { job, phase, deadline: 0, ca: 0, ra: 0 });
+                        if start {
+                            self.arm(regs, env, phase);
+                            return;
+                        }
+                        // An empty dispatch: nothing to start, the clean still runs.
+                        self.finish(regs, env, true);
+                        continue;
+                    }
                     if head.has_bin() && !Self::deps_done(env, &head.bin_deps) { return; }
                     let job = self.pending.pop_front().unwrap();
                     let bin = job.has_bin();
@@ -337,7 +438,9 @@ impl ClQueue {
 
     fn finish(&mut self, regs: &dyn V3dRegs, env: &dyn QueueEnv, ok: bool) {
         let mut r = self.run.take().unwrap();
-        if ok && r.job.flush_cache && !clean_caches(regs, env) {
+        // Clean after every CSD job (Linux queues a CACHE_CLEAN job behind each one).
+        let clean = r.job.flush_cache || matches!(r.job.kind, JobKind::Csd(_));
+        if ok && clean && !clean_caches(regs, env) {
             self.stats.clean_fail += 1;
             r.job.ok = false;
         }
