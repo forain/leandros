@@ -53,6 +53,10 @@ pub enum Step {
     Ident,
     Version,
     Cores,
+    /// GRAFX island power-up (PM_GRAFX POWUP/POWOK, memory repair).
+    Grafx,
+    /// Re-read of PM right before the first V3D access did not show the island on.
+    PmConfirm,
 }
 
 impl Step {
@@ -66,6 +70,8 @@ impl Step {
             Step::Ident => "ident",
             Step::Version => "ver",
             Step::Cores => "cores",
+            Step::Grafx => "grafx",
+            Step::PmConfirm => "pm-confirm",
         }
     }
 }
@@ -104,6 +110,8 @@ impl PowerError {
 /// What the probe learned, for the `[v3d] ident ...` line and GET_PARAM later.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProbeReport {
+    pub grafx_before: u32,
+    pub grafx_after: u32,
     pub pm_before: u32,
     pub pm_after: u32,
     pub clk_hz: u32,
@@ -143,6 +151,89 @@ fn poll<E: PowerEnv>(env: &mut E, step: Step, mut read: impl FnMut() -> u32, don
 }
 
 /// Step 1: release GRAFX_V3D from reset.
+/// Per-inrush-step POWOK wait (Linux: 3 us) and the memory-repair wait (Linux: 1 us),
+/// both widened for a slow `now_us`.
+pub const POWOK_TIMEOUT_US: u64 = 20;
+pub const MRDONE_TIMEOUT_US: u64 = 200;
+
+fn pm_set<E: PowerEnv>(env: &mut E, off: u32, set: u32, clear: u32) {
+    let v = env.pm_r(off) & 0x00ff_ffff;
+    env.pm_w(off, PM_PASSWORD | ((v & !clear) | set));
+}
+
+/// GRAFX island power-up, Linux `bcm2835_power_power_on(PM_GRAFX)` (the parent domain of
+/// GRAFX_V3D): left alone if the firmware already set POWUP; otherwise POWUP with the
+/// inrush current ramped 3.5 -> 20 mA until POWOK, then ISPOW, MEMREP/MRDONE, ISFUNC.
+/// Every failure undoes what it set, as Linux does.
+pub fn grafx_power_on<E: PowerEnv>(env: &mut E, rep: &mut ProbeReport) -> Result<(), PowerError> {
+    let before = env.pm_r(PM_GRAFX);
+    rep.grafx_before = before;
+    rep.grafx_after = before;
+    if before & PM_POWUP != 0 {
+        return Ok(());
+    }
+    let mut powok = Err(before);
+    for inrush in 0..=PM_INRUSH_MAX {
+        pm_set(env, PM_GRAFX, (inrush << PM_INRUSH_SHIFT) | PM_POWUP, PM_INRUSH_MASK);
+        powok = poll_pm(env, PM_GRAFX, PM_POWOK, POWOK_TIMEOUT_US);
+        if powok.is_ok() {
+            break;
+        }
+    }
+    if let Err(last) = powok {
+        pm_set(env, PM_GRAFX, 0, PM_POWUP | PM_INRUSH_MASK);
+        rep.grafx_after = env.pm_r(PM_GRAFX);
+        return Err(PowerError::Timeout { step: Step::Grafx, last });
+    }
+    pm_set(env, PM_GRAFX, PM_ISPOW, 0);
+    pm_set(env, PM_GRAFX, PM_MEMREP, 0);
+    if let Err(last) = poll_pm(env, PM_GRAFX, PM_MRDONE, MRDONE_TIMEOUT_US) {
+        pm_set(env, PM_GRAFX, 0, PM_ISPOW);
+        pm_set(env, PM_GRAFX, 0, PM_POWUP | PM_INRUSH_MASK);
+        rep.grafx_after = env.pm_r(PM_GRAFX);
+        return Err(PowerError::Timeout { step: Step::Grafx, last });
+    }
+    pm_set(env, PM_GRAFX, PM_ISFUNC, 0);
+    rep.grafx_after = env.pm_r(PM_GRAFX);
+    Ok(())
+}
+
+/// Polls a PM register for `mask`, bounded by `timeout_us` of clock and of 1 us waits.
+fn poll_pm<E: PowerEnv>(env: &mut E, off: u32, mask: u32, timeout_us: u64) -> Result<u32, u32> {
+    let start = env.now_us();
+    let mut last = 0;
+    // Each miss waits 1 us, so `timeout_us + 1` reads also bound a frozen clock.
+    for _ in 0..=timeout_us {
+        last = env.pm_r(off);
+        if last & mask != 0 {
+            return Ok(last);
+        }
+        if env.now_us().wrapping_sub(start) >= timeout_us {
+            break;
+        }
+        env.delay_us(1);
+    }
+    Err(last)
+}
+
+/// The gate in front of the first V3D access: re-read both PM registers after the
+/// clock is on and require the island fully on (POWUP, POWOK, ISPOW, ISFUNC) and
+/// V3D out of reset. Touching SMS/hub/core of an unpowered island is an external
+/// abort (an SError at the next EL0 entry on the Pi 5), so this fails cleanly instead.
+pub fn pm_confirm<E: PowerEnv>(env: &mut E, rep: &mut ProbeReport) -> Result<(), PowerError> {
+    let g = env.pm_r(PM_GRAFX);
+    let v = env.pm_r(PM_GRAFX_2712);
+    rep.grafx_after = g;
+    rep.pm_after = v;
+    if g & PM_GRAFX_ON != PM_GRAFX_ON {
+        return Err(PowerError::Mismatch { step: Step::PmConfirm, value: g });
+    }
+    if v & PM_V3DRSTN == 0 {
+        return Err(PowerError::Mismatch { step: Step::PmConfirm, value: v });
+    }
+    Ok(())
+}
+
 pub fn pm_power_on<E: PowerEnv>(env: &mut E, rep: &mut ProbeReport) -> Result<(), PowerError> {
     let before = env.pm_r(PM_GRAFX_2712);
     rep.pm_before = before;
@@ -225,8 +316,10 @@ pub fn identify<R: V3dRegs>(regs: &R, rep: &mut ProbeReport) -> Result<(), Power
 /// reset and identified; on failure nothing past the failing step ran.
 pub fn power_on<R: V3dRegs, E: PowerEnv>(regs: R, env: &mut E) -> Result<(V3d<R>, ProbeReport), (PowerError, ProbeReport)> {
     let mut rep = ProbeReport::default();
+    if let Err(e) = grafx_power_on(env, &mut rep) { return Err((e, rep)); }
     if let Err(e) = pm_power_on(env, &mut rep) { return Err((e, rep)); }
     if let Err(e) = clock_on(env, &mut rep) { return Err((e, rep)); }
+    if let Err(e) = pm_confirm(env, &mut rep) { return Err((e, rep)); }
     if let Err(e) = sms_power_on(&regs, env) { return Err((e, rep)); }
     match sms_reset(&regs, env) {
         Ok(v) => rep.sms_state = sms_state(v),

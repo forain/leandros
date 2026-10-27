@@ -7,8 +7,8 @@
 //! artifacts/notes/lane-piv3d-design-2026-10-26.md.
 //!
 //! Inert on failure: any failing step logs one `[v3d] fail ...` line, leaves
-//! [`DEVICE`] empty and the DRM backend on its stub path. `v3d.probe=0` on the
-//! kernel command line skips the probe entirely.
+//! [`DEVICE`] empty and the DRM backend on its stub path. The probe is opt-in:
+//! it runs only with `v3d.probe=1` on the kernel command line.
 pub mod regs;
 pub mod power;
 pub mod mmu;
@@ -25,12 +25,29 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub const PROBE_NONE: u32 = 0;
 /// Powered and identified; [`DEVICE`] holds the block.
 pub const PROBE_UP: u32 = 1;
-/// Skipped by `v3d.probe=0`.
+/// Skipped: opt-in only (`v3d.probe=1`) until the probe is proven on a Pi 5.
 pub const PROBE_SKIPPED: u32 = 2;
 /// A region could not be mapped.
 pub const PROBE_NOMAP: u32 = 3;
 /// Failed: `PROBE_FAILED_BASE + power::Step as u32`.
 pub const PROBE_FAILED_BASE: u32 = 0x100;
+/// An SError (async external abort) was pending after the probe touched the hardware;
+/// the block is treated as absent.
+pub const PROBE_SERROR: u32 = 4;
+
+/// `v3d.probe=1` opts in. The default is off: the first Pi 5 boot of the probe
+/// (2026-10-26) ended in an SError at the first EL0 entry.
+pub fn probe_enabled(cmdline: &str) -> bool {
+    cmdline.split_ascii_whitespace().any(|t| t == "v3d.probe=1")
+}
+
+/// After-probe SError check, provided by the arch layer: `Some(syndrome)` if an SError
+/// was pending (it has been consumed), `None` if clean.
+pub type SerrorCheck = fn() -> Option<u64>;
+
+pub fn serror_line(stage: &str, syndrome: u64) -> alloc::string::String {
+    alloc::format!("[v3d] fail serror stage={} syn=0x{:016x} (block left unused)\n", stage, syndrome)
+}
 
 /// Outcome of the boot probe, for debug readers and later phases.
 pub static PROBE_STATE: AtomicU32 = AtomicU32::new(PROBE_NONE);
@@ -54,8 +71,8 @@ pub fn ident_line(r: &power::ProbeReport) -> alloc::string::String {
 /// Formats the one failure line.
 pub fn fail_line(e: power::PowerError, r: &power::ProbeReport) -> alloc::string::String {
     alloc::format!(
-        "[v3d] fail {} {} val=0x{:08x} pm=0x{:08x}->0x{:08x} clk={}MHz\n",
-        e.step().name(), e.kind(), e.value(), r.pm_before, r.pm_after, r.clk_hz / 1_000_000
+        "[v3d] fail {} {} val=0x{:08x} grafx=0x{:08x}->0x{:08x} pm=0x{:08x}->0x{:08x} clk={}MHz\n",
+        e.step().name(), e.kind(), e.value(), r.grafx_before, r.grafx_after, r.pm_before, r.pm_after, r.clk_hz / 1_000_000
     )
 }
 
@@ -142,9 +159,9 @@ mod hw {
 
     /// Boot-time probe (task context, after kva is up). Never panics or hangs:
     /// every outcome is one `[v3d]` line and a [`PROBE_STATE`] value.
-    pub fn probe_boot(cmdline: &str, hhdm_offset: u64) {
-        if cmdline.split_ascii_whitespace().any(|t| t == "v3d.probe=0") {
-            serial_debug("[v3d] skipped (v3d.probe=0)\n");
+    pub fn probe_boot(cmdline: &str, hhdm_offset: u64, serror_check: SerrorCheck) {
+        if !probe_enabled(cmdline) {
+            serial_debug("[v3d] skipped (default off; v3d.probe=1 enables)\n");
             PROBE_STATE.store(PROBE_SKIPPED, Ordering::Relaxed);
             return;
         }
@@ -167,14 +184,23 @@ mod hw {
         crate::rpi_mailbox::set_mbox_virt(mbox);
         let mut env = Env { pm, hhdm: hhdm_offset as usize };
         let t0 = sched::monotonic_ns();
-        match power::power_on(MmioRegs { hub, core, sms }, &mut env) {
+        let res = power::power_on(MmioRegs { hub, core, sms }, &mut env);
+        // Bus errors from the accesses above are asynchronous: catch them here,
+        // attributed to the probe, instead of at the next EL0 entry.
+        if let Some(syn) = serror_check() {
+            if let Err((e, rep)) = &res { serial_debug(&fail_line(*e, rep)); }
+            serial_debug(&serror_line("power", syn));
+            PROBE_STATE.store(PROBE_SERROR, Ordering::Relaxed);
+            return;
+        }
+        match res {
             Ok((dev, rep)) => {
                 serial_debug(&ident_line(&rep));
                 serial_debug(&alloc::format!(
-                    "[v3d] regs hub_ident=0x{:08x},0x{:08x},0x{:08x},0x{:08x} core_ident=0x{:08x},0x{:08x},0x{:08x} mmu_debug=0x{:08x} pm=0x{:08x}->0x{:08x} t={}us\n",
+                    "[v3d] regs hub_ident=0x{:08x},0x{:08x},0x{:08x},0x{:08x} core_ident=0x{:08x},0x{:08x},0x{:08x} mmu_debug=0x{:08x} grafx=0x{:08x}->0x{:08x} pm=0x{:08x}->0x{:08x} t={}us\n",
                     rep.hub_ident0, rep.hub_ident1, rep.hub_ident2, rep.hub_ident3,
                     rep.core_ident0, rep.core_ident1, rep.core_ident2, rep.mmu_debug,
-                    rep.pm_before, rep.pm_after, (sched::monotonic_ns() - t0) / 1000
+                    rep.grafx_before, rep.grafx_after, rep.pm_before, rep.pm_after, (sched::monotonic_ns() - t0) / 1000
                 ));
                 *REPORT.lock() = Some(rep);
                 // Phase B (pv3d-mmu): MMU + IRQ lines, only after a successful probe. The
@@ -192,6 +218,12 @@ mod hw {
                 }
                 // Phase F (pv3d-mesa): the hardware is real and usable, so card0 and
                 // renderD128 answer as `v3d` from now on; no client cap or env needed.
+                if let Some(syn) = serror_check() {
+                    serial_debug(&serror_line("mmu-cl", syn));
+                    *DEVICE.lock() = None;
+                    PROBE_STATE.store(PROBE_SERROR, Ordering::Relaxed);
+                    return;
+                }
                 if super::submit::auto_arm_decision(mmu_up, cmdline) {
                     crate::drm_device_interface::v3d_arm_hw();
                     serial_debug("[v3d] armed: card0+renderD128 report v3d (auto, probe ok)\n");
