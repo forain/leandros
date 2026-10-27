@@ -136,7 +136,10 @@ pub fn init(cmdline: &str) {
 pub fn present() -> bool { PRESENT.load(Ordering::Acquire) }
 
 /// Register the control side for the netif `drivers/src/netdev.rs` gave us.
-pub fn attach(ifindex: u32, name: &str) -> bool { MGR.attach(ifindex, name) }
+pub fn attach(ifindex: u32, name: &str) -> bool {
+    cfg::NETCTL_IFINDEX.store(ifindex, Ordering::Relaxed);
+    MGR.attach(ifindex, name)
+}
 
 static SHUTDOWN_REQ: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);

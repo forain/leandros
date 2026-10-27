@@ -882,3 +882,31 @@ fn dump_line_round_trips_first_64_bytes_and_length() {
     let (len, bytes) = parse_dump_line(&fmt_dump_line(1, &[0xab; 10])).unwrap();
     assert_eq!((len, bytes), (10, vec![0xab; 10]));
 }
+
+/// Pi 5 with `pcie.rpi5=1`: eth0 (macb) registers first, wifi0 becomes netctl
+/// ifindex 3. The host 4-way handshake must not depend on that: EAPOL goes
+/// out through the firmware data path with the firmware's own MAC as source.
+#[test]
+fn host_handshake_ignores_the_netctl_ifindex_and_uses_the_firmware_mac() {
+    use crate::brcmf::cfg::NETCTL_IFINDEX;
+    use core::sync::atomic::Ordering;
+    let run = |ifindex: u32| {
+        NETCTL_IFINDEX.store(ifindex, Ordering::Relaxed);
+        let mut d = up();
+        d.fw.refuse = vec!["sup_wpa".into()];
+        let _tk = ap_handshake(&mut d, b"correct horse battery", [0x33u8; 16]);
+        let r = d.join(psk_req(), &mut Steps::default(), 5_000);
+        assert_eq!(r, Ok(()), "ifindex {}: fail_cmd {}", ifindex, d.fail_cmd);
+        let mac = d.mac;
+        let tx: Vec<Vec<u8>> = d.fw.calls.iter().filter_map(|c| match c { Call::Tx(f) => Some(f.clone()), _ => None }).collect();
+        assert_eq!(tx.len(), 2, "M2 + M4");
+        for f in &tx {
+            assert_eq!(&f[0..6], &AP, "EAPOL to the AP");
+            assert_eq!(&f[6..12], &mac, "EAPOL from the firmware MAC");
+            assert_eq!(&f[12..14], &[0x88, 0x8e]);
+        }
+        tx.len()
+    };
+    assert_eq!(run(2), run(3));
+    NETCTL_IFINDEX.store(0, Ordering::Relaxed);
+}
