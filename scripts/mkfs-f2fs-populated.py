@@ -2953,6 +2953,13 @@ def main():
         for ino in sorted(m5_exec_by_ino):
             add_files_to_dir(ino, m5_exec_by_ino[ino])
 
+    # scripts/pi_sync.py: describe the tree (paths, modes, owners, sha256) and
+    # stop; no image is written.
+    _manifest_dir = os.environ.get("LEANDROS_ROOT_MANIFEST")
+    if _manifest_dir:
+        n = lx_pop.manifest(_manifest_dir, dir_nodes, dir_owner)
+        print(f"Wrote root manifest ({n} inodes) to {_manifest_dir}/manifest.json")
+        return
     import time
     t0 = time.time()
     info = lx_pop.finish(out_file, total_segs, dir_nodes, dir_owner, subdirs, BUILD_TIME,
