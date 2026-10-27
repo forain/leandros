@@ -6,7 +6,27 @@
 //! the fixed virtio-style naming the SD driver already mirrors (the card is
 //! index 1, i.e. `vdb` — see `sdhci::init`).
 
-pub use crate::sdhci::{device_count, flush, has_f2fs, info, init, read_block, read_blocks, write_block};
+pub use crate::sdhci::{device_count, flush, has_f2fs, info, init};
+
+const SD_BLOCK: usize = 4096;
+/// SD I/O lights the Pi 5 ACT LED (DTB `led-act` trigger `mmc0`).
+#[inline]
+fn act() {
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    crate::pi5_board::act_activity();
+}
+pub fn read_block(dev_idx: usize, blk: u64, buf: &mut [u8; SD_BLOCK]) -> bool {
+    act();
+    crate::sdhci::read_block(dev_idx, blk, buf)
+}
+pub fn read_blocks(dev_idx: usize, blk: u64, buf: &mut [u8]) -> bool {
+    act();
+    crate::sdhci::read_blocks(dev_idx, blk, buf)
+}
+pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; SD_BLOCK]) -> bool {
+    act();
+    crate::sdhci::write_block(dev_idx, blk, buf)
+}
 pub use crate::blockdev::{
     is_f2fs_block0, parse_root_arg, BlkErr, BlockDevice, BootDisk, DiskDesc, RootErr, NAME_MAX,
 };

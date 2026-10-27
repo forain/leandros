@@ -50,13 +50,9 @@ pub fn attach(bar1: usize, bar1_size: u64) {
 }
 
 /// RP1 GPIO 42 (USB_VBUS_EN) as a plain output, high: port power on.
-fn vbus_on(bar1: usize) {
-    let Some((ctrl, rio, pad, bit)) = hw::rp1_gpio_regs(d::RP1_USB_VBUS_GPIO) else { return };
-    w(bar1 + rio + hw::RIO_SET + hw::RIO_OUT, bit);
-    w(bar1 + rio + hw::RIO_SET + hw::RIO_OE, bit);
-    w(bar1 + pad, (r(bar1 + pad) & !hw::RP1_PAD_OD) | hw::RP1_PAD_IE);
-    w(bar1 + ctrl, (r(bar1 + ctrl) & !0x1f) | hw::RP1_FSEL_SYS_RIO);
-    log("[rp1usb] vbus on (gpio42)\n");
+fn vbus_on(_bar1: usize) {
+    if crate::rp1_gpio::output(d::RP1_USB_VBUS_GPIO, true) { log("[rp1usb] vbus on (gpio42)\n"); }
+    else { log("[rp1usb] FAIL vbus gpio42\n"); }
 }
 
 /// DWC3 global setup for host mode. Returns the base on success.

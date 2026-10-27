@@ -1,0 +1,15 @@
+# Host unit tests for drivers/src/rp1_hw.rs (RP1 clock, GPIO and PWM register
+# math; Pi 5 fan curve, LED/button GPIO bits). Its own workspace so it builds
+# for the host:
+#
+#   cd drivers/rp1-tests && cargo test --target aarch64-apple-darwin
+[package]
+name = "rp1-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
