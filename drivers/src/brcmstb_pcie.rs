@@ -8,8 +8,10 @@
 //! `[pcie] ...` line, leaves the bus unregistered and boot continues.
 //!
 //! Sequence (Linux `brcm_pcie_probe` / `brcm_pcie_setup` / `brcm_pcie_start_link`):
-//!  1. rescal reset pulse; bridge SW_INIT asserted; PERST# asserted;
-//!  2. bridge out of reset, SerDes out of IDDQ;
+//!  1. rescal reset pulse; bridge reset pulse through the brcmstb-reset
+//!     controller (bit 44) with no RC access while it is asserted;
+//!  2. bridge release confirmed by SW_INIT status + an RC REVISION read,
+//!     then PERST# asserted and the SerDes out of IDDQ;
 //!  3. 54 MHz PLL setup over MDIO, L1SS PM clock period;
 //!  4. MISC_CTRL (SCB access, UR-on-read, 512 B burst), UBUS error suppression
 //!     (reads that fail return all-ones instead of an SError) and timeouts;
@@ -44,6 +46,8 @@ pub fn state() -> &'static str {
         4 => "mdio-timeout",
         5 => "link-down",
         7 => "stopped",
+        8 => "bridge-stuck",
+        9 => "rc-dead",
         _ => "no-rp1",
     }
 }
@@ -86,11 +90,19 @@ fn rescal_reset(base: usize) -> bool {
     }
 }
 
-fn bridge_reset(swinit: usize, assert: bool) {
-    let (bank, bit) = hw::sw_init_set(hw::PCIE2_BRIDGE_RESET_ID);
-    let off = bank + if assert { 0 } else { hw::SW_INIT_CLEAR };
-    unsafe { leandros_lib::mmio::write((swinit + off) as *mut u32, bit) };
-    sched::kthread::udelay(200);
+/// Real MMIO behind the host-tested [`hw::PcieBus`] sequencing.
+struct MmioBus { rc: usize, swinit: usize }
+
+impl hw::PcieBus for MmioBus {
+    fn rd(&mut self, blk: hw::Blk, off: usize) -> u32 {
+        let base = match blk { hw::Blk::Rc => self.rc, hw::Blk::SwInit => self.swinit };
+        unsafe { leandros_lib::mmio::read((base + off) as *const u32) }
+    }
+    fn wr(&mut self, blk: hw::Blk, off: usize, v: u32) {
+        let base = match blk { hw::Blk::Rc => self.rc, hw::Blk::SwInit => self.swinit };
+        unsafe { leandros_lib::mmio::write((base + off) as *mut u32, v) }
+    }
+    fn udelay(&mut self, us: u32) { sched::kthread::udelay(us as u64) }
 }
 
 fn perst(assert: bool) {
@@ -227,20 +239,34 @@ fn init_inner() {
     }
 
     if !reuse {
-        // 1. Resets (Linux brcm_pcie_setup order for BCM2712).
+        // 1. Resets (Linux brcm_pcie_setup order for BCM2712): bridge reset
+        //    pulse with NO RC access while it is asserted (the RC block
+        //    does not answer then; a read stalls the CPU forever).
+        let mut bus = MmioBus { rc: regs, swinit };
         if !stage(5) { REGS.store(0, Ordering::Release); return; }
-        bridge_reset(swinit, true);
-        perst(true);
-        sched::kthread::udelay(200);
+        let st = hw::bridge_assert(&mut bus);
+        raw_hex("[pcie] bridge asserted swinit=", st as u64);
+        raw("\n");
         if !stage(6) { REGS.store(0, Ordering::Release); return; }
-        bridge_reset(swinit, false);
-        // 2. SerDes power-up.
+        match hw::bridge_release(&mut bus) {
+            Ok(rev) => { raw_hex("[pcie] bridge released rc rev=", rev as u64); raw("\n"); }
+            Err(hw::BridgeErr::StuckInReset) => {
+                REGS.store(0, Ordering::Release);
+                return fail(8, "bridge stuck in reset");
+            }
+            Err(hw::BridgeErr::RcDead(v)) => {
+                REGS.store(0, Ordering::Release);
+                raw_hex("[pcie] rc dead after release rev=", v as u64);
+                raw("\n");
+                return fail(9, "rc not answering");
+            }
+        }
+        // 2. First RC writes: PERST# asserted, SerDes power-up.
         if !stage(7) { REGS.store(0, Ordering::Release); return; }
-        rmw(hw::HARD_DEBUG, hw::HARD_DEBUG_SERDES_IDDQ, 0);
-        sched::kthread::udelay(200);
-        log("[pcie] rc rev ");
-        print_hex(rd(hw::MISC_REVISION) as u64);
-        log("\n");
+        hw::perst_serdes(&mut bus);
+        raw_hex("[pcie] perst+serdes ctrl=", rd(hw::MISC_PCIE_CTRL) as u64);
+        raw_hex(" hard_debug=", rd(hw::HARD_DEBUG) as u64);
+        raw("\n");
 
         // 3. 54 MHz reference-clock PLL, L1SS PM clock period (18.52 ns).
         if !stage(8) { REGS.store(0, Ordering::Release); return; }

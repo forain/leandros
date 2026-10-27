@@ -119,6 +119,7 @@ mod tests {
         assert_eq!(parse_stop("pcie.stop=x"), LAST_STAGE);
         assert_eq!(stage_name(0), "idle");
         assert_eq!(stage_name(4), "rc-read");
+        assert_eq!(stage_name(7), "perst-serdes");
         assert_eq!(stage_name(12), "link-poll");
         assert_eq!(stage_name(LAST_STAGE), "rp1-probe");
         assert_eq!(stage_name(LAST_STAGE + 1), "?");
@@ -140,5 +141,94 @@ mod tests {
         // brcmstb-reset: bank = id / 32, 0x18 per bank; SET/CLEAR/STATUS at +0/+4/+8.
         assert_eq!(sw_init_set(PCIE2_BRIDGE_RESET_ID), (0x18, 1 << 12));
         assert_eq!((SW_INIT_CLEAR, SW_INIT_STATUS), (0x4, 0x8));
+    }
+
+    /// Recording mock of the reset controller + RC: models the BCM2712 rule
+    /// that the RC block does not answer while the bridge reset is asserted
+    /// (an access then is recorded as a hang).
+    struct Mock { bridge: bool, stuck: bool, rc_rev: u32, ctrl: u32, hd: u32, log: Vec<(Blk, bool, usize, u32)>, hung: bool }
+    impl Mock {
+        fn new() -> Self { Mock { bridge: false, stuck: false, rc_rev: 0x500, ctrl: 0, hd: HARD_DEBUG_SERDES_IDDQ, log: Vec::new(), hung: false } }
+        fn rc_writes(&self) -> Vec<(usize, u32)> { self.log.iter().filter(|e| e.0 == Blk::Rc && e.1).map(|e| (e.2, e.3)).collect() }
+    }
+    impl PcieBus for Mock {
+        fn rd(&mut self, blk: Blk, off: usize) -> u32 {
+            let (bank, bit) = sw_init_set(PCIE2_BRIDGE_RESET_ID);
+            let v = match blk {
+                Blk::SwInit => { assert_eq!(off, bank + SW_INIT_STATUS); if self.bridge { bit } else { 0 } }
+                Blk::Rc => {
+                    if self.bridge { self.hung = true; }
+                    match off { MISC_REVISION => self.rc_rev, MISC_PCIE_CTRL => self.ctrl, HARD_DEBUG => self.hd, _ => 0 }
+                }
+            };
+            self.log.push((blk, false, off, v));
+            v
+        }
+        fn wr(&mut self, blk: Blk, off: usize, v: u32) {
+            let (bank, bit) = sw_init_set(PCIE2_BRIDGE_RESET_ID);
+            match blk {
+                Blk::SwInit => {
+                    assert_eq!(v, bit);
+                    if off == bank { self.bridge = true; }
+                    else if off == bank + SW_INIT_CLEAR { if !self.stuck { self.bridge = false; } }
+                    else { panic!("bad swinit write {off:#x}"); }
+                }
+                Blk::Rc => {
+                    if self.bridge { self.hung = true; }
+                    match off { MISC_PCIE_CTRL => self.ctrl = v, HARD_DEBUG => self.hd = v, _ => {} }
+                }
+            }
+            self.log.push((blk, true, off, v));
+        }
+        fn udelay(&mut self, _us: u32) {}
+    }
+
+    #[test]
+    fn bridge_reset_never_touches_rc_while_asserted() {
+        let mut m = Mock::new();
+        let st = bridge_assert(&mut m);
+        assert_eq!(st, 1 << 12); // id 44 = bank 1 bit 12
+        assert!(m.log.iter().all(|e| e.0 == Blk::SwInit));
+        assert_eq!(m.log[0], (Blk::SwInit, true, 0x18, 1 << 12));
+        assert_eq!(bridge_release(&mut m), Ok(0x500));
+        perst_serdes(&mut m);
+        assert!(!m.hung, "RC accessed while bridge in reset");
+        // PERST# already asserted (ctrl=0 at hand-over): only HARD_DEBUG is written.
+        assert_eq!(m.rc_writes(), vec![(HARD_DEBUG, 0)]);
+        // Firmware left PERST# released: it is asserted first.
+        let mut m = Mock::new();
+        m.ctrl = PCIE_CTRL_PERSTB | 0x1;
+        bridge_assert(&mut m);
+        bridge_release(&mut m).unwrap();
+        perst_serdes(&mut m);
+        assert!(!m.hung);
+        assert_eq!(m.rc_writes(), vec![(MISC_PCIE_CTRL, 0x1), (HARD_DEBUG, 0)]);
+    }
+
+    #[test]
+    fn old_sequence_is_caught_by_the_mock() {
+        // pipcie2 order: SW_INIT set, then PERST# rmw on MISC_PCIE_CTRL — the Pi 5 hang.
+        let mut m = Mock::new();
+        let (bank, bit) = sw_init_set(PCIE2_BRIDGE_RESET_ID);
+        m.wr(Blk::SwInit, bank, bit);
+        let c = m.rd(Blk::Rc, MISC_PCIE_CTRL);
+        m.wr(Blk::Rc, MISC_PCIE_CTRL, c & !PCIE_CTRL_PERSTB);
+        assert!(m.hung);
+    }
+
+    #[test]
+    fn bridge_stuck_or_rc_dead_stops_before_rc_writes() {
+        let mut m = Mock::new();
+        m.stuck = true;
+        bridge_assert(&mut m);
+        assert_eq!(bridge_release(&mut m), Err(BridgeErr::StuckInReset));
+        assert!(!m.hung && m.log.iter().all(|e| e.0 == Blk::SwInit));
+        for bad in [0u32, 0xffff_ffff] {
+            let mut m = Mock::new();
+            m.rc_rev = bad;
+            bridge_assert(&mut m);
+            assert_eq!(bridge_release(&mut m), Err(BridgeErr::RcDead(bad)));
+            assert!(m.rc_writes().is_empty());
+        }
     }
 }
