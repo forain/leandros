@@ -42,3 +42,5 @@
   click-through not done. If the user's session menu still fails on the laptop, capture
   cosmic-osd's log + the `[init] ... requested by` line (a DENIED line names the pid whose
   ancestry is not under greetd).
+
+- Merge note: leandros-sysbus is staged into the SHARED m5-session-ship dir by every lane build; a concurrent lane build overwrote it once (power subcommand missing). After merge, main carries it.
