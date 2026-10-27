@@ -823,6 +823,7 @@ def do_reboot(t, timeout, expect_kid=None, logs=True, wait=True):
 
 # ── Raspberry Pi 5: kernels in the root, entered by kexec ─────────────────
 PI_DIR = "/boot/pi"
+PI_APPEND_MARK = "pi.append=1"   # marks where pi-boot/pi-deploy extras start on the kernel cmdline
 PI_KERNEL_PHYS = 0x20_0000  # build-all.sh --rpi5 links kernel-direct here
 
 
@@ -860,8 +861,11 @@ def pi_kexec(t, slot, append, timeout):
     if t.run(f"test -s {d}/kernel && test -s {d}/initrd", check=False).returncode != 0:
         die(f"no kernel/initrd in {d}")
     before = t.out("uname -v").strip()
-    ap = f" --append={shlex.quote(append)}" if append else ""
-    t.out(f"/bin/kexec -l {d}/kernel --initrd={d}/initrd --reuse-cmdline{ap}")
+    # --append is per boot, not cumulative: the running cmdline is cut at the
+    # PI_APPEND_MARK an earlier pi-boot/pi-deploy put before its own extras.
+    base = t.out("cat /proc/cmdline").strip().split(f" {PI_APPEND_MARK}")[0].strip()
+    cmd = f"{base} {PI_APPEND_MARK} {append}" if append else base
+    t.out(f"/bin/kexec -l {d}/kernel --initrd={d}/initrd --command-line={shlex.quote(cmd)}")
     t.run("echo remdbg > /tmp/.remdbg-alive && sync", check=False, timeout=60)
     print(f"kexec into {slot} on {t.label()} (was: {before})")
     t0 = time.time()
