@@ -34,6 +34,10 @@
 #define BUF(n) static char n[2 * PG] __attribute__((aligned(PG)))
 BUF(b_console); BUF(b_pipe); BUF(b_readv1); BUF(b_readv2); BUF(b_write);
 BUF(b_file); BUF(b_sock); BUF(b_pty);
+/* .data twins: file-backed private pages of the exec image, absent until the
+ * first touch — the shape that made the console read answer EFAULT. */
+#define DBUF(n) static char n[2 * PG] __attribute__((aligned(PG))) = { 1 }
+DBUF(d_console); DBUF(d_pipe); DBUF(d_file); DBUF(d_sock);
 
 static int fails;
 static void result(const char *name, int ok, const char *why) {
@@ -48,13 +52,13 @@ static void check_n(const char *name, ssize_t r, ssize_t want, const char *got, 
     result(name, 1, NULL);
 }
 
-static void console_read(void) {
-    if (!isatty(0) || !isatty(1)) { printf("console_read: SKIP - stdio is not a tty\n"); return; }
-    if (write(1, "\x1b[6n", 4) != 4) { result("console_read", 0, "CPR write failed"); return; }
-    ssize_t r = read(0, b_console, PG);
+static void console_read(const char *name, char *b) {
+    if (!isatty(0) || !isatty(1)) { printf("%s: SKIP - stdio is not a tty\n", name); return; }
+    if (write(1, "\x1b[6n", 4) != 4) { result(name, 0, "CPR write failed"); return; }
+    ssize_t r = read(0, b, PG);
     char why[96];
-    if (r < 0) { snprintf(why, sizeof why, "returned -1 errno %d (%s)", errno, strerror(errno)); result("console_read", 0, why); return; }
-    result("console_read", r >= 6 && b_console[0] == 0x1b && b_console[r - 1] == 'R', r >= 6 ? NULL : "short reply");
+    if (r < 0) { snprintf(why, sizeof why, "returned -1 errno %d (%s)", errno, strerror(errno)); result(name, 0, why); return; }
+    result(name, r >= 6 && b[0] == 0x1b && b[r - 1] == 'R', r >= 6 ? NULL : "short reply");
 }
 
 static void pipe_cases(void) {
@@ -66,8 +70,11 @@ static void pipe_cases(void) {
     write(p[1], "abcdefgh", 8);
     struct iovec iov[2] = { { b_readv1, 3 }, { b_readv2, PG } };
     ssize_t r = readv(p[0], iov, 2);
-    check_n("pipe_readv", r, 8, b_readv1, "abc");
-    if (r == 8 && memcmp(b_readv2, "defgh", 5) != 0) result("pipe_readv_tail", 0, "wrong bytes");
+    if (r == 8 && (memcmp(b_readv1, "abc", 3) != 0 || memcmp(b_readv2, "defgh", 5) != 0)) r = -2;
+    if (r == -2) result("pipe_readv", 0, "wrong bytes"); else check_n("pipe_readv", r, 8, NULL, NULL);
+
+    write(p[1], "datapipe", 8);
+    check_n("pipe_read_data", read(p[0], d_pipe, PG), 8, d_pipe, "datapipe");
 
     r = write(p[1], b_write, PG);
     static char back[PG];
@@ -87,6 +94,8 @@ static void file_read(void) {
     write(fd, "filedata", 8);
     lseek(fd, 0, SEEK_SET);
     check_n("file_read", read(fd, b_file, PG), 8, b_file, "filedata");
+    lseek(fd, 0, SEEK_SET);
+    check_n("file_read_data", read(fd, d_file, PG), 8, d_file, "filedata");
     close(fd); unlink(path);
 }
 
@@ -95,6 +104,8 @@ static void sock_read(void) {
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) { result("sock_read", 0, "socketpair"); return; }
     write(sv[1], "sockdata", 8);
     check_n("sock_read", read(sv[0], b_sock, PG), 8, b_sock, "sockdata");
+    write(sv[1], "sockdat2", 8);
+    check_n("sock_read_data", read(sv[0], d_sock, PG), 8, d_sock, "sockdat2");
     close(sv[0]); close(sv[1]);
 }
 
@@ -105,8 +116,7 @@ static void pty_read(void) {
     if (s < 0) { result("pty_read", 0, "open slave"); close(m); return; }
     write(m, "ptyline\n", 8);
     ssize_t r = read(s, b_pty, PG);
-    if (r > 0 && b_pty[r - 1] == '\n') r = 8; /* "ptyline\n" (icrnl may not apply) */
-    check_n("pty_read", r, 8, b_pty, "ptyline");
+    check_n("pty_read", r, 8, b_pty, "ptyline\n");
     close(s); close(m);
 }
 
@@ -122,7 +132,8 @@ static void anon_read(void) {
 
 int main(int argc, char **argv) {
     int only_console = argc > 1 && strcmp(argv[1], "console") == 0;
-    console_read();
+    console_read("console_read", b_console);
+    console_read("console_read_data", d_console);
     if (!only_console) { pipe_cases(); file_read(); sock_read(); pty_read(); anon_read(); }
     printf("uaccesstest: %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
