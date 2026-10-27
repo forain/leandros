@@ -34,3 +34,4 @@ seen from cpu1). No `[pcie]` line, no SError. Without the knob the kernel boots 
 ## Stage table
 1 map, 2 swinit-read, 3 rescal, 4 rc-read, 5 bridge-assert, 6 bridge-release, 7 serdes, 8 pll, 9 misc, 10 windows,
 11 link-params, 12 link-poll, 13 bus-numbers, 14 rp1-id, 15 rp1-bars, 16 rp1-probe.
+- aarch64 QEMU virt regress: all suites RC=0 except sigtest2 sigtimedwait_parks (timing); rerun /bin/sigtest2 PASS. New code runs only on the rpi5 build with pcie.rpi5=1.
