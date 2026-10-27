@@ -357,7 +357,7 @@ impl<F: Fwil> BrcmfRadio<F> {
         *COUNTERS.lock() = self.dev.counters_line();
         *FW_CAPS.lock() = self.dev.caps.clone().unwrap_or_else(|| String::from("unknown (cap refused)"));
         *JOIN_OPTS.lock() = self.dev.opts.describe();
-        *RSN_INFO.lock() = self.dev.rsn.lines().iter().map(|(k, v)| (*k, v.clone())).collect();
+        *RSN_INFO.lock() = self.dev.rsn.lines().iter().map(|(k, v)| (*k, String::clone(v))).collect();
         let Some(text) = self.ctl.as_mut().and_then(|c| c.poll()) else { return };
         let text = String::from(text.trim());
         match cfg::parse_ctl(&text) {
@@ -383,7 +383,7 @@ impl<F: Fwil> BrcmfRadio<F> {
                 let bad = self.dev.opts.apply(&knobs);
                 if !bad.is_empty() { log(&alloc::format!("ctl: join: unknown knob(s) {:?} ignored", bad)); }
                 *JOIN_OPTS.lock() = self.dev.opts.describe();
-        *RSN_INFO.lock() = self.dev.rsn.lines().iter().map(|(k, v)| (*k, v.clone())).collect();
+        *RSN_INFO.lock() = self.dev.rsn.lines().iter().map(|(k, v)| (*k, String::clone(v))).collect();
                 log(&alloc::format!("ctl: join opts: {}", self.dev.opts.describe()));
                 self.ctl_join(ssid)
             }
