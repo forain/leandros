@@ -54,16 +54,18 @@ pub(crate) fn log(service: &str, msg: std::fmt::Arguments<'_>) {
     eprintln!("leandros-sysbus[{service}]: {msg}");
 }
 
-/// The bus services this binary serves, as a marker the image build reads out
-/// of the staged binary (scripts/mkfs-f2fs-populated.py): every
-/// `Exec=/usr/libexec/leandros-sysbus <name>` in ports/dbus/session-pkg/services
-/// must be listed here, or mkfs refuses the image. ~/code/leandros-artifacts is
-/// shared by every worktree, so a sysbus rebuilt from an older tree would
-/// otherwise silently drop a service. Keep it in sync with the match in main().
-const SERVICES: &str = "leandros-sysbus-services:login1,locale1,upower,power-profiles,polkit,rtkit,networkmanager,bluez;";
+/// Every subcommand this binary implements (bus services and clients), as a
+/// marker the image build reads out of the staged binary
+/// (scripts/mkfs-f2fs-populated.py) and compares with THIS line in the tree
+/// being packed: any difference means the staged binary was built from
+/// another tree and mkfs refuses the image. ~/code/leandros-artifacts is
+/// shared by every worktree, so a sysbus rebuilt by a lane on an older tree
+/// would otherwise silently drop e.g. `bluez` or `power`. Add every new
+/// subcommand here.
+const SERVICES: &str = "leandros-sysbus-services:login1,locale1,upower,power-profiles,polkit,rtkit,networkmanager,bluez,bluez-test,probe,power,portal;";
 
 fn usage() -> ExitCode {
-    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|networkmanager|bluez|bluez-test|probe|portal [settings|screenshot|open-file|all] [timeout_s]>");
+    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|networkmanager|bluez|bluez-test|probe|power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>|portal [settings|screenshot|open-file|all] [timeout_s]>");
     eprintln!("{SERVICES}");
     ExitCode::from(2)
 }
@@ -96,6 +98,30 @@ fn main() -> ExitCode {
             let t = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(30);
             let (_pass, fail) = portal_probe::run(builder.build().await?, &what, t).await;
             return Ok(Some(fail == 0));
+        }
+        if which == "power" {
+            // Client: `leandros-sysbus power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>`
+            // calls login1 on the system bus the way systemctl/loginctl do;
+            // /bin/poweroff, reboot, halt and systemctl use it for a non-root
+            // caller. Can* print logind's answer ("yes", "na", ...).
+            let method = std::env::args().nth(2).unwrap_or_default();
+            if !matches!(
+                method.as_str(),
+                "PowerOff" | "Reboot" | "Halt" | "CanPowerOff" | "CanReboot" | "CanHalt"
+            ) {
+                return Ok(None);
+            }
+            let conn = builder.build().await?;
+            let (dest, path, iface) =
+                (Some("org.freedesktop.login1"), "/org/freedesktop/login1", Some("org.freedesktop.login1.Manager"));
+            if method.starts_with("Can") {
+                let reply = conn.call_method(dest, path, iface, method.as_str(), &()).await?;
+                let answer: String = reply.body().deserialize()?;
+                println!("{answer}");
+                return Ok(Some(answer == "yes"));
+            }
+            conn.call_method(dest, path, iface, method.as_str(), &(false,)).await?;
+            return Ok(Some(true));
         }
         if which == "bluez-test" {
             let (_pass, fail) = bluez::test::run(builder.build().await?).await;

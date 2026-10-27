@@ -365,18 +365,23 @@ def verify_dbus_staging(arch):
             elif exec_line[0].endswith("/leandros-sysbus"):
                 # Feature check, not just mtime: the staged binary lives in the
                 # SHARED ~/code/leandros-artifacts, so a lane that rebuilds
-                # sysbus from an older tree overwrites it with a NEWER binary
-                # that lacks a service (the mtime test below passes). The
-                # binary carries "leandros-sysbus-services:a,b,...;" (main.rs).
+                # sysbus from another tree overwrites it with a NEWER binary
+                # that lacks a subcommand (bluez, power, ...) and the mtime
+                # test below passes. The binary carries the subcommand list
+                # "leandros-sysbus-services:a,b,...;" (ports/sysbus/src/main.rs
+                # SERVICES); it must equal this tree's, and name this .service.
+                _pat = rb"leandros-sysbus-services:([a-z0-9,-]*);"
                 with open(staged_bin, "rb") as _bf:
-                    _blob = _bf.read()
-                _m = re.search(rb"leandros-sysbus-services:([a-z0-9,-]*);", _blob)
-                _have = set(_m.group(1).decode().split(",")) if _m else set()
+                    _m = re.search(_pat, _bf.read())
+                with open(os.path.join(repo, "ports", "sysbus", "src", "main.rs"), "rb") as _sf:
+                    _t = re.search(_pat, _sf.read())
+                _have = _m.group(1).decode() if _m else "no marker"
+                _tree = _t.group(1).decode() if _t else ""
                 _want = exec_line[1] if len(exec_line) > 1 else ""
-                if _want not in _have:
-                    problems.append(f"  STALE    {exec_line[0]} ({arch}) does not serve '{_want}' "
-                                    f"(services/{fn}); it was built from an older tree "
-                                    f"(serves: {','.join(sorted(_have)) or 'no marker'}).\n"
+                if _have != _tree or _want not in _tree.split(","):
+                    problems.append(f"  STALE    {exec_line[0]} ({arch}) was built from another tree:\n"
+                                    f"           staged serves [{_have}], this tree [{_tree}] "
+                                    f"(services/{fn} needs '{_want}').\n"
                                     f"           rebuild from this tree: ./ports/sysbus/build.sh {arch}")
                 # lib/netctl-abi too: the NetworkManager shim links it, and an
                 # ABI change the staged binary predates is exactly the stale
@@ -431,7 +436,7 @@ def main():
     # path makes all three names hardlinks to one inode.
     p = os.path.join(userland_dir, "poweroff")
     if os.path.exists(p):
-        for name in ("poweroff", "reboot", "halt"):
+        for name in ("poweroff", "reboot", "halt", "systemctl"):
             bin_files.append((name, p, 0o100755))
 
     # exectest's `#!` fixtures. The modes are the test: exectest-noexec.sh must
@@ -1192,6 +1197,11 @@ def main():
     if os.path.isfile(_net_auto):
         bin_files.append(("net-autotest", _net_auto, 0o100755))
 
+    # /bin/dmesg: the kernel's RAM log ring (/proc/klog), optional substring filter.
+    _dmesg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                          "userland", "dmesg", "dmesg.sh")
+    if os.path.isfile(_dmesg):
+        bin_files.append(("dmesg", _dmesg, 0o100755))
     # /bin/wifiscan: the iwlwifi driver's last scan (/proc/net/wifi).
     _wifiscan = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                              "userland", "wifiscan", "wifiscan.sh")
