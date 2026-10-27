@@ -197,10 +197,14 @@ fn attempt(mut host: SdioHost<Mmio>, dt_mac: Option<[u8; 6]>, o: &Opts) -> Outco
     };
     // Which image this is: the RTE version string sits near the end of the image.
     let tail = &code[code.len().saturating_sub(4096)..];
-    let fwver = tail.windows(8).position(|w| w == b"Version:").map(|i| {
-        let s = &tail[i..];
-        let end = s.iter().position(|&c| c == 0 || c == b'\n').unwrap_or(s.len()).min(96);
-        String::from_utf8_lossy(&s[..end]).into_owned()
+    // The whole trailer string: "<chip>-roml/<features incl. -sr-> Version: x CRC: y Date: z".
+    let fwver = tail.windows(8).rposition(|w| w == b"Version:").map(|i| {
+        let start = tail[..i].iter().rposition(|&c| c == 0 || c == b'\n').map_or(0, |p| p + 1);
+        let s = &tail[start..];
+        let end = s.iter().position(|&c| c == 0 || c == b'\n').unwrap_or(s.len());
+        let t = String::from_utf8_lossy(&s[..end]).into_owned();
+        let cut = t.len().saturating_sub(320);
+        String::from(t.get(cut..).unwrap_or(&t))
     }).unwrap_or_else(|| String::from("Version:?"));
     log(&format!("files fw {} {}B nvram {}B clm {}B rstvec {:#x} {}", o.fw, code.len(), nvram.len(), clm.len(),
                  u32::from_le_bytes([code[0], code[1], code[2], code[3]]), fwver));
