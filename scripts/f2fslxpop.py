@@ -77,6 +77,46 @@ class Pop:
                 self.by_path[key] = nid
             self.entries.append((parent_ino, name.encode(), nid, dt))
 
+    def manifest(self, out_dir, dir_nodes, dir_owner):
+        """Writes <out_dir>/manifest.json describing the tree instead of an image
+        (scripts/pi_sync.py: update a live root in place). Inline (bytes) contents
+        are saved as <out_dir>/blobs/<sha256>; hardlinked names share one entry."""
+        import hashlib, json
+        os.makedirs(os.path.join(out_dir, "blobs"), exist_ok=True)
+        names = {}
+        for pino, name, nid, _dt in self.entries:
+            d = dir_nodes[pino]
+            names.setdefault(nid, []).append((d.rstrip("/") + "/" + name.decode()))
+        files = []
+        for nid in self.order:
+            f = self.files[nid]
+            src = f["path"]
+            if isinstance(src, (bytes, bytearray)):
+                data = bytes(src)
+            else:
+                with open(src, "rb") as fh:
+                    data = fh.read()
+            sha = hashlib.sha256(data).hexdigest()
+            e = dict(paths=names[nid], mode=f["mode"], uid=f["uid"], gid=f["gid"],
+                     size=len(data), sha256=sha)
+            if (f["mode"] & S_IFMT) == S_IFLNK:
+                e["target"] = data.decode()
+            elif isinstance(src, (bytes, bytearray)):
+                blob = os.path.join(out_dir, "blobs", sha)
+                with open(blob, "wb") as fh:
+                    fh.write(data)
+                e["src"] = blob
+            else:
+                e["src"] = os.path.abspath(src)
+            files.append(e)
+        dirs = []
+        for ino in sorted(dir_nodes, key=lambda i: dir_nodes[i]):
+            mode, uid, gid = dir_owner.get(ino, (0o040755, 0, 0))
+            dirs.append(dict(path=dir_nodes[ino], mode=mode, uid=uid, gid=gid))
+        with open(os.path.join(out_dir, "manifest.json"), "w") as fh:
+            json.dump(dict(dirs=dirs, files=files), fh)
+        return len(files)
+
     def finish(self, out_path, total_segs, dir_nodes, dir_owner, subdirs, build_time, label=None):
         # ---- geometry (mirrors mkfs-f2fs-home.py) ----
         sit_blocks = -(-total_segs // SIT_PER_BLK)
