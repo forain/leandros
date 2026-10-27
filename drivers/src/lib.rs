@@ -87,6 +87,10 @@ pub mod wifi_mgr;
 /// Broadcom/Cypress FullMAC Wi-Fi (CYW43455, Raspberry Pi 5).
 pub mod brcmf;
 pub mod bcm2712_id;
+/// BCM2712 GPIO (gio/gio_aon), pin mux (C0/D0) and l2 interrupt controllers.
+pub mod bcm2712_gpio;
+/// Pi 5 board serial and factory MACs from the OTP (firmware mailbox).
+pub mod bcm2712_otp;
 /// Pi 5 Wi-Fi boot bring-up: sdio2 host → firmware → "ver" (rpi5 only).
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod brcmf_boot;

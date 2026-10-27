@@ -89,7 +89,9 @@ pub fn start(cmdline: &str) {
     };
     STATE.store(STATE_RUNNING, Ordering::Release);
     // Read the MAC now, while the boot DTB is certainly mapped.
-    let mac = unsafe { boot::device_tree::recorded_dtb() }.and_then(fdt_fmac_mac);
+    // Fallback: the board OTP's Ethernet MAC + 1 (bcm2712_otp), as the Pi firmware assigns it.
+    let mac = unsafe { boot::device_tree::recorded_dtb() }.and_then(fdt_fmac_mac).map(|m| (m, "dtb"))
+        .or_else(|| crate::bcm2712_otp::wifi_mac().map(|m| (m, "otp")));
     if sched::kthread::spawn("brcmf", move || run(host, mac)).is_none() {
         fail("thread-spawn");
     }
@@ -177,7 +179,7 @@ fn dump_diag(bus: &mut SdioHost<Mmio>, chip: &mut Chip, lines: usize) {
     }
 }
 
-fn attempt(mut host: SdioHost<Mmio>, dt_mac: Option<[u8; 6]>, o: &Opts) -> Outcome {
+fn attempt(mut host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>, o: &Opts) -> Outcome {
     // All files before touching the chip, so a missing file leaves it untouched.
     let code = match load(&o.fw, FW_MAX) { Ok(v) => v, Err(m) => { fail(&m); return Outcome::Failed(None) } };
     let nvram = match &o.nvram {
@@ -248,11 +250,11 @@ fn attempt(mut host: SdioHost<Mmio>, dt_mac: Option<[u8; 6]>, o: &Opts) -> Outco
     // The nvram carries a placeholder macaddr; the real one is the DTB's
     // local-mac-address (filled by the Pi firmware). Keep the nvram one if absent.
     let src = match dt_mac {
-        Some(m) => match dev.iovar_set("cur_etheraddr", &m) {
-            Ok(()) => "dtb",
+        Some((m, from)) => match dev.iovar_set("cur_etheraddr", &m) {
+            Ok(()) => from,
             Err(e) => { log(&format!("mac set failed {:?}, keeping nvram", e)); "nvram" }
         },
-        None => "nvram (no dtb local-mac-address)",
+        None => "nvram (no dtb local-mac-address, no otp)",
     };
     let mut mbuf = [0u8; 6];
     match dev.iovar_get("cur_etheraddr", &mut mbuf) {
@@ -321,7 +323,7 @@ fn ctl_command(text: &str, parked: &mut Option<(SdioHost<Mmio>, Chip)>, tries: u
     }
 }
 
-fn run(host: SdioHost<Mmio>, dt_mac: Option<[u8; 6]>) {
+fn run(host: SdioHost<Mmio>, dt_mac: Option<([u8; 6], &'static str)>) {
     let t0 = now_ms();
     while !crate::firmware::root_ready() {
         if now_ms() - t0 > ROOT_WAIT_MS { return fail("root-not-mounted 120s"); }

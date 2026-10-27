@@ -252,6 +252,9 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         drivers::v3d::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset, arch_aarch64::exception::serror_checkpoint);
         // RNG, firmware RTC, PM watchdog, thermal, ARM clock: one line each (lane pimisc).
         drivers::rpi_misc::boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset);
+        // BCM2712 GPIO/pinctrl/l2-intc (one [gpio] line) and OTP serial + MACs (one [otp] line), lane pigio.
+        drivers::bcm2712_gpio::boot(arch_aarch64::exception::serror_checkpoint);
+        drivers::bcm2712_otp::boot();
     }
      #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] drivers::brcmf_boot::start(crate::boot_cmdline().unwrap_or("")); // Pi 5 V3D power-up + ident (one [v3d] line); CYW43455 firmware bring-up on a kthread ([brcmf] lines)
     // Persist the console log on the boot disk's log partition, if it has one.
