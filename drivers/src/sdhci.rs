@@ -319,6 +319,25 @@ const CMD_DATA_PRESENT: u16 = 1 << 5;
 // Transfer Mode bits
 const TM_BLOCK_COUNT_EN: u16 = 1 << 1;
 const TM_DIR_READ:       u16 = 1 << 4;
+/// Auto CMD12: the controller sends STOP_TRANSMISSION itself after the last
+/// block of a multi-block transfer (SDHCI 2.0+, QEMU sdhci, BCM2712 brcmstb).
+const TM_AUTO_CMD12:     u16 = 1 << 2;
+const TM_MULTI_BLOCK:    u16 = 1 << 5;
+/// Command Type = Abort (Command register bits 7:6), for a manual CMD12.
+const CMD_TYPE_ABORT:    u16 = 0b11 << 6;
+
+/// Sectors per multi-block command, and so the most I/O done under one
+/// `DEVICES` hold: 128 x 512 B = 64 KiB.
+const MULTI_MAX_SECTORS: usize = 128;
+/// Blocks (4 KiB) per multi-block command.
+const MULTI_MAX_BLOCKS: usize = MULTI_MAX_SECTORS / SECTORS_PER_BLOCK;
+/// Multi-block CMD18/CMD25 in use. Cleared (for good) after
+/// `MULTI_FALLBACK_LIMIT` transfers failed multi-block but then succeeded
+/// sector by sector: the card or controller does not do multi-block right,
+/// and the old single-sector path is known to work.
+static MULTI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+static MULTI_FALLBACKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+const MULTI_FALLBACK_LIMIT: u32 = 3;
 
 // SD command indices used by this driver
 const CMD_GO_IDLE_STATE:      u8 = 0;
@@ -331,6 +350,9 @@ const CMD_SEND_CSD:           u8 = 9;
 const CMD_SET_BLOCKLEN:       u8 = 16;
 const CMD_READ_SINGLE_BLOCK:  u8 = 17;
 const CMD_WRITE_BLOCK:        u8 = 24;
+const CMD_STOP_TRANSMISSION:  u8 = 12;
+const CMD_READ_MULTIPLE_BLOCK:  u8 = 18;
+const CMD_WRITE_MULTIPLE_BLOCK: u8 = 25;
 const CMD_APP_CMD:            u8 = 55;
 /// Same index as `CMD_SWITCH_FUNC` — an SD command is only an *application*
 /// command by virtue of the CMD55 that precedes it, never by its number.
@@ -520,6 +542,96 @@ impl SdhciDevice {
         }
 
         self.wait_normal_int(NI_XFER_COMPLETE)
+    }
+
+    /// Read or write `count` (1..=MULTI_MAX_SECTORS) contiguous sectors with
+    /// one CMD18/CMD25 and Auto CMD12, PIO through the buffer port.
+    ///
+    /// One command per span instead of one per sector: on a real card every
+    /// CMD24 is a separate program cycle (~1 ms), which capped writes at
+    /// ~0.5 MB/s; CMD25 lets the card stream the whole span.
+    unsafe fn do_io_multi(&self, is_write: bool, sector: u64, count: usize, buf: *mut u8) -> bool {
+        let arg = if self.high_capacity { sector as u32 } else { (sector * SECTOR_SIZE as u64) as u32 };
+        let cmd = if is_write { CMD_WRITE_MULTIPLE_BLOCK } else { CMD_READ_MULTIPLE_BLOCK };
+
+        self.w16(REG_BLOCK_SIZE, SECTOR_SIZE as u16);
+        self.w16(REG_BLOCK_COUNT, count as u16);
+        let tm = TM_BLOCK_COUNT_EN | TM_MULTI_BLOCK | TM_AUTO_CMD12
+            | if is_write { 0 } else { TM_DIR_READ };
+        self.w16(REG_TRANSFER_MODE, tm);
+
+        if self.send_command(cmd, arg, RESP_48, true, true, true).is_none() {
+            return false;
+        }
+        let ready_bit = if is_write { NI_BUF_WRITE_READY } else { NI_BUF_READ_READY };
+        for b in 0..count {
+            if !self.wait_normal_int(ready_bit) {
+                return false;
+            }
+            let p = buf.add(b * SECTOR_SIZE);
+            for i in 0..(SECTOR_SIZE / 4) {
+                let word_ptr = p.add(i * 4) as *mut u32;
+                if is_write {
+                    self.w32(REG_BUFFER_DATA, word_ptr.read_unaligned());
+                } else {
+                    word_ptr.write_unaligned(self.r32(REG_BUFFER_DATA));
+                }
+            }
+            if b & 7 == 7 { tick_window(); }
+        }
+        // Transfer Complete follows the auto CMD12 (and, for a write, the
+        // card's busy on DAT0).
+        self.wait_normal_int(NI_XFER_COMPLETE)
+    }
+
+    /// After a failed multi-block transfer: reset CMD/DAT, send a manual
+    /// CMD12 so a card left in the data or receive state returns to
+    /// transfer state (an error reply from a card already there is fine),
+    /// and reset again.
+    unsafe fn abort_multi(&self) {
+        self.reset_cmd_dat();
+        self.w32(REG_ARGUMENT1, 0);
+        self.wait_cmd_inhibit_clear(false);
+        self.w16(REG_NORMAL_INT_STATUS, NI_ALL);
+        self.w16(REG_ERROR_INT_STATUS, EI_ALL);
+        self.w16(REG_COMMAND, ((CMD_STOP_TRANSMISSION as u16) << 8) | RESP_48B
+            | CMD_CRC_CHECK | CMD_IDX_CHECK | CMD_TYPE_ABORT);
+        let _ = self.wait_normal_int(NI_CMD_COMPLETE);
+        self.wait_cmd_inhibit_clear(true);
+        self.reset_cmd_dat();
+    }
+
+    /// `nblocks` (1..=MULTI_MAX_BLOCKS) contiguous 4 KiB blocks. Multi-block
+    /// first; on any failure the span is redone with the single-sector path,
+    /// which stays the only path once multi-block has proven unreliable.
+    fn do_io_span(&self, is_write: bool, blk: u64, nblocks: usize, buf: *mut u8) -> bool {
+        if MULTI_ON.load(Ordering::Relaxed) {
+            let sector = (blk + self.partition_offset) * SECTORS_PER_BLOCK as u64;
+            tick_window();
+            if unsafe { self.do_io_multi(is_write, sector, nblocks * SECTORS_PER_BLOCK, buf) } {
+                return true;
+            }
+            let latched = LAST_FAIL.load(Ordering::Relaxed);
+            unsafe { self.abort_multi(); }
+            let ok = (0..nblocks).all(|j| self.do_io(is_write, blk + j as u64,
+                unsafe { buf.add(j * BLOCK_SIZE) }));
+            crate::pci::serial_debug(if is_write { "[sdhci] multi-block write" } else { "[sdhci] multi-block read" });
+            crate::pci::serial_debug(" failed (N<<16|E latched: ");
+            let mut hx = [0u8; 8];
+            for (i, c) in hx.iter_mut().enumerate() {
+                let nib = ((latched >> (28 - 4 * i)) & 0xf) as u8;
+                *c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+            }
+            crate::pci::serial_debug(core::str::from_utf8(&hx).unwrap_or("?"));
+            crate::pci::serial_debug(if ok { "), single-sector redo ok\n" } else { "), single-sector redo failed too\n" });
+            if ok && MULTI_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1 >= MULTI_FALLBACK_LIMIT
+                && MULTI_ON.swap(false, Ordering::Relaxed)
+            {
+                crate::pci::serial_debug("[sdhci] multi-block disabled; I/O is single-sector PIO from now on\n");
+            }
+            return ok;
+        }
+        (0..nblocks).all(|j| self.do_io(is_write, blk + j as u64, unsafe { buf.add(j * BLOCK_SIZE) }))
     }
 
     /// Issue CMD55 (APP_CMD) so the *next* command is interpreted as an ACMD.
@@ -1207,7 +1319,12 @@ pub fn init() {
     // device — so mirroring the index instead of touching shared userland
     // code keeps `/dev/vdb` working unmodified everywhere.
     *cnt = match unsafe { probe_card(virt_base) } {
-        Some(d) => { devs[1] = Some(d); dbg(b']'); 2 }
+        Some(d) => {
+            devs[1] = Some(d);
+            dbg(b']');
+            crate::pci::serial_debug("[sdhci] I/O mode: PIO multi-block CMD18/CMD25 + auto-CMD12, up to 64 KiB per command (single-sector fallback)\n");
+            2
+        }
         None => { dbg(b'-'); 0 }
     };
 }
@@ -1220,7 +1337,7 @@ pub fn device_count() -> usize {
 pub fn read_block(dev_idx: usize, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool {
     let devs = DEVICES.lock();
     if let Some(ref dev) = devs[dev_idx] {
-        dev.do_io(false, blk, buf.as_mut_ptr())
+        dev.do_io_span(false, blk, 1, buf.as_mut_ptr())
     } else {
         false
     }
@@ -1236,18 +1353,32 @@ pub fn read_block(dev_idx: usize, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool 
 /// so no request this loop issues is larger than one 512-byte sector either
 /// way. One lock acquisition covers the whole span, matching virtio_blk.
 pub fn read_blocks(dev_idx: usize, blk: u64, buf: &mut [u8]) -> bool {
-    if buf.is_empty() || buf.len() % BLOCK_SIZE != 0 { return false; }
-    // The lock is taken per block, not across the span: a multi-megabyte PIO
-    // read holds it for seconds, and a waiter on another CPU spins on this
-    // `spin::Mutex` with IRQs masked (deaf) for all of it. Blocks are
-    // independent requests, exactly as `write_blocks` already issues them.
-    let total = buf.len() / BLOCK_SIZE;
-    for i in 0..total {
+    span_io(dev_idx, false, blk, buf.as_mut_ptr(), buf.len())
+}
+
+/// Write `buf.len() / BLOCK_SIZE` contiguous blocks starting at `blk`.
+pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
+    span_io(dev_idx, true, blk, buf.as_ptr() as *mut u8, buf.len())
+}
+
+/// Contiguous span I/O, at most `MULTI_MAX_BLOCKS` per command and per
+/// `DEVICES` hold. Between chunks (lock dropped) the caller's CPU may be
+/// given to another task: the whole span is polled PIO on this CPU, and a
+/// multi-megabyte f2fs writeback otherwise keeps every task queued behind
+/// it (sshd's keepalive reply, for one) off this CPU until it ends.
+fn span_io(dev_idx: usize, is_write: bool, blk: u64, buf: *mut u8, len: usize) -> bool {
+    if len == 0 || len % BLOCK_SIZE != 0 { return false; }
+    let total = len / BLOCK_SIZE;
+    let mut i = 0;
+    while i < total {
+        let n = (total - i).min(MULTI_MAX_BLOCKS);
         let devs = DEVICES.lock();
-        let dev = match devs[dev_idx] { Some(ref d) => d, None => return false };
-        let ok = dev.do_io(false, blk + i as u64, unsafe { buf.as_mut_ptr().add(i * BLOCK_SIZE) });
+        let dev = match devs.get(dev_idx) { Some(Some(d)) => d, _ => return false };
+        let ok = dev.do_io_span(is_write, blk + i as u64, n, unsafe { buf.add(i * BLOCK_SIZE) });
         drop(devs);
         if !ok { return false; }
+        i += n;
+        if i < total { sched::kthread::cond_resched(); }
     }
     true
 }
@@ -1274,7 +1405,7 @@ pub fn flush(dev_idx: usize) -> bool {
 pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
     let devs = DEVICES.lock();
     if let Some(ref dev) = devs[dev_idx] {
-        dev.do_io(true, blk, buf.as_ptr() as *mut u8)
+        dev.do_io_span(true, blk, 1, buf.as_ptr() as *mut u8)
     } else {
         false
     }

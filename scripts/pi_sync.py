@@ -112,6 +112,47 @@ def run_script(t, R, name, text, timeout):
     return p.stdout.decode(errors="replace")
 
 
+def run_detached(t, R, name, text, timeout):
+    """Uploads `text` as RTMP/name and runs it detached from the ssh session,
+    then polls for its done marker with short ssh calls. A big extraction on
+    the Pi's SD card can outlast the ssh connection (keepalives starve while
+    the card is busy); sshd's channel close then SIGHUPs the session's process
+    group (userland/sshd/src/session.rs), which used to kill `head` midway.
+    Here the job ignores SIGHUP (inherited by every child through exec), has
+    no tie to the session's stdio, and a dropped poll is simply retried.
+    Starting is idempotent (a `.started` marker), so an ssh retry of the
+    start command never runs the script twice. Returns the script's output
+    ("" if it did not finish within `timeout`)."""
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+        f.write("trap '' HUP\n" + text)
+        local = f.name
+    try:
+        R.upload_one(t, local, f"{RTMP}/{name}", R.sha256_file(local), "600", quiet=True)
+    finally:
+        os.unlink(local)
+    base = f"{RTMP}/{name}"
+    start = (f"[ -e {base}.started ] || {{ : > {base}.started; rm -f {base}.log {base}.done; "
+             f"sh -c 'trap \"\" HUP; sh {base} > {base}.log 2>&1; : > {base}.done' "
+             f"< /dev/null > /dev/null 2>&1 & }}; echo started")
+    R.rrun(t, start, timeout=60, tries=3, what=f"start {name}")
+    deadline, last = time.time() + timeout, ""
+    while time.time() < deadline:
+        try:
+            p = subprocess.run(t.ssh_argv(f"cat {base}.log; [ -e {base}.done ] && echo PISYNC-DONE"),
+                               capture_output=True, timeout=30)
+            out = p.stdout.decode(errors="replace")
+            if p.returncode != 255:
+                last = out
+                if "PISYNC-DONE" in out.splitlines()[-1:]:
+                    R.rrun(t, f"rm -f {base} {base}.log {base}.done {base}.started", timeout=60, tries=3,
+                           what=f"clean {name}")
+                    return out
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(5)
+    return last if "PISYNC-DONE" in last else ""
+
+
 def remote_stat(t, R, paths):
     """{path: (fmt_mode, uid, gid, size)} for the paths that exist."""
     lines = []
@@ -346,7 +387,11 @@ def apply(t, R, acts):
             R.upload_one(t, local, f"{RTMP}/bundle", R.sha256_file(local), "600", quiet=True)
         finally:
             os.unlink(local)
-        out = run_script(t, R, "extract.sh", "\n".join(lines) + "\n", timeout=1800)
+        # Budget: 1800 s, or 200 kB/s of SD write for a big bundle (the Pi's
+        # card wrote ~0.5 MB/s single-sector, and each byte is written twice:
+        # the upload, then the cut).
+        out = run_detached(t, R, f"extract{bi}.sh", "\n".join(lines) + "\n",
+                           timeout=max(1800, off / 200e3))
         if "PISYNC-END" not in out:
             fails.append(f"FAIL bundle {bi}: extraction script did not finish")
         fails += [l for l in out.splitlines() if l.startswith("FAIL")]
