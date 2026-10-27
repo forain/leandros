@@ -282,7 +282,7 @@ populate_f2fs_root() {
         export LEANDROS_AUTHORIZED_KEYS="$AUTH_KEYS_FILE"
     fi
 
-    ( cd "$REPO_ROOT" && python3 scripts/mkfs-f2fs-populated.py "$tmp_img" aarch64 ) \
+    ( cd "$REPO_ROOT" && LEANDROS_BOARD=rpi5 python3 scripts/mkfs-f2fs-populated.py "$tmp_img" aarch64 ) \
         || { [[ -z "$wifi_tmp" ]] || rm -f "$wifi_tmp"; die "mkfs-f2fs-populated.py failed. Run ./scripts/build-all.sh --arch aarch64 --rpi5 first."; }
     [[ -z "$wifi_tmp" ]] || rm -f "$wifi_tmp"
     unset LEANDROS_WIFI_CONF

@@ -242,6 +242,14 @@ pub const TFU_BO_SIZE: usize = 0x8000;
 /// Mesa `TEXTURE_DATA_FORMAT_R32F` (cle/v3d_packet.xml).
 pub const TEX_R32F: u32 = 29;
 
+/// Phase F: should a successful probe arm the DRM v3d backend by itself?
+/// Only once the MMU (and with it the CL queue) is up: without page tables every CREATE_BO
+/// handed to Mesa would point at nothing. `v3d.arm=0` on the boot line keeps the device
+/// disarmed (the old opt-in behaviour, for A/B against the firmware-FB softpipe path).
+pub fn auto_arm_decision(mmu_up: bool, cmdline: &str) -> bool {
+    mmu_up && !cmdline.split_ascii_whitespace().any(|t| t == "v3d.arm=0")
+}
+
 /// The TFU register block for the self-test (Mesa `v3dX(tfu)`, V3D 7.1 path).
 pub fn tfu_selftest_regs(va: u32) -> super::queue::TfuRegs {
     // V3D71: ICFG IFORMAT [27:23] = RASTER (0), OTYPE [22:16] = texture type;

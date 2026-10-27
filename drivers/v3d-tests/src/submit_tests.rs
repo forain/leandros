@@ -209,3 +209,12 @@ fn tfu_selftest_block_and_check() {
     assert_eq!(tfu_selftest_check(&rev), (4095, 1, 0));
     assert_eq!(tfu_selftest_check(&bo[0x4000..]), (0, 0, 4096), "untouched destination");
 }
+
+#[test]
+fn auto_arm_only_with_mmu_and_not_opted_out() {
+    assert!(auto_arm_decision(true, ""));
+    assert!(auto_arm_decision(true, "console=ttyAMA10 v3d.selftest=0"));
+    assert!(!auto_arm_decision(false, ""));
+    assert!(!auto_arm_decision(true, "quiet v3d.arm=0"));
+    assert!(auto_arm_decision(true, "v3d.arm=1"));
+}
