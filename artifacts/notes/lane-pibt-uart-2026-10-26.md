@@ -28,7 +28,7 @@ Status: DELIVERED (code + host tests; unproven on hardware until the next Pi boo
 
 ## Expected on the next Pi boot (card must be re-prepped or the .hcd pushed to /lib/firmware/brcm/)
     [bt] uarta D0 mux24-27=xxxx gpio29-fsel=0 lsr=0x60 baud=3000000
-    [bt] hci ver=9 rev=0x… lmp_ver=9 lmp_subver=0x6119 rom_subver=0x…. manuf=305 fw=patched(323 records, 62837 bytes) baud=3000000 bdaddr=d8:3a:dd:..:..:.. (set-from-dt|controller) … ms
+    [bt] hci ver=9 rev=0x… lmp_ver=9 lmp_subver=0x6119 rom_subver=0x…. manuf=… fw=patched(323 records, 62837 bytes) baud=3000000 bdaddr=d8:3a:dd:..:..:.. (set-from-dt|controller) … ms
   or `[bt] fail stage=<reset|version|minidriver|patch|reset-patched|baud|version-final|bdaddr> err=…`.
   `fail stage=reset err=NoAnswer(0xc03)` = no UART link (mux/flow control/BT_ON); then try `bt.baud=115200`.
 
