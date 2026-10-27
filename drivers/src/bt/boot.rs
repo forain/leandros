@@ -74,7 +74,7 @@ const LSR_TEMT: u32 = 0x40;
 const TX_CHUNK: usize = 16;
 
 extern "C" { fn serial_print_str_raw(s: *const u8, len: usize); }
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     let mut s = String::with_capacity(msg.len() + 8);
     s.push_str("[bt] ");
     s.push_str(msg);
@@ -192,7 +192,7 @@ fn fail(msg: &str) {
 
 /// Boot entry (rpi5): maps the UART, logs the mux, then runs the bring-up on
 /// its own kernel thread once the root (and its firmware) is mounted.
-pub fn start(cmdline: &str, serror: SerrorCheck) {
+pub fn start(cmdline: &str, serror: SerrorCheck, on_ready: fn(port: u32)) {
     if opt(cmdline, "bt") == Some("0") {
         STATE.store(STATE_SKIPPED, Ordering::Release);
         return log("skip (bt=0)");
@@ -217,7 +217,7 @@ pub fn start(cmdline: &str, serror: SerrorCheck) {
     // Read the address now, while the boot DTB is certainly mapped.
     let dt_addr = unsafe { boot::device_tree::recorded_dtb() }.and_then(bringup::fdt_local_bd_address);
     STATE.store(STATE_RUNNING, Ordering::Release);
-    if sched::kthread::spawn("bt", move || run(uart, oper, patch, dt_addr)).is_none() {
+    if sched::kthread::spawn("bt", move || run(uart, oper, patch, dt_addr, on_ready)).is_none() {
         STATE.store(STATE_FAILED, Ordering::Release);
         log("fail thread-spawn");
     }
@@ -241,7 +241,7 @@ fn load_hcd() -> Result<(Vec<u8>, &'static str), String> {
     Err(last)
 }
 
-fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>) {
+fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready: fn(port: u32)) {
     let t0 = now_us();
     let hcd = if patch {
         while !crate::firmware::root_ready() {
@@ -277,6 +277,15 @@ fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>) {
                 "hci ver={} rev={:#x} lmp_ver={} lmp_subver={:#06x} rom_subver={:#06x} manuf={} fw={} baud={} bdaddr={} ({}) {} ms stray={} garbage={} lsr_err={}",
                 r.ver.hci_ver, r.ver.hci_rev, r.ver.lmp_ver, r.ver.lmp_subver, r.rom.lmp_subver, r.ver.manufacturer,
                 fw, r.baud, r.bdaddr, addr, (now_us() - t1) / 1000, r.stray_events, r.garbage, uart.line_errors));
+            // Vendor init is done: publish /dev/hci0 and become its pump.
+            match super::hcidev::create_port() {
+                Some(port) => {
+                    on_ready(port);
+                    log("/dev/hci0 ready");
+                    super::hcidev::pump(&mut uart);
+                }
+                None => log("fail stage=hci0-port"),
+            }
         }
         Err(e) => fail(&format!("stage={} err={:?} lsr_err={}", e.stage, e.kind, uart.line_errors)),
     }

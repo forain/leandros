@@ -12678,6 +12678,9 @@ const GID_NETDEV: u32 = 108;
 /// node under it (116:16, pcmC0D0p's number); like /dev/snd/* it is
 /// root:audio 0660.
 pub const SOUND_MAJOR: u32 = 116;
+/// /dev/hci0 (Linux's misc vhci number; one raw HCI controller).
+pub const HCI_MAJOR: u32 = 10;
+pub const HCI_MINOR: u32 = 137;
 
 /// Owner/mode of a dynamic character device by its major/minor, following
 /// udev's defaults: evdev (13) root:input 0660 — anyone who can open it reads
@@ -12695,6 +12698,8 @@ fn dyn_dev_meta(major: u32, minor: u32) -> xattr::FileMeta {
         // net server records per open whether it was opened for writing and
         // refuses mutating ioctls on a read-only open (EPERM).
         (NETCTL_MAJOR, NETCTL_MINOR) => xattr::FileMeta { mode: S_IFCHR | 0o664, uid: 0, gid: GID_NETDEV },
+        // /dev/hci0: raw HCI, only btd (root) opens it (docs/servers/bluetooth.md A).
+        (HCI_MAJOR, HCI_MINOR) => xattr::FileMeta { mode: S_IFCHR | 0o600, uid: 0, gid: 0 },
         _ => xattr::FileMeta { mode: S_IFCHR | 0o666, uid: 0, gid: 0 },
     }
 }
