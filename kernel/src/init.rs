@@ -278,6 +278,18 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         }
         drivers::bcm2712_dma40::boot(crate::boot_cmdline().unwrap_or(""), arch_aarch64::exception::serror_checkpoint);
     }
+    // HDMI audio binds late: PipeWire's first init ran before the HDMI probe, so retry once now.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] {
+        drivers::hdmi_audio::set_serror_check(arch_aarch64::exception::serror_checkpoint);
+        if !pipewire_server::is_initialized() {
+            if let Ok(p) = pipewire_server::init(crate::boot_cmdline().unwrap_or("")) {
+                serial_print_str("[INIT] PipeWire server port (HDMI audio): ");
+                crate::print_number(p);
+                serial_print_str("\n");
+                crate::syscall::set_audio_server_port(p);
+            }
+        }
+    }
      #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] { drivers::brcmf_boot::start(crate::boot_cmdline().unwrap_or("")); drivers::bt::boot::start(crate::boot_cmdline().unwrap_or(""), arch_aarch64::exception::serror_checkpoint); } // Pi 5 V3D power-up + ident (one [v3d] line); CYW43455 firmware bring-up on a kthread ([brcmf] lines)
     // Persist the console log on the boot disk's log partition, if it has one.
     crate::klog::init(); crate::iostat::init(); crate::hungtask::init(); // + the 5 s [usbms]/[fslock] summary task

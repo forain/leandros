@@ -29,6 +29,21 @@ pub const PROBE_SERROR: u32 = 4;
 /// Outcome of the boot probe (one of the `PROBE_*` values).
 pub static PROBE_STATE: AtomicU32 = AtomicU32::new(PROBE_NOT_RUN);
 
+/// Per-port results for the HDMI audio backend (`hdmi_audio`), valid once PROBE_STATE = DONE.
+pub const PORT_VALID: u32 = 1 << 0;
+pub const PORT_HPD: u32 = 1 << 1;
+pub const PORT_HDMI_MODE: u32 = 1 << 2;
+pub const PORT_ACTIVE: u32 = 1 << 3;
+pub const PORT_GATE_OPEN: u32 = 1 << 4;
+pub static PORT_FLAGS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+/// Measured (snapped) pixel clock per port, kHz; 0 = unknown.
+pub static PORT_PIX_KHZ: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+/// What the firmware's EDID says about the sink: 0 unknown/refused, 1 HDMI (VSDB), 2 DVI.
+pub const SINK_UNKNOWN: u32 = 0;
+pub const SINK_HDMI: u32 = 1;
+pub const SINK_DVI: u32 = 2;
+pub static EDID_SINK: AtomicU32 = AtomicU32::new(SINK_UNKNOWN);
+
 pub fn probe_enabled(cmdline: &str) -> bool {
     !cmdline.split_ascii_whitespace().any(|t| t == "hdmi.probe=0")
 }
@@ -201,6 +216,15 @@ mod hw {
             ClockClass::Raw => "raw",
         };
         let (n48, cts48) = if khz != 0 { acr_n_cts(khz, 48000) } else { (0, 0) };
+        PORT_PIX_KHZ[port].store(khz, Ordering::Relaxed);
+        PORT_FLAGS[port].store(
+            PORT_VALID
+                | if hotplug & HOTPLUG_CONNECTED != 0 { PORT_HPD } else { 0 }
+                | if sched & SCHED_MODE_HDMI != 0 { PORT_HDMI_MODE } else { 0 }
+                | if sched & SCHED_HDMI_ACTIVE != 0 { PORT_ACTIVE } else { 0 }
+                | if dvp_audio_gate_open(misc, port) { PORT_GATE_OPEN } else { 0 },
+            Ordering::Relaxed,
+        );
         let m = decode_mai_ctl(mai_ctl);
         let (crp_n, crp_ext, crp_dis) = decode_crp(crp);
         let (ram_en, ram_mask) = decode_ram_packets(ram_cfg);
@@ -308,6 +332,7 @@ mod hw {
                     hdmi |= cea_has_hdmi_vsdb(&b);
                 }
             }
+            EDID_SINK.store(if hdmi { SINK_HDMI } else { SINK_DVI }, Ordering::Relaxed);
             format!("{}blk sink={}", 1 + ext as u32, if hdmi { "hdmi" } else { "dvi" })
         }
     }
