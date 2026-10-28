@@ -35,4 +35,11 @@ Status: DELIVERED (design-lapdisp2 Lane C1). No hardware touched.
 ## Evidence
 - aarch64 HVF QEMU `i915crtc2`: CRTC_ENUM, ATOMIC_CRTC2 (nb=10 pipe-B events, na=10 pipe-A events), ATOMIC_BAD,
   ATOMIC_CRTC2_OFF all PASS; first run showed ATOMIC_BAD FAIL when the test bound nothing first (test bug, fixed).
-- Box regress results: see the merge report.
+- Box farm aarch64 full regress (pre lane-A merge, 5f8f2629): all suites RC=0, `overall: PASS` (first attempt hit ENOSPC on the box
+  mid-run, rerun clean). x86_64 KVM `--gpu virgl --suite drm`: PASS. No COSMIC desktop boot was run (no suite for it; the virgl
+  path only needs `extra_crtcs()==0`, which is the default).
+- After merging lane A (conflict in GETENCODER, resolved: `ext_crtc_mask(i)` now ORs in `pipe2_mask(i)`), local aarch64 HVF
+  `i915crtc2` 8/8 repeats PASS. The earlier "timeouts" were UART interleaving of a kernel log line with the test's final
+  marker, removed (no log on disable).
+- `i915fake` `ddb_plane_whole_pipe_0_860` / `ddb_cursor_top_32_860_892` fail on main too (verified on a clean main build):
+  not caused by this lane.
