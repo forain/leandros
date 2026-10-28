@@ -242,12 +242,12 @@ static NB_OPENS: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomi
 
 fn nb_add(id: u64) {
     use core::sync::atomic::Ordering::AcqRel;
-    for s in NB_OPENS.iter() { if s.compare_exchange(0, id, AcqRel, AcqRel).is_ok() { return; } }
+    for s in NB_OPENS.iter() { if s.compare_exchange(0, id, AcqRel, core::sync::atomic::Ordering::Acquire).is_ok() { return; } }
 }
 fn nb_has(id: u64) -> bool { NB_OPENS.iter().any(|s| s.load(core::sync::atomic::Ordering::Acquire) == id) }
 fn nb_del(id: u64) {
     use core::sync::atomic::Ordering::AcqRel;
-    for s in NB_OPENS.iter() { let _ = s.compare_exchange(id, 0, AcqRel, AcqRel); }
+    for s in NB_OPENS.iter() { let _ = s.compare_exchange(id, 0, AcqRel, core::sync::atomic::Ordering::Acquire); }
 }
 
 /// The poll tag of the capture side, woken by `tick_pump` when a period of

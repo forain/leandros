@@ -111,7 +111,8 @@ impl Hda {
         let mut s = String::new();
         let _ = writeln!(s, "[HDA] capture: internal mic {} jack mic {} input stream {}",
                          path_str(&self.ext.int_path), path_str(&self.ext.jack_path), self.ext.cap_sd_index);
-        let _ = writeln!(s, "[HDA] jack: headphone pins {:x?} speaker pins {:x?}", self.ext.hp_pins, self.ext.spk_pins);
+        let _ = writeln!(s, "[HDA] jack: headphone pins {:x?} speaker pins {:x?}", self.ext.hp_pins,
+                         self.ext.spk_saved.iter().map(|&(n, _)| n).collect::<Vec<_>>());
         s.push_str(&self.ext.hdmi_summary.clone());
         for line in s.lines() { hlog!("{}\n", line); }
         self.summary.push_str(&s);
