@@ -78,6 +78,7 @@ unsafe impl Send for Wrap {}
 
 fn log(s: &str) { crate::i915::emit_logonly(s); }
 /// Console + klog (the one-time discovery summary).
+static EC_FAIL_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 fn say(s: &str) { crate::i915::emit(s); }
 fn now_ns() -> u64 { crate::i915::now_ns() }
 
@@ -144,7 +145,8 @@ impl Host for KHost {
             aml::SPACE_EC => {
                 let mut v = 0u64;
                 for i in 0..(width / 8) as u64 {
-                    v |= (ec::read((addr + i) as u8).unwrap_or(0) as u64) << (8 * i);
+                    let b = match ec::read((addr + i) as u8) { Some(b) => b, None => { if !EC_FAIL_LOGGED.swap(true, Ordering::Relaxed) { say(&format!("acpi: EC read of {:#04x} FAILED (reads as 0; further failures counted in timeouts)\n", addr + i)); } 0 } };
+                    v |= (b as u64) << (8 * i);
                 }
                 v
             }
@@ -185,7 +187,7 @@ impl Host for KHost {
         }
     }
 
-    fn sleep_ms(&mut self, ms: u64) { crate::i915::delay_us(ms.min(20) * 1000); }
+    fn sleep_ms(&mut self, ms: u64) { crate::i915::delay_us(ms.min(100) * 1000); }
     fn stall_us(&mut self, us: u64) { crate::i915::delay_us(us.min(100)); }
     fn timer(&mut self) -> u64 { now_ns() / 100 }
     fn notify(&mut self, node: usize, code: u64) { if self.notes.len() < 64 { self.notes.push((node, code)); } }
@@ -295,6 +297,8 @@ pub fn init(rsdp: u64, hhdm: u64) {
         if let Some(g) = ns.eval_child(&mut h, e, "_GPE", &[]).and_then(|v| v.as_int()) { st.ec_gpe = Some(g as u32); }
         ec::flush();
     }
+    if crate::nvidia_probe::cmdline_word("acpi_power.trace").map_or(false, |w| w == "1") { ec::TRACE.store(true, Ordering::Relaxed); }
+    if ec::present() && crate::nvidia_probe::cmdline_word("acpi_power.ecdump").map_or(false, |w| w == "1") { ec::dump(); }
     // Initialization, as an OS would: \_SB._INI, EC _REG, \_SB.PCI0._INI.
     if let Some(sb) = ns.find("\\_SB_") { if ns.child(sb, "_INI").is_some() { ns.eval_child(&mut h, sb, "_INI", &[]); } }
     if ec::present() {
@@ -305,6 +309,7 @@ pub fn init(rsdp: u64, hhdm: u64) {
                 if ns.child(p, "_REG").is_some() && !regs.contains(&p) { regs.push(p); }
             }
         }
+        if let Some(e) = st.ec_dev { if ns.child(e, "_REG").is_some() && !regs.contains(&e) { regs.push(e); } }
         for p in regs { ns.eval_child(&mut h, p, "_REG", &[V::Int(3), V::Int(1)]); }
     }
     let mut inits: Vec<usize> = Vec::new();
