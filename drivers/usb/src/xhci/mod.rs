@@ -36,6 +36,7 @@ pub mod regs;
 pub mod ring;
 mod intr;
 pub mod isoch;
+pub mod btusb;
 
 pub use intr::{HidPipe, IntrPipe, Poll as IntrPoll, Reports as IntrReports, REPORT_MAX};
 
@@ -324,7 +325,33 @@ impl Xhci {
         usb_log!("[XHCI] bus {}: xHCI {:x}.{:02x}, {} ports, {} of {} slots, {}-byte contexts, {}, {} scratchpad pages\n",
                  bus, x.hci_version >> 8, x.hci_version & 0xFF, max_ports, max_slots, max_slots_hw,
                  csz, if dma32 { "32-bit DMA" } else { "64-bit DMA" }, nscratch);
+        x.log_root_hub();
         Ok(x)
+    }
+
+    /// One boot-log line per bus: root-hub port split by protocol revision and
+    /// the raw PORTSC of every port (proof the root hub is alive).
+    fn log_root_hub(&self) {
+        use alloc::string::String;
+        use core::fmt::Write;
+        let mut groups = String::new();
+        let n = self.max_ports as usize;
+        let mut i = 0;
+        while i < n {
+            let rev = self.port_rev[i];
+            let mut j = i;
+            while j + 1 < n && self.port_rev[j + 1] == rev { j += 1; }
+            if !groups.is_empty() { groups.push_str(", "); }
+            let name = match rev { 2 => "USB2", 3 => "USB3", _ => "USB?" };
+            if i == j { let _ = write!(groups, "{} port {}", name, i + 1); }
+            else { let _ = write!(groups, "{} ports {}-{}", name, i + 1, j + 1); }
+            i = j + 1;
+        }
+        let mut sc = String::new();
+        for p in 1..=self.max_ports {
+            let _ = write!(sc, " p{} {:#x}", p, self.regs.portsc(p));
+        }
+        usb_log!("[XHCI] bus {} root hub: {}; PORTSC{}\n", self.bus, groups, sc);
     }
 
     /// Halt the controller (Run/Stop = 0, wait HCH, reset). Returns whether
@@ -1191,6 +1218,18 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
         // No boot HID either: an audio function (isochronous streaming
         // interfaces)? Select its configuration; a class driver opens the
         // streams later with `isoch::IsochPipe::open`.
+        // Bluetooth HCI (E0/01/01): configured here, endpoints opened by
+        // the bt driver (btusb.rs); handed over as a function like audio.
+        if hid.is_empty() && btusb::scan_bt(&cfg).is_some() {
+            match control(hc, slot, 0x00, 9, ci.value as u16, 0, CtrlData::None, ENUM_CTRL_TIMEOUT_MS) {
+                Ok(_) => {
+                    info.class = 0xE0;
+                    let f = isoch::UsbFunction { hc: hc.clone(), slot, speed, config_value: ci.value, cfg: cfg.clone() };
+                    return Ok(Enumerated { info, bulk: None, hid, hub: None, audio: Some(f) });
+                }
+                Err(e) => usb_log!("[XHCI] slot {}: Bluetooth SET_CONFIGURATION failed ({:?})\n", slot, e),
+            }
+        }
         let mut audio = None;
         let video = crate::uvc::has_video_streaming(&cfg);
         if hid.is_empty() && (video || isoch::has_audio_streaming(&cfg)) {
@@ -1287,6 +1326,19 @@ pub unsafe fn probe(base: usize, len: usize, bus: u8) -> Result<(Arc<Hc>, Vec<En
 pub fn root_port_connected(hc: &Hc, port: u8) -> bool {
     let x = hc.lock();
     !x.dead && port >= 1 && port <= x.max_ports && x.regs.portsc(port) & PORTSC_CCS != 0
+}
+
+/// True when the controller stopped answering MMIO (USBSTS reads all-ones:
+/// surprise removal / link drop).
+pub fn controller_gone(hc: &Hc) -> bool {
+    let x = hc.lock();
+    !x.dead && x.regs.op(OP_USBSTS) == 0xFFFF_FFFF
+}
+
+/// Root-hub shape for lsusb: (port count, any USB 3 port).
+pub fn root_hub_shape(hc: &Hc) -> (u8, bool) {
+    let x = hc.lock();
+    (x.max_ports, x.port_rev.iter().any(|&r| r >= 3))
 }
 
 /// Number of root ports, or 0 for a controller that died.
