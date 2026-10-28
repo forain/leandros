@@ -83,6 +83,7 @@ pub use rps::proc_text;
 mod vblank;
 mod cursor;
 mod outputs;
+mod pipeb_stub;
 
 use hw::reg;
 

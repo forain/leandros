@@ -10,7 +10,7 @@ Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --cmdline "ARGS"         boot a copy of the image with this kernel command line
-                           (scripts/set-image-cmdline.sh; suite i915fake implies
+                           (scripts/set-image-cmdline.sh; suite i915crtc2 = two-CRTC stub pipe; suite i915fake implies
                            "i915.fake=2 i915.kms=1")
   --suite NAME             add a named list of commands (repeatable):
                              regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + uaccesstest + proctest + chroottest + netctltest + bttest + sudotest + nmtest --quick (mock) + blueztest (org.bluez shim) + evherdtest + pollnarrowtest + listentagtest + vfstagtest + nettag2test + kparkstest + sshsmoke
@@ -253,6 +253,7 @@ SUITES = {
     # path Mesa iris takes on the laptop: catches a DRM-layer change that
     # breaks i915 ioctl argument access (lane irisseg).
     "i915fake": ["/bin/i915test"],
+    "i915crtc2": ["/bin/drmsmoke --crtc2"],
     # The same with every soft-engine fence pending for 2 ms after submit, so
     # CPU fence waits really wait: the fence-wait spin bound (lane rddsys).
     "i915fence": ["/bin/i915test"],
@@ -347,6 +348,8 @@ def main(argv):
         cmds += SUITES[s]
     if "i915fake" in suites and cmdline is None:
         cmdline = "i915.fake=2 i915.kms=1"
+    if "i915crtc2" in suites and cmdline is None:
+        cmdline = "i915.fake=2 i915.kms=1 i915.extout=1 i915.pipeb_stub=1"
     if "i915fence" in suites and cmdline is None:
         cmdline = "i915.fake=2 i915.kms=1 i915.fake_lat_us=2000"
     # GPU-accounting suites (venustest/drmsmoke count window spans, blobs and

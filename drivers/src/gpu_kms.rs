@@ -250,7 +250,7 @@ pub fn set_internal_panel(v: bool) { INTERNAL_PANEL.store(v, Ordering::Release);
 pub fn internal_panel() -> bool { INTERNAL_PANEL.load(Ordering::Acquire) }
 
 /// Possible-CRTC mask of extra `idx`, 0 when no backend/CRTC.
-pub fn ext_crtc_mask(idx: usize) -> u32 { outputs().map_or(0, |o| (o.crtc_mask)(idx)) }
+pub fn ext_crtc_mask(idx: usize) -> u32 { outputs().map_or(0, |o| (o.crtc_mask)(idx)) | pipe2_mask(idx) }
 
 static OUTPUTS: AtomicPtr<KmsOutputs> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -271,3 +271,51 @@ pub fn ext_index(id: u32, base: u32) -> Option<usize> {
     let i = id.checked_sub(base)? as usize;
     if i < ext_count() { Some(i) } else { None }
 }
+
+// ── second pipe (lane lapdisp C1) ───────────────────────────────────────────
+
+/// The second CRTC's backend hooks. Pipe A's `KmsBackend`/`KmsFlip` stay as
+/// they are; a backend with a second pipe registers this beside them. Every
+/// hook runs in task context with no DRM lock held, except `busy` (any
+/// context, lock-free).
+pub struct KmsPipe2 {
+    pub name: &'static str,
+    /// Light extra connector `conn_idx` with `t`.
+    pub modeset: fn(conn_idx: usize, t: &KmsTiming) -> Result<(), DriverError>,
+    /// Turn the pipe off.
+    pub disable: fn(),
+    /// Queue `token` for scanout; `ev` (nonzero) completes when it latched.
+    pub queue: fn(token: u32, src_x: u32, src_y: u32, ev: u32) -> Result<(), DriverError>,
+    /// A commit that flipped nothing: complete `ev` at the next vblank.
+    pub event: fn(ev: u32),
+    pub busy: fn() -> bool,
+    pub wait_idle: fn(timeout_ns: u64) -> bool,
+    /// The cursor plane of pipe B (None: plane 33 is not exposed).
+    pub cursor: Option<&'static KmsCursor>,
+    /// The current mode, `(w, h, refresh)`, while the pipe is on.
+    pub mode: fn() -> Option<(u32, u32, u32)>,
+    /// Accept plain dumb framebuffers (no backend token): the stub only.
+    pub dumb_ok: bool,
+}
+
+static PIPE2: AtomicPtr<KmsPipe2> = AtomicPtr::new(core::ptr::null_mut());
+
+pub fn register_pipe2(p: &'static KmsPipe2) {
+    PIPE2.store(p as *const KmsPipe2 as *mut KmsPipe2, Ordering::Release);
+}
+
+/// The second pipe's hooks, while a backend and a second pipe are registered.
+#[inline]
+pub fn pipe2() -> Option<&'static KmsPipe2> {
+    if !active() { return None; }
+    let p = PIPE2.load(Ordering::Acquire);
+    if p.is_null() { None } else { Some(unsafe { &*p }) }
+}
+
+/// CRTCs beyond the first (0 unless a second pipe is registered).
+#[inline]
+pub fn extra_crtcs() -> usize { pipe2().map_or(0, |_| 1) }
+
+/// `possible_crtcs` of extra connector `idx`'s encoder.
+#[inline]
+pub fn pipe2_mask(_idx: usize) -> u32 { if pipe2().is_some() { 0b10 } else { 0 } }
