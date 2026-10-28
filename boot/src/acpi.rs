@@ -180,10 +180,22 @@ pub struct AcpiPower {
     /// revision 2): bit 0 LEGACY_DEVICES, bit 1 8042 present, ...
     pub fadt_revision: u8,
     pub iapc_boot_arch: u16,
+    /// Sleep-state facts for suspend (kernel pm): FADT LOW_POWER_S0_IDLE_CAPABLE
+    /// (flags bit 21: the firmware prefers s2idle over S3), the DSDT's `\_S3_`
+    /// SLP_TYP pair, the FACS address (firmware waking vector), and whether
+    /// the DSDT names `_PTS` / `_WAK` methods (they need an AML interpreter).
+    pub low_power_s0: bool,
+    pub s3_found: bool,
+    pub s3_typ_a: u8,
+    pub s3_typ_b: u8,
+    pub facs: u64,
+    pub has_pts: bool,
+    pub has_wak: bool,
 }
 
 const FADT_FLAG_RESET_REG_SUP: u32 = 1 << 10;
 const FADT_FLAG_HW_REDUCED:    u32 = 1 << 20;
+const FADT_FLAG_LOW_POWER_S0:  u32 = 1 << 21;
 const GAS_SYSTEM_IO: u8 = 1;
 
 #[inline]
@@ -230,6 +242,9 @@ pub unsafe fn find_power_info(rsdp_phys: u64, hhdm_offset: u64) -> Option<AcpiPo
     let mut p = AcpiPower::default();
     let flags = read_u32(fadt.add(112));
     p.hw_reduced = flags & FADT_FLAG_HW_REDUCED != 0;
+    p.low_power_s0 = flags & FADT_FLAG_LOW_POWER_S0 != 0;
+    p.facs = read_u32(fadt.add(36)) as u64;
+    if len >= 140 && read_u64(fadt.add(132)) != 0 { p.facs = read_u64(fadt.add(132)); }
     p.smi_cmd = read_u32(fadt.add(48)) as u16;
     p.acpi_enable = *fadt.add(52);
     p.pm1a_cnt = read_u32(fadt.add(64)) as u16;
@@ -266,6 +281,13 @@ pub unsafe fn find_power_info(rsdp_phys: u64, hhdm_offset: u64) -> Option<AcpiPo
                     p.slp_typ_b = b;
                     p.s5_found = true;
                 }
+                if let Some((a, b)) = find_sx(aml, b"_S3_") {
+                    p.s3_typ_a = a;
+                    p.s3_typ_b = b;
+                    p.s3_found = true;
+                }
+                p.has_pts = aml.windows(4).any(|w| w == b"_PTS");
+                p.has_wak = aml.windows(4).any(|w| w == b"_WAK");
             }
         }
     }
@@ -314,10 +336,13 @@ pub unsafe fn for_each_aml_table(rsdp_phys: u64, hhdm_offset: u64, f: &mut dyn F
 /// Locate `Name(_S5_, Package(){SLP_TYPa, SLP_TYPb, ...})` in raw AML — the
 /// standard minimal-OS shortcut that avoids a full AML interpreter. QEMU's
 /// DSDT encodes it as `08 5F 53 35 5F 12 06 04 00 00 00 00`.
-fn find_s5(aml: &[u8]) -> Option<(u8, u8)> {
+fn find_s5(aml: &[u8]) -> Option<(u8, u8)> { find_sx(aml, b"_S5_") }
+
+/// `find_s5` for any `\_Sx_` package name.
+fn find_sx(aml: &[u8], name: &[u8; 4]) -> Option<(u8, u8)> {
     let mut i = 36;
     while i + 4 < aml.len() {
-        if &aml[i..i + 4] == b"_S5_" {
+        if &aml[i..i + 4] == name {
             // Preceded by NameOp (0x08), optionally with a root prefix '\'.
             let named = (i >= 1 && aml[i - 1] == 0x08)
                 || (i >= 2 && aml[i - 1] == b'\\' && aml[i - 2] == 0x08);
