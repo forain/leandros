@@ -456,12 +456,14 @@ const DM_TEXT_LOGIN_MARKER: &[u8] = b"/etc/leandros/text-login\0";
 const DM_LOG: &[u8] = b"/var/log/greetd.log\0";
 /// The previous generation, kept when `DM_LOG` reaches `DM_LOG_CAP`.
 const DM_LOG_OLD: &[u8] = b"/var/log/greetd.log.1\0";
+const DM_LOG_OLD2: &[u8] = b"/var/log/greetd.log.2\0";
+const DM_LOG_OLD3: &[u8] = b"/var/log/greetd.log.3\0";
 /// Size cap of one log generation. The chain writes through a pipe to a
 /// logger child (`run_dm_logger`), which rotates at this size, so the log
 /// costs at most two generations of disk however hard something spams it.
 /// A cosmic-panel spinning on a dead Wayland connection (virgl, 2026-09-25)
 /// wrote 8.4 M lines, over a gigabyte, before the guest died.
-const DM_LOG_CAP: usize = 8 << 20;
+const DM_LOG_CAP: usize = 4 << 20;
 /// Memory-pressure guard (`mem_guard`): when MemAvailable stays below this
 /// floor for `MEM_GUARD_PERSIST_MS`, init kills the largest process on the
 /// graphical side (see `mem_guard`), as systemd-oomd does. The floor is the
@@ -1559,11 +1561,34 @@ unsafe fn run_dm_logger(rfd: i32) -> ! {
     // Leave the serial console alone: nothing here should print there except
     // a failure to open the log.
     let open_log = || open(DM_LOG.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0o644);
+    // Keep four boots: .2 -> .3, .1 -> .2, current -> .1. Rotation happens
+    // here, once per logger start (a respawned chain within one boot is a new
+    // logger too, so a crash-looping greeter still ages the oldest out).
+    syscall4(nr::RENAMEAT, AT_FDCWD, DM_LOG_OLD2.as_ptr() as usize,
+             AT_FDCWD, DM_LOG_OLD3.as_ptr() as usize);
+    syscall4(nr::RENAMEAT, AT_FDCWD, DM_LOG_OLD.as_ptr() as usize,
+             AT_FDCWD, DM_LOG_OLD2.as_ptr() as usize);
+    syscall4(nr::RENAMEAT, AT_FDCWD, DM_LOG.as_ptr() as usize,
+             AT_FDCWD, DM_LOG_OLD.as_ptr() as usize);
     let mut log = open_log();
     if log < 0 {
         write_str("ERROR: greetd logger cannot open /var/log/greetd.log\n");
     }
     let mut size = 0usize;
+    if log >= 0 {
+        let mut line = [0u8; 48];
+        let head = b"=== boot (uptime ";
+        let mut p = head.len();
+        line[..p].copy_from_slice(head);
+        p += fmt_u32(&mut line[p..], monotonic_secs() as u32);
+        let t = b" s) ===";
+        line[p..p + t.len()].copy_from_slice(t);
+        p += t.len();
+        line[p] = b'\n';
+        p += 1;
+        write(log, line.as_ptr(), p);
+        size += p;
+    }
     let mut rotations = 0u32;
     let buf = &mut *core::ptr::addr_of_mut!(BUF);
     loop {
@@ -1575,9 +1600,9 @@ unsafe fn run_dm_logger(rfd: i32) -> ! {
         }
         let n = n as usize;
         if log >= 0 && size + n > DM_LOG_CAP {
+            // Past the cap within one logger life: start the file over
+            // (O_TRUNC) instead of renaming, so the kept boots .1-.3 survive.
             close(log);
-            syscall4(nr::RENAMEAT, AT_FDCWD, DM_LOG.as_ptr() as usize,
-                     AT_FDCWD, DM_LOG_OLD.as_ptr() as usize);
             log = open_log();
             size = 0;
             rotations = rotations.saturating_add(1);
@@ -1587,7 +1612,7 @@ unsafe fn run_dm_logger(rfd: i32) -> ! {
                 let mut p = head.len();
                 line[..p].copy_from_slice(head);
                 p += fmt_u32(&mut line[p..], rotations);
-                let tail = b"; previous in greetd.log.1)\n";
+                let tail = b"; earlier output of this boot dropped)\n";
                 line[p..p + tail.len()].copy_from_slice(tail);
                 p += tail.len();
                 write(log, line.as_ptr(), p);
