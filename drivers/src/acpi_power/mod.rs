@@ -67,6 +67,9 @@ pub fn init(rsdp_phys: u64, hhdm_offset: u64) {
     power::init(rsdp_phys, hhdm_offset)
 }
 
+/// Evaluate arbitrary AML under the interpreter lock (task context only).
+pub fn with_ns<T>(f: impl FnOnce(&mut aml::Ns, &mut dyn aml::Host) -> T) -> Option<T> { power::with_ns(f) }
+
 /// Number of batteries (`PNP0C0A` devices) the firmware describes.
 pub fn battery_count() -> usize { power::battery_count() }
 
