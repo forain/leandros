@@ -1930,6 +1930,8 @@ fn kfacil_init(hhdm_offset: u64) {
     #[cfg(target_arch = "x86_64")]
     drivers::pci::init_ecam_from_acpi(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr }, hhdm_offset);
     #[cfg(target_arch = "x86_64")]
+    power::log_reset_cause();
+    #[cfg(target_arch = "x86_64")]
     drivers::usb_hcd::early_quiesce();
     #[cfg(not(target_arch = "x86_64"))]
     let _ = hhdm_offset;

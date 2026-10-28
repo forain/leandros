@@ -32,8 +32,10 @@ unsafe fn inb(port: u16) -> u8 {
 /// Read one CMOS register. Bit 7 of the index is the NMI-disable latch; it
 /// is left clear so this never changes the NMI state behind the caller.
 unsafe fn cmos_read(reg: u8) -> u8 {
-    outb(CMOS_ADDR, reg & 0x7f);
-    inb(CMOS_DATA)
+    drivers::acpi_power::cmos_locked(|| {
+        outb(CMOS_ADDR, reg & 0x7f);
+        inb(CMOS_DATA)
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,8 +125,10 @@ const REG_STATUS_C: u8 = 0x0C;
 const AIE: u8 = 0x20;
 
 unsafe fn cmos_write(reg: u8, v: u8) {
-    outb(CMOS_ADDR, reg & 0x7f);
-    outb(CMOS_DATA, v);
+    drivers::acpi_power::cmos_locked(|| {
+        outb(CMOS_ADDR, reg & 0x7f);
+        outb(CMOS_DATA, v);
+    })
 }
 
 unsafe fn wait_uip() -> bool {

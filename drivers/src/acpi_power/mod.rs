@@ -18,6 +18,7 @@ use alloc::string::String;
 
 pub mod aml;
 pub mod ec;
+pub mod gl;
 mod power;
 
 /// `status` values (Linux POWER_SUPPLY_STATUS_*).
@@ -125,3 +126,18 @@ pub fn sx_typ(name: &str) -> Option<(u8, u8)> { power::sx_typ(name) }
 pub fn pause_poll(on: bool) { power::pause_poll(on) }
 /// Diagnostic: evaluate `_PTS(3)` (and `_WAK(3)` when `with_wak`) without ever entering a sleep state.
 pub fn s3_dryrun(with_wak: bool) { power::s3_dryrun(with_wak) }
+
+static CMOS_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+/// Run `f` with the one CMOS index/data lock (0x70..0x73) held and interrupts masked.
+/// Shared by the AML SystemCMOS/SystemIO accesses and `arch_x86_64::rtc` so an
+/// index write is never separated from its data access by the other party.
+pub fn cmos_locked<T>(f: impl FnOnce() -> T) -> T {
+    let fl = sched::ksync::irq_save();
+    let g = CMOS_LOCK.lock();
+    let r = f();
+    drop(g);
+    sched::ksync::irq_restore(fl);
+    r
+}
+/// FACS global-lock acquire timeouts since boot (should stay 0).
+pub fn gl_fails() -> u32 { power::gl_fails() }

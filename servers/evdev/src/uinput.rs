@@ -22,6 +22,7 @@ pub struct Ctx {
     key: [u8; KEY_BITMAP_BYTES],
     rel: u16,
     abs: u64,
+    prop: u32,
     absinfo: [[i32; 6]; ABS_CODES],
     bus: u16,
     vendor: u16,
@@ -32,7 +33,7 @@ pub struct Ctx {
 
 const CTX0: Ctx = Ctx {
     in_use: false, created: false, open_id: 0, dev: 0, evbits: 0,
-    key: [0; KEY_BITMAP_BYTES], rel: 0, abs: 0, absinfo: [[0; 6]; ABS_CODES],
+    key: [0; KEY_BITMAP_BYTES], rel: 0, abs: 0, prop: 0, absinfo: [[0; 6]; ABS_CODES],
     bus: 0, vendor: 0, product: 0, name: [0; NAME_MAX], name_len: 0,
 };
 
@@ -41,6 +42,7 @@ static CTXS: Mutex<[Ctx; MAX_CTX]> = Mutex::new([CTX0; MAX_CTX]);
 /// Is `kind` one of the uinput-backed device kinds?
 pub fn is_kind(kind: u8) -> bool {
     kind == DEVKIND_UINPUT || kind == DEVKIND_UINPUT_PAD || kind == DEVKIND_UINPUT_MOUSE
+        || kind == DEVKIND_UINPUT_TOUCHPAD
 }
 
 fn with_ctxs<R>(f: impl FnOnce(&mut [Ctx; MAX_CTX]) -> R) -> R {
@@ -73,6 +75,11 @@ pub fn absinfo(dev_id: usize, abs: usize) -> Option<[i32; 6]> {
         .map(|c| c.absinfo[abs]))
 }
 
+/// INPUT_PROP_* bitmask (first 32 props) of the uinput node `dev_id`.
+pub fn props(dev_id: usize) -> u32 {
+    with_ctxs(|cs| cs.iter().find(|c| c.in_use && c.created && c.dev == dev_id as u32).map_or(0, |c| c.prop))
+}
+
 fn destroy_at(open_id: u32, only_node: bool) -> bool {
     let dev = with_ctxs(|cs| {
         let c = cs.iter_mut().find(|c| c.in_use && c.open_id == open_id)?;
@@ -95,7 +102,8 @@ fn create(open_id: u32) -> Message {
     let (kind, name, nlen, bus, vendor, product) = match with_ctxs(|cs| {
         let c = cs.iter().find(|c| c.in_use && c.open_id == open_id)?;
         if c.created { return Some(None); }
-        let kind = if c.key[0x120 / 8] & (1 << (0x120 % 8)) != 0 || c.key[0x130 / 8] & (1 << (0x130 % 8)) != 0 {
+        let mt = c.abs & (1u64 << 0x2f) != 0 && c.abs & (1u64 << 0x35) != 0;
+        let kind = if mt { DEVKIND_UINPUT_TOUCHPAD } else if c.key[0x120 / 8] & (1 << (0x120 % 8)) != 0 || c.key[0x130 / 8] & (1 << (0x130 % 8)) != 0 {
             DEVKIND_UINPUT_PAD
         } else if c.rel & 1 != 0 { DEVKIND_UINPUT_MOUSE } else { DEVKIND_UINPUT };
         Some(Some((kind, c.name, c.name_len, c.bus, c.vendor, c.product)))
@@ -105,6 +113,11 @@ fn create(open_id: u32) -> Message {
     let dev = match register_input_device(kind, nm, bus, vendor, product) {
         Some(d) => d, None => return err_reply(-12),
     };
+    if kind == DEVKIND_UINPUT_TOUCHPAD {
+        let n = with_ctxs(|cs| cs.iter().find(|c| c.in_use && c.open_id == open_id)
+            .map_or(0, |c| c.absinfo[0x2f][2] + 1));
+        mt_init(dev, n.max(1) as usize);
+    }
     let ok = with_ctxs(|cs| match cs.iter_mut().find(|c| c.in_use && c.open_id == open_id) {
         Some(c) => { c.created = true; c.dev = dev; true }
         None => false,
@@ -197,6 +210,7 @@ fn do_ioctl(msg: &Message, open_id: u32) -> Message {
         100 => { if v >= 32 { return err_reply(-22); } set_bit(&mut |c| { if c.created { return false; } c.evbits |= 1 << v; true }) }
         101 => { if v >= KEY_BITMAP_BYTES * 8 { return err_reply(-22); } set_bit(&mut |c| { if c.created { return false; } c.key[v / 8] |= 1 << (v % 8); true }) }
         102 => { if v >= 16 { return err_reply(-22); } set_bit(&mut |c| { if c.created { return false; } c.rel |= 1 << v; true }) }
+        110 => { if v >= 32 { return err_reply(-22); } set_bit(&mut |c| { if c.created { return false; } c.prop |= 1 << v; true }) }
         103 => { if v >= ABS_CODES { return err_reply(-22); } set_bit(&mut |c| { if c.created { return false; } c.abs |= 1 << v; true }) }
         _ => err_reply(-25),
     }

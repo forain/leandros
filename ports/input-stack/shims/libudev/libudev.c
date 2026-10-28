@@ -267,6 +267,7 @@ static int bit_set(const unsigned char *b, size_t len, unsigned bit) {
 
 static unsigned cls_from_kind(const char *kind) {
 	if (strcmp(kind, "kbd") == 0) return C_KEYBOARD | C_KEY;
+	if (strcmp(kind, "touchpad") == 0) return C_TOUCHPAD;
 	return C_MOUSE; /* "mouse", and "tablet" = virtio-tablet absolute pointer */
 }
 
