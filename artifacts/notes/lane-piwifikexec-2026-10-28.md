@@ -13,3 +13,6 @@ wifi_mgr.rs `note_failure` / `note_success`; knob `wifi.wrongkey_bss=N` (default
   the weak-BSS failure did not recur (intermittent), so T1 is the proof. Left on good.
 - Builds: aarch64 --rpi5, aarch64, x86_64 INTEL=1: 0 errors.
 - Open: BSS 84:78:48:d8:7e:79 rejects with reason 2 on every boot; stamp timestamp_s on success.
+- Regress (box, aarch64): first run 56/57, wifisimtest left-associated failed: the WRONG_KEY BSS back-off survived a
+  profile reload. Fix: ProfilesChanged also clears wk_bss and bss_backoff. Re-run wifisimtest PASS; brcmf-tests 82/82.
+  (The Pi kexec runs used the build before this reload-clear amendment; the reload path is unrelated to kexec.)
