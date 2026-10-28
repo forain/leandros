@@ -16,7 +16,7 @@
 //! lists the outputs (with EDID modes) but cannot light them. No HPD
 //! interrupt and no hotplug uevent: status updates when a client asks.
 //!
-//! Knobs: `i915.extout=0` registers nothing; `i915.extout_aux=0` skips the
+//! Knobs: `i915.extout=1` enables it (default off until cosmic-comp is verified with the extras); `i915.extout_aux=0` skips the
 //! boot-time AUX probe of unplugged ports (the register-path proof).
 //! Inert on failure: every probe is bounded, a failure reads "disconnected".
 
@@ -113,7 +113,7 @@ pub(super) fn set_vbt(vbt: &[u8]) {
 
 /// From `kms::init`, before the backend registers.
 pub(super) fn init(d: &Device) {
-    if opt("i915.extout") == Some(0) { ilog!("outputs: i915.extout=0, external connectors not reported"); return; }
+    if opt("i915.extout") != Some(1) { ilog!("outputs: external connectors not reported (i915.extout=1 to enable)"); return; }
     MMIO.store(d.mmio.va, Ordering::Release);
     FAKE.store(d.fake, Ordering::Release);
     let m = d.mmio;
