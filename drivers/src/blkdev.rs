@@ -32,7 +32,7 @@
 //! stalls virtio I/O and registration from a USB enumeration thread never
 //! blocks readers.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
 
 pub use crate::blockdev::{
@@ -358,6 +358,7 @@ pub fn read_block(dev_idx: usize, blk: u64, buf: &mut [u8; BLOCK]) -> bool {
 /// `buf.len()` must be a non-zero multiple of 4096.
 pub fn read_blocks(dev_idx: usize, blk: u64, buf: &mut [u8]) -> bool {
     if buf.is_empty() || buf.len() % BLOCK != 0 { return false; }
+    let _io = io_enter();
     let e = match get(dev_idx) { Some(e) => e, None => return false };
     // Per-thread device-read count: tells a major page fault from a
     // page-cache hit (sched::page_fault).
@@ -377,6 +378,7 @@ pub fn read_only(dev_idx: usize) -> bool {
 
 /// Write one 4096-byte block to device `dev_idx` at logical block `blk`.
 pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK]) -> bool {
+    let _io = io_enter();
     let e = match get(dev_idx) { Some(e) => e, None => return false };
     if e.dev.read_only() { return false; }
     match locate(&e, blk, BLOCK) {
@@ -391,6 +393,7 @@ pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK]) -> bool {
 /// of one per block — on a USB stick each small write is expensive.
 pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
     if buf.is_empty() || buf.len() % BLOCK != 0 { return false; }
+    let _io = io_enter();
     let e = match get(dev_idx) { Some(e) => e, None => return false };
     if e.dev.read_only() { return false; }
     match locate(&e, blk, buf.len()) {
@@ -401,6 +404,7 @@ pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
 
 /// Commit `dev_idx`'s (or its disk's) volatile write cache.
 pub fn flush(dev_idx: usize) -> bool {
+    let _io = io_enter();
     get(dev_idx).map_or(false, |e| e.dev.flush().is_ok())
 }
 
@@ -536,6 +540,7 @@ fn raw_locate(e: &Entry, byte_off: u64, len: usize) -> Option<u64> {
 /// Read `buf.len()` bytes at `byte_off` within entry `idx`; both must be
 /// multiples of the sector size.
 pub fn raw_read(idx: usize, byte_off: u64, buf: &mut [u8]) -> bool {
+    let _io = io_enter();
     let e = match get(idx) { Some(e) => e, None => return false };
     match raw_locate(&e, byte_off, buf.len()) {
         Some(lba) => e.dev.read_sectors(lba, buf).is_ok(),
@@ -554,6 +559,7 @@ pub fn raw_write(idx: usize, byte_off: u64, buf: &[u8], panic_path: bool) -> boo
     } else {
         match get(idx) { Some(e) => e, None => return false }
     };
+    let _io = if panic_path { None } else { Some(io_enter()) };
     if e.dev.read_only() { return false; }
     match raw_locate(&e, byte_off, buf.len()) {
         Some(lba) => if panic_path {
@@ -580,6 +586,71 @@ pub fn flush_all_disks() -> (usize, usize) {
         if e.dev.flush().is_ok() { ok += 1; } else { bad += 1; }
     }
     (ok, bad)
+}
+
+// ── System sleep gate (kernel pm) ───────────────────────────────────────────
+
+/// Set while the devices are quiesced for a suspend cycle: new requests wait
+/// (bounded, so a stuck cycle cannot wedge the system: after `PM_WAIT_MAX_NS`
+/// a request goes through anyway and is counted in `PM_LEAKED`).
+static PM_FROZEN: AtomicBool = AtomicBool::new(false);
+static PM_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static PM_WAITED: AtomicUsize = AtomicUsize::new(0);
+static PM_LEAKED: AtomicUsize = AtomicUsize::new(0);
+const PM_WAIT_MAX_NS: u64 = 10_000_000_000;
+
+struct IoGuard;
+impl Drop for IoGuard {
+    fn drop(&mut self) { PM_INFLIGHT.fetch_sub(1, Ordering::SeqCst); }
+}
+
+fn io_enter() -> IoGuard {
+    PM_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+    if !PM_FROZEN.load(Ordering::SeqCst) { return IoGuard; }
+    PM_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    PM_WAITED.fetch_add(1, Ordering::Relaxed);
+    let deadline = sched::monotonic_ns().saturating_add(PM_WAIT_MAX_NS);
+    loop {
+        if sched::irqctx::can_sleep() { sched::kthread::msleep(1); } else { sched::kthread::udelay(200); }
+        PM_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+        if !PM_FROZEN.load(Ordering::SeqCst) { return IoGuard; }
+        if sched::monotonic_ns() >= deadline { PM_LEAKED.fetch_add(1, Ordering::Relaxed); return IoGuard; }
+        PM_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Suspend hook: stop new requests, wait up to `timeout_ms` for the ones in
+/// flight (all requests are synchronous), then commit every disk's write
+/// cache. On a drain timeout the gate is reopened and the hook fails.
+pub fn pm_freeze(timeout_ms: u64) -> Result<alloc::string::String, alloc::string::String> {
+    PM_WAITED.store(0, Ordering::Relaxed);
+    PM_LEAKED.store(0, Ordering::Relaxed);
+    PM_FROZEN.store(true, Ordering::SeqCst);
+    let t = sched::monotonic_ns();
+    let deadline = t.saturating_add(timeout_ms * 1_000_000);
+    while PM_INFLIGHT.load(Ordering::SeqCst) != 0 {
+        if sched::monotonic_ns() >= deadline {
+            PM_FROZEN.store(false, Ordering::SeqCst);
+            return Err(alloc::format!("{} request(s) still in flight after {} ms", PM_INFLIGHT.load(Ordering::SeqCst), timeout_ms));
+        }
+        sched::kthread::msleep(1);
+    }
+    let drained = (sched::monotonic_ns() - t) / 1000;
+    // flush_all_disks goes straight to the devices, under the gate.
+    let (ok, bad) = flush_all_disks();
+    if bad != 0 {
+        PM_FROZEN.store(false, Ordering::SeqCst);
+        return Err(alloc::format!("write-cache flush failed on {} of {} disk(s)", bad, ok + bad));
+    }
+    Ok(alloc::format!("{} disk(s): drained in {} us, write caches flushed", ok, drained))
+}
+
+/// Resume hook: reopen the gate; reports how many requests waited.
+pub fn pm_thaw() -> Result<alloc::string::String, alloc::string::String> {
+    PM_FROZEN.store(false, Ordering::SeqCst);
+    let (w, l) = (PM_WAITED.load(Ordering::Relaxed), PM_LEAKED.load(Ordering::Relaxed));
+    if l != 0 { return Err(alloc::format!("{} request(s) waited, {} passed the gate on timeout", w, l)); }
+    Ok(alloc::format!("gate open; {} request(s) waited", w))
 }
 
 // ── Names ────────────────────────────────────────────────────────────────────

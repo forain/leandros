@@ -12,6 +12,7 @@ mod hungtask;
 #[cfg(target_arch = "x86_64")]
 mod lappower;
 mod power;
+mod pm;
 mod kexec;
 #[cfg(target_arch = "x86_64")]
 mod direct_hhdm;
