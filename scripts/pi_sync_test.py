@@ -46,4 +46,36 @@ bp = "root:x:0:0:root:/root:/bin/sh\nleandro:x:1000:1000::/home/leandro:/bin/sh\
 t4, n4 = S.merge_db(rp, bp, False)
 check(t4.startswith(rp) and t4.endswith("btd:x:112:112::/:/bin/false\n") and n4 == ["+btd"],
       "passwd merge: existing users untouched, new user appended")
+
+# manifest generation: rg/grep/dmesg/coreutils are required unless --allow-missing
+import tempfile, io, contextlib
+_calls = []
+def _fake_run(cmd, **kw):
+    class R: returncode = 0
+    if "mkfs-f2fs-populated.py" in " ".join(map(str, cmd)):
+        _calls.append(kw["env"].get("LEANDROS_REQUIRE"))
+        if kw["env"].get("LEANDROS_REQUIRE"):
+            kw["stdout"].write("MISSING optional: rg (../ripgrep/x)\nFATAL: required binaries missing (LEANDROS_REQUIRE): rg\n")
+            kw["stdout"].flush()
+            R.returncode = 1
+        else:
+            open(os.path.join(kw["env"]["LEANDROS_ROOT_MANIFEST"], "manifest.json"), "w").write("{}")
+    return R
+_real_run = S.subprocess.run
+S.subprocess.run = _fake_run
+try:
+    d = tempfile.mkdtemp()
+    buf = io.StringIO()
+    died = False
+    try:
+        with contextlib.redirect_stdout(buf):
+            S.build_manifest(d, None, os.path.join(d, "l.log"))
+    except SystemExit:
+        died = True
+    check(died and "MISSING optional: rg" in buf.getvalue(), "manifest without /bin/rg fails with the MISSING message")
+    check(_calls[-1] == "rg,grep,dmesg,coreutils", "default requires rg,grep,dmesg,coreutils")
+    S.build_manifest(d, None, os.path.join(d, "l2.log"), allow_missing=True)
+    check(_calls[-1] is None, "--allow-missing passes without LEANDROS_REQUIRE")
+finally:
+    S.subprocess.run = _real_run
 sys.exit(1 if fails else 0)

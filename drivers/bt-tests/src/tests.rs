@@ -636,3 +636,30 @@ mod hci0 {
         assert_eq!(q.with(|q| q.read(4096)), Err(EIO));
     }
 }
+
+// ── bdaddr selection (bt.bdaddr=) ────────────────────────────────────────────
+
+#[test]
+fn bdaddr_from_otp_mac_is_lsb_first() {
+    let a = bringup::bdaddr_from_mac(&[0xd8, 0x3a, 0xdd, 0x12, 0x34, 0x58]);
+    assert_eq!(a.0, [0x58, 0x34, 0x12, 0xdd, 0x3a, 0xd8], "WRITE_BD_ADDR payload is LSB first");
+    assert_eq!(format!("{}", a), "d8:3a:dd:12:34:58");
+}
+
+#[test]
+fn bdaddr_knob_selection() {
+    let dt = Some(BdAddr([1, 2, 3, 4, 5, 6]));
+    let otp = Some(bringup::bdaddr_from_mac(&[0xd8, 0x3a, 0xdd, 0, 0, 2]));
+    assert_eq!(bringup::pick_bdaddr(None, None, otp), (otp, "set-from-otp"));
+    assert_eq!(bringup::pick_bdaddr(Some("auto"), dt, otp), (dt, "set-from-dt"));
+    assert_eq!(bringup::pick_bdaddr(Some("auto"), Some(BdAddr([0; 6])), otp), (otp, "set-from-otp"));
+    assert_eq!(bringup::pick_bdaddr(Some("dt"), None, otp), (None, "set-from-dt"));
+    assert_eq!(bringup::pick_bdaddr(Some("otp"), dt, otp), (otp, "set-from-otp"));
+    assert_eq!(bringup::pick_bdaddr(Some("keep"), dt, otp), (None, "placeholder"));
+    assert_eq!(bringup::pick_bdaddr(None, None, None), (None, "set-from-otp"));
+    let (a, l) = bringup::pick_bdaddr(Some("aa:bb:cc:dd:ee:ff"), dt, otp);
+    assert_eq!((a.unwrap().0, l), ([0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa], "set-from-cmdline"));
+    assert_eq!(bringup::pick_bdaddr(Some("zz:bb"), dt, otp).1, "set-from-dt");
+    assert!(bringup::parse_bdaddr_text("aa:bb:cc:dd:ee").is_none());
+    assert!(bringup::parse_bdaddr_text("00:00:00:00:00:00").is_none());
+}

@@ -101,6 +101,11 @@ pub fn init_acpi(rsdp_phys: u64, hhdm_offset: u64) {
 }
 
 /// The FADT's verdict on a PS/2 (i8042) controller: `Some(present)` from
+#[cfg(target_arch = "x86_64")]
+pub fn acpi_power() -> Option<&'static boot::acpi::AcpiPower> {
+    unsafe { (*core::ptr::addr_of!(ACPI_POWER)).as_ref() }
+}
+
 /// IAPC_BOOT_ARCH bit 1 on a revision >= 2 FADT, `None` when there is no
 /// FADT or it predates the field (Linux's rule, `acpi_boot_init`).
 #[cfg(target_arch = "x86_64")]

@@ -106,6 +106,9 @@ fn board_thread() {
             && sched::monotonic_ns().saturating_sub(ACT_LAST_NS.load(Ordering::Relaxed)) > ACT_HOLD_NS {
             act(false);
         }
+        if t % 1_000 == 0 && RP1_UP.load(Ordering::Acquire) {
+            crate::rp1_fan::tick(crate::thermal::soc_millicelsius());
+        }
         if !rpm_logged && t >= 5_000 && RP1_UP.load(Ordering::Acquire) {
             rpm_logged = true;
             if let Some(r) = crate::rp1_fan::rpm() {

@@ -31,8 +31,13 @@
 # no PT_INTERP, first PT_LOAD @ 0x200000.
 #
 # Output binaries are staged to:
-#   ~/code/leandros-artifacts/greetd-lane/<arch>/greetd
-# which is where scripts/mkfs-f2fs-populated.py picks them up for /bin/greetd.
+#   ~/code/leandros-artifacts/greetd-lane/<arch>/<srchash>/{greetd,fakegreet,greetd.srchash}
+# keyed by the sha256 of the pam-leandros sources, so lanes building different
+# sources never overwrite each other. scripts/mkfs-f2fs-populated.py picks the
+# directory matching its own checkout (and runs this script when it is missing).
+# <arch>/greetd (+ fakegreet, greetd.srchash) is still refreshed as a
+# latest-build copy for older tooling; nothing in the image build trusts it.
+# Env: ARCHES="aarch64" limits the build; FORCE=1 rebuilds a cached hash.
 set -euo pipefail
 # macOS: pick an SDK whose libSystem the linker can read (see darwin-sdk.sh).
 source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/darwin-sdk.sh"
@@ -52,6 +57,7 @@ if [ ! -d "$SRC" ]; then
   git -C "$SRC" apply "$HERE/patches/0001-leandros.patch"
   git -C "$SRC" apply "$HERE/patches/0002-fakegreet-leandros.patch"
   git -C "$SRC" apply "$HERE/patches/0003-socket-dir-leandros.patch"
+  git -C "$SRC" apply "$HERE/patches/0004-trace-leandros.patch"
 fi
 
 # The PAM provider is ours and lives in-repo; refresh it every run so an edit
@@ -71,18 +77,27 @@ linker = "rust-lld"
 linker = "rust-lld"
 CFG
 
-for arch in aarch64 x86_64; do
+SRCHASH=$(cd "$HERE/pam-leandros/src" && LC_ALL=C cat $(LC_ALL=C ls) | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d" " -f1)
+
+for arch in ${ARCHES:-aarch64 x86_64}; do
+  KEYED="$SHIP/$arch/$SRCHASH"
+  if [ -z "${FORCE:-}" ] && [ -x "$KEYED/greetd" ] && [ -x "$KEYED/fakegreet" ]; then
+    echo "cached $arch: $KEYED"
+    continue
+  fi
   target="${arch}-unknown-linux-musl"
   (
     cd "$SRC"
     RUSTFLAGS="-C relocation-model=static -L native=$WORK/linkstub" \
       cargo +nightly build --release -p greetd -p fakegreet --target "$target"
   )
-  mkdir -p "$SHIP/$arch"
-  install -m 0755 "$SRC/target/$target/release/greetd" "$SHIP/$arch/greetd"
-  install -m 0755 "$SRC/target/$target/release/fakegreet" "$SHIP/$arch/fakegreet"
-  (cd "$HERE/pam-leandros/src" && LC_ALL=C cat $(LC_ALL=C ls) | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d" " -f1) > "$SHIP/$arch/greetd.srchash"
-  echo "staged $arch: $SHIP/$arch/greetd + fakegreet"
+  mkdir -p "$KEYED"
+  install -m 0755 "$SRC/target/$target/release/greetd" "$KEYED/greetd"
+  install -m 0755 "$SRC/target/$target/release/fakegreet" "$KEYED/fakegreet"
+  echo "$SRCHASH" > "$KEYED/greetd.srchash"
+  # Latest-build compatibility copies (not trusted by mkfs-f2fs-populated.py).
+  cp -f "$KEYED/greetd" "$KEYED/fakegreet" "$KEYED/greetd.srchash" "$SHIP/$arch/"
+  echo "staged $arch: $KEYED"
 done
 
 echo "done. Rebuild the f2fs images (scripts/mkfs-f2fs-populated.py) to pick up greetd."

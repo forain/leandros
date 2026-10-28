@@ -139,6 +139,12 @@ fn trace_write(space: u8, addr: u64, w: u8, val: u64) {
 /// requested from deep inside a field access, so it cannot be hoisted out.
 static GL: super::gl::Gl = super::gl::Gl::new();
 const GL_TRIES: u32 = 10_000;
+/// Virtual address of the FACS (mapped like the AML memory regions), if the FADT named one.
+pub fn facs_va() -> Option<usize> {
+    let phys = FACS_PHYS.load(Ordering::Relaxed);
+    if phys == 0 { return None; }
+    mem_va(phys)
+}
 fn facs_word() -> Option<&'static core::sync::atomic::AtomicU32> {
     let phys = FACS_PHYS.load(Ordering::Relaxed);
     if phys == 0 { return None; }

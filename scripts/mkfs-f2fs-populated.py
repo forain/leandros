@@ -96,6 +96,31 @@ def _greetd_src_hash():
     return h.hexdigest()
 
 
+def _greetd_stage_dir(arch):
+    """Directory holding the greetd built from THIS checkout's pam-leandros
+    sources: greetd-lane/<arch>/<srchash>/. Never the shared latest-build copy
+    (another lane may have built different sources there). Missing -> run
+    ports/greetd/build.sh for this arch (cached per hash). Returns None when
+    the cache is absent and GREETD_NO_AUTOBUILD is set (image ships no greetd,
+    as before when nothing was staged)."""
+    import subprocess
+    d = os.path.expanduser(
+        f"~/code/leandros-artifacts/greetd-lane/{arch}/{_greetd_src_hash()}")
+    if os.path.exists(os.path.join(d, "greetd")):
+        return d
+    if os.environ.get("GREETD_NO_AUTOBUILD"):
+        return None
+    build = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "..", "ports", "greetd", "build.sh")
+    print(f"greetd for {arch} ({_greetd_src_hash()[:12]}) not staged; "
+          f"running ports/greetd/build.sh", file=sys.stderr)
+    r = subprocess.run(["bash", build], env=dict(os.environ, ARCHES=arch))
+    if r.returncode != 0 or not os.path.exists(os.path.join(d, "greetd")):
+        sys.exit(f"error: ports/greetd/build.sh failed for {arch}; "
+                 f"expected {d}/greetd")
+    return d
+
+
 def _check_greetd_fresh(path):
     """Refuse a greetd whose embedded PAM shim predates sha512-crypt shadow.
 
@@ -1689,9 +1714,9 @@ def main():
     # it is packed straight into /bin like any other static binary. Its config,
     # its PAM service marker and the /etc/profile that carries the session
     # environment ride the /etc directory registration further down.
-    greetd_bin = os.path.expanduser(
-        f"~/code/leandros-artifacts/greetd-lane/{arch}/greetd")
-    if os.path.exists(greetd_bin):
+    greetd_dir = _greetd_stage_dir(arch)
+    greetd_bin = os.path.join(greetd_dir, "greetd") if greetd_dir else None
+    if greetd_bin and os.path.exists(greetd_bin):
         _check_greetd_fresh(greetd_bin)
         bin_files.append(("greetd", greetd_bin, 0o100755))
 
@@ -1702,9 +1727,8 @@ def main():
     # without starting anything. It is how the greeter half (render environment,
     # DRM, socket, the DBUS_SYSTEM_BUS_ADDRESS trap) gets proven with none of
     # the daemon's risk surface in frame.
-    fakegreet_bin = os.path.expanduser(
-        f"~/code/leandros-artifacts/greetd-lane/{arch}/fakegreet")
-    if os.path.exists(fakegreet_bin):
+    fakegreet_bin = os.path.join(greetd_dir, "fakegreet") if greetd_dir else None
+    if fakegreet_bin and os.path.exists(fakegreet_bin):
         bin_files.append(("fakegreet", fakegreet_bin, 0o100755))
 
     # The two greeter launchers and the environment they share, POSIX-sh
@@ -1885,6 +1909,12 @@ def main():
     p = f"../ripgrep/target/{_musl_triple}/release/rg"
     if os.path.exists(p):
         bin_files.append(("rg", p, 0o100755))
+    # grep/egrep/fgrep: userland/grep, a POSIX grep front end that runs /bin/rg
+    # (argv0 selects -E / -F). One binary, three names.
+    p = f"userland/grep/target/{_musl_triple}/release/grep"
+    if os.path.exists(p):
+        for _g in ("grep", "egrep", "fgrep"):
+            bin_files.append((_g, p, 0o100755))
 
     # spawnwedge: the musl thread/fork lock-handoff regression test (the
     # cosmic-comp keybinding wedge). A std/musl crate with its own build.sh
@@ -2722,6 +2752,27 @@ def main():
               f"{len(_git_won)}: {' '.join(sorted(_git_won))}")
     else:
         print(f"  (no git staged: {_git_root} missing — ports/git/build.sh {arch})")
+
+    # Optional binaries are skipped silently when their build output is absent.
+    # Say so, and let LEANDROS_REQUIRE=rg,grep,dmesg,coreutils make it fatal.
+    _opt_src = {
+        "rg": f"../ripgrep/target/{_musl_triple}/release/rg",
+        "grep": f"userland/grep/target/{_musl_triple}/release/grep",
+        "dmesg": "userland/dmesg/dmesg.sh",
+        "coreutils": coreutils_bin,
+        "disktester": f"../disks-rs/target/{_musl_triple}/release/disktester",
+    }
+    _have = {name for name, _path, _mode in bin_files}
+    _missing = [n for n in _opt_src if n not in _have]
+    for _n in _missing:
+        print(f"MISSING optional: {_n} ({_opt_src[_n]})")
+    if _missing:
+        print(f"MISSING optional summary: {len(_missing)} skipped: {' '.join(_missing)}")
+    _req = [r for r in os.environ.get("LEANDROS_REQUIRE", "").split(",") if r]
+    _fatal = [r for r in _req if r in _missing or r not in _have]
+    if _fatal:
+        print(f"FATAL: required binaries missing (LEANDROS_REQUIRE): {' '.join(_fatal)}")
+        sys.exit(1)
 
     if any(name == "doom" for name, _path, _mode in bin_files):
         m4_share_dirs.update(("/usr/share", "/usr/share/soundfonts"))
