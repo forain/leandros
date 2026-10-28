@@ -53,6 +53,9 @@ pub(crate) static NETD_TX_HELD_SLEEPS: core::sync::atomic::AtomicU64 = core::syn
 pub(crate) static NETD_IMMEDIATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Timer-limited sleeps by length: <100 us, <1 ms, <10 ms, >= 10 ms.
 pub(crate) static NETD_SLEEP_HIST: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+/// Frames sent / received per pass: 0, 1, 2-7, 8-63, 64+.
+pub(crate) static NETD_TX_HIST: [core::sync::atomic::AtomicU64; 5] = [const { core::sync::atomic::AtomicU64::new(0) }; 5];
+pub(crate) static NETD_RX_HIST: [core::sync::atomic::AtomicU64; 5] = [const { core::sync::atomic::AtomicU64::new(0) }; 5];
 pub(crate) static NETD_ACTIVE_SLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static NETD_EARLY_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static NETD_EARLY_SITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -143,6 +146,11 @@ fn nic(w: &mut Out) {
                      (0..4).map(drivers::virtio_net::rx_irq_count).sum::<u64>(),
                      TCP_RXBUF_LAST.load(Ordering::Relaxed),
                      crate::netctl::WAKES.load(Ordering::Relaxed));
+    let _ = write!(w, "netd_pass_hist: tx");
+    for h in NETD_TX_HIST.iter() { let _ = write!(w, " {}", h.load(Ordering::Relaxed)); }
+    let _ = write!(w, " rx");
+    for h in NETD_RX_HIST.iter() { let _ = write!(w, " {}", h.load(Ordering::Relaxed)); }
+    let _ = writeln!(w, " (0/1/2-7/8-63/64+)");
     let r = &smoltcp::socket::tcp::RECOVERY_STATS;
     let _ = writeln!(w, "tcp_recovery: fast_retransmit {} rto {} partial_ack {} dup_acks {}",
                      r[0].load(Ordering::Relaxed), r[1].load(Ordering::Relaxed),
@@ -172,6 +180,7 @@ pub fn generate(name: &[u8], out: &mut Vec<u8>) -> bool {
         b"udp"   => inet(&mut w, false),
         b"unix"  => unix(&mut w),
         b"nic"   => nic(&mut w),
+        b"tcpsnd" => tcpsnd(&mut w),
         b"listen" => super::listen::proc_listen(&mut w),
         b"igmp"  => {
             let mut t = alloc::string::String::new();
@@ -332,6 +341,28 @@ fn udp_local(sid: Sid, h: SocketHandle) -> Option<([u8; 4], u16)> {
 
 fn ep4(e: Option<IpEndpoint>) -> ([u8; 4], u16) {
     e.map(|e| (v4(e.addr), e.port)).unwrap_or(([0; 4], 0))
+}
+
+/// /proc/net/tcpsnd (LeandrOS-specific): the sender state of every TCP socket
+/// that has data in flight or queued (see `SenderSnapshot`).
+fn tcpsnd(w: &mut Out) {
+    let _ = writeln!(w, "local-remote una nxt flight wnd ws mss q nagle timer t_ms delay srtt rttvar rto rc dup rec cwnd ssth sent rtx acks dupacks rtofired fast partial bytes_acked");
+    let now = crate::stack_now();
+    for sid in 0..MAX_STACKS as Sid {
+        let stack = stack_for(sid);
+        let Some(s) = stack.as_ref() else { continue };
+        for (_, sock) in s.socket_set.iter() {
+            let Some(t) = tcp::Socket::downcast(sock) else { continue };
+            if t.state() != tcp::State::Established && t.state() != tcp::State::CloseWait { continue; }
+            let (Some(l), Some(r)) = (t.local_endpoint(), t.remote_endpoint()) else { continue };
+            let n = t.sender_snapshot(now);
+            if n.sent == 0 && n.tx_queued == 0 { continue; }
+            let _ = writeln!(w, "{:?}-{:?} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                l, r, n.snd_una, n.snd_nxt, n.snd_nxt.wrapping_sub(n.snd_una), n.snd_wnd, n.wscale, n.mss, n.tx_queued,
+                n.nagle as u8, n.timer, n.timer_in_ms, n.timer_delay_ms, n.srtt_ms, n.rttvar_ms, n.rto_ms, n.rto_count,
+                n.dup_acks, n.recover, n.cwnd, n.ssthresh, n.sent, n.rtx, n.acks, n.dupacks, n.rto_fired, n.fast, n.partial, n.bytes_acked);
+        }
+    }
 }
 
 /// /proc/net/tcp (`tcp`) or /proc/net/udp.
