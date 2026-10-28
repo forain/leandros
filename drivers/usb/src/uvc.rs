@@ -26,7 +26,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::platform::{self, Deadline};
@@ -68,6 +68,16 @@ pub struct VideoInfo {
     pub vs_iface: u8,
     pub formats: Vec<FormatDesc>,
     pub alts: Vec<IsochEpDesc>,
+    /// Camera terminal id (0 = none) and its bmControls.
+    pub ct_id: u8,
+    pub ct_ctrls: u32,
+    /// Processing unit id (0 = none) and its bmControls.
+    pub pu_id: u8,
+    pub pu_ctrls: u32,
+}
+
+fn ctrl_bits(d: &[u8]) -> u32 {
+    d.iter().take(4).enumerate().fold(0u32, |a, (i, b)| a | (*b as u32) << (8 * i))
 }
 
 /// Whether `cfg` has a video streaming interface.
@@ -106,6 +116,16 @@ pub fn parse(cfg: &[u8]) -> Option<VideoInfo> {
             0x24 if cur_class == 0x0E && d.len() >= 3 => {
                 if cur_sub == 0x01 && d[2] == 0x01 && d.len() >= 5 && cur_if == v.vc_iface {
                     v.bcd_uvc = le16(d, 3);
+                } else if cur_sub == 0x01 && cur_if == v.vc_iface {
+                    // INPUT_TERMINAL, camera type 0x0201
+                    if d[2] == 0x02 && d.len() >= 15 && le16(d, 4) == 0x0201 && v.ct_id == 0 {
+                        let n = d[14] as usize;
+                        if d.len() >= 15 + n { v.ct_id = d[3]; v.ct_ctrls = ctrl_bits(&d[15..15 + n]); }
+                    // PROCESSING_UNIT
+                    } else if d[2] == 0x05 && d.len() >= 8 && v.pu_id == 0 {
+                        let n = d[7] as usize;
+                        if d.len() >= 8 + n { v.pu_id = d[3]; v.pu_ctrls = ctrl_bits(&d[8..8 + n]); }
+                    }
                 } else if cur_sub == 0x02 && cur_if == v.vs_iface {
                     match d[2] {
                         0x04 | 0x06 if d.len() >= 11 => {
@@ -235,14 +255,15 @@ impl Stream {
     /// Negotiate `format`/`frame` (0 = the device's default) and open the
     /// streaming pipe. `bufs` are the frame buffers (none queued yet). Task
     /// context.
-    pub fn start(f: &UsbFunction, v: &VideoInfo, format: u8, frame: u8, bufs: Vec<Buf>)
+    pub fn start(f: &UsbFunction, v: &VideoInfo, format: u8, frame: u8, interval: u32, bufs: Vec<Buf>)
                  -> Result<Stream, &'static str> {
         let fmt = v.formats.iter().find(|x| x.index == format).or(v.formats.first()).ok_or("no video formats")?;
         let fr = fmt.frames.iter().find(|y| y.index == frame)
             .or(fmt.frames.iter().find(|y| y.index == fmt.default_frame)).or(fmt.frames.first())
             .ok_or("format without frames")?;
         let _ = f.set_interface(v.vs_iface, 0);
-        let neg = negotiate(f, v, fmt.index, fr.index, fr.interval).map_err(|_| "probe/commit failed")?;
+        let want = if interval != 0 { interval } else { fr.interval };
+        let neg = negotiate(f, v, fmt.index, fr.index, want).map_err(|_| "probe/commit failed")?;
         let mut alts: Vec<&IsochEpDesc> = v.alts.iter().collect();
         alts.sort_by_key(|e| alt_bytes(e));
         let alt = alts.iter().find(|e| alt_bytes(e) >= neg.max_payload).or(alts.last())
@@ -250,6 +271,7 @@ impl Stream {
         usb_log!("[UVC] slot {}: format {} frame {} ({}x{}) interval {} max_frame {} max_payload {} -> alt {} ({} B/interval)\n",
                  f.slot, neg.format, neg.frame, fr.width, fr.height, neg.interval, neg.max_frame,
                  neg.max_payload, alt.alt, alt_bytes(alt));
+        apply_controls(f, v);
         let pkt_max = alt_bytes(alt) as usize;
         // 240 TDs: 30 ms at one per 125 µs microframe, more than a 10 ms tick.
         let pipe = IsochPipe::open_ex(f, alt, StreamFormat { rate: 0, frame_bytes: 0 }, 1 << 20, 240, true)?;
@@ -261,7 +283,7 @@ impl Stream {
     }
 
     /// The fake camera's stream (`uvc.fake=1`): no hardware, `poll` synthesizes frames.
-    pub fn start_fake(v: &VideoInfo, format: u8, frame: u8, bufs: Vec<Buf>) -> Result<Stream, &'static str> {
+    pub fn start_fake(v: &VideoInfo, format: u8, frame: u8, _interval: u32, bufs: Vec<Buf>) -> Result<Stream, &'static str> {
         let fmt = v.formats.iter().find(|x| x.index == format).or(v.formats.first()).ok_or("no video formats")?;
         let fr = fmt.frames.iter().find(|y| y.index == frame).or(fmt.frames.first()).ok_or("format without frames")?;
         let neg = Negotiated { format: fmt.index, frame: fr.index, interval: fr.interval, max_frame: fr.max_size, max_payload: 0 };
@@ -397,10 +419,79 @@ static FAKE_CAMERA: AtomicU32 = AtomicU32::new(0);
 const FAKE_JPEG: &[u8] = include_bytes!("fake_cam.jpg");
 static SELFTEST_FRAMES: AtomicU32 = AtomicU32::new(0);
 
+// ── camera terminal controls ────────────────────────────────────────────────
+
+/// CT_AE_PRIORITY request: 0 = constant frame rate (default), 1 = may vary, -1 = leave the device's.
+pub static AE_PRIO: AtomicI32 = AtomicI32::new(0);
+pub const EXPO_DEFAULT: u32 = 0; // leave AE mode alone
+pub const EXPO_MANUAL: u32 = 1;
+pub const EXPO_AUTO: u32 = 2; // explicit aperture priority
+pub static EXPO_MODE: AtomicU32 = AtomicU32::new(EXPO_DEFAULT);
+/// CT_EXPOSURE_TIME_ABSOLUTE, 100 us units, used in manual mode.
+pub static EXPO_ABS: AtomicU32 = AtomicU32::new(0);
+
+const CT_AE_MODE: u8 = 0x02;
+const CT_AE_PRIORITY: u8 = 0x03;
+const CT_EXPOSURE_ABS: u8 = 0x04;
+
+fn ctrl_get(f: &UsbFunction, v: &VideoInfo, sel: u8, req: u8, buf: &mut [u8]) -> Option<usize> {
+    f.control_in(0xA1, req, (sel as u16) << 8, (v.ct_id as u16) << 8 | v.vc_iface as u16, buf).ok()
+}
+fn ctrl_set(f: &UsbFunction, v: &VideoInfo, sel: u8, buf: &[u8]) -> bool {
+    let mut info = [0u8; 1];
+    // GET_INFO bit 1: SET supported.
+    if ctrl_get(f, v, sel, 0x86, &mut info).is_some() && info[0] & 2 == 0 { return false; }
+    f.control_out(0x21, 0x01, (sel as u16) << 8, (v.ct_id as u16) << 8 | v.vc_iface as u16, buf).is_ok()
+}
+
+/// Apply the AE priority / exposure knobs and log the read-back. Never fails the stream.
+fn apply_controls(f: &UsbFunction, v: &VideoInfo) {
+    if v.ct_id == 0 {
+        usb_log!("[UVC] slot {}: no camera terminal\n", f.slot);
+        return;
+    }
+    let has = |bit: u32| v.ct_ctrls & (1 << bit) != 0;
+    let mut b = [0u8; 4];
+    let mode0 = if has(1) && ctrl_get(f, v, CT_AE_MODE, 0x81, &mut b[..1]).is_some() { b[0] as i32 } else { -1 };
+    let prio0 = if has(2) && ctrl_get(f, v, CT_AE_PRIORITY, 0x81, &mut b[..1]).is_some() { b[0] as i32 } else { -1 };
+    let mut bad = 0u32;
+    let prio = AE_PRIO.load(Ordering::Relaxed);
+    if prio >= 0 && has(2) && !ctrl_set(f, v, CT_AE_PRIORITY, &[prio as u8]) { bad += 1; }
+    match EXPO_MODE.load(Ordering::Relaxed) {
+        EXPO_MANUAL if has(1) => {
+            if !ctrl_set(f, v, CT_AE_MODE, &[1]) { bad += 1; }
+            let e = EXPO_ABS.load(Ordering::Relaxed);
+            if e != 0 && has(3) && !ctrl_set(f, v, CT_EXPOSURE_ABS, &e.to_le_bytes()) { bad += 1; }
+        }
+        EXPO_AUTO if has(1) => { if !ctrl_set(f, v, CT_AE_MODE, &[8]) { bad += 1; } }
+        _ => {}
+    }
+    let mode1 = if has(1) && ctrl_get(f, v, CT_AE_MODE, 0x81, &mut b[..1]).is_some() { b[0] as i32 } else { -1 };
+    let prio1 = if has(2) && ctrl_get(f, v, CT_AE_PRIORITY, 0x81, &mut b[..1]).is_some() { b[0] as i32 } else { -1 };
+    let (mut e, mut emin, mut emax) = (-1i64, -1i64, -1i64);
+    if has(3) {
+        let rd = |req: u8| { let mut x = [0u8; 4]; ctrl_get(f, v, CT_EXPOSURE_ABS, req, &mut x).map(|_| u32::from_le_bytes(x) as i64).unwrap_or(-1) };
+        e = rd(0x81); emin = rd(0x82); emax = rd(0x83);
+    }
+    usb_log!("[UVC] slot {}: ae_mode {} -> {} ae_prio {} -> {}, exposure_abs {} (min {} max {}){}\n",
+             f.slot, mode0, mode1, prio0, prio1, e, emin, emax, if bad != 0 { " [some controls refused]" } else { "" });
+}
+
 /// Parse `uvc.selftest=<frames>`.
 pub fn set_cmdline(cmdline: &str) {
     for tok in cmdline.split_ascii_whitespace() {
         if tok == "uvc.fake=1" { FAKE_CAMERA.store(1, Ordering::Relaxed); }
+        if let Some(v) = tok.strip_prefix("uvc.ae_prio=") {
+            match v { "0" => AE_PRIO.store(0, Ordering::Relaxed), "1" => AE_PRIO.store(1, Ordering::Relaxed),
+                      _ => AE_PRIO.store(-1, Ordering::Relaxed) }
+        }
+        if let Some(v) = tok.strip_prefix("uvc.exposure=") {
+            if v == "auto" { EXPO_MODE.store(EXPO_DEFAULT, Ordering::Relaxed); }
+            else if let Some(n) = v.strip_prefix("manual:").and_then(|x| x.parse::<u32>().ok()) {
+                EXPO_MODE.store(EXPO_MANUAL, Ordering::Relaxed);
+                EXPO_ABS.store(n, Ordering::Relaxed);
+            }
+        }
         if let Some(v) = tok.strip_prefix("uvc.selftest=") {
             if let Ok(n) = v.parse::<u32>() { SELFTEST_FRAMES.store(n, Ordering::Relaxed); }
         }
@@ -415,6 +506,10 @@ fn fmt_name(k: u8) -> &'static str {
 pub fn dump(slot: u8, v: &VideoInfo) {
     usb_log!("[UVC] slot {}: UVC {:x}.{:02x}, VC iface {}, VS iface {}, {} format(s), {} isoch alt(s)\n",
              slot, v.bcd_uvc >> 8, v.bcd_uvc & 0xFF, v.vc_iface, v.vs_iface, v.formats.len(), v.alts.len());
+    if v.ct_id != 0 || v.pu_id != 0 {
+        usb_log!("[UVC] slot {}: camera terminal {} controls {:#010x}, processing unit {} controls {:#010x}\n",
+                 slot, v.ct_id, v.ct_ctrls, v.pu_id, v.pu_ctrls);
+    }
     for f in &v.formats {
         usb_log!("[UVC]   format {} {} bpp {} default frame {}\n", f.index, fmt_name(f.kind), f.bpp, f.default_frame);
         for fr in &f.frames {
@@ -449,6 +544,7 @@ pub fn register_fake() {
             FormatDesc { index: 2, kind: FMT_YUYV, bpp: 16, default_frame: 1, frames: alloc::vec![fr] },
         ],
         alts: Vec::new(),
+        ..Default::default()
     };
     usb_log!("[UVC] fake camera registered (uvc.fake=1)\n");
     CAMERAS.lock().push(Arc::new(Camera { func: None, info }));
@@ -487,7 +583,7 @@ fn selftest(cam: &Camera, frames: u32) {
     let cap = fmt.frames.iter().map(|y| y.max_size as usize).max().unwrap_or(0).clamp(64 * 1024, 8 << 20);
     let mut store: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; cap]).collect();
     let bufs = store.iter_mut().map(|b| Buf { ptr: b.as_mut_ptr(), cap }).collect();
-    let mut s = match Stream::start(cam.func.as_ref().unwrap(), &cam.info, fmt.index, 0, bufs) {
+    let mut s = match Stream::start(cam.func.as_ref().unwrap(), &cam.info, fmt.index, 0, 0, bufs) {
         Ok(s) => s,
         Err(e) => { usb_log!("[UVC] selftest: start failed: {}\n", e); return; }
     };

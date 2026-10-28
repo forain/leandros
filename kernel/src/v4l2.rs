@@ -57,6 +57,12 @@ const VIDIOC_STREAMON: usize = 0x4004_5612;
 const VIDIOC_STREAMOFF: usize = 0x4004_5613;
 const VIDIOC_G_PARM: usize = 0xC0CC_5615;
 const VIDIOC_S_PARM: usize = 0xC0CC_5616;
+const VIDIOC_G_CTRL: usize = 0xC008_561B;
+const VIDIOC_S_CTRL: usize = 0xC008_561C;
+const VIDIOC_QUERYCTRL: usize = 0xC044_5624;
+const CID_EXPOSURE_AUTO: u32 = 0x009a_0901;
+const CID_EXPOSURE_ABSOLUTE: u32 = 0x009a_0902;
+const CID_EXPOSURE_AUTO_PRIORITY: u32 = 0x009a_0903;
 const VIDIOC_ENUMINPUT: usize = 0xC050_561A;
 const VIDIOC_G_INPUT: usize = 0x8004_5626;
 const VIDIOC_S_INPUT: usize = 0xC004_5627;
@@ -92,6 +98,8 @@ struct Dev {
     cam: Option<Arc<Camera>>,
     fmt: u8,
     frame: u8,
+    /// Requested frame interval (x100 ns) from S_PARM; 0 = the frame's default.
+    interval: u32,
     nreq: usize,
     pending: [bool; MAX_BUFS],
     queued: [bool; MAX_BUFS],
@@ -101,7 +109,7 @@ struct Dev {
 struct Pool { cap: usize, order: usize, phys: [usize; MAX_BUFS], n: usize }
 
 static DEV: Mutex<Dev> = Mutex::new(Dev {
-    owner: 0, cam: None, fmt: 0, frame: 0, nreq: 0,
+    owner: 0, cam: None, fmt: 0, frame: 0, interval: 0, nreq: 0,
     pending: [false; MAX_BUFS], queued: [false; MAX_BUFS], streaming: false,
 });
 static POOL: Mutex<Pool> = Mutex::new(Pool { cap: 0, order: 0, phys: [0; MAX_BUFS], n: 0 });
@@ -161,7 +169,7 @@ fn handle(msg: &Message, _caller: u32, _target: u32) -> Message {
             let mut d = DEV.lock();
             if d.owner != 0 { return reply(EBUSY as i64); }
             let (f, fr) = default_format(&cam);
-            *d = Dev { owner: id, cam: Some(cam), fmt: f, frame: fr, nreq: 0,
+            *d = Dev { owner: id, cam: Some(cam), fmt: f, frame: fr, interval: 0, nreq: 0,
                        pending: [false; MAX_BUFS], queued: [false; MAX_BUFS], streaming: false };
             reply(0)
         }
@@ -404,11 +412,54 @@ fn ioctl(pid: u32, fd: usize, id: u32, cmd: usize, arg: usize) -> isize {
             let mut b = match rd::<204>(arg) { Ok(b) => b, Err(e) => return e };
             if g32(&b, 0) != BUF_TYPE_CAPTURE { return EINVAL; }
             let Some((_, fr)) = cur(&d) else { return EINVAL };
+            let (rn, rd_) = (g32(&b, 12), g32(&b, 16));
+            if cmd == VIDIOC_S_PARM && !d.streaming && rn != 0 && rd_ != 0 {
+                d.interval = ((rn as u64 * 10_000_000) / rd_ as u64).clamp(1, u32::MAX as u64) as u32;
+            }
             for x in &mut b[4..] { *x = 0; }
-            let (n, dd) = fract(fr.interval);
+            let (n, dd) = fract(if d.interval != 0 { d.interval } else { fr.interval });
             p32(&mut b, 4, CAP_TIMEPERFRAME);
             p32(&mut b, 12, n);
             p32(&mut b, 16, dd);
+            wr(arg, &b)
+        }
+        VIDIOC_QUERYCTRL => {
+            let mut b = match rd::<68>(arg) { Ok(b) => b, Err(e) => return e };
+            let (name, ty, min, max, def) = match g32(&b, 0) {
+                CID_EXPOSURE_AUTO => ("Auto Exposure", 3u32, 0u32, 3u32, 3u32),
+                CID_EXPOSURE_ABSOLUTE => ("Exposure Time, Absolute", 1, 1, 100_000, 1),
+                CID_EXPOSURE_AUTO_PRIORITY => ("Exposure, Dynamic Framerate", 2, 0, 1, 0),
+                _ => return EINVAL,
+            };
+            let id = g32(&b, 0);
+            for x in &mut b[4..] { *x = 0; }
+            p32(&mut b, 4, ty);
+            pstr(&mut b, 8, 32, name);
+            p32(&mut b, 40, min); p32(&mut b, 44, max); p32(&mut b, 48, 1); p32(&mut b, 52, def);
+            let _ = id;
+            wr(arg, &b)
+        }
+        VIDIOC_G_CTRL | VIDIOC_S_CTRL => {
+            let mut b = match rd::<8>(arg) { Ok(b) => b, Err(e) => return e };
+            let id = g32(&b, 0);
+            let set = cmd == VIDIOC_S_CTRL;
+            let v = g32(&b, 4);
+            use core::sync::atomic::Ordering::Relaxed;
+            let out = match id {
+                CID_EXPOSURE_AUTO => {
+                    if set { uvc::EXPO_MODE.store(if v == 1 { uvc::EXPO_MANUAL } else { uvc::EXPO_AUTO }, Relaxed); v }
+                    else if uvc::EXPO_MODE.load(Relaxed) == uvc::EXPO_MANUAL { 1 } else { 3 }
+                }
+                CID_EXPOSURE_ABSOLUTE => {
+                    if set { uvc::EXPO_ABS.store(v.clamp(1, 100_000), Relaxed); v } else { uvc::EXPO_ABS.load(Relaxed) }
+                }
+                CID_EXPOSURE_AUTO_PRIORITY => {
+                    if set { uvc::AE_PRIO.store((v != 0) as i32, Relaxed); (v != 0) as u32 }
+                    else { (uvc::AE_PRIO.load(Relaxed) != 0) as u32 }
+                }
+                _ => return EINVAL,
+            };
+            p32(&mut b, 4, out);
             wr(arg, &b)
         }
         VIDIOC_ENUMINPUT => {
@@ -472,8 +523,8 @@ fn ioctl(pid: u32, fd: usize, id: u32, cmd: usize, arg: usize) -> isize {
                 (0..d.nreq).map(|i| Buf { ptr: mm::phys_to_virt(p.phys[i]) as *mut u8, cap: p.cap }).collect()
             };
             let started = match &cam.func {
-                Some(f) => Stream::start(f, &cam.info, d.fmt, d.frame, bufs),
-                None => Stream::start_fake(&cam.info, d.fmt, d.frame, bufs),
+                Some(f) => Stream::start(f, &cam.info, d.fmt, d.frame, d.interval, bufs),
+                None => Stream::start_fake(&cam.info, d.fmt, d.frame, d.interval, bufs),
             };
             let mut s = match started {
                 Ok(s) => s,
