@@ -150,7 +150,6 @@ fn scan(ifarg: Option<&[u8]>) -> i32 {
     // Wait for SCAN_DONE (after the snapshot, which may carry an old one).
     let mut r = Reassembler::new();
     let mut buf = [0u8; 64 * 32];
-    let mut last_attempt = 0u32;
     let deadline = now_ms() + 15_000;
     let mut live = false;
     let mut done = false;
@@ -429,6 +428,7 @@ fn stamp_profile(uuid: [u8; 16]) {
 
 fn watch(show_snapshot: bool, secs: u64, stamp: bool) -> i32 {
     let n = match open_ro() { Ok(n) => n, Err(e) => return fail("open /dev/netctl", e) };
+    let mut last_attempt = 0u32;
     let mut r = Reassembler::new();
     let mut buf = [0u8; 64 * 32];
     let deadline = if secs == 0 { u64::MAX } else { now_ms() + secs * 1000 };
