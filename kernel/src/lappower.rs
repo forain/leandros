@@ -26,7 +26,7 @@ fn sleep_until(deadline: u64) {
 fn i2c_task() -> ! {
     let mut next = sched::monotonic_ns();
     while drivers::i2c_hid::listen_once(sched::monotonic_ns()) {
-        next += 10_000_000;
+        next += drivers::i2c_hid::poll_interval_ns();
         sleep_until(next);
     }
     loop { next += 3_600_000_000_000; sleep_until(next); }
@@ -70,6 +70,7 @@ pub fn init(rsdp: u64, hhdm: u64, cmdline: &str) {
         out[..n].copy_from_slice(&name.as_bytes()[..n]);
         Some((n, t))
     });
+    drivers::i2c_hid::set_ps2_reinit(arch_x86_64::psmouse::init);
     if drivers::i2c_hid::init(cmdline) && sched::spawn(i2c_task, 0).map(|p| sched::set_comm(p, b"ki2chid")).is_none() {
         crate::serial_print_str("[I2C] could not start the HID probe thread\n");
     }
