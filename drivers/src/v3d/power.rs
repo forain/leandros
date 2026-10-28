@@ -27,6 +27,11 @@ pub trait PowerEnv {
     fn clk_get_max_rate(&mut self, id: u32) -> Option<u32>;
     /// SET_CLOCK_RATE; returns the rate the firmware actually set, in Hz.
     fn clk_set_rate(&mut self, id: u32, hz: u32) -> Option<u32>;
+    /// Firmware power-domain SET_DOMAIN_STATE (raspberrypi-power); returns the reply
+    /// state word, `None` when unsupported/disabled (`v3d.pwr=pm`) or no reply.
+    fn fw_domain(&mut self, _domain: u32, _on: bool) -> Option<u32> { None }
+    /// `v3d.pwr=nogate`: skip the GRAFX island-bits requirement in `pm_confirm`.
+    fn relaxed_gate(&mut self) -> bool { false }
     fn delay_us(&mut self, us: u32);
     fn now_us(&mut self) -> u64;
 }
@@ -131,6 +136,27 @@ pub struct ProbeReport {
     pub pa_width: u32,
     /// SMS_REE_CS state after the reset (0 = idle).
     pub sms_state: u32,
+    /// Firmware V3D domain reply (`NO_FW_DOMAIN` = step skipped or no reply), and PM_GRAFX
+    /// right before / after it.
+    pub fw_dom: u32,
+    pub grafx_pre_fw: u32,
+    pub grafx_post_fw: u32,
+}
+
+pub const NO_FW_DOMAIN: u32 = 0xffff_ffff;
+
+/// Firmware power-domain step (Linux raspberrypi-power): ask the VideoCore to power the
+/// V3D domain before the PM sequence, then wait (bounded) for GRAFX POWOK. Best effort:
+/// the outcome is only recorded, `pm_confirm` stays the gate.
+pub fn fw_domain_on<E: PowerEnv>(env: &mut E, rep: &mut ProbeReport) {
+    rep.fw_dom = NO_FW_DOMAIN;
+    rep.grafx_pre_fw = env.pm_r(PM_GRAFX);
+    rep.grafx_post_fw = rep.grafx_pre_fw;
+    if let Some(r) = env.fw_domain(FW_DOMAIN_V3D, true) {
+        rep.fw_dom = r;
+        let _ = poll_pm(env, PM_GRAFX, PM_POWOK, 5_000);
+        rep.grafx_post_fw = env.pm_r(PM_GRAFX);
+    }
 }
 
 /// Polls `read` until `done(value)`, bounded by time and iterations.
@@ -225,7 +251,7 @@ pub fn pm_confirm<E: PowerEnv>(env: &mut E, rep: &mut ProbeReport) -> Result<(),
     let v = env.pm_r(PM_GRAFX_2712);
     rep.grafx_after = g;
     rep.pm_after = v;
-    if g & PM_GRAFX_ON != PM_GRAFX_ON {
+    if g & PM_GRAFX_ON != PM_GRAFX_ON && !env.relaxed_gate() {
         return Err(PowerError::Mismatch { step: Step::PmConfirm, value: g });
     }
     if v & PM_V3DRSTN == 0 {
@@ -316,6 +342,8 @@ pub fn identify<R: V3dRegs>(regs: &R, rep: &mut ProbeReport) -> Result<(), Power
 /// reset and identified; on failure nothing past the failing step ran.
 pub fn power_on<R: V3dRegs, E: PowerEnv>(regs: R, env: &mut E) -> Result<(V3d<R>, ProbeReport), (PowerError, ProbeReport)> {
     let mut rep = ProbeReport::default();
+    rep.fw_dom = NO_FW_DOMAIN;
+    fw_domain_on(env, &mut rep);
     if let Err(e) = grafx_power_on(env, &mut rep) { return Err((e, rep)); }
     if let Err(e) = pm_power_on(env, &mut rep) { return Err((e, rep)); }
     if let Err(e) = clock_on(env, &mut rep) { return Err((e, rep)); }

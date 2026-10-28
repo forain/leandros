@@ -71,8 +71,9 @@ pub fn ident_line(r: &power::ProbeReport) -> alloc::string::String {
 /// Formats the one failure line.
 pub fn fail_line(e: power::PowerError, r: &power::ProbeReport) -> alloc::string::String {
     alloc::format!(
-        "[v3d] fail {} {} val=0x{:08x} grafx=0x{:08x}->0x{:08x} pm=0x{:08x}->0x{:08x} clk={}MHz\n",
-        e.step().name(), e.kind(), e.value(), r.grafx_before, r.grafx_after, r.pm_before, r.pm_after, r.clk_hz / 1_000_000
+        "[v3d] fail {} {} val=0x{:08x} grafx=0x{:08x}->0x{:08x} pm=0x{:08x}->0x{:08x} clk={}MHz fw=0x{:08x} grafx_fw=0x{:08x}->0x{:08x}\n",
+        e.step().name(), e.kind(), e.value(), r.grafx_before, r.grafx_after, r.pm_before, r.pm_after, r.clk_hz / 1_000_000,
+        r.fw_dom, r.grafx_pre_fw, r.grafx_post_fw
     )
 }
 
@@ -113,9 +114,22 @@ mod hw {
     struct Env {
         pm: usize,
         hhdm: usize,
+        /// `v3d.pwr=fw` turns the firmware power-domain step on (Pi 5 firmware answers BadCode(0x80000001)
+        /// to SET_DOMAIN_STATE, so it is off by default).
+        fw_dom: bool,
+        /// `v3d.pwr=nogate`: pm_confirm only requires V3DRSTN (GRAFX POWOK/MRDONE ignored).
+        nogate: bool,
     }
 
     impl Env {
+        /// Raw reply words [buffer status, tag code, tag len, v0, v1] or empty on failure.
+        fn raw(&mut self, tag: u32, vals: &[u32; 2]) -> alloc::vec::Vec<u32> {
+            let msg = [32u32, 0, tag, 8, 0, vals[0], vals[1], 0];
+            match unsafe { crate::rpi_mailbox::property_call(self.hhdm, &msg[..8]) } {
+                Ok(r) => alloc::vec![r[1], r[4], r[5], r[6]],
+                Err(e) => { serial_debug(&alloc::format!("[v3d] fw mbox err {:?}\n", e)); alloc::vec::Vec::new() }
+            }
+        }
         /// One single-tag property call; returns the tag's value words.
         fn tag(&mut self, tag: u32, vals: &[u32]) -> Option<[u32; 3]> {
             let mut msg = [0u32; 9];
@@ -147,6 +161,20 @@ mod hw {
         }
         fn clk_set_rate(&mut self, id: u32, hz: u32) -> Option<u32> {
             self.tag(TAG_SET_CLOCK_RATE, &[id, hz, 0]).map(|v| v[1])
+        }
+        fn relaxed_gate(&mut self) -> bool { self.nogate }
+        fn fw_domain(&mut self, domain: u32, on: bool) -> Option<u32> {
+            if !self.fw_dom { return None; }
+            // Raw diagnostics: GET before, SET, GET after, for the V3D domain and its neighbours.
+            for d in [domain] {
+                let g = self.raw(TAG_GET_DOMAIN_STATE, &[d, 0]);
+                serial_debug(&alloc::format!("[v3d] fw get-domain {} -> {:x?}\n", d, g));
+            }
+            let s = self.raw(TAG_SET_DOMAIN_STATE, &[domain, on as u32]);
+            serial_debug(&alloc::format!("[v3d] fw set-domain {} {} -> {:x?}\n", domain, on as u32, s));
+            let g = self.raw(TAG_GET_DOMAIN_STATE, &[domain, 0]);
+            serial_debug(&alloc::format!("[v3d] fw get-domain {} after -> {:x?}\n", domain, g));
+            self.tag(TAG_GET_DOMAIN_STATE, &[domain, 0]).map(|v| v[1])
         }
         fn delay_us(&mut self, us: u32) {
             let end = sched::monotonic_ns() + us as u64 * 1000;
@@ -182,7 +210,7 @@ mod hw {
         };
         // The HHDM does not cover the mailbox registers this late in boot.
         crate::rpi_mailbox::set_mbox_virt(mbox);
-        let mut env = Env { pm, hhdm: hhdm_offset as usize };
+        let mut env = Env { pm, hhdm: hhdm_offset as usize, nogate: cmdline.split_ascii_whitespace().any(|t| t == "v3d.pwr=nogate"), fw_dom: cmdline.split_ascii_whitespace().any(|t| t == "v3d.pwr=fw") };
         let t0 = sched::monotonic_ns();
         let res = power::power_on(MmioRegs { hub, core, sms }, &mut env);
         // Bus errors from the accesses above are asynchronous: catch them here,
@@ -195,6 +223,7 @@ mod hw {
         }
         match res {
             Ok((dev, rep)) => {
+                serial_debug(&alloc::format!("[v3d] fw-domain reply=0x{:08x} grafx_fw=0x{:08x}->0x{:08x}\n", rep.fw_dom, rep.grafx_pre_fw, rep.grafx_post_fw));
                 serial_debug(&ident_line(&rep));
                 serial_debug(&alloc::format!(
                     "[v3d] regs hub_ident=0x{:08x},0x{:08x},0x{:08x},0x{:08x} core_ident=0x{:08x},0x{:08x},0x{:08x} mmu_debug=0x{:08x} grafx=0x{:08x}->0x{:08x} pm=0x{:08x}->0x{:08x} t={}us\n",
