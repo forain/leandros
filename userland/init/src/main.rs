@@ -553,6 +553,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     vconsole_setup();
 
     spawn_netctl_stamper();
+    start_bthid_early();
 
     // 5. Graphical login, when the image carries one and nothing opted out.
     // /run is on the persistent root, so a pid file from an earlier boot
@@ -692,14 +693,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
                         continue;
                     }
                 }
-                write_str("\n");
-                write_str("################################################################\n");
-                write_str("## NO GPU RENDERER: the graphical login (COSMIC) was NOT started.\n");
-                write_str("## COSMIC renders on the host GPU only (zink/Venus or virgl);\n");
-                write_str("## this VM has no GL-capable virtio-gpu, or its GPU stack failed.\n");
-                write_str("## Details: /var/log/greetd.log. Software rendering is opt-in:\n");
-                write_str("##   touch /etc/leandros/allow-software-render\n");
-                write_str("################################################################\n");
+                print_no_gpu_banner();
                 // The failed graphical start repainted the console over the
                 // summary printed before the first login prompt.
                 usb_summary_after_repaint(login_pid);
@@ -902,7 +896,18 @@ unsafe fn bt_services() {
     if !exists(BTD_PATH) || cmdline_has(b"bt=0") { return; }
     write_str("starting btd and bthid (/dev/hci0 is up)\n");
     daemon_start(0);
-    if daemon_wanted(1) { daemon_start(1); }
+    // bthid may already be running (started without /dev/hci0, see
+    // `start_bthid_early`).
+    if daemon_wanted(1) && DAEMONS[1].pid <= 0 { daemon_start(1); }
+}
+
+/// bthid also serves USB sources, so it starts whether or not /dev/hci0 ever
+/// appears (`bthid=0` / `bt=0` disable).
+unsafe fn start_bthid_early() {
+    if daemon_wanted(1) && DAEMONS[1].pid <= 0 {
+        write_str("starting bthid\n");
+        daemon_start(1);
+    }
 }
 
 /// Supervised init-spawned daemons: btd, bthid and `netctl watch --stamp`.
@@ -1433,6 +1438,68 @@ fn exists(path: &[u8]) -> bool {
     }
 }
 
+/// The loud console banner for "no hardware GL renderer".
+unsafe fn print_no_gpu_banner() {
+    write_str("\n");
+    write_str("################################################################\n");
+    write_str("## NO GPU RENDERER: the graphical login (COSMIC) was NOT started.\n");
+    write_str("## COSMIC renders on the host GPU only (zink/Venus or virgl);\n");
+    write_str("## this VM has no GL-capable virtio-gpu, or its GPU stack failed.\n");
+    write_str("## Details: /var/log/greetd.log. Software rendering is opt-in:\n");
+    write_str("##   touch /etc/leandros/allow-software-render\n");
+    write_str("################################################################\n");
+}
+
+/// Run the renderer decision of /bin/gpu-env (sourced, exactly as greeter-real
+/// does) without starting anything. Returns true only for a definite "no
+/// hardware GL renderer" (exit 78); a timeout, a failure to run or any other
+/// status is "unknown" and keeps the old path (start greetd).
+unsafe fn gpu_precheck_refused() -> bool {
+    if cmdline_has(b"dm.precheck=0") || !exists(b"/bin/gpu-env\0") || !exists(b"/bin/sh\0") {
+        return false;
+    }
+    // A booting/ready NVIDIA card is handled by gpu-env's own wait and init's
+    // retry; do not hold up the serial getty for it.
+    if exists(b"/proc/nvrm_state\0") && !nvrm_state_is(b"absent") { return false; }
+    let pid = fork();
+    if pid < 0 { return false; }
+    if pid == 0 {
+        let null = open(b"/dev/null\0".as_ptr(), O_RDONLY, 0);
+        if null >= 0 {
+            dup3(null, 0, 0);
+            if null > 2 { close(null); }
+        }
+        let argv: [*const u8; 4] = [
+            b"/bin/sh\0".as_ptr(),
+            b"-c\0".as_ptr(),
+            b". /bin/gpu-env; [ \"$LEANDROS_RENDERER_PATH\" = refused ] && exit 78; exit 0\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        let env = b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\0";
+        let envp: [*const u8; 2] = [env.as_ptr(), core::ptr::null()];
+        execve(b"/bin/sh\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    const WNOHANG: i32 = 1;
+    let mut waited_ms = 0u32;
+    loop {
+        let mut status: i32 = 0;
+        let r = wait4(pid, &mut status, WNOHANG, core::ptr::null_mut());
+        if r == pid {
+            return status & 0x7f == 0 && (status >> 8) & 0xff == DM_EXIT_NO_GPU;
+        }
+        if r < 0 { return false; }
+        if waited_ms >= 120_000 {
+            syscall2(nr::KILL, pid as usize, 9);
+            wait4(pid, &mut status, 0, core::ptr::null_mut());
+            write_str("gpu precheck timed out; starting the graphical login anyway\n");
+            return false;
+        }
+        usleep(50_000);
+        waited_ms += 50;
+    }
+}
+
 /// The three-way decision: the daemon and its config are staged, and nobody
 /// asked for a text login.
 unsafe fn graphical_login_wanted() -> bool {
@@ -1456,6 +1523,10 @@ unsafe fn graphical_login_wanted() -> bool {
     }
     if !exists(DM_DAEMON) || !exists(DM_CONFIG) {
         write_str("no greetd in this image; text login only\n");
+        return false;
+    }
+    if gpu_precheck_refused() {
+        print_no_gpu_banner();
         return false;
     }
     true

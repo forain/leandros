@@ -18,7 +18,7 @@
 # ---- search path -----------------------------------------------------------
 # cosmic-comp and cosmic-session spawn their children by BARE NAME through a
 # Rust std PATH lookup, and the session binaries live in /bin.
-PATH=/usr/bin:/bin
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 
 # ---- XDG runtime dir -------------------------------------------------------

@@ -1885,6 +1885,12 @@ def main():
     p = f"../ripgrep/target/{_musl_triple}/release/rg"
     if os.path.exists(p):
         bin_files.append(("rg", p, 0o100755))
+    # grep/egrep/fgrep: userland/grep, a POSIX grep front end that runs /bin/rg
+    # (argv0 selects -E / -F). One binary, three names.
+    p = f"userland/grep/target/{_musl_triple}/release/grep"
+    if os.path.exists(p):
+        for _g in ("grep", "egrep", "fgrep"):
+            bin_files.append((_g, p, 0o100755))
 
     # spawnwedge: the musl thread/fork lock-handoff regression test (the
     # cosmic-comp keybinding wedge). A std/musl crate with its own build.sh
@@ -2722,6 +2728,27 @@ def main():
               f"{len(_git_won)}: {' '.join(sorted(_git_won))}")
     else:
         print(f"  (no git staged: {_git_root} missing — ports/git/build.sh {arch})")
+
+    # Optional binaries are skipped silently when their build output is absent.
+    # Say so, and let LEANDROS_REQUIRE=rg,grep,dmesg,coreutils make it fatal.
+    _opt_src = {
+        "rg": f"../ripgrep/target/{_musl_triple}/release/rg",
+        "grep": f"userland/grep/target/{_musl_triple}/release/grep",
+        "dmesg": "userland/dmesg/dmesg.sh",
+        "coreutils": coreutils_bin,
+        "disktester": f"../disks-rs/target/{_musl_triple}/release/disktester",
+    }
+    _have = {name for name, _path, _mode in bin_files}
+    _missing = [n for n in _opt_src if n not in _have]
+    for _n in _missing:
+        print(f"MISSING optional: {_n} ({_opt_src[_n]})")
+    if _missing:
+        print(f"MISSING optional summary: {len(_missing)} skipped: {' '.join(_missing)}")
+    _req = [r for r in os.environ.get("LEANDROS_REQUIRE", "").split(",") if r]
+    _fatal = [r for r in _req if r in _missing or r not in _have]
+    if _fatal:
+        print(f"FATAL: required binaries missing (LEANDROS_REQUIRE): {' '.join(_fatal)}")
+        sys.exit(1)
 
     if any(name == "doom" for name, _path, _mode in bin_files):
         m4_share_dirs.update(("/usr/share", "/usr/share/soundfonts"))
