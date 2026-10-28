@@ -7,7 +7,7 @@ use crate::iwl_rs::*;
 /// The laptop's link: 5 GHz, 40 MHz, STBC + LDPC, both TX chains, -77 dBm.
 fn ctl(valid_ant: u8, fixed: Option<u8>) -> RateCtl {
     let cfg = RateCfg { ap_rates: vec![0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c], max_r500k: 0, valid_ant, fixed_ant: fixed,
-                        band_24: false, rssi: Some(-77), ht: Some(HtRates { sgi: false, mimo: false, ht40: true, stbc: true, ldpc: true }) };
+                        band_24: false, rssi: Some(-77), ht: Some(HtRates { sgi: false, mimo: false, ht40: true, stbc: true, ldpc: true, vht: None }) };
     let mut c = RateCtl::new(&cfg);
     c.set_agg(true, 63);
     c.mark_sent(0);
@@ -17,7 +17,7 @@ fn ctl(valid_ant: u8, fixed: Option<u8>) -> RateCtl {
 /// A-MPDUs of 24 subframes every 20 ms for `secs` s; subframe success
 /// permille per rate id from `p`. Returns goodput (acked subframes x
 /// nominal rate) over the last `tail` seconds.
-fn run(c: &mut RateCtl, now: &mut u64, secs: u64, tail: u64, p: &dyn Fn(u8) -> u64) -> u64 {
+fn run(c: &mut RateCtl, now: &mut u64, secs: u64, tail: u64, p: &dyn Fn(u16) -> u64) -> u64 {
     let mut x = 0x2545_f491_4f6c_dd1du64;
     let mut good = 0;
     for k in 0..secs * 50 {
@@ -36,8 +36,8 @@ fn run(c: &mut RateCtl, now: &mut u64, secs: u64, tail: u64, p: &dyn Fn(u8) -> u
     good
 }
 
-fn mcs(id: u8) -> u8 { id & 0x0f }
-fn sgi(id: u8) -> bool { id & HT_SGI != 0 }
+fn mcs(id: u16) -> u8 { (id & 0x0f) as u8 }
+fn sgi(id: u16) -> bool { id & HT_SGI != 0 }
 
 #[test]
 fn col_search_capability_checks() {
@@ -83,7 +83,7 @@ fn mimo2_column_ladder_has_low_two_stream_mcs() {
 /// under 45 %; two streams deliver well up to MCS 10.
 #[test]
 fn col_search_switches_to_mimo2_when_it_delivers_more() {
-    let chan = |id: u8| -> u64 {
+    let chan = |id: u16| -> u64 {
         match mcs(id) { 0..=3 => 750, 4..=7 => 400, 8..=10 => 900, _ => 300 }
     };
     let mut base = ctl(ANT_AB, None);
@@ -101,7 +101,7 @@ fn col_search_switches_to_mimo2_when_it_delivers_more() {
 /// back each time, and backs off (the probes cost under 10 % goodput).
 #[test]
 fn col_search_reverts_and_backs_off_when_columns_are_worse() {
-    let chan = |id: u8| -> u64 {
+    let chan = |id: u16| -> u64 {
         if mcs(id) >= 8 { 150 } else if sgi(id) { 350 } else if mcs(id) <= 3 { 750 } else { 400 }
     };
     let mut base = ctl(ANT_AB, None);
@@ -120,7 +120,7 @@ fn col_search_reverts_and_backs_off_when_columns_are_worse() {
 /// Short GI delivers as well as long GI: ~10 % more per MCS, kept.
 #[test]
 fn col_search_keeps_short_gi_when_it_delivers_as_well() {
-    let chan = |id: u8| -> u64 { if mcs(id) >= 8 { 100 } else if mcs(id) <= 3 { 750 } else { 400 } };
+    let chan = |id: u16| -> u64 { if mcs(id) >= 8 { 100 } else if mcs(id) <= 3 { 750 } else { 400 } };
     let mut c = ctl(ANT_AB, None);
     c.enable_col_search(true, true);
     let mut now = 0;

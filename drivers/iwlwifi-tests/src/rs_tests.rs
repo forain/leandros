@@ -227,7 +227,7 @@ fn retries_charge_the_chain() {
     let first = c.sent.unwrap()[0];
     // Success on the 4th attempt: 54, 54, 48 failed, 36 succeeded.
     c.on_tx(&resp(0x0001, 3, first), 1001);
-    let i = |r: u8| c.rates.iter().position(|&x| x == r).unwrap();
+    let i = |r: u16| c.rates.iter().position(|&x| x == r).unwrap();
     assert_eq!((c.win[i(108)].att, c.win[i(108)].succ), (2, 0));
     assert_eq!((c.win[i(96)].att, c.win[i(96)].succ), (1, 0));
     assert_eq!((c.win[i(72)].att, c.win[i(72)].succ), (1, 1));
@@ -372,7 +372,7 @@ fn bss_erp_parsed() {
 }
 
 fn ht_cfg(rssi: i8, sgi: bool, mimo: bool) -> RateCfg {
-    RateCfg { ht: Some(HtRates { sgi, mimo, ht40: false, stbc: false, ldpc: false }), ..cfg(rssi) }
+    RateCfg { ht: Some(HtRates { sgi, mimo, ht40: false, stbc: false, ldpc: false, vht: None }), ..cfg(rssi) }
 }
 
 #[test]
