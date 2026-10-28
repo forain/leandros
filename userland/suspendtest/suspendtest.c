@@ -7,7 +7,7 @@
 //   disk_after      1 MiB written, fsynced and read back after the cycle
 //   net_after       e1000e back with link (or absent); --net HOST:PORT also connects
 //   display_after   i915 plane scanning out again (or no KMS display)
-// Usage: suspendtest [--hold MS] [--xhci-halt] [--net A.B.C.D:PORT] [--dir DIR]
+// Usage: suspendtest [--hold MS] [--xhci-halt] [--pci|--pci-deep] [--net A.B.C.D:PORT] [--dir DIR]
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -103,6 +103,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--hold") && i + 1 < argc) r.hold_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--xhci-halt")) r.flags |= 1;
+        else if (!strcmp(argv[i], "--pci")) r.flags |= 2;
+        else if (!strcmp(argv[i], "--pci-deep")) r.flags |= 6;
         else if (!strcmp(argv[i], "--net") && i + 1 < argc) net = argv[++i];
         else if (!strcmp(argv[i], "--dir") && i + 1 < argc) dir = argv[++i];
         else { fprintf(stderr, "usage: suspendtest [--hold MS] [--xhci-halt] [--net IP:PORT] [--dir DIR]\n"); return 2; }
@@ -170,6 +172,8 @@ int main(int argc, char **argv) {
         }
     }
     result("net_after", net_ok, why);
+    if (r.flags & 2)
+        result("pci_verify", strstr(rep, "resume pci: ok") != NULL && !strstr(rep, "suspend pci: FAILED"), "");
     result("display_after", strstr(rep, "resume i915: ok") != NULL, "");
     printf("suspendtest: %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

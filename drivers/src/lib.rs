@@ -10,6 +10,8 @@ extern crate alloc;
 
 pub mod serial;
 pub mod pci;
+/// Generic PCI config-space save/restore for system sleep (lane s3pci).
+pub mod pci_pm;
 /// Runtime IRQ registration, x86_64 vector allocator, MSI/MSI-X (lane kfacil).
 pub mod irq;
 /// `request_firmware`: kernel read of a file from the mounted root (lane kfacil).
