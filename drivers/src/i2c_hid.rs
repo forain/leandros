@@ -59,7 +59,7 @@ fn spin_ms(ms: u64) {
 
 fn short(path: &str) -> &str { path.rsplit('.').next().unwrap_or(path) }
 
-fn probe_slave(s: &I2cSlave, bus: usize) -> Option<Listen> {
+fn probe_slave(s: &I2cSlave, bus: usize, reset: bool) -> Option<Listen> {
     let name = String::from(short(&s.path).trim_end_matches('_'));
     let reg = s.hid_desc_reg?;
     let mut d = [0u8; 30];
@@ -76,18 +76,20 @@ fn probe_slave(s: &I2cSlave, bus: usize) -> Option<Listen> {
     let (rd_len, rd_reg, in_reg, max_in, cmd_reg) = (w(4) as usize, w(6), w(8), w(10) as usize, w(16));
     log(&format!("i2c-hid: {} vid={:04x} pid={:04x} ver={:04x} rd_len={} in={:#x} max_in={} cmd={:#x} data={:#x}",
         name, w(20), w(22), w(24), rd_len, in_reg, max_in, cmd_reg, w(18)));
-    // SET_POWER ON, then RESET and wait for the 0x0000 acknowledge.
-    let c = [cmd_reg as u8, (cmd_reg >> 8) as u8];
-    let _ = dw_i2c::xfer(bus, s.addr, &[c[0], c[1], 0x00, 0x08], &mut []);
-    spin_ms(1);
-    let rst = dw_i2c::xfer(bus, s.addr, &[c[0], c[1], 0x00, 0x01], &mut []);
-    let mut acked = false;
-    for _ in 0..100 {
-        let mut a = [0xFFu8; 2];
-        if dw_i2c::xfer(bus, s.addr, &[in_reg as u8, (in_reg >> 8) as u8], &mut a).is_ok() && a == [0, 0] { acked = true; break; }
+    if reset {
+        // SET_POWER ON, then RESET and wait for the 0x0000 acknowledge.
+        let c = [cmd_reg as u8, (cmd_reg >> 8) as u8];
+        let _ = dw_i2c::xfer(bus, s.addr, &[c[0], c[1], 0x00, 0x08], &mut []);
         spin_ms(1);
+        let rst = dw_i2c::xfer(bus, s.addr, &[c[0], c[1], 0x00, 0x01], &mut []);
+        let mut acked = false;
+        for _ in 0..100 {
+            let mut a = [0xFFu8; 2];
+            if dw_i2c::xfer(bus, s.addr, &[in_reg as u8, (in_reg >> 8) as u8], &mut a).is_ok() && a == [0, 0] { acked = true; break; }
+            spin_ms(1);
+        }
+        log(&format!("i2c-hid: {} reset write={:?} ack={}", name, rst, acked));
     }
-    log(&format!("i2c-hid: {} reset write={:?} ack={}", name, rst, acked));
     if rd_len == 0 || rd_len > 4096 { return None; }
     let mut rep = alloc::vec![0u8; rd_len];
     if let Err(e) = dw_i2c::xfer(bus, s.addr, &[rd_reg as u8, (rd_reg >> 8) as u8], &mut rep) {
@@ -127,7 +129,7 @@ pub fn init(cmdline: &str) -> bool {
     let mut l = LISTEN.lock();
     for s in sc.slaves.iter().filter(|s| s.sta & 0xB == 0xB && s.hid_desc_reg.is_some()) {
         match dw_i2c::bus_for_adr(s.ctrl_adr) {
-            Some(bus) => { if let Some(p) = probe_slave(s, bus) { l.push(p); } }
+            Some(bus) => { if let Some(p) = probe_slave(s, bus, mode == "probe+reset") { l.push(p); } }
             None => log(&format!("i2c-hid: {} controller {:#x} not up", s.path, s.ctrl_adr)),
         }
     }
