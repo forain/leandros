@@ -73,6 +73,8 @@ impl Fwil for Mock {
     fn iovar_get(&mut self, name: &str, buf: &mut [u8]) -> Result<usize, FwError> {
         self.calls.push(Call::IovarGet(name.into()));
         if name == "cur_etheraddr" { buf[..6].copy_from_slice(&[0xb8, 0x27, 0xeb, 1, 2, 3]); return Ok(6); }
+        // The real firmware answers BCME_BUFTOOSHORT (-14) to a too small assoc_info buffer.
+        if name == "assoc_info" && buf.len() < 32 { return Err(FwError::Status(-14)); }
         if let Some(v) = self.gets.get(name) { let n = v.len().min(buf.len()); buf[..n].copy_from_slice(&v[..n]); return Ok(n); }
         Err(FwError::Status(-23))
     }
@@ -971,4 +973,44 @@ mod wrongkey {
         crate::wifi_pref::set_knobs("wifi.wrongkey_bss=2");
         assert_eq!(crate::wifi_pref::wrongkey_bss(), 2);
     }
+}
+
+/// A fresh firmware drops the early "wpaie" when wpa_auth changes: by default
+/// the IE is set again after wpa_auth/wsec (and mfp); `wpaie=early` keeps one set.
+#[test]
+fn wpaie_is_set_again_after_wpa_auth_by_default() {
+    let mut d = up();
+    d.fw.on("join", join_ok());
+    assert_eq!(d.join(psk_req(), &mut Steps::default(), 2_000), Ok(()));
+    let names = d.fw.iovars_set();
+    let ie: Vec<usize> = names.iter().enumerate().filter(|(_, n)| **n == "wpaie").map(|(i, _)| i).collect();
+    assert_eq!(ie.len(), 2, "early and late set: {:?}", names);
+    let wa = names.iter().position(|n| *n == "wpa_auth").or_else(|| d.fw.calls.iter().position(|c| matches!(c, Call::CmdSet(c, _) if *c == cmd::SET_WPA_AUTH)));
+    assert!(wa.is_some());
+    assert!(names.iter().position(|n| *n == "join").map_or(true, |j| ie[1] < j), "late wpaie before the join");
+}
+
+/// assoc_info with the old 8 byte buffer fails on every join; a 512 byte one reports the firmware's IE.
+#[test]
+fn assoc_info_is_read_with_a_full_size_buffer() {
+    let mut d = up();
+    d.fw.refuse = vec!["sup_wpa".into()];
+    let fw_ie = crate::wifi_crypto::rsn_ie_psk_ccmp().to_vec();
+    let mut req_ies = vec![0, SSID.len() as u8];
+    req_ies.extend_from_slice(SSID);
+    req_ies.extend_from_slice(&fw_ie);
+    let mut info = (req_ies.len() as u32).to_le_bytes().to_vec();
+    info.extend_from_slice(&[0u8; 28]);
+    d.fw.gets.insert("assoc_info".into(), info);
+    d.fw.gets.insert("assoc_req_ies".into(), req_ies);
+    use crate::wifi_crypto as wc;
+    use wc::key_info as ki;
+    let m1 = wc::build_eapol_key(2, 2 | ki::TYPE_PAIRWISE | ki::ACK, 16, &1u64.to_be_bytes(), &[0x6bu8; 32], &[]);
+    d.fw.on("join", vec![
+        evf(ev::ASSOC, status::SUCCESS, 0, 0, &[]),
+        evf(ev::LINK, status::SUCCESS, 0, event::FLAG_LINK, &[]),
+        Frame::Data(eth(STA, AP, &m1)),
+    ]);
+    let _ = d.join(psk_req(), &mut Steps::default(), 500);
+    assert!(d.rsn.assoc_fw.starts_with("30"), "assoc_fw {}", d.rsn.assoc_fw);
 }

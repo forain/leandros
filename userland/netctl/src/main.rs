@@ -16,7 +16,7 @@
 //!                                      write a profile to the slots, reload (W)
 //! netctl forget SSID|UUID              remove a saved profile, reload (W)
 //! netctl reload                        re-read the profile slots (W)
-//! netctl watch [--no-snapshot] [--for S]  print events as they arrive (for S seconds)
+//! netctl watch [--no-snapshot] [--for S] [--stamp]  print events as they arrive (--stamp: quietly record connects in timestamp_s)
 //! ```
 //!
 //! (W): needs a write-capable open, i.e. root or the `netdev` group.
@@ -37,7 +37,7 @@ use netctl_abi::profiles::Profile;
 use netctl_abi::*;
 
 fn usage() -> i32 {
-    eprintln!("usage: netctl [status|ifaces|scan [IF]|bss [IF]|connect SSID [PASS] [--if IF] [--bssid MAC] [--hidden] [--akm A]|connect --uuid UUID|disconnect [IF] [--keep-auto]|up IF|radio on|off [IF]|profiles|save SSID [PASS] [--prio N] [--hidden] [--no-auto]|forget SSID|UUID|reload|watch [--no-snapshot] [--for S]]");
+    eprintln!("usage: netctl [status|ifaces|scan [IF]|bss [IF]|connect SSID [PASS] [--if IF] [--bssid MAC] [--hidden] [--akm A]|connect --uuid UUID|disconnect [IF] [--keep-auto]|up IF|radio on|off [IF]|profiles|save SSID [PASS] [--prio N] [--hidden] [--no-auto]|forget SSID|UUID|reload|watch [--no-snapshot] [--for S] [--stamp]]");
     2
 }
 
@@ -150,6 +150,7 @@ fn scan(ifarg: Option<&[u8]>) -> i32 {
     // Wait for SCAN_DONE (after the snapshot, which may carry an old one).
     let mut r = Reassembler::new();
     let mut buf = [0u8; 64 * 32];
+    let mut last_attempt = 0u32;
     let deadline = now_ms() + 15_000;
     let mut live = false;
     let mut done = false;
@@ -412,7 +413,21 @@ fn print_event(m: &EventMeta, e: &Event) {
     }
 }
 
-fn watch(show_snapshot: bool, secs: u64) -> i32 {
+fn stamp_profile(uuid: [u8; 16]) {
+    let now = { let mut ts = leandros_libc::timespec { tv_sec: 0, tv_nsec: 0 }; unsafe { leandros_libc::clock_gettime(0, &mut ts); } ts.tv_sec as u64 };
+    let r = with_current(|list, gflags| {
+        let mut changed = false;
+        if let Some(p) = list.iter_mut().find(|p| p.uuid == uuid) { changed = netctl_abi::profiles::stamp(p, now); }
+        if changed { write_profiles(list, gflags).map(|_| true) } else { Ok(false) }
+    });
+    match r {
+        Ok(Ok(true)) => sayln!("netctl: stamped {} timestamp_s {}", Uuid(uuid), now),
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) | Err(e) => { let _ = fail("stamp", e); }
+    }
+}
+
+fn watch(show_snapshot: bool, secs: u64, stamp: bool) -> i32 {
     let n = match open_ro() { Ok(n) => n, Err(e) => return fail("open /dev/netctl", e) };
     let mut r = Reassembler::new();
     let mut buf = [0u8; 64 * 32];
@@ -424,7 +439,17 @@ fn watch(show_snapshot: bool, secs: u64) -> i32 {
             match poll1(n.fd, left.min(1000) as i64) { Ok(0) => continue, Ok(_) => {} Err(e) => return fail("poll", e) }
         }
         let k = match n.read_records(&mut buf) { Ok(k) => k, Err(e) => return fail("read", e) };
-        for_events(&mut r, &buf, k, |m, e| if show_snapshot || !m.is_snapshot() { print_event(&m, &e) });
+        for_events(&mut r, &buf, k, |m, e| {
+            if stamp {
+                // Quiet stamper: one line per slot write.
+                if let Event::WifiState(w) = &e {
+                    if w.state == netctl_abi::wifi_state::CONNECTED && w.profile_uuid != [0u8; 16] && w.attempt != last_attempt {
+                        last_attempt = w.attempt;
+                        stamp_profile(w.profile_uuid);
+                    }
+                }
+            } else if show_snapshot || !m.is_snapshot() { print_event(&m, &e) }
+        });
     }
 }
 
@@ -468,11 +493,13 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         b"forget" => forget(argc, argv),
         b"watch" => {
             let mut snap = true;
+            let mut stamp = false;
             let mut secs = 0u64;
             let mut i = 2;
             while i < argc {
                 match arg(argv, i) {
                     b"--no-snapshot" => snap = false,
+                    b"--stamp" => stamp = true,
                     b"--for" if i + 1 < argc => {
                         for c in arg(argv, i + 1) { if !c.is_ascii_digit() { return usage(); } secs = secs * 10 + (c - b'0') as u64; }
                         i += 1;
@@ -481,7 +508,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
                 }
                 i += 1;
             }
-            watch(snap, secs)
+            watch(snap, secs, stamp)
         }
         b"-h" | b"--help" | b"help" => { usage(); 0 }
         _ => usage(),
