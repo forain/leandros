@@ -42,6 +42,7 @@ pub mod op {
     pub const RECV: u8 = 0x83;
     pub const CLOSED: u8 = 0x84;
     pub const INCOMING: u8 = 0x85;
+    pub const LINK: u8 = 0x86;
     pub const DEVICE: u8 = 0x90;
     pub const RESULT: u8 = 0x91;
     pub const INFO_RSP: u8 = 0x92;
@@ -81,6 +82,8 @@ pub enum Msg {
     Recv { cid: u16, data: Vec<u8> },
     Closed { cid: u16, reason: u8 },
     Incoming { cid: u16, addr: Addr, psm: u16, peer_mtu: u16 },
+    /// A BR/EDR ACL came up or went down; `incoming` = the peer made it.
+    Link { addr: Addr, up: bool, incoming: bool },
     Device(DeviceInfo),
     Result { op: u8, status: u8 },
     InfoRsp { addr: Addr, hci_ver: u8, lmp_subver: u16, manufacturer: u16, state: u8, name: String },
@@ -110,6 +113,9 @@ impl Msg {
             Msg::Closed { cid, reason } => { out.push(op::CLOSED); w16(out, *cid); out.push(*reason); }
             Msg::Incoming { cid, addr, psm, peer_mtu } => {
                 out.push(op::INCOMING); w16(out, *cid); out.extend_from_slice(&addr.0); w16(out, *psm); w16(out, *peer_mtu);
+            }
+            Msg::Link { addr, up, incoming } => {
+                out.push(op::LINK); out.extend_from_slice(&addr.0); out.push(*up as u8); out.push(*incoming as u8);
             }
             Msg::Device(d) => {
                 out.push(op::DEVICE); out.extend_from_slice(&d.addr.0); out.push(d.flags); out.push(d.rssi as u8);
@@ -146,6 +152,7 @@ impl Msg {
             op::RECV => { need(2)?; Msg::Recv { cid: le16(p, 0), data: p[2..].to_vec() } }
             op::CLOSED => { need(3)?; Msg::Closed { cid: le16(p, 0), reason: p[2] } }
             op::INCOMING => { need(12)?; Msg::Incoming { cid: le16(p, 0), addr: addr(2), psm: le16(p, 8), peer_mtu: le16(p, 10) } }
+            op::LINK => { need(8)?; Msg::Link { addr: addr(0), up: p[6] != 0, incoming: p[7] != 0 } }
             op::DEVICE => {
                 need(11)?;
                 Msg::Device(DeviceInfo { addr: addr(0), flags: p[6], rssi: p[7] as i8,

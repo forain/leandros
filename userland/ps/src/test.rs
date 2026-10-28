@@ -263,6 +263,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     test_set_mm();
     test_sysstat(me);
     test_ps_simple(me);
+    test_kthread_exit();
 
     let (t, f) = (TESTS, FAILS);
     sayln!("pstest: {} checks, {} failed", t, f);
@@ -1107,6 +1108,26 @@ unsafe fn test_sysstat_futex(buf: &mut [u8]) {
 
 /// ps's simple selections (procps-ng) and the terminals' st_rdev, around a
 /// pty session of a live leader and a sleeper.
+/// Kernel threads that returned (the boot canary kexit0/kexit1) leave no
+/// process behind: not in ps, no unreaped zombie, and pid 1 stays visible.
+unsafe fn test_kthread_exit() {
+    let mut sb = [0u8; 512];
+    let ok = match read_file(b"/proc/1/stat\0", &mut sb) {
+        Ok(n) => { let mut f: [&[u8]; 24] = [&[]; 24]; stat_fields(&sb[..n], &mut f) >= 20 }
+        Err(_) => false,
+    };
+    check(ok, "returning kthreads: /proc/1/stat reads and parses");
+    let mut out = [0u8; 16384];
+    let n = run_ps(&[b"-e\0"], &mut out);
+    check(has_pid_line(&out[..n], 1) && !contains(&out[..n], b"kexit"),
+          "returning kthreads leave no trace in ps -e");
+    let mut zombie_kernel = false;
+    for line in out[..n].split(|&c| c == b'\n') {
+        if contains(line, b"<defunct>") && contains(line, b"[") { zombie_kernel = true; }
+    }
+    check(!zombie_kernel, "returning kthreads leave no zombie");
+}
+
 unsafe fn test_ps_simple(me: i32) {
     let m = l::open(b"/dev/ptmx\0".as_ptr(), O_RDWR | 0o400 /* O_NOCTTY */, 0);
     if m < 0 { check(false, "open /dev/ptmx"); return; }

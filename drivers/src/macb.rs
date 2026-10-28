@@ -105,6 +105,28 @@ impl Regs for Mmio {
     fn delay_us(&mut self, us: u32) { sched::kthread::udelay(us as u64) }
 }
 
+/// kexec (dma_shutdown hook, interrupts off): TX/RX DMA stopped and every
+/// ring pointer cleared, so no received frame is written into memory the
+/// next kernel owns.
+fn kexec_shutdown() -> bool {
+    let base = BASE.load(Ordering::SeqCst);
+    if base == 0 { return true; }
+    RUNNING.store(false, Ordering::SeqCst);
+    IRQ_ACTIVE.store(false, Ordering::SeqCst);
+    let mut m = Mmio(base);
+    // Exclude `ncr_set` read-modify-writes. Bound the wait: a CPU holding
+    // the lock is either parked or about to see RUNNING=false.
+    let mut n = 0u32;
+    let _g = loop {
+        if let Some(g) = NCR_LOCK.try_lock() { break Some(g); }
+        n += 1;
+        if n > 2_000_000 { break None; }
+        core::hint::spin_loop();
+    };
+    let _ = hw::quiesce(&mut m, QUEUES.load(Ordering::Relaxed));
+    m.r32(hw::NCR) & (hw::NCR_TE | hw::NCR_RE) == 0
+}
+
 // ── state ───────────────────────────────────────────────────────────────────
 
 static ATTACHED: Mutex<Option<(Rp1Gem, hw::GemDt)>> = Mutex::new(None);
@@ -157,6 +179,19 @@ static TX_DMA: AtomicU64 = AtomicU64::new(0);
 static RX_DMA: AtomicU64 = AtomicU64::new(0);
 /// Rewinds of an idle-but-not-progressing TX queue (`hw::TxStall`).
 static TX_STALLS: AtomicU64 = AtomicU64::new(0);
+// pigem-bulk diagnostics and knobs (macb.fix1=0 / macb.fix2=0 turn a fix off).
+static FIX1: AtomicBool = AtomicBool::new(true);
+static FIX2: AtomicBool = AtomicBool::new(false);
+/// tx_ready() returned false (netd held off).
+static TX_READY_FALSE: AtomicU64 = AtomicU64::new(0);
+/// Set when tx_ready() said no; the driver thread kicks netd once the queue drains.
+static TX_HELD: AtomicBool = AtomicBool::new(false);
+static TSTART_RINGS: AtomicU64 = AtomicU64::new(0);
+static TX_RESTARTS: AtomicU64 = AtomicU64::new(0);
+static TX_DESYNC: AtomicU64 = AtomicU64::new(0);
+static TX_DRAIN_KICKS: AtomicU64 = AtomicU64::new(0);
+static TX_TAIL_MOVED_MS: AtomicU64 = AtomicU64::new(0);
+static TXWATCH_LINES: AtomicU32 = AtomicU32::new(0);
 
 /// Make descriptor/buffer stores (Normal NC or cleaned lines) visible to the
 /// device before the doorbell (Device) write: Linux `wmb()` before TSTART.
@@ -183,6 +218,7 @@ static RINGS: Mutex<Option<Rings>> = Mutex::new(None);
 static NCR_LOCK: Mutex<()> = Mutex::new(());
 
 fn ncr_set(m: &mut Mmio, set: u32, clear: u32) {
+    if set & hw::NCR_TSTART != 0 { TSTART_RINGS.fetch_add(1, Ordering::Relaxed); }
     let _g = NCR_LOCK.lock();
     let v = m.r32(hw::NCR);
     m.w32(hw::NCR, (v & !clear) | set);
@@ -257,6 +293,8 @@ pub fn init(cmdline: &str) {
     mlog!("GEM MID {:#x}, {} queue(s), MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (from {})", mid, queues,
           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], src);
 
+    FIX1.store(cmdline_val(cmdline, "macb.fix1") != Some("0"), Ordering::Relaxed);
+    FIX2.store(cmdline_val(cmdline, "macb.fix2") == Some("1"), Ordering::Relaxed);
     let mode = match cmdline_val(cmdline, "macb.dma") {
         Some("dev") => DmaMode::Dev, Some("cmo") => DmaMode::Cmo, Some("coh") => DmaMode::Coh, _ => DmaMode::Nc,
     };
@@ -301,6 +339,7 @@ pub fn init(cmdline: &str) {
         mid, queues, dcfg1, dcfg6, src, if res.irq_wired { "RP1 6" } else { "polled" }));
     PRESENT.store(true, Ordering::SeqCst);
     RUNNING.store(true, Ordering::SeqCst);
+    crate::dma_shutdown::register("gem", crate::dma_shutdown::Stage::Device, kexec_shutdown);
     set_state("phy");
     // `macb.phy=rgmii|rgmii-id|rgmii-rxid|rgmii-txid` pins the PHY delays
     // (no automatic RX-delay retry then).
@@ -494,6 +533,9 @@ fn driver_thread(mut m: Mmio, want: u8, mut mode: PhyMode, pinned: bool, polled:
     let mut flips = 0u32;
     let mut rx_ok_said = false;
     let mut stall = hw::TxStall::default();
+    let mut last_diag_pkts = 0u64;
+    let mut last_tail = usize::MAX;
+    let mut tail_polls = 0u32;
     loop {
         let res = { let _g = NCR_LOCK.lock(); w.poll(&mut m, addr) };
         match res {
@@ -505,12 +547,18 @@ fn driver_thread(mut m: Mmio, want: u8, mut mode: PhyMode, pinned: bool, polled:
         if w.cur.up {
             let now = now_ms();
             let t_up = *up_at.get_or_insert_with(|| { win_start = (now, *HW_STATS.lock()); now });
-            // Diag at +10 s and again at +40 s (after any TX recovery).
-            if diag_n < 2 && now - t_up >= if diag_n == 0 { 10_000 } else { 40_000 } {
+            // Diag at +10 s, +40 s, then every 15 s (max 20 lines) while traffic moves,
+            // so a line lands during and after a bulk stall.
+            let due = if diag_n == 0 { 10_000 } else if diag_n == 1 { 40_000 } else { 40_000 + 15_000 * (diag_n as u64 - 1) };
+            if diag_n < 20 && now - t_up >= due {
+                let traffic = TX_PKTS.load(Ordering::Relaxed) + RX_PKTS.load(Ordering::Relaxed);
+                if diag_n < 2 || traffic != last_diag_pkts {
+                    last_diag_pkts = traffic;
+                    let pd = { let _g = NCR_LOCK.lock(); hw::phy_diag(&mut m, addr).ok() };
+                    *PHY_DIAG.lock() = pd;
+                    log(&diag_line(&m, mode, pd, ((now - t_up) / 1000) as u32));
+                }
                 diag_n += 1;
-                let pd = { let _g = NCR_LOCK.lock(); hw::phy_diag(&mut m, addr).ok() };
-                *PHY_DIAG.lock() = pd;
-                log(&diag_line(&m, mode, pd, if diag_n == 1 { 10 } else { 40 }));
             }
             if now - win_start.0 >= 6_000 {
                 let cur = *HW_STATS.lock();
@@ -548,10 +596,42 @@ fn driver_thread(mut m: Mmio, want: u8, mut mode: PhyMode, pinned: bool, polled:
         if let Some(r) = RINGS.lock().as_mut() {
             r.tx.reclaim();
             if r.tx.in_flight() > 0 { wmb(); ncr_set(&mut m, hw::NCR_TSTART, 0); }
-            let tgo = m.r32(hw::TSR) & hw::TSR_TGO != 0;
+            let tsr = m.r32(hw::TSR);
+            let tgo = tsr & hw::TSR_TGO != 0;
             let slot = hw::ring_slot(m.r32(hw::TBQP), TX_DMA.load(Ordering::Relaxed) as u32, r.tx.len());
+            let infl = if w.cur.up { r.tx.in_flight() } else { 0 };
+            // Tail age and the stall watch line (30 per boot).
+            if r.tx.tail() != last_tail || infl == 0 { last_tail = r.tx.tail(); tail_polls = 0; TX_TAIL_MOVED_MS.store(now_ms(), Ordering::Relaxed); }
+            else { tail_polls += 1; }
+            let uat = r.tx.used_after_tail();
+            if infl > 0 && tail_polls >= 2 && TXWATCH_LINES.fetch_add(1, Ordering::Relaxed) < 30 {
+                let (h, t) = (r.tx.head(), r.tx.tail());
+                let s = slot.unwrap_or(t);
+                mlog!("txwatch: head {} tail {} inflight {} hw {:?} tgo {} TSR {:#x} full {} held {} desync {} tstart {} | d[T] {:08x} d[T+1] {:08x} d[S-1] {:08x} d[S] {:08x} | used-after-tail {:?} | rxubr {}",
+                      h, t, infl, slot, tgo as u8, tsr, TX_FULL.load(Ordering::Relaxed), TX_READY_FALSE.load(Ordering::Relaxed),
+                      TX_DESYNC.load(Ordering::Relaxed), TSTART_RINGS.load(Ordering::Relaxed),
+                      r.tx.desc(t).ctrl, r.tx.desc(t + 1).ctrl, r.tx.desc(s + r.tx.len() - 1).ctrl, r.tx.desc(s).ctrl,
+                      uat, RX_UBR.load(Ordering::Relaxed));
+            }
+            // Fix 1a: the GEM is idle past the tail and later slots completed, but
+            // the tail's completion was lost: retire up to the hardware slot.
+            if FIX1.load(Ordering::Relaxed) && !tgo && uat.is_some() {
+                if let Some(s) = slot {
+                    if s != r.tx.tail() {
+                        TX_DESYNC.fetch_add(1, Ordering::Relaxed);
+                        r.tx.resync_to(s);
+                        crate::netdev::kick();
+                    }
+                }
+            }
+            // Fix 1c: netd parked on tx_ready(); wake it once the queue drains.
+            if r.tx.in_flight() < NUM_TX / 2 && TX_HELD.swap(false, Ordering::Relaxed) {
+                TX_DRAIN_KICKS.fetch_add(1, Ordering::Relaxed);
+                crate::netdev::kick();
+            }
             // Link down: TE is off on purpose, nothing is stalled.
-            if stall.tick(slot, r.tx.tail(), if w.cur.up { r.tx.in_flight() } else { 0 }, tgo) {
+            let fired = if FIX1.load(Ordering::Relaxed) { stall.tick_tail(r.tx.tail(), infl) } else { stall.tick(slot, r.tx.tail(), infl, tgo) };
+            if fired {
                 let n = TX_STALLS.fetch_add(1, Ordering::Relaxed) + 1;
                 let (h, t) = (r.tx.head(), r.tx.tail());
                 let d = r.tx.desc(slot.unwrap_or(t));
@@ -641,7 +721,9 @@ pub fn send_packet(buf: &[u8]) -> bool {
 }
 
 pub fn tx_ready() -> bool {
-    RINGS.lock().as_mut().map(|r| { r.tx.reclaim(); r.tx.in_flight() < NUM_TX - 8 }).unwrap_or(false)
+    let ok = RINGS.lock().as_mut().map(|r| { r.tx.reclaim(); r.tx.in_flight() < NUM_TX - 8 }).unwrap_or(false);
+    if !ok { TX_HELD.store(true, Ordering::Relaxed); TX_READY_FALSE.fetch_add(1, Ordering::Relaxed); }
+    ok
 }
 
 pub fn poll_receive(out: &mut [u8]) -> Option<usize> {
@@ -649,6 +731,17 @@ pub fn poll_receive(out: &mut [u8]) -> Option<usize> {
     let mut g = RINGS.lock();
     let r = g.as_mut()?;
     r.tx.reclaim();
+    // Fix 2: the polled GEM has no TXUBR interrupt. A TSTART that lost the race
+    // with the controller's used-bit read leaves frames posted and TX idle
+    // (Linux macb_tx_restart). Re-ring when idle with frames queued.
+    if r.tx.in_flight() > 0 && FIX2.load(Ordering::Relaxed) && !IRQ_ACTIVE.load(Ordering::Relaxed) {
+        let mut m = Mmio(BASE.load(Ordering::Relaxed));
+        if m.r32(hw::TSR) & hw::TSR_TGO == 0 {
+            wmb();
+            ncr_set(&mut m, hw::NCR_TSTART, 0);
+            TX_RESTARTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     for _ in 0..NUM_RX {
         match r.rx.next() {
             RxEvent::Empty => return None,
@@ -693,6 +786,17 @@ pub fn info_lines(out: &mut String) {
     let _ = write!(out, "irqs: {}\nrx_overruns: {}\nrx_used_bit_read: {}\nhresp: {}\ntx_irq_errors: {}\ntx_desc_errors: {}\n",
         IRQS.load(Ordering::Relaxed), RX_OVR.load(Ordering::Relaxed), RX_UBR.load(Ordering::Relaxed),
         HRESP.load(Ordering::Relaxed), IRQ_ERR.load(Ordering::Relaxed), tx_err);
+    {
+        let g = RINGS.lock();
+        if let Some(r) = g.as_ref() {
+            let _ = write!(out, "tx_head: {}\ntx_tail: {}\ntx_inflight: {}\ntx_used_after_tail: {:?}\n",
+                r.tx.head(), r.tx.tail(), r.tx.in_flight(), r.tx.used_after_tail());
+        }
+    }
+    let _ = write!(out, "tx_ready_false: {}\ntstart_rings: {}\ntx_restarts: {}\ntx_desync: {}\ntx_stalls: {}\ntx_drain_kicks: {}\ntx_tail_age_ms: {}\nfix1: {}\nfix2: {}\n",
+        TX_READY_FALSE.load(Ordering::Relaxed), TSTART_RINGS.load(Ordering::Relaxed), TX_RESTARTS.load(Ordering::Relaxed),
+        TX_DESYNC.load(Ordering::Relaxed), TX_STALLS.load(Ordering::Relaxed), TX_DRAIN_KICKS.load(Ordering::Relaxed),
+        now_ms().saturating_sub(TX_TAIL_MOVED_MS.load(Ordering::Relaxed)), FIX1.load(Ordering::Relaxed) as u8, FIX2.load(Ordering::Relaxed) as u8);
     let base = BASE.load(Ordering::Relaxed);
     if base == 0 { return; }
     let mut m = Mmio(base);

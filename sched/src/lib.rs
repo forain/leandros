@@ -1136,8 +1136,25 @@ fn release_quiesce_if_owner(tgid: Pid, pid: Pid) {
     }
 }
 
-pub fn alloc_pid() -> Pid {
+static PID1_RESERVED: AtomicBool = AtomicBool::new(true);
+
+/// A kernel thread's pid: as [`alloc_pid`], but never pid 1 while it is still
+/// unclaimed (the first non-kthread task gets it).
+fn alloc_kthread_pid() -> Pid {
+    {
+        let mut g = NEXT_PID.lock();
+        if *g == 1 && PID1_RESERVED.load(Ordering::Acquire) { *g = 2; }
+    }
+    alloc_pid_inner(false)
+}
+
+pub fn alloc_pid() -> Pid { alloc_pid_inner(true) }
+
+fn alloc_pid_inner(may_take_one: bool) -> Pid {
     let mut pid_guard = NEXT_PID.lock();
+    // Pid 1 is /bin/init's: a kernel thread spawned before it (btusb, the boot
+    // canary) must not take it (`alloc_kthread_pid`).
+    if may_take_one && PID1_RESERVED.swap(false, Ordering::AcqRel) && *pid_guard >= 2 { return 1; }
     loop {
         let pid = *pid_guard;
         *pid_guard += 1;
@@ -3380,6 +3397,8 @@ pub mod poll_class {
     /// The raw HCI node /dev/hci0 (drivers/src/bt/hcidev): a packet queued
     /// for the reader, TX room, or the controller died.
     pub const BT: u32 = 25;
+    /// A V4L2 capture node (kernel/src/v4l2.rs), index 0.
+    pub const VIDEO: u32 = 26;
 }
 
 /// Bumped by every producer whose object's poll tag itself changes (a
@@ -5824,11 +5843,27 @@ fn nmi_probe(cpu: usize) {
 /// x86_64, an NMI sample whose RIP is in `wdog_selftest_stall`. 0 = off.
 static WDOG_SELFTEST_TICK: AtomicU32 = AtomicU32::new(0);
 static WDOG_SELFTEST_SEEN: AtomicBool = AtomicBool::new(false);
+static WDOG_SELFTEST_FOREVER: AtomicBool = AtomicBool::new(false);
 pub fn wdog_selftest_arm() { WDOG_SELFTEST_TICK.store(3000, Ordering::Relaxed); }
+/// `wdog.selftest=2`: cpu1 stalls with IRQs masked and is never released, to
+/// prove the hardware-watchdog stall -> reset path on real boards.
+pub fn wdog_selftest_arm_forever() {
+    WDOG_SELFTEST_FOREVER.store(true, Ordering::Relaxed);
+    wdog_selftest_arm();
+}
 
 #[inline(never)]
 fn wdog_selftest_stall() {
     extern "C" { fn arch_serial_putc(c: u8); }
+    if WDOG_SELFTEST_FOREVER.load(Ordering::Relaxed) {
+        for &b in b"\n[WDOG] selftest: cpu1 stalls with IRQs masked FOREVER (wdog.selftest=2); expect a hardware-watchdog reset\n" {
+            unsafe { arch_serial_putc(b) }
+        }
+        // Count as busy, not idle: the tick may have interrupted the idle
+        // loop, and an idle-flagged CPU is excluded from the stuck test.
+        IDLE_SINCE[1].store(0, Ordering::Relaxed);
+        loop { core::hint::spin_loop(); }
+    }
     for &b in b"\n[WDOG] selftest: cpu1 stalls with IRQs masked until reported (wdog.selftest=1)\n" {
         unsafe { arch_serial_putc(b) }
     }
@@ -7120,22 +7155,54 @@ pub fn spawn(entry: fn() -> !, _flags: usize) -> Option<Pid> {
 }
 
 /// Spawn a kernel task that runs `func(arg)`; `func` must not return (end
-/// with `exit`). The building block of `kthread::spawn`.
+/// with [`kthread_exit`]). The building block of `kthread::spawn`.
 pub fn spawn_with_arg(func: extern "C" fn(usize) -> !, arg: usize) -> Option<Pid> {
-    let pid = alloc_pid();
+    spawn_with_arg_named(func, arg, b"")
+}
+
+/// As [`spawn_with_arg`], with the thread's exe-path name set before it can
+/// run (a closure that returns at once must not race the name). The task is a
+/// kernel thread: session 0, process group 0, no exit record on return.
+pub fn spawn_with_arg_named(func: extern "C" fn(usize) -> !, arg: usize, name: &[u8]) -> Option<Pid> {
+    let pid = alloc_kthread_pid();
     let stack_base = mm::buddy::alloc(KERNEL_STACK_ORDER)?;
     arm_kernel_stack(stack_base);
     let mut task = Task::new_kernel(pid, 0, stack_base, KERNEL_STACK_SIZE, 0);
     task.ctx = CpuContext::new_task_with_arg(func as usize, arg,
         mm::phys_to_virt(stack_base) + KERNEL_STACK_SIZE);
+    task.kthread = true;
+    task.sid = 0;
+    task.pgid = 0;
+    if !name.is_empty() { set_exe_path(pid, name); }
     let ok = RUN_QUEUE.lock().enqueue(task);
     if ok {
         wake_up_an_idle_cpu();
         Some(pid)
     } else {
+        if !name.is_empty() { clear_exe_path(pid); }
         mm::buddy::free(stack_base, KERNEL_STACK_ORDER);
         None
     }
+}
+
+/// End the calling kernel thread. It is not a process: no fd teardown, no
+/// session/pgrp hooks, no exit record, no parent notice. The task becomes a
+/// born-reaped zombie and the dispatch loop frees its slot and stack.
+pub fn kthread_exit() -> ! {
+    let pid = current_pid();
+    clear_comm(pid);
+    clear_exe_path(pid);
+    {
+        let mut rq = RUN_QUEUE.lock();
+        if let Some(t) = rq.find_pid_mut(pid) {
+            t.exiting = true;
+            t.exit_code = 0;
+            t.wait_reported = true;
+            t.set_state(TaskState::Zombie);
+        }
+    }
+    yield_now("kthread_exit");
+    loop { core::hint::spin_loop(); }
 }
 
 pub fn spawn_user_with_address_space(entry_point: usize, sp: usize, as_: mm::vmm::AddressSpace) -> Option<Pid> {
@@ -7513,7 +7580,10 @@ fn scheduler_run_loop() -> ! {
                     // EXIT_LOG — a gap between remove() and a later
                     // log_exit() makes waitpid return ECHILD.
                     let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
-                    log_exit(&mut rq, zpid, status, parent_tgid, pgid, is_proc, reported);
+                    let is_kthread = rq.get(idx).map_or(false, |t| t.kthread);
+                    if !is_kthread {
+                        log_exit(&mut rq, zpid, status, parent_tgid, pgid, is_proc, reported);
+                    }
                     let ztgid = rq.get(idx).map(|t| t.tgid).unwrap_or(zpid);
                     release_quiesce_if_owner(ztgid, zpid);
                     // Lane proclife: the Box (and with it this thread's
@@ -8160,6 +8230,8 @@ pub fn exit(code: i32) -> ! {
         fn print_number(n: u32);
     }
     let pid = current_pid();
+    // A kernel thread is not a process: defensive diversion.
+    if RUN_QUEUE.lock().find_pid(pid).map_or(false, |t| t.kthread) { kthread_exit(); }
 
     // Release this task's fds *before* it becomes a zombie.
     //

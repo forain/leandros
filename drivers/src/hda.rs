@@ -347,6 +347,9 @@ pub struct Hda {
     rirb: usize, rirb_phys: usize, rirb_entries: u16, rirb_rp: u16,
     immediate: bool,
     cmd_timeouts: u32,
+    /// Probing a secondary codec: a CORB timeout fails the verb instead of
+    /// switching the whole link to the immediate interface.
+    no_fallback: bool,
     // DMA
     posbuf: usize,
     bdl: usize, bdl_phys: usize,
@@ -378,6 +381,7 @@ pub struct Hda {
     restarts: u32,
     dma_errors: u32,
     summary: String,
+    ext: capture::Ext,
 }
 
 unsafe impl Send for Hda {}
@@ -389,7 +393,7 @@ impl Hda {
             base: 0, func: pci::PciFunction::new(0, 0, 0), vendor: 0, device: 0, class_sub: 0, gcap: 0,
             corb: 0, corb_phys: 0, corb_entries: 0, corb_wp: 0,
             rirb: 0, rirb_phys: 0, rirb_entries: 0, rirb_rp: 0,
-            immediate: false, cmd_timeouts: 0,
+            immediate: false, cmd_timeouts: 0, no_fallback: false,
             posbuf: 0, bdl: 0, bdl_phys: 0, ring: 0, ring_phys: 0, sd: 0, sd_index: 0, fifos: 0,
             cad: 0, codec_vid: 0, codec_rev: 0, codec_subsys: 0, afg: 0,
             widgets: Vec::new(), pins: Vec::new(), dacs: Vec::new(), dac_rates: 0,
@@ -399,6 +403,7 @@ impl Hda {
             resamp: Resampler { step: 65536, frac: 0, prev: [0; 2], primed: false },
             restarts: 0, dma_errors: 0,
             summary: String::new(),
+            ext: capture::Ext::new(),
         }
     }
 
@@ -543,6 +548,7 @@ impl Hda {
         self.sd = SD_BASE + self.sd_index as usize * SD_STRIDE;
         self.program_codec_paths();
         self.build_summary();
+        self.ext_probe(statests);
         for line in self.summary.clone().lines() {
             let mut s = String::from(line);
             s.push('\n');
@@ -708,6 +714,7 @@ impl Hda {
         if !self.immediate {
             if let Some(r) = self.send_corb(cmd) { return Some(r); }
             self.cmd_timeouts += 1;
+            if self.no_fallback { return None; }
             hlog!("[HDA] CORB/RIRB command {:#010x} timed out; switching to the immediate command interface\n", cmd);
             // Stop the rings: the immediate interface is only defined with
             // CORB/RIRB DMA off.
@@ -1223,7 +1230,7 @@ impl Hda {
 
     /// The tick-pump hook: just the position update (the hardware never
     /// stops on underrun; consumed regions are already silent).
-    pub fn top_up_silence(&mut self) { self.update(); }
+    pub fn top_up_silence(&mut self) { self.update(); self.capture_update(); }
 
     #[inline]
     fn put_frame(&mut self, l: i16, r: i16) {
@@ -1406,6 +1413,8 @@ impl Hda {
                            if over(t0) { ", budget exhausted" } else { "" });
         }
 
+        self.shutdown_display();
+
         // 3. Controller.
         self.w32(INTCTL, 0);
         self.w8(CORBCTL, 0);
@@ -1446,6 +1455,7 @@ impl Hda {
         let _ = writeln!(s, "counters: played {} written {} queued {} starved {} restarts {} dma_errors {} cmd_timeouts {} intsts {:#x}",
                          self.played, self.written, self.queued_bytes(), self.underruns, self.restarts,
                          self.dma_errors, self.cmd_timeouts, self.r32(INTSTS));
+        self.ext_info(&mut s);
         s
     }
 }
@@ -1470,3 +1480,6 @@ fn codec_name(vid: u32) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+#[path = "hda_capture.rs"]
+mod capture;

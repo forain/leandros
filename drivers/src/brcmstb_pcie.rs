@@ -3,8 +3,7 @@
 //! `pcie-brcmstb.c` does for BCM2712, then plugs a config-space backend into
 //! `pci.rs` so RP1 (1de4:0001) enumerates as an ordinary PCI function.
 //!
-//! Opt-in: `pcie.rpi5=1` on the kernel command line (default off until it is
-//! hardware-verified). Every step is bounded; any failure prints one
+//! On by default; `pcie.rpi5=0` on the kernel command line turns it off. Every step is bounded; any failure prints one
 //! `[pcie] ...` line, leaves the bus unregistered and boot continues.
 //!
 //! Sequence (Linux `brcm_pcie_probe` / `brcm_pcie_setup` / `brcm_pcie_start_link`):
@@ -27,6 +26,8 @@ use spin::Mutex;
 static REGS: AtomicUsize = AtomicUsize::new(0);
 /// Serialises EXT_CFG_INDEX + data access.
 static CFG_LOCK: Mutex<()> = Mutex::new(());
+/// Virtual address of the brcmstb-reset SW_INIT bank base (for the kexec hook).
+static SWINIT: AtomicUsize = AtomicUsize::new(0);
 /// 0 = not run, 1 = link up and registered, 2.. = failed at step (see `state`).
 static STATE: AtomicU32 = AtomicU32::new(0);
 
@@ -116,10 +117,12 @@ fn map(pa: u64, len: usize) -> usize {
 /// Config-space backend handed to `pci.rs`.
 fn cfg_access(bus: u8, dev: u8, func: u8, off: u16, size: u8, write: Option<u32>) -> u32 {
     let ones = match size { 1 => 0xff, 2 => 0xffff, _ => 0xffff_ffff };
-    let base = REGS.load(Ordering::Acquire);
-    if base == 0 || bus > 1 { return ones; }
+    if REGS.load(Ordering::Acquire) == 0 || bus > 1 { return ones; }
     let Some(o) = hw::cfg_offset(bus, dev, func, off) else { return ones };
     let _g = CFG_LOCK.lock();
+    // Re-read under the lock: `kexec_reset` clears REGS while holding it.
+    let base = REGS.load(Ordering::Acquire);
+    if base == 0 { return ones; }
     if bus != 0 {
         // Never send a config TLP over a dead link.
         if !hw::link_up(rd(hw::MISC_PCIE_STATUS)) { return ones; }
@@ -223,6 +226,7 @@ fn init_inner() {
     if regs == 0 || rescal == 0 || swinit == 0 { return fail(2, "ioremap"); }
     let rescal = rescal + (hw::RESCAL_REGS & 0xfff) as usize;
     let swinit = swinit + (hw::SW_INIT_REGS & 0xfff) as usize;
+    SWINIT.store(swinit, Ordering::Release);
 
     // Reset-controller status: is the bridge held in reset at hand-over?
     if !stage(2) { return; }
@@ -239,6 +243,12 @@ fn init_inner() {
     // First RC reads, before touching anything: tells whether the RC
     // register block is clocked at all and whether the firmware left a link.
     if !stage(4) { REGS.store(0, Ordering::Release); return; }
+    if st & bit != 0 {
+        // Held in reset (early_reset, a previous kernel's kexec hook, or the
+        // firmware): the RC block does not answer, so no read before the
+        // bridge pulse below; there is no link to reuse either.
+        raw("[pcie] rc not read: bridge held in reset at hand-over\n");
+    } else {
     let rev = rd(hw::MISC_REVISION);
     let status = rd(hw::MISC_PCIE_STATUS);
     let ctrl = rd(hw::MISC_PCIE_CTRL);
@@ -249,6 +259,7 @@ fn init_inner() {
     if REUSE.load(Ordering::Relaxed) && hw::link_up(status) {
         raw("[pcie] reusing the firmware link (pcie.reuse=1)\n");
         reuse = true;
+    }
     }
 
     if !reuse {
@@ -374,6 +385,7 @@ fn init_inner() {
 
     crate::pci::set_cfg_backend(cfg_access, hw::OB_MEM_CPU - hw::OB_MEM_PCI, 1);
     STATE.store(1, Ordering::Relaxed);
+    crate::dma_shutdown::register("pcie-perst", crate::dma_shutdown::Stage::Bus, kexec_reset);
     log("[pcie] 0000:01:00.0 1de4:0001");
     for (i, b) in l.bars.iter().enumerate() {
         let n = [b' ', b'b', b'a', b'r', b'0' + i as u8, b'='];
@@ -412,3 +424,64 @@ pub fn rp1_bar1() -> Option<(u64, u64)> {
     if size == 0 { None } else { Some((RP1_BAR1.load(Ordering::Relaxed), size)) }
 }
 
+
+// ── kexec: nothing behind pcie2 may master after the jump ──────────────────
+
+/// RP1 (01:00.0) and the root port (00:00.0) lose bus mastering, PERST#
+/// holds RP1 in reset, then the bridge reset cuts the RC off the AXI bus.
+/// Runs as the last `dma_shutdown` hook (Stage::Bus), interrupts off: after
+/// it no config or RC access is possible, so `REGS` is cleared and every
+/// later `cfg_access` returns all-ones instead of stalling the CPU.
+fn kexec_reset() -> bool {
+    let regs = REGS.load(Ordering::Acquire);
+    let swinit = SWINIT.load(Ordering::Acquire);
+    if regs == 0 || swinit == 0 { return true; }
+    // Runs from the last CPU with every other CPU parked (a parked CPU may
+    // have been stopped inside `cfg_access`), so the lock is forced and the
+    // delay is a counted register read, not the (switched-off) timer.
+    unsafe { CFG_LOCK.force_unlock(); }
+    for bus in [1u8, 0] {
+        let cmd = cfg32(bus, 0x04);
+        if cmd == 0xffff_ffff { continue; }
+        cfgw32(bus, 0x04, (cmd & 0xffff) & !0x4);
+    }
+    perst(true);
+    for _ in 0..2000 { let _ = rd(hw::MISC_PCIE_CTRL); }
+    STATE.store(0, Ordering::Relaxed);
+    let _g = CFG_LOCK.lock();
+    REGS.store(0, Ordering::Release);
+    let mut bus = MmioBus { rc: regs, swinit };
+    let (_, bit) = hw::sw_init_set(hw::PCIE2_BRIDGE_RESET_ID);
+    hw::bridge_assert(&mut bus) & bit != 0
+}
+
+/// Outcome of [`early_reset_identity`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EarlyReset {
+    /// The bridge was already held in reset; nothing behind pcie2 can reach DRAM.
+    AlreadyInReset,
+    /// The bridge was put in reset.
+    Reset { held: bool },
+}
+
+/// New kernel, before the buddy allocator exists (rpi5 direct boot only):
+/// a previous kernel may have left RP1 running (GEM RX ring, xHCI, RP1 DMA)
+/// with pcie2 up, and its frames would land in pages this kernel is about to
+/// call free. Holds RP1 in PERST# and the RC bridge in reset whatever
+/// `pcie.rpi5` says; `init` brings it back out when PCIe is wanted.
+///
+/// # Safety
+/// The physical BCM2712 MMIO at 0x10_0000_0000.. must be identity-mapped as
+/// Device memory (entry stub PUD 64), and nothing else may touch pcie2.
+pub unsafe fn early_reset_identity() -> EarlyReset {
+    use leandros_lib::mmio::{read, write};
+    let (bank, bit) = hw::sw_init_set(hw::PCIE2_BRIDGE_RESET_ID);
+    let sw = hw::SW_INIT_REGS as usize + bank;
+    if read((sw + hw::SW_INIT_STATUS) as *const u32) & bit != 0 { return EarlyReset::AlreadyInReset; }
+    // Only the reset-controller block is touched: no RC register is read
+    // before rescal. Holding the bridge in reset already cuts RP1 off from
+    // AXI/DRAM; `init` asserts PERST# once the bridge is released.
+    write(sw as *mut u32, bit);
+    let held = read((sw + hw::SW_INIT_STATUS) as *const u32) & bit != 0;
+    EarlyReset::Reset { held }
+}

@@ -35,6 +35,9 @@ const LINUX_REBOOT_CMD_CAD_OFF:    u32 = 0x0000_0000;
 const LINUX_REBOOT_CMD_POWER_OFF:  u32 = 0x4321_FEDC;
 const LINUX_REBOOT_CMD_RESTART2:   u32 = 0xA1B2_C3D4;
 const LINUX_REBOOT_CMD_KEXEC:      u32 = 0x4558_4543;
+/// LeandrOS private: run one freeze-only device suspend/resume cycle
+/// (`pm::sys_pm_test`, arg = user `PmTestReq`). "PMTS".
+const LEANDROS_REBOOT_CMD_PM_TEST: u32 = 0x504D_5453;
 
 const EPERM:  isize = -1;
 const EINVAL: isize = -22;
@@ -88,6 +91,9 @@ pub fn init_acpi(rsdp_phys: u64, hhdm_offset: u64) {
             serial_print_str(" value ");
             crate::serial_print_hex(p.reset_value as usize);
             serial_print_str("\n");
+            serial_print_str(&alloc::format!(
+                "[ACPI] sleep: LOW_POWER_S0={} \\_S3_={} SLP_TYP={:#x}/{:#x} FACS={:#x} _PTS={} _WAK={}\n",
+                p.low_power_s0 as u8, p.s3_found as u8, p.s3_typ_a, p.s3_typ_b, p.facs, p.has_pts as u8, p.has_wak as u8));
             unsafe { ACPI_POWER = Some(p); }
         }
         None => serial_print_str("[ACPI] no FADT: power-off falls back to halt\n"),
@@ -118,6 +124,7 @@ pub fn sys_reboot(magic1: usize, magic2: usize, cmd: usize, _arg: usize) -> isiz
         return EINVAL;
     }
     match cmd {
+        LEANDROS_REBOOT_CMD_PM_TEST => crate::pm::sys_pm_test(_arg),
         LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_RESTART2 => kernel_restart(),
         LINUX_REBOOT_CMD_CAD_ON  => { CAD_ENABLED.store(true, Ordering::Relaxed); 0 }
         LINUX_REBOOT_CMD_CAD_OFF => { CAD_ENABLED.store(false, Ordering::Relaxed); 0 }
@@ -153,14 +160,15 @@ fn shutdown_prepare(state: u8) {
 //
 // `reboot.quiesce=0`     skip the device quiesce below (the pre-lane-rebootq
 //                        behaviour: filesystems + NVMe only).
-// `reboot.type=cold|warm` x86_64 reset flavour (default cold): cold = PCI
+// `reboot.type=cold|warm` x86_64 reset flavour (default warm; cold is an
+//                        alias for reboot.method=cf9full): cold = PCI
 //                        reset control 0xCF9 FULL_RST (0x0E: the chipset
 //                        drops SLP_S3#/S4#/S5# for 3-5 s, i.e. a power
 //                        cycle, what EDK2's ResetSystem(EfiResetCold) does on
 //                        Intel PCHs); warm = Linux's default chain on an ACPI
 //                        machine (FADT RESET_REG — 0xCF9 <- 0x06 on the HP —
 //                        then the 8042, then 0xCF9 0x06, then triple fault).
-// `reboot.method=auto|acpi|cf9|kbd|triple` try this one first, then the
+// `reboot.method=auto|acpi|kbd|cf9|cf9full|triple` try this one first, then the
 //                        rest of the type's chain (default auto).
 // `reboot.hda_crst=1`    also hold the HDA link in reset after the codec is
 //                        in D3 (Linux skips it at shutdown: pops).
@@ -174,7 +182,7 @@ fn shutdown_prepare(state: u8) {
 //                        what the Intel ResetSystemLib does for EfiResetCold.
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ResetMethod { Auto, Acpi, Cf9, Kbd, Triple }
+pub enum ResetMethod { Auto, Acpi, Cf9, Cf9Full, Kbd, Triple }
 
 #[derive(Clone, Copy)]
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
@@ -200,12 +208,15 @@ impl RebootCfg {
         let on = |k: &str| matches!(opt(k), Some("1") | Some("on") | Some("yes"));
         RebootCfg {
             quiesce: !off("reboot.quiesce"),
-            cold: opt("reboot.type") != Some("warm"),
+            cold: opt("reboot.type") == Some("cold"),
             method: match opt("reboot.method") {
                 Some("acpi") => ResetMethod::Acpi,
                 Some("cf9") => ResetMethod::Cf9,
+                Some("cf9full") => ResetMethod::Cf9Full,
                 Some("kbd") => ResetMethod::Kbd,
                 Some("triple") => ResetMethod::Triple,
+                // reboot.type=cold is an alias for method=cf9full.
+                _ if opt("reboot.type") == Some("cold") => ResetMethod::Cf9Full,
                 _ => ResetMethod::Auto,
             },
             hda_crst: on("reboot.hda_crst"),
@@ -217,7 +228,7 @@ impl RebootCfg {
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     fn method_name(&self) -> &'static str {
         match self.method { ResetMethod::Auto => "auto", ResetMethod::Acpi => "acpi",
-                            ResetMethod::Cf9 => "cf9", ResetMethod::Kbd => "kbd", ResetMethod::Triple => "triple" }
+                            ResetMethod::Cf9 => "cf9", ResetMethod::Cf9Full => "cf9full", ResetMethod::Kbd => "kbd", ResetMethod::Triple => "triple" }
     }
 }
 
@@ -271,9 +282,11 @@ fn quiesce_phase1(cfg: &RebootCfg, what: &str) -> alloc::vec::Vec<drivers::pci::
 /// Phase 2, interrupts off, after the last write to any disk: xHCI halt
 /// (+ reset, + port power off), then bus mastering off. Serial only — the
 /// stick is gone.
-fn quiesce_phase2(cfg: &RebootCfg, bm: &[drivers::pci::PciFunction]) {
-    if !cfg.quiesce { return; }
+fn quiesce_phase2(cfg: &RebootCfg, bm: &[drivers::pci::PciFunction]) -> usize {
+    if !cfg.quiesce { return 0; }
+    let mut halted = 0;
     for line in drivers::usb_hcd::quiesce_all(cfg.xhci_hcrst, cfg.usb_vbus_off) {
+        if line.contains(" halted in ") { halted += 1; }
         serial_print_str("[REBOOT] ");
         serial_print_str(&line);
         serial_print_str("\n");
@@ -286,6 +299,7 @@ fn quiesce_phase2(cfg: &RebootCfg, bm: &[drivers::pci::PciFunction]) {
         }
         serial_print_str("[REBOOT] bus mastering off on the audio, network and display functions\n");
     }
+    halted
 }
 
 /// Last step of every path: no more interrupts on this CPU, every queued
@@ -348,6 +362,15 @@ fn kernel_restart() -> ! {
     let cfg = RebootCfg::from_cmdline();
     let bm = quiesce_phase1(&cfg, "restart");
     serial_print_str("reboot: Restarting system\n");
+    #[cfg(target_arch = "x86_64")]
+    plog(&alloc::format!("chain: {}", arch_x86_64::power::chain_text(match cfg.method {
+        ResetMethod::Auto => arch_x86_64::power::Method::Auto,
+        ResetMethod::Acpi => arch_x86_64::power::Method::Acpi,
+        ResetMethod::Cf9 => arch_x86_64::power::Method::Cf9,
+        ResetMethod::Cf9Full => arch_x86_64::power::Method::Cf9Full,
+        ResetMethod::Kbd => arch_x86_64::power::Method::Kbd,
+        ResetMethod::Triple => arch_x86_64::power::Method::Triple,
+    })));
     machine_prepare();
     quiesce_phase2(&cfg, &bm);
     #[cfg(target_arch = "x86_64")]
@@ -356,10 +379,11 @@ fn kernel_restart() -> ! {
             ResetMethod::Auto => arch_x86_64::power::Method::Auto,
             ResetMethod::Acpi => arch_x86_64::power::Method::Acpi,
             ResetMethod::Cf9 => arch_x86_64::power::Method::Cf9,
+            ResetMethod::Cf9Full => arch_x86_64::power::Method::Cf9Full,
             ResetMethod::Kbd => arch_x86_64::power::Method::Kbd,
             ResetMethod::Triple => arch_x86_64::power::Method::Triple,
         };
-        arch_x86_64::power::restart((*core::ptr::addr_of!(ACPI_POWER)).as_ref(), m, cfg.cold);
+        arch_x86_64::power::restart((*core::ptr::addr_of!(ACPI_POWER)).as_ref(), m);
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -394,10 +418,46 @@ fn kernel_kexec() -> isize {
     crate::kexec::devreset::plan(crate::kexec::handover_fb());
     serial_print_str("kexec_core: Starting new kernel\n");
     machine_prepare();
-    quiesce_phase2(&cfg, &bm);
+    let xhci = quiesce_phase2(&cfg, &bm);
     if cfg.quiesce { kexec_hooks(); }
+    // Every registered DMA engine, even with reboot.quiesce=0: a bus master
+    // left running writes into pages the next kernel calls free (Pi 5 RP1
+    // GEM, 2026-10-27). Then config-space bus mastering off everywhere, and
+    // last the bus resets (PCIe PERST# + bridge), after which the RC is gone.
+    let (mut ok, mut bad) = drivers::dma_shutdown::run(drivers::dma_shutdown::Stage::Device);
     quiesce_all_pci();
+    // aarch64: the Bus stage runs later, from `final_cpu0` once every other
+    // CPU is parked (a bridge reset under live RP1 driver threads stalls them
+    // on AXI). Other architectures have no parked-CPU point, run it here.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let (bus_ok, bus_bad) = drivers::dma_shutdown::run(drivers::dma_shutdown::Stage::Bus);
+        ok.extend(bus_ok);
+        bad.extend(bus_bad);
+    }
+    serial_print_str(&kexec_quiesced_line(&ok, xhci, &bad));
     crate::kexec::exec_jump()
+}
+
+/// `[kexec] quiesced: gem xhci0 xhci1 dma40 pcie-perst` (+ `FAILED: ...`):
+/// one line naming every bus master stopped before the jump.
+fn kexec_quiesced_line(ok: &[&str], xhci: usize, bad: &[&str]) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let mut l = alloc::string::String::from("[kexec] quiesced:");
+    let (dev, bus): (alloc::vec::Vec<&str>, alloc::vec::Vec<&str>) =
+        ok.iter().partition(|n| **n != "pcie-perst");
+    let mut it = dev.iter();
+    if let Some(first) = it.next() { let _ = write!(l, " {}", first); }
+    for i in 0..xhci { let _ = write!(l, " xhci{}", i); }
+    for n in it { let _ = write!(l, " {}", n); }
+    for n in bus { let _ = write!(l, " {}", n); }
+    if ok.is_empty() && xhci == 0 { l.push_str(" (no bus masters registered)"); }
+    if !bad.is_empty() {
+        l.push_str(" FAILED:");
+        for n in bad { let _ = write!(l, " {}", n); }
+    }
+    l.push('\n');
+    l
 }
 
 /// kexec only, right after the filesystems are synced and before phase 1
@@ -501,4 +561,49 @@ fn kernel_halt() -> ! {
     arch_x86_64::power::halt_forever();
     #[cfg(target_arch = "aarch64")]
     arch_aarch64::power::halt_forever();
+}
+
+/// `[PMC] reset cause`: why did the last reset happen (x86_64, Intel PCH PMC
+/// at 00:1f.2). Log only, nothing is written. Register offsets and bit
+/// positions are from memory of the 100/200-series PCH datasheet and coreboot
+/// `soc/intel/skylake/include/soc/pmc.h`: UNVERIFIED, raw values are logged
+/// next to the decode. Needs mm::kva (ETR3 mapping).
+#[cfg(target_arch = "x86_64")]
+pub fn log_reset_cause() {
+    unsafe fn outl(p: u16, v: u32) { core::arch::asm!("out dx, eax", in("dx") p, in("eax") v, options(nomem, nostack)); }
+    unsafe fn inl(p: u16) -> u32 { let v: u32; core::arch::asm!("in eax, dx", in("dx") p, out("eax") v, options(nomem, nostack)); v }
+    unsafe fn inw(p: u16) -> u16 { let v: u16; core::arch::asm!("in ax, dx", in("dx") p, out("ax") v, options(nomem, nostack)); v }
+    let rd = |reg: u32| -> u32 {
+        unsafe { outl(0xCF8, 0x8000_0000 | (0x1f << 11) | (2 << 8) | (reg & 0xFC)); inl(0xCFC) }
+    };
+    let id = rd(0);
+    if id & 0xFFFF != 0x8086 || id == 0xFFFF_FFFF {
+        serial_print_str(&alloc::format!("[PMC] reset cause: no Intel PMC at 00:1f.2 (id {:#x})\n", id));
+        return;
+    }
+    let a = rd(0xA0);
+    let b = rd(0xA4);
+    let bar = rd(0x10);
+    let mut etr3 = None;
+    let base = (bar & !0xFFF) as u64;
+    if bar & 1 == 0 && base != 0 && bar != 0xFFFF_FFFF {
+        if let Some(va) = mm::kva::ioremap(base, 0x1000, mm::kva::CacheMode::Uncached) {
+            etr3 = Some(unsafe { core::ptr::read_volatile((va + 0x48) as *const u32) });
+        }
+    }
+    let pm1_sts = match unsafe { (*core::ptr::addr_of!(ACPI_POWER)).as_ref() } {
+        Some(p) if p.pm1a_evt != 0 => Some(unsafe { inw(p.pm1a_evt) }),
+        _ => None,
+    };
+    // (unverified) GEN_PMCON_A: GBL_RST_STS bit 24, HOST_RST_STS bit 9;
+    // GEN_PMCON_B: PWR_FLR bit 1, SUS_PWR_FLR bit 14; ETR3: CF9GR bit 20,
+    // CF9LOCK bit 31; PM1_STS: PWRBTN_STS bit 8, PRBTNOR_STS bit 11, WAK_STS bit 15.
+    serial_print_str(&alloc::format!(
+        "[PMC] reset cause: GEN_PMCON_A={:#010x} B={:#010x} PWRMBASE={:#x} ETR3={} PM1_STS={} | decode(unverified): GBL_RST={} HOST_RST={} PWR_FLR={} SUS_PWR_FLR={} CF9GR={} PWRBTN={} PRBTNOR={} WAK={}\n",
+        a, b, base,
+        match etr3 { Some(v) => alloc::format!("{:#010x}", v), None => alloc::string::String::from("n/a") },
+        match pm1_sts { Some(v) => alloc::format!("{:#06x}", v), None => alloc::string::String::from("n/a") },
+        (a >> 24) & 1, (a >> 9) & 1, (b >> 1) & 1, (b >> 14) & 1,
+        etr3.map_or(0, |v| (v >> 20) & 1),
+        pm1_sts.map_or(0, |v| (v >> 8) & 1), pm1_sts.map_or(0, |v| (v >> 11) & 1), pm1_sts.map_or(0, |v| (v >> 15) & 1)));
 }

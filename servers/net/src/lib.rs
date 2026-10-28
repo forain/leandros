@@ -21,7 +21,7 @@ use spin::Mutex;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
 use smoltcp::socket::{tcp, udp, icmp};
 use smoltcp::time::Instant;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicBool, AtomicU64};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 
 // ── Protocol tag constants ────────────────────────────────────────────────────
@@ -102,6 +102,20 @@ const NET_DEBUG: bool = false;
 /// `servers/drm/src/lib.rs` bounds its mmap trace.
 static ACCEPT_EAGAIN_SEEN: AtomicU32 = AtomicU32::new(0);
 const ACCEPT_EAGAIN_LIMIT: u32 = 64;
+
+/// Start (ms+1) of the current tx_ready()==false episode; 0 = none. A held
+/// episode longer than 2 s is logged once (pigem-bulk diagnosis).
+static TX_HELD_SINCE: AtomicU64 = AtomicU64::new(0);
+static TX_HELD_LOGGED: AtomicBool = AtomicBool::new(false);
+fn tx_held_episode(id: usize, now_ms: i64, held: u64) {
+    let since = TX_HELD_SINCE.load(Ordering::Relaxed);
+    if since == 0 { TX_HELD_SINCE.store(now_ms as u64 + 1, Ordering::Relaxed); TX_HELD_LOGGED.store(false, Ordering::Relaxed); return; }
+    if now_ms as u64 + 1 - since >= 2000 && !TX_HELD_LOGGED.swap(true, Ordering::Relaxed) {
+        extern "C" { fn arch_serial_putc(c: u8); }
+        let _ = (id, held);
+        for &b in b"netd: tx held >2 s (see tx_held in /proc/net)\n" { unsafe { arch_serial_putc(b); } }
+    }
+}
 
 fn dbg(msg: &str) {
     if !NET_DEBUG { return; }
@@ -2414,7 +2428,31 @@ static INET_SEQ_GEN: AtomicU64 = AtomicU64::new(1);
 /// on a stack new ones get the small sizes, and an allocation that fails
 /// falls back by halves (a 2 MiB buffer is one physically contiguous block).
 const TCP_RX_BUF: usize = 2 * 1024 * 1024;
-const TCP_TX_BUF: usize = 256 * 1024;
+const TCP_TX_BUF_DEFAULT: usize = 256 * 1024;
+/// Send buffer of a big TCP socket: `tcp.sndbuf_kb=` on the kernel command line.
+static TCP_TX_BUF_CFG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(TCP_TX_BUF_DEFAULT);
+/// Active polled-NIC pass cadence in ns (`net.cadence_us=`).
+static NET_CADENCE_NS: AtomicU64 = AtomicU64::new(1_000_000);
+fn tcp_tx_buf() -> usize { TCP_TX_BUF_CFG.load(Ordering::Relaxed) }
+
+/// Read the TCP / cadence knobs once (kernel command line).
+fn read_net_knobs() {
+    use smoltcp::socket::tcp as t;
+    match drivers::nvidia_probe::cmdline_word("tcp.cc") {
+        Some("reno") => t::CC_MODE.store(1, Ordering::Relaxed),
+        Some("cubic") => t::CC_MODE.store(2, Ordering::Relaxed),
+        Some("none") => t::CC_MODE.store(0, Ordering::Relaxed),
+        None => {} // default: CUBIC (smoltcp CC_MODE)
+        Some(_) => {
+            extern "C" { fn arch_serial_putc(c: u8); }
+            for &b in b"netd: unknown tcp.cc= value (want none|reno|cubic), using cubic\n" { unsafe { arch_serial_putc(b); } }
+        }
+    }
+    if let Some(v) = drivers::nvidia_probe::cmdline_opt("tcp.iw") { t::CC_IW.store(v.clamp(1, 1000) as u32, Ordering::Relaxed); }
+    if let Some(v) = drivers::nvidia_probe::cmdline_opt("tcp.rto_min_ms") { t::RTO_MIN_MS.store(v.clamp(1, 5000) as u32, Ordering::Relaxed); }
+    if let Some(v) = drivers::nvidia_probe::cmdline_opt("tcp.sndbuf_kb") { TCP_TX_BUF_CFG.store((v.clamp(64, 16384) as usize) * 1024, Ordering::Relaxed); }
+    if let Some(v) = drivers::nvidia_probe::cmdline_opt("net.cadence_us") { NET_CADENCE_NS.store(v.clamp(50, 100_000) * 1000, Ordering::Relaxed); }
+}
 const TCP_RX_BUF_SMALL: usize = 256 * 1024;
 const TCP_TX_BUF_SMALL: usize = 64 * 1024;
 const TCP_BUF_MIN: usize = 64 * 1024;
@@ -2440,7 +2478,7 @@ fn alloc_net_buf(want: usize, min: usize) -> alloc::vec::Vec<u8> {
 /// A new TCP socket for `set`, with buffers sized as above.
 fn new_tcp_socket(set: &SocketSet<'static>) -> tcp::Socket<'static> {
     let ntcp = set.iter().filter(|(_, sk)| matches!(sk, smoltcp::socket::Socket::Tcp(_))).count();
-    let (rx, tx) = if ntcp < TCP_BIG_SOCKETS { (TCP_RX_BUF, TCP_TX_BUF) } else { (TCP_RX_BUF_SMALL, TCP_TX_BUF_SMALL) };
+    let (rx, tx) = if ntcp < TCP_BIG_SOCKETS { (TCP_RX_BUF, tcp_tx_buf()) } else { (TCP_RX_BUF_SMALL, TCP_TX_BUF_SMALL) };
     let rxb = alloc_net_buf(rx, TCP_BUF_MIN);
     let txb = alloc_net_buf(tx, TCP_BUF_MIN / 4);
     procnet::TCP_RXBUF_LAST.store(rxb.len() as u64, Ordering::Relaxed);
@@ -2817,15 +2855,17 @@ impl<'a> smoltcp::phy::Device for NicDevice {
         }
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+    fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>> {
         // Backpressure: a driver whose queue is past its high-water mark
         // gets nothing more; smoltcp keeps the segments (TCP in its send
         // buffer, UDP in the socket's) and retries on a later pass. The
         // driver kicks the daemon when its queue drains.
         if !self.netif.tx_ready() {
-            iface::STATS[self.netif.id as usize].tx_held.fetch_add(1, Ordering::Relaxed);
+            let held = iface::STATS[self.netif.id as usize].tx_held.fetch_add(1, Ordering::Relaxed) + 1;
+            tx_held_episode(self.netif.id as usize, timestamp.total_millis(), held);
             return None;
         }
+        TX_HELD_SINCE.store(0, Ordering::Relaxed);
         Some(TxToken { netif: self.netif })
     }
 
@@ -3336,6 +3376,8 @@ pub fn net_daemon() -> ! {
     let mut immediate_streak = 0u32;
     let mut rearm = rxpolicy::RearmGuard::new();
     let mut busy_marked = false;
+    read_net_knobs();
+    let (mut prev_tx, mut prev_rx) = (0u64, 0u64);
     loop {
         // This task runs with IRQs masked between parks: let the tick in on
         // every pass, so a pass that keeps restarting cannot starve the CPU
@@ -3344,6 +3386,15 @@ pub fn net_daemon() -> ! {
         if !busy_marked { busy_marked = true; sched::wedge::mark(sched::wedge::SLOT_NETD, 1, 0); }
         if drivers::netdev::take_kick() { procnet::NETD_KICK_PASSES.fetch_add(1, Ordering::Relaxed); }
         procnet::NETD_PASSES.fetch_add(1, Ordering::Relaxed);
+        {
+            // Per-pass histograms of frames sent / received since the last pass began.
+            let (mut tx, mut rx) = (0u64, 0u64);
+            for st in iface::STATS.iter() { tx += st.tx_pkts.load(Ordering::Relaxed); rx += st.rx_pkts.load(Ordering::Relaxed); }
+            let hb = |d: u64| match d { 0 => 0, 1 => 1, 2..=7 => 2, 8..=63 => 3, _ => 4 };
+            procnet::NETD_TX_HIST[hb(tx.wrapping_sub(prev_tx))].fetch_add(1, Ordering::Relaxed);
+            procnet::NETD_RX_HIST[hb(rx.wrapping_sub(prev_rx))].fetch_add(1, Ordering::Relaxed);
+            prev_tx = tx; prev_rx = rx;
+        }
         let timestamp = stack_now();
 
         let mut readiness_changed = false;
@@ -3532,7 +3583,7 @@ pub fn net_daemon() -> ! {
         let irq_driven = drivers::netdev::iter().all(|n| n.rx_irq_driven());
         let active = !irq_driven
             && now.saturating_sub(LAST_TRAFFIC_NS.load(Ordering::Relaxed)) < ACTIVE_NS;
-        let cadence_ns: u64 = if active { 1_000_000 }
+        let cadence_ns: u64 = if active { NET_CADENCE_NS.load(Ordering::Relaxed) }
             else if irq_driven { IDLE_CAP_NS }
             else { 10_000_000 };
         let mut sleep_ns = match next_poll {
@@ -7167,7 +7218,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                 Some(UNIX_SNDBUF_DEFAULT),
             (l, SO_SNDBUF) | (l, SO_RCVBUF) if l == SOL_SOCKET as usize && is_udp_entry(&e) =>
                 Some(if optname == SO_SNDBUF { UDP_TX_BUF as u32 } else { UDP_RX_BUF as u32 }),
-            (l, SO_SNDBUF) | (l, SO_RCVBUF) if l == SOL_SOCKET as usize => Some(if optname == SO_SNDBUF { TCP_TX_BUF as u32 } else { TCP_RX_BUF as u32 }),
+            (l, SO_SNDBUF) | (l, SO_RCVBUF) if l == SOL_SOCKET as usize => Some(if optname == SO_SNDBUF { tcp_tx_buf() as u32 } else { TCP_RX_BUF as u32 }),
             (l, SO_BROADCAST) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).broadcast as u32),
             (l, SO_REUSEPORT) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).reuseport as u32),
             (SOL_UDP, UDP_SEGMENT) if is_udp_entry(&e) => Some(sock_opts(e.ofd).gso as u32),

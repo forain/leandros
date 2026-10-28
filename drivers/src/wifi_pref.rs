@@ -18,8 +18,18 @@ pub const PREFER_5GHZ_GOOD_SNR: i16 = 25;
 /// `wifi.prefer5` (default on): see `auto_key`.
 pub static PREFER_5GHZ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
-/// Read the manager's kernel command-line knobs (`wifi.prefer5=0|1`).
+/// `wifi.wrongkey_bss=N` (default 2): distinct access points that must agree on
+/// "wrong passphrase" before the profile is blocked for the boot (1 = on the
+/// first verdict, the old behaviour).
+pub static WRONGKEY_BSS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
+pub fn wrongkey_bss() -> u8 { WRONGKEY_BSS.load(core::sync::atomic::Ordering::Relaxed) }
+
+/// Read the manager's kernel command-line knobs (`wifi.prefer5=0|1`, `wifi.wrongkey_bss=N`).
 pub fn set_knobs(cmdline: &str) {
+    if let Some(n) = cmdline.split_ascii_whitespace().filter_map(|t| t.strip_prefix("wifi.wrongkey_bss="))
+        .filter_map(|v| v.parse::<u8>().ok()).last() {
+        WRONGKEY_BSS.store(n.max(1), core::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(v) = cmdline.split_ascii_whitespace().filter_map(|t| t.strip_prefix("wifi.prefer5=")).last() {
         PREFER_5GHZ.store(v != "0", core::sync::atomic::Ordering::Relaxed);
     }
@@ -47,12 +57,13 @@ pub fn five_usable(channel: u8, signal_dbm: i16, best_24_dbm: Option<i16>) -> bo
 /// addition: a usable 5 GHz BSS ([`five_usable`]: channel > 14, at least
 /// `PREFER_5GHZ_MIN_DBM`, and not 7 dB of SNR behind the strongest 2.4 GHz
 /// candidate `best_24_dbm`) beats 2.4 GHz ones of the same priority unless
+/// `clean` is false for a BSS that rejected us this boot (it loses to any clean BSS of the same SSID).
 /// a network was connected this boot (`boot_ms`: when; 0 = not this boot,
 /// the most recent wins). `stored_s` is the profile's stored timestamp. On the laptop
 /// 'Anvara 5G' at -75 dBm gave 5x the throughput of 'Anvara' (2.4 GHz) at
 /// -73 dBm (lane wifi2), as the 2.4 GHz channels are shared by many BSSs.
-pub fn auto_key(priority: i32, boot_ms: u64, stored_s: u64, legacy: bool, channel: u8, signal_dbm: i16,
-                best_24_dbm: Option<i16>) -> (i64, u64, bool, u64, bool, i16) {
+pub fn auto_key(priority: i32, boot_ms: u64, clean: bool, stored_s: u64, legacy: bool, channel: u8, signal_dbm: i16,
+                best_24_dbm: Option<i16>) -> (i64, u64, bool, bool, u64, bool, i16) {
     let five = PREFER_5GHZ.load(core::sync::atomic::Ordering::Relaxed) && five_usable(channel, signal_dbm, best_24_dbm);
-    (priority as i64, boot_ms, five, stored_s, legacy, signal_dbm)
+    (priority as i64, boot_ms, clean, five, stored_s, legacy, signal_dbm)
 }

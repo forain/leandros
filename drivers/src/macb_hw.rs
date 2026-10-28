@@ -339,6 +339,19 @@ impl TxStall {
     }
 }
 
+impl TxStall {
+    /// Keyed on the software tail only. Frames posted after a lost completion
+    /// (ping replies through the ungated RX-paired token) move TBQP every
+    /// poll and kept `tick` from ever firing; a 1 Gbit/s queue never keeps the
+    /// same head-of-queue frame for 3 s (PAUSE is off). TGO is ignored.
+    pub fn tick_tail(&mut self, tail: usize, in_flight: usize) -> bool {
+        if in_flight == 0 { *self = TxStall::default(); return false; }
+        let key = (0, tail);
+        if self.last == Some(key) { self.polls += 1; } else { self.last = Some(key); self.polls = 0; }
+        if self.polls >= TX_STALL_POLLS { *self = TxStall::default(); true } else { false }
+    }
+}
+
 /// RX ring: word 0 USED set by the controller = frame for software; the
 /// driver clears it to give the slot back. The last slot carries WRAP.
 pub struct RxRing {
@@ -449,6 +462,30 @@ impl TxRing {
         self.head = 0;
         self.tail = 0;
         dropped
+    }
+    /// Lost-completion signature: `tail` lacks USED while a later queued slot
+    /// has it. Returns the first and last such slot.
+    pub fn used_after_tail(&self) -> Option<(usize, usize)> {
+        if self.tail == self.head || self.desc(self.tail).ctrl & TX_USED != 0 { return None; }
+        let (mut first, mut last) = (None, 0);
+        for k in 1..self.in_flight() {
+            let i = (self.tail + k) % self.n;
+            if self.desc(i).ctrl & TX_USED != 0 { if first.is_none() { first = Some(i); } last = i; }
+        }
+        first.map(|f| (f, last))
+    }
+    /// The controller is idle on `hw` and finished slots after `tail`, but
+    /// `tail` itself never came back. Retire tail..hw so the queue does not
+    /// wedge. Returns the slots retired.
+    pub fn resync_to(&mut self, hw: usize) -> usize {
+        let mut k = 0;
+        while self.tail != hw && self.tail != self.head {
+            unsafe { wr_word(self.descs, self.tail, 1, TX_USED | Self::wrap_of(self.n, self.tail)); }
+            self.tail = (self.tail + 1) % self.n;
+            k += 1;
+        }
+        fence(Ordering::SeqCst);
+        k
     }
     /// Retire slots the controller finished; returns how many.
     pub fn reclaim(&mut self) -> usize {
@@ -878,4 +915,38 @@ pub fn phy_diag(r: &mut dyn Regs, phy: u8) -> Result<PhyDiag, MdioError> {
     mdio_write(r, phy, MII_BCM_SHD1C, (SHD_CLK_CTL & 0x1f) << 10)?;
     let clk_ctl = mdio_read(r, phy, MII_BCM_SHD1C)? & 0x3ff;
     Ok(PhyDiag { rx_err, false_carrier, rx_notok, aux_status, misc, clk_ctl })
+}
+
+// ── kexec quiesce (Linux macb_reset_hw + macb_halt_tx), host-testable ──────
+
+/// Stops every DMA the GEM runs before a kexec: interrupts masked, TX halted
+/// (bounded wait for TSR.TGO to clear), TE/RE cleared so neither queue
+/// fetches a descriptor or writes a frame again, statistics and status
+/// cleared, then every queue pointer zeroed so a stray re-enable has no
+/// ring to walk. Returns true when the transmitter reported idle.
+pub fn quiesce<R: Regs>(m: &mut R, queues: usize) -> bool {
+    m.w32(IDR, INT_ALL);
+    for q in 1..queues { m.w32(IDRQ1 + 4 * (q - 1), INT_ALL); }
+    let ncr = m.r32(NCR);
+    m.w32(NCR, ncr | NCR_THALT);
+    let mut idle = false;
+    for _ in 0..1000 {
+        if m.r32(TSR) & TSR_TGO == 0 { idle = true; break; }
+        m.delay_us(10);
+    }
+    let ncr = m.r32(NCR);
+    m.w32(NCR, (ncr & !(NCR_TE | NCR_RE | NCR_TSTART)) | NCR_CLRSTAT);
+    m.delay_us(100);
+    m.w32(TSR, 0xffff_ffff);
+    m.w32(RSR, 0xffff_ffff);
+    let _ = m.r32(ISR);
+    m.w32(TBQP, 0);
+    m.w32(RBQP, 0);
+    for q in 1..queues {
+        m.w32(TBQPQ1 + 4 * (q - 1), 0);
+        m.w32(RBQPQ1 + 4 * (q - 1), 0);
+    }
+    m.w32(TBQPH, 0);
+    m.w32(RBQPH, 0);
+    idle
 }

@@ -10,7 +10,7 @@ Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --cmdline "ARGS"         boot a copy of the image with this kernel command line
-                           (scripts/set-image-cmdline.sh; suite i915fake implies
+                           (scripts/set-image-cmdline.sh; suite i915crtc2 = two-CRTC stub pipe; suite i915fake implies
                            "i915.fake=2 i915.kms=1")
   --suite NAME             add a named list of commands (repeatable):
                              regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + uaccesstest + proctest + chroottest + netctltest + bttest + sudotest + nmtest --quick (mock) + blueztest (org.bluez shim) + evherdtest + pollnarrowtest + listentagtest + vfstagtest + nettag2test + kparkstest + sshsmoke
@@ -94,6 +94,8 @@ SUITES = {
                 "/bin/epolltest churn 20",
                 # + a non-leader thread forking in a loop (lane tforkhang).
                 "/bin/epolltest churn 20 tfork",
+                # 5000 spawn/join + 2500 detached threads: VMAs/VmSize/RSS stay flat (lane threadleak).
+                "/bin/pthreadtest churn 5000",
                 # kmscube on the v3d UAPI stub (lane kmscube2, openbugs L11.8):
                 # sync-file fence export + ADDFB2 of a v3d BO. The override is
                 # needed only in QEMU, where Mesa names the driver from the
@@ -102,7 +104,7 @@ SUITES = {
                 "if [ \"$(uname -m)\" = aarch64 ]; then drmsmoke --arm-v3d && MESA_LOADER_DRIVER_OVERRIDE=v3d kmscube -c 30; __k=$?; drmsmoke --disarm-v3d; test $__k = 0; fi",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/udptest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/bttest", "/bin/pstest",
+                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
                 # kexec tool: load + unload only (non-destructive).
                 "/bin/sh -c '/bin/kexec -l /boot/kexec --initrd=/boot/kexec-initrd --append=x && /bin/kexec -u'",
                 # ripgrep (rg): file match, recursive dir walk, stdin, exit codes 0/1.
@@ -251,6 +253,7 @@ SUITES = {
     # path Mesa iris takes on the laptop: catches a DRM-layer change that
     # breaks i915 ioctl argument access (lane irisseg).
     "i915fake": ["/bin/i915test"],
+    "i915crtc2": ["/bin/drmsmoke --crtc2"],
     # The same with every soft-engine fence pending for 2 ms after submit, so
     # CPU fence waits really wait: the fence-wait spin bound (lane rddsys).
     "i915fence": ["/bin/i915test"],
@@ -345,6 +348,8 @@ def main(argv):
         cmds += SUITES[s]
     if "i915fake" in suites and cmdline is None:
         cmdline = "i915.fake=2 i915.kms=1"
+    if "i915crtc2" in suites and cmdline is None:
+        cmdline = "i915.fake=2 i915.kms=1 i915.extout=1 i915.pipeb_stub=1"
     if "i915fence" in suites and cmdline is None:
         cmdline = "i915.fake=2 i915.kms=1 i915.fake_lat_us=2000"
     # GPU-accounting suites (venustest/drmsmoke count window spans, blobs and

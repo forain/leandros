@@ -548,3 +548,14 @@ fn secrets() {
     assert_eq!(c.secret(), b"");
     assert!(c.secret.iter().all(|&b| b == 0));
 }
+
+#[test]
+fn stamp_policy() {
+    use crate::profiles::{stamp, Profile};
+    let mut p = Profile::new_wifi([1; 16], b"x", 0, b"").unwrap();
+    assert!(stamp(&mut p, 50) && p.timestamp_s == 1, "no clock: proven, time unknown");
+    assert!(!stamp(&mut p, 60));
+    assert!(stamp(&mut p, 1_800_000_000) && p.timestamp_s == 1_800_000_000, "clock set replaces 1");
+    assert!(!stamp(&mut p, 1_800_000_000 + 3600), "within 6 h: no write");
+    assert!(stamp(&mut p, 1_800_000_000 + 7 * 3600));
+}

@@ -73,6 +73,8 @@ impl Fwil for Mock {
     fn iovar_get(&mut self, name: &str, buf: &mut [u8]) -> Result<usize, FwError> {
         self.calls.push(Call::IovarGet(name.into()));
         if name == "cur_etheraddr" { buf[..6].copy_from_slice(&[0xb8, 0x27, 0xeb, 1, 2, 3]); return Ok(6); }
+        // The real firmware answers BCME_BUFTOOSHORT (-14) to a too small assoc_info buffer.
+        if name == "assoc_info" && buf.len() < 32 { return Err(FwError::Status(-14)); }
         if let Some(v) = self.gets.get(name) { let n = v.len().min(buf.len()); buf[..n].copy_from_slice(&v[..n]); return Ok(n); }
         Err(FwError::Status(-23))
     }
@@ -909,4 +911,106 @@ fn host_handshake_ignores_the_netctl_ifindex_and_uses_the_firmware_mac() {
     };
     assert_eq!(run(2), run(3));
     NETCTL_IFINDEX.store(0, Ordering::Relaxed);
+}
+
+// ── lane piwifikexec: wrong-passphrase policy (WRONG_KEY on one weak BSS) ────
+mod wrongkey {
+    use crate::wifi_wrongkey::*;
+    const P: [u8; 16] = [7; 16];
+    const A: [u8; 6] = [0x8c, 0x30, 0x66, 0x6a, 0x6f, 0x9d];
+    const B: [u8; 6] = [0x74, 0x83, 0xc2, 0xb7, 0xec, 0x19];
+
+    /// T1: one WRONG_KEY verdict on one (weak) BSS must not block the profile.
+    #[test]
+    fn t1_single_bss_verdict_does_not_block() {
+        let mut s = Vec::new();
+        assert_eq!(note_wrong_key(&mut s, P, A, 1000, false, 2), WkVerdict::Defer(1));
+        // The same BSS failing again is still one BSS.
+        assert_eq!(note_wrong_key(&mut s, P, A, 20_000, false, 2), WkVerdict::Defer(1));
+    }
+
+    /// T2: a real wrong passphrase (two different BSSes) still blocks.
+    #[test]
+    fn t2_two_bsses_block() {
+        let mut s = Vec::new();
+        assert_eq!(note_wrong_key(&mut s, P, A, 1000, false, 2), WkVerdict::Defer(1));
+        assert_eq!(note_wrong_key(&mut s, P, B, 30_000, false, 2), WkVerdict::Block(2));
+        // Verdicts outside the window do not corroborate.
+        let mut s = Vec::new();
+        note_wrong_key(&mut s, P, A, 0, false, 2);
+        assert_eq!(note_wrong_key(&mut s, P, B, WK_WINDOW_MS + 1, false, 2), WkVerdict::Defer(1));
+    }
+
+    /// T3: a profile proven this boot (or by a stored timestamp) is never blocked.
+    #[test]
+    fn t3_proven_profile_never_blocks() {
+        let mut s = Vec::new();
+        assert_eq!(note_wrong_key(&mut s, P, A, 1000, true, 2), WkVerdict::Defer(1));
+        assert_eq!(note_wrong_key(&mut s, P, B, 2000, true, 2), WkVerdict::Defer(2));
+        assert_eq!(note_wrong_key(&mut s, P, B, 3000, true, 1), WkVerdict::Defer(2));
+    }
+
+    /// T4: `wifi.wrongkey_bss=1` keeps the old behaviour (block on the first).
+    #[test]
+    fn t4_threshold_one_is_legacy() {
+        let mut s = Vec::new();
+        assert_eq!(note_wrong_key(&mut s, P, A, 1000, false, 1), WkVerdict::Block(1));
+        // 0 is treated as 1.
+        assert_eq!(note_wrong_key(&mut Vec::new(), P, A, 1000, false, 0), WkVerdict::Block(1));
+    }
+
+    /// T5: verdicts are per profile; success clears; knob parsing.
+    #[test]
+    fn t5_per_profile_and_clear_and_knob() {
+        let q = [9u8; 16];
+        let mut s = Vec::new();
+        note_wrong_key(&mut s, P, A, 1000, false, 2);
+        assert_eq!(note_wrong_key(&mut s, q, B, 2000, false, 2), WkVerdict::Defer(1));
+        clear_profile(&mut s, &P);
+        assert_eq!(note_wrong_key(&mut s, P, B, 3000, false, 2), WkVerdict::Defer(1));
+        crate::wifi_pref::set_knobs("quiet wifi.wrongkey_bss=1");
+        assert_eq!(crate::wifi_pref::wrongkey_bss(), 1);
+        crate::wifi_pref::set_knobs("wifi.wrongkey_bss=2");
+        assert_eq!(crate::wifi_pref::wrongkey_bss(), 2);
+    }
+}
+
+/// A fresh firmware drops the early "wpaie" when wpa_auth changes: by default
+/// the IE is set again after wpa_auth/wsec (and mfp); `wpaie=early` keeps one set.
+#[test]
+fn wpaie_is_set_again_after_wpa_auth_by_default() {
+    let mut d = up();
+    d.fw.on("join", join_ok());
+    assert_eq!(d.join(psk_req(), &mut Steps::default(), 2_000), Ok(()));
+    let names = d.fw.iovars_set();
+    let ie: Vec<usize> = names.iter().enumerate().filter(|(_, n)| **n == "wpaie").map(|(i, _)| i).collect();
+    assert_eq!(ie.len(), 2, "early and late set: {:?}", names);
+    let wa = names.iter().position(|n| *n == "wpa_auth").or_else(|| d.fw.calls.iter().position(|c| matches!(c, Call::CmdSet(c, _) if *c == cmd::SET_WPA_AUTH)));
+    assert!(wa.is_some());
+    assert!(names.iter().position(|n| *n == "join").map_or(true, |j| ie[1] < j), "late wpaie before the join");
+}
+
+/// assoc_info with the old 8 byte buffer fails on every join; a 512 byte one reports the firmware's IE.
+#[test]
+fn assoc_info_is_read_with_a_full_size_buffer() {
+    let mut d = up();
+    d.fw.refuse = vec!["sup_wpa".into()];
+    let fw_ie = crate::wifi_crypto::rsn_ie_psk_ccmp().to_vec();
+    let mut req_ies = vec![0, SSID.len() as u8];
+    req_ies.extend_from_slice(SSID);
+    req_ies.extend_from_slice(&fw_ie);
+    let mut info = (req_ies.len() as u32).to_le_bytes().to_vec();
+    info.extend_from_slice(&[0u8; 28]);
+    d.fw.gets.insert("assoc_info".into(), info);
+    d.fw.gets.insert("assoc_req_ies".into(), req_ies);
+    use crate::wifi_crypto as wc;
+    use wc::key_info as ki;
+    let m1 = wc::build_eapol_key(2, 2 | ki::TYPE_PAIRWISE | ki::ACK, 16, &1u64.to_be_bytes(), &[0x6bu8; 32], &[]);
+    d.fw.on("join", vec![
+        evf(ev::ASSOC, status::SUCCESS, 0, 0, &[]),
+        evf(ev::LINK, status::SUCCESS, 0, event::FLAG_LINK, &[]),
+        Frame::Data(eth(STA, AP, &m1)),
+    ]);
+    let _ = d.join(psk_req(), &mut Steps::default(), 500);
+    assert!(d.rsn.assoc_fw.starts_with("30"), "assoc_fw {}", d.rsn.assoc_fw);
 }

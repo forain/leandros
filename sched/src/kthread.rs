@@ -8,8 +8,9 @@
 //! `cond_resched()` now and then, or its CPU takes no tick and the `[WDOG]`
 //! watchdog reports it after 2 s.
 //!
-//! When the closure returns the thread exits (`sched::exit(0)`) and its slot,
-//! kernel stack and `/proc`-style name are released by the scheduler.
+//! When the closure returns the thread ends with `sched::kthread_exit()`: it is
+//! not a process, so it leaves no exit record and runs no process-exit hooks;
+//! its slot, kernel stack and `/proc`-style name are released by the scheduler.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -61,7 +62,7 @@ extern "C" fn kthread_main(arg: usize) -> ! {
     STOP_FLAGS.lock().retain(|(p, _)| *p != me);
     done.complete_all();
     drop(done);
-    crate::exit(0)
+    crate::kthread_exit()
 }
 
 /// Spawn a kernel thread running `f`. `name` is what task dumps show (as the
@@ -74,7 +75,12 @@ pub fn spawn<F: FnOnce() + Send + 'static>(name: &str, f: F) -> Option<KThread> 
     let raw = Box::into_raw(st);
     // Registered before the thread can run, under the same lock it reads.
     let mut flags = STOP_FLAGS.lock();
-    let pid = match crate::spawn_with_arg(kthread_main, raw as usize) {
+    let mut nm = [0u8; 32];
+    let n = name.len().min(nm.len() - 2);
+    nm[0] = b'[';
+    nm[1..1 + n].copy_from_slice(&name.as_bytes()[..n]);
+    nm[1 + n] = b']';
+    let pid = match crate::spawn_with_arg_named(kthread_main, raw as usize, &nm[..n + 2]) {
         Some(p) => p,
         None => {
             drop(flags);
@@ -84,12 +90,6 @@ pub fn spawn<F: FnOnce() + Send + 'static>(name: &str, f: F) -> Option<KThread> 
     };
     flags.push((pid, stop.clone()));
     drop(flags);
-    let mut nm = [0u8; 32];
-    let n = name.len().min(nm.len() - 2);
-    nm[0] = b'[';
-    nm[1..1 + n].copy_from_slice(&name.as_bytes()[..n]);
-    nm[1 + n] = b']';
-    crate::set_exe_path(pid, &nm[..n + 2]);
     Some(KThread { pid, done, stop })
 }
 

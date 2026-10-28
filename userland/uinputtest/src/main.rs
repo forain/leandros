@@ -33,6 +33,17 @@ const EVIOCGABS_X: c_ulong = 0x80184540;
 const EVIOCGABS_Z: c_ulong = 0x80184542;
 const EVIOCGABS_HAT0X: c_ulong = 0x80184550;
 
+const UI_SET_PROPBIT: c_ulong = 0x4004556e;
+const EVIOCGPROP_8: c_ulong = 0x80084509;
+const EVIOCGMTSLOTS_24: c_ulong = 0x8018450a; // len = 4 + 5*4
+const EVIOCGMTSLOTS_8: c_ulong = 0x8008450a; // len = 4 + 1*4
+const ABS_MT_SLOT: u16 = 0x2f;
+const ABS_MT_TOOL_TYPE: u16 = 0x37;
+const ABS_MT_POSITION_X: u16 = 0x35;
+const ABS_MT_POSITION_Y: u16 = 0x36;
+const ABS_MT_TRACKING_ID: u16 = 0x39;
+const TPNAME: &[u8] = b"lapmt test touchpad";
+
 const BTN_SOUTH: u16 = 0x130;
 const BTN_THUMBR: u16 = 0x13e;
 const ABS_X: u16 = 0;
@@ -89,7 +100,9 @@ struct UiAbs { code: u16, pad: u16, value: i32, min: i32, max: i32, fuzz: i32, f
 
 const NAME: &[u8] = b"bthid test pad";
 
-unsafe fn find_node() -> Option<u32> {
+unsafe fn find_node() -> Option<u32> { find_named(NAME) }
+
+unsafe fn find_named(want: &[u8]) -> Option<u32> {
     let mut path = *b"/dev/input/event00\0";
     for n in 2..16u32 {
         let len;
@@ -101,7 +114,7 @@ unsafe fn find_node() -> Option<u32> {
         let mut nm = [0u8; 64];
         let r = ioctl(fd, EVIOCGNAME_64, nm.as_mut_ptr());
         close(fd);
-        if r >= 0 && &nm[..NAME.len()] == NAME && nm[NAME.len()] == 0 { return Some(n); }
+        if r >= 0 && &nm[..want.len()] == want && nm[want.len()] == 0 { return Some(n); }
     }
     None
 }
@@ -198,7 +211,113 @@ pub unsafe extern "C" fn ui_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut 
     close(ufd);
     chk!(b"close_removes", find_node().is_none());
 
+    fails += touchpad_test();
+
     puts(b"--- uinputtest done ---\n\0".as_ptr());
+    fails
+}
+
+fn mtab(slot: i32, id: i32, x: i32, y: i32) -> [Ev; 4] {
+    [ev(3, ABS_MT_SLOT, slot), ev(3, ABS_MT_TRACKING_ID, id), ev(3, ABS_MT_POSITION_X, x), ev(3, ABS_MT_POSITION_Y, y)]
+}
+
+/// Protocol-B 5-slot touchpad (the 06cb:82f1 shape): caps, props, MT slots, two-finger scroll, tap.
+unsafe fn touchpad_test() -> i32 {
+    let mut fails = 0;
+    macro_rules! chk { ($n:expr, $c:expr) => { if !report($n, $c) { fails += 1; } } }
+    let ufd = open(b"/dev/uinput\0".as_ptr(), O_RDWR);
+    chk!(b"tp_open_uinput", ufd >= 0);
+    if ufd < 0 { return fails; }
+    let mut ok = true;
+    for e in [1, 3] { ok &= ioctl(ufd, UI_SET_EVBIT, e) == 0; }
+    for k in [0x110, 0x145, 0x14a, 0x148, 0x14d, 0x14e, 0x14f] { ok &= ioctl(ufd, UI_SET_KEYBIT, k) == 0; }
+    ok &= ioctl(ufd, UI_SET_PROPBIT, 0) == 0 && ioctl(ufd, UI_SET_PROPBIT, 2) == 0;
+    for (a, min, max, res) in [(0u16, 0, 1273, 12), (1, 0, 672, 12), (ABS_MT_SLOT, 0, 4, 0),
+                               (ABS_MT_TRACKING_ID, 0, 65535, 0), (ABS_MT_POSITION_X, 0, 1273, 12),
+                               (ABS_MT_POSITION_Y, 0, 672, 12), (ABS_MT_TOOL_TYPE, 0, 2, 0)] {
+        ok &= ioctl(ufd, UI_SET_ABSBIT, a as c_int) == 0;
+        let ab = UiAbs { code: a, pad: 0, value: 0, min, max, fuzz: 0, flat: 0, res };
+        ok &= ioctl(ufd, UI_ABS_SETUP, &ab as *const UiAbs) == 0;
+    }
+    let mut su = UiSetup { bustype: 0x18, vendor: 0x06cb, product: 0x82f1, version: 1, name: [0; 80], ff: 0 };
+    su.name[..TPNAME.len()].copy_from_slice(TPNAME);
+    ok &= ioctl(ufd, UI_DEV_SETUP, &su as *const UiSetup) == 0;
+    chk!(b"tp_setup", ok);
+    chk!(b"tp_create", ioctl(ufd, UI_DEV_CREATE) == 0);
+    let node = match find_named(TPNAME) { Some(n) => n, None => { chk!(b"tp_node", false); return fails; } };
+    let mut p = [0u8; 20];
+    path_of(node, &mut p);
+    let efd = open(p.as_ptr(), O_RDONLY | O_NONBLOCK);
+    chk!(b"tp_open_node", efd >= 0);
+
+    let mut id = [0u16; 4];
+    chk!(b"tp_id_i2c", ioctl(efd, EVIOCGID, id.as_mut_ptr()) >= 0 && id[0] == 0x18 && id[1] == 0x06cb && id[2] == 0x82f1);
+    let mut pr = [0u8; 8];
+    chk!(b"tp_prop", ioctl(efd, EVIOCGPROP_8, pr.as_mut_ptr()) >= 0 && pr[0] & 5 == 5 && pr[0] & 2 == 0);
+    let mut kb = [0u8; 96];
+    ioctl(efd, EVIOCGBIT_KEY, kb.as_mut_ptr());
+    let has = |k: usize| kb[k / 8] & (1 << (k % 8)) != 0;
+    chk!(b"tp_keys", has(0x110) && has(0x145) && has(0x14a) && has(0x148) && !has(0x111));
+    let mut ab = [0u8; 8];
+    ioctl(efd, EVIOCGBIT_ABS, ab.as_mut_ptr());
+    let hasa = |a: u16| ab[a as usize / 8] & (1 << (a % 8)) != 0;
+    chk!(b"tp_abs_bits", hasa(0) && hasa(1) && hasa(ABS_MT_SLOT) && hasa(ABS_MT_POSITION_X)
+        && hasa(ABS_MT_POSITION_Y) && hasa(ABS_MT_TRACKING_ID) && hasa(ABS_MT_TOOL_TYPE));
+    let mut ai = [0i32; 6];
+    chk!(b"tp_gabs_slot", ioctl(efd, 0x80184540 + ABS_MT_SLOT as c_ulong, ai.as_mut_ptr()) >= 0 && ai[1] == 0 && ai[2] == 4);
+    chk!(b"tp_gabs_mtx", ioctl(efd, 0x80184540 + ABS_MT_POSITION_X as c_ulong, ai.as_mut_ptr()) >= 0 && ai[2] == 1273 && ai[5] == 12);
+    chk!(b"tp_gabs_mty", ioctl(efd, 0x80184540 + ABS_MT_POSITION_Y as c_ulong, ai.as_mut_ptr()) >= 0 && ai[2] == 672 && ai[5] == 12);
+
+    // Idle slots read tracking id -1 (code=ABS_MT_TRACKING_ID).
+    let mut sl = [0i32; 6];
+    sl[0] = ABS_MT_TRACKING_ID as i32;
+    chk!(b"tp_mtslots_idle", ioctl(efd, EVIOCGMTSLOTS_24, sl.as_mut_ptr()) >= 0
+        && sl[0] == ABS_MT_TRACKING_ID as i32 && sl[1..6] == [-1; 5]);
+
+    // Two-finger scroll: down at (400,300)/(520,300), move down 3 steps, lift.
+    let mut seq = [ev(0, 0, 0); 64];
+    let mut n = 0;
+    let mut put = |seq: &mut [Ev; 64], n: &mut usize, e: &[Ev]| { for x in e { seq[*n] = *x; *n += 1; } };
+    put(&mut seq, &mut n, &mtab(0, 10, 400, 300)); put(&mut seq, &mut n, &mtab(1, 11, 520, 300));
+    put(&mut seq, &mut n, &[ev(1, 0x14a, 1), ev(1, 0x14d, 1), ev(0, 0, 0)]);
+    put(&mut seq, &mut n, &mtab(0, 10, 400, 340)); put(&mut seq, &mut n, &mtab(1, 11, 520, 340));
+    put(&mut seq, &mut n, &[ev(0, 0, 0)]);
+    let w = write(ufd, seq.as_ptr() as *const c_void, n * 24);
+    chk!(b"tp_write_scroll", w == (n * 24) as isize);
+    sl[0] = ABS_MT_TRACKING_ID as i32;
+    chk!(b"tp_mtslots_ids", ioctl(efd, EVIOCGMTSLOTS_24, sl.as_mut_ptr()) >= 0
+        && sl[1] == 10 && sl[2] == 11 && sl[3] == -1 && sl[4] == -1 && sl[5] == -1);
+    sl[0] = ABS_MT_POSITION_Y as i32;
+    chk!(b"tp_mtslots_y", ioctl(efd, EVIOCGMTSLOTS_24, sl.as_mut_ptr()) >= 0 && sl[1] == 340 && sl[2] == 340);
+    sl[0] = ABS_MT_POSITION_X as i32;
+    chk!(b"tp_mtslots_x", ioctl(efd, EVIOCGMTSLOTS_24, sl.as_mut_ptr()) >= 0 && sl[1] == 400 && sl[2] == 520);
+    let mut sm = [ABS_MT_POSITION_X as i32, 0];
+    chk!(b"tp_mtslots_short", ioctl(efd, EVIOCGMTSLOTS_8, sm.as_mut_ptr()) >= 0 && sm[1] == 400);
+    sm[0] = 0x30;
+    chk!(b"tp_mtslots_badcode", ioctl(efd, EVIOCGMTSLOTS_8, sm.as_mut_ptr()) < 0);
+    chk!(b"tp_gabs_slot_cur", ioctl(efd, 0x80184540 + ABS_MT_SLOT as c_ulong, ai.as_mut_ptr()) >= 0 && ai[0] == 1);
+    // Events arrive in order, starting with ABS_MT_SLOT 0 / TRACKING_ID 10.
+    let mut got = [ev(9, 9, 9); 8];
+    let r = read(efd, got.as_mut_ptr() as *mut c_void, 24 * 8);
+    chk!(b"tp_read_back", r == 192 && got[0].t == 3 && got[0].c == ABS_MT_SLOT && got[0].v == 0
+        && got[1].c == ABS_MT_TRACKING_ID && got[1].v == 10 && got[2].v == 400 && got[3].v == 300);
+
+    // Lift both, then a one-finger tap (down, up) and check slots return to idle.
+    let lift = [ev(3, ABS_MT_SLOT, 0), ev(3, ABS_MT_TRACKING_ID, -1), ev(3, ABS_MT_SLOT, 1),
+                ev(3, ABS_MT_TRACKING_ID, -1), ev(1, 0x14a, 0), ev(1, 0x14d, 0), ev(0, 0, 0)];
+    write(ufd, lift.as_ptr() as *const c_void, core::mem::size_of_val(&lift));
+    let tap = [ev(3, ABS_MT_SLOT, 0), ev(3, ABS_MT_TRACKING_ID, 12), ev(3, ABS_MT_POSITION_X, 600),
+               ev(3, ABS_MT_POSITION_Y, 200), ev(1, 0x14a, 1), ev(1, 0x145, 1), ev(0, 0, 0)];
+    write(ufd, tap.as_ptr() as *const c_void, core::mem::size_of_val(&tap));
+    sl[0] = ABS_MT_TRACKING_ID as i32;
+    chk!(b"tp_tap_down", ioctl(efd, EVIOCGMTSLOTS_24, sl.as_mut_ptr()) >= 0 && sl[1] == 12 && sl[2] == -1);
+    let up = [ev(3, ABS_MT_TRACKING_ID, -1), ev(1, 0x14a, 0), ev(1, 0x145, 0), ev(0, 0, 0)];
+    write(ufd, up.as_ptr() as *const c_void, core::mem::size_of_val(&up));
+    chk!(b"tp_tap_up", ioctl(efd, EVIOCGMTSLOTS_24, sl.as_mut_ptr()) >= 0 && sl[1..6] == [-1; 5]);
+
+    close(efd);
+    close(ufd);
+    chk!(b"tp_node_gone", find_named(TPNAME).is_none());
     fails
 }
 

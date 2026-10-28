@@ -1837,12 +1837,201 @@ unsafe fn scatter_cases(fd: c_int) -> (i32, i32) {
     (failures, 0)
 }
 
+// ── Connector enumeration (lane lapdisp) ─────────────────────────────────────
+// Every connector GETRESOURCES lists must answer GETCONNECTOR, and every
+// encoder GETENCODER. With `verbose` one line per connector:
+// "connector <id> <TYPE>-<n> <status> modes=<n> [<w>x<h>@<hz>] encoder=<id> possible_crtcs=0x<m>".
+const DRM_IOCTL_MODE_GETENCODER_L: c_ulong = 0xC01464A6;
+#[repr(C)]
+#[derive(Default)]
+struct DrmModeGetEncoderL { encoder_id: u32, encoder_type: u32, crtc_id: u32, possible_crtcs: u32, possible_clones: u32 }
+
+struct LineBuf { b: [u8; 256], n: usize }
+impl LineBuf {
+    fn s(&mut self, t: &[u8]) { for &c in t { if self.n < 254 { self.b[self.n] = c; self.n += 1; } } }
+    fn d(&mut self, v: u64) {
+        let mut t = [0u8; 20]; let mut k = 0; let mut x = v;
+        loop { t[k] = b'0' + (x % 10) as u8; k += 1; x /= 10; if x == 0 { break; } }
+        while k > 0 { k -= 1; self.s(&[t[k]]); }
+    }
+    fn x(&mut self, v: u32) { for i in (0..8).rev() { let n = ((v >> (4 * i)) & 0xf) as u8; self.s(&[if n < 10 { b'0' + n } else { b'a' + n - 10 }]); } }
+    unsafe fn put(&mut self) { self.b[self.n] = 0; puts(self.b.as_ptr()); self.n = 0; }
+}
+
+unsafe fn enum_connectors(fd: c_int, verbose: bool) -> bool {
+    let mut res = DrmModeCardRes::default();
+    if ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut res as *mut _) != 0 { return false; }
+    let mut ids = [0u32; 16];
+    let mut encs = [0u32; 16];
+    let (nc, ne) = ((res.count_connectors as usize).min(16), (res.count_encoders as usize).min(16));
+    let mut r2 = DrmModeCardRes::default();
+    r2.connector_id_ptr = ids.as_mut_ptr() as u64; r2.count_connectors = nc as u32;
+    r2.encoder_id_ptr = encs.as_mut_ptr() as u64; r2.count_encoders = ne as u32;
+    if ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut r2 as *mut _) != 0 { return false; }
+    let mut ok = true;
+    for &id in &ids[..nc] {
+        let mut modes: [DrmModeModeinfo; 4] = core::array::from_fn(|_| DrmModeModeinfo::default());
+        let mut encid = [0u32; 4];
+        let mut c = DrmModeGetConnector::default();
+        c.connector_id = id;
+        c.modes_ptr = modes.as_mut_ptr() as u64; c.count_modes = 4;
+        c.encoders_ptr = encid.as_mut_ptr() as u64; c.count_encoders = 4;
+        if ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &mut c as *mut _) != 0 || c.connection == 0 || c.connection > 3 { ok = false; continue; }
+        let mut e = DrmModeGetEncoderL { encoder_id: encid[0], ..Default::default() };
+        let eok = c.count_encoders == 0 || ioctl(fd, DRM_IOCTL_MODE_GETENCODER_L, &mut e as *mut _) == 0;
+        if !eok { ok = false; }
+        if verbose {
+            let mut l = LineBuf { b: [0; 256], n: 0 };
+            l.s(b"connector "); l.d(id as u64); l.s(b" ");
+            l.s(match c.connector_type { 10 => b"DP" as &[u8], 11 => b"HDMI-A", 14 => b"eDP", 15 => b"Virtual", _ => b"type?" });
+            l.s(b"-"); l.d(c.connector_type_id as u64);
+            l.s(match c.connection { 1 => b" connected" as &[u8], 2 => b" disconnected", _ => b" unknown" });
+            l.s(b" modes="); l.d(c.count_modes as u64);
+            if c.count_modes > 0 { l.s(b" "); l.d(modes[0].hdisplay as u64); l.s(b"x"); l.d(modes[0].vdisplay as u64); l.s(b"@"); l.d(modes[0].vrefresh as u64); }
+            l.s(b" mm="); l.d(c.mm_width as u64); l.s(b"x"); l.d(c.mm_height as u64);
+            l.s(b" encoder="); l.d(encid[0] as u64); l.s(b" possible_crtcs=0x"); l.x(e.possible_crtcs);
+            l.s(if eok { b"" as &[u8] } else { b" GETENCODER-FAILED" });
+            l.put();
+        }
+    }
+    ok
+}
+
+
+// ── lane lapdisp C1: two-CRTC DRM core against the stub pipe B ─────────────
+// Needs `i915.fake=2 i915.kms=1 i915.pipeb_stub=1` (QEMU). Object ids are the
+// driver's: CRTC 2, planes 32/33, extra connector 0x100, extra encoder 0x180.
+const DRM_IOCTL_MODE_GETPLANE_C2: c_ulong = 0xC02064B6;
+const DRM_IOCTL_MODE_CREATEPROPBLOB_C2: c_ulong = 0xC01064BD;
+const C2_PROP_ACTIVE: u32 = 60;
+const C2_PROP_MODE_ID: u32 = 61;
+const C2_PROP_CONN_CRTC_ID: u32 = 70;
+const C2_ALLOW_MODESET: u32 = 0x0400;
+
+#[repr(C)]
+#[derive(Default)]
+struct C2GetPlane { plane_id: u32, crtc_id: u32, fb_id: u32, possible_crtcs: u32, gamma_size: u32, count_fmt: u32, fmt_ptr: u64 }
+#[repr(C)]
+#[derive(Default)]
+struct C2Blob { data: u64, length: u32, blob_id: u32 }
+
+unsafe fn c2_atomic(fd: c_int, flags: u32, objs: &[u32], counts: &[u32], props: &[u32], vals: &[u64]) -> c_int {
+    let mut req = DrmModeAtomic::default();
+    req.flags = flags;
+    req.count_objs = objs.len() as u32;
+    req.objs_ptr = objs.as_ptr() as u64;
+    req.count_props_ptr = counts.as_ptr() as u64;
+    req.props_ptr = props.as_ptr() as u64;
+    req.prop_values_ptr = vals.as_ptr() as u64;
+    ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &mut req as *mut _)
+}
+
+/// One FLIP_COMPLETE event's crtc_id, or 0 on timeout.
+unsafe fn c2_event_crtc(fd: c_int) -> u32 {
+    let mut pfd = pollfd { fd, events: POLLIN, revents: 0 };
+    if poll(&mut pfd as *mut _, 1, 2000) <= 0 { return 0; }
+    let mut b = [0u8; 32];
+    if read(fd, b.as_mut_ptr() as *mut c_void, 32) != 32 { return 0; }
+    if u32::from_le_bytes([b[0], b[1], b[2], b[3]]) != DRM_EVENT_FLIP_COMPLETE { return 0; }
+    u32::from_le_bytes([b[28], b[29], b[30], b[31]])
+}
+
+unsafe fn crtc2_mode() -> i32 {
+    let mut failures = 0i32;
+    let fd = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    if fd < 0 { puts(b"crtc2: open failed\n\0".as_ptr()); return 1; }
+
+    // CRTC_ENUM
+    let mut res = DrmModeCardRes::default();
+    let mut ids = [0u32; 4];
+    let ok0 = ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut res as *mut _) == 0 && res.count_crtcs == 2;
+    let mut r2 = DrmModeCardRes::default();
+    r2.crtc_id_ptr = ids.as_mut_ptr() as u64; r2.count_crtcs = 2;
+    let ok1 = ok0 && ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut r2 as *mut _) == 0 && ids[0] == 1 && ids[1] == 2;
+    let mut pl = |id: u32| -> u32 {
+        let mut g = C2GetPlane { plane_id: id, ..Default::default() };
+        if ioctl(fd, DRM_IOCTL_MODE_GETPLANE_C2, &mut g as *mut _) != 0 { 0xFF } else { g.possible_crtcs }
+    };
+    let (pa, pb) = (pl(30), pl(32));
+    let mut e = DrmModeGetEncoderL { encoder_id: 0x180, ..Default::default() };
+    let eok = ioctl(fd, DRM_IOCTL_MODE_GETENCODER_L, &mut e as *mut _) == 0 && e.possible_crtcs == 2;
+    let mut e1 = DrmModeGetEncoderL { encoder_id: 1, ..Default::default() };
+    let e1ok = ioctl(fd, DRM_IOCTL_MODE_GETENCODER_L, &mut e1 as *mut _) == 0 && e1.possible_crtcs == 1;
+    if !report(b"CRTC_ENUM", ok1 && pa == 1 && pb == 2 && eok && e1ok) { failures += 1; }
+
+    // Mode blob 1280x720@60.
+    let mut mi = DrmModeModeinfo::default();
+    mi.clock = 74250; mi.hdisplay = 1280; mi.hsync_start = 1390; mi.hsync_end = 1430; mi.htotal = 1650;
+    mi.vdisplay = 720; mi.vsync_start = 725; mi.vsync_end = 730; mi.vtotal = 750; mi.vrefresh = 60;
+    let mut blob = C2Blob { data: &mi as *const _ as u64, length: core::mem::size_of::<DrmModeModeinfo>() as u32, blob_id: 0 };
+    let blob_ok = ioctl(fd, DRM_IOCTL_MODE_CREATEPROPBLOB_C2, &mut blob as *mut _) == 0;
+    let (h0, fb0) = dumb_fb(fd, 1280, 720);
+    let (h1, fb1) = dumb_fb(fd, 1280, 720);
+    let (_ha, fba) = dumb_fb(fd, 1280, 720);
+    let _ = (h0, h1);
+
+    // ATOMIC_CRTC2: connector 0x100 + CRTC 2 + plane 32.
+    let objs = [0x100u32, 2, 32];
+    let counts = [1u32, 2, 10];
+    let mut props = [0u32; 13];
+    props[0] = C2_PROP_CONN_CRTC_ID; props[1] = C2_PROP_ACTIVE; props[2] = C2_PROP_MODE_ID;
+    let pp = [PROP_PLANE_CRTC_ID, PROP_FB_ID, PROP_SRC_X, PROP_SRC_Y, PROP_SRC_W, PROP_SRC_H, PROP_CRTC_X, PROP_CRTC_Y, PROP_CRTC_W, PROP_CRTC_H];
+    for k in 0..10 { props[3 + k] = pp[k]; }
+    let vals: [u64; 13] = [2, 1, blob.blob_id as u64, 2, fb0 as u64, 0, 0, 1280 << 16, 720 << 16, 0, 0, 1280, 720];
+    let t_ok = blob_ok && fb0 != 0 && c2_atomic(fd, C2_ALLOW_MODESET | DRM_MODE_ATOMIC_TEST_ONLY, &objs, &counts, &props, &vals) == 0;
+    let c_ok = t_ok && c2_atomic(fd, C2_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT, &objs, &counts, &props, &vals) == 0
+        && c2_event_crtc(fd) == 2;
+    // 10 flips on B with concurrent flips on A; every event carries its own CRTC.
+    let (mut nb, mut na) = (0, 0);
+    if c_ok {
+        for i in 0..10 {
+            let fb = if i & 1 == 0 { fb1 } else { fb0 };
+            let o = [32u32]; let c = [10u32];
+            let v: [u64; 10] = [2, fb as u64, 0, 0, 1280 << 16, 720 << 16, 0, 0, 1280, 720];
+            let rb = c2_atomic(fd, DRM_MODE_PAGE_FLIP_EVENT, &o, &c, &pp, &v);
+            let ra = atomic_plane_commit(fd, fba, 1280, 720, DRM_MODE_PAGE_FLIP_EVENT);
+            if rb != 0 { break; }
+            let mut want = 1 + (ra == 0) as u32;
+            while want > 0 {
+                match c2_event_crtc(fd) { 2 => nb += 1, 1 => na += 1, _ => break }
+                want -= 1;
+            }
+        }
+    }
+    if !report(b"ATOMIC_CRTC2", c_ok && nb == 10 && na >= 1) { failures += 1; }
+
+    // ATOMIC_BAD: eDP connector 1 -> CRTC 2 is refused; so is a second extra on CRTC 2.
+    let o = [1u32]; let c = [1u32]; let p = [C2_PROP_CONN_CRTC_ID]; let v = [2u64];
+    let bad1 = c2_atomic(fd, C2_ALLOW_MODESET | DRM_MODE_ATOMIC_TEST_ONLY, &o, &c, &p, &v) != 0 && errno() == EINVAL;
+    let o2 = [0x101u32]; 
+    let bad2 = c2_atomic(fd, C2_ALLOW_MODESET | DRM_MODE_ATOMIC_TEST_ONLY, &o2, &c, &p, &v) != 0 && errno() == EINVAL;
+    if !report(b"ATOMIC_BAD", bad1 && bad2) { failures += 1; }
+
+    // Tear down B.
+    let o = [2u32, 0x100]; let c = [2u32, 1]; let p = [C2_PROP_ACTIVE, C2_PROP_MODE_ID, C2_PROP_CONN_CRTC_ID]; let v = [0u64, 0, 0];
+    let off = c2_atomic(fd, C2_ALLOW_MODESET, &o, &c, &p, &v) == 0;
+    if !report(b"ATOMIC_CRTC2_OFF", off) { failures += 1; }
+    puts(b"--- drmsmoke crtc2 done ---\n\0".as_ptr());
+    failures
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0i32;
     let mut skips = 0i32;
 
     let hold_mode = argc > 1 && arg_is(*argv.add(1) as *const u8, b"--hold");
+
+    if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--crtc2") {
+        return crtc2_mode();
+    }
+    if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--list") {
+        let fd = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let ok = fd >= 0 && enum_connectors(fd, true);
+        report(b"CONNECTOR_ENUM", ok);
+        puts(b"--- drmsmoke done ---\n\0".as_ptr());
+        return if ok { 0 } else { 1 };
+    }
 
     if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--leak") {
         let mut iters = 20u32;
@@ -2042,6 +2231,8 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         && res.max_width >= res.min_width && res.max_height >= res.min_height;
     let res_errno = errno();
     if !report_errno(b"GETRESOURCES", res_ok, res_errno) { failures += 1; }
+    // Every listed connector/encoder answers (extra outputs, lane lapdisp).
+    if !report(b"CONNECTOR_ENUM", enum_connectors(fd, false)) { failures += 1; }
 
     // GETCONNECTOR — connected + >=1 mode. Two-pass: count then fill.
     let connector_id = 1u32; // GETRESOURCES reports connector id 1

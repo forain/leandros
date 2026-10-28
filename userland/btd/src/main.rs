@@ -1,7 +1,7 @@
 //! btd — the Bluetooth host daemon.
 //!
 //! ```text
-//! btd [--dev PATH | --fd N] [--name NAME] [--sock PATH] [--keys PATH]
+//! btd [--dev PATH | --fd N] [--name NAME] [--sock PATH] [--keys PATH] [--idle-ms N] [--grace-ms N]
 //!     defaults: /dev/hci0, "LeandrOS", /run/bluetooth/btd.sock, /var/lib/bluetooth/linkkeys
 //!     (--fd/--sock/--keys exist for bttest, which plays the controller over a socketpair)
 //! ```
@@ -66,13 +66,46 @@ fn write_pkt(dev: i32, pkt: &[u8]) -> bool {
     true
 }
 
+/// True when the environment holds `prefix` (e.g. `BTD_TRACE=`) followed by a non-empty, non-"0" value.
+unsafe fn env_is_set(envp: *const *const u8, prefix: &[u8]) -> bool {
+    if envp.is_null() { return false; }
+    let mut i = 0;
+    loop {
+        let p = *envp.add(i);
+        if p.is_null() { return false; }
+        let mut n = 0;
+        while *p.add(n) != 0 { n += 1; }
+        let s = core::slice::from_raw_parts(p, n);
+        if s.starts_with(prefix) { let v = &s[prefix.len()..]; return !v.is_empty() && v != b"0"; }
+        i += 1;
+    }
+}
+
+/// True when the NUL-terminated path can be opened.
+fn marker(path: &[u8]) -> bool {
+    match sys::open(path, sys::O_RDONLY, 0) { Ok(fd) => { let _ = sys::close(fd); true } Err(_) => false }
+}
+
+/// Parses a NUL-terminated decimal argument.
+fn parse_ms(a: &[u8]) -> Option<u64> {
+    let d = &a[..a.len().saturating_sub(1)];
+    if d.is_empty() || !d.iter().all(|c| c.is_ascii_digit()) { return None; }
+    core::str::from_utf8(d).ok()?.parse().ok()
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
+pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *const u8) -> i32 {
     let mut dev_path: &[u8] = b"/dev/hci0\0";
     let mut name = "LeandrOS";
     let mut dev_fd: Option<i32> = None;
     let mut sock: &[u8] = btd::SOCK_PATH;
     let mut keys: &[u8] = btd::KEYS_PATH;
+    let mut idle_ms: Option<u64> = None;
+    let mut grace_ms: Option<u64> = None;
+    // Knobs also reachable without touching how init spawns us: BTD_TRACE=1 /
+    // BTD_ACCEPT_CENTRAL=1 in the environment, or marker files in /etc.
+    let mut trace = env_is_set(envp, b"BTD_TRACE=") || marker(b"/etc/btd.trace\0");
+    let mut accept_central = env_is_set(envp, b"BTD_ACCEPT_CENTRAL=") || marker(b"/etc/btd.accept-central\0");
     let mut i = 1;
     while i < argc as isize {
         match arg(argv, i) {
@@ -89,7 +122,11 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             }
             b"--sock\0" if i + 1 < argc as isize => { i += 1; sock = arg(argv, i); }
             b"--keys\0" if i + 1 < argc as isize => { i += 1; keys = arg(argv, i); }
-            _ => { eprintln!("usage: btd [--dev PATH | --fd N] [--name NAME] [--sock PATH] [--keys PATH]"); return 2; }
+            b"--idle-ms\0" if i + 1 < argc as isize => { i += 1; idle_ms = parse_ms(arg(argv, i)); }
+            b"--grace-ms\0" if i + 1 < argc as isize => { i += 1; grace_ms = parse_ms(arg(argv, i)); }
+            b"--trace\0" => trace = true,
+            b"--accept-central\0" => accept_central = true,
+            _ => { eprintln!("usage: btd [--dev PATH | --fd N] [--name NAME] [--sock PATH] [--keys PATH] [--idle-ms N] [--grace-ms N] [--trace] [--accept-central]"); return 2; }
         }
         i += 1;
     }
@@ -125,6 +162,11 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     }
 
     let mut host = Host::new(name, load_keys(keys), sys::now_ms());
+    if let Some(v) = idle_ms { host.idle_ms = v; }
+    if let Some(v) = grace_ms { host.incoming_grace_ms = v; }
+    host.trace = trace;
+    host.accept_central = accept_central;
+    if trace || accept_central { eprintln!("[btd] trace={} accept_central={}", trace, accept_central); }
     let mut clients: Vec<Client> = Vec::new();
     let mut next_id: Owner = 1;
     let mut rx: Vec<u8> = Vec::new();

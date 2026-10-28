@@ -70,6 +70,86 @@ pub const DEVKIND_MOUSE: u8 = 3;
 pub const DEVKIND_UINPUT: u8 = 4;
 pub const DEVKIND_UINPUT_PAD: u8 = 5;
 pub const DEVKIND_UINPUT_MOUSE: u8 = 6;
+/// ACPI power/sleep/brightness keys + the lid switch (EV_KEY subset + EV_SW SW_LID).
+pub const DEVKIND_SWITCH: u8 = 7;
+/// A hot-plugged multitouch touchpad (I2C-HID PTP etc.): ABS_X/Y + ABS_MT_* protocol B,
+/// BTN_LEFT/TOUCH/TOOL_FINGER..QUINTTAP, INPUT_PROP_POINTER|BUTTONPAD.
+pub const DEVKIND_TOUCHPAD: u8 = 8;
+/// A uinput-created multitouch touchpad (caps from the creator, ABS_MT_SLOT present).
+pub const DEVKIND_UINPUT_TOUCHPAD: u8 = 9;
+pub const BUS_I2C: u16 = 0x18;
+/// Touchpad geometry for DEVKIND_TOUCHPAD (the Synaptics 06cb:82f1 pad): 5 fingers, 0..1273 x 0..672.
+pub const TP_SLOTS: usize = 5;
+const TP_MAX_X: i32 = 1273;
+const TP_MAX_Y: i32 = 672;
+const TP_RES: i32 = 12; // units/mm
+
+const ABS_MT_SLOT: usize = 0x2f;
+const ABS_MT_TOOL_TYPE: usize = 0x37;
+const ABS_MT_POSITION_X: usize = 0x35;
+const ABS_MT_POSITION_Y: usize = 0x36;
+const ABS_MT_TRACKING_ID: usize = 0x39;
+const MT_MAX_SLOTS: usize = 16;
+
+/// Per-device multitouch slot table (protocol B), kept current by `push_event`
+/// so EVIOCGMTSLOTS can answer. Per slot: [tracking_id, x, y, tool_type].
+#[derive(Clone, Copy)]
+struct MtDev { nslots: u8, cur: u8, slots: [[i32; 4]; MT_MAX_SLOTS] }
+const MT0: MtDev = MtDev { nslots: 0, cur: 0, slots: [[-1, 0, 0, 0]; MT_MAX_SLOTS] };
+static MT: Mutex<[MtDev; MAX_DEVICES]> = Mutex::new([MT0; MAX_DEVICES]);
+
+/// (Re)initialise the slot table of `dev` with `n` slots, all idle.
+pub fn mt_init(dev: u32, n: usize) {
+    if dev as usize >= MAX_DEVICES { return; }
+    let f = unsafe { arch_interrupt_save() };
+    MT.lock()[dev as usize] = MtDev { nslots: n.min(MT_MAX_SLOTS) as u8, ..MT0 };
+    unsafe { arch_interrupt_restore(f); }
+}
+
+fn mt_track(dev: usize, code: u16, value: i32) {
+    let f = unsafe { arch_interrupt_save() };
+    {
+        let mut m = MT.lock();
+        let d = &mut m[dev];
+        if d.nslots != 0 {
+            let c = code as usize;
+            if c == ABS_MT_SLOT {
+                if value >= 0 && (value as usize) < d.nslots as usize { d.cur = value as u8; }
+            } else if matches!(c, ABS_MT_TRACKING_ID | ABS_MT_POSITION_X | ABS_MT_POSITION_Y | ABS_MT_TOOL_TYPE) {
+                let i = match c { ABS_MT_TRACKING_ID => 0, ABS_MT_POSITION_X => 1, ABS_MT_POSITION_Y => 2, _ => 3 };
+                let cur = d.cur as usize;
+                d.slots[cur][i] = value;
+            }
+        }
+    }
+    unsafe { arch_interrupt_restore(f); }
+}
+
+/// EVIOCGMTSLOTS(len): buffer is `{u32 code; s32 values[n]}`.
+fn eviocgmtslots(dev_id: usize, arg_ptr: usize, size: usize, pid: u32) -> Message {
+    if size < 4 { return err_reply(-22); }
+    let mut cb = [0u8; 4];
+    if copy_in(pid, arg_ptr, &mut cb).is_none() { return err_reply(-14); }
+    let code = u32::from_ne_bytes(cb) as usize;
+    let idx = match code { ABS_MT_TRACKING_ID => 0, ABS_MT_POSITION_X => 1, ABS_MT_POSITION_Y => 2,
+                           ABS_MT_TOOL_TYPE => 3, _ => return err_reply(-22) };
+    let mut out = [0u8; 4 + 4 * MT_MAX_SLOTS];
+    out[..4].copy_from_slice(&cb);
+    let f = unsafe { arch_interrupt_save() };
+    let n = { let m = MT.lock(); let d = &m[dev_id];
+              let n = ((size - 4) / 4).min(d.nslots as usize);
+              for i in 0..n { out[4 + 4 * i..8 + 4 * i].copy_from_slice(&d.slots[i][idx].to_ne_bytes()); }
+              n };
+    unsafe { arch_interrupt_restore(f); }
+    if n == 0 { return err_reply(-22); }
+    copy_out(pid, arg_ptr, &out[..4 + 4 * n])
+}
+
+fn is_touchpad_kind(kind: u8) -> bool { kind == DEVKIND_TOUCHPAD || kind == DEVKIND_UINPUT_TOUCHPAD }
+/// EV_SW state bits (bit n = switch n active; SW_LID=0 set means lid closed).
+static SW_STATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Driver hook: current switch state reported by EVIOCGSW.
+pub fn set_switch_state(bits: u32) { SW_STATE.store(bits, core::sync::atomic::Ordering::Relaxed); }
 pub mod uinput;
 
 const NAME_MAX: usize = 64;
@@ -1168,12 +1248,23 @@ fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) ->
         }
         let mut set = |bit: usize| if bit / 8 < n { buf[bit / 8] |= 1 << (bit % 8); };
         match (kind, ev) {
+            (DEVKIND_SWITCH, 0) => { set(0); set(1); set(5); }
+            (DEVKIND_SWITCH, 1) => { for k in [116usize, 142, 224, 225] { set(k); } }
+            (DEVKIND_SWITCH, 5) => { set(0); } // SW_LID
             (DEVKIND_KEYBOARD, 0) => { set(0); set(1); set(EV_LED as usize); }
             (DEVKIND_KEYBOARD, 1) => { for k in 1..256 { set(k); } }
             (DEVKIND_KEYBOARD, 0x11) => { set(0); set(1); set(2); }
             (DEVKIND_MOUSE, 0) => { set(0); set(1); set(2); }
             (DEVKIND_MOUSE, 1) => { for k in 0x110..0x115 { set(k); } }
             (DEVKIND_MOUSE, 2) => { set(0); set(1); set(8); } // REL_X, REL_Y, REL_WHEEL
+            (DEVKIND_TOUCHPAD, 0) => { set(0); set(1); set(3); }
+            (DEVKIND_TOUCHPAD, 1) => { // BTN_LEFT, TOOL_FINGER, TOUCH, QUINTTAP, DOUBLE/TRIPLE/QUADTAP
+                for k in [0x110usize, 0x145, 0x14a, 0x148, 0x14d, 0x14e, 0x14f] { set(k); }
+            }
+            (DEVKIND_TOUCHPAD, 3) => {
+                for k in [0usize, 1, ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y,
+                          ABS_MT_TOOL_TYPE, ABS_MT_TRACKING_ID] { set(k); }
+            }
             _ => {}
         }
         return copy_out(pid, arg_ptr, &buf[..n]);
@@ -1233,6 +1324,22 @@ fn eviocgabs(dev_id: usize, abs: usize, arg_ptr: usize, pid: u32) -> Message {
         return copy_out(pid, arg_ptr, unsafe {
             core::slice::from_raw_parts(info.as_ptr() as *const u8, 24)
         });
+    }
+    if dev_id >= FIXED_DEVICES && dev_kind(dev_id) == DEVKIND_TOUCHPAD {
+        let cur = { let f = unsafe { arch_interrupt_save() };
+                    let c = MT.lock()[dev_id].cur as i32; unsafe { arch_interrupt_restore(f); } c };
+        let info: Option<[i32; 6]> = match abs {
+            ABS_X | ABS_MT_POSITION_X => Some([0, 0, TP_MAX_X, 0, 0, TP_RES]),
+            ABS_Y | ABS_MT_POSITION_Y => Some([0, 0, TP_MAX_Y, 0, 0, TP_RES]),
+            ABS_MT_SLOT => Some([cur, 0, TP_SLOTS as i32 - 1, 0, 0, 0]),
+            ABS_MT_TRACKING_ID => Some([0, 0, 65535, 0, 0, 0]),
+            ABS_MT_TOOL_TYPE => Some([0, 0, 2, 0, 0, 0]),
+            _ => None,
+        };
+        return match info {
+            Some(i) => copy_out(pid, arg_ptr, unsafe { core::slice::from_raw_parts(i.as_ptr() as *const u8, 24) }),
+            None => zero_out(pid, arg_ptr, 24),
+        };
     }
     if dev_id == DEV_TABLET && (abs == ABS_X || abs == ABS_Y) {
         let info: [i32; 6] = [0, 0, 32767, 0, 0, 0];
@@ -1488,7 +1595,17 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                           // and delivers BTN_LEFT as a pointer button — required for
                           // click-to-focus (a compositor sets keyboard focus on a
                           // pointer button press). Keyboard advertises no props.
-                    if dev_id == DEV_TABLET {
+                    if dev_id >= FIXED_DEVICES && dev_kind(dev_id) == DEVKIND_TOUCHPAD {
+                        let mut buf = [0u8; 8];
+                        buf[0] = (1 << 0) | (1 << 2); // INPUT_PROP_POINTER | INPUT_PROP_BUTTONPAD
+                        let n = core::cmp::min(size, buf.len());
+                        copy_out(pid, arg_ptr, &buf[..n])
+                    } else if dev_id >= FIXED_DEVICES && uinput::is_kind(dev_kind(dev_id)) {
+                        let mut buf = [0u8; 8];
+                        buf[..4].copy_from_slice(&uinput::props(dev_id).to_le_bytes());
+                        let n = core::cmp::min(size, buf.len());
+                        copy_out(pid, arg_ptr, &buf[..n])
+                    } else if dev_id == DEV_TABLET {
                         let mut buf = [0u8; 8];
                         buf[0] = 1 << 0; // bit 0 = INPUT_PROP_POINTER
                         let n = core::cmp::min(size, buf.len());
@@ -1496,6 +1613,10 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     } else {
                         zero_out(pid, arg_ptr, size)
                     }
+                }
+                0x0a => { // EVIOCGMTSLOTS(len)
+                    if dev_id < FIXED_DEVICES || !is_touchpad_kind(dev_kind(dev_id)) { return err_reply(-25); }
+                    eviocgmtslots(dev_id, arg_ptr, size, pid)
                 }
                 0x18 => { // EVIOCGKEY: the real pressed-key bitmap (SYN_DROPPED resync)
                     let mut buf = [0u8; KEY_BITMAP_BYTES];
@@ -1513,7 +1634,15 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     let n = core::cmp::min(size, buf.len());
                     copy_out(pid, arg_ptr, &buf[..n])
                 }
-                0x1b => zero_out(pid, arg_ptr, size), // EVIOCGSW: no switches
+                0x1b => { // EVIOCGSW
+                    if dev_id >= FIXED_DEVICES && dev_kind(dev_id) == DEVKIND_SWITCH {
+                        let mut buf = [0u8; 8];
+                        let v = SW_STATE.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes();
+                        buf[..4].copy_from_slice(&v);
+                        let n = core::cmp::min(size, buf.len());
+                        copy_out(pid, arg_ptr, &buf[..n])
+                    } else { zero_out(pid, arg_ptr, size) }
+                }
                 0xa0 => { // EVIOCSCLOCKID(int) — stored as id+1, applied in `restamp` at read time
                     let mut clk = [0u8; 4];
                     if copy_in(pid, arg_ptr, &mut clk).is_none() { return err_reply(-14); }
@@ -1566,7 +1695,7 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                 }
                 _ if (0x20..0x40).contains(&nr) => // EVIOCGBIT(ev, len)
                     eviocgbit(dev_id, nr - 0x20, arg_ptr, size, pid),
-                _ if (0x40..0x60).contains(&nr) => // EVIOCGABS(abs)
+                _ if (0x40..0x80).contains(&nr) => // EVIOCGABS(abs), ABS_MAX = 0x3f
                     eviocgabs(dev_id, nr - 0x40, arg_ptr, pid),
                 _ => { // ENOTTY — an 'E' request we do not implement. Recorded
                        // with its nr because libinput/libevdev probe a long
@@ -1772,6 +1901,7 @@ pub fn push_event_console(dev_id: u32, type_: u16, code: u16, value: i32) {
 
 fn push_event_ex(dev_id: u32, type_: u16, code: u16, value: i32, users: bool) {
     if dev_id as usize >= MAX_DEVICES { return; }
+    if type_ == 3 && (code as usize) >= ABS_MT_SLOT { mt_track(dev_id as usize, code, value); }
 
     // Stamp from the same monotonic clock userspace reads, at its full
     // resolution. libinput asks for CLOCK_MONOTONIC and compares event times
@@ -2118,6 +2248,7 @@ pub fn register_input_device(kind: u8, name: &str, bus: u16, vendor: u16, produc
     };
     unsafe { arch_interrupt_restore(f); }
     let i = idx?;
+    mt_init(i as u32, if kind == DEVKIND_TOUCHPAD { TP_SLOTS } else { 0 });
     vfs_server::register_device_notify_open(EVENT_PATHS[i], port, i as u32, 13, 64 + i as u32);
     hp_broadcast(HpRec { add: true, dev: i as u8, kind, bus, vendor, product });
     crate_log(b"[EVDEV] added ", EVENT_PATHS[i], name);
@@ -2233,6 +2364,7 @@ fn hp_format(r: &HpRec, out: &mut [u8; 64]) -> usize {
         KIND_VIRT_TABLET => b" tablet ",
         DEVKIND_MOUSE | DEVKIND_UINPUT_MOUSE => b" mouse ",
         DEVKIND_UINPUT_PAD => b" pad ",
+        DEVKIND_TOUCHPAD | DEVKIND_UINPUT_TOUCHPAD => b" touchpad ",
         _ => b" kbd ",
     };
     put(out, &mut n, kind);

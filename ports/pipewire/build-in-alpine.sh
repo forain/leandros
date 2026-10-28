@@ -76,6 +76,8 @@ esac
   # -- our sink + the ScreenCast probe -------------------------------------------
   $CC -O2 -Wall -o "$S/usr/bin/leandros-snd-sink" /src/leandros-snd-sink.c \
      $(pkg-config --cflags --libs libpipewire-0.3) -lm
+  $CC -O2 -Wall -o "$S/usr/bin/leandros-snd-source" /src/leandros-snd-source.c \
+     $(pkg-config --cflags --libs libpipewire-0.3)
   if [ -f /src/pw-screencast-probe.c ]; then
     $CC -O2 -Wall -o "$S/usr/bin/pw-screencast-probe" /src/pw-screencast-probe.c \
        $(pkg-config --cflags --libs libpipewire-0.3 gio-2.0 gio-unix-2.0) -lm

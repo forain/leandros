@@ -521,6 +521,38 @@ mod tests {
     }
 
     #[test]
+    fn tx_stall_tail_keyed_fires_even_if_hw_slot_keeps_moving() {
+        // Ping replies keep moving TBQP while the tail is stuck: tick() never fires, tick_tail() does.
+        let mut a = TxStall::default();
+        for k in 0..20 { assert!(!a.tick(Some(k), 5, 8, false)); }
+        let mut b = TxStall::default();
+        let fired = (0..TX_STALL_POLLS + 1).filter(|_| b.tick_tail(5, 8)).count();
+        assert_eq!(fired, 1);
+        let mut c = TxStall::default();
+        for k in 0..20 { assert!(!c.tick_tail(k, 3)); }
+        for _ in 0..20 { assert!(!c.tick_tail(5, 0)); }
+    }
+
+    #[test]
+    fn lost_tail_completion_is_detected_and_resynced() {
+        let mut d = vec![Desc::default(); 8];
+        let mut t = unsafe { TxRing::init(d.as_mut_ptr(), 8, &|i| DMA_OFF + 0x20000 + i as u64 * 2048) };
+        for _ in 0..4 { let i = t.slot().unwrap(); t.post(i, 100); }
+        assert_eq!(t.used_after_tail(), None);
+        // Controller completed slots 1 and 2 but slot 0 never shows USED.
+        d[1].ctrl |= TX_USED; d[2].ctrl |= TX_USED;
+        assert_eq!(t.reclaim(), 0);
+        assert_eq!(t.used_after_tail(), Some((1, 2)));
+        // Hardware idles on slot 3 (not yet completed).
+        assert_eq!(t.resync_to(3), 3);
+        assert_eq!((t.tail(), t.in_flight()), (3, 1));
+        assert_eq!(t.used_after_tail(), None);
+        d[3].ctrl |= TX_USED;
+        assert_eq!(t.reclaim(), 1);
+        assert_eq!(t.in_flight(), 0);
+    }
+
+    #[test]
     fn ring_slot_maps_queue_pointer_to_index() {
         assert_eq!(ring_slot(0x103f020, 0x103f000, 256), Some(2));
         assert_eq!(ring_slot(0x103f000, 0x103f000, 256), Some(0));
@@ -543,5 +575,49 @@ mod tests {
         let mut st = TxStall::default();
         for _ in 0..20 { assert!(!st.tick(Some(2), 2, 4, true)); }
         for _ in 0..20 { assert!(!st.tick(Some(2), 2, 0, false)); }
+    }
+
+    /// Register file that records writes; TSR.TGO clears after `busy` reads.
+    struct QRegs { v: std::cell::RefCell<HashMap<usize, u32>>, busy: std::cell::Cell<u32>, log: Vec<(usize, u32)> }
+    impl Regs for QRegs {
+        fn r32(&self, off: usize) -> u32 {
+            if off == TSR {
+                let b = self.busy.get();
+                if b > 0 { self.busy.set(b - 1); return TSR_TGO; }
+                return 0;
+            }
+            *self.v.borrow().get(&off).unwrap_or(&0)
+        }
+        fn w32(&mut self, off: usize, v: u32) { self.v.borrow_mut().insert(off, v); self.log.push((off, v)); }
+        fn delay_us(&mut self, _us: u32) {}
+    }
+
+    #[test]
+    fn kexec_quiesce_stops_rx_tx_and_clears_every_queue_pointer() {
+        let mut m = QRegs { v: Default::default(), busy: std::cell::Cell::new(3), log: Vec::new() };
+        for (o, v) in [(NCR, NCR_TE | NCR_RE | NCR_MPE), (RBQP, 0x1000), (TBQP, 0x2000),
+                       (RBQPQ1, 0x3000), (TBQPQ1, 0x4000), (RBQPQ1 + 4, 0x5000), (RBQPH, 1), (TBQPH, 1)] {
+            m.v.borrow_mut().insert(o, v);
+        }
+        assert!(quiesce(&mut m, 3));
+        let ncr = m.r32(NCR);
+        assert_eq!(ncr & (NCR_TE | NCR_RE), 0, "TE/RE must be clear");
+        assert_ne!(ncr & NCR_MPE, 0, "MDIO stays enabled");
+        for o in [RBQP, TBQP, RBQPQ1, TBQPQ1, RBQPQ1 + 4, TBQPQ1 + 4, RBQPH, TBQPH] {
+            assert_eq!(m.r32(o), 0, "queue pointer {:#x} not cleared", o);
+        }
+        assert_eq!(m.r32(IDR), INT_ALL);
+        // RE is cleared before any ring pointer is touched.
+        let re_off = m.log.iter().position(|&(o, v)| o == NCR && v & NCR_RE == 0).unwrap();
+        let rbqp = m.log.iter().position(|&(o, _)| o == RBQP).unwrap();
+        assert!(re_off < rbqp);
+    }
+
+    #[test]
+    fn kexec_quiesce_reports_a_transmitter_that_never_idles() {
+        let mut m = QRegs { v: Default::default(), busy: std::cell::Cell::new(u32::MAX), log: Vec::new() };
+        m.v.borrow_mut().insert(NCR, NCR_TE | NCR_RE);
+        assert!(!quiesce(&mut m, 1));
+        assert_eq!(m.r32(NCR) & (NCR_TE | NCR_RE), 0, "RE/TE still cleared on timeout");
     }
 }

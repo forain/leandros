@@ -47,6 +47,14 @@ static TAP: AtomicBool = AtomicBool::new(true);
 static PACKETS: AtomicU32 = AtomicU32::new(0);
 static BAD_SYNC: AtomicU32 = AtomicU32::new(0);
 /// Re-entrancy guard: the decoder state below is only touched under it.
+/// An I2C-HID Precision Touchpad owns the pad: its own PS/2 packets are dropped
+/// (W=3 pass-through, the trackstick, is kept).
+static I2C_OWNS: AtomicBool = AtomicBool::new(false);
+static I2C_DROPPED: AtomicU32 = AtomicU32::new(0);
+pub fn set_touch_owner_i2c(on: bool) { I2C_OWNS.store(on, Ordering::Release); }
+pub fn i2c_owns() -> bool { I2C_OWNS.load(Ordering::Acquire) }
+pub fn dropped_packets() -> u32 { I2C_DROPPED.load(Ordering::Relaxed) }
+
 static BUSY: AtomicBool = AtomicBool::new(false);
 
 /// What the Synaptics probe found (filled in before PROTO_SYNAPTICS is set).
@@ -303,6 +311,10 @@ fn synaptics(st: &mut State, p: &[u8; 6]) {
     let w = (((p[0] & 0x30) >> 2) | ((p[0] & 0x04) >> 1) | ((p[3] & 0x04) >> 2)) as i32;
     if w == 3 && st.syn.passthrough {
         stick(st, p[1], p[4], p[5]);
+        return;
+    }
+    if I2C_OWNS.load(Ordering::Acquire) {
+        I2C_DROPPED.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let (x, y) = syn_xy(p, st.syn.ext_buttons);

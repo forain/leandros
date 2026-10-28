@@ -552,6 +552,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // and the serial getty start with the configured layout.
     vconsole_setup();
 
+    spawn_netctl_stamper();
+
     // 5. Graphical login, when the image carries one and nothing opted out.
     // /run is on the persistent root, so a pid file from an earlier boot
     // would name whatever process now has that pid (a `kill $(cat ...)` then
@@ -604,6 +606,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
         let pid = wait4(-1, &mut status, WNOHANG, core::ptr::null_mut());
         if pid == 0 {
             bt_services();
+            daemon_tick();
             if dm_pid > 0 { mem_guard(&mut guard, dm_pid, login_pid, dm_logger); }
             usleep(250_000);
             continue;
@@ -619,6 +622,10 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             continue;
         }
         if reap_vt_login(pid) {
+            continue;
+        }
+        if let Some(k) = daemon_index(pid) {
+            daemon_exited(k, status);
             continue;
         }
         if SSHD_PID > 0 && pid == SSHD_PID {
@@ -894,8 +901,86 @@ unsafe fn bt_services() {
     BT_STARTED = true;
     if !exists(BTD_PATH) || cmdline_has(b"bt=0") { return; }
     write_str("starting btd and bthid (/dev/hci0 is up)\n");
-    spawn_daemon(BTD_PATH);
-    if exists(BTHID_PATH) && !cmdline_has(b"bthid=0") { spawn_daemon(BTHID_PATH); }
+    daemon_start(0);
+    if daemon_wanted(1) { daemon_start(1); }
+}
+
+/// Supervised init-spawned daemons: btd, bthid and `netctl watch --stamp`.
+/// Their pids are exempt from `sweep_strays` (the graphical login giving up
+/// on a GPU-less board used to SIGKILL them) and they are respawned with the
+/// sshd backoff when they exit.
+#[derive(Clone, Copy)]
+struct Daemon { pid: i32, started: u64, quick: u32, respawn_at: u64 }
+const DAEMON_NAMES: [&str; 3] = ["btd", "bthid", "netctl watch"];
+static mut DAEMONS: [Daemon; 3] = [Daemon { pid: 0, started: 0, quick: 0, respawn_at: 0 }; 3];
+
+unsafe fn daemon_wanted(k: usize) -> bool {
+    match k {
+        0 => exists(BTD_PATH) && exists(b"/dev/hci0\0") && !cmdline_has(b"bt=0"),
+        1 => exists(BTHID_PATH) && !cmdline_has(b"bt=0") && !cmdline_has(b"bthid=0"),
+        _ => exists(b"/dev/netctl\0"),
+    }
+}
+
+unsafe fn daemon_start(k: usize) {
+    let pid = match k {
+        0 => spawn_daemon(BTD_PATH),
+        1 => spawn_daemon(BTHID_PATH),
+        _ => spawn_netctl_watch(),
+    };
+    DAEMONS[k].pid = if pid > 0 { pid } else { 0 };
+    DAEMONS[k].started = monotonic_secs();
+}
+
+unsafe fn daemon_index(pid: i32) -> Option<usize> {
+    if pid <= 0 { return None; }
+    let mut k = 0;
+    while k < DAEMONS.len() {
+        if DAEMONS[k].pid == pid { return Some(k); }
+        k += 1;
+    }
+    None
+}
+
+/// A supervised daemon exited: log it and schedule the respawn (no sleeping
+/// in the reap path; `daemon_tick` does the respawn).
+unsafe fn daemon_exited(k: usize, status: i32) {
+    DAEMONS[k].pid = 0;
+    let ran = monotonic_secs().saturating_sub(DAEMONS[k].started);
+    if ran >= SSHD_STABLE_SECS { DAEMONS[k].quick = 0; }
+    DAEMONS[k].quick += 1;
+    write_str(DAEMON_NAMES[k]);
+    write_str(" exited (status ");
+    write_u32(status as u32);
+    write_str(") after ");
+    write_u32(ran as u32);
+    write_str(" s");
+    if status & 0x7f == 0 && (status >> 8) & 0xff == 127 {
+        write_str("; exec failed, not restarting it\n");
+        return;
+    }
+    if DAEMONS[k].quick > SSHD_MAX_QUICK_EXITS {
+        write_str("; it keeps failing, not restarting it\n");
+        return;
+    }
+    let delay_s = 1u32 << (DAEMONS[k].quick - 1).min(4);
+    write_str(", restarting in ");
+    write_u32(delay_s);
+    write_str(" s\n");
+    DAEMONS[k].respawn_at = monotonic_secs() + delay_s as u64;
+}
+
+/// Idle tick: respawn daemons whose backoff has elapsed, when still wanted.
+unsafe fn daemon_tick() {
+    let mut k = 0;
+    while k < DAEMONS.len() {
+        let d = DAEMONS[k];
+        if d.pid == 0 && d.respawn_at != 0 && monotonic_secs() >= d.respawn_at && daemon_wanted(k) {
+            DAEMONS[k].respawn_at = 0;
+            daemon_start(k);
+        }
+        k += 1;
+    }
 }
 
 /// Start a plain daemon in its own session, stdin on /dev/null, stdout/stderr
@@ -925,6 +1010,29 @@ unsafe fn sshd_wanted() -> bool {
 /// Start `/usr/sbin/sshd` in its own session, stdin on /dev/null and stdout/
 /// stderr on the console (it logs to /var/log/sshd.log itself; only a fatal
 /// start-up error reaches the console).
+/// Quiet connect stamper: `netctl watch --stamp` records each successful
+/// Wi-Fi connect in the profile's timestamp_s (autoconnect ranking across
+/// boots). Only started when the kernel exposes /dev/netctl; not waited for.
+unsafe fn spawn_netctl_stamper() {
+    if daemon_wanted(2) { daemon_start(2); }
+}
+
+unsafe fn spawn_netctl_watch() -> i32 {
+    let pid = fork();
+    if pid == 0 {
+        setsid();
+        let path = b"/bin/netctl\0";
+        let a1 = b"watch\0";
+        let a2 = b"--no-snapshot\0";
+        let a3 = b"--stamp\0";
+        let argv: [*const u8; 5] = [path.as_ptr(), a1.as_ptr(), a2.as_ptr(), a3.as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    pid
+}
+
 unsafe fn spawn_sshd() -> i32 {
     let pid = fork();
     if pid == 0 {
@@ -1094,6 +1202,7 @@ unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
             p == me || q == login_pid || q == logger_pid || q == AUTORUN_PID
                 || q == NET_AUTORUN_PID || q == AUTORUN_SND_PID
                 || q == AUTORUN_I915_PID || q == SSHD_PID
+                || daemon_index(q).is_some()
         };
         while pid <= last {
             // The log writer is spared: it exits by itself on EOF, once the

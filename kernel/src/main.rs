@@ -9,7 +9,10 @@ mod init;
 mod klog;
 mod iostat;
 mod hungtask;
+#[cfg(target_arch = "x86_64")]
+mod lappower;
 mod power;
+mod pm;
 mod kexec;
 #[cfg(target_arch = "x86_64")]
 mod direct_hhdm;
@@ -1051,6 +1054,28 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 #[cfg(feature = "rpi5")]
                 { BOOT_INFO.pci_ecam_base = 0; }
 
+                // kexec DMA defense (lane pikexecdma): a previous kernel may
+                // have left RP1 mastering (GEM RX ring, xHCI, RP1 DMA) with
+                // pcie2 up, and its frames would land in pages the buddy
+                // allocator is about to hand out. Before mm init, whatever
+                // `pcie.rpi5` says: RP1 in PERST#, the RC bridge in reset
+                // (brcmstb_pcie::init brings it back when PCIe is wanted). Only after a
+                // kexec (prevlog handed over); a cold firmware boot is untouched.
+                // The identity half of early_pgtables maps the BCM2712 MMIO
+                // (PUD 64, Device) here. `pcie.early_reset=0` skips it.
+                #[cfg(feature = "rpi5")]
+                if boot::kexec_prevlog().is_some() && cmdline_knob("pcie.early_reset") != Some("0") {
+                    use drivers::brcmstb_pcie::{early_reset_identity, EarlyReset};
+                    match unsafe { early_reset_identity() } {
+                        EarlyReset::AlreadyInReset =>
+                            serial_print_str("[pcie] early reset: RC held in reset before mm init (bridge was already in reset)\n"),
+                        EarlyReset::Reset { held: true } =>
+                            serial_print_str("[pcie] early reset: RC held in reset before mm init\n"),
+                        EarlyReset::Reset { held: false } =>
+                            serial_print_str("[pcie] early reset: FAILED, bridge reset did not stick\n"),
+                    }
+                }
+
                 // QEMU `-kernel` provides neither a DTB nor ACPI for a bare ELF,
                 // so the device-tree scan above finds nothing and UART/ECAM stay
                 // zero. Fall back to the fixed QEMU virt MMIO addresses: the PL011
@@ -1470,6 +1495,9 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     #[cfg(target_arch = "x86_64")]
     if !boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "usb.early_handoff=0")) {
         drivers::usb_hcd::early_handoff_all();
+    }
+    if boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "usb.tbxhci=0")) {
+        drivers::usb_hcd::disable_controller_gone_guard();
     }
     early_mark(10);
     // PS/2 controller: probed (or ruled out by the FADT) before anything
@@ -1902,13 +1930,40 @@ fn kfacil_init(hhdm_offset: u64) {
     #[cfg(target_arch = "x86_64")]
     drivers::pci::init_ecam_from_acpi(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr }, hhdm_offset);
     #[cfg(target_arch = "x86_64")]
+    power::log_reset_cause();
+    #[cfg(target_arch = "x86_64")]
     drivers::usb_hcd::early_quiesce();
     #[cfg(not(target_arch = "x86_64"))]
     let _ = hhdm_offset;
 }
 
+/// Board hook at the start of every fatal stop (panic, EL1 fault halt):
+/// rpi5 stops feeding the PM watchdog and re-arms its full timeout.
+#[inline(always)]
+fn fatal_begin() {
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    drivers::rpi_misc::panic_begin();
+}
+
+/// After the fatal message is on serial: rpi5 resets the board after
+/// `panic.reset=<s>` (default 5; 0 = halt). Then spin.
+fn fatal_end() -> ! {
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    drivers::rpi_misc::panic_end();
+    loop { core::hint::spin_loop(); }
+}
+
+/// For arch fault paths that halt the machine (aarch64 EL1 faults): the same
+/// board reset policy as a panic. Call after the report is printed.
+#[no_mangle]
+pub extern "C" fn kernel_fatal_halt() -> ! {
+    fatal_begin();
+    fatal_end()
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    fatal_begin();
     // Before the console exists the only way out is the early framebuffer
     // text (boot/src/earlyfb.rs): paint the message there, knob or not. This
     // path allocates nothing and takes no lock it could deadlock on.
@@ -1942,7 +1997,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     }
     serial_print_str("\n--------------------\n");
     klog::flush_panic();
-    loop { core::hint::spin_loop(); }
+    fatal_end()
 }
 
 /// Seed CLOCK_REALTIME from the board's real-time clock (PL031 on virt,

@@ -391,6 +391,10 @@ fn ready(uart: &mut Uart, r: bringup::Report, t1: u64, power: &str, on_ready: fn
     if let Some((w, l)) = r.v1 { log(&format!("flow fallback: auto-RTS version window rx={}[{}] {}", w.len, w.hex(), l)); }
     log(&format!("lines {}", uart.lines()));
     // Vendor init is done: publish /dev/hci0 and become its pump.
+    if !super::hcidev::claim() {
+        log("/dev/hci0 already owned by another transport");
+        return;
+    }
     match super::hcidev::create_port() {
         Some(port) => {
             on_ready(port);

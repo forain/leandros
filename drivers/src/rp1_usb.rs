@@ -2,7 +2,7 @@
 //! usb@300000 in RP1's BAR1), put into xHCI host mode and handed to the
 //! common xHCI stack (`drivers/usb`).
 //!
-//! Two steps, because RP1 is probed (kernel init, `pcie.rpi5=1`) before the
+//! Two steps, because RP1 is probed (kernel init, unless `pcie.rpi5=0`) before the
 //! USB layer comes up:
 //! - [`attach`] (from `rp1::probe`): VBUS on (RP1 GPIO 42 = USB_VBUS_EN), then
 //!   per controller GSNPSID check, core + PHY soft reset, GCTL host, the DTB

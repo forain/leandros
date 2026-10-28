@@ -10,13 +10,30 @@ extern crate alloc;
 
 pub mod serial;
 pub mod pci;
+/// Generic PCI config-space save/restore for system sleep (lane s3pci).
+pub mod pci_pm;
 /// Runtime IRQ registration, x86_64 vector allocator, MSI/MSI-X (lane kfacil).
 pub mod irq;
 /// `request_firmware`: kernel read of a file from the mounted root (lane kfacil).
 pub mod firmware;
 pub mod nvidia_probe;
+/// Laptop device inventory and read-only probes (ACPI ids, PCI BARs, TPM, Thunderbolt, SMBus accelerometer).
+#[cfg(target_arch = "x86_64")]
+pub mod lapinv;
 /// Intel Gen9 graphics: probe, GT bring-up, self-tests (lane i915).
 pub mod i915;
+pub mod acpi_power;
+/// HID report-descriptor parser (pure logic, host-tested; lane lapi2c).
+pub mod hid_desc;
+pub mod hid_ptp;
+/// ACPI I2C slave discovery, DesignWare I2C master, HID-over-I2C probe (lane lapi2c).
+#[cfg(target_arch = "x86_64")]
+pub mod i2c_acpi;
+#[cfg(target_arch = "x86_64")]
+pub mod dw_i2c;
+#[cfg(target_arch = "x86_64")]
+pub mod i2c_hid;
+pub mod power_sysfs;
 pub mod snd;
 /// Intel High Definition Audio controller + codec playback (lane hda).
 pub mod hda;
@@ -59,6 +76,7 @@ pub mod e1000e;
 pub mod e1000e_hw;
 /// Cadence GEM (macb) in the Raspberry Pi 5's RP1, BCM54213PE PHY; inert until the RP1 probe attaches it.
 pub mod macb;
+pub mod dma_shutdown;
 /// Hardware-independent macb pieces (host-tested in drivers/macb-tests).
 pub mod macb_hw;
 /// The NIC behind `eth0`: virtio-net, r8169 or e1000e.
@@ -80,6 +98,8 @@ pub mod wifi_frame;
 /// and wifi_sim (host-tested in drivers/iwlwifi-tests).
 pub mod wifi_ht;
 pub mod wifi_crypto;
+/// Wrong-passphrase block policy of the manager (host-tested in drivers/brcmf-tests).
+pub mod wifi_wrongkey;
 /// The control seam between /dev/netctl and Wi-Fi backends (types only so far).
 pub mod wifi_api;
 /// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).
@@ -130,7 +150,7 @@ pub mod rpi_pm;
 /// SoC temperature API (`thermal::soc_millicelsius`) and /proc hooks.
 pub mod thermal;
 /// BCM2712 PCIe root complex (pcie2) register math, RC bring-up, and the RP1
-/// south bridge behind it. Opt-in at boot with `pcie.rpi5=1`.
+/// south bridge behind it. On by default; `pcie.rpi5=0` turns it off.
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod brcmstb_hw;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]

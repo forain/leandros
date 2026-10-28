@@ -22,8 +22,9 @@
  *   static_poll     poll() on /dev/null for POLLPRI (never reported) plus a
  *                   pipe; and an EPOLLET /dev/null interest after its edge:
  *                   the waiter wakes only for the pipe write
- *   pipewire_poll   poll(POLLIN) on /dev/pipewire plus a pipe: the device
- *                   answers POLLOUT with a narrow tag
+ *   pipewire_poll   /dev/pipewire: POLLOUT always; POLLIN + a read for the
+ *                   capture holder when a capture device exists, never POLLIN
+ *                   for a second open (narrow static tag)
  *   drm_read        a blocking read of /dev/dri/card0, woken by the
  *                   completion event of a PAGE_FLIP issued from another
  *                   thread
@@ -442,17 +443,50 @@ static void static_case(void) {
 static void pipewire_case(void) {
     const char *n = "pipewire_poll";
     if (skipped(n)) return;
-    int fd = open("/dev/pipewire", O_RDONLY);
+    int fd = open("/dev/pipewire", O_RDONLY | O_NONBLOCK);
     if (fd < 0) { skip(n, "(no /dev/pipewire)"); return; }
+    /* The first poller claims the capture side; always writable. */
     struct pollfd pf = { fd, POLLIN | POLLOUT, 0 };
     int pr = poll(&pf, 1, 0);
-    if (pr != 1 || pf.revents != POLLOUT) {
-        fail(n, "poll answered %d revents %#x, want POLLOUT only", pr, pf.revents);
+    if (pr < 1 || !(pf.revents & POLLOUT) || (pf.revents & (POLLERR | POLLHUP))) {
+        fail(n, "poll answered %d revents %#x, want POLLOUT", pr, pf.revents);
         close(fd); return;
     }
-    int bad = poll_set_case(n, fd, POLLIN, 0);
+    /* With a capture device (QEMU hda-micro, the laptop) POLLIN arrives
+     * within a period or two and a read then yields data and never 0;
+     * without one (virtio-sound) POLLIN must never fire. */
+    pf.events = POLLIN; pf.revents = 0;
+    pr = poll(&pf, 1, 400);
+    int capture = pr == 1 && (pf.revents & POLLIN);
+    if (capture) {
+        char buf[1920];
+        ssize_t r = read(fd, buf, sizeof buf);
+        if (r <= 0) { fail(n, "POLLIN but read returned %zd errno %d", r, errno); close(fd); return; }
+        /* Drained: not readable again right away. */
+        r = read(fd, buf, sizeof buf);
+        for (int i = 0; i < 100 && r > 0; i++) r = read(fd, buf, sizeof buf);
+        if (r != -1 || errno != EAGAIN) { fail(n, "empty O_NONBLOCK read returned %zd errno %d, want EAGAIN", r, errno); close(fd); return; }
+    } else if (pr != 0) {
+        fail(n, "poll(POLLIN) answered %d revents %#x without a capture device", pr, pf.revents);
+        close(fd); return;
+    }
+    /* A second open is not the capture holder: never POLLIN, still POLLOUT. */
+    int fd2 = open("/dev/pipewire", O_RDONLY | O_NONBLOCK);
+    if (fd2 >= 0) {
+        struct pollfd p2 = { fd2, POLLIN | POLLOUT, 0 };
+        pr = poll(&p2, 1, capture ? 100 : 0);
+        if (pr != 1 || p2.revents != POLLOUT) {
+            fail(n, "second open: poll answered %d revents %#x, want POLLOUT only", pr, p2.revents);
+            close(fd2); close(fd); return;
+        }
+        /* Its wake tag is the narrow static one: the existing narrow-wake case. */
+        int bad = poll_set_case(n, fd2, POLLIN, 0);
+        close(fd2); close(fd);
+        if (!bad) pass(n);
+        return;
+    }
     close(fd);
-    if (!bad) pass(n);
+    fail(n, "second open: errno %d", errno);
 }
 
 /* ── DRM: a blocking card read woken by a page-flip event ─────────────── */

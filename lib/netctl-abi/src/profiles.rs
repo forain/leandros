@@ -471,3 +471,24 @@ fn trim(s: &[u8]) -> &[u8] {
 fn unquote(s: &[u8]) -> &[u8] {
     if s.len() >= 2 && s[0] == b'"' && s[s.len() - 1] == b'"' { &s[1..s.len() - 1] } else { s }
 }
+
+/// Seconds since the epoch below which the clock is not set (2020-01-01).
+pub const STAMP_MIN_EPOCH_S: u64 = 1_577_836_800;
+/// Re-stamp a profile only when its stored value is older than this (flash wear).
+pub const STAMP_REFRESH_S: u64 = 6 * 3600;
+
+/// Record a successful connect in `p.timestamp_s`. With no clock yet
+/// (`now_s` before 2020) the value 1 means "proven, time unknown". Returns
+/// false when nothing changed, so the caller skips the slot write.
+pub fn stamp(p: &mut Profile, now_s: u64) -> bool {
+    let old = p.timestamp_s;
+    let new = if now_s < STAMP_MIN_EPOCH_S {
+        if old == 0 { 1 } else { return false }
+    } else if old < STAMP_MIN_EPOCH_S || now_s.saturating_sub(old) > STAMP_REFRESH_S {
+        now_s
+    } else {
+        return false;
+    };
+    p.timestamp_s = new;
+    true
+}
