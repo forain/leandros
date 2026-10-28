@@ -115,6 +115,8 @@ struct Fake {
     got: usize,
     frags: usize,
     reject: bool,
+    reject_once: bool,
+    to_bootloader: usize,
     ddc: Vec<Vec<u8>>,
     reset_param: Vec<u8>,
     bulk_cmds_after_boot: usize,
@@ -123,7 +125,7 @@ struct Fake {
 
 impl Fake {
     fn new(fw_len: usize, oper: bool) -> Fake {
-        Fake { t: 0, oper, events: VecDeque::new(), fw_len, got: 0, frags: 0, reject: false, ddc: vec![],
+        Fake { t: 0, oper, events: VecDeque::new(), fw_len, got: 0, frags: 0, reject: false, reject_once: false, to_bootloader: 0, ddc: vec![],
                reset_param: vec![], bulk_cmds_after_boot: 0, became_operational: false }
     }
     fn cc(&mut self, op: u16, ret: &[u8]) {
@@ -159,9 +161,16 @@ impl Link for Fake {
                 self.frags += 1;
                 self.cc(op, &[0]);
                 if self.got == self.fw_len - 4 {
-                    let r = if self.reject { 1 } else { 0 };
+                    let r = if self.reject || self.reject_once { 1 } else { 0 };
+                    self.reject_once = false;
                     self.events.push_back(vec![0xff, 5, 0x06, r, 0x09, 0xfc, 0]);
                 }
+            }
+            btintel::OP_RESET if p[3] == 0 => {
+                // Reset to bootloader: forget the partial download.
+                self.to_bootloader += 1;
+                self.got = 0;
+                self.oper = false;
             }
             btintel::OP_RESET => {
                 self.reset_param = p.to_vec();
@@ -229,6 +238,18 @@ fn rejected_firmware_is_an_error() {
         r => panic!("{:?}", r.map(|_| ())),
     }
     assert!(f.reset_param.is_empty());
+    assert_eq!(f.to_bootloader, 2, "one retry, then a final reset to the bootloader");
+}
+
+#[test]
+fn one_rejected_download_is_retried_after_a_reset_to_bootloader() {
+    let fw = sample_fw();
+    let mut f = Fake::new(fw.len(), false);
+    f.reject_once = true;
+    let r = btintel::setup(&mut f, &mut loader(fw)).unwrap();
+    assert_eq!(f.to_bootloader, 1);
+    assert_eq!(r.oper.fw_variant, 0x23);
+    assert!(f.became_operational);
 }
 
 #[test]
