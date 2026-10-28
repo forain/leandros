@@ -25,7 +25,7 @@ virt/raspi4b are untouched.
 ## Evidence
 - host: `drivers/rpi-misc-tests` 15/15 (dtb/magic test extended with pm_regs_plausible + Buf::x).
 - check-rpi5.sh clean for rpi5 and raspi4b; `build-all.sh --arch aarch64 --rpi5` builds.
-- aarch64 regress (QEMU virt): see commit/merge.
+- aarch64 regress (QEMU virt, HVF) overall PASS, boots failed 0/1, no `[WDT]` line in any log.
 
 ## Open
 - Confirm on the Pi after pi-deploy: expect the "kexec FDT" line followed by the armed line.
