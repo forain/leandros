@@ -230,6 +230,7 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, a: &mut Alloc) -> R
         cpus: &cpus,
         psci_method: if smc { b"smc" } else { b"hvc" },
         kexec_ap_mailbox: dtb as u64 + AP_PARK_OFF + AP_MAILBOX_OFF,
+        dma_noncoherent: !mm::dma_cache::coherent(),
         kexec_prevlog: Some(inp.prevlog),
     };
     let mut buf = alloc::vec![0u8; AP_PARK_OFF as usize];

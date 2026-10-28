@@ -74,6 +74,10 @@ pub struct FdtInput<'a> {
     /// leandros,kexec-ap-mailbox`, u64), 0 = none. See
     /// `kernel/src/kexec/purgatory_aarch64.s`.
     pub kexec_ap_mailbox: u64,
+    /// The booting kernel runs with non-coherent DMA (a Pi): `/chosen/
+    /// leandros,dma-noncoherent`. The FDT is "linux,dummy-virt", so the next
+    /// kernel cannot detect the board from it.
+    pub dma_noncoherent: bool,
     /// The old kernel's final-log buffer `(phys, size)` (`/chosen/
     /// leandros,kexec-prevlog`, two u64), None = none. Must lie in `memory`
     /// (the next kernel keeps it out of its allocator until read).
@@ -215,6 +219,9 @@ pub fn build_fdt(input: &FdtInput, buf: &mut [u8]) -> Result<usize, FdtError> {
     }
     if input.kexec_ap_mailbox != 0 {
         f.p_u64(b"leandros,kexec-ap-mailbox", input.kexec_ap_mailbox);
+    }
+    if input.dma_noncoherent {
+        f.prop(b"leandros,dma-noncoherent", &[]);
     }
     if let Some((p, l)) = input.kexec_prevlog {
         let mut v = [0u8; 16];
