@@ -67,6 +67,9 @@ pub fn init(rsdp_phys: u64, hhdm_offset: u64) {
     power::init(rsdp_phys, hhdm_offset)
 }
 
+/// The `idx`-th raw ACPI table as (Linux file name, bytes).
+pub fn raw_table(idx: usize) -> Option<(alloc::string::String, &'static [u8])> { power::raw_table(idx) }
+
 /// Number of batteries (`PNP0C0A` devices) the firmware describes.
 pub fn battery_count() -> usize { power::battery_count() }
 

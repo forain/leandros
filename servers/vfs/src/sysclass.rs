@@ -119,6 +119,7 @@ pub fn write(path: &[u8], data: &[u8]) -> i32 {
 
 /// The `idx`-th entry of an overlay directory: `(name length, is_dir)`.
 pub fn dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)> {
+    if dev == SC_TABLES { return tables_dirent(idx, out); }
     let o = ops()?;
     let cls = ((dev >> 8) & 0xF) as usize;
     let class = CLASSES.get(cls)?;
@@ -131,4 +132,48 @@ pub fn dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_LEN]) -> Opti
         }
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// `/sys/firmware/acpi/tables/<SIG>[n]`: the raw ACPI tables, Linux-style
+// (DSDT, SSDT1.., FACP, ECDT), root-only. Served while a provider is
+// registered; the directory uses `SC_BASE | 0xF << 8 | 0xFF`.
+
+/// `idx`-th table: writes its file name into `name`, returns (name length, bytes).
+pub type TableFn = fn(idx: usize, name: &mut [u8; NAME_LEN]) -> Option<(usize, &'static [u8])>;
+
+static TABLES: AtomicUsize = AtomicUsize::new(0);
+const TABLES_DIR: &[u8] = b"/sys/firmware/acpi/tables";
+pub const SC_TABLES: u16 = SC_BASE | 0xF << 8 | 0xFF;
+
+pub fn set_acpi_tables(f: TableFn) {
+    TABLES.store(f as usize, Ordering::Release);
+}
+
+fn tables() -> Option<TableFn> {
+    let p = TABLES.load(Ordering::Acquire);
+    if p == 0 { None } else { Some(unsafe { core::mem::transmute::<usize, TableFn>(p) }) }
+}
+
+/// True for the tables directory itself (when a provider is registered).
+pub fn is_tables_dir(path: &[u8]) -> bool {
+    tables().is_some() && (path == TABLES_DIR || path.strip_prefix(TABLES_DIR) == Some(b"/"))
+}
+
+/// The bytes of `/sys/firmware/acpi/tables/<name>`.
+pub fn acpi_table(path: &[u8]) -> Option<&'static [u8]> {
+    let f = tables()?;
+    let name = path.strip_prefix(TABLES_DIR)?.strip_prefix(b"/")?;
+    let mut b = [0u8; NAME_LEN];
+    (0..64).find_map(|i| f(i, &mut b).filter(|(n, _)| &b[..*n] == name).map(|(_, t)| t))
+}
+
+/// True for any path this table overlay answers.
+pub fn is_tables_path(path: &[u8]) -> bool {
+    is_tables_dir(path) || acpi_table(path).is_some()
+}
+
+/// The `idx`-th entry of the tables directory.
+pub fn tables_dirent(idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)> {
+    Some((tables()?(idx, out)?.0, false))
 }

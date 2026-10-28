@@ -44,6 +44,12 @@ pub fn init(rsdp: u64, hhdm: u64, cmdline: &str) {
     drivers::power_sysfs::set_fake(has("acpi_power.fake=1"));
     drivers::acpi_power::init(rsdp, hhdm);
     vfs_server::sysclass::set_sysclass_ops(&OPS);
+    vfs_server::sysclass::set_acpi_tables(|idx, out| {
+        let (name, t) = drivers::acpi_power::raw_table(idx)?;
+        let n = name.len().min(out.len());
+        out[..n].copy_from_slice(&name.as_bytes()[..n]);
+        Some((n, t))
+    });
     if sched::spawn(task, 0).map(|p| sched::set_comm(p, b"kacpid")).is_none() {
         crate::serial_print_str("[ACPI] could not start the power poll thread\n");
     }
