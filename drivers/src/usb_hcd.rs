@@ -43,6 +43,8 @@ pub const ROLE_KEYBOARD: u8 = 0x01;
 pub const ROLE_MOUSE: u8 = 0x02;
 pub const ROLE_MASS_STORAGE: u8 = 0x04;
 pub const ROLE_HUB: u8 = 0x08;
+/// Synthetic root-hub entry (one per controller), combined with ROLE_HUB.
+pub const ROLE_ROOT_HUB: u8 = 0x40;
 pub const ROLE_HID_UNSUPPORTED: u8 = 0x80;
 
 /// Turn on verbose xHCI tracing and the BOT self-test. Call before `init()`.
@@ -355,12 +357,31 @@ unsafe fn probe_one(pci: &PciDevice) {
     }
 }
 
+/// `usb.tbxhci=0`: skip the controller-gone (all-ones USBSTS) guard in the hot-plug scan.
+pub fn disable_controller_gone_guard() {
+    usb::TBXHCI_GUARD_OFF.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn device_count() -> usize {
-    usb::devices().len()
+    usb::controller_count() + usb::devices().len()
 }
 
 pub fn device_info(index: usize) -> Option<UsbDevInfo> {
-    let d = usb::devices().into_iter().nth(index)?;
+    let nctl = usb::controller_count();
+    if index < nctl {
+        let (_, usb3) = usb::controller_ports(index)?;
+        return Some(UsbDevInfo {
+            bus: index as u8,
+            address: 1,
+            vendor_id: 0x1d6b,
+            product_id: if usb3 { 0x0003 } else { 0x0002 },
+            class: 0x09,
+            role: ROLE_HUB | ROLE_ROOT_HUB,
+            port: 0,
+            speed: if usb3 { 4 } else { 3 },
+        });
+    }
+    let d = usb::devices().into_iter().nth(index - nctl)?;
     Some(UsbDevInfo {
         // `lsusb` prints bus + 1 (0-based, like the PCI-style syscalls).
         bus: d.bus.saturating_sub(1),
