@@ -52,15 +52,23 @@ pub(super) struct Ext {
     cap_read: u64,
     cap_overruns: u32,
     cap_starts: u32,
+    cap_dma_errors: u32,
+    cap_logged_errs: u32,
+    cap_restarts: u32,
+    cap_stalled: bool,
+    cap_move_us: u64,
+    cap_fifo: u32,
     // jack
     hp_pins: Vec<u16>,
-    spk_pins: Vec<u16>,
+    /// Speaker pins the playback path enabled, with their original PIN_CTL.
+    spk_saved: Vec<(u16, u32)>,
     hp_present: Option<bool>,
     mic_present: Option<bool>,
     last_poll_us: u64,
     jack_switches: u32,
     // display codec
     hdmi_summary: String,
+    display: Option<(u8, u16)>,
 }
 
 impl Ext {
@@ -69,7 +77,8 @@ impl Ext {
             int_path: Vec::new(), jack_path: Vec::new(), cur_path: Vec::new(),
             cap_sd: 0, cap_sd_index: 0, cap_bdl: 0, cap_bdl_phys: 0, cap_ring: 0, cap_ring_phys: 0,
             cap_active: false, cap_last_pos: 0, cap_total: 0, cap_read: 0, cap_overruns: 0, cap_starts: 0,
-            hp_pins: Vec::new(), spk_pins: Vec::new(), hp_present: None, mic_present: None,
+            cap_dma_errors: 0, cap_logged_errs: 0, cap_restarts: 0, cap_stalled: false, cap_move_us: 0, cap_fifo: 0,
+            hp_pins: Vec::new(), spk_saved: Vec::new(), display: None, hp_present: None, mic_present: None,
             last_poll_us: 0, jack_switches: 0, hdmi_summary: String::new(),
         }
     }
@@ -164,7 +173,12 @@ impl Hda {
             let w = match self.widget(p.nid) { Some(w) => w.clone(), None => continue };
             match (w.cfg >> 20) & 0xF {
                 2 if w.pincap & PINCAP_PRES_DETECT != 0 && (w.cfg >> 8) & 1 == 0 => self.ext.hp_pins.push(p.nid),
-                1 => self.ext.spk_pins.push(p.nid),
+                // Unconnected pins (default config 0x411111f0 and kin) are
+                // left alone; only speakers the playback path switched on.
+                1 if (w.cfg >> 30) != 1 => {
+                    let ctl = self.verb(p.nid, V_GET_PIN_CTL, 0).unwrap_or(0) & 0xFF;
+                    if ctl & PINCTL_OUT_EN != 0 { self.ext.spk_saved.push((p.nid, ctl)); }
+                }
                 _ => {}
             }
         }
@@ -247,6 +261,10 @@ impl Hda {
         self.w8(sd + SD_CTL0, ctl & !(SD_CTL_RUN | 0x1C));
         wait_for(1000, || self.r8(sd + SD_CTL0) & SD_CTL_RUN == 0);
         if let Some(&(adc, _)) = self.ext.cur_path.first() { self.verb(adc, V_SET_STREAM, 0); }
+        // Mic bias and input off.
+        if self.ext.cur_path.len() > 1 {
+            if let Some(&(pin, _)) = self.ext.cur_path.last() { self.verb(pin, V_SET_PIN_CTL, 0); }
+        }
         self.ext.cap_active = false;
     }
 
@@ -275,6 +293,9 @@ impl Hda {
         fence(Ordering::SeqCst);
         self.w8(sd + SD_CTL0, SD_CTL_RUN);
         let ok = wait_for(1000, || self.r8(sd + SD_CTL0) & SD_CTL_RUN != 0);
+        self.ext.cap_fifo = (((self.r16(sd + SD_FIFOS) as u32) + 1 + 3) & !3).min(256);
+        self.ext.cap_move_us = monotonic_us();
+        self.ext.cap_stalled = false;
         self.ext.cap_last_pos = 0;
         self.ext.cap_total = 0;
         self.ext.cap_read = 0;
@@ -285,31 +306,56 @@ impl Hda {
         ok
     }
 
-    fn capture_update(&mut self) {
+    /// MMIO only (runs from the tick): fold the DMA position into the byte
+    /// counters, count DMA errors, note a stuck LPIB.
+    pub(super) fn capture_update(&mut self) {
         if !self.ext.cap_active { return; }
         let sd = self.ext.cap_sd;
         let sts = self.r8(sd + SD_STS);
+        if sts & (SD_STS_FIFOE | SD_STS_DESE) != 0 { self.ext.cap_dma_errors += 1; }
         if sts != 0 { self.w8(sd + SD_STS, sts & (SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE)); }
         let pos = self.r32(sd + SD_LPIB);
+        fence(Ordering::Acquire);
         if pos as usize >= RING_BYTES { return; }
+        let now = monotonic_us();
+        if pos != self.ext.cap_last_pos { self.ext.cap_move_us = now; self.ext.cap_stalled = false; }
+        else if now.wrapping_sub(self.ext.cap_move_us) >= 100_000 { self.ext.cap_stalled = true; }
         let delta = ((pos as usize + RING_BYTES - self.ext.cap_last_pos as usize) % RING_BYTES) as u64;
         self.ext.cap_total += delta;
         self.ext.cap_last_pos = pos;
     }
 
-    /// Copy captured 48 kHz s16le stereo into `out`; 0 = nothing new yet.
-    /// Starts the stream on first use.
-    pub fn capture_read(&mut self, out: &mut [u8]) -> Result<usize, i32> {
+    /// Thread context: make sure the capture stream runs (the only place it
+    /// is started, so a read racing a close cannot revive it).
+    pub fn capture_ensure(&mut self) -> Result<(), i32> {
         if !self.initialized || self.ext.cap_sd == 0 { return Err(-19); } // ENODEV
         if !self.ext.cap_active && !self.capture_start() { return Err(-5); }
+        Ok(())
+    }
+
+    /// Thread context: restart a stalled stream.
+    pub fn capture_restart(&mut self) -> bool { self.ext.cap_restarts += 1; self.capture_start() }
+
+    /// Bytes ready to read (behind the FIFO's reach); no MMIO.
+    pub fn capture_pending(&self) -> usize {
+        if !self.ext.cap_active { return 0; }
+        ((self.ext.cap_total - self.ext.cap_read) as usize).saturating_sub(self.ext.cap_fifo as usize)
+    }
+
+    /// Copy captured 48 kHz s16le stereo into `out`. Never 0: -EAGAIN when
+    /// nothing is there yet (the caller decides whether to wait).
+    pub fn capture_read(&mut self, out: &mut [u8]) -> Result<usize, i32> {
+        if !self.initialized || self.ext.cap_sd == 0 { return Err(-19); } // ENODEV
+        if out.len() < 4 { return Err(-22); }
+        if !self.ext.cap_active { return Err(-11); }
         self.capture_update();
         let avail = self.ext.cap_total - self.ext.cap_read;
         if avail > (RING_BYTES - 8192) as u64 {
             self.ext.cap_overruns += 1;
             self.ext.cap_read = self.ext.cap_total - (RING_BYTES / 2) as u64;
         }
-        let avail = (self.ext.cap_total - self.ext.cap_read) as usize;
-        let n = avail.min(out.len()) & !3;
+        let n = self.capture_pending().min(out.len()) & !3;
+        if n == 0 { return Err(-11); }
         let mut done = 0;
         while done < n {
             let off = ((self.ext.cap_read + done as u64) % RING_BYTES as u64) as usize;
@@ -319,6 +365,32 @@ impl Hda {
         }
         self.ext.cap_read += n as u64;
         Ok(n)
+    }
+
+    /// Thread context, every ~100 ms: jack sense, DMA-error log, stall restart.
+    pub fn jack_service(&mut self) {
+        if !self.initialized { return; }
+        self.poll_jacks(false);
+        if self.ext.cap_dma_errors != self.ext.cap_logged_errs {
+            if self.ext.cap_logged_errs < 4 { hlog!("[HDA] capture DMA error (FIFOE/DESE), {} so far\n", self.ext.cap_dma_errors); }
+            self.ext.cap_logged_errs = self.ext.cap_dma_errors;
+        }
+        if self.ext.cap_active && self.ext.cap_stalled {
+            hlog!("[HDA] capture LPIB stuck for 100 ms; restarting the stream\n");
+            self.capture_restart();
+        }
+    }
+
+    /// Display codec to D3 (kexec/reboot quiesce).
+    pub(super) fn shutdown_display(&mut self) {
+        if let Some((cad, fg)) = self.ext.display.take() {
+            let main = self.cad;
+            self.cad = cad;
+            self.no_fallback = true;
+            self.verb(fg, V_SET_POWER, 3);
+            self.no_fallback = false;
+            self.cad = main;
+        }
     }
 
     /// The reading open went away.
@@ -341,21 +413,22 @@ impl Hda {
         let now = monotonic_us();
         if !force && now.wrapping_sub(self.ext.last_poll_us) < JACK_POLL_US { return; }
         self.ext.last_poll_us = now;
-        self.capture_update();
         let mut hp = None;
         for nid in self.ext.hp_pins.clone() {
             if let Some(p) = self.pin_present(nid) { hp = Some(hp.unwrap_or(false) | p); }
         }
         if hp.is_some() && hp != self.ext.hp_present {
+            let prev = self.ext.hp_present;
             self.ext.hp_present = hp;
-            self.ext.jack_switches += 1;
             let on = hp != Some(true);
-            for nid in self.ext.spk_pins.clone() {
-                let cur = self.verb(nid, V_GET_PIN_CTL, 0).unwrap_or(0) & 0xFF;
-                let ctl = if on { cur | PINCTL_OUT_EN } else { cur & !PINCTL_OUT_EN };
-                self.verb(nid, V_SET_PIN_CTL, ctl);
+            // The first reading with nothing plugged only records state.
+            if prev.is_some() || hp == Some(true) {
+                self.ext.jack_switches += 1;
+                for (nid, saved) in self.ext.spk_saved.clone() {
+                    self.verb(nid, V_SET_PIN_CTL, if on { saved } else { saved & !PINCTL_OUT_EN });
+                }
+                if !force { hlog!("[HDA] jack: headphone {} -> speakers {}\n", if on { "unplugged" } else { "plugged" }, if on { "on" } else { "muted" }); }
             }
-            if !force { hlog!("[HDA] jack: headphone {} -> speakers {}\n", if on { "unplugged" } else { "plugged" }, if on { "on" } else { "muted" }); }
         }
         let mic = match self.ext.jack_path.last() { Some(&(n, _)) => self.pin_present(n), None => None };
         if mic.is_some() && mic != self.ext.mic_present {
@@ -383,9 +456,9 @@ impl Hda {
 
     pub(super) fn ext_info(&mut self, s: &mut String) {
         self.capture_update();
-        let _ = writeln!(s, "capture: active={} path {} total {} read {} overruns {} starts {} lpib {}",
+        let _ = writeln!(s, "capture: active={} path {} total {} read {} overruns {} starts {} dmaerr {} restarts {} lpib {}",
                          self.ext.cap_active, path_str(&self.ext.cur_path), self.ext.cap_total, self.ext.cap_read,
-                         self.ext.cap_overruns, self.ext.cap_starts,
+                         self.ext.cap_overruns, self.ext.cap_starts, self.ext.cap_dma_errors, self.ext.cap_restarts,
                          if self.ext.cap_sd != 0 { self.r32(self.ext.cap_sd + SD_LPIB) } else { 0 });
         let _ = writeln!(s, "jack: headphone={:?} headset_mic={:?} switches {}",
                          self.ext.hp_present, self.ext.mic_present, self.ext.jack_switches);
@@ -395,12 +468,24 @@ impl Hda {
     // ── display (HDMI/DP) codec ──
 
     fn probe_display_codec(&mut self, cad: u8) {
+        let t = self.cmd_timeouts;
+        self.no_fallback = true;
+        self.probe_display_codec_inner(cad);
+        self.no_fallback = false;
+        if self.cmd_timeouts != t {
+            hlog!("[HDA] display codec {} stopped answering; left alone\n", cad);
+            self.ext.display = None;
+        }
+    }
+
+    fn probe_display_codec_inner(&mut self, cad: u8) {
         self.cad = cad;
         let mut s = String::new();
         let vid = match self.verb(0, V_GET_PARAM, P_VENDOR) { Some(v) => v, None => return };
         let sub = self.param(0, P_SUBNODES);
         let fg = ((sub >> 16) & 0xFF) as u16;
         if self.param(fg, P_FG_TYPE) & 0xFF != 0x01 { return; }
+        self.ext.display = Some((cad, fg));
         self.verb(fg, V_SET_POWER, 0);
         udelay(10_000);
         if vid >> 16 == 0x8086 {
