@@ -155,3 +155,12 @@ pub fn resolve_source(_spec: &str, _cmdline: Option<&str>, _boot: Option<BootDis
 {
     None
 }
+
+/// No-op on the rpi5 SDHCI backend: writes are synchronous, nothing to drain.
+pub fn pm_freeze(_timeout_ms: u64) -> Result<alloc::string::String, alloc::string::String> {
+    Ok(alloc::string::String::from("sdhci: nothing to freeze"))
+}
+
+pub fn pm_thaw() -> Result<alloc::string::String, alloc::string::String> {
+    Ok(alloc::string::String::from("sdhci: nothing to thaw"))
+}

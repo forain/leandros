@@ -124,7 +124,11 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             out(sp);
         }
         out(b" - ");
-        out(role_name(dev.role, dev.class));
+        if dev.role & 0x40 != 0 {
+            out(if dev.product_id == 3 { b"Linux Foundation 3.0 root hub" } else { b"Linux Foundation 2.0 root hub" });
+        } else {
+            out(role_name(dev.role, dev.class));
+        }
         out(b"\n");
     }
     0

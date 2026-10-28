@@ -112,3 +112,70 @@ pub fn epoch_secs() -> Option<u64> {
         Some(days as u64 * 86_400 + hour * 3_600 + min * 60 + sec)
     }
 }
+
+// ---- Alarm (lane s3sysfs). Only CMOS registers 0x01/0x03/0x05 (alarm
+// sec/min/hour) and the AIE bit of 0x0B are ever written; never 0x0E..0x7F
+// or bank 1 (HP's checksummed NVRAM).
+const REG_ALRM_SEC: u8 = 0x01;
+const REG_ALRM_MIN: u8 = 0x03;
+const REG_ALRM_HOUR: u8 = 0x05;
+const REG_STATUS_C: u8 = 0x0C;
+const AIE: u8 = 0x20;
+
+unsafe fn cmos_write(reg: u8, v: u8) {
+    outb(CMOS_ADDR, reg & 0x7f);
+    outb(CMOS_DATA, v);
+}
+
+unsafe fn wait_uip() -> bool {
+    let mut spins = 0u32;
+    while cmos_read(REG_STATUS_A) & 0x80 != 0 {
+        spins += 1;
+        if spins > 1_000_000 { return false; }
+    }
+    true
+}
+
+/// Arm the alarm for the time-of-day of `target` (Unix seconds, must be
+/// 1..=86399 s after the current CMOS time). Returns the hardware register
+/// snapshot `(sec, min, hour, status_b)` after programming, or a negative errno.
+pub fn set_alarm(target: u64) -> Result<(u8, u8, u8, u8), i32> {
+    let now = epoch_secs().ok_or(-19)?;
+    if target <= now || target - now >= 86_400 { return Err(-22); }
+    unsafe {
+        if !wait_uip() { return Err(-16); }
+        let b = cmos_read(REG_STATUS_B);
+        let binary = b & 0x04 != 0;
+        let h24 = b & 0x02 != 0;
+        let enc = |v: u8| if binary { v } else { ((v / 10) << 4) | (v % 10) };
+        let tod = target % 86_400;
+        let (h, m, s) = ((tod / 3600) as u8, ((tod / 60) % 60) as u8, (tod % 60) as u8);
+        let hreg = if h24 { enc(h) } else {
+            let pm = h >= 12;
+            let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+            enc(h12) | if pm { 0x80 } else { 0 }
+        };
+        // Disable while rewriting, clear a stale AF (reading 0x0C), then arm.
+        cmos_write(REG_STATUS_B, b & !AIE);
+        cmos_write(REG_ALRM_SEC, enc(s));
+        cmos_write(REG_ALRM_MIN, enc(m));
+        cmos_write(REG_ALRM_HOUR, hreg);
+        let _ = cmos_read(REG_STATUS_C);
+        cmos_write(REG_STATUS_B, b | AIE);
+        Ok((cmos_read(REG_ALRM_SEC), cmos_read(REG_ALRM_MIN), cmos_read(REG_ALRM_HOUR), cmos_read(REG_STATUS_B)))
+    }
+}
+
+/// Disarm: clear AIE and the pending flag.
+pub fn clear_alarm() {
+    unsafe {
+        let b = cmos_read(REG_STATUS_B);
+        cmos_write(REG_STATUS_B, b & !AIE);
+        let _ = cmos_read(REG_STATUS_C);
+    }
+}
+
+/// `(sec, min, hour, status_b)` raw alarm registers, for diagnostics.
+pub fn alarm_regs() -> (u8, u8, u8, u8) {
+    unsafe { (cmos_read(REG_ALRM_SEC), cmos_read(REG_ALRM_MIN), cmos_read(REG_ALRM_HOUR), cmos_read(REG_STATUS_B)) }
+}

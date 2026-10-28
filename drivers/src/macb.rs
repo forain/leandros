@@ -114,6 +114,15 @@ fn kexec_shutdown() -> bool {
     RUNNING.store(false, Ordering::SeqCst);
     IRQ_ACTIVE.store(false, Ordering::SeqCst);
     let mut m = Mmio(base);
+    // Exclude `ncr_set` read-modify-writes. Bound the wait: a CPU holding
+    // the lock is either parked or about to see RUNNING=false.
+    let mut n = 0u32;
+    let _g = loop {
+        if let Some(g) = NCR_LOCK.try_lock() { break Some(g); }
+        n += 1;
+        if n > 2_000_000 { break None; }
+        core::hint::spin_loop();
+    };
     let _ = hw::quiesce(&mut m, QUEUES.load(Ordering::Relaxed));
     m.r32(hw::NCR) & (hw::NCR_TE | hw::NCR_RE) == 0
 }
