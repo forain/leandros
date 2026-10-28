@@ -94,6 +94,8 @@ SUITES = {
                 "/bin/epolltest churn 20",
                 # + a non-leader thread forking in a loop (lane tforkhang).
                 "/bin/epolltest churn 20 tfork",
+                # 5000 spawn/join + 2500 detached threads: VMAs/VmSize/RSS stay flat (lane threadleak).
+                "/bin/pthreadtest churn 5000",
                 # kmscube on the v3d UAPI stub (lane kmscube2, openbugs L11.8):
                 # sync-file fence export + ADDFB2 of a v3d BO. The override is
                 # needed only in QEMU, where Mesa names the driver from the

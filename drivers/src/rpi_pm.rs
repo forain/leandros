@@ -65,6 +65,10 @@ pub fn wdt_kick_try(secs: u32) -> bool {
 }
 /// Re-arm without the lock (kexec hand-off: every other CPU is stopped).
 pub fn wdt_kick_nolock(secs: u32) -> bool { with_nolock(|r| pm::arm(r, pm::secs_to_ticks(secs))).is_some() }
+/// Stop the watchdog without the lock (panic path, `panic.reset=0`).
+pub fn wdt_stop_nolock() { let _ = with_nolock(|r| pm::disarm(r)); }
+/// Remaining watchdog ticks (PM_WDOG counter, 1/65536 s units), lock-free.
+pub fn wdt_ticks_nolock() -> Option<u32> { with_nolock(|r| r.r(pm::WDOG) & pm::WDOG_TIME_SET) }
 /// True if the watchdog is armed (RSTC WRCFG = full reset), lock-free.
 pub fn wdt_running_nolock() -> bool { with_nolock(|r| pm::is_running(r)).unwrap_or(false) }
 

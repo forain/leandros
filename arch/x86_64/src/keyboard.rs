@@ -345,6 +345,9 @@ fn handle_scancode(scancode: u8) {
         match code {
             0x1C => 96,  // KEY_KPENTER
             0x1D => 97,  // KEY_RIGHTCTRL
+            0x20 => 113, // KEY_MUTE
+            0x2E => 114, // KEY_VOLUMEDOWN
+            0x30 => 115, // KEY_VOLUMEUP
             0x35 => 98,  // KEY_KPSLASH
             0x38 => 100, // KEY_RIGHTALT
             0x47 => 102, // KEY_HOME
@@ -442,4 +445,56 @@ fn handle_scancode(scancode: u8) {
         // latency either. No-op unless the burst mode is compiled in.
         evdev_server::flush_pending_wake();
     }
+}
+
+/// Saved controller configuration byte across a system-sleep cycle.
+static PM_CTR: AtomicU32 = AtomicU32::new(0);
+
+/// System-sleep suspend hook (kernel pm): disable the keyboard and AUX ports
+/// so no byte arrives while the devices are quiesced; the devices themselves
+/// keep their state (no reset), as on a Linux freeze. The polled reads run
+/// with `AUX_BUSY` set so the IRQ handler leaves the output buffer alone.
+/// Ok(None): no controller; Ok(Some(ctr)): ports disabled.
+pub fn pm_suspend() -> Result<Option<u8>, &'static str> {
+    if !present() { return Ok(None); }
+    AUX_BUSY.store(true, Ordering::SeqCst);
+    let r = unsafe {
+        if !command(0xAD) { Err("timeout disabling the keyboard port") } else {
+            for _ in 0..32 { if inb(STATUS) & 1 == 0 { break; } let _ = inb(DATA); }
+            let mut ctr = None;
+            if command(0x20) {
+                for _ in 0..4 {
+                    match wait_read() {
+                        // A late AUX byte (status bit 5) is not the answer.
+                        Some(b) => { if inb(STATUS) & 0x20 == 0 || ctr.is_none() { ctr = Some(b); break; } }
+                        None => break,
+                    }
+                }
+            }
+            match ctr {
+                None => { let _ = command(0xAE); Err("no answer to READ CTR") }
+                Some(c) => {
+                    PM_CTR.store(c as u32 | 0x100, Ordering::SeqCst);
+                    if !command(0xA7) { let _ = command(0xAE); Err("timeout disabling the AUX port") } else {
+                        for _ in 0..32 { if inb(STATUS) & 1 == 0 { break; } let _ = inb(DATA); }
+                        Ok(c)
+                    }
+                }
+            }
+        }
+    };
+    AUX_BUSY.store(false, Ordering::SeqCst);
+    r.map(Some)
+}
+
+/// System-sleep resume hook: re-enable the keyboard port, and the AUX port
+/// when the saved configuration byte had its clock enabled (bit 5 clear).
+/// Ok(None): nothing saved; Ok(Some(aux)): ports enabled (AUX too when `aux`).
+pub fn pm_resume() -> Result<Option<bool>, &'static str> {
+    let saved = PM_CTR.swap(0, Ordering::SeqCst);
+    if saved & 0x100 == 0 { return Ok(None); }
+    let aux = saved & 0x20 == 0;
+    let ok = unsafe { command(0xAE) && (!aux || command(0xA8)) };
+    if !ok { return Err("timeout re-enabling the ports"); }
+    Ok(Some(aux))
 }

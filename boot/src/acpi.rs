@@ -180,10 +180,22 @@ pub struct AcpiPower {
     /// revision 2): bit 0 LEGACY_DEVICES, bit 1 8042 present, ...
     pub fadt_revision: u8,
     pub iapc_boot_arch: u16,
+    /// Sleep-state facts for suspend (kernel pm): FADT LOW_POWER_S0_IDLE_CAPABLE
+    /// (flags bit 21: the firmware prefers s2idle over S3), the DSDT's `\_S3_`
+    /// SLP_TYP pair, the FACS address (firmware waking vector), and whether
+    /// the DSDT names `_PTS` / `_WAK` methods (they need an AML interpreter).
+    pub low_power_s0: bool,
+    pub s3_found: bool,
+    pub s3_typ_a: u8,
+    pub s3_typ_b: u8,
+    pub facs: u64,
+    pub has_pts: bool,
+    pub has_wak: bool,
 }
 
 const FADT_FLAG_RESET_REG_SUP: u32 = 1 << 10;
 const FADT_FLAG_HW_REDUCED:    u32 = 1 << 20;
+const FADT_FLAG_LOW_POWER_S0:  u32 = 1 << 21;
 const GAS_SYSTEM_IO: u8 = 1;
 
 #[inline]
@@ -193,7 +205,7 @@ unsafe fn read_u16(p: *const u8) -> u16 {
 
 /// Find a table by signature in the XSDT (or the RSDT for revision-0 RSDPs).
 /// Returns its *virtual* address.
-unsafe fn find_table(rsdp_phys: u64, hhdm_offset: u64, sig: &[u8; 4]) -> Option<*const u8> {
+pub unsafe fn find_table(rsdp_phys: u64, hhdm_offset: u64, sig: &[u8; 4]) -> Option<*const u8> {
     if rsdp_phys == 0 { return None; }
     let rsdp = (rsdp_phys + hhdm_offset) as *const u8;
     if core::slice::from_raw_parts(rsdp, 8) != RSDP_SIG { return None; }
@@ -230,6 +242,9 @@ pub unsafe fn find_power_info(rsdp_phys: u64, hhdm_offset: u64) -> Option<AcpiPo
     let mut p = AcpiPower::default();
     let flags = read_u32(fadt.add(112));
     p.hw_reduced = flags & FADT_FLAG_HW_REDUCED != 0;
+    p.low_power_s0 = flags & FADT_FLAG_LOW_POWER_S0 != 0;
+    p.facs = read_u32(fadt.add(36)) as u64;
+    if len >= 140 && read_u64(fadt.add(132)) != 0 { p.facs = read_u64(fadt.add(132)); }
     p.smi_cmd = read_u32(fadt.add(48)) as u16;
     p.acpi_enable = *fadt.add(52);
     p.pm1a_cnt = read_u32(fadt.add(64)) as u16;
@@ -266,6 +281,13 @@ pub unsafe fn find_power_info(rsdp_phys: u64, hhdm_offset: u64) -> Option<AcpiPo
                     p.slp_typ_b = b;
                     p.s5_found = true;
                 }
+                if let Some((a, b)) = find_sx(aml, b"_S3_") {
+                    p.s3_typ_a = a;
+                    p.s3_typ_b = b;
+                    p.s3_found = true;
+                }
+                p.has_pts = aml.windows(4).any(|w| w == b"_PTS");
+                p.has_wak = aml.windows(4).any(|w| w == b"_WAK");
             }
         }
     }
@@ -314,10 +336,13 @@ pub unsafe fn for_each_aml_table(rsdp_phys: u64, hhdm_offset: u64, f: &mut dyn F
 /// Locate `Name(_S5_, Package(){SLP_TYPa, SLP_TYPb, ...})` in raw AML — the
 /// standard minimal-OS shortcut that avoids a full AML interpreter. QEMU's
 /// DSDT encodes it as `08 5F 53 35 5F 12 06 04 00 00 00 00`.
-fn find_s5(aml: &[u8]) -> Option<(u8, u8)> {
+fn find_s5(aml: &[u8]) -> Option<(u8, u8)> { find_sx(aml, b"_S5_") }
+
+/// `find_s5` for any `\_Sx_` package name.
+fn find_sx(aml: &[u8], name: &[u8; 4]) -> Option<(u8, u8)> {
     let mut i = 36;
     while i + 4 < aml.len() {
-        if &aml[i..i + 4] == b"_S5_" {
+        if &aml[i..i + 4] == name {
             // Preceded by NameOp (0x08), optionally with a root prefix '\'.
             let named = (i >= 1 && aml[i - 1] == 0x08)
                 || (i >= 2 && aml[i - 1] == b'\\' && aml[i - 2] == 0x08);
@@ -438,4 +463,49 @@ pub unsafe fn for_each_madt_cpu(rsdp_phys: u64, hhdm_offset: u64, f: &mut dyn Fn
         off += elen;
     }
     true
+}
+
+/// Call `f(signature, virtual address, length)` for every table the XSDT
+/// (or RSDT) lists, plus the DSDT the FADT points at (it is not in the
+/// root table). Read-only; used by the device inventory (lane lapinv).
+///
+/// # Safety
+/// The ACPI tables must be readable through the HHDM at `hhdm_offset`.
+pub unsafe fn for_each_table(rsdp_phys: u64, hhdm_offset: u64, f: &mut dyn FnMut(&[u8; 4], *const u8, usize)) {
+    if rsdp_phys == 0 { return; }
+    let rsdp = (rsdp_phys + hhdm_offset) as *const u8;
+    if core::slice::from_raw_parts(rsdp, 8) != RSDP_SIG { return; }
+    let revision = *rsdp.add(15);
+    let (root_phys, entry_size, root_sig): (u64, usize, &[u8; 4]) = if revision >= 2 && read_u64(rsdp.add(24)) != 0 {
+        (read_u64(rsdp.add(24)), 8, b"XSDT")
+    } else {
+        (read_u32(rsdp.add(16)) as u64, 4, b"RSDT")
+    };
+    if root_phys == 0 { return; }
+    let root = (root_phys + hhdm_offset) as *const u8;
+    if core::slice::from_raw_parts(root, 4) != root_sig { return; }
+    let len = read_u32(root.add(4)) as usize;
+    if len < 36 || len > 1 << 20 { return; }
+    for i in 0..(len - 36) / entry_size {
+        let e = root.add(36 + i * entry_size);
+        let phys = if entry_size == 8 { read_u64(e) } else { read_u32(e) as u64 };
+        if phys == 0 { continue; }
+        let t = (phys + hhdm_offset) as *const u8;
+        let mut sig = [0u8; 4];
+        sig.copy_from_slice(core::slice::from_raw_parts(t, 4));
+        let tlen = read_u32(t.add(4)) as usize;
+        if tlen < 36 || tlen > 16 << 20 { continue; }
+        f(&sig, t, tlen);
+        if &sig == b"FACP" && tlen >= 44 {
+            let mut dsdt = read_u32(t.add(40)) as u64;
+            if tlen >= 148 && read_u64(t.add(140)) != 0 { dsdt = read_u64(t.add(140)); }
+            if dsdt != 0 {
+                let d = (dsdt + hhdm_offset) as *const u8;
+                let dlen = read_u32(d.add(4)) as usize;
+                if core::slice::from_raw_parts(d, 4) == b"DSDT" && (36..16 << 20).contains(&dlen) {
+                    f(b"DSDT", d, dlen);
+                }
+            }
+        }
+    }
 }

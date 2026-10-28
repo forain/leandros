@@ -15,8 +15,13 @@ pub mod irq;
 /// `request_firmware`: kernel read of a file from the mounted root (lane kfacil).
 pub mod firmware;
 pub mod nvidia_probe;
+/// Laptop device inventory and read-only probes (ACPI ids, PCI BARs, TPM, Thunderbolt, SMBus accelerometer).
+#[cfg(target_arch = "x86_64")]
+pub mod lapinv;
 /// Intel Gen9 graphics: probe, GT bring-up, self-tests (lane i915).
 pub mod i915;
+pub mod acpi_power;
+pub mod power_sysfs;
 pub mod snd;
 /// Intel High Definition Audio controller + codec playback (lane hda).
 pub mod hda;
@@ -59,6 +64,7 @@ pub mod e1000e;
 pub mod e1000e_hw;
 /// Cadence GEM (macb) in the Raspberry Pi 5's RP1, BCM54213PE PHY; inert until the RP1 probe attaches it.
 pub mod macb;
+pub mod dma_shutdown;
 /// Hardware-independent macb pieces (host-tested in drivers/macb-tests).
 pub mod macb_hw;
 /// The NIC behind `eth0`: virtio-net, r8169 or e1000e.
