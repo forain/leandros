@@ -150,7 +150,7 @@ pub mod rpi_pm;
 /// SoC temperature API (`thermal::soc_millicelsius`) and /proc hooks.
 pub mod thermal;
 /// BCM2712 PCIe root complex (pcie2) register math, RC bring-up, and the RP1
-/// south bridge behind it. Opt-in at boot with `pcie.rpi5=1`.
+/// south bridge behind it. On by default; `pcie.rpi5=0` turns it off.
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod brcmstb_hw;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
