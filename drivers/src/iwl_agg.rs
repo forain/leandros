@@ -137,6 +137,42 @@ pub struct AggStats {
     /// Frames whose sequence number did not match the ring index (the
     /// scheduler requirement; should stay 0).
     pub misaligned: u64,
+    /// BA notifications with no A-MPDU TX response before them: the AP's
+    /// answer to our BAR (or a stray BA). They reclaim, but are neither
+    /// partial nor rate-control samples.
+    pub ba_unsolicited: u64,
+    /// BAs whose bitmap shows a frame the firmware finished (below
+    /// scd_ssn) that the AP never received: a hole only a BAR closes.
+    pub ba_holes: u64,
+}
+
+/// One BA notification as kept for /proc/net/nic (newest last).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BaRec {
+    /// The BA's starting sequence number (the AP's window start).
+    pub ba_ssn: u16,
+    pub bitmap: u64,
+    /// The SN of scd_ssn (the first frame the firmware has not finished).
+    pub scd_sn: u16,
+    pub txed: u8,
+    pub done: u8,
+    /// An A-MPDU TX response came before it.
+    pub solicited: bool,
+}
+
+/// The number of BA records kept.
+pub const BA_RECS: usize = 6;
+
+/// A hole the AP waits for: the BA's window starts at `ba_ssn` with
+/// `bitmap` (bit i = SN ba_ssn + i received), and the firmware has
+/// finished every frame before `scd_sn`. A finished frame the bitmap does
+/// not have (or a window start more than 64 behind) never comes again.
+pub fn ba_hole(ba_ssn: u16, bitmap: u64, scd_sn: u16) -> bool {
+    let d = scd_sn.wrapping_sub(ba_ssn) & 0xfff;
+    if d == 0 || d >= 0x800 { return false; }
+    if d >= 64 { return true; }
+    let need = (1u64 << d) - 1;
+    bitmap & need != need
 }
 
 /// The TX aggregation session of TID 0 with the AP.
@@ -152,6 +188,9 @@ pub struct TxAgg {
     /// The BAR on air (SSN, sent at), waiting for its TX status.
     bar_inflight: Option<(u16, u64)>,
     last_bar_ms: Option<u64>,
+    /// An A-MPDU TX response awaits its BA notification.
+    agg_pending: bool,
+    pub recent: [BaRec; BA_RECS],
     bar_fails: u32,
     pub st: AggStats,
 }
@@ -168,7 +207,8 @@ fn sn_before(a: u16, b: u16) -> bool { (a.wrapping_sub(b) & 0xfff) > 0x800 }
 impl TxAgg {
     pub fn new(enabled: bool) -> TxAgg {
         TxAgg { state: AggState::Off, enabled, tries: 0, next_try_ms: 0, next_dialog: 1, bar_want: None, bar_inflight: None,
-                last_bar_ms: None, bar_fails: 0, st: AggStats::default() }
+                last_bar_ms: None, bar_fails: 0, agg_pending: false,
+                recent: [BaRec::default(); BA_RECS], st: AggStats::default() }
     }
 
     /// A new association: no session, tries reset (counters kept).
@@ -264,19 +304,36 @@ impl TxAgg {
         self.st.agg_rsps += 1;
         self.st.agg_frames += frames as u64;
         self.st.agg_max = self.st.agg_max.max(frames);
+        self.agg_pending = true;
     }
 
     /// A BA notification; `next_sn` is the next sequence number to assign.
-    /// A partial BA (or an open hole) asks for a BAR at the SN of scd_ssn.
-    pub fn on_ba(&mut self, n: &BaNotif, next_sn: u16) {
+    /// True when it answers an A-MPDU (an agg TX response came first): only
+    /// then are its sent / acked counts a rate-control sample. The firmware
+    /// also reports the AP's answer to our BAR; counting that one as a
+    /// partial BA asked for the next BAR, a BAR loop at the BAR rate limit.
+    /// A BAR is wanted only for a real hole ([`ba_hole`]): the firmware
+    /// retries unacked frames itself while they stay at or above scd_ssn.
+    pub fn on_ba(&mut self, n: &BaNotif, next_sn: u16) -> bool {
         self.st.ba_notifs += 1;
+        let solicited = core::mem::replace(&mut self.agg_pending, false);
+        let scd_sn = sn_of_index(next_sn, n.scd_ssn);
+        let ba_ssn = n.seq_ctl >> 4;
+        self.recent.copy_within(1.., 0);
+        self.recent[BA_RECS - 1] = BaRec { ba_ssn, bitmap: n.bitmap, scd_sn, txed: n.txed, done: n.txed_2_done, solicited };
+        if !solicited {
+            self.st.ba_unsolicited += 1;
+            return false;
+        }
         self.st.ba_txed += n.txed as u64;
         self.st.ba_acked += n.txed_2_done as u64;
-        let partial = n.txed_2_done < n.txed;
-        if partial { self.st.ba_partial += 1; }
-        if self.on() && (partial || self.bar_want.is_some()) {
-            self.want_bar(sn_of_index(next_sn, n.scd_ssn));
+        if n.txed_2_done < n.txed { self.st.ba_partial += 1; }
+        let hole = ba_hole(ba_ssn, n.bitmap, scd_sn);
+        if hole { self.st.ba_holes += 1; }
+        if self.on() && (hole || self.bar_want.is_some()) {
+            self.want_bar(scd_sn);
         }
+        true
     }
 
     /// A frame of the session failed alone (sequence number `sn`): the AP's
@@ -349,10 +406,12 @@ impl TxAgg {
             AggState::On { buf } => format!("on win{}", buf),
         };
         let avg10 = if s.agg_rsps > 0 { s.agg_frames * 10 / s.agg_rsps } else { 0 };
-        format!("{}; addba {} accepted {} refused {} (last status {}) timeouts {} delba {}; ampdu {} frames {} avg {}.{} max {}; ba {} txed {} acked {}; single_fail {} partial {} bars {} bar_fail {} bar_teardown {} misaligned {}",
+        format!("{}; addba {} accepted {} refused {} (last status {}) timeouts {} delba {}; ampdu {} frames {} avg {}.{} max {}; ba {} txed {} acked {}; single_fail {} partial {} bars {} bar_fail {} bar_teardown {} misaligned {} unsolicited {} holes {}; last {}",
                 state, s.addba_sent, s.accepted, s.refused, s.last_refusal, s.timeouts, s.delba_rx, s.agg_rsps, s.agg_frames,
                 avg10 / 10, avg10 % 10, s.agg_max, s.ba_notifs, s.ba_txed, s.ba_acked, s.single_fail, s.ba_partial, s.bars_sent, s.bars_failed,
-                s.bar_teardowns, s.misaligned)
+                s.bar_teardowns, s.misaligned, s.ba_unsolicited, s.ba_holes,
+                self.recent.iter().filter(|r| r.txed > 0 || r.bitmap != 0).map(|r| format!("{}:{:x}@{}/{}/{}{}", r.ba_ssn, r.bitmap, r.scd_sn,
+                    r.txed, r.done, if r.solicited { "" } else { "u" })).collect::<alloc::vec::Vec<_>>().join(" "))
     }
 }
 
@@ -412,9 +471,11 @@ pub fn sim_bar_hole(lost: u16, hold_ms: u64, bar_acked: bool, run_ms: u64) -> Ho
             rx_got[sn as usize] = true;
         }
         fw_head = (fw_head + n) & 0xfff; // all finished (the lost ones given up)
-        let ba = BaNotif { sta_addr: [0; 6], sta_id: 0, tid: AGG_TID, seq_ctl: 0, bitmap: 0, scd_flow: 0,
+        // The AP's compressed BA: its window start and what it holds.
+        let bitmap = (0..64u16).filter(|&k| rx_got[((rx_head + k) & 0xfff) as usize]).fold(0u64, |m, k| m | 1 << k);
+        let ba = BaNotif { sta_addr: [0; 6], sta_id: 0, tid: AGG_TID, seq_ctl: rx_head << 4, bitmap, scd_flow: 0,
                            scd_ssn: fw_head & 0xff, txed: n as u8, txed_2_done: done, reduced_txp: 0 };
-        if n > 0 { a.on_ba(&ba, next_sn); }
+        if n > 0 { a.on_agg_rsp(n as u8); a.on_ba(&ba, next_sn); }
         if let Some(ssn) = a.next_bar(now) {
             r.bars += 1;
             if bar_acked {

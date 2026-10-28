@@ -93,6 +93,8 @@
 //!   iwlwifi.tx40=0          (40 MHz link) transmit HT at 20 MHz
 //!   iwlwifi.vht=0           no VHT / 80 MHz on 5 GHz (default: VHT 80 MHz
 //!                           where the AP, the NVM and the SKU allow it)
+//!   iwlwifi.vhttx=1         (80 MHz VHT link) transmit VHT MCS 0-9 x 1-2 streams
+//!                           (default off: HT40 rates; untested on a real VHT link)
 //!   iwlwifi.mcast=0         no MCAST_FILTER_CMD (the firmware then drops
 //!                           group-addressed frames); default: pass all
 //!   iwlwifi.smps=static|dynamic
@@ -232,6 +234,8 @@ static LDPC: AtomicBool = AtomicBool::new(true);
 static HT40: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.vht (default on): VHT at 80 MHz on 5 GHz where allowed.
 static VHT: AtomicBool = AtomicBool::new(true);
+/// iwlwifi.vhttx (default off): VHT TX rates on a VHT link.
+static VHTTX: AtomicBool = AtomicBool::new(false);
 /// iwlwifi.txagg (default on): TX A-MPDU on TID 0.
 static TXAGG: AtomicBool = AtomicBool::new(true);
 
@@ -932,13 +936,15 @@ impl Dev {
         if n.sta_id != AP_STA_ID || n.scd_flow as usize != BSS_QUEUE { return; }
         self.t.tx_reclaim(BSS_QUEUE, n.scd_ssn as usize);
         let next_sn = self.link.as_ref().map_or(0, |l| l.seq);
-        self.tagg.on_ba(n, next_sn);
-        self.txs.ok += n.txed_2_done as u64;
-        self.txs.rate_ok[rs::rate_bucket(self.agg_rate)] += n.txed_2_done as u64;
+        let ampdu = self.tagg.on_ba(n, next_sn);
+        if ampdu {
+            self.txs.ok += n.txed_2_done as u64;
+            self.txs.rate_ok[rs::rate_bucket(self.agg_rate)] += n.txed_2_done as u64;
+        }
         self.txq_drained();
         let now = now_ms();
         self.poll_bar(now);
-        if self.link.as_ref().map_or(false, |l| l.lq) {
+        if ampdu && self.link.as_ref().map_or(false, |l| l.lq) {
             let rate = self.agg_rate;
             if let Some(c) = self.rc.as_mut() { c.on_ampdu(rate, n.txed, n.txed_2_done, now); }
             self.send_lq_if_due(now);
@@ -1280,6 +1286,9 @@ impl Dev {
     }
 }
 
+/// The association runs VHT 80 MHz.
+fn h_vht(htl: &Option<HtLink>) -> bool { htl.as_ref().map_or(false, |h| h.vht80.is_some()) }
+
 fn with_dev<R>(f: impl FnOnce(&mut Dev) -> R) -> Option<R> {
     let mut g = DEV.lock();
     WITH_DEV_HELD.store(true, Ordering::SeqCst);
@@ -1348,6 +1357,7 @@ pub fn init(cmdline: &str) {
     TXAGG.store(cmdline_val(cmdline, "iwlwifi.txagg") != Some("0"), Ordering::Relaxed);
     HT40.store(cmdline_val(cmdline, "iwlwifi.ht40") != Some("0"), Ordering::Relaxed);
     VHT.store(cmdline_val(cmdline, "iwlwifi.vht") != Some("0"), Ordering::Relaxed);
+    VHTTX.store(cmdline_val(cmdline, "iwlwifi.vhttx") == Some("1"), Ordering::Relaxed);
     ilog!("QoS/HT: {}; RX Block Ack {}; TX MCS {}, short GI {}, MIMO {}, STBC {}, LDPC {}; SM PS {}, LDPC {}",
           match HT_MODE.load(Ordering::Relaxed) { HT_LEGACY => "legacy only (iwlwifi.ht=0)", HT_WMM => "WMM only (iwlwifi.ht=wmm)", _ => "WMM + HT 20 MHz" },
           if BA_ON.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.ba=0)" },
@@ -2639,8 +2649,23 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
                 stbc: TXSTBC.load(Ordering::Relaxed) && cap.rx_stbc() && hw.tx_ant & asc::ANT_AB == asc::ANT_AB
                       && (txant == 0 || txant == asc::ANT_AB),
                 ldpc: TXLDPC.load(Ordering::Relaxed) && cap.ldpc(),
+                vht: None,
             }),
             _ => None,
+        };
+        // VHT TX rates: only when the link really runs VHT 80 MHz.
+        let ht_rates = match (ht_rates, h_vht(&htl), rht.vht_cap) {
+            (Some(mut r), true, Some(vc)) if VHTTX.load(Ordering::Relaxed) && TX40.load(Ordering::Relaxed) => {
+                if let Some(m1) = ht::vht_map_max_mcs(vc.rx_mcs, 1) {
+                    r.vht = Some(rs::VhtRates {
+                        width: 80, max_mcs_1ss: m1,
+                        max_mcs_2ss: if r.mimo { ht::vht_map_max_mcs(vc.rx_mcs, 2) } else { None },
+                        sgi80: TXSGI.load(Ordering::Relaxed) && vc.sgi80(),
+                    });
+                }
+                Some(r)
+            }
+            (r, _, _) => r,
         };
         if let Some(h) = htl.as_mut() { h.ht_rates = ht_rates.is_some(); }
         let cfg = rs::RateCfg { ap_rates: ap_rates.clone(), max_r500k: maxrate, valid_ant: hw.tx_ant,
@@ -2651,7 +2676,11 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
             // single antenna, and 5 GHz (on 2.4 GHz BT coex shares a chain).
             let mimo = h.ap_streams >= 2 && h.ap_sm_ps != ht::SM_PS_STATIC && hw.tx_ant & asc::ANT_AB == asc::ANT_AB
                 && (txant == 0 || txant == asc::ANT_AB) && !band_24;
-            c.enable_col_search(if h.ht40.is_some() && TX40.load(Ordering::Relaxed) { cap.sgi40() } else { cap.sgi20() }, mimo);
+            let sgi_col = match ht_rates.and_then(|r| r.vht) {
+                Some(v) => v.sgi80,
+                None => if h.ht40.is_some() && TX40.load(Ordering::Relaxed) { cap.sgi40() } else { cap.sgi20() },
+            };
+            c.enable_col_search(sgi_col, mimo);
             ilog!("rate control: columns {}", c.cols.iter().map(|k| k.label()).collect::<Vec<_>>().join("/"));
         }
         send(cmd::LQ_CMD, None, &c.lq(AP_STA_ID))?;
@@ -3284,7 +3313,7 @@ impl wm::Radio for IwlRadio {
     fn tx_rate_kbps(&mut self) -> u32 {
         with_dev(|d| d.rc.as_ref().map(|c| {
             let id = c.rates[c.cur];
-            rs::nominal_r500k(id) * 500 * if id & rs::HT_SGI != 0 { 10 } else { 9 } / 9
+            rs::nominal_r500k(id) * 500 * if id & rs::HT_SGI != 0 && !rs::is_vht(id) { 10 } else { 9 } / 9
         })).flatten().unwrap_or(0)
     }
 }
