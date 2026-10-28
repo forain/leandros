@@ -63,6 +63,7 @@ extern "C" {
 
     pub fn pthread_join(thread: pthread_t, retval: *mut *mut c_void) -> i32;
     pub fn pthread_detach(thread: pthread_t) -> i32;
+    pub fn pthread_cancel(thread: pthread_t) -> i32;
 
     pub fn pthread_mutex_init(mutex: *mut pthread_mutex_t, attr: *const c_void) -> i32;
     pub fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> i32;
