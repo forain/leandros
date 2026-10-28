@@ -95,6 +95,8 @@ pub mod wifi_frame;
 /// and wifi_sim (host-tested in drivers/iwlwifi-tests).
 pub mod wifi_ht;
 pub mod wifi_crypto;
+/// Wrong-passphrase block policy of the manager (host-tested in drivers/brcmf-tests).
+pub mod wifi_wrongkey;
 /// The control seam between /dev/netctl and Wi-Fi backends (types only so far).
 pub mod wifi_api;
 /// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).
