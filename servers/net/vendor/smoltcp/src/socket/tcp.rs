@@ -6,13 +6,118 @@ use core::fmt::Display;
 #[cfg(feature = "async")]
 use core::task::Waker;
 use core::{cmp, fmt, mem};
-use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 
 /// LEANDROS: loss-recovery counters over all sockets (for /proc/net/nic):
 /// fast retransmits, RTO retransmits (go-back-N), NewReno partial-ACK
 /// retransmits, duplicate ACKs received.
 pub static RECOVERY_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 fn stat(i: usize) { RECOVERY_STATS[i].fetch_add(1, AtomicOrdering::Relaxed); }
+/// LEANDROS: congestion-control knobs, set once by netd from the kernel
+/// command line: `tcp.cc=none|reno|cubic` (0/1/2, default 2), `tcp.iw` (segments),
+/// `tcp.rto_min_ms`.
+pub static CC_MODE: AtomicU8 = AtomicU8::new(2);
+pub static CC_IW: AtomicU32 = AtomicU32::new(10);
+pub static RTO_MIN_MS: AtomicU32 = AtomicU32::new(200);
+
+/// LEANDROS: sender congestion state (Reno / CUBIC). `cwnd == 0` means not
+/// yet initialised (set lazily to IW * MSS). Mode `none` never limits.
+#[derive(Debug, Clone, Copy, Default)]
+struct Cc {
+    cwnd: usize,
+    ssthresh: usize,
+    acked: usize,
+    w_max: usize,
+    epoch: Option<Instant>,
+}
+
+fn cbrt(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0; }
+    let mut g = if x > 1.0 { x / 3.0 } else { 1.0 };
+    for _ in 0..40 { g = (2.0 * g + x / (g * g)) / 3.0; }
+    g
+}
+
+impl Cc {
+    fn mode() -> u8 { CC_MODE.load(AtomicOrdering::Relaxed) }
+    fn init(&mut self, mss: usize) {
+        if self.cwnd == 0 {
+            self.cwnd = (CC_IW.load(AtomicOrdering::Relaxed).max(1) as usize) * mss;
+            self.ssthresh = usize::MAX / 2;
+        }
+    }
+    fn window(&self, mss: usize) -> usize {
+        if Self::mode() == 0 { return usize::MAX; }
+        if self.cwnd == 0 { (CC_IW.load(AtomicOrdering::Relaxed).max(1) as usize) * mss } else { self.cwnd }
+    }
+    fn on_ack(&mut self, mode: u8, now: Instant, len: usize, mss: usize, rtt_ms: u32, recovering: bool) {
+        if mode == 0 || recovering { return; }
+        self.init(mss);
+        if self.cwnd < self.ssthresh {
+            self.cwnd += len.min(mss);
+            return;
+        }
+        if mode == 1 {
+            self.acked += len;
+            if self.acked >= self.cwnd { self.acked -= self.cwnd; self.cwnd += mss; }
+            return;
+        }
+        // CUBIC (RFC 8312): W(t) = C (t-K)^3 + W_max, C = 0.4, beta = 0.7.
+        let epoch = match self.epoch { Some(e) => e, None => { self.epoch = Some(now); now } };
+        if self.w_max < self.cwnd { self.w_max = self.cwnd; }
+        let wmax = self.w_max as f64 / mss as f64;
+        let k = cbrt(wmax * 0.3 / 0.4);
+        let t = (now - epoch).total_micros() as f64 / 1e6 + rtt_ms as f64 / 1e3;
+        let d = t - k;
+        let target = ((0.4 * d * d * d + wmax) * mss as f64).max(0.0) as usize;
+        if target > self.cwnd {
+            let inc = ((target - self.cwnd) as u64 * len as u64 / self.cwnd as u64) as usize;
+            self.cwnd += inc.min(len);
+        } else {
+            self.acked += len;
+            if self.acked >= 100 * self.cwnd { self.acked = 0; self.cwnd += mss; }
+        }
+    }
+    fn on_dup3(&mut self, mode: u8, flight: usize, mss: usize) {
+        if mode == 0 { return; }
+        self.init(mss);
+        self.epoch = None;
+        self.acked = 0;
+        if mode == 1 {
+            self.ssthresh = (flight / 2).max(2 * mss);
+        } else {
+            self.w_max = self.cwnd;
+            self.ssthresh = (self.cwnd * 7 / 10).max(2 * mss);
+        }
+        self.cwnd = self.ssthresh;
+    }
+    fn on_rto(&mut self, mode: u8, flight: usize, mss: usize) {
+        if mode == 0 { return; }
+        self.init(mss);
+        self.epoch = None;
+        self.acked = 0;
+        self.w_max = self.cwnd;
+        self.ssthresh = (if mode == 1 { flight / 2 } else { self.cwnd * 7 / 10 }).max(2 * mss);
+        self.cwnd = mss;
+    }
+}
+
+/// LEANDROS: per-socket sender counters (for /proc/net/tcpsnd).
+#[derive(Debug, Clone, Copy, Default)]
+struct SndCtr { sent: u32, rtx: u32, acks: u32, dupacks: u32, rto: u32, fast: u32, partial: u32, bytes_acked: u64 }
+
+/// LEANDROS: a point-in-time view of the sender for /proc/net/tcpsnd.
+#[derive(Debug, Clone, Copy)]
+pub struct SenderSnapshot {
+    pub snd_una: u32, pub snd_nxt: u32, pub snd_wnd: u32, pub wscale: i8,
+    pub mss: u16, pub tx_queued: u32, pub nagle: bool,
+    pub timer: u8, pub timer_in_ms: i32, pub timer_delay_ms: u32,
+    pub srtt_ms: u32, pub rttvar_ms: u32, pub rto_ms: u32, pub rto_count: u8,
+    pub dup_acks: u8, pub recover: i64, pub cwnd: u32, pub ssthresh: u32,
+    pub sent: u32, pub rtx: u32, pub acks: u32, pub dupacks: u32, pub rto_fired: u32,
+    pub fast: u32, pub partial: u32, pub bytes_acked: u64,
+}
+
 /// LEANDROS: receive-side counters: in-order data segments, out-of-order
 /// segments kept, segments dropped for too many holes, data segments outside
 /// the window (already received: retransmissions).
@@ -212,7 +317,6 @@ const RTTE_MIN_MARGIN: u32 = 5;
 // LEANDROS: 200 ms like Linux's TCP_RTO_MIN (was 10 ms). Over Wi-Fi the RTT
 // swings by 100+ ms and peers delay ACKs; a 10-30 ms RTO fired spuriously and
 // every spurious RTO resends the whole window (go-back-N).
-const RTTE_MIN_RTO: u32 = 200;
 const RTTE_MAX_RTO: u32 = 10000;
 
 #[derive(Debug, Clone, Copy)]
@@ -241,7 +345,7 @@ impl Default for RttEstimator {
 impl RttEstimator {
     fn retransmission_timeout(&self) -> Duration {
         let margin = RTTE_MIN_MARGIN.max(self.deviation * 4);
-        let ms = (self.rtt + margin).clamp(RTTE_MIN_RTO, RTTE_MAX_RTO);
+        let ms = (self.rtt + margin).clamp(RTO_MIN_MS.load(AtomicOrdering::Relaxed).max(1), RTTE_MAX_RTO);
         Duration::from_millis(ms as u64)
     }
 
@@ -468,6 +572,8 @@ pub struct Socket<'a> {
     state: State,
     timer: Timer,
     rtte: RttEstimator,
+    cc: Cc,
+    ctr: SndCtr,
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
     rx_fin_received: bool,
@@ -581,6 +687,8 @@ impl<'a> Socket<'a> {
             state: State::Closed,
             timer: Timer::new(),
             rtte: RttEstimator::default(),
+            cc: Cc::default(),
+            ctr: SndCtr::default(),
             assembler: Assembler::new(),
             tx_buffer,
             rx_buffer,
@@ -937,6 +1045,8 @@ impl<'a> Socket<'a> {
         self.state = State::Closed;
         self.timer = Timer::new();
         self.rtte = RttEstimator::default();
+        self.cc = Cc::default();
+        self.ctr = SndCtr::default();
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
         self.rx_buffer.clear();
@@ -1420,6 +1530,35 @@ impl<'a> Socket<'a> {
     /// Return the amount of octets queued in the transmit buffer.
     ///
     /// Note that the Berkeley sockets interface does not have an equivalent of this API.
+    fn cc_flight(&self) -> usize {
+        if self.remote_last_seq >= self.local_seq_no { self.remote_last_seq - self.local_seq_no } else { 0 }
+    }
+
+    /// LEANDROS: sender state for /proc/net/tcpsnd.
+    pub fn sender_snapshot(&self, now: Instant) -> SenderSnapshot {
+        let (timer, tin, tdelay) = match self.timer {
+            Timer::Idle { .. } => (0u8, 0i32, 0u32),
+            Timer::Retransmit { expires_at, delay } =>
+                (1, (expires_at - now).total_millis() as i32, delay.total_millis() as u32),
+            Timer::FastRetransmit => (2, 0, 0),
+            Timer::Close { .. } => (3, 0, 0),
+        };
+        SenderSnapshot {
+            snd_una: self.local_seq_no.0 as u32, snd_nxt: self.remote_last_seq.0 as u32,
+            snd_wnd: self.remote_win_len as u32, wscale: self.remote_win_scale.map(|s| s as i8).unwrap_or(-1),
+            mss: self.remote_mss as u16, tx_queued: self.tx_buffer.len() as u32, nagle: self.nagle,
+            timer, timer_in_ms: tin, timer_delay_ms: tdelay,
+            srtt_ms: self.rtte.rtt, rttvar_ms: self.rtte.deviation,
+            rto_ms: self.rtte.retransmission_timeout().total_millis() as u32, rto_count: self.rtte.rto_count,
+            dup_acks: self.local_rx_dup_acks,
+            recover: self.recover_seq.map(|r| if r >= self.local_seq_no { (r - self.local_seq_no) as i64 } else { 0 }).unwrap_or(-1),
+            cwnd: if Cc::mode() == 0 { 0 } else { self.cc.window(self.remote_mss).min(u32::MAX as usize) as u32 },
+            ssthresh: if Cc::mode() == 0 { 0 } else { self.cc.ssthresh.min(u32::MAX as usize) as u32 },
+            sent: self.ctr.sent, rtx: self.ctr.rtx, acks: self.ctr.acks, dupacks: self.ctr.dupacks,
+            rto_fired: self.ctr.rto, fast: self.ctr.fast, partial: self.ctr.partial, bytes_acked: self.ctr.bytes_acked,
+        }
+    }
+
     pub fn send_queue(&self) -> usize {
         self.tx_buffer.len()
     }
@@ -2101,6 +2240,7 @@ impl<'a> Socket<'a> {
                         && !is_window_update =>
                 {
                     stat(3);
+                    self.ctr.dupacks += 1;
                     // Increment duplicate ACK count
                     self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
 
@@ -2116,6 +2256,11 @@ impl<'a> Socket<'a> {
                     );
 
                     if self.local_rx_dup_acks == 3 {
+                        if self.recover_seq.is_none() {
+                            let flight = self.cc_flight();
+                            self.cc.on_dup3(Cc::mode(), flight, self.remote_mss);
+                        }
+                        self.ctr.fast += 1;
                         self.timer.set_for_fast_retransmit();
                         net_debug!("started fast retransmit");
                     }
@@ -2143,7 +2288,11 @@ impl<'a> Socket<'a> {
             // (RFC 6298 5.3). Upstream 0.11 kept the timer armed at the first
             // send, so a long transfer over a queued link hit the RTO while
             // ACKs were still arriving, and each RTO resent the whole window.
+            self.ctr.acks += 1;
             if ack_len > 0 {
+                self.ctr.bytes_acked += ack_len as u64;
+                let rec = matches!(self.recover_seq, Some(r) if ack_number < r);
+                self.cc.on_ack(Cc::mode(), cx.now(), ack_len, self.remote_mss, self.rtte.rtt, rec);
                 if let Timer::Retransmit { .. } = self.timer {
                     let rto = self.rtte.retransmission_timeout();
                     self.timer = Timer::Retransmit { expires_at: cx.now() + rto, delay: rto };
@@ -2154,6 +2303,7 @@ impl<'a> Socket<'a> {
                 match self.recover_seq {
                     Some(recover) if ack_number < recover => {
                         stat(2);
+                        self.ctr.partial += 1;
                         self.timer.set_for_fast_retransmit();
                     }
                     Some(_) => self.recover_seq = None,
@@ -2295,8 +2445,9 @@ impl<'a> Socket<'a> {
         }
 
         // max sequence number we can send.
+        let win = core::cmp::min(self.remote_win_len, self.cc.window(self.remote_mss));
         let max_send_seq =
-            self.local_seq_no + core::cmp::min(self.remote_win_len, self.tx_buffer.len());
+            self.local_seq_no + core::cmp::min(win, self.tx_buffer.len());
 
         // Max amount of octets we can send.
         let max_send = if max_send_seq >= self.remote_last_seq {
@@ -2413,6 +2564,9 @@ impl<'a> Socket<'a> {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
                 net_debug!("retransmitting at t+{}", retransmit_delta);
                 stat(1);
+                self.ctr.rto += 1;
+                let flight = self.cc_flight();
+                self.cc.on_rto(Cc::mode(), flight, self.remote_mss);
 
                 // Rewind "last sequence number sent", as if we never
                 // had sent them. This will cause all data in the queue
@@ -2529,7 +2683,8 @@ impl<'a> Socket<'a> {
                 // from the transmit buffer.
 
                 // Right edge of window, ie the max sequence number we're allowed to send.
-                let win_right_edge = self.local_seq_no + self.remote_win_len;
+                let win_right_edge = self.local_seq_no
+                    + core::cmp::min(self.remote_win_len, self.cc.window(self.remote_mss));
 
                 // Max amount of octets we're allowed to send according to the remote window.
                 let win_limit = if win_right_edge >= self.remote_last_seq {
@@ -2666,6 +2821,7 @@ impl<'a> Socket<'a> {
         if let Some(resume) = resume_seq {
             // The hole is out; carry on after what was already in flight.
             stat(0);
+            self.ctr.rtx += 1;
             // Entering recovery records how far it reaches; a retransmit
             // inside it (partial ACK) must not move that point, or recovery
             // never ends while new data keeps going out.
@@ -2684,6 +2840,7 @@ impl<'a> Socket<'a> {
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
 
+        if !repr.payload.is_empty() { self.ctr.sent += 1; }
         if repr.segment_len() > 0 {
             self.rtte
                 .on_send(cx.now(), repr.seq_number + repr.segment_len());
@@ -7953,6 +8110,40 @@ mod test {
         let s = socket_established_with_buffer_sizes(64, 2 << 20);
         assert_eq!(s.rx_window(), 2 << 20);
         assert_eq!(s.rx_autotune_clamp(), None);
+    }
+
+    #[test]
+    fn test_cc_reno_growth_and_loss() {
+        let mut c = Cc::default();
+        let (mss, now) = (1000, Instant::from_millis(0));
+        c.on_ack(1, now, 1000, mss, 10, false);
+        assert_eq!(c.cwnd, 11_000, "IW 10 then slow start +1 MSS");
+        c.on_dup3(1, 8000, mss);
+        assert_eq!((c.ssthresh, c.cwnd), (4000, 4000), "halve flight on 3 dupacks");
+        for _ in 0..4 { c.on_ack(1, now, 1000, mss, 10, false); }
+        assert_eq!(c.cwnd, 5000, "congestion avoidance +1 MSS per cwnd acked");
+        c.on_ack(1, now, 1000, mss, 10, true);
+        assert_eq!(c.cwnd, 5000, "no growth in recovery");
+        c.on_rto(1, 5000, mss);
+        assert_eq!((c.cwnd, c.ssthresh), (1000, 2500), "1 MSS after RTO");
+    }
+
+    #[test]
+    fn test_cc_none_never_limits() {
+        let c = Cc::default();
+        assert_eq!(c.window(1000), usize::MAX);
+    }
+
+    #[test]
+    fn test_cc_cubic_grows_after_loss() {
+        let mut c = Cc::default();
+        let mss = 1000;
+        c.on_ack(2, Instant::from_millis(0), 1000, mss, 10, false);
+        c.on_dup3(2, 20_000, mss);
+        let after = c.cwnd;
+        assert_eq!(after, 7700);
+        for i in 1..2000 { c.on_ack(2, Instant::from_millis(i * 5), 1000, mss, 10, false); }
+        assert!(c.cwnd > after, "cubic regrows: {}", c.cwnd);
     }
 
     #[test]
