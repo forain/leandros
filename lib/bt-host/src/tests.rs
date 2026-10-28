@@ -341,6 +341,15 @@ fn stale_key_falls_back_to_fresh_pairing() {
 }
 
 #[test]
+fn accept_peripheral_knob_selects_role_01() {
+    let mut vc = Vc::new();
+    let mut h = ready(&mut vc, KeyStore::default());
+    h.accept_central = false;
+    feed(&mut h, "04 04 0a 01 02 03 04 05 06 08 05 00 01");
+    assert_eq!(outs(&mut h), vec![hx("01 09 04 07 01 02 03 04 05 06 01")]);
+}
+
+#[test]
 fn incoming_channel_on_listened_psm_and_refused_psm() {
     let mut vc = Vc::new();
     let mut h = ready(&mut vc, KeyStore::default());
@@ -348,7 +357,7 @@ fn incoming_channel_on_listened_psm_and_refused_psm() {
     h.request(5, Msg::Listen { psm: 0x11 });
     assert_eq!(evs(&mut h), vec![(2, Msg::Result { op: aop::LISTEN, status: 0 }), (5, Msg::Result { op: aop::LISTEN, status: status::BUSY })]);
     feed(&mut h, "04 04 0a 01 02 03 04 05 06 08 05 00 01");
-    assert_eq!(outs(&mut h), vec![hx("01 09 04 07 01 02 03 04 05 06 01")]);
+    assert_eq!(outs(&mut h), vec![hx("01 09 04 07 01 02 03 04 05 06 00")]);
     feed(&mut h, "04 0f 04 00 01 09 04");
     feed(&mut h, "04 03 0b 00 0c 00 01 02 03 04 05 06 01 01");
     assert!(outs(&mut h).is_empty(), "already encrypted, nothing to do");
