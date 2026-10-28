@@ -171,6 +171,11 @@ pub struct AcpiPower {
     /// FADT RESET_REG, when `RESET_REG_SUP` is set and it is in System I/O
     /// space (the only kind this kernel writes): port and value.
     pub reset_port: u16,
+    /// PM1a/PM1b event blocks and GPE0 block + length (System I/O).
+    pub pm1a_evt: u16,
+    pub pm1b_evt: u16,
+    pub gpe0: u16,
+    pub gpe0_len: u16,
     pub reset_value: u8,
     /// FADT flags: HW_REDUCED_ACPI (no PM1 blocks — arm64 servers).
     pub hw_reduced: bool,
@@ -249,6 +254,12 @@ pub unsafe fn find_power_info(rsdp_phys: u64, hhdm_offset: u64) -> Option<AcpiPo
     p.acpi_enable = *fadt.add(52);
     p.pm1a_cnt = read_u32(fadt.add(64)) as u16;
     p.pm1b_cnt = read_u32(fadt.add(68)) as u16;
+    if !p.hw_reduced {
+        p.pm1a_evt = read_u32(fadt.add(56)) as u16;
+        p.pm1b_evt = read_u32(fadt.add(60)) as u16;
+        p.gpe0 = read_u32(fadt.add(80)) as u16;
+        p.gpe0_len = *fadt.add(92) as u16;
+    }
     // ACPI 2.0+ extended blocks win when they are present and in I/O space.
     if len >= 196 {
         if *fadt.add(172) == GAS_SYSTEM_IO && read_u64(fadt.add(176)) != 0 {

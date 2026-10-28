@@ -72,7 +72,7 @@ pub unsafe fn acpi_power_off(p: &AcpiPower) {
 /// Which reset to try first (`reboot.method=`); the rest of the chain
 /// follows if it does not take.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Method { Auto, Acpi, Cf9, Kbd, Triple }
+pub enum Method { Auto, Acpi, Kbd, Cf9, Cf9Full, Triple }
 
 /// Busy-wait on the TSC clock (valid with interrupts off).
 fn udelay(us: u64) {
@@ -124,9 +124,13 @@ unsafe fn reset_cf9(cold: bool) {
     outb(0xCF9, cf9 | 0x02);
     udelay(50);
     outb(0xCF9, cf9 | code);
-    // A full reset holds the rails down for seconds before the CPU is gone
-    // on some chipsets; give it time before falling back.
-    udelay(if cold { 500_000 } else { 100_000 });
+    // A full reset holds the rails down for seconds before the CPU is gone;
+    // wait 5 s so the chain never writes into a running power cycle.
+    if cold {
+        for _ in 0..50 { udelay(100_000); }
+    } else {
+        udelay(100_000);
+    }
 }
 
 /// Triple fault (Linux BOOT_TRIPLE): an empty IDT and an exception.
@@ -139,36 +143,70 @@ unsafe fn reset_triple() -> ! {
     loop { core::arch::asm!("cli; hlt", options(nomem, nostack)); }
 }
 
+/// Quiet the ACPI event blocks before any reset: PM1_EN = 0, PM1_STS written
+/// all-ones (W1C), GPE0_EN = 0, GPE0_STS written all-ones. SCI_EN is left
+/// alone. Skipped for HW-reduced FADTs (no PM1/GPE blocks).
+unsafe fn quiet_acpi_events(p: &AcpiPower) {
+    if p.pm1a_evt != 0 { outw(p.pm1a_evt + 2, 0); outw(p.pm1a_evt, 0xFFFF); }
+    if p.pm1b_evt != 0 { outw(p.pm1b_evt + 2, 0); outw(p.pm1b_evt, 0xFFFF); }
+    if p.gpe0 != 0 {
+        let half = p.gpe0_len / 2;
+        for i in 0..half { outb(p.gpe0 + half + i, 0); outb(p.gpe0 + i, 0xFF); }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step { Acpi, Kbd, Cf9, Cf9Full }
+
+fn step_of(m: Method) -> Option<Step> {
+    match m {
+        Method::Acpi => Some(Step::Acpi),
+        Method::Kbd => Some(Step::Kbd),
+        Method::Cf9 => Some(Step::Cf9),
+        Method::Cf9Full => Some(Step::Cf9Full),
+        _ => None,
+    }
+}
+
+/// Human-readable chain `restart` runs for `method` (for the log).
+pub fn chain_text(method: Method) -> &'static str {
+    match method {
+        Method::Auto => "acpi kbd acpi kbd cf9(0x06) cf9full(0x0E) triple",
+        Method::Acpi => "acpi kbd acpi kbd cf9(0x06) cf9full(0x0E) triple",
+        Method::Kbd => "kbd acpi acpi kbd cf9(0x06) cf9full(0x0E) triple",
+        Method::Cf9 => "cf9(0x06) acpi kbd acpi kbd cf9full(0x0E) triple",
+        Method::Cf9Full => "cf9full(0x0E) acpi kbd acpi kbd cf9(0x06) triple",
+        Method::Triple => "triple",
+    }
+}
+
 /// Reset the machine. Never returns.
 ///
-/// Chains (the first entry is replaced by `method` when one is given, and
-/// that one is not repeated later):
-/// - warm (Linux's default on an ACPI machine, `native_machine_emergency_restart`
-///   with reboot_type BOOT_ACPI; EFI and BIOS steps skipped, this kernel has
-///   neither): ACPI RESET_REG, 8042, ACPI RESET_REG, 8042, 0xCF9 0x06,
-///   triple fault;
-/// - cold: 0xCF9 0x0E (full reset), ACPI RESET_REG, 8042, triple fault.
+/// Chain (Linux `native_machine_emergency_restart` with reboot=acpi, EFI and
+/// BIOS steps skipped): ACPI RESET_REG, 8042, ACPI RESET_REG, 8042, 0xCF9
+/// 0x06, then 0xCF9 0x0E (FULL_RST, a power cycle) only as the last resort
+/// before the triple fault. A non-Auto `method` runs first and is not
+/// repeated at its original slot (Cf9Full with a 5 s wait).
 ///
 /// # Safety
 /// Ring 0; the machine restarts. Interrupts should already be disabled.
-pub unsafe fn restart(p: Option<&AcpiPower>, method: Method, cold: bool) -> ! {
-    match method {
-        Method::Acpi => reset_acpi(p),
-        Method::Cf9 => reset_cf9(cold),
-        Method::Kbd => reset_kbd(),
-        Method::Triple => reset_triple(),
-        Method::Auto => {}
-    }
-    if cold {
-        if method != Method::Cf9 { reset_cf9(true); }
-        if method != Method::Acpi { reset_acpi(p); }
-        if method != Method::Kbd { reset_kbd(); }
-    } else {
-        if method != Method::Acpi { reset_acpi(p); }
-        if method != Method::Kbd { reset_kbd(); }
-        reset_acpi(p);
-        reset_kbd();
-        if method != Method::Cf9 { reset_cf9(false); }
+pub unsafe fn restart(p: Option<&AcpiPower>, method: Method) -> ! {
+    if let Some(p) = p { quiet_acpi_events(p); }
+    let first = step_of(method);
+    let run = |st: Step| match st {
+        Step::Acpi => reset_acpi(p),
+        Step::Kbd => reset_kbd(),
+        Step::Cf9 => reset_cf9(false),
+        Step::Cf9Full => reset_cf9(true),
+    };
+    if method == Method::Triple { reset_triple(); }
+    if let Some(st) = first { run(st); }
+    let mut seq = [Step::Acpi, Step::Kbd, Step::Acpi, Step::Kbd, Step::Cf9, Step::Cf9Full];
+    let mut skip = first;
+    for st in seq.iter_mut() {
+        // Drop only the first occurrence of the leading step.
+        if skip == Some(*st) { skip = None; continue; }
+        run(*st);
     }
     reset_triple()
 }
