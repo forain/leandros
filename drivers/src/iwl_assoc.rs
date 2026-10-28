@@ -273,6 +273,13 @@ pub fn rate_vht(rate_n_flags: u32) -> Option<(u8, u8, u16)> {
     Some(((rate_n_flags & 0xf) as u8, ((rate_n_flags >> 4) & 3) as u8 + 1, w))
 }
 
+/// rate_n_flags (v1) of VHT MCS `mcs` with `nss` streams (1-2) at `width`
+/// MHz (20 / 40 / 80) on antenna mask `ant`.
+pub fn vht_rate(mcs: u8, nss: u8, sgi: bool, ant: u8, width: u16) -> u32 {
+    let w = match width { 80 => RATE_MCS_CHAN_WIDTH_80, 40 => RATE_MCS_CHAN_WIDTH_40, _ => 0 };
+    RATE_MCS_VHT | (mcs as u32 & 0xf) | (((nss.max(1) - 1) as u32 & 3) << 4) | w | if sgi { RATE_MCS_SGI } else { 0 } | ((ant as u32 & 7) << RATE_MCS_ANT_POS)
+}
+
 /// An HT rate at 20 or 40 MHz.
 pub fn ht_rate_w(mcs: u8, sgi: bool, ant: u8, ht40: bool) -> u32 {
     ht_rate(mcs, sgi, ant) | if ht40 { RATE_MCS_CHAN_WIDTH_40 } else { 0 }
@@ -290,7 +297,7 @@ pub fn rate_mcs(rate_n_flags: u32) -> Option<(u8, bool)> {
 /// The bits of a rate_n_flags that identify a rate on an antenna (what the
 /// TX response's initial rate is compared on): legacy / HT MCS, CCK, short
 /// GI, channel width, antennas.
-pub const RATE_ID_MSK: u32 = 0xff | RATE_MCS_HT | RATE_MCS_CCK | RATE_MCS_CHAN_WIDTH_MSK | RATE_MCS_SGI | RATE_MCS_ANT_MSK;
+pub const RATE_ID_MSK: u32 = 0xff | RATE_MCS_HT | RATE_MCS_VHT | RATE_MCS_CCK | RATE_MCS_CHAN_WIDTH_MSK | RATE_MCS_SGI | RATE_MCS_ANT_MSK;
 
 /// The lowest mandatory rate of the band (management frames).
 pub fn mgmt_rate(channel: u8) -> u32 { legacy_rate(if channel <= 14 { 2 } else { 12 }).unwrap() }
