@@ -153,6 +153,10 @@ fn setup_pad(name: &str, bus: usize, s: &I2cSlave, d: &Descriptor, ids: (u16, u1
         spin_ms(10);
         got = get_feature(bus, s.addr, cmd_reg, data_reg, mode.id, pl.len());
     }
+    if got.is_err() && word("touchpad.verify", "") == Some("0") {
+        log(&format!("i2c-hid: {} GET_REPORT unverified (touchpad.verify=0)", name));
+        got = Ok(alloc::vec![3u8; pl.len()]);
+    }
     match got {
         Ok(r) => {
             let v = hid_ptp::bits(&r, mode.bit, mode.size);
