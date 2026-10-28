@@ -103,9 +103,9 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     let mut idle_ms: Option<u64> = None;
     let mut grace_ms: Option<u64> = None;
     // Knobs also reachable without touching how init spawns us: BTD_TRACE=1 /
-    // BTD_ACCEPT_CENTRAL=1 in the environment, or marker files in /etc.
+    // BTD_ACCEPT_PERIPHERAL=1 / /etc/btd.accept-peripheral / --accept-peripheral select the old peripheral role; central is the default (accept-central knobs are no-ops).
     let mut trace = env_is_set(envp, b"BTD_TRACE=") || marker(b"/etc/btd.trace\0");
-    let mut accept_central = env_is_set(envp, b"BTD_ACCEPT_CENTRAL=") || marker(b"/etc/btd.accept-central\0");
+    let mut accept_central = !(env_is_set(envp, b"BTD_ACCEPT_PERIPHERAL=") || marker(b"/etc/btd.accept-peripheral\0"));
     let mut i = 1;
     while i < argc as isize {
         match arg(argv, i) {
@@ -125,8 +125,9 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
             b"--idle-ms\0" if i + 1 < argc as isize => { i += 1; idle_ms = parse_ms(arg(argv, i)); }
             b"--grace-ms\0" if i + 1 < argc as isize => { i += 1; grace_ms = parse_ms(arg(argv, i)); }
             b"--trace\0" => trace = true,
-            b"--accept-central\0" => accept_central = true,
-            _ => { eprintln!("usage: btd [--dev PATH | --fd N] [--name NAME] [--sock PATH] [--keys PATH] [--idle-ms N] [--grace-ms N] [--trace] [--accept-central]"); return 2; }
+            b"--accept-central\0" => {} // no-op: central is the default
+            b"--accept-peripheral\0" => accept_central = false,
+            _ => { eprintln!("usage: btd [--dev PATH | --fd N] [--name NAME] [--sock PATH] [--keys PATH] [--idle-ms N] [--grace-ms N] [--trace] [--accept-central] [--accept-peripheral]"); return 2; }
         }
         i += 1;
     }

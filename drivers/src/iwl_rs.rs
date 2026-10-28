@@ -60,10 +60,12 @@ pub const HT_R500K: [u32; 8] = [13, 26, 39, 52, 78, 104, 117, 130];
 
 /// A ladder entry is a rate id: a legacy rate in 500 kb/s units (2..108),
 /// or HT_ID | MCS (0-15), with HT_SGI for the short guard interval.
-pub const HT_ID: u8 = 0x80;
-pub const HT_SGI: u8 = 0x40;
+/// Rate ids are u16 so VHT ids (VHT_ID | width | stream | MCS) fit; legacy and HT ids keep their u8 values.
+pub type RateId = u16;
+pub const HT_ID: RateId = 0x80;
+pub const HT_SGI: RateId = 0x40;
 /// 40 MHz (the MCS index uses the low 4 bits).
-pub const HT_40: u8 = 0x20;
+pub const HT_40: RateId = 0x20;
 /// Linux rs.c expected_tpt_siso_40MHz / _mimo2_40MHz, MCS 0-7, [NGI, SGI,
 /// AGG+NGI, AGG+SGI].
 pub const EXPECTED_TPT_SISO40: [[u32; 8]; 4] = [[77, 127, 160, 184, 220, 242, 250, 257], [83, 135, 169, 193, 229, 250, 257, 264],
@@ -73,14 +75,72 @@ pub const EXPECTED_TPT_MIMO2_40: [[u32; 8]; 4] = [[123, 182, 214, 235, 264, 279,
 /// Nominal 40 MHz long-GI rates of MCS 0-7 (one stream) in 500 kb/s units.
 pub const HT40_R500K: [u32; 8] = [27, 54, 81, 108, 162, 216, 243, 270];
 
-pub fn is_ht(id: u8) -> bool { id & HT_ID != 0 }
-pub fn ht_id(mcs: u8, sgi: bool) -> u8 { HT_ID | (mcs & 0x0f) | if sgi { HT_SGI } else { 0 } }
-pub fn ht_id_w(mcs: u8, sgi: bool, ht40: bool) -> u8 { ht_id(mcs, sgi) | if ht40 { HT_40 } else { 0 } }
-pub fn is_40(id: u8) -> bool { is_ht(id) && id & HT_40 != 0 }
+pub fn is_ht(id: RateId) -> bool { id & HT_ID != 0 }
+pub fn ht_id(mcs: u8, sgi: bool) -> RateId { HT_ID | (mcs as RateId & 0x0f) | if sgi { HT_SGI } else { 0 } }
+pub fn ht_id_w(mcs: u8, sgi: bool, ht40: bool) -> RateId { ht_id(mcs, sgi) | if ht40 { HT_40 } else { 0 } }
+pub fn is_40(id: RateId) -> bool { is_ht(id) && !is_vht(id) && id & HT_40 != 0 }
+
+/// A VHT rate id: VHT_ID | HT_ID | SGI | two streams (VHT_NSS2) | MCS 0-9 in
+/// bits 0-3 | width code (0 = 20, 1 = 40, 2 = 80 MHz) in bits 9-10.
+pub const VHT_ID: RateId = 0x100;
+pub const VHT_NSS2: RateId = 0x10;
+pub fn is_vht(id: RateId) -> bool { id & VHT_ID != 0 }
+fn width_code(width: u16) -> RateId { match width { 80 => 2, 40 => 1, _ => 0 } }
+/// `width` in MHz (20 / 40 / 80), `nss` 1 or 2.
+pub fn vht_id(mcs: u8, nss: u8, sgi: bool, width: u16) -> RateId {
+    VHT_ID | HT_ID | (mcs as RateId & 0x0f) | if nss >= 2 { VHT_NSS2 } else { 0 } | if sgi { HT_SGI } else { 0 } | (width_code(width) << 9)
+}
+pub fn vht_mcs(id: RateId) -> u8 { (id & 0x0f) as u8 }
+pub fn vht_nss(id: RateId) -> u8 { if id & VHT_NSS2 != 0 { 2 } else { 1 } }
+pub fn vht_width(id: RateId) -> u16 { match (id >> 9) & 3 { 2 => 80, 1 => 40, _ => 20 } }
+/// A two-stream rate id (HT MCS 8-15 or VHT with two streams).
+pub fn is_mimo_id(id: RateId) -> bool { if is_vht(id) { id & VHT_NSS2 != 0 } else { is_ht(id) && id & 0x0f >= 8 } }
+
+/// VHT tables (Linux rs.c, MCS 0-9, [NGI, SGI]); 0 = no such rate.
+const VHT80_SISO: [[u32; 10]; 2] = [[130, 191, 223, 244, 273, 288, 294, 298, 305, 308], [138, 200, 231, 251, 279, 293, 298, 302, 308, 312]];
+const VHT80_MIMO: [[u32; 10]; 2] = [[209, 245, 263, 273, 287, 294, 297, 300, 307, 309], [213, 249, 266, 275, 289, 296, 299, 302, 308, 310]];
+const VHT80_SISO_AGG: [[u32; 10]; 2] = [[217, 429, 634, 834, 1220, 1585, 1760, 1931, 2258, 2466], [241, 475, 701, 921, 1343, 1741, 1931, 2117, 2468, 2691]];
+const VHT80_MIMO_AGG: [[u32; 10]; 2] = [[411, 834, 1232, 1625, 2387, 3066, 3402, 3733, 4316, 4723], [460, 921, 1362, 1795, 2627, 3373, 3741, 4091, 4734, 5143]];
+/// MCS 8-9 at 20 / 40 MHz, [agg][sgi][mcs - 8] (SISO, MIMO2). Agg SGI at 40 MHz is the long-GI value x 10/9.
+const VHT20_SISO_89: [[[u32; 2]; 2]; 2] = [[[216, 0], [225, 0]], [[551, 0], [612, 0]]];
+const VHT20_MIMO_89: [[[u32; 2]; 2]; 2] = [[[262, 0], [268, 0]], [[1032, 0], [1146, 0]]];
+const VHT40_SISO_89: [[[u32; 2]; 2]; 2] = [[[269, 275], [275, 280]], [[1070, 1173], [1189, 1303]]];
+const VHT40_MIMO_89: [[[u32; 2]; 2]; 2] = [[[296, 300], [300, 303]], [[1928, 2059], [2142, 2288]]];
+
+fn vht_tpt(id: RateId, agg: bool) -> u32 {
+    let (mcs, mimo, sgi, a) = (vht_mcs(id) as usize, id & VHT_NSS2 != 0, (id & HT_SGI != 0) as usize, agg as usize);
+    if mcs > 9 { return 0; }
+    match vht_width(id) {
+        80 => (match (mimo, agg) { (false, false) => VHT80_SISO, (true, false) => VHT80_MIMO, (false, true) => VHT80_SISO_AGG, (true, true) => VHT80_MIMO_AGG })[sgi][mcs],
+        w => {
+            if mcs >= 8 {
+                let t = match (w == 40, mimo) { (false, false) => &VHT20_SISO_89, (false, true) => &VHT20_MIMO_89, (true, false) => &VHT40_SISO_89, (true, true) => &VHT40_MIMO_89 };
+                return t[a][sgi][mcs - 8];
+            }
+            let m = mcs;
+            if w == 40 {
+                let k = 2 * a + sgi;
+                if mimo { EXPECTED_TPT_MIMO2_40[k][m] } else { EXPECTED_TPT_SISO40[k][m] }
+            } else if mimo {
+                (if agg { &EXPECTED_TPT_MIMO2_AGG } else { &EXPECTED_TPT_MIMO2 })[sgi][m]
+            } else {
+                (if agg { &EXPECTED_TPT_SISO_AGG } else { &EXPECTED_TPT_SISO })[sgi][m]
+            }
+        }
+    }
+}
+
+/// Nominal long-GI VHT rates, one stream, MCS 0-9, 500 kb/s units (x10 not needed: rounded).
+const VHT_R500K: [[u32; 10]; 3] = [[13, 26, 39, 52, 78, 104, 117, 130, 156, 0], [27, 54, 81, 108, 162, 216, 243, 270, 324, 360],
+                                   [59, 117, 176, 234, 351, 468, 527, 585, 702, 780]];
+
+/// An invalid VHT combination (MCS 9 at 20 MHz with one or two streams).
+pub fn vht_valid(mcs: u8, width: u16) -> bool { mcs <= 9 && !(mcs == 9 && width == 20) }
 
 /// Expected throughput of a rate id with TX aggregation (rs.c AGG
 /// columns; legacy rates are never aggregated).
-pub fn expected_tpt_agg(id: u8) -> u32 {
+pub fn expected_tpt_agg(id: RateId) -> u32 {
+    if is_vht(id) { return vht_tpt(id, true); }
     if is_40(id) {
         let (mcs, sgi) = ((id & 0x0f) as usize, (id & HT_SGI != 0) as usize);
         return match mcs { 0..=7 => EXPECTED_TPT_SISO40[2 + sgi][mcs], 8..=15 => EXPECTED_TPT_MIMO2_40[2 + sgi][mcs - 8], _ => 0 };
@@ -94,7 +154,8 @@ pub fn expected_tpt_agg(id: u8) -> u32 {
 }
 
 /// Expected throughput of a rate id (rs.c tables, no aggregation).
-pub fn expected_tpt(id: u8) -> u32 {
+pub fn expected_tpt(id: RateId) -> u32 {
+    if is_vht(id) { return vht_tpt(id, false); }
     if is_40(id) {
         let (mcs, sgi) = ((id & 0x0f) as usize, (id & HT_SGI != 0) as usize);
         return match mcs { 0..=7 => EXPECTED_TPT_SISO40[sgi][mcs], 8..=15 => EXPECTED_TPT_MIMO2_40[sgi][mcs - 8], _ => 0 };
@@ -103,12 +164,17 @@ pub fn expected_tpt(id: u8) -> u32 {
         let (mcs, sgi) = ((id & 0x0f) as usize, (id & HT_SGI != 0) as usize);
         match mcs { 0..=7 => EXPECTED_TPT_SISO[sgi][mcs], 8..=15 => EXPECTED_TPT_MIMO2[sgi][mcs - 8], _ => 0 }
     } else {
-        legacy_index(id).map_or(0, |i| EXPECTED_TPT[i])
+        legacy_index(id as u8).map_or(0, |i| EXPECTED_TPT[i])
     }
 }
 
 /// Nominal rate of a rate id in 500 kb/s units (the iwlwifi.maxrate cap).
-pub fn nominal_r500k(id: u8) -> u32 {
+pub fn nominal_r500k(id: RateId) -> u32 {
+    if is_vht(id) {
+        let w = match vht_width(id) { 80 => 2, 40 => 1, _ => 0 };
+        let b = VHT_R500K[w][(vht_mcs(id) as usize).min(9)] * vht_nss(id) as u32;
+        return if id & HT_SGI != 0 { b * 10 / 9 } else { b };
+    }
     if is_ht(id) {
         let mcs = (id & 0x0f) as usize;
         (if is_40(id) { HT40_R500K[mcs % 8] } else { HT_R500K[mcs % 8] }) * (1 + (mcs / 8) as u32)
@@ -119,30 +185,40 @@ pub fn nominal_r500k(id: u8) -> u32 {
 
 /// The rate_n_flags of a rate id; single-stream rates on antenna `ant`,
 /// two-stream ones on both.
-pub fn rate_code(id: u8, ant: u8) -> u32 {
+pub fn rate_code(id: RateId, ant: u8) -> u32 {
+    if is_vht(id) {
+        return asc::vht_rate(vht_mcs(id), vht_nss(id), id & HT_SGI != 0, if vht_nss(id) >= 2 { ANT_AB } else { ant }, vht_width(id));
+    }
     if is_ht(id) {
-        let mcs = id & 0x0f;
+        let mcs = (id & 0x0f) as u8;
         asc::ht_rate_w(mcs, id & HT_SGI != 0, if mcs >= 8 { ANT_AB } else { ant }, is_40(id))
     } else {
-        asc::legacy_rate_ant(id, ant).unwrap_or(0)
+        asc::legacy_rate_ant(id as u8, ant).unwrap_or(0)
     }
 }
 
 /// The rate id a rate_n_flags carries (any antenna).
-pub fn rate_id(rate_n_flags: u32) -> Option<u8> {
+pub fn rate_id(rate_n_flags: u32) -> Option<RateId> {
+    if let Some((mcs, nss, w)) = asc::rate_vht(rate_n_flags) {
+        if nss > 2 || w > 80 || mcs > 9 { return None; }
+        return Some(vht_id(mcs, nss, rate_n_flags & asc::RATE_MCS_SGI != 0, w));
+    }
     match asc::rate_mcs(rate_n_flags) {
         Some((mcs, sgi)) if mcs < 16 => Some(ht_id_w(mcs, sgi, asc::rate_is_40(rate_n_flags))),
         Some(_) => None,
-        None => asc::rate_r500k(rate_n_flags),
+        None => asc::rate_r500k(rate_n_flags).map(|r| r as RateId),
     }
 }
 
 /// A rate id as text: "54M", "5.5M", "MCS7", "MCS7s" (short GI).
-pub fn rate_label(id: u8) -> String {
+pub fn rate_label(id: RateId) -> String {
+    if is_vht(id) {
+        return format!("VHT{}x{}/{}{}", vht_mcs(id), vht_nss(id), vht_width(id), if id & HT_SGI != 0 { "s" } else { "" });
+    }
     if is_ht(id) {
         format!("MCS{}{}{}", id & 0x0f, if is_40(id) { "/40" } else { "" }, if id & HT_SGI != 0 { "s" } else { "" })
     } else {
-        format!("{}M", mbps(id))
+        format!("{}M", mbps(id as u8))
     }
 }
 
@@ -181,7 +257,7 @@ pub const ANT_HINT_DB: i16 = 6;
 pub const ANT_HINT_MIN_MS: u64 = 5000;
 
 fn legacy_index(r500k: u8) -> Option<usize> {
-    if is_ht(r500k) { return None; }
+    if is_ht(r500k as RateId) { return None; }
     LEGACY_R500K.iter().position(|&r| r == r500k & 0x7f)
 }
 
@@ -295,6 +371,21 @@ pub struct HtRates {
     pub stbc: bool,
     /// HT rates use LDPC coding (the AP receives LDPC: rs.c `lq_sta->ldpc`).
     pub ldpc: bool,
+    /// VHT TX rates (None = HT only, every path as before).
+    pub vht: Option<VhtRates>,
+}
+
+/// The VHT rates rate control may use (an 80/40/20 MHz VHT link).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VhtRates {
+    /// Transmit width in MHz: 20, 40 or 80.
+    pub width: u16,
+    /// Highest MCS (7, 8 or 9) the AP receives with one stream.
+    pub max_mcs_1ss: u8,
+    /// Highest MCS with two streams (None: the AP has one RX stream, or mimo is off).
+    pub max_mcs_2ss: Option<u8>,
+    /// Short guard interval at 80 MHz (AP VHT cap and our TXSGI knob).
+    pub sgi80: bool,
 }
 
 /// A rate-control column (rs.c `enum rs_column`): streams and guard interval.
@@ -322,7 +413,7 @@ pub const COL_BACKOFF_MAX_MS: u64 = 160_000;
 #[derive(Clone, Debug)]
 pub struct ColProbe {
     pub from: usize,
-    pub from_rates: Vec<u8>,
+    pub from_rates: Vec<RateId>,
     pub from_floor: usize,
     pub from_cur: usize,
     pub from_win: Vec<RateWin>,
@@ -331,23 +422,57 @@ pub struct ColProbe {
     pub until_ms: u64,
 }
 
+/// Effective short GI of a VHT rate: at 80 MHz only when the AP and our knob allow it.
+fn vht_sgi(v: &VhtRates, sgi: bool) -> bool { sgi && (v.width != 80 || v.sgi80) }
+
+/// The VHT part of a column's ladder: one stream MCS 0..max_mcs_1ss, then (MIMO
+/// column, or the start column with mimo on) the two-stream rates, mirroring the
+/// HT ladder (the single-stream rates below two-stream MCS 0 are kept for a MIMO column,
+/// the start column only adds two-stream rates faster than the single-stream top).
+fn vht_ladder(v: &VhtRates, sgi: bool, col: Option<Col>, mimo: bool, cap: &dyn Fn(RateId) -> bool) -> Vec<RateId> {
+    let sgi = vht_sgi(v, sgi);
+    let mk = |nss: u8, max: u8| -> Vec<RateId> {
+        (0..=max.min(9)).filter(|&m| vht_valid(m, v.width)).map(|m| vht_id(m, nss, sgi, v.width)).filter(|&id| cap(id)).collect()
+    };
+    let mut r = mk(1, v.max_mcs_1ss);
+    let two = v.max_mcs_2ss;
+    if let (Some(m2), true) = (two, col.map_or(false, |c| c.mimo)) {
+        let m0 = expected_tpt(vht_id(0, 2, sgi, v.width));
+        r.retain(|&id| expected_tpt(id) < m0);
+        r.extend(mk(2, m2));
+    } else if let (Some(m2), true, true) = (two, col.is_none(), mimo) {
+        let top = r.last().map_or(0, |&id| expected_tpt(id));
+        r.extend(mk(2, m2).into_iter().filter(|&id| expected_tpt(id) > top));
+    }
+    r
+}
+
+/// The single-stream VHT rate worth trying first at `rssi` (80 MHz spreads the
+/// power over four times the band: 6 dB less per subcarrier, 40 MHz 3 dB).
+fn vht_start(v: &VhtRates, rssi: Option<i8>, sgi: bool) -> RateId {
+    let off = match v.width { 80 => 6, 40 => 3, _ => 0 };
+    let m = rssi.map_or(3, |r| initial_mcs(r.saturating_sub(off)));
+    vht_id(m.min(v.max_mcs_1ss), 1, vht_sgi(v, sgi), v.width)
+}
+
 /// The rate ladder of a column: the legacy rates below the lowest MCS,
 /// then the MCS ladder. `col` None = the start column of `cfg.ht`; Some =
 /// that column (MIMO2: the single-stream MCS below MCS 8, then MCS 8-15).
 /// Returns (rates, floor, start index).
-fn ladder(cfg: &RateCfg, col: Option<Col>) -> (Vec<u8>, usize, usize) {
-        let mut rates: Vec<u8> = cfg.ap_rates.iter().map(|r| r & 0x7f)
-            .filter(|&r| legacy_index(r).is_some() && (cfg.max_r500k == 0 || r <= cfg.max_r500k)).collect();
-        rates.sort_unstable_by_key(|&r| legacy_index(r));
+fn ladder(cfg: &RateCfg, col: Option<Col>) -> (Vec<RateId>, usize, usize) {
+        let mut rates: Vec<RateId> = cfg.ap_rates.iter().map(|r| r & 0x7f)
+            .filter(|&r| legacy_index(r).is_some() && (cfg.max_r500k == 0 || r <= cfg.max_r500k)).map(|r| r as RateId).collect();
+        rates.sort_unstable_by_key(|&r| legacy_index(r as u8));
         rates.dedup();
         if rates.is_empty() { rates.push(if cfg.band_24 { 2 } else { 12 }); }
         let mut want_ht = None;
         if let Some(h) = cfg.ht {
             // HT: the legacy rates below MCS 0, then the MCS ladder.
-            let cap = |id: u8| cfg.max_r500k == 0 || nominal_r500k(id) <= cfg.max_r500k as u32;
+            let cap = |id: RateId| cfg.max_r500k == 0 || nominal_r500k(id) <= cfg.max_r500k as u32;
             let sgi = col.map_or(h.sgi, |c| c.sgi);
-            let mut ht: Vec<u8> = (0..8).map(|m| ht_id_w(m, sgi, h.ht40)).filter(|&id| cap(id)).collect();
-            if col.map_or(false, |c| c.mimo) {
+            let mut ht: Vec<RateId> = if let Some(v) = h.vht { vht_ladder(&v, sgi, col, h.mimo, &cap) } else { (0..8).map(|m| ht_id_w(m, sgi, h.ht40)).filter(|&id| cap(id)).collect() };
+            if h.vht.is_some() {
+            } else if col.map_or(false, |c| c.mimo) {
                 let m8 = expected_tpt(ht_id_w(8, sgi, h.ht40));
                 ht.retain(|&id| expected_tpt(id) < m8);
                 ht.extend((8..16).map(|m| ht_id_w(m, sgi, h.ht40)).filter(|&id| cap(id)));
@@ -360,17 +485,20 @@ fn ladder(cfg: &RateCfg, col: Option<Col>) -> (Vec<u8>, usize, usize) {
                 rates.extend_from_slice(&ht);
                 // Unknown signal: MCS 3, the middle of the table.
                 // 40 MHz spreads the power over twice the band: 3 dB less per subcarrier.
-                want_ht = Some(ht_id_w(cfg.rssi.map_or(3, |r| initial_mcs(if h.ht40 { r.saturating_sub(3) } else { r })), sgi, h.ht40));
+                want_ht = Some(match h.vht {
+                    Some(v) => vht_start(&v, cfg.rssi, sgi),
+                    None => ht_id_w(cfg.rssi.map_or(3, |r| initial_mcs(if h.ht40 { r.saturating_sub(3) } else { r })), sgi, h.ht40),
+                });
             }
         }
         let floor = cfg.ap_rates.iter().filter(|r| *r & 0x80 != 0)
-            .filter_map(|r| rates.iter().position(|&x| x == r & 0x7f)).min().unwrap_or(0);
+            .filter_map(|r| rates.iter().position(|&x| x == (r & 0x7f) as RateId)).min().unwrap_or(0);
         let cur = match want_ht {
             Some(w) => rates.iter().rposition(|&r| expected_tpt(r) <= expected_tpt(w)).unwrap_or(0),
             None => {
                 // Unknown signal: 24 Mb/s, the middle of the table.
                 let want = cfg.rssi.map_or(48, |s| initial_r500k(s, cfg.band_24));
-                rates.iter().rposition(|&r| legacy_index(r) <= legacy_index(want)).unwrap_or(0)
+                rates.iter().rposition(|&r| legacy_index(r as u8) <= legacy_index(want)).unwrap_or(0)
             }
         };
     (rates, floor, cur)
@@ -381,7 +509,7 @@ fn ladder(cfg: &RateCfg, col: Option<Col>) -> (Vec<u8>, usize, usize) {
 pub struct RateCtl {
     /// Usable rates (rate ids: legacy in 500 kb/s units, or HT_ID | MCS),
     /// slowest first by expected throughput.
-    pub rates: Vec<u8>,
+    pub rates: Vec<RateId>,
     /// Index of the lowest basic rate (the floor of the retry chain).
     pub floor: usize,
     pub win: Vec<RateWin>,
@@ -464,12 +592,12 @@ impl RateCtl {
                   sent: None, sent_ms: 0, pending: true, fail_streak: 0, last_toggle_ms: 0,
                   ups: 0, downs: 0, toggles: 0, lq_sent: 0, mismatched: 0, agg: false, agg_limit: 63, ampdus: 0,
                   probe: None, next_probe_ms: 0, probes: 0, probes_kept: 0, reseeds: 0, leg_att: [0; 2], leg_ok: [0; 2], signal: None, band_24: cfg.band_24, ht_cfg: cfg.ht,
-                  cols: alloc::vec![Col { mimo: cfg.ht.map_or(false, |h| h.mimo), sgi: cfg.ht.map_or(false, |h| h.sgi) }], col: 0,
+                  cols: alloc::vec![Col { mimo: cfg.ht.map_or(false, |h| h.mimo && h.vht.map_or(true, |v| v.max_mcs_2ss.is_some())), sgi: cfg.ht.map_or(false, |h| h.sgi) }], col: 0,
                   col_probe: None, col_next_ms: 0, col_not_before: alloc::vec![0], col_backoff: alloc::vec![COL_SEARCH_MS],
                   col_probes: 0, col_kept: 0, cfg: cfg.clone() }
     }
 
-    pub fn cur_r500k(&self) -> u8 { self.rates[self.cur] }
+    pub fn cur_r500k(&self) -> u8 { self.rates[self.cur] as u8 }
 
     /// Let rate control search the other columns: the other guard interval
     /// (`sgi`: the AP receives short GI at this width) and two streams
@@ -482,7 +610,7 @@ impl RateCtl {
         let base = self.cols[0];
         let mut cols = alloc::vec![base];
         let sgis: &[bool] = if sgi { &[false, true] } else { &[false] };
-        let mimos: &[bool] = if mimo && two && !h.mimo { &[false, true] } else { &[false] };
+        let mimos: &[bool] = if mimo && two && !h.mimo && h.vht.map_or(true, |v| v.max_mcs_2ss.is_some()) { &[false, true] } else { &[false] };
         for &m in mimos { for &g in sgis {
             let c = Col { mimo: m || base.mimo, sgi: if sgi { g } else { base.sgi } };
             if !cols.contains(&c) { cols.push(c); }
@@ -597,7 +725,7 @@ impl RateCtl {
         let id = self.rates[i];
         match self.ht_cfg {
             Some(h) if is_ht(id) => {
-                let mut c = if h.stbc && id & 0x0f < 8 { rate_code(id, ANT_AB) | asc::RATE_MCS_STBC } else { rate_code(id, ant) };
+                let mut c = if h.stbc && !is_mimo_id(id) { rate_code(id, ANT_AB) | asc::RATE_MCS_STBC } else { rate_code(id, ant) };
                 if h.ldpc { c |= asc::RATE_MCS_LDPC_V1; }
                 c
             }
@@ -613,8 +741,9 @@ impl RateCtl {
 
     /// The first single-stream entry of `table` (0 without MIMO entries).
     pub fn mimo_delim(t: &[u32; 16]) -> u8 {
-        if !matches!(asc::rate_mcs(t[0]), Some((m, _)) if m >= 8) { return 0; }
-        t.iter().position(|&r| !matches!(asc::rate_mcs(r), Some((m, _)) if m >= 8)).unwrap_or(16) as u8
+        let mimo = |r: u32| matches!(asc::rate_mcs(r), Some((m, _)) if m >= 8) || matches!(asc::rate_vht(r), Some((_, n, _)) if n >= 2);
+        if !mimo(t[0]) { return 0; }
+        t.iter().position(|&r| !mimo(r)).unwrap_or(16) as u8
     }
 
     pub fn lq(&self, sta_id: u8) -> Vec<u8> {
@@ -836,12 +965,15 @@ impl RateCtl {
         if self.probe.is_some() || self.col_probe.is_some() || self.win.iter().any(|w| w.fresh(now)) { return false; }
         let want = match self.ht_cfg.filter(|_| self.rates.iter().any(|&r| is_ht(r))) {
             Some(h) => {
-                let id = ht_id_w(initial_mcs(if h.ht40 { dbm.saturating_sub(3) } else { dbm }), self.cols[self.col].sgi, h.ht40);
+                let id = match h.vht {
+                    Some(v) => vht_start(&v, Some(dbm), self.cols[self.col].sgi),
+                    None => ht_id_w(initial_mcs(if h.ht40 { dbm.saturating_sub(3) } else { dbm }), self.cols[self.col].sgi, h.ht40),
+                };
                 self.rates.iter().rposition(|&r| expected_tpt(r) <= expected_tpt(id)).unwrap_or(0)
             }
             None => {
                 let r = initial_r500k(dbm, self.band_24);
-                self.rates.iter().rposition(|&x| legacy_index(x) <= legacy_index(r)).unwrap_or(0)
+                self.rates.iter().rposition(|&x| legacy_index(x as u8) <= legacy_index(r)).unwrap_or(0)
             }
         };
         if want == self.cur { return false; }

@@ -156,7 +156,7 @@ pub struct Host {
     pub incoming_grace_ms: u64,
     /// Log ACL in/out hex, credits and signalling (diagnosis aid).
     pub trace: bool,
-    /// ACCEPT_CONN role: false = stay peripheral (0x01, default), true = become central (0x00).
+    /// ACCEPT_CONN role: true = become central (0x00, default), false = stay peripheral (0x01).
     pub accept_central: bool,
     tx_blocked_logged: bool,
 }
@@ -177,7 +177,7 @@ impl Host {
             listens: Vec::new(), keys_dirty: false, scan: None, pairs: Vec::new(), next_cid: FIRST_DYN_CID,
             next_ident: 1, acl_txq: VecDeque::new(), acl_avail: 0, le_avail: 0,
             idle_ms: IDLE_DISCONNECT_MS, incoming_grace_ms: INCOMING_GRACE_MS,
-            trace: false, accept_central: false, tx_blocked_logged: false,
+            trace: false, accept_central: true, tx_blocked_logged: false,
         };
         for k in h.keys.keys.clone() {
             h.devices.push(Device { addr: k.addr, name: k.name, psrm: 1, ..Default::default() });
@@ -426,7 +426,7 @@ impl Host {
                     l.incoming = true;
                     l.since = now;
                     let mut c = a.0.to_vec();
-                    c.push(if self.accept_central { 0x00 } else { 0x01 }); // default: remain peripheral
+                    c.push(if self.accept_central { 0x00 } else { 0x01 }); // default: become central (peripheral via accept-peripheral knob)
                     self.send_cmd(op::ACCEPT_CONN, &c);
                 } else if existing.is_some_and(|i| self.links[i].accepting) {
                     // Duplicate request while we are already accepting: nothing to do.
