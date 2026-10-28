@@ -128,10 +128,10 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     if !crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "pi5.board=0")) {
         drivers::pi5_board::init();
     }
-    // Raspberry Pi 5: PCIe root complex for RP1 (Ethernet, USB). Opt-in until
-    // hardware-verified; bounded (<= ~0.4 s) and inert on failure.
+    // Raspberry Pi 5: PCIe root complex for RP1 (Ethernet, USB). On by default;
+    // `pcie.rpi5=0` turns it off. Bounded (<= ~0.4 s) and inert on failure.
     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-    if crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "pcie.rpi5=1")) {
+    if crate::boot_cmdline().map_or(true, |c| !c.split_ascii_whitespace().any(|t| t == "pcie.rpi5=0")) {
         drivers::rp1::GEM_IRQ.store(crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "rp1.irq=1")),
             core::sync::atomic::Ordering::Relaxed);
         drivers::brcmstb_pcie::configure(crate::boot_cmdline().unwrap_or(""));
@@ -143,6 +143,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         drivers::pci::serial_debug("[pcie] state=");
         drivers::pci::serial_debug(drivers::brcmstb_pcie::state());
         drivers::pci::serial_debug("\n");
+    } else {
+        drivers::pci::serial_debug("[pcie] off (pcie.rpi5=0)\n");
     }
     // Raspberry Pi 5: power the CYW43455 and bring sdio2 up as an SDIO host.
     // One `[sdio]` line either way; inert on failure, bounded to ~2 s.

@@ -3,8 +3,7 @@
 //! `pcie-brcmstb.c` does for BCM2712, then plugs a config-space backend into
 //! `pci.rs` so RP1 (1de4:0001) enumerates as an ordinary PCI function.
 //!
-//! Opt-in: `pcie.rpi5=1` on the kernel command line (default off until it is
-//! hardware-verified). Every step is bounded; any failure prints one
+//! On by default; `pcie.rpi5=0` on the kernel command line turns it off. Every step is bounded; any failure prints one
 //! `[pcie] ...` line, leaves the bus unregistered and boot continues.
 //!
 //! Sequence (Linux `brcm_pcie_probe` / `brcm_pcie_setup` / `brcm_pcie_start_link`):
