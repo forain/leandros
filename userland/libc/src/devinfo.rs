@@ -31,7 +31,7 @@ pub struct UsbDevInfo {
     pub product_id: u16,
     pub class: u8,
     /// Role bits: 0x01 HID keyboard, 0x02 HID mouse, 0x04 mass storage,
-    /// 0x08 hub, 0x80 HID interface the kernel cannot drive. 0 on older
+    /// 0x08 hub, 0x40 synthetic root hub (one per controller), 0x80 HID interface the kernel cannot drive. 0 on older
     /// kernels.
     pub role: u8,
     /// Root-hub port (1-based; 0 = unknown) and xHCI speed ID
