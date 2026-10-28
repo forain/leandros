@@ -32,6 +32,8 @@ pub const PM_PCI: u32 = 2;
 /// With `PM_PCI`: restore unconditionally (COMMAND=0 pulse, all registers)
 /// and also clobber MSI data / MSI-X entry 0.
 pub const PM_PCI_DEEP: u32 = 4;
+/// Real S3 (lane s3core): save PCI config without clobbering, restore everything unconditionally.
+pub const PM_S3: u32 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -77,9 +79,9 @@ fn xhci_resume(_: u32) -> Result<String, String> { drivers::usb_hcd::pm_resume()
 static PCI_SAVED: spin::Mutex<Option<alloc::vec::Vec<drivers::pci_pm::FnState>>> = spin::Mutex::new(None);
 
 fn pci_suspend(f: u32) -> Result<String, String> {
-    if f & PM_PCI == 0 { return Ok(String::from("off")); }
+    if f & (PM_PCI | PM_S3) == 0 { return Ok(String::from("off")); }
     let st = drivers::pci_pm::save_all();
-    let stuck = drivers::pci_pm::clobber(&st, f & PM_PCI_DEEP != 0);
+    let stuck = if f & PM_PCI != 0 { drivers::pci_pm::clobber(&st, f & PM_PCI_DEEP != 0) } else { 0 };
     let r = alloc::format!("saved {} function(s), {} MSI-X dword-entries, clobbered {} function(s)",
         drivers::pci_pm::count(&st), drivers::pci_pm::msix_entries(&st) , stuck);
     *PCI_SAVED.lock() = Some(st);
@@ -88,7 +90,7 @@ fn pci_suspend(f: u32) -> Result<String, String> {
 
 fn pci_resume(f: u32) -> Result<String, String> {
     let Some(st) = PCI_SAVED.lock().take() else { return Ok(String::from("off")) };
-    let dead = drivers::pci_pm::restore_all(&st, f & PM_PCI_DEEP != 0, |ms| sched::kthread::msleep(ms as _));
+    let dead = drivers::pci_pm::restore_all(&st, f & (PM_PCI_DEEP | PM_S3) != 0, |ms| sched::kthread::msleep(ms as _));
     let (n, bad) = drivers::pci_pm::verify(&st);
     for b in bad.iter().take(40) { crate::serial_print_str("[PM] pci mismatch: "); crate::serial_print_str(b); crate::serial_print_str("\n"); }
     if !dead.is_empty() { return Err(alloc::format!("{} function(s) not responding after restore", dead.len())); }
@@ -112,12 +114,39 @@ static DEVS: &[PmDev] = &[
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 
-fn line(out: &mut String, s: &str) {
+pub(crate) fn line(out: &mut String, s: &str) {
     crate::serial_print_str("[PM] ");
     crate::serial_print_str(s);
     crate::serial_print_str("\n");
     out.push_str(s);
     out.push('\n');
+}
+
+/// Run every device suspend hook in order; stops at the first failure and
+/// returns (hooks that succeeded, all ok). Used by the real S3 path.
+pub(crate) fn devs_suspend(flags: u32, out: &mut String) -> (usize, bool) {
+    let mut done = 0usize;
+    for d in DEVS {
+        let t = sched::monotonic_ns();
+        match (d.suspend)(flags) {
+            Ok(s) => { line(out, &alloc::format!("suspend {}: ok in {} us: {}", d.name, (sched::monotonic_ns() - t) / 1000, s)); done += 1; }
+            Err(e) => { line(out, &alloc::format!("suspend {}: FAILED: {}", d.name, e)); return (done, false); }
+        }
+    }
+    (done, true)
+}
+
+/// Resume the first `done` hooks in reverse order.
+pub(crate) fn devs_resume(done: usize, flags: u32, out: &mut String) -> bool {
+    let mut ok = true;
+    for d in DEVS[..done].iter().rev() {
+        let t = sched::monotonic_ns();
+        match (d.resume)(flags) {
+            Ok(s) => line(out, &alloc::format!("resume {}: ok in {} us: {}", d.name, (sched::monotonic_ns() - t) / 1000, s)),
+            Err(e) => { line(out, &alloc::format!("resume {}: FAILED: {}", d.name, e)); ok = false; }
+        }
+    }
+    ok
 }
 
 /// One freeze-only cycle. Returns (all hooks succeeded, report). Nothing may
@@ -184,6 +213,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
 use vfs_server::sysclass::Ops;
 
 const LEVELS: [&str; 6] = ["none", "core", "processors", "platform", "devices", "freezer"];
+const LV_CORE: u8 = 1;
 const LV_DEVICES: u8 = 4;
 const LV_FREEZER: u8 = 5;
 /// Hold time of a sysfs-triggered freeze-only cycle.
@@ -210,6 +240,8 @@ pub fn init() {
             },
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    S3_VALID.store(crate::pm_s3::valid(), Ordering::Relaxed);
     vfs_server::sysclass::set_sysclass_ops(&PM_OPS);
 }
 
@@ -315,7 +347,12 @@ fn suspend_enter(mem: bool) -> i32 {
         line(&mut o, "pm_test=freezer: freeze and thaw only (no freezer yet), nothing to do");
         return 0;
     }
-    if lv != LV_DEVICES { return -38; } // platform/processors/core/none: ENOSYS
+    #[cfg(target_arch = "x86_64")]
+    if lv == 0 || lv == LV_CORE {
+        if !S3_VALID.load(Ordering::Relaxed) { return -22; }
+        return crate::pm_s3::suspend(lv == LV_CORE);
+    }
+    if lv != LV_DEVICES { return -38; } // platform/processors (and any level on aarch64): ENOSYS
     let (ok, _) = freeze_cycle(0, SYSFS_HOLD_MS);
     if ok { 0 } else { -5 }
 }

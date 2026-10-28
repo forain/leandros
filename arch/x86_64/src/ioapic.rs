@@ -121,3 +121,30 @@ pub unsafe fn mask_all() {
         write(0x10 + i * 2, lo | (1 << 16));
     }
 }
+
+/// Saved IOAPIC state for S3 (ID register + every redirection entry).
+pub struct PmState { id: u32, n: u8, rte: [u64; 120] }
+
+pub unsafe fn pm_save() -> Option<PmState> {
+    if IOAPIC_BASE_VIRT == 0 { return None; }
+    let n = (((read(0x01) >> 16) & 0xFF) + 1).min(120) as u8;
+    let mut s = PmState { id: read(0x00), n, rte: [0; 120] };
+    for i in 0..n {
+        s.rte[i as usize] = (read(0x10 + i * 2) as u64) | ((read(0x11 + i * 2) as u64) << 32);
+    }
+    Some(s)
+}
+
+/// Write the ID, then every entry masked, then the saved values (Linux order).
+pub unsafe fn pm_restore(s: &PmState) {
+    if IOAPIC_BASE_VIRT == 0 { return; }
+    write(0x00, s.id);
+    for i in 0..s.n {
+        let v = s.rte[i as usize];
+        write(0x10 + i * 2, (v as u32) | (1 << 16));
+        write(0x11 + i * 2, (v >> 32) as u32);
+    }
+    for i in 0..s.n {
+        write(0x10 + i * 2, s.rte[i as usize] as u32);
+    }
+}
