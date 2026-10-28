@@ -357,7 +357,7 @@ fn tcpsnd(w: &mut Out) {
             let (Some(l), Some(r)) = (t.local_endpoint(), t.remote_endpoint()) else { continue };
             let n = t.sender_snapshot(now);
             if n.sent == 0 && n.tx_queued == 0 { continue; }
-            let _ = writeln!(w, "{:?}-{:?} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+            let _ = writeln!(w, "{}-{} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                 l, r, n.snd_una, n.snd_nxt, n.snd_nxt.wrapping_sub(n.snd_una), n.snd_wnd, n.wscale, n.mss, n.tx_queued,
                 n.nagle as u8, n.timer, n.timer_in_ms, n.timer_delay_ms, n.srtt_ms, n.rttvar_ms, n.rto_ms, n.rto_count,
                 n.dup_acks, n.recover, n.cwnd, n.ssthresh, n.sent, n.rtx, n.acks, n.dupacks, n.rto_fired, n.fast, n.partial, n.bytes_acked);
