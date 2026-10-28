@@ -23,11 +23,13 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::cmp::Ordering as Ord;
 
-/// Operation region address spaces.
+/// Operation region address spaces. Spaces above SPACE_EC reach the host too (it counts what it drops).
 pub const SPACE_MEM: u8 = 0;
 pub const SPACE_IO: u8 = 1;
 pub const SPACE_PCI: u8 = 2;
 pub const SPACE_EC: u8 = 3;
+pub const SPACE_SMBUS: u8 = 4;
+pub const SPACE_CMOS: u8 = 5;
 
 /// Hardware behind the interpreter.
 pub trait Host {
@@ -42,6 +44,8 @@ pub trait Host {
     /// `Notify(node, code)`.
     fn notify(&mut self, node: usize, code: u64);
     fn log(&mut self, msg: &str);
+    /// FACS global lock (`Field(..., Lock, ...)`): acquire or release. Default: nothing.
+    fn global_lock(&mut self, _acquire: bool) {}
 }
 
 #[derive(Clone, Debug, Default)]
@@ -116,6 +120,8 @@ struct FieldUnit {
     bits: u64,
     access: u8,
     update: u8,
+    /// FieldFlags LockRule: take the FACS global lock around every access.
+    lock: bool,
 }
 
 #[derive(Clone)]
@@ -646,6 +652,7 @@ impl Ns {
         *p += 1;
         let mut access = flags & 0x0F;
         let update = (flags >> 5) & 3;
+        let lock = flags & 0x10 != 0;
         let mut bit = 0u64;
         while *p < end {
             match c[*p] {
@@ -659,7 +666,7 @@ impl Ns {
                     s.copy_from_slice(&c[*p..*p + 4]);
                     let (bits, n) = pl_num(c, *p + 4)?;
                     *p += 4 + n;
-                    let fu = FieldUnit { kind, bit_off: bit, bits, access, update };
+                    let fu = FieldUnit { kind, bit_off: bit, bits, access, update, lock };
                     let np = NamePath { root: false, up: 0, segs: vec![s] };
                     self.define(f.scope, &np, Obj::Field(fu));
                     bit += bits;
@@ -816,15 +823,22 @@ impl Ns {
     }
 
     fn unit_read(&mut self, h: &mut dyn Host, fu: &FieldUnit, byte: u64, w: u8) -> R<u64> {
+        if fu.lock { h.global_lock(true); }
+        let r = self.unit_read_inner(h, fu, byte, w);
+        if fu.lock { h.global_lock(false); }
+        r
+    }
+
+    fn unit_read_inner(&mut self, h: &mut dyn Host, fu: &FieldUnit, byte: u64, w: u8) -> R<u64> {
         match fu.kind {
             FieldKind::Region(r) => {
                 let (s, a) = self.region_addr(h, r, byte)?;
-                Ok(if s <= SPACE_EC { h.read(s, a, w) } else { 0 })
+                Ok(h.read(s, a, w))
             }
             FieldKind::Bank { region, bank, val } => {
                 self.store_node(h, bank, &V::Int(val))?;
                 let (s, a) = self.region_addr(h, region, byte)?;
-                Ok(if s <= SPACE_EC { h.read(s, a, w) } else { 0 })
+                Ok(h.read(s, a, w))
             }
             FieldKind::Index { index, data } => {
                 self.store_node(h, index, &V::Int(byte))?;
@@ -835,15 +849,22 @@ impl Ns {
     }
 
     fn unit_write(&mut self, h: &mut dyn Host, fu: &FieldUnit, byte: u64, w: u8, val: u64) -> R<()> {
+        if fu.lock { h.global_lock(true); }
+        let r = self.unit_write_inner(h, fu, byte, w, val);
+        if fu.lock { h.global_lock(false); }
+        r
+    }
+
+    fn unit_write_inner(&mut self, h: &mut dyn Host, fu: &FieldUnit, byte: u64, w: u8, val: u64) -> R<()> {
         match fu.kind {
             FieldKind::Region(r) => {
                 let (s, a) = self.region_addr(h, r, byte)?;
-                if s <= SPACE_EC { h.write(s, a, w, val); }
+                h.write(s, a, w, val);
             }
             FieldKind::Bank { region, bank, val: bv } => {
                 self.store_node(h, bank, &V::Int(bv))?;
                 let (s, a) = self.region_addr(h, region, byte)?;
-                if s <= SPACE_EC { h.write(s, a, w, val); }
+                h.write(s, a, w, val);
             }
             FieldKind::Index { index, data } => {
                 self.store_node(h, index, &V::Int(byte))?;
