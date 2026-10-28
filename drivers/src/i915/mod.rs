@@ -82,6 +82,7 @@ mod rps;
 pub use rps::proc_text;
 mod vblank;
 mod cursor;
+mod outputs;
 
 use hw::reg;
 
@@ -278,6 +279,12 @@ pub fn kexec_quiesce() -> alloc::vec::Vec<String> {
     v.extend(exec::kexec_quiesce());
     v
 }
+
+/// System-sleep hooks (kernel pm): display plane off / back on. The render
+/// engines need nothing for a freeze cycle (no power loss); S3 needs the GT
+/// re-initialised and the modeset restored.
+pub fn pm_suspend() -> Result<String, String> { kms::pm_plane_off() }
+pub fn pm_resume() -> Result<String, String> { kms::pm_plane_on() }
 
 /// Run the probe and, when asked, the engine bring-up. Called once from
 /// kernel init (task context, before userspace), after `nvidia_probe::set_cmdline`.

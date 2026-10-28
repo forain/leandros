@@ -13,6 +13,8 @@
 
 use core::ffi::c_void;
 
+mod churn;
+
 pub type pthread_t = *mut c_void;
 pub type pthread_key_t = u64;
 
@@ -60,6 +62,7 @@ extern "C" {
     ) -> i32;
 
     pub fn pthread_join(thread: pthread_t, retval: *mut *mut c_void) -> i32;
+    pub fn pthread_detach(thread: pthread_t) -> i32;
 
     pub fn pthread_mutex_init(mutex: *mut pthread_mutex_t, attr: *const c_void) -> i32;
     pub fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> i32;
@@ -145,6 +148,18 @@ pub unsafe extern "C" fn pthread_main(argc: isize, argv: *mut *mut u8, _envp: *m
         let msg = b"EXITKILL: FAIL (exit returned)\n";
         write(1, msg.as_ptr(), msg.len());
         return 1;
+    }
+
+    // Mode `pthreadtest churn [N]`: only the thread-churn leak check.
+    if argc >= 2 && arg_eq(argv, 1, b"churn") {
+        let mut n = 5000u64;
+        if argc >= 3 {
+            let p = *argv.offset(2);
+            let mut v = 0u64; let mut i = 0;
+            while (*p.add(i)).is_ascii_digit() { v = v * 10 + (*p.add(i) - b'0') as u64; i += 1; }
+            if v > 0 { n = v; }
+        }
+        return if churn::test_thread_churn_flat(n) { 0 } else { 1 };
     }
 
     let mut failures = 0;

@@ -422,6 +422,7 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
         },
         DRM_MODE_OBJECT_CRTC_T if obj_id == DRM_CRTC_ID => CRTC,
         DRM_MODE_OBJECT_CONNECTOR_T if obj_id == DRM_CONNECTOR_ID => CONNECTOR,
+        DRM_MODE_OBJECT_CONNECTOR_T if crate::gpu_kms::ext_index(obj_id, crate::gpu_kms::EXT_CONN_BASE).is_some() => CONNECTOR,
         // obj_type 0 (DRM_MODE_OBJECT_ANY) or an unrecognised type: fall back
         // to the plane ids, which are the only unambiguous ones.
         _ => match obj_id {
@@ -6837,15 +6838,25 @@ impl DrmDeviceInterface {
         }
         res.count_crtcs = 1;
 
-        if res.connector_id_ptr != 0 && res.count_connectors >= 1 {
+        // Extra connectors/encoders of a backend's other outputs (lane lapdisp).
+        let next = crate::gpu_kms::ext_count();
+        if res.connector_id_ptr != 0 && res.count_connectors as usize >= 1 + next {
             unsafe { sched::uaccess::copy_to_user(res.connector_id_ptr as usize, connector_ids.as_ptr() as *const u8, (1) * 4); }
+            for i in 0..next {
+                let id = crate::gpu_kms::EXT_CONN_BASE + i as u32;
+                unsafe { sched::uaccess::copy_to_user(res.connector_id_ptr as usize + 4 * (1 + i), &id as *const u32 as *const u8, 4); }
+            }
         }
-        res.count_connectors = 1;
+        res.count_connectors = 1 + next as u32;
 
-        if res.encoder_id_ptr != 0 && res.count_encoders >= 1 {
+        if res.encoder_id_ptr != 0 && res.count_encoders as usize >= 1 + next {
             unsafe { sched::uaccess::copy_to_user(res.encoder_id_ptr as usize, encoder_ids.as_ptr() as *const u8, (1) * 4); }
+            for i in 0..next {
+                let id = crate::gpu_kms::EXT_ENC_BASE + i as u32;
+                unsafe { sched::uaccess::copy_to_user(res.encoder_id_ptr as usize + 4 * (1 + i), &id as *const u32 as *const u8, 4); }
+            }
         }
-        res.count_encoders = 1;
+        res.count_encoders = 1 + next as u32;
 
         res.min_width = 320;
         res.max_width = 4096;
@@ -6859,9 +6870,14 @@ impl DrmDeviceInterface {
     fn std_handle_get_connector(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         with_user_struct(arg, |conn: &mut drm_mode_get_connector| {
-        
+        if let Some(i) = crate::gpu_kms::ext_index(conn.connector_id, crate::gpu_kms::EXT_CONN_BASE) {
+            return Self::ext_get_connector(conn, i);
+        }
         conn.connector_id = 1;
-        conn.connector_type = 11; // DRM_MODE_CONNECTOR_VIRTUAL
+        // 11 is DRM_MODE_CONNECTOR_HDMIA (VIRTUAL is 15), kept as before. A
+        // backend with real extra outputs (i915) drives the internal panel:
+        // report eDP-1 so it never shares a name with an HDMI-A-1 port.
+        conn.connector_type = if crate::gpu_kms::ext_count() > 0 { 14 } else { 11 };
         conn.connector_type_id = 1;
         conn.connection = 1; // Connected
 
@@ -6928,9 +6944,56 @@ impl DrmDeviceInterface {
         })
     }
 
+    /// GETCONNECTOR of extra connector `i` (lane lapdisp): the backend's
+    /// probed status and EDID modes, no encoder bound.
+    fn ext_get_connector(conn: &mut drm_mode_get_connector, i: usize) -> Result<usize, DriverError> {
+        let inf = match crate::gpu_kms::outputs().and_then(|o| (o.info)(i)) {
+            Some(c) => c,
+            None => return Err(DriverError::InvalidParameter),
+        };
+        conn.connector_type = inf.conn_type;
+        conn.connector_type_id = inf.type_id;
+        conn.connection = if inf.connected { 1 } else { 2 };
+        conn.mm_width = inf.mm_w;
+        conn.mm_height = inf.mm_h;
+        conn.subpixel = 1; // UNKNOWN
+        conn.encoder_id = 0;
+        if conn.encoders_ptr != 0 && conn.count_encoders >= 1 {
+            let e = crate::gpu_kms::EXT_ENC_BASE + i as u32;
+            unsafe { sched::uaccess::copy_to_user(conn.encoders_ptr as usize, &e as *const u32 as *const u8, 4); }
+        }
+        conn.count_encoders = 1;
+        let n = if inf.connected { inf.nmodes } else { 0 };
+        if conn.modes_ptr != 0 {
+            for (k, t) in inf.modes[..n.min(conn.count_modes as usize)].iter().enumerate() {
+                let mut mode = mode_60hz(t.h[0] as u32, t.v[0] as u32, k == 0);
+                mode.clock = t.clock_khz;
+                mode.hsync_start = t.h[1]; mode.hsync_end = t.h[2]; mode.htotal = t.h[3];
+                mode.vsync_start = t.v[1]; mode.vsync_end = t.v[2]; mode.vtotal = t.v[3];
+                mode.flags = t.flags;
+                let tot = t.h[3] as u64 * t.v[3] as u64;
+                mode.vrefresh = if tot > 0 { ((t.clock_khz as u64 * 1000 + tot / 2) / tot) as u32 } else { 60 };
+                unsafe {
+                    sched::uaccess::copy_to_user((conn.modes_ptr as *mut drm_mode_modeinfo).add(k) as usize, &mode as *const drm_mode_modeinfo as *const u8, ::core::mem::size_of::<drm_mode_modeinfo>());
+                }
+            }
+        }
+        conn.count_modes = n as u32;
+        conn.count_props = 0;
+        Ok(0)
+    }
+
     fn std_handle_get_encoder(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         with_user_struct(arg, |enc: &mut drm_mode_get_encoder| {
+        if let Some(i) = crate::gpu_kms::ext_index(enc.encoder_id, crate::gpu_kms::EXT_ENC_BASE) {
+            // Not bound, and no CRTC can drive it yet (no second-pipe modeset).
+            enc.encoder_type = crate::gpu_kms::outputs().and_then(|o| (o.cached)(i)).map_or(2, |c| c.enc_type);
+            enc.crtc_id = 0;
+            enc.possible_crtcs = 0;
+            enc.possible_clones = 0;
+            return Ok(0);
+        }
         enc.encoder_id = 1;
         enc.encoder_type = 3; // DRM_MODE_ENCODER_VIRTUAL
         enc.crtc_id = 1;
@@ -7645,6 +7708,11 @@ impl DrmDeviceInterface {
                         want_mode = Some(val);
                     }
                     // ── connector ──
+                    // An extra connector (lane lapdisp) can only stay off.
+                    PROP_CONN_CRTC_ID if obj != DRM_CONNECTOR_ID
+                        && crate::gpu_kms::ext_index(obj, crate::gpu_kms::EXT_CONN_BASE).is_some() => {
+                        if val != 0 { return Err(DriverError::InvalidParameter); }
+                    }
                     PROP_CONN_CRTC_ID => {
                         if obj != DRM_CONNECTOR_ID { return Err(DriverError::InvalidParameter); }
                         want_conn_crtc = Some(val);

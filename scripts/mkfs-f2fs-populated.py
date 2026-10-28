@@ -426,7 +426,7 @@ def main():
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "uinputtest", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
-        "sndtest", "syscalltest", "uaccesstest", "proctest", "proctest-cold.bin", "chroottest", "kexectest", "kexec", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid",
+        "sndtest", "syscalltest", "uaccesstest", "proctest", "proctest-cold.bin", "chroottest", "kexectest", "kexec", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -1245,6 +1245,19 @@ def main():
                 m4_share_files.append(("/lib/firmware", _f, os.path.join(_iwl_cache, _f)))
             if _iwl:
                 print(f"  iwlwifi firmware: {', '.join(_iwl)} in /lib/firmware")
+    # Intel Bluetooth (btusb + btintel, x86_64 laptops): /lib/firmware/intel/
+    # ibt-*.{sfi,ddc} from the cache ports/intel-bt/fetch.sh fills
+    # ($INTEL_BT_CACHE, default ~/.cache/leandros/intel-bt). Absent -> skipped.
+    if arch == "x86_64":
+        _ibt_cache = os.path.expanduser(os.environ.get("INTEL_BT_CACHE", "~/.cache/leandros/intel-bt"))
+        if os.path.isdir(_ibt_cache):
+            _ibt = sorted(f for f in os.listdir(_ibt_cache) if f.startswith("ibt-") and (f.endswith(".sfi") or f.endswith(".ddc")))
+            for _f in _ibt:
+                for d in ("/lib/firmware", "/lib/firmware/intel"):
+                    m4_share_dirs.add(d)
+                m4_share_files.append(("/lib/firmware/intel", _f, os.path.join(_ibt_cache, _f)))
+            if _ibt:
+                print(f"  intel-bt firmware: {', '.join(_ibt)} in /lib/firmware/intel")
     # Raspberry Pi 5 Wi-Fi (CYW43455, brcmfmac family): /lib/firmware/brcm/
     # {cyw43455-sdio.bin, cyw43455-sdio.clm_blob, brcmfmac43455-sdio.raspberrypi,
     # 5-model-b.txt} from the cache ports/brcmfmac/fetch.sh fills
