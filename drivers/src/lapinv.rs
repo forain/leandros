@@ -141,7 +141,7 @@ pub fn aml_scan(t: &[u8]) -> Vec<(String, &'static str, String)> {
             }
         }
         if t[i] == 0x08 && (&t[i + 1..i + 5] == b"_HID" || &t[i + 1..i + 5] == b"_CID") {
-            let which = if t[i + 3] == b'H' { "_HID" } else { "_CID" };
+            let which = if t[i + 2] == b'H' { "_HID" } else { "_CID" };
             let path = stack.last().map(|e| e.1.clone()).unwrap_or_else(|| String::from("?"));
             let id = match t[i + 5] {
                 0x0C if i + 10 <= t.len() => eisaid(u32::from_le_bytes([t[i + 6], t[i + 7], t[i + 8], t[i + 9]])),
@@ -259,8 +259,8 @@ fn tb_probe() {
             let flags = mm::paging::PageFlags::PRESENT | mm::paging::PageFlags::MMIO;
             let fw = unsafe { mm::paging::map_kernel_device(bar0 as usize + 0x39000, 0x1000, flags) }
                 .map(|va| unsafe { core::ptr::read_volatile((va + 0x944) as *const u32) });
-            let mail = unsafe { mm::paging::map_kernel_device(bar0 as usize + 0x19000, 0x1000, flags) }
-                .map(|va| unsafe { core::ptr::read_volatile((va + 0xE1C) as *const u32) });
+            let mail = unsafe { mm::paging::map_kernel_device(bar0 as usize + 0x39000, 0x1000, flags) }
+                .map(|va| unsafe { core::ptr::read_volatile((va + 0x90C) as *const u32) });
             if let Some(v) = fw {
                 s.push_str(&format!(" FW_STS {:#010x} (ICM_EN={} nvm_auth_done={})", v, v & 1, v >> 31));
             }
@@ -337,6 +337,13 @@ fn smbus_probe() {
     let f = d.function();
     let base = (f.read32(0x20) & 0xFFE0) as u16;
     let hostc = f.read8(0x40);
+    let cmd = f.read16(0x04);
+    if base != 0 && hostc & 1 != 0 && cmd & pci::CMD_IO == 0 {
+        // Firmware left I/O decode off (the laptop does); turn it on as
+        // Linux's i801 does through pci_enable_device().
+        f.write16(0x04, cmd | pci::CMD_IO);
+        log(&format!("smbus {:04x}: enabled I/O decode (cmd {:#x} -> {:#x})", d.device_id, cmd, f.read16(0x04)));
+    }
     let cmd = f.read16(0x04);
     if base == 0 || hostc & 1 == 0 || cmd & pci::CMD_IO == 0 {
         return log(&format!("smbus {:04x}: host disabled (base {:#x} HOSTC {:#x} cmd {:#x}), not probing", d.device_id, base, hostc, cmd));
