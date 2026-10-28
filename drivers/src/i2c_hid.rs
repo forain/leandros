@@ -145,7 +145,15 @@ fn setup_pad(name: &str, bus: usize, s: &I2cSlave, d: &Descriptor, ids: (u16, u1
     if !acked { return Err(fail(String::from("RESET not acked in 1 s"))); }
     let pl = hid_ptp::feature_payload(mode, 3);
     if let Err(e) = set_feature(bus, s.addr, cmd_reg, data_reg, mode.id, &pl) { return Err(fail(format!("SET_REPORT mode {:#x}", e))); }
-    match get_feature(bus, s.addr, cmd_reg, data_reg, mode.id, pl.len()) {
+    // The pad may NAK commands while it applies the mode switch: retry.
+    let mut got = get_feature(bus, s.addr, cmd_reg, data_reg, mode.id, pl.len());
+    for i in 0..30 {
+        let Err(e) = got else { break };
+        if i == 0 { log(&format!("i2c-hid: {} GET_REPORT mode first try {:#x}, retrying", name, e)); }
+        spin_ms(10);
+        got = get_feature(bus, s.addr, cmd_reg, data_reg, mode.id, pl.len());
+    }
+    match got {
         Ok(r) => {
             let v = hid_ptp::bits(&r, mode.bit, mode.size);
             log(&format!("i2c-hid: {} touchpad Input Mode read back {} (feature id {})", name, v, mode.id));
