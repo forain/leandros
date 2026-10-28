@@ -152,6 +152,23 @@ static TX_RECOVER: AtomicBool = AtomicBool::new(true);
 static QUEUES: AtomicUsize = AtomicUsize::new(1);
 static TXD_AT_ERR: Mutex<Option<hw::Desc>> = Mutex::new(None);
 static PCIE_FIX: Mutex<Option<String>> = Mutex::new(None);
+/// Bus address of TX queue 0's ring (TBQPH:TBQP), rewritten on every rewind.
+static TX_DMA: AtomicU64 = AtomicU64::new(0);
+static RX_DMA: AtomicU64 = AtomicU64::new(0);
+/// Rewinds of an idle-but-not-progressing TX queue (`hw::TxStall`).
+static TX_STALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Make descriptor/buffer stores (Normal NC or cleaned lines) visible to the
+/// device before the doorbell (Device) write: Linux `wmb()` before TSTART.
+/// `fence(SeqCst)` is only `dmb ish`, which does not order against a
+/// PCIe-attached observer.
+#[inline]
+fn wmb() {
+    #[cfg(target_arch = "aarch64")]
+    unsafe { core::arch::asm!("dsb st", options(nostack, preserves_flags)); }
+    #[cfg(not(target_arch = "aarch64"))]
+    core::sync::atomic::fence(Ordering::SeqCst);
+}
 
 struct Rings {
     rx: RxRing,
@@ -262,6 +279,8 @@ pub fn init(cmdline: &str) {
     m.w32(hw::TBQPH, (tx_dma >> 32) as u32);
     m.w32(hw::RBQP, rx_dma as u32);
     m.w32(hw::TBQP, tx_dma as u32);
+    TX_DMA.store(tx_dma, Ordering::SeqCst);
+    RX_DMA.store(rx_dma, Ordering::SeqCst);
     // Unused priority queues point at a dummy USED|WRAP descriptor.
     for q in 1..queues {
         m.w32(hw::TBQPQ1 + 4 * (q - 1), dummy_dma as u32);
@@ -303,6 +322,11 @@ fn zeroed_page() -> Option<usize> {
 /// mapped Normal Non-cacheable. Returns (CPU pointer, physical address).
 fn desc_page() -> Option<(*mut Desc, usize)> {
     let p = zeroed_page()?;
+    // The Normal Non-cacheable alias must not find lines of this page in the
+    // cache: zeroed_page only cleaned them, and an NC access that hits a line
+    // left by the cacheable linear alias reads (and writes) the stale cached
+    // copy, never memory. Clean + invalidate, as Linux arch_dma_prep_coherent.
+    mm::dma_cache::sync_for_cpu(mm::phys_to_virt(p), PAGE);
     let va = if mm::dma_cache::coherent() { mm::phys_to_virt(p) }
              else { mm::kva::vmap(&[p as u64], mm::kva::CacheMode::WriteCombining)? };
     Some((va as *mut Desc, p))
@@ -356,6 +380,7 @@ fn driver_thread(mut m: Mmio, want: u8, mut mode: PhyMode, pinned: bool, polled:
     let mut win_start = (0u64, hw::HwStats::default());
     let mut flips = 0u32;
     let mut rx_ok_said = false;
+    let mut stall = hw::TxStall::default();
     loop {
         let res = { let _g = NCR_LOCK.lock(); w.poll(&mut m, addr) };
         match res {
@@ -404,9 +429,25 @@ fn driver_thread(mut m: Mmio, want: u8, mut mode: PhyMode, pinned: bool, polled:
         }
         tx_check(&mut m);
         // TX doorbell retry: frames posted while the controller was halting.
+        // A queue that stays idle on the same descriptor with frames posted
+        // (TSR.TGO clear, TBQP not moving, TSTART rung every poll) is out of
+        // step with the ring: rewind both to the base, as after an error.
         if let Some(r) = RINGS.lock().as_mut() {
             r.tx.reclaim();
-            if r.tx.in_flight() > 0 { ncr_set(&mut m, hw::NCR_TSTART, 0); }
+            if r.tx.in_flight() > 0 { wmb(); ncr_set(&mut m, hw::NCR_TSTART, 0); }
+            let tgo = m.r32(hw::TSR) & hw::TSR_TGO != 0;
+            let slot = hw::ring_slot(m.r32(hw::TBQP), TX_DMA.load(Ordering::Relaxed) as u32, r.tx.len());
+            // Link down: TE is off on purpose, nothing is stalled.
+            if stall.tick(slot, r.tx.tail(), if w.cur.up { r.tx.in_flight() } else { 0 }, tgo) {
+                let n = TX_STALLS.fetch_add(1, Ordering::Relaxed) + 1;
+                let (h, t) = (r.tx.head(), r.tx.tail());
+                let d = r.tx.desc(slot.unwrap_or(t));
+                let dropped = tx_rewind(&mut m, &mut r.tx);
+                if n <= 3 {
+                    mlog!("tx stalled: TBQP slot {:?} head {} tail {} desc {:08x} {:08x} {:08x}; queue rewound, {} frame(s) dropped",
+                          slot, h, t, d.addr, d.ctrl, d.addr_hi, dropped);
+                }
+            }
         }
         sched::kthread::msleep(if w.cur.up { 1000 } else { 250 });
     }
@@ -479,6 +520,7 @@ pub fn send_packet(buf: &[u8]) -> bool {
     }
     mm::dma_cache::sync_for_device(dst, len);
     r.tx.post(idx, len);
+    wmb();
     ncr_set(&mut m, hw::NCR_TSTART, 0);
     TX_PKTS.fetch_add(1, Ordering::Relaxed);
     TX_BYTES.fetch_add(buf.len() as u64, Ordering::Relaxed);
@@ -622,6 +664,14 @@ isr tcomp {} rcomp {} txubr {} hresp {} | sw tx {} rx {} | TSR {:#x} RSR {:#x} N
     if let Some(r) = RINGS.lock().as_ref() {
         let d = r.tx.desc(0);
         let _ = write!(l, " txd0 {:08x} {:08x} {:08x}", d.addr, d.ctrl, d.addr_hi);
+        let ts = hw::ring_slot(m.r32(hw::TBQP), TX_DMA.load(Ordering::Relaxed) as u32, r.tx.len());
+        let _ = write!(l, " | txring head {} tail {} hw {:?} stalls {} ctrl0-3", r.tx.head(), r.tx.tail(), ts,
+                       TX_STALLS.load(Ordering::Relaxed));
+        for i in 0..4 { let _ = write!(l, " {:08x}", r.tx.desc(i).ctrl); }
+        let rs = hw::ring_slot(m.r32(hw::RBQP), RX_DMA.load(Ordering::Relaxed) as u32, r.rx.len());
+        let rd = r.rx.desc(r.rx.head());
+        let _ = write!(l, " | rxring head {} hw {:?} frags {} rxd[head] {:08x} {:08x}", r.rx.head(), rs,
+                       RX_FRAGS.load(Ordering::Relaxed), rd.addr, rd.ctrl);
     }
     if let Some(p) = PCIE_FIX.lock().as_ref() { let _ = write!(l, " | pcie {}", p); }
     l
@@ -649,6 +699,30 @@ fn pcie_fixup(cmdline: &str) -> String {
             if off { " [macb.mps=0]" } else { "" })
 }
 
+/// Stop the transmitter, give every slot back and point TBQP at the ring
+/// base again; TE stays off. Linux `macb_tx_error_task` rewrites TBQP too:
+/// clearing TE alone does not move the queue pointer on every GEM, and a
+/// software ring rewound to 0 under a controller parked on slot k stalls.
+fn tx_rewind_keep_off(m: &mut Mmio, tx: &mut TxRing) -> usize {
+    ncr_set(m, 0, hw::NCR_TE);
+    let mut spins = 0;
+    while m.r32(hw::TSR) & hw::TSR_TGO != 0 && spins < 100 { sched::kthread::udelay(10); spins += 1; }
+    let dropped = tx.reset();
+    TX_DROPS.fetch_add(dropped as u64, Ordering::Relaxed);
+    let base = TX_DMA.load(Ordering::Relaxed);
+    wmb();
+    m.w32(hw::TBQPH, (base >> 32) as u32);
+    m.w32(hw::TBQP, base as u32);
+    dropped
+}
+
+fn tx_rewind(m: &mut Mmio, tx: &mut TxRing) -> usize {
+    let dropped = tx_rewind_keep_off(m, tx);
+    m.w32(hw::TSR, m.r32(hw::TSR));
+    ncr_set(m, hw::NCR_TE, 0);
+    dropped
+}
+
 /// A transmitter that halted on an error (TSR tfc/hresp/rle/und) stays
 /// halted: Linux's `macb_tx_error_task` cycles TE (which moves the queue
 /// back to its base), gives every slot back, clears TSR and restarts.
@@ -665,11 +739,7 @@ fn tx_check(m: &mut Mmio) {
         m.w32(hw::TSR, tsr);
         return;
     }
-    ncr_set(m, 0, hw::NCR_TE);
-    let mut spins = 0;
-    while m.r32(hw::TSR) & hw::TSR_TGO != 0 && spins < 100 { sched::kthread::udelay(10); spins += 1; }
-    let dropped = r.tx.reset();
-    TX_DROPS.fetch_add(dropped as u64, Ordering::Relaxed);
+    let dropped = tx_rewind_keep_off(m, &mut r.tx);
     m.w32(hw::TSR, tsr);
     let mut note = String::new();
     if BURST_AUTO.load(Ordering::Relaxed) && tsr & (hw::TSR_TFC | hw::TSR_HRESP) != 0 && n % 2 == 0 {
