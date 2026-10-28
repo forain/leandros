@@ -251,6 +251,19 @@ impl<'a> Buf<'a> {
         if v < 0 { self.s("-"); }
         self.u(v.unsigned_abs())
     }
+    /// "0x" + lowercase hex, no leading zeros.
+    pub fn x(&mut self, v: u64) -> &mut Self {
+        self.s("0x");
+        let mut started = false;
+        for k in (0..16).rev() {
+            let d = ((v >> (k * 4)) & 0xf) as u8;
+            if d == 0 && !started && k != 0 { continue; }
+            started = true;
+            let c = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+            if self.n < self.b.len() { self.b[self.n] = c; self.n += 1; }
+        }
+        self
+    }
     /// Millidegrees as "52.3".
     pub fn mc(&mut self, m: i32) -> &mut Self {
         if m < 0 { self.s("-"); }
@@ -321,5 +334,15 @@ pub mod wdt {
     pub fn dtb_has_pm(dtb: &[u8]) -> bool {
         let has = |pat: &[u8]| dtb.windows(pat.len()).any(|w| w == pat);
         has(b"brcm,bcm2712-pm\0") || has(b"brcm,bcm2835-pm\0") || has(b"brcm,bcm2835-pm-wdt\0")
+    }
+
+    /// Do PM_RSTC / PM_RSTS / PM_WDOG read like a live BCM2835-style PM block?
+    /// Used when the DTB has no PM node (the FDT a kexec builds is a minimal
+    /// `linux,dummy-virt` tree) but the SoC id says BCM2712. The password
+    /// byte reads back as 0 and PM_WDOG holds only its 20-bit counter, so a
+    /// floating / absent / error bus (all-ones, or junk in the high bits) fails.
+    pub fn pm_regs_plausible(rstc: u32, rsts: u32, wdog: u32) -> bool {
+        let hi = 0xff00_0000;
+        rstc & hi == 0 && rsts & hi == 0 && wdog & !super::pm::WDOG_TIME_SET == 0
     }
 }

@@ -275,8 +275,20 @@ pub fn serial_magic(b: u8, brk: bool, now_ms: u64) {
 fn wdt_init(cmdline: &str) {
     use crate::rpi_misc_logic::wdt;
     let dt_pm = unsafe { boot::device_tree::recorded_dtb() }.map(wdt::dtb_has_pm).unwrap_or(false);
-    if !dt_pm { return serial_debug("[WDT] no bcm2712-pm node in the DTB: watchdog off\n"); }
+    // After a kexec the DTB is our own minimal FDT (no PM node). If the SoC id
+    // registers decode as BCM2712, use the fixed PM block, but only after its
+    // registers read back plausibly; anything else stays inert.
+    let chip = !dt_pm && crate::bcm2712_id::stepping().source == crate::bcm2712_id::Source::Hw;
+    if !dt_pm && !chip { return serial_debug("[WDT] no bcm2712-pm node in the DTB and no BCM2712 chip id: watchdog off\n"); }
     let Some(_) = crate::rpi_pm::base() else { return serial_debug("[WDT] bcm2712-pm fail map\n") };
+    if chip {
+        let (rstc, rsts, wdog) = crate::rpi_pm::with(|r| (r.r(crate::rpi_misc_logic::pm::RSTC),
+            r.r(crate::rpi_misc_logic::pm::RSTS), r.r(crate::rpi_misc_logic::pm::WDOG))).unwrap_or((u32::MAX, u32::MAX, u32::MAX));
+        if !wdt::pm_regs_plausible(rstc, rsts, wdog) {
+            return line(|b| { b.s("[WDT] BCM2712 chip id but PM regs implausible rstc=").x(rstc as u64).s(" rsts=").x(rsts as u64).s(" wdog=").x(wdog as u64).s(": watchdog off"); });
+        }
+        serial_debug("[WDT] no PM node in the DTB (kexec FDT): BCM2712 chip id, PM regs sane, using 0x107d200000\n");
+    }
     PM_OK.store(true, Ordering::Release);
     let was = crate::rpi_pm::with(|r| crate::rpi_misc_logic::pm::is_running(r)).unwrap_or(false);
     if opt(cmdline, "wdt.off") == Some("1") {
