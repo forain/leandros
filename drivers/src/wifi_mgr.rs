@@ -1348,6 +1348,7 @@ pub fn run<R: Radio>(mgr: &'static Mgr, r: &mut R) {
                         let mut st = mgr.st.lock();
                         st.auto_blocked = false;
                         st.wrong_key.retain(|u| *u != p.profile_uuid);
+                    crate::wifi_wrongkey::clear_profile(&mut st.wk_bss, &p.profile_uuid);
                         st.backoff.retain(|b| b.uuid != p.profile_uuid);
                     }
                     if rfkill || !mgr.st.lock().radio_on { continue; }
@@ -1378,7 +1379,9 @@ pub fn run<R: Radio>(mgr: &'static Mgr, r: &mut R) {
                     {
                         let mut st = mgr.st.lock();
                         st.wrong_key.clear();
+                        st.wk_bss.clear();
                         st.backoff.clear();
+                        st.bss_backoff.clear();
                         st.auto_blocked = false;
                         st.next_auto_ms = 0;
                     }
@@ -1669,7 +1672,9 @@ fn connected<R: Radio>(mgr: &Mgr, r: &mut R, req: &Req, bssid: [u8; 6]) -> After
                 {
                     let mut st = mgr.st.lock();
                     st.wrong_key.clear();
+                    st.wk_bss.clear();
                     st.backoff.clear();
+                    st.bss_backoff.clear();
                     st.auto_blocked = false;
                 }
                 mgr.refresh_flags();
@@ -1706,6 +1711,7 @@ fn connected<R: Radio>(mgr: &Mgr, r: &mut R, req: &Req, bssid: [u8; 6]) -> After
                     let mut st = mgr.st.lock();
                     st.auto_blocked = false;
                     st.wrong_key.retain(|u| *u != p.profile_uuid);
+                    crate::wifi_wrongkey::clear_profile(&mut st.wk_bss, &p.profile_uuid);
                     st.backoff.retain(|b| b.uuid != p.profile_uuid);
                 }
                 return After::Next(Req::from_params(p));
