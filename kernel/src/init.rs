@@ -260,6 +260,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     } else if cl.split_ascii_whitespace().any(|t| t == "wdog.selftest=2") {
         sched::wdog_selftest_arm_forever();
     }
+    #[cfg(target_arch = "x86_64")]
+    drivers::lapinv::run(boot_info.rsdp_addr, boot_info.hhdm_offset, crate::boot_cmdline().unwrap_or(""));
     drivers::nvidia_probe::run(
         boot_info.rsdp_addr, boot_info.hhdm_offset,
         boot_info.framebuffer_base, boot_info.framebuffer_width,
