@@ -63,3 +63,5 @@ mod frame_tests;
 pub mod wifi_ht;
 #[cfg(test)]
 mod ht_tests;
+#[cfg(test)]
+mod vhtrs_tests;

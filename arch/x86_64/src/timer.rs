@@ -407,6 +407,25 @@ pub unsafe fn init_local_timer() {
     apic::write(apic::LAPIC_TIMER_INIT, ticks_per_irq);
 }
 
+/// S3 resume: the TSC restarted. Re-seed the epoch so CLOCK_MONOTONIC continues
+/// from `mono_ns`, and shift every stored raw TSC value by the same delta. Call
+/// before the local timer is re-armed. Returns the delta (wrapping).
+pub unsafe fn pm_rebase(mono_ns: u64) -> u64 {
+    let per = TSC_PER_TICK.load(Ordering::Relaxed);
+    let new_epoch = rdtsc().wrapping_sub(((mono_ns as u128) * per as u128 / 10_000_000u128) as u64);
+    let old = EPOCH_TSC.swap(new_epoch, Ordering::SeqCst);
+    let delta = new_epoch.wrapping_sub(old);
+    GRID_TSC.store(GRID_TSC.load(Ordering::Relaxed).wrapping_add(delta), Ordering::SeqCst);
+    for i in 0..TIMER_MAX_CPUS {
+        let o = ONESHOT_TSC[i].load(Ordering::Relaxed);
+        if o != u64::MAX { ONESHOT_TSC[i].store(o.wrapping_add(delta), Ordering::Relaxed); }
+        LAST_IRQ_TSC[i].store(LAST_IRQ_TSC[i].load(Ordering::Relaxed).wrapping_add(delta), Ordering::Relaxed);
+        LAST_TICK_TSC[i].store(LAST_TICK_TSC[i].load(Ordering::Relaxed).wrapping_add(delta), Ordering::Relaxed);
+        LAPIC_STATE[i].store(ST_PERIODIC, Ordering::Relaxed);
+    }
+    delta
+}
+
 const TIMER_MAX_CPUS: usize = sched::MAX_CPUS;
 
 /// Per CPU: the earliest pending one-shot deadline (TSC units) armed by

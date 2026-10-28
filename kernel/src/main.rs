@@ -13,6 +13,8 @@ mod hungtask;
 mod lappower;
 mod power;
 mod pm;
+#[cfg(target_arch = "x86_64")]
+mod pm_s3;
 mod kexec;
 #[cfg(target_arch = "x86_64")]
 mod direct_hhdm;
@@ -1473,6 +1475,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     }
     // `apic.x2apic=1`: run the local APICs in x2APIC mode even when no APIC
     // ID needs it (tests the mode firmware and kexec hand-offs leave us in).
+    #[cfg(target_arch = "x86_64")]
+    arch_x86_64::smp::set_nosmp(boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "nosmp")));
     #[cfg(target_arch = "x86_64")]
     arch_x86_64::apic::set_force_x2apic(cmdline_knob("apic.x2apic").map_or(false, |v| v != "0"));
     // `pan=strict|audit|off` on x86_64 drives SMAP (see the aarch64 knob below):

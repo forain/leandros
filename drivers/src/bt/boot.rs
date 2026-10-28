@@ -305,8 +305,19 @@ pub fn start(cmdline: &str, serror: SerrorCheck, on_ready: fn(port: u32)) {
     log(&format!("uarta {} lsr={:#x} baud={}", mux, lsr, oper));
     // Read the address now, while the boot DTB is certainly mapped.
     let dt_addr = unsafe { boot::device_tree::recorded_dtb() }.and_then(bringup::fdt_local_bd_address);
+    // OTP-derived (Ethernet MAC + 2); the placeholder stays when the OTP read failed.
+    // The firmware tag can fail on the board; its `smsc95xx.macaddr=` (the same Ethernet MAC) then stands in.
+    let cmd_mac = opt(cmdline, "smsc95xx.macaddr").and_then(bringup::parse_mac_text).filter(|m| m[0] & 1 == 0 && *m != [0; 6]);
+    let (bt_mac, mac_src) = match crate::bcm2712_otp::bt_mac() {
+        Some(m) => (Some(m), "set-from-otp"),
+        None => (cmd_mac.map(|m| crate::bcm2712_otp::bt_from_eth(&m)), "set-from-cmdline-mac"),
+    };
+    let otp_addr = bt_mac.map(|m| bringup::bdaddr_from_mac(&m));
+    let (dt_addr, addr_src) = bringup::pick_bdaddr(opt(cmdline, "bt.bdaddr"), dt_addr, otp_addr);
+    let addr_src = if addr_src == "set-from-otp" { mac_src } else { addr_src };
+    if bt_mac.is_none() { log("bdaddr: no otp mac and no smsc95xx.macaddr (placeholder stays)"); }
     STATE.store(STATE_RUNNING, Ordering::Release);
-    if sched::kthread::spawn("bt", move || run(uart, oper, patch, dt_addr, on_ready)).is_none() {
+    if sched::kthread::spawn("bt", move || run(uart, oper, patch, dt_addr, addr_src, on_ready)).is_none() {
         STATE.store(STATE_FAILED, Ordering::Release);
         log("fail thread-spawn");
     }
@@ -332,7 +343,7 @@ fn load_hcd() -> Result<(Vec<u8>, &'static str), String> {
     Err(last)
 }
 
-fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready: fn(port: u32)) {
+fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, addr_src: &'static str, on_ready: fn(port: u32)) {
     let t0 = now_us();
     let hcd = if patch {
         while !crate::firmware::root_ready() {
@@ -361,7 +372,7 @@ fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready
         let t1 = now_us();
         let o = Options { hcd: hcd.as_deref(), oper_baud: Some(oper), bdaddr: dt_addr, cmd_timeout_us: 0 };
         match bringup::bring_up(&mut uart, &o) {
-            Ok(r) => return ready(&mut uart, r, t1, &power, on_ready),
+            Ok(r) => return ready(&mut uart, r, t1, &power, addr_src, on_ready),
             Err(e) => {
                 let msg = fail_msg(&mut uart, &e, &power);
                 if attempt == 1 && e.stage != "hcd" {
@@ -376,13 +387,13 @@ fn run(mut uart: Uart, oper: u32, patch: bool, dt_addr: Option<BdAddr>, on_ready
 
 fn pad01(p: Option<bool>) -> &'static str { match p { Some(true) => "1", Some(false) => "0", None => "?" } }
 
-fn ready(uart: &mut Uart, r: bringup::Report, t1: u64, power: &str, on_ready: fn(port: u32)) {
+fn ready(uart: &mut Uart, r: bringup::Report, t1: u64, power: &str, addr_src: &str, on_ready: fn(port: u32)) {
     STATE.store(STATE_READY, Ordering::Release);
     let fw = match r.patch {
         Some(s) => format!("patched({} records, {} bytes)", s.records, s.payload_bytes),
         None => String::from("rom"),
     };
-    let addr = if r.bdaddr_set { "set-from-dt" } else if r.bdaddr.is_placeholder() { "placeholder" } else { "controller" };
+    let addr = if r.bdaddr_set { addr_src } else if r.bdaddr.is_placeholder() { "placeholder" } else { "controller" };
     log(&format!(
         "hci ver={} rev={:#x} lmp_ver={} lmp_subver={:#06x} rom_subver={:#06x} manuf={} fw={} baud={} bdaddr={} ({}) {} ms resets={} vers={} flow={} stray={} garbage={} lsr_err={} {}",
         r.ver.hci_ver, r.ver.hci_rev, r.ver.lmp_ver, r.ver.lmp_subver, r.rom.lmp_subver, r.ver.manufacturer,

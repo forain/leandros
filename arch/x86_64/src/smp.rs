@@ -55,6 +55,11 @@ pub extern "C" fn arch_active_cpu_count() -> usize {
     active_cpu_count()
 }
 
+static NOSMP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `nosmp` boot knob: leave the application processors parked (S3 needs one CPU).
+pub fn set_nosmp(on: bool) { NOSMP.store(on, Ordering::Relaxed); }
+pub fn nosmp() -> bool { NOSMP.load(Ordering::Relaxed) }
+
 // ── IPI vectors ───────────────────────────────────────────────────────────────
 
 /// Reschedule IPI — handled in idt.rs (EOI + preempt_check).

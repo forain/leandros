@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 
+REQUIRED_BINS = "rg,grep,dmesg,coreutils"
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RTMP = "/tmp/pisync"
 BUNDLE_MAX = int(os.environ.get("LEANDROS_PISYNC_BUNDLE", 64 << 20))
@@ -70,7 +71,7 @@ def q(s):
 
 # ── 1. manifest ─────────────────────────────────────────────────────────────
 
-def build_manifest(out_dir, board, log):
+def build_manifest(out_dir, board, log, allow_missing=False):
     env = dict(os.environ)
     for k in ("LEANDROS_WIFI_CONF", "LEANDROS_AUTHORIZED_KEYS"):
         env.pop(k, None)          # never stage credentials into the manifest
@@ -87,11 +88,21 @@ def build_manifest(out_dir, board, log):
         else:
             env.pop("LEANDROS_BOARD", None)
         env["LEANDROS_ROOT_MANIFEST"] = out_dir
+        # A sync must never again silently drop the userland tools the Pi
+        # root depends on (rg/grep/dmesg/coreutils). Override: --allow-missing
+        # or LEANDROS_PISYNC_ALLOW_MISSING=1.
+        if allow_missing or os.environ.get("LEANDROS_PISYNC_ALLOW_MISSING") == "1":
+            env.pop("LEANDROS_REQUIRE", None)
+        else:
+            env["LEANDROS_REQUIRE"] = REQUIRED_BINS
         r = subprocess.run([sys.executable, "scripts/mkfs-f2fs-populated.py",
                             os.path.join(out_dir, "unused.img"), "aarch64"],
                            cwd=REPO, env=env, stdout=lf, stderr=lf)
     mf = os.path.join(out_dir, "manifest.json")
     if r.returncode != 0 or not os.path.exists(mf):
+        miss = [l.strip() for l in open(log, errors="replace") if l.startswith(("MISSING", "FATAL"))]
+        if miss:
+            print("\n".join(miss[-8:]))
         sys.exit(f"manifest generation failed (rc {r.returncode}); see {log} "
                  f"(run ./scripts/build-all.sh --arch aarch64 first)")
     return json.load(open(mf))
@@ -421,7 +432,8 @@ def main(t, R, a):
         else:
             print("building root manifest (mkfs-f2fs-populated.py, board "
                   f"{a.board or 'virt'}) ...", flush=True)
-            man = build_manifest(work, a.board, os.path.join(work, "mkfs.log"))
+            man = build_manifest(work, a.board, os.path.join(work, "mkfs.log"),
+                                 getattr(a, "allow_missing", False))
         print(f"manifest: {len(man['files'])} inodes, {len(man['dirs'])} dirs; probing {t.label()} ...",
               flush=True)
         R.rrun(t, f"mkdir -p {RTMP}", what="mkdir")

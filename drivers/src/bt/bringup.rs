@@ -456,3 +456,43 @@ pub fn fdt_local_bd_address(dtb: &[u8]) -> Option<BdAddr> {
     }
     None
 }
+
+/// BdAddr from a MAC written MSB first (HCI stores it LSB first).
+pub fn bdaddr_from_mac(m: &[u8; 6]) -> BdAddr { BdAddr([m[5], m[4], m[3], m[2], m[1], m[0]]) }
+
+/// `xx:xx:xx:xx:xx:xx` -> bytes (MSB first); None when malformed.
+pub fn parse_mac_text(t: &str) -> Option<[u8; 6]> {
+    let mut m = [0u8; 6];
+    let mut n = 0;
+    for part in t.split(':') {
+        if n >= 6 || part.len() != 2 { return None; }
+        m[n] = u8::from_str_radix(part, 16).ok()?;
+        n += 1;
+    }
+    if n != 6 { return None; }
+    Some(m)
+}
+
+/// `xx:xx:xx:xx:xx:xx` (MSB first) -> BdAddr; None when malformed or all zero.
+pub fn parse_bdaddr_text(t: &str) -> Option<BdAddr> {
+    let a = bdaddr_from_mac(&parse_mac_text(t)?);
+    if a.is_zero() { None } else { Some(a) }
+}
+
+/// Address to write when the controller reports the placeholder, by `bt.bdaddr=`
+/// knob: auto (default: DT if usable, else OTP), dt, otp, keep, or explicit.
+/// Returns the address and the log label for it.
+pub fn pick_bdaddr(knob: Option<&str>, dt: Option<BdAddr>, otp: Option<BdAddr>) -> (Option<BdAddr>, &'static str) {
+    let dt = dt.filter(|a| !a.is_placeholder());
+    let otp = otp.filter(|a| !a.is_placeholder());
+    match knob.unwrap_or("auto") {
+        "keep" => (None, "placeholder"),
+        "dt" => (dt, "set-from-dt"),
+        "otp" => (otp, "set-from-otp"),
+        "auto" => if dt.is_some() { (dt, "set-from-dt") } else { (otp, "set-from-otp") },
+        t => match parse_bdaddr_text(t) {
+            Some(a) => (Some(a), "set-from-cmdline"),
+            None => if dt.is_some() { (dt, "set-from-dt") } else { (otp, "set-from-otp") },
+        },
+    }
+}

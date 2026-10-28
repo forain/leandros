@@ -135,6 +135,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         drivers::rp1::GEM_IRQ.store(crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "rp1.irq=1")),
             core::sync::atomic::Ordering::Relaxed);
         drivers::brcmstb_pcie::configure(crate::boot_cmdline().unwrap_or(""));
+        drivers::rp1_fan::configure(crate::boot_cmdline().unwrap_or(""));
         drivers::brcmstb_pcie::init();
         if drivers::brcmstb_pcie::is_up() && drivers::brcmstb_pcie::stage(16) {
             drivers::rp1::probe();

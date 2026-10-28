@@ -54,7 +54,7 @@ fn ht40_rates() {
     assert_eq!(expected_tpt_agg(id), 911);
     assert_eq!(nominal_r500k(id), 270);
     let cfg = RateCfg { ap_rates: vec![0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108], max_r500k: 0, valid_ant: ANT_AB, fixed_ant: None,
-                        band_24: false, rssi: Some(-76), ht: Some(HtRates { sgi: false, mimo: false, ht40: true, stbc: false, ldpc: false }) };
+                        band_24: false, rssi: Some(-76), ht: Some(HtRates { sgi: false, mimo: false, ht40: true, stbc: false, ldpc: false, vht: None }) };
     let c = RateCtl::new(&cfg);
     assert!(c.rates.iter().filter(|&&r| is_ht(r)).all(|&r| is_40(r)));
     // -76 dBm at 40 MHz counts as -79: MCS 3.
@@ -64,7 +64,7 @@ fn ht40_rates() {
 
 fn stbc_ctl(stbc: bool, ldpc: bool, fixed: Option<u8>) -> RateCtl {
     let cfg = RateCfg { ap_rates: vec![0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108], max_r500k: 0, valid_ant: ANT_AB, fixed_ant: fixed,
-                        band_24: false, rssi: Some(-78), ht: Some(HtRates { sgi: false, mimo: false, ht40: true, stbc, ldpc }) };
+                        band_24: false, rssi: Some(-78), ht: Some(HtRates { sgi: false, mimo: false, ht40: true, stbc, ldpc, vht: None }) };
     RateCtl::new(&cfg)
 }
 
