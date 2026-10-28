@@ -148,6 +148,8 @@ if command -v zig >/dev/null 2>&1; then
     # kexectest: kexec_file_load of /boot/kexec (load, re-load, bad flags, unload).
     echo "[userland] Building kexectest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kexectest" userland/kexectest/kexectest.c
+    # suspendtest: one freeze-only device suspend/resume cycle (kernel pm).
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/suspendtest" userland/suspendtest/suspendtest.c
     # kexec: kexec-tools style front end (-l/-u/-e) over kexec_file_load + reboot(KEXEC).
     echo "[userland] Building kexec (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kexec" userland/kexec/kexec.c

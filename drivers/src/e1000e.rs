@@ -2278,3 +2278,42 @@ pub fn shutdown() -> Option<String> {
     m.flush();
     Some(format!("e1000e: interrupts masked, RX/TX off, DRV_LOAD released (CTRL_EXT {:08x})", m.r32(CTRL_EXT)))
 }
+
+/// RCTL, TCTL, IMS and RUNNING saved across a system-sleep cycle.
+static PM_SAVE: spin::Mutex<Option<(u32, u32, u32, bool)>> = spin::Mutex::new(None);
+
+/// System-sleep suspend hook (kernel pm): stop the senders (`RUNNING`), take
+/// the ring lock so no send is mid-descriptor, mask interrupts, receiver and
+/// transmitter off. Rings and link stay as they are (freeze semantics).
+pub fn pm_suspend() -> Result<String, String> {
+    let base = BASE.load(Ordering::Acquire);
+    if base == 0 { return Ok(String::from("not present")); }
+    let m = Mmio(base);
+    if m.r32(STATUS) == !0 { return Err(String::from("registers read all-ones")); }
+    let was = RUNNING.swap(false, Ordering::SeqCst);
+    let _g = RINGS.lock();
+    let (rctl, tctl, ims) = (m.r32(RCTL), m.r32(TCTL), m.r32(IMS));
+    m.w32(IMC, !0);
+    m.clr(RCTL, RCTL_EN);
+    m.clr(TCTL, TCTL_EN);
+    m.flush();
+    *PM_SAVE.lock() = Some((rctl, tctl, ims, was));
+    Ok(format!("RX/TX off, interrupts masked (RCTL {:08x} TCTL {:08x} IMS {:08x})", rctl, tctl, ims))
+}
+
+/// System-sleep resume hook: transmitter, receiver and interrupt mask back.
+pub fn pm_resume() -> Result<String, String> {
+    let base = BASE.load(Ordering::Acquire);
+    let Some((rctl, tctl, ims, was)) = PM_SAVE.lock().take() else { return Ok(String::from("nothing saved")); };
+    let m = Mmio(base);
+    {
+        let _g = RINGS.lock();
+        m.w32(TCTL, tctl);
+        m.w32(RCTL, rctl);
+        m.w32(IMS, ims);
+        m.flush();
+    }
+    RUNNING.store(was, Ordering::SeqCst);
+    let (up, mbps, _) = link();
+    Ok(format!("RX/TX on, link {} {} Mb/s", if up { "up" } else { "down" }, mbps))
+}

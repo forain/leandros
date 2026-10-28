@@ -56,12 +56,35 @@ pub fn count() -> usize { COUNT.load(Ordering::Relaxed) }
 /// the devices that reported quiet and those that did not.
 pub fn run(stage: Stage) -> (alloc::vec::Vec<&'static str>, alloc::vec::Vec<&'static str>) {
     let (mut ok, mut bad) = (alloc::vec::Vec::new(), alloc::vec::Vec::new());
-    // try_lock: a CPU parked mid-register must not wedge the kexec.
-    let Some(t) = ENTRIES.try_lock() else { return (ok, bad) };
+    // Other CPUs may still be running (a late `register`): spin briefly
+    // instead of silently skipping every hook.
+    let mut tries = 0u32;
+    let t = loop {
+        if let Some(t) = ENTRIES.try_lock() { break t; }
+        tries += 1;
+        if tries > 2_000_000 {
+            crate::pci::serial_debug("[kexec] dma_shutdown registry busy\n");
+            return (ok, bad);
+        }
+        core::hint::spin_loop();
+    };
     let list: [Option<Entry>; MAX] = *t;
     drop(t);
     for e in list.iter().flatten().filter(|e| e.stage == stage) {
         if (e.hook)() { ok.push(e.name) } else { bad.push(e.name) }
     }
     (ok, bad)
+}
+
+/// Runs every hook of `stage` with no allocation and no waiting on locks.
+/// For the last CPU of a kexec after every other CPU is parked: a parked
+/// CPU may have been stopped holding the registry lock, so it is forced.
+/// `report(name, quiet)` is called once per hook.
+pub fn run_parked(stage: Stage, mut report: impl FnMut(&'static str, bool)) {
+    // SAFETY: the caller is the only CPU still running.
+    unsafe { ENTRIES.force_unlock(); }
+    let list: [Option<Entry>; MAX] = *ENTRIES.lock();
+    for e in list.iter().flatten().filter(|e| e.stage == stage) {
+        report(e.name, (e.hook)());
+    }
 }
