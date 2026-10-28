@@ -121,8 +121,6 @@ static SLEEP_WIN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 static TRACE_LEFT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static FACS_PHYS: AtomicU64 = AtomicU64::new(0);
 static PM1A_CNT: AtomicUsize = AtomicUsize::new(0);
-static GL_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static GL_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn cnt(i: usize) { CNT[i & 47].fetch_add(1, Ordering::Relaxed); }
 fn space_name(s: usize) -> &'static str {
@@ -136,39 +134,40 @@ fn trace_write(space: u8, addr: u64, w: u8, val: u64) {
     }
 }
 
-/// FACS global lock (ACPI 5.2.10.1): cmpxchg on FACS+16; bit0 pending, bit1 owned.
-static GL_DEPTH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-fn gl_acquire() {
-    if GL_DEPTH.fetch_add(1, Ordering::Relaxed) > 0 { return; }
+/// FACS global lock (ACPI 5.2.10.1); ownership tracking lives in `gl`.
+/// The ~10 ms acquire spin happens under the interpreter lock: the acquire is
+/// requested from deep inside a field access, so it cannot be hoisted out.
+static GL: super::gl::Gl = super::gl::Gl::new();
+const GL_TRIES: u32 = 10_000;
+fn facs_word() -> Option<&'static core::sync::atomic::AtomicU32> {
     let phys = FACS_PHYS.load(Ordering::Relaxed);
-    if phys == 0 { return; }
-    let Some(va) = mem_va(phys + 16) else { return };
-    let a = unsafe { &*(va as *const core::sync::atomic::AtomicU32) };
-    for _ in 0..100_000u32 {
-        let old = a.load(Ordering::Acquire);
-        let new = (old & !3) | 2 | if old & 2 != 0 { 1 } else { 0 };
-        if a.compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            if new & 1 == 0 { GL_PENDING.store(false, Ordering::Relaxed); return; }
-            // Owned by firmware: pending set, wait for its release.
-            GL_PENDING.store(true, Ordering::Relaxed);
-        }
-        core::hint::spin_loop();
-        crate::i915::delay_us(1);
+    if phys == 0 { return None; }
+    let va = mem_va(phys + 16)?;
+    Some(unsafe { &*(va as *const core::sync::atomic::AtomicU32) })
+}
+fn gl_acquire() -> bool {
+    let Some(a) = facs_word() else { return true };
+    let ok = GL.acquire(a, GL_TRIES, &mut || { core::hint::spin_loop(); crate::i915::delay_us(1); });
+    if !ok {
+        let n = GL.fails.load(Ordering::Relaxed);
+        if n <= 8 { say(&format!("acpi: FACS global lock acquire TIMED OUT (#{}); field access failed\n", n)); }
     }
-    GL_FAILS.fetch_add(1, Ordering::Relaxed);
+    ok
 }
 fn gl_release() {
-    if GL_DEPTH.fetch_sub(1, Ordering::Relaxed) > 1 { return; }
-    let phys = FACS_PHYS.load(Ordering::Relaxed);
-    if phys == 0 { return; }
-    let Some(va) = mem_va(phys + 16) else { return };
-    let a = unsafe { &*(va as *const core::sync::atomic::AtomicU32) };
-    let old = a.fetch_and(!3, Ordering::AcqRel);
-    if old & 1 != 0 {
+    let Some(a) = facs_word() else { return };
+    if GL.release(a) {
         let p = PM1A_CNT.load(Ordering::Relaxed) as u16;
         if p != 0 { pio::outw(p, pio::inw(p) | (1 << 2)); } // GBL_RLS
     }
 }
+pub fn gl_fails() -> u32 { GL.fails.load(Ordering::Relaxed) }
+/// `pm.aml_smi_drop=<val>`: AML writes of this value to SMI_CMD are dropped (diagnostic).
+fn smi_drop_val() -> Option<u64> {
+    let w = crate::nvidia_probe::cmdline_word("pm.aml_smi_drop")?;
+    match w.strip_prefix("0x") { Some(h) => u64::from_str_radix(h, 16).ok(), None => w.parse().ok() }
+}
+fn is_cmos_io(addr: u64, width: u8) -> bool { addr < 0x74 && addr + (width as u64 / 8).max(1) > 0x70 }
 
 struct KHost {
     notes: Vec<(usize, u64)>,
@@ -195,7 +194,8 @@ impl Host for KHost {
             }
             aml::SPACE_IO => {
                 let p = addr as u16;
-                match width { 8 => pio::inb(p) as u64, 16 => pio::inw(p) as u64, 32 => pio::inl(p) as u64, _ => pio::inl(p) as u64 | (pio::inl(p + 4) as u64) << 32 }
+                let rd = || match width { 8 => pio::inb(p) as u64, 16 => pio::inw(p) as u64, 32 => pio::inl(p) as u64, _ => pio::inl(p) as u64 | (pio::inl(p + 4) as u64) << 32 };
+                if is_cmos_io(addr, width) { super::cmos_locked(rd) } else { rd() }
             }
             aml::SPACE_PCI => {
                 let off = (addr & 0xFFF) as u16;
@@ -211,13 +211,15 @@ impl Host for KHost {
                 v
             }
             aml::SPACE_CMOS => {
-                let mut v = 0u64;
-                for i in 0..(width / 8) as u64 {
-                    let (ip, dp, idx) = cmos_ports(addr + i);
-                    pio::outb(ip, idx & 0x7F);
-                    v |= (pio::inb(dp) as u64) << (8 * i);
-                }
-                v
+                super::cmos_locked(|| {
+                    let mut v = 0u64;
+                    for i in 0..(width / 8) as u64 {
+                        let (ip, dp, idx) = cmos_ports(addr + i);
+                        pio::outb(ip, idx & 0x7F);
+                        v |= (pio::inb(dp) as u64) << (8 * i);
+                    }
+                    v
+                })
             }
             _ => { cnt(32 + space as usize); 0 }
         }
@@ -240,7 +242,12 @@ impl Host for KHost {
             }
             aml::SPACE_IO => {
                 let p = addr as u16;
-                match width { 8 => pio::outb(p, val as u8), 16 => pio::outw(p, val as u16), _ => pio::outl(p, val as u32) }
+                if p == 0xB2 {
+                    if crate::nvidia_probe::cmdline_word("pm.amltrace") == Some("1") { log(&format!("[S3] aml: SMI_CMD 0xB2 <- {:#x} w{}\n", val, width)); }
+                    if smi_drop_val() == Some(val) { cnt(32 + space as usize); log(&format!("[S3] aml: SMI_CMD write {:#x} DROPPED (pm.aml_smi_drop)\n", val)); return; }
+                }
+                let wr = || match width { 8 => pio::outb(p, val as u8), 16 => pio::outw(p, val as u16), _ => pio::outl(p, val as u32) };
+                if is_cmos_io(addr, width) { super::cmos_locked(wr) } else { wr() }
             }
             aml::SPACE_PCI => {
                 let off = (addr & 0xFFF) as u16;
@@ -255,11 +262,11 @@ impl Host for KHost {
                 for i in 0..(width / 8) as u64 { ec::write((addr + i) as u8, (val >> (8 * i)) as u8); }
             }
             aml::SPACE_CMOS if crate::nvidia_probe::cmdline_word("pm.aml_cmos_write") == Some("1") => {
-                for i in 0..(width / 8) as u64 {
+                super::cmos_locked(|| for i in 0..(width / 8) as u64 {
                     let (ip, dp, idx) = cmos_ports(addr + i);
                     pio::outb(ip, idx & 0x7F);
                     pio::outb(dp, (val >> (8 * i)) as u8);
-                }
+                })
             }
             _ => cnt(32 + space as usize), // CMOS writes (unless allowed), SMBus, GPIO, GSBus, PCC ...
         }
@@ -269,7 +276,7 @@ impl Host for KHost {
         let cap = if SLEEP_WIN.load(Ordering::Relaxed) { 2000 } else { 100 };
         crate::i915::delay_us(ms.min(cap) * 1000);
     }
-    fn global_lock(&mut self, acquire: bool) { if acquire { gl_acquire() } else { gl_release() } }
+    fn global_lock(&mut self, acquire: bool) -> bool { if acquire { gl_acquire() } else { gl_release(); true } }
     fn stall_us(&mut self, us: u64) { crate::i915::delay_us(us.min(100)); }
     fn timer(&mut self) -> u64 { now_ns() / 100 }
     fn notify(&mut self, node: usize, code: u64) { if self.notes.len() < 64 { self.notes.push((node, code)); } }
@@ -445,6 +452,8 @@ fn with<T>(f: impl FnOnce(&mut State, &mut KHost) -> T) -> Option<T> {
 
 /// Run `f` on the loaded namespace (for other drivers' _CRS/_DSM/_STA/_PSx).
 pub fn with_ns<T>(f: impl FnOnce(&mut Ns, &mut dyn Host) -> T) -> Option<T> {
+    // Quiesced for a sleep transition (pause_poll): backlight/I2C/NVIDIA AML callers get None.
+    if PAUSED.load(Ordering::Relaxed) { return None; }
     with(|s, h| f(&mut s.ns, h))
 }
 
@@ -691,10 +700,10 @@ fn run_method(ns: &mut Ns, h: &mut KHost, path: &str, args: &[V]) -> Result<Opti
 fn run_group(label: &str, steps: &[(&str, u64)], want_wak: bool) -> SleepAml {
     let mut out = SleepAml { ok: true, ..Default::default() };
     let t0 = now_ns();
-    TRACE_LEFT.store(200, Ordering::Relaxed);
-    SLEEP_WIN.store(true, Ordering::Relaxed);
     let before = snap();
     let r = with_ns_locked(|ns, h| {
+        TRACE_LEFT.store(200, Ordering::Relaxed);
+        SLEEP_WIN.store(true, Ordering::Relaxed);
         for &(path, arg) in steps {
             let t = now_ns();
             match run_method(ns, h, path, &[V::Int(arg)]) {
@@ -713,13 +722,13 @@ fn run_group(label: &str, steps: &[(&str, u64)], want_wak: bool) -> SleepAml {
                 Err(()) => out.ok = false,
             }
         }
+        SLEEP_WIN.store(false, Ordering::Relaxed);
     });
-    SLEEP_WIN.store(false, Ordering::Relaxed);
     if r.is_none() { out.ok = false; log("[S3] aml: interpreter not loaded\n"); }
     let (sum, dropped) = diff_summary(&before, &snap());
     out.dropped = dropped;
     out.ms = (now_ns() - t0) / 1_000_000;
-    log(&format!("[S3] aml: {} {} in {} ms ({}; global lock fails {})\n", label, if out.ok { "ok" } else { "FAILED" }, out.ms, sum, GL_FAILS.load(Ordering::Relaxed)));
+    log(&format!("[S3] aml: {} {} in {} ms ({}; global lock fails {})\n", label, if out.ok { "ok" } else { "FAILED" }, out.ms, sum, gl_fails()));
     out
 }
 
@@ -767,5 +776,5 @@ pub fn s3_dryrun(with_wak: bool) {
     let w = if with_wak { sleep_wake(3) } else { log("[S3] dryrun: _WAK skipped (pm.s3_dryrun=2 runs it; on the HP 840 G5 it ends in SMI 0xEA91 and resets the machine when no S3 was entered)\n"); SleepAml { ok: true, ..Default::default() } };
     tts(0);
     pause_poll(false);
-    log(&format!("[S3] dryrun: done prepare_ok={} wake_ok={} wak={:?} dropped={} gl_fails={}\n", p.ok, w.ok, w.wak, p.dropped + w.dropped, GL_FAILS.load(Ordering::Relaxed)));
+    log(&format!("[S3] dryrun: done prepare_ok={} wake_ok={} wak={:?} dropped={} gl_fails={}\n", p.ok, w.ok, w.wak, p.dropped + w.dropped, gl_fails()));
 }
