@@ -181,7 +181,7 @@ static RX_DMA: AtomicU64 = AtomicU64::new(0);
 static TX_STALLS: AtomicU64 = AtomicU64::new(0);
 // pigem-bulk diagnostics and knobs (macb.fix1=0 / macb.fix2=0 turn a fix off).
 static FIX1: AtomicBool = AtomicBool::new(true);
-static FIX2: AtomicBool = AtomicBool::new(true);
+static FIX2: AtomicBool = AtomicBool::new(false);
 /// tx_ready() returned false (netd held off).
 static TX_READY_FALSE: AtomicU64 = AtomicU64::new(0);
 /// Set when tx_ready() said no; the driver thread kicks netd once the queue drains.
@@ -294,7 +294,7 @@ pub fn init(cmdline: &str) {
           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], src);
 
     FIX1.store(cmdline_val(cmdline, "macb.fix1") != Some("0"), Ordering::Relaxed);
-    FIX2.store(cmdline_val(cmdline, "macb.fix2") != Some("0"), Ordering::Relaxed);
+    FIX2.store(cmdline_val(cmdline, "macb.fix2") == Some("1"), Ordering::Relaxed);
     let mode = match cmdline_val(cmdline, "macb.dma") {
         Some("dev") => DmaMode::Dev, Some("cmo") => DmaMode::Cmo, Some("coh") => DmaMode::Coh, _ => DmaMode::Nc,
     };
