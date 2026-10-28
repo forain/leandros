@@ -2942,10 +2942,14 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     let mut phys_addr: usize = 0;
     // Set from slot 1 of the device's 0x1007 reply; see MMAP_HINT_UNCACHED.
     let mut dev_uncached = false;
+    let mut v4l2_pins: Option<Vec<usize>> = None;
     // /dev/video0: the V4L2 layer hands out its frame buffers directly.
     if let Some(vfs::VnodeKind::DynamicDevice { port, dev_id, open_id }) = kind {
         if vfs::dynamic_device_major(port, dev_id) == Some(v4l2::VIDEO_MAJOR) {
-            match v4l2::mmap_phys(open_id, off, len) { Ok(p) => phys_addr = p, Err(e) => return e }
+            match v4l2::mmap_frames(open_id, off, len) {
+                Ok(f) => { phys_addr = f[0]; v4l2_pins = Some(f); }
+                Err(e) => return e,
+            }
         }
     }
 
@@ -3048,11 +3052,11 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         // framebuffer, host-visible window, GPU apertures) keep the plain
         // device mapping. Asked before the AS hold (the BO maps are never
         // taken under it).
-        let pinned = match kind {
+        let pinned = v4l2_pins.take().or_else(|| match kind {
             Some(vfs::VnodeKind::DynamicDevice { open_id, .. }) =>
                 drivers::drm_device_interface::mmap_pin_frames(phys_addr, len, open_id as u32),
             _ => None,
-        };
+        });
         if pinned.as_ref().map_or(false, |f| f.is_empty()) { return -22; }
         // L1.14, host-visible window (no guest RAM to pin): the window span is
         // held by its map count until this VMA goes (munmap / exit release it

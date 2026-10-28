@@ -99,12 +99,46 @@ static int probe(void) {
     return bad;
 }
 
+/* --mmap: exercise the buffer mmap path only (no streaming). */
+static int mmap_test(void) {
+    int fd = open("/dev/video0", O_RDWR | O_NONBLOCK);
+    if (fd < 0) { perror("camtest: open /dev/video0"); return 1; }
+    struct v4l2_format f = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
+    f.fmt.pix.width = 640; f.fmt.pix.height = 480; f.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+    f.fmt.pix.field = V4L2_FIELD_NONE;
+    if (xioctl(fd, VIDIOC_S_FMT, &f) < 0) { perror("camtest: S_FMT"); return 1; }
+    struct v4l2_requestbuffers rb = { .count = 4, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP };
+    if (xioctl(fd, VIDIOC_REQBUFS, &rb) < 0 || rb.count < 2) { perror("camtest: REQBUFS"); return 1; }
+    unsigned long off_last = 0;
+    for (unsigned i = 0; i < rb.count; i++) {
+        struct v4l2_buffer b = { .index = i, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP };
+        if (xioctl(fd, VIDIOC_QUERYBUF, &b) < 0) { perror("camtest: QUERYBUF"); return 1; }
+        uint8_t *m = mmap(NULL, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, b.m.offset);
+        if (m == MAP_FAILED) { perror("camtest: mmap"); return 1; }
+        for (size_t o = 0; o < b.length; o += 4096) m[o] = (uint8_t)(o / 4096 + i * 7 + 1);
+        m[b.length - 1] = 0xA5;
+        for (size_t o = 0; o < b.length; o += 4096)
+            if (m[o] != (uint8_t)(o / 4096 + i * 7 + 1)) { printf("camtest mmap: FAIL pattern buf %u page %zu\n", i, o / 4096); return 1; }
+        if (m[b.length - 1] != 0xA5) { printf("camtest mmap: FAIL tail buf %u\n", i); return 1; }
+        munmap(m, b.length);
+        off_last = b.m.offset;
+    }
+    void *bad = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 4096);
+    if (bad != MAP_FAILED || errno != EINVAL) { printf("camtest mmap: FAIL bad offset 4096 accepted/errno %d\n", errno); return 1; }
+    bad = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, off_last + (1UL << 24) * 8);
+    if (bad != MAP_FAILED || errno != EINVAL) { printf("camtest mmap: FAIL far offset accepted/errno %d\n", errno); return 1; }
+    close(fd);
+    printf("camtest mmap: PASS (%u buffers)\n", rb.count);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int frames = 30;
     uint32_t want_fmt = V4L2_PIX_FMT_MJPEG, w = 640, h = 480;
     const char *out = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--probe")) return probe();
+        if (!strcmp(argv[i], "--mmap")) return mmap_test();
         if (!strcmp(argv[i], "-o") && i + 1 < argc) { out = argv[++i]; continue; }
         if (!strcasecmp(argv[i], "mjpg") || !strcasecmp(argv[i], "mjpeg")) { want_fmt = V4L2_PIX_FMT_MJPEG; continue; }
         if (!strcasecmp(argv[i], "yuyv")) { want_fmt = V4L2_PIX_FMT_YUYV; continue; }

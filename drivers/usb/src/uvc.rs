@@ -214,7 +214,9 @@ pub struct StreamStats {
 }
 
 pub struct Stream {
-    pipe: IsochPipe,
+    pipe: Option<IsochPipe>,
+    /// `uvc.fake=1`: (format kind, polls since the last frame); no hardware.
+    fake: Option<(u8, u32)>,
     bufs: Vec<Buf>,
     /// Buffer indices given to the driver, oldest first.
     queued: Vec<usize>,
@@ -252,10 +254,50 @@ impl Stream {
         // 240 TDs: 30 ms at one per 125 µs microframe, more than a 10 ms tick.
         let pipe = IsochPipe::open_ex(f, alt, StreamFormat { rate: 0, frame_bytes: 0 }, 1 << 20, 240, true)?;
         Ok(Stream {
-            pipe, bufs, queued: Vec::with_capacity(32), done: Vec::with_capacity(32), cur: None,
+            pipe: Some(pipe), fake: None, bufs, queued: Vec::with_capacity(32), done: Vec::with_capacity(32), cur: None,
             last_fid: 0xFF, seq: 0, pkt: vec![0u8; pkt_max.max(64)].into_boxed_slice(), neg,
             stats: StreamStats::default(), gone: false,
         })
+    }
+
+    /// The fake camera's stream (`uvc.fake=1`): no hardware, `poll` synthesizes frames.
+    pub fn start_fake(v: &VideoInfo, format: u8, frame: u8, bufs: Vec<Buf>) -> Result<Stream, &'static str> {
+        let fmt = v.formats.iter().find(|x| x.index == format).or(v.formats.first()).ok_or("no video formats")?;
+        let fr = fmt.frames.iter().find(|y| y.index == frame).or(fmt.frames.first()).ok_or("format without frames")?;
+        let neg = Negotiated { format: fmt.index, frame: fr.index, interval: fr.interval, max_frame: fr.max_size, max_payload: 0 };
+        Ok(Stream {
+            pipe: None, fake: Some((fmt.kind, 0)), bufs, queued: Vec::with_capacity(32), done: Vec::with_capacity(32),
+            cur: None, last_fid: 0xFF, seq: 0, pkt: Vec::new().into_boxed_slice(), neg,
+            stats: StreamStats::default(), gone: false,
+        })
+    }
+
+    fn fake_poll(&mut self, kind: u8) {
+        // The USB tick is 10 ms: one frame every 3 ticks is ~33 fps.
+        let Some((_, n)) = self.fake.as_mut() else { return };
+        *n += 1;
+        if *n < 3 || self.queued.is_empty() || self.done.len() >= self.done.capacity() { return; }
+        *n = 0;
+        let i = self.queued.remove(0);
+        let buf = self.bufs[i];
+        let len = if kind == FMT_MJPEG {
+            let j = FAKE_JPEG;
+            let k = j.len().min(buf.cap);
+            unsafe { core::ptr::copy_nonoverlapping(j.as_ptr(), buf.ptr, k); }
+            // Trailing bytes after EOI are ignored by decoders; they make frames differ.
+            let pad = ((self.seq % 8) as usize).min(buf.cap - k);
+            for o in 0..pad { unsafe { *buf.ptr.add(k + o) = 0; } }
+            k + pad
+        } else {
+            let k = (self.neg.max_frame as usize).min(buf.cap);
+            for o in 0..k { unsafe { *buf.ptr.add(o) = (o as u32).wrapping_add(self.seq) as u8; } }
+            k
+        };
+        self.stats.payloads += 1;
+        self.stats.frames += 1;
+        let d = Done { index: i, bytes: len, seq: self.seq, ts_ns: platform::now_ns(), error: false };
+        self.seq = self.seq.wrapping_add(1);
+        self.done.push(d);
     }
 
     pub fn nbufs(&self) -> usize { self.bufs.len() }
@@ -320,10 +362,12 @@ impl Stream {
     /// Harvest the pipe and reassemble frames. Tick-safe (try-lock only).
     pub fn poll(&mut self) {
         if self.gone { return; }
-        if self.pipe.poll() == Poll::Gone { self.gone = true; return; }
+        if let Some((kind, _)) = self.fake { self.fake_poll(kind); return; }
+        let Some(pipe) = self.pipe.as_mut() else { return };
+        if pipe.poll() == Poll::Gone { self.gone = true; return; }
         loop {
             let mut pkt = core::mem::take(&mut self.pkt);
-            let r = self.pipe.read_packet(&mut pkt);
+            let r = self.pipe.as_mut().unwrap().read_packet(&mut pkt);
             self.pkt = pkt;
             match r {
                 Some(n) => self.payload(n.min(self.pkt.len())),
@@ -334,7 +378,7 @@ impl Stream {
 
     /// Stop streaming (alternate setting 0); returns the buffers. Task context.
     pub fn stop(self) -> Vec<Buf> {
-        self.pipe.close();
+        if let Some(p) = self.pipe { p.close(); }
         self.bufs
     }
 }
@@ -343,16 +387,20 @@ impl Stream {
 
 /// A camera found at enumeration.
 pub struct Camera {
-    pub func: UsbFunction,
+    /// None for the `uvc.fake=1` camera.
+    pub func: Option<UsbFunction>,
     pub info: VideoInfo,
 }
 
 pub static CAMERAS: Mutex<Vec<Arc<Camera>>> = Mutex::new(Vec::new());
+static FAKE_CAMERA: AtomicU32 = AtomicU32::new(0);
+const FAKE_JPEG: &[u8] = include_bytes!("fake_cam.jpg");
 static SELFTEST_FRAMES: AtomicU32 = AtomicU32::new(0);
 
 /// Parse `uvc.selftest=<frames>`.
 pub fn set_cmdline(cmdline: &str) {
     for tok in cmdline.split_ascii_whitespace() {
+        if tok == "uvc.fake=1" { FAKE_CAMERA.store(1, Ordering::Relaxed); }
         if let Some(v) = tok.strip_prefix("uvc.selftest=") {
             if let Ok(n) = v.parse::<u32>() { SELFTEST_FRAMES.store(n, Ordering::Relaxed); }
         }
@@ -384,10 +432,26 @@ pub fn dump(slot: u8, v: &VideoInfo) {
 pub fn register(f: UsbFunction) {
     let Some(info) = parse(&f.cfg) else { return };
     dump(f.slot, &info);
-    let cam = Arc::new(Camera { func: f, info });
+    let cam = Arc::new(Camera { func: Some(f), info });
     let n = SELFTEST_FRAMES.load(Ordering::Relaxed);
     if n != 0 { selftest(&cam, n); }
     CAMERAS.lock().push(cam);
+}
+
+/// Register the fake camera when `uvc.fake=1` was given (MJPG and YUYV 640x480).
+pub fn register_fake() {
+    if FAKE_CAMERA.load(Ordering::Relaxed) == 0 { return; }
+    let fr = FrameDesc { index: 1, width: 640, height: 480, max_size: 614400, interval: 333333 };
+    let info = VideoInfo {
+        bcd_uvc: 0x0100, vc_iface: 0, vs_iface: 1,
+        formats: alloc::vec![
+            FormatDesc { index: 1, kind: FMT_MJPEG, bpp: 0, default_frame: 1, frames: alloc::vec![fr] },
+            FormatDesc { index: 2, kind: FMT_YUYV, bpp: 16, default_frame: 1, frames: alloc::vec![fr] },
+        ],
+        alts: Vec::new(),
+    };
+    usb_log!("[UVC] fake camera registered (uvc.fake=1)\n");
+    CAMERAS.lock().push(Arc::new(Camera { func: None, info }));
 }
 
 /// The first camera, if any.
@@ -395,7 +459,7 @@ pub fn camera(i: usize) -> Option<Arc<Camera>> { CAMERAS.lock().get(i).cloned() 
 
 /// The device on (`hc`, `slot`) left.
 pub fn detach(hc: &crate::xhci::Hc, slot: u8) {
-    CAMERAS.lock().retain(|c| !(core::ptr::eq(&*c.func.hc, hc) && c.func.slot == slot));
+    CAMERAS.lock().retain(|c| !c.func.as_ref().map_or(false, |f| core::ptr::eq(&*f.hc, hc) && f.slot == slot));
 }
 
 static PUMP: AtomicUsize = AtomicUsize::new(0);
@@ -423,7 +487,7 @@ fn selftest(cam: &Camera, frames: u32) {
     let cap = fmt.frames.iter().map(|y| y.max_size as usize).max().unwrap_or(0).clamp(64 * 1024, 8 << 20);
     let mut store: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; cap]).collect();
     let bufs = store.iter_mut().map(|b| Buf { ptr: b.as_mut_ptr(), cap }).collect();
-    let mut s = match Stream::start(&cam.func, &cam.info, fmt.index, 0, bufs) {
+    let mut s = match Stream::start(cam.func.as_ref().unwrap(), &cam.info, fmt.index, 0, bufs) {
         Ok(s) => s,
         Err(e) => { usb_log!("[UVC] selftest: start failed: {}\n", e); return; }
     };
@@ -442,7 +506,7 @@ fn selftest(cam: &Camera, frames: u32) {
         platform::relax();
     }
     let st = s.stats;
-    let ps = s.pipe.local;
+    let ps = s.pipe.as_ref().unwrap().local;
     let _ = s.stop();
     usb_log!("[UVC] selftest: {} frame(s), payloads {} dropped {} errors {}, isoch tds {} missed {} underrun {} errors {}\n",
              got, st.payloads, st.dropped, st.errors, ps.tds, ps.missed, ps.underrun, ps.errors);
