@@ -608,3 +608,24 @@ fn selftest(cam: &Camera, frames: u32) {
              got, st.payloads, st.dropped, st.errors, ps.tds, ps.missed, ps.underrun, ps.errors);
     drop(store);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_camera_terminal_and_processing_unit() {
+        let cfg: &[u8] = &[
+            9, 4, 0, 0, 1, 0x0E, 0x01, 0, 0,                          // VC interface 0
+            13, 0x24, 0x01, 0x00, 0x01, 0x6A, 0, 0, 0, 0, 0, 1, 1,    // VC header
+            18, 0x24, 0x02, 1, 0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0x0E, 0x0A, 0x00, // camera IT
+            11, 0x24, 0x05, 2, 1, 0, 0, 2, 0x7F, 0x17, 0,             // processing unit
+            9, 4, 1, 0, 0, 0x0E, 0x02, 0, 0,                          // VS interface 1
+        ];
+        let v = parse(cfg).unwrap();
+        assert_eq!(v.ct_id, 1);
+        assert_eq!(v.ct_ctrls, 0x0A0E);
+        assert_eq!(v.pu_id, 2);
+        assert_eq!(v.pu_ctrls, 0x177F);
+    }
+}
