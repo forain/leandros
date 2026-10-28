@@ -954,6 +954,7 @@ pub(super) fn init(d: &Device, env: &BootEnv) {
     let vbl = super::vblank::init(d);
     let cur = super::cursor::init(d);
     super::outputs::init(d);
+    super::pipeb_stub::init(d);
     crate::gpu_kms::register(&BACKEND);
     ilog!("kms: flips {}; hardware cursor {}",
           if vbl { "on real vblank (queued, armed after the render fence, event at the latching vblank; i915.vblank=0: synchronous + 60 Hz synthetic events)" }
