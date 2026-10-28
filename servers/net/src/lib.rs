@@ -2441,7 +2441,8 @@ fn read_net_knobs() {
     match drivers::nvidia_probe::cmdline_word("tcp.cc") {
         Some("reno") => t::CC_MODE.store(1, Ordering::Relaxed),
         Some("cubic") => t::CC_MODE.store(2, Ordering::Relaxed),
-        _ => t::CC_MODE.store(0, Ordering::Relaxed),
+        Some("none") => t::CC_MODE.store(0, Ordering::Relaxed),
+        _ => {} // default: CUBIC (smoltcp CC_MODE)
     }
     if let Some(v) = drivers::nvidia_probe::cmdline_opt("tcp.iw") { t::CC_IW.store(v.clamp(1, 1000) as u32, Ordering::Relaxed); }
     if let Some(v) = drivers::nvidia_probe::cmdline_opt("tcp.rto_min_ms") { t::RTO_MIN_MS.store(v.clamp(1, 5000) as u32, Ordering::Relaxed); }

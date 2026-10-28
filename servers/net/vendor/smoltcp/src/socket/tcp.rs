@@ -14,9 +14,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering as AtomicOrder
 pub static RECOVERY_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 fn stat(i: usize) { RECOVERY_STATS[i].fetch_add(1, AtomicOrdering::Relaxed); }
 /// LEANDROS: congestion-control knobs, set once by netd from the kernel
-/// command line: `tcp.cc=none|reno|cubic` (0/1/2), `tcp.iw` (segments),
+/// command line: `tcp.cc=none|reno|cubic` (0/1/2, default 2), `tcp.iw` (segments),
 /// `tcp.rto_min_ms`.
-pub static CC_MODE: AtomicU8 = AtomicU8::new(0);
+pub static CC_MODE: AtomicU8 = AtomicU8::new(2);
 pub static CC_IW: AtomicU32 = AtomicU32::new(10);
 pub static RTO_MIN_MS: AtomicU32 = AtomicU32::new(200);
 
