@@ -154,6 +154,17 @@ pub struct Host {
     pub idle_ms: u64,
     /// Idle limit (ms) for a fresh incoming ACL from a bonded device.
     pub incoming_grace_ms: u64,
+    /// Log ACL in/out hex, credits and signalling (diagnosis aid).
+    pub trace: bool,
+    /// ACCEPT_CONN role: false = stay peripheral (0x01, default), true = become central (0x00).
+    pub accept_central: bool,
+    tx_blocked_logged: bool,
+}
+
+fn hex(b: &[u8]) -> String {
+    let mut s = String::new();
+    for x in b.iter().take(32) { s.push_str(&format!("{:02x}", x)); }
+    s
 }
 
 impl Host {
@@ -166,6 +177,7 @@ impl Host {
             listens: Vec::new(), keys_dirty: false, scan: None, pairs: Vec::new(), next_cid: FIRST_DYN_CID,
             next_ident: 1, acl_txq: VecDeque::new(), acl_avail: 0, le_avail: 0,
             idle_ms: IDLE_DISCONNECT_MS, incoming_grace_ms: INCOMING_GRACE_MS,
+            trace: false, accept_central: false, tx_blocked_logged: false,
         };
         for k in h.keys.keys.clone() {
             h.devices.push(Device { addr: k.addr, name: k.name, psrm: 1, ..Default::default() });
@@ -177,6 +189,10 @@ impl Host {
     // ── outputs ────────────────────────────────────────────────────────────
     pub fn take_out(&mut self) -> Option<Vec<u8>> { self.out.pop_front() }
     pub fn take_event(&mut self) -> Option<(Owner, Msg)> { self.events.pop_front() }
+    #[cfg(test)]
+    pub(crate) fn test_set_acl_avail(&mut self, n: u16) { self.acl_avail = n; }
+    #[cfg(test)]
+    pub(crate) fn test_new_connecting(&mut self, a: Addr) { self.new_link(a, false, LinkState::Connecting); }
     pub fn take_log(&mut self) -> Option<String> { self.logs.pop_front() }
     /// The link-key file contents when they changed since the last call.
     pub fn take_keys_dirty(&mut self) -> Option<String> {
@@ -410,7 +426,7 @@ impl Host {
                     l.incoming = true;
                     l.since = now;
                     let mut c = a.0.to_vec();
-                    c.push(0x01); // remain peripheral; no role switch demanded
+                    c.push(if self.accept_central { 0x00 } else { 0x01 }); // default: remain peripheral
                     self.send_cmd(op::ACCEPT_CONN, &c);
                 } else if existing.is_some_and(|i| self.links[i].accepting) {
                     // Duplicate request while we are already accepting: nothing to do.
@@ -438,9 +454,17 @@ impl Host {
                     self.link_down(i, hci::status_of(p[0]));
                     return;
                 }
+                let new_h = le16(p, 1) & 0x0fff;
+                let mut i = i;
+                while let Some(j) = self.links.iter().position(|l| l.addr == a && l.state == LinkState::Up && !l.le && l.handle != new_h) {
+                    let oh = self.links[j].handle;
+                    self.log(format!("{}: stale link 0x{:03x} dropped for new 0x{:03x}", a, oh, new_h));
+                    self.link_down(j, status::LINK_LOST);
+                    if j < i { i -= 1; }
+                }
                 let now = self.now;
                 let l = &mut self.links[i];
-                l.handle = le16(p, 1) & 0x0fff;
+                l.handle = new_h;
                 l.state = LinkState::Up;
                 l.encrypted = p[10] != 0;
                 l.last_activity = now;
@@ -516,6 +540,7 @@ impl Host {
                     if p.len() < 5 + 4 * i { break; }
                     let h = le16(p, 1 + 4 * i) & 0x0fff;
                     let n = le16(p, 3 + 4 * i);
+                    if self.trace { self.log(format!("ncp h=0x{:03x} n={} avail={}", h, n, self.acl_avail)); }
                     self.credit_back(h, n);
                 }
             }
@@ -763,7 +788,11 @@ impl Host {
     }
 
     fn up_link(&self, a: Addr) -> Option<usize> {
-        self.links.iter().position(|l| l.addr == a && l.state == LinkState::Up)
+        let mut best: Option<usize> = None;
+        for (i, l) in self.links.iter().enumerate() {
+            if l.addr == a && l.state == LinkState::Up && best.map_or(true, |b| l.up_at >= self.links[b].up_at) { best = Some(i); }
+        }
+        best
     }
 
     /// Finds or pages the BR/EDR link to `a`.
@@ -910,16 +939,31 @@ impl Host {
         while let Some((h, le, _)) = self.acl_txq.front() {
             let (h, le) = (*h, *le);
             let pool = if le && self.info.le_pkts > 0 { &mut self.le_avail } else { &mut self.acl_avail };
-            if *pool == 0 { break; }
+            if *pool == 0 {
+                if !self.tx_blocked_logged {
+                    self.tx_blocked_logged = true;
+                    let (q, n) = (self.acl_txq.len(), self.info.acl_pkts);
+                    self.log(format!("acl tx blocked: 0/{} credits, q={}", n, q));
+                }
+                break;
+            }
             *pool -= 1;
+            self.tx_blocked_logged = false;
             let (_, _, pkt) = self.acl_txq.pop_front().unwrap();
+            if self.trace {
+                let av = if le && self.info.le_pkts > 0 { self.le_avail } else { self.acl_avail };
+                self.logs.push_back(format!("acl> h=0x{:03x} avail={} {}", h, av, hex(&pkt)));
+            }
             if let Some(l) = self.links.iter_mut().find(|l| l.handle == h && l.state == LinkState::Up) { l.outstanding += 1; }
             self.out.push_back(pkt);
         }
     }
 
     fn credit_back(&mut self, h: u16, n: u16) {
-        let Some(l) = self.links.iter_mut().find(|l| l.handle == h && l.state == LinkState::Up) else { return };
+        let Some(l) = self.links.iter_mut().find(|l| l.handle == h && l.state == LinkState::Up) else {
+            if self.trace { self.log(format!("ncp h=0x{:03x}: no Up link, credits not returned", h)); }
+            return;
+        };
         l.outstanding = l.outstanding.saturating_sub(n);
         if l.le && self.info.le_pkts > 0 {
             self.le_avail = (self.le_avail + n).min(self.info.le_pkts);
@@ -933,7 +977,11 @@ impl Host {
         let (h, pb) = (hraw & 0x0fff, (hraw >> 12) & 3);
         let len = (le16(pkt, 3) as usize).min(pkt.len() - 5);
         let data = &pkt[5..5 + len];
-        let Some(i) = self.link_by_handle(h) else { return };
+        if self.trace { self.log(format!("acl< h=0x{:03x} pb={} {}", h, pb, hex(data))); }
+        let Some(i) = self.link_by_handle(h) else {
+            if self.trace { self.log(format!("acl< unknown handle 0x{:03x}", h)); }
+            return;
+        };
         let le = self.links[i].le;
         self.links[i].last_activity = self.now;
         let mut rx = core::mem::take(&mut self.links[i].rx);
@@ -1046,6 +1094,7 @@ impl Host {
     }
 
     fn on_sig(&mut self, h: u16, code: u8, id: u8, d: &[u8]) {
+        if self.trace { self.log(format!("sig h=0x{:03x} code=0x{:02x} id={} len={}", h, code, id, d.len())); }
         let Some(a) = self.links.iter().find(|l| l.handle == h).map(|l| l.addr) else { return };
         let now = self.now;
         let find = |s: &Self, cid: u16| s.chans.iter().position(|c| c.cid == cid && c.addr == a);
@@ -1347,7 +1396,15 @@ impl Host {
         let mut ci = 0;
         while ci < self.chans.len() {
             if now >= self.chans[ci].deadline {
-                self.log(format!("cid 0x{:04x}: timeout in {:?}", self.chans[ci].cid, self.chans[ci].state));
+                let (up, out, q) = (self.links.iter().filter(|l| l.state == LinkState::Up).count(),
+                    self.links.iter().map(|l| l.outstanding as u32).sum::<u32>(), self.acl_txq.len());
+                let (hh, av, tot) = (self.links.iter().find(|l| l.addr == self.chans[ci].addr).map_or(0, |l| l.handle), self.acl_avail, self.info.acl_pkts);
+                self.log(format!("cid 0x{:04x}: timeout in {:?} h=0x{:03x} avail={}/{} outstanding={} txq={} links_up={}",
+                    self.chans[ci].cid, self.chans[ci].state, hh, av, tot, out, q, up));
+                if self.acl_avail == 0 && tot > 0 && self.links.iter().all(|l| l.outstanding == 0) {
+                    self.log(format!("ACL credit leak, restoring {}", tot));
+                    self.acl_avail = tot;
+                }
                 self.fail_chan(ci, status::TIMEOUT);
             } else {
                 ci += 1;
