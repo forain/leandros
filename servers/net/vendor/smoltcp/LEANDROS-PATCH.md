@@ -46,7 +46,19 @@ update keeps the count. To run them, copy the crate with the crates.io `Cargo.to
 (dev-dependencies) and `cargo test --lib socket::tcp` on the host (582/582
 pass).
 
-Not done: congestion control (0.12 has Reno/CUBIC), SACK-based recovery.
+Not done: SACK-based recovery.
+
+## Lane pitcp / pitcp2 (2026-10-28): congestion control
+
+`Cc` in `socket/tcp.rs` (`tcp.cc=none|reno|cubic`, default cubic; unknown values log a warning). After the review:
+
+1. cwnd grows only when cwnd-limited (flight + MSS >= cwnd; slow start: 2*flight >= cwnd) and is clamped to max(peer window, send buffer). Loss uses the flight size for `w_max`/`ssthresh`.
+2. CUBIC is integer-only (`icbrt`, ms units, i128); K is computed once per epoch. `w_max` changes only on loss; with no loss in the epoch K = 0. Reno-friendly region (`w_est`, alpha 0.53) added.
+3. A repeated RTO (`rto_count > 0`) keeps ssthresh/w_max (RFC 5681 3.1). After an RTO `rto_recover` records the highest sent sequence so dupacks of the resend do not reduce again (RFC 6582).
+4. Restart after idle > RTO: cwnd = IW and the CUBIC epoch is shifted by the idle time (RFC 5681 4.1).
+5. `/proc/net/tcpsnd` `t_ms` is signed (negative when the timer is overdue).
+
+Tests: `Cc` unit tests plus `test_dupacks_after_rto_do_not_reduce_again`; legacy tests that assume no CC pin `TEST_CC_MODE` to 0 (thread-local). Not done: fast-recovery inflation, fast convergence.
 
 ## Lane udp2 (2026-10-18): UDP demultiplexing, ICMP errors, IPv4 fragments
 

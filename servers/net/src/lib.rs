@@ -2442,7 +2442,11 @@ fn read_net_knobs() {
         Some("reno") => t::CC_MODE.store(1, Ordering::Relaxed),
         Some("cubic") => t::CC_MODE.store(2, Ordering::Relaxed),
         Some("none") => t::CC_MODE.store(0, Ordering::Relaxed),
-        _ => {} // default: CUBIC (smoltcp CC_MODE)
+        None => {} // default: CUBIC (smoltcp CC_MODE)
+        Some(_) => {
+            extern "C" { fn arch_serial_putc(c: u8); }
+            for &b in b"netd: unknown tcp.cc= value (want none|reno|cubic), using cubic\n" { unsafe { arch_serial_putc(b); } }
+        }
     }
     if let Some(v) = drivers::nvidia_probe::cmdline_opt("tcp.iw") { t::CC_IW.store(v.clamp(1, 1000) as u32, Ordering::Relaxed); }
     if let Some(v) = drivers::nvidia_probe::cmdline_opt("tcp.rto_min_ms") { t::RTO_MIN_MS.store(v.clamp(1, 5000) as u32, Ordering::Relaxed); }
