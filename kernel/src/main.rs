@@ -1059,21 +1059,19 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 // pcie2 up, and its frames would land in pages the buddy
                 // allocator is about to hand out. Before mm init, whatever
                 // `pcie.rpi5` says: RP1 in PERST#, the RC bridge in reset
-                // (brcmstb_pcie::init brings it back when PCIe is wanted).
+                // (brcmstb_pcie::init brings it back when PCIe is wanted). Only after a
+                // kexec (prevlog handed over); a cold firmware boot is untouched.
                 // The identity half of early_pgtables maps the BCM2712 MMIO
                 // (PUD 64, Device) here. `pcie.early_reset=0` skips it.
                 #[cfg(feature = "rpi5")]
-                if cmdline_knob("pcie.early_reset") != Some("0") {
+                if boot::kexec_prevlog().is_some() && cmdline_knob("pcie.early_reset") != Some("0") {
                     use drivers::brcmstb_pcie::{early_reset_identity, EarlyReset};
                     match unsafe { early_reset_identity() } {
                         EarlyReset::AlreadyInReset =>
                             serial_print_str("[pcie] early reset: RC held in reset before mm init (bridge was already in reset)\n"),
-                        EarlyReset::Reset { perstb_was, held: true } => {
-                            serial_print_str("[pcie] early reset: RC held in reset before mm init (PERST# ");
-                            serial_print_str(if perstb_was { "was released" } else { "was asserted" });
-                            serial_print_str(")\n");
-                        }
-                        EarlyReset::Reset { held: false, .. } =>
+                        EarlyReset::Reset { held: true } =>
+                            serial_print_str("[pcie] early reset: RC held in reset before mm init\n"),
+                        EarlyReset::Reset { held: false } =>
                             serial_print_str("[pcie] early reset: FAILED, bridge reset did not stick\n"),
                     }
                 }
