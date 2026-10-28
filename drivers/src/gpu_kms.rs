@@ -36,7 +36,7 @@
 //!   * `KmsCursor` — a hardware cursor plane: the DRM cursor plane is exposed
 //!     while a backend is registered only when this is.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::DriverError;
 
@@ -194,4 +194,80 @@ pub fn mode_allowed(w: u32, h: u32) -> bool {
 /// loader's surface back. Lock-free.
 pub fn console_restore() {
     if let Some(f) = backend().and_then(|b| b.console_restore) { f(); }
+}
+
+// ── Extra connectors (lane lapdisp) ─────────────────────────────────────────
+//
+// A backend with physical outputs beside its scanout (i915: the HDMI and
+// DP/USB-C ports) lists them as extra connectors after connector 1. They have
+// no CRTC yet (possible_crtcs 0, encoder unbound), so a compositor enumerates
+// them with their true status and EDID modes but cannot light them: inert
+// until a second-pipe modeset exists. Unregistered: nothing changes.
+
+/// First extra connector id; extra encoder `i` is `EXT_ENC_BASE + i`. Clear of
+/// the property ids (40..=70) and of the single CRTC/connector/encoder (1).
+pub const EXT_CONN_BASE: u32 = 0x100;
+pub const EXT_ENC_BASE: u32 = 0x180;
+pub const EXT_MAX: usize = 8;
+
+/// One timing, DRM units (kHz, pixels, lines; flags = DRM_MODE_FLAG_*).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct KmsTiming {
+    pub clock_khz: u32,
+    pub h: [u16; 4],
+    pub v: [u16; 4],
+    pub flags: u32,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct KmsConnInfo {
+    /// DRM_MODE_CONNECTOR_* (10 DisplayPort, 11 HDMI-A).
+    pub conn_type: u32,
+    pub type_id: u32,
+    /// DRM_MODE_ENCODER_* for its encoder (2 TMDS, as Linux i915 for DP/HDMI).
+    pub enc_type: u32,
+    pub connected: bool,
+    pub mm_w: u32,
+    pub mm_h: u32,
+    pub modes: [KmsTiming; 4],
+    pub nmodes: usize,
+}
+
+pub struct KmsOutputs {
+    pub count: fn() -> usize,
+    /// Task context, no DRM lock held (GETCONNECTOR): may probe the port.
+    pub info: fn(idx: usize) -> Option<KmsConnInfo>,
+    /// Lock-free cached view (GETENCODER / GETRESOURCES, under the DRM lock).
+    pub cached: fn(idx: usize) -> Option<KmsConnInfo>,
+    /// Possible-CRTC bitmask of extra `idx` (0: no CRTC can drive it).
+    pub crtc_mask: fn(idx: usize) -> u32,
+}
+
+static INTERNAL_PANEL: AtomicBool = AtomicBool::new(false);
+
+/// The backend scans out an internal panel (eDP): connector 1 reports eDP.
+pub fn set_internal_panel(v: bool) { INTERNAL_PANEL.store(v, Ordering::Release); }
+pub fn internal_panel() -> bool { INTERNAL_PANEL.load(Ordering::Acquire) }
+
+/// Possible-CRTC mask of extra `idx`, 0 when no backend/CRTC.
+pub fn ext_crtc_mask(idx: usize) -> u32 { outputs().map_or(0, |o| (o.crtc_mask)(idx)) }
+
+static OUTPUTS: AtomicPtr<KmsOutputs> = AtomicPtr::new(core::ptr::null_mut());
+
+pub fn register_outputs(o: &'static KmsOutputs) {
+    OUTPUTS.store(o as *const KmsOutputs as *mut KmsOutputs, Ordering::Release);
+}
+
+pub fn outputs() -> Option<&'static KmsOutputs> {
+    let p = OUTPUTS.load(Ordering::Acquire);
+    if p.is_null() { None } else { Some(unsafe { &*p }) }
+}
+
+/// Number of extra connectors (0 when none registered).
+pub fn ext_count() -> usize { outputs().map_or(0, |o| (o.count)().min(EXT_MAX)) }
+
+/// `id` -> extra index when `id` is `base + i` for a registered extra.
+pub fn ext_index(id: u32, base: u32) -> Option<usize> {
+    let i = id.checked_sub(base)? as usize;
+    if i < ext_count() { Some(i) } else { None }
 }

@@ -35,6 +35,9 @@ const LINUX_REBOOT_CMD_CAD_OFF:    u32 = 0x0000_0000;
 const LINUX_REBOOT_CMD_POWER_OFF:  u32 = 0x4321_FEDC;
 const LINUX_REBOOT_CMD_RESTART2:   u32 = 0xA1B2_C3D4;
 const LINUX_REBOOT_CMD_KEXEC:      u32 = 0x4558_4543;
+/// LeandrOS private: run one freeze-only device suspend/resume cycle
+/// (`pm::sys_pm_test`, arg = user `PmTestReq`). "PMTS".
+const LEANDROS_REBOOT_CMD_PM_TEST: u32 = 0x504D_5453;
 
 const EPERM:  isize = -1;
 const EINVAL: isize = -22;
@@ -88,6 +91,9 @@ pub fn init_acpi(rsdp_phys: u64, hhdm_offset: u64) {
             serial_print_str(" value ");
             crate::serial_print_hex(p.reset_value as usize);
             serial_print_str("\n");
+            serial_print_str(&alloc::format!(
+                "[ACPI] sleep: LOW_POWER_S0={} \\_S3_={} SLP_TYP={:#x}/{:#x} FACS={:#x} _PTS={} _WAK={}\n",
+                p.low_power_s0 as u8, p.s3_found as u8, p.s3_typ_a, p.s3_typ_b, p.facs, p.has_pts as u8, p.has_wak as u8));
             unsafe { ACPI_POWER = Some(p); }
         }
         None => serial_print_str("[ACPI] no FADT: power-off falls back to halt\n"),
@@ -118,6 +124,7 @@ pub fn sys_reboot(magic1: usize, magic2: usize, cmd: usize, _arg: usize) -> isiz
         return EINVAL;
     }
     match cmd {
+        LEANDROS_REBOOT_CMD_PM_TEST => crate::pm::sys_pm_test(_arg),
         LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_RESTART2 => kernel_restart(),
         LINUX_REBOOT_CMD_CAD_ON  => { CAD_ENABLED.store(true, Ordering::Relaxed); 0 }
         LINUX_REBOOT_CMD_CAD_OFF => { CAD_ENABLED.store(false, Ordering::Relaxed); 0 }
@@ -405,9 +412,15 @@ fn kernel_kexec() -> isize {
     // last the bus resets (PCIe PERST# + bridge), after which the RC is gone.
     let (mut ok, mut bad) = drivers::dma_shutdown::run(drivers::dma_shutdown::Stage::Device);
     quiesce_all_pci();
-    let (bus_ok, bus_bad) = drivers::dma_shutdown::run(drivers::dma_shutdown::Stage::Bus);
-    ok.extend(bus_ok);
-    bad.extend(bus_bad);
+    // aarch64: the Bus stage runs later, from `final_cpu0` once every other
+    // CPU is parked (a bridge reset under live RP1 driver threads stalls them
+    // on AXI). Other architectures have no parked-CPU point, run it here.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let (bus_ok, bus_bad) = drivers::dma_shutdown::run(drivers::dma_shutdown::Stage::Bus);
+        ok.extend(bus_ok);
+        bad.extend(bus_bad);
+    }
     serial_print_str(&kexec_quiesced_line(&ok, xhci, &bad));
     crate::kexec::exec_jump()
 }
