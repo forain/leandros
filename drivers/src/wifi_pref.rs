@@ -18,8 +18,18 @@ pub const PREFER_5GHZ_GOOD_SNR: i16 = 25;
 /// `wifi.prefer5` (default on): see `auto_key`.
 pub static PREFER_5GHZ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
-/// Read the manager's kernel command-line knobs (`wifi.prefer5=0|1`).
+/// `wifi.wrongkey_bss=N` (default 2): distinct access points that must agree on
+/// "wrong passphrase" before the profile is blocked for the boot (1 = on the
+/// first verdict, the old behaviour).
+pub static WRONGKEY_BSS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
+pub fn wrongkey_bss() -> u8 { WRONGKEY_BSS.load(core::sync::atomic::Ordering::Relaxed) }
+
+/// Read the manager's kernel command-line knobs (`wifi.prefer5=0|1`, `wifi.wrongkey_bss=N`).
 pub fn set_knobs(cmdline: &str) {
+    if let Some(n) = cmdline.split_ascii_whitespace().filter_map(|t| t.strip_prefix("wifi.wrongkey_bss="))
+        .filter_map(|v| v.parse::<u8>().ok()).last() {
+        WRONGKEY_BSS.store(n.max(1), core::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(v) = cmdline.split_ascii_whitespace().filter_map(|t| t.strip_prefix("wifi.prefer5=")).last() {
         PREFER_5GHZ.store(v != "0", core::sync::atomic::Ordering::Relaxed);
     }

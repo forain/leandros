@@ -8,6 +8,10 @@ pub mod brcmf;
 pub mod wifi_frame;
 #[path = "../../src/wifi_crypto.rs"]
 pub mod wifi_crypto;
+#[path = "../../src/wifi_pref.rs"]
+pub mod wifi_pref;
+#[path = "../../src/wifi_wrongkey.rs"]
+pub mod wifi_wrongkey;
 
 #[cfg(test)]
 mod mock;

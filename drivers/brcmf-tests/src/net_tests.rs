@@ -910,3 +910,65 @@ fn host_handshake_ignores_the_netctl_ifindex_and_uses_the_firmware_mac() {
     assert_eq!(run(2), run(3));
     NETCTL_IFINDEX.store(0, Ordering::Relaxed);
 }
+
+// ── lane piwifikexec: wrong-passphrase policy (WRONG_KEY on one weak BSS) ────
+mod wrongkey {
+    use crate::wifi_wrongkey::*;
+    const P: [u8; 16] = [7; 16];
+    const A: [u8; 6] = [0x8c, 0x30, 0x66, 0x6a, 0x6f, 0x9d];
+    const B: [u8; 6] = [0x74, 0x83, 0xc2, 0xb7, 0xec, 0x19];
+
+    /// T1: one WRONG_KEY verdict on one (weak) BSS must not block the profile.
+    #[test]
+    fn t1_single_bss_verdict_does_not_block() {
+        let mut s = Vec::new();
+        assert_eq!(note_wrong_key(&mut s, P, A, 1000, false, 2), WkVerdict::Defer(1));
+        // The same BSS failing again is still one BSS.
+        assert_eq!(note_wrong_key(&mut s, P, A, 20_000, false, 2), WkVerdict::Defer(1));
+    }
+
+    /// T2: a real wrong passphrase (two different BSSes) still blocks.
+    #[test]
+    fn t2_two_bsses_block() {
+        let mut s = Vec::new();
+        assert_eq!(note_wrong_key(&mut s, P, A, 1000, false, 2), WkVerdict::Defer(1));
+        assert_eq!(note_wrong_key(&mut s, P, B, 30_000, false, 2), WkVerdict::Block(2));
+        // Verdicts outside the window do not corroborate.
+        let mut s = Vec::new();
+        note_wrong_key(&mut s, P, A, 0, false, 2);
+        assert_eq!(note_wrong_key(&mut s, P, B, WK_WINDOW_MS + 1, false, 2), WkVerdict::Defer(1));
+    }
+
+    /// T3: a profile proven this boot (or by a stored timestamp) is never blocked.
+    #[test]
+    fn t3_proven_profile_never_blocks() {
+        let mut s = Vec::new();
+        assert_eq!(note_wrong_key(&mut s, P, A, 1000, true, 2), WkVerdict::Defer(1));
+        assert_eq!(note_wrong_key(&mut s, P, B, 2000, true, 2), WkVerdict::Defer(2));
+        assert_eq!(note_wrong_key(&mut s, P, B, 3000, true, 1), WkVerdict::Defer(2));
+    }
+
+    /// T4: `wifi.wrongkey_bss=1` keeps the old behaviour (block on the first).
+    #[test]
+    fn t4_threshold_one_is_legacy() {
+        let mut s = Vec::new();
+        assert_eq!(note_wrong_key(&mut s, P, A, 1000, false, 1), WkVerdict::Block(1));
+        // 0 is treated as 1.
+        assert_eq!(note_wrong_key(&mut Vec::new(), P, A, 1000, false, 0), WkVerdict::Block(1));
+    }
+
+    /// T5: verdicts are per profile; success clears; knob parsing.
+    #[test]
+    fn t5_per_profile_and_clear_and_knob() {
+        let q = [9u8; 16];
+        let mut s = Vec::new();
+        note_wrong_key(&mut s, P, A, 1000, false, 2);
+        assert_eq!(note_wrong_key(&mut s, q, B, 2000, false, 2), WkVerdict::Defer(1));
+        clear_profile(&mut s, &P);
+        assert_eq!(note_wrong_key(&mut s, P, B, 3000, false, 2), WkVerdict::Defer(1));
+        crate::wifi_pref::set_knobs("quiet wifi.wrongkey_bss=1");
+        assert_eq!(crate::wifi_pref::wrongkey_bss(), 1);
+        crate::wifi_pref::set_knobs("wifi.wrongkey_bss=2");
+        assert_eq!(crate::wifi_pref::wrongkey_bss(), 2);
+    }
+}

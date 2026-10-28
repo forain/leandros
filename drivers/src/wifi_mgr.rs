@@ -670,6 +670,8 @@ struct St {
     age_out_ms: u64,
     auto_blocked: bool,
     wrong_key: Vec<[u8; 16]>,
+    /// WRONG_KEY verdicts per (profile, BSS), see `wifi_wrongkey`.
+    wk_bss: Vec<crate::wifi_wrongkey::WkSeen>,
     backoff: Vec<Backoff>,
     bss_backoff: Vec<BssBackoff>,
     /// (profile, `now_ms` of its last successful connection this boot).
@@ -718,7 +720,7 @@ impl Mgr {
                     _rsv: [0; 8],
                 },
                 bss: Vec::new(), last_scan: None, last_scan_ms: 0, scan_gen: 0, radio_on: true, caps: 0,
-                age_out_ms: BSS_AGE_OUT_MS as u64, auto_blocked: false, wrong_key: Vec::new(), backoff: Vec::new(),
+                age_out_ms: BSS_AGE_OUT_MS as u64, auto_blocked: false, wrong_key: Vec::new(), wk_bss: Vec::new(), backoff: Vec::new(),
                 bss_backoff: Vec::new(), used: Vec::new(), rejected_logged: Vec::new(), flaps: Vec::new(),
                 fallback: Vec::new(), next_auto_ms: 0, next_attempt: 1, last_signal: (0, 0),
             }),
@@ -1122,14 +1124,37 @@ impl Mgr {
         // included) instead of hammering it.
         let bss_fault = matches!(f.reason, reason::AUTH_REJECTED | reason::ASSOC_REJECTED | reason::DEAUTH_BY_AP
                                          | reason::TIMEOUT | reason::BEACON_LOSS);
-        if let (true, Some(b)) = (bss_fault, bssid) {
+        if let (true, Some(b)) = (bss_fault || f.reason == reason::WRONG_KEY, bssid) {
             self.note_bss_failure(b);
         }
         if uuid_is_nil(uuid) { return; }
         let mut st = self.st.lock();
-        if f.reason == reason::WRONG_KEY || f.reason == reason::NO_SECRET {
+        if f.reason == reason::NO_SECRET {
             if !st.wrong_key.contains(uuid) { st.wrong_key.push(*uuid); }
             return;
+        }
+        if f.reason == reason::WRONG_KEY {
+            // One handshake timeout on one weak BSS is not proof of a wrong
+            // passphrase: back off, and block only when several access points
+            // agree (`wifi.wrongkey_bss`) and the profile never worked.
+            let proven = st.used.iter().any(|u| u.0 == *uuid)
+                || self.profiles().iter().any(|p| p.uuid == *uuid && p.timestamp_s != 0);
+            let now = now_ms();
+            let bss = bssid.unwrap_or([0; 6]);
+            let thr = crate::wifi_pref::wrongkey_bss();
+            let v = crate::wifi_wrongkey::note_wrong_key(&mut st.wk_bss, *uuid, bss, now, proven, thr);
+            if let crate::wifi_wrongkey::WkVerdict::Block(n) = v {
+                if !st.wrong_key.contains(uuid) { st.wrong_key.push(*uuid); }
+                drop(st);
+                self.log(&alloc::format!("profile blocked: wrong passphrase on {} access point(s)", n));
+                return;
+            }
+            if let crate::wifi_wrongkey::WkVerdict::Defer(n) = v {
+                drop(st);
+                self.log(&alloc::format!("wrong-key verdict on {} ({} of {} BSSes), not blocking the profile yet",
+                                         fmt_mac(&bss), n, thr));
+                st = self.st.lock();
+            }
         }
         if bss_fault && bssid.is_some() { return; }
         let now = now_ms();
@@ -1147,6 +1172,7 @@ impl Mgr {
         let mut st = self.st.lock();
         st.backoff.retain(|b| b.uuid != *uuid);
         st.bss_backoff.retain(|b| b.bssid != bssid);
+        crate::wifi_wrongkey::clear_profile(&mut st.wk_bss, uuid);
         if !uuid_is_nil(uuid) {
             st.used.retain(|u| u.0 != *uuid);
             if st.used.len() >= netctl_abi::MAX_PROFILES { st.used.remove(0); }
@@ -1322,6 +1348,7 @@ pub fn run<R: Radio>(mgr: &'static Mgr, r: &mut R) {
                         let mut st = mgr.st.lock();
                         st.auto_blocked = false;
                         st.wrong_key.retain(|u| *u != p.profile_uuid);
+                    crate::wifi_wrongkey::clear_profile(&mut st.wk_bss, &p.profile_uuid);
                         st.backoff.retain(|b| b.uuid != p.profile_uuid);
                     }
                     if rfkill || !mgr.st.lock().radio_on { continue; }
@@ -1352,7 +1379,9 @@ pub fn run<R: Radio>(mgr: &'static Mgr, r: &mut R) {
                     {
                         let mut st = mgr.st.lock();
                         st.wrong_key.clear();
+                        st.wk_bss.clear();
                         st.backoff.clear();
+                        st.bss_backoff.clear();
                         st.auto_blocked = false;
                         st.next_auto_ms = 0;
                     }
@@ -1643,7 +1672,9 @@ fn connected<R: Radio>(mgr: &Mgr, r: &mut R, req: &Req, bssid: [u8; 6]) -> After
                 {
                     let mut st = mgr.st.lock();
                     st.wrong_key.clear();
+                    st.wk_bss.clear();
                     st.backoff.clear();
+                    st.bss_backoff.clear();
                     st.auto_blocked = false;
                 }
                 mgr.refresh_flags();
@@ -1680,6 +1711,7 @@ fn connected<R: Radio>(mgr: &Mgr, r: &mut R, req: &Req, bssid: [u8; 6]) -> After
                     let mut st = mgr.st.lock();
                     st.auto_blocked = false;
                     st.wrong_key.retain(|u| *u != p.profile_uuid);
+                    crate::wifi_wrongkey::clear_profile(&mut st.wk_bss, &p.profile_uuid);
                     st.backoff.retain(|b| b.uuid != p.profile_uuid);
                 }
                 return After::Next(Req::from_params(p));
