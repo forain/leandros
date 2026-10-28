@@ -316,7 +316,7 @@ fn loopback_pair_connect_echo_fragmented_then_reconnect_with_stored_key() {
     assert_eq!(h.channel_count(), 0);
     h.tick(10_000);
     vc.run(&mut h);
-    assert!(std::iter::from_fn(|| h.take_log()).any(|l| l.contains("idle, disconnecting")));
+    assert!(std::iter::from_fn(|| h.take_log()).any(|l| l.contains("ms, disconnecting")));
     assert!(!h.busy());
     // btd restart: keys come back from the file; the reconnect uses them (no SSP).
     let mut vc2 = Vc::new();
@@ -362,7 +362,10 @@ fn incoming_channel_on_listened_psm_and_refused_psm() {
     feed(&mut h, "02 0c 20 0e 00 0a 00 01 00 05 01 06 00 40 00 00 00 00 00");
     feed(&mut h, "02 0c 20 0c 00 08 00 01 00 04 0b 04 00 40 00 00 00");
     assert_eq!(outs(&mut h), vec![hx("02 0c 20 0e 00 0a 00 01 00 05 0b 06 00 42 00 00 00 00 00")]);
-    assert_eq!(evs(&mut h), vec![(2, Msg::Incoming { cid: 0x40, addr: PAD, psm: 0x11, peer_mtu: 672 })]);
+    assert_eq!(evs(&mut h), vec![
+        (2, Msg::Link { addr: PAD, up: true, incoming: true }),
+        (2, Msg::Incoming { cid: 0x40, addr: PAD, psm: 0x11, peer_mtu: 672 }),
+    ]);
     // The listener goes away: its channel is closed towards the peer.
     h.drop_owner(2);
     assert_eq!(outs(&mut h), vec![hx("02 0c 20 0c 00 08 00 01 00 06 02 04 00 42 00 40 00")]);
@@ -458,4 +461,129 @@ fn init_with_late_clock_does_not_time_out_reset() {
     let mut vc = Vc::new();
     vc.run(&mut h);
     assert_eq!(h.state, State::Ready);
+}
+
+const CONN_REQ: &str = "04 04 0a 01 02 03 04 05 06 08 05 00 01";
+const CONN_OK_PLAIN: &str = "04 03 0b 00 0b 00 01 02 03 04 05 06 01 00";
+
+fn ops(h: &mut Host) -> Vec<u16> { outs(h).iter().filter_map(|p| opcode(p)).collect() }
+fn cs_status(o: u16, st: u8) -> Vec<u8> { let b = o.to_le_bytes(); hci::event(ev::CMD_STATUS, &[st, 1, b[0], b[1]]) }
+fn has_connect_ok(e: &[(Owner, Msg)]) -> bool {
+    e.iter().any(|(_, m)| matches!(m, Msg::ConnectResult { status: 0, .. }))
+}
+
+#[test]
+fn crossing_conn_request_while_paging_is_adopted() {
+    let mut vc = Vc::new();
+    let mut h = ready(&mut vc, KeyStore::default());
+    h.request(3, Msg::Connect { req: 1, addr: PAD, psm: 0x13 });
+    assert_eq!(ops(&mut h), vec![op::CREATE_CONN]);
+    feed(&mut h, CONN_REQ);
+    h.on_packet(&cs_status(op::CREATE_CONN, 0x0b));
+    let o = ops(&mut h);
+    assert!(o.contains(&op::ACCEPT_CONN) && !o.contains(&op::REJECT_CONN), "{:?}", o);
+    h.on_packet(&Vc::cs(op::ACCEPT_CONN));
+    assert!(evs(&mut h).is_empty(), "the 0x0b must not fail the connect");
+    feed(&mut h, CONN_OK_PLAIN);
+    vc.run(&mut h);
+    let e = evs(&mut h);
+    assert!(has_connect_ok(&e), "{:?}", e);
+}
+
+#[test]
+fn create_conn_0x0b_then_incoming() {
+    let mut vc = Vc::new();
+    let mut h = ready(&mut vc, KeyStore::default());
+    h.request(3, Msg::Connect { req: 1, addr: PAD, psm: 0x13 });
+    assert_eq!(ops(&mut h), vec![op::CREATE_CONN]);
+    h.on_packet(&cs_status(op::CREATE_CONN, 0x0b));
+    assert!(evs(&mut h).is_empty());
+    feed(&mut h, CONN_REQ);
+    assert!(ops(&mut h).contains(&op::ACCEPT_CONN));
+    h.on_packet(&Vc::cs(op::ACCEPT_CONN));
+    feed(&mut h, CONN_OK_PLAIN);
+    vc.run(&mut h);
+    assert!(has_connect_ok(&evs(&mut h)));
+    // Variant: no incoming link ever shows up.
+    let mut vc = Vc::new();
+    let mut h = ready(&mut vc, KeyStore::default());
+    h.request(3, Msg::Connect { req: 1, addr: PAD, psm: 0x13 });
+    outs(&mut h);
+    h.on_packet(&cs_status(op::CREATE_CONN, 0x0b));
+    h.tick(5_000);
+    assert!(evs(&mut h).is_empty());
+    h.tick(11_000);
+    assert_eq!(evs(&mut h), vec![(3, Msg::ConnectResult { req: 1, status: status::BUSY, cid: 0, peer_mtu: 0 })]);
+}
+
+#[test]
+fn incoming_bonded_link_gets_grace_and_security() {
+    let mut vc = Vc::new();
+    vc.peer_has_key = true;
+    let ks = KeyStore::parse("06:05:04:03:02:01 00112233445566778899aabbccddeeff 4 Pad\n");
+    let mut h = ready(&mut vc, ks);
+    h.request(2, Msg::Listen { psm: 0x11 });
+    evs(&mut h);
+    feed(&mut h, CONN_REQ);
+    h.on_packet(&Vc::cs(op::ACCEPT_CONN));
+    outs(&mut h);
+    feed(&mut h, CONN_OK_PLAIN);
+    vc.run(&mut h);
+    assert!(vc.commands.contains(&op::AUTH_REQUESTED), "we secure the incoming bonded link");
+    assert!(vc.commands.contains(&op::SET_CONN_ENCRYPT));
+    assert_eq!(evs(&mut h), vec![(2, Msg::Link { addr: PAD, up: true, incoming: true })]);
+    h.tick(6_000);
+    assert!(!ops(&mut h).contains(&op::DISCONNECT), "inside the grace");
+    h.tick(21_000);
+    assert!(ops(&mut h).contains(&op::DISCONNECT), "grace over");
+}
+
+#[test]
+fn incoming_hid_psm_pending_until_encrypted() {
+    let pending = hx("02 0b 20 10 00 0c 00 01 00 03 0a 08 00 40 00 42 00 01 00 01 00");
+    let accepted = hx("02 0b 20 10 00 0c 00 01 00 03 0a 08 00 40 00 42 00 00 00 00 00");
+    let blocked = hx("02 0b 20 10 00 0c 00 01 00 03 0a 08 00 40 00 42 00 03 00 00 00");
+    let req = "02 0b 20 0c 00 08 00 01 00 02 0a 04 00 11 00 42 00";
+    let setup = || {
+        let mut vc = Vc::new();
+        let mut h = ready(&mut vc, KeyStore::default());
+        h.request(2, Msg::Listen { psm: 0x11 });
+        feed(&mut h, CONN_REQ);
+        h.on_packet(&Vc::cs(op::ACCEPT_CONN));
+        feed(&mut h, CONN_OK_PLAIN);
+        outs(&mut h);
+        evs(&mut h);
+        h
+    };
+    let mut h = setup();
+    feed(&mut h, req);
+    let o = outs(&mut h);
+    assert!(o.contains(&pending), "{:?}", o);
+    assert!(o.iter().any(|p| opcode(p) == Some(op::AUTH_REQUESTED)));
+    assert!(evs(&mut h).is_empty());
+    feed(&mut h, "04 08 04 00 0b 00 01");
+    let o = outs(&mut h);
+    assert!(o.contains(&accepted), "{:?}", o);
+    assert_eq!(o.iter().filter(|p| p[0] == hci::H4_ACL).count(), 2, "response plus our Config Request");
+    // Authentication fails: the channel is refused with a security block.
+    let mut h = setup();
+    feed(&mut h, req);
+    outs(&mut h);
+    feed(&mut h, "04 06 03 05 0b 00");
+    let o = outs(&mut h);
+    assert!(o.contains(&blocked), "{:?}", o);
+    assert_eq!(h.channel_count(), 0);
+}
+
+#[test]
+fn unsolicited_pairing_on_incoming_link_is_refused() {
+    let mut vc = Vc::new();
+    let mut h = ready(&mut vc, KeyStore::default());
+    feed(&mut h, CONN_REQ);
+    h.on_packet(&Vc::cs(op::ACCEPT_CONN));
+    feed(&mut h, CONN_OK_PLAIN);
+    outs(&mut h);
+    feed(&mut h, "04 31 06 01 02 03 04 05 06");
+    let o = ops(&mut h);
+    assert!(o.contains(&op::IO_CAP_NEG_REPLY) && !o.contains(&op::IO_CAP_REPLY), "{:?}", o);
 }

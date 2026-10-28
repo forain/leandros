@@ -1,7 +1,7 @@
 //! btd — the Bluetooth host daemon.
 //!
 //! ```text
-//! btd [--dev PATH | --fd N] [--name NAME] [--sock PATH] [--keys PATH]
+//! btd [--dev PATH | --fd N] [--name NAME] [--sock PATH] [--keys PATH] [--idle-ms N] [--grace-ms N]
 //!     defaults: /dev/hci0, "LeandrOS", /run/bluetooth/btd.sock, /var/lib/bluetooth/linkkeys
 //!     (--fd/--sock/--keys exist for bttest, which plays the controller over a socketpair)
 //! ```
@@ -66,6 +66,13 @@ fn write_pkt(dev: i32, pkt: &[u8]) -> bool {
     true
 }
 
+/// Parses a NUL-terminated decimal argument.
+fn parse_ms(a: &[u8]) -> Option<u64> {
+    let d = &a[..a.len().saturating_sub(1)];
+    if d.is_empty() || !d.iter().all(|c| c.is_ascii_digit()) { return None; }
+    core::str::from_utf8(d).ok()?.parse().ok()
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
     let mut dev_path: &[u8] = b"/dev/hci0\0";
@@ -73,6 +80,8 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     let mut dev_fd: Option<i32> = None;
     let mut sock: &[u8] = btd::SOCK_PATH;
     let mut keys: &[u8] = btd::KEYS_PATH;
+    let mut idle_ms: Option<u64> = None;
+    let mut grace_ms: Option<u64> = None;
     let mut i = 1;
     while i < argc as isize {
         match arg(argv, i) {
@@ -89,7 +98,9 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             }
             b"--sock\0" if i + 1 < argc as isize => { i += 1; sock = arg(argv, i); }
             b"--keys\0" if i + 1 < argc as isize => { i += 1; keys = arg(argv, i); }
-            _ => { eprintln!("usage: btd [--dev PATH | --fd N] [--name NAME] [--sock PATH] [--keys PATH]"); return 2; }
+            b"--idle-ms\0" if i + 1 < argc as isize => { i += 1; idle_ms = parse_ms(arg(argv, i)); }
+            b"--grace-ms\0" if i + 1 < argc as isize => { i += 1; grace_ms = parse_ms(arg(argv, i)); }
+            _ => { eprintln!("usage: btd [--dev PATH | --fd N] [--name NAME] [--sock PATH] [--keys PATH] [--idle-ms N] [--grace-ms N]"); return 2; }
         }
         i += 1;
     }
@@ -125,6 +136,8 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     }
 
     let mut host = Host::new(name, load_keys(keys), sys::now_ms());
+    if let Some(v) = idle_ms { host.idle_ms = v; }
+    if let Some(v) = grace_ms { host.incoming_grace_ms = v; }
     let mut clients: Vec<Client> = Vec::new();
     let mut next_id: Owner = 1;
     let mut rx: Vec<u8> = Vec::new();

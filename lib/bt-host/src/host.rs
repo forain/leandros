@@ -29,6 +29,10 @@ const CID_SMP: u16 = 0x0006;
 const FIRST_DYN_CID: u16 = 0x0040;
 pub const IDLE_DISCONNECT_MS: u64 = 5000;
 const CMD_TIMEOUT_MS: u64 = 4000;
+/// Default idle limit for a fresh incoming ACL from a bonded device.
+pub const INCOMING_GRACE_MS: u64 = 20_000;
+/// How long a 0x0b (ACL exists) create waits for the controller's incoming Connection Complete.
+const CROSS_WAIT_MS: u64 = 10_000;
 const NOBODY: Owner = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,10 +85,16 @@ struct Link {
     rx: Vec<u8>,
     last_activity: u64,
     outstanding: u16,
+    paging: bool,
+    accepting: bool,
+    incoming: bool,
+    used: bool,
+    up_at: u64,
+    expect_until: u64,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
-enum ChanState { WaitLink, WaitConnRsp, Config { ours_ok: bool, theirs_ok: bool }, Open, Closing }
+enum ChanState { WaitLink, WaitSecurity, WaitConnRsp, Config { ours_ok: bool, theirs_ok: bool }, Open, Closing }
 
 struct Chan {
     cid: u16,
@@ -140,6 +150,10 @@ pub struct Host {
     acl_txq: VecDeque<(u16, bool, Vec<u8>)>,
     acl_avail: u16,
     le_avail: u16,
+    /// Idle limit (ms) for a BR/EDR link nobody uses.
+    pub idle_ms: u64,
+    /// Idle limit (ms) for a fresh incoming ACL from a bonded device.
+    pub incoming_grace_ms: u64,
 }
 
 impl Host {
@@ -151,6 +165,7 @@ impl Host {
             events: VecDeque::new(), logs: VecDeque::new(), links: Vec::new(), chans: Vec::new(),
             listens: Vec::new(), keys_dirty: false, scan: None, pairs: Vec::new(), next_cid: FIRST_DYN_CID,
             next_ident: 1, acl_txq: VecDeque::new(), acl_avail: 0, le_avail: 0,
+            idle_ms: IDLE_DISCONNECT_MS, incoming_grace_ms: INCOMING_GRACE_MS,
         };
         for k in h.keys.keys.clone() {
             h.devices.push(Device { addr: k.addr, name: k.name, psrm: 1, ..Default::default() });
@@ -284,8 +299,14 @@ impl Host {
             op::CREATE_CONN if st != 0 && params.len() >= 6 => {
                 let a = Addr::from_slice(&params);
                 if let Some(i) = self.links.iter().position(|l| l.addr == a && l.state == LinkState::Connecting) {
-                    self.log(format!("connect {} failed status 0x{:02x}", a, st));
-                    self.link_down(i, hci::status_of(st));
+                    self.links[i].paging = false;
+                    if self.links[i].accepting || st == 0x0b {
+                        if !self.links[i].accepting { self.links[i].expect_until = self.now + CROSS_WAIT_MS; }
+                        self.log(format!("connect {}: status 0x{:02x}, ACL exists, reusing the incoming link", a, st));
+                    } else {
+                        self.log(format!("connect {} failed status 0x{:02x}", a, st));
+                        self.link_down(i, hci::status_of(st));
+                    }
                 }
             }
             op::AUTH_REQUESTED | op::SET_CONN_ENCRYPT if st != 0 && params.len() >= 2 => {
@@ -372,12 +393,27 @@ impl Host {
             ev::CONN_REQUEST => {
                 need!(10);
                 let a = Addr::from_slice(p);
-                if p[9] == 1 && self.state == State::Ready && !self.links.iter().any(|l| l.addr == a) {
-                    self.log(format!("incoming connection from {}", a));
-                    self.new_link(a, false, LinkState::Connecting);
+                let existing = self.links.iter().position(|l| l.addr == a);
+                let ok = p[9] == 1 && self.state == State::Ready
+                    && existing.map_or(true, |i| self.links[i].state == LinkState::Connecting && !self.links[i].accepting);
+                if ok {
+                    let i = match existing {
+                        Some(i) => { self.log(format!("incoming connection from {} crosses our page; adopting", a)); i }
+                        None => {
+                            self.log(format!("incoming connection from {}", a));
+                            self.new_link(a, false, LinkState::Connecting)
+                        }
+                    };
+                    let now = self.now;
+                    let l = &mut self.links[i];
+                    l.accepting = true;
+                    l.incoming = true;
+                    l.since = now;
                     let mut c = a.0.to_vec();
                     c.push(0x01); // remain peripheral; no role switch demanded
                     self.send_cmd(op::ACCEPT_CONN, &c);
+                } else if existing.is_some_and(|i| self.links[i].accepting) {
+                    // Duplicate request while we are already accepting: nothing to do.
                 } else {
                     let mut c = a.0.to_vec();
                     c.push(0x0d);
@@ -390,6 +426,14 @@ impl Host {
                 let a = Addr::from_slice(&p[3..]);
                 let Some(i) = self.links.iter().position(|l| l.addr == a && l.state == LinkState::Connecting) else { return };
                 if p[0] != 0 {
+                    let l = &mut self.links[i];
+                    if p[0] == 0x0b || (l.paging && l.accepting) {
+                        // Page crossing: this failure is one of two attempts; the other may still land.
+                        l.paging = false;
+                        l.expect_until = self.now + CROSS_WAIT_MS;
+                        self.log(format!("connection to {}: status 0x{:02x}, waiting for the other attempt", a, p[0]));
+                        return;
+                    }
                     self.log(format!("connection to {} failed status 0x{:02x}", a, p[0]));
                     self.link_down(i, hci::status_of(p[0]));
                     return;
@@ -400,9 +444,17 @@ impl Host {
                 l.state = LinkState::Up;
                 l.encrypted = p[10] != 0;
                 l.last_activity = now;
-                let h = l.handle;
+                l.up_at = now;
+                l.paging = false;
+                l.accepting = false;
+                l.expect_until = 0;
+                let (h, incoming) = (l.handle, l.incoming);
                 self.log(format!("connected {} handle 0x{:03x}", a, h));
+                self.link_event(a, true, incoming);
                 self.advance(a);
+                if incoming && self.keys.get(a).is_some() {
+                    if let Some(i) = self.up_link(a) { self.start_security(i); }
+                }
             }
             ev::DISCONN_COMPLETE => {
                 need!(4);
@@ -440,6 +492,11 @@ impl Host {
                 let h = le16(p, 1) & 0x0fff;
                 let Some(i) = self.link_by_handle(h) else { return };
                 self.links[i].enc_pending = false;
+                self.links[i].last_activity = self.now;
+                if p[0] == 0 && p[3] == 0 {
+                    let a = self.links[i].addr;
+                    self.log(format!("{}: encryption off", a));
+                }
                 if p[0] == 0 && p[3] != 0 {
                     let l = &mut self.links[i];
                     l.encrypted = true;
@@ -475,6 +532,8 @@ impl Host {
             ev::LINK_KEY_REQUEST => {
                 need!(6);
                 let a = Addr::from_slice(p);
+                self.touch(a);
+                self.log(format!("{}: link key requested, {}", a, if self.keys.get(a).is_some() { "stored key sent" } else { "none" }));
                 match self.keys.get(a).map(|k| k.key) {
                     Some(k) => {
                         let mut c = p[..6].to_vec();
@@ -499,6 +558,17 @@ impl Host {
             }
             ev::IO_CAP_REQUEST => {
                 need!(6);
+                let a = Addr::from_slice(p);
+                self.touch(a);
+                let wanted = self.pairs.iter().any(|q| q.1 == a)
+                    || self.chans.iter().any(|c| c.addr == a && c.req.is_some() && c.state != ChanState::Open);
+                if !wanted {
+                    self.log(format!("{}: pairing refused (nobody asked for it)", a));
+                    let mut c = p[..6].to_vec();
+                    c.push(0x18);
+                    self.send_cmd(op::IO_CAP_NEG_REPLY, &c);
+                    return;
+                }
                 let mut c = p[..6].to_vec();
                 // NoInputNoOutput, no OOB data, general bonding without MITM: just-works.
                 c.extend_from_slice(&[0x03, 0x00, 0x04]);
@@ -506,11 +576,13 @@ impl Host {
             }
             ev::IO_CAP_RESPONSE => {
                 need!(9);
+                self.touch(Addr::from_slice(p));
                 self.log(format!("{}: remote io_cap={} auth_req=0x{:02x}", Addr::from_slice(p), p[6], p[8]));
             }
             ev::USER_CONFIRM_REQUEST => {
                 need!(10);
                 let v = u32::from_le_bytes([p[6], p[7], p[8], p[9]]);
+                self.touch(Addr::from_slice(p));
                 self.log(format!("{}: confirm {:06} auto-accepted", Addr::from_slice(p), v));
                 self.send_cmd(op::USER_CONFIRM_REPLY, &p[..6]);
             }
@@ -664,9 +736,26 @@ impl Host {
         self.links.push(Link {
             addr: a, handle: 0xffff, le, state, since: self.now, authenticated: false, encrypted: false,
             auth_pending: false, enc_pending: false, auth_retried: false, rx: Vec::new(),
-            last_activity: self.now, outstanding: 0,
+            last_activity: self.now, outstanding: 0, paging: false, accepting: false, incoming: false,
+            used: false, up_at: self.now, expect_until: 0,
         });
         self.links.len() - 1
+    }
+
+    /// Marks activity on the BR/EDR link to `a` (security traffic counts, so the idle rule stays off).
+    fn touch(&mut self, a: Addr) {
+        let now = self.now;
+        if let Some(l) = self.links.iter_mut().find(|l| l.addr == a && !l.le) { l.last_activity = now; }
+    }
+
+    /// Tells every LISTEN owner (once) that a BR/EDR ACL came up or went down.
+    fn link_event(&mut self, a: Addr, up: bool, incoming: bool) {
+        let mut seen: Vec<Owner> = Vec::new();
+        for l in self.listens.clone() {
+            if seen.contains(&l.1) { continue; }
+            seen.push(l.1);
+            self.emit(l.1, Msg::Link { addr: a, up, incoming });
+        }
     }
 
     fn link_by_handle(&self, h: u16) -> Option<usize> {
@@ -689,7 +778,9 @@ impl Host {
         c.extend_from_slice(&clock.to_le_bytes());
         c.push(1);
         self.send_cmd(op::CREATE_CONN, &c);
-        Some(self.new_link(a, false, LinkState::Connecting))
+        let i = self.new_link(a, false, LinkState::Connecting);
+        self.links[i].paging = true;
+        Some(i)
     }
 
     fn start_security(&mut self, i: usize) {
@@ -728,6 +819,20 @@ impl Host {
         }
         for (id, d) in reqs { self.sig_raw(handle, 0x02, id, &d); }
         if enc {
+            let secured: Vec<usize> = (0..self.chans.len())
+                .filter(|&k| self.chans[k].addr == a && self.chans[k].state == ChanState::WaitSecurity).collect();
+            for k in secured {
+                let (cid, rcid, ident) = (self.chans[k].cid, self.chans[k].rcid, self.chans[k].ident);
+                let mut r = cid.to_le_bytes().to_vec();
+                r.extend_from_slice(&rcid.to_le_bytes());
+                r.extend_from_slice(&[0, 0, 0, 0]);
+                self.sig_raw(handle, 0x03, ident, &r);
+                self.chans[k].state = ChanState::Config { ours_ok: false, theirs_ok: false };
+                self.chans[k].deadline = now + 10_000;
+                self.send_config_req(k);
+            }
+        }
+        if enc {
             let done: Vec<Owner> = self.pairs.iter().filter(|p| p.1 == a).map(|p| p.0).collect();
             self.pairs.retain(|p| p.1 != a);
             for o in done { self.result(o, aop::PAIR, status::OK); }
@@ -745,6 +850,16 @@ impl Host {
             .filter(|c| c.addr == a && c.state == ChanState::WaitLink && c.psm != PSM_SDP)
             .map(|c| (c.owner, c.req.unwrap_or(0), c.cid)).collect();
         self.chans.retain(|c| !(c.addr == a && c.state == ChanState::WaitLink && c.psm != PSM_SDP));
+        let blocked: Vec<(u16, u16, u8)> = self.chans.iter()
+            .filter(|c| c.addr == a && c.state == ChanState::WaitSecurity).map(|c| (c.cid, c.rcid, c.ident)).collect();
+        self.chans.retain(|c| !(c.addr == a && c.state == ChanState::WaitSecurity));
+        let handle = self.links[i].handle;
+        for (cid, rcid, ident) in blocked {
+            let mut r = cid.to_le_bytes().to_vec();
+            r.extend_from_slice(&rcid.to_le_bytes());
+            r.extend_from_slice(&[3, 0, 0, 0]); // security block
+            self.sig_raw(handle, 0x03, ident, &r);
+        }
         for (o, r, _) in failed { self.emit(o, Msg::ConnectResult { req: r, status: st, cid: 0, peer_mtu: 0 }); }
         let done: Vec<Owner> = self.pairs.iter().filter(|p| p.1 == a).map(|p| p.0).collect();
         self.pairs.retain(|p| p.1 != a);
@@ -773,6 +888,7 @@ impl Host {
         self.pairs.retain(|p| p.1 != a);
         for o in done { evs.push((o, Msg::Result { op: aop::PAIR, status: st })); }
         for (o, m) in evs { self.emit(o, m); }
+        if !l.le && l.state == LinkState::Up { self.link_event(a, false, l.incoming); }
     }
 
     // ── ACL ────────────────────────────────────────────────────────────────
@@ -899,6 +1015,9 @@ impl Host {
         if c.state != (ChanState::Config { ours_ok: true, theirs_ok: true }) { return; }
         c.state = ChanState::Open;
         c.deadline = u64::MAX;
+        let ca = c.addr;
+        if let Some(l) = self.links.iter_mut().find(|l| l.addr == ca && !l.le) { l.used = true; }
+        let c = &mut self.chans[ci];
         let m = match c.req {
             Some(req) => Msg::ConnectResult { req, status: status::OK, cid: c.cid, peer_mtu: c.peer_mtu },
             None => Msg::Incoming { cid: c.cid, addr: c.addr, psm: c.psm, peer_mtu: c.peer_mtu },
@@ -930,9 +1049,11 @@ impl Host {
         let Some(a) = self.links.iter().find(|l| l.handle == h).map(|l| l.addr) else { return };
         let now = self.now;
         let find = |s: &Self, cid: u16| s.chans.iter().position(|c| c.cid == cid && c.addr == a);
+        self.touch(a);
         match code {
             0x02 if d.len() >= 4 => {
                 let (psm, scid) = (le16(d, 0), le16(d, 2));
+                self.log(format!("{}: l2cap conn req psm 0x{:04x}", a, psm));
                 let Some(owner) = self.listens.iter().find(|l| l.0 == psm).map(|l| l.1) else {
                     self.log(format!("{}: refusing psm 0x{:04x}", a, psm));
                     let mut r = vec![0, 0];
@@ -941,6 +1062,20 @@ impl Host {
                     return self.sig_raw(h, 0x03, id, &r);
                 };
                 let cid = self.alloc_cid();
+                let li = self.up_link(a);
+                if psm != PSM_SDP && li.is_some_and(|li| !self.links[li].encrypted) {
+                    // Not encrypted yet: answer "pending, authentication" and secure the link first.
+                    self.chans.push(Chan {
+                        cid, rcid: scid, psm, addr: a, owner, req: None, state: ChanState::WaitSecurity,
+                        peer_mtu: OUR_MTU, deadline: now + 10_000, ident: id,
+                    });
+                    let mut r = cid.to_le_bytes().to_vec();
+                    r.extend_from_slice(&scid.to_le_bytes());
+                    r.extend_from_slice(&[1, 0, 1, 0]);
+                    self.sig_raw(h, 0x03, id, &r);
+                    self.start_security(li.unwrap());
+                    return;
+                }
                 self.chans.push(Chan {
                     cid, rcid: scid, psm, addr: a, owner, req: None,
                     state: ChanState::Config { ours_ok: false, theirs_ok: false },
@@ -1131,7 +1266,7 @@ impl Host {
             }
             Msg::Close { cid } => {
                 let Some(ci) = self.chans.iter().position(|c| c.cid == cid && c.owner == owner && c.state != ChanState::Closing) else { return };
-                if self.chans[ci].state == ChanState::WaitLink { self.chans.remove(ci); } else {
+                if matches!(self.chans[ci].state, ChanState::WaitLink | ChanState::WaitSecurity) { self.chans.remove(ci); } else {
                     self.close_chan(ci);
                     self.chans[ci].req = None;
                 }
@@ -1188,7 +1323,7 @@ impl Host {
         let mut i = 0;
         while i < self.chans.len() {
             if self.chans[i].owner == owner {
-                if self.chans[i].state == ChanState::WaitLink { self.chans.remove(i); continue; }
+                if matches!(self.chans[i].state, ChanState::WaitLink | ChanState::WaitSecurity) { self.chans.remove(i); continue; }
                 if self.chans[i].state != ChanState::Closing { self.close_chan(i); }
                 self.chans[i].owner = NOBODY;
                 self.chans[i].req = None;
@@ -1225,14 +1360,22 @@ impl Host {
                 self.link_down(li, status::TIMEOUT);
                 continue;
             }
+            if l.state == LinkState::Connecting && !l.paging && l.expect_until != 0 && now > l.expect_until {
+                let a = l.addr;
+                self.log(format!("connect {}: no incoming link after 0x0b", a));
+                self.link_down(li, status::BUSY);
+                continue;
+            }
             let a = l.addr;
+            let grace = l.incoming && !l.used && self.keys.get(a).is_some();
+            let limit = if grace { self.incoming_grace_ms } else { self.idle_ms };
             let idle = l.state == LinkState::Up && !l.le && !l.auth_pending && !l.enc_pending
-                && now.saturating_sub(l.last_activity) > IDLE_DISCONNECT_MS
+                && now.saturating_sub(l.last_activity.max(if grace { l.up_at } else { 0 })) > limit
                 && !self.chans.iter().any(|c| c.addr == a) && !self.pairs.iter().any(|p| p.1 == a);
             if idle {
                 let h = self.links[li].handle.to_le_bytes();
                 self.links[li].last_activity = now;
-                self.log(format!("{}: idle, disconnecting", a));
+                self.log(format!("{}: idle {} ms, disconnecting", a, limit));
                 self.send_cmd(op::DISCONNECT, &[h[0], h[1], 0x13]);
             }
             li += 1;

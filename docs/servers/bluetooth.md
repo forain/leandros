@@ -84,6 +84,7 @@ Replies / events (btd -> client):
 | 0x83 | RECV           | cid:u16 data… |
 | 0x84 | CLOSED         | cid:u16 reason:u8 (status code) |
 | 0x85 | INCOMING       | cid:u16 bdaddr[6] psm:u16 peer_mtu:u16 |
+| 0x86 | LINK           | bdaddr[6] up:u8 incoming:u8 (BR/EDR ACL up/down; sent to LISTEN owners) |
 | 0x90 | DEVICE         | bdaddr[6] flags:u8 (1 paired, 2 connected, 4 LE, 8 LE-random) rssi:i8 class:u24 name… (UTF-8, rest of frame) |
 | 0x91 | RESULT         | op:u8 status:u8 |
 | 0x92 | INFO           | bdaddr[6] hci_ver:u8 lmp_subver:u16 manufacturer:u16 state:u8 (0 init, 1 ready, 2 dead) name… |
