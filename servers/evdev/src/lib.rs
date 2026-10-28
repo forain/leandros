@@ -70,6 +70,12 @@ pub const DEVKIND_MOUSE: u8 = 3;
 pub const DEVKIND_UINPUT: u8 = 4;
 pub const DEVKIND_UINPUT_PAD: u8 = 5;
 pub const DEVKIND_UINPUT_MOUSE: u8 = 6;
+/// ACPI power/sleep/brightness keys + the lid switch (EV_KEY subset + EV_SW SW_LID).
+pub const DEVKIND_SWITCH: u8 = 7;
+/// EV_SW state bits (bit n = switch n active; SW_LID=0 set means lid closed).
+static SW_STATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Driver hook: current switch state reported by EVIOCGSW.
+pub fn set_switch_state(bits: u32) { SW_STATE.store(bits, core::sync::atomic::Ordering::Relaxed); }
 pub mod uinput;
 
 const NAME_MAX: usize = 64;
@@ -1168,6 +1174,9 @@ fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) ->
         }
         let mut set = |bit: usize| if bit / 8 < n { buf[bit / 8] |= 1 << (bit % 8); };
         match (kind, ev) {
+            (DEVKIND_SWITCH, 0) => { set(0); set(1); set(5); }
+            (DEVKIND_SWITCH, 1) => { for k in [116usize, 142, 224, 225] { set(k); } }
+            (DEVKIND_SWITCH, 5) => { set(0); } // SW_LID
             (DEVKIND_KEYBOARD, 0) => { set(0); set(1); set(EV_LED as usize); }
             (DEVKIND_KEYBOARD, 1) => { for k in 1..256 { set(k); } }
             (DEVKIND_KEYBOARD, 0x11) => { set(0); set(1); set(2); }
@@ -1513,7 +1522,15 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     let n = core::cmp::min(size, buf.len());
                     copy_out(pid, arg_ptr, &buf[..n])
                 }
-                0x1b => zero_out(pid, arg_ptr, size), // EVIOCGSW: no switches
+                0x1b => { // EVIOCGSW
+                    if dev_id >= FIXED_DEVICES && dev_kind(dev_id) == DEVKIND_SWITCH {
+                        let mut buf = [0u8; 8];
+                        let v = SW_STATE.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes();
+                        buf[..4].copy_from_slice(&v);
+                        let n = core::cmp::min(size, buf.len());
+                        copy_out(pid, arg_ptr, &buf[..n])
+                    } else { zero_out(pid, arg_ptr, size) }
+                }
                 0xa0 => { // EVIOCSCLOCKID(int) — stored as id+1, applied in `restamp` at read time
                     let mut clk = [0u8; 4];
                     if copy_in(pid, arg_ptr, &mut clk).is_none() { return err_reply(-14); }
