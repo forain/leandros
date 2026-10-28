@@ -42,6 +42,11 @@ struct Pad {
     t0: u64,
     force_fail: bool,
     frames: u32,
+    mode_confirmed: bool,
+    resent: bool,
+    mode_id: u8,
+    mode_pl: Vec<u8>,
+    data_reg: u16,
 }
 
 struct Listen {
@@ -116,15 +121,62 @@ fn set_feature(bus: usize, addr: u16, cmd_reg: u16, data_reg: u16, id: u8, pl: &
     dw_i2c::xfer(bus, addr, &w, &mut [])
 }
 
+/// Plain input read (Linux i2c_hid_get_input): returns the LE16 length word.
+fn read_input(bus: usize, addr: u16, in_reg: u16, buf: &mut [u8]) -> Result<usize, u32> {
+    if word("i2c_hid.inreg", "") == Some("1") {
+        dw_i2c::xfer(bus, addr, &[in_reg as u8, (in_reg >> 8) as u8], buf)?;
+    } else {
+        dw_i2c::xfer(bus, addr, &[], buf)?;
+    }
+    Ok(u16::from_le_bytes([buf[0], buf[1]]) as usize)
+}
+
+/// Read pending reports until the length word is <= 2. Returns (reports, errors).
+fn drain(bus: usize, addr: u16, in_reg: u16, max_in: usize) -> (u32, u32) {
+    let (mut r, mut e) = (0, 0);
+    let mut buf = [0u8; 256];
+    let n = max_in.clamp(2, 256);
+    for _ in 0..8 {
+        match read_input(bus, addr, in_reg, &mut buf[..n]) {
+            Ok(len) if len > 2 => r += 1,
+            Ok(_) => break,
+            Err(_) => { e += 1; break; }
+        }
+    }
+    (r, e)
+}
+
+/// After RESET: wait 100 ms, read until the 0x0000 sentinel, drain the rest.
+fn reset_wait(bus: usize, addr: u16, in_reg: u16, max_in: usize) -> (bool, u32, u64) {
+    spin_ms(100);
+    let n = max_in.clamp(2, 256);
+    let mut buf = [0u8; 256];
+    let mut got = false;
+    let mut ms = 100;
+    while ms < 1000 {
+        if let Ok(0) = read_input(bus, addr, in_reg, &mut buf[..n]) { got = true; break; }
+        spin_ms(5);
+        ms += 5;
+    }
+    let (r, _) = drain(bus, addr, in_reg, max_in);
+    (got, r, ms)
+}
+
 fn power(bus: usize, addr: u16, cmd_reg: u16, on: bool) -> Result<(), u32> {
     dw_i2c::xfer(bus, addr, &[cmd_reg as u8, (cmd_reg >> 8) as u8, if on { 0 } else { 1 }, 0x08], &mut [])
 }
 
 /// touchpad=i2c set-up after the descriptors parsed. Err(true) = the pad was
 /// touched (RESET sent) and needs the PS/2 fallback; Err(false) = left alone.
-fn setup_pad(name: &str, bus: usize, s: &I2cSlave, d: &Descriptor, ids: (u16, u16), regs: (u16, u16, u16)) -> Result<Pad, (bool, String)> {
+fn setup_pad(name: &str, bus: usize, s: &I2cSlave, d: &Descriptor, ids: (u16, u16), regs: (u16, u16, u16), max_in: usize) -> Result<Pad, (bool, String)> {
     let (vid, pid) = ids;
     let (in_reg, cmd_reg, data_reg) = regs;
+    let dbg = word("touchpad.debug", "") == Some("1");
+    let r = setup_inner(name, bus, s, d, vid, pid, in_reg, cmd_reg, data_reg, max_in, dbg);
+    r
+}
+
+fn setup_inner(name: &str, bus: usize, s: &I2cSlave, d: &Descriptor, vid: u16, pid: u16, in_reg: u16, cmd_reg: u16, data_reg: u16, max_in: usize, dbg: bool) -> Result<Pad, (bool, String)> {
     let Some(ptp) = hid_desc::ptp(d) else { return Err((false, String::from("no touchpad collection"))) };
     let ok = ptp.fingers.iter().any(|f| f.x.is_some() && f.y.is_some());
     let Some(mode) = ptp.mode_feature.filter(|_| ok) else { return Err((false, String::from("no finger X/Y or Input Mode feature"))) };
@@ -136,38 +188,50 @@ fn setup_pad(name: &str, bus: usize, s: &I2cSlave, d: &Descriptor, ids: (u16, u1
     if let Err(e) = power(bus, s.addr, cmd_reg, true) { return Err(fail(format!("SET_POWER ON {:#x}", e))); }
     spin_ms(1);
     if let Err(e) = dw_i2c::xfer(bus, s.addr, &[cmd_reg as u8, (cmd_reg >> 8) as u8, 0x00, 0x01], &mut []) { return Err(fail(format!("RESET {:#x}", e))); }
-    let mut acked = false;
-    for _ in 0..1000 {
-        let mut a = [0xFFu8; 2];
-        if dw_i2c::xfer(bus, s.addr, &[in_reg as u8, (in_reg >> 8) as u8], &mut a).is_ok() && a == [0, 0] { acked = true; break; }
-        spin_ms(1);
-    }
-    if !acked { return Err(fail(String::from("RESET not acked in 1 s"))); }
-    let pl = hid_ptp::config_report(d, mode.id);
-    if let Err(e) = set_feature(bus, s.addr, cmd_reg, data_reg, mode.id, &pl) { return Err(fail(format!("SET_REPORT mode {:#x}", e))); }
-    // The pad may NAK commands while it applies the mode switch: retry.
-    let mut got = get_feature(bus, s.addr, cmd_reg, data_reg, mode.id, pl.len());
-    for i in 0..30 {
-        let Err(e) = got else { break };
-        if i == 0 { log(&format!("i2c-hid: {} GET_REPORT mode first try {:#x}, retrying", name, e)); }
+    if dbg { dw_i2c::DEBUG.store(true, Ordering::Relaxed); }
+    let res = (|| -> Result<bool, String> {
+        let (sent, rep, ms) = reset_wait(bus, s.addr, in_reg, max_in);
+        log(&format!("i2c-hid: {} reset done in {} ms (sentinel {}), drained {}", name, ms, sent, rep));
+        let pl = hid_ptp::config_report(d, mode.id);
+        if let Err(e) = set_feature(bus, s.addr, cmd_reg, data_reg, mode.id, &pl) { return Err(format!("SET_REPORT mode {:#x}", e)); }
         spin_ms(10);
-        got = get_feature(bus, s.addr, cmd_reg, data_reg, mode.id, pl.len());
-    }
-    if got.is_err() && word("touchpad.verify", "") == Some("0") {
-        log(&format!("i2c-hid: {} GET_REPORT unverified (touchpad.verify=0)", name));
-        got = Ok(alloc::vec![3u8; pl.len()]);
-    }
-    match got {
-        Ok(r) => {
-            let v = hid_ptp::bits(&r, mode.bit, mode.size);
-            log(&format!("i2c-hid: {} touchpad Input Mode read back {} (feature id {})", name, v, mode.id));
-            if v != 3 { return Err(fail(format!("Input Mode reads {}", v))); }
+        let (r, _) = drain(bus, s.addr, in_reg, max_in);
+        log(&format!("i2c-hid: {} SET_REPORT mode ok, drained {}", name, r));
+        if word("touchpad.verify", "") == Some("0") {
+            log(&format!("i2c-hid: {} GET_REPORT skipped (touchpad.verify=0)", name));
+            return Ok(false);
         }
-        Err(e) => return Err(fail(format!("GET_REPORT mode {:#x}", e))),
-    }
+        let mut got = get_feature(bus, s.addr, cmd_reg, data_reg, mode.id, pl.len());
+        for i in 0..5 {
+            let Err(e) = got else { break };
+            if i == 0 { log(&format!("i2c-hid: {} GET_REPORT mode first try {:#x}, retrying", name, e)); }
+            spin_ms(10);
+            drain(bus, s.addr, in_reg, max_in);
+            got = get_feature(bus, s.addr, cmd_reg, data_reg, mode.id, pl.len());
+        }
+        match got {
+            Ok(r) => {
+                let v = hid_ptp::bits(&r, mode.bit, mode.size);
+                log(&format!("i2c-hid: {} touchpad Input Mode read back {} (feature id {})", name, v, mode.id));
+                if v != 3 { return Err(format!("Input Mode reads {}", v)); }
+                Ok(true)
+            }
+            Err(e) => {
+                let mc = ptp.max_contacts_feature.map(|m| (m.id, hid_ptp::config_report(d, m.id).len()));
+                let Some((id, plen)) = mc else { return Err(format!("GET_REPORT mode {:#x}, no maxc feature", e)) };
+                match get_feature(bus, s.addr, cmd_reg, data_reg, id, plen) {
+                    Ok(v) => { log(&format!("i2c-hid: {} GET mode NAK {:#x}, GET maxc (id {}) ok {}", name, e, id, hex(&v))); Ok(false) }
+                    Err(e2) => { log(&format!("i2c-hid: {} GET mode NAK {:#x}, GET maxc (id {}) NAK {:#x}", name, e, id, e2)); Err(format!("GET_REPORT mode {:#x}, maxc {:#x}", e, e2)) }
+                }
+            }
+        }
+    })();
+    if dbg { dw_i2c::DEBUG.store(word("i2c.debug", "") == Some("1"), Ordering::Relaxed); }
+    let confirmed = match res { Ok(c) => c, Err(w) => return Err(fail(w)) };
     extern "C" { fn arch_monotonic_ns() -> u64; }
     Ok(Pad { mouse: hid_ptp::mouse_layout(d), ptp, uses_ids: d.uses_report_ids, dev, cmd_reg, mt: Mt::default(), asm: Assembler::default(),
-        err_run: 0, t0: unsafe { arch_monotonic_ns() }, force_fail: word("touchpad.fail", "") == Some("1"), frames: 0 })
+        err_run: 0, t0: unsafe { arch_monotonic_ns() }, force_fail: word("touchpad.fail", "") == Some("1"), frames: 0,
+        mode_confirmed: confirmed, resent: false, mode_id: mode.id, mode_pl: hid_ptp::config_report(d, mode.id), data_reg })
 }
 
 /// Put the pad back on PS/2: SLEEP the I2C side, drop the node, re-init psmouse.
@@ -202,12 +266,7 @@ fn probe_slave(s: &I2cSlave, bus: usize, reset: bool, tp_i2c: bool) -> Option<Li
         let _ = dw_i2c::xfer(bus, s.addr, &[c[0], c[1], 0x00, 0x08], &mut []);
         spin_ms(1);
         let rst = dw_i2c::xfer(bus, s.addr, &[c[0], c[1], 0x00, 0x01], &mut []);
-        let mut acked = false;
-        for _ in 0..100 {
-            let mut a = [0xFFu8; 2];
-            if dw_i2c::xfer(bus, s.addr, &[in_reg as u8, (in_reg >> 8) as u8], &mut a).is_ok() && a == [0, 0] { acked = true; break; }
-            spin_ms(1);
-        }
+        let (acked, _, _) = reset_wait(bus, s.addr, in_reg, max_in.clamp(2, 256));
         log(&format!("i2c-hid: {} reset write={:?} ack={}", name, rst, acked));
     }
     if rd_len == 0 || rd_len > 4096 { return None; }
@@ -221,7 +280,7 @@ fn probe_slave(s: &I2cSlave, bus: usize, reset: bool, tp_i2c: bool) -> Option<Li
     extern "C" { fn arch_monotonic_ns() -> u64; }
     let mut pad = None;
     if tp_i2c && hid_desc::ptp(&parsed).is_some() {
-        match setup_pad(&name, bus, s, &parsed, (w(20), w(22)), (in_reg, cmd_reg, w(18))) {
+        match setup_pad(&name, bus, s, &parsed, (w(20), w(22)), (in_reg, cmd_reg, w(18)), max_in.clamp(2, 256)) {
             Ok(p) => { log(&format!("touchpad: i2c active ({}), polling every 8 ms", name)); POLL_NS.store(POLL_ACTIVE_NS, Ordering::Relaxed); pad = Some(p); }
             Err((touched, why)) => {
                 log(&format!("touchpad: i2c failed ({}), back to ps2", why));
@@ -288,9 +347,8 @@ pub fn listen_once(now_ns: u64) -> bool {
         live = true;
         let mut buf = [0u8; 256];
         let n = p.max_in;
-        match dw_i2c::xfer(p.bus, p.addr, &[p.input_reg as u8, (p.input_reg >> 8) as u8], &mut buf[..n]) {
-            Ok(()) => {
-                let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+        match read_input(p.bus, p.addr, p.input_reg, &mut buf[..n]) {
+            Ok(len) => {
                 if len <= 2 || len > n { p.empty += 1; continue; }
                 p.reports += 1;
                 if p.logged < 4 {
@@ -313,14 +371,14 @@ fn pad_poll(l: &mut Listen, now_ns: u64) {
     if pad.force_fail && now_ns.saturating_sub(pad.t0) > 3_000_000_000 { why = Some(String::from("touchpad.fail=1")); }
     for _ in 0..4 {
         if why.is_some() { break; }
-        match dw_i2c::xfer(l.bus, l.addr, &[l.input_reg as u8, (l.input_reg >> 8) as u8], &mut buf[..n]) {
-            Ok(()) => {
+        match read_input(l.bus, l.addr, l.input_reg, &mut buf[..n]) {
+            Ok(len) => {
                 pad.err_run = 0;
-                let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
                 if len <= 2 || len > n { l.empty += 1; break; }
                 l.reports += 1;
                 let rep = &buf[2..len];
                 if let Some((_, f)) = hid_ptp::parse_report(&pad.ptp, pad.uses_ids, rep) {
+                    if !pad.mode_confirmed { pad.mode_confirmed = true; log("touchpad: PTP reports confirmed"); }
                     if let Some(f) = pad.asm.push(f, pad.ptp.fingers.len()) {
                         let mut ev = Vec::new();
                         pad.mt.frame(&f, &mut ev);
@@ -328,6 +386,13 @@ fn pad_poll(l: &mut Listen, now_ns: u64) {
                         for (t, c, v) in ev { evdev_server::push_event(pad.dev, t, c, v); }
                     }
                 } else if let Some(m) = &pad.mouse {
+                    if !pad.mode_confirmed {
+                        if !pad.resent {
+                            log("touchpad: pad still in mouse mode, resending SET_REPORT");
+                            pad.resent = true;
+                            let _ = set_feature(l.bus, l.addr, pad.cmd_reg, pad.data_reg, pad.mode_id, &pad.mode_pl);
+                        }
+                    }
                     if let Some((dx, dy, wh, b)) = hid_ptp::parse_mouse(m, pad.uses_ids, rep) {
                         crate::rel_pointer::report(crate::rel_pointer::SRC_STICK, dx, dy, wh * 120, 0, b);
                     }
