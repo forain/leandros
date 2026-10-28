@@ -242,6 +242,10 @@ static WDT_FED: AtomicBool = AtomicBool::new(true);
 
 fn wdt_feed_hook() {
     use crate::rpi_misc_logic::wdt;
+    // After a kernel panic nothing may feed: the panicking CPU can still take
+    // timer ticks (the panic loop leaves IRQs as they were), so the per-CPU
+    // tick-age test alone would keep the board alive forever.
+    if PANICKED.load(Ordering::Acquire) { return; }
     let n = sched::active_cpu_count();
     let stuck = wdt::stuck_cpu((1..n).map(|c| (c, sched::wdog_tick_age_secs(c), sched::cpu_idle(c))), wdt::STUCK_SECS);
     match stuck {
@@ -272,6 +276,23 @@ pub fn serial_magic(b: u8, brk: bool, now_ms: u64) {
     loop { core::hint::spin_loop(); }
 }
 
+/// Prove the armed countdown runs: PM_WDOG must drop by ~655 ticks
+/// (1/65536 s units) over 10 ms. A counter that does not move would make the
+/// stall reset a no-op, so say so loudly.
+fn wdt_countdown_check() {
+    let Some(a) = crate::rpi_pm::wdt_ticks_nolock() else { return };
+    let t0 = sched::monotonic_ns();
+    while sched::monotonic_ns().wrapping_sub(t0) < 10_000_000 { core::hint::spin_loop(); }
+    let us = sched::monotonic_ns().wrapping_sub(t0) / 1000;
+    let b = crate::rpi_pm::wdt_ticks_nolock().unwrap_or(a);
+    let rstc = crate::rpi_pm::with(|r| r.r(crate::rpi_misc_logic::pm::RSTC)).unwrap_or(0);
+    let d = a.wrapping_sub(b) & crate::rpi_misc_logic::pm::WDOG_TIME_SET;
+    line(|l| {
+        l.s("[WDT] countdown ").s(if d > 0 && d < 0x10000 { "ok" } else { "NOT RUNNING" }).s(": wdog ").x(a as u64)
+            .s(" -> ").x(b as u64).s(" in ").u(us).s(" us (expect ~").u(us * 65536 / 1_000_000).s(" ticks), rstc ").x(rstc as u64);
+    });
+}
+
 fn wdt_init(cmdline: &str) {
     use crate::rpi_misc_logic::wdt;
     let dt_pm = unsafe { boot::device_tree::recorded_dtb() }.map(wdt::dtb_has_pm).unwrap_or(false);
@@ -289,6 +310,11 @@ fn wdt_init(cmdline: &str) {
         }
         serial_debug("[WDT] no PM node in the DTB (kexec FDT): BCM2712 chip id, PM regs sane, using 0x107d200000\n");
     }
+    match opt(cmdline, "panic.reset").map(|v| v.parse::<u32>()) {
+        Some(Ok(0)) => PANIC_RESET_SECS.store(u32::MAX, Ordering::Relaxed),
+        Some(Ok(n)) => PANIC_RESET_SECS.store(n.min(3600), Ordering::Relaxed),
+        _ => {}
+    }
     PM_OK.store(true, Ordering::Release);
     let was = crate::rpi_pm::with(|r| crate::rpi_misc_logic::pm::is_running(r)).unwrap_or(false);
     if opt(cmdline, "wdt.off") == Some("1") {
@@ -297,10 +323,61 @@ fn wdt_init(cmdline: &str) {
     }
     crate::rpi_pm::wdt_start(wdt::HW_SECS);
     sched::set_hw_watchdog_hook(wdt_feed_hook);
+    wdt_countdown_check();
     line(|b| {
         b.s("[WDT] bcm2712-pm armed ").u(wdt::HW_SECS as u64).s(" s, fed while all CPUs tick; reset ~")
             .u((wdt::STUCK_SECS + wdt::HW_SECS) as u64).s(" s into a stall (wdt.off=1 disables); serial reset: 5x Ctrl-] or BREAK b");
     });
+}
+
+// ── Panic reset (lane piwdtpanic) ────────────────────────────────────────────
+//
+// The kernel panic handler (and the EL1 fault halts) call `panic_begin` first
+// and `panic_end` once the message is on serial. `panic_begin` stops cpu0's
+// feeding and re-arms the full 15 s, so a panic path that hangs (log flush)
+// still resets. `panic_end` resets after `panic.reset=<s>` seconds (default 5,
+// Linux `panic=` semantics); `panic.reset=0` stops the watchdog and halts so
+// the screen/serial state can be inspected.
+
+static PANICKED: AtomicBool = AtomicBool::new(false);
+/// `panic.reset=` seconds; u32::MAX = never (halt). Parsed at `wdt_init`.
+static PANIC_RESET_SECS: AtomicU32 = AtomicU32::new(5);
+
+/// First thing on panic: no more feeding, full hardware timeout from now.
+pub fn panic_begin() {
+    if PANICKED.swap(true, Ordering::AcqRel) { return; }
+    if PM_OK.load(Ordering::Acquire) && crate::rpi_pm::wdt_running_nolock() {
+        crate::rpi_pm::wdt_kick_nolock(crate::rpi_misc_logic::wdt::HW_SECS);
+    }
+}
+
+/// After the panic message is printed: reset the board (or halt with
+/// `panic.reset=0`). Returns only when the PM block is unavailable.
+pub fn panic_end() {
+    if !PM_OK.load(Ordering::Acquire) { return; }
+    let secs = PANIC_RESET_SECS.load(Ordering::Relaxed);
+    if secs == u32::MAX {
+        crate::rpi_pm::wdt_stop_nolock();
+        serial_debug("[WDT] panic: halted, watchdog stopped (panic.reset=0)\n");
+        return;
+    }
+    line(|b| { b.s("[WDT] panic: full reset in ").u(secs as u64).s(" s (panic.reset=0 halts instead)"); });
+    let t0 = sched::monotonic_ns();
+    let mut last = 0u64;
+    loop {
+        let el = sched::monotonic_ns().wrapping_sub(t0);
+        if el >= secs as u64 * 1_000_000_000 { break; }
+        // Keep the hardware timer as the backstop; it fires 15 s after the last
+        // kick even if this clock stops (EPOCH unset reads 0 forever).
+        if el / 1_000_000_000 != last || el == 0 {
+            last = el / 1_000_000_000;
+            crate::rpi_pm::wdt_kick_nolock(crate::rpi_misc_logic::wdt::HW_SECS);
+        }
+        core::hint::spin_loop();
+    }
+    serial_debug("[WDT] panic: full reset now\n");
+    crate::rpi_pm::restart();
+    loop { core::hint::spin_loop(); }
 }
 
 // ── Boot ─────────────────────────────────────────────────────────────────────

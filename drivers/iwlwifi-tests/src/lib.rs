@@ -36,6 +36,8 @@ mod agg_tests;
 #[cfg(test)]
 mod ht40_tests;
 #[cfg(test)]
+mod vht_tests;
+#[cfg(test)]
 mod ant_tests;
 
 #[path = "../../src/wifi_pref.rs"]

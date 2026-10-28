@@ -26,6 +26,8 @@ use crate::wifi_frame as wf;
 
 pub const IE_HT_CAPS: u8 = 45;
 pub const IE_HT_OP: u8 = 61;
+pub const IE_VHT_CAPS: u8 = 191;
+pub const IE_VHT_OP: u8 = 192;
 pub const IE_VENDOR: u8 = 221;
 
 /// Vendor OUI + type of the WMM elements (Microsoft, type 2).
@@ -266,6 +268,8 @@ pub struct BssHt {
     pub wmm: Option<Wmm>,
     pub ht_cap: Option<HtCap>,
     pub ht_op: Option<HtOp>,
+    pub vht_cap: Option<VhtCap>,
+    pub vht_op: Option<VhtOp>,
 }
 
 pub fn parse_bss_ies(ies: &[u8]) -> BssHt {
@@ -274,6 +278,8 @@ pub fn parse_bss_ies(ies: &[u8]) -> BssHt {
         match id {
             IE_HT_CAPS if b.ht_cap.is_none() => b.ht_cap = parse_ht_cap(d),
             IE_HT_OP if b.ht_op.is_none() => b.ht_op = parse_ht_op(d),
+            IE_VHT_CAPS if b.vht_cap.is_none() => b.vht_cap = parse_vht_cap(d),
+            IE_VHT_OP if b.vht_op.is_none() => b.vht_op = parse_vht_op(d),
             _ => {}
         }
     }
@@ -778,4 +784,99 @@ impl<T> RxAgg<T> {
         for r in self.tids.iter().flatten() { s.add(&r.stats); }
         s
     }
+}
+
+// ── VHT (802.11ac) ──────────────────────────────────────────────────────────
+
+pub mod vhtcap {
+    /// Maximum MPDU length 3895 is 0 in bits 0-1.
+    pub const RXLDPC: u32 = 1 << 4;
+    pub const SHORT_GI_80: u32 = 1 << 5;
+    pub const TXSTBC: u32 = 1 << 7;
+    pub const RXSTBC_1: u32 = 1 << 8;
+    pub const AMPDU_EXP_SHIFT: u32 = 23;
+    pub const AMPDU_EXP_MASK: u32 = 7 << 23;
+}
+
+/// A peer's VHT Capabilities element.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VhtCap {
+    pub cap: u32,
+    pub rx_mcs: u16,
+    pub tx_mcs: u16,
+}
+
+/// Streams of a VHT MCS map (2 bits per stream, 3 = not supported).
+pub fn vht_map_streams(map: u16) -> u8 {
+    (0..8).take_while(|i| (map >> (2 * i)) & 3 != 3).count() as u8
+}
+
+/// Highest MCS of a VHT MCS map entry: 0 -> 7, 1 -> 8, 2 -> 9.
+pub fn vht_map_max_mcs(map: u16, nss: u8) -> Option<u8> {
+    if nss == 0 || nss > 8 { return None; }
+    match (map >> (2 * (nss - 1))) & 3 { 0 => Some(7), 1 => Some(8), 2 => Some(9), _ => None }
+}
+
+impl VhtCap {
+    pub fn rx_streams(&self) -> u8 { vht_map_streams(self.rx_mcs) }
+    pub fn ampdu_exp(&self) -> u8 { ((self.cap & vhtcap::AMPDU_EXP_MASK) >> vhtcap::AMPDU_EXP_SHIFT) as u8 }
+    pub fn sgi80(&self) -> bool { self.cap & vhtcap::SHORT_GI_80 != 0 }
+}
+
+pub fn parse_vht_cap(d: &[u8]) -> Option<VhtCap> {
+    if d.len() < 12 { return None; }
+    Some(VhtCap { cap: u32::from_le_bytes([d[0], d[1], d[2], d[3]]), rx_mcs: u16::from_le_bytes([d[4], d[5]]),
+                  tx_mcs: u16::from_le_bytes([d[8], d[9]]) })
+}
+
+/// A BSS's VHT Operation element: channel width (0 = 20/40, 1 = 80, 2 = 160
+/// (deprecated encoding), 3 = 80+80) and the centre segments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VhtOp {
+    pub width: u8,
+    pub seg0: u8,
+    pub seg1: u8,
+}
+
+pub fn parse_vht_op(d: &[u8]) -> Option<VhtOp> {
+    if d.len() < 5 { return None; }
+    Some(VhtOp { width: d[0], seg0: d[1], seg1: d[2] })
+}
+
+impl VhtOp {
+    /// The centre channel of the 80 MHz segment holding `primary` when the
+    /// BSS runs 80 MHz or wider (a 160 / 80+80 BSS is used as its primary 80,
+    /// as a station that advertises no 160 MHz does). None at 20/40 MHz or
+    /// when `primary` does not fall inside that segment.
+    pub fn center80(&self, primary: u8) -> Option<u8> {
+        let c = match self.width {
+            1 | 3 => self.seg0,
+            2 => if primary < self.seg0 { self.seg0.checked_sub(8)? } else { self.seg0 + 8 },
+            _ => return None,
+        };
+        matches!(primary as i16 - c as i16, -6 | -2 | 2 | 6).then_some(c)
+    }
+}
+
+/// The four 20 MHz channels of the 80 MHz segment centred on `center`.
+pub fn channels80(center: u8) -> [u8; 4] { [center - 6, center - 2, center + 2, center + 6] }
+
+/// Our VHT Capabilities element (id 191, length 12): what Linux
+/// iwl_init_vht_hw_capab advertises for the 8000 family minus beamforming
+/// (no sounding support here): 3895-byte MPDUs, short GI 80, RX LDPC, RX
+/// STBC 1, TX STBC with two chains, A-MPDU exponent 7, MCS 0-9 on each
+/// receive / transmit stream, 80 MHz only.
+pub fn vht_cap_ie(c: &HtCfg) -> [u8; 14] {
+    let mut cap = vhtcap::SHORT_GI_80 | vhtcap::RXSTBC_1 | (7 << vhtcap::AMPDU_EXP_SHIFT);
+    if c.ldpc { cap |= vhtcap::RXLDPC; }
+    if c.stbc && c.tx_streams >= 2 { cap |= vhtcap::TXSTBC; }
+    let map = |n: u8| -> u16 { (0..8).fold(0u16, |m, i| m | (if i < n { 2 } else { 3 }) << (2 * i)) };
+    let (rx, tx) = (map(c.rx_streams.clamp(1, 2)), map(c.tx_streams.clamp(1, 2)));
+    let mut e = [0u8; 14];
+    e[0] = IE_VHT_CAPS;
+    e[1] = 12;
+    e[2..6].copy_from_slice(&cap.to_le_bytes());
+    e[6..8].copy_from_slice(&rx.to_le_bytes());
+    e[10..12].copy_from_slice(&tx.to_le_bytes());
+    e
 }

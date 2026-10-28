@@ -9,6 +9,8 @@ mod init;
 mod klog;
 mod iostat;
 mod hungtask;
+#[cfg(target_arch = "x86_64")]
+mod lappower;
 mod power;
 mod kexec;
 #[cfg(target_arch = "x86_64")]
@@ -1931,8 +1933,33 @@ fn kfacil_init(hhdm_offset: u64) {
     let _ = hhdm_offset;
 }
 
+/// Board hook at the start of every fatal stop (panic, EL1 fault halt):
+/// rpi5 stops feeding the PM watchdog and re-arms its full timeout.
+#[inline(always)]
+fn fatal_begin() {
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    drivers::rpi_misc::panic_begin();
+}
+
+/// After the fatal message is on serial: rpi5 resets the board after
+/// `panic.reset=<s>` (default 5; 0 = halt). Then spin.
+fn fatal_end() -> ! {
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    drivers::rpi_misc::panic_end();
+    loop { core::hint::spin_loop(); }
+}
+
+/// For arch fault paths that halt the machine (aarch64 EL1 faults): the same
+/// board reset policy as a panic. Call after the report is printed.
+#[no_mangle]
+pub extern "C" fn kernel_fatal_halt() -> ! {
+    fatal_begin();
+    fatal_end()
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    fatal_begin();
     // Before the console exists the only way out is the early framebuffer
     // text (boot/src/earlyfb.rs): paint the message there, knob or not. This
     // path allocates nothing and takes no lock it could deadlock on.
@@ -1966,7 +1993,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     }
     serial_print_str("\n--------------------\n");
     klog::flush_panic();
-    loop { core::hint::spin_loop(); }
+    fatal_end()
 }
 
 /// Seed CLOCK_REALTIME from the board's real-time clock (PL031 on virt,

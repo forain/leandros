@@ -193,7 +193,7 @@ unsafe fn read_u16(p: *const u8) -> u16 {
 
 /// Find a table by signature in the XSDT (or the RSDT for revision-0 RSDPs).
 /// Returns its *virtual* address.
-unsafe fn find_table(rsdp_phys: u64, hhdm_offset: u64, sig: &[u8; 4]) -> Option<*const u8> {
+pub unsafe fn find_table(rsdp_phys: u64, hhdm_offset: u64, sig: &[u8; 4]) -> Option<*const u8> {
     if rsdp_phys == 0 { return None; }
     let rsdp = (rsdp_phys + hhdm_offset) as *const u8;
     if core::slice::from_raw_parts(rsdp, 8) != RSDP_SIG { return None; }
@@ -438,4 +438,49 @@ pub unsafe fn for_each_madt_cpu(rsdp_phys: u64, hhdm_offset: u64, f: &mut dyn Fn
         off += elen;
     }
     true
+}
+
+/// Call `f(signature, virtual address, length)` for every table the XSDT
+/// (or RSDT) lists, plus the DSDT the FADT points at (it is not in the
+/// root table). Read-only; used by the device inventory (lane lapinv).
+///
+/// # Safety
+/// The ACPI tables must be readable through the HHDM at `hhdm_offset`.
+pub unsafe fn for_each_table(rsdp_phys: u64, hhdm_offset: u64, f: &mut dyn FnMut(&[u8; 4], *const u8, usize)) {
+    if rsdp_phys == 0 { return; }
+    let rsdp = (rsdp_phys + hhdm_offset) as *const u8;
+    if core::slice::from_raw_parts(rsdp, 8) != RSDP_SIG { return; }
+    let revision = *rsdp.add(15);
+    let (root_phys, entry_size, root_sig): (u64, usize, &[u8; 4]) = if revision >= 2 && read_u64(rsdp.add(24)) != 0 {
+        (read_u64(rsdp.add(24)), 8, b"XSDT")
+    } else {
+        (read_u32(rsdp.add(16)) as u64, 4, b"RSDT")
+    };
+    if root_phys == 0 { return; }
+    let root = (root_phys + hhdm_offset) as *const u8;
+    if core::slice::from_raw_parts(root, 4) != root_sig { return; }
+    let len = read_u32(root.add(4)) as usize;
+    if len < 36 || len > 1 << 20 { return; }
+    for i in 0..(len - 36) / entry_size {
+        let e = root.add(36 + i * entry_size);
+        let phys = if entry_size == 8 { read_u64(e) } else { read_u32(e) as u64 };
+        if phys == 0 { continue; }
+        let t = (phys + hhdm_offset) as *const u8;
+        let mut sig = [0u8; 4];
+        sig.copy_from_slice(core::slice::from_raw_parts(t, 4));
+        let tlen = read_u32(t.add(4)) as usize;
+        if tlen < 36 || tlen > 16 << 20 { continue; }
+        f(&sig, t, tlen);
+        if &sig == b"FACP" && tlen >= 44 {
+            let mut dsdt = read_u32(t.add(40)) as u64;
+            if tlen >= 148 && read_u64(t.add(140)) != 0 { dsdt = read_u64(t.add(140)); }
+            if dsdt != 0 {
+                let d = (dsdt + hhdm_offset) as *const u8;
+                let dlen = read_u32(d.add(4)) as usize;
+                if core::slice::from_raw_parts(d, 4) == b"DSDT" && (36..16 << 20).contains(&dlen) {
+                    f(b"DSDT", d, dlen);
+                }
+            }
+        }
+    }
 }
