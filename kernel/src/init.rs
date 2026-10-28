@@ -86,6 +86,9 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         serial_print_str("[INIT] ERROR: DRM server initialization failed\n");
     }
 
+    // /dev/video0: V4L2 capture over UVC cameras (ENODEV until one enumerates).
+    crate::syscall::v4l2::init();
+
     // Initialize PipeWire server
     match pipewire_server::init(crate::boot_cmdline().unwrap_or("")) {
         Ok(p) => {

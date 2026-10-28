@@ -26,7 +26,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::platform::{self, Deadline};
@@ -396,6 +396,20 @@ pub fn camera(i: usize) -> Option<Arc<Camera>> { CAMERAS.lock().get(i).cloned() 
 /// The device on (`hc`, `slot`) left.
 pub fn detach(hc: &crate::xhci::Hc, slot: u8) {
     CAMERAS.lock().retain(|c| !(core::ptr::eq(&*c.func.hc, hc) && c.func.slot == slot));
+}
+
+static PUMP: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the stream pump the USB timer tick runs (the kernel's V4L2 layer).
+pub fn set_pump(f: fn()) { PUMP.store(f as usize, Ordering::Release); }
+
+/// USB timer tick (IRQ context): run the installed pump, if any.
+pub fn tick() {
+    let p = PUMP.load(Ordering::Acquire);
+    if p != 0 {
+        let f: fn() = unsafe { core::mem::transmute(p) };
+        f();
+    }
 }
 
 /// FNV-1a over `d`.
