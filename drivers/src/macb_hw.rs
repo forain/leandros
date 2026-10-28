@@ -263,9 +263,40 @@ pub const TX_ERR_MASK: u32 = (1 << 29) | (1 << 27) | (1 << 26) | (7 << 20);
 pub const TX_WRAP: u32 = 1 << 30;
 pub const TX_USED: u32 = 1 << 31;
 
-unsafe fn rd(d: *mut Desc, i: usize) -> Desc { core::ptr::read_volatile(d.add(i)) }
+/// Per-descriptor cache maintenance for rings kept in CACHEABLE memory on a
+/// non-coherent bus (`macb.dma=cmo`): `(clean, invalidate)` over `(va, len)`.
+/// Null = the rings are in Normal-NC / Device memory (or the bus snoops) and
+/// plain volatile accesses are enough.
+static DESC_CMO: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub type CmoFns = (fn(usize, usize), fn(usize, usize));
+static mut CMO_FNS: CmoFns = (cmo_nop, cmo_nop);
+fn cmo_nop(_: usize, _: usize) {}
+
+/// Install (or clear) per-descriptor cache maintenance. Call before the rings
+/// are initialised; not meant to change while the GEM runs.
+pub fn set_desc_cmo(f: Option<CmoFns>) {
+    use core::sync::atomic::Ordering;
+    match f {
+        Some(f) => { unsafe { CMO_FNS = f; } DESC_CMO.store(1, Ordering::Release); }
+        None => DESC_CMO.store(0, Ordering::Release),
+    }
+}
+#[inline]
+fn cmo() -> Option<CmoFns> {
+    if DESC_CMO.load(core::sync::atomic::Ordering::Acquire) == 0 { None } else { Some(unsafe { CMO_FNS }) }
+}
+
+unsafe fn rd(d: *mut Desc, i: usize) -> Desc {
+    if let Some((_, inv)) = cmo() { inv(d.add(i) as usize, core::mem::size_of::<Desc>()); }
+    core::ptr::read_volatile(d.add(i))
+}
 unsafe fn wr_word(d: *mut Desc, i: usize, word: usize, v: u32) {
-    core::ptr::write_volatile((d.add(i) as *mut u32).add(word), v)
+    let c = cmo();
+    // Fetch the line fresh first: a stale copy of a neighbour descriptor the
+    // GEM has since written must not be cleaned back over it.
+    if let Some((_, inv)) = c { inv(d.add(i) as usize, core::mem::size_of::<Desc>()); }
+    core::ptr::write_volatile((d.add(i) as *mut u32).add(word), v);
+    if let Some((clean, _)) = c { clean(d.add(i) as usize, core::mem::size_of::<Desc>()); }
 }
 
 #[derive(Debug, PartialEq, Eq)]

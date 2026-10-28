@@ -257,6 +257,11 @@ pub fn init(cmdline: &str) {
     mlog!("GEM MID {:#x}, {} queue(s), MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (from {})", mid, queues,
           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], src);
 
+    let mode = match cmdline_val(cmdline, "macb.dma") {
+        Some("dev") => DmaMode::Dev, Some("cmo") => DmaMode::Cmo, Some("coh") => DmaMode::Coh, _ => DmaMode::Nc,
+    };
+    DMA_MODE.store(mode as u8, Ordering::Relaxed);
+    hw::set_desc_cmo(if mode == DmaMode::Cmo { Some((cmo_clean as fn(usize, usize), cmo_inval as fn(usize, usize))) } else { None });
     let (rings, rx_dma, tx_dma, dummy_dma) = match alloc_rings(res.dma_offset) {
         Some(r) => r,
         None => { log("out of DMA memory for the rings; Ethernet stays off"); set_state("no memory"); return; }
@@ -310,11 +315,112 @@ pub fn init(cmdline: &str) {
     }
 }
 
+/// How the rings and packet buffers are kept coherent with the GEM
+/// (`macb.dma=`). RP1 sits behind the BCM2712 PCIe root, which never snoops,
+/// so the default ignores the platform flag (`mm::dma_cache::coherent()`):
+/// after a kexec the handed-over FDT is "linux,dummy-virt" and that flag
+/// said "coherent" on the Pi, which left the rings in cacheable memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum DmaMode {
+    /// Rings mapped Normal Non-cacheable (Linux arm64 coherent memory); buffers cleaned/invalidated.
+    Nc = 0,
+    /// Rings mapped Device-nGnRnE (the kernel's Uncached attribute); buffers cleaned/invalidated.
+    Dev = 1,
+    /// Rings in the cacheable linear map with per-descriptor dc ivac / dc cvac; buffers likewise.
+    Cmo = 2,
+    /// Trust `mm::dma_cache` (plain memory when the platform says coherent).
+    Coh = 3,
+}
+static DMA_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(DmaMode::Nc as u8);
+fn dma_mode() -> DmaMode {
+    match DMA_MODE.load(Ordering::Relaxed) { 1 => DmaMode::Dev, 2 => DmaMode::Cmo, 3 => DmaMode::Coh, _ => DmaMode::Nc }
+}
+fn dma_mode_name(m: DmaMode) -> &'static str {
+    match m { DmaMode::Nc => "nc", DmaMode::Dev => "dev", DmaMode::Cmo => "cmo", DmaMode::Coh => "coh" }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn cmo_clean(va: usize, len: usize) { mm::dma_cache::clean_range(va, len); }
+#[cfg(target_arch = "aarch64")]
+fn cmo_inval(va: usize, len: usize) { mm::dma_cache::invalidate_range(va, len); }
+#[cfg(not(target_arch = "aarch64"))]
+fn cmo_clean(va: usize, len: usize) { mm::dma_cache::sync_for_device(va, len); }
+#[cfg(not(target_arch = "aarch64"))]
+fn cmo_inval(va: usize, len: usize) { mm::dma_cache::sync_for_cpu(va, len); }
+
+/// CPU wrote `[va, va+len)` (cacheable alias); the GEM reads it next.
+fn buf_for_device(va: usize, len: usize) {
+    if dma_mode() == DmaMode::Coh { mm::dma_cache::sync_for_device(va, len) } else { cmo_clean(va, len) }
+}
+/// The GEM wrote `[va, va+len)`; the CPU reads it next.
+fn buf_for_cpu(va: usize, len: usize) {
+    if dma_mode() == DmaMode::Coh { mm::dma_cache::sync_for_cpu(va, len) } else { cmo_inval(va, len) }
+}
+
+/// Last-level descriptor (page or block) that maps kernel `va`, from TTBR1_EL1.
+#[cfg(target_arch = "aarch64")]
+fn kernel_pte(va: usize) -> Option<u64> {
+    let ttbr: u64;
+    unsafe { core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr, options(nomem, nostack)); }
+    let mut table = (ttbr & 0x0000_FFFF_FFFF_F000) as usize;
+    for level in 0..4 {
+        let idx = (va >> (39 - 9 * level)) & 511;
+        let e = unsafe { core::ptr::read_volatile((mm::phys_to_virt(table) as *const u64).add(idx)) };
+        if e & 1 == 0 { return None; }
+        if level == 3 || e & 2 == 0 { return Some(e); }
+        table = (e & 0x0000_FFFF_FFFF_F000) as usize;
+    }
+    None
+}
+
+/// Boot line: the attribute the ring mapping really carries, then a
+/// two-alias round trip on a spare descriptor of the dummy page. `ring` is the
+/// CPU pointer the driver uses, `phys` its page.
+fn ring_selfcheck(ring: *mut Desc, phys: usize) {
+    let slot = 4usize; // dummy page: slots 0 and 1 are live, 4 shares no line with them
+    let rva = unsafe { ring.add(slot) } as usize;
+    let lva = mm::phys_to_virt(phys) + slot * core::mem::size_of::<Desc>();
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mair: u64;
+        unsafe { core::arch::asm!("mrs {}, mair_el1", out(reg) mair, options(nomem, nostack)); }
+        let pte = kernel_pte(rva).unwrap_or(0);
+        let idx = (pte >> 2) & 7;
+        mlog!("dma {} (platform {}): ring va {:#x} pte {:#x} attrindx {} = mair byte {:#04x} sh {} | MAIR_EL1 {:#018x}",
+              dma_mode_name(dma_mode()), if mm::dma_cache::coherent() { "coherent" } else { "non-coherent" },
+              rva, pte, idx, (mair >> (idx * 8)) & 0xff, (pte >> 8) & 3, mair);
+    }
+    let ctrl = |va: usize| (va + 4) as *mut u32;
+    let cmo = dma_mode() == DmaMode::Cmo;
+    // 1. ring alias -> memory -> linear alias.
+    const A: u32 = 0xA5C3_5A3C;
+    unsafe { core::ptr::write_volatile(ctrl(rva), A); }
+    if cmo { cmo_clean(rva, 16); }
+    wmb();
+    cmo_inval(lva, 16);
+    let got1 = unsafe { core::ptr::read_volatile(ctrl(lva)) };
+    // 2. linear alias -> memory (clean + invalidate, no line left behind) -> ring alias.
+    const B: u32 = 0x3C5A_C3A5;
+    unsafe { core::ptr::write_volatile(ctrl(lva), B); }
+    cmo_clean(lva, 16);
+    cmo_inval(lva, 16);
+    if cmo { cmo_inval(rva, 16); }
+    let got2 = unsafe { core::ptr::read_volatile(ctrl(rva)) };
+    unsafe { core::ptr::write_volatile(ctrl(rva), 0); }
+    if cmo { cmo_clean(rva, 16); }
+    wmb();
+    cmo_inval(lva, 16);
+    let ok = got1 == A && got2 == B;
+    mlog!("dma selfcheck: ring->linear {:#010x} (want {:#010x}), linear->ring {:#010x} (want {:#010x}): {}",
+          got1, A, got2, B, if ok { "agree" } else { "DISAGREE (the ring alias is not the memory the GEM sees)" });
+}
+
 fn zeroed_page() -> Option<usize> {
     let p = mm::buddy::alloc_below(0, 1 << 32)?;
     let va = mm::phys_to_virt(p);
     unsafe { core::ptr::write_bytes(va as *mut u8, 0, PAGE); }
-    mm::dma_cache::sync_for_device(va, PAGE);
+    buf_for_device(va, PAGE);
     Some(p)
 }
 
@@ -326,9 +432,14 @@ fn desc_page() -> Option<(*mut Desc, usize)> {
     // cache: zeroed_page only cleaned them, and an NC access that hits a line
     // left by the cacheable linear alias reads (and writes) the stale cached
     // copy, never memory. Clean + invalidate, as Linux arch_dma_prep_coherent.
-    mm::dma_cache::sync_for_cpu(mm::phys_to_virt(p), PAGE);
-    let va = if mm::dma_cache::coherent() { mm::phys_to_virt(p) }
-             else { mm::kva::vmap(&[p as u64], mm::kva::CacheMode::WriteCombining)? };
+    buf_for_cpu(mm::phys_to_virt(p), PAGE);
+    let va = match dma_mode() {
+        DmaMode::Nc => mm::kva::vmap(&[p as u64], mm::kva::CacheMode::WriteCombining)?,
+        DmaMode::Dev => mm::kva::vmap(&[p as u64], mm::kva::CacheMode::Uncached)?,
+        DmaMode::Cmo => mm::phys_to_virt(p),
+        DmaMode::Coh if mm::dma_cache::coherent() => mm::phys_to_virt(p),
+        DmaMode::Coh => mm::kva::vmap(&[p as u64], mm::kva::CacheMode::WriteCombining)?,
+    };
     Some((va as *mut Desc, p))
 }
 
@@ -339,7 +450,9 @@ fn alloc_rings(off: u64) -> Option<(Rings, u64, u64, u64)> {
     unsafe {
         core::ptr::write_volatile(dmy, Desc { addr: 0, ctrl: hw::TX_USED | hw::TX_WRAP, addr_hi: 0, rsvd: 0 });
         core::ptr::write_volatile(dmy.add(1), Desc { addr: hw::RX_USED | hw::RX_WRAP, ctrl: 0, addr_hi: 0, rsvd: 0 });
+        if dma_mode() == DmaMode::Cmo { cmo_clean(dmy as usize, 32); }
     }
+    ring_selfcheck(dmy, dmyp);
     let per_page = PAGE / BUF_SIZE;
     let mut rx_phys = alloc::vec::Vec::with_capacity(NUM_RX);
     for _ in 0..NUM_RX / per_page {
@@ -518,7 +631,7 @@ pub fn send_packet(buf: &[u8]) -> bool {
         core::ptr::copy_nonoverlapping(buf.as_ptr(), dst as *mut u8, buf.len());
         if buf.len() < ETH_ZLEN { core::ptr::write_bytes((dst as *mut u8).add(buf.len()), 0, ETH_ZLEN - buf.len()); }
     }
-    mm::dma_cache::sync_for_device(dst, len);
+    buf_for_device(dst, len);
     r.tx.post(idx, len);
     wmb();
     ncr_set(&mut m, hw::NCR_TSTART, 0);
@@ -542,7 +655,7 @@ pub fn poll_receive(out: &mut [u8]) -> Option<usize> {
             RxEvent::Frame { idx, len } => {
                 let n = len.min(out.len()).min(BUF_SIZE);
                 let src = r.rx_va[idx];
-                mm::dma_cache::sync_for_cpu(src, n);
+                buf_for_cpu(src, n);
                 unsafe { core::ptr::copy_nonoverlapping(src as *const u8, out.as_mut_ptr(), n); }
                 r.rx.release(idx);
                 RX_PKTS.fetch_add(1, Ordering::Relaxed);

@@ -2891,9 +2891,12 @@ fn early_dma_cache(hhdm: u64) {
         boot::device_tree::struct_contains(b"brcm,bcm2712").unwrap_or(false)
             || boot::device_tree::struct_contains(b"brcm,bcm2711").unwrap_or(false)
     };
+    // A kexec FDT is "linux,dummy-virt": the kernel that built it passes its
+    // own non-coherent mode on (`fdt_build`), or a Pi would come up coherent.
+    let kx = unsafe { boot::device_tree::has_property_name(b"leandros,dma-noncoherent") } == Some(true);
     let c = match cmdline_knob("dma.coherent") {
         Some("0") => false, Some("1") => true,
-        _ => !(bcm && dt != Some(true)),
+        _ => !((bcm && dt != Some(true)) || kx),
     };
     dc::set_coherent(c);
     let line = dc::dline();
@@ -2923,6 +2926,7 @@ fn early_dma_cache(hhdm: u64) {
     serial_print_str(if c { "[early] dma: coherent" } else { "[early] dma: NON-COHERENT (cache maintenance on sync)" });
     serial_print_str(match dt { Some(true) => ", dtb dma-coherent", Some(false) => ", dtb without dma-coherent", None => ", no dtb" });
     if bcm { serial_print_str(", bcm27xx"); }
+    if kx { serial_print_str(", kexec fdt non-coherent"); }
     serial_print_str(", line ");
     print_number(line as u32);
     serial_print_str(", selftest ");
