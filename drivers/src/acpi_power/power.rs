@@ -60,6 +60,8 @@ struct Wrap(State);
 unsafe impl Send for Wrap {}
 
 fn log(s: &str) { crate::i915::emit_logonly(s); }
+/// Console + klog (the one-time discovery summary).
+fn say(s: &str) { crate::i915::emit(s); }
 fn now_ns() -> u64 { crate::i915::now_ns() }
 
 #[cfg(target_arch = "x86_64")]
@@ -303,7 +305,7 @@ pub fn init(rsdp: u64, hhdm: u64) {
     }
     if let Some(l) = st.lid { st.lid_open = ns.eval_child(&mut h, l, "_LID", &[]).and_then(|v| v.as_int()).map(|v| v != 0); }
     let path = |o: Option<usize>, ns: &Ns| o.map(|a| ns.path(a)).unwrap_or_else(|| String::from("-"));
-    log(&format!(
+    say(&format!(
         "acpi: namespace {} nodes, {} load errors, {} init errors, {} ms; EC {} (status {:#x}, GPE {:?}, timeouts {}); batteries [{}]; AC {}; lid {} (open {:?}); power button {}; sleep button {}; video {} ({} levels); PM1a_EVT {:#x} GPE0 {:#x}/{}\n",
         ns.len(), load_errs, ns.errors - load_errs, (now_ns() - t0) / 1_000_000, ec::present(), ec::status(), st.ec_gpe,
         ec::TIMEOUTS.load(Ordering::Relaxed),
@@ -315,10 +317,10 @@ pub fn init(rsdp: u64, hhdm: u64) {
     st.ns = ns;
     *STATE.lock() = Some(Wrap(st));
     if let Some(b) = battery(0) {
-        log(&format!("acpi: BAT0 present={} status={} capacity={}% now={} full={} design={} rate={} mV={} model={:?} rechargeable={}\n",
+        say(&format!("acpi: BAT0 present={} status={} capacity={}% now={} full={} design={} rate={} mV={} model={:?} rechargeable={}\n",
             b.present, b.status, b.capacity, b.now, b.full, b.full_design, b.rate, b.voltage_now / 1000, b.model, b.rechargeable));
     }
-    if ac_present() { log(&format!("acpi: AC online={:?}\n", ac_online())); }
+    if ac_present() { say(&format!("acpi: AC online={:?}\n", ac_online())); }
 }
 
 fn with<T>(f: impl FnOnce(&mut State, &mut KHost) -> T) -> Option<T> {
