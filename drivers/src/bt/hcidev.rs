@@ -110,6 +110,15 @@ fn handle(msg: &Message, _caller: u32, _target: u32) -> Message {
     }
 }
 
+static CLAIMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The first transport to claim wins `/dev/hci0` (Pi UART vs a USB dongle);
+/// the loser must not create a port or pump the shared queues.
+pub fn claim() -> bool { !CLAIMED.swap(true, Ordering::AcqRel) }
+
+/// True while a client has `/dev/hci0` open.
+pub fn is_open() -> bool { OWNER.load(Ordering::Acquire) != 0 }
+
 /// Creates the kernel-handler port for `/dev/hci0` (before it is registered).
 pub fn create_port() -> Option<u32> {
     let port = ipc::port::create(0)?;

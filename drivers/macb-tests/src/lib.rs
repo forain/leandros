@@ -521,6 +521,38 @@ mod tests {
     }
 
     #[test]
+    fn tx_stall_tail_keyed_fires_even_if_hw_slot_keeps_moving() {
+        // Ping replies keep moving TBQP while the tail is stuck: tick() never fires, tick_tail() does.
+        let mut a = TxStall::default();
+        for k in 0..20 { assert!(!a.tick(Some(k), 5, 8, false)); }
+        let mut b = TxStall::default();
+        let fired = (0..TX_STALL_POLLS + 1).filter(|_| b.tick_tail(5, 8)).count();
+        assert_eq!(fired, 1);
+        let mut c = TxStall::default();
+        for k in 0..20 { assert!(!c.tick_tail(k, 3)); }
+        for _ in 0..20 { assert!(!c.tick_tail(5, 0)); }
+    }
+
+    #[test]
+    fn lost_tail_completion_is_detected_and_resynced() {
+        let mut d = vec![Desc::default(); 8];
+        let mut t = unsafe { TxRing::init(d.as_mut_ptr(), 8, &|i| DMA_OFF + 0x20000 + i as u64 * 2048) };
+        for _ in 0..4 { let i = t.slot().unwrap(); t.post(i, 100); }
+        assert_eq!(t.used_after_tail(), None);
+        // Controller completed slots 1 and 2 but slot 0 never shows USED.
+        d[1].ctrl |= TX_USED; d[2].ctrl |= TX_USED;
+        assert_eq!(t.reclaim(), 0);
+        assert_eq!(t.used_after_tail(), Some((1, 2)));
+        // Hardware idles on slot 3 (not yet completed).
+        assert_eq!(t.resync_to(3), 3);
+        assert_eq!((t.tail(), t.in_flight()), (3, 1));
+        assert_eq!(t.used_after_tail(), None);
+        d[3].ctrl |= TX_USED;
+        assert_eq!(t.reclaim(), 1);
+        assert_eq!(t.in_flight(), 0);
+    }
+
+    #[test]
     fn ring_slot_maps_queue_pointer_to_index() {
         assert_eq!(ring_slot(0x103f020, 0x103f000, 256), Some(2));
         assert_eq!(ring_slot(0x103f000, 0x103f000, 256), Some(0));

@@ -228,6 +228,11 @@ struct drm_syncobj_wait {
 const DRM_CURSOR_PLANE_ID: u32 = 31;
 const DRM_PLANE_TYPE_CURSOR: u32 = 2;
 const DRM_CRTC_ID: u32 = 1;
+/// Lane lapdisp C1: pipe B. Exposed only while a second pipe is registered
+/// (`gpu_kms::extra_crtcs() > 0`).
+const DRM_CRTC2_ID: u32 = 2;
+const DRM_PLANE2_ID: u32 = 32;
+const DRM_CURSOR2_PLANE_ID: u32 = 33;
 const DRM_CONNECTOR_ID: u32 = 1;
 
 // Property ids. Ranges are deliberately disjoint per object class:
@@ -410,6 +415,8 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
         return match obj_id {
             DRM_PLANE_ID => PLANE_KMS,
             DRM_CURSOR_PLANE_ID if crate::gpu_kms::cursor().is_some() => CURSOR_PLANE,
+            DRM_PLANE2_ID if crate::gpu_kms::extra_crtcs() > 0 => PLANE_KMS,
+            DRM_CURSOR2_PLANE_ID if crate::gpu_kms::pipe2().map_or(false, |p| p.cursor.is_some()) => CURSOR_PLANE,
             _ => &[],
         };
     }
@@ -421,6 +428,7 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
             _ => &[],
         },
         DRM_MODE_OBJECT_CRTC_T if obj_id == DRM_CRTC_ID => CRTC,
+        DRM_MODE_OBJECT_CRTC_T if obj_id == DRM_CRTC2_ID && crate::gpu_kms::extra_crtcs() > 0 => CRTC,
         DRM_MODE_OBJECT_CONNECTOR_T if obj_id == DRM_CONNECTOR_ID => CONNECTOR,
         DRM_MODE_OBJECT_CONNECTOR_T if crate::gpu_kms::ext_index(obj_id, crate::gpu_kms::EXT_CONN_BASE).is_some() => CONNECTOR,
         // obj_type 0 (DRM_MODE_OBJECT_ANY) or an unrecognised type: fall back
@@ -3459,9 +3467,28 @@ const MAX_DAMAGE_RECTS: usize = 64;
 
 // Committed crtc/connector state. Only used to decide whether an incoming
 // atomic request needs ALLOW_MODESET.
-static CRTC_ACTIVE: AtomicU32 = AtomicU32::new(0);
-static CRTC_MODE_BLOB: AtomicU32 = AtomicU32::new(0);
+static CRTC_ACTIVE: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+static CRTC_MODE_BLOB: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static CONN_CRTC: AtomicU32 = AtomicU32::new(0);
+/// Extra connector i -> the CRTC id it is bound to (0 = none). Lane lapdisp C1.
+static EXT_CONN_CRTC: [AtomicU32; crate::gpu_kms::EXT_MAX] = [const { AtomicU32::new(0) }; crate::gpu_kms::EXT_MAX];
+/// Pipe B's planes: [primary, cursor] -> CRTC id (0 = unbound).
+static PLANE_B_CRTC: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+/// A `drm_mode_modeinfo` blob -> timing (None when malformed).
+fn blob_timing(blob: u32) -> Option<crate::gpu_kms::KmsTiming> {
+    let g = BLOBS.lock();
+    let b = g.get(&blob)?;
+    if b.len() < 32 { return None; }
+    let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let t = crate::gpu_kms::KmsTiming {
+        clock_khz: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        h: [u16at(4), u16at(6), u16at(8), u16at(10)],
+        v: [u16at(14), u16at(16), u16at(18), u16at(20)],
+        flags: u32::from_le_bytes([b[28], b[29], b[30], b[31]]),
+    };
+    if t.h[0] == 0 || t.v[0] == 0 { None } else { Some(t) }
+}
 
 /// One plane's worth of an atomic request. Every field is `None` when the
 /// commit did not mention that property — "unchanged", not "zero".
@@ -6829,14 +6856,15 @@ impl DrmDeviceInterface {
         with_user_struct(arg, |res: &mut drm_mode_card_res| {
         
         // We report 1 of each for a simple virtual device
-        let crtc_ids = [1u32];
+        let crtc_ids = [1u32, DRM_CRTC2_ID];
+        let ncrtc = 1 + crate::gpu_kms::extra_crtcs();
         let connector_ids = [1u32];
         let encoder_ids = [1u32];
 
-        if res.crtc_id_ptr != 0 && res.count_crtcs >= 1 {
-            unsafe { sched::uaccess::copy_to_user(res.crtc_id_ptr as usize, crtc_ids.as_ptr() as *const u8, (1) * 4); }
+        if res.crtc_id_ptr != 0 && res.count_crtcs as usize >= ncrtc {
+            unsafe { sched::uaccess::copy_to_user(res.crtc_id_ptr as usize, crtc_ids.as_ptr() as *const u8, ncrtc * 4); }
         }
-        res.count_crtcs = 1;
+        res.count_crtcs = ncrtc as u32;
 
         // Extra connectors/encoders of a backend's other outputs (lane lapdisp).
         let next = crate::gpu_kms::ext_count();
@@ -6960,7 +6988,7 @@ impl DrmDeviceInterface {
         conn.mm_width = inf.mm_w;
         conn.mm_height = inf.mm_h;
         conn.subpixel = 1; // UNKNOWN
-        conn.encoder_id = 0;
+        conn.encoder_id = if EXT_CONN_CRTC[i].load(Ordering::Relaxed) != 0 { crate::gpu_kms::EXT_ENC_BASE + i as u32 } else { 0 };
         if conn.encoders_ptr != 0 && conn.count_encoders >= 1 {
             let e = crate::gpu_kms::EXT_ENC_BASE + i as u32;
             unsafe { sched::uaccess::copy_to_user(conn.encoders_ptr as usize, &e as *const u32 as *const u8, 4); }
@@ -6992,7 +7020,7 @@ impl DrmDeviceInterface {
         if let Some(i) = crate::gpu_kms::ext_index(enc.encoder_id, crate::gpu_kms::EXT_ENC_BASE) {
             // Not bound, and no CRTC can drive it yet (no second-pipe modeset).
             enc.encoder_type = crate::gpu_kms::outputs().and_then(|o| (o.cached)(i)).map_or(2, |c| c.enc_type);
-            enc.crtc_id = 0;
+            enc.crtc_id = if crate::gpu_kms::extra_crtcs() > 0 { EXT_CONN_CRTC[i].load(Ordering::Relaxed) } else { 0 };
             enc.possible_crtcs = crate::gpu_kms::ext_crtc_mask(i);
             enc.possible_clones = 0;
             return Ok(0);
@@ -7008,6 +7036,20 @@ impl DrmDeviceInterface {
     fn std_handle_get_crtc(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         with_user_struct(arg, |crtc_out: &mut drm_mode_crtc| {
+        if crtc_out.crtc_id == DRM_CRTC2_ID {
+            let p2 = crate::gpu_kms::pipe2().ok_or(DriverError::NotFound)?;
+            crtc_out.fb_id = 0;
+            crtc_out.x = 0;
+            crtc_out.y = 0;
+            crtc_out.mode_valid = 0;
+            if let Some((w, h, r)) = (p2.mode)() {
+                crtc_out.mode.hdisplay = w as u16;
+                crtc_out.mode.vdisplay = h as u16;
+                crtc_out.mode.vrefresh = r;
+                crtc_out.mode_valid = 1;
+            }
+            return Ok(0);
+        }
         let crtc_id = DrmObjectId(crtc_out.crtc_id);
         if let Some(crtc) = device.get_crtc(crtc_id) {
             // Find FB ID from planes associated with this CRTC
@@ -7198,6 +7240,10 @@ impl DrmDeviceInterface {
     fn ext_set_crtc(arg: usize, open_id: u32) -> Option<Result<usize, DriverError>> {
         if !crate::gpu_kms::active() || arg == 0 { return None; }
         let set = uread::<drm_mode_crtc>(arg).ok()?;
+        // Pipe B is driven by atomic commits only (v1).
+        if set.crtc_id == DRM_CRTC2_ID && crate::gpu_kms::extra_crtcs() > 0 {
+            return Some(Err(DriverError::InvalidParameter));
+        }
         if set.mode_valid != 0 && mode_refused(set.mode.hdisplay as u32, set.mode.vdisplay as u32, "SETCRTC") {
             return Some(Err(DriverError::InvalidParameter));
         }
@@ -7226,6 +7272,25 @@ impl DrmDeviceInterface {
         if !crate::gpu_kms::active() || arg == 0 { return None; }
         let flip = uread::<drm_mode_crtc_page_flip>(arg).ok()?;
         if ext_fb_token(flip.fb_id) == 0 { return None; }
+        if flip.crtc_id == DRM_CRTC2_ID {
+            let p2 = crate::gpu_kms::pipe2()?;
+            if (p2.busy)() {
+                EXT_EBUSY.fetch_add(1, Ordering::Relaxed);
+                return Some(Err(DriverError::Errno(EBUSY)));
+            }
+            let ev = if flip.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+                match ext_event_new(open_id, DRM_CRTC2_ID, flip.user_data) {
+                    Some(c) => c,
+                    None => return Some(Err(DriverError::Errno(EBUSY))),
+                }
+            } else { 0 };
+            let r = (p2.queue)(ext_fb_token(flip.fb_id), 0, 0, ev);
+            match r {
+                Ok(()) => { FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed); }
+                Err(_) => if ev != 0 { ext_event_cancel(ev); },
+            }
+            return Some(r.map(|_| 0));
+        }
         if let Some(f) = crate::gpu_kms::flip() {
             // Real vblank: queue it; EBUSY while one is pending (Linux's
             // legacy page flip answers the same).
@@ -7465,12 +7530,24 @@ impl DrmDeviceInterface {
     /// actually reads back matter here; the rest report 0, which is the correct
     /// "unset" state for an unconfigured plane.
     fn current_prop_value(obj_id: u32, prop_id: u32) -> u64 {
+        // With a second pipe the per-object state is real; without one the
+        // old zeroes stay (default behaviour unchanged).
+        let two = crate::gpu_kms::extra_crtcs() > 0;
         match prop_id {
             PROP_TYPE => match obj_id {
-                DRM_CURSOR_PLANE_ID => DRM_PLANE_TYPE_CURSOR as u64,
+                DRM_CURSOR_PLANE_ID | DRM_CURSOR2_PLANE_ID => DRM_PLANE_TYPE_CURSOR as u64,
                 _ => DRM_PLANE_TYPE_PRIMARY as u64,
             },
             PROP_IN_FORMATS => in_formats_blob() as u64,
+            PROP_CONN_CRTC_ID if two => {
+                if obj_id == DRM_CONNECTOR_ID { CONN_CRTC.load(Ordering::Relaxed) as u64 }
+                else { crate::gpu_kms::ext_index(obj_id, crate::gpu_kms::EXT_CONN_BASE)
+                        .map_or(0, |i| EXT_CONN_CRTC[i].load(Ordering::Relaxed) as u64) }
+            }
+            PROP_ACTIVE if two => CRTC_ACTIVE[(obj_id == DRM_CRTC2_ID) as usize].load(Ordering::Relaxed) as u64,
+            PROP_MODE_ID if two => CRTC_MODE_BLOB[(obj_id == DRM_CRTC2_ID) as usize].load(Ordering::Relaxed) as u64,
+            PROP_PLANE_CRTC_ID if two && obj_id == DRM_PLANE2_ID => PLANE_B_CRTC[0].load(Ordering::Relaxed) as u64,
+            PROP_PLANE_CRTC_ID if two && obj_id == DRM_CURSOR2_PLANE_ID => PLANE_B_CRTC[1].load(Ordering::Relaxed) as u64,
             _ => 0,
         }
     }
@@ -7484,7 +7561,16 @@ impl DrmDeviceInterface {
         const ALL_PLANES: [u32; 2] = [DRM_PLANE_ID, DRM_CURSOR_PLANE_ID];
         // A KMS backend's scanout has a cursor plane only with a hardware
         // cursor (see `object_props`).
-        let planes: &[u32] = if crate::gpu_kms::cursor_plane_exposed() { &ALL_PLANES } else { &ALL_PLANES[..1] };
+        let mut plist = [0u32; 4];
+        let mut np = 0usize;
+        plist[np] = DRM_PLANE_ID; np += 1;
+        if crate::gpu_kms::cursor_plane_exposed() { plist[np] = DRM_CURSOR_PLANE_ID; np += 1; }
+        if let Some(p2) = crate::gpu_kms::pipe2() {
+            plist[np] = DRM_PLANE2_ID; np += 1;
+            if p2.cursor.is_some() { plist[np] = DRM_CURSOR2_PLANE_ID; np += 1; }
+        }
+        let _ = ALL_PLANES;
+        let planes: &[u32] = &plist[..np];
         let ptr_planes = uread::<u64>(arg)?;
         let cap = unsafe { ptr::read_unaligned((arg + 8) as *const u32) };
         if ptr_planes != 0 && cap as usize >= planes.len() {
@@ -7515,12 +7601,15 @@ impl DrmDeviceInterface {
             DRM_CURSOR_PLANE_ID if !crate::gpu_kms::cursor_plane_exposed() => return Err(DriverError::NotFound),
             DRM_CURSOR_PLANE_ID => &CURSOR_FORMATS,
             DRM_PLANE_ID => &PRIMARY_FORMATS,
+            DRM_PLANE2_ID if crate::gpu_kms::extra_crtcs() > 0 => &PRIMARY_FORMATS,
+            DRM_CURSOR2_PLANE_ID if crate::gpu_kms::pipe2().map_or(false, |p| p.cursor.is_some()) => &CURSOR_FORMATS,
             _ => return Err(DriverError::NotFound),
         };
+        let b_plane = plane_id == DRM_PLANE2_ID || plane_id == DRM_CURSOR2_PLANE_ID;
         unsafe {
             ptr::write_unaligned((arg + 4) as *mut u32, 0);  // crtc_id: not currently bound
             ptr::write_unaligned((arg + 8) as *mut u32, 0);  // fb_id
-            ptr::write_unaligned((arg + 12) as *mut u32, 1); // possible_crtcs: crtc index 0
+            ptr::write_unaligned((arg + 12) as *mut u32, if b_plane { 2 } else { 1 }); // possible_crtcs: crtc index 0 (A) or 1 (B)
             ptr::write_unaligned((arg + 16) as *mut u32, 0); // gamma_size
         }
         let cap = unsafe { ptr::read_unaligned((arg + 20) as *const u32) };
@@ -7692,6 +7781,15 @@ impl DrmDeviceInterface {
         let mut want_active: Option<u64> = None;
         let mut want_mode: Option<u64> = None;
         let mut want_conn_crtc: Option<u64> = None;
+        // Pipe B (lane lapdisp C1); all inert unless a second pipe is registered.
+        let b_on = crate::gpu_kms::extra_crtcs() > 0;
+        let mut primary_b = AtomicPlaneReq::default();
+        let mut cursor_b = AtomicPlaneReq::default();
+        let mut want_active_b: Option<u64> = None;
+        let mut want_mode_b: Option<u64> = None;
+        let mut ext_conn: [Option<u64>; crate::gpu_kms::EXT_MAX] = [None; crate::gpu_kms::EXT_MAX];
+        let mut touch_b = false;
+        let mut a_obj = false;
 
         let mut k = 0usize;
         for (i, &obj) in objs.iter().enumerate() {
@@ -7702,38 +7800,59 @@ impl DrmDeviceInterface {
 
                 match pid {
                     // ── crtc ──
+                    PROP_ACTIVE if b_on && obj == DRM_CRTC2_ID => { touch_b = true; want_active_b = Some(val); }
+                    PROP_MODE_ID if b_on && obj == DRM_CRTC2_ID => { touch_b = true; want_mode_b = Some(val); }
                     PROP_ACTIVE => {
                         if obj != DRM_CRTC_ID { return Err(DriverError::InvalidParameter); }
+                        a_obj = true;
                         want_active = Some(val);
                     }
                     PROP_MODE_ID => {
                         if obj != DRM_CRTC_ID { return Err(DriverError::InvalidParameter); }
+                        a_obj = true;
                         want_mode = Some(val);
                     }
                     // ── connector ──
                     // An extra connector (lane lapdisp) can only stay off.
                     PROP_CONN_CRTC_ID if obj != DRM_CONNECTOR_ID
                         && crate::gpu_kms::ext_index(obj, crate::gpu_kms::EXT_CONN_BASE).is_some() => {
-                        if val != 0 { return Err(DriverError::InvalidParameter); }
+                        let ei = crate::gpu_kms::ext_index(obj, crate::gpu_kms::EXT_CONN_BASE).unwrap();
+                        if val != 0 && !(b_on && val == DRM_CRTC2_ID as u64) { return Err(DriverError::InvalidParameter); }
+                        if b_on {
+                            ext_conn[ei] = Some(val);
+                            if val != 0 || EXT_CONN_CRTC[ei].load(Ordering::Relaxed) != 0 { touch_b = true; }
+                        }
                     }
                     PROP_CONN_CRTC_ID => {
                         if obj != DRM_CONNECTOR_ID { return Err(DriverError::InvalidParameter); }
+                        if b_on && val > 1 { return Err(DriverError::InvalidParameter); }
+                        a_obj = true;
                         want_conn_crtc = Some(val);
                     }
                     // ── planes ──
                     _ => {
+                        let mut plane_b = false;
                         let p = match obj {
-                            DRM_PLANE_ID => &mut primary,
+                            DRM_PLANE_ID => { a_obj = true; &mut primary }
                             DRM_CURSOR_PLANE_ID => {
                                 if DRM_STATS {
                                     CURSOR_PLANE_SEEN.fetch_add(1, Ordering::Relaxed);
                                 }
+                                a_obj = true;
                                 &mut cursor
+                            }
+                            DRM_PLANE2_ID if b_on => { plane_b = true; touch_b = true; &mut primary_b }
+                            DRM_CURSOR2_PLANE_ID if b_on && crate::gpu_kms::pipe2().map_or(false, |p| p.cursor.is_some()) => {
+                                plane_b = true; touch_b = true; &mut cursor_b
                             }
                             _ => return Err(DriverError::InvalidParameter),
                         };
                         match pid {
                             PROP_TYPE => {} // immutable; ignore writes
+                            // A plane may bind only to its own pipe's CRTC.
+                            PROP_PLANE_CRTC_ID if b_on && val != 0 && val != if plane_b { DRM_CRTC2_ID } else { DRM_CRTC_ID } as u64 => {
+                                return Err(DriverError::InvalidParameter);
+                            }
                             PROP_PLANE_CRTC_ID => p.crtc_id = Some(val as u32),
                             PROP_FB_ID => p.fb_id = Some(val as u32),
                             // SRC_* are 16.16 fixed point.
@@ -7760,15 +7879,58 @@ impl DrmDeviceInterface {
         // wedges startup or makes every frame a modeset.
         let allow_modeset = flags & DRM_MODE_ATOMIC_ALLOW_MODESET != 0;
         let test_only = flags & DRM_MODE_ATOMIC_TEST_ONLY != 0;
-        let cur_active = CRTC_ACTIVE.load(Ordering::Relaxed) as u64;
-        let cur_mode = CRTC_MODE_BLOB.load(Ordering::Relaxed) as u64;
+        let cur_active = CRTC_ACTIVE[0].load(Ordering::Relaxed) as u64;
+        let cur_mode = CRTC_MODE_BLOB[0].load(Ordering::Relaxed) as u64;
         let cur_conn = CONN_CRTC.load(Ordering::Relaxed) as u64;
         let changes_modeset = want_active.map_or(false, |v| v != cur_active)
             || want_mode.map_or(false, |v| v != cur_mode)
             || want_conn_crtc.map_or(false, |v| v != cur_conn);
-        if changes_modeset && !allow_modeset {
+
+        // ── Pipe B validation ──
+        // The extra bound to CRTC 2 afterwards (at most one), its timing, and
+        // the framebuffer token: all resolved before anything is applied.
+        let mut conn_b: Option<usize> = None;
+        let mut act_b = 0u64;
+        let mut mode_b = 0u64;
+        let mut changes_b = false;
+        let mut timing_b: Option<crate::gpu_kms::KmsTiming> = None;
+        let mut token_b = 0u32;
+        let mut fb_b = false;
+        if b_on {
+            for i in 0..crate::gpu_kms::ext_count() {
+                let v = ext_conn[i].unwrap_or(EXT_CONN_CRTC[i].load(Ordering::Relaxed) as u64);
+                if v == DRM_CRTC2_ID as u64 {
+                    if conn_b.is_some() { return Err(DriverError::InvalidParameter); }
+                    conn_b = Some(i);
+                }
+            }
+            act_b = want_active_b.unwrap_or(CRTC_ACTIVE[1].load(Ordering::Relaxed) as u64);
+            mode_b = want_mode_b.unwrap_or(CRTC_MODE_BLOB[1].load(Ordering::Relaxed) as u64);
+            let old_conn_b = (0..crate::gpu_kms::ext_count()).find(|&i| EXT_CONN_CRTC[i].load(Ordering::Relaxed) != 0);
+            changes_b = want_active_b.map_or(false, |v| v != CRTC_ACTIVE[1].load(Ordering::Relaxed) as u64)
+                || want_mode_b.map_or(false, |v| v != CRTC_MODE_BLOB[1].load(Ordering::Relaxed) as u64)
+                || conn_b != old_conn_b;
+            if act_b != 0 {
+                // An active CRTC needs a connector and a valid mode.
+                if conn_b.is_none() || mode_b == 0 { return Err(DriverError::InvalidParameter); }
+                timing_b = blob_timing(mode_b as u32);
+                if timing_b.is_none() { return Err(DriverError::InvalidParameter); }
+            } else if primary_b.fb_id.map_or(false, |f| f != 0) || primary_b.crtc_id.map_or(false, |c| c != 0) {
+                // Showing a plane on an inactive CRTC.
+                return Err(DriverError::InvalidParameter);
+            }
+            if let Some(fb) = primary_b.fb_id.filter(|&f| f != 0) {
+                token_b = ext_fb_token(fb);
+                let dumb_ok = crate::gpu_kms::pipe2().map_or(false, |p| p.dumb_ok);
+                let known = token_b != 0 || (dumb_ok && get_drm_device().lock().get_framebuffer(DrmObjectId(fb)).is_some());
+                if !known { return Err(DriverError::InvalidParameter); }
+                fb_b = true;
+            }
+        }
+        if (changes_modeset || changes_b) && !allow_modeset {
             return Err(DriverError::InvalidParameter);
         }
+        let touch_a = !touch_b || a_obj;
 
         // A MODE_ID blob must exist if one was named.
         if let Some(mode_blob) = want_mode {
@@ -7809,7 +7971,15 @@ impl DrmDeviceInterface {
         // one has not completed is EBUSY, a blocking one waits for it. Before
         // any state is applied, so an EBUSY commit changes nothing.
         let hw_flip = crate::gpu_kms::flip();
-        if let Some(f) = hw_flip {
+        if let Some(p2) = crate::gpu_kms::pipe2().filter(|_| touch_b) {
+            if (p2.busy)() {
+                if flags & DRM_MODE_ATOMIC_NONBLOCK != 0 || !(p2.wait_idle)(EXT_BLOCKING_WAIT_NS) {
+                    EXT_EBUSY.fetch_add(1, Ordering::Relaxed);
+                    return Err(DriverError::Errno(EBUSY));
+                }
+            }
+        }
+        if let Some(f) = hw_flip.filter(|_| touch_a) {
             if (f.busy)() {
                 if flags & DRM_MODE_ATOMIC_NONBLOCK != 0 || !(f.wait_idle)(EXT_BLOCKING_WAIT_NS) {
                     EXT_EBUSY.fetch_add(1, Ordering::Relaxed);
@@ -7820,7 +7990,7 @@ impl DrmDeviceInterface {
         // Its event cookie: allocated before anything is presented, so a
         // flip that latches at once has somewhere to complete to.
         let hw_ev = match hw_flip {
-            Some(_) if flags & DRM_MODE_PAGE_FLIP_EVENT != 0 => match ext_event_new(open_id, DRM_CRTC_ID, user_data) {
+            Some(_) if touch_a && flags & DRM_MODE_PAGE_FLIP_EVENT != 0 => match ext_event_new(open_id, DRM_CRTC_ID, user_data) {
                 Some(c) => c,
                 None => return Err(DriverError::Errno(EBUSY)),
             },
@@ -7828,8 +7998,8 @@ impl DrmDeviceInterface {
         };
         let mut hw_ev_owned = hw_ev != 0;
 
-        if let Some(v) = want_active { CRTC_ACTIVE.store(v as u32, Ordering::Relaxed); }
-        if let Some(v) = want_mode { CRTC_MODE_BLOB.store(v as u32, Ordering::Relaxed); }
+        if let Some(v) = want_active { CRTC_ACTIVE[0].store(v as u32, Ordering::Relaxed); }
+        if let Some(v) = want_mode { CRTC_MODE_BLOB[0].store(v as u32, Ordering::Relaxed); }
 
         // Carry a MODE_ID change into the CRTC's mode. GETCRTC and the
         // software (non-blob) present path size the scanout from crtc.mode;
@@ -7953,6 +8123,37 @@ impl DrmDeviceInterface {
                 LAST_PRIMARY_FB.store(fb_id, Ordering::Relaxed);
                 LAST_PRIMARY_DAMAGE.store(blob, Ordering::Relaxed);
             }
+        }
+
+        // ── Pipe B commit (lane lapdisp C1) ──
+        if touch_b {
+            let p2 = crate::gpu_kms::pipe2().ok_or(DriverError::InvalidParameter)?;
+            let old_conn_b = (0..crate::gpu_kms::ext_count()).find(|&i| EXT_CONN_CRTC[i].load(Ordering::Relaxed) != 0);
+            for i in 0..crate::gpu_kms::ext_count() {
+                if let Some(v) = ext_conn[i] { EXT_CONN_CRTC[i].store(v as u32, Ordering::Relaxed); }
+            }
+            CRTC_ACTIVE[1].store(act_b as u32, Ordering::Relaxed);
+            CRTC_MODE_BLOB[1].store(mode_b as u32, Ordering::Relaxed);
+            if let Some(c) = primary_b.crtc_id { PLANE_B_CRTC[0].store(c, Ordering::Relaxed); }
+            if let Some(c) = cursor_b.crtc_id { PLANE_B_CRTC[1].store(c, Ordering::Relaxed); }
+            if changes_b {
+                match (act_b != 0, conn_b, timing_b) {
+                    (true, Some(i), Some(t)) => (p2.modeset)(i, &t)?,
+                    _ => if old_conn_b.is_some() || want_active_b.is_some() { (p2.disable)() },
+                }
+            }
+            let ev_b = if flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+                ext_event_new(open_id, DRM_CRTC2_ID, user_data).ok_or(DriverError::Errno(EBUSY))?
+            } else { 0 };
+            if fb_b {
+                let r = (p2.queue)(token_b, primary_b.src_x.unwrap_or(0), primary_b.src_y.unwrap_or(0), ev_b);
+                if r.is_err() && ev_b != 0 { ext_event_cancel(ev_b); }
+                r?;
+                FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed);
+            } else if ev_b != 0 {
+                (p2.event)(ev_b);
+            }
+            if !touch_a { return Ok(0); }
         }
 
         match crate::gpu_kms::cursor() {

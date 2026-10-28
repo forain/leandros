@@ -333,6 +333,11 @@ fn with<T>(f: impl FnOnce(&mut State, &mut KHost) -> T) -> Option<T> {
     Some(r)
 }
 
+/// Run `f` on the loaded namespace (for other drivers' _CRS/_DSM/_STA/_PSx).
+pub fn with_ns<T>(f: impl FnOnce(&mut Ns, &mut dyn Host) -> T) -> Option<T> {
+    with(|s, h| f(&mut s.ns, h))
+}
+
 pub fn battery_count() -> usize { with(|s, _| s.bats.len()).unwrap_or(0) }
 pub fn ac_present() -> bool { with(|s, _| s.ac.is_some()).unwrap_or(false) }
 

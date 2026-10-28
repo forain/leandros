@@ -93,6 +93,8 @@ struct InPipe {
     pending: Vec<(u64, u8)>,
     failed: Option<u8>,
     recoveries: u32,
+    /// A good completion was harvested since the last recovery.
+    good: bool,
 }
 
 impl InPipe {
@@ -131,9 +133,10 @@ impl InPipe {
                         let mut v = alloc::vec![0u8; len];
                         buf.copy_out(idx as usize * chunk, &mut v);
                         out.push((bulk, v));
+                        self.good = true;
                     }
                 }
-                cc => { self.failed = Some(cc); break; }
+                cc => { if self.failed.is_none() { self.failed = Some(cc); } }
             }
         }
         events.clear();
@@ -149,6 +152,8 @@ pub struct BtUsb {
     ev: InPipe,
     acl: InPipe,
     dead: bool,
+    /// An IN pipe was recovered since the last `take_resets` (event, ACL).
+    reset: (bool, bool),
 }
 
 /// What one [`BtUsb::poll`] saw.
@@ -164,6 +169,10 @@ pub enum BtPoll {
 impl BtUsb {
     pub fn endpoints(&self) -> BtEps { self.eps }
     pub fn slot(&self) -> u8 { self.slot }
+
+    /// (events, ACL): that pipe lost data to a recovery, so its reassembler
+    /// must drop any half packet. Cleared by the call.
+    pub fn take_resets(&mut self) -> (bool, bool) { core::mem::take(&mut self.reset) }
 
     pub fn open(f: &UsbFunction) -> Result<BtUsb, &'static str> {
         let e = scan_bt(&f.cfg).ok_or("no Bluetooth HCI interface")?;
@@ -199,9 +208,10 @@ impl BtUsb {
         }
         let mut d = BtUsb {
             hc: hc.clone(), slot, eps: e, dci_out: dbo,
-            ev: InPipe { dci: di, chunk: ichunk, pending: Vec::with_capacity(NTDS), failed: None, recoveries: 0 },
-            acl: InPipe { dci: dbi, chunk: bchunk, pending: Vec::with_capacity(NTDS), failed: None, recoveries: 0 },
+            ev: InPipe { dci: di, chunk: ichunk, pending: Vec::with_capacity(NTDS), failed: None, recoveries: 0, good: false },
+            acl: InPipe { dci: dbi, chunk: bchunk, pending: Vec::with_capacity(NTDS), failed: None, recoveries: 0, good: false },
             dead: false,
+            reset: (false, false),
         };
         {
             let mut x = d.hc.lock();
@@ -239,10 +249,15 @@ impl BtUsb {
             }
             self.ev.harvest(&mut x, self.slot, false, &mut out);
             self.acl.harvest(&mut x, self.slot, true, &mut out);
+            for p in [&mut self.ev, &mut self.acl] {
+                if p.good && p.failed.is_none() { p.recoveries = 0; }
+                p.good = false;
+            }
             if self.ev.failed.is_none() { self.ev.prime(&mut x, self.slot); }
             if self.acl.failed.is_none() { self.acl.prime(&mut x, self.slot); }
         }
-        for p in [&mut self.ev, &mut self.acl] {
+        for i in 0..2 {
+            let p = if i == 0 { &mut self.ev } else { &mut self.acl };
             let Some(cc) = p.failed else { continue };
             p.recoveries += 1;
             usb_log!("[USB-BT] slot {} dci {}: transfer error cc {}, resetting endpoint\n", self.slot, p.dci, cc);
@@ -250,9 +265,11 @@ impl BtUsb {
             // take the whole controller (and the USB root disk) down.
             if p.recoveries > MAX_RECOVERIES || recover_ep_inner(&self.hc, self.slot, p.dci).is_err() {
                 usb_log!("[USB-BT] slot {} dci {}: endpoint unrecoverable\n", self.slot, p.dci);
+                quarantine_slot(&self.hc, self.slot, "BT endpoint unrecoverable");
                 self.dead = true;
                 return BtPoll::Gone;
             }
+            if i == 0 { self.reset.0 = true } else { self.reset.1 = true }
             p.failed = None;
             p.pending.clear();
             let mut x = self.hc.lock();

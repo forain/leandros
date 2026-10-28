@@ -63,7 +63,11 @@ struct Link<'a> {
 
 impl Link<'_> {
     fn pull(&mut self) -> bool {
-        match self.d.poll() {
+        let r = self.d.poll();
+        let (re, rb) = self.d.take_resets();
+        if re { self.ev.reset(); }
+        if rb { self.bev.reset(); }
+        match r {
             BtPoll::Data(v) => {
                 let mut out = Vec::new();
                 let any = !v.is_empty();
@@ -99,6 +103,7 @@ impl btintel::Link for Link<'_> {
     }
     fn now_ms(&mut self) -> u64 { now_ms() }
     fn operational(&mut self) { self.boot = false; self.bev.reset(); }
+    fn bootloader(&mut self) { self.boot = true; self.bev.reset(); self.ev.reset(); }
     fn log(&mut self, msg: &str) { log(msg) }
 }
 
@@ -138,6 +143,7 @@ fn run(f: usb::xhci::isoch::UsbFunction, fw: bool, on_ready: fn(port: u32)) {
     }
     let leftover = link.q.len();
     drop(link);
+    if !hcidev::claim() { return log("/dev/hci0 already owned by another transport"); }
     let Some(port) = hcidev::create_port() else { return log("fail stage=port") };
     on_ready(port);
     log(&format!("/dev/hci0 ready ({} stale set-up events dropped)", leftover));
@@ -150,7 +156,11 @@ fn pump(d: &mut BtUsb) -> ! {
     let mut out = Vec::new();
     loop {
         let mut changed = false;
-        match d.poll() {
+        let r = d.poll();
+        let (re, rb) = d.take_resets();
+        if re { ev.reset(); }
+        if rb { acl.reset(); }
+        match r {
             BtPoll::Data(v) => {
                 for (bulk, c) in v {
                     if bulk { acl.push(&c, &mut out) } else { ev.push(&c, &mut out) }
@@ -179,6 +189,6 @@ fn pump(d: &mut BtUsb) -> ! {
         let drops = hcidev::rx_drops();
         if drops != logged_drops { log(&format!("rx drop n={} (sco tx dropped {})", drops, sco_drops)); logged_drops = drops; }
         if changed { hcidev::notify(); idle = 0; } else { idle = idle.saturating_add(1); }
-        if idle < 64 { sched::kthread::yield_now() } else { sched::kthread::msleep(if idle < 2000 { 1 } else { 4 }) }
+        if idle < 64 { sched::kthread::yield_now() } else { sched::kthread::msleep(if !hcidev::is_open() { 100 } else if idle < 2000 { 1 } else { 20 }) }
     }
 }

@@ -131,6 +131,9 @@ if command -v zig >/dev/null 2>&1; then
     # PipeWire's sink uses; run at boot by /bin/snd-autotest (snd.test=1).
     echo "[userland] Building sndtest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/sndtest" userland/sndtest/sndtest.c -lm
+    # camtest (lane lapv4l2): V4L2 mmap capture from /dev/video0; --probe is the no-camera regress check.
+    echo "[userland] Building camtest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/camtest" userland/camtest/camtest.c
     # syscalltest: splice/tee/vmsplice, rseq and pidfd (checked against a host kernel).
     echo "[userland] Building syscalltest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/syscalltest" userland/syscalltest/syscalltest.c
