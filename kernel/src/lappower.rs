@@ -22,6 +22,16 @@ fn sleep_until(deadline: u64) {
     }
 }
 
+/// Input-report counter for the HID-over-I2C probe (lane lapi2c): polls every 10 ms until its window ends.
+fn i2c_task() -> ! {
+    let mut next = sched::monotonic_ns();
+    while drivers::i2c_hid::listen_once(sched::monotonic_ns()) {
+        next += 10_000_000;
+        sleep_until(next);
+    }
+    loop { next += 3_600_000_000_000; sleep_until(next); }
+}
+
 fn task() -> ! {
     let mut registered = false;
     let mut tries = 0u32;
@@ -44,6 +54,9 @@ pub fn init(rsdp: u64, hhdm: u64, cmdline: &str) {
     drivers::power_sysfs::set_fake(has("acpi_power.fake=1"));
     drivers::acpi_power::init(rsdp, hhdm);
     vfs_server::sysclass::set_sysclass_ops(&OPS);
+    if drivers::i2c_hid::init(cmdline) && sched::spawn(i2c_task, 0).map(|p| sched::set_comm(p, b"ki2chid")).is_none() {
+        crate::serial_print_str("[I2C] could not start the HID probe thread\n");
+    }
     if sched::spawn(task, 0).map(|p| sched::set_comm(p, b"kacpid")).is_none() {
         crate::serial_print_str("[ACPI] could not start the power poll thread\n");
     }

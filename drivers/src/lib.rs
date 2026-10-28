@@ -21,6 +21,15 @@ pub mod lapinv;
 /// Intel Gen9 graphics: probe, GT bring-up, self-tests (lane i915).
 pub mod i915;
 pub mod acpi_power;
+/// HID report-descriptor parser (pure logic, host-tested; lane lapi2c).
+pub mod hid_desc;
+/// ACPI I2C slave discovery, DesignWare I2C master, HID-over-I2C probe (lane lapi2c).
+#[cfg(target_arch = "x86_64")]
+pub mod i2c_acpi;
+#[cfg(target_arch = "x86_64")]
+pub mod dw_i2c;
+#[cfg(target_arch = "x86_64")]
+pub mod i2c_hid;
 pub mod power_sysfs;
 pub mod snd;
 /// Intel High Definition Audio controller + codec playback (lane hda).
