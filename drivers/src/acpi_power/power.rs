@@ -111,6 +111,65 @@ fn mem_va(phys: u64) -> Option<usize> {
     Some(va + (phys & 0xFFF) as usize)
 }
 
+
+// ---- sleep-method support (lane s3aml) ----
+/// Per-space OpRegion accounting: [0..16) reads, [16..32) writes, [32..48) dropped accesses.
+static CNT: [core::sync::atomic::AtomicU32; 48] = [const { core::sync::atomic::AtomicU32::new(0) }; 48];
+static PAUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Inside _TTS/_PTS/_WAK: Sleep() honours up to 2000 ms, writes may be traced.
+static SLEEP_WIN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static TRACE_LEFT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FACS_PHYS: AtomicU64 = AtomicU64::new(0);
+static PM1A_CNT: AtomicUsize = AtomicUsize::new(0);
+static GL_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static GL_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn cnt(i: usize) { CNT[i & 47].fetch_add(1, Ordering::Relaxed); }
+fn space_name(s: usize) -> &'static str {
+    match s { 0 => "Mem", 1 => "IO", 2 => "PCI", 3 => "EC", 4 => "SMBus", 5 => "CMOS", 6 => "PCIBar", 7 => "IPMI", 8 => "GPIO", 9 => "GSBus", 10 => "PCC", _ => "?" }
+}
+fn cmos_ports(addr: u64) -> (u16, u16, u8) { if addr >= 0x80 { (0x72, 0x73, (addr - 0x80) as u8) } else { (0x70, 0x71, addr as u8) } }
+fn trace_write(space: u8, addr: u64, w: u8, val: u64) {
+    if !SLEEP_WIN.load(Ordering::Relaxed) || crate::nvidia_probe::cmdline_word("pm.amltrace") != Some("1") { return; }
+    if TRACE_LEFT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1)).is_ok() {
+        log(&format!("[S3] aml: write {} {:#x} w{} = {:#x}\n", space_name(space as usize), addr, w, val));
+    }
+}
+
+/// FACS global lock (ACPI 5.2.10.1): cmpxchg on FACS+16; bit0 pending, bit1 owned.
+static GL_DEPTH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+fn gl_acquire() {
+    if GL_DEPTH.fetch_add(1, Ordering::Relaxed) > 0 { return; }
+    let phys = FACS_PHYS.load(Ordering::Relaxed);
+    if phys == 0 { return; }
+    let Some(va) = mem_va(phys + 16) else { return };
+    let a = unsafe { &*(va as *const core::sync::atomic::AtomicU32) };
+    for _ in 0..100_000u32 {
+        let old = a.load(Ordering::Acquire);
+        let new = (old & !3) | 2 | if old & 2 != 0 { 1 } else { 0 };
+        if a.compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if new & 1 == 0 { GL_PENDING.store(false, Ordering::Relaxed); return; }
+            // Owned by firmware: pending set, wait for its release.
+            GL_PENDING.store(true, Ordering::Relaxed);
+        }
+        core::hint::spin_loop();
+        crate::i915::delay_us(1);
+    }
+    GL_FAILS.fetch_add(1, Ordering::Relaxed);
+}
+fn gl_release() {
+    if GL_DEPTH.fetch_sub(1, Ordering::Relaxed) > 1 { return; }
+    let phys = FACS_PHYS.load(Ordering::Relaxed);
+    if phys == 0 { return; }
+    let Some(va) = mem_va(phys + 16) else { return };
+    let a = unsafe { &*(va as *const core::sync::atomic::AtomicU32) };
+    let old = a.fetch_and(!3, Ordering::AcqRel);
+    if old & 1 != 0 {
+        let p = PM1A_CNT.load(Ordering::Relaxed) as u16;
+        if p != 0 { pio::outw(p, pio::inw(p) | (1 << 2)); } // GBL_RLS
+    }
+}
+
 struct KHost {
     notes: Vec<(usize, u64)>,
 }
@@ -121,6 +180,7 @@ fn pci_fn(addr: u64) -> crate::pci::PciFunction {
 
 impl Host for KHost {
     fn read(&mut self, space: u8, addr: u64, width: u8) -> u64 {
+        cnt(space as usize);
         match space {
             aml::SPACE_MEM => {
                 let Some(va) = mem_va(addr) else { return 0 };
@@ -150,11 +210,22 @@ impl Host for KHost {
                 }
                 v
             }
-            _ => 0,
+            aml::SPACE_CMOS => {
+                let mut v = 0u64;
+                for i in 0..(width / 8) as u64 {
+                    let (ip, dp, idx) = cmos_ports(addr + i);
+                    pio::outb(ip, idx & 0x7F);
+                    v |= (pio::inb(dp) as u64) << (8 * i);
+                }
+                v
+            }
+            _ => { cnt(32 + space as usize); 0 }
         }
     }
 
     fn write(&mut self, space: u8, addr: u64, width: u8, val: u64) {
+        cnt(16 + space as usize);
+        trace_write(space, addr, width, val);
         match space {
             aml::SPACE_MEM => {
                 let Some(va) = mem_va(addr) else { return };
@@ -183,11 +254,22 @@ impl Host for KHost {
             aml::SPACE_EC => {
                 for i in 0..(width / 8) as u64 { ec::write((addr + i) as u8, (val >> (8 * i)) as u8); }
             }
-            _ => {}
+            aml::SPACE_CMOS if crate::nvidia_probe::cmdline_word("pm.aml_cmos_write") == Some("1") => {
+                for i in 0..(width / 8) as u64 {
+                    let (ip, dp, idx) = cmos_ports(addr + i);
+                    pio::outb(ip, idx & 0x7F);
+                    pio::outb(dp, (val >> (8 * i)) as u8);
+                }
+            }
+            _ => cnt(32 + space as usize), // CMOS writes (unless allowed), SMBus, GPIO, GSBus, PCC ...
         }
     }
 
-    fn sleep_ms(&mut self, ms: u64) { crate::i915::delay_us(ms.min(100) * 1000); }
+    fn sleep_ms(&mut self, ms: u64) {
+        let cap = if SLEEP_WIN.load(Ordering::Relaxed) { 2000 } else { 100 };
+        crate::i915::delay_us(ms.min(cap) * 1000);
+    }
+    fn global_lock(&mut self, acquire: bool) { if acquire { gl_acquire() } else { gl_release() } }
     fn stall_us(&mut self, us: u64) { crate::i915::delay_us(us.min(100)); }
     fn timer(&mut self) -> u64 { now_ns() / 100 }
     fn notify(&mut self, node: usize, code: u64) { if self.notes.len() < 64 { self.notes.push((node, code)); } }
@@ -233,6 +315,9 @@ pub fn init(rsdp: u64, hhdm: u64) {
         pm1a_evt = rd32(f, 56) as u16;
         pm1b_evt = rd32(f, 60) as u16;
         let pm1a_cnt = rd32(f, 64) as u16;
+        PM1A_CNT.store(pm1a_cnt as usize, Ordering::Relaxed);
+        let facs = if f.len() >= 140 && rd64(f, 132) != 0 { rd64(f, 132) } else { rd32(f, 36) as u64 };
+        FACS_PHYS.store(facs, Ordering::Relaxed);
         gpe0 = rd32(f, 80) as u16;
         gpe0_len = f.get(92).copied().unwrap_or(0) as u16;
         flags = rd32(f, 112);
@@ -503,6 +588,7 @@ fn handle_notes(s: &mut State, h: &mut KHost, mut notes: Vec<(usize, u64)>) {
 }
 
 pub fn poll() {
+    if PAUSED.load(Ordering::Relaxed) { return; }
     let _ = with(|s, h| {
         // Fixed-feature buttons (PM1 status, write-1-to-clear).
         for blk in [s.pm1a_evt, s.pm1b_evt] {
@@ -557,4 +643,129 @@ pub fn poll() {
             }
         }
     });
+}
+
+// ---- sleep methods (lane s3aml): _TTS / _PTS / _SST / _WAK / _Sx_ ----
+
+/// Result of one sleep-method group.
+#[derive(Clone, Debug, Default)]
+pub struct SleepAml {
+    /// No method failed.
+    pub ok: bool,
+    /// `_WAK` Package{status, PSS} (sleep_wake only).
+    pub wak: Option<(u64, u64)>,
+    pub ms: u64,
+    /// Accesses to unsupported spaces that were dropped.
+    pub dropped: u32,
+}
+
+pub fn pause_poll(on: bool) { PAUSED.store(on, Ordering::Relaxed); }
+
+fn snap() -> [u32; 48] { let mut a = [0u32; 48]; for (i, c) in CNT.iter().enumerate() { a[i] = c.load(Ordering::Relaxed); } a }
+
+fn diff_summary(a: &[u32; 48], b: &[u32; 48]) -> (String, u32) {
+    let mut s = String::new();
+    let mut dropped = 0;
+    for sp in 0..16 {
+        let (r, w, d) = (b[sp] - a[sp], b[16 + sp] - a[16 + sp], b[32 + sp] - a[32 + sp]);
+        if r + w > 0 {
+            if !s.is_empty() { s.push_str(", "); }
+            s.push_str(&format!("{} r{} w{}", space_name(sp), r, w));
+        }
+        if d > 0 { dropped += d; s.push_str(&format!(" dropped {} {}", space_name(sp), d)); }
+    }
+    if s.is_empty() { s.push_str("no region access"); }
+    (s, dropped)
+}
+
+/// Evaluate `path` (absolute) with `args` if it exists. Ok(None) = absent.
+fn run_method(ns: &mut Ns, h: &mut KHost, path: &str, args: &[V]) -> Result<Option<V>, ()> {
+    let Some(n) = ns.find(path) else { return Ok(None) };
+    if !ns.is_method(n) { return Ok(None); }
+    match ns.eval(h, n, args) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => { log(&format!("[S3] aml: {} failed: {:?}\n", path, e)); Err(()) }
+    }
+}
+
+fn run_group(label: &str, steps: &[(&str, u64)], want_wak: bool) -> SleepAml {
+    let mut out = SleepAml { ok: true, ..Default::default() };
+    let t0 = now_ns();
+    TRACE_LEFT.store(200, Ordering::Relaxed);
+    SLEEP_WIN.store(true, Ordering::Relaxed);
+    let before = snap();
+    let r = with_ns_locked(|ns, h| {
+        for &(path, arg) in steps {
+            let t = now_ns();
+            match run_method(ns, h, path, &[V::Int(arg)]) {
+                Ok(None) => log(&format!("[S3] aml: {}({}) absent\n", path, arg)),
+                Ok(Some(v)) => {
+                    let mut extra = String::new();
+                    if want_wak && path == "\\_WAK" {
+                        let e = v.elements();
+                        let (st, pss) = e.as_ref().map(|e| (e.get(0).and_then(|x| x.as_int()).unwrap_or(0), e.get(1).and_then(|x| x.as_int()).unwrap_or(0)))
+                            .unwrap_or_else(|| (v.as_int().unwrap_or(0), 0));
+                        out.wak = Some((st, pss));
+                        extra = format!(" -> ({}, {}){}{}", st, pss, if st & 1 != 0 { " [wake failed: no power]" } else { "" }, if st & 2 != 0 { " [thermal]" } else { "" });
+                    }
+                    log(&format!("[S3] aml: {}({}) ok in {} ms{}\n", path, arg, (now_ns() - t) / 1_000_000, extra));
+                }
+                Err(()) => out.ok = false,
+            }
+        }
+    });
+    SLEEP_WIN.store(false, Ordering::Relaxed);
+    if r.is_none() { out.ok = false; log("[S3] aml: interpreter not loaded\n"); }
+    let (sum, dropped) = diff_summary(&before, &snap());
+    out.dropped = dropped;
+    out.ms = (now_ns() - t0) / 1_000_000;
+    log(&format!("[S3] aml: {} {} in {} ms ({}; global lock fails {})\n", label, if out.ok { "ok" } else { "FAILED" }, out.ms, sum, GL_FAILS.load(Ordering::Relaxed)));
+    out
+}
+
+fn with_ns_locked<T>(f: impl FnOnce(&mut Ns, &mut KHost) -> T) -> Option<T> { with(|s, h| f(&mut s.ns, h)) }
+
+/// `_TTS(state)`, `_PTS(state)`, `\_SI._SST(3)` (kacpid paused by the caller via [`pause_poll`]).
+pub fn sleep_prepare(state: u8) -> SleepAml {
+    let st = state as u64;
+    run_group("prepare", &[("\\_TTS", st), ("\\_PTS", st), ("\\_SI._SST", 3)], false)
+}
+
+/// `\_SI._SST(2)`, `_WAK(state)` -> (status, pss), `\_SI._SST(1)`.
+pub fn sleep_wake(state: u8) -> SleepAml {
+    let st = state as u64;
+    run_group("wake", &[("\\_SI._SST", 2), ("\\_WAK", st), ("\\_SI._SST", 1)], true)
+}
+
+/// `_TTS(state)` alone (S0 at the very end of a resume).
+pub fn tts(state: u8) { let _ = with_ns_locked(|ns, h| run_method(ns, h, "\\_TTS", &[V::Int(state as u64)])); }
+
+/// Evaluate `\_S0_` / `\_S3_` / `\_S5_` -> (SLP_TYPa, SLP_TYPb).
+pub fn sx_typ(name: &str) -> Option<(u8, u8)> {
+    let path = format!("\\{}", name);
+    with_ns_locked(|ns, h| {
+        let n = ns.find(&path)?;
+        let v = ns.eval(h, n, &[]).ok()?;
+        let e = v.elements()?;
+        let a = ns.int_of(h, e.get(0)?)? as u8;
+        let b = ns.int_of(h, e.get(1)?)? as u8;
+        Some((a, b))
+    }).flatten()
+}
+
+/// Dry run: `_S3_`, then prepare + wake back-to-back. Never writes SLP_EN.
+pub fn s3_dryrun() {
+    log("[S3] dryrun: start (no sleep state will be entered)\n");
+    for sx in ["_S0_", "_S3_", "_S5_"] {
+        match sx_typ(sx) {
+            Some((a, b)) => log(&format!("[S3] dryrun: \\{} SLP_TYP = {:#x}/{:#x}\n", sx, a, b)),
+            None => log(&format!("[S3] dryrun: \\{} absent\n", sx)),
+        }
+    }
+    pause_poll(true);
+    let p = sleep_prepare(3);
+    let w = sleep_wake(3);
+    tts(0);
+    pause_poll(false);
+    log(&format!("[S3] dryrun: done prepare_ok={} wake_ok={} wak={:?} dropped={} gl_fails={}\n", p.ok, w.ok, w.wak, p.dropped + w.dropped, GL_FAILS.load(Ordering::Relaxed)));
 }
