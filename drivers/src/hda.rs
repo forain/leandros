@@ -378,6 +378,7 @@ pub struct Hda {
     restarts: u32,
     dma_errors: u32,
     summary: String,
+    ext: capture::Ext,
 }
 
 unsafe impl Send for Hda {}
@@ -399,6 +400,7 @@ impl Hda {
             resamp: Resampler { step: 65536, frac: 0, prev: [0; 2], primed: false },
             restarts: 0, dma_errors: 0,
             summary: String::new(),
+            ext: capture::Ext::new(),
         }
     }
 
@@ -543,6 +545,7 @@ impl Hda {
         self.sd = SD_BASE + self.sd_index as usize * SD_STRIDE;
         self.program_codec_paths();
         self.build_summary();
+        self.ext_probe(statests);
         for line in self.summary.clone().lines() {
             let mut s = String::from(line);
             s.push('\n');
@@ -1223,7 +1226,7 @@ impl Hda {
 
     /// The tick-pump hook: just the position update (the hardware never
     /// stops on underrun; consumed regions are already silent).
-    pub fn top_up_silence(&mut self) { self.update(); }
+    pub fn top_up_silence(&mut self) { self.update(); self.poll_jacks(false); }
 
     #[inline]
     fn put_frame(&mut self, l: i16, r: i16) {
@@ -1446,6 +1449,7 @@ impl Hda {
         let _ = writeln!(s, "counters: played {} written {} queued {} starved {} restarts {} dma_errors {} cmd_timeouts {} intsts {:#x}",
                          self.played, self.written, self.queued_bytes(), self.underruns, self.restarts,
                          self.dma_errors, self.cmd_timeouts, self.r32(INTSTS));
+        self.ext_info(&mut s);
         s
     }
 }
@@ -1470,3 +1474,6 @@ fn codec_name(vid: u32) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+#[path = "hda_capture.rs"]
+mod capture;

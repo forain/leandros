@@ -166,10 +166,69 @@ out:
 	return rc;
 }
 
+/* Microphone capture: read /dev/pipewire (48 kHz s16le stereo) for `sec`
+ * seconds and report RMS / peak per channel. PASS = data arrived at about
+ * the real-time rate and is not digital silence. */
+static int record(double sec)
+{
+	int fd = open(DEV, O_RDONLY);
+	if (fd < 0) { printf("sndtest: record: open %s: %s\n", DEV, strerror(errno)); return 0; }
+	size_t want = (size_t)(sec * 48000) * 4, got = 0;
+	int16_t *buf = malloc(want + 4096);
+	double t0 = now_s();
+	while (got < want && now_s() - t0 < sec + 3) {
+		ssize_t n = read(fd, (char *)buf + got, want - got);
+		if (n < 0) { printf("sndtest: record: read: %s\n", strerror(errno)); break; }
+		got += (size_t)n;
+	}
+	double el = now_s() - t0;
+	close(fd);
+	size_t frames = got / 4;
+	double ss[2] = {0, 0}; int peak[2] = {0, 0}; size_t nz = 0;
+	for (size_t i = 0; i < frames; i++)
+		for (int c = 0; c < 2; c++) {
+			int v = buf[i * 2 + c];
+			ss[c] += (double)v * v;
+			if (abs(v) > peak[c]) peak[c] = abs(v);
+			if (v) nz++;
+		}
+	double rl = frames ? sqrt(ss[0] / frames) : 0, rr = frames ? sqrt(ss[1] / frames) : 0;
+	double rate = el > 0 ? frames / el : 0;
+	int ok = frames >= (size_t)(sec * 48000 * 0.9) && (peak[0] > 0 || peak[1] > 0);
+	printf("sndtest: record %.1f s: %zu frames in %.2f s (%.0f fps) rms L %.1f R %.1f (%.1f dBFS) peak L %d R %d nonzero %zu -> %s\n",
+	       sec, frames, el, rate, rl, rr, 20 * log10(((rl > rr ? rl : rr) + 1e-9) / 32768.0), peak[0], peak[1], nz,
+	       ok ? "PASS" : "FAIL");
+	free(buf);
+	return ok;
+}
+
+/* Jack and display-codec state lines from SND_GET_INFO. */
+static void jack_report(void)
+{
+	const char *t = get_info();
+	const char *keys[] = {"capture:", "jack:", "pin ", "[HDA] display codec", "[HDA]   pin", "[HDA]   conv", "[HDA] capture", NULL};
+	for (const char *l = t; l && *l;) {
+		const char *e = strchr(l, '\n');
+		size_t n = e ? (size_t)(e - l) : strlen(l);
+		for (int k = 0; keys[k]; k++)
+			if (!strncmp(l, keys[k], strlen(keys[k]))) { printf("sndtest: %.*s\n", (int)n, l); break; }
+		l = e ? e + 1 : NULL;
+	}
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	const char *cmd = argc > 1 ? argv[1] : "all";
+	if (!strcmp(cmd, "record")) {
+		int ok = record(argc > 2 ? atof(argv[2]) : 3);
+		jack_report();
+		return ok ? 0 : 1;
+	}
+	if (!strcmp(cmd, "jack")) {
+		jack_report();
+		return 0;
+	}
 	if (!strcmp(cmd, "info")) {
 		fputs(get_info(), stdout);
 		return 0;
