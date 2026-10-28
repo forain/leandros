@@ -38,8 +38,6 @@ fn opt<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
 }
 
 const FW_DIR: &str = "/lib/firmware/intel/";
-/// How long the thread waits for a USB Bluetooth function to show up.
-const PROBE_WAIT_MS: u64 = 20_000;
 
 fn load_fw(name: &str) -> Option<Vec<u8>> {
     let t0 = now_ms();
@@ -109,18 +107,19 @@ impl btintel::Link for Link<'_> {
 pub fn start(cmdline: &str, on_ready: fn(port: u32)) {
     if opt(cmdline, "bt") == Some("0") { return; }
     let fw = opt(cmdline, "btusb.fw") != Some("0");
-    if sched::kthread::spawn("btusb", move || run(fw, on_ready)).is_none() {
+    // Enumeration at boot is synchronous (usb_hcd::init ran first): no
+    // function now = no thread (a returning kthread upsets ps, see run()).
+    let Some(f) = btusb::take() else { return };
+    if sched::kthread::spawn("btusb", move || { run(f, fw, on_ready); park() }).is_none() {
         log("thread spawn failed");
     }
 }
 
-fn run(fw: bool, on_ready: fn(port: u32)) {
-    let t0 = now_ms();
-    let f = loop {
-        if let Some(f) = btusb::take() { break f; }
-        if now_ms() - t0 > PROBE_WAIT_MS { return; }
-        sched::kthread::msleep(200);
-    };
+/// A failed set-up parks the thread instead of returning: an exited kthread
+/// leaves a /proc entry that breaks ps (pstest "ps -ax" / "ps x" cases).
+fn park() -> ! { loop { sched::kthread::msleep(3_600_000); } }
+
+fn run(f: usb::xhci::isoch::UsbFunction, fw: bool, on_ready: fn(port: u32)) {
     let (vid, pid) = usb::devices().iter().find(|d| d.slot == f.slot && d.class == 0xE0)
         .map_or((0, 0), |d| (d.vendor, d.product));
     log(&format!("controller {:04x}:{:04x} on slot {}", vid, pid, f.slot));
