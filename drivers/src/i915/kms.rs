@@ -652,6 +652,7 @@ fn native_setup(m: &Mmio, gw: u32, gh: u32) -> Option<(u32, u32)> {
     // else transcoder A.
     let edp = m.r(reg::TRANS_DDI_FUNC_CTL_EDP);
     let edp_on = m.r(reg::TRANSCONF_EDP) >> 31 != 0 && edp >> 31 != 0 && matches!((edp >> 12) & 7, 0 | 4);
+    crate::gpu_kms::set_internal_panel(edp_on);
     let (tbase, ddi, name) = if edp_on {
         (reg::TRANS_HTOTAL_EDP, edp, "eDP")
     } else if m.r(reg::TRANSCONF_A) >> 31 != 0 {
