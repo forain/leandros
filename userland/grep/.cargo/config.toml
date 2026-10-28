@@ -1,0 +1,6 @@
+# Override the repo root's `.cargo/config.toml`, which sets [build] target =
+# "aarch64-unknown-kernel" (a custom bare-metal spec) for the whole tree.
+# This crate is std/host+musl userland, not kernel code, so pin the default
+# back to the host triple; build.sh overrides --target explicitly per arch.
+[build]
+target = "aarch64-apple-darwin"

@@ -945,6 +945,17 @@ build_disktester() {
 # checkout is a sibling repo pinned at release tag 15.2.0 (e89fff8) and stays
 # UNMODIFIED, built like disktester: same pinned nightly, same musl linker
 # wrapper, skipped with a warning when the checkout is absent.
+# grep/egrep/fgrep: userland/grep, a POSIX grep front end that runs /bin/rg.
+build_grep() {
+    local arch="$1"
+    echo "🔎 Building $arch grep..."
+    if [[ ! -x "$ROOT_DIR/userland/grep/build.sh" ]]; then
+        echo "⚠️  userland/grep not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/grep/build.sh" "$arch"
+}
+
 build_ripgrep() {
     local arch="$1"
     echo "🔎 Building $arch ripgrep..."
@@ -1114,6 +1125,7 @@ for arch in "${ARCHS[@]}"; do
     build_git "$arch"
     build_disktester "$arch"
     build_ripgrep "$arch"
+    build_grep "$arch"
     stage_dbus_session "$arch"
     create_initrd "$arch"
     build_kernel "$arch"
