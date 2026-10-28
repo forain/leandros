@@ -271,9 +271,11 @@ fn quiesce_phase1(cfg: &RebootCfg, what: &str) -> alloc::vec::Vec<drivers::pci::
 /// Phase 2, interrupts off, after the last write to any disk: xHCI halt
 /// (+ reset, + port power off), then bus mastering off. Serial only — the
 /// stick is gone.
-fn quiesce_phase2(cfg: &RebootCfg, bm: &[drivers::pci::PciFunction]) {
-    if !cfg.quiesce { return; }
+fn quiesce_phase2(cfg: &RebootCfg, bm: &[drivers::pci::PciFunction]) -> usize {
+    if !cfg.quiesce { return 0; }
+    let mut halted = 0;
     for line in drivers::usb_hcd::quiesce_all(cfg.xhci_hcrst, cfg.usb_vbus_off) {
+        if line.contains(" halted in ") { halted += 1; }
         serial_print_str("[REBOOT] ");
         serial_print_str(&line);
         serial_print_str("\n");
@@ -286,6 +288,7 @@ fn quiesce_phase2(cfg: &RebootCfg, bm: &[drivers::pci::PciFunction]) {
         }
         serial_print_str("[REBOOT] bus mastering off on the audio, network and display functions\n");
     }
+    halted
 }
 
 /// Last step of every path: no more interrupts on this CPU, every queued
@@ -394,10 +397,40 @@ fn kernel_kexec() -> isize {
     crate::kexec::devreset::plan(crate::kexec::handover_fb());
     serial_print_str("kexec_core: Starting new kernel\n");
     machine_prepare();
-    quiesce_phase2(&cfg, &bm);
+    let xhci = quiesce_phase2(&cfg, &bm);
     if cfg.quiesce { kexec_hooks(); }
+    // Every registered DMA engine, even with reboot.quiesce=0: a bus master
+    // left running writes into pages the next kernel calls free (Pi 5 RP1
+    // GEM, 2026-10-27). Then config-space bus mastering off everywhere, and
+    // last the bus resets (PCIe PERST# + bridge), after which the RC is gone.
+    let (mut ok, mut bad) = drivers::dma_shutdown::run(drivers::dma_shutdown::Stage::Device);
     quiesce_all_pci();
+    let (bus_ok, bus_bad) = drivers::dma_shutdown::run(drivers::dma_shutdown::Stage::Bus);
+    ok.extend(bus_ok);
+    bad.extend(bus_bad);
+    serial_print_str(&kexec_quiesced_line(&ok, xhci, &bad));
     crate::kexec::exec_jump()
+}
+
+/// `[kexec] quiesced: gem xhci0 xhci1 dma40 pcie-perst` (+ `FAILED: ...`):
+/// one line naming every bus master stopped before the jump.
+fn kexec_quiesced_line(ok: &[&str], xhci: usize, bad: &[&str]) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let mut l = alloc::string::String::from("[kexec] quiesced:");
+    let (dev, bus): (alloc::vec::Vec<&str>, alloc::vec::Vec<&str>) =
+        ok.iter().partition(|n| **n != "pcie-perst");
+    let mut it = dev.iter();
+    if let Some(first) = it.next() { let _ = write!(l, " {}", first); }
+    for i in 0..xhci { let _ = write!(l, " xhci{}", i); }
+    for n in it { let _ = write!(l, " {}", n); }
+    for n in bus { let _ = write!(l, " {}", n); }
+    if ok.is_empty() && xhci == 0 { l.push_str(" (no bus masters registered)"); }
+    if !bad.is_empty() {
+        l.push_str(" FAILED:");
+        for n in bad { let _ = write!(l, " {}", n); }
+    }
+    l.push('\n');
+    l
 }
 
 /// kexec only, right after the filesystems are synced and before phase 1
