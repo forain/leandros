@@ -34,6 +34,8 @@ fn i2c_task() -> ! {
 
 static S3_DRYRUN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+static S3_WAK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn task() -> ! {
     let mut registered = false;
     let mut tries = 0u32;
@@ -41,7 +43,7 @@ fn task() -> ! {
     let mut dryrun_at = if S3_DRYRUN.load(core::sync::atomic::Ordering::Relaxed) { Some(next + 8_000_000_000) } else { None };
     loop {
         if let Some(t) = dryrun_at {
-            if sched::monotonic_ns() >= t { dryrun_at = None; drivers::acpi_power::s3_dryrun(); }
+            if sched::monotonic_ns() >= t { dryrun_at = None; drivers::acpi_power::s3_dryrun(S3_DRYRUN.load(core::sync::atomic::Ordering::Relaxed) && S3_WAK.load(core::sync::atomic::Ordering::Relaxed)); }
         }
         if !registered && tries < 50 {
             registered = drivers::power_sysfs::register_input();
@@ -59,7 +61,8 @@ pub fn init(rsdp: u64, hhdm: u64, cmdline: &str) {
     if has("acpi_power=0") { return; }
     drivers::power_sysfs::set_fake(has("acpi_power.fake=1"));
     drivers::acpi_power::init(rsdp, hhdm);
-    S3_DRYRUN.store(has("pm.s3_dryrun=1"), core::sync::atomic::Ordering::Relaxed);
+    S3_DRYRUN.store(has("pm.s3_dryrun=1") || has("pm.s3_dryrun=2"), core::sync::atomic::Ordering::Relaxed);
+    S3_WAK.store(has("pm.s3_dryrun=2"), core::sync::atomic::Ordering::Relaxed);
     vfs_server::sysclass::set_sysclass_ops(&OPS);
     vfs_server::sysclass::set_acpi_tables(|idx, out| {
         let (name, t) = drivers::acpi_power::raw_table(idx)?;

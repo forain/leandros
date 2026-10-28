@@ -754,7 +754,7 @@ pub fn sx_typ(name: &str) -> Option<(u8, u8)> {
 }
 
 /// Dry run: `_S3_`, then prepare + wake back-to-back. Never writes SLP_EN.
-pub fn s3_dryrun() {
+pub fn s3_dryrun(with_wak: bool) {
     log("[S3] dryrun: start (no sleep state will be entered)\n");
     for sx in ["_S0_", "_S3_", "_S5_"] {
         match sx_typ(sx) {
@@ -764,7 +764,7 @@ pub fn s3_dryrun() {
     }
     pause_poll(true);
     let p = sleep_prepare(3);
-    let w = sleep_wake(3);
+    let w = if with_wak { sleep_wake(3) } else { log("[S3] dryrun: _WAK skipped (pm.s3_dryrun=2 runs it; on the HP 840 G5 it ends in SMI 0xEA91 and resets the machine when no S3 was entered)\n"); SleepAml { ok: true, ..Default::default() } };
     tts(0);
     pause_poll(false);
     log(&format!("[S3] dryrun: done prepare_ok={} wake_ok={} wak={:?} dropped={} gl_fails={}\n", p.ok, w.ok, w.wak, p.dropped + w.dropped, GL_FAILS.load(Ordering::Relaxed)));

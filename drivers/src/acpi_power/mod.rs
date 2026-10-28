@@ -123,5 +123,5 @@ pub fn tts(state: u8) { power::tts(state) }
 pub fn sx_typ(name: &str) -> Option<(u8, u8)> { power::sx_typ(name) }
 /// Stop/resume kacpid's EC-query and GPE evaluation.
 pub fn pause_poll(on: bool) { power::pause_poll(on) }
-/// Diagnostic: evaluate `_PTS(3)` then `_WAK(3)` without ever entering a sleep state.
-pub fn s3_dryrun() { power::s3_dryrun() }
+/// Diagnostic: evaluate `_PTS(3)` (and `_WAK(3)` when `with_wak`) without ever entering a sleep state.
+pub fn s3_dryrun(with_wak: bool) { power::s3_dryrun(with_wak) }
