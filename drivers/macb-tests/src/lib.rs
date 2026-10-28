@@ -519,4 +519,29 @@ mod tests {
             assert_eq!(x.addr_hi, 0x10);
         }
     }
+
+    #[test]
+    fn ring_slot_maps_queue_pointer_to_index() {
+        assert_eq!(ring_slot(0x103f020, 0x103f000, 256), Some(2));
+        assert_eq!(ring_slot(0x103f000, 0x103f000, 256), Some(0));
+        assert_eq!(ring_slot(0x103f000 + 256 * 16, 0x103f000, 256), None);
+        assert_eq!(ring_slot(0x103f008, 0x103f000, 256), None);
+        assert_eq!(ring_slot(0x103e000, 0x103f000, 256), None);
+    }
+
+    #[test]
+    fn tx_stall_fires_only_on_an_idle_queue_that_does_not_move() {
+        // The Pi boot: TBQP parked on slot 2, frames queued, TGO clear.
+        let mut st = TxStall::default();
+        let fired: Vec<bool> = (0..TX_STALL_POLLS + 1).map(|_| st.tick(Some(2), 2, 4, false)).collect();
+        assert_eq!(fired.iter().filter(|&&f| f).count(), 1);
+        assert!(*fired.last().unwrap());
+        // Progress (tail or TBQP moving) restarts the count.
+        let mut st = TxStall::default();
+        for k in 0..20 { assert!(!st.tick(Some(k), k, 3, false)); }
+        // Busy transmitter or nothing in flight never counts as a stall.
+        let mut st = TxStall::default();
+        for _ in 0..20 { assert!(!st.tick(Some(2), 2, 4, true)); }
+        for _ in 0..20 { assert!(!st.tick(Some(2), 2, 0, false)); }
+    }
 }

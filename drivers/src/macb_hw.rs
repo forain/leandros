@@ -277,6 +277,37 @@ pub enum RxEvent {
     Fragment { idx: usize },
 }
 
+/// Slot index a queue pointer register (TBQP/RBQP low word) points at, or
+/// None when it lies outside the `n`-descriptor ring at `base_lo`.
+pub fn ring_slot(qp_lo: u32, base_lo: u32, n: usize) -> Option<usize> {
+    let off = qp_lo.wrapping_sub(base_lo) as usize;
+    if off % DESC_SIZE != 0 || off / DESC_SIZE >= n { None } else { Some(off / DESC_SIZE) }
+}
+
+/// Polls (1 s apart) that may pass with frames queued, the transmitter idle
+/// (TSR.TGO clear) and TBQP not moving before the driver rewinds the queue.
+pub const TX_STALL_POLLS: u32 = 3;
+
+/// TX stall detector: frames are in flight, TSTART was rung, yet the
+/// controller sits idle on the same descriptor. `tick` is called once per
+/// driver-thread poll and answers true when the queue must be rewound.
+#[derive(Default, Debug)]
+pub struct TxStall {
+    last: Option<(usize, usize)>,
+    polls: u32,
+}
+impl TxStall {
+    pub fn tick(&mut self, hw_slot: Option<usize>, tail: usize, in_flight: usize, tgo: bool) -> bool {
+        if in_flight == 0 || tgo {
+            *self = TxStall::default();
+            return false;
+        }
+        let key = (hw_slot.unwrap_or(usize::MAX), tail);
+        if self.last == Some(key) { self.polls += 1; } else { self.last = Some(key); self.polls = 0; }
+        if self.polls >= TX_STALL_POLLS { *self = TxStall::default(); true } else { false }
+    }
+}
+
 /// RX ring: word 0 USED set by the controller = frame for software; the
 /// driver clears it to give the slot back. The last slot carries WRAP.
 pub struct RxRing {
@@ -303,6 +334,8 @@ impl RxRing {
     }
     pub fn len(&self) -> usize { self.n }
     pub fn head(&self) -> usize { self.head }
+    /// Descriptor `i` as the CPU sees it (diagnostics).
+    pub fn desc(&self, i: usize) -> Desc { unsafe { rd(self.descs, i % self.n) } }
     /// Look at the next slot in order (does not consume it).
     pub fn next(&self) -> RxEvent {
         let d = unsafe { rd(self.descs, self.head) };
@@ -358,6 +391,7 @@ impl TxRing {
     pub fn len(&self) -> usize { self.n }
     pub fn in_flight(&self) -> usize { (self.head + self.n - self.tail) % self.n }
     pub fn tail(&self) -> usize { self.tail }
+    pub fn head(&self) -> usize { self.head }
     /// Next free slot; one slot always stays idle so head never catches tail.
     pub fn slot(&self) -> Option<usize> {
         if self.in_flight() >= self.n - 1 { None } else { Some(self.head) }
