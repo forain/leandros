@@ -57,12 +57,13 @@ pub fn five_usable(channel: u8, signal_dbm: i16, best_24_dbm: Option<i16>) -> bo
 /// addition: a usable 5 GHz BSS ([`five_usable`]: channel > 14, at least
 /// `PREFER_5GHZ_MIN_DBM`, and not 7 dB of SNR behind the strongest 2.4 GHz
 /// candidate `best_24_dbm`) beats 2.4 GHz ones of the same priority unless
+/// `clean` is false for a BSS that rejected us this boot (it loses to any clean BSS of the same SSID).
 /// a network was connected this boot (`boot_ms`: when; 0 = not this boot,
 /// the most recent wins). `stored_s` is the profile's stored timestamp. On the laptop
 /// 'Anvara 5G' at -75 dBm gave 5x the throughput of 'Anvara' (2.4 GHz) at
 /// -73 dBm (lane wifi2), as the 2.4 GHz channels are shared by many BSSs.
-pub fn auto_key(priority: i32, boot_ms: u64, stored_s: u64, legacy: bool, channel: u8, signal_dbm: i16,
-                best_24_dbm: Option<i16>) -> (i64, u64, bool, u64, bool, i16) {
+pub fn auto_key(priority: i32, boot_ms: u64, clean: bool, stored_s: u64, legacy: bool, channel: u8, signal_dbm: i16,
+                best_24_dbm: Option<i16>) -> (i64, u64, bool, bool, u64, bool, i16) {
     let five = PREFER_5GHZ.load(core::sync::atomic::Ordering::Relaxed) && five_usable(channel, signal_dbm, best_24_dbm);
-    (priority as i64, boot_ms, five, stored_s, legacy, signal_dbm)
+    (priority as i64, boot_ms, clean, five, stored_s, legacy, signal_dbm)
 }
