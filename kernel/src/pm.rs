@@ -25,6 +25,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// instead of only masking their interrupts. Off by default: on the laptop
 /// the root file system is on a USB stick.
 pub const PM_XHCI_HALT: u32 = 1;
+/// Save PCI config space of every function after the devices quiesced,
+/// clobber scratch-safe registers, restore before they resume and verify
+/// every saved dword (lane s3pci). Inert without this flag.
+pub const PM_PCI: u32 = 2;
+/// With `PM_PCI`: restore unconditionally (COMMAND=0 pulse, all registers)
+/// and also clobber MSI data / MSI-X entry 0.
+pub const PM_PCI_DEEP: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -67,6 +74,28 @@ fn blk_resume(_: u32) -> Result<String, String> { drivers::blkdev::pm_thaw() }
 fn xhci_suspend(f: u32) -> Result<String, String> { drivers::usb_hcd::pm_suspend(f & PM_XHCI_HALT != 0) }
 fn xhci_resume(_: u32) -> Result<String, String> { drivers::usb_hcd::pm_resume() }
 
+static PCI_SAVED: spin::Mutex<Option<alloc::vec::Vec<drivers::pci_pm::FnState>>> = spin::Mutex::new(None);
+
+fn pci_suspend(f: u32) -> Result<String, String> {
+    if f & PM_PCI == 0 { return Ok(String::from("off")); }
+    let st = drivers::pci_pm::save_all();
+    let stuck = drivers::pci_pm::clobber(&st, f & PM_PCI_DEEP != 0);
+    let r = alloc::format!("saved {} function(s), {} MSI-X dword-entries, clobbered {} function(s)",
+        drivers::pci_pm::count(&st), drivers::pci_pm::msix_entries(&st) , stuck);
+    *PCI_SAVED.lock() = Some(st);
+    Ok(r)
+}
+
+fn pci_resume(f: u32) -> Result<String, String> {
+    let Some(st) = PCI_SAVED.lock().take() else { return Ok(String::from("off")) };
+    let dead = drivers::pci_pm::restore_all(&st, f & PM_PCI_DEEP != 0, |ms| sched::kthread::msleep(ms as _));
+    let (n, bad) = drivers::pci_pm::verify(&st);
+    for b in bad.iter().take(40) { crate::serial_print_str("[PM] pci mismatch: "); crate::serial_print_str(b); crate::serial_print_str("\n"); }
+    if !dead.is_empty() { return Err(alloc::format!("{} function(s) not responding after restore", dead.len())); }
+    if !bad.is_empty() { return Err(alloc::format!("{} of {} dwords mismatch", bad.len(), n)); }
+    Ok(alloc::format!("restored, {} dwords verified", n))
+}
+
 /// Suspend order; resume runs it backwards.
 static DEVS: &[PmDev] = &[
     #[cfg(target_arch = "x86_64")]
@@ -77,6 +106,8 @@ static DEVS: &[PmDev] = &[
     PmDev { name: "e1000e", suspend: e1000e_suspend, resume: e1000e_resume },
     PmDev { name: "block", suspend: blk_suspend, resume: blk_resume },
     PmDev { name: "xhci", suspend: xhci_suspend, resume: xhci_resume },
+    // Last: runs after every driver quiesced, restores before any resumes.
+    PmDev { name: "pci", suspend: pci_suspend, resume: pci_resume },
 ];
 
 static BUSY: AtomicBool = AtomicBool::new(false);
@@ -134,7 +165,7 @@ pub fn sys_pm_test(arg: usize) -> isize {
     let mut req = PmTestReq { flags: 0, hold_ms: 0, buf: 0, buf_len: 0 };
     let n = core::mem::size_of::<PmTestReq>();
     if unsafe { sched::uaccess::copy_from_user(&mut req as *mut _ as *mut u8, arg, n) } != 0 { return -14; }
-    if req.hold_ms > 60_000 || req.flags & !PM_XHCI_HALT != 0 { return -22; }
+    if req.hold_ms > 60_000 || req.flags & !(PM_XHCI_HALT | PM_PCI | PM_PCI_DEEP) != 0 { return -22; }
     let (ok, rep) = freeze_cycle(req.flags, req.hold_ms);
     if req.buf != 0 && req.buf_len > 0 {
         let mut v: Vec<u8> = rep.into_bytes();
