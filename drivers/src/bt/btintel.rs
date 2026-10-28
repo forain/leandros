@@ -45,6 +45,8 @@ pub trait Link {
     fn now_ms(&mut self) -> u64;
     /// The controller left the bootloader: bulk IN carries ACL from now on.
     fn operational(&mut self) {}
+    /// The controller was reset back into the bootloader: events arrive on bulk IN again.
+    fn bootloader(&mut self) {}
     fn log(&mut self, _msg: &str) {}
 }
 
@@ -232,6 +234,77 @@ impl<'a, L: Link> Ctx<'a, L> {
         Version::parse(&r).ok_or(Error::Status(OP_READ_VERSION, r.first().copied().unwrap_or(0xff)))
     }
 
+    fn check_send_result(&mut self) -> Result<(), Error> {
+        if let Some((res, st)) = self.send_result.take() {
+            if res != 0 || st != 0 {
+                return Err(Error::Firmware(format!("secure send rejected: result {:#04x} status {:#04x}", res, st)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Intel Reset back into the bootloader (Linux btintel_reset_to_bootloader).
+    fn reset_to_bootloader(&mut self) {
+        let mut pkt = Vec::with_capacity(11);
+        pkt.extend_from_slice(&OP_RESET.to_le_bytes());
+        pkt.push(8);
+        pkt.extend_from_slice(&[1, 1, 1, 0, 0, 0, 0, 0]);
+        let _ = self.l.send_cmd(&pkt, false);
+        self.l.bootloader();
+        let _ = self.wait_event(150, |_, _| None);
+        self.send_result = None;
+        self.booted = false;
+    }
+
+    /// Streams the fragments, waits for the bootloader's verdict, then boots
+    /// the image and checks the controller is operational.
+    fn download(&mut self, frags: &[(u8, &[u8])], boot: u32, rep: &mut Report) -> Result<(), Error> {
+        self.send_result = None;
+        let t0 = self.l.now_ms();
+        rep.fragments = 0;
+        for (ty, d) in frags {
+            rep.fragments += self.secure_send(*ty, d)?;
+        }
+        // The bootloader verifies the image, then reports (ff/06).
+        if self.send_result.is_none() {
+            let _ = self.wait_event(5000, |s, _| s.send_result.map(|_| Ok(Vec::new())));
+        }
+        self.check_send_result_final()?;
+        rep.download_ms = self.l.now_ms() - t0;
+        self.l.log(&format!("{}: {} bytes in {} fragments, {} ms, boot address {:#010x}",
+                            rep.fw, rep.fw_bytes, rep.fragments, rep.download_ms, boot));
+        // Intel Reset: reset_type 0, patch_enable 1, ddc_reload 0, boot_option 1, boot_param.
+        let mut p = [0u8; 8];
+        p[1] = 1;
+        p[3] = 1;
+        p[4..8].copy_from_slice(&boot.to_le_bytes());
+        let mut pkt = Vec::with_capacity(11);
+        pkt.extend_from_slice(&OP_RESET.to_le_bytes());
+        pkt.push(8);
+        pkt.extend_from_slice(&p);
+        if !self.l.send_cmd(&pkt, false) { return Err(Error::Send(OP_RESET)); }
+        if !self.booted {
+            let _ = self.wait_event(5000, |s, _| if s.booted { Some(Ok(Vec::new())) } else { None });
+        }
+        if !self.booted { return Err(Error::Firmware(String::from("no boot-up event after Intel Reset"))); }
+        self.l.operational();
+        let o = self.version()?;
+        self.l.log(&format!("booted: {}", o.describe()));
+        if o.fw_variant != FW_OPERATIONAL {
+            return Err(Error::Firmware(format!("still not operational after boot (fw variant {:#04x})", o.fw_variant)));
+        }
+        rep.oper = o;
+        Ok(())
+    }
+
+    fn check_send_result_final(&mut self) -> Result<(), Error> {
+        match self.send_result.take() {
+            None => Err(Error::Firmware(String::from("no secure send result after the download"))),
+            Some((0, 0)) => Ok(()),
+            Some((r, s)) => Err(Error::Firmware(format!("firmware rejected: result {:#04x} status {:#04x}", r, s))),
+        }
+    }
+
     fn secure_send(&mut self, ty: u8, mut data: &[u8]) -> Result<usize, Error> {
         let mut n = 0;
         let mut p = [0u8; FRAG_MAX + 1];
@@ -239,12 +312,11 @@ impl<'a, L: Link> Ctx<'a, L> {
             let k = data.len().min(FRAG_MAX);
             p[0] = ty;
             p[1..1 + k].copy_from_slice(&data[..k]);
+            // The result (ff/06) of fragment N arrives after its Command
+            // Complete: check and clear the previous one before sending the
+            // next; the last one is left for the caller's final wait.
+            self.check_send_result()?;
             self.cmd(OP_SECURE_SEND, &p[..1 + k], true, 5000)?;
-            if let Some((res, st)) = self.send_result {
-                if res != 0 || st != 0 {
-                    return Err(Error::Firmware(format!("secure send rejected: result {:#04x} status {:#04x}", res, st)));
-                }
-            }
             data = &data[k..];
             n += 1;
         }
@@ -290,55 +362,37 @@ pub fn setup<L: Link>(l: &mut L, load: &mut dyn FnMut(&str) -> Option<Vec<u8>>) 
         rep.fw = name;
         rep.fw_bytes = fw.len();
         rep.boot_addr = boot;
-        let t0 = c.l.now_ms();
-        for (ty, d) in &frags {
-            rep.fragments += c.secure_send(*ty, d)?;
+        // One retry after a reset back into the bootloader; a failure
+        // leaves the controller in the bootloader (clean for kexec/retry).
+        if let Err(e) = c.download(&frags, boot, &mut rep) {
+            c.l.log(&format!("download failed ({}), resetting to the bootloader and retrying once", e.describe()));
+            c.reset_to_bootloader();
+            if let Err(e2) = c.download(&frags, boot, &mut rep) {
+                c.reset_to_bootloader();
+                return Err(e2);
+            }
         }
-        // The bootloader verifies the image, then reports (ff/06).
-        if c.send_result.is_none() {
-            let _ = c.wait_event(5000, |s, _| s.send_result.map(|_| Ok(Vec::new())));
-        }
-        match c.send_result {
-            None => return Err(Error::Firmware(String::from("no secure send result after the download"))),
-            Some((0, 0)) => {}
-            Some((r, s)) => return Err(Error::Firmware(format!("firmware rejected: result {:#04x} status {:#04x}", r, s))),
-        }
-        rep.download_ms = c.l.now_ms() - t0;
-        c.l.log(&format!("{}: {} bytes in {} fragments, {} ms, boot address {:#010x}",
-                         rep.fw, rep.fw_bytes, rep.fragments, rep.download_ms, boot));
-        // Intel Reset: reset_type 0, patch_enable 1, ddc_reload 0, boot_option 1, boot_param.
-        let mut p = [0u8; 8];
-        p[1] = 1;
-        p[3] = 1;
-        p[4..8].copy_from_slice(&boot.to_le_bytes());
-        let mut pkt = Vec::with_capacity(11);
-        pkt.extend_from_slice(&OP_RESET.to_le_bytes());
-        pkt.push(8);
-        pkt.extend_from_slice(&p);
-        if !c.l.send_cmd(&pkt, false) { return Err(Error::Send(OP_RESET)); }
-        if !c.booted {
-            let _ = c.wait_event(5000, |s, _| if s.booted { Some(Ok(Vec::new())) } else { None });
-        }
-        if !c.booted { return Err(Error::Firmware(String::from("no boot-up event after Intel Reset"))); }
-        c.l.operational();
-        let o = c.version()?;
-        c.l.log(&format!("booted: {}", o.describe()));
-        if o.fw_variant != FW_OPERATIONAL {
-            return Err(Error::Firmware(format!("still not operational after boot (fw variant {:#04x})", o.fw_variant)));
-        }
-        rep.oper = o;
     }
     let ddc_name = format!("{}.ddc", base);
     match load(&ddc_name) {
         None => c.l.log(&format!("intel/{} missing, no DDC applied", ddc_name)),
         Some(ddc) => {
-            let recs = ddc_records(&ddc).map_err(|e| Error::Firmware(format!("{}: {}", ddc_name, e)))?;
-            for r in &recs {
-                let ret = c.cmd(OP_WRITE_DDC, r, false, 2000)?;
-                if ret.first().copied().unwrap_or(0) != 0 { return Err(Error::Status(OP_WRITE_DDC, ret[0])); }
+            // The controller is operational: a DDC problem only warns.
+            let mut applied = 0;
+            match ddc_records(&ddc) {
+                Err(e) => c.l.log(&format!("{}: {} (DDC skipped)", ddc_name, e)),
+                Ok(recs) => {
+                    for r in &recs {
+                        match c.cmd(OP_WRITE_DDC, r, false, 2000) {
+                            Ok(ret) if ret.first().copied().unwrap_or(0) == 0 => applied += 1,
+                            Ok(ret) => { c.l.log(&format!("{}: DDC status {:#04x}, stopping", ddc_name, ret[0])); break; }
+                            Err(e) => { c.l.log(&format!("{}: DDC {}, stopping", ddc_name, e.describe())); break; }
+                        }
+                    }
+                    rep.ddc_records = applied;
+                    c.l.log(&format!("{}: {}/{} records applied", ddc_name, applied, recs.len()));
+                }
             }
-            rep.ddc_records = recs.len();
-            c.l.log(&format!("{}: {} records applied", ddc_name, recs.len()));
         }
     }
     if let Err(e) = c.cmd(OP_EVENT_MASK, &[0x87, 0, 0, 0, 0, 0, 0, 0], false, 2000) {

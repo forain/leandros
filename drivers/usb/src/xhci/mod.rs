@@ -677,12 +677,27 @@ fn ep_cmd(ty: u32, slot: u8, dci: usize) -> Trb {
 fn recover_ep(hc: &Hc, slot: u8, dci: usize) -> Result<(), UsbErr> {
     let r = recover_ep_inner(hc, slot, dci);
     if r.is_err() {
-        let mut x = hc.lock();
-        if !x.dead && x.slot(slot).is_some() {
-            x.die("endpoint recovery failed");
-        }
+        quarantine_slot(hc, slot, "endpoint recovery failed");
     }
     r
+}
+
+/// A slot whose endpoint cannot be recovered is disabled (the controller
+/// then stops all DMA for it) instead of halting the whole controller the
+/// root disk may sit on. Only if Disable Slot itself fails does the
+/// controller die, so the endpoint's buffers can never be written behind
+/// our back.
+pub(crate) fn quarantine_slot(hc: &Hc, slot: u8, why: &str) {
+    {
+        let x = hc.lock();
+        if x.dead || x.slot(slot).is_none() { return; }
+        usb_log!("[XHCI] bus {}: slot {}: {}, disabling the slot\n", x.bus, slot, why);
+    }
+    disable_slot(hc, slot);
+    let mut x = hc.lock();
+    if !x.dead && x.slot(slot).is_some() {
+        x.die("slot would not disable after endpoint failure");
+    }
 }
 
 fn recover_ep_inner(hc: &Hc, slot: u8, dci: usize) -> Result<(), UsbErr> {
