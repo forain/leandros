@@ -49,6 +49,7 @@ extern crate mm;
 /// `/sys/class/block` tree. See the module docs for why it lives here and why
 /// sysfs is generated on demand rather than stored.
 pub mod block;
+pub mod sysclass;
 
 /// Open file descriptions (see the module docs): what epoll keys by.
 pub mod ofd;
@@ -4807,6 +4808,8 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
        // volume onto "/". The rest of /sys is staged on disk and falls
        // through to the normal mount lookup below.
        || block::is_sysfs_path(path)
+       // Hook-backed power_supply/backlight classes, only while they have devices.
+       || sysclass::is_path(path)
        // A GPU backend's PCI identity for the DRM nodes — only the attribute
        // files it answers, only while it is registered (`drm_sysfs_attr`).
        || is_drm_sysfs_override(path)
@@ -6390,6 +6393,26 @@ fn gen_drm_sysfs(path: &[u8]) -> Option<VnodeKind> {
     gen_sysfs_bytes(&buf[..len.min(TMP_BUF_SIZE)])
 }
 
+/// Writable snapshot of a hook-backed sysfs attribute; the fake path carries
+/// the real one so `handle_write` can route the bytes to the hook.
+const SYSCLASS_W: &[u8] = b"/tmp/.syscw";
+
+fn gen_sysclass_writable(path: &[u8]) -> Option<VnodeKind> {
+    let mut data = [0u8; 64];
+    let n = sysclass::attr(path, &mut data).unwrap_or(0).min(64);
+    let mut fake = [0u8; 96];
+    if SYSCLASS_W.len() + path.len() > fake.len() { return None; }
+    fake[..SYSCLASS_W.len()].copy_from_slice(SYSCLASS_W);
+    fake[SYSCLASS_W.len()..SYSCLASS_W.len() + path.len()].copy_from_slice(path);
+    let fl = SYSCLASS_W.len() + path.len();
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, &fake[..fl]);
+    if !tmp_fill_kernel(&mut tmp, idx, &data[..n]) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
+
 fn gen_sysfs(path: &[u8]) -> Option<VnodeKind> {
     let mut buf = [0u8; TMP_BUF_SIZE];
     let len = block::sysfs_attr(path, &mut buf)?;
@@ -7461,6 +7484,23 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             match gen_drm_sysfs(lookup_path) {
                 Some(v) => v,
                 None => return err_reply(-2),
+            }
+        } else if sysclass::is_path(lookup_path) {
+            if let Some((dev, level)) = sysclass::dir(lookup_path) {
+                if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
+                VnodeKind::SysBlock { dev, level, pos: 0 }
+            } else if flags & (O_WRONLY | O_RDWR) != 0 {
+                if sched::euid_of(pid) != 0 || !sysclass::is_writable(lookup_path) { return err_reply(-13); }
+                match gen_sysclass_writable(lookup_path) {
+                    Some(v) => v,
+                    None => return err_reply(-2),
+                }
+            } else {
+                let mut buf = [0u8; TMP_BUF_SIZE];
+                match sysclass::attr(lookup_path, &mut buf).and_then(|n| gen_sysfs_bytes(&buf[..n.min(TMP_BUF_SIZE)])) {
+                    Some(v) => v,
+                    None => return err_reply(-2),
+                }
             }
         } else if block::is_sysfs_path(lookup_path) {
             // A directory in the synthesized `/sys/class/block` subtree, or
@@ -8539,6 +8579,22 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                     Some(t)
                 } else { None }
             };
+            let sc_path = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                if e.in_use() && e.ephemeral() && e.path().starts_with(SYSCLASS_W) {
+                    let mut p = [0u8; 96]; let rp = &e.path()[SYSCLASS_W.len()..];
+                    let l = rp.len().min(96); p[..l].copy_from_slice(&rp[..l]);
+                    Some((p, l))
+                } else { None }
+            };
+            if let Some((p, l)) = sc_path {
+                let n = count.min(64);
+                let mut data = [0u8; 64];
+                if unsafe { sched::uaccess::copy_raw(data.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let r = sysclass::write(&p[..l], &data[..n]);
+                return if r < 0 { err_reply(r) } else { val_reply(count as u64) };
+            }
             if let Some(tid) = comm_tid {
                 let me = sched::euid_of(pid);
                 if me != 0 && me != sched::euid_of(tid) { return err_reply(-13); }
@@ -9954,13 +10010,21 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         let mut off = 0usize;
         let mut cur = desc_pos(&tbl.fds[fd]);
         loop {
-            let mut name = [0u8; block::NAME_MAX];
+            let mut name = [0u8; sysclass::NAME_LEN];
             let (nlen, is_dir, ino) = if cur == 0 {
                 name[0] = b'.'; (1, true, 1)
             } else if cur == 1 {
                 name[0] = b'.'; name[1] = b'.'; (2, true, 1)
             } else {
-                match block::sysfs_dirent(dev, level, cur - 2, &mut name) {
+                let r = if dev >= sysclass::SC_BASE {
+                    sysclass::dirent(dev, level, cur - 2, &mut name)
+                } else {
+                    let mut n16 = [0u8; block::NAME_MAX];
+                    let r = block::sysfs_dirent(dev, level, cur - 2, &mut n16);
+                    name[..block::NAME_MAX].copy_from_slice(&n16);
+                    r
+                };
+                match r {
                     Some((n, d)) => (n, d, 0x5000_0000 + cur as u64),
                     None => break,
                 }
@@ -13180,7 +13244,7 @@ fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
     // synthesized `/sys/class/block` subtree is synthetic the same way; the
     // rest of /sys is staged on disk and falls through to the mount lookup.
     if !is_tmp_path(path)
-        && (path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path)) {
+        && (path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path) || sysclass::is_path(path)) {
         write_statfs(buf_ptr, &procfs_statfs());
         return statfs_reply();
     }
@@ -13671,6 +13735,19 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
         // their attribute files. `/sys` and `/sys/class` themselves, and
         // everything outside this subtree, are staged on disk and answered
         // by the ordinary mount lookup below, not here.
+        if sysclass::is_path(lookup_path) {
+            if let Some((dev, level)) = sysclass::dir(lookup_path) {
+                write_stat(stat_ptr, 0o040755, 0, 0x5000_0000 + (dev as u64) * 8 + level as u64);
+                return ok_reply();
+            }
+            let mut buf = [0u8; TMP_BUF_SIZE];
+            if let Some(n) = sysclass::attr(lookup_path, &mut buf) {
+                let m = if sysclass::is_writable(lookup_path) { 0o100644 } else { 0o100444 };
+                write_stat(stat_ptr, m, n as u64, path_ino(lookup_path, 5));
+                return ok_reply();
+            }
+            return err_reply(-2);
+        }
         if block::is_sysfs_path(lookup_path) {
             if let Some((dev, level)) = block::sysfs_dir(lookup_path) {
                 write_stat(stat_ptr, 0o040755, 0,

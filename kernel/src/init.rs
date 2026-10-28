@@ -222,6 +222,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── USB ───────────────────────────────────────────────────────────────────
     usb::xhci::isoch::set_cmdline(crate::boot_cmdline().unwrap_or(""));
+    usb::uvc::set_cmdline(crate::boot_cmdline().unwrap_or(""));
     drivers::usb_hcd::init();
     // The xHCI BIOS handoff above ends the firmware's USB legacy (PS/2)
     // emulation: an i8042 that was only ever that emulation is gone now.
@@ -253,9 +254,14 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         sched::wedge::set_enabled(on || (cfg!(feature = "rpi5") && !off));
         sched::wedge::armed_banner(sched::active_cpu_count());
     }
-    if crate::boot_cmdline().unwrap_or("").split_ascii_whitespace().any(|t| t == "wdog.selftest=1") {
+    let cl = crate::boot_cmdline().unwrap_or("");
+    if cl.split_ascii_whitespace().any(|t| t == "wdog.selftest=1") {
         sched::wdog_selftest_arm();
+    } else if cl.split_ascii_whitespace().any(|t| t == "wdog.selftest=2") {
+        sched::wdog_selftest_arm_forever();
     }
+    #[cfg(target_arch = "x86_64")]
+    drivers::lapinv::run(boot_info.rsdp_addr, boot_info.hhdm_offset, crate::boot_cmdline().unwrap_or(""));
     drivers::nvidia_probe::run(
         boot_info.rsdp_addr, boot_info.hhdm_offset,
         boot_info.framebuffer_base, boot_info.framebuffer_width,
@@ -320,6 +326,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     net_server::init();
     sched::spawn(net_server::net_daemon, 0).map(|p| sched::set_comm(p, b"netd"));
     crate::netwatch::init();
+    #[cfg(target_arch = "x86_64")] crate::lappower::init(boot_info.rsdp_addr, boot_info.hhdm_offset, crate::boot_cmdline().unwrap_or("")); // ACPI power poll + /sys/class/{power_supply,backlight} + lid/power-button evdev
     net_server::netctl::init(crate::boot_cmdline().unwrap_or("")); // /dev/netctl
     // Block devices are initialized, but f2fs disk mounting is deferred to userspace init.
 
