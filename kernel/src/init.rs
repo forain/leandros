@@ -330,6 +330,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     sched::spawn(net_server::net_daemon, 0).map(|p| sched::set_comm(p, b"netd"));
     crate::netwatch::init();
     #[cfg(target_arch = "x86_64")] crate::lappower::init(boot_info.rsdp_addr, boot_info.hhdm_offset, crate::boot_cmdline().unwrap_or("")); // ACPI power poll + /sys/class/{power_supply,backlight} + lid/power-button evdev
+    crate::pm::init(); // /sys/power, /sys/class/rtc, pm.s3 knobs (inert by default); replaces lappower's ops table with a delegating one
     net_server::netctl::init(crate::boot_cmdline().unwrap_or("")); // /dev/netctl
     // Block devices are initialized, but f2fs disk mounting is deferred to userspace init.
 
