@@ -33,6 +33,7 @@ pub mod hubproto;
 pub mod msc;
 pub mod transfer;
 pub mod xhci;
+pub mod uvc;
 
 pub use descriptor::*;
 pub use device::UsbDevice;
@@ -159,6 +160,15 @@ fn adopt(bus: u8, e: xhci::Enumerated, hot: bool) -> Option<XhciBulk> {
         }
         a => a,
     };
+    // A camera arrives through the same isochronous-function path.
+    let (video, audio) = match audio {
+        Some(f) if uvc::has_video_streaming(&f.cfg) => (Some(f), None),
+        a => (None, a),
+    };
+    if let Some(f) = video {
+        usb_log!("[USB] bus {} slot {}: video function (UVC)\n", bus, f.slot);
+        uvc::register(f);
+    }
     if let Some(f) = audio {
         usb_log!("[USB] bus {} slot {}: audio function, {} isochronous endpoint(s)\n",
                  bus, f.slot, f.isoch_endpoints().len());
@@ -212,6 +222,7 @@ fn detach(bus: u8, hc: &Controller, port: u8, route: u32, ev: &mut Vec<HotEvent>
         } else {
             if i.hid != 0 { hid::detach(hc, i.slot); }
             xhci::isoch::detach(hc, i.slot);
+            uvc::detach(hc, i.slot);
             xhci::release_slot(hc, i.slot);
             usb_log!("[USB] bus {} slot {}: released\n", bus, i.slot);
         }
