@@ -144,3 +144,192 @@ pub fn sys_pm_test(arg: usize) -> isize {
     }
     if ok { 0 } else { -5 }
 }
+
+// ---------------------------------------------------------------------------
+// /sys/power and /sys/class/rtc (lane s3sysfs). Everything here is inert
+// unless `pm.s3=1`; `freeze` needs only a `pm_test` level of freezer/devices.
+// ---------------------------------------------------------------------------
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
+use vfs_server::sysclass::Ops;
+
+const LEVELS: [&str; 6] = ["none", "core", "processors", "platform", "devices", "freezer"];
+const LV_DEVICES: u8 = 4;
+const LV_FREEZER: u8 = 5;
+/// Hold time of a sysfs-triggered freeze-only cycle.
+const SYSFS_HOLD_MS: u32 = 500;
+
+static PM_TEST: AtomicU8 = AtomicU8::new(0);
+static S3_ENABLED: AtomicBool = AtomicBool::new(false);
+static S3_REQUIRE_RTC: AtomicBool = AtomicBool::new(true);
+/// True once the platform sleep path exists (set by lane s3core).
+static S3_VALID: AtomicBool = AtomicBool::new(false);
+static WAKE_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Armed wake alarm (Unix seconds), 0 = none.
+static ALARM: AtomicU64 = AtomicU64::new(0);
+
+/// Parse `pm.s3`, `pm.s3_require_rtc`, `pm.test` and register the sysfs ops.
+pub fn init() {
+    let cmd = crate::boot_cmdline().unwrap_or("");
+    for t in cmd.split_ascii_whitespace() {
+        match t {
+            "pm.s3=1" => S3_ENABLED.store(true, Ordering::Relaxed),
+            "pm.s3_require_rtc=0" => S3_REQUIRE_RTC.store(false, Ordering::Relaxed),
+            _ => if let Some(l) = t.strip_prefix("pm.test=") {
+                if let Some(i) = LEVELS.iter().position(|x| *x == l) { PM_TEST.store(i as u8, Ordering::Relaxed); }
+            },
+        }
+    }
+    vfs_server::sysclass::set_sysclass_ops(&PM_OPS);
+}
+
+static PM_OPS: Ops = Ops {
+    devices: |class, idx, out| match class {
+        "rtc" => if idx == 0 && has_rtc() { copy(out, "rtc0") } else { None },
+        _ => drivers::power_sysfs::device(class, idx, out),
+    },
+    attrs: |class, dev, idx, out| match class {
+        "power" => copy(out, *["state", "mem_sleep", "pm_test", "wakeup_count"].get(idx)?),
+        "rtc" => copy(out, *["wakealarm", "since_epoch"].get(idx)?),
+        _ => drivers::power_sysfs::attr_name(class, dev, idx, out),
+    },
+    read: |class, dev, attr, out| match class {
+        "power" => power_read(attr, out),
+        "rtc" => rtc_read(attr, out),
+        _ => drivers::power_sysfs::read(class, dev, attr, out),
+    },
+    writable: |class, dev, attr| match class {
+        "power" => attr != "" && ["state", "mem_sleep", "pm_test", "wakeup_count"].contains(&attr),
+        "rtc" => attr == "wakealarm",
+        _ => drivers::power_sysfs::writable(class, dev, attr),
+    },
+    write: |class, dev, attr, data| match class {
+        "power" => power_write(attr, data),
+        "rtc" => rtc_write(data),
+        _ => drivers::power_sysfs::write(class, dev, attr, data),
+    },
+};
+
+fn copy(out: &mut [u8], s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.len() > out.len() { return None; }
+    out[..b.len()].copy_from_slice(b);
+    Some(b.len())
+}
+
+fn has_rtc() -> bool { cfg!(target_arch = "x86_64") }
+
+fn s3_ok() -> bool { S3_ENABLED.load(Ordering::Relaxed) && S3_VALID.load(Ordering::Relaxed) }
+
+fn power_read(attr: &str, out: &mut [u8]) -> Option<usize> {
+    let s = match attr {
+        // freeze (devices-only cycle) is always offered; mem only when S3 is real.
+        "state" => String::from(if s3_ok() { "freeze mem\n" } else { "freeze\n" }),
+        "mem_sleep" => String::from(if s3_ok() { "[deep]\n" } else { "\n" }),
+        "pm_test" => {
+            let cur = PM_TEST.load(Ordering::Relaxed) as usize;
+            let mut s = String::new();
+            for (i, l) in LEVELS.iter().enumerate() {
+                if i > 0 { s.push(' '); }
+                if i == cur { s.push('['); s.push_str(l); s.push(']'); } else { s.push_str(l); }
+            }
+            s.push('\n');
+            s
+        }
+        "wakeup_count" => alloc::format!("{}\n", WAKE_COUNT.load(Ordering::Relaxed)),
+        _ => return None,
+    };
+    copy(out, &s)
+}
+
+fn power_write(attr: &str, data: &[u8]) -> i32 {
+    let Ok(s) = core::str::from_utf8(data) else { return -22 };
+    let s = s.trim();
+    match attr {
+        "state" => match s {
+            "freeze" => suspend_enter(false),
+            "mem" => suspend_enter(true),
+            _ => -22,
+        },
+        "mem_sleep" => if s3_ok() && s == "deep" { 0 } else { -22 },
+        "pm_test" => match LEVELS.iter().position(|l| *l == s) {
+            Some(i) => { PM_TEST.store(i as u8, Ordering::Relaxed); 0 }
+            None => -22,
+        },
+        "wakeup_count" => match s.parse::<u32>() {
+            Ok(v) if v == WAKE_COUNT.load(Ordering::Relaxed) => 0,
+            Ok(_) => -16, // EBUSY: a wake event arrived since it was read
+            Err(_) => -22,
+        },
+        _ => -2,
+    }
+}
+
+/// `state` write. `freeze` runs the devices-only cycle; `mem` additionally
+/// needs `pm.s3=1`, an armed alarm (`pm.s3_require_rtc`) at level `none`, and
+/// the platform path (lane s3core), which does not exist yet: -ENOSYS.
+fn suspend_enter(mem: bool) -> i32 {
+    let lv = PM_TEST.load(Ordering::Relaxed);
+    if mem {
+        if !S3_ENABLED.load(Ordering::Relaxed) { return -22; }
+        if lv == 0 && S3_REQUIRE_RTC.load(Ordering::Relaxed) {
+            let a = ALARM.load(Ordering::Relaxed);
+            let now = rtc_now().unwrap_or(0);
+            if a == 0 || a <= now || a - now > 300 { return -22; }
+        }
+    } else if lv != LV_DEVICES && lv != LV_FREEZER {
+        return -22; // plain freeze is only offered as a test level for now
+    }
+    if lv == LV_FREEZER {
+        let mut o = String::new();
+        line(&mut o, "pm_test=freezer: freeze and thaw only (no freezer yet), nothing to do");
+        return 0;
+    }
+    if lv != LV_DEVICES { return -38; } // platform/processors/core/none: ENOSYS
+    let (ok, _) = freeze_cycle(0, SYSFS_HOLD_MS);
+    if ok { 0 } else { -5 }
+}
+
+fn rtc_now() -> Option<u64> {
+    #[cfg(target_arch = "x86_64")] { arch_x86_64::rtc::epoch_secs() }
+    #[cfg(not(target_arch = "x86_64"))] { None }
+}
+
+fn rtc_read(attr: &str, out: &mut [u8]) -> Option<usize> {
+    match attr {
+        "wakealarm" => {
+            let a = ALARM.load(Ordering::Relaxed);
+            // A fired alarm reads back empty, like Linux.
+            if a != 0 && rtc_now().map_or(false, |n| a > n) { copy(out, &alloc::format!("{}\n", a)) } else { copy(out, "\n") }
+        }
+        "since_epoch" => copy(out, &alloc::format!("{}\n", rtc_now()?)),
+        _ => None,
+    }
+}
+
+fn rtc_write(data: &[u8]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let Ok(s) = core::str::from_utf8(data) else { return -22 };
+        let s = s.trim();
+        if s.is_empty() || s == "0" {
+            arch_x86_64::rtc::clear_alarm();
+            ALARM.store(0, Ordering::Relaxed);
+            return 0;
+        }
+        let Some(now) = arch_x86_64::rtc::epoch_secs() else { return -19 };
+        let target = match s.strip_prefix('+') {
+            Some(n) => match n.parse::<u64>() { Ok(n) => now + n, Err(_) => return -22 },
+            None => match s.parse::<u64>() { Ok(t) => t, Err(_) => return -22 },
+        };
+        match arch_x86_64::rtc::set_alarm(target) {
+            Ok((sc, mi, hr, b)) => {
+                ALARM.store(target, Ordering::Relaxed);
+                crate::serial_print_str(&alloc::format!("[PM] rtc alarm armed for {} (cmos sec={:#04x} min={:#04x} hour={:#04x} regB={:#04x})\n", target, sc, mi, hr, b));
+                0
+            }
+            Err(e) => e,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = data; -19 }
+}

@@ -57,9 +57,49 @@ static int check_file(const char *p, int seed, int n) {
     return 0;
 }
 
+// --sysfs: /sys/power and /sys/class/rtc (lane s3sysfs). x86_64 has the rtc.
+static int wr(const char *p, const char *v) {
+    int fd = open(p, O_WRONLY); if (fd < 0) return -errno;
+    int r = write(fd, v, strlen(v)); int e = errno; close(fd);
+    return r < 0 ? -e : 0;
+}
+static int rd(const char *p, char *b, size_t n) {
+    int fd = open(p, O_RDONLY); if (fd < 0) return -errno;
+    int r = read(fd, b, n - 1); close(fd);
+    if (r < 0) return -errno;
+    b[r] = 0; return r;
+}
+static int sysfs_mode(void) {
+    char b[128]; 
+#ifdef __x86_64__
+    int x86 = 1;
+#else
+    int x86 = 0;
+#endif
+    result("power_state", rd("/sys/power/state", b, sizeof b) > 0 && strstr(b, "freeze"), b);
+    result("mem_refused", wr("/sys/power/state", "mem") == -EINVAL, "mem without pm.s3=1 is EINVAL");
+    result("bad_state", wr("/sys/power/state", "bogus") == -EINVAL, "");
+    result("freeze_needs_level", wr("/sys/power/pm_test", "none") == 0 && wr("/sys/power/state", "freeze") == -EINVAL, "");
+    result("pm_test_set", wr("/sys/power/pm_test", "devices") == 0 && rd("/sys/power/pm_test", b, sizeof b) > 0 && strstr(b, "[devices]"), b);
+    result("freeze_cycle", wr("/sys/power/state", "freeze") == 0, "pm_test=devices");
+    result("fs_after", system("echo ok > /root/.suspendtest-sysfs && rm /root/.suspendtest-sysfs") == 0, "");
+    if (x86) {
+        result("alarm_set", wr("/sys/class/rtc/rtc0/wakealarm", "+120") == 0, "");
+        long a = rd("/sys/class/rtc/rtc0/wakealarm", b, sizeof b) > 0 ? atol(b) : 0;
+        char e[64]; long now = rd("/sys/class/rtc/rtc0/since_epoch", e, sizeof e) > 0 ? atol(e) : 0;
+        result("alarm_readback", a > now + 100 && a <= now + 125, b);
+        result("alarm_clear", wr("/sys/class/rtc/rtc0/wakealarm", "0") == 0 && rd("/sys/class/rtc/rtc0/wakealarm", b, sizeof b) >= 0 && atol(b) == 0, "");
+    } else {
+        result("no_rtc", wr("/sys/class/rtc/rtc0/wakealarm", "+10") < 0, "no rtc0 on this arch");
+    }
+    printf("suspendtest --sysfs: %s\n", fails ? "FAIL" : "PASS");
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     struct req r = { 0, 300, (uint64_t)(uintptr_t)rep, sizeof rep };
     const char *net = NULL, *dir = "/root";
+    if (argc > 1 && !strcmp(argv[1], "--sysfs")) return sysfs_mode();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--hold") && i + 1 < argc) r.hold_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--xhci-halt")) r.flags |= 1;
