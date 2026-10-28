@@ -227,7 +227,9 @@ pub const PM_INRUSH_MASK: u32 = 3 << PM_INRUSH_SHIFT;
 /// 3.5 mA .. 20 mA, ramped up until POWOK.
 pub const PM_INRUSH_MAX: u32 = 3;
 /// Island fully on: power OK, electrical and functional isolation off.
-pub const PM_GRAFX_ON: u32 = PM_POWUP | PM_POWOK | PM_ISPOW | PM_ISFUNC;
+/// BCM2712 firmware leaves GRAFX at 0x706d (POWUP|ISPOW|ISFUNC, POWOK and MRDONE clear) and the
+/// V3D behind it answers; POWOK is therefore not required (pigpu, measured on the Pi 5).
+pub const PM_GRAFX_ON: u32 = PM_POWUP | PM_ISPOW | PM_ISFUNC;
 /// BCM2712 GRAFX_V3D domain control (no ASB on the 2712).
 pub const PM_GRAFX_2712: u32 = 0x304;
 /// Reset deassert (1 = out of reset).
@@ -236,8 +238,9 @@ pub const PM_V3DRSTN: u32 = bit(6);
 // ── Firmware clock (mailbox property interface) ──
 pub const FW_CLK_V3D: u32 = 5;
 pub const TAG_GET_MAX_CLOCK_RATE: u32 = 0x0003_0004;
-/// RPI_FIRMWARE_SET_DOMAIN_STATE; domain 10 = V3D (RPI_POWER_DOMAIN_V3D).
+/// RPI_FIRMWARE_SET_DOMAIN_STATE; domain 7 = V3D (dt-bindings raspberrypi-power.h: I2C0..H264=0..6, V3D=7).
 pub const TAG_SET_DOMAIN_STATE: u32 = 0x0003_8030;
-pub const FW_DOMAIN_V3D: u32 = 10;
+pub const FW_DOMAIN_V3D: u32 = 7;
+pub const TAG_GET_DOMAIN_STATE: u32 = 0x0003_0030;
 pub const TAG_SET_CLOCK_STATE: u32 = 0x0003_8001;
 pub const TAG_SET_CLOCK_RATE: u32 = 0x0003_8002;

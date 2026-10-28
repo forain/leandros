@@ -30,6 +30,8 @@ pub trait PowerEnv {
     /// Firmware power-domain SET_DOMAIN_STATE (raspberrypi-power); returns the reply
     /// state word, `None` when unsupported/disabled (`v3d.pwr=pm`) or no reply.
     fn fw_domain(&mut self, _domain: u32, _on: bool) -> Option<u32> { None }
+    /// `v3d.pwr=nogate`: skip the GRAFX island-bits requirement in `pm_confirm`.
+    fn relaxed_gate(&mut self) -> bool { false }
     fn delay_us(&mut self, us: u32);
     fn now_us(&mut self) -> u64;
 }
@@ -249,7 +251,7 @@ pub fn pm_confirm<E: PowerEnv>(env: &mut E, rep: &mut ProbeReport) -> Result<(),
     let v = env.pm_r(PM_GRAFX_2712);
     rep.grafx_after = g;
     rep.pm_after = v;
-    if g & PM_GRAFX_ON != PM_GRAFX_ON {
+    if g & PM_GRAFX_ON != PM_GRAFX_ON && !env.relaxed_gate() {
         return Err(PowerError::Mismatch { step: Step::PmConfirm, value: g });
     }
     if v & PM_V3DRSTN == 0 {
