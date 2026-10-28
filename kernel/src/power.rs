@@ -405,9 +405,15 @@ fn kernel_kexec() -> isize {
     // last the bus resets (PCIe PERST# + bridge), after which the RC is gone.
     let (mut ok, mut bad) = drivers::dma_shutdown::run(drivers::dma_shutdown::Stage::Device);
     quiesce_all_pci();
-    let (bus_ok, bus_bad) = drivers::dma_shutdown::run(drivers::dma_shutdown::Stage::Bus);
-    ok.extend(bus_ok);
-    bad.extend(bus_bad);
+    // aarch64: the Bus stage runs later, from `final_cpu0` once every other
+    // CPU is parked (a bridge reset under live RP1 driver threads stalls them
+    // on AXI). Other architectures have no parked-CPU point, run it here.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let (bus_ok, bus_bad) = drivers::dma_shutdown::run(drivers::dma_shutdown::Stage::Bus);
+        ok.extend(bus_ok);
+        bad.extend(bus_bad);
+    }
     serial_print_str(&kexec_quiesced_line(&ok, xhci, &bad));
     crate::kexec::exec_jump()
 }
