@@ -192,6 +192,11 @@ static HUBS: Mutex<Vec<(u8, xhci::HubPorts)>> = Mutex::new(Vec::new());
 
 /// (bus, root port, route) whose device failed to enumerate: not retried
 /// until the port reports a disconnect or a connection change.
+/// `usb.tbxhci=0` (set by the kernel from the command line): skip the
+/// controller-gone guard in [`hotplug_scan`].
+pub static TBXHCI_GUARD_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Buses whose controller was seen reading all-ones.
+static GONE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static HOT_FAILED: Mutex<Vec<(u8, u8, u32)>> = Mutex::new(Vec::new());
 
 /// Whether `route` is `at` or a port below it (same root port).
@@ -291,6 +296,24 @@ pub fn hotplug_scan() -> Vec<HotEvent> {
     let mut ev = Vec::new();
     for (i, hc) in ctrls.iter().enumerate() {
         let bus = (i + 1) as u8;
+        if !TBXHCI_GUARD_OFF.load(core::sync::atomic::Ordering::Relaxed) {
+            if xhci::controller_gone(hc) {
+                let mut g = GONE.lock();
+                if !g.contains(&bus) {
+                    g.push(bus);
+                    drop(g);
+                    usb_log!("[USB] bus {} controller gone (reads all-ones); devices detached, scan paused\n", bus);
+                    let ports = xhci::root_ports(hc);
+                    for port in 1..=ports { detach(bus, hc, port, 0, &mut ev); }
+                }
+                continue;
+            }
+            let mut g = GONE.lock();
+            if g.contains(&bus) {
+                g.retain(|&b| b != bus);
+                usb_log!("[USB] bus {} controller back (not re-probed)\n", bus);
+            }
+        }
         for port in 1..=xhci::root_ports(hc) {
             let changed = xhci::root_port_take_csc(hc, port);
             let ccs = xhci::root_port_connected(hc, port);
@@ -314,6 +337,12 @@ pub fn release_slot(bus: u8, slot: u8) {
 /// Controllers brought up by [`probe_xhci`], with or without devices.
 pub fn controller_count() -> usize {
     CONTROLLERS.lock().len()
+}
+
+/// Root-hub shape of controller `index` (0-based): (ports, has USB 3 ports).
+pub fn controller_ports(index: usize) -> Option<(u8, bool)> {
+    let hc = CONTROLLERS.lock().get(index).cloned()?;
+    Some(xhci::root_hub_shape(&hc))
 }
 
 pub fn devices() -> Vec<UsbDeviceInfo> {

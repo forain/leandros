@@ -1496,6 +1496,9 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     if !boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "usb.early_handoff=0")) {
         drivers::usb_hcd::early_handoff_all();
     }
+    if boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "usb.tbxhci=0")) {
+        drivers::usb_hcd::disable_controller_gone_guard();
+    }
     early_mark(10);
     // PS/2 controller: probed (or ruled out by the FADT) before anything
     // trusts IRQ 1.
