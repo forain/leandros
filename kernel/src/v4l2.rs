@@ -412,12 +412,13 @@ fn ioctl(pid: u32, fd: usize, id: u32, cmd: usize, arg: usize) -> isize {
             let mut b = match rd::<204>(arg) { Ok(b) => b, Err(e) => return e };
             if g32(&b, 0) != BUF_TYPE_CAPTURE { return EINVAL; }
             let Some((_, fr)) = cur(&d) else { return EINVAL };
+            let fr_interval = fr.interval;
             let (rn, rd_) = (g32(&b, 12), g32(&b, 16));
             if cmd == VIDIOC_S_PARM && !d.streaming && rn != 0 && rd_ != 0 {
                 d.interval = ((rn as u64 * 10_000_000) / rd_ as u64).clamp(1, u32::MAX as u64) as u32;
             }
             for x in &mut b[4..] { *x = 0; }
-            let (n, dd) = fract(if d.interval != 0 { d.interval } else { fr.interval });
+            let (n, dd) = fract(if d.interval != 0 { d.interval } else { fr_interval });
             p32(&mut b, 4, CAP_TIMEPERFRAME);
             p32(&mut b, 12, n);
             p32(&mut b, 16, dd);
