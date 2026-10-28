@@ -45,7 +45,8 @@ pub trait Host {
     fn notify(&mut self, node: usize, code: u64);
     fn log(&mut self, msg: &str);
     /// FACS global lock (`Field(..., Lock, ...)`): acquire or release. Default: nothing.
-    fn global_lock(&mut self, _acquire: bool) {}
+    /// Returns `false` when the acquire timed out (the field access must then fail; no release follows).
+    fn global_lock(&mut self, _acquire: bool) -> bool { true }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -104,6 +105,8 @@ pub enum Err {
     Eof,
     Fatal,
     Loop,
+    /// FACS global lock acquire timed out (ACPICA: AE_TIME).
+    Timeout,
 }
 
 #[derive(Clone, Copy)]
@@ -823,7 +826,7 @@ impl Ns {
     }
 
     fn unit_read(&mut self, h: &mut dyn Host, fu: &FieldUnit, byte: u64, w: u8) -> R<u64> {
-        if fu.lock { h.global_lock(true); }
+        if fu.lock && !h.global_lock(true) { return Err(Err::Timeout); }
         let r = self.unit_read_inner(h, fu, byte, w);
         if fu.lock { h.global_lock(false); }
         r
@@ -849,7 +852,7 @@ impl Ns {
     }
 
     fn unit_write(&mut self, h: &mut dyn Host, fu: &FieldUnit, byte: u64, w: u8, val: u64) -> R<()> {
-        if fu.lock { h.global_lock(true); }
+        if fu.lock && !h.global_lock(true) { return Err(Err::Timeout); }
         let r = self.unit_write_inner(h, fu, byte, w, val);
         if fu.lock { h.global_lock(false); }
         r

@@ -4,6 +4,8 @@
 
 #[path = "../../src/acpi_power/aml.rs"]
 pub mod aml;
+#[path = "../../src/acpi_power/gl.rs"]
+pub mod gl;
 
 #[cfg(test)]
 mod tests {
@@ -16,6 +18,7 @@ mod tests {
         acq: u32,
         rel: u32,
         cmos: u64,
+        gl_fail: bool,
     }
     impl Host for Fake {
         fn read(&mut self, s: u8, a: u64, w: u8) -> u64 { self.reads.push((s, a, w)); self.cmos }
@@ -25,7 +28,7 @@ mod tests {
         fn timer(&mut self) -> u64 { 0 }
         fn notify(&mut self, _: usize, _: u64) {}
         fn log(&mut self, _: &str) {}
-        fn global_lock(&mut self, a: bool) { if a { self.acq += 1 } else { self.rel += 1 } }
+        fn global_lock(&mut self, a: bool) -> bool { if a { if self.gl_fail { return false; } self.acq += 1 } else { self.rel += 1 } true }
     }
 
     fn dsdt() -> &'static [u8] {
@@ -107,5 +110,60 @@ mod tests {
         let n = ns.find("\\_WAK").unwrap();
         let v = ns.eval(&mut h, n, &[V::Int(3)]).unwrap();
         assert_eq!(v.elements().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn lock_timeout_fails_field_access_without_touching_host() {
+        let (mut ns, mut h) = load();
+        h.gl_fail = true;
+        let n = ns.find("\\_PTS").unwrap();
+        assert!(ns.eval(&mut h, n, &[V::Int(3)]).is_err());
+        assert!(h.writes.is_empty(), "{:?}", h.writes);
+        assert_eq!((h.acq, h.rel), (0, 0));
+    }
+
+    #[test]
+    fn gl_acquire_release_clean() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let g = crate::gl::Gl::new();
+        let w = AtomicU32::new(0);
+        assert!(g.acquire(&w, 10, &mut || {}));
+        assert_eq!(w.load(Ordering::Relaxed), 2);
+        assert!(g.acquire(&w, 10, &mut || {})); // nested
+        assert!(!g.release(&w));
+        assert_eq!(w.load(Ordering::Relaxed), 2); // still held
+        assert!(!g.release(&w));
+        assert_eq!(w.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn gl_timeout_withdraws_pending_and_keeps_firmware_ownership() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let g = crate::gl::Gl::new();
+        let w = AtomicU32::new(2); // firmware owns, never releases
+        let mut spins = 0;
+        assert!(!g.acquire(&w, 50, &mut || spins += 1));
+        assert_eq!(spins, 50);
+        assert_eq!(w.load(Ordering::Relaxed), 2, "firmware owned bit kept, our pending cleared");
+        assert!(!g.owned());
+        assert!(!g.release(&w)); // must not touch FACS
+        assert_eq!(w.load(Ordering::Relaxed), 2);
+        assert_eq!(g.fails.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn gl_acquires_after_firmware_releases_and_reports_pending() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let g = crate::gl::Gl::new();
+        let w = AtomicU32::new(2);
+        let mut n = 0;
+        // firmware releases on the 3rd delay (clears owned+pending)
+        assert!(g.acquire(&w, 100, &mut || { n += 1; if n == 3 { w.store(0, Ordering::Relaxed); } }));
+        assert!(g.owned());
+        assert_eq!(w.load(Ordering::Relaxed), 2);
+        // firmware sets pending while we hold it -> release must report GBL_RLS needed
+        w.fetch_or(1, Ordering::Relaxed);
+        assert!(g.release(&w));
+        assert_eq!(w.load(Ordering::Relaxed), 0);
     }
 }
