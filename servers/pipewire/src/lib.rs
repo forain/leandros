@@ -77,6 +77,18 @@ impl Backend {
     fn capture_close(&mut self) {
         if let Backend::Hda(d) = self { d.capture_close(); }
     }
+    fn capture_ensure(&mut self) -> Result<(), i32> {
+        match self { Backend::Hda(d) => d.capture_ensure(), _ => Err(-19) }
+    }
+    fn capture_restart(&mut self) {
+        if let Backend::Hda(d) = self { d.capture_restart(); }
+    }
+    fn capture_pending(&self) -> usize {
+        match self { Backend::Hda(d) => d.capture_pending(), _ => 0 }
+    }
+    fn jack_service(&mut self) {
+        if let Backend::Hda(d) = self { d.jack_service(); }
+    }
     fn info(&mut self) -> alloc::string::String {
         match self {
             Backend::Virtio(_) => alloc::string::String::from("backend: virtio-sound\n"),
@@ -224,25 +236,65 @@ fn claim_reader(want: u64) -> Result<(), i32> {
     }
 }
 
-/// VFS_READ: block until at least one period (10 ms) of capture is there or
-/// `count` is filled, at most ~500 ms; returns what was captured.
-fn capture_read(buf_ptr: usize, count: usize) -> Message {
+/// Open ids of O_RDONLY|O_NONBLOCK opens (recorded at VFS_OPEN; a later
+/// fcntl(O_NONBLOCK) is not seen here).
+static NB_OPENS: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+
+fn nb_add(id: u64) {
+    use core::sync::atomic::Ordering::AcqRel;
+    for s in NB_OPENS.iter() { if s.compare_exchange(0, id, AcqRel, core::sync::atomic::Ordering::Acquire).is_ok() { return; } }
+}
+fn nb_has(id: u64) -> bool { NB_OPENS.iter().any(|s| s.load(core::sync::atomic::Ordering::Acquire) == id) }
+fn nb_del(id: u64) {
+    use core::sync::atomic::Ordering::AcqRel;
+    for s in NB_OPENS.iter() { let _ = s.compare_exchange(id, 0, AcqRel, core::sync::atomic::Ordering::Acquire); }
+}
+
+/// The poll tag of the capture side, woken by `tick_pump` when a period of
+/// audio is ready.
+const fn capture_tag() -> u64 { sched::poll_tag(sched::poll_class::STATIC, 0x5043) }
+/// One 10 ms period of 48 kHz s16le stereo.
+const CAPTURE_PERIOD: usize = 1920;
+
+/// VFS_READ for the reader `h`. Never returns 0: O_NONBLOCK gets -EAGAIN
+/// when nothing is ready; a blocking read waits for data, restarts a stream
+/// that delivers nothing for 2 s once, and then fails -EIO.
+fn capture_read(buf_ptr: usize, count: usize, h: u64) -> Message {
+    if count < 4 { return err_reply(-22); }
+    let nb = nb_has(h);
     let mut kbuf = [0u8; 4096];
     let mut total = 0usize;
-    let start = drivers::snd::monotonic_us();
+    let mut since = drivers::snd::monotonic_us();
+    let mut restarted = false;
     while total < count {
-        let want = (count - total).min(kbuf.len());
+        let want = (count - total).min(kbuf.len()) & !3;
+        if want == 0 { break; }
         let r = {
             let mut state = STATE.lock();
             if !state.initialized { return err_reply(-19); }
-            state.snd_driver.capture_read(&mut kbuf[..want])
+            // The close that revoked the claim may have run since the last
+            // pass: never (re)start the stream for a reader that is gone.
+            if READER.load(core::sync::atomic::Ordering::Acquire) != h {
+                return if total > 0 { val_reply(total as u64) } else { err_reply(-9) };
+            }
+            match state.snd_driver.capture_ensure() {
+                Ok(()) => state.snd_driver.capture_read(&mut kbuf[..want]),
+                Err(e) => Err(e),
+            }
         };
         match r {
-            Err(e) => return if total > 0 { val_reply(total as u64) } else { err_reply(e) },
-            Ok(0) => {
-                if total >= 1920 || drivers::snd::monotonic_us().wrapping_sub(start) > 500_000 { break; }
+            Err(-11) => {
+                if total > 0 { break; }
+                if nb { return err_reply(-11); }
+                if drivers::snd::monotonic_us().wrapping_sub(since) > 2_000_000 {
+                    if restarted { return err_reply(-5); }
+                    restarted = true;
+                    since = drivers::snd::monotonic_us();
+                    STATE.lock().snd_driver.capture_restart();
+                }
                 sched::kthread::sleep_ns(5_000_000);
             }
+            Err(e) => return if total > 0 { val_reply(total as u64) } else { err_reply(e) },
             Ok(n) => {
                 if unsafe { sched::uaccess::copy_to_user(buf_ptr + total, kbuf.as_ptr(), n) } != 0 {
                     return if total > 0 { val_reply(total as u64) } else { err_reply(-14) };
@@ -417,6 +469,7 @@ pub fn init(cmdline: &str) -> Result<u32, i32> {
 
     state.initialized = true;
     sched::register_tick_hook(tick_pump);
+    if matches!(state.snd_driver, Backend::Hda(_)) { let _ = sched::kthread::spawn("[audio]", audio_service); }
     pci::rdebug("[PW] Ready on port ");
     pci::rdebug_hex(server_port);
     pci::rdebug("\n");
@@ -434,7 +487,10 @@ fn handle_msg(msg: &Message, caller_pid: u32, _target_port: u32) -> Message {
     match msg.tag {
         0x10 => { // VFS_OPEN {dev_id, flags, _, pid, open_id}
             let flags = arg(msg, 1) as u32;
-            if flags & 3 == 0 { return val_reply(0); } // O_RDONLY: no claim
+            if flags & 3 == 0 { // O_RDONLY: no claim
+                if flags & 0o4000 != 0 { nb_add(HOLD_OPEN | open_id_of(msg)); }
+                return val_reply(0);
+            }
             return match claim(HOLD_OPEN | open_id_of(msg)) {
                 Ok(()) => val_reply(0),
                 Err(e) => err_reply(e),
@@ -443,6 +499,7 @@ fn handle_msg(msg: &Message, caller_pid: u32, _target_port: u32) -> Message {
         0x13 => { // VFS_CLOSE {dev_id, open_id}: the open's last fd is gone
             let h = HOLD_OPEN | (arg(msg, 1) & 0xffff_ffff);
             release(h);
+            nb_del(h);
             if READER.compare_exchange(h, 0, core::sync::atomic::Ordering::AcqRel,
                                        core::sync::atomic::Ordering::Acquire).is_ok() {
                 let mut state = STATE.lock();
@@ -451,9 +508,10 @@ fn handle_msg(msg: &Message, caller_pid: u32, _target_port: u32) -> Message {
             return val_reply(0);
         }
         0x11 => { // VFS_READ: microphone capture, one reading open at a time
-            if let Err(e) = claim_reader(HOLD_OPEN | open_id_of(msg)) { return err_reply(e); }
+            let h = HOLD_OPEN | open_id_of(msg);
+            if let Err(e) = claim_reader(h) { return err_reply(e); }
             if !STATE.lock().initialized { return err_reply(-19); }
-            return capture_read(arg(msg, 1) as usize, arg(msg, 2) as usize);
+            return capture_read(arg(msg, 1) as usize, arg(msg, 2) as usize, h);
         }
         0x12 => { // VFS_WRITE: only through the holding open
             if let Err(e) = claim(HOLD_OPEN | open_id_of(msg)) { return err_reply(e); }
@@ -466,13 +524,28 @@ fn handle_msg(msg: &Message, caller_pid: u32, _target_port: u32) -> Message {
         }
         vfs_server::VFS_POLL => {
             // Always writable (a write blocks inside this server, or is
-            // refused EBUSY at arbitration), never readable: a constant
-            // answer, so the static tag, which nothing has to wake. With no
-            // arm the empty reply (data[32] == 0) made every poller of the
-            // node a broadcast-mask parker.
+            // refused EBUSY at arbitration). The capture holder is also
+            // readable once a period is ready, and parks on `capture_tag`,
+            // which `tick_pump` wakes; polling claims and starts the capture
+            // stream, so poll-before-read clients work. Everyone else (the
+            // writer, a second reader, a backend with no capture) gets the
+            // constant static tag, which nothing has to wake.
+            let h = HOLD_OPEN | open_id_of(msg);
+            let mut revents = vfs_server::POLLOUT as u64;
+            let mut tag = vfs_server::static_poll_tag();
+            if WRITER.load(core::sync::atomic::Ordering::Acquire) != h && claim_reader(h).is_ok() {
+                let mut state = STATE.lock();
+                if state.initialized && state.snd_driver.capture_ensure().is_ok() {
+                    tag = capture_tag();
+                    if state.snd_driver.capture_pending() >= CAPTURE_PERIOD { revents |= vfs_server::POLLIN as u64; }
+                } else {
+                    drop(state);
+                    let _ = READER.compare_exchange(h, 0, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
+                }
+            }
             let mut m = Message::empty();
-            m.data[0..8].copy_from_slice(&(vfs_server::POLLOUT as u64).to_le_bytes());
-            m.data[24..32].copy_from_slice(&vfs_server::static_poll_tag().to_le_bytes());
+            m.data[0..8].copy_from_slice(&revents.to_le_bytes());
+            m.data[24..32].copy_from_slice(&tag.to_le_bytes());
             m.data[32] = 1;
             return m;
         }
@@ -513,10 +586,26 @@ pub fn shutdown(link_reset: bool) -> (alloc::string::String, Option<drivers::pci
 }
 
 fn tick_pump() {
+    let mut ready = false;
     if let Some(mut state) = STATE.try_lock() {
         if state.initialized {
             state.drain_spool();
             state.snd_driver.top_up_silence();
+            ready = READER.load(core::sync::atomic::Ordering::Acquire) != 0
+                && state.snd_driver.capture_pending() >= CAPTURE_PERIOD;
+        }
+    }
+    if ready { sched::try_wake_poll_tagged(capture_tag()); }
+}
+
+/// Thread context, every 100 ms: jack sense, capture health. Verbs and
+/// stream restarts never run in the timer IRQ.
+fn audio_service() {
+    loop {
+        sched::kthread::sleep_ns(100_000_000);
+        if let Some(mut state) = STATE.try_lock() {
+            if !state.initialized { return; }
+            state.snd_driver.jack_service();
         }
     }
 }
