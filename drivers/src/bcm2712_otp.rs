@@ -46,6 +46,12 @@ pub fn wifi_from_eth(e: &[u8; 6]) -> [u8; 6] {
     [e[0], e[1], e[2], (nic >> 16) as u8, (nic >> 8) as u8, nic as u8]
 }
 
+/// Bluetooth MAC: the Ethernet MAC + 2 in the low 24 bits (Pi convention).
+pub fn bt_from_eth(e: &[u8; 6]) -> [u8; 6] {
+    let nic = (((e[3] as u32) << 16) | ((e[4] as u32) << 8) | e[5] as u32).wrapping_add(2) & 0xFF_FFFF;
+    [e[0], e[1], e[2], (nic >> 16) as u8, (nic >> 8) as u8, nic as u8]
+}
+
 pub fn fmt_mac(m: &[u8; 6]) -> [u8; 17] {
     const H: &[u8; 16] = b"0123456789abcdef";
     let mut o = [b':'; 17];
@@ -73,6 +79,8 @@ pub fn set(serial: Option<u64>, mac: Option<[u8; 6]>) {
 pub fn eth_mac() -> Option<[u8; 6]> { unpack(MAC.load(Ordering::Acquire)) }
 /// Wi-Fi MAC (= Ethernet MAC + 1).
 pub fn wifi_mac() -> Option<[u8; 6]> { eth_mac().map(|m| wifi_from_eth(&m)) }
+/// Bluetooth MAC (= Ethernet MAC + 2), MSB first.
+pub fn bt_mac() -> Option<[u8; 6]> { eth_mac().map(|m| bt_from_eth(&m)) }
 pub fn serial() -> Option<u64> {
     (SERIAL_OK.load(Ordering::Acquire) != 0).then(|| SERIAL.load(Ordering::Relaxed))
 }

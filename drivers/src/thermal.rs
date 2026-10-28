@@ -23,6 +23,11 @@ pub extern "C" fn arch_thermal_report(buf: *mut u8, cap: usize) -> usize {
         Some(t) => { b.s("soc: ").i(t as i64).s(" (").mc(t).s(" C)\n"); }
         None => { b.s("thermal: no sensor\n"); }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    if let Some(st) = crate::rp1_fan::state() {
+        b.s("fan: state=").i(st as i64).s(" level=").i(crate::rp1_hw::FAN_LEVELS[st] as i64).s("/255 rpm=")
+            .i(crate::rp1_fan::rpm().unwrap_or(0) as i64).s(if crate::rp1_fan::auto() { " mode=auto\n" } else { " mode=fixed\n" });
+    }
     b.n
 }
 
