@@ -44,6 +44,9 @@ use super::*;
 /// TDs (service intervals) kept queued per isochronous endpoint: 64 ms of
 /// audio at FS 1 ms intervals, enough to ride over a few skipped 10 ms ticks.
 pub const NTDS: usize = 64;
+/// Most TDs one pipe may keep queued (the transfer ring holds 256 TRBs,
+/// one of them the Link TRB).
+pub const NTDS_MAX: usize = 240;
 /// Default size of the byte FIFO between the class driver and the TDs.
 pub const FIFO_BYTES: usize = 64 * 1024;
 /// OUT: with the FIFO dry, silence is queued only while fewer than this many
@@ -212,7 +215,7 @@ pub enum Poll {
 }
 
 #[derive(Clone, Copy)]
-struct Pending { ptr: u64, idx: u8, len: u16 }
+struct Pending { ptr: u64, idx: u16, len: u16 }
 
 /// One isochronous endpoint with TDs permanently queued on it.
 pub struct IsochPipe {
@@ -235,6 +238,10 @@ pub struct IsochPipe {
     acc: u64,
     pending: Vec<Pending>,
     next_idx: usize,
+    /// TDs kept queued (and bounce-buffer slots).
+    ntds: usize,
+    /// IN: the FIFO holds `[len u16 LE][data]` records, one per TD.
+    framed: bool,
     fifo: Vec<u8>,
     /// Monotonic FIFO counters (bytes written / consumed).
     wr: u64,
@@ -274,6 +281,18 @@ impl IsochPipe {
     /// is rounded up to a power of two. Task context.
     pub fn open(f: &UsbFunction, d: &IsochEpDesc, fmt: StreamFormat, fifo_bytes: usize)
                 -> Result<IsochPipe, &'static str> {
+        Self::open_ex(f, d, fmt, fifo_bytes, NTDS, false)
+    }
+
+    /// [`open`](Self::open) with `ntds` TDs kept queued (clamped to
+    /// 8..=[`NTDS_MAX`]) and, for IN, `framed`: the FIFO keeps per-TD packet
+    /// boundaries (one record per service interval, read back with
+    /// [`read_packet`](Self::read_packet)) — what UVC needs, since every
+    /// payload starts with its own header. A framed FIFO that is full drops
+    /// the new packet (counted as missed) instead of overwriting old data.
+    pub fn open_ex(f: &UsbFunction, d: &IsochEpDesc, fmt: StreamFormat, fifo_bytes: usize,
+                   ntds: usize, framed: bool) -> Result<IsochPipe, &'static str> {
+        let ntds = ntds.clamp(8, NTDS_MAX);
         let hc = &f.hc;
         let (slot, speed) = (f.slot, f.speed);
         let dir_in = d.is_in();
@@ -298,12 +317,12 @@ impl IsochPipe {
             if s.gone { return Err("device gone"); }
             if s.eps.get(dci).map_or(true, |e| e.is_some()) { return Err("endpoint already configured"); }
             let ring = ProducerRing::new(dma32).ok_or("oom: isoch ring")?;
-            let bounce = DmaBuf::new(NTDS * chunk, dma32).ok_or("oom: isoch buffers")?;
+            let bounce = DmaBuf::new(ntds * chunk, dma32).ok_or("oom: isoch buffers")?;
             let ty = if dir_in { EP_TYPE_ISOCH_IN } else { EP_TYPE_ISOCH_OUT };
             let mut ep = Endpoint::new(ring, ty, mps as u16, burst as u8, interval, esit.min(0xFFFF) as u16);
             ep.esit = esit;
             ep.bounce = Some(bounce);
-            ep.events = Vec::with_capacity(2 * NTDS + 8);
+            ep.events = Vec::with_capacity(2 * ntds + 8);
             s.eps[dci] = Some(ep);
             (dma32, x.build_configure_input(slot, 0, 1 << dci))
         };
@@ -327,10 +346,10 @@ impl IsochPipe {
             return Err("SET_INTERFACE failed");
         }
         usb_log!("[USB-ISOCH] slot {} ep {:02x} ({}) iface {} alt {}: mps {} burst {} esit {} interval {} us, {} TDs of {} B\n",
-                 slot, d.ep_addr, if dir_in { "in" } else { "out" }, d.iface, d.alt, mps, burst, esit, ival_us, NTDS, chunk);
+                 slot, d.ep_addr, if dir_in { "in" } else { "out" }, d.iface, d.alt, mps, burst, esit, ival_us, ntds, chunk);
         Ok(IsochPipe {
             hc: hc.clone(), slot, dci, ep_addr: d.ep_addr, iface: d.iface, dir_in, speed, chunk, mps, burst, esit,
-            ival_us, fmt, acc: 0, pending: Vec::with_capacity(NTDS), next_idx: 0,
+            ival_us, fmt, acc: 0, pending: Vec::with_capacity(ntds), next_idx: 0, ntds, framed: framed && dir_in,
             fifo: vec![0u8; fifo_bytes.max(2 * chunk).next_power_of_two()], wr: 0, rd: 0, done_bytes: 0,
             flowing: false, state: State::Running, reported_gone: false, local: IsochStats::default(),
         })
@@ -364,6 +383,20 @@ impl IsochPipe {
         let n = out.len().min(self.queued());
         self.fifo_take(&mut out[..n]);
         n
+    }
+
+    /// IN, framed: take the oldest packet (one service interval's data).
+    /// `Some(n)` is the packet's length; bytes beyond `out.len()` are
+    /// dropped. `None` when no packet is queued. No lock, no wait.
+    pub fn read_packet(&mut self, out: &mut [u8]) -> Option<usize> {
+        if !self.dir_in || !self.framed || self.queued() < 2 { return None; }
+        let mut h = [0u8; 2];
+        self.fifo_take(&mut h);
+        let n = u16::from_le_bytes(h) as usize;
+        let k = n.min(out.len());
+        self.fifo_take(&mut out[..k]);
+        self.rd += (n - k) as u64;
+        Some(n)
     }
 
     fn fifo_take(&mut self, out: &mut [u8]) {
@@ -413,7 +446,7 @@ impl IsochPipe {
         // An OUT stream starts with the producer's first write; an idle one
         // (paused, or never started) queues nothing and drains.
         if !self.dir_in && !self.flowing { return; }
-        while self.pending.len() < NTDS {
+        while self.pending.len() < self.ntds {
             if !self.dir_in && (self.wr - self.rd) < self.esit as u64 && self.pending.len() >= LOW_TDS {
                 break;
             }
@@ -449,8 +482,8 @@ impl IsochPipe {
             let t = Trb::new(TRB_ISOCH, base + off as u64, len, flags);
             let mut p = [0u64; 1];
             ep.ring.enqueue_td(&[t], &mut p);
-            self.pending.push(Pending { ptr: p[0], idx: idx as u8, len: len as u16 });
-            self.next_idx = (idx + 1) % NTDS;
+            self.pending.push(Pending { ptr: p[0], idx: idx as u16, len: len as u16 });
+            self.next_idx = (idx + 1) % self.ntds;
             queued = true;
         }
         if queued { regs.doorbell(self.slot, self.dci as u32); }
@@ -520,10 +553,21 @@ impl IsochPipe {
                     if self.dir_in && got > 0 {
                         let off = p.idx as usize * self.chunk;
                         buf.sync_range_for_cpu(off, self.chunk);
-                        // Keep the newest data when the reader falls behind.
                         let space = self.fifo.len() - (self.wr - self.rd) as usize;
-                        if got > space { self.rd += (got - space) as u64; }
                         let mask = self.fifo.len() - 1;
+                        if self.framed {
+                            // A record must stay whole: drop the new packet when full.
+                            if got + 2 > space { missed += 1; continue; }
+                            let h = (got as u16).to_le_bytes();
+                            for b in h {
+                                let o = (self.wr as usize) & mask;
+                                self.fifo[o] = b;
+                                self.wr += 1;
+                            }
+                        } else if got > space {
+                            // Keep the newest data when the reader falls behind.
+                            self.rd += (got - space) as u64;
+                        }
                         let start = (self.wr as usize) & mask;
                         let k1 = got.min(self.fifo.len() - start);
                         buf.copy_out(off, &mut self.fifo[start..start + k1]);
