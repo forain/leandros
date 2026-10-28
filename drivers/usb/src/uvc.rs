@@ -429,6 +429,10 @@ pub const EXPO_AUTO: u32 = 2; // explicit aperture priority
 pub static EXPO_MODE: AtomicU32 = AtomicU32::new(EXPO_DEFAULT);
 /// CT_EXPOSURE_TIME_ABSOLUTE, 100 us units, used in manual mode.
 pub static EXPO_ABS: AtomicU32 = AtomicU32::new(0);
+/// Explicit `uvc.ae_mode=N` (UVC bitmap value 1/2/4/8); -1 = pick automatically.
+pub static AE_MODE_REQ: AtomicI32 = AtomicI32::new(-1);
+/// Longest exposure (100 us units) that still fits a 30 fps frame interval.
+const EXPO_FRAME_CAP: u32 = 333;
 
 const CT_AE_MODE: u8 = 0x02;
 const CT_AE_PRIORITY: u8 = 0x03;
@@ -464,6 +468,31 @@ fn apply_controls(f: &UsbFunction, v: &VideoInfo) {
             if e != 0 && has(3) && !ctrl_set(f, v, CT_EXPOSURE_ABS, &e.to_le_bytes()) { bad += 1; }
         }
         EXPO_AUTO if has(1) => { if !ctrl_set(f, v, CT_AE_MODE, &[8]) { bad += 1; } }
+        _ if has(1) => {
+            let req = AE_MODE_REQ.load(Ordering::Relaxed);
+            if req >= 0 {
+                if !ctrl_set(f, v, CT_AE_MODE, &[req as u8]) { bad += 1; usb_log!("[UVC] slot {}: ae_mode {} refused\n", f.slot, req); }
+            } else if mode0 == 1 {
+                // Camera booted in manual mode: pick the best supported auto mode (GET_RES bitmap).
+                let sup = if ctrl_get(f, v, CT_AE_MODE, 0x84, &mut b[..1]).is_some() { b[0] } else { 0x0A };
+                let mut ok = false;
+                for m in [8u8, 2] {
+                    if sup & m != 0 {
+                        if ctrl_set(f, v, CT_AE_MODE, &[m]) { ok = true; break; }
+                        usb_log!("[UVC] slot {}: ae_mode {} refused (supported {:#x})\n", f.slot, m, sup);
+                    }
+                }
+                if !ok {
+                    bad += 1;
+                    let mut x = [0u8; 4];
+                    let cur = ctrl_get(f, v, CT_EXPOSURE_ABS, 0x81, &mut x).map(|_| u32::from_le_bytes(x)).unwrap_or(0);
+                    if has(3) && cur > EXPO_FRAME_CAP {
+                        let _ = ctrl_set(f, v, CT_EXPOSURE_ABS, &EXPO_FRAME_CAP.to_le_bytes());
+                        usb_log!("[UVC] slot {}: auto AE unavailable, manual exposure capped to {}\n", f.slot, EXPO_FRAME_CAP);
+                    }
+                }
+            }
+        }
         _ => {}
     }
     let mode1 = if has(1) && ctrl_get(f, v, CT_AE_MODE, 0x81, &mut b[..1]).is_some() { b[0] as i32 } else { -1 };
@@ -484,6 +513,9 @@ pub fn set_cmdline(cmdline: &str) {
         if let Some(v) = tok.strip_prefix("uvc.ae_prio=") {
             match v { "0" => AE_PRIO.store(0, Ordering::Relaxed), "1" => AE_PRIO.store(1, Ordering::Relaxed),
                       _ => AE_PRIO.store(-1, Ordering::Relaxed) }
+        }
+        if let Some(n) = tok.strip_prefix("uvc.ae_mode=").and_then(|x| x.parse::<i32>().ok()) {
+            AE_MODE_REQ.store(n, Ordering::Relaxed);
         }
         if let Some(v) = tok.strip_prefix("uvc.exposure=") {
             if v == "auto" { EXPO_MODE.store(EXPO_DEFAULT, Ordering::Relaxed); }
