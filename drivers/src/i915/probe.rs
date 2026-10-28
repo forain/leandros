@@ -347,6 +347,7 @@ fn log_opregion(f: &PciFunction) {
         hw::VbtLocation::Rvda(_, n) => { ilog!("VBT (RVDA): implausible size {}", n); return; }
         hw::VbtLocation::None => { log("VBT: none in the OpRegion"); return; }
     };
+    super::outputs::set_vbt(&vbt);
     let vi = match hw::parse_vbt(&vbt) {
         Some(v) => v,
         None => { log("VBT: invalid header"); return; }
