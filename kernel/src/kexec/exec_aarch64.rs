@@ -285,6 +285,18 @@ fn final_cpu0() -> ! {
             log(" never reached the park page; jumping anyway\n");
         }
     }
+    // Bus-stage hooks (pcie-perst + bridge reset) only now: every other CPU
+    // is on the park page, so none can be mid-access to RP1 when the bridge
+    // goes into reset. No allocation, no timer, no locks that a parked CPU
+    // could hold.
+    {
+        let mut any = false;
+        drivers::dma_shutdown::run_parked(drivers::dma_shutdown::Stage::Bus, |name, quiet| {
+            if !any { log("[kexec] bus quiesced:"); any = true; }
+            if quiet { log(" "); log(name); } else { log(" FAILED: "); log(name); }
+        });
+        if any { log("\n"); }
+    }
     for i in 1..n {
         if p.cpu_off == 0 { break; }
         let Some(m) = arch_aarch64::smp::mpidr_of(i) else { continue };
