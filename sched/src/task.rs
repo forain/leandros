@@ -630,6 +630,9 @@ pub struct Task {
     /// so of two threads exiting at once exactly one sees itself last and
     /// tears the process fd table down).
     pub exiting: bool,
+    /// Kernel thread (spawned by `spawn_with_arg`): never a process; on return it
+    /// is born reaped and leaves no exit record (see `kthread_exit`).
+    pub kthread: bool,
 
     // ââ Signal fast path (lane sigfast) âââââââââââââââââââââââââââââââââââââââ
     /// "This thread may have signal work": non-zero whenever
@@ -889,6 +892,7 @@ impl Task {
             delayed_leader: false,
             forced_exit: 0,
             exiting: false,
+            kthread: false,
             sig_hint: core::sync::atomic::AtomicU32::new(1),
             listen: crate::PollListen::OFF,
             ep_cache: None,
@@ -1312,6 +1316,7 @@ impl Task {
             delayed_leader: false,
             forced_exit: 0,
             exiting: false,
+            kthread: false,
             sig_hint: core::sync::atomic::AtomicU32::new(1),
             listen: crate::PollListen::OFF,
             ep_cache: None,

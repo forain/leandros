@@ -19,7 +19,9 @@ pub const LVL_SC_CLASS: u8 = 0xE0;
 pub const LVL_SC_DEV: u8 = 0xE1;
 pub const NAME_LEN: usize = 32;
 
-const CLASSES: [&str; 2] = ["power_supply", "backlight"];
+const CLASSES: [&str; 4] = ["power_supply", "backlight", "rtc", "power"];
+/// Index of the pseudo class served directly under `/sys/power` (files, no devices).
+const POWER: usize = 3;
 
 /// What the kernel registers. All names are ASCII; every fn must be callable
 /// with no VFS lock held and must not re-enter the VFS.
@@ -62,6 +64,17 @@ fn find_dev(o: &Ops, class: &str, name: &str) -> Option<usize> {
 struct Split<'a> { o: &'static Ops, cls: usize, dev: Option<&'a str>, attr: Option<&'a str> }
 
 fn split(path: &[u8]) -> Option<Split<'_>> {
+    if let Some(rest) = path.strip_prefix(b"/sys/power") {
+        let o = ops()?;
+        let mut b = [0u8; NAME_LEN];
+        (o.attrs)("power", "", 0, &mut b)?; // registered only while the kernel serves it
+        let rest = core::str::from_utf8(rest).ok()?;
+        if !rest.is_empty() && !rest.starts_with('/') { return None; }
+        let mut it = rest.split('/').skip(1);
+        let attr = it.next().filter(|s| !s.is_empty());
+        if it.next().is_some() { return Some(Split { o, cls: POWER, dev: None, attr: Some("") }); }
+        return Some(Split { o, cls: POWER, dev: None, attr });
+    }
     let rest = path.strip_prefix(b"/sys/class/")?;
     let rest = core::str::from_utf8(rest).ok()?;
     let mut it = rest.split('/');
@@ -84,6 +97,7 @@ pub fn is_path(path: &[u8]) -> bool {
 /// Resolve `path` to an overlay directory as `(dev, level)`.
 pub fn dir(path: &[u8]) -> Option<(u16, u8)> {
     let s = split(path)?;
+    if s.cls == POWER { return if s.attr.is_none() { Some((SC_BASE | (POWER as u16) << 8 | 0xFF, LVL_SC_CLASS)) } else { None }; }
     match (s.dev, s.attr) {
         (None, _) => Some((SC_BASE | (s.cls as u16) << 8 | 0xFF, LVL_SC_CLASS)),
         (Some(d), None) => {
@@ -97,6 +111,7 @@ pub fn dir(path: &[u8]) -> Option<(u16, u8)> {
 /// Read an attribute file.
 pub fn attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
     let s = split(path)?;
+    if s.cls == POWER { return (s.o.read)("power", "", s.attr?, out); }
     let (d, a) = (s.dev?, s.attr?);
     find_dev(s.o, CLASSES[s.cls], d)?;
     (s.o.read)(CLASSES[s.cls], d, a, out)
@@ -105,6 +120,7 @@ pub fn attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
 /// Whether the attribute at `path` exists and is writable.
 pub fn is_writable(path: &[u8]) -> bool {
     let Some(s) = split(path) else { return false };
+    if s.cls == POWER { return s.attr.map_or(false, |a| (s.o.writable)("power", "", a)); }
     let (Some(d), Some(a)) = (s.dev, s.attr) else { return false };
     (s.o.writable)(CLASSES[s.cls], d, a)
 }
@@ -112,6 +128,11 @@ pub fn is_writable(path: &[u8]) -> bool {
 /// Write to an attribute (0 or a negative errno).
 pub fn write(path: &[u8], data: &[u8]) -> i32 {
     let Some(s) = split(path) else { return -2 };
+    if s.cls == POWER {
+        let Some(a) = s.attr else { return -21 };
+        if !(s.o.writable)("power", "", a) { return -13; }
+        return (s.o.write)("power", "", a, data);
+    }
     let (Some(d), Some(a)) = (s.dev, s.attr) else { return -21 };
     if !(s.o.writable)(CLASSES[s.cls], d, a) { return -13; }
     (s.o.write)(CLASSES[s.cls], d, a, data)
@@ -124,6 +145,7 @@ pub fn dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_LEN]) -> Opti
     let cls = ((dev >> 8) & 0xF) as usize;
     let class = CLASSES.get(cls)?;
     match level {
+        LVL_SC_CLASS if cls == POWER => Some(((o.attrs)("power", "", idx, out)?, false)),
         LVL_SC_CLASS => Some(((o.devices)(class, idx, out)?, true)),
         LVL_SC_DEV => {
             let mut b = [0u8; NAME_LEN];

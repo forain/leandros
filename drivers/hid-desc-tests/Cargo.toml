@@ -1,0 +1,14 @@
+[package]
+name = "hid-desc-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Host-only test crate: compiles drivers/src/hid_desc.rs via #[path] and
+# runs it against HID descriptors and report streams. Detached from the kernel
+# workspace.
+# Run: cargo test --manifest-path drivers/hid-desc-tests/Cargo.toml --target <host-triple>
+[workspace]
+
+[lib]
+path = "src/lib.rs"

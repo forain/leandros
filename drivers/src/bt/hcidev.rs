@@ -1,17 +1,24 @@
-//! `/dev/hci0` on the Pi 5 (docs/servers/bluetooth.md section A): the raw HCI
+//! `/dev/hci0` (docs/servers/bluetooth.md section A), shared by the Pi 5
+//! UART transport and the USB one (usb.rs): the raw HCI
 //! node btd opens. A kernel-handler port answers the VFS from the shared
 //! `HciQueues`; the bt thread becomes the pump once the vendor init is done.
 //! The node is registered (by the kernel, through `on_ready`) only after that.
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 use alloc::format;
+use alloc::vec::Vec;
 use alloc::vec;
 use ipc::Message;
 use spin::Mutex;
 
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 use super::bringup::Transport;
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 use super::h4::H4Parser;
-use super::hcidev_core::{self as core_, pump_once, HciQueues, QueueLock};
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+use super::hcidev_core::pump_once;
+use super::hcidev_core::{self as core_, HciQueues, QueueLock};
 
 // VFS request tags (servers/vfs: drivers does not depend on vfs_server).
 const VFS_OPEN: u64 = 0x10;
@@ -103,6 +110,15 @@ fn handle(msg: &Message, _caller: u32, _target: u32) -> Message {
     }
 }
 
+static CLAIMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The first transport to claim wins `/dev/hci0` (Pi UART vs a USB dongle);
+/// the loser must not create a port or pump the shared queues.
+pub fn claim() -> bool { !CLAIMED.swap(true, Ordering::AcqRel) }
+
+/// True while a client has `/dev/hci0` open.
+pub fn is_open() -> bool { OWNER.load(Ordering::Acquire) != 0 }
+
 /// Creates the kernel-handler port for `/dev/hci0` (before it is registered).
 pub fn create_port() -> Option<u32> {
     let port = ipc::port::create(0)?;
@@ -110,6 +126,7 @@ pub fn create_port() -> Option<u32> {
     Some(port)
 }
 
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 /// The bt thread after a successful bring-up: moves packets between the
 /// queues and the controller forever. A failed send marks the node dead
 /// (POLLHUP|POLLERR, EIO) and the thread idles.
@@ -134,4 +151,25 @@ pub fn pump<T: Transport>(t: &mut T) -> ! {
             loop { sched::kthread::msleep(1000); }
         }
     }
+}
+
+/// Queues one received H4 packet for the reader (false: node closed or RX full).
+pub fn push_rx(pkt: Vec<u8>) -> bool { KLock.with(|q| q.push_rx(pkt)) }
+
+/// The next packet btd wrote, if any.
+pub fn pop_tx() -> Option<Vec<u8>> { KLock.with(|q| q.pop_tx()) }
+
+/// RX packets dropped because the queue was full.
+pub fn rx_drops() -> u64 { KLock.with(|q| q.rx_drops) }
+
+/// Marks the controller dead (POLLHUP|POLLERR, EIO) and wakes pollers.
+pub fn set_dead() {
+    KLock.with(|q| q.dead = true);
+    notify();
+}
+
+/// Readiness changed: bump the sequence word and wake pollers.
+pub fn notify() {
+    SEQ.fetch_add(1, Ordering::AcqRel);
+    sched::wake_poll_key(poll_key());
 }

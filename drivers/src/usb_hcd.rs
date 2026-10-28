@@ -43,6 +43,8 @@ pub const ROLE_KEYBOARD: u8 = 0x01;
 pub const ROLE_MOUSE: u8 = 0x02;
 pub const ROLE_MASS_STORAGE: u8 = 0x04;
 pub const ROLE_HUB: u8 = 0x08;
+/// Synthetic root-hub entry (one per controller), combined with ROLE_HUB.
+pub const ROLE_ROOT_HUB: u8 = 0x40;
 pub const ROLE_HID_UNSUPPORTED: u8 = 0x80;
 
 /// Turn on verbose xHCI tracing and the BOT self-test. Call before `init()`.
@@ -355,12 +357,31 @@ unsafe fn probe_one(pci: &PciDevice) {
     }
 }
 
+/// `usb.tbxhci=0`: skip the controller-gone (all-ones USBSTS) guard in the hot-plug scan.
+pub fn disable_controller_gone_guard() {
+    usb::TBXHCI_GUARD_OFF.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn device_count() -> usize {
-    usb::devices().len()
+    usb::controller_count() + usb::devices().len()
 }
 
 pub fn device_info(index: usize) -> Option<UsbDevInfo> {
-    let d = usb::devices().into_iter().nth(index)?;
+    let nctl = usb::controller_count();
+    if index < nctl {
+        let (_, usb3) = usb::controller_ports(index)?;
+        return Some(UsbDevInfo {
+            bus: index as u8,
+            address: 1,
+            vendor_id: 0x1d6b,
+            product_id: if usb3 { 0x0003 } else { 0x0002 },
+            class: 0x09,
+            role: ROLE_HUB | ROLE_ROOT_HUB,
+            port: 0,
+            speed: if usb3 { 4 } else { 3 },
+        });
+    }
+    let d = usb::devices().into_iter().nth(index - nctl)?;
     Some(UsbDevInfo {
         // `lsusb` prints bus + 1 (0-based, like the PCI-style syscalls).
         bus: d.bus.saturating_sub(1),
@@ -653,4 +674,56 @@ unsafe fn early_ehci_handoff(bus: u8, dev: u8, func: u8) {
     }
     pci_write_config_32(bus, dev, func, eecp + 4, 0);
     early_line(format_args!("[EHCI] {:02x}:{:02x}.{}: early BIOS handoff: USBLEGSUP {:#010x} ({}), SMIs off\n", bus, dev, func, leg, how));
+}
+
+/// (operational base, USBCMD) per controller, saved across a system-sleep cycle.
+static PM_SAVE: spin::Mutex<alloc::vec::Vec<(usize, u32)>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+fn pm_wait_hch(op: usize, halted: bool) -> Option<u64> {
+    let t = sched::monotonic_ns();
+    while sched::monotonic_ns() - t < 32_000_000 {
+        if (mmio_r32(op + OP_USBSTS) & 1 != 0) == halted { return Some(sched::monotonic_ns() - t); }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// System-sleep suspend hook (kernel pm). Default: controller interrupts off
+/// (USBCMD.INTE), the schedule keeps running. With `halt`: USBCMD.R/S = 0 and
+/// wait for HCHalted (xHCI 4.15: a halted controller keeps its rings and
+/// device contexts and continues from them when R/S is set again).
+pub fn pm_suspend(halt: bool) -> Result<alloc::string::String, alloc::string::String> {
+    let ctrls = CONTROLLERS.lock();
+    let mut save = PM_SAVE.lock();
+    save.clear();
+    for c in ctrls.iter() {
+        let caplen = (mmio_r32(c.base) & 0xFF) as usize;
+        let op = c.base + caplen;
+        if caplen == 0 || mmio_r32(op + OP_USBSTS) == !0 { continue; }
+        let cmd = mmio_r32(op + OP_USBCMD);
+        save.push((op, cmd));
+        if halt {
+            mmio_w32(op + OP_USBCMD, cmd & !(CMD_RUN | CMD_INTE));
+            if cmd & CMD_RUN != 0 && pm_wait_hch(op, true).is_none() {
+                for &(o, v) in save.iter() { mmio_w32(o + OP_USBCMD, v); }
+                save.clear();
+                return Err(alloc::format!("xHCI {:02x}:{:02x}.{} did not halt in 32 ms", c.bus, c.dev, c.func));
+            }
+        } else {
+            mmio_w32(op + OP_USBCMD, cmd & !CMD_INTE);
+        }
+    }
+    Ok(alloc::format!("{} controller(s) {}", save.len(), if halt { "halted" } else { "interrupts masked" }))
+}
+
+/// System-sleep resume hook: USBCMD back (R/S, INTE), wait for the run state.
+pub fn pm_resume() -> Result<alloc::string::String, alloc::string::String> {
+    let save = core::mem::take(&mut *PM_SAVE.lock());
+    let mut bad = 0;
+    for &(op, cmd) in save.iter() {
+        mmio_w32(op + OP_USBCMD, cmd);
+        if cmd & CMD_RUN != 0 && pm_wait_hch(op, false).is_none() { bad += 1; }
+    }
+    if bad != 0 { return Err(alloc::format!("{} of {} controller(s) did not restart", bad, save.len())); }
+    Ok(alloc::format!("{} controller(s) running", save.len()))
 }

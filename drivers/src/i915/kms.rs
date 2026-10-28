@@ -652,6 +652,7 @@ fn native_setup(m: &Mmio, gw: u32, gh: u32) -> Option<(u32, u32)> {
     // else transcoder A.
     let edp = m.r(reg::TRANS_DDI_FUNC_CTL_EDP);
     let edp_on = m.r(reg::TRANSCONF_EDP) >> 31 != 0 && edp >> 31 != 0 && matches!((edp >> 12) & 7, 0 | 4);
+    crate::gpu_kms::set_internal_panel(edp_on);
     let (tbase, ddi, name) = if edp_on {
         (reg::TRANS_HTOTAL_EDP, edp, "eDP")
     } else if m.r(reg::TRANSCONF_A) >> 31 != 0 {
@@ -954,6 +955,7 @@ pub(super) fn init(d: &Device, env: &BootEnv) {
     let vbl = super::vblank::init(d);
     let cur = super::cursor::init(d);
     super::outputs::init(d);
+    super::pipeb_stub::init(d);
     crate::gpu_kms::register(&BACKEND);
     ilog!("kms: flips {}; hardware cursor {}",
           if vbl { "on real vblank (queued, armed after the render fence, event at the latching vblank; i915.vblank=0: synchronous + 60 Hz synthetic events)" }
@@ -968,4 +970,45 @@ pub(super) fn init(d: &Device, env: &BootEnv) {
           opt("i915.kms_uncached").unwrap_or(1), opt("i915.kms_clflush").unwrap_or(2), opt("i915.ppat_cached").unwrap_or(4),
           opt("i915.kms_psr").unwrap_or(0), debug() as u8,
           DUMP_AT[0].load(Ordering::Relaxed), DUMP_AT[1].load(Ordering::Relaxed));
+}
+
+/// PLANE_CTL of plane 1A saved across a system-sleep cycle (bit 31 = it was on).
+static PM_CTL: AtomicU32 = AtomicU32::new(0);
+
+/// System-sleep suspend hook: plane 1A off (no scanout DMA from memory);
+/// pipe, port and panel stay up (freeze semantics; S3 will need the full
+/// modeset restore).
+pub(super) fn pm_plane_off() -> Result<alloc::string::String, alloc::string::String> {
+    if FAKE.load(Ordering::Relaxed) || MMIO.load(Ordering::Acquire) == 0 { return Ok(alloc::string::String::from("no KMS display")); }
+    let m = mmio();
+    let ctl = m.r(preg(reg::PLANE_CTL_1_A));
+    PM_CTL.store(ctl, Ordering::SeqCst);
+    if ctl >> 31 == 0 { return Ok(alloc::string::String::from("plane 1A already off")); }
+    let surf = m.r(preg(reg::PLANE_SURF_1_A));
+    m.w(preg(reg::PLANE_CTL_1_A), ctl & !(1 << 31));
+    m.w(preg(reg::PLANE_SURF_1_A), surf);
+    Ok(alloc::format!("plane 1A off (CTL {:08x} SURF {:08x})", ctl, surf))
+}
+
+/// System-sleep resume hook: plane 1A back with its saved control word on
+/// the surface it has now; waits (<= 100 ms) until the hardware scans it out.
+pub(super) fn pm_plane_on() -> Result<alloc::string::String, alloc::string::String> {
+    let ctl = PM_CTL.swap(0, Ordering::SeqCst);
+    if ctl >> 31 == 0 { return Ok(alloc::string::String::from("plane 1A was off; left off")); }
+    let m = mmio();
+    let surf = m.r(preg(reg::PLANE_SURF_1_A));
+    m.w(preg(reg::PLANE_CTL_1_A), ctl);
+    m.w(preg(reg::PLANE_SURF_1_A), surf);
+    let t = sched::monotonic_ns();
+    loop {
+        let live = m.r(preg(PLANE_SURFLIVE_1_A));
+        let on = m.r(preg(reg::PLANE_CTL_1_A)) >> 31 != 0;
+        if on && live & !0xFFF == surf & !0xFFF {
+            return Ok(alloc::format!("plane 1A on, scanning out {:08x} after {} us", live, (sched::monotonic_ns() - t) / 1000));
+        }
+        if sched::monotonic_ns() - t > 100_000_000 {
+            return Err(alloc::format!("plane 1A: SURFLIVE {:08x} != SURF {:08x} after 100 ms (CTL on={})", live, surf, on));
+        }
+        sched::kthread::msleep(1);
+    }
 }

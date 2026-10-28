@@ -12801,6 +12801,8 @@ fn dyn_dev_meta(major: u32, minor: u32) -> xattr::FileMeta {
         (10, 223) => xattr::FileMeta { mode: S_IFCHR | 0o600, uid: 0, gid: 0 },
         (SOUND_MAJOR, _) => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_AUDIO },
         (226, m) if m < 128 => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_VIDEO },
+        // /dev/video* (V4L2 capture): root:video 0660, as udev does.
+        (81, _) => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_VIDEO },
         // /dev/netctl: everyone reads state, root and netdev may manage. The
         // net server records per open whether it was opened for writing and
         // refuses mutating ioctls on a read-only open (EPERM).
