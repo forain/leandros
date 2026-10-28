@@ -1192,10 +1192,11 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
         // interfaces)? Select its configuration; a class driver opens the
         // streams later with `isoch::IsochPipe::open`.
         let mut audio = None;
-        if hid.is_empty() && isoch::has_audio_streaming(&cfg) {
+        let video = crate::uvc::has_video_streaming(&cfg);
+        if hid.is_empty() && (video || isoch::has_audio_streaming(&cfg)) {
             match control(hc, slot, 0x00, 9, ci.value as u16, 0, CtrlData::None, ENUM_CTRL_TIMEOUT_MS) {
                 Ok(_) => {
-                    info.class = 0x01;
+                    info.class = if video { 0x0E } else { 0x01 };
                     audio = Some(isoch::UsbFunction {
                         hc: hc.clone(), slot, speed, config_value: ci.value, cfg: cfg.clone(),
                     });
