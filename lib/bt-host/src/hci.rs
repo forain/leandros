@@ -21,6 +21,7 @@ pub mod op {
     pub const SET_CONN_ENCRYPT: u16 = 0x0413;
     pub const REMOTE_NAME_REQ: u16 = 0x0419;
     pub const IO_CAP_REPLY: u16 = 0x042b;
+    pub const IO_CAP_NEG_REPLY: u16 = 0x0434;
     pub const USER_CONFIRM_REPLY: u16 = 0x042c;
     pub const USER_PASSKEY_NEG_REPLY: u16 = 0x042f;
     pub const SET_EVENT_MASK: u16 = 0x0c01;

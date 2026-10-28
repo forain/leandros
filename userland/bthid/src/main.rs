@@ -51,6 +51,19 @@ const EV_CONNECT_RESULT: u8 = 0x81;
 const EV_RECV: u8 = 0x83;
 const EV_CLOSED: u8 = 0x84;
 const EV_INCOMING: u8 = 0x85;
+const EV_LINK: u8 = 0x86;
+/// After an incoming ACL from a listed device: wait this long for it to open L2CAP itself.
+const INCOMING_WAIT_MS: u64 = 3000;
+/// Delay before the one retry of an outgoing connect that btd refused as BUSY.
+const RETRY_MS: u64 = 2000;
+
+fn now_ms() -> u64 {
+    #[cfg(target_arch = "aarch64")] const SYS_CLOCK_GETTIME: usize = 113;
+    #[cfg(target_arch = "x86_64")] const SYS_CLOCK_GETTIME: usize = 228;
+    let mut ts = [0u64; 2];
+    unsafe { syscall3(SYS_CLOCK_GETTIME, 1, ts.as_mut_ptr() as usize, 0); }
+    ts[0] * 1000 + ts[1] / 1_000_000
+}
 const EV_DEVICE: u8 = 0x90;
 const EV_RESULT: u8 = 0x91;
 
@@ -280,13 +293,20 @@ struct Dev {
     /// We started this connection (and connect 0x11/0x13 after SDP).
     outgoing: bool,
     busy: bool,
+    /// Retries of a BUSY outgoing connect used since the last `start`.
+    retries: u8,
+    /// ms deadline (0 = none) to retry a BUSY outgoing connect.
+    retry_at: u64,
+    /// ms deadline (0 = none) to connect over an ACL the device made but left silent.
+    wait_until: u64,
 }
 
 impl Dev {
     fn new(addr: [u8; 6]) -> Dev {
         let (vid, pid, desc) = match load_cache(&addr) { Some((v, p, d)) => (v, p, Some(d)), None => (0, 0, None) };
         Dev { addr, ctrl: None, intr: None, sdp: None, stage: Sdp::Idle, acc: Vec::new(), vid, pid, desc,
-              hid: None, nodes: [-1; 3], outgoing: false, busy: false }
+              hid: None, nodes: [-1; 3], outgoing: false, busy: false,
+              retries: 0, retry_at: 0, wait_until: 0 }
     }
 }
 
@@ -325,7 +345,15 @@ impl Host {
     /// Outgoing connect: SDP first unless the descriptor is cached.
     fn start(&mut self, a: [u8; 6]) {
         let i = self.dev(&a);
+        self.devs[i].retries = 0;
+        self.start_try(a);
+    }
+
+    fn start_try(&mut self, a: [u8; 6]) {
+        let i = self.dev(&a);
         let d = &mut self.devs[i];
+        d.retry_at = 0;
+        d.wait_until = 0;
         if d.busy || d.ctrl.is_some() || d.intr.is_some() { return; }
         d.outgoing = true;
         let cached = d.desc.is_some();
@@ -450,7 +478,28 @@ impl Host {
                 self.devs[i].busy = false;
                 if status != 0 {
                     eprintln!("bthid: {}: connect PSM 0x{:02x} failed (status {})", A(a), psm, status);
-                    self.teardown(i, "connect failed");
+                    let d = &mut self.devs[i];
+                    if d.ctrl.is_some() || d.intr.is_some() {
+                        sayln!("bthid: {}: outgoing PSM 0x{:02x} failed (status {}); keeping the device's channels", A(a), psm, status);
+                        d.outgoing = false;
+                    } else if (status == 7 || status == 10) && d.retries < 1 {
+                        d.retries += 1;
+                        d.outgoing = true;
+                        d.retry_at = now_ms() + RETRY_MS;
+                        sayln!("bthid: {}: btd busy (status {}), retrying in {} ms", A(a), status, RETRY_MS);
+                    } else {
+                        self.teardown(i, "connect failed");
+                    }
+                    return;
+                }
+                let slot_taken = match psm {
+                    report::SDP_PSM => self.devs[i].sdp.is_some(),
+                    report::HID_CONTROL_PSM => self.devs[i].ctrl.is_some(),
+                    _ => self.devs[i].intr.is_some(),
+                };
+                if slot_taken {
+                    sayln!("bthid: {}: duplicate PSM 0x{:02x}, keeping the first", A(a), psm);
+                    self.bt.close(cid);
                     return;
                 }
                 match psm {
@@ -472,7 +521,21 @@ impl Host {
                 let mut a = [0u8; 6];
                 a.copy_from_slice(&p[2..8]);
                 let psm = u16at(8);
+                if (psm == report::HID_CONTROL_PSM || psm == report::HID_INTERRUPT_PSM) && !listed().contains(&a) {
+                    sayln!("bthid: {}: incoming PSM 0x{:02x} from an unlisted device, closing", A(a), psm);
+                    self.bt.close(cid);
+                    return;
+                }
                 let i = self.dev(&a);
+                self.devs[i].outgoing = false;
+                self.devs[i].retry_at = 0;
+                self.devs[i].wait_until = 0;
+                let filled = if psm == report::HID_CONTROL_PSM { self.devs[i].ctrl.is_some() } else { self.devs[i].intr.is_some() };
+                if filled && self.devs[i].hid.is_none() {
+                    sayln!("bthid: {}: duplicate PSM 0x{:02x}, keeping the first", A(a), psm);
+                    self.bt.close(cid);
+                    return;
+                }
                 if psm == report::HID_CONTROL_PSM {
                     if self.devs[i].hid.is_some() { self.teardown(i, "reconnected"); }
                     self.devs[i].ctrl = Some(cid);
@@ -501,6 +564,23 @@ impl Host {
                         if !mine.is_empty() { uinput_write(fd, &mine); }
                     }
                     if data.first() == Some(&report::HIDP_VC_UNPLUG) { self.teardown(i, "virtual cable unplug"); }
+                }
+            }
+            EV_LINK if p.len() >= 8 => {
+                let mut a = [0u8; 6];
+                a.copy_from_slice(&p[..6]);
+                let up = p[6] != 0;
+                if !listed().contains(&a) { return; }
+                let i = self.dev(&a);
+                let d = &mut self.devs[i];
+                if up {
+                    if d.ctrl.is_none() && d.intr.is_none() && !d.busy {
+                        d.wait_until = now_ms() + INCOMING_WAIT_MS;
+                        sayln!("bthid: {}: ACL up (incoming {}), waiting {} ms for the device", A(a), p[7], INCOMING_WAIT_MS);
+                    }
+                } else {
+                    d.wait_until = 0;
+                    d.retry_at = 0;
                 }
             }
             EV_CLOSED if p.len() >= 2 => {
@@ -564,7 +644,8 @@ fn daemon() -> i32 {
     let mut h = Host { bt, devs: Vec::new(), names: Vec::new(), next_req: 0, reqs: Vec::new(), tid: 0 };
     for a in listed() { h.start(a); }
     loop {
-        match poll1(h.bt.fd, 2000) {
+        let armed = h.devs.iter().any(|d| d.wait_until != 0 || d.retry_at != 0);
+        match poll1(h.bt.fd, if armed { 500 } else { 2000 }) {
             Ok(r) if r != 0 => {
                 if h.bt.fill().is_err() {
                     eprintln!("bthid: btd went away; restarting");
@@ -576,6 +657,17 @@ fn daemon() -> i32 {
             }
             Ok(_) => {}
             Err(_) => sleep_ms(100),
+        }
+        if armed {
+            let now = now_ms();
+            let due: Vec<[u8; 6]> = h.devs.iter()
+                .filter(|d| (d.wait_until != 0 && now >= d.wait_until) || (d.retry_at != 0 && now >= d.retry_at))
+                .map(|d| d.addr).collect();
+            for a in due {
+                let i = h.dev(&a);
+                if h.devs[i].ctrl.is_none() { sayln!("bthid: {}: connecting over the existing link", A(a)); }
+                h.start_try(a);
+            }
         }
         // `bthid connect ADDR` requests.
         if let Some(t) = read_file(REQ) {
