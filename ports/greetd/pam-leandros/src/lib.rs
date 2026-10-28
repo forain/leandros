@@ -220,7 +220,10 @@ pub unsafe extern "C" fn pam_authenticate(pamh: *mut PamHandle, _flags: c_int) -
         let p = (*resp).resp;
         if p.is_null() { Vec::new() } else { CStr::from_ptr(p).to_bytes().to_vec() }
     };
+    let t0 = std::time::Instant::now();
     let verdict = verify_user(&user, &password);
+    // Diagnostic only (lane lapgreet): outcome and timing, never the secret.
+    eprintln!("pam-leandros: auth user={} rc={} in {} ms", user, verdict, t0.elapsed().as_millis());
     free_responses(resp, 1);
     verdict
 }

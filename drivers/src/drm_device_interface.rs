@@ -6003,6 +6003,16 @@ fn master_release(open_id: u32) -> bool {
     any
 }
 
+/// Diagnostic klog line for master hand-over (lane lapgreet). dmesg only;
+/// rate-limited to 8 lines per boot so a spinning client cannot flood it.
+fn master_trace(msg: alloc::string::String) {
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    extern "C" { fn klog_write_only(s: *const u8, len: usize); }
+    let line = alloc::format!("drm: {}\n", msg);
+    unsafe { klog_write_only(line.as_ptr(), line.len()); }
+}
+
 /// `DRM_IOCTL_SET_MASTER`.
 fn master_set(open_id: u32) -> Result<usize, DriverError> {
     if open_id == 0 { return Ok(0); }
@@ -6028,6 +6038,9 @@ fn master_set(open_id: u32) -> Result<usize, DriverError> {
     } else {
         // The VT on screen has a master already.
         vtstats::MASTER_SET_BUSY.fetch_add(1, Ordering::Relaxed);
+        master_trace(alloc::format!(
+            "SET_MASTER EBUSY open_id {} (holder open_id {})",
+            open_id, vtstats::MASTER_HOLDER.load(Ordering::Relaxed)));
         Err(DriverError::Busy)
     }
 }
@@ -6058,6 +6071,7 @@ pub fn drm_master_clear(open_id: u32) {
         return;
     }
     if master_release(open_id) {
+        master_trace(alloc::format!("master released open_id {} (last close)", open_id));
         vtstats::MASTER_CLEARED.fetch_add(1, Ordering::Relaxed);
     }
 }

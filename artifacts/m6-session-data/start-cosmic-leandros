@@ -15,6 +15,14 @@
 # overridable from the environment; the defaults target a single-GPU QEMU guest.
 set -eu
 
+# Diagnostic trace (lane lapgreet): one stderr line per step, with uptime.
+_trace() {
+	_up=""
+	read -r _up _ < /proc/uptime 2>/dev/null || true
+	echo "start-cosmic: ${_up:-?} step $* (uid $(id -u))" >&2
+}
+_trace begin
+
 # ---- runtime dir (wayland socket + dbus socket live here) -------------------
 # cosmic-comp creates $XDG_RUNTIME_DIR/wayland-N; dbus-run-session puts its
 # socket here too. Must be a writable 0700 tmpfs owned by the session uid.
@@ -227,8 +235,12 @@ if [ -x /usr/bin/pipewire ] && [ "${LEANDROS_NO_PIPEWIRE:-0}" != "1" ]; then
 	fi
 fi
 
+if [ -d "${HOME:-/nonexistent}" ]; then _trace "home ok"; else _trace "home MISSING (${HOME:-unset})"; fi
+if [ -d "$XDG_RUNTIME_DIR" ]; then _trace "runtime dir ok"; else _trace "runtime dir MISSING"; fi
 if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+	_trace "exec cosmic-session"
 	exec /bin/cosmic-session /bin/cosmic-comp --no-xwayland
 else
+	_trace "dbus-run-session + exec cosmic-session"
 	exec /bin/sh /usr/bin/dbus-run-session -- /bin/cosmic-session /bin/cosmic-comp --no-xwayland
 fi
