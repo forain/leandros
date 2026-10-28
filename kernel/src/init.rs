@@ -227,6 +227,10 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // USB Bluetooth (btusb + Intel firmware): a kthread that registers
     // /dev/hci0 once the controller is set up ([btusb] lines).
     drivers::bt::usb::start(crate::boot_cmdline().unwrap_or(""), |port| vfs_server::register_device_notify_open("/dev/hci0", port, 0, vfs_server::HCI_MAJOR, vfs_server::HCI_MINOR));
+    // Permanent canary (lane kexit): kernel threads whose closure returns must
+    // leave no process behind; pstest/sudotest/ps fail if one ever does.
+    let _ = sched::kthread::spawn("kexit0", || {});
+    let _ = sched::kthread::spawn("kexit1", || sched::kthread::msleep(50));
     // The xHCI BIOS handoff above ends the firmware's USB legacy (PS/2)
     // emulation: an i8042 that was only ever that emulation is gone now.
     #[cfg(target_arch = "x86_64")]
@@ -330,6 +334,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     sched::spawn(net_server::net_daemon, 0).map(|p| sched::set_comm(p, b"netd"));
     crate::netwatch::init();
     #[cfg(target_arch = "x86_64")] crate::lappower::init(boot_info.rsdp_addr, boot_info.hhdm_offset, crate::boot_cmdline().unwrap_or("")); // ACPI power poll + /sys/class/{power_supply,backlight} + lid/power-button evdev
+    crate::pm::init(); // /sys/power, /sys/class/rtc, pm.s3 knobs (inert by default); replaces lappower's ops table with a delegating one
     net_server::netctl::init(crate::boot_cmdline().unwrap_or("")); // /dev/netctl
     // Block devices are initialized, but f2fs disk mounting is deferred to userspace init.
 

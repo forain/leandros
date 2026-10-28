@@ -21,7 +21,7 @@ use spin::Mutex;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
 use smoltcp::socket::{tcp, udp, icmp};
 use smoltcp::time::Instant;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicBool, AtomicU64};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 
 // ── Protocol tag constants ────────────────────────────────────────────────────
@@ -102,6 +102,20 @@ const NET_DEBUG: bool = false;
 /// `servers/drm/src/lib.rs` bounds its mmap trace.
 static ACCEPT_EAGAIN_SEEN: AtomicU32 = AtomicU32::new(0);
 const ACCEPT_EAGAIN_LIMIT: u32 = 64;
+
+/// Start (ms+1) of the current tx_ready()==false episode; 0 = none. A held
+/// episode longer than 2 s is logged once (pigem-bulk diagnosis).
+static TX_HELD_SINCE: AtomicU64 = AtomicU64::new(0);
+static TX_HELD_LOGGED: AtomicBool = AtomicBool::new(false);
+fn tx_held_episode(id: usize, now_ms: i64, held: u64) {
+    let since = TX_HELD_SINCE.load(Ordering::Relaxed);
+    if since == 0 { TX_HELD_SINCE.store(now_ms as u64 + 1, Ordering::Relaxed); TX_HELD_LOGGED.store(false, Ordering::Relaxed); return; }
+    if now_ms as u64 + 1 - since >= 2000 && !TX_HELD_LOGGED.swap(true, Ordering::Relaxed) {
+        extern "C" { fn arch_serial_putc(c: u8); }
+        let _ = (id, held);
+        for &b in b"netd: tx held >2 s (see tx_held in /proc/net)\n" { unsafe { arch_serial_putc(b); } }
+    }
+}
 
 fn dbg(msg: &str) {
     if !NET_DEBUG { return; }
@@ -2817,15 +2831,17 @@ impl<'a> smoltcp::phy::Device for NicDevice {
         }
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+    fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>> {
         // Backpressure: a driver whose queue is past its high-water mark
         // gets nothing more; smoltcp keeps the segments (TCP in its send
         // buffer, UDP in the socket's) and retries on a later pass. The
         // driver kicks the daemon when its queue drains.
         if !self.netif.tx_ready() {
-            iface::STATS[self.netif.id as usize].tx_held.fetch_add(1, Ordering::Relaxed);
+            let held = iface::STATS[self.netif.id as usize].tx_held.fetch_add(1, Ordering::Relaxed) + 1;
+            tx_held_episode(self.netif.id as usize, timestamp.total_millis(), held);
             return None;
         }
+        TX_HELD_SINCE.store(0, Ordering::Relaxed);
         Some(TxToken { netif: self.netif })
     }
 

@@ -6905,7 +6905,7 @@ impl DrmDeviceInterface {
         // 11 is DRM_MODE_CONNECTOR_HDMIA (VIRTUAL is 15), kept as before. A
         // backend with real extra outputs (i915) drives the internal panel:
         // report eDP-1 so it never shares a name with an HDMI-A-1 port.
-        conn.connector_type = if crate::gpu_kms::ext_count() > 0 { 14 } else { 11 };
+        conn.connector_type = if crate::gpu_kms::internal_panel() { 14 } else { 11 };
         conn.connector_type_id = 1;
         conn.connection = 1; // Connected
 
@@ -6981,6 +6981,9 @@ impl DrmDeviceInterface {
         };
         conn.connector_type = inf.conn_type;
         conn.connector_type_id = inf.type_id;
+        // No CRTC can drive it: hide from clients (cosmic-comp bails on a connected output without one).
+        let hidden = crate::gpu_kms::ext_crtc_mask(i) == 0 && crate::nvidia_probe::cmdline_opt("i915.extout_show") != Some(1);
+        let inf = if hidden { crate::gpu_kms::KmsConnInfo { connected: false, nmodes: 0, ..inf } } else { inf };
         conn.connection = if inf.connected { 1 } else { 2 };
         conn.mm_width = inf.mm_w;
         conn.mm_height = inf.mm_h;
@@ -7018,7 +7021,7 @@ impl DrmDeviceInterface {
             // Not bound, and no CRTC can drive it yet (no second-pipe modeset).
             enc.encoder_type = crate::gpu_kms::outputs().and_then(|o| (o.cached)(i)).map_or(2, |c| c.enc_type);
             enc.crtc_id = if crate::gpu_kms::extra_crtcs() > 0 { EXT_CONN_CRTC[i].load(Ordering::Relaxed) } else { 0 };
-            enc.possible_crtcs = crate::gpu_kms::pipe2_mask(i);
+            enc.possible_crtcs = crate::gpu_kms::ext_crtc_mask(i);
             enc.possible_clones = 0;
             return Ok(0);
         }

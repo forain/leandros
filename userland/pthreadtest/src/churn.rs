@@ -140,5 +140,24 @@ pub unsafe fn test_thread_churn_flat(n: u64) -> bool {
     let det = sample();
     put_sample(b"detach", nd as u64, det);
     let ok_det = within(base, det);
-    report(name, ok_join && ok_det)
+
+    // Cancellation racing thread exit (threadleak2): the cancel signal may
+    // land while the thread is already exiting. Neither the joinable nor the
+    // detached case may run the exit path twice (double post / zombie cycle).
+    let nc = core::cmp::max(n / 5, 100);
+    for i in 0..nc {
+        let mut t: pthread_t = core::ptr::null_mut();
+        if pthread_create(&mut t, core::ptr::null(), churn_joinable, i as *mut c_void) != 0 { return report(name, false); }
+        pthread_cancel(t);
+        if i % 2 == 0 {
+            let mut rv: *mut c_void = core::ptr::null_mut();
+            if pthread_join(t, &mut rv) != 0 { return report(name, false); }
+        } else if pthread_detach(t) != 0 { return report(name, false); }
+        if i % 64 == 63 { usleep(2000); }
+    }
+    usleep(50_000);
+    if !spawn_join(10) { return report(name, false); }
+    let cs = sample();
+    put_sample(b"cancel", nc, cs);
+    report(name, ok_join && ok_det && within(base, cs))
 }

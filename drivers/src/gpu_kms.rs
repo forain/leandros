@@ -36,7 +36,7 @@
 //!   * `KmsCursor` — a hardware cursor plane: the DRM cursor plane is exposed
 //!     while a backend is registered only when this is.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::DriverError;
 
@@ -239,7 +239,18 @@ pub struct KmsOutputs {
     pub info: fn(idx: usize) -> Option<KmsConnInfo>,
     /// Lock-free cached view (GETENCODER / GETRESOURCES, under the DRM lock).
     pub cached: fn(idx: usize) -> Option<KmsConnInfo>,
+    /// Possible-CRTC bitmask of extra `idx` (0: no CRTC can drive it).
+    pub crtc_mask: fn(idx: usize) -> u32,
 }
+
+static INTERNAL_PANEL: AtomicBool = AtomicBool::new(false);
+
+/// The backend scans out an internal panel (eDP): connector 1 reports eDP.
+pub fn set_internal_panel(v: bool) { INTERNAL_PANEL.store(v, Ordering::Release); }
+pub fn internal_panel() -> bool { INTERNAL_PANEL.load(Ordering::Acquire) }
+
+/// Possible-CRTC mask of extra `idx`, 0 when no backend/CRTC.
+pub fn ext_crtc_mask(idx: usize) -> u32 { outputs().map_or(0, |o| (o.crtc_mask)(idx)) | pipe2_mask(idx) }
 
 static OUTPUTS: AtomicPtr<KmsOutputs> = AtomicPtr::new(core::ptr::null_mut());
 
