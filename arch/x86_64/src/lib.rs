@@ -26,6 +26,8 @@ pub mod rtc;
 #[cfg(target_arch = "x86_64")]
 pub mod smp;
 #[cfg(target_arch = "x86_64")]
+pub mod s3;
+#[cfg(target_arch = "x86_64")]
 pub mod syscall;
 #[cfg(target_arch = "x86_64")]
 pub mod timer;
@@ -153,7 +155,9 @@ pub fn init(info: &boot::BootInfo) {
         // overwrite firmware data: boot on the BSP alone instead.
         let ok = info.memory_regions().iter().any(|r| r.kind == boot::MemoryType::Available
             && r.base <= 0x7000 && r.base + r.length >= 0x8000);
-        if ok {
+        if ok && smp::nosmp() {
+            cpus::log("[SMP] nosmp: application processors NOT started (1 CPU)\n");
+        } else if ok {
             unsafe { smp::smp_init(); }
         } else {
             cpus::log("[SMP] trampoline page 0x7000 is not usable RAM in the firmware memory map; application processors NOT started (1 CPU)\n");
