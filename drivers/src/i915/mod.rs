@@ -81,6 +81,7 @@ mod rps;
 pub use rps::proc_text;
 mod vblank;
 mod cursor;
+mod outputs;
 
 use hw::reg;
 
