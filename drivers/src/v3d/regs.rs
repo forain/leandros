@@ -236,5 +236,8 @@ pub const PM_V3DRSTN: u32 = bit(6);
 // ── Firmware clock (mailbox property interface) ──
 pub const FW_CLK_V3D: u32 = 5;
 pub const TAG_GET_MAX_CLOCK_RATE: u32 = 0x0003_0004;
+/// RPI_FIRMWARE_SET_DOMAIN_STATE; domain 10 = V3D (RPI_POWER_DOMAIN_V3D).
+pub const TAG_SET_DOMAIN_STATE: u32 = 0x0003_8030;
+pub const FW_DOMAIN_V3D: u32 = 10;
 pub const TAG_SET_CLOCK_STATE: u32 = 0x0003_8001;
 pub const TAG_SET_CLOCK_RATE: u32 = 0x0003_8002;

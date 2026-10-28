@@ -71,8 +71,9 @@ pub fn ident_line(r: &power::ProbeReport) -> alloc::string::String {
 /// Formats the one failure line.
 pub fn fail_line(e: power::PowerError, r: &power::ProbeReport) -> alloc::string::String {
     alloc::format!(
-        "[v3d] fail {} {} val=0x{:08x} grafx=0x{:08x}->0x{:08x} pm=0x{:08x}->0x{:08x} clk={}MHz\n",
-        e.step().name(), e.kind(), e.value(), r.grafx_before, r.grafx_after, r.pm_before, r.pm_after, r.clk_hz / 1_000_000
+        "[v3d] fail {} {} val=0x{:08x} grafx=0x{:08x}->0x{:08x} pm=0x{:08x}->0x{:08x} clk={}MHz fw=0x{:08x} grafx_fw=0x{:08x}->0x{:08x}\n",
+        e.step().name(), e.kind(), e.value(), r.grafx_before, r.grafx_after, r.pm_before, r.pm_after, r.clk_hz / 1_000_000,
+        r.fw_dom, r.grafx_pre_fw, r.grafx_post_fw
     )
 }
 
@@ -113,6 +114,8 @@ mod hw {
     struct Env {
         pm: usize,
         hhdm: usize,
+        /// `v3d.pwr=pm` turns the firmware power-domain step off.
+        fw_dom: bool,
     }
 
     impl Env {
@@ -148,6 +151,10 @@ mod hw {
         fn clk_set_rate(&mut self, id: u32, hz: u32) -> Option<u32> {
             self.tag(TAG_SET_CLOCK_RATE, &[id, hz, 0]).map(|v| v[1])
         }
+        fn fw_domain(&mut self, domain: u32, on: bool) -> Option<u32> {
+            if !self.fw_dom { return None; }
+            self.tag(TAG_SET_DOMAIN_STATE, &[domain, on as u32]).map(|v| v[1])
+        }
         fn delay_us(&mut self, us: u32) {
             let end = sched::monotonic_ns() + us as u64 * 1000;
             while sched::monotonic_ns() < end {
@@ -182,7 +189,7 @@ mod hw {
         };
         // The HHDM does not cover the mailbox registers this late in boot.
         crate::rpi_mailbox::set_mbox_virt(mbox);
-        let mut env = Env { pm, hhdm: hhdm_offset as usize };
+        let mut env = Env { pm, hhdm: hhdm_offset as usize, fw_dom: !cmdline.split_ascii_whitespace().any(|t| t == "v3d.pwr=pm") };
         let t0 = sched::monotonic_ns();
         let res = power::power_on(MmioRegs { hub, core, sms }, &mut env);
         // Bus errors from the accesses above are asynchronous: catch them here,
@@ -195,6 +202,7 @@ mod hw {
         }
         match res {
             Ok((dev, rep)) => {
+                serial_debug(&alloc::format!("[v3d] fw-domain reply=0x{:08x} grafx_fw=0x{:08x}->0x{:08x}\n", rep.fw_dom, rep.grafx_pre_fw, rep.grafx_post_fw));
                 serial_debug(&ident_line(&rep));
                 serial_debug(&alloc::format!(
                     "[v3d] regs hub_ident=0x{:08x},0x{:08x},0x{:08x},0x{:08x} core_ident=0x{:08x},0x{:08x},0x{:08x} mmu_debug=0x{:08x} grafx=0x{:08x}->0x{:08x} pm=0x{:08x}->0x{:08x} t={}us\n",
