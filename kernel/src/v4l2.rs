@@ -6,7 +6,7 @@
 //! already open), VFS_POLL (POLLIN when a frame is ready, POLLERR when not
 //! streaming or unplugged), VFS_CLOSE (stops the stream). The `'V'` ioctls are
 //! answered in the syscall layer (`intercept`), which reads and writes the
-//! caller's structs directly; mmap is answered by `mmap_phys` from `sys_mmap`.
+//! caller's structs directly; mmap is answered by `mmap_frames` from `sys_mmap`.
 //!
 //! Structs follow linux/videodev2.h on LP64 (both arches), so stock
 //! libv4l/PipeWire can drive the node. Subset: QUERYCAP, ENUM_FMT,
@@ -200,8 +200,10 @@ fn handle(msg: &Message, _caller: u32, _target: u32) -> Message {
     }
 }
 
-/// mmap of `/dev/video0` at `off` for `len` bytes: the buffer's physical address.
-pub(super) fn mmap_phys(open_id: u32, off: usize, len: usize) -> Result<usize, isize> {
+/// mmap of `/dev/video0` at `off` for `len` bytes: the buffer's frames, each
+/// pinned (+1) for the VMA. Pool blocks are never freed, so the pool is the
+/// implicit owner and the VMA's pin can never reach zero.
+pub(super) fn mmap_frames(open_id: u32, off: usize, len: usize) -> Result<Vec<usize>, isize> {
     let id = if open_id == 0 { u32::MAX } else { open_id };
     let d = DEV.lock();
     if d.owner != id { return Err(EBUSY); }
@@ -209,7 +211,10 @@ pub(super) fn mmap_phys(open_id: u32, off: usize, len: usize) -> Result<usize, i
     if off & ((1 << OFF_SHIFT) - 1) != 0 || i >= d.nreq { return Err(EINVAL); }
     let p = POOL.lock();
     if i >= p.n || len == 0 || len > (4096usize << p.order) { return Err(EINVAL); }
-    Ok(p.phys[i])
+    let base = p.phys[i];
+    let frames: Vec<usize> = (0..len.div_ceil(4096)).map(|k| base + k * 4096).collect();
+    mm::pageref::inc_many(&frames);
+    Ok(frames)
 }
 
 // ── ioctls ──────────────────────────────────────────────────────────────────
@@ -332,7 +337,7 @@ fn ioctl(pid: u32, fd: usize, id: u32, cmd: usize, arg: usize) -> isize {
             pstr(&mut b, 0, 16, "uvcvideo");
             let card = alloc::format!("UVC Camera (UVC {:x}.{:02x})", cam.info.bcd_uvc >> 8, cam.info.bcd_uvc & 0xFF);
             pstr(&mut b, 16, 32, &card);
-            pstr(&mut b, 48, 32, &alloc::format!("usb-xhci-{}", cam.func.slot));
+            pstr(&mut b, 48, 32, &alloc::format!("usb-xhci-{}", cam.func.as_ref().map_or(255, |f| f.slot)));
             p32(&mut b, 80, (6 << 16) | (1 << 8));
             p32(&mut b, 84, CAP_VIDEO_CAPTURE | CAP_STREAMING | CAP_DEVICE_CAPS);
             p32(&mut b, 88, CAP_VIDEO_CAPTURE | CAP_STREAMING);
@@ -466,7 +471,11 @@ fn ioctl(pid: u32, fd: usize, id: u32, cmd: usize, arg: usize) -> isize {
                 let p = POOL.lock();
                 (0..d.nreq).map(|i| Buf { ptr: mm::phys_to_virt(p.phys[i]) as *mut u8, cap: p.cap }).collect()
             };
-            let mut s = match Stream::start(&cam.func, &cam.info, d.fmt, d.frame, bufs) {
+            let started = match &cam.func {
+                Some(f) => Stream::start(f, &cam.info, d.fmt, d.frame, bufs),
+                None => Stream::start_fake(&cam.info, d.fmt, d.frame, bufs),
+            };
+            let mut s = match started {
                 Ok(s) => s,
                 Err(_) => return EIO,
             };

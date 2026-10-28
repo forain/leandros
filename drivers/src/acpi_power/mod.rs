@@ -111,3 +111,17 @@ pub fn poll() { power::poll() }
 /// Monotonic counter bumped on every battery/AC Notify, so pollers (upower)
 /// can tell a change happened without re-reading everything.
 pub fn change_seq() -> u64 { power::change_seq() }
+
+pub use power::SleepAml;
+/// `_TTS(state)`, `_PTS(state)`, `\_SI._SST(3)`; logs every method result and OpRegion access summary.
+pub fn sleep_prepare(state: u8) -> SleepAml { power::sleep_prepare(state) }
+/// `\_SI._SST(2)`, `_WAK(state)`, `\_SI._SST(1)`.
+pub fn sleep_wake(state: u8) -> SleepAml { power::sleep_wake(state) }
+/// `_TTS(state)` alone.
+pub fn tts(state: u8) { power::tts(state) }
+/// `\_S0_`/`\_S3_`/`\_S5_` package -> (SLP_TYPa, SLP_TYPb).
+pub fn sx_typ(name: &str) -> Option<(u8, u8)> { power::sx_typ(name) }
+/// Stop/resume kacpid's EC-query and GPE evaluation.
+pub fn pause_poll(on: bool) { power::pause_poll(on) }
+/// Diagnostic: evaluate `_PTS(3)` (and `_WAK(3)` when `with_wak`) without ever entering a sleep state.
+pub fn s3_dryrun(with_wak: bool) { power::s3_dryrun(with_wak) }

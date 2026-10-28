@@ -10,6 +10,8 @@ extern crate alloc;
 
 pub mod serial;
 pub mod pci;
+/// Generic PCI config-space save/restore for system sleep (lane s3pci).
+pub mod pci_pm;
 /// Runtime IRQ registration, x86_64 vector allocator, MSI/MSI-X (lane kfacil).
 pub mod irq;
 /// `request_firmware`: kernel read of a file from the mounted root (lane kfacil).
@@ -95,6 +97,8 @@ pub mod wifi_frame;
 /// and wifi_sim (host-tested in drivers/iwlwifi-tests).
 pub mod wifi_ht;
 pub mod wifi_crypto;
+/// Wrong-passphrase block policy of the manager (host-tested in drivers/brcmf-tests).
+pub mod wifi_wrongkey;
 /// The control seam between /dev/netctl and Wi-Fi backends (types only so far).
 pub mod wifi_api;
 /// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).

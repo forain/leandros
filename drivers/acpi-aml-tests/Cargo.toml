@@ -1,0 +1,11 @@
+[package]
+name = "acpi-aml-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Host-only test crate: compiles drivers/src/acpi_power/aml.rs via #[path] and
+# runs hand-assembled AML (sleep methods, CMOS/GPIO regions, global lock).
+# Detached from the kernel workspace. Run:
+#   cargo test --manifest-path drivers/acpi-aml-tests/Cargo.toml --target <host-triple>
+[workspace]
