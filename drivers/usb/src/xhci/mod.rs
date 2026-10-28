@@ -36,6 +36,7 @@ pub mod regs;
 pub mod ring;
 mod intr;
 pub mod isoch;
+pub mod btusb;
 
 pub use intr::{HidPipe, IntrPipe, Poll as IntrPoll, Reports as IntrReports, REPORT_MAX};
 
@@ -1191,6 +1192,18 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
         // No boot HID either: an audio function (isochronous streaming
         // interfaces)? Select its configuration; a class driver opens the
         // streams later with `isoch::IsochPipe::open`.
+        // Bluetooth HCI (E0/01/01): configured here, endpoints opened by
+        // the bt driver (btusb.rs); handed over as a function like audio.
+        if hid.is_empty() && btusb::scan_bt(&cfg).is_some() {
+            match control(hc, slot, 0x00, 9, ci.value as u16, 0, CtrlData::None, ENUM_CTRL_TIMEOUT_MS) {
+                Ok(_) => {
+                    info.class = 0xE0;
+                    let f = isoch::UsbFunction { hc: hc.clone(), slot, speed, config_value: ci.value, cfg: cfg.clone() };
+                    return Ok(Enumerated { info, bulk: None, hid, hub: None, audio: Some(f) });
+                }
+                Err(e) => usb_log!("[XHCI] slot {}: Bluetooth SET_CONFIGURATION failed ({:?})\n", slot, e),
+            }
+        }
         let mut audio = None;
         if hid.is_empty() && isoch::has_audio_streaming(&cfg) {
             match control(hc, slot, 0x00, 9, ci.value as u16, 0, CtrlData::None, ENUM_CTRL_TIMEOUT_MS) {

@@ -149,7 +149,16 @@ fn adopt(bus: u8, e: xhci::Enumerated, hot: bool) -> Option<XhciBulk> {
         let name = if i.product_name.is_empty() { "USB HID device" } else { i.product_name.as_str() };
         hid::register(pipes, name, hid::initial_leds(), i.vendor, i.product);
     }
+    let is_bt = i.class == 0xE0;
     DEVICES.lock().push(i);
+    let audio = match audio {
+        Some(f) if is_bt => {
+            usb_log!("[USB] bus {} slot {}: Bluetooth HCI function\n", bus, f.slot);
+            xhci::btusb::register(f);
+            None
+        }
+        a => a,
+    };
     if let Some(f) = audio {
         usb_log!("[USB] bus {} slot {}: audio function, {} isochronous endpoint(s)\n",
                  bus, f.slot, f.isoch_endpoints().len());

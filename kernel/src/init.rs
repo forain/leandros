@@ -223,6 +223,9 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // ── USB ───────────────────────────────────────────────────────────────────
     usb::xhci::isoch::set_cmdline(crate::boot_cmdline().unwrap_or(""));
     drivers::usb_hcd::init();
+    // USB Bluetooth (btusb + Intel firmware): a kthread that registers
+    // /dev/hci0 once the controller is set up ([btusb] lines).
+    drivers::bt::usb::start(crate::boot_cmdline().unwrap_or(""), |port| vfs_server::register_device_notify_open("/dev/hci0", port, 0, vfs_server::HCI_MAJOR, vfs_server::HCI_MINOR));
     // The xHCI BIOS handoff above ends the firmware's USB legacy (PS/2)
     // emulation: an i8042 that was only ever that emulation is gone now.
     #[cfg(target_arch = "x86_64")]
