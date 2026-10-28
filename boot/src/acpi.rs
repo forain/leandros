@@ -193,7 +193,7 @@ unsafe fn read_u16(p: *const u8) -> u16 {
 
 /// Find a table by signature in the XSDT (or the RSDT for revision-0 RSDPs).
 /// Returns its *virtual* address.
-unsafe fn find_table(rsdp_phys: u64, hhdm_offset: u64, sig: &[u8; 4]) -> Option<*const u8> {
+pub unsafe fn find_table(rsdp_phys: u64, hhdm_offset: u64, sig: &[u8; 4]) -> Option<*const u8> {
     if rsdp_phys == 0 { return None; }
     let rsdp = (rsdp_phys + hhdm_offset) as *const u8;
     if core::slice::from_raw_parts(rsdp, 8) != RSDP_SIG { return None; }

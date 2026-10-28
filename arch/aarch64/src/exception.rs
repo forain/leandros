@@ -433,7 +433,8 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64, frame: *mut u64) {
         sched::exit_group_signal(SIGSEGV);
     }
 
-    loop { core::hint::spin_loop(); }
+    extern "C" { fn kernel_fatal_halt() -> !; }
+    kernel_fatal_halt()
 }
 
 #[no_mangle]
@@ -801,5 +802,6 @@ unsafe extern "C" fn exc_unexpected_handler(esr: u64, elr: u64) {
     serial_print_str(" ELR=");
     print_hex(elr as usize);
     serial_print_str("\n");
-    loop { core::hint::spin_loop(); }
+    extern "C" { fn kernel_fatal_halt() -> !; }
+    kernel_fatal_halt()
 }

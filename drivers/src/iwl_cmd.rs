@@ -567,6 +567,28 @@ pub fn phy_ctxt_cmd_w(id: u32, color: u32, action: u32, channel: u8, secondary: 
     b.done()
 }
 
+pub const PHY_VHT_CHANNEL_MODE80: u8 = 2;
+
+/// The control position of `primary` in the 80 MHz segment centred on
+/// `center` (iwl_mvm_get_ctrl_pos): -6 / -2 / +2 / +6 channels from the
+/// centre are 2_BELOW (1), 1_BELOW (0), 1_ABOVE (4), 2_ABOVE (5).
+pub fn ctrl_pos80(primary: u8, center: u8) -> Option<u8> {
+    match primary as i16 - center as i16 { -6 => Some(1), -2 => Some(0), 2 => Some(4), 6 => Some(5), _ => None }
+}
+
+/// PHY_CONTEXT_CMD v1 at 80 MHz: control channel `channel` in the segment
+/// centred on `center` (VHT operation centre segment 0).
+pub fn phy_ctxt_cmd_80(id: u32, color: u32, action: u32, channel: u8, center: u8, tx_ant: u8, rx_ant: u8) -> Option<Vec<u8>> {
+    let pos = ctrl_pos80(channel, center)?;
+    let n_rx = if rx_ant.count_ones() >= 2 { 2u32 } else { 1 };
+    let rxchain = ((rx_ant as u32) << 1) | (n_rx << 10) | (n_rx << 12);
+    let mut b = Buf::new();
+    b.u32(id_and_color(id, color)).u32(action).u32(0).u32(0);
+    b.u8(PHY_BAND_5).u8(channel).u8(PHY_VHT_CHANNEL_MODE80).u8(pos);
+    b.u32(tx_ant as u32).u32(rxchain).u32(0).u32(0);
+    Some(b.done())
+}
+
 // ── stations and queues ─────────────────────────────────────────────────────
 
 pub const STA_LINK: u8 = 0;
@@ -584,6 +606,7 @@ pub const STA_FLG_AGG_MPDU_DENS_SHIFT: u32 = 23;
 pub const STA_FLG_AGG_MPDU_DENS_MSK: u32 = 7 << 23;
 pub const STA_FLG_FAT_EN_MSK: u32 = 3 << 26;
 pub const STA_FLG_FAT_EN_40MHZ: u32 = 1 << 26;
+pub const STA_FLG_FAT_EN_80MHZ: u32 = 2 << 26;
 pub const STA_FLG_MIMO_EN_MIMO2: u32 = 1 << 28;
 pub const STA_FLG_MIMO_EN_MSK: u32 = 3 << 28;
 pub const STA_MODIFY_TID_DISABLE_TX: u8 = 1 << 1;
@@ -598,6 +621,14 @@ pub const STA_MODIFY_QUEUES: u8 = 1 << 7;
 /// MPDU density. Returns (flags, mask).
 pub fn sta_ht_flags(rx_streams: u8, sm_ps: u8, ampdu_factor: u8, ampdu_density: u8) -> (u32, u32) {
     sta_ht_flags_w(rx_streams, sm_ps, ampdu_factor, ampdu_density, false)
+}
+
+/// A VHT peer at 80 MHz (iwl_mvm_sta_send_to_fw): FAT_EN_80MHZ, MIMO2 from
+/// its VHT receive streams, the larger of its HT and VHT A-MPDU exponents
+/// (the field holds 0-15; the firmware caps it).
+pub fn sta_vht80_flags(ht_streams: u8, vht_streams: u8, sm_ps: u8, ht_ampdu: u8, vht_ampdu: u8, ampdu_density: u8) -> (u32, u32) {
+    let (f, m) = sta_ht_flags_w(ht_streams.max(vht_streams), sm_ps, ht_ampdu.max(vht_ampdu), ampdu_density, false);
+    (f | STA_FLG_FAT_EN_80MHZ, m)
 }
 
 /// The same with the peer's 40 MHz bandwidth (STA_FLG_FAT_EN_40MHZ).
