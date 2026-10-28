@@ -535,11 +535,14 @@ impl Ns {
                 let end = pkg_len(c, p)?;
                 let cs = *p;
                 let mut iters = 0u32;
+                let t0 = h.timer();
                 loop {
                     let mut q = cs;
                     if self.int_op(h, f, c, &mut q)? == 0 { break; }
                     iters += 1;
-                    if iters > 100_000 { return Err(Err::Loop); }
+                    // Bounded by count and by time (2 s): a loop polling a
+                    // bit that never flips must not stall the caller.
+                    if iters > 100_000 || h.timer().wrapping_sub(t0) > 20_000_000 { return Err(Err::Loop); }
                     match self.term_list(h, f, c, q, end, load)? {
                         Flow::Break => break,
                         Flow::Ret(v) => { *p = end; return Ok(Flow::Ret(v)); }

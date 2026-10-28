@@ -40,7 +40,8 @@ fn wait(cmd: u16, mask: u8, want: u8) -> bool {
     loop {
         if inb(cmd) & mask == want { return true; }
         if crate::i915::now_ns().wrapping_sub(t0) > 5_000_000 {
-            TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            // A dead EC must not cost 5 ms per field access forever.
+            if TIMEOUTS.fetch_add(1, Ordering::Relaxed) >= 32 { PORTS.store(0, Ordering::Release); }
             return false;
         }
         core::hint::spin_loop();
