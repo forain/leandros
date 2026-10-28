@@ -85,9 +85,27 @@ mod hw {
         if WIN.load(Ordering::Acquire) != 0 { return true; }
         let phys = cb::BLOCK_PHYS + cb::FIRST_CHAN as u64 * cb::CHAN_SIZE;
         match ioremap(phys, NCH * cb::CHAN_SIZE as usize, CacheMode::Uncached) {
-            Some(v) => { WIN.store(v, Ordering::Release); true }
+            Some(v) => {
+                WIN.store(v, Ordering::Release);
+                crate::dma_shutdown::register("dma40", crate::dma_shutdown::Stage::Device, kexec_stop_all);
+                true
+            }
             None => false,
         }
+    }
+
+    /// kexec (dma_shutdown hook, interrupts off): every channel this kernel
+    /// claimed is aborted and reset, so no control block chain keeps copying
+    /// into memory the next kernel owns. Firmware-owned channels are left alone.
+    fn kexec_stop_all() -> bool {
+        let claimed = CLAIMED.load(Ordering::Acquire);
+        CYCLIC.store(0, Ordering::Release);
+        let mut ok = true;
+        for ch in cb::FIRST_CHAN..=cb::LAST_CHAN {
+            if claimed & (1 << ch) == 0 { continue; }
+            if let Some(r) = regs(ch) { ok &= cb::abort(&r); }
+        }
+        ok
     }
 
     /// True when channel interrupts were not proven by the self-test: callers drive

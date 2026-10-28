@@ -105,6 +105,19 @@ impl Regs for Mmio {
     fn delay_us(&mut self, us: u32) { sched::kthread::udelay(us as u64) }
 }
 
+/// kexec (dma_shutdown hook, interrupts off): TX/RX DMA stopped and every
+/// ring pointer cleared, so no received frame is written into memory the
+/// next kernel owns.
+fn kexec_shutdown() -> bool {
+    let base = BASE.load(Ordering::SeqCst);
+    if base == 0 { return true; }
+    RUNNING.store(false, Ordering::SeqCst);
+    IRQ_ACTIVE.store(false, Ordering::SeqCst);
+    let mut m = Mmio(base);
+    let _ = hw::quiesce(&mut m, QUEUES.load(Ordering::Relaxed));
+    m.r32(hw::NCR) & (hw::NCR_TE | hw::NCR_RE) == 0
+}
+
 // ── state ───────────────────────────────────────────────────────────────────
 
 static ATTACHED: Mutex<Option<(Rp1Gem, hw::GemDt)>> = Mutex::new(None);
@@ -301,6 +314,7 @@ pub fn init(cmdline: &str) {
         mid, queues, dcfg1, dcfg6, src, if res.irq_wired { "RP1 6" } else { "polled" }));
     PRESENT.store(true, Ordering::SeqCst);
     RUNNING.store(true, Ordering::SeqCst);
+    crate::dma_shutdown::register("gem", crate::dma_shutdown::Stage::Device, kexec_shutdown);
     set_state("phy");
     // `macb.phy=rgmii|rgmii-id|rgmii-rxid|rgmii-txid` pins the PHY delays
     // (no automatic RX-delay retry then).
