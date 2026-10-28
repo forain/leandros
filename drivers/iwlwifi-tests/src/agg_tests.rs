@@ -155,7 +155,7 @@ fn bar_tx_cmd() {
 fn ht_ctl() -> RateCtl {
     RateCtl::new(&RateCfg { ap_rates: vec![0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36, 48, 72, 96, 108], max_r500k: 0,
                             valid_ant: asc::ANT_AB, fixed_ant: None, band_24: false, rssi: Some(-76),
-                            ht: Some(HtRates { sgi: false, mimo: false, ht40: false, stbc: false, ldpc: false }) })
+                            ht: Some(HtRates { sgi: false, mimo: false, ht40: false, stbc: false, ldpc: false, vht: None }) })
 }
 
 #[test]
@@ -267,4 +267,73 @@ fn failing_bars_tear_down_the_session() {
     }
     assert!(!a.on() && a.st.bar_teardowns == 1 && a.st.bars_failed == 3);
     assert!(a.line().contains("bar_fail 3 bar_teardown 1"), "{}", a.line());
+}
+
+fn ba_at(ba_ssn: u16, bitmap: u64, scd_idx: u16, txed: u8, done: u8) -> BaNotif {
+    BaNotif { sta_addr: [0; 6], sta_id: 1, tid: 0, seq_ctl: ba_ssn << 4, bitmap, scd_flow: 4, scd_ssn: scd_idx,
+              txed, txed_2_done: done, reduced_txp: 0 }
+}
+
+fn session() -> TxAgg {
+    let mut a = TxAgg::new(true);
+    a.poll_request(0, true, true, true, 0).unwrap();
+    a.on_addba_resp(1, 0, 0, 64, 1);
+    a
+}
+
+#[test]
+fn ba_hole_needs_a_finished_frame_the_ap_lacks() {
+    assert!(!ba_hole(100, 0, 100)); // nothing finished in the window
+    assert!(!ba_hole(100, 0xff, 108)); // all 8 finished frames received
+    assert!(ba_hole(100, 0xfb, 108)); // SN 102 given up, AP lacks it
+    assert!(!ba_hole(4090, 0xffff, 4)); // wraps
+    assert!(ba_hole(4090, 0xffef, 4)); // SN 4094 missing across the wrap
+    assert!(ba_hole(0, u64::MAX, 100)); // window start 100 behind: stuck
+    assert!(!ba_hole(110, 0, 100)); // AP ahead of scd (BA after a BAR)
+}
+
+/// Laptop good kernel: `ba 120819 acked 3247 partial 120265 bars 120266`.
+/// The AP's answer to a BAR arrives as a BA notification with no A-MPDU
+/// before it; the old code called it partial and sent the next BAR.
+#[test]
+fn bar_answer_does_not_start_a_bar_loop() {
+    let mut a = session();
+    a.on_single_fail(9);
+    let mut bars = 0;
+    for t in 0..200u64 {
+        let now = 100 + t * 60;
+        if let Some(_) = a.next_bar(now) {
+            bars += 1;
+            a.on_bar_status(true, now);
+            // The AP's BA for the BAR: window at the BAR SSN, nothing new.
+            assert!(!a.on_ba(&ba_at(10, 0, 10, 1, 0), 10));
+        }
+    }
+    assert_eq!(bars, 1, "{}", a.line());
+    assert_eq!(a.st.ba_partial, 0);
+    assert_eq!(a.st.ba_unsolicited, 1);
+}
+
+/// A partially acked A-MPDU whose missing frames the firmware still
+/// retries (scd_ssn stays at the first of them) is not a hole: no BAR.
+#[test]
+fn partial_ampdu_without_hole_sends_no_bar() {
+    let mut a = session();
+    a.on_agg_rsp(16);
+    // AP window 0, frames 0-3 acked, 4-15 lost; firmware done up to 4.
+    assert!(a.on_ba(&ba_at(0, 0xf, 4, 16, 4), 16));
+    assert_eq!(a.st.ba_partial, 1);
+    assert_eq!(a.next_bar(1000), None);
+    // Now the firmware gives up on 4 and moves on to 16: hole at 4.
+    a.on_agg_rsp(12);
+    assert!(a.on_ba(&ba_at(4, 0xffe, 16, 12, 11), 16));
+    assert_eq!(a.st.ba_holes, 1);
+    assert_eq!(a.next_bar(2000), Some(16));
+}
+
+#[test]
+fn lossless_flow_sends_no_bars() {
+    let r = sim_bar_hole(0, 300_000, true, 3_000);
+    assert_eq!(r.bars, 0, "{:?}", r);
+    assert!(r.delivered > 1000, "{:?}", r);
 }

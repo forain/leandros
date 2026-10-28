@@ -932,13 +932,15 @@ impl Dev {
         if n.sta_id != AP_STA_ID || n.scd_flow as usize != BSS_QUEUE { return; }
         self.t.tx_reclaim(BSS_QUEUE, n.scd_ssn as usize);
         let next_sn = self.link.as_ref().map_or(0, |l| l.seq);
-        self.tagg.on_ba(n, next_sn);
-        self.txs.ok += n.txed_2_done as u64;
-        self.txs.rate_ok[rs::rate_bucket(self.agg_rate)] += n.txed_2_done as u64;
+        let ampdu = self.tagg.on_ba(n, next_sn);
+        if ampdu {
+            self.txs.ok += n.txed_2_done as u64;
+            self.txs.rate_ok[rs::rate_bucket(self.agg_rate)] += n.txed_2_done as u64;
+        }
         self.txq_drained();
         let now = now_ms();
         self.poll_bar(now);
-        if self.link.as_ref().map_or(false, |l| l.lq) {
+        if ampdu && self.link.as_ref().map_or(false, |l| l.lq) {
             let rate = self.agg_rate;
             if let Some(c) = self.rc.as_mut() { c.on_ampdu(rate, n.txed, n.txed_2_done, now); }
             self.send_lq_if_due(now);
