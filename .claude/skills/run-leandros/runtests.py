@@ -91,6 +91,7 @@ SUITES = {
                 "/bin/epolltest abi",
                 # /proc/epollstat per-instance attribution (lane epattr).
                 "/bin/epolltest stat",
+                "/bin/epolltest churn 20",
                 # kmscube on the v3d UAPI stub (lane kmscube2, openbugs L11.8):
                 # sync-file fence export + ADDFB2 of a v3d BO. The override is
                 # needed only in QEMU, where Mesa names the driver from the

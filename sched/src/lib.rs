@@ -4071,6 +4071,20 @@ fn ep_cache_swap_current(c: Option<alloc::boxed::Box<dyn core::any::Any + Send>>
     r
 }
 
+/// The running task's scheduler slot and that slot's generation (bumped
+/// each time the slot is freed): the owner tag an epoll wait snapshot
+/// carries, so one that turns up in another thread's slot is caught
+/// (lane piepollsrc). `(usize::MAX, 0)` without a current slot.
+pub fn current_slot_tag() -> (usize, u32) {
+    with_current_slot(|s| s.gen.load(Ordering::Relaxed)).map_or((usize::MAX, 0), |g| {
+        let fl = ksync::irq_save();
+        let cpu = unsafe { cpu_id() };
+        let i = if cpu < MAX_CPUS { CURRENT_SLOT[cpu].load(Ordering::Relaxed) } else { usize::MAX };
+        ksync::irq_restore(fl);
+        (i, g)
+    })
+}
+
 /// Store the thread's epoll snapshot back (see `poll_listen_enter`).
 pub fn poll_listen_store(c: Option<alloc::boxed::Box<dyn core::any::Any + Send>>) {
     drop(ep_cache_swap_current(c)); // freed with IRQs enabled again
