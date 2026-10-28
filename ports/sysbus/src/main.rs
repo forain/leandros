@@ -5,7 +5,7 @@
 //!
 //!   leandros-sysbus login1   org.freedesktop.login1   (sessions, seats, inhibitors)
 //!   leandros-sysbus locale1  org.freedesktop.locale1  (/etc/locale.conf, X11 keymap)
-//!   leandros-sysbus upower   org.freedesktop.UPower   (a machine with no battery)
+//!   leandros-sysbus upower   org.freedesktop.UPower   (power_supply class, or no battery)
 //!   leandros-sysbus power-profiles  org.freedesktop.UPower.PowerProfiles +
 //!                                    net.hadess.PowerProfiles (ppd, placeholder driver)
 //!   leandros-sysbus polkit   org.freedesktop.PolicyKit1 (agent registry; only root is authorized)

@@ -72,6 +72,7 @@ pub mod vmbind;
 pub mod wa;
 pub mod gen9_renderstate;
 mod probe;
+pub mod backlight;
 mod gt;
 mod uapi;
 pub use uapi::{prime_dedup, ptecheck_dmabuf_mmap, ptecheck_fd_to_handle, set_tmpfs_census};
@@ -81,6 +82,7 @@ mod rps;
 pub use rps::proc_text;
 mod vblank;
 mod cursor;
+mod outputs;
 
 use hw::reg;
 

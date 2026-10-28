@@ -544,4 +544,48 @@ mod tests {
         for _ in 0..20 { assert!(!st.tick(Some(2), 2, 4, true)); }
         for _ in 0..20 { assert!(!st.tick(Some(2), 2, 0, false)); }
     }
+
+    /// Register file that records writes; TSR.TGO clears after `busy` reads.
+    struct QRegs { v: std::cell::RefCell<HashMap<usize, u32>>, busy: std::cell::Cell<u32>, log: Vec<(usize, u32)> }
+    impl Regs for QRegs {
+        fn r32(&self, off: usize) -> u32 {
+            if off == TSR {
+                let b = self.busy.get();
+                if b > 0 { self.busy.set(b - 1); return TSR_TGO; }
+                return 0;
+            }
+            *self.v.borrow().get(&off).unwrap_or(&0)
+        }
+        fn w32(&mut self, off: usize, v: u32) { self.v.borrow_mut().insert(off, v); self.log.push((off, v)); }
+        fn delay_us(&mut self, _us: u32) {}
+    }
+
+    #[test]
+    fn kexec_quiesce_stops_rx_tx_and_clears_every_queue_pointer() {
+        let mut m = QRegs { v: Default::default(), busy: std::cell::Cell::new(3), log: Vec::new() };
+        for (o, v) in [(NCR, NCR_TE | NCR_RE | NCR_MPE), (RBQP, 0x1000), (TBQP, 0x2000),
+                       (RBQPQ1, 0x3000), (TBQPQ1, 0x4000), (RBQPQ1 + 4, 0x5000), (RBQPH, 1), (TBQPH, 1)] {
+            m.v.borrow_mut().insert(o, v);
+        }
+        assert!(quiesce(&mut m, 3));
+        let ncr = m.r32(NCR);
+        assert_eq!(ncr & (NCR_TE | NCR_RE), 0, "TE/RE must be clear");
+        assert_ne!(ncr & NCR_MPE, 0, "MDIO stays enabled");
+        for o in [RBQP, TBQP, RBQPQ1, TBQPQ1, RBQPQ1 + 4, TBQPQ1 + 4, RBQPH, TBQPH] {
+            assert_eq!(m.r32(o), 0, "queue pointer {:#x} not cleared", o);
+        }
+        assert_eq!(m.r32(IDR), INT_ALL);
+        // RE is cleared before any ring pointer is touched.
+        let re_off = m.log.iter().position(|&(o, v)| o == NCR && v & NCR_RE == 0).unwrap();
+        let rbqp = m.log.iter().position(|&(o, _)| o == RBQP).unwrap();
+        assert!(re_off < rbqp);
+    }
+
+    #[test]
+    fn kexec_quiesce_reports_a_transmitter_that_never_idles() {
+        let mut m = QRegs { v: Default::default(), busy: std::cell::Cell::new(u32::MAX), log: Vec::new() };
+        m.v.borrow_mut().insert(NCR, NCR_TE | NCR_RE);
+        assert!(!quiesce(&mut m, 1));
+        assert_eq!(m.r32(NCR) & (NCR_TE | NCR_RE), 0, "RE/TE still cleared on timeout");
+    }
 }

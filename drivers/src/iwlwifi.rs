@@ -91,6 +91,8 @@
 //!   iwlwifi.txldpc=0        (ht=1) BCC instead of LDPC; default: LDPC when
 //!                           the AP receives it
 //!   iwlwifi.tx40=0          (40 MHz link) transmit HT at 20 MHz
+//!   iwlwifi.vht=0           no VHT / 80 MHz on 5 GHz (default: VHT 80 MHz
+//!                           where the AP, the NVM and the SKU allow it)
 //!   iwlwifi.mcast=0         no MCAST_FILTER_CMD (the firmware then drops
 //!                           group-addressed frames); default: pass all
 //!   iwlwifi.smps=static|dynamic
@@ -228,6 +230,8 @@ static SMPS: AtomicU8 = AtomicU8::new(ht::SM_PS_DISABLED);
 static LDPC: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.ht40 (default on): 40 MHz on 5 GHz where allowed.
 static HT40: AtomicBool = AtomicBool::new(true);
+/// iwlwifi.vht (default on): VHT at 80 MHz on 5 GHz where allowed.
+static VHT: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.txagg (default on): TX A-MPDU on TID 0.
 static TXAGG: AtomicBool = AtomicBool::new(true);
 
@@ -563,6 +567,8 @@ struct HtLink {
     ht_rates: bool,
     /// 40 MHz: the secondary channel offset (+1 above, -1 below).
     ht40: Option<i8>,
+    /// VHT at 80 MHz: the segment's centre channel and the AP's VHT receive streams.
+    vht80: Option<(u8, u8)>,
 }
 
 /// Block Ack action frames and BARs.
@@ -608,6 +614,9 @@ struct RxStats {
     /// how many of those frames were 40 MHz wide.
     rate: [u64; rs::RATE_BUCKETS],
     rx40: u64,
+    /// VHT data frames by (streams - 1) * 10 + MCS, and the 80 MHz ones.
+    vht: [u64; 20],
+    rx80: u64,
     /// Longest gap between two RX ring services (ms) while associated.
     svc_gap_max_ms: u64,
 }
@@ -1216,6 +1225,10 @@ impl Dev {
         let rnf = self.last_phy.map_or(0, |p| p.rate_n_flags);
         self.rxs.rate[rs::rate_bucket(rnf)] += 1;
         if asc::rate_is_40(rnf) { self.rxs.rx40 += 1; }
+        if let Some((m, n, w)) = asc::rate_vht(rnf) {
+            if m < 10 && n <= 2 { self.rxs.vht[(n as usize - 1) * 10 + m as usize] += 1; }
+            if w == 80 { self.rxs.rx80 += 1; }
+        }
         let mut out = [0u8; 2400];
         let n = match wf::data_to_ethernet(frame, h, t, &mut out) {
             Some(n) => n,
@@ -1334,6 +1347,7 @@ pub fn init(cmdline: &str) {
     LDPC.store(cmdline_val(cmdline, "iwlwifi.ldpc") != Some("0"), Ordering::Relaxed);
     TXAGG.store(cmdline_val(cmdline, "iwlwifi.txagg") != Some("0"), Ordering::Relaxed);
     HT40.store(cmdline_val(cmdline, "iwlwifi.ht40") != Some("0"), Ordering::Relaxed);
+    VHT.store(cmdline_val(cmdline, "iwlwifi.vht") != Some("0"), Ordering::Relaxed);
     ilog!("QoS/HT: {}; RX Block Ack {}; TX MCS {}, short GI {}, MIMO {}, STBC {}, LDPC {}; SM PS {}, LDPC {}",
           match HT_MODE.load(Ordering::Relaxed) { HT_LEGACY => "legacy only (iwlwifi.ht=0)", HT_WMM => "WMM only (iwlwifi.ht=wmm)", _ => "WMM + HT 20 MHz" },
           if BA_ON.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.ba=0)" },
@@ -2426,9 +2440,28 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
                                None => String::from("20 MHz") });
         }
     }
+    // 80 MHz VHT: on top of 40 MHz, the AP runs an 80 MHz BSS (VHT
+    // operation), has VHT capabilities, and the NVM allows 80 MHz on all
+    // four channels of the segment.
+    let nvm80 = |c: u8| hw.nvm.channels.iter().any(|x| x.ch == c && x.flags & cmd::chan_flags::MHZ80 != 0);
+    let vht80 = if ht40.is_some() && hw.nvm.vht && VHT.load(Ordering::Relaxed) && bht.vht_cap.is_some() {
+        bht.vht_op.and_then(|o| o.center80(ch)).filter(|&c| ht::channels80(c).iter().all(|&x| nvm80(x)))
+    } else {
+        None
+    };
+    if ht40.is_some() && bht.vht_cap.is_some() {
+        ilog!("BSS VHT: operation {:?}, NVM vht {}, NVM 80 MHz {}; using {}", bht.vht_op, hw.nvm.vht as u8, nvm80(ch) as u8,
+              match vht80 { Some(c) => format!("80 MHz (centre ch {})", c),
+                            None if !VHT.load(Ordering::Relaxed) => String::from("40 MHz (iwlwifi.vht=0)"),
+                            None => String::from("40 MHz") });
+    }
 
     // Channel, binding, quota (none until associated), MAC context with the BSSID.
-    send(cmd::PHY_CONTEXT_CMD, None, &cmd::phy_ctxt_cmd_w(PHY_ID, 0, cmd::FW_CTXT_ACTION_MODIFY, ch, ht40, hw.tx_ant, hw.rx_ant))?;
+    let phy = match vht80.and_then(|c| cmd::phy_ctxt_cmd_80(PHY_ID, 0, cmd::FW_CTXT_ACTION_MODIFY, ch, c, hw.tx_ant, hw.rx_ant)) {
+        Some(p) => p,
+        None => cmd::phy_ctxt_cmd_w(PHY_ID, 0, cmd::FW_CTXT_ACTION_MODIFY, ch, ht40, hw.tx_ant, hw.rx_ant),
+    };
+    send(cmd::PHY_CONTEXT_CMD, None, &phy)?;
     let r = send(cmd::BINDING_CONTEXT_CMD, None, &asc::binding_cmd(PHY_ID, cmd::FW_CTXT_ACTION_ADD, &[MAC_ID]))?;
     if cmd::le32(&r, 0).unwrap_or(0) != 0 { return Err(Err::Status("binding", cmd::le32(&r, 0).unwrap_or(0)).into()); }
     prog.bound = true;
@@ -2517,6 +2550,7 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
         c.ldpc = LDPC.load(Ordering::Relaxed);
         c.ht40 = ht40.is_some();
         extra.extend_from_slice(&ht::ht_cap_ie(&c));
+        if vht80.is_some() { extra.extend_from_slice(&ht::vht_cap_ie(&c)); }
     }
     if want_wmm { extra.extend_from_slice(&ht::wmm_info_ie(0)); }
     let req = wf::build_assoc_req(&bssid, &hw.mac, cap, 10, &b.ssid, &rates, if pmk.is_some() { Some(&rsn[..]) } else { None },
@@ -2556,12 +2590,13 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
             ampdu_factor: cap.ampdu_factor, ampdu_density: cap.ampdu_density,
             ht_prot: use_ht && ht_op.map_or(false, |o| o.needs_ht_prot(wide.is_some())), op_mode: op,
             wmm_count: wmm.map_or(0, |w| w.set_count()), ht_rates: false, ht40: wide,
+            vht80: if wide.is_some() { vht80.zip(rht.vht_cap).map(|(c, v)| (c, v.rx_streams().max(1))) } else { None },
         });
     }
     ilog!("associated: AID {}, AP capability {:#06x}; {}", aid, resp.capability,
           match htl {
               Some(h) if h.ht => format!("QoS (WMM) + HT {} MHz: AP {} stream(s), SM PS {}, A-MPDU 2^(13+{}) density {}, HT op mode {:#06x}{}",
-                                        if h.ht40.is_some() { 40 } else { 20 }, h.ap_streams, h.ap_sm_ps, h.ampdu_factor, h.ampdu_density, h.op_mode,
+                                        if h.vht80.is_some() { 80 } else if h.ht40.is_some() { 40 } else { 20 }, h.ap_streams, h.ap_sm_ps, h.ampdu_factor, h.ampdu_density, h.op_mode,
                                         if h.ht_prot { ", HT protection" } else { "" }),
               Some(_) => String::from(if want_ht { "QoS (WMM), no HT (the response carries no HT capabilities)" } else { "QoS (WMM)" }),
               None if want_wmm => String::from("legacy (the response carries no WMM element)"),
@@ -2571,7 +2606,13 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
     // Station associated, its rate table, the MAC context associated.
     let (mut sflags, mut smask) = (0u32, (3u32 << 26) | (3 << 28));
     if let Some(h) = htl.filter(|h| h.ht) {
-        let (f, m) = cmd::sta_ht_flags_w(h.ap_streams, h.ap_sm_ps, h.ampdu_factor, h.ampdu_density, h.ht40.is_some());
+        let (f, m) = match h.vht80 {
+            Some((_, vs)) => {
+                let ve = rht.vht_cap.map_or(0, |v| v.ampdu_exp());
+                cmd::sta_vht80_flags(h.ap_streams, vs, h.ap_sm_ps, h.ampdu_factor, ve, h.ampdu_density)
+            }
+            None => cmd::sta_ht_flags_w(h.ap_streams, h.ap_sm_ps, h.ampdu_factor, h.ampdu_density, h.ht40.is_some()),
+        };
         sflags = f;
         smask = m;
     }
@@ -3330,6 +3371,9 @@ fn rx_quality(d: &Dev) -> String {
                         d.t.rx_rb_max, tr::RX_QUEUE_SIZE, d.t.rx_rb_high, r.svc_gap_max_ms);
     s.push_str(&rs::rate_hist_line(&r.rate));
     s.push_str(&format!("; 40 MHz frames {}", r.rx40));
+    let v: Vec<String> = (0..20).filter(|&i| r.vht[i] > 0).map(|i| format!("VHT{}x{}:{}", i % 10, i / 10 + 1, r.vht[i])).collect();
+    if !v.is_empty() { s.push_str(&format!("; vht {}", v.join(" "))); }
+    s.push_str(&format!("; 80 MHz frames {}", r.rx80));
     s
 }
 
@@ -3358,7 +3402,7 @@ fn ht_lines(d: &Dev) -> (String, String) {
         Some(l) => format!("{}; link qos {} ht {} tx_mcs {}; ap streams {} sm_ps {} ampdu {} density {}; op_mode {:#06x} ht_prot {}; wmm set {} updates {}; width {}",
                            mode, l.qos as u8, l.ht as u8, l.ht_rates as u8, l.ap_streams, l.ap_sm_ps, l.ampdu_factor,
                            l.ampdu_density, l.op_mode, l.ht_prot as u8, l.wmm_count, d.wmm_updates,
-                           match l.ht40 { Some(o) if o > 0 => "40+", Some(_) => "40-", None => "20" }),
+                           match (l.vht80, l.ht40) { (Some(_), _) => "80 vht", (_, Some(o)) if o > 0 => "40+", (_, Some(_)) => "40-", _ => "20" }),
     };
     let st = d.agg.stats();
     let tids: Vec<String> = (0..8u8).filter(|&t| d.agg.has(t))

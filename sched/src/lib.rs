@@ -5826,11 +5826,27 @@ fn nmi_probe(cpu: usize) {
 /// x86_64, an NMI sample whose RIP is in `wdog_selftest_stall`. 0 = off.
 static WDOG_SELFTEST_TICK: AtomicU32 = AtomicU32::new(0);
 static WDOG_SELFTEST_SEEN: AtomicBool = AtomicBool::new(false);
+static WDOG_SELFTEST_FOREVER: AtomicBool = AtomicBool::new(false);
 pub fn wdog_selftest_arm() { WDOG_SELFTEST_TICK.store(3000, Ordering::Relaxed); }
+/// `wdog.selftest=2`: cpu1 stalls with IRQs masked and is never released, to
+/// prove the hardware-watchdog stall -> reset path on real boards.
+pub fn wdog_selftest_arm_forever() {
+    WDOG_SELFTEST_FOREVER.store(true, Ordering::Relaxed);
+    wdog_selftest_arm();
+}
 
 #[inline(never)]
 fn wdog_selftest_stall() {
     extern "C" { fn arch_serial_putc(c: u8); }
+    if WDOG_SELFTEST_FOREVER.load(Ordering::Relaxed) {
+        for &b in b"\n[WDOG] selftest: cpu1 stalls with IRQs masked FOREVER (wdog.selftest=2); expect a hardware-watchdog reset\n" {
+            unsafe { arch_serial_putc(b) }
+        }
+        // Count as busy, not idle: the tick may have interrupted the idle
+        // loop, and an idle-flagged CPU is excluded from the stuck test.
+        IDLE_SINCE[1].store(0, Ordering::Relaxed);
+        loop { core::hint::spin_loop(); }
+    }
     for &b in b"\n[WDOG] selftest: cpu1 stalls with IRQs masked until reported (wdog.selftest=1)\n" {
         unsafe { arch_serial_putc(b) }
     }

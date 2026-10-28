@@ -1837,12 +1837,80 @@ unsafe fn scatter_cases(fd: c_int) -> (i32, i32) {
     (failures, 0)
 }
 
+// ── Connector enumeration (lane lapdisp) ─────────────────────────────────────
+// Every connector GETRESOURCES lists must answer GETCONNECTOR, and every
+// encoder GETENCODER. With `verbose` one line per connector:
+// "connector <id> <TYPE>-<n> <status> modes=<n> [<w>x<h>@<hz>] encoder=<id> possible_crtcs=0x<m>".
+const DRM_IOCTL_MODE_GETENCODER_L: c_ulong = 0xC01464A6;
+#[repr(C)]
+#[derive(Default)]
+struct DrmModeGetEncoderL { encoder_id: u32, encoder_type: u32, crtc_id: u32, possible_crtcs: u32, possible_clones: u32 }
+
+struct LineBuf { b: [u8; 256], n: usize }
+impl LineBuf {
+    fn s(&mut self, t: &[u8]) { for &c in t { if self.n < 254 { self.b[self.n] = c; self.n += 1; } } }
+    fn d(&mut self, v: u64) {
+        let mut t = [0u8; 20]; let mut k = 0; let mut x = v;
+        loop { t[k] = b'0' + (x % 10) as u8; k += 1; x /= 10; if x == 0 { break; } }
+        while k > 0 { k -= 1; self.s(&[t[k]]); }
+    }
+    fn x(&mut self, v: u32) { for i in (0..8).rev() { let n = ((v >> (4 * i)) & 0xf) as u8; self.s(&[if n < 10 { b'0' + n } else { b'a' + n - 10 }]); } }
+    unsafe fn put(&mut self) { self.b[self.n] = 0; puts(self.b.as_ptr()); self.n = 0; }
+}
+
+unsafe fn enum_connectors(fd: c_int, verbose: bool) -> bool {
+    let mut res = DrmModeCardRes::default();
+    if ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut res as *mut _) != 0 { return false; }
+    let mut ids = [0u32; 16];
+    let mut encs = [0u32; 16];
+    let (nc, ne) = ((res.count_connectors as usize).min(16), (res.count_encoders as usize).min(16));
+    let mut r2 = DrmModeCardRes::default();
+    r2.connector_id_ptr = ids.as_mut_ptr() as u64; r2.count_connectors = nc as u32;
+    r2.encoder_id_ptr = encs.as_mut_ptr() as u64; r2.count_encoders = ne as u32;
+    if ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut r2 as *mut _) != 0 { return false; }
+    let mut ok = true;
+    for &id in &ids[..nc] {
+        let mut modes: [DrmModeModeinfo; 4] = core::array::from_fn(|_| DrmModeModeinfo::default());
+        let mut encid = [0u32; 4];
+        let mut c = DrmModeGetConnector::default();
+        c.connector_id = id;
+        c.modes_ptr = modes.as_mut_ptr() as u64; c.count_modes = 4;
+        c.encoders_ptr = encid.as_mut_ptr() as u64; c.count_encoders = 4;
+        if ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &mut c as *mut _) != 0 || c.connection == 0 || c.connection > 3 { ok = false; continue; }
+        let mut e = DrmModeGetEncoderL { encoder_id: encid[0], ..Default::default() };
+        let eok = c.count_encoders == 0 || ioctl(fd, DRM_IOCTL_MODE_GETENCODER_L, &mut e as *mut _) == 0;
+        if !eok { ok = false; }
+        if verbose {
+            let mut l = LineBuf { b: [0; 256], n: 0 };
+            l.s(b"connector "); l.d(id as u64); l.s(b" ");
+            l.s(match c.connector_type { 10 => b"DP" as &[u8], 11 => b"HDMI-A", 14 => b"eDP", 15 => b"Virtual", _ => b"type?" });
+            l.s(b"-"); l.d(c.connector_type_id as u64);
+            l.s(match c.connection { 1 => b" connected" as &[u8], 2 => b" disconnected", _ => b" unknown" });
+            l.s(b" modes="); l.d(c.count_modes as u64);
+            if c.count_modes > 0 { l.s(b" "); l.d(modes[0].hdisplay as u64); l.s(b"x"); l.d(modes[0].vdisplay as u64); l.s(b"@"); l.d(modes[0].vrefresh as u64); }
+            l.s(b" mm="); l.d(c.mm_width as u64); l.s(b"x"); l.d(c.mm_height as u64);
+            l.s(b" encoder="); l.d(encid[0] as u64); l.s(b" possible_crtcs=0x"); l.x(e.possible_crtcs);
+            l.s(if eok { b"" as &[u8] } else { b" GETENCODER-FAILED" });
+            l.put();
+        }
+    }
+    ok
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0i32;
     let mut skips = 0i32;
 
     let hold_mode = argc > 1 && arg_is(*argv.add(1) as *const u8, b"--hold");
+
+    if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--list") {
+        let fd = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let ok = fd >= 0 && enum_connectors(fd, true);
+        report(b"CONNECTOR_ENUM", ok);
+        puts(b"--- drmsmoke done ---\n\0".as_ptr());
+        return if ok { 0 } else { 1 };
+    }
 
     if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--leak") {
         let mut iters = 20u32;
@@ -2042,6 +2110,8 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         && res.max_width >= res.min_width && res.max_height >= res.min_height;
     let res_errno = errno();
     if !report_errno(b"GETRESOURCES", res_ok, res_errno) { failures += 1; }
+    // Every listed connector/encoder answers (extra outputs, lane lapdisp).
+    if !report(b"CONNECTOR_ENUM", enum_connectors(fd, false)) { failures += 1; }
 
     // GETCONNECTOR — connected + >=1 mode. Two-pass: count then fill.
     let connector_id = 1u32; // GETRESOURCES reports connector id 1
