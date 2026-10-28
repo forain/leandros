@@ -30,7 +30,7 @@ in the samples), fast_retransmit 21-37, rto 0-4 per run.
 
 ## QEMU aarch64 (slirp, irq-driven NIC)
 Did not reproduce: 40 MB guest -> host in ~1 s, so the cap needs line-rate bursts into a
-real bridge. Regress aarch64 (box): 57 suites, 0 bad with cc=none; see commit message for cubic.
+real bridge. Regress aarch64 (box): 57 suites, 0 bad with cc=none; with the cubic default also 57 suites, 0 bad (nettest, udptest, net* included).
 
 ## Notes
 - After a trial -> trial kexec the Pi's wifi0 does not come back (eth0 does); good -> trial
