@@ -587,3 +587,45 @@ fn unsolicited_pairing_on_incoming_link_is_refused() {
     let o = ops(&mut h);
     assert!(o.contains(&op::IO_CAP_NEG_REPLY) && !o.contains(&op::IO_CAP_REPLY), "{:?}", o);
 }
+
+const CONN_OK_H0C: &str = "04 03 0b 00 0c 00 01 02 03 04 05 06 01 00";
+
+#[test]
+fn new_conn_complete_drops_stale_up_link_for_same_addr() {
+    let mut vc = Vc::new();
+    let mut h = ready(&mut vc, KeyStore::default());
+    h.request(2, Msg::Listen { psm: 0x11 });
+    evs(&mut h);
+    feed(&mut h, CONN_REQ);
+    h.on_packet(&Vc::cs(op::ACCEPT_CONN));
+    feed(&mut h, CONN_OK_PLAIN);
+    // A second Connecting entry for the same address while the old link is still Up.
+    h.test_new_connecting(PAD);
+    feed(&mut h, CONN_OK_H0C);
+    let mut logs = vec![];
+    while let Some(l) = h.take_log() { logs.push(l); }
+    assert!(logs.iter().any(|l| l.contains("stale link 0x00b dropped for new 0x00c")), "{:?}", logs);
+    let e = evs(&mut h);
+    assert_eq!(e.iter().filter(|x| matches!(x.1, Msg::Link { up: false, .. })).count(), 1, "{:?}", e);
+    assert_eq!(e.iter().filter(|x| matches!(x.1, Msg::Link { up: true, .. })).count(), 2, "{:?}", e);
+}
+
+#[test]
+fn acl_credit_leak_is_restored_on_channel_timeout() {
+    let mut vc = Vc::new();
+    let mut h = ready(&mut vc, KeyStore::default());
+    h.request(2, Msg::Listen { psm: 0x11 });
+    evs(&mut h);
+    feed(&mut h, CONN_REQ);
+    h.on_packet(&Vc::cs(op::ACCEPT_CONN));
+    feed(&mut h, CONN_OK_PLAIN);
+    // A leaked pool: nothing outstanding, yet no credit left. Our request sits queued.
+    h.test_set_acl_avail(0);
+    h.request(2, Msg::Connect { req: 1, addr: PAD, psm: 0x01 });
+    assert!(outs(&mut h).iter().all(|p| p[0] != hci::H4_ACL), "blocked");
+    h.tick(60_000);
+    let mut logs = vec![];
+    while let Some(l) = h.take_log() { logs.push(l); }
+    assert!(logs.iter().any(|l| l.contains("ACL credit leak, restoring")), "{:?}", logs);
+    assert!(outs(&mut h).iter().any(|p| p[0] == hci::H4_ACL), "queued frame flows after recovery");
+}
