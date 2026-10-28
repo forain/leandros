@@ -33,6 +33,7 @@ pub struct I2cSlave {
     pub hid_desc_reg: Option<u16>,
     pub sta: u64,
     pub ps0_ran: bool,
+    pub ini_ran: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -143,6 +144,7 @@ pub fn scan(run_ps0: bool) -> Option<Scan> {
             if !is_lpss_adr(adr) { continue; }
             if !ctrl_done.contains(&p) {
                 ctrl_done.push(p);
+                let _ = ns.eval_child(h, p, "_INI", &[]);
                 out.timings.push(Timing {
                     ctrl_adr: adr,
                     ss: timing_pkg(ns, h, p, "SSCN"),
@@ -156,6 +158,9 @@ pub fn scan(run_ps0: bool) -> Option<Scan> {
             if let Some(v) = ns.eval_child(h, n, "_CID", &[]) { s.cid = id_strings(&v).join(","); }
             let live = s.sta & 0xB == 0xB;
             if live {
+                if ns.child(n, "_INI").is_some() {
+                    s.ini_ran = ns.eval_child(h, n, "_INI", &[]).is_some();
+                }
                 if run_ps0 {
                     if !ctrl_done.contains(&(usize::MAX - p)) {
                         ctrl_done.push(usize::MAX - p);
@@ -170,7 +175,7 @@ pub fn scan(run_ps0: bool) -> Option<Scan> {
                 let is_hid = |x: &str| x.split(',').any(|t| t == "PNP0C50" || t == "ACPI0C50");
                 if is_hid(&s.hid) || is_hid(&s.cid) {
                     let args = [V::buf(HID_I2C_DSM.to_vec()), V::Int(1), V::Int(1), V::pkg(Vec::new())];
-                    if let Some(v) = ns.eval_child(h, n, "_DSM", &args) { s.hid_desc_reg = v.as_int().map(|r| r as u16); }
+                    if let Some(v) = ns.eval_child(h, n, "_DSM", &args) { if let V::Int(r) = v { s.hid_desc_reg = Some(r as u16); } }
                 }
             }
             out.slaves.push(s);
@@ -186,6 +191,7 @@ pub fn describe(s: &I2cSlave) -> String {
         l += &format!(" addr={:#x}{} speed={}", s.addr, if s.ten_bit { "(10b)" } else { "" }, s.speed_hz);
         if let Some((src, pin, fl)) = &s.gpio { l += &format!(" gpio={}:pin{} flags={:#x}", src, pin, fl); }
         if let Some(i) = s.irq { l += &format!(" irq={}", i); }
+        l += &format!(" ini={}", s.ini_ran as u8);
         if let Some(r) = s.hid_desc_reg { l += &format!(" desc={:#x}", r); }
     }
     l
