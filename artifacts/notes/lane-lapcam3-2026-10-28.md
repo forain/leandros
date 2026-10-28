@@ -13,3 +13,7 @@ STATUS: PARTIAL - code done and QEMU green; laptop fps numbers pending (laptop l
   but not runnable on the host.
 - Note: x86_64 image build needed lane/lapgreet's pam-leandros lib.rs overlaid temporarily (shared greetd srchash).
 - Laptop script: scratchpad lapcam3-laptop.sh (deploy trial, push camtest, T1/T2 runs, discard + reboot to good).
+
+## Final laptop result (lapcam5, main merged incl. greetdcache)
+- Trial f8646f042a05: default 30.38 fps (90/90), manual 5 ms 30.48 fps, JPEG 30/30, 100 ms manual 9.98 fps, YUYV ok. Laptop restored to good 2d3e00b630f2.
+- aarch64 regress: all green; wifisimtest failed once, passed on rerun (flake).
