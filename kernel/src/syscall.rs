@@ -13427,6 +13427,11 @@ struct EpKids {
 /// A thread's epoll snapshot of one instance, valid while its listener id is
 /// `lid` and the instance in `slot` is `inst`.
 struct EpCache {
+    /// `EP_MAGIC` while the box is live, and the owner's
+    /// `sched::current_slot_tag()` at creation (lane piepollsrc): a torn
+    /// box (magic gone) and a box in a foreign slot are told apart.
+    magic: u64,
+    owner: (usize, u32),
     /// The per-call `cand`/`recheck`/`changed` vectors while the thread sleeps
     /// (a thread killed asleep is reaped without unwinding; see `ep_cache_put`).
     scratch: (alloc::vec::Vec<bool>, alloc::vec::Vec<u32>, alloc::vec::Vec<u32>),
@@ -13667,6 +13672,14 @@ fn ep_vec_sane<T>(v: &alloc::vec::Vec<T>) -> bool {
     len <= cap && cap < (1 << 24) && (cap == 0 || core::mem::size_of::<T>() == 0 || (p >> 48) == 0xffff)
 }
 
+const EP_MAGIC: u64 = 0x4570_4361_6368_6531;
+
+fn ep_cache_new(slot: usize, lid: u32) -> alloc::boxed::Box<EpCache> {
+    alloc::boxed::Box::new(EpCache { magic: EP_MAGIC, owner: sched::current_slot_tag(), slot, inst: 0, lid,
+                                     ents: alloc::vec::Vec::new(), carry: sched::WakeRing::EMPTY, cgen: 0,
+                                     others: alloc::vec::Vec::new(), scratch: Default::default() })
+}
+
 fn ep_cache_sane(c: &EpCache) -> bool {
     ep_vec_sane(&c.ents) && ep_vec_sane(&c.others) && c.others.iter().all(|o| ep_vec_sane(&o.ents))
 }
@@ -13681,8 +13694,15 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
     let inst_id = { EPOLL_INSTANCES.lock()[slot].id };
     let fresh = cbox.is_none();
     let mut c: alloc::boxed::Box<EpCache> = match cbox.and_then(|b| b.downcast::<EpCache>().ok()) {
-        Some(c) if ep_cache_sane(&c) => c,
+        Some(c) if c.magic == EP_MAGIC && c.owner == sched::current_slot_tag() && ep_cache_sane(&c) => c,
         Some(c) => {
+            let (m, o, here) = (c.magic, c.owner, sched::current_slot_tag());
+            serial_print_str(if m != EP_MAGIC { "[EPOLL] torn wait snapshot (magic) " }
+                             else if o != here { "[EPOLL] foreign wait snapshot owner slot " }
+                             else { "[EPOLL] bad wait snapshot vectors " });
+            mmap_print_dec(o.0); serial_print_str("/"); mmap_print_dec(o.1 as usize);
+            serial_print_str(" here "); mmap_print_dec(here.0); serial_print_str("/"); mmap_print_dec(here.1 as usize);
+            serial_print_str("\n");
             // A torn snapshot (Pi 5, a9a61b2b: `ents` with a NULL buffer
             // and a capacity, so ep_diff's resize memset address 0 under
             // EPOLL_INSTANCES). Never touch it again: leak it and start over.
@@ -13690,13 +13710,9 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
             mmap_print_dec(pid as usize);
             serial_print_str("\n");
             core::mem::forget(c);
-            alloc::boxed::Box::new(EpCache { slot, inst: 0, lid: 0, ents: alloc::vec::Vec::new(),
-                                             carry: sched::WakeRing::EMPTY, cgen: 0,
-                                             others: alloc::vec::Vec::new(), scratch: Default::default() })
+            ep_cache_new(slot, 0)
         }
-        None => alloc::boxed::Box::new(EpCache { slot, inst: 0, lid: 0, ents: alloc::vec::Vec::new(),
-                                                 carry: sched::WakeRing::EMPTY, cgen: 0,
-                                                 others: alloc::vec::Vec::new(), scratch: Default::default() }),
+        None => ep_cache_new(slot, 0),
     };
     // Another instance than the snapshot's, under the same listener: swap in
     // a kept snapshot of it if there is one (the current one is kept).
@@ -14040,10 +14056,17 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
                 sched::ep_cache_put(c);
                 sched::block_on_poll_commit();
                 c = match sched::ep_cache_get().and_then(|b| b.downcast::<EpCache>().ok()) {
-                    Some(c) => c,
-                    None => alloc::boxed::Box::new(EpCache { slot, inst: 0, lid, ents: alloc::vec::Vec::new(),
-                                                             carry: sched::WakeRing::EMPTY, cgen: 0,
-                                                             others: alloc::vec::Vec::new(), scratch: Default::default() }),
+                    Some(c) if c.magic == EP_MAGIC && c.owner == sched::current_slot_tag() => c,
+                    Some(c) => {
+                        // Lane piepollsrc: what went to sleep in this slot is
+                        // not what came back.
+                        serial_print_str("[EPOLL] wait snapshot changed across park: pid=");
+                        mmap_print_dec(pid as usize);
+                        serial_print_str(if c.magic != EP_MAGIC { " torn\n" } else { " foreign\n" });
+                        core::mem::forget(c);
+                        ep_cache_new(slot, lid)
+                    }
+                    None => ep_cache_new(slot, lid),
                 };
                 (cand, recheck, changed) = core::mem::take(&mut c.scratch);
                 woke = true;

@@ -30,6 +30,7 @@ use core::ffi::c_void;
 mod cost;
 mod abi;
 mod stat;
+mod churn;
 
 type c_int = i32;
 type c_long = i64;
@@ -230,6 +231,21 @@ pub unsafe extern "C" fn epoll_main(argc: isize, argv: *mut *mut u8, _envp: *mut
         if !arg.is_null() && *arg == b'k' { return stat::ctl_foreign_main(); }
         // `drain`: the pipe drain-wake guard alone (lane panelpipe).
         if !arg.is_null() && *arg == b'd' { return stat::pipe_wake_main(); }
+        // `churn [secs]` / `churnx` (lane piepollsrc, see churn.rs).
+        if !arg.is_null() && *arg == b'c' && *arg.add(1) == b'h' {
+            if *arg.add(5) == b'x' { return 0; } // the image a churn child execs
+            let mut secs = 15u64;
+            if argc >= 3 {
+                let a = *argv.add(2);
+                let mut v = 0u64; let mut k = 0;
+                while !a.is_null() && (*a.add(k)).is_ascii_digit() { v = v * 10 + (*a.add(k) - b'0') as u64; k += 1; }
+                if v > 0 { secs = v; }
+            }
+            // `churn N tfork`: also fork from a non-leader thread (hangs, see
+            // artifacts/notes/lane-piepollsrc-2026-10-27.md).
+            let tfork = argc >= 4 && *(*argv.add(3)) == b't';
+            return churn::churn_main(secs, tfork);
+        }
         // `cost` / `costbench` (lane epollcost, see cost.rs).
         if !arg.is_null() && *arg == b'c' {
             return if *arg.add(4) == b'b' { cost::costbench() } else { cost::cost_main() };
