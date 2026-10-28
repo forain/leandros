@@ -143,7 +143,7 @@ fn setup_pad(name: &str, bus: usize, s: &I2cSlave, d: &Descriptor, ids: (u16, u1
         spin_ms(1);
     }
     if !acked { return Err(fail(String::from("RESET not acked in 1 s"))); }
-    let pl = hid_ptp::feature_payload(mode, 3);
+    let pl = hid_ptp::config_report(d, mode.id);
     if let Err(e) = set_feature(bus, s.addr, cmd_reg, data_reg, mode.id, &pl) { return Err(fail(format!("SET_REPORT mode {:#x}", e))); }
     // The pad may NAK commands while it applies the mode switch: retry.
     let mut got = get_feature(bus, s.addr, cmd_reg, data_reg, mode.id, pl.len());

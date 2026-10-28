@@ -213,3 +213,15 @@ fn mode_feature_payload() {
     assert_eq!(m.id, 3);
     assert_eq!(feature_payload(m, 3), vec![3]);
 }
+
+#[test]
+fn config_report_sets_mode_and_switches() {
+    // id 3 report: Input Mode (8 bits), Surface Switch (1), Button Switch (1), 6 pad bits
+    let mut d = ptp_desc();
+    d.truncate(d.len() - 12);
+    d.extend_from_slice(&[0x09, 0x52, 0x25, 0x0A, 0x75, 0x08, 0x95, 0x01, 0xB1, 0x02,
+        0x09, 0x57, 0x09, 0x58, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0xB1, 0x02, 0x95, 0x06, 0xB1, 0x03, 0xC0, 0xC0]);
+    let p = parse(&d);
+    let r = config_report(&p, 3);
+    assert_eq!(r, vec![3, 0b11]);
+}

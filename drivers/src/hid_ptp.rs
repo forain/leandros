@@ -225,3 +225,21 @@ pub fn feature_payload(loc: Loc, value: u32) -> Vec<u8> {
     }
     v
 }
+
+/// Whole Device-Configuration feature report `id` (payload without id byte) as
+/// hid-multitouch writes it for a touchpad: Input Mode = 3, Surface Switch = 1,
+/// Button Switch = 1, every other bit 0. Length covers every field of the report.
+pub fn config_report(d: &Descriptor, id: u8) -> Vec<u8> {
+    let fs: Vec<_> = d.fields.iter().filter(|f| f.kind == hid_desc::KIND_FEATURE && f.report_id == id).collect();
+    let bits_total = fs.iter().map(|f| f.bit + f.size * f.count).max().unwrap_or(0);
+    let mut v = alloc::vec![0u8; ((bits_total + 7) / 8) as usize];
+    for f in fs {
+        for (i, &u) in f.usages.iter().enumerate() {
+            let val = match u { hid_desc::U_INPUT_MODE => 3, 0x000D_0057 | 0x000D_0058 => 1, _ => 0 };
+            if val == 0 { continue; }
+            let loc = Loc { id, bit: f.bit + i as u32 * f.size, size: f.size };
+            for (j, b) in feature_payload(loc, val).iter().enumerate() { if j < v.len() { v[j] |= b; } }
+        }
+    }
+    v
+}
