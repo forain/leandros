@@ -552,7 +552,7 @@ fn secrets() {
 #[test]
 fn stamp_policy() {
     use crate::profiles::{stamp, Profile};
-    let mut p = Profile::default();
+    let mut p = Profile::new_wifi([1; 16], b"x", 0, b"").unwrap();
     assert!(stamp(&mut p, 50) && p.timestamp_s == 1, "no clock: proven, time unknown");
     assert!(!stamp(&mut p, 60));
     assert!(stamp(&mut p, 1_800_000_000) && p.timestamp_s == 1_800_000_000, "clock set replaces 1");
