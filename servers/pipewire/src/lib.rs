@@ -70,6 +70,13 @@ impl Backend {
         match self { Backend::Virtio(d) => d.recover_stream(), Backend::Hda(d) => d.recover_stream(),
                      Backend::Hdmi(d) => d.recover_stream(), Backend::None => {} }
     }
+    /// Captured 48 kHz s16le stereo (HD Audio only); Ok(0) = nothing yet.
+    fn capture_read(&mut self, out: &mut [u8]) -> Result<usize, i32> {
+        match self { Backend::Hda(d) => d.capture_read(out), _ => Err(-19) } // ENODEV
+    }
+    fn capture_close(&mut self) {
+        if let Backend::Hda(d) = self { d.capture_close(); }
+    }
     fn info(&mut self) -> alloc::string::String {
         match self {
             Backend::Virtio(_) => alloc::string::String::from("backend: virtio-sound\n"),
@@ -202,6 +209,49 @@ fn claim(want: u64) -> Result<(), i32> {
             return Ok(());
         }
     }
+}
+
+/// The capture reader: 0 = none, else `HOLD_OPEN | open_id` of the open of
+/// /dev/pipewire that reads the microphone (one at a time, like the writer).
+static READER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn claim_reader(want: u64) -> Result<(), i32> {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire};
+    match READER.compare_exchange(0, want, AcqRel, Acquire) {
+        Ok(_) => Ok(()),
+        Err(cur) if cur == want => Ok(()),
+        Err(_) => Err(-16), // EBUSY
+    }
+}
+
+/// VFS_READ: block until at least one period (10 ms) of capture is there or
+/// `count` is filled, at most ~500 ms; returns what was captured.
+fn capture_read(buf_ptr: usize, count: usize) -> Message {
+    let mut kbuf = [0u8; 4096];
+    let mut total = 0usize;
+    let start = drivers::snd::monotonic_us();
+    while total < count {
+        let want = (count - total).min(kbuf.len());
+        let r = {
+            let mut state = STATE.lock();
+            if !state.initialized { return err_reply(-19); }
+            state.snd_driver.capture_read(&mut kbuf[..want])
+        };
+        match r {
+            Err(e) => return if total > 0 { val_reply(total as u64) } else { err_reply(e) },
+            Ok(0) => {
+                if total >= 1920 || drivers::snd::monotonic_us().wrapping_sub(start) > 500_000 { break; }
+                sched::kthread::sleep_ns(5_000_000);
+            }
+            Ok(n) => {
+                if unsafe { sched::uaccess::copy_to_user(buf_ptr + total, kbuf.as_ptr(), n) } != 0 {
+                    return if total > 0 { val_reply(total as u64) } else { err_reply(-14) };
+                }
+                total += n;
+            }
+        }
+    }
+    val_reply(total as u64)
 }
 
 fn release(holder: u64) {
@@ -391,8 +441,19 @@ fn handle_msg(msg: &Message, caller_pid: u32, _target_port: u32) -> Message {
             };
         }
         0x13 => { // VFS_CLOSE {dev_id, open_id}: the open's last fd is gone
-            release(HOLD_OPEN | (arg(msg, 1) & 0xffff_ffff));
+            let h = HOLD_OPEN | (arg(msg, 1) & 0xffff_ffff);
+            release(h);
+            if READER.compare_exchange(h, 0, core::sync::atomic::Ordering::AcqRel,
+                                       core::sync::atomic::Ordering::Acquire).is_ok() {
+                let mut state = STATE.lock();
+                if state.initialized { state.snd_driver.capture_close(); }
+            }
             return val_reply(0);
+        }
+        0x11 => { // VFS_READ: microphone capture, one reading open at a time
+            if let Err(e) = claim_reader(HOLD_OPEN | open_id_of(msg)) { return err_reply(e); }
+            if !STATE.lock().initialized { return err_reply(-19); }
+            return capture_read(arg(msg, 1) as usize, arg(msg, 2) as usize);
         }
         0x12 => { // VFS_WRITE: only through the holding open
             if let Err(e) = claim(HOLD_OPEN | open_id_of(msg)) { return err_reply(e); }

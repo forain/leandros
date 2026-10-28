@@ -1053,6 +1053,30 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 #[cfg(feature = "rpi5")]
                 { BOOT_INFO.pci_ecam_base = 0; }
 
+                // kexec DMA defense (lane pikexecdma): a previous kernel may
+                // have left RP1 mastering (GEM RX ring, xHCI, RP1 DMA) with
+                // pcie2 up, and its frames would land in pages the buddy
+                // allocator is about to hand out. Before mm init, whatever
+                // `pcie.rpi5` says: RP1 in PERST#, the RC bridge in reset
+                // (brcmstb_pcie::init brings it back when PCIe is wanted).
+                // The identity half of early_pgtables maps the BCM2712 MMIO
+                // (PUD 64, Device) here. `pcie.early_reset=0` skips it.
+                #[cfg(feature = "rpi5")]
+                if cmdline_knob("pcie.early_reset") != Some("0") {
+                    use drivers::brcmstb_pcie::{early_reset_identity, EarlyReset};
+                    match unsafe { early_reset_identity() } {
+                        EarlyReset::AlreadyInReset =>
+                            serial_print_str("[pcie] early reset: RC held in reset before mm init (bridge was already in reset)\n"),
+                        EarlyReset::Reset { perstb_was, held: true } => {
+                            serial_print_str("[pcie] early reset: RC held in reset before mm init (PERST# ");
+                            serial_print_str(if perstb_was { "was released" } else { "was asserted" });
+                            serial_print_str(")\n");
+                        }
+                        EarlyReset::Reset { held: false, .. } =>
+                            serial_print_str("[pcie] early reset: FAILED, bridge reset did not stick\n"),
+                    }
+                }
+
                 // QEMU `-kernel` provides neither a DTB nor ACPI for a bare ELF,
                 // so the device-tree scan above finds nothing and UART/ECAM stay
                 // zero. Fall back to the fixed QEMU virt MMIO addresses: the PL011

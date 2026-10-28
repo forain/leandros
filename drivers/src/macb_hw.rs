@@ -879,3 +879,37 @@ pub fn phy_diag(r: &mut dyn Regs, phy: u8) -> Result<PhyDiag, MdioError> {
     let clk_ctl = mdio_read(r, phy, MII_BCM_SHD1C)? & 0x3ff;
     Ok(PhyDiag { rx_err, false_carrier, rx_notok, aux_status, misc, clk_ctl })
 }
+
+// ── kexec quiesce (Linux macb_reset_hw + macb_halt_tx), host-testable ──────
+
+/// Stops every DMA the GEM runs before a kexec: interrupts masked, TX halted
+/// (bounded wait for TSR.TGO to clear), TE/RE cleared so neither queue
+/// fetches a descriptor or writes a frame again, statistics and status
+/// cleared, then every queue pointer zeroed so a stray re-enable has no
+/// ring to walk. Returns true when the transmitter reported idle.
+pub fn quiesce<R: Regs>(m: &mut R, queues: usize) -> bool {
+    m.w32(IDR, INT_ALL);
+    for q in 1..queues { m.w32(IDRQ1 + 4 * (q - 1), INT_ALL); }
+    let ncr = m.r32(NCR);
+    m.w32(NCR, ncr | NCR_THALT);
+    let mut idle = false;
+    for _ in 0..1000 {
+        if m.r32(TSR) & TSR_TGO == 0 { idle = true; break; }
+        m.delay_us(10);
+    }
+    let ncr = m.r32(NCR);
+    m.w32(NCR, (ncr & !(NCR_TE | NCR_RE | NCR_TSTART)) | NCR_CLRSTAT);
+    m.delay_us(100);
+    m.w32(TSR, 0xffff_ffff);
+    m.w32(RSR, 0xffff_ffff);
+    let _ = m.r32(ISR);
+    m.w32(TBQP, 0);
+    m.w32(RBQP, 0);
+    for q in 1..queues {
+        m.w32(TBQPQ1 + 4 * (q - 1), 0);
+        m.w32(RBQPQ1 + 4 * (q - 1), 0);
+    }
+    m.w32(TBQPH, 0);
+    m.w32(RBQPH, 0);
+    idle
+}
