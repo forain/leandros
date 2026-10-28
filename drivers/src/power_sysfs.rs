@@ -57,8 +57,12 @@ fn status_str(s: u8) -> &'static str {
 fn battery_attrs(b: &BatteryInfo) -> Vec<(&'static str, String)> {
     let mut v: Vec<(&'static str, String)> = Vec::new();
     v.push(("type", "Battery".to_string()));
-    v.push(("present", (b.present as u8).to_string()));
+    // A failed/all-zero _BST/_BIF read must not look like a 0% battery
+    // (critical-battery policy would power the machine off): hide it.
+    let bogus = b.now == 0 && b.full == 0;
+    v.push(("present", ((b.present && !bogus) as u8).to_string()));
     if !b.present { return v; }
+    if bogus { v.push(("status", "Unknown".to_string())); return v; }
     v.push(("status", status_str(b.status).to_string()));
     v.push(("capacity", b.capacity.to_string()));
     let level = if b.status == acpi_power::ST_FULL { "Full" }
