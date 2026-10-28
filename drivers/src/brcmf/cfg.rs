@@ -374,6 +374,8 @@ pub struct JoinOpts {
     pub mfp: Option<u32>,
     /// Set "wpaie" (our RSN IE) before joining.
     pub wpaie: bool,
+    /// Set "wpaie" again after wpa_auth/auth/wsec/mfp (a fresh firmware drops the early one).
+    pub wpaie_late: bool,
     /// AKM suite type we advertise: None = auto (6 if the AP offers it, else 2).
     pub akm: Option<u8>,
     /// RSN capability MFPC / MFPR we advertise: None = auto (MFPC if the AP
@@ -458,7 +460,7 @@ pub fn parse_ap_rsn(ie: &[u8]) -> Option<ApRsn> {
 
 impl Default for JoinOpts {
     fn default() -> Self {
-        JoinOpts { method: JoinMethod::Auto, sup: SupMode::Auto, pmk: PmkForm::Auto, sec: SecPath::Auto, mfp: None, wpaie: true,
+        JoinOpts { method: JoinMethod::Auto, sup: SupMode::Auto, pmk: PmkForm::Auto, sec: SecPath::Auto, mfp: None, wpaie: true, wpaie_late: true,
                    akm: None, mfpc: None, mfpr: None, msg2ie: Msg2Ie::Auto }
     }
 }
@@ -487,8 +489,9 @@ impl JoinOpts {
                 ("sec", "iovar") => { self.sec = SecPath::Iovar; true }
                 ("mfp", "auto") => { self.mfp = None; true }
                 ("mfp", n) => match n.parse::<u32>() { Ok(n) if n <= 2 => { self.mfp = Some(n); true } _ => false },
-                ("wpaie", "1") => { self.wpaie = true; true }
-                ("wpaie", "0") => { self.wpaie = false; true }
+                ("wpaie", "1") | ("wpaie", "early") => { self.wpaie = true; self.wpaie_late = false; true }
+                ("wpaie", "0") => { self.wpaie = false; self.wpaie_late = false; true }
+                ("wpaie", "late") => { self.wpaie = true; self.wpaie_late = true; true }
                 ("akm", "auto") => { self.akm = None; true }
                 ("akm", "2") => { self.akm = Some(2); true }
                 ("akm", "6") => { self.akm = Some(6); true }
@@ -518,7 +521,7 @@ impl JoinOpts {
         let a = match self.akm { None => alloc::string::String::from("auto"), Some(n) => alloc::format!("{}", n) };
         let i = match self.msg2ie { Msg2Ie::Auto => "auto", Msg2Ie::Ours => "ours", Msg2Ie::Fw => "fw" };
         alloc::format!("method={} supwpa={} pmk={} sec={} mfp={} wpaie={} akm={} mfpc={} mfpr={} msg2ie={}",
-                       m, s, p, c, f, self.wpaie as u8, a, ob(self.mfpc), ob(self.mfpr), i)
+                       m, s, p, c, f, if self.wpaie_late { "late" } else if self.wpaie { "early" } else { "0" }, a, ob(self.mfpc), ob(self.mfpr), i)
     }
 }
 
@@ -1060,23 +1063,25 @@ impl<F: Fwil> Brcmf<F> {
 
     /// The RSN IE of the association request the firmware sent ("assoc_info"
     /// lengths, then "assoc_req_ies"), as Linux brcmf_get_assoc_ies reads it.
-    fn assoc_req_rsn(&mut self) -> Option<Vec<u8>> {
-        let mut li = [0u8; 8];
-        let n = self.fw.iovar_get("assoc_info", &mut li).ok()?;
-        if n < 4 { return None; }
+    fn assoc_req_rsn(&mut self) -> Result<Vec<u8>, alloc::string::String> {
+        // Linux queries with WL_ASSOC_INFO_MAX (512); a short buffer makes the
+        // firmware answer BCME_BUFTOOSHORT on every join.
+        let mut li = alloc::vec![0u8; 512];
+        let n = self.fw.iovar_get("assoc_info", &mut li).map_err(|e| alloc::format!("assoc_info {:?}", e))?;
+        if n < 4 { return Err(alloc::format!("assoc_info short {}", n)); }
         let req_len = (le32(&li, 0) as usize).min(512);
-        if req_len == 0 { return None; }
+        if req_len == 0 { return Err("req_len 0".into()); }
         let mut buf = alloc::vec![0u8; 512];
-        let n = self.fw.iovar_get("assoc_req_ies", &mut buf).ok()?.min(512);
+        let n = self.fw.iovar_get("assoc_req_ies", &mut buf).map_err(|e| alloc::format!("assoc_req_ies {:?}", e))?.min(512);
         let b = &buf[..n.max(req_len).min(512)];
         // Usually the IEs start at 0 (SSID first); some builds keep the fixed
         // fields (capability + listen interval, + current AP for reassoc).
         for off in [0usize, 4, 10] {
             if b.get(off) == Some(&0) {
-                if let Some(ie) = find_rsn_ie(&b[off..]) { return Some(ie.to_vec()); }
+                if let Some(ie) = find_rsn_ie(&b[off..]) { return Ok(ie.to_vec()); }
             }
         }
-        None
+        Err(alloc::format!("no RSN IE in {} bytes", req_len))
     }
 
     fn configure_security(&mut self, req: &JoinReq) -> Result<bool, FwError> {
@@ -1110,6 +1115,10 @@ impl<F: Fwil> Brcmf<F> {
             let r = self.iovar_u32("mfp", m);
             let r = self.step(&alloc::format!("iovar mfp={}", m), r);
             if r.is_err() && (o.mfp.is_some() || o.mfpc.is_some() || o.mfpr.is_some()) { return r.map(|_| false); }
+        }
+        if o.wpaie && o.wpaie_late {
+            let r = self.fw.iovar_set("wpaie", &ie);
+            let _ = self.step("iovar wpaie (late)", r); // optional
         }
         let host = match o.sup {
             SupMode::Host => true,
@@ -1174,8 +1183,10 @@ impl<F: Fwil> Brcmf<F> {
                 (self.env.random)(&mut snonce);
                 // Message 2 must carry the RSN IE of the association request
                 // byte for byte: take the one the firmware actually sent.
-                let fw_ie = self.assoc_req_rsn();
-                self.rsn.assoc_fw = match &fw_ie { Some(i) => hex(i), None => "unavailable".into() };
+                let fw_ie = match self.assoc_req_rsn() {
+                    Ok(i) => { self.rsn.assoc_fw = hex(&i); Some(i) }
+                    Err(e) => { self.rsn.assoc_fw = alloc::format!("unavailable ({})", e); None }
+                };
                 let (ie, src) = match (self.opts.msg2ie, fw_ie) {
                     (Msg2Ie::Ours, _) | (_, None) => (h.rsn_ie.clone(), "ours"),
                     (_, Some(i)) => (i, "fw"),
@@ -1319,7 +1330,9 @@ impl<F: Fwil> Brcmf<F> {
         match (w, self.rx.down) {
             (_, Some(Down::JoinFailed { status, .. })) if status == status::NO_NETWORKS => Err(JoinFail::NoNetwork),
             (_, Some(Down::JoinFailed { status, reason })) => Err(JoinFail::Assoc { status, reason }),
-            (_, Some(Down::Deauth { reason, .. })) | (_, Some(Down::Disassoc { reason, .. })) => {
+            (_, Some(Down::Deauth { reason, by_ap })) | (_, Some(Down::Disassoc { reason, by_ap })) => {
+                let kind = match self.rx.down { Some(Down::Deauth { .. }) => "DEAUTH", _ => "DISASSOC" };
+                self.log(&alloc::format!("join: {}{} reason {} (after message 2: {})", kind, if by_ap { "_IND from the AP" } else { " by the firmware" }, reason, msg2));
                 if keyed && self.rx.link_seen { Err(JoinFail::Handshake { msg2, reason: Some(reason) }) }
                 else { Err(JoinFail::Assoc { status: status::FAIL, reason: reason as u32 }) }
             }

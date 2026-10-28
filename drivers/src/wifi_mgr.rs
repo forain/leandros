@@ -653,6 +653,9 @@ struct Backoff {
 }
 
 /// A BSS that failed us (see `BSS_BACKOFF_MS`).
+/// How long a BSS that rejected us stays demoted in autoconnect.
+const BSS_REJECT_DECAY_MS: u64 = 10 * 60 * 1000;
+
 struct BssBackoff {
     bssid: [u8; 6],
     fails: u32,
@@ -674,6 +677,8 @@ struct St {
     wk_bss: Vec<crate::wifi_wrongkey::WkSeen>,
     backoff: Vec<Backoff>,
     bss_backoff: Vec<BssBackoff>,
+    /// BSSes that rejected us (handshake/assoc/flap), with the time of the last one.
+    bss_rejected: Vec<([u8; 6], u64)>,
     /// (profile, `now_ms` of its last successful connection this boot).
     used: Vec<([u8; 16], u64)>,
     /// BSSs whose RSN details were logged as not joinable, with the `ext`
@@ -721,7 +726,7 @@ impl Mgr {
                 },
                 bss: Vec::new(), last_scan: None, last_scan_ms: 0, scan_gen: 0, radio_on: true, caps: 0,
                 age_out_ms: BSS_AGE_OUT_MS as u64, auto_blocked: false, wrong_key: Vec::new(), wk_bss: Vec::new(), backoff: Vec::new(),
-                bss_backoff: Vec::new(), used: Vec::new(), rejected_logged: Vec::new(), flaps: Vec::new(),
+                bss_backoff: Vec::new(), bss_rejected: Vec::new(), used: Vec::new(), rejected_logged: Vec::new(), flaps: Vec::new(),
                 fallback: Vec::new(), next_auto_ms: 0, next_attempt: 1, last_signal: (0, 0),
             }),
             events: Mutex::new((0, VecDeque::new())),
@@ -1037,7 +1042,7 @@ impl Mgr {
         let st = self.st.lock();
         // Candidates: (profile, BSS, AKM, auto_key inputs), then the strongest
         // 2.4 GHz one (the 5 GHz preference is relative to it), then the key.
-        let mut cands: Vec<(usize, [u8; 6], u8, i32, u64, u64, bool, u8, i16)> = Vec::new();
+        let mut cands: Vec<(usize, [u8; 6], u8, i32, u64, u64, bool, u8, i16, bool)> = Vec::new();
         for (pi, p) in profiles.iter().enumerate() {
             if p.kind != if_kind::WIFI || !p.autoconnect { continue; }
             let pif = p.iface();
@@ -1060,13 +1065,14 @@ impl Mgr {
                     Ok(a) => a,
                     Err(_) => continue,
                 };
-                cands.push((pi, e.nc.bssid, a, p.priority, boot_ms, stored_s, legacy, e.nc.channel, e.nc.signal_dbm));
+                cands.push((pi, e.nc.bssid, a, p.priority, boot_ms, stored_s, legacy, e.nc.channel, e.nc.signal_dbm,
+                           !st.bss_rejected.iter().any(|r| r.0 == e.nc.bssid && now.saturating_sub(r.1) < BSS_REJECT_DECAY_MS)));
             }
         }
         let best24 = cands.iter().filter(|c| c.7 <= 14).map(|c| c.8).max();
-        let mut best: Option<((i64, u64, bool, u64, bool, i16), usize, [u8; 6], u8)> = None;
-        for &(pi, bssid, a, prio, boot_ms, stored_s, legacy, ch, sig) in cands.iter() {
-            let k = auto_key(prio, boot_ms, stored_s, legacy, ch, sig, best24);
+        let mut best: Option<((i64, u64, bool, bool, u64, bool, i16), usize, [u8; 6], u8)> = None;
+        for &(pi, bssid, a, prio, boot_ms, stored_s, legacy, ch, sig, clean) in cands.iter() {
+            let k = auto_key(prio, boot_ms, clean, stored_s, legacy, ch, sig, best24);
             if best.as_ref().map_or(true, |b| k > b.0) { best = Some((k, pi, bssid, a)); }
         }
         best.map(|b| (profiles[b.1].clone(), b.2, b.3))
@@ -1087,6 +1093,13 @@ impl Mgr {
         let now = now_ms();
         let (fails, ms) = {
             let mut st = self.st.lock();
+            match st.bss_rejected.iter_mut().find(|r| r.0 == bssid) {
+                Some(r) => r.1 = now,
+                None => {
+                    if st.bss_rejected.len() >= netctl_abi::MAX_BSS { st.bss_rejected.remove(0); }
+                    st.bss_rejected.push((bssid, now));
+                }
+            }
             match st.bss_backoff.iter_mut().find(|b| b.bssid == bssid) {
                 Some(b) => {
                     b.fails += 1;
@@ -1172,6 +1185,7 @@ impl Mgr {
         let mut st = self.st.lock();
         st.backoff.retain(|b| b.uuid != *uuid);
         st.bss_backoff.retain(|b| b.bssid != bssid);
+        st.bss_rejected.retain(|r| r.0 != bssid);
         crate::wifi_wrongkey::clear_profile(&mut st.wk_bss, uuid);
         if !uuid_is_nil(uuid) {
             st.used.retain(|u| u.0 != *uuid);
@@ -1382,6 +1396,7 @@ pub fn run<R: Radio>(mgr: &'static Mgr, r: &mut R) {
                         st.wk_bss.clear();
                         st.backoff.clear();
                         st.bss_backoff.clear();
+                        st.bss_rejected.clear();
                         st.auto_blocked = false;
                         st.next_auto_ms = 0;
                     }
@@ -1417,8 +1432,9 @@ pub fn run<R: Radio>(mgr: &'static Mgr, r: &mut R) {
                     None if is_legacy(&p) => String::from("the legacy network"),
                     None => String::from("not connected before"),
                 };
-                mgr.log(&alloc::format!("autoconnect: '{}' (priority {}) via {} ({})", wf::ssid_display(p.ssid()), p.priority,
-                                        fmt_mac(&bssid), why));
+                let demoted = mgr.st.lock().bss_rejected.iter().any(|r| r.0 == bssid && now_ms().saturating_sub(r.1) < BSS_REJECT_DECAY_MS);
+                mgr.log(&alloc::format!("autoconnect: '{}' (priority {}) via {} ({}{})", wf::ssid_display(p.ssid()), p.priority,
+                                        fmt_mac(&bssid), why, if demoted { ", rejected this boot, demoted" } else { "" }));
                 match drive(mgr, r, req) { After::Dead => return, _ => {} }
                 continue;
             }
@@ -1675,6 +1691,7 @@ fn connected<R: Radio>(mgr: &Mgr, r: &mut R, req: &Req, bssid: [u8; 6]) -> After
                     st.wk_bss.clear();
                     st.backoff.clear();
                     st.bss_backoff.clear();
+                        st.bss_rejected.clear();
                     st.auto_blocked = false;
                 }
                 mgr.refresh_flags();

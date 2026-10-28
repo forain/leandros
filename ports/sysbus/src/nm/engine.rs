@@ -291,12 +291,10 @@ impl Engine {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if now == 0 {
-            return;
-        }
         let r = backend::edit(self.be.store(), |list, _| match list.iter_mut().find(|p| p.uuid == uuid) {
             Some(p) => {
-                p.timestamp_s = now;
+                // Shared policy (netctl watch --stamp uses it too): no write when unchanged.
+                let _ = netctl_abi::profiles::stamp(p, now);
                 Ok(())
             }
             None => Err(()), // in-memory or legacy connection: nothing written

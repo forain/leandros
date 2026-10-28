@@ -552,6 +552,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // and the serial getty start with the configured layout.
     vconsole_setup();
 
+    spawn_netctl_stamper();
+
     // 5. Graphical login, when the image carries one and nothing opted out.
     // /run is on the persistent root, so a pid file from an earlier boot
     // would name whatever process now has that pid (a `kill $(cat ...)` then
@@ -925,6 +927,27 @@ unsafe fn sshd_wanted() -> bool {
 /// Start `/usr/sbin/sshd` in its own session, stdin on /dev/null and stdout/
 /// stderr on the console (it logs to /var/log/sshd.log itself; only a fatal
 /// start-up error reaches the console).
+/// Quiet connect stamper: `netctl watch --stamp` records each successful
+/// Wi-Fi connect in the profile's timestamp_s (autoconnect ranking across
+/// boots). Only started when the kernel exposes /dev/netctl; not waited for.
+unsafe fn spawn_netctl_stamper() {
+    let fd = open(b"/dev/netctl\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 { return; }
+    close(fd);
+    let pid = fork();
+    if pid == 0 {
+        setsid();
+        let path = b"/bin/netctl\0";
+        let a1 = b"watch\0";
+        let a2 = b"--no-snapshot\0";
+        let a3 = b"--stamp\0";
+        let argv: [*const u8; 5] = [path.as_ptr(), a1.as_ptr(), a2.as_ptr(), a3.as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(0);
+    }
+}
+
 unsafe fn spawn_sshd() -> i32 {
     let pid = fork();
     if pid == 0 {
