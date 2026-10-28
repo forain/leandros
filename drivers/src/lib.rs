@@ -25,6 +25,7 @@ pub mod i915;
 pub mod acpi_power;
 /// HID report-descriptor parser (pure logic, host-tested; lane lapi2c).
 pub mod hid_desc;
+pub mod hid_ptp;
 /// ACPI I2C slave discovery, DesignWare I2C master, HID-over-I2C probe (lane lapi2c).
 #[cfg(target_arch = "x86_64")]
 pub mod i2c_acpi;
