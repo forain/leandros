@@ -47,6 +47,14 @@ struct Pad {
     mode_id: u8,
     mode_pl: Vec<u8>,
     data_reg: u16,
+    /// Time of the first read error since the last good read (0 = none).
+    first_err: u64,
+    power_retried: bool,
+    /// Reports that were neither PTP nor mouse.
+    unknown: u32,
+    oversize_logged: bool,
+    dbg: bool,
+    last_dbg: u64,
 }
 
 struct Listen {
@@ -85,6 +93,23 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
+fn mono_ns() -> u64 {
+    extern "C" { fn arch_monotonic_ns() -> u64; }
+    unsafe { arch_monotonic_ns() }
+}
+
+/// Wall-clock budget for reset_wait and the GET retry loops.
+const DEADLINE_NS: u64 = 1_000_000_000;
+/// Runtime fallback: read errors with no good read in between for this long.
+const ERR_FALLBACK_NS: u64 = 2_000_000_000;
+/// Runtime fallback: this many reports that are neither PTP nor mouse.
+const UNKNOWN_FALLBACK: u32 = 64;
+/// touchpad.debug stats period.
+const DBG_PERIOD_NS: u64 = 5_000_000_000;
+
+/// `i2c_hid.inreg=1` cached at init (read_input runs up to 500x/s).
+static INREG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn spin_ms(ms: u64) {
     extern "C" { fn arch_monotonic_ns() -> u64; }
     let t0 = unsafe { arch_monotonic_ns() };
@@ -108,6 +133,7 @@ fn get_feature(bus: usize, addr: u16, cmd_reg: u16, data_reg: u16, id: u8, plen:
     dw_i2c::xfer(bus, addr, &w, &mut r)?;
     let n = u16::from_le_bytes([r[0], r[1]]) as usize;
     if n < 2 + extra + plen { return Err(5); }
+    if id != 0 && r[2] != id { return Err(6); }
     Ok(r[2 + extra..].to_vec())
 }
 
@@ -123,7 +149,7 @@ fn set_feature(bus: usize, addr: u16, cmd_reg: u16, data_reg: u16, id: u8, pl: &
 
 /// Plain input read (Linux i2c_hid_get_input): returns the LE16 length word.
 fn read_input(bus: usize, addr: u16, in_reg: u16, buf: &mut [u8]) -> Result<usize, u32> {
-    if word("i2c_hid.inreg", "") == Some("1") {
+    if INREG.load(Ordering::Relaxed) {
         dw_i2c::xfer(bus, addr, &[in_reg as u8, (in_reg >> 8) as u8], buf)?;
     } else {
         dw_i2c::xfer(bus, addr, &[], buf)?;
@@ -152,12 +178,12 @@ fn reset_wait(bus: usize, addr: u16, in_reg: u16, max_in: usize) -> (bool, u32, 
     let n = max_in.clamp(2, 256);
     let mut buf = [0u8; 256];
     let mut got = false;
-    let mut ms = 100;
-    while ms < 1000 {
+    let t0 = mono_ns() - 100_000_000;
+    while mono_ns().saturating_sub(t0) < DEADLINE_NS {
         if let Ok(0) = read_input(bus, addr, in_reg, &mut buf[..n]) { got = true; break; }
         spin_ms(5);
-        ms += 5;
     }
+    let ms = mono_ns().saturating_sub(t0) / 1_000_000;
     let (r, _) = drain(bus, addr, in_reg, max_in);
     (got, r, ms)
 }
@@ -202,8 +228,10 @@ fn setup_inner(name: &str, bus: usize, s: &I2cSlave, d: &Descriptor, vid: u16, p
             return Ok(false);
         }
         let mut got = get_feature(bus, s.addr, cmd_reg, data_reg, mode.id, pl.len());
+        let gt0 = mono_ns();
         for i in 0..5 {
             let Err(e) = got else { break };
+            if mono_ns().saturating_sub(gt0) > DEADLINE_NS { log(&format!("i2c-hid: {} GET_REPORT retries hit the 1 s deadline", name)); break; }
             if i == 0 { log(&format!("i2c-hid: {} GET_REPORT mode first try {:#x}, retrying", name, e)); }
             spin_ms(10);
             drain(bus, s.addr, in_reg, max_in);
@@ -220,7 +248,7 @@ fn setup_inner(name: &str, bus: usize, s: &I2cSlave, d: &Descriptor, vid: u16, p
                 let mc = ptp.max_contacts_feature.map(|m| (m.id, hid_ptp::config_report(d, m.id).len()));
                 let Some((id, plen)) = mc else { return Err(format!("GET_REPORT mode {:#x}, no maxc feature", e)) };
                 match get_feature(bus, s.addr, cmd_reg, data_reg, id, plen) {
-                    Ok(v) => { log(&format!("i2c-hid: {} GET mode NAK {:#x}, GET maxc (id {}) ok {}", name, e, id, hex(&v))); Ok(false) }
+                    Ok(v) => { log(&format!("i2c-hid: {} GET mode NAK {:#x}, GET maxc (id {}) ok {} (Input Mode unverified)", name, e, id, hex(&v))); Ok(false) }
                     Err(e2) => { log(&format!("i2c-hid: {} GET mode NAK {:#x}, GET maxc (id {}) NAK {:#x}", name, e, id, e2)); Err(format!("GET_REPORT mode {:#x}, maxc {:#x}", e, e2)) }
                 }
             }
@@ -228,15 +256,16 @@ fn setup_inner(name: &str, bus: usize, s: &I2cSlave, d: &Descriptor, vid: u16, p
     })();
     if dbg { dw_i2c::DEBUG.store(word("i2c.debug", "") == Some("1"), Ordering::Relaxed); }
     let confirmed = match res { Ok(c) => c, Err(w) => return Err(fail(w)) };
-    extern "C" { fn arch_monotonic_ns() -> u64; }
     Ok(Pad { mouse: hid_ptp::mouse_layout(d), ptp, uses_ids: d.uses_report_ids, dev, cmd_reg, mt: Mt::default(), asm: Assembler::default(),
-        err_run: 0, t0: unsafe { arch_monotonic_ns() }, force_fail: word("touchpad.fail", "") == Some("1"), frames: 0,
-        mode_confirmed: confirmed, resent: false, mode_id: mode.id, mode_pl: hid_ptp::config_report(d, mode.id), data_reg })
+        err_run: 0, t0: mono_ns(), force_fail: word("touchpad.fail", "") == Some("1"), frames: 0,
+        mode_confirmed: confirmed, resent: false, mode_id: mode.id, mode_pl: hid_ptp::config_report(d, mode.id), data_reg,
+        first_err: 0, power_retried: false, unknown: 0, oversize_logged: false, dbg, last_dbg: mono_ns() })
 }
 
 /// Put the pad back on PS/2: SLEEP the I2C side, drop the node, re-init psmouse.
 fn fallback(p: &mut Pad, bus: usize, addr: u16, why: &str) {
-    log(&format!("touchpad: i2c failed ({}), back to ps2", why));
+    log(&format!("touchpad: i2c failed ({}), back to ps2 (ps2 pad packets dropped while i2c owned: {})", why, crate::psmouse::dropped_packets()));
+    crate::psmouse::set_touch_owner_i2c(false);
     let _ = power(bus, addr, p.cmd_reg, false);
     evdev_server::unregister_input_device(p.dev);
     let f = PS2_REINIT.load(Ordering::Acquire);
@@ -281,10 +310,11 @@ fn probe_slave(s: &I2cSlave, bus: usize, reset: bool, tp_i2c: bool) -> Option<Li
     let mut pad = None;
     if tp_i2c && hid_desc::ptp(&parsed).is_some() {
         match setup_pad(&name, bus, s, &parsed, (w(20), w(22)), (in_reg, cmd_reg, w(18)), max_in.clamp(2, 256)) {
-            Ok(p) => { log(&format!("touchpad: i2c active ({}), polling every 8 ms", name)); POLL_NS.store(POLL_ACTIVE_NS, Ordering::Relaxed); pad = Some(p); }
+            Ok(p) => { log(&format!("touchpad: i2c active ({}), polling every 8 ms", name)); POLL_NS.store(POLL_ACTIVE_NS, Ordering::Relaxed); crate::psmouse::set_touch_owner_i2c(true); pad = Some(p); }
             Err((touched, why)) => {
                 log(&format!("touchpad: i2c failed ({}), back to ps2", why));
                 if touched {
+                    crate::psmouse::set_touch_owner_i2c(false);
                     let _ = power(bus, s.addr, cmd_reg, false);
                     let f = PS2_REINIT.load(Ordering::Acquire);
                     if f != 0 { let f: fn() = unsafe { core::mem::transmute(f) }; f(); }
@@ -302,6 +332,7 @@ pub fn init(cmdline: &str) -> bool {
     if word("i2c", cmdline) == Some("0") { return false; }
     dw_i2c::DEBUG.store(word("i2c.debug", cmdline) == Some("1"), Ordering::Relaxed);
     let mode = word("i2c_hid", cmdline).unwrap_or("probe");
+    INREG.store(word("i2c_hid.inreg", cmdline) == Some("1"), Ordering::Relaxed);
     let tp = word("touchpad", cmdline).unwrap_or("ps2");
     if tp == "auto" { log("touchpad=auto: not enabled yet, using ps2"); }
     let tp_i2c = tp == "i2c";
@@ -374,10 +405,17 @@ fn pad_poll(l: &mut Listen, now_ns: u64) {
         match read_input(l.bus, l.addr, l.input_reg, &mut buf[..n]) {
             Ok(len) => {
                 pad.err_run = 0;
-                if len <= 2 || len > n { l.empty += 1; break; }
+                pad.first_err = 0;
+                if len > n {
+                    l.errs += 1;
+                    if !pad.oversize_logged { pad.oversize_logged = true; log(&format!("touchpad: report length {} exceeds wMaxInputLength {}", len, n)); }
+                    break;
+                }
+                if len <= 2 { l.empty += 1; break; }
                 l.reports += 1;
                 let rep = &buf[2..len];
                 if let Some((_, f)) = hid_ptp::parse_report(&pad.ptp, pad.uses_ids, rep) {
+                    pad.unknown = 0;
                     if !pad.mode_confirmed { pad.mode_confirmed = true; log("touchpad: PTP reports confirmed"); }
                     if let Some(f) = pad.asm.push(f, pad.ptp.fingers.len()) {
                         let mut ev = Vec::new();
@@ -395,14 +433,38 @@ fn pad_poll(l: &mut Listen, now_ns: u64) {
                     }
                     if let Some((dx, dy, wh, b)) = hid_ptp::parse_mouse(m, pad.uses_ids, rep) {
                         crate::rel_pointer::report(crate::rel_pointer::SRC_STICK, dx, dy, wh * 120, 0, b);
+                    } else {
+                        pad.unknown += 1;
                     }
+                } else {
+                    pad.unknown += 1;
                 }
+                if pad.unknown >= UNKNOWN_FALLBACK { why = Some(format!("PTP never confirmed, {} unparsable reports", pad.unknown)); break; }
             }
             Err(_) => {
                 l.errs += 1;
                 pad.err_run += 1;
-                if pad.err_run >= 20 { why = Some(String::from("20 consecutive transfer errors")); }
+                if pad.first_err == 0 { pad.first_err = mono_ns().max(1); }
+                if mono_ns().saturating_sub(pad.first_err) > ERR_FALLBACK_NS {
+                    if !pad.power_retried {
+                        pad.power_retried = true;
+                        let r = power(l.bus, l.addr, pad.cmd_reg, true);
+                        log(&format!("touchpad: read errors for 2 s, SET_POWER ON retry -> {:?}", r));
+                        pad.first_err = mono_ns().max(1);
+                    } else {
+                        why = Some(format!("read errors for over 2 s ({} in a row)", pad.err_run));
+                    }
+                }
                 break;
+            }
+        }
+    }
+    if why.is_none() {
+        if let Some(pad) = l.pad.as_mut() {
+            if pad.dbg && now_ns.saturating_sub(pad.last_dbg) > DBG_PERIOD_NS {
+                pad.last_dbg = now_ns;
+                log(&format!("touchpad: i2c reports {} frames {} empty {} errs {} unknown {} ps2 pad packets dropped {}",
+                    l.reports, pad.frames, l.empty, l.errs, pad.unknown, crate::psmouse::dropped_packets()));
             }
         }
     }
