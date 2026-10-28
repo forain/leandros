@@ -47,7 +47,6 @@ fn modeset(conn_idx: usize, t: &KmsTiming) -> Result<(), DriverError> {
 
 fn disable() {
     MODE_W.store(0, Ordering::Release);
-    ilog!("drm: CRTC 2 disabled");
 }
 
 fn queue(_token: u32, _sx: u32, _sy: u32, ev: u32) -> Result<(), DriverError> {
