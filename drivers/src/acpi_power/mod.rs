@@ -67,6 +67,8 @@ pub fn init(rsdp_phys: u64, hhdm_offset: u64) {
     power::init(rsdp_phys, hhdm_offset)
 }
 
+/// The `idx`-th raw ACPI table as (Linux file name, bytes).
+pub fn raw_table(idx: usize) -> Option<(alloc::string::String, &'static [u8])> { power::raw_table(idx) }
 /// Evaluate arbitrary AML under the interpreter lock (task context only).
 pub fn with_ns<T>(f: impl FnOnce(&mut aml::Ns, &mut dyn aml::Host) -> T) -> Option<T> { power::with_ns(f) }
 

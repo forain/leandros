@@ -988,11 +988,15 @@ def main():
     # /sys/class and /sys/class/block are staged here too: the vfs only
     # synthesizes the *contents* of /sys/class/block (see block::is_sysfs_path),
     # so the directories themselves must exist on disk for `ls /sys/class` to
-    # list `block` at all.
+    # list `block` at all. The same holds for the power_supply/backlight
+    # overlay (servers/vfs/src/sysclass.rs); with no devices registered they
+    # are simply empty, as on Linux.
     if os.environ.get("LEANDROS_BOARD") == "rpi5":
         m4_share_dirs.add("/sys/bus/platform")
     for d in ("/sys", "/sys/bus", "/sys/bus/pci", "/sys/bus/pci/devices",
-              "/sys/class", "/sys/class/block"):
+              "/sys/class", "/sys/class/block",
+              "/sys/class/power_supply", "/sys/class/backlight",
+              "/sys/firmware", "/sys/firmware/acpi", "/sys/firmware/acpi/tables"):
         m4_share_dirs.add(d)
 
     for _minor, _node in ((0, "card0"), (128, "renderD128")):

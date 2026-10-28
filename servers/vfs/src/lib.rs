@@ -4810,6 +4810,7 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
        || block::is_sysfs_path(path)
        // Hook-backed power_supply/backlight classes, only while they have devices.
        || sysclass::is_path(path)
+       || sysclass::is_tables_path(path)
        // A GPU backend's PCI identity for the DRM nodes — only the attribute
        // files it answers, only while it is registered (`drm_sysfs_attr`).
        || is_drm_sysfs_override(path)
@@ -7485,6 +7486,19 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None => return err_reply(-2),
             }
+        } else if sysclass::is_tables_dir(lookup_path) {
+            if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
+            VnodeKind::SysBlock { dev: sysclass::SC_TABLES, level: sysclass::LVL_SC_CLASS, pos: 0 }
+        } else if let Some(t) = sysclass::acpi_table(lookup_path) {
+            // Raw firmware tables are root-only, as on Linux (mode 0400).
+            if flags & (O_WRONLY | O_RDWR) != 0 || sched::euid_of(pid) != 0 { return err_reply(-13); }
+            let mut tmp = TMP_FILES.lock();
+            let Some(idx) = tmp_free_slot(&mut *tmp) else { return err_reply(-23) };
+            tmp.claim(idx, b"", true);
+            let fake = alloc::format!("/tmp/.acpitbl_{}", idx);
+            tmp.set_path(idx, fake.as_bytes());
+            if !tmp_fill_kernel(&mut tmp, idx, t) { tmp.release(idx); return err_reply(-12); }
+            VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 }
         } else if sysclass::is_path(lookup_path) {
             if let Some((dev, level)) = sysclass::dir(lookup_path) {
                 if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
