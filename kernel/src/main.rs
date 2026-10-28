@@ -9,6 +9,8 @@ mod init;
 mod klog;
 mod iostat;
 mod hungtask;
+#[cfg(target_arch = "x86_64")]
+mod lappower;
 mod power;
 mod kexec;
 #[cfg(target_arch = "x86_64")]

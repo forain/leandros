@@ -18,6 +18,7 @@ pub mod nvidia_probe;
 /// Intel Gen9 graphics: probe, GT bring-up, self-tests (lane i915).
 pub mod i915;
 pub mod acpi_power;
+pub mod power_sysfs;
 pub mod snd;
 /// Intel High Definition Audio controller + codec playback (lane hda).
 pub mod hda;
