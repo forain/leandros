@@ -456,12 +456,14 @@ const DM_TEXT_LOGIN_MARKER: &[u8] = b"/etc/leandros/text-login\0";
 const DM_LOG: &[u8] = b"/var/log/greetd.log\0";
 /// The previous generation, kept when `DM_LOG` reaches `DM_LOG_CAP`.
 const DM_LOG_OLD: &[u8] = b"/var/log/greetd.log.1\0";
+const DM_LOG_OLD2: &[u8] = b"/var/log/greetd.log.2\0";
+const DM_LOG_OLD3: &[u8] = b"/var/log/greetd.log.3\0";
 /// Size cap of one log generation. The chain writes through a pipe to a
 /// logger child (`run_dm_logger`), which rotates at this size, so the log
 /// costs at most two generations of disk however hard something spams it.
 /// A cosmic-panel spinning on a dead Wayland connection (virgl, 2026-09-25)
 /// wrote 8.4 M lines, over a gigabyte, before the guest died.
-const DM_LOG_CAP: usize = 8 << 20;
+const DM_LOG_CAP: usize = 4 << 20;
 /// Memory-pressure guard (`mem_guard`): when MemAvailable stays below this
 /// floor for `MEM_GUARD_PERSIST_MS`, init kills the largest process on the
 /// graphical side (see `mem_guard`), as systemd-oomd does. The floor is the
@@ -553,6 +555,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     vconsole_setup();
 
     spawn_netctl_stamper();
+    start_bthid_early();
 
     // 5. Graphical login, when the image carries one and nothing opted out.
     // /run is on the persistent root, so a pid file from an earlier boot
@@ -692,14 +695,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
                         continue;
                     }
                 }
-                write_str("\n");
-                write_str("################################################################\n");
-                write_str("## NO GPU RENDERER: the graphical login (COSMIC) was NOT started.\n");
-                write_str("## COSMIC renders on the host GPU only (zink/Venus or virgl);\n");
-                write_str("## this VM has no GL-capable virtio-gpu, or its GPU stack failed.\n");
-                write_str("## Details: /var/log/greetd.log. Software rendering is opt-in:\n");
-                write_str("##   touch /etc/leandros/allow-software-render\n");
-                write_str("################################################################\n");
+                print_no_gpu_banner();
                 // The failed graphical start repainted the console over the
                 // summary printed before the first login prompt.
                 usb_summary_after_repaint(login_pid);
@@ -902,7 +898,18 @@ unsafe fn bt_services() {
     if !exists(BTD_PATH) || cmdline_has(b"bt=0") { return; }
     write_str("starting btd and bthid (/dev/hci0 is up)\n");
     daemon_start(0);
-    if daemon_wanted(1) { daemon_start(1); }
+    // bthid may already be running (started without /dev/hci0, see
+    // `start_bthid_early`).
+    if daemon_wanted(1) && DAEMONS[1].pid <= 0 { daemon_start(1); }
+}
+
+/// bthid also serves USB sources, so it starts whether or not /dev/hci0 ever
+/// appears (`bthid=0` / `bt=0` disable).
+unsafe fn start_bthid_early() {
+    if daemon_wanted(1) && DAEMONS[1].pid <= 0 {
+        write_str("starting bthid\n");
+        daemon_start(1);
+    }
 }
 
 /// Supervised init-spawned daemons: btd, bthid and `netctl watch --stamp`.
@@ -1433,6 +1440,68 @@ fn exists(path: &[u8]) -> bool {
     }
 }
 
+/// The loud console banner for "no hardware GL renderer".
+unsafe fn print_no_gpu_banner() {
+    write_str("\n");
+    write_str("################################################################\n");
+    write_str("## NO GPU RENDERER: the graphical login (COSMIC) was NOT started.\n");
+    write_str("## COSMIC renders on the host GPU only (zink/Venus or virgl);\n");
+    write_str("## this VM has no GL-capable virtio-gpu, or its GPU stack failed.\n");
+    write_str("## Details: /var/log/greetd.log. Software rendering is opt-in:\n");
+    write_str("##   touch /etc/leandros/allow-software-render\n");
+    write_str("################################################################\n");
+}
+
+/// Run the renderer decision of /bin/gpu-env (sourced, exactly as greeter-real
+/// does) without starting anything. Returns true only for a definite "no
+/// hardware GL renderer" (exit 78); a timeout, a failure to run or any other
+/// status is "unknown" and keeps the old path (start greetd).
+unsafe fn gpu_precheck_refused() -> bool {
+    if cmdline_has(b"dm.precheck=0") || !exists(b"/bin/gpu-env\0") || !exists(b"/bin/sh\0") {
+        return false;
+    }
+    // A booting/ready NVIDIA card is handled by gpu-env's own wait and init's
+    // retry; do not hold up the serial getty for it.
+    if exists(b"/proc/nvrm_state\0") && !nvrm_state_is(b"absent") { return false; }
+    let pid = fork();
+    if pid < 0 { return false; }
+    if pid == 0 {
+        let null = open(b"/dev/null\0".as_ptr(), O_RDONLY, 0);
+        if null >= 0 {
+            dup3(null, 0, 0);
+            if null > 2 { close(null); }
+        }
+        let argv: [*const u8; 4] = [
+            b"/bin/sh\0".as_ptr(),
+            b"-c\0".as_ptr(),
+            b". /bin/gpu-env; [ \"$LEANDROS_RENDERER_PATH\" = refused ] && exit 78; exit 0\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        let env = b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\0";
+        let envp: [*const u8; 2] = [env.as_ptr(), core::ptr::null()];
+        execve(b"/bin/sh\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    const WNOHANG: i32 = 1;
+    let mut waited_ms = 0u32;
+    loop {
+        let mut status: i32 = 0;
+        let r = wait4(pid, &mut status, WNOHANG, core::ptr::null_mut());
+        if r == pid {
+            return status & 0x7f == 0 && (status >> 8) & 0xff == DM_EXIT_NO_GPU;
+        }
+        if r < 0 { return false; }
+        if waited_ms >= 120_000 {
+            syscall2(nr::KILL, pid as usize, 9);
+            wait4(pid, &mut status, 0, core::ptr::null_mut());
+            write_str("gpu precheck timed out; starting the graphical login anyway\n");
+            return false;
+        }
+        usleep(50_000);
+        waited_ms += 50;
+    }
+}
+
 /// The three-way decision: the daemon and its config are staged, and nobody
 /// asked for a text login.
 unsafe fn graphical_login_wanted() -> bool {
@@ -1456,6 +1525,10 @@ unsafe fn graphical_login_wanted() -> bool {
     }
     if !exists(DM_DAEMON) || !exists(DM_CONFIG) {
         write_str("no greetd in this image; text login only\n");
+        return false;
+    }
+    if gpu_precheck_refused() {
+        print_no_gpu_banner();
         return false;
     }
     true
@@ -1559,11 +1632,34 @@ unsafe fn run_dm_logger(rfd: i32) -> ! {
     // Leave the serial console alone: nothing here should print there except
     // a failure to open the log.
     let open_log = || open(DM_LOG.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0o644);
+    // Keep four boots: .2 -> .3, .1 -> .2, current -> .1. Rotation happens
+    // here, once per logger start (a respawned chain within one boot is a new
+    // logger too, so a crash-looping greeter still ages the oldest out).
+    syscall4(nr::RENAMEAT, AT_FDCWD, DM_LOG_OLD2.as_ptr() as usize,
+             AT_FDCWD, DM_LOG_OLD3.as_ptr() as usize);
+    syscall4(nr::RENAMEAT, AT_FDCWD, DM_LOG_OLD.as_ptr() as usize,
+             AT_FDCWD, DM_LOG_OLD2.as_ptr() as usize);
+    syscall4(nr::RENAMEAT, AT_FDCWD, DM_LOG.as_ptr() as usize,
+             AT_FDCWD, DM_LOG_OLD.as_ptr() as usize);
     let mut log = open_log();
     if log < 0 {
         write_str("ERROR: greetd logger cannot open /var/log/greetd.log\n");
     }
     let mut size = 0usize;
+    if log >= 0 {
+        let mut line = [0u8; 48];
+        let head = b"=== boot (uptime ";
+        let mut p = head.len();
+        line[..p].copy_from_slice(head);
+        p += fmt_u32(&mut line[p..], monotonic_secs() as u32);
+        let t = b" s) ===";
+        line[p..p + t.len()].copy_from_slice(t);
+        p += t.len();
+        line[p] = b'\n';
+        p += 1;
+        write(log, line.as_ptr(), p);
+        size += p;
+    }
     let mut rotations = 0u32;
     let buf = &mut *core::ptr::addr_of_mut!(BUF);
     loop {
@@ -1575,9 +1671,9 @@ unsafe fn run_dm_logger(rfd: i32) -> ! {
         }
         let n = n as usize;
         if log >= 0 && size + n > DM_LOG_CAP {
+            // Past the cap within one logger life: start the file over
+            // (O_TRUNC) instead of renaming, so the kept boots .1-.3 survive.
             close(log);
-            syscall4(nr::RENAMEAT, AT_FDCWD, DM_LOG.as_ptr() as usize,
-                     AT_FDCWD, DM_LOG_OLD.as_ptr() as usize);
             log = open_log();
             size = 0;
             rotations = rotations.saturating_add(1);
@@ -1587,7 +1683,7 @@ unsafe fn run_dm_logger(rfd: i32) -> ! {
                 let mut p = head.len();
                 line[..p].copy_from_slice(head);
                 p += fmt_u32(&mut line[p..], rotations);
-                let tail = b"; previous in greetd.log.1)\n";
+                let tail = b"; earlier output of this boot dropped)\n";
                 line[p..p + tail.len()].copy_from_slice(tail);
                 p += tail.len();
                 write(log, line.as_ptr(), p);

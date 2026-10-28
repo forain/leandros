@@ -278,6 +278,12 @@ pub fn fan_state(temp_mc: i32, cur: usize) -> usize {
     while s < cur && temp_mc > FAN_TRIPS_MC[s] - FAN_HYST_MC { s += 1; }
     s
 }
+/// Above this the fan is forced to the top state whatever the hysteresis says.
+pub const FAN_CRIT_MC: i32 = 85_000;
+/// Curve step used by the board loop: `fan_state` plus the critical override.
+pub fn fan_next(temp_mc: i32, cur: usize) -> usize {
+    if temp_mc >= FAN_CRIT_MC { FAN_LEVELS.len() - 1 } else { fan_state(temp_mc, cur) }
+}
 
 /// `ethernet@100000`: `phy-reset-gpios = <&rp1_gpio 32 GPIO_ACTIVE_LOW>`, 5 ms.
 pub const ETH_PHY_RESET_GPIO: u32 = 32;

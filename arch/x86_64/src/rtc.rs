@@ -170,6 +170,12 @@ pub fn set_alarm(target: u64) -> Result<(u8, u8, u8, u8), i32> {
     }
 }
 
+/// FADT DAY_ALRM = 0x0D: the date-alarm register must be 0 ("don't care") or the
+/// alarm only fires on that day of the month. Bits 5:0 only; bit 7 (VRT) kept.
+pub fn clear_day_alarm() {
+    unsafe { let v = cmos_read(0x0D); cmos_write(0x0D, v & 0x80); }
+}
+
 /// Disarm: clear AIE and the pending flag.
 pub fn clear_alarm() {
     unsafe {

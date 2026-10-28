@@ -1,0 +1,63 @@
+diff --git a/greetd/src/server.rs b/greetd/src/server.rs
+--- a/greetd/src/server.rs
++++ b/greetd/src/server.rs
+@@ -74,6 +74,18 @@
+             Err(e) => return Err(e.into()),
+         };
+ 
++        eprintln!(
++            "greetd: ipc {}",
++            match &req {
++                Request::CreateSession { .. } => "create_session".to_string(),
++                Request::PostAuthMessageResponse { .. } => "post_auth_response".to_string(),
++                Request::StartSession { cmd, .. } => format!(
++                    "start_session cmd={}",
++                    cmd.first().map(|s| s.as_str()).unwrap_or("<empty>")
++                ),
++                Request::CancelSession => "cancel_session".to_string(),
++            }
++        );
+         let resp = match req {
+             Request::CreateSession { username } => match ctx.create_session(username).await {
+                 Ok(()) => client_get_question(ctx).await,
+diff --git a/greetd/src/context.rs b/greetd/src/context.rs
+--- a/greetd/src/context.rs
++++ b/greetd/src/context.rs
+@@ -364,6 +364,10 @@
+                             // Our greeter finally bit the dust so we can
+                             // start our scheduled session.
+                             drop(inner);
++                            eprintln!(
++                                "greetd: greeter exited after start_session (ran {} ms); starting session",
++                                sesion_length.as_millis()
++                            );
+                             let s = match scheduled.session.start().await {
+                                 Ok(s) => s,
+                                 Err(e) => return Err(format!("session start failed: {e}").into()),
+diff --git a/greetd/src/session/worker.rs b/greetd/src/session/worker.rs
+--- a/greetd/src/session/worker.rs
++++ b/greetd/src/session/worker.rs
+@@ -301,6 +301,7 @@
+     prctl(PrctlOption::SET_PDEATHSIG(libc::SIGTERM))?;
+ 
+     // Wait for process to terminate, handling EINTR as necessary.
++    let t_start = std::time::Instant::now();
+     loop {
+         match waitpid(child, None) {
+             Err(nix::errno::Errno::EINTR) => continue,
+@@ -308,7 +309,14 @@
+                 eprintln!("session: waitpid on inner child failed: {e}");
+                 break;
+             }
+-            Ok(_) => break,
++            Ok(st) => {
++                eprintln!(
++                    "greetd: session exited status={:?} after {} ms",
++                    st,
++                    t_start.elapsed().as_millis()
++                );
++                break;
++            }
+         }
+     }
+ 

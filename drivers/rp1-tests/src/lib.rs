@@ -93,6 +93,20 @@ mod tests {
     }
 
     #[test]
+    fn fan_next_edges_and_critical_override() {
+        assert_eq!(fan_next(49_999, 0), 0);
+        assert_eq!(fan_next(50_000, 0), 1);
+        assert_eq!(fan_next(60_000, 1), 2); // rise at 60.0
+        assert_eq!(fan_next(55_100, 2), 2); // hold at 55.1
+        assert_eq!(fan_next(54_900, 2), 1); // drop at 54.9
+        assert_eq!(fan_next(75_000, 3), 4);
+        assert_eq!(fan_next(84_999, 0), 4);
+        assert_eq!(fan_next(85_000, 0), 4);
+        assert_eq!(fan_next(85_000, 2), 4);
+        assert_eq!(fan_next(-5_000, 4), 0);
+    }
+
+    #[test]
     fn fan_curve_with_hysteresis() {
         assert_eq!(fan_state(40_000, 0), 0);
         assert_eq!(fan_state(50_000, 0), 1);

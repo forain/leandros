@@ -140,4 +140,5 @@ pub fn cmos_locked<T>(f: impl FnOnce() -> T) -> T {
     r
 }
 /// FACS global-lock acquire timeouts since boot (should stay 0).
+pub fn facs_va() -> Option<usize> { power::facs_va() }
 pub fn gl_fails() -> u32 { power::gl_fails() }

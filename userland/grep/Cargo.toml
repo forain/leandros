@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "grep"
+version = "0.1.0"
+edition = "2021"
+description = "POSIX grep front end that runs /bin/rg (the image ships ripgrep, not grep)"
+
+# Standalone musl std crate with its own build.sh, like userland/spawnwedge.
+[[bin]]
+name = "grep"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = 2
