@@ -236,7 +236,7 @@ pub fn legacy_rate(r500k: u8) -> Option<u32> { legacy_rate_ant(r500k, ANT_A) }
 
 /// The legacy rate (500 kb/s units) a v1 rate_n_flags carries, any antenna.
 pub fn rate_r500k(rate_n_flags: u32) -> Option<u8> {
-    if rate_n_flags & (1 << 8) != 0 { return None; } // HT
+    if rate_n_flags & ((1 << 8) | RATE_MCS_VHT) != 0 { return None; } // HT / VHT
     let cck = rate_n_flags & RATE_MCS_CCK != 0;
     let plcp = rate_n_flags & 0xff;
     LEGACY_R500K.iter().copied().find(|&r| legacy_plcp(r) == Some((plcp, cck)))
@@ -262,6 +262,16 @@ pub const RATE_MCS_LDPC_V1: u32 = 1 << 27;
 
 /// RATE_MCS_CHAN_WIDTH_40 (v1 rate_n_flags).
 pub const RATE_MCS_CHAN_WIDTH_40: u32 = 1 << 11;
+pub const RATE_MCS_CHAN_WIDTH_80: u32 = 2 << 11;
+pub const RATE_MCS_VHT: u32 = 1 << 26;
+
+/// The VHT MCS (0-9), stream count (1-8) and width in MHz of a v1
+/// rate_n_flags (RATE_MCS_VHT_MSK, RATE_VHT_MCS_RATE_CODE_MSK / NSS).
+pub fn rate_vht(rate_n_flags: u32) -> Option<(u8, u8, u16)> {
+    if rate_n_flags & RATE_MCS_VHT == 0 { return None; }
+    let w = match (rate_n_flags & RATE_MCS_CHAN_WIDTH_MSK) >> 11 { 0 => 20, 1 => 40, 2 => 80, _ => 160 };
+    Some(((rate_n_flags & 0xf) as u8, ((rate_n_flags >> 4) & 3) as u8 + 1, w))
+}
 
 /// An HT rate at 20 or 40 MHz.
 pub fn ht_rate_w(mcs: u8, sgi: bool, ant: u8, ht40: bool) -> u32 {
