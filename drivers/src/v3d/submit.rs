@@ -495,6 +495,34 @@ mod hw {
     }
 
     /// After the MMU came up (phase B): bring the queue up, then the boot self-test.
+    /// kexec `dma_shutdown` hook: stop both control-list executors, wait
+    /// (bounded) for the CLE and CSD to go idle, then switch the V3D MMU
+    /// off so the next kernel does not inherit a page-table base inside
+    /// memory it calls free. When a queue does not go idle the MMU stays on
+    /// (a stray job then faults instead of writing physical memory) and
+    /// the hook reports failure. TFU has no idle poll here: it is one-shot
+    /// and already stopped because new jobs are refused (`ACTIVE`).
+    fn kexec_shutdown() -> bool {
+        const CTRUN: u32 = 1 << 5;
+        const CTRSTP: u32 = 1 << 15;
+        const CSD_ACTIVE: u32 = 0xff << 8;
+        let p = REGS.load(Ordering::Acquire);
+        if p.is_null() { return true; }
+        ACTIVE.store(false, Ordering::Release);
+        let r = unsafe { &*p };
+        r.core_w(super::super::regs::CLE_CT0CS, CTRSTP);
+        r.core_w(super::super::regs::CLE_CT1CS, CTRSTP);
+        let mut idle = false;
+        for _ in 0..200_000 {
+            let ct = r.core_r(super::super::regs::CLE_CT0CS) | r.core_r(super::super::regs::CLE_CT1CS);
+            let csd = r.core_r(super::super::regs::CSD_STATUS);
+            if ct & CTRUN == 0 && csd & CSD_ACTIVE == 0 { idle = true; break; }
+            core::hint::spin_loop();
+        }
+        if idle { r.hub_w(mmu::MMU_CTL, 0); }
+        idle
+    }
+
     pub fn after_mmu(r: &'static MmioRegs, ver: u32, cmdline: &str) {
         REGS.store(r as *const MmioRegs as *mut MmioRegs, Ordering::Release);
         VER.store(ver, Ordering::Relaxed);
@@ -502,6 +530,7 @@ mod hw {
         irq::set_core_hook(core_hook);
         irq::set_hub_hook(hub_hook);
         ACTIVE.store(true, Ordering::Release);
+        crate::dma_shutdown::register("v3d", crate::dma_shutdown::Stage::Device, kexec_shutdown);
         for _ in 0..POOL_START { if !add_chunk() { break; } }
         crate::pci::serial_debug(&alloc::format!(
             "[v3d] cl queue up pool={}x256K mode={}\n",

@@ -118,10 +118,12 @@ fn map(pa: u64, len: usize) -> usize {
 /// Config-space backend handed to `pci.rs`.
 fn cfg_access(bus: u8, dev: u8, func: u8, off: u16, size: u8, write: Option<u32>) -> u32 {
     let ones = match size { 1 => 0xff, 2 => 0xffff, _ => 0xffff_ffff };
-    let base = REGS.load(Ordering::Acquire);
-    if base == 0 || bus > 1 { return ones; }
+    if REGS.load(Ordering::Acquire) == 0 || bus > 1 { return ones; }
     let Some(o) = hw::cfg_offset(bus, dev, func, off) else { return ones };
     let _g = CFG_LOCK.lock();
+    // Re-read under the lock: `kexec_reset` clears REGS while holding it.
+    let base = REGS.load(Ordering::Acquire);
+    if base == 0 { return ones; }
     if bus != 0 {
         // Never send a config TLP over a dead link.
         if !hw::link_up(rd(hw::MISC_PCIE_STATUS)) { return ones; }
@@ -435,12 +437,17 @@ fn kexec_reset() -> bool {
     let regs = REGS.load(Ordering::Acquire);
     let swinit = SWINIT.load(Ordering::Acquire);
     if regs == 0 || swinit == 0 { return true; }
+    // Runs from the last CPU with every other CPU parked (a parked CPU may
+    // have been stopped inside `cfg_access`), so the lock is forced and the
+    // delay is a counted register read, not the (switched-off) timer.
+    unsafe { CFG_LOCK.force_unlock(); }
     for bus in [1u8, 0] {
-        let cmd = cfg32(bus, 0x04) & 0xffff;
-        cfgw32(bus, 0x04, cmd & !0x4);
+        let cmd = cfg32(bus, 0x04);
+        if cmd == 0xffff_ffff { continue; }
+        cfgw32(bus, 0x04, (cmd & 0xffff) & !0x4);
     }
     perst(true);
-    sched::kthread::udelay(100);
+    for _ in 0..2000 { let _ = rd(hw::MISC_PCIE_CTRL); }
     STATE.store(0, Ordering::Relaxed);
     let _g = CFG_LOCK.lock();
     REGS.store(0, Ordering::Release);
@@ -454,8 +461,8 @@ fn kexec_reset() -> bool {
 pub enum EarlyReset {
     /// The bridge was already held in reset; nothing behind pcie2 can reach DRAM.
     AlreadyInReset,
-    /// PERST# asserted (it was released: `perstb` = 1) and the bridge put in reset.
-    Reset { perstb_was: bool, held: bool },
+    /// The bridge was put in reset.
+    Reset { held: bool },
 }
 
 /// New kernel, before the buddy allocator exists (rpi5 direct boot only):
@@ -472,15 +479,10 @@ pub unsafe fn early_reset_identity() -> EarlyReset {
     let (bank, bit) = hw::sw_init_set(hw::PCIE2_BRIDGE_RESET_ID);
     let sw = hw::SW_INIT_REGS as usize + bank;
     if read((sw + hw::SW_INIT_STATUS) as *const u32) & bit != 0 { return EarlyReset::AlreadyInReset; }
-    // Bridge released, so the RC block answers (a read while it is held in
-    // reset would stall the CPU; see brcmstb_hw stage 5).
-    let ctrl_pa = (hw::PCIE2_REGS as usize + hw::MISC_PCIE_CTRL) as *mut u32;
-    let ctrl = read(ctrl_pa as *const u32);
-    if ctrl & hw::PCIE_CTRL_PERSTB != 0 { write(ctrl_pa, ctrl & !hw::PCIE_CTRL_PERSTB); }
-    let _ = read(ctrl_pa as *const u32);
-    // ~100 us for in-flight TLPs to drain (no timer yet: status reads pace it).
-    for _ in 0..2000 { let _ = read((sw + hw::SW_INIT_STATUS) as *const u32); }
+    // Only the reset-controller block is touched: no RC register is read
+    // before rescal. Holding the bridge in reset already cuts RP1 off from
+    // AXI/DRAM; `init` asserts PERST# once the bridge is released.
     write(sw as *mut u32, bit);
     let held = read((sw + hw::SW_INIT_STATUS) as *const u32) & bit != 0;
-    EarlyReset::Reset { perstb_was: ctrl & hw::PCIE_CTRL_PERSTB != 0, held }
+    EarlyReset::Reset { held }
 }
