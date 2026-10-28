@@ -93,8 +93,8 @@
 //!   iwlwifi.tx40=0          (40 MHz link) transmit HT at 20 MHz
 //!   iwlwifi.vht=0           no VHT / 80 MHz on 5 GHz (default: VHT 80 MHz
 //!                           where the AP, the NVM and the SKU allow it)
-//!   iwlwifi.vhttx=0         (80 MHz VHT link) transmit HT40 rates instead of VHT
-//!                           MCS 0-9 x 1-2 streams (default: VHT TX rates)
+//!   iwlwifi.vhttx=1         (80 MHz VHT link) transmit VHT MCS 0-9 x 1-2 streams
+//!                           (default off: HT40 rates; untested on a real VHT link)
 //!   iwlwifi.mcast=0         no MCAST_FILTER_CMD (the firmware then drops
 //!                           group-addressed frames); default: pass all
 //!   iwlwifi.smps=static|dynamic
@@ -234,8 +234,8 @@ static LDPC: AtomicBool = AtomicBool::new(true);
 static HT40: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.vht (default on): VHT at 80 MHz on 5 GHz where allowed.
 static VHT: AtomicBool = AtomicBool::new(true);
-/// iwlwifi.vhttx (default on): VHT TX rates on a VHT link.
-static VHTTX: AtomicBool = AtomicBool::new(true);
+/// iwlwifi.vhttx (default off): VHT TX rates on a VHT link.
+static VHTTX: AtomicBool = AtomicBool::new(false);
 /// iwlwifi.txagg (default on): TX A-MPDU on TID 0.
 static TXAGG: AtomicBool = AtomicBool::new(true);
 
@@ -1357,7 +1357,7 @@ pub fn init(cmdline: &str) {
     TXAGG.store(cmdline_val(cmdline, "iwlwifi.txagg") != Some("0"), Ordering::Relaxed);
     HT40.store(cmdline_val(cmdline, "iwlwifi.ht40") != Some("0"), Ordering::Relaxed);
     VHT.store(cmdline_val(cmdline, "iwlwifi.vht") != Some("0"), Ordering::Relaxed);
-    VHTTX.store(cmdline_val(cmdline, "iwlwifi.vhttx") != Some("0"), Ordering::Relaxed);
+    VHTTX.store(cmdline_val(cmdline, "iwlwifi.vhttx") == Some("1"), Ordering::Relaxed);
     ilog!("QoS/HT: {}; RX Block Ack {}; TX MCS {}, short GI {}, MIMO {}, STBC {}, LDPC {}; SM PS {}, LDPC {}",
           match HT_MODE.load(Ordering::Relaxed) { HT_LEGACY => "legacy only (iwlwifi.ht=0)", HT_WMM => "WMM only (iwlwifi.ht=wmm)", _ => "WMM + HT 20 MHz" },
           if BA_ON.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.ba=0)" },
