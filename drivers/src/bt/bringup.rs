@@ -460,8 +460,8 @@ pub fn fdt_local_bd_address(dtb: &[u8]) -> Option<BdAddr> {
 /// BdAddr from a MAC written MSB first (HCI stores it LSB first).
 pub fn bdaddr_from_mac(m: &[u8; 6]) -> BdAddr { BdAddr([m[5], m[4], m[3], m[2], m[1], m[0]]) }
 
-/// `xx:xx:xx:xx:xx:xx` (MSB first) -> BdAddr; None when malformed or all zero.
-pub fn parse_bdaddr_text(t: &str) -> Option<BdAddr> {
+/// `xx:xx:xx:xx:xx:xx` -> bytes (MSB first); None when malformed.
+pub fn parse_mac_text(t: &str) -> Option<[u8; 6]> {
     let mut m = [0u8; 6];
     let mut n = 0;
     for part in t.split(':') {
@@ -470,7 +470,12 @@ pub fn parse_bdaddr_text(t: &str) -> Option<BdAddr> {
         n += 1;
     }
     if n != 6 { return None; }
-    let a = bdaddr_from_mac(&m);
+    Some(m)
+}
+
+/// `xx:xx:xx:xx:xx:xx` (MSB first) -> BdAddr; None when malformed or all zero.
+pub fn parse_bdaddr_text(t: &str) -> Option<BdAddr> {
+    let a = bdaddr_from_mac(&parse_mac_text(t)?);
     if a.is_zero() { None } else { Some(a) }
 }
 
