@@ -254,8 +254,11 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         sched::wedge::set_enabled(on || (cfg!(feature = "rpi5") && !off));
         sched::wedge::armed_banner(sched::active_cpu_count());
     }
-    if crate::boot_cmdline().unwrap_or("").split_ascii_whitespace().any(|t| t == "wdog.selftest=1") {
+    let cl = crate::boot_cmdline().unwrap_or("");
+    if cl.split_ascii_whitespace().any(|t| t == "wdog.selftest=1") {
         sched::wdog_selftest_arm();
+    } else if cl.split_ascii_whitespace().any(|t| t == "wdog.selftest=2") {
+        sched::wdog_selftest_arm_forever();
     }
     drivers::nvidia_probe::run(
         boot_info.rsdp_addr, boot_info.hhdm_offset,
