@@ -14,6 +14,14 @@ pub mod bringup;
 #[allow(dead_code)]
 #[path = "../../src/bt/hcidev_core.rs"]
 pub mod hcidev_core;
+#[allow(dead_code)]
+#[path = "../../src/bt/btintel.rs"]
+pub mod btintel;
+#[allow(dead_code)]
+#[path = "../../src/bt/usb_reasm.rs"]
+pub mod usb_reasm;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod usb_tests;
