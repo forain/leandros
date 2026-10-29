@@ -181,6 +181,10 @@ pub extern "C" fn kapi_pci_cfg_write(bdf: u32, off: u16, width: u8, val: u32) {
 pub extern "C" fn kapi_map_device(phys: u64, len: usize, flags: u32) -> usize {
     use mm::paging::{map_kernel_device, PageFlags};
     if len == 0 { return 0; }
+    // UC: a strongly-ordered kernel-VA mapping (ioremap), the mode register BARs need.
+    if flags & kmod_abi::KMAP_UC != 0 {
+        return mm::kva::ioremap(phys, len, mm::kva::CacheMode::Uncached).unwrap_or(0);
+    }
     let mut f = PageFlags::PRESENT;
     if flags & KMAP_WRITABLE != 0 { f |= PageFlags::WRITABLE; }
     if flags & KMAP_MMIO != 0 { f |= PageFlags::MMIO; }
@@ -239,6 +243,219 @@ pub extern "C" fn kapi_hwrng_register(owner: KmodId, name: *const u8, len: usize
     0
 }
 
+
+// ── e1000e-class exports (L6a): PCI enable/caps, IRQs, wait queue, netdev, pm hooks ──────
+
+use alloc::boxed::Box;
+use alloc::string::String;
+use core::sync::atomic::AtomicU64;
+use kmod_abi::{KIrqHandler, KNetifOps, KPmFn, KNET_WIFI};
+
+fn func_of(bdf: u32) -> drivers::pci::PciFunction {
+    let (b, d, f) = unbdf(bdf);
+    drivers::pci::PciFunction::new(b, d, f)
+}
+
+/// Memory decode on, bus mastering on when asked. 0 ok, -19 no such function.
+#[no_mangle]
+pub extern "C" fn kapi_pci_enable(bdf: u32, bus_master: bool) -> i32 {
+    let f = func_of(bdf);
+    if f.read16(0) == 0xffff { return -19; }
+    if bus_master { f.enable_mem_and_bus_master(); } else { f.enable_memory(); }
+    0
+}
+
+/// Config-space offset of capability `cap_id` (PM = 1, PCIe = 0x10, ...), 0 when absent.
+#[no_mangle]
+pub extern "C" fn kapi_pci_find_cap(bdf: u32, cap_id: u8) -> u16 {
+    func_of(bdf).find_capability(cap_id).unwrap_or(0)
+}
+
+fn irq_errno(e: drivers::irq::IrqError) -> i64 {
+    use drivers::irq::IrqError::*;
+    match e { NoSpace | NoMemory => -12, NotFound => -19, Unsupported => -95, Busy => -16 }
+}
+
+/// The handler must return 0 (not ours) or 1 (handled): that is `IrqReturn`'s repr.
+fn irq_handler(h: KIrqHandler) -> drivers::irq::IrqHandler {
+    unsafe { core::mem::transmute::<KIrqHandler, drivers::irq::IrqHandler>(h) }
+}
+
+/// Single-vector MSI (x86_64). Returns the vector, or -errno (-95 where MSI is unsupported).
+#[no_mangle]
+pub extern "C" fn kapi_irq_request_msi(owner: KmodId, bdf: u32, handler: KIrqHandler, ctx: usize) -> i64 {
+    match drivers::irq::request_msi(func_of(bdf), irq_handler(handler), ctx) {
+        Ok(h) => {
+            let v = h.vector().unwrap_or(0) as u64;
+            core::mem::forget(h); // modules are permanent
+            super::registry::note_registration(owner, RegKind::IRQ, v);
+            v as i64
+        }
+        Err(e) => irq_errno(e),
+    }
+}
+
+/// The function's INTx line (aarch64 `virt`). Returns the line, or -errno. The caller clears
+/// the command register's INTx-disable bit when it wants the line live.
+#[no_mangle]
+pub extern "C" fn kapi_irq_request_line(owner: KmodId, bdf: u32, handler: KIrqHandler, ctx: usize) -> i64 {
+    let Some(line) = func_of(bdf).intx_line() else { return -19 };
+    match drivers::irq::request_irq(drivers::irq::IrqSource::Line(line), irq_handler(handler), ctx) {
+        Ok(h) => {
+            core::mem::forget(h);
+            super::registry::note_registration(owner, RegKind::IRQ, line as u64);
+            line as i64
+        }
+        Err(e) => irq_errno(e),
+    }
+}
+
+/// A wait queue with an event counter: the module's `LinkMon`.
+struct KWait {
+    wq: sched::ksync::KWaitQueue,
+    events: AtomicU64,
+    seen: AtomicU64,
+}
+
+#[no_mangle]
+pub extern "C" fn kapi_wait_new() -> usize {
+    Box::into_raw(Box::new(KWait {
+        wq: sched::ksync::KWaitQueue::new(), events: AtomicU64::new(0), seen: AtomicU64::new(0),
+    })) as usize
+}
+
+/// Any context (IRQ included). Handles are permanent.
+#[no_mangle]
+pub extern "C" fn kapi_wait_notify(h: usize) {
+    if h == 0 { return; }
+    let w = unsafe { &*(h as *const KWait) };
+    w.events.fetch_add(1, Ordering::AcqRel);
+    w.wq.wake_all();
+}
+
+/// Sleep up to `ns` or until an event newer than the last wait's arrives (one waiter per handle).
+/// True when woken by an event.
+#[no_mangle]
+pub extern "C" fn kapi_wait_timeout(h: usize, ns: u64) -> bool {
+    if h == 0 { return false; }
+    let w = unsafe { &*(h as *const KWait) };
+    let s = w.seen.load(Ordering::Acquire);
+    let hit = w.wq.wait_event_timeout(|| w.events.load(Ordering::Acquire) != s, ns);
+    w.seen.store(w.events.load(Ordering::Acquire), Ordering::Release);
+    hit
+}
+
+struct ModNetif { ops: KNetifOps, ctx: usize, name: &'static str }
+
+/// Write-once slots (leaked boxes); a netif's `dev` is its slot index.
+static MOD_NETIF: [AtomicUsize; drivers::netdev::MAX_NETIF] = [const { AtomicUsize::new(0) }; drivers::netdev::MAX_NETIF];
+static MOD_NETIF_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+fn mn(d: u8) -> &'static ModNetif { unsafe { &*(MOD_NETIF[d as usize].load(Ordering::Acquire) as *const ModNetif) } }
+
+static MOD_OPS: drivers::netdev::NetifOps = drivers::netdev::NetifOps {
+    driver: |d| mn(d).name,
+    send: |d, b| { let m = mn(d); (m.ops.send)(m.ctx, b.as_ptr(), b.len()) },
+    tx_ready: |d| { let m = mn(d); (m.ops.tx_ready)(m.ctx) },
+    recv: |d, b| {
+        let m = mn(d);
+        let n = (m.ops.recv)(m.ctx, b.as_mut_ptr(), b.len());
+        if n < 0 { None } else { Some((n as usize).min(b.len())) }
+    },
+    rx_rearm: |d| { let m = mn(d); (m.ops.rx_rearm)(m.ctx) },
+    rx_irq_driven: |d| { let m = mn(d); (m.ops.rx_irq_driven)(m.ctx) },
+    mac: |d| {
+        let m = mn(d);
+        let mut a = [0u8; 6];
+        if (m.ops.mac)(m.ctx, a.as_mut_ptr()) { Some(a) } else { None }
+    },
+    link: |d| {
+        let m = mn(d);
+        let (mut up, mut mbps, mut full) = (false, 0u32, false);
+        (m.ops.link)(m.ctx, &mut up, &mut mbps, &mut full);
+        (up, mbps, full)
+    },
+    link_gen: |d| { let m = mn(d); (m.ops.link_gen)(m.ctx) },
+    info: |d, out| {
+        let m = mn(d);
+        let mut buf = alloc::vec![0u8; 2048];
+        let n = (m.ops.info)(m.ctx, buf.as_mut_ptr(), buf.len()).min(buf.len());
+        out.push_str(&String::from_utf8_lossy(&buf[..n]));
+    },
+};
+
+/// Register a netif from a module, at any time. Returns the netif id, or -errno
+/// (-22 bad arguments, -12 no free slot). The net daemon is kicked and builds the stack on its next pass.
+#[no_mangle]
+pub extern "C" fn kapi_netdev_register(owner: KmodId, kind: u32, prefix: *const u8, prefix_len: usize,
+                                       ops: *const KNetifOps, ctx: usize) -> i32 {
+    let pfx = match core::str::from_utf8(unsafe { bytes(prefix, prefix_len.min(8)) }) {
+        Ok(s) if !s.is_empty() && s.len() <= 6 && s.bytes().all(|b| b.is_ascii_lowercase()) => s,
+        _ => return -22,
+    };
+    if ops.is_null() { return -22; }
+    let ops = unsafe { *ops };
+    let mut nb = [0u8; 32];
+    let n = (ops.driver_name)(ctx, nb.as_mut_ptr(), nb.len()).min(nb.len());
+    let name: &'static str = Box::leak(String::from_utf8_lossy(&nb[..n]).into_owned().into_boxed_str());
+    let slot = {
+        let _g = MOD_NETIF_LOCK.lock();
+        let Some(i) = MOD_NETIF.iter().position(|s| s.load(Ordering::Acquire) == 0) else { return -12 };
+        MOD_NETIF[i].store(Box::into_raw(Box::new(ModNetif { ops, ctx, name })) as usize, Ordering::Release);
+        i
+    };
+    let k = if kind == KNET_WIFI { drivers::netdev::Kind::Wifi } else { drivers::netdev::Kind::Wired };
+    match drivers::netdev::register_late(k, pfx, &MOD_OPS, slot as u8) {
+        Some(id) => {
+            super::registry::note_registration(owner, RegKind::NETDEV, id as u64);
+            id as i32
+        }
+        None => -12,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kapi_netdev_kick() { drivers::netdev::kick(); }
+#[no_mangle]
+pub extern "C" fn kapi_netdev_kick_from_irq() { drivers::netdev::kick_from_irq(); }
+
+#[derive(Clone, Copy)]
+struct PmHooks { suspend: Option<KPmFn>, resume: Option<KPmFn>, shutdown: Option<KPmFn>, ctx: usize }
+static PM_HOOKS: spin::Mutex<Option<PmHooks>> = spin::Mutex::new(None);
+
+/// Register the NIC's power-management hooks (one set; the builtin e1000e is then a stub).
+/// 0 ok, -16 already registered.
+#[no_mangle]
+pub extern "C" fn kapi_pm_register(_owner: KmodId, suspend: Option<KPmFn>, resume: Option<KPmFn>,
+                                   shutdown: Option<KPmFn>, ctx: usize) -> i32 {
+    let mut g = PM_HOOKS.lock();
+    if g.is_some() { return -16; }
+    *g = Some(PmHooks { suspend, resume, shutdown, ctx });
+    0
+}
+
+fn run_pm(f: Option<KPmFn>, ctx: usize) -> Option<(i32, String)> {
+    let f = f?;
+    let mut buf = [0u8; 256];
+    let r = f(ctx, buf.as_mut_ptr(), buf.len());
+    let n = (r.unsigned_abs() as usize).min(buf.len());
+    Some((r, String::from(String::from_utf8_lossy(&buf[..n]))))
+}
+
+fn pm_result(h: Option<PmHooks>, pick: fn(&PmHooks) -> Option<KPmFn>) -> Option<Result<String, String>> {
+    let h = h?;
+    let (r, m) = run_pm(pick(&h), h.ctx)?;
+    Some(if r >= 0 { Ok(m) } else { Err(m) })
+}
+fn pm_hooks() -> Option<PmHooks> { *PM_HOOKS.lock() }
+
+/// `Some` only when a module registered hooks; pm.rs falls back to the builtin otherwise.
+pub fn pm_suspend() -> Option<Result<String, String>> { pm_result(pm_hooks(), |h| h.suspend) }
+pub fn pm_resume() -> Option<Result<String, String>> { pm_result(pm_hooks(), |h| h.resume) }
+pub fn pm_shutdown() -> Option<String> {
+    match pm_result(pm_hooks(), |h| h.shutdown)? { Ok(m) if !m.is_empty() => Some(m), Err(m) => Some(m), _ => None }
+}
+
 // Compile-time signature check against kmod_abi::sys.
 const _: sys::AbiVersionFn = kapi_abi_version;
 const _: sys::LogFn = kapi_log;
@@ -262,6 +479,17 @@ const _: sys::PhysToVirtFn = kapi_phys_to_virt;
 const _: sys::PageAllocFn = kapi_page_alloc;
 const _: sys::PageFreeFn = kapi_page_free;
 const _: sys::HwrngRegisterFn = kapi_hwrng_register;
+const _: sys::PciEnableFn = kapi_pci_enable;
+const _: sys::PciFindCapFn = kapi_pci_find_cap;
+const _: sys::IrqRequestMsiFn = kapi_irq_request_msi;
+const _: sys::IrqRequestLineFn = kapi_irq_request_line;
+const _: sys::WaitNewFn = kapi_wait_new;
+const _: sys::WaitTimeoutFn = kapi_wait_timeout;
+const _: sys::WaitNotifyFn = kapi_wait_notify;
+const _: sys::NetdevRegisterFn = kapi_netdev_register;
+const _: sys::NetdevKickFn = kapi_netdev_kick;
+const _: sys::NetdevKickFn = kapi_netdev_kick_from_irq;
+const _: sys::PmRegisterFn = kapi_pm_register;
 const _: () = {
     assert!(mm::kmodwin::BASE as u64 == kmod_abi::layout::BASE);
     assert!(mm::kmodwin::SIZE as u64 == kmod_abi::layout::SIZE);
@@ -269,7 +497,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 22;
+pub const NEXPORTS: usize = 33;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -296,6 +524,17 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_page_alloc", kapi_page_alloc),
     sym!("kapi_page_free", kapi_page_free),
     sym!("kapi_hwrng_register", kapi_hwrng_register),
+    sym!("kapi_pci_enable", kapi_pci_enable),
+    sym!("kapi_pci_find_cap", kapi_pci_find_cap),
+    sym!("kapi_irq_request_msi", kapi_irq_request_msi),
+    sym!("kapi_irq_request_line", kapi_irq_request_line),
+    sym!("kapi_wait_new", kapi_wait_new),
+    sym!("kapi_wait_timeout", kapi_wait_timeout),
+    sym!("kapi_wait_notify", kapi_wait_notify),
+    sym!("kapi_netdev_register", kapi_netdev_register),
+    sym!("kapi_netdev_kick", kapi_netdev_kick),
+    sym!("kapi_netdev_kick_from_irq", kapi_netdev_kick_from_irq),
+    sym!("kapi_pm_register", kapi_pm_register),
 ];
 
 extern "C" {

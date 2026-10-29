@@ -69,8 +69,12 @@ fn ps2_resume(_: u32) -> Result<String, String> {
 
 fn i915_suspend(_: u32) -> Result<String, String> { drivers::i915::pm_suspend() }
 fn i915_resume(_: u32) -> Result<String, String> { drivers::i915::pm_resume() }
-fn e1000e_suspend(_: u32) -> Result<String, String> { drivers::e1000e::pm_suspend() }
-fn e1000e_resume(_: u32) -> Result<String, String> { drivers::e1000e::pm_resume() }
+fn e1000e_suspend(_: u32) -> Result<String, String> {
+    crate::kmod::exports::pm_suspend().unwrap_or_else(drivers::e1000e::pm_suspend)
+}
+fn e1000e_resume(_: u32) -> Result<String, String> {
+    crate::kmod::exports::pm_resume().unwrap_or_else(drivers::e1000e::pm_resume)
+}
 fn blk_suspend(_: u32) -> Result<String, String> { drivers::blkdev::pm_freeze(5_000) }
 fn blk_resume(_: u32) -> Result<String, String> { drivers::blkdev::pm_thaw() }
 fn xhci_suspend(f: u32) -> Result<String, String> {

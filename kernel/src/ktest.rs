@@ -572,7 +572,7 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 22 && exports::NEXPORTS == 22, "ksymtab has 22 exports");
+    t.check(exports::ksymtab().len() == 33 && exports::NEXPORTS == 33, "ksymtab has 33 exports");
     let find = sym!("kapi_pci_find", sys::PciFindFn);
     let rd = sym!("kapi_pci_cfg_read", sys::PciCfgReadFn);
     let wr = sym!("kapi_pci_cfg_write", sys::PciCfgWriteFn);
@@ -638,7 +638,134 @@ fn t_kmodkapi() -> T {
         registry::registrations(owner, &mut |k, _| if k == RegKind::HWRNG { seen = true });
         t.check(seen, "HWRNG registration recorded for the owner");
     }
+    kmodkapi_l6a(&mut t);
     t
+}
+
+static KT_WAKES: AtomicU32 = AtomicU32::new(0);
+static KT_NIF_SENT: AtomicU32 = AtomicU32::new(0);
+static KT_PM: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn kt_irq(_c: usize) -> u32 { 0 }
+extern "C" fn kt_nsend(_c: usize, _b: *const u8, len: usize) -> bool { KT_NIF_SENT.fetch_add(len as u32, Ordering::SeqCst); true }
+extern "C" fn kt_ntrue(_c: usize) -> bool { true }
+extern "C" fn kt_nfalse(_c: usize) -> bool { false }
+extern "C" fn kt_nrecv(_c: usize, _b: *mut u8, _cap: usize) -> i32 { -1 }
+extern "C" fn kt_nmac(_c: usize, o: *mut u8) -> bool { unsafe { core::ptr::copy_nonoverlapping([2u8, 0x4b, 0x54, 0, 0, 1].as_ptr(), o, 6); } true }
+extern "C" fn kt_nlink(_c: usize, up: *mut bool, mbps: *mut u32, full: *mut bool) { unsafe { *up = true; *mbps = 1000; *full = true; } }
+extern "C" fn kt_ngen(_c: usize) -> u32 { 7 }
+fn kt_put(s: &str, b: *mut u8, cap: usize) -> usize { let n = s.len().min(cap); unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), b, n); } n }
+extern "C" fn kt_ninfo(_c: usize, b: *mut u8, cap: usize) -> usize { kt_put("driver: ktest\n", b, cap) }
+extern "C" fn kt_nname(_c: usize, b: *mut u8, cap: usize) -> usize { kt_put("kt-nic", b, cap) }
+extern "C" fn kt_pm_ok(c: usize, b: *mut u8, cap: usize) -> i32 { KT_PM.fetch_add(c as u32, Ordering::SeqCst); kt_put("pm ok", b, cap) as i32 }
+extern "C" fn kt_pm_err(_c: usize, b: *mut u8, cap: usize) -> i32 { -(kt_put("pm bad", b, cap) as i32) }
+
+/// L6a: PCI enable/caps, IRQ errors, wait queue, late netdev registration, pm hooks.
+fn kmodkapi_l6a(t: &mut T) {
+    use crate::kmod::exports;
+    use kmod_abi::{sys, KNetifOps, KPciDev, KmodId};
+    macro_rules! sym { ($n:literal, $ty:ty) => {{
+        let a = exports::lookup($n);
+        t.check(a.is_some(), concat!($n, " in KSYMTAB"));
+        match a { Some(a) => unsafe { core::mem::transmute::<usize, $ty>(a) }, None => return }
+    }}; }
+    let find = sym!("kapi_pci_find", sys::PciFindFn);
+    let enable = sym!("kapi_pci_enable", sys::PciEnableFn);
+    let cap = sym!("kapi_pci_find_cap", sys::PciFindCapFn);
+    let msi = sym!("kapi_irq_request_msi", sys::IrqRequestMsiFn);
+    let line = sym!("kapi_irq_request_line", sys::IrqRequestLineFn);
+    let wnew = sym!("kapi_wait_new", sys::WaitNewFn);
+    let wto = sym!("kapi_wait_timeout", sys::WaitTimeoutFn);
+    let wnot = sym!("kapi_wait_notify", sys::WaitNotifyFn);
+    let nreg = sym!("kapi_netdev_register", sys::NetdevRegisterFn);
+    let kick = sym!("kapi_netdev_kick", sys::NetdevKickFn);
+    let kirq = sym!("kapi_netdev_kick_from_irq", sys::NetdevKickFn);
+    let pmr = sym!("kapi_pm_register", sys::PmRegisterFn);
+    let owner = KmodId(60002);
+    unsafe {
+        // PCI: an Intel/virtio function has a PM or PCIe capability on most machines; at least
+        // the capability list walk must agree with the config-space status bit.
+        let mut d = KPciDev::default();
+        let mut rc = find(0x8086, 0xffff, 0, &mut d);
+        if rc != 0 { rc = find(0x1af4, 0xffff, 0, &mut d); }
+        if rc == 0 {
+            t.check(enable(d.bdf, true) == 0, "pci_enable ok");
+            t.check(kapi_cfg(d.bdf, 4) & 6 == 6, "pci_enable set memory + bus master");
+            let has_list = kapi_cfg(d.bdf, 6) & 0x10 != 0;
+            let c = cap(d.bdf, 0x05);
+            let p = cap(d.bdf, 0x01);
+            t.check(has_list || (c == 0 && p == 0), "find_cap consistent with the capability-list bit");
+            t.check(cap(d.bdf, 0x7e) == 0, "find_cap absent id -> 0");
+            let l = line(owner, d.bdf, kt_irq, 0);
+            t.check(l >= -95 && l != -22, &format!("irq_request_line returns a line or an errno ({})", l));
+        } else { t.skip("no PCI device for pci_enable"); }
+        t.check(enable(0x00ff_ff00 | 7, false) == -19, "pci_enable absent function -> -19");
+        t.check(cap(0x00ff_ff00 | 7, 0x01) == 0, "find_cap absent function -> 0");
+        t.check(msi(owner, 0x00ff_ff00 | 7, kt_irq, 0) < 0, "irq_request_msi absent function fails");
+
+        // Wait queue: timeout expires, a notify before the wait is seen by it, a notify during wakes it.
+        let w = wnew();
+        t.check(w != 0, "wait_new handle");
+        let t0 = sched::monotonic_ns();
+        t.check(!wto(w, 20_000_000), "wait_timeout expires without an event");
+        t.check(sched::monotonic_ns() - t0 >= 15_000_000, "wait_timeout slept");
+        wnot(w);
+        t.check(wto(w, 1_000_000), "event before the wait is delivered");
+        t.check(!wto(w, 1_000_000), "event is consumed once");
+        KT_WAKES.store(0, Ordering::SeqCst);
+        let h = w;
+        let th = kthread::spawn("kt-wait", move || { sched::kthread::msleep(30); wnot(h); KT_WAKES.store(1, Ordering::SeqCst); });
+        t.check(th.is_some(), "spawn notifier");
+        t.check(wto(w, 2_000_000_000), "notify from another thread wakes the waiter");
+        wnot(0);
+        t.check(!wto(0, 1), "wait on a null handle -> false");
+
+        // Netdev: register after boot, daemon-visible through the registry.
+        let ops: &'static KNetifOps = alloc::boxed::Box::leak(alloc::boxed::Box::new(KNetifOps {
+            send: kt_nsend, tx_ready: kt_ntrue, recv: kt_nrecv, rx_rearm: kt_nfalse, rx_irq_driven: kt_nfalse,
+            mac: kt_nmac, link: kt_nlink, link_gen: kt_ngen, info: kt_ninfo, driver_name: kt_nname,
+        }));
+        t.check(nreg(owner, 0, b"Bad".as_ptr(), 3, ops, 0) == -22, "netdev_register bad prefix -> -22");
+        t.check(nreg(owner, 0, b"ktn".as_ptr(), 3, core::ptr::null(), 0) == -22, "netdev_register null ops -> -22");
+        let before = drivers::netdev::count();
+        let id = nreg(owner, 0, b"ktn".as_ptr(), 3, ops, 5);
+        if id < 0 { say!("kmodkapi: netdev_register -> {} (table full?)", id); }
+        else {
+            t.check(drivers::netdev::count() == before + 1, "netdev count +1");
+            let n = drivers::netdev::get(id as usize);
+            t.check(n.map_or(false, |n| n.name() == "ktn0" && n.driver() == "kt-nic"), "netif ktn0 / driver kt-nic");
+            if let Some(n) = n {
+                let b = KT_NIF_SENT.load(Ordering::SeqCst); // the net daemon may send (DHCP) on it too
+                t.check(n.send(&[0u8; 60]) && KT_NIF_SENT.load(Ordering::SeqCst).wrapping_sub(b) >= 60, "send goes through the module op");
+                t.check(n.mac() == Some([2, 0x4b, 0x54, 0, 0, 1]), "mac");
+                t.check(n.link() == (true, 1000, true) && n.link_generation() == 7, "link + link_gen");
+                t.check(n.recv(&mut [0u8; 64]).is_none() && n.tx_ready() && !n.rx_irq_driven(), "recv none / tx_ready / rx_irq");
+                let mut s = String::new(); n.info_lines(&mut s);
+                t.check(s.contains("driver: ktest"), "info lines");
+            }
+            let mut seen = false;
+            crate::kmod::registry::registrations(owner, &mut |k, _| if k == kmod_abi::RegKind::NETDEV { seen = true });
+            t.check(seen, "NETDEV registration recorded");
+        }
+        kick(); kirq();
+        t.check(true, "netdev kick / kick_from_irq callable");
+
+        // PM hooks
+        t.check(exports::pm_suspend().is_none() && exports::pm_shutdown().is_none(), "no pm hooks before register");
+        t.check(pmr(owner, Some(kt_pm_ok), Some(kt_pm_err), None, 3) == 0, "pm_register ok");
+        t.check(pmr(owner, None, None, None, 0) == -16, "pm_register twice -> -16");
+        t.check(matches!(exports::pm_suspend(), Some(Ok(ref m)) if m == "pm ok") && KT_PM.load(Ordering::SeqCst) == 3, "pm suspend hook ok");
+        t.check(matches!(exports::pm_resume(), Some(Err(ref m)) if m == "pm bad"), "pm resume hook error");
+        t.check(exports::pm_shutdown().is_none(), "absent shutdown hook -> None");
+    }
+}
+
+fn kapi_cfg(bdf: u32, off: u16) -> u32 {
+    let f = exports_cfg();
+    unsafe { f(bdf, off, 2) }
+}
+fn exports_cfg() -> kmod_abi::sys::PciCfgReadFn {
+    unsafe { core::mem::transmute::<usize, kmod_abi::sys::PciCfgReadFn>(crate::kmod::exports::lookup("kapi_pci_cfg_read").unwrap_or(0)) }
 }
 
 fn t_kmodload() -> T {
