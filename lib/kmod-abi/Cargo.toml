@@ -1,0 +1,17 @@
+# Frozen kernel-module ABI v1: the module header, the context passed to init,
+# the owner tag, the export-table entry and the module-window constants.
+# Shared by the kernel loader, the module runtime and the host tools.
+#
+# No features and no dependencies on purpose: the layout must be identical in
+# the kernel and the module build. Any change bumps KMOD_ABI_VERSION.
+#
+# Host tests (the repo's .cargo config defaults to the kernel target):
+#   cargo test -p kmod-abi --target aarch64-apple-darwin
+[package]
+name = "kmod-abi"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[dependencies]
