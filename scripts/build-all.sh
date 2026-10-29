@@ -137,6 +137,10 @@ create_initrd() {
     mkdir -p "$temp_dir/bin"
 
     cp "$userland_dir/init" "$temp_dir/bin/init"
+    # Loadable kernel modules (KMOD_TEST=1: the assembly test module, staged by testblob.sh).
+    if [[ -d "$ROOT_DIR/target/kmod/$arch/initrd" ]]; then
+        cp -R "$ROOT_DIR/target/kmod/$arch/initrd/." "$temp_dir/"
+    fi
 
     (
         cd "$temp_dir" || exit 1
@@ -1157,8 +1161,14 @@ for arch in "${ARCHS[@]}"; do
     build_ripgrep "$arch"
     build_grep "$arch"
     stage_dbus_session "$arch"
-    create_initrd "$arch"
     build_kernel "$arch"
+    # The initrd is built after the kernel: module blobs are linked against the
+    # kernel's exported symbols and keyed by its build-id.
+    rm -rf "$ROOT_DIR/target/kmod/$arch"
+    if [[ "${KMOD_TEST:-}" == "1" ]]; then
+        "$ROOT_DIR/scripts/kmod/testblob.sh" "$arch"
+    fi
+    create_initrd "$arch"
     create_disk_image "$arch" "$LIMINE_DIR"
     echo "💾 Creating populated F2FS images for $arch..."
     python3 scripts/mkfs-f2fs-populated.py "f2fs-data0-$arch.img" "$arch"

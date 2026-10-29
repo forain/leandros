@@ -18,7 +18,11 @@ pub extern "C" fn kapi_abi_version() -> u32 { KMOD_ABI_VERSION }
 #[no_mangle]
 pub extern "C" fn kapi_log(level: u32, ptr: *const u8, len: usize) {
     let m = unsafe { bytes(ptr, len.min(512)) };
-    log(&alloc::format!("[kmod] <{}> {}\n", level, alloc::string::String::from_utf8_lossy(m)));
+    let o = super::load::CUR_OWNER.load(Ordering::SeqCst);
+    let nm = if o != 0 { super::registry::name_of(KmodId(o)) } else { [0; 32] };
+    let nm = super::name_str(&nm);
+    let sep = if nm.is_empty() { "" } else { " " };
+    log(&alloc::format!("[kmod{}{}] <{}> {}\n", sep, nm, level, alloc::string::String::from_utf8_lossy(m)));
 }
 
 #[no_mangle]
