@@ -24,6 +24,15 @@ const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
 const RTM_GETROUTE: u16 = 26;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETNEIGH: u16 = 30;
+const RTA_DST: u16 = 1;
+const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
+const RTA_PREFSRC: u16 = 7;
+const RTA_TABLE: u16 = 15;
+const RT_TABLE_MAIN: u8 = 254;
+const RTN_UNICAST: u8 = 1;
 
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_MULTI: u16 = 0x2;
@@ -199,6 +208,48 @@ fn pack(msgs: Vec<Vec<u8>>, out: &mut Vec<Vec<u8>>) {
 /// Answer the netlink request(s) in `req`: the reply datagrams, in order.
 /// `pid` is the socket's nl_pid, echoed as `nlmsg_pid`.
 pub fn handle_request(req: &[u8], links: &[Link], pid: u32) -> Vec<Vec<u8>> {
+    handle_request_r(req, links, pid, &|_| None)
+}
+
+/// Route lookup result: output ifindex and the gateway when off-link.
+pub type RouteHit = (u32, Option<[u8; 4]>);
+
+/// RTM_GETROUTE reply: one RTM_NEWROUTE for `dst` via `hit`.
+fn route_msg(dst: [u8; 4], hit: RouteHit, links: &[Link], seq: u32, pid: u32) -> Vec<u8> {
+    let mut v = Vec::new();
+    let s = begin_msg(&mut v, RTM_NEWROUTE, 0, seq, pid);
+    v.extend_from_slice(&[AF_INET, 32, 0, 0, RT_TABLE_MAIN, if hit.1.is_some() { 4 } else { 2 },
+                          RT_SCOPE_UNIVERSE, RTN_UNICAST]);
+    put32(&mut v, 0); // rtm_flags
+    attr(&mut v, RTA_TABLE, &(RT_TABLE_MAIN as u32).to_ne_bytes());
+    attr(&mut v, RTA_DST, &dst);
+    attr(&mut v, RTA_OIF, &hit.0.to_ne_bytes());
+    if let Some(a) = links.iter().find(|l| l.index == hit.0).and_then(|l| l.addr) {
+        attr(&mut v, RTA_PREFSRC, &a.0);
+    }
+    if let Some(g) = hit.1 { attr(&mut v, RTA_GATEWAY, &g); }
+    end_msg(&mut v, s);
+    v
+}
+
+/// The RTA_DST of an rtmsg request body, for AF_INET.
+fn req_dst(msg: &[u8]) -> Option<[u8; 4]> {
+    if msg.len() < 28 || msg[16] != AF_INET { return None; }
+    let mut o = 28;
+    while o + 4 <= msg.len() {
+        let l = rd16(msg, o) as usize;
+        if l < 4 || o + l > msg.len() { break; }
+        if rd16(msg, o + 2) & 0x3fff == RTA_DST && l >= 8 {
+            return Some([msg[o + 4], msg[o + 5], msg[o + 6], msg[o + 7]]);
+        }
+        o += (l + 3) & !3;
+    }
+    None
+}
+
+/// [`handle_request`] with a route lookup for non-dump RTM_GETROUTE.
+pub fn handle_request_r(req: &[u8], links: &[Link], pid: u32,
+                        route: &dyn Fn([u8; 4]) -> Option<RouteHit>) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = Vec::new();
     let mut off = 0usize;
     while off + 16 <= req.len() {
@@ -208,7 +259,7 @@ pub fn handle_request(req: &[u8], links: &[Link], pid: u32) -> Vec<Vec<u8>> {
         let flags = rd16(req, off + 6);
         let seq = rd32(req, off + 8);
         let msg = &req[off..off + len];
-        let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
+        let dump = flags & NLM_F_DUMP != 0; // Linux: ROOT or MATCH alone is a dump
         match ty {
             RTM_GETLINK if dump => {
                 let msgs = links.iter().map(|l| link_msg(l, seq, pid)).collect();
@@ -224,6 +275,11 @@ pub fn handle_request(req: &[u8], links: &[Link], pid: u32) -> Vec<Vec<u8>> {
             }
             // No routes are exported: an empty dump.
             RTM_GETROUTE if dump => out.push(done_msg(seq, pid)),
+            RTM_GETROUTE => match req_dst(msg).and_then(|d| route(d).map(|h| (d, h))) {
+                Some((d, h)) => out.push(route_msg(d, h, links, seq, pid)),
+                None => out.push(error_msg(101, msg, seq, pid)), // ENETUNREACH
+            },
+            RTM_GETNEIGH if dump => out.push(done_msg(seq, pid)),
             // Control messages (NLMSG_NOOP..DONE) are ignored, as in Linux.
             t if t < 16 => {}
             _ if flags & NLM_F_REQUEST != 0 => out.push(error_msg(95, msg, seq, pid)), // EOPNOTSUPP
@@ -344,6 +400,18 @@ pub fn ifconf(links: &[Link], cap: usize) -> Vec<u8> {
 /// The interface table, as `/proc/net/dev` sees it: lo, then every netif
 /// (`ifindex = id + 2`).
 #[cfg(not(test))]
+pub fn route_lookup(d: [u8; 4]) -> Option<RouteHit> {
+    use smoltcp::wire::{IpAddress, Ipv4Address};
+    let sid = super::iface::route_select(IpAddress::Ipv4(Ipv4Address::from_bytes(&d)))?;
+    let gw = super::iface::snapshot().into_iter().find(|s| s.id as u32 + 1 == sid as u32)
+        .and_then(|s| match (s.addr, s.gateway) {
+            (Some((a, p)), Some(g)) if !super::iface::IfCfg { addr: a, prefix: p, gateway: None }.on_link(d) => Some(g),
+            _ => None,
+        });
+    Some((sid as u32 + 1, gw))
+}
+
+#[cfg(not(test))]
 pub fn current_links() -> Vec<Link> {
     let mut v = Vec::new();
     v.push(Link {
@@ -455,6 +523,51 @@ mod tests {
         assert_eq!(rd16(&m[0].1, 2), ARPHRD_LOOPBACK);
         // wifi0: no carrier
         assert_eq!(rd32(&m[2].1, 8) & IFF_RUNNING, 0);
+    }
+
+    fn route_req(dst: [u8; 4]) -> Vec<u8> {
+        let mut v = Vec::new();
+        put32(&mut v, 0);
+        put16(&mut v, RTM_GETROUTE);
+        put16(&mut v, 1);
+        put32(&mut v, 11);
+        put32(&mut v, 0);
+        v.extend_from_slice(&[AF_INET, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        attr(&mut v, RTA_DST, &dst);
+        let l = v.len() as u32;
+        v[0..4].copy_from_slice(&l.to_ne_bytes());
+        v
+    }
+
+    #[test]
+    fn getaddr_root_request_flags_is_a_dump() {
+        let out = handle_request(&req(RTM_GETADDR, 0x101, 3), &links(), 4);
+        assert_eq!(split(&out[0])[0].0, RTM_NEWADDR);
+    }
+
+    #[test]
+    fn getroute_single_reply_and_neigh_done() {
+        let hit = |d: [u8; 4]| if d[0] == 8 { Some((2u32, Some([192, 168, 2, 1]))) } else { None };
+        let out = handle_request_r(&route_req([8, 8, 8, 8]), &links(), 42, &hit);
+        assert_eq!(out.len(), 1);
+        let m = split(&out[0]);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].0, RTM_NEWROUTE);
+        assert_eq!(rd16(&out[0], 6), 0);
+        assert_eq!(rd32(&out[0], 8), 11);
+        assert_eq!(rd32(&out[0], 12), 42);
+        let a = attrs(&m[0].1[12..]);
+        let get = |t| a.iter().find(|x| x.0 == t).map(|x| x.1.clone());
+        assert_eq!(get(RTA_OIF).unwrap(), 2u32.to_ne_bytes());
+        assert_eq!(get(RTA_GATEWAY).unwrap(), vec![192, 168, 2, 1]);
+        assert_eq!(get(RTA_DST).unwrap(), vec![8, 8, 8, 8]);
+        assert!(get(RTA_PREFSRC).is_some() && get(RTA_TABLE).is_some());
+        let e = handle_request_r(&route_req([9, 9, 9, 9]), &links(), 42, &hit);
+        let m = split(&e[0]);
+        assert_eq!(m[0].0, NLMSG_ERROR);
+        assert_eq!(i32::from_ne_bytes(m[0].1[..4].try_into().unwrap()), -101);
+        let n = handle_request(&req(RTM_GETNEIGH, 0x301, 5), &links(), 1);
+        assert_eq!(split(&n[0])[0].0, NLMSG_DONE);
     }
 
     #[test]
