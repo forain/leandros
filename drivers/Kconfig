@@ -1,0 +1,185 @@
+menu "Device drivers"
+
+menu "Virtio (QEMU)"
+
+config VIRTIO_BLK
+	bool "virtio-blk"
+	default y
+
+config VIRTIO_NET
+	bool "virtio-net"
+	depends on NET
+	default y
+
+config VIRTIO_GPU
+	bool "virtio-gpu"
+	depends on DRM
+	default y
+
+config VIRTIO_KEYBOARD
+	bool "virtio-input keyboard"
+	default y
+
+config VIRTIO_RNG
+	bool "virtio-rng"
+	default y
+
+config VIRTIO_SND
+	bool "virtio-snd"
+	default y
+
+endmenu
+
+menu "Network"
+	depends on NET
+
+config E1000E
+	bool "Intel e1000e"
+	depends on PCI && ARCH_X86_64
+	default y
+
+config R8169
+	bool "Realtek r8169"
+	depends on PCI && ARCH_X86_64
+	default y
+
+config IWLWIFI
+	bool "Intel iwlwifi"
+	depends on PCI && ARCH_X86_64
+	select WIFI_STACK
+	default y
+
+config WIFI_SIM
+	bool "Simulated Wi-Fi device (testing)"
+	select WIFI_STACK
+	default y
+
+config MACB
+	bool "Cadence macb (Pi 5 RP1 Ethernet)"
+	depends on BOARD_RPI5
+	default y
+
+config BRCMF
+	bool "Broadcom brcmfmac (SDIO Wi-Fi)"
+	depends on BOARD_RPI5
+	select WIFI_STACK
+	default y
+
+endmenu
+
+menu "Graphics, display and audio"
+
+config I915
+	bool "Intel i915"
+	depends on PCI && DRM && ARCH_X86_64
+	default y
+
+config V3D
+	bool "Broadcom V3D / KMS"
+	depends on DRM && BOARD_RPI5
+	default y
+
+config HDMI_AUDIO
+	bool "Pi 5 HDMI audio"
+	depends on BOARD_RPI5
+	default y
+
+config HDA
+	bool "Intel HD Audio (+capture)"
+	depends on PCI && ARCH_X86_64
+	default y
+
+endmenu
+
+menu "Storage"
+
+config NVME
+	bool "NVMe"
+	depends on PCI
+	default y
+
+config SDHCI
+	bool "SDHCI SD/eMMC (Pi 5, raspi4b)"
+	depends on BOARD_RPI5 || BOARD_RASPI4B
+	default y
+
+endmenu
+
+menu "Input"
+
+config PSMOUSE
+	bool "PS/2 mouse (i8042)"
+	depends on ARCH_X86_64
+	default y
+
+config I2C_HID
+	bool "I2C HID (+ DesignWare I2C, ACPI I2C, precision touchpad)"
+	depends on ARCH_X86_64
+	default y
+
+endmenu
+
+menu "Platform and power"
+
+config ACPI_POWER
+	bool "ACPI EC / battery"
+	depends on ARCH_X86_64
+	default y
+
+config THERMAL
+	bool "Thermal"
+	depends on ARCH_X86_64
+	default y
+
+config PCI_PM
+	bool "PCI power management"
+	depends on PCI
+	default y
+
+config LAPINV
+	bool "Laptop inventory/quirks"
+	depends on ARCH_X86_64
+	default y
+
+endmenu
+
+menu "Raspberry Pi 5 platform"
+	depends on BOARD_RPI5
+
+config BRCMSTB_PCIE
+	bool "Broadcom STB PCIe"
+	default y
+
+config RP1
+	bool "RP1 south bridge (USB, GPIO, clk, fan)"
+	default y
+
+config BCM2712_DMA40
+	bool "BCM2712 DMA40"
+	default y
+
+config BCM2712_GPIO
+	bool "BCM2712 GPIO / pinctrl"
+	default y
+
+config RPI_MAILBOX
+	bool "VideoCore mailbox"
+	default y
+
+config RPI_MISC
+	bool "Pi misc (OTP, ids)"
+	default y
+
+config RPI_PM
+	bool "Pi power management"
+	default y
+
+config PI5_BOARD
+	bool "Pi 5 board setup"
+	default y
+
+endmenu
+
+source "drivers/usb/Kconfig"
+
+endmenu
