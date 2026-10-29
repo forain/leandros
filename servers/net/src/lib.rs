@@ -8,6 +8,8 @@ pub mod nftables;
 /// `/dev/netctl` (docs/servers/netctl.md).
 pub mod netctl;
 mod procnet;
+pub mod rtnetlink;
+mod nlsock;
 mod iface;
 pub mod netwatch;
 
@@ -174,6 +176,7 @@ fn cmsg_align(n: usize) -> usize { (n + 7) & !7 }
 
 pub const AF_UNIX:    usize = 1;
 pub const AF_INET:    usize = 2;
+pub const AF_NETLINK: usize = 16;
 /// connect(AF_UNSPEC): dissolve a UDP socket's association.
 const AF_UNSPEC:      usize = 0;
 pub const SOCK_STREAM: usize = 1;
@@ -3880,6 +3883,11 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
 fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> Message {
     match domain {
         AF_UNIX | AF_INET => {}
+        // NETLINK_ROUTE only (`rtnetlink`): getifaddrs, if_nameindex, nICEr.
+        AF_NETLINK => {
+            if sock_type & 0xf != SOCK_RAW && sock_type & 0xf != SOCK_DGRAM { return err_reply(-94); } // ESOCKTNOSUPPORT
+            if protocol != rtnetlink::NETLINK_ROUTE { return err_reply(-93); } // EPROTONOSUPPORT
+        }
         _                 => return err_reply(-97),
     }
     // SOCK_RAW needs CAP_NET_RAW (root) — EPERM. An unprivileged ping uses
@@ -3912,11 +3920,13 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         hidden:     false,
         connecting: false,
     };
+    if domain == AF_NETLINK { nlsock::create(tbl.socks[slot].ofd, sched::tgid_of(pid)); }
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
 
 fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Option<&[u8]>) -> Message {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
+    if let Some(o) = nlsock::of(pid, fd) { return nlsock::bind(o, addr_ptr, addrlen); }
     if addrlen < 2 { return err_reply(-22); }
 
     let sa_family = match sched::uaccess::read_user::<u16>(addr_ptr) { Some(f) => f as usize, None => return err_reply(-14) };
@@ -4983,6 +4993,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
 }
 
 fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize, addrlen: usize) -> Message {
+    if let Some(o) = nlsock::of(pid, fd) { return nlsock::send_buf(o, buf_ptr, len); }
     // A UDP socket with UDP_SEGMENT set splits a long send (see `udp_send_gso`).
     if GSO_USED.load(Ordering::Relaxed) {
         let seg = fd_ofd(pid, fd).map_or(0, |o| sock_opts(o).gso) as usize;
@@ -5617,6 +5628,7 @@ fn unix_dgram_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
 
 fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize, addrlen_ptr: usize,
                flags: usize) -> Message {
+    if let Some(o) = nlsock::of(pid, fd) { return nlsock::recv(o, buf_ptr, len, addr_ptr, addrlen_ptr, flags); }
     let peek = flags & MSG_PEEK != 0;
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.read();
@@ -5965,6 +5977,7 @@ fn unix_dgram_send_fds(pid: u32, fd: usize, conn_idx: usize, is_a: bool, data: &
 
 fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Message {
     if msghdr_ptr == 0 { return err_reply(-14); }
+    if let Some(o) = nlsock::of(pid, fd) { return nlsock::send_msg(o, msghdr_ptr); }
     let iov_ptr  = rd_or_efault!(msghdr_ptr + 16);
     let iovcnt   = rd_or_efault!(msghdr_ptr + 24);
     let ctrl_ptr = rd_or_efault!(msghdr_ptr + 32);
@@ -6387,6 +6400,7 @@ unsafe fn write_msg_tail(msghdr_ptr: usize, controllen: usize, msg_flags: i32) {
 
 fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Message {
     if msghdr_ptr == 0 { return err_reply(-14); }
+    if let Some(o) = nlsock::of(pid, fd) { return nlsock::recv_msg(o, msghdr_ptr, flags); }
     let iov_ptr  = rd_or_efault!(msghdr_ptr + 16);
     let iovcnt   = rd_or_efault!(msghdr_ptr + 24);
     let ctrl_ptr = rd_or_efault!(msghdr_ptr + 32);
@@ -6766,6 +6780,7 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
 /// unnamed unix socket exactly that way.
 fn handle_getsockname(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Message {
     if addr_ptr == 0 || addrlen_ptr == 0 { return err_reply(-14); }
+    if let Some(o) = nlsock::of(pid, fd) { return nlsock::getsockname(o, addr_ptr, addrlen_ptr); }
     // Endpoint resolved first; user memory is written with no lock held.
     let endpoint = inet_local_endpoint(pid, fd);
     match endpoint {
@@ -6844,6 +6859,8 @@ fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
 /// unrelated behaviour change.
 fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                      optval_ptr: usize, optlen: usize) -> Message {
+    // Netlink: buffer sizes and the like are accepted and ignored.
+    if nlsock::of(pid, fd).is_some() { return ok_reply(); }
     const SO_REUSEADDR: usize = 2;
     if level == SOL_SOCKET as usize && optname == SO_REUSEADDR {
         // The int is read out of user memory before any server lock is taken:
@@ -8052,6 +8069,11 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             (POLLOUT, Some(0), sock_tag(&ent))
         }
         SockState::IcmpUnbound => { drop(tbls); (POLLOUT, Some(0), sock_tag(&ent)) }
+        SockState::Unbound { domain, .. } if domain == AF_NETLINK as u8 => {
+            drop(tbls);
+            let (readable, gen) = nlsock::poll_state(ofd);
+            (POLLOUT | if readable { POLLIN } else { 0 }, Some(gen), sock_tag(&ent))
+        }
         // Not bound yet, TCP bound but not listening, AF_UNIX not bound or
         // connected: nothing to report until bind/listen/connect, which wake
         // the SOCKSTATE key.

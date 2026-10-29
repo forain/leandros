@@ -450,7 +450,7 @@ def main():
         "pthreadtest", "timertest", "sigtest", "polltest", "fdmaxtest", "ptytest", "forktest", "shmtest", "racetest",
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "uinputtest", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
-        "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
+        "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "netlinktest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
         "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "kexectest", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid",
     ]
     for b in bins:
