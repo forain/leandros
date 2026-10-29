@@ -338,6 +338,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     #[cfg(all(feature = "nvidia", target_arch = "x86_64"))] nvidia_rm::init(&nvidia_rm::BootEnv { cmdline: crate::boot_cmdline().unwrap_or(""), fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32, log_flush: crate::klog::flush_now, rsdp_phys: boot_info.rsdp_addr }); // OpenRM; one line so the default kernel's panic line numbers (and bytes) stay unchanged
     // ── Network Stack ────────────────────────────────────────────────────────
     drivers::netdev::init(crate::boot_cmdline().unwrap_or(""));
+    crate::kmod::autoload::boot(); // modules.load= / kmod=0
     net_server::init();
     sched::spawn(net_server::net_daemon, 0).map(|p| sched::set_comm(p, b"netd"));
     crate::netwatch::init();

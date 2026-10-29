@@ -1,9 +1,11 @@
 //! Loadable kernel modules: boot-time state (build-id, module window).
 
+pub mod autoload;
 pub mod buildid;
 pub mod exports;
 pub mod load;
 pub mod registry;
+pub mod sys;
 
 pub use load::{load_image, KmodErr, Source};
 pub use registry::{for_each, note_registration, registrations, ModInfo, State};

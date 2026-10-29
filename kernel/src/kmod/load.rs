@@ -10,6 +10,9 @@ use super::registry::{self, State};
 
 const PAGE: usize = 4096;
 
+/// The module whose `init` is running now (0 = none); `kapi_log` tags lines with it.
+pub static CUR_OWNER: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Source { Initrd, Syscall, Ktest }
 
@@ -84,6 +87,10 @@ pub fn load_image(img: &[u8], src: Source) -> Result<KmodId, KmodErr> {
         Err(e) => { log(&alloc::format!("[kmod] {:?} image refused: {:?}\n", src, e)); return Err(KmodErr::Elf(e)); }
     };
     let hdr = plan.hdr;
+    if super::autoload::blacklisted(super::name_str(&hdr.name)) {
+        log(&alloc::format!("[kmod] {} Blacklisted\n", super::name_str(&hdr.name)));
+        return Err(KmodErr::Blacklisted);
+    }
     if registry::name_exists(&hdr.name) {
         log("[kmod] refused: name already loaded\n");
         return Err(KmodErr::Exists);
@@ -141,7 +148,9 @@ pub fn load_image(img: &[u8], src: Source) -> Result<KmodId, KmodErr> {
         _pad: 0, _pad2: 0, cmdline: cl.as_ptr(), cmdline_len: cl.len(), params: core::ptr::null(), params_len: 0,
     };
     let init: extern "C" fn(*const KmodCtx) -> i32 = unsafe { core::mem::transmute(hdr.init as usize) };
+    CUR_OWNER.store(id.0, core::sync::atomic::Ordering::SeqCst);
     let rc = init(&ctx);
+    CUR_OWNER.store(0, core::sync::atomic::Ordering::SeqCst);
     let nm = super::name_str(&hdr.name);
     if rc >= 0 {
         registry::set_state(id, State::Live);

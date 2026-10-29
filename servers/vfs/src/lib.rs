@@ -6342,6 +6342,15 @@ fn gen_thermal() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.thermal", &out, false)
 }
 
+/// `/proc/modules`: loaded kernel modules (`kernel::kmod::sys`).
+fn gen_modules() -> Option<VnodeKind> {
+    let mut out = alloc::vec![0u8; 4096];
+    extern "C" { fn arch_kmod_report(buf: *mut u8, cap: usize) -> usize; }
+    let n = unsafe { arch_kmod_report(out.as_mut_ptr(), out.len()) };
+    out.truncate(n);
+    proc_snapshot(b"/tmp/.modules", &out, false)
+}
+
 /// `/proc/pcache`: the unified page cache (`mm::pagecache`), one
 /// `name value` per line; counters are cumulative pages since boot.
 fn gen_pcache() -> Option<VnodeKind> {
@@ -7045,7 +7054,7 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog"];
+                                     b"/proc/pcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ"];
 
@@ -7819,6 +7828,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/thermal" {
             match gen_thermal() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/modules" {
+            match gen_modules() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }

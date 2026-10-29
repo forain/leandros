@@ -2477,10 +2477,12 @@ fn dispatch_inner(
         // Root-only operations this kernel does not implement: an unprivileged
         // caller gets Linux's answer (EPERM — the capability check comes before
         // anything else there), root gets ENOSYS.
-        ACCT | VHANGUP | SWAPON | SWAPOFF | INIT_MODULE | DELETE_MODULE
-        | FINIT_MODULE | KEXEC_LOAD => {
+        ACCT | VHANGUP | SWAPON | SWAPOFF | KEXEC_LOAD => {
             if sched::current_euid() != 0 { -1 } else { log_enosys(number) }
         }
+        INIT_MODULE   => crate::kmod::sys::sys_init_module(a0, a1, a2),
+        FINIT_MODULE  => crate::kmod::sys::sys_finit_module(a0, a1, a2),
+        DELETE_MODULE => crate::kmod::sys::sys_delete_module(a0, a1),
         KEXEC_FILE_LOAD => crate::kexec::sys_kexec_file_load(a0, a1, a2, a3, a4),
         #[cfg(not(target_arch = "aarch64"))]
         IOPL | IOPERM => if sched::current_euid() != 0 { -1 } else { log_enosys(number) },
