@@ -20,8 +20,8 @@ pub mod layout {
         pub const BASE: u64 = 0xffff_fe00_0000_0000;
     }
     pub const SIZE: u64 = 0x1000_0000;
-    pub const SLOT_ALIGN: u64 = 0x20_0000;
-    /// Slots 126-127 are reserved for ktest / testblob.
+    pub const SLOT_ALIGN: u64 = 0x4_0000; // 256 KiB, 1024 slots
+    /// Slots 1022-1023 are reserved for ktest / testblob.
     pub const TEST_SLOT_OFF: u64 = SIZE - 2 * SLOT_ALIGN;
     pub const NSLOTS: u64 = SIZE / SLOT_ALIGN;
 
@@ -60,24 +60,37 @@ pub struct KmodId(pub u16); // 0 = BUILTIN
 
 #[repr(C)]
 pub struct KmodCtx {
-    pub abi_version: u32,
-    pub owner: KmodId,
-    pub _pad: u16,
-    pub cmdline: *const u8,
-    pub cmdline_len: usize,
+    pub ctx_size: u32,    // 0, == size_of::<KmodCtx>()
+    pub abi_version: u32, // 4
+    pub owner: KmodId,    // 8
+    pub _pad: u16,        // 10
+    pub _pad2: u32,       // 12
+    pub cmdline: *const u8, // 16
+    pub cmdline_len: usize, // 24
+    pub params: *const u8,  // 32, init_module params (ignored in v1)
+    pub params_len: usize,  // 40
 }
 
-#[repr(u16)]
+/// Registration kind. A struct, not an enum: an out-of-range value from a
+/// module across FFI must not be UB.
+#[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RegKind {
-    Kthread = 1,
-    Netdev = 2,
-    Hwrng = 3,
-    UsbClass = 4,
-    V4l2 = 5,
-    Irq = 6,
-    Pci = 7,
+pub struct RegKind(pub u16);
+impl RegKind {
+    pub const KTHREAD: RegKind = RegKind(1);
+    pub const NETDEV: RegKind = RegKind(2);
+    pub const HWRNG: RegKind = RegKind(3);
+    pub const USB_CLASS: RegKind = RegKind(4);
+    pub const V4L2: RegKind = RegKind(5);
+    pub const IRQ: RegKind = RegKind(6);
+    pub const PCI: RegKind = RegKind(7);
 }
+
+/// Every id-table entry starts with a `u16 bus` discriminator.
+pub const BUS_PCI: u16 = 1;
+pub const BUS_USB: u16 = 2;
+pub const BUS_OF: u16 = 3;
+pub const BUS_ACPI: u16 = 4;
 
 /// Export-table entry; `name` is NUL-terminated.
 #[repr(C)]
@@ -141,7 +154,7 @@ const _: () = {
     assert!(core::mem::size_of::<KmodHeader>() == 128);
     assert!(core::mem::align_of::<KmodHeader>() == 8);
     assert!(core::mem::size_of::<KmodId>() == 2);
-    assert!(core::mem::size_of::<KmodCtx>() == 24);
+    assert!(core::mem::size_of::<KmodCtx>() == 48);
     assert!(core::mem::size_of::<KSym>() == 16);
     assert!(core::mem::offset_of!(KmodHeader, magic) == 0);
     assert!(core::mem::offset_of!(KmodHeader, abi_version) == 8);
@@ -158,9 +171,15 @@ const _: () = {
     assert!(core::mem::offset_of!(KmodHeader, ids_len) == 88);
     assert!(core::mem::offset_of!(KmodHeader, ids_entry_size) == 92);
     assert!(core::mem::offset_of!(KmodHeader, name) == 96);
-    assert!(core::mem::offset_of!(KmodCtx, owner) == 4);
-    assert!(core::mem::offset_of!(KmodCtx, cmdline) == 8);
-    assert!(core::mem::offset_of!(KmodCtx, cmdline_len) == 16);
+    assert!(core::mem::offset_of!(KmodCtx, abi_version) == 4);
+    assert!(core::mem::offset_of!(KmodCtx, owner) == 8);
+    assert!(core::mem::offset_of!(KmodCtx, cmdline) == 16);
+    assert!(core::mem::offset_of!(KmodCtx, cmdline_len) == 24);
+    assert!(core::mem::offset_of!(KmodCtx, params) == 32);
+    assert!(core::mem::offset_of!(KmodCtx, params_len) == 40);
+    assert!(core::mem::size_of::<RegKind>() == 2);
+    assert!(layout::TEST_SLOT_OFF == layout::SIZE - 2 * layout::SLOT_ALIGN);
+    assert!(layout::TEST_SLOT_OFF == 0x0ff8_0000);
     assert!(layout::x86_64::BASE % layout::SLOT_ALIGN == 0);
     assert!(layout::aarch64::BASE % layout::SLOT_ALIGN == 0);
 };

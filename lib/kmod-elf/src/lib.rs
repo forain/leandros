@@ -65,7 +65,7 @@ impl ElfErr {
 }
 
 const PAGE: u64 = 4096;
-const SLOT_ALIGN: u64 = 0x20_0000;
+const SLOT_ALIGN: u64 = kmod_abi::layout::SLOT_ALIGN;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;

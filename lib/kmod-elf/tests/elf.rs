@@ -24,10 +24,10 @@ const H: usize = 4096; // file offset of the KmodHeader
 #[test]
 fn layout_and_sizes() {
     assert_eq!(core::mem::size_of::<KmodHeader>(), 128);
-    assert_eq!(core::mem::size_of::<KmodCtx>(), 24);
+    assert_eq!(core::mem::size_of::<KmodCtx>(), 48);
     assert_eq!(core::mem::size_of::<KSym>(), 16);
-    assert_eq!(layout::TEST_SLOT_OFF, 126 * layout::SLOT_ALIGN);
-    assert_eq!(layout::NSLOTS, 128);
+    assert_eq!(layout::TEST_SLOT_OFF, 1022 * layout::SLOT_ALIGN);
+    assert_eq!(layout::NSLOTS, 1024);
     assert_eq!(base(62) + layout::SIZE, 0xffff_ffff_a000_0000);
 }
 
