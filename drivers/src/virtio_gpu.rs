@@ -3762,6 +3762,9 @@ pub fn is_host_rendered(res_id: u32) -> bool {
 }
 
 pub fn init() {
+    // CONFIG_VIRTIO_GPU=n: never probe; VIRTIO_GPU stays None and the DRM /
+    // KMS layers fall back as on a machine without the device.
+    if !cfg!(feature = "virtio-gpu") { return; }
     let mut gpu = VIRTIO_GPU.lock();
     // Idempotent: only probe/reset the device the first time.  A second
     // `VirtioGpuDevice::new()` would write `device_status = 0` (a full device

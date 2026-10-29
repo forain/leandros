@@ -293,6 +293,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         if let Some(syn) = arch_aarch64::exception::serror_checkpoint() {
             drivers::pci::serial_debug(&alloc::format!("[SERROR] pending before the v3d probe syn=0x{:016x} (an earlier probe)\n", syn));
         }
+        #[cfg(feature = "drv-v3d")]
         drivers::v3d::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset, arch_aarch64::exception::serror_checkpoint);
         // RNG, firmware RTC, PM watchdog, thermal, ARM clock: one line each (lane pimisc).
         drivers::rpi_misc::boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset);

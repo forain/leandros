@@ -13,6 +13,11 @@ raspi4b = []
 # Verbose xHCI tracing and the boot-time bulk-only-transport self-test on
 # every enumerated USB mass-storage interface (drivers/src/usb_hcd.rs).
 usb-debug = []
+# Kconfig CONFIG_I915 / CONFIG_VIRTIO_GPU / CONFIG_V3D (kernel features drv-*).
+# Off: i915 is replaced by drivers/src/i915_stub.rs; the others skip their probe.
+i915 = []
+virtio-gpu = []
+v3d = []
 # kmod L1c: misc driver gates (CONFIG_* -> drv-*). Off = stub module, same API.
 drv-virtio-rng = []
 drv-hda = []
