@@ -6476,10 +6476,13 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
         }
         mm::vmm::FaultPlan::Vmo(p) => {
             unsafe { unlock_address_space(as_ptr); }
-            let phys = mm::vmm::vmo_page(p.vmo, p.off);
+            let mut frames = [0usize; mm::vmm::VMO_FAULT_AROUND];
+            let win_off = p.off - (p.page_va - p.win_va) as u64;
+            let n = mm::vmm::vmo_pages(p.vmo, win_off, &mut frames[..p.win_n.min(mm::vmm::VMO_FAULT_AROUND)]);
+            let frames = &frames[..n];
             match lock_leader_address_space(pid) {
                 Some(a) => {
-                    let f = unsafe { (*a).install_vmo_fault(&p, phys) };
+                    let f = unsafe { (*a).install_vmo_fault(&p, frames) };
                     if matches!(f, mm::vmm::Fault::Handled) {
                         let _ = with_current_slot(|s| {
                             if !s.mm_borrowed.load(Ordering::Relaxed) { unsafe { (*a).min_flt.fetch_add(1, Ordering::Relaxed); } }
@@ -6490,7 +6493,7 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
                     f
                 }
                 None => {
-                    if let Some(f) = phys { mm::pageref::unref_or_free(f, 0); }
+                    for &f in frames { mm::pageref::unref_or_free(f, 0); }
                     mm::vmm::Fault::Handled
                 }
             }

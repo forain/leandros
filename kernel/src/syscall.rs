@@ -445,7 +445,7 @@ pub fn init_exec_file_backing() {
     mm::vmm::set_device_vma_hooks(drivers::drm_device_interface::hostvis_vma_retain,
                                   drivers::drm_device_interface::hostvis_vma_release);
     mm::vmm::set_file_key_hook(exec_file_key);
-    mm::vmm::set_vmo_page_hook(vfs::vmo_fault_frame);
+    mm::vmm::set_vmo_page_hook(vfs::vmo_fault_frames);
     mm::vmm::set_vmo_ref_hooks(vfs::vmo_retain, vfs::vmo_release);
     mm::vmm::set_file_name_hook(exec_file_name);
 }

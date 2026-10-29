@@ -219,7 +219,9 @@ fn backing_seq() -> u64 { BACKING_SHRINK_SEQ.load(Ordering::SeqCst) }
 /// (allocated zeroed if it is a hole), or None if `off` lies past the
 /// object's end (or it is gone). Takes the VFS's tmpfs locks, so it is only
 /// ever called with the address space unlocked.
-pub type VmoPageFn = fn(vmo: u64, off: u64) -> Option<usize>;
+pub type VmoPageFn = fn(vmo: u64, off: u64, out: &mut [usize]) -> usize;
+/// Pages a VMO fault maps around the faulting one (aligned window).
+pub const VMO_FAULT_AROUND: usize = 16;
 static VMO_PAGE_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the VFS's tmpfs/memfd page lookup (see [`VmoPageFn`]).
@@ -227,12 +229,14 @@ pub fn set_vmo_page_hook(f: VmoPageFn) {
     VMO_PAGE_HOOK.store(f as usize, Ordering::Release);
 }
 
-/// Look up through the registered hook (see [`VmoPageFn`]).
-pub fn vmo_page(vmo: u64, off: u64) -> Option<usize> {
+/// Acquire the frames of pages `off/4096 ..` into `out` through the
+/// registered hook in one call (see [`VmoPageFn`]); returns how many
+/// consecutive pages were acquired (0: none, the first is past the end).
+pub fn vmo_pages(vmo: u64, off: u64, out: &mut [usize]) -> usize {
     let f = VMO_PAGE_HOOK.load(Ordering::Acquire);
-    if f == 0 { return None; }
+    if f == 0 { return 0; }
     let f: VmoPageFn = unsafe { core::mem::transmute(f) };
-    f(vmo, off)
+    f(vmo, off, out)
 }
 
 /// Kernel-private `map_flags` bit (Linux never sets bit 30): the VMA is an
@@ -300,6 +304,10 @@ pub struct VmoFault {
     pub page_va: usize,
     /// Byte offset in the object backing `page_va`.
     pub off:     u64,
+    /// First page of the fault-around window (<= `page_va`) and its length
+    /// in pages, clamped to the VMA.
+    pub win_va:  usize,
+    pub win_n:   usize,
     /// [`BACKING_SHRINK_SEQ`] when the fault was planned.
     pub seq:     u64,
 }
@@ -1046,43 +1054,56 @@ impl AddressSpace {
         }
     }
 
-    /// Second half of a tmpfs/memfd fault: map `phys` (one reference, from
-    /// [`vmo_page`]; None: past the object's end) for `p`. Re-validated as
+    /// Second half of a tmpfs/memfd fault: map `frames` (one reference each,
+    /// from [`vmo_pages`]; the pages of the fault-around window starting at
+    /// `p.win_va`, possibly fewer than `p.win_n`) for `p`. Re-validated as
     /// [`install_file_fault`](Self::install_file_fault) is; on any mismatch
-    /// the reference is dropped and the access retries.
-    pub fn install_vmo_fault(&mut self, p: &VmoFault, phys: Option<usize>) -> Fault {
-        let release = |phys: Option<usize>| {
-            if let Some(f) = phys { crate::pageref::unref_or_free(f, 0); }
+    /// the references are dropped and the access retries. Pages already
+    /// mapped are left alone; the faulting page missing is SIGBUS.
+    pub fn install_vmo_fault(&mut self, p: &VmoFault, frames: &[usize]) -> Fault {
+        let release_all = |from: usize| {
+            for &f in &frames[from.min(frames.len())..] { crate::pageref::unref_or_free(f, 0); }
         };
-        if backing_seq() != p.seq { release(phys); return Fault::Handled; }
+        if backing_seq() != p.seq { release_all(0); return Fault::Handled; }
         let page_table_root = self.page_table_root;
         let region = match self.regions.iter_mut().filter_map(|r| r.as_mut()).find(
             |r| p.page_va >= r.start && p.page_va < r.end
         ) {
             Some(r) => r,
-            None => { release(phys); return Fault::Handled; }
+            None => { release_all(0); return Fault::Handled; }
         };
         let page_idx = (p.page_va - region.start) / PAGE_SIZE;
         if !region.lazy || region.vmo != p.vmo
             || region.file_off + (page_idx * PAGE_SIZE) as u64 != p.off
             || region.lazy_pages.get(page_idx).copied().unwrap_or(0) != 0
+            || p.win_va < region.start
+            || p.win_va + p.win_n * PAGE_SIZE > region.end
         {
-            release(phys);
+            release_all(0);
             return Fault::Handled;
         }
-        let phys = match phys { Some(f) => f, None => return Fault::Bus };
+        let first = (p.page_va - p.win_va) / PAGE_SIZE;
+        if frames.len() <= first { release_all(0); return Fault::Bus; }
         // A private (CoW) mapping shares the object's frame: read-only, the
         // first store copies it.
         let install = if region.cow { region.flags & !PageFlags::WRITABLE } else { region.flags };
-        if !unsafe { map_page(page_table_root, p.page_va, phys, install) } {
-            crate::pageref::unref_or_free(phys, 0);
-            return Fault::Segv;
+        let base_idx = (p.win_va - region.start) / PAGE_SIZE;
+        if region.lazy_pages.len() < base_idx + frames.len() {
+            region.lazy_pages.resize(base_idx + frames.len(), 0);
         }
-        if region.lazy_pages.len() <= page_idx {
-            region.lazy_pages.resize(page_idx + 1, 0);
+        for (i, &phys) in frames.iter().enumerate() {
+            let idx = base_idx + i;
+            if region.lazy_pages[idx] != 0 { crate::pageref::unref_or_free(phys, 0); continue; }
+            let va = p.win_va + i * PAGE_SIZE;
+            if !unsafe { map_page(page_table_root, va, phys, install) } {
+                crate::pageref::unref_or_free(phys, 0);
+                if i == first { release_all(i + 1); return Fault::Segv; }
+                release_all(i + 1);
+                break;
+            }
+            region.lazy_pages[idx] = phys;
+            region.lazy_count += 1;
         }
-        region.lazy_pages[page_idx] = phys;
-        region.lazy_count += 1;
         Fault::Handled
     }
 
@@ -1307,10 +1328,15 @@ impl AddressSpace {
         // SIGBUS. Zero-filling privately would detach this mapping from the
         // object without a word.
         if region.vmo != 0 {
+            let win = VMO_FAULT_AROUND * PAGE_SIZE;
+            let win_va = (page_va & !(win - 1)).max(region.start);
+            let win_end = (win_va - (win_va & (win - 1)) + win).min(region.end);
             return FaultPlan::Vmo(VmoFault {
                 vmo: region.vmo,
                 page_va,
                 off: region.file_off + (page_idx * PAGE_SIZE) as u64,
+                win_va,
+                win_n: (win_end - win_va) / PAGE_SIZE,
                 seq: backing_seq(),
             });
         }
