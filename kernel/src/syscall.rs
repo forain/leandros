@@ -1181,6 +1181,9 @@ pub extern "C" fn syscall_dispatch(
     a3: usize, a4: usize,
     a5: usize, frame_ptr: usize, _padding: usize,
 ) -> isize {
+    // IF=0 here on x86: answer a pending TLB shootdown now rather than
+    // leaving its initiator spinning for the length of this syscall.
+    mm::paging::tlb_service_pending();
     let ret = dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr);
     if ret == ERESTARTSYS || ret == ERESTARTNOHAND {
         // Never reaches user space: the frame gets EINTR, and the signal
@@ -3538,6 +3541,8 @@ fn unmap_chunked(virt: usize, size: usize) {
                 sched::note_as_hold_ns(sched::monotonic_ns().wrapping_sub(t0));
                 r
             });
+            // The shootdown wait happens here, with the AS lock dropped.
+            mm::vmm::drain_deferred(true);
             irq_window();
             at += n;
         }
@@ -3547,6 +3552,7 @@ fn unmap_chunked(virt: usize, size: usize) {
         as_.unmap(virt, size);
         sched::note_as_hold_ns(sched::monotonic_ns().wrapping_sub(t0));
     });
+    mm::vmm::drain_deferred(true);
 }
 
 /// mremap(2), Linux semantics.

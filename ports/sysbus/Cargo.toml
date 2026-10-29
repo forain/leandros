@@ -10,6 +10,10 @@ publish = false
 name = "leandros-sysbus"
 path = "src/main.rs"
 
+[[bin]]
+name = "busctl"
+path = "src/bin/busctl.rs"
+
 [dependencies]
 # zbus 5 (busd 0.5.0 uses the same major), tokio flavour only.
 zbus = { version = "5.13", default-features = false, features = ["tokio"] }

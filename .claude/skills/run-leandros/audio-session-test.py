@@ -149,6 +149,14 @@ def main():
             res["pwlog"] = sh("cat /run/user/1000/pipewire.log | tail -40", 20)
             res["status"] = sh(f"{ENV} /usr/bin/wpctl status", 30)
             res["vol0"] = sh(f"{ENV} /usr/bin/wpctl get-volume @DEFAULT_AUDIO_SINK@", 20)
+        elif st == "busctl":
+            # COSMIC's VolumeRaise action, exactly as system_actions runs it.
+            bus = "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"
+            res["bc_vol0"] = sh(f"{ENV} /usr/bin/wpctl get-volume @DEFAULT_AUDIO_SINK@", 20)
+            res["bc_rc"] = sh(f"{ENV} {bus} /usr/bin/busctl --user call com.system76.CosmicSettingsDaemon "
+                              "/com/system76/CosmicSettingsDaemon com.system76.CosmicSettingsDaemon VolumeUp; echo rc=$?", 30)
+            time.sleep(2)
+            res["bc_vol1"] = sh(f"{ENV} /usr/bin/wpctl get-volume @DEFAULT_AUDIO_SINK@", 20)
         elif st == "tone":
             tone("tone1")
         elif st == "volume":
