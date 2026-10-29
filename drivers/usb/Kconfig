@@ -1,0 +1,29 @@
+menu "USB"
+	depends on USB
+
+config USB_XHCI
+	bool "xHCI host controller (+hub)"
+	default y
+
+config USB_HID
+	bool "USB HID"
+	default y
+
+config USB_STORAGE
+	bool "USB mass storage"
+	default y
+
+config UVC
+	bool "USB video class (webcam)"
+	default y
+
+config BT
+	bool "Bluetooth (btusb + bthid)"
+	default y
+
+config DWC3
+	bool "DesignWare USB3 (Pi)"
+	depends on ARCH_ARM64
+	default y
+
+endmenu

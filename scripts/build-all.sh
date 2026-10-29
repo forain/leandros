@@ -148,6 +148,25 @@ create_initrd() {
     rm -rf "$temp_dir"
 }
 
+# Kconfig -> cargo features. Uses $ROOT_DIR/.config if present (edit it with
+# scripts/menuconfig.sh), else the target's configs/*_defconfig. Prints the
+# comma-separated kernel feature list (board features rpi5/raspi4b/nvidia
+# included once declared by the config; build-all flags still apply too).
+kconfig_features() {
+    local arch="$1" def cfg
+    if [[ "$arch" == "aarch64" && "$RPI5" == "true" ]]; then def="rpi5"
+    elif [[ "$arch" == "x86_64" && "${INTEL:-}" == "1" ]]; then def="x86_64_laptop"
+    else def="$arch"; fi
+    mkdir -p "$ROOT_DIR/target/kconfig-$arch"
+    cfg="$ROOT_DIR/target/kconfig-$arch/.config"
+    if [[ -f "$ROOT_DIR/.config" ]]; then
+        python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" olddefconfig --arch "$arch" --config "$ROOT_DIR/.config" --out "$cfg" >&2
+    else
+        python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" defconfig --arch "$arch" --defconfig "$ROOT_DIR/configs/${def}_defconfig" --out "$cfg" >&2
+    fi
+    python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" features --arch "$arch" --config "$cfg" --kmod-list "$ROOT_DIR/target/kconfig-$arch/kmod-list"
+}
+
 # Function to build kernel
 build_kernel() {
     local arch="$1"
@@ -185,6 +204,17 @@ build_kernel() {
             || "$ROOT_DIR/ports/openrm/fetch.sh"
         "$ROOT_DIR/ports/openrm/build.sh"
         features_arg="--features nvidia"
+    fi
+    # Kconfig: .config (or the target's defconfig) -> extra cargo features.
+    local kc_feats
+    kc_feats="$(kconfig_features "$arch")"
+    if [[ -n "$kc_feats" ]]; then
+        local have="${features_arg#--features }" f
+        local -a all=()
+        [[ -n "$have" ]] && all+=("$have")
+        IFS=',' read -r -a kcf <<< "$kc_feats"
+        for f in "${kcf[@]}"; do [[ ",$have," == *",$f,"* ]] || all+=("$f"); done
+        if [[ ${#all[@]} -gt 0 ]]; then features_arg="--features $(IFS=,; echo "${all[*]}")"; fi
     fi
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_std" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
     RUSTFLAGS="-C link-arg=-T$linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro $STACK_SIZES_FLAG" \

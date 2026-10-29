@@ -1,0 +1,60 @@
+# LeandrOS kernel configuration. Edit with ./scripts/menuconfig.sh
+#
+# Naming convention: CONFIG_FOO_BAR=y  <->  cargo feature "drv-foo-bar" of the
+# kernel crate (scripts/kconfig/to-cargo.py). A feature is passed to cargo only
+# if kernel/Cargo.toml declares it, so symbols may exist before they are wired.
+mainmenu "LeandrOS Kernel Configuration"
+
+config ARCH_X86_64
+	def_bool "$(ARCH)" = "x86_64"
+
+config ARCH_ARM64
+	def_bool "$(ARCH)" = "aarch64"
+
+choice
+	prompt "Board"
+	default BOARD_QEMU
+
+config BOARD_QEMU
+	bool "QEMU / generic PC (no board feature)"
+
+config BOARD_RPI5
+	bool "Raspberry Pi 5 (BCM2712 + RP1)"
+	depends on ARCH_ARM64
+
+config BOARD_RASPI4B
+	bool "QEMU -M raspi4b (testing stepping stone)"
+	depends on ARCH_ARM64
+
+endchoice
+
+config MODULES
+	bool "Loadable module support (stage 2, not yet implemented)"
+	default n
+	help
+	  Reserved. Drivers become tristate once their module lane lands.
+
+config PCI
+	def_bool y
+
+config USB
+	bool "USB support"
+	default y
+
+config NET
+	def_bool y
+
+config DRM
+	def_bool y
+
+config WIFI_STACK
+	bool
+	help
+	  Shared wifi_* stack (selected by Wi-Fi drivers).
+
+config NVIDIA
+	bool "NVIDIA GPUs via OpenRM (needs ports/openrm build; ./build-all.sh --nvidia)"
+	depends on ARCH_X86_64
+	default n
+
+source "drivers/Kconfig"

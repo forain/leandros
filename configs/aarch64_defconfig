@@ -1,0 +1,3 @@
+# aarch64 QEMU virt
+# All applicable drivers are y (symbol defaults). NVIDIA stays n (build-all --nvidia).
+CONFIG_BOARD_QEMU=y

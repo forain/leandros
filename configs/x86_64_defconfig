@@ -1,0 +1,3 @@
+# x86_64 QEMU / generic PC
+# All applicable drivers are y (symbol defaults). NVIDIA stays n (build-all --nvidia).
+CONFIG_BOARD_QEMU=y
