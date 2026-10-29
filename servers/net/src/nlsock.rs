@@ -73,7 +73,7 @@ pub fn getsockname(ofd: u32, addr_ptr: usize, addrlen_ptr: usize) -> Message {
 pub fn send(ofd: u32, data: &[u8]) -> Message {
     let pid = match NL.lock().get(&ofd) { Some(s) => s.pid, None => return err_reply(-9) };
     let links = rt::current_links();
-    let replies = rt::handle_request(data, &links, pid);
+    let replies = rt::handle_request_r(data, &links, pid, &rt::route_lookup);
     if !replies.is_empty() {
         let mut m = NL.lock();
         if let Some(s) = m.get_mut(&ofd) {

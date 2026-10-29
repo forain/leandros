@@ -127,6 +127,47 @@ int main(void) {
     struct nlmsghdr *eh = (struct nlmsghdr *)buf;
     CHECK("unsupported request -> NLMSG_ERROR", en > 0 && eh->nlmsg_type == NLMSG_ERROR && eh->nlmsg_seq == 14);
 
+    // nICEr (Firefox): RTM_GETADDR with NLM_F_ROOT|NLM_F_REQUEST (0x101) is a dump.
+    struct req ra = { .h = { .nlmsg_len = sizeof ra, .nlmsg_type = RTM_GETADDR,
+                             .nlmsg_flags = NLM_F_ROOT | NLM_F_REQUEST, .nlmsg_seq = 20 } };
+    send(s, &ra, sizeof ra, 0);
+    ssize_t na = recv(s, buf, sizeof buf, 0);
+    CHECK("GETADDR ROOT|REQUEST (0x101) returns addresses",
+          na > 0 && ((struct nlmsghdr *)buf)->nlmsg_type == RTM_NEWADDR);
+    recv(s, buf, sizeof buf, 0); // DONE
+
+    // Firefox NetlinkService: non-dump RTM_GETROUTE to 8.8.8.8 -> one RTM_NEWROUTE.
+    struct { struct nlmsghdr h; struct rtmsg m; struct rtattr a; unsigned char d[4]; } rr;
+    memset(&rr, 0, sizeof rr);
+    rr.h.nlmsg_len = sizeof rr; rr.h.nlmsg_type = RTM_GETROUTE;
+    rr.h.nlmsg_flags = NLM_F_REQUEST; rr.h.nlmsg_seq = 21;
+    rr.m.rtm_family = AF_INET; rr.m.rtm_dst_len = 32;
+    rr.a.rta_len = RTA_LENGTH(4); rr.a.rta_type = RTA_DST;
+    rr.d[0] = 8; rr.d[1] = 8; rr.d[2] = 8; rr.d[3] = 8;
+    send(s, &rr, sizeof rr, 0);
+    ssize_t nr = recv(s, buf, sizeof buf, 0);
+    struct nlmsghdr *rh = (struct nlmsghdr *)buf;
+    int oif = 0, pref = 0, gw = 0;
+    if (nr > 0 && rh->nlmsg_type == RTM_NEWROUTE) {
+        struct rtmsg *rm = NLMSG_DATA(rh);
+        int rl = RTM_PAYLOAD(rh);
+        for (struct rtattr *ra2 = RTM_RTA(rm); RTA_OK(ra2, rl); ra2 = RTA_NEXT(ra2, rl)) {
+            if (ra2->rta_type == RTA_OIF) oif = 1;
+            if (ra2->rta_type == RTA_PREFSRC) pref = 1;
+            if (ra2->rta_type == RTA_GATEWAY) gw = 1;
+        }
+    }
+    CHECK("GETROUTE 8.8.8.8 -> RTM_NEWROUTE seq echoed",
+          nr > 0 && rh->nlmsg_type == RTM_NEWROUTE && rh->nlmsg_seq == 21 && !(rh->nlmsg_flags & NLM_F_MULTI));
+    CHECK("GETROUTE reply has OIF, PREFSRC and GATEWAY", oif && pref && gw);
+
+    // RTM_GETNEIGH dump -> empty DONE.
+    struct req rn = { .h = { .nlmsg_len = sizeof rn, .nlmsg_type = RTM_GETNEIGH,
+                             .nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP, .nlmsg_seq = 22 } };
+    send(s, &rn, sizeof rn, 0);
+    ssize_t nn = recv(s, buf, sizeof buf, 0);
+    CHECK("GETNEIGH dump -> NLMSG_DONE", nn > 0 && ((struct nlmsghdr *)buf)->nlmsg_type == NLMSG_DONE);
+
     // Non-blocking socket with nothing queued.
     int nb = socket(AF_NETLINK, SOCK_DGRAM | SOCK_NONBLOCK, NETLINK_ROUTE);
     CHECK("SOCK_DGRAM|SOCK_NONBLOCK netlink socket", nb >= 0);
