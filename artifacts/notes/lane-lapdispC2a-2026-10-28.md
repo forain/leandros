@@ -27,3 +27,31 @@ Branch lane/lapdispC2a. Everything is off by default (knobs below); nothing ligh
 
 Design corrections found while porting: 148.5 MHz gives p=12 (p0 2 p1 3 p2 2, dco 8910000 kHz), not "p0 2 p1 1 p2 5";
 WM_LINETIME_B for 1080p60 is 119 (DIV_ROUND_CLOSEST(2200*8000/148500)), not 59.
+
+## Evidence (status: FIXED/DELIVERED for the no-monitor half)
+- Host: 82 tests pass in drivers/i915-tests.
+- QEMU regress, no knobs: aarch64 PASS (boots failed 0/1), x86_64 PASS (before merging main with lapdispB; both arches
+  still build after the merge). The i915 knobs are skipped on the fake device.
+- Laptop (trial 87c42c9ed873, `--append "i915.ddb_test=1 i915.pipeb_test=dryrun"`, no monitor, back on good afterwards):
+  - `kms: ddb test: pipe A plane 1A 0x01bd0000 -> 0x01b50000 ([0,438) of A's [0,446)) ...`
+  - `kms: ddb test A [0,446) 10 s underruns 0 (latched true live 0x035b0000), restored 0x01bd0000 (latched true, +0 during restore)`
+  - `pipeb: DPLL1 148500 kHz dco 8910000 kHz p 12 (p0 2 p1 3 p2 2) cfgcr1 0x80400173 cfgcr2 0x000003a5 locked in 268 us, disabled`
+  - `pipeb: dryrun done: DPLL1 locked; power: PW2 refs 0 at end` (DDI_B_IO refs 1 -> 0, bring-up 1-2 us; PW2 stays on: BIOS CTL1 owns it)
+  - full register plan: `grep 'pipeb: plan' klog`; no `underruns [1-9]` line anywhere in the trial klog.
+- Note: the PLL test and the dry-run write DPLL_CTRL1/CFGCR/LCPLL2_CTL only; the DDI mapping (CTRL2), buffer
+  translation, transcoder and plane writes are only logged.
+
+## Left for C2b ([MONITOR]: HDMI monitor on the laptop, ~15 min of the combined ~45 min user session)
+1. Plug an HDMI monitor (the port is DDI-B or DDI-C; try `i915.pipeb_port=1` first). Tell me which jack and the monitor model.
+2. Boot the C2b trial with `i915.extout=1 i915.pipeb_test=hdmi1` (hdmi2 for port C). Expect the klog lines in
+   design-lapdisp2 lane C2 "Expected klog" (DPLL1 lock, buf trans slot 9, `DDB A [0,446) B [446,892)`, `TRANSCONF_B on`,
+   frame counter advancing ~60/s, `kms: underruns` 0 on pipe A).
+3. Look at the monitor: colour bars plus a moving bar for 10 s, then it blanks. Confirm the laptop panel never flickers
+   or tears while that runs. Repeat at 1280x720 (`i915.pipeb_mode=1280x720`) and, if a 4K TV is at hand, once there
+   (it must pick <= 300 MHz).
+4. Unplug the cable while the pattern is up: no hang, and the log still shows the disable sequence finishing and
+   `DDB A [0,892) restored`.
+5. Pass criteria: bars correct on every mode, panel unaffected, 0 underruns on A, no stuck DPLL/power refs
+   (`power: PW2 refs 0`).
+Open design points for C2b: DVI mode only (HDMI mode + AVI infoframe is the follow-up, needed for audio); the hdmi
+level shifter comes from the VBT (`hdmi_level_shifter`, child byte 7) - the dry-run uses Linux's default entry 8.
