@@ -40,6 +40,35 @@ def build_id(path):
             if ty == 3 and name == b"GNU":
                 return d[doff:doff + dsz].hex()
             o = doff + ((dsz + 3) & ~3)
+    return _sym_build_id(d, phoff, phentsize, phnum, shoff, shentsize, shnum)
+
+
+def _sym_build_id(d, phoff, phentsize, phnum, shoff, shentsize, shnum):
+    """Folded layout (aarch64: note lives inside .rodata): read the bytes at __build_id_start,
+    the same place the kernel reads its id at runtime."""
+    if not shoff:
+        return None
+    secs = [struct.unpack_from("<IIQQQQIIQQ", d, shoff + i * shentsize) for i in range(shnum)]
+    st = next((s for s in secs if s[1] == 2), None)
+    if st is None:
+        return None
+    strtab = secs[st[6]]
+    bs = None
+    for i in range(st[5] // 24):
+        nm, info, other, shndx, val, size = struct.unpack_from("<IBBHQQ", d, st[4] + i * 24)
+        o = strtab[4] + nm
+        if shndx and d[o:o + 17] == b"__build_id_start\0":
+            bs = val
+            break
+    if bs is None:
+        return None
+    for i in range(phnum):
+        t, fl, po, va, pa, fs, ms, al = struct.unpack_from("<IIQQQQQQ", d, phoff + i * phentsize)
+        if t == 1 and va <= bs < va + fs:
+            o = po + (bs - va)
+            nsz, dsz, ty = struct.unpack_from("<III", d, o)
+            if ty == 3 and dsz == 20:
+                return d[o + 12 + ((nsz + 3) & ~3):][:dsz].hex()
     return None
 
 
