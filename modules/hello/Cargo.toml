@@ -1,0 +1,13 @@
+[package]
+name = "kmod-hello"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod-rt = { path = "../../lib/kmod-rt" }
+spin = { workspace = true }

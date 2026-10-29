@@ -1,0 +1,6 @@
+# <name> <first_slot> <nslots>  (slot = 256 KiB; slots 1022-1023 are reserved for ktest/testblob)
+# Names are the underscore form of the crate (modules/<dash-name>). Next free: 32.
+hello 0 1
+virtio_rng 4 4
+e1000e 8 16
+uvc 24 8

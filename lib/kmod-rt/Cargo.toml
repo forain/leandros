@@ -1,0 +1,14 @@
+# Runtime for loadable kernel modules (kmod ABI v1): header/id statics, the
+# kmod_init entry, the global allocator, the panic handler and kinfo!/kwarn!/kerr!.
+# Depends only on kmod-abi and spin; see scripts/kmod/kmod-build.sh.
+[package]
+name = "kmod-rt"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[dependencies]
+kmod-abi = { path = "../kmod-abi" }
+kmod-kapi = { path = "../kmod-kapi" }
+spin = { workspace = true }

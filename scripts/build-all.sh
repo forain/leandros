@@ -1168,6 +1168,8 @@ for arch in "${ARCHS[@]}"; do
     if [[ "${KMOD_TEST:-}" == "1" ]]; then
         "$ROOT_DIR/scripts/kmod/testblob.sh" "$arch"
     fi
+    # Rust modules (CONFIG_X=m, $KMOD_EXTRA); a no-op when there is nothing to build.
+    "$ROOT_DIR/scripts/kmod/kmod-build.sh" "$arch"
     create_initrd "$arch"
     create_disk_image "$arch" "$LIMINE_DIR"
     echo "💾 Creating populated F2FS images for $arch..."
