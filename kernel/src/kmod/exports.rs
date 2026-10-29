@@ -113,6 +113,132 @@ pub fn ping_state() -> (u32, u16, u32, u32, usize) {
      PING_ABI.load(Ordering::SeqCst), PING_CMDLEN.load(Ordering::SeqCst))
 }
 
+// ── PCI / memory / entropy exports (L5a) ────────────────────────────────────
+
+use kmod_abi::{KPciDev, KMAP_MMIO, KMAP_WC, KMAP_WRITABLE};
+
+fn unbdf(bdf: u32) -> (u8, u8, u8) { ((bdf >> 16) as u8, (bdf >> 8) as u8, bdf as u8) }
+
+/// Index-th PCI function matching vendor/device (0xffff = any device). 0 ok, -19 none, -22 bad out.
+#[no_mangle]
+pub extern "C" fn kapi_pci_find(vendor: u16, device: u16, index: u32, out: *mut KPciDev) -> i32 {
+    if out.is_null() { return -22; }
+    let hit = drivers::pci::scan().into_iter()
+        .filter(|d| d.vendor_id == vendor && (device == 0xffff || d.device_id == device))
+        .nth(index as usize);
+    match hit {
+        Some(d) => {
+            unsafe {
+                out.write(KPciDev {
+                    bdf: (d.bus as u32) << 16 | (d.dev as u32) << 8 | d.func as u32,
+                    vendor: d.vendor_id,
+                    device: d.device_id,
+                    class: (d.class as u32) << 16 | (d.subclass as u32) << 8 | d.prog_if as u32,
+                    _pad: 0,
+                    bars: d.bars,
+                });
+            }
+            0
+        }
+        None => -19,
+    }
+}
+
+/// Config read of `width` (1, 2 or 4) bytes at `off` (< 256). Bad arguments read as all-ones.
+#[no_mangle]
+pub extern "C" fn kapi_pci_cfg_read(bdf: u32, off: u16, width: u8) -> u32 {
+    let (b, d, f) = unbdf(bdf);
+    if off > 0xff { return u32::MAX; }
+    let o = off as u8;
+    unsafe {
+        match width {
+            1 => drivers::pci::pci_read_config_8(b, d, f, o) as u32,
+            2 => drivers::pci::pci_read_config_16(b, d, f, o) as u32,
+            4 => drivers::pci::pci_read_config_32(b, d, f, o),
+            _ => u32::MAX,
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kapi_pci_cfg_write(bdf: u32, off: u16, width: u8, val: u32) {
+    let (b, d, f) = unbdf(bdf);
+    if off > 0xff { return; }
+    let o = off as u8;
+    unsafe {
+        match width {
+            1 => drivers::pci::pci_write_config_8(b, d, f, o, val as u8),
+            2 => drivers::pci::pci_write_config_16(b, d, f, o, val as u16),
+            4 => drivers::pci::pci_write_config_32(b, d, f, o, val),
+            _ => {}
+        }
+    }
+}
+
+/// Map device memory into the kernel. Only KMAP_* are honoured: the mapping is always
+/// kernel-only and non-executable. Returns 0 on failure (the caller falls back itself).
+#[no_mangle]
+pub extern "C" fn kapi_map_device(phys: u64, len: usize, flags: u32) -> usize {
+    use mm::paging::{map_kernel_device, PageFlags};
+    if len == 0 { return 0; }
+    let mut f = PageFlags::PRESENT;
+    if flags & KMAP_WRITABLE != 0 { f |= PageFlags::WRITABLE; }
+    if flags & KMAP_MMIO != 0 { f |= PageFlags::MMIO; }
+    if flags & KMAP_WC != 0 { f |= PageFlags::WRITECOMBINE; }
+    unsafe { map_kernel_device(phys as usize, len, f).unwrap_or(0) }
+}
+
+#[no_mangle]
+pub extern "C" fn kapi_phys_to_virt(phys: u64) -> usize { mm::phys_to_virt(phys as usize) }
+
+/// 2^order pages. `below` is an exclusive physical ceiling (0 = any); the block ends at or below it.
+#[no_mangle]
+pub extern "C" fn kapi_page_alloc(order: u32, below: u64) -> u64 {
+    if order > 10 { return 0; }
+    let r = if below == 0 { mm::buddy::alloc(order as usize) }
+            else { mm::buddy::alloc_below(order as usize, below as usize) };
+    r.map_or(0, |p| p as u64)
+}
+
+#[no_mangle]
+pub extern "C" fn kapi_page_free(phys: u64, order: u32) {
+    if phys != 0 && order <= 10 { mm::buddy::free(phys as usize, order as usize); }
+}
+
+const HW_SLOTS: usize = 4;
+static HW_READ: [AtomicUsize; HW_SLOTS] = [const { AtomicUsize::new(0) }; HW_SLOTS];
+static HW_USED: AtomicUsize = AtomicUsize::new(0);
+
+fn hw_tramp<const N: usize>(out: &mut [u8]) -> usize {
+    let p = HW_READ[N].load(Ordering::Acquire);
+    if p == 0 { return 0; }
+    let f: extern "C" fn(*mut u8, usize) -> usize = unsafe { core::mem::transmute(p) };
+    f(out.as_mut_ptr(), out.len()).min(out.len())
+}
+
+/// Register a module entropy source and reseed the CSPRNG at once so it contributes
+/// immediately. 0 ok, -12 no free slot (MAX 4), -22 bad name.
+#[no_mangle]
+pub extern "C" fn kapi_hwrng_register(owner: KmodId, name: *const u8, len: usize,
+                                      read: extern "C" fn(*mut u8, usize) -> usize) -> i32 {
+    let nm = match core::str::from_utf8(unsafe { bytes(name, len.min(32)) }) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return -22,
+    };
+    let i = HW_USED.fetch_add(1, Ordering::SeqCst);
+    if i >= HW_SLOTS { HW_USED.store(HW_SLOTS, Ordering::SeqCst); return -12; }
+    // Modules are permanent, so the name bytes live as long as the kernel.
+    let nm: &'static str = unsafe { core::mem::transmute::<&str, &'static str>(nm) };
+    HW_READ[i].store(read as usize, Ordering::Release);
+    let tramp: sched::random::SourceFn = match i {
+        0 => hw_tramp::<0>, 1 => hw_tramp::<1>, 2 => hw_tramp::<2>, _ => hw_tramp::<3>,
+    };
+    sched::random::register_source(nm, tramp);
+    super::registry::note_registration(owner, RegKind::HWRNG, i as u64);
+    sched::random::reseed_now();
+    0
+}
+
 // Compile-time signature check against kmod_abi::sys.
 const _: sys::AbiVersionFn = kapi_abi_version;
 const _: sys::LogFn = kapi_log;
@@ -128,6 +254,14 @@ const _: sys::SpinHeldFn = kapi_spin_held;
 const _: sys::SpinHeldCountFn = kapi_spin_held_count;
 const _: sys::KthreadSpawnFn = kapi_kthread_spawn;
 const _: sys::KtestPingFn = kapi_ktest_ping;
+const _: sys::PciFindFn = kapi_pci_find;
+const _: sys::PciCfgReadFn = kapi_pci_cfg_read;
+const _: sys::PciCfgWriteFn = kapi_pci_cfg_write;
+const _: sys::MapDeviceFn = kapi_map_device;
+const _: sys::PhysToVirtFn = kapi_phys_to_virt;
+const _: sys::PageAllocFn = kapi_page_alloc;
+const _: sys::PageFreeFn = kapi_page_free;
+const _: sys::HwrngRegisterFn = kapi_hwrng_register;
 const _: () = {
     assert!(mm::kmodwin::BASE as u64 == kmod_abi::layout::BASE);
     assert!(mm::kmodwin::SIZE as u64 == kmod_abi::layout::SIZE);
@@ -135,7 +269,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 14;
+pub const NEXPORTS: usize = 22;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -154,6 +288,14 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_spin_held_count", kapi_spin_held_count),
     sym!("kapi_kthread_spawn", kapi_kthread_spawn),
     sym!("kapi_ktest_ping", kapi_ktest_ping),
+    sym!("kapi_pci_find", kapi_pci_find),
+    sym!("kapi_pci_cfg_read", kapi_pci_cfg_read),
+    sym!("kapi_pci_cfg_write", kapi_pci_cfg_write),
+    sym!("kapi_map_device", kapi_map_device),
+    sym!("kapi_phys_to_virt", kapi_phys_to_virt),
+    sym!("kapi_page_alloc", kapi_page_alloc),
+    sym!("kapi_page_free", kapi_page_free),
+    sym!("kapi_hwrng_register", kapi_hwrng_register),
 ];
 
 extern "C" {

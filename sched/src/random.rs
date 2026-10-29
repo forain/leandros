@@ -469,6 +469,23 @@ pub fn init() {
     }
 }
 
+/// Mix fresh material (including every registered external source) into the
+/// key now. Used when a source registers after the boot seed was taken, so a
+/// late device contributes at once instead of at the next timed reseed.
+pub fn reseed_now() {
+    if RNG.lock().is_none() { init(); return; }
+    let Some(_gl) = GATHER.try_lock() else { return };
+    let gathered = gather_locked(RESEED_HW_WORDS, RESEED_JITTER, RESEED_EXT_BYTES);
+    let mut g = RNG.lock();
+    if let Some(st) = g.as_mut() {
+        st.key = mix(Some(&st.key), None, &gathered);
+        st.since_reseed = 0;
+        st.last_reseed_ns = super::monotonic_ns();
+    }
+    drop(g);
+    log_sources("[RANDOM] reseeded (late source) from:", &gathered, None, RESEED_JITTER);
+}
+
 fn log_sources(prefix: &str, g: &Gathered, boot: Option<(&str, usize)>, jitter: usize) {
     let mut strong = false;
     log(prefix);
