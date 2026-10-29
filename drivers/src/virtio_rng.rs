@@ -31,7 +31,9 @@
 #[allow(unused_imports)]
 use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
-use crate::pci::{PciDevice, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
+// Kernel APIs come through `kenv` so the same source builds as a module (kmod-kapi shim).
+use crate::kenv::{mm, sched, pci};
+use pci::{PciDevice, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
 
 const VIRTIO_PCI_VENDOR: u16 = 0x1af4;
 const VIRTIO_PCI_DEVICE_RNG_MODERN: u16 = 0x1044; // 0x1040 + device type 4
@@ -109,7 +111,7 @@ impl VirtioRng {
         // and never reads ISR status (see PCI_CMD_INTX_DISABLE).
         let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
         pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04,
-            (cmd | 0x0006) | crate::pci::PCI_CMD_INTX_DISABLE);
+            (cmd | 0x0006) | pci::PCI_CMD_INTX_DISABLE);
 
         let mut common: *mut VirtioPciCommonCfg = core::ptr::null_mut();
         let mut notify_base: usize = 0;
@@ -143,7 +145,7 @@ impl VirtioRng {
             cap = pci_read_config_8(pci.bus, pci.dev, pci.func, cap + 1);
         }
         if common.is_null() || notify_base == 0 {
-            crate::pci::serial_debug("[RNG] virtio-rng: missing modern capabilities\n");
+            pci::serial_debug("[RNG] virtio-rng: missing modern capabilities\n");
             return None;
         }
 
@@ -163,7 +165,7 @@ impl VirtioRng {
         ds.mmio_write(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
         if ds.mmio_read() & VIRTIO_STATUS_FEATURES_OK == 0 {
             ds.mmio_write(VIRTIO_STATUS_FAILED);
-            crate::pci::serial_debug("[RNG] virtio-rng: FEATURES_OK refused\n");
+            pci::serial_debug("[RNG] virtio-rng: FEATURES_OK refused\n");
             return None;
         }
 
@@ -291,18 +293,18 @@ pub fn read(out: &mut [u8]) -> usize {
 /// without the device (or without PCI).
 pub fn init() {
     if DEVICE.lock().is_some() { return; }
-    let pci = crate::pci::find_device(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_RNG_MODERN)
-        .or_else(|| crate::pci::find_device(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_RNG_LEGACY));
+    let pci = pci::find_device(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_RNG_MODERN)
+        .or_else(|| pci::find_device(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_RNG_LEGACY));
     let Some(pci) = pci else {
-        crate::pci::serial_debug("[RNG] no virtio-rng device\n");
+        pci::serial_debug("[RNG] no virtio-rng device\n");
         return;
     };
     match unsafe { VirtioRng::probe(pci) } {
         Some(d) => {
             *DEVICE.lock() = Some(d);
-            crate::pci::serial_debug("[RNG] virtio-rng bound\n");
+            pci::serial_debug("[RNG] virtio-rng bound\n");
             sched::random::register_source("virtio-rng", read);
         }
-        None => crate::pci::serial_debug("[RNG] virtio-rng probe failed\n"),
+        None => pci::serial_debug("[RNG] virtio-rng probe failed\n"),
     }
 }

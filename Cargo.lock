@@ -281,10 +281,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-kapi"
+version = "0.1.0"
+dependencies = [
+ "kmod-abi",
+]
+
+[[package]]
 name = "kmod-rt"
 version = "0.1.0"
 dependencies = [
  "kmod-abi",
+ "kmod-kapi",
  "spin",
 ]
 

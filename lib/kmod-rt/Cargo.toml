@@ -10,4 +10,5 @@ publish = false
 
 [dependencies]
 kmod-abi = { path = "../kmod-abi" }
+kmod-kapi = { path = "../kmod-kapi" }
 spin = { workspace = true }

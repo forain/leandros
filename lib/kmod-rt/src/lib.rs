@@ -76,6 +76,7 @@ pub fn __enter(ctx: *const KmodCtx, init: fn() -> i32) -> i32 {
         return EINVAL;
     }
     OWNER.store(c.owner.0, Ordering::Relaxed);
+    kmod_kapi::set_owner(c.owner);
     // This copy of `spin` has its own (unset) hook; forward it to the kernel's accounting.
     spin::held::set_hook(|acq| unsafe { sys::kapi_spin_held(acq) });
     init()

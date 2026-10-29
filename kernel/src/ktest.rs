@@ -21,7 +21,7 @@ use sched::{irqctx, kthread};
 
 const ALL: [&str; 11] = ["irqctx", "sync", "kthread", "workqueue", "hrtimer", "atomicpool", "kva", "pci", "msi", "firmware", "gpulock"];
 /// Opt-in only (not in `all`): a timing report, not a pass/fail facility test.
-const EXTRA: [&str; 3] = ["memperf", "kmodwin", "kmodload"];
+const EXTRA: [&str; 4] = ["memperf", "kmodwin", "kmodload", "kmodkapi"];
 
 /// UART only (`arch_serial_putc`), never the framebuffer console: a console
 /// print flushes the framebuffer through virtio-gpu, and a test thread
@@ -78,6 +78,7 @@ fn run(names: Vec<&'static str>, fw: Option<String>) {
             "memperf" => t_memperf(),
             "kmodwin" => t_kmodwin(),
             "kmodload" => t_kmodload(),
+            "kmodkapi" => t_kmodkapi(),
             "pci" => t_pci(),
             "msi" => t_msi(),
             "firmware" => t_firmware(fw.as_deref()),
@@ -549,6 +550,94 @@ fn t_kmodwin() -> T {
     t.check(kmodwin::reserve(base, kmodwin::SLOT_ALIGN), "slot reusable after release");
     kmodwin::release(base, kmodwin::SLOT_ALIGN);
     mm::buddy::free(rw, 0); mm::buddy::free(rx, 0);
+    t
+}
+
+static KAPI_RNG_CALLS: AtomicU32 = AtomicU32::new(0);
+extern "C" fn kapi_fake_rng(p: *mut u8, n: usize) -> usize {
+    KAPI_RNG_CALLS.fetch_add(1, Ordering::SeqCst);
+    let n = n.min(8);
+    for i in 0..n { unsafe { p.add(i).write(0xa5); } }
+    n
+}
+
+/// L5a: the PCI / memory / entropy kapi exports, called through the KSYMTAB addresses
+/// (exactly what a module's relocations resolve to).
+fn t_kmodkapi() -> T {
+    use crate::kmod::{exports, registry};
+    use kmod_abi::{sys, KPciDev, KmodId, RegKind, KMAP_MMIO, KMAP_WRITABLE};
+    let mut t = T::new("kmodkapi");
+    macro_rules! sym { ($n:literal, $ty:ty) => {{
+        let a = exports::lookup($n);
+        t.check(a.is_some(), concat!($n, " in KSYMTAB"));
+        match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
+    }}; }
+    t.check(exports::ksymtab().len() == 22 && exports::NEXPORTS == 22, "ksymtab has 22 exports");
+    let find = sym!("kapi_pci_find", sys::PciFindFn);
+    let rd = sym!("kapi_pci_cfg_read", sys::PciCfgReadFn);
+    let wr = sym!("kapi_pci_cfg_write", sys::PciCfgWriteFn);
+    let map = sym!("kapi_map_device", sys::MapDeviceFn);
+    let p2v = sym!("kapi_phys_to_virt", sys::PhysToVirtFn);
+    let pa = sym!("kapi_page_alloc", sys::PageAllocFn);
+    let pf = sym!("kapi_page_free", sys::PageFreeFn);
+    let hw = sym!("kapi_hwrng_register", sys::HwrngRegisterFn);
+    let (Some(find), Some(rd), Some(wr), Some(map), Some(p2v), Some(pa), Some(pf), Some(hw)) =
+        (find, rd, wr, map, p2v, pa, pf, hw) else { return t };
+
+    unsafe {
+        // PCI: virtio-rng (QEMU provides it on the default machine); any 1af4 device otherwise.
+        let mut d = KPciDev::default();
+        let mut rc = find(0x1af4, 0x1044, 0, &mut d);
+        if rc != 0 { rc = find(0x1af4, 0xffff, 0, &mut d); }
+        t.check(find(0x1af4, 0x1044, 0, core::ptr::null_mut()) == -22, "pci_find null out -> -22");
+        let mut none = KPciDev::default();
+        t.check(find(0xdead, 0xbeef, 0, &mut none) == -19, "pci_find no match -> -19");
+        if rc == 0 {
+            t.check(d.vendor == 0x1af4, "pci_find vendor");
+            t.check(rd(d.bdf, 0, 2) == 0x1af4, "cfg_read vendor via bdf (16-bit)");
+            t.check(rd(d.bdf, 0, 4) == (d.device as u32) << 16 | 0x1af4, "cfg_read id dword (32-bit)");
+            t.check(rd(d.bdf, 0, 1) == 0xf4, "cfg_read byte");
+            t.check(rd(d.bdf, 0, 3) == u32::MAX && rd(d.bdf, 0x100, 2) == u32::MAX, "bad width / offset -> all ones");
+            let cmd = rd(d.bdf, 4, 2);
+            wr(d.bdf, 4, 2, cmd); // write-back of the same value must be harmless
+            t.check(rd(d.bdf, 4, 2) == cmd, "cfg_write command round trip");
+            let bar = d.bars.iter().copied().find(|b| *b != 0 && b & 1 == 0);
+            if let Some(b) = bar {
+                let phys = (b & !0xf) as u64;
+                let v = map(phys, 0x1000, KMAP_WRITABLE | KMAP_MMIO);
+                t.check(v == 0 || v == p2v(phys), "map_device returns the HHDM alias or 0");
+            } else { say!("kmodkapi: no 32-bit memory BAR on the device, map_device skipped"); }
+        } else { t.skip("no 1af4 PCI device in this VM"); }
+        t.check(map(0x1000, 0, KMAP_WRITABLE) == 0, "map_device len 0 -> 0");
+
+        // Pages
+        let p = pa(0, 1 << 32);
+        t.check(p != 0 && p < (1 << 32) && p & 0xfff == 0, "page_alloc(0, below 4G) < 4G");
+        if p != 0 {
+            let v = p2v(p) as *mut u32;
+            v.write_volatile(0x5eed_1234);
+            t.check(v.read_volatile() == 0x5eed_1234, "page_alloc page is writable through phys_to_virt");
+            pf(p, 0);
+        }
+        let q = pa(0, 0);
+        t.check(q != 0, "page_alloc(0, any)");
+        if q != 0 { pf(q, 0); }
+        t.check(pa(11, 0) == 0, "page_alloc order 11 refused");
+
+        // Hardware RNG registration reseeds at once.
+        let owner = KmodId(60001);
+        let name = b"ktest-hwrng";
+        KAPI_RNG_CALLS.store(0, Ordering::SeqCst);
+        t.check(hw(owner, core::ptr::null(), 0, kapi_fake_rng) == -22, "hwrng_register empty name -> -22");
+        let r = hw(owner, name.as_ptr(), name.len(), kapi_fake_rng);
+        t.check(r == 0, "hwrng_register ok");
+        let mut c = KAPI_RNG_CALLS.load(Ordering::SeqCst);
+        if c == 0 { sched::random::reseed_now(); c = KAPI_RNG_CALLS.load(Ordering::SeqCst); }
+        t.check(c >= 1, &format!("late source was read by the reseed (calls {})", c));
+        let mut seen = false;
+        registry::registrations(owner, &mut |k, _| if k == RegKind::HWRNG { seen = true });
+        t.check(seen, "HWRNG registration recorded for the owner");
+    }
     t
 }
 

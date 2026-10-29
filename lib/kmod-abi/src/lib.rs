@@ -86,16 +86,10 @@ impl RegKind {
     pub const PCI: RegKind = RegKind(7);
 }
 
-/// Every id-table entry starts with a `u16 bus` discriminator.
-pub const BUS_PCI: u16 = 1;
-pub const BUS_USB: u16 = 2;
-pub const BUS_OF: u16 = 3;
-pub const BUS_ACPI: u16 = 4;
-
-/// One id-table entry (`header.ids`), 16 bytes. PCI: a=vendor, b=device (0xffff = any).
-/// USB: a=vid, b=pid (0xffff = any), class = class<<16|sub<<8|proto under class_mask.
+/// Device-id table entry (`.kmod.ids`), 16 bytes. PCI: a=vendor, b=device (0xffff = any).
+/// USB: a=vid, b=pid (0xffff = any), class = class<<16|sub<<8|proto under `class_mask`.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KmodDevId {
     pub bus: u16,
     pub a: u16,
@@ -104,6 +98,30 @@ pub struct KmodDevId {
     pub class: u32,
     pub class_mask: u32,
 }
+
+/// PCI device record returned by `kapi_pci_find` (40 bytes: the plan said 48, but the listed fields sum to 40). `bdf` = bus<<16|dev<<8|func,
+/// `class` = class<<16|subclass<<8|prog_if.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KPciDev {
+    pub bdf: u32,
+    pub vendor: u16,
+    pub device: u16,
+    pub class: u32,
+    pub _pad: u32,
+    pub bars: [u32; 6],
+}
+
+/// `kapi_map_device` flags. Never executable, never user.
+pub const KMAP_WRITABLE: u32 = 1;
+pub const KMAP_MMIO: u32 = 2;
+pub const KMAP_WC: u32 = 4;
+
+/// Every id-table entry starts with a `u16 bus` discriminator.
+pub const BUS_PCI: u16 = 1;
+pub const BUS_USB: u16 = 2;
+pub const BUS_OF: u16 = 3;
+pub const BUS_ACPI: u16 = 4;
 
 /// Export-table entry; `name` is NUL-terminated.
 #[repr(C)]
@@ -132,6 +150,15 @@ pub mod sys {
     pub type KthreadSpawnFn =
         unsafe extern "C" fn(*const u8, usize, extern "C" fn(*mut u8), *mut u8, KmodId) -> i64;
     pub type KtestPingFn = unsafe extern "C" fn(*const KmodCtx) -> i32;
+    pub type PciFindFn = unsafe extern "C" fn(u16, u16, u32, *mut super::KPciDev) -> i32;
+    pub type PciCfgReadFn = unsafe extern "C" fn(u32, u16, u8) -> u32;
+    pub type PciCfgWriteFn = unsafe extern "C" fn(u32, u16, u8, u32);
+    pub type MapDeviceFn = unsafe extern "C" fn(u64, usize, u32) -> usize;
+    pub type PhysToVirtFn = unsafe extern "C" fn(u64) -> usize;
+    pub type PageAllocFn = unsafe extern "C" fn(u32, u64) -> u64;
+    pub type PageFreeFn = unsafe extern "C" fn(u64, u32);
+    pub type HwrngRegisterFn =
+        unsafe extern "C" fn(KmodId, *const u8, usize, extern "C" fn(*mut u8, usize) -> usize) -> i32;
 
     extern "C" {
         pub fn kapi_abi_version() -> u32;
@@ -149,6 +176,15 @@ pub mod sys {
         pub fn kapi_kthread_spawn(name: *const u8, name_len: usize, f: extern "C" fn(*mut u8),
                                   arg: *mut u8, owner: KmodId) -> i64;
         pub fn kapi_ktest_ping(ctx: *const KmodCtx) -> i32;
+        pub fn kapi_pci_find(vendor: u16, device: u16, index: u32, out: *mut super::KPciDev) -> i32;
+        pub fn kapi_pci_cfg_read(bdf: u32, off: u16, width: u8) -> u32;
+        pub fn kapi_pci_cfg_write(bdf: u32, off: u16, width: u8, val: u32);
+        pub fn kapi_map_device(phys: u64, len: usize, flags: u32) -> usize;
+        pub fn kapi_phys_to_virt(phys: u64) -> usize;
+        pub fn kapi_page_alloc(order: u32, below: u64) -> u64;
+        pub fn kapi_page_free(phys: u64, order: u32);
+        pub fn kapi_hwrng_register(owner: KmodId, name: *const u8, len: usize,
+                                   read: extern "C" fn(*mut u8, usize) -> usize) -> i32;
     }
 }
 
@@ -227,6 +263,7 @@ const _: () = {
     assert!(core::mem::offset_of!(KmodCtx, params) == 32);
     assert!(core::mem::offset_of!(KmodCtx, params_len) == 40);
     assert!(core::mem::size_of::<RegKind>() == 2);
+    assert!(core::mem::size_of::<KPciDev>() == 40);
     assert!(layout::TEST_SLOT_OFF == layout::SIZE - 2 * layout::SLOT_ALIGN);
     assert!(layout::TEST_SLOT_OFF == 0x0ff8_0000);
     assert!(layout::x86_64::BASE % layout::SLOT_ALIGN == 0);

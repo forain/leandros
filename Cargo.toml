@@ -29,6 +29,7 @@ members = [
     "scripts/kmod/fixtures/badsym",
     "scripts/kmod/fixtures/baddep",
     "scripts/kmod/fixtures/badsimd",
+    "lib/kmod-kapi",
     "arch/x86_64",
     "arch/aarch64",
 ]
