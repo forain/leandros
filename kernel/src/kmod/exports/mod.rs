@@ -79,6 +79,32 @@ const _: sys::SleepUntilFn = kapi_sleep_until;
 const _: sys::YieldFn = kapi_yield;
 const _: sys::CanSleepFn = kapi_irqs_masked;
 const _: sys::CurrentPidFn = kapi_current_pid;
+const _: sys::IoremapFn = kapi_ioremap;
+const _: sys::IounmapFn = kapi_iounmap;
+const _: sys::DmaSyncFn = kapi_dma_sync;
+const _: sys::CanSleepFn = kapi_dma_coherent;
+const _: sys::MutexNewFn = kapi_mutex_new;
+const _: sys::WaitNotifyFn = kapi_mutex_lock;
+const _: sys::WaitNotifyFn = kapi_mutex_unlock;
+const _: sys::SemNewFn = kapi_sem_new;
+const _: sys::WaitTimeoutFn = kapi_sem_down_timeout;
+const _: sys::WaitNotifyFn = kapi_sem_up;
+const _: sys::HrtimerNewFn = kapi_hrtimer_new;
+const _: sys::HrtimerArmFn = kapi_hrtimer_arm;
+const _: sys::WaitNotifyFn = kapi_hrtimer_cancel;
+const _: sys::NetdevKickFn = kapi_preempt_disable;
+const _: sys::NetdevKickFn = kapi_preempt_enable;
+const _: sys::RandomFillFn = kapi_random_fill;
+const _: sys::CopyFromUserFn = kapi_copy_from_user;
+const _: sys::CopyToUserFn = kapi_copy_to_user;
+const _: sys::PciScanFn = kapi_pci_scan;
+const _: sys::IrqRequestMsixFn = kapi_irq_request_msix;
+const _: sys::CanSleepFn = kapi_fw_root_ready;
+const _: sys::FwRequestFn = kapi_fw_request;
+const _: sys::WaitNotifyFn = kapi_fw_release;
+const _: sys::SecretPeekFn = kapi_secret_peek;
+const _: sys::ExtEventStatsFn = kapi_ext_event_stats;
+const _: sys::ProcPrimeFn = kapi_proc_prime;
 const _: sys::V4l2RegisterFn = kapi_v4l2_register;
 const _: sys::TickRegisterFn = kapi_tick_register;
 const _: sys::UsbClassRegisterFn = kapi_usb_class_register;
@@ -97,7 +123,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 51;
+pub const NEXPORTS: usize = 77;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -142,6 +168,32 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_yield", kapi_yield),
     sym!("kapi_irqs_masked", kapi_irqs_masked),
     sym!("kapi_current_pid", kapi_current_pid),
+    sym!("kapi_ioremap", kapi_ioremap),
+    sym!("kapi_iounmap", kapi_iounmap),
+    sym!("kapi_dma_sync", kapi_dma_sync),
+    sym!("kapi_dma_coherent", kapi_dma_coherent),
+    sym!("kapi_mutex_new", kapi_mutex_new),
+    sym!("kapi_mutex_lock", kapi_mutex_lock),
+    sym!("kapi_mutex_unlock", kapi_mutex_unlock),
+    sym!("kapi_sem_new", kapi_sem_new),
+    sym!("kapi_sem_down_timeout", kapi_sem_down_timeout),
+    sym!("kapi_sem_up", kapi_sem_up),
+    sym!("kapi_hrtimer_new", kapi_hrtimer_new),
+    sym!("kapi_hrtimer_arm", kapi_hrtimer_arm),
+    sym!("kapi_hrtimer_cancel", kapi_hrtimer_cancel),
+    sym!("kapi_preempt_disable", kapi_preempt_disable),
+    sym!("kapi_preempt_enable", kapi_preempt_enable),
+    sym!("kapi_random_fill", kapi_random_fill),
+    sym!("kapi_copy_from_user", kapi_copy_from_user),
+    sym!("kapi_copy_to_user", kapi_copy_to_user),
+    sym!("kapi_pci_scan", kapi_pci_scan),
+    sym!("kapi_irq_request_msix", kapi_irq_request_msix),
+    sym!("kapi_fw_root_ready", kapi_fw_root_ready),
+    sym!("kapi_fw_request", kapi_fw_request),
+    sym!("kapi_fw_release", kapi_fw_release),
+    sym!("kapi_secret_peek", kapi_secret_peek),
+    sym!("kapi_ext_event_stats", kapi_ext_event_stats),
+    sym!("kapi_proc_prime", kapi_proc_prime),
     sym!("kapi_v4l2_register", kapi_v4l2_register),
     sym!("kapi_tick_register", kapi_tick_register),
     sym!("kapi_usb_class_register", kapi_usb_class_register),

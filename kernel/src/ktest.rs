@@ -572,7 +572,7 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 51 && exports::NEXPORTS == 51, "ksymtab has 51 exports");
+    t.check(exports::ksymtab().len() == 77 && exports::NEXPORTS == 77, "ksymtab has 77 exports");
     let find = sym!("kapi_pci_find", sys::PciFindFn);
     let rd = sym!("kapi_pci_cfg_read", sys::PciCfgReadFn);
     let wr = sym!("kapi_pci_cfg_write", sys::PciCfgWriteFn);
@@ -665,6 +665,8 @@ extern "C" fn kt_pm_err(_c: usize, b: *mut u8, cap: usize) -> i32 { -(kt_put("pm
 /// L6a: PCI enable/caps, IRQ errors, wait queue, late netdev registration, pm hooks.
 static KT_TICKS: AtomicUsize = AtomicUsize::new(0);
 extern "C" fn kt_tick(ctx: usize) { KT_TICKS.fetch_add(ctx, Ordering::SeqCst); }
+static KT_W2_TICKS: AtomicUsize = AtomicUsize::new(0);
+extern "C" fn kt_w2_tick(ctx: usize) { KT_W2_TICKS.fetch_add(ctx, Ordering::SeqCst); }
 extern "C" fn kt_probe_no(_i: *const kmod_abi::KUsbIf, _ctx: usize) -> i32 { 1 }
 extern "C" fn kt_cinfo(_c: usize, o: *mut kmod_abi::KCamInfo) -> i32 {
     unsafe { *o = kmod_abi::KCamInfo { bcd: 0x0110, slot: 200, nformats: 1 }; } 0
@@ -703,13 +705,13 @@ fn kmodkapi_w2(t: &mut T) {
         // tick: a failed init must take its callback back and leave no record.
         let treg: sys::TickRegisterFn = core::mem::transmute(exports::lookup("kapi_tick_register").unwrap());
         let tc = usb::class::tick_count();
-        t.check(treg(owner, kt_tick, 5) == 0, "w2: tick_register ok");
+        t.check(treg(owner, kt_w2_tick, 5) == 0, "w2: tick_register ok");
         t.check(registry::reg_count(owner) == 1, "w2: tick registration recorded");
         t.check(registry::release_all(owner), "w2: failed init releases a tick callback");
         t.check(usb::class::tick_count() == tc && registry::reg_count(owner) == 0, "w2: tick callback gone, record gone");
-        let b = KT_TICKS.load(Ordering::SeqCst);
+        let b = KT_W2_TICKS.load(Ordering::SeqCst);
         usb::class::tick();
-        t.check(KT_TICKS.load(Ordering::SeqCst) == b, "w2: released tick callback no longer runs");
+        t.check(KT_W2_TICKS.load(Ordering::SeqCst) == b, "w2: released tick callback no longer runs");
 
         // pm: two owners can register (a list), each removed on its own failed init.
         let preg: sys::PmRegisterFn = core::mem::transmute(exports::lookup("kapi_pm_register").unwrap());
@@ -751,6 +753,56 @@ fn kmodkapi_w2(t: &mut T) {
         let page = mm::phys_to_virt(0x1000);
         t.check(v2p(page) == 0x1000, "w2: virt_to_phys of an HHDM address");
         let _ = &PROBE;
+    }
+    // W2-1 session 2: the remaining common exports (bad arguments and a few real round trips).
+    unsafe {
+        let f = |n: &str| exports::lookup(n).unwrap_or_else(|| { say!("missing export {}", n); 0 });
+        t.check(f("kapi_ioremap") != 0 && f("kapi_proc_prime") != 0, "w2b: exports present");
+        let ior: sys::IoremapFn = core::mem::transmute(f("kapi_ioremap"));
+        t.check(ior(0xfee0_0000, 0, 0) == 0 && ior(0xfee0_0000, 4096, 9) == 0, "w2b: ioremap zero len / bad cache refused");
+        let mnew: sys::MutexNewFn = core::mem::transmute(f("kapi_mutex_new"));
+        let mlock: sys::WaitNotifyFn = core::mem::transmute(f("kapi_mutex_lock"));
+        let munlock: sys::WaitNotifyFn = core::mem::transmute(f("kapi_mutex_unlock"));
+        mlock(0); munlock(0);
+        let m = mnew(b"kt".as_ptr(), 2);
+        t.check(m != 0, "w2b: mutex_new");
+        mlock(m); munlock(m);
+        let snew: sys::SemNewFn = core::mem::transmute(f("kapi_sem_new"));
+        let sdown: sys::WaitTimeoutFn = core::mem::transmute(f("kapi_sem_down_timeout"));
+        let sup: sys::WaitNotifyFn = core::mem::transmute(f("kapi_sem_up"));
+        t.check(!sdown(0, 1000), "w2b: sem_down_timeout on a null handle is false");
+        let sm = snew(1);
+        t.check(sdown(sm, 0) && !sdown(sm, 1000), "w2b: sem takes its one permit then times out");
+        sup(sm);
+        t.check(sdown(sm, 0), "w2b: sem_up gives the permit back");
+        let hnew: sys::HrtimerNewFn = core::mem::transmute(f("kapi_hrtimer_new"));
+        t.check(hnew(None, 0, true) == 0, "w2b: hrtimer_new null callback refused");
+        let rf: sys::RandomFillFn = core::mem::transmute(f("kapi_random_fill"));
+        rf(core::ptr::null_mut(), 8);
+        let mut rb = [0u8; 32];
+        rf(rb.as_mut_ptr(), 32);
+        t.check(rb.iter().any(|b| *b != 0), "w2b: random_fill fills");
+        let cfu: sys::CopyFromUserFn = core::mem::transmute(f("kapi_copy_from_user"));
+        let ctu: sys::CopyToUserFn = core::mem::transmute(f("kapi_copy_to_user"));
+        t.check(cfu(core::ptr::null_mut(), 0x1000, 4) == -22 && ctu(0x1000, core::ptr::null(), 4) == -22, "w2b: copy_user null kernel side is -EINVAL");
+        t.check(cfu(rb.as_mut_ptr(), usize::MAX - 8, 16) == -14 && ctu(0, rb.as_ptr(), 4) == -14, "w2b: copy_user bad user range is -EFAULT");
+        let scan: sys::PciScanFn = core::mem::transmute(f("kapi_pci_scan"));
+        let mut d = core::mem::zeroed::<kmod_abi::KPciDev>();
+        t.check(scan(0, core::ptr::null_mut()) == -22 && scan(u32::MAX, &mut d) == -19, "w2b: pci_scan bad out / past the end");
+        let msix: sys::IrqRequestMsixFn = core::mem::transmute(f("kapi_irq_request_msix"));
+        extern "C" fn nop(_: usize) -> u32 { 0 }
+        t.check(msix(KmodId(60011), 0x00ff_0000, 0, nop, 0) < 0, "w2b: irq_request_msix on a missing device fails");
+        let fwr: sys::FwRequestFn = core::mem::transmute(f("kapi_fw_request"));
+        let (mut n, mut p) = (0usize, core::ptr::null::<u8>());
+        t.check(fwr(core::ptr::null(), 0, 0, &mut n, &mut p) == 0 && fwr(b"x".as_ptr(), 1, 0, core::ptr::null_mut(), &mut p) == 0, "w2b: fw_request bad args");
+        let sp: sys::SecretPeekFn = core::mem::transmute(f("kapi_secret_peek"));
+        let mut sb = [0u8; 8];
+        t.check(sp(KmodId(60012), b"wifi".as_ptr(), 4, sb.as_mut_ptr(), 8) == -1, "w2b: secret_peek refused without a netdev registration");
+        let ees: sys::ExtEventStatsFn = core::mem::transmute(f("kapi_ext_event_stats"));
+        let mut o = [0u64; 2];
+        t.check(ees(core::ptr::null_mut()) == -22 && ees(o.as_mut_ptr()) == 0, "w2b: ext_event_stats");
+        let pp: sys::ProcPrimeFn = core::mem::transmute(f("kapi_proc_prime"));
+        t.check(pp(core::ptr::null_mut(), 8) == -22 && pp(sb.as_mut_ptr(), 0) <= 0, "w2b: proc_prime bad args");
     }
     // pm2: suspend order is INPUT, GPU, NET, BLOCK, USB, PCI.
     let steps = crate::pm2::suspend_steps();

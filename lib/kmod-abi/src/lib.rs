@@ -367,6 +367,22 @@ pub mod sys {
     pub type CanSleepFn = unsafe extern "C" fn() -> bool;
     pub type SleepUntilFn = unsafe extern "C" fn(u64);
     pub type YieldFn = unsafe extern "C" fn();
+    pub type IoremapFn = unsafe extern "C" fn(u64, usize, u32) -> usize;
+    pub type IounmapFn = unsafe extern "C" fn(usize, usize);
+    pub type DmaSyncFn = unsafe extern "C" fn(usize, usize, u32);
+    pub type MutexNewFn = unsafe extern "C" fn(*const u8, usize) -> usize;
+    pub type SemNewFn = unsafe extern "C" fn(u32) -> usize;
+    pub type HrtimerNewFn = unsafe extern "C" fn(Option<extern "C" fn(usize)>, usize, bool) -> usize;
+    pub type HrtimerArmFn = unsafe extern "C" fn(usize, u64);
+    pub type RandomFillFn = unsafe extern "C" fn(*mut u8, usize);
+    pub type CopyFromUserFn = unsafe extern "C" fn(*mut u8, usize, usize) -> i32;
+    pub type CopyToUserFn = unsafe extern "C" fn(usize, *const u8, usize) -> i32;
+    pub type PciScanFn = unsafe extern "C" fn(u32, *mut super::KPciDev) -> i32;
+    pub type IrqRequestMsixFn = unsafe extern "C" fn(KmodId, u32, u16, super::KIrqHandler, usize) -> i64;
+    pub type FwRequestFn = unsafe extern "C" fn(*const u8, usize, usize, *mut usize, *mut *const u8) -> usize;
+    pub type SecretPeekFn = unsafe extern "C" fn(KmodId, *const u8, usize, *mut u8, usize) -> isize;
+    pub type ExtEventStatsFn = unsafe extern "C" fn(*mut u64) -> i32;
+    pub type ProcPrimeFn = unsafe extern "C" fn(*mut u8, usize) -> isize;
     pub type CurrentPidFn = unsafe extern "C" fn() -> u32;
     pub type TickRegisterFn = unsafe extern "C" fn(KmodId, super::KTickFn, usize) -> i32;
     pub type UsbClassRegisterFn = unsafe extern "C" fn(KmodId, *const super::KmodDevId, usize, super::KUsbProbeFn,
@@ -402,6 +418,32 @@ pub mod sys {
         pub fn kapi_yield();
         pub fn kapi_irqs_masked() -> bool;
         pub fn kapi_current_pid() -> u32;
+        pub fn kapi_ioremap(phys: u64, len: usize, cache: u32) -> usize;
+        pub fn kapi_iounmap(va: usize, len: usize);
+        pub fn kapi_dma_sync(va: usize, len: usize, dir: u32);
+        pub fn kapi_dma_coherent() -> bool;
+        pub fn kapi_mutex_new(name: *const u8, len: usize) -> usize;
+        pub fn kapi_mutex_lock(h: usize);
+        pub fn kapi_mutex_unlock(h: usize);
+        pub fn kapi_sem_new(n: u32) -> usize;
+        pub fn kapi_sem_down_timeout(h: usize, ns: u64) -> bool;
+        pub fn kapi_sem_up(h: usize);
+        pub fn kapi_hrtimer_new(cb: Option<extern "C" fn(usize)>, ctx: usize, irq_mode: bool) -> usize;
+        pub fn kapi_hrtimer_arm(h: usize, ns: u64);
+        pub fn kapi_hrtimer_cancel(h: usize);
+        pub fn kapi_preempt_disable();
+        pub fn kapi_preempt_enable();
+        pub fn kapi_random_fill(buf: *mut u8, len: usize);
+        pub fn kapi_copy_from_user(dst: *mut u8, uaddr: usize, n: usize) -> i32;
+        pub fn kapi_copy_to_user(uaddr: usize, src: *const u8, n: usize) -> i32;
+        pub fn kapi_pci_scan(index: u32, out: *mut super::KPciDev) -> i32;
+        pub fn kapi_irq_request_msix(owner: KmodId, bdf: u32, entry: u16, handler: super::KIrqHandler, ctx: usize) -> i64;
+        pub fn kapi_fw_root_ready() -> bool;
+        pub fn kapi_fw_request(path: *const u8, len: usize, max: usize, size: *mut usize, data: *mut *const u8) -> usize;
+        pub fn kapi_fw_release(h: usize);
+        pub fn kapi_secret_peek(owner: KmodId, key: *const u8, klen: usize, buf: *mut u8, cap: usize) -> isize;
+        pub fn kapi_ext_event_stats(out: *mut u64) -> i32;
+        pub fn kapi_proc_prime(buf: *mut u8, cap: usize) -> isize;
         pub fn kapi_tick_register(owner: KmodId, f: super::KTickFn, ctx: usize) -> i32;
         pub fn kapi_usb_class_register(owner: KmodId, ids: *const super::KmodDevId, nids: usize,
                                        probe: super::KUsbProbeFn, detach: Option<super::KUsbDetachFn>,
