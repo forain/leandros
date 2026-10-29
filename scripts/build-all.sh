@@ -1171,6 +1171,8 @@ for arch in "${ARCHS[@]}"; do
     # Rust modules (CONFIG_X=m, $KMOD_EXTRA); a no-op when there is nothing to build.
     "$ROOT_DIR/scripts/kmod/kmod-build.sh" "$arch"
     create_initrd "$arch"
+    # Fail the build when a shipped kernel variant has no lib/modules/<its build-id> (any =m set).
+    python3 "$ROOT_DIR/scripts/kmod/bidcheck.py" build "$arch"
     create_disk_image "$arch" "$LIMINE_DIR"
     echo "💾 Creating populated F2FS images for $arch..."
     python3 scripts/mkfs-f2fs-populated.py "f2fs-data0-$arch.img" "$arch"
