@@ -33,35 +33,37 @@ endmenu
 menu "Network"
 	depends on NET
 
+# The NIC drivers are compiled on every arch/board today (inert without the
+# hardware), so they have no arch/board dependency: a PCI e1000e is also a
+# QEMU aarch64 option, and macb/brcmf just never find their RP1/SDIO device.
 config E1000E
 	bool "Intel e1000e"
-	depends on PCI && ARCH_X86_64
+	depends on PCI
 	default y
 
 config R8169
 	bool "Realtek r8169"
-	depends on PCI && ARCH_X86_64
+	depends on PCI
 	default y
 
 config IWLWIFI
 	bool "Intel iwlwifi"
-	depends on PCI && ARCH_X86_64
+	depends on PCI
 	select WIFI_STACK
 	default y
 
 config WIFI_SIM
 	bool "Simulated Wi-Fi device (testing)"
+	depends on VIRTIO_NET
 	select WIFI_STACK
 	default y
 
 config MACB
 	bool "Cadence macb (Pi 5 RP1 Ethernet)"
-	depends on BOARD_RPI5
 	default y
 
 config BRCMF
 	bool "Broadcom brcmfmac (SDIO Wi-Fi)"
-	depends on BOARD_RPI5
 	select WIFI_STACK
 	default y
 

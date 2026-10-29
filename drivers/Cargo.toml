@@ -24,6 +24,18 @@ drv-hda = []
 drv-lapinv = []
 drv-i2c-hid = []
 
+# Kconfig-gated NIC drivers (CONFIG_FOO -> kernel feature drv-foo -> drivers/foo).
+# Off: the module is replaced by a small stub under src/stubs/ or compiled out.
+e1000e = []
+r8169 = []
+macb = []
+virtio-net = []
+# Hidden CONFIG_WIFI_STACK: shared 802.11 code (frames, crypto, HT, manager).
+wifi-stack = []
+iwlwifi = ["wifi-stack"]
+wifi-sim = ["wifi-stack", "virtio-net"]
+brcmf = ["wifi-stack"]
+
 [dependencies]
 leandros-lib = { path = "../lib" }
 ipc = { path = "../ipc" }

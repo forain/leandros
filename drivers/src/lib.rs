@@ -111,47 +111,47 @@ pub mod virtio;
 pub mod virtio_gpu;
 pub mod virtio_blk;
 pub mod virtio_keyboard;
-pub mod virtio_net;
+#[cfg(feature = "virtio-net")] pub mod virtio_net;
 /// Realtek RTL8111/8168 PCIe gigabit Ethernet (real PCs).
-pub mod r8169;
+#[cfg(feature = "r8169")] pub mod r8169;
 /// Hardware-independent r8169 pieces (host-tested in drivers/r8169-tests).
-pub mod r8169_hw;
+#[cfg(feature = "r8169")] pub mod r8169_hw;
 /// Intel e1000e family (I219 PCH NICs, QEMU's 82574L).
-pub mod e1000e;
+#[cfg(feature = "e1000e")] pub mod e1000e;
 /// Hardware-independent e1000e pieces (host-tested in drivers/e1000e-tests).
-pub mod e1000e_hw;
+#[cfg(feature = "e1000e")] pub mod e1000e_hw;
 /// Cadence GEM (macb) in the Raspberry Pi 5's RP1, BCM54213PE PHY; inert until the RP1 probe attaches it.
-pub mod macb;
+#[cfg(feature = "macb")] pub mod macb;
 pub mod dma_shutdown;
 /// Hardware-independent macb pieces (host-tested in drivers/macb-tests).
-pub mod macb_hw;
+#[cfg(feature = "macb")] pub mod macb_hw;
 /// The NIC behind `eth0`: virtio-net, r8169 or e1000e.
 pub mod netdev;
 pub mod netshape;
 /// Intel Wireless 8265/8275 (iwlwifi, MVM firmware) and its pieces: PCIe
 /// transport, firmware file parser, firmware command codec, 802.11 frames,
 /// WPA2 crypto (the last four host-tested in drivers/iwlwifi-tests).
-pub mod iwlwifi;
+#[cfg(feature = "iwlwifi")] pub mod iwlwifi;
 pub mod cmdline_secrets;
-pub mod iwl_trans;
-pub mod iwl_fw;
-pub mod iwl_cmd;
-pub mod iwl_assoc;
-pub mod iwl_rs;
-pub mod iwl_agg;
-pub mod wifi_frame;
+#[cfg(feature = "iwlwifi")] pub mod iwl_trans;
+#[cfg(feature = "iwlwifi")] pub mod iwl_fw;
+#[cfg(feature = "wifi-stack")] pub mod iwl_cmd;
+#[cfg(feature = "iwlwifi")] pub mod iwl_assoc;
+#[cfg(feature = "iwlwifi")] pub mod iwl_rs;
+#[cfg(feature = "wifi-stack")] pub mod iwl_agg;
+#[cfg(feature = "wifi-stack")] pub mod wifi_frame;
 /// WMM, HT and Block Ack (incl. the RX reorder buffer), shared by iwlwifi
 /// and wifi_sim (host-tested in drivers/iwlwifi-tests).
-pub mod wifi_ht;
-pub mod wifi_crypto;
+#[cfg(feature = "wifi-stack")] pub mod wifi_ht;
+#[cfg(feature = "wifi-stack")] pub mod wifi_crypto;
 /// Wrong-passphrase block policy of the manager (host-tested in drivers/brcmf-tests).
-pub mod wifi_wrongkey;
+#[cfg(feature = "wifi-stack")] pub mod wifi_wrongkey;
 /// The control seam between /dev/netctl and Wi-Fi backends (types only so far).
 pub mod wifi_api;
 /// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).
-pub mod wifi_mgr;
+#[cfg(feature = "wifi-stack")] pub mod wifi_mgr;
 /// Broadcom/Cypress FullMAC Wi-Fi (CYW43455, Raspberry Pi 5).
-pub mod brcmf;
+#[cfg(feature = "brcmf")] pub mod brcmf;
 pub mod bcm2712_id;
 /// BCM2712 GPIO (gio/gio_aon), pin mux (C0/D0) and l2 interrupt controllers.
 pub mod bcm2712_gpio;
@@ -163,12 +163,12 @@ pub mod hdmi_probe;
 pub mod hdmi_audio;
 /// Pi 5 Wi-Fi boot bring-up: sdio2 host → firmware → "ver" (rpi5 only).
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-pub mod brcmf_boot;
+#[cfg(feature = "brcmf")] pub mod brcmf_boot;
 /// Bluetooth: H4 transport + Broadcom bring-up (CYW43455 BT half on the Pi 5 uarta).
 pub mod bt;
-pub mod wifi_pref;
+#[cfg(feature = "wifi-stack")] pub mod wifi_pref;
 /// A simulated Wi-Fi interface for QEMU tests (opt-in; see its header).
-pub mod wifi_sim;
+#[cfg(feature = "wifi-sim")] pub mod wifi_sim;
 #[cfg(feature = "drv-virtio-rng")]
 pub mod virtio_rng;
 /// CONFIG_VIRTIO_RNG=n: no hardware entropy device.
@@ -298,3 +298,20 @@ pub enum DriverError {
     /// VK_ERROR_DEVICE_LOST). The DRM server answers `-errno`.
     Errno(i32),
 }
+
+// Stubs for the Kconfig-gated drivers that are switched off (see stubs/).
+#[cfg(not(feature = "virtio-net"))]
+#[path = "stubs/virtio_net.rs"]
+pub mod virtio_net;
+#[cfg(not(feature = "r8169"))]
+#[path = "stubs/r8169.rs"]
+pub mod r8169;
+#[cfg(not(feature = "e1000e"))]
+#[path = "stubs/e1000e.rs"]
+pub mod e1000e;
+#[cfg(not(feature = "iwlwifi"))]
+#[path = "stubs/iwlwifi.rs"]
+pub mod iwlwifi;
+#[cfg(not(feature = "wifi-stack"))]
+#[path = "stubs/wifi_mgr.rs"]
+pub mod wifi_mgr;

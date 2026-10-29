@@ -200,35 +200,35 @@ pub fn note_link(id: u8, ev: LinkEvent) {
 /// the net server's `init`.
 pub fn init(cmdline: &str) {
     crate::virtio_net::init();
-    crate::r8169::init(cmdline);
-    crate::e1000e::init(cmdline);
-    crate::macb::init(cmdline);
-    crate::iwlwifi::init(cmdline);
+    #[cfg(feature = "r8169")] crate::r8169::init(cmdline);
+    #[cfg(feature = "e1000e")] crate::e1000e::init(cmdline);
+    #[cfg(feature = "macb")] crate::macb::init(cmdline);
+    #[cfg(feature = "iwlwifi")] crate::iwlwifi::init(cmdline);
     // The simulated Wi-Fi (QEMU only, opt-in) may claim a virtio-net device
     // as its data path; that device is then wifi0, not an ethN.
-    crate::wifi_sim::init(cmdline);
+    #[cfg(feature = "wifi-sim")] crate::wifi_sim::init(cmdline);
     // CYW43455 (Raspberry Pi 5 only; inert in every other build).
-    crate::brcmf::netdev::init(cmdline);
+    #[cfg(feature = "brcmf")] crate::brcmf::netdev::init(cmdline);
     for i in 0..crate::virtio_net::device_count() {
-        if crate::wifi_sim::claims_virtio(i) { continue; }
+        #[cfg(feature = "wifi-sim")] if crate::wifi_sim::claims_virtio(i) { continue; }
         register(Kind::Wired, "eth", &VIRTIO_OPS, i as u8);
     }
-    if crate::r8169::present() { register(Kind::Wired, "eth", &R8169_OPS, 0); }
-    if crate::e1000e::present() { register(Kind::Wired, "eth", &E1000E_OPS, 0); }
-    if crate::macb::present() { register(Kind::Wired, "eth", &MACB_OPS, 0); }
+    #[cfg(feature = "r8169")] if crate::r8169::present() { register(Kind::Wired, "eth", &R8169_OPS, 0); }
+    #[cfg(feature = "e1000e")] if crate::e1000e::present() { register(Kind::Wired, "eth", &E1000E_OPS, 0); }
+    #[cfg(feature = "macb")] if crate::macb::present() { register(Kind::Wired, "eth", &MACB_OPS, 0); }
     // Wi-Fi netifs, then their control side on the /dev/netctl seam
     // (iwlwifi serves it only with iwlwifi.mgr=1).
-    if crate::wifi_sim::present() {
+    #[cfg(feature = "wifi-sim")] if crate::wifi_sim::present() {
         if let Some(n) = register(Kind::Wifi, "wifi", &WIFISIM_OPS, 0).and_then(|id| get(id as usize)) {
             crate::wifi_sim::attach(n.ifindex(), n.name());
         }
     }
-    if crate::iwlwifi::present() {
+    #[cfg(feature = "iwlwifi")] if crate::iwlwifi::present() {
         if let Some(n) = register(Kind::Wifi, "wifi", &IWL_OPS, 0).and_then(|id| get(id as usize)) {
             crate::iwlwifi::attach(n.ifindex(), n.name());
         }
     }
-    if crate::brcmf::netdev::present() {
+    #[cfg(feature = "brcmf")] if crate::brcmf::netdev::present() {
         if let Some(n) = register(Kind::Wifi, "wifi", &BRCMF_OPS, 0).and_then(|id| get(id as usize)) {
             crate::brcmf::netdev::attach(n.ifindex(), n.name());
         }
@@ -264,13 +264,13 @@ static VIRTIO_OPS: NetifOps = NetifOps {
         let _ = writeln!(out, "driver: virtio-net");
         fmt_mac(out, crate::virtio_net::get_mac_address(d as usize));
         let _ = writeln!(out, "link: {}", if crate::virtio_net::link_up(d as usize) { "up" } else { "down" });
-        let _ = writeln!(out, "realtek: {}", crate::r8169::chip_name().unwrap_or("none"));
-        let _ = writeln!(out, "intel: {}", crate::e1000e::chip_name().unwrap_or("none"));
-        let _ = writeln!(out, "macb: {}", crate::macb::state());
+        #[cfg(feature = "r8169")] let _ = writeln!(out, "realtek: {}", crate::r8169::chip_name().unwrap_or("none"));
+        #[cfg(feature = "e1000e")] let _ = writeln!(out, "intel: {}", crate::e1000e::chip_name().unwrap_or("none"));
+        #[cfg(feature = "macb")] let _ = writeln!(out, "macb: {}", crate::macb::state());
     },
 };
 
-static R8169_OPS: NetifOps = NetifOps {
+#[cfg(feature = "r8169")] static R8169_OPS: NetifOps = NetifOps {
     driver: |_| "r8169",
     send: |_, b| crate::r8169::send_packet(b),
     tx_ready: |_| true,
@@ -283,7 +283,7 @@ static R8169_OPS: NetifOps = NetifOps {
     info: |_, out| crate::r8169::info_lines(out),
 };
 
-static E1000E_OPS: NetifOps = NetifOps {
+#[cfg(feature = "e1000e")] static E1000E_OPS: NetifOps = NetifOps {
     driver: |_| "e1000e",
     send: |_, b| crate::e1000e::send_packet(b),
     tx_ready: |_| true,
@@ -296,7 +296,7 @@ static E1000E_OPS: NetifOps = NetifOps {
     info: |_, out| crate::e1000e::info_lines(out),
 };
 
-static MACB_OPS: NetifOps = NetifOps {
+#[cfg(feature = "macb")] static MACB_OPS: NetifOps = NetifOps {
     driver: |_| "macb",
     send: |_, b| crate::macb::send_packet(b),
     tx_ready: |_| crate::macb::tx_ready(),
@@ -309,7 +309,7 @@ static MACB_OPS: NetifOps = NetifOps {
     info: |_, out| crate::macb::info_lines(out),
 };
 
-static WIFISIM_OPS: NetifOps = NetifOps {
+#[cfg(feature = "wifi-sim")] static WIFISIM_OPS: NetifOps = NetifOps {
     driver: |_| "wifi_sim",
     send: |_, b| crate::wifi_sim::send_packet(b),
     tx_ready: |_| true,
@@ -322,7 +322,7 @@ static WIFISIM_OPS: NetifOps = NetifOps {
     info: |_, out| crate::wifi_sim::info_lines(out),
 };
 
-static IWL_OPS: NetifOps = NetifOps {
+#[cfg(feature = "iwlwifi")] static IWL_OPS: NetifOps = NetifOps {
     driver: |_| "iwlwifi",
     send: |_, b| crate::iwlwifi::send_packet(b),
     tx_ready: |_| crate::iwlwifi::tx_ready(),
@@ -335,7 +335,7 @@ static IWL_OPS: NetifOps = NetifOps {
     info: |_, out| crate::iwlwifi::info_lines(out),
 };
 
-static BRCMF_OPS: NetifOps = NetifOps {
+#[cfg(feature = "brcmf")] static BRCMF_OPS: NetifOps = NetifOps {
     driver: |_| "brcmfmac",
     send: |_, b| crate::brcmf::netdev::send_packet(b),
     tx_ready: |_| crate::brcmf::netdev::tx_ready(),

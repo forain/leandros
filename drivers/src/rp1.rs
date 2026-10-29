@@ -92,7 +92,7 @@ pub static GEM_IRQ: AtomicBool = AtomicBool::new(false);
 /// Pulses the BCM54213PE reset (RP1 GPIO 32, active low, 5 ms) and hands the
 /// GEM to `macb`, unless its clocks could not be enabled (an unclocked GEM
 /// would stall the bus on the first register read).
-fn attach_gem(bar1: usize, clocks_ok: bool) {
+#[cfg(feature = "macb")] fn attach_gem(bar1: usize, clocks_ok: bool) {
     if !clocks_ok { log("[rp1] FAIL gem clocks off, macb not attached\n"); return; }
     if crate::rp1_gpio::reset_pulse_active_low(crate::rp1_hw::ETH_PHY_RESET_GPIO, 5) {
         log("[rp1] eth phy reset pulsed (gpio32)\n");
@@ -209,3 +209,6 @@ pub fn free_irq(n: u32, h: IrqHandle) {
     crate::irq::free_irq(h);
     USER_HANDLER[n as usize].store(0, Ordering::Release);
 }
+
+#[cfg(not(feature = "macb"))]
+fn attach_gem(_bar1: usize, _clocks_ok: bool) { log("[rp1] macb not built\n"); }
