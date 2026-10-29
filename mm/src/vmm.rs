@@ -221,7 +221,7 @@ fn backing_seq() -> u64 { BACKING_SHRINK_SEQ.load(Ordering::SeqCst) }
 /// ever called with the address space unlocked.
 pub type VmoPageFn = fn(vmo: u64, off: u64, out: &mut [usize]) -> usize;
 /// Pages a VMO fault maps around the faulting one (aligned window).
-pub const VMO_FAULT_AROUND: usize = 16;
+pub const VMO_FAULT_AROUND: usize = 32;
 static VMO_PAGE_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the VFS's tmpfs/memfd page lookup (see [`VmoPageFn`]).
