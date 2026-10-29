@@ -1,6 +1,12 @@
 //! Loadable kernel modules: boot-time state (build-id, module window).
 
 pub mod buildid;
+pub mod exports;
+pub mod load;
+pub mod registry;
+
+pub use load::{load_image, KmodErr, Source};
+pub use registry::{for_each, note_registration, registrations, ModInfo, State};
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -27,6 +33,15 @@ pub fn init() {
         DISABLED.store(true, Ordering::Relaxed);
         log(&alloc::format!("[kmod] window {:#x} BUSY {} pages, kmod disabled\n", mm::kmodwin::BASE, mm::kmodwin::present_pages()));
     }
+}
+
+/// True when modules cannot be loaded (window init failed, or kmod disabled).
+pub fn disabled() -> bool { !window_ok() }
+
+/// The NUL-padded module name as a str.
+pub fn name_str(n: &[u8; 32]) -> &str {
+    let l = n.iter().position(|&b| b == 0).unwrap_or(32);
+    core::str::from_utf8(&n[..l]).unwrap_or("?")
 }
 
 fn log(s: &str) { drivers::pci::serial_debug(s); }

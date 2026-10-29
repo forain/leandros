@@ -42,6 +42,8 @@ drv-i2c-hid = ["drivers/drv-i2c-hid"]
 
 [dependencies]
 mm         = { path = "../mm" }
+kmod-abi   = { path = "../lib/kmod-abi" }
+kmod-elf   = { path = "../lib/kmod-elf" }
 sched      = { path = "../sched" }
 elf        = { path = "../elf" }
 ipc        = { path = "../ipc" }

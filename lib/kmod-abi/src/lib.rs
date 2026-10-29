@@ -101,8 +101,43 @@ pub struct KSym {
 }
 unsafe impl Sync for KSym {}
 
-/// The kapi extern list is defined by L3c.
-pub mod sys {}
+/// The core kapi v1 imports (implemented by the kernel, `kernel/src/kmod/exports.rs`).
+/// The `*Fn` aliases are what the kernel's compile-time signature check uses.
+pub mod sys {
+    use super::{KmodCtx, KmodId};
+    pub type AbiVersionFn = unsafe extern "C" fn() -> u32;
+    pub type LogFn = unsafe extern "C" fn(u32, *const u8, usize);
+    pub type PanicFn = unsafe extern "C" fn(KmodId, *const u8, usize) -> !;
+    pub type AllocFn = unsafe extern "C" fn(usize, usize) -> *mut u8;
+    pub type DeallocFn = unsafe extern "C" fn(*mut u8, usize, usize);
+    pub type ReallocFn = unsafe extern "C" fn(*mut u8, usize, usize, usize) -> *mut u8;
+    pub type CmdlineFn = unsafe extern "C" fn(*mut usize) -> *const u8;
+    pub type MonotonicFn = unsafe extern "C" fn() -> u64;
+    pub type SleepFn = unsafe extern "C" fn(u64);
+    pub type SpinHeldFn = unsafe extern "C" fn(bool);
+    pub type SpinHeldCountFn = unsafe extern "C" fn() -> u32;
+    pub type KthreadSpawnFn =
+        unsafe extern "C" fn(*const u8, usize, extern "C" fn(*mut u8), *mut u8, KmodId) -> i64;
+    pub type KtestPingFn = unsafe extern "C" fn(*const KmodCtx) -> i32;
+
+    extern "C" {
+        pub fn kapi_abi_version() -> u32;
+        pub fn kapi_log(level: u32, ptr: *const u8, len: usize);
+        pub fn kapi_panic(owner: KmodId, ptr: *const u8, len: usize) -> !;
+        pub fn kapi_alloc(size: usize, align: usize) -> *mut u8;
+        pub fn kapi_dealloc(ptr: *mut u8, size: usize, align: usize);
+        pub fn kapi_realloc(ptr: *mut u8, size: usize, align: usize, new_size: usize) -> *mut u8;
+        pub fn kapi_cmdline(len_out: *mut usize) -> *const u8;
+        pub fn kapi_monotonic_ns() -> u64;
+        pub fn kapi_msleep(ms: u64);
+        pub fn kapi_udelay(us: u64);
+        pub fn kapi_spin_held(acquired: bool);
+        pub fn kapi_spin_held_count() -> u32;
+        pub fn kapi_kthread_spawn(name: *const u8, name_len: usize, f: extern "C" fn(*mut u8),
+                                  arg: *mut u8, owner: KmodId) -> i64;
+        pub fn kapi_ktest_ping(ctx: *const KmodCtx) -> i32;
+    }
+}
 
 impl KmodHeader {
     /// Parse from little-endian bytes (any alignment). None if too short.
