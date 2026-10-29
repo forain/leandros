@@ -29,10 +29,13 @@ config BOARD_RASPI4B
 endchoice
 
 config MODULES
-	bool "Loadable module support (stage 2, not yet implemented)"
+	bool "Loadable module support"
+	option modules
 	default n
 	help
-	  Reserved. Drivers become tristate once their module lane lands.
+	  Allow drivers marked tristate to be built as loadable modules (=m).
+	  Modules are built by scripts/kmod/kmod-build.sh and loaded from the
+	  initrd or with finit_module(). Leave unset for an all-built-in kernel.
 
 config PCI
 	def_bool y

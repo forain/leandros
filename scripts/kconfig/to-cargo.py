@@ -17,6 +17,9 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import kconfiglib  # noqa: E402
 
+# Kconfig symbol (lowercase, dashed) -> modules/<dir> when the two differ.
+KMOD_NAME_MAP = {"kmod-hello": "hello"}
+
 BOARD_FEATURES = {"BOARD_RPI5": "rpi5", "BOARD_RASPI4B": "raspi4b", "NVIDIA": "nvidia"}
 
 
@@ -75,7 +78,11 @@ def main():
         if val == 2 and "drv-" + name in declared:
             feats.append("drv-" + name)
         elif val == 1:
-            mods.append(name)
+            mod = KMOD_NAME_MAP.get(name, name)
+            if not os.path.isfile(os.path.join(ROOT, "modules", mod, "Cargo.toml")):
+                sys.exit("to-cargo.py: CONFIG_%s=m but there is no module crate modules/%s/Cargo.toml"
+                         % (sym.name, mod))
+            mods.append(mod)
     if a.kmod_list:
         with open(a.kmod_list, "w") as f:
             f.write("".join(m + "\n" for m in sorted(mods)))
