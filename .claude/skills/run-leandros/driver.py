@@ -1243,7 +1243,10 @@ def _build_direct_cmd(arch):
             *_audiodev_args(),
             *_sound_device_args(),
             "-device", "virtio-rng-pci,disable-legacy=on",
-            "-net", "none", "-no-reboot",
+            # Default: no NIC. LEANDROS_NIC=<model> (e.g. e1000e, the kmod autoload test) adds one.
+            *(["-net", "none"] if "LEANDROS_NIC" not in os.environ else
+              ["-netdev", "user,id=net0", *_nic_device("x86_64")]),
+            "-no-reboot",
             "-display", "none",
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off,logfile={SERIAL_FULL_LOG}",
             "-serial", "chardev:serial0",
