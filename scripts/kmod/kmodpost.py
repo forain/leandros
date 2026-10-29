@@ -188,19 +188,46 @@ def check_shape(arch, b, e):
             die("shape", f"section {n} is not empty ({s['size']} bytes)")
 
 
+def fnv1a32(data):
+    h = 0x811c9dc5
+    for c in data:
+        h = ((h ^ c) * 0x01000193) & 0xffffffff
+    return h
+
+
 def alias_lines(b, e, name, entry_size=16):
+    """modules.alias lines for the .kmod.ids rows (pci, pci class, usb, of, sdio)."""
     s = e["secs"].get(".kmod.ids")
     out = []
     if not s:
         return out
+    ofs = e["secs"].get(".kmod.ofstr")
     for i in range(s["size"] // entry_size):
         bus, a, bb, c, cls, mask = struct.unpack_from("<HHHHII", b, s["off"] + i * entry_size)
         pid = "*" if bb == 0xffff else f"{bb:04x}"
+        vid = "*" if a == 0xffff else f"{a:04x}"
         if bus == 1:
-            out.append(f"pci {a:04x} {pid} {name}")
+            if mask:
+                out.append(f"pci {vid} {pid} {cls & mask:06x} {mask:06x} {name}")
+            else:
+                out.append(f"pci {vid} {pid} {name}")
         elif bus == 2:
             f = lambda sh: "*" if not (mask >> sh) & 0xff else f"{(cls >> sh) & 0xff:02x}"
-            out.append(f"usb {a:04x} {pid} {f(16)} {f(8)} {f(0)} {name}")
+            out.append(f"usb {vid} {pid} {f(16)} {f(8)} {f(0)} {name}")
+        elif bus == 3:
+            if not ofs:
+                die("alias", "OF row without .kmod.ofstr")
+            off = a | (bb << 16)
+            if off + c >= ofs["size"] + 0 or b[ofs["off"] + off + c] != 0 or c == 0:
+                die("alias", f"OF row {i}: bad offset/length ({off},{c})")
+            raw = bytes(b[ofs["off"] + off:ofs["off"] + off + c])
+            if b"\0" in raw or fnv1a32(raw) != cls:
+                die("alias", f"OF row {i}: hash/len does not match the string")
+            out.append(f"of {raw.decode()} {name}")
+        elif bus == 5:
+            out.append(f"sdio {a:04x} {pid} {name}")
+        else:
+            die("alias", f"row {i}: unknown bus {bus}")
     return out
 
 

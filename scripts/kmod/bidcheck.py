@@ -6,7 +6,9 @@ initrd it ships with (and in the staged f2fs root).
                                             initrd-<arch>.cpio and target/kmod/<arch>/rootfs.
                                             Only when a module is set (kmod-list/KMOD_EXTRA/staged dirs).
   bidcheck.py pair <kernel> <initrd.cpio>   deploy gate: exit 1 when the initrd carries lib/modules
-                                            but not <kernel>'s build-id.
+                                            but not <kernel>'s build-id, or whose modules.load names a missing .kmod.
+  bidcheck.py bootcheck <arch>              every =m name in modules/BOOT is in the initrd, in modules.load
+                                            (BOOT order) and has an alias row; unknown names fail.
 """
 import os, struct, sys
 
@@ -89,6 +91,32 @@ def cpio_names(path):
     return names
 
 
+def cpio_files(path, prefix="lib/modules/"):
+    """name -> bytes for the newc members under `prefix`."""
+    with open(path, "rb") as f:
+        d = f.read()
+    out, o = {}, 0
+    while o + 110 <= len(d) and d[o:o + 6] == b"070701":
+        fsz = int(d[o + 54:o + 62], 16)
+        nsz = int(d[o + 94:o + 102], 16)
+        name = d[o + 110:o + 110 + nsz - 1].decode(errors="replace")
+        if name == "TRAILER!!!":
+            break
+        o = (o + 110 + nsz + 3) & ~3
+        if name.lstrip("./").startswith(prefix):
+            out[name.lstrip("./")] = d[o:o + fsz]
+        o = (o + fsz + 3) & ~3
+    return out
+
+
+def boot_names():
+    """Names in modules/BOOT, in order."""
+    p = os.environ.get("LEANDROS_BOOT_FILE") or os.path.join(ROOT, "modules", "BOOT")
+    if not os.path.isfile(p):
+        return []
+    return [w for ln in open(p) for w in ln.split("#")[0].split()]
+
+
 def initrd_ids(path):
     ids = set()
     for n in cpio_names(path):
@@ -108,6 +136,59 @@ def pair(kernel, initrd):
                 f"{{{', '.join(sorted(ids))}}}: the kernel would not find its modules "
                 f"(rebuild with scripts/build-all.sh)")
     return None
+
+
+def _modules_load_problems(files):
+    """modules.load entries without a .kmod next to them, per build-id directory."""
+    bad = []
+    for n, data in files.items():
+        if n.endswith("/modules.load"):
+            d = n[:-len("modules.load")]
+            for m in data.decode(errors="replace").replace(",", " ").split():
+                if d + m + ".kmod" not in files:
+                    bad.append(f"{n} names {m} but {d}{m}.kmod is not in the initrd")
+    return bad
+
+
+def bootcheck(arch, boot=None, initrd=None):
+    """Every =m module named in modules/BOOT must be in the initrd, listed in modules.load
+    (BOOT order) and have an alias row. Names that are =y (a crate exists, not in kmod-list)
+    are skipped; names with no crate at all fail. Returns the problem list."""
+    boot = boot_names() if boot is None else boot
+    if not boot:
+        return []
+    kl = os.path.join(ROOT, "target", f"kconfig-{arch}", "kmod-list")
+    built = set()
+    if os.path.isfile(kl):
+        built = {w.replace("-", "_") for w in open(kl).read().split()}
+    built |= {w.replace("-", "_") for w in os.environ.get("KMOD_EXTRA", "").split()}
+    initrd = initrd or os.path.join(ROOT, f"initrd-{arch}.cpio")
+    files = cpio_files(initrd) if os.path.isfile(initrd) else {}
+    bad = []
+    for m in boot:
+        if m.replace("_", "-") and not os.path.isfile(os.path.join(ROOT, "modules", m.replace("_", "-"), "Cargo.toml")) \
+                and m not in built:
+            bad.append(f"modules/BOOT names {m}: no module crate modules/{m.replace('_', '-')}")
+    want = [m for m in boot if m in built]
+    if not want:
+        return bad
+    dirs = sorted({n.rsplit("/", 1)[0] for n in files if n.endswith(".kmod")})
+    if not dirs:
+        return bad + [f"BOOT modules {want} are =m but {initrd} has no lib/modules/*/*.kmod"]
+    for d in dirs:
+        load = files.get(d + "/modules.load", b"").decode(errors="replace").replace(",", " ").split()
+        alias = files.get(d + "/modules.alias", b"").decode(errors="replace").splitlines()
+        for m in want:
+            if d + "/" + m + ".kmod" not in files:
+                bad.append(f"{d}: BOOT module {m}.kmod missing from the initrd")
+            if m not in load:
+                bad.append(f"{d}: BOOT module {m} not listed in modules.load")
+            if not any(ln.split()[-1:] == [m] for ln in alias):
+                bad.append(f"{d}: BOOT module {m} has no modules.alias row")
+        order = [m for m in load if m in want]
+        if order != [m for m in want if m in load]:
+            bad.append(f"{d}: modules.load order {order} differs from BOOT order {want}")
+    return bad
 
 
 def build(arch):
@@ -140,14 +221,25 @@ def build(arch):
             bad += 1
         if not bad:
             print(f"bidcheck: {arch} {v} {bid[:12]} ok (initrd + root)")
+    for p in bootcheck(arch):
+        print(f"bidcheck: FAIL bootcheck: {p}", file=sys.stderr)
+        bad += 1
     return 1 if bad else 0
 
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "build":
         sys.exit(build(sys.argv[2]))
+    if len(sys.argv) == 3 and sys.argv[1] == "bootcheck":
+        pr = bootcheck(sys.argv[2])
+        for p in pr:
+            print(f"bidcheck: FAIL bootcheck: {p}", file=sys.stderr)
+        sys.exit(1 if pr else 0)
     if len(sys.argv) == 4 and sys.argv[1] == "pair":
         e = pair(sys.argv[2], sys.argv[3])
+        if not e and os.path.isfile(sys.argv[3]):
+            pr = _modules_load_problems(cpio_files(sys.argv[3]))
+            e = "; ".join(pr) if pr else None
         if e:
             print("bidcheck: " + e, file=sys.stderr)
         sys.exit(1 if e else 0)

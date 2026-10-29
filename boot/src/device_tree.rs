@@ -502,6 +502,145 @@ pub unsafe fn for_each_cpu_mpidr_at(dtb: usize, f: &mut dyn FnMut(u64)) -> bool 
     found_cpus
 }
 
+/// One DT node handed to [`for_each_compatible`]: `compat` is the raw NUL-separated
+/// `compatible` property, `reg` the first (address, size) translated through simple-bus
+/// `ranges` of the ancestors (None if the node has no `reg`).
+pub struct DtNode<'a> { pub name: &'a [u8], pub compat: &'a [u8], pub reg: Option<(u64, u64)> }
+
+const DT_MAX_DEPTH: usize = 16;
+
+#[derive(Clone, Copy)]
+struct DtFrame {
+    name: *const u8, name_len: usize,
+    compat: *const u8, compat_len: usize,
+    reg: *const u8, reg_len: usize,
+    ok: bool,
+    /// Cells of this node's children (`#address-cells`, `#size-cells`).
+    acells: usize, scells: usize,
+    /// First `ranges` entry for this node's children: (child base, parent base, len); None = identity.
+    range: Option<(u64, u64, u64)>,
+    simple_bus: bool,
+}
+
+unsafe fn read_cells_raw(p: *const u8, cells: usize) -> u64 {
+    let mut v = 0u64;
+    for i in 0..cells.min(2) { v = (v << 32) | be32(p.add(i * 4)) as u64; }
+    if cells > 2 { v = be32(p.add((cells - 1) * 4)) as u64 | (be32(p.add((cells - 2) * 4)) as u64) << 32; }
+    v
+}
+
+/// Visit every node that has a `compatible` property and `status` absent/"okay"/"ok", in tree order.
+/// `reg` is translated through the parents' `ranges` for simple-bus parents only.
+///
+/// # Safety
+/// The DTB recorded by `parse` must still be mapped.
+pub unsafe fn for_each_compatible(f: &mut dyn FnMut(&DtNode)) -> bool {
+    for_each_compatible_at(DTB_VIRT.load(core::sync::atomic::Ordering::Relaxed), f)
+}
+
+/// [`for_each_compatible`] on an explicit DTB address (host tests).
+///
+/// # Safety
+/// `dtb` must be 0 or the address of a readable, complete FDT.
+pub unsafe fn for_each_compatible_at(dtb: usize, f: &mut dyn FnMut(&DtNode)) -> bool {
+    if dtb == 0 || !is_valid_dtb(dtb) { return false; }
+    let hdr = dtb as *const FdtHeader;
+    let struct_off  = be32(core::ptr::addr_of!((*hdr).off_dt_struct)  as *const u8) as usize;
+    let strings_off = be32(core::ptr::addr_of!((*hdr).off_dt_strings) as *const u8) as usize;
+    let total       = be32(core::ptr::addr_of!((*hdr).totalsize)      as *const u8) as usize;
+    let mut ptr = (dtb + struct_off) as *const u8;
+    let end = (dtb + total) as *const u8;
+    let strings = (dtb + strings_off) as *const u8;
+    let blank = DtFrame { name: core::ptr::null(), name_len: 0, compat: core::ptr::null(), compat_len: 0,
+        reg: core::ptr::null(), reg_len: 0, ok: true, acells: 2, scells: 1, range: None, simple_bus: false };
+    let mut st = [blank; DT_MAX_DEPTH];
+    let mut depth = 0usize; // number of open nodes
+    while ptr < end {
+        match be32(ptr) {
+            FDT_BEGIN_NODE => {
+                let name_ptr = ptr.add(4);
+                let name_len = strlen(name_ptr);
+                if depth < DT_MAX_DEPTH {
+                    st[depth] = DtFrame { name: name_ptr, name_len, ..blank };
+                }
+                depth += 1;
+                ptr = ptr.add(4 + align_up(name_len + 1, 4));
+            }
+            FDT_END_NODE => {
+                if depth == 0 { break; }
+                depth -= 1;
+                if depth < DT_MAX_DEPTH {
+                    let n = st[depth];
+                    if n.ok && !n.compat.is_null() {
+                        let mut reg = None;
+                        if !n.reg.is_null() && depth >= 1 && depth - 1 < DT_MAX_DEPTH {
+                            let par = st[depth - 1];
+                            let (ac, sc) = (par.acells, par.scells);
+                            if n.reg_len >= (ac + sc) * 4 {
+                                let mut a = read_cells_raw(n.reg, ac);
+                                let sz = read_cells_raw(n.reg.add(ac * 4), sc);
+                                // Translate through every simple-bus ancestor's single range entry.
+                                let mut d = depth - 1;
+                                loop {
+                                    let anc = st[d];
+                                    if let Some((cb, pb, len)) = anc.range {
+                                        if a >= cb && a - cb < len { a = a - cb + pb; }
+                                    }
+                                    if d == 0 || !anc.simple_bus { break; }
+                                    d -= 1;
+                                }
+                                reg = Some((a, sz));
+                            }
+                        }
+                        f(&DtNode { name: core::slice::from_raw_parts(n.name, n.name_len),
+                            compat: core::slice::from_raw_parts(n.compat, n.compat_len), reg });
+                    }
+                }
+                if depth == 0 { break; }
+                ptr = ptr.add(4);
+            }
+            FDT_PROP => {
+                let len = be32(ptr.add(4)) as usize;
+                let name_ptr = strings.add(be32(ptr.add(8)) as usize);
+                let pname = core::slice::from_raw_parts(name_ptr, strlen(name_ptr));
+                let data = ptr.add(12);
+                if depth >= 1 && depth <= DT_MAX_DEPTH {
+                    let pc = if depth >= 2 { st[depth - 2].acells } else { 2 };
+                    let fr = &mut st[depth - 1];
+                    match pname {
+                        b"compatible" => { fr.compat = data; fr.compat_len = len; }
+                        b"reg" => { fr.reg = data; fr.reg_len = len; }
+                        b"status" => {
+                            let v = core::slice::from_raw_parts(data, len.min(4));
+                            fr.ok = v.starts_with(b"okay") || v.starts_with(b"ok\0");
+                        }
+                        b"#address-cells" if len >= 4 => fr.acells = be32(data) as usize,
+                        b"#size-cells" if len >= 4 => fr.scells = be32(data) as usize,
+                        b"ranges" => {
+                            // Parent cells are known only once the parent frame is; use this node's
+                            // own #address-cells as the child cells (set before ranges in practice).
+                            let (cc, ps) = (fr.acells, pc);
+                            if len >= (cc + ps + fr.scells) * 4 && len > 0 {
+                                fr.range = Some((read_cells_raw(data, cc), read_cells_raw(data.add(cc * 4), ps),
+                                    read_cells_raw(data.add((cc + ps) * 4), fr.scells)));
+                            }
+                        }
+                        _ => {}
+                    }
+                    if pname == b"compatible" && len >= 10 {
+                        let c = core::slice::from_raw_parts(data, len);
+                        fr.simple_bus = c.windows(10).any(|w| w == b"simple-bus");
+                    }
+                }
+                ptr = ptr.add(12 + align_up(len, 4));
+            }
+            FDT_NOP => { ptr = ptr.add(4); }
+            _ => break,
+        }
+    }
+    true
+}
+
 fn strlen(s: *const u8) -> usize {
     let mut len = 0;
     unsafe { while *s.add(len) != 0 { len += 1; } }

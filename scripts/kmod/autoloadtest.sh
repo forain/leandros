@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# autoloadtest.sh [arch] [virtio_rng|e1000e|uvc]: host-side test of the modules.alias autoload path.
+# autoloadtest.sh [arch] [virtio_rng|e1000e|uvc|of]: host-side test of the modules.alias autoload path.
 # Builds with CONFIG_MODULES=y CONFIG_VIRTIO_RNG=m (the driver is then ONLY a module, found via
 # modules.alias, no modules.load), boots under QEMU and checks that it autoloads, is listed, feeds
 # the CSPRNG, and that modules.blacklist=virtio_rng boots without it. Restores .config afterwards
@@ -37,6 +37,33 @@ if [[ "$mod" == "e1000e" ]]; then
     check "$L" 'alias 8086:10d3 e1000e: Blacklisted' "blacklist refuses the alias load"
     if grep -aq 'DHCP configured' "$L"; then echo "FAIL eth up despite blacklist"; fail=1; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest e1000e: PASS" || { echo "autoloadtest e1000e: FAIL"; exit 1; }
+    exit 0
+fi
+if [[ "$mod" == "of" ]]; then
+    # Platform registry: hello is built as an extra module carrying `of: ["leandros,test"]`;
+    # plat.alias_selftest=1 announces that compatible with no built-in driver, so the registry's
+    # autoload hook must load hello through the `of` alias row (no modules.load).
+    printf 'CONFIG_MODULES=y\n' > .config
+    KMOD_EXTRA=hello ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/autoloadtest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/autoloadtest-build.log"; exit 1; }
+    if find "target/kmod/$arch" -name modules.load | grep -q .; then echo "FAIL: modules.load present, alias path not isolated"; exit 1; fi
+    if ! grep -rqa 'of leandros,test hello' "target/kmod/$arch/initrd/lib/modules" 2>/dev/null; then echo "FAIL: no 'of leandros,test hello' alias row"; exit 1; fi
+    RT=.claude/skills/run-leandros/runtests.py
+    fail=0
+    check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3"; fail=1; fi; }
+    export LEANDROS_RUN_ID="autoloadtest-$arch"
+    python3 "$RT" "$arch" alt1 --cmdline "plat.alias_selftest=1" "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt1/serial-full.log
+    check "$L" '^\[plat\] DT compatibles' "DT walker ran"
+    check "$L" '^\[kmod\] of leandros,test -> hello' "of alias autoload via the platform registry"
+    check "$L" '^\[kmod\] hello loaded id' "hello loaded"
+    check "$L" '^hello [0-9]* [0-9]* - Live' "listed in /proc/modules"
+    python3 "$RT" "$arch" alt2 --cmdline "plat.alias_selftest=1 modules.blacklist=hello" "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt2/serial-full.log
+    check "$L" 'alias of leandros,test hello: Blacklisted' "blacklist refuses the of load"
+    python3 "$RT" "$arch" alt3 --cmdline "kmod=0 plat.alias_selftest=1" "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt3/serial-full.log
+    if grep -aq '^\[kmod\] hello loaded' "$L"; then echo "FAIL kmod=0 still loaded hello"; fail=1; else echo "ok   kmod=0 blocks the of hook"; fi
+    [[ $fail -eq 0 ]] && echo "autoloadtest of: PASS" || { echo "autoloadtest of: FAIL"; exit 1; }
     exit 0
 fi
 if [[ "$mod" == "uvc" ]]; then

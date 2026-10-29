@@ -549,11 +549,20 @@ fn flusher() -> ! {
 /// Find the log partition on the boot disk, claim this boot's slot, dump the
 /// log so far and start the periodic flusher. Task context, after the block
 /// devices (USB included) are registered.
-pub fn init() {
+pub fn init() { init_inner(false) }
+
+/// Re-check for the log partition after a module registered a disk (boot-path drivers built
+/// as modules appear after `init`). No-op once logging is attached; silent when still absent.
+pub fn on_disk_registered() {
+    if STATE.lock().is_some() { return; }
+    init_inner(true)
+}
+
+fn init_inner(quiet: bool) {
     let idx = match drivers::blkdev::find_log_partition(crate::boot_disk()) {
         Some(i) => i,
         None => {
-            crate::serial_print_str("[KLOG] no log partition on the boot disk; log is RAM only\n");
+            if !quiet { crate::serial_print_str("[KLOG] no log partition on the boot disk; log is RAM only\n"); }
             return;
         }
     };
