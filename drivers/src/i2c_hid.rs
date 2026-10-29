@@ -25,6 +25,17 @@ static PS2_REINIT: AtomicUsize = AtomicUsize::new(0);
 pub fn set_ps2_reinit(f: fn()) { PS2_REINIT.store(f as usize, Ordering::Release); }
 
 const POLL_ACTIVE_NS: u64 = 8_000_000;
+/// Idle poll period: after [`IDLE_AFTER_NS`] without a report the pad is polled this slowly
+/// (touchpad.idle_ms=N overrides; 8..=1000). One read costs ~1.3 ms, so 100 ms is ~1.3 %
+/// of a CPU against 16.7 % at 8 ms.
+const POLL_IDLE_NS: u64 = 100_000_000;
+const IDLE_AFTER_NS: u64 = 1_000_000_000;
+static IDLE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(POLL_IDLE_NS);
+
+/// Poll period for a pad last active at `last_active` (pure; unit-testable).
+pub fn adaptive_period(now_ns: u64, last_active: u64, idle_ns: u64) -> u64 {
+    if now_ns.saturating_sub(last_active) > IDLE_AFTER_NS { idle_ns } else { POLL_ACTIVE_NS }
+}
 static POLL_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(10_000_000);
 /// Delay the kernel thread should sleep between [`listen_once`] calls.
 pub fn poll_interval_ns() -> u64 { POLL_NS.load(Ordering::Relaxed) }
@@ -55,6 +66,8 @@ struct Pad {
     oversize_logged: bool,
     dbg: bool,
     last_dbg: u64,
+    /// Time of the last non-empty input report (adaptive poll).
+    last_active: u64,
 }
 
 struct Listen {
@@ -259,7 +272,7 @@ fn setup_inner(name: &str, bus: usize, s: &I2cSlave, d: &Descriptor, vid: u16, p
     Ok(Pad { mouse: hid_ptp::mouse_layout(d), ptp, uses_ids: d.uses_report_ids, dev, cmd_reg, mt: Mt::default(), asm: Assembler::default(),
         err_run: 0, t0: mono_ns(), force_fail: word("touchpad.fail", "") == Some("1"), frames: 0,
         mode_confirmed: confirmed, resent: false, mode_id: mode.id, mode_pl: hid_ptp::config_report(d, mode.id), data_reg,
-        first_err: 0, power_retried: false, unknown: 0, oversize_logged: false, dbg, last_dbg: mono_ns() })
+        first_err: 0, power_retried: false, unknown: 0, oversize_logged: false, dbg, last_dbg: mono_ns(), last_active: mono_ns() })
 }
 
 /// Put the pad back on PS/2: SLEEP the I2C side, drop the node, re-init psmouse.
@@ -310,7 +323,7 @@ fn probe_slave(s: &I2cSlave, bus: usize, reset: bool, tp_i2c: bool) -> Option<Li
     let mut pad = None;
     if tp_i2c && hid_desc::ptp(&parsed).is_some() {
         match setup_pad(&name, bus, s, &parsed, (w(20), w(22)), (in_reg, cmd_reg, w(18)), max_in.clamp(2, 256)) {
-            Ok(p) => { log(&format!("touchpad: i2c active ({}), polling every 8 ms", name)); POLL_NS.store(POLL_ACTIVE_NS, Ordering::Relaxed); crate::psmouse::set_touch_owner_i2c(true); pad = Some(p); }
+            Ok(p) => { log(&format!("touchpad: i2c active ({}), adaptive poll 8 ms active / {} ms idle", name, IDLE_NS.load(Ordering::Relaxed) / 1_000_000)); POLL_NS.store(POLL_ACTIVE_NS, Ordering::Relaxed); crate::psmouse::set_touch_owner_i2c(true); pad = Some(p); }
             Err((touched, why)) => {
                 log(&format!("touchpad: i2c failed ({}), back to ps2", why));
                 if touched {
@@ -333,6 +346,9 @@ pub fn init(cmdline: &str) -> bool {
     dw_i2c::DEBUG.store(word("i2c.debug", cmdline) == Some("1"), Ordering::Relaxed);
     let mode = word("i2c_hid", cmdline).unwrap_or("probe");
     INREG.store(word("i2c_hid.inreg", cmdline) == Some("1"), Ordering::Relaxed);
+    if let Some(ms) = word("touchpad.idle_ms", cmdline).and_then(|v| v.parse::<u64>().ok()) {
+        IDLE_NS.store(ms.clamp(8, 1000) * 1_000_000, Ordering::Relaxed);
+    }
     let tp_arg = word("touchpad", cmdline);
     let tp = tp_arg.unwrap_or("auto");
     if tp == "auto" && tp_arg.is_some() { log("touchpad=auto: same as the default (i2c when ACPI has an I2C-HID pad)"); }
@@ -436,6 +452,7 @@ fn pad_poll(l: &mut Listen, now_ns: u64) {
                 }
                 if len <= 2 { l.empty += 1; break; }
                 l.reports += 1;
+                pad.last_active = now_ns;
                 let rep = &buf[2..len];
                 if let Some((_, f)) = hid_ptp::parse_report(&pad.ptp, pad.uses_ids, rep) {
                     pad.unknown = 0;
@@ -484,6 +501,7 @@ fn pad_poll(l: &mut Listen, now_ns: u64) {
     }
     if why.is_none() {
         if let Some(pad) = l.pad.as_mut() {
+            POLL_NS.store(adaptive_period(now_ns, pad.last_active, IDLE_NS.load(Ordering::Relaxed)), Ordering::Relaxed);
             if pad.dbg && now_ns.saturating_sub(pad.last_dbg) > DBG_PERIOD_NS {
                 pad.last_dbg = now_ns;
                 log(&format!("touchpad: i2c reports {} frames {} empty {} errs {} unknown {} ps2 pad packets dropped {}",
