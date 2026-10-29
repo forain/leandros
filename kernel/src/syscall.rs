@@ -11147,6 +11147,35 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         return if sched::uaccess::write_user(arg, n.min(i32::MAX as isize) as i32) { 0 } else { -14 };
     }
 
+    // SIOCGIF* (getifaddrs' ioctl fallback, if_nameindex, if_indextoname,
+    // nICEr's SIOCGIFFLAGS): answered from the net server's interface table
+    // (`net_server::rtnetlink`). The user buffers are copied with no lock held.
+    if fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE
+        && net_server::rtnetlink::is_if_ioctl(cmd as u32)
+    {
+        use net_server::rtnetlink as nl;
+        let links = nl::current_links();
+        if cmd as u32 == nl::SIOCGIFCONF {
+            // struct ifconf { int ifc_len; (pad) char *ifc_buf; }
+            if arg == 0 { return -14; }
+            let (len, buf) = match (sched::uaccess::read_user::<i32>(arg), sched::uaccess::read_user::<usize>(arg + 8)) {
+                (Some(l), Some(b)) => (l.max(0) as usize, b), _ => return -14,
+            };
+            let all = nl::ifconf(&links, usize::MAX);
+            let out = if buf == 0 { &all[..] } else { &all[..all.len().min(len) / nl::IFREQ_LEN * nl::IFREQ_LEN] };
+            if buf != 0 && !out.is_empty() {
+                if !validate_user_buf(buf, out.len()) { return -14; }
+                if unsafe { sched::uaccess::copy_raw(buf as *mut u8, out.as_ptr(), out.len()) } != 0 { return -14; }
+            }
+            return if sched::uaccess::write_user(arg, out.len() as i32) { 0 } else { -14 };
+        }
+        if arg == 0 || !validate_user_buf(arg, nl::IFREQ_LEN) { return -14; }
+        let mut ifr = match sched::uaccess::read_user::<[u8; nl::IFREQ_LEN]>(arg) { Some(v) => v, None => return -14 };
+        let r = nl::ifreq_ioctl(cmd as u32, &mut ifr, &links);
+        if r < 0 { return r as isize; }
+        return if sched::uaccess::write_user(arg, ifr) { 0 } else { -14 };
+    }
+
     // ── Block devices ────────────────────────────────────────────────────────
     // BLKGETSIZE64/BLKSSZGET/BLKPG/LOOP_* live in the VFS's block registry,
     // which owns the node, its size and its partition table. Dispatched on the

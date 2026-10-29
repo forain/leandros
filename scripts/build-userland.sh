@@ -106,6 +106,9 @@ if command -v zig >/dev/null 2>&1; then
     # nettest: same idea (ICMP/UDP/TCP basics, checked against a host kernel).
     echo "[userland] Building nettest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nettest" userland/nettest/nettest.c
+    # netlinktest: NETLINK_ROUTE dumps, getifaddrs, if_nameindex, SIOCGIF* (nICEr / Firefox WebRTC ICE gathering).
+    echo "[userland] Building netlinktest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/netlinktest" userland/netlinktest/netlinktest.c
     # udptest: UDP semantics, EPOLLET edges of UDP/ICMP/listeners (checked against a host kernel).
     echo "[userland] Building udptest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/udptest" userland/udptest/udptest.c
