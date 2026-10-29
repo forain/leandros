@@ -34,6 +34,7 @@ pub mod msc;
 pub mod transfer;
 pub mod xhci;
 pub mod uvc;
+pub mod class;
 
 pub use descriptor::*;
 pub use device::UsbDevice;
@@ -152,6 +153,7 @@ fn adopt(bus: u8, e: xhci::Enumerated, hot: bool) -> Option<XhciBulk> {
         hid::register(pipes, name, hid::initial_leds(), i.vendor, i.product);
     }
     let is_bt = i.class == 0xE0;
+    let (vid, pid) = (i.vendor, i.product);
     DEVICES.lock().push(i);
     let audio = match audio {
         Some(f) if is_bt => {
@@ -161,15 +163,14 @@ fn adopt(bus: u8, e: xhci::Enumerated, hot: bool) -> Option<XhciBulk> {
         }
         a => a,
     };
-    // A camera arrives through the same isochronous-function path.
-    let (video, audio) = match audio {
-        Some(f) if uvc::has_video_streaming(&f.cfg) => (Some(f), None),
-        a => (None, a),
+    // Class drivers (video, and any registered at run time) get the function first.
+    let audio = match audio {
+        Some(f) => match class::offer(f, bus, vid, pid) {
+            class::Offer::Claimed | class::Offer::Kept => None,
+            class::Offer::NoMatch(f) => Some(f),
+        },
+        None => None,
     };
-    if let Some(f) = video {
-        usb_log!("[USB] bus {} slot {}: video function (UVC)\n", bus, f.slot);
-        uvc::register(f);
-    }
     if let Some(f) = audio {
         usb_log!("[USB] bus {} slot {}: audio function, {} isochronous endpoint(s)\n",
                  bus, f.slot, f.isoch_endpoints().len());
@@ -228,7 +229,7 @@ fn detach(bus: u8, hc: &Controller, port: u8, route: u32, ev: &mut Vec<HotEvent>
         } else {
             if i.hid != 0 { hid::detach(hc, i.slot); }
             xhci::isoch::detach(hc, i.slot);
-            uvc::detach(hc, i.slot);
+            class::detach(hc, i.slot);
             xhci::release_slot(hc, i.slot);
             usb_log!("[USB] bus {} slot {}: released\n", bus, i.slot);
         }

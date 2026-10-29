@@ -20,14 +20,40 @@
 //! handed back to the allocator, so a stale mapping can only see old frames).
 //! mmap offset of buffer i = i << 24.
 //!
-//! The stream (`usb::uvc::Stream`) is pumped from the USB timer tick
-//! (`usb::uvc::tick` -> `pump`, try-lock only, IRQ-safe wake) and also on
-//! every DQBUF/poll in task context.
+//! Cameras register through `register_camera(owner, ops, ctx)` with a
+//! `KCameraOps` table (the built-in uvc driver does the same as a module
+//! would); nothing here names a USB type. The stream is pumped from the USB
+//! timer tick (`usb::class::tick` -> `pump`, try-lock only, IRQ-safe wake) and
+//! also on every DQBUF/poll in task context.
 
 use super::*;
 use alloc::sync::Arc;
 use spin::Mutex;
-use usb::uvc::{self, Buf, Camera, FormatDesc, FrameDesc, Stream, FMT_MJPEG, FMT_NV12, FMT_YUYV};
+use kmod_abi::{KCamBuf, KCamDone, KCamInfo, KCameraOps, KFormat, KFrame, KmodId, KCAM_GONE};
+
+const FMT_MJPEG: u8 = kmod_abi::KFMT_MJPEG;
+const FMT_YUYV: u8 = kmod_abi::KFMT_YUYV;
+const FMT_NV12: u8 = kmod_abi::KFMT_NV12;
+
+#[derive(Clone, Copy)]
+pub(crate) struct FrameDesc { pub index: u8, pub width: u16, pub height: u16, pub max_size: u32, pub interval: u32 }
+pub(crate) struct FormatDesc { pub index: u8, pub kind: u8, pub default_frame: u8, pub frames: Vec<FrameDesc> }
+pub(crate) struct CamInfo { pub bcd_uvc: u16, pub formats: Vec<FormatDesc> }
+
+/// A registered camera: its description (snapshotted at registration) and its ops.
+pub(crate) struct Camera {
+    pub owner: KmodId,
+    pub info: CamInfo,
+    pub slot: u8,
+    ops: &'static KCameraOps,
+    ctx: usize,
+}
+
+static CAMERAS: Mutex<Vec<Arc<Camera>>> = Mutex::new(Vec::new());
+
+/// The camera behind the active stream (what the tick pumps).
+#[derive(Clone, Copy)]
+struct CamRef { ops: &'static KCameraOps, ctx: usize }
 
 pub const VIDEO_MAJOR: u32 = 81;
 
@@ -113,7 +139,7 @@ static DEV: Mutex<Dev> = Mutex::new(Dev {
     pending: [false; MAX_BUFS], queued: [false; MAX_BUFS], streaming: false,
 });
 static POOL: Mutex<Pool> = Mutex::new(Pool { cap: 0, order: 0, phys: [0; MAX_BUFS], n: 0 });
-static STREAM: Mutex<Option<Stream>> = Mutex::new(None);
+static STREAM: Mutex<Option<CamRef>> = Mutex::new(None);
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static WAKE_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -121,21 +147,57 @@ fn poll_key() -> u64 { sched::poll_key(sched::poll_class::VIDEO, 0) }
 
 // ── registration, tick, VFS handler ─────────────────────────────────────────
 
-/// Create /dev/video0 and hook the USB tick. Called once at boot.
+/// Create /dev/video0, hook the USB tick and take cameras from the built-in uvc driver.
+/// Called once at boot.
 pub(crate) fn init() {
     let Some(port) = ipc::port::create(0) else { return };
     if !ipc::port::register_kernel_handler(port, handle) { return; }
     vfs::register_device_notify_open("/dev/video0", port, 0, VIDEO_MAJOR, 0);
-    uvc::set_pump(pump);
+    usb::class::tick_register(KmodId(0), pump_tick, 0);
+    usb::uvc::set_camera_sink(usb::uvc::CameraSink {
+        add: |owner, ops, ctx| { let _ = register_camera(owner, ops, ctx); },
+        remove: unregister_camera,
+    });
 }
+
+/// Register a camera. Its formats and frame sizes are read once, here. 0 ok, -22 bad table.
+pub(crate) fn register_camera(owner: KmodId, ops: &'static KCameraOps, ctx: usize) -> i32 {
+    let mut ci = KCamInfo::default();
+    if (ops.info)(ctx, &mut ci) != 0 { return -22; }
+    let mut formats = Vec::new();
+    for i in 0..ci.nformats as u32 {
+        let mut kf = KFormat::default();
+        if (ops.format)(ctx, i, &mut kf) != 0 { return -22; }
+        let mut frames = Vec::new();
+        for j in 0..kf.nframes {
+            let mut y = KFrame::default();
+            if (ops.frame)(ctx, i, j, &mut y) != 0 { return -22; }
+            frames.push(FrameDesc { index: y.index, width: y.width, height: y.height, max_size: y.max_size, interval: y.interval });
+        }
+        formats.push(FormatDesc { index: kf.index, kind: kf.kind, default_frame: kf.default_frame, frames });
+    }
+    let cam = Arc::new(Camera { owner, info: CamInfo { bcd_uvc: ci.bcd, formats }, slot: ci.slot, ops, ctx });
+    CAMERAS.lock().push(cam);
+    0
+}
+
+/// The camera with this ctx went away (unplugged).
+pub(crate) fn unregister_camera(ctx: usize) {
+    CAMERAS.lock().retain(|c| c.ctx != ctx);
+}
+
+/// Registered cameras (ktest).
+pub(crate) fn camera_count() -> usize { CAMERAS.lock().len() }
+
+fn camera(i: usize) -> Option<Arc<Camera>> { CAMERAS.lock().get(i).cloned() }
+
+fn pump_tick(_ctx: usize) { pump(); }
 
 /// USB timer tick (IRQ context): reassemble frames, wake pollers.
 fn pump() {
-    if let Some(mut g) = STREAM.try_lock() {
-        if let Some(s) = g.as_mut() {
-            let before = s.ready();
-            s.poll();
-            if s.ready() > before || s.is_gone() { WAKE_PENDING.store(true, Ordering::Release); }
+    if let Some(g) = STREAM.try_lock() {
+        if let Some(c) = *g {
+            if (c.ops.stream_poll)(c.ctx) != 0 { WAKE_PENDING.store(true, Ordering::Release); }
         }
     }
     if WAKE_PENDING.load(Ordering::Acquire) {
@@ -164,7 +226,7 @@ fn handle(msg: &Message, _caller: u32, _target: u32) -> Message {
     match msg.tag {
         VFS_OPEN => {
             let id = match msg_arg(msg, 4) as u32 { 0 => u32::MAX, v => v };
-            let Some(cam) = uvc::camera(0) else { return reply(ENODEV as i64) };
+            let Some(cam) = camera(0) else { return reply(ENODEV as i64) };
             if default_format(&cam).0 == 0 { return reply(ENODEV as i64); }
             let mut d = DEV.lock();
             if d.owner != 0 { return reply(EBUSY as i64); }
@@ -176,10 +238,11 @@ fn handle(msg: &Message, _caller: u32, _target: u32) -> Message {
         VFS_POLL => {
             let revents = {
                 let mut g = STREAM.lock();
-                match g.as_mut() {
-                    Some(s) => {
-                        s.poll();
-                        if s.is_gone() { POLLERR } else if s.ready() > 0 { POLLIN | POLLRDNORM } else { 0 }
+                match *g {
+                    Some(c) => {
+                        let f = (c.ops.stream_poll)(c.ctx);
+                        if f & KCAM_GONE != 0 || (c.ops.stream_gone)(c.ctx) { POLLERR }
+                        else if (c.ops.stream_ready)(c.ctx) > 0 { POLLIN | POLLRDNORM } else { 0 }
                     }
                     None => POLLERR,
                 }
@@ -328,7 +391,7 @@ fn pool_ensure(n: usize, cap: usize) -> Result<(), isize> {
 
 fn stream_off(d: &mut Dev) {
     let s = STREAM.lock().take();
-    if let Some(s) = s { let _ = s.stop(); }
+    if let Some(c) = s { (c.ops.stream_stop)(c.ctx); }
     d.streaming = false;
     d.pending = [false; MAX_BUFS];
     d.queued = [false; MAX_BUFS];
@@ -345,7 +408,7 @@ fn ioctl(pid: u32, fd: usize, id: u32, cmd: usize, arg: usize) -> isize {
             pstr(&mut b, 0, 16, "uvcvideo");
             let card = alloc::format!("UVC Camera (UVC {:x}.{:02x})", cam.info.bcd_uvc >> 8, cam.info.bcd_uvc & 0xFF);
             pstr(&mut b, 16, 32, &card);
-            pstr(&mut b, 48, 32, &alloc::format!("usb-xhci-{}", cam.func.as_ref().map_or(255, |f| f.slot)));
+            pstr(&mut b, 48, 32, &alloc::format!("usb-xhci-{}", cam.slot));
             p32(&mut b, 80, (6 << 16) | (1 << 8));
             p32(&mut b, 84, CAP_VIDEO_CAPTURE | CAP_STREAMING | CAP_DEVICE_CAPS);
             p32(&mut b, 88, CAP_VIDEO_CAPTURE | CAP_STREAMING);
@@ -445,21 +508,9 @@ fn ioctl(pid: u32, fd: usize, id: u32, cmd: usize, arg: usize) -> isize {
             let id = g32(&b, 0);
             let set = cmd == VIDIOC_S_CTRL;
             let v = g32(&b, 4);
-            use core::sync::atomic::Ordering::Relaxed;
-            let out = match id {
-                CID_EXPOSURE_AUTO => {
-                    if set { uvc::EXPO_MODE.store(if v == 1 { uvc::EXPO_MANUAL } else { uvc::EXPO_AUTO }, Relaxed); v }
-                    else if uvc::EXPO_MODE.load(Relaxed) == uvc::EXPO_MANUAL { 1 } else { 3 }
-                }
-                CID_EXPOSURE_ABSOLUTE => {
-                    if set { uvc::EXPO_ABS.store(v.clamp(1, 100_000), Relaxed); v } else { uvc::EXPO_ABS.load(Relaxed) }
-                }
-                CID_EXPOSURE_AUTO_PRIORITY => {
-                    if set { uvc::AE_PRIO.store((v != 0) as i32, Relaxed); (v != 0) as u32 }
-                    else { (uvc::AE_PRIO.load(Relaxed) != 0) as u32 }
-                }
-                _ => return EINVAL,
-            };
+            if !matches!(id, CID_EXPOSURE_AUTO | CID_EXPOSURE_ABSOLUTE | CID_EXPOSURE_AUTO_PRIORITY) { return EINVAL; }
+            let mut out = 0u32;
+            if (cam.ops.control)(cam.ctx, id, set, v, &mut out) != 0 { return EINVAL; }
             p32(&mut b, 4, out);
             wr(arg, &b)
         }
@@ -504,7 +555,7 @@ fn ioctl(pid: u32, fd: usize, id: u32, cmd: usize, arg: usize) -> isize {
             if cmd == VIDIOC_QBUF {
                 if g32(&b, 60) != MEMORY_MMAP || d.queued[i] || d.pending[i] { return EINVAL; }
                 if d.streaming {
-                    let ok = STREAM.lock().as_mut().map(|s| s.qbuf(i)).unwrap_or(false);
+                    let ok = (cam.ops.stream_qbuf)(cam.ctx, i as u32) == 0;
                     if !ok { return EINVAL; }
                     d.queued[i] = true;
                 } else {
@@ -519,23 +570,18 @@ fn ioctl(pid: u32, fd: usize, id: u32, cmd: usize, arg: usize) -> isize {
             let b = match rd::<4>(arg) { Ok(b) => b, Err(e) => return e };
             if g32(&b, 0) != BUF_TYPE_CAPTURE || d.nreq == 0 { return EINVAL; }
             if d.streaming { return 0; }
-            let bufs = {
+            let bufs: Vec<KCamBuf> = {
                 let p = POOL.lock();
-                (0..d.nreq).map(|i| Buf { ptr: mm::phys_to_virt(p.phys[i]) as *mut u8, cap: p.cap }).collect()
+                (0..d.nreq).map(|i| KCamBuf { ptr: mm::phys_to_virt(p.phys[i]) as *mut u8, cap: p.cap }).collect()
             };
-            let started = match &cam.func {
-                Some(f) => Stream::start(f, &cam.info, d.fmt, d.frame, d.interval, bufs),
-                None => Stream::start_fake(&cam.info, d.fmt, d.frame, d.interval, bufs),
-            };
-            let mut s = match started {
-                Ok(s) => s,
-                Err(_) => return EIO,
-            };
+            if (cam.ops.stream_start)(cam.ctx, d.fmt, d.frame, d.interval, bufs.as_ptr(), bufs.len() as u32) != 0 {
+                return EIO;
+            }
             for i in 0..d.nreq {
-                if d.pending[i] && s.qbuf(i) { d.queued[i] = true; }
+                if d.pending[i] && (cam.ops.stream_qbuf)(cam.ctx, i as u32) == 0 { d.queued[i] = true; }
             }
             d.pending = [false; MAX_BUFS];
-            *STREAM.lock() = Some(s);
+            *STREAM.lock() = Some(CamRef { ops: cam.ops, ctx: cam.ctx });
             d.streaming = true;
             0
         }
@@ -560,18 +606,18 @@ fn dqbuf(pid: u32, fd: usize, id: u32, arg: usize) -> isize {
     let nonblock = vfs::fd_nonblock(pid, fd);
     let deadline = monotonic_ns() + 3_000_000_000;
     loop {
-        let got = {
-            let mut g = STREAM.lock();
-            let Some(s) = g.as_mut() else { return EINVAL };
-            s.poll();
-            if s.is_gone() { return ENODEV; }
-            s.dqbuf()
+        let mut done = KCamDone::default();
+        let r = {
+            let Some(c) = *STREAM.lock() else { return EINVAL };
+            (c.ops.stream_dqbuf)(c.ctx, &mut done)
         };
-        if let Some(done) = got {
-            DEV.lock().queued[done.index] = false;
+        if r == -19 { return ENODEV; }
+        if r == -22 { return EINVAL; }
+        if r == 0 {
+            DEV.lock().queued[done.index as usize] = false;
             let len = POOL.lock().cap as u32;
-            let flags = BUF_FLAG_DONE | if done.error { BUF_FLAG_ERROR } else { 0 };
-            buf_fill(&mut b, done.index, done.bytes as u32, flags, done.seq, done.ts_ns, len);
+            let flags = BUF_FLAG_DONE | if done.error != 0 { BUF_FLAG_ERROR } else { 0 };
+            buf_fill(&mut b, done.index as usize, done.bytes as u32, flags, done.seq, done.ts_ns, len);
             return wr(arg, &b);
         }
         if nonblock { return EAGAIN; }

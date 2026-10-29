@@ -434,6 +434,70 @@ pub extern "C" fn kapi_pm_register(_owner: KmodId, suspend: Option<KPmFn>, resum
     0
 }
 
+// ── uvc-class exports (L7a): V4L2 camera registration, USB class drivers, tick callbacks ──
+
+use kmod_abi::{KCameraOps, KTickFn, KUsbIf, KUsbProbeFn, KmodDevId, BUS_USB};
+
+/// Register a camera with the V4L2 layer; it appears as /dev/video0 candidate at once.
+/// 0 ok, -22 bad table or description.
+#[no_mangle]
+pub extern "C" fn kapi_v4l2_register(owner: KmodId, ops: *const KCameraOps, ctx: usize) -> i32 {
+    if ops.is_null() { return -22; }
+    // Modules are permanent, so the table lives as long as the kernel.
+    let ops: &'static KCameraOps = unsafe { &*ops };
+    let r = crate::syscall::v4l2::register_camera(owner, ops, ctx);
+    if r == 0 { super::registry::note_registration(owner, RegKind::V4L2, ctx as u64); }
+    r
+}
+
+fn tick_tramp(p: usize) {
+    let b = unsafe { &*(p as *const (KTickFn, usize)) };
+    (b.0)(b.1);
+}
+
+/// Run `f(ctx)` on every USB timer tick (interrupt context, must not block). 0 ok.
+#[no_mangle]
+pub extern "C" fn kapi_tick_register(owner: KmodId, f: KTickFn, ctx: usize) -> i32 {
+    let p = Box::into_raw(Box::new((f, ctx))) as usize;
+    usb::class::tick_register(owner, tick_tramp, p);
+    0
+}
+
+/// Functions claimed by module class drivers (kept alive; the handle in `KUsbIf` is the slot).
+static CLAIMED: spin::Mutex<alloc::vec::Vec<usb::xhci::isoch::UsbFunction>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Number of USB functions held by module class drivers (ktest).
+pub fn usb_claimed() -> usize { CLAIMED.lock().len() }
+
+fn usb_probe_tramp(f: usb::xhci::isoch::UsbFunction, m: &usb::class::Match, p: usize)
+    -> Result<(), usb::xhci::isoch::UsbFunction> {
+    let b = unsafe { &*(p as *const (KUsbProbeFn, usize)) };
+    let intf = KUsbIf {
+        handle: f.slot as u64, vid: m.vid, pid: m.pid, slot: f.slot,
+        class: m.class, subclass: m.subclass, protocol: m.protocol, iface: m.iface, _pad: [0; 7],
+    };
+    if (b.0)(&intf, b.1) == 0 { CLAIMED.lock().push(f); Ok(()) } else { Err(f) }
+}
+
+/// Register a USB class driver for the given USB id-table entries. Interfaces that were
+/// enumerated earlier and left unclaimed are offered to it before this returns.
+/// 0 ok, -22 bad arguments.
+#[no_mangle]
+pub extern "C" fn kapi_usb_class_register(owner: KmodId, ids: *const KmodDevId, nids: usize,
+                                          probe: KUsbProbeFn, ctx: usize) -> i32 {
+    if ids.is_null() || nids == 0 || nids > 64 { return -22; }
+    let v: alloc::vec::Vec<usb::class::IdEntry> = unsafe { core::slice::from_raw_parts(ids, nids) }
+        .iter().filter(|e| e.bus == BUS_USB)
+        .map(|e| usb::class::IdEntry { vid: e.a, pid: e.b, class: e.class, mask: e.class_mask }).collect();
+    if v.is_empty() { return -22; }
+    let p = Box::into_raw(Box::new((probe, ctx))) as usize;
+    super::registry::note_registration(owner, RegKind::USB_CLASS, p as u64);
+    usb::class::register(usb::class::Driver {
+        owner, ids: usb::class::leak_ids(v), probe: usb_probe_tramp, detach: None, ctx: p,
+    });
+    0
+}
+
 fn run_pm(f: Option<KPmFn>, ctx: usize) -> Option<(i32, String)> {
     let f = f?;
     let mut buf = [0u8; 256];
@@ -490,6 +554,9 @@ const _: sys::NetdevRegisterFn = kapi_netdev_register;
 const _: sys::NetdevKickFn = kapi_netdev_kick;
 const _: sys::NetdevKickFn = kapi_netdev_kick_from_irq;
 const _: sys::PmRegisterFn = kapi_pm_register;
+const _: sys::V4l2RegisterFn = kapi_v4l2_register;
+const _: sys::TickRegisterFn = kapi_tick_register;
+const _: sys::UsbClassRegisterFn = kapi_usb_class_register;
 const _: () = {
     assert!(mm::kmodwin::BASE as u64 == kmod_abi::layout::BASE);
     assert!(mm::kmodwin::SIZE as u64 == kmod_abi::layout::SIZE);
@@ -497,7 +564,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 33;
+pub const NEXPORTS: usize = 36;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -535,6 +602,9 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_netdev_kick", kapi_netdev_kick),
     sym!("kapi_netdev_kick_from_irq", kapi_netdev_kick_from_irq),
     sym!("kapi_pm_register", kapi_pm_register),
+    sym!("kapi_v4l2_register", kapi_v4l2_register),
+    sym!("kapi_tick_register", kapi_tick_register),
+    sym!("kapi_usb_class_register", kapi_usb_class_register),
 ];
 
 extern "C" {

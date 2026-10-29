@@ -26,8 +26,9 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use spin::Mutex;
+use kmod_abi::{KCamBuf, KCamDone, KCamInfo, KCameraOps, KFormat, KFrame, KmodId, KCAM_GONE, KCAM_NEW_FRAME};
 
 use crate::platform::{self, Deadline};
 use crate::transport::UsbErr;
@@ -562,8 +563,18 @@ pub fn register(f: UsbFunction) {
     let cam = Arc::new(Camera { func: Some(f), info });
     let n = SELFTEST_FRAMES.load(Ordering::Relaxed);
     if n != 0 { selftest(&cam, n); }
-    CAMERAS.lock().push(cam);
+    CAMERAS.lock().push(cam.clone());
+    announce(cam);
 }
+
+/// Class-driver probe (the built-in table entry for video streaming interfaces).
+pub fn class_probe(f: UsbFunction, m: &crate::class::Match, _ctx: usize) -> Result<(), UsbFunction> {
+    usb_log!("[USB] bus {} slot {}: video function (UVC)\n", m.bus, f.slot);
+    register(f);
+    Ok(())
+}
+
+pub fn class_detach(hc: &crate::xhci::Hc, slot: u8, _ctx: usize) { detach(hc, slot); }
 
 /// Register the fake camera when `uvc.fake=1` was given (MJPG and YUYV 640x480).
 pub fn register_fake() {
@@ -579,7 +590,9 @@ pub fn register_fake() {
         ..Default::default()
     };
     usb_log!("[UVC] fake camera registered (uvc.fake=1)\n");
-    CAMERAS.lock().push(Arc::new(Camera { func: None, info }));
+    let cam = Arc::new(Camera { func: None, info });
+    CAMERAS.lock().push(cam.clone());
+    announce(cam);
 }
 
 /// The first camera, if any.
@@ -587,22 +600,148 @@ pub fn camera(i: usize) -> Option<Arc<Camera>> { CAMERAS.lock().get(i).cloned() 
 
 /// The device on (`hc`, `slot`) left.
 pub fn detach(hc: &crate::xhci::Hc, slot: u8) {
-    CAMERAS.lock().retain(|c| !c.func.as_ref().map_or(false, |f| core::ptr::eq(&*f.hc, hc) && f.slot == slot));
+    let gone: Vec<usize> = {
+        let mut cams = CAMERAS.lock();
+        let mut ctxs = CTXS.lock();
+        let mut out = Vec::new();
+        cams.retain(|c| {
+            let g = c.func.as_ref().map_or(false, |f| core::ptr::eq(&*f.hc, hc) && f.slot == slot);
+            if g { ctxs.retain(|&x| { let hit = unsafe { Arc::ptr_eq(&(*(x as *const CamCtx)).cam, c) }; if hit { out.push(x); } !hit }); }
+            !g
+        });
+        out
+    };
+    let sink = *SINK.lock();
+    if let Some(k) = sink { for c in gone { (k.remove)(c); } }
 }
 
-static PUMP: AtomicUsize = AtomicUsize::new(0);
+// ── the camera ops adapter: uvc registers with the kernel's V4L2 layer through KCameraOps ──
 
-/// Install the stream pump the USB timer tick runs (the kernel's V4L2 layer).
-pub fn set_pump(f: fn()) { PUMP.store(f as usize, Ordering::Release); }
+/// Where cameras are announced (the kernel's V4L2 layer installs this at boot).
+#[derive(Clone, Copy)]
+pub struct CameraSink {
+    pub add: fn(KmodId, &'static KCameraOps, usize),
+    pub remove: fn(usize),
+}
 
-/// USB timer tick (IRQ context): run the installed pump, if any.
-pub fn tick() {
-    let p = PUMP.load(Ordering::Acquire);
-    if p != 0 {
-        let f: fn() = unsafe { core::mem::transmute(p) };
-        f();
+struct CamCtx {
+    cam: Arc<Camera>,
+    stream: Mutex<Option<Stream>>,
+}
+
+static SINK: Mutex<Option<CameraSink>> = Mutex::new(None);
+/// `*const CamCtx` of every announced camera, for replay to a sink installed later.
+static CTXS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn announce(cam: Arc<Camera>) {
+    let ctx = Box::into_raw(Box::new(CamCtx { cam, stream: Mutex::new(None) })) as usize;
+    CTXS.lock().push(ctx);
+    let sink = *SINK.lock();
+    if let Some(k) = sink { (k.add)(KmodId(0), &UVC_OPS, ctx); }
+}
+
+/// Install the sink and replay every camera announced so far.
+pub fn set_camera_sink(k: CameraSink) {
+    *SINK.lock() = Some(k);
+    let all: Vec<usize> = CTXS.lock().clone();
+    for c in all { (k.add)(KmodId(0), &UVC_OPS, c); }
+}
+
+fn cx<'a>(ctx: usize) -> &'a CamCtx { unsafe { &*(ctx as *const CamCtx) } }
+
+extern "C" fn op_info(ctx: usize, out: *mut KCamInfo) -> i32 {
+    let c = &cx(ctx).cam;
+    unsafe {
+        *out = KCamInfo {
+            bcd: c.info.bcd_uvc,
+            slot: c.func.as_ref().map_or(255, |f| f.slot),
+            nformats: c.info.formats.len().min(255) as u8,
+        };
+    }
+    0
+}
+extern "C" fn op_format(ctx: usize, i: u32, out: *mut KFormat) -> i32 {
+    let Some(f) = cx(ctx).cam.info.formats.get(i as usize) else { return -22 };
+    unsafe { *out = KFormat { index: f.index, kind: f.kind, bpp: f.bpp, default_frame: f.default_frame, nframes: f.frames.len() as u32 }; }
+    0
+}
+extern "C" fn op_frame(ctx: usize, fi: u32, ji: u32, out: *mut KFrame) -> i32 {
+    let Some(y) = cx(ctx).cam.info.formats.get(fi as usize).and_then(|f| f.frames.get(ji as usize)) else { return -22 };
+    unsafe { *out = KFrame { index: y.index, _pad: 0, width: y.width, height: y.height, _pad2: 0, max_size: y.max_size, interval: y.interval }; }
+    0
+}
+extern "C" fn op_stream_start(ctx: usize, fmt: u8, frame: u8, interval: u32, bufs: *const KCamBuf, n: u32) -> i32 {
+    let c = cx(ctx);
+    let bufs: Vec<Buf> = (0..n as usize).map(|i| { let b = unsafe { *bufs.add(i) }; Buf { ptr: b.ptr, cap: b.cap } }).collect();
+    let started = match &c.cam.func {
+        Some(f) => Stream::start(f, &c.cam.info, fmt, frame, interval, bufs),
+        None => Stream::start_fake(&c.cam.info, fmt, frame, interval, bufs),
+    };
+    match started {
+        Ok(s) => { *c.stream.lock() = Some(s); 0 }
+        Err(_) => -5,
     }
 }
+extern "C" fn op_stream_stop(ctx: usize) {
+    let s = cx(ctx).stream.lock().take();
+    if let Some(s) = s { let _ = s.stop(); }
+}
+extern "C" fn op_stream_poll(ctx: usize) -> u32 {
+    let Some(mut g) = cx(ctx).stream.try_lock() else { return 0 };
+    let Some(s) = g.as_mut() else { return 0 };
+    let before = s.ready();
+    s.poll();
+    (if s.ready() > before { KCAM_NEW_FRAME } else { 0 }) | (if s.is_gone() { KCAM_GONE } else { 0 })
+}
+extern "C" fn op_stream_ready(ctx: usize) -> u32 {
+    cx(ctx).stream.lock().as_ref().map_or(0, |s| s.ready() as u32)
+}
+extern "C" fn op_stream_gone(ctx: usize) -> bool {
+    cx(ctx).stream.lock().as_ref().map_or(true, |s| s.is_gone())
+}
+extern "C" fn op_stream_qbuf(ctx: usize, i: u32) -> i32 {
+    if cx(ctx).stream.lock().as_mut().map_or(false, |s| s.qbuf(i as usize)) { 0 } else { -22 }
+}
+extern "C" fn op_stream_dqbuf(ctx: usize, out: *mut KCamDone) -> i32 {
+    let mut g = cx(ctx).stream.lock();
+    let Some(s) = g.as_mut() else { return -22 };
+    s.poll();
+    if s.is_gone() { return -19; }
+    match s.dqbuf() {
+        Some(d) => {
+            unsafe { *out = KCamDone { index: d.index as u32, seq: d.seq, bytes: d.bytes as u64, ts_ns: d.ts_ns, error: d.error as u32, _pad: 0 }; }
+            0
+        }
+        None => -11,
+    }
+}
+extern "C" fn op_control(_ctx: usize, cid: u32, set: bool, v: u32, out: *mut u32) -> i32 {
+    use core::sync::atomic::Ordering::Relaxed;
+    const AUTO: u32 = 0x009a_0901;
+    const ABS: u32 = 0x009a_0902;
+    const PRIO: u32 = 0x009a_0903;
+    let r = match cid {
+        AUTO => {
+            if set { EXPO_MODE.store(if v == 1 { EXPO_MANUAL } else { EXPO_AUTO }, Relaxed); v }
+            else if EXPO_MODE.load(Relaxed) == EXPO_MANUAL { 1 } else { 3 }
+        }
+        ABS => { if set { EXPO_ABS.store(v.clamp(1, 100_000), Relaxed); v } else { EXPO_ABS.load(Relaxed) } }
+        PRIO => {
+            if set { AE_PRIO.store((v != 0) as i32, Relaxed); (v != 0) as u32 }
+            else { (AE_PRIO.load(Relaxed) != 0) as u32 }
+        }
+        _ => return -22,
+    };
+    unsafe { *out = r; }
+    0
+}
+
+pub static UVC_OPS: KCameraOps = KCameraOps {
+    info: op_info, format: op_format, frame: op_frame,
+    stream_start: op_stream_start, stream_stop: op_stream_stop, stream_poll: op_stream_poll,
+    stream_ready: op_stream_ready, stream_gone: op_stream_gone,
+    stream_qbuf: op_stream_qbuf, stream_dqbuf: op_stream_dqbuf, control: op_control,
+};
 
 /// FNV-1a over `d`.
 pub fn fnv1a(d: &[u8]) -> u32 {
