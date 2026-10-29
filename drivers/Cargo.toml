@@ -13,6 +13,11 @@ raspi4b = []
 # Verbose xHCI tracing and the boot-time bulk-only-transport self-test on
 # every enumerated USB mass-storage interface (drivers/src/usb_hcd.rs).
 usb-debug = []
+# kmod L1c: misc driver gates (CONFIG_* -> drv-*). Off = stub module, same API.
+drv-virtio-rng = []
+drv-hda = []
+drv-lapinv = []
+drv-i2c-hid = []
 
 # Kconfig-gated NIC drivers (CONFIG_FOO -> kernel feature drv-foo -> drivers/foo).
 # Off: the module is replaced by a small stub under src/stubs/ or compiled out.

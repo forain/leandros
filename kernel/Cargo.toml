@@ -30,6 +30,11 @@ drv-wifi-stack = ["drivers/wifi-stack"]
 drv-iwlwifi = ["drivers/iwlwifi"]
 drv-wifi-sim = ["drivers/wifi-sim"]
 drv-brcmf = ["drivers/brcmf"]
+# kmod L1c misc driver gates.
+drv-virtio-rng = ["drivers/drv-virtio-rng"]
+drv-hda = ["drivers/drv-hda"]
+drv-lapinv = ["drivers/drv-lapinv"]
+drv-i2c-hid = ["drivers/drv-i2c-hid"]
 
 [dependencies]
 mm         = { path = "../mm" }
