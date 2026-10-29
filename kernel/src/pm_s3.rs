@@ -119,6 +119,7 @@ fn suspend_inner(core_only: bool) -> i32 {
     if sig != 0x5343_4146 { say(&format!("S3 refused: FACS signature {:#x}", sig)); return -22; }
     let hwsig = facs_rd32(facs, 8);
     let facs_ver = unsafe { core::ptr::read_volatile((facs + 32) as *const u8) };
+    drivers::usb_hcd::pm_set_s3_mode(knob("pm.s3_xhci"));
     let beep = knob("pm.s3_beep") == Some("1");
     let run_wak = knob("pm.s3_wak") != Some("0");
     say(&format!("S3: begin ({}), \\_S3_ SLP_TYP {}/{}, FACS ver {} hwsig {:#x}, beep {}, _WAK {}",

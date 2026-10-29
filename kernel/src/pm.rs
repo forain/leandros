@@ -73,8 +73,14 @@ fn e1000e_suspend(_: u32) -> Result<String, String> { drivers::e1000e::pm_suspen
 fn e1000e_resume(_: u32) -> Result<String, String> { drivers::e1000e::pm_resume() }
 fn blk_suspend(_: u32) -> Result<String, String> { drivers::blkdev::pm_freeze(5_000) }
 fn blk_resume(_: u32) -> Result<String, String> { drivers::blkdev::pm_thaw() }
-fn xhci_suspend(f: u32) -> Result<String, String> { drivers::usb_hcd::pm_suspend(f & PM_XHCI_HALT != 0) }
-fn xhci_resume(_: u32) -> Result<String, String> { drivers::usb_hcd::pm_resume() }
+fn xhci_suspend(f: u32) -> Result<String, String> {
+    if f & PM_S3 != 0 { return drivers::usb_hcd::pm_suspend_s3(); }
+    drivers::usb_hcd::pm_suspend(f & PM_XHCI_HALT != 0)
+}
+fn xhci_resume(f: u32) -> Result<String, String> {
+    if f & PM_S3 != 0 { return drivers::usb_hcd::pm_resume_s3(); }
+    drivers::usb_hcd::pm_resume()
+}
 
 static PCI_SAVED: spin::Mutex<Option<alloc::vec::Vec<drivers::pci_pm::FnState>>> = spin::Mutex::new(None);
 
