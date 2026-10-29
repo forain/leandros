@@ -22,6 +22,15 @@ pub mod wa;
 #[path = "../../src/i915/gen9_renderstate.rs"]
 pub mod gen9_renderstate;
 
+#[path = "../../src/i915/wrpll.rs"]
+pub mod wrpll;
+
+#[path = "../../src/i915/buf_trans.rs"]
+pub mod buf_trans;
+
+#[path = "../../src/i915/ddb.rs"]
+pub mod ddb;
+
 #[cfg(test)]
 mod g3_tests {
     use super::softcs::*;

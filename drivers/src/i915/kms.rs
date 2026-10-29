@@ -83,27 +83,8 @@ static DDB_PENDING: AtomicBool = AtomicBool::new(false);
 static DDB_PLANE_BLOCKS: AtomicU32 = AtomicU32::new(0);
 const PIPECONF_A: u32 = 0x70008;
 
-/// skl_ddb_entry_write: start | (end - 1) << 16, end exclusive; 0 = empty.
-pub(super) fn ddb_entry(start: u32, end: u32) -> u32 { if end == 0 { 0 } else { (end - 1) << 16 | start } }
-
-/// skl_ddb_get_pipe_allocation_limits (display 9: no DBuf slices, each
-/// active pipe weighted by its hdisplay; `widths[p] == 0` = pipe off) and
-/// skl_crtc_allocate_plane_ddb for one universal plane plus the cursor: the
-/// cursor gets max(32 with one active pipe else 8, `cursor_min`) blocks at
-/// the top of the pipe's range, the single plane everything below it (the
-/// data-rate split of the left-over blocks gives one plane all of them).
-/// Returns `(plane, cursor)` as `[start, end)`.
-pub(super) fn skl_ddb_plan(ddb_size: u32, widths: &[u32], pipe: usize, cursor_min: u32) -> Option<((u32, u32), (u32, u32))> {
-    let total: u64 = widths.iter().map(|&w| w as u64).sum();
-    if pipe >= widths.len() || widths[pipe] == 0 { return None; }
-    let before: u64 = widths[..pipe].iter().map(|&w| w as u64).sum();
-    let start = (ddb_size as u64 * before / total) as u32;
-    let end = (ddb_size as u64 * (before + widths[pipe] as u64) / total) as u32;
-    let active = widths.iter().filter(|&&w| w != 0).count();
-    let cur = cursor_min.max(if active == 1 { 32 } else { 8 });
-    if end <= start + cur { return None; }
-    Some(((start, end - cur), (end - cur, end)))
-}
+// The DDB arithmetic is pure and host-tested (`ddb.rs`).
+pub(super) use super::ddb::{ddb_entry, skl_ddb_plan};
 
 /// Plan the whole-pipe DDB for pipe A (plane 1A + cursor). Only when pipe A
 /// is the only lit pipe and plane 1A its only enabled universal plane: a
@@ -116,12 +97,14 @@ fn ddb_setup(m: &Mmio, w: u32) {
         return;
     }
     let fw = m.r(preg(PLANE_BUF_CFG_1_A));
+    // Pipe A's slice is proportional to the lit pipes' hdisplay (Linux
+    // skl_ddb_get_pipe_allocation_limits); another lit pipe's own plane
+    // allocation (firmware's, we do not drive it) must stay clear of it.
     let mut widths = [0u32; 3];
     widths[0] = w;
     for p in 1..3u32 {
         if m.r(PIPECONF_A + 0x1000 * p) >> 31 != 0 {
-            ilog!("kms: ddb: pipe {} is lit too: keeping the firmware allocation (plane 1A BUF_CFG 0x{:08x})", (b'A' + p as u8) as char, fw);
-            return;
+            widths[p as usize] = (m.r(reg::pipe(reg::PIPESRC_A, p)) >> 16 & 0x1FFF) + 1;
         }
     }
     for pl in 1..3u32 {
@@ -131,6 +114,16 @@ fn ddb_setup(m: &Mmio, w: u32) {
         }
     }
     let Some(((ps, pe), (cs, ce))) = skl_ddb_plan(DDB_SIZE, &widths, 0, 0) else { return };
+    for p in 1..3usize {
+        if widths[p] == 0 { continue; }
+        let other = m.r(reg::plane(reg::PLANE_BUF_CFG_1_A, p as u32, 0));
+        let r = ((other & 0x7FF), ((other >> 16) & 0x7FF) + 1);
+        if other != 0 && super::ddb::overlaps(r, (ps, ce)) {
+            ilog!("kms: ddb: pipe {} is lit (width {}) and its plane 1 allocation {}..{} overlaps pipe A's new range {}..{}: keeping the firmware allocation",
+                  (b'A' + p as u8) as char, widths[p], r.0, r.1, ps, ce);
+            return;
+        }
+    }
     if fw != 0 && (fw >> 16) & 0x7FF >= cs {
         ilog!("kms: ddb: firmware plane 1A BUF_CFG 0x{:08x} overlaps the cursor range {}..{}: keeping the firmware allocation", fw, cs, ce);
         return;
@@ -139,8 +132,8 @@ fn ddb_setup(m: &Mmio, w: u32) {
     DDB_PLANE_BLOCKS.store(pe - ps, Ordering::Relaxed);
     DDB_PENDING.store(true, Ordering::Release);
     super::cursor::set_ddb(ddb_entry(cs, ce));
-    ilog!("kms: ddb: whole-pipe allocation (skl_allocate_plane_ddb, {} blocks, pipe A only): plane 1A {}..{} PLANE_BUF_CFG 0x{:08x} (firmware 0x{:08x}), cursor {}..{} CUR_BUF_CFG 0x{:08x}; armed with the next flip; i915.ddb=0 keeps the firmware's",
-          DDB_SIZE, ps, pe, ddb_entry(ps, pe), fw, cs, ce, ddb_entry(cs, ce));
+    ilog!("kms: ddb: whole-pipe allocation (skl_allocate_plane_ddb, {} blocks, {} pipe(s) lit): plane 1A {}..{} PLANE_BUF_CFG 0x{:08x} (firmware 0x{:08x}), cursor {}..{} CUR_BUF_CFG 0x{:08x}; armed with the next flip; i915.ddb=0 keeps the firmware's",
+          DDB_SIZE, widths.iter().filter(|&&x| x != 0).count(), ps, pe, ddb_entry(ps, pe), fw, cs, ce, ddb_entry(cs, ce));
 }
 
 /// Live PLANE_BUF_CFG_1_A / CUR_BUF_CFG_A, for /proc/i915.
@@ -148,6 +141,65 @@ pub(super) fn ddb_regs() -> Option<(u32, u32)> {
     let m = mmio();
     if m.va == 0 { return None; }
     Some((m.r(preg(PLANE_BUF_CFG_1_A)), m.r(0x7017C)))
+}
+
+/// `i915.ddb_test=1`: the C2 transition risk, tested on the panel alone.
+/// Shrinks pipe A's plane 1A to the half a lit pipe B would leave it
+/// ([0,446) minus the 8-block cursor slice), with watermarks recomputed for
+/// it, holds that for 10 s counting pipe A FIFO underruns, then writes the
+/// previous allocation and watermarks back. Both steps are armed by a
+/// PLANE_SURF rewrite of the live address inside a vblank-evaded window
+/// (the shrink only ever takes blocks away from the plane; the cursor is
+/// off, so no live plane's old range overlaps another's new one). Runs from
+/// the `pipeb` thread right after init, before any client can flip: a flip
+/// that mode-switches meanwhile would write watermarks sized for the old DDB.
+pub(super) fn ddb_test() {
+    let m = mmio();
+    if m.va == 0 || FAKE.load(Ordering::Relaxed) { log("kms: ddb test: skipped (fake device)"); return; }
+    if FLIPS.load(Ordering::Relaxed) != 0 { log("kms: ddb test: skipped (a client already flipped)"); return; }
+    let edp_on = m.r(reg::TRANSCONF_EDP) >> 31 != 0 && m.r(reg::TRANS_DDI_FUNC_CTL_EDP) >> 31 != 0;
+    let tbase = if edp_on { reg::TRANS_HTOTAL_EDP } else if m.r(reg::TRANSCONF_A) >> 31 != 0 { reg::TRANS_HTOTAL_A } else {
+        log("kms: ddb test: no enabled transcoder feeds pipe A"); return;
+    };
+    let (_, htot) = hw::timing_pair(m.r(tbase));
+    let clk = PIX_KHZ.load(Ordering::Relaxed) as u64;
+    let pw = (m.r(preg(reg::PLANE_SIZE_1_A)) & 0x1FFF) + 1;
+    let Some(lat) = skl_wm_latency(&m) else { log("kms: ddb test: no pcode watermark latencies"); return };
+    if clk == 0 { log("kms: ddb test: pixel clock unknown"); return; }
+    let Some(((ps, pe), (_, ce))) = skl_ddb_plan(DDB_SIZE, &[pw, pw], 0, 0) else { log("kms: ddb test: no plan"); return };
+    let wm = skl_plane_wm(&lat, clk, htot, pw, pe - ps);
+    if wm[0] == 0 { ilog!("kms: ddb test: level-0 watermark does not fit {} blocks", pe - ps); return; }
+    let old_buf = m.r(preg(PLANE_BUF_CFG_1_A));
+    let mut old_wm = [0u32; 9];
+    for i in 0..WM_LEVELS { old_wm[i] = m.r(preg(PLANE_WM_1_A) + 4 * i as u32); }
+    old_wm[8] = m.r(preg(PLANE_WM_TRANS_1_A));
+    let arm = |buf: u32, w: &[u32; 9]| -> bool {
+        let surf = m.r(preg(reg::PLANE_SURF_1_A));
+        let f = evade_and_cli();
+        m.w(preg(PLANE_BUF_CFG_1_A), buf);
+        for i in 0..WM_LEVELS { m.w(preg(PLANE_WM_1_A) + 4 * i as u32, w[i]); }
+        m.w(preg(PLANE_WM_TRANS_1_A), w[8]);
+        m.w(preg(reg::PLANE_SURF_1_A), surf);
+        irq_restore(f);
+        let t0 = super::now_ns();
+        while super::now_ns().wrapping_sub(t0) < 50_000_000 {
+            if m.r(preg(PLANE_SURFLIVE_1_A)) & !0xFFF == surf & !0xFFF { return true; }
+            sched::kthread::msleep(1);
+        }
+        false
+    };
+    let u0 = underruns();
+    ilog!("kms: ddb test: pipe A plane 1A {:#010x} -> {:#010x} ([{},{}) of A's [0,{})), WM {:08x?} -> {:08x?}",
+          old_buf, ddb_entry(ps, pe), ps, pe, ce, &old_wm[..WM_LEVELS], &wm[..WM_LEVELS]);
+    let latched = arm(ddb_entry(ps, pe), &wm);
+    let t0 = super::now_ns();
+    while super::now_ns().wrapping_sub(t0) < 10_000_000_000 { sched::kthread::msleep(100); let _ = underruns(); }
+    let u1 = underruns();
+    let live = m.r(preg(PLANE_BUF_CFG_1_A));
+    let back = arm(old_buf, &old_wm);
+    let u2 = underruns();
+    ilog!("kms: ddb test A [0,{}) 10 s underruns {} (latched {} live {:#010x}), restored {:#010x} (latched {}, +{} during restore)",
+          ce, u1 - u0, latched, live, m.r(preg(PLANE_BUF_CFG_1_A)), back, u2 - u1);
 }
 
 /// The scanout GGTT window: 16 slots of 32 MiB from 1 GiB (clear of the GOP
@@ -193,6 +245,8 @@ static NAT_WM_SET: AtomicBool = AtomicBool::new(false);
 static NATIVE_W: AtomicU32 = AtomicU32::new(0);
 static NATIVE_H: AtomicU32 = AtomicU32::new(0);
 static REFRESH: AtomicU32 = AtomicU32::new(60);
+/// Pixel clock (kHz) of the native timings (0: unknown), for `ddb_test`.
+static PIX_KHZ: AtomicU32 = AtomicU32::new(0);
 /// Vblank start line and the evasion margin (lines) of the active timings.
 pub(super) static VBL_START: AtomicU32 = AtomicU32::new(0);
 /// Transcoder vertical total and line time (ns) of the active timings:
@@ -677,6 +731,7 @@ fn native_setup(m: &Mmio, gw: u32, gh: u32) -> Option<(u32, u32)> {
     let refresh = if clk != 0 { ((clk * 1000 + tot / 2) / tot) as u32 } else { 60 };
     let refresh = if (20..=240).contains(&refresh) { refresh } else { 60 };
     REFRESH.store(refresh, Ordering::Relaxed);
+    PIX_KHZ.store(clk as u32, Ordering::Relaxed);
     VBL_START.store(vbs.min(vtot), Ordering::Relaxed);
     VTOTAL.store(vtot, Ordering::Relaxed);
     let line_ns = if clk != 0 { htot as u64 * 1_000_000 / clk } else { 1_000_000_000 / (refresh as u64 * vtot.max(1) as u64) };
@@ -796,7 +851,7 @@ fn pcode(m: &Mmio, mbox: u32, val: u32) -> Option<u32> {
 /// skl_read_wm_latency: levels 0..3 then 4..7, one byte each; a zero level
 /// above 0 disables it and every level above; WaWmMemoryReadLatency adds
 /// 2 us to every level when level 0 reads 0.
-fn skl_wm_latency(m: &Mmio) -> Option<[u32; 8]> {
+pub(super) fn skl_wm_latency(m: &Mmio) -> Option<[u32; 8]> {
     let a = pcode(m, GEN9_PCODE_READ_MEM_LATENCY, 0)?;
     let b = pcode(m, GEN9_PCODE_READ_MEM_LATENCY, 1)?;
     let mut w = [0u32; 8];
@@ -956,6 +1011,7 @@ pub(super) fn init(d: &Device, env: &BootEnv) {
     let cur = super::cursor::init(d);
     super::outputs::init(d);
     super::pipeb_stub::init(d);
+    super::pipeb::init(d);
     crate::gpu_kms::register(&BACKEND);
     ilog!("kms: flips {}; hardware cursor {}",
           if vbl { "on real vblank (queued, armed after the render fence, event at the latching vblank; i915.vblank=0: synchronous + 60 Hz synthetic events)" }

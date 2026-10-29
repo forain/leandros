@@ -30,9 +30,6 @@ use super::{delay_us, ilog, now_ns, opt, Device, Mmio};
 
 const SFUSE_STRAP: u32 = 0xC2014;
 const SDEISR: u32 = 0xC4000;
-const PWR_WELL_CTL2: u32 = 0x45404; // driver request
-const PW2_REQ: u32 = 1 << 31;
-const PW2_STATE: u32 = 1 << 30;
 
 const PCH_PORT_HOTPLUG: u32 = 0xC4030; // == reg::SHOTPLUG_CTL
 const SOUTH_DSPCLK_GATE_D: u32 = 0xC2020;
@@ -379,39 +376,9 @@ fn parse_edid(e: &[u8; 128], inf: &mut KmsConnInfo) {
     }
 }
 
-/// Power well 2 users: (count, we set the request). One lock serializes the
-/// request/release so concurrent probes cannot drop the well under each other.
-static PW2: spin::Mutex<(u32, bool)> = spin::Mutex::new((0, false));
-
-fn pw2_get(m: &Mmio) {
-    let mut g = PW2.lock();
-    if g.0 == 0 {
-        let old = m.r(PWR_WELL_CTL2);
-        g.1 = old & PW2_REQ == 0;
-        if g.1 {
-            m.w(PWR_WELL_CTL2, old | PW2_REQ);
-            let _ = m.wait(PWR_WELL_CTL2, PW2_STATE, PW2_STATE, 2000);
-        }
-    }
-    g.0 += 1;
-}
-
-fn pw2_put(m: &Mmio) {
-    let mut g = PW2.lock();
-    g.0 = g.0.saturating_sub(1);
-    if g.0 == 0 && g.1 {
-        m.w(PWR_WELL_CTL2, m.r(PWR_WELL_CTL2) & !PW2_REQ);
-        g.1 = false;
-    }
-}
-
-/// Run `f` with power well 2 (AUX B..D) on (refcounted).
+/// Run `f` with power well 2 (AUX B..D) on (refcounted by `power`).
 fn with_pw2<T>(f: impl FnOnce() -> T) -> T {
-    let m = mmio();
-    pw2_get(&m);
-    let r = f();
-    pw2_put(&m);
-    r
+    super::power::with(&mmio(), super::power::Dom::Pw2, f)
 }
 
 // ── DP AUX ──────────────────────────────────────────────────────────────────

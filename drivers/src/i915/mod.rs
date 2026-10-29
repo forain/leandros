@@ -66,6 +66,9 @@ use alloc::format;
 use alloc::string::String;
 
 pub mod hw;
+pub mod wrpll;
+pub mod buf_trans;
+pub mod ddb;
 pub mod uapi_abi;
 pub mod softcs;
 pub mod vmbind;
@@ -84,6 +87,8 @@ mod vblank;
 mod cursor;
 mod outputs;
 mod pipeb_stub;
+mod power;
+mod pipeb;
 
 use hw::reg;
 
