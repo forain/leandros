@@ -30,7 +30,8 @@ static SWITCH_VIOLATIONS: AtomicU32 = AtomicU32::new(0);
 #[inline(always)]
 fn cpu() -> usize { (unsafe { crate::cpu_id() }).min(MAX_CPUS - 1) }
 
-fn hook(acquired: bool) {
+/// The accounting step of the hook, callable from outside (kmod `kapi_spin_held`).
+pub fn account(acquired: bool) {
     let c = &HELD[cpu()];
     if acquired {
         c.fetch_add(1, Ordering::Relaxed);
@@ -44,7 +45,7 @@ fn hook(acquired: bool) {
 
 /// Install the hook. Called once, early in boot (before any task runs).
 pub fn init() {
-    spin::held::set_hook(hook);
+    spin::held::set_hook(account);
     // Self-check, one boot line: the count must read 1 under a held lock and
     // return to where it was after the drop.
     static PROBE: spin::Mutex<()> = spin::Mutex::new(());

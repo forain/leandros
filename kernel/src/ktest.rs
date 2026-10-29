@@ -21,7 +21,7 @@ use sched::{irqctx, kthread};
 
 const ALL: [&str; 11] = ["irqctx", "sync", "kthread", "workqueue", "hrtimer", "atomicpool", "kva", "pci", "msi", "firmware", "gpulock"];
 /// Opt-in only (not in `all`): a timing report, not a pass/fail facility test.
-const EXTRA: [&str; 2] = ["memperf", "kmodwin"];
+const EXTRA: [&str; 3] = ["memperf", "kmodwin", "kmodload"];
 
 /// UART only (`arch_serial_putc`), never the framebuffer console: a console
 /// print flushes the framebuffer through virtio-gpu, and a test thread
@@ -77,6 +77,7 @@ fn run(names: Vec<&'static str>, fw: Option<String>) {
             "kva" => t_kva(),
             "memperf" => t_memperf(),
             "kmodwin" => t_kmodwin(),
+            "kmodload" => t_kmodload(),
             "pci" => t_pci(),
             "msi" => t_msi(),
             "firmware" => t_firmware(fw.as_deref()),
@@ -548,6 +549,162 @@ fn t_kmodwin() -> T {
     t.check(kmodwin::reserve(base, kmodwin::SLOT_ALIGN), "slot reusable after release");
     kmodwin::release(base, kmodwin::SLOT_ALIGN);
     mm::buddy::free(rw, 0); mm::buddy::free(rx, 0);
+    t
+}
+
+fn t_kmodload() -> T {
+    use crate::kmod::{self, exports, registry, KmodErr, Source};
+    use kmod_elf::ElfErr;
+    use mm::kmodwin;
+    let mut t = T::new("kmodload");
+    if !kmod::window_ok() { t.check(false, "module window initialised"); return t; }
+    #[cfg(target_arch = "x86_64")]
+    const M: u16 = 62;
+    #[cfg(target_arch = "aarch64")]
+    const M: u16 = 183;
+    let bid = kmod::buildid::build_id();
+    let slot_a = (kmodwin::BASE + kmodwin::TEST_SLOT_OFF) as u64;
+    let slot_b = slot_a + kmodwin::SLOT_ALIGN as u64;
+    let base_pages = kmodwin::present_pages();
+    let ping = exports::lookup("kapi_ktest_ping");
+    t.check(ping.is_some(), "kapi_ktest_ping found by KSYMTAB walk");
+    let ping = ping.unwrap_or(0) as u64;
+    t.check(exports::ksymtab().len() == exports::NEXPORTS, "ksymtab length == NEXPORTS");
+
+    // positive
+    let tc = kmod_elf::text_tailcall(M, ping);
+    let rodata = *b"kmodload-rodata!";
+    let ok_img = kmod_elf::synth(M, bid, slot_a, "kt_ok", &tc, &rodata, &[1, 2, 3, 4], 64);
+    let c0 = exports::ping_state().0;
+    let id = kmod::load_image(&ok_img, Source::Ktest);
+    t.check(id.is_ok(), "load_image Ok");
+    let id = id.unwrap_or(kmod_abi::KmodId(0));
+    let (c1, own, csz, abi, _cl) = exports::ping_state();
+    t.check(c1 == c0 + 1, "init ran once (ping +1)");
+    t.check(own == id.0 && csz == 48 && abi == 1, "init got the right ctx (owner, size 48, abi 1)");
+    let mut live = false;
+    kmod::for_each(&mut |m| { if kmod::name_str(&m.name) == "kt_ok" && m.id == id && m.state == kmod::State::Live { live = true; } });
+    t.check(live, "registry: kt_ok Live");
+    let hdr_init = kmod_abi::KmodHeader::from_bytes(unsafe { core::slice::from_raw_parts(slot_a as *const u8, 128) });
+    let init_va = hdr_init.map_or(0, |h| h.init as usize);
+    let f: extern "C" fn(*const kmod_abi::KmodCtx) -> i32 = unsafe { core::mem::transmute(init_va) };
+    let cx = kmod_abi::KmodCtx { ctx_size: 48, abi_version: 1, owner: id, _pad: 0, _pad2: 0,
+        cmdline: core::ptr::null(), cmdline_len: 0, params: core::ptr::null(), params_len: 0 };
+    t.check(f(&cx) == 42 + id.0 as i32, "init re-call returns 42 + owner");
+    let ro = unsafe { core::slice::from_raw_parts((slot_a as usize + 128) as *const u8, rodata.len()) };
+    t.check(ro == rodata, "rodata reads back through the window");
+
+    // W^X over every present window page
+    let root = mm::paging::get_kernel_root();
+    let (mut n, mut bad_wx, mut bad_ux, mut nx, mut nw) = (0, 0, 0, 0, 0);
+    let mut va = kmodwin::BASE;
+    let end = kmodwin::BASE + kmodwin::SIZE;
+    while va < end {
+        let p = mm::paging::leaf_pte(root, va);
+        if p != 0 {
+            n += 1;
+            #[cfg(target_arch = "x86_64")]
+            { let (w, x, u) = (p & 2 != 0, p >> 63 == 0, p & 4 != 0); if w && x { bad_wx += 1; } if u { bad_ux += 1; } if x { nx += 1; } if w { nw += 1; } }
+            #[cfg(target_arch = "aarch64")]
+            { let (w, x) = (p & (1 << 7) == 0, p & (1 << 53) == 0); if w && x { bad_wx += 1; } if p & (1 << 54) == 0 { bad_ux += 1; } if x { nx += 1; } if w { nw += 1; } }
+        }
+        va += if p != 0 { 4096 } else { kmodwin::SLOT_ALIGN };
+    }
+    t.check(n > 0 && nx >= 1 && nw >= 1, "module has executable and writable pages");
+    t.check(bad_wx == 0, "no page is W+X");
+    #[cfg(target_arch = "x86_64")]
+    t.check(bad_ux == 0, "no page is USER");
+    #[cfg(target_arch = "aarch64")]
+    t.check(bad_ux == 0, "every page is UXN");
+
+    // cross-CPU instruction fetch
+    if sched::active_cpu_count() >= 2 {
+        static XR: AtomicU32 = AtomicU32::new(0);
+        static XCPU: AtomicU32 = AtomicU32::new(99);
+        XR.store(0, Ordering::SeqCst);
+        let owner = id;
+        let th = kthread::spawn("kmodx", move || {
+            let me = sched::current_pid();
+            let _ = sched::cred::sched_setaffinity(me, Some(2));
+            let mut tries = 0;
+            while unsafe { sched::cpu_id() } != 1 && tries < 200 { kthread::msleep(2); tries += 1; }
+            XCPU.store(unsafe { sched::cpu_id() } as u32, Ordering::SeqCst);
+            let cx = kmod_abi::KmodCtx { ctx_size: 48, abi_version: 1, owner, _pad: 0, _pad2: 0,
+                cmdline: core::ptr::null(), cmdline_len: 0, params: core::ptr::null(), params_len: 0 };
+            let r = f(&cx);
+            XR.store(r as u32, Ordering::SeqCst);
+        });
+        t.check(th.is_some(), "spawn pinned thread");
+        let mut w = 0;
+        while XR.load(Ordering::SeqCst) == 0 && w < 500 { kthread::msleep(10); w += 1; }
+        t.check(XCPU.load(Ordering::SeqCst) == 1, "thread ran on CPU1");
+        t.check(XR.load(Ordering::SeqCst) == 42 + id.0 as u32, "CPU1 executed the new code (42 + owner)");
+    } else { say!("kmodload: single CPU, cross-CPU fetch check skipped (use -smp 2)"); }
+
+    // spin hook through the table
+    if let (Some(a), Some(b)) = (exports::lookup("kapi_spin_held"), exports::lookup("kapi_spin_held_count")) {
+        let sh: extern "C" fn(bool) = unsafe { core::mem::transmute(a) };
+        let sc: extern "C" fn() -> u32 = unsafe { core::mem::transmute(b) };
+        let h0 = sc();
+        sh(true);
+        let h1 = sc();
+        sh(false);
+        t.check(h1 == h0 + 1 && sc() == h0, "kapi_spin_held +1 / -1 via table");
+    } else { t.check(false, "spin exports found"); }
+
+    // owner-tagged kthread
+    if let Some(a) = exports::lookup("kapi_kthread_spawn") {
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn body(p: *mut u8) { RAN.store(p as usize as u32, Ordering::SeqCst); }
+        let sp: unsafe extern "C" fn(*const u8, usize, extern "C" fn(*mut u8), *mut u8, kmod_abi::KmodId) -> i64 =
+            unsafe { core::mem::transmute(a) };
+        let tid = unsafe { sp(b"kmodt".as_ptr(), 5, body, 7usize as *mut u8, id) };
+        t.check(tid > 0, "kapi_kthread_spawn returned a tid");
+        let mut seen = 0i64;
+        registry::registrations(id, &mut |k, h| { if k == kmod_abi::RegKind::KTHREAD { seen = h as i64; } });
+        t.check(seen == tid, "registrations yields (Kthread, tid)");
+        let mut w = 0;
+        while RAN.load(Ordering::SeqCst) != 7 && w < 200 { kthread::msleep(5); w += 1; }
+        t.check(RAN.load(Ordering::SeqCst) == 7, "module kthread ran");
+    }
+
+    // negatives: each leaves present_pages unchanged
+    let pp = kmodwin::present_pages();
+    let good = |name: &str, base: u64| kmod_elf::synth(M, bid, base, name, &tc, &rodata, &[0; 8], 0);
+    let mut neg = |t: &mut T, what: &str, img: &[u8], want: fn(&KmodErr) -> bool| {
+        let r = kmod::load_image(img, Source::Ktest);
+        let ok = matches!(&r, Err(e) if want(e));
+        t.check(ok && kmodwin::present_pages() == pp, what);
+    };
+    let mut i = good("kt_magic", slot_b); i[4096] ^= 0xff;
+    neg(&mut t, "bad magic refused", &i, |e| matches!(e, KmodErr::Elf(ElfErr::Magic)));
+    let mut i = good("kt_bid", slot_b); i[4096 + 24] ^= 1;
+    neg(&mut t, "wrong build-id refused", &i, |e| matches!(e, KmodErr::Elf(ElfErr::BuildId)));
+    let mut i = good("kt_wx", slot_b); i[64 + 56 + 4] = 7;
+    neg(&mut t, "W+X segment refused", &i, |e| matches!(e, KmodErr::Elf(ElfErr::WplusX)));
+    let i = good("kt_out", (kmodwin::BASE + kmodwin::SIZE) as u64);
+    neg(&mut t, "slot outside window refused", &i, |e| matches!(e, KmodErr::Elf(_)));
+    let i = good("kt_ovl", slot_a);
+    neg(&mut t, "overlap with live slot refused", &i, |e| matches!(e, KmodErr::SlotBusy));
+    let i = good("kt_ok", slot_b);
+    neg(&mut t, "duplicate name refused", &i, |e| matches!(e, KmodErr::Exists));
+    let i = good("kt_trunc", slot_b);
+    neg(&mut t, "truncated image refused", &i[..200], |e| matches!(e, KmodErr::Elf(_)));
+
+    // failed init with no registrations frees the slot; a retry works
+    #[cfg(target_arch = "x86_64")]
+    let fail_text: [u8; 6] = [0xb8, 0xfb, 0xff, 0xff, 0xff, 0xc3];
+    #[cfg(target_arch = "aarch64")]
+    let fail_text: [u8; 8] = [0x80, 0x00, 0x80, 0x12, 0xc0, 0x03, 0x5f, 0xd6];
+    let fi = kmod_elf::synth(M, bid, slot_b, "kt_fail", &fail_text, &rodata, &[0; 8], 0);
+    for round in 0..2 {
+        let r = kmod::load_image(&fi, Source::Ktest);
+        t.check(matches!(r, Err(KmodErr::Init(-5))) && kmodwin::present_pages() == pp,
+            if round == 0 { "failing init -> Init(-5), pages unmapped" } else { "retry after failure reaches init again" });
+    }
+    let mut left = false;
+    kmod::for_each(&mut |m| { if kmod::name_str(&m.name) == "kt_fail" { left = true; } });
+    t.check(!left, "failed module dropped from the registry");
     t
 }
 
