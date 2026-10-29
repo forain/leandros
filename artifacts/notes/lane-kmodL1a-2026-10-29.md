@@ -20,3 +20,9 @@ What is gated in drivers/src/lib.rs
 Kconfig dependencies: E1000E/R8169/IWLWIFI depend on PCI only and MACB/BRCMF on nothing (were ARCH_X86_64 / BOARD_RPI5).
 Reason: before this lane those drivers were compiled into every kernel (aarch64 QEMU can use a PCI e1000e; the
 Pi-only drivers are inert elsewhere), so the byte-identical gate requires them ON in every default config.
+
+## Gate results (kmodL1a2)
+
+Gate 1 revised: byte-identity not required (declaring features changes the crate metadata hash and CGU layout). Accepted: hash-normalised symbol set equal apart from generic instances (drop_in_place, grow_one, fmt) moving between crates; section sizes equal; no string diffs beyond string-table packing; aarch64 runtests pass.
+
+Gate 2: x86_64 all-N build OK, boots in QEMU, /bin/pstest 108 checks, 0 failed, no panic in dmesg.
