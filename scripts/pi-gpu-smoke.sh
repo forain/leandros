@@ -29,7 +29,7 @@ report() { # name ok(0/1) detail
 
 out=$(R 'readlink /sys/dev/char/226:0/device/subsystem')
 case "$out" in */platform*) report ident 0 "subsystem=platform" ;;
-    *) report ident 1 "subsystem=$(echo "$out" | tail -n1) (card not prepared with LEANDROS_BOARD=rpi5?)" ;; esac
+    *) report ident 1 "subsystem=$(echo "$out" | tail -n1) (card not prepared with LEANDROS_BOARD=rpi5? run scripts/pi-v3d-sysfs.sh)" ;; esac
 
 out=$(R 'dmesg | grep -m1 -E "\[v3d\] (armed|not armed|fail|skipped)"')
 case "$out" in *"[v3d] armed"*) report armed 0 "auto" ;;
