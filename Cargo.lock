@@ -221,6 +221,8 @@ dependencies = [
  "evdev-server",
  "f2fs-server",
  "ipc",
+ "kmod-abi",
+ "kmod-elf",
  "leandros-lib",
  "limine",
  "miniz_oxide",
