@@ -79,6 +79,27 @@ fn log(s: &str) {
     unsafe { serial_print(s.as_ptr(), s.len()) };
 }
 
+static UNMAPPED_WIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static UNMAPPED_N: AtomicU32 = AtomicU32::new(0);
+
+/// Log a set-1 scancode that has no evdev mapping ("kbd: unmapped sc e0 6f dn"),
+/// at most 10 lines per second (100 ticks), so a held or unknown key cannot flood the log.
+fn log_unmapped(ext: bool, code: u8, up: bool) {
+    let now = super::timer::ticks();
+    if now.wrapping_sub(UNMAPPED_WIN.load(Ordering::Relaxed)) >= 100 {
+        UNMAPPED_WIN.store(now, Ordering::Relaxed);
+        UNMAPPED_N.store(0, Ordering::Relaxed);
+    }
+    if UNMAPPED_N.fetch_add(1, Ordering::Relaxed) >= 10 { return; }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut b = *b"kbd: unmapped sc    xx dn\n";
+    if ext { b[17] = b'e'; b[18] = b'0'; }
+    b[20] = HEX[(code >> 4) as usize];
+    b[21] = HEX[(code & 15) as usize];
+    if up { b[23] = b'u'; b[24] = b'p'; }
+    if let Ok(t) = core::str::from_utf8(&b) { log(t); }
+}
+
 /// One line per IRQ 1 routing, like PSMOUSE's IRQ 12 line: laptop bring-up
 /// needs to see which GSI the keyboard IRQ landed on after MADT overrides.
 pub fn log_irq1_route() {
@@ -438,6 +459,9 @@ fn handle_scancode(scancode: u8) {
         }
     };
 
+    if ev_code == 0 {
+        log_unmapped(is_ext, code, is_up);
+    }
     if ev_code != 0 {
         evdev_server::push_event(0, 1 /* EV_KEY */, ev_code, if is_up { 0 } else { 1 });
         evdev_server::push_event(0, 0 /* EV_SYN */, 0, 0);

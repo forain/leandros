@@ -42,6 +42,7 @@
 
 #include "libudev.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fnmatch.h>
 #include <stdarg.h>
@@ -417,6 +418,25 @@ static struct dyn_desc *dyn_input(int n, int is_parent, const struct input_info 
 	return x;
 }
 
+/* backlight class device /sys/class/backlight/<name>: no devnode, attrs read from sysfs. */
+static struct dyn_desc *dyn_backlight(const char *name) {
+	if (!name || !name[0] || strchr(name, '/') || name[0] == '.' || strlen(name) >= sizeof(((struct dyn_desc *)0)->sysname))
+		return NULL;
+	char path[64];
+	snprintf(path, sizeof path, "/sys/class/backlight/%s", name);
+	struct stat st;
+	if (stat(path, &st) != 0) return NULL;
+	struct dyn_desc *x = calloc(1, sizeof *x);
+	if (!x) return NULL;
+	snprintf(x->syspath, sizeof x->syspath, "%s", path);
+	snprintf(x->sysname, sizeof x->sysname, "%s", name);
+	x->d.syspath = x->syspath;
+	x->d.sysname = x->sysname;
+	x->d.subsystem = "backlight";
+	x->d.is_initialized = 1;
+	return x;
+}
+
 /* Input node n (event node, or its inputN parent) when present. */
 static struct dyn_desc *input_lookup(int n, int is_parent) {
 	if (n < 0 || n >= MAX_INPUTS) return NULL;
@@ -441,6 +461,10 @@ static const struct dev_desc *desc_by_syspath(const char *syspath, struct dyn_de
 	if (strncmp(syspath, "/sys/class/input/", 17) == 0) {
 		int par, n = input_sysname(syspath + 17, &par);
 		*own = n >= 0 ? input_lookup(n, par) : NULL;
+		return *own ? &(*own)->d : NULL;
+	}
+	if (strncmp(syspath, "/sys/class/backlight/", 21) == 0) {
+		*own = dyn_backlight(syspath + 21);
 		return *own ? &(*own)->d : NULL;
 	}
 	for (size_t i = 0; i < g_ndevices; i++)
@@ -471,6 +495,10 @@ static const struct dev_desc *desc_by_subsystem_sysname(const char *subsystem, c
 	if (strcmp(subsystem, "input") == 0) {
 		int par, n = input_sysname(sysname, &par);
 		*own = n >= 0 ? input_lookup(n, par) : NULL;
+		return *own ? &(*own)->d : NULL;
+	}
+	if (strcmp(subsystem, "backlight") == 0) {
+		*own = dyn_backlight(sysname);
 		return *own ? &(*own)->d : NULL;
 	}
 	for (size_t i = 0; i < g_ndevices; i++) {
@@ -845,9 +873,32 @@ struct udev_list_entry *udev_device_get_current_tags_list_entry(struct udev_devi
 struct udev_list_entry *udev_device_get_sysattr_list_entry(struct udev_device *d) { (void)d; return NULL; }
 
 const char *udev_device_get_sysattr_value(struct udev_device *d, const char *sysattr) {
+	const char *val = NULL;
+	if (d && sysattr && !strchr(sysattr, '/') && strcmp(d->desc->subsystem, "backlight") == 0) {
+		for (struct udev_list_entry *le = d->sysattrs; le; le = le->next)
+			if (strcmp(le->name, sysattr) == 0) { val = le->value; break; }
+		if (!val) {
+			char path[160], buf[64];
+			snprintf(path, sizeof path, "%s/%s", d->desc->syspath, sysattr);
+			int fd = open(path, O_RDONLY | O_CLOEXEC);
+			if (fd >= 0) {
+				ssize_t n = read(fd, buf, sizeof buf - 1);
+				close(fd);
+				if (n >= 0) {
+					while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == ' ')) n--;
+					buf[n] = 0;
+					if (list_append(&d->sysattrs, sysattr, buf) == 0) {
+						struct udev_list_entry *t = d->sysattrs;
+						while (t->next) t = t->next;
+						val = t->value;
+					}
+				}
+			}
+		}
+	}
 	trc("dev_sysattr syspath=%s attr=%s -> %s",
-	    d ? d->desc->syspath : "(null)", sysattr ? sysattr : "(null)", "(null)");
-	return NULL; /* sysattrs served later off synthetic sysfs */
+	    d ? d->desc->syspath : "(null)", sysattr ? sysattr : "(null)", val ? val : "(null)");
+	return val;
 }
 
 int udev_device_set_sysattr_value(struct udev_device *d, const char *sysattr, const char *value) {
@@ -1072,6 +1123,20 @@ int udev_enumerate_scan_devices(struct udev_enumerate *e) {
 		if (enum_matches(e, &x->d))
 			list_append(&e->results, x->syspath, NULL);
 		free(x);
+	}
+	/* Backlight class devices: dynamic scan of /sys/class/backlight (empty when absent). */
+	DIR *bd = opendir("/sys/class/backlight");
+	if (bd) {
+		struct dirent *de;
+		while ((de = readdir(bd)) != NULL) {
+			if (de->d_name[0] == '.') continue;
+			struct dyn_desc *x = dyn_backlight(de->d_name);
+			if (!x) continue;
+			if (enum_matches(e, &x->d))
+				list_append(&e->results, x->syspath, NULL);
+			free(x);
+		}
+		closedir(bd);
 	}
 	size_t n = 0;
 	for (struct udev_list_entry *le = e->results; le; le = le->next) n++;

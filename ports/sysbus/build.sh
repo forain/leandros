@@ -32,5 +32,7 @@ for arch in "${ARCHES[@]}"; do
   install -d "$SHIP/$arch/usr/libexec"
   install -m 0755 "$HERE/target/$target/release/leandros-sysbus" \
     "$SHIP/$arch/usr/libexec/leandros-sysbus"
-  echo "staged $arch: usr/libexec/leandros-sysbus"
+  install -d "$SHIP/$arch/usr/bin"
+  install -m 0755 "$HERE/target/$target/release/busctl" "$SHIP/$arch/usr/bin/busctl"
+  echo "staged $arch: usr/libexec/leandros-sysbus usr/bin/busctl"
 done
