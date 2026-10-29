@@ -446,6 +446,7 @@ pub fn init_exec_file_backing() {
                                   drivers::drm_device_interface::hostvis_vma_release);
     mm::vmm::set_file_key_hook(exec_file_key);
     mm::vmm::set_vmo_page_hook(vfs::vmo_fault_frame);
+    mm::vmm::set_vmo_ref_hooks(vfs::vmo_retain, vfs::vmo_release);
     mm::vmm::set_file_name_hook(exec_file_name);
 }
 
@@ -3158,6 +3159,29 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             // ceiling does not apply (only the address-space cap does).
             if len > ANON_MAP_MAX_BYTES { return -22; }
             tr.kind = 3;
+            // Lazy MAP_SHARED (lane mmapB): the VMA only names the object;
+            // pages are found on first touch outside the tmpfs locks, so a
+            // 4 MiB map is O(1) here instead of 1024 allocs + zeroing + PTEs.
+            // Dmabuf/borrowed objects and ranges past EOF keep the eager path.
+            if flags & MAP_SHARED != 0 {
+                if let Some(vmo_id) = vfs::vmo_lazy_prepare(pid, fd, off, len) {
+                    if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
+                    let placed = with_current_address_space_mut(|as_| {
+                        let at = if flags & MAP_FIXED != 0 {
+                            as_.unmap_range(virt, len);
+                            virt
+                        } else {
+                            match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
+                        };
+                        Some((as_.map_shared_vmo_lazy(at, len, page_flags, vmo_id, off as u64), at))
+                    });
+                    return match placed {
+                        Some(Some((true, at))) => at as isize,
+                        Some(Some((false, _))) => enomem_map_site("mmap/shared-vmo-lazy"),
+                        _ => enomem_site("mmap/shared-vmo-lazy/no-room"),
+                    };
+                }
+            }
             let ta = monotonic_ns();
             let acquired = vfs::vmo_acquire_frames(pid, fd, off, len);
             tr.io_ns += monotonic_ns().wrapping_sub(ta);

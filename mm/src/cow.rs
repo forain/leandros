@@ -270,6 +270,7 @@ pub fn clone_as_step(src: &mut AddressSpace, c: &mut CloneCursor, budget_pages: 
             if crate::vmm::is_file_backed(region.file_cap) {
                 crate::vmm::file_retain(region.file_cap);
             }
+            crate::vmm::vmo_retain(region.vmo);
             *dst_slot = Some(VmaRegion {
                 start: region.start, end: region.end, phys: 0, flags: region.flags,
                 lazy: true, lazy_pages: dst_lazy_pages, lazy_count: dst_lazy_count,
@@ -291,6 +292,7 @@ pub fn clone_as_step(src: &mut AddressSpace, c: &mut CloneCursor, budget_pages: 
                 if crate::vmm::is_file_backed(region.file_cap) {
                     crate::vmm::file_retain(region.file_cap);
                 }
+                crate::vmm::vmo_retain(region.vmo);
                 if !is_shared { region.cow = true; }
                 let mut dst_lazy_pages = crate::pagevec::PageVec::new();
                 dst_lazy_pages.resize(region.lazy_pages.len(), 0);
