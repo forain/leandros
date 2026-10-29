@@ -6,5 +6,6 @@ edition.workspace = true
 [dependencies]
 leandros-lib = { path = "../lib" }
 boot    = { path = "../boot" }
+kmod-abi = { path = "../lib/kmod-abi" }
 bitflags.workspace = true
 spin.workspace = true

@@ -6,6 +6,7 @@
 extern crate alloc;
 
 mod init;
+mod kmod;
 mod klog;
 mod iostat;
 mod hungtask;
@@ -1379,6 +1380,11 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     if !is_limine {
         let gb = direct_hhdm::cpu_has_gbpages()
             && cmdline_knob("direct.gbpages").map_or(true, |v| v != "0");
+        // Before extend(): guarantees its two pool pages (see the function doc).
+        if !unsafe { direct_hhdm::unshare_kernel_slot() } {
+            kmod::disable();
+            serial_print_str("[kmod] direct: could not unshare the kernel PDPT, module window disabled\n");
+        }
         let o = unsafe { direct_hhdm::extend((*core::ptr::addr_of!(BOOT_INFO)).memory_regions(), gb) };
         serial_print_str("[early] direct HHDM: RAM to ");
         serial_print_hex(o.top as usize);
@@ -1930,6 +1936,7 @@ fn kfacil_init(hhdm_offset: u64) {
     if !mm::kva::init() {
         serial_print_str("[KVA] could not create the ioremap/vmap window\n");
     }
+    kmod::init();
     mm::atomic_pool::set_irq_query(sched::irqctx::in_interrupt);
     #[cfg(target_arch = "x86_64")]
     drivers::pci::init_ecam_from_acpi(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr }, hhdm_offset);

@@ -13,6 +13,7 @@ pub mod buddy;
 pub mod cow;
 pub mod dma_cache;
 pub mod gap2;
+pub mod kmodwin;
 pub mod kva;
 pub mod pagecache;
 pub mod pageref;

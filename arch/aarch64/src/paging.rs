@@ -255,6 +255,7 @@ fn translate_flags(bits: u64) -> PageDescFlags {
     if src.contains(PageFlags::USER)     { f |= PageDescFlags::USER | PageDescFlags::PXN; }
     if !src.contains(PageFlags::WRITABLE){ f |= PageDescFlags::RDONLY; }
     if !src.contains(PageFlags::EXECUTE) { f |= PageDescFlags::NO_EXEC; }
+    if src.contains(PageFlags::KERNEL_ONLY_X) { f |= PageDescFlags::UXN; }
     if src.contains(PageFlags::MMIO)     { f |= PageDescFlags::ATTR_DEV; }     // MAIR index 1
     else if src.contains(PageFlags::NOCACHE) { f |= PageDescFlags::ATTR_NOCACHE; } // MAIR index 3
     // Non-cached but still Normal: unaligned access and plain memcpy are legal,
@@ -490,4 +491,20 @@ pub unsafe extern "C" fn arch_alloc_page_table_root() -> usize {
         }
         None => 0,
     }
+}
+
+/// Raw leaf descriptor for `va` (0 if any level is invalid; blocks returned as is).
+#[no_mangle]
+pub unsafe extern "C" fn arch_leaf_pte(root: usize, va: usize) -> u64 {
+    const V: u64 = 1;
+    const TBL: u64 = 2;
+    const M: u64 = 0x0000_FFFF_FFFF_F000;
+    let mut t = mm::phys_to_virt(root) as *const u64;
+    for (lvl, sh) in [39usize, 30, 21, 12].into_iter().enumerate() {
+        let e = t.add((va >> sh) & 0x1FF).read();
+        if e & V == 0 { return 0; }
+        if lvl == 3 || e & TBL == 0 { return e; }
+        t = mm::phys_to_virt((e & M) as usize) as *const u64;
+    }
+    0
 }

@@ -29,6 +29,9 @@ bitflags! {
         /// blob be non-cached without turning the sound card's registers into
         /// speculatively-readable Normal memory.
         const WRITECOMBINE = 1 << 6;
+        /// Kernel-only executable page: on AArch64 sets UXN (EL0 may never execute
+        /// it) while leaving PXN clear. No effect on x86-64.
+        const KERNEL_ONLY_X = 1 << 7;
     }
 }
 
@@ -58,6 +61,9 @@ extern "C" {
     /// Arch-provided: perform a flush another CPU requested of this one
     /// (x86-64; no-op on AArch64). Called from IRQ-masked spin loops.
     fn arch_tlb_service_pending();
+    /// Arch-provided: raw leaf PTE for `va` in the tables rooted at `root`,
+    /// or 0 when any level is absent. A block/huge leaf is returned as is.
+    fn arch_leaf_pte(root: usize, va: usize) -> u64;
     /// Arch-provided: free every intermediate page-table node below the user
     /// root `page_table_root` (not the root itself, never the kernel's shared
     /// nodes). Returns the number of 4 KiB table pages released.
@@ -119,6 +125,11 @@ pub unsafe fn map_page(
 /// Unmap a virtual page and flush the TLB entry on the current CPU.
 pub unsafe fn unmap_page(page_table_root: usize, virt: usize) {
     arch_unmap_page(page_table_root, virt);
+}
+
+/// Raw leaf PTE for `va` (0 if unmapped). For diagnostics and self-tests.
+pub fn leaf_pte(root: usize, va: usize) -> u64 {
+    unsafe { arch_leaf_pte(root, va) }
 }
 
 /// Invalidate all user-space TLB entries across all CPUs.

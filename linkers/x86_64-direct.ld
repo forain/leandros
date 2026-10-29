@@ -49,6 +49,20 @@ SECTIONS {
         *(.rodata .rodata.*)
     } :high
 
+    . = ALIGN(8);
+    .note.gnu.build-id : AT(ADDR(.note.gnu.build-id) - KERNEL_OFFSET) {
+        __build_id_start = .;
+        KEEP(*(.note.gnu.build-id))
+        __build_id_end = .;
+    } :high
+
+    . = ALIGN(8);
+    .ksymtab : AT(ADDR(.ksymtab) - KERNEL_OFFSET) {
+        __ksymtab_start = .;
+        KEEP(*(.ksymtab))
+        __ksymtab_end = .;
+    } :high
+
     . = ALIGN(4K);
     .data : AT(ADDR(.data) - KERNEL_OFFSET) {
         *(.data .data.*)
@@ -75,4 +89,6 @@ SECTIONS {
         *(.rel.eh_frame*)
         *(.note.gnu*)
     }
+
+    ASSERT(__kernel_end - KERNEL_OFFSET < 0x10000000, "x86 direct image must stay below 256 MiB (kmodwin unshare)")
 }

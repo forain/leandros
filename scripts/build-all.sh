@@ -217,7 +217,7 @@ build_kernel() {
         if [[ ${#all[@]} -gt 0 ]]; then features_arg="--features $(IFS=,; echo "${all[*]}")"; fi
     fi
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_std" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
-    RUSTFLAGS="-C link-arg=-T$linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro $STACK_SIZES_FLAG" \
+    RUSTFLAGS="-C link-arg=-T$linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro -C link-arg=--build-id=sha1 $STACK_SIZES_FLAG" \
     cargo build -p kernel $features_arg --target "$target_spec" --target-dir "$target_root_std" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
 
     mkdir -p "target/final-$arch"
@@ -246,7 +246,7 @@ build_kernel() {
             "$ROOT_DIR/linkers/aarch64-direct.ld" > "$direct_linker"
     fi
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_dir" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
-    RUSTFLAGS="-C link-arg=-T$direct_linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro $STACK_SIZES_FLAG" \
+    RUSTFLAGS="-C link-arg=-T$direct_linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro -C link-arg=--build-id=sha1 $STACK_SIZES_FLAG" \
     cargo build -p kernel $features_arg --target "$target_spec" --target-dir "$target_root_dir" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
 
     cp "$target_root_dir/$target_triple/release/kernel" "target/final-$arch/kernel-direct"
