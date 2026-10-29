@@ -13,7 +13,7 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use crate::paging::{PageFlags, map_page, unmap_page, tlb_flush_range, tlb_flush_as, tlb_flush_local_page};
+use crate::paging::{PageFlags, map_page, unmap_page, tlb_flush_range, tlb_flush_range_start, tlb_flush_as, tlb_flush_local_page};
 use crate::buddy::{PAGE_SIZE, alloc as buddy_alloc, free as buddy_free};
 
 // ── POSIX mmap/mprotect protection flags ─────────────────────────────────────
@@ -103,6 +103,71 @@ pub type FileReadFn = fn(file_cap: usize, offset: u64, dst: *mut u8, len: usize)
 pub type FileRefFn = fn(file_cap: usize);
 
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+// ── Deferred frame release behind an asynchronous TLB shootdown ─────────────
+//
+// Frames, page-table pages and device ranges a flush protects may only be
+// freed once every remote CPU acknowledged it. Waiting for that with the
+// address-space lock held convoys every sibling thread behind the slowest
+// acknowledger, so the unmap paths start the flush, queue what it protects
+// here, and the wait happens after the lock is dropped ([`drain_deferred`]).
+// A timed-out wait never frees: the entry stays queued until the ack arrives.
+struct Deferred {
+    tickets: Vec<crate::paging::FlushTicket>,
+    frames: Vec<usize>,
+    blocks: Vec<(usize, usize)>,
+    dev: Vec<(usize, usize)>,
+    tables: Vec<usize>,
+}
+
+static DEFERRED: spin::Mutex<Vec<Deferred>> = spin::Mutex::new(Vec::new());
+static DEFERRED_LEN: AtomicUsize = AtomicUsize::new(0);
+/// Frees postponed because a shootdown ack was not yet in.
+pub static DEFERRED_FREES: AtomicUsize = AtomicUsize::new(0);
+/// Waits that timed out (entry kept, nothing freed).
+pub static DEFERRED_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+
+fn release_deferred(d: Deferred) {
+    for phys in d.frames { crate::pageref::unref_or_free(phys, 0); }
+    for (phys, order) in d.blocks { buddy_free(phys, order); }
+    for (phys, len) in d.dev { device_vma_release(phys, len); }
+    if !d.tables.is_empty() {
+        PT_PAGES_PRUNED.fetch_add(d.tables.len(), Ordering::Relaxed);
+        for phys in d.tables { buddy_free(phys, 0); }
+    }
+}
+
+/// Free `d` now if every flush it waits for is already acknowledged, else queue it.
+fn free_after_flush(mut d: Deferred) {
+    d.tickets.retain_mut(|t| !crate::paging::flush_poll(t));
+    if d.tickets.is_empty() { release_deferred(d); return; }
+    DEFERRED_FREES.fetch_add(1, Ordering::Relaxed);
+    DEFERRED_LEN.fetch_add(1, Ordering::Relaxed);
+    DEFERRED.lock().push(d);
+}
+
+/// Release queued entries whose shootdowns completed. `wait`: bounded wait
+/// for the others (call with no address-space lock held).
+pub fn drain_deferred(wait: bool) {
+    if DEFERRED_LEN.load(Ordering::Relaxed) == 0 { return; }
+    let list = core::mem::take(&mut *DEFERRED.lock());
+    DEFERRED_LEN.fetch_sub(list.len(), Ordering::Relaxed);
+    let mut keep: Vec<Deferred> = Vec::new();
+    for mut d in list {
+        d.tickets.retain_mut(|t| {
+            if wait { !crate::paging::flush_wait(t) } else { !crate::paging::flush_poll(t) }
+        });
+        if d.tickets.is_empty() { release_deferred(d); } else {
+            if wait { DEFERRED_TIMEOUTS.fetch_add(1, Ordering::Relaxed); }
+            keep.push(d);
+        }
+    }
+    if !keep.is_empty() {
+        DEFERRED_LEN.fetch_add(keep.len(), Ordering::Relaxed);
+        DEFERRED.lock().extend(keep);
+    }
+}
+
 static FILE_READ_HOOK:    AtomicUsize = AtomicUsize::new(0);
 static FILE_RETAIN_HOOK:  AtomicUsize = AtomicUsize::new(0);
 static FILE_RELEASE_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -1815,14 +1880,9 @@ impl AddressSpace {
         // `tlbi vaae1is`/`vmalle1is` drop the non-leaf entries too).
         let mut tables: Vec<usize> = Vec::new();
         unsafe { crate::paging::prune_user_page_tables(pt, virt, end, &mut tables); }
-        if did_unmap || !tables.is_empty() { tlb_flush_range(pt, virt, len / PAGE_SIZE); }
-        for phys in released { crate::pageref::unref_or_free(phys, 0); }
-        for (phys, order) in released_blocks { buddy_free(phys, order); }
-        for (phys, len) in released_dev { device_vma_release(phys, len); }
-        if !tables.is_empty() {
-            PT_PAGES_PRUNED.fetch_add(tables.len(), Ordering::Relaxed);
-            for phys in tables { buddy_free(phys, 0); }
-        }
+        let mut tickets = Vec::new();
+        if did_unmap || !tables.is_empty() { tickets.push(tlb_flush_range_start(pt, virt, len / PAGE_SIZE)); }
+        free_after_flush(Deferred { tickets, frames: released, blocks: released_blocks, dev: released_dev, tables });
     }
 
     /// True if `[start, start+len)` overlaps no VMA and no arch-reserved range.
@@ -1941,8 +2001,8 @@ impl AddressSpace {
             }
         }
         if !released.is_empty() {
-            tlb_flush_range(pt, virt, len / PAGE_SIZE);
-            for phys in released { crate::pageref::unref_or_free(phys, 0); }
+            let t = tlb_flush_range_start(pt, virt, len / PAGE_SIZE);
+            free_after_flush(Deferred { tickets: alloc::vec![t], frames: released, blocks: Vec::new(), dev: Vec::new(), tables: Vec::new() });
         }
         covered == len
     }
@@ -1981,8 +2041,8 @@ impl AddressSpace {
         }
         let n = released.len();
         if n != 0 {
-            tlb_flush_range(pt, virt, len / PAGE_SIZE);
-            for phys in released { crate::pageref::unref_or_free(phys, 0); }
+            let t = tlb_flush_range_start(pt, virt, len / PAGE_SIZE);
+            free_after_flush(Deferred { tickets: alloc::vec![t], frames: released, blocks: Vec::new(), dev: Vec::new(), tables: Vec::new() });
         }
         n
     }
@@ -2264,9 +2324,9 @@ impl AddressSpace {
             }
             if dropped { flush.push((r.start, r.pages())); }
         }
-        for (va, n) in flush { tlb_flush_range(pt, va, n); }
         let n = released.len();
-        for phys in released { crate::pageref::unref_or_free(phys, 0); }
+        let tickets: Vec<_> = flush.into_iter().map(|(va, k)| tlb_flush_range_start(pt, va, k)).collect();
+        free_after_flush(Deferred { tickets, frames: released, blocks: Vec::new(), dev: Vec::new(), tables: Vec::new() });
         n
     }
 
