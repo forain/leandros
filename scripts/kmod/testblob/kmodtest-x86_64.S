@@ -31,7 +31,7 @@ kmod_init:
     mov rbx, rdi
     mov edi, 1
     lea rsi, [rip + msg]
-    mov edx, msglen
+    mov edx, offset msglen
     call kapi_log
     mov rdi, rbx
     call kapi_ktest_ping
