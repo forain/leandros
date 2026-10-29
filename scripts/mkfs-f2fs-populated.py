@@ -1414,7 +1414,7 @@ def main():
                 hp = os.path.join(dirpath, fn)
                 if not os.path.isfile(hp):
                     continue
-                if fn in ("busd", "dbus-run-session", "leandros-sysbus"):  # must be executable
+                if fn in ("busd", "dbus-run-session", "leandros-sysbus", "busctl"):  # must be executable
                     m5_exec_files.append((image_dir, fn, hp))
                 else:                                       # session.conf etc. = data
                     m4_share_files.append((image_dir, fn, hp))
