@@ -3,7 +3,7 @@
 //! PNP0C50 slave reads the HID descriptor and the report descriptor and
 //! counts input reports for a while. No input node, no Input Mode switch: the
 //! default `i2c_hid=probe` changes no behaviour.
-//! `touchpad=ps2|i2c|auto` (default ps2): `i2c` switches the Precision Touchpad to
+//! `touchpad=ps2|ps2!|i2c|auto` (default auto: i2c when ACPI has a SYNA/PNP0C50 pad, else ps2): `i2c` switches the Precision Touchpad to
 //! Input Mode 3 and feeds an evdev MT node (lane lapptp); any failure puts the
 //! pad back on PS/2. `touchpad.fail=1` forces that fallback 3 s after set-up.
 //! Knobs: `i2c=0` (nothing), `i2c_hid=probe|0` , `i2c.debug=1` (hex-dump transfers).
@@ -333,17 +333,31 @@ pub fn init(cmdline: &str) -> bool {
     dw_i2c::DEBUG.store(word("i2c.debug", cmdline) == Some("1"), Ordering::Relaxed);
     let mode = word("i2c_hid", cmdline).unwrap_or("probe");
     INREG.store(word("i2c_hid.inreg", cmdline) == Some("1"), Ordering::Relaxed);
-    let tp = word("touchpad", cmdline).unwrap_or("ps2");
-    if tp == "auto" { log("touchpad=auto: not enabled yet, using ps2"); }
-    // Explicit `touchpad=ps2!` forces PS/2. Otherwise, if no PS/2 port found a Synaptics pad
-    // (silent AUX2: the pad can latch in I2C/HID mode), try the I2C PTP driver if a pad exists.
-    let ps2_syn = (0..crate::psmouse::NPORTS).any(|i| crate::psmouse::protocol(i) == crate::psmouse::PROTO_SYNAPTICS);
-    let auto_i2c = tp != "i2c" && tp != "ps2!" && !ps2_syn;
-    let tp_i2c = tp == "i2c" || auto_i2c;
+    let tp_arg = word("touchpad", cmdline);
+    let tp = tp_arg.unwrap_or("auto");
+    if tp == "auto" && tp_arg.is_some() { log("touchpad=auto: same as the default (i2c when ACPI has an I2C-HID pad)"); }
     let devs = dw_i2c::find();
     if devs.is_empty() {
         log("i2c: no LPSS I2C controllers");
+        if tp == "auto" { log("touchpad: no I2C controller -> ps2 (default)"); }
         return false;
+    }
+    // Default (no touchpad= given): like Linux, an ACPI-present PNP0C50 SYNA pad uses I2C. A pad
+    // latched in I2C mode (persists on EC standby power) still answers PS/2 identification but
+    // sends no motion, so PS/2 detection cannot be trusted. `touchpad=ps2`/`ps2!` keep PS/2,
+    // `touchpad=i2c` forces I2C. The pre-scan is passive (no _PS0, no reads of the pad).
+    let mut tp_i2c = tp == "i2c";
+    if tp == "auto" {
+        let pad = i2c_acpi::scan(false).and_then(|sc| sc.slaves.into_iter()
+            .find(|s| s.sta & 0x1 != 0 && s.hid_desc_reg.is_some() && (s.hid.contains("SYNA") || s.cid.contains("PNP0C50"))));
+        match pad {
+            Some(s) => {
+                let nm = s.path.rsplit('.').next().unwrap_or("");
+                log(&format!("touchpad: {} {} present -> i2c (default)", nm, s.hid));
+                tp_i2c = true;
+            }
+            None => log("touchpad: no ACPI I2C-HID pad -> ps2 (default)"),
+        }
     }
     if mode == "1" { log("i2c-hid: i2c_hid=1 (input node) is not in this build, probing only"); }
     // Default (touchpad=ps2, i2c_hid=probe): touch nothing on the pad. No _INI, no
@@ -360,9 +374,8 @@ pub fn init(cmdline: &str) -> bool {
         dw_i2c::bring_up(d, tm);
     }
     for s in &sc.slaves { log(&i2c_acpi::describe(s)); }
-    if auto_i2c { log("touchpad: ps2 pad silent, using i2c (CPD0)"); }
     if mode == "0" && !tp_i2c { return false; }
-    if !active { log("i2c-hid: idle (touchpad=ps2); i2c_hid.listen=1 to probe"); return false; }
+    if !active { log("i2c-hid: idle (touchpad=ps2 or no I2C pad); i2c_hid.listen=1 to probe"); return false; }
     let mut l = LISTEN.lock();
     for s in sc.slaves.iter().filter(|s| s.sta & 0xB == 0xB && s.hid_desc_reg.is_some()) {
         match dw_i2c::bus_for_adr(s.ctrl_adr) {
