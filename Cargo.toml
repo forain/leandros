@@ -27,6 +27,7 @@ members = [
     "lib/kmod-rt",
     "modules/hello",
     "modules/virtio-rng",
+    "modules/e1000e",
     "scripts/kmod/fixtures/badsym",
     "scripts/kmod/fixtures/baddep",
     "scripts/kmod/fixtures/badsimd",

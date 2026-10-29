@@ -266,6 +266,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-e1000e"
+version = "0.1.0"
+dependencies = [
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
+]
+
+[[package]]
 name = "kmod-elf"
 version = "0.1.0"
 dependencies = [
