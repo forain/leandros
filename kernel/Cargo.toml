@@ -21,6 +21,15 @@ usb-debug = ["drivers/usb-debug"]
 # (drivers/nvidia + libnvrm.a from ports/openrm/build.sh). x86_64 only; off by
 # default, and the default kernel is byte-for-byte unaffected by it.
 nvidia = ["dep:nvidia-rm"]
+# Kconfig-gated network drivers (kmod L1a).
+drv-e1000e = ["drivers/e1000e"]
+drv-r8169 = ["drivers/r8169"]
+drv-macb = ["drivers/macb"]
+drv-virtio-net = ["drivers/virtio-net"]
+drv-wifi-stack = ["drivers/wifi-stack"]
+drv-iwlwifi = ["drivers/iwlwifi"]
+drv-wifi-sim = ["drivers/wifi-sim"]
+drv-brcmf = ["drivers/brcmf"]
 
 [dependencies]
 mm         = { path = "../mm" }

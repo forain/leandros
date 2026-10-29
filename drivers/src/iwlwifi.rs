@@ -3593,9 +3593,9 @@ pub fn info_lines(out: &mut String) {
 pub fn scan_lines(out: &mut String) {
     // No Intel radio but the simulated one runs: show its list here, so
     // /proc/net/wifi and /bin/wifiscan work for it too.
-    if !present() && crate::wifi_sim::present() { return crate::wifi_sim::scan_lines(out); }
+    #[cfg(feature = "wifi-sim")] if !present() && crate::wifi_sim::present() { return crate::wifi_sim::scan_lines(out); }
     // The Pi's CYW43455 (brcmfmac): its manager's BSS cache.
-    if !present() && crate::brcmf::netdev::present() { return crate::brcmf::netdev::MGR.scan_lines("brcmfmac", out); }
+    #[cfg(feature = "brcmf")] if !present() && crate::brcmf::netdev::present() { return crate::brcmf::netdev::MGR.scan_lines("brcmfmac", out); }
     if manager_on() {
         let name = INFO.lock().as_ref().map_or("iwlwifi", |i| i.name);
         MGR.scan_lines(name, out);
