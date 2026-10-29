@@ -21,6 +21,10 @@ usb-debug = ["drivers/usb-debug"]
 # (drivers/nvidia + libnvrm.a from ports/openrm/build.sh). x86_64 only; off by
 # default, and the default kernel is byte-for-byte unaffected by it.
 nvidia = ["dep:nvidia-rm"]
+# GPU / display drivers (Kconfig I915, VIRTIO_GPU, V3D). Feature on == today's code.
+drv-i915 = ["drivers/i915"]
+drv-virtio-gpu = ["drivers/virtio-gpu"]
+drv-v3d = ["drivers/v3d"]
 
 [dependencies]
 mm         = { path = "../mm" }

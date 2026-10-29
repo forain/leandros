@@ -21,6 +21,11 @@ pub mod nvidia_probe;
 #[cfg(target_arch = "x86_64")]
 pub mod lapinv;
 /// Intel Gen9 graphics: probe, GT bring-up, self-tests (lane i915).
+#[cfg(feature = "i915")]
+pub mod i915;
+/// `i915` off: same API, nothing probed (CONFIG_I915=n).
+#[cfg(not(feature = "i915"))]
+#[path = "i915_stub.rs"]
 pub mod i915;
 pub mod acpi_power;
 /// HID report-descriptor parser (pure logic, host-tested; lane lapi2c).

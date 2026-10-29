@@ -71,7 +71,7 @@ menu "Graphics, display and audio"
 
 config I915
 	bool "Intel i915"
-	depends on PCI && DRM && ARCH_X86_64
+	depends on PCI && DRM
 	default y
 
 config V3D
