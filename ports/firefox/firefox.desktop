@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Firefox
+GenericName=Web Browser
+Comment=Browse the World Wide Web
+Exec=firefox %u
+Icon=firefox
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+StartupWMClass=firefox
+StartupNotify=true

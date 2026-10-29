@@ -1678,6 +1678,20 @@ def main():
         print(f"  WARNING: {_btapplet} or {_libdbus} absent, no Bluetooth applet in the panel: "
               f"./ports/cosmic-applet-bluetooth/build.sh {arch}")
 
+    # cosmic-applet-power, the panel's Power menu (already named in upstream's
+    # default plugins_wings): unmodified upstream, built by
+    # ports/cosmic-applet-power/build.sh. Binary and .desktop are staged
+    # together or not at all, like the Network applet above.
+    _pwrapplet = m6_pick(f"{m6_out}/cosmic-applet-power-{arch}")
+    if os.path.exists(_pwrapplet):
+        bin_files.append(("cosmic-applet-power", _pwrapplet, 0o100755))
+        m4_share_dirs.add("/usr/share/applications")
+        m4_share_files.append(("/usr/share/applications", "com.system76.CosmicAppletPower.desktop",
+                               "ports/cosmic-applet-power/com.system76.CosmicAppletPower.desktop"))
+    else:
+        print(f"  WARNING: {_pwrapplet} absent, no Power applet in the panel: "
+              f"./ports/cosmic-applet-power/build.sh {arch}")
+
     # leandros-applet — a minimal dependency-free wl_shm xdg_toplevel panel applet.
     # cosmic-panel refuses to render its bar with no applet content (render()
     # early-returns while actual_size<=20), and the real cosmic applets pull
@@ -2686,6 +2700,23 @@ def main():
             m4_share_dirs.update(("/usr/lib/firefox/defaults", "/usr/lib/firefox/defaults/pref"))
             m4_share_files.append(("/usr/lib/firefox/defaults/pref", "leandros-prefs.js", _ff_prefs))
         bin_files.append(("firefox", os.path.join(_ff_port, "firefox.sh"), 0o100755))
+        # Launcher entry + hicolor icons so Firefox shows in the app library
+        # and Super-search. The file is named firefox.desktop to match the
+        # Wayland app_id. Staged only together with Firefox itself.
+        _ff_desktop = os.path.join(_ff_port, "firefox.desktop")
+        if os.path.isfile(_ff_desktop):
+            m4_share_dirs.add("/usr/share/applications")
+            m4_share_files.append(("/usr/share/applications", "firefox.desktop", _ff_desktop))
+        _ff_icon_dir = os.path.join(_ff_root, "usr", "lib", "firefox", "browser", "chrome", "icons", "default")
+        for _sz in (16, 32, 48, 64, 128, 256):
+            _ff_png = os.path.join(_ff_icon_dir, f"default{_sz}.png")
+            if os.path.isfile(_ff_png):
+                _ff_idir = f"/usr/share/icons/hicolor/{_sz}x{_sz}/apps"
+                m4_share_dirs.update(("/usr/share", "/usr/share/icons", "/usr/share/icons/hicolor",
+                                      f"/usr/share/icons/hicolor/{_sz}x{_sz}", _ff_idir))
+                m4_share_files.append((_ff_idir, "firefox.png", _ff_png))
+            else:
+                print(f"  WARNING: Firefox icon absent: {_ff_png}")
         _ff_ver = ""
         try:
             with open(os.path.join(_ff_root, "FIREFOX-VERSION")) as _f:
@@ -2815,7 +2846,7 @@ def main():
     # (…Tiling.On.svg / …Tiling.Off.svg back …Tiling-symbolic).
     _icon_stems = set()
     for _d, _n, _p in m4_share_files:
-        if "/icons/" in _d and _n.endswith(".svg"):
+        if "/icons/" in _d and _n.endswith((".svg", ".png")):
             _icon_stems.add(_n[:-4])
     _missing_icons = {}
     for _d, _n, _p in m4_share_files:
