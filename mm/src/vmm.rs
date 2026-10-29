@@ -312,6 +312,33 @@ pub enum FaultPlan {
     Vmo(VmoFault),
 }
 
+/// VFS reference counting of the tmpfs/memfd object a VMA names, so the object
+/// outlives its last descriptor while a lazily-mapped VMA may still fault.
+pub type VmoRefFn = fn(vmo: u64);
+static VMO_RETAIN_HOOK:  AtomicUsize = AtomicUsize::new(0);
+static VMO_RELEASE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_vmo_ref_hooks(retain: VmoRefFn, release: VmoRefFn) {
+    VMO_RETAIN_HOOK.store(retain as usize, Ordering::Release);
+    VMO_RELEASE_HOOK.store(release as usize, Ordering::Release);
+}
+
+pub fn vmo_retain(vmo: u64) {
+    if vmo == 0 { return; }
+    let f = VMO_RETAIN_HOOK.load(Ordering::Acquire);
+    if f == 0 { return; }
+    let f: VmoRefFn = unsafe { core::mem::transmute(f) };
+    f(vmo)
+}
+
+pub fn vmo_release(vmo: u64) {
+    if vmo == 0 { return; }
+    let f = VMO_RELEASE_HOOK.load(Ordering::Acquire);
+    if f == 0 { return; }
+    let f: VmoRefFn = unsafe { core::mem::transmute(f) };
+    f(vmo)
+}
+
 pub fn file_retain(file_cap: usize) {
     let f = FILE_RETAIN_HOOK.load(Ordering::Acquire);
     if f == 0 { return; }
@@ -473,6 +500,7 @@ impl Drop for AddressSpace {
                 if is_file_backed(region.file_cap) {
                     file_release(region.file_cap);
                 }
+                vmo_release(region.vmo);
             }
         }
         // Free the page-table tree: every intermediate node `map_page`
@@ -1697,6 +1725,7 @@ impl AddressSpace {
 
         // Each surviving VMA holds its own reference on the backing file.
         if is_file_backed(file_cap) { file_retain(file_cap); }
+        vmo_retain(tail_vmo);
 
         let right_count = tail_pages.count_present();
         let new_region = VmaRegion {
@@ -1795,6 +1824,7 @@ impl AddressSpace {
             if is_file_backed(region.file_cap) {
                 file_release(region.file_cap);
             }
+            vmo_release(region.vmo);
             *slot = None;
         }
 
@@ -2056,9 +2086,36 @@ impl AddressSpace {
         if let Some(r) = self.regions.iter_mut().filter_map(|r| r.as_mut())
             .find(|r| r.start == virt)
         {
+            let old = r.vmo;
             r.vmo = vmo;
             r.file_off = off;
+            vmo_retain(vmo);
+            vmo_release(old);
         }
+    }
+
+    /// Lazy `MAP_SHARED` mapping of a tmpfs/memfd object: the VMA only names
+    /// the object (`vmo`, byte offset `off` of its first page); every page
+    /// is found by the fault path (`FaultPlan::Vmo`), so nothing is
+    /// allocated, zeroed or pinned at mmap time.
+    pub fn map_shared_vmo_lazy(&mut self, virt: usize, size: usize, flags: PageFlags, vmo: u64, off: u64) -> bool {
+        if vmo == 0 || !self.map_lazy(virt, size, flags, false) { return false; }
+        let virt = virt & !(PAGE_SIZE - 1);
+        let r = match self.regions.iter_mut().filter_map(|r| r.as_mut()).find(|r| r.start == virt) {
+            Some(r) => r,
+            None => return false,
+        };
+        r.map_flags = MAP_SHARED;
+        r.prot = {
+            let mut p = PROT_READ;
+            if flags.contains(PageFlags::WRITABLE) { p |= PROT_WRITE; }
+            if flags.contains(PageFlags::EXECUTE)  { p |= PROT_EXEC; }
+            p
+        };
+        r.vmo = vmo;
+        r.file_off = off;
+        vmo_retain(vmo);
+        true
     }
 
     /// What `mremap` must know about `[addr, addr+len)` before it decides
