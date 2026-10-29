@@ -1075,6 +1075,8 @@ stage_dbus_session() {
         echo "⚠️  ports/cosmic-applet-bluetooth/build.sh FAILED for $arch (no Bluetooth applet)"
     ./ports/cosmic-applet-power/build.sh "$arch" || \
         echo "⚠️  ports/cosmic-applet-power/build.sh FAILED for $arch (no Power applet)"
+    ./ports/cosmic-applets-panel/build.sh "$arch" || \
+        echo "⚠️  ports/cosmic-applets-panel/build.sh FAILED for $arch (no Time/Battery/Notifications/... applets)"
     # iso-codes tables for cosmic-settings' Region & language page (data only).
     ./ports/iso-codes/build.sh "$arch" || \
         echo "⚠️  ports/iso-codes/build.sh FAILED for $arch (Region page stays empty)"
