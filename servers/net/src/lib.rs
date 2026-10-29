@@ -6612,16 +6612,24 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         requested += iovs[i].1;
     }
     // Destination bytes (and the control buffer) faulted in and unshared
-    // before UNIX_CONNS is taken (see handle_send).
-    {
-        let mut budget = RING_MAX;
+    // before UNIX_CONNS is taken (see handle_send). Only the bytes queued now
+    // are prefaulted (a 52-page walk per call otherwise); if more arrives and
+    // the copy then faults with nothing delivered, the read is retried once
+    // with the full window (below).
+    let queued = {
+        let conns = UNIX_CONNS.lock();
+        if !conns[conn_idx].in_use { 0 } else if is_a { conns[conn_idx].ring_ba.count } else { conns[conn_idx].ring_ab.count }
+    };
+    let prefault_iovs = |cap: usize| {
+        let mut budget = cap.min(RING_MAX);
         for &(base, len) in iovs[..n_iov].iter() {
             if budget == 0 { break; }
             sched::uaccess::prefault(base, len.min(budget), false);
             budget -= len.min(budget);
         }
-        if ctrl_ptr != 0 { sched::uaccess::prefault(ctrl_ptr, ctrl_cap.min(MAX_CONTROL), false); }
-    }
+    };
+    prefault_iovs(queued);
+    if ctrl_ptr != 0 { sched::uaccess::prefault(ctrl_ptr, ctrl_cap.min(MAX_CONTROL), false); }
     // A zero-length recv can't consume the fd-carrying byte and would spin the
     // blocking wrapper on EAGAIN forever — return 0 immediately (msg_flags set).
     if requested == 0 {
@@ -6637,7 +6645,21 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         unsafe { write_msg_tail(msghdr_ptr, 0, 0); }
         return val_reply(0);
     }
-    let sr = unix_stream_read_locked(&mut conns, conn_idx, is_a, &iovs[..n_iov], peek, true);
+    let mut sr = unix_stream_read_locked(&mut conns, conn_idx, is_a, &iovs[..n_iov], peek, true);
+    if sr.fault && sr.nread == 0 && queued < RING_MAX {
+        // Data arrived after the queue length was sampled: fault in the full
+        // window and read again.
+        drop(conns);
+        for x in sr.discard { xfer_drop(x); }
+        prefault_iovs(RING_MAX);
+        conns = UNIX_CONNS.lock();
+        if !conns[conn_idx].in_use {
+            drop(conns);
+            unsafe { write_msg_tail(msghdr_ptr, 0, 0); }
+            return val_reply(0);
+        }
+        sr = unix_stream_read_locked(&mut conns, conn_idx, is_a, &iovs[..n_iov], peek, true);
+    }
     let nread = sr.nread;
     let conn = &mut conns[conn_idx];
     if nread == 0 {
