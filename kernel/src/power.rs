@@ -158,7 +158,7 @@ fn shutdown_prepare(state: u8) {
     crate::print_number(n as u32);
     serial_print_str(" f2fs volume(s) committed with a clean-unmount checkpoint (the rest were already read-only)\n");
     // NVMe: delete the I/O queues and send CC.SHN (Linux `nvme_shutdown`).
-    drivers::nvme::shutdown_all();
+    for l in crate::pm2::block_shutdown() { plog(&l); }
 }
 
 // ── Reboot / power-off knobs (kernel command line) ───────────────────────────
@@ -261,14 +261,9 @@ fn quiesce_phase1(cfg: &RebootCfg, what: &str) -> alloc::vec::Vec<drivers::pci::
     plog(&plan);
     if !cfg.quiesce { return bm; }
     let t = sched::monotonic_ns();
-    let (audio, f) = pipewire_server::shutdown(cfg.hda_crst);
-    plog(&alloc::format!("audio: {}", audio));
-    if let Some(f) = f { bm.push(f); }
-    if let Some(s) = crate::kmod::exports::pm_shutdown().or_else(drivers::e1000e::shutdown) { plog(&s); }
-    // Pi 5 Wi-Fi: leave the AP, WLC_DOWN, chip off with WL_REG_ON held low
-    // across a kexec (the CYW43455 otherwise keeps running into the next kernel).
-    #[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "drv-brcmf"))]
-    if let Some(s) = drivers::brcmf_boot::shutdown() { plog(&s); }
+    let (lines, fns) = crate::pm2::shutdown_phase1(cfg.hda_crst);
+    for l in lines { plog(&l); }
+    bm.extend(fns);
     if cfg.busmaster_off {
         // Network (02xx: e1000e, iwlwifi, virtio-net, r8169) and display
         // (03xx: i915, NVIDIA, virtio-gpu) functions; xHCI is done by its
@@ -490,11 +485,7 @@ fn nvidia_kexec_unload() {
 /// or the framebuffer's GPU that is not reset at all). The scanout goes back
 /// to the boot loader's surface first, so the next kernel's console shows.
 fn kexec_hooks() {
-    drivers::gpu_kms::console_restore();
-    let mut lines: alloc::vec::Vec<alloc::string::String> = drivers::nvme::kexec_disable();
-    lines.extend(drivers::i915::kexec_quiesce());
-    lines.extend(drivers::r8169::shutdown());
-    lines.extend(drivers::iwlwifi::kexec_stop());
+    let lines = crate::pm2::kexec_quiesce();
     for l in lines {
         serial_print_str("[KEXEC] ");
         serial_print_str(&l);

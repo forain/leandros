@@ -14,6 +14,7 @@ mod hungtask;
 mod lappower;
 mod power;
 mod pm;
+mod pm2;
 #[cfg(target_arch = "x86_64")]
 mod pm_s3;
 mod kexec;

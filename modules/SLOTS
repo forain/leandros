@@ -1,6 +1,23 @@
 # <name> <first_slot> <nslots>  (slot = 256 KiB; slots 1022-1023 are reserved for ktest/testblob)
-# Names are the underscore form of the crate (modules/<dash-name>). Next free: 32.
+# Names are the underscore form of the crate (modules/<dash-name>). Next free: 304.
 hello 0 1
 virtio_rng 4 4
 e1000e 8 16
 uvc 24 8
+nvme 32 8
+virtio_blk 40 4
+usb_storage 44 8
+r8169 52 8
+virtio_net 60 4
+virtio_snd 64 4
+hda 68 8
+usb_hid 76 4
+virtio_keyboard 80 4
+bt 84 12
+iwlwifi 96 32
+brcmf 128 32
+i915 160 64
+virtio_gpu 224 32
+v3d 256 32
+macb 288 8
+hdmi_audio 296 8
