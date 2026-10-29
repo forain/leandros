@@ -23,6 +23,9 @@
 _Static_assert(VIDIOC_QUERYCAP == 0x80685600, "querycap");
 _Static_assert(VIDIOC_ENUM_FMT == 0xC0405602, "enum_fmt");
 _Static_assert(VIDIOC_S_FMT == 0xC0D05605, "s_fmt");
+_Static_assert(VIDIOC_G_CTRL == 0xC008561B, "g_ctrl");
+_Static_assert(VIDIOC_S_CTRL == 0xC008561C, "s_ctrl");
+_Static_assert(VIDIOC_QUERYCTRL == 0xC0445624, "queryctrl");
 _Static_assert(VIDIOC_REQBUFS == 0xC0145608, "reqbufs");
 _Static_assert(VIDIOC_QUERYBUF == 0xC0585609, "querybuf");
 _Static_assert(VIDIOC_DQBUF == 0xC0585611, "dqbuf");
@@ -136,9 +139,13 @@ int main(int argc, char **argv) {
     int frames = 30;
     uint32_t want_fmt = V4L2_PIX_FMT_MJPEG, w = 640, h = 480;
     const char *out = NULL;
+    int ae_prio = -1, exposure = -1, show_fps = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--probe")) return probe();
         if (!strcmp(argv[i], "--mmap")) return mmap_test();
+        if (!strcmp(argv[i], "--fps")) { show_fps = 1; continue; }
+        if (!strcmp(argv[i], "--ae-prio") && i + 1 < argc) { ae_prio = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--exposure") && i + 1 < argc) { exposure = atoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "-o") && i + 1 < argc) { out = argv[++i]; continue; }
         if (!strcasecmp(argv[i], "mjpg") || !strcasecmp(argv[i], "mjpeg")) { want_fmt = V4L2_PIX_FMT_MJPEG; continue; }
         if (!strcasecmp(argv[i], "yuyv")) { want_fmt = V4L2_PIX_FMT_YUYV; continue; }
@@ -163,6 +170,16 @@ int main(int argc, char **argv) {
     printf("camtest: using %s %ux%u sizeimage %u @%u fps\n", cc, f.fmt.pix.width, f.fmt.pix.height,
            f.fmt.pix.sizeimage, fps);
 
+    if (ae_prio >= 0) {
+        struct v4l2_control c = { .id = V4L2_CID_EXPOSURE_AUTO_PRIORITY, .value = ae_prio };
+        if (xioctl(fd, VIDIOC_S_CTRL, &c) < 0) perror("camtest: S_CTRL ae_prio");
+    }
+    if (exposure >= 0) {
+        struct v4l2_control c = { .id = V4L2_CID_EXPOSURE_AUTO, .value = V4L2_EXPOSURE_MANUAL };
+        if (xioctl(fd, VIDIOC_S_CTRL, &c) < 0) perror("camtest: S_CTRL exposure_auto");
+        c.id = V4L2_CID_EXPOSURE_ABSOLUTE; c.value = exposure;
+        if (xioctl(fd, VIDIOC_S_CTRL, &c) < 0) perror("camtest: S_CTRL exposure_abs");
+    }
     struct v4l2_requestbuffers rb = { .count = NBUF, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP };
     if (xioctl(fd, VIDIOC_REQBUFS, &rb) < 0 || rb.count < 2) { perror("camtest: REQBUFS"); return 1; }
     void *map[NBUF] = {0};
@@ -182,6 +199,7 @@ int main(int argc, char **argv) {
     uint32_t prev = 0, distinct = 0;
     static uint8_t last[8 << 20];
     size_t last_n = 0;
+    double t_first = 0, t_prev = 0, t_max = 0, t_sum = 0;
     while (got < frames) {
         struct pollfd p = { .fd = fd, .events = POLLIN };
         int pr = poll(&p, 1, 3000);
@@ -205,10 +223,21 @@ int main(int argc, char **argv) {
                n > 0 ? d[0] : 0, n > 1 ? d[1] : 0, (long)b.timestamp.tv_sec, (long)b.timestamp.tv_usec,
                (b.flags & V4L2_BUF_FLAG_ERROR) ? " ERR" : "");
         if (n <= sizeof last) { memcpy(last, d, n); last_n = n; }
+        double t = (double)b.timestamp.tv_sec * 1e3 + (double)b.timestamp.tv_usec / 1e3;
+        if (got == 0) t_first = t;
+        else { double dt = t - t_prev; t_sum += dt; if (dt > t_max) t_max = dt; }
+        t_prev = t;
         got++;
         if (xioctl(fd, VIDIOC_QBUF, &b) < 0) { perror("camtest: QBUF"); break; }
     }
     xioctl(fd, VIDIOC_STREAMOFF, &type);
+    if (show_fps || ae_prio >= 0 || exposure >= 0) {
+        double span = t_prev - t_first;
+        if (got > 1 && span > 0)
+            printf("camtest: %d/%d frames, %.2f fps, spacing mean %.1f ms max %.1f ms\n", got, frames,
+                   (got - 1) * 1000.0 / span, t_sum / (got - 1), t_max);
+        else printf("camtest: %d/%d frames, fps n/a\n", got, frames);
+    }
     if (last_n) {
         FILE *o = fopen(out, "wb");
         if (o) { fwrite(last, 1, last_n, o); fclose(o); printf("camtest: wrote %zu bytes to %s\n", last_n, out); }
