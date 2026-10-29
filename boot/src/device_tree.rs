@@ -374,6 +374,12 @@ pub unsafe fn has_property_name(name: &[u8]) -> Option<bool> {
     Some(strs.split(|&b| b == 0).any(|s| s == name))
 }
 
+/// Re-point the recorded DTB at a copy (kernel-virtual address) so the
+/// original block can be freed.
+pub fn set_recorded_dtb(virt: usize) {
+    DTB_VIRT.store(virt, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// The recorded DTB as bytes (its header `totalsize`), `None` without one.
 ///
 /// # Safety

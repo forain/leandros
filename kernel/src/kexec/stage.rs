@@ -61,6 +61,25 @@ impl Alloc {
         }
     }
 
+    /// Like [`block`], but the block must start at or above `min` (blocks
+    /// below it are held until `release_held`).
+    pub fn block_above(&mut self, order: usize, limit: Option<usize>, min: u64) -> Result<usize, isize> {
+        let len = (PAGE << order) as u64;
+        loop {
+            let a = match limit {
+                Some(l) => mm::buddy::alloc_below(order, l),
+                None => mm::buddy::alloc(order),
+            }.ok_or(ENOMEM)?;
+            if (a as u64) < min || overlaps(&self.forbidden, a as u64, len) {
+                self.held.push((a, order));
+                continue;
+            }
+            unsafe { core::ptr::write_bytes(mm::phys_to_virt(a) as *mut u8, 0, PAGE << order); }
+            self.owned.push((a, order));
+            return Ok(a);
+        }
+    }
+
     /// Free the rejected pages (success path) .
     pub fn release_held(&mut self) {
         for (a, o) in self.held.drain(..) { mm::buddy::free(a, o); }

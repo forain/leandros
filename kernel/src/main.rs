@@ -1539,6 +1539,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         _ => sched::uaccess::PAN_STRICT,
     }, Ordering::Relaxed);
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
+    #[cfg(target_arch = "aarch64")] kexec::return_boot_fdt();
 
     // The wall clock's epoch, from the board's battery clock, now that the
     // monotonic counter is running (arch init started the timer). Without a

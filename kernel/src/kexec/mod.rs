@@ -335,3 +335,38 @@ pub fn handover_fb() -> Option<u64> {
 pub fn exec_jump() -> ! { exec_aarch64::stop_and_jump() }
 #[cfg(target_arch = "x86_64")]
 pub fn exec_jump() -> ! { exec_x86_64::stop_and_jump() }
+
+/// aarch64: the previous LeandrOS kernel left its 16 KiB FDT block (FDT plus
+/// AP park page) out of `/memory`, so this kernel's map has a hole there, and
+/// every kexec of this kernel would copy the hole on, one more per generation.
+/// Once the APs have left the park page, move the FDT to the heap, put the
+/// block back into the map as Available and give it to the allocator.
+/// No-op for a firmware DTB (no kexec AP mailbox).
+#[cfg(target_arch = "aarch64")]
+pub fn return_boot_fdt() {
+    let mb = boot::device_tree::kexec_ap_mailbox();
+    if mb == 0 { return; }
+    // Test knob: keep the hole, to show the regression guard failing.
+    if crate::cmdline_knob("kexec.keep_fdt_hole") == Some("1") { return; }
+    let blk = mb & !0x3fff;
+    let end = blk + 0x4000;
+    let bi = unsafe { &mut *core::ptr::addr_of_mut!(crate::BOOT_INFO) };
+    // Already RAM in this map (e.g. a non-LeandrOS-built FDT)? Nothing to do.
+    if bi.memory_regions().iter().any(|r| r.kind == boot::MemoryType::Available
+        && r.base < end && blk < r.base + r.length) {
+        return;
+    }
+    // Keep a copy of the FDT: drivers read the recorded DTB at probe time.
+    if let Some(d) = unsafe { boot::device_tree::recorded_dtb() } {
+        let mut v: Vec<u64> = alloc::vec![0u64; (d.len() + 7) / 8];
+        unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), v.as_mut_ptr() as *mut u8, d.len()); }
+        boot::device_tree::set_recorded_dtb(v.as_ptr() as usize);
+        core::mem::forget(v);
+    }
+    let reported = boot::sanitize_stats().map(|(_, r)| r).unwrap_or(0);
+    let add = [boot::MemoryRegion { base: blk, length: 0x4000, kind: boot::MemoryType::Available }];
+    unsafe { boot::sanitize_boot_info(bi, reported, &add) };
+    let n = mm::buddy::add_free_range(blk as usize, end as usize);
+    crate::serial_print_str(&alloc::format!(
+        "[KEXEC] boot FDT block {:#x}-{:#x} returned to the map ({} pages)\n", blk, end, n));
+}

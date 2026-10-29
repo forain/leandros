@@ -304,6 +304,22 @@ pub fn release_reserved(start: usize, end: usize) -> usize {
     n
 }
 
+/// Give the pages of `[start, end)` to the allocator that `init_from_map`
+/// never saw as RAM (a hole in the boot map the kernel has since proven is
+/// free, e.g. the kexec boot FDT block). Pages overlapping a reservation are
+/// skipped. Returns the pages freed. The caller guarantees the range was not
+/// in the map's Available set (no double free).
+pub fn add_free_range(start: usize, end: usize) -> usize {
+    let mut a = leandros_lib::align_down(start, PAGE_SIZE).max(LOW_RESERVED_END);
+    let e = end & !(PAGE_SIZE - 1);
+    let mut n = 0;
+    while a < e {
+        if !overlaps_reserved(a, PAGE_SIZE) { free(a, 0); n += 1; }
+        a += PAGE_SIZE;
+    }
+    n
+}
+
 /// Progress lines from `init_from_map` (and `mm::init_with_map`), for the
 /// early framebuffer text dump (`earlyfb.memmap=1`): a hang in the middle of
 /// memory-manager init then shows on a photo which region it was in.

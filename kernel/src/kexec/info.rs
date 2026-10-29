@@ -177,7 +177,19 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, a: &mut Alloc) -> R
 
     const ORDER: usize = 2; // 16 KiB: FDT in the first 12, AP park page last
     const LIMIT: usize = 8 << 30;
-    let dtb = a.block(ORDER, Some(LIMIT))?;
+    // Debug knob `kexec.fdt_low=1`: put the FDT block just above the image
+    // footprint (the first free 16 KiB there), which is where it ends up in
+    // practice and makes the hole-accumulation bug reproducible in QEMU.
+    let dtb = if crate::cmdline_knob("kexec.fdt_low") == Some("1") {
+        let ird = inp.initrd.map(|(d, _)| d);
+        let min = inp.footprint.iter().filter(|&&(s, _)| Some(s) != ird).map(|&(_, e)| e).max().unwrap_or(0);
+        match a.block_above(ORDER, Some((min as usize + (32 << 20)).min(LIMIT)), min) {
+            Ok(b) => b,
+            Err(_) => a.block(ORDER, Some(LIMIT))?,
+        }
+    } else {
+        a.block(ORDER, Some(LIMIT))?
+    };
     let dtb_len = (4096usize << ORDER) as u64;
     // The whole block is left out of `/memory`, so the park page survives
     // into the next kernel (see `AP_PARK_OFF`).
