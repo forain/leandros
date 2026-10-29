@@ -86,7 +86,7 @@ config HDMI_AUDIO
 
 config HDA
 	bool "Intel HD Audio (+capture)"
-	depends on PCI && ARCH_X86_64
+	depends on PCI
 	default y
 
 endmenu

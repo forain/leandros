@@ -21,6 +21,11 @@ usb-debug = ["drivers/usb-debug"]
 # (drivers/nvidia + libnvrm.a from ports/openrm/build.sh). x86_64 only; off by
 # default, and the default kernel is byte-for-byte unaffected by it.
 nvidia = ["dep:nvidia-rm"]
+# kmod L1c misc driver gates.
+drv-virtio-rng = ["drivers/drv-virtio-rng"]
+drv-hda = ["drivers/drv-hda"]
+drv-lapinv = ["drivers/drv-lapinv"]
+drv-i2c-hid = ["drivers/drv-i2c-hid"]
 
 [dependencies]
 mm         = { path = "../mm" }

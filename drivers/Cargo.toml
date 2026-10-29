@@ -13,6 +13,11 @@ raspi4b = []
 # Verbose xHCI tracing and the boot-time bulk-only-transport self-test on
 # every enumerated USB mass-storage interface (drivers/src/usb_hcd.rs).
 usb-debug = []
+# kmod L1c: misc driver gates (CONFIG_* -> drv-*). Off = stub module, same API.
+drv-virtio-rng = []
+drv-hda = []
+drv-lapinv = []
+drv-i2c-hid = []
 
 [dependencies]
 leandros-lib = { path = "../lib" }
