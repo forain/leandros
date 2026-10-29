@@ -21,7 +21,8 @@
 //! Inert on failure: every probe is bounded, a failure reads "disconnected".
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use sched::ksync::KSemaphore;
 
 use crate::gpu_kms::{KmsConnInfo, KmsOutputs, KmsTiming};
 
@@ -86,6 +87,22 @@ static PROBING: AtomicBool = AtomicBool::new(false);
 static PORTS: spin::Mutex<Vec<Port>> = spin::Mutex::new(Vec::new());
 static CONNS: spin::Mutex<Vec<Conn>> = spin::Mutex::new(Vec::new());
 static VBT_PORTS: spin::Mutex<Vec<Port>> = spin::Mutex::new(Vec::new());
+
+/// PCH_PORT_HOTPLUG pulse status bits latched by the ISR, consumed by `i915-hpd`.
+static HPD_PENDING: AtomicU32 = AtomicU32::new(0);
+static HPD_WAKE: KSemaphore = KSemaphore::new(0);
+static HPD_IRQS: AtomicU64 = AtomicU64::new(0);
+static HPD_WAKES: AtomicU64 = AtomicU64::new(0);
+static HPD_REPROBES: AtomicU64 = AtomicU64::new(0);
+static HPD_THREAD: AtomicBool = AtomicBool::new(false);
+static HPD_GEN: AtomicU32 = AtomicU32::new(0);
+
+/// From the ISR: remember the latched pulse status and wake the thread. No locks.
+pub(super) fn hpd_irq(status: u32) {
+    HPD_IRQS.fetch_add(1, Ordering::Relaxed);
+    HPD_PENDING.fetch_or(status | 1 << 31, Ordering::AcqRel);
+    HPD_WAKE.up();
+}
 
 static OUTPUTS: KmsOutputs = KmsOutputs { count, info, cached, crtc_mask };
 
@@ -173,7 +190,8 @@ pub(super) fn init(d: &Device) {
                 (now_ns() - t0) / 1000, hpd_live(&m, p.ddi));
         }
     }
-    for i in 0..n { let _ = info(i); }
+    for i in 0..n { let _ = reprobe(i); }
+    hpd_thread_start(&m, d.fake);
     let l = CONNS.lock();
     let st: Vec<alloc::string::String> = l.iter().map(|c| alloc::format!("{}-{}={}", if c.is_dp { "DP" } else { "HDMI-A" }, c.type_id,
         if c.info.connected { "connected" } else { "disconnected" })).collect();
@@ -230,8 +248,13 @@ fn count() -> usize { CONNS.lock().len() }
 
 fn cached(i: usize) -> Option<KmsConnInfo> { CONNS.lock().get(i).map(|c| c.info) }
 
-/// Re-probe connector `i` when its port's live HPD changed since the last probe.
+/// GETCONNECTOR path: cache-only once the `i915-hpd` thread owns re-probing.
 fn info(i: usize) -> Option<KmsConnInfo> {
+    if HPD_THREAD.load(Ordering::Acquire) { cached(i) } else { reprobe(i) }
+}
+
+/// Re-probe connector `i` when its port's live HPD changed since the last probe.
+fn reprobe(i: usize) -> Option<KmsConnInfo> {
     let (c, p) = {
         let l = CONNS.lock();
         let c = *l.get(i)?;
@@ -519,4 +542,91 @@ fn gmbus_read_edid_inner(m: &Mmio, pin: u8, edid: &mut [u8; 128]) -> Result<(), 
     m.w(GMBUS1, 0);
     m.w(GMBUS0, 0);
     r
+}
+
+// ── hotplug: PCH HPD interrupt, `i915-hpd` thread ───────────────────────────
+
+/// Live DDI B/C/D bits of SDEISR (SPT: 21..23).
+fn live_bits(m: &Mmio) -> u32 { if FAKE.load(Ordering::Relaxed) { 0 } else { m.r(SDEISR) & (7 << 21) } }
+
+/// Enable the HPD interrupt (unless `i915.hpd=0`) and start `i915-hpd`.
+/// Only reached with `i915.extout=1`.
+fn hpd_thread_start(m: &Mmio, fake: bool) {
+    let irq = if fake || opt("i915.hpd") == Some(0) { None } else { super::vblank::hpd_irq_enable(m) };
+    let debounce = opt("i915.hpd_debounce_ms").unwrap_or(100).min(2000);
+    if sched::kthread::spawn("i915-hpd", move || hpd_thread(debounce)).is_none() {
+        ilog!("outputs: could not start i915-hpd; connector state probes on GETCONNECTOR");
+        return;
+    }
+    HPD_THREAD.store(true, Ordering::Release);
+    match irq {
+        Some((imr, ier)) => ilog!("outputs: HPD irq enabled (SDEIMR 0x{:08x} SDEIER 0x{:08x} PCH_PORT_HOTPLUG 0x{:08x} SDEISR live 0x{:x}), kthread i915-hpd, debounce {} ms",
+            imr, ier, m.r(PCH_PORT_HOTPLUG), live_bits(m), debounce),
+        None => ilog!("outputs: HPD irq off ({}), kthread i915-hpd polls SDEISR every 2 s", if fake { "fake device" } else { "i915.hpd=0 or no display irq" }),
+    }
+}
+
+/// Force a re-probe of every connector on the DDIs in `ddis` (bit per DDI index).
+/// Returns whether any `(connected, modes)` changed.
+fn reprobe_ports(ddis: u32) -> bool {
+    let n = CONNS.lock().len();
+    let mut changed = false;
+    for i in 0..n {
+        let before = {
+            let mut l = CONNS.lock();
+            let Some(c) = l.get_mut(i) else { continue };
+            let Some(p) = PORTS.lock().get(c.port).copied() else { continue };
+            if ddis & (1 << p.ddi) == 0 { continue }
+            c.hpd = u8::MAX; c.fail = 0; c.next_ns = 0;
+            c.info
+        };
+        HPD_REPROBES.fetch_add(1, Ordering::Relaxed);
+        if let Some(after) = reprobe(i) {
+            if after.connected != before.connected || after.nmodes != before.nmodes { changed = true; }
+        }
+    }
+    changed
+}
+
+fn hpd_thread(debounce_ms: u64) {
+    let m = mmio();
+    let mut last_live = live_bits(&m);
+    let mut next_report = now_ns() + 300_000_000_000;
+    while !sched::kthread::should_stop() {
+        let woke = HPD_WAKE.down_timeout(2_000_000_000);
+        HPD_WAKES.fetch_add(1, Ordering::Relaxed);
+        let pend = HPD_PENDING.swap(0, Ordering::AcqRel);
+        let live = live_bits(&m);
+        let mut ddis = 0u32;
+        // Per port: B=[1:0], C=[9:8], D=[17:16]; 10 = long pulse, 01 = short pulse.
+        for (ddi, shift) in [(1u32, 0u32), (2, 8), (3, 16)] {
+            let v = (pend >> shift) & 3;
+            let name = (b'A' + ddi as u8) as char;
+            if v & 2 != 0 {
+                ilog!("outputs: hpd DDI-{} long pulse (PCH_PORT_HOTPLUG status 0x{:08x}) -> reprobe", name, pend & !(1 << 31));
+                ddis |= 1 << ddi;
+            } else if v & 1 != 0 {
+                ilog!("outputs: hpd DDI-{} short pulse (DP IRQ_HPD), logged only", name);
+            }
+            if (live ^ last_live) & (1 << (20 + ddi)) != 0 {
+                if v == 0 { ilog!("outputs: hpd DDI-{} live bit changed without a pulse (poll backstop) -> reprobe", name); }
+                ddis |= 1 << ddi;
+            }
+        }
+        last_live = live;
+        if ddis != 0 {
+            sched::kthread::msleep(debounce_ms);
+            if reprobe_ports(ddis) {
+                let g = HPD_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+                ilog!("outputs: uevent drm change card0 (gen {})", g);
+                evdev_server::hp_drm_change(0);
+            }
+        }
+        if !woke && now_ns() >= next_report {
+            next_report = now_ns() + 300_000_000_000;
+            ilog!("outputs: hpd stats: irqs {} wakes {} reprobes {} gen {} PCH_PORT_HOTPLUG 0x{:08x} SDEISR live 0x{:x}",
+                HPD_IRQS.load(Ordering::Relaxed), HPD_WAKES.load(Ordering::Relaxed), HPD_REPROBES.load(Ordering::Relaxed),
+                HPD_GEN.load(Ordering::Relaxed), m.r(PCH_PORT_HOTPLUG), live);
+        }
+    }
 }

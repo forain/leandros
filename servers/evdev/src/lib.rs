@@ -2349,6 +2349,15 @@ fn hp_broadcast(r: HpRec) {
     }
 }
 
+/// Hotplug record kind for a DRM `change` uevent (`dev` = card number).
+const HP_KIND_DRM: u8 = 0xFE;
+
+/// Queue a DRM `change cardN drm` uevent for the libudev shim (display hotplug).
+/// Never call from interrupt context: it takes the hotplug lock.
+pub fn hp_drm_change(card: u8) {
+    hp_broadcast(HpRec { add: false, dev: card, kind: HP_KIND_DRM, bus: 0, vendor: 0, product: 0 });
+}
+
 fn hp_format(r: &HpRec, out: &mut [u8; 64]) -> usize {
     fn put(out: &mut [u8; 64], n: &mut usize, s: &[u8]) {
         for &b in s { if *n < out.len() { out[*n] = b; *n += 1; } }
@@ -2358,6 +2367,12 @@ fn hp_format(r: &HpRec, out: &mut [u8; 64]) -> usize {
         put(out, n, &[H[(v >> 12) as usize & 15], H[(v >> 8) as usize & 15], H[(v >> 4) as usize & 15], H[v as usize & 15]]);
     }
     let mut n = 0;
+    if r.kind == HP_KIND_DRM {
+        put(out, &mut n, b"change card");
+        put(out, &mut n, &[b'0' + (r.dev % 10)]);
+        put(out, &mut n, b" drm 0 0 0\n");
+        return n;
+    }
     put(out, &mut n, if r.add { b"add " } else { b"remove " });
     put(out, &mut n, EVENT_PATHS[r.dev as usize].trim_start_matches("/dev/input/").as_bytes());
     let kind: &[u8] = match r.kind {

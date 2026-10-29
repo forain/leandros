@@ -11593,7 +11593,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
        cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||
        cmd == DRM_IOCTL_SET_PLANE || cmd == DRM_IOCTL_GET_CAPS ||
        cmd == DRM_IOCTL_GPU_IRQ_STATS || cmd == DRM_IOCTL_GPU_PARK_SPIN ||
-       cmd == DRM_IOCTL_CTX_DRAIN_US ||
+       cmd == DRM_IOCTL_CTX_DRAIN_US || cmd == 0x100B /* fake HPD uevent, root test hook */ ||
        is_evdev || is_drm ||
        // /dev/uinput ('U'): only on a device-server fd, never on other fd kinds.
        (ioctl_type == 0x55 && matches!(vfs::vfs_get_node_kind(pid, fd), Some(vfs::VnodeKind::DynamicDevice { .. }))) {
