@@ -65,6 +65,7 @@ mod nr {
     pub const MEMFD_CREATE: usize = 279;
     pub const PREAD64: usize = 67;
     pub const PWRITE64: usize = 68;
+    pub const CLOCK_GETTIME: usize = 113;
 }
 #[cfg(target_arch = "x86_64")]
 mod nr {
@@ -75,6 +76,7 @@ mod nr {
     pub const MEMFD_CREATE: usize = 319;
     pub const PREAD64: usize = 17;
     pub const PWRITE64: usize = 18;
+    pub const CLOCK_GETTIME: usize = 228;
 }
 
 fn wifexited(status: c_int) -> bool { (status & 0x7f) == 0 }
@@ -638,9 +640,45 @@ unsafe fn t_rss_shmem() -> bool {
     report(name, true)
 }
 
+unsafe fn now_ns() -> u64 {
+    let mut ts = [0u64; 2];
+    sys(nr::CLOCK_GETTIME, 1, ts.as_mut_ptr() as usize, 0, 0, 0);
+    ts[0] * 1_000_000_000 + ts[1]
+}
+
+/// `shmtest bench`: 4 MiB memfd / anon map-touch-unmap cost (lane mmapB).
+unsafe fn bench() {
+    const N: usize = 500;
+    const LEN: usize = 1024 * PS;
+    let fd = sys(nr::MEMFD_CREATE, b"bench\0".as_ptr() as usize, 0, 0, 0, 0) as c_int;
+    if fd < 0 || sys(nr::FTRUNCATE, fd as usize, LEN, 0, 0, 0) != 0 { say(b"bench: memfd failed\n"); return; }
+    for mode in 0..3 {
+        let (mut tm, mut tt, mut tu) = (0u64, 0u64, 0u64);
+        for _ in 0..N {
+            let t0 = now_ns();
+            let p = if mode == 0 { map(LEN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1) }
+                    else { map(LEN, PROT_READ | PROT_WRITE, MAP_SHARED, fd) };
+            let t1 = now_ns();
+            if p.is_null() { say(b"bench: mmap failed\n"); return; }
+            if mode != 2 { for i in 0..1024 { wr(p, i * PS, 1); } }
+            let t2 = now_ns();
+            unmap(p, LEN);
+            let t3 = now_ns();
+            tm += t1 - t0; tt += t2 - t1; tu += t3 - t2;
+        }
+        say(match mode { 0 => b"anon touched   ", 1 => b"memfd touched  ", _ => b"memfd untouched" });
+        say(b" ns/iter mmap="); say_num(tm / N as u64);
+        say(b" touch="); say_num(tt / N as u64);
+        say(b" munmap="); say_num(tu / N as u64);
+        say(b"\n");
+    }
+    close(fd);
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn shm_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
-    let cases: [unsafe fn() -> bool; 12] = [
+pub unsafe extern "C" fn shm_main(argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    if argc >= 2 { bench(); return 0; }
+    let cases: [unsafe fn() -> bool; 13] = [
         t_live_both_ways, t_multi_fork, t_munmap, t_madvise, t_mprotect, t_threads_fork,
         t_devzero, t_memfd, t_memfd_lazy, t_private_cow, t_mremap, t_release, t_rss_shmem,
     ];
