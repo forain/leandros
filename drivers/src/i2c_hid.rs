@@ -335,7 +335,11 @@ pub fn init(cmdline: &str) -> bool {
     INREG.store(word("i2c_hid.inreg", cmdline) == Some("1"), Ordering::Relaxed);
     let tp = word("touchpad", cmdline).unwrap_or("ps2");
     if tp == "auto" { log("touchpad=auto: not enabled yet, using ps2"); }
-    let tp_i2c = tp == "i2c";
+    // Explicit `touchpad=ps2!` forces PS/2. Otherwise, if no PS/2 port found a Synaptics pad
+    // (silent AUX2: the pad can latch in I2C/HID mode), try the I2C PTP driver if a pad exists.
+    let ps2_syn = (0..crate::psmouse::NPORTS).any(|i| crate::psmouse::protocol(i) == crate::psmouse::PROTO_SYNAPTICS);
+    let auto_i2c = tp != "i2c" && tp != "ps2!" && !ps2_syn;
+    let tp_i2c = tp == "i2c" || auto_i2c;
     let devs = dw_i2c::find();
     if devs.is_empty() {
         log("i2c: no LPSS I2C controllers");
@@ -356,6 +360,7 @@ pub fn init(cmdline: &str) -> bool {
         dw_i2c::bring_up(d, tm);
     }
     for s in &sc.slaves { log(&i2c_acpi::describe(s)); }
+    if auto_i2c { log("touchpad: ps2 pad silent, using i2c (CPD0)"); }
     if mode == "0" && !tp_i2c { return false; }
     if !active { log("i2c-hid: idle (touchpad=ps2); i2c_hid.listen=1 to probe"); return false; }
     let mut l = LISTEN.lock();
