@@ -275,3 +275,38 @@ pub mod pm {
         match unsafe { sys::kapi_pm_register(owner(), suspend, resume, shutdown, ctx) } { 0 => Ok(()), e => Err(e) }
     }
 }
+
+pub mod v4l2 {
+    use super::*;
+    pub use kmod_abi::{KCamBuf, KCamDone, KCamInfo, KCameraOps, KFormat, KFrame, KCAM_GONE, KCAM_NEW_FRAME};
+
+    /// Register a camera with the kernel's V4L2 layer. `ops` must be `'static` (modules are permanent).
+    /// Err = kernel errno.
+    pub fn register(ops: &'static KCameraOps, ctx: usize) -> Result<(), i32> {
+        match unsafe { sys::kapi_v4l2_register(owner(), ops, ctx) } { 0 => Ok(()), e => Err(e) }
+    }
+}
+
+pub mod tick {
+    use super::*;
+    pub use kmod_abi::KTickFn;
+
+    /// Run `f(ctx)` on every USB timer tick (interrupt context, must not block).
+    pub fn register(f: KTickFn, ctx: usize) -> Result<(), i32> {
+        match unsafe { sys::kapi_tick_register(owner(), f, ctx) } { 0 => Ok(()), e => Err(e) }
+    }
+}
+
+pub mod usb {
+    use super::*;
+    pub use kmod_abi::{KUsbIf, KUsbProbeFn, KmodDevId, BUS_USB};
+
+    /// Register a USB class driver. The kernel replays interfaces that were enumerated earlier and
+    /// left unclaimed. `probe` returns 0 to claim the interface. Err = kernel errno.
+    pub fn class_register(ids: &'static [KmodDevId], probe: KUsbProbeFn, ctx: usize) -> Result<(), i32> {
+        match unsafe { sys::kapi_usb_class_register(owner(), ids.as_ptr(), ids.len(), probe, ctx) } {
+            0 => Ok(()),
+            e => Err(e),
+        }
+    }
+}

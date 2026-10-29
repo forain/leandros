@@ -7,5 +7,6 @@ edition.workspace = true
 leandros-lib = { path = "../../lib" }
 ipc     = { path = "../../ipc" }
 mm      = { path = "../../mm" }
+kmod-abi = { path = "../../lib/kmod-abi" }
 bitflags.workspace = true
 spin.workspace = true
