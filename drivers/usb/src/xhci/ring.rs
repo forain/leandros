@@ -84,6 +84,15 @@ impl ProducerRing {
     }
 
     #[inline] pub fn phys(&self) -> u64 { self.buf.phys() }
+
+    /// Back to the freshly-allocated state (system resume: the controller
+    /// forgot every ring position).
+    pub fn reset(&mut self) {
+        self.buf.zero(0, RING_TRBS * TRB_SIZE);
+        self.enq = 0;
+        self.pcs = true;
+        self.write_raw(RING_TRBS - 1, &Trb::new(TRB_LINK, self.buf.phys(), 0, TRB_TC), false);
+    }
     #[inline] fn trb_phys(&self, idx: usize) -> u64 { self.buf.phys() + (idx * TRB_SIZE) as u64 }
 
     /// The current enqueue pointer with the DCS/RCS bit, for CRCR, an
@@ -166,6 +175,14 @@ impl EventRing {
         erst.write32(12, 0);
         dma_wmb();
         Some(EventRing { seg, erst, deq: 0, ccs: true })
+    }
+
+    /// Empty ring, consumer at the start (system resume after a controller reset).
+    pub fn reset(&mut self) {
+        self.seg.zero(0, RING_TRBS * TRB_SIZE);
+        crate::dma::dma_wmb();
+        self.deq = 0;
+        self.ccs = true;
     }
 
     pub fn erst_phys(&self) -> u64 { self.erst.phys() }

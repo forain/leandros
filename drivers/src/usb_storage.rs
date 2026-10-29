@@ -1139,3 +1139,25 @@ fn publish(mut disk: ScsiDisk<XhciBulk>, loc: (u8, u8)) -> bool {
         }
     }
 }
+
+/// After an S3 resume: every USB disk answers TEST UNIT READY (unit attention
+/// from the power-on reset is retried by the SCSI layer) and reports the same
+/// capacity as before. A disk that does not is marked gone: no further I/O,
+/// no writes (lane s3xhci).
+pub fn pm_resume_check() -> Result<alloc::string::String, alloc::string::String> {
+    let disks: Vec<&'static UsbDisk> = DISKS.lock().clone();
+    let mut bad = alloc::string::String::new();
+    let mut ok = 0;
+    for d in disks {
+        if d.gone.load(Ordering::Relaxed) { continue; }
+        let mut g = d.disk.lock();
+        let r = g.init();
+        let same = r.is_ok() && g.sector_size() == d.sector_size && g.capacity_sectors() == d.sectors;
+        drop(g);
+        if same { ok += 1; continue; }
+        d.gone.store(true, Ordering::Relaxed);
+        let _ = core::fmt::Write::write_fmt(&mut bad, format_args!(
+            "[S3] root/usb device changed across suspend: bus {} slot {} halted, no writes; ", d.bus, d.slot));
+    }
+    if bad.is_empty() { Ok(alloc::format!("{} usb disk(s) same capacity", ok)) } else { Err(bad) }
+}

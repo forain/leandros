@@ -727,3 +727,20 @@ pub fn pm_resume() -> Result<alloc::string::String, alloc::string::String> {
     if bad != 0 { return Err(alloc::format!("{} of {} controller(s) did not restart", bad, save.len())); }
     Ok(alloc::format!("{} controller(s) running", save.len()))
 }
+
+/// `pm.s3_xhci=auto|restore|reinit` (lane s3xhci).
+pub fn pm_set_s3_mode(v: Option<&str>) {
+    let m = match v { Some("restore") => 1, Some("reinit") => 2, _ => 0 };
+    usb::PM_XHCI_MODE.store(m, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// S3 suspend: ports to U3, controllers halted and their state saved.
+pub fn pm_suspend_s3() -> Result<alloc::string::String, alloc::string::String> { usb::pm_suspend_all() }
+
+/// S3 resume: restore or reinit, re-address the persisted devices, then check
+/// every USB disk is the same one (TEST UNIT READY, READ CAPACITY).
+pub fn pm_resume_s3() -> Result<alloc::string::String, alloc::string::String> {
+    let mut s = usb::pm_resume_all()?;
+    s.push_str(&crate::usb_storage::pm_resume_check()?);
+    Ok(s)
+}

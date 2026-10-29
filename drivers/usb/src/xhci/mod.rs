@@ -37,6 +37,7 @@ pub mod ring;
 mod intr;
 pub mod isoch;
 pub mod btusb;
+pub mod pm;
 
 pub use intr::{HidPipe, IntrPipe, Poll as IntrPoll, Reports as IntrReports, REPORT_MAX};
 
@@ -130,6 +131,8 @@ struct Slot {
     ctrl_buf: DmaBuf,
     /// Indexed by DCI (0 unused, 1 = EP0).
     eps: Vec<Option<Endpoint>>,
+    /// What system resume needs to bring this device back (lane s3xhci).
+    persist: pm::Persist,
 }
 
 pub struct Xhci {
@@ -151,6 +154,8 @@ pub struct Xhci {
     cmd_done: Vec<(u64, u8, u8)>,
     slots: ManuallyDrop<Vec<Option<Box<Slot>>>>,
     dead: bool,
+    /// Register image saved at S3 suspend (lane s3xhci).
+    pm: Option<Box<pm::Saved>>,
 }
 
 // H1 regression guard: controller and slot objects must stay small, so no
@@ -301,6 +306,7 @@ impl Xhci {
             cmd_done: Vec::with_capacity(33),
             slots: ManuallyDrop::new(slots),
             dead: false,
+            pm: None,
         };
 
         // Run (INTE stays 0: this driver never takes the controller's IRQ).
@@ -1127,7 +1133,7 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
         in_ctx.sync_for_device();
         let in_phys = in_ctx.phys();
         x.dcbaa.write64(slot as usize * 8, out_ctx.phys());
-        x.slots[slot as usize] = Some(Box::new(Slot { port, gone: false, out_ctx, in_ctx, ctrl_buf, eps }));
+        x.slots[slot as usize] = Some(Box::new(Slot { port, gone: false, out_ctx, in_ctx, ctrl_buf, eps, persist: pm::Persist::default() }));
         in_phys
     };
 
@@ -1170,6 +1176,7 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
     let vendor = u16::from_le_bytes([dd[8], dd[9]]);
     let product = u16::from_le_bytes([dd[10], dd[11]]);
     let dev_class = dd[4];
+    let persist_dd = dd;
 
     let mut hdr = [0u8; 9];
     control(hc, slot, 0x80, 6, 0x0200, 0, CtrlData::In(&mut hdr), ENUM_CTRL_TIMEOUT_MS)
@@ -1189,6 +1196,7 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
     };
     let manufacturer = get_string(hc, slot, dd[14], lang);
     let product_name = get_string(hc, slot, dd[15], lang);
+    let persist_serial = get_string(hc, slot, dd[16], lang);
 
     let address = {
         let x = hc.lock();
@@ -1289,6 +1297,15 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
     }
     info.mass_storage = true;
     info.interface = bot.iface;
+    // System resume can re-address this device in place (lane s3xhci).
+    if route == 0 {
+        if let Some(s) = hc.lock().slot_mut(slot) {
+            s.persist = pm::Persist {
+                ok: true, speed, config: ci.value, alt: bot.alt, iface: bot.iface,
+                dd: persist_dd, serial: persist_serial, lang,
+            };
+        }
+    }
     usb_dbg!("[XHCI] slot {}: BOT interface {} alt {} subclass {:02x}, IN {:02x} (mps {}, burst {}), OUT {:02x} (mps {}, burst {})\n",
              slot, bot.iface, bot.alt, bot.subclass, bot.ep_in.addr, bot.ep_in.mps, bot.ep_in.burst,
              bot.ep_out.addr, bot.ep_out.mps, bot.ep_out.burst);

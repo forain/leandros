@@ -44,6 +44,7 @@ pub use transport::{BulkTransport, UsbErr};
 pub use xhci::XhciBulk;
 
 use alloc::string::String;
+use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -292,6 +293,7 @@ fn scan_hubs(bus: u8, hc: &Controller, ev: &mut Vec<HotEvent>) -> usize {
 /// everything behind it; a newly connected port is enumerated.
 /// Sleeps (port reset, enumeration): task context only.
 pub fn hotplug_scan() -> Vec<HotEvent> {
+    if PM_ACTIVE.load(core::sync::atomic::Ordering::Acquire) { return Vec::new(); }
     let ctrls: Vec<Controller> = CONTROLLERS.lock().clone();
     let mut ev = Vec::new();
     for (i, hc) in ctrls.iter().enumerate() {
@@ -359,4 +361,42 @@ pub fn mass_storage_count() -> usize {
 /// once: a second call returns only interfaces enumerated since.
 pub fn mass_storage_devices() -> Vec<XhciBulk> {
     core::mem::take(&mut *MASS_STORAGE.lock())
+}
+
+// ── System sleep (lane s3xhci) ─────────────────────────────────────────────
+
+/// Set from S3 suspend until the controllers are back: the hot-plug scan stays out.
+static PM_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `pm.s3_xhci`: 0 auto (restore, else reinit), 1 restore only, 2 reinit only.
+pub static PM_XHCI_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Halt every xHCI controller and save its state (S3).
+pub fn pm_suspend_all() -> Result<String, String> {
+    PM_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+    let ctrls: Vec<Controller> = CONTROLLERS.lock().clone();
+    let mut out = String::new();
+    for hc in ctrls.iter() {
+        match xhci::pm::suspend(hc) {
+            Ok(s) => { out.push_str(&s); out.push_str("; "); }
+            Err(e) => { PM_ACTIVE.store(false, core::sync::atomic::Ordering::Release); return Err(e); }
+        }
+    }
+    Ok(out)
+}
+
+/// Restore or re-initialise every xHCI controller after S3 and re-address
+/// the persisted devices in place.
+pub fn pm_resume_all() -> Result<String, String> {
+    let ctrls: Vec<Controller> = CONTROLLERS.lock().clone();
+    let mode = PM_XHCI_MODE.load(core::sync::atomic::Ordering::Relaxed);
+    let mut out = String::new();
+    let mut err = None;
+    for hc in ctrls.iter() {
+        match xhci::pm::resume(hc, mode) {
+            Ok(s) => { out.push_str(&s); out.push_str("; "); }
+            Err(e) => { err = Some(e); }
+        }
+    }
+    PM_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+    match err { Some(e) => Err(e), None => Ok(out) }
 }
