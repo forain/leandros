@@ -6217,6 +6217,7 @@ impl DrmDeviceInterface {
             0x1008 => Self::handle_gpu_irq_stats(arg),
             0x1009 => Self::handle_gpu_park_spin(arg),
             0x100A => Self::handle_ctx_drain_us(arg),
+            0x100B => Self::handle_fake_hpd(),
             // No device lock: the handler reads no device state, and a backend's
             // token check takes its own STATE lock (L1.14 per-open check).
             0x1007 => self.handle_ioctl_mmap(arg, open_id),
@@ -6742,6 +6743,14 @@ impl DrmDeviceInterface {
         let old = CTX_DRAIN_US_OVERRIDE.swap(unsafe { p.read_volatile() },
                                              ::core::sync::atomic::Ordering::Relaxed);
         unsafe { p.write_volatile(old); }
+        Ok(0)
+    }
+
+    /// LeandrOS 0x100B: queue a DRM `change` uevent on /dev/input/hotplug, the
+    /// same record the i915 HPD thread sends (DRM_DEBUG_FAKE_HPD). Root only; test hook.
+    fn handle_fake_hpd() -> Result<usize, DriverError> {
+        if sched::current_euid() != 0 { return Err(DriverError::Access); }
+        evdev_server::hp_drm_change(0);
         Ok(0)
     }
 
