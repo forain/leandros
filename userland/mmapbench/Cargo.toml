@@ -1,0 +1,14 @@
+[package]
+name = "mmapbench"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mmapbench"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc! We link directly against librelibc.a, the same way
+# pthreadtest/timertest/sigtest/polltest/forktest do: the suite needs real
+# fork()/pthread/nanosleep/clock_gettime from the libc userspace, plus a
+# handful of raw Leandros IPC syscalls issued via local inline asm.
