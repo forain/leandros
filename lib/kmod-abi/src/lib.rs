@@ -240,6 +240,7 @@ const _: () = {
     assert!(core::mem::size_of::<KmodId>() == 2);
     assert!(core::mem::size_of::<KmodCtx>() == 48);
     assert!(core::mem::size_of::<KSym>() == 16);
+    assert!(core::mem::size_of::<KmodDevId>() == 16);
     assert!(core::mem::offset_of!(KmodHeader, magic) == 0);
     assert!(core::mem::offset_of!(KmodHeader, abi_version) == 8);
     assert!(core::mem::offset_of!(KmodHeader, header_size) == 12);
@@ -262,7 +263,6 @@ const _: () = {
     assert!(core::mem::offset_of!(KmodCtx, params) == 32);
     assert!(core::mem::offset_of!(KmodCtx, params_len) == 40);
     assert!(core::mem::size_of::<RegKind>() == 2);
-    assert!(core::mem::size_of::<KmodDevId>() == 16);
     assert!(core::mem::size_of::<KPciDev>() == 40);
     assert!(layout::TEST_SLOT_OFF == layout::SIZE - 2 * layout::SLOT_ALIGN);
     assert!(layout::TEST_SLOT_OFF == 0x0ff8_0000);
