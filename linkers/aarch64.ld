@@ -28,6 +28,20 @@ SECTIONS
         __rodata_end = .;
     } :kernel
 
+    . = ALIGN(8);
+    .note.gnu.build-id : AT(ADDR(.note.gnu.build-id) - KERNEL_OFFSET) {
+        __build_id_start = .;
+        KEEP(*(.note.gnu.build-id))
+        __build_id_end = .;
+    } :kernel
+
+    . = ALIGN(8);
+    .ksymtab : AT(ADDR(.ksymtab) - KERNEL_OFFSET) {
+        __ksymtab_start = .;
+        KEEP(*(.ksymtab))
+        __ksymtab_end = .;
+    } :kernel
+
     . = ALIGN(4K);
 
     /* ── Limine Revision 6 Requests ───────────────────────────────────────── */

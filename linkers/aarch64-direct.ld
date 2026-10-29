@@ -36,6 +36,20 @@ SECTIONS {
         __rodata_end = .;
     }
 
+    . = ALIGN(8);
+    .note.gnu.build-id : AT(ADDR(.note.gnu.build-id) - KERNEL_VIRT) {
+        __build_id_start = .;
+        KEEP(*(.note.gnu.build-id))
+        __build_id_end = .;
+    }
+
+    . = ALIGN(8);
+    .ksymtab : AT(ADDR(.ksymtab) - KERNEL_VIRT) {
+        __ksymtab_start = .;
+        KEEP(*(.ksymtab))
+        __ksymtab_end = .;
+    }
+
     .data : AT(ADDR(.data) - KERNEL_VIRT) {
         __data_start = .;
         *(.data*)
