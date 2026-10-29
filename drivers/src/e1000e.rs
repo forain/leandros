@@ -60,7 +60,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use spin::Mutex;
 
 use crate::e1000e_hw::{self as hw, DevInfo, Family, RxEvent, RxRing, TxRing};
-use crate::pci::{self, PciFunction};
+use crate::kenv::{irq, mm, netdev, pci, sched};
+use crate::kenv::pci::PciFunction;
 
 // ── MAC registers ───────────────────────────────────────────────────────────
 
@@ -425,7 +426,7 @@ static IRQS: AtomicU64 = AtomicU64::new(0);
 static IRQ_RX: AtomicU64 = AtomicU64::new(0);
 static IRQ_LSC: AtomicU64 = AtomicU64::new(0);
 /// The link monitor parks here; the ISR wakes it on LSC / ECCER.
-pub static LINKMON: crate::netdev::LinkMon = crate::netdev::LinkMon::new();
+pub static LINKMON: netdev::LinkMon = netdev::LinkMon::new();
 /// Link-monitor cadence: while frames move, while TX is in flight (watchdog)
 /// or when no interrupt is wired, and otherwise (idle; a link change arrives
 /// as ICR.LSC and wakes the monitor at once).
@@ -1664,13 +1665,13 @@ impl hw::IcrRegs for Mmio {
     fn unmask(&mut self, bits: u32) { self.w32(IMS, bits) }
 }
 
-extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
+extern "C" fn isr(_ctx: usize) -> irq::IrqReturn {
     let base = BASE.load(Ordering::Relaxed);
-    if base == 0 { return crate::irq::IrqReturn::None; }
+    if base == 0 { return irq::IrqReturn::None; }
     let mut m = Mmio(base);
     let st = match hw::irq_service(&mut m) {
         Some(st) => st,
-        None => { IRQ_EMPTY.fetch_add(1, Ordering::Relaxed); return crate::irq::IrqReturn::None; }
+        None => { IRQ_EMPTY.fetch_add(1, Ordering::Relaxed); return irq::IrqReturn::None; }
     };
     IRQS.fetch_add(1, Ordering::Relaxed);
     IRQ_LAST.store(st, Ordering::Relaxed);
@@ -1679,8 +1680,8 @@ extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
     if st & hw::ICR_RXO != 0 { IRQ_RXO.fetch_add(1, Ordering::Relaxed); }
     if st & ICR_ECCER != 0 { ECC_ERRORS.fetch_add(1, Ordering::Relaxed); }
     if st & (hw::ICR_LSC | ICR_ECCER) != 0 { LINKMON.notify(); }
-    crate::netdev::kick_from_irq();
-    crate::irq::IrqReturn::Handled
+    netdev::kick_from_irq();
+    irq::IrqReturn::Handled
 }
 
 // ── probe ───────────────────────────────────────────────────────────────────
@@ -1827,7 +1828,7 @@ pub fn init(cmdline: &str) {
             RX_IRQ.store(hwst.opts.rxirq, Ordering::SeqCst);
             if hwst.opts.rxirq { "RX + link/errors" } else { "link/errors only, RX polled (e1000e.rxirq=0)" }
         };
-        match crate::irq::request_msi(func, isr, 0) {
+        match irq::request_msi(func, isr, 0) {
             Ok(h) => {
                 let v = h.vector();
                 core::mem::forget(h);
@@ -1840,11 +1841,11 @@ pub fn init(cmdline: &str) {
             // it on that IMS write if a cause latched meanwhile. RX on INTx
             // measured 1027 Mbit/s up / 1382 Mbit/s down (lane e1000intx).
             Err(e) => match func.intx_line() {
-                Some(line) => match crate::irq::request_irq(crate::irq::IrqSource::Line(line), isr, 0) {
+                Some(line) => match irq::request_irq(irq::IrqSource::Line(line), isr, 0) {
                     Ok(h) => {
                         core::mem::forget(h);
                         let rx = arm();
-                        func.write16(0x04, func.read16(0x04) & !crate::pci::PCI_CMD_INTX_DISABLE);
+                        func.write16(0x04, func.read16(0x04) & !pci::PCI_CMD_INTX_DISABLE);
                         format!("INTx line {} (MSI {:?}; {})", line, e, rx)
                     }
                     Err(e2) => format!("none (MSI {:?}, INTx {:?}; polled)", e, e2),
@@ -2043,7 +2044,7 @@ fn driver_thread(mut hw: Hw) {
                         Some((filled, true)) => {
                             elog!("RX backlog #{}: {} frames waiting, none consumed for {} ms (net daemon last polled {} ms ago); waking it",
                                   n, filled, now - rx_still_since, now.saturating_sub(LAST_RX_POLL_MS.load(Ordering::Relaxed)));
-                            crate::netdev::kick();
+                            netdev::kick();
                         }
                         _ if !rx_stall_soft => {
                             elog!("RX stall #{}: no frame for {} ms, missed/no-buffer {} -> {}; re-arming RDT and the mask: {}",
@@ -2052,7 +2053,7 @@ fn driver_thread(mut hw: Hw) {
                                 if let Some(r) = g.as_ref() { hw.m.w32(RDT, ((r.rx.cur + NUM_RX - 1) % NUM_RX) as u32); }
                             }
                             if IRQ_ACTIVE.load(Ordering::Relaxed) { hw.m.w32(IMS, IRQ_EN.load(Ordering::Relaxed)); }
-                            crate::netdev::kick();
+                            netdev::kick();
                             rx_stall_soft = true;
                         }
                         _ => {

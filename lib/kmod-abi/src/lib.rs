@@ -116,6 +116,38 @@ pub struct KPciDev {
 pub const KMAP_WRITABLE: u32 = 1;
 pub const KMAP_MMIO: u32 = 2;
 pub const KMAP_WC: u32 = 4;
+/// Strongly-ordered uncached device mapping in kernel VA space (what `ioremap(.., Uncached)` gives);
+/// the right mode for register BARs. Honoured together with KMAP_WRITABLE.
+pub const KMAP_UC: u32 = 8;
+
+/// `kapi_netdev_register` kinds.
+pub const KNET_WIRED: u32 = 0;
+pub const KNET_WIFI: u32 = 1;
+
+/// Network-interface driver operations (module side of the kernel's `NetifOps`). Every entry takes
+/// the `ctx` given at registration first. `link` fills (up, Mbit/s, full duplex); `mac` writes 6 bytes
+/// and returns false when unknown; `recv` returns the frame length or a negative value for none;
+/// `info` and `driver_name` copy up to `cap` bytes into `buf` and return the length.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KNetifOps {
+    pub send: extern "C" fn(ctx: usize, buf: *const u8, len: usize) -> bool,
+    pub tx_ready: extern "C" fn(ctx: usize) -> bool,
+    pub recv: extern "C" fn(ctx: usize, buf: *mut u8, cap: usize) -> i32,
+    pub rx_rearm: extern "C" fn(ctx: usize) -> bool,
+    pub rx_irq_driven: extern "C" fn(ctx: usize) -> bool,
+    pub mac: extern "C" fn(ctx: usize, out6: *mut u8) -> bool,
+    pub link: extern "C" fn(ctx: usize, up: *mut bool, mbps: *mut u32, full: *mut bool),
+    pub link_gen: extern "C" fn(ctx: usize) -> u32,
+    pub info: extern "C" fn(ctx: usize, buf: *mut u8, cap: usize) -> usize,
+    pub driver_name: extern "C" fn(ctx: usize, buf: *mut u8, cap: usize) -> usize,
+}
+
+/// Power-management hook: writes a message into `buf` (<= `cap`). Return >= 0 = ok with that
+/// message length (shutdown: 0 = nothing to log); < 0 = error with message length `-r`.
+pub type KPmFn = extern "C" fn(ctx: usize, buf: *mut u8, cap: usize) -> i32;
+/// Interrupt handler: returns 1 when handled, 0 when the interrupt was not the device's.
+pub type KIrqHandler = extern "C" fn(ctx: usize) -> u32;
 
 /// Every id-table entry starts with a `u16 bus` discriminator.
 pub const BUS_PCI: u16 = 1;
@@ -160,7 +192,33 @@ pub mod sys {
     pub type HwrngRegisterFn =
         unsafe extern "C" fn(KmodId, *const u8, usize, extern "C" fn(*mut u8, usize) -> usize) -> i32;
 
+    pub type PciEnableFn = unsafe extern "C" fn(u32, bool) -> i32;
+    pub type PciFindCapFn = unsafe extern "C" fn(u32, u8) -> u16;
+    pub type IrqRequestMsiFn = unsafe extern "C" fn(KmodId, u32, super::KIrqHandler, usize) -> i64;
+    pub type IrqRequestLineFn = unsafe extern "C" fn(KmodId, u32, super::KIrqHandler, usize) -> i64;
+    pub type WaitNewFn = unsafe extern "C" fn() -> usize;
+    pub type WaitTimeoutFn = unsafe extern "C" fn(usize, u64) -> bool;
+    pub type WaitNotifyFn = unsafe extern "C" fn(usize);
+    pub type NetdevRegisterFn =
+        unsafe extern "C" fn(KmodId, u32, *const u8, usize, *const super::KNetifOps, usize) -> i32;
+    pub type NetdevKickFn = unsafe extern "C" fn();
+    pub type PmRegisterFn = unsafe extern "C" fn(KmodId, Option<super::KPmFn>, Option<super::KPmFn>,
+                                                 Option<super::KPmFn>, usize) -> i32;
+
     extern "C" {
+        pub fn kapi_pci_enable(bdf: u32, bus_master: bool) -> i32;
+        pub fn kapi_pci_find_cap(bdf: u32, cap_id: u8) -> u16;
+        pub fn kapi_irq_request_msi(owner: KmodId, bdf: u32, handler: super::KIrqHandler, ctx: usize) -> i64;
+        pub fn kapi_irq_request_line(owner: KmodId, bdf: u32, handler: super::KIrqHandler, ctx: usize) -> i64;
+        pub fn kapi_wait_new() -> usize;
+        pub fn kapi_wait_timeout(h: usize, ns: u64) -> bool;
+        pub fn kapi_wait_notify(h: usize);
+        pub fn kapi_netdev_register(owner: KmodId, kind: u32, prefix: *const u8, prefix_len: usize,
+                                    ops: *const super::KNetifOps, ctx: usize) -> i32;
+        pub fn kapi_netdev_kick();
+        pub fn kapi_netdev_kick_from_irq();
+        pub fn kapi_pm_register(owner: KmodId, suspend: Option<super::KPmFn>, resume: Option<super::KPmFn>,
+                                shutdown: Option<super::KPmFn>, ctx: usize) -> i32;
         pub fn kapi_abi_version() -> u32;
         pub fn kapi_log(level: u32, ptr: *const u8, len: usize);
         pub fn kapi_panic(owner: KmodId, ptr: *const u8, len: usize) -> !;

@@ -3,3 +3,5 @@
 pub use ::mm;
 pub use ::sched;
 pub use crate::pci;
+pub use crate::irq;
+pub use crate::netdev;
