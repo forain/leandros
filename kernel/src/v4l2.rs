@@ -154,6 +154,7 @@ pub(crate) fn init() {
     if !ipc::port::register_kernel_handler(port, handle) { return; }
     vfs::register_device_notify_open("/dev/video0", port, 0, VIDEO_MAJOR, 0);
     usb::class::tick_register(KmodId(0), pump_tick, 0);
+    #[cfg(not(feature = "mod-usb-video-class"))]
     usb::uvc::set_camera_sink(usb::uvc::CameraSink {
         add: |owner, ops, ctx| { let _ = register_camera(owner, ops, ctx); },
         remove: unregister_camera,

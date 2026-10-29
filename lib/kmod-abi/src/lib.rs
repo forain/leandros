@@ -257,6 +257,21 @@ pub struct KUsbIf {
 
 /// Class-driver probe: 0 = claimed, non-zero = not mine (the kernel keeps the interface for later drivers).
 pub type KUsbProbeFn = extern "C" fn(intf: *const KUsbIf, ctx: usize) -> i32;
+/// The device behind `handle` left the bus. The kernel drops the handle (and closes any isochronous
+/// pipe still open on it) right after this returns. Task context.
+pub type KUsbDetachFn = extern "C" fn(handle: u64, ctx: usize);
+
+/// USB control request header, as on the wire. Bit 7 of `request_type` gives the data direction.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KUsbSetup {
+    pub request_type: u8,
+    pub request: u8,
+    pub value: u16,
+    pub index: u16,
+    pub length: u16,
+}
+
 /// Tick callback (USB timer tick, interrupt context).
 pub type KTickFn = extern "C" fn(ctx: usize);
 
@@ -315,8 +330,16 @@ pub mod sys {
     pub type NetdevKickFn = unsafe extern "C" fn();
     pub type V4l2RegisterFn = unsafe extern "C" fn(KmodId, *const super::KCameraOps, usize) -> i32;
     pub type TickRegisterFn = unsafe extern "C" fn(KmodId, super::KTickFn, usize) -> i32;
-    pub type UsbClassRegisterFn =
-        unsafe extern "C" fn(KmodId, *const super::KmodDevId, usize, super::KUsbProbeFn, usize) -> i32;
+    pub type UsbClassRegisterFn = unsafe extern "C" fn(KmodId, *const super::KmodDevId, usize, super::KUsbProbeFn,
+                                                       Option<super::KUsbDetachFn>, usize) -> i32;
+    pub type UsbCtrlFn = unsafe extern "C" fn(u64, *const super::KUsbSetup, *mut u8, usize, u32) -> i32;
+    pub type UsbSetAltFn = unsafe extern "C" fn(u64, u8, u8) -> i32;
+    pub type UsbCfgFn = unsafe extern "C" fn(u64, *mut u8, usize) -> i32;
+    pub type UsbIsochOpenFn = unsafe extern "C" fn(u64, u8, u8, u8, usize, usize, bool) -> i64;
+    pub type UsbIsochSubmitFn = unsafe extern "C" fn(u64) -> i32;
+    pub type UsbIsochReapFn = unsafe extern "C" fn(u64, *mut u8, usize) -> i32;
+    pub type UsbIsochCloseFn = unsafe extern "C" fn(u64);
+    pub type V4l2UnregisterFn = unsafe extern "C" fn(usize);
     pub type PmRegisterFn = unsafe extern "C" fn(KmodId, Option<super::KPmFn>, Option<super::KPmFn>,
                                                  Option<super::KPmFn>, usize) -> i32;
 
@@ -335,7 +358,18 @@ pub mod sys {
         pub fn kapi_v4l2_register(owner: KmodId, ops: *const super::KCameraOps, ctx: usize) -> i32;
         pub fn kapi_tick_register(owner: KmodId, f: super::KTickFn, ctx: usize) -> i32;
         pub fn kapi_usb_class_register(owner: KmodId, ids: *const super::KmodDevId, nids: usize,
-                                       probe: super::KUsbProbeFn, ctx: usize) -> i32;
+                                       probe: super::KUsbProbeFn, detach: Option<super::KUsbDetachFn>,
+                                       ctx: usize) -> i32;
+        pub fn kapi_usb_ctrl(handle: u64, setup: *const super::KUsbSetup, buf: *mut u8, len: usize,
+                             timeout_ms: u32) -> i32;
+        pub fn kapi_usb_set_alt(handle: u64, iface: u8, alt: u8) -> i32;
+        pub fn kapi_usb_cfg(handle: u64, buf: *mut u8, len: usize) -> i32;
+        pub fn kapi_usb_isoch_open(handle: u64, iface: u8, alt: u8, ep_addr: u8, fifo_bytes: usize,
+                                   ntds: usize, framed: bool) -> i64;
+        pub fn kapi_usb_isoch_submit(pipe: u64) -> i32;
+        pub fn kapi_usb_isoch_reap(pipe: u64, buf: *mut u8, len: usize) -> i32;
+        pub fn kapi_usb_isoch_close(pipe: u64);
+        pub fn kapi_v4l2_unregister(ctx: usize);
         pub fn kapi_pm_register(owner: KmodId, suspend: Option<super::KPmFn>, resume: Option<super::KPmFn>,
                                 shutdown: Option<super::KPmFn>, ctx: usize) -> i32;
         pub fn kapi_abi_version() -> u32;
@@ -446,6 +480,7 @@ const _: () = {
     assert!(core::mem::size_of::<KFrame>() == 16);
     assert!(core::mem::size_of::<KCamDone>() == 32);
     assert!(core::mem::size_of::<KUsbIf>() == 24);
+    assert!(core::mem::size_of::<KUsbSetup>() == 8);
     assert!(layout::TEST_SLOT_OFF == layout::SIZE - 2 * layout::SLOT_ALIGN);
     assert!(layout::TEST_SLOT_OFF == 0x0ff8_0000);
     assert!(layout::x86_64::BASE % layout::SLOT_ALIGN == 0);

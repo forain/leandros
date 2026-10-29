@@ -18,7 +18,7 @@ sys.path.insert(0, HERE)
 import kconfiglib  # noqa: E402
 
 # Kconfig symbol (lowercase, dashed) -> modules/<dir> when the two differ.
-KMOD_NAME_MAP = {"kmod-hello": "hello"}
+KMOD_NAME_MAP = {"kmod-hello": "hello", "usb-video-class": "uvc"}
 
 BOARD_FEATURES = {"BOARD_RPI5": "rpi5", "BOARD_RASPI4B": "raspi4b", "NVIDIA": "nvidia"}
 
@@ -78,6 +78,8 @@ def main():
         if val == 2 and "drv-" + name in declared:
             feats.append("drv-" + name)
         elif val == 1:
+            if "mod-" + name in declared:
+                feats.append("mod-" + name)  # =m: leave the built-in driver out of the kernel
             mod = KMOD_NAME_MAP.get(name, name)
             if not os.path.isfile(os.path.join(ROOT, "modules", mod, "Cargo.toml")):
                 sys.exit("to-cargo.py: CONFIG_%s=m but there is no module crate modules/%s/Cargo.toml"

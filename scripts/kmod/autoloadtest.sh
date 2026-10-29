@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# autoloadtest.sh [arch] [virtio_rng|e1000e]: host-side test of the modules.alias autoload path.
+# autoloadtest.sh [arch] [virtio_rng|e1000e|uvc]: host-side test of the modules.alias autoload path.
 # Builds with CONFIG_MODULES=y CONFIG_VIRTIO_RNG=m (the driver is then ONLY a module, found via
 # modules.alias, no modules.load), boots under QEMU and checks that it autoloads, is listed, feeds
 # the CSPRNG, and that modules.blacklist=virtio_rng boots without it. Restores .config afterwards
@@ -37,6 +37,34 @@ if [[ "$mod" == "e1000e" ]]; then
     check "$L" 'alias 8086:10d3 e1000e: Blacklisted' "blacklist refuses the alias load"
     if grep -aq 'DHCP configured' "$L"; then echo "FAIL eth up despite blacklist"; fail=1; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest e1000e: PASS" || { echo "autoloadtest e1000e: FAIL"; exit 1; }
+    exit 0
+fi
+if [[ "$mod" == "uvc" ]]; then
+    # CONFIG_USB_VIDEO_CLASS=m: the camera driver is ONLY a module. QEMU has no UVC device, so the
+    # `usb 0e 02` alias is exercised by usb.alias_selftest=1 (the enumerate hook on a synthetic
+    # interface), and the camera path by the fake camera (uvc.fake=1, registered by the module's init).
+    printf 'CONFIG_MODULES=y\nCONFIG_USB_VIDEO_CLASS=m\n' > .config
+    ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/autoloadtest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/autoloadtest-build.log"; exit 1; }
+    if find "target/kmod/$arch" -name modules.load | grep -q .; then echo "FAIL: modules.load present, alias path not isolated"; exit 1; fi
+    RT=.claude/skills/run-leandros/runtests.py
+    fail=0
+    check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3"; fail=1; fi; }
+    export LEANDROS_RUN_ID="autoloadtest-$arch"
+    python3 "$RT" "$arch" alt1 --cmdline "usb.alias_selftest=1" "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt1/serial-full.log
+    check "$L" '^\[kmod\] usb alias 1234:5678 0e0200 -> uvc' "usb alias autoload at enumerate"
+    check "$L" '^\[kmod\] uvc loaded id' "uvc loaded"
+    check "$L" 'usb alias selftest: class driver wants the interface: Some(14)' "module's class driver registered"
+    check "$L" '^uvc [0-9]* [0-9]* - Live' "listed in /proc/modules"
+    python3 "$RT" "$arch" alt2 --cmdline "uvc.fake=1 modules.load=uvc" "/bin/camtest --probe" "/bin/camtest 8" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt2/serial-full.log
+    check "$L" 'camtest: probe: camera present, ioctls PASS' "camtest --probe"
+    check "$L" 'camtest: SUMMARY PASS frames 8/8' "camtest 8"
+    python3 "$RT" "$arch" alt3 --cmdline "usb.alias_selftest=1 modules.blacklist=uvc" "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt3/serial-full.log
+    check "$L" 'alias 1234:5678 uvc: Blacklisted\|usb alias 1234:5678 uvc: Blacklisted' "blacklist refuses the alias load"
+    if grep -aq '^\[kmod\] uvc loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
+    [[ $fail -eq 0 ]] && echo "autoloadtest uvc: PASS" || { echo "autoloadtest uvc: FAIL"; exit 1; }
     exit 0
 fi
 printf 'CONFIG_MODULES=y\nCONFIG_VIRTIO_RNG=m\n' > .config

@@ -1254,7 +1254,7 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
             }
         }
         let mut audio = None;
-        let video = crate::class::wants(&cfg, vendor, product);
+        let video = crate::class::wants_or_load(&cfg, vendor, product);
         if hid.is_empty() && (video.is_some() || isoch::has_audio_streaming(&cfg)) {
             match control(hc, slot, 0x00, 9, ci.value as u16, 0, CtrlData::None, ENUM_CTRL_TIMEOUT_MS) {
                 Ok(_) => {
