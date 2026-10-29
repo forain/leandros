@@ -288,6 +288,10 @@ pub fn read(out: &mut [u8]) -> usize {
     got
 }
 
+/// True once a device is bound and registered.
+#[allow(dead_code)]
+pub fn is_bound() -> bool { DEVICE.lock().is_some() }
+
 /// Probe the PCI bus for a virtio-rng function and, if found, register it with
 /// the kernel CSPRNG as an entropy source. Idempotent; a no-op on machines
 /// without the device (or without PCI).

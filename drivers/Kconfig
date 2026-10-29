@@ -28,7 +28,7 @@ config VIRTIO_KEYBOARD
 	default y
 
 config VIRTIO_RNG
-	bool "virtio-rng"
+	tristate "virtio-rng"
 	default y
 
 config VIRTIO_SND
