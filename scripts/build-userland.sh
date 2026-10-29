@@ -156,6 +156,10 @@ if command -v zig >/dev/null 2>&1; then
     # kexec: kexec-tools style front end (-l/-u/-e) over kexec_file_load + reboot(KEXEC).
     echo "[userland] Building kexec (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kexec" userland/kexec/kexec.c
+    # kmodctl / kmodctltest: kernel module list/load/unload/info and the finit_module error-path test.
+    echo "[userland] Building kmodctl, kmodctltest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kmodctl" userland/kmodctl/kmodctl.c
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kmodctltest" userland/kmodctltest/kmodctltest.c
     # serrx: framed, ACKed file receiver over the serial console (scripts/pi-serial-push.py).
     echo "[userland] Building serrx (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -Os -s -Wall -o "${OUT}/serrx" userland/serrx/serrx.c

@@ -104,7 +104,7 @@ SUITES = {
                 "if [ \"$(uname -m)\" = aarch64 ]; then drmsmoke --arm-v3d && MESA_LOADER_DRIVER_OVERRIDE=v3d kmscube -c 30; __k=$?; drmsmoke --disarm-v3d; test $__k = 0; fi",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/udptest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
+                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
                 # kexec tool: load + unload only (non-destructive).
                 "/bin/sh -c '/bin/kexec -l /boot/kexec --initrd=/boot/kexec-initrd --append=x && /bin/kexec -u'",
                 # ripgrep (rg): file match, recursive dir walk, stdin, exit codes 0/1.
@@ -186,6 +186,7 @@ SUITES = {
     "procps": ["/bin/pstest"],
     # /dev/netctl: permission model, event stream, profiles (runs as root).
     "netctl": ["/bin/netctltest"],
+    "kmodctl": ["/bin/kmodctltest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
     "wifisim": ["host:wifisimtest.py"],
     "psklog": ["host:psklogtest.py"],

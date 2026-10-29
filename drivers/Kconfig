@@ -1,5 +1,12 @@
 menu "Device drivers"
 
+config KMOD_HELLO
+	tristate "Rust hello module (test)"
+	default n
+	help
+	  Test module used by the kmod pipeline. =y is accepted and ignored (no
+	  built-in form exists); =m builds modules/hello.
+
 menu "Virtio (QEMU)"
 
 config VIRTIO_BLK
