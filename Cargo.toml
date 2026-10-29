@@ -22,6 +22,8 @@ members = [
     "lib",
     "lib/netctl-abi",
     "lib/bt-host",
+    "lib/kmod-abi",
+    "lib/kmod-elf",
     "arch/x86_64",
     "arch/aarch64",
 ]

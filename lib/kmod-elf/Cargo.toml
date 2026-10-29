@@ -1,0 +1,14 @@
+# Pure validator for kernel-module ELF images plus a synthesiser for tests.
+# no_std + alloc, no features, depends only on kmod-abi.
+#
+# Host tests (the repo's .cargo config defaults to the kernel target):
+#   cargo test -p kmod-elf --target aarch64-apple-darwin
+[package]
+name = "kmod-elf"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[dependencies]
+kmod-abi = { path = "../kmod-abi" }
