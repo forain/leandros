@@ -613,6 +613,15 @@ def promote(t):
     return p.returncode, out
 
 
+def bid_check(kernel, initrd):
+    """Refuse a kernel/initrd pair where the initrd carries lib/modules but not this kernel's build-id."""
+    sys.path.insert(0, os.path.join(REPO, "scripts", "kmod"))
+    import bidcheck
+    err = bidcheck.pair(kernel, initrd)
+    if err:
+        die(err)
+
+
 def cmd_deploy_kernel(t, a):
     arch = a.arch or t.out("uname -m").strip()
     if arch not in ("x86_64", "aarch64"):
@@ -622,6 +631,7 @@ def cmd_deploy_kernel(t, a):
     for f in (kernel, initrd):
         if not os.path.isfile(f):
             die(f"missing {f}: build first (./scripts/build-all.sh --arch {arch})")
+    bid_check(kernel, initrd)
     remote_arch = t.out("uname -m").strip()
     if remote_arch != arch:
         die(f"the target runs {remote_arch}, not {arch}")
@@ -915,6 +925,7 @@ def cmd_pi_deploy(t, a):
     k = a.kernel or os.path.join(REPO, "target/final-aarch64/kernel-direct")
     i = a.initrd or os.path.join(REPO, "initrd-aarch64.cpio")
     pi_check_elf(k)
+    bid_check(k, i)
     t.run(f"mkdir -p {PI_DIR}/trial")
     upload(t, [(k, f"{PI_DIR}/trial/kernel", None), (i, f"{PI_DIR}/trial/initrd", None)])
     rev = subprocess.run(["git", "-C", REPO, "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True).stdout.strip()
