@@ -58,6 +58,12 @@ extern "C" {
     fn arch_tlb_flush_range(root: usize, va: usize, pages: usize);
     /// Arch-provided: invalidate one page on this CPU only.
     fn arch_tlb_flush_local_page(va: usize);
+    /// Arch-provided: local flush + start of the remote flush, no waiting.
+    fn arch_tlb_flush_range_start(root: usize, va: usize, pages: usize, t: *mut FlushTicket);
+    /// Arch-provided: true when every CPU in the ticket has acknowledged.
+    fn arch_tlb_flush_poll(t: *mut FlushTicket) -> bool;
+    /// Arch-provided: bounded wait; false on timeout (do not free).
+    fn arch_tlb_flush_wait(t: *mut FlushTicket) -> bool;
     /// Arch-provided: perform a flush another CPU requested of this one
     /// (x86-64; no-op on AArch64). Called from IRQ-masked spin loops.
     fn arch_tlb_service_pending();
@@ -143,6 +149,43 @@ pub fn tlb_shootdown_all() {
 pub fn tlb_flush_range(root: usize, va: usize, pages: usize) {
     if pages == 0 { return; }
     unsafe { arch_tlb_flush_range(root, va, pages); }
+}
+
+/// Outstanding remote part of a TLB flush (x86-64; always empty on AArch64,
+/// whose broadcast TLBI is complete on return).
+#[repr(C)]
+pub struct FlushTicket {
+    pub mask: u64,
+    pub root: usize,
+    pub gens: [u64; 64],
+}
+
+impl FlushTicket {
+    pub const EMPTY: FlushTicket = FlushTicket { mask: 0, root: 0, gens: [0; 64] };
+    #[inline]
+    pub fn is_empty(&self) -> bool { self.mask == 0 }
+}
+
+/// Flush like [`tlb_flush_range`] but do not wait for remote CPUs. The pages
+/// the flush protects must not be freed until [`flush_poll`] / [`flush_wait`]
+/// says every CPU acknowledged.
+pub fn tlb_flush_range_start(root: usize, va: usize, pages: usize) -> FlushTicket {
+    let mut t = FlushTicket::EMPTY;
+    if pages == 0 { return t; }
+    unsafe { arch_tlb_flush_range_start(root, va, pages, &mut t); }
+    t
+}
+
+/// Non-blocking: true once every CPU of the ticket acknowledged.
+pub fn flush_poll(t: &mut FlushTicket) -> bool {
+    if t.mask == 0 { return true; }
+    unsafe { arch_tlb_flush_poll(t) }
+}
+
+/// Bounded wait. False on timeout: the caller must keep the pages alive.
+pub fn flush_wait(t: &mut FlushTicket) -> bool {
+    if t.mask == 0 { return true; }
+    unsafe { arch_tlb_flush_wait(t) }
 }
 
 /// Invalidate every user translation of the address space rooted at `root`

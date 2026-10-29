@@ -477,10 +477,12 @@ pub extern "C" fn arch_tlb_service_pending() {
     }
 }
 
-/// Flush the remote CPUs whose CR3 may hold `root` (`root == usize::MAX`:
-/// every CPU that ever loaded a user root) and wait, bounded, for them.
-unsafe fn flush_remote(root: usize) {
+/// Send the shootdown IPIs for `root` (`usize::MAX`: every CPU that ever
+/// loaded a user root) and record whom to wait for in `t`. Does not wait.
+unsafe fn flush_remote_start(root: usize, t: &mut mm::paging::FlushTicket) {
     use mm::paging::tlbstat as ts;
+    t.mask = 0;
+    t.root = root;
     let ncpus = super::smp::active_cpu_count();
     if ncpus <= 1 { return; }
     let me = this_cpu();
@@ -493,7 +495,6 @@ unsafe fn flush_remote(root: usize) {
         return;
     }
     let mut mask: u64 = 0;
-    let mut gens = [0u64; TRACK];
     for c in 0..TRACK {
         if c == me { continue; }
         let loaded = LOADED_ROOT[c].load(Ordering::SeqCst);
@@ -501,7 +502,7 @@ unsafe fn flush_remote(root: usize) {
             loaded != 0 && loaded != KERNEL_CR3.load(Ordering::Relaxed)
         } else { loaded == root };
         if !hit { continue; }
-        gens[c] = FLUSH_GEN[c].load(Ordering::SeqCst);
+        t.gens[c] = FLUSH_GEN[c].load(Ordering::SeqCst);
         FLUSH_REQ[c].store(true, Ordering::SeqCst);
         super::smp::send_tlb_shootdown_ipi(c);
         mask |= 1 << c;
@@ -509,21 +510,37 @@ unsafe fn flush_remote(root: usize) {
     if mask == 0 { return; }
     ts::REMOTE_FLUSHES.fetch_add(1, Ordering::Relaxed);
     ts::IPIS.fetch_add(mask.count_ones() as u64, Ordering::Relaxed);
+    t.mask = mask;
+}
+
+/// Drop from the ticket every CPU that has acknowledged; true when none left.
+/// Acks latch: a CPU that left the root and came back is not waited for again
+/// once seen (and one never seen still has its IPI pended).
+fn flush_remote_poll(t: &mut mm::paging::FlushTicket) -> bool {
+    let mut m = t.mask;
+    while m != 0 {
+        let c = m.trailing_zeros() as usize;
+        m &= m - 1;
+        let moved = FLUSH_GEN[c].load(Ordering::Acquire) != t.gens[c];
+        // A CPU that switched to another root reloaded CR3 already
+        // (the kernel-root store follows its CR3 write; a user-root
+        // store precedes one that runs before any user access).
+        let left = t.root != usize::MAX && LOADED_ROOT[c].load(Ordering::Acquire) != t.root;
+        if moved || left { t.mask &= !(1 << c); }
+    }
+    t.mask == 0
+}
+
+/// Wait, bounded, for the ticket. True when every CPU acknowledged; false on
+/// timeout (the caller must then NOT free what the flush protects).
+unsafe fn flush_remote_wait(t: &mut mm::paging::FlushTicket) -> bool {
+    use mm::paging::tlbstat as ts;
+    if t.mask == 0 { return true; }
+    let me = this_cpu();
     let t0 = ts::now_ns();
     let mut spins = 0usize;
-    while mask != 0 {
-        let mut m = mask;
-        while m != 0 {
-            let c = m.trailing_zeros() as usize;
-            m &= m - 1;
-            let moved = FLUSH_GEN[c].load(Ordering::Acquire) != gens[c];
-            // A CPU that switched to another root reloaded CR3 already
-            // (the kernel-root store follows its CR3 write; a user-root
-            // store precedes one that runs before any user access).
-            let left = root != usize::MAX && LOADED_ROOT[c].load(Ordering::Acquire) != root;
-            if moved || left { mask &= !(1 << c); }
-        }
-        if mask == 0 { break; }
+    let mut ok = true;
+    while !flush_remote_poll(t) {
         // Two initiators waiting on each other with IRQs masked would each
         // time out; answer requests aimed at this CPU while waiting.
         service_flush(me);
@@ -531,19 +548,21 @@ unsafe fn flush_remote(root: usize) {
         spins += 1;
         if spins > ACK_SPINS {
             ts::TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            ok = false;
             break;
         }
     }
     ts::add(&ts::WAIT_NS, &ts::WAIT_MAX_NS, ts::now_ns().saturating_sub(t0));
+    ok
 }
 
-/// Invalidate `pages` pages at `va` of the address space rooted at `root`
-/// (`pages == usize::MAX`: the whole address space) on every CPU that may
-/// cache it: `invlpg`/CR3 reload locally if this CPU has it loaded, a
-/// targeted IPI to each other CPU that has it loaded.
-#[no_mangle]
-pub unsafe extern "C" fn arch_tlb_flush_range(root: usize, va: usize, pages: usize) {
-    mm::paging::tlbstat::FLUSHES.fetch_add(1, Ordering::Relaxed);
+unsafe fn flush_remote(root: usize) {
+    let mut t = mm::paging::FlushTicket::EMPTY;
+    flush_remote_start(root, &mut t);
+    flush_remote_wait(&mut t);
+}
+
+unsafe fn flush_local(root: usize, va: usize, pages: usize) {
     if arch_get_current_root() == root {
         if pages <= LOCAL_INVLPG_MAX {
             for i in 0..pages {
@@ -553,7 +572,38 @@ pub unsafe extern "C" fn arch_tlb_flush_range(root: usize, va: usize, pages: usi
             reload_cr3();
         }
     }
+}
+
+/// Invalidate `pages` pages at `va` of the address space rooted at `root`
+/// (`pages == usize::MAX`: the whole address space) on every CPU that may
+/// cache it: `invlpg`/CR3 reload locally if this CPU has it loaded, a
+/// targeted IPI to each other CPU that has it loaded.
+#[no_mangle]
+pub unsafe extern "C" fn arch_tlb_flush_range(root: usize, va: usize, pages: usize) {
+    mm::paging::tlbstat::FLUSHES.fetch_add(1, Ordering::Relaxed);
+    flush_local(root, va, pages);
     flush_remote(root);
+}
+
+/// Like `arch_tlb_flush_range` but does not wait for remote CPUs: the local
+/// flush is done, IPIs are sent, `t` records who must still acknowledge.
+#[no_mangle]
+pub unsafe extern "C" fn arch_tlb_flush_range_start(
+    root: usize, va: usize, pages: usize, t: *mut mm::paging::FlushTicket)
+{
+    mm::paging::tlbstat::FLUSHES.fetch_add(1, Ordering::Relaxed);
+    flush_local(root, va, pages);
+    flush_remote_start(root, &mut *t);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn arch_tlb_flush_poll(t: *mut mm::paging::FlushTicket) -> bool {
+    flush_remote_poll(&mut *t)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn arch_tlb_flush_wait(t: *mut mm::paging::FlushTicket) -> bool {
+    flush_remote_wait(&mut *t)
 }
 
 /// Invalidate one page on this CPU only (a permission upgrade on the

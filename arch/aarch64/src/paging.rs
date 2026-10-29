@@ -242,6 +242,21 @@ pub unsafe extern "C" fn arch_tlb_flush_local_page(va: usize) {
 #[no_mangle]
 pub extern "C" fn arch_tlb_service_pending() {}
 
+/// Broadcast TLBI is complete on return: the ticket is always empty.
+#[no_mangle]
+pub unsafe extern "C" fn arch_tlb_flush_range_start(
+    root: usize, va: usize, pages: usize, t: *mut mm::paging::FlushTicket)
+{
+    arch_tlb_flush_range(root, va, pages);
+    (*t).mask = 0;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn arch_tlb_flush_poll(_t: *mut mm::paging::FlushTicket) -> bool { true }
+
+#[no_mangle]
+pub unsafe extern "C" fn arch_tlb_flush_wait(_t: *mut mm::paging::FlushTicket) -> bool { true }
+
 /// Translate mm::PageFlags bits to AArch64 page-descriptor flags.
 fn translate_flags(bits: u64) -> PageDescFlags {
     use mm::paging::PageFlags;

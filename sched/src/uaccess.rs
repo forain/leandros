@@ -401,6 +401,7 @@ pub unsafe fn copy_raw(dst: *mut u8, src: *const u8, len: usize) -> usize {
 pub unsafe fn copy_from_user(dst: *mut u8, src: usize, len: usize) -> usize {
     if len == 0 { return 0; }
     if src == 0 || !user_range_ok(src, len) { return len; }
+    mm::paging::tlb_service_pending();
     copy_raw(dst, src as *const u8, len)
 }
 
@@ -412,6 +413,7 @@ pub unsafe fn copy_from_user(dst: *mut u8, src: usize, len: usize) -> usize {
 pub unsafe fn copy_to_user(dst: usize, src: *const u8, len: usize) -> usize {
     if len == 0 { return 0; }
     if dst == 0 || !user_range_ok(dst, len) { return len; }
+    mm::paging::tlb_service_pending();
     copy_raw(dst as *mut u8, src, len)
 }
 
@@ -450,5 +452,6 @@ pub fn write_user<T: Copy>(dst: usize, v: T) -> bool {
 /// itself then reports them.
 pub fn prefault(ptr: usize, len: usize, read_only: bool) {
     if len == 0 || !user_range_ok(ptr, len) { return; }
+    mm::paging::tlb_service_pending();
     crate::prefault_current_range(ptr, len, read_only);
 }
