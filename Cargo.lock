@@ -251,6 +251,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-kapi"
+version = "0.1.0"
+dependencies = [
+ "kmod-abi",
+]
+
+[[package]]
 name = "leandros-lib"
 version = "0.1.0"
 dependencies = [

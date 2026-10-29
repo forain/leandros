@@ -24,6 +24,7 @@ members = [
     "lib/bt-host",
     "lib/kmod-abi",
     "lib/kmod-elf",
+    "lib/kmod-kapi",
     "arch/x86_64",
     "arch/aarch64",
 ]

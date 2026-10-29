@@ -1,0 +1,12 @@
+# Module-side shim over the kapi_* imports. It re-exposes, under the same paths and signatures,
+# the slice of `drivers::pci`, `mm` and `sched` a built-in driver source uses, so a module crate
+# can `#[path]`-include the driver unchanged and point `kenv` at this crate.
+[package]
+name = "kmod-kapi"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[dependencies]
+kmod-abi = { path = "../kmod-abi" }
