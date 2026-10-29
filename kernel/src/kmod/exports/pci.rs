@@ -5,7 +5,7 @@ use super::*;
 
 use kmod_abi::{KPciDev, KMAP_MMIO, KMAP_WC, KMAP_WRITABLE};
 
-fn unbdf(bdf: u32) -> (u8, u8, u8) { ((bdf >> 16) as u8, (bdf >> 8) as u8, bdf as u8) }
+pub(super) fn unbdf(bdf: u32) -> (u8, u8, u8) { ((bdf >> 16) as u8, (bdf >> 8) as u8, bdf as u8) }
 
 /// Index-th PCI function matching vendor/device (0xffff = any device). 0 ok, -19 none, -22 bad out.
 #[no_mangle]
@@ -97,11 +97,11 @@ pub extern "C" fn kapi_page_free(phys: u64, order: u32) {
     if phys != 0 && order <= 10 { mm::buddy::free(phys as usize, order as usize); }
 }
 
-const HW_SLOTS: usize = 4;
-static HW_READ: [AtomicUsize; HW_SLOTS] = [const { AtomicUsize::new(0) }; HW_SLOTS];
-static HW_USED: AtomicUsize = AtomicUsize::new(0);
+pub(super) const HW_SLOTS: usize = 4;
+pub(super) static HW_READ: [AtomicUsize; HW_SLOTS] = [const { AtomicUsize::new(0) }; HW_SLOTS];
+pub(super) static HW_USED: AtomicUsize = AtomicUsize::new(0);
 
-fn hw_tramp<const N: usize>(out: &mut [u8]) -> usize {
+pub(super) fn hw_tramp<const N: usize>(out: &mut [u8]) -> usize {
     let p = HW_READ[N].load(Ordering::Acquire);
     if p == 0 { return 0; }
     let f: extern "C" fn(*mut u8, usize) -> usize = unsafe { core::mem::transmute(p) };
@@ -126,7 +126,7 @@ pub extern "C" fn kapi_hwrng_register(owner: KmodId, name: *const u8, len: usize
         0 => hw_tramp::<0>, 1 => hw_tramp::<1>, 2 => hw_tramp::<2>, _ => hw_tramp::<3>,
     };
     sched::random::register_source(nm, tramp);
-    super::registry::note_registration(owner, RegKind::HWRNG, i as u64);
+    crate::kmod::registry::note_registration(owner, RegKind::HWRNG, i as u64);
     sched::random::reseed_now();
     0
 }

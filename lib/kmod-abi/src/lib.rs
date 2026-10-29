@@ -84,6 +84,8 @@ impl RegKind {
     pub const V4L2: RegKind = RegKind(5);
     pub const IRQ: RegKind = RegKind(6);
     pub const PCI: RegKind = RegKind(7);
+    pub const TICK: RegKind = RegKind(8);
+    pub const PM: RegKind = RegKind(9);
 }
 
 /// Device-id table entry (`.kmod.ids`), 16 bytes. PCI: a=vendor, b=device (0xffff = any).
@@ -146,6 +148,37 @@ pub struct KNetifOps {
 /// Power-management hook: writes a message into `buf` (<= `cap`). Return >= 0 = ok with that
 /// message length (shutdown: 0 = nothing to log); < 0 = error with message length `-r`.
 pub type KPmFn = extern "C" fn(ctx: usize, buf: *mut u8, cap: usize) -> i32;
+
+/// Power-management phases (`KPmOps::phase`). The kernel orders hooks by phase for each operation
+/// (suspend: INPUT, GPU, NET, WIFI, BLOCK, USB, PCI; resume is the reverse).
+pub mod pm_phase {
+    pub const INPUT: u32 = 1;
+    pub const GPU: u32 = 2;
+    pub const SOUND: u32 = 3;
+    pub const NET: u32 = 4;
+    pub const WIFI: u32 = 5;
+    pub const BLOCK: u32 = 6;
+    pub const USB: u32 = 7;
+    pub const PCI: u32 = 8;
+    pub const CONSOLE: u32 = 9;
+    pub const MAX: u32 = 9;
+}
+
+/// Hooks for `kapi_pm_register2`. `size` is `size_of::<KPmOps>()` so fields can be appended.
+/// Each hook returns >= 0 (ok) or < 0 (error); the message length is |return|, text in `buf`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KPmOps {
+    pub size: u32,
+    pub phase: u32,
+    pub suspend: Option<KPmFn>,
+    pub resume: Option<KPmFn>,
+    pub freeze: Option<KPmFn>,
+    pub thaw: Option<KPmFn>,
+    pub shutdown: Option<KPmFn>,
+    pub kexec_quiesce: Option<KPmFn>,
+    pub resume_check: Option<KPmFn>,
+}
 /// Interrupt handler: returns 1 when handled, 0 when the interrupt was not the device's.
 pub type KIrqHandler = extern "C" fn(ctx: usize) -> u32;
 
@@ -329,6 +362,12 @@ pub mod sys {
         unsafe extern "C" fn(KmodId, u32, *const u8, usize, *const super::KNetifOps, usize) -> i32;
     pub type NetdevKickFn = unsafe extern "C" fn();
     pub type V4l2RegisterFn = unsafe extern "C" fn(KmodId, *const super::KCameraOps, usize) -> i32;
+    pub type PmRegister2Fn = unsafe extern "C" fn(KmodId, *const super::KPmOps, usize) -> i32;
+    pub type VirtToPhysFn = unsafe extern "C" fn(usize) -> u64;
+    pub type CanSleepFn = unsafe extern "C" fn() -> bool;
+    pub type SleepUntilFn = unsafe extern "C" fn(u64);
+    pub type YieldFn = unsafe extern "C" fn();
+    pub type CurrentPidFn = unsafe extern "C" fn() -> u32;
     pub type TickRegisterFn = unsafe extern "C" fn(KmodId, super::KTickFn, usize) -> i32;
     pub type UsbClassRegisterFn = unsafe extern "C" fn(KmodId, *const super::KmodDevId, usize, super::KUsbProbeFn,
                                                        Option<super::KUsbDetachFn>, usize) -> i32;
@@ -356,6 +395,13 @@ pub mod sys {
         pub fn kapi_netdev_kick();
         pub fn kapi_netdev_kick_from_irq();
         pub fn kapi_v4l2_register(owner: KmodId, ops: *const super::KCameraOps, ctx: usize) -> i32;
+        pub fn kapi_pm_register2(owner: KmodId, ops: *const super::KPmOps, ctx: usize) -> i32;
+        pub fn kapi_virt_to_phys(va: usize) -> u64;
+        pub fn kapi_can_sleep() -> bool;
+        pub fn kapi_sleep_until(ns: u64);
+        pub fn kapi_yield();
+        pub fn kapi_irqs_masked() -> bool;
+        pub fn kapi_current_pid() -> u32;
         pub fn kapi_tick_register(owner: KmodId, f: super::KTickFn, ctx: usize) -> i32;
         pub fn kapi_usb_class_register(owner: KmodId, ids: *const super::KmodDevId, nids: usize,
                                        probe: super::KUsbProbeFn, detach: Option<super::KUsbDetachFn>,

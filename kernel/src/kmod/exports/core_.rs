@@ -7,9 +7,9 @@ pub extern "C" fn kapi_abi_version() -> u32 { KMOD_ABI_VERSION }
 #[no_mangle]
 pub extern "C" fn kapi_log(level: u32, ptr: *const u8, len: usize) {
     let m = unsafe { bytes(ptr, len.min(512)) };
-    let o = super::load::CUR_OWNER.load(Ordering::SeqCst);
-    let nm = if o != 0 { super::registry::name_of(KmodId(o)) } else { [0; 32] };
-    let nm = super::name_str(&nm);
+    let o = crate::kmod::load::CUR_OWNER.load(Ordering::SeqCst);
+    let nm = if o != 0 { crate::kmod::registry::name_of(KmodId(o)) } else { [0; 32] };
+    let nm = crate::kmod::name_str(&nm);
     let sep = if nm.is_empty() { "" } else { " " };
     log(&alloc::format!("[kmod{}{}] <{}> {}\n", sep, nm, level, alloc::string::String::from_utf8_lossy(m)));
 }
@@ -17,8 +17,8 @@ pub extern "C" fn kapi_log(level: u32, ptr: *const u8, len: usize) {
 #[no_mangle]
 pub extern "C" fn kapi_panic(owner: KmodId, ptr: *const u8, len: usize) -> ! {
     let m = unsafe { bytes(ptr, len.min(512)) };
-    let nm = super::registry::name_of(owner);
-    panic!("kmod {} (id {}) panic: {}", super::name_str(&nm), owner.0, alloc::string::String::from_utf8_lossy(m));
+    let nm = crate::kmod::registry::name_of(owner);
+    panic!("kmod {} (id {}) panic: {}", crate::kmod::name_str(&nm), owner.0, alloc::string::String::from_utf8_lossy(m));
 }
 
 #[no_mangle]
@@ -70,18 +70,18 @@ pub extern "C" fn kapi_kthread_spawn(name: *const u8, name_len: usize, f: extern
     match sched::kthread::spawn(nm, move || f(a as *mut u8)) {
         Some(t) => {
             let pid = t.pid();
-            super::registry::note_registration(owner, RegKind::KTHREAD, pid as u64);
+            crate::kmod::registry::note_registration(owner, RegKind::KTHREAD, pid as u64);
             pid as i64
         }
         None => -12,
     }
 }
 
-static PING_COUNT: AtomicU32 = AtomicU32::new(0);
-static PING_OWNER: AtomicU16 = AtomicU16::new(0);
-static PING_CTXSZ: AtomicU32 = AtomicU32::new(0);
-static PING_ABI: AtomicU32 = AtomicU32::new(0);
-static PING_CMDLEN: AtomicUsize = AtomicUsize::new(0);
+pub(super) static PING_COUNT: AtomicU32 = AtomicU32::new(0);
+pub(super) static PING_OWNER: AtomicU16 = AtomicU16::new(0);
+pub(super) static PING_CTXSZ: AtomicU32 = AtomicU32::new(0);
+pub(super) static PING_ABI: AtomicU32 = AtomicU32::new(0);
+pub(super) static PING_CMDLEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Test aid: counts calls, remembers the last ctx, returns 42 + owner.
 #[no_mangle]

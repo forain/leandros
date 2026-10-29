@@ -415,10 +415,29 @@ pub mod pm {
     use super::*;
     pub use kmod_abi::KPmFn;
 
+    pub use kmod_abi::{pm_phase, KPmOps};
+    /// Register a full hook table in a phase (`pm_phase::*`). Err = kernel errno.
+    pub fn register2(ops: &KPmOps, ctx: usize) -> Result<(), i32> {
+        match unsafe { sys::kapi_pm_register2(owner(), ops, ctx) } { 0 => Ok(()), e => Err(e) }
+    }
     /// Register suspend / resume / shutdown hooks (see `kmod_abi::KPmFn`). Err = kernel errno.
     pub fn register(suspend: Option<KPmFn>, resume: Option<KPmFn>, shutdown: Option<KPmFn>, ctx: usize) -> Result<(), i32> {
         match unsafe { sys::kapi_pm_register(owner(), suspend, resume, shutdown, ctx) } { 0 => Ok(()), e => Err(e) }
     }
+}
+
+/// Scheduler and address helpers (kmodW2 common kapi).
+pub mod sys_common {
+    use super::*;
+    /// Physical address of a direct-map address, or None for a module-image address (not DMA-able).
+    pub fn virt_to_phys(va: usize) -> Option<u64> {
+        match unsafe { sys::kapi_virt_to_phys(va) } { u64::MAX => None, p => Some(p) }
+    }
+    pub fn can_sleep() -> bool { unsafe { sys::kapi_can_sleep() } }
+    pub fn sleep_until(ns: u64) { unsafe { sys::kapi_sleep_until(ns) } }
+    pub fn yield_now() { unsafe { sys::kapi_yield() } }
+    pub fn irqs_masked() -> bool { unsafe { sys::kapi_irqs_masked() } }
+    pub fn current_pid() -> u32 { unsafe { sys::kapi_current_pid() } }
 }
 
 /// The kernel command line.

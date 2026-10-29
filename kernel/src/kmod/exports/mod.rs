@@ -6,6 +6,13 @@ use core::alloc::Layout;
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use kmod_abi::{sys, KSym, KmodCtx, KmodId, RegKind, KMOD_ABI_VERSION};
 
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::sync::Arc;
+use core::sync::atomic::AtomicU64;
+use kmod_abi::{BUS_USB, KCameraOps, KIrqHandler, KNetifOps, KPciDev, KPmFn, KTickFn, KUsbDetachFn, KUsbIf, KUsbProbeFn,
+               KmodDevId, KMAP_MMIO, KMAP_WC, KMAP_WRITABLE, KNET_WIFI};
+
 fn log(s: &str) { drivers::pci::serial_debug(s); }
 
 unsafe fn bytes<'a>(p: *const u8, n: usize) -> &'a [u8] {
@@ -13,21 +20,23 @@ unsafe fn bytes<'a>(p: *const u8, n: usize) -> &'a [u8] {
 }
 
 
+mod common;
 mod core_;
 mod pci;
 mod irq;
 mod net;
 mod pm;
 mod v4l2;
-mod usb;
+mod usbfn;
 
 pub use pci::*;
 pub use irq::*;
 pub use net::*;
 pub use pm::*;
 pub use v4l2::*;
-pub use usb::*;
+pub use usbfn::*;
 pub use core_::*;
+pub use common::*;
 
 // Compile-time signature check against kmod_abi::sys.
 const _: sys::AbiVersionFn = kapi_abi_version;
@@ -63,6 +72,13 @@ const _: sys::NetdevRegisterFn = kapi_netdev_register;
 const _: sys::NetdevKickFn = kapi_netdev_kick;
 const _: sys::NetdevKickFn = kapi_netdev_kick_from_irq;
 const _: sys::PmRegisterFn = kapi_pm_register;
+const _: sys::PmRegister2Fn = kapi_pm_register2;
+const _: sys::VirtToPhysFn = kapi_virt_to_phys;
+const _: sys::CanSleepFn = kapi_can_sleep;
+const _: sys::SleepUntilFn = kapi_sleep_until;
+const _: sys::YieldFn = kapi_yield;
+const _: sys::CanSleepFn = kapi_irqs_masked;
+const _: sys::CurrentPidFn = kapi_current_pid;
 const _: sys::V4l2RegisterFn = kapi_v4l2_register;
 const _: sys::TickRegisterFn = kapi_tick_register;
 const _: sys::UsbClassRegisterFn = kapi_usb_class_register;
@@ -81,7 +97,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 44;
+pub const NEXPORTS: usize = 51;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -119,6 +135,13 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_netdev_kick", kapi_netdev_kick),
     sym!("kapi_netdev_kick_from_irq", kapi_netdev_kick_from_irq),
     sym!("kapi_pm_register", kapi_pm_register),
+    sym!("kapi_pm_register2", kapi_pm_register2),
+    sym!("kapi_virt_to_phys", kapi_virt_to_phys),
+    sym!("kapi_can_sleep", kapi_can_sleep),
+    sym!("kapi_sleep_until", kapi_sleep_until),
+    sym!("kapi_yield", kapi_yield),
+    sym!("kapi_irqs_masked", kapi_irqs_masked),
+    sym!("kapi_current_pid", kapi_current_pid),
     sym!("kapi_v4l2_register", kapi_v4l2_register),
     sym!("kapi_tick_register", kapi_tick_register),
     sym!("kapi_usb_class_register", kapi_usb_class_register),

@@ -131,7 +131,7 @@ pub fn match_pci<'a>(aliases: &'a [Alias], vendor: u16, device: u16) -> Option<&
 /// at interface enumerate by [`usb_hook`]. Policy (kmod=0, blacklist) is
 /// enforced by `load_by_name`; an already-loaded name is skipped quietly.
 fn autoload_aliases() {
-    if super::disabled() { return; }
+    if super::disabled() || opt("kmod") == Some("0") { return; }
     let bi = crate::BOOT_INFO_PTR.load(core::sync::atomic::Ordering::SeqCst);
     if bi == 0 { return; }
     let bi = unsafe { &*(bi as *const boot::BootInfo) };
@@ -160,7 +160,8 @@ static USB_ALIASES: spin::Mutex<Option<Vec<Alias>>> = spin::Mutex::new(None);
 /// context, before the device is configured). Loads the first module whose `usb` alias matches;
 /// the module registers its class driver from `init`, so the enumerator's next `wants` succeeds.
 pub fn usb_hook(vid: u16, pid: u16, class: u8, sub: u8, proto: u8) {
-    if super::disabled() { return; }
+    // The hook can fire before `boot()` has parsed kmod=0, so honour it here too.
+    if super::disabled() || opt("kmod") == Some("0") { return; }
     let name = {
         let mut g = USB_ALIASES.lock();
         if g.is_none() {

@@ -2,15 +2,15 @@
 use super::*;
 
 
-struct ModNetif { ops: KNetifOps, ctx: usize, name: &'static str }
+pub(super) struct ModNetif { ops: KNetifOps, ctx: usize, name: &'static str }
 
 /// Write-once slots (leaked boxes); a netif's `dev` is its slot index.
-static MOD_NETIF: [AtomicUsize; drivers::netdev::MAX_NETIF] = [const { AtomicUsize::new(0) }; drivers::netdev::MAX_NETIF];
-static MOD_NETIF_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+pub(super) static MOD_NETIF: [AtomicUsize; drivers::netdev::MAX_NETIF] = [const { AtomicUsize::new(0) }; drivers::netdev::MAX_NETIF];
+pub(super) static MOD_NETIF_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
-fn mn(d: u8) -> &'static ModNetif { unsafe { &*(MOD_NETIF[d as usize].load(Ordering::Acquire) as *const ModNetif) } }
+pub(super) fn mn(d: u8) -> &'static ModNetif { unsafe { &*(MOD_NETIF[d as usize].load(Ordering::Acquire) as *const ModNetif) } }
 
-static MOD_OPS: drivers::netdev::NetifOps = drivers::netdev::NetifOps {
+pub(super) static MOD_OPS: drivers::netdev::NetifOps = drivers::netdev::NetifOps {
     driver: |d| mn(d).name,
     send: |d, b| { let m = mn(d); (m.ops.send)(m.ctx, b.as_ptr(), b.len()) },
     tx_ready: |d| { let m = mn(d); (m.ops.tx_ready)(m.ctx) },
@@ -64,7 +64,7 @@ pub extern "C" fn kapi_netdev_register(owner: KmodId, kind: u32, prefix: *const 
     let k = if kind == KNET_WIFI { drivers::netdev::Kind::Wifi } else { drivers::netdev::Kind::Wired };
     match drivers::netdev::register_late(k, pfx, &MOD_OPS, slot as u8) {
         Some(id) => {
-            super::registry::note_registration(owner, RegKind::NETDEV, id as u64);
+            crate::kmod::registry::note_registration(owner, RegKind::NETDEV, id as u64);
             id as i32
         }
         None => -12,
@@ -75,5 +75,3 @@ pub extern "C" fn kapi_netdev_register(owner: KmodId, kind: u32, prefix: *const 
 pub extern "C" fn kapi_netdev_kick() { drivers::netdev::kick(); }
 #[no_mangle]
 pub extern "C" fn kapi_netdev_kick_from_irq() { drivers::netdev::kick_from_irq(); }
-
-#[derive(Clone, Copy)]

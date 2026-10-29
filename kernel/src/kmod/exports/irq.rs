@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::AtomicU64;
 use kmod_abi::{KIrqHandler, KNetifOps, KPmFn, KNET_WIFI};
 
-fn func_of(bdf: u32) -> drivers::pci::PciFunction {
+pub(super) fn func_of(bdf: u32) -> drivers::pci::PciFunction {
     let (b, d, f) = unbdf(bdf);
     drivers::pci::PciFunction::new(b, d, f)
 }
@@ -29,13 +29,13 @@ pub extern "C" fn kapi_pci_find_cap(bdf: u32, cap_id: u8) -> u16 {
     func_of(bdf).find_capability(cap_id).unwrap_or(0)
 }
 
-fn irq_errno(e: drivers::irq::IrqError) -> i64 {
+pub(super) fn irq_errno(e: drivers::irq::IrqError) -> i64 {
     use drivers::irq::IrqError::*;
     match e { NoSpace | NoMemory => -12, NotFound => -19, Unsupported => -95, Busy => -16 }
 }
 
 /// The handler must return 0 (not ours) or 1 (handled): that is `IrqReturn`'s repr.
-fn irq_handler(h: KIrqHandler) -> drivers::irq::IrqHandler {
+pub(super) fn irq_handler(h: KIrqHandler) -> drivers::irq::IrqHandler {
     unsafe { core::mem::transmute::<KIrqHandler, drivers::irq::IrqHandler>(h) }
 }
 
@@ -46,7 +46,7 @@ pub extern "C" fn kapi_irq_request_msi(owner: KmodId, bdf: u32, handler: KIrqHan
         Ok(h) => {
             let v = h.vector().unwrap_or(0) as u64;
             core::mem::forget(h); // modules are permanent
-            super::registry::note_registration(owner, RegKind::IRQ, v);
+            crate::kmod::registry::note_registration(owner, RegKind::IRQ, v);
             v as i64
         }
         Err(e) => irq_errno(e),
@@ -61,7 +61,7 @@ pub extern "C" fn kapi_irq_request_line(owner: KmodId, bdf: u32, handler: KIrqHa
     match drivers::irq::request_irq(drivers::irq::IrqSource::Line(line), irq_handler(handler), ctx) {
         Ok(h) => {
             core::mem::forget(h);
-            super::registry::note_registration(owner, RegKind::IRQ, line as u64);
+            crate::kmod::registry::note_registration(owner, RegKind::IRQ, line as u64);
             line as i64
         }
         Err(e) => irq_errno(e),
@@ -69,7 +69,7 @@ pub extern "C" fn kapi_irq_request_line(owner: KmodId, bdf: u32, handler: KIrqHa
 }
 
 /// A wait queue with an event counter: the module's `LinkMon`.
-struct KWait {
+pub(super) struct KWait {
     wq: sched::ksync::KWaitQueue,
     events: AtomicU64,
     seen: AtomicU64,

@@ -13,11 +13,11 @@ pub extern "C" fn kapi_v4l2_register(owner: KmodId, ops: *const KCameraOps, ctx:
     // Modules are permanent, so the table lives as long as the kernel.
     let ops: &'static KCameraOps = unsafe { &*ops };
     let r = crate::syscall::v4l2::register_camera(owner, ops, ctx);
-    if r == 0 { super::registry::note_registration(owner, RegKind::V4L2, ctx as u64); }
+    if r == 0 { crate::kmod::registry::note_registration(owner, RegKind::V4L2, ctx as u64); }
     r
 }
 
-fn tick_tramp(p: usize) {
+pub(super) fn tick_tramp(p: usize) {
     let b = unsafe { &*(p as *const (KTickFn, usize)) };
     (b.0)(b.1);
 }
@@ -26,6 +26,7 @@ fn tick_tramp(p: usize) {
 #[no_mangle]
 pub extern "C" fn kapi_tick_register(owner: KmodId, f: KTickFn, ctx: usize) -> i32 {
     let p = Box::into_raw(Box::new((f, ctx))) as usize;
+    crate::kmod::registry::note_registration(owner, RegKind::TICK, p as u64);
     usb::class::tick_register(owner, tick_tramp, p);
     0
 }

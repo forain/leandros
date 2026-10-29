@@ -11,19 +11,19 @@ use super::*;
 use usb::xhci::isoch::{IsochPipe, Poll as IsoPoll, StreamFormat, UsbFunction};
 
 /// (handle, owning driver's registration pointer, function)
-static FUNCS: spin::Mutex<alloc::vec::Vec<(u64, usize, Arc<UsbFunction>)>> = spin::Mutex::new(alloc::vec::Vec::new());
+pub(super) static FUNCS: spin::Mutex<alloc::vec::Vec<(u64, usize, Arc<UsbFunction>)>> = spin::Mutex::new(alloc::vec::Vec::new());
 /// (pipe handle, function handle, `*mut IsochPipe`). The module serialises use of one pipe.
-static PIPES: spin::Mutex<alloc::vec::Vec<(u64, u64, usize)>> = spin::Mutex::new(alloc::vec::Vec::new());
-static NEXT_HANDLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+pub(super) static PIPES: spin::Mutex<alloc::vec::Vec<(u64, u64, usize)>> = spin::Mutex::new(alloc::vec::Vec::new());
+pub(super) static NEXT_HANDLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// Number of USB functions held by module class drivers (ktest).
 pub fn usb_claimed() -> usize { FUNCS.lock().len() }
 /// Number of open isochronous pipes held by modules (ktest).
 pub fn usb_pipes() -> usize { PIPES.lock().len() }
 
-fn func(h: u64) -> Option<Arc<UsbFunction>> { FUNCS.lock().iter().find(|e| e.0 == h).map(|e| e.2.clone()) }
+pub(super) fn func(h: u64) -> Option<Arc<UsbFunction>> { FUNCS.lock().iter().find(|e| e.0 == h).map(|e| e.2.clone()) }
 
-fn usb_errno(e: usb::UsbErr) -> i32 {
+pub(super) fn usb_errno(e: usb::UsbErr) -> i32 {
     match e {
         usb::UsbErr::Stall => -32,
         usb::UsbErr::Timeout => -110,
@@ -34,7 +34,7 @@ fn usb_errno(e: usb::UsbErr) -> i32 {
 }
 
 /// Forget function `h` and close the pipes still open on it.
-fn drop_func(h: u64) {
+pub(super) fn drop_func(h: u64) {
     FUNCS.lock().retain(|e| e.0 != h);
     let mut dead = alloc::vec::Vec::new();
     PIPES.lock().retain(|e| { if e.1 == h { dead.push(e.2); false } else { true } });
@@ -104,7 +104,7 @@ pub extern "C" fn kapi_usb_isoch_open(handle: u64, iface: u8, alt: u8, ep_addr: 
     }
 }
 
-fn pipe_ptr(ph: u64) -> Option<*mut IsochPipe> {
+pub(super) fn pipe_ptr(ph: u64) -> Option<*mut IsochPipe> {
     PIPES.try_lock()?.iter().find(|e| e.0 == ph).map(|e| e.2 as *mut IsochPipe)
 }
 
@@ -139,9 +139,9 @@ pub extern "C" fn kapi_usb_isoch_close(pipe: u64) {
 pub extern "C" fn kapi_v4l2_unregister(ctx: usize) { crate::syscall::v4l2::unregister_camera(ctx); }
 
 /// What a registered class driver's `ctx` points at.
-struct UsbCls { probe: KUsbProbeFn, detach: Option<KUsbDetachFn>, ctx: usize }
+pub(super) struct UsbCls { probe: KUsbProbeFn, detach: Option<KUsbDetachFn>, ctx: usize }
 
-fn usb_probe_tramp(f: UsbFunction, m: &usb::class::Match, p: usize) -> Result<(), UsbFunction> {
+pub(super) fn usb_probe_tramp(f: UsbFunction, m: &usb::class::Match, p: usize) -> Result<(), UsbFunction> {
     let b = unsafe { &*(p as *const UsbCls) };
     let h = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let f = Arc::new(f);
@@ -157,7 +157,7 @@ fn usb_probe_tramp(f: UsbFunction, m: &usb::class::Match, p: usize) -> Result<()
 }
 
 /// The device on (`hc`, `slot`) left: tell the driver, then drop its handles.
-fn usb_detach_tramp(hc: &usb::xhci::Hc, slot: u8, p: usize) {
+pub(super) fn usb_detach_tramp(hc: &usb::xhci::Hc, slot: u8, p: usize) {
     let b = unsafe { &*(p as *const UsbCls) };
     let hs: alloc::vec::Vec<u64> = FUNCS.lock().iter()
         .filter(|e| e.1 == p && core::ptr::eq(&*e.2.hc, hc) && e.2.slot == slot).map(|e| e.0).collect();
@@ -179,7 +179,7 @@ pub extern "C" fn kapi_usb_class_register(owner: KmodId, ids: *const KmodDevId, 
         .map(|e| usb::class::IdEntry { vid: e.a, pid: e.b, class: e.class, mask: e.class_mask }).collect();
     if v.is_empty() { return -22; }
     let p = Box::into_raw(Box::new(UsbCls { probe, detach, ctx })) as usize;
-    super::registry::note_registration(owner, RegKind::USB_CLASS, p as u64);
+    crate::kmod::registry::note_registration(owner, RegKind::USB_CLASS, p as u64);
     usb::class::register(usb::class::Driver {
         owner, ids: usb::class::leak_ids(v), probe: usb_probe_tramp, detach: Some(usb_detach_tramp), ctx: p,
     });
