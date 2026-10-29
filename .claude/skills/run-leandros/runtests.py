@@ -193,6 +193,8 @@ SUITES = {
     "psklog": ["host:psklogtest.py"],
     # lane piserialxfer: serial-console push (bootstrap + 5.6 MB) and kexec; leaves the VM kexec'd.
     "serialxfer": ["host:serialxfertest.py"],
+    # lane kexecfdt: the kexec boot FDT block returns to the map along a gen1..gen4 chain (leaves the VM kexec'd).
+    "kexecfdt": ["host:kexecfdttest.py"],
     # lane dtbres: devices behind PCIe root port -> PCI-PCI bridge (own boot).
     "pcibridge": ["host:pcibridgetest.py"],
     "usbisoch": ["host:usbisochtest.py"],

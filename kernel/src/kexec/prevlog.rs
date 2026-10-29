@@ -97,17 +97,34 @@ static FREEABLE: AtomicBool = AtomicBool::new(false);
 /// buddy allocator. Only a page-aligned range of plausible size that lies
 /// wholly inside one Available region is accepted (anything else would be
 /// unmapped or not ours to free).
+/// Is `[s, e)` covered by the union of Available regions (adjacent regions
+/// count as one)? Walks forward from `s` through regions that touch.
+fn in_available_union(bi: &boot::BootInfo, s: u64, e: u64) -> bool {
+    let mut cur = s;
+    while cur < e {
+        match bi.memory_regions().iter().find(|r| r.kind == boot::MemoryType::Available
+            && cur >= r.base && cur < r.base + r.length) {
+            Some(r) => cur = r.base + r.length,
+            None => return false,
+        }
+    }
+    true
+}
+
 pub fn reserve_early(bi: &boot::BootInfo) {
     let Some((p, s)) = boot::kexec_prevlog() else { return };
     let ok = p & 0xfff == 0 && s >= 4096 && s <= 64 * 1024 && s & 0xfff == 0
-        && bi.memory_regions().iter().any(|r| r.kind == boot::MemoryType::Available
-            && p >= r.base && p + s <= r.base + r.length);
+        && in_available_union(bi, p, p + s);
     crate::serial_print_str("[early] kexec prevlog: ");
     crate::serial_print_hex(p as usize);
     crate::serial_print_str(", ");
     crate::serial_print_hex(s as usize);
     if !ok {
         crate::serial_print_str(" B: not in usable RAM, ignored\n");
+        for r in bi.memory_regions().iter().filter(|r| r.base < p + s && p < r.base + r.length) {
+            crate::serial_print_str(&alloc::format!("[early]   overlapping map entry {:#x}-{:#x} kind {}\n",
+                r.base, r.base + r.length, r.kind as u32));
+        }
         return;
     }
     crate::serial_print_str(" B reserved until read\n");
