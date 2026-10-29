@@ -33,3 +33,17 @@ Design: artifacts/notes/design-lapdisp2-2026-10-27.md lane B. Everything is behi
 5. Also try an DP-alt/USB-C adapter: expect long/short pulse lines; short pulse is only logged.
 6. If PCH_PORT_HOTPLUG shows no pulse on a plug: collect `outputs: hpd stats:` and SDEISR live bits (live changes are
    caught by the 2 s backstop, line `live bit changed without a pulse`).
+
+## Results
+- Regress x86_64 (TCG) PASS and aarch64 PASS (0/1 boots failed), run on the lane before merging main (drmsmoke and desktop suites included).
+- x86_64 QEMU `i915.fake=2 i915.kms=1 i915.extout=1 drmsmoke --hotplug --fake`: PASS (record + enum in about 1 s).
+  Found on the way: private ioctls need an entry in the kernel/src/syscall.rs whitelist (0x100B added).
+- Laptop trial 5846b82196e2 (main + lane, INTEL=1, `i915.extout=1`), booted once, then back on good 887028f6dc27:
+  - HPD readback: `PCH_PORT_HOTPLUG 0x10001010 -> 0x10101010` then `HPD irq enabled (SDEIMR 0x03020000 SDEIER 0x00e00000
+    PCH_PORT_HOTPLUG 0x10101010 SDEISR live 0x0), kthread i915-hpd`. Bits 21..23 unmasked, no port live.
+  - Hotplug-absent path: 4 extra connectors all `disconnected (0 modes)`, no HPD IRQ in 300 s (`hpd stats: irqs 0 wakes 150 reprobes 0`).
+  - Idle wake count: 150 wakes in 300 s = 0.5/s (the 2 s backstop) from `i915-hpd`; nothing else added.
+  - The internal eDP panel is unaffected: cosmic-comp up, the deployed (older) drmsmoke result unchanged (GETCONNECTOR PASS;
+    the 3 FAILs are the V3D/syncobj checks that are expected on Intel).
+  - New drmsmoke pushed to /tmp: `--hotplug --fake` HOTPLUG_DRM_RECORD PASS, CONNECTOR_ENUM PASS; `--list` x100 over SSH completed.
+- Not measured: a per-call `--list` time under 1 ms (only the 100-run loop completed), a real pulse, cosmic-comp's connector rescan ([MONITOR] 3-4).
