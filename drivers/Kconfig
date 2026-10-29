@@ -44,7 +44,7 @@ menu "Network"
 # hardware), so they have no arch/board dependency: a PCI e1000e is also a
 # QEMU aarch64 option, and macb/brcmf just never find their RP1/SDIO device.
 config E1000E
-	bool "Intel e1000e"
+	tristate "Intel e1000e"
 	depends on PCI
 	default y
 

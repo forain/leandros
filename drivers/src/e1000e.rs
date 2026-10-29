@@ -355,16 +355,13 @@ static ECC_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 // ── logging ─────────────────────────────────────────────────────────────────
 
-extern "C" {
-    fn serial_print_str_raw(s: *const u8, len: usize);
-}
 
 fn log(msg: &str) {
     let mut s = String::with_capacity(msg.len() + 10);
     s.push_str("[e1000e] ");
     s.push_str(msg);
     s.push('\n');
-    unsafe { serial_print_str_raw(s.as_ptr(), s.len()); }
+    crate::kenv::serial_raw(&s);
 }
 
 macro_rules! elog { ($($a:tt)*) => { log(&format!($($a)*)) }; }

@@ -1,6 +1,8 @@
 //! Module-side kernel API shim (see Cargo.toml). Only `kapi_*` functions are imported.
 #![no_std]
 
+extern crate alloc;
+
 use core::sync::atomic::{AtomicU16, Ordering};
 use kmod_abi::{sys, KPciDev, KmodId, KMAP_MMIO, KMAP_UC, KMAP_WC, KMAP_WRITABLE};
 
@@ -29,6 +31,107 @@ pub mod pci {
     }
 
     fn bdf(bus: u8, dev: u8, func: u8) -> u32 { (bus as u32) << 16 | (dev as u32) << 8 | func as u32 }
+
+    impl PciDevice {
+        pub fn function(&self) -> PciFunction { PciFunction { bus: self.bus, dev: self.dev, func: self.func } }
+    }
+
+    /// One decoded BAR (same shape as the kernel's `pci::BarInfo`).
+    #[derive(Debug, Clone, Copy)]
+    pub struct BarInfo {
+        pub index: usize,
+        pub io: bool,
+        pub is64: bool,
+        pub prefetchable: bool,
+        pub base: u64,
+        pub size: u64,
+    }
+
+    /// bdf of the function whose `intx_line` was asked last; `irq::request_irq(IrqSource::Line)`
+    /// turns the line back into the kernel's per-function `kapi_irq_request_line`.
+    static INTX_BDF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    /// A PCI function addressed by bdf: the module-side twin of the kernel's `pci::PciFunction`
+    /// over `kapi_pci_cfg_*`, `kapi_pci_enable`, `kapi_pci_find_cap` and `kapi_map_device`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PciFunction { pub bus: u8, pub dev: u8, pub func: u8 }
+
+    impl From<PciFunction> for u32 {
+        fn from(f: PciFunction) -> u32 { f.bdf() }
+    }
+
+    impl PciFunction {
+        pub const fn new(bus: u8, dev: u8, func: u8) -> Self { Self { bus, dev, func } }
+        pub fn bdf(&self) -> u32 { bdf(self.bus, self.dev, self.func) }
+        fn rd(&self, off: u16, w: u8) -> u32 { unsafe { sys::kapi_pci_cfg_read(self.bdf(), off, w) } }
+        fn wr(&self, off: u16, w: u8, v: u32) { unsafe { sys::kapi_pci_cfg_write(self.bdf(), off, w, v) } }
+        pub fn read8(&self, off: u16) -> u8 { self.rd(off, 1) as u8 }
+        pub fn read16(&self, off: u16) -> u16 { self.rd(off, 2) as u16 }
+        pub fn read32(&self, off: u16) -> u32 { self.rd(off, 4) }
+        pub fn write8(&self, off: u16, v: u8) { self.wr(off, 1, v as u32) }
+        pub fn write16(&self, off: u16, v: u16) { self.wr(off, 2, v as u32) }
+        pub fn write32(&self, off: u16, v: u32) { self.wr(off, 4, v) }
+        pub fn find_capability(&self, id: u8) -> Option<u16> { find_capability(self.bdf(), id) }
+        pub fn enable_mem_and_bus_master(&self) { let _ = enable(self.bdf(), true); }
+
+        pub fn bar(&self, i: usize) -> Option<BarInfo> {
+            if i >= 6 { return None; }
+            let off = 0x10 + 4 * i as u16;
+            let v = self.read32(off);
+            if v & 1 == 1 {
+                return Some(BarInfo { index: i, io: true, is64: false, prefetchable: false, base: (v & !3) as u64, size: 0 });
+            }
+            let is64 = (v & 6) == 4;
+            let hi = if is64 && i < 5 { self.read32(off + 4) as u64 } else { 0 };
+            Some(BarInfo { index: i, io: false, is64, prefetchable: v & 8 != 0, base: (hi << 32) | (v & !0xF) as u64, size: 0 })
+        }
+
+        /// Size memory BAR `i` (decode off, all-ones probe, restore; no local-IRQ mask, so call it
+        /// from init before anything else touches the device).
+        fn bar_size(&self, i: usize) -> u64 {
+            let off = 0x10 + 4 * i as u16;
+            let cmd = self.read16(0x04);
+            self.write16(0x04, cmd & !0x3);
+            let o = self.read32(off);
+            self.write32(off, 0xFFFF_FFFF);
+            let v = self.read32(off);
+            self.write32(off, o);
+            let size = if (o & 6) == 4 && i < 5 {
+                let o2 = self.read32(off + 4);
+                self.write32(off + 4, 0xFFFF_FFFF);
+                let v2 = self.read32(off + 4);
+                self.write32(off + 4, o2);
+                (!(((v2 as u64) << 32) | (v & !0xF) as u64)).wrapping_add(1)
+            } else {
+                (!(v & !0xF)).wrapping_add(1) as u64
+            };
+            self.write16(0x04, cmd);
+            size
+        }
+
+        /// Size and map memory BAR `i`; `(virtual address, size)`.
+        pub fn map_bar(&self, i: usize, mode: mm::kva::CacheMode) -> Option<(usize, u64)> {
+            let b = self.bar(i)?;
+            if b.io || b.base == 0 { return None; }
+            let size = self.bar_size(i);
+            if size == 0 { return None; }
+            let va = mm::kva::ioremap(b.base, size as usize, mode)?;
+            Some((va, size))
+        }
+
+        /// INTx routing: only the aarch64 `virt` swizzle is known; elsewhere use MSI.
+        pub fn intx_line(&self) -> Option<u32> {
+            let pin = self.read8(0x3D);
+            if pin == 0 || pin > 4 { return None; }
+            INTX_BDF.store(self.bdf(), Ordering::SeqCst);
+            #[cfg(target_arch = "aarch64")]
+            { return Some(32 + 3 + ((self.dev as u32 + (pin as u32 - 1)) % 4)); }
+            #[allow(unreachable_code)]
+            None
+        }
+    }
+
+    pub(super) fn intx_bdf() -> u32 { INTX_BDF.load(Ordering::SeqCst) }
 
     pub fn find_device(vendor_id: u16, device_id: u16) -> Option<PciDevice> {
         let mut k = KPciDev::default();
@@ -130,6 +233,10 @@ pub mod mm {
         pub fn alloc(order: usize) -> Option<usize> {
             match unsafe { sys::kapi_page_alloc(order as u32, 0) } { 0 => None, p => Some(p as usize) }
         }
+        /// Physical pages below `limit` (exclusive).
+        pub fn alloc_below(order: usize, limit: usize) -> Option<usize> {
+            match unsafe { sys::kapi_page_alloc(order as u32, limit as u64) } { 0 => None, p => Some(p as usize) }
+        }
         pub fn free(addr: usize, order: usize) { unsafe { sys::kapi_page_free(addr as u64, order as u32) } }
     }
 }
@@ -138,6 +245,29 @@ pub mod sched {
     use super::*;
 
     pub fn monotonic_ns() -> u64 { unsafe { sys::kapi_monotonic_ns() } }
+
+    pub mod kthread {
+        use super::*;
+        use alloc::boxed::Box;
+
+        pub fn udelay(us: u64) { unsafe { sys::kapi_udelay(us) } }
+        pub fn msleep(ms: u64) { unsafe { sys::kapi_msleep(ms) } }
+
+        extern "C" fn tramp(arg: *mut u8) {
+            let f: Box<Box<dyn FnOnce() + Send>> = unsafe { Box::from_raw(arg as *mut Box<dyn FnOnce() + Send>) };
+            (*f)();
+        }
+
+        /// A kernel thread running `f`; `Some(())` when it started.
+        pub fn spawn<F: FnOnce() + Send + 'static>(name: &str, f: F) -> Option<()> {
+            let arg = Box::into_raw(Box::new(Box::new(f) as Box<dyn FnOnce() + Send>)) as *mut u8;
+            let r = unsafe { sys::kapi_kthread_spawn(name.as_ptr(), name.len(), tramp, arg, owner()) };
+            if r < 0 {
+                drop(unsafe { Box::from_raw(arg as *mut Box<dyn FnOnce() + Send>) });
+                None
+            } else { Some(()) }
+        }
+    }
 
     pub mod random {
         use super::*;
@@ -196,17 +326,27 @@ pub mod irq {
 
     fn raw(h: IrqHandler) -> kmod_abi::KIrqHandler { unsafe { core::mem::transmute(h) } }
 
+    /// Where an interrupt comes from (the Y build's `irq::IrqSource`, line variant only).
+    #[derive(Clone, Copy, Debug)]
+    pub enum IrqSource { Line(u32) }
+
+    /// The INTx line of the function last passed to `PciFunction::intx_line`.
+    pub fn request_irq(src: IrqSource, h: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
+        let IrqSource::Line(_) = src;
+        request_line(super::pci::intx_bdf(), h, ctx)
+    }
+
     /// Single-vector MSI on the function `bdf`.
-    pub fn request_msi(bdf: u32, h: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
-        match unsafe { sys::kapi_irq_request_msi(owner(), bdf, raw(h), ctx) } {
+    pub fn request_msi(bdf: impl Into<u32>, h: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
+        match unsafe { sys::kapi_irq_request_msi(owner(), bdf.into(), raw(h), ctx) } {
             v if v >= 0 => Ok(IrqHandle { vector: Some(v as u8), line: None }),
             e => Err(err(e)),
         }
     }
 
     /// The function's INTx line.
-    pub fn request_line(bdf: u32, h: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
-        match unsafe { sys::kapi_irq_request_line(owner(), bdf, raw(h), ctx) } {
+    pub fn request_line(bdf: impl Into<u32>, h: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
+        match unsafe { sys::kapi_irq_request_line(owner(), bdf.into(), raw(h), ctx) } {
             l if l >= 0 => Ok(IrqHandle { vector: None, line: Some(l as u32) }),
             e => Err(err(e)),
         }
@@ -253,6 +393,11 @@ pub mod netdev {
             match self.h.compare_exchange(0, n, Ordering::AcqRel, Ordering::Acquire) { Ok(_) => n, Err(cur) => cur }
         }
 
+        pub fn line(&self) -> alloc::string::String {
+            alloc::format!("linkmon: irq_wakes {} timer_wakes {}",
+                           self.irq_wakes.load(Ordering::Relaxed), self.timer_wakes.load(Ordering::Relaxed))
+        }
+
         /// Any context (ISR included).
         pub fn notify(&self) { unsafe { sys::kapi_wait_notify(self.handle()) } }
 
@@ -275,6 +420,17 @@ pub mod pm {
         match unsafe { sys::kapi_pm_register(owner(), suspend, resume, shutdown, ctx) } { 0 => Ok(()), e => Err(e) }
     }
 }
+
+/// The kernel command line.
+pub fn cmdline() -> &'static str {
+    let mut n = 0usize;
+    let p = unsafe { sys::kapi_cmdline(&mut n) };
+    if p.is_null() { return ""; }
+    core::str::from_utf8(unsafe { core::slice::from_raw_parts(p, n) }).unwrap_or("")
+}
+
+/// Raw log line for drivers that print their own prefix (newline stripped; `kapi_log` adds one).
+pub fn serial_raw(s: &str) { pci::serial_debug(s) }
 
 pub mod v4l2 {
     use super::*;
