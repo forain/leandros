@@ -25,6 +25,11 @@ nvidia = ["dep:nvidia-rm"]
 drv-i915 = ["drivers/i915"]
 drv-virtio-gpu = ["drivers/virtio-gpu"]
 drv-v3d = ["drivers/v3d"]
+# kmod L1c misc driver gates.
+drv-virtio-rng = ["drivers/drv-virtio-rng"]
+drv-hda = ["drivers/drv-hda"]
+drv-lapinv = ["drivers/drv-lapinv"]
+drv-i2c-hid = ["drivers/drv-i2c-hid"]
 
 [dependencies]
 mm         = { path = "../mm" }

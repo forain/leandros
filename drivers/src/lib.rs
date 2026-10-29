@@ -18,8 +18,13 @@ pub mod irq;
 pub mod firmware;
 pub mod nvidia_probe;
 /// Laptop device inventory and read-only probes (ACPI ids, PCI BARs, TPM, Thunderbolt, SMBus accelerometer).
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "drv-lapinv"))]
 pub mod lapinv;
+/// CONFIG_LAPINV=n: the boot inventory does not run.
+#[cfg(all(target_arch = "x86_64", not(feature = "drv-lapinv")))]
+pub mod lapinv {
+    pub fn run(_rsdp_phys: u64, _hhdm: u64, _cmdline: &str) {}
+}
 /// Intel Gen9 graphics: probe, GT bring-up, self-tests (lane i915).
 #[cfg(feature = "i915")]
 pub mod i915;
@@ -32,16 +37,52 @@ pub mod acpi_power;
 pub mod hid_desc;
 pub mod hid_ptp;
 /// ACPI I2C slave discovery, DesignWare I2C master, HID-over-I2C probe (lane lapi2c).
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "drv-i2c-hid"))]
 pub mod i2c_acpi;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "drv-i2c-hid"))]
 pub mod dw_i2c;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "drv-i2c-hid"))]
 pub mod i2c_hid;
+/// CONFIG_I2C_HID=n: no I2C touchpad; the PS/2 path stays as is.
+#[cfg(all(target_arch = "x86_64", not(feature = "drv-i2c-hid")))]
+pub mod i2c_hid {
+    pub fn set_ps2_reinit(_f: fn()) {}
+    pub fn poll_interval_ns() -> u64 { 1_000_000_000 }
+    pub fn init(_cmdline: &str) -> bool { false }
+    pub fn listen_once(_now_ns: u64) -> bool { false }
+}
 pub mod power_sysfs;
 pub mod snd;
 /// Intel High Definition Audio controller + codec playback (lane hda).
+#[cfg(feature = "drv-hda")]
 pub mod hda;
+/// CONFIG_HDA=n: no HD Audio controller; `probe` always fails.
+#[cfg(not(feature = "drv-hda"))]
+pub mod hda {
+    use alloc::string::String;
+    pub const TX_BUF_BYTES: usize = crate::snd::TX_BUF_BYTES;
+    pub struct Hda;
+    impl Hda {
+        pub const fn new() -> Self { Hda }
+        pub fn probe(&mut self) -> Result<(), ()> { Err(()) }
+        pub fn reconfigure_stream(&mut self, _stream_id: u32, _freq: u32, _channels: u8) {}
+        pub fn recover_stream(&mut self) {}
+        pub fn queued_bytes(&self) -> u64 { 0 }
+        pub fn tx_level(&self) -> u16 { 0 }
+        pub fn tx_used_idx(&self) -> u16 { 0 }
+        pub fn top_up_silence(&mut self) {}
+        pub fn send_pcm_data(&mut self, _data: &[u8]) -> usize { 0 }
+        pub fn shutdown(&mut self, _link_reset: bool, _budget_us: u64) -> String { String::new() }
+        pub fn pci_function(&self) -> Option<crate::pci::PciFunction> { None }
+        pub fn info(&mut self) -> String { String::new() }
+        pub fn capture_ensure(&mut self) -> Result<(), i32> { Err(-19) }
+        pub fn capture_restart(&mut self) -> bool { false }
+        pub fn capture_pending(&self) -> usize { 0 }
+        pub fn capture_read(&mut self, _out: &mut [u8]) -> Result<usize, i32> { Err(-19) }
+        pub fn jack_service(&mut self) {}
+        pub fn capture_close(&mut self) {}
+    }
+}
 pub mod framebuffer;
 pub mod kms;
 pub mod kms_v3d;
@@ -128,7 +169,15 @@ pub mod bt;
 pub mod wifi_pref;
 /// A simulated Wi-Fi interface for QEMU tests (opt-in; see its header).
 pub mod wifi_sim;
+#[cfg(feature = "drv-virtio-rng")]
 pub mod virtio_rng;
+/// CONFIG_VIRTIO_RNG=n: no hardware entropy device.
+#[cfg(not(feature = "drv-virtio-rng"))]
+pub mod virtio_rng {
+    pub const MAX_READ: usize = 4096;
+    pub fn read(_out: &mut [u8]) -> usize { 0 }
+    pub fn init() {}
+}
 pub mod usb_hcd;
 pub mod usb_hid;
 pub mod rel_pointer;
