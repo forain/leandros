@@ -572,7 +572,7 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 33 && exports::NEXPORTS == 33, "ksymtab has 33 exports");
+    t.check(exports::ksymtab().len() == 36 && exports::NEXPORTS == 36, "ksymtab has 36 exports");
     let find = sym!("kapi_pci_find", sys::PciFindFn);
     let rd = sym!("kapi_pci_cfg_read", sys::PciCfgReadFn);
     let wr = sym!("kapi_pci_cfg_write", sys::PciCfgWriteFn);
@@ -639,6 +639,7 @@ fn t_kmodkapi() -> T {
         t.check(seen, "HWRNG registration recorded for the owner");
     }
     kmodkapi_l6a(&mut t);
+    kmodkapi_l7a(&mut t);
     t
 }
 
@@ -661,6 +662,88 @@ extern "C" fn kt_pm_ok(c: usize, b: *mut u8, cap: usize) -> i32 { KT_PM.fetch_ad
 extern "C" fn kt_pm_err(_c: usize, b: *mut u8, cap: usize) -> i32 { -(kt_put("pm bad", b, cap) as i32) }
 
 /// L6a: PCI enable/caps, IRQ errors, wait queue, late netdev registration, pm hooks.
+static KT_TICKS: AtomicUsize = AtomicUsize::new(0);
+extern "C" fn kt_tick(ctx: usize) { KT_TICKS.fetch_add(ctx, Ordering::SeqCst); }
+extern "C" fn kt_probe_no(_i: *const kmod_abi::KUsbIf, _ctx: usize) -> i32 { 1 }
+extern "C" fn kt_cinfo(_c: usize, o: *mut kmod_abi::KCamInfo) -> i32 {
+    unsafe { *o = kmod_abi::KCamInfo { bcd: 0x0110, slot: 200, nformats: 1 }; } 0
+}
+extern "C" fn kt_cformat(_c: usize, i: u32, o: *mut kmod_abi::KFormat) -> i32 {
+    if i != 0 { return -22; }
+    unsafe { *o = kmod_abi::KFormat { index: 1, kind: kmod_abi::KFMT_MJPEG, bpp: 0, default_frame: 1, nframes: 1 }; } 0
+}
+extern "C" fn kt_cframe(_c: usize, f: u32, j: u32, o: *mut kmod_abi::KFrame) -> i32 {
+    if f != 0 || j != 0 { return -22; }
+    unsafe { *o = kmod_abi::KFrame { index: 1, _pad: 0, width: 320, height: 240, _pad2: 0, max_size: 65536, interval: 333333 }; } 0
+}
+extern "C" fn kt_cstart(_c: usize, _f: u8, _fr: u8, _i: u32, _b: *const kmod_abi::KCamBuf, _n: u32) -> i32 { 0 }
+extern "C" fn kt_cstop(_c: usize) {}
+extern "C" fn kt_cpoll(_c: usize) -> u32 { 0 }
+extern "C" fn kt_cready(_c: usize) -> u32 { 0 }
+extern "C" fn kt_cgone(_c: usize) -> bool { false }
+extern "C" fn kt_cq(_c: usize, _i: u32) -> i32 { 0 }
+extern "C" fn kt_cdq(_c: usize, _o: *mut kmod_abi::KCamDone) -> i32 { -11 }
+extern "C" fn kt_cctl(_c: usize, _id: u32, _s: bool, _v: u32, _o: *mut u32) -> i32 { -22 }
+static KT_CAM_OPS: kmod_abi::KCameraOps = kmod_abi::KCameraOps {
+    info: kt_cinfo, format: kt_cformat, frame: kt_cframe, stream_start: kt_cstart, stream_stop: kt_cstop,
+    stream_poll: kt_cpoll, stream_ready: kt_cready, stream_gone: kt_cgone, stream_qbuf: kt_cq,
+    stream_dqbuf: kt_cdq, control: kt_cctl,
+};
+
+/// L7a: camera registration, USB class registration/matching and tick callbacks through the kapi.
+fn kmodkapi_l7a(t: &mut T) {
+    use crate::kmod::exports;
+    use kmod_abi::{sys, KmodDevId, KmodId, BUS_PCI, BUS_USB};
+    macro_rules! sym { ($n:literal, $ty:ty) => {{
+        let a = exports::lookup($n);
+        t.check(a.is_some(), concat!($n, " in KSYMTAB"));
+        match a { Some(a) => unsafe { core::mem::transmute::<usize, $ty>(a) }, None => return }
+    }}; }
+    let vreg = sym!("kapi_v4l2_register", sys::V4l2RegisterFn);
+    let treg = sym!("kapi_tick_register", sys::TickRegisterFn);
+    let creg = sym!("kapi_usb_class_register", sys::UsbClassRegisterFn);
+    let owner = KmodId(60003);
+    unsafe {
+        // v4l2: bad table, then a good one that must show up (and go away again).
+        t.check(vreg(owner, core::ptr::null(), 1) == -22, "v4l2_register null ops -> -22");
+        let n0 = crate::syscall::v4l2::camera_count();
+        t.check(vreg(owner, &KT_CAM_OPS, 0x7e57) == 0, "v4l2_register ok");
+        t.check(crate::syscall::v4l2::camera_count() == n0 + 1, "camera count +1");
+        let mut seen = false;
+        crate::kmod::registry::registrations(owner, &mut |k, _| if k == kmod_abi::RegKind::V4L2 { seen = true });
+        t.check(seen, "V4L2 registration recorded");
+        crate::syscall::v4l2::unregister_camera(0x7e57);
+        t.check(crate::syscall::v4l2::camera_count() == n0, "camera count restored after unregister");
+
+        // tick callbacks run on every usb::class::tick.
+        let tc = usb::class::tick_count();
+        t.check(treg(owner, kt_tick, 3) == 0, "tick_register ok");
+        t.check(usb::class::tick_count() == tc + 1, "tick count +1");
+        let b = KT_TICKS.load(Ordering::SeqCst);
+        usb::class::tick();
+        t.check(KT_TICKS.load(Ordering::SeqCst) == b + 3, "tick callback ran once with its ctx");
+
+        // usb class: argument checks, then a vendor-class driver that matches a synthetic config.
+        let id = |bus, a, b, class, mask| KmodDevId { bus, a, b, c: 0, class, class_mask: mask };
+        let pci_only = [id(BUS_PCI, 1, 2, 0, 0)];
+        t.check(creg(owner, core::ptr::null(), 1, kt_probe_no, 0) == -22, "usb_class_register null ids -> -22");
+        t.check(creg(owner, pci_only.as_ptr(), 1, kt_probe_no, 0) == -22, "usb_class_register without a USB id -> -22");
+        // device descriptor stand-in: one interface, class 0xDE sub 0xAD proto 0xBE
+        let cfg: [u8; 9] = [9, 4, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0];
+        let uvc_cfg: [u8; 9] = [9, 4, 1, 0, 0, 0x0E, 0x02, 0x00, 0];
+        t.check(usb::class::wants(&cfg, 0xdead, 0xbeef).is_none(), "vendor interface unwanted before register");
+        t.check(usb::class::wants(&uvc_cfg, 0x1234, 0x5678) == Some(0x0E), "built-in table wants video streaming");
+        t.check(usb::class::wants(&[9, 4, 0, 0, 0, 0x0E, 0x01, 0, 0], 1, 2).is_none(), "video control alone unwanted");
+        let ids = [id(BUS_USB, 0xdead, 0xbeef, 0xDE_AD_00, 0xFF_FF_00)];
+        t.check(creg(owner, ids.as_ptr(), 1, kt_probe_no, 0) == 0, "usb_class_register ok");
+        t.check(usb::class::wants(&cfg, 0xdead, 0xbeef) == Some(0xDE), "registered driver wants its interface");
+        t.check(usb::class::wants(&cfg, 0xdead, 0x0001).is_none(), "pid mismatch unwanted");
+        let mut seen = false;
+        crate::kmod::registry::registrations(owner, &mut |k, _| if k == kmod_abi::RegKind::USB_CLASS { seen = true });
+        t.check(seen, "USB_CLASS registration recorded");
+    }
+}
+
 fn kmodkapi_l6a(t: &mut T) {
     use crate::kmod::exports;
     use kmod_abi::{sys, KNetifOps, KPciDev, KmodId};

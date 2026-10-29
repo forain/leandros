@@ -149,6 +149,117 @@ pub type KPmFn = extern "C" fn(ctx: usize, buf: *mut u8, cap: usize) -> i32;
 /// Interrupt handler: returns 1 when handled, 0 when the interrupt was not the device's.
 pub type KIrqHandler = extern "C" fn(ctx: usize) -> u32;
 
+
+// ── video (L7a): the camera ops table behind /dev/video0, and the USB class-driver seam ──
+
+pub const KFMT_OTHER: u8 = 0;
+pub const KFMT_MJPEG: u8 = 1;
+pub const KFMT_YUYV: u8 = 2;
+pub const KFMT_NV12: u8 = 3;
+
+/// Camera summary: UVC version (bcdUVC, 0 if not UVC), the USB slot (255 = none) and the format count.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct KCamInfo {
+    pub bcd: u16,
+    pub slot: u8,
+    pub nformats: u8,
+}
+
+/// One pixel format. `kind` is a `KFMT_*`; `nframes` frame sizes follow via `KCameraOps::frame`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct KFormat {
+    pub index: u8,
+    pub kind: u8,
+    pub bpp: u8,
+    pub default_frame: u8,
+    pub nframes: u32,
+}
+
+/// One frame size; `interval` is in 100 ns units.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct KFrame {
+    pub index: u8,
+    pub _pad: u8,
+    pub width: u16,
+    pub height: u16,
+    pub _pad2: u16,
+    pub max_size: u32,
+    pub interval: u32,
+}
+
+/// A capture buffer handed to `stream_start` (kernel virtual address).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct KCamBuf {
+    pub ptr: *mut u8,
+    pub cap: usize,
+}
+
+/// A completed buffer from `stream_dqbuf`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct KCamDone {
+    pub index: u32,
+    pub seq: u32,
+    pub bytes: u64,
+    pub ts_ns: u64,
+    pub error: u32,
+    pub _pad: u32,
+}
+
+/// `stream_poll` result bits.
+pub const KCAM_NEW_FRAME: u32 = 1;
+pub const KCAM_GONE: u32 = 2;
+
+/// A video-capture device as seen by the kernel's V4L2 layer. Every op takes the driver's `ctx`
+/// first. `stream_poll` and `stream_ready`/`stream_gone` may run in interrupt context (the
+/// tick), must never block, and must tolerate losing a lock race (return 0). Everything else
+/// runs in task context. Errors are `-errno`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KCameraOps {
+    pub info: extern "C" fn(ctx: usize, out: *mut KCamInfo) -> i32,
+    pub format: extern "C" fn(ctx: usize, index: u32, out: *mut KFormat) -> i32,
+    pub frame: extern "C" fn(ctx: usize, format_index: u32, frame_index: u32, out: *mut KFrame) -> i32,
+    pub stream_start: extern "C" fn(ctx: usize, format: u8, frame: u8, interval: u32,
+                                    bufs: *const KCamBuf, nbufs: u32) -> i32,
+    pub stream_stop: extern "C" fn(ctx: usize),
+    pub stream_poll: extern "C" fn(ctx: usize) -> u32,
+    pub stream_ready: extern "C" fn(ctx: usize) -> u32,
+    pub stream_gone: extern "C" fn(ctx: usize) -> bool,
+    pub stream_qbuf: extern "C" fn(ctx: usize, index: u32) -> i32,
+    /// 0 = a buffer was written to `out`, -11 none ready, -19 the device is gone.
+    pub stream_dqbuf: extern "C" fn(ctx: usize, out: *mut KCamDone) -> i32,
+    /// Get (`set` false) or set a V4L2 control by CID; the value is read from `val`, and the
+    /// resulting value written to `out`. -22 for an unknown control.
+    pub control: extern "C" fn(ctx: usize, cid: u32, set: bool, val: u32, out: *mut u32) -> i32,
+}
+
+/// A USB interface offered to a class driver. `handle` names the device function for the
+/// control/alt/isochronous calls added in L7b. `class`/`subclass`/`protocol` are those of the
+/// matched interface.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KUsbIf {
+    pub handle: u64,
+    pub vid: u16,
+    pub pid: u16,
+    pub slot: u8,
+    pub class: u8,
+    pub subclass: u8,
+    pub protocol: u8,
+    pub iface: u8,
+    pub _pad: [u8; 7],
+}
+
+/// Class-driver probe: 0 = claimed, non-zero = not mine (the kernel keeps the interface for later drivers).
+pub type KUsbProbeFn = extern "C" fn(intf: *const KUsbIf, ctx: usize) -> i32;
+/// Tick callback (USB timer tick, interrupt context).
+pub type KTickFn = extern "C" fn(ctx: usize);
+
 /// Every id-table entry starts with a `u16 bus` discriminator.
 pub const BUS_PCI: u16 = 1;
 pub const BUS_USB: u16 = 2;
@@ -202,6 +313,10 @@ pub mod sys {
     pub type NetdevRegisterFn =
         unsafe extern "C" fn(KmodId, u32, *const u8, usize, *const super::KNetifOps, usize) -> i32;
     pub type NetdevKickFn = unsafe extern "C" fn();
+    pub type V4l2RegisterFn = unsafe extern "C" fn(KmodId, *const super::KCameraOps, usize) -> i32;
+    pub type TickRegisterFn = unsafe extern "C" fn(KmodId, super::KTickFn, usize) -> i32;
+    pub type UsbClassRegisterFn =
+        unsafe extern "C" fn(KmodId, *const super::KmodDevId, usize, super::KUsbProbeFn, usize) -> i32;
     pub type PmRegisterFn = unsafe extern "C" fn(KmodId, Option<super::KPmFn>, Option<super::KPmFn>,
                                                  Option<super::KPmFn>, usize) -> i32;
 
@@ -217,6 +332,10 @@ pub mod sys {
                                     ops: *const super::KNetifOps, ctx: usize) -> i32;
         pub fn kapi_netdev_kick();
         pub fn kapi_netdev_kick_from_irq();
+        pub fn kapi_v4l2_register(owner: KmodId, ops: *const super::KCameraOps, ctx: usize) -> i32;
+        pub fn kapi_tick_register(owner: KmodId, f: super::KTickFn, ctx: usize) -> i32;
+        pub fn kapi_usb_class_register(owner: KmodId, ids: *const super::KmodDevId, nids: usize,
+                                       probe: super::KUsbProbeFn, ctx: usize) -> i32;
         pub fn kapi_pm_register(owner: KmodId, suspend: Option<super::KPmFn>, resume: Option<super::KPmFn>,
                                 shutdown: Option<super::KPmFn>, ctx: usize) -> i32;
         pub fn kapi_abi_version() -> u32;
@@ -322,6 +441,11 @@ const _: () = {
     assert!(core::mem::offset_of!(KmodCtx, params_len) == 40);
     assert!(core::mem::size_of::<RegKind>() == 2);
     assert!(core::mem::size_of::<KPciDev>() == 40);
+    assert!(core::mem::size_of::<KCamInfo>() == 4);
+    assert!(core::mem::size_of::<KFormat>() == 8);
+    assert!(core::mem::size_of::<KFrame>() == 16);
+    assert!(core::mem::size_of::<KCamDone>() == 32);
+    assert!(core::mem::size_of::<KUsbIf>() == 24);
     assert!(layout::TEST_SLOT_OFF == layout::SIZE - 2 * layout::SLOT_ALIGN);
     assert!(layout::TEST_SLOT_OFF == 0x0ff8_0000);
     assert!(layout::x86_64::BASE % layout::SLOT_ALIGN == 0);
