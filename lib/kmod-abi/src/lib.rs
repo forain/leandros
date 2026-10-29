@@ -92,6 +92,19 @@ pub const BUS_USB: u16 = 2;
 pub const BUS_OF: u16 = 3;
 pub const BUS_ACPI: u16 = 4;
 
+/// One id-table entry (`header.ids`), 16 bytes. PCI: a=vendor, b=device (0xffff = any).
+/// USB: a=vid, b=pid (0xffff = any), class = class<<16|sub<<8|proto under class_mask.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KmodDevId {
+    pub bus: u16,
+    pub a: u16,
+    pub b: u16,
+    pub c: u16,
+    pub class: u32,
+    pub class_mask: u32,
+}
+
 /// Export-table entry; `name` is NUL-terminated.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -191,6 +204,7 @@ const _: () = {
     assert!(core::mem::size_of::<KmodId>() == 2);
     assert!(core::mem::size_of::<KmodCtx>() == 48);
     assert!(core::mem::size_of::<KSym>() == 16);
+    assert!(core::mem::size_of::<KmodDevId>() == 16);
     assert!(core::mem::offset_of!(KmodHeader, magic) == 0);
     assert!(core::mem::offset_of!(KmodHeader, abi_version) == 8);
     assert!(core::mem::offset_of!(KmodHeader, header_size) == 12);

@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 arch="$1"
 HERE="$ROOT/scripts/kmod"
 OUT="$ROOT/target/kmod/$arch"
-rm -rf "$OUT"; mkdir -p "$OUT/initrd/lib/modules"
+mkdir -p "$OUT/initrd/lib/modules"
 LLD="$(find "$(rustc --print sysroot)" -name rust-lld | head -n 1)"
 if [[ "$arch" == "aarch64" ]]; then
     BASE=0xfffffe0000000000; triple=aarch64-unknown-none

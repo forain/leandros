@@ -1,0 +1,13 @@
+# selftest fixture (must be rejected by scripts/kmod/kmodpost.py); never built by default
+[package]
+name = "kmod-badsimd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod-rt = { path = "../../../../lib/kmod-rt" }
+

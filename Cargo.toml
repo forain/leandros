@@ -24,6 +24,11 @@ members = [
     "lib/bt-host",
     "lib/kmod-abi",
     "lib/kmod-elf",
+    "lib/kmod-rt",
+    "modules/hello",
+    "scripts/kmod/fixtures/badsym",
+    "scripts/kmod/fixtures/baddep",
+    "scripts/kmod/fixtures/badsimd",
     "arch/x86_64",
     "arch/aarch64",
 ]
