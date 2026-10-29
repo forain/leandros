@@ -451,7 +451,7 @@ def main():
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "uinputtest", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
-        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "kexectest", "kexec", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid",
+        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "kexectest", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -1329,6 +1329,21 @@ def main():
     # secrets in them. Owner/mode are applied where the tree is packed.
     m4_share_dirs.add("/etc/leandros")
     m4_share_dirs.add("/etc/leandros/network")
+
+    # Kernel modules for kmodctl / kmodctltest: target/kmod/<arch>/rootfs/lib/modules/<id>/*
+    # (kmod-build), else the initrd copy (testblob). Absent without KMOD_TEST / =m.
+    for _kd in (f"target/kmod/{arch}/rootfs", f"target/kmod/{arch}/initrd"):
+        _km = os.path.join(_kd, "lib", "modules")
+        if os.path.isdir(_km):
+            m4_share_dirs.update(("/lib", "/lib/modules"))
+            for _id in sorted(os.listdir(_km)):
+                _idd = os.path.join(_km, _id)
+                if not os.path.isdir(_idd):
+                    continue
+                m4_share_dirs.add(f"/lib/modules/{_id}")
+                for _f in sorted(os.listdir(_idd)):
+                    m4_share_files.append((f"/lib/modules/{_id}", _f, os.path.join(_idd, _f)))
+            break
 
     # kexec image (lane kexecload): the direct-boot kernel ELF the in-guest
     # kexec_file_load loads, as /boot/kexec. Omitted when not built.
