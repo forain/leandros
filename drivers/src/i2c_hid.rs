@@ -342,7 +342,11 @@ pub fn init(cmdline: &str) -> bool {
         return false;
     }
     if mode == "1" { log("i2c-hid: i2c_hid=1 (input node) is not in this build, probing only"); }
-    let Some(sc) = i2c_acpi::scan(true) else {
+    // Default (touchpad=ps2, i2c_hid=probe): touch nothing on the pad. No _INI, no
+    // descriptor/report reads; the PS/2 Synaptics pad must stay in PS/2 mode.
+    let listen = word("i2c_hid.listen", cmdline) == Some("1") || mode == "probe+reset";
+    let active = tp_i2c || listen;
+    let Some(sc) = i2c_acpi::scan(active) else {
         log("i2c-acpi: no ACPI namespace, skipping slave scan");
         return false;
     };
@@ -353,6 +357,7 @@ pub fn init(cmdline: &str) -> bool {
     }
     for s in &sc.slaves { log(&i2c_acpi::describe(s)); }
     if mode == "0" && !tp_i2c { return false; }
+    if !active { log("i2c-hid: idle (touchpad=ps2); i2c_hid.listen=1 to probe"); return false; }
     let mut l = LISTEN.lock();
     for s in sc.slaves.iter().filter(|s| s.sta & 0xB == 0xB && s.hid_desc_reg.is_some()) {
         match dw_i2c::bus_for_adr(s.ctrl_adr) {
