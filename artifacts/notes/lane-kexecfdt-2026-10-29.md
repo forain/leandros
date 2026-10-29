@@ -22,3 +22,4 @@ gen1's FDT X1=0x41000000 (image ends 0x40ecd000). In gen3 `kexec -l` of an image
 then kexec'd into it. `returned to the map` printed 4/4. With `KEXECFDT_NOFIX=1` (keep_fdt_hole in gen1/gen2) the
 same step fails: `destination 0x40080000-0x41004000 is not usable RAM`.
 kexectest + kexec load/unload green. See PR commit for the aarch64 regress and x86_64 results.
+x86_64: kexec gen0->gen1->gen2 chain PASS (kexecfdt suite x86 mode); aarch64 default regress PASS.

@@ -66,6 +66,15 @@ def last_pt_load(path):
 
 def main():
     fails = []
+    if "x86_64" in guest("uname -m")[1]:
+        # x86_64 has no FDT; just prove the chain gen0 -> gen1 -> gen2 still works.
+        rc, out = guest(f"{KX} --reuse-cmdline --append='kexec.gen=1'")
+        print("  x86 load", rc, flush=True)
+        r1 = kexec_exec("kexec.gen=1")
+        rc, out = guest(f"{KX} --reuse-cmdline --append='kexec.gen=2'")
+        r2 = kexec_exec("kexec.gen=2")
+        print("RESULT:", "PASS" if (r1 == 0 and r2 == 0 and rc == 0) else "FAIL x86 chain")
+        return 0 if (r1 == 0 and r2 == 0 and rc == 0) else 1
 
     def check(name, ok, detail=""):
         print(f"  {'ok  ' if ok else 'FAIL'} {name} {detail}", flush=True)
