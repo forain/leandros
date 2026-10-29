@@ -513,7 +513,16 @@ struct TmpVmo {
     /// mapping (0 = never mapped). Unique for the boot, so a mapping that
     /// outlives the slot never names its next tenant. See [`vmo_id_of`].
     id: u64,
+    /// Address-space VMAs naming this object (`mm::vmm::vmo_retain`/`vmo_release`).
+    /// A VMO destroyed while this is non-zero lives on in `TMP_ZOMBIES`, so the
+    /// pages a lazy mapping has not faulted in yet can still be found.
+    maps: u32,
 }
+
+/// Objects whose last descriptor/name went away while VMAs still map them
+/// (the fd is closed right after mmap by most shm users). Faults of those
+/// mappings are served from here; the entry dies with its last VMA.
+static TMP_ZOMBIES: Mutex<alloc::vec::Vec<TmpVmo>> = Mutex::new(alloc::vec::Vec::new());
 
 /// Low bits of a VMO identity: the TMP_VMOS slot.
 const VMO_ID_IDX_BITS: u32 = 16;
@@ -611,7 +620,7 @@ impl TmpVmo {
     /// An empty, owning VMO (no pages: the whole file is a hole).
     const fn new_owned(is_memfd: bool) -> Self {
         TmpVmo { pages: alloc::vec::Vec::new(), len: 0, seals: 0, is_memfd,
-                 borrowed: false, dmabuf_handle: 0, dmabuf_obj: 0, id: 0 }
+                 borrowed: false, dmabuf_handle: 0, dmabuf_obj: 0, id: 0, maps: 0 }
     }
 
     /// The frame backing page `i`, or 0 for a hole.
@@ -916,8 +925,75 @@ fn vmo_free_owned(vmo: TmpVmo) -> Option<u32> {
     if vmo.borrowed {
         return if vmo.dmabuf_obj != 0 { Some(vmo.dmabuf_obj) } else { None };
     }
+    // VMAs still name this object (lazy shared mappings with unfaulted pages):
+    // keep it findable by id until the last of them goes.
+    if vmo.maps > 0 && vmo.id != 0 {
+        TMP_ZOMBIES.lock().push(vmo);
+        return None;
+    }
     for phys in vmo.pages { tmp_page_put(phys); }
     None
+}
+
+/// One more VMA names VMO `id` (`mm::vmm::VmoRefFn`). Takes only the leaf
+/// VMO locks.
+pub fn vmo_retain(id: u64) {
+    if id == 0 { return; }
+    let idx = vmo_id_slot(id);
+    {
+        let mut vmos = TMP_VMOS.lock();
+        if let Some(v) = vmos.get_mut(idx).and_then(|v| v.as_mut()).filter(|v| v.id == id) {
+            v.maps += 1;
+            return;
+        }
+    }
+    if let Some(v) = TMP_ZOMBIES.lock().iter_mut().find(|v| v.id == id) { v.maps += 1; }
+}
+
+/// A VMA naming VMO `id` went away; the last one frees a zombie object.
+pub fn vmo_release(id: u64) {
+    if id == 0 { return; }
+    let idx = vmo_id_slot(id);
+    {
+        let mut vmos = TMP_VMOS.lock();
+        if let Some(v) = vmos.get_mut(idx).and_then(|v| v.as_mut()).filter(|v| v.id == id) {
+            v.maps = v.maps.saturating_sub(1);
+            return;
+        }
+    }
+    let dead = {
+        let mut z = TMP_ZOMBIES.lock();
+        match z.iter().position(|v| v.id == id) {
+            Some(i) => {
+                z[i].maps = z[i].maps.saturating_sub(1);
+                if z[i].maps == 0 { Some(z.swap_remove(i)) } else { None }
+            }
+            None => None,
+        }
+    };
+    if let Some(v) = dead { for phys in v.pages { tmp_page_put(phys); } }
+}
+
+/// Prepare a lazy `MAP_SHARED` mapping of `[off, off+len)` of the tmpfs/memfd
+/// behind `fd`: promote the file to a VMO if it has none and return the
+/// object id, WITHOUT allocating, zeroing or pinning any frame. The pages
+/// are found at fault time (`vmo_fault_frame`). None (caller maps eagerly)
+/// for a dmabuf/borrowed object, or a range reaching past EOF (a fault
+/// there would be SIGBUS, which the eager path never raised).
+pub fn vmo_lazy_prepare(pid: u32, fd: usize, off: usize, len: usize) -> Option<u64> {
+    if len == 0 || off % 4096 != 0 { return None; }
+    let idx = tmpfile_owner_of(pid, fd)?;
+    let end = off.checked_add(len)?.checked_add(4095)? & !4095;
+    let tmp = TMP_FILES.lock();
+    let mut vmos = TMP_VMOS.lock();
+    if vmos[idx].is_none() {
+        let mut v = TmpVmo::new_owned(false);
+        v.len = tmp[idx].len;
+        vmos[idx] = Some(v);
+    }
+    let vmo = vmos[idx].as_mut().unwrap();
+    if vmo.borrowed || ((vmo.len + 4095) & !4095) < end { return None; }
+    Some(vmo_assign_id(vmo, idx))
 }
 
 /// Resolve `(pid, fd)` to the owning tmpfs slot index, or `None` if the fd is
@@ -1090,7 +1166,7 @@ pub fn install_dmabuf_vmo_pages(pid: u32, fd: usize, pages: alloc::vec::Vec<usiz
     tmp[idx].len = len;
     vmos[idx] = Some(TmpVmo {
         pages, len, seals: 0, is_memfd: true,
-        borrowed: true, dmabuf_handle: handle, dmabuf_obj: obj, id: 0,
+        borrowed: true, dmabuf_handle: handle, dmabuf_obj: obj, id: 0, maps: 0,
     });
     true
 }
@@ -1435,8 +1511,17 @@ pub fn vmo_fault_frame(id: u64, off: u64) -> Option<usize> {
     if id == 0 { return None; }
     let idx = vmo_id_slot(id);
     let p = (off / 4096) as usize;
-    let mut vmos = TMP_VMOS.lock();
-    let vmo = vmos.get_mut(idx)?.as_mut().filter(|v| v.id == id)?;
+    {
+        let mut vmos = TMP_VMOS.lock();
+        if let Some(vmo) = vmos.get_mut(idx).and_then(|v| v.as_mut()).filter(|v| v.id == id) {
+            if off >= ((vmo.len as u64) + 4095) & !4095 { return None; }
+            let phys = vmo.ensure_page(p, true).ok()?;
+            mm::pageref::inc(phys);
+            return Some(phys);
+        }
+    }
+    let mut z = TMP_ZOMBIES.lock();
+    let vmo = z.iter_mut().find(|v| v.id == id)?;
     if off >= ((vmo.len as u64) + 4095) & !4095 { return None; }
     let phys = vmo.ensure_page(p, true).ok()?;
     mm::pageref::inc(phys);

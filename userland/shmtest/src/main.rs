@@ -64,6 +64,8 @@ mod nr {
     pub const FTRUNCATE: usize = 46;
     pub const MEMFD_CREATE: usize = 279;
     pub const PREAD64: usize = 67;
+    pub const PWRITE64: usize = 68;
+    pub const CLOCK_GETTIME: usize = 113;
 }
 #[cfg(target_arch = "x86_64")]
 mod nr {
@@ -73,6 +75,8 @@ mod nr {
     pub const FTRUNCATE: usize = 77;
     pub const MEMFD_CREATE: usize = 319;
     pub const PREAD64: usize = 17;
+    pub const PWRITE64: usize = 18;
+    pub const CLOCK_GETTIME: usize = 228;
 }
 
 fn wifexited(status: c_int) -> bool { (status & 0x7f) == 0 }
@@ -489,6 +493,46 @@ unsafe fn t_memfd() -> bool {
     report(name, true)
 }
 
+/// Lazy MAP_SHARED of a memfd (lane mmapB): two mappings and the fd see the
+/// same frames, pages nobody touched at mmap time are found at first touch
+/// (also by a kernel copy and by a forked child), and the mappings keep
+/// working after the last descriptor is closed.
+unsafe fn t_memfd_lazy() -> bool {
+    let name = b"memfd_lazy";
+    let fd = sys(nr::MEMFD_CREATE, b"lazy\0".as_ptr() as usize, 0, 0, 0, 0) as c_int;
+    if fd < 0 { return why(name, b"memfd_create", (-fd) as u64); }
+    if sys(nr::FTRUNCATE, fd as usize, 8 * PS, 0, 0, 0) != 0 { close(fd); return why(name, b"ftruncate", 0); }
+    let a = map(8 * PS, PROT_READ | PROT_WRITE, MAP_SHARED, fd);
+    let b = map(8 * PS, PROT_READ | PROT_WRITE, MAP_SHARED, fd);
+    if a.is_null() || b.is_null() { close(fd); return why(name, b"mmap", 0); }
+    let mut bad = 0u64;
+    // pwrite before any page was touched, seen through both mappings.
+    let v = 0x11223344u32;
+    if sys(nr::PWRITE64, fd as usize, &v as *const u32 as usize, 4, 3 * PS, 0) != 4 { bad |= 1; }
+    if rd(a, 3 * PS) != v || rd(b, 3 * PS) != v { bad |= 2; }
+    // A store through one mapping: the other mapping and pread see it.
+    wr(a, 5 * PS, 0x55);
+    let mut w = 0u32;
+    if rd(b, 5 * PS) != 0x55 { bad |= 4; }
+    if sys(nr::PREAD64, fd as usize, &mut w as *mut u32 as usize, 4, 5 * PS, 0) != 4 || w != 0x55 { bad |= 8; }
+    // The kernel copies into a page of the mapping nobody touched yet.
+    if sys(nr::PREAD64, fd as usize, a.add(2 * PS) as usize, 4, 3 * PS, 0) != 4 { bad |= 16; }
+    if rd(b, 2 * PS) != v { bad |= 32; }
+    // Last descriptor closed: untouched pages are still found.
+    close(fd);
+    if rd(a, 6 * PS) != 0 { bad |= 64; }
+    wr(b, 6 * PS, 0x66);
+    if rd(a, 6 * PS) != 0x66 { bad |= 128; }
+    let pid = spawn(|| { wr(a, 7 * PS, 0x77); 0 });
+    let rc = wait_exit_code(pid);
+    if rc != 0 || rd(b, 7 * PS) != 0x77 { bad |= 256; }
+    unmap(a, 8 * PS);
+    if rd(b, 6 * PS) != 0x66 || rd(b, 5 * PS) != 0x55 { bad |= 512; }
+    unmap(b, 8 * PS);
+    if bad != 0 { return why(name, b"bad", bad); }
+    report(name, true)
+}
+
 unsafe fn t_private_cow() -> bool {
     let name = b"private_cow";
     let p = map(2 * PS, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1);
@@ -596,11 +640,47 @@ unsafe fn t_rss_shmem() -> bool {
     report(name, true)
 }
 
+unsafe fn now_ns() -> u64 {
+    let mut ts = [0u64; 2];
+    sys(nr::CLOCK_GETTIME, 1, ts.as_mut_ptr() as usize, 0, 0, 0);
+    ts[0] * 1_000_000_000 + ts[1]
+}
+
+/// `shmtest bench`: 4 MiB memfd / anon map-touch-unmap cost (lane mmapB).
+unsafe fn bench() {
+    const N: usize = 500;
+    const LEN: usize = 1024 * PS;
+    let fd = sys(nr::MEMFD_CREATE, b"bench\0".as_ptr() as usize, 0, 0, 0, 0) as c_int;
+    if fd < 0 || sys(nr::FTRUNCATE, fd as usize, LEN, 0, 0, 0) != 0 { say(b"bench: memfd failed\n"); return; }
+    for mode in 0..3 {
+        let (mut tm, mut tt, mut tu) = (0u64, 0u64, 0u64);
+        for _ in 0..N {
+            let t0 = now_ns();
+            let p = if mode == 0 { map(LEN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1) }
+                    else { map(LEN, PROT_READ | PROT_WRITE, MAP_SHARED, fd) };
+            let t1 = now_ns();
+            if p.is_null() { say(b"bench: mmap failed\n"); return; }
+            if mode != 2 { for i in 0..1024 { wr(p, i * PS, 1); } }
+            let t2 = now_ns();
+            unmap(p, LEN);
+            let t3 = now_ns();
+            tm += t1 - t0; tt += t2 - t1; tu += t3 - t2;
+        }
+        say(match mode { 0 => b"anon touched   ", 1 => b"memfd touched  ", _ => b"memfd untouched" });
+        say(b" ns/iter mmap="); say_num(tm / N as u64);
+        say(b" touch="); say_num(tt / N as u64);
+        say(b" munmap="); say_num(tu / N as u64);
+        say(b"\n");
+    }
+    close(fd);
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn shm_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
-    let cases: [unsafe fn() -> bool; 12] = [
+pub unsafe extern "C" fn shm_main(argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    if argc >= 2 { bench(); return 0; }
+    let cases: [unsafe fn() -> bool; 13] = [
         t_live_both_ways, t_multi_fork, t_munmap, t_madvise, t_mprotect, t_threads_fork,
-        t_devzero, t_memfd, t_private_cow, t_mremap, t_release, t_rss_shmem,
+        t_devzero, t_memfd, t_memfd_lazy, t_private_cow, t_mremap, t_release, t_rss_shmem,
     ];
     let mut failures = 0;
     for c in cases.iter() { if !c() { failures += 1; } }
