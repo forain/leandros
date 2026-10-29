@@ -41,7 +41,18 @@ done
 case "$arch" in x86_64) elfm=elf_x86_64 ;; aarch64) elfm=aarch64linux ;; esac
 mkdir -p "$OUT" "$HERE/out/stub-$arch"
 ln -sf "$HERE/out/$arch.alpine/usr/lib/libpipewire-0.3.so.0" "$HERE/out/stub-$arch/libpipewire-0.3.so"
-cfg=$HERE/out/cargo-$arch.toml
+# Worktree-independent paths: rustflags are part of cargo's unit hash, so
+# embedding $HERE/out/... made every worktree rebuild (and keep) a full copy of
+# every crate in the shared target dir. Reach the per-worktree SDK/stub dirs
+# through symlinks at a fixed place in the cache instead.
+CACHE=${LEANDROS_PORTS_CACHE:-$HOME/Library/Caches/leandros-ports}
+STABLE=$CACHE/portal-stable/$arch
+mkdir -p "$STABLE"
+ln -sfn "$SDK" "$STABLE/sdk"
+ln -sfn "$HERE/out/stub-$arch" "$STABLE/stub"
+SDK=$STABLE/sdk
+STUB=$STABLE/stub
+cfg=$STABLE/cargo.toml
 cat > "$cfg" <<EOF
 [target.$triple]
 linker = "$D/toolchain/zig-ld-lld"
@@ -50,7 +61,7 @@ rustflags = [
   "-C", "target-feature=-crt-static",
   "-C", "relocation-model=pic",
   "-C", "link-self-contained=no",
-  "-C", "link-args=--sysroot=$S --entry _start --build-id=none --eh-frame-hdr -znow -m $elfm --dynamic-linker /lib/ld-musl-$arch.so.1 -pie -L$S/usr/lib -L$SDK/usr/lib -L$HERE/out/stub-$arch $S/usr/lib/Scrt1.o $S/usr/lib/crti.o $S/usr/lib/crtn.o -lc",
+  "-C", "link-args=--sysroot=$S --entry _start --build-id=none --eh-frame-hdr -znow -m $elfm --dynamic-linker /lib/ld-musl-$arch.so.1 -pie -L$S/usr/lib -L$SDK/usr/lib -L$STUB $S/usr/lib/Scrt1.o $S/usr/lib/crti.o $S/usr/lib/crtn.o -lc",
 ]
 EOF
 export PATH="/opt/homebrew/opt/bison/bin:$PATH"
@@ -63,9 +74,9 @@ for dep in GLIB_2_0:glib-2.0 GOBJECT_2_0:gobject-2.0 GIO_2_0:gio-2.0; do
     export SYSTEM_DEPS_${n}_LIB="$l"
     export SYSTEM_DEPS_${n}_INCLUDE="$gi"
 done
-export SYSTEM_DEPS_LIBPIPEWIRE_NO_PKG_CONFIG=1 SYSTEM_DEPS_LIBPIPEWIRE_SEARCH_NATIVE="$HERE/out/stub-$arch" \
+export SYSTEM_DEPS_LIBPIPEWIRE_NO_PKG_CONFIG=1 SYSTEM_DEPS_LIBPIPEWIRE_SEARCH_NATIVE="$STUB" \
        SYSTEM_DEPS_LIBPIPEWIRE_LIB="pipewire-0.3" SYSTEM_DEPS_LIBPIPEWIRE_INCLUDE="$PG/inc/pipewire-0.3:$PG/inc/spa-0.2"
-export SYSTEM_DEPS_LIBSPA_NO_PKG_CONFIG=1 SYSTEM_DEPS_LIBSPA_SEARCH_NATIVE="$HERE/out/stub-$arch" \
+export SYSTEM_DEPS_LIBSPA_NO_PKG_CONFIG=1 SYSTEM_DEPS_LIBSPA_SEARCH_NATIVE="$STUB" \
        SYSTEM_DEPS_LIBSPA_LIB="pipewire-0.3" SYSTEM_DEPS_LIBSPA_INCLUDE="$PG/inc/spa-0.2"
 export BINDGEN_EXTRA_CLANG_ARGS="--target=$arch-linux-musl --sysroot=$S -isystem $S/usr/include"
 tus=$(echo "$triple" | tr - _)
@@ -74,8 +85,14 @@ export CFLAGS_${tus}="-fno-sanitize=all -I$PG/inc/pipewire-0.3 -I$PG/inc/spa-0.2
 export LIBCLANG_PATH="/opt/homebrew/opt/llvm/lib"
 # Shared by every worktree (cargo locks the dir itself): ~2.4 GiB, kept out of
 # each checkout. Override with LEANDROS_PORTS_CACHE.
-export CARGO_TARGET_DIR="${LEANDROS_PORTS_CACHE:-$HOME/Library/Caches/leandros-ports}/portal-target"
+export CARGO_TARGET_DIR="$CACHE/portal-target"
 mkdir -p "$CARGO_TARGET_DIR"
+# Guard: if stale hashes pile up anyway, keep only the newest copy per crate.
+deps=$CARGO_TARGET_DIR/$triple/release/deps
+if [ -d "$deps" ] && [ "$(ls "$deps" | grep -c '^xdg_desktop_portal_cosmic-.*\.d$')" -gt 3 ]; then
+    echo "portal-target: pruning stale hashes"
+    rm -rf "$deps" "$CARGO_TARGET_DIR/$triple/release/.fingerprint" "$CARGO_TARGET_DIR/$triple/release/build"
+fi
 log=$HERE/out/backend-$arch.log
 echo "=== cargo +nightly build $triple ($SRC @ $(git -C "$SRC" rev-parse --short HEAD 2>/dev/null)) ===" | tee "$log"
 ( cd "$SRC" && cargo +nightly build --release --locked --target "$triple" --config "$cfg" ) >> "$log" 2>&1
