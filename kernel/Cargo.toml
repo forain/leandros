@@ -26,6 +26,7 @@ drv-i915 = ["drivers/i915"]
 drv-virtio-gpu = ["drivers/virtio-gpu"]
 drv-v3d = ["drivers/v3d"]
 # Kconfig-gated network drivers (kmod L1a).
+mod-usb-video-class = ["usb/uvc-module"]
 drv-e1000e = ["drivers/e1000e"]
 drv-r8169 = ["drivers/r8169"]
 drv-macb = ["drivers/macb"]

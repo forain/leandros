@@ -572,7 +572,7 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 36 && exports::NEXPORTS == 36, "ksymtab has 36 exports");
+    t.check(exports::ksymtab().len() == 44 && exports::NEXPORTS == 44, "ksymtab has 44 exports");
     let find = sym!("kapi_pci_find", sys::PciFindFn);
     let rd = sym!("kapi_pci_cfg_read", sys::PciCfgReadFn);
     let wr = sym!("kapi_pci_cfg_write", sys::PciCfgWriteFn);
@@ -726,21 +726,41 @@ fn kmodkapi_l7a(t: &mut T) {
         // usb class: argument checks, then a vendor-class driver that matches a synthetic config.
         let id = |bus, a, b, class, mask| KmodDevId { bus, a, b, c: 0, class, class_mask: mask };
         let pci_only = [id(BUS_PCI, 1, 2, 0, 0)];
-        t.check(creg(owner, core::ptr::null(), 1, kt_probe_no, 0) == -22, "usb_class_register null ids -> -22");
-        t.check(creg(owner, pci_only.as_ptr(), 1, kt_probe_no, 0) == -22, "usb_class_register without a USB id -> -22");
+        t.check(creg(owner, core::ptr::null(), 1, kt_probe_no, None, 0) == -22, "usb_class_register null ids -> -22");
+        t.check(creg(owner, pci_only.as_ptr(), 1, kt_probe_no, None, 0) == -22, "usb_class_register without a USB id -> -22");
         // device descriptor stand-in: one interface, class 0xDE sub 0xAD proto 0xBE
         let cfg: [u8; 9] = [9, 4, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0];
         let uvc_cfg: [u8; 9] = [9, 4, 1, 0, 0, 0x0E, 0x02, 0x00, 0];
         t.check(usb::class::wants(&cfg, 0xdead, 0xbeef).is_none(), "vendor interface unwanted before register");
+        #[cfg(not(feature = "mod-usb-video-class"))]
         t.check(usb::class::wants(&uvc_cfg, 0x1234, 0x5678) == Some(0x0E), "built-in table wants video streaming");
+        #[cfg(feature = "mod-usb-video-class")]
+        t.check(usb::class::wants(&uvc_cfg, 0x1234, 0x5678).is_none(), "no built-in video driver: video streaming unwanted");
         t.check(usb::class::wants(&[9, 4, 0, 0, 0, 0x0E, 0x01, 0, 0], 1, 2).is_none(), "video control alone unwanted");
         let ids = [id(BUS_USB, 0xdead, 0xbeef, 0xDE_AD_00, 0xFF_FF_00)];
-        t.check(creg(owner, ids.as_ptr(), 1, kt_probe_no, 0) == 0, "usb_class_register ok");
+        t.check(creg(owner, ids.as_ptr(), 1, kt_probe_no, None, 0) == 0, "usb_class_register ok");
         t.check(usb::class::wants(&cfg, 0xdead, 0xbeef) == Some(0xDE), "registered driver wants its interface");
         t.check(usb::class::wants(&cfg, 0xdead, 0x0001).is_none(), "pid mismatch unwanted");
         let mut seen = false;
         crate::kmod::registry::registrations(owner, &mut |k, _| if k == kmod_abi::RegKind::USB_CLASS { seen = true });
         t.check(seen, "USB_CLASS registration recorded");
+        // L7b: handle-based USB calls reject handles nobody owns.
+        let (uctrl, ualt, ucfg) = (sym!("kapi_usb_ctrl", sys::UsbCtrlFn), sym!("kapi_usb_set_alt", sys::UsbSetAltFn),
+                                   sym!("kapi_usb_cfg", sys::UsbCfgFn));
+        let (uopen, usub, urap, ucls) = (sym!("kapi_usb_isoch_open", sys::UsbIsochOpenFn), sym!("kapi_usb_isoch_submit", sys::UsbIsochSubmitFn),
+                                         sym!("kapi_usb_isoch_reap", sys::UsbIsochReapFn), sym!("kapi_usb_isoch_close", sys::UsbIsochCloseFn));
+        let setup = kmod_abi::KUsbSetup { request_type: 0x80, request: 6, value: 0x0100, index: 0, length: 4 };
+        let mut b4 = [0u8; 4];
+        t.check(unsafe { uctrl(0xdead, &setup, b4.as_mut_ptr(), 4, 100) } == -19, "usb_ctrl bad handle -> -19");
+        t.check(unsafe { uctrl(0xdead, core::ptr::null(), b4.as_mut_ptr(), 4, 100) } == -22, "usb_ctrl null setup -> -22");
+        t.check(unsafe { uctrl(0xdead, &setup, b4.as_mut_ptr(), 2, 100) } == -22, "usb_ctrl short buffer -> -22");
+        t.check(unsafe { ualt(0xdead, 1, 1) } == -19, "usb_set_alt bad handle -> -19");
+        t.check(unsafe { ucfg(0xdead, b4.as_mut_ptr(), 4) } == -19, "usb_cfg bad handle -> -19");
+        t.check(unsafe { uopen(0xdead, 1, 1, 0x81, 4096, 64, true) } == -19, "usb_isoch_open bad handle -> -19");
+        t.check(unsafe { usub(0xdead) } == 1, "usb_isoch_submit bad pipe -> busy");
+        t.check(unsafe { urap(0xdead, b4.as_mut_ptr(), 4) } == -11, "usb_isoch_reap bad pipe -> -11");
+        unsafe { ucls(0xdead) };
+        t.check(exports::usb_claimed() == 0 && exports::usb_pipes() == 0, "no handles leaked");
     }
 }
 

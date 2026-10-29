@@ -30,10 +30,9 @@ use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use spin::Mutex;
 use kmod_abi::{KCamBuf, KCamDone, KCamInfo, KCameraOps, KFormat, KFrame, KmodId, KCAM_GONE, KCAM_NEW_FRAME};
 
-use crate::platform::{self, Deadline};
-use crate::transport::UsbErr;
-use crate::usb_log;
-use crate::xhci::isoch::{IsochEpDesc, IsochPipe, Poll, StreamFormat, UsbFunction};
+// Everything the driver needs from the USB stack comes through `crate::uvcenv`: the kernel build
+// maps it onto the xhci types, the loadable module (modules/uvc) onto the kapi handle calls.
+use crate::uvcenv::{self as env, platform, usb_log, Deadline, IsochEpDesc, IsochPipe, Poll, StreamFormat, UsbErr, UsbFunction};
 
 pub const FMT_MJPEG: u8 = 1;
 pub const FMT_YUYV: u8 = 2;
@@ -158,7 +157,7 @@ pub fn parse(cfg: &[u8]) -> Option<VideoInfo> {
         }
     }
     if !have_vs { return None; }
-    v.alts = crate::xhci::isoch::scan_isoch(cfg).into_iter()
+    v.alts = env::scan_isoch(cfg).into_iter()
         .filter(|e| e.iface == v.vs_iface && e.is_in()).collect();
     Some(v)
 }
@@ -568,13 +567,11 @@ pub fn register(f: UsbFunction) {
 }
 
 /// Class-driver probe (the built-in table entry for video streaming interfaces).
-pub fn class_probe(f: UsbFunction, m: &crate::class::Match, _ctx: usize) -> Result<(), UsbFunction> {
+pub fn class_probe(f: UsbFunction, m: &env::Match, _ctx: usize) -> Result<(), UsbFunction> {
     usb_log!("[USB] bus {} slot {}: video function (UVC)\n", m.bus, f.slot);
     register(f);
     Ok(())
 }
-
-pub fn class_detach(hc: &crate::xhci::Hc, slot: u8, _ctx: usize) { detach(hc, slot); }
 
 /// Register the fake camera when `uvc.fake=1` was given (MJPG and YUYV 640x480).
 pub fn register_fake() {
@@ -598,21 +595,21 @@ pub fn register_fake() {
 /// The first camera, if any.
 pub fn camera(i: usize) -> Option<Arc<Camera>> { CAMERAS.lock().get(i).cloned() }
 
-/// The device on (`hc`, `slot`) left.
-pub fn detach(hc: &crate::xhci::Hc, slot: u8) {
-    let gone: Vec<usize> = {
+/// Drop every camera whose function satisfies `gone` (the device left).
+pub fn detach_where(gone: impl Fn(&UsbFunction) -> bool) {
+    let removed: Vec<usize> = {
         let mut cams = CAMERAS.lock();
         let mut ctxs = CTXS.lock();
         let mut out = Vec::new();
         cams.retain(|c| {
-            let g = c.func.as_ref().map_or(false, |f| core::ptr::eq(&*f.hc, hc) && f.slot == slot);
+            let g = c.func.as_ref().map_or(false, |f| gone(f));
             if g { ctxs.retain(|&x| { let hit = unsafe { Arc::ptr_eq(&(*(x as *const CamCtx)).cam, c) }; if hit { out.push(x); } !hit }); }
             !g
         });
         out
     };
     let sink = *SINK.lock();
-    if let Some(k) = sink { for c in gone { (k.remove)(c); } }
+    if let Some(k) = sink { for c in removed { (k.remove)(c); } }
 }
 
 // ── the camera ops adapter: uvc registers with the kernel's V4L2 layer through KCameraOps ──
