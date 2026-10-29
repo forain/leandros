@@ -32,6 +32,16 @@ if [[ ! -x "$M6/build-rust.sh" ]]; then
   exit 1
 fi
 
+# No gvfs (needs a GLib/GIO SDK the sysroot lacks) and no io-uring (LeandrOS
+# has no io_uring; compio falls back to its poll driver).
+feat_for() {
+  case "$1" in
+    cosmic-files) echo "--no-default-features --features bzip2,dbus-config,desktop,lzma-rust2,notify,wayland,wgpu" ;;
+    cosmic-edit)  echo "--no-default-features --features dbus-config,wayland,wgpu" ;;
+    *)            echo "" ;;
+  esac
+}
+
 for app in "${APPS[@]}"; do
   if [[ ! -f "$SRC/$app/Cargo.toml" ]]; then
     echo "cosmic-apps: no source at $SRC/$app -- not built (git clone https://github.com/pop-os/$app, tag epoch-1.3.0)" >&2
@@ -43,7 +53,7 @@ for app in "${APPS[@]}"; do
   fi
   [[ -f "$SRC/$app/.cargo/config.toml" ]] || sh "$M6/gen-cargo-config.sh" "$SRC/$app" > /dev/null
   for arch in "${ARCHES[@]}"; do
-    if ! "$M6/build-rust.sh" "$SRC/$app" "$arch" > /dev/null; then
+    if ! "$M6/build-rust.sh" "$SRC/$app" "$arch" $(feat_for "$app") > /dev/null; then
       echo "cosmic-apps: $app build failed for $arch (log: $M6/logs/$app-$arch.log)" >&2
       exit 1
     fi
