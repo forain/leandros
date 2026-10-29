@@ -1502,30 +1502,41 @@ pub fn vmo_acquire_frames_by_id(id: u64, off: usize, len: usize) -> Option<alloc
 }
 
 /// The page fault of a MAP_SHARED tmpfs/memfd mapping whose page a truncate
-/// or hole punch took away (`mm::vmm::VmoPageFn`): the frame of object `id`
-/// holding byte `off`, one `pageref` reference, allocated zeroed if it is a
-/// hole; None past the object's current end (SIGBUS) or if it is gone. So a
-/// file that grows back is seen again by its old mappings, as on Linux.
-/// Called with the address space unlocked.
-pub fn vmo_fault_frame(id: u64, off: u64) -> Option<usize> {
-    if id == 0 { return None; }
+/// or hole punch took away, or that was never touched (`mm::vmm::VmoPageFn`):
+/// the frames of object `id` holding bytes `off ..` into `out` (one page
+/// each, one `pageref` reference each, holes allocated zeroed), all under one
+/// lock round trip. Returns how many consecutive pages were acquired; the
+/// first one failing (past the object's current end: SIGBUS; gone; out of
+/// memory) gives 0, a later one just ends the batch (fault-around is best
+/// effort). So a file that grows back is seen again by its old mappings, as
+/// on Linux. Called with the address space unlocked.
+pub fn vmo_fault_frames(id: u64, off: u64, out: &mut [usize]) -> usize {
+    if id == 0 { return 0; }
     let idx = vmo_id_slot(id);
-    let p = (off / 4096) as usize;
+    let p0 = (off / 4096) as usize;
+    fn fill(vmo: &mut TmpVmo, p0: usize, off: u64, out: &mut [usize]) -> usize {
+        let end = ((vmo.len as u64) + 4095) & !4095;
+        let mut n = 0;
+        while n < out.len() {
+            if off + (n as u64) * 4096 >= end { break; }
+            match vmo.ensure_page(p0 + n, true) {
+                Ok(phys) => { mm::pageref::inc(phys); out[n] = phys; n += 1; }
+                Err(_) => break,
+            }
+        }
+        n
+    }
     {
         let mut vmos = TMP_VMOS.lock();
         if let Some(vmo) = vmos.get_mut(idx).and_then(|v| v.as_mut()).filter(|v| v.id == id) {
-            if off >= ((vmo.len as u64) + 4095) & !4095 { return None; }
-            let phys = vmo.ensure_page(p, true).ok()?;
-            mm::pageref::inc(phys);
-            return Some(phys);
+            return fill(vmo, p0, off, out);
         }
     }
     let mut z = TMP_ZOMBIES.lock();
-    let vmo = z.iter_mut().find(|v| v.id == id)?;
-    if off >= ((vmo.len as u64) + 4095) & !4095 { return None; }
-    let phys = vmo.ensure_page(p, true).ok()?;
-    mm::pageref::inc(phys);
-    Some(phys)
+    match z.iter_mut().find(|v| v.id == id) {
+        Some(vmo) => fill(vmo, p0, off, out),
+        None => 0,
+    }
 }
 
 /// `/proc/<pid>/maps` name of the VMO `id` into `out` (its tmpfs path; a
