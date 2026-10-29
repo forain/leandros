@@ -32,23 +32,21 @@ SECTIONS {
     .rodata : AT(ADDR(.rodata) - KERNEL_VIRT) {
         __rodata_start = .;
         *(.rodata*)
+        /* No PHDRS here: a standalone SHT_NOTE section gets its own PT_LOAD
+         * in lld, so the build-id note and the (empty) ksymtab live inside
+         * .rodata. The symbols still delimit them. */
+        . = ALIGN(8);
+        __build_id_start = .;
+        KEEP(*(.note.gnu.build-id))
+        __build_id_end = .;
+        . = ALIGN(8);
+        __ksymtab_start = .;
+        KEEP(*(.ksymtab))
+        __ksymtab_end = .;
         . = ALIGN(4096);
         __rodata_end = .;
     }
 
-    . = ALIGN(8);
-    .note.gnu.build-id : AT(ADDR(.note.gnu.build-id) - KERNEL_VIRT) {
-        __build_id_start = .;
-        KEEP(*(.note.gnu.build-id))
-        __build_id_end = .;
-    }
-
-    . = ALIGN(8);
-    .ksymtab : AT(ADDR(.ksymtab) - KERNEL_VIRT) {
-        __ksymtab_start = .;
-        KEEP(*(.ksymtab))
-        __ksymtab_end = .;
-    }
 
     .data : AT(ADDR(.data) - KERNEL_VIRT) {
         __data_start = .;

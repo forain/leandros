@@ -910,3 +910,16 @@ pub unsafe extern "C" fn arch_map_page(
 pub unsafe extern "C" fn arch_unmap_page(page_table_root: usize, virt: usize) {
     unmap_4k(page_table_root, virt);
 }
+
+/// Raw leaf PTE for `va` (0 if any level is absent; huge pages returned as is).
+#[no_mangle]
+pub unsafe extern "C" fn arch_leaf_pte(root: usize, va: usize) -> u64 {
+    let mut t = mm::phys_to_virt(root) as *const u64;
+    for (lvl, sh) in [39usize, 30, 21, 12].into_iter().enumerate() {
+        let e = t.add((va >> sh) & 0x1FF).read();
+        if e & 1 == 0 { return 0; }
+        if lvl == 3 || (lvl > 0 && e & (1 << 7) != 0) { return e; }
+        t = mm::phys_to_virt((e & PHYS_ADDR_MASK) as usize) as *const u64;
+    }
+    0
+}

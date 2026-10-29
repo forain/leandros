@@ -84,6 +84,38 @@ fn ram_like(k: MemoryType) -> bool {
     matches!(k, MemoryType::Available | MemoryType::AcpiReclaimable | MemoryType::AcpiNvs)
 }
 
+/// Give PML4[511] a private PDPT and a private copy of the PD behind PDPT[510],
+/// with the module-window entries cleared, so that `mm::kmodwin` can place
+/// 4 KiB mappings in the top 2 GiB without splitting the 2 MiB entries shared
+/// with the identity map and the low HHDM. Must run on the BSP before `extend`
+/// (so its two pool pages are guaranteed), before SMP bring-up and before the
+/// first user PML4. The kernel image (below 256 MiB, asserted by the linker
+/// script) keeps its 2 MiB entries. Returns false (nothing changed) when the
+/// pool cannot supply two pages.
+pub unsafe fn unshare_kernel_slot() -> bool {
+    let first = ((mm::kmodwin::BASE as u64 >> 21) & 511) as usize;
+    let n = mm::kmodwin::SIZE >> 21;
+    if POOL_PAGES - POOL_USED < 2 { return false; }
+    let cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    let pml4 = tab(cr3);
+    let e511 = pml4.add(511).read();
+    if e511 & P == 0 { return false; }
+    let old_pdpt = tab(e511);
+    let e510 = old_pdpt.add(510).read();
+    if e510 & P == 0 || e510 & PS != 0 { return false; }
+    let old_pd = tab(e510);
+    let Some((pdpt, pdpt_phys)) = alloc_table() else { return false };
+    let Some((pd, pd_phys)) = alloc_table() else { return false };
+    for i in 0..512 { pd.add(i).write(old_pd.add(i).read()); }
+    for i in first..first + n { pd.add(i).write(0); }
+    pdpt.add(510).write(pd_phys | P | W);
+    pdpt.add(511).write(old_pdpt.add(511).read());
+    pml4.add(511).write(pdpt_phys | P | W);
+    core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack));
+    true
+}
+
 /// Map `[s, e)` (s >= 2 GiB) into the HHDM. Returns Err(addr) where the pool ran out.
 unsafe fn map_run(pml4: *mut u64, s: u64, e: u64, gb: bool, o: &mut Outcome) -> Result<(), u64> {
     let mut a = s & !(MIB2 - 1);

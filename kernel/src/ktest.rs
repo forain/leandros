@@ -21,7 +21,7 @@ use sched::{irqctx, kthread};
 
 const ALL: [&str; 11] = ["irqctx", "sync", "kthread", "workqueue", "hrtimer", "atomicpool", "kva", "pci", "msi", "firmware", "gpulock"];
 /// Opt-in only (not in `all`): a timing report, not a pass/fail facility test.
-const EXTRA: [&str; 1] = ["memperf"];
+const EXTRA: [&str; 2] = ["memperf", "kmodwin"];
 
 /// UART only (`arch_serial_putc`), never the framebuffer console: a console
 /// print flushes the framebuffer through virtio-gpu, and a test thread
@@ -76,6 +76,7 @@ fn run(names: Vec<&'static str>, fw: Option<String>) {
             "atomicpool" => t_atomicpool(),
             "kva" => t_kva(),
             "memperf" => t_memperf(),
+            "kmodwin" => t_kmodwin(),
             "pci" => t_pci(),
             "msi" => t_msi(),
             "firmware" => t_firmware(fw.as_deref()),
@@ -506,6 +507,49 @@ fn t_atomicpool() -> T {
 }
 
 // ── kva ─────────────────────────────────────────────────────────────────────
+
+fn t_kmodwin() -> T {
+    use mm::kmodwin::{self, Perm};
+    let mut t = T::new("kmodwin");
+    if !crate::kmod::window_ok() { t.check(false, "module window initialised"); return t; }
+    t.check(kmodwin::present_pages() == 0, "window empty at start");
+    let base = kmodwin::BASE + kmodwin::TEST_SLOT_OFF;
+    t.check(kmodwin::reserve(base, kmodwin::SLOT_ALIGN), "reserve test slot");
+    t.check(!kmodwin::reserve(base, kmodwin::SLOT_ALIGN), "double reserve refused");
+    t.check(!kmodwin::reserve(base + 1, 4096), "unaligned reserve refused");
+    let (rw, rx) = (mm::buddy::alloc(0).unwrap(), mm::buddy::alloc(0).unwrap());
+    let (va_rw, va_rx) = (base, base + 4096);
+    let root = mm::paging::get_kernel_root();
+    unsafe {
+        t.check(kmodwin::map(va_rw, rw, Perm::RW), "map RW");
+        (va_rw as *mut u64).write_volatile(0xC0DE_F00D_1234_5678);
+        let hh = mm::phys_to_virt(rw) as *const u64;
+        t.check(hh.read_volatile() == 0xC0DE_F00D_1234_5678, "write through window visible via HHDM");
+        (mm::phys_to_virt(rw) as *mut u64).add(1).write_volatile(0x55AA);
+        t.check((va_rw as *const u64).add(1).read_volatile() == 0x55AA, "HHDM write visible through window");
+        t.check(!kmodwin::map(va_rw, rw, Perm::RW), "double map refused");
+        t.check(kmodwin::map(va_rx, rx, Perm::RX), "map RX");
+    }
+    let p = mm::paging::leaf_pte(root, va_rx);
+    #[cfg(target_arch = "x86_64")]
+    t.check(p & 1 != 0 && p & 2 == 0 && p & 4 == 0 && p >> 63 == 0, "RX PTE: present, no W, no U, NX clear");
+    #[cfg(target_arch = "aarch64")]
+    t.check(p & 1 != 0 && p & (1 << 7) != 0 && p & (1 << 6) == 0 && p & (1 << 54) != 0 && p & (1 << 53) == 0,
+        "RX PTE: valid, read-only, kernel-only, UXN=1, PXN=0");
+    let pw = mm::paging::leaf_pte(root, va_rw);
+    #[cfg(target_arch = "x86_64")]
+    t.check(pw & 2 != 0 && pw >> 63 == 1, "RW PTE: W set, NX set");
+    #[cfg(target_arch = "aarch64")]
+    t.check(pw & (1 << 7) == 0 && pw & (1 << 53) != 0 && pw & (1 << 54) != 0, "RW PTE: writable, PXN+UXN");
+    t.check(kmodwin::present_pages() == 2, "present_pages counts both");
+    unsafe { kmodwin::unmap(va_rw, 2); }
+    t.check(kmodwin::present_pages() == 0, "present_pages back to 0 after unmap");
+    kmodwin::release(base, kmodwin::SLOT_ALIGN);
+    t.check(kmodwin::reserve(base, kmodwin::SLOT_ALIGN), "slot reusable after release");
+    kmodwin::release(base, kmodwin::SLOT_ALIGN);
+    mm::buddy::free(rw, 0); mm::buddy::free(rx, 0);
+    t
+}
 
 fn t_kva() -> T {
     use mm::kva::{self, CacheMode};
