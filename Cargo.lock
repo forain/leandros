@@ -307,6 +307,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-uvc"
+version = "0.1.0"
+dependencies = [
+ "kmod-abi",
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
+]
+
+[[package]]
 name = "kmod-virtio-rng"
 version = "0.1.0"
 dependencies = [

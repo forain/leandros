@@ -10,3 +10,7 @@ mm      = { path = "../../mm" }
 kmod-abi = { path = "../../lib/kmod-abi" }
 bitflags.workspace = true
 spin.workspace = true
+
+[features]
+# CONFIG_USB_VIDEO_CLASS=m: the uvc class driver is left out of the kernel (modules/uvc is built instead).
+uvc-module = []

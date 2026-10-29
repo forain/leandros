@@ -44,6 +44,14 @@ config USB
 	bool "USB support"
 	default y
 
+config USB_VIDEO_CLASS
+	tristate "USB Video Class webcams (uvc)"
+	depends on USB
+	default y
+	help
+	  The UVC class driver and its /dev/video0 camera. =m builds modules/uvc, loaded by the
+	  `usb 0e 02` alias when the enumerator meets a video-streaming interface.
+
 config NET
 	def_bool y
 

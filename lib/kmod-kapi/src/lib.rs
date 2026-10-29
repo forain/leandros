@@ -441,6 +441,9 @@ pub mod v4l2 {
     pub fn register(ops: &'static KCameraOps, ctx: usize) -> Result<(), i32> {
         match unsafe { sys::kapi_v4l2_register(owner(), ops, ctx) } { 0 => Ok(()), e => Err(e) }
     }
+
+    /// Remove the camera registered with `ctx` (the device went away).
+    pub fn unregister(ctx: usize) { unsafe { sys::kapi_v4l2_unregister(ctx) } }
 }
 
 pub mod tick {
@@ -455,14 +458,62 @@ pub mod tick {
 
 pub mod usb {
     use super::*;
-    pub use kmod_abi::{KUsbIf, KUsbProbeFn, KmodDevId, BUS_USB};
+    pub use kmod_abi::{KUsbDetachFn, KUsbIf, KUsbProbeFn, KUsbSetup, KmodDevId, BUS_USB};
 
     /// Register a USB class driver. The kernel replays interfaces that were enumerated earlier and
-    /// left unclaimed. `probe` returns 0 to claim the interface. Err = kernel errno.
-    pub fn class_register(ids: &'static [KmodDevId], probe: KUsbProbeFn, ctx: usize) -> Result<(), i32> {
-        match unsafe { sys::kapi_usb_class_register(owner(), ids.as_ptr(), ids.len(), probe, ctx) } {
+    /// left unclaimed. `probe` returns 0 to claim the interface; `detach` runs when a claimed
+    /// device leaves the bus. Err = kernel errno.
+    pub fn class_register(ids: &'static [KmodDevId], probe: KUsbProbeFn, detach: Option<KUsbDetachFn>,
+                          ctx: usize) -> Result<(), i32> {
+        match unsafe { sys::kapi_usb_class_register(owner(), ids.as_ptr(), ids.len(), probe, detach, ctx) } {
             0 => Ok(()),
             e => Err(e),
         }
     }
+
+    fn rc(r: i32) -> Result<usize, i32> { if r < 0 { Err(r) } else { Ok(r as usize) } }
+
+    /// Control transfer on a claimed function; `buf` must hold `setup.length` bytes. Ok = bytes
+    /// transferred (IN) or 0. Err = -errno. Task context.
+    pub fn ctrl(handle: u64, setup: &KUsbSetup, buf: &mut [u8], timeout_ms: u32) -> Result<usize, i32> {
+        rc(unsafe { sys::kapi_usb_ctrl(handle, setup, buf.as_mut_ptr(), buf.len(), timeout_ms) })
+    }
+
+    /// SET_INTERFACE. Task context.
+    pub fn set_alt(handle: u64, iface: u8, alt: u8) -> Result<(), i32> {
+        rc(unsafe { sys::kapi_usb_set_alt(handle, iface, alt) }).map(|_| ())
+    }
+
+    /// The function's full configuration descriptor.
+    pub fn config_descriptor(handle: u64) -> Result<alloc::vec::Vec<u8>, i32> {
+        let n = rc(unsafe { sys::kapi_usb_cfg(handle, core::ptr::null_mut(), 0) })?;
+        let mut v = alloc::vec![0u8; n];
+        rc(unsafe { sys::kapi_usb_cfg(handle, v.as_mut_ptr(), n) })?;
+        Ok(v)
+    }
+
+    /// What `isoch_submit` found.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Poll { Ok, Busy, Gone }
+
+    /// Open an isochronous endpoint (see `kapi_usb_isoch_open`). Ok = pipe handle. Task context.
+    pub fn isoch_open(handle: u64, iface: u8, alt: u8, ep_addr: u8, fifo_bytes: usize, ntds: usize,
+                      framed: bool) -> Result<u64, i32> {
+        let r = unsafe { sys::kapi_usb_isoch_open(handle, iface, alt, ep_addr, fifo_bytes, ntds, framed) };
+        if r < 0 { Err(r as i32) } else { Ok(r as u64) }
+    }
+
+    /// Retire completed transfers, keep the ring full. Interrupt-safe, never blocks.
+    pub fn isoch_submit(pipe: u64) -> Poll {
+        match unsafe { sys::kapi_usb_isoch_submit(pipe) } { 0 => Poll::Ok, 2 => Poll::Gone, _ => Poll::Busy }
+    }
+
+    /// Oldest framed packet: Some(length; may exceed `buf.len()`), None when none is queued.
+    pub fn isoch_reap(pipe: u64, buf: &mut [u8]) -> Option<usize> {
+        let r = unsafe { sys::kapi_usb_isoch_reap(pipe, buf.as_mut_ptr(), buf.len()) };
+        if r < 0 { None } else { Some(r as usize) }
+    }
+
+    /// Stop and free the pipe. Task context.
+    pub fn isoch_close(pipe: u64) { unsafe { sys::kapi_usb_isoch_close(pipe) } }
 }

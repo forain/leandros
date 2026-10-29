@@ -60,13 +60,17 @@ pub struct Driver {
 }
 
 /// Built-in drivers: video streaming interfaces (class 0x0E, subclass 0x02) go to uvc.
+#[cfg(not(feature = "uvc-module"))]
 static BUILTIN: [Driver; 1] = [Driver {
     owner: KmodId(0),
     ids: &[IdEntry { vid: 0xffff, pid: 0xffff, class: 0x0E_02_00, mask: 0xFF_FF_00 }],
     probe: crate::uvc::class_probe,
-    detach: Some(crate::uvc::class_detach),
+    detach: Some(crate::uvcenv::class_detach),
     ctx: 0,
 }];
+/// CONFIG_USB_VIDEO_CLASS=m or n: video interfaces go to the uvc module (or nobody).
+#[cfg(feature = "uvc-module")]
+static BUILTIN: [Driver; 0] = [];
 
 static MODULES: Mutex<Vec<Driver>> = Mutex::new(Vec::new());
 /// Configured functions that matched a driver's ids but were declined by every driver.
@@ -151,6 +155,23 @@ pub fn register(d: Driver) {
             Err((f, _)) => UNCLAIMED.lock().push((m0, f)),
         }
     }
+}
+
+/// Asked once per interface that no class driver wants yet: vid, pid, class, subclass, protocol.
+/// The kernel's module autoloader installs it; a module it loads registers its driver from `init`.
+pub type AutoloadFn = fn(u16, u16, u8, u8, u8);
+static AUTOLOAD: Mutex<Option<AutoloadFn>> = Mutex::new(None);
+
+pub fn set_autoload(f: AutoloadFn) { *AUTOLOAD.lock() = Some(f); }
+
+/// Like [`wants`], but when nobody wants the device yet the autoload hook gets to load a driver
+/// module for each interface first (alias match at enumerate). Task context, no class locks held.
+pub fn wants_or_load(cfg: &[u8], vid: u16, pid: u16) -> Option<u8> {
+    if let Some(c) = wants(cfg, vid, pid) { return Some(c); }
+    let hook = *AUTOLOAD.lock();
+    let f = hook?;
+    for x in walk(cfg).filter(|x| x.len() >= 9 && x[1] == 4) { f(vid, pid, x[5], x[6], x[7]); }
+    wants(cfg, vid, pid)
 }
 
 /// Functions kept for late drivers (for tests and diagnostics).

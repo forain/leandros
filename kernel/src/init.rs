@@ -228,8 +228,12 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── USB ───────────────────────────────────────────────────────────────────
     usb::xhci::isoch::set_cmdline(crate::boot_cmdline().unwrap_or(""));
-    usb::uvc::set_cmdline(crate::boot_cmdline().unwrap_or(""));
-    usb::uvc::register_fake();
+    #[cfg(not(feature = "mod-usb-video-class"))]
+    {
+        usb::uvc::set_cmdline(crate::boot_cmdline().unwrap_or(""));
+        usb::uvc::register_fake();
+    }
+    usb::class::set_autoload(crate::kmod::autoload::usb_hook);
     drivers::usb_hcd::init();
     // USB Bluetooth (btusb + Intel firmware): a kthread that registers
     // /dev/hci0 once the controller is set up ([btusb] lines).

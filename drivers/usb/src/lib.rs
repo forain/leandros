@@ -33,7 +33,11 @@ pub mod hubproto;
 pub mod msc;
 pub mod transfer;
 pub mod xhci;
+#[cfg(not(feature = "uvc-module"))]
 pub mod uvc;
+#[cfg(not(feature = "uvc-module"))]
+pub mod uvcenv;
+pub mod isocdesc;
 pub mod class;
 
 pub use descriptor::*;
