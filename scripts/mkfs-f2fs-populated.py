@@ -96,6 +96,31 @@ def _greetd_src_hash():
     return h.hexdigest()
 
 
+def _greetd_stage_dir(arch):
+    """Directory holding the greetd built from THIS checkout's pam-leandros
+    sources: greetd-lane/<arch>/<srchash>/. Never the shared latest-build copy
+    (another lane may have built different sources there). Missing -> run
+    ports/greetd/build.sh for this arch (cached per hash). Returns None when
+    the cache is absent and GREETD_NO_AUTOBUILD is set (image ships no greetd,
+    as before when nothing was staged)."""
+    import subprocess
+    d = os.path.expanduser(
+        f"~/code/leandros-artifacts/greetd-lane/{arch}/{_greetd_src_hash()}")
+    if os.path.exists(os.path.join(d, "greetd")):
+        return d
+    if os.environ.get("GREETD_NO_AUTOBUILD"):
+        return None
+    build = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "..", "ports", "greetd", "build.sh")
+    print(f"greetd for {arch} ({_greetd_src_hash()[:12]}) not staged; "
+          f"running ports/greetd/build.sh", file=sys.stderr)
+    r = subprocess.run(["bash", build], env=dict(os.environ, ARCHES=arch))
+    if r.returncode != 0 or not os.path.exists(os.path.join(d, "greetd")):
+        sys.exit(f"error: ports/greetd/build.sh failed for {arch}; "
+                 f"expected {d}/greetd")
+    return d
+
+
 def _check_greetd_fresh(path):
     """Refuse a greetd whose embedded PAM shim predates sha512-crypt shadow.
 
@@ -1689,9 +1714,9 @@ def main():
     # it is packed straight into /bin like any other static binary. Its config,
     # its PAM service marker and the /etc/profile that carries the session
     # environment ride the /etc directory registration further down.
-    greetd_bin = os.path.expanduser(
-        f"~/code/leandros-artifacts/greetd-lane/{arch}/greetd")
-    if os.path.exists(greetd_bin):
+    greetd_dir = _greetd_stage_dir(arch)
+    greetd_bin = os.path.join(greetd_dir, "greetd") if greetd_dir else None
+    if greetd_bin and os.path.exists(greetd_bin):
         _check_greetd_fresh(greetd_bin)
         bin_files.append(("greetd", greetd_bin, 0o100755))
 
@@ -1702,9 +1727,8 @@ def main():
     # without starting anything. It is how the greeter half (render environment,
     # DRM, socket, the DBUS_SYSTEM_BUS_ADDRESS trap) gets proven with none of
     # the daemon's risk surface in frame.
-    fakegreet_bin = os.path.expanduser(
-        f"~/code/leandros-artifacts/greetd-lane/{arch}/fakegreet")
-    if os.path.exists(fakegreet_bin):
+    fakegreet_bin = os.path.join(greetd_dir, "fakegreet") if greetd_dir else None
+    if fakegreet_bin and os.path.exists(fakegreet_bin):
         bin_files.append(("fakegreet", fakegreet_bin, 0o100755))
 
     # The two greeter launchers and the environment they share, POSIX-sh
