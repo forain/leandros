@@ -161,6 +161,17 @@ fn register(kind: Kind, prefix: &str, ops: &'static NetifOps, dev: u8) -> Option
     Some(n as u8)
 }
 
+static LATE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+/// `register` for a driver that probes after boot (a loadable module): serialised,
+/// and the net daemon is kicked so its next pass builds the stack for the new netif.
+/// Readers need no lock: entries below `COUNT` never change.
+pub fn register_late(kind: Kind, prefix: &str, ops: &'static NetifOps, dev: u8) -> Option<u8> {
+    let id = { let _g = LATE_LOCK.lock(); register(kind, prefix, ops, dev) };
+    if id.is_some() { kick(); }
+    id
+}
+
 /// How many netifs are registered.
 pub fn count() -> usize { COUNT.load(Ordering::Acquire) }
 

@@ -264,7 +264,7 @@ fn quiesce_phase1(cfg: &RebootCfg, what: &str) -> alloc::vec::Vec<drivers::pci::
     let (audio, f) = pipewire_server::shutdown(cfg.hda_crst);
     plog(&alloc::format!("audio: {}", audio));
     if let Some(f) = f { bm.push(f); }
-    if let Some(s) = drivers::e1000e::shutdown() { plog(&s); }
+    if let Some(s) = crate::kmod::exports::pm_shutdown().or_else(drivers::e1000e::shutdown) { plog(&s); }
     // Pi 5 Wi-Fi: leave the AP, WLC_DOWN, chip off with WL_REG_ON held low
     // across a kexec (the CYW43455 otherwise keeps running into the next kernel).
     #[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "drv-brcmf"))]
