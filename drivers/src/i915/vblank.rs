@@ -67,6 +67,11 @@ const DE_PORT_IIR: u32 = 0x44448;
 const DE_MISC_IIR: u32 = 0x44468;
 const PCU_IIR: u32 = 0x444E8;
 const SDEIIR: u32 = 0xC4008;
+const SDEIMR: u32 = 0xC4004;
+const SDEIER: u32 = 0xC400C;
+const PCH_PORT_HOTPLUG: u32 = 0xC4030;
+/// SDE hotplug bits for DDI B/C/D (SPT): 21, 22, 23.
+const SDE_HPD_BITS: u32 = 7 << 21;
 /// GEN8_PIPE_VBLANK, GEN9_PIPE_PLANE1_FLIP_DONE, GEN8_PIPE_FIFO_UNDERRUN.
 const PIPE_VBLANK: u32 = 1 << 0;
 const PIPE_PLANE1_FLIP_DONE: u32 = 1 << 3;
@@ -464,6 +469,7 @@ extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
         }
     }
     let mut ours = false;
+    let mut hpd_seen = false;
     if master & MASTER_DE_PIPE_A != 0 {
         let iir = m.r(DE_PIPE_IIR);
         if iir != 0 {
@@ -478,12 +484,22 @@ extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
         if master & bit != 0 {
             let v = m.r(iir);
             if v != 0 { m.w(iir, v); }
+            if iir == SDEIIR && v & SDE_HPD_BITS != 0 {
+                // Latch the per-port pulse status (write-1-to-clear), hand it to
+                // the i915-hpd thread. No locks here.
+                let st = m.r(PCH_PORT_HOTPLUG);
+                m.w(PCH_PORT_HOTPLUG, st);
+                super::outputs::hpd_irq(st);
+                hpd_seen = true;
+            }
         }
     }
     if ours {
         IRQ_VBL.fetch_add(1, Ordering::Relaxed);
         IRQ_IDLE_STREAK.store(0, Ordering::Relaxed);
         let _ = check(true);
+    } else if hpd_seen {
+        IRQ_IDLE_STREAK.store(0, Ordering::Relaxed);
     } else if IRQ_IDLE_STREAK.fetch_add(1, Ordering::Relaxed) > 100_000 {
         // An interrupt source we do not handle keeps firing: leave the
         // master off (the backstop polls) rather than storm.
@@ -494,6 +510,16 @@ extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
     if KEXEC_OFF.load(Ordering::Acquire) { return crate::irq::IrqReturn::Handled; }
     m.w(MASTER_IRQ, MASTER_IRQ_CONTROL);
     crate::irq::IrqReturn::Handled
+}
+
+/// Unmask the PCH hotplug interrupt (DDI B/C/D) once the display MSI is live.
+/// Returns the readback `(SDEIMR, SDEIER)`, or None when the IRQ path is off.
+pub(super) fn hpd_irq_enable(m: &super::Mmio) -> Option<(u32, u32)> {
+    if !IRQ_ON.load(Ordering::Acquire) || KEXEC_OFF.load(Ordering::Acquire) { return None; }
+    m.w(SDEIIR, SDE_HPD_BITS);
+    m.w(SDEIMR, m.r(SDEIMR) & !SDE_HPD_BITS);
+    m.w(SDEIER, m.r(SDEIER) | SDE_HPD_BITS);
+    Some((m.r(SDEIMR), m.r(SDEIER)))
 }
 
 /// Set by [`kexec_irq_off`]: the ISR must not turn the master back on.
@@ -526,6 +552,9 @@ pub(super) fn kexec_irq_off() -> Option<alloc::string::String> {
         m.w(DE_PIPE_IIR + o, !0);
         pipes += 1;
     }
+    m.w(SDEIMR, !0);
+    m.w(SDEIER, 0);
+    m.w(SDEIIR, !0);
     // DE port (IMR/IIR/IER 0x44444/8/C) and DE misc (0x44464/8/C).
     for iir in [DE_PORT_IIR, DE_MISC_IIR] {
         m.w(iir - 4, !0);

@@ -824,7 +824,9 @@ const char *udev_device_get_property_value(struct udev_device *d, const char *ke
 		return NULL;
 	}
 	const char *val = NULL;
-	for (size_t i = 0; i < d->desc->nprops; i++)
+	if (strcmp(key, "HOTPLUG") == 0 && strcmp(d->action, "change") == 0 && strcmp(d->desc->subsystem, "drm") == 0)
+		val = "1";
+	for (size_t i = 0; !val && i < d->desc->nprops; i++)
 		if (strcmp(d->desc->props[i].key, key) == 0) {
 			val = d->desc->props[i].val;
 			break;
@@ -1168,7 +1170,7 @@ int udev_monitor_enable_receiving(struct udev_monitor *m) {
 		trc("mon_enable mon=(nil) rc=%d", -EINVAL);
 		return -EINVAL;
 	}
-	if (!m->enabled && monitor_wants(m, "input")) {
+	if (!m->enabled && (monitor_wants(m, "input") || monitor_wants(m, "drm"))) {
 		int hp = open(HOTPLUG_NODE, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 		if (hp >= 0) {
 			/* The coldplug records describe devices that exist already —
@@ -1217,6 +1219,20 @@ struct udev_device *udev_monitor_receive_device(struct udev_monitor *m) {
 		if (r <= 0) break;
 		line[r] = 0;
 		char act[8], kind[8]; int n; unsigned b, v, p;
+		{	/* DRM uevent from the kernel (display hotplug): "change cardN drm 0 0 0" */
+			char dact[8]; int card;
+			if (sscanf(line, "%7s card%d drm", dact, &card) == 2) {
+				if (!monitor_wants(m, "drm")) continue;
+				struct dyn_desc *own = NULL;
+				const struct dev_desc *cd = desc_by_syspath("/sys/class/drm/card0", &own);
+				struct udev_device *d = device_wrap(m->udev, cd, own);
+				if (!d) continue;
+				snprintf(d->action, sizeof d->action, "%s", dact);
+				trc("mon_recv mon=%p action=%s syspath=%s -> %p", (void *)m, d->action, cd->syspath, (void *)d);
+				return d;
+			}
+		}
+		if (!monitor_wants(m, "input")) continue;
 		if (!parse_record(line, act, &n, kind, &b, &v, &p)) continue;
 		int add = strcmp(act, "add") == 0;
 		struct input_info in;

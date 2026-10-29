@@ -2033,6 +2033,43 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         return if ok { 0 } else { 1 };
     }
 
+    if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--hotplug") {
+        // `--hotplug [--fake]`: wait up to 60 s for a DRM `change` record on
+        // /dev/input/hotplug, then list the connectors. `--fake` fires it with the
+        // root test ioctl 0x100B (DRM_DEBUG_FAKE_HPD) so no monitor is needed.
+        let fake = argc > 2 && arg_is(*argv.add(2) as *const u8, b"--fake");
+        const O_NONBLOCK: c_int = 0o4000;
+        let hp = open(b"/dev/input/hotplug\0".as_ptr(), O_RDONLY | O_NONBLOCK);
+        let fd = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let mut ok = hp >= 0 && fd >= 0;
+        let mut buf = [0u8; 96];
+        if ok {
+            // Drain the input coldplug records so only later events count.
+            while read(hp, buf.as_mut_ptr() as *mut c_void, buf.len()) > 0 {}
+            if fake { ok = ioctl(fd, 0x100B as c_ulong, 0usize) == 0; if !ok { puts(b"drmsmoke: fake HPD ioctl 0x100B failed\0".as_ptr()); } }
+        } else {
+            if hp < 0 { puts(b"drmsmoke: cannot open /dev/input/hotplug\0".as_ptr()); }
+            if fd < 0 { puts(b"drmsmoke: cannot open /dev/dri/card0\0".as_ptr()); }
+        }
+        let mut got = false;
+        let mut waited = 0;
+        while ok && !got && waited < 60_000 {
+            let mut p = pollfd { fd: hp, events: POLLIN, revents: 0 };
+            poll(&mut p, 1, 1000);
+            waited += 1000;
+            loop {
+                let r = read(hp, buf.as_mut_ptr() as *mut c_void, buf.len() - 1);
+                if r <= 0 { break; }
+                if r >= 18 && &buf[..11] == b"change card" && &buf[12..16] == b" drm" { got = true; }
+            }
+        }
+        report(b"HOTPLUG_DRM_RECORD", ok && got);
+        let listed = got && enum_connectors(fd, true);
+        report(b"CONNECTOR_ENUM", listed);
+        puts(b"--- drmsmoke done ---\0".as_ptr());
+        return if got && listed { 0 } else { 1 };
+    }
+
     if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--leak") {
         let mut iters = 20u32;
         if argc > 2 {
