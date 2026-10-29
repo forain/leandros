@@ -2938,6 +2938,10 @@ impl smoltcp::phy::TxToken for TxToken {
         }
 
         let stats = &iface::STATS[self.netif.id as usize];
+        // A host talking to its own interface address (see `local_delivery`).
+        if transmit_allowed && local_delivery(self.netif.id, &buf) {
+            return result;
+        }
         if transmit_allowed {
             if self.netif.send(&buf) {
                 stats.tx(len);
@@ -2950,6 +2954,46 @@ impl smoltcp::phy::TxToken for TxToken {
         }
         result
     }
+}
+
+/// A frame smoltcp built for one of this host's own addresses never reaches
+/// a wire: the neighbour of our own IP is ourselves. An ARP request for an
+/// address a local interface holds is answered here (the reply is queued for
+/// the sender's stack), and an IPv4 frame addressed to a local interface's
+/// MAC (which that answer makes smoltcp use) is queued for that interface's
+/// stack, as Linux's `local` routing table delivers it. Without the answer
+/// the datagram waited forever for an ARP reply that nobody sends, and
+/// blocked its socket's later sends. True when `buf` was consumed.
+fn local_delivery(from: u8, buf: &[u8]) -> bool {
+    if buf.len() < 14 { return false; }
+    let proto = u16::from_be_bytes([buf[12], buf[13]]);
+    if proto == 0x0806 && buf.len() >= 42 && u16::from_be_bytes([buf[20], buf[21]]) == 1 {
+        let tip = smoltcp::wire::Ipv4Address::from_bytes(&buf[38..42]);
+        let Some(holder) = iface::holder_of(IpAddress::Ipv4(tip)) else { return false };
+        if holder == LO { return false; }
+        let Some(hmac) = drivers::netdev::get((holder - 1) as usize).and_then(|n| n.mac()) else { return false };
+        let mut r = alloc::vec![0u8; 42];
+        r[0..6].copy_from_slice(&buf[6..12]);
+        r[6..12].copy_from_slice(&hmac);
+        r[12..14].copy_from_slice(&[0x08, 0x06]);
+        r[14..20].copy_from_slice(&buf[14..20]);
+        r[20..22].copy_from_slice(&[0, 2]);
+        r[22..28].copy_from_slice(&hmac);
+        r[28..32].copy_from_slice(&tip.0);
+        r[32..38].copy_from_slice(&buf[22..28]);
+        r[38..42].copy_from_slice(&buf[28..32]);
+        inject_frame(from as Sid + 1, r);
+        return true;
+    }
+    if proto == 0x0800 && buf[0] & 1 == 0 {
+        for i in 0..drivers::netdev::count() {
+            if drivers::netdev::get(i).and_then(|n| n.mac()).map_or(false, |m| m[..] == buf[0..6]) {
+                inject_frame(i as Sid + 1, buf.to_vec());
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ── Local copies of multicast and broadcast ──────────────────────────────────
