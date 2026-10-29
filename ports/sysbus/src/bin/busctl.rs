@@ -1,6 +1,6 @@
 //! Minimal `busctl` for LeandrOS: only `busctl [--user|--system] [-q] call DEST PATH IFACE METHOD [SIG ARGS...]`,
-//! the form COSMIC's system_actions uses. SIG may combine s, o, g, i, u, x, t, b, d, y, n, q.
-use zbus::zvariant::{ObjectPath, Signature, StructureBuilder, Value};
+//! the form COSMIC's system_actions uses. SIG may combine s, o, i, u, x, t, b, d, y, n, q.
+use zbus::zvariant::{ObjectPath, StructureBuilder, Value};
 use zbus::Connection;
 
 fn fail(msg: &str) -> ! {
@@ -9,24 +9,23 @@ fn fail(msg: &str) -> ! {
 }
 
 fn parse_arg(c: char, s: &str) -> Result<Value<'static>, String> {
-    let bad = |_| format!("Failed to parse '{s}' as '{c}'");
+    fn bad<E>(c: char, s: &str) -> impl Fn(E) -> String + '_ { move |_| format!("Failed to parse '{s}' as '{c}'") }
     Ok(match c {
         's' => Value::from(s.to_string()),
         'o' => Value::from(ObjectPath::try_from(s.to_string()).map_err(|e| e.to_string())?),
-        'g' => Value::from(Signature::try_from(s.to_string()).map_err(|e| e.to_string())?),
         'b' => Value::from(match s {
             "true" | "1" | "yes" | "on" => true,
             "false" | "0" | "no" | "off" => false,
             _ => return Err(format!("Failed to parse '{s}' as 'b'")),
         }),
-        'y' => Value::from(s.parse::<u8>().map_err(bad)?),
-        'n' => Value::from(s.parse::<i16>().map_err(bad)?),
-        'q' => Value::from(s.parse::<u16>().map_err(bad)?),
-        'i' => Value::from(s.parse::<i32>().map_err(bad)?),
-        'u' => Value::from(s.parse::<u32>().map_err(bad)?),
-        'x' => Value::from(s.parse::<i64>().map_err(bad)?),
-        't' => Value::from(s.parse::<u64>().map_err(bad)?),
-        'd' => Value::from(s.parse::<f64>().map_err(bad)?),
+        'y' => Value::from(s.parse::<u8>().map_err(bad(c, s))?),
+        'n' => Value::from(s.parse::<i16>().map_err(bad(c, s))?),
+        'q' => Value::from(s.parse::<u16>().map_err(bad(c, s))?),
+        'i' => Value::from(s.parse::<i32>().map_err(bad(c, s))?),
+        'u' => Value::from(s.parse::<u32>().map_err(bad(c, s))?),
+        'x' => Value::from(s.parse::<i64>().map_err(bad(c, s))?),
+        't' => Value::from(s.parse::<u64>().map_err(bad(c, s))?),
+        'd' => Value::from(s.parse::<f64>().map_err(bad(c, s))?),
         _ => return Err(format!("Unsupported signature character '{c}'")),
     })
 }
