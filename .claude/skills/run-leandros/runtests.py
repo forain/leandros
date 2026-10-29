@@ -103,7 +103,7 @@ SUITES = {
                 # aarch64 only: the x86_64 megadriver has no v3d.
                 "if [ \"$(uname -m)\" = aarch64 ]; then drmsmoke --arm-v3d && MESA_LOADER_DRIVER_OVERRIDE=v3d kmscube -c 30; __k=$?; drmsmoke --disarm-v3d; test $__k = 0; fi",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
-                "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/netlinktest", "/bin/udptest", "/bin/pcachetest",
+                "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/netlinktest", "/bin/udpselftest", "/bin/udptest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
                 # kexec tool: load + unload only (non-destructive).
                 "/bin/sh -c '/bin/kexec -l /boot/kexec --initrd=/boot/kexec-initrd --append=x && /bin/kexec -u'",

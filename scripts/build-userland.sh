@@ -109,6 +109,8 @@ if command -v zig >/dev/null 2>&1; then
     # netlinktest: NETLINK_ROUTE dumps, getifaddrs, if_nameindex, SIOCGIF* (nICEr / Firefox WebRTC ICE gathering).
     echo "[userland] Building netlinktest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/netlinktest" userland/netlinktest/netlinktest.c
+    # udpselftest: UDP to our own interface IP is delivered locally; an unresolved next hop does not block the socket.
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/udpselftest" userland/udpselftest/udpselftest.c
     # udptest: UDP semantics, EPOLLET edges of UDP/ICMP/listeners (checked against a host kernel).
     echo "[userland] Building udptest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/udptest" userland/udptest/udptest.c

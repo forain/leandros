@@ -5,6 +5,7 @@ use core::task::Waker;
 use crate::iface::Context;
 use crate::phy::PacketMeta;
 use crate::socket::PollAt;
+use crate::time::Instant;
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
 use crate::storage::Empty;
@@ -129,6 +130,9 @@ impl core::fmt::Display for RecvError {
 #[cfg(feature = "std")]
 impl std::error::Error for RecvError {}
 
+/// LEANDROS: how long a datagram may wait for its next hop (ms).
+const TX_STALL_MS: u64 = 3000;
+
 /// A User Datagram Protocol socket.
 ///
 /// A UDP socket is bound to a specific endpoint, and owns transmit and receive
@@ -152,6 +156,11 @@ pub struct Socket<'a> {
     /// LEANDROS: a pending socket error (errno, 0 = none) from an ICMP
     /// error about a datagram this connected socket sent (sk_err).
     error: u8,
+    /// LEANDROS: since when the head datagram has failed to dispatch (its
+    /// next hop unresolved). Dropped after `TX_STALL_MS`, so one
+    /// unreachable on-link peer cannot block every later send (Linux drops
+    /// a datagram queued on an unresolved neighbour after ~3 s).
+    tx_stall_since: Option<Instant>,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -170,6 +179,7 @@ impl<'a> Socket<'a> {
             reuseport: false,
             bind_seq: 0,
             error: 0,
+            tx_stall_since: None,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -675,8 +685,23 @@ impl<'a> Socket<'a> {
         });
         match res {
             Err(Empty) => Ok(()),
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                // LEANDROS: see `tx_stall_since`.
+                let now = cx.now();
+                match self.tx_stall_since {
+                    None => self.tx_stall_since = Some(now),
+                    Some(t0) if now - t0 >= crate::time::Duration::from_millis(TX_STALL_MS) => {
+                        let _ = self.tx_buffer.dequeue();
+                        self.tx_stall_since = None;
+                        #[cfg(feature = "async")]
+                        self.tx_waker.wake();
+                    }
+                    Some(_) => {}
+                }
+                Err(e)
+            }
             Ok(Ok(())) => {
+                self.tx_stall_since = None;
                 #[cfg(feature = "async")]
                 self.tx_waker.wake();
                 Ok(())
