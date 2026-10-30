@@ -357,7 +357,7 @@ pub mod blk;
 pub mod input;
 pub mod plat;
 pub use blk::{KBlkDesc, KBlkOps};
-pub use plat::{KDmaQuiesceFn, KPlatDev, KPlatProbeFn, KPlatReg};
+pub use plat::{KDmaQuiesceFn, KHdmiSink, KPlatDev, KPlatProbeFn, KPlatReg};
 
 /// Export-table entry; `name` is NUL-terminated.
 #[repr(C)]

@@ -54,7 +54,7 @@ drv-usb-hid = []
 drv-virtio-snd = ["drivers/virtio-snd"]
 drv-bt = []
 mod-bt = ["usb/bt-module"]
-drv-hdmi-audio = []
+drv-hdmi-audio = ["drivers/hdmi-audio"]
 
 [dependencies]
 mm         = { path = "../mm" }

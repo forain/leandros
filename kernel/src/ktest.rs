@@ -582,7 +582,9 @@ fn kmodplat_checks(t: &mut T) {
     use drivers::platform::{self, PlatDev};
     use kmod_abi::{KmodId, RegKind};
     for n in ["kapi_plat_register", "kapi_plat_unregister", "kapi_dtb_blob", "kapi_board_mac", "kapi_soc_stepping",
-              "kapi_serror_checkpoint", "kapi_vmap", "kapi_vunmap", "kapi_dma_quiesce_register"] {
+              "kapi_serror_checkpoint", "kapi_vmap", "kapi_vunmap", "kapi_dma_quiesce_register",
+              "kapi_dma40_claim", "kapi_dma40_release", "kapi_dma40_start_cyclic", "kapi_dma40_stop", "kapi_dma40_position",
+              "kapi_dma40_periods", "kapi_dma40_poll", "kapi_dma40_polled", "kapi_hdmi_sink_info"] {
         t.check(exports::lookup(n).is_some(), "plat/board export in KSYMTAB");
     }
     // Registration argument checks.
@@ -647,6 +649,24 @@ fn kmodplat_checks(t: &mut T) {
         }
         exports::kapi_page_free(pg, 0);
     }
+    // dma40 handles + HDMI sink facts (kmodpi H1). Off a BCM2712 the channel calls fail cleanly.
+    t.check(exports::kapi_dma40_release(0) < 0 && exports::kapi_dma40_release(99) < 0, "dma40 release bad handle -> errno");
+    t.check(exports::kapi_dma40_stop(0) < 0 && exports::kapi_dma40_position(99) < 0, "dma40 stop/position bad handle -> errno");
+    t.check(exports::kapi_dma40_start_cyclic(0, 0, 0, 0, 0, 0, 1) < 0 && exports::kapi_dma40_poll(0) < 0, "dma40 start_cyclic/poll bad handle -> errno");
+    t.check(exports::kapi_dma40_periods(0) == 0, "dma40 periods bad handle -> 0");
+    let c = exports::kapi_dma40_claim(-1);
+    t.check(c > 0 || c < 0, "dma40 claim returns handle or errno");
+    if c > 0 {
+        t.check(exports::kapi_dma40_release(c as u32) == 0 && exports::kapi_dma40_release(c as u32) < 0, "dma40 claim/release once");
+    } else {
+        t.check(c == -19 || c == -16, "dma40 claim off-board -> -19/-16");
+    }
+    t.check(exports::kapi_hdmi_sink_info(core::ptr::null_mut()) == -22, "hdmi_sink_info null -> -22");
+    let mut hs = kmod_abi::KHdmiSink::default();
+    t.check(exports::kapi_hdmi_sink_info(&mut hs) == -22, "hdmi_sink_info size 0 -> -22");
+    hs.size = core::mem::size_of::<kmod_abi::KHdmiSink>() as u32;
+    t.check(exports::kapi_hdmi_sink_info(&mut hs) == 0 && hs.size == core::mem::size_of::<kmod_abi::KHdmiSink>() as u32
+        && hs.state == drivers::hdmi_audio::sink_info().0, "hdmi_sink_info fills the record");
     // DMA quiesce hook: registered, name collisions refused, removed again on a failed init.
     let qo = KmodId(60021);
     let nm = b"ktest-q";

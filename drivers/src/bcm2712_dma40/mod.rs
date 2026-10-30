@@ -18,6 +18,7 @@
 //! All addresses are CPU physical: the node's `dma-ranges` are the identity.
 
 pub mod cb;
+pub mod handles;
 
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub use hw::*;

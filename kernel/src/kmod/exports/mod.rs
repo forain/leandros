@@ -35,6 +35,7 @@ mod input;
 mod wifi;
 mod drm;
 mod plat;
+mod dma40;
 
 pub use pci::*;
 pub use irq::*;
@@ -46,6 +47,7 @@ pub use input::*;
 pub use wifi::*;
 pub use drm::*;
 pub use plat::*;
+pub use dma40::*;
 pub use v4l2::*;
 pub use usbfn::*;
 pub use hci::*;
@@ -170,6 +172,15 @@ const _: kmod_abi::plat::sys_plat::SerrorCheckpointFn = kapi_serror_checkpoint;
 const _: kmod_abi::plat::sys_plat::VmapFn = kapi_vmap;
 const _: kmod_abi::plat::sys_plat::VunmapFn = kapi_vunmap;
 const _: kmod_abi::plat::sys_plat::DmaQuiesceRegisterFn = kapi_dma_quiesce_register;
+const _: kmod_abi::plat::sys_dma40::Dma40ClaimFn = kapi_dma40_claim;
+const _: kmod_abi::plat::sys_dma40::Dma40ReleaseFn = kapi_dma40_release;
+const _: kmod_abi::plat::sys_dma40::Dma40StartCyclicFn = kapi_dma40_start_cyclic;
+const _: kmod_abi::plat::sys_dma40::Dma40StopFn = kapi_dma40_stop;
+const _: kmod_abi::plat::sys_dma40::Dma40PositionFn = kapi_dma40_position;
+const _: kmod_abi::plat::sys_dma40::Dma40PeriodsFn = kapi_dma40_periods;
+const _: kmod_abi::plat::sys_dma40::Dma40PollFn = kapi_dma40_poll;
+const _: kmod_abi::plat::sys_dma40::Dma40PolledFn = kapi_dma40_polled;
+const _: kmod_abi::plat::sys_dma40::HdmiSinkInfoFn = kapi_hdmi_sink_info;
 const _: () = {
     assert!(mm::kmodwin::BASE as u64 == kmod_abi::layout::BASE);
     assert!(mm::kmodwin::SIZE as u64 == kmod_abi::layout::SIZE);
@@ -177,7 +188,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 132;
+pub const NEXPORTS: usize = 141;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -314,6 +325,15 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_vmap", kapi_vmap),
     sym!("kapi_vunmap", kapi_vunmap),
     sym!("kapi_dma_quiesce_register", kapi_dma_quiesce_register),
+    sym!("kapi_dma40_claim", kapi_dma40_claim),
+    sym!("kapi_dma40_release", kapi_dma40_release),
+    sym!("kapi_dma40_start_cyclic", kapi_dma40_start_cyclic),
+    sym!("kapi_dma40_stop", kapi_dma40_stop),
+    sym!("kapi_dma40_position", kapi_dma40_position),
+    sym!("kapi_dma40_periods", kapi_dma40_periods),
+    sym!("kapi_dma40_poll", kapi_dma40_poll),
+    sym!("kapi_dma40_polled", kapi_dma40_polled),
+    sym!("kapi_hdmi_sink_info", kapi_hdmi_sink_info),
 ];
 
 extern "C" {
