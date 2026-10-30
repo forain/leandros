@@ -610,7 +610,8 @@ controller looked healthy and "CMD8 always times out" was blamed on QEMU's block
 - SDHCI is PIO and single-sector by default; `sdhci.multi=1` is unproven on the Pi (see above).
 - Wi-Fi: WPA3 deferred; one AP rejects with reason 2 every boot; weak-signal BSSes still produce handshake
   timeouts (now back-off, not a blocked profile).
-- The Bluetooth reconnect story (the pad pages back in) is only partly verified; see
+- Bluetooth reconnect: the 8BitDo Lite 2 gamepad auto-reconnected on the good kernel `f51a46029ffb` (2026-10-28,
+  user-confirmed); other pads are unverified; see
   [servers/bluetooth.md](../servers/bluetooth.md).
 - Single block device: the SD card. There is no home partition on it, so the fstab's `LABEL=leandros-home`
   mount of `/home` fails (`nofail`) and `/home` is the root's own.

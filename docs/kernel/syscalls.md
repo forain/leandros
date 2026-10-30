@@ -138,5 +138,6 @@ Every regression suite is, in effect, a syscall conformance test; `uptrtest` dri
 
 - [ipc.md](ipc.md) — the native IPC calls
 - [processes.md](processes.md) — `clone`, `execve`, `wait4`
+- [modules.md](modules.md) — `init_module` / `finit_module` / `delete_module` (module loading; `delete_module` is `EBUSY`)
 - [servers/README.md](../servers/README.md) — where most of the Linux surface is implemented
 - [arch-x86_64.md](arch-x86_64.md), [arch-aarch64.md](arch-aarch64.md) — the entry paths

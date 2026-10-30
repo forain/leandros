@@ -12,7 +12,7 @@ The image builder ([`scripts/mkfs-f2fs-populated.py`](../../scripts/mkfs-f2fs-po
 | `leandro` | 1000:1000 | `/home/leandro` | `/bin/brush` | `leandro` | `wheel` (10), `audio` (29), `video` (44), `input` (104), `netdev` (108) |
 | `cosmic-greeter` | 990:990 | `/home/cosmic-greeter` | `/bin/false` | none (cannot log in) | `video`, `input` |
 
-The image also defines the system groups `netdev` (108, which may drive NetworkManager's network-control actions), `video` (44, which may also write `backlight/*/brightness`, see [vfs.md](vfs.md#synthetic-sys)) and `bluetooth` (112, a Debian-style group: `btd.sock` and `/run/bluetooth/bthid.connect` are `root:bluetooth 0660`, and `leandro` is a member). The groups are what authorise the desktop's Bluetooth applet and brightness keys without making the session root.
+The image also defines the system groups `netdev` (108, gates `O_RDWR` on `/dev/netctl` (`root:netdev 0660`); the session's NetworkManager shim (`ports/sysbus`) opens it with the user's own credentials, so members get read-write network control and everyone else a read-only view), `video` (44, which may also write `backlight/*/brightness`, see [vfs.md](vfs.md#synthetic-sys)) and `bluetooth` (112, a Debian-style group: `btd.sock` and `/run/bluetooth/bthid.connect` are `root:bluetooth 0660`, and `leandro` is a member). The groups are what authorise the desktop's Bluetooth applet and brightness keys without making the session root.
 
 These are development credentials, well known by design. `cosmic-greeter` is a system account below `UID_MIN` so the greeter does not offer it as a login choice, and its `/bin/false` shell excludes it a second, independent way. Group numbers follow Debian's.
 
