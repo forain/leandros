@@ -148,9 +148,11 @@ esac
     case "$so" in libc.*) continue ;; esac
     cp -L "$s" "$D/usr/lib/$so"
   done
-  for so in $(cd "$R/usr/lib" && ls | grep -E '^lib(gst[a-z0-9-]*|glib-2.0|gobject-2.0|gio-2.0|gmodule-2.0|gthread-2.0|orc-0.4|mount|blkid|pcre2-8|uuid)\.so$'); do
+  for so in $(cd "$R/usr/lib" && ls | grep -E '^lib(gst[a-z0-9.-]*|glib-2.0|gobject-2.0|gio-2.0|gmodule-2.0|gthread-2.0|orc-0.4|mount|blkid|pcre2-8|uuid)\.so$'); do
     cp -L "$R/usr/lib/$so" "$D/usr/lib/$so"
   done
+  # libintl: musl-libintl ships only the versioned lib in the runtime package
+  [ -e "$D/usr/lib/libintl.so" ] || { [ -e "$D/usr/lib/libintl.so.8" ] && ln -s libintl.so.8 "$D/usr/lib/libintl.so"; }
   for f in $(find "$D/usr/lib" -maxdepth 1 -type f -name '*.so*'); do
     if readelf -d "$f" 2>/dev/null | grep -q "libc.musl-$ARCH.so.1"; then patchelf --replace-needed "libc.musl-$ARCH.so.1" libc.so "$f"; fi
   done
