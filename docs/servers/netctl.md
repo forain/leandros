@@ -37,7 +37,7 @@ The kernel checks once, at `open(2)`, as Linux does for a device node:
 - **`O_RDONLY`**: anyone. A read-only open can read events, use every `NETCTL_GET_*` ioctl and `NETCTL_REQUEST_SNAPSHOT`.
 - **`O_WRONLY` / `O_RDWR`**: needs euid 0, or gid 108 as the egid or among the supplementary groups. Otherwise open fails with **`EACCES`**. This is the ordinary VFS mode check on the node's `root:netdev 0664` metadata (`dyn_dev_meta`).
 - The device server records at `VFS_OPEN` whether the open is write-capable (access mode ≠ `O_RDONLY`).
-  - A **mutating ioctl** (nr ≥ `0x20`: `SCAN`, `CONNECT`, `DISCONNECT`, `SET_RADIO`, `RELOAD_PROFILES`) on a read-only open answers **`EPERM`**.
+  - A **mutating ioctl** (nr ≥ `0x20`: `SCAN`, `CONNECT`, `DISCONNECT`, `SET_RADIO`, `RELOAD_PROFILES`, `SET_METRIC`) on a read-only open answers **`EPERM`**.
   - This is enforced in the device server itself. It does not rely on the VFS refusing anything.
 - Nothing is re-checked per call. A descriptor passed with `SCM_RIGHTS` or inherited by `fork` keeps the capability of its open. Removing a user from `netdev` takes effect at their next login.
 - There is no broker. The NM shim runs as the session user and opens the node with that user's credentials, so it cannot launder authority. A `netdev` member who bypasses the shim and talks to the node directly is doing exactly what membership allows.
@@ -89,6 +89,7 @@ The kernel checks once, at `open(2)`, as Linux does for a device node:
 | `NETCTL_DISCONNECT` | `_IOW('N',0x22)` | `0x40104E22` | `NcIfReq` | **W** |
 | `NETCTL_SET_RADIO` | `_IOW('N',0x23)` | `0x40104E23` | `NcRadio` | **W** |
 | `NETCTL_RELOAD_PROFILES` | `_IOWR('N',0x24)` | `0xC0104E24` | `NcReload` (out) | **W** |
+| `NETCTL_SET_METRIC` | `_IOW('N',0x25)` | — | `NcMetric` (`ifindex`, `metric`; 0 = default) | **W** |
 | `NETCTL_NETWATCH_DISARM` | `_IO('N',0x30)` | `0x00004E30` | none | **W** — stop the kernel trial watchdog (`netwatch=` knobs) for this boot; `espctl promote` issues it |
 
 ### Queries (`NcQuery`, 32 bytes)
@@ -145,6 +146,12 @@ The kernel checks once, at `open(2)`, as Linux does for a device node:
   - Autoconnect on that interface stays suppressed until the next `CONNECT` or `RELOAD_PROFILES` (NM semantics), unless `KEEP_AUTOCONNECT` is set.
 - **Wired:** admin down. Stop DHCP, drop the address and routes at once (no carrier grace period; TCP on that interface is reset), and clear `ADMIN_UP` (oper `DOWN`). `IFACE_CHANGED` and `IPV4` (state `NONE`) follow within one net-daemon pass. A wired `CONNECT` sets `ADMIN_UP` again and restarts DHCP. Available when `features::WIRED_ADMIN` is set; without it, `DISCONNECT` on wired answers `EOPNOTSUPP`. The admin state is not persisted: every interface boots admin up.
 - Returns 0 even when the interface is already disconnected.
+
+**`SET_METRIC` (`NcMetric`: `ifindex`, `metric`)**
+
+- Sets the interface's route metric (`IfRt.metric`); 0 restores the default. The default is wired 100 (+n), Wi-Fi 600, or the boot knob `net.metric.<ifname>=<n>` (`iface::default_metric`), so `default` restores the knob value. CLI: `netctl metric <if> <n>` and `netctl metric <if> default`.
+- The netctl views are kicked and `IFACE_CHANGED` is emitted. Only new flows follow a changed default route; existing sockets keep their stack. On-link routes still use longest prefix first, so `eth0`'s own subnet stays reachable when the default route moves to `wifi0` (`/proc/net/route` keeps the on-link entry).
+- The NetworkManager shim does not map `ipv4.route-metric` to it yet (open).
 
 **`SET_RADIO` (`NcRadio`: `ifindex` (0 = all Wi-Fi), `on`)**
 
@@ -318,7 +325,7 @@ any state ──SET_RADIO off / rfkill──▶ RADIO_OFF ──on──▶ DISC
 | `ASSOC_REJECTED` | 5 | as above | 120 reason 8 |
 | `TIMEOUT` | 6 | no auth/assoc response or EAPOL message | 120 reason 11 |
 | `FW_ERROR` | 7 | firmware error/restart | 120 reason 1 |
-| `UNSUPPORTED_SECURITY` | 8 | SAE-only before WPA3, TKIP, EAP, … | 120 reason 1 |
+| `UNSUPPORTED_SECURITY` | 8 | SAE-only before WPA3, TKIP pairwise, EAP, … | 120 reason 1 |
 | `DEAUTH_BY_AP` | 9 | `ieee_reason` holds the 802.11 reason | 30 reason 8 |
 | `BEACON_LOSS` | 10 | | 30 reason 8 |
 | `USER` | 11 | `DISCONNECT` | 30 reason 39 |
@@ -330,7 +337,9 @@ Rules a client may rely on:
 
 - Autoconnect runs only while the interface is disconnected: a working connection is never left for autoconnect reasons.
 - Candidate order (NetworkManager's): highest `priority` (0 by default, the legacy profile too), then the most recently connected (this boot first, then the stored `timestamp_s`), then the legacy network, then the signal. After a failed activation — the user's or autoconnect's — autoconnect therefore returns to the network it was on last.
-- A profile that failed with `WRONG_KEY` is skipped by autoconnect (`BLOCKED_WRONG_KEY`) until `RELOAD_PROFILES` or an explicit `CONNECT`.
+- A profile that failed with `WRONG_KEY` is skipped by autoconnect (`BLOCKED_WRONG_KEY`) until `RELOAD_PROFILES` or an explicit `CONNECT`. The block is only set when several distinct access points agree (`wifi.wrongkey_bss=N`, default 2, 1 = block on the first) and the profile never worked, so one AP with a bad handshake does not lock out a good profile.
+- **WPA/WPA2 mixed mode** with a TKIP group key is joinable: pairwise CCMP, group TKIP receive-only (the log says `WPA/WPA2 mixed mode: pairwise CCMP, group TKIP (receive only)`); verified on the laptop against a mixed-mode AP. Group-key and TKIP counters appear in `/proc/net/wifi`. On the Pi 5 the 4-way handshake can also run in the host when the firmware has no supplicant: AKM 6 (PSK-SHA256) and MFP follow the AP's RSN element, with KDF-SHA256, AES-CMAC (descriptor version 3) and the IGTK in `wifi_crypto`.
+- A first join must carry the RSN element in the association info (the Pi's `assoc_info` buffer is 512 bytes, with the late `wpaie` read); without it the AP rejected the handshake.
 - A failure of one access point — auth or association refused, deauthenticated during the handshake, no answer, or a second link it ended within 30 s of connecting (within 2 min) — backs that BSS off: 15 s, 60 s, 120 s, then 300 s (kept across `RELOAD_PROFILES`; cleared when it connects). Other failures back the profile off: 10 s, 30 s, then 60 s.
 - A BSS that is not `JOINABLE` gets one log line with its RSN element (group/pairwise ciphers, AKMs, MFPC/MFPR) and the cause; a `CONNECT` to it fails `UNSUPPORTED_SECURITY` with that cause as the message (TKIP group cipher, PSK-SHA256 or FT-PSK as the only AKM, MFP required, SAE-only, 802.1X, WPA1, WEP). The NM shim does not export non-`JOINABLE` BSSs.
 - One attempt is bounded by `CONNECT_DEADLINE_MS` (15 s) up to CONNECTED. DHCP comes on top of that.
@@ -464,7 +473,8 @@ It is dropped when a stored profile has the same SSID. It cannot be edited throu
 - [`lib/netctl-abi`](../../lib/netctl-abi): types, ioctl numbers, event encoder and `Reassembler`, profile parser and serializer, CRC-32, helpers (NM quality, channel ↔ frequency, UUID text, deterministic UUIDs, secret validation).
   - Run its host tests with `cargo test -p netctl-abi --target aarch64-apple-darwin`, or your host triple.
   - The tests pin every offset and ioctl value, round-trip every event kind including the 32-byte-SSID split, and cover torn and corrupt slots, newest-wins selection, skipped entries and newer-geometry files.
-- [`drivers/src/wifi_api.rs`](../../drivers/src/wifi_api.rs): the backend seam (inert until L2/L3).
+- [`drivers/src/wifi_api.rs`](../../drivers/src/wifi_api.rs): the backend seam.
+- **Wi-Fi radio class** ([`wifi_class.rs`](../../drivers/src/wifi_class.rs), [`wifi_radio.rs`](../../drivers/src/wifi_radio.rs)). A radio driver (iwlwifi, brcmf, the simulator) registers a `KWifiRadioOps` table; the kernel owns the connection manager (`wifi_mgr::Mgr`) for each radio and runs it on its own kthread through the `KRadio` adapter. The state machine, autoconnect, scan cache, profiles and backoff above therefore live once in the kernel and drivers only supply radio operations. `/proc/net/wifi` and the netctl attach walk the class registry, so nothing outside a driver names a particular radio. iwlwifi can be built as a loadable module (`IWLWIFI` is a tristate); with a device present the radio thread pins the module, so unload is only clean without a device.
 
 ## See also
 

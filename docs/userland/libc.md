@@ -169,6 +169,13 @@ deadlocked cosmic-comp — `userland/spawnwedge`), `CLONE_CHILD_CLEARTID` wakes 
 `FUTEX_WAIT_BITSET`'s timespec is an **absolute** deadline (Rust std's `park_timeout` uses
 it), and private futexes are keyed per process, not by address alone.
 
+### Thread exit and fork (October 2026 fixes)
+
+- **Exited threads are freed.** relibc never unmapped an exited thread's 1 MiB pthread stack or its TCB/TLS mapping, so every thread left two VMAs and about 1 MiB of address space behind (`pthreadtest churn 5000`: VMAs 208 to 10208 and VmSize 113 MB to 5.29 GB; after the fix 8 VMAs and 9544 kB, flat). The kernel was innocent. The review follow-up blocks all signals and disables cancellation before a thread exits (as musl's `pthread_exit` does), makes `pthread_detach` of an already-exited thread push it on the zombie list instead of blocking, and has a fork child forget the parent's zombie list.
+- **`fork()` holds relibc's thread-map lock.** `pthread::create` inserts into `OS_TID_TO_PTHREAD` (a futex mutex) after the clone; a fork from another thread at that moment gave the child a locked mutex and its first `pthread_create` hung forever. `fork` now takes the lock around the fork, and `epolltest churn 20 tfork` is in `regress`.
+- **Affinity.** `sched_getcpu`, `sched_setaffinity`/`getaffinity` and `waitid` exist in relibc, and the scheduler honours the mask (placement, wake CPU choice, EEVDF pick, load balance).
+- **`memset` in zig-static musl builds** on aarch64 was a byte loop (musl's C fallback); an assembly version is used. Every other C library in the image already used word or vector `mem*`.
+
 ## Limitations & open work
 
 - relibc's full sysroot (headers, `crt0`, C shims) is not produced by the build; C programs

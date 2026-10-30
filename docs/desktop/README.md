@@ -211,6 +211,7 @@ Summarised here; the full list with causes is [limitations.md](limitations.md).
 - greetd uses no PAM stack and records no utmpx; the greeter's own compositor runs as root.
 - No document portal (no FUSE), no ScreenCast through the portal; some system services
   (timedate1, SwitcherooControl, the a11y bus) are absent.
+- Not everything behind the new applets is real yet: the workspaces applet is not in the default panel config, Lock and Suspend in the power applet do nothing, and cosmic-screenshot's capture path is unverified. Power off and restart now work from the greeter and as a regular user, and the Bluetooth applet runs over the `org.bluez` shim ([../servers/bluetooth.md](../servers/bluetooth.md#c-orgbluez-for-the-desktop-leandros-sysbus-bluez-portssysbussrcbluez)).
 - A use-after-free in iced's SCTK thread can crash `cosmic-term` on exit (upstream; Linux
   has it too).
 

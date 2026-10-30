@@ -210,6 +210,12 @@ Of the five workspace crates, `agreety` is not built (`/bin/login` has that role
 
 init respawns the graphical login, but a login that exits within `DM_STABLE_SECS` (60 s) is a crash, not a session. For the first three such exits init copies the last 3 KiB of `/var/log/greetd.log` to the console before restarting it, whole lines, prefixed `greetd.log| `, with ANSI colour sequences removed (COSMIC's tracing output is coloured; masking only ESC left `[2m…[0m` noise), other control bytes masked, empty lines dropped and lines cut at 200 bytes. The console lands in the stick's log partition, so a PC whose screen or keyboard is dead still says why the greeter or its compositor exited.
 
+### Login diagnostics and the greetd build cache
+
+Lane lapgreet added diagnostics for a first greetd login after boot that sometimes failed on the laptop (not reproduced: 3/3 and then 4/4 boots logged in within 6 s; the cause stays open). `greetd.log` now keeps four boots (`greetd.log`, `.1` to `.3`), rotated when the logger starts, each file capped at 4 MB (past the cap the file restarts instead of renaming, so earlier boots survive) and headed `=== boot (uptime N s) ===`. Trace lines show the IPC sequence (`greetd: ipc <type>`, the command's argv0, `session exited status=.. after N ms`, `greeter exited after start_session`), `pam-leandros: auth user=.. rc=.. in N ms` (never the secret) and `start-cosmic: <uptime> step ...`. The kernel logs `drm: SET_MASTER EBUSY open_id N (holder open_id M)` and `drm: master released open_id N (last close)` (8 lines a boot); a healthy login shows the master released before start-cosmic runs.
+
+greetd is staged by a hash of the `pam-leandros` source: `greetd-lane/<arch>/<srchash>/{greetd,fakegreet,greetd.srchash}`. `ports/greetd/build.sh` skips cargo when that hash directory exists (`FORCE=1` rebuilds), and `scripts/mkfs-f2fs-populated.py` always uses the hash directory of its own checkout, building it when missing (about 20 s warm; `GREETD_NO_AUTOBUILD=1` disables). Two worktrees therefore cannot ship each other's greetd, and the old mtime-based freshness guard (which gave false "stale" errors and let stale binaries through) became the hash check. The greeter has no GPU path on a Pi without one: init skips greetd when the GPU precheck refuses.
+
 ## Limitations & open work
 
 - **cosmic-comp still runs as root in the greeter session.** libseat is a shim with no
@@ -218,8 +224,6 @@ init respawns the graphical login, but a login that exits within `DM_STABLE_SECS
 - **No real PAM, no utmpx.** Whether to extend the shim or port Linux-PAM (which `dlopen`s
   its modules) is undecided. Nothing that is shipped reads utmpx — upstream greetd has no
   utmpx code at all — so that item waits on a consumer.
-- **The greeter's power buttons do nothing.** cosmic-greeter has no `login1` in its phase
-  (the system bus is deliberately unset there, see [session.md](session.md#the-system-bus-is-the-session-bus)).
 - **Landmines recorded in the port** ([ports/greetd/README.md](../../ports/greetd/README.md#landmines)):
   greetd's parent-to-worker channel is a `UnixDatagram` socketpair (a message up to
   212960 bytes goes through, a larger one is `EMSGSIZE`, as on Linux); `prctl(PR_SET_PDEATHSIG)` is accepted and does nothing; cosmic-comp's
