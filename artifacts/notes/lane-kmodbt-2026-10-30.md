@@ -23,3 +23,6 @@ Status: DELIVERED (BT tristate; shipped configs keep BT=y).
 
 ## Evidence
 See the end of this file (filled after the gates ran).
+- aarch64 default regress on the box (6fb4a7a1): overall PASS, 0 boots failed; selftest.sh aarch64 0 FAIL;
+  ktest=kmodkapi both arches 0 FAIL (109 exports); autoloadtest bt PASS (aarch64); x86_64 default and BT=m builds ok
+  (bt module in initrd); `--rpi5` aarch64 build ok. main had not moved (no merge conflicts with kmoddrm yet).
