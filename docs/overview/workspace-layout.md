@@ -31,14 +31,18 @@ The root [`Cargo.toml`](../../Cargo.toml) lists these members. The release profi
 | [`servers/libc-shim`](../../servers/libc-shim) | In-kernel glue backing the userspace libc | [libc](../userland/libc.md) |
 | [`lib`](../../lib) | `align_up`/`align_down` and other utilities shared across crates | — |
 
+Loadable-module support adds `lib/` crates, listed in the root workspace: [`lib/kmod-abi`](../../lib/kmod-abi) (the module/kernel ABI types), [`lib/kmod-elf`](../../lib/kmod-elf) (the module ELF loader and relocator), [`lib/kmod-kapi`](../../lib/kmod-kapi) (the kernel API shim modules link against) and [`lib/kmod-rt`](../../lib/kmod-rt) (the module runtime). [`lib/bt-host`](../../lib/bt-host) is the host-side Bluetooth stack shared by `userland/btd` and `userland/bthid`, and [`lib/netctl-abi`](../../lib/netctl-abi) the `/dev/netctl` ABI. Each driver built as a module is a crate under [`modules/`](../../modules) (`virtio-blk`, `nvme`, `virtio-net`, `e1000e`, `iwlwifi`, `usb-hid`, `usb-storage`, `uvc`, `bt`, `hda`, `virtio-snd`, `virtio-rng`, `virtio-keyboard`, `hello`). Many drivers also have a sibling `*-tests` host crate (for example `drivers/bt-tests`, `drivers/v3d-tests`, `drivers/brcmf-tests`) that runs their logic on the build host. See [kernel modules](../kernel/modules.md).
+
 [`drivers/nvidia`](../../drivers/nvidia) (`nvidia-rm`) is an optional kernel dependency behind the `nvidia` feature (x86-64 only): the OS-interface shim for NVIDIA's open GPU kernel modules ([PC hardware](../hardware/pc.md)).
 
 ## Other top-level directories
 
 | Path | Contents |
 |---|---|
-| [`userland/`](../../userland) | In-tree programs and regression suites, as their own Cargo workspace ([`userland/Cargo.toml`](../../userland/Cargo.toml)); linked against `leandros-libc`, relibc or musl. A few (`spawnwedge`, `killmt`) are std/musl crates with their own `build.sh`. See [programs](../userland/programs.md) and [testing](../development/testing.md). |
+| [`userland/`](../../userland) | In-tree programs (including the Bluetooth daemon `btd` and HID bridge `bthid`) and regression suites, as their own Cargo workspace ([`userland/Cargo.toml`](../../userland/Cargo.toml)); linked against `leandros-libc`, relibc or musl. A few (`spawnwedge`, `killmt`) are std/musl crates with their own `build.sh`. See [programs](../userland/programs.md) and [testing](../development/testing.md). |
 | [`ports/`](../../ports) | Build recipes and integration files for third-party software: Mesa, D-Bus/busd and the system-bus services, COSMIC components, greetd and `pam-leandros`, input-stack shims (libseat, libudev), PipeWire, Firefox, the desktop portal, brush, mkfs.fat, mkfs.xfs, OpenRM. Each has its own README. See [ports](../userland/ports.md). |
+| [`Kconfig`](../../Kconfig) and `drivers/Kconfig` | The kernel configuration tree (symbols map to `drv-*` cargo features); edit with `scripts/menuconfig.sh`, which uses the vendored kconfiglib in `scripts/kconfig/`. |
+| [`modules/`](../../modules) | Loadable kernel module crates, built by `scripts/kmod/` (`kmod-build.sh`, `kmodpost.py`, `bidcheck.py`). |
 | [`scripts/`](../../scripts) | Build, image, run and deploy scripts (`build-all.sh`, `run-qemu.sh`, `mkfs-f2fs-populated.py`, the musl cross wrappers, Raspberry Pi and USB-stick writers, benchmarks). |
 | [`artifacts/`](../../artifacts) | Versioned investigation instruments — session drivers, capture harnesses — and `artifacts/notes/`, the lane notes each measured claim in this handbook rests on. Authored sources, notes and harnesses only; large binaries live outside the repository. |
 | [`.claude/skills/run-leandros/`](../../.claude/skills/run-leandros) | The scriptable QEMU driver (`driver.py`) and the test and session runners built on it. See [workflow](../development/workflow.md). |

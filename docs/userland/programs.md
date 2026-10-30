@@ -13,7 +13,7 @@ this page.
 | `init` | PID 1; mounts the root filesystem, supervises the graphical login, the serial getty and the VT 2..6 logins, and handles power-off ([below](#init)) |
 | `login` | Authenticates against `/etc/shadow`, sets supplementary groups, drops privilege via `setresgid`/`setresuid`, sets `XDG_RUNTIME_DIR`, execs the account's shell |
 | `greeter-launch` | `cosmic-comp`'s kiosk child: becomes the `cosmic-greeter` account, verifies the drop by reading `getuid()` back, execs the greeter ([../desktop/login.md](../desktop/login.md)) |
-| `poweroff` / `reboot` / `halt` | One binary dispatching on `argv[0]` (hardlinked); asks init for an orderly shutdown over `/run/user/initctl`; `-f` does `sync` + `reboot(2)` directly (root only), and is the fallback when init is unreachable |
+| `poweroff` / `reboot` / `halt` | One binary dispatching on `argv[0]` (hardlinked); asks init for an orderly shutdown over `/run/user/initctl`; `-f` does `sync` + `reboot(2)` directly (root only), and is the fallback when init is unreachable. As a non-root user with a D-Bus session in the environment it execs `leandros-sysbus power`, so the request goes through login1 like `systemctl poweroff` on Linux |
 | `ps` | Process status from `/proc`, procps-compatible ([below](#ps)) |
 | `meminfo` | One-line `sysinfo` sample of buddy-allocator total/free, so a session script can read a series rather than a point |
 | `shell` | The original built-in CLI with Unix-style commands and VFS integration, on leandros-libc |
@@ -159,8 +159,7 @@ leandros-libc.
 | `su`, `sudo` | [ports/sudo-rs](../../ports/sudo-rs/README.md) | sudo-rs v0.2.15, set-user-ID root; `/etc/sudoers` lets `root` and `%wheel` run anything ([security](../servers/security.md#su-and-sudo)) |
 | `kmscube` | [ports/gl-stack](../../ports/gl-stack/NOTES.md) | the first dynamic `ET_DYN` + `PT_INTERP` binary; a KMS/GL smoke test |
 
-The image has no `grep` or `busctl`; scripts and harnesses that run in the guest are written
-around that.
+The image ships ripgrep as `rg` ([ports/ripgrep](../../ports/ripgrep), stripped), and `grep`, `egrep` and `fgrep` are a thin shim over it ([`userland/grep`](../../userland/grep), host-tested); `pi-sync` refuses to update a Pi root that lacks rg, grep or dmesg. `busctl` (from [ports/sysbus](../../ports/sysbus): `busctl call`, `--user`/`--system`, `-q`, the usual signature characters) is staged at `/usr/bin/busctl` and is how scripts drive login1, PipeWire's volume path and the like. `leandros-sysbus power <PowerOff|Reboot|Halt|Can*>` is the login1 client behind a regular user's `poweroff`. Other additions since the last survey: `netctl metric` and `netctl watch --stamp` ([../servers/netctl.md](../servers/netctl.md)), the netlink and local-UDP regression programs `netlinktest` and `udpselftest` ([../servers/networking.md](../servers/networking.md)), `btd`, `btctl` and `bthid` for Bluetooth ([../servers/bluetooth.md](../servers/bluetooth.md)), and `kmodctl` for loadable kernel modules. Scripts that run in the guest may rely on `grep`, but still not on `awk` or `sed` beyond what uutils provides.
 
 ### ps
 
@@ -216,7 +215,7 @@ for a Linux host, so the two runs' result lines can be diffed — Linux is the o
 
 ## Limitations & open work
 
-- No `passwd`, `grep`, `who`/`w`/`last` (and no utmpx for them to read).
+- No `passwd`, `who`/`w`/`last` (and no utmpx for them to read).
 - `shell` is legacy; new interactive work goes into brush.
 
 ## Code & tests

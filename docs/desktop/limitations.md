@@ -22,10 +22,28 @@ this page is the explanation.
   login1/locale1/UPower implementations cannot do anything that needs root. `SetLocale` as a
   normal user answers `AccessDenied` (`/etc` is root's); power-off is the one root operation
   that is supported, by delegation to init ([session.md](session.md#shut-down-and-restart)).
+  Backlight brightness is the one sysfs write opened to group `video`
+  ([session.md](session.md#brightness-keys-and-login1-setbrightness)).
 - **Power management is shutdown and reboot only.** Suspend, hibernate and hybrid sleep are
   `NotSupported`; logind "block" inhibitors for shutdown are accepted but not enforced
-  (COSMIC only takes handle-power-key inhibitors); Ctrl-Alt-Del does not reach init yet; the
-  greeter's own power buttons do nothing, because the greeter phase has no system bus.
+  (COSMIC only takes handle-power-key inhibitors); Ctrl-Alt-Del does not reach init yet. The
+  power applet's Lock is a no-op (no screen locker exists) and its log-out path to the greeter
+  is unverified on hardware. Power off and restart from the greeter and from a user session
+  work through login1.
+- **Applets without a backing service or config.** The workspaces applet is staged but the
+  default panel config does not launch it. The battery applet shows data only where the
+  kernel exports a power_supply class (the laptop's ACPI battery); QEMU shows none. The
+  Bluetooth applet depends on an adapter (`/dev/hci0`) and the `org.bluez` shim, and is only
+  checked against the shim, not yet in a live session on hardware.
+- **Brightness and volume hotkeys are partly unconfirmed.** The EliteBook 840 G5 brightness
+  keys are mapped (`E0 12`/`E0 17`) but a real key press reaching the compositor has not been
+  confirmed; other machines' keys appear as `kbd: unmapped sc` lines until mapped.
+- **cosmic-screenshot's capture path is unverified.** The app starts, but the
+  portal/screencopy capture has not produced a PNG in a test.
+- **Firefox is still heavy during YouTube** (about 310 % total CPU on the laptop, Firefox
+  decoding in software unless hardware decode is enabled) and a first greetd login after boot
+  once failed on the laptop and was not reproduced (diagnostics are in
+  [login.md](login.md#login-diagnostics-and-the-greetd-build-cache)).
 
 ### Login and privilege
 
@@ -73,8 +91,9 @@ this page is the explanation.
 
 ### Display, input and hardware
 
-- **QEMU is the only place the desktop is verified.** The Raspberry Pi 5 and real-PC targets
-  boot and have their own display paths, but COSMIC on real hardware is future work
+- **QEMU was the first place the desktop was verified.** COSMIC now also renders on the
+  HP EliteBook's Intel graphics and on an NVIDIA RTX 3070 PC, but the Raspberry Pi 5 has no
+  desktop yet, and low frame rates and software video decode remain open
   ([../hardware/README.md](../hardware/README.md)).
 - **cosmic-comp is never fully idle.** It does an allocate/free cycle per wakeup; the kernel
   side of the idle cost was cut (greeter dispatches roughly halved, host QEMU CPU at idle
@@ -91,10 +110,13 @@ kept here because each was a real, recorded gap and the reason it closed is wort
 | **VT switching lands, device arbitration does not** — a background VT could read live keyboard/pointer events | DRM master is per VT and follows the switch (`959710d`, `869014d`); `EVIOCGRAB` is enforced and `EVIOCREVOKE` implemented; VT 2..6 are real terminals with their own logins; a measured round trip shows cosmic-comp dropping and retaking master itself through the shim ([../servers/tty-and-vt.md](../servers/tty-and-vt.md)) |
 | **The privilege boundary is thinner than it looks** — the greeter reached a `0700 root` `/run/user/0` and a root-owned socket because path resolution applied no search-permission test and `AF_UNIX` connect discarded the caller's identity | Search permission is enforced on every component and write permission on socket inodes; the greeter now uses its own `/run/user/990` ([login.md](login.md#greetds-control-socket-cannot-live-in-run)) |
 | **A compositor death leaks kernel memory** — roughly 140 MB per `cosmic-comp` respawn; a fast respawn storm could exhaust the buddy allocator | It was user pages, not kernel heap: eager VMAs are backed by a power-of-two buddy block, and the unmapped tail was lost whenever the VMA was split or forked. `free_eager_tail` returns it (14.1k pages per death → −26) ([lane-greeterleak](../../artifacts/notes/lane-greeterleak-2026-09-24.md)) |
-| **Closed windows leak a GPU texture each** | the approved `weak_window` cosmic-comp patch ([README.md](README.md#zero-cosmic-source-patches-with-one-approved-exception)) |
+| **Closed windows leak a GPU texture each** | the approved `weak_window` cosmic-comp patch ([README.md](README.md#almost-no-cosmic-source-patches)) |
 | **cosmic-comp runs as root** | true only for the greeter session; the user session's compositor runs as the user |
 | **Software rendering (softpipe) by default** | GPU by default (Zink over Venus, else virgl); softpipe only by explicit opt-in |
 | **No `#!` scripts** — every launcher had to be run as `sh <script>` | `execve` follows Linux `binfmt_script` semantics (`3762fb6`, `userland/exectest`); the launchers are still invoked through `sh` |
+| **The greeter's power buttons do nothing** — cosmic-greeter was built without its `logind` feature and had no system bus | built with `--features logind`, run under `dbus-run-session` with its own bus; shut down and restart work from the greeter and, via `leandros-sysbus power`, for a regular user ([session.md](session.md#power-off-and-restart-from-the-greeter-and-as-a-user)) |
+| **Battery and Bluetooth applets have nothing to show** — UPower answered "no battery" and there was no bluez | UPower reads `/sys/class/power_supply`; the `org.bluez` shim over btd serves the Bluetooth applet and Settings ([../servers/bluetooth.md](../servers/bluetooth.md)) |
+| **Only the clock stand-in and five applets** | time, battery, notifications, status-area, input-sources, a11y, app-list, power and Bluetooth are staged, plus cosmic-files, cosmic-edit, cosmic-screenshot and a Firefox launcher entry |
 | **No power-off** — the shutdown dialog's Confirm failed | login1 → init → `reboot(2)` → ACPI S5 / PSCI, with a clean f2fs unmount |
 
 ## Refuted limitations

@@ -30,7 +30,7 @@ kernel fault. See [servers/README.md](../servers/README.md) for the server layer
 | [virtio_keyboard.rs](../../drivers/src/virtio_keyboard.rs) | virtio-input keyboard and tablet → evdev event0/event1 | [input.md](../input.md) |
 | [virtio_rng.rs](../../drivers/src/virtio_rng.rs) | Entropy for the kernel CSPRNG | [virtual-machines.md](virtual-machines.md#entropy) |
 | [snd.rs](../../drivers/src/snd.rs) | virtio-snd PCM | [audio.md](../audio.md) |
-| [hda.rs](../../drivers/src/hda.rs) | Intel HD Audio playback (PCI class 0403) for the audio server | [audio.md](../audio.md#the-intel-hd-audio-driver) |
+| [hda.rs](../../drivers/src/hda.rs), `hda_capture.rs` | Intel HD Audio playback (PCI class 0403) for the audio server; microphone capture, jack sense and the display codec | [audio.md](../audio.md#the-intel-hd-audio-driver) |
 | [r8169.rs](../../drivers/src/r8169.rs), `r8169_hw.rs`, [netdev.rs](../../drivers/src/netdev.rs) | Realtek RTL8111/8168 Ethernet and the NIC backend dispatch (`eth0` is virtio-net if present, else r8169) | [pc.md](pc.md#ethernet-realtek-r8169) |
 | [virtio_gpu.rs](../../drivers/src/virtio_gpu.rs) | virtio-gpu: 2D, virgl, Venus, blobs, async control queue, MSI-X | [graphics/virtio-gpu.md](../graphics/virtio-gpu.md) |
 | [drm_device_interface.rs](../../drivers/src/drm_device_interface.rs), [drm_driver.rs](../../drivers/src/drm_driver.rs), [kms.rs](../../drivers/src/kms.rs), `drm/` | The DRM/KMS ioctl implementation behind the DRM server | [graphics/drm-kms.md](../graphics/drm-kms.md) |
@@ -42,6 +42,11 @@ kernel fault. See [servers/README.md](../servers/README.md) for the server layer
 | [usb_hcd.rs](../../drivers/src/usb_hcd.rs), [usb_storage.rs](../../drivers/src/usb_storage.rs), [usb_hid.rs](../../drivers/src/usb_hid.rs) | Kernel glue for the `usb` crate | [pc.md](pc.md#the-usb-stack) |
 | [iwlwifi.rs](../../drivers/src/iwlwifi.rs), `iwl_*.rs`, [wifi_ht.rs](../../drivers/src/wifi_ht.rs), [wifi_frame.rs](../../drivers/src/wifi_frame.rs), [wifi_mgr.rs](../../drivers/src/wifi_mgr.rs), [wifi_sim.rs](../../drivers/src/wifi_sim.rs) | Intel Wi-Fi (the laptop's 8265) as `wifi0`, the shared 802.11 frame, WMM/HT and Block Ack code, the connection manager, and the simulated AP used in QEMU | [below](#wi-fi), [servers/netctl.md](../servers/netctl.md) |
 | [netshape.rs](../../drivers/src/netshape.rs) | `netshape=` test knob: a Wi-Fi-shaped link (rate, queues, delay, loss) in front of one netif | [servers/networking.md](../servers/networking.md#netshape-link-emulator) |
+| [i915/](../../drivers/src/i915/mod.rs) | Intel Gen9 GPU: execlists, i915 UAPI, KMS, external outputs, hot-plug, power wells, backlight | [graphics/drm-kms.md](../graphics/drm-kms.md#the-i915-backend) |
+| [acpi_power/](../../drivers/src/acpi_power/mod.rs) (`aml.rs`, `ec.rs`, `power.rs`, `gl.rs`), [power_sysfs.rs](../../drivers/src/power_sysfs.rs) | AML interpreter, embedded controller, battery/AC/lid, `/sys/class/{power_supply,backlight}`, sleep methods | [pc.md](pc.md#acpi-power-battery-backlight-and-hotkeys) |
+| [dw_i2c.rs](../../drivers/src/dw_i2c.rs), [i2c_acpi.rs](../../drivers/src/i2c_acpi.rs), [i2c_hid.rs](../../drivers/src/i2c_hid.rs), [hid_desc.rs](../../drivers/src/hid_desc.rs), [hid_ptp.rs](../../drivers/src/hid_ptp.rs) | DesignWare I2C master, ACPI I2C enumeration, I2C-HID and Precision Touchpad | [pc.md](pc.md#touchpad-i2c-hid-precision-touchpad) |
+| [pci_pm.rs](../../drivers/src/pci_pm.rs), [lapinv.rs](../../drivers/src/lapinv.rs) | PCI config-space save/restore for suspend; read-only laptop device inventory | [pc.md](pc.md#suspend) |
+| `usb/src/uvc.rs`, `kernel/src/v4l2.rs` | UVC webcam over isochronous xHCI pipes and the V4L2 `/dev/video0` surface | [pc.md](pc.md#webcam) |
 | [firmware.rs](../../drivers/src/firmware.rs) | `request_firmware`: read a file from the mounted root into a page list; logs `[FW] <path>: <n> bytes crc32=0x…` per file | [below](#firmware-loading) |
 | [nvidia_probe.rs](../../drivers/src/nvidia_probe.rs) | Read-only NVIDIA GPU probe (`[NVPROBE]`) | [pc.md](pc.md#stage-g1-a-read-only-probe) |
 
@@ -176,8 +181,8 @@ the scheduler and memory manager: [kernel/scheduler.md](../kernel/scheduler.md),
 `drivers/wifi` is a structural port of Linux's wireless layering — `ieee80211` frame types,
 `cfg80211` configuration, `mac80211` soft-MAC, and an `nl80211`-style control interface over IPC —
 with one driver, `VirtioWifi`, which is **simulated**: transmit records frame metadata in a small ring,
-and scans return pre-injected fake BSS entries. That crate is compiled into the kernel but nothing in
-the kernel calls it.
+and scans return pre-injected fake BSS entries. It is the test driver; the real driver, `iwlwifi`, follows
+and is a loadable module on the kernel-owned Wi-Fi radio class (`kmodwifi`, see [kernel/modules.md](../kernel/modules.md)).
 
 The real Wi-Fi driver is `iwlwifi` in the `drivers` crate: Intel's 8265 (the laptop) as `wifi0`, with
 WPA2, scanning, roaming and the connection manager that `/dev/netctl` and the NetworkManager shim drive
@@ -280,6 +285,10 @@ subframes, so every `wifi_sim` boot in `regress` and `net-e2e` exercises the reo
 default `30:10:0`). The `wifisimtest` self-test includes `ht-addba`, `ht-reorder` and
 `ht-reorder-loss`; `wifihtbench.py` measures host → guest throughput over `wifi0`.
 
+## Loadable drivers
+
+Some drivers no longer live only in the kernel image: e1000e, HDA (and virtio-snd), iwlwifi, UVC, USB HID, USB storage, NVMe (with virtio-blk), virtio-net, USB Bluetooth and virtio-rng build as modules with Y/M/N selection and are bound through kernel-API (`kapi_*`) shims. How modules are built, aliased, autoloaded and unloaded is in [kernel/modules.md](../kernel/modules.md). The module map above still names the source file; the load path is the thing that changed.
+
 ## Rules every driver follows
 
 These come from bugs, each of which cost days:
@@ -318,8 +327,9 @@ These come from bugs, each of which cost days:
 - No interrupt-driven block I/O; a slow device holds its CPU while polling (the USB disk lock now sleeps between polls and spins only 300 us, but virtio-blk still polls). Network RX is interrupt-driven on r8169 (MSI) and kick-driven on virtio-net.
 - No MSI on aarch64 (needs a GICv3 ITS); no legacy INTx routing on x86_64.
 - No IOMMU support; DMA addresses are physical addresses.
-- No USB hubs, UAS, or hot-plug; no Wi-Fi driver for real hardware. A Realtek wired NIC, Intel HD Audio and the NVIDIA GPU are the real-PC drivers; see [pc.md](pc.md).
-- Wi-Fi is a simulated stack, not wired into the kernel.
+- No UAS (bulk-only transport only). USB hubs and mass-storage/HID hot-plug work; xHCI endpoint recovery disables only the failing slot (`quarantine_slot`), and a controller that disappears (Thunderbolt power-down) is guarded by `usb.tbxhci`. See [pc.md](pc.md#usb-c-and-thunderbolt).
+- Real-hardware drivers: a Realtek wired NIC, Intel e1000e, Intel HD Audio, Intel iwlwifi Wi-Fi and Bluetooth, the NVIDIA GPU (desktop PC) and the Intel i915 GPU (laptop); see [pc.md](pc.md).
+- No interrupt on the I2C touchpad (GPIO not wired; it is polled), no HDMI/DP audio playback, no Thunderbolt driver, and S3 on the laptop is unresolved ([pc.md](pc.md#suspend)).
 
 ## Code and tests
 

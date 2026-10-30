@@ -84,11 +84,26 @@ Boot-protocol USB keyboards and mice work over xHCI interrupt pipes (`0fff571`),
 - Each interrupt-IN pipe keeps eight one-packet transfers queued and is **harvested from the bootstrap CPU's tick**, next to the virtio-input poll. The controller lock is only `try_lock`ed, nothing in the tick path waits or allocates, and a halted endpoint is recovered by a small state machine spread across ticks (Reset Endpoint, Set TR Dequeue, `CLEAR_FEATURE(HALT)`), giving up after 16 recoveries.
 - Keyboards: the 8-byte boot report is diffed against the previous one into Linux key edges using Linux's usbkbd usage table. **Typematic** re-sends the newest held key as another *press* after the console's `KDKBDREP` delay at its period (default 250/33 ms) — how PS/2 and QEMU's virtio keyboard deliver repeats; libinput ignores a press for a key already down, so COSMIC does not double-repeat. Value 2 is never used (it is the serial marker). LEDs follow the VT on screen, or the `EV_LED` events a compositor writes to `event0`.
 - Mice feed `event1`. libinput rejects a node that is both absolute and relative, and the libudev shim knows only two nodes, so relative motion is integrated into an absolute position (one count = one framebuffer pixel, clamped, no acceleration) and the buttons and wheel are OR-ed into `event1`'s capabilities (`add_device_caps`).
-- Only boot-protocol interfaces are used; report-protocol-only devices (QEMU's `usb-tablet`, media keys, game pads) are logged as unsupported. Devices behind a hub are not enumerated yet. See [PC hardware](hardware/pc.md).
+- Only boot-protocol interfaces are used; report-protocol-only devices (QEMU's `usb-tablet`, media keys, game pads) are logged as unsupported. Devices behind a hub are enumerated (lane `usbhot2`). USB HID is a loadable module (`kmodusbin2`, see [kernel/modules.md](kernel/modules.md)), and each device gets its own evdev node, removed with `ENODEV`/`POLLHUP` on unplug (`evdyn`), so the original two-node limit no longer applies to USB. See [PC hardware](hardware/pc.md).
 
 ### PS/2 keyboard (x86_64)
 
 The i8042 driver decides a controller exists the way Linux does — the ACPI FADT `IAPC_BOOT_ARCH` 8042 bit, a status port that is not `0xFF`, a bounded flush, and a self-test with timeouts — and re-checks after the xHCI BIOS hand-off, because firmware often only *emulates* a PS/2 controller for USB keyboards until the OS takes the controller over. Before this, a real PC with no controller read floating ports as phantom keystrokes. The AUX port (PS/2 mouse, Synaptics touchpad, pass-through pointing stick) is driven by `arch/x86_64/src/psmouse.rs` + `drivers/src/psmouse.rs` and feeds `event1` through the shared `drivers/src/rel_pointer.rs` path, like USB mice; see `artifacts/notes/lane-pointer-2026-10-12.md`.
+
+### Touchpads and multitouch
+
+The EliteBook's pad is an I2C-HID Windows Precision Touchpad, driven by `drivers/src/i2c_hid.rs` and decoded in `hid_ptp.rs` (design and defaults in [hardware/pc.md](hardware/pc.md#touchpad-i2c-hid-precision-touchpad)). It registers as a separate evdev node (`DEVKIND_TOUCHPAD`, `BUS_I2C`, "CPD0 06CB:82F1 Touchpad"), which libinput treats as a touchpad because it has `BTN_TOOL_FINGER` and no `INPUT_PROP_DIRECT`.
+
+- **Protocol B.** Each contact is a slot: `ABS_MT_SLOT` 0..4, `ABS_MT_TRACKING_ID` 0..65535, `ABS_MT_POSITION_X/Y` (0..1273 by 0..672), `ABS_MT_TOOL_TYPE`, plus `BTN_TOUCH`, `BTN_TOOL_FINGER` through `BTN_TOOL_QUINTTAP` and `BTN_LEFT`; `INPUT_PROP_POINTER|BUTTONPAD`. A frame with a contact whose confidence bit is clear (a palm) drops that contact.
+- **State queries.** `servers/evdev` keeps a per-device slot table updated by every `ABS_MT_*` event so `EVIOCGMTSLOTS` answers `{code; values[n]}` for tracking id, X, Y and tool type (other codes `EINVAL`); `EVIOCGPROP` reports property bits, and uinput accepts `UI_SET_PROPBIT` and `UI_ABS_SETUP(ABS_MT_SLOT)`, so a uinput device can be a multitouch touchpad too (`uinputtest` creates a five-slot pad shaped like the real one). `EVIOCGABS` used to be dispatched only below `0x60`, which made every `ABS_MT_*` axis fail with `ENOTTY`; libevdev would have rejected any multitouch device before the fix.
+- **Defaults and fallback.** The kernel prefers the I2C pad when ACPI lists it and falls back to the PS/2 Synaptics path on failure; the PS/2 trackstick stays a relative pointer either way. Knobs: `touchpad=ps2|ps2!|i2c|auto`, `touchpad.debug=1`.
+- **Polling.** The pad's interrupt GPIO is not wired; the driver polls the I2C device every 8 ms while fingers are down and every 100 ms when idle (`i2chidpoll`), which keeps the idle wake count low.
+
+Limits: libinput classification and gestures were verified by reading the capability probe and with `uinputtest`, not with a physical finger in a compositor; that test is still owed.
+
+### Laptop keys and lid
+
+The laptop's PS/2 keyboard sends the brightness keys as set-1 `E0 12` and `E0 17`, mapped to `KEY_BRIGHTNESSDOWN`/`KEY_BRIGHTNESSUP`; `E0 20/2E/30` are mute and volume. Lid and power button come from an "ACPI Power Buttons" switch device (`SW_LID`) fed by the `kacpid` thread ([hardware/pc.md](hardware/pc.md#acpi-power-battery-backlight-and-hotkeys)). Unmapped extended scancodes are logged on the serial line (`kbd: unmapped sc e0 xx dn|up`, at most 10 per second). The compositor's brightness request goes through login1 `SetBrightness`, which writes `/sys/class/backlight/*/brightness`; group `video` may write that attribute.
 
 ### Serial
 
@@ -121,9 +136,9 @@ A historical trap: `run-qemu.sh` has four QEMU command lines (UEFI and direct bo
 
 - On aarch64, clicks in COSMIC have been reported as ignored while the pointer moves; delivery to evdev is proven on both architectures, and the leading hypothesis is aim (host cursor versus guest mapping under host display scaling), which only a physical mouse can test.
 - Horizontal wheel is mirrored but QEMU's tablet advertises none, so it is untested.
-- USB devices behind hubs are not enumerated; USB mice have no acceleration.
+- USB mice have no acceleration.
 - The text-VT keymap is US only; virtio keys have no console autorepeat.
-- The libudev device table is static; hot-plug is not modelled.
+- The libudev shim began as a static device table; hot-plugged USB input, DRM change events and `/sys/class/backlight` are now enumerated and monitored (`udevhot`, `lapdispB`, `hotkeys2`), but the shim is still not udev: no rules, no persistent database.
 - virtio-input is polled at 100 Hz rather than interrupt-driven.
 
 ## Code and tests

@@ -109,6 +109,10 @@ A COSMIC session switched to VT 2, logged in and typed there, and switched back,
 - `setsid()` still succeeds for a process-group leader (Linux: `EPERM`).
 - The console's default `c_cc` indices look off (`cc[11]` = `^Q` lands in `VEOL`).
 - A staged kernel line with no trailing newline waits until its CPU prints one; interrupt-context lines can still be dropped under host back-pressure, by design.
+- **Console and pty reads fault pages in.** `read(0, buf, n)` on the console once returned `EFAULT` when `buf` lay in a never-touched file-backed page (a `.data` page of the exec image), because that path wrote with a helper that only fills pages already present. It now uses the fault-tolerant `uaccess` copy, so an absent page is faulted in like the task's own store and only a truly invalid range is `EFAULT` (lane ttyefault, 2026-10-27; `uaccesstest` covers console, pipe, `readv`, file, socket, pty and mmap destinations). Console and pty ioctls copy through a kernel bounce buffer (`tty_ioctl_bounce`) with no tty lock held ([invariants](../kernel/invariants.md#user-memory-is-reached-only-through-uaccess)).
+- `TIOCSIG` on a pty takes the signal by value (lane tiocsig).
+- **Serial console input.** Bytes from the serial console reach only the console tty; an opt-in `serial-kbd` input node can turn them into mapped key press/release events for a compositor (lane serialkbd). The Pi 5 keeps console RX polled during framebuffer scroll/blit so input is not lost while the screen repaints.
+- **VT switch diagnostics.** `/proc/vtstat` counts hand-offs, a switch logs its origin, and the `doomsession` test has a `chvt` mode; games draw on VT 2 (`CREATE_FB` above 4 GiB is accepted) and fail loudly instead of falling back to the firmware framebuffer.
 
 ## Code and tests
 

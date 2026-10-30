@@ -116,6 +116,15 @@ Kernel-side CPU questions — "is this process busy, or is the kernel busy on it
 
 `epoll.ready=0` on the kernel command line turns the epoll ready list off (every wake re-probes every registration again), which is the A/B control for any suspected lost-wake stall in an event loop.
 
+### Counters added in October 2026
+
+- `/proc/lockstat` carries `spin_held <sum over CPUs> <switch violations> <sleep violations>`: the count of `spin::Mutex` guards believed held. A persistent non-zero sum on an idle machine means a release path forgot to decrement ([invariants](../kernel/invariants.md#a-fault-kill-and-a-forgotten-guard-must-leave-the-lock-accounting-balanced)).
+- `sched.check=N` runs the scheduler consistency checker every N seconds; wake attribution (`kwake`, `widen`, `dlscan`, `w4scan`, `fdclose`, `fddup`) is in `/proc/wakestat` and `/proc/rqhold`.
+- `/proc/pcipm` dumps the LTR/L1SS/AER registers per PCI function, to compare a cold boot with a kexec'd one.
+- `/proc/klog` and `dmesg` (also on the Pi); after a kexec the previous kernel's last lines come back as `[prevkexec] ...`.
+- `[EPOLL] torn|foreign wait snapshot` lines name the failure class of a corrupted epoll snapshot ([event-loop.md](../kernel/event-loop.md#wake-keys-and-the-epoll-wait-snapshot-after-october-2026)); `[SMAP] audit:` lists raw user accesses under `pan=audit`; `[BUDDY] CORRUPT LINK` after a kexec means a bus master was left running.
+- **A kernel that wedges with all CPUs spinning:** the QEMU monitor's `info registers -a` on the hung guest (once per CPU, not polled under HVF) showed which CPUs spun in a lock's slow path and which lock; this is how the `ipcregress` livelock was found. On the Pi 5, `piwedge` diagnostics use a lock-free raw-UART path (IRQ trail, stage markers), and a panic resets the board after 5 s (`panic.reset`).
+
 ## Other instruments
 
 - **Gated debug output.** Most diagnostics are compile-time constants defaulting to off (render and audio hot paths, `[MMAP]`/`[CPIO]` tracing, EL0 fault backtraces, unix-socket traces, `DRM_STATS` in [`drivers/src/drm_device_interface.rs`](../../drivers/src/drm_device_interface.rs) for the `[DRMSTAT]` census). Turn one on in a private build; leave it off on `main`. After gating any helper, diff a live serial log before and after — a private copy of a print helper in one server once kept printing unlabelled hex digits after the shared one was gated.

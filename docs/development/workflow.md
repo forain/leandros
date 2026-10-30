@@ -32,6 +32,22 @@ A **wave** is a set of lanes started from the same `main` and merged together. L
 
 On a shared machine, only stop QEMU processes you started (by PID). Note that `pkill -f qemu-system-aarch64` run over ssh matches, and kills, the ssh command itself; use a pattern such as `qemu-system-aarch6[4]`.
 
+### Locks, the regress farm and lane discipline
+
+Scarce machines are arbitrated by `lock.sh <kind> <command…>` in the orchestration directory that sits next to the repository (outside it, with the lane protocol and design notes): it holds a slot for the duration of the command and reclaims locks whose process died. The kinds are `qemu` (2 slots on the Mac), `box` (6 slots on the Linux desktop), `laptop` and `merge` (1 each). A test run that boots QEMU on the Mac, a box run, a laptop trial and a merge into `main` each take their slot; a hold longer than needed stalls every other lane.
+
+**The box regress farm.** `box/regress.sh <git-ref> <aarch64|x86_64> [runtests args…]` builds `<ref>` in release mode on the Linux desktop and runs `runtests.py` there: the ref and the sibling `relibc` master are shipped as git objects (refs under `refs/farm/*` and detached worktrees on the box's tmpfs; it never pushes), and `regress.sh --gc <ref>` removes the worktree. The full default regress takes about 10 minutes for x86-64 under KVM and about 13 for AArch64 under TCG, and runs six at a time, so it is the gate that a lane's evidence must come from when the Mac's two QEMU slots are busy. The same box also runs interop tests that need Linux tools (`fsck.f2fs`, `mkfs.f2fs`). Sync to the box is by git bundle from the Mac, never a push; it has little free disk, so large files go to `/tmp` and are deleted after.
+
+**Lane discipline learned the hard way.**
+
+- *Small lanes, short reports, fresh agents.* A lane has a tool-call budget (about 60), keeps tool output tiny, and when it runs out writes a hand-off file (done, in progress, next steps, the exact lines to change) instead of continuing in a bloated context.
+- *Lanes test AArch64 only; both architectures run once per merge batch on `main`.* An x86-64 or hardware claim is made on the machine that can make it ([the accelerator is not the arch](methodology.md#the-accelerator-is-not-the-architecture)).
+- *A lane worktree is about 4 GiB* (images are dense; it was 9 to 18 GiB before the image slimming), and a full disk failed lanes twice on 2026-10-19/20. Remove the worktree after merging, and copy images with `cp -c` (clone) on macOS. The ports' target cache (`~/Library/Caches/leandros-ports`) grew to 236 GB once; check it first when the disk fills.
+- *Never `git stash`* (the stash is shared by every worktree) and never switch the branch of the main checkout: commit work in progress on the lane branch and merge `main` into it.
+- *The relibc sibling is shared*: commit relibc edits at once and small, on its `master`.
+- *Pushes are deliberate.* Before any push, scan the commit messages of the new range for tool-attribution trailers; one once reached the remote and had to be force-fixed.
+- Every tool call in a lane carries the lane name as a prefix in its description, so a log of many concurrent lanes can be read.
+
 ## The QEMU driver
 
 `run-qemu.sh` is the interactive path ([running](../getting-started/running.md)). [`.claude/skills/run-leandros/driver.py`](../../.claude/skills/run-leandros/driver.py) is the scriptable one: it starts QEMU headless with the serial console and the monitor on Unix sockets and a QMP socket, and exposes subcommands:

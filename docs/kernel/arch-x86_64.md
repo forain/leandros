@@ -105,7 +105,7 @@ Context switches save the 512-byte `FXSAVE64` area. `CR4.OSXSAVE` is never set, 
 
 ## Limitations and open work
 
-- **No SMAP/SMEP** (`CR4` bits 20/21 are never set) — see [memory.md](memory.md#smap-is-a-discipline-here-not-a-hardware-feature). `CR0.WP` is on.
+- **SMEP and SMAP are on** (since 2026-10-23, lane smapx86): `CR4` bits 20/21 are set on the BSP and every AP when CPUID reports them, `stac`/`clac` bracket every `sched::uaccess` copy and `UserAccess` window, and `pan=strict|audit|off` (default strict) picks panic, log-and-allow, or off. See [memory.md](memory.md#smepsmap-and-pan-are-on-uaccess-is-the-only-way-in). `CR0.WP` is on.
 - No AVX/AVX-512 state management (above).
 - MSI always targets the BSP; no interrupt affinity, no multi-vector MSI (MSI-X has per-entry vectors). Legacy INTx (`IrqSource::Line`) returns `Unsupported`: there is no ACPI `_PRT` parser.
 - More than 64 CPUs would need a wider shootdown acknowledgement mask; firmware-enabled x2APIC on the *BSP* is handled by code but has not been exercised (OVMF hands the BSP over in xAPIC mode even with 288 vCPUs).

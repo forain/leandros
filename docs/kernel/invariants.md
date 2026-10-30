@@ -23,6 +23,8 @@ The hard rules the kernel depends on, each with the failure that taught it. Brea
 | 15 | [Both architectures, release builds, real round trips](#both-architectures-release-builds-real-round-trips) | Project practice |
 | 16 | [Every readiness change issues a matching poll wake](#every-readiness-change-issues-a-matching-poll-wake) | `epolltest` (both `epoll.ready` modes); the producer audit |
 | 17 | [Every write that creates signal work kicks the signal hint](#every-write-that-creates-signal-work-kicks-the-signal-hint) | Sampled re-check; `miss` in `/proc/rqhold`; `sigtest sigfast` |
+| 18 | [A fault kill and a forgotten guard must leave the lock accounting balanced](#a-fault-kill-and-a-forgotten-guard-must-leave-the-lock-accounting-balanced) | `force_release_held()`; `spin_held` in `/proc/lockstat`; `scmtest`, `privtest` |
+| 19 | [User memory is reached only through `uaccess`](#user-memory-is-reached-only-through-uaccess) | SMAP/PAN (`pan=strict`); `privtest`, `uaccesstest` |
 
 ## Never touch user memory under an IRQ-off spinlock
 
@@ -116,7 +118,7 @@ A new `static mut` must fit one of those categories and say which in a comment; 
 
 **Rule.** A failure path that returns a generic errno for a specific limit must be traceable to that limit: every `ENOMEM` in the memory, address-space and exec paths goes through `enomem_site("…")`, and every fixed-size kernel table reports itself full in one ungated line, once.
 
-**Why.** `ENOMEM` meant about a dozen unrelated things, two of them about RAM. Two investigations hunted a memory leak with over a gigabyte free; the cause was a 64-entry IPC port table, and the visible symptom was `stat()` of an existing directory failing with "Out of memory" ([ipc.md](ipc.md#live_buckets-the-ceiling-that-looked-like-ram)). Today: `[IPC] port table FULL … this is ipc::port::LIVE_BUCKETS, not RAM`, `[VFS] ENOMEM: no reply port for this task`, `[SCHED] task table FULL … this is runqueue::MAX_TASKS, not RAM`, and the mapping failure reason from `mm::vmm::last_map_fail()` ([memory.md](memory.md#enomem-must-name-its-cause)).
+**Why.** `ENOMEM` meant about a dozen unrelated things, two of them about RAM. Two investigations hunted a memory leak with over a gigabyte free; the cause was a 64-entry IPC port table, and the visible symptom was `stat()` of an existing directory failing with "Out of memory" ([ipc.md](ipc.md#live_buckets-the-ceiling-that-looked-like-ram-history-the-table-is-a-slab-since-2026-10-19)). Today: `[IPC] port table FULL … this is ipc::port::LIVE_BUCKETS, not RAM`, `[VFS] ENOMEM: no reply port for this task`, `[SCHED] task table FULL … this is runqueue::MAX_TASKS, not RAM`, and the mapping failure reason from `mm::vmm::last_map_fail()` ([memory.md](memory.md#enomem-must-name-its-cause)).
 
 ## Fatal faults end the whole thread group
 
@@ -141,6 +143,18 @@ A new `static mut` must fit one of those categories and say which in a comment; 
 **Rule.** Any new code that sets `signal_pending`, `shared_signal_pending`, `stop_pending`, `saved_sigmask` or `group_exit_owner`, or unmasks a signal, does it under `RUN_QUEUE` and calls `Task::sig_kick` (or `RunQueue::sig_kick_group` for leader-held fields) in the same hold.
 
 **Why.** Syscall return and `interrupted()` skip the signal check without the lock when the thread's hint reads 0 ([signals.md](signals.md#the-lock-free-signal-hint)). A missing kick delays a signal until something else sets the hint. One fast return in 1024 re-checks under the lock and counts a miss; `/proc/rqhold`'s `# sigfast … miss N` must stay 0.
+
+## A fault kill and a forgotten guard must leave the lock accounting balanced
+
+**Rule.** Whatever path ends a task or releases a lock, the per-CPU record of held locks must come out right. Two cases: (1) an EL1 fault that kills the task must release every tracked lock the faulting CPU holds before the exit path runs; (2) any release that does not drop a guard (`force_unlock`, `mem::forget` of a re-taken guard) must also decrement the held-lock count.
+
+**Why.** (1) On the Pi 5 a data abort in `epoll_wait` (FAR 0, a torn per-thread snapshot) was classified by FAR as a user-pointer fault and the task was killed by the normal path, whose exit re-took `EPOLL_INSTANCES`, which the dying thread still held: all four CPUs spun on it. Now every `TrackedMutex` acquisition records the mutex and a type-erased force-unlock per CPU, and the EL1 fault-kill paths (aarch64 `exception.rs`, x86-64 `idt.rs`) call `force_release_held()` before `exit_group_signal` and log the mask (lane piepollnull). Plain `spin::Mutex` and sleeping locks are not covered. (2) `TrackedGuard::unlocked` released `UNIX_CONNS` with `spin::Mutex::force_unlock` around long AF_UNIX stream copies, but the vendored spin crate's held-count hook counted the acquire and `force_unlock` released nothing: net +1 per long copy. A CPU with a non-zero count "holds a spin lock" to `sleep_forbidden_reason` for ever, so every `KMutex`/wait-queue wait on it spins with IRQs masked; the desktop login moves enough unix-socket traffic to poison all CPUs, and it livelocked on both architectures (lane ipcregress, 2026-10-24). `force_unlock` now calls `held::released()`, and `/proc/lockstat` prints `spin_held <sum> <switch violations> <sleep violations>`; a persistent non-zero sum on an idle machine is this bug.
+
+## User memory is reached only through `uaccess`
+
+**Rule.** Kernel code, in-kernel servers and drivers read and write the current task's user memory only through `sched::uaccess` (`copy_from_user`, `copy_to_user`, `read_user`, `write_user`, `copy_user_str`, or a `UserAccess` window), with no filesystem, tty or driver lock held across the copy: copy in, work on a kernel buffer, copy out.
+
+**Why.** Under `pan=strict` a raw access is a hardware fault (see [memory.md](memory.md#smepsmap-and-pan-are-on-uaccess-is-the-only-way-in)), and independent of that a bad pointer under a lock killed the caller while it held the lock, wedging every later user. The 2026-10-19 audit (lane uaccess) converted `rt_sigaction`, `sigaltstack`, `getdents64` (kernel bounce buffer of up to 64 KiB, copied out with nothing held), `memfd_create`, the pty and console ioctls (`tty_ioctl_bounce`: per-command size and direction), the VT/KD ioctls and the kernel-side ioctls. A read path that must fault a never-touched page in uses the fault-tolerant copy, not a `virt_to_phys` write that gives up on an absent page: that was the console `read(0, buf, n)` returning `EFAULT` for a `.data` page that had never been touched (lane ttyefault; `uaccesstest` covers console, pipe, `readv`, file, socket, pty and anonymous mmap destinations).
 
 ## See also
 
