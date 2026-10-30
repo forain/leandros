@@ -46,3 +46,5 @@ ports/sudo-rs/out/
 # scripts/remote.py logs: fetched console logs and status of remote machines.
 artifacts/remote-logs/
 /.config
+# GStreamer port output (ports/gstreamer/build.sh)
+ports/gstreamer/out/
