@@ -2108,6 +2108,13 @@ def main():
         m4_share_dirs.add("/usr/sbin")
         m5_exec_files.append(("/usr/sbin", "espctl", p))
 
+    # leandros-install: the installer backend (userland/leandros-install),
+    # run as root (the GUI goes through sudo): list disks, install to one.
+    p = f"userland/leandros-install/target/{_musl_triple}/release/leandros-install"
+    if os.path.exists(p):
+        m4_share_dirs.add("/usr/sbin")
+        m5_exec_files.append(("/usr/sbin", "leandros-install", p))
+
     # disktester loads its provisioning strategy from a path RELATIVE to the
     # working directory — load_provisioning("crates/provisioning/tests/
     # use_whole_disk.kdl") in its main.rs — so the file has to be reachable

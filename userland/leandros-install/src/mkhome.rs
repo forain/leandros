@@ -463,3 +463,17 @@ pub fn write_home(path: &Path, size: u64, uuid: &[u8; 16], time: u64, head_only:
     f.sync_all().ok();
     Ok(total_blocks * BLOCK as u64)
 }
+
+/// Write the head of a fresh volume of `size` bytes at byte offset `off` of an
+/// open block device (or file). Everything past the head is left alone: the
+/// f2fs server zeroes the blocks it allocates. Returns the bytes written.
+pub fn write_home_at(f: &mut std::fs::File, off: u64, size: u64, uuid: &[u8; 16], time: u64) -> io::Result<u64> {
+    let (blocks, _total) = build(size, uuid, time).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut n = 0;
+    for (b, data) in &blocks {
+        f.seek(SeekFrom::Start(off + b * BLOCK as u64))?;
+        f.write_all(data)?;
+        n += data.len() as u64;
+    }
+    Ok(n)
+}
