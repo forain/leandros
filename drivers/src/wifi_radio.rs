@@ -119,18 +119,39 @@ pub trait Radio {
 #[derive(Clone, Copy)]
 pub struct KSsid { pub len: u8, pub b: [u8; 32] }
 
+pub const KRSN_PW: usize = 8;
+pub const KRSN_AKM: usize = 12;
+
+/// A BSS as a C struct: every field of `wifi_frame::Bss` explicitly (the sim and the Pi build
+/// theirs from firmware events, so the IEs alone do not reproduce it). Pointers borrow the hit.
 #[repr(C)]
 pub struct KScanHit {
     pub bssid: [u8; 6],
     pub channel: u8,
     pub rssi: i8,
     pub dtim: u8,
+    pub wpa1: u8,
+    pub ht: u8,
+    pub vht: u8,
+    /// 0 = no ERP element, else 1 and `erp` holds the flags.
+    pub has_erp: u8,
+    pub erp: u8,
     pub capability: u16,
     pub beacon_interval: u16,
     pub tsf: u64,
     pub ssid: KSsid,
     pub ies: *const u8,
     pub ies_len: usize,
+    pub rates: *const u8,
+    pub rates_len: usize,
+    pub has_rsn: u8,
+    pub rsn_n_pw: u8,
+    pub rsn_n_akm: u8,
+    pub rsn_version: u16,
+    pub rsn_caps: u16,
+    pub rsn_group: u32,
+    pub rsn_pw: [u32; KRSN_PW],
+    pub rsn_akm: [u32; KRSN_AKM],
 }
 
 pub const KFAIL_MSG: usize = 120;
@@ -170,50 +191,50 @@ pub fn fail_from_k(k: &KWifiFail) -> Fail {
     }
 }
 
-/// The scan hit as a C struct borrowing `h` (its IEs).
+/// The scan hit as a C struct borrowing `h` (its IEs and rates).
 pub fn hit_to_k(h: &ScanHit) -> KScanHit {
+    let b = &h.bss;
     let mut ssid = KSsid { len: 0, b: [0; 32] };
-    let n = h.bss.ssid.len().min(32);
-    ssid.b[..n].copy_from_slice(&h.bss.ssid[..n]);
+    let n = b.ssid.len().min(32);
+    ssid.b[..n].copy_from_slice(&b.ssid[..n]);
     ssid.len = n as u8;
-    KScanHit {
-        bssid: h.bss.bssid, channel: h.bss.channel, rssi: h.rssi, dtim: h.bss.dtim_period,
-        capability: h.bss.capability, beacon_interval: h.bss.beacon_interval, tsf: h.bss.tsf, ssid,
-        ies: h.bss.ies.as_ptr(), ies_len: h.bss.ies.len(),
+    let mut k = KScanHit {
+        bssid: b.bssid, channel: b.channel, rssi: h.rssi, dtim: b.dtim_period, wpa1: b.wpa1 as u8, ht: b.ht as u8, vht: b.vht as u8,
+        has_erp: b.erp.is_some() as u8, erp: b.erp.unwrap_or(0), capability: b.capability, beacon_interval: b.beacon_interval,
+        tsf: b.tsf, ssid, ies: b.ies.as_ptr(), ies_len: b.ies.len(), rates: b.rates.as_ptr(), rates_len: b.rates.len(),
+        has_rsn: 0, rsn_n_pw: 0, rsn_n_akm: 0, rsn_version: 0, rsn_caps: 0, rsn_group: 0, rsn_pw: [0; KRSN_PW], rsn_akm: [0; KRSN_AKM],
+    };
+    if let Some(r) = &b.rsn {
+        k.has_rsn = 1;
+        k.rsn_version = r.version;
+        k.rsn_caps = r.caps;
+        k.rsn_group = r.group;
+        let np = r.pairwise.len().min(KRSN_PW);
+        let na = r.akm.len().min(KRSN_AKM);
+        k.rsn_pw[..np].copy_from_slice(&r.pairwise[..np]);
+        k.rsn_akm[..na].copy_from_slice(&r.akm[..na]);
+        k.rsn_n_pw = np as u8;
+        k.rsn_n_akm = na as u8;
     }
+    k
 }
 
-/// Rebuild the BSS from the C struct: a synthetic beacon around the IEs goes through
-/// `wifi_frame::parse_beacon` (so the parsed fields stay in step with the IEs), then the explicit
-/// fields override.
+/// Rebuild the BSS from the C struct.
 pub fn hit_from_k(k: &KScanHit) -> Option<ScanHit> {
-    let ies: &[u8] = if k.ies.is_null() { &[] } else { unsafe { core::slice::from_raw_parts(k.ies, k.ies_len) } };
-    let ssid = &k.ssid.b[..(k.ssid.len as usize).min(32)];
-    let mut f: Vec<u8> = Vec::with_capacity(36 + ssid.len() + 2 + ies.len());
-    f.extend_from_slice(&[0x80, 0x00, 0, 0]);
-    f.extend_from_slice(&[0xff; 6]);
-    f.extend_from_slice(&k.bssid);
-    f.extend_from_slice(&k.bssid);
-    f.extend_from_slice(&[0, 0]);
-    f.extend_from_slice(&k.tsf.to_le_bytes());
-    f.extend_from_slice(&k.beacon_interval.to_le_bytes());
-    f.extend_from_slice(&k.capability.to_le_bytes());
-    if ies.first() != Some(&0) {
-        f.push(0);
-        f.push(ssid.len() as u8);
-        f.extend_from_slice(ssid);
-    }
-    f.extend_from_slice(ies);
-    let mut bss = wf::parse_beacon(&f, k.channel)?;
-    bss.bssid = k.bssid;
-    bss.ssid = ssid.to_vec();
-    bss.channel = k.channel;
-    bss.tsf = k.tsf;
-    bss.beacon_interval = k.beacon_interval;
-    bss.capability = k.capability;
-    bss.dtim_period = k.dtim;
-    bss.rssi = k.rssi;
-    bss.ies = ies.to_vec();
+    let sl = |p: *const u8, n: usize| -> Vec<u8> { if p.is_null() || n == 0 { Vec::new() } else { unsafe { core::slice::from_raw_parts(p, n) }.to_vec() } };
+    let rsn = if k.has_rsn != 0 {
+        Some(wf::RsnInfo {
+            version: k.rsn_version, group: k.rsn_group, caps: k.rsn_caps,
+            pairwise: k.rsn_pw[..(k.rsn_n_pw as usize).min(KRSN_PW)].to_vec(),
+            akm: k.rsn_akm[..(k.rsn_n_akm as usize).min(KRSN_AKM)].to_vec(),
+        })
+    } else { None };
+    let bss = wf::Bss {
+        bssid: k.bssid, ssid: k.ssid.b[..(k.ssid.len as usize).min(32)].to_vec(), channel: k.channel,
+        beacon_interval: k.beacon_interval, capability: k.capability, tsf: k.tsf, rates: sl(k.rates, k.rates_len), rsn,
+        wpa1: k.wpa1 != 0, ht: k.ht != 0, vht: k.vht != 0, dtim_period: k.dtim,
+        erp: if k.has_erp != 0 { Some(k.erp) } else { None }, rssi: k.rssi, ies: sl(k.ies, k.ies_len),
+    };
     Some(ScanHit { bss, rssi: k.rssi })
 }
 
