@@ -12,6 +12,8 @@ const USAGE: &str = "usage:
   leandros-install list [--json] [--allow-removable]
   leandros-install install --target /dev/X --yes [--root-gib N] [--allow-removable]
                            [--no-verify] [--zero-fill] [--json] [--dry-run]
+  leandros-install repair-esp [--boot DEV] [--esp DEV]
+      recreate the three LeandrOS files on a dual-boot disk's shared ESP (runs espctl repair-esp)
   leandros-install gaps --dev FILE|/dev/X [--sector-size 512|4096]
   leandros-install mkhome --out FILE --size SIZE [--uuid HEX] [--time EPOCH] [--full]";
 
@@ -93,6 +95,15 @@ fn parse_opts(args: &[String]) -> Opts {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("repair-esp") => {
+            // The ESP logic lives in espctl (fatfs, owner markers); one implementation.
+            let st = std::process::Command::new("espctl").arg("repair-esp").args(&args[1..]).status();
+            match st {
+                Ok(s) if s.success() => {}
+                Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+                Err(e) => die(&format!("cannot run espctl: {e}")),
+            }
+        }
         Some("gaps") => gaps_cmd(&args),
         Some("mkhome") => mkhome_cmd(&args),
         Some("list") => install::list(&parse_opts(&args)),

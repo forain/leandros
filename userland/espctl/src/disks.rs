@@ -16,6 +16,9 @@ pub enum Kind {
     /// partition is a second 0x83 and reads as Linux).
     Home,
     BiosBoot,
+    /// The private LeandrOS boot partition of a dual-boot disk (FAT, holds
+    /// Limine, kernels and espctl's state; the shared ESP only chains to it).
+    Boot,
     Other(String),
 }
 
@@ -27,6 +30,7 @@ impl Kind {
             Kind::Linux => "linux".into(),
             Kind::Home => "home".into(),
             Kind::BiosBoot => "bios-boot".into(),
+            Kind::Boot => "leandros-boot".into(),
             Kind::Other(s) => s.clone(),
         }
     }
@@ -40,6 +44,19 @@ pub struct Part {
     pub start: u64,
     pub size: u64,
     pub kind: Kind,
+    /// GPT unique partition GUID, mixed-endian on disk (zero on MBR).
+    pub uniq: [u8; 16],
+}
+
+impl Part {
+    /// The PARTUUID as the usual upper-case string.
+    pub fn partuuid(&self) -> String {
+        let g = &self.uniq;
+        format!(
+            "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+            g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]
+        )
+    }
 }
 
 const ESP_GUID: [u8; 16] = guid_le(0xC12A7328, 0xF81F, 0x11D2, [0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B]);
@@ -49,6 +66,7 @@ const HOME_GUID: [u8; 16] = guid_le(0x933AC7E1, 0x2EB4, 0x4F13, [0xB8, 0x44, 0x0
 const LROOT_GUID: [u8; 16] = guid_le(0x3F2D991B, 0xD385, 0x4FFF, [0x9C, 0xF1, 0xA0, 0xDB, 0x03, 0x06, 0x2D, 0xE5]);
 const LHOME_GUID: [u8; 16] = guid_le(0xF936DEE1, 0x99D9, 0x4BBC, [0x8D, 0x2A, 0xB7, 0x44, 0x7D, 0xB9, 0xF6, 0x50]);
 const LLOG_GUID: [u8; 16] = guid_le(0x3EC8FA02, 0x816A, 0x4D04, [0x87, 0x18, 0x64, 0xC3, 0x77, 0x1C, 0x51, 0x87]);
+const LBOOT_GUID: [u8; 16] = guid_le(0x0E02ED9A, 0xFEEE, 0x4CAB, [0xA2, 0x2F, 0xC8, 0x61, 0xAD, 0x7D, 0xE3, 0x07]);
 const BIOS_GUID: [u8; 16] = guid_le(0x21686148, 0x6449, 0x6E6F, [0x74, 0x4E, 0x65, 0x65, 0x64, 0x45, 0x46, 0x49]);
 
 const fn guid_le(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
@@ -143,7 +161,7 @@ pub fn scan_disk(disk: &str) -> Vec<Part> {
                 t => Kind::Other(format!("mbr-{:02x}", t)),
             };
             let pno = i as u32 + 1;
-            out.push(Part { disk: disk.into(), dev: part_dev(disk, pno), pno, start: start * 512, size: len * 512, kind });
+            out.push(Part { disk: disk.into(), dev: part_dev(disk, pno), pno, start: start * 512, size: len * 512, kind, uniq: [0u8; 16] });
         }
         return out;
     }
@@ -181,13 +199,15 @@ pub fn scan_disk(disk: &str) -> Vec<Part> {
                 Kind::Linux
             } else if t == HOME_GUID || t == LHOME_GUID {
                 Kind::Home
+            } else if t == LBOOT_GUID {
+                Kind::Boot
             } else if t == BIOS_GUID {
                 Kind::BiosBoot
             } else {
                 Kind::Other("gpt-other".into())
             };
             let pno = i as u32 + 1;
-            out.push(Part { disk: disk.into(), dev: part_dev(disk, pno), pno, start: first * lbs, size: (last + 1 - first) * lbs, kind });
+            out.push(Part { disk: disk.into(), dev: part_dev(disk, pno), pno, start: first * lbs, size: (last + 1 - first) * lbs, kind, uniq: e[16..32].try_into().unwrap() });
         }
         return out;
     }
