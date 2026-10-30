@@ -706,6 +706,42 @@ unsafe fn groups_probe(want: u32) -> i32 {
     if n == 1 && g[0] == want { 0 } else { 1 }
 }
 
+// ── sysfs backlight (group video) ────────────────────────────────────────────
+
+const BL_BRIGHT: &[u8] = b"/sys/class/backlight/intel_backlight/brightness\0";
+const BL_MAX: &[u8] = b"/sys/class/backlight/intel_backlight/max_brightness\0";
+
+unsafe fn have_backlight() -> bool {
+    let mut st = [0u8; STAT_SIZE];
+    raw_stat(BL_BRIGHT.as_ptr(), st.as_mut_ptr()) == 0
+}
+
+/// uid 1000 WITH group 44: may open brightness for write, stat is 0664 root:44,
+/// but a read-only sibling attribute stays closed. SKIP without a backlight.
+unsafe fn case_backlight_group(_root: &[u8]) -> bool {
+    if !have_backlight() { out(b"    SKIP: no backlight device\n"); return true; }
+    let mut ok = true;
+    let fd = open(BL_BRIGHT.as_ptr(), O_WRONLY, 0);
+    ok &= step(fd >= 0, b"group 44 opens backlight brightness for write");
+    if fd >= 0 { close(fd); }
+    let mut st = [0u8; STAT_SIZE];
+    ok &= step(raw_stat(BL_BRIGHT.as_ptr(), st.as_mut_ptr()) == 0, b"stat brightness");
+    let mode = u32::from_ne_bytes(st[STAT_MODE_OFF..STAT_MODE_OFF + 4].try_into().unwrap());
+    ok &= step(mode & 0o7777 == 0o664, b"brightness mode is 0664");
+    ok &= step(stat_gid(BL_BRIGHT.as_ptr()) == GID_VIDEO, b"brightness gid is 44");
+    ok &= step(fails_with(open(BL_MAX.as_ptr(), O_WRONLY, 0) as isize, EACCES), b"group 44 still cannot write a non-brightness attribute");
+    ok
+}
+
+/// uid 1000 WITHOUT group 44: EACCES on the same open.
+unsafe fn case_backlight_nogroup(_root: &[u8]) -> bool {
+    if !have_backlight() { out(b"    SKIP: no backlight device\n"); return true; }
+    let mut ok = true;
+    ok &= step(fails_with(open(BL_BRIGHT.as_ptr(), O_WRONLY, 0) as isize, EACCES), b"no group 44: brightness write is EACCES");
+    ok &= step(fails_with(open(BL_MAX.as_ptr(), O_WRONLY, 0) as isize, EACCES), b"no group 44: max_brightness write is EACCES");
+    ok
+}
+
 // ── execve x-bit ─────────────────────────────────────────────────────────────
 
 /// Fork + exec `path`; returns the wait status, or -errno when execve failed
@@ -978,6 +1014,13 @@ unsafe fn run_matrix(root: &[u8], tag: &[u8], with_sockets: bool, with_exec: boo
         let n = named(b"group_allowed_supplementary");
         let nm = core::slice::from_raw_parts(n, 27 + tag.len());
         if !report(nm, run_as_groups(UID_USER, UID_USER, &[GID_VIDEO], case_group_allowed, root)) { failures += 1; }
+    }
+
+    case!(b"backlight_nogroup", UID_USER, case_backlight_nogroup);
+    {
+        let n = named(b"backlight_group");
+        let nm = core::slice::from_raw_parts(n, 15 + tag.len());
+        if !report(nm, run_as_groups(UID_USER, UID_USER, &[GID_VIDEO], case_backlight_group, root)) { failures += 1; }
     }
 
     if with_exec {
