@@ -88,6 +88,33 @@ It boots, logs in as root on the serial console and runs each command through th
 | `ssh`, `sshfull` | host `sshsmoke.py`, `sshsmoke.py --full` (keys, sftp/scp, git over ssh/https) |
 | `drm` | `drmsmoke` (needs `--gpu virgl` or `--venus`) |
 
+Suites added since 2026-10-18 (all in `SUITES` of `runtests.py`, or commands in `regress`). Host-side `*.py` scripts are `host:` commands that boot their own VM with a specific disk, cmdline or fault injection:
+
+| Suite or command | What it guards |
+|---|---|
+| `uaccesstest` (regress) | Destinations that are valid but untouched (console, pipe, `readv`, file, socket, pty, anonymous mmap) are faulted in rather than `EFAULT`; bad ones fail cleanly |
+| `epolltest cost` / `abi` / `stat` / `churn [secs] [tfork]`, `polltest` | Per-call epoll cost, ABI details, the stat table, and the churn stress (waiters, a thread spawner, a pipe poker, children exec'ing from a non-leader thread; `tfork` forks from the spawner thread). Suites `epollcost`, `epollabi` |
+| `pthreadtest churn 5000` (regress) | Thread create/join/detach leaves the VMA count, `VmSize` and RSS flat (fails on >16 VMAs, >16 MB, >2 MB growth) |
+| `shmtest memfd_lazy`, `shmtest bench` | Lazy `MAP_SHARED` of memfd/tmpfs: two mappings plus `pwrite`/`pread`, a kernel copy into an untouched page, `close(fd)` then touch, a forked child write; a bench of untouched and touched cost |
+| `mmapbench [iters]` | `mmap`/`touch`/`munmap` microbench (anonymous and memfd, with busy siblings) used for the shootdown work |
+| `killmt <n> proclife` (regress) | Exec de-thread against `SIGKILL`, a fatal signal, a sibling fault and a concurrent `clone` (`exec_kill`, `exec_exit`, `exec_sibterm`, `exec_sibfault`, `exec_clone`) |
+| `pstest` (`test_kthread_exit`) | pid 1 stays init, returning kernel threads leave no process behind |
+| `schedstress short`, `futextest` | Scheduler stress; futex lost-wake guard |
+| `kexec -l … && kexec -u` (regress); `kexectest`; suites `kexecfdt`, `kexecblk` | Load/unload smoke; chained kexec generations (`kexecfdt` leaves the VM kexec'd gen0..gen4 and checks the FDT block is returned); kexec with the root on a block module |
+| `f2fscptest`, `f2fscrashtest`, `f2fsfulltest`, `f2fsorphantest`, `f2fsgctest` (`.py`) | f2fs checkpoint, power-cut, near-full, orphan and GC behaviour; `F2FS_TEST_LEGACY=1` selects the old-format fixture where one remains |
+| `blkslow`, `blkmany`, `blkfault`, `nvmefault`, `rootpick`, `stdev`, `pcibridge` | Block layer: slow media, many devices, injected faults, NVMe reset after a timeout, the root not depending on virtio probe order, two disks cloned from one image (`stdev`: distinct device identity), PCI-PCI bridge chains on AArch64 |
+| `usbisoch`, `usbstalltest`, `usbunplugtest`, `udevhottest` | xHCI isochronous pipes, stalls, mass-storage unplug/re-plug, hot-plugged HID reaching the compositor |
+| `nettxtest`, `netidle`, `linkmon`, `netmetric`, `udppeer`, `inload` | Net daemon sleep/wake behaviour on a full TX queue and on idle, link-change interrupts, metrics, UDP peers, a heavy-traffic input-load guard |
+| `listentag`, `nettag2`, `vfstag`, `kparks`, `pollnarrow` | Narrow parking: a TCP listener's pollers, blocked VFS waiters, console poll/epoll and `VT_WAITACTIVE` park on their own key and wake on their event |
+| `trialwatchtest.py`, `psklogtest.py`, `straysweep`, `serialkbd`, `serialxfer`, `powerctltest.py` | The netwatch trial watch; no PSK in logs or `/proc/cmdline`; init's stray sweep not killing sshd threads; serial-console bytes never appearing as keyboard events; serial file push; power off from the greeter and a user session |
+| `rpi5check` | The rpi5 kernel compile-checks inside `runtests` |
+| `permtest` (not in regress) | Includes the backlight group cases; run it explicitly |
+| `bttest`, `kmodctltest`, `netlinktest`, `proctest`, `strtest`, `floattest` | Bluetooth host core, module control, netlink, `/proc`, relibc string conformance, hard-float C ABI |
+
+Known flakes (re-run once under the lock before investigating): the `nettag2test` wake-count cases, `sigtest timed_wait_stop_resumes_remainder`, `timertest realtime_is_not_uptime`, `scmtest tcp_connect_refused`, `sshsmoke ssh_hostkey`. A wedged `socket_vmnet` bridge (one stalled VM deafens the others) makes `runtests` fall back to SLIRP.
+
+The graphical session has its own tests
+
 The graphical session has its own tests outside `runtests.py`, because `regress` boots without a compositor. `blanktest.py <arch> [tag]` boots a GPU session (`ffsession.py --nofirefox`) and runs `/bin/blanktest` against cosmic-comp. The test powers every output off and checks four things: frame callbacks keep coming at about 1/s, a window mapped while the outputs are off gets its first callback, an idle inhibitor on such a window does not resume idle, and the compositor leaves the outputs off ([ports/cosmic-comp](../../ports/cosmic-comp/README.md)).
 
 A command `host:<script> [args]` runs a script from the skill directory on the host. Output goes to `$FFSESSION_OUT/tests-<tag>/` (default `/tmp/ffsession`): every command's output, the serial log, QEMU's full serial log and `summary.json`; the exit status is 0 only if every command returned 0 with a known status.

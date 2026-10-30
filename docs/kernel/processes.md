@@ -133,6 +133,13 @@ Tasks carry `pgid` and `sid`; `setpgid`/`setsid`/`getsid` follow Linux's rules (
 - **Start time**: `Task::start_ns` is a thread group's creation time; `/proc/<pid>/stat` field 22 reports it in clock ticks.
 - **`/proc/<pid>/exe`** is synthesised by the VFS server (there is no separate proc server) from the tgid-keyed `EXE_PATHS` table for any pid, not just the `self` alias. It resolves inside `readlink(2)` only — nothing `open`s or `execve`s that path, which is why greetd's session worker must call `std::env::current_exe()` before it forks rather than handing the magic path to `execv`. See [../servers/vfs.md](../servers/vfs.md).
 
+### Kernel threads: pid 1 is reserved, returning is clean
+
+A kernel thread (`kthread::spawn`, the `kexit` canary, drivers such as `btusb`) is a `Task` flagged `kthread` with session and process group 0. Two rules came out of lane kexit (2026-10-27):
+
+- **pid 1 belongs to init.** `alloc_pid` hands pids out in order, and a kernel thread spawned before `/bin/init` (btusb on the laptop) took pid 1; init became pid 3, and when that thread returned, pid 1 was gone, so `ps -e`, `ps aux`, `ps -u root`, `/proc/1/stat` and sudotest's start time all failed. `alloc_kthread_pid` never returns pid 1 while it is unclaimed; the first non-kernel task gets it. The permanent canary in `kernel/src/init.rs` (`kexit0`, `kexit1`, which take pids 2 and 3) makes a regression visible in every boot, and `pstest` case `test_kthread_exit` checks `/proc/1/stat`, `ps -e` and the absence of a kernel zombie.
+- **Returning is `kthread_exit()`.** `kthread_main` ends in it: the task becomes a born-reaped zombie with no exit-log entry and no process-exit hooks, and `exit()` diverts for kernel threads. A returning kernel thread therefore leaves no process behind.
+
 ## Design decisions
 
 ### Fatal signals and faults end the whole thread group
@@ -175,13 +182,23 @@ Tasks carry `pgid` and `sid`; `setpgid`/`setsid`/`getsid` follow Linux's rules (
 
 At least seven instances were found and fixed (`install_dmabuf_vmo`, eventfd/timerfd refcounts, `vfs_get_node_kind`, `tmpfile_owner_of` in `77f170d`, the POSIX timer table, `sys_fcntl`'s stdio `F_GETFL`, `sys_execve`'s `steal_mounted_file`). The rule that ended it is structural: canonicalise once at each server's IPC choke point, and make every `pub fn` that bypasses `handle()` canonicalise itself. The inverse mistake is real too: teardown helpers called on *every* thread exit must stay gated to leader exits (`if sched::tgid_of(pid) == pid`), or a worker thread's exit would wipe process-wide console/timer state out from under its siblings.
 
+### Exec, fatal signals and clone racing a group exit
+
+Several races between a non-leader `execve` (which de-threads the group), a fatal signal and a concurrent `clone` were closed on 2026-10-24 (lanes killexec, killexec2, fatalsig, faultclaim, exitexec). The common shape: a decision to end the group was made in one `RUN_QUEUE` hold and *claimed* in a later one, and the de-thread slipped into the gap.
+
+- **A fatal signal is never dropped with a reaped sibling.** `kill_next_group_member_except` scans the reaped member's unblocked pending set: `SIGKILL` first, else the lowest signal whose action is `SIG_DFL` and whose default terminates (`signal::default_terminates`). It becomes the exec'ing thread's `forced_exit`, so the exec fails with that signal (`WTERMSIG`). Blocked, handled, ignored, stop and default-ignore signals stay with the thread, as thread-directed signals do on Linux.
+- **The claim is made in the deciding hold.** `claim_fatal_signal_locked` runs in the `RUN_QUEUE` hold that dequeues a default-kill signal (`check_and_deliver_signals`) and in the hold in which `fault_signal` decides a user fault gets no handler. Either that thread owns the group exit and a racing exec loses its claim and dies, or a non-leader exec already owns it and the signal becomes the exec's `forced_exit`.
+- **A `tgkill` at a sibling the de-thread already marked `group_killed`** with a default-kill signal goes to the exec's owner instead of being lost.
+- **`clone`/`fork` checks for a group exit in the hold that enqueues the child**, like Linux's `copy_process` returning `-ERESTARTNOINTR` on a pending fatal signal. Without it a second `clone` in flight while another thread exec'd joined the group after the sibling kill loop had looked past it, and the exec finished with a thread of the old image still running.
+- Guards: `killmt proclife` (`exec_kill`, `exec_exit`, `exec_sibterm`, `exec_sibfault`) in the regress suite.
+
 ## Limitations and open work
 
 - **`AT_RANDOM` is derived from the tick counter**, not from the kernel CSPRNG that `getrandom` uses, so it is predictable; it seeds libc stack-protector canaries and pointer guards. `execve` honours the set-user-ID/set-group-ID bits (`/bin/su`, `/bin/sudo`; see [../servers/security.md](../servers/security.md#su-and-sudo)); `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID` carry the real and new effective ids, and `AT_SECURE` is set when they differ.
 - **`CLOSE_RANGE_UNSHARE` and `unshare(CLONE_FILES)` cannot split a thread off its process's fd table.** Fd tables are keyed by tgid. In a single-threaded caller, such as a vfork child before exec, the result is the same as Linux. A thread that asks gets the closes applied to its siblings too (`close_range`), or EINVAL (`unshare`).
 - A signal-killed group still becomes waitable when its leader is reaped, before a sibling's CPU drops the last address-space reference; `killmt` tolerates the window, the kernel still has it.
 - `with_task_address_space` (evdev/drm) reads a page-table root without taking a reference, a latent race against any address-space drop.
-- A `SIGKILL` landing during the takeover window of a non-leader `execve` can still reap the parked leader as a process exit.
+- The non-leader `execve` takeover window is closed for fatal signals (above); what remains open is only the ordinary race that a group exit begun elsewhere in the same instant fails the exec with the signal, which is Linux's behaviour too.
 - No core dumps. `clone3` is `ENOSYS` (callers fall back to `clone`), so `CLONE_PIDFD` is only reachable through `clone`.
 - `times(2)` reports zero CPU times (the per-task `cpu_ns` behind `CLOCK_*_CPUTIME_ID` is not wired into it).
 

@@ -148,6 +148,15 @@ Two harness traps cost a cycle each and are worth knowing before writing a futex
 
 Second, the `EINTR` the stress case saw came from a `SIGCHLD` handler *without* `SA_RESTART` left installed by an earlier test case; under load the forked child's exit landed on the correctly restarted wait. With `SIGCHLD` at `SIG_DFL` both arches give 0/100 `EINTR`. The investigation did find two real bugs next to the false one — a claimed wake could be turned into a restart and lost, and an ignored signal returned a spurious 0 — both fixed (`8002838`, `2f7d101`). The stress cases are now strict: a handled signal must give `EINTR` at the signal with the handler run once, an ignored one `ETIMEDOUT` at ≥ 350 ms.
 
+### Thread exit in the C library: what the kernel provides and what relibc must do
+
+Two October 2026 hangs and a leak were not kernel bugs, and are recorded here because the kernel contract they rest on is easy to forget.
+
+- **A thread's stack and TCB must be unmapped by someone.** relibc never unmapped an exited thread's 1 MiB pthread stack or its TCB/TLS mapping: two VMAs and about 1 MiB of address space per thread, forever (`pthreadtest churn 5000` went 208 to 10208 VMAs and 113 MB to 5.29 GB of address space; `epolltest churn 25 tfork` managed only ~2k thread spawns in 45 s). The kernel side was fine: `set_tid_address` registers `Pthread::exit_tid`, and at thread exit the kernel zeroes it and futex-wakes it. relibc now has `pthread_join` wait for `exit_tid == 0` and then unmap both; exited detached threads push themselves on a lock-free `ZOMBIES` list that the next `pthread_create`/`join` reaps once `exit_tid` is 0; an `EXITING` flag closes the detach-after-exit race. After the fix the same churn is flat at 8 VMAs and 9.5 MB, in 0.9 s.
+- **Exit-time signals and cancellation** are blocked by relibc while a thread tears down, `pthread_detach` no longer blocks, and a fork child drops the zombie list it inherited (lane threadleak2); `churn` has a cancel phase.
+- **`fork()` must hold relibc's thread-map lock.** relibc inserts into `OS_TID_TO_PTHREAD` (a futex mutex) after the `clone`, and the insert allocates, so the lock order is map then allocator. `fork()` took only the allocator lock (its atfork hook), so a forker thread holding the allocator across a ~57 ms fork let the main thread fork a child whose copy of the map was locked by a thread that did not exist there, and the child's first `pthread_create` waited forever. `fork()` now runs under `pthread::with_thread_map_locked` (relibc `88bbaa57`). Nothing in the kernel log showed it.
+- The regress suite carries `/bin/pthreadtest churn 5000`, `/bin/epolltest churn 20` and `/bin/epolltest churn 20 tfork`.
+
 ## Limitations and open work
 
 - **Shared futexes are keyed by virtual address**, not physical page: two processes sharing a `MAP_SHARED` futex word at *different* addresses will not wake each other, and non-private waiters at the same address in unrelated processes can be woken spuriously (harmless — waiters re-check).

@@ -61,6 +61,10 @@ A laptop reachable only over Wi-Fi is lost when a trial kernel breaks the networ
 - **`promote` removes `netwatch=` from the good entry.** Promoting copies the trial's command line, and a good kernel must never reboot itself for a network outage; `remote.py promote` (and `deploy-kernel --promote`) strips the knob afterwards with `espctl cmdline good …`.
 - `netwatchtest.py <arch>` in the run-leandros skill checks it in QEMU: a boot with no NIC (`LEANDROS_NIC=none`) must print the line and reset; a boot with a NIC must stay up.
 
+### The trial watch: reachability for the whole trial
+
+Since lane netwatch2 (2026-10-24) the watchdog does not only look at boot. When the kernel booted as `leandros.slot=trial` (the one-shot entry `espctl` arms) and any `netwatch` knob is set, it keeps probing: every `netwatch.every=` (10 s) an ICMP echo goes to `netwatch.host=` (default: the default gateway, which must answer ARP first). It reboots into the good entry only when no reply has come for `netwatch.reach=` (300 s; 0 = off) **and** the last `netwatch.fails=` (3) probes all failed, so a Wi-Fi blip shorter than `reach` never fires. `netwatch.trial_max=` (minutes, off by default) reboots an un-promoted trial after that long regardless. Durations take `s`/`m`/`h`. `promote` disarms everything for the rest of that boot, so a promoted kernel never reboots itself. `trialwatchtest.py` in the run-leandros skill drives the real one-shot path in QEMU (`deploy-kernel --netwatch` against a VM, a 20 s link blip that must not reboot, a long loss that must land on the good slot, an immediate promote that must disarm).
+
 ### When a trial does not come back
 
 `deploy-kernel --reboot` and `reboot` wait 300 s by default and then say what to do:
@@ -71,6 +75,31 @@ A laptop reachable only over Wi-Fi is lost when a trial kernel breaks the networ
 4. Last resort: re-flash the stick (`scripts/write-usb.sh x86_64 /dev/diskN`, which keeps `/home`), or read its log partition on the Mac with `scripts/read-usb-log.sh /dev/rdiskN --all`.
 
 For a kernel-only A/B, build only the kernel and reuse the initrd already on the ESP (`remote.py espctl get /leandros/k/<good>/initrd.gz <file>`, then `remote.py pull`). A full `build-all.sh` in a fresh worktree needs about 6 GB of disk.
+
+### Taking the laptop: the lock and the verify-then-promote rule
+
+One laptop serves every lane, so deploy, measure and promote happen inside **one hold** of the orchestration directory's `lock.sh laptop` (the same script takes `qemu`, `box` and `merge` slots; stale locks from a dead pid are reclaimed). Three rules came from incidents:
+
+- **A trial is built from current `main`.** Merge `main` into the lane right before the build; a promotion from an older base silently drops other lanes' fixes from the good kernel. Report both the promoted hash and the `main` commit it contains.
+- **Check that the booted kernel is yours before measuring or promoting.** Another lane may have booted its own trial in between: compare `uname -v` and the slot ids with the build you deployed, and never drop the lock between that check and `promote` (a wrong promotion happened on 2026-10-28).
+- **Measure with the screen lit.** After about 15 minutes without input the panel blanks. What looked like a Firefox hang on the laptop was the blanked panel (the same on an older kernel); measure within about 15 minutes of the desktop login, or keep the session active.
+
+Logins for scripted desktop sessions are stored outside the repository; read them from there at use time and never print them. Secrets are kept off the media: `espctl scrub-psk` removes `wifi.psk=` tokens from `limine.conf` and `factory.conf` on the ESP, and `espctl oneshot <entry-file> <save-path>` boots a foreign Limine entry once (for example a Linux comparison baseline) with `oneshot-restore` as the recovery.
+
+## The Raspberry Pi 5 flow
+
+A Pi 5 with network and the remote key takes kernels the same way, without an SD swap. The firmware boots the card's `kernel.img` (the factory kernel) and the LeandrOS root holds the real kernels in `/boot/pi/{trial,good,prev}/{kernel,initrd,info}`; the card's FAT partition is not reachable from LeandrOS, so a new kernel is staged into the root and entered with `kexec` ([boot.md](../kernel/boot.md#kexec-leandros-to-leandros)). Build with `./scripts/build-all.sh --arch aarch64 --rpi5` (release only), then:
+
+```sh
+export LEANDROS_REMOTE=pi LEANDROS_PI_HOST=<pi-ip>     # or LEANDROS_REMOTE=pi:<ip>
+python3 scripts/remote.py pi-deploy [--append ARGS]    # upload to /boot/pi/trial, kexec, wait, check uname -v
+python3 scripts/remote.py pi-status                    # slots, running kernel, cmdline
+python3 scripts/remote.py pi-promote                   # trial -> good, old good -> prev (only if running the trial)
+python3 scripts/remote.py pi-boot good [--append ARGS] # after a power cycle: back to the promoted kernel
+python3 scripts/remote.py pi-sync [--dry-run] [--list] # update the root file system in place
+```
+
+`--append` is per boot, not cumulative. `pi-deploy` refuses an ELF whose lowest `PT_LOAD` is not `0x200000`. A bad kernel is recovered by a power cycle; then `pi-boot good`. Updating `kernel.img` itself still needs a card swap (`scripts/prepare-rpi5-sdcard.sh`). `pi-sync` regenerates the root manifest (path, mode, owner, size, sha256, symlink targets) from the current build, diffs it against the target by sha256, and updates files in place with verified bundles and per-file atomic renames; it preserves `shadow`, SSH keys and other local state, and requires `rg`, `grep` and `dmesg` on the target. Wi-Fi and SSH secrets are stripped from the build environment of the manifest step. Without network, the 3-pin UART is the only channel ([raspberry-pi-5.md](../hardware/raspberry-pi-5.md)); a serial-console file push plus `kexec` exists for that case (lane piserialxfer, `serialxfertest.py`). The `pi-remote` skill has the expected serial output of a kexec.
 
 ## Starting the desktop remotely
 
