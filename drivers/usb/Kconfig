@@ -13,8 +13,11 @@ config USB_HID
 	  boot keyboard or mouse. Keep =y on any image whose only keyboard is USB.
 
 config USB_STORAGE
-	bool "USB mass storage"
+	tristate "USB mass storage"
 	default y
+	help
+	  =m builds modules/usb-storage, loaded by the `usb * * 08 06 50` alias (and listed in modules/BOOT
+	  for a USB root). Keep =y on any image that boots from a USB stick.
 
 config UVC
 	bool "USB video class (webcam)"

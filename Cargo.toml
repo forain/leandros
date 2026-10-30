@@ -33,6 +33,7 @@ members = [
     "modules/virtio-blk",
     "modules/virtio-keyboard",
     "modules/usb-hid",
+    "modules/usb-storage",
     "modules/virtio-net",
     "modules/virtio-snd",
     "modules/hda",

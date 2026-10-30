@@ -465,7 +465,7 @@ pub fn flush_final() {
     let t0 = sched::monotonic_ns();
     while BUSY.load(Ordering::Acquire) && sched::monotonic_ns().saturating_sub(t0) < 10_000_000_000 {
         if sched::irqctx::can_sleep() && sched::current_pid() != 0 {
-            drivers::usb_storage::sleep_until(sched::monotonic_ns() + 1_000_000);
+            drivers::kenv::sleep_until(sched::monotonic_ns() + 1_000_000);
         } else {
             core::hint::spin_loop();
         }
@@ -533,7 +533,7 @@ fn flusher() -> ! {
         if test_panic && ticks == 4 {
             panic!("klog.testpanic: deliberate kernel panic to test the log partition");
         }
-        drivers::usb_storage::sleep_until(sched::monotonic_ns().saturating_add(TICK_NS));
+        drivers::kenv::sleep_until(sched::monotonic_ns().saturating_add(TICK_NS));
         let t0 = sched::monotonic_ns();
         let req = FLUSH_REQ.swap(false, Ordering::AcqRel);
         if t0 < next_due && !req { continue; }

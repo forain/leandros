@@ -1216,7 +1216,9 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
         return Ok(Enumerated { info, bulk: None, hid: Vec::new(), hub: Some(hub), audio: None });
     }
 
-    let Some(bot) = ci.bot else {
+    // CONFIG_USB_STORAGE=m: the module's class driver takes the interface through the class registry.
+    let bot_here = if cfg!(feature = "msc-module") { None } else { ci.bot };
+    let Some(bot) = bot_here else {
         if ci.uas_seen {
             usb_log!("[XHCI] slot {}: UAS-only storage without a bulk-only alt setting, unsupported\n", slot);
         }
@@ -1320,6 +1322,37 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
             ep_in: bot.ep_in.addr, ep_out: bot.ep_out.addr, dci_in, dci_out,
         }),
     })
+}
+
+/// Module path (CONFIG_USB_STORAGE=m): configure the bulk-only interface of a class-claimed
+/// function's configuration (the enumerator did SET_CONFIGURATION) and hand back its transport.
+/// `iface` selects the interface number.
+pub fn open_bulk_on(f: &isoch::UsbFunction, iface: u8) -> Result<XhciBulk, &'static str> {
+    let hc = &f.hc;
+    let (slot, speed) = (f.slot, f.speed);
+    let ci = parse_config(&f.cfg);
+    let bot = match ci.bot { Some(b) if b.iface == iface => b, _ => return Err("no bulk-only interface") };
+    let dma32 = hc.lock().dma32;
+    let dci_in = dci_of(bot.ep_in.addr);
+    let dci_out = dci_of(bot.ep_out.addr);
+    let _ = speed;
+    let in_phys = {
+        let mut x = hc.lock();
+        let s = x.slot_mut(slot).ok_or("slot vanished")?;
+        for (dci, e, ty) in [(dci_in, bot.ep_in, EP_TYPE_BULK_IN), (dci_out, bot.ep_out, EP_TYPE_BULK_OUT)] {
+            let ring = ProducerRing::new(dma32).ok_or("oom: bulk ring")?;
+            s.eps[dci] = Some(Endpoint::new(ring, ty, e.mps, e.burst, 0, 3072));
+        }
+        x.build_configure_input(slot, 0, (1 << dci_in) | (1 << dci_out)).ok_or("slot vanished")?
+    };
+    let (cc, _) = run_cmd(hc, Trb::new(TRB_CONFIGURE_EP, in_phys, 0, (slot as u32) << 24))
+        .map_err(|_| "Configure Endpoint timed out")?;
+    if cc != CC_SUCCESS { return Err("Configure Endpoint failed"); }
+    if bot.alt != 0 {
+        control(hc, slot, 0x01, 11, bot.alt as u16, bot.iface as u16, CtrlData::None, ENUM_CTRL_TIMEOUT_MS)
+            .map_err(|_| "SET_INTERFACE failed")?;
+    }
+    Ok(XhciBulk { hc: hc.clone(), slot, iface: bot.iface, ep_in: bot.ep_in.addr, ep_out: bot.ep_out.addr, dci_in, dci_out })
 }
 
 /// Bring up one controller and enumerate its root ports (hubs are not

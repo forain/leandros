@@ -269,3 +269,65 @@ pub extern "C" fn kapi_usb_intr_close(pipe: u64) {
     INTRS.lock().retain(|e| { if e.0 == pipe { found = Some(e.2); false } else { true } });
     if let Some(p) = found { drop(unsafe { Box::from_raw(p as *mut IntrEntry) }); }
 }
+
+// ── bulk pipes (mass storage) ──
+
+/// Open bulk-only transports: (pipe, function handle, boxed `XhciBulk`).
+static BULKS: spin::Mutex<alloc::vec::Vec<(u64, u64, usize)>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Number of open bulk pipes held by modules (ktest).
+pub fn usb_bulk_pipes() -> usize { BULKS.lock().len() }
+
+/// Configure the bulk-only interface `iface` of the function's configuration (SET_CONFIGURATION is
+/// done): both bulk endpoints get rings and the alternate setting is selected. Returns the pipe
+/// handle (> 0) or -errno. Task context.
+#[no_mangle]
+pub extern "C" fn kapi_usb_bulk_open(handle: u64, iface: u8) -> i64 {
+    let Some(f) = func(handle) else { return -19 };
+    match usb::xhci::open_bulk_on(&f, iface) {
+        Ok(b) => {
+            let ph = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let ptr = Box::into_raw(Box::new(b)) as usize;
+            BULKS.lock().push((ph, handle, ptr));
+            ph as i64
+        }
+        Err(_) => -5,
+    }
+}
+
+fn bulk_ptr(ph: u64) -> Option<*mut usb::XhciBulk> {
+    BULKS.lock().iter().find(|e| e.0 == ph).map(|e| e.2 as *mut usb::XhciBulk)
+}
+
+/// One transfer on an open bulk pipe. `op`: 0 bulk OUT, 1 bulk IN, 2 clear-halt IN, 3 clear-halt OUT,
+/// 4 class control OUT, 5 class control IN (for 4/5 `arg` = request | value << 8 | index << 24; the
+/// request goes to the pipe's interface). Returns the byte count or -errno (-32 stall, -110 timeout,
+/// -19 gone). Task context (sleeps).
+#[no_mangle]
+pub extern "C" fn kapi_usb_bulk(pipe: u64, op: u32, arg: u64, buf: *mut u8, len: usize, timeout_ns: u64) -> isize {
+    use usb::BulkTransport;
+    if buf.is_null() && len != 0 { return -22; }
+    let Some(p) = bulk_ptr(pipe) else { return -19 };
+    let b = unsafe { &mut *p };
+    let ms = (timeout_ns / 1_000_000).clamp(1, u32::MAX as u64) as u32;
+    let (req, val, idx) = (arg as u8, (arg >> 8) as u16, (arg >> 24) as u16);
+    let sl_mut = || unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    let r = match op {
+        0 => b.bulk_out(unsafe { core::slice::from_raw_parts(buf, len) }, ms),
+        1 => b.bulk_in(sl_mut(), ms),
+        2 => b.clear_halt_in().map(|_| 0),
+        3 => b.clear_halt_out().map(|_| 0),
+        4 => b.class_control_out(req, val, idx, unsafe { core::slice::from_raw_parts(buf, len) }).map(|_| 0),
+        5 => b.class_control_in(req, val, idx, sl_mut()),
+        _ => return -22,
+    };
+    match r { Ok(n) => n as isize, Err(e) => usb_errno(e) as isize }
+}
+
+/// Forget the pipe. The endpoints stay configured until the device leaves.
+#[no_mangle]
+pub extern "C" fn kapi_usb_bulk_close(pipe: u64) {
+    let mut found = None;
+    BULKS.lock().retain(|e| { if e.0 == pipe { found = Some(e.2); false } else { true } });
+    if let Some(p) = found { drop(unsafe { Box::from_raw(p as *mut usb::XhciBulk) }); }
+}
