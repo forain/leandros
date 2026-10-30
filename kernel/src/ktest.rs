@@ -572,7 +572,7 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 77 && exports::NEXPORTS == 77, "ksymtab has 77 exports");
+    t.check(exports::ksymtab().len() == 78 && exports::NEXPORTS == 78, "ksymtab has 78 exports");
     let find = sym!("kapi_pci_find", sys::PciFindFn);
     let rd = sym!("kapi_pci_cfg_read", sys::PciCfgReadFn);
     let wr = sym!("kapi_pci_cfg_write", sys::PciCfgWriteFn);
@@ -902,6 +902,7 @@ fn kmodkapi_l6a(t: &mut T) {
     let wnot = sym!("kapi_wait_notify", sys::WaitNotifyFn);
     let nreg = sym!("kapi_netdev_register", sys::NetdevRegisterFn);
     let kick = sym!("kapi_netdev_kick", sys::NetdevKickFn);
+    let sreg = sym!("kapi_snd_register", sys::SndRegisterFn);
     let kirq = sym!("kapi_netdev_kick_from_irq", sys::NetdevKickFn);
     let pmr = sym!("kapi_pm_register", sys::PmRegisterFn);
     let owner = KmodId(60002);
@@ -950,6 +951,7 @@ fn kmodkapi_l6a(t: &mut T) {
         }));
         t.check(nreg(owner, 0, b"Bad".as_ptr(), 3, ops, 0) == -22, "netdev_register bad prefix -> -22");
         t.check(nreg(owner, 0, b"ktn".as_ptr(), 3, core::ptr::null(), 0) == -22, "netdev_register null ops -> -22");
+        { t.check(sreg(owner, core::ptr::null(), 0) == -22, "snd_register null ops -> -22"); }
         let before = drivers::netdev::count();
         let id = nreg(owner, 0, b"ktn".as_ptr(), 3, ops, 5);
         if id < 0 { say!("kmodkapi: netdev_register -> {} (table full?)", id); }

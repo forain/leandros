@@ -1920,6 +1920,23 @@ pub fn monotonic_ns() -> u64 {
     unsafe { arch_monotonic_ns() }
 }
 
+/// Monotonic microseconds from the architectural counter (generic-timer count on aarch64, the
+/// TSC-derived clock on x86_64). Formerly `drivers::snd::monotonic_us`.
+pub fn monotonic_us() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let cnt: u64;
+        let frq: u64;
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt, options(nomem, nostack));
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack));
+        ((cnt as u128 * 1_000_000) / frq.max(1) as u128) as u64
+    }
+    #[cfg(target_arch = "x86_64")]
+    { monotonic_ns() / 1000 }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    { 0 }
+}
+
 /// `CLOCK_REALTIME - CLOCK_MONOTONIC`, in nanoseconds (signed: a wall clock
 /// stepped backwards below the boot instant is representable). 0 until
 /// `set_realtime_offset_ns` runs at boot (from the board's battery clock) or

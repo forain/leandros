@@ -1,9 +1,9 @@
 //! VirtIO Sound Driver.
 
-use super::{Driver, DriverError, pci};
-use ipc::Message;
-use mm::{phys_to_virt, virt_to_phys, buddy};
-use mm::paging::{map_kernel_device, PageFlags};
+// Kernel APIs come through `kenv` so the same source builds as a module (kmod-kapi shim).
+use crate::kenv::{pci, DriverError};
+use crate::kenv::mm::{phys_to_virt, virt_to_phys, buddy};
+use crate::kenv::mm::paging::{map_kernel_device, PageFlags};
 use leandros_lib;
 use core::sync::atomic::{self, Ordering};
 
@@ -56,36 +56,8 @@ const TX_MAX_INFLIGHT: u16 = (TX_MAX_INFLIGHT_BYTES / TX_BUF_BYTES) as u16;
 const TX_TOPUP_BYTES: usize = 16 * 1024;
 const TX_TOPUP_BUFS: u16 = (TX_TOPUP_BYTES / TX_BUF_BYTES) as u16;
 
-/// Monotonic microseconds for stall detection and the `*_us` diagnostics
-/// (audio stall recovery, the DRM/GPU latency census, PipeWire's producer
-/// gap). Reads the free-running hardware counter, so it keeps advancing even
-/// while spinning in kernel context with IRQs masked (unlike sched::ticks()).
-///
-/// On x86_64 this is `arch_monotonic_ns` — the TSC against the frequency
-/// `timer::init` resolved (CPUID or PIT-measured) — and not a raw `rdtsc`
-/// divided by an assumed 1 GHz, which it was until 2026-09-18: on a 4.49 GHz
-/// host TSC every "250 ms" stall threshold was really 56 ms and every census
-/// field 4.5× inflated; on a 1.9 GHz laptop, 1.9×. Zero until the BSP timer
-/// has started, which is before any driver that calls this is initialised.
-pub fn monotonic_us() -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let cnt: u64;
-        let frq: u64;
-        core::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt, options(nomem, nostack));
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack));
-        ((cnt as u128 * 1_000_000) / frq.max(1) as u128) as u64
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        extern "C" { fn arch_monotonic_ns() -> u64; }
-        arch_monotonic_ns() / 1000
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        0
-    }
-}
+
+pub use crate::kenv::sched::monotonic_us;
 
 #[repr(C)]
 struct VirtioSndHdr { code: u32 }
@@ -273,7 +245,7 @@ impl VirtioSnd {
                     let phys = (bar_val & !0xF) as usize;
                     if phys != 0 {
                         let map_size = (off as usize + len as usize + 4095) & !4095;
-                        let base = map_kernel_device(phys, map_size.max(0x10000), PageFlags::PRESENT|PageFlags::WRITABLE|PageFlags::NOCACHE).ok_or(DriverError::Io)?;
+                        let base = map_kernel_device(phys, map_size.max(0x10000), PageFlags::PRESENT|PageFlags::WRITABLE|PageFlags::MMIO).ok_or(DriverError::Io)?;
                         
                         match typ {
                             1 => { self.common_cfg = base + off as usize; }
@@ -572,22 +544,6 @@ impl VirtioSnd {
     }
 }
 
-impl Driver for VirtioSnd {
-    fn probe(&mut self) -> Result<(), DriverError> { unsafe { self.init_device() } }
-    fn handle(&mut self, msg: Message) -> Message {
-        match msg.tag {
-            0x100 => {
-                let freq = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                self.reconfigure_stream(0, freq, msg.data[4]);
-                Message::empty()
-            }
-            0x200 => {
-                let len = u16::from_le_bytes([msg.data[0], msg.data[1]]) as usize;
-                if len > 0 { self.send_pcm_data(&msg.data[2..2+len]); }
-                Message::empty()
-            }
-            0x1000 => { let mut r = Message::empty(); r.tag = 0x1001; r }
-            _ => Message::empty()
-        }
-    }
+impl VirtioSnd {
+    pub fn probe(&mut self) -> Result<(), DriverError> { unsafe { self.init_device() } }
 }

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 sched = { path = "../../sched" }
 drivers = { path = "../../drivers" }
+kmod-abi = { path = "../../lib/kmod-abi" }
 ipc = { path = "../../ipc" }
 vfs-server = { path = "../vfs" }
 net-server = { path = "../net" }

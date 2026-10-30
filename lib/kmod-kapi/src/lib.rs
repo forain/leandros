@@ -181,6 +181,8 @@ pub mod pci {
     pub unsafe fn pci_read_config_32(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
         sys::kapi_pci_cfg_read(bdf(bus, dev, func), off as u16, 4)
     }
+    /// Config read that also works for offsets the built-in's ECAM path treats specially; one path here.
+    pub unsafe fn pci_read_config_32_any(bus: u8, dev: u8, func: u8, off: u8) -> u32 { pci_read_config_32(bus, dev, func, off) }
     pub unsafe fn pci_write_config_16(bus: u8, dev: u8, func: u8, off: u8, val: u16) {
         sys::kapi_pci_cfg_write(bdf(bus, dev, func), off as u16, 2, val as u32)
     }
@@ -201,6 +203,9 @@ pub mod pci {
     }
 
     /// Kernel log line (the trailing newline is stripped; `kapi_log` adds its own).
+    /// Verbose-boot trace in the kernel; a module build drops it.
+    pub fn rdebug(_msg: &str) {}
+    pub fn rdebug_hex(_v: u32) {}
     pub fn serial_debug(msg: &str) {
         let m = msg.strip_suffix('\n').unwrap_or(msg);
         unsafe { sys::kapi_log(6, m.as_ptr(), m.len()) }
@@ -211,6 +216,8 @@ pub mod mm {
     use super::*;
 
     pub fn phys_to_virt(phys: usize) -> usize { unsafe { sys::kapi_phys_to_virt(phys as u64) } }
+    /// Physical address of a direct-map address (0 for a module-image address: not DMA-able).
+    pub fn virt_to_phys(va: usize) -> usize { super::sys_common::virt_to_phys(va).unwrap_or(0) as usize }
 
     pub mod paging {
         use super::*;
@@ -268,6 +275,7 @@ pub mod sched {
     use super::*;
 
     pub fn monotonic_ns() -> u64 { unsafe { sys::kapi_monotonic_ns() } }
+    pub fn monotonic_us() -> u64 { monotonic_ns() / 1000 }
 
     pub mod kthread {
         use super::*;
@@ -389,6 +397,16 @@ pub mod irq {
             l if l >= 0 => Ok(IrqHandle { vector: None, line: Some(l as u32) }),
             e => Err(err(e)),
         }
+    }
+}
+
+pub mod snd {
+    use super::*;
+    pub use kmod_abi::{KSndOps, KSND_CAPTURE};
+    /// Register the sound backend (one per machine); the ops table must outlive the module.
+    /// Returns 0 or the kernel's negative errno (-16 a backend is already attached).
+    pub fn register(ops: &'static KSndOps, ctx: usize) -> Result<(), i32> {
+        match unsafe { sys::kapi_snd_register(owner(), ops, ctx) } { 0 => Ok(()), e => Err(e) }
     }
 }
 

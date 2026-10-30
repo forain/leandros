@@ -32,7 +32,7 @@ config VIRTIO_RNG
 	default y
 
 config VIRTIO_SND
-	bool "virtio-snd"
+	tristate "virtio-snd"
 	default y
 
 endmenu

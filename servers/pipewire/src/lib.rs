@@ -27,6 +27,7 @@ use drivers::hda::Hda;
 use drivers::hdmi_audio::HdmiAudio;
 use drivers::Driver;
 use drivers::pci;
+use kmod_abi::{KSndOps, KSND_CAPTURE};
 
 /// The playback device behind the spool: virtio-sound (QEMU's default) or
 /// an Intel HD Audio controller (real PCs; QEMU `--hda`). Same calls, so
@@ -36,64 +37,114 @@ enum Backend {
     Virtio(VirtioSnd),
     Hda(Hda),
     Hdmi(HdmiAudio),
+    /// A loadable sound module (`kapi_snd_register`): the same calls through `KSndOps`.
+    Module { ops: &'static KSndOps, ctx: usize },
+}
+
+/// Text from a module callback that fills `(buf, cap) -> len`.
+fn module_text(f: impl FnOnce(*mut u8, usize) -> usize) -> alloc::string::String {
+    let mut buf = [0u8; 1024];
+    let n = f(buf.as_mut_ptr(), buf.len()).min(buf.len());
+    alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
 impl Backend {
     fn reconfigure_stream(&mut self, id: u32, freq: u32, ch: u8) {
         match self { Backend::Virtio(d) => d.reconfigure_stream(id, freq, ch),
                      Backend::Hda(d) => d.reconfigure_stream(id, freq, ch),
-                     Backend::Hdmi(d) => d.reconfigure_stream(id, freq, ch), Backend::None => {} }
+                     Backend::Hdmi(d) => d.reconfigure_stream(id, freq, ch),
+                     Backend::Module { ops, ctx } => (ops.configure)(*ctx, id, freq, ch),
+                     Backend::None => {} }
     }
     fn send_pcm_data(&mut self, data: &[u8]) -> usize {
         match self { Backend::Virtio(d) => d.send_pcm_data(data),
                      Backend::Hda(d) => d.send_pcm_data(data),
-                     Backend::Hdmi(d) => d.send_pcm_data(data), Backend::None => 0 }
+                     Backend::Hdmi(d) => d.send_pcm_data(data),
+                     Backend::Module { ops, ctx } => (ops.write)(*ctx, data.as_ptr(), data.len()),
+                     Backend::None => 0 }
     }
     fn tx_used_idx(&self) -> u16 {
         match self { Backend::Virtio(d) => d.tx_used_idx(), Backend::Hda(d) => d.tx_used_idx(),
-                     Backend::Hdmi(d) => d.tx_used_idx(), Backend::None => 0 }
+                     Backend::Hdmi(d) => d.tx_used_idx(),
+                     Backend::Module { ops, ctx } => (ops.tx_used_idx)(*ctx) as u16,
+                     Backend::None => 0 }
     }
-    /// Bytes queued in the device ahead of the DAC.
+    /// Bytes handed to the device and not yet played.
     fn queued_bytes(&self) -> usize {
         match self {
             Backend::Virtio(d) => d.tx_level() as usize * drivers::snd::TX_BUF_BYTES,
             Backend::Hda(d) => d.queued_bytes() as usize,
             Backend::Hdmi(d) => d.queued_bytes() as usize,
+            Backend::Module { ops, ctx } => (ops.queued_bytes)(*ctx),
             Backend::None => 0,
         }
     }
     fn top_up_silence(&mut self) {
         match self { Backend::Virtio(d) => d.top_up_silence(), Backend::Hda(d) => d.top_up_silence(),
-                     Backend::Hdmi(d) => d.top_up_silence(), Backend::None => {} }
+                     Backend::Hdmi(d) => d.top_up_silence(),
+                     Backend::Module { ops, ctx } => (ops.top_up_silence)(*ctx),
+                     Backend::None => {} }
     }
     fn recover_stream(&mut self) {
         match self { Backend::Virtio(d) => d.recover_stream(), Backend::Hda(d) => d.recover_stream(),
-                     Backend::Hdmi(d) => d.recover_stream(), Backend::None => {} }
+                     Backend::Hdmi(d) => d.recover_stream(),
+                     Backend::Module { ops, ctx } => (ops.recover)(*ctx),
+                     Backend::None => {} }
     }
     /// Captured 48 kHz s16le stereo (HD Audio only); Ok(0) = nothing yet.
     fn capture_read(&mut self, out: &mut [u8]) -> Result<usize, i32> {
-        match self { Backend::Hda(d) => d.capture_read(out), _ => Err(-19) } // ENODEV
+        match self {
+            Backend::Hda(d) => d.capture_read(out),
+            Backend::Module { ops, ctx } if ops.flags & KSND_CAPTURE != 0 => {
+                let r = (ops.cap_read)(*ctx, out.as_mut_ptr(), out.len());
+                if r < 0 { Err(r) } else { Ok((r as usize).min(out.len())) }
+            }
+            _ => Err(-19), // ENODEV
+        }
     }
     fn capture_close(&mut self) {
-        if let Backend::Hda(d) = self { d.capture_close(); }
+        match self {
+            Backend::Hda(d) => d.capture_close(),
+            Backend::Module { ops, ctx } if ops.flags & KSND_CAPTURE != 0 => (ops.cap_close)(*ctx),
+            _ => {}
+        }
     }
     fn capture_ensure(&mut self) -> Result<(), i32> {
-        match self { Backend::Hda(d) => d.capture_ensure(), _ => Err(-19) }
+        match self {
+            Backend::Hda(d) => d.capture_ensure(),
+            Backend::Module { ops, ctx } if ops.flags & KSND_CAPTURE != 0 => {
+                match (ops.cap_ensure)(*ctx) { 0 => Ok(()), e => Err(if e > 0 { -e } else { e }) }
+            }
+            _ => Err(-19),
+        }
     }
     fn capture_restart(&mut self) {
-        if let Backend::Hda(d) = self { d.capture_restart(); }
+        match self {
+            Backend::Hda(d) => { d.capture_restart(); }
+            Backend::Module { ops, ctx } if ops.flags & KSND_CAPTURE != 0 => (ops.cap_restart)(*ctx),
+            _ => {}
+        }
     }
     fn capture_pending(&self) -> usize {
-        match self { Backend::Hda(d) => d.capture_pending(), _ => 0 }
+        match self {
+            Backend::Hda(d) => d.capture_pending(),
+            Backend::Module { ops, ctx } if ops.flags & KSND_CAPTURE != 0 => (ops.cap_pending)(*ctx),
+            _ => 0,
+        }
     }
     fn jack_service(&mut self) {
-        if let Backend::Hda(d) = self { d.jack_service(); }
+        match self {
+            Backend::Hda(d) => d.jack_service(),
+            Backend::Module { ops, ctx } if ops.flags & KSND_CAPTURE != 0 => (ops.jack_service)(*ctx),
+            _ => {}
+        }
     }
     fn info(&mut self) -> alloc::string::String {
         match self {
             Backend::Virtio(_) => alloc::string::String::from("backend: virtio-sound\n"),
             Backend::Hda(d) => d.info(),
             Backend::Hdmi(d) => d.info(),
+            Backend::Module { ops, ctx } => module_text(|b, c| (ops.info)(*ctx, b, c)),
             Backend::None => alloc::string::String::from("backend: none\n"),
         }
     }
@@ -264,7 +315,7 @@ fn capture_read(buf_ptr: usize, count: usize, h: u64) -> Message {
     let nb = nb_has(h);
     let mut kbuf = [0u8; 4096];
     let mut total = 0usize;
-    let mut since = drivers::snd::monotonic_us();
+    let mut since = sched::monotonic_us();
     let mut restarted = false;
     while total < count {
         let want = (count - total).min(kbuf.len()) & !3;
@@ -286,10 +337,10 @@ fn capture_read(buf_ptr: usize, count: usize, h: u64) -> Message {
             Err(-11) => {
                 if total > 0 { break; }
                 if nb { return err_reply(-11); }
-                if drivers::snd::monotonic_us().wrapping_sub(since) > 2_000_000 {
+                if sched::monotonic_us().wrapping_sub(since) > 2_000_000 {
                     if restarted { return err_reply(-5); }
                     restarted = true;
-                    since = drivers::snd::monotonic_us();
+                    since = sched::monotonic_us();
                     STATE.lock().snd_driver.capture_restart();
                 }
                 sched::kthread::sleep_ns(5_000_000);
@@ -345,7 +396,7 @@ static STATE: sched::lockwatch::TrackedMutex<PipeWireState> =
 /// because we are mid-push: data flows immediately after the restart, so
 /// the revived stream doesn't underrun again.
 fn push_spool_blocking(data: &[u8]) -> usize {
-    use drivers::snd::monotonic_us;
+    use sched::monotonic_us;
     let mut off = 0;
     let start = monotonic_us();
     let mut last_used = STATE.lock().snd_driver.tx_used_idx();
@@ -425,6 +476,8 @@ pub fn is_initialized() -> bool { STATE.lock().initialized }
 
 pub fn init(cmdline: &str) -> Result<u32, i32> {
     let mut state = STATE.lock();
+    // Idempotent: a sound module may have attached (and registered the server) before the boot path ran.
+    if state.initialized { return Ok(state.bound_port); }
 
     pci::rdebug("[PW] Initializing...\n");
     let want = cmdline_opt(cmdline, "snd.backend").unwrap_or("auto");
@@ -452,7 +505,30 @@ pub fn init(cmdline: &str) -> Result<u32, i32> {
         pci::serial_debug("[PW] no sound device (virtio-sound, HD Audio or HDMI)\n");
         return Err(-19); // ENODEV
     }
+    register_server(&mut state)
+}
 
+/// Attach a sound module's backend (`kapi_snd_register`). When no built-in device was found (so
+/// `init` registered nothing) this also registers `/dev/pipewire` and the socket, lazily, so
+/// machines without sound are unchanged. Err(-16) when a backend is already present.
+pub fn attach(ops: &'static KSndOps, ctx: usize) -> Result<u32, i32> {
+    let mut state = STATE.lock();
+    if !matches!(state.snd_driver, Backend::None) { return Err(-16); }
+    state.snd_driver = Backend::Module { ops, ctx };
+    let port = if state.initialized {
+        state.bound_port
+    } else {
+        match register_server(&mut state) {
+            Ok(p) => p,
+            Err(e) => { state.snd_driver = Backend::None; return Err(e); }
+        }
+    };
+    if ops.flags & KSND_CAPTURE != 0 { let _ = sched::kthread::spawn("[audio]", audio_service); }
+    Ok(port)
+}
+
+/// Create the server port, `/dev/pipewire` and the socket for the backend already chosen.
+fn register_server(state: &mut PipeWireState) -> Result<u32, i32> {
     let server_port = port::create(0).ok_or(-12)?; // ENOMEM
     if !port::register_handler(server_port, handle_msg) {
         return Err(-1);
@@ -581,6 +657,10 @@ pub fn shutdown(link_reset: bool) -> (alloc::string::String, Option<drivers::pci
         }
         Backend::Virtio(_) => (alloc::string::String::from("virtio-sound: nothing to do"), None),
         Backend::Hdmi(_) => (alloc::string::String::from("hdmi audio: nothing to do"), None),
+        Backend::Module { ops, ctx } => {
+            let t = module_text(|b, c| (ops.shutdown)(*ctx, link_reset as u32, b, c));
+            (alloc::format!("sound module: {}", t), None)
+        }
         Backend::None => (alloc::string::String::from("no sound device"), None),
     }
 }
@@ -640,7 +720,7 @@ pub fn handle(msg: &Message) -> Message {
             {
                 // Diagnostic: surface large producer gaps (rare, cold path).
                 let mut state = STATE.lock();
-                let now = drivers::snd::monotonic_us();
+                let now = sched::monotonic_us();
                 let last = state.last_pcm_us;
                 state.last_pcm_us = now;
                 if last != 0 && now.wrapping_sub(last) > 100_000 {
