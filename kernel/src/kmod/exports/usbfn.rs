@@ -45,6 +45,7 @@ pub(super) fn drop_func(h: u64) {
     let mut gone = alloc::vec::Vec::new();
     INTRS.lock().retain(|e| { if e.1 == h { gone.push(e.2); false } else { true } });
     for p in gone { drop(unsafe { Box::from_raw(p as *mut IntrEntry) }); }
+    super::hci::drop_bt(h);
 }
 
 /// USB control transfer on the claimed function. The direction is bit 7 of `setup.request_type`;

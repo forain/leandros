@@ -18,3 +18,5 @@ uvc-module = []
 hid-module = []
 # CONFIG_USB_STORAGE=m: the enumerator leaves bulk-only interfaces to the usb-storage module (class registry).
 msc-module = []
+# CONFIG_BT=m: the E0/01/01 function goes to the class registry (modules/bt) instead of the built-in btusb thread.
+bt-module = []

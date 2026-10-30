@@ -24,8 +24,11 @@ config UVC
 	default y
 
 config BT
-	bool "Bluetooth (btusb + bthid)"
+	tristate "Bluetooth (btusb + bthid)"
 	default y
+	help
+	  =m builds modules/bt (the USB HCI transport, Intel set-up), loaded by the `usb * * e0 01 01` alias.
+	  The HCI node, the Pi UART transport and btd/bthid stay built in. Shipped configs keep =y.
 
 config DWC3
 	bool "DesignWare USB3 (Pi)"

@@ -160,7 +160,7 @@ fn adopt(bus: u8, e: xhci::Enumerated, hot: bool) -> Option<XhciBulk> {
     let (vid, pid) = (i.vendor, i.product);
     DEVICES.lock().push(i);
     let audio = match audio {
-        Some(f) if is_bt => {
+        Some(f) if is_bt && !cfg!(feature = "bt-module") => {
             usb_log!("[USB] bus {} slot {}: Bluetooth HCI function\n", bus, f.slot);
             xhci::btusb::register(f);
             None
@@ -171,6 +171,8 @@ fn adopt(bus: u8, e: xhci::Enumerated, hot: bool) -> Option<XhciBulk> {
     let audio = match audio {
         Some(f) => match class::offer(f, bus, vid, pid) {
             class::Offer::Claimed | class::Offer::Kept => None,
+            // CONFIG_BT=m with no module loaded: leave the controller unclaimed (not an audio function).
+            class::Offer::NoMatch(_) if is_bt => None,
             class::Offer::NoMatch(f) => Some(f),
         },
         None => None,

@@ -29,6 +29,7 @@ mod snd;
 mod pm;
 mod v4l2;
 mod usbfn;
+mod hci;
 mod blk;
 mod input;
 mod wifi;
@@ -43,6 +44,7 @@ pub use input::*;
 pub use wifi::*;
 pub use v4l2::*;
 pub use usbfn::*;
+pub use hci::*;
 pub use core_::*;
 pub use common::*;
 
@@ -139,6 +141,15 @@ const _: sys::UsbIntrCloseFn = kapi_usb_intr_close;
 const _: sys::UsbBulkOpenFn = kapi_usb_bulk_open;
 const _: sys::UsbBulkFn = kapi_usb_bulk;
 const _: sys::UsbBulkCloseFn = kapi_usb_bulk_close;
+const _: sys::HciRegisterFn = kapi_hci_register;
+const _: sys::HciRxFn = kapi_hci_rx;
+const _: sys::HciTxPopFn = kapi_hci_tx_pop;
+const _: sys::HciCtlFn = kapi_hci_ctl;
+const _: sys::HciUnregisterFn = kapi_hci_unregister;
+const _: sys::UsbBtOpenFn = kapi_usb_bt_open;
+const _: sys::UsbBtPollFn = kapi_usb_bt_poll;
+const _: sys::UsbBtSendFn = kapi_usb_bt_send;
+const _: sys::UsbBtCloseFn = kapi_usb_bt_close;
 const _: kmod_abi::input::sys_input::InputUnregisterFn = kapi_input_unregister;
 const _: kmod_abi::input::sys_input::InputEventConsoleFn = kapi_input_event_console;
 const _: kmod_abi::input::sys_input::InputLedsFn = kapi_input_leds;
@@ -153,7 +164,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 100;
+pub const NEXPORTS: usize = 109;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -250,6 +261,15 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_usb_bulk_open", kapi_usb_bulk_open),
     sym!("kapi_usb_bulk", kapi_usb_bulk),
     sym!("kapi_usb_bulk_close", kapi_usb_bulk_close),
+    sym!("kapi_hci_register", kapi_hci_register),
+    sym!("kapi_hci_rx", kapi_hci_rx),
+    sym!("kapi_hci_tx_pop", kapi_hci_tx_pop),
+    sym!("kapi_hci_ctl", kapi_hci_ctl),
+    sym!("kapi_hci_unregister", kapi_hci_unregister),
+    sym!("kapi_usb_bt_open", kapi_usb_bt_open),
+    sym!("kapi_usb_bt_poll", kapi_usb_bt_poll),
+    sym!("kapi_usb_bt_send", kapi_usb_bt_send),
+    sym!("kapi_usb_bt_close", kapi_usb_bt_close),
     sym!("kapi_input_unregister", kapi_input_unregister),
     sym!("kapi_input_event_console", kapi_input_event_console),
     sym!("kapi_input_leds", kapi_input_leds),

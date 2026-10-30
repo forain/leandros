@@ -572,7 +572,7 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 100 && exports::NEXPORTS == 100, "ksymtab has 100 exports");
+    t.check(exports::ksymtab().len() == 109 && exports::NEXPORTS == 109, "ksymtab has 109 exports");
     t.check(exports::lookup("kapi_wifi_register").is_some(), "kapi_wifi_register in KSYMTAB");
     #[cfg(feature = "drv-wifi-stack")]
     {
@@ -606,6 +606,11 @@ fn t_kmodkapi() -> T {
         t.check(crate::kmod::exports::kapi_usb_bulk_open(0xdead, 0) == -19, "kapi_usb_bulk_open bad handle -> -19");
         t.check(crate::kmod::exports::kapi_usb_bulk(0xdead, 1, 0, core::ptr::null_mut(), 0, 1_000_000) == -19, "kapi_usb_bulk bad pipe -> -19");
         t.check(crate::kmod::exports::kapi_usb_bulk(0xdead, 1, 0, core::ptr::null_mut(), 8, 1_000_000) == -22, "kapi_usb_bulk null buf -> -22");
+        t.check(crate::kmod::exports::kapi_usb_bt_open(0xdead) == -19, "kapi_usb_bt_open bad handle -> -19");
+        t.check(crate::kmod::exports::kapi_usb_bt_send(0xdead, 0, [0u8; 3].as_ptr(), 3) == -19, "kapi_usb_bt_send bad pipe -> -19");
+        t.check(crate::kmod::exports::kapi_usb_bt_poll(0xdead, [0u8; 4].as_mut_ptr(), 4, &mut 0u32) == -19, "kapi_usb_bt_poll bad pipe -> -19");
+        t.check(crate::kmod::exports::kapi_hci_rx(0xdead, [1u8; 3].as_ptr(), 3) == -19, "kapi_hci_rx bad handle -> -19");
+        t.check(crate::kmod::exports::kapi_hci_ctl(0, 2) == -19 && crate::kmod::exports::kapi_hci_tx_pop(0, core::ptr::null_mut(), 0) == -19, "kapi_hci_ctl/tx_pop bad handle -> -19");
         t.check(crate::kmod::exports::kapi_usb_intr_poll(0xdead, core::ptr::null_mut(), 0) == -19, "kapi_usb_intr_poll bad pipe -> -19");
         t.check(crate::kmod::exports::kapi_usb_intr_out(0xdead, [0u8].as_ptr(), 1) == -19, "kapi_usb_intr_out bad pipe -> -19");
         t.check(crate::kmod::exports::kapi_usb_intr_out(0xdead, core::ptr::null(), 1) == -22, "kapi_usb_intr_out null -> -22");
