@@ -7661,7 +7661,8 @@ fn scheduler_run_loop() -> ! {
                 }
             }
         } else {
-            let t_idle = if idlestat::ENABLED { unsafe { arch_monotonic_ns() } } else { 0 };
+            // Always-on per-CPU idle time (/proc/stat idle jiffies).
+            let t_idle = unsafe { arch_monotonic_ns() };
             if IDLE_SINCE[id].load(Ordering::Relaxed) == 0 {
                 IDLE_SINCE[id].store(monotonic_ns().max(1), Ordering::Relaxed);
             }
@@ -7671,11 +7672,21 @@ fn scheduler_run_loop() -> ! {
                 #[cfg(target_arch = "aarch64")]
                 core::arch::asm!("msr daifclr, #2; wfi; msr daifset, #2");
             }
+            let idle_ns = unsafe { arch_monotonic_ns() }.saturating_sub(t_idle);
+            CPU_IDLE_NS[id.min(MAX_CPUS - 1)].fetch_add(idle_ns, Ordering::Relaxed);
             if idlestat::ENABLED {
-                idlestat::on_idle(id, unsafe { arch_monotonic_ns() }.saturating_sub(t_idle));
+                idlestat::on_idle(id, idle_ns);
             }
         }
     }
+}
+
+/// Nanoseconds each CPU has spent parked in the idle instruction (hlt/wfi).
+static CPU_IDLE_NS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Cumulative idle nanoseconds of `cpu` (feeds /proc/stat and /proc/uptime).
+pub fn cpu_idle_ns(cpu: usize) -> u64 {
+    CPU_IDLE_NS[cpu.min(MAX_CPUS - 1)].load(Ordering::Relaxed)
 }
 
 /// Run the registered fd/pipe/socket teardown for `pid`, if one is installed.

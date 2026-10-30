@@ -38,6 +38,8 @@ this page is the explanation.
 - **Brightness and volume hotkeys are partly unconfirmed.** The EliteBook 840 G5 brightness
   keys are mapped (`E0 12`/`E0 17`) but a real key press reaching the compositor has not been
   confirmed; other machines' keys appear as `kbd: unmapped sc` lines until mapped.
+- **cosmic-monitor has no disk or network data.** `/proc/diskstats`, `/sys/class/net`, `/sys/class/drm` and `/sys/devices/system/cpu` (cpufreq) do not exist, so the disk/network graphs and GPU/frequency readouts stay empty; CPU, memory, load and the process list work. CPU is shown as user time (no user/system split is kept).
+- **cosmic-initial-setup's Network pages need the system bus.** They `unwrap()` `zbus::Connection::system()`; it works only with `DBUS_SYSTEM_BUS_ADDRESS` set as in the session, not from a bare shell.
 - **cosmic-screenshot's capture path is unverified.** The app starts, but the
   portal/screencopy capture has not produced a PNG in a test.
 - **Firefox is still heavy during YouTube** (about 310 % total CPU on the laptop, Firefox

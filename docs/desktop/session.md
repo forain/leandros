@@ -196,6 +196,8 @@ Since lane cosapplets the unmodified upstream applets from cosmic-applets are st
 
 **Other applications.** `cosmic-files`, `cosmic-edit` and `cosmic-screenshot` (epoch-1.3.0, gvfs and io-uring dropped) are staged with `.desktop` files and hicolor icons ([`ports/cosmic-apps`](../../ports/cosmic-apps)); Firefox has a `firefox.desktop` entry and icon, so it appears in the launcher. Launched by hand they need `WAYLAND_DISPLAY=wayland-1` exported (cosmic-panel hands its children a socket, not the variable); with that all three ran 15 s without a panic. The Print key is bound by cosmic-comp to the Screenshot action; the capture path through the portal and screencopy has not been verified.
 
+**System Monitor, Initial Setup, wallpapers.** `cosmic-monitor` (no nvml) and `cosmic-initial-setup` (epoch-1.3.0) are built by `ports/cosmic-apps` and staged with their `.desktop`; Initial Setup is `NoDisplay` and its Autostart entry is not staged, so it never runs at first login (the image creates accounts itself) and is launched by hand. `ports/cosmic-wallpapers` stages the six other upstream wallpapers, downscaled to 1280x720 (about 1.2 MB), next to the Orion Nebula default in `/usr/share/backgrounds/cosmic/`. `/proc/stat` now reports real per-CPU busy/idle jiffies (idle = time in hlt/wfi), which the monitor's CPU graphs read.
+
 How the panel finds an applet shapes the staging
 ([scripts/mkfs-f2fs-populated.py](../../scripts/mkfs-f2fs-populated.py)):
 

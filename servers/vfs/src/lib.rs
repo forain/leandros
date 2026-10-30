@@ -6711,10 +6711,30 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
 
     if path == b"/proc/stat" {
         let mut p = 0;
-        p = write_lit(buf, p, b"cpu  0 0 0 ");
-        p = write_u32(buf, p, (uptime_sec * 100) as u32); // idle jiffies
-        p = write_lit(buf, p, b" 0 0 0 0 0 0\ncpu0 0 0 0 ");
-        p = write_u32(buf, p, (uptime_sec * 100) as u32);
+        // Real per-CPU accounting: idle = time parked in hlt/wfi, busy (shown as
+        // user time: no user/system split is kept) = uptime - idle, in jiffies.
+        let ncpu = sched::active_cpu_count();
+        let up_j = uptime_sec * 100 + (ticks % 100);
+        let mut idle_tot = 0u64;
+        let mut busy_tot = 0u64;
+        for c in 0..ncpu {
+            let idle = (sched::cpu_idle_ns(c) / 10_000_000).min(up_j);
+            idle_tot += idle;
+            busy_tot += up_j - idle;
+        }
+        p = write_lit(buf, p, b"cpu  ");
+        p = write_u64(buf, p, busy_tot);
+        p = write_lit(buf, p, b" 0 0 ");
+        p = write_u64(buf, p, idle_tot);
+        for c in 0..ncpu {
+            let idle = (sched::cpu_idle_ns(c) / 10_000_000).min(up_j);
+            p = write_lit(buf, p, b" 0 0 0 0 0 0\ncpu");
+            p = write_u32(buf, p, c as u32);
+            p = write_lit(buf, p, b" ");
+            p = write_u64(buf, p, up_j - idle);
+            p = write_lit(buf, p, b" 0 0 ");
+            p = write_u64(buf, p, idle);
+        }
         p = write_lit(buf, p, b" 0 0 0 0 0 0\nbtime ");
         // Boot time = now − uptime (fake: use 0)
         p = write_lit(buf, p, b"0\nctxt ");

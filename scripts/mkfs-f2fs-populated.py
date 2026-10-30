@@ -1699,13 +1699,18 @@ def main():
     cosapps_icon_dirs = []
     for _app, _appid in (("cosmic-files", "com.system76.CosmicFiles"),
                          ("cosmic-edit", "com.system76.CosmicEdit"),
-                         ("cosmic-screenshot", "com.system76.CosmicScreenshot")):
+                         ("cosmic-screenshot", "com.system76.CosmicScreenshot"),
+                         ("cosmic-monitor", "com.system76.CosmicMonitor"),
+                         ("cosmic-initial-setup", "com.system76.CosmicInitialSetup")):
         _appbin = m6_pick(f"{m6_out}/{_app}-{arch}")
         if os.path.exists(_appbin):
             bin_files.append((_app, _appbin, 0o100755))
             m4_share_dirs.add("/usr/share/applications")
             m4_share_files.append(("/usr/share/applications", f"{_appid}.desktop",
                                    f"ports/cosmic-apps/{_appid}.desktop"))
+            # cosmic-initial-setup is NOT autostarted (our image creates the
+            # accounts itself): only its NoDisplay .desktop is staged, so it can
+            # be launched by hand, and the Autostart .desktop is left out.
             _appres = "resources" if _app == "cosmic-screenshot" else "res"
             cosapps_icon_dirs.append(os.path.expanduser(
                 f"~/code/leandros-artifacts/m6-session-bins/src/{_app}/{_appres}/icons/hicolor"))
