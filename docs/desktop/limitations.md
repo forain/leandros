@@ -145,4 +145,4 @@ Recorded so they are not reopened without new evidence:
 
 | Limit | Detail |
 |---|---|
-| **No audio from cosmic-player yet** | It starts, opens its window and decodes video, but `playbin` with `pipewiresink` stays PAUSED ("waiting for pool to become active"); a plain `... ! pipewiresink` pipeline streams fine. Needs `GST_PLUGIN_FEATURE_RANK=pipewiresink:PRIMARY` (set by the `.desktop`). aarch64 only; see `artifacts/notes/lane-gstport-2026-10-30.md`. |
+| **cosmic-player is aarch64-verified only** | Audio works through the patched gst-plugin-pipewire 1.2.7 (the pool-activation deadlock is fixed). It needs `GST_PLUGIN_FEATURE_RANK=pipewiresink:PRIMARY` (set by the `.desktop`). x86_64 is untested. See `artifacts/notes/lane-gstport-2026-10-30.md`. |

@@ -448,5 +448,10 @@ is overwritten). `cosmic-player` (`ports/cosmic-apps`) builds against it with up
   `videotestsrc ! fakesink` and the clip's demux/avdec_mpeg4/vorbisdec chain run, and
   `filesrc ! matroskademux ! vorbisdec ! audioconvert ! audioresample ! pipewiresink` streams into
   `leandros_output` (cycles=424 in 7 s). x86_64 is not built or tested.
-- Open: `playbin ... audio-sink=pipewiresink` (what cosmic-player uses) stays in PAUSED, see
-  `artifacts/notes/lane-gstport-2026-10-30.md`.
+- **Patched port: gst-plugin-pipewire 1.2.7.** The plugin is rebuilt from vendored sources
+  (`ports/gstreamer/data/gst-pipewire-1.2.7`, built by `build-in-alpine.sh`) with a deadlock patch:
+  `on_param_changed` holds the PipeWire thread-loop lock while it waits for the buffer pool to activate,
+  and the pool activation needs `setcaps`, which needs that same lock; additionally `do_start` could lose
+  its wake-up. With the patch `playbin ... audio-sink=pipewiresink` (what cosmic-player uses) reaches PLAYING
+  and cosmic-player plays with sound (aarch64: cycles 1 -> 1880 in 30 s, no panics). Image size is unchanged
+  (~46 MiB). See `artifacts/notes/lane-gstport-2026-10-30.md`.
