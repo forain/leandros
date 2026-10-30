@@ -55,7 +55,7 @@ if [[ "$mod" == "virtio_snd" ]]; then
     check "$L" '^\[kmod virtio_snd\].*virtio-sound attached' "backend attached by the module"
     check "$L" '^virtio_snd [0-9]* [0-9]* - Live' "listed in /proc/modules"
     check "$L" '^virtio_snd .* Live ' "listed by kmodctl list"
-    check "$L" 'sndtest: .*\(PASS\|pass\|ok\)' "sndtest played through the module"
+    check "$L" 'both channels done: [0-9]* B' "sndtest played through the module"
     python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=virtio_snd" "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt2/serial-full.log
     check "$L" 'alias pci 1af4:1059 virtio_snd: Blacklisted' "blacklist refuses the alias load"
