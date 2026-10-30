@@ -757,6 +757,12 @@ pub fn resolve_root(cmdline: Option<&str>, boot: Option<BootDisk>) -> Result<usi
     if let Some(e) = get(1) {
         if e.parent.is_none() && e.class == "vd" && has_f2fs(1) { return Ok(1); }
     }
+    // A lone whole "vd" disk (the SDHCI module registers the SD card as vda: no virtio boot disk holds index 0).
+    if device_count() == 1 {
+        if let Some(e) = get(0) {
+            if e.parent.is_none() && e.class == "vd" && has_f2fs(0) { return Ok(0); }
+        }
+    }
 
     // Snapshot, then probe for magic with the lock dropped.
     let n = device_count();

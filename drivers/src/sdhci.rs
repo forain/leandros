@@ -75,7 +75,7 @@
 #[allow(unused_imports)]
 use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
-use crate::kenv::mm;
+use crate::kenv::{mm, sched};
 
 /// Bring-up marker straight to the Pi's debug PL011, independent of the console
 /// stack. This driver runs before userspace and had never touched real silicon;

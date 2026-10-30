@@ -53,6 +53,10 @@ impl blockdev::BlockDevice for Card {
     fn name_class(&self) -> &'static str { "vd" }
 }
 
+/// The driver does not read C_SIZE yet (`sdhci::info` reports 0). Claim 256 GiB of 4 KiB blocks so the registry's
+/// bounds checks pass; reads past the real end fail in the driver.
+const UNKNOWN_BLOCKS: u64 = 1 << 26;
+
 static DONE: AtomicBool = AtomicBool::new(false);
 
 fn init() -> i32 {
@@ -62,7 +66,7 @@ fn init() -> i32 {
     let mut found = 0;
     for idx in 0..sdhci::device_count() {
         let Some(info) = sdhci::info(idx) else { continue };
-        let card = alloc::boxed::Box::leak(alloc::boxed::Box::new(Card { idx, blocks: info.total_blocks }));
+        let card = alloc::boxed::Box::leak(alloc::boxed::Box::new(Card { idx, blocks: if info.total_blocks != 0 { info.total_blocks } else { UNKNOWN_BLOCKS } }));
         if blkdev::register(card).is_ok() { found += 1; }
     }
     if found == 0 { -19 } else { 0 }
