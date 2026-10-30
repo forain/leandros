@@ -19,6 +19,12 @@ use kmod_kapi::{input, usb as kusb};
 macro_rules! usb_log { ($($a:tt)*) => { kmod_rt::kinfo!($($a)*) } }
 pub(crate) use usb_log;
 
+mod descriptor {
+    pub const DT_INTERFACE: u8 = 0x04;
+    pub const DT_ENDPOINT: u8 = 0x05;
+    pub const DT_SS_ENDPOINT: u8 = 0x30;
+}
+
 mod platform {
     pub fn now_ns() -> u64 { kmod_kapi::sched::monotonic_ns() }
 }
