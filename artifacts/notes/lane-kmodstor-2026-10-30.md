@@ -28,3 +28,4 @@ See the end of this file (filled after the gates ran).
   Under `=m` the hungtask/iostat USB sections are empty (stub). Shipped configs keep `USB_STORAGE=y`.
 - UAS-only devices unchanged (unsupported). S3 resume re-address (`persist`) is not set for the module path.
 - USB root with `=m` (LEANDROS_USB_STICK / ROOT_BUS=usb) not exercised here; the module is in modules/BOOT for it.
+- aarch64 default regress on the box (100eb261): 61 suites, 0 bad; selftest.sh aarch64 PASS; ktest=kmodkapi both arches 0 FAIL (100 exports); autoloadtest usb_storage PASS; usbunplugtest unplug (module) PASS incl. re-plug; x86_64 default and USB_STORAGE=m build ok.
