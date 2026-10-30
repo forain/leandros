@@ -166,7 +166,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 109;
+pub const NEXPORTS: usize = 118;
 
 #[used]
 #[link_section = ".ksymtab"]

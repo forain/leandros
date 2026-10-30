@@ -159,6 +159,7 @@ create_initrd() {
 kconfig_features() {
     local arch="$1" def cfg
     if [[ "$arch" == "aarch64" && "$RPI5" == "true" ]]; then def="rpi5"
+    elif [[ "$arch" == "aarch64" && "${RASPI4B:-}" == "true" ]]; then def="raspi4b"
     elif [[ "$arch" == "x86_64" && "${INTEL:-}" == "1" ]]; then def="x86_64_laptop"
     else def="$arch"; fi
     mkdir -p "$ROOT_DIR/target/kconfig-$arch"
@@ -1175,7 +1176,8 @@ for arch in "${ARCHS[@]}"; do
         "$ROOT_DIR/scripts/kmod/testblob.sh" "$arch"
     fi
     # Rust modules (CONFIG_X=m, $KMOD_EXTRA); a no-op when there is nothing to build.
-    "$ROOT_DIR/scripts/kmod/kmod-build.sh" "$arch"
+    KMOD_BOARD="$([[ "$arch" == "aarch64" && "$RPI5" == "true" ]] && echo rpi5 || { [[ "$arch" == "aarch64" && "${RASPI4B:-}" == "true" ]] && echo raspi4b; } || true)" \
+        "$ROOT_DIR/scripts/kmod/kmod-build.sh" "$arch"
     create_initrd "$arch"
     # Fail the build when a shipped kernel variant has no lib/modules/<its build-id> (any =m set).
     python3 "$ROOT_DIR/scripts/kmod/bidcheck.py" build "$arch"

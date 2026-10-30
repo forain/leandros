@@ -75,7 +75,7 @@
 #[allow(unused_imports)]
 use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
-use mm;
+use crate::kenv::{mm, sched};
 
 /// Bring-up marker straight to the Pi's debug PL011, independent of the console
 /// stack. This driver runs before userspace and had never touched real silicon;
@@ -652,8 +652,8 @@ impl SdhciDevice {
             for i in 0..digits { let nib = ((v >> (4 * (digits - 1 - i))) & 0xf) as u8; o[i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 }; }
             o
         };
-        let p = |s: &str| crate::pci::serial_debug(s);
-        let ph = |v: u64, d: usize| { let o = hex(v, d); crate::pci::serial_debug(core::str::from_utf8(&o[..d]).unwrap_or("?")); };
+        let p = |s: &str| crate::kenv::pci::serial_debug(s);
+        let ph = |v: u64, d: usize| { let o = hex(v, d); crate::kenv::pci::serial_debug(core::str::from_utf8(&o[..d]).unwrap_or("?")); };
         p("[sdhci] multitest 1024 blocks (4 MiB, spans 16/1/7) crc single="); ph(!crc_s as u64, 8);
         p(" multi="); ph(!crc_m as u64, 8);
         p(" multifails="); ph(fails as u64, 4);
@@ -703,19 +703,19 @@ impl SdhciDevice {
             unsafe { self.abort_multi(); }
             let ok = (0..nblocks).all(|j| self.do_io(is_write, blk + j as u64,
                 unsafe { buf.add(j * BLOCK_SIZE) }));
-            crate::pci::serial_debug(if is_write { "[sdhci] multi-block write" } else { "[sdhci] multi-block read" });
-            crate::pci::serial_debug(" failed (N<<16|E latched: ");
+            crate::kenv::pci::serial_debug(if is_write { "[sdhci] multi-block write" } else { "[sdhci] multi-block read" });
+            crate::kenv::pci::serial_debug(" failed (N<<16|E latched: ");
             let mut hx = [0u8; 8];
             for (i, c) in hx.iter_mut().enumerate() {
                 let nib = ((latched >> (28 - 4 * i)) & 0xf) as u8;
                 *c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
             }
-            crate::pci::serial_debug(core::str::from_utf8(&hx).unwrap_or("?"));
-            crate::pci::serial_debug(if ok { "), single-sector redo ok\n" } else { "), single-sector redo failed too\n" });
+            crate::kenv::pci::serial_debug(core::str::from_utf8(&hx).unwrap_or("?"));
+            crate::kenv::pci::serial_debug(if ok { "), single-sector redo ok\n" } else { "), single-sector redo failed too\n" });
             if ok && MULTI_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1 >= MULTI_FALLBACK_LIMIT
                 && MULTI_ON.swap(false, Ordering::Relaxed)
             {
-                crate::pci::serial_debug("[sdhci] multi-block disabled; I/O is single-sector PIO from now on\n");
+                crate::kenv::pci::serial_debug("[sdhci] multi-block disabled; I/O is single-sector PIO from now on\n");
             }
             return ok;
         }
@@ -1413,7 +1413,7 @@ pub fn init() {
             if MULTITEST.load(Ordering::Relaxed) {
                 if let Some(ref d) = devs[1] { unsafe { d.multitest(); } }
             }
-            crate::pci::serial_debug(if MULTI_ON.load(Ordering::Relaxed) {
+            crate::kenv::pci::serial_debug(if MULTI_ON.load(Ordering::Relaxed) {
                 "[sdhci] I/O mode: PIO multi-block CMD18/CMD25 + auto-CMD12, up to 64 KiB per command (single-sector fallback) (sdhci.multi=1)\n"
             } else {
                 "[sdhci] I/O mode: PIO single-sector CMD17/CMD24 (multi-block off; sdhci.multi=1 enables it)\n"

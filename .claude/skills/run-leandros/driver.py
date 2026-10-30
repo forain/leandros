@@ -1138,25 +1138,35 @@ def _root_bus_args(virtio_args):
     NVMe namespace or a usb-storage device on qemu-xhci instead of virtio-blk; the data disks
     stay virtio. Exercises the boot-path drivers (NVME, USB_STORAGE) in QEMU."""
     bus = os.environ.get("LEANDROS_ROOT_BUS", "virtio") or "virtio"
-    if bus == "virtio":
+    # LEANDROS_ROOTFS_BUS=nvme|usb moves the root FILESYSTEM disk (data0, LABEL=leandros-root) instead
+    # of the boot disk: the kernel must then mount root through the nvme / usb_storage driver
+    # (the root-on-module gate, scripts/kmod/rootmodtest.sh).
+    fsbus = os.environ.get("LEANDROS_ROOTFS_BUS", "virtio") or "virtio"
+    if bus == "virtio" and fsbus == "virtio":
         return virtio_args
-    if bus not in ("nvme", "usb"):
-        sys.exit(f"ERROR: LEANDROS_ROOT_BUS must be virtio, nvme or usb (got {bus})")
+    if bus not in ("virtio", "nvme", "usb") or fsbus not in ("virtio", "nvme", "usb"):
+        sys.exit(f"ERROR: LEANDROS_ROOT_BUS / LEANDROS_ROOTFS_BUS must be virtio, nvme or usb (got {bus}/{fsbus})")
     out, hit = [], False
     for i, a in enumerate(virtio_args):
-        if a.startswith("virtio-blk-pci,drive=drive0"):
+        if bus != "virtio" and a.startswith("virtio-blk-pci,drive=drive0"):
             hit = True
             if bus == "nvme":
                 out.append("nvme,drive=drive0,serial=leandros-root,bootindex=0")
             else:
                 out.append("usb-storage,bus=xhci.0,drive=drive0,id=usbroot,bootindex=0")
+        elif fsbus != "virtio" and a.startswith("virtio-blk-pci,drive=data0"):
+            hit = True
+            if fsbus == "nvme":
+                out.append("nvme,drive=data0,serial=leandros-rootfs")
+            else:
+                out.append("usb-storage,bus=xhci.0,drive=data0,id=usbrootfs")
         else:
             out.append(a)
     if not hit:
         return virtio_args
-    if bus == "usb":
+    if "usb" in (bus, fsbus):
         # the controller must exist before the usb-storage device
-        j = max(k for k, a in enumerate(out) if a.startswith("usb-storage,bus=xhci.0")) - 1
+        j = min(k for k, a in enumerate(out) if a.startswith("usb-storage,bus=xhci.0")) - 1
         out[j:j] = ["-device", "qemu-xhci,id=xhci"]
     return out
 

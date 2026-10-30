@@ -50,7 +50,7 @@ kmod_rt::module! { name: "virtio_rng", init: init,
 
 ## 3. The kapi export table
 
-The kapi is a table of `extern "C"` functions in [kernel/src/kmod/exports/](../../kernel/src/kmod/exports) (one file per group, assembled by `mod.rs`). **It is the only kernel surface a module can reach**; there is no general symbol export as in Linux. The table currently has **`NEXPORTS = 109`** entries. Groups:
+The kapi is a table of `extern "C"` functions in [kernel/src/kmod/exports/](../../kernel/src/kmod/exports) (one file per group, assembled by `mod.rs`). **It is the only kernel surface a module can reach**; there is no general symbol export as in Linux. The table currently has **`NEXPORTS = 118`** entries. Groups:
 
 | Group | File | Contents |
 |---|---|---|
@@ -102,7 +102,7 @@ The root file system is mounted from a block device, so it looks like a chicken-
 - The kernel's **built-in cpio reader** unpacks `lib/modules/<build-id>/` from that RAM image (`extract_binary_from_initrd` in [kernel/src/init.rs](../../kernel/src/init.rs)); no driver is needed to read it.
 - It loads the BOOT list (`virtio_blk`, `nvme`, `usb_storage`), those drivers register their block devices, and the usual root wait finds the disk.
 
-So NVMe, virtio-blk and USB mass storage can be `=m`, and SDHCI is planned to follow once lane kmodroot lands. Two rules fall out. The kernel and initrd must be from the **same build** (the build-id directory name is the lookup key; a mismatched initrd simply has no matching directory and the root never appears). And the **root wait** is a timing risk: the module path adds load time and, for USB, device enumeration before root is visible; the wait bounds exist but were tuned for built-in drivers.
+So NVMe, virtio-blk and USB mass storage can be `=m`, and SDHCI (`modules/sdhci`, in BOOT) as well. Two rules fall out. The kernel and initrd must be from the **same build** (the build-id directory name is the lookup key; a mismatched initrd simply has no matching directory and the root never appears). And the **root wait** is a timing risk: the module path adds load time and, for USB, device enumeration before root is visible; the wait bounds exist but were tuned for built-in drivers.
 
 **Caution, not a technical need:** the shipped configs keep root drivers `=y`. The root-on-module evidence is QEMU only (virtio-blk through `kexecblktest`; NVMe and USB-root `=m` paths are exercised less), and a failure there means a machine that cannot boot, so the default stays conservative until real hardware has done it.
 
@@ -126,14 +126,15 @@ Tristate symbols and their module (all default to `y`; slot numbers in [modules/
 | `USB_HID` | `usb-hid` | boot keyboards/mice via `usb 03 01 01/02` aliases, interrupt pipe, per-device evdev nodes |
 | `USB_STORAGE` | `usb-storage` | USB bulk pipes, block kapi, in BOOT |
 | `BT` | `bt` | HCI over USB (Intel), `usb_bt_*` pipes |
+| `SDHCI` | `sdhci` | SD/eMMC host, block kapi, `of:` aliases `brcm,bcm2712-sdhci` and `brcm,bcm2711-emmc2`, in BOOT; fixed 256 GiB capacity (no C_SIZE) |
 
-**Y-only (bool) drivers:** `VIRTIO_GPU`, `V3D`, `R8169`, `MACB`, `BRCMF`, `HDMI_AUDIO`, `I915`, plus the platform pieces (SDHCI, RP1, bcm2712 blocks, PSMOUSE, I2C-HID, ...). Several already have reserved SLOTS entries (brcmf, i915, virtio_gpu, v3d, macb, hdmi_audio, r8169) but **no module crate**, so they cannot be set to `m`. The DRM class kapi (`KDrmOps`) is merged; i915 is the intended first user but first needs a `kenv` seam over its direct kernel dependencies. `VIRTIO_GPU` and `V3D` were deliberately kept `bool`.
+**Y-only (bool) drivers:** `VIRTIO_GPU`, `V3D`, `R8169`, `MACB`, `BRCMF`, `HDMI_AUDIO`, `I915`, plus the platform pieces (RP1, bcm2712 blocks, PSMOUSE, I2C-HID, ...). Several already have reserved SLOTS entries (brcmf, i915, virtio_gpu, v3d, macb, hdmi_audio, r8169) but **no module crate**, so they cannot be set to `m`. The DRM class kapi (`KDrmOps`) is merged; i915 is the intended first user but first needs a `kenv` seam over its direct kernel dependencies. `VIRTIO_GPU` and `V3D` were deliberately kept `bool`.
 
 ## 7. What a module cannot do, and why
 
 - **Tied to one kernel build.** Build-id lock and addresses linked into the image (section 2). You cannot copy a `.kmod` from another kernel, or update the kernel and keep the old initrd.
 - **Slot limits.** A module must fit its SLOTS allocation (e.g. 8 x 256 KiB for nvme). Growing a driver may mean a new SLOTS line (check the file's "next free" comment).
-- **Only the kapi is reachable.** A driver that needs a kernel facility not in the 109 exports needs a new export, and an exported function becomes ABI the module crates compile against (`KMOD_ABI_VERSION = 1`).
+- **Only the kapi is reachable.** A driver that needs a kernel facility not in the 118 exports needs a new export, and an exported function becomes ABI the module crates compile against (`KMOD_ABI_VERSION = 1`).
 - **No unload.** `delete_module` is `EBUSY`; a module that registered a thread, IRQ or device cannot be torn down safely. A failed `init` is the only path that releases a slot. For example, with a radio present the iwlwifi radio thread pins the module, so unloading it would only ever be clean with no device.
 - **Crash-time and boot-critical paths stay in the kernel.** Panic output, the persistent kernel log, kexec's device quiesce, and the console cannot depend on a loadable driver. Where such a hook is needed from a module (shutdown, suspend, kexec quiesce), it is registered through the kapi power-management table and ordered by phase.
 - **Per-driver reductions**, to keep the first versions simple:
@@ -147,8 +148,9 @@ Tristate symbols and their module (all default to `y`; slot numbers in [modules/
 
 All of this is in the regression/ktest tooling, none on real hardware:
 
-- **`ktest=kmodkapi`** ([kernel/src/ktest.rs](../../kernel/src/ktest.rs)) exercises the 109 exports and per-callback-kind failed-init release, on both arches.
+- **`ktest=kmodkapi`** ([kernel/src/ktest.rs](../../kernel/src/ktest.rs)) exercises the 118 exports and per-callback-kind failed-init release, on both arches.
 - **`scripts/kmod/selftest.sh <arch>`** is the module pipeline self-test; **`scripts/kmod/autoloadtest.sh <mod>`** builds a kernel with that driver `=m` and asserts the device works through alias autoload, and that blacklisting it removes the device. Cases: e1000e, virtio_rng, virtio_net (via `nettest`), virtio_keyboard, virtio_snd, hda, iwlwifi, usb_hid, bt, virtio_blk/nvme (negative cases), and `of`.
+- **`scripts/kmod/rootmodtest.sh <nvme|usb_storage|sdhci>`** (bus chosen by `LEANDROS_ROOTFS_BUS`) builds a kernel with that storage driver `=m`, boots with the root on that bus and asserts the root mounts through the initrd module path. aarch64 results: nvme PASS, usb_storage PASS, sdhci PASS (`-M raspi4b`). `sdhci` is aarch64 only. The sdhci module reports a fixed 256 GiB capacity because it does not decode C_SIZE, so other card sizes are not reported correctly.
 - **`kexecblktest`** (`runtests ... kexecblk`) is the root-on-module gate: a kernel built `MODULES=y VIRTIO_BLK=m` is kexec'd and must mount root.
 - **`usbunplugtest.py`** covers USB hot-unplug and not-ready devices, including the `hid` case.
 - **`bidcheck.py`** (`scripts/kmod/bidcheck.py build <arch>`, last step of the build) fails the build if a shipped kernel variant has no `lib/modules/<its build-id>/` in the initrd, so a stale or mismatched initrd cannot ship.

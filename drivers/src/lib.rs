@@ -209,7 +209,7 @@ pub mod nvme;
 #[cfg(not(feature = "drv-nvme"))]
 #[path = "stubs/nvme.rs"]
 pub mod nvme;
-#[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
+#[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b"), feature = "drv-sdhci"))]
 pub mod sdhci;
 /// VideoCore mailbox — the only source of a framebuffer on a Raspberry Pi 5,
 /// whose firmware publishes no `simple-framebuffer` DTB node. Compiled for
@@ -272,10 +272,10 @@ pub mod partscan;
 /// any time, partitions scanned from both. On rpi5/raspi4b it stays the
 /// compile-time SD-card path (`blkdev_sdhci.rs` over `sdhci`; no PCI bus
 /// exists on either target). Both expose the same functions.
-#[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
+#[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b"), feature = "drv-sdhci"))]
 #[path = "blkdev_sdhci.rs"]
 pub mod blkdev;
-#[cfg(not(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b"))))]
+#[cfg(not(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b"), feature = "drv-sdhci")))]
 pub mod blkdev;
 
 /// Per-device metadata surfaced to userspace via the block-device-enumeration

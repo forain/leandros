@@ -111,6 +111,12 @@ pub mod env {
         }
         pub mod irqctx {
             pub fn can_sleep() -> bool { crate::sys_common::can_sleep() }
+            /// Module code never runs in IRQ context (handlers are separate entry points).
+            pub fn in_irq() -> bool { false }
+        }
+        pub mod kthread {
+            pub use crate::sched::kthread::*;
+            pub fn cond_resched() { crate::sys_common::yield_now() }
         }
         pub mod ksync {
             use core::ops::{Deref, DerefMut};
