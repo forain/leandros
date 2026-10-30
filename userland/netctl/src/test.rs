@@ -165,7 +165,7 @@ fn case_queries() {
     check!("query_short_size", n.ioctl(NETCTL_GET_IFACES, &mut q) == Err(EINVAL));
 }
 
-fn mutating_all(n: &Netctl) -> [Result<usize, i32>; 5] {
+fn mutating_all(n: &Netctl) -> [Result<usize, i32>; 6] {
     let mut s = NcScan::new();
     let mut c = NcConnect::new();
     c.flags = connect_flags::INLINE;
@@ -176,8 +176,11 @@ fn mutating_all(n: &Netctl) -> [Result<usize, i32>; 5] {
     let mut r = NcRadio::new();
     r.on = 1;
     let mut l = NcReload::new();
+    let mut m = NcMetric::new();
+    m.ifindex = 2;
+    m.metric = 100;
     [n.ioctl(NETCTL_SCAN, &mut s), n.ioctl(NETCTL_CONNECT, &mut c), n.ioctl(NETCTL_DISCONNECT, &mut d),
-     n.ioctl(NETCTL_SET_RADIO, &mut r), n.ioctl(NETCTL_RELOAD_PROFILES, &mut l)]
+     n.ioctl(NETCTL_SET_RADIO, &mut r), n.ioctl(NETCTL_RELOAD_PROFILES, &mut l), n.ioctl(NETCTL_SET_METRIC, &mut m)]
 }
 
 fn case_ro_eperm() {

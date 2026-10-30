@@ -83,7 +83,24 @@ pub(crate) static IFRT: Mutex<[IfRt; MAX_NETIF]> = Mutex::new([const { IfRt::new
 /// The metric a netif gets: wired 100 (+ its index among wired NICs), Wi-Fi 600.
 pub(crate) fn default_metric(n: &netdev::Netif) -> u32 {
     let nth = netdev::iter().filter(|o| o.kind == n.kind && o.id < n.id).count() as u32;
-    match n.kind { netdev::Kind::Wired => 100 + nth, netdev::Kind::Wifi => 600 + nth }
+    let base = match n.kind { netdev::Kind::Wired => 100 + nth, netdev::Kind::Wifi => 600 + nth };
+    // Boot knob: `net.metric.<ifname>=<n>` on the kernel command line.
+    let key = alloc::format!("net.metric.{}", n.name());
+    match drivers::nvidia_probe::cmdline_opt(&key) {
+        Some(v) if v > 0 => v.min(u32::MAX as u64) as u32,
+        _ => base,
+    }
+}
+
+/// Set a netif's route metric (`None` = the default). New flows follow the
+/// lowest-metric default route at once; the netctl model is refreshed.
+pub fn set_metric(netif: u8, metric: Option<u32>) -> bool {
+    if (netif as usize) >= netdev::count().min(MAX_NETIF) { return false; }
+    let Some(n) = netdev::get(netif as usize) else { return false };
+    let m = metric.unwrap_or_else(|| default_metric(&n));
+    IFRT.lock()[netif as usize].metric = m;
+    crate::netctl::kick();
+    true
 }
 
 /// A snapshot of one netif's routing state.

@@ -84,7 +84,7 @@ fn ioctl_numbers() {
               NETCTL_GET_PROFILES, NETCTL_REQUEST_SNAPSHOT] {
         assert!(!is_mutating(c) && is_netctl_ioctl(c));
     }
-    for c in [NETCTL_SCAN, NETCTL_CONNECT, NETCTL_DISCONNECT, NETCTL_SET_RADIO, NETCTL_RELOAD_PROFILES] {
+    for c in [NETCTL_SCAN, NETCTL_CONNECT, NETCTL_DISCONNECT, NETCTL_SET_RADIO, NETCTL_RELOAD_PROFILES, NETCTL_SET_METRIC] {
         assert!(is_mutating(c));
     }
     assert_eq!(ioc_size(NETCTL_CONNECT), NcConnect::SIZE);

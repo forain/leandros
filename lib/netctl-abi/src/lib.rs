@@ -167,6 +167,8 @@ pub const NETCTL_DISCONNECT: u32 = ioc(IOC_WRITE, 0x22, size_of::<NcIfReq>());
 pub const NETCTL_SET_RADIO: u32 = ioc(IOC_WRITE, 0x23, size_of::<NcRadio>());
 /// `_IOWR('N', 0x24, NcReload)` — re-read the profile slots, synchronously. W.
 pub const NETCTL_RELOAD_PROFILES: u32 = ioc(IOC_READ | IOC_WRITE, 0x24, size_of::<NcReload>());
+/// `_IOW('N', 0x25, NcMetric)` — set an interface's route metric (0 = default). W.
+pub const NETCTL_SET_METRIC: u32 = ioc(IOC_WRITE, 0x25, size_of::<NcMetric>());
 
 /// `_IO('N', 0x30)` — stop the kernel's trial-boot network watchdog
 /// (`netwatch=` knobs) for the rest of this boot; `espctl promote` issues it,

@@ -570,6 +570,23 @@ pub struct NcIfReq {
 }
 cmd!(NcIfReq, 16);
 
+/// `NETCTL_SET_METRIC`: set an interface's route metric (lower wins the
+/// default route). `metric == 0` restores the built-in value (wired 100,
+/// Wi-Fi 600, or the `net.metric.<ifname>=` boot knob).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NcMetric {
+    /// 0
+    pub size: u32,
+    /// 4: ifindex (>= 2).
+    pub ifindex: u32,
+    /// 8: new metric, 0 = restore the default.
+    pub metric: u32,
+    /// 12
+    pub _rsv: u32,
+}
+cmd!(NcMetric, 16);
+
 /// `NETCTL_SET_RADIO`: soft rfkill. Off = disconnect (reason RADIO_OFF),
 /// stop scanning, drop the BSS cache (BSS_GONE for each), firmware idle.
 #[repr(C)]

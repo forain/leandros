@@ -224,6 +224,8 @@ SUITES = {
                 "host:netroamtest.py",
                 # netctl event path on a QMP set_link flap (own boot).
                 "host:netflaptest.py",
+                # netctl metric + net.metric.<if>= boot knob (own boot).
+                "host:netmetrictest.py",
                 # Idle net-daemon wake bound (own boot): netidletest.py.
                 "host:netidletest.py",
                 # hostfwd connects under bulk load / a held unpumped serial (own boot).
@@ -242,6 +244,7 @@ SUITES = {
                 "host:udppeertest.py"],
     # netroamtest.py alone.
     "netroam": ["host:netroamtest.py"],
+    "netmetric": ["host:netmetrictest.py"],
     # udppeertest.py alone (udptest peer against the raw-Ethernet host peer).
     "udppeer": ["host:udppeertest.py"],
     # linkmontest.py alone.

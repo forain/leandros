@@ -37,7 +37,7 @@ use netctl_abi::profiles::Profile;
 use netctl_abi::*;
 
 fn usage() -> i32 {
-    eprintln!("usage: netctl [status|ifaces|scan [IF]|bss [IF]|connect SSID [PASS] [--if IF] [--bssid MAC] [--hidden] [--akm A]|connect --uuid UUID|disconnect [IF] [--keep-auto]|up IF|radio on|off [IF]|profiles|save SSID [PASS] [--prio N] [--hidden] [--no-auto]|forget SSID|UUID|reload|watch [--no-snapshot] [--for S] [--stamp]]");
+    eprintln!("usage: netctl [status|ifaces|scan [IF]|bss [IF]|connect SSID [PASS] [--if IF] [--bssid MAC] [--hidden] [--akm A]|connect --uuid UUID|disconnect [IF] [--keep-auto]|up IF|metric IF N|default|radio on|off [IF]|profiles|save SSID [PASS] [--prio N] [--hidden] [--no-auto]|forget SSID|UUID|reload|watch [--no-snapshot] [--for S] [--stamp]]");
     2
 }
 
@@ -469,6 +469,18 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         }
         b"connect" => connect(argc, argv),
         b"disconnect" => simple_if_cmd(argc, argv, None),
+        b"metric" if argc == 4 => {
+            let n = match open_rw() { Ok(n) => n, Err(e) => return fail("open /dev/netctl for writing", e) };
+            let ix = match n.resolve_if(arg(argv, 2)) { Ok(i) => i, Err(e) => return fail("interface", e) };
+            let v = arg(argv, 3);
+            let m: u32 = if v == b"default" { 0 } else {
+                match core::str::from_utf8(v).ok().and_then(|s| s.parse::<u32>().ok()) { Some(m) if m > 0 => m, _ => return usage() }
+            };
+            let mut q = NcMetric::new();
+            q.ifindex = ix;
+            q.metric = m;
+            match n.ioctl(NETCTL_SET_METRIC, &mut q) { Ok(_) => { sayln!("ok"); 0 } Err(e) => fail("metric", e) }
+        }
         b"up" => match a2 {
             Some(a) if argc == 3 => {
                 let n = match open_rw() { Ok(n) => n, Err(e) => return fail("open /dev/netctl for writing", e) };

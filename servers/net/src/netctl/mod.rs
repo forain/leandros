@@ -900,6 +900,10 @@ fn do_ioctl(cmd: u32, ptr: usize, open_id: u32) -> Result<i64, i32> {
             if !copy_out(ptr, &r.as_bytes()[..n]) { return Err(errno::EFAULT); }
             Ok(0)
         }
+        0x25 => {
+            let (r, _) = read_cmd::<NcMetric>(ptr, NcMetric::SIZE)?;
+            links::set_metric(r.ifindex, r.metric).map(|_| 0)
+        }
         _ => Err(errno::ENOTTY),
     }
 }
