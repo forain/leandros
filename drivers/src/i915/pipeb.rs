@@ -52,7 +52,7 @@ pub(super) fn init(d: &Device) {
         ilog!("pipeb: i915.pipeb_test/ddb_test: skipped on the fake device");
         return;
     }
-    if sched::kthread::spawn("i915-pipeb", move || worker(test, ddb)).is_none() {
+    if crate::kenv::sched::kthread::spawn("i915-pipeb", move || worker(test, ddb)).is_none() {
         ilog!("pipeb: could not start the test thread");
     }
 }

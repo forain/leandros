@@ -39,9 +39,9 @@
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-use sched::ksync::{KSemaphore, KSpinLock};
+use crate::kenv::sched::ksync::{KSemaphore, KSpinLock};
 
-use crate::gpu_kms::KmsFlip;
+use crate::kenv::kms::KmsFlip;
 use crate::DriverError;
 
 use super::hw::reg;
@@ -113,7 +113,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// The MSI is installed and GEN8_MASTER_IRQ enabled.
 static IRQ_ON: AtomicBool = AtomicBool::new(false);
 static FAKE_FRAME: AtomicU32 = AtomicU32::new(0);
-static TIMER: AtomicPtr<sched::hrtimer::HrTimer> = AtomicPtr::new(core::ptr::null_mut());
+static TIMER: AtomicPtr<crate::kenv::sched::hrtimer::HrTimer> = AtomicPtr::new(core::ptr::null_mut());
 
 // Counters (the periodic `kms: vblank` line).
 static IRQS: AtomicU64 = AtomicU64::new(0);
@@ -162,7 +162,7 @@ fn vblank_irq(on: bool) {
     if want != imr { m.w(DE_PIPE_IMR, want); }
 }
 
-fn timer() -> Option<&'static sched::hrtimer::HrTimer> {
+fn timer() -> Option<&'static crate::kenv::sched::hrtimer::HrTimer> {
     let p = TIMER.load(Ordering::Acquire);
     unsafe { p.as_ref() }
 }
@@ -223,7 +223,7 @@ fn check(from_irq: bool) -> bool {
         if from_irq { DONE_IRQ.fetch_add(1, Ordering::Relaxed); } else { DONE_POLL.fetch_add(1, Ordering::Relaxed); }
         (p, f, vblank_ts(t))
     };
-    for &e in &p.ev { if e != 0 { crate::drm_device_interface::ext_event_complete(e, seq, ts); } }
+    for &e in &p.ev { if e != 0 { crate::kenv::drm::ext_event_complete(e, seq, ts); } }
     false
 }
 
@@ -244,7 +244,7 @@ fn arm_locked(st: &mut Option<Pending>, mut p: Pending) -> kms::Armed {
 fn complete_now(p: &Pending) {
     let t = now();
     let f = frame_now();
-    for &e in &p.ev { if e != 0 { crate::drm_device_interface::ext_event_complete(e, f, t); } }
+    for &e in &p.ev { if e != 0 { crate::kenv::drm::ext_event_complete(e, f, t); } }
 }
 
 // ── KmsFlip hooks ───────────────────────────────────────────────────────────
@@ -305,7 +305,7 @@ fn event(ev: u32) {
     }
     // No room: complete it now rather than lose it.
     let t = now();
-    crate::drm_device_interface::ext_event_complete(ev, frame_now(), t);
+    crate::kenv::drm::ext_event_complete(ev, frame_now(), t);
 }
 
 fn busy() -> bool { STATE.lock().is_some() }
@@ -317,7 +317,7 @@ fn wait_idle(timeout_ns: u64) -> bool {
         if now().wrapping_sub(t0) >= timeout_ns { return false; }
         // Polling keeps a missed completion from stalling a blocking commit.
         let _ = check(false);
-        sched::kthread::sleep_ns(500_000);
+        crate::kenv::sched::kthread::sleep_ns(500_000);
     }
 }
 
@@ -430,7 +430,7 @@ fn worker() {
 
 fn stats_line(window: u64) {
     let n = NDONE.load(Ordering::Relaxed).max(1);
-    let (ebusy, evpend) = crate::drm_device_interface::ext_event_stats();
+    let (ebusy, evpend) = crate::kenv::drm::ext_event_stats();
     ilog!("kms: vblank: {} completions in window ({} total: {} on IRQ, {} by polling); armed {} in-ioctl / {} after fence; event-only {}; dropped {} (fence timeouts {}); unlatched {}; queue->event avg {} us max {} us, arm->event avg {} us max {} us; IRQs {} (vblank/flip {}) irq={}; EBUSY {}; DRM events pending {}; underruns {}",
           window, NDONE.load(Ordering::Relaxed), DONE_IRQ.load(Ordering::Relaxed), DONE_POLL.load(Ordering::Relaxed),
           ARMED_DIRECT.load(Ordering::Relaxed), ARMED_WORKER.load(Ordering::Relaxed), EVENT_ONLY.load(Ordering::Relaxed),
@@ -453,11 +453,11 @@ fn stats_line(window: u64) {
 
 /// gen8_irq_handler's shape: master off, banks acked (DE pipe A handled),
 /// master back on (a bank that latched meanwhile raises a new MSI).
-extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
+extern "C" fn isr(_ctx: usize) -> crate::kenv::irq::IrqReturn {
     let m = kms::mmio();
     IRQS.fetch_add(1, Ordering::Relaxed);
     let master = m.r(MASTER_IRQ) & !MASTER_IRQ_CONTROL;
-    if master == 0 { return crate::irq::IrqReturn::Handled; }
+    if master == 0 { return crate::kenv::irq::IrqReturn::Handled; }
     m.w(MASTER_IRQ, 0);
     // GT banks: nothing here unmasks GT sources (execution completion is
     // polled); acknowledge whatever latched so it cannot re-raise. A GT/PM
@@ -504,12 +504,12 @@ extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
         // An interrupt source we do not handle keeps firing: leave the
         // master off (the backstop polls) rather than storm.
         IRQ_ON.store(false, Ordering::Relaxed);
-        return crate::irq::IrqReturn::Handled;
+        return crate::kenv::irq::IrqReturn::Handled;
     }
     // After the kexec hook masked everything, leave the master off.
-    if KEXEC_OFF.load(Ordering::Acquire) { return crate::irq::IrqReturn::Handled; }
+    if KEXEC_OFF.load(Ordering::Acquire) { return crate::kenv::irq::IrqReturn::Handled; }
     m.w(MASTER_IRQ, MASTER_IRQ_CONTROL);
-    crate::irq::IrqReturn::Handled
+    crate::kenv::irq::IrqReturn::Handled
 }
 
 /// Unmask the PCH hotplug interrupt (DDI B/C/D) once the display MSI is live.
@@ -576,9 +576,9 @@ pub(super) fn init(d: &Device) -> bool {
         log("kms: i915.vblank=0: synchronous flips, 60 Hz synthetic flip events");
         return false;
     }
-    let t = alloc::boxed::Box::into_raw(sched::hrtimer::HrTimer::new(backstop_fire, 0, sched::hrtimer::TimerMode::Irq));
+    let t = alloc::boxed::Box::into_raw(crate::kenv::sched::hrtimer::HrTimer::new(backstop_fire, 0, crate::kenv::sched::hrtimer::TimerMode::Irq));
     TIMER.store(t, Ordering::Release);
-    if sched::kthread::spawn("i915-flip", worker).is_none() {
+    if crate::kenv::sched::kthread::spawn("i915-flip", worker).is_none() {
         log("kms: vblank: could not start the flip worker; synchronous flips");
         return false;
     }
@@ -591,7 +591,7 @@ pub(super) fn init(d: &Device) -> bool {
         how = if opt("i915.vblank_irq") == Some(0) {
             alloc::string::String::from("i915.vblank_irq=0: completion by polling only")
         } else {
-            match crate::irq::request_msi(d.func, isr, 0) {
+            match crate::kenv::irq::request_msi(d.func, isr, 0) {
                 Ok(h) => {
                     core::mem::forget(h);
                     // Mask ours, clear stale latches, enable them in the IER
@@ -610,7 +610,7 @@ pub(super) fn init(d: &Device) -> bool {
         };
     }
     ENABLED.store(true, Ordering::Release);
-    crate::gpu_kms::register_flip(&FLIP);
+    crate::kenv::kms::register_flip(&FLIP);
     ilog!("kms: vblank: flips queued from the ioctl, armed after the render fence, completed at the latching vblank ({}); one commit in flight (EBUSY), i915.vblank=0 for the old synchronous path", how);
     true
 }

@@ -5,9 +5,9 @@
 //! in QEMU. No hardware is touched.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use sched::ksync::KSemaphore;
+use crate::kenv::sched::ksync::KSemaphore;
 
-use crate::gpu_kms::{KmsPipe2, KmsTiming};
+use crate::kenv::kms::{KmsPipe2, KmsTiming};
 use crate::DriverError;
 
 use super::{ilog, now_ns, opt};
@@ -41,7 +41,7 @@ fn modeset(conn_idx: usize, t: &KmsTiming) -> Result<(), DriverError> {
     MODE_W.store(t.h[0] as u32, Ordering::Release);
     MODE_H.store(t.v[0] as u32, Ordering::Release);
     MODE_R.store(r, Ordering::Release);
-    ilog!("drm: CRTC 2 modeset {}x{}@{} conn 0x{:x}", t.h[0], t.v[0], r, crate::gpu_kms::EXT_CONN_BASE as usize + conn_idx);
+    ilog!("drm: CRTC 2 modeset {}x{}@{} conn 0x{:x}", t.h[0], t.v[0], r, crate::kenv::kms::EXT_CONN_BASE as usize + conn_idx);
     Ok(())
 }
 
@@ -80,16 +80,16 @@ fn worker() {
         let _ = TICK.down_timeout(16_666_667);
         let seq = FRAME.fetch_add(1, Ordering::AcqRel) + 1;
         let ev = PENDING.swap(0, Ordering::AcqRel);
-        if ev != 0 { crate::drm_device_interface::ext_event_complete(ev, seq, now_ns()); }
+        if ev != 0 { crate::kenv::drm::ext_event_complete(ev, seq, now_ns()); }
     }
 }
 
 pub(super) fn init(d: &super::Device) {
     if !d.fake || opt("i915.pipeb_stub") != Some(1) { return; }
-    if sched::kthread::spawn("i915-pipeb-stub", worker).is_none() {
+    if crate::kenv::sched::kthread::spawn("i915-pipeb-stub", worker).is_none() {
         ilog!("drm: pipeb stub: could not start the vblank thread");
         return;
     }
-    crate::gpu_kms::register_pipe2(&PIPE);
+    crate::kenv::kms::register_pipe2(&PIPE);
     ilog!("drm: 2 CRTCs (pipe B: stub)");
 }

@@ -53,16 +53,16 @@ pub(super) struct KStore;
 
 impl PtStore for KStore {
     fn alloc_page(&mut self) -> Option<u64> {
-        let p = mm::buddy::alloc_below(0, LOW4G)?;
-        unsafe { core::ptr::write_bytes(mm::phys_to_virt(p) as *mut u8, 0, 4096); }
+        let p = crate::kenv::mm::buddy::alloc_below(0, LOW4G)?;
+        unsafe { core::ptr::write_bytes(crate::kenv::mm::phys_to_virt(p) as *mut u8, 0, 4096); }
         Some(p as u64)
     }
-    fn free_page(&mut self, phys: u64) { mm::buddy::free(phys as usize, 0); }
+    fn free_page(&mut self, phys: u64) { crate::kenv::mm::buddy::free(phys as usize, 0); }
     fn read(&self, t: u64, i: usize) -> u64 {
-        unsafe { core::ptr::read_volatile((mm::phys_to_virt(t as usize) + i * 8) as *const u64) }
+        unsafe { core::ptr::read_volatile((crate::kenv::mm::phys_to_virt(t as usize) + i * 8) as *const u64) }
     }
     fn write(&mut self, t: u64, i: usize, v: u64) {
-        unsafe { core::ptr::write_volatile((mm::phys_to_virt(t as usize) + i * 8) as *mut u64, v) }
+        unsafe { core::ptr::write_volatile((crate::kenv::mm::phys_to_virt(t as usize) + i * 8) as *mut u64, v) }
     }
     /// Gen9 big-core parts share the LLC with the CPU: a store fence is all
     /// it takes for the GPU's page walker to see the entries.
@@ -85,8 +85,8 @@ pub(super) fn order_for(size: u64) -> usize {
 
 pub(super) fn alloc_bo(size: u64, ggtt: u64, g: &Gsm) -> Option<Bo> {
     let order = order_for(size);
-    let phys = mm::buddy::alloc_below(order, LOW4G)? as u64;
-    let va = mm::phys_to_virt(phys as usize);
+    let phys = crate::kenv::mm::buddy::alloc_below(order, LOW4G)? as u64;
+    let va = crate::kenv::mm::phys_to_virt(phys as usize);
     unsafe { core::ptr::write_bytes(va as *mut u8, 0, 4096 << order); }
     for i in 0..(size + 4095) / 4096 {
         g.write(ggtt / 4096 + i, hw::ggtt_pte(phys + i * 4096));
@@ -98,7 +98,7 @@ pub(super) fn alloc_bo(size: u64, ggtt: u64, g: &Gsm) -> Option<Bo> {
 /// invalidates the GGTT TLB and guarantees the GPU no longer uses it.
 pub(super) fn free_bo(b: &Bo, g: &Gsm) {
     for i in 0..(b.size + 4095) / 4096 { g.write(b.ggtt / 4096 + i, 0); }
-    mm::buddy::free(b.phys as usize, order_for(b.size));
+    crate::kenv::mm::buddy::free(b.phys as usize, order_for(b.size));
 }
 
 /// `enable_execlists` + `reset_csb_pointers` on the engine at `e`, with its
@@ -361,8 +361,8 @@ pub(super) fn bringup_and_selftest(d: &Device, env: &BootEnv, t: Tests) {
         return;
     }
     let m = &d.mmio;
-    let c = if d.fake { crate::pci::CMD_BUS_MASTER } else { d.func.command() };
-    if c & crate::pci::CMD_BUS_MASTER == 0 {
+    let c = if d.fake { crate::kenv::pci::CMD_BUS_MASTER } else { d.func.command() };
+    if c & crate::kenv::pci::CMD_BUS_MASTER == 0 {
         log("PCI bus mastering was off; enabling it");
         d.func.set_bus_master(true);
     }
@@ -573,7 +573,7 @@ fn fb_test(d: &Device, env: &BootEnv, eng: &mut Engine, fb_mirrored: bool, budge
     // addresses are not linear in the aperture without a fence).
     if !x_tiled {
         let len = (env.fb_pitch as usize) * band as usize;
-        match mm::kva::ioremap(d.gmadr_base + off, (len + 4095) & !4095, mm::kva::CacheMode::Uncached) {
+        match crate::kenv::mm::kva::ioremap(d.gmadr_base + off, (len + 4095) & !4095, crate::kenv::mm::kva::CacheMode::Uncached) {
             Some(va) => {
                 let mut bad = 0;
                 let mut s = alloc::string::String::new();
@@ -584,7 +584,7 @@ fn fb_test(d: &Device, env: &BootEnv, eng: &mut Engine, fb_mirrored: bool, budge
                     if p != col { bad += 1; }
                     s.push_str(&alloc::format!(" {:06x}", p));
                 }
-                mm::kva::iounmap(va);
+                crate::kenv::mm::kva::iounmap(va);
                 ilog!("self-test fb: bar centres read back through the aperture:{} -> {} ({} mismatches; the console may have redrawn)",
                     s, if bad == 0 { "PASS" } else { "MISMATCH" }, bad);
             }
