@@ -139,3 +139,9 @@ Recorded so they are not reopened without new evidence:
 - [../../TODO.md](../../TODO.md) — the live open-work list
 - [../servers/security.md](../servers/security.md) — the full privilege-gap list
 - [../graphics/README.md](../graphics/README.md) — GPU paths and their host requirements
+
+## cosmic-player (GStreamer)
+
+| Limit | Detail |
+|---|---|
+| **No audio from cosmic-player yet** | It starts, opens its window and decodes video, but `playbin` with `pipewiresink` stays PAUSED ("waiting for pool to become active"); a plain `... ! pipewiresink` pipeline streams fine. Needs `GST_PLUGIN_FEATURE_RANK=pipewiresink:PRIMARY` (set by the `.desktop`). aarch64 only; see `artifacts/notes/lane-gstport-2026-10-30.md`. |

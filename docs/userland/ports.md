@@ -136,6 +136,7 @@ Known gaps:
 | [apk](../../ports/apk/) | `apk.static`, `alpine-sysroot`, Alpine keys/repositories and a CA bundle for in-guest builds; `claude-code-install` and its `claude` launcher | [build.sh](../../ports/apk/build.sh), [In-guest builds](#in-guest-builds-apk-without-containers), [below](#the-claude-code-cli) |
 | [git](../../ports/git/) | git 2.47 + git-remote-https, less, nano, OpenSSH's `sftp-server` and `/etc/terminfo`, repackaged from Alpine 3.21 like PipeWire; symlinks in the staged tree become hard links in the image | [build-in-alpine.sh](../../ports/git/build-in-alpine.sh), [programs.md](programs.md#sshd) |
 | [pipewire](../../ports/pipewire/) | PipeWire 1.2.7 + WirePlumber from Alpine, the `leandros-snd-sink` virtio-snd sink, `pipewire-pulse`, `cosmic-applet-audio`, a ScreenCast-enabled `cosmic.portal` | [build.sh](../../ports/pipewire/build.sh), [../audio.md](../audio.md) |
+| [gstreamer](../../ports/gstreamer/) | GStreamer 1.24.11 (core, plugins-base/good whitelist, gst-libav on FFmpeg 6.1) and the PipeWire plugin 1.2.7 from Alpine 3.21, `gst-launch-1.0`/`gst-inspect-1.0`, a 30 s test clip, and the `-dev` files merged into the cross sysroot for cosmic-player's gstreamer-rs crates | this file |
 | [iso-codes](../../ports/iso-codes/) | Debian iso-codes 4.18.0 JSON tables (sha256-pinned) for Settings' Region page | [build.sh](../../ports/iso-codes/build.sh) |
 | [kbd-keymaps](../../ports/kbd-keymaps/) | binary console keymaps for `loadkmap` | [README.md](../../ports/kbd-keymaps/README.md) |
 | [firefox](../../ports/firefox/) | Alpine's prebuilt Firefox, its closure, FFmpeg and libpulse, the launcher and prefs | [below](#firefox) |
@@ -427,3 +428,25 @@ Kernel defects the bring-up found:
 - [../desktop/README.md](../desktop/README.md) — how the COSMIC ports fit together
 - [../graphics/mesa.md](../graphics/mesa.md) — Mesa drivers and patches in depth
 - [../getting-started/building.md](../getting-started/building.md) — sibling repositories and build flags
+
+## GStreamer (ports/gstreamer)
+
+Alpine 3.21 repackage, same recipe as `ports/pipewire` (`build-in-alpine.sh` in a container of the target
+architecture, closure walk, `libc.musl-*` rewritten to `libc.so`, `libleandros_ssp.so.1` for
+`__stack_chk_guard`). It stages `usr/lib/gstreamer-1.0` (53 plugins: no alsa/pulse/v4l2/soup/gtk/gl),
+`gst-plugin-scanner`, and `clip-mpeg4-vorbis.mkv` (30 s, MPEG-4 + Vorbis, generated in the container).
+GLib and FFmpeg are byte-identical to the copies the Firefox and PipeWire ports already stage, so the
+image grows by about 46 MiB (aarch64; the staged tree is 119 MiB before overlap). The same script
+installs `gstreamer-dev`, `gst-plugins-base-dev`, `glib-dev`, `util-linux-dev` and `pcre2-dev` and merges
+headers, `.pc` files and ELF-fixed linkable libraries into `m3-gl-stack/sysroot-<arch>` (`cp -n`, nothing
+is overwritten). `cosmic-player` (`ports/cosmic-apps`) builds against it with upstream default features.
+
+- `autoaudiosink` finds no sink (pipewiresink has rank NONE, there is no pulse/alsa plugin): the
+  `.desktop` file launches `env GST_PLUGIN_FEATURE_RANK=pipewiresink:PRIMARY cosmic-player`.
+- `gst-launch-1.0` needs `/usr/bin` on `PATH` (the serial shell's default `PATH` lacks it).
+- Verified on aarch64 only (QEMU, virgl): `gst-inspect-1.0` lists 53 plugins / 1007 features, a 30-buffer
+  `videotestsrc ! fakesink` and the clip's demux/avdec_mpeg4/vorbisdec chain run, and
+  `filesrc ! matroskademux ! vorbisdec ! audioconvert ! audioresample ! pipewiresink` streams into
+  `leandros_output` (cycles=424 in 7 s). x86_64 is not built or tested.
+- Open: `playbin ... audio-sink=pipewiresink` (what cosmic-player uses) stays in PAUSED, see
+  `artifacts/notes/lane-gstport-2026-10-30.md`.
