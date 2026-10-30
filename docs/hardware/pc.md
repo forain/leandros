@@ -7,8 +7,11 @@ linked into the kernel — boots the GPU's GSP firmware, a nouveau-compatible DR
 upstream Mesa NVK and Zink render on it, KMS scans out by copy-engine blits, and the COSMIC desktop
 runs with Firefox playing YouTube with sound over a Realtek Ethernet NIC and Intel HD Audio. The
 remaining work on the PC is performance and robustness, not bring-up (see [Limitations](#limitations-and-open-work)).
+A second machine, an all-Intel HP EliteBook 840 G5 laptop, boots from the same kind of stick and has its own
+section, [HP EliteBook 840 G5](#hp-elitebook-840-g5-laptop): i915 graphics and external outputs, ACPI power,
+suspend, an I2C touchpad, a webcam and a microphone.
 
-## Status (2026-10-11)
+## Status (desktop PC 2026-10-11; laptop rows 2026-10-30)
 
 | Capability | State | Since |
 |---|---|---|
@@ -25,8 +28,9 @@ remaining work on the PC is performance and robustness, not bring-up (see [Limit
 | Realtek RTL8111/8168 Ethernet | **Works** (DHCP, DNS, TCP; 77 and 166 Mbit/s in the first measurements) | `1c119a9`, `fb37c94`; boot 8-9 |
 | Intel HD Audio playback | **Works** | `71f0d9a`; boot 8 |
 | Desktop, Firefox playing YouTube with sound on the GPU | **Works** | boot 11-12 |
-| USB hubs | Not supported (work started, paused) | — |
-| Wi-Fi | No driver | — |
+| USB hubs and hot-plug | **Work** (USB 2 and SuperSpeed hubs, mass-storage and HID unplug/re-plug) | lanes `usbhot2`, `usbstick`, `usbunplug` |
+| Wi-Fi | Intel 8265 `iwlwifi` on the laptop; none on the desktop PC (see [drivers.md](drivers.md#wi-fi)) | — |
+| HP EliteBook 840 G5 | Boots, COSMIC on i915; ACPI battery/AC/backlight, webcam, microphone work; external outputs and S3 are opt-in or unresolved | [below](#hp-elitebook-840-g5-laptop) |
 
 The test machine is an Intel Kaby Lake desktop (4 cores, 4 threads, APIC IDs 0,2,4,6, no integrated
 GPU in use), a Sunrise Point PCH, a Realtek RTL8111 NIC, an ASMedia PCIe bridge, and an ASUS RTX 3070
@@ -179,7 +183,7 @@ Design of the current driver (`drivers/usb/src/xhci/`):
   addressing forms, which HVF cannot emulate (it aborts with `Assertion isv failed`) — and 64-bit
   registers are written low half then high half.
 - **Root ports only**: 100 ms debounce, then a second pass at +200 ms; USB3 ports wait for link
-  training, with a warm reset if it fails. Hubs are enumerated as devices but nothing behind them is.
+  training, with a warm reset if it fails. Hubs (USB 2 and SuperSpeed) are enumerated and their downstream ports scanned; a hub and everything behind it is re-enumerated from the connect-change latch after an unplug.
 
 ### Mass storage: bulk-only transport and SCSI
 
@@ -332,7 +336,7 @@ MADT or the device tree. Details: [kernel/scheduler.md](../kernel/scheduler.md) 
 control block and `RESET_REG`, and `\_S5_` from the DSDT. The test PC reports
 `PM1a_CNT=0x1804`, `\_S5_ SLP_TYP=7`, `RESET_REG=0xCF9 value 0x06`, and powers down cleanly. Reset
 falls back from `RESET_REG` to the keyboard controller, port `0xCF9`, then a triple fault. See
-[kernel/arch-x86_64.md](../kernel/arch-x86_64.md).
+[kernel/arch-x86_64.md](../kernel/arch-x86_64.md). The laptop adds an AML interpreter, an embedded controller, battery/AC and backlight, warm reboot and a suspend path; see [the laptop section](#acpi-power-battery-backlight-and-hotkeys).
 
 ## NVIDIA RTX 3070
 
@@ -522,7 +526,7 @@ Not done: checksum offload, TSO, jumbo frames, INTx on x86_64 (no `_PRT`: falls 
 
 ## Audio (Intel HD Audio)
 
-The PC's onboard codec is driven by `drivers/src/hda.rs` behind the same kernel audio server as virtio-sound; see [audio.md](../audio.md#the-intel-hd-audio-driver). `snd.backend=auto|virtio|hda` selects the backend and `snd.test=1` runs `/bin/snd-autotest` (off by default; `--cmdline "snd.test=1"` on the test stick).
+The PC's onboard codec is driven by `drivers/src/hda.rs` behind the same kernel audio server as virtio-sound; see [audio.md](../audio.md#the-intel-hd-audio-driver). HDA is also available as a loadable module (`kmodnetsnd`, see [kernel/modules.md](../kernel/modules.md)). `snd.backend=auto|virtio|hda` selects the backend and `snd.test=1` runs `/bin/snd-autotest` (off by default; `--cmdline "snd.test=1"` on the test stick).
 
 ## The NVIDIA test stick
 
@@ -532,26 +536,181 @@ Lazy fsync was on by default here until lane f2fsync (boot 17: Firefox fsyncs to
 
 Bisect knobs that need no rebuild (edit the stick's `limine.conf` cmdline between boots): `nvrm.conhold=0`, `nvrm.constress=<n>`, `f2fs.nostall=0`, `usbms.wryield=0`, `f2fs.fsyncbatch=0`, `pcache=0`; the full list of storage knobs is in [filesystems.md](../servers/filesystems.md#kernel-command-line-knobs). The kernel log of the last four boots is read back with `read-usb-log.sh`.
 
+## HP EliteBook 840 G5 (laptop)
+
+The second real machine is an HP EliteBook 840 G5: Core i5-8350U (Kaby Lake-R, Gen9.5 GT2 "UHD 620", `8086:5917`),
+Sunrise Point-LP PCH, eDP panel, NVMe, Intel e1000e Ethernet, Intel 8265 Wi-Fi and Bluetooth, an Alpine Ridge
+Thunderbolt 3 controller, a Synaptics I2C touchpad with a PS/2 trackstick, an integrated UVC webcam and an HDA
+codec with an internal microphone. It boots from the same Limine USB stick as the desktop PC. The whole
+machine is Intel, so none of the NVIDIA work applies; the graphics driver is `drivers/src/i915/` (Mesa iris and
+ANV on an i915 UAPI, KMS on the eDP, COSMIC on the GPU; see [graphics/drm-kms.md](../graphics/drm-kms.md#the-i915-backend)).
+Remote deployment and logs: [development/remote.md](../development/remote.md). `lapinv` (`lapinv=0` disables,
+`lapinv.smbus=0`, `lapinv.acpi=1`) prints a read-only device inventory at boot: the ACPI `_HID`/`_CID` walk
+(84 `_HID` and 17 `_CID` on this machine), every PCI function with BARs, the TPM 2.0 (Infineon, TIS), the
+Thunderbolt NHI state (firmware connection manager) and the Intel SMBus; the inventory and its gap table are in
+`artifacts/notes/laptop-device-inventory-2026-10-27.md`.
+
+Several drivers here are loadable modules (e1000e, HDA, iwlwifi, UVC, USB HID, USB storage, NVMe, USB Bluetooth);
+see [kernel/modules.md](../kernel/modules.md) for how they are built, aliased and autoloaded.
+
+### ACPI power, battery, backlight and hotkeys
+
+Lane `lappower` added `drivers/src/acpi_power/`: an AML interpreter in pure `core`+`alloc` behind a `Host` trait
+(the DSDT and SSDTs are loaded into a namespace; Field/IndexField/BankField over SystemMemory, SystemIO, PCI_Config,
+EmbeddedControl and SystemCMOS; `_OSI` answers as Windows; a `While` is capped at 100k iterations or 2 s), a polled
+embedded-controller driver (`ec.rs`, found from the ECDT or `_CRS`) and `power.rs`, which runs `\_SB._INI`, the EC's
+`_REG(3,1)` and `\_SB.PCI0._INI`, then polls in the `kacpid` thread every 200 ms for PM1 buttons, EC `_Qxx` queries
+and EC GPE clearing (other GPE methods only with `acpi_power.gpe=1`). It exposes:
+
+- `/sys/class/power_supply/{BAT0,AC}` and `/sys/class/backlight/intel_backlight` (the overlay is `servers/vfs/src/sysclass.rs`
+  plus `drivers/src/power_sysfs.rs`; backlight drives the PCH BLC PWM in `i915/backlight.rs`). upower reads the supply
+  from sysfs, which is what the COSMIC battery applet shows. A battery reporting `now==0 && full==0` (a failed EC
+  read) is treated as absent.
+- an "ACPI Power Buttons" evdev switch device (lid as `SW_LID`, power button), and PS/2 E0 20/2E/30 as mute and volume
+  keys. The HP brightness keys arrive as PS/2 set-1 `E0 12`/`E0 17` and map to `KEY_BRIGHTNESSDOWN`/`UP` (lane `bkeys`);
+  other unmapped scancodes log `kbd: unmapped sc e0 xx dn|up` (rate-limited). `brightness` is writable by root and, since
+  lane `bkperm`, by group `video` (gid 44) for that one attribute only, so login1's `SetBrightness` works for the session user.
+
+Why it is shaped this way: Linux's `acpi_battery`/`ec` stack is huge; the laptop's `_BST`, `_BIX` and `_PSR` are plain AML over
+EC fields, so a small interpreter plus a serialised EC driver covers it. The EC hardening (`lapdsdt`) came from hardware:
+one lock around every transaction, stale OBF drained before each command, 50 ms waits, and a 1 s back-off after four
+consecutive timeouts instead of permanently disabling the EC. The first sample after boot (AC 0, 0 A) is an EC settling
+transient and reads correctly from about 40 s. Knobs: `acpi_power=0` (all off), `acpi_power.fake=1` (fake QEMU data),
+`acpi_power.trace=1` (every EC read/write/query), `acpi_power.ecdump=1` (256-byte EC dump at init). The AML interpreter
+is host-tested with `drivers/acpi-aml-tests`.
+
+### Warm reboot
+
+The default x86_64 reboot used to end in a cold `0xCF9 = 0x0E` power cycle, which on the laptop sometimes turned into
+S5 (power off). Lane `lapreboot` made the chain Linux's: ACPI `RESET_REG`, 8042, ACPI, 8042, `CF9 = 0x06`, then
+`CF9 = 0x0E`, then a triple fault, after first clearing `PM1_EN`/`GPE0_EN` and write-1-clearing `PM1_STS`/`GPE0_STS`
+(`SCI_EN` untouched). `reboot.method=auto|acpi|kbd|cf9|cf9full|triple` selects one step (`reboot.type=cold` is an alias for
+`cf9full`). The chain is logged as `[REBOOT] chain: ...` before the final klog flush and the next boot prints
+`[PMC] reset cause`; the decode offsets there are unverified and the raw register values are printed beside it. The
+original power-off was intermittent and not reproduced; 15 of 15 reboot cycles on the laptop returned.
+
+### Suspend
+
+Suspend is layered, from safe to risky, and everything past the first layer is behind `pm.s3=1`:
+
+1. **Freeze-only device cycle** (`kernel/src/pm.rs`, lane `lapsusp`): hooks in suspend order i8042, i915 plane 1A, e1000e,
+   the block layer (new requests wait, bounded 10 s, in-flight drained, write caches flushed), xHCI, then a generic
+   "pci" hook (`drivers/src/pci_pm.rs`, lane `s3pci`) that saves and restores config space (BARs, MSI, MSI-X table,
+   PCIe capabilities, LTR/L1SS) in Linux's order. Resume runs in reverse and a failed suspend resumes whatever already ran.
+   Triggered by a root-only private `reboot(2)` command or `echo freeze > /sys/power/state` with `pm_test=devices`;
+   `suspendtest` (`--sysfs`, `--pci`, `--pci-deep`, `--xhci-halt`) exercises it. This is Linux's `pm_test=devices` level.
+2. **Sysfs surface** (`s3sysfs`): `/sys/power/{state,mem_sleep,pm_test,wakeup_count}` and `/sys/class/rtc/rtc0/{wakealarm,since_epoch}`;
+   `mem` is `EINVAL` without `pm.s3=1`, and with it needs an armed RTC alarm of at most 300 s unless `pm.s3_require_rtc=0`.
+   `pm.test=<level>` sets the test level.
+3. **AML sleep methods** (`s3aml`, `s3aml2`): `_TTS`, `_PTS`, `\_Sx_`, `_SST` and `_WAK` evaluation with per-operation-region
+   counters in `[S3] aml:` log lines; field access takes the FACS global lock with ownership tracking and a ~10 ms timeout, and
+   one irq-safe lock covers CMOS accesses. `pm.s3_dryrun=1` runs `_TTS/_PTS/_SST` eight seconds after boot without ever
+   setting `SLP_EN`; `=2` also runs `_WAK`. Finding: running `_WAK(3)` without a real sleep writes `0xEA91` to `SMI_CMD` (`0xB2`)
+   and resets the laptop; `pm.aml_smi_drop=<value>` drops that write and `_WAK(3)` then completes (66 ms), so `_WAK` runs only after
+   an actual wake. `pm.amltrace=1` logs a marker before every `0xB2` write.
+4. **The real S3 path** (`s3core`, `arch/x86_64/src/s3.rs`, `kernel/src/pm_s3.rs`): a real-mode wake stub at physical `0x7400`
+   climbing through protected mode to long mode on a temporary page table, a `setjmp`-style `pm_s3_lowlevel`, CPU/IOAPIC/TSC
+   save and restore, the ACPICA legacy `SLP_EN` sequence, and a canary check after wake. It refuses unless `pm.s3=1`, `\_S3_` is
+   valid, the FACS signature is right, exactly one CPU is online (`nosmp`) and the caller is the BSP. `pm_test=core` stops after a
+   CPU-only restore in place. Knobs: `pm.s3_beep=1` (PC speaker), `pm.s3_reset_after=<s>` (watchdog-style reset helper).
+5. **xHCI across S3** (`s3xhci`, `drivers/usb/src/xhci/pm.rs`): ports to U3, `R/S=0`, register save and `CSS`; on resume try a
+   state restore, else `HCRST` with a re-init of the same controller object, then USB persist done in place under the old slot ids
+   (port reset, Address Device, serial-string compare, Configure Endpoint), so the root stick's block device and mount survive.
+   `usb_storage::pm_resume_check()` re-reads the capacity and marks the disk gone, with no writes, on a mismatch.
+   `pm.s3_xhci=auto|restore|reinit`.
+
+State: S3 works end to end in QEMU x86_64 (`echo +6 > wakealarm; echo mem > state`, resumed with `PM1_STS` RTC and WAK set).
+On the laptop the first attempt did not come back and needed the power button; the AP-park step (to drop `nosmp`) and a
+supervised retry with the xHCI layer in place have not been done. Treat laptop S3 as unresolved; the freeze cycle is the
+part proven on hardware paths.
+
+### Graphics outputs
+
+See [graphics/drm-kms.md](../graphics/drm-kms.md#the-i915-backend) for the connector, second-CRTC, hot-plug and power-well work. In short:
+the eDP panel is the only lit output by default; HDMI and the two DP++ ports (DDI-B and DDI-C, both routed to USB-C/dock)
+are probed and reported as extra connectors only with `i915.extout=1`, and no external display has been lit yet.
+
+### USB-C and Thunderbolt
+
+The USB-C ports sit behind the Alpine Ridge xHCI (`3a:00.0`). Lane `lapusbc` prints a root-hub line per controller
+(`[XHCI] bus N root hub: USB3 ports a-b, USB2 ports c-d ...`), lists one synthetic root hub per controller in `lsusb`
+(`1d6b:0003`/`0002`), and adds a `controller gone` guard to the hot-plug scan: a controller whose `USBSTS` reads all-ones
+(a Thunderbolt controller powered down) detaches its root-port devices once and pauses the scan, instead of looping on
+garbage. `usb.tbxhci=0` disables the guard. Separately, a failed xHCI endpoint recovery now disables only that device's slot
+(`quarantine_slot()`, lane `xhcisafe`); the controller is halted only if Disable Slot itself fails.
+
+### Touchpad: I2C-HID Precision Touchpad
+
+The pad (Synaptics `SYNA3071`, `06CB:82F1`, `CPD0`, `PNP0C50`, I2C address `0x2c`) is a PS/2 device that firmware may also
+latch into I2C-HID mode, and a pad latched that way answers PS/2 identification but sends no motion. The pieces:
+
+- `drivers/src/dw_i2c.rs`: polled DesignWare I2C master behind the LPSS controllers (`8086:9d60..9d63`), write-then-read with
+  repeated start and `TX_ABRT_SOURCE` as the error. `i2c_acpi.rs` enumerates the devices below them (`_INI`, `_STA`, `_HID`,
+  `_CID`, `_CRS`, the HID-I2C `_DSM` register). `i2c=0` disables; `i2c.debug=1` traces.
+- `drivers/src/hid_desc.rs` parses report descriptors; `hid_ptp.rs` decodes Windows Precision Touchpad reports (tip, confidence,
+  contact id, X/Y, count, button), assembles hybrid frames and emits evdev **protocol B** multitouch events (palm = confidence 0
+  is dropped). Both are host-tested in `drivers/hid-desc-tests`.
+- `i2c_hid.rs`: SET_POWER ON, RESET, Input Mode feature, then polling at 8 ms while fingers are down and 100 ms when idle
+  (`i2chidpoll`). Any setup failure, 20 consecutive transfer errors for more than 2 s, or 64 reports that are neither PTP nor
+  mouse unregister the node and re-run PS/2 `psmouse` setup (`touchpad: i2c failed (...), back to ps2`). While the I2C pad is
+  active the PS/2 side drops the pad's own packets but still passes the trackstick.
+- **Defaults** (`lapptp5`): with no `touchpad=` the driver does a passive ACPI pre-scan (no `_PS0`, no pad reads); if a live
+  `SYNA*`/`PNP0C50` slave with a HID descriptor register exists it logs `touchpad: CPD0 SYNA3071 present -> i2c (default)`.
+  `touchpad=ps2` (or `ps2!`) forces PS/2, `touchpad=i2c` forces I2C. Debug: `touchpad.debug=1`, `touchpad.fail=1` (forced
+  fallback), `touchpad.verify=0`. `i2c_hid=probe` only reads descriptors; `i2c_hid.listen=1` or `probe+reset` is the old
+  120 s input listen. That listen was once the default and it latched the pad into I2C mode and killed PS/2 motion
+  (`lapptpfix`), which is why the default now touches nothing until it decides.
+
+The evdev side (`lapmt`): `DEVKIND_TOUCHPAD` (BUS_I2C, `ABS_MT_SLOT` 0..4, tracking ids, `BTN_TOOL_*TAP`, `INPUT_PROP_POINTER|BUTTONPAD`),
+`EVIOCGMTSLOTS`, `UI_SET_PROPBIT`/`EVIOCGPROP`, and uinput touchpads. Bug found there: `EVIOCGABS` was dispatched only for axes
+below `0x60`, so every `ABS_MT_*` axis returned `ENOTTY`; the range is now `0x40..0x80`. See [input.md](../input.md#touchpads-and-multitouch).
+
+### Webcam
+
+The camera is a UVC device on the xHCI. `drivers/usb/src/xhci/isoch.rs` gained framed isochronous IN pipes (up to 240 TDs, each
+payload keeps its UVC header); `drivers/usb/src/uvc.rs` parses the VC/VS descriptors (MJPEG, YUY2, NV12, frame sizes, isoch
+alternate settings), runs `VS_PROBE`/`VS_COMMIT`, picks the smallest alternate setting whose bandwidth holds the payload, and
+reassembles frames (FID toggle, EOF, ERR). `kernel/src/v4l2.rs` exposes it as `/dev/video0` (`crw-rw---- root video 81,0`) with
+QUERYCAP, formats, REQBUFS/QBUF/DQBUF, `STREAMON`, `S_PARM`, and the exposure controls; buffers are mmap'd (`lapcam2`: the
+device-mmap RAM policy requires pinned frames, so `v4l2::mmap_frames` takes a reference per frame). Knobs: `uvc.selftest=<N>`
+(stream N frames at enumeration and log size and FNV-1a), `uvc.fake=1` (a 640x480 fake camera with an embedded JPEG, ~33 fps, for
+QEMU), `uvc.ae_mode=<bitmap value>` (explicit auto-exposure mode; default picks one), `uvc.ae_prio=0|1|dev` (auto-exposure priority; default 0 keeps the frame rate constant) and
+`uvc.exposure=auto|manual:<100us>`. `userland/camtest` (`camtest 30`, `yuyv`, `--mmap`, `--fps`, `--ae-prio N`, `--exposure N`) captures
+frames and writes `/tmp/cam.jpg`. Measured on the laptop: about 10 fps (100 ms frame spacing) before the exposure controls were set, 30.4 fps (90/90
+frames) with `uvc.ae_prio=0` applied at stream start, YUYV 640x480 correct. The driver is also a loadable module (`kmodL7`, [kernel/modules.md](../kernel/modules.md)).
+
+### Audio
+
+Microphone capture, jack sense and the display codec are in [audio.md](../audio.md#capture-jack-sense-and-the-display-codec).
+
+### Open items on the laptop
+
+- External displays: HDMI/DP are detected and described but not lit; `i915.extout` stays off by default because compositor health with the
+  extra connectors is unverified on hardware.
+- S3: see above. Thunderbolt is only inventoried (read-only), not driven.
+- This unit has no ambient-light sensor and no ST accelerometer; the Synaptics/Validity fingerprint reader (`138a:00ab`) is not driven (vendor class, judged not feasible). The inventory note has the full gap table.
+- Brightness keys and the touchpad finger test need a person at the keyboard; automated checks only prove the plumbing.
+
 ## Limitations and open work
 
-- **No USB hub support.** Devices behind any hub — a monitor hub, a keyboard with a built-in hub,
-  or the internal rate-matching hubs that put many laptops' USB2 ports behind a hub — are not
-  enumerated; the summary prints a line saying so. This is the biggest functional gap on real
-  hardware. Hub work exists on a branch but is paused.
+- USB hubs and hot-plug exist now (lanes `usbhot2`, `usbstick`, `usbunplug`), but have been exercised mainly
+  with the laptop's stick and a few HID devices; a hub behind a hub is untested on hardware.
 - Implemented but not confirmed on any machine: 64-byte xHCI contexts, AC64=0 controllers (only
   simulated in QEMU by forcing DMA below 4 GiB), Stop Endpoint after a real NAK timeout, command-ring
   abort. The AMD, ASMedia and VIA xHCI quirks are not ported. The BIOS handoff, scratchpad buffers
   and a firmware-initialised controller — none of which QEMU models — are proven by the PC boot.
-- **Firmware DMA window**: a controller left running by firmware keeps DMAing into memory the kernel
-  may already have reclaimed until `usb_hcd::init()` stops it; an early quiesce is not done.
-- `usb_storage::init()` blocks the kernel init task for up to ~10 s per not-ready LUN; no hot-plug
-  after boot, and the block registry has no removal path (a pulled stick keeps its `sdX` entry).
+- **Firmware DMA window**: lane `usbladder` added an early xHCI quiesce so a controller left running by
+  firmware stops before the kernel reclaims memory; a soft-lockup detector and a 5 s ladder for atomic
+  callers bound any remaining stall.
+- `usb_storage::init()` blocks the kernel init task for up to ~10 s per not-ready LUN. Unplug and re-plug
+  of a mass-storage device is handled (background LUN readiness, `usbunplugtest` guard); the block
+  registry still keeps the `sdX` entry of a pulled disk.
 - UAS-only devices are skipped (BOT only). Report-protocol HID (tablets, media keys, game pads) is
   unsupported; the mouse has no acceleration.
 - DMA sync is barrier-only, correct on x86 and QEMU virt but not on non-coherent ARM boards.
 - **r8169 RX stalls: fix needs PC confirmation.** Boot 16's two watchdog resets match a dead MSI (an enabled status bit left latched); lane r8169irq made the interrupt protocol Linux's (above). Confirm with `grep -E 'r8169\] (stats|RX )'` on the next PC log: no `RX stall`/`RX backlog` lines under load. An `RX backlog` line instead points at a starved net daemon, not the NIC.
 - The PipeWire sink is named "Virtio Sound Output" whatever the audio backend.
-- No Wi-Fi driver; r8169 has no offloads and no 2.5G parts; HDA has no jack detection or hardware volume.
+- No Wi-Fi driver on the desktop PC; r8169 has no offloads and no 2.5G parts; HDA has no hardware volume (jack sense exists on the laptop codec, [audio.md](../audio.md#capture-jack-sense-and-the-display-codec)).
 - The stick is the bottleneck: writes of 0.5 to 1.3 s per command remain, and the fixes above hide them rather than remove them. Since lane f2fsync fsync uses roll-forward records and checkpoints are journaled ([filesystems.md](../servers/filesystems.md#performance-on-slow-media)), so lazy fsync is off by default.
 
 ## Code and tests
