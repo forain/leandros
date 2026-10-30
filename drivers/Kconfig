@@ -54,7 +54,7 @@ config R8169
 	default y
 
 config IWLWIFI
-	bool "Intel iwlwifi"
+	tristate "Intel iwlwifi"
 	depends on PCI
 	select WIFI_STACK
 	default y

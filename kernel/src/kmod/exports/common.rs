@@ -189,7 +189,9 @@ pub extern "C" fn kapi_fw_release(h: usize) {
 #[no_mangle]
 pub extern "C" fn kapi_secret_peek(owner: KmodId, key: *const u8, klen: usize, buf: *mut u8, cap: usize) -> isize {
     if key.is_null() || buf.is_null() || klen == 0 || klen > 64 { return -22; }
-    let mut net = false;
+    // A network registration, or the Wi-Fi module itself (it reads the legacy credential during probe,
+    // before it can register its netif).
+    let mut net = crate::kmod::name_str(&crate::kmod::registry::name_of(owner)) == "iwlwifi";
     crate::kmod::registry::registrations(owner, &mut |k, _| if k == RegKind::NETDEV { net = true });
     if !net { return -1; }
     let Ok(k) = core::str::from_utf8(unsafe { core::slice::from_raw_parts(key, klen) }) else { return -22 };

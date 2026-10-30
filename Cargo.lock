@@ -301,6 +301,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-iwlwifi"
+version = "0.1.0"
+dependencies = [
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "netctl-abi",
+ "spin",
+]
+
+[[package]]
 name = "kmod-kapi"
 version = "0.1.0"
 dependencies = [

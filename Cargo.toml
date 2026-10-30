@@ -28,6 +28,7 @@ members = [
     "modules/hello",
     "modules/virtio-rng",
     "modules/e1000e",
+    "modules/iwlwifi",
     "modules/nvme",
     "modules/virtio-blk",
     "modules/virtio-net",

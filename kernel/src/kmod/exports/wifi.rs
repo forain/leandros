@@ -9,6 +9,8 @@ use super::*;
 #[no_mangle]
 pub extern "C" fn kapi_wifi_register(_owner: KmodId, ops: *const drivers::wifi_radio::KWifiRadioOps, ctx: usize,
                                      legacy: *const drivers::wifi_radio::KLegacy) -> i32 {
+    // The module cannot reach the manager's `wifi.*` knobs; the built-in driver applies them in its init.
+    drivers::wifi_pref::set_knobs(crate::boot_cmdline().unwrap_or(""));
     drivers::wifi_class::register_raw(ops, ctx, legacy)
 }
 

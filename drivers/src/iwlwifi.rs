@@ -123,6 +123,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use spin::Mutex;
 
+use crate::kenv::{mm, sched};
+
 use crate::iwl_agg::{self as agg, TxAgg};
 use crate::iwl_assoc::{self as asc, MacState, TxParams};
 use crate::iwl_cmd as cmd;
