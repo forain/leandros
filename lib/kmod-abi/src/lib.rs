@@ -89,6 +89,7 @@ impl RegKind {
     pub const SND: RegKind = RegKind(10);
     pub const BLK: RegKind = RegKind(11);
     pub const INPUT: RegKind = RegKind(12);
+    pub const DRM: RegKind = RegKind(13);
 }
 
 /// Device-id table entry (`.kmod.ids`), 16 bytes. PCI: a=vendor, b=device (0xffff = any).
@@ -485,6 +486,15 @@ pub mod sys {
         pub fn kapi_preempt_enable();
         pub fn kapi_random_fill(buf: *mut u8, len: usize);
         pub fn kapi_wifi_register(owner: super::KmodId, ops: *const u8, ctx: usize, legacy: *const u8) -> i32;
+        pub fn kapi_drm_register(owner: super::KmodId, ops: *const u8, ctx: usize) -> i32;
+        pub fn kapi_drm_offset_alloc(real: u64, size: u64) -> u64;
+        pub fn kapi_drm_offset_release(real: u64);
+        pub fn kapi_fence_wait(ids: *const u64, n: usize, deadline_ns: u64) -> i32;
+        pub fn kapi_syncobj_install(handle: u32, open_id: u32, point: u64, fence: u64) -> i32;
+        pub fn kapi_syncobj_exists(handle: u32, open_id: u32) -> bool;
+        pub fn kapi_syncobj_in_fences(handle: u32, open_id: u32, point: u64, out: *mut u64, cap: usize) -> i64;
+        pub fn kapi_fence_irq_hint();
+        pub fn kapi_kms_event_complete(cookie: u32, seq: u32, ts_ns: u64);
         pub fn kapi_copy_from_user(dst: *mut u8, uaddr: usize, n: usize) -> i32;
         pub fn kapi_copy_to_user(uaddr: usize, src: *const u8, n: usize) -> i32;
         pub fn kapi_pci_scan(index: u32, out: *mut super::KPciDev) -> i32;

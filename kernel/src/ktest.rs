@@ -572,8 +572,21 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 100 && exports::NEXPORTS == 100, "ksymtab has 100 exports");
+    t.check(exports::ksymtab().len() == 109 && exports::NEXPORTS == 109, "ksymtab has 109 exports");
     t.check(exports::lookup("kapi_wifi_register").is_some(), "kapi_wifi_register in KSYMTAB");
+    for n in ["kapi_drm_register", "kapi_drm_offset_alloc", "kapi_drm_offset_release", "kapi_fence_wait", "kapi_syncobj_install",
+              "kapi_syncobj_exists", "kapi_syncobj_in_fences", "kapi_fence_irq_hint", "kapi_kms_event_complete"] {
+        t.check(exports::lookup(n).is_some(), "drm class export in KSYMTAB");
+    }
+    t.check(exports::kapi_drm_register(KmodId(0), core::ptr::null(), 0) == -22, "drm_register(null table) = -22");
+    t.check(exports::kapi_fence_wait(core::ptr::null(), 0, 0) == 0, "fence_wait(empty set) = 0");
+    {
+        // A fake offset round trip through the kernel's window, and an unknown syncobj.
+        let off = exports::kapi_drm_offset_alloc(0x1234_5000, 0x2000);
+        t.check(off != 0 && drivers::drm_offset::is_fake(off), "drm_offset_alloc gives a fake offset");
+        exports::kapi_drm_offset_release(0x1234_5000);
+        t.check(!exports::kapi_syncobj_exists(0xdead_beef, 1), "syncobj_exists(unknown) = false");
+    }
     #[cfg(feature = "drv-wifi-stack")]
     {
         // Radio class: the C table must be refused when malformed, and a scan hit / failure must
