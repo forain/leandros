@@ -92,6 +92,7 @@ const _: sys::CanSleepFn = kapi_dma_coherent;
 const _: sys::MutexNewFn = kapi_mutex_new;
 const _: sys::WaitNotifyFn = kapi_mutex_lock;
 const _: sys::WaitNotifyFn = kapi_mutex_unlock;
+const _: sys::MutexTryFn = kapi_mutex_trylock;
 const _: sys::SemNewFn = kapi_sem_new;
 const _: sys::WaitTimeoutFn = kapi_sem_down_timeout;
 const _: sys::WaitNotifyFn = kapi_sem_up;
@@ -129,7 +130,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 81;
+pub const NEXPORTS: usize = 82;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -181,6 +182,7 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_mutex_new", kapi_mutex_new),
     sym!("kapi_mutex_lock", kapi_mutex_lock),
     sym!("kapi_mutex_unlock", kapi_mutex_unlock),
+    sym!("kapi_mutex_trylock", kapi_mutex_trylock),
     sym!("kapi_sem_new", kapi_sem_new),
     sym!("kapi_sem_down_timeout", kapi_sem_down_timeout),
     sym!("kapi_sem_up", kapi_sem_up),

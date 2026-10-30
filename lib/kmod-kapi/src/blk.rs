@@ -15,6 +15,27 @@ pub fn remove(idx: i64) { unsafe { sys_blk::kapi_blk_remove(idx); } }
 
 impl crate::pci::PciFunction {
     pub fn set_command(&self, v: u16) { self.write16(0x04, v); }
+    pub fn command(&self) -> u16 { self.read16(0x04) }
+    /// Module-side twin of the kernel's `size_bars` (BARs only; no local-IRQ mask, so call it
+    /// from init before anything else touches the device).
+    pub fn size_bars(&self) -> BarSizing {
+        let mut bars = alloc::vec::Vec::new();
+        let mut i = 0;
+        while i < 6 {
+            if let Some(mut b) = self.bar(i) {
+                if !b.io { b.size = self.bar_size(i); }
+                if b.base != 0 || b.size != 0 { bars.push(b); }
+                i += if b.is64 { 2 } else { 1 };
+            } else { i += 1; }
+        }
+        BarSizing { bars, rom_orig: 0, rom_size: 0 }
+    }
+}
+
+pub struct BarSizing {
+    pub bars: alloc::vec::Vec<crate::pci::BarInfo>,
+    pub rom_orig: u32,
+    pub rom_size: u64,
 }
 
 pub mod env {
@@ -101,6 +122,12 @@ pub mod env {
             pub struct KMutexGuard<'a, T> { m: &'a KMutex<T> }
             impl<T> KMutex<T> {
                 pub fn new(v: T) -> Self { KMutex { h: crate::sys_common::mutex_new("blk"), v: UnsafeCell::new(v) } }
+                pub fn try_lock(&self) -> Option<KMutexGuard<'_, T>> {
+                    if crate::sys_common::mutex_trylock(self.h) { Some(KMutexGuard { m: self }) } else { None }
+                }
+                pub fn is_locked(&self) -> bool {
+                    match self.try_lock() { Some(_) => false, None => true }
+                }
                 pub fn lock(&self) -> KMutexGuard<'_, T> { crate::sys_common::mutex_lock(self.h); KMutexGuard { m: self } }
             }
             impl<T> Deref for KMutexGuard<'_, T> { type Target = T; fn deref(&self) -> &T { unsafe { &*self.m.v.get() } } }
