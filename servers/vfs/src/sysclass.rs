@@ -125,6 +125,42 @@ pub fn is_writable(path: &[u8]) -> bool {
     (s.o.writable)(CLASSES[s.cls], d, a)
 }
 
+/// Gid 44 = `video` (`scripts/mkfs-f2fs-populated.py` group file). Members may
+/// write a backlight's `brightness`, as the distro udev rule (0664 root:video)
+/// allows; login1 runs as the session user here, not as root.
+pub const VIDEO_GID: u32 = 44;
+
+/// Is `path` a `backlight/<dev>/brightness` attribute that exists and is writable?
+/// The only sysclass attribute group `video` may write.
+pub fn is_video_writable(path: &[u8]) -> bool {
+    let Some(s) = split(path) else { return false };
+    if CLASSES[s.cls] != "backlight" || s.attr != Some("brightness") { return false; }
+    is_writable(path)
+}
+
+/// Permission decision for opening a sysclass attribute for writing.
+/// Root always (when the attribute is writable at all); members of
+/// `VIDEO_GID` (egid or supplementary) only for `video_attr`.
+pub fn write_allowed(euid: u32, egid: u32, groups: &[u32], writable: bool, video_attr: bool) -> bool {
+    if !writable { return false; }
+    euid == 0 || (video_attr && (egid == VIDEO_GID || groups.contains(&VIDEO_GID)))
+}
+
+#[cfg(test)]
+mod perm_tests {
+    use super::*;
+    #[test]
+    fn decision() {
+        assert!(write_allowed(0, 0, &[], true, false));
+        assert!(!write_allowed(0, 0, &[], false, false));
+        assert!(write_allowed(1000, 1000, &[1000, 44], true, true));
+        assert!(write_allowed(1000, 44, &[], true, true));
+        assert!(!write_allowed(1000, 1000, &[1000, 10], true, true));
+        assert!(!write_allowed(1000, 1000, &[44], true, false));
+        assert!(!write_allowed(1000, 44, &[], false, true));
+    }
+}
+
 /// Write to an attribute (0 or a negative errno).
 pub fn write(path: &[u8], data: &[u8]) -> i32 {
     let Some(s) = split(path) else { return -2 };

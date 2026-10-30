@@ -6503,6 +6503,15 @@ fn gen_drm_sysfs(path: &[u8]) -> Option<VnodeKind> {
 /// the real one so `handle_write` can route the bytes to the hook.
 const SYSCLASS_W: &[u8] = b"/tmp/.syscw";
 
+/// May `pid` open the sysclass attribute at `path` for writing? Root for any
+/// writable attribute; group `video` (gid 44) only for a backlight `brightness`.
+fn sysclass_write_ok(pid: u32, path: &[u8]) -> bool {
+    let mut g = [0u32; xattr::NGROUPS_MAX];
+    let n = sched::groups_of(pid, &mut g).min(g.len());
+    sysclass::write_allowed(sched::euid_of(pid), sched::egid_of(pid), &g[..n],
+                            sysclass::is_writable(path), sysclass::is_video_writable(path))
+}
+
 fn gen_sysclass_writable(path: &[u8]) -> Option<VnodeKind> {
     let mut data = [0u8; 64];
     let n = sysclass::attr(path, &mut data).unwrap_or(0).min(64);
@@ -7609,7 +7618,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
                 VnodeKind::SysBlock { dev, level, pos: 0 }
             } else if flags & (O_WRONLY | O_RDWR) != 0 {
-                if sched::euid_of(pid) != 0 || !sysclass::is_writable(lookup_path) { return err_reply(-13); }
+                if !sysclass_write_ok(pid, lookup_path) { return err_reply(-13); }
                 match gen_sysclass_writable(lookup_path) {
                     Some(v) => v,
                     None => return err_reply(-2),
@@ -13868,6 +13877,10 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
             }
             let mut buf = [0u8; TMP_BUF_SIZE];
             if let Some(n) = sysclass::attr(lookup_path, &mut buf) {
+                if sysclass::is_video_writable(lookup_path) {
+                    write_stat_owned(stat_ptr, 0o100664, n as u64, path_ino(lookup_path, 5), 0, sysclass::VIDEO_GID);
+                    return ok_reply();
+                }
                 let m = if sysclass::is_writable(lookup_path) { 0o100644 } else { 0o100444 };
                 write_stat(stat_ptr, m, n as u64, path_ino(lookup_path, 5));
                 return ok_reply();
