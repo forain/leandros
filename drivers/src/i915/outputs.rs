@@ -22,9 +22,9 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use sched::ksync::KSemaphore;
+use crate::kenv::sched::ksync::KSemaphore;
 
-use crate::gpu_kms::{KmsConnInfo, KmsOutputs, KmsTiming};
+use crate::kenv::kms::{KmsConnInfo, KmsOutputs, KmsTiming};
 
 use super::{delay_us, ilog, now_ns, opt, Device, Mmio};
 
@@ -164,7 +164,7 @@ pub(super) fn init(d: &Device) {
         if p.dp { ndp += 1; conns.push(conn(pi, true, ndp)); }
         if p.hdmi { nhdmi += 1; conns.push(conn(pi, false, nhdmi)); }
     }
-    conns.truncate(crate::gpu_kms::EXT_MAX);
+    conns.truncate(crate::kenv::kms::EXT_MAX);
     let n = conns.len();
     let desc: Vec<alloc::string::String> = ports.iter().map(|p| alloc::format!("DDI-{} (gmbus pin {}, AUX {}{}{})",
         (b'A' + p.ddi) as char, p.gmbus_pin, (b'A' + p.aux) as char, if p.dp { ", DP" } else { "" }, if p.hdmi { ", HDMI" } else { "" })).collect();
@@ -193,7 +193,7 @@ pub(super) fn init(d: &Device) {
     let st: Vec<alloc::string::String> = l.iter().map(|c| alloc::format!("{}-{}={}", if c.is_dp { "DP" } else { "HDMI-A" }, c.type_id,
         if c.info.connected { "connected" } else { "disconnected" })).collect();
     drop(l);
-    crate::gpu_kms::register_outputs(&OUTPUTS);
+    crate::kenv::kms::register_outputs(&OUTPUTS);
     ilog!("outputs: registered {} (no CRTC: hidden from clients unless i915.extout_show=1)", st.join(" "));
 }
 
@@ -521,7 +521,7 @@ fn live_bits(m: &Mmio) -> u32 { if FAKE.load(Ordering::Relaxed) { 0 } else { m.r
 fn hpd_thread_start(m: &Mmio, fake: bool) {
     let irq = if fake || opt("i915.hpd") == Some(0) { None } else { super::vblank::hpd_irq_enable(m) };
     let debounce = opt("i915.hpd_debounce_ms").unwrap_or(100).min(2000);
-    if sched::kthread::spawn("i915-hpd", move || hpd_thread(debounce)).is_none() {
+    if crate::kenv::sched::kthread::spawn("i915-hpd", move || hpd_thread(debounce)).is_none() {
         ilog!("outputs: could not start i915-hpd; connector state probes on GETCONNECTOR");
         return;
     }
@@ -559,7 +559,7 @@ fn hpd_thread(debounce_ms: u64) {
     let m = mmio();
     let mut last_live = live_bits(&m);
     let mut next_report = now_ns() + 300_000_000_000;
-    while !sched::kthread::should_stop() {
+    while !crate::kenv::sched::kthread::should_stop() {
         let woke = HPD_WAKE.down_timeout(2_000_000_000);
         HPD_WAKES.fetch_add(1, Ordering::Relaxed);
         let pend = HPD_PENDING.swap(0, Ordering::AcqRel);
@@ -582,11 +582,11 @@ fn hpd_thread(debounce_ms: u64) {
         }
         last_live = live;
         if ddis != 0 {
-            sched::kthread::msleep(debounce_ms);
+            crate::kenv::sched::kthread::msleep(debounce_ms);
             if reprobe_ports(ddis) {
                 let g = HPD_GEN.fetch_add(1, Ordering::AcqRel) + 1;
                 ilog!("outputs: uevent drm change card0 (gen {})", g);
-                evdev_server::hp_drm_change(0);
+                crate::kenv::hotplug(0);
             }
         }
         if !woke && now_ns() >= next_report {

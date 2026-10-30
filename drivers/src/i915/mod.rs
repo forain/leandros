@@ -94,12 +94,6 @@ use hw::reg;
 
 // ── kernel interface ─────────────────────────────────────────────────────────
 
-extern "C" {
-    fn serial_print_str_raw(s: *const u8, len: usize);
-    fn klog_write_only(s: *const u8, len: usize);
-    fn arch_monotonic_ns() -> u64;
-}
-
 /// What the kernel knows about the boot framebuffer.
 pub struct BootEnv {
     pub fb_phys: u64,
@@ -108,8 +102,7 @@ pub struct BootEnv {
     pub fb_pitch: u32,
 }
 
-pub(crate) fn emit(s: &str) { unsafe { serial_print_str_raw(s.as_ptr(), s.len()); } }
-pub(crate) fn emit_logonly(s: &str) { unsafe { klog_write_only(s.as_ptr(), s.len()); } }
+pub(crate) use crate::kenv::{emit, emit_logonly, now_ns, delay_us};
 
 /// One console + klog line, prefixed `[i915] `.
 pub(crate) fn log(msg: &str) {
@@ -131,19 +124,8 @@ macro_rules! idump { ($($a:tt)*) => { $crate::i915::dump(&alloc::format!($($a)*)
 pub(crate) use ilog;
 pub(crate) use idump;
 
-pub(crate) fn now_ns() -> u64 { unsafe { arch_monotonic_ns() } }
-
-/// Bounded busy-wait; falls back to an iteration cap if the clock is stuck.
-pub(crate) fn delay_us(us: u64) {
-    let start = now_ns();
-    for _ in 0..20_000_000u32 {
-        if now_ns().wrapping_sub(start) >= us * 1000 { return; }
-        core::hint::spin_loop();
-    }
-}
-
-pub(crate) fn opt(key: &str) -> Option<u64> { crate::nvidia_probe::cmdline_opt(key) }
-pub(crate) fn word(key: &str) -> Option<&'static str> { crate::nvidia_probe::cmdline_word(key) }
+pub(crate) fn opt(key: &str) -> Option<u64> { crate::kenv::cmdline_opt(key) }
+pub(crate) fn word(key: &str) -> Option<&'static str> { crate::kenv::cmdline_word(key) }
 
 pub(crate) fn fmt_size(n: u64) -> String {
     if n >= 1 << 30 && n % (1 << 30) == 0 { format!("{} GiB", n >> 30) }
@@ -235,7 +217,7 @@ pub(crate) fn forcewake_put(m: &Mmio) {
 
 /// What the probe learned; the bring-up consumes it.
 pub(crate) struct Device {
-    pub func: crate::pci::PciFunction,
+    pub func: crate::kenv::pci::PciFunction,
     pub platform: hw::Platform,
     pub mmio: Mmio,
     pub gsm: Option<Gsm>,
@@ -254,10 +236,10 @@ pub(crate) struct Device {
 /// 8 MiB from the buddy allocator) with the forcewake acks preset, so the
 /// bring-up runs to its first wait and then through the hang path.
 fn fake_device() -> Option<Device> {
-    let mmio = mm::buddy::alloc(9)?;
-    let gsm = mm::buddy::alloc(11)?;
-    let mva = mm::phys_to_virt(mmio);
-    let gva = mm::phys_to_virt(gsm);
+    let mmio = crate::kenv::mm::buddy::alloc(9)?;
+    let gsm = crate::kenv::mm::buddy::alloc(11)?;
+    let mva = crate::kenv::mm::phys_to_virt(mmio);
+    let gva = crate::kenv::mm::phys_to_virt(gsm);
     unsafe {
         core::ptr::write_bytes(mva as *mut u8, 0, 2 << 20);
         core::ptr::write_bytes(gva as *mut u8, 0, 8 << 20);
@@ -266,7 +248,7 @@ fn fake_device() -> Option<Device> {
     for &(_, _, ack) in hw::FW_DOMAINS.iter() { m.w(ack, reg::FORCEWAKE_KERNEL); }
     let gmch = hw::decode_ggc(0x02C1);
     Some(Device {
-        func: crate::pci::PciFunction::new(0xFF, 0x1F, 7),
+        func: crate::kenv::pci::PciFunction::new(0xFF, 0x1F, 7),
         platform: hw::identify(0x5917)?,
         mmio: m,
         gsm: Some(Gsm { va: gva, entries: gmch.ggtt_entries }),

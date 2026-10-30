@@ -472,7 +472,7 @@ fn poll_thread(retire: fn(&[Retired])) {
         rps::stat_tick();
         // Busy: 200 us (one-shot timer), not msleep(1), which can sleep a
         // whole tick and left a ~5 ms bubble between requests on one engine.
-        if busy { sched::kthread::sleep_ns(POLL_BUSY_NS.load(Ordering::Relaxed) as u64) } else { sched::kthread::msleep(5) }
+        if busy { crate::kenv::sched::kthread::sleep_ns(POLL_BUSY_NS.load(Ordering::Relaxed) as u64) } else { crate::kenv::sched::kthread::msleep(5) }
     }
 }
 
@@ -531,7 +531,7 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
     let rev = if d.fake { 7 } else { d.func.read8(0x08) };
     let step = wa::kbl_step(rev);
     ilog!("=== G3b exec bring-up: KBL rev {:02x} (step ordinal {}) ===", rev, step);
-    if !d.fake && d.func.command() & crate::pci::CMD_BUS_MASTER == 0 { d.func.set_bus_master(true); }
+    if !d.fake && d.func.command() & crate::kenv::pci::CMD_BUS_MASTER == 0 { d.func.set_bus_master(true); }
     if let Err(dom) = forcewake_get(&m) { ilog!("exec: forcewake domain '{}' did not ack", dom); return false; }
     if opt("i915.reset") != Some(0) { gt::full_gt_reset(&m); }
     let pat = hw::gen9_private_ppat();
@@ -647,7 +647,7 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
     // Kernel VM, render state and kernel contexts stay allocated (about 200 KiB).
     core::mem::forget(kpt);
     READY.store(true, Ordering::Release);
-    if sched::kthread::spawn("i915-exec", move || poll_thread(retire)).is_none() {
+    if crate::kenv::sched::kthread::spawn("i915-exec", move || poll_thread(retire)).is_none() {
         READY.store(false, Ordering::Release);
         log("exec: could not start the poll thread; hardware execution stays off");
         return false;

@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use super::hw::{self, reg};
 use super::{dump, fmt_size, forcewake_get, forcewake_put, log, now_ns, opt, BootEnv, Device, Gsm, Mmio};
 use super::{idump, ilog};
-use crate::pci::{self, PciDevice, PciFunction};
+use crate::kenv::pci::{self, PciDevice, PciFunction};
 
 pub(super) fn run(env: &BootEnv) -> Option<Device> {
     let cands: Vec<PciDevice> = pci::scan().into_iter()
@@ -96,13 +96,13 @@ pub(super) fn run(env: &BootEnv) -> Option<Device> {
         log("PCI memory decode was off; enabling it");
         f.enable_memory();
     }
-    let mva = match mm::kva::ioremap(bar0.base, hw::MMIO_SIZE, mm::kva::CacheMode::Uncached) {
+    let mva = match crate::kenv::mm::kva::ioremap(bar0.base, hw::MMIO_SIZE, crate::kenv::mm::kva::CacheMode::Uncached) {
         Some(v) => v,
         None => { log("cannot map the BAR0 register window; stopping"); return None; }
     };
     let m = Mmio { va: mva };
     let gsm = if gmch.gtt_table_bytes != 0 && gmch.gtt_table_bytes <= 8 << 20 {
-        mm::kva::ioremap(bar0.base + hw::GTTADR_OFFSET, gmch.gtt_table_bytes as usize, mm::kva::CacheMode::Uncached)
+        crate::kenv::mm::kva::ioremap(bar0.base + hw::GTTADR_OFFSET, gmch.gtt_table_bytes as usize, crate::kenv::mm::kva::CacheMode::Uncached)
             .map(|va| Gsm { va, entries: gmch.ggtt_entries })
     } else { None };
     if gsm.is_none() { log("GGTT page table not mapped (GGMS=0 or mapping failed); GGTT checks skipped"); }
@@ -315,13 +315,13 @@ fn log_display(d: &Device, env: &BootEnv) {
 // ── OpRegion / VBT ───────────────────────────────────────────────────────────
 
 fn copy_phys(phys: u64, len: usize) -> Option<Vec<u8>> {
-    let va = mm::kva::ioremap(phys & !0xFFF, len + (phys & 0xFFF) as usize, mm::kva::CacheMode::WriteBack)?;
+    let va = crate::kenv::mm::kva::ioremap(phys & !0xFFF, len + (phys & 0xFFF) as usize, crate::kenv::mm::kva::CacheMode::WriteBack)?;
     let base = va + (phys & 0xFFF) as usize;
     let mut v = alloc::vec![0u8; len];
     for (i, b) in v.iter_mut().enumerate() {
         *b = unsafe { core::ptr::read_volatile((base + i) as *const u8) };
     }
-    mm::kva::iounmap(va);
+    crate::kenv::mm::kva::iounmap(va);
     Some(v)
 }
 

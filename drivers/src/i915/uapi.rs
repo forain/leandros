@@ -34,9 +34,9 @@ use alloc::vec::Vec;
 use core::ptr;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use sched::ksync::KMutex;
+use crate::kenv::sched::ksync::KMutex;
 
-use crate::gpu_uapi::{UapiBackend, UapiPrime, EXT_FENCE};
+use crate::kenv::uapi::{UapiBackend, UapiPrime, EXT_FENCE};
 use crate::DriverError;
 
 use super::gt::KStore;
@@ -120,7 +120,7 @@ static WHY: spin::Mutex<[(u32, &'static str, u64); ERR_RING]> = spin::Mutex::new
 
 /// Note why the current ioctl fails; returns `e` for `Err(why(...))`.
 fn why(e: i32, reason: &'static str, arg: u64) -> i32 {
-    let pid = sched::current_pid();
+    let pid = crate::kenv::sched::current_pid();
     WHY.lock()[pid as usize % ERR_RING] = (pid, reason, arg);
     e
 }
@@ -129,13 +129,13 @@ fn why(e: i32, reason: &'static str, arg: u64) -> i32 {
 fn whyw(w: Why, arg: u64) -> i32 { why(w.0, w.1, arg) }
 
 fn why_clear() {
-    let pid = sched::current_pid();
+    let pid = crate::kenv::sched::current_pid();
     let mut w = WHY.lock();
     if w[pid as usize % ERR_RING].0 == pid { w[pid as usize % ERR_RING] = (0, "", 0); }
 }
 
 fn err_record(seq: u64, nr: u32, e: i32, fallback_arg: u64) {
-    let pid = sched::current_pid();
+    let pid = crate::kenv::sched::current_pid();
     let (reason, arg) = {
         let mut w = WHY.lock();
         let s = &mut w[pid as usize % ERR_RING];
@@ -210,7 +210,7 @@ fn ptecheck_on() -> bool { PTECHECK.load(Ordering::Relaxed) != 0 }
 fn ptc_may_log() -> bool { PTC_LOGGED.fetch_add(1, Ordering::Relaxed) < PTC_LOG_MAX }
 
 fn ptc_summary() {
-    let now = sched::monotonic_ns();
+    let now = crate::kenv::sched::monotonic_ns();
     let last = PTC_LAST_NS.load(Ordering::Relaxed);
     if now.wrapping_sub(last) < 1_000_000_000 { return; }
     if PTC_LAST_NS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() { return; }
@@ -341,7 +341,7 @@ fn fake_lat_ns() -> u64 {
 fn fake_complete(eng: usize, seq: u64) {
     let lat = fake_lat_ns();
     if lat == 0 { COMPLETED[eng].fetch_max(seq, Ordering::AcqRel); return; }
-    let due = sched::monotonic_ns().saturating_add(lat).max(FAKE_DUE_AT[eng].load(Ordering::Acquire));
+    let due = crate::kenv::sched::monotonic_ns().saturating_add(lat).max(FAKE_DUE_AT[eng].load(Ordering::Acquire));
     FAKE_DUE_AT[eng].store(due, Ordering::Release);
     FAKE_DUE_SEQ[eng].fetch_max(seq, Ordering::AcqRel);
 }
@@ -351,7 +351,7 @@ fn fence_done(f: u64) -> bool {
     if eng >= NENG { return true; }
     let seq = f & SEQ_MASK;
     if COMPLETED[eng].load(Ordering::Acquire) < seq && FAKE_DUE_SEQ[eng].load(Ordering::Acquire) >= seq
-        && sched::monotonic_ns() >= FAKE_DUE_AT[eng].load(Ordering::Acquire)
+        && crate::kenv::sched::monotonic_ns() >= FAKE_DUE_AT[eng].load(Ordering::Acquire)
     {
         COMPLETED[eng].fetch_max(seq, Ordering::AcqRel);
     }
@@ -382,9 +382,9 @@ impl Fences {
     }
     /// Wait (CPU) for every engine's fence.
     fn wait(&self, timeout_ns: u64) -> Result<(), i32> {
-        let t0 = sched::monotonic_ns();
+        let t0 = crate::kenv::sched::monotonic_ns();
         for &f in &self.0 {
-            let used = sched::monotonic_ns().saturating_sub(t0);
+            let used = crate::kenv::sched::monotonic_ns().saturating_sub(t0);
             let left = if timeout_ns == u64::MAX { u64::MAX } else { timeout_ns.saturating_sub(used) };
             if pending(f) && left == 0 { return Err(ETIME); }
             wait_one(f, left)?;
@@ -605,14 +605,14 @@ impl State {
             if self.bos.get(&obj).map_or(false, |b| b.last_fence.pending()) { i += 1; continue; }
             self.zombies.swap_remove(i);
             let Some(b) = self.bos.remove(&obj) else { continue };
-            for tag in [MMAP_TAG_WB, MMAP_TAG_WC, MMAP_TAG_UC] { crate::drm_offset::release(b.phys as u64 | tag); }
+            for tag in [MMAP_TAG_WB, MMAP_TAG_WC, MMAP_TAG_UC] { crate::kenv::drm::offset_release(b.phys as u64 | tag); }
             for v in self.vms.values_mut() {
                 if let Some((s, l)) = v.map.remove_obj(obj) { unmap_range(&mut v.pt, s, l); }
             }
             MMAP_TOKENS.lock().remove(&b.phys);
             // A CPU mapping pins each frame it maps (`mmap_pin`): those pages
             // go back to the allocator when the last mapping does.
-            mm::pageref::free_block_pinned(b.phys as usize, b.order);
+            crate::kenv::mm::pageref::free_block_pinned(b.phys as usize, b.order);
             ulog!(2, "bo {} freed ({} KiB)", obj, b.size >> 10);
         }
     }
@@ -630,15 +630,15 @@ fn unmap_range(pt: &mut Ppgtt, start: u64, len: u64) {
 
 // ── user memory ──────────────────────────────────────────────────────────────
 
-// Every user access goes through `sched::uaccess` (SMAP-safe: a raw access
+// Every user access goes through `crate::kenv::sched::uaccess` (SMAP-safe: a raw access
 // outside it faults; fault-tolerant on a bad pointer). The ioctl argument
 // layouts are plain integers, so a struct that cannot be read is all zeros
 // (handle 0 / null pointers / length 0 — each rejected by its caller), and
 // a store to an unwritable address is dropped.
 fn read_user<T: Copy>(addr: u64) -> T {
-    sched::uaccess::read_user::<T>(addr as usize).unwrap_or_else(|| unsafe { core::mem::zeroed() })
+    crate::kenv::sched::uaccess::read_user::<T>(addr as usize).unwrap_or_else(|| unsafe { core::mem::zeroed() })
 }
-fn write_user<T: Copy>(addr: u64, v: T) { let _ = sched::uaccess::write_user(addr as usize, v); }
+fn write_user<T: Copy>(addr: u64, v: T) { let _ = crate::kenv::sched::uaccess::write_user(addr as usize, v); }
 
 /// `n` user structs at `addr`, copied fault-tolerantly (EFAULT on a bad
 /// pointer instead of a kernel fault).
@@ -647,7 +647,7 @@ fn read_array<T: Copy>(addr: u64, n: u64, max: u64) -> Result<Vec<T>, i32> {
     if n > max || addr == 0 { return Err(why(EINVAL, "array too long or null", n)); }
     let bytes = n as usize * core::mem::size_of::<T>();
     let mut v: Vec<T> = Vec::with_capacity(n as usize);
-    if unsafe { sched::uaccess::copy_from_user(v.as_mut_ptr() as *mut u8, addr as usize, bytes) } != 0 {
+    if unsafe { crate::kenv::sched::uaccess::copy_from_user(v.as_mut_ptr() as *mut u8, addr as usize, bytes) } != 0 {
         return Err(why(EFAULT, "bad user array", addr));
     }
     unsafe { v.set_len(n as usize) };
@@ -658,8 +658,8 @@ fn facts() -> Result<Facts, i32> {
     let g = INFO.lock();
     let i = g.as_ref().ok_or(ENODEV)?;
     let mut f = i.facts.clone();
-    f.ram_total = mm::buddy::total_pages() as u64 * 4096;
-    f.ram_free = mm::buddy::free_pages() as u64 * 4096;
+    f.ram_total = crate::kenv::mm::buddy::total_pages() as u64 * 4096;
+    f.ram_free = crate::kenv::mm::buddy::free_pages() as u64 * 4096;
     Ok(f)
 }
 
@@ -758,13 +758,13 @@ fn err_arg(nr: u32, a: u64, size: usize) -> u64 {
     let rd = |off: u64, n: usize| -> u64 {
         if a == 0 || size < off as usize + n { return 0; }
         let mut v = 0u64;
-        let _ = unsafe { sched::uaccess::copy_from_user(&mut v as *mut u64 as *mut u8, (a + off) as usize, n) };
+        let _ = unsafe { crate::kenv::sched::uaccess::copy_from_user(&mut v as *mut u64 as *mut u8, (a + off) as usize, n) };
         v
     };
     match nr {
         NR_GETPARAM => rd(0, 4),
         NR_GEM_CONTEXT_GETPARAM | NR_GEM_CONTEXT_SETPARAM => rd(8, 8),
-        NR_QUERY => { let items = rd(8, 8); if items == 0 { 0 } else { let mut v = 0u64; let _ = unsafe { sched::uaccess::copy_from_user(&mut v as *mut u64 as *mut u8, items as usize, 4) }; v } }
+        NR_QUERY => { let items = rd(8, 8); if items == 0 { 0 } else { let mut v = 0u64; let _ = unsafe { crate::kenv::sched::uaccess::copy_from_user(&mut v as *mut u64 as *mut u8, items as usize, 4) }; v } }
         NR_GEM_EXECBUFFER2 => rd(40, 8), // flags
         _ => 0,
     }
@@ -789,7 +789,7 @@ fn query(a: u64) -> Result<usize, i32> {
         if copy {
             let b = blob.as_ref().expect("blob");
             if it.data_ptr == 0 { return Err(EFAULT); }
-            if unsafe { sched::uaccess::copy_to_user(it.data_ptr as usize, b.as_ptr(), b.len()) } != 0 {
+            if unsafe { crate::kenv::sched::uaccess::copy_to_user(it.data_ptr as usize, b.as_ptr(), b.len()) } != 0 {
                 return Err(EFAULT);
             }
         }
@@ -856,8 +856,8 @@ fn gem_create(a: u64, open_id: u32, ext: bool) -> Result<usize, i32> {
     let mut st = STATE.lock();
     st.open(open_id)?;
     st.reap();
-    let phys = mm::buddy::alloc(order).ok_or(ENOMEM)? as u64;
-    unsafe { ptr::write_bytes(mm::phys_to_virt(phys as usize) as *mut u8, 0, size as usize); }
+    let phys = crate::kenv::mm::buddy::alloc(order).ok_or(ENOMEM)? as u64;
+    unsafe { ptr::write_bytes(crate::kenv::mm::phys_to_virt(phys as usize) as *mut u8, 0, size as usize); }
     // A dma-buf records only a bare object number, and the DRM layer's
     // PRIME import / fd-close release try the backend FIRST with it
     // (`prime_import_blob`, `bo_release_exported`): an exported dumb
@@ -940,7 +940,7 @@ fn mmap_offset(a: u64, open_id: u32) -> Result<usize, i32> {
     // One offset per (object, caching mode), as Linux hands out one per mmap
     // type: the mode rides in the low bits of the page-aligned real token, so
     // `mmap` below knows which page attributes this mapping asked for.
-    let off = crate::drm_offset::offset_for(phys as u64 | tag, size as u64).ok_or(EINVAL)?;
+    let off = crate::kenv::drm::offset_for(phys as u64 | tag, size as u64).ok_or(EINVAL)?;
     write_user::<u64>(a + 8, off);
     Ok(0)
 }
@@ -955,10 +955,10 @@ fn gem_rw(a: u64, open_id: u32, write: bool) -> Result<usize, i32> {
     if p.size == 0 { return Ok(0); }
     if p.data_ptr == 0 { return Err(EFAULT); }
     f.wait(u64::MAX)?;
-    let k = (mm::phys_to_virt(phys as usize) as u64 + p.offset) as *mut u8;
+    let k = (crate::kenv::mm::phys_to_virt(phys as usize) as u64 + p.offset) as *mut u8;
     let left = unsafe {
-        if write { sched::uaccess::copy_from_user(k, p.data_ptr as usize, p.size as usize) }
-        else { sched::uaccess::copy_to_user(p.data_ptr as usize, k as *const u8, p.size as usize) }
+        if write { crate::kenv::sched::uaccess::copy_from_user(k, p.data_ptr as usize, p.size as usize) }
+        else { crate::kenv::sched::uaccess::copy_to_user(p.data_ptr as usize, k as *const u8, p.size as usize) }
     };
     if left != 0 { return Err(EFAULT); }
     Ok(0)
@@ -968,9 +968,9 @@ fn gem_rw(a: u64, open_id: u32, write: bool) -> Result<usize, i32> {
 fn wait_one(f: u64, timeout_ns: u64) -> Result<(), i32> {
     if !pending(f) { return Ok(()); }
     if timeout_ns == 0 { return Err(ETIME); }
-    let now = sched::monotonic_ns();
+    let now = crate::kenv::sched::monotonic_ns();
     let deadline = if timeout_ns == u64::MAX { now + 10_000_000_000 } else { now.saturating_add(timeout_ns) };
-    match crate::drm_device_interface::wait_fences(&[f], deadline) {
+    match crate::kenv::drm::wait_fences(&[f], deadline) {
         Ok(()) => Ok(()),
         Err(DriverError::Io) => Err(EINTR),
         Err(_) => Err(ETIME),
@@ -1040,10 +1040,10 @@ fn gem_wait(a: u64, open_id: u32) -> Result<usize, i32> {
     let w: GemWait = read_user(a);
     if w.flags != 0 { return Err(EINVAL); }
     let f = with_bo(open_id, w.bo_handle, |b| Ok(b.last_fence))?;
-    let t0 = sched::monotonic_ns();
+    let t0 = crate::kenv::sched::monotonic_ns();
     let r = f.wait(if w.timeout_ns < 0 { u64::MAX } else { w.timeout_ns as u64 });
     if w.timeout_ns > 0 {
-        let left = (w.timeout_ns as u64).saturating_sub(sched::monotonic_ns() - t0);
+        let left = (w.timeout_ns as u64).saturating_sub(crate::kenv::sched::monotonic_ns() - t0);
         write_user::<i64>(a + 8, left as i64);
     }
     r.map(|_| 0)
@@ -1173,7 +1173,7 @@ fn ctx_getparam(a: u64, open_id: u32) -> Result<usize, i32> {
                     v[10 + 4 * i..12 + 4 * i].copy_from_slice(&e.1.to_le_bytes());
                 }
                 drop(st);
-                if unsafe { sched::uaccess::copy_to_user(p.value as usize, v.as_ptr(), v.len()) } != 0 {
+                if unsafe { crate::kenv::sched::uaccess::copy_to_user(p.value as usize, v.as_ptr(), v.len()) } != 0 {
                     return Err(EFAULT);
                 }
             }
@@ -1293,7 +1293,7 @@ impl VmMem<'_> {
     fn kva(&self, va: u64) -> Option<usize> {
         let phys = self.pt.translate(&KStore, va & !3)?;
         if phys & !4095 == self.pt.scratch[0] { return None; }
-        Some(mm::phys_to_virt(phys as usize))
+        Some(crate::kenv::mm::phys_to_virt(phys as usize))
     }
 }
 
@@ -1335,17 +1335,17 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
     let mut wait = Vec::new();
     for &(h, pt, w, s) in &syncs {
         if w {
-            match crate::drm_device_interface::syncobj_in_fences(h, open_id, pt) {
+            match crate::kenv::drm::syncobj_in_fences(h, open_id, pt) {
                 Ok(f) => wait.extend(f),
                 Err(DriverError::NotFound) => return Err(ENOENT),
                 Err(_) => return Err(EINVAL),
             }
         }
-        if s && !crate::drm_device_interface::syncobj_exists(h, open_id) { return Err(ENOENT); }
+        if s && !crate::kenv::drm::syncobj_exists(h, open_id) { return Err(ENOENT); }
     }
     if !wait.is_empty() {
-        let deadline = sched::monotonic_ns() + 10_000_000_000;
-        match crate::drm_device_interface::wait_fences(&wait, deadline) {
+        let deadline = crate::kenv::sched::monotonic_ns() + 10_000_000_000;
+        match crate::kenv::drm::wait_fences(&wait, deadline) {
             Ok(()) => {}
             Err(DriverError::Io) => return Err(EINTR),
             Err(_) => { ulog!(1, "open {}: execbuffer in-fences not signalled in 10 s", open_id); return Err(ETIME); }
@@ -1377,8 +1377,8 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
             if CROSS_WAITS.fetch_add(1, Ordering::Relaxed) == 0 {
                 ulog!(1, "open {}: first cross-engine implicit-sync wait ({} fences)", open_id, other.len());
             }
-            let deadline = sched::monotonic_ns() + 10_000_000_000;
-            match crate::drm_device_interface::wait_fences(&other, deadline) {
+            let deadline = crate::kenv::sched::monotonic_ns() + 10_000_000_000;
+            match crate::kenv::drm::wait_fences(&other, deadline) {
                 Ok(()) => {}
                 Err(DriverError::Io) => return Err(EINTR),
                 Err(_) => return Err(ETIME),
@@ -1444,8 +1444,8 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
                 busy.dedup();
                 drop(st);
                 tries += 1;
-                let deadline = sched::monotonic_ns() + 10_000_000_000;
-                match crate::drm_device_interface::wait_fences(&busy, deadline) {
+                let deadline = crate::kenv::sched::monotonic_ns() + 10_000_000_000;
+                match crate::kenv::drm::wait_fences(&busy, deadline) {
                     Ok(()) => {}
                     Err(DriverError::Io) => return Err(why(EINTR, "reloc: wait for idle interrupted", 0)),
                     Err(_) => return Err(why(ETIME, "reloc: object busy 10 s", 0)),
@@ -1477,7 +1477,7 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
             for p in &patches {
                 let Some(b) = bos.get(&list[p.obj].0) else { continue };
                 let pa = b.phys + p.offset;
-                unsafe { ptr::write_unaligned(mm::phys_to_virt(pa as usize) as *mut u64, p.value) };
+                unsafe { ptr::write_unaligned(crate::kenv::mm::phys_to_virt(pa as usize) as *mut u64, p.value) };
                 if b.scanout_uc { super::kms::flush_for_display(pa, 8); }
             }
         }
@@ -1519,7 +1519,7 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
         let n = EXECS.fetch_add(1, Ordering::Relaxed) + 1;
         ulog!(2, "open {}: exec #{} ctx {} engine {} batch {:#x}+{} -> seqno {}", open_id, n, ctx_id, eng, start, batch_len, seq);
         for &(h, pt, _, s) in &syncs {
-            if s { let _ = crate::drm_device_interface::syncobj_install(h, open_id, pt, fence); }
+            if s { let _ = crate::kenv::drm::syncobj_install(h, open_id, pt, fence); }
         }
         return Ok(0);
     }
@@ -1553,9 +1553,9 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
     if ok { ulog!(2, "open {}: exec #{} ctx {} {} batch {:#x}+{} -> {:?}", open_id, n, ctx_id, eng, batch_off, batch_len, out); }
     else { ulog!(1, "open {}: exec #{} ctx {} engine {} batch {:#x}: soft engine stopped: {:?} (counted as a GPU hang)", open_id, n, ctx_id, eng, start, out); }
     for &(h, pt, _, s) in &syncs {
-        if s { let _ = crate::drm_device_interface::syncobj_install(h, open_id, pt, fence); }
+        if s { let _ = crate::kenv::drm::syncobj_install(h, open_id, pt, fence); }
     }
-    crate::drm_device_interface::gpu_fence_irq_hint();
+    crate::kenv::drm::gpu_fence_irq_hint();
     Ok(0)
 }
 
@@ -1569,11 +1569,11 @@ fn exec_writeback(e: &Execbuffer2, objs: &[ExecObject2], list: &[(u32, u64, u64)
     const PRESUMED_AT: u64 = 16; // relocation_entry.presumed_offset
     for (i, (o, &(_, a, _))) in objs.iter().zip(list).enumerate() {
         if o.flags & EXEC_OBJECT_PINNED != 0 || o.offset == canonical(a) { continue; }
-        sched::uaccess::write_user((e.buffers_ptr + i as u64 * OBJ_SZ + OFFSET_AT) as usize, canonical(a));
+        crate::kenv::sched::uaccess::write_user((e.buffers_ptr + i as u64 * OBJ_SZ + OFFSET_AT) as usize, canonical(a));
     }
     for p in patches {
         let at = objs[p.obj].relocs_ptr + p.entry as u64 * core::mem::size_of::<RelocEntry>() as u64 + PRESUMED_AT;
-        sched::uaccess::write_user(at as usize, p.presumed);
+        crate::kenv::sched::uaccess::write_user(at as usize, p.presumed);
     }
 }
 
@@ -1600,7 +1600,7 @@ pub(super) fn retire(evs: &[super::exec::Retired]) {
         }
         st.reap();
     }
-    crate::drm_device_interface::gpu_fence_irq_hint();
+    crate::kenv::drm::gpu_fence_irq_hint();
 }
 
 // ── mmap, PRIME, teardown ────────────────────────────────────────────────────
@@ -1649,7 +1649,7 @@ fn mmap_pin(token: usize, len: usize, open_id: u32) -> Option<Vec<usize>> {
         return Some(Vec::new());
     }
     let v: Vec<usize> = (0..pages).map(|i| token + i * 4096).collect();
-    mm::pageref::inc_many(&v);
+    crate::kenv::mm::pageref::inc_many(&v);
     Some(v)
 }
 
@@ -1802,8 +1802,8 @@ fn stat_tick() {
     if last == 0 { return; } // first ioctl: arm only
     let s = snap();
     let le = LAST_ERR.load(Ordering::Relaxed);
-    let free_mib = (mm::buddy::free_pages() as u64 * 4096) >> 20;
-    let big = mm::buddy::largest_free_order().map_or(alloc::string::String::from("?"), |o| alloc::format!("{}", 4u64 << o));
+    let free_mib = (crate::kenv::mm::buddy::free_pages() as u64 * 4096) >> 20;
+    let big = crate::kenv::mm::buddy::largest_free_order().map_or(alloc::string::String::from("?"), |o| alloc::format!("{}", 4u64 << o));
     let tmp = match tmpfs_census() {
         Some(c) => alloc::format!("tmpfs {}/{} (hwm {}, anon {}, orphan {}, memfd {}, dmabuf {}, shared {}, full {})",
                                   c[0], c[1], c[2], c[3], c[8], c[4], c[5], c[6], c[7]),
@@ -1921,8 +1921,8 @@ pub(crate) fn register(d: &super::Device, mode: Mode, sseu: Sseu, cs_hz: u32) {
     };
     *INFO.lock() = Some(Info { facts, mode, mmio: d.mmio.va, slot, subsys, revision });
     MODE_FAKE.store((mode == Mode::Fake) as u32, Ordering::Relaxed);
-    crate::gpu_uapi::register(&BACKEND);
-    *crate::drm_device_interface::BACKEND_MMAP_PIN.lock() = Some(mmap_pin);
+    crate::kenv::uapi::register(&BACKEND);
+    crate::kenv::uapi::set_mmap_pin(mmap_pin);
     ilog!("==== G3 UAPI registered: /dev/dri/card0 + renderD128 answer 'i915' 1.6.0 for 8086:{:04x} rev {:02x} at {:02x}:{:02x}.{}; \
            engines rcs0+bcs0{}, {} EUs, CS timestamp {} Hz; execution: {} ====",
           d.platform.device, revision, slot.0, slot.1, slot.2, if vcs { "+vcs0" } else { "" }, sseu.eu_total, cs_hz,
