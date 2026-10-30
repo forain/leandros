@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# autoloadtest.sh [arch] [virtio_rng|e1000e|virtio_net|virtio_snd|virtio_keyboard|hda|iwlwifi|uvc|of]: host-side test of the modules.alias autoload path.
+# autoloadtest.sh [arch] [virtio_rng|e1000e|virtio_net|virtio_snd|virtio_keyboard|hda|iwlwifi|uvc|usb_hid|of]: host-side test of the modules.alias autoload path.
 # Builds with CONFIG_MODULES=y CONFIG_VIRTIO_RNG=m (the driver is then ONLY a module, found via
 # modules.alias, no modules.load), boots under QEMU and checks that it autoloads, is listed, feeds
 # the CSPRNG, and that modules.blacklist=virtio_rng boots without it. Restores .config afterwards
@@ -206,6 +206,30 @@ if [[ "$mod" == "of" ]]; then
     L=/tmp/ffsession/tests-alt3/serial-full.log
     if grep -aq '^\[kmod\] hello loaded' "$L"; then echo "FAIL kmod=0 still loaded hello"; fail=1; else echo "ok   kmod=0 blocks the of hook"; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest of: PASS" || { echo "autoloadtest of: FAIL"; exit 1; }
+    exit 0
+fi
+if [[ "$mod" == "usb_hid" ]]; then
+    # CONFIG_USB_HID=m: a boot keyboard enumerates, the `usb 03 01 01` alias loads usb_hid, which opens
+    # the interrupt pipe over the kapi and registers a per-device evdev node.
+    printf 'CONFIG_MODULES=y\nCONFIG_USB_HID=m\n' > .config
+    ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/autoloadtest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/autoloadtest-build.log"; exit 1; }
+    if find "target/kmod/$arch" -name modules.load | grep -q .; then echo "FAIL: modules.load present, alias path not isolated"; exit 1; fi
+    RT=.claude/skills/run-leandros/runtests.py
+    fail=0
+    check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3"; fail=1; fi; }
+    export LEANDROS_RUN_ID="autoloadtest-$arch"
+    export LEANDROS_QEMU_EXTRA="-device qemu-xhci,id=xhs -device usb-kbd,bus=xhs.0,id=kbd1"
+    python3 "$RT" "$arch" alt1 "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt1/serial-full.log
+    check "$L" '^\[kmod\] usb .* 030101 -> usb_hid' "usb alias autoload at enumerate"
+    check "$L" '^\[kmod\] usb_hid loaded id' "usb_hid loaded"
+    check "$L" '\[USB-HID\].*keyboard' "keyboard bound by the module"
+    check "$L" '^usb_hid [0-9]* [0-9]* - Live' "listed in /proc/modules"
+    python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=usb_hid" "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt2/serial-full.log
+    check "$L" 'usb_hid: Blacklisted' "blacklist refuses the alias load"
+    if grep -aq '^\[kmod\] usb_hid loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
+    [[ $fail -eq 0 ]] && echo "autoloadtest usb_hid: PASS" || { echo "autoloadtest usb_hid: FAIL"; exit 1; }
     exit 0
 fi
 if [[ "$mod" == "uvc" ]]; then

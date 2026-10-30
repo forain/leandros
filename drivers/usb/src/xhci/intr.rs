@@ -391,3 +391,50 @@ pub(super) fn setup_hid(hc: &Arc<Hc>, slot: u8, speed: u8, config_value: u8,
     }
     Ok(pipes)
 }
+
+/// Open the interrupt-IN endpoint of a boot HID interface on a function whose configuration is
+/// already selected (the class-driver path): Configure Endpoint, SET_INTERFACE when the alternate
+/// setting is not 0, then queue the TDs. Protocol, idle and LED setup are left to the driver.
+/// Task context (blocking).
+pub fn open_on(f: &super::isoch::UsbFunction, d: &HidIfaceDesc) -> Result<IntrPipe, &'static str> {
+    let hc = &f.hc;
+    let (slot, speed) = (f.slot, f.speed);
+    let dma32 = hc.lock().dma32;
+    let dci = dci_of(d.ep_addr);
+    let mps = d.mps & 0x7FF;
+    let (burst, mult) = if speed >= SPEED_SS { (d.ss_burst, 0u32) }
+        else if speed == SPEED_HS { (((d.mps >> 11) & 3) as u8, 0u32) } else { (0, 0) };
+    let esit = if speed >= SPEED_SS && d.ss_bytes_per_interval != 0 {
+        d.ss_bytes_per_interval as u32
+    } else {
+        mps as u32 * (burst as u32 + 1) * (mult + 1)
+    };
+    let chunk = (mps as usize).clamp(8, 1024);
+    {
+        let mut x = hc.lock();
+        let s = x.slot_mut(slot).ok_or("slot vanished")?;
+        let ring = ProducerRing::new(dma32).ok_or("oom: interrupt ring")?;
+        let bounce = DmaBuf::new((NTDS * chunk).next_power_of_two().max(4096), dma32)
+            .ok_or("oom: report buffers")?;
+        let mut ep = Endpoint::new(ring, EP_TYPE_INTR_IN, mps, burst,
+                                   interval_field(speed, false, d.interval), mps.max(8));
+        ep.esit = esit;
+        ep.bounce = Some(bounce);
+        s.eps[dci] = Some(ep);
+    }
+    let in_phys = hc.lock().build_configure_input(slot, 0, 1 << dci).ok_or("slot vanished")?;
+    let (cc, _) = run_cmd(hc, Trb::new(TRB_CONFIGURE_EP, in_phys, 0, (slot as u32) << 24))
+        .map_err(|_| "Configure Endpoint timed out")?;
+    if cc != CC_SUCCESS { return Err("Configure Endpoint failed"); }
+    if d.alt != 0 {
+        control(hc, slot, 0x01, 11, d.alt as u16, d.iface as u16, CtrlData::None, ENUM_CTRL_TIMEOUT_MS)
+            .map_err(|_| "SET_INTERFACE failed")?;
+    }
+    let mut pipe = IntrPipe {
+        hc: hc.clone(), slot, dci, ep_addr: d.ep_addr, iface: d.iface, chunk,
+        pending: Vec::with_capacity(NTDS), state: State::Running, recoveries: 0, cmd_deadline: 0,
+        ctrl: None, ctrl_broken: false, reported_gone: false,
+    };
+    { let mut x = hc.lock(); pipe.prime(&mut x); }
+    Ok(pipe)
+}

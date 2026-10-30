@@ -456,7 +456,7 @@ def phase_hid(arch, run_id, env):
             ok = False; print("FAIL: (e) no new eventN appeared for kbd3 within 10 s"); return ok
         info = sh(f"evtest2 info {node}", 20)
         print(f"(e) {info.strip()[-160:]}")
-        if "USB Keyboard" in info and re.search(r"bus=3\b", info): print(f"PASS: (e) per-device node {node} name/bus")
+        if ("USB Keyboard" in info or "USB HID keyboard" in info) and re.search(r"bus=3\b", info): print(f"PASS: (e) per-device node {node} name/bus")
         else: ok = False; print(f"FAIL: (e) node {node} info lacks 'USB Keyboard'/bus=3")
         # (f) keys on the new node; userspace event0 no longer gets them
         # (the libudev stand-in hotplugs the node into libinput)

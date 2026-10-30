@@ -40,6 +40,7 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// LED state for the keyboards' enumeration-time SET_REPORT. Call before
 /// `usb_hcd::init()` probes.
 pub fn prepare() {
+    if cfg!(feature = "usb-hid-module") { return; }
     usb::hid::set_node_hooks(usb::hid::NodeHooks { attach: node_attach, detach: node_detach });
     usb::hid::set_initial_leds(usb::hid::hid_leds_from_console(console_leds()));
 }
@@ -47,6 +48,7 @@ pub fn prepare() {
 /// After enumeration: advertise the mouse's buttons and wheel on the pointer
 /// node, size the motion scale, and start polling.
 pub fn init() {
+    if cfg!(feature = "usb-hid-module") { return; }
     let present = usb::hid::present();
     // A controller with nothing plugged in at boot is still polled: its
     // first keyboard or mouse arrives by hot-plug (lane udevhot2).
@@ -67,7 +69,7 @@ fn console_leds() -> u8 {
 
 /// The LEDs to show (HID bit order): the text console's lock state while it
 /// owns the keyboard, else what the compositor last wrote to the node.
-fn wanted_leds() -> u8 {
+pub fn wanted_leds() -> u8 {
     let console = usb::hid::hid_leds_from_console(console_leds());
     if tty_server::vt::console_keyboard_active() { return console; }
     evdev_server::client_leds().unwrap_or(console)

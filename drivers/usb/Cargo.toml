@@ -14,3 +14,5 @@ spin.workspace = true
 [features]
 # CONFIG_USB_VIDEO_CLASS=m: the uvc class driver is left out of the kernel (modules/uvc is built instead).
 uvc-module = []
+# CONFIG_USB_HID=m: boot HID is left to modules/usb-hid (the enumerator hands the function to the class registry).
+hid-module = []

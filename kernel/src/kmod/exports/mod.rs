@@ -132,6 +132,16 @@ const _: sys::UsbIsochOpenFn = kapi_usb_isoch_open;
 const _: sys::UsbIsochSubmitFn = kapi_usb_isoch_submit;
 const _: sys::UsbIsochReapFn = kapi_usb_isoch_reap;
 const _: sys::UsbIsochCloseFn = kapi_usb_isoch_close;
+const _: sys::UsbIntrOpenFn = kapi_usb_intr_open;
+const _: sys::UsbIntrPollFn = kapi_usb_intr_poll;
+const _: sys::UsbIntrOutFn = kapi_usb_intr_out;
+const _: sys::UsbIntrCloseFn = kapi_usb_intr_close;
+const _: kmod_abi::input::sys_input::InputUnregisterFn = kapi_input_unregister;
+const _: kmod_abi::input::sys_input::InputEventConsoleFn = kapi_input_event_console;
+const _: kmod_abi::input::sys_input::InputLedsFn = kapi_input_leds;
+const _: kmod_abi::input::sys_input::InputRepeatFn = kapi_input_repeat;
+const _: kmod_abi::input::sys_input::RelPointerReportFn = kapi_rel_pointer_report;
+const _: kmod_abi::input::sys_input::RelPointerAdvertiseFn = kapi_rel_pointer_advertise;
 const _: sys::V4l2UnregisterFn = kapi_v4l2_unregister;
 const _: () = {
     assert!(mm::kmodwin::BASE as u64 == kmod_abi::layout::BASE);
@@ -140,7 +150,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 87;
+pub const NEXPORTS: usize = 97;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -230,6 +240,16 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_input_register", kapi_input_register),
     sym!("kapi_input_event", kapi_input_event),
     sym!("kapi_input_set_caps", kapi_input_set_caps),
+    sym!("kapi_usb_intr_open", kapi_usb_intr_open),
+    sym!("kapi_usb_intr_poll", kapi_usb_intr_poll),
+    sym!("kapi_usb_intr_out", kapi_usb_intr_out),
+    sym!("kapi_usb_intr_close", kapi_usb_intr_close),
+    sym!("kapi_input_unregister", kapi_input_unregister),
+    sym!("kapi_input_event_console", kapi_input_event_console),
+    sym!("kapi_input_leds", kapi_input_leds),
+    sym!("kapi_input_repeat", kapi_input_repeat),
+    sym!("kapi_rel_pointer_report", kapi_rel_pointer_report),
+    sym!("kapi_rel_pointer_advertise", kapi_rel_pointer_advertise),
     sym!("kapi_preempt_disabled", kapi_preempt_disabled),
     sym!("kapi_preempt_enable_no_resched", kapi_preempt_enable_no_resched),
 ];

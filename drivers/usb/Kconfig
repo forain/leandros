@@ -6,8 +6,11 @@ config USB_XHCI
 	default y
 
 config USB_HID
-	bool "USB HID"
+	tristate "USB HID boot keyboard and mouse"
 	default y
+	help
+	  =m builds modules/usb-hid, loaded by the `usb 03 01 01|02` alias when the enumerator meets a
+	  boot keyboard or mouse. Keep =y on any image whose only keyboard is USB.
 
 config USB_STORAGE
 	bool "USB mass storage"

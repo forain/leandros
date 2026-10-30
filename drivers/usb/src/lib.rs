@@ -231,7 +231,7 @@ fn detach(bus: u8, hc: &Controller, port: u8, route: u32, ev: &mut Vec<HotEvent>
         if i.mass_storage {
             ev.push(HotEvent::Gone { bus, slot: i.slot });
         } else {
-            if i.hid != 0 { hid::detach(hc, i.slot); }
+            if i.hid != 0 { hid::detach_where(|p| p.pipe.slot() == i.slot && p.pipe.on(hc)); }
             xhci::isoch::detach(hc, i.slot);
             class::detach(hc, i.slot);
             xhci::release_slot(hc, i.slot);

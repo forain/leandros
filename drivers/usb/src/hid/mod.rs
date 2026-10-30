@@ -349,17 +349,17 @@ pub fn poll(leds: u8, repeat: (u32, u32), out: &mut dyn FnMut(u32, Event)) {
     }
 }
 
-/// The device on `slot` of controller `hc` left (hot-plug scan, task
-/// context): its pipes are never polled again, so the slot id can be reused
-/// right away; what it held down is released by the next [`poll`].
-pub(crate) fn detach(hc: &alloc::sync::Arc<crate::xhci::Hc>, slot: u8) {
+/// Devices whose pipe satisfies `gone` left (hot-plug scan, task context): their pipes are never
+/// polled again, so the slot id can be reused right away; what they held down is released by the
+/// next [`poll`].
+pub(crate) fn detach_where(gone: impl Fn(&HidPipe) -> bool) {
     let mut devs = DEVS.lock();
     let mut nodes: Vec<u32> = Vec::new();
-    for d in devs.iter_mut().filter(|d| d.hp.pipe.slot() == slot && d.hp.pipe.on(hc)) {
+    for d in devs.iter_mut().filter(|d| gone(&d.hp)) {
         if !d.gone {
             d.gone = true;
             d.release = true;
-            usb_log!("[USB-HID] {} (slot {} interface {}) removed\n", d.name, slot, d.hp.pipe.interface());
+            usb_log!("[USB-HID] {} (slot {} interface {}) removed\n", d.name, d.hp.pipe.slot(), d.hp.pipe.interface());
         }
         // The poll may have seen it fail first (IRQ context, cannot remove
         // the node); its node goes here either way.

@@ -339,6 +339,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-usb-hid"
+version = "0.1.0"
+dependencies = [
+ "kmod-abi",
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
+]
+
+[[package]]
 name = "kmod-uvc"
 version = "0.1.0"
 dependencies = [
