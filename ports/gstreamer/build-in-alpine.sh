@@ -17,7 +17,7 @@ esac
   set -e
   grep -q '^3\.21\.' /etc/alpine-release || { echo "want Alpine 3.21"; exit 3; }
   PKGS="gstreamer gstreamer-tools gst-plugins-base gst-plugins-good gst-libav gst-plugin-pipewire"
-  DEVPKGS="gstreamer-dev gst-plugins-base-dev glib-dev"
+  DEVPKGS="gstreamer-dev gst-plugins-base-dev glib-dev util-linux-dev pcre2-dev"
   if [ "$(uname -m)" = "$ARCH" ]; then
     R=""; APK="apk"
     apk add --no-cache $PKGS $DEVPKGS binutils file patchelf build-base >/dev/null
@@ -142,13 +142,13 @@ esac
   D=/tmp/gst-sysroot-$ARCH; rm -rf "$D"; mkdir -p "$D/usr/lib/pkgconfig" "$D/usr/include"
   for d in gstreamer-1.0 glib-2.0 orc-0.4; do [ -d "$R/usr/include/$d" ] && cp -a "$R/usr/include/$d" "$D/usr/include/"; done
   cp -a "$R/usr/lib/glib-2.0" "$D/usr/lib/" 2>/dev/null || true
-  for pc in $(ls "$R/usr/lib/pkgconfig" | grep -E '^(gstreamer|gst|glib|gobject|gio|gmodule|gthread|libpcre2|orc)'); do cp -L "$R/usr/lib/pkgconfig/$pc" "$D/usr/lib/pkgconfig/"; done
+  for pc in $(ls "$R/usr/lib/pkgconfig" | grep -E '^(gstreamer|gst|glib|gobject|gio|gmodule|gthread|libpcre2|orc|mount|blkid|libmount|uuid)'); do cp -L "$R/usr/lib/pkgconfig/$pc" "$D/usr/lib/pkgconfig/"; done
   for so in $(cat /tmp/seen); do
     s=$(find_lib "$so" 2>/dev/null) || continue
     case "$so" in libc.*) continue ;; esac
     cp -L "$s" "$D/usr/lib/$so"
   done
-  for so in $(cd "$R/usr/lib" && ls | grep -E '^lib(gst[a-z0-9-]*|glib-2.0|gobject-2.0|gio-2.0|gmodule-2.0|gthread-2.0|orc-0.4)\.so$'); do
+  for so in $(cd "$R/usr/lib" && ls | grep -E '^lib(gst[a-z0-9-]*|glib-2.0|gobject-2.0|gio-2.0|gmodule-2.0|gthread-2.0|orc-0.4|mount|blkid|pcre2-8|uuid)\.so$'); do
     cp -L "$R/usr/lib/$so" "$D/usr/lib/$so"
   done
   for f in $(find "$D/usr/lib" -maxdepth 1 -type f -name '*.so*'); do
