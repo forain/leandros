@@ -32,7 +32,7 @@ impl Disk {
 pub enum Event {
     Disk(Disk),
     Step { name: String, pct: u32 },
-    Done { root_partuuid: String },
+    Done { root_partuuid: String, disk_guid: String },
     Error(String),
     /// Process finished; Some(code) of the exit status.
     Exit(Option<i32>, String),
@@ -72,7 +72,7 @@ pub fn parse_line(line: &str) -> Option<Event> {
             name: s(&["name"]),
             pct: v.get("pct").and_then(|x| x.as_u64()).unwrap_or(0).min(100) as u32,
         }),
-        "done" => Some(Event::Done { root_partuuid: s(&["root_partuuid"]) }),
+        "done" => Some(Event::Done { root_partuuid: s(&["root_partuuid"]), disk_guid: s(&["disk_guid"]) }),
         "error" => Some(Event::Error(s(&["msg", "message"]))),
         _ => None,
     }

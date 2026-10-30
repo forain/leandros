@@ -2,7 +2,7 @@
 # End-to-end test of the LeandrOS installer backend (userland/leandros-install)
 # in QEMU:
 #
-#   scripts/installer-test.sh [aarch64|x86_64] [virtio|nvme]     (default: aarch64 virtio)
+#   scripts/installer-test.sh [aarch64|x86_64] [virtio|nvme] [--via-gui]     (default: aarch64 virtio)
 #
 #  1. boot a GPT USB stick image with a blank install-target disk attached;
 #  2. over ssh (scripts/remote.py, LEANDROS_REMOTE=qemu): `leandros-install list`
@@ -24,6 +24,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 ARCH="${1:-aarch64}"
 BUS="${2:-virtio}"
+[ "${3:-}" = "--via-gui" ] && VIA_GUI=1
 case "$ARCH" in aarch64|x86_64) ;; *) echo "usage: $0 [aarch64|x86_64] [virtio|nvme]"; exit 2 ;; esac
 case "$BUS" in virtio|nvme) ;; *) echo "usage: $0 [aarch64|x86_64] [virtio|nvme]"; exit 2 ;; esac
 TARGET_DEV=/dev/vda; [ "$BUS" = nvme ] && TARGET_DEV=/dev/nvme0n1
@@ -95,8 +96,16 @@ ok "install onto /dev/$BOOTDISK refused (boot disk)"
 $REMOTE run "leandros-install install --target $TARGET_DEV --dry-run --json" > "$WORK/dry.log"
 grep -q '"ev":"done","dry_run":true' "$WORK/dry.log" || fail "dry run did not finish"
 ok "dry run"
+if [ -n "${VIA_GUI:-}" ]; then
+    # Drive the install through the libcosmic GUI's state machine (real backend).
+    $REMOTE run "leandros-installer --self-test-install $TARGET_DEV" > "$WORK/install.log" || { tail -5 "$WORK/install.log"; fail "GUI install failed"; }
+    grep -q "page Done" "$WORK/install.log" || fail "GUI did not reach page Done"
+    ok "GUI reached page Done"
+    DONE="$(sed -n 's/^done root_partuuid=\([^ ]*\) disk_guid=\(.*\)$/{"ev":"done","root_partuuid":"\1","disk_guid":"\2"}/p' "$WORK/install.log" | tail -1)"
+else
 $REMOTE run "leandros-install install --target $TARGET_DEV --yes --json" > "$WORK/install.log" || { tail -5 "$WORK/install.log"; fail "install failed"; }
 DONE="$(grep '"ev":"done"' "$WORK/install.log" | tail -1)"
+fi
 [ -n "$DONE" ] || fail "no done event"
 ROOT_PUUID="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['root_partuuid'])" "$DONE")"
 DISK_GUID="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['disk_guid'])" "$DONE")"

@@ -151,7 +151,7 @@ impl Application for App {
                     self.step = name;
                     self.pct = pct;
                 }
-                Event::Done { root_partuuid } => {
+                Event::Done { root_partuuid, disk_guid } => {
                     log(&format!("done {root_partuuid}"));
                     self.finished = true;
                 }
@@ -316,9 +316,9 @@ fn self_test_install(dev: &str) -> i32 {
                     }
                     println!("  pct {pct}");
                 }
-                Event::Done { root_partuuid } => {
+                Event::Done { root_partuuid, disk_guid } => {
                     done = true;
-                    println!("done root_partuuid={root_partuuid}");
+                    println!("done root_partuuid={root_partuuid} disk_guid={disk_guid}");
                 }
                 Event::Error(m) => println!("error {m}"),
                 Event::Exit(code, _) => {
