@@ -14,7 +14,7 @@ trap restore EXIT
 printf 'CONFIG_MODULES=y\nCONFIG_VIRTIO_BLK=m\n' > .config
 ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/kexecblktest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/kexecblktest-build.log"; exit 1; }
 export LEANDROS_RUN_ID="kexecblk-$arch"
-python3 .claude/skills/run-leandros/runtests.py "$arch" kexecblk > "${TMPDIR:-/tmp}/kexecblktest-run.log" 2>&1 || true
+python3 .claude/skills/run-leandros/runtests.py "$arch" kexecblk --suite kexecblk > "${TMPDIR:-/tmp}/kexecblktest-run.log" 2>&1 || true
 L="/tmp/ffsession/tests-kexecblk"
-if grep -aq "RESULT: PASS" "$L"/*.log "${TMPDIR:-/tmp}/kexecblktest-run.log" 2>/dev/null; then echo "kexecblktest $arch: PASS"; else
+if grep -aq "RESULT: PASS" "$L"/*.txt "$L"/*.log "${TMPDIR:-/tmp}/kexecblktest-run.log" 2>/dev/null; then echo "kexecblktest $arch: PASS"; else
     tail -n 15 "${TMPDIR:-/tmp}/kexecblktest-run.log"; echo "kexecblktest $arch: FAIL"; exit 1; fi
