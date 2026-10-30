@@ -29,12 +29,14 @@ mod snd;
 mod pm;
 mod v4l2;
 mod usbfn;
+mod blk;
 
 pub use pci::*;
 pub use irq::*;
 pub use net::*;
 pub use snd::*;
 pub use pm::*;
+pub use blk::*;
 pub use v4l2::*;
 pub use usbfn::*;
 pub use core_::*;
@@ -81,6 +83,10 @@ const _: sys::CanSleepFn = kapi_can_sleep;
 const _: sys::SleepUntilFn = kapi_sleep_until;
 const _: sys::YieldFn = kapi_yield;
 const _: sys::CanSleepFn = kapi_irqs_masked;
+const _: kmod_abi::blk::sys_blk::BlkRegisterFn = kapi_blk_register;
+const _: kmod_abi::blk::sys_blk::BlkRemoveFn = kapi_blk_remove;
+const _: kmod_abi::blk::sys_blk::BoolFn = kapi_preempt_disabled;
+const _: kmod_abi::blk::sys_blk::VoidFn = kapi_preempt_enable_no_resched;
 const _: sys::CurrentPidFn = kapi_current_pid;
 const _: sys::IoremapFn = kapi_ioremap;
 const _: sys::IounmapFn = kapi_iounmap;
@@ -89,6 +95,7 @@ const _: sys::CanSleepFn = kapi_dma_coherent;
 const _: sys::MutexNewFn = kapi_mutex_new;
 const _: sys::WaitNotifyFn = kapi_mutex_lock;
 const _: sys::WaitNotifyFn = kapi_mutex_unlock;
+const _: sys::MutexTryFn = kapi_mutex_trylock;
 const _: sys::SemNewFn = kapi_sem_new;
 const _: sys::WaitTimeoutFn = kapi_sem_down_timeout;
 const _: sys::WaitNotifyFn = kapi_sem_up;
@@ -126,7 +133,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 78;
+pub const NEXPORTS: usize = 83;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -179,6 +186,7 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_mutex_new", kapi_mutex_new),
     sym!("kapi_mutex_lock", kapi_mutex_lock),
     sym!("kapi_mutex_unlock", kapi_mutex_unlock),
+    sym!("kapi_mutex_trylock", kapi_mutex_trylock),
     sym!("kapi_sem_new", kapi_sem_new),
     sym!("kapi_sem_down_timeout", kapi_sem_down_timeout),
     sym!("kapi_sem_up", kapi_sem_up),
@@ -209,6 +217,10 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_usb_isoch_reap", kapi_usb_isoch_reap),
     sym!("kapi_usb_isoch_close", kapi_usb_isoch_close),
     sym!("kapi_v4l2_unregister", kapi_v4l2_unregister),
+    sym!("kapi_blk_register", kapi_blk_register),
+    sym!("kapi_blk_remove", kapi_blk_remove),
+    sym!("kapi_preempt_disabled", kapi_preempt_disabled),
+    sym!("kapi_preempt_enable_no_resched", kapi_preempt_enable_no_resched),
 ];
 
 extern "C" {

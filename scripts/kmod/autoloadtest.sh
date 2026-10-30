@@ -39,6 +39,36 @@ if [[ "$mod" == "e1000e" ]]; then
     [[ $fail -eq 0 ]] && echo "autoloadtest e1000e: PASS" || { echo "autoloadtest e1000e: FAIL"; exit 1; }
     exit 0
 fi
+if [[ "$mod" == "virtio_blk" || "$mod" == "nvme" ]]; then
+    # Boot-path block drivers as modules (root disk on virtio-blk / nvme via LEANDROS_ROOT_BUS): loaded from the
+    # initrd through modules/BOOT, root mounts; modules.blacklist=<name> must time out without a hang.
+    sym=$(echo "$mod" | tr a-z A-Z)
+    printf 'CONFIG_MODULES=y\nCONFIG_%s=m\n' "$sym" > .config
+    ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/autoloadtest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/autoloadtest-build.log"; exit 1; }
+    RT=.claude/skills/run-leandros/runtests.py
+    fail=0
+    check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3"; fail=1; fi; }
+    export LEANDROS_RUN_ID="autoloadtest-$arch"
+    [[ "$mod" == "nvme" ]] && export LEANDROS_ROOT_BUS=nvme
+    python3 "$RT" "$arch" blk1 "cat /proc/modules" "kmodctl list" "cat /proc/mounts" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-blk1/serial-full.log
+    check "$L" "^\\[kmod\\] .*$mod loaded" "$mod loaded"
+    check "$L" "^$mod [0-9]* [0-9]* - Live" "listed in /proc/modules"
+    check "$L" "^$mod .* Live " "listed by kmodctl list"
+    [[ "$mod" == "nvme" ]] && check "$L" 'nvme0n1' "nvme0n1 registered"
+    # Negative: blacklisted boot-path driver. The root disk never appears; the boot must give up
+    # cleanly (blacklist line, no module loaded) instead of hanging the harness.
+    export LEANDROS_RUN_ID="autoloadtest-$arch-bl"
+    python3 "$RT" "$arch" blk2 --timeout 150 --cmdline "modules.blacklist=$mod" "cat /proc/modules" > /dev/null 2>&1 || true
+    L2="/tmp/leandros-autoloadtest-$arch-bl-serial-full.log"
+    check "$L2" "^\\[kmod\\] $mod Blacklisted" "$mod blacklisted"
+    # The lx root image is a separate virtio disk (nvme only carries the boot disk), so only the
+    # virtio_blk case loses its root disk when blacklisted.
+    [[ "$mod" == "virtio_blk" ]] && check "$L2" "ERROR: Failed to mount the root filesystem" "root wait gave up cleanly"
+    if grep -aq "^\\[kmod\\] .*$mod loaded" "$L2"; then echo "FAIL blacklisted $mod was loaded"; fail=1; else echo "ok   blacklisted $mod not loaded"; fi
+    [[ $fail -eq 0 ]] && echo "autoloadtest $mod: PASS" || { echo "autoloadtest $mod: FAIL"; exit 1; }
+    exit 0
+fi
 if [[ "$mod" == "virtio_snd" ]]; then
     # CONFIG_VIRTIO_SND=m: the sound device is ONLY a module (alias 1af4:1059). No built-in backend
     # exists, so the module's attach registers /dev/pipewire lazily; `sndtest all` plays through it.

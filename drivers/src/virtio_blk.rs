@@ -8,8 +8,8 @@
 #[allow(unused_imports)]
 use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
-use crate::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
-use mm;
+use crate::kenv::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
+use crate::kenv::{mm, sched};
 
 const VIRTIO_PCI_VENDOR: u16 = 0x1af4;
 const VIRTIO_PCI_DEVICE_BLK_MODERN: u16 = 0x1042;
@@ -47,14 +47,14 @@ static REQ_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 
 fn knobs() -> &'static Knobs {
     use core::sync::atomic::Ordering;
-    if KNOBS_STATE.load(Ordering::Acquire) == 0 && crate::nvidia_probe::cmdline_known() {
+    if KNOBS_STATE.load(Ordering::Acquire) == 0 && crate::kenv::cmdline_known() {
         let mut k = Knobs { delay_n: 0, delay_ns: 0, slow_ns: IO_TIMEOUT_NS };
-        if let Some((n, ms)) = crate::nvidia_probe::cmdline_word("virtio_blk.inject_delay")
+        if let Some((n, ms)) = crate::kenv::cmdline_word("virtio_blk.inject_delay")
             .and_then(|w| w.split_once(':'))
             .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))) {
             k.delay_n = n; k.delay_ns = ms * 1_000_000;
         }
-        if let Some(ms) = crate::nvidia_probe::cmdline_opt("virtio_blk.slow_ms") {
+        if let Some(ms) = crate::kenv::cmdline_opt("virtio_blk.slow_ms") {
             if ms > 0 { k.slow_ns = ms * 1_000_000; }
         }
         // Requests run one at a time per disk; two disks racing here write
@@ -279,7 +279,7 @@ impl VirtQueue {
                 if el > warn_at {
                     while warn_at <= el && warn_at != u64::MAX { warn_at = warn_at.saturating_mul(2); }
                     slow = true;
-                    crate::pci::serial_debug(&alloc::format!(
+                    crate::kenv::pci::serial_debug(&alloc::format!(
                         "[VIRTIO-BLK] slow request: type {} sector {} unanswered for {} ms (device_status {:#04x}); still waiting\n",
                         type_, sector, el / 1_000_000, st));
                 }
@@ -333,7 +333,7 @@ unsafe fn enable_pci_mmio(pci: &PciDevice) {
     // polls and never reads its ISR status, so an asserted INTx would stay
     // asserted forever and, on the virt board's shared PCIe lines, storm the
     // GPU's completion interrupt (`virtio_gpu::enable_intx`).
-    pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, (cmd | 0x0006) | crate::pci::PCI_CMD_INTX_DISABLE);
+    pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, (cmd | 0x0006) | crate::kenv::pci::PCI_CMD_INTX_DISABLE);
 }
 
 /// Resolve a BAR index to its 64-bit MMIO base address, or 0 if I/O space.
@@ -556,7 +556,7 @@ impl VirtioBlkDevice {
             if k.delay_n != 0 && seq == k.delay_n {
                 // Injected slow device: the request sits in the ring, unseen,
                 // for delay_ns. The wait below counts from t0.
-                crate::pci::serial_debug(&alloc::format!(
+                crate::kenv::pci::serial_debug(&alloc::format!(
                     "[VIRTIO-BLK] inject: request #{} (type {} sector {}) delayed {} ms\n",
                     seq, type_, sector, k.delay_ns / 1_000_000));
                 while sched::monotonic_ns().saturating_sub(t0) < k.delay_ns {
@@ -567,7 +567,7 @@ impl VirtioBlkDevice {
             self.notify();
             match self.queue.wait_for_completion(self.common_cfg, t0, k.slow_ns, type_, sector) {
                 Ok(false) => {}
-                Ok(true) => crate::pci::serial_debug(&alloc::format!(
+                Ok(true) => crate::kenv::pci::serial_debug(&alloc::format!(
                     "[VIRTIO-BLK] slow request: type {} sector {} completed after {} ms (status {})\n",
                     type_, sector, sched::monotonic_ns().saturating_sub(t0) / 1_000_000, *status_ptr)),
                 Err(WaitErr::Status(st)) => {
@@ -575,7 +575,7 @@ impl VirtioBlkDevice {
                     // forever: it may still complete (and DMA) later, so
                     // never reuse them.
                     self.dead = true;
-                    crate::pci::serial_debug(&alloc::format!(
+                    crate::kenv::pci::serial_debug(&alloc::format!(
                         "[VIRTIO-BLK] request type {} sector {} device failed (device_status {:#04x}); disk marked dead\n",
                         type_, sector, st));
                     return false;
@@ -676,9 +676,9 @@ pub fn probe_all() -> alloc::vec::Vec<&'static VirtioDisk> {
     for device_id in [VIRTIO_PCI_DEVICE_BLK_MODERN, VIRTIO_PCI_DEVICE_BLK_LEGACY] {
         for pci in find_all_devices(VIRTIO_PCI_VENDOR, device_id) {
             if out.len() >= MAX_BLK_DEVICES {
-                crate::pci::serial_debug("[VIRTIO-BLK] device limit reached (");
-                crate::pci::serial_debug_dec(MAX_BLK_DEVICES as u64);
-                crate::pci::serial_debug("); skipping a virtio-blk PCI function\n");
+                crate::kenv::pci::serial_debug("[VIRTIO-BLK] device limit reached (");
+                crate::kenv::pci::serial_debug_dec(MAX_BLK_DEVICES as u64);
+                crate::kenv::pci::serial_debug("); skipping a virtio-blk PCI function\n");
                 continue;
             }
             if let Some(d) = unsafe { VirtioBlkDevice::new(pci, true) } {

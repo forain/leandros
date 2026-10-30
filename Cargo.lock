@@ -308,6 +308,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-nvme"
+version = "0.1.0"
+dependencies = [
+ "kmod-abi",
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
+]
+
+[[package]]
 name = "kmod-rt"
 version = "0.1.0"
 dependencies = [
@@ -318,6 +329,17 @@ dependencies = [
 
 [[package]]
 name = "kmod-uvc"
+version = "0.1.0"
+dependencies = [
+ "kmod-abi",
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
+]
+
+[[package]]
+name = "kmod-virtio-blk"
 version = "0.1.0"
 dependencies = [
  "kmod-abi",

@@ -112,6 +112,7 @@ pub mod sync_file;
 pub mod sync_file_core;
 pub mod virtio;
 pub mod virtio_gpu;
+#[cfg(feature = "drv-virtio-blk")]
 pub mod virtio_blk;
 pub mod virtio_keyboard;
 #[cfg(feature = "virtio-net")] pub mod virtio_net;
@@ -188,6 +189,11 @@ pub mod psmouse;
 /// USB mass storage (xHCI bulk-only + SCSI) registered as `sdX` block devices.
 pub mod usb_storage;
 /// NVMe SSDs registered as `nvme<C>n<N>` block devices (read-only unless `nvme.rw=1`).
+#[cfg(feature = "drv-nvme")]
+pub mod nvme;
+/// CONFIG_NVME=n or =m: the entry points the kernel calls, inert (a module registers its own pm hooks).
+#[cfg(not(feature = "drv-nvme"))]
+#[path = "stubs/nvme.rs"]
 pub mod nvme;
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod sdhci;

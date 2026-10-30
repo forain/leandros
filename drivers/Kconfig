@@ -10,7 +10,7 @@ config KMOD_HELLO
 menu "Virtio (QEMU)"
 
 config VIRTIO_BLK
-	bool "virtio-blk"
+	tristate "virtio-blk"
 	default y
 
 config VIRTIO_NET
@@ -103,7 +103,7 @@ endmenu
 menu "Storage"
 
 config NVME
-	bool "NVMe"
+	tristate "NVMe"
 	depends on PCI
 	default y
 

@@ -65,6 +65,9 @@ pub extern "C" fn kapi_mutex_lock(h: usize) { if h != 0 { unsafe { (*(h as *cons
 #[no_mangle]
 pub extern "C" fn kapi_mutex_unlock(h: usize) { if h != 0 { unsafe { (*(h as *const sched::ksync::KRawMutex)).unlock() } } }
 
+#[no_mangle]
+pub extern "C" fn kapi_mutex_trylock(h: usize) -> bool { h != 0 && unsafe { (*(h as *const sched::ksync::KRawMutex)).try_lock() } }
+
 /// Counting semaphore with `n` initial permits. Permanent handle.
 #[no_mangle]
 pub extern "C" fn kapi_sem_new(n: u32) -> usize { Box::into_raw(Box::new(sched::ksync::KSemaphore::new(n as i64))) as usize }

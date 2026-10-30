@@ -572,7 +572,13 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 78 && exports::NEXPORTS == 78, "ksymtab has 78 exports");
+    t.check(exports::ksymtab().len() == 83 && exports::NEXPORTS == 83, "ksymtab has 83 exports");
+    {
+        use kmod_abi::{KBlkDesc, KBlkOps};
+        let r = crate::kmod::exports::kapi_blk_register(KmodId(0), core::ptr::null::<KBlkDesc>(), core::ptr::null::<KBlkOps>(), 0);
+        t.check(r == -22, "kapi_blk_register null desc/ops -> -22");
+        t.check(crate::kmod::exports::kapi_blk_remove(-1) == -22, "kapi_blk_remove(-1) -> -22");
+    }
     let find = sym!("kapi_pci_find", sys::PciFindFn);
     let rd = sym!("kapi_pci_cfg_read", sys::PciCfgReadFn);
     let wr = sym!("kapi_pci_cfg_write", sys::PciCfgWriteFn);

@@ -12,6 +12,8 @@ static OWNER: AtomicU16 = AtomicU16::new(0);
 pub fn set_owner(id: KmodId) { OWNER.store(id.0, Ordering::SeqCst); }
 pub fn owner() -> KmodId { KmodId(OWNER.load(Ordering::SeqCst)) }
 
+pub mod blk;
+
 pub mod pci {
     use super::*;
 
@@ -93,7 +95,7 @@ pub mod pci {
 
         /// Size memory BAR `i` (decode off, all-ones probe, restore; no local-IRQ mask, so call it
         /// from init before anything else touches the device).
-        fn bar_size(&self, i: usize) -> u64 {
+        pub fn bar_size(&self, i: usize) -> u64 {
             let off = 0x10 + 4 * i as u16;
             let cmd = self.read16(0x04);
             self.write16(0x04, cmd & !0x3);
@@ -529,6 +531,7 @@ pub mod sys_common {
     pub fn mutex_new(name: &str) -> usize { unsafe { sys::kapi_mutex_new(name.as_ptr(), name.len()) } }
     pub fn mutex_lock(h: usize) { unsafe { sys::kapi_mutex_lock(h) } }
     pub fn mutex_unlock(h: usize) { unsafe { sys::kapi_mutex_unlock(h) } }
+    pub fn mutex_trylock(h: usize) -> bool { unsafe { sys::kapi_mutex_trylock(h) } }
     pub fn sem_new(n: u32) -> usize { unsafe { sys::kapi_sem_new(n) } }
     pub fn sem_down_timeout(h: usize, ns: u64) -> bool { unsafe { sys::kapi_sem_down_timeout(h, ns) } }
     pub fn sem_up(h: usize) { unsafe { sys::kapi_sem_up(h) } }

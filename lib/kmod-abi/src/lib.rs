@@ -87,6 +87,7 @@ impl RegKind {
     pub const TICK: RegKind = RegKind(8);
     pub const PM: RegKind = RegKind(9);
     pub const SND: RegKind = RegKind(10);
+    pub const BLK: RegKind = RegKind(11);
 }
 
 /// Device-id table entry (`.kmod.ids`), 16 bytes. PCI: a=vendor, b=device (0xffff = any).
@@ -347,6 +348,8 @@ pub const BUS_ACPI: u16 = 4;
 pub const BUS_SDIO: u16 = 5;
 
 pub mod alias;
+pub mod blk;
+pub use blk::{KBlkDesc, KBlkOps};
 
 /// Export-table entry; `name` is NUL-terminated.
 #[repr(C)]
@@ -405,6 +408,7 @@ pub mod sys {
     pub type IoremapFn = unsafe extern "C" fn(u64, usize, u32) -> usize;
     pub type IounmapFn = unsafe extern "C" fn(usize, usize);
     pub type DmaSyncFn = unsafe extern "C" fn(usize, usize, u32);
+    pub type MutexTryFn = unsafe extern "C" fn(usize) -> bool;
     pub type MutexNewFn = unsafe extern "C" fn(*const u8, usize) -> usize;
     pub type SemNewFn = unsafe extern "C" fn(u32) -> usize;
     pub type HrtimerNewFn = unsafe extern "C" fn(Option<extern "C" fn(usize)>, usize, bool) -> usize;
@@ -461,6 +465,7 @@ pub mod sys {
         pub fn kapi_mutex_new(name: *const u8, len: usize) -> usize;
         pub fn kapi_mutex_lock(h: usize);
         pub fn kapi_mutex_unlock(h: usize);
+        pub fn kapi_mutex_trylock(h: usize) -> bool;
         pub fn kapi_sem_new(n: u32) -> usize;
         pub fn kapi_sem_down_timeout(h: usize, ns: u64) -> bool;
         pub fn kapi_sem_up(h: usize);

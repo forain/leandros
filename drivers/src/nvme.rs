@@ -76,11 +76,12 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use sched::ksync::KMutex;
+use crate::kenv::{mm, sched};
+use crate::kenv::sched::ksync::KMutex;
 
 use crate::blkdev::{self, BlkErr, BlockDevice};
 use crate::partscan;
-use crate::pci::{serial_debug, PciDevice, PciFunction};
+use crate::kenv::pci::{serial_debug, PciDevice, PciFunction};
 
 // ── Registers ────────────────────────────────────────────────────────────────
 
@@ -330,7 +331,7 @@ impl Queue {
                 return Err(CmdErr::Timeout);
             }
             if w.sleepable && waited > 200_000 {
-                crate::usb_storage::sleep_until(now + (waited / 8).clamp(50_000, 1_000_000));
+                crate::kenv::sleep_until(now + (waited / 8).clamp(50_000, 1_000_000));
                 continue;
             }
             spins = spins.wrapping_add(1);
@@ -592,7 +593,7 @@ impl CtrlState {
             if want && csts & CSTS_CFS != 0 { return Err(csts); }
             if sched::monotonic_ns().saturating_sub(t0) > timeout_ms * 1_000_000 { return Err(csts); }
             if sched::irqctx::can_sleep() && sched::current_pid() != 0 {
-                crate::usb_storage::sleep_until(sched::monotonic_ns() + 1_000_000);
+                crate::kenv::sleep_until(sched::monotonic_ns() + 1_000_000);
             } else {
                 core::hint::spin_loop();
             }
@@ -743,23 +744,23 @@ fn probe(dev: &PciDevice, index: usize) {
 
     // Memory decode + bus master, INTx off (polled driver).
     let cmd0 = f.command();
-    f.set_command(cmd0 | crate::pci::CMD_MEMORY | crate::pci::CMD_BUS_MASTER | crate::pci::PCI_CMD_INTX_DISABLE);
+    f.set_command(cmd0 | crate::kenv::pci::CMD_MEMORY | crate::kenv::pci::CMD_BUS_MASTER | crate::kenv::pci::PCI_CMD_INTX_DISABLE);
     let (regs, bar_phys, bar_size) = match bar0(dev) {
         Some(b) => b,
         None => { nlog!("nvme{}: BAR0 missing or unassigned; skipped", index); return; }
     };
-    let msix = f.find_capability(crate::pci::cap::MSIX).map(|c| (f.read16(c + 2) & 0x7FF) + 1);
-    let msi = f.find_capability(crate::pci::cap::MSI).is_some();
+    let msix = f.find_capability(crate::kenv::pci::cap::MSIX).map(|c| (f.read16(c + 2) & 0x7FF) + 1);
+    let msi = f.find_capability(crate::kenv::pci::cap::MSI).is_some();
     nlog!("nvme{}: BAR0 {:#x} size {} KiB; PCI command {:#06x} -> {:#06x}; MSI-X {}, MSI {}; interrupt mode: polled (INTx disabled, all vectors masked)",
         index, bar_phys, bar_size / 1024, cmd0, f.command(),
         match msix { Some(n) => alloc::format!("{} vectors", n), None => String::from("absent") },
         if msi { "present" } else { "absent" });
-    if let Some(pm) = f.find_capability(crate::pci::cap::PM) {
+    if let Some(pm) = f.find_capability(crate::kenv::pci::cap::PM) {
         let pmcsr = f.read16(pm + 4);
         if pmcsr & 3 != 0 {
             nlog!("nvme{}: PCI power state D{}; moving to D0", index, pmcsr & 3);
             f.write16(pm + 4, pmcsr & !3);
-            crate::usb_storage::sleep_until(sched::monotonic_ns() + 10_000_000);
+            crate::kenv::sleep_until(sched::monotonic_ns() + 10_000_000);
         }
     }
 
@@ -1183,7 +1184,7 @@ fn report_partitions(ns: &'static Ns) {
 /// `klog::init`, so these lines reach the stick's log partition.
 pub fn init(cmdline: &str) -> usize {
     parse_cmdline(cmdline);
-    let devs = crate::pci::find_by_class(0x01, 0x08, 0x02);
+    let devs = crate::kenv::pci::find_by_class(0x01, 0x08, 0x02);
     if devs.is_empty() { return 0; }
     if DISABLED.load(Ordering::Relaxed) {
         nlog!("{} controller(s) present; driver disabled by nvme.disable=1", devs.len());
