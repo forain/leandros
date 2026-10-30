@@ -13,4 +13,4 @@ cosmic-files, cosmic-edit, cosmic-screenshot (epoch-1.3.0) staged as /bin/<app> 
   warning, falls back to GLES). No PNG in ~/Pictures: screenshot was launched without args, so it waits
   for interactive capture; the capture path (portal/screencopy) is NOT verified.
 - Print key is bound by cosmic-comp to System(Screenshot).
-- x86_64 build-all: see merge commit result.
+- x86_64 build-all: 0 errors, 0 WARNING:.
