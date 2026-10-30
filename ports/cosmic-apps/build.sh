@@ -6,6 +6,8 @@
 #   m6-session-bins/build-rust.sh src/<app> <arch>
 # Sources live in m6-session-bins/src/<app>; cosmic-edit and cosmic-screenshot
 # share cosmic-files' cargo target dir (symlinked) to save disk.
+# cosmic-monitor and cosmic-initial-setup follow the same recipe; the latter is
+# staged with its .desktop but is NOT run at first login.
 #
 # Output: ~/code/leandros-artifacts/m6-session-bins/out/<app>-<arch>
 # mkfs stages each as /bin/<app> together with its .desktop (this directory)
@@ -25,7 +27,7 @@ case "${1:-both}" in
 esac
 shift || true
 APPS=("$@")
-[[ ${#APPS[@]} -gt 0 ]] || APPS=(cosmic-files cosmic-edit cosmic-screenshot cosmic-store cosmic-player)
+[[ ${#APPS[@]} -gt 0 ]] || APPS=(cosmic-files cosmic-edit cosmic-screenshot cosmic-store cosmic-player cosmic-monitor cosmic-initial-setup)
 
 if [[ ! -x "$M6/build-rust.sh" ]]; then
   echo "cosmic-apps: no m6 toolchain at $M6 -- not built" >&2
@@ -44,6 +46,8 @@ feat_for() {
     # Upstream default features (mpris-server, xdg-portal, wgpu, wayland); its
     # GStreamer stack comes from ports/gstreamer (merged into the sysroot).
     cosmic-player) echo "" ;;
+    cosmic-monitor) echo "--no-default-features --features dbus-config,wayland,wgpu" ;;   # no nvml
+    cosmic-initial-setup) echo "--no-default-features --features wgpu,wayland" ;;
     *)            echo "" ;;
   esac
 }

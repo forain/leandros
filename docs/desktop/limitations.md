@@ -30,14 +30,15 @@ this page is the explanation.
   power applet's Lock is a no-op (no screen locker exists) and its log-out path to the greeter
   is unverified on hardware. Power off and restart from the greeter and from a user session
   work through login1.
-- **Applets without a backing service or config.** The workspaces applet is staged but the
-  default panel config does not launch it. The battery applet shows data only where the
+- **Applets without a backing service.** The battery applet shows data only where the
   kernel exports a power_supply class (the laptop's ACPI battery); QEMU shows none. The
   Bluetooth applet depends on an adapter (`/dev/hci0`) and the `org.bluez` shim, and is only
   checked against the shim, not yet in a live session on hardware.
 - **Brightness and volume hotkeys are partly unconfirmed.** The EliteBook 840 G5 brightness
   keys are mapped (`E0 12`/`E0 17`) but a real key press reaching the compositor has not been
   confirmed; other machines' keys appear as `kbd: unmapped sc` lines until mapped.
+- **cosmic-monitor has no disk or network data.** `/proc/diskstats`, `/sys/class/net`, `/sys/class/drm` and `/sys/devices/system/cpu` (cpufreq) do not exist, so the disk/network graphs and GPU/frequency readouts stay empty; CPU, memory, load and the process list work. CPU is shown as user time (no user/system split is kept).
+- **cosmic-initial-setup's Network pages need the system bus.** They `unwrap()` `zbus::Connection::system()`; it works only with `DBUS_SYSTEM_BUS_ADDRESS` set as in the session, not from a bare shell.
 - **cosmic-screenshot's capture path is unverified.** The app starts, but the
   portal/screencopy capture has not produced a PNG in a test.
 - **Firefox is still heavy during YouTube** (about 310 % total CPU on the laptop, Firefox
