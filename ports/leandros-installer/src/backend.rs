@@ -11,6 +11,7 @@ pub const DEFAULT_BIN: &str = "/usr/sbin/leandros-install";
 pub struct Disk {
     pub dev: String,
     pub model: String,
+    pub bus: String,
     pub size: u64,
     pub eligible: bool,
     pub reason: String,
@@ -22,7 +23,8 @@ impl Disk {
         if g >= 1024.0 { format!("{:.1} TiB", g / 1024.0) } else { format!("{:.1} GiB", g) }
     }
     pub fn label(&self) -> String {
-        if self.model.is_empty() { self.dev.clone() } else { format!("{} ({})", self.model, self.dev) }
+        let m = if self.model.is_empty() { self.bus.as_str() } else { self.model.as_str() };
+        if m.is_empty() { self.dev.clone() } else { format!("{} ({})", m, self.dev) }
     }
 }
 
@@ -60,6 +62,7 @@ pub fn parse_line(line: &str) -> Option<Event> {
             Some(Event::Disk(Disk {
                 dev: s(&["dev", "path", "name", "device"]),
                 model: s(&["model"]),
+                bus: s(&["bus"]),
                 size,
                 eligible,
                 reason: s(&["reason"]),
