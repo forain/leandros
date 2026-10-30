@@ -657,6 +657,13 @@ fn kmodplat_checks(t: &mut T) {
     let before = drivers::dma_shutdown::count();
     t.check(registry::release_all(qo), "release_all drops the dma_quiesce registration");
     t.check(!drivers::dma_shutdown::has("ktest-q") && drivers::dma_shutdown::count() == before - 1, "quiesce entry removed after the failed init");
+    // RP1 interrupt sources: bad arguments are refused everywhere; without an RP1 there is nothing to attach.
+    extern "C" fn kp_irq(_c: usize) -> u32 { 0 }
+    t.check(exports::kapi_rp1_irq_request(KmodId(0), 6, true, kp_irq, 0) == -22 && exports::kapi_rp1_irq_request(KmodId(60023), 64, true, kp_irq, 0) == -22, "rp1_irq_request bad args -> -22");
+    #[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
+    t.check(exports::kapi_rp1_irq_request(KmodId(60023), 6, true, kp_irq, 0) == -19, "rp1_irq_request off the Pi 5 -> -19");
+    t.check(exports::kapi_rp1_irq_free(KmodId(60023), 6) == -19, "rp1_irq_free of an unheld source -> -19");
+    t.check(exports::lookup("kapi_rp1_irq_request").is_some() && exports::lookup("kapi_rp1_irq_free").is_some(), "rp1 irq exports in KSYMTAB");
 }
 
 /// L5a: the PCI / memory / entropy kapi exports, called through the KSYMTAB addresses

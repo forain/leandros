@@ -6,19 +6,8 @@
 //!
 //! This driver does not touch PCIe. The RP1 probe hands it the controller:
 //!
-//! ```ignore
-//! // RP1 BAR1 is RP1's peripheral window (DT 0xc0_4000_0000); the GEM is at
-//! // BAR1 + RP1_GEM_OFFSET, RP1_GEM_SIZE bytes, mapped Uncached (Device).
-//! let va = mm::kva::ioremap(bar1_phys + drivers::macb::RP1_GEM_OFFSET,
-//!                           drivers::macb::RP1_GEM_SIZE, mm::kva::CacheMode::Uncached)?;
-//! drivers::macb::rp1_attach(drivers::macb::Rp1Gem {
-//!     mmio_va: va,
-//!     dma_offset: drivers::macb::RP1_DMA_OFFSET, // CPU phys -> RP1 bus address
-//!     irq_wired: true, // RP1 interrupt RP1_GEM_IRQ (6, level-high) calls rp1_isr
-//! });
-//! // ... and from the RP1 interrupt demux, for RP1 IRQ 6:
-//! drivers::macb::rp1_isr(0);
-//! ```
+//! The RP1 probe announces `raspberrypi,rp1-gem` to the platform registry ([`COMPATS`]);
+//! [`register`] makes this driver claim it ([`probe`] maps the GEM and calls [`rp1_attach`]).
 //!
 //! `rp1_attach` must run before `netdev::init` (kernel `init.rs`), which
 //! calls [`init`]: that is where the controller is brought up and `eth0`
@@ -46,11 +35,10 @@ use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
+use crate::kenv::{self, mm, sched};
 use crate::macb_hw::{self as hw, Desc, Link, LinkWatch, PhyMode, Regs, RxEvent, RxRing, TxRing};
 
 /// The GEM's offset inside RP1 BAR1 (DT `ethernet@100000`, reg 0xc0_4010_0000).
-pub const RP1_GEM_OFFSET: u64 = 0x10_0000;
-pub const RP1_GEM_SIZE: usize = 0x4000;
 /// The GEM's interrupt number on RP1's interrupt controller (DT `interrupts = <6 4>`).
 pub const RP1_GEM_IRQ: u32 = 6;
 /// What RP1 adds to a CPU physical address to reach RAM (pcie2 dma-ranges).
@@ -70,8 +58,6 @@ pub struct Rp1Gem {
     pub eth_cfg_va: usize,
 }
 
-/// eth_cfg sits right after the GEM's 16 KiB window.
-pub const RP1_ETH_CFG_OFFSET: u64 = 0x10_4000;
 
 const NUM_RX: usize = 256;
 const NUM_TX: usize = 256;
@@ -80,16 +66,12 @@ const MAX_FRAME: usize = 1514;
 const ETH_ZLEN: usize = 60;
 const PAGE: usize = 4096;
 
-extern "C" {
-    fn serial_print_str_raw(s: *const u8, len: usize);
-}
-
 fn log(msg: &str) {
     let mut s = String::with_capacity(msg.len() + 10);
     s.push_str("[macb] ");
     s.push_str(msg);
     s.push('\n');
-    unsafe { serial_print_str_raw(s.as_ptr(), s.len()); }
+    kenv::serial_raw(&s);
 }
 
 macro_rules! mlog { ($($a:tt)*) => { log(&format!($($a)*)) }; }
@@ -226,10 +208,35 @@ fn ncr_set(m: &mut Mmio, set: u32, clear: u32) {
 
 fn set_state(s: &'static str) { *STATE.lock() = s; }
 
-/// Called by the RP1 probe (see the module docs). Reads what the DTB says
+/// Platform-registry compatible of the GEM; RP1 announces it (`rp1.rs`) with reg0 = GEM window,
+/// reg1 = eth_cfg (length 0 when BAR1 does not reach it), `dma_offset`, irq0 = RP1 source and
+/// flags bit0 = deliver the interrupt (`rp1.irq=1`).
+pub const COMPATS: &[&str] = &["raspberrypi,rp1-gem"];
+
+/// Register the driver with the platform registry (idempotent). The announcement is replayed to it
+/// if it was made earlier.
+pub fn register() {
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if !ONCE.swap(true, Ordering::AcqRel) { crate::platform::register(COMPATS, probe); }
+}
+
+/// Platform probe: map the GEM, wire the interrupt, remember the DTB node. True = claimed.
+fn probe(_compat: &str, d: &crate::platform::PlatDev) -> bool {
+    let (gem_pa, gem_len) = d.regs[0];
+    if gem_len == 0 { return false; }
+    let Some(mmio_va) = kenv::ioremap_uc(gem_pa, gem_len as usize) else { log("could not map the GEM; macb not attached"); return false };
+    let (cfg_pa, cfg_len) = d.regs[1];
+    let eth_cfg_va = if cfg_len == 0 { 0 } else { kenv::ioremap_uc(cfg_pa, cfg_len as usize).unwrap_or(0) };
+    let src = if d.nirq > 0 { d.irqs[0] } else { RP1_GEM_IRQ };
+    let irq_wired = d.flags & 1 != 0 && kenv::rp1_irq_request(src, true, rp1_isr, 0);
+    rp1_attach(Rp1Gem { mmio_va, dma_offset: d.dma_offset, irq_wired, eth_cfg_va });
+    true
+}
+
+/// Called by [`probe`] (see the module docs). Reads what the DTB says
 /// about the GEM now, while the boot DTB is certainly mapped.
 pub fn rp1_attach(res: Rp1Gem) {
-    let dt = unsafe { boot::device_tree::recorded_dtb() }.map(hw::fdt_find_gem).unwrap_or_default();
+    let dt = kenv::dtb_blob().map(hw::fdt_find_gem).unwrap_or_default();
     mlog!("attached: regs at {:#x}, dma offset {:#x}, irq {}, dtb node {}", res.mmio_va, res.dma_offset,
           if res.irq_wired { "RP1 6" } else { "none (polled)" }, if dt.found { "found" } else { "missing" });
     *ATTACHED.lock() = Some((res, dt));
@@ -278,7 +285,7 @@ pub fn init(cmdline: &str) {
     // firmware left in SA1, else a locally administered one.
     let sa = hw::mac_from_sa(m.r32(hw::SA1B), m.r32(hw::SA1T));
     let (mac, src) = if let Some(mac) = dt.mac { (mac, "dtb") }
-        else if let Some(mac) = crate::bcm2712_otp::eth_mac() { (mac, "otp") }
+        else if let Some(mac) = kenv::board_eth_mac() { (mac, "otp") }
         else if hw::mac_valid(&sa) { (sa, "SA1 registers") }
         else {
             let t = (sched::monotonic_ns() as u32).to_le_bytes();
@@ -339,7 +346,7 @@ pub fn init(cmdline: &str) {
         mid, queues, dcfg1, dcfg6, src, if res.irq_wired { "RP1 6" } else { "polled" }));
     PRESENT.store(true, Ordering::SeqCst);
     RUNNING.store(true, Ordering::SeqCst);
-    crate::dma_shutdown::register("gem", crate::dma_shutdown::Stage::Device, kexec_shutdown);
+    kenv::dma_quiesce_register("gem", kexec_shutdown);
     set_state("phy");
     // `macb.phy=rgmii|rgmii-id|rgmii-rxid|rgmii-txid` pins the PHY delays
     // (no automatic RX-delay retry then).
@@ -976,3 +983,17 @@ fn tx_check(m: &mut Mmio) {
               tsr, names, d.addr, d.ctrl, d.addr_hi, dropped, note);
     }
 }
+
+/// The generic netif table of the GEM (registered by `netdev::init` once [`present`]).
+pub static MACB_OPS: crate::netdev::NetifOps = crate::netdev::NetifOps {
+    driver: |_| "macb",
+    send: |_, b| send_packet(b),
+    tx_ready: |_| tx_ready(),
+    recv: |_, b| poll_receive(b),
+    rx_rearm: |_| rx_rearm(),
+    rx_irq_driven: |_| rx_irq_driven(),
+    mac: |_| mac_address(),
+    link: |_| link(),
+    link_gen: |_| link_generation(),
+    info: |_, out| info_lines(out),
+};
