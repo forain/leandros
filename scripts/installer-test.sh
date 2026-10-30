@@ -97,6 +97,9 @@ $REMOTE run "leandros-install install --target $TARGET_DEV --dry-run --json" > "
 grep -q '"ev":"done","dry_run":true' "$WORK/dry.log" || fail "dry run did not finish"
 ok "dry run"
 if [ -n "${VIA_GUI:-}" ]; then
+    $REMOTE run "leandros-installer --self-test-list" > "$WORK/gui-list.log" 2>&1 || { tail -5 "$WORK/gui-list.log"; fail "GUI --self-test-list failed"; }
+    grep -q "$TARGET_DEV" "$WORK/gui-list.log" || fail "GUI list lacks $TARGET_DEV"
+    ok "GUI --self-test-list shows $TARGET_DEV"
     # Drive the install through the libcosmic GUI's state machine (real backend).
     $REMOTE run "leandros-installer --self-test-install $TARGET_DEV" > "$WORK/install.log" || { tail -5 "$WORK/install.log"; fail "GUI install failed"; }
     grep -q "page Done" "$WORK/install.log" || fail "GUI did not reach page Done"
