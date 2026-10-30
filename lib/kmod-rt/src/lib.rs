@@ -230,9 +230,3 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let _ = write!(b, "{}", info);
     unsafe { sys::kapi_panic(owner(), b.as_bytes().as_ptr(), b.as_bytes().len()) }
 }
-
-/// PCI class id: matches every function whose class<<16|subclass<<8|prog_if satisfies
-/// `(value & mask) == (class & mask)` (modules.alias `pci * * <class> <mask> <name>`).
-pub const fn pci_class(class: u32, mask: u32) -> KmodDevId {
-    KmodDevId { bus: BUS_PCI, a: 0xffff, b: 0xffff, c: 0, class, class_mask: mask }
-}
