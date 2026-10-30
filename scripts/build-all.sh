@@ -967,6 +967,26 @@ build_git() {
     stage_container_port "$port" "$arch" git git GIT
 }
 
+# Function to stage e2fsprogs (ports/e2fsprogs): Alpine 3.21's e2fsck,
+# resize2fs, dumpe2fs, e2undo and mke2fs (dual-boot installer, ext4 shrink).
+# LEANDROS_E2FSPROGS_REBUILD=1 forces it, LEANDROS_SKIP_E2FSPROGS=1 skips it.
+build_e2fsprogs() {
+    local arch="$1"
+    echo "🧰 Staging $arch e2fsprogs..."
+    if [[ "${LEANDROS_SKIP_E2FSPROGS:-0}" == 1 ]]; then
+        echo "⚠️  LEANDROS_SKIP_E2FSPROGS=1, skipping"
+        return 0
+    fi
+    local port="$ROOT_DIR/ports/e2fsprogs"
+    local stamp="$port/out/$arch/.stamp"
+    if [[ "${LEANDROS_E2FSPROGS_REBUILD:-0}" != 1 && -f "$stamp" ]] \
+       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
+        echo "  up to date ($port/out/$arch)"
+        return 0
+    fi
+    stage_container_port "$port" "$arch" e2fsprogs e2fsprogs E2FSPROGS
+}
+
 # Function to build mkfs.xfs — the XFS v5 formatter for the root partition.
 # Same shape as build_mkfs_fat; its build.sh takes one arch (or "all") and
 # installs the binary, which cargo builds as mkfs_xfs because a target name
@@ -1200,6 +1220,7 @@ for arch in "${ARCHS[@]}"; do
     build_espctl "$arch"
     build_leandros_install "$arch"
     build_git "$arch"
+    build_e2fsprogs "$arch"
     build_disktester "$arch"
     build_ripgrep "$arch"
     build_grep "$arch"
