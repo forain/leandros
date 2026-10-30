@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "leandros-install"
+version = "0.1.0"
+edition = "2021"
+description = "LeandrOS installer: writes the ESP, root and a fresh seeded home volume"
+
+# Standalone std/musl crate like userland/espctl.
+[lib]
+name = "leandros_install"
+path = "src/lib.rs"
+
+[[bin]]
+name = "leandros-install"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = 2
