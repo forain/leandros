@@ -572,7 +572,13 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 83 && exports::NEXPORTS == 83, "ksymtab has 83 exports");
+    t.check(exports::ksymtab().len() == 86 && exports::NEXPORTS == 86, "ksymtab has 86 exports");
+    {
+        use crate::kmod::exports::{kapi_input_register, kapi_input_set_caps};
+        t.check(kapi_input_register(KmodId(0), 7, core::ptr::null(), 0, 0, 0, 0) == -22, "kapi_input_register bad kind -> -22");
+        t.check(kapi_input_set_caps(5, core::ptr::null(), 0, core::ptr::null(), 0) == -22, "kapi_input_set_caps bad node -> -22");
+        t.check(kapi_input_set_caps(1, core::ptr::null(), 4, core::ptr::null(), 0) == -22, "kapi_input_set_caps null rel -> -22");
+    }
     {
         use kmod_abi::{KBlkDesc, KBlkOps};
         let r = crate::kmod::exports::kapi_blk_register(KmodId(0), core::ptr::null::<KBlkDesc>(), core::ptr::null::<KBlkOps>(), 0);

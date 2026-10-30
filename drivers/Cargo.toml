@@ -25,6 +25,7 @@ drv-lapinv = []
 drv-i2c-hid = []
 drv-nvme = []
 drv-virtio-blk = []
+drv-virtio-keyboard = []
 
 # Kconfig-gated NIC drivers (CONFIG_FOO -> kernel feature drv-foo -> drivers/foo).
 # Off: the module is replaced by a small stub under src/stubs/ or compiled out.

@@ -44,10 +44,10 @@ drv-i2c-hid = ["drivers/drv-i2c-hid"]
 # every lane edits only its own driver). Y-only: the features do not gate code yet.
 drv-nvme = ["drivers/drv-nvme"]
 drv-virtio-blk = ["drivers/drv-virtio-blk"]
+drv-virtio-keyboard = ["drivers/drv-virtio-keyboard"]
 drv-usb-storage = []
 drv-usb-hid = []
 drv-virtio-snd = ["drivers/virtio-snd"]
-drv-virtio-keyboard = []
 drv-bt = []
 drv-hdmi-audio = []
 

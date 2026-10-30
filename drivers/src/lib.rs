@@ -114,6 +114,10 @@ pub mod virtio;
 pub mod virtio_gpu;
 #[cfg(feature = "drv-virtio-blk")]
 pub mod virtio_blk;
+#[cfg(feature = "drv-virtio-keyboard")]
+pub mod virtio_keyboard;
+#[cfg(not(feature = "drv-virtio-keyboard"))]
+#[path = "stubs/virtio_keyboard.rs"]
 pub mod virtio_keyboard;
 #[cfg(feature = "virtio-net")] pub mod virtio_net;
 /// Realtek RTL8111/8168 PCIe gigabit Ethernet (real PCs).

@@ -24,7 +24,7 @@ config VIRTIO_GPU
 	default y
 
 config VIRTIO_KEYBOARD
-	bool "virtio-input keyboard"
+	tristate "virtio-input keyboard"
 	default y
 
 config VIRTIO_RNG

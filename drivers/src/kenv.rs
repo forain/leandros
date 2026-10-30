@@ -16,3 +16,14 @@ pub fn serial_raw(s: &str) { unsafe { serial_print_str_raw(s.as_ptr(), s.len());
 /// Sleep the calling task until `ns` (monotonic).
 pub fn sleep_until(ns: u64) { crate::usb_storage::sleep_until(ns) }
 pub use crate::nvidia_probe::{cmdline_known, cmdline_opt, cmdline_word};
+
+/// Input seam: the built-in feeds the evdev server directly; the module build goes through the
+/// `kapi_input_*` exports. `register` claims the fixed evdev node of the same index.
+pub mod input {
+    /// The built-in owns both nodes outright; the module build claims them through `kapi_input_register`.
+    pub fn claim(_node: u32) -> bool { true }
+    pub fn push_event(node: u32, ty: u16, code: u16, value: i32) { ::evdev_server::push_event(node, ty, code, value) }
+    pub fn set_device_caps(node: u32, rel: &[u8], key: &[u8]) { ::evdev_server::set_device_caps(node, rel, key) }
+    pub fn register_stats_hook(f: fn(&mut dyn core::fmt::Write)) { ::tty_server::vt::register_stats_hook(f) }
+    pub fn vt_handoff_stats() -> (u64, u64) { crate::drm_device_interface::vt_handoff_stats() }
+}
