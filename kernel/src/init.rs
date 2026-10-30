@@ -288,6 +288,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // NVMe SSDs (read-only unless nvme.rw=1): registered before klog::init so
     // the bring-up diagnostics reach the stick's log partition.
     drivers::nvme::init(crate::boot_cmdline().unwrap_or(""));
+    crate::kmod::exports::set_boot_fb(boot_info.framebuffer_base, boot_info.framebuffer_width, boot_info.framebuffer_height, boot_info.framebuffer_pitch_bytes() as u32);
     drivers::i915::run(&drivers::i915::BootEnv { fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32 }); // Intel Gen9 GPU probe (+ `i915.*` bring-up)
     #[cfg(target_arch = "aarch64")] arch_aarch64::exception::SERROR_ERRREC.store(crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "serror.errrec=1")), core::sync::atomic::Ordering::Relaxed);
     // V3D probe (opt-in v3d.probe=1), bracketed by SError checkpoints: one before, so an
