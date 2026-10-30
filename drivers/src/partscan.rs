@@ -46,6 +46,16 @@ pub const LOG_GPT_GUID: [u8; 16] = [
     0x70, 0x74, 0x2B, 0x04, 0x02, 0x13, 0x61, 0x4E,
     0x93, 0x47, 0xA0, 0x13, 0x0B, 0x27, 0x67, 0x54,
 ];
+/// LeandrOS-root type GUID 3F2D991B-D385-4FFF-9CF1-A0DB03062DE5.
+pub const LEANDROS_ROOT_GUID: [u8; 16] = [
+    0x1B, 0x99, 0x2D, 0x3F, 0x85, 0xD3, 0xFF, 0x4F,
+    0x9C, 0xF1, 0xA0, 0xDB, 0x03, 0x06, 0x2D, 0xE5,
+];
+/// LeandrOS-log type GUID 3EC8FA02-816A-4D04-8718-64C3771C5187.
+pub const LEANDROS_LOG_GUID: [u8; 16] = [
+    0x02, 0xFA, 0xC8, 0x3E, 0x6A, 0x81, 0x04, 0x4D,
+    0x87, 0x18, 0x64, 0xC3, 0x77, 0x1C, 0x51, 0x87,
+];
 /// MBR partition type of a GPT protective entry.
 pub const MBR_PROTECTIVE: u8 = 0xEE;
 
@@ -76,14 +86,14 @@ impl PartType {
     pub fn is_log(&self) -> bool {
         match self {
             PartType::Mbr(t) => *t == MBR_LOG,
-            PartType::Gpt(g) => *g == LOG_GPT_GUID,
+            PartType::Gpt(g) => *g == LOG_GPT_GUID || *g == LEANDROS_LOG_GUID,
         }
     }
     /// True for MBR type 0x83 or the GPT Linux-filesystem GUID.
     pub fn is_linux_fs(&self) -> bool {
         match self {
             PartType::Mbr(t) => *t == MBR_LINUX,
-            PartType::Gpt(g) => *g == LINUX_FS_GUID,
+            PartType::Gpt(g) => *g == LINUX_FS_GUID || *g == LEANDROS_ROOT_GUID,
         }
     }
 }

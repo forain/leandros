@@ -446,12 +446,40 @@ pub fn build(size: u64, uuid: &[u8; 16], time: u64) -> Result<(BTreeMap<u64, Blk
 /// regular file is truncated just past it (the rest of a fresh volume is
 /// zeros); otherwise a regular file is extended to the full size. On a block
 /// device the caller must supply an already-zero (or don't-care) remainder.
+/// First block of the main area (everything below it is metadata: superblocks,
+/// checkpoint, SIT, NAT, SSA). Mirrors the layout math in `build`.
+pub fn main_blkaddr(size: u64) -> u64 {
+    let total_segs = size / (BLOCK as u64 * BPS);
+    let sit_blocks = (total_segs + SIT_PER_BLK - 1) / SIT_PER_BLK;
+    let sit_segs = 2 * ((sit_blocks + BPS - 1) / BPS);
+    let (ckpt_segs, nat_segs) = (2u64, 2u64);
+    let ssa_segs = ssa_segs_for(total_segs, 1 + ckpt_segs + sit_segs + nat_segs);
+    (1 + ckpt_segs + sit_segs + nat_segs + ssa_segs) * BPS
+}
+
+/// Explicitly write zeros over every metadata block `[0, main_blkaddr)` so
+/// stale bytes in the target (e.g. a freed ext4 tail) cannot leak into the SIT,
+/// NAT, SSA or the second checkpoint pack.
+fn zero_meta(f: &mut std::fs::File, off: u64, size: u64) -> io::Result<()> {
+    let end = main_blkaddr(size) * BLOCK as u64;
+    let z = vec![0u8; 1 << 20];
+    let mut pos = 0u64;
+    f.seek(SeekFrom::Start(off))?;
+    while pos < end {
+        let n = (z.len() as u64).min(end - pos) as usize;
+        f.write_all(&z[..n])?;
+        pos += n as u64;
+    }
+    Ok(())
+}
+
 pub fn write_home(path: &Path, size: u64, uuid: &[u8; 16], time: u64, head_only: bool) -> io::Result<u64> {
     let (blocks, total_blocks) = build(size, uuid, time)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let mut f = OpenOptions::new().write(true).create(true).open(path)?;
     let is_file = f.metadata()?.is_file();
     if is_file { f.set_len(0)?; }
+    if !is_file || !head_only { zero_meta(&mut f, 0, size)?; }
     for (n, b) in &blocks {
         f.seek(SeekFrom::Start(n * BLOCK as u64))?;
         f.write_all(b)?;
@@ -465,10 +493,11 @@ pub fn write_home(path: &Path, size: u64, uuid: &[u8; 16], time: u64, head_only:
 }
 
 /// Write the head of a fresh volume of `size` bytes at byte offset `off` of an
-/// open block device (or file). Everything past the head is left alone: the
+/// open block device (or file). Metadata areas are zeroed explicitly; the main area is left alone: the
 /// f2fs server zeroes the blocks it allocates. Returns the bytes written.
 pub fn write_home_at(f: &mut std::fs::File, off: u64, size: u64, uuid: &[u8; 16], time: u64) -> io::Result<u64> {
     let (blocks, _total) = build(size, uuid, time).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    zero_meta(f, off, size)?;
     let mut n = 0;
     for (b, data) in &blocks {
         f.seek(SeekFrom::Start(off + b * BLOCK as u64))?;
@@ -476,4 +505,40 @@ pub fn write_home_at(f: &mut std::fs::File, off: u64, size: u64, uuid: &[u8; 16]
         n += data.len() as u64;
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod zero_tests {
+    use super::*;
+
+    #[test]
+    fn write_home_at_zeroes_metadata_over_garbage() {
+        let size = 128u64 << 20;
+        let dir = std::env::var("GPT_DUMP_DIR").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into());
+        let off = 3u64 << 20;
+        let path = format!("{dir}/home-garbage.img");
+        let mut f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+        f.set_len(off + size).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&vec![0xA5u8; (off + size) as usize]).unwrap();
+        write_home_at(&mut f, off, size, &[7; 16], 1_700_000_000).unwrap();
+        // Reference: full write onto a fresh file.
+        let rp = format!("{dir}/home-ref.img");
+        write_home(Path::new(&rp), size, &[7; 16], 1_700_000_000, false).unwrap();
+        let mb = (main_blkaddr(size) * BLOCK as u64) as usize;
+        let mut got = vec![0u8; mb];
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.read_exact(&mut got).unwrap();
+        let want = std::fs::read(&rp).unwrap();
+        assert!(got == want[..mb], "metadata area differs from a clean build");
+        // Bytes before the window and the main area beyond the head stay as they were.
+        let mut pre = [0u8; 16];
+        f.seek(SeekFrom::Start(off - 16)).unwrap();
+        f.read_exact(&mut pre).unwrap();
+        assert_eq!(pre, [0xA5; 16]);
+        if std::env::var("GPT_DUMP_DIR").is_err() {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&rp);
+        }
+    }
 }
