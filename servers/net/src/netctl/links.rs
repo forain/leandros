@@ -103,5 +103,11 @@ pub fn set_admin(ifindex: u32, up: bool) -> Result<(), i32> {
     if crate::set_iface_admin((ifindex - 2) as u8, up) { Ok(()) } else { Err(errno::ENODEV) }
 }
 
+/// `NETCTL_SET_METRIC`: `metric == 0` restores the default.
+pub fn set_metric(ifindex: u32, metric: u32) -> Result<(), i32> {
+    if ifindex < 2 { return Err(errno::ENODEV); }
+    if crate::iface::set_metric((ifindex - 2) as u8, if metric == 0 { None } else { Some(metric) }) { Ok(()) } else { Err(errno::ENODEV) }
+}
+
 /// `NcVersion.features` bits this adapter provides.
 pub const FEATURES: u32 = features::WIRED_ADMIN;
