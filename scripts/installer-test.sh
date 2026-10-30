@@ -27,6 +27,7 @@ BUS="${2:-virtio}"
 case "$ARCH" in aarch64|x86_64) ;; *) echo "usage: $0 [aarch64|x86_64] [virtio|nvme]"; exit 2 ;; esac
 case "$BUS" in virtio|nvme) ;; *) echo "usage: $0 [aarch64|x86_64] [virtio|nvme]"; exit 2 ;; esac
 TARGET_DEV=/dev/vda; [ "$BUS" = nvme ] && TARGET_DEV=/dev/nvme0n1
+PSEP=""; [ "$BUS" = nvme ] && PSEP=p
 WORK="$ROOT/target/installer-test-$ARCH-$BUS"
 RUN_ID="installer-$ARCH-$BUS"
 PORT=$((2290 + $(printf '%s' "$ARCH$BUS" | cksum | cut -d' ' -f1) % 60))
@@ -162,7 +163,7 @@ boot_vm alone --boot-disk="$TGT,$BUS"
 CMD="$($REMOTE run 'cat /proc/cmdline' | tr -d '\r')"
 case "$CMD" in *"root=PARTUUID=$ROOT_PUUID"*) ok "booted with root=PARTUUID=$ROOT_PUUID" ;; *) fail "cmdline: $CMD" ;; esac
 MNT="$($REMOTE run 'cat /proc/mounts' | tr -d '\r')"
-echo "$MNT" | grep -Eq "^${TARGET_DEV}2 / " || { echo "$MNT" | head -5; fail "root is not ${TARGET_DEV}2"; }
+echo "$MNT" | grep -Eq "^${TARGET_DEV}${PSEP}2 / " || { echo "$MNT" | head -5; fail "root is not ${TARGET_DEV}${PSEP}2"; }
 echo "$MNT" | grep -Eq "^${TARGET_DEV}[p]?4 /home " || { echo "$MNT" | head -8; fail "/home is not on the target"; }
 ok "root and /home mounted from the target"
 # Headless --no-gpu: init declines to start COSMIC (no software rendering) and
@@ -171,7 +172,7 @@ ok "root and /home mounted from the target"
 grep -aq "serial login only\|greetd" "$WORK/alone.log" || fail "userland did not reach the login stage (serial log)"
 ok "userland up (login stage reached)"
 grep -aq "\[BLK\] boot disk: GPT disk GUID $DISK_GUID" "$WORK/alone.log" || fail "serial log: boot disk GUID is not the target's ($DISK_GUID)"
-grep -aq "\[KLOG\] logging to ${TARGET_DEV}3" "$WORK/alone.log" || fail "serial log: klog not on the target's p3"
+grep -aq "\[KLOG\] logging to ${TARGET_DEV}${PSEP}3" "$WORK/alone.log" || fail "serial log: klog not on the target's p3"
 ok "serial log: boot disk GUID and klog partition are the target's"
 grep -aq 'panic' "$WORK/alone.log" && fail "panic in the serial log"
 stop_vm
@@ -182,7 +183,7 @@ LEANDROS_USB_IMAGE="$STICK" boot_vm both --boot-disk="$TGT,$BUS" --usb-stick=gpt
 CMD="$($REMOTE run 'cat /proc/cmdline' | tr -d '\r')"
 case "$CMD" in *"root=PARTUUID=$ROOT_PUUID"*) ;; *) fail "cmdline with stick: $CMD" ;; esac
 MNT="$($REMOTE run 'cat /proc/mounts' | tr -d '\r')"
-echo "$MNT" | grep -Eq "^${TARGET_DEV}2 / " || { echo "$MNT" | head -5; fail "with the stick attached, root is not ${TARGET_DEV}2"; }
+echo "$MNT" | grep -Eq "^${TARGET_DEV}${PSEP}2 / " || { echo "$MNT" | head -5; fail "with the stick attached, root is not ${TARGET_DEV}${PSEP}2"; }
 echo "$MNT" | grep -Eq "^${TARGET_DEV}[p]?4 /home " || { echo "$MNT" | head -8; fail "with the stick attached, /home is not on the target"; }
 ok "stick attached: root and /home still come from the target"
 stop_vm
