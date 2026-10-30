@@ -2823,6 +2823,20 @@ def main():
     else:
         print(f"  (no xdg-desktop-portal staged: {_xdp_root} missing — ports/portal/build.sh {arch})")
 
+    # ── GStreamer (optional, ports/gstreamer) ───────────────────────────────
+    # Alpine 3.21's GStreamer 1.24 + plugins-base/good + gst-libav + the
+    # PipeWire plugin (cosmic-player's media stack), gst-launch/inspect, and a
+    # short test clip. Shared libs (GLib, FFmpeg) are byte-identical to the
+    # Firefox/PipeWire ports' copies, so overlaying them is free. Same overlay rules.
+    _gst_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "..", "ports", "gstreamer", "out", arch))
+    if os.path.isfile(os.path.join(_gst_root, "usr", "lib", "libgstreamer-1.0.so.0")):
+        _gst_n, _gst_bytes, _gst_won = _overlay_port_tree(_gst_root)
+        print(f"  GStreamer: {_gst_n} file(s), {_gst_bytes // (1024 * 1024)} MiB "
+              f"from {_gst_root}; image copy kept for {len(_gst_won)}: {' '.join(sorted(_gst_won))}")
+    else:
+        print(f"  (no GStreamer staged: {_gst_root} missing — ports/gstreamer/build.sh {arch})")
+
     # ── apk-tools (optional, ports/apk) ──────────────────────────────────────
     # /usr/sbin/apk.static (static, runs as-is), /usr/sbin/alpine-sysroot, the
     # Alpine keys + 3.21 repositories under /etc/apk, and a CA bundle at
