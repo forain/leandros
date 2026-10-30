@@ -30,8 +30,7 @@ this page is the explanation.
   power applet's Lock is a no-op (no screen locker exists) and its log-out path to the greeter
   is unverified on hardware. Power off and restart from the greeter and from a user session
   work through login1.
-- **Applets without a backing service or config.** The workspaces applet is staged but the
-  default panel config does not launch it. The battery applet shows data only where the
+- **Applets without a backing service.** The battery applet shows data only where the
   kernel exports a power_supply class (the laptop's ACPI battery); QEMU shows none. The
   Bluetooth applet depends on an adapter (`/dev/hci0`) and the `org.bluez` shim, and is only
   checked against the shim, not yet in a live session on hardware.
