@@ -34,6 +34,7 @@ mod blk;
 mod input;
 mod wifi;
 mod drm;
+mod gfx;
 mod plat;
 
 pub use pci::*;
@@ -45,6 +46,7 @@ pub use blk::*;
 pub use input::*;
 pub use wifi::*;
 pub use drm::*;
+pub use gfx::*;
 pub use plat::*;
 pub use v4l2::*;
 pub use usbfn::*;
@@ -160,6 +162,13 @@ const _: kmod_abi::input::sys_input::InputLedsFn = kapi_input_leds;
 const _: kmod_abi::input::sys_input::InputRepeatFn = kapi_input_repeat;
 const _: kmod_abi::input::sys_input::RelPointerReportFn = kapi_rel_pointer_report;
 const _: kmod_abi::input::sys_input::RelPointerAdvertiseFn = kapi_rel_pointer_advertise;
+const _: unsafe extern "C" fn(*mut kmod_abi::KBootFb) -> bool = kapi_boot_fb;
+const _: unsafe extern "C" fn(KmodId, Option<kmod_abi::KBlGetFn>, Option<kmod_abi::KBlSetFn>, usize) -> i32 = kapi_backlight_register;
+const _: unsafe extern "C" fn(*const usize, usize) = kapi_page_ref_many;
+const _: unsafe extern "C" fn(u64, u32) -> bool = kapi_page_free_pinned;
+const _: unsafe extern "C" fn(*mut u64) = kapi_mem_info;
+const _: unsafe extern "C" fn() -> u64 = kapi_irq_save;
+const _: unsafe extern "C" fn(u64) = kapi_irq_restore;
 const _: sys::V4l2UnregisterFn = kapi_v4l2_unregister;
 const _: kmod_abi::plat::sys_plat::PlatRegisterFn = kapi_plat_register;
 const _: kmod_abi::plat::sys_plat::PlatUnregisterFn = kapi_plat_unregister;
@@ -177,7 +186,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 132;
+pub const NEXPORTS: usize = 139;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -227,6 +236,13 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_drm_hotplug", kapi_drm_hotplug),
     sym!("kapi_ext_present_stats", kapi_ext_present_stats),
     sym!("kapi_tmpfs_census", kapi_tmpfs_census),
+    sym!("kapi_boot_fb", kapi_boot_fb),
+    sym!("kapi_backlight_register", kapi_backlight_register),
+    sym!("kapi_page_ref_many", kapi_page_ref_many),
+    sym!("kapi_page_free_pinned", kapi_page_free_pinned),
+    sym!("kapi_mem_info", kapi_mem_info),
+    sym!("kapi_irq_save", kapi_irq_save),
+    sym!("kapi_irq_restore", kapi_irq_restore),
     sym!("kapi_netdev_kick", kapi_netdev_kick),
     sym!("kapi_snd_register", kapi_snd_register),
     sym!("kapi_netdev_kick_from_irq", kapi_netdev_kick_from_irq),

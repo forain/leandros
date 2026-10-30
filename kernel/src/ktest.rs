@@ -805,6 +805,7 @@ fn t_kmodkapi() -> T {
     kmodkapi_l7a(&mut t);
     kmodkapi_w2(&mut t);
     kmodkapi_k2a(&mut t);
+    kmodkapi_k2b(&mut t);
     t
 }
 
@@ -2006,4 +2007,80 @@ fn kmodkapi_k2a(t: &mut T) {
     drivers::drm_class::set_tmpfs_census(census);
     let mut cen = [0u64; 9];
     t.check(exports::kapi_tmpfs_census(cen.as_mut_ptr()) && cen[8] == 9 && !exports::kapi_tmpfs_census(core::ptr::null_mut()), "k2a: tmpfs_census registered late is read at use time");
+}
+
+static KT_BL_DUTY: AtomicU32 = AtomicU32::new(0);
+extern "C" fn kt_bl_get(ctx: usize, duty: *mut u32, period: *mut u32) -> bool {
+    unsafe { *duty = KT_BL_DUTY.load(Ordering::SeqCst); *period = ctx as u32; }
+    true
+}
+extern "C" fn kt_bl_set(_ctx: usize, duty: u32) -> bool { KT_BL_DUTY.store(duty, Ordering::SeqCst); true }
+
+fn kmodkapi_k2b(t: &mut T) {
+    use crate::kmod::{exports, registry};
+    use kmod_abi::{KBootFb, KmodId, RegKind};
+    for n in ["kapi_boot_fb", "kapi_backlight_register", "kapi_page_ref_many", "kapi_page_free_pinned", "kapi_mem_info", "kapi_irq_save", "kapi_irq_restore"] {
+        t.check(exports::lookup(n).is_some(), "k2b export in KSYMTAB");
+    }
+    // boot framebuffer
+    t.check(!exports::kapi_boot_fb(core::ptr::null_mut()), "k2b: boot_fb null out = false");
+    let saved = { let mut f = KBootFb::default(); if exports::kapi_boot_fb(&mut f) { Some(f) } else { None } };
+    exports::set_boot_fb(0x1234_0000, 640, 480, 2560);
+    let mut f = KBootFb::default();
+    t.check(exports::kapi_boot_fb(&mut f) && f.phys == 0x1234_0000 && f.width == 640 && f.height == 480 && f.pitch == 2560, "k2b: boot_fb round trip");
+    if let Some(o) = saved { exports::set_boot_fb(o.phys, o.width, o.height, o.pitch); }
+
+    // backlight: per-owner records, withdrawn on failed init
+    let a = KmodId(60030);
+    let b = KmodId(60031);
+    t.check(exports::kapi_backlight_register(a, None, None, 0) == -22, "k2b: backlight without callbacks = -22");
+    let ctxa = 1000usize;
+    t.check(exports::kapi_backlight_register(a, Some(kt_bl_get), Some(kt_bl_set), ctxa) == 0, "k2b: backlight register ok");
+    t.check(exports::kapi_backlight_register(b, Some(kt_bl_get), Some(kt_bl_set), 2000) == 0, "k2b: second owner registers");
+    let mut seen = false;
+    registry::registrations(a, &mut |k, _| if k == RegKind::BACKLIGHT { seen = true });
+    t.check(seen, "k2b: backlight registration recorded for owner");
+    t.check(drivers::power_sysfs::bl_get().map_or(false, |(d, p)| d == 0 && (p == 1000 || p == 2000)), "k2b: bl_get answered by a module provider");
+    t.check(drivers::power_sysfs::bl_set(321) && KT_BL_DUTY.load(Ordering::SeqCst) == 321, "k2b: bl_set reaches the provider");
+    t.check(drivers::power_sysfs::bl_count(a.0 as u32) == 1 && drivers::power_sysfs::bl_count(b.0 as u32) == 1, "k2b: one record per owner");
+    t.check(registry::release_all(a) && drivers::power_sysfs::bl_count(a.0 as u32) == 0 && drivers::power_sysfs::bl_count(b.0 as u32) == 1, "k2b: failed init withdraws only its owner's provider");
+    registry::release_all(b);
+    t.check(drivers::power_sysfs::bl_count(b.0 as u32) == 0, "k2b: second owner withdrawn");
+
+    // page references
+    let p = exports::kapi_page_alloc(1, 0);
+    t.check(p != 0, "k2b: page_alloc order 1");
+    if p != 0 {
+        let p0 = p as usize;
+        let frames = [p0];
+        exports::kapi_page_ref_many(frames.as_ptr(), 1);
+        exports::kapi_page_ref_many(core::ptr::null(), 4);
+        t.check(mm::pageref::get(p0) == 2 && mm::pageref::get(p0 + 4096) == 1, "k2b: ref_many counts the listed frame only");
+        let free0 = mm::buddy::free_pages();
+        t.check(exports::kapi_page_free_pinned(p, 1), "k2b: free_pinned reports a still-held page");
+        t.check(mm::pageref::get(p0) == 1 && mm::buddy::free_pages() == free0 + 1, "k2b: free_pinned dropped our ref and freed the unheld page");
+        exports::kapi_page_free(p, 0);
+        t.check(mm::buddy::free_pages() == free0 + 2, "k2b: last holder frees the held page");
+    }
+    let q = exports::kapi_page_alloc(0, 0);
+    if q != 0 {
+        let fq = mm::buddy::free_pages();
+        t.check(!exports::kapi_page_free_pinned(q, 0) && mm::buddy::free_pages() == fq + 1, "k2b: free_pinned on an unshared block frees it whole");
+    }
+
+    // memory totals
+    let mut mi = [0u64; 3];
+    exports::kapi_mem_info(mi.as_mut_ptr());
+    t.check(mi[0] > 0 && mi[1] <= mi[0] && mi[2] == 4096, "k2b: mem_info totals sane");
+    exports::kapi_mem_info(core::ptr::null_mut());
+
+    // irq save/restore nests
+    let was = exports::kapi_irqs_masked();
+    let f1 = exports::kapi_irq_save();
+    let m1 = exports::kapi_irqs_masked();
+    let f2 = exports::kapi_irq_save();
+    exports::kapi_irq_restore(f2);
+    let m2 = exports::kapi_irqs_masked();
+    exports::kapi_irq_restore(f1);
+    t.check(m1 && m2 && exports::kapi_irqs_masked() == was, "k2b: irq_save masks, nested restore keeps mask, outer restore returns to the prior state");
 }

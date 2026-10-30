@@ -24,6 +24,6 @@ pub fn ptecheck_fd_to_handle(fd: i32, open_id: u32, obj: Option<u32>, handle: u3
 pub fn ptecheck_dmabuf_mmap(obj: u32, off: u64, frames: &[usize]) { crate::drm_class::ptecheck_dmabuf_mmap(obj, off, frames) }
 
 pub mod backlight {
-    pub fn get() -> Option<(u32, u32)> { None }
-    pub fn set(_duty: u32) -> bool { false }
+    pub fn get() -> Option<(u32, u32)> { crate::power_sysfs::bl_get() }
+    pub fn set(duty: u32) -> bool { crate::power_sysfs::bl_set(duty) }
 }
