@@ -64,6 +64,7 @@ use netctl_abi::{
 
 use crate::wifi_api::{ConnectParams, IfIndex, Secret, WifiBackend, WifiCmd, WifiEvent};
 use crate::wifi_frame as wf;
+pub use crate::wifi_radio::{ConnCtx, Fail, KConnCtx, Radio, ScanHit};
 
 // ── RSN suite selectors (OUI 00-0f-ac || type, big-endian) ─────────────────
 
@@ -262,39 +263,6 @@ fn msleep(ms: u64) { sched::kthread::msleep(ms) }
 
 // ── what a radio reports ────────────────────────────────────────────────────
 
-/// One BSS seen by a scan.
-#[derive(Clone, Debug)]
-pub struct ScanHit {
-    pub bss: wf::Bss,
-    pub rssi: i8,
-}
-
-/// Why an attempt or a link ended.
-#[derive(Clone, Debug)]
-pub struct Fail {
-    /// `netctl_abi::reason`.
-    pub reason: u8,
-    /// 802.11 status code (auth/assoc response), 0 = none.
-    pub ieee_status: u16,
-    /// 802.11 reason code (deauth/disassoc), 0 = none.
-    pub ieee_reason: u16,
-    /// The firmware asserted (the radio must be restarted).
-    pub fw_assert: bool,
-    pub msg: String,
-}
-
-impl Fail {
-    pub fn new(reason: u8, msg: impl Into<String>) -> Fail {
-        Fail { reason, ieee_status: 0, ieee_reason: 0, fw_assert: false, msg: msg.into() }
-    }
-    pub fn status(mut self, s: u16) -> Fail { self.ieee_status = s; self }
-    pub fn ieee_reason(mut self, r: u16) -> Fail { self.ieee_reason = r; self }
-    pub fn fw_assert(msg: impl Into<String>) -> Fail {
-        Fail { reason: reason::FW_ERROR, ieee_status: 0, ieee_reason: 0, fw_assert: true, msg: msg.into() }
-    }
-    pub fn superseded() -> Fail { Fail::new(reason::SUPERSEDED, "preempted by a newer command") }
-}
-
 /// The 4-way handshake ended without keys: decide between a wrong secret
 /// and a plain timeout. The pattern of a wrong passphrase on WPA2-PSK is
 /// that the AP sent message 1, got our message 2, could not verify its MIC
@@ -324,66 +292,6 @@ pub fn handshake_failure_ev(msg2_sent: bool, mic_suspect: Option<bool>, deauth_r
         None if msg2_sent => Fail::new(reason::WRONG_KEY, "4-way handshake timed out after message 2: wrong passphrase"),
         None => Fail::new(reason::TIMEOUT, "no EAPOL message 1 from the AP"),
     }
-}
-
-/// Context a radio's `connect` gets: progress reports and preemption.
-pub struct ConnCtx<'a> {
-    mgr: &'a Mgr,
-    deadline_ms: u64,
-}
-
-impl ConnCtx<'_> {
-    /// Report the next step (AUTHENTICATING, ASSOCIATING, HANDSHAKE).
-    pub fn step(&self, state: u8) { self.mgr.set_step(state); }
-    /// A newer command (Connect, Disconnect, radio off) is waiting, or the
-    /// attempt ran past `CONNECT_DEADLINE_MS`: stop and return
-    /// [`Fail::superseded`] (or a TIMEOUT).
-    pub fn aborted(&self) -> bool { self.mgr.preempt_pending() }
-    /// Milliseconds left of the attempt's overall deadline.
-    pub fn left_ms(&self) -> u64 { self.deadline_ms.saturating_sub(now_ms()) }
-    /// Sleep up to `ms`, waking early when preempted. False when preempted.
-    pub fn sleep(&self, ms: u64) -> bool {
-        let t0 = now_ms();
-        while now_ms() - t0 < ms {
-            if self.aborted() { return false; }
-            msleep((ms - (now_ms() - t0)).min(20).max(1));
-        }
-        !self.aborted()
-    }
-}
-
-/// What a Wi-Fi driver provides to [`run`].
-pub trait Radio {
-    /// `netctl_abi::wifi_caps`.
-    fn caps(&self) -> u32;
-    /// Scan: wildcard plus directed probes for `ssids`. `connected` is true
-    /// when associated (only called then if caps has SCAN_CONNECTED).
-    fn scan(&mut self, ssids: &[Vec<u8>], connected: bool) -> Result<Vec<ScanHit>, Fail>;
-    /// Authenticate, associate and (unless `akm == NONE`) run the 4-way
-    /// handshake with `secret`; on success the data path is open.
-    fn connect(&mut self, hit: &ScanHit, ssid: &[u8], akm: u8, secret: &[u8], cx: &ConnCtx) -> Result<(), Fail>;
-    /// Associated: service the link for up to `budget_ms`. `Some` when it
-    /// went away (deauth by AP, beacon loss, firmware error).
-    fn poll_connected(&mut self, budget_ms: u64) -> Option<Fail>;
-    /// Fast part of leaving (a few ms): close the data path, send a
-    /// deauthentication when associated (`deauth`).
-    fn leave(&mut self, deauth: bool);
-    /// Slow part, after the state was reported: put the firmware back into a
-    /// clean unassociated state (a restart after `after.fw_assert`). False
-    /// when the device is gone for good.
-    fn settle(&mut self, after: Option<&Fail>) -> bool;
-    /// Idle: service the device for up to `ms`.
-    fn idle(&mut self, ms: u64);
-    /// Soft radio switch.
-    fn set_radio(&mut self, on: bool) -> bool;
-    /// Hardware kill switch engaged.
-    fn hw_rfkill(&mut self) -> bool { false }
-    /// The kill switch was released: bring the radio back (false = dead).
-    fn rfkill_released(&mut self) -> bool { self.settle(None) }
-    /// Current signal of the associated BSS.
-    fn signal(&mut self) -> Option<i8> { None }
-    /// TX rate in kbit/s, 0 = unknown.
-    fn tx_rate_kbps(&mut self) -> u32 { 0 }
 }
 
 // ── BSS → NcBss ─────────────────────────────────────────────────────────────
@@ -705,6 +613,9 @@ pub struct Mgr {
     /// The radio thread's wake-up (`set_waker`): a queued command ends a
     /// long park instead of waiting for it.
     waker: AtomicUsize,
+    /// Registered radios: the `kick` callback and its context.
+    waker_raw: Mutex<Option<(extern "C" fn(usize), usize)>>,
+    fixed_mac: Mutex<Option<[u8; 6]>>,
     st: Mutex<St>,
     events: Mutex<(u64, VecDeque<(u64, u64, WifiEvent)>)>,
     ifname: Mutex<[u8; 16]>,
@@ -717,6 +628,8 @@ impl Mgr {
             ifindex: AtomicU32::new(0),
             cmds: Mutex::new(VecDeque::new()),
             waker: AtomicUsize::new(0),
+            waker_raw: Mutex::new(None),
+            fixed_mac: Mutex::new(None),
             st: Mutex::new(St {
                 ws: NcWifiState {
                     ifindex: 0, state: wifi_state::UNAVAILABLE, reason: reason::NONE, akm: akm::AUTO, pmf: 0,
@@ -856,6 +769,8 @@ impl Mgr {
     // ── commands ──
 
     /// Called after every queued command (the radio thread may be parked).
+    pub fn set_waker_raw(&self, f: extern "C" fn(usize), arg: usize) { *self.waker_raw.lock() = Some((f, arg)); }
+    pub fn set_mac(&self, m: [u8; 6]) { *self.fixed_mac.lock() = Some(m); }
     pub fn set_waker(&self, f: fn()) { self.waker.store(f as usize, Ordering::Release); }
 
     fn pop_cmd(&self) -> Option<WifiCmd> { self.cmds.lock().pop_front() }
@@ -1198,7 +1113,7 @@ impl Mgr {
 impl WifiBackend for Mgr {
     fn driver(&self) -> &'static str { self.name }
     fn caps(&self) -> u32 { self.st.lock().caps }
-    fn mac(&self) -> Option<[u8; 6]> { (self.mac_fn)() }
+    fn mac(&self) -> Option<[u8; 6]> { if let Some(m) = *self.fixed_mac.lock() { return Some(m); } (self.mac_fn)() }
 
     fn submit(&self, cmd: WifiCmd) -> Result<(), i32> {
         use netctl_abi::errno;
@@ -1235,6 +1150,8 @@ impl WifiBackend for Mgr {
             let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(w) };
             f();
         }
+        let raw = *self.waker_raw.lock();
+        if let Some((f, a)) = raw { f(a); }
         Ok(())
     }
 
@@ -1322,6 +1239,22 @@ impl Req {
 
 /// The driver thread's loop once the radio is up (never returns while the
 /// device lives). `mgr` must be the radio's own manager.
+/// What a radio's `ConnCtx` calls back into during `connect`.
+struct CxBack<'m> { mgr: &'m Mgr, deadline_ms: u64 }
+fn cxb<'a>(c: usize) -> &'a CxBack<'a> { unsafe { &*(c as *const CxBack) } }
+extern "C" fn cx_step(c: usize, s: u8) { cxb(c).mgr.set_step(s); }
+extern "C" fn cx_aborted(c: usize) -> bool { cxb(c).mgr.preempt_pending() }
+extern "C" fn cx_left_ms(c: usize) -> u64 { cxb(c).deadline_ms.saturating_sub(now_ms()) }
+extern "C" fn cx_sleep(c: usize, ms: u64) -> bool {
+    let b = cxb(c);
+    let t0 = now_ms();
+    while now_ms() - t0 < ms {
+        if b.mgr.preempt_pending() { return false; }
+        msleep((ms - (now_ms() - t0)).min(20).max(1));
+    }
+    !b.mgr.preempt_pending()
+}
+
 pub fn run<R: Radio>(mgr: &'static Mgr, r: &mut R) {
     mgr.set_caps(r.caps());
     {
@@ -1593,7 +1526,9 @@ fn attempt<R: Radio>(mgr: &Mgr, r: &mut R, req: Req) -> After {
     }
     mgr.log(&alloc::format!("connecting to '{}' {} ch {} ({} dBm, akm {}){}", wf::ssid_display(&req.ssid), fmt_mac(&nc.bssid),
                             nc.channel, nc.signal_dbm, akm_name(a), if req.auto { " [auto]" } else { "" }));
-    let cx = ConnCtx { mgr, deadline_ms: t0 + netctl_abi::CONNECT_DEADLINE_MS as u64 };
+    let back = CxBack { mgr, deadline_ms: t0 + netctl_abi::CONNECT_DEADLINE_MS as u64 };
+    let raw = KConnCtx { ctx: &back as *const CxBack as usize, step: cx_step, aborted: cx_aborted, left_ms: cx_left_ms, sleep: cx_sleep };
+    let cx = ConnCtx::from_raw(&raw);
     mgr.set_state(wifi_state::AUTHENTICATING, reason::NONE);
     let res = r.connect(&hit, &req.ssid, a, req.secret.as_bytes(), &cx);
     if let Err(f) = res {

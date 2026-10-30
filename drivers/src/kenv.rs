@@ -27,3 +27,9 @@ pub mod input {
     pub fn register_stats_hook(f: fn(&mut dyn core::fmt::Write)) { ::tty_server::vt::register_stats_hook(f) }
     pub fn vt_handoff_stats() -> (u64, u64) { crate::drm_device_interface::vt_handoff_stats() }
 }
+
+/// Hand a radio table to the kernel's Wi-Fi class (the module build calls `kapi_wifi_register`).
+#[cfg(feature = "wifi-stack")]
+pub fn wifi_register(ops: &crate::wifi_radio::KWifiRadioOps, ctx: usize, legacy: *const crate::wifi_radio::KLegacy) -> i32 {
+    crate::wifi_class::register_raw(ops, ctx, legacy)
+}
