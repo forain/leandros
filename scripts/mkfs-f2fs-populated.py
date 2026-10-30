@@ -1719,6 +1719,16 @@ def main():
         else:
             print(f"  WARNING: {_appbin} absent, no {_app} in the Applications menu: "
                   f"./ports/cosmic-apps/build.sh {arch} {_app}")
+    # LeandrOS installer GUI (ports/leandros-installer): /bin binary + launcher
+    # entry, or neither. Uses a stock themed icon, so no hicolor dir.
+    _inst = m6_pick(f"{m6_out}/leandros-installer-{arch}")
+    if os.path.exists(_inst):
+        bin_files.append(("leandros-installer", _inst, 0o100755))
+        m4_share_dirs.add("/usr/share/applications")
+        m4_share_files.append(("/usr/share/applications", "com.leandros.Installer.desktop",
+                               "ports/leandros-installer/com.leandros.Installer.desktop"))
+    else:
+        print(f"  WARNING: {_inst} absent, no installer GUI: ./ports/leandros-installer/build.sh {arch}")
     real_time_applet = False
     # The rest of the panel's applets (Time, Battery, Notifications, Status Area,
     # Workspaces, Input Sources, A11y) and the dock's App List: unmodified
