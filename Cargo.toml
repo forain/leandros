@@ -28,6 +28,7 @@ members = [
     "modules/hello",
     "modules/virtio-rng",
     "modules/e1000e",
+    "modules/virtio-net",
     "modules/uvc",
     "scripts/kmod/fixtures/badsym",
     "scripts/kmod/fixtures/baddep",

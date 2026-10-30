@@ -149,6 +149,29 @@ pub mod pci {
         })
     }
 
+    /// Every function with this vendor/device id (kapi_pci_find walks them by index).
+    pub fn find_all_devices(vendor_id: u16, device_id: u16) -> alloc::vec::Vec<PciDevice> {
+        let mut v = alloc::vec::Vec::new();
+        for index in 0..64u32 {
+            let mut k = KPciDev::default();
+            if unsafe { sys::kapi_pci_find(vendor_id, device_id, index, &mut k) } != 0 { break; }
+            v.push(PciDevice {
+                bus: (k.bdf >> 16) as u8, dev: (k.bdf >> 8) as u8, func: k.bdf as u8,
+                vendor_id: k.vendor, device_id: k.device,
+                class: (k.class >> 16) as u8, subclass: (k.class >> 8) as u8, prog_if: k.class as u8,
+                bars: k.bars,
+            });
+        }
+        v
+    }
+
+    pub fn serial_debug_hex(v: u32) {
+        let mut b = [0u8; 10];
+        b[0] = b'0'; b[1] = b'x';
+        for i in 0..8 { b[2 + i] = b"0123456789abcdef"[((v >> (28 - 4 * i)) & 0xf) as usize]; }
+        serial_debug(core::str::from_utf8(&b).unwrap_or(""));
+    }
+
     pub unsafe fn pci_read_config_8(bus: u8, dev: u8, func: u8, off: u8) -> u8 {
         sys::kapi_pci_cfg_read(bdf(bus, dev, func), off as u16, 1) as u8
     }
@@ -334,6 +357,22 @@ pub mod irq {
     pub fn request_irq(src: IrqSource, h: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
         let IrqSource::Line(_) = src;
         request_line(super::pci::intx_bdf(), h, ctx)
+    }
+
+    /// MSI-X of one function (x86_64): the kernel enables the table on the first request.
+    #[derive(Clone, Copy, Debug)]
+    pub struct MsixTable { bdf: u32 }
+    impl MsixTable {
+        pub fn enable(func: super::pci::PciFunction) -> Result<MsixTable, IrqError> {
+            if func.find_capability(super::pci::cap::MSIX).is_none() { return Err(IrqError::NotFound); }
+            Ok(MsixTable { bdf: func.bdf() })
+        }
+        pub fn request(&self, entry: u16, h: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
+            match super::sys_common::irq_request_msix(self.bdf, entry, raw(h), ctx) {
+                Ok(v) => Ok(IrqHandle { vector: Some(v), line: None }),
+                Err(e) => Err(err(e)),
+            }
+        }
     }
 
     /// Single-vector MSI on the function `bdf`.
