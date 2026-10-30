@@ -128,6 +128,10 @@ Known gaps:
 | [cosmic-comp](../../ports/cosmic-comp/) | the one approved COSMIC patch (closed-window texture leak) and its build | [README.md](../../ports/cosmic-comp/README.md) |
 | [cosmic-wgpu](../../ports/cosmic-wgpu/) | rebuilds the libcosmic clients with iced's wgpu renderer, by feature flags only | [build-wgpu-clients.sh](../../ports/cosmic-wgpu/build-wgpu-clients.sh) |
 | [pop-launcher](../../ports/pop-launcher/) | the launcher's search backend, unmodified | [README.md](../../ports/pop-launcher/README.md) |
+| [cosmic-applets-panel](../../ports/cosmic-applets-panel/) | the upstream panel applets (time, battery, notifications, status-area, workspaces, input-sources, a11y, app-list) with their `.desktop` files, staged together or not at all | [build.sh](../../ports/cosmic-applets-panel/build.sh), [../desktop/session.md](../desktop/session.md#the-panel-and-its-applets) |
+| [cosmic-applet-power](../../ports/cosmic-applet-power/), [cosmic-applet-bluetooth](../../ports/cosmic-applet-bluetooth/) | the power and Bluetooth applets; the latter links `libdbus-1.so.3` from [libdbus](../../ports/libdbus/) (client library only, sha256-pinned) | [../desktop/session.md](../desktop/session.md#the-panel-and-its-applets) |
+| [cosmic-apps](../../ports/cosmic-apps/) | cosmic-files, cosmic-edit and cosmic-screenshot (epoch-1.3.0, no gvfs or io-uring) with icons | [../desktop/session.md](../desktop/session.md#the-panel-and-its-applets) |
+| [ripgrep](../../ports/ripgrep/) | `rg`, behind the `grep` shim | [programs.md](programs.md) |
 | [portal](../../ports/portal/) | xdg-desktop-portal frontend (Alpine) + xdg-desktop-portal-cosmic (cross-built, unmodified) | [build.sh](../../ports/portal/build.sh), [../desktop/session.md](../desktop/session.md#the-desktop-portal) |
 | [apk](../../ports/apk/) | `apk.static`, `alpine-sysroot`, Alpine keys/repositories and a CA bundle for in-guest builds; `claude-code-install` and its `claude` launcher | [build.sh](../../ports/apk/build.sh), [In-guest builds](#in-guest-builds-apk-without-containers), [below](#the-claude-code-cli) |
 | [git](../../ports/git/) | git 2.47 + git-remote-https, less, nano, OpenSSH's `sftp-server` and `/etc/terminfo`, repackaged from Alpine 3.21 like PipeWire; symlinks in the staged tree become hard links in the image | [build-in-alpine.sh](../../ports/git/build-in-alpine.sh), [programs.md](programs.md#sshd) |
@@ -201,6 +205,10 @@ Known gaps:
   that would have kept the kernel spool full and spun a CPU.
 - **sysbus** is one binary with one subcommand per service, so busd's `.service` files are
   the whole configuration; mkfs refuses an image whose `.service` `Exec=` is missing or stale.
+
+**The portal build cache.** `ports/portal/build-backend.sh` used to put worktree paths (`out/stub-<arch>`, `out/sdk-<arch>`) into cargo's rustflags, which are part of a unit's hash; with one shared `CARGO_TARGET_DIR` every lane worktree produced a complete second set of hashes, and the cache grew to 236 GB. The SDK and stub directories are now reached through symlinks under `$CACHE/portal-stable/<arch>/`, refreshed on each build, so the flags are worktree-independent (a second worktree builds in 0.71 s with one hash). A guard wipes `deps`, `.fingerprint` and `build` when more than three `xdg_desktop_portal_cosmic` `.d` files accumulate. After one full build the cache is 2.5 GB. busd's shared target is path-free and unaffected. If the disk fills, check `~/Library/Caches/leandros-ports` first.
+
+**greetd staging.** greetd is built into a hash directory of the `pam-leandros` source, and mkfs builds it when missing; see [../desktop/login.md](../desktop/login.md#login-diagnostics-and-the-greetd-build-cache).
 
 ### Data ports
 
