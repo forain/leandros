@@ -8,3 +8,10 @@ OPEN: with pipewiresink (needs GST_PLUGIN_FEATURE_RANK=pipewiresink:PRIMARY; aut
 "waiting for pool to become active", PipeWire nodes stay suspended, cycles do not advance. Same sink works in a hand-built audio pipeline. Not yet isolated (playbin audio chain vs video preroll vs pipewire thread-loop).
 Gaps logged: serial shell PATH lacks /usr/bin; `pkill`/`timeout` missing in the guest shell; grep is ripgrep.
 Not done: x86_64, regress, merge.
+
+## Update gstport2 (root cause FOUND + FIXED, S3 goal met)
+Stall = upstream gst-plugin-pipewire 1.2.7 deadlock, not our OS: on_param_changed (runs on the PW loop thread holding the thread-loop lock) waits for pool activation; the streaming thread in setcaps() needs that lock back after its timed wait, and only a buffer reaching render() activates the pool. Whoever wins the lock after the "paused" signal decides; audio-only/uridecodebin pipelines happened to win, playbin and cosmic-player's first launch lost (second launch won). Also do_start() signals the cond before the pool active flag is set (lost wake-up).
+Fix: libgstpipewire is rebuilt in ports/gstreamer/build-in-alpine.sh from vendored sources ports/gstreamer/data/gst-pipewire-1.2.7 (patched gstpipewiresink.c: drop the loop lock while waiting, poll 5 ms). No COSMIC source touched.
+Evidence (fresh boot, first cosmic-player launch): sink cycles 1 -> 471 -> 941 -> 1880 over ~30 s, process alive, 0 panics, clip played to EOS.
+Isolation record: playbin+fakesink video stalled in default flags; flags=0x3/0x12/0x217/0x417 and uridecodebin+two sinks passed (timing); pipewire*:5 debug changes the race.
+gstsession.py: fixed rg-incompatible grep -h, added --no-s3, S3 now samples 4 times.

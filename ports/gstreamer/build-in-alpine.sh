@@ -17,7 +17,7 @@ esac
   set -e
   grep -q '^3\.21\.' /etc/alpine-release || { echo "want Alpine 3.21"; exit 3; }
   PKGS="gstreamer gstreamer-tools gst-plugins-base gst-plugins-good gst-libav gst-plugin-pipewire"
-  DEVPKGS="gstreamer-dev gst-plugins-base-dev glib-dev util-linux-dev pcre2-dev"
+  DEVPKGS="pipewire-dev gstreamer-dev gst-plugins-base-dev glib-dev util-linux-dev pcre2-dev"
   if [ "$(uname -m)" = "$ARCH" ]; then
     R=""; APK="apk"
     apk add --no-cache $PKGS $DEVPKGS binutils file patchelf build-base >/dev/null
@@ -47,6 +47,15 @@ esac
     f="$R/usr/lib/gstreamer-1.0/libgst$p.so"
     if [ -e "$f" ]; then cp -L "$f" "$S/usr/lib/gstreamer-1.0/"; else echo "plugin not in alpine: $p"; fi
   done
+  # libgstpipewire rebuilt from the vendored 1.2.7 sources: upstream's pool-activation
+  # wake-up is lost (data/gst-pipewire-1.2.7/gstpipewiresink.c, on_param_changed).
+  G=/tmp/gstpw-$ARCH; rm -rf "$G"; mkdir -p "$G"; mkdir -p "$G/gst"; cp /src/data/gst-pipewire-1.2.7/*.[ch] "$G/gst/"; ln -s gst/gstpipewire.c "$G/x" 2>/dev/null; rm -f "$G/x"
+  printf '#define PACKAGE "pipewire"\n#define PACKAGE_VERSION "1.2.7"\n#define HAVE_GSTREAMER_DEVICE_PROVIDER 1\n' > "$G/config.h"; cp "$G/config.h" "$G/gst/config.h"
+  INC=""; for i in gstreamer-1.0 glib-2.0 pipewire-0.3 spa-0.2 ../lib/glib-2.0/include; do INC="$INC -I$R/usr/include/$i"; done
+  $CC -shared -fPIC -O2 -DHAVE_CONFIG_H -DGST_USE_UNSTABLE_API -I"$G" $INC "$G"/gst/gstpipewire*.c \
+    -L"$R/usr/lib" -lgstvideo-1.0 -lgstaudio-1.0 -lgstallocators-1.0 -lgstbase-1.0 -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0 -lpipewire-0.3 \
+    -o "$S/usr/lib/gstreamer-1.0/libgstpipewire.so"
+  echo "libgstpipewire rebuilt with the pool wake-up fix"
   ls "$S/usr/lib/gstreamer-1.0" | tr '\n' ' '; echo
   # -- closure ------------------------------------------------------------------
   is_excluded() {

@@ -198,14 +198,16 @@ def main():
     log("S2 videotestsrc: " + sh(ENV + "gst-launch-1.0 -q videotestsrc num-buffers=30 ! fakesink 2>&1 | tail -n 5; echo rc=$?", 120))
     log("S2 decode: " + sh(ENV + "gst-launch-1.0 -q filesrc location=" + CLIP + " ! matroskademux name=d d. ! queue ! avdec_mpeg4 ! fakesink d. ! queue ! vorbisdec ! audioconvert ! fakesink 2>&1 | tail -n 8; echo done", 240))
     log("S2 pipewiresink: " + sh(ENV + "gst-launch-1.0 -q audiotestsrc num-buffers=200 samplesperbuffer=960 ! audio/x-raw,rate=48000,channels=2 ! pipewiresink 2>&1 | tail -n 8; echo done", 240))
-    CNT = "grep -h 'leandros-snd-sink: cycles=' /run/user/1000/pipewire.log | tail -n 1 | cut -c1-120"
+    CNT = "grep 'leandros-snd-sink: cycles=' /run/user/1000/pipewire.log | tail -n 1 | cut -c1-120"
     log("S3 counters before: " + sh(CNT, 30))
-    log("S3 start: " + sh(ENV + "(cosmic-player " + CLIP + " > /tmp/player.log 2>&1 & echo $! > /tmp/player.pid); true", 30))
-    ser.pump(8 * scale)
-    log("S3 top1: " + sh("/usr/bin/pw-top -b -n 2 2>&1 | grep -E 'leandros|player|gst|Stream|pipewiresink' | tail -n 5; " + CNT + "; echo", 60))
-    ser.pump(10 * scale)
-    log("S3 top2 (t+18s): " + sh("/usr/bin/pw-top -b -n 2 2>&1 | grep -E 'leandros|player|gst|Stream|pipewiresink' | tail -n 5; " + CNT + "; echo", 60))
-    log("S3 alive: " + sh("P=$(cat /tmp/player.pid); ls -d /proc/$P && head -3 /proc/$P/status; wc -l /tmp/player.log; grep -ciE 'panic' /tmp/player.log; tail -n 12 /tmp/player.log | cut -c1-200", 60))
+    PLP = 'for p in $(ls /proc | grep -E "^[0-9]+$"); do [ "$(cat /proc/$p/comm 2>/dev/null)" = cosmic-player ] && echo $p; done | head -n 1'
+    if "--no-s3" not in A:
+        log("S3 start: " + sh(ENV + "(cosmic-player " + CLIP + " > /tmp/player.log 2>&1 & echo $! > /tmp/player.pid); true", 30))
+        ser.pump(8 * scale)
+        for tag, wait in (("t+8s", 0), ("t+20s", 12), ("t+34s", 14), ("t+42s", 8)):
+            ser.pump(wait * scale)
+            log("S3 " + tag + ": " + sh(PLP + "; /usr/bin/pw-top -b -n 1 2>&1 | grep -E 'player|gst|pipewiresink' | cut -c1-90; " + CNT + "; echo", 60))
+        log("S3 alive: " + sh("P=$(" + PLP + "); echo pid=$P; head -n 3 /proc/$P/status | tr '\\n' ' '; wc -l < /tmp/player.log; grep -ciE 'panic' /tmp/player.log; grep -iE 'gst|pipewire|audio' /tmp/player.log | tail -n 5 | cut -c1-200", 60))
     json.dump(steps, open(f"{out}/steps.json", "w"), indent=1)
     open(f"{out}/serial-live.log", "w").write(ser.text() if hasattr(ser, "text") else "")
     if "--keep" not in A:
