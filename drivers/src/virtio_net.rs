@@ -6,9 +6,11 @@
 
 use spin::Mutex;
 use core::sync::atomic::Ordering;
-use crate::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
+// Kernel APIs come through `kenv` so the same source builds as a module (kmod-kapi shim).
+use crate::kenv::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
+use crate::kenv::{irq, mm, sched};
+use crate::virtio::{bar64, find_isr};
 use leandros_lib::mmio::{MmioRd, MmioWr};
-use mm;
 
 const VIRTIO_PCI_VENDOR: u16 = 0x1af4;
 const VIRTIO_NET_DEVICE_MODERN: u16 = 0x1041;
@@ -241,17 +243,7 @@ unsafe fn enable_pci_mmio(pci: &PciDevice) {
     // polls and never reads its ISR status, so an asserted INTx would stay
     // asserted forever and, on the virt board's shared PCIe lines, storm the
     // GPU's completion interrupt (`virtio_gpu::enable_intx`).
-    pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, (cmd | 0x0006) | crate::pci::PCI_CMD_INTX_DISABLE);
-}
-
-fn bar64(pci: &PciDevice, bar_idx: usize) -> u64 {
-    let raw = pci.bars[bar_idx];
-    if raw & 1 != 0 { return 0; }
-    if (raw >> 1) & 3 == 2 && bar_idx + 1 < 6 {
-        (raw & !0xF) as u64 | ((pci.bars[bar_idx + 1] as u64) << 32)
-    } else {
-        (raw & !0xF) as u64
-    }
+    pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, (cmd | 0x0006) | crate::kenv::pci::PCI_CMD_INTX_DISABLE);
 }
 
 unsafe fn walk_caps(
@@ -402,9 +394,7 @@ impl VirtioNetDevice {
         }
         dev.notify_rx();
 
-        extern "C" { fn arch_serial_putc(b: u8); }
-        let msg = b"[NET] VirtIO Net device initialized successfully\r\n";
-        for &b in msg { unsafe { arch_serial_putc(b); } }
+        crate::kenv::serial_raw("[NET] VirtIO Net device initialized successfully\r\n");
 
         Some(dev)
     }
@@ -567,74 +557,20 @@ static RX_IRQS: [core::sync::atomic::AtomicU64; MAX_NET_DEVICES] =
 /// RX interrupt: wake the net daemon. `ctx` is the device index. With INTx the
 /// ISR status byte is read first (the read deasserts the level line); a
 /// shared line whose condition is not ours is `NotHandled`.
-extern "C" fn virtio_net_irq(ctx: usize) -> crate::irq::IrqReturn {
+extern "C" fn virtio_net_irq(ctx: usize) -> irq::IrqReturn {
     use core::sync::atomic::Ordering::Relaxed;
-    if ctx >= MAX_NET_DEVICES { return crate::irq::IrqReturn::None; }
+    if ctx >= MAX_NET_DEVICES { return irq::IrqReturn::None; }
     let p = ISR_PTR[ctx].load(Ordering::Acquire) as *const u8;
     if !p.is_null() {
         let isr = unsafe { p.mmio_read() };
         // Bit 0: a queue; bit 1: a device config change (link status).
-        if isr & 3 == 0 { return crate::irq::IrqReturn::None; }
+        if isr & 3 == 0 { return irq::IrqReturn::None; }
     }
     if RX_IRQS[ctx].fetch_add(1, Relaxed) == 0 {
-        crate::pci::serial_debug("[NET] first RX interrupt\n");
+        crate::kenv::pci::serial_debug("[NET] first RX interrupt\n");
     }
-    crate::netdev::kick_from_irq();
-    crate::irq::IrqReturn::Handled
-}
-
-/// First MSI-X capability: (cap offset, mapped vector table), x86_64 only.
-#[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn find_msix(pci: &PciDevice) -> Option<(u8, *mut u32)> {
-    let mut cap = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x34);
-    while cap != 0 {
-        if pci_read_config_8(pci.bus, pci.dev, pci.func, cap) == 0x11 {
-            let ctrl = pci_read_config_16(pci.bus, pci.dev, pci.func, cap + 2);
-            let entries = (ctrl & 0x7FF) as usize + 1;
-            let tbl = pci_read_config_32(pci.bus, pci.dev, pci.func, cap + 4);
-            let bir = (tbl & 7) as usize;
-            let toff = (tbl & !7) as usize;
-            if bir < 6 && pci.bars[bir] & 1 == 0 {
-                let base = bar64(pci, bir);
-                if base != 0 {
-                    let virt = mm::paging::map_kernel_device(
-                        base as usize + toff, entries * 16,
-                        mm::paging::PageFlags::PRESENT | mm::paging::PageFlags::WRITABLE | mm::paging::PageFlags::MMIO,
-                    ).unwrap_or_else(|| mm::phys_to_virt(base as usize + toff));
-                    return Some((cap, virt as *mut u32));
-                }
-            }
-            return None;
-        }
-        cap = pci_read_config_8(pci.bus, pci.dev, pci.func, cap + 1);
-    }
-    None
-}
-
-/// The ISR status byte (virtio cfg type 3).
-pub(crate) unsafe fn find_isr(pci: &PciDevice) -> *mut u8 {
-    let mut cap = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x34);
-    while cap != 0 {
-        if pci_read_config_8(pci.bus, pci.dev, pci.func, cap) == 0x09
-            && pci_read_config_8(pci.bus, pci.dev, pci.func, cap + 3) == 3
-        {
-            let bar_idx = pci_read_config_8(pci.bus, pci.dev, pci.func, cap + 4) as usize;
-            let offset = pci_read_config_32(pci.bus, pci.dev, pci.func, cap + 8);
-            let length = pci_read_config_32(pci.bus, pci.dev, pci.func, cap + 12);
-            if bar_idx < 6 {
-                let base = bar64(pci, bar_idx);
-                if base != 0 {
-                    let phys = base as usize + offset as usize;
-                    return mm::paging::map_kernel_device(
-                        phys, length as usize,
-                        mm::paging::PageFlags::PRESENT | mm::paging::PageFlags::WRITABLE | mm::paging::PageFlags::MMIO,
-                    ).unwrap_or_else(|| mm::phys_to_virt(phys)) as *mut u8;
-                }
-            }
-        }
-        cap = pci_read_config_8(pci.bus, pci.dev, pci.func, cap + 1);
-    }
-    core::ptr::null_mut()
+    crate::kenv::netdev::kick_from_irq();
+    irq::IrqReturn::Handled
 }
 
 /// Arm the RX-queue interrupt for device `idx`: MSI-X when available (x86_64),
@@ -646,36 +582,23 @@ unsafe fn arm_rx_irq(idx: usize, d: &VirtioNetDevice) {
     core::ptr::addr_of_mut!((*d.tx_queue.avail).flags).write_volatile(1); // NO_INTERRUPT
     let pci = &d._pci;
     #[cfg(target_arch = "x86_64")]
-    if let Some((cap, table)) = find_msix(pci) {
+    if let Ok(tab) = irq::MsixTable::enable(pci.function()) {
         const NO_VECTOR: u16 = 0xFFFF;
-        if let Some(vector) = crate::irq::alloc_vector() {
-            if let Some((msg_addr, msg_data)) = crate::irq::msi_message(vector) {
-                if crate::irq::request_irq(crate::irq::IrqSource::Vector(vector), virtio_net_irq, idx).is_ok() {
-                    table.add(3).mmio_write(1);
-                    table.add(0).mmio_write(msg_addr as u32);
-                    table.add(1).mmio_write((msg_addr >> 32) as u32);
-                    table.add(2).mmio_write(msg_data);
-                    let ctrl = pci_read_config_16(pci.bus, pci.dev, pci.func, cap + 2);
-                    pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, ctrl | 0xC000);
-                    let cfg = d.common_cfg;
-                    // Config changes (link status) share vector table entry 0.
-                    core::ptr::addr_of_mut!((*cfg).config_msix_vector).mmio_write(0);
-                    core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(1);
-                    core::ptr::addr_of_mut!((*cfg).queue_msix_vector).mmio_write(NO_VECTOR);
-                    core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(0);
-                    core::ptr::addr_of_mut!((*cfg).queue_msix_vector).mmio_write(0);
-                    if core::ptr::addr_of!((*cfg).queue_msix_vector).mmio_read() == 0 {
-                        pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, (ctrl | 0x8000) & !0x4000);
-                        table.add(3).mmio_write(0);
-                        IRQ_ARMED[idx].store(true, Ordering::Release);
-                        crate::pci::serial_debug("[NET] MSI-X armed: RX queue -> vector ");
-                        crate::pci::serial_debug_hex(vector as u32);
-                        crate::pci::serial_debug("\n");
-                        return;
-                    }
-                    pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, ctrl & !0x8000);
-                } else { crate::irq::free_vector(vector); }
-            } else { crate::irq::free_vector(vector); }
+        if let Ok(h) = tab.request(0, virtio_net_irq, idx) {
+            let cfg = d.common_cfg;
+            // Config changes (link status) share vector table entry 0.
+            core::ptr::addr_of_mut!((*cfg).config_msix_vector).mmio_write(0);
+            core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(1);
+            core::ptr::addr_of_mut!((*cfg).queue_msix_vector).mmio_write(NO_VECTOR);
+            core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(0);
+            core::ptr::addr_of_mut!((*cfg).queue_msix_vector).mmio_write(0);
+            if core::ptr::addr_of!((*cfg).queue_msix_vector).mmio_read() == 0 {
+                IRQ_ARMED[idx].store(true, Ordering::Release);
+                crate::kenv::pci::serial_debug("[NET] MSI-X armed: RX queue -> vector ");
+                crate::kenv::pci::serial_debug_hex(h.vector().unwrap_or(0) as u32);
+                crate::kenv::pci::serial_debug("\n");
+                return;
+            }
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -686,23 +609,23 @@ unsafe fn arm_rx_irq(idx: usize, d: &VirtioNetDevice) {
         if isr.is_null() { return; }
         let pin = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x3D);
         if pin == 0 || pin > 4 { return; }
-        let intid = 32 + 3 + ((pci.dev as u32 + (pin as u32 - 1)) % 4);
+        let Some(intid) = pci.function().intx_line() else { return };
         // Publish the ISR pointer, drain stale state, register, only then
         // lift INTx Disable.
         let _ = isr.mmio_read();
         ISR_PTR[idx].store(isr as usize, Ordering::Release);
-        if crate::irq::request_irq(crate::irq::IrqSource::Line(intid), virtio_net_irq, idx).is_err() {
+        if irq::request_irq(irq::IrqSource::Line(intid), virtio_net_irq, idx).is_err() {
             ISR_PTR[idx].store(0, Ordering::Release);
-            crate::pci::serial_debug("[NET] INTx: line registration refused; polling only\n");
+            crate::kenv::pci::serial_debug("[NET] INTx: line registration refused; polling only\n");
             return;
         }
         let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
-        pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd & !crate::pci::PCI_CMD_INTX_DISABLE);
+        pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd & !crate::kenv::pci::PCI_CMD_INTX_DISABLE);
         let _ = isr.mmio_read();
         IRQ_ARMED[idx].store(true, Ordering::Release);
-        crate::pci::serial_debug("[NET] INTx armed: INTID ");
-        crate::pci::serial_debug_hex(intid);
-        crate::pci::serial_debug("\n");
+        crate::kenv::pci::serial_debug("[NET] INTx armed: INTID ");
+        crate::kenv::pci::serial_debug_hex(intid);
+        crate::kenv::pci::serial_debug("\n");
     }
     let _ = pci;
 }

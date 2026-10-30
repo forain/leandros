@@ -75,6 +75,11 @@ pub mod pci {
         pub fn write32(&self, off: u16, v: u32) { self.wr(off, 4, v) }
         pub fn find_capability(&self, id: u8) -> Option<u16> { find_capability(self.bdf(), id) }
         pub fn enable_mem_and_bus_master(&self) { let _ = enable(self.bdf(), true); }
+        pub fn set_intx_disable(&self, disable: bool) {
+            let c = self.read16(0x04);
+            let n = if disable { c | PCI_CMD_INTX_DISABLE } else { c & !PCI_CMD_INTX_DISABLE };
+            if n != c { self.write16(0x04, n); }
+        }
 
         pub fn bar(&self, i: usize) -> Option<BarInfo> {
             if i >= 6 { return None; }
@@ -151,6 +156,45 @@ pub mod pci {
         })
     }
 
+    /// Every function with this vendor/device id (kapi_pci_find walks them by index).
+    /// Every PCI function (the kernel's `pci::scan`), via `kapi_pci_scan`.
+    pub fn scan() -> alloc::vec::Vec<PciDevice> {
+        let mut v = alloc::vec::Vec::new();
+        let mut i = 0u32;
+        while let Some(k) = super::sys_common::pci_scan(i) {
+            v.push(PciDevice {
+                bus: (k.bdf >> 16) as u8, dev: (k.bdf >> 8) as u8, func: k.bdf as u8,
+                vendor_id: k.vendor, device_id: k.device,
+                class: (k.class >> 16) as u8, subclass: (k.class >> 8) as u8, prog_if: k.class as u8,
+                bars: k.bars,
+            });
+            i += 1;
+        }
+        v
+    }
+
+    pub fn find_all_devices(vendor_id: u16, device_id: u16) -> alloc::vec::Vec<PciDevice> {
+        let mut v = alloc::vec::Vec::new();
+        for index in 0..64u32 {
+            let mut k = KPciDev::default();
+            if unsafe { sys::kapi_pci_find(vendor_id, device_id, index, &mut k) } != 0 { break; }
+            v.push(PciDevice {
+                bus: (k.bdf >> 16) as u8, dev: (k.bdf >> 8) as u8, func: k.bdf as u8,
+                vendor_id: k.vendor, device_id: k.device,
+                class: (k.class >> 16) as u8, subclass: (k.class >> 8) as u8, prog_if: k.class as u8,
+                bars: k.bars,
+            });
+        }
+        v
+    }
+
+    pub fn serial_debug_hex(v: u32) {
+        let mut b = [0u8; 10];
+        b[0] = b'0'; b[1] = b'x';
+        for i in 0..8 { b[2 + i] = b"0123456789abcdef"[((v >> (28 - 4 * i)) & 0xf) as usize]; }
+        serial_debug(core::str::from_utf8(&b).unwrap_or(""));
+    }
+
     pub unsafe fn pci_read_config_8(bus: u8, dev: u8, func: u8, off: u8) -> u8 {
         sys::kapi_pci_cfg_read(bdf(bus, dev, func), off as u16, 1) as u8
     }
@@ -160,6 +204,8 @@ pub mod pci {
     pub unsafe fn pci_read_config_32(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
         sys::kapi_pci_cfg_read(bdf(bus, dev, func), off as u16, 4)
     }
+    /// Config read that also works for offsets the built-in's ECAM path treats specially; one path here.
+    pub unsafe fn pci_read_config_32_any(bus: u8, dev: u8, func: u8, off: u8) -> u32 { pci_read_config_32(bus, dev, func, off) }
     pub unsafe fn pci_write_config_16(bus: u8, dev: u8, func: u8, off: u8, val: u16) {
         sys::kapi_pci_cfg_write(bdf(bus, dev, func), off as u16, 2, val as u32)
     }
@@ -180,6 +226,9 @@ pub mod pci {
     }
 
     /// Kernel log line (the trailing newline is stripped; `kapi_log` adds its own).
+    /// Verbose-boot trace in the kernel; a module build drops it.
+    pub fn rdebug(_msg: &str) {}
+    pub fn rdebug_hex(_v: u32) {}
     pub fn serial_debug(msg: &str) {
         let m = msg.strip_suffix('\n').unwrap_or(msg);
         unsafe { sys::kapi_log(6, m.as_ptr(), m.len()) }
@@ -190,6 +239,8 @@ pub mod mm {
     use super::*;
 
     pub fn phys_to_virt(phys: usize) -> usize { unsafe { sys::kapi_phys_to_virt(phys as u64) } }
+    /// Physical address of a direct-map address (0 for a module-image address: not DMA-able).
+    pub fn virt_to_phys(va: usize) -> usize { super::sys_common::virt_to_phys(va).unwrap_or(0) as usize }
 
     pub mod paging {
         use super::*;
@@ -247,6 +298,7 @@ pub mod sched {
     use super::*;
 
     pub fn monotonic_ns() -> u64 { unsafe { sys::kapi_monotonic_ns() } }
+    pub fn monotonic_us() -> u64 { monotonic_ns() / 1000 }
 
     pub mod kthread {
         use super::*;
@@ -338,6 +390,22 @@ pub mod irq {
         request_line(super::pci::intx_bdf(), h, ctx)
     }
 
+    /// MSI-X of one function (x86_64): the kernel enables the table on the first request.
+    #[derive(Clone, Copy, Debug)]
+    pub struct MsixTable { bdf: u32 }
+    impl MsixTable {
+        pub fn enable(func: super::pci::PciFunction) -> Result<MsixTable, IrqError> {
+            if func.find_capability(super::pci::cap::MSIX).is_none() { return Err(IrqError::NotFound); }
+            Ok(MsixTable { bdf: func.bdf() })
+        }
+        pub fn request(&self, entry: u16, h: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
+            match super::sys_common::irq_request_msix(self.bdf, entry, raw(h), ctx) {
+                Ok(v) => Ok(IrqHandle { vector: Some(v), line: None }),
+                Err(e) => Err(err(e)),
+            }
+        }
+    }
+
     /// Single-vector MSI on the function `bdf`.
     pub fn request_msi(bdf: impl Into<u32>, h: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
         match unsafe { sys::kapi_irq_request_msi(owner(), bdf.into(), raw(h), ctx) } {
@@ -352,6 +420,16 @@ pub mod irq {
             l if l >= 0 => Ok(IrqHandle { vector: None, line: Some(l as u32) }),
             e => Err(err(e)),
         }
+    }
+}
+
+pub mod snd {
+    use super::*;
+    pub use kmod_abi::{KSndOps, KSND_CAPTURE};
+    /// Register the sound backend (one per machine); the ops table must outlive the module.
+    /// Returns 0 or the kernel's negative errno (-16 a backend is already attached).
+    pub fn register(ops: &'static KSndOps, ctx: usize) -> Result<(), i32> {
+        match unsafe { sys::kapi_snd_register(owner(), ops, ctx) } { 0 => Ok(()), e => Err(e) }
     }
 }
 

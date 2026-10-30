@@ -10,7 +10,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicU64;
-use kmod_abi::{BUS_USB, KCameraOps, KIrqHandler, KNetifOps, KPciDev, KPmFn, KTickFn, KUsbDetachFn, KUsbIf, KUsbProbeFn,
+use kmod_abi::{BUS_USB, KCameraOps, KIrqHandler, KNetifOps, KSndOps, KPciDev, KPmFn, KTickFn, KUsbDetachFn, KUsbIf, KUsbProbeFn,
                KmodDevId, KMAP_MMIO, KMAP_WC, KMAP_WRITABLE, KNET_WIFI};
 
 fn log(s: &str) { drivers::pci::serial_debug(s); }
@@ -25,6 +25,7 @@ mod core_;
 mod pci;
 mod irq;
 mod net;
+mod snd;
 mod pm;
 mod v4l2;
 mod usbfn;
@@ -33,6 +34,7 @@ mod blk;
 pub use pci::*;
 pub use irq::*;
 pub use net::*;
+pub use snd::*;
 pub use pm::*;
 pub use blk::*;
 pub use v4l2::*;
@@ -72,6 +74,7 @@ const _: sys::WaitTimeoutFn = kapi_wait_timeout;
 const _: sys::WaitNotifyFn = kapi_wait_notify;
 const _: sys::NetdevRegisterFn = kapi_netdev_register;
 const _: sys::NetdevKickFn = kapi_netdev_kick;
+const _: sys::SndRegisterFn = kapi_snd_register;
 const _: sys::NetdevKickFn = kapi_netdev_kick_from_irq;
 const _: sys::PmRegisterFn = kapi_pm_register;
 const _: sys::PmRegister2Fn = kapi_pm_register2;
@@ -130,7 +133,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 82;
+pub const NEXPORTS: usize = 83;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -166,6 +169,7 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_wait_notify", kapi_wait_notify),
     sym!("kapi_netdev_register", kapi_netdev_register),
     sym!("kapi_netdev_kick", kapi_netdev_kick),
+    sym!("kapi_snd_register", kapi_snd_register),
     sym!("kapi_netdev_kick_from_irq", kapi_netdev_kick_from_irq),
     sym!("kapi_pm_register", kapi_pm_register),
     sym!("kapi_pm_register2", kapi_pm_register2),

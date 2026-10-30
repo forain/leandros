@@ -283,6 +283,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-hda"
+version = "0.1.0"
+dependencies = [
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
+]
+
+[[package]]
 name = "kmod-hello"
 version = "0.1.0"
 dependencies = [
@@ -340,7 +350,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-virtio-net"
+version = "0.1.0"
+dependencies = [
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
+]
+
+[[package]]
 name = "kmod-virtio-rng"
+version = "0.1.0"
+dependencies = [
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
+]
+
+[[package]]
+name = "kmod-virtio-snd"
 version = "0.1.0"
 dependencies = [
  "kmod-kapi",
@@ -437,6 +467,7 @@ version = "0.1.0"
 dependencies = [
  "drivers",
  "ipc",
+ "kmod-abi",
  "net-server",
  "sched",
  "spin",

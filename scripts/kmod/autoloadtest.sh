@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# autoloadtest.sh [arch] [virtio_rng|e1000e|uvc|of]: host-side test of the modules.alias autoload path.
+# autoloadtest.sh [arch] [virtio_rng|e1000e|virtio_net|virtio_snd|hda|uvc|of]: host-side test of the modules.alias autoload path.
 # Builds with CONFIG_MODULES=y CONFIG_VIRTIO_RNG=m (the driver is then ONLY a module, found via
 # modules.alias, no modules.load), boots under QEMU and checks that it autoloads, is listed, feeds
 # the CSPRNG, and that modules.blacklist=virtio_rng boots without it. Restores .config afterwards
@@ -65,6 +65,77 @@ if [[ "$mod" == "virtio_blk" || "$mod" == "nvme" ]]; then
     check "$L2" "ERROR: Failed to mount the root filesystem" "root wait gave up cleanly"
     if grep -aq "^\\[kmod\\] .*$mod loaded" "$L2"; then echo "FAIL blacklisted $mod was loaded"; fail=1; else echo "ok   blacklisted $mod not loaded"; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest $mod: PASS" || { echo "autoloadtest $mod: FAIL"; exit 1; }
+    exit 0
+fi
+if [[ "$mod" == "virtio_snd" ]]; then
+    # CONFIG_VIRTIO_SND=m: the sound device is ONLY a module (alias 1af4:1059). No built-in backend
+    # exists, so the module's attach registers /dev/pipewire lazily; `sndtest all` plays through it.
+    printf 'CONFIG_MODULES=y\nCONFIG_VIRTIO_SND=m\n' > .config
+    ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/autoloadtest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/autoloadtest-build.log"; exit 1; }
+    if find "target/kmod/$arch" -name modules.load | grep -q .; then echo "FAIL: modules.load present, alias path not isolated"; exit 1; fi
+    RT=.claude/skills/run-leandros/runtests.py
+    fail=0
+    check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3"; fail=1; fi; }
+    export LEANDROS_RUN_ID="autoloadtest-$arch"
+    python3 "$RT" "$arch" alt1 "cat /proc/modules" "kmodctl list" "sndtest all" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt1/serial-full.log
+    check "$L" '^\[kmod\] virtio_snd loaded id' "virtio_snd autoloaded"
+    check "$L" '^\[kmod virtio_snd\].*virtio-sound attached' "backend attached by the module"
+    check "$L" '^virtio_snd [0-9]* [0-9]* - Live' "listed in /proc/modules"
+    check "$L" '^virtio_snd .* Live ' "listed by kmodctl list"
+    check "$L" 'both channels done: [0-9]* B' "sndtest played through the module"
+    python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=virtio_snd" "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt2/serial-full.log
+    check "$L" 'alias pci 1af4:1059 virtio_snd: Blacklisted' "blacklist refuses the alias load"
+    [[ $fail -eq 0 ]] && echo "autoloadtest virtio_snd: PASS" || { echo "autoloadtest virtio_snd: FAIL"; exit 1; }
+    exit 0
+fi
+if [[ "$mod" == "hda" ]]; then
+    # CONFIG_HDA=m: the controller is ONLY a module (PCI class alias 040300/ffff00). x86_64 QEMU gets
+    # `intel-hda` + `hda-duplex` (LEANDROS_SND=hda-duplex); `sndtest all` plays through the module.
+    printf 'CONFIG_MODULES=y\nCONFIG_HDA=m\n' > .config
+    ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/autoloadtest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/autoloadtest-build.log"; exit 1; }
+    if find "target/kmod/$arch" -name modules.load | grep -q .; then echo "FAIL: modules.load present, alias path not isolated"; exit 1; fi
+    RT=.claude/skills/run-leandros/runtests.py
+    fail=0
+    check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3"; fail=1; fi; }
+    export LEANDROS_RUN_ID="autoloadtest-$arch" LEANDROS_SND=hda-duplex
+    python3 "$RT" "$arch" alt1 "cat /proc/modules" "kmodctl list" "sndtest all" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt1/serial-full.log
+    check "$L" '^\[kmod\] hda loaded id' "hda autoloaded"
+    check "$L" '^\[kmod hda\].*hda attached' "backend attached by the module"
+    check "$L" '^hda [0-9]* [0-9]* - Live' "listed in /proc/modules"
+    check "$L" '^hda .* Live ' "listed by kmodctl list"
+    check "$L" 'both channels done: [0-9]* B' "sndtest played through the module"
+    python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=hda" "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt2/serial-full.log
+    check "$L" '\[kmod\] hda Blacklisted' "blacklist refuses the alias load"
+    [[ $fail -eq 0 ]] && echo "autoloadtest hda: PASS" || { echo "autoloadtest hda: FAIL"; exit 1; }
+    exit 0
+fi
+if [[ "$mod" == "virtio_net" ]]; then
+    # CONFIG_VIRTIO_NET=m (WIFI_SIM needs =y so it drops out): the QEMU NIC is ONLY a module
+    # (alias 1af4:1041). Both arches boot with the default virtio NIC.
+    printf 'CONFIG_MODULES=y\nCONFIG_VIRTIO_NET=m\n' > .config
+    ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/autoloadtest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/autoloadtest-build.log"; exit 1; }
+    if find "target/kmod/$arch" -name modules.load | grep -q .; then echo "FAIL: modules.load present, alias path not isolated"; exit 1; fi
+    RT=.claude/skills/run-leandros/runtests.py
+    fail=0
+    check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3"; fail=1; fi; }
+    export LEANDROS_RUN_ID="autoloadtest-$arch"
+    python3 "$RT" "$arch" alt1 "cat /proc/modules" "kmodctl list" "/bin/nettest" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt1/serial-full.log
+    check "$L" '^\[kmod\] virtio_net loaded id' "virtio_net autoloaded"
+    check "$L" '^\[kmod virtio_net\].*registered netif' "netif registered by the module"
+    check "$L" '^\[NET\] DHCP configured' "DHCP"
+    check "$L" '^nettest: .* 0 failed' "nettest passes"
+    check "$L" '^virtio_net [0-9]* [0-9]* - Live' "listed in /proc/modules"
+    check "$L" '^virtio_net .* Live ' "listed by kmodctl list"
+    python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=virtio_net" "ip link" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt2/serial-full.log
+    check "$L" 'alias pci 1af4:10\(41\|00\) virtio_net: Blacklisted' "blacklist refuses the alias load"
+    if grep -aq 'DHCP configured' "$L"; then echo "FAIL eth up despite blacklist"; fail=1; fi
+    [[ $fail -eq 0 ]] && echo "autoloadtest virtio_net: PASS" || { echo "autoloadtest virtio_net: FAIL"; exit 1; }
     exit 0
 fi
 if [[ "$mod" == "of" ]]; then

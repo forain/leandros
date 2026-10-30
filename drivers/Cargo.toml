@@ -32,6 +32,7 @@ e1000e = []
 r8169 = []
 macb = []
 virtio-net = []
+virtio-snd = []
 # Hidden CONFIG_WIFI_STACK: shared 802.11 code (frames, crypto, HT, manager).
 wifi-stack = []
 iwlwifi = ["wifi-stack"]

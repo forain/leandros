@@ -54,6 +54,7 @@ pub mod i2c_hid {
     pub fn listen_once(_now_ns: u64) -> bool { false }
 }
 pub mod power_sysfs;
+#[cfg(feature = "virtio-snd")]
 pub mod snd;
 /// Intel High Definition Audio controller + codec playback (lane hda).
 #[cfg(feature = "drv-hda")]
@@ -308,6 +309,9 @@ pub enum DriverError {
 }
 
 // Stubs for the Kconfig-gated drivers that are switched off (see stubs/).
+#[cfg(not(feature = "virtio-snd"))]
+#[path = "stubs/snd.rs"]
+pub mod snd;
 #[cfg(not(feature = "virtio-net"))]
 #[path = "stubs/virtio_net.rs"]
 pub mod virtio_net;
