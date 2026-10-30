@@ -572,7 +572,7 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 84 && exports::NEXPORTS == 84, "ksymtab has 84 exports");
+    t.check(exports::ksymtab().len() == 87 && exports::NEXPORTS == 87, "ksymtab has 87 exports");
     t.check(exports::lookup("kapi_wifi_register").is_some(), "kapi_wifi_register in KSYMTAB");
     #[cfg(feature = "drv-wifi-stack")]
     {
@@ -594,6 +594,12 @@ fn t_kmodkapi() -> T {
         let f = Fail::new(5, "handshake: no message 3").status(17).ieee_reason(15);
         let fb = fail_from_k(&fail_to_k(&f));
         t.check(fb.reason == 5 && fb.ieee_status == 17 && fb.ieee_reason == 15 && !fb.fw_assert && fb.msg == f.msg, "Fail survives KWifiFail");
+    }
+    {
+        use crate::kmod::exports::{kapi_input_register, kapi_input_set_caps};
+        t.check(kapi_input_register(KmodId(0), 7, core::ptr::null(), 0, 0, 0, 0) == -22, "kapi_input_register bad kind -> -22");
+        t.check(kapi_input_set_caps(5, core::ptr::null(), 0, core::ptr::null(), 0) == -22, "kapi_input_set_caps bad node -> -22");
+        t.check(kapi_input_set_caps(1, core::ptr::null(), 4, core::ptr::null(), 0) == -22, "kapi_input_set_caps null rel -> -22");
     }
     {
         use kmod_abi::{KBlkDesc, KBlkOps};

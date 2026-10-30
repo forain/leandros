@@ -423,6 +423,25 @@ pub mod irq {
     }
 }
 
+pub mod input {
+    use super::*;
+    use kmod_abi::input::sys_input;
+    pub use kmod_abi::input::{INPUT_KEYBOARD, INPUT_POINTER};
+    /// Claim the evdev node for `kind`; the node index, or -errno.
+    pub fn register(kind: u32, name: &str, bus: u16, vid: u16, pid: u16) -> i32 {
+        unsafe { sys_input::kapi_input_register(owner(), kind, name.as_ptr(), name.len(), bus, vid, pid) }
+    }
+    pub fn claim(node: u32) -> bool { register(node, "virtio-input", 0x06, 0x1af4, 0x1052) >= 0 }
+    pub fn push_event(node: u32, ty: u16, code: u16, value: i32) {
+        unsafe { sys_input::kapi_input_event(node as i32, ty, code, value) }
+    }
+    pub fn set_device_caps(node: u32, rel: &[u8], key: &[u8]) {
+        unsafe { sys_input::kapi_input_set_caps(node as i32, rel.as_ptr(), rel.len(), key.as_ptr(), key.len()); }
+    }
+    pub fn register_stats_hook(_f: fn(&mut dyn core::fmt::Write)) {}
+    pub fn vt_handoff_stats() -> (u64, u64) { (0, 0) }
+}
+
 pub mod snd {
     use super::*;
     pub use kmod_abi::{KSndOps, KSND_CAPTURE};
