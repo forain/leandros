@@ -24,7 +24,7 @@ Once per run it downloads and caches the Limine bootloader binaries (version 11.
 1. **relibc** (`../relibc`), with its C sources pointed at the zig musl wrapper.
 2. **In-tree userland** (`scripts/build-userland.sh --release`): the programs and regression suites under `userland/`, plus the two C conformance tests (`privtest`, `nettest`) when zig is present.
 3. **Ported software**: DOOM, MAME, Firefox, the desktop portal, PipeWire, `bottom`, brush, coreutils, mkfs.fat, mkfs.xfs, `spawnwedge`, `killmt`, disks-rs's `disktester`, then the D-Bus session package (busd, `dbus-run-session`, `session.conf`), the system-bus services (`ports/sysbus`) and the iso-codes data.
-4. **initrd** — a `newc` CPIO holding only `/bin/init`; everything else comes from the root file system. It is written uncompressed (`initrd-<arch>.cpio`) and copied to `initrd-<arch>.cpio.gz`, because the kernel's initrd parser does not decompress.
+4. **initrd** — a `newc` CPIO holding `/bin/init` and, for any driver configured `=m`, `lib/modules/<build-id>/` ([loadable modules](../kernel/modules.md)); everything else comes from the root file system. It is written uncompressed (`initrd-<arch>.cpio`) and copied to `initrd-<arch>.cpio.gz`, because the kernel's initrd parser does not decompress.
 5. **Kernel**, built twice with `-Z build-std=core,alloc` against the custom target spec `targets/<arch>-unknown-kernel.json`:
    - the **standard** kernel, linked with `linkers/<arch>.ld`, booted by Limine → `target/final-<arch>/kernel`;
    - the **direct-boot** kernel, linked with `linkers/<arch>-direct.ld` → `target/final-<arch>/kernel-direct`, plus a flat binary `kernel-direct.bin` (and, on x86-64, a 32-bit ELF `kernel-direct-32.elf`) when `llvm-objcopy`/`rust-objcopy` is installed.
@@ -36,6 +36,18 @@ Once per run it downloads and caches the Limine bootloader binaries (version 11.
 
 - **Kernel stack frames.** Both kernels are linked with `-Z emit-stack-sizes`, and [`scripts/check-stack-frames.py`](../../scripts/check-stack-frames.py) fails the build if any function's frame exceeds **48 KiB**. Kernel stacks are 128 KiB with no guard page; an oversized frame does not fault, it overwrites the neighbouring buddy allocation and the corruption surfaces somewhere else entirely. A 156 KB frame in `f2fs::mount` (and a 72 KB one in `sys_umount2`) once spent a day looking like a host-dependent boot failure. The largest legitimate frame is about 34 KB (`vfs_close_all_for`, inflated by LTO inlining). See [scheduler](../kernel/scheduler.md).
 - **Stale staging.** Every payload the image takes from a port is regenerated from tracked source on each build, and the image builder refuses to write an image whose staged D-Bus payload is older than its source (`verify_dbus_staging`). A `.service` activation once sat in the repository and in no image for two days while a boot test that only asked "does the desktop come up" called it green. A failing port step warns in `build-all.sh` and the image step refuses: never silent in either place.
+
+## Kernel configuration (Kconfig)
+
+Which drivers are built in, left out or built as loadable modules is decided by a Linux-style Kconfig tree ([Kconfig](../../Kconfig), [drivers/Kconfig](../../drivers/Kconfig)) and a `.config` file:
+
+```sh
+./scripts/menuconfig.sh [--arch x86_64|aarch64]            # interactive TUI, edits ./.config
+./scripts/menuconfig.sh defconfig x86_64_laptop --arch x86_64   # start from configs/<name>_defconfig
+./scripts/menuconfig.sh olddefconfig                       # fill symbols added since .config was written
+```
+
+The shipped defconfigs are in [configs/](../../configs) (`x86_64`, `aarch64`, `x86_64_laptop`, `rpi5`); all drivers are `y` and `CONFIG_MODULES` is unset, so nothing changes unless you ask. `=m` needs `CONFIG_MODULES=y` and makes the build also produce `.kmod` files in the initrd and fail on a build-id mismatch ([bidcheck](../kernel/modules.md#8-testing)). The full story, including the kernel-side stubs for `=n`/`=m`, is in [Loadable kernel modules](../kernel/modules.md).
 
 ## Release builds only
 
