@@ -18,7 +18,8 @@ M6="$HOME/code/leandros-artifacts/m6-session-bins"
 SRC="$M6/src/cosmic-applets"
 APPLETS=(cosmic-applet-time cosmic-applet-battery cosmic-applet-notifications
          cosmic-applet-status-area cosmic-applet-workspaces
-         cosmic-applet-input-sources cosmic-applet-a11y cosmic-app-list)
+         cosmic-applet-input-sources cosmic-applet-a11y cosmic-app-list
+         cosmic-applet-audio)
 
 case "${1:-both}" in
   aarch64)  ARCHES=(aarch64) ;;
