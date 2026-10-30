@@ -312,6 +312,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-i915"
+version = "0.1.0"
+dependencies = [
+ "kmod-abi",
+ "kmod-kapi",
+ "kmod-rt",
+ "spin",
+]
+
+[[package]]
 name = "kmod-iwlwifi"
 version = "0.1.0"
 dependencies = [
