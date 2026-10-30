@@ -166,7 +166,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 118;
+pub const NEXPORTS: usize = 123;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -211,6 +211,11 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_syncobj_in_fences", kapi_syncobj_in_fences),
     sym!("kapi_fence_irq_hint", kapi_fence_irq_hint),
     sym!("kapi_kms_event_complete", kapi_kms_event_complete),
+    sym!("kapi_kms_register", kapi_kms_register),
+    sym!("kapi_kms_set_internal_panel", kapi_kms_set_internal_panel),
+    sym!("kapi_drm_hotplug", kapi_drm_hotplug),
+    sym!("kapi_ext_present_stats", kapi_ext_present_stats),
+    sym!("kapi_tmpfs_census", kapi_tmpfs_census),
     sym!("kapi_netdev_kick", kapi_netdev_kick),
     sym!("kapi_snd_register", kapi_snd_register),
     sym!("kapi_netdev_kick_from_irq", kapi_netdev_kick_from_irq),
