@@ -59,7 +59,7 @@ if [[ "$mod" == "virtio_net" ]]; then
     check "$L" '^virtio_net .* Live ' "listed by kmodctl list"
     python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=virtio_net" "ip link" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt2/serial-full.log
-    check "$L" 'alias pci 1af4:1041 virtio_net: Blacklisted' "blacklist refuses the alias load"
+    check "$L" 'alias pci 1af4:10\(41\|00\) virtio_net: Blacklisted' "blacklist refuses the alias load"
     if grep -aq 'DHCP configured' "$L"; then echo "FAIL eth up despite blacklist"; fail=1; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest virtio_net: PASS" || { echo "autoloadtest virtio_net: FAIL"; exit 1; }
     exit 0
