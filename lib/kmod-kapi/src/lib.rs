@@ -415,9 +415,88 @@ pub mod pm {
     use super::*;
     pub use kmod_abi::KPmFn;
 
+    pub use kmod_abi::{pm_phase, KPmOps};
+    /// Register a full hook table in a phase (`pm_phase::*`). Err = kernel errno.
+    pub fn register2(ops: &KPmOps, ctx: usize) -> Result<(), i32> {
+        match unsafe { sys::kapi_pm_register2(owner(), ops, ctx) } { 0 => Ok(()), e => Err(e) }
+    }
     /// Register suspend / resume / shutdown hooks (see `kmod_abi::KPmFn`). Err = kernel errno.
     pub fn register(suspend: Option<KPmFn>, resume: Option<KPmFn>, shutdown: Option<KPmFn>, ctx: usize) -> Result<(), i32> {
         match unsafe { sys::kapi_pm_register(owner(), suspend, resume, shutdown, ctx) } { 0 => Ok(()), e => Err(e) }
+    }
+}
+
+/// Scheduler and address helpers (kmodW2 common kapi).
+pub mod sys_common {
+    use super::*;
+    use kmod_abi::KIrqHandler;
+    /// Physical address of a direct-map address, or None for a module-image address (not DMA-able).
+    pub fn virt_to_phys(va: usize) -> Option<u64> {
+        match unsafe { sys::kapi_virt_to_phys(va) } { u64::MAX => None, p => Some(p) }
+    }
+    pub fn can_sleep() -> bool { unsafe { sys::kapi_can_sleep() } }
+    pub fn sleep_until(ns: u64) { unsafe { sys::kapi_sleep_until(ns) } }
+    pub fn yield_now() { unsafe { sys::kapi_yield() } }
+    pub fn irqs_masked() -> bool { unsafe { sys::kapi_irqs_masked() } }
+    pub fn current_pid() -> u32 { unsafe { sys::kapi_current_pid() } }
+    /// Map device memory: cache 0 uncached, 1 write-combining, 2 write-back. None on failure.
+    pub fn ioremap(phys: u64, len: usize, cache: u32) -> Option<usize> {
+        match unsafe { sys::kapi_ioremap(phys, len, cache) } { 0 => None, v => Some(v) }
+    }
+    pub fn iounmap(va: usize, len: usize) { unsafe { sys::kapi_iounmap(va, len) } }
+    /// dir: 0 to device, 1 to CPU, 2 both.
+    pub fn dma_sync(va: usize, len: usize, dir: u32) { unsafe { sys::kapi_dma_sync(va, len, dir) } }
+    pub fn dma_coherent() -> bool { unsafe { sys::kapi_dma_coherent() } }
+    /// Sleeping mutex handle (permanent).
+    pub fn mutex_new(name: &str) -> usize { unsafe { sys::kapi_mutex_new(name.as_ptr(), name.len()) } }
+    pub fn mutex_lock(h: usize) { unsafe { sys::kapi_mutex_lock(h) } }
+    pub fn mutex_unlock(h: usize) { unsafe { sys::kapi_mutex_unlock(h) } }
+    pub fn sem_new(n: u32) -> usize { unsafe { sys::kapi_sem_new(n) } }
+    pub fn sem_down_timeout(h: usize, ns: u64) -> bool { unsafe { sys::kapi_sem_down_timeout(h, ns) } }
+    pub fn sem_up(h: usize) { unsafe { sys::kapi_sem_up(h) } }
+    pub fn hrtimer_new(cb: extern "C" fn(usize), ctx: usize, irq_mode: bool) -> usize {
+        unsafe { sys::kapi_hrtimer_new(Some(cb), ctx, irq_mode) }
+    }
+    pub fn hrtimer_arm(h: usize, ns: u64) { unsafe { sys::kapi_hrtimer_arm(h, ns) } }
+    pub fn hrtimer_cancel(h: usize) { unsafe { sys::kapi_hrtimer_cancel(h) } }
+    pub fn preempt_disable() { unsafe { sys::kapi_preempt_disable() } }
+    pub fn preempt_enable() { unsafe { sys::kapi_preempt_enable() } }
+    pub fn random_fill(buf: &mut [u8]) { unsafe { sys::kapi_random_fill(buf.as_mut_ptr(), buf.len()) } }
+    /// Ioctl-thread only. Err(-14) bad user range.
+    pub fn copy_from_user(dst: &mut [u8], uaddr: usize) -> Result<(), i32> {
+        match unsafe { sys::kapi_copy_from_user(dst.as_mut_ptr(), uaddr, dst.len()) } { 0 => Ok(()), e => Err(e) }
+    }
+    pub fn copy_to_user(uaddr: usize, src: &[u8]) -> Result<(), i32> {
+        match unsafe { sys::kapi_copy_to_user(uaddr, src.as_ptr(), src.len()) } { 0 => Ok(()), e => Err(e) }
+    }
+    /// The index-th PCI function of any kind; None past the end.
+    pub fn pci_scan(index: u32) -> Option<KPciDev> {
+        let mut d = core::mem::MaybeUninit::<KPciDev>::uninit();
+        if unsafe { sys::kapi_pci_scan(index, d.as_mut_ptr()) } == 0 { Some(unsafe { d.assume_init() }) } else { None }
+    }
+    pub fn irq_request_msix(bdf: u32, entry: u16, handler: KIrqHandler, ctx: usize) -> Result<u8, i64> {
+        match unsafe { sys::kapi_irq_request_msix(owner(), bdf, entry, handler, ctx) } { v if v < 0 => Err(v), v => Ok(v as u8) }
+    }
+    pub fn fw_root_ready() -> bool { unsafe { sys::kapi_fw_root_ready() } }
+    /// Load firmware: (handle, data, len). The data stays valid until `fw_release(handle)`.
+    pub fn fw_request(path: &str, max: usize) -> Option<(usize, *const u8, usize)> {
+        let (mut n, mut p) = (0usize, core::ptr::null::<u8>());
+        match unsafe { sys::kapi_fw_request(path.as_ptr(), path.len(), max, &mut n, &mut p) } { 0 => None, h => Some((h, p, n)) }
+    }
+    pub fn fw_release(h: usize) { unsafe { sys::kapi_fw_release(h) } }
+    /// Command-line secret; the caller must have registered a netdev. Err is the negative errno-style code.
+    pub fn secret_peek(key: &str, buf: &mut [u8]) -> Result<usize, isize> {
+        match unsafe { sys::kapi_secret_peek(owner(), key.as_ptr(), key.len(), buf.as_mut_ptr(), buf.len()) } { n if n < 0 => Err(n), n => Ok(n as usize) }
+    }
+    /// (EBUSY refusals, pending backend events).
+    pub fn ext_event_stats() -> (u64, u64) {
+        let mut o = [0u64; 2];
+        unsafe { sys::kapi_ext_event_stats(o.as_mut_ptr()) };
+        (o[0], o[1])
+    }
+    /// Bytes of the PRIME/GEM counters line written to `buf` (0 when all zero).
+    pub fn proc_prime(buf: &mut [u8]) -> Result<usize, isize> {
+        match unsafe { sys::kapi_proc_prime(buf.as_mut_ptr(), buf.len()) } { n if n < 0 => Err(n), n => Ok(n as usize) }
     }
 }
 

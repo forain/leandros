@@ -157,8 +157,8 @@ pub fn load_image(img: &[u8], src: Source) -> Result<KmodId, KmodErr> {
         log(&alloc::format!("[kmod] {} loaded id {} slot {:#x} {} pages\n", nm, id.0, base, pages.len()));
         return Ok(id);
     }
-    if registry::reg_count(id) == 0 {
-        // Nothing can reference the slot: unmap, free, release, forget, so a retry works.
+    if registry::release_all(id) {
+        // Callbacks that can be taken back were unregistered; nothing can reference the slot: unmap, free, release, forget, so a retry works.
         for &(v, _, _) in &pages { unsafe { kmodwin::unmap(v, 1); } }
         free_all(&pages);
         kmodwin::release(base, size);

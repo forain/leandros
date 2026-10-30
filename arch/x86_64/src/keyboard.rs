@@ -366,6 +366,8 @@ fn handle_scancode(scancode: u8) {
         match code {
             0x1C => 96,  // KEY_KPENTER
             0x1D => 97,  // KEY_RIGHTCTRL
+            0x12 => 224, // KEY_BRIGHTNESSDOWN (HP EliteBook 840 G5)
+            0x17 => 225, // KEY_BRIGHTNESSUP (HP EliteBook 840 G5)
             0x20 => 113, // KEY_MUTE
             0x2E => 114, // KEY_VOLUMEDOWN
             0x30 => 115, // KEY_VOLUMEUP

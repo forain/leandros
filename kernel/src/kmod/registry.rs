@@ -75,3 +75,27 @@ pub fn registrations(owner: KmodId, f: &mut dyn FnMut(RegKind, u64)) {
     let snap: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == owner).map(|r| (r.1, r.2)).collect();
     for (k, h) in snap { f(k, h); }
 }
+
+/// Release one registration whose callback can be taken back. False = the kind has no unregister
+/// path (irq, netdev, hwrng, kthread, usb class): the slot must then stay mapped.
+fn release_one(owner: KmodId, kind: RegKind, handle: u64) -> bool {
+    match kind {
+        RegKind::TICK => { usb::class::tick_unregister_owner(owner); true }
+        RegKind::PM => { super::exports::pm_unregister_owner(owner); true }
+        RegKind::V4L2 => { crate::syscall::v4l2::unregister_camera(handle as usize); true }
+        _ => false,
+    }
+}
+
+/// Failed init: unregister every registration that can be taken back, dropping its record.
+/// True when none is left, i.e. nothing can call into the module and its slot may be freed.
+pub fn release_all(owner: KmodId) -> bool {
+    let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == owner).map(|r| (r.1, r.2)).collect();
+    for (k, h) in recs {
+        if release_one(owner, k, h) {
+            let mut r = REGS.lock();
+            if let Some(i) = r.iter().position(|x| x.0 == owner && x.1 == k && x.2 == h) { r.remove(i); }
+        }
+    }
+    reg_count(owner) == 0
+}
