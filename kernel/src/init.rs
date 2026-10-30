@@ -223,6 +223,12 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             Err(_) => false,
         },
         flush: |i| drivers::blkdev::flush(i),
+        set_rw: |i| match drivers::blkdev::describe(i) {
+            Some(d) if d.class == "nvme" && d.parent.is_none() =>
+                core::str::from_utf8(&d.name[..d.nlen as usize])
+                    .map_or(false, |n| drivers::nvme::set_writable(n)),
+            _ => false,
+        },
     };
     vfs_server::block::init(&DISK_OPS);
 
