@@ -20,3 +20,10 @@ Status: PARTIAL. Delivered: input kapi + VIRTIO_KEYBOARD tristate. Deferred: USB
 - W2-6c: USB_STORAGE onto bulk kapi + blk class (relocate usb_storage::sleep_until, usb::tick).
 - W2-6d: BT HCI kapi.
 - Merge note: kmodwifi may also add RegKind 12 / exports; keep main's values, renumber INPUT, recount NEXPORTS.
+
+## W2-6a: USB_HID as a loadable module (lane kmodusbin2/3)
+- DELIVERED: CONFIG_USB_HID=m. modules/usb-hid (slot usb_hid) binds boot keyboards/mice via the `usb 03 01 01/02` alias, opens the interrupt pipe over new kapi_usb_intr_open/poll/out/close, and registers per-device evdev nodes (kapi_input kinds 2/3, kapi_input_unregister/_event_console/_leds/_repeat, rel pointer). kapi exports 87 -> 97.
+- Shipped configs keep USB_HID=y (unchanged boot-keyboard path).
+- Evidence: aarch64 default, x86_64 default and x86_64 USB_HID=m build; ktest=kmodkapi PASS on both arches; autoloadtest usb_hid PASS (aarch64); usbunplugtest hid phase with USB_HID=m (aarch64): keys on per-device node, unplug/replug, ENODEV/POLLHUP all PASS; usbunplugtest all with USB_HID=y PASS; kmod selftest.sh aarch64 PASS.
+- Test change: the (e) name check accepts the module's generic "USB HID keyboard".
+- Limits / deferred: module names devices generically (not the product string); only boot HID interfaces via intr_open; =y path is still handled in xhci enumeration (HID class-driver path for =y not done); kapi_usb_bulk, USB_STORAGE (W2-6c), BT not started.
