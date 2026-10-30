@@ -42,7 +42,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use crate::gpu_kms::{KmsBackend, KmsFbReq};
+use crate::kenv::kms::{KmsBackend, KmsFbReq};
 use crate::DriverError;
 
 use super::hw::{self, reg};
@@ -184,7 +184,7 @@ pub(super) fn ddb_test() {
         let t0 = super::now_ns();
         while super::now_ns().wrapping_sub(t0) < 50_000_000 {
             if m.r(preg(PLANE_SURFLIVE_1_A)) & !0xFFF == surf & !0xFFF { return true; }
-            sched::kthread::msleep(1);
+            crate::kenv::sched::kthread::msleep(1);
         }
         false
     };
@@ -193,7 +193,7 @@ pub(super) fn ddb_test() {
           old_buf, ddb_entry(ps, pe), ps, pe, ce, &old_wm[..WM_LEVELS], &wm[..WM_LEVELS]);
     let latched = arm(ddb_entry(ps, pe), &wm);
     let t0 = super::now_ns();
-    while super::now_ns().wrapping_sub(t0) < 10_000_000_000 { sched::kthread::msleep(100); let _ = underruns(); }
+    while super::now_ns().wrapping_sub(t0) < 10_000_000_000 { crate::kenv::sched::kthread::msleep(100); let _ = underruns(); }
     let u1 = underruns();
     let live = m.r(preg(PLANE_BUF_CFG_1_A));
     let back = arm(old_buf, &old_wm);
@@ -328,7 +328,7 @@ pub(super) fn flush_for_display(phys: u64, len: u64) {
             has = (core::arch::x86_64::__cpuid_count(7, 0).ebx >> 23) & 1; // CPUID.7.0:EBX.CLFLUSHOPT
             OPT.store(has, Ordering::Relaxed);
         }
-        let va = mm::phys_to_virt(phys as usize);
+        let va = crate::kenv::mm::phys_to_virt(phys as usize);
         let mut p = va & !63;
         let end = va + len as usize;
         if has == 1 {
@@ -400,7 +400,7 @@ fn program(ctl: u32, stride: u32, offset: u32, surf: u32, wait: bool, native: bo
     let t0 = super::now_ns();
     while super::now_ns().wrapping_sub(t0) < 50_000_000 {
         if m.r(preg(PLANE_SURFLIVE_1_A)) & !0xFFF == surf & !0xFFF { return true; }
-        sched::kthread::msleep(1);
+        crate::kenv::sched::kthread::msleep(1);
     }
     if LATE.fetch_add(1, Ordering::Relaxed) < 4 {
         ilog!("kms: flip to GGTT 0x{:08x} not latched after 50 ms (SURFLIVE=0x{:08x})", surf, m.r(preg(PLANE_SURFLIVE_1_A)));
@@ -622,7 +622,7 @@ pub(super) fn after_arm(r: &FlipRegs, a: &Armed, t: (u64, u64, u64)) {
         let slow = t.1 - t.0 > 20_000_000 || !a.latched || a.prev == 0;
         if slow || ur != 0 || dbg_ok() {
             let m = mmio();
-            let (pres, perr, vtr) = crate::drm_device_interface::ext_present_stats();
+            let (pres, perr, vtr) = crate::kenv::drm::ext_present_stats();
             ilog!("kms: flip #{} fb {} (prev {}) fence {} us flush {} us latch {} us{} FRMCOUNT {} underruns {} console-restores {} presents/errors/VT-repaints {}/{}/{} PSR_STATUS 0x{:08x}",
                   FLIPS.load(Ordering::Relaxed) + 1, r.token, a.prev, (t.1 - t.0) / 1000, (t.2 - t.1) / 1000, t3.saturating_sub(t.2) / 1000,
                   if a.latched { "" } else { " NOT LATCHED" }, m.r(reg::pipe(reg::PIPE_FRMCOUNT_A, PIPE)),
@@ -665,7 +665,7 @@ fn dump(n: u32, token: u32, fb: &Fb, src_x: u32, src_y: u32, mw: u32, mh: u32) {
     let hdr = alloc::format!("P6\n{} {}\n255\n", ow, oh);
     let mut img = alloc::vec::Vec::with_capacity(hdr.len() + (ow * oh * 3) as usize);
     img.extend_from_slice(hdr.as_bytes());
-    let base = mm::phys_to_virt(fb.phys as usize) + fb.offset as usize + src_y as usize * fb.pitch as usize + src_x as usize * 4;
+    let base = crate::kenv::mm::phys_to_virt(fb.phys as usize) + fb.offset as usize + src_y as usize * fb.pitch as usize + src_x as usize * 4;
     let mut row = alloc::vec![[0u32; 3]; ow as usize];
     for oy in 0..oh {
         for a in row.iter_mut() { *a = [0; 3]; }
@@ -706,7 +706,7 @@ fn native_setup(m: &Mmio, gw: u32, gh: u32) -> Option<(u32, u32)> {
     // else transcoder A.
     let edp = m.r(reg::TRANS_DDI_FUNC_CTL_EDP);
     let edp_on = m.r(reg::TRANSCONF_EDP) >> 31 != 0 && edp >> 31 != 0 && matches!((edp >> 12) & 7, 0 | 4);
-    crate::gpu_kms::set_internal_panel(edp_on);
+    crate::kenv::kms::set_internal_panel(edp_on);
     let (tbase, ddi, name) = if edp_on {
         (reg::TRANS_HTOTAL_EDP, edp, "eDP")
     } else if m.r(reg::TRANSCONF_A) >> 31 != 0 {
@@ -1012,7 +1012,7 @@ pub(super) fn init(d: &Device, env: &BootEnv) {
     super::outputs::init(d);
     super::pipeb_stub::init(d);
     super::pipeb::init(d);
-    crate::gpu_kms::register(&BACKEND);
+    crate::kenv::kms::register(&BACKEND);
     ilog!("kms: flips {}; hardware cursor {}",
           if vbl { "on real vblank (queued, armed after the render fence, event at the latching vblank; i915.vblank=0: synchronous + 60 Hz synthetic events)" }
           else { "synchronous, events on the 60 Hz synthetic vblank" },
@@ -1055,16 +1055,16 @@ pub(super) fn pm_plane_on() -> Result<alloc::string::String, alloc::string::Stri
     let surf = m.r(preg(reg::PLANE_SURF_1_A));
     m.w(preg(reg::PLANE_CTL_1_A), ctl);
     m.w(preg(reg::PLANE_SURF_1_A), surf);
-    let t = sched::monotonic_ns();
+    let t = crate::kenv::sched::monotonic_ns();
     loop {
         let live = m.r(preg(PLANE_SURFLIVE_1_A));
         let on = m.r(preg(reg::PLANE_CTL_1_A)) >> 31 != 0;
         if on && live & !0xFFF == surf & !0xFFF {
-            return Ok(alloc::format!("plane 1A on, scanning out {:08x} after {} us", live, (sched::monotonic_ns() - t) / 1000));
+            return Ok(alloc::format!("plane 1A on, scanning out {:08x} after {} us", live, (crate::kenv::sched::monotonic_ns() - t) / 1000));
         }
-        if sched::monotonic_ns() - t > 100_000_000 {
+        if crate::kenv::sched::monotonic_ns() - t > 100_000_000 {
             return Err(alloc::format!("plane 1A: SURFLIVE {:08x} != SURF {:08x} after 100 ms (CTL on={})", live, surf, on));
         }
-        sched::kthread::msleep(1);
+        crate::kenv::sched::kthread::msleep(1);
     }
 }

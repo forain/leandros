@@ -44,18 +44,18 @@ static BACKOFF_UNTIL: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 static CONSEC: AtomicU32 = AtomicU32::new(0);
 
 fn tr(args: core::fmt::Arguments) {
-    if TRACE.load(Ordering::Relaxed) { crate::i915::emit(&alloc::format!("acpi: ec {}\n", args)); }
+    if TRACE.load(Ordering::Relaxed) { crate::kdiag::emit(&alloc::format!("acpi: ec {}\n", args)); }
 }
 
 /// Wait until `(status & mask) == want`, up to ~50 ms.
 fn wait(cmd: u16, mask: u8, want: u8) -> bool {
-    let t0 = crate::i915::now_ns();
+    let t0 = crate::kdiag::now_ns();
     loop {
         if inb(cmd) & mask == want { return true; }
-        let now = crate::i915::now_ns();
+        let now = crate::kdiag::now_ns();
         if now.wrapping_sub(t0) > 50_000_000 {
             let n = TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
-            if n <= 16 { crate::i915::emit(&alloc::format!("acpi: ec TIMEOUT #{} status={:#x} mask={:#x} want={:#x}\n", n, inb(cmd), mask, want)); }
+            if n <= 16 { crate::kdiag::emit(&alloc::format!("acpi: ec TIMEOUT #{} status={:#x} mask={:#x} want={:#x}\n", n, inb(cmd), mask, want)); }
             // A dead EC must not cost 50 ms per access: back off for 1 s after 4 in a row.
             if CONSEC.fetch_add(1, Ordering::Relaxed) + 1 >= 4 {
                 BACKOFF_UNTIL.store(now + 1_000_000_000, Ordering::Relaxed);
@@ -69,7 +69,7 @@ fn wait(cmd: u16, mask: u8, want: u8) -> bool {
 
 fn ok() { CONSEC.store(0, Ordering::Relaxed); }
 
-fn backed_off() -> bool { crate::i915::now_ns() < BACKOFF_UNTIL.load(Ordering::Relaxed) }
+fn backed_off() -> bool { crate::kdiag::now_ns() < BACKOFF_UNTIL.load(Ordering::Relaxed) }
 
 /// Drop a stale output byte before a command (bounded).
 fn drain(d: u16, c: u16) { for _ in 0..16 { if inb(c) & OBF == 0 { break; } let _ = inb(d); } }
@@ -135,7 +135,7 @@ pub fn dump() {
         for col in 0..16u16 {
             match read((row * 16 + col) as u8) { Some(v) => s.push_str(&alloc::format!("{:02x} ", v)), None => s.push_str("?? ") }
         }
-        crate::i915::emit(&alloc::format!("acpi: ecdump {:02x}: {}\n", row * 16, s));
+        crate::kdiag::emit(&alloc::format!("acpi: ecdump {:02x}: {}\n", row * 16, s));
     }
 }
 

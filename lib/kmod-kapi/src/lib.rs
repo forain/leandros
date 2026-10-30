@@ -538,6 +538,15 @@ pub mod drm {
     use super::{owner, sys};
     /// Register the table (valid for the life of the module). 0, -22 bad table, -17 backend already installed.
     pub fn register(ops: *const u8, ctx: usize) -> i32 { unsafe { sys::kapi_drm_register(owner(), ops, ctx) } }
+    /// KMS table kinds for `kms_register` (`drivers::kms_class::KIND_*`).
+    pub const KMS_BACKEND: u32 = 0; pub const KMS_FLIP: u32 = 1; pub const KMS_CURSOR: u32 = 2;
+    pub const KMS_OUTPUTS: u32 = 3; pub const KMS_PIPE2: u32 = 4; pub const KMS_CURSOR2: u32 = 5;
+    /// Register a KMS table of `kind` (valid for the life of the module). 0, -22 bad, -17 already registered.
+    pub fn kms_register(kind: u32, ops: *const u8, ctx: usize) -> i32 { unsafe { sys::kapi_kms_register(owner(), kind, ops, ctx) } }
+    pub fn kms_set_internal_panel(v: bool) { unsafe { sys::kapi_kms_set_internal_panel(v) } }
+    pub fn hotplug(minor: u8) { unsafe { sys::kapi_drm_hotplug(minor) } }
+    pub fn ext_present_stats() -> [u64; 3] { let mut o = [0u64; 3]; unsafe { sys::kapi_ext_present_stats(o.as_mut_ptr()) }; o }
+    pub fn tmpfs_census() -> Option<[u64; 9]> { let mut o = [0u64; 9]; if unsafe { sys::kapi_tmpfs_census(o.as_mut_ptr()) } { Some(o) } else { None } }
     pub fn offset_alloc(real: u64, size: u64) -> Option<u64> { match unsafe { sys::kapi_drm_offset_alloc(real, size) } { 0 => None, o => Some(o) } }
     pub fn offset_release(real: u64) { unsafe { sys::kapi_drm_offset_release(real) } }
     pub fn fence_wait(ids: &[u64], deadline_ns: u64) -> i32 { unsafe { sys::kapi_fence_wait(ids.as_ptr(), ids.len(), deadline_ns) } }

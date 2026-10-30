@@ -134,7 +134,7 @@ Tristate symbols and their module (all default to `y`; slot numbers in [modules/
 
 - **Tied to one kernel build.** Build-id lock and addresses linked into the image (section 2). You cannot copy a `.kmod` from another kernel, or update the kernel and keep the old initrd.
 - **Slot limits.** A module must fit its SLOTS allocation (e.g. 8 x 256 KiB for nvme). Growing a driver may mean a new SLOTS line (check the file's "next free" comment).
-- **Only the kapi is reachable.** A driver that needs a kernel facility not in the 127 exports needs a new export, and an exported function becomes ABI the module crates compile against (`KMOD_ABI_VERSION = 1`).
+- **Only the kapi is reachable.** A driver that needs a kernel facility not in the 132 exports needs a new export, and an exported function becomes ABI the module crates compile against (`KMOD_ABI_VERSION = 1`).
 - **No unload.** `delete_module` is `EBUSY`; a module that registered a thread, IRQ or device cannot be torn down safely. A failed `init` is the only path that releases a slot. For example, with a radio present the iwlwifi radio thread pins the module, so unloading it would only ever be clean with no device.
 - **Crash-time and boot-critical paths stay in the kernel.** Panic output, the persistent kernel log, kexec's device quiesce, and the console cannot depend on a loadable driver. Where such a hook is needed from a module (shutdown, suspend, kexec quiesce), it is registered through the kapi power-management table and ordered by phase.
 - **Per-driver reductions**, to keep the first versions simple:
@@ -148,7 +148,7 @@ Tristate symbols and their module (all default to `y`; slot numbers in [modules/
 
 All of this is in the regression/ktest tooling, none on real hardware:
 
-- **`ktest=kmodkapi`** ([kernel/src/ktest.rs](../../kernel/src/ktest.rs)) exercises the 127 exports and per-callback-kind failed-init release, on both arches.
+- **`ktest=kmodkapi`** ([kernel/src/ktest.rs](../../kernel/src/ktest.rs)) exercises the 132 exports and per-callback-kind failed-init release, on both arches.
 - **`scripts/kmod/selftest.sh <arch>`** is the module pipeline self-test; **`scripts/kmod/autoloadtest.sh <mod>`** builds a kernel with that driver `=m` and asserts the device works through alias autoload, and that blacklisting it removes the device. Cases: e1000e, virtio_rng, virtio_net (via `nettest`), virtio_keyboard, virtio_snd, hda, iwlwifi, usb_hid, bt, virtio_blk/nvme (negative cases), and `of`.
 - **`scripts/kmod/rootmodtest.sh <nvme|usb_storage|sdhci>`** (bus chosen by `LEANDROS_ROOTFS_BUS`) builds a kernel with that storage driver `=m`, boots with the root on that bus and asserts the root mounts through the initrd module path. aarch64 results: nvme PASS, usb_storage PASS, sdhci PASS (`-M raspi4b`). `sdhci` is aarch64 only. The sdhci module reports a fixed 256 GiB capacity because it does not decode C_SIZE, so other card sizes are not reported correctly.
 - **`kexecblktest`** (`runtests ... kexecblk`) is the root-on-module gate: a kernel built `MODULES=y VIRTIO_BLK=m` is kexec'd and must mount root.

@@ -90,8 +90,9 @@ impl RegKind {
     pub const BLK: RegKind = RegKind(11);
     pub const INPUT: RegKind = RegKind(12);
     pub const DRM: RegKind = RegKind(13);
-    pub const PLAT: RegKind = RegKind(14);
-    pub const DMAQ: RegKind = RegKind(15);
+    pub const KMS: RegKind = RegKind(14);
+    pub const PLAT: RegKind = RegKind(15);
+    pub const DMAQ: RegKind = RegKind(16);
 }
 
 /// Device-id table entry (`.kmod.ids`), 16 bytes. PCI: a=vendor, b=device (0xffff = any).
@@ -500,6 +501,11 @@ pub mod sys {
         pub fn kapi_random_fill(buf: *mut u8, len: usize);
         pub fn kapi_wifi_register(owner: super::KmodId, ops: *const u8, ctx: usize, legacy: *const u8) -> i32;
         pub fn kapi_drm_register(owner: super::KmodId, ops: *const u8, ctx: usize) -> i32;
+        pub fn kapi_kms_register(owner: super::KmodId, kind: u32, ops: *const u8, ctx: usize) -> i32;
+        pub fn kapi_kms_set_internal_panel(v: bool);
+        pub fn kapi_drm_hotplug(minor: u8);
+        pub fn kapi_ext_present_stats(out: *mut u64);
+        pub fn kapi_tmpfs_census(out: *mut u64) -> bool;
         pub fn kapi_drm_offset_alloc(real: u64, size: u64) -> u64;
         pub fn kapi_drm_offset_release(real: u64);
         pub fn kapi_fence_wait(ids: *const u64, n: usize, deadline_ns: u64) -> i32;
