@@ -742,4 +742,23 @@ pub mod usb {
         rc(unsafe { sys::kapi_usb_intr_out(pipe, data.as_ptr(), data.len()) }).map(|_| ())
     }
     pub fn intr_close(pipe: u64) { unsafe { sys::kapi_usb_intr_close(pipe) } }
+
+    /// Bulk-only transfer ops of `bulk`.
+    pub const BULK_OUT: u32 = 0;
+    pub const BULK_IN: u32 = 1;
+    pub const BULK_CLEAR_IN: u32 = 2;
+    pub const BULK_CLEAR_OUT: u32 = 3;
+    pub const BULK_CTL_OUT: u32 = 4;
+    pub const BULK_CTL_IN: u32 = 5;
+    /// Configure the bulk-only interface `iface`. Ok = pipe handle. Task context.
+    pub fn bulk_open(handle: u64, iface: u8) -> Result<u64, i32> {
+        let r = unsafe { sys::kapi_usb_bulk_open(handle, iface) };
+        if r < 0 { Err(r as i32) } else { Ok(r as u64) }
+    }
+    /// One transfer (see the kernel's `kapi_usb_bulk`): Ok(bytes) or Err(-errno). Sleeps.
+    pub fn bulk(pipe: u64, op: u32, arg: u64, buf: *mut u8, len: usize, timeout_ns: u64) -> Result<usize, i32> {
+        let r = unsafe { sys::kapi_usb_bulk(pipe, op, arg, buf, len, timeout_ns) };
+        if r < 0 { Err(r as i32) } else { Ok(r as usize) }
+    }
+    pub fn bulk_close(pipe: u64) { unsafe { sys::kapi_usb_bulk_close(pipe) } }
 }

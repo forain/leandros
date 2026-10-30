@@ -16,3 +16,5 @@ spin.workspace = true
 uvc-module = []
 # CONFIG_USB_HID=m: boot HID is left to modules/usb-hid (the enumerator hands the function to the class registry).
 hid-module = []
+# CONFIG_USB_STORAGE=m: the enumerator leaves bulk-only interfaces to the usb-storage module (class registry).
+msc-module = []

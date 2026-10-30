@@ -195,6 +195,11 @@ pub mod usb_hid;
 pub mod rel_pointer;
 pub mod psmouse;
 /// USB mass storage (xHCI bulk-only + SCSI) registered as `sdX` block devices.
+#[cfg(feature = "drv-usb-storage")]
+pub mod usb_storage;
+/// CONFIG_USB_STORAGE=m or n: the module (or nothing) owns the disks; the hot-plug scan still runs.
+#[cfg(not(feature = "drv-usb-storage"))]
+#[path = "stubs/usb_storage.rs"]
 pub mod usb_storage;
 /// NVMe SSDs registered as `nvme<C>n<N>` block devices (read-only unless `nvme.rw=1`).
 #[cfg(feature = "drv-nvme")]

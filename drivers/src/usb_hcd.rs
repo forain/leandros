@@ -102,7 +102,7 @@ fn relax() {
             // for hundreds of milliseconds costs a few hundred wake-ups.
             let waited = now.saturating_sub(STREAK[cpu].load(Ordering::Relaxed));
             let park = (waited / 8).clamp(100_000, 2_000_000);
-            crate::usb_storage::sleep_until(now + park);
+            crate::kenv::sleep_until(now + park);
             // Possibly another CPU now: continue the streak there.
             let c2 = (unsafe { sched::cpu_id() }).min(sched::MAX_CPUS - 1);
             if c2 != cpu { STREAK[c2].store(STREAK[cpu].load(Ordering::Relaxed), Ordering::Relaxed); }

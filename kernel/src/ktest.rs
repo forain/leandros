@@ -572,7 +572,7 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 97 && exports::NEXPORTS == 97, "ksymtab has 97 exports");
+    t.check(exports::ksymtab().len() == 100 && exports::NEXPORTS == 100, "ksymtab has 100 exports");
     t.check(exports::lookup("kapi_wifi_register").is_some(), "kapi_wifi_register in KSYMTAB");
     #[cfg(feature = "drv-wifi-stack")]
     {
@@ -603,6 +603,9 @@ fn t_kmodkapi() -> T {
         t.check(kapi_input_register(KmodId(0), 2, core::ptr::null(), 0, 0, 0, 0) == -22, "kapi_input_register dev kind null name -> -22");
         t.check(crate::kmod::exports::kapi_usb_intr_open(0xdead, 0x81, 8) == -19, "kapi_usb_intr_open bad handle -> -19");
         t.check(crate::kmod::exports::kapi_usb_intr_open(1, 0x81, 0) == -22, "kapi_usb_intr_open max 0 -> -22");
+        t.check(crate::kmod::exports::kapi_usb_bulk_open(0xdead, 0) == -19, "kapi_usb_bulk_open bad handle -> -19");
+        t.check(crate::kmod::exports::kapi_usb_bulk(0xdead, 1, 0, core::ptr::null_mut(), 0, 1_000_000) == -19, "kapi_usb_bulk bad pipe -> -19");
+        t.check(crate::kmod::exports::kapi_usb_bulk(0xdead, 1, 0, core::ptr::null_mut(), 8, 1_000_000) == -22, "kapi_usb_bulk null buf -> -22");
         t.check(crate::kmod::exports::kapi_usb_intr_poll(0xdead, core::ptr::null_mut(), 0) == -19, "kapi_usb_intr_poll bad pipe -> -19");
         t.check(crate::kmod::exports::kapi_usb_intr_out(0xdead, [0u8].as_ptr(), 1) == -19, "kapi_usb_intr_out bad pipe -> -19");
         t.check(crate::kmod::exports::kapi_usb_intr_out(0xdead, core::ptr::null(), 1) == -22, "kapi_usb_intr_out null -> -22");
