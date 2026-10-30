@@ -36,7 +36,7 @@ accounts, `/etc` files, icon themes and desktop entries are seeded.
   kernel implements Linux's syscall numbers and semantics rather than a translation layer.
   When a port needs a change, the change goes into LeandrOS first, a build flag second, and a
   source patch to the third-party project last — and never, by policy, into COSMIC (see
-  [../desktop/README.md](../desktop/README.md#zero-cosmic-source-patches-with-one-approved-exception)).
+  [../desktop/README.md](../desktop/README.md#almost-no-cosmic-source-patches)).
 - **In-tree code is Rust by rule.** Programs, tests and probes written for LeandrOS are Rust
   crates under `userland/` or `ports/`; a capability worth keeping is rewritten as a crate
   rather than imported as C.

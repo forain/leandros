@@ -118,7 +118,7 @@ A new `static mut` must fit one of those categories and say which in a comment; 
 
 **Rule.** A failure path that returns a generic errno for a specific limit must be traceable to that limit: every `ENOMEM` in the memory, address-space and exec paths goes through `enomem_site("…")`, and every fixed-size kernel table reports itself full in one ungated line, once.
 
-**Why.** `ENOMEM` meant about a dozen unrelated things, two of them about RAM. Two investigations hunted a memory leak with over a gigabyte free; the cause was a 64-entry IPC port table, and the visible symptom was `stat()` of an existing directory failing with "Out of memory" ([ipc.md](ipc.md#live_buckets-the-ceiling-that-looked-like-ram)). Today: `[IPC] port table FULL … this is ipc::port::LIVE_BUCKETS, not RAM`, `[VFS] ENOMEM: no reply port for this task`, `[SCHED] task table FULL … this is runqueue::MAX_TASKS, not RAM`, and the mapping failure reason from `mm::vmm::last_map_fail()` ([memory.md](memory.md#enomem-must-name-its-cause)).
+**Why.** `ENOMEM` meant about a dozen unrelated things, two of them about RAM. Two investigations hunted a memory leak with over a gigabyte free; the cause was a 64-entry IPC port table, and the visible symptom was `stat()` of an existing directory failing with "Out of memory" ([ipc.md](ipc.md#live_buckets-the-ceiling-that-looked-like-ram-history-the-table-is-a-slab-since-2026-10-19)). Today: `[IPC] port table FULL … this is ipc::port::LIVE_BUCKETS, not RAM`, `[VFS] ENOMEM: no reply port for this task`, `[SCHED] task table FULL … this is runqueue::MAX_TASKS, not RAM`, and the mapping failure reason from `mm::vmm::last_map_fail()` ([memory.md](memory.md#enomem-must-name-its-cause)).
 
 ## Fatal faults end the whole thread group
 

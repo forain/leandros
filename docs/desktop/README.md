@@ -117,7 +117,7 @@ The graphics side of this (Venus, virgl, Zink, Mesa, KMS) is documented in
 
 ## Design decisions
 
-### Zero COSMIC source patches, with one approved exception
+### Almost no COSMIC source patches
 
 The project rule is that temporary debug edits to COSMIC are fine and permanent ones are
 not: every permanent fix belongs on the LeandrOS side — kernel, shims, launchers or
@@ -139,7 +139,7 @@ Two permanent patches once existed and both are retired:
   (the 5 s timeout expiring, to within 22 ms) and now starts at 2.186 s
   ([ports/cosmic-session/README.md](../../ports/cosmic-session/README.md)).
 
-The **one approved exception** is
+Four patches remain, all in the compositor and idle daemon. The first is
 [ports/cosmic-comp/0001-toplevel-info-weak-window.patch](../../ports/cosmic-comp/0001-toplevel-info-weak-window.patch),
 approved on 2026-09-27 for one leak only. Each closed window left one GL texture alive in
 cosmic-comp, because every `ZcosmicToplevelHandleV1` held a *strong* clone of its window
@@ -148,9 +148,21 @@ fix (Smithay#1562, cosmic-comp#2084): the handle stores `Window::Weak` and upgra
 use. Smithay's draft PR #1921 was tried first and refuted for this leak — the same ~1
 texture per closed window persisted with it. Remove the port when upstream merges the fix.
 
+The other three came from lane blankplay (2026-10-18), which fixed Firefox misbehaving
+while the panel is blanked. They are upstream COSMIC bugs, not LeandrOS ones, so a patch is
+the only place to fix them (`artifacts/notes/lane-blankplay-2026-10-18.md`):
+
+- [ports/cosmic-comp/0002-kms-frame-callbacks-while-dpms-off.patch](../../ports/cosmic-comp/0002-kms-frame-callbacks-while-dpms-off.patch):
+  while an output is powered off nothing is submitted to KMS and no vblank drives frame
+  callbacks, so clients stalled; a throttled timer keeps sending them without waking the display.
+- [ports/cosmic-comp/0003-idle-inhibit-ignores-powered-off-outputs.patch](../../ports/cosmic-comp/0003-idle-inhibit-ignores-powered-off-outputs.patch):
+  an idle-inhibit-protocol inhibitor on a powered-off output no longer counts, so it cannot resume the outputs.
+- [ports/cosmic-idle/0001-screen-off-inhibit-no-wake.patch](../../ports/cosmic-idle/0001-screen-off-inhibit-no-wake.patch):
+  cosmic-idle no longer powers the outputs back on when Firefox takes its D-Bus screensaver inhibitor after screen-off.
+
 Patches to software that is *not* COSMIC are a different matter and are made freely when
 they are the right fix: busd (ours to ship, [session.md](session.md#busd)), greetd
-([login.md](login.md#the-greetd-deltas)), brush, and two Mesa patches.
+([login.md](login.md#the-greetd-deltas)), brush, sudo-rs, and two Mesa patches.
 
 ### GPU rendering only
 

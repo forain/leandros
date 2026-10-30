@@ -41,7 +41,7 @@ Scarce machines are arbitrated by `lock.sh <kind> <command…>` in the orchestra
 **Lane discipline learned the hard way.**
 
 - *Small lanes, short reports, fresh agents.* A lane has a tool-call budget (about 60), keeps tool output tiny, and when it runs out writes a hand-off file (done, in progress, next steps, the exact lines to change) instead of continuing in a bloated context.
-- *Lanes test AArch64 only; both architectures run once per merge batch on `main`.* An x86-64 or hardware claim is made on the machine that can make it ([the accelerator is not the arch](methodology.md#the-accelerator-is-not-the-arch)).
+- *Lanes test AArch64 only; both architectures run once per merge batch on `main`.* An x86-64 or hardware claim is made on the machine that can make it ([the accelerator is not the arch](methodology.md#the-accelerator-is-not-the-architecture)).
 - *A lane worktree is about 4 GiB* (images are dense; it was 9 to 18 GiB before the image slimming), and a full disk failed lanes twice on 2026-10-19/20. Remove the worktree after merging, and copy images with `cp -c` (clone) on macOS. The ports' target cache (`~/Library/Caches/leandros-ports`) grew to 236 GB once; check it first when the disk fills.
 - *Never `git stash`* (the stash is shared by every worktree) and never switch the branch of the main checkout: commit work in progress on the lane branch and merge `main` into it.
 - *The relibc sibling is shared*: commit relibc edits at once and small, on its `master`.

@@ -178,7 +178,7 @@ Known gaps:
   practice: the greeter's patch replaced by a staging decision, the session's patch retired
   after two kernel fixes with a before/after measurement, and the single approved compositor
   patch with its upstream references and a "remove when upstream merges" note
-  ([../desktop/README.md](../desktop/README.md#zero-cosmic-source-patches-with-one-approved-exception)).
+  ([../desktop/README.md](../desktop/README.md#almost-no-cosmic-source-patches)).
 - **cosmic-wgpu** turns on libcosmic's `wgpu` feature for the greeter, launcher,
   notifications, OSD, workspaces and files applet (Settings, App Library and the terminal
   already had it). wgpu's Vulkan and GLES backends are `dlopen`ed, so no `DT_NEEDED` changes;

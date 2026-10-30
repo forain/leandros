@@ -228,8 +228,9 @@ The lanes `pibtreconn`, `pibtacl` and `pibtrole` made this reliable enough to re
   resets the pool. `BTD_TRACE=1` or `/etc/btd.trace` (or `--trace`) logs `acl<`/`acl>`/`ncp`/`sig` lines, frames
   capped at 32 bytes of hex.
 
-Status: the reconnect on the Pi was not verified end to end in the last lane note (the pad was asleep, outbound
-page timeout `0x04`); incoming connection under role `0x00` showed `event2` and PSMs 0x11/0x13 open.
+Status: the lane note recorded the reconnect as unverified (the pad was asleep, outbound page timeout `0x04`);
+it was later verified end to end: on 2026-10-28, on the Pi 5 good kernel `f51a46029ffb`, the 8BitDo Lite 2 gamepad
+auto-reconnected (user-confirmed). Incoming connection under role `0x00` showed `event2` and PSMs 0x11/0x13 open.
 
 ## Supervision
 
