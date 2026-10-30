@@ -1699,6 +1699,7 @@ def main():
     cosapps_icon_dirs = []
     for _app, _appid in (("cosmic-files", "com.system76.CosmicFiles"),
                          ("cosmic-edit", "com.system76.CosmicEdit"),
+                         ("cosmic-store", "com.system76.CosmicStore"),
                          ("cosmic-screenshot", "com.system76.CosmicScreenshot")):
         _appbin = m6_pick(f"{m6_out}/{_app}-{arch}")
         if os.path.exists(_appbin):
