@@ -12,6 +12,8 @@ The image builder ([`scripts/mkfs-f2fs-populated.py`](../../scripts/mkfs-f2fs-po
 | `leandro` | 1000:1000 | `/home/leandro` | `/bin/brush` | `leandro` | `wheel` (10), `audio` (29), `video` (44), `input` (104), `netdev` (108) |
 | `cosmic-greeter` | 990:990 | `/home/cosmic-greeter` | `/bin/false` | none (cannot log in) | `video`, `input` |
 
+The image also defines the system groups `netdev` (108, which may drive NetworkManager's network-control actions), `video` (44, which may also write `backlight/*/brightness`, see [vfs.md](vfs.md#synthetic-sys)) and `bluetooth` (112, a Debian-style group: `btd.sock` and `/run/bluetooth/bthid.connect` are `root:bluetooth 0660`, and `leandro` is a member). The groups are what authorise the desktop's Bluetooth applet and brightness keys without making the session root.
+
 These are development credentials, well known by design. `cosmic-greeter` is a system account below `UID_MIN` so the greeter does not offer it as a login choice, and its `/bin/false` shell excludes it a second, independent way. Group numbers follow Debian's.
 
 ### /etc/shadow
@@ -96,6 +98,8 @@ Measured against a Linux host with the same test program (`userland/privtest`, w
 ### Power-off authorisation
 
 `init` accepts `poweroff`/`reboot`/`halt` requests on a stream socket at `/run/user/initctl` (sockets only live on tmpfs, and `/run/user` is the tmpfs only root may create entries in, so nobody can squat the name). The request is authorised from the peer's `SO_PEERCRED`: root always, anyone else only if the requesting process belongs to a local session init supervises (the graphical login, the serial login, or a text VT login) — logind's default `allow_active=yes` policy. The session's `login1` service and `/bin/poweroff`/`/bin/reboot`/`/bin/halt` ([`userland/poweroff`](../../userland/poweroff)) forward to it; the actual `reboot(2)` remains root-only.
+
+Two fixes in lane powerctl (2026-10-27) make this work from the places users look for it. The **greeter's Restart / Shut down buttons** did nothing because `cosmic-greeter` had been built `--no-default-features`, which compiles out the `logind` feature that its confirm handler is gated on; it is now built with `--features logind`, and `greeter-launch` starts it under `dbus-run-session` with `DBUS_SYSTEM_BUS_ADDRESS` pointing at the greeter account's own `/run/user/990/bus`, so `login1` is activated there as uid 990. In a **user session**, power-off runs COSMIC's OSD to `login1` `PowerOff`/`Reboot` to init as before; `leandros-sysbus power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>` is the `systemctl`/`loginctl`-style client, and `poweroff`/`reboot` run by a non-root user now go through `login1` instead of speaking to init directly. `powerctltest.py` covers it.
 
 ## The privilege boundary of the desktop
 

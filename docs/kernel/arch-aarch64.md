@@ -110,7 +110,7 @@ Covered above: both ID-register methods were measured to give the wrong answer o
 
 ## Limitations and open work
 
-- **No PAN** (`PSTATE.PAN` is never set), and executable user pages clear PXN as well as UXN, so the kernel could execute user code ([memory.md](memory.md#limitations-and-open-work)).
+- **PAN is on** (`SCTLR_EL1.SPAN = 0`, so every exception entry sets `PSTATE.PAN`; `[MMU] PAN on (strict)`; `pan=audit|off` relax it, see [memory.md](memory.md#smepsmap-and-pan-are-on-uaccess-is-the-only-way-in)). Executable user pages still clear PXN as well as UXN, so the kernel could execute user code ([memory.md](memory.md#limitations-and-open-work)).
 - **No MSI/MSI-X**: `request_msi` and `MsixTable::enable` return `Unsupported` until a GICv3 ITS driver exists.
 - `AT_HWCAP` is 0, so userspace selects baseline (non-crypto, non-atomics-extension) code paths.
 - The direct-boot park loop still elects on `MPIDR.Aff0` (the `raspi4b` path).

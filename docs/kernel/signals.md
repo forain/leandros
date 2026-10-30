@@ -148,6 +148,8 @@ Ctrl-T's task dump prints a stopped task as state `T` (see [../development/debug
 - No core dumps; `WCOREDUMP` is never set.
 - `SIGEV_THREAD` has no kernel meaning (libc builds it on `SIGEV_THREAD_ID`); it is accepted and never signals.
 - `signalfd` reads carry `ssi_signo`, `ssi_code`, `ssi_pid`, `ssi_uid`, `ssi_status`, but not `ssi_overrun` or `ssi_ptr` for timer signals.
+- `TIOCSIG` on a pty takes the signal number by value, as Linux does (it was read through a pointer until lane tiocsig, 2026-10-24).
+- A default-kill signal that arrives while a non-leader `execve` is de-threading is forwarded to the exec rather than dropped; see [processes.md](processes.md#exec-fatal-signals-and-clone-racing-a-group-exit).
 
 ## Code and tests
 
