@@ -2,21 +2,28 @@
 
 LeandrOS boots on a real Raspberry Pi 5 (BCM2712, Cortex-A76) from its SD card: firmware → kernel →
 init → F2FS root on the card → `pivot_root` → getty → `login:` → an interactive `brush` shell, all
-over the board's debug UART. This page covers the `rpi5` build, preparing and updating a card, the
-bring-up bugs that only real silicon exposed, and the display and GPU groundwork that is proven in
-QEMU but still waits for a hardware boot.
+over the board's debug UART, and since late October 2026 also over the network (Ethernet, Wi-Fi, USB),
+with Bluetooth, HDMI audio and a V3D-rendered GL stack. This page covers the `rpi5` build, preparing and
+updating a card, the bring-up bugs that only real silicon exposed, the RP1 / Wi-Fi / GPU / board drivers,
+and the network kernel-update flow. Bluetooth has its own page: [servers/bluetooth.md](../servers/bluetooth.md).
 
 ## Status
 
 | Area | State |
 |---|---|
 | Boot to a shell prompt over serial | **Working** since 2026-08-20 (`bc9de03`..`b328db7`) |
-| SD card (SDHCI) read/write, F2FS root | **Working**, zero transfer failures |
-| SD bus speed negotiation (4-bit, high speed) | Implemented and proven on QEMU `raspi4b` (`1efd015`); not yet confirmed on the Pi |
-| HDMI console via the VideoCore mailbox | Implemented and proven on QEMU `raspi4b` (`f480fbe`); not yet confirmed on the Pi |
-| GPU (V3D) | Mesa builds with `v3d`; the kernel side is an ioctl stub — see [graphics/mesa.md](../graphics/mesa.md) |
-| USB, Ethernet, Wi-Fi | **Not available**: they sit behind RP1 on PCIe, which is not brought up |
-| SMP | Four cores via PSCI. CPU enumeration moved to the device tree in 2026-10 (`963c681`); not re-verified on the Pi since |
+| SD card (SDHCI) read/write, F2FS root | **Working**; PIO, single-sector by default (see [SDHCI](#sdhci)) |
+| PCIe (`pcie2`) and RP1 | **On by default** since 2026-10-28; `pcie.rpi5=0` opts out |
+| Ethernet (RP1 Cadence GEM + BCM54213PE, `eth0`) | **Working** (1000M up in the 2026-10-28 matrix); bulk send fixed by CUBIC, see [Ethernet](#ethernet-gem--macb) |
+| USB (RP1 DWC3, two xHCI roots) | Probed and enumerated on hardware (`lsusb` shows two 1d6b:0003 root hubs) |
+| Wi-Fi (CYW43455 over SDIO, `wifi0`) | **Working**: firmware download, WPA2 join with a host 4-way handshake, DHCP; survives kexec |
+| Bluetooth | `/dev/hci0` over uarta, `btd`/`bthid` supervised by init; see [servers/bluetooth.md](../servers/bluetooth.md) |
+| Network kernel updates | **Working**: `remote.py pi-deploy` / `pi-boot` / `pi-promote` / `pi-sync`; serial push as the no-network fallback |
+| V3D 7.1 GPU | Ladder green on hardware (`v3d.probe=1`); Mesa `v3d` renders GLES; no display path for scanout apps yet |
+| HDMI audio | Implemented (IEC958, MAI, dma40 ring) as a PipeWire backend; audible output not confirmed in the lane notes |
+| Watchdog, panic reset, fan, RNG, RTC, thermal | Implemented; fan curve and wedge/panic behaviour confirmed on the Pi where noted below |
+| HDMI console via the VideoCore mailbox | Implemented and proven on QEMU `raspi4b` (`f480fbe`) |
+| SMP | Four cores via PSCI; kexec keeps all four (secondaries are parked, not powered off) |
 
 ## Building
 
@@ -123,8 +130,8 @@ points at an ELF. Until it is updated, prefer the copy above.
 
 The console is the **dedicated 3-pin JST debug connector** (BCM2712 `uart10` at physical
 `0x10_7D001000`), 115200 8N1, driven by `arch/aarch64/src/uart.rs`. It is **not** the GPIO 14/15 UART:
-that one lives inside RP1, behind PCIe, and is unreachable from a bare-metal kernel that does not
-train the PCIe link. Any 3.3 V USB-serial adapter works; on Linux the reading user typically needs to
+that one lives inside RP1, behind PCIe, and is not used as the console (RP1 is brought up later in
+boot, and a console must work before that). Any 3.3 V USB-serial adapter works; on Linux the reading user typically needs to
 be in the `uucp`/`dialout` group.
 
 On `rpi5`, `uart::reinit` **inherits** the firmware's programmed divisors (`IBRD`/`FBRD`/`LCRH`)
@@ -140,8 +147,9 @@ instead of computing them. The measured values were `IBRD=24, FBRD=0`, i.e. a UA
    EL2 → EL1, builds early page tables, enables the MMU **and the caches**, and enters `kernel_main`.
 3. `kernel_main` installs the exception vectors before its first MMIO touch, so an unbacked address
    produces an `ESR`/`FAR` line naming it rather than minutes of silence.
-4. PCIe probing is forced **off** (`BOOT_INFO.pci_ecam_base = 0`), the GIC-400 is driven as GICv2,
-   the mailbox framebuffer is requested, and the SDHCI driver brings up the card.
+4. The GIC-400 is driven as GICv2, the mailbox framebuffer is requested, and the SDHCI driver brings
+   up the card. The BCM2712 `pcie2` root complex and RP1 are brought up by the board code (no ECAM:
+   `BOOT_INFO.pci_ecam_base = 0`), unless `pcie.rpi5=0` (see [PCIe and RP1](#pcie-and-rp1)).
 5. Init mounts F2FS from partition 2, `pivot_root`s, and starts the serial getty.
 
 Pi builds stay GICv2-only by `cfg` (GIC-400); the GICv3 detection used on QEMU virt is compiled out.
@@ -224,7 +232,25 @@ speed, validated on the **64-byte DAT payload** (`status[16] & 0x0F == 1`), not 
 QEMU `raspi4b` result: `width=4 clk=26000kHz hs=1 base=52000kHz tran=25000kHz specver=2`; all four
 degradation paths still boot, including total refusal falling back to the 101 kHz identification
 floor. Expected effect on the Pi: roughly two minutes → about one second for that `brush` load.
-Not yet done: multi-block `CMD18`/`CMD25` — each 4 KiB block is still eight single-sector `CMD17`s.
+Multi-block transfers were added afterwards and are covered below.
+
+### Multi-block I/O, the tick stall, and the `sdhci.multi` knob
+
+- **Multi-block (`pisdperf`).** Contiguous spans can go out as one `CMD18`/`CMD25` with Auto-CMD12
+  (Transfer Mode bit 2, multi bit 5), up to 128 sectors = 64 KiB per command, and
+  `blkdev_sdhci::write_blocks` now passes a whole span down instead of 4 KiB calls. Any multi-block
+  failure resets CMD/DAT, aborts with a manual `CMD12`, and redoes the span sector by sector; three such
+  fallbacks disable multi-block for the rest of the boot. There is still no DMA (SDMA/ADMA2 were not
+  attempted); PIO multi-block under 10 MB/s on hardware is the stated trigger for that next step.
+- **It is off by default.** On a Pi build with PCIe/RP1 up, inbound SSH was refused (RST: no listener)
+  although sshd logged ready; the multi-block change was the only difference from the last working
+  kernel, so `lane/pisd-multi` made single-block the default. The root cause was not confirmed on the
+  Pi. `sdhci.multi=1` re-enables the multi-block path; the boot line says which mode is active
+  (`[sdhci] I/O mode: PIO single-sector CMD17/CMD24 (multi-block off; sdhci.multi=1 enables it)`).
+  `sdhci.multitest=1` runs a single-vs-multi read comparison self-test at probe.
+- **Tick stall (`pitickstall`).** The PIO loops used to run with interrupts masked long enough that Pi CPUs
+  went without timer ticks; the driver now opens IRQ windows per sector and every 1024 spins of its polled
+  waits, and takes the DEVICES lock per block on reads.
 
 ## Display: the VideoCore mailbox framebuffer
 
@@ -304,11 +330,239 @@ The V3D path is designed and partly built; details of the Mesa side are in
   so it is a separate dispatch selected per backend, never extra arms in the same `match`.
 - Mesa 25.3.6 builds with the `v3d` gallium driver for aarch64 (`5a40318`); it needs no LLVM.
 
+> **Superseded by the [V3D](#v3d-gpu) section below**, which records what was built and proven on hardware.
+> The paragraph that follows is the original plan.
+
 The remaining V3D work (GPU MMU, job queues and binner overflow, the ISR — an estimated 3,300–4,300
 lines) is hardware-in-the-loop only: QEMU models no V3D anywhere. It is staged behind two cheap
 milestones: reading `V3D_HUB_IDENT0` back as ASCII `"V3D"` with tech version 7 (proves discovery,
 mapping, power domain and clock in one register read), then a deliberate MMU fault at VA 0 caught by
 the ISR (proves page tables, MMU enable and the interrupt before any command list exists).
+
+## PCIe and RP1
+
+The Pi 5's USB, Ethernet, GPIO UART, fan PWM and LEDs all sit in the RP1 south bridge behind the BCM2712
+`pcie2` root complex. It is `drivers/src/brcmstb_pcie.rs` (pure sequencing in `brcmstb_hw.rs`, host-tested)
+plus `rp1.rs`, and as of `lane/pipcie-default` (2026-10-28) it is **on by default**; `pcie.rpi5=0` opts
+out (the boot prints `[pcie] off (pcie.rpi5=0)`). `rp1.irq` stays default off. All RP1 registrations
+(kexec quiesce hooks, USB controller list, `eth0`, fan) are reached only through `rp1::probe`, which runs
+only when the link came up, so a failed bring-up registers nothing. The 2026-10-28 matrix on the Pi
+(kexec trial to trial x3, `pcie.rpi5=0`, return to the previous kernel, 28-minute soak) found no bus
+corruption, watchdog or panic.
+
+Real-silicon findings that shaped it:
+
+- **The firmware leaves the x4 controller in reset** (`pciex4_reset=1`), so a down link at hand-over is
+  normal. An early stage-5 stall (`pipcie3`) was an RC register read-modify-write (`perst(true)`) issued
+  while the bridge reset held the RC block: the AXI read never completes. Between assert and de-assert of
+  the bridge reset only the reset block and a short delay are touched, as in Linux `brcm_pcie_setup()`.
+  Each bring-up stage is announced on the raw UART before its first access (`pipcie2`), so a stall names
+  its stage; `pcie.stop=N` stops after stage N and `pcie.reuse=1` reuses a link the previous kernel left up
+  (for hand-over experiments).
+- **RP1 BARs read all-ones** (`chip_id=0xFFFFFFFF`) because BAR sizing used sub-dword config writes, no BAR
+  was placed, and the root-port memory window was therefore written closed. BARs are now sized with dword
+  writes, placed, read back, and the window opened over them (`pirp1-bar`).
+- **Bus mastering never turned on** because sub-dword config writes did not land; they are now dword
+  read-modify-writes (`pigem-data`), which is what actually enables DMA for GEM and xHCI.
+- **Payload size.** The root complex splits read completions at its own MPS while RP1 resets to 128 B, so
+  256-byte DMA reads came back as malformed TLPs. RP1's MPS/MRRS now follow the root port (`pigem-tx`).
+- **No bus master survives a kexec** (`pikexecdma`). The RP1 GEM kept receiving into pages the next
+  kernel's buddy allocator had already handed out, which showed up as `[BUDDY] CORRUPT LINK` and as an
+  EPOLL null write. Each engine is now stopped at its own registers (`dma_shutdown` hooks: RP1 GEM, xHCI,
+  dma40), then `pcie2` is cut with PERST# and a bridge reset, and the next kernel starts with an early reset
+  (`[pcie] early reset`, `[kexec] quiesced: dma40 xhci0 xhci1 gem pcie-perst`).
+- RP1 clocks (`rp1_clk.rs`: PLLs read back, never reprogrammed; `clk_eth` 125 MHz, `clk_eth_tsu`/`clk_pwm1`
+  50 MHz enabled only if off), RP1 GPIO (`rp1_gpio.rs`: function, pull, RIO output/input, active-low reset
+  pulse) and the PWM fan, ACT/PWR LEDs and the KEY_POWER button (`pirp1`) hang off the same probe.
+
+### Ethernet (GEM / macb)
+
+`drivers/src/macb.rs` (+ `macb_hw.rs`, host tests in `drivers/macb-tests`) drives the Cadence GEM in RP1
+with the BCM54213PE PHY (clause-22 MDIO, RGMII delays as Linux `bcm54xx_config_clock_delay`) and
+registers `eth0` like r8169/e1000e. It is attached only by `rp1::probe`, and not at all if a GEM clock
+cannot be enabled. Hard-won details:
+
+- **Descriptor rings are Normal non-cacheable by default.** After a kexec the FDT is `linux,dummy-virt`,
+  which made the non-coherent-DMA detection (which looked for `brcm,bcm2712|2711` in the DTB) come up
+  coherent; rings then sat in write-back memory and RX stuck at slot 0 while the GEM reached slot 115.
+  The kexec FDT now carries the non-coherent mode, and `macb.dma=n` selects the ring mapping explicitly
+  (`pigem-coh`). Descriptor pages are invalidated behind the NC alias and a `dsb` precedes `TSTART`
+  (`pigem-ring`).
+- **TX recovery.** TSR `tfc|hresp` on large frame reads (see the MPS fix above), halted-transmitter
+  recovery, `macb.burst=` / buffer knobs (`pigem-tx`), a tail-keyed watchdog and resync (`macb.fix1=0`
+  disables; default on), and an opt-in polled `TSTART` re-ring (`macb.fix2=1`, default off: it did not help
+  and issued thousands of spurious `TSTART`s). `/proc/net/nic` shows hardware counters.
+- **Bulk send stall was above the NIC** (`pigem-bulk` refuted tail desync and lost `TSTART` on hardware).
+  The vendored smoltcp 0.11 had no congestion window, so every `eth0` burst was a full 256 KiB window.
+  `lane/pitcp` added Reno and CUBIC (`tcp.cc=none|reno|cubic`, default **cubic**; also `tcp.iw`,
+  `tcp.rto_min_ms`, `tcp.sndbuf_kb`, `net.cadence_us`), `/proc/net/tcpsnd`, and `netd_pass_hist:` in
+  `/proc/net/nic`. The lane records `eth0` bulk send going from 0.3 to 29 MB/s.
+
+### USB (RP1 DWC3)
+
+`dwc3_hw.rs` / `rp1_usb.rs` (`piusb`) set up RP1's two DWC3 cores in host mode (GCTL, core and PHY reset,
+Linux's `axi-pipe-limit`, TX threshold and GUCTL1 quirks), turn VBUS on through RP1 GPIO 42 and hand each
+to the existing xHCI driver with a DMA offset (`rp1::dma_addr`, `usb::platform::set_dma_offset`) because
+RP1 sees system RAM at a different bus address. DMA buffers come from non-cacheable coherent `DmaBuf`s,
+since this board is not DMA-coherent. The controllers join `usb_hcd`'s list so `quiesce_all` halts them
+before a kexec. A failed endpoint is recovered by disabling only its slot (`xhcisafe`), not the controller.
+
+## Wi-Fi (CYW43455 / brcmf)
+
+The on-board CYW43455 sits on `sdio2` (`drivers/src/brcmf/sdio_host.rs`, a PIO-polled SDHCI host with no GIC
+line) and is driven by `drivers/src/brcmf/` (chip, firmware, SDPCM, BCDC, `cfg.rs`, `netdev.rs`;
+host tests in `drivers/brcmf-tests`). It exposes `wifi0` through the same radio manager as iwlwifi
+(`wifi_mgr`; `/etc/leandros/wifi.conf` autoconnect and netctl profiles; `wifiscan` and `/proc/net/wifi` show
+the BSS cache). The firmware (`cyw43455-sdio.bin`, CLM, NVRAM) is staged into the root by
+`ports/brcmfmac/fetch.sh`; `prepare-rpi5-sdcard.sh --wifi-ssid NAME` writes the credentials (the SSID is
+never derived from the PSK file name: SSIDs are case-sensitive, and an early card used the wrong case).
+
+How the bring-up works and why it looks the way it does:
+
+- **Download order follows brcmfmac.** ALP clock only while downloading, KSO wake, CR4 halted and D11
+  reset, code at RAM base `0x198000`, NVRAM (with its length-token word) at the top of RAM, both read back,
+  CR4 released, then the HT clock requested with a **1 s** bound. The first version asked for HT before the
+  write with a 15 ms bound and failed with `fw HT clock timeout` on a fresh chip.
+- **Read-back must be word aligned.** With the 2_4B backplane flag the SDIO core drops address bits 1:0,
+  so the old unaligned 256-byte tail sample (offset 609053 of a 609309-byte image) read shifted bytes
+  and reported a mismatch although the write was fine (`pibrcmf-dl`). `peek`/`poke` and SDIO/download
+  retry knobs let a boot be bisected over serial.
+- **Runtime control file `/etc/brcmf.ctl`** is serviced once a second in every state (`status`, `scan`,
+  `join [ssid=..]`, `diag [lines=N]`, `retry [knobs]`); `retry` winds the manager down and re-probes with a
+  `WL_REG_ON` cycle. `/proc/net/nic` shows `wifi0` state, caps, join options and the RSN fields below, and
+  `/proc/klog` plus `dmesg` carry the `[brcmf]` lines.
+- **The firmware has no `idsup`, so the host runs the 4-way handshake.** Linux enables the in-firmware
+  supplicant only when `cap` lists `idsup`; this 7.45.265 build does not (the early symptom was
+  `BCME_UNSUPPORTED -23` on `sup_wpa`/`WLC_SET_WSEC_PMK`). `wifi_crypto::Supplicant` (shared with
+  iwlwifi) takes the EAPOL frames, answers message 2/4 through the firmware data path, and installs PTK and
+  GTK with `wsec_key`.
+- **AKM 6 / MFP.** The AP's RSN element is decoded at join. The auto choice is AKM 6 (SHA-256 KDF, AES-CMAC
+  MIC, key descriptor v3, `wpa_auth` `0x8000`) if offered, else AKM 2 with MFPC if the AP and firmware
+  both support it. IGTK is installed at key index 4/5. Knobs (all on `join`): `akm=auto|2|6`,
+  `mfpc=auto|0|1`, `mfpr=auto|0|1`, `msg2ie=auto|ours|fw`, `wpaie=late|early|0`.
+- **Message 2 echoes the RSN IE the firmware actually put in the association request**
+  (`assoc_info` / `assoc_req_ies`). The firmware sets the PTKSA-counter bits itself, so an IE built from
+  the profile differed and the AP rejected the handshake. Reading `assoc_info` into 8 bytes had returned
+  `BUFTOOSHORT` on every join; with a 512-byte buffer 5 of 5 trial kexecs associated (`piwifiap`).
+- **Failure classification.** A deauth with reason 1/2 and no message 1 re-send after message 2 is an AP
+  rejection (BSS back-off, profile stays eligible), not a wrong key (`piprofile`). The manager keeps a
+  per-boot rejected-BSS list with a 10-minute decay, and a profile is marked wrong-key only after verdicts
+  on `wifi.wrongkey_bss` (default 2) distinct BSSes within 10 minutes (`piwifikexec`: one weak-BSS
+  handshake timeout at -81 dBm had blocked the profile for the whole boot). 5 GHz is preferred
+  (`wifi.prefer5=1`); `netctl watch --stamp`, started by init, stamps profiles on connect.
+- **Kexec.** The CYW43455 keeps running across a kexec, and the kexec FDT has no `wifi@1` node. The kernel
+  therefore powers the chip down on kexec, restart and power-off (disassoc, `WLC_DOWN`, host reset,
+  `WL_REG_ON` held low across the jump), holds `WL_REG_ON` low for at least 100 ms at probe (200 ms default),
+  and auto-retries once with 1 s off after a `chip`/`fw`/`clm`/`ver` failure. The MAC falls back to
+  `brcmf.mac=` or the firmware's `smsc95xx.macaddr=` + 1 when neither the DTB nor the OTP tag is available.
+- **Wedges.** A netd spin with interrupts off on a not-yet-built stack (`pirxwedge`), unbounded credit and
+  control waits under steady RX (`piwifi-up`), and the SSH listener not being adopted by a late-built
+  `wifi0` stack (`pisshrace`) were each fixed; the `piwedge` raw-UART diagnostics (`brcmf dp on|off|rx|yield`
+  bisection, IRQ trail, stage markers) remain for the next one.
+
+Open: BSS `84:78:48:d8:7e:79` rejected with reason 2 on every boot in the last lane note; WPA3 is deferred.
+
+## DMA, GPIO and HDMI audio
+
+- **dma40** (`drivers/src/bcm2712_dma40/`, `pidma40`): the BCM2712 40-bit DMA engine, with a pure control-block
+  layer (32-byte `Scb`, memcpy chains, cyclic memory-to-FIFO rings with `D_DREQ`), interrupt or polled
+  completion, channel selection and a boot self-test. Its DREQ numbers for hdmi0/hdmi1 are 10/17 (decoded
+  from the DTB cells as Linux does), not 12/13 as the first design note guessed.
+- **GPIO / pinctrl / l2 intc** (`bcm2712_gpio.rs`, `pigio`): brcmstb `gio` and `gio_aon` banks, `pinctrl` tables
+  for the C0 and D0 steppings generated from Linux by `scripts/gen-bcm2712-pinctrl.py`, and chained l2
+  interrupt controllers. The stepping always comes from the chip id (SUN_TOP_CTRL); an unknown stepping
+  refuses pin mux. D0 is what the Pi ships with; the card carries the BCM2712 D0 device tree and overlay
+  (`pid0`, `pid0c`).
+- **HDMI audio** (`drivers/src/hdmi_audio/`, `pihdmi-audio`): IEC958 subframes, MAI/ACR registers (the D0
+  7-bit `VC6_D` threshold layout), audio InfoFrame, fed by a dma40 cyclic ring on hdmi0, registered as a
+  PipeWire backend. A read-only probe (`hdmi.probe=0` disables) decides HDMI vs DVI, measured pixel clock
+  and the audio gate first (`pihdmi-probe`). The lane notes record the path as host-tested; they do not
+  record audible output.
+
+## V3D GPU
+
+The kernel V3D 7.1 driver (`drivers/src/v3d/`, design in `artifacts/notes/lane-piv3d-design-2026-10-26.md`)
+was built in phases and armed from the Pi 5 probe: power and identification, MMU page tables and IRQ lines,
+a real `SUBMIT_CL` queue (out-of-memory binner overflow, hang reset, multi-sync), `SUBMIT_TFU` and
+`SUBMIT_CSD`, and scanout by a pitch-converting copy from a v3d BO into the firmware framebuffer
+(`kms_v3d.rs`). `v3d.probe=1` climbs the whole ladder on the Pi and prints the identification line
+(`ver=71 rev=10 cores=1 qpus=12 va=36 pa=36 clk=960MHz` in the lane note).
+
+- **The power gate was wrong.** It required PM_GRAFX `POWOK`, but the 2712 firmware leaves GRAFX at
+  `0x706d` (`POWUP|ISPOW|ISFUNC`, `POWOK` and `MRDONE` clear) with V3D answering behind it. The gate now
+  requires the three bits that are set. The firmware's `SET_DOMAIN_STATE` is rejected on this board
+  (`BadCode`); `v3d.pwr=fw` (off by default) tries it and `v3d.pwr=nogate` skips the island check.
+- **Mesa `v3d` renders GLES on the Pi** (`pigpu2`). It had fallen back to softpipe because the Pi root still
+  carried the virtio-pci sysfs identity for card0/renderD128 and `pi-sync` skips `/sys/dev/char/226:*`.
+  `scripts/pi-v3d-sysfs.sh` rewrites the identity to a platform device once per root. `es31test --fbo`
+  and `vkprobe` ship in the aarch64 set. kmscube has no display path on the Pi yet.
+- `kexec` quiesces V3D (`pikexecdma2`); `v3d` is Y/N gated by the kernel-module work
+  ([kernel/modules.md](../kernel/modules.md)).
+
+## Board support: watchdog, panic, fan, identity
+
+- **Watchdog** (`piwdt`). The BCM2712 PM watchdog (`brcm,bcm2712-pm`, `0x10_7d200000`) is armed at boot with
+  its 15 s maximum and fed by cpu0's tick scan only while every busy CPU is still ticking; a CPU stuck with
+  interrupts masked therefore lets the board reset itself roughly a minute into the stall. `wdt.off=1`
+  disables it. A serial reset (5x Ctrl-] or a BREAK) is also provided. After a kexec the FDT has no PM
+  node, so arming now keys off the BCM2712 chip id plus a PM register sanity read (`piwdtdt`).
+- **Panic reset** (`piwdtpanic`). A panic used to leave the watchdog fed (the panicking CPU kept ticking).
+  The panic handler now stops feeding and resets the board after `panic.reset=<s>` seconds (default 5; 0 =
+  halt). `wdog.selftest=1|2` exercises the stuck-CPU and countdown paths.
+- **Fan** (`piboard`, `rp1_fan`): the curve follows the DTB cpu-thermal trips, ticks every second, forces full
+  speed at 85 C; `fan=auto|off|0..4`. `/proc/thermal` has a `fan:` line with state, level and RPM
+  (the lane saw 40.2 C at state 0 and 52.9 C at state 1, level 75/255).
+- **Identity.** The Bluetooth address is chosen by `bt.bdaddr=auto|dt|otp|keep|xx:xx:..`. On the Pi the
+  OTP/firmware MAC tag fails (`[otp] mac=none`), so `auto` falls back to the Ethernet MAC from the firmware's
+  `smsc95xx.macaddr` + 2 (Wi-Fi uses + 1). Changing the address invalidates existing bonds: re-pair once, or
+  use `bt.bdaddr=keep`.
+- **Misc** (`pimisc`): hardware RNG (`rng200`, boot seed plus reseed source), firmware RTC read at boot and
+  written back by `clock_settime`, AVS thermal reading, an `ondemand`-style ARM clock governor, and a device
+  inventory (`artifacts/notes/pi5-device-inventory-2026-10-26.md`).
+
+## Updating a running Pi over the network
+
+Once the Pi has network and sshd, no SD swap is needed. The board's FAT partition is not reachable from
+LeandrOS, so kernels live in the root at `/boot/pi/{trial,good,prev}/{kernel,initrd,info}` and are entered
+with `kexec`; the firmware always boots the card's `kernel.img` (the factory kernel), which this flow never
+writes, so **a power cycle is the recovery** and `pi-boot good` returns to the promoted kernel.
+
+```sh
+export LEANDROS_REMOTE=pi LEANDROS_PI_HOST=<pi-ip>
+./scripts/build-all.sh --arch aarch64 --rpi5
+python3 scripts/remote.py pi-deploy        # upload to /boot/pi/trial, kexec, wait, check uname -v
+python3 scripts/remote.py pi-status        # slots, running kernel, cmdline
+python3 scripts/remote.py pi-promote       # trial -> good (only while running from trial)
+python3 scripts/remote.py pi-boot good     # after a power cycle; --append is per boot, not cumulative
+python3 scripts/remote.py pi-sync          # update the root fs in place from the current build
+```
+
+- `pi-deploy` refuses an ELF whose lowest PT_LOAD is not `0x200000`. The firmware command line is kept
+  (`--reuse-cmdline`); `--append` adds arguments for that boot only.
+- **`pi-sync`** (`piuserland`) builds the root manifest with `LEANDROS_ROOT_MANIFEST` (paths, modes,
+  sha256, symlinks), diffs it against the live root (`stat` then `sha256sum`), and uploads changed files
+  as verified bundles with per-file atomic rename. Bundles of 2 MiB (`LEANDROS_PISYNC_BUNDLE`) took 96 s for
+  46 changes versus about 25 minutes with one 64 MiB bundle. It requires `rg`, `grep` and `dmesg` in the build
+  (`LEANDROS_PISYNC_ALLOW_MISSING=1` overrides). `--dry-run`, `--list` and `--plan-out` preview a sync.
+- **Kexec on the Pi** needed several board-specific fixes: the firmware DTB's reserved `atf@0` range (BL31) is
+  carried; the initrd is placed at `0x1000_0000` where the rpi5 kernel looks; GICv2 SGIs are cleared;
+  secondaries are **parked in a mailbox loop** instead of `PSCI CPU_OFF`, because the Pi's TF-A never
+  restarts a core after `CPU_OFF` (the new kernel saw `1 CPUs online`); and every bus master is stopped
+  first (see above). `pi-boot` runs `kexec -e` in the foreground because a backgrounded one died with the
+  SSH channel's SIGHUP.
+- **Serial fallback** (`piserialxfer`): `scripts/pi-serial-push.py <local> <remote>` pushes a file over the
+  console to the in-guest `serrx` (framed, CRC-checked, go-back-N, sha256 verified, atomic rename), and
+  `scripts/pi-serial-kexec.sh` pushes a kernel and initrd and kexecs. It refuses a port another process has
+  open and never kills it.
+
+## Init without a GPU, and background daemons
+
+`lane/piinit`: init runs a GPU pre-check (`/bin/sh -c '. /bin/gpu-env ...'`, 120 s bound, skipped when
+`dm.precheck=0` or when `/proc/nvrm_state` is not `absent`). Exit 78 prints a `NO GPU` banner once and
+init does not start greetd or the stray sweep, which is the Pi's normal state until a display path exists.
+`bthid` starts without `/dev/hci0`; `btd` and `netctl watch` are supervised daemons (see
+[servers/bluetooth.md](../servers/bluetooth.md#supervision)). `userland/grep` is a grep/egrep/fgrep shim
+over `rg`.
 
 ## The `raspi4b` QEMU path
 
@@ -350,16 +604,19 @@ controller looked healthy and "CMD8 always times out" was blamed on QEMU's block
 
 ## Limitations and open work
 
-- No USB, Ethernet or GPIO UART: RP1 is behind PCIe, which is not trained. The xHCI driver's DMA
-  sync hooks are barrier-only, which would also be wrong on this non-coherent board.
-- No Wi-Fi (the on-board SDIO chip is untouched; see [drivers.md](drivers.md#wi-fi)).
-- HDMI console, SD speed negotiation and the rewritten CPU enumeration (MPIDR from the DTB, cores
-  distinguished by `Aff1` on the A76) await their first hardware boot.
-- Single block device: the SD card. There is no home partition on it (yet), so the fstab's
-  `LABEL=leandros-home` mount of `/home` fails (`nofail`) and `/home` is the root's own; device
-  index 0 is intentionally empty.
-- No multi-block SD transfers; no V3D rendering, so no desktop (the GPU-only policy applies here too).
-- `deploy-rpi5.sh` writes an ELF and a `kernel=kernel.elf` config (see above).
+- No display path for scanout GL apps (kmscube) on the V3D yet; desktop on the Pi is not there.
+- HDMI audio output, the HDMI console and the SD speed negotiation have not been confirmed by ear/eye in the
+  lane notes; HDMI console and SD ladder are QEMU-proven.
+- SDHCI is PIO and single-sector by default; `sdhci.multi=1` is unproven on the Pi (see above).
+- Wi-Fi: WPA3 deferred; one AP rejects with reason 2 every boot; weak-signal BSSes still produce handshake
+  timeouts (now back-off, not a blocked profile).
+- The Bluetooth reconnect story (the pad pages back in) is only partly verified; see
+  [servers/bluetooth.md](../servers/bluetooth.md).
+- Single block device: the SD card. There is no home partition on it, so the fstab's `LABEL=leandros-home`
+  mount of `/home` fails (`nofail`) and `/home` is the root's own.
+- `deploy-rpi5.sh` writes an ELF and a `kernel=kernel.elf` config (see above); the network flow replaces it
+  for everything except `kernel.img` itself, which still needs a card swap.
+- OTP/firmware MAC tag read fails on the Pi 5 firmware (`GET_BOARD_MAC_ADDRESS`); cause not found.
 
 ## Code and tests
 
@@ -374,6 +631,10 @@ controller looked healthy and "CMD8 always times out" was blamed on QEMU's block
   [arch/aarch64/src/gic.rs](../../arch/aarch64/src/gic.rs),
   [arch/aarch64/src/smp.rs](../../arch/aarch64/src/smp.rs),
   [kernel/src/main.rs](../../kernel/src/main.rs) (`INITRD_PHYS`, PCIe off, mailbox, `BAR_HOLD_SECS`)
+- RP1 / network / board: `drivers/src/brcmstb_pcie.rs`, `rp1.rs`, `rp1_usb.rs`, `macb.rs`, `dwc3_hw.rs`,
+  `bcm2712_dma40/`, `bcm2712_gpio.rs`, `hdmi_audio/`, `v3d/`, `rpi_misc.rs`, `rpi_pm.rs`, `brcmf/`
+  (host tests: `drivers/brcmf-tests`, `macb-tests`, `dwc3-tests`, `rp1-tests`, `bcm2712-tests`),
+  `scripts/remote.py` (`pi-*`), `scripts/pi-serial-push.py`, `scripts/pi-v3d-sysfs.sh`
 - Regression: the `raspi4b` boot (`run-qemu.sh --raspi4b`) for SDHCI and the mailbox; the aarch64
   `--direct` QEMU boot, the only QEMU path that exercises the entry stub's cache/TCR/PUD code (Limine
   branches around it). Real-board verification is a serial capture showing the prompt.
@@ -383,4 +644,6 @@ controller looked healthy and "CMD8 always times out" was blamed on QEMU's block
 - [README.md](README.md) — targets and hosts
 - [kernel/arch-aarch64.md](../kernel/arch-aarch64.md) — exception vectors, GIC, timer, PSCI
 - [graphics/mesa.md](../graphics/mesa.md) — the `v3d` Mesa build and its kernel contract
+- [servers/bluetooth.md](../servers/bluetooth.md) — `/dev/hci0`, `btd`, `bthid`, the Pi UART bring-up
+- [kernel/modules.md](../kernel/modules.md) — Y/M/N gating of drivers
 - [servers/filesystems.md](../servers/filesystems.md) — F2FS and the block layer
