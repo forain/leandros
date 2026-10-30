@@ -78,6 +78,15 @@ pub fn unregister_owner(owner: u16) -> usize {
     n
 }
 
+/// Drop the hook registered under `name` (kexec bisect knob `kexec.skip=`). True if one went.
+pub fn remove(name: &str) -> bool {
+    let mut t = ENTRIES.lock();
+    for slot in t.iter_mut() {
+        if matches!(slot, Some(e) if e.name == name) { *slot = None; COUNT.fetch_sub(1, Ordering::Relaxed); return true; }
+    }
+    false
+}
+
 /// Is a hook registered under `name`? (ktest)
 pub fn has(name: &str) -> bool { ENTRIES.lock().iter().flatten().any(|e| e.name == name) }
 
