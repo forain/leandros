@@ -48,10 +48,10 @@ type Hook = fn(u32) -> Result<String, String>;
 
 struct PmDev { name: &'static str, suspend: Hook, resume: Hook }
 
-fn none(_: u32) -> Result<String, String> { Ok(String::from("not present")) }
+pub(crate) fn none(_: u32) -> Result<String, String> { Ok(String::from("not present")) }
 
 #[cfg(target_arch = "x86_64")]
-fn ps2_suspend(_: u32) -> Result<String, String> {
+pub(crate) fn ps2_suspend(_: u32) -> Result<String, String> {
     match arch_x86_64::keyboard::pm_suspend() {
         Ok(None) => Ok(String::from("no i8042")),
         Ok(Some(c)) => Ok(alloc::format!("keyboard + AUX ports disabled (CTR {:#04x})", c)),
@@ -59,7 +59,7 @@ fn ps2_suspend(_: u32) -> Result<String, String> {
     }
 }
 #[cfg(target_arch = "x86_64")]
-fn ps2_resume(_: u32) -> Result<String, String> {
+pub(crate) fn ps2_resume(_: u32) -> Result<String, String> {
     match arch_x86_64::keyboard::pm_resume() {
         Ok(None) => Ok(String::from("nothing saved")),
         Ok(Some(aux)) => Ok(alloc::format!("keyboard{} port(s) enabled", if aux { " + AUX" } else { "" })),
@@ -67,28 +67,28 @@ fn ps2_resume(_: u32) -> Result<String, String> {
     }
 }
 
-fn i915_suspend(_: u32) -> Result<String, String> { drivers::i915::pm_suspend() }
-fn i915_resume(_: u32) -> Result<String, String> { drivers::i915::pm_resume() }
-fn e1000e_suspend(_: u32) -> Result<String, String> {
-    crate::kmod::exports::pm_suspend().unwrap_or_else(drivers::e1000e::pm_suspend)
+pub(crate) fn i915_suspend(_: u32) -> Result<String, String> { drivers::i915::pm_suspend() }
+pub(crate) fn i915_resume(_: u32) -> Result<String, String> { drivers::i915::pm_resume() }
+pub(crate) fn e1000e_suspend(_: u32) -> Result<String, String> {
+    drivers::e1000e::pm_suspend()
 }
-fn e1000e_resume(_: u32) -> Result<String, String> {
-    crate::kmod::exports::pm_resume().unwrap_or_else(drivers::e1000e::pm_resume)
+pub(crate) fn e1000e_resume(_: u32) -> Result<String, String> {
+    drivers::e1000e::pm_resume()
 }
-fn blk_suspend(_: u32) -> Result<String, String> { drivers::blkdev::pm_freeze(5_000) }
-fn blk_resume(_: u32) -> Result<String, String> { drivers::blkdev::pm_thaw() }
-fn xhci_suspend(f: u32) -> Result<String, String> {
+pub(crate) fn blk_suspend(_: u32) -> Result<String, String> { drivers::blkdev::pm_freeze(5_000) }
+pub(crate) fn blk_resume(_: u32) -> Result<String, String> { drivers::blkdev::pm_thaw() }
+pub(crate) fn xhci_suspend(f: u32) -> Result<String, String> {
     if f & PM_S3 != 0 { return drivers::usb_hcd::pm_suspend_s3(); }
     drivers::usb_hcd::pm_suspend(f & PM_XHCI_HALT != 0)
 }
-fn xhci_resume(f: u32) -> Result<String, String> {
+pub(crate) fn xhci_resume(f: u32) -> Result<String, String> {
     if f & PM_S3 != 0 { return drivers::usb_hcd::pm_resume_s3(); }
     drivers::usb_hcd::pm_resume()
 }
 
 static PCI_SAVED: spin::Mutex<Option<alloc::vec::Vec<drivers::pci_pm::FnState>>> = spin::Mutex::new(None);
 
-fn pci_suspend(f: u32) -> Result<String, String> {
+pub(crate) fn pci_suspend(f: u32) -> Result<String, String> {
     if f & (PM_PCI | PM_S3) == 0 { return Ok(String::from("off")); }
     let st = drivers::pci_pm::save_all();
     let stuck = if f & PM_PCI != 0 { drivers::pci_pm::clobber(&st, f & PM_PCI_DEEP != 0) } else { 0 };
@@ -98,7 +98,7 @@ fn pci_suspend(f: u32) -> Result<String, String> {
     Ok(r)
 }
 
-fn pci_resume(f: u32) -> Result<String, String> {
+pub(crate) fn pci_resume(f: u32) -> Result<String, String> {
     let Some(st) = PCI_SAVED.lock().take() else { return Ok(String::from("off")) };
     let dead = drivers::pci_pm::restore_all(&st, f & (PM_PCI_DEEP | PM_S3) != 0, |ms| sched::kthread::msleep(ms as _));
     let (n, bad) = drivers::pci_pm::verify(&st);
@@ -108,19 +108,8 @@ fn pci_resume(f: u32) -> Result<String, String> {
     Ok(alloc::format!("restored, {} dwords verified", n))
 }
 
-/// Suspend order; resume runs it backwards.
-static DEVS: &[PmDev] = &[
-    #[cfg(target_arch = "x86_64")]
-    PmDev { name: "i8042", suspend: ps2_suspend, resume: ps2_resume },
-    #[cfg(not(target_arch = "x86_64"))]
-    PmDev { name: "i8042", suspend: none, resume: none },
-    PmDev { name: "i915", suspend: i915_suspend, resume: i915_resume },
-    PmDev { name: "e1000e", suspend: e1000e_suspend, resume: e1000e_resume },
-    PmDev { name: "block", suspend: blk_suspend, resume: blk_resume },
-    PmDev { name: "xhci", suspend: xhci_suspend, resume: xhci_resume },
-    // Last: runs after every driver quiesced, restores before any resumes.
-    PmDev { name: "pci", suspend: pci_suspend, resume: pci_resume },
-];
+/// The devices suspended by the last `devs_suspend`, in order (`pm2` owns the ordering).
+static STEPS: spin::Mutex<alloc::vec::Vec<crate::pm2::Step>> = spin::Mutex::new(alloc::vec::Vec::new());
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 
@@ -136,22 +125,29 @@ pub(crate) fn line(out: &mut String, s: &str) {
 /// returns (hooks that succeeded, all ok). Used by the real S3 path.
 pub(crate) fn devs_suspend(flags: u32, out: &mut String) -> (usize, bool) {
     let mut done = 0usize;
-    for d in DEVS {
+    let steps = crate::pm2::suspend_steps();
+    let mut run = alloc::vec::Vec::new();
+    let mut result = (0usize, true);
+    for d in steps {
         let t = sched::monotonic_ns();
-        match (d.suspend)(flags) {
-            Ok(s) => { line(out, &alloc::format!("suspend {}: ok in {} us: {}", d.name, (sched::monotonic_ns() - t) / 1000, s)); done += 1; }
-            Err(e) => { line(out, &alloc::format!("suspend {}: FAILED: {}", d.name, e)); return (done, false); }
+        let r = d.suspend(flags);
+        run.push(d);
+        match r {
+            Ok(s) => { let d = run.last().unwrap(); line(out, &alloc::format!("suspend {}: ok in {} us: {}", d.name, (sched::monotonic_ns() - t) / 1000, s)); done += 1; }
+            Err(e) => { let d = run.last().unwrap(); line(out, &alloc::format!("suspend {}: FAILED: {}", d.name, e)); result = (done, false); break; }
         }
     }
-    (done, true)
+    *STEPS.lock() = run;
+    if result.1 { (done, true) } else { result }
 }
 
 /// Resume the first `done` hooks in reverse order.
 pub(crate) fn devs_resume(done: usize, flags: u32, out: &mut String) -> bool {
     let mut ok = true;
-    for d in DEVS[..done].iter().rev() {
+    let steps = STEPS.lock();
+    for d in steps[..done.min(steps.len())].iter().rev() {
         let t = sched::monotonic_ns();
-        match (d.resume)(flags) {
+        match d.resume(flags) {
             Ok(s) => line(out, &alloc::format!("resume {}: ok in {} us: {}", d.name, (sched::monotonic_ns() - t) / 1000, s)),
             Err(e) => { line(out, &alloc::format!("resume {}: FAILED: {}", d.name, e)); ok = false; }
         }
@@ -170,24 +166,30 @@ pub fn freeze_cycle(flags: u32, hold_ms: u32) -> (bool, String) {
         return (false, out);
     }
     let t0 = sched::monotonic_ns();
-    line(&mut out, &alloc::format!("freeze-only cycle: {} device class(es), hold {} ms, flags {:#x}", DEVS.len(), hold_ms, flags));
+    line(&mut out, &alloc::format!("freeze-only cycle: {} device class(es), hold {} ms, flags {:#x}", crate::pm2::suspend_steps().len(), hold_ms, flags));
     let mut done = 0usize;
     let mut ok = true;
-    for d in DEVS {
+    let steps = crate::pm2::suspend_steps();
+    let mut run = alloc::vec::Vec::new();
+    for d in steps {
         let t = sched::monotonic_ns();
-        match (d.suspend)(flags) {
-            Ok(s) => { line(&mut out, &alloc::format!("suspend {}: ok in {} us: {}", d.name, (sched::monotonic_ns() - t) / 1000, s)); done += 1; }
-            Err(e) => { line(&mut out, &alloc::format!("suspend {}: FAILED: {} (aborting, resuming {} device(s))", d.name, e, done)); ok = false; break; }
+        let r = d.suspend(flags);
+        run.push(d);
+        match r {
+            Ok(s) => { let d = run.last().unwrap(); line(&mut out, &alloc::format!("suspend {}: ok in {} us: {}", d.name, (sched::monotonic_ns() - t) / 1000, s)); done += 1; }
+            Err(e) => { let d = run.last().unwrap(); line(&mut out, &alloc::format!("suspend {}: FAILED: {} (aborting, resuming {} device(s))", d.name, e, done)); ok = false; break; }
         }
     }
+    *STEPS.lock() = run;
     if ok {
         line(&mut out, &alloc::format!("all devices quiesced after {} us", (sched::monotonic_ns() - t0) / 1000));
         let until = sched::monotonic_ns() + hold_ms as u64 * 1_000_000;
         while sched::monotonic_ns() < until { sched::kthread::msleep(5); }
     }
-    for d in DEVS[..done].iter().rev() {
+    let steps = STEPS.lock();
+    for d in steps[..done.min(steps.len())].iter().rev() {
         let t = sched::monotonic_ns();
-        match (d.resume)(flags) {
+        match d.resume(flags) {
             Ok(s) => line(&mut out, &alloc::format!("resume {}: ok in {} us: {}", d.name, (sched::monotonic_ns() - t) / 1000, s)),
             Err(e) => { line(&mut out, &alloc::format!("resume {}: FAILED: {}", d.name, e)); ok = false; }
         }

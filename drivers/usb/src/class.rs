@@ -199,14 +199,27 @@ pub fn tick_register(owner: KmodId, f: fn(usize), ctx: usize) {
 
 pub fn tick_count() -> usize { TICKS.lock().len() }
 
+static TICK_RUNNING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Remove every tick callback of `owner` and wait until no CPU is still inside `tick()` with a
+/// copy of the old list (failed module init: the code is about to be unmapped). Returns the
+/// `ctx` values removed so the caller can free its trampoline boxes.
+pub fn tick_unregister_owner(owner: KmodId) -> usize {
+    let n = { let mut g = TICKS.lock(); let b = g.len(); g.retain(|c| c.owner != owner); b - g.len() };
+    while TICK_RUNNING.load(core::sync::atomic::Ordering::Acquire) != 0 { core::hint::spin_loop(); }
+    n
+}
+
 /// USB timer tick (IRQ context). A tick that finds the list busy is skipped.
 pub fn tick() {
-    let Some(g) = TICKS.try_lock() else { return };
+    TICK_RUNNING.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let Some(g) = TICKS.try_lock() else { TICK_RUNNING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel); return };
     // Copy out under the lock: callbacks are few and the list only grows.
     let mut buf = [None::<TickCb>; 8];
     for (i, c) in g.iter().take(8).enumerate() { buf[i] = Some(*c); }
     drop(g);
     for c in buf.iter().flatten() { let _ = c.owner; (c.f)(c.ctx); }
+    TICK_RUNNING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
 }
 
 /// Leak a slice so a driver's id table can be `'static`.
