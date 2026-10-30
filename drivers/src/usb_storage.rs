@@ -98,17 +98,7 @@ fn delay_ms(ms: u32) {
     sleep_until(sched::monotonic_ns().saturating_add(ms as u64 * 1_000_000));
 }
 
-/// Park until `deadline` (`monotonic_ns`). Task context that may sleep only.
-pub fn sleep_until(deadline: u64) {
-    while sched::monotonic_ns() < deadline {
-        sched::block_on_poll_prepare_masked(deadline, sched::POLL_MASK_TIMED_ONLY);
-        if sched::monotonic_ns() >= deadline {
-            sched::block_on_poll_cancel();
-        } else {
-            sched::block_on_poll_commit();
-        }
-    }
-}
+pub use crate::kenv::sleep_until;
 
 // ── Emulated device latency (QEMU benchmarking) ────────────────────────────
 //

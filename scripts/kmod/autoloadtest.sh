@@ -232,6 +232,37 @@ if [[ "$mod" == "usb_hid" ]]; then
     [[ $fail -eq 0 ]] && echo "autoloadtest usb_hid: PASS" || { echo "autoloadtest usb_hid: FAIL"; exit 1; }
     exit 0
 fi
+if [[ "$mod" == "usb_storage" ]]; then
+    # CONFIG_USB_STORAGE=m: a QEMU usb-storage stick enumerates, the `usb * * 08 06 50` alias (or
+    # modules/BOOT) gives it to usb_storage, which opens the bulk pipes over the kapi, registers the
+    # disk through kapi_blk_register; a known block reads back through /dev/sda.
+    printf 'CONFIG_MODULES=y\nCONFIG_USB_STORAGE=m\n' > .config
+    ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/autoloadtest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/autoloadtest-build.log"; exit 1; }
+    RT=.claude/skills/run-leandros/runtests.py
+    fail=0
+    check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3"; fail=1; fi; }
+    export LEANDROS_RUN_ID="autoloadtest-$arch"
+    IMG="${TMPDIR:-/tmp}/autoload-stick-$arch.img"
+    python3 - "$IMG" <<'PY'
+import sys
+b = bytearray(8 * 1024 * 1024)
+b[3 * 512:3 * 512 + 16] = b"KMODSTOR-BLOCK3\n"
+open(sys.argv[1], "wb").write(b)
+PY
+    export LEANDROS_QEMU_EXTRA="-drive if=none,id=stk0,file=$IMG,format=raw -device qemu-xhci,id=xhs -device usb-storage,bus=xhs.0,drive=stk0,id=stick0"
+    python3 "$RT" "$arch" alt1 "cat /proc/modules" "sh -c 'dd if=/dev/sda bs=512 skip=3 count=1 2>/dev/null | head -c 15; echo'" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt1/serial-full.log
+    check "$L" '^\[kmod\] usb_storage loaded id' "usb_storage loaded"
+    check "$L" '\[USB-MSC\] interface 0 LUN 0: 16384 x 512-byte sectors' "disk probed by the module"
+    check "$L" '^usb_storage [0-9]* [0-9]* - Live' "listed in /proc/modules"
+    check "$L" 'KMODSTOR-BLOCK3' "known block 3 reads back through /dev/sda"
+    python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=usb_storage" "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt2/serial-full.log
+    if grep -aq '^\[kmod\] usb_storage loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; else echo "ok   blacklist refuses the load"; fi
+    unset LEANDROS_QEMU_EXTRA
+    [[ $fail -eq 0 ]] && echo "autoloadtest usb_storage: PASS" || { echo "autoloadtest usb_storage: FAIL"; exit 1; }
+    exit 0
+fi
 if [[ "$mod" == "uvc" ]]; then
     # CONFIG_USB_VIDEO_CLASS=m: the camera driver is ONLY a module. QEMU has no UVC device, so the
     # `usb 0e 02` alias is exercised by usb.alias_selftest=1 (the enumerate hook on a synthetic

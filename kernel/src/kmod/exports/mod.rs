@@ -136,6 +136,9 @@ const _: sys::UsbIntrOpenFn = kapi_usb_intr_open;
 const _: sys::UsbIntrPollFn = kapi_usb_intr_poll;
 const _: sys::UsbIntrOutFn = kapi_usb_intr_out;
 const _: sys::UsbIntrCloseFn = kapi_usb_intr_close;
+const _: sys::UsbBulkOpenFn = kapi_usb_bulk_open;
+const _: sys::UsbBulkFn = kapi_usb_bulk;
+const _: sys::UsbBulkCloseFn = kapi_usb_bulk_close;
 const _: kmod_abi::input::sys_input::InputUnregisterFn = kapi_input_unregister;
 const _: kmod_abi::input::sys_input::InputEventConsoleFn = kapi_input_event_console;
 const _: kmod_abi::input::sys_input::InputLedsFn = kapi_input_leds;
@@ -150,7 +153,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 97;
+pub const NEXPORTS: usize = 100;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -244,6 +247,9 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_usb_intr_poll", kapi_usb_intr_poll),
     sym!("kapi_usb_intr_out", kapi_usb_intr_out),
     sym!("kapi_usb_intr_close", kapi_usb_intr_close),
+    sym!("kapi_usb_bulk_open", kapi_usb_bulk_open),
+    sym!("kapi_usb_bulk", kapi_usb_bulk),
+    sym!("kapi_usb_bulk_close", kapi_usb_bulk_close),
     sym!("kapi_input_unregister", kapi_input_unregister),
     sym!("kapi_input_event_console", kapi_input_event_console),
     sym!("kapi_input_leds", kapi_input_leds),

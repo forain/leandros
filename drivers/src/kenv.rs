@@ -13,8 +13,18 @@ extern "C" {
 /// Raw serial line (the module build routes this through `kapi_log`).
 pub fn serial_raw(s: &str) { unsafe { serial_print_str_raw(s.as_ptr(), s.len()); } }
 
-/// Sleep the calling task until `ns` (monotonic).
-pub fn sleep_until(ns: u64) { crate::usb_storage::sleep_until(ns) }
+/// Park until `deadline` (`monotonic_ns`). Task context that may sleep only.
+pub fn sleep_until(deadline: u64) {
+    while sched::monotonic_ns() < deadline {
+        sched::block_on_poll_prepare_masked(deadline, sched::POLL_MASK_TIMED_ONLY);
+        if sched::monotonic_ns() >= deadline {
+            sched::block_on_poll_cancel();
+        } else {
+            sched::block_on_poll_commit();
+        }
+    }
+}
+
 pub use crate::nvidia_probe::{cmdline_known, cmdline_opt, cmdline_word};
 
 /// Input seam: the built-in feeds the evdev server directly; the module build goes through the

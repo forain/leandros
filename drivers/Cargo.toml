@@ -15,6 +15,9 @@ raspi4b = []
 usb-debug = []
 # CONFIG_USB_HID=m: modules/usb-hid owns boot HID; the built-in glue (usb_hid.rs) only runs the USB tick hooks.
 usb-hid-module = ["usb/hid-module"]
+# CONFIG_USB_STORAGE=y gates drivers/src/usb_storage.rs; =m / =n use the stub.
+drv-usb-storage = []
+usb-storage-module = ["usb/msc-module"]
 # Kconfig CONFIG_I915 / CONFIG_VIRTIO_GPU / CONFIG_V3D (kernel features drv-*).
 # Off: i915 is replaced by drivers/src/i915_stub.rs; the others skip their probe.
 i915 = []
