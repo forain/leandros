@@ -154,6 +154,9 @@ pub mod cmdline_secrets;
 pub mod wifi_api;
 /// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).
 #[cfg(feature = "wifi-stack")] pub mod wifi_mgr;
+/// The Wi-Fi radio class: `Radio` trait + `repr(C)` table (pure) and the kernel registry.
+#[cfg(feature = "wifi-stack")] pub mod wifi_radio;
+#[cfg(feature = "wifi-stack")] pub mod wifi_class;
 /// Broadcom/Cypress FullMAC Wi-Fi (CYW43455, Raspberry Pi 5).
 #[cfg(feature = "brcmf")] pub mod brcmf;
 pub mod bcm2712_id;

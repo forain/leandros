@@ -572,7 +572,28 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 83 && exports::NEXPORTS == 83, "ksymtab has 83 exports");
+    t.check(exports::ksymtab().len() == 84 && exports::NEXPORTS == 84, "ksymtab has 84 exports");
+    t.check(exports::lookup("kapi_wifi_register").is_some(), "kapi_wifi_register in KSYMTAB");
+    #[cfg(feature = "drv-wifi-stack")]
+    {
+        // Radio class: the C table must be refused when malformed, and a scan hit / failure must
+        // survive the repr(C) round trip (the kernel re-parses the BSS from a synthetic beacon).
+        use drivers::wifi_radio::*;
+        t.check(exports::kapi_wifi_register(KmodId(0), core::ptr::null(), 0, core::ptr::null()) == -22, "wifi_register(null table) = -22");
+        let ie: [u8; 20] = [0, 4, b'k', b'm', b'o', b'd', 1, 4, 0x82, 0x84, 0x8b, 0x96, 3, 1, 6, 5, 4, 0, 1, 0];
+        let bss = drivers::wifi_frame::Bss {
+            bssid: [2, 1, 2, 3, 4, 5], ssid: b"kmod".to_vec(), channel: 6, beacon_interval: 100, capability: 0x0411, tsf: 77,
+            rates: alloc::vec![0x82, 0x84, 0x8b, 0x96], rsn: None, wpa1: false, ht: false, vht: false, dtim_period: 1,
+            erp: None, rssi: -50, ies: ie.to_vec(),
+        };
+        let hit = ScanHit { bss, rssi: -50 };
+        let back = hit_from_k(&hit_to_k(&hit));
+        t.check(back.as_ref().map_or(false, |b| b.bss.bssid == hit.bss.bssid && b.bss.ssid == b"kmod" && b.bss.channel == 6
+                && b.rssi == -50 && b.bss.ies == hit.bss.ies && b.bss.capability == 0x0411 && b.bss.tsf == 77), "scan hit survives KScanHit");
+        let f = Fail::new(5, "handshake: no message 3").status(17).ieee_reason(15);
+        let fb = fail_from_k(&fail_to_k(&f));
+        t.check(fb.reason == 5 && fb.ieee_status == 17 && fb.ieee_reason == 15 && !fb.fw_assert && fb.msg == f.msg, "Fail survives KWifiFail");
+    }
     {
         use kmod_abi::{KBlkDesc, KBlkOps};
         let r = crate::kmod::exports::kapi_blk_register(KmodId(0), core::ptr::null::<KBlkDesc>(), core::ptr::null::<KBlkOps>(), 0);

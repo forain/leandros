@@ -156,7 +156,9 @@ static TX_FRAMES: AtomicU32 = AtomicU32::new(0);
 static RX_DROPPED: AtomicU32 = AtomicU32::new(0);
 
 /// The manager of the simulated interface.
-pub static MGR: Mgr = Mgr::new("wifi_sim", "wifisim", mac_fn);
+const MGR_NAME: &str = "wifi_sim";
+/// The kernel-owned manager of the simulated radio (it registers from its thread, ~200 ms after init).
+fn mgr() -> &'static Mgr { crate::wifi_class::lookup_wait(MGR_NAME, 15_000).expect("wifi_sim radio not registered") }
 
 fn mac_fn() -> Option<[u8; 6]> { if present() { Some(*MAC.lock()) } else { None } }
 
@@ -408,12 +410,14 @@ pub fn init(cmdline: &str) {
     }
     *SIM.lock() = Some(Sim { aps, radio_on: true, assoc: None, pending_deauth: None });
     ACTIVE.store(true, Ordering::SeqCst);
-    MGR.set_caps(SimRadio.caps());
     let selftest = cmdline_val(cmdline, "wifisim.selftest").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
     if sched::kthread::spawn("wifisim", || {
         // "Firmware" start-up.
         msleep(200);
-        wm::run(&MGR, &mut SimRadio);
+        match crate::wifi_radio::register(alloc::boxed::Box::new(SimRadio), MGR_NAME, "wifisim", mac_fn().unwrap_or([0; 6]), sim_kick, None) {
+            Ok(done) => { while !done.load(core::sync::atomic::Ordering::Acquire) { msleep(200); } }
+            Err(e) => log(&alloc::format!("could not register the radio class: {}", e)),
+        }
         log("manager loop ended");
     }).is_none() {
         log("could not start the sim thread");
@@ -428,7 +432,7 @@ pub fn init(cmdline: &str) {
 
 /// Register the control side with the netctl seam (the netif registry gives
 /// the ifindex; `name` is the interface name, "wifi0").
-pub fn attach(ifindex: u32, name: &str) -> bool { if present() { MGR.attach(ifindex, name) } else { false } }
+pub fn attach(ifindex: u32, name: &str) -> bool { if present() { crate::wifi_class::attach(MGR_NAME, ifindex, name) } else { false } }
 
 /// The sim is on.
 pub fn present() -> bool { ACTIVE.load(Ordering::Relaxed) }
@@ -511,11 +515,14 @@ pub fn info_lines(out: &mut String) {
     let _ = writeln!(out, "rx_frames: {} rx_dropped: {} tx_frames: {}", RX_FRAMES.load(Ordering::Relaxed),
                      RX_DROPPED.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed));
     ht_info_lines(out);
-    MGR.info_lines(out);
+    crate::wifi_class::info_lines(MGR_NAME, out);
 }
 
 /// The BSS cache as a table (for /proc/net/wifi).
-pub fn scan_lines(out: &mut String) { MGR.scan_lines("wifi_sim (simulated Wi-Fi)", out); }
+pub fn scan_lines(out: &mut String) { if let Some(m) = crate::wifi_class::lookup(MGR_NAME) { m.scan_lines("wifi_sim (simulated Wi-Fi)", out); } }
+
+/// The manager queued a command: the sim radio is polled, nothing to wake.
+fn sim_kick() {}
 
 // ── the radio ───────────────────────────────────────────────────────────────
 
@@ -1150,7 +1157,7 @@ fn wait<F: FnMut() -> bool>(timeout_ms: u64, mut f: F) -> Option<u64> {
 fn wait_event(seq: u64, t0: u64, timeout_ms: u64, mut f: impl FnMut(&WifiEvent) -> bool) -> Option<(u64, WifiEvent)> {
     let mut found = None;
     wait(timeout_ms, || {
-        for (_, t, e) in MGR.events_since(seq) {
+        for (_, t, e) in mgr().events_since(seq) {
             if f(&e) { found = Some((t.saturating_sub(t0), e)); return true; }
         }
         false
@@ -1174,22 +1181,22 @@ fn connect_params(attempt: u32, ssid: &str, a: u8, secret: &str, uuid: u8) -> Co
 
 fn find_bss(ssid: &str) -> Option<NcBss> {
     let mut v = Vec::new();
-    MGR.bss_snapshot(&mut v);
+    mgr().bss_snapshot(&mut v);
     v.into_iter().find(|b| b.ssid() == ssid.as_bytes())
 }
 
 fn find_bssid(bssid: [u8; 6]) -> Option<NcBss> {
     let mut v = Vec::new();
-    MGR.bss_snapshot(&mut v);
+    mgr().bss_snapshot(&mut v);
     v.into_iter().find(|b| b.bssid == bssid)
 }
 
 /// Connect and wait for the outcome: Ok(ms to CONNECTED) or Err((ms, reason)).
 fn do_connect(p: ConnectParams) -> Result<u64, (u64, u8, String)> {
-    let seq = MGR.event_seq();
+    let seq = mgr().event_seq();
     let attempt = p.attempt;
     let t0 = now_ms();
-    if let Err(e) = MGR.submit(WifiCmd::Connect(p)) { return Err((0, 0, alloc::format!("submit errno {}", e))); }
+    if let Err(e) = mgr().submit(WifiCmd::Connect(p)) { return Err((0, 0, alloc::format!("submit errno {}", e))); }
     match wait_event(seq, t0, 20_000, |e| matches!(e, WifiEvent::State(s) if (s.state == wifi_state::CONNECTED && s.attempt == attempt)
                                                                              || s.state == wifi_state::FAILED)) {
         Some((ms, WifiEvent::State(s))) if s.state == wifi_state::CONNECTED => Ok(ms),
@@ -1199,17 +1206,17 @@ fn do_connect(p: ConnectParams) -> Result<u64, (u64, u8, String)> {
 }
 
 fn disconnect(block: bool) -> Option<u64> {
-    let seq = MGR.event_seq();
+    let seq = mgr().event_seq();
     let t0 = now_ms();
-    MGR.submit(WifiCmd::Disconnect { block_autoconnect: block }).ok()?;
+    mgr().submit(WifiCmd::Disconnect { block_autoconnect: block }).ok()?;
     wait_event(seq, t0, 10_000, |e| state_ev(e, wifi_state::DISCONNECTED).is_some()).map(|(ms, _)| ms)
 }
 
 fn scan(force: bool, ssids: &[&str]) -> Option<(u64, netctl_abi::NcScanInfo)> {
-    let seq = MGR.event_seq();
+    let seq = mgr().event_seq();
     let t0 = now_ms();
     let ss = ssids.iter().map(|s| wm::ssid(s.as_bytes())).collect();
-    MGR.submit(WifiCmd::Scan { ssids: ss, force }).ok()?;
+    mgr().submit(WifiCmd::Scan { ssids: ss, force }).ok()?;
     // The periodic background scan may finish meanwhile: not ours.
     match wait_event(seq, t0, 10_000, |e| matches!(e, WifiEvent::ScanDone(i) if i.flags & scan_flags::BACKGROUND == 0))? {
         (ms, WifiEvent::ScanDone(i)) => Some((ms, i)),
@@ -1231,14 +1238,14 @@ fn selftest_main(level: u32) {
     let t_start = now_ms();
     slog!("selftest: level {} starting", level);
     // Ready: the manager reports DISCONNECTED and the boot scan is in.
-    let ready = wait(10_000, || MGR.state().state == wifi_state::DISCONNECTED && MGR.last_scan().is_some());
+    let ready = wait(10_000, || mgr().state().state == wifi_state::DISCONNECTED && mgr().last_scan().is_some());
     // Uplink Block Ack: a router holding its reorder window at a hole gets
     // data again within 1 s through our BAR (lane bssidbar, L12 #63).
     let h = crate::iwl_agg::sim_bar_hole(3, 300_000, true, 3_000);
     t.check("ba-hole-bar", h.bars > 0 && h.resume_ms.map_or(false, |ms| ms < 1000) && !h.teardown, alloc::format!("{:?}", h));
     let h = crate::iwl_agg::sim_bar_hole(3, 300_000, false, 3_000);
     t.check("ba-bar-fail-teardown", h.teardown && h.bars == crate::iwl_agg::BAR_MAX_FAILS as u64, alloc::format!("{:?}", h));
-    t.check("ready", ready.is_some(), alloc::format!("state {} after {} ms", wm::state_name(MGR.state().state), now_ms() - t_start));
+    t.check("ready", ready.is_some(), alloc::format!("state {} after {} ms", wm::state_name(mgr().state().state), now_ms() - t_start));
     if ready.is_none() { finish(t); return; }
 
     // 1. A fresh scan lists every AP with the right security bits.
@@ -1269,7 +1276,7 @@ fn selftest_main(level: u32) {
     t.check("bss-tkip-group-joinable", tkip.map_or(false, |b| b.ext & bss_ext::JOINABLE != 0 && b.ext & bss_ext::AKM_PSK != 0
             && b.rsn_flags & nm_sec::GROUP_TKIP != 0), alloc::format!("{:?}", tkip.map(|b| (b.ext, b.rsn_flags))));
     let r = do_connect(connect_params(10, "SimTkip", akm::AUTO, "tkip-pass-123", 0));
-    t.check("connect-tkip-group", r.is_ok() && MGR.state().akm == akm::PSK, alloc::format!("{:?}", r));
+    t.check("connect-tkip-group", r.is_ok() && mgr().state().akm == akm::PSK, alloc::format!("{:?}", r));
     // The AP rekeys the group key (new key index): the install is counted
     // and the key index changes; the TKIP receive counters move.
     let (i0, k0) = (wm::gk::installs(), wm::gk::key_id());
@@ -1310,10 +1317,10 @@ fn selftest_main(level: u32) {
     t.check("scan-directed-hidden", d.is_some() && hid.map_or(false, |b| b.ssid() == b"SimHidden"), alloc::format!("{:?}", hid.map(|b| b.ssid_len)));
 
     // 4. Wrong passphrase: FAILED(wrong-key), then DISCONNECTED(wrong-key).
-    let seq = MGR.event_seq();
+    let seq = mgr().event_seq();
     let r = do_connect(connect_params(11, "SimHome", akm::AUTO, "not-the-pass", 1));
-    let seen: Vec<(u8, u8)> = MGR.events_since(seq).iter().filter_map(|(_, _, e)| if let WifiEvent::State(s) = e { Some((s.state, s.reason)) } else { None }).collect();
-    let follow = wait(2_000, || { let s = MGR.state(); s.state == wifi_state::DISCONNECTED && s.reason == reason::WRONG_KEY }).is_some();
+    let seen: Vec<(u8, u8)> = mgr().events_since(seq).iter().filter_map(|(_, _, e)| if let WifiEvent::State(s) = e { Some((s.state, s.reason)) } else { None }).collect();
+    let follow = wait(2_000, || { let s = mgr().state(); s.state == wifi_state::DISCONNECTED && s.reason == reason::WRONG_KEY }).is_some();
     let mut path = seen.iter().map(|x| x.0).collect::<Vec<u8>>();
     path.dedup();
     let want = [wifi_state::CONNECTING, wifi_state::AUTHENTICATING, wifi_state::ASSOCIATING, wifi_state::HANDSHAKE, wifi_state::FAILED];
@@ -1323,7 +1330,7 @@ fn selftest_main(level: u32) {
     // 5. Right passphrase: CONNECTED, data path up.
     let gen0 = link_generation();
     let r = do_connect(connect_params(12, "SimHome", akm::AUTO, "simhome-pass", 1));
-    let st = MGR.state();
+    let st = mgr().state();
     t.check("connect-right-key", r.is_ok() && st.akm == akm::PSK && link_up() && link_generation() != gen0 && st.attempt == 12,
             alloc::format!("{:?} ms; akm {} attempt {} link {}", r, st.akm, st.attempt, link_up()));
     // An HT AP: the association runs an RX Block Ack session (unless the
@@ -1356,8 +1363,8 @@ fn selftest_main(level: u32) {
     let nk = if k0 == 1 { 2 } else { 1 };
     M1_DURING_SCAN.store(nk as u32 + 1, Ordering::Relaxed);
     let s = scan(true, &[]);
-    t.check("scan-while-connected", s.map_or(false, |(_, i)| i.flags & scan_flags::COALESCED == 0) && MGR.state().state == wifi_state::CONNECTED,
-            alloc::format!("{:?} state {}", s.map(|(ms, i)| (ms, i.flags)), wm::state_name(MGR.state().state)));
+    t.check("scan-while-connected", s.map_or(false, |(_, i)| i.flags & scan_flags::COALESCED == 0) && mgr().state().state == wifi_state::CONNECTED,
+            alloc::format!("{:?} state {}", s.map(|(ms, i)| (ms, i.flags)), wm::state_name(mgr().state().state)));
     // Group message 1 popped by the scan's wait still installs the key (lane eapoldrop).
     let t1 = now_ms();
     while now_ms() - t1 < 2_000 && wm::gk::installs() == i0 { msleep(20); }
@@ -1369,12 +1376,12 @@ fn selftest_main(level: u32) {
     {
         let ufo = netctl_abi::scan_req_flags::USER & netctl_abi::scan_req_flags::FORCE != 0;
         msleep(2_100);
-        let g0 = MGR.last_scan().map_or(0, |i| i.scan_gen);
+        let g0 = mgr().last_scan().map_or(0, |i| i.scan_gen);
         let a = scan(ufo, &[]);
         msleep(2_100);
         let b = scan(ufo, &[]);
         let (ga, gb) = (a.map_or(0, |x| x.1.scan_gen), b.map_or(0, |x| x.1.scan_gen));
-        t.check("scan-user-twice-connected", ga != g0 && gb != ga && MGR.state().state == wifi_state::CONNECTED,
+        t.check("scan-user-twice-connected", ga != g0 && gb != ga && mgr().state().state == wifi_state::CONNECTED,
                 alloc::format!("gen {} -> {} -> {}", g0, ga, gb));
     }
     // 7c. No periodic background scan while associated with a good signal
@@ -1391,7 +1398,7 @@ fn selftest_main(level: u32) {
 
     // 8. Disconnect: DISCONNECTED(user) well within 2 s, autoconnect blocked.
     let ms = disconnect(true);
-    let st = MGR.state();
+    let st = mgr().state();
     t.check("disconnect-fast", ms.map_or(false, |m| m < netctl_abi::DISCONNECT_DEADLINE_MS as u64) && st.reason == reason::USER
             && st.flags & wifi_flags::AUTOCONNECT_BLOCKED != 0 && !link_up(), alloc::format!("{:?} ms, reason {}", ms, wm::reason_name(st.reason)));
     // Disconnect again while disconnected: still answered.
@@ -1404,28 +1411,28 @@ fn selftest_main(level: u32) {
     let r = do_connect(connect_params(14, "NoSuchNetwork", akm::AUTO, "whatever-123", 3));
     t.check("no-ap", matches!(r, Err((_, reason::NO_AP, _))), alloc::format!("{:?}", r));
     let r = do_connect(connect_params(15, "SimFull", akm::AUTO, "full-pass-123", 4));
-    t.check("assoc-rejected", matches!(r, Err((_, reason::ASSOC_REJECTED, _))) && MGR.state().ieee_status == 17, alloc::format!("{:?} status {}", r, MGR.state().ieee_status));
+    t.check("assoc-rejected", matches!(r, Err((_, reason::ASSOC_REJECTED, _))) && mgr().state().ieee_status == 17, alloc::format!("{:?} status {}", r, mgr().state().ieee_status));
     let r = do_connect(connect_params(16, "SimHome", akm::NONE, "", 0));
     t.check("open-profile-on-psk-ap", matches!(r, Err((_, reason::UNSUPPORTED_SECURITY, _))), alloc::format!("{:?}", r));
-    t.check("submit-sae-eopnotsupp", MGR.submit(WifiCmd::Connect(connect_params(17, "SimWPA3", akm::SAE, "wpa3-pass-123", 2))) == Err(netctl_abi::errno::EOPNOTSUPP), String::new());
+    t.check("submit-sae-eopnotsupp", mgr().submit(WifiCmd::Connect(connect_params(17, "SimWPA3", akm::SAE, "wpa3-pass-123", 2))) == Err(netctl_abi::errno::EOPNOTSUPP), String::new());
     let r = do_connect(connect_params(18, "SimMixed", akm::AUTO, "mixed-pass-123", 5));
-    t.check("transition-joins-as-psk", r.is_ok() && MGR.state().akm == akm::PSK, alloc::format!("{:?} akm {}", r, MGR.state().akm));
+    t.check("transition-joins-as-psk", r.is_ok() && mgr().state().akm == akm::PSK, alloc::format!("{:?} akm {}", r, mgr().state().akm));
 
     // 10. A new CONNECT while connected replaces the link (no disconnect first).
-    let seq = MGR.event_seq();
+    let seq = mgr().event_seq();
     let r = do_connect(connect_params(19, "SimOpen", akm::NONE, "", 6));
-    let sup = MGR.events_since(seq).iter().any(|(_, _, e)| matches!(e, WifiEvent::State(s) if s.state == wifi_state::DISCONNECTED && s.reason == reason::SUPERSEDED));
-    t.check("connect-replaces-link", r.is_ok() && sup && MGR.state().akm == akm::NONE, alloc::format!("{:?} superseded-event {}", r, sup));
+    let sup = mgr().events_since(seq).iter().any(|(_, _, e)| matches!(e, WifiEvent::State(s) if s.state == wifi_state::DISCONNECTED && s.reason == reason::SUPERSEDED));
+    t.check("connect-replaces-link", r.is_ok() && sup && mgr().state().akm == akm::NONE, alloc::format!("{:?} superseded-event {}", r, sup));
 
     // 11. Beacon loss and deauthentication by the AP.
-    let seq = MGR.event_seq();
+    let seq = mgr().event_seq();
     let t0 = now_ms();
     set_on_air(b"SimOpen", false);
     let lost = wait_event(seq, t0, 3_000, |e| state_ev(e, wifi_state::DISCONNECTED).map_or(false, |s| s.reason == reason::BEACON_LOSS));
     set_on_air(b"SimOpen", true);
     t.check("beacon-loss", lost.is_some() && !link_up(), alloc::format!("{:?} ms", lost.map(|x| x.0)));
     let _ = do_connect(connect_params(20, "SimHome", akm::AUTO, "simhome-pass", 1));
-    let seq = MGR.event_seq();
+    let seq = mgr().event_seq();
     let t0 = now_ms();
     deauth(4);
     let d = wait_event(seq, t0, 3_000, |e| state_ev(e, wifi_state::DISCONNECTED).map_or(false, |s| s.reason == reason::DEAUTH_BY_AP && s.ieee_reason == 4));
@@ -1435,7 +1442,7 @@ fn selftest_main(level: u32) {
 
     // 12. Aging: an AP that left stays listed until the age-out window passes.
     // (Fresh scans are rate-limited to one per 2 s, hence the 2.1 s steps.)
-    MGR.set_age_out_ms(4_000);
+    mgr().set_age_out_ms(4_000);
     msleep(2_100);
     let _ = scan(true, &[]);
     set_on_air(b"SimCafe", false);
@@ -1443,65 +1450,65 @@ fn selftest_main(level: u32) {
     let _ = scan(true, &[]);
     let kept = find_bss("SimCafe").is_some();
     msleep(2_100);
-    let seq = MGR.event_seq();
+    let seq = mgr().event_seq();
     let _ = scan(true, &[]);
     let gone = find_bss("SimCafe").is_none();
-    let gone_ev = MGR.events_since(seq).iter().any(|(_, _, e)| matches!(e, WifiEvent::BssGone(b) if b.ssid() == b"SimCafe"));
+    let gone_ev = mgr().events_since(seq).iter().any(|(_, _, e)| matches!(e, WifiEvent::BssGone(b) if b.ssid() == b"SimCafe"));
     t.check("bss-aging", kept && gone && gone_ev, alloc::format!("kept-after-2.4s {} gone-after-4.7s {} event {}", kept, gone, gone_ev));
-    MGR.set_age_out_ms(netctl_abi::BSS_AGE_OUT_MS as u64);
+    mgr().set_age_out_ms(netctl_abi::BSS_AGE_OUT_MS as u64);
     set_on_air(b"SimCafe", true);
 
     // 13. Radio off: RADIO_OFF, cache dropped; on: DISCONNECTED and a scan.
-    let seq = MGR.event_seq();
+    let seq = mgr().event_seq();
     let t0 = now_ms();
-    let _ = MGR.submit(WifiCmd::SetRadio(false));
+    let _ = mgr().submit(WifiCmd::SetRadio(false));
     let off = wait_event(seq, t0, 3_000, |e| state_ev(e, wifi_state::RADIO_OFF).is_some());
     let mut v = Vec::new();
-    MGR.bss_snapshot(&mut v);
-    let scan_refused = MGR.submit(WifiCmd::Scan { ssids: Vec::new(), force: true }) == Err(netctl_abi::errno::ENETDOWN);
+    mgr().bss_snapshot(&mut v);
+    let scan_refused = mgr().submit(WifiCmd::Scan { ssids: Vec::new(), force: true }) == Err(netctl_abi::errno::ENETDOWN);
     t.check("radio-off", off.is_some() && v.is_empty() && scan_refused, alloc::format!("{:?} ms, {} BSSs", off.map(|x| x.0), v.len()));
-    let seq = MGR.event_seq();
+    let seq = mgr().event_seq();
     let t0 = now_ms();
-    let _ = MGR.submit(WifiCmd::SetRadio(true));
+    let _ = mgr().submit(WifiCmd::SetRadio(true));
     let on = wait_event(seq, t0, 3_000, |e| state_ev(e, wifi_state::DISCONNECTED).is_some());
     let rescan = wait_event(seq, t0, 5_000, |e| matches!(e, WifiEvent::ScanDone(i) if i.n_bss > 0));
     t.check("radio-on", on.is_some() && rescan.is_some(), alloc::format!("{:?} / scan {:?} ms", on.map(|x| x.0), rescan.map(|x| x.0)));
 
     // 14. Autoconnect: highest priority wins; DISCONNECT blocks it until
     // RELOAD; a wrong-key profile is skipped for the next candidate.
-    let seq = MGR.event_seq();
+    let seq = mgr().event_seq();
     let t0 = now_ms();
     crate::wifi_api::set_profiles(1000, alloc::vec![profile("SimHome", "simhome-pass", 0, 0x21), profile("SimMixed", "mixed-pass-123", 10, 0x22)]);
-    let _ = MGR.submit(WifiCmd::ProfilesChanged);
+    let _ = mgr().submit(WifiCmd::ProfilesChanged);
     let ac = wait_event(seq, t0, 15_000, |e| state_ev(e, wifi_state::CONNECTED).is_some());
-    let st = MGR.state();
+    let st = mgr().state();
     t.check("autoconnect-priority", ac.is_some() && st.ssid() == b"SimMixed" && st.flags & wifi_flags::AUTO != 0 && st.attempt & wm::AUTO_ATTEMPT_BIT != 0,
             alloc::format!("{:?} ms to '{}' flags {:#x}", ac.map(|x| x.0), wf::ssid_display(st.ssid()), st.flags));
     let _ = disconnect(true);
     msleep(3_000);
-    t.check("autoconnect-blocked-after-disconnect", MGR.state().state == wifi_state::DISCONNECTED, String::from(wm::state_name(MGR.state().state)));
-    let seq = MGR.event_seq();
+    t.check("autoconnect-blocked-after-disconnect", mgr().state().state == wifi_state::DISCONNECTED, String::from(wm::state_name(mgr().state().state)));
+    let seq = mgr().event_seq();
     let t0 = now_ms();
     crate::wifi_api::set_profiles(1001, alloc::vec![profile("SimHome", "wrong-pass-99", 20, 0x21), profile("SimMixed", "mixed-pass-123", 10, 0x22)]);
-    let _ = MGR.submit(WifiCmd::ProfilesChanged);
+    let _ = mgr().submit(WifiCmd::ProfilesChanged);
     let ac = wait_event(seq, t0, 20_000, |e| state_ev(e, wifi_state::CONNECTED).is_some());
-    let wk = MGR.events_since(seq).iter().any(|(_, _, e)| matches!(e, WifiEvent::State(s) if s.state == wifi_state::FAILED && s.reason == reason::WRONG_KEY && s.ssid() == b"SimHome"));
-    let st = MGR.state();
+    let wk = mgr().events_since(seq).iter().any(|(_, _, e)| matches!(e, WifiEvent::State(s) if s.state == wifi_state::FAILED && s.reason == reason::WRONG_KEY && s.ssid() == b"SimHome"));
+    let st = mgr().state();
     t.check("autoconnect-skips-wrong-key", ac.is_some() && wk && st.ssid() == b"SimMixed",
             alloc::format!("{:?} ms, wrong-key seen {}, now '{}'", ac.map(|x| x.0), wk, wf::ssid_display(st.ssid())));
     // Link loss with a profile: reconnects by itself.
-    let seq = MGR.event_seq();
+    let seq = mgr().event_seq();
     let t0 = now_ms();
     deauth(7);
     let back = wait_event(seq, t0, 10_000, |e| state_ev(e, wifi_state::CONNECTED).is_some());
     t.check("autoconnect-after-link-loss", back.is_some(), alloc::format!("{:?} ms", back.map(|x| x.0)));
     crate::wifi_api::set_profiles(1002, Vec::new());
-    let _ = MGR.submit(WifiCmd::ProfilesChanged);
+    let _ = mgr().submit(WifiCmd::ProfilesChanged);
     let _ = disconnect(true);
 
     // 15. Disconnect during the handshake preempts the attempt quickly.
-    let seq = MGR.event_seq();
-    let _ = MGR.submit(WifiCmd::Connect(connect_params(21, "SimHome", akm::AUTO, "not-the-pass", 1)));
+    let seq = mgr().event_seq();
+    let _ = mgr().submit(WifiCmd::Connect(connect_params(21, "SimHome", akm::AUTO, "not-the-pass", 1)));
     let _ = wait_event(seq, now_ms(), 5_000, |e| state_ev(e, wifi_state::HANDSHAKE).is_some());
     let ms = disconnect(true);
     t.check("disconnect-preempts-attempt", ms.map_or(false, |m| m < netctl_abi::DISCONNECT_DEADLINE_MS as u64), alloc::format!("{:?} ms", ms));
@@ -1510,8 +1517,8 @@ fn selftest_main(level: u32) {
     // userland can check the net server's DHCP lease and traffic on wifi0.
     if level >= 2 {
         crate::wifi_api::set_profiles(1003, alloc::vec![profile("SimHome", "simhome-pass", 0, 0x21)]);
-        let _ = MGR.submit(WifiCmd::ProfilesChanged);
-        let up = wait(15_000, || MGR.state().state == wifi_state::CONNECTED);
+        let _ = mgr().submit(WifiCmd::ProfilesChanged);
+        let up = wait(15_000, || mgr().state().state == wifi_state::CONNECTED);
         t.check("left-associated", up.is_some(), alloc::format!("wifi0 -> SimHome for the userland checks ({:?} ms)", up));
     }
     finish(t);
