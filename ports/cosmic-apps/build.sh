@@ -6,6 +6,8 @@
 #   m6-session-bins/build-rust.sh src/<app> <arch>
 # Sources live in m6-session-bins/src/<app>; cosmic-edit and cosmic-screenshot
 # share cosmic-files' cargo target dir (symlinked) to save disk.
+# cosmic-monitor and cosmic-initial-setup follow the same recipe; the latter is
+# staged with its .desktop but is NOT run at first login.
 #
 # Output: ~/code/leandros-artifacts/m6-session-bins/out/<app>-<arch>
 # mkfs stages each as /bin/<app> together with its .desktop (this directory)
@@ -41,6 +43,8 @@ feat_for() {
     # No libflatpak (GLib/GIO) and no packagekit: appstream is pure Rust, so the
     # store starts with no backend. Upstream feature flags only, no source patch.
     cosmic-store) echo "--no-default-features --features dbus-config,desktop,logind,notify,packagekit,single-instance,wayland,wgpu,xdg-portal" ;;
+    cosmic-monitor) echo "--no-default-features --features dbus-config,wayland,wgpu" ;;   # no nvml
+    cosmic-initial-setup) echo "--no-default-features --features wgpu,wayland" ;;
     *)            echo "" ;;
   esac
 }
