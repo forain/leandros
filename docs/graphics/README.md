@@ -40,6 +40,7 @@ COSMIC's own clients (greeter, settings, terminal and other apps) are built with
 | Linux desktop, AMD iGPU (RADV/radeonsi) | x86_64 KVM | Venus → Zink | ~20–21 fps full desktop; greeter keystroke p50 50 ms |
 | Same | aarch64 TCG | Venus → Zink | works; greeter at 1280×800, key p50 ~79 ms |
 | Linux laptop, Intel UHD 620 | x86_64 KVM | Venus → Zink (ANV) or virgl (iris) | Zink 23.4 fps; Venus needs `vulkan-intel` installed |
+| HP EliteBook 840 G5 (real hardware, Intel UHD 620) | x86_64 bare metal | Native `i915` driver: Mesa iris (GL) and ANV (Vulkan) on the i915 UAPI | COSMIC renders; external outputs are opt-in (`i915.extout=1`), see [drm-kms.md](drm-kms.md#the-i915-backend) |
 | Mac, from-source GPU QEMU (`scripts/mac-qemu-gpu/build.sh --angle-vulkan`) | aarch64 HVF | virgl over ANGLE → Vulkan → MoltenVK | guest GLES 3.1 with SSBOs, so wgpu works |
 | Mac, Homebrew QEMU | aarch64 HVF | none | no virglrenderer; COSMIC refused, serial login only |
 

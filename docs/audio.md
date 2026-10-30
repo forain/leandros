@@ -31,7 +31,7 @@ Sound leaves a LeandrOS machine through one playback stream, driven by a kernel 
 
 The driver implements the `virtio-snd` specification over modern virtio-PCI:
 
-- Control, event, TX and RX virtqueues are set up (sized by negotiation, at most 256); playback uses TX. There is no capture.
+- Control, event, TX and RX virtqueues are set up (sized by negotiation, at most 256); playback uses TX. There is no capture (the HDA driver has one; see below).
 - PCM stream lifecycle `SET_PARAMS → PREPARE → START → STOP → RELEASE`, with status words checked against `VIRTIO_SND_S_OK`. Reconfiguration tears down unconditionally — `STOP`/`RELEASE` on a never-started stream is a harmless `BAD_MSG`.
 - S16LE at 44.1 kHz and 48 kHz, stereo (mono accepted from producers).
 - Robust negotiation: control commands time out instead of hanging on a host that does not answer every command.
@@ -53,7 +53,18 @@ The driver implements the `virtio-snd` specification over modern virtio-PCI:
 - **Selection.** `snd.backend=auto` (default: virtio-sound when present, else HDA), `virtio` or `hda`. ioctl `0x103` (`SND_GET_INFO`) returns the driver's state as text.
 - **Self-test.** With `snd.test=1` init runs `/bin/snd-autotest` (`userland/sndtest`) a few seconds after the login prompt: it prints the controller and codec ids and the chosen output pins, then plays through `/dev/pipewire` a 2 s 440 Hz tone, 1 s on the left only (440 Hz), 1 s on the right only (660 Hz) and 1 s at 44.1 kHz, twice, and prints `sndtest: SUMMARY PASS|FAIL`. In QEMU: `run-qemu.sh <arch> --hda[=output|duplex|micro]` swaps virtio-sound for an ICH9 HDA controller with QEMU's `hda-*` codec; `LEANDROS_AUDIO_WAV` records the output and `driver.py` with `LEANDROS_SND=hda` plus `sndwav.py` check the capture. Off by default; enable it on the NVIDIA test stick with `--cmdline "snd.test=1"`.
 
-HDA works on the PC (headphones and speakers; Firefox plays YouTube with sound). Not done: Realtek COEF quirks and GPIO amp enables (a generic parser needs none for basic playback apart from EAPD), jack detection and auto-mute (all outputs play at once), hardware volume, PCI power management, capture, and `LPIB` versus the DMA position buffer (Linux uses `LPIB` for playback on Skylake and newer).
+HDA works on the PC (headphones and speakers; Firefox plays YouTube with sound) and on the laptop. On the desktop PC all outputs still play at once; jack sense, auto-mute and capture exist on the laptop's codec (next section). Not done: Realtek COEF quirks and GPIO amp enables (a generic parser needs none for basic playback apart from EAPD), hardware volume, PCI power management, and `LPIB` versus the DMA position buffer (Linux uses `LPIB` for playback on Skylake and newer).
+
+### Capture, jack sense and the display codec
+
+Lane `lapaudio2` (with review fixes in `lapaudio3`) added `drivers/src/hda_capture.rs`, a child module of `hda.rs`, proven on the HP EliteBook 840 G5 (see [hardware/pc.md](hardware/pc.md#hp-elitebook-840-g5-laptop)).
+
+- **Capture path.** A depth-first search over the codec's connection lists finds ADC, mixer/selector and mic-pin paths. The internal (fixed) microphone is the default; the headset mic is used while its pin senses presence. One input stream descriptor records 48 kHz s16le stereo into a 64 KiB ring (BDL in the playback BDL page at +2 KiB, stream tag 2). The mic pin gets `IN_EN` (plus `VREF80` for a jack mic) and a boost amp one step above 0 dB; the ADC input amp is 0 dB and unmuted. As for playback, interrupts stay off and the tick pump drains the ring.
+- **ABI.** Capture is a `read()` on `/dev/pipewire` opened `O_RDONLY`: one reading open at a time (a second gets `EBUSY`), no effect on the single writer. A read blocks until at least 10 ms of audio exists, never returns 0 (`-EAGAIN` for non-blocking opens, `-EIO` after a 2 s stall and one restart, `-EINVAL` for a count below 4), and the stream starts only on the first read or poll. `poll` on the node reports `POLLIN` at 1920 bytes for the holder and `POLLOUT` for everyone else. `ports/pipewire/leandros-snd-source.c` is an `Audio/Source` PipeWire node that opens the device only while streaming and exits on `ENODEV`; it is started from `50-leandros.conf`, so Firefox and `pw-record` see a microphone.
+- **Jack sense.** Presence is polled (every 100 ms in the `[audio]` kthread, not the tick). A plugged headphone clears `OUT_EN` on the speaker pins and unplugging restores their saved `PIN_CTL`; a headset-mic change restarts an active capture on the other pin. The first "nothing plugged" reading only records state. `SND_GET_INFO` (ioctl `0x103`) gains `capture:`, `jack:` and per-pin `pin ... sense ...` lines.
+- **Display codec.** Every other codec in `STATESTS` (the Intel HDMI/DP audio codec) is walked read-only after setting the Intel vendor bit that enables all pins and converters; pin sense, ELD validity, ELD size, monitor name and SAD count are logged. There is no HDMI/DP playback yet. Probing uses `no_fallback`, so a CORB timeout fails the verb rather than switching the link to immediate commands, and the display AFG is put in D3 at shutdown.
+
+QEMU gives silence for capture (`--hda=micro`, `sndtest record 3` passes the plumbing with rms 0); the real-microphone proof is the laptop's internal mic. The Raspberry Pi 5 has HDMI audio on `hdmi0` as another PipeWire backend ([hardware/raspberry-pi-5.md](hardware/raspberry-pi-5.md)). The HDA driver builds as a loadable module (`kmodnetsnd`, see [kernel/modules.md](kernel/modules.md)).
 
 ## The kernel audio server
 
@@ -128,12 +139,12 @@ Audio is verified at the destination: QEMU's `wav` backend captures the guest's 
 
 ## Limitations and open work
 
-- Playback only, one stream; no capture, no ALSA ABI.
-- **The PipeWire sink is still named "Virtio Sound Output"** whatever the backend (the node description in `leandros-snd-sink.c`); on the PC the panel shows that name for the HDA output.
+- One playback stream and one capture stream (HDA only, read-only open of `/dev/pipewire`); no ALSA ABI. No HDMI/DP playback on x86_64, and jack switching was verified for the sense read only (nothing was plugged during the lane).
+- **The PipeWire sink is still named "Virtio Sound Output"** whatever the backend (the node description in `leandros-snd-sink.c`); on the PC the panel shows that name for the HDA output. The virtio-snd and HDA drivers are loadable modules (`kmodnetsnd`; [kernel/modules.md](kernel/modules.md)).
 - The first playback of a session on x86_64 can show a ~40 ms gap about a second in — most likely a client xrun, since there is no real-time scheduling class and RTKit is absent. Steady playback is clean.
 - PI futexes have no priority boosting or ownership hand-off; robust lists are not implemented.
-- DOOM's audio clips heavily on x86_64; this predates the PipeWire path and is in DOOM's own mixing.
-- Firefox audio on x86_64 has been verified only under TCG, where throughput gaps are expected.
+- DOOM's x86_64 clipping is fixed (lane `kvmaudio`): `userland/libc` is built for Rust's soft-float target, so its exported `pow/exp/log/log10/tan/sqrt` took doubles in integer registers while clang-built C callers pass `xmm0/xmm1`; asm trampolines now convert, and `scripts/check-c-float-abi.py` guards the DOOM binary in `build-all.sh`. The capture shows 0 clipped samples.
+- Firefox media and a PipeWire tone were verified on x86_64 under KVM (lane `kvmaudio2`: 880 Hz at the expected RMS, 0 clipped samples), not only TCG.
 
 ## See also
 
