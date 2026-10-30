@@ -1692,6 +1692,54 @@ def main():
         print(f"  WARNING: {_pwrapplet} absent, no Power applet in the panel: "
               f"./ports/cosmic-applet-power/build.sh {arch}")
 
+    # COSMIC apps for the Applications menu (ports/cosmic-apps/build.sh):
+    # cosmic-files, cosmic-edit, cosmic-screenshot (Print key target). Each is
+    # staged as /bin/<app> together with its .desktop and hicolor icons, or
+    # not at all.
+    cosapps_icon_dirs = []
+    for _app, _appid in (("cosmic-files", "com.system76.CosmicFiles"),
+                         ("cosmic-edit", "com.system76.CosmicEdit"),
+                         ("cosmic-screenshot", "com.system76.CosmicScreenshot")):
+        _appbin = m6_pick(f"{m6_out}/{_app}-{arch}")
+        if os.path.exists(_appbin):
+            bin_files.append((_app, _appbin, 0o100755))
+            m4_share_dirs.add("/usr/share/applications")
+            m4_share_files.append(("/usr/share/applications", f"{_appid}.desktop",
+                                   f"ports/cosmic-apps/{_appid}.desktop"))
+            _appres = "resources" if _app == "cosmic-screenshot" else "res"
+            cosapps_icon_dirs.append(os.path.expanduser(
+                f"~/code/leandros-artifacts/m6-session-bins/src/{_app}/{_appres}/icons/hicolor"))
+        else:
+            print(f"  WARNING: {_appbin} absent, no {_app} in the Applications menu: "
+                  f"./ports/cosmic-apps/build.sh {arch} {_app}")
+    real_time_applet = False
+    # The rest of the panel's applets (Time, Battery, Notifications, Status Area,
+    # Workspaces, Input Sources, A11y) and the dock's App List: unmodified
+    # upstream, one binary per crate, built together by
+    # ports/cosmic-applets-panel/build.sh. Upstream's default panel config
+    # (/usr/share/cosmic/com.system76.CosmicPanel.*/v1/plugins_*) already names
+    # all of them, so binary + .desktop is all that puts them on the panel.
+    # Each binary and its .desktop are staged together or not at all.
+    for _ap, _dk in (("cosmic-applet-time", "CosmicAppletTime"),
+                     ("cosmic-applet-battery", "CosmicAppletBattery"),
+                     ("cosmic-applet-notifications", "CosmicAppletNotifications"),
+                     ("cosmic-applet-status-area", "CosmicAppletStatusArea"),
+                     ("cosmic-applet-workspaces", "CosmicAppletWorkspaces"),
+                     ("cosmic-applet-input-sources", "CosmicAppletInputSources"),
+                     ("cosmic-applet-a11y", "CosmicAppletA11y"),
+                     ("cosmic-app-list", "CosmicAppList")):
+        _apbin = m6_pick(f"{m6_out}/{_ap}-{arch}")
+        if os.path.exists(_apbin):
+            bin_files.append((_ap, _apbin, 0o100755))
+            m4_share_dirs.add("/usr/share/applications")
+            m4_share_files.append(("/usr/share/applications", f"com.system76.{_dk}.desktop",
+                                   f"ports/cosmic-applets-panel/com.system76.{_dk}.desktop"))
+            if _ap == "cosmic-applet-time":
+                real_time_applet = True
+        else:
+            print(f"  WARNING: {_apbin} absent, no {_ap} in the panel: "
+                  f"./ports/cosmic-applets-panel/build.sh {arch}")
+
     # leandros-applet — a minimal dependency-free wl_shm xdg_toplevel panel applet.
     # cosmic-panel refuses to render its bar with no applet content (render()
     # early-returns while actual_size<=20), and the real cosmic applets pull
@@ -2379,6 +2427,9 @@ def main():
         if os.path.isdir(_src):
             _stage_icon_tree(_src, "hicolor")
             break
+    # icons of the apps staged by ports/cosmic-apps (see above)
+    for _d in cosapps_icon_dirs:
+        _stage_icon_tree(_d, "hicolor")
     # cosmic-applet-time's .desktop asks for Icon=application-default-icon, a
     # name no upstream icon theme ships (cosmic-icons has application-default).
     # Stage the upstream application-default.svg under the requested name in
@@ -2460,6 +2511,10 @@ def main():
                 # A duplicate would pack two directory entries of the same name
                 # into one inode, so the shadowed copy is dropped, not appended.
                 if (image_dir, fn) in _shared_seen:
+                    continue
+                # The real Time applet supersedes the leandros-applet stand-in's
+                # .desktop of the same name.
+                if real_time_applet and fn == "com.system76.CosmicAppletTime.desktop":
                     continue
                 _shared_seen[(image_dir, fn)] = _root
                 m4_share_files.append((image_dir, fn, hp))
