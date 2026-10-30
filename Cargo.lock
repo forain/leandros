@@ -283,6 +283,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-hda"
+version = "0.1.0"
+dependencies = [
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
+]
+
+[[package]]
 name = "kmod-hello"
 version = "0.1.0"
 dependencies = [

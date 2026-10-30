@@ -94,7 +94,7 @@ config HDMI_AUDIO
 	default y
 
 config HDA
-	bool "Intel HD Audio (+capture)"
+	tristate "Intel HD Audio (+capture)"
 	depends on PCI
 	default y
 

@@ -31,18 +31,19 @@
 //!   supports; mono input is duplicated, unsupported rates are linearly
 //!   resampled to 48 kHz.
 
-use super::pci;
-use crate::snd::monotonic_us;
+// Kernel APIs come through `kenv` so the same source builds as a module (kmod-kapi shim).
+use crate::kenv::pci;
+use crate::kenv::sched::monotonic_us;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 use core::sync::atomic::{fence, Ordering};
-use mm::{buddy, phys_to_virt};
-use mm::paging::{map_kernel_device, PageFlags};
+use crate::kenv::mm::{buddy, phys_to_virt};
+use crate::kenv::mm::paging::{map_kernel_device, PageFlags};
 
 /// Same unit as the virtio backend's TX buffer, for the server's
 /// level/used-index arithmetic.
-pub const TX_BUF_BYTES: usize = crate::snd::TX_BUF_BYTES;
+pub const TX_BUF_BYTES: usize = 512;
 
 // ── Controller registers (spec §3.3) ─────────────────────────────────────────
 const GCAP: usize = 0x00;
@@ -183,14 +184,9 @@ macro_rules! hlog {
     ($($t:tt)*) => {{ let _ = core::fmt::Write::write_fmt(&mut Uart, format_args!($($t)*)); }};
 }
 
-extern "C" {
-    /// Kernel whole-line console print: UART + klog + framebuffer console.
-    fn serial_print_str_raw(s: *const u8, len: usize);
-}
-
 /// A line that should also be readable on the PC's monitor (boot context).
 fn screen(s: &str) {
-    unsafe { serial_print_str_raw(s.as_ptr(), s.len()) };
+    crate::kenv::serial_raw(s);
 }
 
 // ── MMIO (HVF-safe on aarch64: plain ldr/str, never a writeback form) ─────────
@@ -508,7 +504,7 @@ impl Hda {
         f.set_intx_disable(true);
 
         let base = unsafe { map_kernel_device(bar.base as usize, 0x4000,
-                                     PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NOCACHE) }
+                                     PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::MMIO) }
             .ok_or("cannot map BAR0")?;
         self.base = base;
         let gcap = self.r16(GCAP);

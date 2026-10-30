@@ -73,6 +73,11 @@ pub mod pci {
         pub fn write32(&self, off: u16, v: u32) { self.wr(off, 4, v) }
         pub fn find_capability(&self, id: u8) -> Option<u16> { find_capability(self.bdf(), id) }
         pub fn enable_mem_and_bus_master(&self) { let _ = enable(self.bdf(), true); }
+        pub fn set_intx_disable(&self, disable: bool) {
+            let c = self.read16(0x04);
+            let n = if disable { c | PCI_CMD_INTX_DISABLE } else { c & !PCI_CMD_INTX_DISABLE };
+            if n != c { self.write16(0x04, n); }
+        }
 
         pub fn bar(&self, i: usize) -> Option<BarInfo> {
             if i >= 6 { return None; }
@@ -150,6 +155,22 @@ pub mod pci {
     }
 
     /// Every function with this vendor/device id (kapi_pci_find walks them by index).
+    /// Every PCI function (the kernel's `pci::scan`), via `kapi_pci_scan`.
+    pub fn scan() -> alloc::vec::Vec<PciDevice> {
+        let mut v = alloc::vec::Vec::new();
+        let mut i = 0u32;
+        while let Some(k) = super::sys_common::pci_scan(i) {
+            v.push(PciDevice {
+                bus: (k.bdf >> 16) as u8, dev: (k.bdf >> 8) as u8, func: k.bdf as u8,
+                vendor_id: k.vendor, device_id: k.device,
+                class: (k.class >> 16) as u8, subclass: (k.class >> 8) as u8, prog_if: k.class as u8,
+                bars: k.bars,
+            });
+            i += 1;
+        }
+        v
+    }
+
     pub fn find_all_devices(vendor_id: u16, device_id: u16) -> alloc::vec::Vec<PciDevice> {
         let mut v = alloc::vec::Vec::new();
         for index in 0..64u32 {
