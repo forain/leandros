@@ -99,6 +99,7 @@ pub mod console_properties;
 pub mod drm_device_interface;
 pub mod device_mmap_policy;
 pub mod drm_offset;
+pub mod drm_class;
 /// Pure DRM sync-object state (binary + timeline); host-tested in drivers/uapi-tests.
 pub mod syncobj_core;
 pub mod hostvis_core;

@@ -32,6 +32,7 @@ mod usbfn;
 mod blk;
 mod input;
 mod wifi;
+mod drm;
 
 pub use pci::*;
 pub use irq::*;
@@ -41,6 +42,7 @@ pub use pm::*;
 pub use blk::*;
 pub use input::*;
 pub use wifi::*;
+pub use drm::*;
 pub use v4l2::*;
 pub use usbfn::*;
 pub use core_::*;
@@ -150,7 +152,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 97;
+pub const NEXPORTS: usize = 106;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -186,6 +188,15 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_wait_notify", kapi_wait_notify),
     sym!("kapi_netdev_register", kapi_netdev_register),
     sym!("kapi_wifi_register", kapi_wifi_register),
+    sym!("kapi_drm_register", kapi_drm_register),
+    sym!("kapi_drm_offset_alloc", kapi_drm_offset_alloc),
+    sym!("kapi_drm_offset_release", kapi_drm_offset_release),
+    sym!("kapi_fence_wait", kapi_fence_wait),
+    sym!("kapi_syncobj_install", kapi_syncobj_install),
+    sym!("kapi_syncobj_exists", kapi_syncobj_exists),
+    sym!("kapi_syncobj_in_fences", kapi_syncobj_in_fences),
+    sym!("kapi_fence_irq_hint", kapi_fence_irq_hint),
+    sym!("kapi_kms_event_complete", kapi_kms_event_complete),
     sym!("kapi_netdev_kick", kapi_netdev_kick),
     sym!("kapi_snd_register", kapi_snd_register),
     sym!("kapi_netdev_kick_from_irq", kapi_netdev_kick_from_irq),

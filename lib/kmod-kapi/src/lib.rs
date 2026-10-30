@@ -532,6 +532,23 @@ pub mod netdev {
     }
 }
 
+/// DRM class (W2-7a): the uapi table (`drivers::drm_class::KDrmOps`), the fake-offset window, fences and syncobjs.
+pub mod drm {
+    use super::{owner, sys};
+    /// Register the table (valid for the life of the module). 0, -22 bad table, -17 backend already installed.
+    pub fn register(ops: *const u8, ctx: usize) -> i32 { unsafe { sys::kapi_drm_register(owner(), ops, ctx) } }
+    pub fn offset_alloc(real: u64, size: u64) -> Option<u64> { match unsafe { sys::kapi_drm_offset_alloc(real, size) } { 0 => None, o => Some(o) } }
+    pub fn offset_release(real: u64) { unsafe { sys::kapi_drm_offset_release(real) } }
+    pub fn fence_wait(ids: &[u64], deadline_ns: u64) -> i32 { unsafe { sys::kapi_fence_wait(ids.as_ptr(), ids.len(), deadline_ns) } }
+    pub fn syncobj_install(handle: u32, open_id: u32, point: u64, fence: u64) -> i32 { unsafe { sys::kapi_syncobj_install(handle, open_id, point, fence) } }
+    pub fn syncobj_exists(handle: u32, open_id: u32) -> bool { unsafe { sys::kapi_syncobj_exists(handle, open_id) } }
+    pub fn syncobj_in_fences(handle: u32, open_id: u32, point: u64, out: &mut [u64]) -> i64 {
+        unsafe { sys::kapi_syncobj_in_fences(handle, open_id, point, out.as_mut_ptr(), out.len()) }
+    }
+    pub fn fence_irq_hint() { unsafe { sys::kapi_fence_irq_hint() } }
+    pub fn kms_event_complete(cookie: u32, seq: u32, ts_ns: u64) { unsafe { sys::kapi_kms_event_complete(cookie, seq, ts_ns) } }
+}
+
 pub mod wifi {
     use super::*;
     /// Hand a radio table (`drivers::wifi_radio::KWifiRadioOps`) and the optional legacy credential
