@@ -27,7 +27,7 @@ case "${1:-both}" in
 esac
 shift || true
 APPS=("$@")
-[[ ${#APPS[@]} -gt 0 ]] || APPS=(cosmic-files cosmic-edit cosmic-screenshot cosmic-store cosmic-monitor cosmic-initial-setup)
+[[ ${#APPS[@]} -gt 0 ]] || APPS=(cosmic-files cosmic-edit cosmic-screenshot cosmic-store cosmic-player cosmic-monitor cosmic-initial-setup)
 
 if [[ ! -x "$M6/build-rust.sh" ]]; then
   echo "cosmic-apps: no m6 toolchain at $M6 -- not built" >&2
@@ -43,6 +43,9 @@ feat_for() {
     # No libflatpak (GLib/GIO) and no packagekit: appstream is pure Rust, so the
     # store starts with no backend. Upstream feature flags only, no source patch.
     cosmic-store) echo "--no-default-features --features dbus-config,desktop,logind,notify,packagekit,single-instance,wayland,wgpu,xdg-portal" ;;
+    # Upstream default features (mpris-server, xdg-portal, wgpu, wayland); its
+    # GStreamer stack comes from ports/gstreamer (merged into the sysroot).
+    cosmic-player) echo "" ;;
     cosmic-monitor) echo "--no-default-features --features dbus-config,wayland,wgpu" ;;   # no nvml
     cosmic-initial-setup) echo "--no-default-features --features wgpu,wayland" ;;
     *)            echo "" ;;

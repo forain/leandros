@@ -580,6 +580,26 @@ build_portal() {
     stage_container_port "$port" "$arch" portal "the portal" PORTAL
 }
 
+# Function to stage GStreamer (ports/gstreamer): Alpine 3.21 gstreamer 1.24 +
+# plugins + gst-libav + PipeWire plugin for cosmic-player. Same rules as PipeWire;
+# LEANDROS_GSTREAMER_REBUILD=1 forces it, LEANDROS_SKIP_GSTREAMER=1 skips it.
+build_gstreamer() {
+    local arch="$1"
+    echo "🎞  Staging $arch GStreamer..."
+    if [[ "${LEANDROS_SKIP_GSTREAMER:-0}" == 1 ]]; then
+        echo "⚠️  LEANDROS_SKIP_GSTREAMER=1, skipping"
+        return 0
+    fi
+    local port="$ROOT_DIR/ports/gstreamer"
+    local stamp="$port/out/$arch/.stamp"
+    if [[ "${LEANDROS_GSTREAMER_REBUILD:-0}" != 1 && -f "$stamp" ]] \
+       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
+        echo "  up to date ($port/out/$arch)"
+        return 0
+    fi
+    stage_container_port "$port" "$arch" gstreamer GStreamer GSTREAMER
+}
+
 # Function to stage PipeWire + WirePlumber (ports/pipewire)
 #
 # Alpine 3.21's prebuilt pipewire 1.2.7 + wireplumber 0.5 (container, like the
@@ -1144,6 +1164,7 @@ for arch in "${ARCHS[@]}"; do
     build_firefox "$arch"
     build_portal "$arch"
     build_pipewire "$arch"
+    build_gstreamer "$arch"
     build_apk "$arch"
     build_bottom "$arch"
     build_brush "$arch"

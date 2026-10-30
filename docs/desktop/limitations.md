@@ -140,3 +140,9 @@ Recorded so they are not reopened without new evidence:
 - [../../TODO.md](../../TODO.md) — the live open-work list
 - [../servers/security.md](../servers/security.md) — the full privilege-gap list
 - [../graphics/README.md](../graphics/README.md) — GPU paths and their host requirements
+
+## cosmic-player (GStreamer)
+
+| Limit | Detail |
+|---|---|
+| **cosmic-player is aarch64-verified only** | Audio works through the patched gst-plugin-pipewire 1.2.7 (the pool-activation deadlock is fixed). It needs `GST_PLUGIN_FEATURE_RANK=pipewiresink:PRIMARY` (set by the `.desktop`). x86_64 is untested. See `artifacts/notes/lane-gstport-2026-10-30.md`. |
