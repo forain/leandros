@@ -275,12 +275,12 @@ impl Layout {
     }
 
     pub fn specs(&self, guids: &[[u8; 16]; 4]) -> Vec<PartSpec> {
-        let mk = |t, g, r: (u64, u64), name| PartSpec { ptype: t, guid: g, first: r.0, last: r.0 + r.1 - 1, name };
+        let mk = |t, g, r: (u64, u64), name| PartSpec { ptype: t, guid: g, first: r.0, last: r.0 + r.1 - 1, name, attrs: if t == gpt::ESP_TYPE { 0 } else { gpt::ATTR_NO_AUTO } };
         vec![
             mk(gpt::ESP_TYPE, guids[0], self.esp, "LEANDROS ESP"),
-            mk(gpt::LINUX_TYPE, guids[1], self.root, "LEANDROS root"),
-            mk(gpt::LOG_TYPE, guids[2], self.log, "LEANDROS-LOG"),
-            mk(gpt::HOME_TYPE, guids[3], self.home, "LEANDROS home"),
+            mk(gpt::LROOT_TYPE, guids[1], self.root, "LEANDROS root"),
+            mk(gpt::LLOG_TYPE, guids[2], self.log, "LEANDROS-LOG"),
+            mk(gpt::LHOME_TYPE, guids[3], self.home, "LEANDROS home"),
         ]
     }
 }

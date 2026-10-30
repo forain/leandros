@@ -44,3 +44,29 @@ Source layout: `plan.rs` (disks, eligibility, layout), `gpt.rs`, `esp.rs`
 (FAT32 + conf rewrite), `copy.rs` (root block copy), `mkhome.rs` (home head),
 `install.rs` (the flow). `dev.rs`, `disks.rs`, `conf.rs` are espctl's, included
 by path. Acceptance test: `scripts/installer-test.sh aarch64 virtio`.
+
+## Partition types
+
+LeandrOS partitions use their own type GUIDs and carry GPT attribute bit 63
+(no-auto) so Linux gpt-auto never mounts them. The legacy types
+(0FC63DAF root, 933AC7E1 home, 042B7470 log) are still recognised by the
+kernel (`drivers/src/partscan.rs`) and espctl, so older sticks keep booting.
+
+| role | type GUID |
+|------|-----------|
+| root | `3F2D991B-D385-4FFF-9CF1-A0DB03062DE5` |
+| home | `F936DEE1-99D9-4BBC-8D2A-B7447DB9F650` |
+| log  | `3EC8FA02-816A-4D04-8718-64C3771C5187` |
+| boot | `0E02ED9A-FEEE-4CAB-A22F-C861AD7DE307` |
+
+Never use XBOOTLDR (`BC13C2FF`) or 933AC7E1 for LeandrOS partitions.
+
+## GPT editor and `gaps`
+
+`gpt::Gpt` reads an existing table (512 or 4096-byte sectors, entry geometry
+from the header), and `shrink`, `add`, `set_attrs` change only the named
+fields; every other entry byte and header field is kept. `write` writes the
+backup entries+header first, then the primary, then re-reads and verifies both
+CRCs. `leandros-install gaps --dev X [--sector-size N]` lists the entries and
+unallocated 1 MiB-aligned ranges of at least 1 MiB. `mkhome` explicitly zeroes
+all f2fs metadata blocks `[0, main_blkaddr)` before writing the head.

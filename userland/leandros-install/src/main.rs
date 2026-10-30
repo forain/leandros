@@ -12,6 +12,7 @@ const USAGE: &str = "usage:
   leandros-install list [--json] [--allow-removable]
   leandros-install install --target /dev/X --yes [--root-gib N] [--allow-removable]
                            [--no-verify] [--zero-fill] [--json] [--dry-run]
+  leandros-install gaps --dev FILE|/dev/X [--sector-size 512|4096]
   leandros-install mkhome --out FILE --size SIZE [--uuid HEX] [--time EPOCH] [--full]";
 
 fn mkhome_cmd(args: &[String]) {
@@ -43,6 +44,30 @@ fn mkhome_cmd(args: &[String]) {
     }
 }
 
+fn gaps_cmd(args: &[String]) {
+    let (mut dev, mut ss) = (None, 512u64);
+    let mut i = 1;
+    while i < args.len() {
+        let val = args.get(i + 1).cloned().unwrap_or_else(|| die("missing value"));
+        match args[i].as_str() {
+            "--dev" => dev = Some(val),
+            "--sector-size" => ss = val.parse().unwrap_or_else(|_| die("bad --sector-size")),
+            a => die(&format!("unknown argument {a}")),
+        }
+        i += 2;
+    }
+    let dev = dev.unwrap_or_else(|| die("--dev required"));
+    let mut f = std::fs::File::open(&dev).unwrap_or_else(|e| die(&format!("{dev}: {e}")));
+    let len = std::io::Seek::seek(&mut f, std::io::SeekFrom::End(0)).unwrap_or_else(|e| die(&e.to_string()));
+    let g = leandros_install::gpt::Gpt::read(&mut f, ss, len / ss).unwrap_or_else(|e| die(&e));
+    for (i, e) in g.used() {
+        println!("p{} {}..{} {}", i + 1, e.first, e.last, e.name);
+    }
+    for (a, b) in g.gaps() {
+        println!("gap {}..{} ({} MiB)", a, b, (b - a + 1) * ss >> 20);
+    }
+}
+
 fn parse_opts(args: &[String]) -> Opts {
     let mut o = Opts::default();
     let mut i = 1;
@@ -68,6 +93,7 @@ fn parse_opts(args: &[String]) -> Opts {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("gaps") => gaps_cmd(&args),
         Some("mkhome") => mkhome_cmd(&args),
         Some("list") => install::list(&parse_opts(&args)),
         Some("install") => {
