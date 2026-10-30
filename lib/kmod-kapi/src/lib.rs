@@ -12,6 +12,8 @@ static OWNER: AtomicU16 = AtomicU16::new(0);
 pub fn set_owner(id: KmodId) { OWNER.store(id.0, Ordering::SeqCst); }
 pub fn owner() -> KmodId { KmodId(OWNER.load(Ordering::SeqCst)) }
 
+pub mod blk;
+
 pub mod pci {
     use super::*;
 

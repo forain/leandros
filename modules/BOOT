@@ -1,3 +1,5 @@
 # Boot-critical modules, loaded first and in this order (modules.load keeps it; no sorting).
 # One name per line. Only names built as =m are used; a name with no crate fails the build (bidcheck bootcheck).
-# W2-3 (kmodblk) adds: virtio_blk nvme usb_storage (virtio_blk first: positional root rule).
+# virtio_blk first: positional root rule. usb_storage is added by W2-6.
+virtio_blk
+nvme

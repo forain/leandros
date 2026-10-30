@@ -321,7 +321,10 @@ pub fn register(dev: &'static dyn BlockDevice) -> Result<usize, BlkErr> {
 /// Probe the boot-time disks: every virtio-blk device first (indices 0..n in
 /// PCI order), then their partition tables.
 pub fn init() {
+    #[cfg(feature = "drv-virtio-blk")]
     let disks = crate::virtio_blk::probe_all();
+    #[cfg(not(feature = "drv-virtio-blk"))]
+    let disks: alloc::vec::Vec<&'static dyn BlockDevice> = alloc::vec::Vec::new();
     let _g = REGISTER.lock();
     let mut added: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(disks.len());
     for d in disks {

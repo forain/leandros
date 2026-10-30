@@ -39,6 +39,26 @@ if [[ "$mod" == "e1000e" ]]; then
     [[ $fail -eq 0 ]] && echo "autoloadtest e1000e: PASS" || { echo "autoloadtest e1000e: FAIL"; exit 1; }
     exit 0
 fi
+if [[ "$mod" == "virtio_blk" || "$mod" == "nvme" ]]; then
+    # Boot-path block drivers as modules (root disk on virtio-blk / nvme via LEANDROS_ROOT_BUS): loaded from the
+    # initrd through modules/BOOT, root mounts; modules.blacklist=<name> must time out without a hang.
+    sym=$(echo "$mod" | tr a-z A-Z)
+    printf 'CONFIG_MODULES=y\nCONFIG_%s=m\n' "$sym" > .config
+    ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/autoloadtest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/autoloadtest-build.log"; exit 1; }
+    RT=.claude/skills/run-leandros/runtests.py
+    fail=0
+    check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3"; fail=1; fi; }
+    export LEANDROS_RUN_ID="autoloadtest-$arch"
+    [[ "$mod" == "nvme" ]] && export LEANDROS_ROOT_BUS=nvme
+    python3 "$RT" "$arch" blk1 "cat /proc/modules" "kmodctl list" "cat /proc/mounts" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-blk1/serial-full.log
+    check "$L" "^\\[kmod\\] .*$mod loaded" "$mod loaded"
+    check "$L" "^$mod [0-9]* [0-9]* - Live" "listed in /proc/modules"
+    check "$L" "^$mod .* Live " "listed by kmodctl list"
+    [[ "$mod" == "nvme" ]] && check "$L" 'nvme0n1' "nvme0n1 registered"
+    [[ $fail -eq 0 ]] && echo "autoloadtest $mod: PASS" || { echo "autoloadtest $mod: FAIL"; exit 1; }
+    exit 0
+fi
 if [[ "$mod" == "of" ]]; then
     # Platform registry: hello is built as an extra module carrying `of: ["leandros,test"]`;
     # plat.alias_selftest=1 announces that compatible with no built-in driver, so the registry's

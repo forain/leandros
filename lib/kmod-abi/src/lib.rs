@@ -86,6 +86,7 @@ impl RegKind {
     pub const PCI: RegKind = RegKind(7);
     pub const TICK: RegKind = RegKind(8);
     pub const PM: RegKind = RegKind(9);
+    pub const BLK: RegKind = RegKind(10);
 }
 
 /// Device-id table entry (`.kmod.ids`), 16 bytes. PCI: a=vendor, b=device (0xffff = any).
@@ -317,6 +318,8 @@ pub const BUS_ACPI: u16 = 4;
 pub const BUS_SDIO: u16 = 5;
 
 pub mod alias;
+pub mod blk;
+pub use blk::{KBlkDesc, KBlkOps};
 
 /// Export-table entry; `name` is NUL-terminated.
 #[repr(C)]

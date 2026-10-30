@@ -28,11 +28,13 @@ mod net;
 mod pm;
 mod v4l2;
 mod usbfn;
+mod blk;
 
 pub use pci::*;
 pub use irq::*;
 pub use net::*;
 pub use pm::*;
+pub use blk::*;
 pub use v4l2::*;
 pub use usbfn::*;
 pub use core_::*;
@@ -78,6 +80,10 @@ const _: sys::CanSleepFn = kapi_can_sleep;
 const _: sys::SleepUntilFn = kapi_sleep_until;
 const _: sys::YieldFn = kapi_yield;
 const _: sys::CanSleepFn = kapi_irqs_masked;
+const _: kmod_abi::blk::sys_blk::BlkRegisterFn = kapi_blk_register;
+const _: kmod_abi::blk::sys_blk::BlkRemoveFn = kapi_blk_remove;
+const _: kmod_abi::blk::sys_blk::BoolFn = kapi_preempt_disabled;
+const _: kmod_abi::blk::sys_blk::VoidFn = kapi_preempt_enable_no_resched;
 const _: sys::CurrentPidFn = kapi_current_pid;
 const _: sys::IoremapFn = kapi_ioremap;
 const _: sys::IounmapFn = kapi_iounmap;
@@ -123,7 +129,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 77;
+pub const NEXPORTS: usize = 81;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -205,6 +211,10 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_usb_isoch_reap", kapi_usb_isoch_reap),
     sym!("kapi_usb_isoch_close", kapi_usb_isoch_close),
     sym!("kapi_v4l2_unregister", kapi_v4l2_unregister),
+    sym!("kapi_blk_register", kapi_blk_register),
+    sym!("kapi_blk_remove", kapi_blk_remove),
+    sym!("kapi_preempt_disabled", kapi_preempt_disabled),
+    sym!("kapi_preempt_enable_no_resched", kapi_preempt_enable_no_resched),
 ];
 
 extern "C" {
