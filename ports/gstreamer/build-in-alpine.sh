@@ -134,8 +134,8 @@ esac
   if [ "$(uname -m)" = "$ARCH" ]; then
     mkdir -p "$S/usr/share/sounds/leandros"
     gst-launch-1.0 -q matroskamux name=m ! filesink location="$S/usr/share/sounds/leandros/clip-mpeg4-vorbis.mkv" \
-      videotestsrc num-buffers=150 pattern=ball ! video/x-raw,width=320,height=240,framerate=25/1 ! videoconvert ! avenc_mpeg4 ! m. \
-      audiotestsrc num-buffers=300 freq=440 samplesperbuffer=960 ! audio/x-raw,rate=48000,channels=2 ! audioconvert ! vorbisenc ! m. \
+      videotestsrc num-buffers=750 pattern=ball ! video/x-raw,width=320,height=240,framerate=25/1 ! videoconvert ! avenc_mpeg4 ! m. \
+      audiotestsrc num-buffers=1500 freq=440 samplesperbuffer=960 ! audio/x-raw,rate=48000,channels=2 ! audioconvert ! vorbisenc ! m. \
       && ls -l "$S/usr/share/sounds/leandros/clip-mpeg4-vorbis.mkv"
   fi
   # -- dev tree for the cross sysroot: headers, .pc, linkable libs (ELF-fixed) ----

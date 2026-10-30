@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=COSMIC Media Player
 Comment=Media player for the COSMIC desktop
-Exec=cosmic-player %U
+Exec=env GST_PLUGIN_FEATURE_RANK=pipewiresink:PRIMARY cosmic-player %U
 Terminal=false
 Type=Application
 StartupNotify=true
