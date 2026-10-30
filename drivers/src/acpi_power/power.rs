@@ -76,11 +76,11 @@ struct State {
 struct Wrap(State);
 unsafe impl Send for Wrap {}
 
-fn log(s: &str) { crate::i915::emit_logonly(s); }
+fn log(s: &str) { crate::kdiag::emit_logonly(s); }
 /// Console + klog (the one-time discovery summary).
 static EC_FAIL_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-fn say(s: &str) { crate::i915::emit(s); }
-fn now_ns() -> u64 { crate::i915::now_ns() }
+fn say(s: &str) { crate::kdiag::emit(s); }
+fn now_ns() -> u64 { crate::kdiag::now_ns() }
 
 #[cfg(target_arch = "x86_64")]
 mod pio {
@@ -153,7 +153,7 @@ fn facs_word() -> Option<&'static core::sync::atomic::AtomicU32> {
 }
 fn gl_acquire() -> bool {
     let Some(a) = facs_word() else { return true };
-    let ok = GL.acquire(a, GL_TRIES, &mut || { core::hint::spin_loop(); crate::i915::delay_us(1); });
+    let ok = GL.acquire(a, GL_TRIES, &mut || { core::hint::spin_loop(); crate::kdiag::delay_us(1); });
     if !ok {
         let n = GL.fails.load(Ordering::Relaxed);
         if n <= 8 { say(&format!("acpi: FACS global lock acquire TIMED OUT (#{}); field access failed\n", n)); }
@@ -280,10 +280,10 @@ impl Host for KHost {
 
     fn sleep_ms(&mut self, ms: u64) {
         let cap = if SLEEP_WIN.load(Ordering::Relaxed) { 2000 } else { 100 };
-        crate::i915::delay_us(ms.min(cap) * 1000);
+        crate::kdiag::delay_us(ms.min(cap) * 1000);
     }
     fn global_lock(&mut self, acquire: bool) -> bool { if acquire { gl_acquire() } else { gl_release(); true } }
-    fn stall_us(&mut self, us: u64) { crate::i915::delay_us(us.min(100)); }
+    fn stall_us(&mut self, us: u64) { crate::kdiag::delay_us(us.min(100)); }
     fn timer(&mut self) -> u64 { now_ns() / 100 }
     fn notify(&mut self, node: usize, code: u64) { if self.notes.len() < 64 { self.notes.push((node, code)); } }
     fn log(&mut self, msg: &str) { log(msg); }
@@ -338,7 +338,7 @@ pub fn init(rsdp: u64, hhdm: u64) {
         let enable = f.get(52).copied().unwrap_or(0);
         if pm1a_cnt != 0 && pio::inw(pm1a_cnt) & 1 == 0 && smi_cmd != 0 && enable != 0 {
             pio::outb(smi_cmd, enable);
-            for _ in 0..300 { if pio::inw(pm1a_cnt) & 1 != 0 { break; } crate::i915::delay_us(1000); }
+            for _ in 0..300 { if pio::inw(pm1a_cnt) & 1 != 0 { break; } crate::kdiag::delay_us(1000); }
             log(&format!("acpi: SCI_EN was clear, ACPI enable -> PM1a_CNT={:#x}\n", pio::inw(pm1a_cnt)));
         }
     }

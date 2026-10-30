@@ -10,6 +10,7 @@ extern crate alloc;
 
 pub mod serial;
 pub mod kenv;
+pub mod kdiag;
 pub mod platform;
 pub mod pci;
 /// Generic PCI config-space save/restore for system sleep (lane s3pci).

@@ -32,9 +32,9 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use sched::ksync::KSpinLock;
+use crate::kenv::sched::ksync::KSpinLock;
 
-use crate::gpu_kms::{KmsCursor, KmsCursorSrc};
+use crate::kenv::kms::{KmsCursor, KmsCursorSrc};
 
 use super::hw::{self, reg};
 use super::kms;
@@ -178,8 +178,8 @@ fn set(src: &KmsCursorSrc, x: i32, y: i32) -> bool {
     let next = 1 - CUR.lock().active;
     // Copy outside the lock: the other buffer is not being scanned (the
     // previous switch latched before the commit that brings this one).
-    let dst = mm::phys_to_virt(buf_phys(next) as usize) as *mut u8;
-    let s = mm::phys_to_virt(phys as usize) as *const u8;
+    let dst = crate::kenv::mm::phys_to_virt(buf_phys(next) as usize) as *mut u8;
+    let s = crate::kenv::mm::phys_to_virt(phys as usize) as *const u8;
     let cols = w.min(SIZE) as usize * 4;
     let rows = h.min(SIZE) as usize;
     unsafe {
@@ -325,8 +325,8 @@ pub(super) fn init(d: &Device) -> bool {
         }
     };
     // Two 16 KiB images, contiguous (order 3 = 32 KiB), zeroed, flushed.
-    let Some(phys) = mm::buddy::alloc(3) else { log("kms: cursor: out of memory; no hardware cursor"); return false };
-    unsafe { core::ptr::write_bytes(mm::phys_to_virt(phys) as *mut u8, 0, 2 * BYTES); }
+    let Some(phys) = crate::kenv::mm::buddy::alloc(3) else { log("kms: cursor: out of memory; no hardware cursor"); return false };
+    unsafe { core::ptr::write_bytes(crate::kenv::mm::phys_to_virt(phys) as *mut u8, 0, 2 * BYTES); }
     kms::flush_for_display(phys as u64, 2 * BYTES as u64);
     let base = kms::CURSOR_GGTT / 4096;
     for i in 0..(2 * BYTES as u64 / 4096) { kms::gsm_write(base + i, hw::ggtt_pte(phys as u64 + i * 4096)); }
@@ -340,7 +340,7 @@ pub(super) fn init(d: &Device) -> bool {
         m.w(CURBASE, buf_ggtt(0));
     }
     ENABLED.store(true, Ordering::Release);
-    crate::gpu_kms::register_cursor(&CURSOR);
+    crate::kenv::kms::register_cursor(&CURSOR);
     ilog!("kms: cursor: hardware cursor on pipe A: {}x{} ARGB8888, images at GGTT 0x{:08x}/0x{:08x}, DDB blocks {}..={} (CUR_BUF_CFG was 0x{:08x}, CURCNTR was 0x{:08x}; plane 1A BUF_CFG 0x{:08x}); i915.hwcursor=0 turns it off",
           SIZE, SIZE, buf_ggtt(0), buf_ggtt(1), ddb & 0x7FF, (ddb >> 16) & 0x7FF, m.r(CUR_BUF_CFG), was,
           m.r(kms::preg(kms::PLANE_BUF_CFG_1_A)));

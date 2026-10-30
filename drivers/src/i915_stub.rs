@@ -5,31 +5,12 @@
 
 use alloc::string::String;
 
-extern "C" {
-    fn serial_print_str_raw(s: *const u8, len: usize);
-    fn klog_write_only(s: *const u8, len: usize);
-    fn arch_monotonic_ns() -> u64;
-}
-
 /// What the kernel knows about the boot framebuffer.
 pub struct BootEnv {
     pub fb_phys: u64,
     pub fb_width: u32,
     pub fb_height: u32,
     pub fb_pitch: u32,
-}
-
-pub(crate) fn emit(s: &str) { unsafe { serial_print_str_raw(s.as_ptr(), s.len()); } }
-pub(crate) fn emit_logonly(s: &str) { unsafe { klog_write_only(s.as_ptr(), s.len()); } }
-pub(crate) fn now_ns() -> u64 { unsafe { arch_monotonic_ns() } }
-
-/// Bounded busy-wait; falls back to an iteration cap if the clock is stuck.
-pub(crate) fn delay_us(us: u64) {
-    let start = now_ns();
-    for _ in 0..20_000_000u32 {
-        if now_ns().wrapping_sub(start) >= us * 1000 { return; }
-        core::hint::spin_loop();
-    }
 }
 
 pub fn run(_env: &BootEnv) {}

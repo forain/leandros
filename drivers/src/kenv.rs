@@ -43,3 +43,31 @@ pub mod input {
 pub fn wifi_register(ops: &crate::wifi_radio::KWifiRadioOps, ctx: usize, legacy: *const crate::wifi_radio::KLegacy) -> i32 {
     crate::wifi_class::register_raw(ops, ctx, legacy)
 }
+
+pub use crate::kdiag::{emit, emit_logonly, now_ns, delay_us};
+
+/// DRM device-interface seam (fences, sync objects, ext events, offsets, stats).
+pub mod drm {
+    pub use crate::drm_device_interface::{
+        ext_event_complete, ext_event_stats, ext_present_stats, gpu_fence_irq_hint, proc_prime,
+        syncobj_exists, syncobj_in_fences, syncobj_install, wait_fences,
+    };
+    pub use crate::drm_offset::{offset_for, release as offset_release};
+}
+
+/// KMS backend registration seam.
+pub mod kms {
+    pub use crate::gpu_kms::*;
+}
+
+/// DRM uapi backend registration seam.
+pub mod uapi {
+    pub use crate::gpu_uapi::*;
+    /// Install the backend mmap-pin hook (sys_mmap page pin for driver tokens).
+    pub fn set_mmap_pin(f: fn(usize, usize, u32) -> Option<alloc::vec::Vec<usize>>) {
+        *crate::drm_device_interface::BACKEND_MMAP_PIN.lock() = Some(f);
+    }
+}
+
+/// HPD uevent to userspace (evdev hotplug node).
+pub fn hotplug(minor: u8) { ::evdev_server::hp_drm_change(minor) }
