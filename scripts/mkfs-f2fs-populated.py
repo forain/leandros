@@ -1699,6 +1699,7 @@ def main():
     cosapps_icon_dirs = []
     for _app, _appid in (("cosmic-files", "com.system76.CosmicFiles"),
                          ("cosmic-edit", "com.system76.CosmicEdit"),
+                         ("cosmic-store", "com.system76.CosmicStore"),
                          ("cosmic-screenshot", "com.system76.CosmicScreenshot"),
                          ("cosmic-monitor", "com.system76.CosmicMonitor"),
                          ("cosmic-initial-setup", "com.system76.CosmicInitialSetup")):
@@ -1732,7 +1733,8 @@ def main():
                      ("cosmic-applet-workspaces", "CosmicAppletWorkspaces"),
                      ("cosmic-applet-input-sources", "CosmicAppletInputSources"),
                      ("cosmic-applet-a11y", "CosmicAppletA11y"),
-                     ("cosmic-app-list", "CosmicAppList")):
+                     ("cosmic-app-list", "CosmicAppList"),
+                     ("cosmic-applet-audio", "CosmicAppletAudio")):
         _apbin = m6_pick(f"{m6_out}/{_ap}-{arch}")
         if os.path.exists(_apbin):
             bin_files.append((_ap, _apbin, 0o100755))
@@ -1744,6 +1746,17 @@ def main():
         else:
             print(f"  WARNING: {_apbin} absent, no {_ap} in the panel: "
                   f"./ports/cosmic-applets-panel/build.sh {arch}")
+
+    # Upstream's default plugins_wings (the compiled-in default and the
+    # initial-setup layout) lists the Workspaces BUTTON, not the Workspaces
+    # APPLET. System default (cosmic-config reads /usr/share/cosmic) = upstream's
+    # list plus com.system76.CosmicAppletWorkspaces after the app button.
+    if "cosmic-applet-workspaces" in [b[0] for b in bin_files]:
+        for _d in ("/usr/share/cosmic", "/usr/share/cosmic/com.system76.CosmicPanel.Panel",
+                   "/usr/share/cosmic/com.system76.CosmicPanel.Panel/v1"):
+            m4_share_dirs.add(_d)
+        m4_share_files.append(("/usr/share/cosmic/com.system76.CosmicPanel.Panel/v1", "plugins_wings",
+                               "ports/cosmic-applets-panel/panel_plugins_wings"))
 
     # leandros-applet — a minimal dependency-free wl_shm xdg_toplevel panel applet.
     # cosmic-panel refuses to render its bar with no applet content (render()

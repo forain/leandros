@@ -25,7 +25,7 @@ case "${1:-both}" in
 esac
 shift || true
 APPS=("$@")
-[[ ${#APPS[@]} -gt 0 ]] || APPS=(cosmic-files cosmic-edit cosmic-screenshot)
+[[ ${#APPS[@]} -gt 0 ]] || APPS=(cosmic-files cosmic-edit cosmic-screenshot cosmic-store cosmic-monitor cosmic-initial-setup)
 
 if [[ ! -x "$M6/build-rust.sh" ]]; then
   echo "cosmic-apps: no m6 toolchain at $M6 -- not built" >&2
@@ -38,8 +38,21 @@ feat_for() {
   case "$1" in
     cosmic-files) echo "--no-default-features --features bzip2,dbus-config,desktop,lzma-rust2,notify,wayland,wgpu" ;;
     cosmic-edit)  echo "--no-default-features --features dbus-config,wayland,wgpu" ;;
+    # No libflatpak (GLib/GIO) and no packagekit: appstream is pure Rust, so the
+    # store starts with no backend. Upstream feature flags only, no source patch.
+    cosmic-store) echo "--no-default-features --features dbus-config,desktop,logind,notify,packagekit,single-instance,wayland,wgpu,xdg-portal" ;;
     *)            echo "" ;;
   esac
+}
+
+# cosmic-store's reqwest pulls aws-lc-sys, whose C objects reference
+# __stack_chk_guard; the sysroot libc.so does not export it (same gap as
+# ports/mesa/ssp_guard.c), so link the same shim object in.
+extra_for() {
+  [[ "$1" == cosmic-store ]] || return 0
+  local o="$M6/out/ssp_guard-$2.o"
+  "$M6/toolchain/$2-linux-musl-cc" -fno-stack-protector -c "$(dirname "$0")/../mesa/ssp_guard.c" -o "$o" || return 1
+  echo "--config=target.$2-unknown-linux-musl.rustflags=[\"-C\",\"link-arg=$o\"]"
 }
 
 for app in "${APPS[@]}"; do
@@ -53,7 +66,7 @@ for app in "${APPS[@]}"; do
   fi
   [[ -f "$SRC/$app/.cargo/config.toml" ]] || sh "$M6/gen-cargo-config.sh" "$SRC/$app" > /dev/null
   for arch in "${ARCHES[@]}"; do
-    if ! "$M6/build-rust.sh" "$SRC/$app" "$arch" $(feat_for "$app") > /dev/null; then
+    if ! "$M6/build-rust.sh" "$SRC/$app" "$arch" $(feat_for "$app") $(extra_for "$app" "$arch") > /dev/null; then
       echo "cosmic-apps: $app build failed for $arch (log: $M6/logs/$app-$arch.log)" >&2
       exit 1
     fi

@@ -795,7 +795,17 @@ premises, is in `git log -p TODO.md` and `artifacts/notes/`.
 - **D-Bus services still missing**: xdg-desktop-portal (no portal, screenshot or file chooser),
   timedate1, SwitcherooControl and the a11y bus. busd activation itself works, and lane
   `dbussvc` (`ports/sysbus`) added login1, locale1, UPower, power-profiles and PolicyKit1.
-- **`cosmic-files`, `cosmic-edit` and `cosmic-store` are not built or staged.**
+- **`cosmic-store` is staged with no backend** (lane cosapps2b): the build uses upstream features
+  `packagekit` (pure-Rust zbus client) without `flatpak`; at runtime `failed to load packagekit backend`
+  because no PackageKit D-Bus service exists, so the store UI is empty. A real backend needs either a
+  PackageKit service or libflatpak (GLib/GIO + ostree, not in the sysroot).
+- **`cosmic-player` is not built (blocked, ~1-2 days)**: GStreamer is a hard dependency (`gstreamer-tag`
+  and the `iced_video_player` fork, no cargo feature removes it). Missing: glib/gobject/gio, gstreamer
+  1.x core, plugins-base (app, video, playback, audio), plugins-good, a decoder (gst-libav + ffmpeg, or
+  gst-plugins-bad) and an audio sink for PipeWire (pipewire gst plugin or pulsesink via pipewire-pulse);
+  ~80-120 MB of shared libs. Route: Alpine 3.21 repackage (ports/firefox pattern) for the runtime closure,
+  plus the `-dev` pkg-config files and libs added to `m3-gl-stack/sysroot-aarch64` so the musl cross build
+  can link gstreamer-sys. Then verify a short clip plays with sound through PipeWire.
 - **One permanent COSMIC patch remains**: `ports/cosmic-comp/0001-toplevel-info-weak-window.patch`
   (the closed-window texture leak, lane `weakwindow`). The goal is unmodified COSMIC, so it is a
   standing debt until upstream has an equivalent.

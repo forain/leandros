@@ -194,7 +194,7 @@ Since lane cosapplets the unmodified upstream applets from cosmic-applets are st
 
 **Bluetooth.** The Bluetooth applet and Settings page use the `org.bluez` shim over btd ([../servers/bluetooth.md](../servers/bluetooth.md#c-orgbluez-for-the-desktop-leandros-sysbus-bluez-portssysbussrcbluez)), D-Bus-activated on first use through `org.bluez.service`. `ports/cosmic-applet-bluetooth` builds unmodified upstream (bluer 0.17.4, linked against `libdbus-1.so.3` from `ports/libdbus`). Access is by group: `bluetooth` (gid 112, containing the desktop user) owns `btd.sock` and `/run/bluetooth/bthid.connect` as `root:bluetooth 0660`; `/run` is a tmpfs. Because the shim and the other sysbus services live in one shared binary, `leandros-sysbus` embeds a `leandros-sysbus-services:<subcommands>;` marker and mkfs refuses an image whose staged binary does not list every subcommand a `.service` names (a stale shared artifact otherwise looks like "service unknown").
 
-**Other applications.** `cosmic-files`, `cosmic-edit` and `cosmic-screenshot` (epoch-1.3.0, gvfs and io-uring dropped) are staged with `.desktop` files and hicolor icons ([`ports/cosmic-apps`](../../ports/cosmic-apps)); Firefox has a `firefox.desktop` entry and icon, so it appears in the launcher. Launched by hand they need `WAYLAND_DISPLAY=wayland-1` exported (cosmic-panel hands its children a socket, not the variable); with that all three ran 15 s without a panic. The Print key is bound by cosmic-comp to the Screenshot action; the capture path through the portal and screencopy has not been verified.
+**Other applications.** `cosmic-files`, `cosmic-edit`, `cosmic-store` and `cosmic-screenshot` (epoch-1.3.0, gvfs and io-uring dropped; the store is built with `desktop,logind,notify,packagekit,single-instance,wayland,wgpu,xdg-portal` and no libflatpak, and has no working backend because no PackageKit service exists, so it starts and shows an empty store) are staged with `.desktop` files and hicolor icons ([`ports/cosmic-apps`](../../ports/cosmic-apps)); Firefox has a `firefox.desktop` entry and icon, so it appears in the launcher. Launched by hand they need `WAYLAND_DISPLAY=wayland-1` exported (cosmic-panel hands its children a socket, not the variable); with that all three ran 15 s without a panic. The Print key is bound by cosmic-comp to the Screenshot action; the capture path through the portal and screencopy has not been verified.
 
 **System Monitor, Initial Setup, wallpapers.** `cosmic-monitor` (no nvml) and `cosmic-initial-setup` (epoch-1.3.0) are built by `ports/cosmic-apps` and staged with their `.desktop`; Initial Setup is `NoDisplay` and its Autostart entry is not staged, so it never runs at first login (the image creates accounts itself) and is launched by hand. `ports/cosmic-wallpapers` stages the six other upstream wallpapers, downscaled to 1280x720 (about 1.2 MB), next to the Orion Nebula default in `/usr/share/backgrounds/cosmic/`. `/proc/stat` now reports real per-CPU busy/idle jiffies (idle = time in hlt/wfi), which the monitor's CPU graphs read.
 
@@ -378,3 +378,12 @@ See [limitations.md](limitations.md) for the full list.
 - [../kernel/threads-and-futex.md](../kernel/threads-and-futex.md) — futex keying
 - [../servers/networking.md](../servers/networking.md) — AF_UNIX, SCM_RIGHTS, `shutdown(2)`
 - [../userland/ports.md](../userland/ports.md)
+
+## Audio applet and Workspaces applet (cosapplets2, 2026-10-30)
+
+`cosmic-applet-audio` (unmodified, built by `ports/cosmic-applets-panel/build.sh`) does not speak
+PulseAudio: it talks varlink to cosmic-settings-daemon's audio server (native PipeWire), which
+the image already runs. `cosmic-applet-minimize` and `cosmic-applet-tiling` were already staged.
+Upstream's default `plugins_wings` names the Workspaces button, not the Workspaces applet, so the
+image stages a system default `/usr/share/cosmic/com.system76.CosmicPanel.Panel/v1/plugins_wings`
+(`ports/cosmic-applets-panel/panel_plugins_wings`) = upstream's list plus `CosmicAppletWorkspaces`.
