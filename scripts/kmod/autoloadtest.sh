@@ -263,6 +263,29 @@ PY
     [[ $fail -eq 0 ]] && echo "autoloadtest usb_storage: PASS" || { echo "autoloadtest usb_storage: FAIL"; exit 1; }
     exit 0
 fi
+if [[ "$mod" == "bt" ]]; then
+    # CONFIG_BT=m: QEMU has no USB Bluetooth controller, so the `usb * * e0 01 01` alias is exercised
+    # by usb.alias_selftest=bt (a synthetic HCI interface through the enumerate hook). The module
+    # loads, registers its class driver (no device: nothing probes) and stays resident.
+    printf 'CONFIG_MODULES=y\nCONFIG_BT=m\n' > .config
+    ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/autoloadtest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/autoloadtest-build.log"; exit 1; }
+    RT=.claude/skills/run-leandros/runtests.py
+    fail=0
+    check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3"; fail=1; fi; }
+    export LEANDROS_RUN_ID="autoloadtest-$arch"
+    python3 "$RT" "$arch" alt1 --cmdline "usb.alias_selftest=bt" "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt1/serial-full.log
+    check "$L" '^\[kmod\] usb 1234:5678 e00101 -> bt' "usb alias autoload at enumerate"
+    check "$L" '^\[kmod\] bt loaded id' "bt loaded"
+    check "$L" 'usb alias selftest: class driver wants the interface: Some(224)' "module's class driver registered"
+    check "$L" '^bt [0-9]* [0-9]* - Live' "listed in /proc/modules"
+    python3 "$RT" "$arch" alt3 --cmdline "usb.alias_selftest=bt modules.blacklist=bt" "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt3/serial-full.log
+    check "$L" 'alias usb 1234:5678 e00101 bt: Blacklisted' "blacklist refuses the alias load"
+    if grep -aq '^\[kmod\] bt loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
+    [[ $fail -eq 0 ]] && echo "autoloadtest bt: PASS" || { echo "autoloadtest bt: FAIL"; exit 1; }
+    exit 0
+fi
 if [[ "$mod" == "uvc" ]]; then
     # CONFIG_USB_VIDEO_CLASS=m: the camera driver is ONLY a module. QEMU has no UVC device, so the
     # `usb 0e 02` alias is exercised by usb.alias_selftest=1 (the enumerate hook on a synthetic

@@ -34,6 +34,7 @@ members = [
     "modules/virtio-keyboard",
     "modules/usb-hid",
     "modules/usb-storage",
+    "modules/bt",
     "modules/virtio-net",
     "modules/virtio-snd",
     "modules/hda",

@@ -169,8 +169,10 @@ pub fn sdio_hook(vid: u16, did: u16) {
 /// `usb.alias_selftest=1`: run the enumerate-time hook against a synthetic video-streaming
 /// interface (QEMU has no UVC device), the way the xhci enumerator does for a real camera.
 fn usb_selftest() {
-    if opt("usb.alias_selftest") != Some("1") { return; }
-    let cfg: [u8; 9] = [9, 4, 1, 0, 0, 0x0E, 0x02, 0x00, 0];
+    // `=bt`: a synthetic Bluetooth HCI interface (e0/01/01), QEMU has no USB BT controller.
+    let bt = opt("usb.alias_selftest") == Some("bt");
+    if opt("usb.alias_selftest") != Some("1") && !bt { return; }
+    let cfg: [u8; 9] = if bt { [9, 4, 0, 0, 3, 0xE0, 0x01, 0x01, 0] } else { [9, 4, 1, 0, 0, 0x0E, 0x02, 0x00, 0] };
     let r = usb::class::wants_or_load(&cfg, 0x1234, 0x5678);
     log(&alloc::format!("[kmod] usb alias selftest: class driver wants the interface: {:?}\n", r));
 }

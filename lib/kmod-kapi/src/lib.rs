@@ -778,4 +778,46 @@ pub mod usb {
         if r < 0 { Err(r as i32) } else { Ok(r as usize) }
     }
     pub fn bulk_close(pipe: u64) { unsafe { sys::kapi_usb_bulk_close(pipe) } }
+
+    /// `bt_poll` flags.
+    pub const BT_BULK: u32 = 1;
+    pub const BT_RESET_EV: u32 = 2;
+    pub const BT_RESET_ACL: u32 = 4;
+    /// Configure the HCI interface of a class-claimed function. Ok = pipe handle. Task context.
+    pub fn bt_open(handle: u64) -> Result<u64, i32> {
+        let r = unsafe { sys::kapi_usb_bt_open(handle) };
+        if r < 0 { Err(r as i32) } else { Ok(r as u64) }
+    }
+    /// Next received chunk: Ok((len, flags)) (len may exceed `buf`), Err(-11) none, Err(-16) busy, Err(-19) gone.
+    pub fn bt_poll(pipe: u64, buf: &mut [u8]) -> Result<(usize, u32), i32> {
+        let mut f = 0u32;
+        let r = unsafe { sys::kapi_usb_bt_poll(pipe, buf.as_mut_ptr(), buf.len(), &mut f) };
+        if r < 0 { if f != 0 && r == -11 { Ok((0, f)) } else { Err(r as i32) } } else { Ok((r as usize, f)) }
+    }
+    /// kind 0 = HCI command (EP0), 1 = ACL (bulk OUT); no H4 type byte. Sleeps.
+    pub fn bt_send(pipe: u64, kind: u32, data: &[u8]) -> Result<(), i32> {
+        match unsafe { sys::kapi_usb_bt_send(pipe, kind, data.as_ptr(), data.len()) } { 0 => Ok(()), e => Err(e) }
+    }
+    pub fn bt_close(pipe: u64) { unsafe { sys::kapi_usb_bt_close(pipe) } }
+}
+
+/// Bluetooth HCI transport registration (/dev/hci0).
+pub mod hci {
+    use super::*;
+    pub fn register() -> Result<u64, i32> {
+        let r = unsafe { sys::kapi_hci_register(owner()) };
+        if r < 0 { Err(r as i32) } else { Ok(r as u64) }
+    }
+    /// Queue one H4 packet (type byte first) for btd.
+    pub fn rx(h: u64, pkt: &[u8]) -> bool { unsafe { sys::kapi_hci_rx(h, pkt.as_ptr(), pkt.len()) == 0 } }
+    /// Next H4 packet btd wrote, or None.
+    pub fn tx_pop(h: u64, buf: &mut [u8]) -> Option<usize> {
+        let r = unsafe { sys::kapi_hci_tx_pop(h, buf.as_mut_ptr(), buf.len()) };
+        if r > 0 { Some(r as usize) } else { None }
+    }
+    pub fn notify(h: u64) { unsafe { sys::kapi_hci_ctl(h, 0); } }
+    pub fn set_dead(h: u64) { unsafe { sys::kapi_hci_ctl(h, 1); } }
+    pub fn is_open(h: u64) -> bool { unsafe { sys::kapi_hci_ctl(h, 2) > 0 } }
+    pub fn rx_drops(h: u64) -> u64 { unsafe { sys::kapi_hci_ctl(h, 3).max(0) as u64 } }
+    pub fn unregister(h: u64) { unsafe { sys::kapi_hci_unregister(h) } }
 }

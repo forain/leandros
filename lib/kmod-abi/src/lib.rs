@@ -440,6 +440,15 @@ pub mod sys {
     pub type UsbBulkOpenFn = unsafe extern "C" fn(u64, u8) -> i64;
     pub type UsbBulkFn = unsafe extern "C" fn(u64, u32, u64, *mut u8, usize, u64) -> isize;
     pub type UsbBulkCloseFn = unsafe extern "C" fn(u64);
+    pub type HciRegisterFn = unsafe extern "C" fn(super::KmodId) -> i64;
+    pub type HciRxFn = unsafe extern "C" fn(u64, *const u8, usize) -> i32;
+    pub type HciTxPopFn = unsafe extern "C" fn(u64, *mut u8, usize) -> isize;
+    pub type HciCtlFn = unsafe extern "C" fn(u64, u32) -> i64;
+    pub type HciUnregisterFn = unsafe extern "C" fn(u64);
+    pub type UsbBtOpenFn = unsafe extern "C" fn(u64) -> i64;
+    pub type UsbBtPollFn = unsafe extern "C" fn(u64, *mut u8, usize, *mut u32) -> isize;
+    pub type UsbBtSendFn = unsafe extern "C" fn(u64, u32, *const u8, usize) -> i32;
+    pub type UsbBtCloseFn = unsafe extern "C" fn(u64);
     pub type UsbIntrPollFn = unsafe extern "C" fn(u64, *mut u8, usize) -> isize;
     pub type UsbIntrOutFn = unsafe extern "C" fn(u64, *const u8, usize) -> i32;
     pub type UsbIntrCloseFn = unsafe extern "C" fn(u64);
@@ -525,6 +534,15 @@ pub mod sys {
         pub fn kapi_usb_bulk_open(handle: u64, iface: u8) -> i64;
         pub fn kapi_usb_bulk(pipe: u64, op: u32, arg: u64, buf: *mut u8, len: usize, timeout_ns: u64) -> isize;
         pub fn kapi_usb_bulk_close(pipe: u64);
+        pub fn kapi_hci_register(owner: super::KmodId) -> i64;
+        pub fn kapi_hci_rx(h: u64, pkt: *const u8, len: usize) -> i32;
+        pub fn kapi_hci_tx_pop(h: u64, buf: *mut u8, cap: usize) -> isize;
+        pub fn kapi_hci_ctl(h: u64, op: u32) -> i64;
+        pub fn kapi_hci_unregister(h: u64);
+        pub fn kapi_usb_bt_open(handle: u64) -> i64;
+        pub fn kapi_usb_bt_poll(pipe: u64, buf: *mut u8, cap: usize, flags: *mut u32) -> isize;
+        pub fn kapi_usb_bt_send(pipe: u64, kind: u32, buf: *const u8, len: usize) -> i32;
+        pub fn kapi_usb_bt_close(pipe: u64);
         pub fn kapi_v4l2_unregister(ctx: usize);
         pub fn kapi_pm_register(owner: KmodId, suspend: Option<super::KPmFn>, resume: Option<super::KPmFn>,
                                 shutdown: Option<super::KPmFn>, ctx: usize) -> i32;
