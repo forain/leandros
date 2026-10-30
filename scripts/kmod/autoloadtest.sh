@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# autoloadtest.sh [arch] [virtio_rng|e1000e|virtio_net|virtio_snd|virtio_keyboard|hda|uvc|usb_hid|of]: host-side test of the modules.alias autoload path.
+# autoloadtest.sh [arch] [virtio_rng|e1000e|virtio_net|virtio_snd|virtio_keyboard|hda|iwlwifi|uvc|usb_hid|of]: host-side test of the modules.alias autoload path.
 # Builds with CONFIG_MODULES=y CONFIG_VIRTIO_RNG=m (the driver is then ONLY a module, found via
 # modules.alias, no modules.load), boots under QEMU and checks that it autoloads, is listed, feeds
 # the CSPRNG, and that modules.blacklist=virtio_rng boots without it. Restores .config afterwards
@@ -112,6 +112,25 @@ if [[ "$mod" == "virtio_snd" ]]; then
     L=/tmp/ffsession/tests-alt2/serial-full.log
     check "$L" 'alias pci 1af4:1059 virtio_snd: Blacklisted' "blacklist refuses the alias load"
     [[ $fail -eq 0 ]] && echo "autoloadtest virtio_snd: PASS" || { echo "autoloadtest virtio_snd: FAIL"; exit 1; }
+    exit 0
+fi
+if [[ "$mod" == "iwlwifi" ]]; then
+    # CONFIG_IWLWIFI=m, no Intel Wi-Fi in QEMU: KMOD_AUTOLOAD forces the load. The module must build,
+    # load, find no device (init -19), free its slot and leave nothing registered or listed. The built-in
+    # stack (wifi-stack) stays up: the simulated radio still serves /proc/net/wifi.
+    printf 'CONFIG_MODULES=y\nCONFIG_IWLWIFI=m\n' > .config
+    KMOD_AUTOLOAD=iwlwifi ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/autoloadtest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/autoloadtest-build.log"; exit 1; }
+    RT=.claude/skills/run-leandros/runtests.py
+    fail=0
+    check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3"; fail=1; fi; }
+    nocheck() { if grep -aq -- "$2" "$1"; then echo "FAIL $3"; fail=1; else echo "ok   $3"; fi; }
+    export LEANDROS_RUN_ID="autoloadtest-$arch"
+    python3 "$RT" "$arch" alt1 "cat /proc/modules" "kmodctl list" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt1/serial-full.log
+    check "$L" '\[kmod\] iwlwifi init failed -19, slot freed' "no device: init -19, slot freed"
+    nocheck "$L" '^iwlwifi [0-9]* [0-9]* - Live' "not listed in /proc/modules"
+    nocheck "$L" 'iwlwifi init failed -19, [0-9]* pages leaked' "nothing left registered"
+    [[ $fail -eq 0 ]] && echo "autoloadtest iwlwifi: PASS" || { echo "autoloadtest iwlwifi: FAIL"; exit 1; }
     exit 0
 fi
 if [[ "$mod" == "hda" ]]; then

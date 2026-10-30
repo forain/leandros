@@ -65,6 +65,11 @@ pub extern "C" fn kapi_netdev_register(owner: KmodId, kind: u32, prefix: *const 
     match drivers::netdev::register_late(k, pfx, &MOD_OPS, slot as u8) {
         Some(id) => {
             crate::kmod::registry::note_registration(owner, RegKind::NETDEV, id as u64);
+            // A module Wi-Fi netif gets its netctl control side the same way the built-in one does.
+            #[cfg(feature = "drv-wifi-stack")]
+            if kind == KNET_WIFI {
+                if let Some(n) = drivers::netdev::get(id as usize) { drivers::wifi_class::attach(name, n.ifindex(), n.name()); }
+            }
             id as i32
         }
         None => -12,

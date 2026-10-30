@@ -21,9 +21,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-extern "C" {
-    fn serial_print_str_raw(s: *const u8, len: usize);
-}
+use crate::kenv::{mm, sched};
+
 
 /// One `[iwlwifi] ...` line on the console (and so in the persistent log).
 pub fn log(msg: &str) {
@@ -31,7 +30,7 @@ pub fn log(msg: &str) {
     s.push_str("[iwlwifi] ");
     s.push_str(msg);
     s.push('\n');
-    unsafe { serial_print_str_raw(s.as_ptr(), s.len()); }
+    crate::kenv::serial_raw(&s);
 }
 
 macro_rules! ilog { ($($a:tt)*) => { $crate::iwl_trans::log(&alloc::format!($($a)*)) }; }

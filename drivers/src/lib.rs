@@ -157,6 +157,7 @@ pub mod cmdline_secrets;
 /// The control seam between /dev/netctl and Wi-Fi backends (types only so far).
 pub mod wifi_api;
 /// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).
+#[cfg(feature = "wifi-stack")] pub mod wifi_pure;
 #[cfg(feature = "wifi-stack")] pub mod wifi_mgr;
 /// The Wi-Fi radio class: `Radio` trait + `repr(C)` table (pure) and the kernel registry.
 #[cfg(feature = "wifi-stack")] pub mod wifi_radio;

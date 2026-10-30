@@ -327,6 +327,9 @@ pub mod sched {
         use super::*;
         use core::sync::atomic::AtomicUsize;
 
+        /// Fill `buf` from the kernel CSPRNG.
+        pub fn fill(buf: &mut [u8]) { unsafe { sys::kapi_random_fill(buf.as_mut_ptr(), buf.len()) } }
+
         pub type SourceFn = fn(&mut [u8]) -> usize;
         const N: usize = 4;
         static FNS: [AtomicUsize; N] = [const { AtomicUsize::new(0) }; N];
@@ -526,6 +529,15 @@ pub mod netdev {
             if hit { self.irq_wakes.fetch_add(1, Ordering::Relaxed); } else { self.timer_wakes.fetch_add(1, Ordering::Relaxed); }
             hit
         }
+    }
+}
+
+pub mod wifi {
+    use super::*;
+    /// Hand a radio table (`drivers::wifi_radio::KWifiRadioOps`) and the optional legacy credential
+    /// (`KLegacy`) to the kernel's Wi-Fi class. Both stay valid for the life of the module.
+    pub fn register(ops: *const u8, ctx: usize, legacy: *const u8) -> i32 {
+        unsafe { sys::kapi_wifi_register(owner(), ops, ctx, legacy) }
     }
 }
 
