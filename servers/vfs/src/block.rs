@@ -100,6 +100,8 @@ pub struct DiskOps {
     pub flush: fn(usize) -> bool,
     /// Changes whenever a backend entry is removed (an unplugged USB disk).
     pub removed_gen: fn() -> usize,
+    /// Enable writes on whole disk `idx` (an NVMe disk) until the next boot.
+    pub set_rw: fn(usize) -> bool,
 }
 
 /// One backend entry as `DiskOps::describe` reports it.
@@ -1018,7 +1020,28 @@ pub fn ioctl(pid: u32, dev: u16, cmd: usize, arg: usize) -> isize {
         BLKROSET => {
             if arg == 0 { return -14; }
             let v = match sched::uaccess::read_user::<i32>(arg) { Some(v) => v, None => return -14 };
-            if v == 0 && !ro { 0 } else if v == 0 { -13 } else { -22 }
+            if v != 0 { return -22; }
+            if !ro { return 0; }
+            // Runtime write enable: root only, whole NVMe disk only, this boot only.
+            if sched::euid_of(pid) != 0 { return -13; }
+            match backing {
+                Backing::Disk(i) => match ops() {
+                    Some(o) if (o.set_rw)(i as usize) => {
+                        let mut b = BDEVS.lock();
+                        let slot = b.iter().position(|e| e.in_use && e.backing == Backing::Disk(i));
+                        for (k, e) in b.iter_mut().enumerate().filter(|(_, e)| e.in_use) {
+                            let me = match e.backing {
+                                Backing::Part { parent, .. } => Some(parent as usize) == slot,
+                                _ => Some(k) == slot,
+                            };
+                            if me { e.ro = false; }
+                        }
+                        0
+                    }
+                    _ => -13,
+                },
+                _ => -13,
+            }
         }
         // The partition table is only ever changed through BLKPG here, so a
         // re-read has nothing to do — and succeeding is what Linux does for a

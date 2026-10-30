@@ -18,6 +18,15 @@
 //! EROFS before they reach this file, and `write_sectors` refuses them again
 //! here (one log line per controller).
 //!
+//! # Runtime write enable
+//!
+//! `set_writable(disk)` clears the read-only flag of the controller that owns
+//! the named whole disk (`nvme0n1`) for the rest of this boot only; nothing
+//! persists. The VFS reaches it through `BLKROSET(0)` on the whole-disk node,
+//! which it allows for euid 0 only (the installer uses this to write its
+//! target disk). The flag is per controller, so every namespace of that
+//! controller becomes writable.
+//!
 //! # Bring-up (Linux `nvme_pci_configure_admin_queue` + `nvme_init_ctrl`)
 //!
 //! 1. Memory decode + bus master on, INTx disabled (we poll; nothing may
@@ -450,7 +459,7 @@ struct Ctrl {
     rtd3e_us: u32,
     timeout_ms: u64,
     vwc: bool,
-    read_only: bool,
+    read_only: AtomicBool,
     warned_ro: AtomicBool,
     // Statistics, printed at shutdown.
     rd_cmds: AtomicU64,
@@ -679,19 +688,19 @@ impl BlockDevice for Ns {
         self.rw(false, lba, buf.as_mut_ptr(), buf.len())
     }
     fn write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), BlkErr> {
-        if self.ctrl.read_only { return Err(self.refuse_write()); }
+        if self.ctrl.read_only.load(Ordering::Relaxed) { return Err(self.refuse_write()); }
         // `rw` only reads from the pointer for a write.
         self.rw(true, lba, buf.as_ptr() as *mut u8, buf.len())
     }
     /// Panic path: never wait for the controller lock.
     fn try_write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), BlkErr> {
-        if self.ctrl.read_only { return Err(BlkErr::ReadOnly); }
+        if self.ctrl.read_only.load(Ordering::Relaxed) { return Err(BlkErr::ReadOnly); }
         if self.ctrl.st.is_locked() { return Err(BlkErr::Io); }
         self.rw(true, lba, buf.as_ptr() as *mut u8, buf.len())
     }
     fn flush(&self) -> Result<(), BlkErr> {
         // Read-only: nothing was written, and Flush is on the never-send list.
-        if self.ctrl.read_only || !self.ctrl.vwc { return Ok(()); }
+        if self.ctrl.read_only.load(Ordering::Relaxed) || !self.ctrl.vwc { return Ok(()); }
         let mut st = self.ctrl.st.lock();
         if st.shut_down { return Err(BlkErr::Io); }
         self.ctrl.flushes.fetch_add(1, Ordering::Relaxed);
@@ -706,7 +715,7 @@ impl BlockDevice for Ns {
     }
     fn removable(&self) -> bool { false }
     fn name_class(&self) -> &'static str { "nvme" }
-    fn read_only(&self) -> bool { self.ctrl.read_only }
+    fn read_only(&self) -> bool { self.ctrl.read_only.load(Ordering::Relaxed) }
     fn disk_name(&self) -> Option<&'static str> { Some(self.name) }
 }
 
@@ -1071,7 +1080,7 @@ fn probe(dev: &PciDevice, index: usize) {
         rtd3e_us: rtd3e,
         timeout_ms: to_ms,
         vwc,
-        read_only,
+        read_only: AtomicBool::new(read_only),
         warned_ro: AtomicBool::new(false),
         rd_cmds: AtomicU64::new(0),
         rd_bytes: AtomicU64::new(0),
@@ -1175,6 +1184,20 @@ fn report_partitions(ns: &'static Ns) {
             ns.name, p.pno, p.start_lba, human(p.num_lbas * ss as u64), p.num_lbas, ty,
             core::str::from_utf8(&u[..un]).unwrap_or("?"), fs);
     }
+}
+
+/// Make the controller behind whole disk `name` (`nvme<C>n<NSID>`) writable
+/// until the next boot. Returns false when no such NVMe disk exists.
+pub fn set_writable(name: &str) -> bool {
+    let rest = match name.strip_prefix("nvme") { Some(r) => r, None => return false };
+    let (c, n) = match rest.split_once('n') { Some(x) => x, None => return false };
+    let (c, n) = match (c.parse::<usize>(), n.parse::<u32>()) { (Ok(c), Ok(n)) if n > 0 => (c, n), _ => return false };
+    let _ = n;
+    let ctrl = match CTRLS.lock().iter().find(|k| k.index == c) { Some(k) => *k, None => return false };
+    if ctrl.read_only.swap(false, Ordering::SeqCst) {
+        nlog!("nvme{}: writes enabled at runtime", c);
+    }
+    true
 }
 
 // ── Public entry points ──────────────────────────────────────────────────────
