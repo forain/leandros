@@ -477,6 +477,7 @@ pub mod sys {
         pub fn kapi_preempt_disable();
         pub fn kapi_preempt_enable();
         pub fn kapi_random_fill(buf: *mut u8, len: usize);
+        pub fn kapi_wifi_register(owner: super::KmodId, ops: *const u8, ctx: usize, legacy: *const u8) -> i32;
         pub fn kapi_copy_from_user(dst: *mut u8, uaddr: usize, n: usize) -> i32;
         pub fn kapi_copy_to_user(uaddr: usize, src: *const u8, n: usize) -> i32;
         pub fn kapi_pci_scan(index: u32, out: *mut super::KPciDev) -> i32;

@@ -19,7 +19,7 @@ WINDOW = {"aarch64": 0xfffffe0000000000, "x86_64": 0xffffffff90000000}
 WINDOW_SIZE = 0x10000000
 NSLOTS = WINDOW_SIZE // SLOT
 RESERVED_FROM = NSLOTS - 2  # 1022-1023: ktest/testblob
-ALLOW_DEPS = {"kmod-abi", "kmod-rt", "kmod-kapi", "spin", "bitflags", "leandros-lib",
+ALLOW_DEPS = {"netctl-abi", "kmod-abi", "kmod-rt", "kmod-kapi", "spin", "bitflags", "leandros-lib",
               "lock_api", "scopeguard"}
 FORBIDDEN_CRATES = ["mm", "sched", "drivers", "usb", "kernel", "vfs", "boot"]
 FLAG_SOFTFLOAT_CHECKED, FLAG_PERMANENT = 1, 2
