@@ -108,6 +108,7 @@ pub mod hostvis_core;
 /// (the NVIDIA nouveau-UAPI layer in drivers/nvidia).
 pub mod gpu_uapi;
 pub mod gpu_kms;
+pub mod kms_class;
 /// Sync files and dma-buf implicit fences (zink on a GPU UAPI backend).
 pub mod sync_file;
 /// Pure sync-file / dma-buf reservation semantics; host-tested in drivers/uapi-tests.
