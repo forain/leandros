@@ -36,7 +36,7 @@ const JOIN_TIMEOUT_MS: u64 = 20_000;
 const TXQ_MAX: usize = 128;
 const RXQ_MAX: usize = 256;
 
-pub static MGR: wm::Mgr = wm::Mgr::new("brcmfmac", "brcmf", mac_address);
+const MGR_NAME: &str = "brcmfmac";
 
 static PRESENT: AtomicBool = AtomicBool::new(false);
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -129,7 +129,6 @@ pub fn init(cmdline: &str) {
     sched::wedge::set_namer(sched::wedge::SLOT_NET, |c| match c { 1 => "netd-recv", 2 => "netd-send", _ => "idle" });
     sched::wedge::set_namer(sched::wedge::SLOT_SDIO, |c| match c { 1 => "cmd", 2 => "cmd53-data", _ => "idle" });
     crate::wifi_mgr::set_knobs(cmdline);
-    MGR.set_caps(CAPS);
     PRESENT.store(true, Ordering::Release);
 }
 
@@ -138,7 +137,7 @@ pub fn present() -> bool { PRESENT.load(Ordering::Acquire) }
 /// Register the control side for the netif `drivers/src/netdev.rs` gave us.
 pub fn attach(ifindex: u32, name: &str) -> bool {
     cfg::NETCTL_IFINDEX.store(ifindex, Ordering::Relaxed);
-    MGR.attach(ifindex, name)
+    crate::wifi_class::attach(MGR_NAME, ifindex, name)
 }
 
 static SHUTDOWN_REQ: AtomicBool = AtomicBool::new(false);
@@ -177,11 +176,11 @@ pub trait Ctl<F> {
 
 /// Integration entry point on the caller's thread: init sequence, then the
 /// connection manager loop. Returns only when the device is gone.
-pub fn run<F: Fwil>(fw: F) { let _ = run_ctl(fw, None); }
+pub fn run<F: Fwil + 'static>(fw: F) { let _ = run_ctl(fw, None); }
 
 /// [`run`] with the ctl file serviced in every state. Returns the bus and the
 /// `retry ...` text when a full re-probe (WL_REG_ON cycle) was asked for.
-pub fn run_ctl<F: Fwil>(fw: F, ctl: Option<Box<dyn Ctl<F>>>) -> Option<(F, String)> {
+pub fn run_ctl<F: Fwil + 'static>(fw: F, ctl: Option<Box<dyn Ctl<F>>>) -> Option<(F, String)> {
     if !present() || RUNNING.swap(true, Ordering::AcqRel) { return None; }
     let mut dev = Brcmf::new(fw, kernel_env());
     let cc = *COUNTRY.lock();
@@ -207,8 +206,19 @@ pub fn run_ctl<F: Fwil>(fw: F, ctl: Option<Box<dyn Ctl<F>>>) -> Option<(F, Strin
     if ok {
         // Same as iwlwifi.mgr=1: the legacy network is the autoconnect profile
         // until netctl publishes the stored ones (which then include it).
-        MGR.set_fallback_profiles(legacy_fallback());
-        wm::run(&MGR, &mut r);
+        let legacy = legacy_creds();
+        let mac = mac_address().unwrap_or([0; 6]);
+        let shared = alloc::sync::Arc::new(Mutex::new(Some(r)));
+        let res = crate::wifi_radio::register(Box::new(SharedRadio(shared.clone())), MGR_NAME, "brcmf", mac, brcmf_kick,
+                                          legacy.as_ref().map(|(s, p)| (s.as_slice(), p.as_slice())));
+        match res {
+            Ok(done) => {
+                // The kernel runs the manager loop; wait for it to end (the bus is handed back below).
+                while !done.load(Ordering::Acquire) { sched::kthread::msleep(100); }
+            }
+            Err(e) => log(&alloc::format!("could not register the radio class: {}", e)),
+        }
+        r = shared.lock().take().expect("radio taken back");
         *STATE.lock() = "stopped";
         log("manager loop ended");
     } else if r.ctl.is_some() {
@@ -228,10 +238,10 @@ const WIFI_CONF: &str = "/etc/leandros/wifi.conf";
 
 /// /etc/leandros/wifi.conf (`ssid=` / `psk=`) as the fallback profile list.
 /// Logs the SSID only; the file buffer is wiped after parsing.
-fn legacy_fallback() -> Vec<netctl_abi::profiles::Profile> {
+fn legacy_creds() -> Option<(Vec<u8>, Vec<u8>)> {
     let mut v = match crate::firmware::request_firmware(WIFI_CONF, 64 * 1024).ok().and_then(|f| f.to_vec()) {
         Some(v) => v,
-        None => { log("no /etc/leandros/wifi.conf: autoconnect waits for netctl profiles"); return Vec::new(); }
+        None => { log("no /etc/leandros/wifi.conf: autoconnect waits for netctl profiles"); return None; }
     };
     let out = match netctl_abi::profiles::parse_legacy_wifi_conf(&v) {
         Some((ssid, psk)) => {
@@ -239,12 +249,13 @@ fn legacy_fallback() -> Vec<netctl_abi::profiles::Profile> {
             match netctl_abi::profiles::legacy_profile(ssid, psk) {
                 Some(p) => {
                     log(&alloc::format!("credentials from {}: SSID '{}' (passphrase not logged)", WIFI_CONF, name));
-                    alloc::vec![p]
+                    let _ = p;
+                    Some((ssid.to_vec(), psk.to_vec()))
                 }
-                None => { log("wifi.conf: passphrase must be 8..63 characters (or 64 hex digits); not connecting"); Vec::new() }
+                None => { log("wifi.conf: passphrase must be 8..63 characters (or 64 hex digits); not connecting"); None }
             }
         }
-        None => { log("wifi.conf: no usable ssid= line"); Vec::new() }
+        None => { log("wifi.conf: no usable ssid= line"); None }
     };
     for b in v.iter_mut() { unsafe { core::ptr::write_volatile(b, 0) }; }
     out
@@ -326,7 +337,7 @@ pub fn info_lines(out: &mut String) {
         let _ = writeln!(out, "{}: {}", k, if v.is_empty() { "none" } else { v.as_str() });
     }
     let _ = writeln!(out, "ctl: /etc/brcmf.ctl (brcmfctl status|scan|join [method=auto|joiniovar|setssid supwpa=auto|1|0 pmk=auto|raw|hex|passphrase sec=auto|ioctl|iovar mfp=auto|0|1|2 wpaie=1|0 akm=auto|2|6 mfpc=auto|0|1 mfpr=auto|0|1 msg2ie=auto|ours|fw reset] [ssid=..]|diag|retry)");
-    if RUNNING.load(Ordering::Acquire) { MGR.info_lines(out); }
+    if RUNNING.load(Ordering::Acquire) { crate::wifi_class::info_lines(MGR_NAME, out); }
     let _ = writeln!(out, "log (last {} [brcmf] lines):", LOG_KEEP);
     for l in LOG_RING.lock().iter() { let _ = writeln!(out, "  {}", l); }
 }
@@ -546,7 +557,8 @@ impl<F: Fwil> BrcmfRadio<F> {
     /// success the link is dropped again and autoconnect takes over.
     fn ctl_join(&mut self, want: Option<&str>) {
         if !self.dev.radio_on() { log("ctl: join: radio is off / init failed"); return; }
-        let profiles = legacy_fallback();
+        let profiles: Vec<netctl_abi::profiles::Profile> = legacy_creds()
+            .and_then(|(s, p)| netctl_abi::profiles::legacy_profile(&s, &p)).into_iter().collect();
         let p = match want {
             Some(w) => profiles.iter().find(|p| p.ssid() == w.as_bytes()),
             None => profiles.first(),
@@ -759,4 +771,26 @@ impl<F: Fwil> Radio for BrcmfRadio<F> {
         RATE_MBPS.store(k / 1000, Ordering::Relaxed);
         k
     }
+}
+
+/// The manager queued a command: the brcmf thread polls, nothing to wake.
+fn brcmf_kick() {}
+
+/// The radio behind the class table while the kernel's manager thread drives it; the driver thread
+/// takes it back (`Option::take`) once the manager loop ended, to hand the bus on.
+struct SharedRadio<F: Fwil>(alloc::sync::Arc<Mutex<Option<BrcmfRadio<F>>>>);
+
+impl<F: Fwil + 'static> Radio for SharedRadio<F> {
+    fn caps(&self) -> u32 { self.0.lock().as_ref().map_or(0, |r| r.caps()) }
+    fn scan(&mut self, ssids: &[Vec<u8>], connected: bool) -> Result<Vec<ScanHit>, Fail> { self.0.lock().as_mut().unwrap().scan(ssids, connected) }
+    fn connect(&mut self, hit: &ScanHit, ssid: &[u8], akm: u8, secret: &[u8], cx: &ConnCtx) -> Result<(), Fail> { self.0.lock().as_mut().unwrap().connect(hit, ssid, akm, secret, cx) }
+    fn poll_connected(&mut self, budget_ms: u64) -> Option<Fail> { self.0.lock().as_mut().unwrap().poll_connected(budget_ms) }
+    fn leave(&mut self, deauth: bool) { self.0.lock().as_mut().unwrap().leave(deauth) }
+    fn settle(&mut self, after: Option<&Fail>) -> bool { self.0.lock().as_mut().unwrap().settle(after) }
+    fn idle(&mut self, ms: u64) { self.0.lock().as_mut().unwrap().idle(ms) }
+    fn set_radio(&mut self, on: bool) -> bool { self.0.lock().as_mut().unwrap().set_radio(on) }
+    fn hw_rfkill(&mut self) -> bool { self.0.lock().as_mut().unwrap().hw_rfkill() }
+    fn rfkill_released(&mut self) -> bool { self.0.lock().as_mut().unwrap().rfkill_released() }
+    fn signal(&mut self) -> Option<i8> { self.0.lock().as_mut().unwrap().signal() }
+    fn tx_rate_kbps(&mut self) -> u32 { self.0.lock().as_mut().unwrap().tx_rate_kbps() }
 }

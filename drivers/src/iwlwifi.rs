@@ -425,7 +425,8 @@ static INFO: Mutex<Option<Info>> = Mutex::new(None);
 static MGR_ON: AtomicBool = AtomicBool::new(false);
 
 /// The connection manager of this interface (iwlwifi.mgr=1).
-pub static MGR: wm::Mgr = wm::Mgr::new("iwlwifi", "iwlwifi", mac_address);
+/// The manager's name in the radio class registry.
+const MGR_NAME: &str = "iwlwifi";
 
 /// What /proc/net/nic and /proc/net/wifi show.
 #[derive(Clone, Default)]
@@ -1377,7 +1378,6 @@ pub fn init(cmdline: &str) {
         log("iwlwifi.mgr=1 implies iwlwifi.start=1");
     }
     MGR_ON.store(opts.mgr, Ordering::SeqCst);
-    MGR.set_waker(iwl_kick);
     let func = dev.function();
     let subsys = (func.read16(0x2c), func.read16(0x2e));
     ilog!("found {} 8086:{:04x} at {:02x}:{:02x}.{} (rev {:02x}, subsystem {:04x}:{:04x})",
@@ -3087,12 +3087,20 @@ fn manager(fw: Fw, hw: Hw, func: PciFunction, opts: Opts) {
             }
         }
     }
-    MGR.set_fallback_profiles(fallback);
-    let mut r = IwlRadio { fw, hw, func, opts, prog: Prog::default(), fw_errors: 0, radio_off: false };
+    let legacy = if opts.connect { load_credentials(&opts) } else { None };
+    let r = IwlRadio { fw, hw, func, opts, prog: Prog::default(), fw_errors: 0, radio_off: false };
     set_state("up (manager)");
-    wm::run(&MGR, &mut r);
-    set_state("down (firmware failed)");
-    log("connection manager stopped: Wi-Fi stays down");
+    let mac = mac_address().unwrap_or([0; 6]);
+    match crate::wifi_radio::register(alloc::boxed::Box::new(r), MGR_NAME, "iwlwifi", mac, iwl_kick,
+                                      legacy.as_ref().map(|(s, p)| (s.as_slice(), p.as_slice()))) {
+        Ok(done) => {
+            // The kernel runs the manager; this thread only reports when it ended.
+            while !done.load(Ordering::Acquire) { sched::kthread::msleep(500); }
+            set_state("down (firmware failed)");
+            log("connection manager stopped: Wi-Fi stays down");
+        }
+        Err(e) => { set_state("down (register failed)"); log(&format!("could not register the radio class: {}", e)); }
+    }
 }
 
 impl IwlRadio {
@@ -3322,7 +3330,7 @@ impl wm::Radio for IwlRadio {
 /// mgr=0 nothing is served and boot behaviour is unchanged).
 pub fn attach(ifindex: u32, name: &str) -> bool {
     if !present() || !MGR_ON.load(Ordering::Relaxed) { return false; }
-    MGR.attach(ifindex, name)
+    crate::wifi_class::attach(MGR_NAME, ifindex, name)
 }
 
 /// iwlwifi.mgr=1 is on.
@@ -3586,19 +3594,17 @@ pub fn info_lines(out: &mut String) {
             let _ = writeln!(out, "fw_stats: {}", fw_stats_line(d));
         }
     }
-    if manager_on() { MGR.info_lines(out); }
+    if manager_on() { crate::wifi_class::info_lines(MGR_NAME, out); }
 }
 
 /// The last scan as a table (for /proc/net/wifi).
 pub fn scan_lines(out: &mut String) {
-    // No Intel radio but the simulated one runs: show its list here, so
+    // No Intel radio but another registered one (simulated, brcmfmac): show its list here, so
     // /proc/net/wifi and /bin/wifiscan work for it too.
-    #[cfg(feature = "wifi-sim")] if !present() && crate::wifi_sim::present() { return crate::wifi_sim::scan_lines(out); }
-    // The Pi's CYW43455 (brcmfmac): its manager's BSS cache.
-    #[cfg(feature = "brcmf")] if !present() && crate::brcmf::netdev::present() { return crate::brcmf::netdev::MGR.scan_lines("brcmfmac", out); }
+    if !present() && crate::wifi_class::count() > 0 { return crate::wifi_class::scan_lines(out); }
     if manager_on() {
         let name = INFO.lock().as_ref().map_or("iwlwifi", |i| i.name);
-        MGR.scan_lines(name, out);
+        if let Some(m) = crate::wifi_class::lookup(MGR_NAME) { m.scan_lines(name, out); }
         return tx_lines(out);
     }
     scan_table(out);

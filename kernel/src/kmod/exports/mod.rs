@@ -30,6 +30,7 @@ mod pm;
 mod v4l2;
 mod usbfn;
 mod blk;
+mod wifi;
 
 pub use pci::*;
 pub use irq::*;
@@ -37,6 +38,7 @@ pub use net::*;
 pub use snd::*;
 pub use pm::*;
 pub use blk::*;
+pub use wifi::*;
 pub use v4l2::*;
 pub use usbfn::*;
 pub use core_::*;
@@ -133,7 +135,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 83;
+pub const NEXPORTS: usize = 84;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -168,6 +170,7 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_wait_timeout", kapi_wait_timeout),
     sym!("kapi_wait_notify", kapi_wait_notify),
     sym!("kapi_netdev_register", kapi_netdev_register),
+    sym!("kapi_wifi_register", kapi_wifi_register),
     sym!("kapi_netdev_kick", kapi_netdev_kick),
     sym!("kapi_snd_register", kapi_snd_register),
     sym!("kapi_netdev_kick_from_irq", kapi_netdev_kick_from_irq),
