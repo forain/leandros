@@ -34,7 +34,7 @@ if [[ "$mod" == "e1000e" ]]; then
     check "$L" '^e1000e .* Live ' "listed by kmodctl list"
     python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=e1000e" "ip link" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt2/serial-full.log
-    check "$L" 'alias 8086:10d3 e1000e: Blacklisted' "blacklist refuses the alias load"
+    check "$L" 'alias pci 8086:10d3 e1000e: Blacklisted' "blacklist refuses the alias load"
     if grep -aq 'DHCP configured' "$L"; then echo "FAIL eth up despite blacklist"; fail=1; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest e1000e: PASS" || { echo "autoloadtest e1000e: FAIL"; exit 1; }
     exit 0
@@ -79,7 +79,7 @@ if [[ "$mod" == "uvc" ]]; then
     export LEANDROS_RUN_ID="autoloadtest-$arch"
     python3 "$RT" "$arch" alt1 --cmdline "usb.alias_selftest=1" "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt1/serial-full.log
-    check "$L" '^\[kmod\] usb alias 1234:5678 0e0200 -> uvc' "usb alias autoload at enumerate"
+    check "$L" '^\[kmod\] usb 1234:5678 0e0200 -> uvc' "usb alias autoload at enumerate"
     check "$L" '^\[kmod\] uvc loaded id' "uvc loaded"
     check "$L" 'usb alias selftest: class driver wants the interface: Some(14)' "module's class driver registered"
     check "$L" '^uvc [0-9]* [0-9]* - Live' "listed in /proc/modules"
@@ -89,7 +89,7 @@ if [[ "$mod" == "uvc" ]]; then
     check "$L" 'camtest: SUMMARY PASS frames 8/8' "camtest 8"
     python3 "$RT" "$arch" alt3 --cmdline "usb.alias_selftest=1 modules.blacklist=uvc" "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt3/serial-full.log
-    check "$L" 'alias 1234:5678 uvc: Blacklisted\|usb alias 1234:5678 uvc: Blacklisted' "blacklist refuses the alias load"
+    check "$L" 'alias usb 1234:5678 0e0200 uvc: Blacklisted' "blacklist refuses the alias load"
     if grep -aq '^\[kmod\] uvc loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest uvc: PASS" || { echo "autoloadtest uvc: FAIL"; exit 1; }
     exit 0
@@ -113,6 +113,6 @@ check "$L" '^virtio_rng .* Live ' "listed by kmodctl list"
 if grep -aq '^\[RNG\] virtio-rng bound' "$L"; then echo "FAIL built-in driver also bound"; fail=1; fi
 python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=virtio_rng" "kmodctl list" > /dev/null 2>&1 || true
 L=/tmp/ffsession/tests-alt2/serial-full.log
-check "$L" 'alias 1af4:1044 virtio_rng: Blacklisted' "blacklist refuses the alias load"
+check "$L" 'alias pci 1af4:1044 virtio_rng: Blacklisted' "blacklist refuses the alias load"
 if grep -aq '^\[kmod\] virtio_rng loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
 [[ $fail -eq 0 ]] && echo "autoloadtest: PASS" || { echo "autoloadtest: FAIL"; exit 1; }
