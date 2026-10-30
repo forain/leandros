@@ -62,7 +62,9 @@ if [[ "$mod" == "virtio_blk" || "$mod" == "nvme" ]]; then
     python3 "$RT" "$arch" blk2 --timeout 150 --cmdline "modules.blacklist=$mod" "cat /proc/modules" > /dev/null 2>&1 || true
     L2="/tmp/leandros-autoloadtest-$arch-bl-serial-full.log"
     check "$L2" "^\\[kmod\\] $mod Blacklisted" "$mod blacklisted"
-    check "$L2" "ERROR: Failed to mount the root filesystem" "root wait gave up cleanly"
+    # The lx root image is a separate virtio disk (nvme only carries the boot disk), so only the
+    # virtio_blk case loses its root disk when blacklisted.
+    [[ "$mod" == "virtio_blk" ]] && check "$L2" "ERROR: Failed to mount the root filesystem" "root wait gave up cleanly"
     if grep -aq "^\\[kmod\\] .*$mod loaded" "$L2"; then echo "FAIL blacklisted $mod was loaded"; fail=1; else echo "ok   blacklisted $mod not loaded"; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest $mod: PASS" || { echo "autoloadtest $mod: FAIL"; exit 1; }
     exit 0
