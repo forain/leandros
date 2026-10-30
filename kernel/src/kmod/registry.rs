@@ -48,6 +48,8 @@ pub fn remove(id: KmodId) {
     REGS.lock().retain(|r| r.0 != id);
 }
 
+pub fn registrations_of_kind(id: KmodId, k: RegKind) -> usize { REGS.lock().iter().filter(|r| r.0 == id && r.1 == k).count() }
+
 pub fn reg_count(id: KmodId) -> usize { REGS.lock().iter().filter(|r| r.0 == id).count() }
 
 pub fn name_of(id: KmodId) -> [u8; 32] {
@@ -83,6 +85,8 @@ fn release_one(owner: KmodId, kind: RegKind, handle: u64) -> bool {
         RegKind::TICK => { usb::class::tick_unregister_owner(owner); true }
         RegKind::PM => { super::exports::pm_unregister_owner(owner); true }
         RegKind::BACKLIGHT => { super::exports::backlight_unregister_owner(owner); true }
+        RegKind::PLAT => { super::exports::plat_unregister_owner(owner); true }
+        RegKind::DMAQ => { super::exports::dma_quiesce_unregister_owner(owner); true }
         RegKind::V4L2 => { crate::syscall::v4l2::unregister_camera(handle as usize); true }
         _ => false,
     }

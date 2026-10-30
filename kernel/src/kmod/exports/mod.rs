@@ -35,6 +35,7 @@ mod input;
 mod wifi;
 mod drm;
 mod gfx;
+mod plat;
 
 pub use pci::*;
 pub use irq::*;
@@ -46,6 +47,7 @@ pub use input::*;
 pub use wifi::*;
 pub use drm::*;
 pub use gfx::*;
+pub use plat::*;
 pub use v4l2::*;
 pub use usbfn::*;
 pub use hci::*;
@@ -168,6 +170,15 @@ const _: unsafe extern "C" fn(*mut u64) = kapi_mem_info;
 const _: unsafe extern "C" fn() -> u64 = kapi_irq_save;
 const _: unsafe extern "C" fn(u64) = kapi_irq_restore;
 const _: sys::V4l2UnregisterFn = kapi_v4l2_unregister;
+const _: kmod_abi::plat::sys_plat::PlatRegisterFn = kapi_plat_register;
+const _: kmod_abi::plat::sys_plat::PlatUnregisterFn = kapi_plat_unregister;
+const _: kmod_abi::plat::sys_plat::DtbBlobFn = kapi_dtb_blob;
+const _: kmod_abi::plat::sys_plat::BoardMacFn = kapi_board_mac;
+const _: kmod_abi::plat::sys_plat::SocSteppingFn = kapi_soc_stepping;
+const _: kmod_abi::plat::sys_plat::SerrorCheckpointFn = kapi_serror_checkpoint;
+const _: kmod_abi::plat::sys_plat::VmapFn = kapi_vmap;
+const _: kmod_abi::plat::sys_plat::VunmapFn = kapi_vunmap;
+const _: kmod_abi::plat::sys_plat::DmaQuiesceRegisterFn = kapi_dma_quiesce_register;
 const _: () = {
     assert!(mm::kmodwin::BASE as u64 == kmod_abi::layout::BASE);
     assert!(mm::kmodwin::SIZE as u64 == kmod_abi::layout::SIZE);
@@ -175,7 +186,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 130;
+pub const NEXPORTS: usize = 139;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -310,6 +321,15 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_rel_pointer_advertise", kapi_rel_pointer_advertise),
     sym!("kapi_preempt_disabled", kapi_preempt_disabled),
     sym!("kapi_preempt_enable_no_resched", kapi_preempt_enable_no_resched),
+    sym!("kapi_plat_register", kapi_plat_register),
+    sym!("kapi_plat_unregister", kapi_plat_unregister),
+    sym!("kapi_dtb_blob", kapi_dtb_blob),
+    sym!("kapi_board_mac", kapi_board_mac),
+    sym!("kapi_soc_stepping", kapi_soc_stepping),
+    sym!("kapi_serror_checkpoint", kapi_serror_checkpoint),
+    sym!("kapi_vmap", kapi_vmap),
+    sym!("kapi_vunmap", kapi_vunmap),
+    sym!("kapi_dma_quiesce_register", kapi_dma_quiesce_register),
 ];
 
 extern "C" {

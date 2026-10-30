@@ -561,6 +561,104 @@ extern "C" fn kapi_fake_rng(p: *mut u8, n: usize) -> usize {
     n
 }
 
+
+static KP_PROBES: AtomicU32 = AtomicU32::new(0);
+static KP_HOOKED: AtomicU32 = AtomicU32::new(0);
+static KP_BAD: AtomicU32 = AtomicU32::new(0);
+extern "C" fn kp_probe(ctx: usize, dev: *const kmod_abi::KPlatDev) -> bool {
+    let d = unsafe { &*dev };
+    if ctx != 0xc0de || d.size as usize != core::mem::size_of::<kmod_abi::KPlatDev>() || d.compat_idx != 1
+        || d.reg[0].phys != 0x1000_0000 || d.reg[0].len != 0x200 || d.reg[1].phys != 0x2000 || d.nirq != 1 || d.irq[0] != 77
+        || d.dma_offset != 0x4000_0000 { KP_BAD.fetch_add(1, Ordering::SeqCst); }
+    KP_PROBES.fetch_add(1, Ordering::SeqCst);
+    true
+}
+fn kp_hook(compat: &str) { if compat == "leandros,ktest-early2" { KP_HOOKED.fetch_add(1, Ordering::SeqCst); } }
+extern "C" fn kp_quiet(_ctx: usize) -> bool { true }
+
+/// kmodpi P0: platform registry (module probes, replay of early announcements), board services, vmap, DMA quiesce.
+fn kmodplat_checks(t: &mut T) {
+    use crate::kmod::{exports, registry};
+    use drivers::platform::{self, PlatDev};
+    use kmod_abi::{KmodId, RegKind};
+    for n in ["kapi_plat_register", "kapi_plat_unregister", "kapi_dtb_blob", "kapi_board_mac", "kapi_soc_stepping",
+              "kapi_serror_checkpoint", "kapi_vmap", "kapi_vunmap", "kapi_dma_quiesce_register"] {
+        t.check(exports::lookup(n).is_some(), "plat/board export in KSYMTAB");
+    }
+    // Registration argument checks.
+    let own = KmodId(60020); // not 60010: kmodkapi_w2 counts that owner's records
+    t.check(exports::kapi_plat_register(own, core::ptr::null(), 4, kp_probe, 0) == -22, "plat_register null compats -> -22");
+    t.check(exports::kapi_plat_register(KmodId(0), b"a\0".as_ptr(), 2, kp_probe, 0) == -22, "plat_register owner 0 -> -22");
+    // A device announced before any driver exists is claimed by a module registering later (the replay).
+    let mut d = PlatDev::default();
+    d.base = 0x1000_0000; d.size = 0x200; d.dma_offset = 0x4000_0000; d.irqs[0] = 77; d.nirq = 1;
+    d.regs[1] = (0x2000, 0x10);
+    platform::announce("leandros,ktest-early", d);
+    t.check(platform::is_claimed("leandros,ktest-early") == Some(false), "early announced device stays unclaimed");
+    let list = b"leandros,ktest-other\0leandros,ktest-early\0";
+    KP_PROBES.store(0, Ordering::SeqCst);
+    t.check(exports::kapi_plat_register(own, list.as_ptr(), list.len(), kp_probe, 0xc0de) == 0, "plat_register ok");
+    t.check(KP_PROBES.load(Ordering::SeqCst) == 1 && KP_BAD.load(Ordering::SeqCst) == 0, "module probe saw the early device (KPlatDev fields, compat_idx 1)");
+    t.check(platform::is_claimed("leandros,ktest-early") == Some(true), "early device claimed through kapi_plat_register");
+    // Failed init: the registry takes the registration back and the device is unclaimed again.
+    t.check(registry::reg_count(own) == 1, "plat registration recorded for the owner");
+    t.check(registry::release_all(own), "release_all drops the plat registration");
+    t.check(platform::is_claimed("leandros,ktest-early") == Some(false), "device unclaimed after the owner went");
+    t.check(exports::kapi_plat_register(own, list.as_ptr(), list.len(), kp_probe, 0xc0de) == 0 && platform::is_claimed("leandros,ktest-early") == Some(true), "re-register claims it again");
+    exports::kapi_plat_unregister(own);
+    t.check(platform::is_claimed("leandros,ktest-early") == Some(false), "kapi_plat_unregister unclaims");
+    // set_autoload replays devices announced before the hook existed.
+    let old = platform::swap_autoload(0);
+    platform::announce("leandros,ktest-early2", PlatDev::default());
+    KP_HOOKED.store(0, Ordering::SeqCst);
+    platform::set_autoload(kp_hook);
+    t.check(KP_HOOKED.load(Ordering::SeqCst) == 1, "set_autoload replays an early announcement to the hook once");
+    platform::replay_unclaimed();
+    t.check(KP_HOOKED.load(Ordering::SeqCst) == 1, "a second replay does not re-fire");
+    platform::swap_autoload(old);
+    // Board services.
+    let mut m = [0u8; 6];
+    t.check(exports::kapi_board_mac(9, m.as_mut_ptr()) == -22 && exports::kapi_board_mac(0, core::ptr::null_mut()) == -22, "board_mac bad args -> -22");
+    #[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
+    { t.check(exports::kapi_board_mac(0, m.as_mut_ptr()) == -19, "board_mac off the Pi 5 -> -19");
+      t.check(exports::kapi_soc_stepping() == -19, "soc_stepping off the Pi 5 -> -19"); }
+    let mut n = 99usize;
+    let p = exports::kapi_dtb_blob(&mut n);
+    t.check(p.is_null() == (n == 0), "dtb_blob pointer and length agree");
+    let _ = exports::kapi_serror_checkpoint();
+    t.check(true, "serror_checkpoint returns");
+    // vmap alias: a page written through the alias is visible through the direct map after clean.
+    let pg = exports::kapi_page_alloc(0, 0);
+    if pg != 0 {
+        let pages = [pg];
+        t.check(exports::kapi_vmap(core::ptr::null(), 1, 2) == 0 && exports::kapi_vmap(pages.as_ptr(), 0, 2) == 0 && exports::kapi_vmap(pages.as_ptr(), 1, 7) == 0, "vmap bad args -> 0");
+        let odd = [pg + 8];
+        t.check(exports::kapi_vmap(odd.as_ptr(), 1, 2) == 0, "vmap unaligned page -> 0");
+        let va = exports::kapi_vmap(pages.as_ptr(), 1, 2);
+        t.check(va != 0, "vmap one page");
+        if va != 0 {
+            unsafe { (va as *mut u32).write_volatile(0xfeed_0042); }
+            exports::kapi_dma_sync(va, 64, 3);
+            let hh = exports::kapi_phys_to_virt(pg) as *const u32;
+            t.check(unsafe { hh.read_volatile() } == 0xfeed_0042, "write through the vmap alias visible in the direct map");
+            exports::kapi_dma_sync(va, 64, 4);
+            exports::kapi_dma_sync(va, 64, 5); // out of range: ignored
+            exports::kapi_vunmap(va);
+        }
+        exports::kapi_page_free(pg, 0);
+    }
+    // DMA quiesce hook: registered, name collisions refused, removed again on a failed init.
+    let qo = KmodId(60021);
+    let nm = b"ktest-q";
+    t.check(exports::kapi_dma_quiesce_register(qo, core::ptr::null(), 7, 0, kp_quiet, 0) == -22 && exports::kapi_dma_quiesce_register(qo, nm.as_ptr(), 7, 5, kp_quiet, 0) == -22, "dma_quiesce bad args -> -22");
+    t.check(exports::kapi_dma_quiesce_register(qo, nm.as_ptr(), 7, 0, kp_quiet, 1) == 0 && drivers::dma_shutdown::has("ktest-q"), "dma_quiesce registered");
+    t.check(exports::kapi_dma_quiesce_register(KmodId(60022), nm.as_ptr(), 7, 0, kp_quiet, 1) == -17, "dma_quiesce duplicate name -> -17");
+    t.check(registry::registrations_of_kind(qo, RegKind::DMAQ) == 1, "dma_quiesce recorded in the registry");
+    let before = drivers::dma_shutdown::count();
+    t.check(registry::release_all(qo), "release_all drops the dma_quiesce registration");
+    t.check(!drivers::dma_shutdown::has("ktest-q") && drivers::dma_shutdown::count() == before - 1, "quiesce entry removed after the failed init");
+}
+
 /// L5a: the PCI / memory / entropy kapi exports, called through the KSYMTAB addresses
 /// (exactly what a module's relocations resolve to).
 fn t_kmodkapi() -> T {
@@ -637,6 +735,7 @@ fn t_kmodkapi() -> T {
         t.check(r == -22, "kapi_blk_register null desc/ops -> -22");
         t.check(crate::kmod::exports::kapi_blk_remove(-1) == -22, "kapi_blk_remove(-1) -> -22");
     }
+    kmodplat_checks(&mut t);
     let find = sym!("kapi_pci_find", sys::PciFindFn);
     let rd = sym!("kapi_pci_cfg_read", sys::PciCfgReadFn);
     let wr = sym!("kapi_pci_cfg_write", sys::PciCfgWriteFn);
