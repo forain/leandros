@@ -1692,7 +1692,6 @@ def main():
         print(f"  WARNING: {_pwrapplet} absent, no Power applet in the panel: "
               f"./ports/cosmic-applet-power/build.sh {arch}")
 
-<<<<<<< HEAD
     # COSMIC apps for the Applications menu (ports/cosmic-apps/build.sh):
     # cosmic-files, cosmic-edit, cosmic-screenshot (Print key target). Each is
     # staged as /bin/<app> together with its .desktop and hicolor icons, or
@@ -1713,7 +1712,6 @@ def main():
         else:
             print(f"  WARNING: {_appbin} absent, no {_app} in the Applications menu: "
                   f"./ports/cosmic-apps/build.sh {arch} {_app}")
-=======
     real_time_applet = False
     # The rest of the panel's applets (Time, Battery, Notifications, Status Area,
     # Workspaces, Input Sources, A11y) and the dock's App List: unmodified
@@ -1741,7 +1739,6 @@ def main():
         else:
             print(f"  WARNING: {_apbin} absent, no {_ap} in the panel: "
                   f"./ports/cosmic-applets-panel/build.sh {arch}")
->>>>>>> main
 
     # leandros-applet — a minimal dependency-free wl_shm xdg_toplevel panel applet.
     # cosmic-panel refuses to render its bar with no applet content (render()
