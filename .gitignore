@@ -48,3 +48,4 @@ artifacts/remote-logs/
 /.config
 # GStreamer port output (ports/gstreamer/build.sh)
 ports/gstreamer/out/
+*_vars.bootdisk.fd
