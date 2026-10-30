@@ -13,6 +13,7 @@ pub fn set_owner(id: KmodId) { OWNER.store(id.0, Ordering::SeqCst); }
 pub fn owner() -> KmodId { KmodId(OWNER.load(Ordering::SeqCst)) }
 
 pub mod blk;
+pub mod plat;
 
 pub mod pci {
     use super::*;
