@@ -14,7 +14,7 @@ config VIRTIO_BLK
 	default y
 
 config VIRTIO_NET
-	bool "virtio-net"
+	tristate "virtio-net"
 	depends on NET
 	default y
 
@@ -32,7 +32,7 @@ config VIRTIO_RNG
 	default y
 
 config VIRTIO_SND
-	bool "virtio-snd"
+	tristate "virtio-snd"
 	default y
 
 endmenu
@@ -61,7 +61,7 @@ config IWLWIFI
 
 config WIFI_SIM
 	bool "Simulated Wi-Fi device (testing)"
-	depends on VIRTIO_NET
+	depends on VIRTIO_NET=y
 	select WIFI_STACK
 	default y
 
@@ -94,7 +94,7 @@ config HDMI_AUDIO
 	default y
 
 config HDA
-	bool "Intel HD Audio (+capture)"
+	tristate "Intel HD Audio (+capture)"
 	depends on PCI
 	default y
 

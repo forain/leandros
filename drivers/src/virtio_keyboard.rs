@@ -562,7 +562,7 @@ unsafe fn arm_irq(d: &VirtioKeyboardDevice) {
     if slot >= MAX_IRQ_DEVS { return; }
     let pci = &d._pci_dev;
     #[cfg(target_arch = "x86_64")]
-    if let Some((cap, table)) = crate::virtio_net::find_msix(pci) {
+    if let Some((cap, table)) = crate::virtio::find_msix(pci) {
         const NO_VECTOR: u16 = 0xFFFF;
         if let Some(vector) = crate::irq::alloc_vector() {
             if let Some((msg_addr, msg_data)) = crate::irq::msi_message(vector) {
@@ -592,7 +592,7 @@ unsafe fn arm_irq(d: &VirtioKeyboardDevice) {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let isr = crate::virtio_net::find_isr(pci);
+        let isr = crate::virtio::find_isr(pci);
         if isr.is_null() { return; }
         let pin = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x3D);
         if pin == 0 || pin > 4 { return; }

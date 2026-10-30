@@ -86,6 +86,7 @@ impl RegKind {
     pub const PCI: RegKind = RegKind(7);
     pub const TICK: RegKind = RegKind(8);
     pub const PM: RegKind = RegKind(9);
+    pub const SND: RegKind = RegKind(10);
 }
 
 /// Device-id table entry (`.kmod.ids`), 16 bytes. PCI: a=vendor, b=device (0xffff = any).
@@ -143,6 +144,35 @@ pub struct KNetifOps {
     pub link_gen: extern "C" fn(ctx: usize) -> u32,
     pub info: extern "C" fn(ctx: usize, buf: *mut u8, cap: usize) -> usize,
     pub driver_name: extern "C" fn(ctx: usize, buf: *mut u8, cap: usize) -> usize,
+}
+
+/// `KSndOps::flags`: the capture entries and `jack_service` are live (HD Audio); the kernel then
+/// runs its `[audio]` service thread for the device.
+pub const KSND_CAPTURE: u32 = 1;
+
+/// Sound-backend operations (module side of the pipewire server's `Backend`). Every entry takes
+/// the `ctx` given at registration first. `write` returns the bytes accepted; `queued_bytes` the
+/// bytes in flight; `tx_used_idx` a counter of retired TX chunks (only its changes matter);
+/// `cap_read` returns the byte count or a negative errno; `info` and `shutdown` copy up to `cap`
+/// bytes of text into `buf` and return the length (`shutdown`: `link_reset` != 0 also holds the link in reset).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KSndOps {
+    pub flags: u32,
+    pub configure: extern "C" fn(ctx: usize, stream: u32, freq: u32, channels: u8),
+    pub write: extern "C" fn(ctx: usize, buf: *const u8, len: usize) -> usize,
+    pub queued_bytes: extern "C" fn(ctx: usize) -> usize,
+    pub tx_used_idx: extern "C" fn(ctx: usize) -> u32,
+    pub top_up_silence: extern "C" fn(ctx: usize),
+    pub recover: extern "C" fn(ctx: usize),
+    pub cap_ensure: extern "C" fn(ctx: usize) -> i32,
+    pub cap_restart: extern "C" fn(ctx: usize),
+    pub cap_pending: extern "C" fn(ctx: usize) -> usize,
+    pub cap_read: extern "C" fn(ctx: usize, buf: *mut u8, cap: usize) -> i32,
+    pub cap_close: extern "C" fn(ctx: usize),
+    pub jack_service: extern "C" fn(ctx: usize),
+    pub info: extern "C" fn(ctx: usize, buf: *mut u8, cap: usize) -> usize,
+    pub shutdown: extern "C" fn(ctx: usize, link_reset: u32, buf: *mut u8, cap: usize) -> usize,
 }
 
 /// Power-management hook: writes a message into `buf` (<= `cap`). Return >= 0 = ok with that
@@ -365,6 +395,7 @@ pub mod sys {
     pub type NetdevRegisterFn =
         unsafe extern "C" fn(KmodId, u32, *const u8, usize, *const super::KNetifOps, usize) -> i32;
     pub type NetdevKickFn = unsafe extern "C" fn();
+    pub type SndRegisterFn = unsafe extern "C" fn(KmodId, *const super::KSndOps, usize) -> i32;
     pub type V4l2RegisterFn = unsafe extern "C" fn(KmodId, *const super::KCameraOps, usize) -> i32;
     pub type PmRegister2Fn = unsafe extern "C" fn(KmodId, *const super::KPmOps, usize) -> i32;
     pub type VirtToPhysFn = unsafe extern "C" fn(usize) -> u64;
@@ -412,6 +443,7 @@ pub mod sys {
         pub fn kapi_wait_notify(h: usize);
         pub fn kapi_netdev_register(owner: KmodId, kind: u32, prefix: *const u8, prefix_len: usize,
                                     ops: *const super::KNetifOps, ctx: usize) -> i32;
+        pub fn kapi_snd_register(owner: KmodId, ops: *const super::KSndOps, ctx: usize) -> i32;
         pub fn kapi_netdev_kick();
         pub fn kapi_netdev_kick_from_irq();
         pub fn kapi_v4l2_register(owner: KmodId, ops: *const super::KCameraOps, ctx: usize) -> i32;

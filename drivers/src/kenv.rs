@@ -5,6 +5,7 @@ pub use ::sched;
 pub use crate::pci;
 pub use crate::irq;
 pub use crate::netdev;
+pub use crate::DriverError;
 
 extern "C" {
     fn serial_print_str_raw(s: *const u8, len: usize);
