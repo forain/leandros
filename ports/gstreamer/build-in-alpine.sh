@@ -155,7 +155,9 @@ esac
   [ -e "$D/usr/lib/libintl.so" ] || { [ -e "$D/usr/lib/libintl.so.8" ] && ln -s libintl.so.8 "$D/usr/lib/libintl.so"; }
   for f in $(find "$D/usr/lib" -maxdepth 1 -type f -name '*.so*'); do
     if readelf -d "$f" 2>/dev/null | grep -q "libc.musl-$ARCH.so.1"; then patchelf --replace-needed "libc.musl-$ARCH.so.1" libc.so "$f"; fi
+    if readelf --dyn-syms -W "$f" | awk '$7=="UND"{print $8}' | sed 's/@.*//' | grep -qx '__stack_chk_guard'; then patchelf --add-needed libleandros_ssp.so.1 "$f"; fi
   done
+  cp "$S/usr/lib/libleandros_ssp.so.1" "$D/usr/lib/"
   echo "sysroot dev tree: $(du -sh "$D" | cut -f1)"
   echo "$GSTVER $PWV alpine-$(cat /etc/alpine-release)" > "$S/GSTREAMER-VERSION"
   echo "== staged size =="; du -sh "$S"
