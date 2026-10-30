@@ -1692,6 +1692,26 @@ def main():
         print(f"  WARNING: {_pwrapplet} absent, no Power applet in the panel: "
               f"./ports/cosmic-applet-power/build.sh {arch}")
 
+    # COSMIC apps for the Applications menu (ports/cosmic-apps/build.sh):
+    # cosmic-files, cosmic-edit, cosmic-screenshot (Print key target). Each is
+    # staged as /bin/<app> together with its .desktop and hicolor icons, or
+    # not at all.
+    cosapps_icon_dirs = []
+    for _app, _appid in (("cosmic-files", "com.system76.CosmicFiles"),
+                         ("cosmic-edit", "com.system76.CosmicEdit"),
+                         ("cosmic-screenshot", "com.system76.CosmicScreenshot")):
+        _appbin = m6_pick(f"{m6_out}/{_app}-{arch}")
+        if os.path.exists(_appbin):
+            bin_files.append((_app, _appbin, 0o100755))
+            m4_share_dirs.add("/usr/share/applications")
+            m4_share_files.append(("/usr/share/applications", f"{_appid}.desktop",
+                                   f"ports/cosmic-apps/{_appid}.desktop"))
+            _appres = "resources" if _app == "cosmic-screenshot" else "res"
+            cosapps_icon_dirs.append(os.path.expanduser(
+                f"~/code/leandros-artifacts/m6-session-bins/src/{_app}/{_appres}/icons/hicolor"))
+        else:
+            print(f"  WARNING: {_appbin} absent, no {_app} in the Applications menu: "
+                  f"./ports/cosmic-apps/build.sh {arch} {_app}")
     real_time_applet = False
     # The rest of the panel's applets (Time, Battery, Notifications, Status Area,
     # Workspaces, Input Sources, A11y) and the dock's App List: unmodified
@@ -2407,6 +2427,9 @@ def main():
         if os.path.isdir(_src):
             _stage_icon_tree(_src, "hicolor")
             break
+    # icons of the apps staged by ports/cosmic-apps (see above)
+    for _d in cosapps_icon_dirs:
+        _stage_icon_tree(_d, "hicolor")
     # cosmic-applet-time's .desktop asks for Icon=application-default-icon, a
     # name no upstream icon theme ships (cosmic-icons has application-default).
     # Stage the upstream application-default.svg under the requested name in
