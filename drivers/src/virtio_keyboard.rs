@@ -3,8 +3,9 @@
 #[allow(unused_imports)]
 use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
-use crate::pci::{PciDevice, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
-use mm;
+// Kernel APIs come through `kenv` so the same source builds as a module (kmod-kapi shim).
+use crate::kenv::pci::{PciDevice, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
+use crate::kenv::{irq, mm};
 
 const VIRTIO_PCI_VENDOR: u16 = 0x1af4;
 const VIRTIO_PCI_DEVICE_INPUT: u16 = 0x1052; // modern virtio-input
@@ -179,7 +180,7 @@ pub fn vq_census() -> VqCensus {
 
 impl VirtioKeyboardDevice {
     pub fn new_from(dev: PciDevice) -> Option<Self> {
-        crate::pci::serial_debug("[INPUT] Found VirtIO Input device\n");
+        crate::kenv::pci::serial_debug("[INPUT] Found VirtIO Input device\n");
 
         // Enable PCI Memory Space (bit 1) and Bus Master (bit 2); INTx
         // Disable (bit 10) too — this driver polls and never reads its ISR
@@ -188,7 +189,7 @@ impl VirtioKeyboardDevice {
         // (`virtio_gpu::enable_intx`).
         unsafe {
             let cmd = pci_read_config_16(dev.bus, dev.dev, dev.func, 0x04);
-            pci_write_config_16(dev.bus, dev.dev, dev.func, 0x04, (cmd | 0x0006) | crate::pci::PCI_CMD_INTX_DISABLE);
+            pci_write_config_16(dev.bus, dev.dev, dev.func, 0x04, (cmd | 0x0006) | crate::kenv::pci::PCI_CMD_INTX_DISABLE);
         }
 
         let mut common_cfg = core::ptr::null_mut();
@@ -246,7 +247,7 @@ impl VirtioKeyboardDevice {
         }
 
         if common_cfg.is_null() || notify_cfg.is_null() {
-            crate::pci::serial_debug("[KBD] Missing required VirtIO capabilities\n");
+            crate::kenv::pci::serial_debug("[KBD] Missing required VirtIO capabilities\n");
             return None;
         }
 
@@ -254,11 +255,13 @@ impl VirtioKeyboardDevice {
         // init_device: a virtio-tablet reports a non-zero EV_ABS bitmap size,
         // a keyboard does not. This is order-independent (vs relying on PCI
         // enumeration order).
-        let evdev_index = if !device_cfg.is_null() && unsafe { device_supports_ev_abs(device_cfg) } {
-            crate::pci::serial_debug("[INPUT] -> tablet (event1)\n");
+        let is_tablet = !device_cfg.is_null() && unsafe { device_supports_ev_abs(device_cfg) };
+        if !crate::kenv::input::claim(if is_tablet { EVDEV_TABLET } else { EVDEV_KEYBOARD }) { return None; }
+        let evdev_index = if is_tablet {
+            crate::kenv::pci::serial_debug("[INPUT] -> tablet (event1)\n");
             EVDEV_TABLET
         } else {
-            crate::pci::serial_debug("[INPUT] -> keyboard (event0)\n");
+            crate::kenv::pci::serial_debug("[INPUT] -> keyboard (event0)\n");
             EVDEV_KEYBOARD
         };
 
@@ -272,12 +275,12 @@ impl VirtioKeyboardDevice {
                 read_ev_bits(device_cfg, EV_REL, &mut rel);
                 read_ev_bits(device_cfg, EV_KEY, &mut key);
             }
-            evdev_server::set_device_caps(EVDEV_TABLET, &rel, &key);
-            crate::pci::serial_debug("[INPUT] tablet EV_REL bits=");
-            crate::pci::serial_debug_hex(u32::from_le_bytes(rel));
-            crate::pci::serial_debug(" BTN 0x110 byte=");
-            crate::pci::serial_debug_hex(key[0x110 >> 3] as u32);
-            crate::pci::serial_debug("\n");
+            crate::kenv::input::set_device_caps(EVDEV_TABLET, &rel, &key);
+            crate::kenv::pci::serial_debug("[INPUT] tablet EV_REL bits=");
+            crate::kenv::pci::serial_debug_hex(u32::from_le_bytes(rel));
+            crate::kenv::pci::serial_debug(" BTN 0x110 byte=");
+            crate::kenv::pci::serial_debug_hex(key[0x110 >> 3] as u32);
+            crate::kenv::pci::serial_debug("\n");
         }
 
         let mut kbd = Self {
@@ -318,7 +321,7 @@ impl VirtioKeyboardDevice {
             // 7. Set DRIVER_OK
             status.mmio_write(status.mmio_read() | VIRTIO_STATUS_DRIVER_OK);
         }
-        crate::pci::serial_debug("[KBD] VirtIO Input device initialized\n");
+        crate::kenv::pci::serial_debug("[KBD] VirtIO Input device initialized\n");
     }
 
     unsafe fn setup_queue(&mut self, id: u16) -> Option<VirtioQueue> {
@@ -438,7 +441,7 @@ impl VirtioKeyboardDevice {
                 let ev = (buf_virt as *const VirtioInputEvent).read_volatile();
 
                 // Push to this device's evdev node (keyboard=0, tablet=1).
-                evdev_server::push_event(evdev_index, ev.type_, ev.code, ev.value);
+                crate::kenv::input::push_event(evdev_index, ev.type_, ev.code, ev.value);
                 EVENTS_SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
                 // Recycle descriptor: put it back into avail ring. The slot has
@@ -532,26 +535,26 @@ fn stats_hook(w: &mut dyn core::fmt::Write) {
     use core::sync::atomic::Ordering::Relaxed;
     let _ = writeln!(w, "virtio_input_irqs {} tick_poll_found {} irq_armed {}",
         VIRTIO_INPUT_IRQS.load(Relaxed), POLL_FOUND.load(Relaxed), IRQ_ARMED.load(Relaxed) as u8);
-    let (stale, restores) = crate::drm_device_interface::vt_handoff_stats();
+    let (stale, restores) = crate::kenv::input::vt_handoff_stats();
     let _ = writeln!(w, "vt_handoff stale_presents={} vt_restores={}", stale, restores);
 }
 
 /// Event-queue interrupt: drain the queues. A shared INTx line whose ISR byte
 /// is clear is `None`. try_lock: if task context holds the list (init only),
 /// the slow safety poll picks the events up.
-extern "C" fn virtio_input_irq(ctx: usize) -> crate::irq::IrqReturn {
+extern "C" fn virtio_input_irq(ctx: usize) -> irq::IrqReturn {
     use core::sync::atomic::Ordering::{Acquire, Relaxed};
-    if ctx >= MAX_IRQ_DEVS { return crate::irq::IrqReturn::None; }
+    if ctx >= MAX_IRQ_DEVS { return irq::IrqReturn::None; }
     let p = ISR_PTR[ctx].load(Acquire) as *const u8;
     if !p.is_null() {
         let isr = unsafe { p.mmio_read() };
-        if isr & 1 == 0 { return crate::irq::IrqReturn::None; }
+        if isr & 1 == 0 { return irq::IrqReturn::None; }
     }
     VIRTIO_INPUT_IRQS.fetch_add(1, Relaxed);
     if let Some(mut inputs) = VIRTIO_INPUTS.try_lock() {
         for d in inputs.iter_mut() { d.poll(); }
     }
-    crate::irq::IrqReturn::Handled
+    irq::IrqReturn::Handled
 }
 
 /// Arm the event-queue interrupt: MSI-X (x86_64) or shared INTx SPI (aarch64),
@@ -562,32 +565,19 @@ unsafe fn arm_irq(d: &VirtioKeyboardDevice) {
     if slot >= MAX_IRQ_DEVS { return; }
     let pci = &d._pci_dev;
     #[cfg(target_arch = "x86_64")]
-    if let Some((cap, table)) = crate::virtio::find_msix(pci) {
+    if let Ok(tab) = irq::MsixTable::enable(pci.function()) {
         const NO_VECTOR: u16 = 0xFFFF;
-        if let Some(vector) = crate::irq::alloc_vector() {
-            if let Some((msg_addr, msg_data)) = crate::irq::msi_message(vector) {
-                if crate::irq::request_irq(crate::irq::IrqSource::Vector(vector), virtio_input_irq, slot).is_ok() {
-                    table.add(3).write_volatile(1);
-                    table.add(0).write_volatile(msg_addr as u32);
-                    table.add(1).write_volatile((msg_addr >> 32) as u32);
-                    table.add(2).write_volatile(msg_data);
-                    let ctrl = pci_read_config_16(pci.bus, pci.dev, pci.func, cap + 2);
-                    pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, ctrl | 0xC000);
-                    let cfg = d.common_cfg;
-                    core::ptr::addr_of_mut!((*cfg).config_msix_vector).write_volatile(NO_VECTOR);
-                    core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(0);
-                    core::ptr::addr_of_mut!((*cfg).queue_msix_vector).write_volatile(0);
-                    if core::ptr::addr_of!((*cfg).queue_msix_vector).read_volatile() == 0 {
-                        pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, (ctrl | 0x8000) & !0x4000);
-                        table.add(3).write_volatile(0);
-                        NEXT_SLOT.store(slot + 1, Relaxed);
-                        IRQ_ARMED.store(true, Relaxed);
-                        crate::pci::serial_debug("[INPUT] MSI-X armed\n");
-                        return;
-                    }
-                    pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, ctrl & !0x8000);
-                } else { crate::irq::free_vector(vector); }
-            } else { crate::irq::free_vector(vector); }
+        if tab.request(0, virtio_input_irq, slot).is_ok() {
+            let cfg = d.common_cfg;
+            core::ptr::addr_of_mut!((*cfg).config_msix_vector).write_volatile(NO_VECTOR);
+            core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(0);
+            core::ptr::addr_of_mut!((*cfg).queue_msix_vector).write_volatile(0);
+            if core::ptr::addr_of!((*cfg).queue_msix_vector).read_volatile() == 0 {
+                NEXT_SLOT.store(slot + 1, Relaxed);
+                IRQ_ARMED.store(true, Relaxed);
+                crate::kenv::pci::serial_debug("[INPUT] MSI-X armed\n");
+                return;
+            }
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -596,19 +586,19 @@ unsafe fn arm_irq(d: &VirtioKeyboardDevice) {
         if isr.is_null() { return; }
         let pin = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x3D);
         if pin == 0 || pin > 4 { return; }
-        let intid = 32 + 3 + ((pci.dev as u32 + (pin as u32 - 1)) % 4);
+        let Some(intid) = pci.function().intx_line() else { return };
         let _ = isr.mmio_read();
         ISR_PTR[slot].store(isr as usize, Release);
-        if crate::irq::request_irq(crate::irq::IrqSource::Line(intid), virtio_input_irq, slot).is_err() {
+        if irq::request_irq(irq::IrqSource::Line(intid), virtio_input_irq, slot).is_err() {
             ISR_PTR[slot].store(0, Release);
             return;
         }
         NEXT_SLOT.store(slot + 1, Relaxed);
         let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
-        pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd & !crate::pci::PCI_CMD_INTX_DISABLE);
+        pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd & !crate::kenv::pci::PCI_CMD_INTX_DISABLE);
         let _ = isr.mmio_read();
         IRQ_ARMED.store(true, Relaxed);
-        crate::pci::serial_debug("[INPUT] INTx armed\n");
+        crate::kenv::pci::serial_debug("[INPUT] INTx armed\n");
     }
     let _ = (pci, Release);
 }
@@ -628,11 +618,11 @@ pub fn init() {
     if !VIRTIO_INPUTS.lock().is_empty() { return; }
 
     // Bind every virtio-input PCI function (keyboard + tablet).
-    let found = crate::pci::find_all_devices(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_INPUT);
-    crate::pci::serial_debug("[INPUT] virtio-input functions found=");
-    crate::pci::serial_debug_hex(found.len() as u32);
-    crate::pci::serial_debug("\n");
-    tty_server::vt::register_stats_hook(stats_hook);
+    let found = crate::kenv::pci::find_all_devices(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_INPUT);
+    crate::kenv::pci::serial_debug("[INPUT] virtio-input functions found=");
+    crate::kenv::pci::serial_debug_hex(found.len() as u32);
+    crate::kenv::pci::serial_debug("\n");
+    crate::kenv::input::register_stats_hook(stats_hook);
     let mut probed = alloc::vec::Vec::new();
     for dev in found {
         if let Some(d) = VirtioKeyboardDevice::new_from(dev) {
@@ -646,9 +636,9 @@ pub fn init() {
     if inputs.is_empty() {
         *inputs = probed;
     }
-    crate::pci::serial_debug("[INPUT] bound=");
-    crate::pci::serial_debug_hex(inputs.len() as u32);
-    crate::pci::serial_debug("\n");
+    crate::kenv::pci::serial_debug("[INPUT] bound=");
+    crate::kenv::pci::serial_debug_hex(inputs.len() as u32);
+    crate::kenv::pci::serial_debug("\n");
 }
 
 pub fn poll_events() {

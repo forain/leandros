@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# autoloadtest.sh [arch] [virtio_rng|e1000e|virtio_net|virtio_snd|hda|iwlwifi|uvc|of]: host-side test of the modules.alias autoload path.
+# autoloadtest.sh [arch] [virtio_rng|e1000e|virtio_net|virtio_snd|virtio_keyboard|hda|iwlwifi|uvc|of]: host-side test of the modules.alias autoload path.
 # Builds with CONFIG_MODULES=y CONFIG_VIRTIO_RNG=m (the driver is then ONLY a module, found via
 # modules.alias, no modules.load), boots under QEMU and checks that it autoloads, is listed, feeds
 # the CSPRNG, and that modules.blacklist=virtio_rng boots without it. Restores .config afterwards
@@ -67,6 +67,28 @@ if [[ "$mod" == "virtio_blk" || "$mod" == "nvme" ]]; then
     [[ "$mod" == "virtio_blk" ]] && check "$L2" "ERROR: Failed to mount the root filesystem" "root wait gave up cleanly"
     if grep -aq "^\\[kmod\\] .*$mod loaded" "$L2"; then echo "FAIL blacklisted $mod was loaded"; fail=1; else echo "ok   blacklisted $mod not loaded"; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest $mod: PASS" || { echo "autoloadtest $mod: FAIL"; exit 1; }
+    exit 0
+fi
+if [[ "$mod" == "virtio_keyboard" ]]; then
+    # CONFIG_VIRTIO_KEYBOARD=m: virtio-input (keyboard + tablet, alias 1af4:1052) is ONLY a module; it
+    # claims the evdev nodes through kapi_input_register and polls from kapi_tick_register.
+    printf 'CONFIG_MODULES=y\nCONFIG_VIRTIO_KEYBOARD=m\n' > .config
+    ./scripts/build-all.sh --arch "$arch" > "${TMPDIR:-/tmp}/autoloadtest-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/autoloadtest-build.log"; exit 1; }
+    if find "target/kmod/$arch" -name modules.load | grep -q .; then echo "FAIL: modules.load present, alias path not isolated"; exit 1; fi
+    RT=.claude/skills/run-leandros/runtests.py
+    fail=0
+    check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3"; fail=1; fi; }
+    export LEANDROS_RUN_ID="autoloadtest-$arch"
+    python3 "$RT" "$arch" alt1 "cat /proc/modules" "kmodctl list" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt1/serial-full.log
+    check "$L" '^\[kmod\] virtio_keyboard loaded id' "virtio_keyboard autoloaded"
+    check "$L" '\[INPUT\] -> keyboard (event0)' "keyboard claimed event0"
+    check "$L" '\[INPUT\] -> tablet (event1)' "tablet claimed event1"
+    check "$L" '^virtio_keyboard [0-9]* [0-9]* - Live' "listed in /proc/modules"
+    python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=virtio_keyboard" "cat /proc/modules" > /dev/null 2>&1 || true
+    L=/tmp/ffsession/tests-alt2/serial-full.log
+    check "$L" 'alias pci 1af4:1052 virtio_keyboard: Blacklisted' "blacklist refuses the alias load"
+    [[ $fail -eq 0 ]] && echo "autoloadtest virtio_keyboard: PASS" || { echo "autoloadtest virtio_keyboard: FAIL"; exit 1; }
     exit 0
 fi
 if [[ "$mod" == "virtio_snd" ]]; then

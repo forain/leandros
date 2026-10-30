@@ -31,6 +31,7 @@ members = [
     "modules/iwlwifi",
     "modules/nvme",
     "modules/virtio-blk",
+    "modules/virtio-keyboard",
     "modules/virtio-net",
     "modules/virtio-snd",
     "modules/hda",

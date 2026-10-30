@@ -361,6 +361,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-virtio-keyboard"
+version = "0.1.0"
+dependencies = [
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
+]
+
+[[package]]
 name = "kmod-virtio-net"
 version = "0.1.0"
 dependencies = [

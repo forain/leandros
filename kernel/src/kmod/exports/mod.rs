@@ -30,6 +30,7 @@ mod pm;
 mod v4l2;
 mod usbfn;
 mod blk;
+mod input;
 mod wifi;
 
 pub use pci::*;
@@ -38,6 +39,7 @@ pub use net::*;
 pub use snd::*;
 pub use pm::*;
 pub use blk::*;
+pub use input::*;
 pub use wifi::*;
 pub use v4l2::*;
 pub use usbfn::*;
@@ -87,6 +89,9 @@ const _: sys::YieldFn = kapi_yield;
 const _: sys::CanSleepFn = kapi_irqs_masked;
 const _: kmod_abi::blk::sys_blk::BlkRegisterFn = kapi_blk_register;
 const _: kmod_abi::blk::sys_blk::BlkRemoveFn = kapi_blk_remove;
+const _: kmod_abi::input::sys_input::InputRegisterFn = kapi_input_register;
+const _: kmod_abi::input::sys_input::InputEventFn = kapi_input_event;
+const _: kmod_abi::input::sys_input::InputSetCapsFn = kapi_input_set_caps;
 const _: kmod_abi::blk::sys_blk::BoolFn = kapi_preempt_disabled;
 const _: kmod_abi::blk::sys_blk::VoidFn = kapi_preempt_enable_no_resched;
 const _: sys::CurrentPidFn = kapi_current_pid;
@@ -135,7 +140,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 84;
+pub const NEXPORTS: usize = 87;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -222,6 +227,9 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_v4l2_unregister", kapi_v4l2_unregister),
     sym!("kapi_blk_register", kapi_blk_register),
     sym!("kapi_blk_remove", kapi_blk_remove),
+    sym!("kapi_input_register", kapi_input_register),
+    sym!("kapi_input_event", kapi_input_event),
+    sym!("kapi_input_set_caps", kapi_input_set_caps),
     sym!("kapi_preempt_disabled", kapi_preempt_disabled),
     sym!("kapi_preempt_enable_no_resched", kapi_preempt_enable_no_resched),
 ];
