@@ -108,7 +108,7 @@ config NVME
 	default y
 
 config SDHCI
-	bool "SDHCI SD/eMMC (Pi 5, raspi4b)"
+	tristate "SDHCI SD/eMMC (Pi 5, raspi4b)"
 	depends on BOARD_RPI5 || BOARD_RASPI4B
 	default y
 

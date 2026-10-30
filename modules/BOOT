@@ -4,3 +4,4 @@
 virtio_blk
 nvme
 usb_storage
+sdhci

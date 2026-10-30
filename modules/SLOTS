@@ -21,3 +21,4 @@ virtio_gpu 224 32
 v3d 256 32
 macb 288 8
 hdmi_audio 296 8
+sdhci 304 8

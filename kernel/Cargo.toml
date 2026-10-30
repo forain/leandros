@@ -44,6 +44,8 @@ drv-i2c-hid = ["drivers/drv-i2c-hid"]
 # kmodW2: gates for drivers that become tristate in later lanes (declared now so
 # every lane edits only its own driver). Y-only: the features do not gate code yet.
 drv-nvme = ["drivers/drv-nvme"]
+drv-sdhci = ["drivers/drv-sdhci"]
+mod-sdhci = []
 drv-virtio-blk = ["drivers/drv-virtio-blk"]
 drv-virtio-keyboard = ["drivers/drv-virtio-keyboard"]
 drv-usb-storage = ["drivers/drv-usb-storage"]

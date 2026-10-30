@@ -29,6 +29,7 @@ drv-hda = []
 drv-lapinv = []
 drv-i2c-hid = []
 drv-nvme = []
+drv-sdhci = []
 drv-virtio-blk = []
 drv-virtio-keyboard = []
 

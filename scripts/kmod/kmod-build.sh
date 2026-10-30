@@ -51,7 +51,10 @@ for name in $names; do
     [[ -f "$ROOT/modules/$dash/Cargo.toml" ]] || { echo "kmod-build: no module crate modules/$dash" >&2; exit 1; }
     read -r base size < <(python3 "$HERE/kmodpost.py" slot "$arch" "$name")
     echo "kmod-build: $name ($arch) slot $base size $size"
-    if ! RUSTFLAGS= cargo build -q -p "kmod-$dash" --target "$SPEC" --target-dir "$ROOT/target/kmod-build" --release \
+    # Board-specific modules (sdhci): the crate features mirror the kernel build's board.
+    feat=""
+    if [[ "$dash" == "sdhci" && -n "${KMOD_BOARD:-}" ]]; then feat="--features $KMOD_BOARD"; fi
+    if ! RUSTFLAGS= cargo build -q -p "kmod-$dash" $feat --target "$SPEC" --target-dir "$ROOT/target/kmod-build" --release \
         -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec >"$OUT/cargo-$name.log" 2>&1; then
         tail -n 30 "$OUT/cargo-$name.log" >&2; echo "kmod-build: cargo build of kmod-$dash failed" >&2; exit 1
     fi

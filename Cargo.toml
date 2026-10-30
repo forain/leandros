@@ -30,6 +30,7 @@ members = [
     "modules/e1000e",
     "modules/iwlwifi",
     "modules/nvme",
+    "modules/sdhci",
     "modules/virtio-blk",
     "modules/virtio-keyboard",
     "modules/usb-hid",
