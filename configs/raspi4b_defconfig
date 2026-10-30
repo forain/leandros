@@ -1,0 +1,2 @@
+# QEMU -M raspi4b (build-all --raspi4b): the SDHCI test machine. All applicable drivers are y.
+CONFIG_BOARD_RASPI4B=y

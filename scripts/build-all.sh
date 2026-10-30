@@ -159,6 +159,7 @@ create_initrd() {
 kconfig_features() {
     local arch="$1" def cfg
     if [[ "$arch" == "aarch64" && "$RPI5" == "true" ]]; then def="rpi5"
+    elif [[ "$arch" == "aarch64" && "${RASPI4B:-}" == "true" ]]; then def="raspi4b"
     elif [[ "$arch" == "x86_64" && "${INTEL:-}" == "1" ]]; then def="x86_64_laptop"
     else def="$arch"; fi
     mkdir -p "$ROOT_DIR/target/kconfig-$arch"
