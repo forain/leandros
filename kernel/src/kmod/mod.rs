@@ -24,6 +24,8 @@ pub fn window_ok() -> bool { WINDOW_OK.load(Ordering::Relaxed) && !DISABLED.load
 /// Called once after `mm::kva::init()`.
 pub fn init() {
     log(&alloc::format!("[kmod] build-id {}\n", buildid::build_id_hex()));
+    // kmod=0 must hold for every autoload route (the USB hook runs before autoload::boot).
+    if autoload::opt("kmod") == Some("0") { DISABLED.store(true, Ordering::Relaxed); }
     if DISABLED.load(Ordering::Relaxed) {
         log("[kmod] window disabled\n");
         return;

@@ -6,7 +6,7 @@ use alloc::format;
 use alloc::vec::Vec;
 use kmod_rt::{kinfo, kerr};
 
-kmod_rt::module! { name: "hello", init: init }
+kmod_rt::module! { name: "hello", init: init, of: ["leandros,test"] }
 
 extern "C" {
     fn kapi_spin_held_count() -> u32;

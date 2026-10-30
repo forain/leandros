@@ -1,6 +1,6 @@
 //! Frozen kmod ABI v1. See docs/design (kmod L3b). Any change bumps
 //! `KMOD_ABI_VERSION`.
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 pub const KMOD_MAGIC: [u8; 8] = *b"LKMOD\0\0\x01";
 pub const KMOD_ABI_VERSION: u32 = 1;
@@ -313,6 +313,10 @@ pub const BUS_PCI: u16 = 1;
 pub const BUS_USB: u16 = 2;
 pub const BUS_OF: u16 = 3;
 pub const BUS_ACPI: u16 = 4;
+/// SDIO function-1 CIS manfid (a=vendor, b=device, 0xffff = any). Added by W2-2.
+pub const BUS_SDIO: u16 = 5;
+
+pub mod alias;
 
 /// Export-table entry; `name` is NUL-terminated.
 #[repr(C)]

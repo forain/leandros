@@ -11,6 +11,7 @@ SECTIONS {
     . = SLOT_BASE;
     .kmod.info : { KEEP(*(.kmod.info)) } :hdr
     .kmod.ids  : { KEEP(*(.kmod.ids)) } :hdr
+    .kmod.ofstr : { KEEP(*(.kmod.ofstr)) } :hdr
     .rodata : { *(.rodata .rodata.*) } :hdr
     . = ALIGN(4096);
     .text : { *(.text .text.*) } :text

@@ -76,10 +76,19 @@ for v in "${variants[@]}"; do
     id="$(bid_of $v)"
     sort -u "$OUT/alias-$v" > "$OUT/initrd/lib/modules/$id/modules.alias"
     cp "$OUT/initrd/lib/modules/$id/modules.alias" "$OUT/rootfs/lib/modules/$id/modules.alias"
-    if [[ -n "${KMOD_AUTOLOAD:-}" ]]; then
-        for m in $KMOD_AUTOLOAD; do echo "$m" >> "$OUT/initrd/lib/modules/$id/modules.load"; done
-        sort -u -o "$OUT/initrd/lib/modules/$id/modules.load" "$OUT/initrd/lib/modules/$id/modules.load"
+    # modules.load = modules/BOOT (only =m names that were built, in BOOT order) then $KMOD_AUTOLOAD;
+    # duplicates dropped WITHOUT sorting (the order is the root-disk probe order).
+    load="$OUT/initrd/lib/modules/$id/modules.load"
+    : > "$load"
+    bootf="${LEANDROS_BOOT_FILE:-$ROOT/modules/BOOT}"
+    if [[ -f "$bootf" ]]; then
+        for m in $(sed 's/#.*//' "$bootf"); do
+            case " $names " in *" ${m//-/_} "*) echo "${m//-/_}" >> "$load";; esac
+        done
     fi
+    for m in ${KMOD_AUTOLOAD:-}; do echo "$m" >> "$load"; done
+    awk '!seen[$0]++' "$load" > "$load.tmp" && mv "$load.tmp" "$load"
+    [[ -s "$load" ]] || rm -f "$load"
     rm -f "$OUT/alias-$v"
 done
 echo "kmod-build: staged $OUT"

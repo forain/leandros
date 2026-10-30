@@ -4,14 +4,14 @@
 use alloc::string::String;
 use super::load::{load_image, KmodErr, Source};
 use alloc::vec::Vec;
-use kmod_abi::{KmodDevId, KmodId, BUS_PCI, BUS_USB};
+use kmod_abi::{KmodId, BUS_USB};
 
 fn log(s: &str) { drivers::pci::serial_debug(s); }
 
 fn cmdline() -> &'static str { crate::boot_cmdline().unwrap_or("") }
 
 /// The value of `key=` on the command line (last occurrence wins).
-fn opt(key: &str) -> Option<&'static str> {
+pub(super) fn opt(key: &str) -> Option<&'static str> {
     let mut v = None;
     for tok in cmdline().split_ascii_whitespace() {
         if let Some(r) = tok.strip_prefix(key) {
@@ -27,9 +27,7 @@ fn list_has(key: &str, name: &str) -> bool {
 
 pub fn blacklisted(name: &str) -> bool { list_has("modules.blacklist", name) }
 
-fn valid_name(n: &str) -> bool {
-    !n.is_empty() && n.len() <= 31 && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-}
+use kmod_abi::alias::valid_name;
 
 /// Load `<name>.kmod` from this kernel's build-id directory in the initrd.
 pub fn load_by_name(name: &str, src: Source) -> Result<KmodId, KmodErr> {
@@ -57,9 +55,23 @@ pub fn boot() {
     if opt("kmod") == Some("0") {
         super::disable();
         log("[kmod] disabled by kmod=0\n");
+    }
+    if super::disabled() {
+        // M6: a direct-boot (kexec/Pi) kernel can lose the window; with boot modules listed that
+        // means no root disk, so say so loudly instead of a silent mount timeout.
+        let bi = crate::BOOT_INFO_PTR.load(core::sync::atomic::Ordering::SeqCst);
+        if bi != 0 {
+            let bi = unsafe { &*(bi as *const boot::BootInfo) };
+            let path = alloc::format!("lib/modules/{}/modules.load", super::buildid::build_id_hex());
+            if let Some(b) = crate::init::extract_binary_from_initrd(&path, bi) {
+                let t = String::from_utf8_lossy(b);
+                if !t.trim().is_empty() {
+                    log(&alloc::format!("[kmod] ERROR: kmod is disabled but modules.load lists: {}\n", t.trim().replace('\n', " ")));
+                }
+            }
+        }
         return;
     }
-    if super::disabled() { return; }
     // modules.load= wins; without it, the initrd's lib/modules/<build-id>/modules.load
     // (names separated by commas or whitespace) is the default list. Direct aarch64
     // boots receive no command line, so this is their only route.
@@ -79,82 +91,52 @@ pub fn boot() {
     }
     autoload_aliases();
     usb_selftest();
+    plat_selftest();
+    // Boot-path modules (root disks) register disks late: re-check for the boot-log partition.
+    crate::klog::on_disk_registered();
 }
 
-/// One parsed `modules.alias` line.
-pub struct Alias { pub id: KmodDevId, pub name: String }
+pub use kmod_abi::alias::{match_of, match_pci, match_sdio, parse_aliases, Alias};
 
-fn hex16(t: &str) -> Option<u16> { u16::from_str_radix(t, 16).ok() }
-fn hex8(t: &str) -> Option<u32> { u32::from_str_radix(t, 16).ok() }
+/// The initrd's parsed `modules.alias`, read once on first use.
+static ALIASES: spin::Mutex<Option<Vec<Alias>>> = spin::Mutex::new(None);
 
-/// Parse the alias file (see plan section 3.5). Malformed lines are skipped.
-/// `pci <vvvv> <dddd|*> <name>`; `usb <vvvv> <pppp|*> <cc> <ss> <pp|*> <name>`.
-pub fn parse_aliases(text: &str) -> Vec<Alias> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let t: Vec<&str> = line.split_ascii_whitespace().collect();
-        let any16 = |s: &str| if s == "*" { Some(0xffffu16) } else { hex16(s) };
-        let a = match t.as_slice() {
-            ["pci", v, d, n] => match (hex16(v), any16(d)) {
-                (Some(v), Some(d)) => Some(Alias {
-                    id: KmodDevId { bus: BUS_PCI, a: v, b: d, c: 0, class: 0, class_mask: 0 },
-                    name: String::from(*n) }),
-                _ => None,
-            },
-            ["usb", v, p, cc, ss, pp, n] => {
-                let (cc, ss) = (hex8(cc), hex8(ss));
-                let (pp, mask_pp) = if *pp == "*" { (Some(0), 0) } else { (hex8(pp), 0xff) };
-                match (hex16(v), any16(p), cc, ss, pp) {
-                    (Some(v), Some(p), Some(cc), Some(ss), Some(pp)) => Some(Alias {
-                        id: KmodDevId { bus: BUS_USB, a: v, b: p, c: 0,
-                            class: (cc << 16) | (ss << 8) | pp,
-                            class_mask: 0xffff00 | mask_pp },
-                        name: String::from(*n) }),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        if let Some(a) = a { if valid_name(&a.name) { out.push(a); } }
+fn with_aliases<R>(f: impl FnOnce(&[Alias]) -> R) -> Option<R> {
+    let mut g = ALIASES.lock();
+    if g.is_none() {
+        let bi = crate::BOOT_INFO_PTR.load(core::sync::atomic::Ordering::SeqCst);
+        if bi == 0 { return None; }
+        let bi = unsafe { &*(bi as *const boot::BootInfo) };
+        let path = alloc::format!("lib/modules/{}/modules.alias", super::buildid::build_id_hex());
+        let text = crate::init::extract_binary_from_initrd(&path, bi)
+            .map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+        *g = Some(parse_aliases(&text));
     }
-    out
+    Some(f(g.as_ref().unwrap()))
 }
 
-/// First alias name matching a PCI function.
-pub fn match_pci<'a>(aliases: &'a [Alias], vendor: u16, device: u16) -> Option<&'a str> {
-    aliases.iter()
-        .find(|al| al.id.bus == BUS_PCI && al.id.a == vendor && (al.id.b == 0xffff || al.id.b == device))
-        .map(|al| al.name.as_str())
+fn load_logged(what: &str, name: &str) {
+    match load_by_name(name, Source::Initrd) {
+        Ok(_) => log(&alloc::format!("[kmod] {} -> {}\n", what, name)),
+        Err(KmodErr::Exists) => {}
+        Err(e) => log(&alloc::format!("[kmod] alias {} {}: {:?}\n", what, name, e)),
+    }
 }
 
-/// For every PCI function, load the first matching alias name once. USB lines are matched
-/// at interface enumerate by [`usb_hook`]. Policy (kmod=0, blacklist) is
-/// enforced by `load_by_name`; an already-loaded name is skipped quietly.
+/// For every PCI function, load the first matching alias name once (vendor/device or class).
+/// USB lines are matched at interface enumerate by [`usb_hook`]; `of` lines by [`of_hook`].
+/// Policy (kmod=0, blacklist) is enforced by `load_by_name`; an already-loaded name is skipped.
 fn autoload_aliases() {
     if super::disabled() || opt("kmod") == Some("0") { return; }
-    let bi = crate::BOOT_INFO_PTR.load(core::sync::atomic::Ordering::SeqCst);
-    if bi == 0 { return; }
-    let bi = unsafe { &*(bi as *const boot::BootInfo) };
-    let path = alloc::format!("lib/modules/{}/modules.alias", super::buildid::build_id_hex());
-    let text = match crate::init::extract_binary_from_initrd(&path, bi) {
-        Some(b) => String::from_utf8_lossy(b).into_owned(),
-        None => return,
-    };
-    let aliases = parse_aliases(&text);
     let mut tried: Vec<String> = Vec::new();
     for d in drivers::pci::scan() {
-        let Some(name) = match_pci(&aliases, d.vendor_id, d.device_id) else { continue };
-        if tried.iter().any(|t| t == name) { continue; }
-        tried.push(String::from(name));
-        match load_by_name(name, Source::Initrd) {
-            Ok(_) | Err(KmodErr::Exists) => {}
-            Err(e) => log(&alloc::format!("[kmod] alias {:04x}:{:04x} {}: {:?}\n", d.vendor_id, d.device_id, name, e)),
-        }
+        let class = (d.class as u32) << 16 | (d.subclass as u32) << 8 | d.prog_if as u32;
+        let Some(Some(name)) = with_aliases(|al| match_pci(al, d.vendor_id, d.device_id, class).map(String::from)) else { continue };
+        if tried.iter().any(|t| *t == name) { continue; }
+        tried.push(name.clone());
+        load_logged(&alloc::format!("pci {:04x}:{:04x}", d.vendor_id, d.device_id), &name);
     }
 }
-
-/// The initrd's parsed `modules.alias`, read on the first USB enumerate.
-static USB_ALIASES: spin::Mutex<Option<Vec<Alias>>> = spin::Mutex::new(None);
 
 /// USB alias autoload, called by the xhci enumerator for each interface nobody wants yet (task
 /// context, before the device is configured). Loads the first module whose `usb` alias matches;
@@ -162,28 +144,26 @@ static USB_ALIASES: spin::Mutex<Option<Vec<Alias>>> = spin::Mutex::new(None);
 pub fn usb_hook(vid: u16, pid: u16, class: u8, sub: u8, proto: u8) {
     // The hook can fire before `boot()` has parsed kmod=0, so honour it here too.
     if super::disabled() || opt("kmod") == Some("0") { return; }
-    let name = {
-        let mut g = USB_ALIASES.lock();
-        if g.is_none() {
-            let bi = crate::BOOT_INFO_PTR.load(core::sync::atomic::Ordering::SeqCst);
-            if bi == 0 { return; }
-            let bi = unsafe { &*(bi as *const boot::BootInfo) };
-            let path = alloc::format!("lib/modules/{}/modules.alias", super::buildid::build_id_hex());
-            let text = crate::init::extract_binary_from_initrd(&path, bi)
-                .map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
-            *g = Some(parse_aliases(&text));
-        }
-        let intf = (class as u32) << 16 | (sub as u32) << 8 | proto as u32;
-        g.as_ref().unwrap().iter().find(|al| al.id.bus == BUS_USB
-            && (al.id.a == 0xffff || al.id.a == vid) && (al.id.b == 0xffff || al.id.b == pid)
-            && (intf & al.id.class_mask) == (al.id.class & al.id.class_mask)).map(|al| al.name.clone())
-    };
+    let intf = (class as u32) << 16 | (sub as u32) << 8 | proto as u32;
+    let name = with_aliases(|al| al.iter().find(|al| al.id.bus == BUS_USB
+        && (al.id.a == 0xffff || al.id.a == vid) && (al.id.b == 0xffff || al.id.b == pid)
+        && (intf & al.id.class_mask) == (al.id.class & al.id.class_mask)).map(|al| al.name.clone())).flatten();
     let Some(name) = name else { return };
-    match load_by_name(&name, Source::Initrd) {
-        Ok(_) => log(&alloc::format!("[kmod] usb alias {:04x}:{:04x} {:02x}{:02x}{:02x} -> {}\n", vid, pid, class, sub, proto, name)),
-        Err(KmodErr::Exists) => {}
-        Err(e) => log(&alloc::format!("[kmod] usb alias {:04x}:{:04x} {}: {:?}\n", vid, pid, name, e)),
-    }
+    load_logged(&alloc::format!("usb {:04x}:{:04x} {:02x}{:02x}{:02x}", vid, pid, class, sub, proto), &name);
+}
+
+/// Platform-registry hook: an announced device with this `compatible` found no built-in driver.
+pub fn of_hook(compat: &str) {
+    if super::disabled() || opt("kmod") == Some("0") { return; }
+    let Some(Some(name)) = with_aliases(|al| match_of(al, compat).map(String::from)) else { return };
+    load_logged(&alloc::format!("of {}", compat), &name);
+}
+
+/// SDIO hook: function-1 manfid of a card no built-in driver claimed.
+pub fn sdio_hook(vid: u16, did: u16) {
+    if super::disabled() || opt("kmod") == Some("0") { return; }
+    let Some(Some(name)) = with_aliases(|al| match_sdio(al, vid, did).map(String::from)) else { return };
+    load_logged(&alloc::format!("sdio {:04x}:{:04x}", vid, did), &name);
 }
 
 /// `usb.alias_selftest=1`: run the enumerate-time hook against a synthetic video-streaming
@@ -193,4 +173,12 @@ fn usb_selftest() {
     let cfg: [u8; 9] = [9, 4, 1, 0, 0, 0x0E, 0x02, 0x00, 0];
     let r = usb::class::wants_or_load(&cfg, 0x1234, 0x5678);
     log(&alloc::format!("[kmod] usb alias selftest: class driver wants the interface: {:?}\n", r));
+}
+
+/// `plat.alias_selftest=1`: announce a synthetic platform device with compatible
+/// `leandros,test` that no built-in driver claims, the way the DT walker would.
+fn plat_selftest() {
+    if opt("plat.alias_selftest") != Some("1") { return; }
+    drivers::platform::announce("leandros,test", drivers::platform::PlatDev::default());
+    log("[kmod] plat alias selftest: announced leandros,test\n");
 }

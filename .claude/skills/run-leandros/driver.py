@@ -1133,6 +1133,34 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         sys.exit(f"ERROR: unknown arch '{arch}'")
 
 
+def _root_bus_args(virtio_args):
+    """LEANDROS_ROOT_BUS=virtio|nvme|usb (default virtio): attach the ROOT disk (drive0) as an
+    NVMe namespace or a usb-storage device on qemu-xhci instead of virtio-blk; the data disks
+    stay virtio. Exercises the boot-path drivers (NVME, USB_STORAGE) in QEMU."""
+    bus = os.environ.get("LEANDROS_ROOT_BUS", "virtio") or "virtio"
+    if bus == "virtio":
+        return virtio_args
+    if bus not in ("nvme", "usb"):
+        sys.exit(f"ERROR: LEANDROS_ROOT_BUS must be virtio, nvme or usb (got {bus})")
+    out, hit = [], False
+    for i, a in enumerate(virtio_args):
+        if a.startswith("virtio-blk-pci,drive=drive0"):
+            hit = True
+            if bus == "nvme":
+                out.append("nvme,drive=drive0,serial=leandros-root,bootindex=0")
+            else:
+                out.append("usb-storage,bus=xhci.0,drive=drive0,id=usbroot,bootindex=0")
+        else:
+            out.append(a)
+    if not hit:
+        return virtio_args
+    if bus == "usb":
+        # the controller must exist before the usb-storage device
+        j = max(k for k, a in enumerate(out) if a.startswith("usb-storage,bus=xhci.0")) - 1
+        out[j:j] = ["-device", "qemu-xhci,id=xhci"]
+    return out
+
+
 def _disk_args(virtio_args):
     """The virtio-blk boot + data disks, or — with
     LEANDROS_USB_STICK=<img>[,<img2>...] — USB mass-storage sticks on one
@@ -1144,7 +1172,7 @@ def _disk_args(virtio_args):
     `driver.py qmp device_del '{"id": "usbstick1"}'`)."""
     sticks = [x for x in os.environ.get("LEANDROS_USB_STICK", "").split(",") if x]
     if not sticks:
-        return virtio_args
+        return _root_bus_args(virtio_args)
     args = ["-device", "qemu-xhci,id=xhci"]
     for i, img in enumerate(sticks):
         img = os.path.abspath(img)
