@@ -56,6 +56,14 @@ if [[ "$mod" == "virtio_blk" || "$mod" == "nvme" ]]; then
     check "$L" "^$mod [0-9]* [0-9]* - Live" "listed in /proc/modules"
     check "$L" "^$mod .* Live " "listed by kmodctl list"
     [[ "$mod" == "nvme" ]] && check "$L" 'nvme0n1' "nvme0n1 registered"
+    # Negative: blacklisted boot-path driver. The root disk never appears; the boot must give up
+    # cleanly (blacklist line, no module loaded) instead of hanging the harness.
+    export LEANDROS_RUN_ID="autoloadtest-$arch-bl"
+    python3 "$RT" "$arch" blk2 --timeout 150 --cmdline "modules.blacklist=$mod" "cat /proc/modules" > /dev/null 2>&1 || true
+    L2="/tmp/leandros-autoloadtest-$arch-bl-serial-full.log"
+    check "$L2" "^\\[kmod\\] $mod Blacklisted" "$mod blacklisted"
+    check "$L2" "ERROR: Failed to mount the root filesystem" "root wait gave up cleanly"
+    if grep -aq "^\\[kmod\\] .*$mod loaded" "$L2"; then echo "FAIL blacklisted $mod was loaded"; fail=1; else echo "ok   blacklisted $mod not loaded"; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest $mod: PASS" || { echo "autoloadtest $mod: FAIL"; exit 1; }
     exit 0
 fi
