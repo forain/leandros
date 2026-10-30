@@ -572,7 +572,7 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 109 && exports::NEXPORTS == 109, "ksymtab has 109 exports");
+    t.check(exports::ksymtab().len() == 118 && exports::NEXPORTS == 118, "ksymtab has 118 exports");
     t.check(exports::lookup("kapi_wifi_register").is_some(), "kapi_wifi_register in KSYMTAB");
     for n in ["kapi_drm_register", "kapi_drm_offset_alloc", "kapi_drm_offset_release", "kapi_fence_wait", "kapi_syncobj_install",
               "kapi_syncobj_exists", "kapi_syncobj_in_fences", "kapi_fence_irq_hint", "kapi_kms_event_complete"] {
