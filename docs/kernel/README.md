@@ -61,6 +61,7 @@ Process model (separate pages):
 - [Threads and futexes](threads-and-futex.md) — `clone(CLONE_VM)`, futex semantics and keying.
 - [Signals](signals.md) — delivery, the lock-free signal hint, frames, `sigaltstack`, fault `siginfo`, job-control stops.
 - [Time and timers](time.md) — the monotonic clock, the tick grid, POSIX timers, `timerfd`, `nanosleep`.
+- [Loadable kernel modules](modules.md) — Kconfig Y/M/N, the module window and slots, the kapi export table, autoload, root on a module.
 - [The event loop](event-loop.md) — `poll`/`select`/`epoll`, the poll wait channel, tagged and keyed wakes, the epoll ready list, readiness edges.
 
 ## Execution model in one paragraph

@@ -29,6 +29,7 @@ New here? Read [Overview](overview/README.md), then [Getting started](getting-st
 - [Signals](kernel/signals.md) — delivery, frames, `sigaltstack`, job-control stops
 - [Time and timers](kernel/time.md) — the monotonic clock, POSIX timers, `timerfd`, sleeping
 - [The event loop](kernel/event-loop.md) — `poll`/`select`/`epoll`, wait channels, readiness edges
+- [Loadable kernel modules](kernel/modules.md) — Kconfig Y/M/N, module slots, the kapi table, autoload, root on a module
 - [x86-64](kernel/arch-x86_64.md) and [AArch64](kernel/arch-aarch64.md) architecture support
 - [Kernel invariants](kernel/invariants.md) — the hard rules, and the bugs that taught them
 
