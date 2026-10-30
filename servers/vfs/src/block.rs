@@ -632,9 +632,18 @@ pub fn dev_read_only(dev: u16) -> bool {
 /// `nvme.rw=1`) answers EROFS.
 fn write_chunk(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
     let (root, base, size) = match resolve(dev) { Some(r) => r, None => return -6 };
-    if dev_read_only(dev) { return -30; } // EROFS
-    if off >= size { return -28; } // ENOSPC
+    if off >= size { return if dev_read_only(dev) { -30 } else { -28 }; } // EROFS / ENOSPC
     let n = len.min((size - off) as usize).min(MAX_XFER);
+    // A live BLKWRWIN window on this disk is the only way to write it when it
+    // is read-only, and confines writes to its ranges when it is not.
+    match root {
+        Root::Disk(i) => match window_check(i, base + off, n as u64) {
+            WinCheck::Inside => {}
+            WinCheck::Outside => return -30, // EROFS
+            WinCheck::None => if dev_read_only(dev) { return -30; },
+        },
+        _ => if dev_read_only(dev) { return -30; },
+    }
     if n == 0 { return 0; }
     let mut v = alloc::vec![0u8; n];
     if unsafe { sched::uaccess::copy_raw(v.as_mut_ptr(), buf_ptr as *const u8, n) } != 0 { return -14; }
@@ -647,6 +656,94 @@ fn write_chunk(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
     };
     if !ok { return -5; }
     n as isize
+}
+
+// ── BLKWRWIN: install-time write windows ────────────────────────────────────
+
+/// `BLKWRWIN` = `_IOW(0x12, 0xF0, struct blkwrwin)` (264 bytes). Root only, on
+/// an open whole-disk node. Ranges are in 512-byte units whatever the logical
+/// block size. While the open file description that set it is alive, writes
+/// through any node of that disk succeed only inside the ranges (and do
+/// succeed there even on a read-only disk); everything else is EROFS.
+/// A second BLKWRWIN on the same description replaces the window; count 0
+/// closes it. The window dies with the description.
+const BLKWRWIN: usize = 0x4108_12F0;
+const WRWIN_MAX_RANGES: usize = 16;
+const WRWIN_SLOTS: usize = 8;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WrWinRange { start: u64, len: u64 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WrWin { count: u32, flags: u32, r: [WrWinRange; WRWIN_MAX_RANGES] }
+
+#[derive(Clone, Copy)]
+struct WinSlot { used: bool, disk: u8, ofd: u32, n: u8, r: [(u64, u64); WRWIN_MAX_RANGES] }
+
+static WINDOWS: Mutex<[WinSlot; WRWIN_SLOTS]> =
+    Mutex::new([WinSlot { used: false, disk: 0, ofd: 0, n: 0, r: [(0, 0); WRWIN_MAX_RANGES] }; WRWIN_SLOTS]);
+
+enum WinCheck { None, Inside, Outside }
+
+/// Windows of disk `i` whose description is still open. Stale slots are
+/// dropped here (and logged), which is the "closed" half of the window life.
+fn window_check(i: u8, abs: u64, n: u64) -> WinCheck {
+    let mut w = WINDOWS.lock();
+    let mut any = false;
+    let mut inside = false;
+    for s in w.iter_mut().filter(|s| s.used && s.disk == i) {
+        if !super::ofd::live(s.ofd) {
+            s.used = false;
+            super::dbg_str("[BLK] write window closed (disk "); super::dbg_dec(i as usize); super::dbg_str(")\n");
+            continue;
+        }
+        any = true;
+        if s.r[..s.n as usize].iter().any(|&(a, l)| abs >= a && abs + n <= a + l) { inside = true; }
+    }
+    if !any { WinCheck::None } else if inside { WinCheck::Inside } else { WinCheck::Outside }
+}
+
+fn blkwrwin(pid: u32, ofd_id: u32, backing: Backing, size: u64, ro: bool, arg: usize) -> isize {
+    if sched::euid_of(pid) != 0 { return -13; } // EACCES
+    let i = match backing { Backing::Disk(i) => i, _ => return -22 }; // whole disk only
+    if arg == 0 { return -14; }
+    let req = match sched::uaccess::read_user::<WrWin>(arg) { Some(v) => v, None => return -14 };
+    let cnt = req.count as usize;
+    if cnt > WRWIN_MAX_RANGES || req.flags != 0 { return -22; }
+    let mut r = [(0u64, 0u64); WRWIN_MAX_RANGES];
+    for k in 0..cnt {
+        let (a, l) = (req.r[k].start.checked_mul(512), req.r[k].len.checked_mul(512));
+        let (a, l) = match (a, l) { (Some(a), Some(l)) if l > 0 => (a, l), _ => return -22 };
+        match a.checked_add(l) { Some(e) if e <= size => {}, _ => return -22 }
+        r[k] = (a, l);
+    }
+    if !super::ofd::live(ofd_id) { return -9; }
+    if cnt > 0 && ro {
+        // Implied runtime write enable, unless the boot policy (blk.rw=) forbids it.
+        match ops() {
+            Some(o) => {
+                if !(o.set_rw)(i as usize) { return -13; }
+                if (o.describe)(i as usize).map_or(true, |d| d.ro) { return -1; } // EPERM
+            }
+            None => return -6,
+        }
+    }
+    let mut w = WINDOWS.lock();
+    let slot = w.iter().position(|s| s.used && s.disk == i && s.ofd == ofd_id)
+        .or_else(|| w.iter().position(|s| !s.used || !super::ofd::live(s.ofd)));
+    let slot = match slot { Some(s) => s, None => return -16 }; // EBUSY
+    if cnt == 0 {
+        w[slot].used = false;
+    } else {
+        w[slot] = WinSlot { used: true, disk: i, ofd: ofd_id, n: cnt as u8, r };
+    }
+    drop(w);
+    super::dbg_str("[BLK] write window set on disk "); super::dbg_dec(i as usize);
+    super::dbg_str(", ranges "); super::dbg_dec(cnt); super::dbg_str(" by pid "); super::dbg_dec(pid as usize);
+    super::dbg_str("\n");
+    0
 }
 
 /// `fsync(2)` on a block node.
@@ -986,7 +1083,7 @@ fn put_user<T: Copy>(arg: usize, v: T) -> isize {
     if sched::uaccess::write_user(arg, v) { 0 } else { -14 }
 }
 
-pub fn ioctl(pid: u32, dev: u16, cmd: usize, arg: usize) -> isize {
+pub fn ioctl(pid: u32, ofd_id: u32, dev: u16, cmd: usize, arg: usize) -> isize {
     if dev == LOOP_CONTROL { return loop_control_ioctl(cmd, arg); }
     let (backing, size, lbs, ro) = {
         let b = BDEVS.lock();
@@ -1026,7 +1123,8 @@ pub fn ioctl(pid: u32, dev: u16, cmd: usize, arg: usize) -> isize {
             if sched::euid_of(pid) != 0 { return -13; }
             match backing {
                 Backing::Disk(i) => match ops() {
-                    Some(o) if (o.set_rw)(i as usize) => {
+                    // blk.rw= still holds after the controller is writable.
+                    Some(o) if (o.set_rw)(i as usize) && !(o.describe)(i as usize).map_or(true, |d| d.ro) => {
                         let mut b = BDEVS.lock();
                         let slot = b.iter().position(|e| e.in_use && e.backing == Backing::Disk(i));
                         for (k, e) in b.iter_mut().enumerate().filter(|(_, e)| e.in_use) {
@@ -1046,6 +1144,7 @@ pub fn ioctl(pid: u32, dev: u16, cmd: usize, arg: usize) -> isize {
         // The partition table is only ever changed through BLKPG here, so a
         // re-read has nothing to do — and succeeding is what Linux does for a
         // device with no partitions open.
+        BLKWRWIN => blkwrwin(pid, ofd_id, backing, size, ro, arg),
         BLKRRPART => 0,
         BLKFLSBUF => flush_dev(dev),
         BLKPG => blkpg(dev, arg),
