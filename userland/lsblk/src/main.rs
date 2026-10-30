@@ -3,7 +3,7 @@
 
 extern crate leandros_libc;
 
-use leandros_libc::{write, open, read, close, ioctl, lseek, O_RDONLY, O_RDWR, STDOUT_FILENO};
+use leandros_libc::{write, open, read, close, ioctl, lseek, setuid, O_RDONLY, O_RDWR, STDOUT_FILENO};
 use leandros_libc::devinfo;
 
 unsafe fn out(s: &[u8]) {
@@ -102,21 +102,88 @@ unsafe fn setrw_cmd(argv: *const *const u8) -> i32 {
     if r < 0 { 1 } else { 0 }
 }
 
-unsafe fn wtest_cmd(argv: *const *const u8) -> i32 {
+unsafe fn parse_u64(p: *const u8) -> u64 {
+    let mut v = 0u64;
+    let mut i = 0;
+    while *p.add(i) != 0 { v = v * 10 + (*p.add(i) - b'0') as u64; i += 1; }
+    v
+}
+
+/// `lsblk --wtest <dev> [byte_offset]`: write 4 KiB of 0xA5 at the offset
+/// (default 0) and read it back. DESTROYS those 4 KiB.
+unsafe fn wtest_cmd(argc: i32, argv: *const *const u8) -> i32 {
     let dev = *argv.add(2);
+    let off = if argc >= 4 { parse_u64(*argv.add(3)) } else { 0 };
     let fd = open(dev, O_RDWR, 0);
     if fd < 0 { out(b"wtest: open failed\n"); return 1; }
     let wbuf = [0xA5u8; 4096];
     let mut rbuf = [0u8; 4096];
-    lseek(fd, 0, 0);
+    lseek(fd, off as _, 0);
     let w = write(fd, wbuf.as_ptr(), wbuf.len());
-    out(b"write = "); out_num(w as i64); out(b"\n");
+    out(b"write = "); out_num(w as i64);
+    if w < 0 { out(b" errno "); out_num(leandros_libc::errno::get_errno() as i64); }
+    out(b"\n");
     if w != 4096 { close(fd); return 1; }
-    lseek(fd, 0, 0);
+    lseek(fd, off as _, 0);
     let r = read(fd, rbuf.as_mut_ptr(), rbuf.len());
     close(fd);
     out(b"read = "); out_num(r as i64); out(b"\n");
     if r == 4096 && rbuf == wbuf { out(b"WTEST OK\n"); 0 } else { out(b"WTEST MISMATCH\n"); 1 }
+}
+
+#[repr(C)]
+struct WrWin { count: u32, flags: u32, r: [[u64; 2]; 16] }
+const BLKWRWIN: usize = 0x4108_12F0;
+
+/// Write 4 KiB at `off` of `dev` (fresh open); returns the write result.
+unsafe fn wr_at(dev: *const u8, off: u64) -> i64 {
+    let fd = open(dev, O_RDWR, 0);
+    if fd < 0 { return -1000; }
+    let wbuf = [0x5Au8; 4096];
+    lseek(fd, off as _, 0);
+    let w = write(fd, wbuf.as_ptr(), wbuf.len());
+    let e = leandros_libc::errno::get_errno();
+    close(fd);
+    if w < 0 { -(e as i64) } else { w as i64 }
+}
+
+/// `lsblk --wrwin <disk> <start_sector> <nsectors> <part_in> <part_out>`:
+/// BLKWRWIN on the whole disk, then checks writes inside and outside.
+unsafe fn wrwin_cmd(argv: *const *const u8) -> i32 {
+    let disk = *argv.add(2);
+    let (start, len) = (parse_u64(*argv.add(3)), parse_u64(*argv.add(4)));
+    let (pin, pout) = (*argv.add(5), *argv.add(6));
+    let fd = open(disk, O_RDONLY, 0);
+    if fd < 0 { out(b"wrwin: open failed\n"); return 1; }
+    let mut w = WrWin { count: 1, flags: 0, r: [[0; 2]; 16] };
+    w.r[0] = [start, len];
+    let mut r = ioctl(fd, BLKWRWIN, &w as *const WrWin as usize) as i64;
+    if r < 0 { r = -(leandros_libc::errno::get_errno() as i64); }
+    out(b"T0 BLKWRWIN = "); out_num(r); out(b"\n");
+    let mut bad = (r != 0) as i32;
+    let t1 = wr_at(pin, 0);          out(b"T1 part-in write = ");  out_num(t1); out(b"\n");
+    let t2 = wr_at(pout, 0);         out(b"T2 part-out write = "); out_num(t2); out(b"\n");
+    let t3 = wr_at(disk, (start + len) * 512); out(b"T3 disk-outside write = "); out_num(t3); out(b"\n");
+    let t4 = wr_at(disk, start * 512);         out(b"T4 disk-inside write = ");  out_num(t4); out(b"\n");
+    close(fd);
+    let t5 = wr_at(pin, 0);          out(b"T5 after-close part-in write = "); out_num(t5); out(b"\n");
+    if t1 != 4096 || t2 != -30 || t3 != -30 || t4 != 4096 || t5 != -30 { bad = 1; }
+    if bad == 0 { out(b"WRWIN PASS\n"); 0 } else { out(b"WRWIN FAIL\n"); 1 }
+}
+
+/// `lsblk --wrwin-user <disk>`: drop to uid 1000, then try BLKWRWIN (expect EACCES).
+unsafe fn wrwin_user_cmd(argv: *const *const u8) -> i32 {
+    let disk = *argv.add(2);
+    let fd = open(disk, O_RDONLY, 0);
+    if fd < 0 { out(b"wrwin-user: open failed\n"); return 1; }
+    setuid(1000);
+    let mut w = WrWin { count: 1, flags: 0, r: [[0; 2]; 16] };
+    w.r[0] = [0, 8];
+    let mut r = ioctl(fd, BLKWRWIN, &w as *const WrWin as usize) as i64;
+    if r < 0 { r = -(leandros_libc::errno::get_errno() as i64); }
+    close(fd);
+    out(b"nonroot BLKWRWIN = "); out_num(r as i64); out(b"\n");
+    if r == -13 { out(b"WRWIN-USER PASS\n"); 0 } else { out(b"WRWIN-USER FAIL\n"); 1 }
 }
 
 #[no_mangle]
@@ -124,7 +191,9 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if argc >= 3 {
         let a = core::slice::from_raw_parts(*argv.add(1), cstr_len(*argv.add(1)));
         if a == b"--setrw" { return setrw_cmd(argv); }
-        if a == b"--wtest" { return wtest_cmd(argv); }
+        if a == b"--wtest" { return wtest_cmd(argc, argv); }
+        if a == b"--wrwin" && argc >= 7 { return wrwin_cmd(argv); }
+        if a == b"--wrwin-user" { return wrwin_user_cmd(argv); }
     }
     out_padded(b"NAME", 16);
     out_padded(b"SIZE", 8);

@@ -372,18 +372,79 @@ pub fn read_blocks(dev_idx: usize, blk: u64, buf: &mut [u8]) -> bool {
     }
 }
 
+
+// ── Boot-time write allow-list (`blk.rw=`) ───────────────────────────────────
+
+/// Entries of `blk.rw=`, lower-cased: `partuuid=<id>` or `disk:<guid>`.
+static RW_LIST: Mutex<alloc::vec::Vec<alloc::string::String>> = Mutex::new(alloc::vec::Vec::new());
+
+/// Parse the last `blk.rw=A,B,...` token of the command line. Each item is
+/// `PARTUUID=<id>` (or a bare id) or `disk:<GPT disk GUID>`. Call before any
+/// registry query; the policy is evaluated lazily.
+pub fn set_rw_list(cmdline: &str) {
+    let mut l = RW_LIST.lock();
+    l.clear();
+    let Some(v) = cmdline.split_ascii_whitespace().filter_map(|t| t.strip_prefix("blk.rw=")).last() else { return };
+    for item in v.split(',').filter(|i| !i.is_empty()) {
+        let low = item.to_ascii_lowercase();
+        let norm = if let Some(r) = low.strip_prefix("partuuid=") { alloc::format!("partuuid={}", r) } else if low.starts_with("disk:") { low } else { alloc::format!("partuuid={}", low) };
+        l.push(norm);
+    }
+}
+
+/// True when a `blk.rw=` list was given.
+pub fn rw_list_active() -> bool { !RW_LIST.lock().is_empty() }
+
+fn rw_listed(prefix: &str, id: &PartUuid) -> bool {
+    let mut b = [0u8; 36];
+    let n = id.format(&mut b);
+    let txt = core::str::from_utf8(&b[..n]).unwrap_or("");
+    RW_LIST.lock().iter().any(|i| i.strip_prefix(prefix) == Some(txt))
+}
+
+/// Write policy of entry `idx` from `blk.rw=`: true when it is read-only
+/// because its disk holds a listed partition and `idx` is not listed (or is
+/// the whole disk). NVMe disks are always governed once a list is given (a mistyped id must not leave one writable); other disks only when they hold a listed partition.
+fn policy_ro(idx: usize) -> bool {
+    if !rw_list_active() { return false; }
+    let Some(e) = get(idx) else { return false };
+    let di = e.parent.map_or(idx, |p| p as usize);
+    let Some(d) = get(di) else { return false };
+    if let Some(BootDisk::Gpt(g)) = d.disk_id {
+        if rw_listed("disk:", &PartUuid::Gpt(g)) { return false; }
+    }
+    let n = device_count();
+    let governed = d.class == "nvme" || (0..n).any(|i| get(i).map_or(false, |x| x.parent == Some(di as u16)
+        && x.partuuid.map_or(false, |u| rw_listed("partuuid=", &u))));
+    if !governed { return false; }
+    match e.partuuid {
+        Some(u) if e.parent.is_some() => !rw_listed("partuuid=", &u),
+        _ => true,
+    }
+}
+
+/// Entry `idx` refuses writes: the driver says so, or `blk.rw=` does.
+///
+/// The registry gates only partition entries: the VFS writes every node
+/// through its whole-disk entry at an absolute offset and enforces the
+/// per-node policy itself (`DiskDesc::read_only` below carries the full
+/// answer, whole disks included).
+fn entry_ro(idx: usize, e: &Entry) -> bool {
+    e.dev.read_only() || (e.parent.is_some() && policy_ro(idx))
+}
+
 /// True when entry `dev_idx` (or the disk it is a partition of) refuses
 /// writes. Every write entry point below checks it before the device sees
 /// the request.
 pub fn read_only(dev_idx: usize) -> bool {
-    get(dev_idx).map_or(false, |e| e.dev.read_only())
+    get(dev_idx).map_or(false, |e| entry_ro(dev_idx, &e))
 }
 
 /// Write one 4096-byte block to device `dev_idx` at logical block `blk`.
 pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK]) -> bool {
     let _io = io_enter();
     let e = match get(dev_idx) { Some(e) => e, None => return false };
-    if e.dev.read_only() { return false; }
+    if entry_ro(dev_idx, &e) { return false; }
     match locate(&e, blk, BLOCK) {
         Some(lba) => e.dev.write_sectors(lba, buf).is_ok(),
         None => false,
@@ -398,7 +459,7 @@ pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
     if buf.is_empty() || buf.len() % BLOCK != 0 { return false; }
     let _io = io_enter();
     let e = match get(dev_idx) { Some(e) => e, None => return false };
-    if e.dev.read_only() { return false; }
+    if entry_ro(dev_idx, &e) { return false; }
     match locate(&e, blk, buf.len()) {
         Some(lba) => e.dev.write_sectors(lba, buf).is_ok(),
         None => false,
@@ -563,7 +624,7 @@ pub fn raw_write(idx: usize, byte_off: u64, buf: &[u8], panic_path: bool) -> boo
         match get(idx) { Some(e) => e, None => return false }
     };
     let _io = if panic_path { None } else { Some(io_enter()) };
-    if e.dev.read_only() { return false; }
+    if e.dev.read_only() || (!panic_path && e.parent.is_some() && policy_ro(idx)) { return false; }
     match raw_locate(&e, byte_off, buf.len()) {
         Some(lba) => if panic_path {
             e.dev.try_write_sectors(lba, buf).is_ok()
@@ -681,7 +742,7 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
         bytes: e.nsectors * e.ss as u64,
         sector_size: e.ss,
         removable: e.removable,
-        read_only: e.dev.read_only(),
+        read_only: e.dev.read_only() || policy_ro(idx),
         class: e.class,
         ordinal: e.ordinal,
         gone: e.gone,

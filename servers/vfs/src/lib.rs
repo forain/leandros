@@ -11203,8 +11203,9 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
     // resolve and open the backing file, and every arm touches user memory
     // through `arg`, which must be able to demand-page.
     if let VnodeKind::BlockDev { dev, .. } = tbl.fds[fd].kind {
+        let ofd_id = tbl.fds[fd].ofd;
         drop(tbls);
-        return make_reply(block::ioctl(pid, dev, cmd, arg) as i64);
+        return make_reply(block::ioctl(pid, ofd_id, dev, cmd, arg) as i64);
     }
 
     if let VnodeKind::DynamicDevice { port, dev_id, open_id } = &tbl.fds[fd].kind {
