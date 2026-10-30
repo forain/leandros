@@ -435,6 +435,10 @@ pub mod sys {
     pub type UsbIsochSubmitFn = unsafe extern "C" fn(u64) -> i32;
     pub type UsbIsochReapFn = unsafe extern "C" fn(u64, *mut u8, usize) -> i32;
     pub type UsbIsochCloseFn = unsafe extern "C" fn(u64);
+    pub type UsbIntrOpenFn = unsafe extern "C" fn(u64, u8, usize) -> i64;
+    pub type UsbIntrPollFn = unsafe extern "C" fn(u64, *mut u8, usize) -> isize;
+    pub type UsbIntrOutFn = unsafe extern "C" fn(u64, *const u8, usize) -> i32;
+    pub type UsbIntrCloseFn = unsafe extern "C" fn(u64);
     pub type V4l2UnregisterFn = unsafe extern "C" fn(usize);
     pub type PmRegisterFn = unsafe extern "C" fn(KmodId, Option<super::KPmFn>, Option<super::KPmFn>,
                                                  Option<super::KPmFn>, usize) -> i32;
@@ -500,6 +504,10 @@ pub mod sys {
         pub fn kapi_usb_isoch_submit(pipe: u64) -> i32;
         pub fn kapi_usb_isoch_reap(pipe: u64, buf: *mut u8, len: usize) -> i32;
         pub fn kapi_usb_isoch_close(pipe: u64);
+        pub fn kapi_usb_intr_open(handle: u64, ep: u8, max: usize) -> i64;
+        pub fn kapi_usb_intr_poll(pipe: u64, buf: *mut u8, cap: usize) -> isize;
+        pub fn kapi_usb_intr_out(pipe: u64, buf: *const u8, len: usize) -> i32;
+        pub fn kapi_usb_intr_close(pipe: u64);
         pub fn kapi_v4l2_unregister(ctx: usize);
         pub fn kapi_pm_register(owner: KmodId, suspend: Option<super::KPmFn>, resume: Option<super::KPmFn>,
                                 shutdown: Option<super::KPmFn>, ctx: usize) -> i32;

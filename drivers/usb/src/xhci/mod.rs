@@ -34,7 +34,7 @@
 pub mod context;
 pub mod regs;
 pub mod ring;
-mod intr;
+pub mod intr;
 pub mod isoch;
 pub mod btusb;
 pub mod pm;
@@ -1224,7 +1224,7 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
         let scan = crate::hid::parse_config(&cfg);
         if scan.unsupported { info.hid |= crate::hid::ROLE_HID_UNSUPPORTED; }
         let mut hid = Vec::new();
-        if !scan.boot.is_empty() {
+        if !scan.boot.is_empty() && !cfg!(feature = "hid-module") {
             match intr::setup_hid(hc, slot, speed, ci.value, &scan.boot, crate::hid::initial_leds()) {
                 Ok(p) => hid = p,
                 Err(e) => usb_log!("[XHCI] slot {}: HID setup failed: {}\n", slot, e),

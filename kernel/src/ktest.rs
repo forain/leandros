@@ -572,7 +572,7 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 87 && exports::NEXPORTS == 87, "ksymtab has 87 exports");
+    t.check(exports::ksymtab().len() == 97 && exports::NEXPORTS == 97, "ksymtab has 97 exports");
     t.check(exports::lookup("kapi_wifi_register").is_some(), "kapi_wifi_register in KSYMTAB");
     #[cfg(feature = "drv-wifi-stack")]
     {
@@ -598,6 +598,14 @@ fn t_kmodkapi() -> T {
     {
         use crate::kmod::exports::{kapi_input_register, kapi_input_set_caps};
         t.check(kapi_input_register(KmodId(0), 7, core::ptr::null(), 0, 0, 0, 0) == -22, "kapi_input_register bad kind -> -22");
+        t.check(crate::kmod::exports::kapi_input_unregister(0) == -22, "kapi_input_unregister fixed node -> -22");
+        t.check(crate::kmod::exports::kapi_input_unregister(99) == -22, "kapi_input_unregister unknown node -> -22");
+        t.check(kapi_input_register(KmodId(0), 2, core::ptr::null(), 0, 0, 0, 0) == -22, "kapi_input_register dev kind null name -> -22");
+        t.check(crate::kmod::exports::kapi_usb_intr_open(0xdead, 0x81, 8) == -19, "kapi_usb_intr_open bad handle -> -19");
+        t.check(crate::kmod::exports::kapi_usb_intr_open(1, 0x81, 0) == -22, "kapi_usb_intr_open max 0 -> -22");
+        t.check(crate::kmod::exports::kapi_usb_intr_poll(0xdead, core::ptr::null_mut(), 0) == -19, "kapi_usb_intr_poll bad pipe -> -19");
+        t.check(crate::kmod::exports::kapi_usb_intr_out(0xdead, [0u8].as_ptr(), 1) == -19, "kapi_usb_intr_out bad pipe -> -19");
+        t.check(crate::kmod::exports::kapi_usb_intr_out(0xdead, core::ptr::null(), 1) == -22, "kapi_usb_intr_out null -> -22");
         t.check(kapi_input_set_caps(5, core::ptr::null(), 0, core::ptr::null(), 0) == -22, "kapi_input_set_caps bad node -> -22");
         t.check(kapi_input_set_caps(1, core::ptr::null(), 4, core::ptr::null(), 0) == -22, "kapi_input_set_caps null rel -> -22");
     }

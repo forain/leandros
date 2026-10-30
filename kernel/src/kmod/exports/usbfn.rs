@@ -14,6 +14,8 @@ use usb::xhci::isoch::{IsochPipe, Poll as IsoPoll, StreamFormat, UsbFunction};
 pub(super) static FUNCS: spin::Mutex<alloc::vec::Vec<(u64, usize, Arc<UsbFunction>)>> = spin::Mutex::new(alloc::vec::Vec::new());
 /// (pipe handle, function handle, `*mut IsochPipe`). The module serialises use of one pipe.
 pub(super) static PIPES: spin::Mutex<alloc::vec::Vec<(u64, u64, usize)>> = spin::Mutex::new(alloc::vec::Vec::new());
+/// Open interrupt-IN pipes: (pipe handle, function handle, `*mut IntrEntry`).
+pub(super) static INTRS: spin::Mutex<alloc::vec::Vec<(u64, u64, usize)>> = spin::Mutex::new(alloc::vec::Vec::new());
 pub(super) static NEXT_HANDLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// Number of USB functions held by module class drivers (ktest).
@@ -39,6 +41,10 @@ pub(super) fn drop_func(h: u64) {
     let mut dead = alloc::vec::Vec::new();
     PIPES.lock().retain(|e| { if e.1 == h { dead.push(e.2); false } else { true } });
     for p in dead { unsafe { Box::from_raw(p as *mut IsochPipe) }.close(); }
+    // Interrupt pipes die with the device (the slot is disabled by the hot-plug scan).
+    let mut gone = alloc::vec::Vec::new();
+    INTRS.lock().retain(|e| { if e.1 == h { gone.push(e.2); false } else { true } });
+    for p in gone { drop(unsafe { Box::from_raw(p as *mut IntrEntry) }); }
 }
 
 /// USB control transfer on the claimed function. The direction is bit 7 of `setup.request_type`;
@@ -186,3 +192,80 @@ pub extern "C" fn kapi_usb_class_register(owner: KmodId, ids: *const KmodDevId, 
     0
 }
 
+
+// ── interrupt-IN pipes (boot HID) ──
+
+/// An open interrupt pipe with the reports its last poll harvested.
+pub(super) struct IntrEntry { pipe: usb::xhci::intr::IntrPipe, reports: usb::xhci::intr::Reports, next: usize }
+
+/// Number of open interrupt pipes held by modules (ktest).
+pub fn usb_intr_pipes() -> usize { INTRS.lock().len() }
+
+/// Open the interrupt-IN endpoint `ep` (a boot HID interface in the function's configuration):
+/// the endpoint is configured and report TDs are queued. Protocol, idle and LED requests are the
+/// driver's, over `kapi_usb_ctrl`. `max` is the largest report the caller reads (<= 64).
+/// Returns the pipe handle (> 0) or -errno. Task context.
+#[no_mangle]
+pub extern "C" fn kapi_usb_intr_open(handle: u64, ep: u8, max: usize) -> i64 {
+    if max == 0 || max > usb::xhci::intr::REPORT_MAX { return -22; }
+    let Some(f) = func(handle) else { return -19 };
+    let Some(d) = usb::hid::parse_config(&f.cfg).boot.into_iter().find(|d| d.ep_addr == ep) else { return -22 };
+    match usb::xhci::intr::open_on(&f, &d) {
+        Ok(pipe) => {
+            let ph = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let ptr = Box::into_raw(Box::new(IntrEntry { pipe, reports: usb::xhci::intr::Reports::new(), next: 0 })) as usize;
+            INTRS.lock().push((ph, handle, ptr));
+            ph as i64
+        }
+        Err(_) => -5,
+    }
+}
+
+fn intr_ptr(ph: u64) -> Option<*mut IntrEntry> {
+    INTRS.try_lock()?.iter().find(|e| e.0 == ph).map(|e| e.2 as *mut IntrEntry)
+}
+
+/// Take the next report (IRQ-safe: never blocks). Returns its length, -11 when none is queued,
+/// -16 when the controller was busy (retry next tick), -19 when the device is gone or the handle
+/// is bad. A report longer than `cap` is truncated.
+#[no_mangle]
+pub extern "C" fn kapi_usb_intr_poll(pipe: u64, buf: *mut u8, cap: usize) -> isize {
+    if buf.is_null() && cap != 0 { return -22; }
+    let Some(p) = intr_ptr(pipe) else { return -19 };
+    let e = unsafe { &mut *p };
+    if e.next >= e.reports.n {
+        e.reports.n = 0;
+        e.next = 0;
+        match e.pipe.poll(&mut e.reports) {
+            usb::xhci::intr::Poll::Busy => return -16,
+            usb::xhci::intr::Poll::Gone => return -19,
+            usb::xhci::intr::Poll::Ok => {}
+        }
+        if e.reports.n == 0 { return -11; }
+    }
+    let r = e.reports.get(e.next);
+    e.next += 1;
+    let k = r.len().min(cap);
+    if k != 0 { unsafe { core::ptr::copy_nonoverlapping(r.as_ptr(), buf, k); } }
+    r.len() as isize
+}
+
+/// Send a HID output report (SET_REPORT, report id 0) to the pipe's interface without waiting
+/// (IRQ-safe). 0 queued, -16 one is still in flight (retry), -95 the device cannot take it,
+/// -19 bad handle.
+#[no_mangle]
+pub extern "C" fn kapi_usb_intr_out(pipe: u64, buf: *const u8, len: usize) -> i32 {
+    if buf.is_null() || len == 0 || len > 8 { return -22; }
+    let Some(p) = intr_ptr(pipe) else { return -19 };
+    let e = unsafe { &mut *p };
+    if !e.pipe.leds_usable() { return -95; }
+    if e.pipe.set_report_nowait(unsafe { core::slice::from_raw_parts(buf, len) }) { 0 } else { -16 }
+}
+
+/// Forget the pipe. The endpoint stays configured until the device leaves.
+#[no_mangle]
+pub extern "C" fn kapi_usb_intr_close(pipe: u64) {
+    let mut found = None;
+    INTRS.lock().retain(|e| { if e.0 == pipe { found = Some(e.2); false } else { true } });
+    if let Some(p) = found { drop(unsafe { Box::from_raw(p as *mut IntrEntry) }); }
+}

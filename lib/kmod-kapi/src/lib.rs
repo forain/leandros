@@ -438,6 +438,25 @@ pub mod input {
     pub fn set_device_caps(node: u32, rel: &[u8], key: &[u8]) {
         unsafe { sys_input::kapi_input_set_caps(node as i32, rel.as_ptr(), rel.len(), key.as_ptr(), key.len()); }
     }
+    pub use kmod_abi::input::{INPUT_DEV_KEYBOARD, INPUT_DEV_MOUSE, REL_SRC_USB};
+    /// Unregister a per-device node.
+    pub fn unregister(node: u32) { unsafe { sys_input::kapi_input_unregister(node as i32); } }
+    /// Key edge / SYN to the kernel's console keyboard.
+    pub fn push_console(ty: u16, code: u16, value: i32) { unsafe { sys_input::kapi_input_event_console(ty, code, value) } }
+    /// Keyboard LEDs to show (HID output bit order).
+    pub fn leds() -> u8 { unsafe { sys_input::kapi_input_leds() as u8 } }
+    /// Console typematic (delay, period) in ms.
+    pub fn repeat() -> (u32, u32) {
+        let (mut d, mut r) = (0u32, 0u32);
+        unsafe { sys_input::kapi_input_repeat(&mut d, &mut r) };
+        (d, r)
+    }
+    pub fn rel_report(src: u32, dx: i32, dy: i32, wheel: i32, hwheel: i32, buttons: u8) {
+        unsafe { sys_input::kapi_rel_pointer_report(src, dx, dy, wheel, hwheel, buttons) }
+    }
+    pub fn rel_advertise(buttons: u8, hwheel: bool, hires: bool) {
+        unsafe { sys_input::kapi_rel_pointer_advertise(buttons, hwheel, hires) }
+    }
     pub fn register_stats_hook(_f: fn(&mut dyn core::fmt::Write)) {}
     pub fn vt_handoff_stats() -> (u64, u64) { (0, 0) }
 }
@@ -695,4 +714,20 @@ pub mod usb {
 
     /// Stop and free the pipe. Task context.
     pub fn isoch_close(pipe: u64) { unsafe { sys::kapi_usb_isoch_close(pipe) } }
+
+    /// Open the interrupt-IN endpoint `ep` of a boot HID interface. Ok = pipe handle. Task context.
+    pub fn intr_open(handle: u64, ep: u8, max: usize) -> Result<u64, i32> {
+        let r = unsafe { sys::kapi_usb_intr_open(handle, ep, max) };
+        if r < 0 { Err(r as i32) } else { Ok(r as u64) }
+    }
+    /// Next report: Ok(len) (may exceed `buf.len()`), Err(-11) none, Err(-16) controller busy, Err(-19) gone.
+    /// Never blocks (tick context).
+    pub fn intr_poll(pipe: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        rc(unsafe { sys::kapi_usb_intr_poll(pipe, buf.as_mut_ptr(), buf.len()) } as i32)
+    }
+    /// HID output report without waiting. Ok queued; Err(-16) in flight, Err(-95) unusable.
+    pub fn intr_out(pipe: u64, data: &[u8]) -> Result<(), i32> {
+        rc(unsafe { sys::kapi_usb_intr_out(pipe, data.as_ptr(), data.len()) }).map(|_| ())
+    }
+    pub fn intr_close(pipe: u64) { unsafe { sys::kapi_usb_intr_close(pipe) } }
 }
