@@ -376,3 +376,12 @@ See [limitations.md](limitations.md) for the full list.
 - [../kernel/threads-and-futex.md](../kernel/threads-and-futex.md) — futex keying
 - [../servers/networking.md](../servers/networking.md) — AF_UNIX, SCM_RIGHTS, `shutdown(2)`
 - [../userland/ports.md](../userland/ports.md)
+
+## Audio applet and Workspaces applet (cosapplets2, 2026-10-30)
+
+`cosmic-applet-audio` (unmodified, built by `ports/cosmic-applets-panel/build.sh`) does not speak
+PulseAudio: it talks varlink to cosmic-settings-daemon's audio server (native PipeWire), which
+the image already runs. `cosmic-applet-minimize` and `cosmic-applet-tiling` were already staged.
+Upstream's default `plugins_wings` names the Workspaces button, not the Workspaces applet, so the
+image stages a system default `/usr/share/cosmic/com.system76.CosmicPanel.Panel/v1/plugins_wings`
+(`ports/cosmic-applets-panel/panel_plugins_wings`) = upstream's list plus `CosmicAppletWorkspaces`.
