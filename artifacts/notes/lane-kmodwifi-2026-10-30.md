@@ -15,4 +15,4 @@ Behaviour notes
 - PCI id 24f4 is also aliased.
 - llvm-nm on libkmod_iwlwifi.a: the only data statics outside the driver itself are kmod_kapi::OWNER, kmod_rt::OWNER, spin::held::HOOK (per-module runtime state); no copy of kernel-global state beyond the documented gk copy.
 
-Evidence (merged tree): ktest=kmodkapi PASS on x86_64 and aarch64 (ksymtab 87); autoloadtest iwlwifi, wifisim and box aarch64 regress: see merge report. Laptop trial is left to the orchestrator.
+Evidence (merged tree): ktest=kmodkapi PASS on x86_64 and aarch64 (ksymtab 87); autoloadtest iwlwifi PASS x86_64 (=m); default (IWLWIFI=y) x86_64 wifisim PASS; box aarch64 default regress 61 suites, 0 bad. Laptop trial is left to the orchestrator.
