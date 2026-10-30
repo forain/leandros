@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=COSMIC System Monitor
+Comment=System monitor for the COSMIC desktop
+Exec=cosmic-monitor
+Terminal=false
+Type=Application
+StartupNotify=true
+Icon=com.system76.CosmicMonitor
+Categories=COSMIC;System;Monitor;
+Keywords=Monitor;System;Process;CPU;Memory;Network;History;Usage;
