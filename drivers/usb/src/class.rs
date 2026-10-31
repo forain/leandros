@@ -157,6 +157,13 @@ pub fn register(d: Driver) {
     }
 }
 
+/// Remove a module's class drivers (it is unloading). Probes already running finish; the gate of the
+/// module refuses any that start later.
+pub fn unregister_owner(owner: KmodId) { MODULES.lock().retain(|d| d.owner != owner); }
+
+/// Keep a function whose driver went away for drivers registered later (reload re-probes it).
+pub fn requeue(m: Match, f: UsbFunction) { UNCLAIMED.lock().push((m, f)); }
+
 /// Asked once per interface that no class driver wants yet: vid, pid, class, subclass, protocol.
 /// The kernel's module autoloader installs it; a module it loads registers its driver from `init`.
 pub type AutoloadFn = fn(u16, u16, u8, u8, u8);

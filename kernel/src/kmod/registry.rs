@@ -127,10 +127,41 @@ fn release_one(owner: KmodId, kind: RegKind, handle: u64) -> bool {
         RegKind::IRQ => super::lower::release_irq(owner, handle),
         RegKind::HRTIMER => super::lower::release_hrtimer(handle),
         RegKind::HWRNG => super::exports::hwrng_release(handle),
+        RegKind::USB_CLASS => true, // torn down by `pre_exit`; the record is leaked (a snapshot may still point at it)
+        RegKind::BLK => { drivers::blkdev::remove_disk(handle as usize); true }
+        RegKind::INPUT => super::exports::input_release(handle),
         // The netif entry stays (name kept); its gate is closed for good, so nothing reaches the module.
         RegKind::NETDEV => true,
         _ => false,
     }
+}
+
+/// D6/D9: why `id` cannot unload, evaluated AFTER the Upper gate drained (so no open, probe or I/O
+/// of this generation is in flight). Open /dev/video*, mounted block devices and DRM pin the module;
+/// netdev, input, hwrng and USB class detach instead.
+pub fn busy_reason(id: KmodId) -> Option<&'static str> {
+    let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == id).map(|r| (r.1, r.2)).collect();
+    for (k, h) in recs {
+        match k {
+            RegKind::V4L2 => { if crate::v4l2::open_by(id) { return Some("camera open"); } }
+            RegKind::BLK => {
+                let mounts = vfs_server::list_mounts();
+                for p in drivers::blkdev::family_paths(h as usize) {
+                    let want = p.strip_prefix("/dev/").unwrap_or(p);
+                    if mounts.iter().any(|m| m.in_use && m.device.strip_prefix("/dev/").unwrap_or(m.device) == want) { return Some("mounted"); }
+                }
+            }
+            RegKind::DRM | RegKind::KMS => return Some("display in use"),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Runs on the exit thread right before the module's `exit()`: take back what needs the module's own code.
+pub fn pre_exit(id: KmodId) {
+    let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == id).map(|r| (r.1, r.2)).collect();
+    for (k, h) in recs { if k == RegKind::USB_CLASS { super::exports::usb_class_teardown(h); } }
 }
 
 /// Unload step 2: tell consumers the module's upper-edge objects are going (netifs record what a reload needs).

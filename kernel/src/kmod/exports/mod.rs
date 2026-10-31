@@ -41,6 +41,7 @@ mod rp1;
 mod pi5pins;
 
 pub use pci::*;
+pub use usbfn::usb_class_teardown;
 pub use irq::*;
 pub use net::*;
 pub use snd::*;

@@ -59,6 +59,10 @@ impl Gate {
         true
     }
 
+    /// Undo a `close_and_drain` (an unload that found the module busy).
+    pub fn reopen(&self, c: Class) { self.ctr(c).fetch_and(!CLOSED, SeqCst); }
+    pub fn upper_closed(&self) -> bool { self.upper.load(SeqCst) & CLOSED != 0 }
+
     pub fn inflight(&self) -> (u32, u32) { (self.upper.load(SeqCst) & !CLOSED, self.lower.load(SeqCst) & !CLOSED) }
     pub fn is_stopping(&self) -> bool { self.stopping.load(SeqCst) }
 }

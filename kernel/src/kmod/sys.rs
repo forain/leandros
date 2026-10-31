@@ -84,8 +84,15 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
     let g = match gate::get(m.id) { Some(g) => g, None => return zombie(m.id, s, "no gate") };
     if gate::current().map_or(false, |c| c.id == m.id) { registry::set_state(m.id, State::Live); return -35; }
     let t0 = sched::monotonic_ns();
-    registry::unbind_upper(m.id);
+    // D9: close the Upper gate first, then judge busy rules against a quiescent upper edge.
     if !g.close_and_drain(Class::Upper, 2000) { return zombie(m.id, s, "upper drain timeout"); }
+    if let Some(why) = registry::busy_reason(m.id) {
+        g.reopen(Class::Upper);
+        registry::set_state(m.id, State::Live);
+        drivers::pci::serial_debug(&alloc::format!("[kmod] {} busy: {}\n", s, why));
+        return EBUSY;
+    }
+    registry::unbind_upper(m.id);
     // D3 step 3: the device goes inert (INTx, MSI/MSI-X, bus mastering off) before the lower drain and exit().
     super::lower::quiesce_pci(m.id);
     g.stopping.store(true, Ordering::SeqCst);
@@ -102,6 +109,7 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
         };
         let f: extern "C" fn(*const kmod_abi::KmodCtx) -> i32 = unsafe { core::mem::transmute(exit) };
         sched::kmodgen::set(id.0);
+        registry::pre_exit(id);
         r2.store(f(&ctx), Ordering::SeqCst);
         sched::kmodgen::set(0);
         d2.store(true, Ordering::SeqCst);
