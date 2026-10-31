@@ -175,7 +175,8 @@ rm -f "${WORK:?}/stick.done"
 fi
 if phase b; then
 echo "== (b) crash injection"
-for PCT in $CRASH_PCTS; do
+crash_case() {
+    local PCT=$1 got
     echo "-- crash at resize >= ${PCT}%"
     fresh_disk; fresh_stick
     boot_stick "crash$PCT"
@@ -190,7 +191,9 @@ for PCT in $CRASH_PCTS; do
     [ -n "$got" ] && [ "$got" -ge "$PCT" ] || fail "resize never reached ${PCT}%"
     qmp_quit; ok "QEMU quit at resize ${got}%"
     boot_stick "recover$PCT"
-    r "$LI shrink-status --json" | tee "$WORK/statout$PCT.log" | grep -q '"state":"interrupted"' && ok "status: interrupted" || { cat "$WORK/statout$PCT.log"; fail "status after crash"; }
+    r "$LI shrink-status --json" > "$WORK/statout$PCT.log"
+    if grep -q '"phase":"done"' "$WORK/statout$PCT.log"; then echo "shrink finished before the kill landed (resize is fast); retrying"; stop_vm; return 2; fi
+    grep -q '"state":"interrupted"' "$WORK/statout$PCT.log" && ok "status: interrupted" || { cat "$WORK/statout$PCT.log"; fail "status after crash"; }
     r "$LI shrink --recover --yes --json; true" > "$WORK/recout$PCT.log"
     r "ls -la /home/dualboot-backup/\$(cat /home/dualboot-backup/shrink-latest 2>/dev/null | xargs basename 2>/dev/null) 2>/dev/null; ls -la \$(cat /home/dualboot-backup/shrink-latest); true" > "$WORK/bkls$PCT.log"
     grep -q '"recovered":true' "$WORK/recout$PCT.log" || { tail -4 "$WORK/recout$PCT.log"; fail "recover at ${PCT}%"; }
@@ -204,6 +207,13 @@ for PCT in $CRASH_PCTS; do
     [ "${D%% *}" = 0 ] || fail "p2 differs from the pre-image after recovery at ${PCT}%: $D"
     ok "p2 byte-identical to the pre-image"
     ! grep -q "doesn't match\|Corrupt" "$WORK/recout$PCT.log" || fail "recovery log has e2undo mismatch/corruption messages (${PCT}%)"
+}
+for PCT in $CRASH_PCTS; do
+    for ATT in 1 2 3; do
+        rc=0; crash_case "$PCT" || rc=$?
+        [ $rc = 2 ] || break
+    done
+    [ $rc = 0 ] || fail "crash case ${PCT}% (attempt rc $rc)"
 done
 
 fi
