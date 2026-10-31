@@ -124,8 +124,19 @@ fn release_one(owner: KmodId, kind: RegKind, handle: u64) -> bool {
         RegKind::PLAT => { super::exports::plat_unregister_owner(owner); true }
         RegKind::DMAQ => { super::exports::dma_quiesce_unregister_owner(owner); true }
         RegKind::V4L2 => { crate::syscall::v4l2::unregister_camera(handle as usize); true }
+        RegKind::IRQ => super::lower::release_irq(owner, handle),
+        RegKind::HRTIMER => super::lower::release_hrtimer(handle),
+        RegKind::HWRNG => super::exports::hwrng_release(handle),
+        // The netif entry stays (name kept); its gate is closed for good, so nothing reaches the module.
+        RegKind::NETDEV => true,
         _ => false,
     }
+}
+
+/// Unload step 2: tell consumers the module's upper-edge objects are going (netifs record what a reload needs).
+pub fn unbind_upper(owner: KmodId) {
+    let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == owner).map(|r| (r.1, r.2)).collect();
+    for (k, h) in recs { if k == RegKind::NETDEV { super::exports::netdev_detach(h); } }
 }
 
 /// Failed init: unregister every registration that can be taken back, dropping its record.

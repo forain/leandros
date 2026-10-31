@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# unloadtest.sh [arch]: kmod unload (lane U1 subset). Needs a build with KMOD_EXTRA="hello kmbad_hang kmbad_reload virtio_rng" (virtio_rng has no exit).
+# unloadtest.sh [arch]: kmod unload (lane U1 subset). Needs a build with KMOD_EXTRA="hello kmbad_hang kmbad_reload virtio_rng" (U2 adds kmbad_thread kmbad_freectx virtio_net).
 # hello load/unload loop, -ENOENT / -EBUSY / -EPERM, kmbad_hang Zombie, kmbad_reload stale-gate proof (kmod.leaktick=1).
 set -uo pipefail
 cd "$(cd "$(dirname "$0")/../.." && pwd)"
@@ -13,7 +13,10 @@ python3 "$RT" "$arch" ul1 --cmdline "kmod.leaktick=1" \
   "kmodctl rmmod hello; echo ENOENT_RC=\$?" \
   "kmodctl load $M/kmbad_hang.kmod; kmodctl rmmod kmbad_hang; echo HANGRM_RC=\$?; kmodctl load $M/kmbad_hang.kmod; echo HANGRELOAD_RC=\$?; cat /proc/modules" \
   "kmodctl load $M/kmbad_reload.kmod; sleep 1; kmodctl rmmod kmbad_reload; kmodctl load $M/kmbad_reload.kmod; sleep 1; kmodctl rmmod kmbad_reload; echo RELOAD_DONE" \
-  "kmodctl load $M/virtio_rng.kmod; o=\$(kmodctl rmmod virtio_rng 2>&1); echo NOEXIT_RC=\$? OUT=\$o; grep virtio_rng /proc/modules" \
+  "o=\$(kmodctl rmmod i915 2>&1); echo NOEXIT_RC=\$? OUT=\$o" \
+  "kmodctl load $M/kmbad_thread.kmod; sleep 1; kmodctl rmmod kmbad_thread; echo THREADRM_RC=\$?; kmodctl load $M/kmbad_freectx.kmod; sleep 1; kmodctl rmmod kmbad_freectx; echo FREECTXRM_RC=\$?; sleep 1; echo BAD_DONE" \
+  "kmodctl rmmod virtio_rng; kmodctl rmmod virtio_net; for i in \$(seq 1 $N); do kmodctl load $M/virtio_rng.kmod >/dev/null 2>&1 || echo RNGLOADFAIL \$i; kmodctl rmmod virtio_rng >/dev/null 2>&1 || echo RNGUNLOADFAIL \$i; done; echo RNGLOOP_DONE" \
+  "(ping -f -c 3000 -i 0.002 10.0.2.2 >/dev/null 2>&1 &); for i in \$(seq 1 ${NET_N:-20}); do kmodctl load $M/virtio_net.kmod >/dev/null 2>&1 || echo NETLOADFAIL \$i; sleep 3; ip link show eth0 >/dev/null 2>&1 || echo NONAME \$i; ping -c 1 -W 3 10.0.2.2 >/dev/null 2>&1 && echo NETPING_OK \$i || echo NETPING_FAIL \$i; kmodctl rmmod virtio_net >/dev/null 2>&1 || echo NETUNLOADFAIL \$i; done; echo NETLOOP_DONE" \
   "kmodctl load $M/hello.kmod; o=\$(/bin/sudo -u leandro /bin/kmodctl rmmod hello 2>&1); echo NONROOT_RC=\$? OUT=\$o; kmodctl rmmod hello" > /dev/null 2>&1
 L=/tmp/ffsession/tests-ul1/serial-full.log
 fail=0
@@ -27,8 +30,17 @@ check 'ZOMBIE: exit timeout' "kmbad_hang becomes Zombie"
 check 'HANGRELOAD_RC=1' "zombie reload refused"
 check 'kmbad_hang .* Zombie' "Zombie in /proc/modules"
 check 'kmbad_reload tick ok gen' "reload fixture ticks"
-check 'NOEXIT_RC=1 OUT=.*delete_module: Resource busy (errno 16)' "no-exit rmmod returns EBUSY"
-check 'virtio_rng .* Live' "no-exit module still Live"
+check 'NOEXIT_RC=1' "no-exit/unknown rmmod fails"
+check 'BAD_DONE' "kmbad_thread/kmbad_freectx run finished"
+check 'kmbad_thread body stopped' "kthread saw should_stop"
+check 'kmbad_freectx exit: ctx freed' "freectx exit ran"
+nocheck 'panic\|PANIC\|Data abort\|Oops' "no crash in the bad fixtures"
+check 'RNGLOOP_DONE' "virtio_rng x$N finished"
+nocheck '^RNG\(LOAD\|UNLOAD\)FAIL' "virtio_rng x$N clean"
+check 'NETLOOP_DONE' "virtio_net loop finished"
+nocheck '^NET\(UNLOAD\|LOAD\)FAIL' "virtio_net reload clean"
+nocheck '^NONAME' "eth0 keeps its name"
+nocheck '^NETPING_FAIL' "ping works after every reload"
 check 'NONROOT_RC=[0-9]* OUT=.*delete_module: Operation not permitted (errno 1)' "non-root errno is EPERM"
 nocheck 'STALE REACHED' "stale registration never reaches the new generation"
 exit $fail

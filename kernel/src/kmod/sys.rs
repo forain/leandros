@@ -84,7 +84,10 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
     let g = match gate::get(m.id) { Some(g) => g, None => return zombie(m.id, s, "no gate") };
     if gate::current().map_or(false, |c| c.id == m.id) { registry::set_state(m.id, State::Live); return -35; }
     let t0 = sched::monotonic_ns();
+    registry::unbind_upper(m.id);
     if !g.close_and_drain(Class::Upper, 2000) { return zombie(m.id, s, "upper drain timeout"); }
+    // D3 step 3: the device goes inert (INTx, MSI/MSI-X, bus mastering off) before the lower drain and exit().
+    super::lower::quiesce_pci(m.id);
     g.stopping.store(true, Ordering::SeqCst);
     if !g.close_and_drain(Class::Lower, 5000) { return zombie(m.id, s, "lower drain timeout"); }
     // exit() on its own thread so a hang only costs a Zombie.
@@ -111,6 +114,8 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
     }
     // Revoke what the kernel can take back; kinds without a revoke path keep the slot (Zombie).
     registry::release_all(m.id);
+    let dma = super::lower::dma_leftover(m.id);
+    if dma != 0 { drivers::pci::serial_debug(&alloc::format!("[kmod] {} exit left {} DMA pages owned: logged, not freed\n", s, dma)); }
     let left = registry::ungated_left(m.id);
     if left != 0 { return zombie(m.id, s, "ungated registrations left"); }
     registry::forget_regs(m.id);

@@ -717,3 +717,30 @@ pub fn poll_receive(dev_idx: usize, buf: &mut [u8]) -> Option<usize> {
         None
     }
 }
+
+/// Module unload: reset every device (it stops DMA and interrupts), then free the RX buffers and
+/// the TX copy block. Ring pages stay owned (the kernel logs them as leftovers). A device that does
+/// not confirm the reset keeps all its pages.
+#[allow(dead_code)]
+pub fn shutdown() {
+    let mut devs = DEVICES.lock();
+    for i in 0..MAX_NET_DEVICES {
+        IRQ_ARMED[i].store(false, Ordering::Release);
+        ISR_PTR[i].store(0, Ordering::Release);
+        let Some(d) = devs[i].take() else { continue };
+        unsafe {
+            let ds = core::ptr::addr_of_mut!((*d.common_cfg).device_status);
+            ds.mmio_write(0);
+            let end = crate::kenv::sched::monotonic_ns() + 100_000_000;
+            let mut ok = true;
+            while ds.mmio_read() != 0 {
+                if crate::kenv::sched::monotonic_ns() >= end { ok = false; break; }
+                core::hint::spin_loop();
+            }
+            if !ok { continue; }
+            for &p in d.rx_buffers_phys.iter() { if p != 0 { mm::buddy::free(p, 0); } }
+            mm::buddy::free(d.tx_req_phys, 4);
+        }
+    }
+    *DEVICE_COUNT.lock() = 0;
+}
