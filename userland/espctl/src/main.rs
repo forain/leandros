@@ -24,6 +24,8 @@ mod conf;
 mod dev;
 mod disks;
 mod klog;
+mod picard;
+mod picard_cli;
 
 use conf::Slots;
 use dev::Dev;
@@ -1224,6 +1226,7 @@ fn cmd_rm(o: &Opts) -> io::Result<()> {
 }
 
 const USAGE: &str = "usage: espctl [--dev /dev/<esp>] <command>
+  pi <status|setup|stage|try|commit|abort|rollback>   Pi 5 card kernel slots via firmware tryboot (see picard.rs)
   status                 slots, default entry, what this boot is
   install <kernel> [--initrd F] [--sha256 H] [--initrd-sha256 H] [--cmdline ARGS] [--no-arm]
                          new trial slot (verified read-back), armed as next boot;
@@ -1262,6 +1265,7 @@ fn main() {
     });
     let mut o = Opts { dev, args };
     let r = match cmd.as_str() {
+        "pi" => picard_cli::run(o.args.clone(), o.dev.clone()),
         "status" => cmd_status(&o),
         "install" => cmd_install(&mut o),
         "arm" => cmd_arm(&o),

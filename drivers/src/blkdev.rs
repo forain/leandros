@@ -391,6 +391,9 @@ static RW_LIST: Mutex<alloc::vec::Vec<alloc::string::String>> = Mutex::new(alloc
 /// `PARTUUID=<id>` (or a bare id) or `disk:<GPT disk GUID>`. Call before any
 /// registry query; the policy is evaluated lazily.
 pub fn set_rw_list(cmdline: &str) {
+    let tb = cmdline.split_ascii_whitespace().filter_map(|t| t.strip_prefix("sdhci.test_bootfat=")).last()
+        .and_then(|v| v.parse::<i64>().ok()).unwrap_or(-1);
+    TEST_BOOTFAT.store(tb, core::sync::atomic::Ordering::Relaxed);
     let mut l = RW_LIST.lock();
     l.clear();
     let Some(v) = cmdline.split_ascii_whitespace().filter_map(|t| t.strip_prefix("blk.rw=")).last() else { return };
@@ -742,6 +745,7 @@ pub fn dev_path(idx: usize) -> &'static str {
 /// Name, parent and geometry of entry `idx`, without any I/O.
 pub fn describe(idx: usize) -> Option<DiskDesc> {
     let e = get_any(idx)?;
+    let tb = test_bootfat(&e);
     Some(DiskDesc {
         name: e.name,
         nlen: e.nlen,
@@ -751,11 +755,21 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
         bytes: e.nsectors * e.ss as u64,
         sector_size: e.ss,
         removable: e.removable,
-        read_only: e.dev.read_only() || policy_ro(idx),
+        read_only: e.dev.read_only() || policy_ro(idx) || tb,
         class: e.class,
         ordinal: e.ordinal,
         gone: e.gone,
+        special: tb,
     })
+}
+
+/// Test-only knob `sdhci.test_bootfat=<virtio disk ordinal>`: marks that whole
+/// virtio disk as a Pi-style boot-FAT device (read-only, hidden, BLKISBOOTFAT=1,
+/// BLKWRWIN-only writes). Inert unless the cmdline names it.
+static TEST_BOOTFAT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(-1);
+fn test_bootfat(e: &Entry) -> bool {
+    e.parent.is_none() && e.class == "vd"
+        && TEST_BOOTFAT.load(core::sync::atomic::Ordering::Relaxed) == e.ordinal as i64
 }
 
 // ── /dev/root ────────────────────────────────────────────────────────────────

@@ -131,6 +131,8 @@ pub struct DiskInfo {
     pub ordinal: u16,
     /// Unplugged: the index is retired (no node, no I/O).
     pub gone: bool,
+    /// Boot-firmware device: reachable by explicit path, hidden from listings.
+    pub special: bool,
 }
 
 static DISK_OPS: core::sync::atomic::AtomicUsize =
@@ -174,6 +176,8 @@ struct BDev {
     removable: bool,
     /// Read-only medium (an NVMe disk without `nvme.rw=1`).
     ro: bool,
+    /// Hidden from /dev and /sys/class/block listings (explicit open still works).
+    special: bool,
 }
 
 impl BDev {
@@ -190,6 +194,7 @@ impl BDev {
             minor: 0,
             removable: false,
             ro: false,
+            special: false,
         }
     }
     fn name(&self) -> &[u8] { &self.name[..self.nlen as usize] }
@@ -247,6 +252,7 @@ pub fn init(disk_ops: &'static DiskOps) {
             minor: l as u32,
             removable: false,
             ro: false,
+            special: false,
         };
     }
 }
@@ -311,6 +317,7 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
                 minor: base_minor,
                 removable: d.removable,
                 ro: d.ro,
+                special: d.special,
             }),
             Some(p) => b.iter()
                 .position(|e| e.in_use && e.backing == Backing::Disk(p as u8))
@@ -326,6 +333,7 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
                     minor: base_minor + d.pno,
                     removable: d.removable,
                     ro: d.ro,
+                    special: d.special,
                 }),
             None => None,
         };
@@ -370,7 +378,7 @@ pub fn lookup_dev_node(path: &[u8]) -> Option<u16> {
 /// Name of the `idx`-th registry entry, for enumerating `/dev`.
 pub fn dev_node_name(idx: usize, out: &mut [u8; NAME_MAX]) -> Option<usize> {
     let b = synced();
-    let e = b.iter().filter(|e| e.in_use).nth(idx)?;
+    let e = b.iter().filter(|e| e.in_use && !e.special).nth(idx)?;
     let n = e.nlen as usize;
     out[..n].copy_from_slice(e.name());
     Some(n)
@@ -720,7 +728,8 @@ fn blkwrwin(pid: u32, ofd_id: u32, backing: Backing, size: u64, ro: bool, arg: u
         r[k] = (a, l);
     }
     if !super::ofd::live(ofd_id) { return -9; }
-    if cnt > 0 && ro {
+    let special = BDEVS.lock().iter().any(|e| e.in_use && e.special && e.backing == Backing::Disk(i));
+    if cnt > 0 && ro && !special {
         // Implied runtime write enable, unless the boot policy (blk.rw=) forbids it.
         match ops() {
             Some(o) => {
@@ -977,7 +986,7 @@ pub fn sysfs_dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_MAX])
     match level {
         LVL_BLOCK => {
             let b = synced();
-            let e = b.iter().filter(|e| e.in_use).nth(idx)?;
+            let e = b.iter().filter(|e| e.in_use && !e.special).nth(idx)?;
             let n = e.nlen as usize;
             out[..n].copy_from_slice(e.name());
             Some((n, true))
@@ -1043,6 +1052,8 @@ pub fn sysfs_dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_MAX])
 // ── ioctls ───────────────────────────────────────────────────────────────────
 
 // Block-layer ioctls (asm-generic, `_IO(0x12, n)`).
+/// `BLKISBOOTFAT` = `_IOR(0x12, 0xF1, int)`: 1 on the Pi boot-FAT device (MBR p1), else 0.
+const BLKISBOOTFAT: usize = 0x8004_12F1;
 const BLKROSET: usize = 0x125D;
 const BLKROGET: usize = 0x125E;
 const BLKRRPART: usize = 0x125F;
@@ -1091,6 +1102,10 @@ pub fn ioctl(pid: u32, ofd_id: u32, dev: u16, cmd: usize, arg: usize) -> isize {
         if d >= MAX_BDEV || !b[d].in_use { return -6; }
         (b[d].backing, b[d].size, b[d].lbs, b[d].ro)
     };
+    if cmd == BLKISBOOTFAT {
+        let sp = { let b = BDEVS.lock(); b[dev as usize].special };
+        return put_user(arg, sp as i32);
+    }
 
     match cmd {
         BLKGETSIZE64 => {
@@ -1407,6 +1422,7 @@ fn add_partition(dev: u16, pno: u32, start: i64, length: i64) -> isize {
         minor: base_minor + pno,
         removable,
         ro,
+        special: false,
     };
     0
 }

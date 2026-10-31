@@ -1,0 +1,10 @@
+[workspace]
+
+[package]
+name = "pitest"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side tests of espctl's picard.rs (run with: cargo +stable test --release)"
+
+[dependencies]
+sha2 = "0.10"
