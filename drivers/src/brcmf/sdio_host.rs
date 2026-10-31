@@ -722,6 +722,7 @@ mod hw {
     use core::sync::atomic::{AtomicU32, Ordering};
     use leandros_lib::mmio::{MmioRd, MmioWr};
     use spin::Mutex;
+    use crate::kenv::{mm, sched};
 
     pub const SDIO2_HOST_PHYS: u64 = 0x10_0110_0000;
     pub const SDIO2_CFG_PHYS: u64 = 0x10_0110_0400;
@@ -758,13 +759,12 @@ mod hw {
     /// Hand the initialised sdio2 host to brcmf (once). `None` if the probe failed.
     pub fn take_host() -> Option<SdioHost<Mmio>> { HOST.lock().take() }
 
-    extern "C" { fn serial_print_str_raw(s: *const u8, len: usize); }
     fn log(msg: &str) {
         let mut s = alloc::string::String::with_capacity(msg.len() + 8);
         s.push_str("[sdio] ");
         s.push_str(msg);
         s.push('\n');
-        unsafe { serial_print_str_raw(s.as_ptr(), s.len()); }
+        crate::kenv::serial_raw(&s);
     }
     macro_rules! slog { ($($a:tt)*) => { log(&alloc::format!($($a)*)) }; }
 

@@ -1,0 +1,24 @@
+[package]
+name = "kmod-brcmf"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+
+[dependencies]
+kmod-rt = { path = "../../lib/kmod-rt" }
+kmod-kapi = { path = "../../lib/kmod-kapi" }
+leandros-lib = { path = "../../lib" }
+spin = { workspace = true }
+kmod-abi = { path = "../../lib/kmod-abi" }
+netctl-abi = { path = "../../lib/netctl-abi" }
+
+[features]
+# The driver sources gate their Pi 5 hardware code on this feature; the module always carries it
+# (off the Pi 5, init returns -19 before touching anything).
+default = ["rpi5"]
+rpi5 = []

@@ -32,6 +32,7 @@ members = [
     "modules/i915",
     "modules/nvme",
     "modules/sdhci",
+    "modules/brcmf",
     "modules/macb",
     "modules/virtio-blk",
     "modules/virtio-keyboard",

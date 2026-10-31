@@ -22,6 +22,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 
+use crate::kenv::sched;
+
 use netctl_abi::{akm, reason, wifi_caps, wifi_state};
 
 use super::cfg::{self, Brcmf, Down, Env, JoinFail, JoinObserver, JoinReq, Key, Step};
@@ -88,13 +90,11 @@ pub fn note_log(line: &str) {
 
 fn log(msg: &str) {
     note_log(msg);
-    extern "C" { fn serial_print_str_raw(s: *const u8, len: usize); }
     let mut s = String::with_capacity(msg.len() + 10);
     s.push_str("[brcmf] ");
     s.push_str(msg);
     s.push('\n');
-    // SAFETY: the kernel's raw serial writer takes a pointer and length.
-    unsafe { serial_print_str_raw(s.as_ptr(), s.len()) };
+    crate::kenv::serial_raw(&s);
 }
 
 fn cmdline_val<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {

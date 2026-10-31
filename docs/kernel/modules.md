@@ -128,9 +128,12 @@ Tristate symbols and their module (all default to `y`; slot numbers in [modules/
 | `BT` | `bt` | HCI over USB (Intel), `usb_bt_*` pipes |
 | `SDHCI` | `sdhci` | SD/eMMC host, block kapi, `of:` aliases `brcm,bcm2712-sdhci` and `brcm,bcm2711-emmc2`, in BOOT; fixed 256 GiB capacity (no C_SIZE) |
 
-**Y-only (bool) drivers:** `VIRTIO_GPU`, `V3D`, `R8169`, `MACB`, `BRCMF`, `I915`, plus the platform pieces (RP1, bcm2712 blocks, PSMOUSE, I2C-HID, ...). Several already have reserved SLOTS entries (brcmf, i915, virtio_gpu, v3d, macb, r8169) but **no module crate**, so they cannot be set to `m`. The DRM class kapi (`KDrmOps`) is merged; i915 is the intended first user but first needs a `kenv` seam over its direct kernel dependencies. `VIRTIO_GPU` and `V3D` were deliberately kept `bool`.
+**Y-only (bool) drivers:** `VIRTIO_GPU`, `V3D`, `R8169`, `I915`, plus the platform pieces (RP1, bcm2712 blocks, PSMOUSE, I2C-HID, ...). Several already have reserved SLOTS entries (i915, virtio_gpu, v3d, r8169) but **no module crate**, so they cannot be set to `m`. The DRM class kapi (`KDrmOps`) is merged; i915 is the intended first user but first needs a `kenv` seam over its direct kernel dependencies. `VIRTIO_GPU` and `V3D` were deliberately kept `bool`.
 
 **`HDMI_AUDIO` (tristate, Pi 5 only):** `modules/hdmi-audio` includes `drivers/src/hdmi_audio/mod.rs` and reaches the hardware through `kenv::hdmi` (dma40 kapi, `hdmi_sink_info`, `iounmap`, `dma_sync`, `serror_checkpoint`). The built-in `kenv::hdmi` lives in `drivers/src/kenv.rs`. The boot probe (`hdmi_probe`) always stays in the kernel; `drivers::hdmi_plat` holds the OF compatible `leandros,pi5-hdmi-audio`, the built-in claimer and `announce()`. `KHdmiSink` gained a `d0` field (ABI: same size class, export fills it; NEXPORTS unchanged). The module's `PROBE_/PORT_/SINK_` literals are pinned to `hdmi_probe` by const asserts in `kernel/src/kmod/exports/dma40.rs`. The module's init returns -19 when the sink state is NOT_RUN (virt).
+
+**`BRCMF` (tristate, Pi 5 only):** `modules/brcmf` path-includes `drivers/src/brcmf/*` and `brcmf_boot.rs` over a module-side `kenv` (SDIO2 pin mux and WL_REG_ON through `kapi_pi5_pins`, which answers only to a module named `brcmf`; board MAC through `kapi_board_mac`; the quiesce hook through `kapi_pm_register2`, phase WIFI). Alias `of brcm,bcm4329-fmac`. `init` returns -19 when `kapi_soc_stepping()` reports not a BCM2712 (no pin is touched); otherwise it registers the `wifi` netif and spawns a kthread that runs `sdio_host::boot_probe` then `brcmf_boot::start`. `BRCMF` still selects `WIFI_STACK`, which rounds to y. Trial build: `printf 'CONFIG_MODULES=y\nCONFIG_BRCMF=m\n' > .config; ./scripts/build-all.sh --rpi5; rm .config`.
+
 
 ## 7. What a module cannot do, and why
 

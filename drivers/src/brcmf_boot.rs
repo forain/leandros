@@ -22,6 +22,8 @@ use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::Mutex;
 
+use crate::kenv::sched;
+
 use crate::brcmf::bcdc::Brcmf;
 use crate::brcmf::chip::Chip;
 use crate::brcmf::fw;
@@ -60,15 +62,13 @@ pub fn state() -> u32 { STATE.load(Ordering::Acquire) }
 /// The firmware's "ver" string once ready (empty before).
 pub fn version() -> String { VERSION.lock().clone() }
 
-extern "C" { fn serial_print_str_raw(s: *const u8, len: usize); }
-
 fn log(msg: &str) {
     crate::brcmf::netdev::note_log(msg);
     let mut s = String::with_capacity(msg.len() + 9);
     s.push_str("[brcmf] ");
     s.push_str(msg);
     s.push('\n');
-    unsafe { serial_print_str_raw(s.as_ptr(), s.len()); }
+    crate::kenv::serial_raw(&s);
 }
 
 /// Text of the last `[brcmf] fail ...` line (drives the automatic retry).
@@ -122,7 +122,7 @@ pub fn start(cmdline: &str) {
     STATE.store(STATE_RUNNING, Ordering::Release);
     // Read the MAC now, while the boot DTB is certainly mapped.
     // Fallback: the board OTP's Ethernet MAC + 1 (bcm2712_otp), as the Pi firmware assigns it.
-    let mac = unsafe { boot::device_tree::recorded_dtb() }.and_then(fdt_fmac_mac).map(|m| (m, "dtb"))
+    let mac = crate::kenv::dtb_blob().and_then(fdt_fmac_mac).map(|m| (m, "dtb"))
         .or_else(|| crate::kenv::pi5::wifi_mac().map(|m| (m, "otp")))
         // After a kexec the DTB is synthetic (no Wi-Fi node); the Pi firmware's
         // smsc95xx.macaddr= survives on the reused command line.
