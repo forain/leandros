@@ -18,3 +18,10 @@ Evidence: builds ok aarch64 and --rpi5; ktest=kmodkapi aarch64 PASS (fails=0).
 Pi trial (=y, over eth0 192.168.2.4): wifi0 associates WPA2 + DHCP; `[brcmf] ...` quiesce line (`brcmf: disassoc+down ... WL_REG_ON low`)
 on reboot/kexec; `[brcmf]` chip/fw/ver lines at boot as before.
 Not done (B2): the module crate, sched::wedge / boot::device_tree uses inside brcmf, init.rs cfg(drv-brcmf) split.
+
+## Pi 5 trial (2026-10-31, orchestrator)
+
+Trial 936a0e3fe3 (rpi5 defconfig, BRCMF=y through the kenv seam, merged with main at NEXPORTS=151):
+root f2fs mounted; brcmf host supplicant 4-way handshake complete, associated on channel 1,
+`connected to 'Anvara' in 184 ms`, DHCP 172.16.162.184 (wifi0). Back to good via kexec. Not promoted.
+Known, pre-existing: `[KSYNC] sleep in atomic context ... netdev.rs:670` (msleep under spin::Mutex).
