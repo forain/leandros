@@ -69,11 +69,15 @@ esp_manifest > "$WORK/esp.before"
 mdir -i "$IMG@@2M" -b ::/ >/dev/null
 mtype -i "$IMG@@2M" ::/loader/loader.conf > "$WORK/loader.conf.orig"
 RS=$(( ($(stat -f %z "$ROOT_IMG") + 1048575) / 1048576 )); HS=$(( ($(stat -f %z "$HOME_IMG") + 1048575) / 1048576 ))
-truncate -s +$((RS + HS + 600))M "$IMG"
+truncate -s +$((RS + HS + 604))M "$IMG"
 sgdisk -e "$IMG" >/dev/null
-sgdisk -n 4:0:+512M -t 4:$BOOTGUID -c 4:LeandrOS-boot -A 4:set:63 \
-       -n 5:0:+${RS}M -t 5:$ROOTGUID -c 5:LeandrOS-root -A 5:set:63 \
-       -n 6:0:+${HS}M -t 6:$HOMEGUID -c 6:LeandrOS-home -A 6:set:63 "$IMG" >/dev/null
+P3E=$(sgdisk -i 3 "$IMG" | sed -n 's/^Last sector: *\([0-9]*\).*/\1/p')
+A4=$(( (P3E + 1 + 2047) / 2048 * 2048 )); E4=$((A4 + 512 * 2048 - 1))
+A5=$(( (E4 + 1 + 2047) / 2048 * 2048 )); E5=$((A5 + RS * 2048 - 1))
+A6=$(( (E5 + 1 + 2047) / 2048 * 2048 )); E6=$((A6 + HS * 2048 - 1))
+sgdisk -n 4:$A4:$E4 -t 4:$BOOTGUID -c 4:LeandrOS-boot -A 4:set:63 \
+       -n 5:$A5:$E5 -t 5:$ROOTGUID -c 5:LeandrOS-root -A 5:set:63 \
+       -n 6:$A6:$E6 -t 6:$HOMEGUID -c 6:LeandrOS-home -A 6:set:63 "$IMG" >/dev/null
 pinfo() { sgdisk -i "$1" "$IMG" | sed -n "s/^$2: *//p" | head -1 | cut -d' ' -f1; }
 P4U=$(sgdisk -i 4 "$IMG" | sed -n 's/^Partition unique GUID: //p'); P5U=$(sgdisk -i 5 "$IMG" | sed -n 's/^Partition unique GUID: //p')
 S4=$(pinfo 4 "First sector"); S5=$(pinfo 5 "First sector"); S6=$(pinfo 6 "First sector")
@@ -102,6 +106,7 @@ mcopy -i "$P4" "$INITRD" ::/initrd.gz
 printf 'timeout: 0\nserial: yes\nverbose: yes\n\n/LeandrOS\n\tprotocol: limine\n\tpath: boot():/kernel.elf\n\tmodule_path: boot():/initrd.gz\n\tmodule_cmdline: initrd\n\tcmdline: root=PARTUUID=%s\n\tKASLR: no\n' "$(echo "$P5U" | tr A-Z a-z)" > "$WORK/p4.conf"
 mcopy -i "$P4" "$WORK/p4.conf" ::/limine.conf
 printf 'leandros-boot %s\n' "$P4U" > "$WORK/owner"; mcopy -i "$P4" "$WORK/owner" ::/leandros/owner
+mcopy -i "$P4" "${LEANDROS_REMOTE_KEY:-$HOME/.ssh/leandros_remote}.pub" ::/leandros/authorized_keys
 # The ESP: what `leandros-install repair-esp` writes, made here by the host so
 # repair-esp itself is tested separately below.
 ESP="$IMG@@2M"
