@@ -133,6 +133,17 @@ pub(crate) fn register_builtin_handlers() {
 /// It never returns: dense CPU 0 jumps to the new kernel, the rest power off.
 pub static IRQ_DIVERT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// Park this CPU for kexec from a non-IRQ context (a spin loop with IRQs
+/// masked): take the pending IPI off the GIC and run the divert target.
+pub fn divert() -> ! {
+    let iar = super::gic::ack();
+    if super::gic::irq_id(iar) != super::gic::SPURIOUS { super::gic::eoi(iar); }
+    let divert = IRQ_DIVERT.load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: only ever set from a `fn() -> !`.
+    let f: fn() -> ! = unsafe { core::mem::transmute::<usize, fn() -> !>(divert) };
+    f()
+}
+
 fn handle_irq(frame: *mut UserFrame) {
     let iar = super::gic::ack();
     let divert = IRQ_DIVERT.load(core::sync::atomic::Ordering::Acquire);

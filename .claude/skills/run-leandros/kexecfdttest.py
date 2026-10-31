@@ -114,13 +114,24 @@ def main():
     rc, out = guest(f"cp /boot/kexec /tmp/k.elf && printf '{hexb}' | dd of=/tmp/k.elf bs=1 seek={off} conv=notrunc 2>&1 | tail -n 1")
     check("patch image", rc == 0, out.strip()[-60:])
     m3 = mark()
-    rc, out = guest(f"/bin/kexec -l /tmp/k.elf --initrd=/boot/kexec-initrd --append='kexec.gen=4'; echo KRC=$?")
+    rc, out = guest(f"/bin/kexec -l /tmp/k.elf --initrd=/boot/kexec-initrd --append='kexec.gen=4 kexec.test_straggler=3'; echo KRC=$?")
     lg3 = log_from(m3)
     krc = re.search(r"KRC=(\d+)", out)
     check("gen3 kexec -l past X1 rc=0", bool(krc) and krc.group(1) == "0", out.strip()[-120:] + " ".join(re.findall(r"destination [^\n]*", lg3))[:100])
     if krc and krc.group(1) == "0":
         check("gen3 -> gen4 (patched image)", kexec_exec("kexec.gen=4") == 0)
+    # lane pikexec: gen4 kexecs with kexec.test_straggler=3 (a CPU spinning in
+    # uart::getc, IRQs masked, RX lock held). gen5 must come up with 4 CPUs.
+    if krc and krc.group(1) == "0":
+        rc, out = guest(f"{KX} --append='kexec.gen=5'")
+        check("gen4 load", rc == 0, out.strip()[-80:])
+        check("gen4 -> gen5 (straggler CPU)", kexec_exec("kexec.gen=5") == 0)
+        rc, out = guest("grep -c '^processor' /proc/cpuinfo")
+        check("gen5 has 4 CPUs online", out.split()[-1:] == ["4"], out.strip()[-40:])
     full = log_from(0)
+    check("straggler path exercised", "straggler spinning in uart::getc" in full)
+    for bad in ("never reached the park page", "never came online", "still in the old kernel"):
+        check("no '" + bad + "'", bad not in full)
     n = len(re.findall(r"\[KEXEC\] boot FDT block 0x[0-9a-fA-F]+-0x[0-9a-fA-F]+ returned to the map", full))
     check("FDT block returned in gen1..gen4", n >= 4 if not KEEP else True, f"(count {n})")
     print("RESULT:", "PASS" if not fails else "FAIL " + ", ".join(fails))
