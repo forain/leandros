@@ -151,6 +151,10 @@ fn sync_all() {
 }
 
 fn free_on(path: &str) -> u64 {
+    // Test hook: pretend the stick has this many free bytes.
+    if let Some(v) = std::env::var("LEANDROS_SHRINK_FREE_BYTES").ok().and_then(|v| v.parse().ok()) {
+        return v;
+    }
     #[cfg(target_os = "linux")]
     {
         if let Ok(c) = std::ffi::CString::new(path) {
@@ -238,6 +242,13 @@ fn open_part(dev: &str) -> Result<Part, String> {
 
 impl Part {
     fn window(&self) -> Result<(), String> {
+        // NVMe is read-only until root clears it (BLKROSET, this boot only);
+        // partition nodes must be writable before e2fsck/resize2fs open them.
+        if let Some((d, _)) = split_part(&self.dev) {
+            if d.starts_with("/dev/nvme") {
+                crate::install::enable_nvme_write(&d)?;
+            }
+        }
         set_window(&self.disk, &[(self.first, self.len)])
     }
     fn close(&self) {
@@ -569,7 +580,7 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
     // fsck -fn
     let fck = fsck_n(&dev)?;
     let triv = fck.rc == 0 || (fck.rc & !1 == 0) || trivial_fsck(&fck.text);
-    g("S10", "fsck", triv, &format!("e2fsck -fn rc {}{}", fck.rc, if triv { String::new() } else { format!(": {}", tail(&fck.text)) }));
+    g("S10", "fsck", triv, &format!("e2fsck -fn rc {}{}", fck.rc, if triv { String::new() } else { format!(": {}", fck.text.lines().filter(|l| !trivial_fsck(l)).take(6).collect::<Vec<_>>().join(" | ")) }));
     if !fails.is_empty() {
         return Err(format!("refused: {}", fails.join("; ")));
     }
@@ -624,7 +635,16 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
 
     // ---- 3. rehearsal on a metadata clone
     out.step("rehearse", 0);
+    // Opt-in (LEANDROS_SHRINK_REHEARSE=1): resize2fs ftruncates the ~48 GiB
+    // sparse clone, and that ftruncate wedges servers/f2fs for 10+ minutes
+    // (lane note dbshrinkfin); tmpfs caps files at 16 GiB. The undo files, the
+    // final e2fsck and --recover are the safety net until that is fixed.
+    let rehearse = std::env::var("LEANDROS_SHRINK_REHEARSE").map(|v| v == "1").unwrap_or(false);
     let clone = format!("{}/rehearsal.raw", dir);
+    if !rehearse {
+        out.event("{\"ev\":\"info\",\"msg\":\"rehearsal skipped\"}", "rehearsal skipped (LEANDROS_SHRINK_REHEARSE=1 enables it)");
+        out.step("rehearse", 100);
+    } else {
     let r = run("e2image", &["-r", &dev, &clone])?;
     if r.rc != 0 {
         return Err(format!("rehearsal: e2image -r failed: {}", tail(&r.text)));
@@ -642,6 +662,7 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
         return Err(format!("refused: the rehearsed filesystem is not clean: {}", tail(&c.text)));
     }
     out.step("rehearse", 100);
+    }
 
     // ---- 5a. hash files whose data has to move
     out.step("hash", 0);
