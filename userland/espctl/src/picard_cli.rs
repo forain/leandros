@@ -146,12 +146,15 @@ pub fn run(mut a: Vec<String>, dev: Option<String>) -> io::Result<()> {
         println!("{}", USAGE);
         return Ok(());
     }
+    if sub == "status" {
+        println!("boot-FAT device ({}): {}", dev, if bf { "yes" } else { "NO (writes refused)" });
+    }
     write_guard(&sub, &dev, bf)?;
     let mut f = Fat::open(Vdc::open(&dev)?)?;
     f.dry = dry;
     let sys = Real;
     let out = match sub.as_str() {
-        "status" => format!("{}\nboot-FAT device: {}", status(&mut f, &sys)?, if bf { "yes" } else { "NO (writes refused)" }),
+        "status" => status(&mut f, &sys)?,
         "setup" => {
             let ksz = opt(&mut a, "--kernel-size").and_then(|v| v.parse().ok()).unwrap_or(DEF_KERNEL);
             let isz = opt(&mut a, "--initrd-size").and_then(|v| v.parse().ok()).unwrap_or(DEF_INITRD);
