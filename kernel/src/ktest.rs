@@ -812,7 +812,7 @@ fn t_kmodkapi() -> T {
         let q = pa(0, 0);
         t.check(q != 0, "page_alloc(0, any)");
         if q != 0 { pf(q, 0); }
-        t.check(pa(11, 0) == 0, "page_alloc order 11 refused");
+        t.check(pa(mm::buddy::MAX_ORDER as u32, 0) == 0, "page_alloc order MAX_ORDER refused");
 
         // Hardware RNG registration reseeds at once.
         let owner = KmodId(60001);
