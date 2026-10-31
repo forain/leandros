@@ -2279,6 +2279,26 @@ pub fn shutdown() -> Option<String> {
     Some(format!("e1000e: interrupts masked, RX/TX off, DRV_LOAD released (CTRL_EXT {:08x})", m.r32(CTRL_EXT)))
 }
 
+/// Module unload only: give the descriptor pages and RX/TX buffer pages back to the page
+/// allocator. Call after `shutdown()` (RX/TX disabled, DMA engine stopped); the rings are
+/// dropped first so no later path can touch them. Built-in never calls it. Returns pages freed.
+#[allow(dead_code)]
+pub fn free_rings() -> usize {
+    let Some(r) = RINGS.lock().take() else { return 0 };
+    let per_page = 4096 / BUF_SIZE;
+    let mut n = 0;
+    mm::buddy::free(r.rx_desc_phys as usize, 0);
+    mm::buddy::free(r.tx_desc_phys as usize, 0);
+    n += 2;
+    for bufs in [&r.rx_buf_phys, &r.tx_buf_phys] {
+        for chunk in bufs.chunks(per_page) {
+            mm::buddy::free(chunk[0] as usize, 0);
+            n += 1;
+        }
+    }
+    n
+}
+
 /// RCTL, TCTL, IMS and RUNNING saved across a system-sleep cycle.
 static PM_SAVE: spin::Mutex<Option<(u32, u32, u32, bool)>> = spin::Mutex::new(None);
 

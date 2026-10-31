@@ -1342,8 +1342,8 @@ def main():
                     continue
                 m4_share_dirs.add(f"/lib/modules/{_id}")
                 for _f in sorted(os.listdir(_idd)):
-                    m4_share_files.append((f"/lib/modules/{_id}", _f, os.path.join(_idd, _f)))
-            break
+                    if not any(x[0] == f"/lib/modules/{_id}" and x[1] == _f for x in m4_share_files):
+                        m4_share_files.append((f"/lib/modules/{_id}", _f, os.path.join(_idd, _f)))
 
     # kexec image (lane kexecload): the direct-boot kernel ELF the in-guest
     # kexec_file_load loads, as /boot/kexec. Omitted when not built.

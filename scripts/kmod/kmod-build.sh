@@ -90,6 +90,8 @@ for v in "${variants[@]}"; do
         done
     fi
     for m in ${KMOD_AUTOLOAD:-}; do echo "$m" >> "$load"; done
+    # KMOD_TEST: testblob.sh staged kmodtest.kmod here and listed it; keep it autoloaded (kmodctltest needs it).
+    [[ "${KMOD_TEST:-}" == "1" && -f "$OUT/initrd/lib/modules/$id/kmodtest.kmod" ]] && echo kmodtest >> "$load"
     awk '!seen[$0]++' "$load" > "$load.tmp" && mv "$load.tmp" "$load"
     [[ -s "$load" ]] || rm -f "$load"
     rm -f "$OUT/alias-$v"

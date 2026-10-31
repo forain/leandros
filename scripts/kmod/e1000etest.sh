@@ -19,6 +19,7 @@ check() { if grep -aq -- "$1" "$L"; then echo "ok   $2"; else echo "FAIL $2"; fa
 nocheck() { if grep -aq -- "$1" "$L"; then echo "FAIL $2"; fail=1; else echo "ok   $2"; fi; }
 check E1KLOOP_DONE "e1000e loop finished"
 nocheck '^E1K\(UNLOAD\|LOAD\)FAIL' "e1000e x$N unload/reload clean (no Zombie / EBUSY)"
+nocheck 'exit left [0-9]* DMA pages owned' "e1000e exit leaks no DMA pages (0 per cycle)"
 nocheck 'e1000e ZOMBIE' "e1000e never Zombie"
 nocheck 'e1000e .* Zombie' "no Zombie in /proc/modules"
 python3 - "$L" <<'PY' || fail=1
