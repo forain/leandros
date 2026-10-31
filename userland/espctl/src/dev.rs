@@ -36,6 +36,8 @@ struct Block {
 struct Inner {
     file: File,
     size: u64,
+    /// Byte offset of the window in the node (0 for a whole node).
+    base: u64,
     writable: bool,
     blocks: HashMap<u64, Block>,
     ndirty: usize,
@@ -72,7 +74,17 @@ impl Dev {
         let mut file = OpenOptions::new().read(true).write(writable).open(path)?;
         let size = dev_size(&mut file)?;
         Ok(Dev {
-            inner: Rc::new(RefCell::new(Inner { file, size, writable, blocks: HashMap::new(), ndirty: 0 })),
+            inner: Rc::new(RefCell::new(Inner { file, size, base: 0, writable, blocks: HashMap::new(), ndirty: 0 })),
+            pos: 0,
+        })
+    }
+
+    /// A window of `len` bytes at byte offset `base` of a node (a partition
+    /// reached through its whole-disk node).
+    pub fn open_window(path: &str, base: u64, len: u64, writable: bool) -> io::Result<Dev> {
+        let file = OpenOptions::new().read(true).write(writable).open(path)?;
+        Ok(Dev {
+            inner: Rc::new(RefCell::new(Inner { file, size: len, base, writable, blocks: HashMap::new(), ndirty: 0 })),
             pos: 0,
         })
     }
@@ -109,7 +121,7 @@ impl Dev {
 
 impl Inner {
     fn pread(&mut self, off: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.file.seek(SeekFrom::Start(off))?;
+        self.file.seek(SeekFrom::Start(self.base + off))?;
         let mut done = 0;
         while done < buf.len() {
             let n = self.file.read(&mut buf[done..])?;
@@ -122,7 +134,7 @@ impl Inner {
     }
 
     fn pwrite(&mut self, off: u64, buf: &[u8]) -> io::Result<()> {
-        self.file.seek(SeekFrom::Start(off))?;
+        self.file.seek(SeekFrom::Start(self.base + off))?;
         self.file.write_all(buf)
     }
 

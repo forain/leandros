@@ -36,6 +36,7 @@ mod wifi;
 mod drm;
 mod gfx;
 mod plat;
+mod rp1;
 
 pub use pci::*;
 pub use irq::*;
@@ -48,6 +49,7 @@ pub use wifi::*;
 pub use drm::*;
 pub use gfx::*;
 pub use plat::*;
+pub use rp1::*;
 pub use v4l2::*;
 pub use usbfn::*;
 pub use hci::*;
@@ -179,6 +181,8 @@ const _: kmod_abi::plat::sys_plat::SerrorCheckpointFn = kapi_serror_checkpoint;
 const _: kmod_abi::plat::sys_plat::VmapFn = kapi_vmap;
 const _: kmod_abi::plat::sys_plat::VunmapFn = kapi_vunmap;
 const _: kmod_abi::plat::sys_plat::DmaQuiesceRegisterFn = kapi_dma_quiesce_register;
+const _: kmod_abi::plat::sys_plat::Rp1IrqRequestFn = kapi_rp1_irq_request;
+const _: kmod_abi::plat::sys_plat::Rp1IrqFreeFn = kapi_rp1_irq_free;
 const _: () = {
     assert!(mm::kmodwin::BASE as u64 == kmod_abi::layout::BASE);
     assert!(mm::kmodwin::SIZE as u64 == kmod_abi::layout::SIZE);
@@ -186,7 +190,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 139;
+pub const NEXPORTS: usize = 141;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -330,6 +334,8 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_vmap", kapi_vmap),
     sym!("kapi_vunmap", kapi_vunmap),
     sym!("kapi_dma_quiesce_register", kapi_dma_quiesce_register),
+    sym!("kapi_rp1_irq_request", kapi_rp1_irq_request),
+    sym!("kapi_rp1_irq_free", kapi_rp1_irq_free),
 ];
 
 extern "C" {
