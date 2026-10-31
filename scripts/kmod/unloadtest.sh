@@ -6,9 +6,10 @@ cd "$(cd "$(dirname "$0")/../.." && pwd)"
 arch="${1:-aarch64}"; N="${UNLOAD_N:-50}"
 RT=.claude/skills/run-leandros/runtests.py
 export LEANDROS_RUN_ID="unloadtest-$arch"
-M='$(ls -d /lib/modules/*/ | head -n 1)'
+M='$MD'  # guest var: the lib/modules/<id> dir whose build-id this kernel accepts (there can be several)
 load() { echo "kmodctl load ${M}$1.kmod"; }
 python3 "$RT" "$arch" ul1 --cmdline "kmod.leaktick=1" \
+  "for d in /lib/modules/*/; do if kmodctl load \${d}hello.kmod >/dev/null 2>&1; then kmodctl rmmod hello >/dev/null 2>&1; MD=\${d%/}; break; fi; done; echo MD=\$MD" \
   "for i in \$(seq 1 $N); do kmodctl load $M/hello.kmod >/dev/null 2>&1 || echo LOADFAIL \$i; kmodctl rmmod hello >/dev/null 2>&1 || echo UNLOADFAIL \$i; done; echo HELLOLOOP_DONE" \
   "kmodctl rmmod hello; echo ENOENT_RC=\$?" \
   "kmodctl load $M/kmbad_hang.kmod; kmodctl rmmod kmbad_hang; echo HANGRM_RC=\$?; kmodctl load $M/kmbad_hang.kmod; echo HANGRELOAD_RC=\$?; cat /proc/modules" \

@@ -906,6 +906,7 @@ fn kmodkapi_w2(t: &mut T) {
     use crate::kmod::{exports, registry};
     use kmod_abi::{pm_phase, sys, KPmOps, KmodId, RegKind};
     let owner = KmodId(60010);
+    let _g2 = (crate::kmod::gate::create(owner), crate::kmod::gate::create(KmodId(60011)));
     unsafe {
         // tick: a failed init must take its callback back and leave no record.
         let treg: sys::TickRegisterFn = core::mem::transmute(exports::lookup("kapi_tick_register").unwrap());
@@ -1028,6 +1029,7 @@ fn kmodkapi_l7a(t: &mut T) {
     let treg = sym!("kapi_tick_register", sys::TickRegisterFn);
     let creg = sym!("kapi_usb_class_register", sys::UsbClassRegisterFn);
     let owner = KmodId(60003);
+    let _g7 = crate::kmod::gate::create(owner);
     unsafe {
         // v4l2: bad table, then a good one that must show up (and go away again).
         t.check(vreg(owner, core::ptr::null(), 1) == -22, "v4l2_register null ops -> -22");
