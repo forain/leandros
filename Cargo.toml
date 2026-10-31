@@ -29,6 +29,7 @@ members = [
     "modules/virtio-rng",
     "modules/e1000e",
     "modules/iwlwifi",
+    "modules/i915",
     "modules/nvme",
     "modules/sdhci",
     "modules/virtio-blk",

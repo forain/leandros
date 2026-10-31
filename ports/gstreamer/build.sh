@@ -57,11 +57,12 @@ for ARCH in $ARCHS; do
     stage_alpine "$ARCH" || { echo "Alpine staging failed (see $OUT/$ARCH.alpine.log)"; exit 1; }
     grep -E '^(package|unresolved strong|sonames where|plugin not|sysroot dev)' "$OUT/$ARCH.alpine.log" || true
     T="$OUT/$ARCH"; rm -rf "$T.new"; cp -a "$OUT/$ARCH.alpine" "$T.new"
-    # the clip is arch-independent: keep one copy under data/ so a foreign-arch build has it
-    if [ -f "$T.new/usr/share/sounds/leandros/clip-mpeg4-vorbis.mkv" ]; then
-      mkdir -p "$HERE/data"; cp "$T.new/usr/share/sounds/leandros/clip-mpeg4-vorbis.mkv" "$HERE/data/"
-    elif [ -f "$HERE/data/clip-mpeg4-vorbis.mkv" ]; then
+    # the clip is arch-independent: keep one copy under data/ so a foreign-arch build has it.
+    # The tracked copy wins (re-encoding is not byte-stable, so writing it back dirties the tree).
+    if [ -f "$HERE/data/clip-mpeg4-vorbis.mkv" ]; then
       mkdir -p "$T.new/usr/share/sounds/leandros"; cp "$HERE/data/clip-mpeg4-vorbis.mkv" "$T.new/usr/share/sounds/leandros/"
+    elif [ -f "$T.new/usr/share/sounds/leandros/clip-mpeg4-vorbis.mkv" ]; then
+      mkdir -p "$HERE/data"; cp "$T.new/usr/share/sounds/leandros/clip-mpeg4-vorbis.mkv" "$HERE/data/"
     fi
     chmod -R a+rX "$T.new/usr"
     rm -rf "$T"; mv "$T.new" "$T"; touch "$T/.stamp"

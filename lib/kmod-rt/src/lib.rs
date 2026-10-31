@@ -26,6 +26,11 @@ pub const fn pci_class(class: u32, class_mask: u32) -> KmodDevId {
     KmodDevId { bus: BUS_PCI, a: 0xffff, b: 0xffff, c: 0, class, class_mask }
 }
 
+/// PCI id: one vendor (any device) restricted to a class under `class_mask`.
+pub const fn pci_vendor_class(vendor: u16, class: u32, class_mask: u32) -> KmodDevId {
+    KmodDevId { bus: BUS_PCI, a: vendor, b: 0xffff, c: 0, class, class_mask }
+}
+
 /// USB id: vid, pid (0xffff = any), class = class<<16|sub<<8|proto under class_mask.
 pub const fn usb(vid: u16, pid: u16, class: u32, class_mask: u32) -> KmodDevId {
     KmodDevId { bus: BUS_USB, a: vid, b: pid, c: 0, class, class_mask }

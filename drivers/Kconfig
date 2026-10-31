@@ -79,7 +79,7 @@ endmenu
 menu "Graphics, display and audio"
 
 config I915
-	bool "Intel i915"
+	tristate "Intel i915"
 	depends on PCI && DRM
 	default y
 
