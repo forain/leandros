@@ -1,5 +1,5 @@
 #!/bin/sh
-# deskplay guest helper: launch | kill | snap TAG | measure TAG N INTERVAL | waitplay MAXSEC | blank on|off|status
+# deskplay guest helper: prefs | launch | kill | snap TAG | measure TAG N INTERVAL | waitplay MAXSEC | blank on|off|status
 D=/tmp/dp; mkdir -p $D
 SESS="XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1"
 URL=https://www.youtube.com/watch?v=aqz-KE-bpKQ
@@ -18,6 +18,10 @@ snap() {
   for p in /proc/[0-9]*; do s=$(cat $p/stat 2>/dev/null) || continue; r=${s##*) }; set -- $r; echo "P ${p#/proc/} $(tr ' ' '_' < $p/comm) ${12} ${13}"; done
   echo "=== sysstat"; cat /proc/sysstat; } > $f.tmp 2>&1; mv $f.tmp $f; }
 case $1 in
+prefs) # a fresh (persistent /home) profile has no autoplay prefs: YouTube then waits for a click
+  for d in /home/leandro/.mozilla/firefox/*.default*; do [ -f $d/prefs.js ] || continue
+    printf 'user_pref("media.autoplay.default", 0);\nuser_pref("media.autoplay.blocking_policy", 0);\n' > $d/user.js
+    chown leandro:leandro $d/user.js 2>/dev/null; echo user.js in ${d##*/}; done;;
 launch) nohup su leandro -c "env $SESS LIBVA_MESSAGING_LEVEL=0 MOZ_AV_LOG_LEVEL=0 firefox $MARI $URL" > $D/ff.log 2>&1 < /dev/null &
         echo launched;;
 kill) for i in 1 2 3; do for p in $(ffpids); do kill -9 $p 2>/dev/null; done; sleep 2; done; echo left: $(ffpids);;
