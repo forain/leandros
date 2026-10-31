@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Install LeandrOS
+Comment=Install LeandrOS onto an internal disk
+Type=Application
+Exec=leandros-installer
+Icon=drive-harddisk-system-symbolic
+Terminal=false
+Categories=COSMIC;System;
+StartupNotify=true
+X-CosmicApplet=false

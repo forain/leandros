@@ -127,7 +127,9 @@ def build(size):
         return blocks[n]
 
     # Superblock, both copies (block 0 and block 1, at byte 1024 of each).
-    vol_uuid = uuid.uuid4().bytes
+    # LEANDROS_HOME_UUID pins the uuid (reproducible images, Rust port tests).
+    vol_uuid = (uuid.UUID(os.environ["LEANDROS_HOME_UUID"]).bytes
+                if os.environ.get("LEANDROS_HOME_UUID") else uuid.uuid4().bytes)
     for base in (0, 1):
         b = blk(base)
         s = 1024
