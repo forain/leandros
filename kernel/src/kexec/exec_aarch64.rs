@@ -261,6 +261,14 @@ fn straggler_entry() -> ! {
             let _g = LOCK.lock();
             loop { core::hint::spin_loop(); }
         }
+        if straggler_mode("rq") {
+            // Like "lock", but the held lock is a run-queue lock (spins with IRQs
+            // masked in cpuq::lock): only tlb_service_pending() reaches the park hook.
+            log("[KEXEC] test: straggler spinning on a run-queue lock held by a parked CPU\n");
+            while !RQ_HELD.load(Ordering::Acquire) { core::hint::spin_loop(); }
+            let _g = sched::cpuq::lock(RQ_IDX.load(Ordering::Relaxed));
+            loop { core::hint::spin_loop(); }
+        }
         if straggler_sleep_mode() {
             // The brcmf radio loop: a spin::Mutex held across msleep(1).
             log("[KEXEC] test: straggler looping msleep(1) holding a spin::Mutex\n");
@@ -280,9 +288,20 @@ fn straggler_entry() -> ! {
     {
         core::mem::forget(LOCK.lock());
     }
+    if straggler_mode("rq") && STRAGGLER.load(Ordering::Relaxed) != usize::MAX
+        && !RQ_TAKEN.swap(true, Ordering::AcqRel)
+    {
+        let c = me;
+        core::mem::forget(sched::cpuq::lock(c));
+        RQ_IDX.store(c, Ordering::Relaxed);
+        RQ_HELD.store(true, Ordering::Release);
+    }
     on_ipi()
 }
 
+static RQ_TAKEN: AtomicBool = AtomicBool::new(false);
+static RQ_HELD: AtomicBool = AtomicBool::new(false);
+static RQ_IDX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static LOCK: spin::Mutex<()> = spin::Mutex::new(());
 static LOCK_HELD: AtomicBool = AtomicBool::new(false);
 
@@ -305,7 +324,7 @@ pub fn stop_and_jump() -> ! {
     let strag = test_straggler().filter(|&c| c != 0 && c < arch_aarch64::smp::assigned());
     if let Some(c) = strag {
         STRAGGLER.store(c, Ordering::Release);
-        if !straggler_sleep_mode() && !straggler_mode("lock") { arch_aarch64::uart::test_leak_rx_lock(); }
+        if !straggler_sleep_mode() && !straggler_mode("lock") && !straggler_mode("rq") { arch_aarch64::uart::test_leak_rx_lock(); }
     }
     let divert: fn() -> ! = if strag.is_some() { straggler_entry } else { on_ipi };
     arch_aarch64::exception::IRQ_DIVERT.store(divert as usize, Ordering::Release);

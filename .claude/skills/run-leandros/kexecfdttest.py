@@ -140,12 +140,20 @@ def main():
     # lane pikexec5: gen6 kexecs with CPU 3 spinning (IRQs masked) on a spin::Mutex
     # that another CPU holds and parked with. It must park via spin's relax hook.
     if krc and krc.group(1) == "0":
-        rc, out = guest(f"{KX} --append='kexec.gen=7'")
+        rc, out = guest(f"{KX} --append='kexec.gen=7 kexec.test_straggler=3 kexec.test_straggler_mode=rq'")
         check("gen6 load (lock straggler)", rc == 0, out.strip()[-80:])
         check("gen6 -> gen7 (spin lock straggler)", kexec_exec("kexec.gen=7") == 0)
         rc, out = guest("grep -c '^processor' /proc/cpuinfo")
         check("gen7 has 4 CPUs online", out.split()[-1:] == ["4"], out.strip()[-40:])
         check("lock straggler path exercised", "spinning on a spin::Mutex held by a parked CPU" in log_from(0))
+        # lane pikexec7: gen7 kexecs with CPU 3 spinning (IRQs masked) on a run-queue
+        # lock another CPU holds forever; it must park via tlb_service_pending().
+        rc, out = guest(f"{KX} --append='kexec.gen=8'")
+        check("gen7 load (rq straggler)", rc == 0, out.strip()[-80:])
+        check("gen7 -> gen8 (rq lock straggler)", kexec_exec("kexec.gen=8") == 0)
+        rc, out = guest("grep -c '^processor' /proc/cpuinfo")
+        check("gen8 has 4 CPUs online", out.split()[-1:] == ["4"], out.strip()[-40:])
+        check("rq straggler path exercised", "spinning on a run-queue lock held by a parked CPU" in log_from(0))
     full = log_from(0)
     check("straggler path exercised", "straggler spinning in uart::getc" in full)
     for bad in ("never reached the park page", "never came online", "still in the old kernel"):

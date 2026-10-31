@@ -238,9 +238,10 @@ pub unsafe extern "C" fn arch_tlb_flush_local_page(va: usize) {
     core::arch::asm!("dsb nshst", "tlbi vaale1, {a}", "dsb nsh", "isb", a = in(reg) arg, options(nostack));
 }
 
-/// Nothing to service: AArch64 TLB maintenance needs no remote cooperation.
+/// No TLB work to service (broadcast TLBI), but every masked cross-CPU wait
+/// loop calls this, so it doubles as the kexec park point.
 #[no_mangle]
-pub extern "C" fn arch_tlb_service_pending() {}
+pub extern "C" fn arch_tlb_service_pending() { sched::wedge::park_check(); }
 
 /// Broadcast TLBI is complete on return: the ticket is always empty.
 #[no_mangle]
