@@ -20,3 +20,17 @@ Status: READY FOR PI TRIAL (PARTIAL until the Pi trial confirms the `[brcmf]` ch
 ## Autoload fix (kmodbrcmfb2)
 - Bug on the Pi: with BRCMF=m the `brcm,bcm4329-fmac` sdio2 `wifi@1` child was never announced (scan_dt did not see it), so no `[kmod] alias` line. Chosen fix (smaller than a generic SDIO-child scan): `drivers::platform::announce_if_in_dtb` (any-status DTB walk) called from kernel/src/init.rs just before `scan_dt`, only under `rpi5 && !drv-brcmf`; prints `[plat] announced brcm,bcm4329-fmac`. BRCMF=y and non-rpi5 builds are unchanged.
 - Evidence: `--rpi5` default and `--rpi5` MODULES=y BRCMF=m both build; the =m kernel contains the `announced brcm,bcm4329-fmac` string and brcmf.kmod. Not run: ktest=kmodkapi (QEMU image was locked by a concurrent suite) and the final target/ rebuild of the =m kernel.
+
+## Pi 5 trials 2026-10-31
+
+- efe8c2f183 (BRCMF=m): module never autoloaded. scan_dt does not announce the nested sdio2 `wifi@1` node.
+- 1b010a2d9e (announce from the boot DTB): still no autoload. After kexec the DTB is synthetic
+  (`boot/src/fdt_build.rs` writes no Wi-Fi node; `[plat] DT compatibles 9`), so `fdt_has_compat` is false.
+- bda9b38f1e (announce on every Pi 5 boot, `announce_board`): PASS. `[plat] announced brcm,bcm4329-fmac (board)`,
+  `brcmf ... Live`, wifi0 DHCP ok, root f2fs (vdb).
+- All-modules image bda9b38f1e-T1104Z (BRCMF=m MACB=m HDMI_AUDIO=m, built on lane/piallm = this branch): PASS.
+  macb and brcmf Live; `of raspberrypi,rp1-gem -> macb`, PHY BCM54213PE, eth0 stack up (no cable, so no link);
+  `alias of leandros,pi5-hdmi-audio hdmi_audio: Init(-19)` (no sink), slot freed; wifi0 DHCP ok; root f2fs.
+  pi-boot good returned to 4ad839207a. Not promoted.
+- One kexec trial→trial (B2 → all-m) hit the known aarch64 kexec straggler and reset to the card kernel; the retry
+  from the card kernel worked (see lane-pikexec5-2026-10-31.md).
