@@ -514,8 +514,13 @@ fn t_kmodwin() -> T {
     use mm::kmodwin::{self, Perm};
     let mut t = T::new("kmodwin");
     if !crate::kmod::window_ok() { t.check(false, "module window initialised"); return t; }
-    t.check(kmodwin::present_pages() == 0, "window empty at start");
-    let base = kmodwin::BASE + kmodwin::TEST_SLOT_OFF;
+    let pp0 = kmodwin::present_pages(); // autoloaded modules (KMOD_TEST builds) already hold pages: count deltas
+    // KMOD_TEST builds autoload kmodtest/kmodbad into the two top slots: step down to the first free one.
+    let mut base = kmodwin::BASE + kmodwin::TEST_SLOT_OFF;
+    for _ in 0..8 {
+        if kmodwin::reserve(base, kmodwin::SLOT_ALIGN) { kmodwin::release(base, kmodwin::SLOT_ALIGN); break; }
+        base -= kmodwin::SLOT_ALIGN;
+    }
     t.check(kmodwin::reserve(base, kmodwin::SLOT_ALIGN), "reserve test slot");
     t.check(!kmodwin::reserve(base, kmodwin::SLOT_ALIGN), "double reserve refused");
     t.check(!kmodwin::reserve(base + 1, 4096), "unaligned reserve refused");
@@ -543,9 +548,9 @@ fn t_kmodwin() -> T {
     t.check(pw & 2 != 0 && pw >> 63 == 1, "RW PTE: W set, NX set");
     #[cfg(target_arch = "aarch64")]
     t.check(pw & (1 << 7) == 0 && pw & (1 << 53) != 0 && pw & (1 << 54) != 0, "RW PTE: writable, PXN+UXN");
-    t.check(kmodwin::present_pages() == 2, "present_pages counts both");
+    t.check(kmodwin::present_pages() == pp0 + 2, "present_pages counts both");
     unsafe { kmodwin::unmap(va_rw, 2); }
-    t.check(kmodwin::present_pages() == 0, "present_pages back to 0 after unmap");
+    t.check(kmodwin::present_pages() == pp0, "present_pages back to start after unmap");
     kmodwin::release(base, kmodwin::SLOT_ALIGN);
     t.check(kmodwin::reserve(base, kmodwin::SLOT_ALIGN), "slot reusable after release");
     kmodwin::release(base, kmodwin::SLOT_ALIGN);

@@ -151,4 +151,8 @@ fn init() -> i32 {
     0
 }
 
-fn exit() { let _ = e1000e::shutdown(); }
+fn exit() {
+    let _ = e1000e::shutdown();
+    let n = e1000e::free_rings();
+    kmod_rt::kinfo!("freed {} DMA pages", n);
+}

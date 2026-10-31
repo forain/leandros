@@ -70,7 +70,7 @@ The kapi is a table of `extern "C"` functions in [kernel/src/kmod/exports/](../.
 
 ## 4. Loading
 
-**Syscalls.** `init_module(2)` and `finit_module(2)` are implemented ([kernel/src/kmod/sys.rs](../../kernel/src/kmod/sys.rs)): root only (effective uid 0), image at most 16 MiB, rejected with `EPERM` when `kmod=0`. `delete_module(2)` returns `EBUSY` always; **modules never unload** (section 7). The userland tool [kmodctl](../../userland/kmodctl/kmodctl.c) wraps them: `kmodctl list | load <path> | unload <name> | info <path>` (`unload` therefore fails by design; `info` prints a module's header).
+**Syscalls.** `init_module(2)` and `finit_module(2)` are implemented ([kernel/src/kmod/sys.rs](../../kernel/src/kmod/sys.rs)): root only (effective uid 0), image at most 16 MiB, rejected with `EPERM` when `kmod=0`. `delete_module(2)` unloads modules that have an `exit` (see "Unloading modules" below). The userland tool [kmodctl](../../userland/kmodctl/kmodctl.c) wraps them: `kmodctl list | load <path> | unload <name> | rmmod <name> | info <path>` (`info` prints a module's header).
 
 **`/proc/modules`**: one line per module, `<name> <size> <regs> - <Live|Failed|Loading> 0x<base>`, where `regs` counts its registrations.
 
@@ -140,7 +140,7 @@ Tristate symbols and their module (all default to `y`; slot numbers in [modules/
 - **Tied to one kernel build.** Build-id lock and addresses linked into the image (section 2). You cannot copy a `.kmod` from another kernel, or update the kernel and keep the old initrd.
 - **Slot limits.** A module must fit its SLOTS allocation (e.g. 8 x 256 KiB for nvme). Growing a driver may mean a new SLOTS line (check the file's "next free" comment).
 - **Only the kapi is reachable.** A driver that needs a kernel facility not in the 150 exports needs a new export, and an exported function becomes ABI the module crates compile against (`KMOD_ABI_VERSION = 1`).
-- **No unload.** `delete_module` is `EBUSY`; a module that registered a thread, IRQ or device cannot be torn down safely. A failed `init` is the only path that releases a slot. For example, with a radio present the iwlwifi radio thread pins the module, so unloading it would only ever be clean with no device.
+- **Unload only with an `exit`.** A module without one (see "Unloading modules") cannot be removed; a module that registered a thread, IRQ or device cannot be torn down safely. A failed `init` is the only path that releases a slot. For example, with a radio present the iwlwifi radio thread pins the module, so unloading it would only ever be clean with no device.
 - **Crash-time and boot-critical paths stay in the kernel.** Panic output, the persistent kernel log, kexec's device quiesce, and the console cannot depend on a loadable driver. Where such a hook is needed from a module (shutdown, suspend, kexec quiesce), it is registered through the kapi power-management table and ordered by phase.
 - **Per-driver reductions**, to keep the first versions simple:
   - `usb-storage` is a *lean* variant: no `IoWindow` (atomic-context I/O), no `usbms.*` latency knobs, no hungtask `inflight`/lock-owner reporting, no iostat counters, no background poll for not-yet-ready LUNs (it waits 3 s for ready, then declines the interface). USB root on `=m` is untested.
@@ -148,6 +148,17 @@ Tristate symbols and their module (all default to `y`; slot numbers in [modules/
   - `bt` supports the USB transport only; detach is passive (the pump sees `Gone` on its next poll and marks `/dev/hci0` dead); a probe on a device without a complete HCI interface returns `-19` and the kernel keeps the interface.
   - `virtio-net` as a module reports `rx_irq_count` as 0 in `/proc/net` (the counter reads the stub).
   - `iwlwifi` keeps a module-local copy of the Wi-Fi gk counters; `/proc/net/wifi` shows the radio from the registry plus gk lines through netif info only.
+
+## Unloading modules
+
+`rmmod <name>` or `kmodctl rmmod <name>` (root only; `delete_module(2)`). The kernel closes the module's upper gate and drains calls into it, checks for users, unbinds its devices, quiesces PCI/IRQ/hrtimer/kthread registrations, closes the lower gate, runs the module's `exit`, then frees the slot and unmaps the image. `kmodctl load` of the same file afterwards starts a fresh generation.
+
+- **EBUSY.** Returned, with the module left fully live, when something holds it: an open fd on a device node it registered (netdev, camera, input), a mounted filesystem on a block device it provides (usb_storage while mounted), or another module that depends on it. The check runs before the upper gate closes, and again after the drain to catch a race, so a busy refusal does not disturb traffic. Unload after `umount`/`close` succeeds.
+- **ENOENT / EPERM.** ENOENT for a name not loaded (or a module with no `exit`); EPERM for non-root.
+- **Zombie.** If `exit` does not return in time, or the module still holds registrations the kernel cannot revoke (fixtures `kmbad_hang`, `kmbad_leak`), it becomes `Zombie` in `/proc/modules` (`ZOMBIE:` on the console). Its slot and image are never freed, reload of that name is refused, and its gates stay closed. Only a reboot clears it.
+- **Unloadable today:** hello, virtio_rng, virtio_net, usb_hid, usb_storage, uvc, e1000e (the e1000e exit also returns its 258 DMA pages), plus the `kmbad_*` fixtures.
+- **Known gaps.** hda, virtio_keyboard and virtio_snd have no `exit` and are not unloadable. Userspace filesystems and open `/dev/sdX` fds do not pin usb_storage (only a kernel mount does). Pages a module still owns at exit are logged (`exit left N DMA pages owned`) and never freed (no IOMMU).
+- **Tests.** `scripts/kmod/unloadtest.sh <arch>` (`UPPER=1` for the upper-edge cases), `scripts/kmod/e1000etest.sh` (x86_64, x10 reload with traffic and a zero-leak check), and `scripts/kmod/kmodregress.sh <arch>`, which runs them with a `KMOD_TEST` build. Like `autoloadtest.sh` they are standalone host scripts, not part of the default all-Y regress.
 
 ## 8. Testing
 
