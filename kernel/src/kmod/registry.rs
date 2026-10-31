@@ -7,7 +7,7 @@ use kmod_abi::{KmodId, RegKind};
 use spin::Mutex;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum State { Coming, Live, Failed }
+pub enum State { Coming, Live, Failed, Going, Zombie }
 
 #[derive(Clone, Copy)]
 pub struct ModInfo {
@@ -17,6 +17,9 @@ pub struct ModInfo {
     pub size: usize,
     pub state: State,
     pub regs: u32,
+    /// Header `exit` VA (0 = none) and whether the image was built unloadable.
+    pub exit: usize,
+    pub unloadable: bool,
 }
 
 static ENTRIES: Mutex<Vec<ModInfo>> = Mutex::new(Vec::new());
@@ -26,14 +29,42 @@ static NEXT_ID: AtomicU16 = AtomicU16::new(1);
 fn name_eq(a: &[u8; 32], b: &[u8; 32]) -> bool { a == b }
 
 /// Insert a `Coming` entry. None if the name is taken or the id space is exhausted.
-pub fn add(name: [u8; 32], base: usize, size: usize) -> Option<KmodId> {
+pub fn add(name: [u8; 32], base: usize, size: usize, exit: usize, unloadable: bool) -> Option<KmodId> {
     let mut e = ENTRIES.lock();
     if e.iter().any(|m| name_eq(&m.name, &name)) { return None; }
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     if id == 0 || id == u16::MAX { return None; }
     let id = KmodId(id);
-    e.push(ModInfo { id, name, base, size, state: State::Coming, regs: 0 });
+    e.push(ModInfo { id, name, base, size, state: State::Coming, regs: 0, exit, unloadable });
     Some(id)
+}
+
+pub fn find_by_name(name: &[u8; 32]) -> Option<ModInfo> { ENTRIES.lock().iter().find(|m| name_eq(&m.name, name)).copied() }
+
+/// Atomically Live -> Going. Err(state) when the module is in any other state.
+pub fn begin_unload(id: KmodId) -> Result<(), State> {
+    let mut e = ENTRIES.lock();
+    match e.iter_mut().find(|m| m.id == id) {
+        Some(m) if m.state == State::Live => { m.state = State::Going; Ok(()) }
+        Some(m) => Err(m.state),
+        None => Err(State::Failed),
+    }
+}
+
+/// Pages (va, phys) of a loaded image, kept for the slot free.
+static PAGES: Mutex<Vec<(KmodId, Vec<(usize, usize)>)>> = Mutex::new(Vec::new());
+pub fn set_pages(id: KmodId, p: Vec<(usize, usize)>) { PAGES.lock().push((id, p)); }
+pub fn take_pages(id: KmodId) -> Vec<(usize, usize)> {
+    let mut g = PAGES.lock();
+    match g.iter().position(|x| x.0 == id) { Some(i) => g.remove(i).1, None => Vec::new() }
+}
+
+/// Drop every remaining registration record of a generation (their gates are closed for good).
+pub fn forget_regs(id: KmodId) { REGS.lock().retain(|r| r.0 != id); }
+
+/// Kinds left behind that are not gated: nothing may be freed while one exists.
+pub fn ungated_left(id: KmodId) -> usize {
+    REGS.lock().iter().filter(|r| r.0 == id && r.1 != RegKind::KTHREAD && r.1 != RegKind::TICK).count()
 }
 
 pub fn name_exists(name: &[u8; 32]) -> bool { ENTRIES.lock().iter().any(|m| name_eq(&m.name, name)) }
@@ -70,6 +101,7 @@ pub fn for_each(f: &mut dyn FnMut(&ModInfo)) {
 
 /// Record that `owner` registered `handle` of `kind` (consumer lanes call this).
 pub fn note_registration(owner: KmodId, kind: RegKind, handle: u64) {
+    let owner = super::gate::owner(owner);
     REGS.lock().push((owner, kind, handle));
 }
 
@@ -82,7 +114,11 @@ pub fn registrations(owner: KmodId, f: &mut dyn FnMut(RegKind, u64)) {
 /// path (irq, netdev, hwrng, kthread, usb class): the slot must then stay mapped.
 fn release_one(owner: KmodId, kind: RegKind, handle: u64) -> bool {
     match kind {
-        RegKind::TICK => { usb::class::tick_unregister_owner(owner); true }
+        RegKind::TICK => {
+            // kmod.leaktick=1 (test knob): leave the registration behind as a dead gated stub.
+            if super::autoload::opt("kmod.leaktick") == Some("1") { return true; }
+            usb::class::tick_unregister_owner(owner); true
+        }
         RegKind::PM => { super::exports::pm_unregister_owner(owner); true }
         RegKind::BACKLIGHT => { super::exports::backlight_unregister_owner(owner); true }
         RegKind::PLAT => { super::exports::plat_unregister_owner(owner); true }

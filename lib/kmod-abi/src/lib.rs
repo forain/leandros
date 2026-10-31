@@ -10,6 +10,7 @@ pub const EM_AARCH64: u32 = 183;
 
 pub const FLAG_SOFTFLOAT_CHECKED: u32 = 1 << 0;
 pub const FLAG_PERMANENT: u32 = 1 << 1;
+pub const FLAG_UNLOADABLE: u32 = 1 << 2;
 
 /// Module window constants. All window constants live here.
 pub mod layout {
@@ -586,6 +587,7 @@ pub mod sys {
         pub fn kapi_spin_held_count() -> u32;
         pub fn kapi_kthread_spawn(name: *const u8, name_len: usize, f: extern "C" fn(*mut u8),
                                   arg: *mut u8, owner: KmodId) -> i64;
+        pub fn kapi_kthread_should_stop() -> bool;
         pub fn kapi_ktest_ping(ctx: *const KmodCtx) -> i32;
         pub fn kapi_pci_find(vendor: u16, device: u16, index: u32, out: *mut super::KPciDev) -> i32;
         pub fn kapi_pci_cfg_read(bdf: u32, off: u16, width: u8) -> u32;

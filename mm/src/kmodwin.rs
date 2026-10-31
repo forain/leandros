@@ -129,4 +129,9 @@ pub unsafe fn unmap(va: usize, pages: usize) {
         if in_window(v) { paging::unmap_page(root, v); }
     }
     paging::tlb_flush_range(root, va, pages);
+    // x86_64: the range flush above only reaches CPUs that have the kernel root loaded; a CPU
+    // running a process root still caches the shared kernel-half window. The window PTEs are
+    // not Global (map_page never sets G), so a CR3 reload on every CPU drops them. Needed for
+    // unload-then-reload at the same VA. aarch64: broadcast TLBI, harmless and rare.
+    paging::tlb_shootdown_all();
 }

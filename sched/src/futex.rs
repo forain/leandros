@@ -463,7 +463,9 @@ fn wait_key(key: FutexKey, uaddr: usize, expected: u32, mono_deadline: Option<u6
         if !ctx.is_null() {
             // Switch back to kernel page table and then to scheduler
             arch_set_page_table(0);
+            let kg = crate::kmodgen::switch_out();
             context::cpu_switch_to(ctx, core::ptr::addr_of!(SCHEDULER_CTX[id]));
+            crate::kmodgen::switch_in(kg);
         }
 
         // ── Woken: by futex_wake, by the deadline tick, or by signal delivery.

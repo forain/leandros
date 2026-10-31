@@ -7,7 +7,7 @@ pub extern "C" fn kapi_abi_version() -> u32 { KMOD_ABI_VERSION }
 #[no_mangle]
 pub extern "C" fn kapi_log(level: u32, ptr: *const u8, len: usize) {
     let m = unsafe { bytes(ptr, len.min(512)) };
-    let o = crate::kmod::load::CUR_OWNER.load(Ordering::SeqCst);
+    let o = sched::kmodgen::get();
     let nm = if o != 0 { crate::kmod::registry::name_of(KmodId(o)) } else { [0; 32] };
     let nm = crate::kmod::name_str(&nm);
     let sep = if nm.is_empty() { "" } else { " " };
@@ -67,7 +67,9 @@ pub extern "C" fn kapi_kthread_spawn(name: *const u8, name_len: usize, f: extern
                                      arg: *mut u8, owner: KmodId) -> i64 {
     let nm = core::str::from_utf8(unsafe { bytes(name, name_len.min(24)) }).unwrap_or("kmod");
     let a = arg as usize;
-    match sched::kthread::spawn(nm, move || f(a as *mut u8)) {
+    let owner = crate::kmod::gate::owner(owner);
+    let gate = match crate::kmod::gate::get(owner) { Some(g) => g, None => return -19 };
+    match sched::kthread::spawn(nm, move || { gate.call(crate::kmod::gate::Class::Lower, || f(a as *mut u8)); }) {
         Some(t) => {
             let pid = t.pid();
             crate::kmod::registry::note_registration(owner, RegKind::KTHREAD, pid as u64);
@@ -75,6 +77,12 @@ pub extern "C" fn kapi_kthread_spawn(name: *const u8, name_len: usize, f: extern
         }
         None => -12,
     }
+}
+
+/// True when the running generation is being unloaded: kthread bodies should return.
+#[no_mangle]
+pub extern "C" fn kapi_kthread_should_stop() -> bool {
+    crate::kmod::gate::current().map_or(false, |g| g.is_stopping())
 }
 
 pub(super) static PING_COUNT: AtomicU32 = AtomicU32::new(0);

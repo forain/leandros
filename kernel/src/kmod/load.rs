@@ -10,9 +10,6 @@ use super::registry::{self, State};
 
 const PAGE: usize = 4096;
 
-/// The module whose `init` is running now (0 = none); `kapi_log` tags lines with it.
-pub static CUR_OWNER: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Source { Initrd, Syscall, Ktest }
 
@@ -91,7 +88,11 @@ pub fn load_image(img: &[u8], src: Source) -> Result<KmodId, KmodErr> {
         log(&alloc::format!("[kmod] {} Blacklisted\n", super::name_str(&hdr.name)));
         return Err(KmodErr::Blacklisted);
     }
-    if registry::name_exists(&hdr.name) {
+    if let Some(m) = registry::find_by_name(&hdr.name) {
+        if matches!(m.state, State::Zombie | State::Going) {
+            log("[kmod] refused: previous generation is a zombie / unloading\n");
+            return Err(KmodErr::SlotBusy);
+        }
         log("[kmod] refused: name already loaded\n");
         return Err(KmodErr::Exists);
     }
@@ -133,7 +134,7 @@ pub fn load_image(img: &[u8], src: Source) -> Result<KmodId, KmodErr> {
     }
     publish_code(&pages);
     // 3. register and run init on this thread.
-    let id = match registry::add(hdr.name, base, size) {
+    let id = match registry::add(hdr.name, base, size, hdr.exit as usize, hdr.flags & kmod_abi::FLAG_UNLOADABLE != 0 && hdr.exit != 0) {
         Some(i) => i,
         None => {
             for &(v, _, _) in &pages { unsafe { kmodwin::unmap(v, 1); } }
@@ -148,11 +149,14 @@ pub fn load_image(img: &[u8], src: Source) -> Result<KmodId, KmodErr> {
         _pad: 0, _pad2: 0, cmdline: cl.as_ptr(), cmdline_len: cl.len(), params: core::ptr::null(), params_len: 0,
     };
     let init: extern "C" fn(*const KmodCtx) -> i32 = unsafe { core::mem::transmute(hdr.init as usize) };
-    CUR_OWNER.store(id.0, core::sync::atomic::Ordering::SeqCst);
+    let _gate = super::gate::create(id);
+    let prev_gen = sched::kmodgen::get();
+    sched::kmodgen::set(id.0);
     let rc = init(&ctx);
-    CUR_OWNER.store(0, core::sync::atomic::Ordering::SeqCst);
+    sched::kmodgen::set(prev_gen);
     let nm = super::name_str(&hdr.name);
     if rc >= 0 {
+        registry::set_pages(id, pages.iter().map(|&(v, p, _)| (v, p)).collect());
         registry::set_state(id, State::Live);
         log(&alloc::format!("[kmod] {} loaded id {} slot {:#x} {} pages\n", nm, id.0, base, pages.len()));
         return Ok(id);
@@ -163,6 +167,7 @@ pub fn load_image(img: &[u8], src: Source) -> Result<KmodId, KmodErr> {
         free_all(&pages);
         kmodwin::release(base, size);
         registry::remove(id);
+        super::gate::remove(id);
         log(&alloc::format!("[kmod] {} init failed {}, slot freed\n", nm, rc));
     } else {
         registry::set_state(id, State::Failed);
