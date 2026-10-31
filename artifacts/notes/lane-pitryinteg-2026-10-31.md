@@ -26,3 +26,9 @@ No L1/L2 code change was needed for any of these.
 ## Pi build
 `./scripts/build-all.sh --rpi5` on a clean tree at d40e8a59: kernel-direct build tag d40e8a5940-20261031T1622Z (HEAD d40e8a59, no -dirty); CONFIG_BOARD_RPI5=y in target/kconfig-aarch64/.config. This note is committed after the build (docs only).
 espctl (with `pi`) is installed as /usr/sbin/espctl in the ROOT image, not the initrd. pi-deploy swaps only kernel+initrd, so userland needs `remote.py pi-sync` (or equivalent root update) before `pi-card` verbs work on the Pi.
+
+## pitryfix (d1b11fc5, 8b6ed13c)
+- Bug 1: `find_boot_partition` read block 0 through the f2fs-offset device, so the 0x55AA check never saw the MBR and /dev/vdc never appeared. It now reads through a raw copy (offset 0, no limit) and logs `[sdhci] boot FAT (MBR p1) not exposed: <no 55AA signature | type 0xNN | unaligned lba N len M | MBR read failed>`.
+- Bug 2: new read-only ioctl BLKISBOOTFAT (_IOR(0x12,0xF1,int) = 0x800412F1) in servers/vfs/src/block.rs returns the boot-FAT (`special`) flag. `espctl pi` verbs other than `status` (setup/stage/try/commit/abort/rollback, with or without --dry-run) refuse unless it returns 1. `status` prints the verdict first.
+- Tests: pitest 5/5 (new guard_refuses_writes_off_bootfat); QEMU aarch64 release: `/usr/sbin/espctl pi setup --dry-run --dev /dev/vdc` -> "refusing, /dev/vdc is not the boot-FAT device".
+- Pi build: `build-all.sh --rpi5` at 8b6ed13c, tag 8b6ed13c4a-20261031 (no -dirty), CONFIG_BOARD_RPI5=y, "exposed" string present. espctl: userland/espctl/target/aarch64-unknown-linux-musl/release/espctl.
