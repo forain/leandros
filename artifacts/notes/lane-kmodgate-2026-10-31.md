@@ -1,0 +1,21 @@
+# lane/kmodgate (U1), 2026-10-31
+
+Done (aarch64 QEMU, scripts/kmod/unloadtest.sh): hello load/unload x50 clean; rmmod of unloaded module -> ENOENT; kmbad_hang -> Zombie after 5 s exit timeout, reload -> EBUSY (16), /proc/modules shows Zombie; kmbad_reload under kmod.leaktick=1 never delivers a stale tick (no "STALE REACHED"), new gen ticks run.
+x86_64: see end of note.
+
+## Design as built
+- sched/src/kmodgen.rs: per-CPU `kmod_gen`, saved/zeroed/restored around the two voluntary switch sites (yield_now, futex park), like spinheld.
+- kernel/src/kmod/gate.rs: Gate (upper/lower in-flight + CLOSED bit, stopping), Class, ModFn<T> (reachable only via with()), create/get/remove/current/owner.
+- registry: State Going/Zombie, ModInfo.exit/unloadable, begin_unload, PAGES store, forget_regs, ungated_left; note_registration takes the owner from the gate (D2). CUR_OWNER removed (kapi_log uses kmodgen).
+- Gated kinds so far: TICK (Lower ModFn in tick_tramp) and KTHREAD (body runs inside Lower gate). Export kapi_kthread_should_stop added (NEXPORTS 152).
+- sys_delete_module: ENOENT / EBUSY (no exit, not Live, Going, Zombie) / EPERM (existing check) / -35 if called from inside the gate; close Upper (2 s), stopping, close Lower (5 s), exit on a "kmod-exit" kthread (5 s), release_all, any ungated registration left -> Zombie, else unmap (+ all-CPU TLB flush), free frames, release slot, remove registry+gate.
+- kmodwin::unmap now also calls tlb_shootdown_all (x86: range flush only hit CPUs with the kernel root loaded; process-root CPUs kept stale window entries). D5 Global-bit answer: map_page never sets G, so a CR3 reload suffices.
+- FLAG_UNLOADABLE (1<<2) set by kmodpost only when the crate declares `exit:` (kmod-rt `.kmod.exit` section, linker script keeps it, header offset 72 patched); otherwise FLAG_PERMANENT. kmod_rt::module! arms: `exit:` with `of:` and with `ids:`.
+- Test knob: cmdline kmod.leaktick=1 leaves TICK registrations behind after unload (dead gated stubs) so kmbad_reload can prove the generation gate.
+- kmodctl: `rmmod` alias of `unload`. Fixtures modules/kmbad-hang (slot 312), kmbad-reload (313); build with KMOD_EXTRA="hello kmbad_hang kmbad_reload".
+
+## Not done / for U2, U3
+- Early-return waits when stopping (kapi_msleep etc.), PCI quiesce (U3a), STALE fault backstop and /proc/modules gate=u/l column, Dekker-style audit of nested call counts.
+- Upper registration kinds, other Lower kinds (IRQ, hrtimer, hwrng, netdev) are NOT gated: a module that leaves one becomes Zombie (ungated_left). Add kinds by wrapping the fn in ModFn at the export and listing the kind as gated in registry::ungated_left; add a revoke in release_one.
+- Non-root -EPERM was only seen as rc=1 from su-run kmodctl (check() unchanged); autoload re-arm; kmodctltest loop mode; autoloadtest/kmodctltest not re-run in this lane.
+- unloadtest.sh is a U1 subset; U4 owns the full one.
