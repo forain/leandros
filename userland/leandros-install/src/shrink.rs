@@ -674,6 +674,7 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
         hashes.push((path.clone(), hash_path(&dev, path)?));
         out.step("hash", 20 + (k as u32 + 1) * 80 / hi.len() as u32);
     }
+    out.step("hash", 100);
     put(&format!("{}/hashes.txt", dir), &hashes.iter().map(|(p, h)| format!("{}  {}\n", h, p)).collect::<String>())?;
     out.info(&format!("{} of {} files have blocks above the new end; hashed", hi.len(), flist.len()));
 
