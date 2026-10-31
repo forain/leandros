@@ -666,7 +666,7 @@ fn kmodplat_checks(t: &mut T) {
     t.check(exports::kapi_hdmi_sink_info(&mut hs) == -22, "hdmi_sink_info size 0 -> -22");
     hs.size = core::mem::size_of::<kmod_abi::KHdmiSink>() as u32;
     t.check(exports::kapi_hdmi_sink_info(&mut hs) == 0 && hs.size == core::mem::size_of::<kmod_abi::KHdmiSink>() as u32
-        && hs.state == drivers::hdmi_audio::sink_info().0, "hdmi_sink_info fills the record");
+        && hs.state == drivers::hdmi_plat::sink_info().0, "hdmi_sink_info fills the record");
     // DMA quiesce hook: registered, name collisions refused, removed again on a failed init.
     let qo = KmodId(60021);
     let nm = b"ktest-q";

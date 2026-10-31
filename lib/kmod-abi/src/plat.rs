@@ -39,7 +39,7 @@ pub mod dma_dir { pub const CLEAN: u32 = 3; pub const INVALIDATE: u32 = 4; }
 /// `pix_khz`: measured pixel clock (0 unknown). `sink`: EDID verdict, 0 unknown, 1 HDMI, 2 DVI.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct KHdmiSink { pub size: u32, pub state: u32, pub port_flags: u32, pub pix_khz: u32, pub sink: u32 }
+pub struct KHdmiSink { pub size: u32, pub state: u32, pub port_flags: u32, pub pix_khz: u32, pub sink: u32, pub d0: u32 }
 
 pub mod sys_dma40 {
     use super::KHdmiSink;

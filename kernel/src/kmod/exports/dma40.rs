@@ -25,11 +25,11 @@ pub extern "C" fn kapi_dma40_polled() -> i32 { h::is_polled() }
 #[no_mangle]
 pub extern "C" fn kapi_hdmi_sink_info(out: *mut kmod_abi::KHdmiSink) -> i32 {
     if out.is_null() { return -22; }
-    let (st, fl, px, sk) = drivers::hdmi_audio::sink_info();
+    let (st, fl, px, sk) = drivers::hdmi_plat::sink_info();
     let want = core::mem::size_of::<kmod_abi::KHdmiSink>() as u32;
     unsafe {
         if (*out).size < want { return -22; }
-        *out = kmod_abi::KHdmiSink { size: want, state: st, port_flags: fl, pix_khz: px, sink: sk };
+        *out = kmod_abi::KHdmiSink { size: want, state: st, port_flags: fl, pix_khz: px, sink: sk, d0: drivers::hdmi_plat::is_d0() as u32 };
     }
     0
 }
