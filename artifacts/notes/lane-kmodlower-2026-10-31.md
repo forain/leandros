@@ -19,8 +19,17 @@ Built on lane/kmodgate (U1). New file kernel/src/kmod/lower.rs; edits in exports
 - Build: KMOD_TEST=1 KMOD_EXTRA="hello kmbad_hang kmbad_reload kmbad_thread kmbad_freectx virtio_rng virtio_net" ./scripts/build-all.sh --arch aarch64
 
 ## Not done
-- x86_64 not run; MSI-X path (x86) release untested. rp1 IRQ, wait/sem handles, MMIO mappings, Wi-Fi/HCI still have no free.
+- rp1 IRQ, wait/sem handles, MMIO mappings, Wi-Fi/HCI still have no free.
 
 ## Result (aarch64 QEMU, after merging main 659f5e1d)
 unloadtest.sh 21/21 ok: hello x50, virtio_rng x50, virtio_net x20 (traffic loop in guest; the guest has no `ip`, so eth0 is verified from the log: no eth1 ever, DHCP on eth0 after every reload), kmbad_thread/kmbad_freectx clean, kmbad_hang Zombie, U1 checks. autoloadtest PASS. The ping target 192.168.105.1 is a guess; the flood is best effort.
 Needs untracked `.config` (CONFIG_MODULES=y, CONFIG_VIRTIO_NET=m) for the net loop.
+
+## Final run (kmodlower3, fresh complete builds, six review fixes applied)
+Earlier failing run was invalid (image copied mid-build; ping flood never ran). unloadtest.sh now: per-worktree FFSESSION_OUT, stale-image/build-running guard, `ping -c 100000 -i 1 192.168.105.1` (integer interval).
+- aarch64: unloadtest all ok, autoloadtest PASS.
+- x86_64 (KVM-less QEMU as configured by runtests): unloadtest all ok incl. virtio_net x20 MSI-X reload path, U1 checks, eth0 DHCP after every reload.
+- Per-cycle eth0 packet deltas (rx/tx, cycle 1 absolute-ish, 20 cycles):
+  - aarch64: 10/9 7/7 11/7 9/7 7/7 7/7 7/7 7/7 7/7 7/7 8/7 7/7 7/7 7/7 7/7 7/7 7/7 8/7 7/7 7/7
+  - x86_64:  11/9 7/7 7/7 8/7 7/7 7/7 7/7 7/7 7/7 8/7 8/7 8/8 7/7 7/7 7/7 7/7 7/7 12/7 7/7 11/8
+  Both counters rise every cycle on both arches.

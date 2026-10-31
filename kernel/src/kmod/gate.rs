@@ -93,6 +93,13 @@ pub fn current() -> Option<Arc<Gate>> {
     match sched::kmodgen::get() { 0 => None, g => get(KmodId(g)) }
 }
 
+/// Running generation under the hard-IRQ rule (D10), 0 when none (or an IRQ without a gate entered here). No claimed id.
+pub fn running_owner() -> KmodId {
+    let gen = sched::kmodgen::get();
+    if gen != 0 && sched::irqctx::in_irq() && sched::kmodgen::entered_depth() != sched::irqctx::irq_depth() { return KmodId(0); }
+    KmodId(gen)
+}
+
 /// Owner for a registration: the running generation (D2), not the module-supplied id.
 pub fn owner(claimed: KmodId) -> KmodId {
     let mut gen = sched::kmodgen::get();

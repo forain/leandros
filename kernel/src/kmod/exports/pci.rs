@@ -52,7 +52,8 @@ pub extern "C" fn kapi_pci_cfg_read(bdf: u32, off: u16, width: u8) -> u32 {
 pub extern "C" fn kapi_pci_cfg_write(bdf: u32, off: u16, width: u8, val: u32) {
     let (b, d, f) = unbdf(bdf);
     if off > 0xff { return; }
-    crate::kmod::lower::note_pci(bdf);
+    // Only a write that turns on memory decode / bus mastering makes the function the module's to quiesce.
+    if off == 4 && (width == 2 || width == 4) && val & 0x6 != 0 { crate::kmod::lower::note_pci(bdf); }
     let o = off as u8;
     unsafe {
         match width {
@@ -149,7 +150,10 @@ pub extern "C" fn kapi_hwrng_register(owner: KmodId, name: *const u8, len: usize
 pub fn hwrng_release(slot: u64) -> bool {
     let i = slot as usize;
     if i >= HW_SLOTS { return false; }
-    if let Some(n) = *HW_NAME[i].lock() { sched::random::unregister_source(n); }
+    let tramp: sched::random::SourceFn = match i {
+        0 => hw_tramp::<0>, 1 => hw_tramp::<1>, 2 => hw_tramp::<2>, _ => hw_tramp::<3>,
+    };
+    sched::random::unregister_source(tramp);
     *HW_READ[i].lock() = None;
     HW_USED.fetch_and(!(1 << i), Ordering::SeqCst);
     true

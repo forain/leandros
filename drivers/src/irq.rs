@@ -478,6 +478,14 @@ impl MsixTable {
         Ok(MsixTable { func, cap, table, pba: pba_va, entries })
     }
 
+    /// Re-assert MSI-X enable, clear the function mask, INTx off, bus master on (after a quiesce).
+    pub fn reenable(&self) {
+        let ctrl = self.func.read16(self.cap + 2);
+        self.func.write16(self.cap + 2, (ctrl | 0x8000) & !0x4000);
+        self.func.set_intx_disable(true);
+        self.func.set_bus_master(true);
+    }
+
     pub fn entries(&self) -> u16 { self.entries }
     pub fn function(&self) -> PciFunction { self.func }
 
