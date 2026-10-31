@@ -45,6 +45,8 @@ pub mod sys_plat {
     pub type VmapFn = unsafe extern "C" fn(*const u64, usize, u32) -> usize;
     pub type VunmapFn = unsafe extern "C" fn(usize);
     pub type DmaQuiesceRegisterFn = unsafe extern "C" fn(KmodId, *const u8, usize, u32, KDmaQuiesceFn, usize) -> i32;
+    pub type Rp1IrqRequestFn = unsafe extern "C" fn(KmodId, u32, bool, crate::KIrqHandler, usize) -> i32;
+    pub type Rp1IrqFreeFn = unsafe extern "C" fn(KmodId, u32) -> i32;
     extern "C" {
         /// `compats`: NUL-separated compatible strings. 0 ok, -22 bad args.
         pub fn kapi_plat_register(owner: KmodId, compats: *const u8, len: usize, probe: KPlatProbeFn, ctx: usize) -> i32;
@@ -61,5 +63,8 @@ pub mod sys_plat {
         pub fn kapi_vmap(pages: *const u64, n: usize, cache: u32) -> usize;
         pub fn kapi_vunmap(va: usize);
         pub fn kapi_dma_quiesce_register(owner: KmodId, name: *const u8, len: usize, stage: u32, f: KDmaQuiesceFn, ctx: usize) -> i32;
+        /// Attach `h(ctx)` to RP1 interrupt source `n` (level = re-arm after each run). 0, -16 busy, -19 no RP1, -22, -95.
+        pub fn kapi_rp1_irq_request(owner: KmodId, n: u32, level: bool, h: crate::KIrqHandler, ctx: usize) -> i32;
+        pub fn kapi_rp1_irq_free(owner: KmodId, n: u32) -> i32;
     }
 }

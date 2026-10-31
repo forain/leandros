@@ -412,6 +412,13 @@ fn kernel_kexec() -> isize {
     let mut cfg = RebootCfg::from_cmdline();
     cfg.usb_vbus_off = false;
     cfg.hda_crst = !matches!(opt("reboot.hda_crst"), Some("0") | Some("off") | Some("no"));
+    // Bisect knob: `kexec.skip=gem,dma40,pcie-perst` drops those dma_shutdown hooks for this kexec.
+    if let Some(list) = opt("kexec.skip") {
+        for n in list.split(',').filter(|n| !n.is_empty()) {
+            let gone = drivers::dma_shutdown::remove(n);
+            serial_print_str(&alloc::format!("[kexec] kexec.skip: {} {}\n", n, if gone { "skipped" } else { "not registered" }));
+        }
+    }
     let bm = quiesce_phase1(&cfg, "kexec");
     // Reset plan while interrupts are on (ECAM pages get mapped); it also
     // decides which function keeps bus mastering (see quiesce_phase2).

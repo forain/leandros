@@ -25,6 +25,24 @@ pub fn sleep_until(deadline: u64) {
     }
 }
 
+/// Uncached (Device) MMIO mapping of a physical range.
+pub fn ioremap_uc(pa: u64, len: usize) -> Option<usize> { ::mm::kva::ioremap(pa, len, ::mm::kva::CacheMode::Uncached) }
+/// Factory Ethernet MAC of the board (Pi 5 OTP); the module build calls `kapi_board_mac`.
+pub fn board_eth_mac() -> Option<[u8; 6]> { crate::bcm2712_otp::eth_mac() }
+/// The recorded boot DTB; the module build calls `kapi_dtb_blob`.
+pub fn dtb_blob() -> Option<&'static [u8]> { unsafe { boot::device_tree::recorded_dtb() } }
+/// Attach `h` to RP1 interrupt source `n` for good (the module build calls `kapi_rp1_irq_request`).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub fn rp1_irq_request(n: u32, level: bool, h: crate::irq::IrqHandler, ctx: usize) -> bool {
+    crate::rp1::request_irq(n, level, h, ctx).map(core::mem::forget).is_ok()
+}
+#[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
+pub fn rp1_irq_request(_n: u32, _level: bool, _h: crate::irq::IrqHandler, _ctx: usize) -> bool { false }
+/// Register a kexec stop hook for a bus master (device stage); the module build calls `kapi_dma_quiesce_register`.
+pub fn dma_quiesce_register(name: &'static str, f: fn() -> bool) {
+    crate::dma_shutdown::register(name, crate::dma_shutdown::Stage::Device, f)
+}
+
 pub use crate::nvidia_probe::{cmdline_known, cmdline_opt, cmdline_word};
 
 /// Input seam: the built-in feeds the evdev server directly; the module build goes through the

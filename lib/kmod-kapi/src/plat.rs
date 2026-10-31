@@ -37,3 +37,8 @@ pub fn vunmap(va: usize) { unsafe { sys_plat::kapi_vunmap(va) } }
 pub fn dma_quiesce_register(name: &'static str, stage: u32, f: KDmaQuiesceFn, ctx: usize) -> Result<(), i32> {
     match unsafe { sys_plat::kapi_dma_quiesce_register(crate::owner(), name.as_ptr(), name.len(), stage, f, ctx) } { 0 => Ok(()), e => Err(e) }
 }
+/// Attach `h(ctx)` to RP1 interrupt source `n` (`level`: re-armed after each run). Err = -errno.
+pub fn rp1_irq_request(n: u32, level: bool, h: kmod_abi::KIrqHandler, ctx: usize) -> Result<(), i32> {
+    match unsafe { sys_plat::kapi_rp1_irq_request(crate::owner(), n, level, h, ctx) } { 0 => Ok(()), e => Err(e) }
+}
+pub fn rp1_irq_free(n: u32) { unsafe { sys_plat::kapi_rp1_irq_free(crate::owner(), n); } }

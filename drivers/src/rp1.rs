@@ -88,25 +88,51 @@ pub fn probe() {
 /// `rp1.irq=1`: deliver the GEM interrupt over MSI-X → MIP → GIC instead of
 /// polling (default polled until the MSI path is hardware-verified).
 pub static GEM_IRQ: AtomicBool = AtomicBool::new(false);
+/// `macb.attach=direct` (bisect knob): hand the GEM to macb the pre-registry way (BAR1 VA + offset,
+/// no platform registry, no second ioremap).
+pub static GEM_DIRECT: AtomicBool = AtomicBool::new(false);
 
-/// Pulses the BCM54213PE reset (RP1 GPIO 32, active low, 5 ms) and hands the
-/// GEM to `macb`, unless its clocks could not be enabled (an unclocked GEM
+/// GEM window in BAR1, the eth_cfg block right behind it, and what RP1 adds to a CPU physical
+/// address to reach RAM (pcie2 dma-ranges).
+const GEM_OFFSET: u64 = 0x10_0000;
+const GEM_SIZE: u64 = 0x4000;
+const ETH_CFG_OFFSET: u64 = 0x10_4000;
+const GEM_DMA_OFFSET: u64 = 0x10_0000_0000;
+/// RP1 interrupt source of the GEM (level).
+const GEM_IRQ_SRC: u32 = 6;
+const GEM_COMPAT: &str = "raspberrypi,rp1-gem";
+
+/// Pulses the BCM54213PE reset (RP1 GPIO 32, active low, 5 ms) and announces the GEM to the
+/// platform registry (`macb` claims it), unless its clocks could not be enabled (an unclocked GEM
 /// would stall the bus on the first register read).
-#[cfg(feature = "macb")] fn attach_gem(bar1: usize, clocks_ok: bool) {
+fn attach_gem(bar1: usize, clocks_ok: bool) {
     if !clocks_ok { log("[rp1] FAIL gem clocks off, macb not attached\n"); return; }
     if crate::rp1_gpio::reset_pulse_active_low(crate::rp1_hw::ETH_PHY_RESET_GPIO, 5) {
         log("[rp1] eth phy reset pulsed (gpio32)\n");
     }
-    let irq_wired = GEM_IRQ.load(Ordering::Relaxed)
-        && request_irq(crate::macb::RP1_GEM_IRQ, true, crate::macb::rp1_isr, 0).map(core::mem::forget).is_ok();
-    crate::macb::rp1_attach(crate::macb::Rp1Gem {
-        mmio_va: bar1 + crate::macb::RP1_GEM_OFFSET as usize,
-        dma_offset: crate::macb::RP1_DMA_OFFSET,
-        irq_wired,
-        eth_cfg_va: if BAR1_SIZE.load(Ordering::Relaxed) as u64 >= crate::macb::RP1_ETH_CFG_OFFSET + 0x20 {
-            bar1 + crate::macb::RP1_ETH_CFG_OFFSET as usize
-        } else { 0 },
-    });
+    #[cfg(feature = "macb")]
+    if GEM_DIRECT.load(Ordering::Relaxed) {
+        log("[rp1] gem attached directly (macb.attach=direct)\n");
+        let irq_wired = GEM_IRQ.load(Ordering::Relaxed)
+            && request_irq(GEM_IRQ_SRC, true, crate::macb::rp1_isr, 0).map(core::mem::forget).is_ok();
+        let size = BAR1_SIZE.load(Ordering::Relaxed);
+        crate::macb::rp1_attach(crate::macb::Rp1Gem {
+            mmio_va: bar1 + GEM_OFFSET as usize,
+            dma_offset: GEM_DMA_OFFSET,
+            irq_wired,
+            eth_cfg_va: if size >= ETH_CFG_OFFSET + 0x20 { bar1 + ETH_CFG_OFFSET as usize } else { 0 },
+        });
+        return;
+    }
+    let _ = bar1;
+    let Some((pa, size)) = crate::brcmstb_pcie::rp1_bar1() else { return };
+    #[cfg(feature = "macb")] crate::macb::register();
+    let mut d = crate::platform::PlatDev { dma_offset: GEM_DMA_OFFSET, flags: GEM_IRQ.load(Ordering::Relaxed) as u32,
+                                           nirq: 1, ..Default::default() };
+    d.regs[0] = (pa + GEM_OFFSET, GEM_SIZE);
+    d.regs[1] = (pa + ETH_CFG_OFFSET, if size >= ETH_CFG_OFFSET + 0x20 { 0x20 } else { 0 });
+    d.irqs[0] = GEM_IRQ_SRC;
+    if !crate::platform::announce(GEM_COMPAT, d) { log("[rp1] gem announced, no driver claimed it\n"); }
 }
 
 /// MIP0: every vector edge-triggered, delivered to the host, masked for the
@@ -210,5 +236,3 @@ pub fn free_irq(n: u32, h: IrqHandle) {
     USER_HANDLER[n as usize].store(0, Ordering::Release);
 }
 
-#[cfg(not(feature = "macb"))]
-fn attach_gem(_bar1: usize, _clocks_ok: bool) { log("[rp1] macb not built\n"); }
