@@ -135,8 +135,17 @@ esac
   PL=$(ls "$B"/o/lib/libext2fs.so.2.* | head -1)
   [ -f "$PL" ] || { echo "patched libext2fs not built"; exit 6; }
   nm -D "$PL" 2>/dev/null | grep -q ext2fs_open || readelf --dyn-syms "$PL" | grep -q ext2fs_open
+  # The patched lib must really differ from Alpine's stock one: an identical
+  # Build ID means the stock lib was staged (it once was, silently).
+  STOCK=$(find_lib libext2fs.so.2) || { echo "stock libext2fs not found"; exit 7; }
+  bid() { readelf -n "$1" | awk '/Build ID/ {print $3}'; }
+  if [ "$(bid "$PL")" = "$(bid "$STOCK")" ] || cmp -s "$PL" "$STOCK"; then
+    echo "FATAL: patched libext2fs has the stock Build ID $(bid "$STOCK")"; exit 7
+  fi
   cp -L "$PL" "$S/usr/lib/libext2fs.so.2"
-  echo "patched  libext2fs.so.2  <- e2fsprogs-$E2V + undo-durable.patch" >> "$S/CLOSURE.txt"
+  [ "$(bid "$S/usr/lib/libext2fs.so.2")" = "$(bid "$PL")" ] || { echo "staged lib is not the patched build"; exit 7; }
+  sed -i '/^alpine libext2fs\.so\.2 /d' "$S/CLOSURE.txt"   # superseded by the patched build below
+  echo "patched  libext2fs.so.2  <- e2fsprogs-$E2V + undo-durable.patch (Build ID $(bid "$PL"), stock $(bid "$STOCK"))" >> "$S/CLOSURE.txt"
   echo "== patched libext2fs NEEDED =="; readelf -d "$S/usr/lib/libext2fs.so.2" | grep -E 'NEEDED|SONAME'
 
   # -- ELF fix-ups (as ports/pipewire) --------------------------------------------

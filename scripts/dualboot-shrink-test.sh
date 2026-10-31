@@ -27,7 +27,7 @@ export LEANDROS_REMOTE="qemu:$RUN_ID" MTOOLS_SKIP_CHECK=1
 REMOTE="python3 $ROOT/scripts/remote.py"
 BIN="${LEANDROS_INSTALL_BIN:-$ROOT/userland/leandros-install/target/aarch64-unknown-linux-musl/release/leandros-install}"
 CRASH_PCTS="${CRASH_PCTS:-10 40 75}"
-PHASES="${PHASES:-c a b d}"   # subset, e.g. PHASES=b CRASH_PCTS=40
+PHASES="${PHASES:-f c a b d}"   # subset, e.g. PHASES=b CRASH_PCTS=40
 phase() { case " $PHASES " in *" $1 "*) return 0;; esac; echo "-- phase $1 skipped (PHASES=$PHASES)"; return 1; }
 DISK="$WORK/disk.img"; STICK="$WORK/stick.img"; QMP="$WORK/qmp.sock"
 QPID=""
@@ -108,6 +108,19 @@ mkdir -p "$WORK"; rm_images
 GPT0=$(gpt_sig "$SRC")
 "$ROOT/scripts/write-usb.sh" "$ARCH" --image "$WORK/stick.base" --gpt >"$WORK/write-usb.log" 2>&1 || { tail -5 "$WORK/write-usb.log"; fail "write-usb.sh"; }
 
+if phase f; then
+echo "== (f) e2fsck -fn x${FSCK_LOOPS:-20} on the Linux root (threaded bitmap reads, one fd)"
+fresh_disk; fresh_stick
+boot_stick fsckloop
+bad=0
+for i in $(seq 1 "${FSCK_LOOPS:-20}"); do
+    out=$(r "e2fsck -fn $P2 2>&1; echo rc=\$?" | tail -4)
+    echo "$out" | grep -q 'rc=0' || { bad=$((bad+1)); echo "$out"; }
+done
+[ "$bad" = 0 ] && ok "e2fsck -fn rc 0 x${FSCK_LOOPS:-20}" || fail "$bad of ${FSCK_LOOPS:-20} e2fsck runs not clean"
+stop_vm
+fi
+
 if phase c; then
 echo "== (c) refusal gates"
 fresh_disk; fresh_stick
@@ -117,11 +130,11 @@ f = open(sys.argv[1], "r+b"); f.seek(96454622 * 512 + 4086); f.write(b"S1SUSPEND
 PY
 GPT1=$(gpt_sig "$DISK")
 boot_stick gates
-r "$LI shrink --part $P2 --to 10G --dry-run --json; true" > "$WORK/gate-hib.log"
+r "$LI shrink --part $P2 --to 10G --dry-run --json 2>&1; true" > "$WORK/gate-hib.log"
 grep -q '"id":"S7","name":"swap","status":"fail"' "$WORK/gate-hib.log" && ok "S7 hibernated swap refused" || { tail -5 "$WORK/gate-hib.log"; fail "S7"; }
 r "$LI shrink --part $P2 --to 3G --dry-run --json; true" > "$WORK/gate-size.log"
 grep -q '"id":"S8","name":"target-size","status":"fail"' "$WORK/gate-size.log" && ok "S8 target below minimum+2GiB refused" || fail "S8"
-r "env LEANDROS_SHRINK_FREE_BYTES=1000000 $LI shrink --part $P2 --to 10G --dry-run --json; true" > "$WORK/gate-space.log"
+r "env LEANDROS_SHRINK_FREE_BYTES=1000000 $LI shrink --part $P2 --to 10G --dry-run --json 2>&1; true" > "$WORK/gate-space.log"
 grep -q '"id":"S9","name":"stick-space","status":"fail"' "$WORK/gate-space.log" && ok "S9 stick space refused" || fail "S9"
 r "$LI shrink --part $P2 --to 10G --json; true" | grep -q '"ev":"error"' && ok "no --yes: refused" || fail "no --yes accepted"
 r "cd /tmp && for v in base dirty state errors orphan mmp unknown; do rm -f g-\$v.img; mke2fs -q -t ext4 -F g-\$v.img 64M; done
@@ -145,11 +158,11 @@ if phase a; then
 echo "== (a) shrink to 10 GiB"
 fresh_disk; fresh_stick
 boot_stick shrink
-r "$LI shrink --part $P2 --to 10G --dry-run --json; true" > "$WORK/dry.log"
+r "$LI shrink --part $P2 --to 10G --dry-run --json 2>&1; true" > "$WORK/dry.log"
 grep -q '"ev":"done","dry_run":true' "$WORK/dry.log" && ok "dry run" || { tail -3 "$WORK/dry.log"; fail "dry run"; }
 grep '"ev":"shrink_info"' "$WORK/dry.log" | head -1 | cut -c1-220
 r "$LI shrink-status --json" | grep -q '"state":"none"' && ok "status none before"
-r "$LI shrink --part $P2 --to 10G --yes --json; true" > "$WORK/shrink.log"
+r "$LI shrink --part $P2 --to 10G --yes --json 2>&1; true" > "$WORK/shrink.log"
 grep -q '"ev":"done","part"' "$WORK/shrink.log" || { tail -5 "$WORK/shrink.log"; fail "shrink did not finish"; }
 for s in backup rehearse hash fsck resize verify; do grep -q "\"name\":\"$s\",\"pct\":100" "$WORK/shrink.log" || fail "step $s did not finish"; done
 ok "all steps finished; $(grep -c '"name":"resize"' "$WORK/shrink.log") resize progress events"
