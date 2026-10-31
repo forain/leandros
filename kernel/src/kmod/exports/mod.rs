@@ -36,6 +36,7 @@ mod wifi;
 mod drm;
 mod gfx;
 mod plat;
+mod pi5pins;
 
 pub use pci::*;
 pub use irq::*;
@@ -48,6 +49,7 @@ pub use wifi::*;
 pub use drm::*;
 pub use gfx::*;
 pub use plat::*;
+pub use pi5pins::*;
 pub use v4l2::*;
 pub use usbfn::*;
 pub use hci::*;
@@ -175,6 +177,7 @@ const _: kmod_abi::plat::sys_plat::PlatUnregisterFn = kapi_plat_unregister;
 const _: kmod_abi::plat::sys_plat::DtbBlobFn = kapi_dtb_blob;
 const _: kmod_abi::plat::sys_plat::BoardMacFn = kapi_board_mac;
 const _: kmod_abi::plat::sys_plat::SocSteppingFn = kapi_soc_stepping;
+const _: kmod_abi::plat::sys_plat::Pi5PinsFn = kapi_pi5_pins;
 const _: kmod_abi::plat::sys_plat::SerrorCheckpointFn = kapi_serror_checkpoint;
 const _: kmod_abi::plat::sys_plat::VmapFn = kapi_vmap;
 const _: kmod_abi::plat::sys_plat::VunmapFn = kapi_vunmap;
@@ -186,7 +189,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 139;
+pub const NEXPORTS: usize = 140;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -326,6 +329,7 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_dtb_blob", kapi_dtb_blob),
     sym!("kapi_board_mac", kapi_board_mac),
     sym!("kapi_soc_stepping", kapi_soc_stepping),
+    sym!("kapi_pi5_pins", kapi_pi5_pins),
     sym!("kapi_serror_checkpoint", kapi_serror_checkpoint),
     sym!("kapi_vmap", kapi_vmap),
     sym!("kapi_vunmap", kapi_vunmap),

@@ -771,28 +771,9 @@ mod hw {
     unsafe fn rd32(a: usize) -> u32 { (a as *const u32).mmio_read() }
     unsafe fn wr32(a: usize, v: u32) { (a as *mut u32).mmio_write(v) }
 
-    use crate::bcm2712_id::{self, Stepping};
+    use crate::kenv::pi5;
 
-    use crate::bcm2712_gpio::{self as gpio, Block, Chip, GROUP_SDIO2_WL_ON, WL_ON};
-
-    /// Mux gpio28 to GPIO and gpio30..35 to sd2 with the dts pulls, through the
-    /// shared BCM2712 pinctrl driver. Returns a short description for the log.
-    /// Writes only registers whose value changes.
-    fn pinmux(st: Stepping) -> alloc::string::String {
-        if bcm2712_id::pin_rows(st).is_none() {
-            return alloc::string::String::from("pinmux=skip(unknown stepping)");
-        }
-        let mut before = 0u32; // packed fsel nibbles of pins 30..35 as found
-        for (i, p) in (30..=35).enumerate() {
-            before |= (gpio::pin_get_fsel(Block::Main, p).unwrap_or(0) & 0xF) << (i as u32 * 4);
-        }
-        match gpio::pin_apply(Block::Main, &GROUP_SDIO2_WL_ON) {
-            Ok(w) => alloc::format!("pinmux={:?} sd2-fsel-before={:06x} writes={}", st, before, w),
-            Err(e) => alloc::format!("pinmux=fail({:?})", e),
-        }
-    }
-
-    fn wl_reg_on(on: bool) { let _ = gpio::gpio_set_output(Chip::Gio, WL_ON, on); }
+    fn wl_reg_on(on: bool) { pi5::wl_reg_on(on) }
 
     fn map(phys: u64, len: usize) -> Option<usize> { mm::kva::ioremap(phys, len, mm::kva::CacheMode::Uncached) }
 
@@ -834,12 +815,11 @@ mod hw {
             _ => None,
         });
         // WL_REG_ON and the pin mux go through the shared BCM2712 GPIO driver.
-        let Some((host, cfg)) = maps.filter(|_| gpio::gpio_is_output(Chip::Gio, WL_ON).is_ok()) else {
+        let Some((host, cfg)) = maps.filter(|_| pi5::wl_reg_on_ready()) else {
             PROBE_STATE.store(4, Ordering::Relaxed); log("FAIL stage=map"); return;
         };
         *MAPS.lock() = Some((host, cfg));
-        let st = bcm2712_id::stepping().stepping;
-        let mux = pinmux(st);
+        let mux = pi5::sdio2_pinmux();
         // Force card presence (non-removable) and select SD pin timing.
         unsafe {
             let v = rd32(cfg + SDIO_CFG_CTRL);
