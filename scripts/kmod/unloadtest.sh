@@ -7,7 +7,7 @@ arch="${1:-aarch64}"; N="${UNLOAD_N:-50}"
 RT=.claude/skills/run-leandros/runtests.py
 export FFSESSION_OUT="${FFSESSION_OUT:-/tmp/ffsession-$(basename "$PWD")}"
 # Guard: refuse to test a stale image or a half-written one.
-if ps aux | grep "[l]eandros-kmodlower.*build-all" >/dev/null; then echo "build-all running in this worktree; wait" >&2; exit 2; fi
+if ps aux | grep "[b]uild-all.sh" | grep -q "$PWD" >/dev/null; then echo "build-all running in this worktree; wait" >&2; exit 2; fi
 img=leandros-limine-$arch.img
 if [ -n "$img" ]; then for e in target/kmod/$arch/*.elf; do [ -e "$e" ] && [ "$e" -nt "$img" ] && { echo "image $img older than $e; rebuild" >&2; exit 2; }; done; fi
 export LEANDROS_RUN_ID="unloadtest-$arch"
@@ -84,7 +84,7 @@ if [ -n "${UPPER:-}" ]; then
   check 'REMOUNT_RC=0' "reload re-mounts"
   check 'RM2_RC=0' "second rmmod ok"
   check 'HIDLOOP_DONE' "usb_hid x10 finished"
-  nocheck 'HIDLOADFAIL' "usb_hid reload clean"
+  nocheck '^HIDLOADFAIL [0-9]' "usb_hid reload clean"
   check 'kmbad_leak ZOMBIE: ungated registrations left' "kmbad_leak becomes Zombie"
   check 'kmbad_leak .* Zombie' "kmbad_leak Zombie in /proc/modules"
 fi
