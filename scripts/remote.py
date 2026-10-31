@@ -17,7 +17,7 @@ Commands:
   keygen                 create ~/.ssh/leandros_remote (ed25519) if missing
   setup                  one-time steps, and a check that key login works
   discover [--subnet CIDR]  find LeandrOS sshds (russh banner) on the LAN
-  status                 kernel, uptime, cmdline, kernel slots
+  status                 kernel, uptime, cmdline (redacted), kernel slots
   run <cmd...>           run a command (exit status passed through)
   shell                  interactive shell
   push <local> <remote>  upload a file or directory, sha256-verified,
@@ -692,7 +692,7 @@ def cmd_espctl(t, a):
 # ── Logs, status ────────────────────────────────────────────────────────────
 
 STATUS_CMD = ("echo \"== uname\"; uname -a; echo \"== uptime\"; cat /proc/uptime; "
-              "echo \"== cmdline\"; cat /proc/cmdline; echo \"== espctl status\"; espctl status; "
+              "echo \"== cmdline (redacted)\"; echo \"$(wc -c < /proc/cmdline | tr -d ' ') bytes, sha256 $(sha256sum /proc/cmdline | cut -c1-8) $(tr ' ' '\\n' < /proc/cmdline | grep -E '^leandros\\.(slot|kid)=' | tr '\\n' ' ')\"; echo \"== espctl status\"; espctl status; "
               "echo \"== mounts\"; cat /proc/mounts; echo \"== meminfo\"; head -5 /proc/meminfo")
 
 
