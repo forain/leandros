@@ -381,6 +381,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-kmbad-leak"
+version = "0.1.0"
+dependencies = [
+ "kmod-kapi",
+ "kmod-rt",
+ "spin",
+]
+
+[[package]]
 name = "kmod-kmbad-reload"
 version = "0.1.0"
 dependencies = [

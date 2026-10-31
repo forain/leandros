@@ -143,7 +143,7 @@ pub fn busy_reason(id: KmodId) -> Option<&'static str> {
     let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == id).map(|r| (r.1, r.2)).collect();
     for (k, h) in recs {
         match k {
-            RegKind::V4L2 => { if crate::v4l2::open_by(id) { return Some("camera open"); } }
+            RegKind::V4L2 => { if crate::syscall::v4l2::open_by(id) { return Some("camera open"); } }
             RegKind::BLK => {
                 let mounts = vfs_server::list_mounts();
                 for p in drivers::blkdev::family_paths(h as usize) {

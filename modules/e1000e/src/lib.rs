@@ -23,6 +23,7 @@ const _: () = assert!(e1000e_hw::DEVICES.len() == 57);
 kmod_rt::module! {
     name: "e1000e",
     init: init,
+    exit: exit,
     ids: [
         kmod_rt::pci(0x8086, 0x156f),
         kmod_rt::pci(0x8086, 0x1570),
@@ -149,3 +150,5 @@ fn init() -> i32 {
     let _ = kmod_kapi::pm::register(Some(pm_suspend), Some(pm_resume), Some(pm_shutdown), 0);
     0
 }
+
+fn exit() { let _ = e1000e::shutdown(); }

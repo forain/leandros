@@ -187,6 +187,7 @@ const IDS: [kmod_abi::KmodDevId; 1] = [kmod_rt::usb(0xffff, 0xffff, 0x08_06_50, 
 kmod_rt::module! {
     name: "usb_storage",
     init: init,
+    exit: exit,
     ids: [kmod_rt::usb(0xffff, 0xffff, 0x08_06_50, 0xFF_FF_FF)],
 }
 
@@ -196,4 +197,9 @@ fn init() -> i32 {
         return e;
     }
     0
+}
+
+fn exit() {
+    let all: Vec<u64> = DISKS.lock().iter().map(|d| d.handle).collect();
+    for h in all { detach(h, 0); }
 }

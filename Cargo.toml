@@ -29,6 +29,7 @@ members = [
     "modules/kmbad-hang",
     "modules/kmbad-reload",
     "modules/kmbad-thread",
+    "modules/kmbad-leak",
     "modules/kmbad-freectx",
     "modules/virtio-rng",
     "modules/e1000e",

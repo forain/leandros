@@ -116,6 +116,7 @@ const IDS: [KmodDevId; 1] = [kmod_rt::usb(0xffff, 0xffff, 0x0E_02_00, 0xFF_FF_00
 kmod_rt::module! {
     name: "uvc",
     init: init,
+    exit: exit,
     ids: [kmod_rt::usb(0xffff, 0xffff, 0x0E_02_00, 0xFF_FF_00)],
 }
 
@@ -146,3 +147,5 @@ fn init() -> i32 {
     uvc::register_fake();
     0
 }
+
+fn exit() { uvc::detach_where(|_| true); }
