@@ -18,3 +18,9 @@ macb stays built in; the GEM now reaches the driver through the platform registr
 Evidence: builds ok aarch64 and `--rpi5` (kernel has macb::probe); ktest=kmodkapi PASS on aarch64 HVF (134 exports, 4 new rp1 cases);
 box aarch64 regress: see report. Not done: Pi hardware trial (orchestrator), ioremap of reg0/reg1 is a second Uncached mapping of the
 BAR1 sub-range (rp1's own BAR1 map stays).
+
+## Pi trial
+
+- Pi 5 boot OK: `[macb] attached ... dma offset 0x1000000000`, PHY BCM54213PE detected; no cable, so no link (link behaviour unverified).
+- kexec-out from this kernel resets the board, but the same happens on plain main since merge 95aacfa2 (bisected: 66ea4725 PASS x2, everything after FAIL). It is tracked separately as a main regression and is not caused by this lane.
+- Merge with main (gfxkapi, i915mod): NEXPORTS 141 (139 on main + kapi_rp1_irq_request/free); ktest=kmodkapi aarch64 prints "141 exports" and PASS.
