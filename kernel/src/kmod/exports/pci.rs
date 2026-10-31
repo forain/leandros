@@ -86,7 +86,7 @@ pub extern "C" fn kapi_phys_to_virt(phys: u64) -> usize { mm::phys_to_virt(phys 
 /// 2^order pages. `below` is an exclusive physical ceiling (0 = any); the block ends at or below it.
 #[no_mangle]
 pub extern "C" fn kapi_page_alloc(order: u32, below: u64) -> u64 {
-    if order > 10 { return 0; }
+    if order as usize >= mm::buddy::MAX_ORDER { return 0; }
     let r = if below == 0 { mm::buddy::alloc(order as usize) }
             else { mm::buddy::alloc_below(order as usize, below as usize) };
     r.map_or(0, |p| p as u64)
@@ -94,7 +94,7 @@ pub extern "C" fn kapi_page_alloc(order: u32, below: u64) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn kapi_page_free(phys: u64, order: u32) {
-    if phys != 0 && order <= 10 { mm::buddy::free(phys as usize, order as usize); }
+    if phys != 0 && (order as usize) < mm::buddy::MAX_ORDER { mm::buddy::free(phys as usize, order as usize); }
 }
 
 pub(super) const HW_SLOTS: usize = 4;
