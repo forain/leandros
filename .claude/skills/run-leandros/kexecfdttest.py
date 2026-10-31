@@ -123,11 +123,20 @@ def main():
     # lane pikexec: gen4 kexecs with kexec.test_straggler=3 (a CPU spinning in
     # uart::getc, IRQs masked, RX lock held). gen5 must come up with 4 CPUs.
     if krc and krc.group(1) == "0":
-        rc, out = guest(f"{KX} --append='kexec.gen=5'")
+        rc, out = guest(f"{KX} --append='kexec.gen=5 kexec.test_straggler=3 kexec.test_straggler_mode=sleep'")
         check("gen4 load", rc == 0, out.strip()[-80:])
         check("gen4 -> gen5 (straggler CPU)", kexec_exec("kexec.gen=5") == 0)
         rc, out = guest("grep -c '^processor' /proc/cpuinfo")
         check("gen5 has 4 CPUs online", out.split()[-1:] == ["4"], out.strip()[-40:])
+    # lane pikexec3: gen5 kexecs with a CPU looping msleep(1) under a spin::Mutex
+    # (the brcmf radio loop); it must still park. gen6 must have 4 CPUs.
+    if krc and krc.group(1) == "0":
+        rc, out = guest(f"{KX} --append='kexec.gen=6'")
+        check("gen5 load (sleep straggler)", rc == 0, out.strip()[-80:])
+        check("gen5 -> gen6 (msleep straggler)", kexec_exec("kexec.gen=6") == 0)
+        rc, out = guest("grep -c '^processor' /proc/cpuinfo")
+        check("gen6 has 4 CPUs online", out.split()[-1:] == ["4"], out.strip()[-40:])
+        check("sleep straggler path exercised", "looping msleep(1) holding a spin::Mutex" in log_from(0))
     full = log_from(0)
     check("straggler path exercised", "straggler spinning in uart::getc" in full)
     for bad in ("never reached the park page", "never came online", "still in the old kernel"):

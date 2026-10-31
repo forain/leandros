@@ -246,9 +246,25 @@ fn straggler_entry() -> ! {
         log("[KEXEC] test: straggler spinning in uart::getc with IRQs masked\n");
         // From now on a divert is the normal park.
         arch_aarch64::exception::IRQ_DIVERT.store(on_ipi as fn() -> ! as usize, Ordering::Release);
+        if straggler_sleep_mode() {
+            // The brcmf radio loop: a spin::Mutex held across msleep(1).
+            log("[KEXEC] test: straggler looping msleep(1) holding a spin::Mutex\n");
+            static M: spin::Mutex<()> = spin::Mutex::new(());
+            let _g = M.lock();
+            // Also a KSpinLock-style depth, so sleep_until takes its pure busy-wait branch.
+            sched::irqctx::atomic_inc();
+            log("[KEXEC] test: msleep context: ");
+            log(sched::irqctx::sleep_forbidden_reason().unwrap_or("may sleep"));
+            log("\n");
+            loop { sched::kthread::msleep(1); }
+        }
         loop { let _ = unsafe { arch_aarch64::uart::getc() }; core::hint::spin_loop(); }
     }
     on_ipi()
+}
+
+fn straggler_sleep_mode() -> bool {
+    crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "kexec.test_straggler_mode=sleep"))
 }
 
 fn test_straggler() -> Option<usize> {
@@ -263,7 +279,7 @@ pub fn stop_and_jump() -> ! {
     let strag = test_straggler().filter(|&c| c != 0 && c < arch_aarch64::smp::assigned());
     if let Some(c) = strag {
         STRAGGLER.store(c, Ordering::Release);
-        arch_aarch64::uart::test_leak_rx_lock();
+        if !straggler_sleep_mode() { arch_aarch64::uart::test_leak_rx_lock(); }
     }
     let divert: fn() -> ! = if strag.is_some() { straggler_entry } else { on_ipi };
     arch_aarch64::exception::IRQ_DIVERT.store(divert as usize, Ordering::Release);
