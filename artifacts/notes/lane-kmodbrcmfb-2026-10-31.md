@@ -11,4 +11,8 @@ Status: READY FOR PI TRIAL (PARTIAL until the Pi trial confirms the `[brcmf]` ch
 - Pi expectations: `[kmod] alias of brcm,bcm4329-fmac brcmf` then `[sdio]` and `[brcmf]` chip/fw/clm/ver lines; wifi0 joins about 350 ms later than =y (WL_ON cycle after BT start). Do not run the trial over wifi0 (use eth0 192.168.2.4, macb=y).
 
 ## Evidence
-(filled in below)
+- `--rpi5` default (BRCMF=y) builds. `--rpi5` with CONFIG_MODULES=y CONFIG_BRCMF=m: brcmf.kmod links (slot 0xfffffe0002000000+0x800000), kmodcheck + bidcheck pass on both arches, modules.alias has `of brcm,bcm4329-fmac brcmf`; target/kconfig-aarch64/.config has BOARD_RPI5=y, SDHCI=y, WIFI_STACK=y, BRCMF=m.
+- Plain aarch64 virt, MODULES=y BRCMF=m, `kmodctl load /lib/modules/<bid>/brcmf.kmod`: `[kmod] brcmf init failed -19, slot freed` (no pin touched).
+- ktest=kmodkapi aarch64 PASS (0 fail).
+- Box regress lane/kmodbrcmfb aarch64 (efe8c2f1): overall PASS, 844 s; `--gc` run.
+- target/ holds the `--rpi5` MODULES=y BRCMF=m build (root .config removed).
