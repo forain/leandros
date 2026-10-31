@@ -137,6 +137,9 @@ pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
 /// Nothing is ever unplugged on this build (see `remove_disk`).
 pub fn removed_generation() -> usize { 0 }
 
+/// `blk.rw=` policy: the SD facade has no per-disk write policy (boot FAT is read-only by construction).
+pub fn set_rw_list(_cmdline: &str) {}
+
 /// Flush every SD device before reboot/poweroff: `(ok, failed)`.
 pub fn flush_all_disks() -> (usize, usize) {
     let (mut ok, mut bad) = (0, 0);
