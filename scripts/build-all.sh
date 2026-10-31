@@ -3,6 +3,10 @@
 # Builds userland, kernel, and generates disk images
 
 set -e  # Exit on any error
+# Make a failed build unmistakable. The script itself exits non-zero on a
+# failed kernel compile (set -e), but callers that pipe it (`build-all.sh | tail`,
+# `| tee`) see the pipe's last status; use `set -o pipefail` or PIPESTATUS there.
+trap 'rc=$?; [[ $rc -ne 0 ]] && echo "build-all.sh: FAILED (exit $rc)" >&2' EXIT
 # macOS: pick an SDK whose libSystem the linker can read (see darwin-sdk.sh).
 source "$(dirname "${BASH_SOURCE[0]}")/darwin-sdk.sh"
 
