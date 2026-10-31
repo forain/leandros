@@ -1,0 +1,17 @@
+[package]
+name = "kmod-macb"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+
+[dependencies]
+kmod-rt = { path = "../../lib/kmod-rt" }
+kmod-kapi = { path = "../../lib/kmod-kapi" }
+leandros-lib = { path = "../../lib" }
+spin = { workspace = true }
+kmod-abi = { path = "../../lib/kmod-abi" }

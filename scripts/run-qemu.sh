@@ -185,6 +185,8 @@ SND_MODEL=""
 RESET_HOME="${LEANDROS_RESET_HOME:-}"
 [ "$RESET_HOME" = 1 ] || RESET_HOME=""
 SCRATCH_HOME=""
+INSTALL_TARGET=""
+BOOT_DISK=""
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         x86_64|aarch64) ARCH="$1"; shift ;;
@@ -197,6 +199,13 @@ while [[ "$#" -gt 0 ]]; do
         --usb-stick) USB_STICK="mbr"; shift ;;
         --usb-stick=mbr|--usb-stick=gpt) USB_STICK="${1#--usb-stick=}"; shift ;;
         --usb-stick=*) echo "❌ --usb-stick takes mbr or gpt (got '${1#--usb-stick=}')"; exit 1 ;;
+        # --install-target=<img>[,nvme|virtio]: a blank (sparse 24 GiB when
+        # missing) install target, never boot-indexed. --boot-disk=<img>[,bus]:
+        # boot UEFI from that disk (bootindex=0) with a fresh vars file; the
+        # virtio data disks are dropped, and with --usb-stick the stick is
+        # attached too, but not as the boot device. See "Installer disks".
+        --install-target=*) INSTALL_TARGET="${1#--install-target=}"; shift ;;
+        --boot-disk=*) BOOT_DISK="${1#--boot-disk=}"; shift ;;
         --usb-input) USB_INPUT="kbd,mouse"; shift ;;
         --usb-input=*) USB_INPUT="${1#--usb-input=}"; shift ;;
         --no-i8042) NO_I8042=1; shift ;;
@@ -819,10 +828,40 @@ if [ -n "$USB_STICK" ]; then
     fi
     # qemu-xhci is a PCI device, so it works unchanged on both q35 and virt.
     # bootindex=0 makes the firmware try the stick first (it is the only disk).
+    _stick_boot=",bootindex=0"
+    [ -n "$BOOT_DISK" ] && _stick_boot=""
     USB_ARGS=(-device qemu-xhci,id=xhci
               -drive if=none,id=stick,format=raw,file="$USB_IMG"
-              -device usb-storage,bus=xhci.0,drive=stick,bootindex=0)
+              -device usb-storage,bus=xhci.0,drive=stick$_stick_boot)
     echo "🔌 USB stick: $USB_IMG ($USB_STICK) on xHCI — no virtio-blk disks"
+fi
+
+# ── Installer disks (--install-target, --boot-disk) ─────────────────────────
+# "img[,nvme|virtio]" (default virtio). The target is a blank sparse image the
+# installer (scripts/installer-test.sh) writes; the boot disk is that image
+# booted alone through UEFI.
+disk_spec_args() { # <img> <id> <bus> <bootindex-suffix>; prints one arg per line
+    case "$3" in
+        nvme) printf '%s\n' -drive "if=none,id=$2,format=raw,file=$1" -device "nvme,drive=$2,serial=leandros$2$4" ;;
+        virtio) printf '%s\n' -drive "if=none,id=$2,format=raw,file=$1" -device "virtio-blk-pci,drive=$2$4" ;;
+        *) echo "❌ disk bus must be nvme or virtio (got '$3')" >&2; exit 1 ;;
+    esac
+}
+INSTALL_ARGS=()
+BOOTDISK_ARGS=()
+if [ -n "$INSTALL_TARGET" ]; then
+    _img="${INSTALL_TARGET%%,*}"; _bus=virtio
+    [[ "$INSTALL_TARGET" == *,* ]] && _bus="${INSTALL_TARGET#*,}"
+    [ -f "$_img" ] || dd if=/dev/zero of="$_img" bs=1 count=0 seek=$((24 * 1024 * 1024 * 1024)) 2>/dev/null
+    while IFS= read -r _l; do INSTALL_ARGS+=("$_l"); done < <(disk_spec_args "$_img" tgt "$_bus" "")
+    echo "💿 install target: $_img ($_bus)"
+fi
+if [ -n "$BOOT_DISK" ]; then
+    _img="${BOOT_DISK%%,*}"; _bus=virtio
+    [[ "$BOOT_DISK" == *,* ]] && _bus="${BOOT_DISK#*,}"
+    [ -f "$_img" ] || { echo "❌ --boot-disk: no such image: $_img"; exit 1; }
+    while IFS= read -r _l; do BOOTDISK_ARGS+=("$_l"); done < <(disk_spec_args "$_img" bootdisk "$_bus" ",bootindex=0")
+    echo "💿 boot disk: $_img ($_bus), fresh UEFI vars"
 fi
 
 # ── Input devices (--usb-input) ─────────────────────────────────────────────
@@ -917,6 +956,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
 
     if [ "$ARCH" = "aarch64" ]; then
         VARS_FILE="aarch64_vars.fd"
+        if [ -n "$BOOT_DISK" ]; then VARS_FILE="aarch64_vars.bootdisk.fd"; rm -f "$VARS_FILE"; fi
         if [ ! -f "$VARS_FILE" ]; then
             # Copy the host's VARS template; fall back to a blank 64 MB region
             # (edk2 will initialise it on first boot).
@@ -943,6 +983,8 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
                    -device virtio-blk-pci,drive=data1,disable-legacy=on)
         # --usb-stick: the stick is the only disk (see "USB stick" above).
         if [ -n "$USB_STICK" ]; then DISK_ARGS=("${USB_ARGS[@]}"); fi
+        if [ -n "$BOOT_DISK" ]; then DISK_ARGS=("${BOOTDISK_ARGS[@]}" "${USB_ARGS[@]}"); fi
+        DISK_ARGS+=("${INSTALL_ARGS[@]}")
         QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m ${LEANDROS_QEMU_MEM:-4G} -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             -drive if=pflash,unit=1,format=raw,file="$VARS_FILE" \
@@ -961,6 +1003,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
         X86_VARS_ARGS=()
         if [[ "$(basename "$UEFI_FIRMWARE")" == *CODE* ]] && [ -n "$VARS_TEMPLATE" ]; then
             X86_VARS_FILE="x86_64_vars.fd"
+            if [ -n "$BOOT_DISK" ]; then X86_VARS_FILE="x86_64_vars.bootdisk.fd"; rm -f "$X86_VARS_FILE"; fi
             if [ ! -f "$X86_VARS_FILE" ]; then cp "$VARS_TEMPLATE" "$X86_VARS_FILE"; fi
             X86_VARS_ARGS=(-drive "if=pflash,unit=1,format=raw,file=$X86_VARS_FILE")
         fi
@@ -972,6 +1015,8 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
                    -device virtio-blk-pci,drive=data1)
         # --usb-stick: the stick is the only disk (see "USB stick" above).
         if [ -n "$USB_STICK" ]; then DISK_ARGS=("${USB_ARGS[@]}"); fi
+        if [ -n "$BOOT_DISK" ]; then DISK_ARGS=("${BOOTDISK_ARGS[@]}" "${USB_ARGS[@]}"); fi
+        DISK_ARGS+=("${INSTALL_ARGS[@]}")
         QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m ${LEANDROS_QEMU_MEM:-4G} -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             "${X86_VARS_ARGS[@]}" \

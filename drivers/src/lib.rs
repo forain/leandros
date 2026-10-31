@@ -176,6 +176,7 @@ pub mod bcm2712_otp;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod hdmi_probe;
 pub mod hdmi_audio;
+pub mod hdmi_plat;
 /// Pi 5 Wi-Fi boot bring-up: sdio2 host → firmware → "ver" (rpi5 only).
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 #[cfg(feature = "brcmf")] pub mod brcmf_boot;

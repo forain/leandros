@@ -3,7 +3,7 @@
 
 extern crate leandros_libc;
 
-use leandros_libc::{write, open, read, close, O_RDONLY, STDOUT_FILENO};
+use leandros_libc::{write, open, read, close, ioctl, lseek, O_RDONLY, O_RDWR, STDOUT_FILENO};
 use leandros_libc::devinfo;
 
 unsafe fn out(s: &[u8]) {
@@ -70,8 +70,62 @@ unsafe fn mountpoint_for(device_bytes: &[u8]) -> ([u8; 32], usize) {
     ([0u8; 32], 0)
 }
 
+unsafe fn out_num(mut v: i64) {
+    let mut b = [0u8; 24];
+    let neg = v < 0;
+    if neg { v = -v; }
+    let mut i = b.len();
+    loop { i -= 1; b[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+    if neg { i -= 1; b[i] = b'-'; }
+    out(&b[i..]);
+}
+
+unsafe fn cstr_len(p: *const u8) -> usize {
+    let mut n = 0;
+    while *p.add(n) != 0 { n += 1; }
+    n
+}
+
+/// `lsblk --setrw <dev>`: BLKROSET(0) on a whole disk (root only; the kernel
+/// answers EACCES otherwise). `lsblk --wtest <dev>` then writes a 4 KiB
+/// pattern at offset 0 and reads it back (DESTROYS the first 4 KiB).
+unsafe fn setrw_cmd(argv: *const *const u8) -> i32 {
+    let dev = *argv.add(2);
+    let fd = open(dev, O_RDONLY, 0);
+    if fd < 0 { out(b"setrw: open failed\n"); return 1; }
+    let zero: i32 = 0;
+    let r = ioctl(fd, 0x125D, &zero as *const i32 as usize);
+    close(fd);
+    out(b"BLKROSET(0) = ");
+    out_num(r as i64);
+    out(b"\n");
+    if r < 0 { 1 } else { 0 }
+}
+
+unsafe fn wtest_cmd(argv: *const *const u8) -> i32 {
+    let dev = *argv.add(2);
+    let fd = open(dev, O_RDWR, 0);
+    if fd < 0 { out(b"wtest: open failed\n"); return 1; }
+    let wbuf = [0xA5u8; 4096];
+    let mut rbuf = [0u8; 4096];
+    lseek(fd, 0, 0);
+    let w = write(fd, wbuf.as_ptr(), wbuf.len());
+    out(b"write = "); out_num(w as i64); out(b"\n");
+    if w != 4096 { close(fd); return 1; }
+    lseek(fd, 0, 0);
+    let r = read(fd, rbuf.as_mut_ptr(), rbuf.len());
+    close(fd);
+    out(b"read = "); out_num(r as i64); out(b"\n");
+    if r == 4096 && rbuf == wbuf { out(b"WTEST OK\n"); 0 } else { out(b"WTEST MISMATCH\n"); 1 }
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
+pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
+    if argc >= 3 {
+        let a = core::slice::from_raw_parts(*argv.add(1), cstr_len(*argv.add(1)));
+        if a == b"--setrw" { return setrw_cmd(argv); }
+        if a == b"--wtest" { return wtest_cmd(argv); }
+    }
     out_padded(b"NAME", 16);
     out_padded(b"SIZE", 8);
     out_padded(b"RO", 3);

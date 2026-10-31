@@ -304,6 +304,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-hdmi-audio"
+version = "0.1.0"
+dependencies = [
+ "kmod-abi",
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
+]
+
+[[package]]
 name = "kmod-hello"
 version = "0.1.0"
 dependencies = [
@@ -337,6 +348,17 @@ name = "kmod-kapi"
 version = "0.1.0"
 dependencies = [
  "kmod-abi",
+]
+
+[[package]]
+name = "kmod-macb"
+version = "0.1.0"
+dependencies = [
+ "kmod-abi",
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
 ]
 
 [[package]]

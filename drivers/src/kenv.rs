@@ -25,6 +25,24 @@ pub fn sleep_until(deadline: u64) {
     }
 }
 
+/// Uncached (Device) MMIO mapping of a physical range.
+pub fn ioremap_uc(pa: u64, len: usize) -> Option<usize> { ::mm::kva::ioremap(pa, len, ::mm::kva::CacheMode::Uncached) }
+/// Factory Ethernet MAC of the board (Pi 5 OTP); the module build calls `kapi_board_mac`.
+pub fn board_eth_mac() -> Option<[u8; 6]> { crate::bcm2712_otp::eth_mac() }
+/// The recorded boot DTB; the module build calls `kapi_dtb_blob`.
+pub fn dtb_blob() -> Option<&'static [u8]> { unsafe { boot::device_tree::recorded_dtb() } }
+/// Attach `h` to RP1 interrupt source `n` for good (the module build calls `kapi_rp1_irq_request`).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub fn rp1_irq_request(n: u32, level: bool, h: crate::irq::IrqHandler, ctx: usize) -> bool {
+    crate::rp1::request_irq(n, level, h, ctx).map(core::mem::forget).is_ok()
+}
+#[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
+pub fn rp1_irq_request(_n: u32, _level: bool, _h: crate::irq::IrqHandler, _ctx: usize) -> bool { false }
+/// Register a kexec stop hook for a bus master (device stage); the module build calls `kapi_dma_quiesce_register`.
+pub fn dma_quiesce_register(name: &'static str, f: fn() -> bool) {
+    crate::dma_shutdown::register(name, crate::dma_shutdown::Stage::Device, f)
+}
+
 pub use crate::nvidia_probe::{cmdline_known, cmdline_opt, cmdline_word};
 
 /// Input seam: the built-in feeds the evdev server directly; the module build goes through the
@@ -124,4 +142,32 @@ pub mod pm {
     pub fn shutdown_hooks(phase: u32) -> Vec<ShutdownFn> {
         HOOKS.lock().iter().filter(|e| e.1 == phase).map(|e| e.2).collect()
     }
+}
+
+/// What the HDMI audio hardware code (`hdmi_audio::hw`) needs from the kernel; the module build
+/// (modules/hdmi-audio) supplies the same names over the kapi exports.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "hdmi-audio"))]
+pub mod hdmi {
+    pub use crate::bcm2712_dma40 as dma;
+    pub use crate::bcm2712_dma40::dcache_clean_inval;
+    pub use crate::hdmi_probe::decode::acr_n_cts;
+    pub use crate::hdmi_probe::{PORT_ACTIVE, PORT_HDMI_MODE, PORT_HPD, PORT_VALID, PROBE_DONE, PROBE_NOT_RUN, PROBE_SKIPPED, SINK_DVI, SINK_HDMI};
+    pub use crate::pci::serial_debug;
+    pub use ::mm::{buddy, phys_to_virt};
+    pub const TX_BUF_BYTES: usize = crate::snd::TX_BUF_BYTES;
+
+    /// Boot-probe facts for hdmi0 plus the SoC stepping.
+    pub struct Sink { pub state: u32, pub flags: u32, pub pix_khz: u32, pub sink: u32, pub d0: bool }
+    pub fn sink() -> Sink {
+        let (state, flags, pix_khz, sink) = crate::hdmi_plat::sink_info();
+        Sink { state, flags, pix_khz, sink, d0: crate::hdmi_plat::is_d0() }
+    }
+    pub fn monotonic_ns() -> u64 { ::sched::monotonic_ns() }
+    /// Uncached device mapping; 0 on failure.
+    pub fn ioremap_uc(phys: u64, len: usize) -> usize {
+        ::mm::kva::ioremap(phys, len, ::mm::kva::CacheMode::Uncached).unwrap_or(0)
+    }
+    pub fn iounmap(va: usize, _len: usize) { let _ = ::mm::kva::iounmap(va); }
+    /// Fallback SError checkpoint when the boot has not installed one.
+    pub fn serror() -> Option<u64> { None }
 }

@@ -1,0 +1,29 @@
+[workspace]
+
+[package]
+name = "leandros-install"
+version = "0.1.0"
+edition = "2021"
+description = "LeandrOS installer: writes the ESP, root and a fresh seeded home volume"
+
+# Standalone std/musl crate like userland/espctl.
+[lib]
+name = "leandros_install"
+path = "src/lib.rs"
+
+[[bin]]
+name = "leandros-install"
+path = "src/main.rs"
+
+[dependencies]
+fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
+sha2 = "0.10"
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+
+[patch.crates-io]
+# The same fatfs with the "."/".." LFN fix that espctl uses.
+fatfs = { path = "../espctl/vendor/fatfs" }

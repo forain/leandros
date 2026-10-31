@@ -582,7 +582,9 @@ fn kmodplat_checks(t: &mut T) {
     use drivers::platform::{self, PlatDev};
     use kmod_abi::{KmodId, RegKind};
     for n in ["kapi_plat_register", "kapi_plat_unregister", "kapi_dtb_blob", "kapi_board_mac", "kapi_soc_stepping",
-              "kapi_serror_checkpoint", "kapi_vmap", "kapi_vunmap", "kapi_dma_quiesce_register", "kapi_pi5_pins"] {
+              "kapi_serror_checkpoint", "kapi_vmap", "kapi_vunmap", "kapi_dma_quiesce_register",
+              "kapi_dma40_claim", "kapi_dma40_release", "kapi_dma40_start_cyclic", "kapi_dma40_stop", "kapi_dma40_position",
+              "kapi_dma40_periods", "kapi_dma40_poll", "kapi_dma40_polled", "kapi_hdmi_sink_info", "kapi_pi5_pins"] {
         t.check(exports::lookup(n).is_some(), "plat/board export in KSYMTAB");
     }
     // The Wi-Fi pins are for the module named brcmf only.
@@ -660,6 +662,24 @@ fn kmodplat_checks(t: &mut T) {
         }
         exports::kapi_page_free(pg, 0);
     }
+    // dma40 handles + HDMI sink facts (kmodpi H1). Off a BCM2712 the channel calls fail cleanly.
+    t.check(exports::kapi_dma40_release(0) < 0 && exports::kapi_dma40_release(99) < 0, "dma40 release bad handle -> errno");
+    t.check(exports::kapi_dma40_stop(0) < 0 && exports::kapi_dma40_position(99) < 0, "dma40 stop/position bad handle -> errno");
+    t.check(exports::kapi_dma40_start_cyclic(0, 0, 0, 0, 0, 0, 1) < 0 && exports::kapi_dma40_poll(0) < 0, "dma40 start_cyclic/poll bad handle -> errno");
+    t.check(exports::kapi_dma40_periods(0) == 0, "dma40 periods bad handle -> 0");
+    let c = exports::kapi_dma40_claim(-1);
+    t.check(c > 0 || c < 0, "dma40 claim returns handle or errno");
+    if c > 0 {
+        t.check(exports::kapi_dma40_release(c as u32) == 0 && exports::kapi_dma40_release(c as u32) < 0, "dma40 claim/release once");
+    } else {
+        t.check(c == -19 || c == -16, "dma40 claim off-board -> -19/-16");
+    }
+    t.check(exports::kapi_hdmi_sink_info(core::ptr::null_mut()) == -22, "hdmi_sink_info null -> -22");
+    let mut hs = kmod_abi::KHdmiSink::default();
+    t.check(exports::kapi_hdmi_sink_info(&mut hs) == -22, "hdmi_sink_info size 0 -> -22");
+    hs.size = core::mem::size_of::<kmod_abi::KHdmiSink>() as u32;
+    t.check(exports::kapi_hdmi_sink_info(&mut hs) == 0 && hs.size == core::mem::size_of::<kmod_abi::KHdmiSink>() as u32
+        && hs.state == drivers::hdmi_plat::sink_info().0, "hdmi_sink_info fills the record");
     // DMA quiesce hook: registered, name collisions refused, removed again on a failed init.
     let qo = KmodId(60021);
     let nm = b"ktest-q";
@@ -670,6 +690,13 @@ fn kmodplat_checks(t: &mut T) {
     let before = drivers::dma_shutdown::count();
     t.check(registry::release_all(qo), "release_all drops the dma_quiesce registration");
     t.check(!drivers::dma_shutdown::has("ktest-q") && drivers::dma_shutdown::count() == before - 1, "quiesce entry removed after the failed init");
+    // RP1 interrupt sources: bad arguments are refused everywhere; without an RP1 there is nothing to attach.
+    extern "C" fn kp_irq(_c: usize) -> u32 { 0 }
+    t.check(exports::kapi_rp1_irq_request(KmodId(0), 6, true, kp_irq, 0) == -22 && exports::kapi_rp1_irq_request(KmodId(60023), 64, true, kp_irq, 0) == -22, "rp1_irq_request bad args -> -22");
+    #[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
+    t.check(exports::kapi_rp1_irq_request(KmodId(60023), 6, true, kp_irq, 0) == -19, "rp1_irq_request off the Pi 5 -> -19");
+    t.check(exports::kapi_rp1_irq_free(KmodId(60023), 6) == -19, "rp1_irq_free of an unheld source -> -19");
+    t.check(exports::lookup("kapi_rp1_irq_request").is_some() && exports::lookup("kapi_rp1_irq_free").is_some(), "rp1 irq exports in KSYMTAB");
 }
 
 /// L5a: the PCI / memory / entropy kapi exports, called through the KSYMTAB addresses
@@ -798,7 +825,7 @@ fn t_kmodkapi() -> T {
         let q = pa(0, 0);
         t.check(q != 0, "page_alloc(0, any)");
         if q != 0 { pf(q, 0); }
-        t.check(pa(11, 0) == 0, "page_alloc order 11 refused");
+        t.check(pa(mm::buddy::MAX_ORDER as u32, 0) == 0, "page_alloc order MAX_ORDER refused");
 
         // Hardware RNG registration reseeds at once.
         let owner = KmodId(60001);
