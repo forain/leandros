@@ -18,11 +18,15 @@ fn err<T>(m: impl Into<String>) -> io::Result<T> {
 }
 
 /// Rewrite one cmdline value.
-fn fix_cmdline(val: &str, root_partuuid: &str, nvme: bool) -> String {
+fn fix_cmdline(val: &str, root_partuuid: &str, extra: Option<&str>) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut seen_root = false;
     for t in val.split_whitespace() {
         if t.starts_with("usbms.") {
+            continue;
+        }
+        // A caller-supplied write policy replaces any inherited one.
+        if extra.is_some() && (t.starts_with("blk.rw=") || t == "nvme.rw=1") {
             continue;
         }
         if t.starts_with("root=") {
@@ -37,8 +41,10 @@ fn fix_cmdline(val: &str, root_partuuid: &str, nvme: bool) -> String {
     if !seen_root {
         out.insert(0, format!("root=PARTUUID={}", root_partuuid));
     }
-    if nvme && !out.iter().any(|t| t == "nvme.rw=1") {
-        out.push("nvme.rw=1".to_string());
+    if let Some(x) = extra {
+        if !out.iter().any(|t| t == x) {
+            out.push(x.to_string());
+        }
     }
     out.join(" ")
 }
@@ -62,11 +68,17 @@ fn is_cmdline_key(line: &str) -> Option<(usize, usize)> {
 /// loses `usbms.*`, gains `nvme.rw=1` on NVMe; an entry that boots a kernel
 /// (`path:` and not `protocol: efi`) without a cmdline gets one.
 pub fn rewrite_conf(text: &str, root_partuuid: &str, nvme: bool) -> String {
+    rewrite_conf_rw(text, root_partuuid, if nvme { Some("nvme.rw=1") } else { None })
+}
+
+/// Like `rewrite_conf`, with an explicit extra cmdline token (`blk.rw=...`)
+/// that also replaces any inherited `blk.rw=` / `nvme.rw=1`.
+pub fn rewrite_conf_rw(text: &str, root_partuuid: &str, nvme: Option<&str>) -> String {
     let mut out: Vec<String> = Vec::new();
     // Start index in `out` of the current entry body, whether it has a
     // cmdline, a kernel path, or is an EFI chain entry.
     let mut cur: Option<(usize, bool, bool, bool)> = None;
-    fn close(out: &mut Vec<String>, cur: &mut Option<(usize, bool, bool, bool)>, root: &str, nvme: bool) {
+    fn close(out: &mut Vec<String>, cur: &mut Option<(usize, bool, bool, bool)>, root: &str, nvme: Option<&str>) {
         if let Some((_start, has_cmd, has_path, efi)) = cur.take() {
             if has_path && !has_cmd && !efi {
                 let mut at = out.len();
@@ -153,11 +165,27 @@ pub fn install_esp(
     dst: &Dev,
     root_partuuid: &str,
     nvme: bool,
+    progress: impl FnMut(u32),
+) -> io::Result<EspResult> {
+    install_esp_ext(src, dst, root_partuuid, if nvme { Some("nvme.rw=1") } else { None }, *b"LEANDROS   ", &[], progress)
+}
+
+/// `install_esp` with an explicit extra cmdline token, volume label and extra
+/// files (path, content) created after the tree copy (dual-boot: the private
+/// boot partition and its `leandros/owner` marker).
+pub fn install_esp_ext(
+    src: &Dev,
+    dst: &Dev,
+    root_partuuid: &str,
+    extra: Option<&str>,
+    label: [u8; 11],
+    extra_files: &[(String, Vec<u8>)],
     mut progress: impl FnMut(u32),
 ) -> io::Result<EspResult> {
+    let nvme = extra;
     fatfs::format_volume(
         dst.handle(),
-        fatfs::FormatVolumeOptions::new().fat_type(fatfs::FatType::Fat32).volume_label(*b"LEANDROS   "),
+        fatfs::FormatVolumeOptions::new().fat_type(fatfs::FatType::Fat32).volume_label(label),
     )?;
     dst.sync()?;
     dst.invalidate()?;
@@ -184,7 +212,7 @@ pub fn install_esp(
         if is_conf(p) {
             let mut v = Vec::new();
             sf.read_to_end(&mut v)?;
-            let text = rewrite_conf(&String::from_utf8_lossy(&v), root_partuuid, nvme);
+            let text = rewrite_conf_rw(&String::from_utf8_lossy(&v), root_partuuid, nvme);
             h.update(text.as_bytes());
             df.write_all(text.as_bytes())?;
             done += v.len() as u64;
@@ -210,6 +238,21 @@ pub fn install_esp(
         drop(df);
         sums.insert(p.clone(), hex(&h.finalize()));
         res.files += 1;
+    }
+    for (p, data) in extra_files {
+        if let Some((dir, _)) = p.rsplit_once('/') {
+            let mut acc = String::new();
+            for comp in dir.split('/') {
+                acc = norm_join(&acc, comp);
+                let _ = dfs.root_dir().create_dir(&acc)?;
+            }
+        }
+        let mut df = dfs.root_dir().create_file(p)?;
+        df.truncate()?;
+        df.write_all(data)?;
+        df.flush()?;
+        drop(df);
+        sums.insert(p.clone(), hex(&Sha256::digest(data)));
     }
     res.bytes = done;
     dfs.unmount()?;
@@ -247,6 +290,99 @@ pub fn preview_conf(src: &Dev, root_partuuid: &str, nvme: bool) -> io::Result<(S
     let old = String::from_utf8_lossy(&v).into_owned();
     let new = rewrite_conf(&old, root_partuuid, nvme);
     Ok((old, new))
+}
+
+/// Like `preview_conf` with an explicit extra cmdline token.
+pub fn preview_conf_rw(src: &Dev, root_partuuid: &str, extra: &str) -> io::Result<(String, String)> {
+    let fs = fatfs::FileSystem::new(src.handle(), fatfs::FsOptions::new())?;
+    let mut f = fs.root_dir().open_file("limine.conf")?;
+    let mut v = Vec::new();
+    f.read_to_end(&mut v)?;
+    let old = String::from_utf8_lossy(&v).into_owned();
+    let new = rewrite_conf_rw(&old, root_partuuid, Some(extra));
+    Ok((old, new))
+}
+
+/// What a dual-boot install adds to the shared ESP: (path, content). Nothing
+/// else on the ESP is created, changed or deleted.
+pub fn shared_files(efi_name: &str, limine_bin: &[u8], boot_partuuid: &str) -> Vec<(String, Vec<u8>)> {
+    let conf = format!(
+        "timeout: 0\nserial: yes\n\n/LeandrOS\n\tprotocol: efi\n\tpath: guid({}):/EFI/BOOT/{}\n",
+        boot_partuuid, efi_name
+    );
+    let entry = format!("title LeandrOS\nefi /EFI/leandros/{}\nsort-key zz-leandros\n", efi_name);
+    vec![
+        (format!("EFI/leandros/{}", efi_name), limine_bin.to_vec()),
+        ("EFI/leandros/limine.conf".to_string(), conf.into_bytes()),
+        ("loader/entries/leandros.conf".to_string(), entry.into_bytes()),
+        ("EFI/leandros/.leandros-owned".to_string(), format!("{}\n", boot_partuuid).into_bytes()),
+    ]
+}
+
+/// Read-only look at a shared ESP: (fat32, dirty bit set, free bytes,
+/// has /loader/entries, has /EFI/leandros, has /loader/entries/leandros.conf).
+pub struct EspProbe {
+    pub fat32: bool,
+    pub dirty: bool,
+    pub free_bytes: u64,
+    pub has_entries_dir: bool,
+    pub has_ours: bool,
+}
+
+pub fn probe_shared(dev: &Dev) -> io::Result<EspProbe> {
+    let mut bs = [0u8; 512];
+    {
+        let mut h = dev.handle();
+        use std::io::Seek;
+        h.seek(io::SeekFrom::Start(0))?;
+        h.read_exact(&mut bs)?;
+    }
+    let fat32 = &bs[0x52..0x5A] == b"FAT32   ";
+    let dirty = bs[0x41] & 1 != 0;
+    let fs = fatfs::FileSystem::new(dev.handle(), fatfs::FsOptions::new())?;
+    let st = fs.stats()?;
+    let free_bytes = st.free_clusters() as u64 * st.cluster_size() as u64;
+    let root = fs.root_dir();
+    let has_entries_dir = root.open_dir("loader/entries").is_ok();
+    let has_ours = root.open_dir("EFI/leandros").is_ok() || root.open_file("loader/entries/leandros.conf").is_ok();
+    drop(root);
+    drop(fs);
+    Ok(EspProbe { fat32, dirty, free_bytes, has_entries_dir, has_ours })
+}
+
+/// Write `files` onto the (writable) shared ESP window and verify them by
+/// reading back from the medium. Existing directories are reused; no other
+/// file is touched.
+pub fn write_shared(dev: &Dev, files: &[(String, Vec<u8>)]) -> io::Result<()> {
+    {
+        let fs = fatfs::FileSystem::new(dev.handle(), fatfs::FsOptions::new())?;
+        for (p, data) in files {
+            if let Some((dir, _)) = p.rsplit_once('/') {
+                let mut acc = String::new();
+                for comp in dir.split('/') {
+                    acc = norm_join(&acc, comp);
+                    fs.root_dir().create_dir(&acc)?;
+                }
+            }
+            let mut f = fs.root_dir().create_file(p)?;
+            f.truncate()?;
+            f.write_all(data)?;
+            f.flush()?;
+        }
+        fs.unmount()?;
+    }
+    dev.sync()?;
+    dev.invalidate()?;
+    let fs = fatfs::FileSystem::new(dev.handle(), fatfs::FsOptions::new())?;
+    for (p, data) in files {
+        let mut f = fs.root_dir().open_file(p)?;
+        let mut v = Vec::new();
+        f.read_to_end(&mut v)?;
+        if &v != data {
+            return err(format!("shared ESP read-back mismatch for {}", p));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

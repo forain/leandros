@@ -212,6 +212,12 @@ pub const VFS_FUTIMENS:        u64 = 0x4F;
 /// fallocate(fd, mode, offset, len). Forwarded to a mount's server for a
 /// `MountedFile` with the same argument layout (`file_id` in place of fd).
 pub const VFS_FALLOCATE:       u64 = 0x50;
+/// pread/pwrite(fd, buf, count, offset) on a block-device node: a positional
+/// op that never touches the description's offset. Any other fd kind answers
+/// `ERR_NOT_POSITIONAL` and the kernel falls back to seek emulation.
+pub const VFS_PREAD:           u64 = 0x51;
+pub const VFS_PWRITE:          u64 = 0x52;
+pub const ERR_NOT_POSITIONAL:  i64 = -524;
 pub const UTIME_NOW:  i64 = (1 << 30) - 1;
 pub const UTIME_OMIT: i64 = (1 << 30) - 2;
 pub const UTIMENS_EXPLICIT: u64 = 1;
@@ -4704,6 +4710,10 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
                                          arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_WRITE        => handle_write(caller_pid, arg(msg,0) as usize,
                                           arg(msg,1) as usize, arg(msg,2) as usize),
+        VFS_PREAD        => handle_pio(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize,
+                                       arg(msg,2) as usize, arg(msg,3), false),
+        VFS_PWRITE       => handle_pio(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize,
+                                        arg(msg,2) as usize, arg(msg,3), true),
         VFS_CLOSE        => handle_close(caller_pid, arg(msg,0) as usize),
         VFS_STAT         => handle_stat(arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_STATFS       => handle_statfs(arg(msg,0) as usize, arg(msg,1) as usize),
@@ -6449,6 +6459,32 @@ fn gen_modules() -> Option<VnodeKind> {
 
 /// `/proc/pcache`: the unified page cache (`mm::pagecache`), one
 /// `name value` per line; counters are cumulative pages since boot.
+/// f2fs no-I/O request reruns / requests that gave up (cumulative), and the
+/// request to drop the clean block cache (`/proc/f2fsdropcache`, test knob).
+pub static F2FS_NOIO_ROUNDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static F2FS_NOIO_GAVE_UP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static F2FS_DROP_CLEAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `/proc/f2fsstat`: `noio_rounds N` and `noio_gave_up N`. Reading
+/// `/proc/f2fsdropcache` asks the f2fs server to drop its clean cache on its
+/// next request.
+fn gen_f2fsstat(drop: bool) -> Option<VnodeKind> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut put = |name: &str, v: u64| {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b' ');
+        let mut d = [0u8; 20]; let mut n = d.len(); let mut x = v;
+        loop { n -= 1; d[n] = b'0' + (x % 10) as u8; x /= 10; if x == 0 { break; } }
+        out.extend_from_slice(&d[n..]);
+        out.push(b'\n');
+    };
+    if drop { F2FS_DROP_CLEAN.store(true, Relaxed); }
+    put("noio_rounds", F2FS_NOIO_ROUNDS.load(Relaxed));
+    put("noio_gave_up", F2FS_NOIO_GAVE_UP.load(Relaxed));
+    proc_snapshot(b"/tmp/.f2fsstat", &out, false)
+}
+
 fn gen_pcache() -> Option<VnodeKind> {
     let st = mm::pagecache::stats();
     let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -7179,7 +7215,7 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules"];
+                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ"];
 
@@ -7961,6 +7997,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if lookup_path == b"/proc/f2fsstat" || lookup_path == b"/proc/f2fsdropcache" {
+            match gen_f2fsstat(lookup_path == b"/proc/f2fsdropcache") {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
         } else if lookup_path == b"/proc/pcache" {
             match gen_pcache() {
                 Some(v) => v,
@@ -8600,6 +8641,28 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
         }
         _ => err_reply(-9),
     }
+}
+
+/// Positional read/write on a block-device descriptor: explicit offset, the
+/// description's `pos` never read or written, so threads sharing one fd cannot
+/// interleave a seek between another's seek and I/O. The access checks are
+/// those of the plain read/write arms (`block::read_at`/`write_at` enforce
+/// read-only, BLKWRWIN and the loop's rw state).
+fn handle_pio(pid: u32, fd: usize, buf_ptr: usize, count: usize, off: u64, write: bool) -> Message {
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
+    if !tbl.fds.used(fd) { return err_reply(-9); }
+    if tbl.fds[fd].flags & O_PATH != 0 { return err_reply(-9); }
+    let d = match tbl.fds[fd].kind {
+        VnodeKind::BlockDev { dev, .. } => dev,
+        _ => return make_reply(ERR_NOT_POSITIONAL),
+    };
+    drop(tbls);
+    if count == 0 { return val_reply(0); }
+    if block::dev_is_char(d) { return if write { err_reply(-9) } else { val_reply(0) }; }
+    let n = if write { block::write_at(d, off, buf_ptr, count) } else { block::read_at(d, off, buf_ptr, count) };
+    if n < 0 { return make_reply(n as i64); }
+    val_reply(n as u64)
 }
 
 fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
@@ -11203,8 +11266,9 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
     // resolve and open the backing file, and every arm touches user memory
     // through `arg`, which must be able to demand-page.
     if let VnodeKind::BlockDev { dev, .. } = tbl.fds[fd].kind {
+        let ofd_id = tbl.fds[fd].ofd;
         drop(tbls);
-        return make_reply(block::ioctl(pid, dev, cmd, arg) as i64);
+        return make_reply(block::ioctl(pid, ofd_id, dev, cmd, arg) as i64);
     }
 
     if let VnodeKind::DynamicDevice { port, dev_id, open_id } = &tbl.fds[fd].kind {

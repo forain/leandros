@@ -451,7 +451,7 @@ def main():
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "uinputtest", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "netlinktest", "udpselftest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
-        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "kexectest", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid",
+        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "preadtest", "kexectest", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -2903,6 +2903,22 @@ def main():
               f"{len(_git_won)}: {' '.join(sorted(_git_won))}")
     else:
         print(f"  (no git staged: {_git_root} missing — ports/git/build.sh {arch})")
+
+    # ── e2fsprogs (optional, ports/e2fsprogs) ─────────────────────────────────
+    # Alpine's e2fsck/resize2fs/dumpe2fs/e2undo/mke2fs in /usr/sbin (+ closure
+    # in /usr/lib, /etc/mke2fs.conf). Also hard-linked into /bin (the console
+    # login's PATH is /bin alone).
+    _e2_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "..", "ports", "e2fsprogs", "out", arch))
+    if os.path.isfile(os.path.join(_e2_root, "usr", "sbin", "e2fsck")):
+        _e2_n, _e2_bytes, _e2_won = _overlay_port_tree(_e2_root)
+        for _name in ("e2fsck", "resize2fs", "dumpe2fs", "e2undo", "mke2fs"):
+            _p = os.path.realpath(os.path.join(_e2_root, "usr", "sbin", _name))
+            if os.path.isfile(_p):
+                bin_files.append((_name, _p, 0o100755))
+        print(f"  e2fsprogs: {_e2_n} file(s), {_e2_bytes // 1024} KiB from {_e2_root}")
+    else:
+        print(f"  (no e2fsprogs staged: {_e2_root} missing — ports/e2fsprogs/build.sh {arch})")
 
     # Optional binaries are skipped silently when their build output is absent.
     # Say so, and let LEANDROS_REQUIRE=rg,grep,dmesg,coreutils make it fatal.

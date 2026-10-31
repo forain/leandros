@@ -44,6 +44,18 @@ const FACTORY_CONF: &str = "leandros/factory.conf";
 const SLOT_ROOT: &str = "leandros/k";
 const ESP_KEYS: &str = "leandros/authorized_keys";
 
+// Shared layout (dual boot): the disk's ESP belongs to another OS, and all of
+// our state lives in a private boot partition (type GUID 0E02ED9A-...) that
+// looks exactly like the stick's ESP (Limine in EFI/BOOT/, limine.conf, kernel
+// slots), so every other code path is the same as in stick mode. The ESP only
+// carries three files and a marker, written by `repair-esp`.
+/// Present in the private boot partition: this volume is ours.
+const BOOT_MARKER: &str = "leandros/owner";
+/// Present in the shared ESP: espctl never opens such a volume for state.
+const ESP_MARKER: &str = "EFI/leandros/.leandros-owned";
+const ESP_APP_DIR: &str = "EFI/leandros";
+const ESP_ENTRY: &str = "loader/entries/leandros.conf";
+
 fn err<T>(msg: impl Into<String>) -> io::Result<T> {
     Err(io::Error::new(io::ErrorKind::Other, msg.into()))
 }
@@ -83,16 +95,42 @@ fn fault_point() {
 struct Esp {
     path: String,
     dev: Dev,
+    /// The private boot partition of a dual-boot disk (see BOOT_MARKER).
+    shared: bool,
 }
 
 impl Esp {
     fn open(path: &str, writable: bool) -> io::Result<Esp> {
         let dev = Dev::open(path, writable).map_err(|e| io::Error::new(e.kind(), format!("{}: {}", path, e)))?;
-        Ok(Esp { path: path.to_string(), dev })
+        Ok(Esp { path: path.to_string(), dev, shared: false })
     }
 
     fn fs(&self) -> io::Result<Fs> {
         fatfs::FileSystem::new(self.dev.handle(), fatfs::FsOptions::new())
+    }
+
+    /// Classify the volume before any state is read from or written to it.
+    /// Returns true for our private boot partition (shared layout). Refuses
+    /// the shared ESP itself and any other volume that belongs to another OS;
+    /// a stick's ESP carries none of those marks, so stick mode is unchanged.
+    fn guard(&self) -> io::Result<bool> {
+        self.read(|fs| {
+            if exists(fs, ESP_MARKER) {
+                return err(format!(
+                    "{} is the shared ESP (/{} exists); espctl keeps its state in the private LeandrOS boot partition",
+                    self.path, ESP_MARKER
+                ));
+            }
+            if exists(fs, BOOT_MARKER) {
+                return Ok(true);
+            }
+            for foreign in ["EFI/systemd", "loader", "EFI/Microsoft", "EFI/ubuntu", "EFI/fedora", "EFI/refind", "EFI/grub"] {
+                if exists(fs, foreign) {
+                    return err(format!("{} holds another OS's boot files (/{}) and no LeandrOS owner marker; refusing", self.path, foreign));
+                }
+            }
+            Ok(false)
+        })
     }
 
     /// One ordered step: mount, run `f`, unmount, write everything out and
@@ -211,11 +249,17 @@ fn find_esp(explicit: Option<&str>) -> io::Result<String> {
     let root = conf::cmdline_value(&cl, "root");
     let kid = conf::cmdline_value(&cl, "leandros.kid");
     let mut cands: Vec<(String, u32)> = Vec::new();
-    for p in disks::scan_all().into_iter().filter(|p| p.kind == disks::Kind::Esp) {
+    let all = disks::scan_all();
+    // A disk with a private boot partition has a shared ESP: not a candidate.
+    let dual: Vec<String> = all.iter().filter(|p| p.kind == disks::Kind::Boot).map(|p| p.disk.clone()).collect();
+    for p in all.into_iter().filter(|p| p.kind == disks::Kind::Boot || (p.kind == disks::Kind::Esp && !dual.contains(&p.disk))) {
         let esp = match Esp::open(&p.dev, false) {
             Ok(e) => e,
             Err(_) => continue,
         };
+        if esp.guard().is_err() {
+            continue;
+        }
         let text = match esp.read(|fs| Ok(effective_conf(fs))) {
             Ok(Some((_, t))) => t,
             _ => continue,
@@ -381,6 +425,8 @@ fn write_slots(esp: &Esp, st: &mut State, slots: &Slots) -> io::Result<()> {
         .filter(|(n, d, _)| *d && n.len() == 8 && n.to_uppercase().starts_with("LT"))
         .map(|(n, _, _)| format!("EFI/{}", n))
         .filter(|p| keep.as_deref().map_or(true, |k| !k.eq_ignore_ascii_case(p)))
+        // Shared layout: only directories that carry our chain signature.
+        .filter(|p| !esp.shared || esp.read(|fs| Ok(exists(fs, &format!("{}/limine.conf", p)) && exists(fs, &format!("{}/{}", p, conf::EFI_NAME)))).unwrap_or(false))
         .collect();
     if !stale.is_empty() {
         let _ = esp.step(|fs| {
@@ -460,7 +506,9 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 
 fn open_esp(o: &Opts, writable: bool) -> io::Result<Esp> {
     let p = find_esp(o.dev.as_deref())?;
-    Esp::open(&p, writable)
+    let mut esp = Esp::open(&p, writable)?;
+    esp.shared = esp.guard()?;
+    Ok(esp)
 }
 
 /// True when the kernel command line carries `name=1`.
@@ -476,6 +524,9 @@ fn booted() -> (Option<String>, Option<String>) {
 fn print_status(esp: &Esp, st: &State) -> io::Result<()> {
     let (slot, kid) = booted();
     println!("esp={}", esp.path);
+    if esp.shared {
+        println!("layout=shared");
+    }
     println!("config=/{}", st.conf_path);
     println!("managed={}", if conf::is_managed(&st.text) { 1 } else { 0 });
     println!("booted_slot={}", slot.as_deref().unwrap_or("unmanaged"));
@@ -909,6 +960,82 @@ fn cmd_boot(o: &Opts) -> io::Result<()> {
     Ok(())
 }
 
+/// Recreate what a dual-boot install put on the shared ESP, and nothing else:
+///   /EFI/leandros/BOOT<ARCH>.EFI   Limine, copied as-is from the boot partition
+///   /EFI/leandros/limine.conf      one entry that chain-loads the boot partition's Limine
+///   /loader/entries/leandros.conf  systemd-boot entry, sorted after Linux
+///   /EFI/leandros/.leandros-owned  marker
+/// Nothing else on the ESP is read for content, changed or deleted.
+/// `BLKWRWIN` over [start, start+len) (512-byte units) of the whole-disk node;
+/// the returned file keeps the window alive. None when the kernel refuses.
+fn wrwin_open(disk: &str, start: u64, len: u64) -> Option<std::fs::File> {
+    #[repr(C)]
+    struct WrWin { count: u32, flags: u32, r: [[u64; 2]; 16] }
+    const BLKWRWIN: libc::c_ulong = 0x4108_12F0;
+    let path = if disk.starts_with("/dev/") { disk.to_string() } else { format!("/dev/{}", disk) };
+    let f = std::fs::File::open(path).ok()?;
+    let mut w = WrWin { count: 1, flags: 0, r: [[0; 2]; 16] };
+    w.r[0] = [start, len];
+    use std::os::unix::io::AsRawFd;
+    (unsafe { libc::ioctl(f.as_raw_fd(), BLKWRWIN as _, &w as *const WrWin) } == 0).then_some(f)
+}
+
+fn cmd_repair_esp(o: &mut Opts) -> io::Result<()> {
+    let boot_arg = take_opt(&mut o.args, "--boot").or_else(|| o.dev.clone());
+    let esp_arg = take_opt(&mut o.args, "--esp");
+    let parts = disks::scan_all();
+    let boots: Vec<&disks::Part> = parts.iter().filter(|p| p.kind == disks::Kind::Boot).collect();
+    let boot = match &boot_arg {
+        Some(d) => boots.iter().find(|p| &p.dev == d).copied(),
+        None if boots.len() == 1 => Some(boots[0]),
+        None => None,
+    }
+    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "need exactly one LeandrOS boot partition, or --boot /dev/<partition>"))?;
+    let esp_dev = match esp_arg {
+        Some(d) => d,
+        None => {
+            let c: Vec<&disks::Part> = parts.iter().filter(|p| p.kind == disks::Kind::Esp && p.disk == boot.disk).collect();
+            if c.len() != 1 {
+                return err(format!("{} ESP partitions on {}; pass --esp", c.len(), boot.disk));
+            }
+            c[0].dev.clone()
+        }
+    };
+    // The boot partition must really be ours, and holds the Limine to copy.
+    let b = Esp::open(&boot.dev, false)?;
+    if !b.guard()? {
+        return err(format!("{} has no LeandrOS owner marker (/{})", boot.dev, BOOT_MARKER));
+    }
+    let bin_src = format!("EFI/BOOT/{}", conf::EFI_NAME);
+    let bin = b.read(|fs| read_file(fs, &bin_src))?;
+    let conf_text = format!(
+        "timeout: 0\nserial: yes\n\n/LeandrOS\n\tprotocol: efi\n\tpath: guid({}):/{}\n",
+        boot.partuuid(),
+        bin_src
+    );
+    let entry = format!("title LeandrOS\nefi /{}/{}\nsort-key zz-leandros\n", ESP_APP_DIR, conf::EFI_NAME);
+    // An NVMe disk is read-only unless blk.rw= lists the partition, and the ESP
+    // never is: open a BLKWRWIN window over just the ESP, held until we return.
+    let _win = parts.iter().find(|p| p.dev == esp_dev).and_then(|p| wrwin_open(&p.disk, p.start / 512, p.size / 512));
+    let e = Esp::open(&esp_dev, true)?;
+    // A foreign ESP is expected here: only the volume type matters.
+    let bin_path = format!("{}/{}", ESP_APP_DIR, conf::EFI_NAME);
+    let conf_path = format!("{}/limine.conf", ESP_APP_DIR);
+    e.step(|fs| {
+        write_file(fs, &bin_path, &bin)?;
+        write_file(fs, &conf_path, conf_text.as_bytes())?;
+        write_file(fs, ESP_ENTRY, entry.as_bytes())?;
+        write_file(fs, ESP_MARKER, format!("{}\n", boot.partuuid()).as_bytes())
+    })?;
+    e.dev.invalidate()?;
+    let ok = e.read(|fs| Ok(sha256(&read_file(fs, &bin_path)?) == sha256(&bin) && read_file(fs, &conf_path)? == conf_text.as_bytes() && read_file(fs, ESP_ENTRY)? == entry.as_bytes()))?;
+    if !ok {
+        return err("read-back mismatch on the shared ESP");
+    }
+    println!("repaired {} -> boot partition {} (PARTUUID {})", esp_dev, boot.dev, boot.partuuid());
+    Ok(())
+}
+
 fn cmd_parts(o: &Opts) -> io::Result<()> {
     let sel = find_esp(o.dev.as_deref()).ok();
     for p in disks::scan_all() {
@@ -1114,6 +1241,7 @@ const USAGE: &str = "usage: espctl [--dev /dev/<esp>] <command>
   scrub-psk              remove wifi.psk= tokens from limine.conf and factory.conf
   boot                   init's per-boot hook (one-shot disarm, key import)
   import-keys            ESP /leandros/authorized_keys -> /root/.ssh/authorized_keys
+  repair-esp [--boot DEV] [--esp DEV]  recreate the three LeandrOS files on the shared ESP
   parts                  partitions of every disk (esp, log, home, ...)
   klog [--all|--list|--boot N]  console log partition: this boot (dmesg), or all 4
   ls [dir] | cat <f> | get <f> <local> | put <local> <f> | rm <f>";
@@ -1149,6 +1277,7 @@ fn main() {
         "scrub-psk" => cmd_scrub_psk(&o),
         "boot" => cmd_boot(&o),
         "import-keys" => cmd_import_keys(&o),
+        "repair-esp" => cmd_repair_esp(&mut o),
         "parts" => cmd_parts(&o),
         "klog" => cmd_klog(&mut o),
         "ls" => cmd_ls(&o),

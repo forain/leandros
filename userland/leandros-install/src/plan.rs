@@ -27,6 +27,14 @@ pub struct DiskInfo {
     pub parts: Vec<Part>,
     pub eligible: bool,
     pub reason: String,
+    /// Free gaps (first, last inclusive, 512-byte sectors).
+    pub gaps: Vec<(u64, u64)>,
+    pub dualboot: bool,
+    pub dualboot_reason: String,
+    /// Largest unmounted ext2/3/4 Linux partition: (dev, fs bytes, estimated minimum bytes).
+    pub shrink: Option<(String, u64, u64)>,
+    /// Session B state for this disk: "", "boot_linux" or "ready_b".
+    pub finish: &'static str,
 }
 
 pub fn read_to_string(p: &str) -> String {
@@ -195,6 +203,23 @@ pub fn gather(allow_removable: bool, root_bytes: u64) -> Vec<DiskInfo> {
         } else {
             ""
         };
+        let parts = disks::scan_disk(n);
+        let gaps = if is_boot || is_mounted { Vec::new() } else { crate::dualboot::gaps_of(&format!("/dev/{}", n), size) };
+        let (dualboot, dualboot_reason) =
+            crate::dualboot::eligibility(is_boot, is_mounted, size, parts.iter().any(|p| p.kind == Kind::Esp), &gaps);
+        let shrink = if is_boot || is_mounted {
+            None
+        } else {
+            parts
+                .iter()
+                .filter(|p| p.kind == Kind::Linux)
+                .filter_map(|p| {
+                    let sb = crate::shrink::read_sb_path(&p.dev).ok()?;
+                    let used = (sb.blocks - sb.free_blocks) * sb.bs;
+                    Some((p.dev.clone(), sb.blocks * sb.bs, used + used / 20))
+                })
+                .max_by_key(|x| x.1)
+        };
         v.push(DiskInfo {
             name: n.clone(),
             dev: format!("/dev/{}", n),
@@ -205,9 +230,14 @@ pub fn gather(allow_removable: bool, root_bytes: u64) -> Vec<DiskInfo> {
             ro,
             boot: is_boot,
             mounted: is_mounted,
-            parts: disks::scan_disk(n),
+            parts,
             eligible: reason.is_empty(),
             reason: reason.to_string(),
+            gaps,
+            dualboot,
+            dualboot_reason,
+            finish: if is_boot || is_mounted { "" } else { crate::shrink::finish_state_for(&format!("/dev/{}", n)) },
+            shrink,
         });
     }
     v
@@ -220,9 +250,15 @@ impl DiskInfo {
             .iter()
             .map(|p| format!("{{\"n\":{},\"kind\":\"{}\",\"size\":{}}}", p.pno, esc(&p.kind.name()), p.size))
             .collect();
+        let gaps: Vec<String> = self.gaps.iter().map(|g| format!("{{\"start\":{},\"sectors\":{}}}", g.0, g.1 - g.0 + 1)).collect();
         format!(
-            "{{\"ev\":\"disk\",\"name\":\"{}\",\"dev\":\"{}\",\"size\":{},\"bus\":\"{}\",\"model\":\"{}\",\"removable\":{},\"ro\":{},\"boot\":{},\"eligible\":{},\"reason\":\"{}\",\"parts\":[{}]}}",
-            esc(&self.name), esc(&self.dev), self.size, self.bus, esc(&self.model), self.removable, self.ro, self.boot, self.eligible, esc(&self.reason), parts.join(",")
+            "{{\"ev\":\"disk\",\"name\":\"{}\",\"dev\":\"{}\",\"size\":{},\"bus\":\"{}\",\"model\":\"{}\",\"removable\":{},\"ro\":{},\"boot\":{},\"eligible\":{},\"reason\":\"{}\",\"parts\":[{}],\"gaps\":[{}],\"dualboot\":{},\"dualboot_reason\":\"{}\",\"finish\":\"{}\"{}}}",
+            esc(&self.name), esc(&self.dev), self.size, self.bus, esc(&self.model), self.removable, self.ro, self.boot, self.eligible, esc(&self.reason), parts.join(","),
+            gaps.join(","), self.dualboot, esc(&self.dualboot_reason), self.finish,
+            match &self.shrink {
+                Some((d, c, m)) => format!(",\"shrink\":{{\"part\":\"{}\",\"cur_bytes\":{},\"min_bytes\":{}}}", esc(d), c, m),
+                None => String::new(),
+            }
         )
     }
 
@@ -237,6 +273,10 @@ impl DiskInfo {
             flags,
             if self.eligible { "eligible".to_string() } else { format!("NOT eligible: {}", self.reason) },
             kinds.join(" ")
+        ) + &format!(
+            "  | dual-boot: {}{}",
+            if self.dualboot { "yes".to_string() } else { format!("no ({})", self.dualboot_reason) },
+            self.gaps.iter().map(|g| format!(" gap@{}+{}MiB", g.0, (g.1 - g.0 + 1) / 2048)).collect::<String>()
         )
     }
 }
@@ -275,12 +315,12 @@ impl Layout {
     }
 
     pub fn specs(&self, guids: &[[u8; 16]; 4]) -> Vec<PartSpec> {
-        let mk = |t, g, r: (u64, u64), name| PartSpec { ptype: t, guid: g, first: r.0, last: r.0 + r.1 - 1, name };
+        let mk = |t, g, r: (u64, u64), name| PartSpec { ptype: t, guid: g, first: r.0, last: r.0 + r.1 - 1, name, attrs: if t == gpt::ESP_TYPE { 0 } else { gpt::ATTR_NO_AUTO } };
         vec![
             mk(gpt::ESP_TYPE, guids[0], self.esp, "LEANDROS ESP"),
-            mk(gpt::LINUX_TYPE, guids[1], self.root, "LEANDROS root"),
-            mk(gpt::LOG_TYPE, guids[2], self.log, "LEANDROS-LOG"),
-            mk(gpt::HOME_TYPE, guids[3], self.home, "LEANDROS home"),
+            mk(gpt::LROOT_TYPE, guids[1], self.root, "LEANDROS root"),
+            mk(gpt::LLOG_TYPE, guids[2], self.log, "LEANDROS-LOG"),
+            mk(gpt::LHOME_TYPE, guids[3], self.home, "LEANDROS home"),
         ]
     }
 }

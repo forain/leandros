@@ -4366,6 +4366,14 @@ fn pread_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) ->
         if flags & O_PATH != 0 { return -9; }
         return f2fs_server::pread_fd(port, file_id as u64, buf_ptr as *mut u8, count, offset as u64);
     }
+    // A block-device node: positional in the VFS itself, so threads sharing
+    // the descriptor cannot interleave their seeks (e2fsprogs reads bitmaps
+    // from several threads on one fd).
+    {
+        let m = make_vfs_msg(vfs::VFS_PREAD, &[fd as u64, buf_ptr as u64, count as u64, offset as u64]);
+        let r = vfs_reply_val(&vfs::handle(&m, pid));
+        if r as i64 != vfs::ERR_NOT_POSITIONAL { return r; }
+    }
     // Seek to offset, read, seek back (best-effort; position state is in VFS).
     // The position to go back to is the one before the seek: restoring the
     // seek's own result (== `offset`) used to leave every tmpfs pread with
@@ -4405,6 +4413,14 @@ fn pwrite_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) -
         if flags & O_PATH != 0 { return -9; }
         return f2fs_server::pwrite_fd(port, file_id as u64, buf_ptr as *const u8, count, offset as u64,
                                       flags & O_APPEND != 0, pid);
+    }
+    // A block-device node: positional in the VFS itself, so threads sharing
+    // the descriptor cannot interleave their seeks (e2fsprogs reads bitmaps
+    // from several threads on one fd).
+    {
+        let m = make_vfs_msg(vfs::VFS_PWRITE, &[fd as u64, buf_ptr as u64, count as u64, offset as u64]);
+        let r = vfs_reply_val(&vfs::handle(&m, pid));
+        if r as i64 != vfs::ERR_NOT_POSITIONAL { return r; }
     }
     // Get current position.
     let cur_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, 0u64, 1 /* SEEK_CUR */]);

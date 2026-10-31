@@ -13,8 +13,11 @@ pub mod dev;
 pub mod disks;
 
 pub mod copy;
+pub mod dualboot;
 pub mod esp;
 pub mod gpt;
 pub mod install;
 pub mod plan;
 pub mod progress;
+pub mod sbguard;
+pub mod shrink;

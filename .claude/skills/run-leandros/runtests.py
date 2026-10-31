@@ -85,6 +85,8 @@ SUITES = {
                 "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest",
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
                 "/bin/f2fstest mmaporphan /root",
+                # Truncate of a file with cold node blocks: one fetch round (lane f2fshang).
+                "/bin/f2fstest trunc_cold /home",
                 # Nested epoll sets on the ready list: LT/ET/ONESHOT/close/dup
                 # cases, and probes per call of a cosmic-comp-shaped set.
                 "/bin/epolltest cost",
@@ -104,7 +106,7 @@ SUITES = {
                 "if [ \"$(uname -m)\" = aarch64 ]; then drmsmoke --arm-v3d && MESA_LOADER_DRIVER_OVERRIDE=v3d kmscube -c 30; __k=$?; drmsmoke --disarm-v3d; test $__k = 0; fi",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/netlinktest", "/bin/udpselftest", "/bin/udptest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
+                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/preadtest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
                 # kexec tool: load + unload only (non-destructive).
                 "/bin/sh -c '/bin/kexec -l /boot/kexec --initrd=/boot/kexec-initrd --append=x && /bin/kexec -u'",
                 # ripgrep (rg): file match, recursive dir walk, stdin, exit codes 0/1.

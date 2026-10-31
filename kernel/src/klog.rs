@@ -6,7 +6,7 @@
 //! a lock-free RAM ring, and a flusher appends it to a dedicated log
 //! partition of the boot disk. The partition has no filesystem:
 //!
-//!   type   MBR 0xDA, or GPT type GUID 042B7470-1302-4E61-9347-A0130B276754
+//!   type   MBR 0xDA, or GPT type GUID 042B7470-1302-4E61-9347-A0130B276754 (or the LeandrOS-log type 3EC8FA02-816A-4D04-8718-64C3771C5187)
 //!   size   64 MiB written by `scripts/write-usb.sh`, at the very end
 //!   slots  4 slots of `min(16 MiB, size / 4)`; boot N uses slot (N-1) % 4
 //!   slot   4096-byte header page, then the plain-text log

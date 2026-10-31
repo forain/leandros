@@ -156,6 +156,9 @@ fn parse_cmdline(cmdline: &str) {
         match tok {
             "nvme.rw=1" => RW.store(true, Ordering::Relaxed),
             "nvme.rw=0" => RW.store(false, Ordering::Relaxed),
+            // `blk.rw=` makes the controller writable; the block registry then
+            // confines writes to the listed partitions (see blkdev::policy_ro).
+            t if t.starts_with("blk.rw=") && t.len() > 7 => RW.store(true, Ordering::Relaxed),
             "nvme.apst=keep" => APST_KEEP.store(true, Ordering::Relaxed),
             "nvme.shutdown=0" => SHUTDOWN_ON.store(false, Ordering::Relaxed),
             "nvme.disable=1" | "nvme=off" => DISABLED.store(true, Ordering::Relaxed),
