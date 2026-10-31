@@ -432,7 +432,7 @@ struct Prog {
 }
 
 impl Prog {
-    fn feed(&mut self, chunk: &str, out: &Out, last: &mut u32) {
+    fn feed(&mut self, chunk: &str, out: &Out, last: &mut u32, child: u32) {
         let mut rest = chunk;
         while !rest.is_empty() {
             if let Some(i) = rest.find("Begin pass ") {
@@ -450,6 +450,14 @@ impl Prog {
         if pct != *last {
             *last = pct;
             out.step("resize", pct);
+            // Test hook (dualboot-shrink-test.sh crash injection): freeze resize2fs the
+            // moment progress reaches this percentage so an external kill lands mid-resize.
+            if let Some(t) = std::env::var("LEANDROS_SHRINK_FREEZE_PCT").ok().and_then(|v| v.parse::<u32>().ok()) {
+                if pct >= t {
+                    unsafe { libc::kill(child as libc::pid_t, libc::SIGSTOP) };
+                    out.step("frozen", pct);
+                }
+            }
         }
     }
 }
@@ -474,7 +482,7 @@ fn run_resize(dev: &str, undo: &str, sectors: u64, out: &Out) -> Result<(), Stri
             break;
         }
         let s = String::from_utf8_lossy(&b[..n]).into_owned();
-        p.feed(&s, out, &mut last);
+        p.feed(&s, out, &mut last, c.id());
         all.push_str(&s);
     }
     let mut err = String::new();
@@ -795,8 +803,15 @@ fn restore_sb(dev: &str, orig_path: &str) -> Result<(), String> {
 fn rollback(dev: &str, p: &mut Part, undo: &str, sb_orig: &str, crash: bool, sb: &Sb, out: &Out) -> Result<(), String> {
     p.window()?;
     if std::path::Path::new(undo).exists() {
-        let r = run("e2undo", &[undo, dev])?;
+        let mut r = run("e2undo", &[undo, dev])?;
         out.info(&format!("e2undo {}: rc {} {}", undo, r.rc, tail(&r.text)));
+        // After a crash the undo header can hold an older superblock than the one on disk
+        // (resize2fs rewrote it after the last undo index flush): that is exactly the
+        // mismatch e2undo -f exists for. The post-rollback e2fsck/size checks still gate it.
+        if crash && r.rc != 0 && r.text.contains("doesn't match the undo file") {
+            r = run("e2undo", &["-f", undo, dev])?;
+            out.info(&format!("e2undo -f {}: rc {} {}", undo, r.rc, tail(&r.text)));
+        }
         if r.rc != 0 {
             return Err(format!("e2undo {} failed (rc {}): {}", undo, r.rc, tail(&r.text)));
         }

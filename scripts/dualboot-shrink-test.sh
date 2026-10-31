@@ -189,19 +189,27 @@ fi
 if phase b; then
 echo "== (b) crash injection"
 crash_case() {
-    local PCT=$1 got
+    local PCT=$1 got REQ=$1
+    # resize2fs -p reports pct 0..60 (passes 1-3, 40 X each of 200) and nothing during passes 4-5
+    # before the installer's own 100. So a requested point above 60 means "the last progress
+    # event resize2fs emits before completion" (60); the kill must still land before "done".
+    [ "$PCT" -gt "${LAST_PROGRESS_PCT:-60}" ] && PCT=${LAST_PROGRESS_PCT:-60}
+    [ "$PCT" = "$REQ" ] || echo "(requested ${REQ}% clamped to the last pre-completion progress event, ${PCT}%)"
     echo "-- crash at resize >= ${PCT}%"
     fresh_disk; fresh_stick
     boot_stick "crash$PCT"
-    $REMOTE run "rm -f /tmp/s.log; nohup $LI shrink --part $P2 --to 10G --yes --json > /tmp/s.log 2>&1 &" >/dev/null 2>&1 || true
+    $REMOTE run "rm -f /tmp/s.log; LEANDROS_SHRINK_FREEZE_PCT=$PCT nohup $LI shrink --part $P2 --to 10G --yes --json > /tmp/s.log 2>&1 &" >/dev/null 2>&1 || true
     got=""
+    # The installer freezes resize2fs (SIGSTOP) the instant its progress reaches PCT
+    # (LEANDROS_SHRINK_FREEZE_PCT) and emits a "frozen" step; the host then kill -9s qemu.
+    # PCT = the resize step pct (0..99) derived from resize2fs -p passes (40 X per pass, 5 passes).
     for i in $(seq 1 900); do
-        got=$(r "grep -o '\"name\":\"resize\",\"pct\":[0-9]*' /tmp/s.log 2>/dev/null | tail -1" || true); got=${got##*:}
-        [ -n "$got" ] && [ "$got" -ge "$PCT" ] && break
-        r "grep -q '\"ev\":\"error\"\\|\"ev\":\"done\"' /tmp/s.log" >/dev/null 2>&1 && { r "tail -c 600 /tmp/s.log; true"; fail "shrink ended before the crash point (pct $got)"; }
+        f=$(r "grep -o '\"name\":\"frozen\",\"pct\":[0-9]*' /tmp/s.log 2>/dev/null | tail -1; true" || true); f=${f##*:}
+        [ -n "$f" ] && { got=$f; break; }
+        r "grep -q '\"ev\":\"error\"\\|\"ev\":\"done\"' /tmp/s.log" >/dev/null 2>&1 && { r "tail -c 600 /tmp/s.log; true"; fail "shrink ended before the crash point"; }
         sleep 1
     done
-    [ -n "$got" ] && [ "$got" -ge "$PCT" ] || fail "resize never reached ${PCT}%"
+    [ -n "$got" ] || fail "resize never reached ${PCT}%"
     qmp_quit; ok "QEMU quit at resize ${got}%"
     boot_stick "recover$PCT"
     r "$LI shrink-status --json" > "$WORK/statout$PCT.log"
@@ -219,7 +227,13 @@ crash_case() {
     D=$(p2_compare "$SRC" "$DISK"); echo "p2 differing 1 MiB chunks vs the pre-image: $D"
     [ "${D%% *}" = 0 ] || fail "p2 differs from the pre-image after recovery at ${PCT}%: $D"
     ok "p2 byte-identical to the pre-image"
-    ! grep -q "doesn't match\|Corrupt" "$WORK/recout$PCT.log" || fail "recovery log has e2undo mismatch/corruption messages (${PCT}%)"
+    ! grep -q "Corrupt" "$WORK/recout$PCT.log" || fail "recovery log has corruption messages (${PCT}%)"
+    # A superblock-vs-undo-header mismatch is tolerated only when the installer's e2undo -f retry
+    # succeeded AND the byte comparison above found p2 identical to the pre-image.
+    if grep -q "doesn't match" "$WORK/recout$PCT.log"; then
+        grep -q 'e2undo -f .*: rc 0' "$WORK/recout$PCT.log" || fail "e2undo mismatch not resolved by the -f retry (${PCT}%)"
+        echo "note: e2undo superblock mismatch at ${PCT}% resolved by e2undo -f (p2 byte-identical)"
+    fi
 }
 for PCT in $CRASH_PCTS; do
     for ATT in 1 2 3; do
