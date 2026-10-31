@@ -1961,6 +1961,7 @@ fn driver_thread(mut hw: Hw) {
     let mut traffic = (RX_PKTS.load(Ordering::Relaxed), TX_PKTS.load(Ordering::Relaxed));
     loop {
         LINKMON.wait(&mut mon_seen, period);
+        if sched::kthread::should_stop() { return; }
         let now = now_ms();
         let st = hw.m.r32(STATUS);
         LAST_STATUS.store(st, Ordering::Relaxed);
@@ -2267,6 +2268,7 @@ pub fn shutdown() -> Option<String> {
     let base = BASE.load(Ordering::Acquire);
     if base == 0 { return None; }
     RUNNING.store(false, Ordering::SeqCst);
+    LINKMON.notify(); // end the monitor thread's wait so it sees should_stop
     let m = Mmio(base);
     if m.r32(STATUS) == !0 { return Some(String::from("e1000e: registers read all-ones; left alone")); }
     m.w32(IMC, !0);

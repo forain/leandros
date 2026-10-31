@@ -60,7 +60,11 @@ impl GOps {
             Some(g) => g.call(crate::kmod::gate::Class::Upper, || f(self.ops)).unwrap_or(dflt),
         }
     }
-    fn open(&self) -> bool { self.gate.as_ref().map_or(true, |g| !g.upper_closed()) }
+    /// Run `f` as an Upper activation (builtin: plain call); None when the gate is closed.
+    /// An open that claims the device does so inside the activation, so the unload's drain sees it.
+    fn in_gate<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        match &self.gate { None => Some(f()), Some(g) => g.call(crate::kmod::gate::Class::Upper, f) }
+    }
     fn stream_poll(&self, c: usize) -> u32 { self.up(KCAM_GONE, |o| (o.stream_poll)(c)) }
     fn stream_gone(&self, c: usize) -> bool { self.up(true, |o| (o.stream_gone)(c)) }
     fn stream_ready(&self, c: usize) -> u32 { self.up(0, |o| (o.stream_ready)(c)) }
@@ -260,13 +264,16 @@ fn handle(msg: &Message, _caller: u32, _target: u32) -> Message {
         VFS_OPEN => {
             let id = match msg_arg(msg, 4) as u32 { 0 => u32::MAX, v => v };
             let Some(cam) = camera(0) else { return reply(ENODEV as i64) };
-            if default_format(&cam).0 == 0 || !cam.ops.open() { return reply(ENODEV as i64); }
-            let mut d = DEV.lock();
-            if d.owner != 0 { return reply(EBUSY as i64); }
-            let (f, fr) = default_format(&cam);
-            *d = Dev { owner: id, cam: Some(cam), fmt: f, frame: fr, interval: 0, nreq: 0,
-                       pending: [false; MAX_BUFS], queued: [false; MAX_BUFS], streaming: false };
-            reply(0)
+            if default_format(&cam).0 == 0 { return reply(ENODEV as i64); }
+            let r = cam.ops.in_gate(|| {
+                let mut d = DEV.lock();
+                if d.owner != 0 { return EBUSY as i64; }
+                let (f, fr) = default_format(&cam);
+                *d = Dev { owner: id, cam: Some(cam.clone()), fmt: f, frame: fr, interval: 0, nreq: 0,
+                           pending: [false; MAX_BUFS], queued: [false; MAX_BUFS], streaming: false };
+                0
+            });
+            reply(r.unwrap_or(ENODEV as i64))
         }
         VFS_POLL => {
             let revents = {

@@ -2581,6 +2581,21 @@ pub fn register_mount(prefix: &'static str, port: u32, device: &'static str, fst
     }
 }
 
+/// Devices a filesystem is mounting right now (its first I/O precedes `register_mount`):
+/// a module that owns the disk must not unload meanwhile.
+static MOUNT_PINS: Mutex<alloc::vec::Vec<&'static str>> = Mutex::new(alloc::vec::Vec::new());
+
+pub fn pin_mounting(device: &'static str) { MOUNT_PINS.lock().push(device); }
+pub fn unpin_mounting(device: &'static str) {
+    let mut p = MOUNT_PINS.lock();
+    if let Some(i) = p.iter().position(|d| *d == device) { p.remove(i); }
+}
+/// True while a mount of `device` ("/dev/x" or "x") is in progress.
+pub fn mounting_device(device: &str) -> bool {
+    let w = device.strip_prefix("/dev/").unwrap_or(device);
+    MOUNT_PINS.lock().iter().any(|d| d.strip_prefix("/dev/").unwrap_or(d) == w)
+}
+
 /// Snapshot of every currently registered mount (for `/proc/mounts`, `mount`, `lsblk`).
 pub fn list_mounts() -> [MountEntry; MAX_MOUNTS] {
     *MOUNTS.lock()

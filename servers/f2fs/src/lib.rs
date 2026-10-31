@@ -9019,7 +9019,17 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
 /// every mutating request answers EROFS. The only way to look at an f2fs
 /// volume on a disk the block layer refuses to write (an NVMe disk without
 /// `nvme.rw=1`).
-pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut read_only: bool) -> Option<u32> {
+pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, read_only: bool) -> Option<u32> {
+    // Pin the device from the first I/O (superblock) until the mount is registered: an rmmod of the
+    // module that owns the disk sees the pin as busy.
+    let dev = virtio_blk::dev_path(dev_idx);
+    vfs_server::pin_mounting(dev);
+    let r = mount_with_pinned(dev_idx, mount_point, owner_pid, read_only);
+    vfs_server::unpin_mounting(dev);
+    r
+}
+
+fn mount_with_pinned(dev_idx: usize, mount_point: &'static str, owner_pid: u32, mut read_only: bool) -> Option<u32> {
     // Read and parse superblock
     let mut block0 = [0u8; BLOCK_SIZE];
     if !virtio_blk::read_block(dev_idx, 0, &mut block0) { return None; }

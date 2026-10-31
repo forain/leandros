@@ -30,3 +30,13 @@ Built on lane/kmodlower (U2 as of 9708c433; its review fixes were not yet commit
 - Results: aarch64 unloadtest UPPER=1 all ok (U1+U2+U3, virtio_net flood counters rise x20, usb_storage EBUSY when mounted, usb_hid x10, kmbad_leak Zombie); autoloadtest aarch64 PASS; x86_64 unloadtest UPPER=1 31/31 ok.
 - rw umount of the stick (ENOTCONN): does NOT reproduce. Default aarch64 build (no .config, this lane's kernel, no unload), rw f2fs mount + write + sync + umount, then ls /bin: all rc 0.
 - Still open: hda/virtio_keyboard/virtio_snd exits; uvc and e1000e exits unexercised.
+
+## Review fixes (kmodupper2, 2026-10-31)
+- e1000e driver_thread returns on kthread should_stop (new kmod_kapi::sched::kthread::should_stop); shutdown() also kicks LINKMON. The wait is at most MON_IDLE_MS (2 s) < the 5 s lower drain. uvc, usb_hid, usb_storage modules spawn no kthreads (usb_storage's hotplug thread is the built-in only): nothing else to fix.
+- sys_delete_module runs busy_reason BEFORE closing the Upper gate (fast EBUSY, zero disruption); the post-drain check stays for the race (D9).
+- v4l2 VFS_OPEN claims DEV inside the Upper gate activation (GOps::in_gate).
+- EBUSY reopen: a detach that arrives with the gate closed is parked (PENDING_GONE) and replayed by usb_class_reopened; probes declined meanwhile (parked in UNCLAIMED) are re-offered via class::reoffer_owner. Teardown skips the requeue for parked-gone functions.
+- class::requeue checks a GONE list (hc, slot) under the lock detach() purges with, so a dead function is never requeued; teardown logs a failed requeue or try_unwrap.
+- Mount pin: vfs_server::pin_mounting/unpin_mounting around f2fs mount_with (first superblock I/O to register_mount); busy_reason reports "mounting".
+- Documented gaps: userspace fs servers and open /dev/sdX fds are not pinned; uvc busy check untested (QEMU has no UVC camera); e1000e exit leaves its 258 DMA pages owned (logged, not freed).
+- New checks: unloadtest UPPER: rw-mounted usb_storage rmmod -> EBUSY, then write+sync+read+umount all rc 0. scripts/kmod/e1000etest.sh: x86_64 QEMU 82574L, rmmod/load x10 with ping traffic, no Zombie, rx rises (10/10 pass). x86_64 unloadtest UPPER=1 35/35.

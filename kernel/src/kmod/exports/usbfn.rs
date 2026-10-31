@@ -173,21 +173,60 @@ pub(super) fn usb_probe_tramp(f: UsbFunction, m: &usb::class::Match, p: usize) -
     match Arc::try_unwrap(f) { Ok(f) => Err(f), Err(_) => Ok(()) }
 }
 
-/// The device on (`hc`, `slot`) left: tell the driver, then drop its handles.
+/// Handles whose device left while the owner's Upper gate was closed (a refused unload in flight):
+/// the driver's `detach` has not run yet; it is replayed after the gate reopens, or by the teardown.
+static PENDING_GONE: spin::Mutex<alloc::vec::Vec<u64>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+fn run_detach(b: &UsbCls, h: u64) {
+    if let Some(d) = b.detach { d(h, b.ctx); }
+    MATCHES.lock().retain(|e| e.0 != h);
+    drop_func(h);
+}
+
+/// The device on (`hc`, `slot`) left: tell the driver, then drop its handles. With the gate closed the
+/// handle is parked instead (detach must not be skipped while the handle is dropped).
 pub(super) fn usb_detach_tramp(hc: &usb::xhci::Hc, slot: u8, p: usize) {
     let b = unsafe { &*(p as *const UsbCls) };
     let hs: alloc::vec::Vec<u64> = FUNCS.lock().iter()
         .filter(|e| e.1 == p && core::ptr::eq(&*e.2.hc, hc) && e.2.slot == slot).map(|e| e.0).collect();
     for h in hs {
-        if let Some(d) = b.detach {
-            match &b.gate {
-                None => d(h, b.ctx),
-                Some(g) => { g.call(crate::kmod::gate::Class::Upper, || d(h, b.ctx)); }
+        match &b.gate {
+            None => run_detach(b, h),
+            Some(g) => {
+                let ran = match b.detach {
+                    Some(d) => g.call(crate::kmod::gate::Class::Upper, || d(h, b.ctx)).is_some(),
+                    None => true,
+                };
+                if ran {
+                    MATCHES.lock().retain(|e| e.0 != h);
+                    drop_func(h);
+                } else {
+                    let mut pg = PENDING_GONE.lock();
+                    if !pg.contains(&h) { pg.push(h); }
+                }
             }
         }
+    }
+}
+
+/// An unload was refused and the Upper gate reopened: replay the detaches that arrived while it was
+/// closed, and re-offer the functions whose probe was declined meanwhile.
+pub fn usb_class_reopened(p: u64) {
+    let p = p as usize;
+    let b = unsafe { &*(p as *const UsbCls) };
+    let mine: alloc::vec::Vec<u64> = {
+        let funcs = FUNCS.lock();
+        let mut pg = PENDING_GONE.lock();
+        let m: alloc::vec::Vec<u64> = pg.iter().copied().filter(|h| funcs.iter().any(|e| e.0 == *h && e.1 == p)).collect();
+        pg.retain(|h| !m.contains(h));
+        m
+    };
+    for h in mine {
+        if let (Some(d), Some(g)) = (b.detach, &b.gate) { g.call(crate::kmod::gate::Class::Upper, || d(h, b.ctx)); }
         MATCHES.lock().retain(|e| e.0 != h);
         drop_func(h);
     }
+    usb::class::reoffer_owner(b.owner);
 }
 
 /// Register a USB class driver for the given USB id-table entries. Interfaces that were
@@ -362,8 +401,14 @@ pub fn usb_class_teardown(p: u64) {
     let hs: alloc::vec::Vec<(u64, Arc<UsbFunction>)> = FUNCS.lock().iter().filter(|e| e.1 == p).map(|e| (e.0, e.2.clone())).collect();
     for (h, f) in hs {
         if let Some(d) = b.detach { d(h, b.ctx); }
+        let gone = { let mut pg = PENDING_GONE.lock(); let n = pg.len(); pg.retain(|x| *x != h); pg.len() != n };
         let m = { let mut g = MATCHES.lock(); g.iter().position(|e| e.0 == h).map(|i| g.remove(i).1) };
         drop_func(h);
-        if let (Some(m), Ok(f)) = (m, Arc::try_unwrap(f)) { usb::class::requeue(m, f); }
+        if gone { continue; } // the device left during a refused unload: nothing to hand back
+        match (m, Arc::try_unwrap(f)) {
+            (Some(m), Ok(f)) => { if !usb::class::requeue(m, f) { crate::kmod::log("[kmod] usb teardown: device already left, function dropped\n"); } }
+            (Some(_), Err(_)) => crate::kmod::log("[kmod] usb teardown: function still referenced, not requeued\n"),
+            _ => {}
+        }
     }
 }

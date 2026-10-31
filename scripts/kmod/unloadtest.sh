@@ -72,6 +72,7 @@ if [ -n "${UPPER:-}" ]; then
   export LEANDROS_QEMU_EXTRA="-device qemu-xhci,id=xhs -device usb-kbd,bus=xhs.0,id=kbd1 -drive if=none,id=stk,format=raw,file=$stick -device usb-storage,bus=xhs.0,drive=stk"
   python3 "$RT" "$arch" ul3 \
     "for d in /lib/modules/*/; do if kmodctl load \${d}hello.kmod >/dev/null 2>&1; then kmodctl rmmod hello >/dev/null 2>&1; MD=\${d%/}; break; fi; done; mkdir /tmp/stk" \
+    "mount -t f2fs /dev/sda /tmp/stk; echo MOUNTRW_RC=\$?; kmodctl rmmod usb_storage; echo BUSYRW_RC=\$?; echo hi > /tmp/stk/f1 && sync; echo WRITEAFTER_RC=\$?; cat /tmp/stk/f1 > /tmp/f1copy; echo CATAFTER_RC=\$?; umount /tmp/stk; echo UMOUNTRW_RC=\$?" \
     "mount -t f2fs -o ro /dev/sda /tmp/stk; echo MOUNT_RC=\$?; kmodctl rmmod usb_storage; echo BUSY_RC=\$?" \
     "umount /tmp/stk; kmodctl rmmod usb_storage; echo UMNT_RM_RC=\$?" \
     "sleep 1; kmodctl load $M/usb_storage.kmod; sleep 3; mount -t f2fs -o ro /dev/sda /tmp/stk; echo REMOUNT_RC=\$?; umount /tmp/stk; kmodctl rmmod usb_storage; echo RM2_RC=\$?" \
@@ -80,6 +81,10 @@ if [ -n "${UPPER:-}" ]; then
   L="${FFSESSION_OUT:-/tmp/ffsession}/tests-ul3/serial-full.log"
   check 'usb_storage busy: mounted' "mounted usb_storage is busy"
   check 'BUSY_RC=1' "rmmod of mounted usb_storage fails"
+  check 'BUSYRW_RC=1' "rmmod of rw-mounted usb_storage fails (fast EBUSY)"
+  check 'WRITEAFTER_RC=0' "rw fs still writes + syncs right after the refused rmmod"
+  check 'CATAFTER_RC=0' "rw fs still reads after the refused rmmod"
+  check 'UMOUNTRW_RC=0' "rw umount after refused rmmod"
   check 'UMNT_RM_RC=0' "rmmod after umount ok"
   check 'REMOUNT_RC=0' "reload re-mounts"
   check 'RM2_RC=0' "second rmmod ok"

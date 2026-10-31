@@ -85,10 +85,17 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
     let g = match gate::get(m.id) { Some(g) => g, None => return zombie(m.id, s, "no gate") };
     if gate::current().map_or(false, |c| c.id == m.id) { registry::set_state(m.id, State::Live); return -35; }
     let t0 = sched::monotonic_ns();
-    // D9: close the Upper gate first, then judge busy rules against a quiescent upper edge.
+    // Fast path: judge busy BEFORE the gate closes, so a refused rmmod disrupts nothing (no gated call fails).
+    if let Some(why) = registry::busy_reason(m.id) {
+        registry::set_state(m.id, State::Live);
+        drivers::pci::serial_debug(&alloc::format!("[kmod] {} busy: {}\n", s, why));
+        return EBUSY;
+    }
+    // D9: close the Upper gate and re-judge against a quiescent upper edge (an open may have raced the check above)., then judge busy rules against a quiescent upper edge.
     if !g.close_and_drain(Class::Upper, 2000) { return zombie(m.id, s, "upper drain timeout"); }
     if let Some(why) = registry::busy_reason(m.id) {
         g.reopen(Class::Upper);
+        registry::reopened(m.id);
         registry::set_state(m.id, State::Live);
         drivers::pci::serial_debug(&alloc::format!("[kmod] {} busy: {}\n", s, why));
         return EBUSY;

@@ -133,6 +133,8 @@ pub enum Offer {
 
 /// Offer a freshly configured function to the class drivers. Task context.
 pub fn offer(f: UsbFunction, bus: u8, vid: u16, pid: u16) -> Offer {
+    let key = (&*f.hc as *const _ as usize, f.slot);
+    GONE.lock().retain(|g| *g != key); // a new function on this slot: the old departure no longer applies
     let m0 = Match { bus, vid, pid, ..Default::default() };
     match try_drivers(&drivers(), f, m0) {
         Ok(()) => Offer::Claimed,
@@ -162,7 +164,33 @@ pub fn register(d: Driver) {
 pub fn unregister_owner(owner: KmodId) { MODULES.lock().retain(|d| d.owner != owner); }
 
 /// Keep a function whose driver went away for drivers registered later (reload re-probes it).
-pub fn requeue(m: Match, f: UsbFunction) { UNCLAIMED.lock().push((m, f)); }
+/// False (function dropped) when its device already left: the hot-unplug purge ran earlier, and
+/// the departure record is checked under the same lock the purge takes.
+pub fn requeue(m: Match, f: UsbFunction) -> bool {
+    let key = (&*f.hc as *const _ as usize, f.slot);
+    let gone = GONE.lock();
+    if gone.contains(&key) { return false; }
+    UNCLAIMED.lock().push((m, f));
+    drop(gone);
+    true
+}
+
+/// Devices that left (hc address, slot) since their slot was last offered a function.
+static GONE: Mutex<Vec<(usize, u8)>> = Mutex::new(Vec::new());
+
+/// An unload that was refused (EBUSY) reopened the module's gate: offer it the functions whose
+/// probe was declined while the gate was closed.
+pub fn reoffer_owner(owner: KmodId) {
+    let Some(d) = MODULES.lock().iter().find(|d| d.owner == owner).copied() else { return };
+    let pending: Vec<(Match, UsbFunction)> = core::mem::take(&mut *UNCLAIMED.lock());
+    for (m0, f) in pending {
+        let one = [d];
+        match try_drivers(&one, f, m0) {
+            Ok(()) => {}
+            Err((f, _)) => UNCLAIMED.lock().push((m0, f)),
+        }
+    }
+}
 
 /// Asked once per interface that no class driver wants yet: vid, pid, class, subclass, protocol.
 /// The kernel's module autoloader installs it; a module it loads registers its driver from `init`.
@@ -186,7 +214,12 @@ pub fn unclaimed_count() -> usize { UNCLAIMED.lock().len() }
 
 /// The device on (`hc`, `slot`) left: drop it from the unclaimed list and tell every driver.
 pub fn detach(hc: &crate::xhci::Hc, slot: u8) {
-    UNCLAIMED.lock().retain(|(_, f)| !(core::ptr::eq(&*f.hc, hc) && f.slot == slot));
+    {
+        let mut gone = GONE.lock();
+        let key = (hc as *const _ as usize, slot);
+        if !gone.contains(&key) { gone.push(key); }
+        UNCLAIMED.lock().retain(|(_, f)| !(core::ptr::eq(&*f.hc, hc) && f.slot == slot));
+    }
     for d in drivers() {
         if let Some(h) = d.detach { h(hc, slot, d.ctx); }
     }

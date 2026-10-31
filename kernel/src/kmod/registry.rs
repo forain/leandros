@@ -147,6 +147,7 @@ pub fn busy_reason(id: KmodId) -> Option<&'static str> {
             RegKind::BLK => {
                 let mounts = vfs_server::list_mounts();
                 for p in drivers::blkdev::family_paths(h as usize) {
+                    if vfs_server::mounting_device(p) { return Some("mounting"); }
                     let want = p.strip_prefix("/dev/").unwrap_or(p);
                     if mounts.iter().any(|m| m.in_use && m.device.strip_prefix("/dev/").unwrap_or(m.device) == want) { return Some("mounted"); }
                 }
@@ -162,6 +163,12 @@ pub fn busy_reason(id: KmodId) -> Option<&'static str> {
 pub fn pre_exit(id: KmodId) {
     let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == id).map(|r| (r.1, r.2)).collect();
     for (k, h) in recs { if k == RegKind::USB_CLASS { super::exports::usb_class_teardown(h); } }
+}
+
+/// A refused unload reopened the Upper gate: replay what arrived while it was closed.
+pub fn reopened(id: KmodId) {
+    let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == id).map(|r| (r.1, r.2)).collect();
+    for (k, h) in recs { if k == RegKind::USB_CLASS { super::exports::usb_class_reopened(h); } }
 }
 
 /// Unload step 2: tell consumers the module's upper-edge objects are going (netifs record what a reload needs).
