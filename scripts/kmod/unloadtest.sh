@@ -19,7 +19,7 @@ python3 "$RT" "$arch" ul1 --cmdline "kmod.leaktick=1" \
   "kmodctl rmmod virtio_rng; kmodctl rmmod virtio_net; for i in \$(seq 1 $N); do kmodctl load $M/virtio_rng.kmod >/dev/null 2>&1 || echo RNGLOADFAIL \$i; kmodctl rmmod virtio_rng >/dev/null 2>&1 || echo RNGUNLOADFAIL \$i; done; echo RNGLOOP_DONE" \
   "(ping -c 100000 -i 0.01 192.168.105.1 >/dev/null 2>\&1 \&); for i in \$(seq 1 ${NET_N:-20}); do kmodctl load $M/virtio_net.kmod >/dev/null 2>&1 || echo NETLOADFAIL \$i; sleep 4; echo NETRELOAD_OK \$i; kmodctl rmmod virtio_net >/dev/null 2>&1 || echo NETUNLOADFAIL \$i; done; echo NETLOOP_DONE" \
   "kmodctl load $M/hello.kmod; o=\$(/bin/sudo -u leandro /bin/kmodctl rmmod hello 2>&1); echo NONROOT_RC=\$? OUT=\$o; kmodctl rmmod hello" > /dev/null 2>&1
-L=/tmp/ffsession/tests-ul1/serial-full.log
+L="${FFSESSION_OUT:-/tmp/ffsession}/tests-ul1/serial-full.log"
 fail=0
 check() { if grep -aq -- "$1" "$L"; then echo "ok   $2"; else echo "FAIL $2"; fail=1; fi; }
 nocheck() { if grep -aq -- "$1" "$L"; then echo "FAIL $2"; fail=1; else echo "ok   $2"; fi; }
@@ -45,4 +45,28 @@ n=$(grep -a 'DHCP configured, address: .* (eth0)' "$L" | wc -l)
 if [ "$n" -ge "${NET_N:-20}" ]; then echo "ok   eth0 DHCP + traffic after each reload ($n)"; else echo "FAIL eth0 DHCP after reloads ($n)"; fail=1; fi
 check 'NONROOT_RC=[0-9]* OUT=.*delete_module: Operation not permitted (errno 1)' "non-root errno is EPERM"
 nocheck 'STALE REACHED' "stale registration never reaches the new generation"
+# ---- U3 upper edge (kmodupper): mounted usb_storage is busy, reload re-mounts, usb_hid x10, kmbad_leak Zombie.
+# Needs KMOD_EXTRA="... kmbad_leak usb_storage usb_hid" and an untracked .config (CONFIG_MODULES=y CONFIG_USB_HID=m CONFIG_USB_STORAGE=m).
+# The stick is a small f2fs volume made by scripts/mkfs-f2fs-home.py (mounted read-only; a rw umount of it broke the root lookup).
+if [ -n "${UPPER:-}" ]; then
+  stick="${TMPDIR:-/tmp}/ul-stick.img"; rm -f "$stick"; python3 scripts/mkfs-f2fs-home.py create "$stick" --size 128M >/dev/null
+  export LEANDROS_QEMU_EXTRA="-device qemu-xhci,id=xhs -device usb-kbd,bus=xhs.0,id=kbd1 -drive if=none,id=stk,format=raw,file=$stick -device usb-storage,bus=xhs.0,drive=stk"
+  python3 "$RT" "$arch" ul3 \
+    "for d in /lib/modules/*/; do if kmodctl load \${d}hello.kmod >/dev/null 2>&1; then kmodctl rmmod hello >/dev/null 2>&1; MD=\${d%/}; break; fi; done; mkdir /tmp/stk" \
+    "mount -t f2fs -o ro /dev/sda /tmp/stk; echo MOUNT_RC=\$?; kmodctl rmmod usb_storage; echo BUSY_RC=\$?" \
+    "umount /tmp/stk; kmodctl rmmod usb_storage; echo UMNT_RM_RC=\$?" \
+    "sleep 1; kmodctl load $M/usb_storage.kmod; sleep 3; mount -t f2fs -o ro /dev/sda /tmp/stk; echo REMOUNT_RC=\$?; umount /tmp/stk; kmodctl rmmod usb_storage; echo RM2_RC=\$?" \
+    "for i in \$(seq 1 10); do kmodctl rmmod usb_hid >/dev/null 2>&1; kmodctl load $M/usb_hid.kmod >/dev/null 2>&1 || echo HIDLOADFAIL \$i; sleep 1; done; echo HIDLOOP_DONE" \
+    "kmodctl load $M/kmbad_leak.kmod; kmodctl rmmod kmbad_leak; echo LEAKRM_RC=\$?; cat /proc/modules" > /dev/null 2>&1
+  L="${FFSESSION_OUT:-/tmp/ffsession}/tests-ul3/serial-full.log"
+  check 'usb_storage busy: mounted' "mounted usb_storage is busy"
+  check 'BUSY_RC=1' "rmmod of mounted usb_storage fails"
+  check 'UMNT_RM_RC=0' "rmmod after umount ok"
+  check 'REMOUNT_RC=0' "reload re-mounts"
+  check 'RM2_RC=0' "second rmmod ok"
+  check 'HIDLOOP_DONE' "usb_hid x10 finished"
+  nocheck 'HIDLOADFAIL' "usb_hid reload clean"
+  check 'kmbad_leak ZOMBIE: ungated registrations left' "kmbad_leak becomes Zombie"
+  check 'kmbad_leak .* Zombie' "kmbad_leak Zombie in /proc/modules"
+fi
 exit $fail
