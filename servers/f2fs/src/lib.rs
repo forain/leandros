@@ -596,6 +596,13 @@ struct BlockCache {
     /// once instead of once per block.
     misses: [(u64, u32); MISS_BATCH],
     nmiss: usize,
+    /// Set while a request walks a whole node tree to free it (truncate,
+    /// unlink): a doomed run then records EVERY uncached block it meets in
+    /// `extra`, past `MISS_BATCH`, so the fetch pass brings the whole tree in
+    /// and the rerun completes (lane f2fshang; 4000 cold dnodes took ~250
+    /// reruns of the whole walk before).
+    collect_all: bool,
+    extra: alloc::vec::Vec<u64>,
     /// Blocks on the device (misses at or past it are dropped: a doomed run
     /// walks zero-filled blocks and can compute any address).
     dev_blocks: u64,
@@ -636,6 +643,8 @@ const GEN_BLK_SLOTS: usize = 4096;
 const FETCH_MAX: usize = 32;
 /// Distinct misses one doomed run records for a single unlocked fetch pass.
 const MISS_BATCH: usize = 16;
+/// Most uncached blocks a tree-walking doomed run remembers beyond `MISS_BATCH`.
+const EXTRA_MISS_MAX: usize = 1 << 16;
 /// Blocks of gap a fetch pass reads through to join two misses into one
 /// device command (a few KiB more transfer instead of one more command,
 /// which on the USB stick can queue behind a 0.25-1 s write).
@@ -670,6 +679,8 @@ impl BlockCache {
             probe: PROBE_OFF,
             icsum: None,
             misses: [(0, 0); MISS_BATCH],
+            collect_all: false,
+            extra: alloc::vec::Vec::new(),
             nmiss: 0,
             dev_blocks: u64::MAX,
             dirtied: 0,
@@ -700,6 +711,8 @@ impl BlockCache {
     /// A request starts in no-I/O mode.
     fn probe_start(&mut self) {
         self.probe = PROBE_ON;
+        self.collect_all = false;
+        self.extra.clear();
         self.ep += 1;
         self.undo.clear();
         self.undo_data.clear();
@@ -724,7 +737,14 @@ impl BlockCache {
             }
             PROBE_MISSED => {
                 if !FSYNCBATCH_ON.load(atomic::Ordering::Relaxed) { return; }
-                if blk == 0 || blk >= self.dev_blocks || self.nmiss >= MISS_BATCH { return; }
+                if blk == 0 || blk >= self.dev_blocks { return; }
+                if self.nmiss >= MISS_BATCH {
+                    if self.collect_all && n == 1 && self.extra.len() < EXTRA_MISS_MAX
+                        && self.extra.last() != Some(&blk) && self.extra.try_reserve(1).is_ok() {
+                        self.extra.push(blk);
+                    }
+                    return;
+                }
                 let end = blk + n as u64;
                 if self.misses[..self.nmiss].iter().any(|&(b, m)| blk >= b && end <= b + m as u64) {
                     return;
@@ -957,6 +977,19 @@ impl BlockCache {
             self.lru_push_back(i);
         }
         true
+    }
+
+    /// Forget every clean, unpinned block (test knob `/proc/f2fsdropcache`).
+    fn drop_clean(&mut self) {
+        for i in 0..self.meta.len() {
+            if !self.pinned(i) && self.meta[i].blk_no != NULL_BLK {
+                self.hash_remove(i);
+                self.meta[i].blk_no = NULL_BLK;
+                self.meta[i].uep = 0;
+                self.lru_unlink(i);
+                self.lru_push_back(i);
+            }
+        }
     }
 
     /// A slot for a block not in the cache, detached from its old block (if
@@ -2282,6 +2315,9 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
     let noio = sched::irqctx::can_sleep() && sched::current_pid() != 0;
     if !noio { note_atomic_request(); }
     let mut mounts = lock_mounts();
+    if vfs_server::F2FS_DROP_CLEAN.swap(false, atomic::Ordering::Relaxed) {
+        for ms in mounts.iter_mut().flatten() { ms.cache.drop_clean(); }
+    }
     let mut rounds = 0u32;
     let mut space_cps = 0u32;
     let mut pressure_cps = 0u32;
@@ -2290,6 +2326,7 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
         if !noio || rounds >= NOIO_MAX_ROUNDS {
             if noio {
                 NOIO_GAVE_UP.fetch_add(1, atomic::Ordering::Relaxed);
+                vfs_server::F2FS_NOIO_GAVE_UP.fetch_add(1, atomic::Ordering::Relaxed);
                 if !NOIO_GAVE_UP_REPORTED.swap(true, atomic::Ordering::Relaxed) {
                     dbg_str("[F2FS] a request needed more than 1024 unlocked metadata reads; finishing it with reads under the lock\n");
                 }
@@ -2348,6 +2385,10 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
         // fsyncbatch; one miss per round before). The install generation of
         // every block is taken now, with the lock held and the block absent.
         let dev = ms.dev;
+        let mut extra = core::mem::take(&mut ms.cache.extra);
+        extra.sort_unstable();
+        extra.dedup();
+        extra.retain(|&b| ms.cache.find(b).is_none());
         let (ranges, k) = plan_fetch(&list);
         let mut gens = [0u32; MISS_BATCH * FETCH_MAX];
         let mut g = 0;
@@ -2378,8 +2419,52 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
             }
             g += r.n;
         }
+        // Everything else the doomed tree walk met uncached, 16 at a time.
+        for chunk in extra.chunks(MISS_BATCH) {
+            let mut l: MissList = ([(0, 0); MISS_BATCH], chunk.len());
+            for (i, &b) in chunk.iter().enumerate() { l.0[i] = (b, 1); }
+            let (rg, kk) = plan_fetch(&l);
+            let (m, ok) = fetch_install(port, mounts, dev, &rg[..kk]);
+            mounts = m;
+            if !ok { rounds = NOIO_MAX_ROUNDS; break; }
+        }
         rounds += 1;
+        vfs_server::F2FS_NOIO_ROUNDS.fetch_add(1, atomic::Ordering::Relaxed);
     }
+}
+
+/// Fetch `ranges` with the lock dropped and install them (the generation
+/// rule of `with_mount`); the guard back, and whether every read succeeded.
+fn fetch_install(port: u32, mut mounts: MountsGuard, dev: usize, ranges: &[FetchRange]) -> (MountsGuard, bool) {
+    let mut gens = [0u32; MISS_BATCH * FETCH_MAX];
+    let mut g = 0;
+    if let Some(ms) = mounts.iter_mut().flatten().find(|m| m.port == port) {
+        for r in ranges {
+            for j in 0..r.n { gens[g] = ms.cache.blk_gen(r.blk + j as u64); g += 1; }
+        }
+    }
+    if ranges.len() > 1 { NOIO_BATCHED.fetch_add(ranges.len() as u32 - 1, atomic::Ordering::Relaxed); }
+    drop(mounts);
+    let fetched = fetch_pass(dev, ranges);
+    mounts = lock_mounts();
+    let mut all_ok = true;
+    let mut g = 0;
+    for (i, r) in ranges.iter().enumerate() {
+        if let Some((buf, claimed, ok)) = &fetched[i] {
+            if !*ok {
+                all_ok = false;
+            } else if let Some(ms) = mounts.iter_mut().flatten().find(|m| m.port == port) {
+                for j in 0..r.n {
+                    if !ms.cache.install_fetched(dev, r.blk + j as u64, &buf[j * BLOCK_SIZE..], gens[g + j]) {
+                        NOIO_STALE.fetch_add(1, atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            if *claimed { fetch_release(dev, r.blk); }
+        }
+        g += r.n;
+    }
+    (mounts, all_ok)
 }
 
 // ── File data generations (lock-free bulk reads) ──────────────────────────────
@@ -3301,6 +3386,13 @@ fn sit_mark_block_free(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
 /// nothing and must not be refunded, or a sparse file's count goes negative.
 fn free_block(ms: &mut MountState, phys: u32) -> bool {
     if let Some((seg, blk)) = blkaddr_to_seg(ms, phys) {
+        if ms.cache.poisoned() {
+            // A doomed run's changes are discarded: do not mark (and undo)
+            // the block, only make sure its SIT block is fetched (lane
+            // f2fshang; a doomed truncate used to redo every free per round).
+            let _ = ms.cache.read(ms.dev, ms.sb.sit_addr(seg / SIT_PER_BLK as u32) as u64);
+            return true;
+        }
         sit_mark_block_free(ms, seg, blk);
         return true;
     }
@@ -5495,6 +5587,12 @@ fn free_dnode(ms: &mut MountState, nid: u32) {
 /// recycled here — see the module notes on why nid reuse is unsafe without a
 /// free list.
 fn free_inode_data_and_nodes(ms: &mut MountState, ino: u32) {
+    ms.cache.collect_all = true;
+    free_inode_data_and_nodes_walk(ms, ino);
+    ms.cache.collect_all = false;
+}
+
+fn free_inode_data_and_nodes_walk(ms: &mut MountState, ino: u32) {
     data_changed(ms, ino);
     // The inode is going away: so do its cached pages (a doomed round
     // dropping them early costs a re-read, nothing else).
@@ -5585,6 +5683,12 @@ fn truncate_to_zero(ms: &mut MountState, ino: u32) {
 /// from its parent. NAT entries for freed nids are deliberately left stale: nid
 /// reuse is unsafe without a free list, exactly as in the unlink path.
 fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
+    ms.cache.collect_all = true;
+    truncate_to_walk(ms, ino, new_len);
+    ms.cache.collect_all = false;
+}
+
+fn truncate_to_walk(ms: &mut MountState, ino: u32, new_len: u64) {
     data_changed(ms, ino);
     let iblkaddr = nat_lookup(ms, ino);
     if iblkaddr == 0 { return; }
