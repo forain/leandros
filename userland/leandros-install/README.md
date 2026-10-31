@@ -142,7 +142,8 @@ With `--json`, `shrink` emits, one object per line:
   (S1-S6 superblock, S7 swap, S0 mounted, S8 target size >= minimum + 2 GiB,
   S9 stick space, S10 fsck). A failed gate is followed by `{"ev":"error"}`
   and exit status 1.
-- `{"ev":"shrink_info",...}` sizes, `{"ev":"step","name":"backup|rehearse|hash|fsck|resize|verify","pct":0..100}`
+- `{"ev":"shrink_info",...}` sizes, `{"ev":"step","name":"backup|rehearse|hash|fsck|resize|verify","pct":0..100}`,
+  `{"ev":"hash_progress","phase":"pre|verify|rollback","path":..,"bytes":N}` (every 64 MiB hashed of one file, so long hashes show motion)
 - `{"ev":"done","part":..,"new_bytes":..,"old_bytes":..,"state":"boot_linux"}`
   (`--dry-run` adds `"dry_run":true`; `--recover` emits `"recovered":true`).
 

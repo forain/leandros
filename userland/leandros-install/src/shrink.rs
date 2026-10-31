@@ -28,6 +28,8 @@ use std::process::{Command, Stdio};
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
+/// Pipe reads deliver at most one ring of data; bigger buffers only cost prefault time.
+const HASH_BUF: usize = 16 * 1024;
 pub const BACKUP_ROOT: &str = "/home/dualboot-backup";
 
 #[derive(Default, Clone)]
@@ -419,7 +421,7 @@ fn high_files(dev: &str, files: &[(u64, String)], limit: u64, dir: &str) -> Resu
     Ok(hits)
 }
 
-fn hash_path(dev: &str, path: &str) -> Result<String, String> {
+fn hash_path(dev: &str, path: &str, out: &Out, what: &str) -> Result<String, String> {
     if path.contains('"') || path.contains('\n') {
         return Ok("skipped".into());
     }
@@ -431,13 +433,22 @@ fn hash_path(dev: &str, path: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     let mut o = c.stdout.take().unwrap();
     let mut h = Sha256::new();
-    let mut b = vec![0u8; MIB as usize];
+    let mut b = vec![0u8; HASH_BUF];
+    let (mut total, mut next) = (0u64, 64 * MIB);
     loop {
         let n = o.read(&mut b).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
         h.update(&b[..n]);
+        total += n as u64;
+        if total >= next {
+            out.event(
+                &format!("{{\"ev\":\"hash_progress\",\"phase\":\"{}\",\"path\":\"{}\",\"bytes\":{}}}", esc(what), esc(path), total),
+                &format!("[hash {}] {} {} MiB", what, path, total / MIB),
+            );
+            next = total + 64 * MIB;
+        }
     }
     let _ = c.wait();
     Ok(crate::copy::hex(&h.finalize()))
@@ -520,6 +531,13 @@ fn run_resize(dev: &str, undo: &str, sectors: u64, out: &Out) -> Result<(), Stri
         .spawn()
         .map_err(|e| format!("resize2fs: {}", e))?;
     let mut so = c.stdout.take().unwrap();
+    let eh = c.stderr.take().map(|mut e| {
+        std::thread::spawn(move || {
+            let mut err = String::new();
+            let _ = e.read_to_string(&mut err);
+            err
+        })
+    });
     let mut p = Prog { pass: 1, x: 0 };
     let mut last = 101u32;
     let mut all = String::new();
@@ -533,10 +551,7 @@ fn run_resize(dev: &str, undo: &str, sectors: u64, out: &Out) -> Result<(), Stri
         p.feed(&s, out, &mut last, c.id());
         all.push_str(&s);
     }
-    let mut err = String::new();
-    if let Some(mut e) = c.stderr.take() {
-        let _ = e.read_to_string(&mut err);
-    }
+    let err = eh.and_then(|h| h.join().ok()).unwrap_or_default();
     let st = c.wait().map_err(|e| e.to_string())?;
     if !st.success() {
         return Err(format!("resize2fs failed (rc {}): {}", st.code().unwrap_or(-1), tail(&format!("{}{}", all.replace(['\x08', 'X', '-'], ""), err))));
@@ -729,7 +744,7 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
     let hi = high_files(&dev, &flist, new_blocks * sb.bs / sb.bs, &dir)?;
     let mut hashes: Vec<(String, String)> = vec![];
     for (k, (_, path)) in hi.iter().enumerate() {
-        hashes.push((path.clone(), hash_path(&dev, path)?));
+        hashes.push((path.clone(), hash_path(&dev, path, &out, "pre")?));
         out.step("hash", 20 + (k as u32 + 1) * 80 / hi.len() as u32);
     }
     out.step("hash", 100);
@@ -842,7 +857,7 @@ fn real_run(dev: &str, st: &mut Vec<(&str, String)>, dir: &str, undo: &str, new_
     }
     out.step("verify", 50);
     for (path, want) in hashes {
-        let got = hash_path(dev, path)?;
+        let got = hash_path(dev, path, out, "verify")?;
         if &got != want {
             return Err(format!("file {} changed during the resize (sha256 mismatch)", path));
         }
@@ -932,12 +947,12 @@ fn hdr_diff_allowed(o: usize) -> bool {
     sb_field_allowed(o) || o < 0x14 || (0x150..0x160).contains(&o) || (0x5c..0x68).contains(&o) || (0x40..0x44).contains(&o) || (0xce..0xd0).contains(&o) || (0x16c..0x170).contains(&o)
 }
 
-fn rehash(dev: &str, dir: &str) -> Result<usize, String> {
+fn rehash(dev: &str, dir: &str, out: &Out) -> Result<usize, String> {
     let t = crate::plan::read_to_string(&format!("{}/hashes.txt", dir));
     let mut n = 0;
     for l in t.lines() {
         if let Some((h, path)) = l.split_once("  ") {
-            let got = hash_path(dev, path)?;
+            let got = hash_path(dev, path, out, "rollback")?;
             if got != h {
                 return Err(format!("file {} differs from its hash after the rollback", path));
             }
@@ -974,7 +989,7 @@ fn verify_restored(dev: &str, dir: &str, orig_blocks: u64, out: &Out) -> Result<
             None => return Err(format!("the group {} backup superblock is not valid", g)),
         }
     }
-    let n = rehash(dev, dir)?;
+    let n = rehash(dev, dir, out)?;
     out.info(&format!("verified: fsck clean, {} blocks, guard cleared everywhere, {} hashed files intact", orig_blocks, n));
     Ok(())
 }

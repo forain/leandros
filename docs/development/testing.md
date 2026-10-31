@@ -81,7 +81,7 @@ It boots, logs in as root on the serial console and runs each command through th
 
 | Suite | Commands |
 |---|---|
-| `regress` (default) | `sigtest`, `sigtest2`, `memtest`, `scmtest`, `polltest`, `fdmaxtest`, `forktest`, `shmtest`, `exectest`, `pthreadtest`, `epolltest`, `timertest`, `jobtest`, `waittest`, `sigchldtest`, `vfstest`, `nettest`, `udptest`, `pcachetest`, `procmax`, `syscalltest`, `chroottest`, `netctltest`, `pstest`, `sudotest`, `nmtest --quick` (mock), host `sshsmoke.py`, and last host `wifisimtest.py` (it reboots into its own VM) |
+| `regress` (default) | `sigtest`, `sigtest2`, `memtest`, `scmtest`, `polltest`, `fdmaxtest`, `pipebw`, `forktest`, `shmtest`, `exectest`, `pthreadtest`, `epolltest`, `timertest`, `jobtest`, `waittest`, `sigchldtest`, `vfstest`, `nettest`, `udptest`, `pcachetest`, `procmax`, `syscalltest`, `chroottest`, `netctltest`, `pstest`, `sudotest`, `nmtest --quick` (mock), host `sshsmoke.py`, and last host `wifisimtest.py` (it reboots into its own VM) |
 | `net-e2e` | `netctltest`, `nmtest` (mock, full and `--ro`), host `nmrealtest.py` and host `netroamtest.py` (each in its own boot) |
 | `net`, `udp`, `procps`, `netctl` | `nettest`, `udptest`, `pstest`, `netctltest` alone |
 | `wifisim`, `netroam` | `wifisimtest.py`, `netroamtest.py` alone |

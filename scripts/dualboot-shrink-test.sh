@@ -158,7 +158,7 @@ fi
 if phase a; then
 echo "== (a) shrink to 10 GiB"
 fresh_disk; fresh_stick
-boot_stick shrink
+boot_stick qemu-shrink
 r "$LI shrink --part $P2 --to 10G --dry-run --json 2>&1; true" > "$WORK/dry.log"
 grep -q '"ev":"done","dry_run":true' "$WORK/dry.log" && ok "dry run" || { tail -3 "$WORK/dry.log"; fail "dry run"; }
 grep '"ev":"shrink_info"' "$WORK/dry.log" | head -1 | cut -c1-220

@@ -447,7 +447,7 @@ def main():
     bin_files = []
     bins = [
         "shell", "login", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "permtest", "f2fstest", "tput",
-        "pthreadtest", "timertest", "sigtest", "polltest", "fdmaxtest", "ptytest", "forktest", "shmtest", "racetest", "mmapbench",
+        "pthreadtest", "timertest", "sigtest", "polltest", "fdmaxtest", "pipebw", "ptytest", "forktest", "shmtest", "racetest", "mmapbench",
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "uinputtest", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "netlinktest", "udpselftest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",

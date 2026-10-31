@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["libc", "hello", "shell", "init", "login", "greeter-launch", "aplay", "memtest", "vfstest", "permtest", "f2fstest", "tput", "pthreadtest", "timertest", "sigtest", "polltest", "fdmaxtest", "ptytest", "forktest", "racetest", "mmapbench", "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "xattr-util", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "evsplit", "vttest", "venustest", "meminfo", "fsbench", "pcachetest", "shmtest", "dbusprobe", "uptrtest", "poweroff", "loadkmap", "i915test", "netctl", "ps", "strtest", "btd", "uinputtest", "bthid"]
+members = ["libc", "hello", "shell", "init", "login", "greeter-launch", "aplay", "memtest", "vfstest", "permtest", "f2fstest", "tput", "pthreadtest", "timertest", "sigtest", "polltest", "fdmaxtest", "pipebw", "ptytest", "forktest", "racetest", "mmapbench", "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "xattr-util", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "evsplit", "vttest", "venustest", "meminfo", "fsbench", "pcachetest", "shmtest", "dbusprobe", "uptrtest", "poweroff", "loadkmap", "i915test", "netctl", "ps", "strtest", "btd", "uinputtest", "bthid"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

@@ -491,6 +491,17 @@ fn prefault_user_ro(ptr: usize, len: usize) {
     sched::prefault_current_range(ptr, len, true);
 }
 
+/// Bytes of a read/write buffer worth prefaulting for `fd`: a pipe read
+/// delivers at most PIPE_READ_MAX and a pipe write accepts at most the ring,
+/// so prefaulting a 1 MiB buffer per call is pure overhead (256 pages x VMA scans).
+fn pipe_prefault_len(pid: u32, fd: usize, count: usize, write: bool) -> usize {
+    if vfs::is_handle(fd) { return count; }
+    match vfs::pipe_end_of(pid, fd) {
+        Some(_) => count.min(if write { vfs::PIPE_RING_SIZE } else { vfs::PIPE_READ_MAX }),
+        None => count,
+    }
+}
+
 // ── VFS call helper ───────────────────────────────────────────────────────────
 
 /// Build a VFS message with up to 7 u64 arguments packed into data[].
@@ -7206,7 +7217,7 @@ fn sys_write_impl(fd: usize, buf_ptr: usize, count: usize, append_held: bool) ->
     // fault inside the filesystem (its lock held) would deadlock, and the
     // fd 1/2 fast path's read_user_buf would fail with EFAULT on a
     // never-touched page (e.g. a .rodata string of a demand-paged binary).
-    prefault_user(buf_ptr, count);
+    prefault_user(buf_ptr, pipe_prefault_len(current_pid(), fd, count, true));
     let pid = current_pid();
     match fd {
         // Only take the serial fast path if this fd hasn't been dup2'd to a
@@ -7256,6 +7267,25 @@ fn sys_write_impl(fd: usize, buf_ptr: usize, count: usize, append_held: bool) ->
             // sys_read), or any pipeline carrying more than one ring's worth of
             // data dies with a spurious "failed to write whole buffer".
             let nonblock = vfs::fd_nonblock(pid, fd);
+            // POSIX/Linux: a blocking pipe write of more than PIPE_BUF keeps
+            // writing (waiting for ring space) until every byte is in. The
+            // VFS arm accepts at most the free space per call; loop here.
+            // A signal or EPIPE after partial progress returns the partial count.
+            if !nonblock && count > vfs::PIPE_BUF && vfs::pipe_end_of(pid, fd).map_or(false, |(_, w)| w) {
+                let mut done = 0usize;
+                while done < count {
+                    let rem = count - done;
+                    prefault_user(buf_ptr + done, rem.min(vfs::PIPE_RING_SIZE));
+                    let m = make_vfs_msg(vfs::VFS_WRITE, &[fd as u64, (buf_ptr + done) as u64, rem as u64]);
+                    let n = block_until_ready(false,
+                        || vfs_reply_val(&vfs::handle(&m, pid)),
+                        || vfs_block_hint(pid, fd, true));
+                    if n < 0 { return if done > 0 { done as isize } else { n }; }
+                    if n == 0 { break; }
+                    done += n as usize;
+                }
+                return done as isize;
+            }
             block_until_ready(nonblock,
                 || vfs_reply_val(&vfs::handle(&msg, pid)),
                 || vfs_block_hint(pid, fd, true))
@@ -7460,7 +7490,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                 // Demand-page any not-yet-faulted pages in the destination buffer
                 // so the VFS can copy directly without taking a kernel-mode fault.
                 if count != 0 {
-                    prefault_user(buf_ptr, count);
+                    prefault_user(buf_ptr, pipe_prefault_len(current_pid(), fd, count, false));
                 }
             }
             let pid = current_pid();
@@ -7588,7 +7618,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
                 let [base, len] = match ua::read_user::<[usize; 2]>(iov_addr) { Some(v) => v, None => return -14 };
                 if len == 0 { continue; }
                 if !validate_user_buf(base, len) { return -14; }
-                prefault_user(base, len);
+                prefault_user(base, pipe_prefault_len(pid, fd, len, false));
                 let msg = make_vfs_msg(vfs::VFS_READ, &[fd as u64, base as u64, len as u64]);
                 // Blocking pipe: park on EAGAIN (EINTR = short read if partial).
                 let nonblock = vfs::fd_nonblock(pid, fd);

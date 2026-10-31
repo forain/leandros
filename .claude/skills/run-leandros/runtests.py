@@ -81,7 +81,7 @@ import driver  # noqa: E402
 
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest",
-                "/bin/polltest", "/bin/fdmaxtest", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/pthreadtest", "/bin/futextest",
+                "/bin/polltest", "/bin/fdmaxtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/pthreadtest", "/bin/futextest",
                 "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest",
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
                 "/bin/f2fstest mmaporphan /root",
@@ -108,6 +108,8 @@ SUITES = {
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/netlinktest", "/bin/udpselftest", "/bin/udptest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/preadtest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
                 # kexec tool: load + unload only (non-destructive).
+                # A blocking pipe write of >PIPE_BUF delivers every byte (lane pipefix).
+                "/bin/sh -c '[ \"$(dd if=/dev/zero bs=1M count=2 2>/dev/null | wc -c)\" = 2097152 ]'",
                 "/bin/sh -c '/bin/kexec -l /boot/kexec --initrd=/boot/kexec-initrd --append=x && /bin/kexec -u'",
                 # ripgrep (rg): file match, recursive dir walk, stdin, exit codes 0/1.
                 "/bin/sh -c 'rg --version >/dev/null && rg -n root /etc/passwd >/dev/null && rg -l root /etc >/dev/null && echo foo | rg -q foo && { echo foo | rg -q zzz; [ $? -eq 1 ]; }'",
