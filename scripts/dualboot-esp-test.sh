@@ -166,5 +166,5 @@ echo "== untouched Linux + ESP"
 esp_manifest > "$WORK/esp.after"
 grep -v ' ./EFI/leandros/\| ./loader/entries/leandros.conf' "$WORK/esp.after" | diff -q - "$WORK/esp.before" >/dev/null \
     && ok "non-LeandrOS ESP files byte-identical (incl. loader.conf, systemd-boot)" || fail "ESP file manifest changed"
-"$ROOT/scripts/check-dualboot-fixture.sh" "$IMG" | sed -n '/ext4\|e2fsck\|sha256\|ESP\|fsck/p' | head -20
+"$ROOT/scripts/check-dualboot-fixture.sh" "$IMG" | sed -n '/ext4\|e2fsck\|sha256\|ESP\|fsck/p' | head -20 || true  # informational: pristine mode flags the added p4-p6 by design
 echo "DONE"
