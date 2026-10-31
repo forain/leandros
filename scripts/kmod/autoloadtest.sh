@@ -154,7 +154,7 @@ if [[ "$mod" == "i915" ]]; then
         python3 "$RT" "$arch" "alt-$s" --suite "$s" "cat /proc/modules" > "/tmp/autoloadtest-$s.out" 2>&1 || true
         L="/tmp/ffsession/tests-alt-$s/serial-full.log"
         check "$L" '^i915 [0-9]* [0-9]* - Live' "$s: i915 Live in /proc/modules"
-        nocheck "$L" '^i915test: .* [1-9][0-9]* failed' "$s: no failed i915test cases"
+        nocheck "$L" ': FAIL$' "$s: no FAIL case lines"
         grep -aEh 'i915test: .*(passed|failed)|PASS|FAIL' "$L" | tail -n 3
     done
     [[ $fail -eq 0 ]] && echo "autoloadtest i915: PASS" || { echo "autoloadtest i915: FAIL"; exit 1; }
