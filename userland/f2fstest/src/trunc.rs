@@ -4,7 +4,7 @@
 //!
 //! Builds a file with one 4 KiB block every 4 MiB (one dnode each), syncs,
 //! drops the clean cache (`/proc/f2fsdropcache`), then `ftruncate(1 MiB)` must
-//! take under 1 s and at most 8 reruns (16 for 16000 dnodes: one more level of indirect nodes to discover) (`/proc/f2fsstat`), leave 16 sectors (one data block + its dnode)
+//! take under 2 s (6 s for 16000 dnodes; 0.18 ms/dnode on x86_64 TCG, 1 s was borderline there) and at most 16 reruns (24 for 16000 dnodes) (`/proc/f2fsstat`), leave 16 sectors (one data block + its dnode)
 //! (`st_blocks`), and after unlink the free-block count must be back.
 
 use leandros_libc::*;
@@ -48,7 +48,7 @@ unsafe fn drop_cache() {
     if fd >= 0 { let mut b = [0u8; 8]; read(fd, b.as_mut_ptr(), 8); close(fd); }
 }
 
-unsafe fn one(dir: &[u8], dnodes: u64, max_rounds: u64) -> bool {
+unsafe fn one(dir: &[u8], dnodes: u64, max_rounds: u64, max_ms: u64) -> bool {
     let mut db = [0u8; 256];
     let mut pb = [0u8; 256];
     for (i, &c) in dir.iter().enumerate().take(200) { db[i] = c; }
@@ -88,14 +88,20 @@ unsafe fn one(dir: &[u8], dnodes: u64, max_rounds: u64) -> bool {
     out(b" blocks="); out_dec(blocks);
     out(b" bfree_delta="); out_dec(base.wrapping_sub(end));
     out(b"\n");
-    let good = ok && ms < 1000 && dr <= max_rounds && blocks == 16 && end == base;
+    let good = ok && ms < max_ms && dr <= max_rounds && blocks == 16 && end == base;
     if !good { out(b"FAIL trunc_cold\n"); }
     good
 }
 
 pub unsafe fn trunc_cold(dir: &[u8]) -> i32 {
-    if !one(dir, 4000, 8) { return 1; }
-    if !one(dir, 16000, 16) { return 1; }
+    // The regression this guards (one rerun per 16 uncached nodes) costs
+    // dnodes/16 = 250 / 1000 reruns and quadratic time. The healthy count is
+    // 6..11 reruns depending on the volume's node layout (a fresh mkfs'd /home
+    // needs more fetch passes than the populated root; x86_64 TCG measured 8
+    // on / and 11 on /home) and time is linear in dnodes (0.18 ms per dnode on
+    // x86_64 TCG), so the limits leave headroom without hiding the bug.
+    if !one(dir, 4000, 16, 2000) { return 1; }
+    if !one(dir, 16000, 24, 6000) { return 1; }
     out(b"PASS trunc_cold\n");
     0
 }
