@@ -77,11 +77,13 @@ import json, sys
 d = {x["name"]: x for x in (json.loads(l) for l in open(sys.argv[1]) if l.startswith("{"))}
 t = d["nvme0n1"]
 assert t["dualboot"] and t["gaps"], t
-assert not d["vda"]["dualboot"], d["vda"]
+b = [x for x in d.values() if x["boot"]]
+assert len(b) == 1 and not b[0]["dualboot"], b
 g = max(t["gaps"], key=lambda g: g["sectors"])
 print("ok: list: nvme0n1 dualboot=true, gap %d MiB" % (g["sectors"] // 2048))
 PY
-if r "$LI install --mode dualboot --use-free --target /dev/vda --yes --json; true" | grep -q '"ev":"done"'; then fail "install onto the stick was accepted"; fi
+BOOTDISK="$(python3 -c "import json; print([json.loads(l)['name'] for l in open('$WORK/list.json') if l.startswith('{') and json.loads(l)['boot']][0])")"
+if r "$LI install --mode dualboot --use-free --target /dev/$BOOTDISK --yes --json; true" | grep -q '"ev":"done"'; then fail "install onto the stick was accepted"; fi
 ok "install onto the boot stick refused"
 snap() { r "dd if=/dev/nvme0n1 bs=1M count=2 2>/dev/null | sha256sum; dd if=/dev/nvme0n1 bs=1M skip=49150 2>/dev/null | sha256sum" | tr '\n' ' '; }
 B4=$(snap)
@@ -131,7 +133,7 @@ echo "== Linux still boots by default"
 ok "systemd-boot default boots Linux (LINUX-DUALBOOT-OK)"
 
 echo "== choose LeandrOS (scratch copy)"
-SC="$WORK/scratch.img"; cp -c "$IMG" "$SC"; cp -c "$IMG.esp.sha256" "$SC.esp.sha256" 2>/dev/null || true
+SC="$WORK/scratch.img"; cp -c "$IMG" "$SC"; for x in meta manifest esp.sha256; do cp -c "$IMG.$x" "$SC.$x"; done
 ESP="$SC@@2M"
 mtype -i "$ESP" ::/loader/loader.conf > "$WORK/loader.conf.orig"
 printf 'default leandros.conf\ntimeout 1\nconsole-mode keep\n' > "$WORK/loader.conf.test"
