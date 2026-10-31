@@ -362,7 +362,7 @@ pub fn usb_class_teardown(p: u64) {
     let hs: alloc::vec::Vec<(u64, Arc<UsbFunction>)> = FUNCS.lock().iter().filter(|e| e.1 == p).map(|e| (e.0, e.2.clone())).collect();
     for (h, f) in hs {
         if let Some(d) = b.detach { d(h, b.ctx); }
-        let m = MATCHES.lock().iter().position(|e| e.0 == h).map(|i| MATCHES.lock().remove(i).1);
+        let m = { let mut g = MATCHES.lock(); g.iter().position(|e| e.0 == h).map(|i| g.remove(i).1) };
         drop_func(h);
         if let (Some(m), Ok(f)) = (m, Arc::try_unwrap(f)) { usb::class::requeue(m, f); }
     }
