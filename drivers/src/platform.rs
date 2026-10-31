@@ -170,3 +170,44 @@ pub fn scan_dt() -> usize {
     for (c, d) in found { announce(&c, d); }
     n
 }
+
+/// True when any node of the flattened tree carries `compat`, whatever its `status` (the Pi 5 sdio2
+/// `wifi@1` child is invisible to `scan_dt`, which walks enabled nodes only).
+pub fn fdt_has_compat(dtb: &[u8], compat: &str) -> bool {
+    let be = |o: usize| dtb.get(o..o + 4).map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]));
+    if be(0) != Some(0xd00d_feed) { return false; }
+    let (Some(st), Some(strs)) = (be(8), be(12)) else { return false };
+    let (st, strs) = (st as usize, strs as usize);
+    let end = (st + be(36).unwrap_or(0) as usize).min(dtb.len());
+    let mut o = st;
+    while o + 4 <= end {
+        let Some(tok) = be(o) else { return false };
+        o += 4;
+        match tok {
+            1 => {
+                let Some(n) = dtb.get(o..end).and_then(|s| s.iter().position(|&c| c == 0)) else { return false };
+                o = (o + n + 1 + 3) & !3;
+            }
+            3 => {
+                let (Some(len), Some(noff)) = (be(o), be(o + 4)) else { return false };
+                let len = len as usize;
+                let Some(val) = dtb.get(o + 8..o + 8 + len) else { return false };
+                o = (o + 8 + len + 3) & !3;
+                let Some(ns) = dtb.get(strs + noff as usize..) else { return false };
+                let nl = ns.iter().position(|&c| c == 0).unwrap_or(ns.len());
+                if &ns[..nl] == b"compatible" && val.split(|&c| c == 0).any(|c| c == compat.as_bytes()) { return true; }
+            }
+            2 | 4 => {}
+            _ => break,
+        }
+    }
+    false
+}
+
+/// Announce `compat` when the boot DTB has such a node (any status). Run before `scan_dt`.
+pub fn announce_if_in_dtb(compat: &str) -> bool {
+    let Some(dtb) = (unsafe { boot::device_tree::recorded_dtb() }) else { return false };
+    if !fdt_has_compat(dtb, compat) { return false; }
+    announce(compat, PlatDev::default());
+    true
+}

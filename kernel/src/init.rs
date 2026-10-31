@@ -357,6 +357,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         crate::serial_print_str("[plat] DT scan skipped (plat.scan=0)\n");
     } else {
     drivers::platform::set_autoload(crate::kmod::autoload::of_hook);
+    // BRCMF=m: the sdio2 `wifi@1` child is not announced by scan_dt; announce it so the alias autoloads brcmf.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5", not(feature = "drv-brcmf")))] { if drivers::platform::announce_if_in_dtb("brcm,bcm4329-fmac") { crate::serial_print_str("[plat] announced brcm,bcm4329-fmac\n"); } }
     { let n = drivers::platform::scan_dt(); let (t, u) = drivers::platform::counts(); crate::serial_print_str(&alloc::format!("[plat] DT compatibles {} announced {} unclaimed {}\n", n, t, u)); }
     }
     crate::kmod::autoload::boot(); // modules.load= / kmod=0

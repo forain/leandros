@@ -16,3 +16,7 @@ Status: READY FOR PI TRIAL (PARTIAL until the Pi trial confirms the `[brcmf]` ch
 - ktest=kmodkapi aarch64 PASS (0 fail).
 - Box regress lane/kmodbrcmfb aarch64 (efe8c2f1): overall PASS, 844 s; `--gc` run.
 - target/ holds the `--rpi5` MODULES=y BRCMF=m build (root .config removed).
+
+## Autoload fix (kmodbrcmfb2)
+- Bug on the Pi: with BRCMF=m the `brcm,bcm4329-fmac` sdio2 `wifi@1` child was never announced (scan_dt did not see it), so no `[kmod] alias` line. Chosen fix (smaller than a generic SDIO-child scan): `drivers::platform::announce_if_in_dtb` (any-status DTB walk) called from kernel/src/init.rs just before `scan_dt`, only under `rpi5 && !drv-brcmf`; prints `[plat] announced brcm,bcm4329-fmac`. BRCMF=y and non-rpi5 builds are unchanged.
+- Evidence: `--rpi5` default and `--rpi5` MODULES=y BRCMF=m both build; the =m kernel contains the `announced brcm,bcm4329-fmac` string and brcmf.kmod. Not run: ktest=kmodkapi (QEMU image was locked by a concurrent suite) and the final target/ rebuild of the =m kernel.
