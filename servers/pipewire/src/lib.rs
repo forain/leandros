@@ -24,7 +24,7 @@ extern crate alloc;
 use ipc::{Message, port};
 use drivers::snd::VirtioSnd;
 use drivers::hda::Hda;
-use drivers::hdmi_audio::HdmiAudio;
+mod hdmi_ops;
 use drivers::Driver;
 use drivers::pci;
 use kmod_abi::{KSndOps, KSND_CAPTURE};
@@ -36,7 +36,6 @@ enum Backend {
     None,
     Virtio(VirtioSnd),
     Hda(Hda),
-    Hdmi(HdmiAudio),
     /// A loadable sound module (`kapi_snd_register`): the same calls through `KSndOps`.
     Module { ops: &'static KSndOps, ctx: usize },
 }
@@ -52,20 +51,17 @@ impl Backend {
     fn reconfigure_stream(&mut self, id: u32, freq: u32, ch: u8) {
         match self { Backend::Virtio(d) => d.reconfigure_stream(id, freq, ch),
                      Backend::Hda(d) => d.reconfigure_stream(id, freq, ch),
-                     Backend::Hdmi(d) => d.reconfigure_stream(id, freq, ch),
                      Backend::Module { ops, ctx } => (ops.configure)(*ctx, id, freq, ch),
                      Backend::None => {} }
     }
     fn send_pcm_data(&mut self, data: &[u8]) -> usize {
         match self { Backend::Virtio(d) => d.send_pcm_data(data),
                      Backend::Hda(d) => d.send_pcm_data(data),
-                     Backend::Hdmi(d) => d.send_pcm_data(data),
                      Backend::Module { ops, ctx } => (ops.write)(*ctx, data.as_ptr(), data.len()),
                      Backend::None => 0 }
     }
     fn tx_used_idx(&self) -> u16 {
         match self { Backend::Virtio(d) => d.tx_used_idx(), Backend::Hda(d) => d.tx_used_idx(),
-                     Backend::Hdmi(d) => d.tx_used_idx(),
                      Backend::Module { ops, ctx } => (ops.tx_used_idx)(*ctx) as u16,
                      Backend::None => 0 }
     }
@@ -74,20 +70,17 @@ impl Backend {
         match self {
             Backend::Virtio(d) => d.tx_level() as usize * drivers::snd::TX_BUF_BYTES,
             Backend::Hda(d) => d.queued_bytes() as usize,
-            Backend::Hdmi(d) => d.queued_bytes() as usize,
             Backend::Module { ops, ctx } => (ops.queued_bytes)(*ctx),
             Backend::None => 0,
         }
     }
     fn top_up_silence(&mut self) {
         match self { Backend::Virtio(d) => d.top_up_silence(), Backend::Hda(d) => d.top_up_silence(),
-                     Backend::Hdmi(d) => d.top_up_silence(),
                      Backend::Module { ops, ctx } => (ops.top_up_silence)(*ctx),
                      Backend::None => {} }
     }
     fn recover_stream(&mut self) {
         match self { Backend::Virtio(d) => d.recover_stream(), Backend::Hda(d) => d.recover_stream(),
-                     Backend::Hdmi(d) => d.recover_stream(),
                      Backend::Module { ops, ctx } => (ops.recover)(*ctx),
                      Backend::None => {} }
     }
@@ -143,7 +136,6 @@ impl Backend {
         match self {
             Backend::Virtio(_) => alloc::string::String::from("backend: virtio-sound\n"),
             Backend::Hda(d) => d.info(),
-            Backend::Hdmi(d) => d.info(),
             Backend::Module { ops, ctx } => module_text(|b, c| (ops.info)(*ctx, b, c)),
             Backend::None => alloc::string::String::from("backend: none\n"),
         }
@@ -495,10 +487,10 @@ pub fn init(cmdline: &str) -> Result<u32, i32> {
         }
     }
     if matches!(state.snd_driver, Backend::None) && (want == "auto" || want == "hdmi") {
-        let mut h = HdmiAudio::new();
-        if h.probe(cmdline).is_ok() {
+        // The built-in HDMI backend goes through the same KSndOps adapter a module would use.
+        if let Some((ops, ctx)) = hdmi_ops::probe(cmdline) {
             pci::serial_debug("[PW] playback device: HDMI audio (hdmi0)\n");
-            state.snd_driver = Backend::Hdmi(h);
+            state.snd_driver = Backend::Module { ops, ctx };
         }
     }
     if matches!(state.snd_driver, Backend::None) {
@@ -656,7 +648,6 @@ pub fn shutdown(link_reset: bool) -> (alloc::string::String, Option<drivers::pci
             (alloc::format!("HD Audio: {}", h.shutdown(link_reset, 300_000)), f)
         }
         Backend::Virtio(_) => (alloc::string::String::from("virtio-sound: nothing to do"), None),
-        Backend::Hdmi(_) => (alloc::string::String::from("hdmi audio: nothing to do"), None),
         Backend::Module { ops, ctx } => {
             let t = module_text(|b, c| (ops.shutdown)(*ctx, link_reset as u32, b, c));
             (alloc::format!("sound module: {}", t), None)

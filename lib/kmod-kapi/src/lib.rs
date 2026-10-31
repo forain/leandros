@@ -15,6 +15,7 @@ pub fn owner() -> KmodId { KmodId(OWNER.load(Ordering::SeqCst)) }
 pub mod blk;
 pub mod ksync;
 pub mod plat;
+pub mod dma40;
 
 pub mod pci {
     use super::*;

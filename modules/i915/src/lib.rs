@@ -58,6 +58,8 @@ fn init() -> i32 {
         Some(f) => i915::BootEnv { fb_phys: f.phys, fb_width: f.width, fb_height: f.height, fb_pitch: f.pitch },
         None => i915::BootEnv { fb_phys: 0, fb_width: 0, fb_height: 0, fb_pitch: 0 },
     };
+    // The VFS tmpfs census lives in the kernel (servers/drm registers it with drm_class): reach it through the kapi.
+    i915::set_tmpfs_census(kmod_kapi::drm::tmpfs_census);
     i915::run(&env);
     if !kenv::registered() { return -19; }
     STARTED.store(true, Ordering::SeqCst);
