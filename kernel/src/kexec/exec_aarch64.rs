@@ -54,6 +54,39 @@ struct Plan {
 static mut PLAN: Plan = Plan { purgatory: 0, ttbr0: 0, tcr: 0, head: 0, entry: 0, fdt: 0, ranges: 0, nranges: 0, park: 0, cpu_off: 1 };
 static ARMED: AtomicBool = AtomicBool::new(false);
 
+/// Per-CPU stage words in the park page (8 B per dense CPU, 16 CPUs):
+/// 1 divert entry, 2 after gic/timer off, 3 just before the `br`, 4 park page entry.
+const STAGE_OFF: u64 = 0x980;
+static CLEAN_PTR: [core::sync::atomic::AtomicUsize; 16] = [const { core::sync::atomic::AtomicUsize::new(0) }; 16];
+static CLEAN_LEN: [core::sync::atomic::AtomicUsize; 16] = [const { core::sync::atomic::AtomicUsize::new(0) }; 16];
+
+fn stage(n: u64) {
+    let park = unsafe { core::ptr::addr_of!(PLAN.park).read() };
+    let me = unsafe { arch_aarch64::smp::arch_cpu_id() };
+    if park == 0 || me >= 16 { return; }
+    let w = mm::phys_to_virt((park + STAGE_OFF) as usize + 8 * me) as *mut u64;
+    unsafe {
+        w.write_volatile(n);
+        core::arch::asm!("dc civac, {}", "dsb sy", in(reg) w as usize, options(nostack));
+    }
+}
+
+fn note_clean() {
+    let me = unsafe { arch_aarch64::smp::arch_cpu_id() };
+    if me >= 16 { return; }
+    let r = sched::irqctx::sleep_forbidden_reason().unwrap_or("clean");
+    CLEAN_LEN[me].store(r.len(), Ordering::Relaxed);
+    CLEAN_PTR[me].store(r.as_ptr() as usize, Ordering::Release);
+}
+
+fn read_stage(p: u64, i: usize) -> u64 {
+    let w = mm::phys_to_virt((p + STAGE_OFF) as usize + 8 * i) as *const u64;
+    unsafe {
+        core::arch::asm!("dc civac, {}", "dsb sy", in(reg) w as usize, options(nostack));
+        w.read_volatile()
+    }
+}
+
 fn log(s: &str) {
     super::prevlog::tee(s.as_bytes());
     arch_aarch64::uart::serial_print_str(s);
@@ -156,7 +189,19 @@ pub fn prepare(img: &Loaded, map: &[super::info::Raw]) -> Result<(), isize> {
                 p += 64;
             }
         }
-        core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb", options(nostack));
+        // Zero the diagnostic stage words (park page +STAGE_OFF), then the icache op.
+        for i in 0..16usize {
+            let w = mm::phys_to_virt((park + STAGE_OFF) as usize + 8 * i) as *mut u64;
+            w.write_volatile(0);
+            core::arch::asm!("dc civac, {}", in(reg) w as usize, options(nostack));
+        }
+        // `kexec.icache=is`: inner-shareable I-cache invalidate (Pi diag A/B).
+        if crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "kexec.icache=is")) {
+            crate::serial_print_str("[KEXEC] icache: ic ialluis\n");
+            core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack));
+        } else {
+            core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb", options(nostack));
+        }
         PLAN = Plan {
             purgatory: purg as u64, ttbr0: l0 as u64, tcr: t,
             head: img.head, entry: img.entry, fdt: img.bootinfo,
@@ -180,6 +225,8 @@ fn timers_off() {
 /// Divert target: every CPU's interrupt after `stop_and_jump` armed it.
 fn on_ipi() -> ! {
     unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)); }
+    stage(1);
+    note_clean();
     if unsafe { arch_aarch64::smp::arch_cpu_id() } == 0 { final_cpu0() }
     park_off()
 }
@@ -187,6 +234,7 @@ fn on_ipi() -> ! {
 fn park_off() -> ! {
     timers_off();
     arch_aarch64::gic::kexec_cpu_off();
+    stage(2);
     let p = unsafe { core::ptr::addr_of!(PLAN).read() };
     if p.purgatory == 0 { arch_aarch64::smp::cpu_off() }
     extern "C" { static boot_entered_el2: u64; }
@@ -201,6 +249,7 @@ fn park_off() -> ! {
 /// x0..x4 = `a`. Never returns.
 fn enter_idmap(target: u64, a: [u64; 5]) -> ! {
     let p = unsafe { core::ptr::addr_of!(PLAN).read() };
+    stage(3);
     unsafe {
         core::arch::asm!(
             "msr ttbr0_el1, x6",
@@ -236,6 +285,7 @@ fn enter_idmap(target: u64, a: [u64; 5]) -> ! {
 static FINAL: AtomicBool = AtomicBool::new(false);
 
 fn park_hook() {
+    stage(1);
     if FINAL.load(Ordering::Relaxed) && unsafe { arch_aarch64::smp::arch_cpu_id() } == 0 { return; }
     arch_aarch64::exception::divert()
 }
@@ -248,6 +298,8 @@ static STRAGGLER_IN: AtomicBool = AtomicBool::new(false);
 
 fn straggler_entry() -> ! {
     unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)); }
+    stage(1);
+    note_clean();
     let me = unsafe { arch_aarch64::smp::arch_cpu_id() };
     if me == STRAGGLER.load(Ordering::Relaxed) && !STRAGGLER_IN.swap(true, Ordering::AcqRel) {
         log("[KEXEC] test: straggler spinning in uart::getc with IRQs masked\n");
@@ -394,6 +446,14 @@ fn final_cpu0() -> ! {
             dec(cnt);
             log(" elr=");
             hex(elr);
+            log(" stage=");
+            dec(read_stage(p.park, i));
+            let (cp, cl) = (CLEAN_PTR[i].load(Ordering::Acquire), CLEAN_LEN[i].load(Ordering::Relaxed));
+            if cp != 0 {
+                log(" clean=");
+                // SAFETY: a &'static str recorded by note_clean.
+                log(unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(cp as *const u8, cl)) });
+            }
             log(" uart_rx_lock_held=");
             log(if arch_aarch64::uart::rx_lock_held() { "1" } else { "0" });
             log("\n");
@@ -414,6 +474,14 @@ fn final_cpu0() -> ! {
         unsafe { arch_aarch64::power::system_reset(); }
         loop { unsafe { core::arch::asm!("wfe", options(nomem, nostack)); } }
     }
+    log("[KEXEC] park stages:");
+    for i in 1..n {
+        log(" cpu");
+        dec(i as u64);
+        log("=");
+        dec(read_stage(p.park, i));
+    }
+    log("\n");
     // Bus-stage hooks (pcie-perst + bridge reset) only now: every other CPU
     // is on the park page, so none can be mid-access to RP1 when the bridge
     // goes into reset. No allocation, no timer, no locks that a parked CPU
