@@ -21,3 +21,25 @@ Changes:
 - Success prints `[KEXEC] park stages: cpu1=4 cpu2=4 cpu3=4`.
 - Knob `kexec.icache=is` (cmdline of the kexec'ing kernel) selects `ic ialluis` instead of `ic iallu` in prepare().
 - QEMU kexecfdt PASS, stages 4 for all CPUs.
+
+## Pi 5 results, orchestrator (2026-10-31) -- straggler NOT fixed, left open
+
+| build | rounds trial->good | aborted | stuck CPU |
+|---|---|---|---|
+| 2ef04f6d (pikexec3, sleep_until park_check) | 3 | 2 | elr in sleep_until irq window |
+| 8e1354e9 (+ spin relax park hook) | 4 | 2 | same |
+| e8e69e85 (+ tlb_service_pending park) | 6 | 4 | same |
+| 899d41dd diag, default / kexec.icache=is | 4 / 4 | 3 / 2 | `stage=0` every time |
+| 49370207 SDIO GATE, default / brcmf.kexec_poweroff=0 | 6 / 3 | 6 / 3 | `stage=0`, same elr |
+
+- `stage=0`: the stuck CPU never enters the divert/park path at all. Its last IRQ was the timer
+  (irq#27) in the IRQ window of sleep_until (brcmf msleep under a spin::Mutex, netdev.rs:670).
+- Refuted: lock-stranding on spin/RQ/ksync waits (three park-point fixes, no change), stale I-cache on
+  the park page (`ic ialluis` knob, no change), MMIO stall from the SDIO power-off (skipping it: 3/3 still fail).
+- The old good kernel 4ad839207a has the same straggler ("never reached the park page; jumping anyway")
+  and jumps over it; pikexec turned that into abort + clean reset to the card kernel. Pi trials still
+  work: a failed kexec-out lands on the card kernel (= good).
+- Kept: the park points (correct, QEMU-proven both ways, legs lock/rq), stage words, icache knob.
+- Reverted: 49370207 (SDIO GATE: did not help, adds a lock to every SDIO MMIO access).
+- Next, if picked up: sample the stuck CPU's PC via A76 external debug (EDPCSR; needs per-CPU OS-lock
+  clear at boot and the BCM2712 debug base from the ROM table), or GICv2 FIQ-as-NMI (group 0) for the park SGI.
