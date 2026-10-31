@@ -574,7 +574,8 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
     // Stick space: undo + e2image + rehearsal clone.
     std::fs::create_dir_all(&root).map_err(|e| format!("{}: {}", root, e))?;
     let moved = (cur_bytes - new_blocks.min(sb.blocks) * sb.bs).min(used_bytes);
-    let need = moved + used_bytes / 50 + 768 * MIB;
+    let rehearse_on = std::env::var("LEANDROS_SHRINK_REHEARSE").map(|v| v == "1").unwrap_or(false);
+    let need = moved + used_bytes / 50 + if rehearse_on { 768 * MIB } else { 256 * MIB };
     let free = free_on(&root);
     g("S9", "stick-space", free >= need, &format!("{} MiB free on {}, need about {} MiB for the undo file, e2image and the rehearsal clone", free >> 20, root, need >> 20));
     // fsck -fn
