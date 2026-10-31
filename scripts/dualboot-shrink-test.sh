@@ -169,9 +169,9 @@ for PCT in $CRASH_PCTS; do
     $REMOTE run "rm -f /tmp/s.log; nohup $LI shrink --part $P2 --to 10G --yes --json > /tmp/s.log 2>&1 &" >/dev/null 2>&1 || true
     got=""
     for i in $(seq 1 900); do
-        got=$(r "grep -o '\"name\":\"resize\",\"pct\":[0-9]*' /tmp/s.log 2>/dev/null | tail -1 | sed 's/.*://'" || true)
+        got=$(r "grep -o '\"name\":\"resize\",\"pct\":[0-9]*' /tmp/s.log 2>/dev/null | tail -1" || true); got=${got##*:}
         [ -n "$got" ] && [ "$got" -ge "$PCT" ] && break
-        r "grep -q '\"ev\":\"error\"\\|\"ev\":\"done\"' /tmp/s.log" >/dev/null 2>&1 && fail "shrink ended before the crash point (pct $got)"
+        r "grep -q '\"ev\":\"error\"\\|\"ev\":\"done\"' /tmp/s.log" >/dev/null 2>&1 && { r "tail -c 600 /tmp/s.log; true"; fail "shrink ended before the crash point (pct $got)"; }
         sleep 1
     done
     [ -n "$got" ] && [ "$got" -ge "$PCT" ] || fail "resize never reached ${PCT}%"
