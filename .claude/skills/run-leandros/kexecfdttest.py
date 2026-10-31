@@ -148,12 +148,20 @@ def main():
         check("lock straggler path exercised", "spinning on a spin::Mutex held by a parked CPU" in log_from(0))
         # lane pikexec7: gen7 kexecs with CPU 3 spinning (IRQs masked) on a run-queue
         # lock another CPU holds forever; it must park via tlb_service_pending().
-        rc, out = guest(f"{KX} --append='kexec.gen=8'")
+        rc, out = guest(f"{KX} --append='kexec.gen=8 kexec.test_straggler=3 kexec.test_straggler_mode=busy'")
         check("gen7 load (rq straggler)", rc == 0, out.strip()[-80:])
         check("gen7 -> gen8 (rq lock straggler)", kexec_exec("kexec.gen=8") == 0)
         rc, out = guest("grep -c '^processor' /proc/cpuinfo")
         check("gen8 has 4 CPUs online", out.split()[-1:] == ["4"], out.strip()[-40:])
         check("rq straggler path exercised", "spinning on a run-queue lock held by a parked CPU" in log_from(0))
+        # lane pistragglerfix: gen8 kexecs with CPU 3 looping the brcmf-style busy pass
+        # (spin::Mutex held, IRQs masked, only masked_poll_point() as a poll point).
+        rc, out = guest(f"{KX} --append='kexec.gen=9'")
+        check("gen8 load (busy straggler)", rc == 0, out.strip()[-80:])
+        check("gen8 -> gen9 (busy straggler)", kexec_exec("kexec.gen=9") == 0)
+        rc, out = guest("grep -c '^processor' /proc/cpuinfo")
+        check("gen9 has 4 CPUs online", out.split()[-1:] == ["4"], out.strip()[-40:])
+        check("busy straggler path exercised", "looping a busy pass holding a spin::Mutex" in log_from(0))
     full = log_from(0)
     check("straggler path exercised", "straggler spinning in uart::getc" in full)
     for bad in ("never reached the park page", "never came online", "still in the old kernel"):

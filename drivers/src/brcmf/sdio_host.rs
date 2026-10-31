@@ -348,6 +348,7 @@ impl<H: HostIo> SdioHost<H> {
         loop {
             if cond(&mut self.io) { return true; }
             if self.expired(start, timeout_us) { return false; }
+            sched::wedge::park_check();
             core::hint::spin_loop();
         }
     }
@@ -359,6 +360,7 @@ impl<H: HostIo> SdioHost<H> {
         let start = self.io.now_us();
         while self.io.r8(REG_SOFTWARE_RESET) & (SWRST_CMD | SWRST_DAT) != 0 {
             if self.io.now_us().saturating_sub(start) > 10_000 { break; }
+            sched::wedge::park_check();
         }
         self.io.w16(REG_NORMAL_INT_STATUS, 0xFFFF);
         self.io.w16(REG_ERROR_INT_STATUS, 0xFFFF);
@@ -391,6 +393,7 @@ impl<H: HostIo> SdioHost<H> {
                 self.reset_cmd_dat();
                 return Err(BusError::Timeout);
             }
+            sched::wedge::park_check();
             core::hint::spin_loop();
         }
     }
@@ -489,6 +492,7 @@ impl<H: HostIo> SdioHost<H> {
         let start = self.io.now_us();
         while self.io.r16(REG_CLOCK_CONTROL) & CLK_STABLE == 0 {
             if self.io.now_us().saturating_sub(start) > 20_000 { break; }
+            sched::wedge::park_check();
         }
         let cc = self.io.r16(REG_CLOCK_CONTROL);
         self.io.w16(REG_CLOCK_CONTROL, cc | CLK_SD_EN);
@@ -676,6 +680,7 @@ impl<H: HostIo> SdioBus for SdioHost<H> {
             let ps = self.io.r32(REG_PRESENT_STATE);
             if ps & (PSTATE_CMD_INHIBIT | PSTATE_DAT_INHIBIT) == 0 && ps & PSTATE_DAT1_LEVEL == 0 { break true; }
             if self.io.now_us().saturating_sub(start) >= timeout_us as u64 { break false; }
+            sched::wedge::park_check();
             core::hint::spin_loop();
         };
         let en = self.io.r16(REG_NORMAL_INT_ENABLE);
