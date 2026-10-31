@@ -340,6 +340,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-macb"
+version = "0.1.0"
+dependencies = [
+ "kmod-abi",
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "spin",
+]
+
+[[package]]
 name = "kmod-nvme"
 version = "0.1.0"
 dependencies = [
