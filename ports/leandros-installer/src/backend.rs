@@ -23,6 +23,8 @@ pub struct Disk {
     pub shrink_part: String,
     pub shrink_cur: u64,
     pub shrink_min: u64,
+    /// Session B state from `list --json`: "", "boot_linux" or "ready_b".
+    pub finish: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -108,6 +110,7 @@ pub fn parse_line(line: &str) -> Option<Event> {
                 shrink_part: sh.and_then(|o| o.get("part")).and_then(|x| x.as_str()).unwrap_or("").to_string(),
                 shrink_cur: shu("cur_bytes"),
                 shrink_min: shu("min_bytes"),
+                finish: s(&["finish"]),
                 dev: s(&["dev", "path", "name", "device"]),
                 model: s(&["model"]),
                 bus: s(&["bus"]),
@@ -228,6 +231,8 @@ pub enum Mode {
     Free,
     /// Shrink the Linux partition first (two sessions), then install.
     Shrink,
+    /// Session B: Linux was shrunk and booted; cut its GPT entry and install.
+    Finish,
     /// Wipe the whole disk.
     Erase,
 }
@@ -235,7 +240,7 @@ pub enum Mode {
 pub fn install_args(dev: &str, mode: Mode, root_gib: Option<u64>, dry: bool) -> Vec<String> {
     let mut a: Vec<String> = vec!["install".into(), "--target".into(), dev.into()];
     if mode != Mode::Erase {
-        a.extend(["--mode".into(), "dualboot".into(), "--use-free".into()]);
+        a.extend(["--mode".into(), "dualboot".into(), if mode == Mode::Finish { "--after-shrink".into() } else { "--use-free".into() }]);
     }
     if let Some(g) = root_gib {
         a.extend(["--root-gib".into(), g.to_string()]);
@@ -250,6 +255,10 @@ pub fn install_args(dev: &str, mode: Mode, root_gib: Option<u64>, dry: bool) -> 
 
 pub fn shrink_args(part: &str, to_bytes: u64) -> Vec<String> {
     vec!["shrink".into(), "--part".into(), part.into(), "--to".into(), to_bytes.to_string(), "--yes".into(), "--json".into()]
+}
+
+pub fn mark_verified_args() -> Vec<String> {
+    vec!["shrink-status".into(), "--mark-verified".into(), "--json".into()]
 }
 
 pub fn shrink_status_args() -> Vec<String> {

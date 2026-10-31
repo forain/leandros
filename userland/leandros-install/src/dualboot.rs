@@ -360,8 +360,8 @@ pub fn backup(target: &str, g: &Gpt, esp_first: u64, esp_len: u64, dir: &str, ou
 pub fn install(o: &Opts) -> Result<(), String> {
     use crate::disks::{self, Kind};
     let out = Out { json: o.json };
-    if !o.use_free {
-        return Err("--mode dualboot needs --use-free (shrinking Linux is not available yet)".into());
+    if !o.use_free && !o.after_shrink {
+        return Err("--mode dualboot needs --use-free or --after-shrink (shrink the Linux partition first with `shrink`)".into());
     }
     if !o.dry_run && !(cfg!(not(target_os = "linux")) || unsafe_euid_root()) {
         return Err("must run as root".into());
@@ -419,6 +419,27 @@ pub fn install(o: &Opts) -> Result<(), String> {
     let Some(g) = g else {
         return Err(format!("preflight failed: {}", gate.failed.join(",")));
     };
+    // Session B (v1b): the on-disk GPT is `g_disk`; `g` is the table with p2 cut back
+    // to the shrunk filesystem, which opens the gap the v1a flow below installs into.
+    let g_disk = g.clone();
+    let mut g = g;
+    let mut sessb: Option<crate::shrink::SessB> = None;
+    if o.after_shrink {
+        match crate::shrink::session_b(&g_disk, &target, o.backup_root.as_deref()) {
+            Ok(sb_) => {
+                let desc = format!("{}: ext4 shrunk and Linux booted; p2 sectors {}..{} become {}..{}", sb_.dev, g_disk.entry(sb_.slot).map_or(0, |e| e.first), sb_.old_last, g_disk.entry(sb_.slot).map_or(0, |e| e.first), sb_.new_last);
+                gate.pass("B1", "shrink session", &desc);
+                if sb_.new_last < sb_.old_last {
+                    g.shrink(sb_.slot, sb_.new_last)?;
+                }
+                sessb = Some(sb_);
+            }
+            Err(e) => {
+                gate.fail("B1", "shrink session", &e);
+                return Err(format!("preflight failed: {}", gate.failed.join(",")));
+            }
+        }
+    }
     // The ESP.
     let esps: Vec<_> = g.used().into_iter().filter(|(_, e)| e.ptype == gpt::ESP_TYPE).collect();
     let esp_ent = if esps.len() == 1 { Some(esps[0].1.clone()) } else { None };
@@ -512,16 +533,24 @@ pub fn install(o: &Opts) -> Result<(), String> {
     add(&mut ng, gpt::LROOT_TYPE, guids[1], layout.root, "LEANDROS root")?;
     add(&mut ng, gpt::LHOME_TYPE, guids[2], layout.home, "LEANDROS home")?;
     add(&mut ng, gpt::LLOG_TYPE, guids[3], layout.log, "LEANDROS-LOG")?;
+    if let Some(sb_) = &sessb {
+        let (old, new) = (g_disk.entry(sb_.slot).unwrap(), g.entry(sb_.slot).unwrap());
+        let fmt = |e: &gpt::Entry| format!("{}..{} ({} sectors) {}", e.first, e.last, e.last - e.first + 1, gpt::guid_text(&e.guid));
+        out.event(
+            &format!("{{\"ev\":\"shrink_gpt\",\"slot\":{},\"old_last\":{},\"new_last\":{},\"first\":{}}}", sb_.slot + 1, old.last, new.last, old.first),
+            &format!("p{} entry:\n  old: {}\n  new: {}", sb_.slot + 1, fmt(&old), fmt(&new)),
+        );
+    }
     let shared = esp::shared_files(efi_name, &limine_bin, &boot_pu);
     let esp_list: Vec<String> = shared.iter().map(|(p, d)| format!("{{\"path\":\"/{}\",\"bytes\":{}}}", esc(p), d.len())).collect();
     out.event(
         &format!(
             "{{\"ev\":\"plan\",\"mode\":\"dualboot\",\"target\":\"{}\",\"bus\":\"{}\",\"size\":{},\"disk_guid\":\"{}\",\"root_partuuid\":\"{}\",\"home_partuuid\":\"{}\",\"log_partuuid\":\"{}\",\"boot_partuuid\":\"{}\",\"cmdline_rw\":\"{}\",\"backup_dir\":\"{}\",\"old_gpt\":{},\"new_gpt\":{},\"esp_files\":[{}],\"f2fs_bytes\":{}}}",
-            esc(&target), plan::bus_of(&tname), size, gpt::guid_text(&g.disk_guid), root_pu, home_pu, log_pu, boot_pu, esc(&rw), esc(&backup_dir), gpt_json(&g), gpt_json(&ng), esp_list.join(","), sb.bytes()
+            esc(&target), plan::bus_of(&tname), size, gpt::guid_text(&g.disk_guid), root_pu, home_pu, log_pu, boot_pu, esc(&rw), esc(&backup_dir), gpt_json(&g_disk), gpt_json(&ng), esp_list.join(","), sb.bytes()
         ),
         &format!(
             "plan: {} ({} MiB, {})\nold GPT:\n  {}\nnew GPT:\n  {}\nESP files to create:\n  {}\ncmdline: root=PARTUUID={} {}\nbackup: {}",
-            target, size >> 20, plan::bus_of(&tname), gpt_lines(&g).join("\n  "), gpt_lines(&ng).join("\n  "),
+            target, size >> 20, plan::bus_of(&tname), gpt_lines(&g_disk).join("\n  "), gpt_lines(&ng).join("\n  "),
             shared.iter().map(|(p, d)| format!("/{} ({} bytes)", p, d.len())).collect::<Vec<_>>().join("\n  "), root_pu, rw, backup_dir
         ),
     );
@@ -541,23 +570,34 @@ pub fn install(o: &Opts) -> Result<(), String> {
 
     // Backups first.
     out.step("backup", 0);
-    let files = backup(&target, &g, esp_ent.first, esp_ent.last - esp_ent.first + 1, &backup_dir, &out)?;
+    let files = backup(&target, &g_disk, esp_ent.first, esp_ent.last - esp_ent.first + 1, &backup_dir, &out)?;
     out.info(&format!("backup: {} ({})", backup_dir, files.join(", ")));
 
     // The write window: GPT areas and the gap only.
     let anchor = OpenOptions::new().read(true).write(true).open(&target).map_err(|e| format!("{}: {}", target, e))?;
     let gap = big.unwrap();
+    if nvme {
+        crate::install::enable_nvme_write(&target)?;
+    }
     let w1 = [(1, g.first_usable - 1), (g.last_usable + 1, total - g.last_usable - 1), (gap.0, gap.1 - gap.0 + 1)];
     set_window(&anchor, &w1)?;
     // Re-read the table under the window; it must be what we planned from.
     let mut anchor_rw = anchor.try_clone().map_err(|e| e.to_string())?;
     let g2 = Gpt::read(&mut anchor_rw, 512, total)?;
-    if gpt_lines(&g2) != gpt_lines(&g) {
+    if gpt_lines(&g2) != gpt_lines(&g_disk) {
         return Err("the partition table changed since the preflight".into());
     }
     let io = |e: std::io::Error| e.to_string();
 
     out.step("gpt", 0);
+    if let Some(sb_) = &sessb {
+        // Checkpoint: the shrunk-p2 table alone (backup copy first, then primary, then verified).
+        // The disk is valid and the freed gap usable if anything fails after this point.
+        if sb_.new_last < sb_.old_last {
+            g.write(&mut anchor_rw)?;
+            anchor_rw.sync_all().map_err(io)?;
+        }
+    }
     ng.write(&mut anchor_rw)?;
     anchor_rw.sync_all().map_err(io)?;
     out.step("gpt", 100);
@@ -613,6 +653,9 @@ pub fn install(o: &Opts) -> Result<(), String> {
     set_window(&anchor, &[])?;
     out.step("esp", 100);
 
+    if let Some(sb_) = &sessb {
+        crate::shrink::finish_b(&sb_.dir);
+    }
     out.event(
         &format!(
             "{{\"ev\":\"done\",\"target\":\"{}\",\"mode\":\"dualboot\",\"root_partuuid\":\"{}\",\"boot_partuuid\":\"{}\",\"disk_guid\":\"{}\",\"root_sha256\":\"{}\",\"backup_dir\":\"{}\"}}",

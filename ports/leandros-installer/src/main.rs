@@ -45,7 +45,7 @@ fn bounds(d: &Disk, mode: Mode) -> (u64, u64) {
             // At least 19 GiB must be freed for the install.
             (lo, (d.shrink_cur / GIB).saturating_sub(19))
         }
-        Mode::Erase => (MIN_ROOT_GIB, MIN_ROOT_GIB),
+        Mode::Erase | Mode::Finish => (MIN_ROOT_GIB, MIN_ROOT_GIB),
     }
 }
 
@@ -62,6 +62,7 @@ enum Message {
     TypedErase(String),
     Backup(bool),
     Ack(bool),
+    Booted(bool),
     Backend(Event),
     PowerOff,
 }
@@ -126,7 +127,7 @@ impl App {
     }
 
     fn root_gib(&self) -> Option<u64> {
-        (self.mode != Mode::Shrink && self.mode != Mode::Erase).then_some(self.slider)
+        (!matches!(self.mode, Mode::Shrink | Mode::Erase | Mode::Finish)).then_some(self.slider)
     }
 
     fn begin(&mut self, op: Op, args: Vec<String>) -> Task<Message> {
@@ -230,7 +231,7 @@ impl Application for App {
                     Page::Disk => Page::Welcome,
                     Page::Mode => Page::Disk,
                     Page::Size => Page::Mode,
-                    Page::Confirm if self.mode == Mode::Erase => Page::Mode,
+                    Page::Confirm if matches!(self.mode, Mode::Erase | Mode::Finish) => Page::Mode,
                     Page::Confirm => Page::Size,
                     Page::Progress if !self.installing => Page::Mode,
                     p => p,
@@ -240,6 +241,7 @@ impl Application for App {
                 Page::Welcome => return self.load_disks(),
                 Page::Disk if self.selected.is_some() => {
                     self.mode = match self.disk() {
+                        Some(d) if d.finish == "ready_b" => Mode::Finish,
                         Some(d) if d.dualboot => Mode::Free,
                         Some(d) if !d.shrink_part.is_empty() => Mode::Shrink,
                         _ => Mode::Erase,
@@ -253,6 +255,12 @@ impl Application for App {
                     self.backed_up = false;
                     if self.mode == Mode::Erase {
                         self.page = Page::Confirm;
+                    } else if self.mode == Mode::Finish {
+                        self.page = Page::Confirm;
+                        if let Some(d) = self.disk() {
+                            let a = backend::install_args(&d.dev, Mode::Finish, None, true);
+                            return self.begin(Op::Dry, a);
+                        }
                     } else if let Some(d) = self.disk() {
                         let (lo, hi) = bounds(&d, self.mode);
                         self.slider = if self.mode == Mode::Shrink { hi.max(lo) } else { MIN_ROOT_GIB.clamp(lo, hi.max(lo)) };
@@ -330,7 +338,18 @@ impl Application for App {
                             };
                         }
                     }
-                    Op::ShrinkStatus => {}
+                    Op::ShrinkStatus => {
+                        // "Linux booted fine" was confirmed: session B is ready, re-check with a dry run.
+                        if code == Some(0) && self.mode == Mode::Finish {
+                            if let Some(i) = self.selected {
+                                self.disks[i].finish = "ready_b".into();
+                            }
+                            if let Some(d) = self.disk() {
+                                let a = backend::install_args(&d.dev, Mode::Finish, None, true);
+                                return self.begin(Op::Dry, a);
+                            }
+                        }
+                    }
                     Op::List => {
                         self.loading = false;
                         if backend::wrong_password(&stderr) {
@@ -343,6 +362,12 @@ impl Application for App {
                     }
                 },
             },
+            Message::Booted(true) => {
+                if self.mode == Mode::Finish {
+                    return self.begin(Op::ShrinkStatus, backend::mark_verified_args());
+                }
+            }
+            Message::Booted(false) => {}
             Message::PowerOff => {
                 let _ = std::process::Command::new("poweroff").spawn();
             }
@@ -438,6 +463,14 @@ impl Application for App {
                 } else {
                     col = col.push(widget::text::caption("Not available: no shrinkable Linux partition was found."));
                 }
+                if !d.finish.is_empty() {
+                    col = col.push(opt(Mode::Finish, "Finish installation (Linux was shrunk)", true));
+                    col = col.push(widget::text::caption(if d.finish == "ready_b" {
+                        "Linux was shrunk and has booted since. The freed space is used for LeandrOS."
+                    } else {
+                        "Linux was shrunk. Confirm on the next page that it booted fine."
+                    }));
+                }
                 col = col.push(opt(Mode::Erase, "Erase disk", true));
                 if self.mode == Mode::Erase {
                     col = col.push(widget::text::title3(format!("WARNING: everything on {} will be destroyed.", d.dev)));
@@ -485,7 +518,10 @@ impl Application for App {
                             d.shrink_part, self.slider
                         )));
                     }
-                    Mode::Free => {
+                    Mode::Free | Mode::Finish => {
+                        if self.mode == Mode::Finish && d.finish != "ready_b" {
+                            col = col.push(widget::checkbox(false).label("Linux booted fine after the shrink").on_toggle(Message::Booted));
+                        }
                         if self.dry_ok {
                             col = col.push(widget::text::body("Dry run passed. Nothing has been written yet."));
                         } else if self.error.is_empty() {
@@ -532,12 +568,13 @@ impl Application for App {
                 let mut ok = self.ack && self.backed_up && self.typed.trim() == d.dev;
                 ok &= match self.mode {
                     Mode::Erase => self.typed_erase.trim() == "ERASE",
-                    Mode::Free => self.dry_ok,
+                    Mode::Free | Mode::Finish => self.dry_ok,
                     Mode::Shrink => true,
                 };
                 let label = match self.mode {
                     Mode::Shrink => "Shrink Linux",
                     Mode::Free => "Install",
+                    Mode::Finish => "Finish installation",
                     Mode::Erase => "Erase and install",
                 };
                 col = col.push(nav(true, Some((label, ok))));
@@ -680,6 +717,21 @@ fn self_test_dualboot(dev: &str) -> i32 {
     if done && !gfail && code == Some(0) { 0 } else { 1 }
 }
 
+fn self_test_after_shrink(dev: &str) -> i32 {
+    let (_, _, _, sc) = drain(backend::shrink_status_args(), "status");
+    println!("shrink-status exit {:?}", sc);
+    println!("page Mode: Finish installation (Linux was shrunk); dry run");
+    let (_, dry, gfail, _) = drain(backend::install_args(dev, Mode::Finish, None, true), "dry");
+    if gfail || !dry {
+        println!("dry run -> page Confirm (blocked: gate failed or no plan)");
+        return 1;
+    }
+    println!("dry run ok -> Finish enabled");
+    let (done, _, gfail, code) = drain(backend::install_args(dev, Mode::Finish, None, false), "install");
+    println!("exit {:?} -> page {}", code, if done { "Done" } else { "Error" });
+    if done && !gfail && code == Some(0) { 0 } else { 1 }
+}
+
 fn parse_size(s: &str) -> u64 {
     let (n, mul) = match s.chars().last() {
         Some('G') | Some('g') => (&s[..s.len() - 1], GIB),
@@ -730,6 +782,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("--self-test-dualboot") => {
             let dev = args.get(1).map(String::as_str).unwrap_or("/dev/nvme0n1");
             std::process::exit(self_test_dualboot(dev));
+        }
+        Some("--self-test-after-shrink") => {
+            let dev = args.get(1).map(String::as_str).unwrap_or("/dev/nvme0n1");
+            std::process::exit(self_test_after_shrink(dev));
         }
         Some("--self-test-shrink") => {
             let dev = args.get(1).map(String::as_str).unwrap_or("/dev/nvme0n1");

@@ -46,6 +46,16 @@ if [ "$MODE" = installed ]; then
     echo "  p$n name=$(field $n 'Partition name')"
   done
   [ -z "$(field 8 'First sector')" ] && ok "no p8" || bad "unexpected p8"
+  if [ "${SESSB:-0}" = 1 ]; then
+    # Session B: only p2's end moved; start, GUID, name and attributes are unchanged.
+    [ "$P2E" -lt "$FX_P2_END" ] && ok "p2 end $P2E < original $FX_P2_END" || bad "p2 end $P2E not below $FX_P2_END"
+    [ $(((P2E + 1) % 2048)) = 0 ] && ok "p2 end + 1 is 1 MiB aligned" || bad "p2 end not aligned"
+    BLK2=$(dumpe2fs -h "$IMG?offset=$((FX_P2_START * 512))" 2>/dev/null | sed -n 's/^Block count: *//p')
+    [ "$P2E" -ge $((FX_P2_START + BLK2 * 4096 / 512 - 1)) ] && ok "p2 still holds the whole filesystem ($BLK2 blocks)" || bad "p2 cut below the filesystem"
+    [ -z "$P2ATTRS" ] || { field 2 "Attribute flags" | grep -qi "^$P2ATTRS\$" && ok "p2 attributes unchanged ($P2ATTRS)" || bad "p2 attributes changed"; }
+    P4S=$(field 4 "First sector" | cut -d' ' -f1)
+    [ "$P4S" -le $((FX_P2_END)) ] && ok "p4 lives in p2's old tail" || bad "p4 not in p2's old tail"
+  fi
 else
   [ -z "$(field 4 'First sector')" ] && ok "no p4 yet" || bad "unexpected p4"
 fi

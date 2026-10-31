@@ -58,6 +58,8 @@ pub struct Sb {
     pub last_orphan: u32,
     pub error_count: u32,
     pub mmp_block: u64,
+    pub mtime: u32,
+    pub mnt_count: u16,
 }
 
 const KNOWN_COMPAT: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000;
@@ -86,6 +88,8 @@ pub fn parse_sb(b: &[u8]) -> Result<Sb, String> {
         last_orphan: le32(b, 0xE8),
         error_count: le32(b, 0x194),
         mmp_block: u64::from_le_bytes(b[0x168..0x170].try_into().unwrap()),
+        mtime: le32(b, 0x2C),
+        mnt_count: u16::from_le_bytes([b[0x34], b[0x35]]),
     })
 }
 
@@ -417,7 +421,7 @@ fn state_read(dir: &str) -> BTreeMap<String, String> {
 }
 
 fn latest_dir(root: &str) -> Option<String> {
-    let mut v: Vec<String> = std::fs::read_dir(root).ok()?.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("shrink-")).collect();
+    let mut v: Vec<String> = std::fs::read_dir(root).ok()?.flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("shrink-")).collect();
     v.sort();
     v.pop().map(|n| format!("{}/{}", root, n))
 }
@@ -696,8 +700,9 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
             });
         }
     }
-    let _ = state_write(&dir, &[("phase", "done".into()), ("part", dev.clone()), ("orig_blocks", sb.blocks.to_string()), ("new_blocks", new_blocks.to_string()), ("block_size", sb.bs.to_string()), ("fsck_undo", undo_fsck), ("resize_undo", undo_rs), ("backup_dir", dir.clone())]);
     let nsb = read_sb_path(&dev)?;
+    // Session B detects "Linux booted once" by the mount time / mount count moving off these.
+    let _ = state_write(&dir, &[("phase", "done".into()), ("part", dev.clone()), ("orig_blocks", sb.blocks.to_string()), ("new_blocks", new_blocks.to_string()), ("block_size", sb.bs.to_string()), ("sb_mtime", nsb.mtime.to_string()), ("sb_mnt", nsb.mnt_count.to_string()), ("fsck_undo", undo_fsck), ("resize_undo", undo_rs), ("backup_dir", dir.clone())]);
     out.event(
         &format!("{{\"ev\":\"done\",\"part\":\"{}\",\"new_bytes\":{},\"old_bytes\":{},\"backup_dir\":\"{}\",\"state\":\"boot_linux\",\"hashed\":{}}}", esc(&dev), nsb.blocks * nsb.bs, cur_bytes, esc(&dir), hashes.len()),
         &format!("shrunk {} to {} MiB; boot Linux once to verify, then run shrink-status", dev, nsb.blocks * nsb.bs >> 20),
@@ -823,17 +828,140 @@ pub fn status(o: &Opts) -> Result<(), String> {
         state_write(&dir, &kv)?;
     }
     let ph = s.get("phase").cloned().unwrap_or_default();
+    // Detection: the ext4 superblock's last-mount time or mount count moved since
+    // session A recorded them, and the filesystem is clean again. --mark-verified
+    // is the manual override (the user confirmed Linux booted).
+    let mut detected = false;
+    if ph == "done" {
+        if let Some(part) = s.get("part") {
+            if let Ok(sb) = read_sb_path(part) {
+                detected = linux_booted(&s, &sb);
+            }
+        }
+    }
     let state = match ph.as_str() {
+        "done" if detected => "ready_b",
         "done" => "boot_linux",
         "verified" => "ready_b",
-        "rolled_back" | "prepared" | "" => "none",
+        "rolled_back" | "prepared" | "" | "b_done" => "none",
         _ => "interrupted",
     };
     let nb = s.get("new_blocks").cloned().unwrap_or_default();
     let bs = s.get("block_size").cloned().unwrap_or_default();
     out.event(
-        &format!("{{\"ev\":\"shrink_status\",\"state\":\"{}\",\"phase\":\"{}\",\"dir\":\"{}\",\"new_blocks\":\"{}\",\"block_size\":\"{}\"}}", state, esc(&ph), esc(&dir), nb, bs),
+        &format!("{{\"ev\":\"shrink_status\",\"state\":\"{}\",\"phase\":\"{}\",\"dir\":\"{}\",\"new_blocks\":\"{}\",\"block_size\":\"{}\",\"detected\":{}}}", state, esc(&ph), esc(&dir), nb, bs, detected),
         &format!("{} (phase {}, {})", state, ph, dir),
     );
     Ok(())
+}
+
+// ------------------------------------------------------------------ session B
+
+/// True when Linux has mounted the shrunk filesystem since session A and left it clean.
+pub fn linux_booted(st: &BTreeMap<String, String>, sb: &Sb) -> bool {
+    let rec_t: Option<u32> = st.get("sb_mtime").and_then(|v| v.parse().ok());
+    let rec_n: Option<u16> = st.get("sb_mnt").and_then(|v| v.parse().ok());
+    let (Some(t), Some(n)) = (rec_t, rec_n) else { return false };
+    (sb.mtime != t || sb.mnt_count != n) && sb.state == 1 && sb.error_count == 0
+}
+
+/// New last sector of the shrunk partition: it holds the filesystem (rounded up
+/// to whole sectors) and ends one sector before a 1 MiB boundary, so the space
+/// after it stays aligned. Sectors `first..=last` are inclusive, hence the -1.
+pub fn new_part_last(first: u64, fs_bytes: u64, ss: u64) -> u64 {
+    let al = crate::gpt::ALIGN_BYTES / ss;
+    let fs_last = first + (fs_bytes + ss - 1) / ss - 1;
+    (fs_last + 1 + al - 1) / al * al - 1
+}
+
+pub struct SessB {
+    pub slot: usize,
+    pub dev: String,
+    pub dir: String,
+    pub old_last: u64,
+    pub new_last: u64,
+}
+
+/// Preconditions for session B against the on-disk GPT `g` of `target`.
+pub fn session_b(g: &Gpt, target: &str, root: Option<&str>) -> Result<SessB, String> {
+    let root = root.unwrap_or(BACKUP_ROOT);
+    let dir = latest_dir(root).ok_or("no shrink session found (run `shrink` first)")?;
+    let s = state_read(&dir);
+    let ph = s.get("phase").cloned().unwrap_or_default();
+    if ph != "done" && ph != "verified" && ph != "b_done" {
+        return Err(format!("shrink session is in phase {:?}, not finished", ph));
+    }
+    let dev = s.get("part").cloned().ok_or("session state has no partition")?;
+    let (disk, pno) = split_part(&dev).ok_or("bad partition in session state")?;
+    if disk != target {
+        return Err(format!("the shrink session was for {}, not {}", disk, target));
+    }
+    if mounted(&dev) {
+        return Err(format!("{} is mounted", dev));
+    }
+    let sb = read_sb_path(&dev)?;
+    if ph == "done" && !linux_booted(&s, &sb) {
+        return Err("Linux has not booted since the shrink (the ext4 mount time and mount count are unchanged, or the filesystem is not clean). Boot Linux once and shut down cleanly, or confirm with `shrink-status --mark-verified`".into());
+    }
+    let nb: u64 = s.get("new_blocks").and_then(|v| v.parse().ok()).ok_or("session state has no new_blocks")?;
+    let bs: u64 = s.get("block_size").and_then(|v| v.parse().ok()).ok_or("session state has no block_size")?;
+    if sb.blocks != nb || sb.bs != bs {
+        return Err(format!("the filesystem is {} blocks of {} but session A recorded {} of {}", sb.blocks, sb.bs, nb, bs));
+    }
+    if let Some((n, m)) = sb_gates(&sb).first() {
+        return Err(format!("{}: {}", n, m));
+    }
+    if sb.state != 1 {
+        return Err(format!("filesystem state {:#x} is not clean", sb.state));
+    }
+    let e = g.entry(pno - 1).ok_or_else(|| format!("{} is not in the GPT", dev))?;
+    let ss = g.ss;
+    let fs_bytes = sb.blocks * sb.bs;
+    let new_last = new_part_last(e.first, fs_bytes, ss);
+    if (new_last - e.first + 1) * ss < fs_bytes {
+        return Err("internal: new partition smaller than the filesystem".into());
+    }
+    if new_last > e.last {
+        return Err(format!("the partition ({} sectors) is smaller than the filesystem needs", e.last - e.first + 1));
+    }
+    Ok(SessB { slot: pno - 1, dev, dir, old_last: e.last, new_last })
+}
+
+/// Mark session B finished (shrink-status reports none afterwards).
+pub fn finish_b(dir: &str) {
+    let mut s = state_read(dir);
+    s.insert("phase".into(), "b_done".into());
+    let kv: Vec<(&str, String)> = s.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let _ = state_write(dir, &kv);
+}
+
+#[cfg(test)]
+mod sessb_tests {
+    use super::*;
+    #[test]
+    fn last_is_aligned_and_covers_fs() {
+        // 2048 start, fs of exactly 10 GiB: ends at 2048 + 20971520 - 1, boundary already aligned.
+        assert_eq!(new_part_last(2048, 10 << 30, 512), 2048 + 20971520 - 1);
+        // one byte over: one more sector, rounded up to the next MiB boundary.
+        assert_eq!(new_part_last(2048, (10 << 30) + 1, 512), 2048 + 20971520 + 2048 - 1);
+        assert_eq!((new_part_last(2048, 5000, 512) + 1) % 2048, 0);
+    }
+}
+
+/// For `list`: "ready_b" / "boot_linux" when the latest finished shrink session belongs to `target`, else "".
+pub fn finish_state_for(target: &str) -> &'static str {
+    let Some(dir) = latest_dir(BACKUP_ROOT) else { return "" };
+    let s = state_read(&dir);
+    let Some(part) = s.get("part") else { return "" };
+    if split_part(part).map(|x| x.0).as_deref() != Some(target) {
+        return "";
+    }
+    match s.get("phase").map(String::as_str) {
+        Some("verified") => "ready_b",
+        Some("done") => match read_sb_path(part) {
+            Ok(sb) if linux_booted(&s, &sb) => "ready_b",
+            _ => "boot_linux",
+        },
+        _ => "",
+    }
 }
