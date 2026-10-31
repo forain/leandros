@@ -231,7 +231,14 @@ fn enter_idmap(target: u64, a: [u64; 5]) -> ! {
     }
 }
 
-fn park_hook() { arch_aarch64::exception::divert() }
+/// Set on entry to `final_cpu0`: a spin inside it (logging -> serial) must not
+/// re-enter `final_cpu0` via divert -> on_ipi.
+static FINAL: AtomicBool = AtomicBool::new(false);
+
+fn park_hook() {
+    if FINAL.load(Ordering::Relaxed) && unsafe { arch_aarch64::smp::arch_cpu_id() } == 0 { return; }
+    arch_aarch64::exception::divert()
+}
 
 /// `kexec.test_straggler=<cpu>` guard: CPU `<cpu>` is the CPU a stuck lock
 /// would hold. Its first IRQ-divert sends it into a masked `uart::getc` loop
@@ -246,6 +253,14 @@ fn straggler_entry() -> ! {
         log("[KEXEC] test: straggler spinning in uart::getc with IRQs masked\n");
         // From now on a divert is the normal park.
         arch_aarch64::exception::IRQ_DIVERT.store(on_ipi as fn() -> ! as usize, Ordering::Release);
+        if straggler_mode("lock") {
+            // Two-CPU variant: another CPU forgot LOCK and parks; this CPU spins on
+            // it with IRQs masked and must still park via spin's relax() hook.
+            log("[KEXEC] test: straggler spinning on a spin::Mutex held by a parked CPU\n");
+            while !LOCK_HELD.load(Ordering::Acquire) { core::hint::spin_loop(); }
+            let _g = LOCK.lock();
+            loop { core::hint::spin_loop(); }
+        }
         if straggler_sleep_mode() {
             // The brcmf radio loop: a spin::Mutex held across msleep(1).
             log("[KEXEC] test: straggler looping msleep(1) holding a spin::Mutex\n");
@@ -260,12 +275,23 @@ fn straggler_entry() -> ! {
         }
         loop { let _ = unsafe { arch_aarch64::uart::getc() }; core::hint::spin_loop(); }
     }
+    if straggler_mode("lock") && STRAGGLER.load(Ordering::Relaxed) != usize::MAX
+        && !LOCK_HELD.swap(true, Ordering::AcqRel)
+    {
+        core::mem::forget(LOCK.lock());
+    }
     on_ipi()
 }
 
-fn straggler_sleep_mode() -> bool {
-    crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "kexec.test_straggler_mode=sleep"))
+static LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static LOCK_HELD: AtomicBool = AtomicBool::new(false);
+
+fn straggler_mode(m: &str) -> bool {
+    crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace()
+        .any(|t| t.strip_prefix("kexec.test_straggler_mode=") == Some(m)))
 }
+
+fn straggler_sleep_mode() -> bool { straggler_mode("sleep") }
 
 fn test_straggler() -> Option<usize> {
     crate::boot_cmdline()?.split_ascii_whitespace()
@@ -279,7 +305,7 @@ pub fn stop_and_jump() -> ! {
     let strag = test_straggler().filter(|&c| c != 0 && c < arch_aarch64::smp::assigned());
     if let Some(c) = strag {
         STRAGGLER.store(c, Ordering::Release);
-        if !straggler_sleep_mode() { arch_aarch64::uart::test_leak_rx_lock(); }
+        if !straggler_sleep_mode() && !straggler_mode("lock") { arch_aarch64::uart::test_leak_rx_lock(); }
     }
     let divert: fn() -> ! = if strag.is_some() { straggler_entry } else { on_ipi };
     arch_aarch64::exception::IRQ_DIVERT.store(divert as usize, Ordering::Release);
@@ -296,11 +322,13 @@ pub fn stop_and_jump() -> ! {
     }
     // Contended spins on masked CPUs also park (see `wedge::Spin::tick`).
     sched::wedge::PARK_HOOK.store(park_hook as fn() as usize, Ordering::Release);
+    spin::held::set_park_hook(park_hook);
     if me == 0 { final_cpu0() }
     park_off()
 }
 
 fn final_cpu0() -> ! {
+    FINAL.store(true, Ordering::Release);
     timers_off();
     // rpi5 wedge watchdog (lane piwdt): if armed, give the next kernel the
     // full 15 s to reach its own watchdog init (`rpi_misc::boot` re-arms it,
