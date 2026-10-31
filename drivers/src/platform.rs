@@ -211,3 +211,11 @@ pub fn announce_if_in_dtb(compat: &str) -> bool {
     announce(compat, PlatDev::default());
     true
 }
+
+/// Announce `compat` unconditionally (board knowledge, e.g. kexec DTB lacks the node).
+/// Returns true if the DTB had it too.
+pub fn announce_board(compat: &str) -> bool {
+    let in_dtb = unsafe { boot::device_tree::recorded_dtb() }.map_or(false, |d| fdt_has_compat(d, compat));
+    announce(compat, PlatDev::default());
+    in_dtb
+}
