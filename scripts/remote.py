@@ -64,7 +64,8 @@ power cycle) is never written: a bad trial is recovered by power-cycling.
   pi-boot <good|prev|trial> [--append ARGS]   kexec into a slot (e.g. back to
                          good after a power cycle booted the card's kernel.img)
   pi-promote             trial -> good (old good -> prev), in the root only
-  pi-status              slots, running kernel, cmdline
+  pi-status              slots, running kernel, cmdline (redacted: length + sha8 + marker)
+  pi-card VERB           card kernel via tryboot: status|setup|stage|try|commit|abort|rollback [--dry-run]
   pi-sync [--dry-run] [--list] [--board B]
                          update the root fs in place from the current aarch64
                          build (sha256 diff, changed files only; keeps
@@ -961,8 +962,18 @@ def cmd_pi_sync(t, a):
 
 
 def cmd_pi_status(t, a):
-    print(t.out(f"uname -v; cat /proc/cmdline; echo booted slot: $(cat /tmp/.pi-booted-slot 2>/dev/null || echo card); "
-                f"for s in trial good prev; do echo \"$s: $(cat {PI_DIR}/$s/info 2>/dev/null || echo -)\"; done").rstrip())
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import pi_card
+    # the kernel cmdline carries the Wi-Fi PSK: redacted to length + sha8 + marker
+    print(t.out(pi_card.pi_status_cmd(PI_DIR)).rstrip())
+
+
+def cmd_pi_card(t, a):
+    if not t.pi:
+        die("pi-card needs LEANDROS_REMOTE=pi (or pi:<host>)")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import pi_card
+    sys.exit(pi_card.main(t, sys.modules[__name__], a))
 
 
 def cmd_reboot(t, a):
@@ -1100,6 +1111,15 @@ def main():
     p = sub.add_parser("pi-boot"); p.add_argument("slot", choices=["good", "prev", "trial"]); p.add_argument("--append")
     p.add_argument("--timeout", type=int, default=240)
     sub.add_parser("pi-promote"); sub.add_parser("pi-status")
+    p = sub.add_parser("pi-card", help="update the Pi 5 card's kernel via firmware tryboot (espctl pi ...)")
+    p.add_argument("verb", choices=["status", "setup", "stage", "try", "commit", "abort", "rollback"])
+    p.add_argument("--dry-run", action="store_true", help="gates and plan only; nothing is written or rebooted")
+    p.add_argument("--kernel", help="rpi5 kernel-direct ELF (stage; default target/final-aarch64/kernel-direct)")
+    p.add_argument("--kernel-bin", help="flat binary (stage; default <kernel>.bin)")
+    p.add_argument("--initrd"); p.add_argument("--kconfig")
+    p.add_argument("--unverified", action="store_true", help="stage: allow a kernel that is not /boot/pi/good/kernel")
+    p.add_argument("--accept-root-sector-risk", action="store_true", help="setup: allow the new root entries to share a sector with firmware-critical entries")
+    p.add_argument("--timeout", type=int, default=300)
     p = sub.add_parser("pi-sync", help="update the target's root fs in place from the current aarch64 build")
     p.add_argument("--dry-run", action="store_true", help="only print what would change and the bytes")
     p.add_argument("--list", action="store_true", help="print every change, not a per-directory summary")
@@ -1135,7 +1155,7 @@ def main():
         "status": cmd_status, "push": cmd_push, "pull": cmd_pull, "deploy-files": cmd_deploy_files,
         "deploy-kernel": cmd_deploy_kernel, "espctl": cmd_espctl, "logs": cmd_logs,
         "reboot": cmd_reboot, "wait": cmd_wait, "forget-host": cmd_forget_host,
-        "pi-deploy": cmd_pi_deploy, "pi-boot": cmd_pi_boot, "pi-promote": cmd_pi_promote, "pi-status": cmd_pi_status, "pi-sync": cmd_pi_sync,
+        "pi-deploy": cmd_pi_deploy, "pi-boot": cmd_pi_boot, "pi-promote": cmd_pi_promote, "pi-status": cmd_pi_status, "pi-sync": cmd_pi_sync, "pi-card": cmd_pi_card,
     }[a.cmd](t, a)
 
 
