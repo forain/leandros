@@ -1,6 +1,7 @@
 #!/bin/sh
 # Runs in an Alpine container. Env: MODE (pristine|installed). Image at /img.
 set -u
+[ -f /img.meta ] && . /img.meta
 . /scripts/constants.sh
 apk add -q e2fsprogs e2fsprogs-extra dosfstools mtools sgdisk util-linux coreutils >/dev/null
 export MTOOLS_SKIP_CHECK=1
@@ -30,15 +31,21 @@ for spec in "1 $FX_ESP_START $((FX_ESP_START+FX_ESP_SECTORS-1)) $FX_P1_GUID" \
   fi
 done
 [ "$(field 2 'Partition name')" = "'endeavouros'" ] && ok "p2 name" || bad "p2 name"
+BOOTT=0E02ED9A-FEEE-4CAB-A22F-C861AD7DE307; ROOTT=3F2D991B-D385-4FFF-9CF1-A0DB03062DE5
+HOMET=F936DEE1-99D9-4BBC-8D2A-B7447DB9F650; LOGT=3EC8FA02-816A-4D04-8718-64C3771C5187
 if [ "$MODE" = installed ]; then
   P2E=$(field 2 "Last sector" | cut -d' ' -f1)
-  for n in 4 5 6; do
+  for spec in "4 $BOOTT" "5 $ROOTT" "6 $HOMET" "7 $LOGT"; do
+    set -- $spec; n=$1
     s=$(field $n "First sector" | cut -d' ' -f1); e=$(field $n "Last sector" | cut -d' ' -f1)
     if [ -z "$s" ]; then bad "p$n missing"; continue; fi
     [ "$s" -gt "$P2E" ] && [ "$e" -lt "$FX_P3_START" ] && ok "p$n [$s,$e] inside gap" || bad "p$n outside gap"
-    echo "  p$n name=$(field $n 'Partition name') type=$(field $n 'Partition GUID code' | cut -c1-36) attr=$(field $n 'Attribute flags')"
+    [ $((s % 2048)) = 0 ] && ok "p$n 1 MiB aligned" || bad "p$n not aligned"
+    [ "$(field $n 'Partition GUID code' | cut -c1-36 | tr a-z A-Z)" = "$2" ] && ok "p$n type $2" || bad "p$n type"
+    field $n "Attribute flags" | grep -qi '^8000000000000000$' && ok "p$n no-auto attr (bit 63)" || bad "p$n attr bit 63"
+    echo "  p$n name=$(field $n 'Partition name')"
   done
-  for n in 4 5; do field $n "Attribute flags" | grep -qi '^8000000000000000$' && ok "p$n no-auto attr (bit 63)" || bad "p$n attr bit 63"; done
+  [ -z "$(field 8 'First sector')" ] && ok "no p8" || bad "unexpected p8"
 else
   [ -z "$(field 4 'First sector')" ] && ok "no p4 yet" || bad "unexpected p4"
 fi
@@ -87,19 +94,32 @@ ls $W/esp/loader/entries/${FX_MACHINE_ID}-*.conf >/dev/null 2>&1 && ok "Linux BL
 
 if [ "$MODE" = installed ]; then
   echo "== LeandrOS side"
-  ls $W/esp/EFI/leandros/BOOT*.EFI >/dev/null 2>&1 && ok "/EFI/leandros/BOOT*.EFI" || bad "/EFI/leandros/BOOT*.EFI"
+  P4U=$(field 4 "Partition unique GUID" | tr A-Z a-z); P5U=$(field 5 "Partition unique GUID" | tr A-Z a-z)
+  P6U=$(field 6 "Partition unique GUID" | tr A-Z a-z); P7U=$(field 7 "Partition unique GUID" | tr A-Z a-z)
+  EN=BOOT$EFIU.EFI
+  [ -s $W/esp/EFI/leandros/$EN ] && ok "/EFI/leandros/$EN" || bad "/EFI/leandros/$EN"
   LC=$W/esp/EFI/leandros/limine.conf
-  [ -f $LC ] && ok "/EFI/leandros/limine.conf" || bad "limine.conf missing"
-  P4=$(field 4 "Partition unique GUID" | tr A-Z a-z)
-  grep -qi "root=PARTUUID=$P4" $LC 2>/dev/null && ok "limine.conf root=PARTUUID=p4" || bad "limine.conf root"
-  grep -q 'nvme.rw=1' $LC 2>/dev/null && ok "nvme.rw=1" || echo "  note: no nvme.rw=1 in limine.conf"
-  for p in $(sed -n 's/^ *\(module_\)\?path: *boot():\(.*\)$/\2/p' $LC 2>/dev/null); do
-    [ -e "$W/esp$p" ] && ok "path exists $p" || bad "path missing $p"
+  grep -q 'protocol: efi' $LC 2>/dev/null && grep -qi "path: guid($P4U):/EFI/BOOT/$EN" $LC && ok "chain conf -> boot partition $P4U" || bad "chain conf"
+  [ "$(cat $W/esp/EFI/leandros/.leandros-owned 2>/dev/null)" = "$P4U" ] && ok "ESP owner marker" || bad "ESP owner marker"
+  EC=$W/esp/loader/entries/leandros.conf
+  [ -f $EC ] && { ok "loader/entries/leandros.conf"; sed 's/^/  | /' $EC; } || bad "loader entry leandros.conf"
+  grep -q "^efi */EFI/leandros/$EN" $EC 2>/dev/null && grep -q '^title LeandrOS' $EC && grep -q '^sort-key zz-leandros' $EC && ok "entry fields" || bad "entry fields"
+  N=$(cd $W/esp && find . -type f | wc -l); N0=$(wc -l < $IMG.esp.sha256)
+  [ "$N" = "$((N0 + 4))" ] && ok "ESP gained exactly 4 files" || bad "ESP file count $N (was $N0)"
+  # The private boot partition.
+  S4=$(field 4 "First sector" | cut -d' ' -f1); E4=$(field 4 "Last sector" | cut -d' ' -f1)
+  dd if=$IMG of=$W/boot.img bs=512 skip=$S4 count=$((E4 - S4 + 1)) conv=sparse 2>/dev/null
+  fsck.fat -n $W/boot.img >/dev/null 2>&1 && ok "boot partition fsck.fat clean" || bad "boot partition fsck.fat"
+  mkdir -p $W/bp; mcopy -i $W/boot.img -s -n ::/* $W/bp/ 2>/dev/null
+  grep -q "^leandros-boot $P4U" $W/bp/leandros/owner 2>/dev/null && ok "boot partition owner marker" || bad "boot partition owner marker"
+  BC=$W/bp/limine.conf
+  grep -qi "root=PARTUUID=$P5U" $BC 2>/dev/null && ok "root=PARTUUID=<p5>" || bad "boot limine.conf root"
+  for u in $P5U $P6U $P7U $P4U; do grep -qi "blk.rw=.*$u" $BC && ok "blk.rw has $u" || bad "blk.rw lacks $u"; done
+  grep -q 'nvme.rw=1' $BC && bad "nvme.rw=1 present" || ok "no nvme.rw=1"
+  for p in $(sed -n 's/^ *\(module_\)\?path: *boot():\(.*\)$/\2/p' $BC 2>/dev/null); do
+    [ -e "$W/bp$p" ] && ok "boot path exists $p" || bad "boot path missing $p"
   done
-  [ -f $W/esp/loader/entries/leandros.conf ] && { ok "loader/entries/leandros.conf"; sed 's/^/  | /' $W/esp/loader/entries/leandros.conf; } || bad "loader entry leandros.conf"
-  grep -q '^efi */EFI/leandros/BOOT' $W/esp/loader/entries/leandros.conf 2>/dev/null && ok "entry efi path" || bad "entry efi path"
-  [ -d $W/esp/leandros ] && ok "/leandros dir" || bad "/leandros dir"
-  # loader.conf must be unchanged (covered by the ESP hash check above).
+  [ -s $W/bp/EFI/BOOT/$EN ] && ok "inner Limine EFI/BOOT/$EN" || bad "inner Limine"
 fi
 echo "RESULT $MODE fail=$FAIL"
 exit $((FAIL > 0))

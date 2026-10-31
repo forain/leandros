@@ -13,6 +13,7 @@ pub mod dev;
 pub mod disks;
 
 pub mod copy;
+pub mod dualboot;
 pub mod esp;
 pub mod gpt;
 pub mod install;

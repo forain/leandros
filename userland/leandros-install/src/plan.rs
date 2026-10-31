@@ -27,6 +27,10 @@ pub struct DiskInfo {
     pub parts: Vec<Part>,
     pub eligible: bool,
     pub reason: String,
+    /// Free gaps (first, last inclusive, 512-byte sectors).
+    pub gaps: Vec<(u64, u64)>,
+    pub dualboot: bool,
+    pub dualboot_reason: String,
 }
 
 pub fn read_to_string(p: &str) -> String {
@@ -195,6 +199,10 @@ pub fn gather(allow_removable: bool, root_bytes: u64) -> Vec<DiskInfo> {
         } else {
             ""
         };
+        let parts = disks::scan_disk(n);
+        let gaps = if is_boot || is_mounted { Vec::new() } else { crate::dualboot::gaps_of(&format!("/dev/{}", n), size) };
+        let (dualboot, dualboot_reason) =
+            crate::dualboot::eligibility(is_boot, is_mounted, size, parts.iter().any(|p| p.kind == Kind::Esp), &gaps);
         v.push(DiskInfo {
             name: n.clone(),
             dev: format!("/dev/{}", n),
@@ -205,9 +213,12 @@ pub fn gather(allow_removable: bool, root_bytes: u64) -> Vec<DiskInfo> {
             ro,
             boot: is_boot,
             mounted: is_mounted,
-            parts: disks::scan_disk(n),
+            parts,
             eligible: reason.is_empty(),
             reason: reason.to_string(),
+            gaps,
+            dualboot,
+            dualboot_reason,
         });
     }
     v
@@ -220,9 +231,11 @@ impl DiskInfo {
             .iter()
             .map(|p| format!("{{\"n\":{},\"kind\":\"{}\",\"size\":{}}}", p.pno, esc(&p.kind.name()), p.size))
             .collect();
+        let gaps: Vec<String> = self.gaps.iter().map(|g| format!("{{\"start\":{},\"sectors\":{}}}", g.0, g.1 - g.0 + 1)).collect();
         format!(
-            "{{\"ev\":\"disk\",\"name\":\"{}\",\"dev\":\"{}\",\"size\":{},\"bus\":\"{}\",\"model\":\"{}\",\"removable\":{},\"ro\":{},\"boot\":{},\"eligible\":{},\"reason\":\"{}\",\"parts\":[{}]}}",
-            esc(&self.name), esc(&self.dev), self.size, self.bus, esc(&self.model), self.removable, self.ro, self.boot, self.eligible, esc(&self.reason), parts.join(",")
+            "{{\"ev\":\"disk\",\"name\":\"{}\",\"dev\":\"{}\",\"size\":{},\"bus\":\"{}\",\"model\":\"{}\",\"removable\":{},\"ro\":{},\"boot\":{},\"eligible\":{},\"reason\":\"{}\",\"parts\":[{}],\"gaps\":[{}],\"dualboot\":{},\"dualboot_reason\":\"{}\"}}",
+            esc(&self.name), esc(&self.dev), self.size, self.bus, esc(&self.model), self.removable, self.ro, self.boot, self.eligible, esc(&self.reason), parts.join(","),
+            gaps.join(","), self.dualboot, esc(&self.dualboot_reason)
         )
     }
 
@@ -237,6 +250,10 @@ impl DiskInfo {
             flags,
             if self.eligible { "eligible".to_string() } else { format!("NOT eligible: {}", self.reason) },
             kinds.join(" ")
+        ) + &format!(
+            "  | dual-boot: {}{}",
+            if self.dualboot { "yes".to_string() } else { format!("no ({})", self.dualboot_reason) },
+            self.gaps.iter().map(|g| format!(" gap@{}+{}MiB", g.0, (g.1 - g.0 + 1) / 2048)).collect::<String>()
         )
     }
 }

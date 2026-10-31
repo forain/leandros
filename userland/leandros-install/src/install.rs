@@ -21,6 +21,8 @@ pub struct Opts {
     pub no_verify: bool,
     pub zero_fill: bool,
     pub json: bool,
+    pub dualboot: bool,
+    pub use_free: bool,
 }
 
 pub fn list(o: &Opts) {
@@ -71,6 +73,9 @@ fn round_up(v: u64, to: u64) -> u64 {
 }
 
 pub fn install(o: &Opts) -> Result<(), String> {
+    if o.dualboot {
+        return crate::dualboot::install(o);
+    }
     let out = Out { json: o.json };
     if !o.dry_run && !euid_is_root() {
         return Err("must run as root".into());

@@ -183,7 +183,7 @@ dd if=$W/esp.img of=$IMG bs=512 seek=$FX_ESP_START conv=notrunc,sparse 2>/dev/nu
 
 echo "== sidecars"
 O=$OUTDIR; mkdir -p $O
-{ echo "FX_KVER=$KVER"; echo "FX_FILES=$FILES"; echo "FX_ARCH=$ARCH"; echo "FX_EFI=$EFI"
+{ echo "FX_KVER=$KVER"; echo "FX_FILES=$FILES"; echo "FX_ARCH=$ARCH"; echo "FX_EFI=$EFI"; echo "FX_GAP_GIB=$FX_GAP_GIB"
   echo "FX_SWAP_SHA256=$(dd if=$IMG bs=512 skip=$FX_P3_START count=$FX_SWAP_SECTORS 2>/dev/null | sha256sum | cut -d' ' -f1)"
 } > $O/fixture.meta
 cp $W/MANIFEST.sha256 $O/fixture.manifest

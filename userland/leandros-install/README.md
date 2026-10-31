@@ -7,6 +7,9 @@ Privileged, headless installer backend (std/musl, installed as
 leandros-install list [--json] [--allow-removable]
 leandros-install install --target /dev/X --yes [--root-gib N] [--allow-removable]
                          [--no-verify] [--zero-fill] [--json] [--dry-run]
+leandros-install install --mode dualboot --target /dev/X --use-free --yes [--root-gib N]
+                         [--json] [--dry-run]
+leandros-install repair-esp [--boot DEV] [--esp DEV]
 leandros-install mkhome --out FILE --size SIZE [--uuid HEX] [--time EPOCH] [--full]
 ```
 
@@ -24,6 +27,48 @@ zero blocks skipped and a SHA-256 verify), p3 log 64 MiB at the end, p4 home
 remounted read-only during the root copy and restored on exit or signal.
 NVMe writes: `install::enable_nvme_write` (BLKROSET 0; the kernel side comes
 from the nvmerw lane, TODO there).
+
+## Dual-boot, free space only (`--mode dualboot --use-free`)
+
+Installs next to an existing OS (v1a). It adds partitions only in unallocated
+space and never writes an existing partition except the files below on the
+shared ESP. The disk must have a valid GPT (primary = backup, pure protective
+MBR, 512-byte sectors), exactly one ESP in the systemd-boot layout
+(`/loader/entries`), and a gap of at least 19 GiB (boot 512 MiB + root >= 16 GiB
++ home >= 2 GiB + log 64 MiB). Gate results are `gate` events (design B section
+6: G1 stick, G2 disk, G5 size, G6 ESP, G7 backup space, G8 AC power; the Linux
+filesystem gates G3/G4/G9-G12 report `na`); any `fail` aborts before any write.
+
+Written, in order (every write goes through a `BLKWRWIN` window held open for
+the whole run: the GPT areas and the gap, then only the ESP for the last step):
+
+1. `backup` to the stick's `/home/dualboot-backup/bk-<epoch>/`: first and last
+   MiB of the disk, `gpt.txt`, the full ESP image (`esp.img`), `RESTORE.txt`,
+   `SHA256SUMS`; files are fsynced, then `sync()` (the stick may run
+   `f2fs.fsync=lazy`, under which fsync returns early but `sync()` does not),
+   then read back and compared.
+2. `gpt`: four entries are added in the largest gap (disk GUID, ESP and Linux
+   entries untouched): p<n> boot 512 MiB (type `0E02ED9A...`), root, home, log
+   (64 MiB at the end of the gap), all with attribute bit 63 and 1 MiB aligned.
+3. `boot`: the stick's ESP tree on a private FAT32 boot partition ("LEANDROSBT"),
+   every `*.conf` rewritten to `root=PARTUUID=<root>` plus
+   `blk.rw=PARTUUID=<root>,PARTUUID=<home>,PARTUUID=<log>,PARTUUID=<boot>` (not
+   `nvme.rw=1`), and the `leandros/owner` marker.
+4. `log`, `home` (fresh volume), `root` (block copy, zero blocks written where
+   the target is not already zero), `verify`.
+5. `esp`: `/EFI/leandros/BOOT<ARCH>.EFI` (Limine), `/EFI/leandros/limine.conf`
+   (`protocol: efi`, `path: guid(<boot>):/EFI/BOOT/BOOT<ARCH>.EFI`),
+   `/loader/entries/leandros.conf` (`sort-key zz-leandros`: Linux stays the
+   default) and `/EFI/leandros/.leandros-owned`, read back from the medium.
+
+`--dry-run` evaluates all gates and prints the `plan` (`old_gpt`, `new_gpt`,
+`esp_files`, `cmdline_rw`, `backup_dir`) and the rewritten `limine.conf`; it
+writes nothing. `list --json` disks gain `gaps` (`[{start, sectors}]`),
+`dualboot` and `dualboot_reason`. Events: `gate` (`id`, `name`, `status`
+`pass|fail|na`, `msg`); `plan` has `"mode":"dualboot"`; `step` names are
+`backup`, `gpt`, `boot`, `log`, `home`, `root`, `verify`, `esp` in that order;
+`done` also carries `boot_partuuid`, `backup_dir`. Test:
+`scripts/dualboot-free-test.sh aarch64`.
 
 ## `--json`: one object per stdout line (the GUI contract)
 

@@ -11,7 +11,9 @@
 # to the image for check-dualboot-fixture.sh. Clone per run with `cp -c`.
 #
 # Env: DUALBOOT_ARTIFACTS (cache dir, default ~/code/leandros-artifacts/dualboot),
-#      FX_FILLER_GIB (10), FX_DATA_MIB (2048), LEANDROS_CONTAINER.
+#      FX_FILLER_GIB (10), FX_DATA_MIB (2048), LEANDROS_CONTAINER,
+#      FX_GAP_GIB (0): leave this many GiB unallocated between p2 and the swap
+#      (p2 shrinks to match), for the free-space installer.
 set -eu
 ARCH=${1:?usage: $0 <x86_64|aarch64> <out.img>}
 OUT=${2:?usage: $0 <x86_64|aarch64> <out.img>}
@@ -38,7 +40,7 @@ fi
 
 rm -f "$BUILD"/fixture.*
 $CT run --rm -e ARCH="$ARCH" -e CACHE=/cache -e OUTDIR=/out \
-  -e FX_FILLER_GIB="${FX_FILLER_GIB:-10}" -e FX_DATA_MIB="${FX_DATA_MIB:-2048}" -e FX_NOPLACE="${FX_NOPLACE:-}" \
+  -e FX_FILLER_GIB="${FX_FILLER_GIB:-10}" -e FX_DATA_MIB="${FX_DATA_MIB:-2048}" -e FX_NOPLACE="${FX_NOPLACE:-}" -e FX_GAP_GIB="${FX_GAP_GIB:-0}" \
   -v "$HERE/dualboot-fixture:/scripts:ro" -v "$CACHE:/cache" -v "$BUILD:/out" \
   alpine:3.21 sh /scripts/inner.sh
 

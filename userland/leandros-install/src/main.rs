@@ -12,6 +12,8 @@ const USAGE: &str = "usage:
   leandros-install list [--json] [--allow-removable]
   leandros-install install --target /dev/X --yes [--root-gib N] [--allow-removable]
                            [--no-verify] [--zero-fill] [--json] [--dry-run]
+  leandros-install install --mode dualboot --target /dev/X --use-free --yes [--root-gib N]
+                           [--json] [--dry-run]   (installs only into unallocated space)
   leandros-install repair-esp [--boot DEV] [--esp DEV]
       recreate the three LeandrOS files on a dual-boot disk's shared ESP (runs espctl repair-esp)
   leandros-install gaps --dev FILE|/dev/X [--sector-size 512|4096]
@@ -86,6 +88,15 @@ fn parse_opts(args: &[String]) -> Opts {
             "--no-verify" => { o.no_verify = true; i += 1; }
             "--zero-fill" => { o.zero_fill = true; i += 1; }
             "--json" => { o.json = true; i += 1; }
+            "--use-free" => { o.use_free = true; i += 1; }
+            "--mode" => {
+                match args.get(i + 1).map(String::as_str) {
+                    Some("dualboot") => o.dualboot = true,
+                    Some("wipe") => o.dualboot = false,
+                    _ => die("--mode must be wipe or dualboot"),
+                }
+                i += 2;
+            }
             a => die(&format!("unknown argument {a}")),
         }
     }
