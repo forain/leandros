@@ -46,6 +46,9 @@ $CT run --rm -e ARCH="$ARCH" -e CACHE=/cache -e OUTDIR=/out \
 
 mkdir -p "$(dirname "$OUT")"
 rm -f "$OUT"
-cp -c "$BUILD/fixture.img" "$OUT" 2>/dev/null || cp "$BUILD/fixture.img" "$OUT"
+# The container writes the image through a bind mount that allocates every
+# block (a 48 GiB file); copy it zero-skipping so the fixture stays sparse.
+python3 "$HERE/sparse-copy.py" "$BUILD/fixture.img" "$OUT"
+rm -f "$BUILD/fixture.img"
 for s in meta manifest esp.sha256; do cp "$BUILD/fixture.$s" "$OUT.$s"; done
 echo "fixture: $OUT (sidecars $OUT.{meta,manifest,esp.sha256})"
