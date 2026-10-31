@@ -59,10 +59,11 @@ extern "C" fn hr_tramp(c: usize) {
 /// Create a timer owned by the running generation. Returns the handle (0 = no callback).
 pub fn hrtimer_new(cb: extern "C" fn(usize), ctx: usize, irq_mode: bool) -> usize {
     let mode = if irq_mode { sched::hrtimer::TimerMode::Irq } else { sched::hrtimer::TimerMode::Worker };
-    let Some(g) = super::gate::current() else {
-        return Box::into_raw(sched::hrtimer::HrTimer::new(cb, ctx, mode)) as usize;
+    let id = super::gate::running_owner();
+    let Some(g) = super::gate::get(id).filter(|_| id.0 != 0) else {
+        super::log("[kmod] hrtimer_new refused: no gate open\n");
+        return 0;
     };
-    let id = g.id;
     let c = Box::into_raw(Box::new(HrCtx { f: ModFn::new(g, Class::Lower, cb), ctx })) as usize;
     let h = Box::into_raw(sched::hrtimer::HrTimer::new(hr_tramp, c, mode)) as usize;
     super::registry::note_registration(id, kmod_abi::RegKind::HRTIMER, h as u64);
@@ -81,7 +82,7 @@ pub fn release_hrtimer(handle: u64) -> bool {
 static PCI_TOUCHED: Mutex<Vec<(KmodId, u32)>> = Mutex::new(Vec::new());
 
 pub fn note_pci(bdf: u32) {
-    let g = sched::kmodgen::get();
+    let g = super::gate::running_owner().0;
     if g == 0 { return; }
     let mut v = PCI_TOUCHED.lock();
     if !v.iter().any(|x| x.0 .0 == g && x.1 == bdf) { v.push((KmodId(g), bdf)); }
@@ -98,6 +99,9 @@ pub fn quiesce_pci(owner: KmodId) {
     for bdf in fns {
         let f = super::exports::func_of_pub(bdf);
         if f.read16(0) == 0xffff { continue; }
+        // Never bridges (header type 1, class 0x06): they carry other devices' traffic.
+        if f.read16(0xe) & 0x7f == 1 || f.read16(0xa) >> 8 == 0x06 { continue; }
+        super::exports::msix_forget(bdf);
         if let Some(c) = f.find_capability(0x05) { let ctl = f.read16(c + 2); f.write16(c + 2, ctl & !1); }
         if let Some(c) = f.find_capability(0x11) { let ctl = f.read16(c + 2); f.write16(c + 2, ctl & !0x8000); }
         let cmd = f.read16(4);
@@ -107,10 +111,10 @@ pub fn quiesce_pci(owner: KmodId) {
 
 // ── DMA pages ────────────────────────────────────────────────────────────────
 
-static DMA: Mutex<Vec<(KmodId, u64, u32)>> = Mutex::new(Vec::new());
+static DMA: sched::ksync::KSpinLock<Vec<(KmodId, u64, u32)>> = sched::ksync::KSpinLock::new(Vec::new());
 
 pub fn note_page_alloc(phys: u64, order: u32) {
-    let g = sched::kmodgen::get();
+    let g = super::gate::running_owner().0;
     if g != 0 && phys != 0 { DMA.lock().push((KmodId(g), phys, order)); }
 }
 pub fn note_page_free(phys: u64) {

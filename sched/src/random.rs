@@ -356,10 +356,10 @@ pub fn register_source(name: &'static str, f: SourceFn) {
     if let Some(slot) = s.iter_mut().find(|e| e.is_none()) { *slot = Some((name, f)); }
 }
 
-/// Remove an entropy source by name (module unload).
-pub fn unregister_source(name: &str) {
+/// Remove an entropy source by its read function (module unload).
+pub fn unregister_source(f: SourceFn) {
     let mut s = SOURCES.lock();
-    for e in s.iter_mut() { if matches!(e, Some((n, _)) if *n == name) { *e = None; } }
+    for e in s.iter_mut() { if matches!(e, Some((_, g)) if *g as usize == f as usize) { *e = None; } }
 }
 
 /// One-shot seed material handed over by the boot environment (the DTB's

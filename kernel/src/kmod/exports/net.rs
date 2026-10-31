@@ -22,6 +22,7 @@ pub(super) static MOD_NETIF_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 pub(super) fn mn(d: u8) -> &'static ModNetif { unsafe { &*(MOD_NETIF[d as usize].load(Ordering::Acquire) as *const ModNetif) } }
 
 /// Netifs whose module was unloaded: (netif id, slot, last mac, last link generation).
+static PENDING: spin::Mutex<alloc::vec::Vec<(u8, usize, Option<[u8; 6]>, u32)>> = spin::Mutex::new(alloc::vec::Vec::new());
 static DETACHED: spin::Mutex<alloc::vec::Vec<(u8, usize, Option<[u8; 6]>, u32)>> = spin::Mutex::new(alloc::vec::Vec::new());
 
 pub(super) static MOD_OPS: drivers::netdev::NetifOps = drivers::netdev::NetifOps {
@@ -71,8 +72,20 @@ pub fn netdev_detach(id: u64) {
     let id = id as u8;
     let Some(n) = drivers::netdev::get(id as usize) else { return };
     let m = mn(n.dev);
-    DETACHED.lock().push((id, n.dev as usize, m.mac, m.last_gen.load(Ordering::Relaxed)));
+    let mut p = PENDING.lock();
+    p.retain(|x| x.0 != id);
+    p.push((id, n.dev as usize, m.mac, m.last_gen.load(Ordering::Relaxed)));
 }
+
+/// Both drains succeeded: the netif may be rebound by a later load. Without this (Zombie) it stays bound to the zombie.
+pub fn netdev_commit_detach(id: u64) {
+    let id = id as u8;
+    let mut p = PENDING.lock();
+    if let Some(i) = p.iter().position(|x| x.0 == id) { let e = p.remove(i); DETACHED.lock().push(e); }
+}
+
+/// Unload failed before the commit: forget the pending record.
+pub fn netdev_abort_detach(id: u64) { let id = id as u8; PENDING.lock().retain(|x| x.0 != id); }
 
 /// Register a netif from a module, at any time. Returns the netif id, or -errno
 /// (-22 bad arguments, -12 no free slot). The net daemon is kicked and builds the stack on its next pass.

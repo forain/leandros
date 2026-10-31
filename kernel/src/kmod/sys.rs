@@ -65,6 +65,7 @@ fn user_name(ptr: usize) -> Result<[u8; 32], isize> {
 }
 
 fn zombie(id: kmod_abi::KmodId, nm: &str, why: &str) -> isize {
+    registry::abort_upper(id);
     registry::set_state(id, State::Zombie);
     drivers::pci::serial_debug(&alloc::format!("[kmod] {} ZOMBIE: {}\n", nm, why));
     EBUSY
@@ -112,6 +113,7 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
         if sched::monotonic_ns() >= end { return zombie(m.id, s, "exit timeout"); }
         sched::kthread::msleep(1);
     }
+    registry::commit_upper(m.id);
     // Revoke what the kernel can take back; kinds without a revoke path keep the slot (Zombie).
     registry::release_all(m.id);
     let dma = super::lower::dma_leftover(m.id);

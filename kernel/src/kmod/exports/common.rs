@@ -147,12 +147,15 @@ pub extern "C" fn kapi_pci_scan(index: u32, out: *mut KPciDev) -> i32 {
 
 static MSIX_TABLES: sched::ksync::KSpinLock<Vec<(u32, &'static drivers::irq::MsixTable)>> = sched::ksync::KSpinLock::new(Vec::new());
 
+/// Quiesce dropped MSI-X enable: forget the cached table so the next request enables it again (the table mapping leaks).
+pub fn msix_forget(bdf: u32) { MSIX_TABLES.lock().retain(|t| t.0 != bdf); }
+
 /// One MSI-X vector (`entry`) of `bdf`; the table is enabled on the first call. Returns the vector or -errno.
 #[no_mangle]
 pub extern "C" fn kapi_irq_request_msix(owner: KmodId, bdf: u32, entry: u16, handler: KIrqHandler, ctx: usize) -> i64 {
     let known = MSIX_TABLES.lock().iter().find(|t| t.0 == bdf).map(|t| t.1);
     let tab = match known {
-        Some(t) => t,
+        Some(t) => { t.reenable(); t }
         None => match drivers::irq::MsixTable::enable(super::irq::func_of(bdf)) {
             Ok(t) => {
                 let t: &'static drivers::irq::MsixTable = Box::leak(Box::new(t));

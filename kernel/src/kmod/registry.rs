@@ -139,6 +139,18 @@ pub fn unbind_upper(owner: KmodId) {
     for (k, h) in recs { if k == RegKind::NETDEV { super::exports::netdev_detach(h); } }
 }
 
+/// Both unload drains succeeded: netifs become rebindable.
+pub fn commit_upper(owner: KmodId) {
+    let recs: Vec<u64> = REGS.lock().iter().filter(|r| r.0 == owner && r.1 == RegKind::NETDEV).map(|r| r.2).collect();
+    for h in recs { super::exports::netdev_commit_detach(h); }
+}
+
+/// Unload gave up (Zombie): pending netif detaches are dropped, the netif stays bound to the zombie.
+pub fn abort_upper(owner: KmodId) {
+    let recs: Vec<u64> = REGS.lock().iter().filter(|r| r.0 == owner && r.1 == RegKind::NETDEV).map(|r| r.2).collect();
+    for h in recs { super::exports::netdev_abort_detach(h); }
+}
+
 /// Failed init: unregister every registration that can be taken back, dropping its record.
 /// True when none is left, i.e. nothing can call into the module and its slot may be freed.
 pub fn release_all(owner: KmodId) -> bool {
