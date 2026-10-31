@@ -117,6 +117,7 @@ pub fn sleep_until(deadline: u64) {
                 crate::wedge::park_check();
                 core::hint::spin_loop();
             } else {
+                crate::wedge::park_check();
                 crate::preempt_disable();
                 crate::irq_window();
                 crate::preempt_enable_no_resched();
@@ -155,6 +156,16 @@ pub fn cond_resched() {
         crate::irq_window();
         crate::preempt_check();
     }
+}
+
+/// Poll point for loops that run with IRQs masked and possibly under a
+/// `spin::Mutex` (where `cond_resched` is a no-op): reach kexec's park page,
+/// then let pending interrupts (IPIs, timer) in with preemption disabled.
+pub fn masked_poll_point() {
+    crate::wedge::park_check();
+    crate::preempt_disable();
+    crate::irq_window();
+    crate::preempt_enable_no_resched();
 }
 
 /// Yield the CPU to any other runnable task (task context).

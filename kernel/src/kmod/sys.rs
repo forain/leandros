@@ -53,15 +53,15 @@ pub fn sys_finit_module(fd: usize, _params: usize, flags: usize) -> isize {
 
 const ENOENT: isize = -2;
 
-fn user_name(ptr: usize) -> Option<[u8; 32]> {
+fn user_name(ptr: usize) -> Result<[u8; 32], isize> {
     let mut n = [0u8; 32];
     for i in 0..31 {
         let mut b = 0u8;
-        if unsafe { sched::uaccess::copy_from_user(&mut b as *mut u8, ptr + i, 1) } != 0 { return None; }
-        if b == 0 { return Some(n); }
+        if unsafe { sched::uaccess::copy_from_user(&mut b as *mut u8, ptr + i, 1) } != 0 { return Err(EFAULT); }
+        if b == 0 { return Ok(n); }
         n[i] = b;
     }
-    None
+    Err(-36)
 }
 
 fn zombie(id: kmod_abi::KmodId, nm: &str, why: &str) -> isize {
@@ -76,7 +76,7 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
     use super::gate::{self, Class};
     use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     if let Some(e) = check() { return e; }
-    let nm = match user_name(name) { Some(n) => n, None => return EFAULT };
+    let nm = match user_name(name) { Ok(n) => n, Err(e) => return e };
     let m = match registry::find_by_name(&nm) { Some(m) => m, None => return ENOENT };
     let s = super::name_str(&nm);
     if !m.unloadable || m.exit == 0 { return EBUSY; }
@@ -120,8 +120,14 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
     if left != 0 { return zombie(m.id, s, "ungated registrations left"); }
     registry::forget_regs(m.id);
     let pages = registry::take_pages(m.id);
-    for &(v, _) in &pages { unsafe { mm::kmodwin::unmap(v, 1); } }
-    for &(_, p) in &pages { mm::buddy::free(p, 0); }
+    // One range unmap (one shootdown). If a remote CPU may still hold a stale entry, leak the
+    // frames rather than hand them back to the buddy allocator.
+    let acked = unsafe { mm::kmodwin::unmap(m.base, (m.size + 4095) / 4096) };
+    if acked {
+        for &(_, p) in &pages { mm::buddy::free(p, 0); }
+    } else {
+        drivers::pci::serial_debug(&alloc::format!("[kmod] {} TLB shootdown unacked: leaking {} frames\n", s, pages.len()));
+    }
     mm::kmodwin::release(m.base, m.size);
     registry::remove(m.id);
     gate::remove(m.id);

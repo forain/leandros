@@ -27,3 +27,12 @@ Build: KMOD_TEST=1 KMOD_EXTRA="hello kmbad_hang kmbad_reload virtio_rng" ./scrip
 - autoloadtest.sh aarch64: PASS. kmodctltest: ALL PASS only with kmodtest staged in the rootfs (KMOD_TEST puts it in the initrd only, so the stock runtests image SKIPs) and `--cmdline modules.load=kmodtest`; I copied kmodtest/kmodbad into target/kmod/aarch64/rootfs by hand and regenerated the f2fs image.
 - Default (no KMOD_*) aarch64 build boots; /proc/modules empty, only "[kmod] build-id" and "[kmod] window ... ok" lines.
 - Not run: autoloadtest x86_64.
+
+## Review fixes (kmodgate3)
+- ktest creates real gates for synthetic owners 60010/60011/60003 (kapi_tick_register/kthread_spawn return -19 without a gate). `ktest=kmodkapi` PASS, `ktest=kmodload` PASS (aarch64). `ktest=kmodwin` "window empty at start" checks fail only because KMOD_EXTRA modules are loaded in this build (not from this change).
+- sys.rs slot free: one `kmodwin::unmap(base, pages)` (single shootdown); unmap returns false if the x86 ack TIMEOUTS counter moved, then frames are leaked with a log line instead of freed to the buddy.
+- kmodgen::switch_out: load+store instead of swap; comment on get()/set() no-preemption assumption.
+- gate::owner(): in hard IRQ, GEN is ignored unless a gate was entered at this IRQ depth (per-CPU entered_depth); fallback logged once.
+- user_name: 31 bytes without NUL -> ENAMETOOLONG (-36); EFAULT only for a bad pointer.
+- unloadtest.sh: pick the lib/modules/<id> dir the running kernel accepts (build now ships two id dirs: kernel and kernel-direct; `head -n 1` picked the wrong one).
+- Results: aarch64 unloadtest 12/12 (N=50), autoloadtest PASS, x86_64 UNLOAD_N=5 12/12.

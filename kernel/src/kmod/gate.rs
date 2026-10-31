@@ -21,6 +21,10 @@ pub struct Gate {
     pub stopping: AtomicBool,
 }
 
+// In a hard IRQ, GEN belongs to the interrupted task unless a gate was entered inside this very
+// IRQ (sched::kmodgen::entered_depth() == irq_depth()).
+static IRQ_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+
 static GATES: Mutex<Vec<Arc<Gate>>> = Mutex::new(Vec::new());
 
 impl Gate {
@@ -32,9 +36,12 @@ impl Gate {
         let a = self.ctr(c);
         if a.fetch_add(1, SeqCst) & CLOSED != 0 { a.fetch_sub(1, SeqCst); return None; }
         let prev = sched::kmodgen::get();
+        let pe = sched::kmodgen::entered_depth();
+        sched::kmodgen::set_entered_depth(sched::irqctx::irq_depth());
         sched::kmodgen::set(self.id.0);
         let r = f();
         sched::kmodgen::set(prev);
+        sched::kmodgen::set_entered_depth(pe);
         a.fetch_sub(1, SeqCst);
         Some(r)
     }
@@ -84,7 +91,14 @@ pub fn current() -> Option<Arc<Gate>> {
 
 /// Owner for a registration: the running generation (D2), not the module-supplied id.
 pub fn owner(claimed: KmodId) -> KmodId {
-    match sched::kmodgen::get() {
+    let mut gen = sched::kmodgen::get();
+    if gen != 0 && sched::irqctx::in_irq() && sched::kmodgen::entered_depth() != sched::irqctx::irq_depth() {
+        if !IRQ_FALLBACK_LOGGED.swap(true, SeqCst) {
+            super::log("[kmod] owner(): hard-IRQ without a gate entered here, using module-claimed id (logged once)\n");
+        }
+        gen = 0;
+    }
+    match gen {
         0 => claimed,
         g => {
             if g != claimed.0 { super::log(&alloc::format!("[kmod] owner mismatch: claimed {} running {}\n", claimed.0, g)); }

@@ -11,6 +11,9 @@ static GEN: [AtomicU16; MAX_CPUS] = [const { AtomicU16::new(0) }; MAX_CPUS];
 #[inline(always)]
 fn cpu() -> usize { (unsafe { crate::cpu_id() }).min(MAX_CPUS - 1) }
 
+// NOTE: get()/set() assume no preemption between cpu_id() and the slot access (callers run with
+// the thread pinned to its CPU by the scheduler contract); plain load+store, no LL/SC (no LSE on aarch64).
+
 /// The generation of the module code running on this thread (0 = none).
 pub fn get() -> u16 { GEN[cpu()].load(Ordering::Relaxed) }
 
@@ -18,7 +21,13 @@ pub fn get() -> u16 { GEN[cpu()].load(Ordering::Relaxed) }
 pub fn set(g: u16) { GEN[cpu()].store(g, Ordering::Relaxed); }
 
 /// Before a context switch: take the outgoing thread's value; the next thread starts at 0.
-pub(crate) fn switch_out() -> u16 { GEN[cpu()].swap(0, Ordering::Relaxed) }
+pub(crate) fn switch_out() -> u16 { { let s = &GEN[cpu()]; let v = s.load(Ordering::Relaxed); s.store(0, Ordering::Relaxed); v } }
 
 /// After resuming: restore this thread's value on the CPU it resumed on.
 pub(crate) fn switch_in(g: u16) { GEN[cpu()].store(g, Ordering::Relaxed); }
+
+/// IRQ depth at which the innermost gate on this CPU was entered (0 = task context). Task-level
+/// entries always store 0, so the slot is only nonzero inside an IRQ-entered gate call.
+static ENTERED: [core::sync::atomic::AtomicU32; MAX_CPUS] = [const { core::sync::atomic::AtomicU32::new(0) }; MAX_CPUS];
+pub fn entered_depth() -> u32 { ENTERED[cpu()].load(Ordering::Relaxed) }
+pub fn set_entered_depth(d: u32) { ENTERED[cpu()].store(d, Ordering::Relaxed); }
