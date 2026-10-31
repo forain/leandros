@@ -414,6 +414,20 @@ struct SdhciDevice {
     /// Always 0 for the `raspi4b` QEMU test image, which has no partition
     /// table and starts F2FS directly at block 0.
     partition_offset: u64,
+    /// Length in 4096-byte blocks; 0 = unbounded (the f2fs device). Non-zero
+    /// only for the boot-FAT device, whose reads/writes are bound by it.
+    limit_blocks: u64,
+    /// Boot-FAT device (`/dev/vdc`): reported read-only; the only write path
+    /// is a root BLKWRWIN window in the VFS block layer, and every write is
+    /// sector-granular and skips sectors whose bytes are unchanged.
+    boot_fat: bool,
+}
+
+impl SdhciDevice {
+    /// Whether `n` blocks at `blk` may be transferred.
+    fn allowed(&self, is_write: bool, blk: u64, n: u64) -> bool {
+        self.limit_blocks == 0 || blk.checked_add(n).map_or(false, |e| e <= self.limit_blocks)
+    }
 }
 
 unsafe impl Send for SdhciDevice {}
@@ -693,6 +707,11 @@ impl SdhciDevice {
     /// first; on any failure the span is redone with the single-sector path,
     /// which stays the only path once multi-block has proven unreliable.
     fn do_io_span(&self, is_write: bool, blk: u64, nblocks: usize, buf: *mut u8) -> bool {
+        if self.boot_fat {
+            // Single-sector commands only (no multi-block), see `do_io`.
+            return (0..nblocks).all(|j| self.do_io(is_write, blk + j as u64,
+                unsafe { buf.add(j * BLOCK_SIZE) }));
+        }
         if MULTI_ON.load(Ordering::Relaxed) {
             let sector = (blk + self.partition_offset) * SECTORS_PER_BLOCK as u64;
             tick_window();
@@ -776,6 +795,14 @@ impl SdhciDevice {
         for i in 0..SECTORS_PER_BLOCK {
             let sector = abs_blk * SECTORS_PER_BLOCK as u64 + i as u64;
             tick_window();
+            if is_write && self.boot_fat {
+                // A 4 KiB VFS write over a 512 B edit must not re-write (and
+                // so risk tearing) the 7 unchanged sectors: read, compare, skip.
+                let mut cur = [0u8; SECTOR_SIZE];
+                let same = unsafe { self.do_io_sector(false, sector, cur.as_mut_ptr()) }
+                    && cur == unsafe { core::slice::from_raw_parts(buf.add(i * SECTOR_SIZE), SECTOR_SIZE) };
+                if same { continue; }
+            }
             let ok = unsafe { self.do_io_sector(is_write, sector, buf.add(i * SECTOR_SIZE)) };
             if !ok {
                 // Report the sector and the controller's own account of what
@@ -1299,8 +1326,24 @@ unsafe fn find_f2fs_partition(dev: &SdhciDevice) -> Option<u64> {
     None
 }
 
+/// MBR partition 1 if it is FAT32 (0x0b/0x0c) and 4 KiB-aligned:
+/// `(offset, length)` in 4096-byte blocks (length rounded down).
+#[cfg(feature = "rpi5")]
+unsafe fn find_boot_partition(dev: &SdhciDevice) -> Option<(u64, u64)> {
+    let mut mbr = [0u8; BLOCK_SIZE];
+    if !dev.do_io(false, 0, mbr.as_mut_ptr()) { return None; }
+    if mbr[510] != 0x55 || mbr[511] != 0xAA { return None; }
+    let e = &mbr[446..462];
+    if e[4] != 0x0b && e[4] != 0x0c { return None; }
+    let lba = u32::from_le_bytes(e[8..12].try_into().unwrap()) as u64;
+    let len = u32::from_le_bytes(e[12..16].try_into().unwrap()) as u64;
+    let spb = SECTORS_PER_BLOCK as u64;
+    if lba % spb != 0 || len < spb { return None; }
+    Some((lba / spb, len / spb))
+}
+
 unsafe fn probe_card(base: usize) -> Option<SdhciDevice> {
-    let mut dev = SdhciDevice { base, high_capacity: false, partition_offset: 0 };
+    let mut dev = SdhciDevice { base, high_capacity: false, partition_offset: 0, limit_blocks: 0, boot_fat: false };
     dev.reset_and_init_clock();
 
     dev.send_command(CMD_GO_IDLE_STATE, 0, RESP_NONE, false, false, false)?;
@@ -1408,7 +1451,22 @@ pub fn init() {
     // code keeps `/dev/vdb` working unmodified everywhere.
     *cnt = match unsafe { probe_card(virt_base) } {
         Some(d) => {
+            #[cfg(feature = "rpi5")]
+            let boot = unsafe { find_boot_partition(&d) };
             devs[1] = Some(d);
+            // MBR partition 1 as /dev/vdc (read-only; BLKWRWIN windows only).
+            // Registered only; nothing reads, mounts or scans it.
+            #[cfg(feature = "rpi5")]
+            let n = if let (Some((off, len)), Some(d1)) = (boot, devs[1].as_ref()) {
+                devs[2] = Some(SdhciDevice {
+                    base: d1.base, high_capacity: d1.high_capacity,
+                    partition_offset: off, limit_blocks: len, boot_fat: true,
+                });
+                crate::kenv::pci::serial_debug("[sdhci] boot FAT (MBR p1) exposed as /dev/vdc\n");
+                3
+            } else { 2 };
+            #[cfg(not(feature = "rpi5"))]
+            let n = 2;
             dbg(b']');
             if MULTITEST.load(Ordering::Relaxed) {
                 if let Some(ref d) = devs[1] { unsafe { d.multitest(); } }
@@ -1418,7 +1476,7 @@ pub fn init() {
             } else {
                 "[sdhci] I/O mode: PIO single-sector CMD17/CMD24 (multi-block off; sdhci.multi=1 enables it)\n"
             });
-            2
+            n
         }
         None => { dbg(b'-'); 0 }
     };
@@ -1432,7 +1490,7 @@ pub fn device_count() -> usize {
 pub fn read_block(dev_idx: usize, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool {
     let devs = DEVICES.lock();
     if let Some(ref dev) = devs[dev_idx] {
-        dev.do_io_span(false, blk, 1, buf.as_mut_ptr())
+        dev.allowed(false, blk, 1) && dev.do_io_span(false, blk, 1, buf.as_mut_ptr())
     } else {
         false
     }
@@ -1464,6 +1522,13 @@ pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
 fn span_io(dev_idx: usize, is_write: bool, blk: u64, buf: *mut u8, len: usize) -> bool {
     if len == 0 || len % BLOCK_SIZE != 0 { return false; }
     let total = len / BLOCK_SIZE;
+    {
+        let devs = DEVICES.lock();
+        match devs.get(dev_idx) {
+            Some(Some(d)) if d.allowed(is_write, blk, total as u64) => {}
+            _ => return false,
+        }
+    }
     if !MULTI_ON.load(Ordering::Relaxed) {
         // Exactly the pre-multi-block behaviour: one 4 KiB block (8 single
         // sectors) per `DEVICES` hold, no reschedule point.
@@ -1503,6 +1568,17 @@ fn span_io(dev_idx: usize, is_write: bool, blk: u64, buf: *mut u8, len: usize) -
 ///
 /// Still gated on the device existing, so a flush against an absent device
 /// reports failure exactly as virtio_blk does.
+/// The boot-FAT device is always read-only (writable only inside a BLKWRWIN window).
+pub fn read_only(dev_idx: usize) -> bool {
+    let devs = DEVICES.lock();
+    matches!(devs.get(dev_idx), Some(Some(d)) if d.boot_fat)
+}
+
+pub fn is_boot_fat(dev_idx: usize) -> bool {
+    let devs = DEVICES.lock();
+    matches!(devs.get(dev_idx), Some(Some(d)) if d.boot_fat)
+}
+
 pub fn flush(dev_idx: usize) -> bool {
     let devs = DEVICES.lock();
     devs[dev_idx].is_some()
@@ -1512,7 +1588,7 @@ pub fn flush(dev_idx: usize) -> bool {
 pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
     let devs = DEVICES.lock();
     if let Some(ref dev) = devs[dev_idx] {
-        dev.do_io_span(true, blk, 1, buf.as_ptr() as *mut u8)
+        dev.allowed(true, blk, 1) && dev.do_io_span(true, blk, 1, buf.as_ptr() as *mut u8)
     } else {
         false
     }
@@ -1535,12 +1611,13 @@ pub fn has_f2fs(dev_idx: usize) -> bool {
 /// is a separate question from bus speed.
 pub fn info(dev_idx: usize) -> Option<crate::BlkDevInfo> {
     let devs = DEVICES.lock();
-    devs.get(dev_idx)?.as_ref()?;
+    let (boot, lim) = { let d = devs.get(dev_idx)?.as_ref()?; (d.boot_fat, d.limit_blocks) };
     drop(devs);
     Some(crate::BlkDevInfo {
-        total_blocks: 0,
+        total_blocks: lim,
         block_size: BLOCK_SIZE as u32,
-        fstype: if has_f2fs(dev_idx) { Some("f2fs") } else { None },
+        // Never fs-scan the boot FAT.
+        fstype: if !boot && has_f2fs(dev_idx) { Some("f2fs") } else { None },
     })
 }
 

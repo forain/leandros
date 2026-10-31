@@ -746,6 +746,7 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
         class: e.class,
         ordinal: e.ordinal,
         gone: e.gone,
+        special: false,
     })
 }
 

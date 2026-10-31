@@ -21,6 +21,7 @@ mod kexec;
 #[cfg(target_arch = "x86_64")]
 mod direct_hhdm;
 mod netwatch;
+mod tryboot;
 mod syscall;
 mod mem;
 mod firmware;

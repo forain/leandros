@@ -92,6 +92,9 @@ pub struct DiskDesc {
     pub ordinal: u16,
     /// Unplugged: the entry keeps its index but has no name or I/O.
     pub gone: bool,
+    /// Boot-firmware device (Pi boot FAT): opened only by its explicit path,
+    /// never listed by generic disk enumeration (/dev, /sys/class/block).
+    pub special: bool,
 }
 
 impl DiskDesc {

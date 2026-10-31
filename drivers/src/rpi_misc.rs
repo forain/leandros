@@ -73,6 +73,26 @@ pub fn fw_tag(tag: u32, vals: &[u32]) -> Option<[u32; fw::VAL_WORDS]> {
     fw::parse(r)
 }
 
+static TRIAL_BOOT: AtomicBool = AtomicBool::new(false);
+static TRIAL_CLEARED: AtomicBool = AtomicBool::new(false);
+
+/// This boot is a tryboot trial: a panic or watchdog reset must clear the
+/// one-shot firmware reboot flag first (`clear_trial_flag_nonblocking`).
+pub fn set_trial_boot(on: bool) { TRIAL_BOOT.store(on, Ordering::Release); }
+
+/// SET_REBOOT_FLAGS 0, once, best effort, never blocking: skipped when the
+/// mailbox lock is held (the panicking CPU may own it), and the mailbox call
+/// itself is a bounded spin. Safe from panic and watchdog paths.
+pub fn clear_trial_flag_nonblocking() {
+    if !TRIAL_BOOT.load(Ordering::Acquire) || !MBOX_READY.load(Ordering::Acquire) { return; }
+    if TRIAL_CLEARED.swap(true, Ordering::AcqRel) { return; }
+    let mut msg = [0u32; fw::MSG_WORDS];
+    fw::build(0x0003_8064, &[0], &mut msg);
+    if let Some(_g) = FW_LOCK.try_lock() {
+        let _ = unsafe { crate::rpi_mailbox::property_call(HHDM.load(Ordering::Relaxed), &msg) };
+    }
+}
+
 // ── RNG ──────────────────────────────────────────────────────────────────────
 
 fn rng_source(out: &mut [u8]) -> usize {
@@ -255,6 +275,7 @@ fn wdt_feed_hook() {
             }
         }
         Some((cpu, secs)) => {
+            clear_trial_flag_nonblocking();
             if WDT_FED.swap(false, Ordering::Relaxed) {
                 line(|b| { b.s("[WDT] cpu").u(cpu as u64).s(" stuck ").u(secs as u64).s("s: letting hardware watchdog reset"); });
             }
@@ -346,6 +367,7 @@ static PANIC_RESET_SECS: AtomicU32 = AtomicU32::new(5);
 /// First thing on panic: no more feeding, full hardware timeout from now.
 pub fn panic_begin() {
     if PANICKED.swap(true, Ordering::AcqRel) { return; }
+    clear_trial_flag_nonblocking();
     if PM_OK.load(Ordering::Acquire) && crate::rpi_pm::wdt_running_nolock() {
         crate::rpi_pm::wdt_kick_nolock(crate::rpi_misc_logic::wdt::HW_SECS);
     }
