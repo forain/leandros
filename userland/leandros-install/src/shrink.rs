@@ -417,7 +417,7 @@ fn state_read(dir: &str) -> BTreeMap<String, String> {
 }
 
 fn latest_dir(root: &str) -> Option<String> {
-    let mut v: Vec<String> = std::fs::read_dir(root).ok()?.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("shrink-")).collect();
+    let mut v: Vec<String> = std::fs::read_dir(root).ok()?.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("shrink-") && n != "shrink-latest").collect();
     v.sort();
     v.pop().map(|n| format!("{}/{}", root, n))
 }
