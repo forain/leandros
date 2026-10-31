@@ -1248,6 +1248,11 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8, route: u32, tt: u
         if hid.is_empty() && btusb::scan_bt(&cfg).is_some() {
             match control(hc, slot, 0x00, 9, ci.value as u16, 0, CtrlData::None, ENUM_CTRL_TIMEOUT_MS) {
                 Ok(_) => {
+                    // CONFIG_BT=m: nobody wants the controller yet, so let the autoloader
+                    // match the `usb * * e0 01 01` alias now (the generic hook below is never
+                    // reached on this early return). The module registers its class driver
+                    // from init and `adopt` then offers it the function.
+                    if cfg!(feature = "bt-module") { let _ = crate::class::wants_or_load(&cfg, vendor, product); }
                     info.class = 0xE0;
                     let f = isoch::UsbFunction { hc: hc.clone(), slot, speed, config_value: ci.value, cfg: cfg.clone() };
                     return Ok(Enumerated { info, bulk: None, hid, hub: None, audio: Some(f) });
