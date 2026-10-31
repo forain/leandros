@@ -739,19 +739,13 @@ mod hw {
 
     pub struct Mmio { host: usize }
 
-    /// Serializes every SDIO host MMIO access against [`power_off`]. The bool is
-    /// the HOST_DEAD flag: once set (under this lock) accessors never touch the
-    /// registers again (reads give all-ones, writes are dropped), so a CPU can
-    /// never be mid-load on a clock-gated controller.
-    static GATE: Mutex<bool> = Mutex::new(false);
-
     impl HostIo for Mmio {
-        fn r8(&mut self, o: usize) -> u8 { let d = GATE.lock(); if *d { 0xFF } else { unsafe { ((self.host + o) as *const u8).mmio_read() } } }
-        fn r16(&mut self, o: usize) -> u16 { let d = GATE.lock(); if *d { 0xFFFF } else { unsafe { ((self.host + o) as *const u16).mmio_read() } } }
-        fn r32(&mut self, o: usize) -> u32 { let d = GATE.lock(); if *d { !0 } else { unsafe { ((self.host + o) as *const u32).mmio_read() } } }
-        fn w8(&mut self, o: usize, v: u8) { let d = GATE.lock(); if !*d { unsafe { ((self.host + o) as *mut u8).mmio_write(v) } } }
-        fn w16(&mut self, o: usize, v: u16) { let d = GATE.lock(); if !*d { unsafe { ((self.host + o) as *mut u16).mmio_write(v) } } }
-        fn w32(&mut self, o: usize, v: u32) { let d = GATE.lock(); if !*d { unsafe { ((self.host + o) as *mut u32).mmio_write(v) } } }
+        fn r8(&mut self, o: usize) -> u8 { unsafe { ((self.host + o) as *const u8).mmio_read() } }
+        fn r16(&mut self, o: usize) -> u16 { unsafe { ((self.host + o) as *const u16).mmio_read() } }
+        fn r32(&mut self, o: usize) -> u32 { unsafe { ((self.host + o) as *const u32).mmio_read() } }
+        fn w8(&mut self, o: usize, v: u8) { unsafe { ((self.host + o) as *mut u8).mmio_write(v) } }
+        fn w16(&mut self, o: usize, v: u16) { unsafe { ((self.host + o) as *mut u16).mmio_write(v) } }
+        fn w32(&mut self, o: usize, v: u32) { unsafe { ((self.host + o) as *mut u32).mmio_write(v) } }
         fn now_us(&mut self) -> u64 { sched::monotonic_ns() / 1_000 }
         fn delay_us(&mut self, us: u32) { sched::kthread::udelay(us as u64) }
         fn mark(&mut self, code: u32, arg: u64) { sched::wedge::mark(sched::wedge::SLOT_SDIO, code, arg) }
@@ -816,23 +810,12 @@ mod hw {
     /// it; lock-free against a wedged brcmf thread (try_lock).
     pub fn power_off() -> Option<&'static str> {
         let (host, _cfg) = (*MAPS.try_lock()?)?;
-        // Take the access gate (bounded: 100 ms) so no accessor is mid-register,
-        // then mark the host dead before touching it.
-        let mut gate = None;
-        for _ in 0..1000 {
-            if let Some(g) = GATE.try_lock() { gate = Some(g); break; }
-            sched::kthread::udelay(100);
-        }
-        let Some(mut g) = gate else { return Some("sdio busy, power-off skipped"); };
-        *g = true;
-        unsafe {
-            ((host + REG_NORMAL_SIG_ENABLE) as *mut u16).mmio_write(0);
-            ((host + REG_ERROR_SIG_ENABLE) as *mut u16).mmio_write(0);
-            ((host + REG_CLOCK_CONTROL) as *mut u16).mmio_write(0);
-            ((host + REG_POWER_CONTROL) as *mut u8).mmio_write(0);
-            ((host + REG_SOFTWARE_RESET) as *mut u8).mmio_write(SWRST_ALL);
-        }
-        drop(g);
+        let mut q = Mmio { host };
+        q.w16(REG_NORMAL_SIG_ENABLE, 0);
+        q.w16(REG_ERROR_SIG_ENABLE, 0);
+        q.w16(REG_CLOCK_CONTROL, 0);
+        q.w8(REG_POWER_CONTROL, 0);
+        q.w8(REG_SOFTWARE_RESET, SWRST_ALL);
         wl_reg_on(false);
         Some("sdio2 host reset, SD clock + bus power off, WL_REG_ON low")
     }
@@ -844,7 +827,6 @@ mod hw {
     /// host from an earlier run is dropped first.
     pub fn probe_with(off_us: u32, on_us: u32, tune: SdioTune) {
         let t0 = sched::monotonic_ns() / 1_000;
-        *GATE.lock() = false;
         drop(HOST.lock().take());
         let cached = *MAPS.lock();
         let maps = cached.or_else(|| match (map(SDIO2_HOST_PHYS, 0x100), map(SDIO2_CFG_PHYS, 0x100)) {

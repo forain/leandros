@@ -84,26 +84,17 @@ static SHUT: AtomicBool = AtomicBool::new(false);
 pub fn shutdown() -> Option<String> {
     SHUT.store(true, Ordering::Release);
     let t0 = now_ms();
-    let running = crate::brcmf::netdev::request_shutdown();
-    if running {
+    let polite = if crate::brcmf::netdev::request_shutdown() {
         while !crate::brcmf::netdev::shutdown_done() && now_ms() - t0 < SHUTDOWN_WAIT_MS {
             sched::kthread::msleep(10);
         }
-    }
-    if running && !crate::brcmf::netdev::shutdown_done() {
-        // The driver thread may be mid-SDIO access: never gate under it. The next
-        // kernel's brcmf probe resets host and WL_REG_ON anyway.
-        return Some(format!("brcmf: thread busy, power-off skipped ({} ms)", now_ms() - t0));
-    }
-    let polite = if running { "disassoc+down" } else { "driver not running" };
-    if NO_POWEROFF.load(Ordering::Relaxed) {
-        return Some(format!("brcmf: {} in {} ms; brcmf.kexec_poweroff=0, SDIO/WL_REG_ON power-off skipped", polite, now_ms() - t0));
-    }
+        if crate::brcmf::netdev::shutdown_done() { "disassoc+down" } else { "driver busy (no answer), forced" }
+    } else {
+        "driver not running"
+    };
     let hw = sdio_host::power_off()?;
     Some(format!("brcmf: {} in {} ms; {}", polite, now_ms() - t0, hw))
 }
-/// `brcmf.kexec_poweroff=0`: leave host and chip powered at reboot/kexec (Pi A/B).
-static NO_POWEROFF: AtomicBool = AtomicBool::new(false);
 const SHUTDOWN_WAIT_MS: u64 = 500;
 
 fn fail(msg: &str) {
@@ -118,9 +109,6 @@ fn now_ms() -> u64 { sched::monotonic_ns() / 1_000_000 }
 
 /// Kernel init, rpi5 only. Returns at once; the work runs on a kthread.
 pub fn start(cmdline: &str) {
-    if cmdline.split_ascii_whitespace().any(|t| t == "brcmf.kexec_poweroff=0") {
-        NO_POWEROFF.store(true, Ordering::Relaxed);
-    }
     if cmdline.split_ascii_whitespace().any(|t| t == "brcmf=0") {
         STATE.store(STATE_SKIPPED, Ordering::Release);
         log("skip (brcmf=0)");
