@@ -89,7 +89,7 @@ config V3D
 	default y
 
 config HDMI_AUDIO
-	bool "Pi 5 HDMI audio"
+	tristate "Pi 5 HDMI audio"
 	depends on BOARD_RPI5
 	default y
 

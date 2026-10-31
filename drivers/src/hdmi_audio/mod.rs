@@ -19,17 +19,6 @@ pub use stub::*;
 
 pub type SerrorCheck = fn() -> Option<u64>;
 
-/// Boot-probe facts for hdmi0 as `(state, port_flags, pix_khz, edid_sink)`; all 0 off the rpi5 build.
-/// Independent of the `hdmi-audio` feature: the probe is also what an out-of-tree audio module reads.
-#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-pub fn sink_info() -> (u32, u32, u32, u32) {
-    use crate::hdmi_probe as p;
-    use core::sync::atomic::Ordering::Relaxed;
-    (p::state(), p::PORT_FLAGS[0].load(Relaxed), p::PORT_PIX_KHZ[0].load(Relaxed), p::EDID_SINK.load(Relaxed))
-}
-#[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
-pub fn sink_info() -> (u32, u32, u32, u32) { (0, 0, 0, 0) }
-
 #[cfg(not(all(target_arch = "aarch64", feature = "rpi5", feature = "hdmi-audio")))]
 mod stub {
     use alloc::string::String;
@@ -54,16 +43,17 @@ mod stub {
 #[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "hdmi-audio"))]
 mod hw {
     use super::pure::*;
-    use crate::bcm2712_dma40 as dma;
-    use crate::hdmi_probe as probe;
-    use crate::pci::serial_debug;
+    use crate::kenv::hdmi as env;
+    use env::{dma, buddy, phys_to_virt, serial_debug};
     use alloc::format;
     use alloc::string::String;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use leandros_lib::mmio::{MmioRd, MmioWr};
-    use mm::kva::{ioremap, iounmap, CacheMode};
-    use mm::{buddy, phys_to_virt};
 
+    const DVP_LEN: usize = 0x10;
+    const HD_LEN: usize = 0x100;
+    const HDMI_LEN: usize = 0x300;
+    const PKT_LEN: usize = 0x400;
     const DVP_PHYS: u64 = 0x10_7c70_0000;
     const HD_PHYS: u64 = 0x10_7c72_0000;
     const HDMI0_PHYS: u64 = 0x10_7c70_1400;
@@ -86,7 +76,7 @@ mod hw {
 
     fn serror() -> Option<u64> {
         let f = SERROR.load(Ordering::Acquire);
-        if f == 0 { return None; }
+        if f == 0 { return env::serror(); }
         let f: super::SerrorCheck = unsafe { core::mem::transmute(f) };
         f()
     }
@@ -96,7 +86,7 @@ mod hw {
     }
 
     pub fn may_appear(cmdline: &str) -> bool {
-        !disabled(cmdline) && probe::state() == probe::PROBE_NOT_RUN
+        !disabled(cmdline) && env::sink().state == env::PROBE_NOT_RUN
     }
 
     #[inline]
@@ -105,8 +95,8 @@ mod hw {
     fn wr(base: usize, off: usize, v: u32) { unsafe { ((base + off) as *mut u32).mmio_write(v) } }
 
     fn spin_us(us: u64) {
-        let end = sched::monotonic_ns() + us * 1000;
-        while sched::monotonic_ns() < end { core::hint::spin_loop(); }
+        let end = env::monotonic_ns() + us * 1000;
+        while env::monotonic_ns() < end { core::hint::spin_loop(); }
     }
 
     pub struct HdmiAudio {
@@ -168,26 +158,26 @@ mod hw {
 
         fn probe_inner(&mut self, cmdline: &str) -> Result<(), &'static str> {
             if disabled(cmdline) { return Err("disabled (hdmi.audio=0)"); }
-            match probe::state() {
-                probe::PROBE_DONE => {}
-                probe::PROBE_NOT_RUN => return Err("hdmi probe has not run yet"),
-                probe::PROBE_SKIPPED => return Err("hdmi probe skipped (hdmi.probe=0)"),
+            let sk = env::sink();
+            match sk.state {
+                env::PROBE_DONE => {}
+                env::PROBE_NOT_RUN => return Err("hdmi probe has not run yet"),
+                env::PROBE_SKIPPED => return Err("hdmi probe skipped (hdmi.probe=0)"),
                 _ => return Err("hdmi probe failed (nomap/serror)"),
             }
-            let f = probe::PORT_FLAGS[0].load(Ordering::Relaxed);
-            if f & probe::PORT_VALID == 0 { return Err("no hdmi0 probe data"); }
-            if f & (probe::PORT_HPD | probe::PORT_ACTIVE) == 0 { return Err("no sink on hdmi0 (hpd=0 active=0)"); }
-            if f & probe::PORT_HDMI_MODE == 0 { return Err("hdmi0 runs DVI (no audio; try hdmi_drive=2)"); }
-            let sink = probe::EDID_SINK.load(Ordering::Relaxed);
-            self.pix_khz = probe::PORT_PIX_KHZ[0].load(Ordering::Relaxed);
+            let f = sk.flags;
+            if f & env::PORT_VALID == 0 { return Err("no hdmi0 probe data"); }
+            if f & (env::PORT_HPD | env::PORT_ACTIVE) == 0 { return Err("no sink on hdmi0 (hpd=0 active=0)"); }
+            if f & env::PORT_HDMI_MODE == 0 { return Err("hdmi0 runs DVI (no audio; try hdmi_drive=2)"); }
+            let sink = sk.sink;
+            self.pix_khz = sk.pix_khz;
             if self.pix_khz == 0 { return Err("hdmi0 pixel clock unknown"); }
-            self.d0 = crate::bcm2712_id::stepping().stepping != crate::bcm2712_id::Stepping::C0;
-
-            let map = |phys: u64, len: usize| ioremap(phys, len, CacheMode::Uncached).unwrap_or(0);
-            self.dvp = map(DVP_PHYS, 0x10);
-            self.hd = map(HD_PHYS, 0x100);
-            self.hdmi = map(HDMI0_PHYS, 0x300);
-            self.pkt = map(PACKET0_PHYS, 0x400);
+            self.d0 = sk.d0;
+            let map = |phys: u64, len: usize| env::ioremap_uc(phys, len);
+            self.dvp = map(DVP_PHYS, DVP_LEN);
+            self.hd = map(HD_PHYS, HD_LEN);
+            self.hdmi = map(HDMI0_PHYS, HDMI_LEN);
+            self.pkt = map(PACKET0_PHYS, PKT_LEN);
             if self.dvp == 0 || self.hd == 0 || self.hdmi == 0 || self.pkt == 0 { return Err("ioremap failed"); }
             if let Some(syn) = serror() {
                 serial_debug(&format!("[hdmiaud] serror pending before setup syn=0x{:016x}\n", syn));
@@ -227,7 +217,7 @@ mod hw {
                 "hdmi0 pix={} kHz N={} CTS={} gate={} thr={} dma ch{} fifo={}(0x{:x}) {} edid={}\n",
                 self.pix_khz, self.n, self.cts, gate_was, if self.d0 { "d0" } else { "c" }, ch_id, how, self.fifo,
                 if dma::polled() { "poll" } else { "irq" },
-                match sink { probe::SINK_HDMI => "hdmi", probe::SINK_DVI => "dvi(forced hdmi mode)", _ => "unknown" }
+                match sink { env::SINK_HDMI => "hdmi", env::SINK_DVI => "dvi(forced hdmi mode)", _ => "unknown" }
             );
             Ok(())
         }
@@ -235,7 +225,7 @@ mod hw {
         /// Programs MAI, packetizer, ACR and the InfoFrame for `fs` (Linux startup + prepare).
         fn program(&mut self, fs: u32) -> Result<(), &'static str> {
             let fmt = mai_fmt(fs).ok_or("unsupported rate")?;
-            let (mut n, mut cts) = crate::hdmi_probe::decode::acr_n_cts(self.pix_khz, fs);
+            let (mut n, mut cts) = env::acr_n_cts(self.pix_khz, fs);
             if n == 0 || cts == 0 { (n, cts) = n_cts_fallback(self.pix_khz, fs); }
             self.n = n;
             self.cts = cts;
@@ -270,8 +260,8 @@ mod hw {
             let bit = 1u32 << AUDIO_PACKET_ID;
             let cfg = rd(h, HDMI_RAM_PACKET_CONFIG);
             wr(h, HDMI_RAM_PACKET_CONFIG, cfg & !bit);
-            let end = sched::monotonic_ns() + 100_000_000;
-            while rd(h, HDMI_RAM_PACKET_STATUS) & bit != 0 && sched::monotonic_ns() < end { core::hint::spin_loop(); }
+            let end = env::monotonic_ns() + 100_000_000;
+            while rd(h, HDMI_RAM_PACKET_STATUS) & bit != 0 && env::monotonic_ns() < end { core::hint::spin_loop(); }
             let words = infoframe_words(&audio_infoframe(2));
             let base = self.pkt + AUDIO_PACKET_ID as usize * PACKET_STRIDE;
             for (i, w) in words.iter().enumerate() { wr(base, i * 4, *w); }
@@ -286,7 +276,7 @@ mod hw {
                 let w = (off % BLOCK_BYTES) / 4;
                 unsafe { core::ptr::write_volatile(ring.add(off / 4), self.silence[w]); }
             }
-            dma::dcache_clean_inval(self.ring + a, b - a);
+            env::dcache_clean_inval(self.ring + a, b - a);
         }
 
         /// Fills the ring with silence and starts the cyclic DMA into MAI_DATA. With `verify`,
@@ -308,8 +298,8 @@ mod hw {
             self.stream_active = true;
             if !verify { return Ok(()); }
             let first = ch.position();
-            let end = sched::monotonic_ns() + 40_000_000;
-            while sched::monotonic_ns() < end {
+            let end = env::monotonic_ns() + 40_000_000;
+            while env::monotonic_ns() < end {
                 ch.poll();
                 let p = ch.position();
                 if p.is_some() && p != first {
@@ -336,7 +326,7 @@ mod hw {
             if self.ring_phys != 0 { buddy::free(self.ring_phys, RING_ORDER); }
             self.ring = 0;
             self.ring_phys = 0;
-            for va in [self.dvp, self.hd, self.hdmi, self.pkt] { if va != 0 { iounmap(va); } }
+            for (va, len) in [(self.dvp, DVP_LEN), (self.hd, HD_LEN), (self.hdmi, HDMI_LEN), (self.pkt, PKT_LEN)] { if va != 0 { env::iounmap(va, len); } }
             self.dvp = 0; self.hd = 0; self.hdmi = 0; self.pkt = 0;
             self.initialized = false;
         }
@@ -432,8 +422,8 @@ mod hw {
             if produced == 0 { return used; }
             let n = produced * FRAME_BYTES;
             let first = n.min(RING_BYTES - start);
-            dma::dcache_clean_inval(self.ring + start, first);
-            if n > first { dma::dcache_clean_inval(self.ring, n - first); }
+            env::dcache_clean_inval(self.ring + start, first);
+            if n > first { env::dcache_clean_inval(self.ring, n - first); }
             self.r.written += n as u64;
             self.r.was_ahead = true;
             used
@@ -442,7 +432,7 @@ mod hw {
         /// Queued audio in S16-stereo-equivalent bytes (the ring holds 8-byte IEC958 frames).
         pub fn queued_bytes(&self) -> u64 { self.r.queued() / 2 }
 
-        pub fn tx_used_idx(&self) -> u16 { (self.r.played / 2 / crate::snd::TX_BUF_BYTES as u64) as u16 }
+        pub fn tx_used_idx(&self) -> u16 { (self.r.played / 2 / env::TX_BUF_BYTES as u64) as u16 }
 
         pub fn top_up_silence(&mut self) { self.update(); }
 

@@ -336,6 +336,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // HDMI audio binds late: PipeWire's first init ran before the HDMI probe, so retry once now.
     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] {
         drivers::hdmi_audio::set_serror_check(arch_aarch64::exception::serror_checkpoint);
+        drivers::hdmi_plat::announce();
         if !pipewire_server::is_initialized() {
             if let Ok(p) = pipewire_server::init(crate::boot_cmdline().unwrap_or("")) {
                 serial_print_str("[INIT] PipeWire server port (HDMI audio): ");

@@ -666,7 +666,7 @@ fn kmodplat_checks(t: &mut T) {
     t.check(exports::kapi_hdmi_sink_info(&mut hs) == -22, "hdmi_sink_info size 0 -> -22");
     hs.size = core::mem::size_of::<kmod_abi::KHdmiSink>() as u32;
     t.check(exports::kapi_hdmi_sink_info(&mut hs) == 0 && hs.size == core::mem::size_of::<kmod_abi::KHdmiSink>() as u32
-        && hs.state == drivers::hdmi_audio::sink_info().0, "hdmi_sink_info fills the record");
+        && hs.state == drivers::hdmi_plat::sink_info().0, "hdmi_sink_info fills the record");
     // DMA quiesce hook: registered, name collisions refused, removed again on a failed init.
     let qo = KmodId(60021);
     let nm = b"ktest-q";
@@ -812,7 +812,7 @@ fn t_kmodkapi() -> T {
         let q = pa(0, 0);
         t.check(q != 0, "page_alloc(0, any)");
         if q != 0 { pf(q, 0); }
-        t.check(pa(11, 0) == 0, "page_alloc order 11 refused");
+        t.check(pa(mm::buddy::MAX_ORDER as u32, 0) == 0, "page_alloc order MAX_ORDER refused");
 
         // Hardware RNG registration reseeds at once.
         let owner = KmodId(60001);
