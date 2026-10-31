@@ -157,7 +157,7 @@ if [[ "$mod" == "i915" ]]; then
         # aarch64 =y (built-in) already fails exactly these two ddb cases (artifacts/notes/lane-lapdispC1-2026-10-27.md,
         # lane-i915kenv-2026-10-30.md), so the module build must match that baseline there; x86_64 must have none.
         known=""; [[ "$arch" == "aarch64" ]] && known='ddb_plane_whole_pipe_0_860|ddb_cursor_top_32_860_892'
-        unexpected=$(grep -aE ': FAIL$' "$L" | tr -d '\r' | { if [[ -n "$known" ]]; then grep -avE "$known"; else cat; fi; } | wc -l | tr -d ' ')
+        unexpected=$({ grep -aE ': FAIL$' "$L" || true; } | tr -d '\r' | { if [[ -n "$known" ]]; then grep -avE "$known" || true; else cat; fi; } | wc -l | tr -d ' ')
         if [[ "$unexpected" == "0" ]]; then echo "ok   $s: no unexpected FAIL case lines"; else echo "FAIL $s: $unexpected unexpected FAIL lines"; fail=1; fi
         grep -aEh 'i915test: .*(passed|failed)|PASS|FAIL' "$L" | tail -n 3
     done
