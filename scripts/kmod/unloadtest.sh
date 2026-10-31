@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# unloadtest.sh [arch]: kmod unload (lane U1 subset). Needs a build with KMOD_EXTRA="hello kmbad_hang kmbad_reload virtio_rng" (virtio_rng has no exit).
+# unloadtest.sh [arch]: kmod unload (lane U1 subset). Needs a build with KMOD_EXTRA="hello kmbad_hang kmbad_reload virtio_rng" (U2 adds kmbad_thread kmbad_freectx virtio_net).
 # hello load/unload loop, -ENOENT / -EBUSY / -EPERM, kmbad_hang Zombie, kmbad_reload stale-gate proof (kmod.leaktick=1).
 set -uo pipefail
 cd "$(cd "$(dirname "$0")/../.." && pwd)"
 arch="${1:-aarch64}"; N="${UNLOAD_N:-50}"
 RT=.claude/skills/run-leandros/runtests.py
+export FFSESSION_OUT="${FFSESSION_OUT:-/tmp/ffsession-$(basename "$PWD")}"
+# Guard: refuse to test a stale image or a half-written one.
+if ps aux | grep "[b]uild-all.sh" | grep -q "$PWD" >/dev/null; then echo "build-all running in this worktree; wait" >&2; exit 2; fi
+img=leandros-limine-$arch.img
+if [ -n "$img" ]; then for e in target/kmod/$arch/*.elf; do [ -e "$e" ] && [ "$e" -nt "$img" ] && { echo "image $img older than $e; rebuild" >&2; exit 2; }; done; fi
 export LEANDROS_RUN_ID="unloadtest-$arch"
 M='$MD'  # guest var: the lib/modules/<id> dir whose build-id this kernel accepts (there can be several)
 load() { echo "kmodctl load ${M}$1.kmod"; }
@@ -14,9 +19,12 @@ python3 "$RT" "$arch" ul1 --cmdline "kmod.leaktick=1" \
   "kmodctl rmmod hello; echo ENOENT_RC=\$?" \
   "kmodctl load $M/kmbad_hang.kmod; kmodctl rmmod kmbad_hang; echo HANGRM_RC=\$?; kmodctl load $M/kmbad_hang.kmod; echo HANGRELOAD_RC=\$?; cat /proc/modules" \
   "kmodctl load $M/kmbad_reload.kmod; sleep 1; kmodctl rmmod kmbad_reload; kmodctl load $M/kmbad_reload.kmod; sleep 1; kmodctl rmmod kmbad_reload; echo RELOAD_DONE" \
-  "kmodctl load $M/virtio_rng.kmod; o=\$(kmodctl rmmod virtio_rng 2>&1); echo NOEXIT_RC=\$? OUT=\$o; grep virtio_rng /proc/modules" \
+  "o=\$(kmodctl rmmod i915 2>&1); echo NOEXIT_RC=\$? OUT=\$o" \
+  "kmodctl load $M/kmbad_thread.kmod; sleep 1; kmodctl rmmod kmbad_thread; echo THREADRM_RC=\$?; kmodctl load $M/kmbad_freectx.kmod; sleep 1; kmodctl rmmod kmbad_freectx; echo FREECTXRM_RC=\$?; sleep 1; echo BAD_DONE" \
+  "kmodctl rmmod virtio_rng; kmodctl rmmod virtio_net; for i in \$(seq 1 $N); do kmodctl load $M/virtio_rng.kmod >/dev/null 2>&1 || echo RNGLOADFAIL \$i; kmodctl rmmod virtio_rng >/dev/null 2>&1 || echo RNGUNLOADFAIL \$i; done; echo RNGLOOP_DONE" \
+  "(ping -c 100000 -i 1 192.168.105.1 >/dev/null 2>&1 &); for i in \$(seq 1 ${NET_N:-20}); do kmodctl load $M/virtio_net.kmod >/dev/null 2>&1 || echo NETLOADFAIL \$i; sleep 4; echo NETRELOAD_OK \$i; echo NETCNT \$i \$(grep eth0 /proc/net/dev);  kmodctl rmmod virtio_net >/dev/null 2>&1 || echo NETUNLOADFAIL \$i; done; echo NETLOOP_DONE" \
   "kmodctl load $M/hello.kmod; o=\$(/bin/sudo -u leandro /bin/kmodctl rmmod hello 2>&1); echo NONROOT_RC=\$? OUT=\$o; kmodctl rmmod hello" > /dev/null 2>&1
-L=/tmp/ffsession/tests-ul1/serial-full.log
+L="${FFSESSION_OUT:-/tmp/ffsession}/tests-ul1/serial-full.log"
 fail=0
 check() { if grep -aq -- "$1" "$L"; then echo "ok   $2"; else echo "FAIL $2"; fail=1; fi; }
 nocheck() { if grep -aq -- "$1" "$L"; then echo "FAIL $2"; fail=1; else echo "ok   $2"; fi; }
@@ -28,8 +36,61 @@ check 'ZOMBIE: exit timeout' "kmbad_hang becomes Zombie"
 check 'HANGRELOAD_RC=1' "zombie reload refused"
 check 'kmbad_hang .* Zombie' "Zombie in /proc/modules"
 check 'kmbad_reload tick ok gen' "reload fixture ticks"
-check 'NOEXIT_RC=1 OUT=.*delete_module: Resource busy (errno 16)' "no-exit rmmod returns EBUSY"
-check 'virtio_rng .* Live' "no-exit module still Live"
+check 'NOEXIT_RC=1' "no-exit/unknown rmmod fails"
+check 'BAD_DONE' "kmbad_thread/kmbad_freectx run finished"
+check 'kmbad_thread body stopped' "kthread saw should_stop"
+check 'kmbad_freectx exit: ctx freed' "freectx exit ran"
+nocheck 'panic\|PANIC\|Data abort\|Oops' "no crash in the bad fixtures"
+check 'RNGLOOP_DONE' "virtio_rng x$N finished"
+nocheck '^RNG\(LOAD\|UNLOAD\)FAIL' "virtio_rng x$N clean"
+check 'NETLOOP_DONE' "virtio_net loop finished"
+nocheck '^NET\(UNLOAD\|LOAD\)FAIL' "virtio_net reload clean"
+nocheck '\[NET\] netif eth1' "reload never creates eth1 (eth0 keeps its name)"
+# Counters per cycle: rx/tx packets (fields 3 and 11 after "eth0:") must rise across reloads.
+grep -a '^NETCNT ' "$L" | tr -d '\r' | sed 's/eth0:/eth0: /' > "${L%.log}-netcnt.txt"
+cat "${L%.log}-netcnt.txt"
+python3 - "${L%.log}-netcnt.txt" <<'PY' || fail=1
+import sys
+rows=[l.split() for l in open(sys.argv[1])]
+rx=[];tx=[]
+for r in rows:
+    f=r[r.index('eth0:')+1:]
+    if len(f)>=10: rx.append(int(f[1])); tx.append(int(f[9]))
+ok=len(rx)>=2 and all(b>a for a,b in zip(rx,rx[1:])) and all(b>a for a,b in zip(tx,tx[1:]))
+print(("ok   " if ok else "FAIL ")+"eth0 rx/tx packets rise across reloads (%d cycles, rx %s..%s, tx %s..%s)"%(len(rx),rx[:1],rx[-1:],tx[:1],tx[-1:]))
+sys.exit(0 if ok else 1)
+PY
+n=$(grep -a 'DHCP configured, address: .* (eth0)' "$L" | wc -l)
+if [ "$n" -ge "${NET_N:-20}" ]; then echo "ok   eth0 DHCP + traffic after each reload ($n)"; else echo "FAIL eth0 DHCP after reloads ($n)"; fail=1; fi
 check 'NONROOT_RC=[0-9]* OUT=.*delete_module: Operation not permitted (errno 1)' "non-root errno is EPERM"
 nocheck 'STALE REACHED' "stale registration never reaches the new generation"
+# ---- U3 upper edge (kmodupper): mounted usb_storage is busy, reload re-mounts, usb_hid x10, kmbad_leak Zombie.
+# Needs KMOD_EXTRA="... kmbad_leak usb_storage usb_hid" and an untracked .config (CONFIG_MODULES=y CONFIG_USB_HID=m CONFIG_USB_STORAGE=m).
+# The stick is a small f2fs volume made by scripts/mkfs-f2fs-home.py (mounted read-only; a rw umount of it broke the root lookup).
+if [ -n "${UPPER:-}" ]; then
+  stick="${TMPDIR:-/tmp}/ul-stick.img"; rm -f "$stick"; python3 scripts/mkfs-f2fs-home.py create "$stick" --size 128M >/dev/null
+  export LEANDROS_QEMU_EXTRA="-device qemu-xhci,id=xhs -device usb-kbd,bus=xhs.0,id=kbd1 -drive if=none,id=stk,format=raw,file=$stick -device usb-storage,bus=xhs.0,drive=stk"
+  python3 "$RT" "$arch" ul3 \
+    "for d in /lib/modules/*/; do if kmodctl load \${d}hello.kmod >/dev/null 2>&1; then kmodctl rmmod hello >/dev/null 2>&1; MD=\${d%/}; break; fi; done; mkdir /tmp/stk" \
+    "mount -t f2fs /dev/sda /tmp/stk; echo MOUNTRW_RC=\$?; kmodctl rmmod usb_storage; echo BUSYRW_RC=\$?; echo hi > /tmp/stk/f1 && sync; echo WRITEAFTER_RC=\$?; cat /tmp/stk/f1 > /tmp/f1copy; echo CATAFTER_RC=\$?; umount /tmp/stk; echo UMOUNTRW_RC=\$?" \
+    "mount -t f2fs -o ro /dev/sda /tmp/stk; echo MOUNT_RC=\$?; kmodctl rmmod usb_storage; echo BUSY_RC=\$?" \
+    "umount /tmp/stk; kmodctl rmmod usb_storage; echo UMNT_RM_RC=\$?" \
+    "sleep 1; kmodctl load $M/usb_storage.kmod; sleep 3; mount -t f2fs -o ro /dev/sda /tmp/stk; echo REMOUNT_RC=\$?; umount /tmp/stk; kmodctl rmmod usb_storage; echo RM2_RC=\$?" \
+    "for i in \$(seq 1 10); do kmodctl rmmod usb_hid >/dev/null 2>&1; kmodctl load $M/usb_hid.kmod >/dev/null 2>&1 || echo HIDLOADFAIL \$i; sleep 1; done; echo HIDLOOP_DONE" \
+    "kmodctl load $M/kmbad_leak.kmod; kmodctl rmmod kmbad_leak; echo LEAKRM_RC=\$?; cat /proc/modules" > /dev/null 2>&1
+  L="${FFSESSION_OUT:-/tmp/ffsession}/tests-ul3/serial-full.log"
+  check 'usb_storage busy: mounted' "mounted usb_storage is busy"
+  check 'BUSY_RC=1' "rmmod of mounted usb_storage fails"
+  check 'BUSYRW_RC=1' "rmmod of rw-mounted usb_storage fails (fast EBUSY)"
+  check 'WRITEAFTER_RC=0' "rw fs still writes + syncs right after the refused rmmod"
+  check 'CATAFTER_RC=0' "rw fs still reads after the refused rmmod"
+  check 'UMOUNTRW_RC=0' "rw umount after refused rmmod"
+  check 'UMNT_RM_RC=0' "rmmod after umount ok"
+  check 'REMOUNT_RC=0' "reload re-mounts"
+  check 'RM2_RC=0' "second rmmod ok"
+  check 'HIDLOOP_DONE' "usb_hid x10 finished"
+  nocheck '^HIDLOADFAIL [0-9]' "usb_hid reload clean"
+  check 'kmbad_leak ZOMBIE: ungated registrations left' "kmbad_leak becomes Zombie"
+  check 'kmbad_leak .* Zombie' "kmbad_leak Zombie in /proc/modules"
+fi
 exit $fail

@@ -133,6 +133,15 @@ pub fn remove_disk(idx: usize) -> usize {
     k
 }
 
+/// `/dev/<name>` of disk `idx` and of its live partitions (a mount names one of them).
+pub fn family_paths(idx: usize) -> alloc::vec::Vec<&'static str> {
+    let t = REG.lock();
+    t.e[..t.n].iter().enumerate().filter_map(|(i, s)| {
+        let e = s.as_ref()?;
+        (!e.gone && (i == idx || e.parent.map(|p| p as usize) == Some(idx))).then_some(e.path)
+    }).collect()
+}
+
 fn leak_path(name: &[u8]) -> &'static str {
     let mut s = alloc::string::String::from("/dev/");
     s.push_str(core::str::from_utf8(name).unwrap_or("?"));

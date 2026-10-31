@@ -45,15 +45,43 @@ pub(crate) struct Camera {
     pub owner: KmodId,
     pub info: CamInfo,
     pub slot: u8,
-    ops: &'static KCameraOps,
+    ops: GOps,
     ctx: usize,
+}
+
+/// A module's camera ops, reachable only through the Upper gate of its generation (builtin: no gate).
+#[derive(Clone)]
+pub(crate) struct GOps { ops: &'static KCameraOps, gate: Option<Arc<crate::kmod::gate::Gate>> }
+
+impl GOps {
+    fn up<R>(&self, dflt: R, f: impl FnOnce(&KCameraOps) -> R) -> R {
+        match &self.gate {
+            None => f(self.ops),
+            Some(g) => g.call(crate::kmod::gate::Class::Upper, || f(self.ops)).unwrap_or(dflt),
+        }
+    }
+    /// Run `f` as an Upper activation (builtin: plain call); None when the gate is closed.
+    /// An open that claims the device does so inside the activation, so the unload's drain sees it.
+    fn in_gate<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        match &self.gate { None => Some(f()), Some(g) => g.call(crate::kmod::gate::Class::Upper, f) }
+    }
+    fn stream_poll(&self, c: usize) -> u32 { self.up(KCAM_GONE, |o| (o.stream_poll)(c)) }
+    fn stream_gone(&self, c: usize) -> bool { self.up(true, |o| (o.stream_gone)(c)) }
+    fn stream_ready(&self, c: usize) -> u32 { self.up(0, |o| (o.stream_ready)(c)) }
+    fn stream_stop(&self, c: usize) { self.up((), |o| (o.stream_stop)(c)) }
+    fn stream_qbuf(&self, c: usize, i: u32) -> i32 { self.up(-19, |o| (o.stream_qbuf)(c, i)) }
+    fn stream_dqbuf(&self, c: usize, out: *mut kmod_abi::KCamDone) -> i32 { self.up(-19, |o| (o.stream_dqbuf)(c, out)) }
+    fn control(&self, c: usize, cid: u32, set: bool, v: u32, out: *mut u32) -> i32 { self.up(-19, |o| (o.control)(c, cid, set, v, out)) }
+    fn stream_start(&self, c: usize, f: u8, fr: u8, iv: u32, b: *const kmod_abi::KCamBuf, n: u32) -> i32 {
+        self.up(-19, |o| (o.stream_start)(c, f, fr, iv, b, n))
+    }
 }
 
 static CAMERAS: Mutex<Vec<Arc<Camera>>> = Mutex::new(Vec::new());
 
 /// The camera behind the active stream (what the tick pumps).
-#[derive(Clone, Copy)]
-struct CamRef { ops: &'static KCameraOps, ctx: usize }
+#[derive(Clone)]
+struct CamRef { ops: GOps, ctx: usize }
 
 pub const VIDEO_MAJOR: u32 = 81;
 
@@ -177,7 +205,10 @@ pub(crate) fn register_camera(owner: KmodId, ops: &'static KCameraOps, ctx: usiz
         }
         formats.push(FormatDesc { index: kf.index, kind: kf.kind, default_frame: kf.default_frame, frames });
     }
-    let cam = Arc::new(Camera { owner, info: CamInfo { bcd_uvc: ci.bcd, formats }, slot: ci.slot, ops, ctx });
+    let gate = if owner.0 == 0 { None } else {
+        match crate::kmod::gate::get(crate::kmod::gate::owner(owner)) { Some(g) => Some(g), None => return -19 }
+    };
+    let cam = Arc::new(Camera { owner, info: CamInfo { bcd_uvc: ci.bcd, formats }, slot: ci.slot, ops: GOps { ops, gate }, ctx });
     CAMERAS.lock().push(cam);
     0
 }
@@ -185,6 +216,11 @@ pub(crate) fn register_camera(owner: KmodId, ops: &'static KCameraOps, ctx: usiz
 /// The camera with this ctx went away (unplugged).
 pub(crate) fn unregister_camera(ctx: usize) {
     CAMERAS.lock().retain(|c| c.ctx != ctx);
+}
+
+/// True when /dev/video0 is open on a camera of `owner` (a busy pin for rmmod).
+pub(crate) fn open_by(owner: KmodId) -> bool {
+    DEV.lock().cam.as_ref().map_or(false, |c| c.owner == owner)
 }
 
 /// Registered cameras (ktest).
@@ -197,8 +233,8 @@ fn pump_tick(_ctx: usize) { pump(); }
 /// USB timer tick (IRQ context): reassemble frames, wake pollers.
 fn pump() {
     if let Some(g) = STREAM.try_lock() {
-        if let Some(c) = *g {
-            if (c.ops.stream_poll)(c.ctx) != 0 { WAKE_PENDING.store(true, Ordering::Release); }
+        if let Some(c) = g.as_ref() {
+            if c.ops.stream_poll(c.ctx) != 0 { WAKE_PENDING.store(true, Ordering::Release); }
         }
     }
     if WAKE_PENDING.load(Ordering::Acquire) {
@@ -229,21 +265,24 @@ fn handle(msg: &Message, _caller: u32, _target: u32) -> Message {
             let id = match msg_arg(msg, 4) as u32 { 0 => u32::MAX, v => v };
             let Some(cam) = camera(0) else { return reply(ENODEV as i64) };
             if default_format(&cam).0 == 0 { return reply(ENODEV as i64); }
-            let mut d = DEV.lock();
-            if d.owner != 0 { return reply(EBUSY as i64); }
-            let (f, fr) = default_format(&cam);
-            *d = Dev { owner: id, cam: Some(cam), fmt: f, frame: fr, interval: 0, nreq: 0,
-                       pending: [false; MAX_BUFS], queued: [false; MAX_BUFS], streaming: false };
-            reply(0)
+            let r = cam.ops.in_gate(|| {
+                let mut d = DEV.lock();
+                if d.owner != 0 { return EBUSY as i64; }
+                let (f, fr) = default_format(&cam);
+                *d = Dev { owner: id, cam: Some(cam.clone()), fmt: f, frame: fr, interval: 0, nreq: 0,
+                           pending: [false; MAX_BUFS], queued: [false; MAX_BUFS], streaming: false };
+                0
+            });
+            reply(r.unwrap_or(ENODEV as i64))
         }
         VFS_POLL => {
             let revents = {
                 let mut g = STREAM.lock();
-                match *g {
+                match g.as_ref() {
                     Some(c) => {
-                        let f = (c.ops.stream_poll)(c.ctx);
-                        if f & KCAM_GONE != 0 || (c.ops.stream_gone)(c.ctx) { POLLERR }
-                        else if (c.ops.stream_ready)(c.ctx) > 0 { POLLIN | POLLRDNORM } else { 0 }
+                        let f = c.ops.stream_poll(c.ctx);
+                        if f & KCAM_GONE != 0 || c.ops.stream_gone(c.ctx) { POLLERR }
+                        else if c.ops.stream_ready(c.ctx) > 0 { POLLIN | POLLRDNORM } else { 0 }
                     }
                     None => POLLERR,
                 }
@@ -392,7 +431,7 @@ fn pool_ensure(n: usize, cap: usize) -> Result<(), isize> {
 
 fn stream_off(d: &mut Dev) {
     let s = STREAM.lock().take();
-    if let Some(c) = s { (c.ops.stream_stop)(c.ctx); }
+    if let Some(c) = s { c.ops.stream_stop(c.ctx); }
     d.streaming = false;
     d.pending = [false; MAX_BUFS];
     d.queued = [false; MAX_BUFS];
@@ -511,7 +550,7 @@ fn ioctl(pid: u32, fd: usize, id: u32, cmd: usize, arg: usize) -> isize {
             let v = g32(&b, 4);
             if !matches!(id, CID_EXPOSURE_AUTO | CID_EXPOSURE_ABSOLUTE | CID_EXPOSURE_AUTO_PRIORITY) { return EINVAL; }
             let mut out = 0u32;
-            if (cam.ops.control)(cam.ctx, id, set, v, &mut out) != 0 { return EINVAL; }
+            if cam.ops.control(cam.ctx, id, set, v, &mut out) != 0 { return EINVAL; }
             p32(&mut b, 4, out);
             wr(arg, &b)
         }
@@ -556,7 +595,7 @@ fn ioctl(pid: u32, fd: usize, id: u32, cmd: usize, arg: usize) -> isize {
             if cmd == VIDIOC_QBUF {
                 if g32(&b, 60) != MEMORY_MMAP || d.queued[i] || d.pending[i] { return EINVAL; }
                 if d.streaming {
-                    let ok = (cam.ops.stream_qbuf)(cam.ctx, i as u32) == 0;
+                    let ok = cam.ops.stream_qbuf(cam.ctx, i as u32) == 0;
                     if !ok { return EINVAL; }
                     d.queued[i] = true;
                 } else {
@@ -575,14 +614,14 @@ fn ioctl(pid: u32, fd: usize, id: u32, cmd: usize, arg: usize) -> isize {
                 let p = POOL.lock();
                 (0..d.nreq).map(|i| KCamBuf { ptr: mm::phys_to_virt(p.phys[i]) as *mut u8, cap: p.cap }).collect()
             };
-            if (cam.ops.stream_start)(cam.ctx, d.fmt, d.frame, d.interval, bufs.as_ptr(), bufs.len() as u32) != 0 {
+            if cam.ops.stream_start(cam.ctx, d.fmt, d.frame, d.interval, bufs.as_ptr(), bufs.len() as u32) != 0 {
                 return EIO;
             }
             for i in 0..d.nreq {
-                if d.pending[i] && (cam.ops.stream_qbuf)(cam.ctx, i as u32) == 0 { d.queued[i] = true; }
+                if d.pending[i] && cam.ops.stream_qbuf(cam.ctx, i as u32) == 0 { d.queued[i] = true; }
             }
             d.pending = [false; MAX_BUFS];
-            *STREAM.lock() = Some(CamRef { ops: cam.ops, ctx: cam.ctx });
+            *STREAM.lock() = Some(CamRef { ops: cam.ops.clone(), ctx: cam.ctx });
             d.streaming = true;
             0
         }
@@ -609,8 +648,8 @@ fn dqbuf(pid: u32, fd: usize, id: u32, arg: usize) -> isize {
     loop {
         let mut done = KCamDone::default();
         let r = {
-            let Some(c) = *STREAM.lock() else { return EINVAL };
-            (c.ops.stream_dqbuf)(c.ctx, &mut done)
+            let Some(c) = STREAM.lock().clone() else { return EINVAL };
+            c.ops.stream_dqbuf(c.ctx, &mut done)
         };
         if r == -19 { return ENODEV; }
         if r == -22 { return EINVAL; }

@@ -3,6 +3,7 @@
 use super::*;
 
 const NODES: i32 = 2;
+static CLAIMED: AtomicU32 = AtomicU32::new(0);
 
 /// Per-device nodes handed out by `kapi_input_register` for kinds `INPUT_DEV_KEYBOARD` / `INPUT_DEV_MOUSE`.
 static DYN: spin::Mutex<alloc::vec::Vec<u32>> = spin::Mutex::new(alloc::vec::Vec::new());
@@ -16,7 +17,6 @@ fn node_ok(node: i32) -> bool {
 #[no_mangle]
 pub extern "C" fn kapi_input_register(owner: KmodId, kind: u32, _name: *const u8, _len: usize,
                                       _bus: u16, _vid: u16, _pid: u16) -> i32 {
-    static CLAIMED: AtomicU32 = AtomicU32::new(0);
     if kind == kmod_abi::input::INPUT_DEV_KEYBOARD || kind == kmod_abi::input::INPUT_DEV_MOUSE {
         // A hot-pluggable device with its own /dev/input/eventN (N >= 2).
         if _name.is_null() || _len > 80 { return -22; }
@@ -90,4 +90,16 @@ pub extern "C" fn kapi_rel_pointer_report(src: u32, dx: i32, dy: i32, wheel: i32
 pub extern "C" fn kapi_rel_pointer_advertise(buttons: u8, hwheel: bool, hires: bool) {
     drivers::rel_pointer::init_scale();
     drivers::rel_pointer::advertise(buttons, hwheel, hires);
+}
+
+/// Unload: take a registration back (per-device node, or a fixed node's claim bit).
+/// Fixed nodes stay claimed: the console keyboard and pointer feed from them, so the module becomes a Zombie.
+pub fn input_release(handle: u64) -> bool {
+    if handle & 0x100 != 0 {
+        let n = (handle & 0xff) as i32;
+        let _ = kapi_input_unregister(n);
+        true
+    } else {
+        false
+    }
 }

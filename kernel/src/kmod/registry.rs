@@ -124,8 +124,69 @@ fn release_one(owner: KmodId, kind: RegKind, handle: u64) -> bool {
         RegKind::PLAT => { super::exports::plat_unregister_owner(owner); true }
         RegKind::DMAQ => { super::exports::dma_quiesce_unregister_owner(owner); true }
         RegKind::V4L2 => { crate::syscall::v4l2::unregister_camera(handle as usize); true }
+        RegKind::IRQ => super::lower::release_irq(owner, handle),
+        RegKind::HRTIMER => super::lower::release_hrtimer(handle),
+        RegKind::HWRNG => super::exports::hwrng_release(handle),
+        RegKind::USB_CLASS => true, // torn down by `pre_exit`; the record is leaked (a snapshot may still point at it)
+        RegKind::BLK => { drivers::blkdev::remove_disk(handle as usize); true }
+        RegKind::INPUT => super::exports::input_release(handle),
+        // The netif entry stays (name kept); its gate is closed for good, so nothing reaches the module.
+        RegKind::NETDEV => true,
         _ => false,
     }
+}
+
+/// D6/D9: why `id` cannot unload, evaluated AFTER the Upper gate drained (so no open, probe or I/O
+/// of this generation is in flight). Open /dev/video*, mounted block devices and DRM pin the module;
+/// netdev, input, hwrng and USB class detach instead.
+pub fn busy_reason(id: KmodId) -> Option<&'static str> {
+    let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == id).map(|r| (r.1, r.2)).collect();
+    for (k, h) in recs {
+        match k {
+            RegKind::V4L2 => { if crate::syscall::v4l2::open_by(id) { return Some("camera open"); } }
+            RegKind::BLK => {
+                let mounts = vfs_server::list_mounts();
+                for p in drivers::blkdev::family_paths(h as usize) {
+                    if vfs_server::mounting_device(p) { return Some("mounting"); }
+                    let want = p.strip_prefix("/dev/").unwrap_or(p);
+                    if mounts.iter().any(|m| m.in_use && m.device.strip_prefix("/dev/").unwrap_or(m.device) == want) { return Some("mounted"); }
+                }
+            }
+            RegKind::DRM | RegKind::KMS => return Some("display in use"),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Runs on the exit thread right before the module's `exit()`: take back what needs the module's own code.
+pub fn pre_exit(id: KmodId) {
+    let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == id).map(|r| (r.1, r.2)).collect();
+    for (k, h) in recs { if k == RegKind::USB_CLASS { super::exports::usb_class_teardown(h); } }
+}
+
+/// A refused unload reopened the Upper gate: replay what arrived while it was closed.
+pub fn reopened(id: KmodId) {
+    let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == id).map(|r| (r.1, r.2)).collect();
+    for (k, h) in recs { if k == RegKind::USB_CLASS { super::exports::usb_class_reopened(h); } }
+}
+
+/// Unload step 2: tell consumers the module's upper-edge objects are going (netifs record what a reload needs).
+pub fn unbind_upper(owner: KmodId) {
+    let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == owner).map(|r| (r.1, r.2)).collect();
+    for (k, h) in recs { if k == RegKind::NETDEV { super::exports::netdev_detach(h); } }
+}
+
+/// Both unload drains succeeded: netifs become rebindable.
+pub fn commit_upper(owner: KmodId) {
+    let recs: Vec<u64> = REGS.lock().iter().filter(|r| r.0 == owner && r.1 == RegKind::NETDEV).map(|r| r.2).collect();
+    for h in recs { super::exports::netdev_commit_detach(h); }
+}
+
+/// Unload gave up (Zombie): pending netif detaches are dropped, the netif stays bound to the zombie.
+pub fn abort_upper(owner: KmodId) {
+    let recs: Vec<u64> = REGS.lock().iter().filter(|r| r.0 == owner && r.1 == RegKind::NETDEV).map(|r| r.2).collect();
+    for h in recs { super::exports::netdev_abort_detach(h); }
 }
 
 /// Failed init: unregister every registration that can be taken back, dropping its record.

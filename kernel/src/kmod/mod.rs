@@ -5,6 +5,7 @@ pub mod buildid;
 pub mod exports;
 pub mod gate;
 pub mod load;
+pub mod lower;
 pub mod registry;
 pub mod sys;
 

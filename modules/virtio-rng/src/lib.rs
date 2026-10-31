@@ -13,6 +13,7 @@ mod virtio_rng;
 kmod_rt::module! {
     name: "virtio_rng",
     init: init,
+    exit: exit,
     ids: [kmod_rt::pci(0x1af4, 0x1044), kmod_rt::pci(0x1af4, 0x1005)]
 }
 
@@ -24,4 +25,8 @@ fn init() -> i32 {
     } else {
         -19
     }
+}
+
+fn exit() {
+    virtio_rng::shutdown();
 }

@@ -93,8 +93,7 @@ pub extern "C" fn kapi_sem_up(h: usize) { if h != 0 { unsafe { (*(h as *const sc
 #[no_mangle]
 pub extern "C" fn kapi_hrtimer_new(cb: Option<extern "C" fn(usize)>, ctx: usize, irq_mode: bool) -> usize {
     let Some(cb) = cb else { return 0 };
-    let mode = if irq_mode { sched::hrtimer::TimerMode::Irq } else { sched::hrtimer::TimerMode::Worker };
-    Box::into_raw(sched::hrtimer::HrTimer::new(cb, ctx, mode)) as usize
+    crate::kmod::lower::hrtimer_new(cb, ctx, irq_mode)
 }
 #[no_mangle]
 pub extern "C" fn kapi_hrtimer_arm(h: usize, ns: u64) { if h != 0 { unsafe { (*(h as *const sched::hrtimer::HrTimer)).start(ns, 0); } } }
@@ -148,12 +147,15 @@ pub extern "C" fn kapi_pci_scan(index: u32, out: *mut KPciDev) -> i32 {
 
 static MSIX_TABLES: sched::ksync::KSpinLock<Vec<(u32, &'static drivers::irq::MsixTable)>> = sched::ksync::KSpinLock::new(Vec::new());
 
+/// Quiesce dropped MSI-X enable: forget the cached table so the next request enables it again (the table mapping leaks).
+pub fn msix_forget(bdf: u32) { MSIX_TABLES.lock().retain(|t| t.0 != bdf); }
+
 /// One MSI-X vector (`entry`) of `bdf`; the table is enabled on the first call. Returns the vector or -errno.
 #[no_mangle]
 pub extern "C" fn kapi_irq_request_msix(owner: KmodId, bdf: u32, entry: u16, handler: KIrqHandler, ctx: usize) -> i64 {
     let known = MSIX_TABLES.lock().iter().find(|t| t.0 == bdf).map(|t| t.1);
     let tab = match known {
-        Some(t) => t,
+        Some(t) => { t.reenable(); t }
         None => match drivers::irq::MsixTable::enable(super::irq::func_of(bdf)) {
             Ok(t) => {
                 let t: &'static drivers::irq::MsixTable = Box::leak(Box::new(t));
@@ -164,10 +166,12 @@ pub extern "C" fn kapi_irq_request_msix(owner: KmodId, bdf: u32, entry: u16, han
         },
     };
     if entry >= tab.entries() { return -22; }
-    match tab.request(entry, super::irq::irq_handler(handler), ctx) {
+    let (hf, hc) = match crate::kmod::lower::wrap_irq(owner, handler, ctx) { Some(x) => x, None => return -19 };
+    crate::kmod::lower::note_pci(bdf);
+    match tab.request(entry, hf, hc) {
         Ok(h) => {
             let v = h.vector().unwrap_or(0) as u64;
-            core::mem::forget(h);
+            crate::kmod::lower::hold_irq(owner, v, h);
             crate::kmod::registry::note_registration(owner, RegKind::IRQ, v);
             v as i64
         }

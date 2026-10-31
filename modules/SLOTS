@@ -24,3 +24,6 @@ hdmi_audio 296 8
 sdhci 304 8
 kmbad_hang 312 1
 kmbad_reload 313 1
+kmbad_thread 314 1
+kmbad_freectx 315 1
+kmbad_leak 316 1

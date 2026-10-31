@@ -52,6 +52,8 @@ pub extern "C" fn kapi_pci_cfg_read(bdf: u32, off: u16, width: u8) -> u32 {
 pub extern "C" fn kapi_pci_cfg_write(bdf: u32, off: u16, width: u8, val: u32) {
     let (b, d, f) = unbdf(bdf);
     if off > 0xff { return; }
+    // Only a write that turns on memory decode / bus mastering makes the function the module's to quiesce.
+    if off == 4 && (width == 2 || width == 4) && val & 0x6 != 0 { crate::kmod::lower::note_pci(bdf); }
     let o = off as u8;
     unsafe {
         match width {
@@ -89,23 +91,29 @@ pub extern "C" fn kapi_page_alloc(order: u32, below: u64) -> u64 {
     if order as usize >= mm::buddy::MAX_ORDER { return 0; }
     let r = if below == 0 { mm::buddy::alloc(order as usize) }
             else { mm::buddy::alloc_below(order as usize, below as usize) };
-    r.map_or(0, |p| p as u64)
+    let p = r.map_or(0, |p| p as u64);
+    crate::kmod::lower::note_page_alloc(p, order);
+    p
 }
 
 #[no_mangle]
 pub extern "C" fn kapi_page_free(phys: u64, order: u32) {
+    crate::kmod::lower::note_page_free(phys);
     if phys != 0 && (order as usize) < mm::buddy::MAX_ORDER { mm::buddy::free(phys as usize, order as usize); }
 }
 
 pub(super) const HW_SLOTS: usize = 4;
-pub(super) static HW_READ: [AtomicUsize; HW_SLOTS] = [const { AtomicUsize::new(0) }; HW_SLOTS];
+type HwRead = extern "C" fn(*mut u8, usize) -> usize;
+type HwSlot = spin::Mutex<Option<Arc<crate::kmod::gate::ModFn<HwRead>>>>;
+pub(super) static HW_READ: [HwSlot; HW_SLOTS] = [const { spin::Mutex::new(None) }; HW_SLOTS];
+/// Slot allocation bitmap (bit i = slot i in use); cleared again on unregister.
 pub(super) static HW_USED: AtomicUsize = AtomicUsize::new(0);
+/// Per-slot owned copy of the source name (leaked once per slot, reused when equal).
+static HW_NAME: [spin::Mutex<Option<&'static str>>; HW_SLOTS] = [const { spin::Mutex::new(None) }; HW_SLOTS];
 
 pub(super) fn hw_tramp<const N: usize>(out: &mut [u8]) -> usize {
-    let p = HW_READ[N].load(Ordering::Acquire);
-    if p == 0 { return 0; }
-    let f: extern "C" fn(*mut u8, usize) -> usize = unsafe { core::mem::transmute(p) };
-    f(out.as_mut_ptr(), out.len()).min(out.len())
+    let f = match HW_READ[N].lock().as_ref() { Some(f) => f.clone(), None => return 0 };
+    f.with(|p| p(out.as_mut_ptr(), out.len())).unwrap_or(0).min(out.len())
 }
 
 /// Register a module entropy source and reseed the CSPRNG at once so it contributes
@@ -117,11 +125,18 @@ pub extern "C" fn kapi_hwrng_register(owner: KmodId, name: *const u8, len: usize
         Ok(s) if !s.is_empty() => s,
         _ => return -22,
     };
-    let i = HW_USED.fetch_add(1, Ordering::SeqCst);
-    if i >= HW_SLOTS { HW_USED.store(HW_SLOTS, Ordering::SeqCst); return -12; }
-    // Modules are permanent, so the name bytes live as long as the kernel.
-    let nm: &'static str = unsafe { core::mem::transmute::<&str, &'static str>(nm) };
-    HW_READ[i].store(read as usize, Ordering::Release);
+    let owner = crate::kmod::gate::owner(owner);
+    let Some(g) = crate::kmod::gate::get(owner) else { return -19 };
+    let i = loop {
+        let m = HW_USED.load(Ordering::SeqCst);
+        let Some(i) = (0..HW_SLOTS).find(|i| m & (1 << i) == 0) else { return -12 };
+        if HW_USED.compare_exchange(m, m | (1 << i), Ordering::SeqCst, Ordering::SeqCst).is_ok() { break i; }
+    };
+    let nm: &'static str = {
+        let mut n = HW_NAME[i].lock();
+        match *n { Some(s) if s == nm => s, _ => { let s: &'static str = Box::leak(String::from(nm).into_boxed_str()); *n = Some(s); s } }
+    };
+    *HW_READ[i].lock() = Some(Arc::new(crate::kmod::gate::ModFn::new(g, crate::kmod::gate::Class::Lower, read)));
     let tramp: sched::random::SourceFn = match i {
         0 => hw_tramp::<0>, 1 => hw_tramp::<1>, 2 => hw_tramp::<2>, _ => hw_tramp::<3>,
     };
@@ -129,6 +144,19 @@ pub extern "C" fn kapi_hwrng_register(owner: KmodId, name: *const u8, len: usize
     crate::kmod::registry::note_registration(owner, RegKind::HWRNG, i as u64);
     sched::random::reseed_now();
     0
+}
+
+/// Unload: take the source out of the CSPRNG (waits for a gather in flight via its lock), free the slot.
+pub fn hwrng_release(slot: u64) -> bool {
+    let i = slot as usize;
+    if i >= HW_SLOTS { return false; }
+    let tramp: sched::random::SourceFn = match i {
+        0 => hw_tramp::<0>, 1 => hw_tramp::<1>, 2 => hw_tramp::<2>, _ => hw_tramp::<3>,
+    };
+    sched::random::unregister_source(tramp);
+    *HW_READ[i].lock() = None;
+    HW_USED.fetch_and(!(1 << i), Ordering::SeqCst);
+    true
 }
 
 

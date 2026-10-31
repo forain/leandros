@@ -87,6 +87,7 @@ struct VirtioRng {
     avail: *mut u8,
     used: *mut u8,
     buf_phys: usize,
+    status: *mut u8,
     last_used: u16,
     in_flight: bool,
 }
@@ -204,6 +205,7 @@ impl VirtioRng {
             avail: mm::phys_to_virt(avail_phys) as *mut u8,
             used: mm::phys_to_virt(used_phys) as *mut u8,
             buf_phys,
+            status: ds,
             last_used: 0,
             in_flight: false,
         })
@@ -310,5 +312,21 @@ pub fn init() {
             sched::random::register_source("virtio-rng", read);
         }
         None => pci::serial_debug("[RNG] virtio-rng probe failed\n"),
+    }
+}
+
+/// Module unload: reset the device (it stops DMA), then give the buffer page back. The ring pages
+/// stay owned (the kernel logs them). A device that does not confirm the reset keeps all its pages.
+#[allow(dead_code)]
+pub fn shutdown() {
+    let Some(d) = DEVICE.lock().take() else { return };
+    unsafe {
+        d.status.mmio_write(0);
+        let end = sched::monotonic_ns() + 100_000_000;
+        while d.status.mmio_read() != 0 {
+            if sched::monotonic_ns() >= end { return; }
+            core::hint::spin_loop();
+        }
+        mm::buddy::free(d.buf_phys, 0);
     }
 }

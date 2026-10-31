@@ -325,6 +325,8 @@ pub mod sched {
 
         pub fn udelay(us: u64) { unsafe { sys::kapi_udelay(us) } }
         pub fn msleep(ms: u64) { unsafe { sys::kapi_msleep(ms) } }
+        /// True once the owning module generation is being unloaded: thread bodies must return.
+        pub fn should_stop() -> bool { unsafe { sys::kapi_kthread_should_stop() } }
 
         extern "C" fn tramp(arg: *mut u8) {
             let f: Box<Box<dyn FnOnce() + Send>> = unsafe { Box::from_raw(arg as *mut Box<dyn FnOnce() + Send>) };

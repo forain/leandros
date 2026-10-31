@@ -22,6 +22,7 @@ mod virtio_net;
 kmod_rt::module! {
     name: "virtio_net",
     init: init,
+    exit: exit,
     ids: [kmod_rt::pci(0x1af4, 0x1041), kmod_rt::pci(0x1af4, 0x1000)]
 }
 
@@ -84,4 +85,8 @@ fn init() -> i32 {
         }
     }
     0
+}
+
+fn exit() {
+    virtio_net::shutdown();
 }

@@ -59,6 +59,10 @@ impl Gate {
         true
     }
 
+    /// Undo a `close_and_drain` (an unload that found the module busy).
+    pub fn reopen(&self, c: Class) { self.ctr(c).fetch_and(!CLOSED, SeqCst); }
+    pub fn upper_closed(&self) -> bool { self.upper.load(SeqCst) & CLOSED != 0 }
+
     pub fn inflight(&self) -> (u32, u32) { (self.upper.load(SeqCst) & !CLOSED, self.lower.load(SeqCst) & !CLOSED) }
     pub fn is_stopping(&self) -> bool { self.stopping.load(SeqCst) }
 }
@@ -87,6 +91,13 @@ pub fn remove(id: KmodId) { GATES.lock().retain(|g| g.id != id); }
 /// The generation whose code is running on this thread.
 pub fn current() -> Option<Arc<Gate>> {
     match sched::kmodgen::get() { 0 => None, g => get(KmodId(g)) }
+}
+
+/// Running generation under the hard-IRQ rule (D10), 0 when none (or an IRQ without a gate entered here). No claimed id.
+pub fn running_owner() -> KmodId {
+    let gen = sched::kmodgen::get();
+    if gen != 0 && sched::irqctx::in_irq() && sched::kmodgen::entered_depth() != sched::irqctx::irq_depth() { return KmodId(0); }
+    KmodId(gen)
 }
 
 /// Owner for a registration: the running generation (D2), not the module-supplied id.

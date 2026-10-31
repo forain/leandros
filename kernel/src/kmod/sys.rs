@@ -65,6 +65,7 @@ fn user_name(ptr: usize) -> Result<[u8; 32], isize> {
 }
 
 fn zombie(id: kmod_abi::KmodId, nm: &str, why: &str) -> isize {
+    registry::abort_upper(id);
     registry::set_state(id, State::Zombie);
     drivers::pci::serial_debug(&alloc::format!("[kmod] {} ZOMBIE: {}\n", nm, why));
     EBUSY
@@ -84,7 +85,24 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
     let g = match gate::get(m.id) { Some(g) => g, None => return zombie(m.id, s, "no gate") };
     if gate::current().map_or(false, |c| c.id == m.id) { registry::set_state(m.id, State::Live); return -35; }
     let t0 = sched::monotonic_ns();
+    // Fast path: judge busy BEFORE the gate closes, so a refused rmmod disrupts nothing (no gated call fails).
+    if let Some(why) = registry::busy_reason(m.id) {
+        registry::set_state(m.id, State::Live);
+        drivers::pci::serial_debug(&alloc::format!("[kmod] {} busy: {}\n", s, why));
+        return EBUSY;
+    }
+    // D9: close the Upper gate and re-judge against a quiescent upper edge (an open may have raced the check above)., then judge busy rules against a quiescent upper edge.
     if !g.close_and_drain(Class::Upper, 2000) { return zombie(m.id, s, "upper drain timeout"); }
+    if let Some(why) = registry::busy_reason(m.id) {
+        g.reopen(Class::Upper);
+        registry::reopened(m.id);
+        registry::set_state(m.id, State::Live);
+        drivers::pci::serial_debug(&alloc::format!("[kmod] {} busy: {}\n", s, why));
+        return EBUSY;
+    }
+    registry::unbind_upper(m.id);
+    // D3 step 3: the device goes inert (INTx, MSI/MSI-X, bus mastering off) before the lower drain and exit().
+    super::lower::quiesce_pci(m.id);
     g.stopping.store(true, Ordering::SeqCst);
     if !g.close_and_drain(Class::Lower, 5000) { return zombie(m.id, s, "lower drain timeout"); }
     // exit() on its own thread so a hang only costs a Zombie.
@@ -99,6 +117,7 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
         };
         let f: extern "C" fn(*const kmod_abi::KmodCtx) -> i32 = unsafe { core::mem::transmute(exit) };
         sched::kmodgen::set(id.0);
+        registry::pre_exit(id);
         r2.store(f(&ctx), Ordering::SeqCst);
         sched::kmodgen::set(0);
         d2.store(true, Ordering::SeqCst);
@@ -109,8 +128,11 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
         if sched::monotonic_ns() >= end { return zombie(m.id, s, "exit timeout"); }
         sched::kthread::msleep(1);
     }
+    registry::commit_upper(m.id);
     // Revoke what the kernel can take back; kinds without a revoke path keep the slot (Zombie).
     registry::release_all(m.id);
+    let dma = super::lower::dma_leftover(m.id);
+    if dma != 0 { drivers::pci::serial_debug(&alloc::format!("[kmod] {} exit left {} DMA pages owned: logged, not freed\n", s, dma)); }
     let left = registry::ungated_left(m.id);
     if left != 0 { return zombie(m.id, s, "ungated registrations left"); }
     registry::forget_regs(m.id);

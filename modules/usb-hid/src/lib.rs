@@ -111,6 +111,7 @@ const IDS: [KmodDevId; 2] = [
 kmod_rt::module! {
     name: "usb_hid",
     init: init,
+    exit: exit,
     ids: [kmod_rt::usb(0xffff, 0xffff, 0x03_01_01, 0xFF_FF_FF), kmod_rt::usb(0xffff, 0xffff, 0x03_01_02, 0xFF_FF_FF)],
 }
 
@@ -219,3 +220,6 @@ fn init() -> i32 {
     }
     0
 }
+
+/// The kernel already ran `detach` for every claimed function; drop whatever is left.
+fn exit() { hid::detach_where(|_| true); }

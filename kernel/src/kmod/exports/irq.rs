@@ -14,11 +14,14 @@ pub(super) fn func_of(bdf: u32) -> drivers::pci::PciFunction {
     drivers::pci::PciFunction::new(b, d, f)
 }
 
+pub fn func_of_pub(bdf: u32) -> drivers::pci::PciFunction { func_of(bdf) }
+
 /// Memory decode on, bus mastering on when asked. 0 ok, -19 no such function.
 #[no_mangle]
 pub extern "C" fn kapi_pci_enable(bdf: u32, bus_master: bool) -> i32 {
     let f = func_of(bdf);
     if f.read16(0) == 0xffff { return -19; }
+    crate::kmod::lower::note_pci(bdf);
     if bus_master { f.enable_mem_and_bus_master(); } else { f.enable_memory(); }
     0
 }
@@ -42,10 +45,12 @@ pub(super) fn irq_handler(h: KIrqHandler) -> drivers::irq::IrqHandler {
 /// Single-vector MSI (x86_64). Returns the vector, or -errno (-95 where MSI is unsupported).
 #[no_mangle]
 pub extern "C" fn kapi_irq_request_msi(owner: KmodId, bdf: u32, handler: KIrqHandler, ctx: usize) -> i64 {
-    match drivers::irq::request_msi(func_of(bdf), irq_handler(handler), ctx) {
+    let (hf, hc) = match crate::kmod::lower::wrap_irq(owner, handler, ctx) { Some(x) => x, None => return -19 };
+    crate::kmod::lower::note_pci(bdf);
+    match drivers::irq::request_msi(func_of(bdf), hf, hc) {
         Ok(h) => {
             let v = h.vector().unwrap_or(0) as u64;
-            core::mem::forget(h); // modules are permanent
+            crate::kmod::lower::hold_irq(owner, v, h);
             crate::kmod::registry::note_registration(owner, RegKind::IRQ, v);
             v as i64
         }
@@ -58,9 +63,11 @@ pub extern "C" fn kapi_irq_request_msi(owner: KmodId, bdf: u32, handler: KIrqHan
 #[no_mangle]
 pub extern "C" fn kapi_irq_request_line(owner: KmodId, bdf: u32, handler: KIrqHandler, ctx: usize) -> i64 {
     let Some(line) = func_of(bdf).intx_line() else { return -19 };
-    match drivers::irq::request_irq(drivers::irq::IrqSource::Line(line), irq_handler(handler), ctx) {
+    let (hf, hc) = match crate::kmod::lower::wrap_irq(owner, handler, ctx) { Some(x) => x, None => return -19 };
+    crate::kmod::lower::note_pci(bdf);
+    match drivers::irq::request_irq(drivers::irq::IrqSource::Line(line), hf, hc) {
         Ok(h) => {
-            core::mem::forget(h);
+            crate::kmod::lower::hold_irq(owner, line as u64, h);
             crate::kmod::registry::note_registration(owner, RegKind::IRQ, line as u64);
             line as i64
         }
