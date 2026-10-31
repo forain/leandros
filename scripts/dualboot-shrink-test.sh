@@ -112,7 +112,7 @@ r "$LI shrink --part $P2 --to 10G --dry-run --json; true" > "$WORK/gate-hib.log"
 grep -q '"id":"S7","name":"swap","status":"fail"' "$WORK/gate-hib.log" && ok "S7 hibernated swap refused" || { tail -5 "$WORK/gate-hib.log"; fail "S7"; }
 r "$LI shrink --part $P2 --to 3G --dry-run --json; true" > "$WORK/gate-size.log"
 grep -q '"id":"S8","name":"target-size","status":"fail"' "$WORK/gate-size.log" && ok "S8 target below minimum+2GiB refused" || fail "S8"
-r "LEANDROS_SHRINK_FREE_BYTES=1000000 $LI shrink --part $P2 --to 10G --dry-run --json; true" > "$WORK/gate-space.log"
+r "env LEANDROS_SHRINK_FREE_BYTES=1000000 $LI shrink --part $P2 --to 10G --dry-run --json; true" > "$WORK/gate-space.log"
 grep -q '"id":"S9","name":"stick-space","status":"fail"' "$WORK/gate-space.log" && ok "S9 stick space refused" || fail "S9"
 r "$LI shrink --part $P2 --to 10G --json; true" | grep -q '"ev":"error"' && ok "no --yes: refused" || fail "no --yes accepted"
 r "cd /tmp && for v in base dirty state errors orphan mmp unknown; do rm -f g-\$v.img; mke2fs -q -t ext4 -F g-\$v.img 64M; done

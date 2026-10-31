@@ -85,7 +85,7 @@ pub fn parse_sb(b: &[u8]) -> Result<Sb, String> {
         ro_compat: le32(b, 0x64),
         last_orphan: le32(b, 0xE8),
         error_count: le32(b, 0x194),
-        mmp_block: u64::from_le_bytes(b[0x160..0x168].try_into().unwrap()),
+        mmp_block: u64::from_le_bytes(b[0x168..0x170].try_into().unwrap()),
     })
 }
 

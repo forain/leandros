@@ -63,7 +63,7 @@ esac
   # Keep only the tools the installer needs (+ mke2fs for tests).
   for f in "$S"/usr/sbin/*; do
     case "$(basename "$f")" in
-      e2fsck|resize2fs|dumpe2fs|e2undo|mke2fs) ;;
+      e2fsck|resize2fs|dumpe2fs|e2undo|mke2fs|debugfs|e2image|tune2fs) ;;
       *) [ -L "$f" ] && case "$(readlink "$f")" in e2fsck|mke2fs) continue ;; esac; rm -f "$f" ;;
     esac
   done
