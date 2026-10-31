@@ -22,7 +22,7 @@ RESERVED_FROM = NSLOTS - 2  # 1022-1023: ktest/testblob
 ALLOW_DEPS = {"netctl-abi", "kmod-abi", "kmod-rt", "kmod-kapi", "spin", "bitflags", "leandros-lib",
               "lock_api", "scopeguard"}
 FORBIDDEN_CRATES = ["mm", "sched", "drivers", "usb", "kernel", "vfs", "boot"]
-FLAG_SOFTFLOAT_CHECKED, FLAG_PERMANENT = 1, 2
+FLAG_SOFTFLOAT_CHECKED, FLAG_PERMANENT, FLAG_UNLOADABLE = 1, 2, 4
 
 
 def die(guard, msg):
@@ -252,11 +252,18 @@ def post_elf(arch, inp, outp, bidfile, objdump, alias):
     sb, sz = slot(arch, name)
     if base != sb:
         die("header", f"linked at {base:#x}, SLOTS says {sb:#x}")
-    flags = rd(b, o + 20, "<I") | FLAG_PERMANENT | (FLAG_SOFTFLOAT_CHECKED if arch == "aarch64" else 0)
+    ex = e["secs"].get(".kmod.exit")
+    exit_va = 0
+    if ex and ex["size"] == 8:
+        exit_va = rd(b, ex["off"], "<Q")
+        if not (first["vaddr"] <= exit_va < first["vaddr"] + sz):
+            die("header", f"exit {exit_va:#x} outside the slot")
+    flags = rd(b, o + 20, "<I") | (FLAG_UNLOADABLE if exit_va else FLAG_PERMANENT) | (FLAG_SOFTFLOAT_CHECKED if arch == "aarch64" else 0)
     struct.pack_into("<I", b, o + 20, flags)
     b[o + 24:o + 44] = bid
     struct.pack_into("<I", b, o + 44, 20)
     struct.pack_into("<QQQ", b, o + 48, sb, sz, e["entry"])
+    struct.pack_into("<Q", b, o + 72, exit_va)
     ids = e["secs"].get(".kmod.ids")
     if ids and ids["size"]:
         struct.pack_into("<QII", b, o + 80, ids["addr"], ids["size"] // 16, 16)

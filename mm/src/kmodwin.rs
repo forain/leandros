@@ -121,12 +121,20 @@ pub unsafe fn map(va: usize, phys: usize, perm: Perm) -> bool {
 }
 
 /// Unmap `pages` pages starting at `va` and flush them on every CPU.
-pub unsafe fn unmap(va: usize, pages: usize) {
-    if !in_window(va) { return; }
+pub unsafe fn unmap(va: usize, pages: usize) -> bool {
+    if !in_window(va) { return true; }
+    let to0 = paging::tlbstat::TIMEOUTS.load(core::sync::atomic::Ordering::Relaxed);
     let root = paging::get_kernel_root();
     for i in 0..pages {
         let v = va + i * PAGE;
         if in_window(v) { paging::unmap_page(root, v); }
     }
     paging::tlb_flush_range(root, va, pages);
+    // x86_64: the range flush above only reaches CPUs that have the kernel root loaded; a CPU
+    // running a process root still caches the shared kernel-half window. The window PTEs are
+    // not Global (map_page never sets G), so a CR3 reload on every CPU drops them. Needed for
+    // unload-then-reload at the same VA. aarch64: broadcast TLBI, harmless and rare.
+    paging::tlb_shootdown_all();
+    // false when an x86 flush ack timed out meanwhile: the caller must not free the frames.
+    paging::tlbstat::TIMEOUTS.load(core::sync::atomic::Ordering::Relaxed) == to0
 }

@@ -90,8 +90,8 @@ int main(int argc, char **argv)
 {
     if (argc == 2 && !strcmp(argv[1], "list")) return cmd_list();
     if (argc == 3 && !strcmp(argv[1], "load")) return cmd_load(argv[2]);
-    if (argc == 3 && !strcmp(argv[1], "unload")) return cmd_unload(argv[2]);
+    if (argc == 3 && (!strcmp(argv[1], "unload") || !strcmp(argv[1], "rmmod"))) return cmd_unload(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "info")) return cmd_info(argv[2]);
-    fprintf(stderr, "usage: kmodctl list | load <path> | unload <name> | info <path>\n");
+    fprintf(stderr, "usage: kmodctl list | load <path> | unload|rmmod <name> | info <path>\n");
     return 2;
 }

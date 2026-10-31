@@ -363,6 +363,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-kmbad-hang"
+version = "0.1.0"
+dependencies = [
+ "kmod-kapi",
+ "kmod-rt",
+ "spin",
+]
+
+[[package]]
+name = "kmod-kmbad-reload"
+version = "0.1.0"
+dependencies = [
+ "kmod-kapi",
+ "kmod-rt",
+ "spin",
+]
+
+[[package]]
 name = "kmod-macb"
 version = "0.1.0"
 dependencies = [

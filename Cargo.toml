@@ -26,6 +26,8 @@ members = [
     "lib/kmod-elf",
     "lib/kmod-rt",
     "modules/hello",
+    "modules/kmbad-hang",
+    "modules/kmbad-reload",
     "modules/virtio-rng",
     "modules/e1000e",
     "modules/iwlwifi",

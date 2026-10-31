@@ -18,14 +18,18 @@ pub extern "C" fn kapi_v4l2_register(owner: KmodId, ops: *const KCameraOps, ctx:
 }
 
 pub(super) fn tick_tramp(p: usize) {
-    let b = unsafe { &*(p as *const (KTickFn, usize)) };
-    (b.0)(b.1);
+    let b = unsafe { &*(p as *const (crate::kmod::gate::ModFn<KTickFn>, usize)) };
+    let c = b.1;
+    b.0.with(|f| f(c));
 }
 
 /// Run `f(ctx)` on every USB timer tick (interrupt context, must not block). 0 ok.
 #[no_mangle]
 pub extern "C" fn kapi_tick_register(owner: KmodId, f: KTickFn, ctx: usize) -> i32 {
-    let p = Box::into_raw(Box::new((f, ctx))) as usize;
+    let owner = crate::kmod::gate::owner(owner);
+    let gate = match crate::kmod::gate::get(owner) { Some(g) => g, None => return -19 };
+    let mf = crate::kmod::gate::ModFn::new(gate, crate::kmod::gate::Class::Lower, f);
+    let p = Box::into_raw(Box::new((mf, ctx))) as usize;
     crate::kmod::registry::note_registration(owner, RegKind::TICK, p as u64);
     usb::class::tick_register(owner, tick_tramp, p);
     0

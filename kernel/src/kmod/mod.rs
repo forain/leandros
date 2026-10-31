@@ -3,6 +3,7 @@
 pub mod autoload;
 pub mod buildid;
 pub mod exports;
+pub mod gate;
 pub mod load;
 pub mod registry;
 pub mod sys;

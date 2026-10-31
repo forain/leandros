@@ -48,6 +48,7 @@ pub mod uaccess;
 // queue and high-resolution timers. See artifacts/notes/lane-kfacil-2026-10-07.md.
 pub mod irqctx;
 pub mod spinheld;
+pub mod kmodgen;
 pub mod ksync;
 pub mod kthread;
 pub mod workqueue;
@@ -5479,10 +5480,12 @@ pub fn yield_now(reason: &str) {
             // A plain spin::Mutex held across a switch: report it, and carry
             // the count with the task (see `spinheld`).
             let held = spinheld::switch_out(reason);
+            let kg = kmodgen::switch_out();
             context::cpu_switch_to(
                 ctx_ptr,
                 core::ptr::addr_of!(SCHEDULER_CTX[id]),
             );
+            kmodgen::switch_in(kg);
             spinheld::switch_in(held);
         }
     }

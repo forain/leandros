@@ -135,6 +135,16 @@ macro_rules! __kmod_unit {
     };
 }
 
+#[macro_export]
+macro_rules! __kmod_exit {
+    ($exit:path) => {
+        extern "C" fn __kmod_exit_shim(_ctx: *const $crate::KmodCtx) -> i32 { $exit(); 0 }
+        #[used]
+        #[link_section = ".kmod.exit"]
+        static __KMOD_EXIT: extern "C" fn(*const $crate::KmodCtx) -> i32 = __kmod_exit_shim;
+    };
+}
+
 /// `module!{ name: "x", init: crate::init, ids: [kmod_rt::pci(0x1af4, 0x1044)] }`
 #[macro_export]
 macro_rules! module {
@@ -156,6 +166,15 @@ macro_rules! module {
     };
     (name: $name:literal, init: $init:path, sdio: [$(($v:expr, $d:expr)),+ $(,)?] $(,)?) => {
         $crate::module! { name: $name, init: $init, ids: [$($crate::sdio($v, $d)),+] }
+    };
+    // Unloadable module: `exit` is run by delete_module with the device quiet and the gates closed.
+    (name: $name:literal, init: $init:path, exit: $exit:path, of: [$($s:literal),+ $(,)?] $(,)?) => {
+        $crate::module! { name: $name, init: $init, of: [$($s),+] }
+        $crate::__kmod_exit!($exit);
+    };
+    (name: $name:literal, init: $init:path, exit: $exit:path $(, ids: [$($id:expr),* $(,)?])? $(,)?) => {
+        $crate::module! { name: $name, init: $init $(, ids: [$($id),*])? }
+        $crate::__kmod_exit!($exit);
     };
     (name: $name:literal, init: $init:path $(, ids: [$($id:expr),* $(,)?])? $(,)?) => {
         #[used]
