@@ -467,6 +467,7 @@ pub fn flush_final() {
         if sched::irqctx::can_sleep() && sched::current_pid() != 0 {
             drivers::kenv::sleep_until(sched::monotonic_ns() + 1_000_000);
         } else {
+            mm::paging::tlb_service_pending();
             core::hint::spin_loop();
         }
     }

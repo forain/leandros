@@ -310,6 +310,17 @@ pub struct Spin { n: u32, t0: u64, told: bool }
 /// 0 = none. It may never return.
 pub static PARK_HOOK: AtomicUsize = AtomicUsize::new(0);
 
+/// Call `PARK_HOOK` if set (kexec stop-and-jump). Cheap: one atomic load.
+#[inline]
+pub fn park_check() {
+    let h = PARK_HOOK.load(Relaxed);
+    if h != 0 {
+        // SAFETY: only ever set from a `fn()`.
+        let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(h) };
+        f();
+    }
+}
+
 /// Spinning this long on one lock is reported (once per wait).
 pub const SPIN_REPORT_MS: u64 = 2_000;
 

@@ -8526,7 +8526,7 @@ fn release_exiting_address_space(pid: Pid) {
     if let Some(old) = taken {
         if old.busy.load(Ordering::Acquire) {
             lockwatch::note_wait(lockwatch::L_AS_BUSY);
-            while old.busy.load(Ordering::Acquire) { core::hint::spin_loop(); }
+            while old.busy.load(Ordering::Acquire) { mm::paging::tlb_service_pending(); core::hint::spin_loop(); }
             lockwatch::note_wait(0);
         }
         // Its peak RSS outlives it too (wait4's ru_maxrss): the space is
@@ -8856,6 +8856,7 @@ pub fn replace_address_space(
             if old.busy.load(Ordering::Acquire) {
                 lockwatch::note_wait(lockwatch::L_AS_BUSY);
                 while old.busy.load(Ordering::Acquire) {
+                    mm::paging::tlb_service_pending();
                     core::hint::spin_loop();
                 }
                 lockwatch::note_wait(0);

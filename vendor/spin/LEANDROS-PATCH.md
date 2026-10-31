@@ -13,3 +13,8 @@ held `spin::Mutex`es: `might_sleep()` reports a sleep with one held, the
 voluntary-switch path (`sched::yield_now`) reports it and carries the count
 with the task, and `preempt_check` defers preemption while it is non-zero.
 Benches, examples and the criterion dev-dependency were dropped.
+
+Lane pikexec5 (2026-10-31): `held::set_park_hook` / `held::park_poll`, called
+first in `RelaxStrategy for Spin::relax`, so a CPU spinning (IRQs masked) on a
+`spin::Mutex` whose holder already parked for kexec reaches a park point. One
+relaxed load when unset.
