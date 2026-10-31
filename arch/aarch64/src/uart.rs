@@ -459,12 +459,26 @@ pub unsafe fn putc_dump(c: u8) {
     wr(DR, c as u32);
 }
 
+/// True while some CPU holds the RX lock (kexec straggler diagnostics).
+pub fn rx_lock_held() -> bool { RX_LOCK.load(core::sync::atomic::Ordering::Relaxed) }
+
+/// kexec.test_straggler guard: take the RX lock and never release it.
+pub fn test_leak_rx_lock() { RX_LOCK.store(true, core::sync::atomic::Ordering::Release); }
+
 pub unsafe fn getc() -> Option<u8> {
     if UART_BASE_ADDR == 0 { return None; }
     // Short hold on the other side (a few MMIO reads); spin for it so a
     // rescued byte is never overtaken by a later hardware byte.
+    // Bounded (~10 ms), and a kexec stop request parks this CPU even though
+    // its IRQs are masked here (the park IPI could never land otherwise).
+    let t0 = unsafe { cntvct_raw() };
+    let limit = crate::timer::freq() / 100;
     let daif = loop {
         if let Some(d) = rx_try_lock() { break d; }
+        if crate::exception::IRQ_DIVERT.load(core::sync::atomic::Ordering::Acquire) != 0 {
+            crate::exception::divert();
+        }
+        if unsafe { cntvct_raw() }.wrapping_sub(t0) > limit { return None; }
         core::hint::spin_loop();
     };
     let r = if RX_HEAD != RX_TAIL {
