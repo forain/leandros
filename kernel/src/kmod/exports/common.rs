@@ -44,9 +44,18 @@ pub extern "C" fn kapi_ioremap(phys: u64, len: usize, cache: u32) -> usize {
 pub extern "C" fn kapi_iounmap(va: usize, _len: usize) { if va != 0 { let _ = mm::kva::iounmap(va); } }
 
 /// Streaming-DMA sync of a direct-map range. `dir`: 0 to device, 1 to CPU, 2 both. Bad ranges are ignored.
+/// 3 = raw clean, 4 = raw invalidate, whatever the coherency mode, on a direct-map or `kapi_vmap`/ioremap
+/// window address (no-ops off aarch64, where DMA snoops the caches).
 #[no_mangle]
 pub extern "C" fn kapi_dma_sync(va: usize, len: usize, dir: u32) {
-    if len == 0 || dir > 2 || kapi_virt_to_phys(va) == u64::MAX { return; }
+    if len == 0 || dir > 4 { return; }
+    if dir >= 3 {
+        if kapi_virt_to_phys(va) == u64::MAX && !mm::kva::in_window(va) { return; }
+        #[cfg(target_arch = "aarch64")]
+        { if dir == 3 { mm::dma_cache::clean_range(va, len); } else { mm::dma_cache::invalidate_range(va, len); } }
+        return;
+    }
+    if kapi_virt_to_phys(va) == u64::MAX { return; }
     if dir != 1 { mm::dma_cache::sync_for_device(va, len); }
     if dir != 0 { mm::dma_cache::sync_for_cpu(va, len); }
 }
@@ -189,9 +198,9 @@ pub extern "C" fn kapi_fw_release(h: usize) {
 #[no_mangle]
 pub extern "C" fn kapi_secret_peek(owner: KmodId, key: *const u8, klen: usize, buf: *mut u8, cap: usize) -> isize {
     if key.is_null() || buf.is_null() || klen == 0 || klen > 64 { return -22; }
-    // A network registration, or the Wi-Fi module itself (it reads the legacy credential during probe,
+    // A network registration, or a Wi-Fi module itself (iwlwifi, brcmf) (it reads the legacy credential during probe,
     // before it can register its netif).
-    let mut net = crate::kmod::name_str(&crate::kmod::registry::name_of(owner)) == "iwlwifi";
+    let mut net = matches!(crate::kmod::name_str(&crate::kmod::registry::name_of(owner)), "iwlwifi" | "brcmf");
     crate::kmod::registry::registrations(owner, &mut |k, _| if k == RegKind::NETDEV { net = true });
     if !net { return -1; }
     let Ok(k) = core::str::from_utf8(unsafe { core::slice::from_raw_parts(key, klen) }) else { return -22 };

@@ -28,7 +28,13 @@ pub enum Stage {
 pub type Hook = fn() -> bool;
 
 #[derive(Clone, Copy)]
-struct Entry { name: &'static str, stage: Stage, hook: Hook }
+struct Entry { name: &'static str, stage: Stage, hook: Hook, ext: Option<(fn(usize) -> bool, usize)>, owner: u16 }
+
+impl Entry {
+    fn call(&self) -> bool { match self.ext { Some((f, c)) => f(c), None => (self.hook)() } }
+}
+
+fn never() -> bool { true }
 
 const MAX: usize = 16;
 static ENTRIES: spin::Mutex<[Option<Entry>; MAX]> = spin::Mutex::new([None; MAX]);
@@ -40,14 +46,49 @@ static COUNT: AtomicUsize = AtomicUsize::new(0);
 pub fn register(name: &'static str, stage: Stage, hook: Hook) {
     let mut t = ENTRIES.lock();
     if let Some(e) = t.iter_mut().flatten().find(|e| e.name == name) {
-        *e = Entry { name, stage, hook };
+        *e = Entry { name, stage, hook, ext: None, owner: 0 };
         return;
     }
     if let Some(slot) = t.iter_mut().find(|e| e.is_none()) {
-        *slot = Some(Entry { name, stage, hook });
+        *slot = Some(Entry { name, stage, hook, ext: None, owner: 0 });
         COUNT.fetch_add(1, Ordering::Relaxed);
     }
 }
+
+/// Module registration: the hook gets a context word and is removed by [`unregister_owner`].
+/// False when the table is full or the name is taken.
+pub fn register_ext(owner: u16, name: &'static str, stage: Stage, hook: fn(usize) -> bool, ctx: usize) -> bool {
+    let mut t = ENTRIES.lock();
+    if t.iter().flatten().any(|e| e.name == name) { return false; }
+    if let Some(slot) = t.iter_mut().find(|e| e.is_none()) {
+        *slot = Some(Entry { name, stage, hook: never, ext: Some((hook, ctx)), owner });
+        COUNT.fetch_add(1, Ordering::Relaxed);
+        true
+    } else { false }
+}
+
+/// Remove every hook `owner` registered. Returns how many went.
+pub fn unregister_owner(owner: u16) -> usize {
+    let mut t = ENTRIES.lock();
+    let mut n = 0;
+    for slot in t.iter_mut() {
+        if matches!(slot, Some(e) if e.owner == owner && owner != 0) { *slot = None; n += 1; }
+    }
+    COUNT.fetch_sub(n, Ordering::Relaxed);
+    n
+}
+
+/// Drop the hook registered under `name` (kexec bisect knob `kexec.skip=`). True if one went.
+pub fn remove(name: &str) -> bool {
+    let mut t = ENTRIES.lock();
+    for slot in t.iter_mut() {
+        if matches!(slot, Some(e) if e.name == name) { *slot = None; COUNT.fetch_sub(1, Ordering::Relaxed); return true; }
+    }
+    false
+}
+
+/// Is a hook registered under `name`? (ktest)
+pub fn has(name: &str) -> bool { ENTRIES.lock().iter().flatten().any(|e| e.name == name) }
 
 /// Number of registered hooks.
 pub fn count() -> usize { COUNT.load(Ordering::Relaxed) }
@@ -71,7 +112,7 @@ pub fn run(stage: Stage) -> (alloc::vec::Vec<&'static str>, alloc::vec::Vec<&'st
     let list: [Option<Entry>; MAX] = *t;
     drop(t);
     for e in list.iter().flatten().filter(|e| e.stage == stage) {
-        if (e.hook)() { ok.push(e.name) } else { bad.push(e.name) }
+        if e.call() { ok.push(e.name) } else { bad.push(e.name) }
     }
     (ok, bad)
 }
@@ -85,6 +126,6 @@ pub fn run_parked(stage: Stage, mut report: impl FnMut(&'static str, bool)) {
     unsafe { ENTRIES.force_unlock(); }
     let list: [Option<Entry>; MAX] = *ENTRIES.lock();
     for e in list.iter().flatten().filter(|e| e.stage == stage) {
-        report(e.name, (e.hook)());
+        report(e.name, e.call());
     }
 }

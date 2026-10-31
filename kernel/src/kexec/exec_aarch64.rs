@@ -54,6 +54,39 @@ struct Plan {
 static mut PLAN: Plan = Plan { purgatory: 0, ttbr0: 0, tcr: 0, head: 0, entry: 0, fdt: 0, ranges: 0, nranges: 0, park: 0, cpu_off: 1 };
 static ARMED: AtomicBool = AtomicBool::new(false);
 
+/// Per-CPU stage words in the park page (8 B per dense CPU, 16 CPUs):
+/// 1 divert entry, 2 after gic/timer off, 3 just before the `br`, 4 park page entry.
+const STAGE_OFF: u64 = 0x980;
+static CLEAN_PTR: [core::sync::atomic::AtomicUsize; 16] = [const { core::sync::atomic::AtomicUsize::new(0) }; 16];
+static CLEAN_LEN: [core::sync::atomic::AtomicUsize; 16] = [const { core::sync::atomic::AtomicUsize::new(0) }; 16];
+
+fn stage(n: u64) {
+    let park = unsafe { core::ptr::addr_of!(PLAN.park).read() };
+    let me = unsafe { arch_aarch64::smp::arch_cpu_id() };
+    if park == 0 || me >= 16 { return; }
+    let w = mm::phys_to_virt((park + STAGE_OFF) as usize + 8 * me) as *mut u64;
+    unsafe {
+        w.write_volatile(n);
+        core::arch::asm!("dc civac, {}", "dsb sy", in(reg) w as usize, options(nostack));
+    }
+}
+
+fn note_clean() {
+    let me = unsafe { arch_aarch64::smp::arch_cpu_id() };
+    if me >= 16 { return; }
+    let r = sched::irqctx::sleep_forbidden_reason().unwrap_or("clean");
+    CLEAN_LEN[me].store(r.len(), Ordering::Relaxed);
+    CLEAN_PTR[me].store(r.as_ptr() as usize, Ordering::Release);
+}
+
+fn read_stage(p: u64, i: usize) -> u64 {
+    let w = mm::phys_to_virt((p + STAGE_OFF) as usize + 8 * i) as *const u64;
+    unsafe {
+        core::arch::asm!("dc civac, {}", "dsb sy", in(reg) w as usize, options(nostack));
+        w.read_volatile()
+    }
+}
+
 fn log(s: &str) {
     super::prevlog::tee(s.as_bytes());
     arch_aarch64::uart::serial_print_str(s);
@@ -156,7 +189,19 @@ pub fn prepare(img: &Loaded, map: &[super::info::Raw]) -> Result<(), isize> {
                 p += 64;
             }
         }
-        core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb", options(nostack));
+        // Zero the diagnostic stage words (park page +STAGE_OFF), then the icache op.
+        for i in 0..16usize {
+            let w = mm::phys_to_virt((park + STAGE_OFF) as usize + 8 * i) as *mut u64;
+            w.write_volatile(0);
+            core::arch::asm!("dc civac, {}", in(reg) w as usize, options(nostack));
+        }
+        // `kexec.icache=is`: inner-shareable I-cache invalidate (Pi diag A/B).
+        if crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "kexec.icache=is")) {
+            crate::serial_print_str("[KEXEC] icache: ic ialluis\n");
+            core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack));
+        } else {
+            core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb", options(nostack));
+        }
         PLAN = Plan {
             purgatory: purg as u64, ttbr0: l0 as u64, tcr: t,
             head: img.head, entry: img.entry, fdt: img.bootinfo,
@@ -180,6 +225,8 @@ fn timers_off() {
 /// Divert target: every CPU's interrupt after `stop_and_jump` armed it.
 fn on_ipi() -> ! {
     unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)); }
+    stage(1);
+    note_clean();
     if unsafe { arch_aarch64::smp::arch_cpu_id() } == 0 { final_cpu0() }
     park_off()
 }
@@ -187,6 +234,7 @@ fn on_ipi() -> ! {
 fn park_off() -> ! {
     timers_off();
     arch_aarch64::gic::kexec_cpu_off();
+    stage(2);
     let p = unsafe { core::ptr::addr_of!(PLAN).read() };
     if p.purgatory == 0 { arch_aarch64::smp::cpu_off() }
     extern "C" { static boot_entered_el2: u64; }
@@ -201,6 +249,7 @@ fn park_off() -> ! {
 /// x0..x4 = `a`. Never returns.
 fn enter_idmap(target: u64, a: [u64; 5]) -> ! {
     let p = unsafe { core::ptr::addr_of!(PLAN).read() };
+    stage(3);
     unsafe {
         core::arch::asm!(
             "msr ttbr0_el1, x6",
@@ -231,11 +280,106 @@ fn enter_idmap(target: u64, a: [u64; 5]) -> ! {
     }
 }
 
+/// Set on entry to `final_cpu0`: a spin inside it (logging -> serial) must not
+/// re-enter `final_cpu0` via divert -> on_ipi.
+static FINAL: AtomicBool = AtomicBool::new(false);
+
+fn park_hook() {
+    stage(1);
+    if FINAL.load(Ordering::Relaxed) && unsafe { arch_aarch64::smp::arch_cpu_id() } == 0 { return; }
+    arch_aarch64::exception::divert()
+}
+
+/// `kexec.test_straggler=<cpu>` guard: CPU `<cpu>` is the CPU a stuck lock
+/// would hold. Its first IRQ-divert sends it into a masked `uart::getc` loop
+/// while the RX lock is held forever (the Pi 5 failure); it must still park.
+static STRAGGLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+static STRAGGLER_IN: AtomicBool = AtomicBool::new(false);
+
+fn straggler_entry() -> ! {
+    unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)); }
+    stage(1);
+    note_clean();
+    let me = unsafe { arch_aarch64::smp::arch_cpu_id() };
+    if me == STRAGGLER.load(Ordering::Relaxed) && !STRAGGLER_IN.swap(true, Ordering::AcqRel) {
+        log("[KEXEC] test: straggler spinning in uart::getc with IRQs masked\n");
+        // From now on a divert is the normal park.
+        arch_aarch64::exception::IRQ_DIVERT.store(on_ipi as fn() -> ! as usize, Ordering::Release);
+        if straggler_mode("lock") {
+            // Two-CPU variant: another CPU forgot LOCK and parks; this CPU spins on
+            // it with IRQs masked and must still park via spin's relax() hook.
+            log("[KEXEC] test: straggler spinning on a spin::Mutex held by a parked CPU\n");
+            while !LOCK_HELD.load(Ordering::Acquire) { core::hint::spin_loop(); }
+            let _g = LOCK.lock();
+            loop { core::hint::spin_loop(); }
+        }
+        if straggler_mode("rq") {
+            // Like "lock", but the held lock is a run-queue lock (spins with IRQs
+            // masked in cpuq::lock): only tlb_service_pending() reaches the park hook.
+            log("[KEXEC] test: straggler spinning on a run-queue lock held by a parked CPU\n");
+            while !RQ_HELD.load(Ordering::Acquire) { core::hint::spin_loop(); }
+            let _g = sched::cpuq::lock(RQ_IDX.load(Ordering::Relaxed));
+            loop { core::hint::spin_loop(); }
+        }
+        if straggler_sleep_mode() {
+            // The brcmf radio loop: a spin::Mutex held across msleep(1).
+            log("[KEXEC] test: straggler looping msleep(1) holding a spin::Mutex\n");
+            static M: spin::Mutex<()> = spin::Mutex::new(());
+            let _g = M.lock();
+            // Also a KSpinLock-style depth, so sleep_until takes its pure busy-wait branch.
+            sched::irqctx::atomic_inc();
+            log("[KEXEC] test: msleep context: ");
+            log(sched::irqctx::sleep_forbidden_reason().unwrap_or("may sleep"));
+            log("\n");
+            loop { sched::kthread::msleep(1); }
+        }
+        loop { let _ = unsafe { arch_aarch64::uart::getc() }; core::hint::spin_loop(); }
+    }
+    if straggler_mode("lock") && STRAGGLER.load(Ordering::Relaxed) != usize::MAX
+        && !LOCK_HELD.swap(true, Ordering::AcqRel)
+    {
+        core::mem::forget(LOCK.lock());
+    }
+    if straggler_mode("rq") && STRAGGLER.load(Ordering::Relaxed) != usize::MAX
+        && !RQ_TAKEN.swap(true, Ordering::AcqRel)
+    {
+        let c = me;
+        core::mem::forget(sched::cpuq::lock(c));
+        RQ_IDX.store(c, Ordering::Relaxed);
+        RQ_HELD.store(true, Ordering::Release);
+    }
+    on_ipi()
+}
+
+static RQ_TAKEN: AtomicBool = AtomicBool::new(false);
+static RQ_HELD: AtomicBool = AtomicBool::new(false);
+static RQ_IDX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static LOCK_HELD: AtomicBool = AtomicBool::new(false);
+
+fn straggler_mode(m: &str) -> bool {
+    crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace()
+        .any(|t| t.strip_prefix("kexec.test_straggler_mode=") == Some(m)))
+}
+
+fn straggler_sleep_mode() -> bool { straggler_mode("sleep") }
+
+fn test_straggler() -> Option<usize> {
+    crate::boot_cmdline()?.split_ascii_whitespace()
+        .filter_map(|t| t.strip_prefix("kexec.test_straggler=")).last()?.parse().ok()
+}
+
 /// Interrupts masked, devices quiesced, `prepare` done. Never returns.
 pub fn stop_and_jump() -> ! {
     unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)); }
     ARMED.store(true, Ordering::Release);
-    arch_aarch64::exception::IRQ_DIVERT.store(on_ipi as fn() -> ! as usize, Ordering::Release);
+    let strag = test_straggler().filter(|&c| c != 0 && c < arch_aarch64::smp::assigned());
+    if let Some(c) = strag {
+        STRAGGLER.store(c, Ordering::Release);
+        if !straggler_sleep_mode() && !straggler_mode("lock") && !straggler_mode("rq") { arch_aarch64::uart::test_leak_rx_lock(); }
+    }
+    let divert: fn() -> ! = if strag.is_some() { straggler_entry } else { on_ipi };
+    arch_aarch64::exception::IRQ_DIVERT.store(divert as usize, Ordering::Release);
     unsafe { core::arch::asm!("dsb ish", options(nostack)); }
     let me = unsafe { arch_aarch64::smp::arch_cpu_id() };
     let n = arch_aarch64::smp::assigned();
@@ -247,11 +391,15 @@ pub fn stop_and_jump() -> ! {
     for i in 0..n {
         if i != me { arch_aarch64::gic::send_sgi(i, arch_aarch64::gic::SGI_RESCHED); }
     }
+    // Contended spins on masked CPUs also park (see `wedge::Spin::tick`).
+    sched::wedge::PARK_HOOK.store(park_hook as fn() as usize, Ordering::Release);
+    spin::held::set_park_hook(park_hook);
     if me == 0 { final_cpu0() }
     park_off()
 }
 
 fn final_cpu0() -> ! {
+    FINAL.store(true, Ordering::Release);
     timers_off();
     // rpi5 wedge watchdog (lane piwdt): if armed, give the next kernel the
     // full 15 s to reach its own watchdog init (`rpi_misc::boot` re-arms it,
@@ -267,9 +415,11 @@ fn final_cpu0() -> ! {
     let p = unsafe { core::ptr::addr_of!(PLAN).read() };
     // Every other CPU first reports that it runs from the park page with its
     // caches flushed: nothing it does after that touches old-kernel memory.
+    let mut stuck: Option<usize> = None;
     for i in 1..n {
         let w = mm::phys_to_virt((p.park + super::info::AP_ARRIVED_OFF) as usize + 8 * i) as *const u64;
         let t0 = arch_aarch64::timer::monotonic_ns();
+        let mut resent = t0;
         let arrived = || unsafe {
             core::arch::asm!("dc civac, {}", "dsb sy", in(reg) w as usize, options(nostack));
             w.read_volatile() != 0
@@ -278,13 +428,60 @@ fn final_cpu0() -> ! {
         while !ok && arch_aarch64::timer::monotonic_ns().wrapping_sub(t0) < 2_000_000_000 {
             core::hint::spin_loop();
             ok = arrived();
+            // A SGI that landed in a window where the CPU could not take it
+            // (or was lost) is sent again.
+            let now = arch_aarch64::timer::monotonic_ns();
+            if !ok && now.wrapping_sub(resent) >= 100_000_000 {
+                resent = now;
+                arch_aarch64::gic::send_sgi(i, arch_aarch64::gic::SGI_RESCHED);
+            }
         }
         if !ok {
             log("[KEXEC] cpu");
             dec(i as u64);
-            log(" never reached the park page; jumping anyway\n");
+            log(" never reached the park page; irq#");
+            let (id, cnt, elr) = sched::wedge::trail(i);
+            if id == u32::MAX { log("-"); } else { dec(id as u64); }
+            log(" n=");
+            dec(cnt);
+            log(" elr=");
+            hex(elr);
+            log(" stage=");
+            dec(read_stage(p.park, i));
+            let (cp, cl) = (CLEAN_PTR[i].load(Ordering::Acquire), CLEAN_LEN[i].load(Ordering::Relaxed));
+            if cp != 0 {
+                log(" clean=");
+                // SAFETY: a &'static str recorded by note_clean.
+                log(unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(cp as *const u8, cl)) });
+            }
+            log(" uart_rx_lock_held=");
+            log(if arch_aarch64::uart::rx_lock_held() { "1" } else { "0" });
+            log("\n");
+            stuck = Some(i);
         }
     }
+    if let Some(i) = stuck {
+        // Entering the purgatory now would overwrite the kernel under a CPU
+        // that is still running it. Reset instead.
+        log("[KEXEC] cpu");
+        dec(i as u64);
+        log(" still in the old kernel; aborting kexec, system reset\n");
+        #[cfg(feature = "rpi5")]
+        {
+            drivers::rpi_pm::wdt_kick_nolock(1);
+        }
+        #[cfg(not(feature = "rpi5"))]
+        unsafe { arch_aarch64::power::system_reset(); }
+        loop { unsafe { core::arch::asm!("wfe", options(nomem, nostack)); } }
+    }
+    log("[KEXEC] park stages:");
+    for i in 1..n {
+        log(" cpu");
+        dec(i as u64);
+        log("=");
+        dec(read_stage(p.park, i));
+    }
+    log("\n");
     // Bus-stage hooks (pcie-perst + bridge reset) only now: every other CPU
     // is on the park page, so none can be mid-access to RP1 when the bridge
     // goes into reset. No allocation, no timer, no locks that a parked CPU

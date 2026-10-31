@@ -19,6 +19,33 @@ const FAKE_PERIOD: u32 = 1000;
 pub fn set_fake(on: bool) { FAKE.store(on, Ordering::Relaxed); }
 pub fn fake() -> bool { FAKE.load(Ordering::Relaxed) }
 
+/// Module-registered backlight providers (`kapi_backlight_register`), one record per owner.
+/// Callbacks are `extern "C"` taking the registrant's `ctx`; the first record that answers wins.
+#[derive(Clone, Copy)]
+pub struct ModBl {
+    pub owner: u32,
+    pub get: Option<extern "C" fn(usize, *mut u32, *mut u32) -> bool>,
+    pub set: Option<extern "C" fn(usize, u32) -> bool>,
+    pub ctx: usize,
+}
+static MOD_BL: spin::Mutex<Vec<ModBl>> = spin::Mutex::new(Vec::new());
+pub fn bl_register(m: ModBl) { MOD_BL.lock().push(m); }
+pub fn bl_unregister_owner(owner: u32) { MOD_BL.lock().retain(|m| m.owner != owner); }
+pub fn bl_count(owner: u32) -> usize { MOD_BL.lock().iter().filter(|m| m.owner == owner).count() }
+/// `(duty, period)` from the first module provider that has a backlight.
+pub fn bl_get() -> Option<(u32, u32)> {
+    let l: Vec<ModBl> = MOD_BL.lock().clone();
+    for m in l {
+        if let Some(g) = m.get { let (mut d, mut p) = (0u32, 0u32); if g(m.ctx, &mut d, &mut p) { return Some((d, p)); } }
+    }
+    None
+}
+/// Set the duty through the first module provider that accepts it.
+pub fn bl_set(duty: u32) -> bool {
+    let l: Vec<ModBl> = MOD_BL.lock().clone();
+    l.iter().any(|m| m.set.map_or(false, |f| f(m.ctx, duty)))
+}
+
 fn fake_battery() -> BatteryInfo {
     BatteryInfo {
         present: true, status: acpi_power::ST_DISCHARGING, capacity: 76, energy_units: true,

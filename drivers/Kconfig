@@ -66,7 +66,7 @@ config WIFI_SIM
 	default y
 
 config MACB
-	bool "Cadence macb (Pi 5 RP1 Ethernet)"
+	tristate "Cadence macb (Pi 5 RP1 Ethernet)"
 	default y
 
 config BRCMF
@@ -79,7 +79,7 @@ endmenu
 menu "Graphics, display and audio"
 
 config I915
-	bool "Intel i915"
+	tristate "Intel i915"
 	depends on PCI && DRM
 	default y
 
@@ -89,7 +89,7 @@ config V3D
 	default y
 
 config HDMI_AUDIO
-	bool "Pi 5 HDMI audio"
+	tristate "Pi 5 HDMI audio"
 	depends on BOARD_RPI5
 	default y
 

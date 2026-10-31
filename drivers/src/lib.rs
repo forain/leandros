@@ -108,6 +108,7 @@ pub mod hostvis_core;
 /// (the NVIDIA nouveau-UAPI layer in drivers/nvidia).
 pub mod gpu_uapi;
 pub mod gpu_kms;
+pub mod kms_class;
 /// Sync files and dma-buf implicit fences (zink on a GPU UAPI backend).
 pub mod sync_file;
 /// Pure sync-file / dma-buf reservation semantics; host-tested in drivers/uapi-tests.
@@ -175,6 +176,7 @@ pub mod bcm2712_otp;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod hdmi_probe;
 pub mod hdmi_audio;
+pub mod hdmi_plat;
 /// Pi 5 Wi-Fi boot bring-up: sdio2 host → firmware → "ver" (rpi5 only).
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 #[cfg(feature = "brcmf")] pub mod brcmf_boot;

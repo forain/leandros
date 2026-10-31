@@ -113,6 +113,8 @@ pub fn sleep_until(deadline: u64) {
     if !crate::irqctx::might_sleep() {
         while crate::monotonic_ns() < deadline {
             if crate::irqctx::in_interrupt() || crate::irqctx::atomic_depth() != 0 || !crate::irqs_masked() {
+                // A masked sleeper must still reach kexec's park page.
+                crate::wedge::park_check();
                 core::hint::spin_loop();
             } else {
                 crate::preempt_disable();
@@ -143,7 +145,7 @@ pub fn msleep(ms: u64) { sleep_ns(ms.saturating_mul(1_000_000)) }
 /// Busy-wait `us` microseconds without parking (any context).
 pub fn udelay(us: u64) {
     let end = crate::monotonic_ns().saturating_add(us.saturating_mul(1000));
-    while crate::monotonic_ns() < end { core::hint::spin_loop(); }
+    while crate::monotonic_ns() < end { crate::wedge::park_check(); core::hint::spin_loop(); }
 }
 
 /// Let pending interrupts in and give up the CPU if the tick asked for it.

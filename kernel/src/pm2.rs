@@ -40,8 +40,7 @@ fn audio_shutdown(hda_crst: bool) -> ShutOut {
     ShutOut { line: Some(alloc::format!("audio: {}", audio)), bm: f }
 }
 fn e1000e_shutdown(_: bool) -> ShutOut { ShutOut { line: drivers::e1000e::shutdown(), bm: None } }
-#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "drv-brcmf"))]
-fn brcmf_shutdown(_: bool) -> ShutOut { ShutOut { line: drivers::brcmf_boot::shutdown(), bm: None } }
+const _: () = assert!(drivers::kenv::pm::PHASE_WIFI == ph::WIFI);
 fn console_kexec() -> Vec<String> { drivers::gpu_kms::console_restore(); Vec::new() }
 fn opt(s: Option<String>) -> Vec<String> { s.into_iter().collect() }
 fn r8169_kexec() -> Vec<String> { opt(drivers::r8169::shutdown()) }
@@ -60,8 +59,6 @@ static BUILTIN: &[Dev] = &[
           shutdown: Some(e1000e_shutdown), ..NONE },
     Dev { name: "r8169", phase: ph::NET, kexec: Some(r8169_kexec), ..NONE },
     Dev { name: "iwlwifi", phase: ph::WIFI, kexec: Some(iwl_kexec), ..NONE },
-    #[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "drv-brcmf"))]
-    Dev { name: "brcmf", phase: ph::WIFI, shutdown: Some(brcmf_shutdown), ..NONE },
     Dev { name: "block", phase: ph::BLOCK, suspend: Some(crate::pm::blk_suspend), resume: Some(crate::pm::blk_resume),
           block_shutdown: Some(drivers::nvme::shutdown_all), kexec: Some(drivers::nvme::kexec_disable), ..NONE },
     Dev { name: "xhci", phase: ph::USB, suspend: Some(crate::pm::xhci_suspend), resume: Some(crate::pm::xhci_resume), ..NONE },
@@ -117,6 +114,8 @@ pub fn shutdown_phase1(hda_crst: bool) -> (Vec<String>, Vec<drivers::pci::PciFun
                 if let Some(b) = o.bm { bm.push(b); }
             }
         }
+        // Hooks the drivers registered themselves (brcmf, phase WIFI).
+        for f in drivers::kenv::pm::shutdown_hooks(p) { if let Some(l) = f() { lines.push(l); } }
         for m in pm_mods(p) { module_line(&m, PmOp::Shutdown, &mut lines); }
     }
     (lines, bm)

@@ -31,3 +31,21 @@ pub(crate) fn acquired() { call(true) }
 
 #[inline(always)]
 pub(crate) fn released() { call(false) }
+
+static PARK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the kexec park hook (called from `RelaxStrategy::relax`).
+pub fn set_park_hook(f: fn()) {
+    PARK.store(f as usize, Ordering::Release);
+}
+
+/// One relaxed load; calls the park hook if set. Lets a CPU spinning on a
+/// lock whose holder already parked reach a park point.
+#[inline]
+pub fn park_poll() {
+    let h = PARK.load(Ordering::Relaxed);
+    if h != 0 {
+        let f: fn() = unsafe { core::mem::transmute(h) };
+        f();
+    }
+}

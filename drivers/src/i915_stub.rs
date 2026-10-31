@@ -17,13 +17,13 @@ pub fn run(_env: &BootEnv) {}
 pub fn kexec_quiesce() -> alloc::vec::Vec<String> { alloc::vec::Vec::new() }
 pub fn pm_suspend() -> Result<String, String> { Ok(String::new()) }
 pub fn pm_resume() -> Result<String, String> { Ok(String::new()) }
-pub fn proc_text() -> Option<String> { None }
-pub fn set_tmpfs_census(_f: fn() -> Option<[u64; 9]>) {}
-pub fn prime_dedup(_obj: u32) -> bool { false }
-pub fn ptecheck_fd_to_handle(_fd: i32, _open_id: u32, _obj: Option<u32>, _handle: u32) {}
-pub fn ptecheck_dmabuf_mmap(_obj: u32, _off: u64, _frames: &[usize]) {}
+pub fn proc_text() -> Option<String> { crate::drm_class::proc_text() }
+pub fn set_tmpfs_census(f: fn() -> Option<[u64; 9]>) { crate::drm_class::set_tmpfs_census(f) }
+pub fn prime_dedup(obj: u32) -> bool { crate::drm_class::prime_dedup(obj) }
+pub fn ptecheck_fd_to_handle(fd: i32, open_id: u32, obj: Option<u32>, handle: u32) { crate::drm_class::ptecheck_fd_to_handle(fd, open_id, obj, handle) }
+pub fn ptecheck_dmabuf_mmap(obj: u32, off: u64, frames: &[usize]) { crate::drm_class::ptecheck_dmabuf_mmap(obj, off, frames) }
 
 pub mod backlight {
-    pub fn get() -> Option<(u32, u32)> { None }
-    pub fn set(_duty: u32) -> bool { false }
+    pub fn get() -> Option<(u32, u32)> { crate::power_sysfs::bl_get() }
+    pub fn set(duty: u32) -> bool { crate::power_sysfs::bl_set(duty) }
 }

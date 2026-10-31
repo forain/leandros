@@ -120,6 +120,13 @@ kexec_purgatory_start:
     .balign 16
     .globl kexec_purgatory_off
 kexec_purgatory_off:
+    adr     x14, kexec_purgatory_start
+    add     x14, x14, #0x980            // exec_aarch64.rs STAGE_OFF
+    add     x14, x14, x3, lsl #3
+    mov     x12, #4
+    str     x12, [x14]                  // stage 4: park page entry
+    dc      civac, x14
+    dsb     sy
     mov     x17, x1                     // 1 = SMC conduit
     mov     x15, x2                     // 1 = park, no CPU_OFF
     mov     x16, x3                     // dense CPU index

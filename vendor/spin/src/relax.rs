@@ -23,6 +23,7 @@ pub struct Spin;
 impl RelaxStrategy for Spin {
     #[inline(always)]
     fn relax() {
+        crate::held::park_poll();
         // Use the deprecated spin_loop_hint() to ensure that we don't get
         // a higher MSRV than we need to.
         #[allow(deprecated)]

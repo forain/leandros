@@ -561,6 +561,144 @@ extern "C" fn kapi_fake_rng(p: *mut u8, n: usize) -> usize {
     n
 }
 
+
+static KP_PROBES: AtomicU32 = AtomicU32::new(0);
+static KP_HOOKED: AtomicU32 = AtomicU32::new(0);
+static KP_BAD: AtomicU32 = AtomicU32::new(0);
+extern "C" fn kp_probe(ctx: usize, dev: *const kmod_abi::KPlatDev) -> bool {
+    let d = unsafe { &*dev };
+    if ctx != 0xc0de || d.size as usize != core::mem::size_of::<kmod_abi::KPlatDev>() || d.compat_idx != 1
+        || d.reg[0].phys != 0x1000_0000 || d.reg[0].len != 0x200 || d.reg[1].phys != 0x2000 || d.nirq != 1 || d.irq[0] != 77
+        || d.dma_offset != 0x4000_0000 { KP_BAD.fetch_add(1, Ordering::SeqCst); }
+    KP_PROBES.fetch_add(1, Ordering::SeqCst);
+    true
+}
+fn kp_hook(compat: &str) { if compat == "leandros,ktest-early2" { KP_HOOKED.fetch_add(1, Ordering::SeqCst); } }
+extern "C" fn kp_quiet(_ctx: usize) -> bool { true }
+
+/// kmodpi P0: platform registry (module probes, replay of early announcements), board services, vmap, DMA quiesce.
+fn kmodplat_checks(t: &mut T) {
+    use crate::kmod::{exports, registry};
+    use drivers::platform::{self, PlatDev};
+    use kmod_abi::{KmodId, RegKind};
+    for n in ["kapi_plat_register", "kapi_plat_unregister", "kapi_dtb_blob", "kapi_board_mac", "kapi_soc_stepping",
+              "kapi_serror_checkpoint", "kapi_vmap", "kapi_vunmap", "kapi_dma_quiesce_register",
+              "kapi_dma40_claim", "kapi_dma40_release", "kapi_dma40_start_cyclic", "kapi_dma40_stop", "kapi_dma40_position",
+              "kapi_dma40_periods", "kapi_dma40_poll", "kapi_dma40_polled", "kapi_hdmi_sink_info", "kapi_pi5_pins"] {
+        t.check(exports::lookup(n).is_some(), "plat/board export in KSYMTAB");
+    }
+    // The Wi-Fi pins are for the module named brcmf only.
+    t.check(exports::kapi_pi5_pins(KmodId(60020), 2, 0, core::ptr::null_mut()) == -1, "pi5_pins refused for a module not named brcmf");
+    // The built-in shutdown hook seam: replace-by-name, per-phase lookup, unregister.
+    {
+        use drivers::kenv::pm;
+        fn h1() -> Option<alloc::string::String> { None }
+        pm::register_shutdown("ktest-brcmf", pm::PHASE_WIFI, h1);
+        pm::register_shutdown("ktest-brcmf", pm::PHASE_WIFI, h1);
+        t.check(pm::shutdown_hooks(pm::PHASE_WIFI).len() == 1, "pm hook registered once per name");
+        t.check(pm::shutdown_hooks(pm::PHASE_WIFI + 1).is_empty(), "pm hook not listed in another phase");
+        pm::unregister("ktest-brcmf");
+        t.check(pm::shutdown_hooks(pm::PHASE_WIFI).is_empty(), "pm hook unregistered");
+    }
+    // Registration argument checks.
+    let own = KmodId(60020); // not 60010: kmodkapi_w2 counts that owner's records
+    t.check(exports::kapi_plat_register(own, core::ptr::null(), 4, kp_probe, 0) == -22, "plat_register null compats -> -22");
+    t.check(exports::kapi_plat_register(KmodId(0), b"a\0".as_ptr(), 2, kp_probe, 0) == -22, "plat_register owner 0 -> -22");
+    // A device announced before any driver exists is claimed by a module registering later (the replay).
+    let mut d = PlatDev::default();
+    d.base = 0x1000_0000; d.size = 0x200; d.dma_offset = 0x4000_0000; d.irqs[0] = 77; d.nirq = 1;
+    d.regs[1] = (0x2000, 0x10);
+    platform::announce("leandros,ktest-early", d);
+    t.check(platform::is_claimed("leandros,ktest-early") == Some(false), "early announced device stays unclaimed");
+    let list = b"leandros,ktest-other\0leandros,ktest-early\0";
+    KP_PROBES.store(0, Ordering::SeqCst);
+    t.check(exports::kapi_plat_register(own, list.as_ptr(), list.len(), kp_probe, 0xc0de) == 0, "plat_register ok");
+    t.check(KP_PROBES.load(Ordering::SeqCst) == 1 && KP_BAD.load(Ordering::SeqCst) == 0, "module probe saw the early device (KPlatDev fields, compat_idx 1)");
+    t.check(platform::is_claimed("leandros,ktest-early") == Some(true), "early device claimed through kapi_plat_register");
+    // Failed init: the registry takes the registration back and the device is unclaimed again.
+    t.check(registry::reg_count(own) == 1, "plat registration recorded for the owner");
+    t.check(registry::release_all(own), "release_all drops the plat registration");
+    t.check(platform::is_claimed("leandros,ktest-early") == Some(false), "device unclaimed after the owner went");
+    t.check(exports::kapi_plat_register(own, list.as_ptr(), list.len(), kp_probe, 0xc0de) == 0 && platform::is_claimed("leandros,ktest-early") == Some(true), "re-register claims it again");
+    exports::kapi_plat_unregister(own);
+    t.check(platform::is_claimed("leandros,ktest-early") == Some(false), "kapi_plat_unregister unclaims");
+    // set_autoload replays devices announced before the hook existed.
+    let old = platform::swap_autoload(0);
+    platform::announce("leandros,ktest-early2", PlatDev::default());
+    KP_HOOKED.store(0, Ordering::SeqCst);
+    platform::set_autoload(kp_hook);
+    t.check(KP_HOOKED.load(Ordering::SeqCst) == 1, "set_autoload replays an early announcement to the hook once");
+    platform::replay_unclaimed();
+    t.check(KP_HOOKED.load(Ordering::SeqCst) == 1, "a second replay does not re-fire");
+    platform::swap_autoload(old);
+    // Board services.
+    let mut m = [0u8; 6];
+    t.check(exports::kapi_board_mac(9, m.as_mut_ptr()) == -22 && exports::kapi_board_mac(0, core::ptr::null_mut()) == -22, "board_mac bad args -> -22");
+    #[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
+    { t.check(exports::kapi_board_mac(0, m.as_mut_ptr()) == -19, "board_mac off the Pi 5 -> -19");
+      t.check(exports::kapi_soc_stepping() == -19, "soc_stepping off the Pi 5 -> -19"); }
+    let mut n = 99usize;
+    let p = exports::kapi_dtb_blob(&mut n);
+    t.check(p.is_null() == (n == 0), "dtb_blob pointer and length agree");
+    let _ = exports::kapi_serror_checkpoint();
+    t.check(true, "serror_checkpoint returns");
+    // vmap alias: a page written through the alias is visible through the direct map after clean.
+    let pg = exports::kapi_page_alloc(0, 0);
+    if pg != 0 {
+        let pages = [pg];
+        t.check(exports::kapi_vmap(core::ptr::null(), 1, 2) == 0 && exports::kapi_vmap(pages.as_ptr(), 0, 2) == 0 && exports::kapi_vmap(pages.as_ptr(), 1, 7) == 0, "vmap bad args -> 0");
+        let odd = [pg + 8];
+        t.check(exports::kapi_vmap(odd.as_ptr(), 1, 2) == 0, "vmap unaligned page -> 0");
+        let va = exports::kapi_vmap(pages.as_ptr(), 1, 2);
+        t.check(va != 0, "vmap one page");
+        if va != 0 {
+            unsafe { (va as *mut u32).write_volatile(0xfeed_0042); }
+            exports::kapi_dma_sync(va, 64, 3);
+            let hh = exports::kapi_phys_to_virt(pg) as *const u32;
+            t.check(unsafe { hh.read_volatile() } == 0xfeed_0042, "write through the vmap alias visible in the direct map");
+            exports::kapi_dma_sync(va, 64, 4);
+            exports::kapi_dma_sync(va, 64, 5); // out of range: ignored
+            exports::kapi_vunmap(va);
+        }
+        exports::kapi_page_free(pg, 0);
+    }
+    // dma40 handles + HDMI sink facts (kmodpi H1). Off a BCM2712 the channel calls fail cleanly.
+    t.check(exports::kapi_dma40_release(0) < 0 && exports::kapi_dma40_release(99) < 0, "dma40 release bad handle -> errno");
+    t.check(exports::kapi_dma40_stop(0) < 0 && exports::kapi_dma40_position(99) < 0, "dma40 stop/position bad handle -> errno");
+    t.check(exports::kapi_dma40_start_cyclic(0, 0, 0, 0, 0, 0, 1) < 0 && exports::kapi_dma40_poll(0) < 0, "dma40 start_cyclic/poll bad handle -> errno");
+    t.check(exports::kapi_dma40_periods(0) == 0, "dma40 periods bad handle -> 0");
+    let c = exports::kapi_dma40_claim(-1);
+    t.check(c > 0 || c < 0, "dma40 claim returns handle or errno");
+    if c > 0 {
+        t.check(exports::kapi_dma40_release(c as u32) == 0 && exports::kapi_dma40_release(c as u32) < 0, "dma40 claim/release once");
+    } else {
+        t.check(c == -19 || c == -16, "dma40 claim off-board -> -19/-16");
+    }
+    t.check(exports::kapi_hdmi_sink_info(core::ptr::null_mut()) == -22, "hdmi_sink_info null -> -22");
+    let mut hs = kmod_abi::KHdmiSink::default();
+    t.check(exports::kapi_hdmi_sink_info(&mut hs) == -22, "hdmi_sink_info size 0 -> -22");
+    hs.size = core::mem::size_of::<kmod_abi::KHdmiSink>() as u32;
+    t.check(exports::kapi_hdmi_sink_info(&mut hs) == 0 && hs.size == core::mem::size_of::<kmod_abi::KHdmiSink>() as u32
+        && hs.state == drivers::hdmi_plat::sink_info().0, "hdmi_sink_info fills the record");
+    // DMA quiesce hook: registered, name collisions refused, removed again on a failed init.
+    let qo = KmodId(60021);
+    let nm = b"ktest-q";
+    t.check(exports::kapi_dma_quiesce_register(qo, core::ptr::null(), 7, 0, kp_quiet, 0) == -22 && exports::kapi_dma_quiesce_register(qo, nm.as_ptr(), 7, 5, kp_quiet, 0) == -22, "dma_quiesce bad args -> -22");
+    t.check(exports::kapi_dma_quiesce_register(qo, nm.as_ptr(), 7, 0, kp_quiet, 1) == 0 && drivers::dma_shutdown::has("ktest-q"), "dma_quiesce registered");
+    t.check(exports::kapi_dma_quiesce_register(KmodId(60022), nm.as_ptr(), 7, 0, kp_quiet, 1) == -17, "dma_quiesce duplicate name -> -17");
+    t.check(registry::registrations_of_kind(qo, RegKind::DMAQ) == 1, "dma_quiesce recorded in the registry");
+    let before = drivers::dma_shutdown::count();
+    t.check(registry::release_all(qo), "release_all drops the dma_quiesce registration");
+    t.check(!drivers::dma_shutdown::has("ktest-q") && drivers::dma_shutdown::count() == before - 1, "quiesce entry removed after the failed init");
+    // RP1 interrupt sources: bad arguments are refused everywhere; without an RP1 there is nothing to attach.
+    extern "C" fn kp_irq(_c: usize) -> u32 { 0 }
+    t.check(exports::kapi_rp1_irq_request(KmodId(0), 6, true, kp_irq, 0) == -22 && exports::kapi_rp1_irq_request(KmodId(60023), 64, true, kp_irq, 0) == -22, "rp1_irq_request bad args -> -22");
+    #[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
+    t.check(exports::kapi_rp1_irq_request(KmodId(60023), 6, true, kp_irq, 0) == -19, "rp1_irq_request off the Pi 5 -> -19");
+    t.check(exports::kapi_rp1_irq_free(KmodId(60023), 6) == -19, "rp1_irq_free of an unheld source -> -19");
+    t.check(exports::lookup("kapi_rp1_irq_request").is_some() && exports::lookup("kapi_rp1_irq_free").is_some(), "rp1 irq exports in KSYMTAB");
+}
+
 /// L5a: the PCI / memory / entropy kapi exports, called through the KSYMTAB addresses
 /// (exactly what a module's relocations resolve to).
 fn t_kmodkapi() -> T {
@@ -572,7 +710,8 @@ fn t_kmodkapi() -> T {
         t.check(a.is_some(), concat!($n, " in KSYMTAB"));
         match a { Some(a) => Some(unsafe { core::mem::transmute::<usize, $ty>(a) }), None => None }
     }}; }
-    t.check(exports::ksymtab().len() == 118 && exports::NEXPORTS == 118, "ksymtab has 118 exports");
+    t.check(exports::ksymtab().len() == exports::NEXPORTS, "ksymtab length == NEXPORTS (count derived from the table)");
+    say!("kmodkapi: {} exports", exports::NEXPORTS);
     t.check(exports::lookup("kapi_wifi_register").is_some(), "kapi_wifi_register in KSYMTAB");
     for n in ["kapi_drm_register", "kapi_drm_offset_alloc", "kapi_drm_offset_release", "kapi_fence_wait", "kapi_syncobj_install",
               "kapi_syncobj_exists", "kapi_syncobj_in_fences", "kapi_fence_irq_hint", "kapi_kms_event_complete"] {
@@ -636,6 +775,7 @@ fn t_kmodkapi() -> T {
         t.check(r == -22, "kapi_blk_register null desc/ops -> -22");
         t.check(crate::kmod::exports::kapi_blk_remove(-1) == -22, "kapi_blk_remove(-1) -> -22");
     }
+    kmodplat_checks(&mut t);
     let find = sym!("kapi_pci_find", sys::PciFindFn);
     let rd = sym!("kapi_pci_cfg_read", sys::PciCfgReadFn);
     let wr = sym!("kapi_pci_cfg_write", sys::PciCfgWriteFn);
@@ -685,7 +825,7 @@ fn t_kmodkapi() -> T {
         let q = pa(0, 0);
         t.check(q != 0, "page_alloc(0, any)");
         if q != 0 { pf(q, 0); }
-        t.check(pa(11, 0) == 0, "page_alloc order 11 refused");
+        t.check(pa(mm::buddy::MAX_ORDER as u32, 0) == 0, "page_alloc order MAX_ORDER refused");
 
         // Hardware RNG registration reseeds at once.
         let owner = KmodId(60001);
@@ -704,6 +844,8 @@ fn t_kmodkapi() -> T {
     kmodkapi_l6a(&mut t);
     kmodkapi_l7a(&mut t);
     kmodkapi_w2(&mut t);
+    kmodkapi_k2a(&mut t);
+    kmodkapi_k2b(&mut t);
     t
 }
 
@@ -1735,4 +1877,250 @@ fn t_memperf() -> T {
     mm::buddy::free(pa, ORDER);
     mm::buddy::free(pb, ORDER);
     t
+}
+
+// ---- K2a: KMS class + KDrmOps tail ----
+mod k2a {
+    use drivers::drm_class::{KDrmOps, KDrmPrime, KDRM_NOT_MINE};
+    use drivers::kms_class::*;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    pub static HITS: AtomicU32 = AtomicU32::new(0);
+    pub static NAME: &[u8] = b"ktest-kms";
+    pub static MODS: [u64; 2] = [0, 0x1234];
+    extern "C" fn mode(_c: usize, o: *mut u32) { unsafe { *o = 640; *o.add(1) = 480; *o.add(2) = 60; } }
+    extern "C" fn fb_create(c: usize, r: *const KKmsFbReq, _o: u32) -> i64 {
+        let r = unsafe { &*r };
+        if c != 0xC0DE { return -5; }
+        if r.handle == 99 { return KMS_NOT_MINE; }
+        if r.handle == 98 { return -22; }
+        if r.has_modifier && r.modifier == 0x1234 { 77 } else { 0x40 + r.pitch as i64 }
+    }
+    extern "C" fn fb_destroy(_c: usize, t: u32) { HITS.fetch_add(t, Ordering::SeqCst); }
+    extern "C" fn present(_c: usize, t: u32, _x: u32, _y: u32, has: bool, r: *const [i32; 4], n: usize) -> i32 {
+        if has && n == 2 && unsafe { (*r.add(1))[2] } == 40 { return 0; }
+        if !has && n == 0 && t == 5 { 0 } else { -22 }
+    }
+    extern "C" fn restore(_c: usize) { HITS.fetch_add(1000, Ordering::SeqCst); }
+    pub static BE: KKmsBackendOps = KKmsBackendOps {
+        size: core::mem::size_of::<KKmsBackendOps>() as u32, name: NAME.as_ptr(), name_len: 9, mode,
+        modifiers: MODS.as_ptr(), n_modifiers: 2, fb_create, fb_destroy, present, console_restore: Some(restore),
+    };
+    extern "C" fn queue(_c: usize, t: u32, _x: u32, _y: u32, ev: u32) -> i32 { if t == 1 && ev == 9 { 0 } else { -16 } }
+    extern "C" fn event(_c: usize, ev: u32) { HITS.fetch_add(ev, Ordering::SeqCst); }
+    extern "C" fn busy(_c: usize) -> bool { true }
+    extern "C" fn wait(_c: usize, ns: u64) -> bool { ns == 7 }
+    pub static FL: KKmsFlipOps = KKmsFlipOps { size: core::mem::size_of::<KKmsFlipOps>() as u32, queue, event, busy, wait_idle: wait };
+    extern "C" fn cset(_c: usize, s: *const KKmsCursorSrc, x: i32, y: i32) -> bool { let s = unsafe { &*s }; s.token == 3 && s.width == 64 && x == -4 && y == 5 }
+    extern "C" fn cmove(_c: usize, x: i32, _y: i32) { HITS.fetch_add(x as u32, Ordering::SeqCst); }
+    extern "C" fn chide(_c: usize) { HITS.fetch_add(100_000, Ordering::SeqCst); }
+    pub static CU: KKmsCursorOps = KKmsCursorOps { size: core::mem::size_of::<KKmsCursorOps>() as u32, cursor_size: 64, set: cset, move_to: cmove, hide: chide };
+    extern "C" fn ocount(_c: usize) -> usize { 2 }
+    fn fill(i: usize, o: *mut KKmsConnInfo) -> bool {
+        if i > 1 { return false; }
+        let o = unsafe { &mut *o };
+        o.conn_type = 11; o.type_id = i as u32 + 1; o.connected = i == 0; o.nmodes = 1;
+        o.modes[0] = KKmsTiming { clock_khz: 148500, h: [1920, 2008, 2052, 2200], v: [1080, 1084, 1089, 1125], flags: 5 };
+        true
+    }
+    extern "C" fn oinfo(_c: usize, i: usize, o: *mut KKmsConnInfo) -> bool { fill(i, o) }
+    extern "C" fn ocached(_c: usize, i: usize, o: *mut KKmsConnInfo) -> bool { fill(i, o) && i == 0 }
+    extern "C" fn omask(_c: usize, i: usize) -> u32 { 1 << i }
+    pub static OU: KKmsOutputsOps = KKmsOutputsOps { size: core::mem::size_of::<KKmsOutputsOps>() as u32, count: ocount, info: oinfo, cached: ocached, crtc_mask: omask };
+    extern "C" fn pmodeset(_c: usize, i: usize, t: *const KKmsTiming) -> i32 { if i == 1 && unsafe { (*t).clock_khz } == 148500 { 0 } else { -22 } }
+    extern "C" fn pdisable(_c: usize) { HITS.fetch_add(1_000_000, Ordering::SeqCst); }
+    extern "C" fn pmode(_c: usize, o: *mut u32) -> bool { unsafe { *o = 1920; *o.add(1) = 1080; *o.add(2) = 60; } true }
+    pub static P2: KKmsPipe2Ops = KKmsPipe2Ops {
+        size: core::mem::size_of::<KKmsPipe2Ops>() as u32, name: NAME.as_ptr(), name_len: 9, modeset: pmodeset, disable: pdisable,
+        queue, event, busy, wait_idle: wait, mode: pmode, dumb_ok: true, has_cursor: true,
+    };
+
+    // KDrmOps with the tail
+    extern "C" fn ioctl(_c: usize, _cmd: u32, _a: usize, _o: u32) -> i64 { KDRM_NOT_MINE }
+    extern "C" fn gclose(_c: usize, _h: u32, _o: u32) -> i64 { KDRM_NOT_MINE }
+    extern "C" fn dmmap(_c: usize, _t: u64, _o: u32, _u: *mut bool) -> u64 { 0 }
+    extern "C" fn drel(_c: usize, _o: u32) {}
+    extern "C" fn pexp(_c: usize, _h: u32, _o: u32, _out: *mut KDrmPrime) -> bool { false }
+    extern "C" fn pimp(_c: usize, _o: u32, _op: u32) -> u32 { 0 }
+    extern "C" fn bor(_c: usize, _o: u32) -> bool { false }
+    extern "C" fn fdone(_c: usize, _f: u64) -> bool { false }
+    extern "C" fn sattr(_c: usize, _a: *const u8, _l: usize, _o: *mut u8, _cap: usize) -> i64 { -1 }
+    extern "C" fn mpin(_c: usize, tok: usize, len: usize, _o: u32, out: *mut usize, cap: usize) -> i64 {
+        if tok == 0x7000 { return KDRM_NOT_MINE; }
+        if tok == 0x8000 { return 0; }
+        let n = (len / 4096).min(cap);
+        for i in 0..n { unsafe { *out.add(i) = tok + i * 4096; } }
+        n as i64
+    }
+    extern "C" fn ptext(_c: usize, out: *mut u8, cap: usize) -> i64 {
+        let s = b"i915: ktest\n";
+        if cap >= s.len() { unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), out, s.len()); } }
+        s.len() as i64
+    }
+    extern "C" fn pdedup(_c: usize, o: u32) -> bool { o == 7 }
+    extern "C" fn ptm(_c: usize, o: u32, off: u64, f: *const usize, n: usize) { if o == 3 && off == 0x1000 && n == 2 && unsafe { *f.add(1) } == 0xB000 { HITS.fetch_add(1 << 20, Ordering::SeqCst); } }
+    extern "C" fn ptf(_c: usize, fd: i32, op: u32, o: u32, h: u32) { if fd == 5 && op == 6 && o == u32::MAX && h == 8 { HITS.fetch_add(1 << 24, Ordering::SeqCst); } }
+    pub static DRM: KDrmOps = KDrmOps {
+        size: core::mem::size_of::<KDrmOps>() as u32, ver_major: 1, ver_minor: 0, ver_patch: 0, user_args: false,
+        name: NAME.as_ptr(), name_len: 9, date: NAME.as_ptr(), date_len: 0, desc: NAME.as_ptr(), desc_len: 0,
+        ioctl, gem_close: gclose, mmap: dmmap, release_open: drel, prime_export: pexp, prime_import: pimp, bo_release: bor,
+        fence_done: fdone, sysfs_attr: sattr,
+        mmap_pin: Some(mpin), proc_text: Some(ptext), prime_dedup: Some(pdedup), ptecheck_mmap: Some(ptm), ptecheck_fd_to_handle: Some(ptf),
+    };
+}
+
+fn kmodkapi_k2a(t: &mut T) {
+    use crate::kmod::{exports, registry};
+    use kmod_abi::{KmodId, RegKind};
+    use drivers::{gpu_kms, kms_class::*};
+    use core::sync::atomic::Ordering;
+    let owner = KmodId(60020);
+    let reg = |k: u32, p: *const u8| exports::kapi_kms_register(owner, k, p, 0xC0DE);
+    for n in ["kapi_kms_register", "kapi_kms_set_internal_panel", "kapi_drm_hotplug", "kapi_ext_present_stats", "kapi_tmpfs_census"] {
+        t.check(exports::lookup(n).is_some(), "k2a export in KSYMTAB");
+    }
+    t.check(reg(KIND_BACKEND, core::ptr::null()) == -22 && reg(99, &k2a::BE as *const _ as *const u8) == -22, "k2a: null table / bad kind = -22");
+    let before = registry::reg_count(owner);
+    t.check(reg(KIND_BACKEND, &k2a::BE as *const _ as *const u8) == 0 && gpu_kms::active(), "k2a: backend registered");
+    t.check(reg(KIND_BACKEND, &k2a::BE as *const _ as *const u8) == -17, "k2a: second backend = -17");
+    t.check(registry::reg_count(owner) == before + 1, "k2a: registration recorded once");
+    let mut seen = false;
+    registry::registrations(owner, &mut |k, _| if k == RegKind::KMS { seen = true });
+    t.check(seen, "k2a: KMS registration kind recorded");
+    let b = gpu_kms::backend().unwrap();
+    t.check(b.name == "ktest-kms" && (b.mode)() == (640, 480, 60) && b.modifiers == &[0, 0x1234], "k2a: backend name/mode/modifiers");
+    let rq = |h: u32, pitch: u32, m: Option<u64>| gpu_kms::KmsFbReq { handle: h, width: 1, height: 1, pitch, offset: 0, fourcc: 0, modifier: m };
+    t.check(matches!((b.fb_create)(&rq(1, 8, None), 1), Some(Ok(0x48))), "k2a: fb_create token");
+    t.check(matches!((b.fb_create)(&rq(1, 8, Some(0x1234)), 1), Some(Ok(77))), "k2a: fb_create modifier flattened");
+    t.check((b.fb_create)(&rq(99, 8, None), 1).is_none(), "k2a: fb_create NOT_MINE = None");
+    t.check(matches!((b.fb_create)(&rq(98, 8, None), 1), Some(Err(_))), "k2a: fb_create errno");
+    t.check((b.present)(5, 0, 0, None).is_ok(), "k2a: present without rects");
+    t.check((b.present)(5, 0, 0, Some(&[(0, 0, 10, 10), (1, 1, 40, 40)])).is_ok(), "k2a: present rects flattened");
+    k2a::HITS.store(0, Ordering::SeqCst);
+    (b.fb_destroy)(3); gpu_kms::console_restore();
+    t.check(k2a::HITS.load(Ordering::SeqCst) == 1003, "k2a: fb_destroy + console_restore forwarded");
+    t.check(gpu_kms::flip().is_none() && gpu_kms::cursor().is_none() && gpu_kms::pipe2().is_none(), "k2a: halves absent before registration");
+    t.check(reg(KIND_FLIP, &k2a::FL as *const _ as *const u8) == 0 && reg(KIND_FLIP, &k2a::FL as *const _ as *const u8) == -17, "k2a: flip once");
+    let f = gpu_kms::flip().unwrap();
+    t.check((f.queue)(1, 0, 0, 9).is_ok() && (f.queue)(2, 0, 0, 9).is_err() && (f.busy)() && (f.wait_idle)(7) && !(f.wait_idle)(8), "k2a: flip adapters");
+    k2a::HITS.store(0, Ordering::SeqCst);
+    (f.event)(5);
+    t.check(k2a::HITS.load(Ordering::SeqCst) == 5, "k2a: flip event");
+    t.check(reg(KIND_CURSOR, &k2a::CU as *const _ as *const u8) == 0, "k2a: cursor registered");
+    let c = gpu_kms::cursor().unwrap();
+    let src = gpu_kms::KmsCursorSrc { token: 3, phys: 0, pitch: 256, width: 64, height: 64 };
+    k2a::HITS.store(0, Ordering::SeqCst);
+    (c.move_to)(6, 0); (c.hide)();
+    t.check(c.size == 64 && (c.set)(&src, -4, 5) && !(c.set)(&src, 0, 0) && k2a::HITS.load(Ordering::SeqCst) == 100_006, "k2a: cursor adapters");
+    t.check(reg(KIND_OUTPUTS, &k2a::OU as *const _ as *const u8) == 0, "k2a: outputs registered");
+    let o = gpu_kms::outputs().unwrap();
+    let i0 = (o.info)(0).unwrap();
+    t.check((o.count)() == 2 && i0.conn_type == 11 && i0.connected && i0.nmodes == 1 && i0.modes[0].clock_khz == 148500 && i0.modes[0].h[3] == 2200 && i0.modes[0].flags == 5, "k2a: outputs info flattened");
+    t.check((o.cached)(1).is_none() && (o.info)(2).is_none() && (o.crtc_mask)(1) == 2, "k2a: outputs cached/none/mask");
+    t.check(reg(KIND_CURSOR2, &k2a::CU as *const _ as *const u8) == 0 && reg(KIND_PIPE2, &k2a::P2 as *const _ as *const u8) == 0, "k2a: pipe2 + its cursor registered");
+    let p = gpu_kms::pipe2().unwrap();
+    let tm = gpu_kms::KmsTiming { clock_khz: 148500, ..Default::default() };
+    t.check((p.modeset)(1, &tm).is_ok() && (p.modeset)(0, &tm).is_err() && (p.mode)() == Some((1920, 1080, 60)) && p.dumb_ok && p.name == "ktest-kms", "k2a: pipe2 adapters");
+    t.check(p.cursor.is_some() && (p.cursor.unwrap().set)(&src, -4, 5) && gpu_kms::extra_crtcs() == 1, "k2a: pipe2 cursor + extra crtcs");
+    exports::kapi_kms_set_internal_panel(true);
+    t.check(gpu_kms::internal_panel(), "k2a: set_internal_panel");
+    let mut st = [0u64; 3];
+    exports::kapi_ext_present_stats(st.as_mut_ptr());
+    t.check(true, "k2a: ext_present_stats callable");
+
+    // KDrmOps tail, resolved through the registration at use time
+    t.check(drivers::i915::proc_text().is_none() || cfg!(feature = "drv-i915"), "k2a: proc_text none before a module registers");
+    if !drivers::gpu_uapi::active() {
+        t.check(exports::kapi_drm_register(owner, &k2a::DRM, 0xC0DE) == 0, "k2a: drm table with tail registered");
+        let pin = drivers::drm_device_interface::BACKEND_MMAP_PIN.lock().unwrap();
+        t.check(pin(0x7000, 8192, 1).is_none() && pin(0x8000, 8192, 1) == Some(alloc::vec::Vec::new()), "k2a: mmap_pin NOT_MINE / refuse");
+        t.check(pin(0x10000, 8192, 1) == Some(alloc::vec![0x10000, 0x11000]), "k2a: mmap_pin frames");
+        if !cfg!(feature = "drv-i915") {
+            t.check(drivers::i915::proc_text().as_deref() == Some("i915: ktest\n"), "k2a: proc_text via registered table");
+            t.check(drivers::i915::prime_dedup(7) && !drivers::i915::prime_dedup(8), "k2a: prime_dedup");
+            k2a::HITS.store(0, Ordering::SeqCst);
+            drivers::i915::ptecheck_dmabuf_mmap(3, 0x1000, &[0xA000, 0xB000]);
+            drivers::i915::ptecheck_fd_to_handle(5, 6, None, 8);
+            t.check(k2a::HITS.load(Ordering::SeqCst) == (1 << 20) + (1 << 24), "k2a: ptecheck_* forwarded");
+        }
+    }
+    fn census() -> Option<[u64; 9]> { Some([1, 2, 3, 4, 5, 6, 7, 8, 9]) }
+    drivers::drm_class::set_tmpfs_census(census);
+    let mut cen = [0u64; 9];
+    t.check(exports::kapi_tmpfs_census(cen.as_mut_ptr()) && cen[8] == 9 && !exports::kapi_tmpfs_census(core::ptr::null_mut()), "k2a: tmpfs_census registered late is read at use time");
+}
+
+static KT_BL_DUTY: AtomicU32 = AtomicU32::new(0);
+extern "C" fn kt_bl_get(ctx: usize, duty: *mut u32, period: *mut u32) -> bool {
+    unsafe { *duty = KT_BL_DUTY.load(Ordering::SeqCst); *period = ctx as u32; }
+    true
+}
+extern "C" fn kt_bl_set(_ctx: usize, duty: u32) -> bool { KT_BL_DUTY.store(duty, Ordering::SeqCst); true }
+
+fn kmodkapi_k2b(t: &mut T) {
+    use crate::kmod::{exports, registry};
+    use kmod_abi::{KBootFb, KmodId, RegKind};
+    for n in ["kapi_boot_fb", "kapi_backlight_register", "kapi_page_ref_many", "kapi_page_free_pinned", "kapi_mem_info", "kapi_irq_save", "kapi_irq_restore"] {
+        t.check(exports::lookup(n).is_some(), "k2b export in KSYMTAB");
+    }
+    // boot framebuffer
+    t.check(!exports::kapi_boot_fb(core::ptr::null_mut()), "k2b: boot_fb null out = false");
+    let saved = { let mut f = KBootFb::default(); if exports::kapi_boot_fb(&mut f) { Some(f) } else { None } };
+    exports::set_boot_fb(0x1234_0000, 640, 480, 2560);
+    let mut f = KBootFb::default();
+    t.check(exports::kapi_boot_fb(&mut f) && f.phys == 0x1234_0000 && f.width == 640 && f.height == 480 && f.pitch == 2560, "k2b: boot_fb round trip");
+    if let Some(o) = saved { exports::set_boot_fb(o.phys, o.width, o.height, o.pitch); }
+
+    // backlight: per-owner records, withdrawn on failed init
+    let a = KmodId(60030);
+    let b = KmodId(60031);
+    t.check(exports::kapi_backlight_register(a, None, None, 0) == -22, "k2b: backlight without callbacks = -22");
+    let ctxa = 1000usize;
+    t.check(exports::kapi_backlight_register(a, Some(kt_bl_get), Some(kt_bl_set), ctxa) == 0, "k2b: backlight register ok");
+    t.check(exports::kapi_backlight_register(b, Some(kt_bl_get), Some(kt_bl_set), 2000) == 0, "k2b: second owner registers");
+    let mut seen = false;
+    registry::registrations(a, &mut |k, _| if k == RegKind::BACKLIGHT { seen = true });
+    t.check(seen, "k2b: backlight registration recorded for owner");
+    t.check(drivers::power_sysfs::bl_get().map_or(false, |(d, p)| d == 0 && (p == 1000 || p == 2000)), "k2b: bl_get answered by a module provider");
+    t.check(drivers::power_sysfs::bl_set(321) && KT_BL_DUTY.load(Ordering::SeqCst) == 321, "k2b: bl_set reaches the provider");
+    t.check(drivers::power_sysfs::bl_count(a.0 as u32) == 1 && drivers::power_sysfs::bl_count(b.0 as u32) == 1, "k2b: one record per owner");
+    t.check(registry::release_all(a) && drivers::power_sysfs::bl_count(a.0 as u32) == 0 && drivers::power_sysfs::bl_count(b.0 as u32) == 1, "k2b: failed init withdraws only its owner's provider");
+    registry::release_all(b);
+    t.check(drivers::power_sysfs::bl_count(b.0 as u32) == 0, "k2b: second owner withdrawn");
+
+    // page references
+    let p = exports::kapi_page_alloc(1, 0);
+    t.check(p != 0, "k2b: page_alloc order 1");
+    if p != 0 {
+        let p0 = p as usize;
+        let frames = [p0];
+        exports::kapi_page_ref_many(frames.as_ptr(), 1);
+        exports::kapi_page_ref_many(core::ptr::null(), 4);
+        t.check(mm::pageref::get(p0) == 2 && mm::pageref::get(p0 + 4096) == 1, "k2b: ref_many counts the listed frame only");
+        let free0 = mm::buddy::free_pages();
+        t.check(exports::kapi_page_free_pinned(p, 1), "k2b: free_pinned reports a still-held page");
+        t.check(mm::pageref::get(p0) == 1 && mm::buddy::free_pages() == free0 + 1, "k2b: free_pinned dropped our ref and freed the unheld page");
+        exports::kapi_page_free(p, 0);
+        t.check(mm::buddy::free_pages() == free0 + 2, "k2b: last holder frees the held page");
+    }
+    let q = exports::kapi_page_alloc(0, 0);
+    if q != 0 {
+        let fq = mm::buddy::free_pages();
+        t.check(!exports::kapi_page_free_pinned(q, 0) && mm::buddy::free_pages() == fq + 1, "k2b: free_pinned on an unshared block frees it whole");
+    }
+
+    // memory totals
+    let mut mi = [0u64; 3];
+    exports::kapi_mem_info(mi.as_mut_ptr());
+    t.check(mi[0] > 0 && mi[1] <= mi[0] && mi[2] == 4096, "k2b: mem_info totals sane");
+    exports::kapi_mem_info(core::ptr::null_mut());
+
+    // irq save/restore nests
+    let was = exports::kapi_irqs_masked();
+    let f1 = exports::kapi_irq_save();
+    let m1 = exports::kapi_irqs_masked();
+    let f2 = exports::kapi_irq_save();
+    exports::kapi_irq_restore(f2);
+    let m2 = exports::kapi_irqs_masked();
+    exports::kapi_irq_restore(f1);
+    t.check(m1 && m2 && exports::kapi_irqs_masked() == was, "k2b: irq_save masks, nested restore keeps mask, outer restore returns to the prior state");
 }

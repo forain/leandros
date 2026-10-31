@@ -135,6 +135,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     if crate::boot_cmdline().map_or(true, |c| !c.split_ascii_whitespace().any(|t| t == "pcie.rpi5=0")) {
         drivers::rp1::GEM_IRQ.store(crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "rp1.irq=1")),
             core::sync::atomic::Ordering::Relaxed);
+        drivers::rp1::GEM_DIRECT.store(crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "macb.attach=direct")),
+            core::sync::atomic::Ordering::Relaxed);
         drivers::brcmstb_pcie::configure(crate::boot_cmdline().unwrap_or(""));
         drivers::rp1_fan::configure(crate::boot_cmdline().unwrap_or(""));
         drivers::brcmstb_pcie::init();
@@ -295,6 +297,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // NVMe SSDs (read-only unless nvme.rw=1): registered before klog::init so
     // the bring-up diagnostics reach the stick's log partition.
     drivers::nvme::init(crate::boot_cmdline().unwrap_or(""));
+    crate::kmod::exports::set_boot_fb(boot_info.framebuffer_base, boot_info.framebuffer_width, boot_info.framebuffer_height, boot_info.framebuffer_pitch_bytes() as u32);
     drivers::i915::run(&drivers::i915::BootEnv { fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32 }); // Intel Gen9 GPU probe (+ `i915.*` bring-up)
     #[cfg(target_arch = "aarch64")] arch_aarch64::exception::SERROR_ERRREC.store(crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "serror.errrec=1")), core::sync::atomic::Ordering::Relaxed);
     // V3D probe (opt-in v3d.probe=1), bracketed by SError checkpoints: one before, so an
@@ -334,6 +337,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // HDMI audio binds late: PipeWire's first init ran before the HDMI probe, so retry once now.
     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] {
         drivers::hdmi_audio::set_serror_check(arch_aarch64::exception::serror_checkpoint);
+        drivers::hdmi_plat::announce();
         if !pipewire_server::is_initialized() {
             if let Ok(p) = pipewire_server::init(crate::boot_cmdline().unwrap_or("")) {
                 serial_print_str("[INIT] PipeWire server port (HDMI audio): ");
@@ -349,8 +353,13 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     #[cfg(all(feature = "nvidia", target_arch = "x86_64"))] nvidia_rm::init(&nvidia_rm::BootEnv { cmdline: crate::boot_cmdline().unwrap_or(""), fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32, log_flush: crate::klog::flush_now, rsdp_phys: boot_info.rsdp_addr }); // OpenRM; one line so the default kernel's panic line numbers (and bytes) stay unchanged
     // ── Network Stack ────────────────────────────────────────────────────────
     drivers::netdev::init(crate::boot_cmdline().unwrap_or(""));
+    // `plat.scan=0` (bisect knob): no DT compatible walk and no OF autoload hook.
+    if crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "plat.scan=0")) {
+        crate::serial_print_str("[plat] DT scan skipped (plat.scan=0)\n");
+    } else {
     drivers::platform::set_autoload(crate::kmod::autoload::of_hook);
     { let n = drivers::platform::scan_dt(); let (t, u) = drivers::platform::counts(); crate::serial_print_str(&alloc::format!("[plat] DT compatibles {} announced {} unclaimed {}\n", n, t, u)); }
+    }
     crate::kmod::autoload::boot(); // modules.load= / kmod=0
     net_server::init();
     sched::spawn(net_server::net_daemon, 0).map(|p| sched::set_comm(p, b"netd"));

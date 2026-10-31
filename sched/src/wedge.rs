@@ -268,6 +268,13 @@ fn cpu_into(o: &Out, cpu: usize) {
     o.s(" elr="); o.h(LAST_ELR[c].load(Relaxed)); o.s("]");
 }
 
+/// (last INTID, IRQ count, interrupted ELR) of `cpu`; INTID `u32::MAX` = none
+/// (also when the wedge probes are off).
+pub fn trail(cpu: usize) -> (u32, u64, u64) {
+    let c = cpu.min(MAX_CPUS - 1);
+    (LAST_IRQ[c].load(Relaxed), IRQ_N[c].load(Relaxed), LAST_ELR[c].load(Relaxed))
+}
+
 /// Extra fields for the watchdog's `[WDOG] cpuN took no timer tick` line.
 pub fn wdog_extra(cpu: usize) {
     if !enabled() { return; }
@@ -298,6 +305,22 @@ pub fn armed_banner(ncpu: usize) {
 /// Costs a counter increment per iteration and a clock read every 64 Ki.
 pub struct Spin { n: u32, t0: u64, told: bool }
 
+/// Set by kexec's stop-and-jump: a `fn()` every contended spin calls now and
+/// then, so a CPU spinning with IRQs masked still reaches the park page.
+/// 0 = none. It may never return.
+pub static PARK_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Call `PARK_HOOK` if set (kexec stop-and-jump). Cheap: one atomic load.
+#[inline]
+pub fn park_check() {
+    let h = PARK_HOOK.load(Relaxed);
+    if h != 0 {
+        // SAFETY: only ever set from a `fn()`.
+        let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(h) };
+        f();
+    }
+}
+
 /// Spinning this long on one lock is reported (once per wait).
 pub const SPIN_REPORT_MS: u64 = 2_000;
 
@@ -306,6 +329,14 @@ impl Spin {
     #[inline]
     pub fn tick(&mut self, what: &str) {
         self.n = self.n.wrapping_add(1);
+        if self.n & 0xFF == 0 {
+            let h = PARK_HOOK.load(Relaxed);
+            if h != 0 {
+                // SAFETY: only ever set from a `fn()`.
+                let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(h) };
+                f();
+            }
+        }
         if self.n & 0xFFFF != 0 || !enabled() || self.told { return; }
         let now = now_ms();
         if self.t0 == 0 { self.t0 = now.max(1); return; }

@@ -34,6 +34,11 @@ mod blk;
 mod input;
 mod wifi;
 mod drm;
+mod gfx;
+mod plat;
+mod dma40;
+mod rp1;
+mod pi5pins;
 
 pub use pci::*;
 pub use irq::*;
@@ -44,6 +49,11 @@ pub use blk::*;
 pub use input::*;
 pub use wifi::*;
 pub use drm::*;
+pub use gfx::*;
+pub use plat::*;
+pub use dma40::*;
+pub use rp1::*;
+pub use pi5pins::*;
 pub use v4l2::*;
 pub use usbfn::*;
 pub use hci::*;
@@ -158,7 +168,35 @@ const _: kmod_abi::input::sys_input::InputLedsFn = kapi_input_leds;
 const _: kmod_abi::input::sys_input::InputRepeatFn = kapi_input_repeat;
 const _: kmod_abi::input::sys_input::RelPointerReportFn = kapi_rel_pointer_report;
 const _: kmod_abi::input::sys_input::RelPointerAdvertiseFn = kapi_rel_pointer_advertise;
+const _: unsafe extern "C" fn(*mut kmod_abi::KBootFb) -> bool = kapi_boot_fb;
+const _: unsafe extern "C" fn(KmodId, Option<kmod_abi::KBlGetFn>, Option<kmod_abi::KBlSetFn>, usize) -> i32 = kapi_backlight_register;
+const _: unsafe extern "C" fn(*const usize, usize) = kapi_page_ref_many;
+const _: unsafe extern "C" fn(u64, u32) -> bool = kapi_page_free_pinned;
+const _: unsafe extern "C" fn(*mut u64) = kapi_mem_info;
+const _: unsafe extern "C" fn() -> u64 = kapi_irq_save;
+const _: unsafe extern "C" fn(u64) = kapi_irq_restore;
 const _: sys::V4l2UnregisterFn = kapi_v4l2_unregister;
+const _: kmod_abi::plat::sys_plat::PlatRegisterFn = kapi_plat_register;
+const _: kmod_abi::plat::sys_plat::PlatUnregisterFn = kapi_plat_unregister;
+const _: kmod_abi::plat::sys_plat::DtbBlobFn = kapi_dtb_blob;
+const _: kmod_abi::plat::sys_plat::BoardMacFn = kapi_board_mac;
+const _: kmod_abi::plat::sys_plat::SocSteppingFn = kapi_soc_stepping;
+const _: kmod_abi::plat::sys_plat::Pi5PinsFn = kapi_pi5_pins;
+const _: kmod_abi::plat::sys_plat::SerrorCheckpointFn = kapi_serror_checkpoint;
+const _: kmod_abi::plat::sys_plat::VmapFn = kapi_vmap;
+const _: kmod_abi::plat::sys_plat::VunmapFn = kapi_vunmap;
+const _: kmod_abi::plat::sys_plat::DmaQuiesceRegisterFn = kapi_dma_quiesce_register;
+const _: kmod_abi::plat::sys_dma40::Dma40ClaimFn = kapi_dma40_claim;
+const _: kmod_abi::plat::sys_dma40::Dma40ReleaseFn = kapi_dma40_release;
+const _: kmod_abi::plat::sys_dma40::Dma40StartCyclicFn = kapi_dma40_start_cyclic;
+const _: kmod_abi::plat::sys_dma40::Dma40StopFn = kapi_dma40_stop;
+const _: kmod_abi::plat::sys_dma40::Dma40PositionFn = kapi_dma40_position;
+const _: kmod_abi::plat::sys_dma40::Dma40PeriodsFn = kapi_dma40_periods;
+const _: kmod_abi::plat::sys_dma40::Dma40PollFn = kapi_dma40_poll;
+const _: kmod_abi::plat::sys_dma40::Dma40PolledFn = kapi_dma40_polled;
+const _: kmod_abi::plat::sys_dma40::HdmiSinkInfoFn = kapi_hdmi_sink_info;
+const _: kmod_abi::plat::sys_plat::Rp1IrqRequestFn = kapi_rp1_irq_request;
+const _: kmod_abi::plat::sys_plat::Rp1IrqFreeFn = kapi_rp1_irq_free;
 const _: () = {
     assert!(mm::kmodwin::BASE as u64 == kmod_abi::layout::BASE);
     assert!(mm::kmodwin::SIZE as u64 == kmod_abi::layout::SIZE);
@@ -166,7 +204,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 118;
+pub const NEXPORTS: usize = 151;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -211,6 +249,18 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_syncobj_in_fences", kapi_syncobj_in_fences),
     sym!("kapi_fence_irq_hint", kapi_fence_irq_hint),
     sym!("kapi_kms_event_complete", kapi_kms_event_complete),
+    sym!("kapi_kms_register", kapi_kms_register),
+    sym!("kapi_kms_set_internal_panel", kapi_kms_set_internal_panel),
+    sym!("kapi_drm_hotplug", kapi_drm_hotplug),
+    sym!("kapi_ext_present_stats", kapi_ext_present_stats),
+    sym!("kapi_tmpfs_census", kapi_tmpfs_census),
+    sym!("kapi_boot_fb", kapi_boot_fb),
+    sym!("kapi_backlight_register", kapi_backlight_register),
+    sym!("kapi_page_ref_many", kapi_page_ref_many),
+    sym!("kapi_page_free_pinned", kapi_page_free_pinned),
+    sym!("kapi_mem_info", kapi_mem_info),
+    sym!("kapi_irq_save", kapi_irq_save),
+    sym!("kapi_irq_restore", kapi_irq_restore),
     sym!("kapi_netdev_kick", kapi_netdev_kick),
     sym!("kapi_snd_register", kapi_snd_register),
     sym!("kapi_netdev_kick_from_irq", kapi_netdev_kick_from_irq),
@@ -289,6 +339,27 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_rel_pointer_advertise", kapi_rel_pointer_advertise),
     sym!("kapi_preempt_disabled", kapi_preempt_disabled),
     sym!("kapi_preempt_enable_no_resched", kapi_preempt_enable_no_resched),
+    sym!("kapi_plat_register", kapi_plat_register),
+    sym!("kapi_plat_unregister", kapi_plat_unregister),
+    sym!("kapi_dtb_blob", kapi_dtb_blob),
+    sym!("kapi_board_mac", kapi_board_mac),
+    sym!("kapi_soc_stepping", kapi_soc_stepping),
+    sym!("kapi_serror_checkpoint", kapi_serror_checkpoint),
+    sym!("kapi_vmap", kapi_vmap),
+    sym!("kapi_vunmap", kapi_vunmap),
+    sym!("kapi_dma_quiesce_register", kapi_dma_quiesce_register),
+    sym!("kapi_dma40_claim", kapi_dma40_claim),
+    sym!("kapi_dma40_release", kapi_dma40_release),
+    sym!("kapi_dma40_start_cyclic", kapi_dma40_start_cyclic),
+    sym!("kapi_dma40_stop", kapi_dma40_stop),
+    sym!("kapi_dma40_position", kapi_dma40_position),
+    sym!("kapi_dma40_periods", kapi_dma40_periods),
+    sym!("kapi_dma40_poll", kapi_dma40_poll),
+    sym!("kapi_dma40_polled", kapi_dma40_polled),
+    sym!("kapi_hdmi_sink_info", kapi_hdmi_sink_info),
+    sym!("kapi_rp1_irq_request", kapi_rp1_irq_request),
+    sym!("kapi_rp1_irq_free", kapi_rp1_irq_free),
+    sym!("kapi_pi5_pins", kapi_pi5_pins),
 ];
 
 extern "C" {

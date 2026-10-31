@@ -90,10 +90,22 @@ impl RegKind {
     pub const BLK: RegKind = RegKind(11);
     pub const INPUT: RegKind = RegKind(12);
     pub const DRM: RegKind = RegKind(13);
+    pub const KMS: RegKind = RegKind(14);
+    pub const PLAT: RegKind = RegKind(15);
+    pub const DMAQ: RegKind = RegKind(16);
+    pub const BACKLIGHT: RegKind = RegKind(17);
 }
 
 /// Device-id table entry (`.kmod.ids`), 16 bytes. PCI: a=vendor, b=device (0xffff = any).
 /// USB: a=vid, b=pid (0xffff = any), class = class<<16|sub<<8|proto under `class_mask`.
+/// Boot framebuffer description (`kapi_boot_fb`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KBootFb { pub phys: u64, pub width: u32, pub height: u32, pub pitch: u32, pub _pad: u32 }
+/// Backlight provider callbacks: `get(ctx, &mut duty, &mut period)` / `set(ctx, duty)`, true on success.
+pub type KBlGetFn = extern "C" fn(usize, *mut u32, *mut u32) -> bool;
+pub type KBlSetFn = extern "C" fn(usize, u32) -> bool;
+
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KmodDevId {
@@ -352,7 +364,9 @@ pub const BUS_SDIO: u16 = 5;
 pub mod alias;
 pub mod blk;
 pub mod input;
+pub mod plat;
 pub use blk::{KBlkDesc, KBlkOps};
+pub use plat::{KDmaQuiesceFn, KHdmiSink, KPlatDev, KPlatProbeFn, KPlatReg};
 
 /// Export-table entry; `name` is NUL-terminated.
 #[repr(C)]
@@ -496,6 +510,18 @@ pub mod sys {
         pub fn kapi_random_fill(buf: *mut u8, len: usize);
         pub fn kapi_wifi_register(owner: super::KmodId, ops: *const u8, ctx: usize, legacy: *const u8) -> i32;
         pub fn kapi_drm_register(owner: super::KmodId, ops: *const u8, ctx: usize) -> i32;
+        pub fn kapi_kms_register(owner: super::KmodId, kind: u32, ops: *const u8, ctx: usize) -> i32;
+        pub fn kapi_kms_set_internal_panel(v: bool);
+        pub fn kapi_boot_fb(out: *mut super::KBootFb) -> bool;
+        pub fn kapi_backlight_register(owner: super::KmodId, get: Option<super::KBlGetFn>, set: Option<super::KBlSetFn>, ctx: usize) -> i32;
+        pub fn kapi_page_ref_many(frames: *const usize, n: usize);
+        pub fn kapi_page_free_pinned(phys: u64, order: u32) -> bool;
+        pub fn kapi_mem_info(out: *mut u64);
+        pub fn kapi_irq_save() -> u64;
+        pub fn kapi_irq_restore(flags: u64);
+        pub fn kapi_drm_hotplug(minor: u8);
+        pub fn kapi_ext_present_stats(out: *mut u64);
+        pub fn kapi_tmpfs_census(out: *mut u64) -> bool;
         pub fn kapi_drm_offset_alloc(real: u64, size: u64) -> u64;
         pub fn kapi_drm_offset_release(real: u64);
         pub fn kapi_fence_wait(ids: *const u64, n: usize, deadline_ns: u64) -> i32;

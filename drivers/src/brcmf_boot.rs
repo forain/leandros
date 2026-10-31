@@ -109,6 +109,8 @@ fn now_ms() -> u64 { sched::monotonic_ns() / 1_000_000 }
 
 /// Kernel init, rpi5 only. Returns at once; the work runs on a kthread.
 pub fn start(cmdline: &str) {
+    // The quiesce hook is brcmf's own registration (phase WIFI); shutdown() answers None when sdio2 was never probed.
+    crate::kenv::pm::register_shutdown("brcmf", crate::kenv::pm::PHASE_WIFI, shutdown);
     if cmdline.split_ascii_whitespace().any(|t| t == "brcmf=0") {
         STATE.store(STATE_SKIPPED, Ordering::Release);
         log("skip (brcmf=0)");
@@ -121,7 +123,7 @@ pub fn start(cmdline: &str) {
     // Read the MAC now, while the boot DTB is certainly mapped.
     // Fallback: the board OTP's Ethernet MAC + 1 (bcm2712_otp), as the Pi firmware assigns it.
     let mac = unsafe { boot::device_tree::recorded_dtb() }.and_then(fdt_fmac_mac).map(|m| (m, "dtb"))
-        .or_else(|| crate::bcm2712_otp::wifi_mac().map(|m| (m, "otp")))
+        .or_else(|| crate::kenv::pi5::wifi_mac().map(|m| (m, "otp")))
         // After a kexec the DTB is synthetic (no Wi-Fi node); the Pi firmware's
         // smsc95xx.macaddr= survives on the reused command line.
         .or_else(|| crate::brcmf::cfg::mac_from_cmdline(cmdline));

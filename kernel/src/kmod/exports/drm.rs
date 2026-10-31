@@ -56,3 +56,37 @@ pub extern "C" fn kapi_fence_irq_hint() { drivers::drm_device_interface::gpu_fen
 /// A page flip / vblank event for `cookie` completed.
 #[no_mangle]
 pub extern "C" fn kapi_kms_event_complete(cookie: u32, seq: u32, ts_ns: u64) { drivers::drm_device_interface::ext_event_complete(cookie, seq, ts_ns) }
+
+/// Register one KMS table (`drivers::kms_class`): kind 0 backend, 1 flip, 2 cursor, 3 outputs, 4 pipe2, 5 pipe-B cursor.
+/// 0 ok, -22 bad kind/table, -17 already registered. Permanent: no unregister exists.
+#[no_mangle]
+pub extern "C" fn kapi_kms_register(owner: KmodId, kind: u32, ops: *const u8, ctx: usize) -> i32 {
+    let r = drivers::kms_class::register_raw(kind, ops, ctx);
+    if r == 0 { crate::kmod::registry::note_registration(owner, RegKind::KMS, ((kind as u64) << 32) | (ctx as u64 & 0xFFFF_FFFF)); }
+    r
+}
+
+/// Connector 1 reports eDP (the backend scans out an internal panel).
+#[no_mangle]
+pub extern "C" fn kapi_kms_set_internal_panel(v: bool) { drivers::gpu_kms::set_internal_panel(v) }
+
+/// HPD uevent for DRM card `minor`.
+#[no_mangle]
+pub extern "C" fn kapi_drm_hotplug(minor: u8) { evdev_server::hp_drm_change(minor) }
+
+/// `[presents, present_errors, vblank_time_ns?]` as `drm_device_interface::ext_present_stats` returns them.
+#[no_mangle]
+pub extern "C" fn kapi_ext_present_stats(out: *mut u64) {
+    if out.is_null() { return; }
+    let (a, b, c) = drivers::drm_device_interface::ext_present_stats();
+    unsafe { *out = a; *out.add(1) = b; *out.add(2) = c; }
+}
+
+/// The VFS tmpfs-pool census registered by servers/drm: 9 u64 into `out`. False = none.
+#[no_mangle]
+pub extern "C" fn kapi_tmpfs_census(out: *mut u64) -> bool {
+    match (out.is_null(), drivers::drm_class::tmpfs_census()) {
+        (false, Some(v)) => { for (i, x) in v.iter().enumerate() { unsafe { *out.add(i) = *x; } } true }
+        _ => false,
+    }
+}

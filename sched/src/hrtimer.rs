@@ -146,7 +146,7 @@ impl HrTimer {
         }
         while self.running.load(Ordering::Acquire) {
             if crate::irqctx::can_sleep() { crate::kthread::sleep_ns(100_000); }
-            else { core::hint::spin_loop(); }
+            else { mm::paging::tlb_service_pending(); core::hint::spin_loop(); }
         }
         was
     }

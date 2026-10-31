@@ -1,0 +1,23 @@
+[package]
+name = "kmod-hdmi-audio"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+# The shared driver source (drivers/src/hdmi_audio/mod.rs) is gated on these; the module is always
+# the Pi 5 one.
+[features]
+default = ["rpi5", "hdmi-audio"]
+rpi5 = []
+hdmi-audio = []
+
+[dependencies]
+kmod-rt = { path = "../../lib/kmod-rt" }
+kmod-kapi = { path = "../../lib/kmod-kapi" }
+kmod-abi = { path = "../../lib/kmod-abi" }
+leandros-lib = { path = "../../lib" }
+spin = { workspace = true }

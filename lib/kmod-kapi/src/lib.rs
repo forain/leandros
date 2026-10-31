@@ -13,6 +13,9 @@ pub fn set_owner(id: KmodId) { OWNER.store(id.0, Ordering::SeqCst); }
 pub fn owner() -> KmodId { KmodId(OWNER.load(Ordering::SeqCst)) }
 
 pub mod blk;
+pub mod ksync;
+pub mod plat;
+pub mod dma40;
 
 pub mod pci {
     use super::*;
@@ -271,12 +274,16 @@ pub mod mm {
         use super::*;
 
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-        pub enum CacheMode { Uncached }
+        pub enum CacheMode { Uncached, WriteCombining, WriteBack }
 
-        /// Uncached device mapping of `len` bytes at `phys` (the BAR-mapping mode of the Y build).
+        /// Device mapping of `len` bytes at `phys`. Uncached is the BAR mode of the Y build; the
+        /// other modes go through `kapi_ioremap` (0 uncached, 1 write-combining, 2 write-back).
         pub fn ioremap(phys: u64, len: usize, mode: CacheMode) -> Option<usize> {
-            let CacheMode::Uncached = mode;
-            match unsafe { sys::kapi_map_device(phys, len, KMAP_UC | KMAP_WRITABLE | KMAP_MMIO) } { 0 => None, v => Some(v) }
+            match mode {
+                CacheMode::Uncached => match unsafe { sys::kapi_map_device(phys, len, KMAP_UC | KMAP_WRITABLE | KMAP_MMIO) } { 0 => None, v => Some(v) },
+                CacheMode::WriteCombining => match unsafe { sys::kapi_ioremap(phys, len, 1) } { 0 => None, v => Some(v) },
+                CacheMode::WriteBack => match unsafe { sys::kapi_ioremap(phys, len, 2) } { 0 => None, v => Some(v) },
+            }
         }
     }
 
@@ -291,6 +298,18 @@ pub mod mm {
             match unsafe { sys::kapi_page_alloc(order as u32, limit as u64) } { 0 => None, p => Some(p as usize) }
         }
         pub fn free(addr: usize, order: usize) { unsafe { sys::kapi_page_free(addr as u64, order as u32) } }
+        pub fn total_pages() -> usize { info()[0] as usize }
+        pub fn free_pages() -> usize { info()[1] as usize }
+        /// `[total pages, free pages, page size]`.
+        pub fn info() -> [u64; 3] { let mut o = [0u64; 3]; unsafe { sys::kapi_mem_info(o.as_mut_ptr()) }; o }
+    }
+
+    pub mod pageref {
+        use super::*;
+        /// One more reference on each order-0 frame.
+        pub fn inc_many(frames: &[usize]) { unsafe { sys::kapi_page_ref_many(frames.as_ptr(), frames.len()) } }
+        /// Free a block that mmap pins may still hold; true when some page was still held.
+        pub fn free_block_pinned(phys: usize, order: usize) -> bool { unsafe { sys::kapi_page_free_pinned(phys as u64, order as u32) } }
     }
 }
 
@@ -537,6 +556,15 @@ pub mod drm {
     use super::{owner, sys};
     /// Register the table (valid for the life of the module). 0, -22 bad table, -17 backend already installed.
     pub fn register(ops: *const u8, ctx: usize) -> i32 { unsafe { sys::kapi_drm_register(owner(), ops, ctx) } }
+    /// KMS table kinds for `kms_register` (`drivers::kms_class::KIND_*`).
+    pub const KMS_BACKEND: u32 = 0; pub const KMS_FLIP: u32 = 1; pub const KMS_CURSOR: u32 = 2;
+    pub const KMS_OUTPUTS: u32 = 3; pub const KMS_PIPE2: u32 = 4; pub const KMS_CURSOR2: u32 = 5;
+    /// Register a KMS table of `kind` (valid for the life of the module). 0, -22 bad, -17 already registered.
+    pub fn kms_register(kind: u32, ops: *const u8, ctx: usize) -> i32 { unsafe { sys::kapi_kms_register(owner(), kind, ops, ctx) } }
+    pub fn kms_set_internal_panel(v: bool) { unsafe { sys::kapi_kms_set_internal_panel(v) } }
+    pub fn hotplug(minor: u8) { unsafe { sys::kapi_drm_hotplug(minor) } }
+    pub fn ext_present_stats() -> [u64; 3] { let mut o = [0u64; 3]; unsafe { sys::kapi_ext_present_stats(o.as_mut_ptr()) }; o }
+    pub fn tmpfs_census() -> Option<[u64; 9]> { let mut o = [0u64; 9]; if unsafe { sys::kapi_tmpfs_census(o.as_mut_ptr()) } { Some(o) } else { None } }
     pub fn offset_alloc(real: u64, size: u64) -> Option<u64> { match unsafe { sys::kapi_drm_offset_alloc(real, size) } { 0 => None, o => Some(o) } }
     pub fn offset_release(real: u64) { unsafe { sys::kapi_drm_offset_release(real) } }
     pub fn fence_wait(ids: &[u64], deadline_ns: u64) -> i32 { unsafe { sys::kapi_fence_wait(ids.as_ptr(), ids.len(), deadline_ns) } }
@@ -547,6 +575,20 @@ pub mod drm {
     }
     pub fn fence_irq_hint() { unsafe { sys::kapi_fence_irq_hint() } }
     pub fn kms_event_complete(cookie: u32, seq: u32, ts_ns: u64) { unsafe { sys::kapi_kms_event_complete(cookie, seq, ts_ns) } }
+}
+
+/// Boot framebuffer and backlight (K2b).
+pub mod gfx {
+    use super::*;
+    pub use kmod_abi::{KBlGetFn, KBlSetFn, KBootFb};
+    pub fn boot_fb() -> Option<KBootFb> {
+        let mut f = KBootFb::default();
+        if unsafe { sys::kapi_boot_fb(&mut f) } { Some(f) } else { None }
+    }
+    /// Register the panel backlight provider. 0, -22 no callbacks. Withdrawn if the module's init fails.
+    pub fn backlight_register(get: Option<KBlGetFn>, set: Option<KBlSetFn>, ctx: usize) -> i32 {
+        unsafe { sys::kapi_backlight_register(owner(), get, set, ctx) }
+    }
 }
 
 pub mod wifi {
