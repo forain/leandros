@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dualboot-free-test.sh [aarch64]  -- free-space dual-boot install (v1a) in QEMU.
+# dualboot-free-test.sh [aarch64|x86_64]  -- free-space dual-boot install (v1a) in QEMU.
 #
 #  1. clone the gap fixture (FX_GAP_GIB=24, make-dualboot-fixture.sh) as an NVMe
 #     target; boot the LeandrOS stick (write-usb.sh image) with it attached;
@@ -20,7 +20,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 ARCH="${1:-aarch64}"
-[ "$ARCH" = aarch64 ] || { echo "only aarch64 is wired here"; exit 2; }
+case "$ARCH" in aarch64|x86_64) ;; *) echo "usage: $0 [aarch64|x86_64]"; exit 2 ;; esac
 FXDIR="${FX_DIR:-$HOME/code/leandros-artifacts/dualboot}"
 WORK="$ROOT/target/dualboot-free-test-$ARCH"
 IMG="$WORK/disk.img"
@@ -29,7 +29,7 @@ PORT=$((2500 + $(printf '%s' "$RUN_ID" | cksum | cut -d' ' -f1) % 60))
 STATE="/tmp/leandros-$RUN_ID-ssh"
 export LEANDROS_REMOTE="qemu:$RUN_ID" MTOOLS_SKIP_CHECK=1
 REMOTE="python3 $ROOT/scripts/remote.py"
-BIN="${LEANDROS_INSTALL_BIN:-$ROOT/userland/leandros-install/target/aarch64-unknown-linux-musl/release/leandros-install}"
+BIN="${LEANDROS_INSTALL_BIN:-$ROOT/userland/leandros-install/target/$ARCH-unknown-linux-musl/release/leandros-install}"
 QPID=""
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }

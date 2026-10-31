@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dualboot-shrink-test.sh [aarch64]  -- dual-boot v1b session A (ext4 shrink) in QEMU.
+# dualboot-shrink-test.sh [aarch64|x86_64]  -- dual-boot v1b session A (ext4 shrink) in QEMU.
 #
 #  (a) shrink p2 of a fx-aarch64 clone (NVMe target of the LeandrOS stick) to 10 GiB;
 #      host: e2fsck -fn clean, manifest OK, GPT byte-identical, block count; the
@@ -16,7 +16,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 ARCH="${1:-aarch64}"
-[ "$ARCH" = aarch64 ] || { echo "only aarch64 is wired here"; exit 2; }
+case "$ARCH" in aarch64|x86_64) ;; *) echo "usage: $0 [aarch64|x86_64]"; exit 2 ;; esac
 FXDIR="${FX_DIR:-$HOME/code/leandros-artifacts/dualboot}"
 SRC="$FXDIR/fx-$ARCH.img"
 WORK="$ROOT/target/dualboot-shrink-test-$ARCH"
@@ -25,7 +25,7 @@ PORT=$((2500 + $(printf '%s' "$RUN_ID" | cksum | cut -d' ' -f1) % 60))
 STATE="/tmp/leandros-$RUN_ID-ssh"
 export LEANDROS_REMOTE="qemu:$RUN_ID" MTOOLS_SKIP_CHECK=1
 REMOTE="python3 $ROOT/scripts/remote.py"
-BIN="${LEANDROS_INSTALL_BIN:-$ROOT/userland/leandros-install/target/aarch64-unknown-linux-musl/release/leandros-install}"
+BIN="${LEANDROS_INSTALL_BIN:-$ROOT/userland/leandros-install/target/$ARCH-unknown-linux-musl/release/leandros-install}"
 CRASH_PCTS="${CRASH_PCTS:-10 40 75}"
 PHASES="${PHASES:-f c a b d}"   # subset, e.g. PHASES=b CRASH_PCTS=40
 phase() { case " $PHASES " in *" $1 "*) return 0;; esac; echo "-- phase $1 skipped (PHASES=$PHASES)"; return 1; }
@@ -38,7 +38,7 @@ cleanup() { [ -n "$QPID" ] && kill "$QPID" 2>/dev/null || true; rm -f "$STATE" "
 trap cleanup EXIT
 r() { $REMOTE run "$1" | tr -d '\r'; }
 LI=/tmp/leandros-install
-GUI_BIN="${GUI_BIN:-$HOME/code/leandros-artifacts/m6-session-bins/out/leandros-installer-aarch64}"
+GUI_BIN="${GUI_BIN:-$HOME/code/leandros-artifacts/m6-session-bins/out/leandros-installer-$ARCH}"
 P2=/dev/nvme0n1p2
 
 dfguard() { local g; g=$(df -g "$HOME" | awk 'NR==2{print $4}'); [ "$g" -ge 30 ] || fail "only ${g} GiB free on the host; stop"; }
@@ -325,6 +325,6 @@ done
 fi
 if phase d; then
 echo "== (d) installer-test"
-./scripts/installer-test.sh aarch64 virtio 2>&1 | tail -3
+./scripts/installer-test.sh "$ARCH" virtio 2>&1 | tail -3
 fi
 echo "PASS: dualboot-shrink-test $ARCH"

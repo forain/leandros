@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dualboot-sessb-test.sh [aarch64]  -- dual-boot v1b session B (finish after the ext4 shrink) in QEMU.
+# dualboot-sessb-test.sh [aarch64|x86_64]  -- dual-boot v1b session B (finish after the ext4 shrink) in QEMU.
 #
 # ONE fixture copy (fx-<arch>, cp -c) goes through the whole story:
 #   1. refusals before anything happened: no shrink session;
@@ -16,7 +16,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 ARCH="${1:-aarch64}"
-[ "$ARCH" = aarch64 ] || { echo "only aarch64 is wired here"; exit 2; }
+case "$ARCH" in aarch64|x86_64) ;; *) echo "usage: $0 [aarch64|x86_64]"; exit 2 ;; esac
 FXDIR="${FX_DIR:-$HOME/code/leandros-artifacts/dualboot}"
 SRC="$FXDIR/fx-$ARCH.img"
 WORK="$ROOT/target/dualboot-sessb-test-$ARCH"
@@ -26,8 +26,8 @@ PORT=$((2500 + $(printf '%s' "$RUN_ID" | cksum | cut -d' ' -f1) % 60))
 STATE="/tmp/leandros-$RUN_ID-ssh"
 export LEANDROS_REMOTE="qemu:$RUN_ID" MTOOLS_SKIP_CHECK=1
 REMOTE="python3 $ROOT/scripts/remote.py"
-BIN="${LEANDROS_INSTALL_BIN:-$ROOT/userland/leandros-install/target/aarch64-unknown-linux-musl/release/leandros-install}"
-GUI_BIN="${GUI_BIN:-$ROOT/ports/leandros-installer/target/aarch64-unknown-linux-musl/release/leandros-installer}"
+BIN="${LEANDROS_INSTALL_BIN:-$ROOT/userland/leandros-install/target/$ARCH-unknown-linux-musl/release/leandros-install}"
+GUI_BIN="${GUI_BIN:-$ROOT/ports/leandros-installer/target/$ARCH-unknown-linux-musl/release/leandros-installer}"
 LI=/tmp/leandros-install
 QPID=""
 fail() { echo "FAIL: $*" >&2; exit 1; }

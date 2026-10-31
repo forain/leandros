@@ -114,7 +114,8 @@ if [ "$MODE" = installed ]; then
   EC=$W/esp/loader/entries/leandros.conf
   [ -f $EC ] && { ok "loader/entries/leandros.conf"; sed 's/^/  | /' $EC; } || bad "loader entry leandros.conf"
   grep -q "^efi */EFI/leandros/$EN" $EC 2>/dev/null && grep -q '^title LeandrOS' $EC && grep -q '^sort-key zz-leandros' $EC && ok "entry fields" || bad "entry fields"
-  N=$(cd $W/esp && find . -type f | wc -l); N0=$(wc -l < $IMG.esp.sha256)
+  N=$(cd $W/esp && find . -type f ! -name NvVars | wc -l); N0=$(wc -l < $IMG.esp.sha256)
+  # NvVars (OVMF variable store, written when firmware boots the disk) is not counted
   [ "$N" = "$((N0 + 4))" ] && ok "ESP gained exactly 4 files" || bad "ESP file count $N (was $N0)"
   # The private boot partition.
   S4=$(field 4 "First sector" | cut -d' ' -f1); E4=$(field 4 "Last sector" | cut -d' ' -f1)

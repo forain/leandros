@@ -966,6 +966,20 @@ fn cmd_boot(o: &Opts) -> io::Result<()> {
 ///   /loader/entries/leandros.conf  systemd-boot entry, sorted after Linux
 ///   /EFI/leandros/.leandros-owned  marker
 /// Nothing else on the ESP is read for content, changed or deleted.
+/// `BLKWRWIN` over [start, start+len) (512-byte units) of the whole-disk node;
+/// the returned file keeps the window alive. None when the kernel refuses.
+fn wrwin_open(disk: &str, start: u64, len: u64) -> Option<std::fs::File> {
+    #[repr(C)]
+    struct WrWin { count: u32, flags: u32, r: [[u64; 2]; 16] }
+    const BLKWRWIN: libc::c_ulong = 0x4108_12F0;
+    let path = if disk.starts_with("/dev/") { disk.to_string() } else { format!("/dev/{}", disk) };
+    let f = std::fs::File::open(path).ok()?;
+    let mut w = WrWin { count: 1, flags: 0, r: [[0; 2]; 16] };
+    w.r[0] = [start, len];
+    use std::os::unix::io::AsRawFd;
+    (unsafe { libc::ioctl(f.as_raw_fd(), BLKWRWIN as _, &w as *const WrWin) } == 0).then_some(f)
+}
+
 fn cmd_repair_esp(o: &mut Opts) -> io::Result<()> {
     let boot_arg = take_opt(&mut o.args, "--boot").or_else(|| o.dev.clone());
     let esp_arg = take_opt(&mut o.args, "--esp");
@@ -1000,6 +1014,9 @@ fn cmd_repair_esp(o: &mut Opts) -> io::Result<()> {
         bin_src
     );
     let entry = format!("title LeandrOS\nefi /{}/{}\nsort-key zz-leandros\n", ESP_APP_DIR, conf::EFI_NAME);
+    // An NVMe disk is read-only unless blk.rw= lists the partition, and the ESP
+    // never is: open a BLKWRWIN window over just the ESP, held until we return.
+    let _win = parts.iter().find(|p| p.dev == esp_dev).and_then(|p| wrwin_open(&p.disk, p.start / 512, p.size / 512));
     let e = Esp::open(&esp_dev, true)?;
     // A foreign ESP is expected here: only the volume type matters.
     let bin_path = format!("{}/{}", ESP_APP_DIR, conf::EFI_NAME);

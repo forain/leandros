@@ -1,5 +1,5 @@
 #!/bin/bash
-# dualboot-esp-test.sh [aarch64]  -- espctl "shared" layout on the dual-boot fixture.
+# dualboot-esp-test.sh [aarch64|x86_64]  -- espctl "shared" layout on the dual-boot fixture.
 #
 # Builds a shared-layout disk from a cp -c copy of the fixture image
 # (~/code/leandros-artifacts/dualboot/fx-<arch>.img, sidecars kept next to it):
@@ -15,7 +15,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 ARCH="${1:-aarch64}"
-[ "$ARCH" = aarch64 ] || { echo "only aarch64 is wired here (x86_64: same flow, other firmware)"; exit 2; }
+case "$ARCH" in aarch64|x86_64) ;; *) echo "usage: $0 [aarch64|x86_64]"; exit 2 ;; esac
 FXDIR="${FX_DIR:-$HOME/code/leandros-artifacts/dualboot}"
 WORK="$ROOT/target/dualboot-esp-test-$ARCH"
 IMG="$WORK/disk.img"
@@ -24,7 +24,9 @@ PORT=$((2400 + $(printf '%s' "$RUN_ID" | cksum | cut -d' ' -f1) % 60))
 STATE="/tmp/leandros-$RUN_ID-ssh"
 export LEANDROS_REMOTE="qemu:$RUN_ID" MTOOLS_SKIP_CHECK=1
 REMOTE="python3 $ROOT/scripts/remote.py"
-EFI=BOOTAA64.EFI
+EFI=BOOTAA64.EFI; BUS=virtio; DEV=/dev/vda; PS=""
+# x86_64 mirrors the laptop: the target is an NVMe disk.
+[ "$ARCH" = x86_64 ] && { EFI=BOOTX64.EFI; BUS=nvme; DEV=/dev/nvme0n1; PS=p; }
 BOOTGUID=0E02ED9A-FEEE-4CAB-A22F-C861AD7DE307
 ROOTGUID=3F2D991B-D385-4FFF-9CF1-A0DB03062DE5
 HOMEGUID=F936DEE1-99D9-4BBC-8D2A-B7447DB9F650
@@ -37,7 +39,7 @@ trap cleanup EXIT
 boot_vm() {
     local log="$WORK/$1.log"
     echo "127.0.0.1 $PORT" > "$STATE"
-    LEANDROS_NET=user LEANDROS_SSH_PORT=$PORT "$ROOT/scripts/run-qemu.sh" "$ARCH" --uefi --no-gpu --boot-disk="$IMG,virtio" -display none \
+    LEANDROS_NET=user LEANDROS_SSH_PORT=$PORT "$ROOT/scripts/run-qemu.sh" "$ARCH" --uefi --no-gpu --boot-disk="$IMG,$BUS" -display none \
         > "$log" 2>&1 < /dev/null &
     QPID=$!
     local i
@@ -80,6 +82,12 @@ sgdisk -n 4:$A4:$E4 -t 4:$BOOTGUID -c 4:LeandrOS-boot -A 4:set:63 \
        -n 6:$A6:$E6 -t 6:$HOMEGUID -c 6:LeandrOS-home -A 6:set:63 "$IMG" >/dev/null
 pinfo() { sgdisk -i "$1" "$IMG" | sed -n "s/^$2: *//p" | head -1 | cut -d' ' -f1; }
 P4U=$(sgdisk -i 4 "$IMG" | sed -n 's/^Partition unique GUID: //p'); P5U=$(sgdisk -i 5 "$IMG" | sed -n 's/^Partition unique GUID: //p')
+P6U=$(sgdisk -i 6 "$IMG" | sed -n 's/^Partition unique GUID: //p')
+RW=""
+P1U=$(sgdisk -i 1 "$IMG" | sed -n 's/^Partition unique GUID: //p')
+# NVMe is read-only unless blk.rw= lists the partition; the ESP is listed so repair-esp can run from the installed system
+# (booted from the stick, which has no blk.rw=, espctl opens a BLKWRWIN window instead).
+[ "$BUS" = nvme ] && RW=" blk.rw=PARTUUID=$P4U,PARTUUID=$P5U,PARTUUID=$P6U,PARTUUID=$P1U"
 S4=$(pinfo 4 "First sector"); S5=$(pinfo 5 "First sector"); S6=$(pinfo 6 "First sector")
 python3 - "$ROOT_IMG" "$IMG" $((S5 * 512)) "$HOME_IMG" $((S6 * 512)) <<'PY'
 import os, sys
@@ -103,7 +111,7 @@ mmd -i "$P4" ::/EFI ::/EFI/BOOT ::/leandros
 mcopy -i "$P4" "$LIMINE" ::/EFI/BOOT/$EFI
 mcopy -i "$P4" "$KERNEL" ::/kernel.elf
 mcopy -i "$P4" "$INITRD" ::/initrd.gz
-printf 'timeout: 0\nserial: yes\nverbose: yes\n\n/LeandrOS\n\tprotocol: limine\n\tpath: boot():/kernel.elf\n\tmodule_path: boot():/initrd.gz\n\tmodule_cmdline: initrd\n\tcmdline: root=PARTUUID=%s\n\tKASLR: no\n' "$(echo "$P5U" | tr A-Z a-z)" > "$WORK/p4.conf"
+printf 'timeout: 0\nserial: yes\nverbose: yes\n\n/LeandrOS\n\tprotocol: limine\n\tpath: boot():/kernel.elf\n\tmodule_path: boot():/initrd.gz\n\tmodule_cmdline: initrd\n\tcmdline: root=PARTUUID=%s%s\n\tKASLR: no\n' "$(echo "$P5U" | tr A-Z a-z)" "$RW" > "$WORK/p4.conf"
 mcopy -i "$P4" "$WORK/p4.conf" ::/limine.conf
 printf 'leandros-boot %s\n' "$P4U" > "$WORK/owner"; mcopy -i "$P4" "$WORK/owner" ::/leandros/owner
 mcopy -i "$P4" "${LEANDROS_REMOTE_KEY:-$HOME/.ssh/leandros_remote}.pub" ::/leandros/authorized_keys
@@ -126,9 +134,9 @@ boot_vm boot1
 CMD=$(r 'cat /proc/cmdline'); echo "$CMD" | grep -qi "root=PARTUUID=$P5U" && ok "root from the private layout ($P5U)" || fail "cmdline: $CMD"
 ST=$(r 'espctl status'); echo "$ST" | head -4
 echo "$ST" | grep -q '^layout=shared' && ok "espctl: shared layout" || fail "espctl did not pick the shared layout"
-echo "$ST" | grep -q '^esp=/dev/vda4' && ok "espctl picked the boot partition, not the ESP" || fail "wrong device"
-r 'espctl --dev /dev/vda1 status 2>&1; true' | grep -qi 'shared ESP' && ok "espctl refuses the shared ESP" || fail "ESP not refused"
-r 'espctl --dev /dev/vda1 put /etc/hostname x.txt 2>&1; true' | grep -qi 'shared ESP' && ok "espctl refuses writes to the shared ESP" || fail "ESP write not refused"
+echo "$ST" | grep -q "^esp=${DEV}${PS}4" && ok "espctl picked the boot partition, not the ESP" || fail "wrong device"
+r "espctl --dev ${DEV}${PS}1 status 2>&1; true" | grep -qi 'shared ESP' && ok "espctl refuses the shared ESP" || fail "ESP not refused"
+r "espctl --dev ${DEV}${PS}1 put /etc/hostname x.txt 2>&1; true" | grep -qi 'shared ESP' && ok "espctl refuses writes to the shared ESP" || fail "ESP write not refused"
 
 echo "== trial -> reboot -> promote"
 $REMOTE push "$KERNEL" /tmp/k.elf >/dev/null; $REMOTE push "$INITRD" /tmp/i.cpio >/dev/null
@@ -154,7 +162,7 @@ mcopy -o -i "$ESP" "$WORK/entry.stale" ::/loader/entries/leandros.conf
 mdel -i "$ESP" ::/EFI/leandros/.leandros-owned
 boot_vm boot4
 r 'leandros-install repair-esp 2>&1' | tail -1
-r 'espctl --dev /dev/vda1 status 2>&1; true' | grep -qi 'shared ESP' && ok "marker restored (espctl refuses the ESP again)" || fail "marker not restored"
+r "espctl --dev ${DEV}${PS}1 status 2>&1; true" | grep -qi 'shared ESP' && ok "marker restored (espctl refuses the ESP again)" || fail "marker not restored"
 stop_vm
 mcopy -o -i "$ESP" "$WORK/loader.conf.orig" ::/loader/loader.conf
 mtype -i "$ESP" ::/EFI/leandros/limine.conf | cmp - "$WORK/esp.conf" && ok "repair-esp: chain conf recreated" || fail "chain conf differs"
@@ -164,7 +172,8 @@ mtype -i "$ESP" ::/EFI/leandros/.leandros-owned | cmp - "$WORK/esp.owner" && ok 
 echo "== untouched Linux + ESP"
 # Everything LeandrOS added on the ESP, then the original manifest must be a subset with equal hashes.
 esp_manifest > "$WORK/esp.after"
-grep -v ' ./EFI/leandros/\| ./loader/entries/leandros.conf' "$WORK/esp.after" | diff -q - "$WORK/esp.before" >/dev/null \
+# ./NvVars is OVMF's own variable store (x86_64 firmware without pflash vars saves it onto the first ESP it boots from).
+grep -v ' ./EFI/leandros/\| ./loader/entries/leandros.conf\| ./NvVars$' "$WORK/esp.after" | diff -q - "$WORK/esp.before" >/dev/null \
     && ok "non-LeandrOS ESP files byte-identical (incl. loader.conf, systemd-boot)" || fail "ESP file manifest changed"
 "$ROOT/scripts/check-dualboot-fixture.sh" "$IMG" | sed -n '/ext4\|e2fsck\|sha256\|ESP\|fsck/p' | head -20 || true  # informational: pristine mode flags the added p4-p6 by design
 echo "DONE"
