@@ -77,7 +77,7 @@ PY
     local i; for i in $(seq 1 30); do kill -0 "$QPID" 2>/dev/null || { QPID=""; return 0; }; sleep 1; done
     kill -9 "$QPID" 2>/dev/null || true; QPID=""
 }
-boot_stick() { boot_vm "$1" --usb-stick=gpt --install-target="$DISK,nvme"; [ -f "$BIN" ] && { $REMOTE push "$BIN" $LI >/dev/null; r "chmod +x $LI"; }; return 0; }
+boot_stick() { LEANDROS_USB_IMAGE="$STICK" boot_vm "$1" --usb-stick=gpt --install-target="$DISK,nvme"; [ -f "$BIN" ] && { $REMOTE push "$BIN" $LI >/dev/null; r "chmod +x $LI"; }; return 0; }
 
 gpt_sig() { { dd if="$1" bs=512 count=34 2>/dev/null; dd if="$1" bs=512 skip=$((51539607552 / 512 - 33)) 2>/dev/null; } | shasum -a 256 | cut -c1-64; }
 p2_compare() { # $1 pre-image, $2 candidate: number of differing 1 MiB chunks of p2
@@ -134,7 +134,7 @@ stop_vm
 echo "== (a) shrink to 10 GiB"
 fresh_disk; fresh_stick
 boot_stick shrink
-r "$LI shrink --part $P2 --to 10G --dry-run --json" > "$WORK/dry.log"
+r "$LI shrink --part $P2 --to 10G --dry-run --json; true" > "$WORK/dry.log"
 grep -q '"ev":"done","dry_run":true' "$WORK/dry.log" && ok "dry run" || { tail -3 "$WORK/dry.log"; fail "dry run"; }
 grep '"ev":"shrink_info"' "$WORK/dry.log" | head -1 | cut -c1-220
 r "$LI shrink-status --json" | grep -q '"state":"none"' && ok "status none before"
@@ -142,7 +142,8 @@ r "$LI shrink --part $P2 --to 10G --yes --json; true" > "$WORK/shrink.log"
 grep -q '"ev":"done","part"' "$WORK/shrink.log" || { tail -5 "$WORK/shrink.log"; fail "shrink did not finish"; }
 for s in backup rehearse hash fsck resize verify; do grep -q "\"name\":\"$s\",\"pct\":100" "$WORK/shrink.log" || fail "step $s did not finish"; done
 ok "all steps finished; $(grep -c '"name":"resize"' "$WORK/shrink.log") resize progress events"
-r "$LI shrink-status --json" | grep -q '"state":"boot_linux"' && ok "status boot_linux" || fail "status after shrink"
+ST=$(r "$LI shrink-status --json; true")
+echo "$ST" | grep -q '"state":"boot_linux"' && ok "status boot_linux" || { echo "$ST" | tail -3; fail "status after shrink"; }
 BK=$(r "cat /home/dualboot-backup/shrink-latest")
 r "ls -l $BK | cut -c1-90; cd $BK && sha256sum -c SHA256SUMS | tail -3" | tail -14
 stop_vm
