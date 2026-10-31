@@ -177,9 +177,9 @@ for PCT in $CRASH_PCTS; do
     [ -n "$got" ] && [ "$got" -ge "$PCT" ] || fail "resize never reached ${PCT}%"
     qmp_quit; ok "QEMU quit at resize ${got}%"
     boot_stick "recover$PCT"
-    r "$LI shrink-status --json" | tee "$WORK/status$PCT.log" | grep -q '"state":"interrupted"' && ok "status: interrupted" || { cat "$WORK/status$PCT.log"; fail "status after crash"; }
-    r "$LI shrink --recover --yes --json; true" > "$WORK/recover$PCT.log"
-    grep -q '"recovered":true' "$WORK/recover$PCT.log" || { tail -4 "$WORK/recover$PCT.log"; fail "recover at ${PCT}%"; }
+    r "$LI shrink-status --json" | tee "$WORK/statout$PCT.log" | grep -q '"state":"interrupted"' && ok "status: interrupted" || { cat "$WORK/statout$PCT.log"; fail "status after crash"; }
+    r "$LI shrink --recover --yes --json; true" > "$WORK/recout$PCT.log"
+    grep -q '"recovered":true' "$WORK/recout$PCT.log" || { tail -4 "$WORK/recout$PCT.log"; fail "recover at ${PCT}%"; }
     ok "recovered"
     stop_vm
     "$ROOT/scripts/check-dualboot-fixture.sh" "$DISK" | tee "$WORK/check-crash$PCT.log" | grep -E "^(FAIL|RESULT)"
