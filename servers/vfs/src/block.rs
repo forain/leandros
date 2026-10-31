@@ -1051,6 +1051,8 @@ pub fn sysfs_dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_MAX])
 // ── ioctls ───────────────────────────────────────────────────────────────────
 
 // Block-layer ioctls (asm-generic, `_IO(0x12, n)`).
+/// `BLKISBOOTFAT` = `_IOR(0x12, 0xF1, int)`: 1 on the Pi boot-FAT device (MBR p1), else 0.
+const BLKISBOOTFAT: usize = 0x8004_12F1;
 const BLKROSET: usize = 0x125D;
 const BLKROGET: usize = 0x125E;
 const BLKRRPART: usize = 0x125F;
@@ -1099,6 +1101,10 @@ pub fn ioctl(pid: u32, ofd_id: u32, dev: u16, cmd: usize, arg: usize) -> isize {
         if d >= MAX_BDEV || !b[d].in_use { return -6; }
         (b[d].backing, b[d].size, b[d].lbs, b[d].ro)
     };
+    if cmd == BLKISBOOTFAT {
+        let sp = { let b = BDEVS.lock(); b[dev as usize].special };
+        return put_user(arg, sp as i32);
+    }
 
     match cmd {
         BLKGETSIZE64 => {

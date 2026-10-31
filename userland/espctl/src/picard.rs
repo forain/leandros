@@ -1114,3 +1114,15 @@ pub fn status<D: Disk>(f: &mut Fat<D>, sys: &dyn Sys) -> R<String> {
 #[cfg(test)]
 #[path = "picard_tests.rs"]
 mod tests;
+
+/// Every `pi` verb except `status` writes (or plans writes): refuse unless the
+/// kernel confirmed (BLKISBOOTFAT) that the opened device is the boot-FAT one.
+pub fn write_guard(sub: &str, dev: &str, boot_fat: bool) -> std::io::Result<()> {
+    if sub == "status" || boot_fat {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("espctl pi {}: refusing, {} is not the boot-FAT device (kernel BLKISBOOTFAT != 1)", sub, dev),
+    ))
+}

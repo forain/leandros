@@ -9,6 +9,7 @@ use std::os::unix::io::AsRawFd;
 const VDC: &str = "/dev/vdc";
 const BLKWRWIN: libc::c_ulong = 0x4108_12F0;
 const BLKFLSBUF: libc::c_ulong = 0x1261;
+const BLKISBOOTFAT: libc::c_ulong = 0x8004_12F1;
 const MAGIC1: libc::c_long = 0xfee1_dead_u32 as libc::c_long;
 const MAGIC2: libc::c_long = 672274793;
 const CMD_RESTART: libc::c_long = 0x0123_4567;
@@ -22,6 +23,14 @@ pub struct Vdc {
     rd: File,
     wr: Option<File>,
 }
+/// True only when the kernel says `path` is the Pi boot-FAT device (BLKISBOOTFAT == 1).
+/// Any failure (old kernel, not a block device) counts as "no".
+pub fn is_boot_fat(path: &str) -> bool {
+    let Ok(f) = File::open(path) else { return false };
+    let mut v: i32 = 0;
+    unsafe { libc::ioctl(f.as_raw_fd(), BLKISBOOTFAT as _, &mut v as *mut i32) == 0 && v == 1 }
+}
+
 impl Vdc {
     pub fn open(path: &str) -> io::Result<Vdc> {
         Ok(Vdc { path: path.into(), rd: File::open(path)?, wr: None })
@@ -132,11 +141,17 @@ pub fn run(mut a: Vec<String>, dev: Option<String>) -> io::Result<()> {
     let sub = a.remove(0);
     let dry = flag(&mut a, "--dry-run");
     let dev = dev.unwrap_or_else(|| VDC.to_string());
+    let bf = is_boot_fat(&dev);
+    if !matches!(sub.as_str(), "status" | "setup" | "stage" | "try" | "commit" | "abort" | "rollback") {
+        println!("{}", USAGE);
+        return Ok(());
+    }
+    write_guard(&sub, &dev, bf)?;
     let mut f = Fat::open(Vdc::open(&dev)?)?;
     f.dry = dry;
     let sys = Real;
     let out = match sub.as_str() {
-        "status" => status(&mut f, &sys)?,
+        "status" => format!("{}\nboot-FAT device: {}", status(&mut f, &sys)?, if bf { "yes" } else { "NO (writes refused)" }),
         "setup" => {
             let ksz = opt(&mut a, "--kernel-size").and_then(|v| v.parse().ok()).unwrap_or(DEF_KERNEL);
             let isz = opt(&mut a, "--initrd-size").and_then(|v| v.parse().ok()).unwrap_or(DEF_INITRD);
@@ -171,3 +186,4 @@ pub fn run(mut a: Vec<String>, dev: Option<String>) -> io::Result<()> {
     println!("{}{}", out, if dry && sub != "stage" { "  [dry-run]" } else { "" });
     Ok(())
 }
+

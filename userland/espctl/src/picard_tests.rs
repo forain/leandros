@@ -515,3 +515,12 @@ fn root_in_fresh_sector_is_accepted() {
     c.fsck("setup fresh-sector");
     assert!(fw(&c.img, true).is_ok());
 }
+
+#[test]
+fn guard_refuses_writes_off_bootfat() {
+    for v in ["setup", "stage", "try", "commit", "abort", "rollback"] {
+        assert!(write_guard(v, "/dev/vdc", false).is_err());
+        assert!(write_guard(v, "/dev/vdc", true).is_ok());
+    }
+    assert!(write_guard("status", "/dev/vdc", false).is_ok());
+}

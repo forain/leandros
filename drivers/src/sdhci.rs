@@ -1330,15 +1330,26 @@ unsafe fn find_f2fs_partition(dev: &SdhciDevice) -> Option<u64> {
 /// `(offset, length)` in 4096-byte blocks (length rounded down).
 #[cfg(feature = "rpi5")]
 unsafe fn find_boot_partition(dev: &SdhciDevice) -> Option<(u64, u64)> {
+    use alloc::format;
+    let serial = crate::kenv::pci::serial_debug;
+    // `dev` already carries the f2fs partition offset: read the MBR through
+    // a raw copy (offset 0, no limit), as find_f2fs_partition does.
+    let raw = SdhciDevice { base: dev.base, high_capacity: dev.high_capacity, partition_offset: 0, limit_blocks: 0, boot_fat: false };
     let mut mbr = [0u8; BLOCK_SIZE];
-    if !dev.do_io(false, 0, mbr.as_mut_ptr()) { return None; }
-    if mbr[510] != 0x55 || mbr[511] != 0xAA { return None; }
+    if !raw.do_io(false, 0, mbr.as_mut_ptr()) { serial("[sdhci] boot FAT (MBR p1) not exposed: MBR read failed\n"); return None; }
+    if mbr[510] != 0x55 || mbr[511] != 0xAA { serial("[sdhci] boot FAT (MBR p1) not exposed: no 55AA signature\n"); return None; }
     let e = &mbr[446..462];
-    if e[4] != 0x0b && e[4] != 0x0c { return None; }
+    if e[4] != 0x0b && e[4] != 0x0c {
+        serial(&format!("[sdhci] boot FAT (MBR p1) not exposed: type 0x{:02x}\n", e[4]));
+        return None;
+    }
     let lba = u32::from_le_bytes(e[8..12].try_into().unwrap()) as u64;
     let len = u32::from_le_bytes(e[12..16].try_into().unwrap()) as u64;
     let spb = SECTORS_PER_BLOCK as u64;
-    if lba % spb != 0 || len < spb { return None; }
+    if lba % spb != 0 || len < spb {
+        serial(&format!("[sdhci] boot FAT (MBR p1) not exposed: unaligned lba {} len {}\n", lba, len));
+        return None;
+    }
     Some((lba / spb, len / spb))
 }
 
