@@ -231,11 +231,42 @@ fn enter_idmap(target: u64, a: [u64; 5]) -> ! {
     }
 }
 
+fn park_hook() { arch_aarch64::exception::divert() }
+
+/// `kexec.test_straggler=<cpu>` guard: CPU `<cpu>` is the CPU a stuck lock
+/// would hold. Its first IRQ-divert sends it into a masked `uart::getc` loop
+/// while the RX lock is held forever (the Pi 5 failure); it must still park.
+static STRAGGLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+static STRAGGLER_IN: AtomicBool = AtomicBool::new(false);
+
+fn straggler_entry() -> ! {
+    unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)); }
+    let me = unsafe { arch_aarch64::smp::arch_cpu_id() };
+    if me == STRAGGLER.load(Ordering::Relaxed) && !STRAGGLER_IN.swap(true, Ordering::AcqRel) {
+        log("[KEXEC] test: straggler spinning in uart::getc with IRQs masked\n");
+        // From now on a divert is the normal park.
+        arch_aarch64::exception::IRQ_DIVERT.store(on_ipi as fn() -> ! as usize, Ordering::Release);
+        loop { let _ = unsafe { arch_aarch64::uart::getc() }; core::hint::spin_loop(); }
+    }
+    on_ipi()
+}
+
+fn test_straggler() -> Option<usize> {
+    crate::boot_cmdline()?.split_ascii_whitespace()
+        .filter_map(|t| t.strip_prefix("kexec.test_straggler=")).last()?.parse().ok()
+}
+
 /// Interrupts masked, devices quiesced, `prepare` done. Never returns.
 pub fn stop_and_jump() -> ! {
     unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)); }
     ARMED.store(true, Ordering::Release);
-    arch_aarch64::exception::IRQ_DIVERT.store(on_ipi as fn() -> ! as usize, Ordering::Release);
+    let strag = test_straggler().filter(|&c| c != 0 && c < arch_aarch64::smp::assigned());
+    if let Some(c) = strag {
+        STRAGGLER.store(c, Ordering::Release);
+        arch_aarch64::uart::test_leak_rx_lock();
+    }
+    let divert: fn() -> ! = if strag.is_some() { straggler_entry } else { on_ipi };
+    arch_aarch64::exception::IRQ_DIVERT.store(divert as usize, Ordering::Release);
     unsafe { core::arch::asm!("dsb ish", options(nostack)); }
     let me = unsafe { arch_aarch64::smp::arch_cpu_id() };
     let n = arch_aarch64::smp::assigned();
@@ -247,6 +278,8 @@ pub fn stop_and_jump() -> ! {
     for i in 0..n {
         if i != me { arch_aarch64::gic::send_sgi(i, arch_aarch64::gic::SGI_RESCHED); }
     }
+    // Contended spins on masked CPUs also park (see `wedge::Spin::tick`).
+    sched::wedge::PARK_HOOK.store(park_hook as fn() as usize, Ordering::Release);
     if me == 0 { final_cpu0() }
     park_off()
 }
@@ -267,9 +300,11 @@ fn final_cpu0() -> ! {
     let p = unsafe { core::ptr::addr_of!(PLAN).read() };
     // Every other CPU first reports that it runs from the park page with its
     // caches flushed: nothing it does after that touches old-kernel memory.
+    let mut stuck: Option<usize> = None;
     for i in 1..n {
         let w = mm::phys_to_virt((p.park + super::info::AP_ARRIVED_OFF) as usize + 8 * i) as *const u64;
         let t0 = arch_aarch64::timer::monotonic_ns();
+        let mut resent = t0;
         let arrived = || unsafe {
             core::arch::asm!("dc civac, {}", "dsb sy", in(reg) w as usize, options(nostack));
             w.read_volatile() != 0
@@ -278,12 +313,43 @@ fn final_cpu0() -> ! {
         while !ok && arch_aarch64::timer::monotonic_ns().wrapping_sub(t0) < 2_000_000_000 {
             core::hint::spin_loop();
             ok = arrived();
+            // A SGI that landed in a window where the CPU could not take it
+            // (or was lost) is sent again.
+            let now = arch_aarch64::timer::monotonic_ns();
+            if !ok && now.wrapping_sub(resent) >= 100_000_000 {
+                resent = now;
+                arch_aarch64::gic::send_sgi(i, arch_aarch64::gic::SGI_RESCHED);
+            }
         }
         if !ok {
             log("[KEXEC] cpu");
             dec(i as u64);
-            log(" never reached the park page; jumping anyway\n");
+            log(" never reached the park page; irq#");
+            let (id, cnt, elr) = sched::wedge::trail(i);
+            if id == u32::MAX { log("-"); } else { dec(id as u64); }
+            log(" n=");
+            dec(cnt);
+            log(" elr=");
+            hex(elr);
+            log(" uart_rx_lock_held=");
+            log(if arch_aarch64::uart::rx_lock_held() { "1" } else { "0" });
+            log("\n");
+            stuck = Some(i);
         }
+    }
+    if let Some(i) = stuck {
+        // Entering the purgatory now would overwrite the kernel under a CPU
+        // that is still running it. Reset instead.
+        log("[KEXEC] cpu");
+        dec(i as u64);
+        log(" still in the old kernel; aborting kexec, system reset\n");
+        #[cfg(feature = "rpi5")]
+        {
+            drivers::rpi_pm::wdt_kick_nolock(1);
+        }
+        #[cfg(not(feature = "rpi5"))]
+        unsafe { arch_aarch64::power::system_reset(); }
+        loop { unsafe { core::arch::asm!("wfe", options(nomem, nostack)); } }
     }
     // Bus-stage hooks (pcie-perst + bridge reset) only now: every other CPU
     // is on the park page, so none can be mid-access to RP1 when the bridge
