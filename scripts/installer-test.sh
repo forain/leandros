@@ -81,6 +81,11 @@ if [ -n "${LEANDROS_INSTALL_BIN:-}" ]; then
     $REMOTE push "$LEANDROS_INSTALL_BIN" /tmp/leandros-install >/dev/null
     $REMOTE run 'chmod +x /tmp/leandros-install && cp /tmp/leandros-install /usr/sbin/leandros-install && sync' >/dev/null
 fi
+if [ -n "${GUI_BIN:-}" ]; then
+    # Likewise for the installer GUI binary.
+    $REMOTE push "$GUI_BIN" /tmp/leandros-installer >/dev/null
+    $REMOTE run 'chmod +x /tmp/leandros-installer && cp /tmp/leandros-installer /bin/leandros-installer && sync' >/dev/null
+fi
 $REMOTE run 'leandros-install list --json' > "$WORK/list.json"
 python3 - "$WORK/list.json" "${TARGET_DEV#/dev/}" <<'PY' || fail "list --json"
 import json, sys
