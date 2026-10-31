@@ -6,7 +6,7 @@
 //! the fixed virtio-style naming the SD driver already mirrors (the card is
 //! index 1, i.e. `vdb` — see `sdhci::init`).
 
-pub use crate::sdhci::{device_count, flush, has_f2fs, info, init};
+pub use crate::sdhci::{device_count, flush, has_f2fs, info, init, read_only};
 
 const SD_BLOCK: usize = 4096;
 /// SD I/O lights the Pi 5 ACT LED (DTB `led-act` trigger `mmc0`).
@@ -60,10 +60,10 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
         parent: None,
         pno: 0,
         start_bytes: 0,
-        bytes: info(idx).map_or(0, |i| i.total_blocks * 4096),
+        bytes: info(idx).map_or(0, |i| i.total_blocks * 4096), // 0 = unknown (f2fs card)
         sector_size: 512,
         removable: false,
-        read_only: false,
+        read_only: read_only(idx),
         gone: false,
         class: "vd",
         ordinal: idx as u16,
@@ -119,8 +119,6 @@ pub fn raw_geometry(_idx: usize) -> Option<(u32, u64)> { None }
 pub fn raw_read(_idx: usize, _byte_off: u64, _buf: &mut [u8]) -> bool { false }
 pub fn raw_write(_idx: usize, _byte_off: u64, _buf: &[u8], _panic_path: bool) -> bool { false }
 pub fn raw_flush(_idx: usize) -> bool { false }
-/// The SD card is never read-only here.
-pub fn read_only(_idx: usize) -> bool { false }
 /// The SD card is fixed and USB disks never register on this build, so
 /// there is nothing to unplug.
 pub fn remove_disk(_idx: usize) -> usize { 0 }

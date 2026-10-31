@@ -33,6 +33,9 @@ use leandros_libc::syscall::{nr, syscall0, syscall3, syscall4};
 const LINUX_REBOOT_MAGIC1: usize = 0xfee1_dead;
 const LINUX_REBOOT_MAGIC2: usize = 672_274_793;
 const LINUX_REBOOT_CMD_RESTART: usize = 0x0123_4567;
+const LINUX_REBOOT_CMD_RESTART2: usize = 0xA1B2_C3D4;
+const LEANDROS_REBOOT_CMD_TRYBOOT_HOLD: usize = 0x5442_4844;
+const LEANDROS_REBOOT_CMD_TRYBOOT_CONFIRM: usize = 0x5442_4F4B;
 const LINUX_REBOOT_CMD_HALT: usize = 0xCDEF_0123;
 const LINUX_REBOOT_CMD_POWER_OFF: usize = 0x4321_FEDC;
 
@@ -67,7 +70,9 @@ fn errno_name(e: isize) -> &'static [u8] {
     match -e {
         1 => b"Operation not permitted",
         2 => b"No such file or directory",
+        5 => b"Input/output error (firmware mailbox)",
         13 => b"Permission denied",
+        95 => b"Operation not supported (not a Pi 5 build)",
         22 => b"Invalid argument",
         111 => b"Connection refused",
         _ => b"error",
@@ -159,9 +164,20 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
         _ => Action::PowerOff,
     };
     let mut force = false;
+    let mut tryboot = false;
+    let mut commit = false;
+    let mut hold = 0u8;
     for i in first..argc as isize {
         match cstr(*argv.offset(i)) {
             b"-f" | b"--force" | b"-ff" => force = true,
+            // `reboot tryboot`: firmware tryboot reset (Pi 5). Direct, no init.
+            b"tryboot" | b"--tryboot" => { tryboot = true; action = Action::Reboot; }
+            // `reboot tryboot-commit`: cancel the trial-boot deadline.
+            b"tryboot-commit" | b"--tryboot-commit" => commit = true,
+            // `reboot tryboot-hold` / `tryboot-release`: pause the deadline
+            // (300 s lease) while a commit writes the boot FAT.
+            b"tryboot-hold" | b"--tryboot-hold" => hold = 1,
+            b"tryboot-release" | b"--tryboot-release" => hold = 2,
             b"-p" | b"--poweroff" => action = Action::PowerOff,
             b"--reboot" => action = Action::Reboot,
             b"--halt" => action = Action::Halt,
@@ -181,6 +197,32 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
         }
     }
 
+    if hold != 0 {
+        let r = syscall4(nr::REBOOT, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LEANDROS_REBOOT_CMD_TRYBOOT_HOLD, (hold == 1) as usize);
+        return if r < 0 { 1 } else { 0 };
+    }
+    if commit {
+        let r = syscall4(nr::REBOOT, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LEANDROS_REBOOT_CMD_TRYBOOT_CONFIRM, 0);
+        if r < 0 {
+            out(STDERR_FILENO, base);
+            out(STDERR_FILENO, b": reboot(2): ");
+            out(STDERR_FILENO, errno_name(r));
+            out(STDERR_FILENO, b"\n");
+            return 1;
+        }
+        return 0;
+    }
+    if tryboot {
+        // Straight to reboot(2): init's orderly path cannot carry the argument.
+        syscall0(nr::SYNC);
+        let arg = b"0 tryboot\0";
+        let r = syscall4(nr::REBOOT, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART2, arg.as_ptr() as usize);
+        out(STDERR_FILENO, base);
+        out(STDERR_FILENO, b": reboot(2) tryboot: ");
+        out(STDERR_FILENO, errno_name(r));
+        out(STDERR_FILENO, b"\n");
+        return 1;
+    }
     if !force && leandros_libc::process::getuid() != 0 && has_bus(envp) {
         via_login1(action, envp);
     }

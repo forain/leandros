@@ -39,7 +39,18 @@ const LINUX_REBOOT_CMD_KEXEC:      u32 = 0x4558_4543;
 /// (`pm::sys_pm_test`, arg = user `PmTestReq`). "PMTS".
 const LEANDROS_REBOOT_CMD_PM_TEST: u32 = 0x504D_5453;
 
+/// `reboot(RESTART2..)` is not the only command: Leandros "TBOK" cancels the
+/// tryboot deadline (the trial kernel is good; see `tryboot.rs`).
+const LEANDROS_REBOOT_CMD_TRYBOOT_CONFIRM: u32 = 0x5442_4F4B;
+
+/// Leandros "TBHD": arg 1 = hold the deadline (a commit is writing the boot
+/// FAT), arg 0 = release. The hold is a 300 s lease.
+const LEANDROS_REBOOT_CMD_TRYBOOT_HOLD: u32 = 0x5442_4844;
+
 const EPERM:  isize = -1;
+const EIO:    isize = -5;
+const EFAULT: isize = -14;
+const EOPNOTSUPP: isize = -95;
 const EINVAL: isize = -22;
 
 /// Ctrl-Alt-Del policy (`C_A_D`): true = the kernel reboots at once, false =
@@ -116,6 +127,51 @@ pub fn acpi_has_8042() -> Option<bool> {
 }
 
 /// reboot(magic1, magic2, cmd, arg) — Linux `SYSCALL_DEFINE4(reboot, ...)`.
+/// Copy the RESTART2 argument string (<= 255 bytes, NUL-terminated) from user
+/// space. Byte at a time so a short string at the end of a mapping is fine.
+/// `Err` is the errno. Never printed or logged.
+fn restart2_arg(arg: usize, out: &mut [u8; 256]) -> Result<usize, isize> {
+    if arg == 0 { return Ok(0); }
+    for i in 0..out.len() - 1 {
+        let mut b = 0u8;
+        if unsafe { sched::uaccess::copy_from_user(&mut b as *mut u8, arg + i, 1) } != 0 { return Err(EFAULT); }
+        if b == 0 { return Ok(i); }
+        out[i] = b;
+    }
+    Ok(out.len() - 1)
+}
+
+/// SET_REBOOT_FLAGS 0, best effort (Pi 5 only; no-op elsewhere).
+pub fn clear_reboot_flag() {
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    { let _ = drivers::rpi_misc::fw_tag(0x0003_8064, &[0]); }
+}
+
+/// `reboot(RESTART2, "... tryboot")`: tell the Pi 5 firmware to read
+/// `tryboot.txt` on the next reset (SET_REBOOT_FLAGS = 1), read it back, send
+/// NOTIFY_REBOOT. Errno on failure; the caller does not reboot then.
+fn arm_tryboot() -> Result<(), isize> {
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    {
+        use drivers::rpi_misc::fw_tag;
+        const SET_REBOOT_FLAGS: u32 = 0x0003_8064;
+        const GET_REBOOT_FLAGS: u32 = 0x0003_0064;
+        const NOTIFY_REBOOT: u32 = 0x0003_0048;
+        if fw_tag(SET_REBOOT_FLAGS, &[1]).is_none() { return Err(EIO); }
+        match fw_tag(GET_REBOOT_FLAGS, &[]) {
+            Some(v) => {
+                serial_print_str(&alloc::format!("[pifw] reboot flags={}\n", v[0]));
+                if v[0] & 1 == 0 { return Err(EIO); }
+            }
+            None => return Err(EIO),
+        }
+        let _ = fw_tag(NOTIFY_REBOOT, &[]);
+        Ok(())
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
+    { Err(EOPNOTSUPP) }
+}
+
 pub fn sys_reboot(magic1: usize, magic2: usize, cmd: usize, _arg: usize) -> isize {
     // CAP_SYS_BOOT first, as Linux does: an unprivileged caller learns
     // nothing about the magic numbers.
@@ -130,7 +186,20 @@ pub fn sys_reboot(magic1: usize, magic2: usize, cmd: usize, _arg: usize) -> isiz
     }
     match cmd {
         LEANDROS_REBOOT_CMD_PM_TEST => crate::pm::sys_pm_test(_arg),
-        LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_RESTART2 => kernel_restart(),
+        LEANDROS_REBOOT_CMD_TRYBOOT_HOLD => { crate::tryboot::hold(_arg != 0); 0 }
+        LEANDROS_REBOOT_CMD_TRYBOOT_CONFIRM => { crate::tryboot::confirm(); 0 }
+        LINUX_REBOOT_CMD_RESTART2 => {
+            let mut buf = [0u8; 256];
+            let n = match restart2_arg(_arg, &mut buf) { Ok(n) => n, Err(e) => return e };
+            let tryboot = core::str::from_utf8(&buf[..n]).map_or(false, |a|
+                a.split_ascii_whitespace().any(|t| t == "tryboot"));
+            if tryboot {
+                if let Err(e) = arm_tryboot() { return e; }
+                crate::tryboot::note_armed();
+            }
+            kernel_restart()
+        }
+        LINUX_REBOOT_CMD_RESTART => kernel_restart(),
         LINUX_REBOOT_CMD_CAD_ON  => { CAD_ENABLED.store(true, Ordering::Relaxed); 0 }
         LINUX_REBOOT_CMD_CAD_OFF => { CAD_ENABLED.store(false, Ordering::Relaxed); 0 }
         LINUX_REBOOT_CMD_HALT    => kernel_halt(),
@@ -358,6 +427,8 @@ pub fn restart_now() -> ! { kernel_restart() }
 
 /// `kernel_restart`.
 fn kernel_restart() -> ! {
+    // A plain reset in a trial boot must never leave the one-shot tryboot flag set.
+    crate::tryboot::before_plain_reset();
     shutdown_prepare(SYSTEM_RESTART);
     let cfg = RebootCfg::from_cmdline();
     let bm = quiesce_phase1(&cfg, "restart");
