@@ -5059,7 +5059,11 @@ fn fsync_port(port: u32, caller_pid: u32, file_id: u64, kind: u64) -> Message {
     let lazy_ns = FSYNC_LAZY_NS.load(atomic::Ordering::Relaxed);
     // An e2undo file (resize2fs -z, the dual-boot shrink) must reach the medium
     // before the filesystem writes it protects: its fsyncs are never lazy.
-    let undo_file = path[..plen].ends_with(b".e2undo");
+    // The shrink state directory (state, sb.orig, sbk.orig, hashes, and the
+    // directory entries that name them) is exempt too: --recover decides from it
+    // after a power cut, so every fsync of it is a real commit.
+    let undo_file = path[..plen].ends_with(b".e2undo")
+        || path[..plen].windows(15).any(|w| w == b"dualboot-backup");
     if per_file && lazy_ns != 0 && !undo_file {
         // `f2fs.fsync=lazy`: commit within the promised time, return now.
         // (The write-back task checks the promise every second.)

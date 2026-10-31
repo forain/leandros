@@ -391,10 +391,12 @@ fn high_files(dev: &str, files: &[(u64, String)], limit: u64, dir: &str) -> Resu
                 continue;
             }
             let t: Vec<&str> = l.split_whitespace().collect();
-            if t.len() >= 9 && t[0].contains('/') && t[3] == "-" && t[6] == "-" {
-                max = max.max(t[7].parse().unwrap_or(0));
-            } else if t.len() == 6 && t[0].contains('/') && t[3] == "-" {
-                max = max.max(t[5].parse().unwrap_or(0));
+            // "Level Entries Logical Physical Length": debugfs pads the level/entry
+            // columns ("0/ 0   1/  4"), so locate the two "-" separators instead of
+            // fixed token positions. Index-node lines have only one.
+            let dashes: Vec<usize> = t.iter().enumerate().filter(|(_, x)| **x == "-").map(|(i, _)| i).collect();
+            if t.len() >= 8 && t[0].contains('/') && dashes.len() == 2 {
+                max = max.max(t[dashes[1] + 1].parse().unwrap_or(0));
             } else if l.contains("extent") && l.contains("not") {
                 noext.push(cur);
             }
@@ -839,6 +841,10 @@ fn real_run(dev: &str, st: &mut Vec<(&str, String)>, dir: &str, undo: &str, new_
     set("unguarding", st)?;
     let (n, _) = sbguard::apply(dev, false, false, &mut |m| out.info(m), &mut |_| {})?;
     out.info(&format!("guard cleared on {} superblock copies", n));
+    if let Ok(orig) = std::fs::read(format!("{}/sb.orig", dir)) {
+        let k = sbguard::clear_stale(dev, &orig, new_blocks * bs)?;
+        out.info(&format!("guard cleared on {} stale backups past the new end", k));
+    }
     let c = fsck_n(dev)?;
     if c.rc != 0 {
         return Err(format!("e2fsck -fn after clearing the guard is not clean (rc {}): {}", c.rc, tail(&c.text)));

@@ -160,6 +160,35 @@ pub fn apply(dev: &str, want: bool, backups_only: bool, log: &mut dyn FnMut(&str
     Ok((done, skipped))
 }
 
+/// After a successful shrink: backups of the OLD geometry that now lie past the new
+/// end of the filesystem still carry the guard. Stock tools never look there, but
+/// clear the bit (valid checksum, matching UUID only) so no copy anywhere keeps it.
+/// `old_prim` is the user's original primary superblock (sb.orig).
+pub fn clear_stale(dev: &str, old_prim: &[u8], new_end_bytes: u64) -> Result<usize, String> {
+    let mut f = OpenOptions::new().read(true).write(true).open(dev).map_err(|e| format!("{}: {}", dev, e))?;
+    let mut n = 0;
+    for c in copies(old_prim)? {
+        if c.group == 0 || c.off < new_end_bytes {
+            continue;
+        }
+        let mut b = match read_at(&mut f, c.off, 1024) { Ok(b) => b, Err(_) => continue };
+        if plausible(&c, &b, old_prim).is_err() || le32(&b, 0x60) & GUARD == 0 {
+            continue;
+        }
+        let inc = le32(&b, 0x60) & !GUARD;
+        b[0x60..0x64].copy_from_slice(&inc.to_le_bytes());
+        if csum_on(&b) {
+            let c32 = crc32c(!0, &b[..0x3FC]);
+            b[0x3FC..0x400].copy_from_slice(&c32.to_le_bytes());
+        }
+        f.seek(SeekFrom::Start(c.off)).and_then(|_| f.write_all(&b)).map_err(|e| format!("write @{}: {}", c.off, e))?;
+        n += 1;
+    }
+    f.sync_all().map_err(|e| e.to_string())?;
+    flush_dev(&f);
+    Ok(n)
+}
+
 /// Re-read every plausible copy: guard state as wanted and checksum valid.
 pub fn verify(dev: &str, want: bool, backups_only: bool) -> Result<usize, String> {
     let mut f = File::open(dev).map_err(|e| format!("{}: {}", dev, e))?;

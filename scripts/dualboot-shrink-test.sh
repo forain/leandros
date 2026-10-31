@@ -164,6 +164,10 @@ grep '"ev":"shrink_info"' "$WORK/dry.log" | head -1 | cut -c1-220
 r "$LI shrink-status --json" | grep -q '"state":"none"' && ok "status none before"
 r "$LI shrink --part $P2 --to 10G --yes --json 2>&1; true" > "$WORK/shrink.log"
 grep -q '"ev":"done","part"' "$WORK/shrink.log" || { tail -5 "$WORK/shrink.log"; fail "shrink did not finish"; }
+H=$(grep -o '"hashed":[0-9]*' "$WORK/shrink.log" | tail -1 | cut -d: -f2)
+[ "${H:-0}" -gt 0 ] && ok "data moved: $H files hashed (blocks above the new end)" || fail "no file had blocks above the new end (hashed=${H:-?}); the fixture does not exercise data moves"
+grep -o '[0-9]* of [0-9]* files have blocks above the new end' "$WORK/shrink.log" | head -1
+grep -o 'guard cleared on [0-9]* stale backups past the new end' "$WORK/shrink.log" | head -1
 for s in backup rehearse hash fsck resize verify; do grep -q "\"name\":\"$s\",\"pct\":100" "$WORK/shrink.log" || fail "step $s did not finish"; done
 ok "all steps finished; $(grep -c '"name":"resize"' "$WORK/shrink.log") resize progress events"
 ST=$(r "$LI shrink-status --json; true")
@@ -172,6 +176,20 @@ BK=$(r "cat /home/dualboot-backup/shrink-latest")
 r "ls -l $BK | cut -c1-90; cd $BK && sha256sum -c SHA256SUMS | tail -3" | tail -14
 stop_vm
 echo "-- host checks"
+python3 - "$DISK" <<'PY' || fail "a superblock copy (incl. stale backups past the new end) still has the guard bit"
+import struct, sys
+f = open(sys.argv[1], "rb"); base = 2101248 * 512; bpg = 32768; bs = 4096
+gs = sorted({1} | {b ** k for b in (3, 5, 7) for k in range(1, 8) if b ** k < 1500})
+bad = []; seen = 0
+for g in gs:
+    f.seek(base + g * bpg * bs); b = f.read(1024)
+    if len(b) < 1024 or struct.unpack_from("<H", b, 0x38)[0] != 0xEF53: continue
+    seen += 1
+    if struct.unpack_from("<I", b, 0x60)[0] & 0x80000000: bad.append(g)
+f.seek(base + 1024); b = f.read(1024)
+if struct.unpack_from("<I", b, 0x60)[0] & 0x80000000: bad.append(0)
+print("superblock copies scanned: %d, with guard bit: %s" % (seen, bad)); sys.exit(1 if bad else 0)
+PY
 [ "$(gpt_sig "$DISK")" = "$GPT0" ] && ok "GPT byte-identical" || fail "GPT changed"
 "$ROOT/scripts/check-dualboot-fixture.sh" "$DISK" --shrunk | tee "$WORK/check-shrunk.log" | grep -E "^(FAIL|RESULT)|block count|sha256"
 grep -q "^RESULT pristine fail=0" "$WORK/check-shrunk.log" || fail "check-dualboot-fixture.sh --shrunk"
@@ -197,7 +215,7 @@ crash_case() {
     case "$PCT" in
         guarded) FZENV="LEANDROS_SHRINK_FREEZE_AT=guarded"; FZNAME=frozen_guarded ;;
         guard1) FZENV="LEANDROS_SHRINK_FREEZE_GUARD=1"; FZNAME=frozen_guard ;;
-        fsck) FZENV="LEANDROS_SHRINK_FREEZE_FSCK_MS=${FSCK_FREEZE_MS:-4000}"; FZNAME=frozen_fsck ;;
+        fsck) FZENV="LEANDROS_SHRINK_FREEZE_FSCK_MS=${FSCK_FREEZE_MS:-30}"; FZNAME=frozen_fsck ;;
         *) [ "$PCT" -gt "${LAST_PROGRESS_PCT:-60}" ] && PCT=${LAST_PROGRESS_PCT:-60}; FZENV="LEANDROS_SHRINK_FREEZE_PCT=$PCT" ;;
     esac
     [ "$PCT" = "$REQ" ] || echo "(requested ${REQ}% clamped to the last pre-completion progress event, ${PCT}%)"
@@ -241,8 +259,26 @@ sys.exit(0 if ok else 1)
 PY
         echo "info: guard state on disk after the crash printed above (guarded/guard1 expect 0x8... on all; stock e2fsck refuses on this bit: exit 8)" ;;
     esac
+    case "$PCT" in guarded|fsck)   # guard1 = only one backup guarded, the primary is not yet: stock e2fsck legitimately runs
+        # (4) a STOCK e2fsck (Alpine, in a container) must refuse the guarded image: exit 8, image unchanged.
+        local sha0 sha1
+        sha0=$(head -c 134217728 "$DISK" | tail -c 100000000 | shasum -a 256 | cut -c1-64)
+        . "$ROOT/scripts/container-lib.sh"
+        if leandros_pick_container; then
+            $CT run --rm -v "$WORK:/w:ro" alpine:3.21 sh -c 'apk add -q e2fsprogs >/dev/null 2>&1; e2fsck -fn "/w/disk.img?offset='$((2101248 * 512))'" >/dev/null 2>&1; echo STOCKRC=$?' 2>&1 | tail -1 > "$WORK/stock-rc-$PCT.log"
+            grep -q 'STOCKRC=8' "$WORK/stock-rc-$PCT.log" || { cat "$WORK/stock-rc-$PCT.log"; fail "stock e2fsck did not exit 8 on the guarded image ($PCT)"; }
+            sha1=$(head -c 134217728 "$DISK" | tail -c 100000000 | shasum -a 256 | cut -c1-64)
+            [ "$sha0" = "$sha1" ] || fail "stock e2fsck changed the image ($PCT)"
+            ok "stock e2fsck refuses the guarded image (exit 8), image unchanged ($PCT)"
+        else
+            echo "(no container runtime: stock e2fsck refusal not tested: $CT_WHY)"
+        fi ;;
+    esac
     boot_stick "recover$PCT"
     r "$LI shrink-status --json" > "$WORK/statout$PCT.log"
+    # (2) the state file written right before the kill must be durable on the stick (f2fs.fsync=lazy)
+    case "$PCT" in guarded) EXPH=guarded ;; guard1) EXPH=guarding ;; fsck) EXPH=fscking ;; *) EXPH=resizing ;; esac
+    grep -q "\"phase\":\"$EXPH\"" "$WORK/statout$PCT.log" && ok "state phase $EXPH durable after kill -9" || { cat "$WORK/statout$PCT.log"; fail "stick state after the kill is not phase $EXPH ($PCT)"; }
     if grep -q '"phase":"done"' "$WORK/statout$PCT.log"; then echo "shrink finished before the kill landed (resize is fast); retrying"; stop_vm; return 2; fi
     grep -q '"state":"interrupted"' "$WORK/statout$PCT.log" && ok "status: interrupted" || { cat "$WORK/statout$PCT.log"; fail "status after crash"; }
     r "$LI shrink --recover --yes --json; true" > "$WORK/recout$PCT.log"
@@ -262,7 +298,8 @@ PY
     ! grep -q 'e2undo -f' "$WORK/recout$PCT.log" || fail "bare e2undo -f used (${PCT})"
     grep -o 'undo header sb vs live sb[^"]*' "$WORK/recout$PCT.log" | head -1 | cut -c1-300
     grep -o 'e2undo -n: rc [^"]*' "$WORK/recout$PCT.log" | head -1 | cut -c1-200
-    grep -q 'verified: fsck clean' "$WORK/recout$PCT.log" && ok "post-rollback verification (fsck, size, guard cleared, backup sb, hashes)" || true
+    NH=$(grep -o 'guard cleared everywhere, [0-9]* hashed files intact' "$WORK/recout$PCT.log" | grep -o '[0-9]* hashed' | head -1 | cut -d' ' -f1)
+    [ "${NH:-0}" -gt 0 ] && ok "post-rollback verification (fsck, size, guard cleared, backup sb, $NH moved-data files rehashed)" || fail "rollback verified no hashed files (${NH:-none}); data-move coverage lost ($PCT)"
 }
 for PCT in ${CRASH_CASES:-guarded guard1 fsck} $CRASH_PCTS; do
     for ATT in 1 2 3; do

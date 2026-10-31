@@ -484,6 +484,13 @@ impl Application for App {
                             "This session shrinks {} to {} GiB. Then boot Linux once to check it and come back to install.",
                             d.shrink_part, self.slider
                         )));
+                        col = col.push(widget::text::title3("Keep the laptop plugged in and do not close the lid."));
+                        col = col.push(widget::text::body(
+                            "If the power fails or the laptop restarts during the resize, your Linux system will not start: it will stop at an emergency or maintenance prompt. This is deliberate, so that Linux cannot damage the half-resized disk.",
+                        ));
+                        col = col.push(widget::text::body(
+                            "If that happens: switch the laptop off, keep this USB stick plugged in, open the boot menu and boot the stick again, then choose Recover. Do not run fsck, GParted or other disk tools on the Linux partition before that.",
+                        ));
                     }
                     Mode::Free => {
                         if self.dry_ok {
