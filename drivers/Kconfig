@@ -70,7 +70,7 @@ config MACB
 	default y
 
 config BRCMF
-	bool "Broadcom brcmfmac (SDIO Wi-Fi)"
+	tristate "Broadcom brcmfmac (SDIO Wi-Fi)"
 	select WIFI_STACK
 	default y
 

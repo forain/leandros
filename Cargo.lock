@@ -266,6 +266,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod-brcmf"
+version = "0.1.0"
+dependencies = [
+ "kmod-abi",
+ "kmod-kapi",
+ "kmod-rt",
+ "leandros-lib",
+ "netctl-abi",
+ "spin",
+]
+
+[[package]]
 name = "kmod-bt"
 version = "0.1.0"
 dependencies = [
