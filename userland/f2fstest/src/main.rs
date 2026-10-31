@@ -13,6 +13,7 @@ mod churn;
 mod crash;
 mod full;
 mod orphan;
+mod trunc;
 
 /// argv[i] as a byte slice (no NUL).
 unsafe fn arg(argv: *const *const u8, i: usize) -> &'static [u8] {
@@ -47,6 +48,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
                 return if arg(argv, 1) == b"fullscan" { full::fullscan(dir, num(3, 100000)) }
                        else { full::fullchurn(dir, num(3, 1), num(4, 4000)) };
             }
+            b"trunc_cold" => return trunc::trunc_cold(dir),
             b"mmaporphan" => return orphan::mmaporphan(dir),
             b"holdorphan" => return orphan::holdorphan(dir),
             b"mmapfault" => {

@@ -6459,6 +6459,32 @@ fn gen_modules() -> Option<VnodeKind> {
 
 /// `/proc/pcache`: the unified page cache (`mm::pagecache`), one
 /// `name value` per line; counters are cumulative pages since boot.
+/// f2fs no-I/O request reruns / requests that gave up (cumulative), and the
+/// request to drop the clean block cache (`/proc/f2fsdropcache`, test knob).
+pub static F2FS_NOIO_ROUNDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static F2FS_NOIO_GAVE_UP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static F2FS_DROP_CLEAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `/proc/f2fsstat`: `noio_rounds N` and `noio_gave_up N`. Reading
+/// `/proc/f2fsdropcache` asks the f2fs server to drop its clean cache on its
+/// next request.
+fn gen_f2fsstat(drop: bool) -> Option<VnodeKind> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut put = |name: &str, v: u64| {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b' ');
+        let mut d = [0u8; 20]; let mut n = d.len(); let mut x = v;
+        loop { n -= 1; d[n] = b'0' + (x % 10) as u8; x /= 10; if x == 0 { break; } }
+        out.extend_from_slice(&d[n..]);
+        out.push(b'\n');
+    };
+    if drop { F2FS_DROP_CLEAN.store(true, Relaxed); }
+    put("noio_rounds", F2FS_NOIO_ROUNDS.load(Relaxed));
+    put("noio_gave_up", F2FS_NOIO_GAVE_UP.load(Relaxed));
+    proc_snapshot(b"/tmp/.f2fsstat", &out, false)
+}
+
 fn gen_pcache() -> Option<VnodeKind> {
     let st = mm::pagecache::stats();
     let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -7189,7 +7215,7 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules"];
+                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ"];
 
@@ -7968,6 +7994,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/modules" {
             match gen_modules() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/f2fsstat" || lookup_path == b"/proc/f2fsdropcache" {
+            match gen_f2fsstat(lookup_path == b"/proc/f2fsdropcache") {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
