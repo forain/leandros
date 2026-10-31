@@ -3,7 +3,7 @@
 
 use kmod_abi::plat::{sys_plat, KDmaQuiesceFn, KPlatProbeFn};
 
-pub use kmod_abi::plat::{board_mac, dma_dir, quiesce_stage};
+pub use kmod_abi::plat::{pi5_pins, board_mac, dma_dir, quiesce_stage};
 pub use kmod_abi::KPlatDev;
 
 /// Register a driver for the NUL-free `compats`; every already-announced unclaimed device is offered to `probe` now.
@@ -42,3 +42,18 @@ pub fn rp1_irq_request(n: u32, level: bool, h: kmod_abi::KIrqHandler, ctx: usize
     match unsafe { sys_plat::kapi_rp1_irq_request(crate::owner(), n, level, h, ctx) } { 0 => Ok(()), e => Err(e) }
 }
 pub fn rp1_irq_free(n: u32) { unsafe { sys_plat::kapi_rp1_irq_free(crate::owner(), n); } }
+
+/// Result of the SDIO2 pin mux: stepping (0 C0, 1 D0), packed fsel nibbles of gpio30..35 before, register writes.
+pub struct Sdio2Mux { pub stepping: u32, pub before: u32, pub writes: u32 }
+/// Mux gpio28 and gpio30..35 for the Wi-Fi SDIO host. Err(-19) unknown stepping / not a Pi 5, Err(-1) not the brcmf module.
+pub fn pi5_sdio2_mux() -> Result<Sdio2Mux, i32> {
+    let mut o = [0u64; 3];
+    match unsafe { sys_plat::kapi_pi5_pins(crate::owner(), pi5_pins::MUX_SDIO2, 0, o.as_mut_ptr()) } {
+        0 => Ok(Sdio2Mux { stepping: o[0] as u32, before: o[1] as u32, writes: o[2] as u32 }),
+        e => Err(e),
+    }
+}
+/// Drive WL_REG_ON.
+pub fn pi5_wl_on(on: bool) { unsafe { sys_plat::kapi_pi5_pins(crate::owner(), pi5_pins::WL_ON_SET, on as u32, core::ptr::null_mut()); } }
+/// The WL_REG_ON line is usable.
+pub fn pi5_wl_on_ready() -> bool { unsafe { sys_plat::kapi_pi5_pins(crate::owner(), pi5_pins::WL_ON_READY, 0, core::ptr::null_mut()) == 0 } }

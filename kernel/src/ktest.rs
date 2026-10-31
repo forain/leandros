@@ -584,8 +584,21 @@ fn kmodplat_checks(t: &mut T) {
     for n in ["kapi_plat_register", "kapi_plat_unregister", "kapi_dtb_blob", "kapi_board_mac", "kapi_soc_stepping",
               "kapi_serror_checkpoint", "kapi_vmap", "kapi_vunmap", "kapi_dma_quiesce_register",
               "kapi_dma40_claim", "kapi_dma40_release", "kapi_dma40_start_cyclic", "kapi_dma40_stop", "kapi_dma40_position",
-              "kapi_dma40_periods", "kapi_dma40_poll", "kapi_dma40_polled", "kapi_hdmi_sink_info"] {
+              "kapi_dma40_periods", "kapi_dma40_poll", "kapi_dma40_polled", "kapi_hdmi_sink_info", "kapi_pi5_pins"] {
         t.check(exports::lookup(n).is_some(), "plat/board export in KSYMTAB");
+    }
+    // The Wi-Fi pins are for the module named brcmf only.
+    t.check(exports::kapi_pi5_pins(KmodId(60020), 2, 0, core::ptr::null_mut()) == -1, "pi5_pins refused for a module not named brcmf");
+    // The built-in shutdown hook seam: replace-by-name, per-phase lookup, unregister.
+    {
+        use drivers::kenv::pm;
+        fn h1() -> Option<alloc::string::String> { None }
+        pm::register_shutdown("ktest-brcmf", pm::PHASE_WIFI, h1);
+        pm::register_shutdown("ktest-brcmf", pm::PHASE_WIFI, h1);
+        t.check(pm::shutdown_hooks(pm::PHASE_WIFI).len() == 1, "pm hook registered once per name");
+        t.check(pm::shutdown_hooks(pm::PHASE_WIFI + 1).is_empty(), "pm hook not listed in another phase");
+        pm::unregister("ktest-brcmf");
+        t.check(pm::shutdown_hooks(pm::PHASE_WIFI).is_empty(), "pm hook unregistered");
     }
     // Registration argument checks.
     let own = KmodId(60020); // not 60010: kmodkapi_w2 counts that owner's records

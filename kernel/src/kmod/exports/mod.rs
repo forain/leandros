@@ -38,6 +38,7 @@ mod gfx;
 mod plat;
 mod dma40;
 mod rp1;
+mod pi5pins;
 
 pub use pci::*;
 pub use irq::*;
@@ -52,6 +53,7 @@ pub use gfx::*;
 pub use plat::*;
 pub use dma40::*;
 pub use rp1::*;
+pub use pi5pins::*;
 pub use v4l2::*;
 pub use usbfn::*;
 pub use hci::*;
@@ -179,6 +181,7 @@ const _: kmod_abi::plat::sys_plat::PlatUnregisterFn = kapi_plat_unregister;
 const _: kmod_abi::plat::sys_plat::DtbBlobFn = kapi_dtb_blob;
 const _: kmod_abi::plat::sys_plat::BoardMacFn = kapi_board_mac;
 const _: kmod_abi::plat::sys_plat::SocSteppingFn = kapi_soc_stepping;
+const _: kmod_abi::plat::sys_plat::Pi5PinsFn = kapi_pi5_pins;
 const _: kmod_abi::plat::sys_plat::SerrorCheckpointFn = kapi_serror_checkpoint;
 const _: kmod_abi::plat::sys_plat::VmapFn = kapi_vmap;
 const _: kmod_abi::plat::sys_plat::VunmapFn = kapi_vunmap;
@@ -201,7 +204,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 150;
+pub const NEXPORTS: usize = 151;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -356,6 +359,7 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_hdmi_sink_info", kapi_hdmi_sink_info),
     sym!("kapi_rp1_irq_request", kapi_rp1_irq_request),
     sym!("kapi_rp1_irq_free", kapi_rp1_irq_free),
+    sym!("kapi_pi5_pins", kapi_pi5_pins),
 ];
 
 extern "C" {

@@ -29,6 +29,8 @@ pub type KDmaQuiesceFn = extern "C" fn(ctx: usize) -> bool;
 
 /// `kapi_dma_quiesce_register` stages.
 pub mod quiesce_stage { pub const DEVICE: u32 = 0; pub const BUS: u32 = 1; }
+/// `kapi_pi5_pins` operations.
+pub mod pi5_pins { pub const MUX_SDIO2: u32 = 0; pub const WL_ON_SET: u32 = 1; pub const WL_ON_READY: u32 = 2; }
 /// `kapi_board_mac` selectors.
 pub mod board_mac { pub const ETH: u32 = 0; pub const WIFI: u32 = 1; pub const BT: u32 = 2; }
 /// `kapi_dma_sync` directions beyond 0..2: raw cache maintenance on any mapped VA (also `kapi_vmap` aliases).
@@ -79,6 +81,7 @@ pub mod sys_plat {
     pub type DtbBlobFn = unsafe extern "C" fn(*mut usize) -> *const u8;
     pub type BoardMacFn = unsafe extern "C" fn(u32, *mut u8) -> i32;
     pub type SocSteppingFn = unsafe extern "C" fn() -> i32;
+    pub type Pi5PinsFn = unsafe extern "C" fn(owner: KmodId, op: u32, arg: u32, out: *mut u64) -> i32;
     pub type SerrorCheckpointFn = unsafe extern "C" fn() -> u64;
     pub type VmapFn = unsafe extern "C" fn(*const u64, usize, u32) -> usize;
     pub type VunmapFn = unsafe extern "C" fn(usize);
@@ -95,6 +98,10 @@ pub mod sys_plat {
         pub fn kapi_board_mac(which: u32, out: *mut u8) -> i32;
         /// BCM2712 stepping: 0 C0, 1 D0, 2 unknown. -19 on other boards.
         pub fn kapi_soc_stepping() -> i32;
+        /// Pi 5 Wi-Fi pins, for the module named `brcmf` only (-1 otherwise): `pi5_pins::MUX_SDIO2` (out[0] stepping 0 C0 / 1 D0,
+        /// out[1] packed fsel nibbles of gpio30..35 before, out[2] register writes; -19 unknown stepping or off the Pi 5, -5 mux
+        /// failure), `WL_ON_SET` (arg 0/1), `WL_ON_READY` (0, or -19 when the gio block is unavailable).
+        pub fn kapi_pi5_pins(owner: KmodId, op: u32, arg: u32, out: *mut u64) -> i32;
         /// Pending SError syndrome since the last checkpoint, 0 when clean (always 0 off aarch64).
         pub fn kapi_serror_checkpoint() -> u64;
         /// Map `n` physical pages (array of page addresses) contiguously in the kernel window. `cache`: 0 UC, 1 WC, 2 WB. 0 on failure.

@@ -90,6 +90,60 @@ pub mod uapi {
 /// HPD uevent to userspace (evdev hotplug node).
 pub fn hotplug(minor: u8) { ::evdev_server::hp_drm_change(minor) }
 
+/// Pi 5 board services of the Wi-Fi chip (SDIO2 pin mux, WL_REG_ON, factory MAC). The module build
+/// answers the same functions through `kapi_pi5_pins` and `kapi_board_mac`.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod pi5 {
+    use alloc::string::String;
+    use crate::bcm2712_gpio::{self as gpio, Block, Chip, GROUP_SDIO2_WL_ON, WL_ON};
+    use crate::bcm2712_id;
+
+    /// Mux gpio28 to GPIO and gpio30..35 to sd2 with the dts pulls. Returns the log text; an unknown
+    /// stepping leaves the mux untouched. Writes only registers whose value changes.
+    pub fn sdio2_pinmux() -> String {
+        let st = bcm2712_id::stepping().stepping;
+        if bcm2712_id::pin_rows(st).is_none() {
+            return String::from("pinmux=skip(unknown stepping)");
+        }
+        let mut before = 0u32; // packed fsel nibbles of pins 30..35 as found
+        for (i, p) in (30..=35).enumerate() {
+            before |= (gpio::pin_get_fsel(Block::Main, p).unwrap_or(0) & 0xF) << (i as u32 * 4);
+        }
+        match gpio::pin_apply(Block::Main, &GROUP_SDIO2_WL_ON) {
+            Ok(w) => alloc::format!("pinmux={:?} sd2-fsel-before={:06x} writes={}", st, before, w),
+            Err(e) => alloc::format!("pinmux=fail({:?})", e),
+        }
+    }
+    pub fn wl_reg_on(on: bool) { let _ = gpio::gpio_set_output(Chip::Gio, WL_ON, on); }
+    /// The WL_ON line is a readable output (the gio block is mapped).
+    pub fn wl_reg_on_ready() -> bool { gpio::gpio_is_output(Chip::Gio, WL_ON).is_ok() }
+    /// Factory Wi-Fi MAC from the board OTP.
+    pub fn wifi_mac() -> Option<[u8; 6]> { crate::bcm2712_otp::wifi_mac() }
+}
+
+/// Power-management hook seam. The built-in build keeps the hooks in a drivers table that the kernel's
+/// pm2 walks per phase; the module build registers through `kapi_pm_register2` (per-owner, dropped
+/// again when init fails).
+pub mod pm {
+    use alloc::{string::String, vec::Vec};
+    /// Same value as `kmod_abi::phase::WIFI` (pm2 asserts it).
+    pub const PHASE_WIFI: u32 = 5;
+    /// A quiesce hook returns its log line.
+    pub type ShutdownFn = fn() -> Option<String>;
+    static HOOKS: spin::Mutex<Vec<(&'static str, u32, ShutdownFn)>> = spin::Mutex::new(Vec::new());
+    /// Register `name`'s phase-1 shutdown hook; a second registration of the same name replaces it.
+    pub fn register_shutdown(name: &'static str, phase: u32, f: ShutdownFn) {
+        let mut h = HOOKS.lock();
+        h.retain(|e| e.0 != name);
+        h.push((name, phase, f));
+    }
+    pub fn unregister(name: &str) { HOOKS.lock().retain(|e| e.0 != name); }
+    /// The shutdown hooks of `phase`, in registration order.
+    pub fn shutdown_hooks(phase: u32) -> Vec<ShutdownFn> {
+        HOOKS.lock().iter().filter(|e| e.1 == phase).map(|e| e.2).collect()
+    }
+}
+
 /// What the HDMI audio hardware code (`hdmi_audio::hw`) needs from the kernel; the module build
 /// (modules/hdmi-audio) supplies the same names over the kapi exports.
 #[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "hdmi-audio"))]
