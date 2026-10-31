@@ -108,6 +108,9 @@ pub fn resolve_root(cmdline: Option<&str>, _boot: Option<BootDisk>) -> Result<us
     if 1 < device_count() && has_f2fs(1) { Ok(1) } else { Err(RootErr::NotFound) }
 }
 
+/// `blk.rw=` allow-list: the SDHCI Pi build has no GPT write policy, so nothing to parse.
+pub fn set_rw_list(_cmdline: &str) {}
+
 /// The SD path has no runtime registration; always `Unsupported`.
 pub fn register(_dev: &'static dyn BlockDevice) -> Result<usize, BlkErr> {
     Err(BlkErr::Unsupported)

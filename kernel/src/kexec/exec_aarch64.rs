@@ -321,6 +321,15 @@ fn straggler_entry() -> ! {
             let _g = sched::cpuq::lock(RQ_IDX.load(Ordering::Relaxed));
             loop { core::hint::spin_loop(); }
         }
+        if straggler_mode("busy") {
+            // The brcmf service() loop: a spin::Mutex held with IRQs masked, looping
+            // on a pass that never sleeps; its only poll point is masked_poll_point().
+            log("[KEXEC] test: straggler looping a busy pass holding a spin::Mutex\n");
+            static M: spin::Mutex<()> = spin::Mutex::new(());
+            let _g = M.lock();
+            sched::irqctx::atomic_inc();
+            loop { busy_pass(); }
+        }
         if straggler_sleep_mode() {
             // The brcmf radio loop: a spin::Mutex held across msleep(1).
             log("[KEXEC] test: straggler looping msleep(1) holding a spin::Mutex\n");
@@ -362,6 +371,10 @@ fn straggler_mode(m: &str) -> bool {
         .any(|t| t.strip_prefix("kexec.test_straggler_mode=") == Some(m)))
 }
 
+/// Stand-in for brcmf `service()`: one pass per call, using the same poll point.
+#[inline(never)]
+fn busy_pass() { sched::kthread::masked_poll_point(); core::hint::spin_loop(); }
+
 fn straggler_sleep_mode() -> bool { straggler_mode("sleep") }
 
 fn test_straggler() -> Option<usize> {
@@ -376,7 +389,7 @@ pub fn stop_and_jump() -> ! {
     let strag = test_straggler().filter(|&c| c != 0 && c < arch_aarch64::smp::assigned());
     if let Some(c) = strag {
         STRAGGLER.store(c, Ordering::Release);
-        if !straggler_sleep_mode() && !straggler_mode("lock") && !straggler_mode("rq") { arch_aarch64::uart::test_leak_rx_lock(); }
+        if !straggler_sleep_mode() && !straggler_mode("lock") && !straggler_mode("rq") && !straggler_mode("busy") { arch_aarch64::uart::test_leak_rx_lock(); }
     }
     let divert: fn() -> ! = if strag.is_some() { straggler_entry } else { on_ipi };
     arch_aarch64::exception::IRQ_DIVERT.store(divert as usize, Ordering::Release);

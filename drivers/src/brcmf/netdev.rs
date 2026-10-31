@@ -599,7 +599,9 @@ impl<F: Fwil> BrcmfRadio<F> {
             // The kthread runs with IRQs masked and is preempted only where it
             // parks: under steady traffic the msleep below never runs, so let
             // interrupts (UART, timer, IPIs) in on every pass.
-            sched::kthread::cond_resched();
+            // Also reached under spin::Mutex (cond_resched is a no-op there):
+            // park for kexec, then open the IRQ window.
+            sched::kthread::masked_poll_point();
             self.check_ctl();
             if self.retry.is_some() { return None; }
             // dp knob changes take effect on the next pass.
