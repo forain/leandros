@@ -14,3 +14,11 @@ Tests (aarch64, hvf):
 - Boot smoke covered by runtests boots.
 
 Pi 5 image: `build-all.sh --rpi5`, target/final-aarch64/kernel-direct tag b7555db9, CONFIG_BOARD_RPI5=y.
+
+## Real Pi 5 result 2026-10-31
+- good ab90917bd8 → trial b7555db96b: straggler, reset to the card kernel (expected: the unfixed kernel did the kexec).
+- card → trial b7555db96b: ok.
+- 5/5 trial→trial kexec rounds out of b7555db96b: ok, every round `[KEXEC] park stages: cpu1=4 cpu2=4 cpu3=4`
+  (Wi-Fi up, brcmf active). Before the fix: 2/3–6/6 rounds aborted with the straggler at stage=0.
+- trial → good (6th kexec out of the fix): ok, back on ab90917bd8 in 21 s.
+- Diagnostic lane A was not needed: the fix result confirms H1 (brcmf service loop under spin::Mutex with no park point).
