@@ -115,3 +115,38 @@ backup entries+header first, then the primary, then re-reads and verifies both
 CRCs. `leandros-install gaps --dev X [--sector-size N]` lists the entries and
 unallocated 1 MiB-aligned ranges of at least 1 MiB. `mkhome` explicitly zeroes
 all f2fs metadata blocks `[0, main_blkaddr)` before writing the head.
+
+## Shrinking a Linux ext4 partition (dual-boot session A)
+
+```
+leandros-install shrink --part /dev/Xp2 --to SIZE [--dry-run] --yes [--json]
+leandros-install shrink --recover [--part DEV] [--dir D] --yes [--json]
+leandros-install shrink-status [--dir D] [--mark-verified] [--json]
+```
+
+`shrink` resizes the ext4 filesystem only; the GPT is untouched (the GUI
+boots Linux once to check it, then installs into the freed space). It backs up
+the superblock/metadata (`e2image`), rehearses the resize on a sparse clone,
+hashes files that live above the new end, runs `e2fsck -fy -z` and
+`resize2fs -z -p` with e2undo files on the stick, and rolls back from the undo
+files on any failure. `--recover` replays the undo files after a crash.
+
+`list --json` disks carry an optional object for the largest unmounted
+ext2/3/4 Linux partition:
+`"shrink":{"part":"/dev/nvme0n1p2","cur_bytes":N,"min_bytes":N}` (`min_bytes`
+is an estimate: used space plus 5 percent; the real gate is S8).
+
+With `--json`, `shrink` emits, one object per line:
+
+- `{"ev":"gate","id":"S0".."S10","name":..,"status":"pass"|"fail","msg":..}`
+  (S1-S6 superblock, S7 swap, S0 mounted, S8 target size >= minimum + 2 GiB,
+  S9 stick space, S10 fsck). A failed gate is followed by `{"ev":"error"}`
+  and exit status 1.
+- `{"ev":"shrink_info",...}` sizes, `{"ev":"step","name":"backup|rehearse|hash|fsck|resize|verify","pct":0..100}`
+- `{"ev":"done","part":..,"new_bytes":..,"old_bytes":..,"state":"boot_linux"}`
+  (`--dry-run` adds `"dry_run":true`; `--recover` emits `"recovered":true`).
+
+`shrink-status --json` emits `{"ev":"shrink_status","state":S,...}` with `S`
+one of `none`, `interrupted` (run `shrink --recover`), `boot_linux` (shrunk,
+boot Linux to verify), `ready_b` (verified; the install may proceed).
+`--mark-verified` moves `boot_linux` to `ready_b`.

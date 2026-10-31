@@ -248,7 +248,7 @@ impl Part {
     }
 }
 
-fn read_sb_path(dev: &str) -> Result<Sb, String> {
+pub fn read_sb_path(dev: &str) -> Result<Sb, String> {
     let mut f = File::open(dev).map_err(|e| format!("{}: {}", dev, e))?;
     let mut b = vec![0u8; 2048];
     f.seek(SeekFrom::Start(1024)).and_then(|_| f.read_exact(&mut b[..1024])).map_err(|e| format!("{}: {}", dev, e))?;

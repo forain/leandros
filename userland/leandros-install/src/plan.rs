@@ -31,6 +31,8 @@ pub struct DiskInfo {
     pub gaps: Vec<(u64, u64)>,
     pub dualboot: bool,
     pub dualboot_reason: String,
+    /// Largest unmounted ext2/3/4 Linux partition: (dev, fs bytes, estimated minimum bytes).
+    pub shrink: Option<(String, u64, u64)>,
 }
 
 pub fn read_to_string(p: &str) -> String {
@@ -203,6 +205,19 @@ pub fn gather(allow_removable: bool, root_bytes: u64) -> Vec<DiskInfo> {
         let gaps = if is_boot || is_mounted { Vec::new() } else { crate::dualboot::gaps_of(&format!("/dev/{}", n), size) };
         let (dualboot, dualboot_reason) =
             crate::dualboot::eligibility(is_boot, is_mounted, size, parts.iter().any(|p| p.kind == Kind::Esp), &gaps);
+        let shrink = if is_boot || is_mounted {
+            None
+        } else {
+            parts
+                .iter()
+                .filter(|p| p.kind == Kind::Linux)
+                .filter_map(|p| {
+                    let sb = crate::shrink::read_sb_path(&p.dev).ok()?;
+                    let used = (sb.blocks - sb.free_blocks) * sb.bs;
+                    Some((p.dev.clone(), sb.blocks * sb.bs, used + used / 20))
+                })
+                .max_by_key(|x| x.1)
+        };
         v.push(DiskInfo {
             name: n.clone(),
             dev: format!("/dev/{}", n),
@@ -219,6 +234,7 @@ pub fn gather(allow_removable: bool, root_bytes: u64) -> Vec<DiskInfo> {
             gaps,
             dualboot,
             dualboot_reason,
+            shrink,
         });
     }
     v
@@ -233,9 +249,13 @@ impl DiskInfo {
             .collect();
         let gaps: Vec<String> = self.gaps.iter().map(|g| format!("{{\"start\":{},\"sectors\":{}}}", g.0, g.1 - g.0 + 1)).collect();
         format!(
-            "{{\"ev\":\"disk\",\"name\":\"{}\",\"dev\":\"{}\",\"size\":{},\"bus\":\"{}\",\"model\":\"{}\",\"removable\":{},\"ro\":{},\"boot\":{},\"eligible\":{},\"reason\":\"{}\",\"parts\":[{}],\"gaps\":[{}],\"dualboot\":{},\"dualboot_reason\":\"{}\"}}",
+            "{{\"ev\":\"disk\",\"name\":\"{}\",\"dev\":\"{}\",\"size\":{},\"bus\":\"{}\",\"model\":\"{}\",\"removable\":{},\"ro\":{},\"boot\":{},\"eligible\":{},\"reason\":\"{}\",\"parts\":[{}],\"gaps\":[{}],\"dualboot\":{},\"dualboot_reason\":\"{}\"{}}}",
             esc(&self.name), esc(&self.dev), self.size, self.bus, esc(&self.model), self.removable, self.ro, self.boot, self.eligible, esc(&self.reason), parts.join(","),
-            gaps.join(","), self.dualboot, esc(&self.dualboot_reason)
+            gaps.join(","), self.dualboot, esc(&self.dualboot_reason),
+            match &self.shrink {
+                Some((d, c, m)) => format!(",\"shrink\":{{\"part\":\"{}\",\"cur_bytes\":{},\"min_bytes\":{}}}", esc(d), c, m),
+                None => String::new(),
+            }
         )
     }
 
