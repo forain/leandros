@@ -34,6 +34,44 @@ pub mod board_mac { pub const ETH: u32 = 0; pub const WIFI: u32 = 1; pub const B
 /// `kapi_dma_sync` directions beyond 0..2: raw cache maintenance on any mapped VA (also `kapi_vmap` aliases).
 pub mod dma_dir { pub const CLEAN: u32 = 3; pub const INVALIDATE: u32 = 4; }
 
+/// HDMI sink facts from the boot probe (`kapi_hdmi_sink_info`). `size` is `size_of::<KHdmiSink>()`.
+/// `state`: hdmi_probe PROBE_* (2 = done). `port_flags`: bit0 valid, 1 hpd, 2 hdmi mode, 3 active, 4 gate open (hdmi0).
+/// `pix_khz`: measured pixel clock (0 unknown). `sink`: EDID verdict, 0 unknown, 1 HDMI, 2 DVI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KHdmiSink { pub size: u32, pub state: u32, pub port_flags: u32, pub pix_khz: u32, pub sink: u32 }
+
+pub mod sys_dma40 {
+    use super::KHdmiSink;
+    pub type Dma40ClaimFn = unsafe extern "C" fn(i32) -> i64;
+    pub type Dma40ReleaseFn = unsafe extern "C" fn(u32) -> i32;
+    pub type Dma40StartCyclicFn = unsafe extern "C" fn(u32, u64, usize, usize, u64, u32, u32) -> i64;
+    pub type Dma40StopFn = unsafe extern "C" fn(u32) -> i32;
+    pub type Dma40PositionFn = unsafe extern "C" fn(u32) -> i64;
+    pub type Dma40PeriodsFn = unsafe extern "C" fn(u32) -> u64;
+    pub type Dma40PollFn = unsafe extern "C" fn(u32) -> i32;
+    pub type Dma40PolledFn = unsafe extern "C" fn() -> i32;
+    pub type HdmiSinkInfoFn = unsafe extern "C" fn(*mut KHdmiSink) -> i32;
+    extern "C" {
+        /// Claim a dma40 channel (`prefer` < 0 = any). Handle (> 0) or -errno (-19 not a BCM2712, -16 none free).
+        pub fn kapi_dma40_claim(prefer: i32) -> i64;
+        pub fn kapi_dma40_release(h: u32) -> i32;
+        /// Cyclic mem-to-FIFO ring (CPU physical addresses, `dreq_cell` = the DT `dmas` cell). Periods or -errno.
+        pub fn kapi_dma40_start_cyclic(h: u32, ring: u64, len: usize, period: usize, fifo: u64, dreq_cell: u32, irq_per_period: u32) -> i64;
+        /// 0, -110 when the abort timed out, -22 bad handle.
+        pub fn kapi_dma40_stop(h: u32) -> i32;
+        /// Byte offset the engine reads next, -1 when no ring runs, -22 bad handle.
+        pub fn kapi_dma40_position(h: u32) -> i64;
+        pub fn kapi_dma40_periods(h: u32) -> u64;
+        /// Service a pending INT (polled mode): 1 serviced, 0 none, -22 bad handle.
+        pub fn kapi_dma40_poll(h: u32) -> i32;
+        /// 1 when the engine completes by polling (no IRQ), 0 IRQ mode, -19 off a BCM2712.
+        pub fn kapi_dma40_polled() -> i32;
+        /// 0 ok, -22 null/short buffer.
+        pub fn kapi_hdmi_sink_info(out: *mut KHdmiSink) -> i32;
+    }
+}
+
 pub mod sys_plat {
     use super::*;
     pub type PlatRegisterFn = unsafe extern "C" fn(KmodId, *const u8, usize, KPlatProbeFn, usize) -> i32;

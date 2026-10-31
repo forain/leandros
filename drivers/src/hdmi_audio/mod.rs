@@ -11,15 +11,26 @@
 
 pub mod pure;
 
-#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "hdmi-audio"))]
 pub use hw::*;
 
-#[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
+#[cfg(not(all(target_arch = "aarch64", feature = "rpi5", feature = "hdmi-audio")))]
 pub use stub::*;
 
 pub type SerrorCheck = fn() -> Option<u64>;
 
+/// Boot-probe facts for hdmi0 as `(state, port_flags, pix_khz, edid_sink)`; all 0 off the rpi5 build.
+/// Independent of the `hdmi-audio` feature: the probe is also what an out-of-tree audio module reads.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub fn sink_info() -> (u32, u32, u32, u32) {
+    use crate::hdmi_probe as p;
+    use core::sync::atomic::Ordering::Relaxed;
+    (p::state(), p::PORT_FLAGS[0].load(Relaxed), p::PORT_PIX_KHZ[0].load(Relaxed), p::EDID_SINK.load(Relaxed))
+}
 #[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
+pub fn sink_info() -> (u32, u32, u32, u32) { (0, 0, 0, 0) }
+
+#[cfg(not(all(target_arch = "aarch64", feature = "rpi5", feature = "hdmi-audio")))]
 mod stub {
     use alloc::string::String;
     /// Builds without the rpi5 feature have no HDMI audio.
@@ -40,7 +51,7 @@ mod stub {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "hdmi-audio"))]
 mod hw {
     use super::pure::*;
     use crate::bcm2712_dma40 as dma;

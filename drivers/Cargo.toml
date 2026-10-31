@@ -40,6 +40,8 @@ r8169 = []
 macb = []
 virtio-net = []
 virtio-snd = []
+# CONFIG_HDMI_AUDIO (Pi 5): gates drivers/src/hdmi_audio/ hardware code; off = stub (probe() = Err).
+hdmi-audio = []
 # Hidden CONFIG_WIFI_STACK: shared 802.11 code (frames, crypto, HT, manager).
 wifi-stack = []
 iwlwifi = ["wifi-stack"]
