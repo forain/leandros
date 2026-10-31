@@ -23,6 +23,8 @@ pub struct Opts {
     pub json: bool,
     pub dualboot: bool,
     pub use_free: bool,
+    pub after_shrink: bool,
+    pub backup_root: Option<String>,
 }
 
 pub fn list(o: &Opts) {

@@ -6,22 +6,25 @@
 # --installed: additionally verifies the LeandrOS side (p4-p6 in the gap with
 # no-auto attrs, p2 shrunk but intact, /EFI/leandros, limine.conf paths and
 # root=PARTUUID, /loader/entries/leandros.conf).
+# --sessb [ATTRS]: with --installed, session B layout: p2 shrunk (start, GUID, attributes ATTRS
+# unchanged, end > fs end, 1 MiB aligned) and p4-p7 inside the freed tail of p2's old range.
 # --boot <arch>: boots a cp -c clone in QEMU through systemd-boot into the
 # Linux kernel and asserts LINUX-DUALBOOT-OK (serial only), no screenshots.
 set -eu
 IMG=${1:?usage: $0 <img> [--installed] [--boot <arch>]}; shift
 HERE=$(cd "$(dirname "$0")" && pwd)
-SHRUNK=0; MODE=pristine; BOOT=""; FORCE_KERNEL=""
+SHRUNK=0; SESSB=0; P2ATTRS=""; MODE=pristine; BOOT=""; FORCE_KERNEL=""
 while [ $# -gt 0 ]; do case "$1" in
   --installed) MODE=installed ;;
   --shrunk) SHRUNK=1 ;;
+  --sessb) SESSB=1; P2ATTRS=${2:-}; shift ;;
   --boot) BOOT=$2; shift ;;
   *) echo "unknown arg $1" >&2; exit 2 ;; esac; shift; done
 IMG=$(cd "$(dirname "$IMG")" && pwd)/$(basename "$IMG")
 RC=0
 if [ -z "$BOOT" ] || [ "$MODE" = installed ]; then
   . "$HERE/container-lib.sh"; leandros_pick_container || { echo "no container: $CT_WHY" >&2; exit 1; }
-  $CT run --rm -e MODE=$MODE -e SHRUNK=$SHRUNK -v "$HERE/dualboot-fixture:/scripts:ro" \
+  $CT run --rm -e MODE=$MODE -e SHRUNK=$SHRUNK -e SESSB=$SESSB -e P2ATTRS=$P2ATTRS -v "$HERE/dualboot-fixture:/scripts:ro" \
     -v "$IMG:/img:ro" $(for s in meta manifest esp.sha256; do [ -f "$IMG.$s" ] && printf -- '-v %s:/img.%s:ro ' "$IMG.$s" "$s"; done) \
     alpine:3.21 sh /scripts/check-inner.sh || RC=$?
 fi
@@ -35,7 +38,7 @@ if [ -n "$BOOT" ]; then
   esac
   [ "$BOOT" = aarch64 ] && [ "$(uname -m)" != arm64 ] && MACH="-machine virt -cpu max -accel tcg"
   T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-  cp -c "$IMG" "$T/disk.img"
+  if [ "${FX_BOOT_INPLACE:-0}" = 1 ]; then ln -s "$IMG" "$T/disk.img"; else cp -c "$IMG" "$T/disk.img"; fi
   VARS=$T/vars.fd
   if [ "$BOOT" = x86_64 ]; then cp /opt/homebrew/share/qemu/edk2-i386-vars.fd "$VARS"; else dd if=/dev/zero of="$VARS" bs=1m count=64 2>/dev/null; fi
   DISKDEV="${FX_DISKDEV:-virtio-blk-pci}"
@@ -47,7 +50,7 @@ if [ -n "$BOOT" ]; then
     > "$T/serial.log" 2>&1 &
   QP=$!; i=0
   while kill -0 $QP 2>/dev/null && [ $i -lt ${FX_BOOT_TIMEOUT:-240} ]; do
-    grep -q 'LINUX-DUALBOOT-\(OK\|FAIL\)' "$T/serial.log" && break; sleep 1; i=$((i+1)); done
+    if [ "${FX_BOOT_INPLACE:-0}" = 1 ]; then : ; else grep -q 'LINUX-DUALBOOT-\(OK\|FAIL\)' "$T/serial.log" && break; fi; sleep 1; i=$((i+1)); done
   kill $QP 2>/dev/null || true; wait $QP 2>/dev/null || true
   tr -d '\r' < "$T/serial.log" | grep -E 'fixture-init|LINUX-DUALBOOT|Linux version|systemd-boot' | head -8 | cut -c1-160
   if tr -d '\r' < "$T/serial.log" | grep -q 'LINUX-DUALBOOT-OK.* bad=0'; then echo "PASS boot $BOOT"

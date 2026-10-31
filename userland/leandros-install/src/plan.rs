@@ -33,6 +33,8 @@ pub struct DiskInfo {
     pub dualboot_reason: String,
     /// Largest unmounted ext2/3/4 Linux partition: (dev, fs bytes, estimated minimum bytes).
     pub shrink: Option<(String, u64, u64)>,
+    /// Session B state for this disk: "", "boot_linux" or "ready_b".
+    pub finish: &'static str,
 }
 
 pub fn read_to_string(p: &str) -> String {
@@ -234,6 +236,7 @@ pub fn gather(allow_removable: bool, root_bytes: u64) -> Vec<DiskInfo> {
             gaps,
             dualboot,
             dualboot_reason,
+            finish: if is_boot || is_mounted { "" } else { crate::shrink::finish_state_for(&format!("/dev/{}", n)) },
             shrink,
         });
     }
@@ -249,9 +252,9 @@ impl DiskInfo {
             .collect();
         let gaps: Vec<String> = self.gaps.iter().map(|g| format!("{{\"start\":{},\"sectors\":{}}}", g.0, g.1 - g.0 + 1)).collect();
         format!(
-            "{{\"ev\":\"disk\",\"name\":\"{}\",\"dev\":\"{}\",\"size\":{},\"bus\":\"{}\",\"model\":\"{}\",\"removable\":{},\"ro\":{},\"boot\":{},\"eligible\":{},\"reason\":\"{}\",\"parts\":[{}],\"gaps\":[{}],\"dualboot\":{},\"dualboot_reason\":\"{}\"{}}}",
+            "{{\"ev\":\"disk\",\"name\":\"{}\",\"dev\":\"{}\",\"size\":{},\"bus\":\"{}\",\"model\":\"{}\",\"removable\":{},\"ro\":{},\"boot\":{},\"eligible\":{},\"reason\":\"{}\",\"parts\":[{}],\"gaps\":[{}],\"dualboot\":{},\"dualboot_reason\":\"{}\",\"finish\":\"{}\"{}}}",
             esc(&self.name), esc(&self.dev), self.size, self.bus, esc(&self.model), self.removable, self.ro, self.boot, self.eligible, esc(&self.reason), parts.join(","),
-            gaps.join(","), self.dualboot, esc(&self.dualboot_reason),
+            gaps.join(","), self.dualboot, esc(&self.dualboot_reason), self.finish,
             match &self.shrink {
                 Some((d, c, m)) => format!(",\"shrink\":{{\"part\":\"{}\",\"cur_bytes\":{},\"min_bytes\":{}}}", esc(d), c, m),
                 None => String::new(),

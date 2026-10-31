@@ -150,3 +150,33 @@ With `--json`, `shrink` emits, one object per line:
 one of `none`, `interrupted` (run `shrink --recover`), `boot_linux` (shrunk,
 boot Linux to verify), `ready_b` (verified; the install may proceed).
 `--mark-verified` moves `boot_linux` to `ready_b`.
+
+## Finishing after the shrink (dual-boot session B)
+
+```
+leandros-install install --mode dualboot --target /dev/X --after-shrink [--dry-run] --yes [--json]
+```
+
+Runs the free-space install (`--use-free`, same code path) after cutting p2's
+GPT entry back to the shrunk filesystem. Gate `B1` (shrink session) requires:
+
+- a finished session A on this disk, and Linux booted since. Detection: session A
+  records the ext4 superblock's last-mount time and mount count when it
+  finishes; `shrink-status` reports `ready_b` once either differs and the
+  filesystem is clean again (state valid, no errors). The manual override is
+  `shrink-status --mark-verified` ("Linux booted fine" in the GUI);
+- the ext4 superblock clean (S1-S6) and blocks x block size equal to session A's
+  `new_blocks` x `block_size`;
+- the partition not mounted.
+
+New p2 end = `start + ceil(fs_bytes / sector) - 1`, rounded up so that the next
+sector is 1 MiB aligned (the freed space stays aligned); never below the
+filesystem end (asserted). Start, GUID, name and attributes are untouched. A p2
+that already ends there (an interrupted session B) is accepted and the install
+resumes. Writes go through BLKWRWIN limited to the GPT areas and the freed gap:
+first the shrunk table alone (backup entries+header, then primary, verified),
+then the full table with the four LeandrOS partitions. `--dry-run` prints
+`{"ev":"shrink_gpt",...}` (old/new p2 end) and the combined `plan` (`old_gpt`
+is the table on disk, `new_gpt` the final one). On success the session phase
+becomes `b_done` (`shrink-status` reports `none`). `list --json` disks carry
+`"finish":"ready_b"|"boot_linux"|""` for the GUI.
