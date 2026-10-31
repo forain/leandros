@@ -165,7 +165,12 @@ kconfig_features() {
     mkdir -p "$ROOT_DIR/target/kconfig-$arch"
     cfg="$ROOT_DIR/target/kconfig-$arch/.config"
     if [[ -f "$ROOT_DIR/.config" ]]; then
-        python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" olddefconfig --arch "$arch" --config "$ROOT_DIR/.config" --out "$cfg" >&2
+        # .config overrides the target's defconfig instead of replacing it: a
+        # partial .config (say CONFIG_MODULES=y + one =m line) used to drop the
+        # board options (BOARD_RPI5 -> no SDHCI, no root; INTEL=1 laptop set).
+        # Kconfig takes the last assignment, so the defconfig goes first.
+        cat "$ROOT_DIR/configs/${def}_defconfig" "$ROOT_DIR/.config" > "$cfg.in"
+        python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" olddefconfig --arch "$arch" --config "$cfg.in" --out "$cfg" >&2
     else
         python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" defconfig --arch "$arch" --defconfig "$ROOT_DIR/configs/${def}_defconfig" --out "$cfg" >&2
     fi
