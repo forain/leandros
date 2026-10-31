@@ -619,16 +619,17 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
     put(&format!("{}/E2IMAGE.sha256", dir), &format!("{}  p{}.e2i\n", want, p.n))?;
     files.push(format!("p{}.e2i", p.n));
     out.step("backup", 100);
-    let undo_fsck = format!("{}/fsck.e2undo", dir);
-    let undo_rs = format!("{}/resize.e2undo", dir);
+    // One undo file for e2fsck and resize2fs: e2fsprogs appends to it, and a
+    // single e2undo then restores the pre-fsck state (two files cannot both be
+    // replayed after a crash: the first e2undo rewrites the superblock).
+    let undo = format!("{}/shrink.e2undo", dir);
     let mut st = vec![
         ("phase", "prepared".to_string()),
         ("part", dev.clone()),
         ("orig_blocks", sb.blocks.to_string()),
         ("new_blocks", new_blocks.to_string()),
         ("block_size", sb.bs.to_string()),
-        ("fsck_undo", undo_fsck.clone()),
-        ("resize_undo", undo_rs.clone()),
+        ("undo", undo.clone()),
         ("backup_dir", dir.clone()),
     ];
     state_write(&dir, &st)?;
@@ -681,15 +682,15 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
 
     // ---- 4. the real run
     p.window()?;
-    let res = real_run(&dev, &mut st, &dir, &undo_fsck, &undo_rs, new_blocks, &out, &hashes, sb.bs);
+    let res = real_run(&dev, &mut st, &dir, &undo, new_blocks, &out, &hashes, sb.bs);
     p.close();
     match res {
         Ok(()) => {}
         Err(e) => {
             // Roll back with e2undo (window re-opened).
             out.info(&format!("rolling back: {}", e));
-            let _ = state_write(&dir, &[("phase", "rollback".into()), ("part", dev.clone()), ("fsck_undo", undo_fsck.clone()), ("resize_undo", undo_rs.clone()), ("backup_dir", dir.clone()), ("orig_blocks", sb.blocks.to_string()), ("new_blocks", new_blocks.to_string()), ("block_size", sb.bs.to_string())]);
-            let rb = rollback(&dev, &mut p, &undo_fsck, &undo_rs, &sb, &out);
+            let _ = state_write(&dir, &[("phase", "rollback".into()), ("part", dev.clone()), ("undo", undo.clone()), ("backup_dir", dir.clone()), ("orig_blocks", sb.blocks.to_string()), ("new_blocks", new_blocks.to_string()), ("block_size", sb.bs.to_string())]);
+            let rb = rollback(&dev, &mut p, &undo, &format!("{}/sb.orig", dir), false, &sb, &out);
             let _ = state_write(&dir, &[("phase", if rb.is_ok() { "rolled_back" } else { "rollback_failed" }.into()), ("part", dev.clone()), ("backup_dir", dir.clone())]);
             return Err(match rb {
                 Ok(()) => format!("{}; the filesystem was restored with e2undo and verified", e),
@@ -697,7 +698,7 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
             });
         }
     }
-    let _ = state_write(&dir, &[("phase", "done".into()), ("part", dev.clone()), ("orig_blocks", sb.blocks.to_string()), ("new_blocks", new_blocks.to_string()), ("block_size", sb.bs.to_string()), ("fsck_undo", undo_fsck), ("resize_undo", undo_rs), ("backup_dir", dir.clone())]);
+    let _ = state_write(&dir, &[("phase", "done".into()), ("part", dev.clone()), ("orig_blocks", sb.blocks.to_string()), ("new_blocks", new_blocks.to_string()), ("block_size", sb.bs.to_string()), ("undo", undo), ("backup_dir", dir.clone())]);
     let nsb = read_sb_path(&dev)?;
     out.event(
         &format!("{{\"ev\":\"done\",\"part\":\"{}\",\"new_bytes\":{},\"old_bytes\":{},\"backup_dir\":\"{}\",\"state\":\"boot_linux\",\"hashed\":{}}}", esc(&dev), nsb.blocks * nsb.bs, cur_bytes, esc(&dir), hashes.len()),
@@ -706,7 +707,7 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
     Ok(())
 }
 
-fn real_run(dev: &str, st: &mut Vec<(&str, String)>, dir: &str, undo_fsck: &str, undo_rs: &str, new_blocks: u64, out: &Out, hashes: &[(String, String)], bs: u64) -> Result<(), String> {
+fn real_run(dev: &str, st: &mut Vec<(&str, String)>, dir: &str, undo: &str, new_blocks: u64, out: &Out, hashes: &[(String, String)], bs: u64) -> Result<(), String> {
     let set = |ph: &str, st: &mut Vec<(&str, String)>| {
         for kv in st.iter_mut() {
             if kv.0 == "phase" {
@@ -715,16 +716,25 @@ fn real_run(dev: &str, st: &mut Vec<(&str, String)>, dir: &str, undo_fsck: &str,
         }
         state_write(dir, st)
     };
+    // The original primary superblock, durable before any write to the device.
+    let sbo = read_raw_sb(dev)?;
+    {
+        let path = format!("{}/sb.orig", dir);
+        let mut f = File::create(&path).map_err(|e| format!("{}: {}", path, e))?;
+        f.write_all(&sbo).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+        sync_all();
+    }
     set("fscking", st)?;
     out.step("fsck", 0);
-    let f = run("e2fsck", &["-fy", "-z", undo_fsck, dev])?;
+    let f = run("e2fsck", &["-fy", "-z", undo, dev])?;
     if f.rc & !1 != 0 {
         return Err(format!("e2fsck -fy failed (rc {}): {}", f.rc, tail(&f.text)));
     }
     out.step("fsck", 100);
     set("resizing", st)?;
     out.step("resize", 0);
-    run_resize(dev, undo_rs, new_blocks * bs / 512, out)?;
+    run_resize(dev, undo, new_blocks * bs / 512, out)?;
     out.step("resize", 100);
     set("verifying", st)?;
     out.step("verify", 0);
@@ -743,17 +753,58 @@ fn real_run(dev: &str, st: &mut Vec<(&str, String)>, dir: &str, undo_fsck: &str,
     Ok(())
 }
 
-fn rollback(dev: &str, p: &mut Part, undo_fsck: &str, undo_rs: &str, sb: &Sb, out: &Out) -> Result<(), String> {
+/// Primary superblock (1024 bytes at offset 1024) as it is on the device.
+fn read_raw_sb(dev: &str) -> Result<Vec<u8>, String> {
+    let mut f = File::open(dev).map_err(|e| format!("{}: {}", dev, e))?;
+    f.seek(SeekFrom::Start(1024)).map_err(|e| e.to_string())?;
+    let mut b = vec![0u8; 1024];
+    f.read_exact(&mut b).map_err(|e| e.to_string())?;
+    Ok(b)
+}
+
+/// Offsets (inside the superblock) that e2fsck -fy and e2undo's own forced
+/// close legitimately rewrite: s_wtime(+hi), s_state, s_kbytes_written,
+/// s_lastcheck(+hi), s_checksum.
+fn sb_field_allowed(o: usize) -> bool {
+    (0x30..0x34).contains(&o) || (0x40..0x44).contains(&o) || (0x3a..0x3c).contains(&o)
+        || (0x178..0x180).contains(&o) || o == 0x274 || o == 0x277 || (0x3fc..0x400).contains(&o)
+}
+
+/// After e2undo: put the original superblock back if only the allowed fields differ.
+fn restore_sb(dev: &str, orig_path: &str) -> Result<(), String> {
+    let orig = std::fs::read(orig_path).map_err(|e| format!("{}: {}", orig_path, e))?;
+    if orig.len() != 1024 {
+        return Err(format!("{} is {} bytes, expected 1024", orig_path, orig.len()));
+    }
+    let live = read_raw_sb(dev)?;
+    let bad: Vec<String> = (0..1024).filter(|&i| orig[i] != live[i] && !sb_field_allowed(i)).map(|i| format!("0x{:x}", i)).collect();
+    if !bad.is_empty() {
+        return Err(format!("superblock differs after e2undo at unexpected offsets {}; left as is", bad.join(",")));
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).open(dev).map_err(|e| format!("{}: {}", dev, e))?;
+    f.seek(SeekFrom::Start(1024)).map_err(|e| e.to_string())?;
+    f.write_all(&orig).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Roll the filesystem back with ONE e2undo, then restore the original
+/// superblock. `crash`: the undo file may end in a half-written record, which
+/// e2undo reports as "Incomplete undo record" with rc 0; elsewhere that, or any
+/// non-zero rc, is fatal.
+fn rollback(dev: &str, p: &mut Part, undo: &str, sb_orig: &str, crash: bool, sb: &Sb, out: &Out) -> Result<(), String> {
     p.window()?;
-    let mut msgs = vec![];
-    for u in [undo_rs, undo_fsck] {
-        if !std::path::Path::new(u).exists() {
-            continue;
-        }
-        let r = run("e2undo", &[u, dev])?;
-        out.info(&format!("e2undo {}: rc {} {}", u, r.rc, tail(&r.text)));
+    if std::path::Path::new(undo).exists() {
+        let r = run("e2undo", &[undo, dev])?;
+        out.info(&format!("e2undo {}: rc {} {}", undo, r.rc, tail(&r.text)));
         if r.rc != 0 {
-            msgs.push(format!("e2undo {}: {}", u, tail(&r.text)));
+            return Err(format!("e2undo {} failed (rc {}): {}", undo, r.rc, tail(&r.text)));
+        }
+        if !crash && r.text.contains("Incomplete undo record") {
+            return Err(format!("e2undo {}: incomplete undo file outside a crash: {}", undo, tail(&r.text)));
+        }
+        if std::path::Path::new(sb_orig).exists() {
+            restore_sb(dev, sb_orig)?;
         }
     }
     p.close();
@@ -761,7 +812,7 @@ fn rollback(dev: &str, p: &mut Part, undo_fsck: &str, undo_rs: &str, sb: &Sb, ou
     let c = fsck_n(dev)?;
     let nsb = read_sb_path(dev)?;
     if c.rc != 0 {
-        return Err(format!("after e2undo e2fsck -fn rc {}: {} {}", c.rc, tail(&c.text), msgs.join("; ")));
+        return Err(format!("after e2undo e2fsck -fn rc {}: {}", c.rc, tail(&c.text)));
     }
     if nsb.blocks != sb.blocks {
         return Err(format!("after e2undo the size is {} blocks, expected {}", nsb.blocks, sb.blocks));
@@ -785,9 +836,8 @@ fn recover(o: &Opts, out: &Out) -> Result<(), String> {
     let mut p = open_part(&dev)?;
     let sb = Sb { blocks: orig, ..Default::default() };
     out.step("recover", 0);
-    let ufsck = s.get("fsck_undo").cloned().unwrap_or_default();
-    let urs = s.get("resize_undo").cloned().unwrap_or_default();
-    let r = rollback(&dev, &mut p, &ufsck, &urs, &sb, out);
+    let undo = s.get("undo").cloned().unwrap_or_else(|| format!("{}/shrink.e2undo", dir));
+    let r = rollback(&dev, &mut p, &undo, &format!("{}/sb.orig", dir), true, &sb, out);
     if r.is_err() && phase == "prepared" {
         // Crashed before any ext4 write: only the clean check matters.
         let c = fsck_n(&dev)?;

@@ -4,9 +4,9 @@
 #  (a) shrink p2 of a fx-aarch64 clone (NVMe target of the LeandrOS stick) to 10 GiB;
 #      host: e2fsck -fn clean, manifest OK, GPT byte-identical, block count; the
 #      fixture alone boots Linux (LINUX-DUALBOOT-OK); shrink-status flow.
-#  (b) crash injection: QMP `quit` mid-resize2fs at three progress points, reboot
-#      the stick, `shrink --recover`; p2 must equal the pre-image (one MiB of
-#      superblock fields aside), fsck-clean, manifest intact.
+#  (b) crash injection: kill -9 of qemu mid-resize2fs at three progress points, reboot
+#      the stick, `shrink --recover`; p2 must be byte-identical to the pre-image (superblock
+#      restored from sb.orig), fsck-clean, manifest intact.
 #  (c) every refusal gate once (superblock gates on small ext4 files edited with
 #      debugfs; hibernated swap, target size, stick space on the real fixture).
 #
@@ -27,11 +27,13 @@ export LEANDROS_REMOTE="qemu:$RUN_ID" MTOOLS_SKIP_CHECK=1
 REMOTE="python3 $ROOT/scripts/remote.py"
 BIN="${LEANDROS_INSTALL_BIN:-$ROOT/userland/leandros-install/target/aarch64-unknown-linux-musl/release/leandros-install}"
 CRASH_PCTS="${CRASH_PCTS:-10 40 75}"
+PHASES="${PHASES:-c a b d}"   # subset, e.g. PHASES=b CRASH_PCTS=40
+phase() { case " $PHASES " in *" $1 "*) return 0;; esac; echo "-- phase $1 skipped (PHASES=$PHASES)"; return 1; }
 DISK="$WORK/disk.img"; STICK="$WORK/stick.img"; QMP="$WORK/qmp.sock"
 QPID=""
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }
-rm_images() { rm -f "${WORK:?}/disk.img" "${WORK:?}"/disk.img.* "${WORK:?}/stick.img" "${WORK:?}/stick.base"; }
+rm_images() { [ "${KEEP_IMAGES:-0}" = 1 ] && return 0; rm -f "${WORK:?}/disk.img" "${WORK:?}"/disk.img.* "${WORK:?}/stick.img" "${WORK:?}/stick.base"; }
 cleanup() { [ -n "$QPID" ] && kill "$QPID" 2>/dev/null || true; rm -f "$STATE" "$QMP"; rm_images; }
 trap cleanup EXIT
 r() { $REMOTE run "$1" | tr -d '\r'; }
@@ -65,7 +67,13 @@ stop_vm() {
     for i in $(seq 1 60); do kill -0 "$QPID" 2>/dev/null || { QPID=""; return 0; }; sleep 1; done
     kill "$QPID" 2>/dev/null || true; QPID=""
 }
-qmp_quit() { # abrupt end of the VM: no guest sync, no shutdown
+qmp_quit() { # abrupt end of the VM: no guest sync, no shutdown. kill -9 of the
+    # qemu process (found by its unique QMP socket path); QMP "quit" if that fails.
+    if pkill -9 -f "[q]emu-system.*$QMP" 2>/dev/null; then
+        local j; for j in $(seq 1 30); do pgrep -f "[q]emu-system.*$QMP" >/dev/null || break; sleep 1; done
+        kill -9 "$QPID" 2>/dev/null || true; QPID=""; return 0
+    fi
+    echo "(kill -9 of qemu not possible; using QMP quit)"
     python3 - "$QMP" <<'PY'
 import socket, sys
 s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.recv(4096)
@@ -100,6 +108,7 @@ mkdir -p "$WORK"; rm_images
 GPT0=$(gpt_sig "$SRC")
 "$ROOT/scripts/write-usb.sh" "$ARCH" --image "$WORK/stick.base" --gpt >"$WORK/write-usb.log" 2>&1 || { tail -5 "$WORK/write-usb.log"; fail "write-usb.sh"; }
 
+if phase c; then
 echo "== (c) refusal gates"
 fresh_disk; fresh_stick
 python3 - "$DISK" <<'PY'
@@ -131,6 +140,8 @@ done
 stop_vm
 [ "$(gpt_sig "$DISK")" = "$GPT1" ] && ok "gate runs left the GPT untouched" || fail "GPT changed during gate tests"
 
+fi
+if phase a; then
 echo "== (a) shrink to 10 GiB"
 fresh_disk; fresh_stick
 boot_stick shrink
@@ -161,6 +172,8 @@ r "$LI shrink-status --mark-verified --json" | grep -q '"state":"ready_b"' && ok
 stop_vm
 rm -f "${WORK:?}/stick.done"
 
+fi
+if phase b; then
 echo "== (b) crash injection"
 for PCT in $CRASH_PCTS; do
     echo "-- crash at resize >= ${PCT}%"
@@ -179,16 +192,23 @@ for PCT in $CRASH_PCTS; do
     boot_stick "recover$PCT"
     r "$LI shrink-status --json" | tee "$WORK/statout$PCT.log" | grep -q '"state":"interrupted"' && ok "status: interrupted" || { cat "$WORK/statout$PCT.log"; fail "status after crash"; }
     r "$LI shrink --recover --yes --json; true" > "$WORK/recout$PCT.log"
+    r "ls -la /home/dualboot-backup/\$(cat /home/dualboot-backup/shrink-latest 2>/dev/null | xargs basename 2>/dev/null) 2>/dev/null; ls -la \$(cat /home/dualboot-backup/shrink-latest); true" > "$WORK/bkls$PCT.log"
     grep -q '"recovered":true' "$WORK/recout$PCT.log" || { tail -4 "$WORK/recout$PCT.log"; fail "recover at ${PCT}%"; }
     ok "recovered"
     stop_vm
+    [ "${KEEP_IMAGES:-0}" = 1 ] && { cp -c "$DISK" "$WORK/after$PCT.img"; cp -c "$STICK" "$WORK/stickafter$PCT.img"; }
     "$ROOT/scripts/check-dualboot-fixture.sh" "$DISK" | tee "$WORK/check-crash$PCT.log" | grep -E "^(FAIL|RESULT)"
     grep -q "^RESULT pristine fail=0" "$WORK/check-crash$PCT.log" || fail "post-recovery fixture check (crash $PCT)"
     [ "$(gpt_sig "$DISK")" = "$GPT0" ] && ok "GPT identical" || fail "GPT changed"
     D=$(p2_compare "$SRC" "$DISK"); echo "p2 differing 1 MiB chunks vs the pre-image: $D"
-    [ "${D%% *}" -le 1 ] && ok "p2 identical to the pre-image (superblock fields aside)" || echo "NOTE: p2 differs from the pre-image after recovery: $D (fsck-clean and manifest intact are the pass criteria; chunk list is a follow-up)"
+    [ "${D%% *}" = 0 ] || fail "p2 differs from the pre-image after recovery at ${PCT}%: $D"
+    ok "p2 byte-identical to the pre-image"
+    ! grep -q "doesn't match\|Corrupt" "$WORK/recout$PCT.log" || fail "recovery log has e2undo mismatch/corruption messages (${PCT}%)"
 done
 
+fi
+if phase d; then
 echo "== (d) installer-test"
 ./scripts/installer-test.sh aarch64 virtio 2>&1 | tail -3
+fi
 echo "PASS: dualboot-shrink-test $ARCH"

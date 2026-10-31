@@ -105,6 +105,40 @@ esac
   done
   if [ -s /tmp/missing ]; then echo "unresolved DT_NEEDED:"; cat /tmp/missing; exit 4; fi
 
+  # -- patched libext2fs: durable undo records (ports/e2fsprogs/patches) --------
+  # Alpine's undo_io never fsyncs the undo file before the protected write, and
+  # keeps records in unix_io's write-back cache. Rebuild libext2fs.so.2 from the
+  # same 1.47.1 source with patches/undo-durable.patch and use it instead.
+  E2V=1.47.1
+  TARB=/out/e2fsprogs-$E2V.tar.xz
+  if [ ! -s "$TARB" ]; then
+    apk add --no-cache wget xz ca-certificates >/dev/null
+    wget -q -O "$TARB.part" "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$E2V/e2fsprogs-$E2V.tar.xz"
+    mv "$TARB.part" "$TARB"
+  fi
+  apk add --no-cache xz patch make pkgconf linux-headers >/dev/null
+  B=/tmp/e2fs-build-$ARCH
+  rm -rf "$B"; mkdir -p "$B"
+  tar xf "$TARB" -C "$B"
+  ( cd "$B/e2fsprogs-$E2V" && patch -p1 < /src/undo-durable.patch )
+  mkdir -p "$B/o"
+  if [ "$(uname -m)" = "$ARCH" ]; then
+    ( cd "$B/o" && ../e2fsprogs-$E2V/configure --prefix=/usr --enable-elf-shlibs \
+        --disable-nls --disable-fsck --disable-uuidd --enable-libuuid --enable-libblkid \
+        CFLAGS="-O2" >/dev/null && make -C lib/et all >/dev/null && make -C lib/ext2fs ext2_err.h >/dev/null && for d in e2p ext2fs; do make -j"$(nproc)" -C lib/$d all >/dev/null || exit 1; done )
+  else
+    ( cd "$B/o" && ../e2fsprogs-$E2V/configure --prefix=/usr --enable-elf-shlibs \
+        --host=$ARCH-alpine-linux-musl --build=$(uname -m)-alpine-linux-musl \
+        --disable-nls --disable-fsck --disable-uuidd --enable-libuuid --enable-libblkid \
+        BUILD_CC=cc CC="$CC" CFLAGS="-O2" >/dev/null && make -C lib/et all >/dev/null && make -C lib/ext2fs ext2_err.h >/dev/null && for d in e2p ext2fs; do make -j"$(nproc)" -C lib/$d all >/dev/null || exit 1; done )
+  fi
+  PL=$(ls "$B"/o/lib/libext2fs.so.2.* | head -1)
+  [ -f "$PL" ] || { echo "patched libext2fs not built"; exit 6; }
+  nm -D "$PL" 2>/dev/null | grep -q ext2fs_open || readelf --dyn-syms "$PL" | grep -q ext2fs_open
+  cp -L "$PL" "$S/usr/lib/libext2fs.so.2"
+  echo "patched  libext2fs.so.2  <- e2fsprogs-$E2V + undo-durable.patch" >> "$S/CLOSURE.txt"
+  echo "== patched libext2fs NEEDED =="; readelf -d "$S/usr/lib/libext2fs.so.2" | grep -E 'NEEDED|SONAME'
+
   # -- ELF fix-ups (as ports/pipewire) --------------------------------------------
   $CC -shared -fPIC -fno-stack-protector -nostdlib -Wl,-soname,libleandros_ssp.so.1 \
     -o "$S/usr/lib/libleandros_ssp.so.1" /src/ssp_guard.c

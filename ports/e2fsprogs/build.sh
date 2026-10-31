@@ -25,7 +25,7 @@ stage_alpine() {
   . "$ROOT/scripts/container-lib.sh"
   leandros_pick_alpine || { echo "no Alpine backend: $ALPINE_WHY"; return 1; }
   SNAP=$(mktemp -d "${TMPDIR:-/tmp}/e2fsprogs-port-src.XXXXXX")
-  cp "$HERE/build-in-alpine.sh" "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
+  cp "$HERE/build-in-alpine.sh" "$HERE/patches/undo-durable.patch" "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
   leandros_alpine_run --arch "$ARCH" -v "$SNAP:/src:ro" -v "$OUT:/out" \
       -- sh /src/build-in-alpine.sh "$ARCH" > "$OUT/$ARCH.alpine.log" 2>&1 || true
   rm -rf "$SNAP"

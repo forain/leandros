@@ -1,0 +1,36 @@
+--- a/lib/ext2fs/undo_io.c	2026-10-31 00:02:24
++++ b/lib/ext2fs/undo_io.c	2026-10-31 00:02:24
+@@ -331,6 +331,7 @@
+ 	unsigned long long data_size;
+ 	struct undo_key *key;
+ 	__u32 blk_crc;
++	unsigned long long start_undo_blk;
+ 
+ 	data = (struct undo_private_data *) channel->private_data;
+ 
+@@ -362,6 +363,7 @@
+ 	offset = (block * channel->block_size) + data->offset ;
+ 	block_num = offset / data->tdb_data_size;
+ 	end_block = (offset + size - 1) / data->tdb_data_size;
++	start_undo_blk = data->undo_blk_num;
+ 
+ 	while (block_num <= end_block) {
+ 		__u32 keysz;
+@@ -474,6 +476,17 @@
+ 		block_num++;
+ 	}
+ 
++	/*
++	 * LeandrOS: make the new undo records durable (flush our own write-back
++	 * cache, then fsync) before the caller overwrites the protected blocks.
++	 * Blocks that were already recorded cost nothing.
++	 */
++	if (data->undo_blk_num != start_undo_blk) {
++		retval = write_undo_indexes(data, 1);
++		if (retval)
++			return retval;
++	}
++
+ 	return retval;
+ }
+ 
