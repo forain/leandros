@@ -38,6 +38,7 @@ cleanup() { [ -n "$QPID" ] && kill "$QPID" 2>/dev/null || true; rm -f "$STATE" "
 trap cleanup EXIT
 r() { $REMOTE run "$1" | tr -d '\r'; }
 LI=/tmp/leandros-install
+GUI_BIN="${GUI_BIN:-$HOME/code/leandros-artifacts/m6-session-bins/out/leandros-installer-aarch64}"
 P2=/dev/nvme0n1p2
 
 dfguard() { local g; g=$(df -g "$HOME" | awk 'NR==2{print $4}'); [ "$g" -ge 30 ] || fail "only ${g} GiB free on the host; stop"; }
@@ -215,7 +216,7 @@ crash_case() {
     case "$PCT" in
         guarded) FZENV="LEANDROS_SHRINK_FREEZE_AT=guarded"; FZNAME=frozen_guarded ;;
         guard1) FZENV="LEANDROS_SHRINK_FREEZE_GUARD=1"; FZNAME=frozen_guard ;;
-        fsck) FZENV="LEANDROS_SHRINK_FREEZE_FSCK_MS=${FSCK_FREEZE_MS:-30}"; FZNAME=frozen_fsck ;;
+        fsck) FZENV="LEANDROS_SHRINK_FREEZE_FSCK=1"; FZNAME=frozen_fsck ;;
         *) [ "$PCT" -gt "${LAST_PROGRESS_PCT:-60}" ] && PCT=${LAST_PROGRESS_PCT:-60}; FZENV="LEANDROS_SHRINK_FREEZE_PCT=$PCT" ;;
     esac
     [ "$PCT" = "$REQ" ] || echo "(requested ${REQ}% clamped to the last pre-completion progress event, ${PCT}%)"
@@ -279,9 +280,21 @@ PY
     # (2) the state file written right before the kill must be durable on the stick (f2fs.fsync=lazy)
     case "$PCT" in guarded) EXPH=guarded ;; guard1) EXPH=guarding ;; fsck) EXPH=fscking ;; *) EXPH=resizing ;; esac
     grep -q "\"phase\":\"$EXPH\"" "$WORK/statout$PCT.log" && ok "state phase $EXPH durable after kill -9" || { cat "$WORK/statout$PCT.log"; fail "stick state after the kill is not phase $EXPH ($PCT)"; }
+    if [ "$PCT" = fsck ]; then   # the freeze is event-based: the undo file must hold keys, so the rollback really replays
+        KEYS=$got   # frozen_fsck reports the undo key count it saw (taken before the crash)
+        [ "${KEYS:-0}" -gt 0 ] && ok "fsck undo file had $KEYS keys at the freeze" || fail "fsck undo had no keys at the freeze"
+    fi
     if grep -q '"phase":"done"' "$WORK/statout$PCT.log"; then echo "shrink finished before the kill landed (resize is fast); retrying"; stop_vm; return 2; fi
     grep -q '"state":"interrupted"' "$WORK/statout$PCT.log" && ok "status: interrupted" || { cat "$WORK/statout$PCT.log"; fail "status after crash"; }
+    if [ "$PCT" = fsck ] && [ -f "$GUI_BIN" ]; then   # the GUI's startup status + Recover button path
+        $REMOTE push "$GUI_BIN" /tmp/leandros-installer >/dev/null; r 'chmod +x /tmp/leandros-installer'
+        r "printf '#!/bin/sh\n$LI \"\$@\" | tee -a /tmp/rec.out\n' > /tmp/li-tee.sh; chmod +x /tmp/li-tee.sh; rm -f /tmp/rec.out"
+        r "LEANDROS_INSTALL_BIN=/tmp/li-tee.sh /tmp/leandros-installer --self-test-recover; echo GUIRC=\$?" > "$WORK/guirec.log"
+        grep -q "banner interrupted" "$WORK/guirec.log" && grep -q "GUIRC=0" "$WORK/guirec.log" && ok "GUI Recover flow recovered the fsck crash" || { tail -6 "$WORK/guirec.log"; fail "GUI recover flow"; }
+        r "cat /tmp/rec.out" > "$WORK/recout$PCT.log"
+    else
     r "$LI shrink --recover --yes --json; true" > "$WORK/recout$PCT.log"
+    fi
     r "ls -la /home/dualboot-backup/\$(cat /home/dualboot-backup/shrink-latest 2>/dev/null | xargs basename 2>/dev/null) 2>/dev/null; ls -la \$(cat /home/dualboot-backup/shrink-latest); true" > "$WORK/bkls$PCT.log"
     grep -q '"recovered":true' "$WORK/recout$PCT.log" || { tail -4 "$WORK/recout$PCT.log"; fail "recover at ${PCT}%"; }
     ok "recovered"

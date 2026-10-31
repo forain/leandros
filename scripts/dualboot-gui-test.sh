@@ -77,6 +77,10 @@ r "$G --self-test-shrink /dev/nvme1n1 120G" > "$WORK/fake-shrink.log"; grep -q "
 ok "fake: shrink reaches ShrinkDone"
 r "FAKE_GATE_FAIL=1 $G --self-test-shrink /dev/nvme1n1 120G; echo rc=\$?" | grep -q "rc=1" && ok "fake: shrink gate failure is an error" || fail "shrink gate failure"
 
+r "rm -f /tmp/fake-recovered; FAKE_INTERRUPTED=1 $G --self-test-recover; echo rc=\$?" > "$WORK/fake-recover.log"
+grep -q "banner interrupted phase=fscking" "$WORK/fake-recover.log" && grep -q "banner cleared" "$WORK/fake-recover.log" && grep -q "rc=0" "$WORK/fake-recover.log" || { tail -6 "$WORK/fake-recover.log"; fail "fake recover flow"; }
+ok "fake: interrupted shrink -> banner -> Recover -> cleared"
+
 echo "== real backend"
 r "LEANDROS_INSTALL_BIN=/tmp/leandros-install /tmp/leandros-installer --self-test-dualboot /dev/nvme0n1" > "$WORK/real-db.log" || { tail -8 "$WORK/real-db.log"; fail "real dualboot self-test"; }
 grep -q "page Done" "$WORK/real-db.log" || fail "real: no page Done"

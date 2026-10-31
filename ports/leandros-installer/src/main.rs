@@ -34,6 +34,7 @@ enum Op {
     Install,
     Shrink,
     ShrinkStatus,
+    Recover,
 }
 
 /// Slider bounds (GiB) for the Size page: (lo, hi, is_shrink).
@@ -64,6 +65,7 @@ enum Message {
     Ack(bool),
     Backend(Event),
     PowerOff,
+    Recover,
 }
 
 struct App {
@@ -91,6 +93,8 @@ struct App {
     pct: u32,
     installing: bool,
     finished: bool,
+    /// Phase of an interrupted shrink found on startup (None = nothing to recover).
+    interrupted: Option<String>,
 }
 
 fn log(msg: &str) {
@@ -144,6 +148,13 @@ impl App {
         start(args, self.pw())
     }
 
+    fn check_shrink(&mut self) -> Task<Message> {
+        self.error.clear();
+        self.loading = true;
+        self.op = Op::ShrinkStatus;
+        start(backend::shrink_status_args(), self.pw())
+    }
+
     fn load_disks(&mut self) -> Task<Message> {
         self.disks.clear();
         self.selected = None;
@@ -195,8 +206,9 @@ impl Application for App {
                 pct: 0,
                 installing: false,
                 finished: false,
+                interrupted: None,
             },
-            Task::none(),
+            if backend::is_root() { start(backend::shrink_status_args(), None) } else { Task::none() },
         )
     }
 
@@ -232,12 +244,13 @@ impl Application for App {
                     Page::Size => Page::Mode,
                     Page::Confirm if self.mode == Mode::Erase => Page::Mode,
                     Page::Confirm => Page::Size,
+                    Page::Progress if !self.installing && self.op == Op::Recover => Page::Welcome,
                     Page::Progress if !self.installing => Page::Mode,
                     p => p,
                 };
             }
             Message::Next => match self.page {
-                Page::Welcome => return self.load_disks(),
+                Page::Welcome => return self.check_shrink(),
                 Page::Disk if self.selected.is_some() => {
                     self.mode = match self.disk() {
                         Some(d) if d.dualboot => Mode::Free,
@@ -293,7 +306,10 @@ impl Application for App {
                 }
                 Event::Plan(p) => self.plan = Some(p),
                 Event::Info(_) => {}
-                Event::ShrinkStatus(s) => self.step = s,
+                Event::ShrinkStatus { state, phase } => {
+                    log(&format!("shrink-status {state} {phase}"));
+                    self.interrupted = (state == "interrupted").then_some(phase);
+                }
                 Event::Step { name, pct } => {
                     log(&format!("step {name} {pct}"));
                     match self.steps.iter_mut().find(|(n, _)| *n == name) {
@@ -330,7 +346,26 @@ impl Application for App {
                             };
                         }
                     }
-                    Op::ShrinkStatus => {}
+                    Op::ShrinkStatus => {
+                        if backend::wrong_password(&stderr) {
+                            self.loading = false;
+                            self.error = "Incorrect password.".into();
+                        } else if self.interrupted.is_some() {
+                            self.loading = false;
+                        } else {
+                            return self.load_disks();
+                        }
+                    }
+                    Op::Recover => {
+                        self.installing = false;
+                        if self.finished {
+                            self.interrupted = None;
+                            self.error.clear();
+                            self.page = Page::Welcome;
+                        } else if self.error.is_empty() {
+                            self.error = format!("Recovery exited ({code:?}) {}", stderr.trim());
+                        }
+                    }
                     Op::List => {
                         self.loading = false;
                         if backend::wrong_password(&stderr) {
@@ -343,6 +378,12 @@ impl Application for App {
                     }
                 },
             },
+            Message::Recover => {
+                self.mode = Mode::Shrink;
+                self.page = Page::Progress;
+                self.installing = true;
+                return self.begin(Op::Recover, backend::recover_args());
+            }
             Message::PowerOff => {
                 let _ = std::process::Command::new("poweroff").spawn();
             }
@@ -366,6 +407,26 @@ impl Application for App {
             r
         };
         match self.page {
+            Page::Welcome if self.interrupted.is_some() => {
+                col = col
+                    .push(widget::text::title1("A previous shrink was interrupted"))
+                    .push(widget::text::body(format!(
+                        "The last attempt to shrink your Linux partition did not finish (stopped in phase \"{}\"), \
+                         for example because of a power loss. Your Linux partition may be unusable until it is \
+                         recovered. Recover restores it from the undo data saved on this USB stick. Do not run \
+                         fsck, GParted or other disk tools on it first. Installing and shrinking are disabled until recovery succeeds.",
+                        self.interrupted.clone().unwrap_or_default()
+                    )));
+                if !backend::is_root() {
+                    col = col
+                        .push(widget::text::body("Enter your password to allow disk access:"))
+                        .push(widget::secure_input("Password", &self.password, None, true).on_input(Message::Password));
+                }
+                if !self.error.is_empty() {
+                    col = col.push(widget::text::body(self.error.clone()));
+                }
+                col = col.push(widget::button::destructive("Recover").on_press(Message::Recover));
+            }
             Page::Welcome => {
                 col = col
                     .push(widget::text::title1("Install LeandrOS"))
@@ -660,7 +721,7 @@ fn drain(args: Vec<String>, label: &str) -> (bool, bool, bool, Option<i32>) {
                     }
                 }
                 Event::Error(m) => println!("error {m}"),
-                Event::ShrinkStatus(s) => println!("shrink-status {s}"),
+                Event::ShrinkStatus { state, phase } => println!("shrink-status {state} {phase}"),
                 Event::Exit(code, err) => {
                     if !err.trim().is_empty() {
                         eprintln!("{}", err.trim());
@@ -724,6 +785,49 @@ fn self_test_shrink(dev: &str, size: &str) -> i32 {
     if done && !gfail && code == Some(0) { 0 } else { 1 }
 }
 
+/// Startup flow of the GUI: shrink-status; if interrupted show the Recover banner and
+/// run the recovery (as the Recover button does); the status must then be clear.
+fn self_test_recover() -> i32 {
+    let st = |label: &str| -> Option<String> {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        backend::run(backend::shrink_status_args(), std::env::var("LEANDROS_INSTALL_PASSWORD").ok(), tx);
+        let r = futures::executor::block_on(async {
+            let mut r = None;
+            while let Some(ev) = rx.next().await {
+                match ev {
+                    Event::ShrinkStatus { state, phase } => {
+                        println!("shrink-status {state} {phase} ({label})");
+                        r = Some(if state == "interrupted" { phase } else { String::new() });
+                    }
+                    Event::Exit(..) => break,
+                    _ => {}
+                }
+            }
+            r
+        });
+        r
+    };
+    match st("startup") {
+        Some(p) if !p.is_empty() => println!("page Welcome: banner interrupted phase={p}; Install/Shrink hidden; Recover enabled"),
+        _ => {
+            println!("no interrupted shrink");
+            return 1;
+        }
+    }
+    let (done, _, _, code) = drain(backend::recover_args(), "recover");
+    println!("exit {:?} -> page {}", code, if done { "Welcome (recovered)" } else { "Error" });
+    if !done || code != Some(0) {
+        return 1;
+    }
+    match st("after") {
+        Some(p) if p.is_empty() => {
+            println!("banner cleared; Install/Shrink modes available");
+            0
+        }
+        _ => 1,
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -738,6 +842,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let dev = args.get(1).map(String::as_str).unwrap_or("/dev/nvme0n1");
             std::process::exit(self_test_dualboot(dev));
         }
+        Some("--self-test-recover") => std::process::exit(self_test_recover()),
         Some("--self-test-shrink") => {
             let dev = args.get(1).map(String::as_str).unwrap_or("/dev/nvme0n1");
             let size = args.get(2).map(String::as_str).unwrap_or("30G");

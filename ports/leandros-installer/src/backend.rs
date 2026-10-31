@@ -67,7 +67,7 @@ pub enum Event {
     Plan(Plan),
     Info(String),
     Done { root_partuuid: String, disk_guid: String, dry_run: bool },
-    ShrinkStatus(String),
+    ShrinkStatus { state: String, phase: String },
     Error(String),
     /// Process finished; Some(code) of the exit status.
     Exit(Option<i32>, String),
@@ -122,7 +122,7 @@ pub fn parse_line(line: &str) -> Option<Event> {
         }),
         "gate" => Some(Event::Gate { id: s(&["id"]), name: s(&["name"]), status: s(&["status"]), msg: s(&["msg"]) }),
         "info" => Some(Event::Info(s(&["msg"]))),
-        "shrink_status" => Some(Event::ShrinkStatus(s(&["state", "msg"]))),
+        "shrink_status" => Some(Event::ShrinkStatus { state: s(&["state"]), phase: s(&["phase"]) }),
         "plan" if v.get("new_gpt").is_some() => {
             let rows = |k: &str| -> Vec<PartRow> {
                 v.get(k)
@@ -250,6 +250,10 @@ pub fn install_args(dev: &str, mode: Mode, root_gib: Option<u64>, dry: bool) -> 
 
 pub fn shrink_args(part: &str, to_bytes: u64) -> Vec<String> {
     vec!["shrink".into(), "--part".into(), part.into(), "--to".into(), to_bytes.to_string(), "--yes".into(), "--json".into()]
+}
+
+pub fn recover_args() -> Vec<String> {
+    vec!["shrink".into(), "--recover".into(), "--yes".into(), "--json".into()]
 }
 
 pub fn shrink_status_args() -> Vec<String> {

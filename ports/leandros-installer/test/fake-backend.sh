@@ -43,6 +43,7 @@ install)
   esac
   ;;
 shrink)
+  case " $* " in *" --recover "*) steps recover; touch /tmp/fake-recovered; echo '{"ev":"done","recovered":true}'; exit 0;; esac
   gate G1 stick pass "ok"
   gate G3 ext4 pass "fsck clean"
   gate G4 backup pass "undo file written"
@@ -50,6 +51,8 @@ shrink)
   steps backup check resize verify
   echo '{"ev":"done","target":"/dev/nvme1n1p2"}'
   ;;
-shrink-status) echo '{"ev":"shrink_status","state":"shrunk-unverified"}' ;;
+shrink-status)
+  if [ -n "$FAKE_INTERRUPTED" ] && [ ! -e /tmp/fake-recovered ]; then echo '{"ev":"shrink_status","state":"interrupted","phase":"fscking"}'; exit 0; fi
+  echo '{"ev":"shrink_status","state":"shrunk-unverified"}' ;;
 *) echo '{"ev":"error","msg":"bad command"}'; exit 1 ;;
 esac

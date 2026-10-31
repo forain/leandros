@@ -803,15 +803,21 @@ fn real_run(dev: &str, st: &mut Vec<(&str, String)>, dir: &str, undo: &str, new_
     }
     set("fscking", st)?;
     out.step("fsck", 0);
-    let f = if let Some(ms) = test_env("LEANDROS_SHRINK_FREEZE_FSCK_MS").and_then(|v| v.parse::<u64>().ok()) {
+    let f = if test_env("LEANDROS_SHRINK_FREEZE_FSCK").is_some() {
+        // Event-based freeze: SIGSTOP e2fsck once its undo file has recorded >= 1 key,
+        // i.e. it has really started modifying the disk (the undo header is flushed).
         let mut c = Command::new(tool("e2fsck")).args(["-fy", "-z", undo, dev]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| e.to_string())?;
-        std::thread::sleep(std::time::Duration::from_millis(ms));
-        if c.try_wait().map_err(|e| e.to_string())?.is_none() {
-            unsafe { libc::kill(c.id() as libc::pid_t, libc::SIGSTOP) };
-            freeze_forever(out, "frozen_fsck", 0);
+        loop {
+            if c.try_wait().map_err(|e| e.to_string())?.is_some() {
+                return Err("test freeze: e2fsck finished before its undo file recorded a key".into());
+            }
+            let k = undo_keys(undo);
+            if k > 0 {
+                unsafe { libc::kill(c.id() as libc::pid_t, libc::SIGSTOP) };
+                freeze_forever(out, "frozen_fsck", k.min(u32::MAX as u64) as u32);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let rc = c.wait().map_err(|e| e.to_string())?.code().unwrap_or(-1);
-        Run { rc, text: String::new() }
     } else {
         run("e2fsck", &["-fy", "-z", undo, dev])?
     };
@@ -1075,8 +1081,16 @@ fn recover(o: &Opts, out: &Out) -> Result<(), String> {
         // A successful shrink whose guard clearing was interrupted: finish it.
         p.window()?;
         let c = sbguard::apply(&dev, false, false, &mut |m| out.info(m), &mut |_| {});
+        // Idempotent: repeat the stale-backup clearing the interrupted run may not have done.
+        let nb0: u64 = s.get("new_blocks").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let bs0: u64 = s.get("block_size").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let st_r = match std::fs::read(format!("{}/sb.orig", dir)) {
+            Ok(orig) if c.is_ok() && bs0 > 0 => sbguard::clear_stale(&dev, &orig, nb0 * bs0).map(|k| out.info(&format!("guard cleared on {} stale backups past the new end", k))),
+            _ => Ok(()),
+        };
         p.close();
         c?;
+        st_r?;
         let nb: u64 = s.get("new_blocks").and_then(|v| v.parse().ok()).unwrap_or(0);
         let f = fsck_n(&dev)?;
         if f.rc != 0 || read_sb_path(&dev)?.blocks != nb {
