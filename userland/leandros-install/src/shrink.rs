@@ -19,6 +19,7 @@ use crate::dualboot::{backup, gpt_lines, lbs, on_battery, set_window};
 use crate::gpt::{self, Gpt};
 use crate::mkhome;
 use crate::progress::{esc, Out};
+use crate::sbguard;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -61,7 +62,7 @@ pub struct Sb {
 }
 
 const KNOWN_COMPAT: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000;
-const KNOWN_INCOMPAT: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x10000 | 0x20000;
+const KNOWN_INCOMPAT: u32 = 0x2 | 0x4 | 0x8 | 0x10 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x2000 | 0x4000 | 0x8000 | 0x10000 | 0x20000;
 const KNOWN_RO: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x10000;
 
 fn le32(b: &[u8], o: usize) -> u32 {
@@ -107,7 +108,10 @@ pub fn sb_gates(s: &Sb) -> Vec<(&'static str, String)> {
     if s.incompat & 0x100 != 0 || s.mmp_block != 0 {
         v.push(("S5", "multi-mount protection is in use".into()));
     }
-    let unk = (s.compat & !KNOWN_COMPAT, s.incompat & !KNOWN_INCOMPAT, s.ro_compat & !KNOWN_RO);
+    if s.incompat & sbguard::GUARD != 0 {
+        v.push(("S11", "an interrupted LeandrOS shrink was found: run shrink --recover with the stick that started it (Linux will not start until then)".into()));
+    }
+    let unk = (s.compat & !KNOWN_COMPAT, s.incompat & !KNOWN_INCOMPAT & !sbguard::GUARD, s.ro_compat & !KNOWN_RO);
     if unk != (0, 0, 0) {
         v.push(("S6", format!("feature bits unknown to e2fsprogs 1.47.1 (compat {:#x} incompat {:#x} ro {:#x})", unk.0, unk.1, unk.2)));
     }
@@ -136,6 +140,29 @@ fn run(name: &str, args: &[&str]) -> Result<Run, String> {
     let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&o.stderr));
     Ok(Run { rc: o.status.code().unwrap_or(-1), text })
+}
+
+fn run_env(name: &str, args: &[&str], env: &[(&str, &str)]) -> Result<Run, String> {
+    let o = Command::new(tool(name)).args(args).envs(env.iter().copied()).stdin(Stdio::null()).output().map_err(|e| format!("{}: {}", name, e))?;
+    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&o.stderr));
+    Ok(Run { rc: o.status.code().unwrap_or(-1), text })
+}
+
+/// Test hooks (crash injection) only work with LEANDROS_TEST=1.
+fn test_env(k: &str) -> Option<String> {
+    if std::env::var("LEANDROS_TEST").map(|v| v == "1").unwrap_or(false) {
+        std::env::var(k).ok()
+    } else {
+        None
+    }
+}
+
+fn freeze_forever(out: &Out, name: &str, pct: u32) -> ! {
+    out.step(name, pct);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
 fn tail(s: &str) -> String {
@@ -194,6 +221,14 @@ fn put(path: &str, data: &str) -> Result<(), String> {
     f.sync_all().map_err(|e| e.to_string())?;
     drop(f);
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    if let Some(d) = std::path::Path::new(path).parent() {
+        if let Ok(df) = File::open(d) {
+            let _ = df.sync_all();
+        }
+    }
+    if let Ok(f2) = File::open(path) {
+        let _ = f2.sync_all();
+    }
     sync_all();
     Ok(())
 }
@@ -409,6 +444,13 @@ fn state_write(dir: &str, kv: &[(&str, String)]) -> Result<(), String> {
     put(&format!("{}/state", dir), &s)
 }
 
+fn set_phase_dir(dir: &str, ph: &str) -> Result<(), String> {
+    let mut m = state_read(dir);
+    m.insert("phase".into(), ph.into());
+    let kv: Vec<(&str, String)> = m.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    state_write(dir, &kv)
+}
+
 fn state_read(dir: &str) -> BTreeMap<String, String> {
     crate::plan::read_to_string(&format!("{}/state", dir))
         .lines()
@@ -452,7 +494,7 @@ impl Prog {
             out.step("resize", pct);
             // Test hook (dualboot-shrink-test.sh crash injection): freeze resize2fs the
             // moment progress reaches this percentage so an external kill lands mid-resize.
-            if let Some(t) = std::env::var("LEANDROS_SHRINK_FREEZE_PCT").ok().and_then(|v| v.parse::<u32>().ok()) {
+            if let Some(t) = test_env("LEANDROS_SHRINK_FREEZE_PCT").and_then(|v| v.parse::<u32>().ok()) {
                 if pct >= t {
                     unsafe { libc::kill(child as libc::pid_t, libc::SIGSTOP) };
                     out.step("frozen", pct);
@@ -697,12 +739,15 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
         Err(e) => {
             // Roll back with e2undo (window re-opened).
             out.info(&format!("rolling back: {}", e));
-            let _ = state_write(&dir, &[("phase", "rollback".into()), ("part", dev.clone()), ("undo", undo.clone()), ("backup_dir", dir.clone()), ("orig_blocks", sb.blocks.to_string()), ("new_blocks", new_blocks.to_string()), ("block_size", sb.bs.to_string())]);
-            let rb = rollback(&dev, &mut p, &undo, &format!("{}/sb.orig", dir), false, &sb, &out);
-            let _ = state_write(&dir, &[("phase", if rb.is_ok() { "rolled_back" } else { "rollback_failed" }.into()), ("part", dev.clone()), ("backup_dir", dir.clone())]);
+            if state_read(&dir).get("phase").map(|v| v == "unguarding").unwrap_or(false) {
+                return Err(format!("{}; the guard clearing had started: run shrink --recover --yes with this stick", e));
+            }
+            let _ = set_phase_dir(&dir, "rollback");
+            let rb = rollback(&dev, &mut p, &undo, &dir, false, &sb, &out);
+            let _ = set_phase_dir(&dir, if rb.is_ok() { "rolled_back" } else { "rollback_failed" });
             return Err(match rb {
                 Ok(()) => format!("{}; the filesystem was restored with e2undo and verified", e),
-                Err(e2) => format!("{}; rollback FAILED: {}", e, e2),
+                Err(e2) => format!("{}; rollback FAILED: {}. STOP: nothing more is written. Restore the Linux partition from your backup", e, e2),
             });
         }
     }
@@ -733,9 +778,41 @@ fn real_run(dev: &str, st: &mut Vec<(&str, String)>, dir: &str, undo: &str, new_
         f.sync_all().map_err(|e| e.to_string())?;
         sync_all();
     }
+    // The user's untouched first backup superblock, to prove the rollback later.
+    if let Some((g, b)) = sbguard::first_backup(dev)? {
+        let path = format!("{}/sbk.orig", dir);
+        let mut f = File::create(&path).map_err(|e| e.to_string())?;
+        f.write_all(&b).and_then(|_| f.sync_all()).map_err(|e| e.to_string())?;
+        st.push(("sbk_group", g.to_string()));
+    }
+    set("guarding", st)?;
+    out.step("guard", 0);
+    let kfreeze: Option<usize> = test_env("LEANDROS_SHRINK_FREEZE_GUARD").and_then(|v| v.parse().ok());
+    let (n, skipped) = sbguard::apply(dev, true, false, &mut |m| out.info(m), &mut |k| {
+        if Some(k) == kfreeze {
+            freeze_forever(out, "frozen_guard", k as u32);
+        }
+    })?;
+    out.info(&format!("guard set on {} superblock copies ({} skipped)", n, skipped));
+    set("guarded", st)?;
+    out.step("guard", 100);
+    if test_env("LEANDROS_SHRINK_FREEZE_AT").as_deref() == Some("guarded") {
+        freeze_forever(out, "frozen_guarded", 0);
+    }
     set("fscking", st)?;
     out.step("fsck", 0);
-    let f = run("e2fsck", &["-fy", "-z", undo, dev])?;
+    let f = if let Some(ms) = test_env("LEANDROS_SHRINK_FREEZE_FSCK_MS").and_then(|v| v.parse::<u64>().ok()) {
+        let mut c = Command::new(tool("e2fsck")).args(["-fy", "-z", undo, dev]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| e.to_string())?;
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        if c.try_wait().map_err(|e| e.to_string())?.is_none() {
+            unsafe { libc::kill(c.id() as libc::pid_t, libc::SIGSTOP) };
+            freeze_forever(out, "frozen_fsck", 0);
+        }
+        let rc = c.wait().map_err(|e| e.to_string())?.code().unwrap_or(-1);
+        Run { rc, text: String::new() }
+    } else {
+        run("e2fsck", &["-fy", "-z", undo, dev])?
+    };
     if f.rc & !1 != 0 {
         return Err(format!("e2fsck -fy failed (rc {}): {}", f.rc, tail(&f.text)));
     }
@@ -758,6 +835,14 @@ fn real_run(dev: &str, st: &mut Vec<(&str, String)>, dir: &str, undo: &str, new_
         }
     }
     out.step("verify", 100);
+    // Last: drop the guard (backups first, primary last) and re-verify.
+    set("unguarding", st)?;
+    let (n, _) = sbguard::apply(dev, false, false, &mut |m| out.info(m), &mut |_| {})?;
+    out.info(&format!("guard cleared on {} superblock copies", n));
+    let c = fsck_n(dev)?;
+    if c.rc != 0 {
+        return Err(format!("e2fsck -fn after clearing the guard is not clean (rc {}): {}", c.rc, tail(&c.text)));
+    }
     Ok(())
 }
 
@@ -785,7 +870,9 @@ fn restore_sb(dev: &str, orig_path: &str) -> Result<(), String> {
         return Err(format!("{} is {} bytes, expected 1024", orig_path, orig.len()));
     }
     let live = read_raw_sb(dev)?;
-    let bad: Vec<String> = (0..1024).filter(|&i| orig[i] != live[i] && !sb_field_allowed(i)).map(|i| format!("0x{:x}", i)).collect();
+    let (li, oi) = (le32(&live, 0x60), le32(&orig, 0x60));
+    let feat_ok = li == oi || li == oi | sbguard::GUARD;
+    let bad: Vec<String> = (0..1024).filter(|&i| orig[i] != live[i] && !sb_field_allowed(i) && !(feat_ok && (0x60..0x64).contains(&i))).map(|i| format!("0x{:x}", i)).collect();
     if !bad.is_empty() {
         return Err(format!("superblock differs after e2undo at unexpected offsets {}; left as is", bad.join(",")));
     }
@@ -796,43 +883,158 @@ fn restore_sb(dev: &str, orig_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Roll the filesystem back with ONE e2undo, then restore the original
-/// superblock. `crash`: the undo file may end in a half-written record, which
-/// e2undo reports as "Incomplete undo record" with rc 0; elsewhere that, or any
-/// non-zero rc, is fatal.
-fn rollback(dev: &str, p: &mut Part, undo: &str, sb_orig: &str, crash: bool, sb: &Sb, out: &Out) -> Result<(), String> {
-    p.window()?;
-    if std::path::Path::new(undo).exists() {
-        let mut r = run("e2undo", &[undo, dev])?;
-        out.info(&format!("e2undo {}: rc {} {}", undo, r.rc, tail(&r.text)));
-        // After a crash the undo header can hold an older superblock than the one on disk
-        // (resize2fs rewrote it after the last undo index flush): that is exactly the
-        // mismatch e2undo -f exists for. The post-rollback e2fsck/size checks still gate it.
-        if crash && r.rc != 0 && r.text.contains("doesn't match the undo file") {
-            r = run("e2undo", &["-f", undo, dev])?;
-            out.info(&format!("e2undo -f {}: rc {} {}", undo, r.rc, tail(&r.text)));
-        }
-        if r.rc != 0 {
-            return Err(format!("e2undo {} failed (rc {}): {}", undo, r.rc, tail(&r.text)));
-        }
-        if !crash && r.text.contains("Incomplete undo record") {
-            return Err(format!("e2undo {}: incomplete undo file outside a crash: {}", undo, tail(&r.text)));
-        }
-        if std::path::Path::new(sb_orig).exists() {
-            restore_sb(dev, sb_orig)?;
+const RESTORE_MSG: &str = "STOP: nothing more is written. Restore the Linux partition from your backup";
+
+/// Superblock copy stored in an undo file header (the device sb at the last index flush).
+fn undo_header_sb(undo: &str) -> Result<(Vec<u8>, u64, u32), String> {
+    let mut f = File::open(undo).map_err(|e| format!("{}: {}", undo, e))?;
+    let mut h = [0u8; 64];
+    f.read_exact(&mut h).map_err(|e| format!("{}: {}", undo, e))?;
+    if &h[..8] != b"E2UNDO02" {
+        return Err(format!("{}: not an undo file", undo));
+    }
+    let keys = u64::from_le_bytes(h[8..16].try_into().unwrap());
+    let sup = u64::from_le_bytes(h[16..24].try_into().unwrap());
+    let bsz = u32::from_le_bytes(h[32..36].try_into().unwrap()) as u64;
+    let state = u32::from_le_bytes(h[44..48].try_into().unwrap());
+    let mut b = vec![0u8; 1024];
+    f.seek(SeekFrom::Start(sup * bsz)).and_then(|_| f.read_exact(&mut b)).map_err(|e| format!("{}: header sb: {}", undo, e))?;
+    b[0x38] = !b[0x38];
+    b[0x39] = !b[0x39];
+    Ok((b, keys, state))
+}
+
+fn undo_keys(undo: &str) -> u64 {
+    undo_header_sb(undo).map(|x| x.1).unwrap_or(0)
+}
+
+/// Offsets that may differ between the undo header's superblock and the live one
+/// (resize2fs/e2fsck rewrote them after the last index flush). Mount count and
+/// mount time are deliberately NOT here; the UUID neither.
+fn hdr_diff_allowed(o: usize) -> bool {
+    sb_field_allowed(o) || o < 0x14 || (0x150..0x160).contains(&o) || (0x5c..0x68).contains(&o) || (0x40..0x44).contains(&o) || (0xce..0xd0).contains(&o) || (0x16c..0x170).contains(&o)
+}
+
+fn rehash(dev: &str, dir: &str) -> Result<usize, String> {
+    let t = crate::plan::read_to_string(&format!("{}/hashes.txt", dir));
+    let mut n = 0;
+    for l in t.lines() {
+        if let Some((h, path)) = l.split_once("  ") {
+            let got = hash_path(dev, path)?;
+            if got != h {
+                return Err(format!("file {} differs from its hash after the rollback", path));
+            }
+            n += 1;
         }
     }
-    p.close();
+    Ok(n)
+}
+
+/// Final checks after a rollback / unchanged recovery: clean fsck, original size,
+/// first backup superblock as it was, hashed files intact.
+fn verify_restored(dev: &str, dir: &str, orig_blocks: u64, out: &Out) -> Result<(), String> {
     sync_all();
     let c = fsck_n(dev)?;
-    let nsb = read_sb_path(dev)?;
     if c.rc != 0 {
-        return Err(format!("after e2undo e2fsck -fn rc {}: {}", c.rc, tail(&c.text)));
+        return Err(format!("e2fsck -fn rc {}: {}", c.rc, tail(&c.text)));
     }
-    if nsb.blocks != sb.blocks {
-        return Err(format!("after e2undo the size is {} blocks, expected {}", nsb.blocks, sb.blocks));
+    let nsb = read_sb_path(dev)?;
+    if nsb.blocks != orig_blocks {
+        return Err(format!("the size is {} blocks, expected {}", nsb.blocks, orig_blocks));
     }
+    if nsb.incompat & sbguard::GUARD != 0 {
+        return Err("the guard bit is still set in the primary superblock".into());
+    }
+    sbguard::verify(dev, false, false)?;
+    if let (Ok(orig), Some(g)) = (std::fs::read(format!("{}/sbk.orig", dir)), state_read(dir).get("sbk_group").and_then(|v| v.parse::<u64>().ok())) {
+        match sbguard::backup_of(dev, g)? {
+            Some(now) => {
+                let bad: Vec<usize> = (0..1024).filter(|&i| orig[i] != now[i] && !sb_field_allowed(i)).collect();
+                if !bad.is_empty() {
+                    return Err(format!("the group {} backup superblock differs from the original at {:?}", g, bad));
+                }
+            }
+            None => return Err(format!("the group {} backup superblock is not valid", g)),
+        }
+    }
+    let n = rehash(dev, dir)?;
+    out.info(&format!("verified: fsck clean, {} blocks, guard cleared everywhere, {} hashed files intact", orig_blocks, n));
     Ok(())
+}
+
+/// Nothing but the guard (and its checksum) changed on the device: drop the guard.
+fn clear_unchanged(dev: &str, p: &mut Part, dir: &str, orig_blocks: u64, out: &Out) -> Result<(), String> {
+    let orig = std::fs::read(format!("{}/sb.orig", dir)).map_err(|e| format!("sb.orig: {}", e))?;
+    let live = read_raw_sb(dev)?;
+    let bad: Vec<usize> = (0..1024).filter(|&i| orig[i] != live[i] && !(0x60..0x64).contains(&i) && !(0x3fc..0x400).contains(&i)).collect();
+    if !bad.is_empty() {
+        return Err(format!("the superblock differs from the saved original at {:?}", bad));
+    }
+    p.window()?;
+    let r = sbguard::apply(dev, false, false, &mut |m| out.info(m), &mut |_| {});
+    p.close();
+    r?;
+    verify_restored(dev, dir, orig_blocks, out)
+}
+
+/// Roll the filesystem back with ONE e2undo (narrow E2UNDO_CRASH mode after a crash,
+/// never `-f`), then restore the original superblock. The live primary must carry
+/// the guard bit. `crash`: the undo file may be unfinished or the header superblock
+/// older than the disk.
+fn rollback(dev: &str, p: &mut Part, undo: &str, dir: &str, crash: bool, sb: &Sb, out: &Out) -> Result<(), String> {
+    let sb_orig = format!("{}/sb.orig", dir);
+    let orig = std::fs::read(&sb_orig).map_err(|e| format!("{}: {}", sb_orig, e))?;
+    if orig.len() != 1024 {
+        return Err(format!("{} is {} bytes, expected 1024", sb_orig, orig.len()));
+    }
+    let live = read_raw_sb(dev)?;
+    if le32(&live, 0x60) & sbguard::GUARD == 0 {
+        return Err("the guard bit is gone from the live superblock (something else wrote to it): refusing".into());
+    }
+    if live[0x68..0x78] != orig[0x68..0x78] {
+        return Err("the live UUID differs from the saved original: refusing".into());
+    }
+    p.window()?;
+    let r = (|| -> Result<(), String> {
+        if std::path::Path::new(undo).exists() {
+            let (hsb, keys, _) = undo_header_sb(undo)?;
+            if hsb[0x68..0x78] != orig[0x68..0x78] {
+                return Err("the undo header belongs to another filesystem (UUID): refusing".into());
+            }
+            let diff: Vec<usize> = (0..1024).filter(|&i| hsb[i] != live[i]).collect();
+            let bad: Vec<String> = diff.iter().filter(|&&i| !hdr_diff_allowed(i)).map(|i| format!("0x{:x}", i)).collect();
+            out.info(&format!("undo header sb vs live sb: {} differing bytes, offsets {:?}; disallowed: {:?}; {} keys", diff.len(), diff.iter().map(|i| format!("{:x}", i)).collect::<Vec<_>>(), bad, keys));
+            if !bad.is_empty() {
+                return Err(format!("the undo header superblock differs from the live one at disallowed offsets {}: refusing", bad.join(",")));
+            }
+            let mut env: Vec<(&str, &str)> = vec![];
+            let mut r = run_env("e2undo", &["-n", undo, dev], &env)?;
+            if r.rc != 0 && crash && r.text.contains("doesn't match the undo file") {
+                env.push(("E2UNDO_CRASH", "1"));
+                r = run_env("e2undo", &["-n", undo, dev], &env)?;
+            }
+            out.info(&format!("e2undo -n: rc {} {}", r.rc, tail(&r.text)));
+            if r.rc != 0 || r.text.contains("checksum error") || r.text.contains("corruption") {
+                return Err(format!("e2undo -n refused (rc {}): {}", r.rc, tail(&r.text)));
+            }
+            set_phase_dir(dir, "undoing")?;
+            let r = run_env("e2undo", &[undo, dev], &env)?;
+            out.info(&format!("e2undo {}: rc {} {}", undo, r.rc, tail(&r.text)));
+            if r.rc != 0 {
+                return Err(format!("e2undo {} failed (rc {}): {}", undo, r.rc, tail(&r.text)));
+            }
+            if !crash && r.text.contains("Incomplete undo record") {
+                return Err(format!("e2undo {}: incomplete undo file outside a crash: {}", undo, tail(&r.text)));
+            }
+        }
+        set_phase_dir(dir, "unguarding_rb")?;
+        sbguard::apply(dev, false, true, &mut |m| out.info(m), &mut |_| {})?;
+        restore_sb(dev, &sb_orig)?;
+        Ok(())
+    })();
+    p.close();
+    r?;
+    verify_restored(dev, dir, sb.blocks, out)
 }
 
 fn recover(o: &Opts, out: &Out) -> Result<(), String> {
@@ -852,19 +1054,36 @@ fn recover(o: &Opts, out: &Out) -> Result<(), String> {
     let sb = Sb { blocks: orig, ..Default::default() };
     out.step("recover", 0);
     let undo = s.get("undo").cloned().unwrap_or_else(|| format!("{}/shrink.e2undo", dir));
-    let r = rollback(&dev, &mut p, &undo, &format!("{}/sb.orig", dir), true, &sb, out);
-    if r.is_err() && phase == "prepared" {
-        // Crashed before any ext4 write: only the clean check matters.
-        let c = fsck_n(&dev)?;
-        if c.rc == 0 && read_sb_path(&dev)?.blocks == orig {
-            let _ = state_write(&dir, &[("phase", "rolled_back".into()), ("part", dev.clone()), ("backup_dir", dir.clone())]);
-            out.step("recover", 100);
-            out.event("{\"ev\":\"done\",\"recovered\":true}", "recovered: nothing had been written");
-            return Ok(());
+    // Decide from the evidence on disk, not only from `phase`: an undo file with keys
+    // means e2fsck/resize2fs may have written, so the e2undo path is the only safe one.
+    let r = if undo_keys(&undo) > 0 {
+        rollback(&dev, &mut p, &undo, &dir, true, &sb, out)
+    } else {
+        match clear_unchanged(&dev, &mut p, &dir, orig, out) {
+            Ok(()) => Ok(()),
+            Err(e) if phase == "unguarding" => Err(e),
+            Err(e) => Err(e),
         }
+    };
+    if phase == "unguarding" && r.is_err() {
+        // A successful shrink whose guard clearing was interrupted: finish it.
+        p.window()?;
+        let c = sbguard::apply(&dev, false, false, &mut |m| out.info(m), &mut |_| {});
+        p.close();
+        c?;
+        let nb: u64 = s.get("new_blocks").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let f = fsck_n(&dev)?;
+        if f.rc != 0 || read_sb_path(&dev)?.blocks != nb {
+            return Err(format!("unguarding finished but the filesystem is not the expected shrink (rc {}). {}", f.rc, RESTORE_MSG));
+        }
+        set_phase_dir(&dir, "done")?;
+        out.event("{\"ev\":\"done\",\"recovered\":false,\"completed\":true}", "the interrupted shrink was completed; boot Linux once to verify");
+        return Ok(());
     }
-    r?;
-    state_write(&dir, &[("phase", "rolled_back".into()), ("part", dev.clone()), ("backup_dir", dir.clone())])?;
+    if let Err(e) = r {
+        return Err(format!("{}. {}", e, RESTORE_MSG));
+    }
+    set_phase_dir(&dir, "rolled_back")?;
     out.step("recover", 100);
     out.event(&format!("{{\"ev\":\"done\",\"recovered\":true,\"blocks\":{}}}", orig), "recovered: the filesystem is back at its original size and clean");
     Ok(())

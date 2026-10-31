@@ -1,0 +1,33 @@
+--- a/lib/ext2fs/ext2_fs.h
++++ b/lib/ext2fs/ext2_fs.h
+@@ -870,6 +870,7 @@
+ #define EXT4_FEATURE_INCOMPAT_INLINE_DATA	0x8000 /* data in inode */
+ #define EXT4_FEATURE_INCOMPAT_ENCRYPT		0x10000
+ #define EXT4_FEATURE_INCOMPAT_CASEFOLD		0x20000
++#define EXT4_FEATURE_INCOMPAT_LEANDROS_GUARD	0x80000000 /* LeandrOS: interrupted shrink, do not mount */
+ 
+ #define EXT4_FEATURE_COMPAT_FUNCS(name, ver, flagname) \
+ static inline int ext2fs_has_feature_##name(struct ext2_super_block *sb) \
+--- a/lib/ext2fs/ext2fs.h
++++ b/lib/ext2fs/ext2fs.h
+@@ -729,7 +729,8 @@
+ 					 EXT4_FEATURE_INCOMPAT_ENCRYPT|\
+ 					 EXT4_FEATURE_INCOMPAT_CASEFOLD|\
+ 					 EXT4_FEATURE_INCOMPAT_CSUM_SEED|\
+-					 EXT4_FEATURE_INCOMPAT_LARGEDIR)
++					 EXT4_FEATURE_INCOMPAT_LARGEDIR|\
++					 EXT4_FEATURE_INCOMPAT_LEANDROS_GUARD)
+ 
+ #define EXT2_LIB_FEATURE_RO_COMPAT_SUPP	(EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER|\
+ 					 EXT4_FEATURE_RO_COMPAT_HUGE_FILE|\
+--- a/lib/e2p/feature.c
++++ b/lib/e2p/feature.c
+@@ -121,6 +121,8 @@
+ 			"casefold"},
+ 	{       E2P_FEATURE_INCOMPAT, EXT4_FEATURE_INCOMPAT_CASEFOLD,
+ 			"fname_encoding"},
++	{       E2P_FEATURE_INCOMPAT, EXT4_FEATURE_INCOMPAT_LEANDROS_GUARD,
++			"leandros_guard"},
+ 	{	0, 0, 0 },
+ };
+ 

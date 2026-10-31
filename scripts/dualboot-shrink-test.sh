@@ -193,24 +193,54 @@ crash_case() {
     # resize2fs -p reports pct 0..60 (passes 1-3, 40 X each of 200) and nothing during passes 4-5
     # before the installer's own 100. So a requested point above 60 means "the last progress
     # event resize2fs emits before completion" (60); the kill must still land before "done".
-    [ "$PCT" -gt "${LAST_PROGRESS_PCT:-60}" ] && PCT=${LAST_PROGRESS_PCT:-60}
+    FZENV="LEANDROS_SHRINK_FREEZE_PCT=$PCT"; FZNAME=frozen
+    case "$PCT" in
+        guarded) FZENV="LEANDROS_SHRINK_FREEZE_AT=guarded"; FZNAME=frozen_guarded ;;
+        guard1) FZENV="LEANDROS_SHRINK_FREEZE_GUARD=1"; FZNAME=frozen_guard ;;
+        fsck) FZENV="LEANDROS_SHRINK_FREEZE_FSCK_MS=${FSCK_FREEZE_MS:-4000}"; FZNAME=frozen_fsck ;;
+        *) [ "$PCT" -gt "${LAST_PROGRESS_PCT:-60}" ] && PCT=${LAST_PROGRESS_PCT:-60}; FZENV="LEANDROS_SHRINK_FREEZE_PCT=$PCT" ;;
+    esac
     [ "$PCT" = "$REQ" ] || echo "(requested ${REQ}% clamped to the last pre-completion progress event, ${PCT}%)"
     echo "-- crash at resize >= ${PCT}%"
     fresh_disk; fresh_stick
     boot_stick "crash$PCT"
-    $REMOTE run "rm -f /tmp/s.log; LEANDROS_SHRINK_FREEZE_PCT=$PCT nohup $LI shrink --part $P2 --to 10G --yes --json > /tmp/s.log 2>&1 &" >/dev/null 2>&1 || true
+    $REMOTE run "rm -f /tmp/s.log; LEANDROS_TEST=1 $FZENV nohup $LI shrink --part $P2 --to 10G --yes --json > /tmp/s.log 2>&1 &" >/dev/null 2>&1 || true
     got=""
     # The installer freezes resize2fs (SIGSTOP) the instant its progress reaches PCT
     # (LEANDROS_SHRINK_FREEZE_PCT) and emits a "frozen" step; the host then kill -9s qemu.
     # PCT = the resize step pct (0..99) derived from resize2fs -p passes (40 X per pass, 5 passes).
     for i in $(seq 1 900); do
-        f=$(r "grep -o '\"name\":\"frozen\",\"pct\":[0-9]*' /tmp/s.log 2>/dev/null | tail -1; true" || true); f=${f##*:}
+        f=$(r "grep -o '\"name\":\"$FZNAME\",\"pct\":[0-9]*' /tmp/s.log 2>/dev/null | tail -1; true" || true); f=${f##*:}
         [ -n "$f" ] && { got=$f; break; }
         r "grep -q '\"ev\":\"error\"\\|\"ev\":\"done\"' /tmp/s.log" >/dev/null 2>&1 && { r "tail -c 600 /tmp/s.log; true"; fail "shrink ended before the crash point"; }
         sleep 1
     done
     [ -n "$got" ] || fail "resize never reached ${PCT}%"
-    qmp_quit; ok "QEMU quit at resize ${got}%"
+    qmp_quit; ok "QEMU quit at ${PCT} (${got})"
+    case "$PCT" in guarded|guard1|fsck)
+        python3 - "$DISK" <<'PY' || fail "guard not set on the disk after the crash at ${PCT}"
+import struct, sys
+f = open(sys.argv[1], "rb"); base = 2101248 * 512
+def sb(off):
+    f.seek(base + off); return f.read(1024)
+def crc32c(b):
+    c = 0xFFFFFFFF
+    for x in b:
+        c ^= x
+        for _ in range(8): c = (c >> 1) ^ (0x82F63B78 if c & 1 else 0)
+    return c
+p = sb(1024)
+inc = struct.unpack_from("<I", p, 0x60)[0]
+bpg = struct.unpack_from("<I", p, 0x20)[0]; bs = 1024 << struct.unpack_from("<I", p, 0x18)[0]
+fdb = struct.unpack_from("<I", p, 0x14)[0]
+b1 = sb((bpg + fdb) * bs)
+i1 = struct.unpack_from("<I", b1, 0x60)[0]
+print("primary incompat %#x backup1 incompat %#x" % (inc, i1))
+ok = struct.unpack_from("<I", p, 0x3FC)[0] == crc32c(p[:0x3FC])
+sys.exit(0 if ok else 1)
+PY
+        echo "info: guard state on disk after the crash printed above (guarded/guard1 expect 0x8... on all; stock e2fsck refuses on this bit: exit 8)" ;;
+    esac
     boot_stick "recover$PCT"
     r "$LI shrink-status --json" > "$WORK/statout$PCT.log"
     if grep -q '"phase":"done"' "$WORK/statout$PCT.log"; then echo "shrink finished before the kill landed (resize is fast); retrying"; stop_vm; return 2; fi
@@ -228,14 +258,13 @@ crash_case() {
     [ "${D%% *}" = 0 ] || fail "p2 differs from the pre-image after recovery at ${PCT}%: $D"
     ok "p2 byte-identical to the pre-image"
     ! grep -q "Corrupt" "$WORK/recout$PCT.log" || fail "recovery log has corruption messages (${PCT}%)"
-    # A superblock-vs-undo-header mismatch is tolerated only when the installer's e2undo -f retry
-    # succeeded AND the byte comparison above found p2 identical to the pre-image.
-    if grep -q "doesn't match" "$WORK/recout$PCT.log"; then
-        grep -q 'e2undo -f .*: rc 0' "$WORK/recout$PCT.log" || fail "e2undo mismatch not resolved by the -f retry (${PCT}%)"
-        echo "note: e2undo superblock mismatch at ${PCT}% resolved by e2undo -f (p2 byte-identical)"
-    fi
+    # No bare -f ever; the narrow E2UNDO_CRASH mode is the only tolerated route.
+    ! grep -q 'e2undo -f' "$WORK/recout$PCT.log" || fail "bare e2undo -f used (${PCT})"
+    grep -o 'undo header sb vs live sb[^"]*' "$WORK/recout$PCT.log" | head -1 | cut -c1-300
+    grep -o 'e2undo -n: rc [^"]*' "$WORK/recout$PCT.log" | head -1 | cut -c1-200
+    grep -q 'verified: fsck clean' "$WORK/recout$PCT.log" && ok "post-rollback verification (fsck, size, guard cleared, backup sb, hashes)" || true
 }
-for PCT in $CRASH_PCTS; do
+for PCT in ${CRASH_CASES:-guarded guard1 fsck} $CRASH_PCTS; do
     for ATT in 1 2 3; do
         rc=0; crash_case "$PCT" || rc=$?
         [ $rc = 2 ] || break

@@ -116,22 +116,32 @@ esac
     wget -q -O "$TARB.part" "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$E2V/e2fsprogs-$E2V.tar.xz"
     mv "$TARB.part" "$TARB"
   fi
-  apk add --no-cache xz patch make pkgconf linux-headers >/dev/null
+  apk add --no-cache xz patch make pkgconf linux-headers util-linux-dev >/dev/null
+  [ "$(uname -m)" = "$ARCH" ] || $APK add --no-cache util-linux-dev >/dev/null
   B=/tmp/e2fs-build-$ARCH
   rm -rf "$B"; mkdir -p "$B"
   tar xf "$TARB" -C "$B"
-  ( cd "$B/e2fsprogs-$E2V" && patch -p1 < /src/undo-durable.patch )
+  for PT in undo-durable leandros-guard leandros-e2undo-crash; do
+    ( cd "$B/e2fsprogs-$E2V" && patch -p1 < /src/$PT.patch ) || exit 1
+  done
   mkdir -p "$B/o"
   if [ "$(uname -m)" = "$ARCH" ]; then
     ( cd "$B/o" && ../e2fsprogs-$E2V/configure --prefix=/usr --enable-elf-shlibs \
-        --disable-nls --disable-fsck --disable-uuidd --enable-libuuid --enable-libblkid \
+        --disable-nls --disable-fsck --disable-uuidd --disable-libuuid --disable-libblkid \
         CFLAGS="-O2" >/dev/null && make -C lib/et all >/dev/null && make -C lib/ext2fs ext2_err.h >/dev/null && for d in e2p ext2fs; do make -j"$(nproc)" -C lib/$d all >/dev/null || exit 1; done )
   else
     ( cd "$B/o" && ../e2fsprogs-$E2V/configure --prefix=/usr --enable-elf-shlibs \
         --host=$ARCH-alpine-linux-musl --build=$(uname -m)-alpine-linux-musl \
-        --disable-nls --disable-fsck --disable-uuidd --enable-libuuid --enable-libblkid \
+        --disable-nls --disable-fsck --disable-uuidd --disable-libuuid --disable-libblkid \
         BUILD_CC=cc CC="$CC" CFLAGS="-O2" >/dev/null && make -C lib/et all >/dev/null && make -C lib/ext2fs ext2_err.h >/dev/null && for d in e2p ext2fs; do make -j"$(nproc)" -C lib/$d all >/dev/null || exit 1; done )
   fi
+  # e2fsck (unix.c) tests s_feature_incompat against the header macro, and e2undo gets
+  # the E2UNDO_CRASH mode: both are rebuilt from the patched source, linked against the
+  # patched libs (stock Alpine binaries would refuse the LeandrOS guard bit).
+  ( cd "$B/o" && for d in lib/support; do make -j"$(nproc)" -C $d all >/dev/null || exit 1; done \
+      && make -j"$(nproc)" -C e2fsck e2fsck >/dev/null && make -j"$(nproc)" -C misc e2undo >/dev/null ) || { echo "patched e2fsck/e2undo not built"; exit 6; }
+  PE2=$B/o/lib/libe2p.so.2.*
+  PE2=$(ls $PE2 | head -1)
   PL=$(ls "$B"/o/lib/libext2fs.so.2.* | head -1)
   [ -f "$PL" ] || { echo "patched libext2fs not built"; exit 6; }
   nm -D "$PL" 2>/dev/null | grep -q ext2fs_open || readelf --dyn-syms "$PL" | grep -q ext2fs_open
@@ -145,7 +155,19 @@ esac
   cp -L "$PL" "$S/usr/lib/libext2fs.so.2"
   [ "$(bid "$S/usr/lib/libext2fs.so.2")" = "$(bid "$PL")" ] || { echo "staged lib is not the patched build"; exit 7; }
   sed -i '/^alpine libext2fs\.so\.2 /d' "$S/CLOSURE.txt"   # superseded by the patched build below
-  echo "patched  libext2fs.so.2  <- e2fsprogs-$E2V + undo-durable.patch (Build ID $(bid "$PL"), stock $(bid "$STOCK"))" >> "$S/CLOSURE.txt"
+  echo "patched  libext2fs.so.2  <- e2fsprogs-$E2V + undo-durable.patch + leandros-guard.patch (Build ID $(bid "$PL"), stock $(bid "$STOCK"))" >> "$S/CLOSURE.txt"
+  STOCKE=$(find_lib libe2p.so.2) || { echo "stock libe2p not found"; exit 7; }
+  cmp -s "$PE2" "$STOCKE" && { echo "FATAL: patched libe2p equals stock"; exit 7; }
+  cp -L "$PE2" "$S/usr/lib/libe2p.so.2"
+  sed -i '/^alpine libe2p\.so\.2 /d' "$S/CLOSURE.txt"
+  echo "patched  libe2p.so.2  <- e2fsprogs-$E2V + leandros-guard.patch" >> "$S/CLOSURE.txt"
+  for T in e2fsck/e2fsck misc/e2undo; do
+    N=$(basename $T)
+    cmp -s "$B/o/$T" "$S/usr/sbin/$N" && { echo "FATAL: patched $N equals stock"; exit 7; }
+    [ "$(bid "$B/o/$T")" != "$(bid "$S/usr/sbin/$N")" ] || { echo "FATAL: patched $N has the stock Build ID"; exit 7; }
+    cp "$B/o/$T" "$S/usr/sbin/$N"
+    echo "patched  $N  <- e2fsprogs-$E2V + leandros-guard/e2undo-crash patches (Build ID $(bid "$S/usr/sbin/$N"))" >> "$S/CLOSURE.txt"
+  done
   echo "== patched libext2fs NEEDED =="; readelf -d "$S/usr/lib/libext2fs.so.2" | grep -E 'NEEDED|SONAME'
 
   # -- ELF fix-ups (as ports/pipewire) --------------------------------------------

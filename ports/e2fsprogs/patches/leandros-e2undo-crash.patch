@@ -1,0 +1,114 @@
+--- a/misc/e2undo.c
++++ b/misc/e2undo.c
+@@ -117,6 +117,9 @@
+ 
+ static char *prg_name;
+ static char *undo_file;
++/* LeandrOS: E2UNDO_CRASH=1 narrow crash-recovery mode (see check_filesystem) */
++static int crash_mode;
++static unsigned long long g_offset;
+ 
+ static void usage(void)
+ {
+@@ -196,6 +199,34 @@
+ 	}
+ 	sb = (struct ext2_super_block *)buf;
+ 	sb->s_magic = ~sb->s_magic;
++	if (memcmp(&super, buf, sizeof(super)) && crash_mode) {
++		/*
++		 * LeandrOS E2UNDO_CRASH=1: after a crash the live superblock
++		 * can be newer than the copy in the undo header (written at
++		 * the last index flush). Skip ONLY the byte compare and the sb
++		 * crc, and only when the identity fields agree and the undo
++		 * file is unfinished. Header CRC, key and block CRCs stay.
++		 */
++		if (super.s_magic == sb->s_magic &&
++		    memcmp(super.s_uuid, sb->s_uuid, sizeof(super.s_uuid)) == 0 &&
++		    super.s_log_block_size == sb->s_log_block_size &&
++		    super.s_first_data_block == sb->s_first_data_block &&
++		    ext2fs_le32_to_cpu(ctx->hdr.fs_block_size) ==
++			(1024U << super.s_log_block_size) &&
++		    (!e2undo_has_feature_fs_offset(&ctx->hdr) ||
++		     ext2fs_le64_to_cpu(ctx->hdr.fs_offset) == g_offset) &&
++		    1 /* FINISHED may be set: resize2fs reopens a file e2fsck closed cleanly */) {
++			fprintf(stderr, "E2UNDO_CRASH: superblock differs from the undo header; identity fields agree: continuing\n");
++			retval = 0;
++			goto out;
++		}
++		fprintf(stderr, "E2UNDO_CRASH: identity check failed (magic %d uuid %d lbs %d fdb %d fsbs %u vs %u); refusing\n",
++			super.s_magic == sb->s_magic,
++			memcmp(super.s_uuid, sb->s_uuid, sizeof(super.s_uuid)) == 0,
++			super.s_log_block_size == sb->s_log_block_size,
++			super.s_first_data_block == sb->s_first_data_block,
++			ext2fs_le32_to_cpu(ctx->hdr.fs_block_size), 1024U << super.s_log_block_size);
++	}
+ 	if (memcmp(&super, buf, sizeof(super))) {
+ 		print_undo_mismatch(&super, (struct ext2_super_block *)buf);
+ 		retval = -1;
+@@ -306,12 +337,14 @@
+ 	int mount_flags, csum_error = 0, io_error = 0;
+ 	size_t i, keys_per_block;
+ 	char *device_name, *tdb_file;
++	const char *crash_env = getenv("E2UNDO_CRASH");
+ 	io_manager manager = unix_io_manager;
+ 	struct undo_context undo_ctx;
+ 	char *buf;
+ 	struct undo_key_block *keyb;
+ 	struct undo_key *dkey;
+ 	struct undo_key_info *ikey;
++	int torn_tail = 0;
+ 	__u32 key_crc, blk_crc, hdr_crc;
+ 	blk64_t lblk;
+ 	ext2_filsys fs;
+@@ -359,6 +392,8 @@
+ 			usage();
+ 		}
+ 	}
++
++	crash_mode = crash_env && strcmp(crash_env, "1") == 0;
+ 
+ 	if (argc != optind + 2)
+ 		usage();
+@@ -475,6 +510,7 @@
+ 		io_channel_set_options(channel, opt_offset_string);
+ 	}
+ 
++	g_offset = offset;
+ 	if (!force && check_filesystem(&undo_ctx, channel))
+ 		exit(1);
+ 
+@@ -567,6 +603,12 @@
+ 						       -(int)ikey->size,
+ 						       buf);
+ 			if (retval) {
++				if (crash_mode &&
++				    i + j + 1 == undo_ctx.num_keys) {
++					fprintf(stderr, "E2UNDO_CRASH: torn last record (unreadable); dropping it\n");
++					torn_tail = 1;
++					continue;
++				}
+ 				com_err(prg_name, retval,
+ 					_("while fetching block %llu."),
+ 					(unsigned long long) ikey->fileblk);
+@@ -578,6 +620,12 @@
+ 
+ 			blk_crc = ext2fs_crc32c_le(~0, (unsigned char *)buf,
+ 						   ikey->size);
++			if (blk_crc != ikey->blk_crc && crash_mode &&
++			    i + j + 1 == undo_ctx.num_keys) {
++				fprintf(stderr, "E2UNDO_CRASH: torn last record (crc); dropping it\n");
++				torn_tail = 1;
++				continue;
++			}
+ 			if (blk_crc != ikey->blk_crc) {
+ 				fprintf(stderr,
+ 					_("checksum error in filesystem block "
+@@ -591,6 +639,8 @@
+ 		}
+ 	}
+ 	ext2fs_free_mem(&keyb);
++	if (torn_tail)
++		undo_ctx.num_keys--;
+ 
+ 	/* sort keys in fs block order */
+ 	qsort(undo_ctx.keys, undo_ctx.num_keys, sizeof(struct undo_key_info),
