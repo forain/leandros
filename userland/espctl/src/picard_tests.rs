@@ -114,10 +114,41 @@ fn tmp(n: &str) -> std::path::PathBuf {
     d.join(n)
 }
 fn mk_card(fill_root: usize) -> Card {
-    let img = tmp(&format!("card{}.img", fill_root));
-    let _ = std::fs::remove_file(&img);
-    let o = Command::new("mkfs.fat").args(["-F", "32", "-s", "8", "-R", "32", "-S", "512", "-C"]).arg(&img).arg("40960").output().expect("mkfs.fat");
+    mk_card_g(fill_root, false)
+}
+/// The real Pi card geometry: FAT32, 512 B sectors, 8 spc, 32 reserved, 2 x 975
+/// FAT sectors, data at sector 1982 (mod 8 = 6), 1,000,000 sectors. mkfs.fat
+/// always rounds the FAT to 976, so the empty image is rebuilt with 975-sector
+/// FATs (data start 1982). Only the used prefix is kept in memory.
+const MIS_PREFIX: usize = 1982 + 8 * 3000;
+fn mk_misaligned(img: &std::path::Path) {
+    use std::os::unix::fs::FileExt;
+    let o = Command::new("mkfs.fat").args(["-F", "32", "-s", "8", "-R", "32", "-S", "512", "-C"]).arg(img).arg("500000").output().expect("mkfs.fat");
     assert!(o.status.success());
+    let f = std::fs::OpenOptions::new().read(true).write(true).open(img).unwrap();
+    let mut res = vec![0u8; 32 * SS];
+    f.read_exact_at(&mut res, 0).unwrap();
+    let mut fat = vec![0u8; 975 * SS];
+    f.read_exact_at(&mut fat, 32 * SS as u64).unwrap();
+    for s in [0usize, 6] {
+        res[s * SS + 32..s * SS + 36].copy_from_slice(&1_000_000u32.to_le_bytes());
+        res[s * SS + 36..s * SS + 40].copy_from_slice(&975u32.to_le_bytes());
+    }
+    f.write_all_at(&res, 0).unwrap();
+    f.write_all_at(&fat, 32 * SS as u64).unwrap();
+    f.write_all_at(&fat, 1007 * SS as u64).unwrap();
+    f.write_all_at(&vec![0u8; 16 * SS], 1982 * SS as u64).unwrap(); // root cluster + next
+    f.set_len(1_000_000 * SS as u64).unwrap();
+}
+fn mk_card_g(fill_root: usize, mis: bool) -> Card {
+    let img = tmp(&format!("card{}{}.img", fill_root, if mis { "m" } else { "" }));
+    let _ = std::fs::remove_file(&img);
+    if mis {
+        mk_misaligned(&img);
+    } else {
+        let o = Command::new("mkfs.fat").args(["-F", "32", "-s", "8", "-R", "32", "-S", "512", "-C"]).arg(&img).arg("40960").output().expect("mkfs.fat");
+        assert!(o.status.success());
+    }
     let (kernel, initrd) = (rnd(1, 100 * 1024), rnd(2, 40 * 1024));
     let files: Vec<(&str, Vec<u8>)> = vec![
         ("config.txt", config_txt()),
@@ -138,7 +169,10 @@ fn mk_card(fill_root: usize) -> Card {
         std::fs::write(&src, b"x").unwrap();
         assert!(Command::new("mcopy").env("MTOOLS_SKIP_CHECK", "1").arg("-i").arg(&img).arg(&src).arg(format!("::dummy{}.txt", i)).output().unwrap().status.success());
     }
-    let b = std::fs::read(&img).unwrap();
+    let mut b = std::fs::read(&img).unwrap();
+    if mis {
+        b.truncate(MIS_PREFIX * SS);
+    }
     Card { img: Rc::new(RefCell::new(b)), log: Rc::new(RefCell::new(vec![])), kernel, initrd }
 }
 impl Card {
@@ -148,6 +182,13 @@ impl Card {
     fn fsck(&self, what: &str) {
         let p = tmp("fsck.img");
         std::fs::write(&p, &*self.img.borrow()).unwrap();
+        {
+            let tot = u32::from_le_bytes(self.img.borrow()[32..36].try_into().unwrap()) as u64 * SS as u64;
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            if f.metadata().unwrap().len() < tot {
+                f.set_len(tot).unwrap();
+            }
+        }
         let o = Command::new("fsck.fat").arg("-n").arg(&p).output().unwrap();
         let t = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
         // Fresh images are flagged for the small cluster count only; any structural complaint fails.
@@ -289,7 +330,16 @@ fn config_migration_layout() {
 /// every phase replayed at every sector write.
 #[test]
 fn power_loss_every_sector() {
-    let c = mk_card(0);
+    power_loss_body(mk_card_g(0, false));
+}
+#[test]
+fn power_loss_every_sector_misaligned() {
+    let c = mk_card_g(0, true);
+    assert_eq!((c.fat().data0 % 8, c.fat().data0, c.fat().fatsz), (6, 1982, 975));
+    c.fsck("misaligned fresh");
+    power_loss_body(c);
+}
+fn power_loss_body(c: Card) {
     let base0 = c.img.borrow().clone();
     let root_cmd = cmdline();
     let factory = (sha(&c.kernel), sha(&c.initrd));

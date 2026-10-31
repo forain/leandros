@@ -138,11 +138,13 @@ impl<D: Disk> Fat<D> {
     pub fn cluster_bytes(&self) -> u64 {
         self.spc * 512
     }
-    /// Cluster size >= 4 KiB and 4 KiB-aligned data area: needed so a bulk
-    /// slot write never read-modify-writes a neighbour's sectors.
+    /// Geometry gate. Every write is whole 512 B sectors through exact
+    /// BLKWRWIN ranges and unchanged sectors are never rewritten, so a
+    /// cluster may start at ANY sector (no 4 KiB alignment is needed).
+    /// FAT12/16 and sector size != 512 are refused in open().
     pub fn check_align(&self) -> R<()> {
-        if self.cluster_bytes() < 4096 || self.data0 % 8 != 0 {
-            return e("FAT geometry not 4 KiB aligned (cluster < 4 KiB or data start not a multiple of 8 sectors)");
+        if self.cluster_bytes() < 512 || self.spc > 128 {
+            return e("unsupported FAT32 cluster size");
         }
         Ok(())
     }
@@ -1098,7 +1100,7 @@ pub fn status<D: Disk>(f: &mut Fat<D>, sys: &dyn Sys) -> R<String> {
     let st = load(f)?;
     let mut s = String::new();
     let free = f.free_clusters()?;
-    s += &format!("fat32 spc={} data0={} clusters={} free={} ({} MiB) aligned={}\n", f.spc, f.data0, f.ncl, free, free as u64 * f.cluster_bytes() >> 20, f.check_align().is_ok());
+    s += &format!("fat32 spc={} data0={} clusters={} free={} ({} MiB) data0%8={}\n", f.spc, f.data0, f.ncl, free, free as u64 * f.cluster_bytes() >> 20, f.data0 % 8);
     s += &format!("config.txt len={} sha8={} os_prefix={}\n", st.cfg.len(), &sha(&st.cfg)[..8], st.cur.map_or("none".into(), |n| format!("slots/s{}/", n)));
     s += &format!("tryboot.txt os_prefix={} pending-sectors={:?}\n", st.tb_slot.map_or("none".into(), |n| format!("slots/s{}/", n)), diff_sectors(&st.cfg, &st.tb));
     for (n, i) in st.infos.iter().enumerate() {

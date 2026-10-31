@@ -42,17 +42,12 @@ impl Disk for Vdc {
     }
     fn write(&mut self, lba: u64, data: &[u8]) -> io::Result<()> {
         let w = self.wr.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no write window"))?;
-        // 512 B pieces first up to 4 KiB alignment, then bulk, then the tail:
-        // the kernel's sector-exact path takes exactly 512 B writes.
+        // Strictly one 512 B pwrite per sector: the kernel's sector-exact
+        // path, no 4 KiB assumption anywhere (clusters may start at any sector).
         let mut off = lba * 512;
-        let mut d = data;
-        while !d.is_empty() && (d.len() < 4096 || off % 4096 != 0) {
-            w.write_all_at(&d[..512], off)?;
+        for s in data.chunks(512) {
+            w.write_all_at(s, off)?;
             off += 512;
-            d = &d[512..];
-        }
-        if !d.is_empty() {
-            w.write_all_at(d, off)?;
         }
         Ok(())
     }
