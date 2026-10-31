@@ -1,6 +1,7 @@
 use leandros_install::install::{self, Opts};
 use leandros_install::mkhome;
 use leandros_install::progress::Out;
+use leandros_install::shrink;
 use std::process::exit;
 
 fn die(msg: &str) -> ! {
@@ -17,6 +18,10 @@ const USAGE: &str = "usage:
   leandros-install repair-esp [--boot DEV] [--esp DEV]
       recreate the three LeandrOS files on a dual-boot disk's shared ESP (runs espctl repair-esp)
   leandros-install gaps --dev FILE|/dev/X [--sector-size 512|4096]
+  leandros-install shrink --part /dev/Xp2 --to SIZE [--dry-run] --yes [--json]
+      session A of the dual-boot ext4 shrink (filesystem only, GPT untouched)
+  leandros-install shrink --recover [--part DEV] [--dir D] --yes [--json]   (e2undo after a crash)
+  leandros-install shrink-status [--dir D] [--mark-verified] [--json]
   leandros-install mkhome --out FILE --size SIZE [--uuid HEX] [--time EPOCH] [--full]";
 
 fn mkhome_cmd(args: &[String]) {
@@ -103,6 +108,28 @@ fn parse_opts(args: &[String]) -> Opts {
     o
 }
 
+fn shrink_cmd(args: &[String]) -> shrink::Opts {
+    let mut o = shrink::Opts::default();
+    let mut i = 1;
+    while i < args.len() {
+        let val = |i: usize| args.get(i + 1).cloned().unwrap_or_else(|| die("missing value"));
+        match args[i].as_str() {
+            "--part" => { o.part = Some(val(i)); i += 2; }
+            "--to" => { o.to = Some(mkhome::parse_size(&val(i)).unwrap_or_else(|e| die(&e))); i += 2; }
+            "--dir" => { o.dir = Some(val(i)); i += 2; }
+            "--backup-root" => { o.root = Some(val(i)); i += 2; }
+            "--dry-run" => { o.dry_run = true; i += 1; }
+            "--yes" => { o.yes = true; i += 1; }
+            "--json" => { o.json = true; i += 1; }
+            "--check-sb" => { o.check_sb = Some(val(i)); i += 2; }
+            "--recover" => { o.recover = true; i += 1; }
+            "--mark-verified" => { o.mark_verified = true; i += 1; }
+            a => die(&format!("unknown argument {a}")),
+        }
+    }
+    o
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -113,6 +140,14 @@ fn main() {
                 Ok(s) if s.success() => {}
                 Ok(s) => std::process::exit(s.code().unwrap_or(1)),
                 Err(e) => die(&format!("cannot run espctl: {e}")),
+            }
+        }
+        Some("shrink") | Some("shrink-status") => {
+            let o = shrink_cmd(&args);
+            let r = if args[0] == "shrink" { shrink::shrink(&o) } else { shrink::status(&o) };
+            if let Err(e) = r {
+                Out { json: o.json }.error(&e);
+                exit(1);
             }
         }
         Some("gaps") => gaps_cmd(&args),

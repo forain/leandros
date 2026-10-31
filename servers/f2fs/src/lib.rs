@@ -5057,7 +5057,10 @@ fn fsync_port(port: u32, caller_pid: u32, file_id: u64, kind: u64) -> Message {
         durable::RF_FALLBACK.fetch_add(1, atomic::Ordering::Relaxed);
     }
     let lazy_ns = FSYNC_LAZY_NS.load(atomic::Ordering::Relaxed);
-    if per_file && lazy_ns != 0 {
+    // An e2undo file (resize2fs -z, the dual-boot shrink) must reach the medium
+    // before the filesystem writes it protects: its fsyncs are never lazy.
+    let undo_file = path[..plen].ends_with(b".e2undo");
+    if per_file && lazy_ns != 0 && !undo_file {
         // `f2fs.fsync=lazy`: commit within the promised time, return now.
         // (The write-back task checks the promise every second.)
         lazy_owe(port, lazy_ns.saturating_sub(1_000_000_000));

@@ -54,7 +54,7 @@ echo "== ext4 p2"
 P2S=$(field 2 "First sector" | cut -d' ' -f1); P2OFF=$((P2S * 512)); E="$IMG?offset=$P2OFF"
 e2fsck -fn "$E" >$W/e2fsck.log 2>&1 && ok "e2fsck -fn clean" || { bad "e2fsck -fn"; tail -3 $W/e2fsck.log; }
 BLK=$(dumpe2fs -h "$E" 2>/dev/null | sed -n 's/^Block count: *//p')
-if [ "$MODE" = pristine ]; then [ "$BLK" = "$FX_P2_BLOCKS" ] && ok "block count $BLK" || bad "block count $BLK"
+if [ "$MODE" = pristine ] && [ "${SHRUNK:-0}" = 0 ]; then [ "$BLK" = "$FX_P2_BLOCKS" ] && ok "block count $BLK" || bad "block count $BLK"
 else echo "  block count $BLK ($((BLK * 4 / 1024 / 1024)) GiB)"; fi
 sb() { dd if=$IMG bs=1 skip=$((P2OFF + 1024 + $1)) count=4 2>/dev/null | od -An -tx4 | tr -d ' '; }
 [ "$(sb 92)-$(sb 96)-$(sb 100)" = "0000103c-000022c2-0000046b" ] && ok "feature bits = laptop" || bad "feature bits $(sb 92)-$(sb 96)-$(sb 100)"

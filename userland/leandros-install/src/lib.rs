@@ -19,3 +19,4 @@ pub mod gpt;
 pub mod install;
 pub mod plan;
 pub mod progress;
+pub mod shrink;

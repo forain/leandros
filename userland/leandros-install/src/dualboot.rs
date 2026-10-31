@@ -179,7 +179,7 @@ fn free_bytes(path: &str) -> Option<u64> {
 }
 
 /// True when a mains supply exists and none is online.
-fn on_battery() -> bool {
+pub fn on_battery() -> bool {
     let Ok(rd) = std::fs::read_dir("/sys/class/power_supply") else { return false };
     let (mut mains, mut online) = (0, 0);
     for e in rd.flatten() {
@@ -232,7 +232,7 @@ fn check_tables(f: &mut File, ss: u64, total: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn gpt_lines(g: &Gpt) -> Vec<String> {
+pub fn gpt_lines(g: &Gpt) -> Vec<String> {
     g.used()
         .iter()
         .map(|(i, e)| {
@@ -274,7 +274,7 @@ fn gpt_json(g: &Gpt) -> String {
 /// stick, with real syncs (the stick may run `f2fs.fsync=lazy`, under which
 /// fsync returns at once; `sync()` is always synchronous) and a read-back
 /// comparison. Returns the file list.
-fn backup(target: &str, g: &Gpt, esp_first: u64, esp_len: u64, dir: &str, out: &Out) -> Result<Vec<String>, String> {
+pub fn backup(target: &str, g: &Gpt, esp_first: u64, esp_len: u64, dir: &str, out: &Out) -> Result<Vec<String>, String> {
     let io = |e: std::io::Error| e.to_string();
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir, e))?;
     let mut disk = File::open(target).map_err(io)?;

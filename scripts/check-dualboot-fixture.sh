@@ -11,16 +11,17 @@
 set -eu
 IMG=${1:?usage: $0 <img> [--installed] [--boot <arch>]}; shift
 HERE=$(cd "$(dirname "$0")" && pwd)
-MODE=pristine; BOOT=""; FORCE_KERNEL=""
+SHRUNK=0; MODE=pristine; BOOT=""; FORCE_KERNEL=""
 while [ $# -gt 0 ]; do case "$1" in
   --installed) MODE=installed ;;
+  --shrunk) SHRUNK=1 ;;
   --boot) BOOT=$2; shift ;;
   *) echo "unknown arg $1" >&2; exit 2 ;; esac; shift; done
 IMG=$(cd "$(dirname "$IMG")" && pwd)/$(basename "$IMG")
 RC=0
 if [ -z "$BOOT" ] || [ "$MODE" = installed ]; then
   . "$HERE/container-lib.sh"; leandros_pick_container || { echo "no container: $CT_WHY" >&2; exit 1; }
-  $CT run --rm -e MODE=$MODE -v "$HERE/dualboot-fixture:/scripts:ro" \
+  $CT run --rm -e MODE=$MODE -e SHRUNK=$SHRUNK -v "$HERE/dualboot-fixture:/scripts:ro" \
     -v "$IMG:/img:ro" $(for s in meta manifest esp.sha256; do [ -f "$IMG.$s" ] && printf -- '-v %s:/img.%s:ro ' "$IMG.$s" "$s"; done) \
     alpine:3.21 sh /scripts/check-inner.sh || RC=$?
 fi
