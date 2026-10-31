@@ -85,8 +85,12 @@ PY
 BOOTDISK="$(python3 -c "import json; print([json.loads(l)['name'] for l in open('$WORK/list.json') if l.startswith('{') and json.loads(l)['boot']][0])")"
 if r "$LI install --mode dualboot --use-free --target /dev/$BOOTDISK --yes --json; true" | grep -q '"ev":"done"'; then fail "install onto the stick was accepted"; fi
 ok "install onto the boot stick refused"
-snap() { r "dd if=/dev/nvme0n1 bs=1M count=2 2>/dev/null | sha256sum; dd if=/dev/nvme0n1 bs=1M skip=49150 2>/dev/null | sha256sum" | tr '\n' ' '; }
+# Hash through /tmp files, not `dd bs=1M | sha256sum`: the host-side hash of the
+# pristine image below is the ground truth for the guest's view.
+snap() { r "dd if=/dev/nvme0n1 bs=1M count=2 of=/tmp/h0 2>/dev/null; sha256sum < /tmp/h0; dd if=/dev/nvme0n1 bs=1M skip=49150 of=/tmp/h1 2>/dev/null; sha256sum < /tmp/h1; rm -f /tmp/h0 /tmp/h1" | tr '\n' ' '; }
+hsnap() { echo "$(dd if="$1" bs=1M count=2 2>/dev/null | shasum -a 256 | cut -d' ' -f1)  - $(dd if="$1" bs=1M skip=49150 2>/dev/null | shasum -a 256 | cut -d' ' -f1)  - "; }
 B4=$(snap)
+[ "$B4" = "$(hsnap "$WORK/pristine.img")" ] && ok "guest hash of the disk matches the host hash" || fail "guest disk hash differs from the host image hash"
 r "$LI install --mode dualboot --use-free --target /dev/nvme0n1 --dry-run --json" > "$WORK/dry.log"
 grep -q '"ev":"done","dry_run":true' "$WORK/dry.log" || { tail -3 "$WORK/dry.log"; fail "dry run did not finish"; }
 grep -q '"ev":"plan".*"new_gpt"' "$WORK/dry.log" && grep -q 'EFI/leandros' "$WORK/dry.log" || fail "dry run plan lacks new_gpt/esp_files"

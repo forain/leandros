@@ -1,0 +1,11 @@
+[package]
+name = "pipebw"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "pipebw"
+path = "src/main.rs"
+
+[dependencies]
+# Linked against librelibc.a like fdmaxtest (relibc_start_v1, fork, waitpid).

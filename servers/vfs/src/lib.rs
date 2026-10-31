@@ -2753,12 +2753,14 @@ fn find_mount_port(path: &[u8]) -> Option<u32> {
 /// anything reads it, so a body larger than one ring would deadlock rather
 /// than merely error. See the F_SETPIPE_SZ arm in handle_fcntl, which refuses
 /// requests above this so that case fails cleanly instead of wedging.
-const PIPE_RING_SIZE: usize = 16384;
+pub const PIPE_RING_SIZE: usize = 16384;
+/// Most bytes one pipe read() delivers; callers (kernel prefault) clamp to it.
+pub const PIPE_READ_MAX: usize = 4096;
 /// POSIX PIPE_BUF: a write of at most this many bytes is atomic — it is
 /// either written whole or (blocking fd) waits / (O_NONBLOCK) fails EAGAIN,
 /// never interleaved with another writer's bytes. Also the POLLOUT threshold:
 /// the write end is writable when at least PIPE_BUF bytes are free (Linux).
-const PIPE_BUF: usize = 4096;
+pub const PIPE_BUF: usize = 4096;
 // The full COSMIC desktop session spawns ~14 long-lived components via
 // cosmic-session/launch_pad, each holding 3 stdio pipes (stdin/stdout/stderr)
 // for its whole lifetime so launch_pad can stream on_stdout/on_stderr — plus
@@ -8430,7 +8432,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // rule in the write arm), so only a drain that crosses that line
             // is a level change.
             let was_full = r.free() < PIPE_BUF;
-            let n = match r.copy_out(buf, count.min(4096)) { Ok(n) => n, Err(e) => return err_reply(e) };
+            let n = match r.copy_out(buf, count.min(PIPE_READ_MAX)) { Ok(n) => n, Err(e) => return err_reply(e) };
             let now_writable = r.free() >= PIPE_BUF;
             // Draining bytes frees ring space → a new POLLOUT edge for the
             // write end. Advance the seq so an epoll writer blocked on a full
@@ -8718,7 +8720,8 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // PIPE_BUF atomicity: a write of at most PIPE_BUF bytes goes in
             // whole or not at all (EAGAIN; the kernel's blocking retry parks
             // the writer until the reader has freed enough). Larger writes
-            // fill whatever is free and return the partial count, as Linux.
+            // fill whatever is free and return the partial count; the kernel's sys_write
+            // loops on blocking fds until all bytes are in (POSIX).
             let free = r.free();
             let mut n = 0usize;
             if count > PIPE_BUF || free >= count {
