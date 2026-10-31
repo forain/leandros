@@ -357,13 +357,20 @@ fn power_loss_body(c: Card) {
     check(&c.img, "start");
 
     // ---- setup
+    {
+        let mut f = c.fat();
+        let er = setup(&mut f, &SetupOpts { ksz: KSZ, isz: ISZ, accept_root_risk: false }).unwrap_err().to_string();
+        assert!(er.contains("firmware-critical"), "gate must refuse without accept: {}", er);
+    }
     let (r, log) = c.record(|f| setup(f, &SetupOpts { ksz: KSZ, isz: ISZ, accept_root_risk: true }));
     let msg = r.unwrap();
     no_secret(&msg);
     // root sector is the last write; nothing before it touches the root dir or config files
     let rootlba = log.last().unwrap().0;
     assert!(log[..log.len() - 1].iter().all(|(l, _)| *l != rootlba), "root sector written before the end");
-    replay(&base0, &log, |_| false, &check);
+    // torn variants on every sector except the root one: a garbage root sector
+    // loses config.txt by construction (the reason for --accept-root-sector-risk).
+    replay(&base0, &log, |l| l != rootlba, &check);
     c.fsck("setup");
 
     // ---- flag-only probe: tryboot.txt = A + cmdline line, factory kernel, noprefix marker
@@ -573,4 +580,18 @@ fn guard_refuses_writes_off_bootfat() {
         assert!(write_guard(v, "/dev/vdc", true).is_ok());
     }
     assert!(write_guard("status", "/dev/vdc", false).is_ok());
+}
+
+/// Not a test: with PICARD_E2E_IMG=<path> it writes the card-shaped FAT32 image
+/// (512 B sectors, spc 8, 32 reserved, 2 x 975 FAT, data0 1982, 1,000,000
+/// sectors; sparse) that scripts/pi-e2e-test.sh attaches to QEMU.
+#[test]
+fn emit_e2e_image() {
+    let Ok(out) = std::env::var("PICARD_E2E_IMG") else { return };
+    let c = mk_card_g(0, true);
+    let b = c.img.borrow();
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::create(&out).unwrap();
+    f.write_all_at(&b, 0).unwrap();
+    f.set_len(1_000_000 * SS as u64).unwrap();
 }

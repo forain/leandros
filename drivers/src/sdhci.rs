@@ -799,9 +799,9 @@ impl SdhciDevice {
                 // A 4 KiB VFS write over a 512 B edit must not re-write (and
                 // so risk tearing) the 7 unchanged sectors: read, compare, skip.
                 let mut cur = [0u8; SECTOR_SIZE];
-                let same = unsafe { self.do_io_sector(false, sector, cur.as_mut_ptr()) }
-                    && cur == unsafe { core::slice::from_raw_parts(buf.add(i * SECTOR_SIZE), SECTOR_SIZE) };
-                if same { continue; }
+                // A failed compare read is an I/O error: never write blind.
+                if !unsafe { self.do_io_sector(false, sector, cur.as_mut_ptr()) } { return false; }
+                if cur == unsafe { core::slice::from_raw_parts(buf.add(i * SECTOR_SIZE), SECTOR_SIZE) } { continue; }
             }
             let ok = unsafe { self.do_io_sector(is_write, sector, buf.add(i * SECTOR_SIZE)) };
             if !ok {

@@ -728,7 +728,8 @@ fn blkwrwin(pid: u32, ofd_id: u32, backing: Backing, size: u64, ro: bool, arg: u
         r[k] = (a, l);
     }
     if !super::ofd::live(ofd_id) { return -9; }
-    if cnt > 0 && ro {
+    let special = BDEVS.lock().iter().any(|e| e.in_use && e.special && e.backing == Backing::Disk(i));
+    if cnt > 0 && ro && !special {
         // Implied runtime write enable, unless the boot policy (blk.rw=) forbids it.
         match ops() {
             Some(o) => {

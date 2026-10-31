@@ -800,6 +800,17 @@ pub fn setup<D: Disk>(f: &mut Fat<D>, o: &SetupOpts) -> R<String> {
     if end_idx + ne.len() > 16 {
         return e("the root directory sector has no room for the new entries");
     }
+    if end_idx + ne.len() == 16 {
+        // The new entries fill the sector: the next root sector must start with
+        // the 0x00 end marker, or a reader would walk on into stale entries.
+        if (end_lba - f.data0) % f.spc == f.spc - 1 {
+            return e("the new root entries fill the last sector of a root cluster; refusing");
+        }
+        let nx = f.rd(end_lba + 1, 1)?;
+        if nx[0] != 0 {
+            return e("the new root entries fill their sector and the next root sector has no end marker; refusing");
+        }
+    }
     let crit: Vec<String> = root.ents.iter().filter(|x| x.lba == end_lba && (CRITICAL.contains(&x.name.to_lowercase().as_str()) || x.name.ends_with(".dtb"))).map(|x| x.name.clone()).collect();
     if !crit.is_empty() && !o.accept_root_risk {
         return e(format!("the root-dir sector that takes the new entries also holds firmware-critical entries ({}); pass --accept-root-sector-risk to proceed", crit.join(",")));
