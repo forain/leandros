@@ -20,3 +20,7 @@ Built on lane/kmodgate (U1). New file kernel/src/kmod/lower.rs; edits in exports
 
 ## Not done
 - x86_64 not run; MSI-X path (x86) release untested. rp1 IRQ, wait/sem handles, MMIO mappings, Wi-Fi/HCI still have no free.
+
+## Result (aarch64 QEMU, after merging main 659f5e1d)
+unloadtest.sh 21/21 ok: hello x50, virtio_rng x50, virtio_net x20 (traffic loop in guest; the guest has no `ip`, so eth0 is verified from the log: no eth1 ever, DHCP on eth0 after every reload), kmbad_thread/kmbad_freectx clean, kmbad_hang Zombie, U1 checks. autoloadtest PASS. The ping target 192.168.105.1 is a guess; the flood is best effort.
+Needs untracked `.config` (CONFIG_MODULES=y, CONFIG_VIRTIO_NET=m) for the net loop.

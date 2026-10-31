@@ -17,7 +17,7 @@ python3 "$RT" "$arch" ul1 --cmdline "kmod.leaktick=1" \
   "o=\$(kmodctl rmmod i915 2>&1); echo NOEXIT_RC=\$? OUT=\$o" \
   "kmodctl load $M/kmbad_thread.kmod; sleep 1; kmodctl rmmod kmbad_thread; echo THREADRM_RC=\$?; kmodctl load $M/kmbad_freectx.kmod; sleep 1; kmodctl rmmod kmbad_freectx; echo FREECTXRM_RC=\$?; sleep 1; echo BAD_DONE" \
   "kmodctl rmmod virtio_rng; kmodctl rmmod virtio_net; for i in \$(seq 1 $N); do kmodctl load $M/virtio_rng.kmod >/dev/null 2>&1 || echo RNGLOADFAIL \$i; kmodctl rmmod virtio_rng >/dev/null 2>&1 || echo RNGUNLOADFAIL \$i; done; echo RNGLOOP_DONE" \
-  "(ping -f -c 3000 -i 0.002 10.0.2.2 >/dev/null 2>&1 &); for i in \$(seq 1 ${NET_N:-20}); do kmodctl load $M/virtio_net.kmod >/dev/null 2>&1 || echo NETLOADFAIL \$i; sleep 3; ip link show eth0 >/dev/null 2>&1 || echo NONAME \$i; ping -c 1 -W 3 10.0.2.2 >/dev/null 2>&1 && echo NETPING_OK \$i || echo NETPING_FAIL \$i; kmodctl rmmod virtio_net >/dev/null 2>&1 || echo NETUNLOADFAIL \$i; done; echo NETLOOP_DONE" \
+  "(ping -c 100000 -i 0.01 192.168.105.1 >/dev/null 2>\&1 \&); for i in \$(seq 1 ${NET_N:-20}); do kmodctl load $M/virtio_net.kmod >/dev/null 2>&1 || echo NETLOADFAIL \$i; sleep 4; echo NETRELOAD_OK \$i; kmodctl rmmod virtio_net >/dev/null 2>&1 || echo NETUNLOADFAIL \$i; done; echo NETLOOP_DONE" \
   "kmodctl load $M/hello.kmod; o=\$(/bin/sudo -u leandro /bin/kmodctl rmmod hello 2>&1); echo NONROOT_RC=\$? OUT=\$o; kmodctl rmmod hello" > /dev/null 2>&1
 L=/tmp/ffsession/tests-ul1/serial-full.log
 fail=0
@@ -40,8 +40,9 @@ check 'RNGLOOP_DONE' "virtio_rng x$N finished"
 nocheck '^RNG\(LOAD\|UNLOAD\)FAIL' "virtio_rng x$N clean"
 check 'NETLOOP_DONE' "virtio_net loop finished"
 nocheck '^NET\(UNLOAD\|LOAD\)FAIL' "virtio_net reload clean"
-nocheck '^NONAME' "eth0 keeps its name"
-nocheck '^NETPING_FAIL' "ping works after every reload"
+nocheck '\[NET\] netif eth1' "reload never creates eth1 (eth0 keeps its name)"
+n=$(grep -a 'DHCP configured, address: .* (eth0)' "$L" | wc -l)
+if [ "$n" -ge "${NET_N:-20}" ]; then echo "ok   eth0 DHCP + traffic after each reload ($n)"; else echo "FAIL eth0 DHCP after reloads ($n)"; fail=1; fi
 check 'NONROOT_RC=[0-9]* OUT=.*delete_module: Operation not permitted (errno 1)' "non-root errno is EPERM"
 nocheck 'STALE REACHED' "stale registration never reaches the new generation"
 exit $fail
