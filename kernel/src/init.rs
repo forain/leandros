@@ -218,6 +218,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             ro: d.read_only,
             ordinal: d.ordinal,
             gone: d.gone,
+            special: d.special,
         }),
         removed_gen: || drivers::blkdev::removed_generation(),
         read_blocks: |i, blk, buf| drivers::blkdev::read_blocks(i, blk, buf),

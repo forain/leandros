@@ -66,6 +66,8 @@ pub fn init() {
     let on = boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "leandros.tryboot=1"));
     if !on { return; }
     ACTIVE.store(true, Ordering::Release);
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    drivers::rpi_misc::set_trial_boot(true);
     serial_print_str("[tryboot] trial boot: deadline armed\n");
     if sched::spawn(watch, 0).map(|p| sched::set_comm(p, b"tryboot")).is_none() {
         serial_print_str("[tryboot] could not start the deadline task\n");

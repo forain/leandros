@@ -1574,6 +1574,11 @@ pub fn read_only(dev_idx: usize) -> bool {
     matches!(devs.get(dev_idx), Some(Some(d)) if d.boot_fat)
 }
 
+pub fn is_boot_fat(dev_idx: usize) -> bool {
+    let devs = DEVICES.lock();
+    matches!(devs.get(dev_idx), Some(Some(d)) if d.boot_fat)
+}
+
 pub fn flush(dev_idx: usize) -> bool {
     let devs = DEVICES.lock();
     devs[dev_idx].is_some()

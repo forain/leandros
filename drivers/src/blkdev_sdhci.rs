@@ -65,6 +65,7 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
         removable: false,
         read_only: read_only(idx),
         gone: false,
+        special: crate::sdhci::is_boot_fat(idx),
         class: "vd",
         ordinal: idx as u16,
     })
