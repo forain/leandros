@@ -166,3 +166,16 @@ pub fn pm_freeze(_timeout_ms: u64) -> Result<alloc::string::String, alloc::strin
 pub fn pm_thaw() -> Result<alloc::string::String, alloc::string::String> {
     Ok(alloc::string::String::from("sdhci: nothing to thaw"))
 }
+
+/// `/dev/<name>` of device `idx`. The SD facade has no partition registry
+/// (the boot-FAT window, vdc, is its own device index, never a child of vdb),
+/// so a family is just the device itself.
+pub fn family_paths(idx: usize) -> alloc::vec::Vec<&'static str> {
+    if idx < device_count() && idx < PATHS.len() { alloc::vec![PATHS[idx]] } else { alloc::vec::Vec::new() }
+}
+
+/// No per-disk write policy on the SD facade (see `set_rw_list`).
+pub fn rw_list_active() -> bool { false }
+
+/// No partition registry, hence no f2fs label lookup.
+pub fn f2fs_label_is(_idx: usize, _label: &str) -> bool { false }
