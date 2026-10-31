@@ -18,3 +18,10 @@ Branch lane/kmodhdmia (off main 81d31ad1), not merged.
 ## Evidence (aarch64 only)
 - ktest=kmodkapi PASS, 141 exports, all new dma40/hdmi_sink_info cases ok.
 - Builds ok: aarch64; --rpi5 (llvm-nm: 8 `hdmi_audio::hw` symbols); --rpi5 with CONFIG_HDMI_AUDIO unset (0 `hdmi_audio::hw`).
+
+## Pi trial
+
+- Pi 5 boot OK with the lane kernel; dma40 selftest ok.
+- `[hdmiaud] inert: no sink on hdmi0 (hpd=0)`: no monitor was attached, so audio playback is unverified.
+- The kexec-out reset seen during the trial is a main regression (secondary CPU straggler, lane pikexec), not caused by this lane.
+- After merging main (macba, gfxkapi, i915mod): NEXPORTS = 150 (141 on main + 9 dma40/hdmi exports).

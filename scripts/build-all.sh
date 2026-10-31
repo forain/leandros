@@ -934,6 +934,18 @@ build_espctl() {
     "$ROOT_DIR/userland/espctl/build.sh" "$arch"
 }
 
+# leandros-install -- the installer backend (userland/leandros-install),
+# installed as /usr/sbin/leandros-install. Same shape as espctl.
+build_leandros_install() {
+    local arch="$1"
+    echo "💿 Building $arch leandros-install..."
+    if [[ ! -x "$ROOT_DIR/userland/leandros-install/build.sh" ]]; then
+        echo "⚠️  userland/leandros-install not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/leandros-install/build.sh" "$arch"
+}
+
 # Function to stage git (ports/git): Alpine 3.21's git + less + nano +
 # sftp-server, repackaged like PipeWire (see stage_container_port). Skipped
 # while out/<arch>/.stamp is newer than the port sources;
@@ -1098,6 +1110,8 @@ stage_dbus_session() {
         echo "⚠️  ports/cosmic-applet-power/build.sh FAILED for $arch (no Power applet)"
     ./ports/cosmic-apps/build.sh "$arch" || \
         echo "⚠️  ports/cosmic-apps/build.sh FAILED for $arch (no Files/Edit/Screenshot apps)"
+    ./ports/leandros-installer/build.sh "$arch" || \
+        echo "⚠️  ports/leandros-installer/build.sh FAILED for $arch (no installer GUI)"
     ./ports/cosmic-applets-panel/build.sh "$arch" || \
         echo "⚠️  ports/cosmic-applets-panel/build.sh FAILED for $arch (no Time/Battery/Notifications/... applets)"
     # iso-codes tables for cosmic-settings' Region & language page (data only).
@@ -1184,6 +1198,7 @@ for arch in "${ARCHS[@]}"; do
     build_sudotest "$arch"
     build_sshd "$arch"
     build_espctl "$arch"
+    build_leandros_install "$arch"
     build_git "$arch"
     build_disktester "$arch"
     build_ripgrep "$arch"

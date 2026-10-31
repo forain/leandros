@@ -84,6 +84,7 @@ fn release_one(owner: KmodId, kind: RegKind, handle: u64) -> bool {
     match kind {
         RegKind::TICK => { usb::class::tick_unregister_owner(owner); true }
         RegKind::PM => { super::exports::pm_unregister_owner(owner); true }
+        RegKind::BACKLIGHT => { super::exports::backlight_unregister_owner(owner); true }
         RegKind::PLAT => { super::exports::plat_unregister_owner(owner); true }
         RegKind::DMAQ => { super::exports::dma_quiesce_unregister_owner(owner); true }
         RegKind::V4L2 => { crate::syscall::v4l2::unregister_camera(handle as usize); true }
