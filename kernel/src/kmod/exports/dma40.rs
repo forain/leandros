@@ -33,3 +33,14 @@ pub extern "C" fn kapi_hdmi_sink_info(out: *mut kmod_abi::KHdmiSink) -> i32 {
     }
     0
 }
+
+// modules/hdmi-audio mirrors these literals in its `kenv::hdmi` (it cannot link `drivers`);
+// pin the kernel values to the module's so the two can never drift apart silently.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+const _: () = {
+    use drivers::hdmi_probe as p;
+    assert!(p::PROBE_NOT_RUN == 0 && p::PROBE_SKIPPED == 1 && p::PROBE_DONE == 2);
+    assert!(p::PORT_VALID == 1 << 0 && p::PORT_HPD == 1 << 1);
+    assert!(p::PORT_HDMI_MODE == 1 << 2 && p::PORT_ACTIVE == 1 << 3);
+    assert!(p::SINK_HDMI == 1 && p::SINK_DVI == 2);
+};
