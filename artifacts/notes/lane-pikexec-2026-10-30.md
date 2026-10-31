@@ -28,3 +28,9 @@ spins with IRQs masked in `uart::getc`'s RX_LOCK acquire loop, so the park SGI n
   irq#- n=0 elr=0 uart_rx_lock_held=1`, then A aborts with system reset, gen5 never comes up.
 - Not proven on the real Pi 5 (needs a trial): the real spinner may be another lock; a Spin-based
   path is covered by PARK_HOOK but not by a QEMU case.
+
+## Pi 5 trial (orchestrator, 2026-10-31, 598fe79b = lane + main)
+X=598fe79b -> good, 3 runs: all 3 ended on the card kernel by a clean reset (no corruption, no wedge, good's serial never ran on a broken image).
+Runs 1 and 3: `[KEXEC] cpu2 never reached the park page; irq#27 n=2516 elr=ffff8000004c0c60 uart_rx_lock_held=0` then
+`cpu2 still in the old kernel; aborting kexec, system reset`. elr = sched::kthread::sleep_until IRQ window (msr DAIFClr; nop; msr DAIFSet):
+cpu2 takes timer IRQs (INTID 27) but never parks -> a second straggler class (not the uart RX_LOCK one). Open: lane pikexec2.
