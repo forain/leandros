@@ -31,6 +31,8 @@ pub struct DiskInfo {
     pub gaps: Vec<(u64, u64)>,
     pub dualboot: bool,
     pub dualboot_reason: String,
+    /// An existing LeandrOS dual-boot set (GPT types + bit 63) is present.
+    pub reinstall: bool,
     /// Largest unmounted ext2/3/4 Linux partition: (dev, fs bytes, estimated minimum bytes).
     pub shrink: Option<(String, u64, u64)>,
     /// Session B state for this disk: "", "boot_linux" or "ready_b".
@@ -236,6 +238,7 @@ pub fn gather(allow_removable: bool, root_bytes: u64) -> Vec<DiskInfo> {
             gaps,
             dualboot,
             dualboot_reason,
+            reinstall: !(is_boot || is_mounted) && crate::dualboot::has_set(&format!("/dev/{}", n), size),
             finish: if is_boot || is_mounted { "" } else { crate::shrink::finish_state_for(&format!("/dev/{}", n)) },
             shrink,
         });
@@ -252,9 +255,9 @@ impl DiskInfo {
             .collect();
         let gaps: Vec<String> = self.gaps.iter().map(|g| format!("{{\"start\":{},\"sectors\":{}}}", g.0, g.1 - g.0 + 1)).collect();
         format!(
-            "{{\"ev\":\"disk\",\"name\":\"{}\",\"dev\":\"{}\",\"size\":{},\"bus\":\"{}\",\"model\":\"{}\",\"removable\":{},\"ro\":{},\"boot\":{},\"eligible\":{},\"reason\":\"{}\",\"parts\":[{}],\"gaps\":[{}],\"dualboot\":{},\"dualboot_reason\":\"{}\",\"finish\":\"{}\"{}}}",
+            "{{\"ev\":\"disk\",\"name\":\"{}\",\"dev\":\"{}\",\"size\":{},\"bus\":\"{}\",\"model\":\"{}\",\"removable\":{},\"ro\":{},\"boot\":{},\"eligible\":{},\"reason\":\"{}\",\"parts\":[{}],\"gaps\":[{}],\"dualboot\":{},\"dualboot_reason\":\"{}\",\"reinstall\":{},\"finish\":\"{}\"{}}}",
             esc(&self.name), esc(&self.dev), self.size, self.bus, esc(&self.model), self.removable, self.ro, self.boot, self.eligible, esc(&self.reason), parts.join(","),
-            gaps.join(","), self.dualboot, esc(&self.dualboot_reason), self.finish,
+            gaps.join(","), self.dualboot, esc(&self.dualboot_reason), self.reinstall, self.finish,
             match &self.shrink {
                 Some((d, c, m)) => format!(",\"shrink\":{{\"part\":\"{}\",\"cur_bytes\":{},\"min_bytes\":{}}}", esc(d), c, m),
                 None => String::new(),

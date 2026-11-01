@@ -666,6 +666,318 @@ pub fn install(o: &Opts) -> Result<(), String> {
     Ok(())
 }
 
+/// The existing LeandrOS dual-boot partition set on a disk (identified by GPT
+/// type GUIDs and attribute bit 63 only; the markers are checked separately).
+#[derive(Clone, Debug)]
+pub struct LSet {
+    pub esp: gpt::Entry,
+    pub boot: gpt::Entry,
+    pub root: gpt::Entry,
+    pub home: gpt::Entry,
+    pub log: gpt::Entry,
+}
+
+pub fn find_set(g: &Gpt) -> Result<LSet, String> {
+    let used = g.used();
+    let pick = |t: [u8; 16], name: &str, need_attr: bool| -> Result<gpt::Entry, String> {
+        let v: Vec<&gpt::Entry> = used.iter().filter(|(_, e)| e.ptype == t).map(|(_, e)| e).collect();
+        match v.len() {
+            0 => Err(format!("no {} partition", name)),
+            1 if need_attr && v[0].attrs & gpt::ATTR_NO_AUTO == 0 => Err(format!("the {} partition lacks attribute bit 63", name)),
+            1 => Ok(v[0].clone()),
+            n => Err(format!("{} {} partitions (need exactly 1)", n, name)),
+        }
+    };
+    Ok(LSet {
+        esp: pick(gpt::ESP_TYPE, "EFI system", false)?,
+        boot: pick(gpt::LBOOT_TYPE, "LeandrOS boot", true)?,
+        root: pick(gpt::LROOT_TYPE, "LeandrOS root", true)?,
+        home: pick(gpt::LHOME_TYPE, "LeandrOS home", true)?,
+        log: pick(gpt::LLOG_TYPE, "LeandrOS log", true)?,
+    })
+}
+
+/// Cheap GPT-only check used by `list`: does this disk carry a complete set?
+pub fn has_set(dev: &str, size: u64) -> bool {
+    let Ok(mut f) = File::open(dev) else { return false };
+    let ss = lbs(&f);
+    ss == 512 && matches!(Gpt::read(&mut f, ss, size / ss), Ok(g) if find_set(&g).is_ok())
+}
+
+fn read_fat_file(d: &Dev, path: &str) -> Result<Vec<u8>, String> {
+    let fs = fatfs::FileSystem::new(d.handle(), fatfs::FsOptions::new()).map_err(|e| e.to_string())?;
+    let mut f = fs.root_dir().open_file(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut v = Vec::new();
+    f.read_to_end(&mut v).map_err(|e| e.to_string())?;
+    Ok(v)
+}
+
+/// `install --mode dualboot --reinstall`: rewrite the existing LeandrOS set in
+/// place. The GPT is never written; home is kept unless `--wipe-home`.
+pub fn reinstall(o: &Opts) -> Result<(), String> {
+    use crate::disks::{self, Kind};
+    let out = Out { json: o.json };
+    if !o.dry_run && !(cfg!(not(target_os = "linux")) || unsafe_euid_root()) {
+        return Err("must run as root".into());
+    }
+    let target = o.target.clone().ok_or("--target /dev/X is required")?;
+    let tname = target.strip_prefix("/dev/").unwrap_or(&target).to_string();
+    let names = disks::whole_disks();
+    if !names.contains(&tname) {
+        return Err(format!("{} is not a whole disk", target));
+    }
+    let mut gate = Gate { out: &out, failed: Vec::new() };
+    let (bdisk, bpno) = plan::boot_root_part(&names)
+        .ok_or("cannot identify the boot disk (no root=PARTUUID= matching a disk on the command line)")?;
+    if bdisk == tname {
+        gate.fail("R1", "boot stick", "the target is the boot disk");
+    }
+    let bparts = disks::scan_disk(&bdisk);
+    let root_part = bparts.iter().find(|p| p.pno == bpno).ok_or("boot root partition not found")?.clone();
+    let esp_part = plan::find_part(&bparts, Kind::Esp).ok_or("the boot disk has no ESP")?.clone();
+    let sb = copy::read_sb(&format!("/dev/{}", bdisk), root_part.start).map_err(|e| format!("boot root superblock: {}", e))?;
+    if gate.failed.is_empty() {
+        gate.pass("R1", "stick and privileges", &format!("running from {} (root p{}), f2fs {} MiB", bdisk, bpno, sb.bytes() >> 20));
+    }
+    if plan::mounted_disks(&names).contains(&tname) {
+        gate.fail("R2", "mounts", "a partition of the target is mounted");
+    }
+    let mut disk = File::open(&target).map_err(|e| format!("{}: {}", target, e))?;
+    let ss = lbs(&disk);
+    let size = plan::disk_size(&tname);
+    if ss != 512 {
+        gate.fail("R2", "disk", &format!("logical block size {} (only 512 is supported)", ss));
+    }
+    let total = size / 512;
+    let g = match Gpt::read(&mut disk, 512, total) {
+        Ok(g) if !g.from_backup => match check_tables(&mut disk, 512, total) {
+            Ok(()) => Some(g),
+            Err(e) => {
+                gate.fail("R2", "disk", &e);
+                None
+            }
+        },
+        Ok(_) => {
+            gate.fail("R2", "disk", "primary GPT is damaged (only the backup is valid)");
+            None
+        }
+        Err(e) => {
+            gate.fail("R2", "disk", &format!("no usable GPT: {}", e));
+            None
+        }
+    };
+    let Some(g) = g else {
+        return Err(format!("preflight failed: {}", gate.failed.join(",")));
+    };
+    if !gate.failed.iter().any(|f| f == "R2") {
+        gate.pass("R2", "disk", "valid GPT (primary = backup), pure protective MBR, nothing mounted");
+    }
+    // R3: the set, by type GUID and attribute bit 63.
+    let set = match find_set(&g) {
+        Ok(s) => {
+            gate.pass("R3", "partition set", &format!("one ESP, boot, root, home and log partition with bit 63 ({})", gpt::guid_text(&s.root.guid)));
+            Some(s)
+        }
+        Err(e) => {
+            gate.fail("R3", "partition set", &e);
+            None
+        }
+    };
+    let Some(set) = set else {
+        return Err(format!("preflight failed: {}", gate.failed.join(",")));
+    };
+    let pu = |e: &gpt::Entry| gpt::guid_text(&e.guid);
+    let (boot_pu, root_pu, home_pu, log_pu) = (pu(&set.boot), pu(&set.root), pu(&set.home), pu(&set.log));
+    let rw = format!("blk.rw=PARTUUID={},PARTUUID={},PARTUUID={},PARTUUID={}", root_pu, home_pu, log_pu, boot_pu);
+    let len = |e: &gpt::Entry| (e.last - e.first + 1) * S;
+    // R4: the ownership markers.
+    let marker_ok = (|| -> Result<(), String> {
+        let ed = Dev::open_window(&target, set.esp.first * S, len(&set.esp), false).map_err(|e| format!("ESP: {}", e))?;
+        let m = read_fat_file(&ed, "EFI/leandros/.leandros-owned").map_err(|e| format!("ESP marker: {}", e))?;
+        if String::from_utf8_lossy(&m).trim() != boot_pu {
+            return Err("ESP marker EFI/leandros/.leandros-owned does not name the boot partition's PARTUUID".into());
+        }
+        let bd = Dev::open_window(&target, set.boot.first * S, len(&set.boot), false).map_err(|e| format!("boot partition: {}", e))?;
+        let m = read_fat_file(&bd, "leandros/owner").map_err(|e| format!("boot partition marker: {}", e))?;
+        if String::from_utf8_lossy(&m).trim() != format!("leandros-boot {}", boot_pu) {
+            return Err("boot partition marker leandros/owner does not match its PARTUUID".into());
+        }
+        Ok(())
+    })();
+    match marker_ok {
+        Ok(()) => gate.pass("R4", "markers", "EFI/leandros/.leandros-owned and leandros/owner match the boot partition"),
+        Err(e) => gate.fail("R4", "markers", &e),
+    }
+    // R5: sizes.
+    if len(&set.root) < sb.bytes() {
+        gate.fail("R5", "size", &format!("root partition {} MiB is smaller than the running root volume {} MiB", len(&set.root) >> 20, sb.bytes() >> 20));
+    } else if len(&set.boot) < 64 * MIB {
+        gate.fail("R5", "size", "boot partition is smaller than 64 MiB");
+    } else {
+        gate.pass("R5", "size", &format!("root {} MiB holds the {} MiB volume", len(&set.root) >> 20, sb.bytes() >> 20));
+    }
+    // R6: the shared ESP and the stick's boot files.
+    let sdisk = format!("/dev/{}", bdisk);
+    let src_esp = Dev::open_window(&sdisk, esp_part.start, esp_part.size, false).map_err(|e| format!("boot ESP: {}", e))?;
+    let efi_name = crate::conf::EFI_NAME;
+    let limine_bin = read_fat_file(&src_esp, &format!("EFI/BOOT/{}", efi_name)).map_err(|e| format!("boot ESP {}: {}", efi_name, e))?;
+    {
+        let d = Dev::open_window(&target, set.esp.first * S, len(&set.esp), false).map_err(|e| e.to_string())?;
+        match esp::probe_shared(&d) {
+            Err(er) => gate.fail("R6", "ESP", &format!("cannot read the ESP: {}", er)),
+            Ok(p) if !p.fat32 => gate.fail("R6", "ESP", "the ESP is not FAT32"),
+            Ok(p) if p.dirty => gate.fail("R6", "ESP", "the ESP has its dirty bit set (fsck it first)"),
+            Ok(p) if !p.has_entries_dir => gate.fail("R6", "ESP", "no /loader/entries (not a systemd-boot ESP)"),
+            Ok(p) if p.free_bytes < MIB => gate.fail("R6", "ESP", "not enough free space on the ESP"),
+            Ok(p) => gate.pass("R6", "ESP", &format!("FAT32, clean, systemd-boot layout, {} KiB free", p.free_bytes >> 10)),
+        }
+    }
+    // R7: backup space; R8: power.
+    let esp_bytes = len(&set.esp);
+    let backup_dir = format!("/home/dualboot-backup/bk-{}", mkhome::now());
+    match free_bytes("/home") {
+        Some(f) if f >= esp_bytes + 2 * MIB + 2 * GIB => gate.pass("R7", "backup space", &format!("{} MiB free in /home", f >> 20)),
+        Some(f) => gate.fail("R7", "backup space", &format!("{} MiB free in /home, need {} MiB", f >> 20, (esp_bytes + 2 * MIB + 2 * GIB) >> 20)),
+        None => gate.fail("R7", "backup space", "cannot stat /home"),
+    }
+    if on_battery() {
+        gate.fail("R8", "power", "running on battery; connect AC power");
+    } else {
+        gate.pass("R8", "power", "AC online or no battery information");
+    }
+    if !gate.failed.is_empty() {
+        return Err(format!("preflight failed: {}", gate.failed.join(",")));
+    }
+    let nvme = plan::bus_of(&tname) == "nvme";
+    let shared = esp::shared_files(efi_name, &limine_bin, &boot_pu);
+    let n = |e: &gpt::Entry| g.used().iter().find(|(_, x)| x.first == e.first).map_or(0, |(i, _)| i + 1);
+    let act = |role: &str, e: &gpt::Entry, action: &str| {
+        format!("{{\"role\":\"{}\",\"n\":{},\"first\":{},\"last\":{},\"partuuid\":\"{}\",\"action\":\"{}\"}}", role, n(e), e.first, e.last, pu(e), action)
+    };
+    let home_action = if o.wipe_home { "reformat" } else { "keep" };
+    let parts_json = [
+        act("esp", &set.esp, "rewrite marker-owned files only"),
+        act("boot", &set.boot, "reformat and rewrite"),
+        act("root", &set.root, "block copy of the running root"),
+        act("home", &set.home, home_action),
+        act("log", &set.log, "reformat"),
+    ];
+    let esp_list: Vec<String> = shared.iter().map(|(p, d)| format!("{{\"path\":\"/{}\",\"bytes\":{}}}", esc(p), d.len())).collect();
+    let human_parts = [
+        format!("p{} ESP {}..{}: rewrite marker-owned files only", n(&set.esp), set.esp.first, set.esp.last),
+        format!("p{} boot {}..{} {}: reformat and rewrite", n(&set.boot), set.boot.first, set.boot.last, boot_pu),
+        format!("p{} root {}..{} {}: block copy of the running root ({} MiB)", n(&set.root), set.root.first, set.root.last, root_pu, sb.bytes() >> 20),
+        format!("p{} home {}..{} {}: {}", n(&set.home), set.home.first, set.home.last, home_pu, home_action),
+        format!("p{} log {}..{} {}: reformat", n(&set.log), set.log.first, set.log.last, log_pu),
+    ];
+    out.event(
+        &format!(
+            "{{\"ev\":\"plan\",\"mode\":\"reinstall\",\"target\":\"{}\",\"bus\":\"{}\",\"size\":{},\"keep_home\":{},\"root_partuuid\":\"{}\",\"home_partuuid\":\"{}\",\"log_partuuid\":\"{}\",\"boot_partuuid\":\"{}\",\"cmdline_rw\":\"{}\",\"backup_dir\":\"{}\",\"gpt\":{},\"partitions\":[{}],\"esp_files\":[{}],\"f2fs_bytes\":{}}}",
+            esc(&target), plan::bus_of(&tname), size, !o.wipe_home, root_pu, home_pu, log_pu, boot_pu, esc(&rw), esc(&backup_dir), gpt_json(&g), parts_json.join(","), esp_list.join(","), sb.bytes()
+        ),
+        &format!(
+            "reinstall plan: {} ({} MiB, {}); the GPT is NOT modified\n  {}\nESP files to rewrite:\n  {}\ncmdline: root=PARTUUID={} {}\nbackup: {}",
+            target, size >> 20, plan::bus_of(&tname), human_parts.join("\n  "),
+            shared.iter().map(|(p, d)| format!("/{} ({} bytes)", p, d.len())).collect::<Vec<_>>().join("\n  "), root_pu, rw, backup_dir
+        ),
+    );
+    if o.dry_run {
+        let (old, new) = esp::preview_conf_rw(&src_esp, &root_pu, &rw).map_err(|e| format!("boot ESP limine.conf: {}", e))?;
+        out.event(
+            &format!("{{\"ev\":\"conf\",\"old\":\"{}\",\"new\":\"{}\"}}", esc(&old), esc(&new)),
+            &format!("boot partition limine.conf after rewrite:\n{}", new),
+        );
+        out.event("{\"ev\":\"done\",\"dry_run\":true}", "dry run: nothing written");
+        return Ok(());
+    }
+    if !o.yes {
+        return Err("refusing to write without --yes".into());
+    }
+    out.step("backup", 0);
+    let files = backup(&target, &g, set.esp.first, set.esp.last - set.esp.first + 1, &backup_dir, &out)?;
+    out.info(&format!("backup: {} ({})", backup_dir, files.join(", ")));
+
+    // The write window: boot, root, log (home only with --wipe-home); the ESP comes last.
+    let anchor = OpenOptions::new().read(true).write(true).open(&target).map_err(|e| format!("{}: {}", target, e))?;
+    if nvme {
+        crate::install::enable_nvme_write(&target)?;
+    }
+    let ext = |e: &gpt::Entry| (e.first, e.last - e.first + 1);
+    let mut w1 = vec![ext(&set.boot), ext(&set.root), ext(&set.log)];
+    if o.wipe_home {
+        w1.push(ext(&set.home));
+    }
+    set_window(&anchor, &w1)?;
+    let mut anchor_rw = anchor.try_clone().map_err(|e| e.to_string())?;
+    let g2 = Gpt::read(&mut anchor_rw, 512, total)?;
+    if gpt_lines(&g2) != gpt_lines(&g) {
+        return Err("the partition table changed since the preflight".into());
+    }
+    let io = |e: std::io::Error| e.to_string();
+
+    out.step("boot", 0);
+    let dst = Dev::open_window(&target, set.boot.first * S, len(&set.boot), true).map_err(io)?;
+    let marker = vec![("leandros/owner".to_string(), format!("leandros-boot {}\n", boot_pu).into_bytes())];
+    let r = esp::install_esp_ext(&src_esp, &dst, &root_pu, Some(&rw), *b"LEANDROSBT ", &marker, |p| out.step("boot", p)).map_err(|e| format!("boot partition: {}", e))?;
+    out.info(&format!("boot: {} files, {} bytes, rewrote {}", r.files, r.bytes, r.confs.join(",")));
+    drop(dst);
+
+    out.step("log", 0);
+    let zeros = vec![0u8; 4096];
+    let (lstart, llen) = (set.log.first * S, len(&set.log));
+    let slot = (llen / 4).min(16 << 20) & !4095;
+    for s in 0..4u64 {
+        anchor_rw.seek(SeekFrom::Start(lstart + s * slot)).map_err(io)?;
+        anchor_rw.write_all(&zeros).map_err(io)?;
+    }
+    anchor_rw.sync_all().map_err(io)?;
+    out.step("log", 100);
+
+    if o.wipe_home {
+        out.step("home", 0);
+        let huuid = mkhome::random_uuid().map_err(io)?;
+        mkhome::write_home_at(&mut anchor_rw, set.home.first * S, len(&set.home), &huuid, mkhome::now()).map_err(|e| format!("home: {}", e))?;
+        anchor_rw.sync_all().map_err(io)?;
+        out.step("home", 100);
+    }
+
+    // Root: the block copy carries the source checkpoint; the f2fs mount
+    // raises next_free_nid from the NAT, so a stale hint cannot reuse a live nid.
+    out.step("root", 0);
+    out.info("System files are read-only while copying");
+    let mut guard = copy::RoGuard::new().map_err(|e| format!("remount / read-only: {}", e))?;
+    let cr = copy::copy_root(&sdisk, root_part.start, &target, set.root.first * S, &sb, o.zero_fill, |p| out.step("root", p));
+    let rwr = guard.release();
+    let cr = cr.map_err(|e| format!("root copy: {}", e))?;
+    rwr.map_err(|e| format!("remount / read-write: {}", e))?;
+    out.info(&format!("root: wrote {} MiB, skipped {} MiB of zeros", cr.written >> 20, cr.skipped >> 20));
+    if !o.no_verify {
+        out.step("verify", 0);
+        copy::verify_root(&target, set.root.first * S, sb.bytes(), &cr.sha256, |p| out.step("verify", p)).map_err(|e| e.to_string())?;
+        out.step("verify", 100);
+    }
+    anchor_rw.sync_all().map_err(io)?;
+    copy::flush_dev(&anchor_rw);
+
+    out.step("esp", 0);
+    set_window(&anchor, &[ext(&set.esp)])?;
+    let edev = Dev::open_window(&target, set.esp.first * S, len(&set.esp), true).map_err(io)?;
+    esp::write_shared(&edev, &shared).map_err(|e| format!("shared ESP: {}", e))?;
+    drop(edev);
+    anchor_rw.sync_all().map_err(io)?;
+    copy::flush_dev(&anchor_rw);
+    set_window(&anchor, &[])?;
+    out.step("esp", 100);
+    out.event(
+        &format!(
+            "{{\"ev\":\"done\",\"target\":\"{}\",\"mode\":\"reinstall\",\"keep_home\":{},\"root_partuuid\":\"{}\",\"boot_partuuid\":\"{}\",\"disk_guid\":\"{}\",\"root_sha256\":\"{}\",\"backup_dir\":\"{}\"}}",
+            esc(&target), !o.wipe_home, root_pu, boot_pu, gpt::guid_text(&g.disk_guid), copy::hex(&cr.sha256), esc(&backup_dir)
+        ),
+        &format!("done: reinstalled root PARTUUID {} boot PARTUUID {} (root sha256 {}) backup {}", root_pu, boot_pu, copy::hex(&cr.sha256), backup_dir),
+    );
+    Ok(())
+}
+
 fn unsafe_euid_root() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -709,5 +1021,34 @@ mod tests {
         assert!(!eligibility(false, false, 1 << 40, false, &big).0);
         assert!(!eligibility(false, false, 1 << 40, true, &[]).0);
         assert!(!eligibility(false, false, 1 << 40, true, &[(2048, 2048 + 4096)]).0);
+    }
+
+    #[test]
+    fn find_set_refuses_missing_and_duplicate() {
+        let mk = |types: &[[u8; 16]], attrs: u64| {
+            let total = 1u64 << 15;
+            let specs: Vec<gpt::PartSpec> = types
+                .iter()
+                .enumerate()
+                .map(|(i, t)| gpt::PartSpec { ptype: *t, guid: [i as u8 + 1; 16], first: 2048 + i as u64 * 2048, last: 2048 + i as u64 * 2048 + 2047, name: "x", attrs })
+                .collect();
+            let t = gpt::build(total, &[9u8; 16], &specs);
+            let mut img = vec![0u8; (total * 512) as usize];
+            img[0..512].copy_from_slice(&t.mbr);
+            img[512..1024].copy_from_slice(&t.primary_hdr);
+            img[1024..1024 + t.entries.len()].copy_from_slice(&t.entries);
+            let end = ((total - 1) * 512) as usize;
+            img[end..end + 512].copy_from_slice(&t.backup_hdr);
+            let eb = ((total - 33) * 512) as usize;
+            img[eb..eb + t.entries.len()].copy_from_slice(&t.entries);
+            Gpt::read(&mut std::io::Cursor::new(img), 512, total).unwrap()
+        };
+        let full = [gpt::ESP_TYPE, gpt::LBOOT_TYPE, gpt::LROOT_TYPE, gpt::LHOME_TYPE, gpt::LLOG_TYPE];
+        assert!(find_set(&mk(&full, gpt::ATTR_NO_AUTO)).is_ok());
+        assert!(find_set(&mk(&full, 0)).is_err());
+        assert!(find_set(&mk(&full[..4], gpt::ATTR_NO_AUTO)).is_err());
+        let mut dup = full.to_vec();
+        dup.push(gpt::LROOT_TYPE);
+        assert!(find_set(&mk(&dup, gpt::ATTR_NO_AUTO)).is_err());
     }
 }

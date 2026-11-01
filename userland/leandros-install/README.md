@@ -182,3 +182,29 @@ then the full table with the four LeandrOS partitions. `--dry-run` prints
 is the table on disk, `new_gpt` the final one). On success the session phase
 becomes `b_done` (`shrink-status` reports `none`). `list --json` disks carry
 `"finish":"ready_b"|"boot_linux"|""` for the GUI.
+
+## Reinstall into the existing LeandrOS partitions
+
+`leandros-install install --mode dualboot --target /dev/X --reinstall [--keep-home|--wipe-home] [--dry-run] --yes --json`
+
+Rewrites an existing dual-boot LeandrOS set in place. The GPT is never written (PARTUUIDs and
+sizes are kept), nothing else on the disk is touched, and home is kept unless `--wipe-home`.
+
+Gates (all must pass, otherwise nothing is written):
+
+- R1 not the boot stick; R2 valid GPT, no partition of the target mounted
+- R3 exactly one ESP and exactly one each of the LeandrOS boot / root / home / log type GUIDs, each with attribute bit 63
+- R4 `EFI/leandros/.leandros-owned` on the ESP and `leandros/owner` on the boot partition both name the boot partition's PARTUUID
+- R5 root partition holds the running root volume; R6 ESP FAT32/clean/systemd-boot; R7 backup space; R8 AC power
+
+Actions: boot partition reformatted and rewritten (cmdline `root=PARTUUID=` and `blk.rw=` rebuilt from
+the existing PARTUUIDs), log zeroed, root block-copied from the running stick and verified, ESP:
+only the four marker-owned files (`/EFI/leandros/*`, `/loader/entries/leandros.conf`). The
+`BLKWRWIN` window covers boot, root, log (and home with `--wipe-home`); the ESP gets its own window
+last, then the window is closed.
+
+The block copy carries the stick's f2fs checkpoint. The installed system's f2fs mount raises
+`next_free_nid` above the highest live NAT entry (kernel, lane f2fsnid), so a stale hint can never
+reuse a live nid; `scripts/dualboot-reinstall-test.sh` asserts `cp.next_free_nid > max live nid` on the
+installed volume. `list --json` reports `"reinstall":true` for disks with a complete GPT set; the
+GUI offers "Reinstall LeandrOS (keep home)" for them (`--self-test-reinstall`).

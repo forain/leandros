@@ -19,6 +19,8 @@ pub struct Disk {
     pub gap_bytes: u64,
     pub dualboot: bool,
     pub dualboot_reason: String,
+    /// An existing LeandrOS dual-boot set can be reinstalled in place.
+    pub reinstall: bool,
     /// Shrinkable Linux partition (optional `shrink` object of `list --json`).
     pub shrink_part: String,
     pub shrink_cur: u64,
@@ -48,6 +50,8 @@ pub struct Plan {
     pub new_gpt: Vec<PartRow>,
     pub esp_files: Vec<(String, u64)>,
     pub backup_dir: String,
+    /// Reinstall plan: one line per partition and its action.
+    pub actions: Vec<String>,
 }
 
 impl Disk {
@@ -107,6 +111,7 @@ pub fn parse_line(line: &str) -> Option<Event> {
                 gap_bytes,
                 dualboot: v.get("dualboot").and_then(|x| x.as_bool()).unwrap_or(false),
                 dualboot_reason: s(&["dualboot_reason"]),
+                reinstall: v.get("reinstall").and_then(|x| x.as_bool()).unwrap_or(false),
                 shrink_part: sh.and_then(|o| o.get("part")).and_then(|x| x.as_str()).unwrap_or("").to_string(),
                 shrink_cur: shu("cur_bytes"),
                 shrink_min: shu("min_bytes"),
@@ -126,7 +131,7 @@ pub fn parse_line(line: &str) -> Option<Event> {
         "gate" => Some(Event::Gate { id: s(&["id"]), name: s(&["name"]), status: s(&["status"]), msg: s(&["msg"]) }),
         "info" => Some(Event::Info(s(&["msg"]))),
         "shrink_status" => Some(Event::ShrinkStatus { state: s(&["state"]), phase: s(&["phase"]) }),
-        "plan" if v.get("new_gpt").is_some() => {
+        "plan" if v.get("new_gpt").is_some() || v.get("partitions").is_some() => {
             let rows = |k: &str| -> Vec<PartRow> {
                 v.get(k)
                     .and_then(|a| a.as_array())
@@ -157,7 +162,19 @@ pub fn parse_line(line: &str) -> Option<Event> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(Event::Plan(Plan { old_gpt: rows("old_gpt"), new_gpt: rows("new_gpt"), esp_files, backup_dir: s(&["backup_dir"]) }))
+            let actions = v
+                .get("partitions")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|e| {
+                            let g = |k: &str| e.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            format!("p{}  {}: {}", e.get("n").and_then(|x| x.as_u64()).unwrap_or(0), g("role"), g("action"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(Event::Plan(Plan { old_gpt: rows("old_gpt"), new_gpt: rows("new_gpt"), esp_files, backup_dir: s(&["backup_dir"]), actions }))
         }
         "done" => Some(Event::Done {
             root_partuuid: s(&["root_partuuid"]),
@@ -233,6 +250,8 @@ pub enum Mode {
     Shrink,
     /// Session B: Linux was shrunk and booted; cut its GPT entry and install.
     Finish,
+    /// Rewrite the existing LeandrOS partition set in place (home kept).
+    Reinstall,
     /// Wipe the whole disk.
     Erase,
 }
@@ -240,7 +259,12 @@ pub enum Mode {
 pub fn install_args(dev: &str, mode: Mode, root_gib: Option<u64>, dry: bool) -> Vec<String> {
     let mut a: Vec<String> = vec!["install".into(), "--target".into(), dev.into()];
     if mode != Mode::Erase {
-        a.extend(["--mode".into(), "dualboot".into(), if mode == Mode::Finish { "--after-shrink".into() } else { "--use-free".into() }]);
+        let flag = match mode {
+            Mode::Finish => "--after-shrink",
+            Mode::Reinstall => "--reinstall",
+            _ => "--use-free",
+        };
+        a.extend(["--mode".into(), "dualboot".into(), flag.into()]);
     }
     if let Some(g) = root_gib {
         a.extend(["--root-gib".into(), g.to_string()]);
