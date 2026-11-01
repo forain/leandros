@@ -3461,6 +3461,36 @@ fn alloc_node_block(ms: &mut MountState) -> Option<u32> {
     log_alloc(ms, true)
 }
 
+/// Mount: next_free_nid = max(checkpoint hint, highest live NAT nid + 1). The
+/// hint can lag the NAT (blocks written in place after the checkpoint, a
+/// block-copied live volume); handing out a live nid overwrites its inode.
+fn nat_raise_next_free_nid(ms: &mut MountState) {
+    if !durable::nid_scan() { return; }
+    let copies = if ms.sb.seg_cnt_sit >= 2 { 2 } else { 1 };
+    let total = (ms.sb.seg_cnt_nat as u64 / copies * ms.sb.blocks_per_seg as u64).min(u32::MAX as u64 / NAT_ENTRY_PER_BLK as u64) as u32;
+    let mut b = total;
+    while b > 0 {
+        b -= 1;
+        let blk = ms.cache.read(ms.dev, ms.sb.nat_addr(b) as u64);
+        let mut i = NAT_ENTRY_PER_BLK;
+        while i > 0 {
+            i -= 1;
+            if r32(blk, i * NAT_ENTRY_SIZE + 5) != 0 {
+                let nid = b * NAT_ENTRY_PER_BLK as u32 + i as u32;
+                if nid >= ms.cp.next_free_nid {
+                    dbg_str("[F2FS] checkpoint next_free_nid ");
+                    dbg_dec(ms.cp.next_free_nid as usize);
+                    dbg_str(" is below live nid ");
+                    dbg_dec(nid as usize);
+                    dbg_str(": raised\n");
+                    ms.cp.next_free_nid = nid + 1;
+                }
+                return;
+            }
+        }
+    }
+}
+
 /// Number of live inodes: NAT entries (nid >= 3) that name themselves as
 /// owner and have a block address. Scans up to the next free nid.
 fn nat_count_inodes(ms: &mut MountState) -> u32 {
@@ -9318,6 +9348,7 @@ fn mount_with_pinned(dev_idx: usize, mount_point: &'static str, owner_pid: u32, 
         if !lx_chain.is_empty() && !ms.read_only { recovered += durable::recover_linux(ms, &lx_chain); }
         // lx: valid_inode_count drifts across a crash (roll-forward recreates
         // inodes without counting them): recount from the NAT, which is exact.
+        nat_raise_next_free_nid(ms);
         if !ms.read_only { ms.cp.valid_inodes = nat_count_inodes(ms); }
         // Lane f2fsorphan: inodes unlinked while open when that checkpoint
         // was cut; nothing holds them now. After roll-forward, so a record
