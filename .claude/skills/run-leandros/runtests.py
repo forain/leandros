@@ -155,6 +155,8 @@ SUITES = {
                 # Console poll/epoll, empty poll/select sets and VT_WAITACTIVE
                 # park narrow and wake on input / their deadline / a VT switch.
                 "host:kparkstest.py",
+                # f2fs nid allocator never re-hands a live nid (own boot, lane f2fsnid).
+                "host:f2fsnidtest.py",
                 "host:sshsmoke.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
@@ -210,6 +212,7 @@ SUITES = {
     # --features rpi5 kernel compile-check (cargo check, no boot; integ lanes run it).
     "rpi5check": ["host:rpi5checktest.py"],
     "stdev": ["host:stdevtest.py"],
+    "f2fsnid": ["host:f2fsnidtest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],

@@ -499,6 +499,12 @@ fn nid_cap() -> u64 {
     v
 }
 
+/// `f2fs.nidscan=0`: the pre-lane-f2fsnid allocator (trust the checkpoint
+/// cursor), so the regress test can show the corruption it prevents.
+pub(crate) fn nid_scan() -> bool {
+    drivers::nvidia_probe::cmdline_opt("f2fs.nidscan") != Some(0)
+}
+
 /// The next node id: a recycled one, else the next never-used one, else
 /// (NAT exhausted) one found free by scanning the NAT. None: ENOSPC.
 pub(crate) fn take_nid(ms: &mut MountState) -> Option<u32> {
@@ -511,7 +517,15 @@ pub(crate) fn take_nid(ms: &mut MountState) -> Option<u32> {
     let nat_copies = if ms.sb.seg_cnt_sit >= 2 { 2 } else { 1 };
     let max = (ms.sb.seg_cnt_nat as u64 / nat_copies * ms.sb.blocks_per_seg as u64 * NAT_ENTRY_PER_BLK as u64)
         .min(u32::MAX as u64).min(if ms.mount_prefix.starts_with("/mnt/") { nid_cap() } else { u64::MAX });
-    let nid = ms.cp.next_free_nid;
+    // The checkpoint cursor is only a hint (Linux scans the NAT too): a stale
+    // one (NAT blocks written in place after the checkpoint, a block-copied
+    // volume) must never hand out a nid whose NAT entry is live (lane
+    // f2fsnid: ~30 live inodes were overwritten that way).
+    let mut nid = ms.cp.next_free_nid;
+    while nid_scan() && (nid as u64) < max && nat_lookup(ms, nid) != 0 {
+        if ms.cache.poisoned() { return None; }
+        nid += 1;
+    }
     if (nid as u64) < max {
         ms.cp.next_free_nid = nid + 1;
         return Some(nid);
