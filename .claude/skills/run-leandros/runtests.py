@@ -155,9 +155,10 @@ SUITES = {
                 # Console poll/epoll, empty poll/select sets and VT_WAITACTIVE
                 # park narrow and wake on input / their deadline / a VT switch.
                 "host:kparkstest.py",
-                # f2fs nid allocator never re-hands a live nid (own boot, lane f2fsnid).
-                "host:f2fsnidtest.py",
                 "host:sshsmoke.py",
+                # f2fs nid allocator never re-hands a live nid. Own boot: it
+                # stops this VM, so it must come after every suite that uses it.
+                "host:f2fsnidtest.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
                 "host:wifisimtest.py"],
