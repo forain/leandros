@@ -1203,6 +1203,19 @@ pub fn set_writable(name: &str) -> bool {
     true
 }
 
+/// Undo `set_writable`: the controller behind `name` is read-only again
+/// (the installer restores the state it found). False when no such disk.
+pub fn set_read_only(name: &str) -> bool {
+    let rest = match name.strip_prefix("nvme") { Some(r) => r, None => return false };
+    let (c, n) = match rest.split_once('n') { Some(x) => x, None => return false };
+    let c = match (c.parse::<usize>(), n.parse::<u32>()) { (Ok(c), Ok(n)) if n > 0 => c, _ => return false };
+    let ctrl = match CTRLS.lock().iter().find(|k| k.index == c) { Some(k) => *k, None => return false };
+    if !ctrl.read_only.swap(true, Ordering::SeqCst) {
+        nlog!("nvme{}: read-only again", c);
+    }
+    true
+}
+
 // ── Public entry points ──────────────────────────────────────────────────────
 
 /// Probe every NVMe controller and register its namespaces. Task context,

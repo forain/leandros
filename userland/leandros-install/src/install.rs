@@ -43,6 +43,15 @@ pub fn enable_nvme_write(dev: &str) -> Result<(), String> {
     {
         use std::os::unix::io::AsRawFd;
         let f = OpenOptions::new().read(true).open(dev).map_err(|e| format!("{}: {}", dev, e))?;
+        // Remember that this disk was read-only so RoGuard can put that back.
+        let mut cur: libc::c_int = 0;
+        const BLKROGET: libc::c_ulong = 0x125E;
+        if unsafe { libc::ioctl(f.as_raw_fd(), BLKROGET as _, &mut cur as *mut libc::c_int) } == 0 && cur != 0 {
+            let mut v = RO_RESTORE.lock().unwrap();
+            if !v.iter().any(|d| d == dev) {
+                v.push(dev.to_string());
+            }
+        }
         let zero: libc::c_int = 0;
         const BLKROSET: libc::c_ulong = 0x125D;
         let r = unsafe { libc::ioctl(f.as_raw_fd(), BLKROSET as _, &zero as *const libc::c_int) };
@@ -57,6 +66,32 @@ pub fn enable_nvme_write(dev: &str) -> Result<(), String> {
     }
     let _ = dev;
     Ok(())
+}
+
+static RO_RESTORE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Put back BLKROSET(1) on every disk `enable_nvme_write` found read-only.
+pub fn restore_ro() {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let devs: Vec<String> = std::mem::take(&mut *RO_RESTORE.lock().unwrap());
+        for d in devs {
+            if let Ok(f) = OpenOptions::new().read(true).open(&d) {
+                let one: libc::c_int = 1;
+                unsafe { libc::ioctl(f.as_raw_fd(), 0x125D as _, &one as *const libc::c_int) };
+            }
+        }
+    }
+}
+
+/// Drop guard: restores the read-only state on success, error and early return.
+pub struct RoGuard;
+
+impl Drop for RoGuard {
+    fn drop(&mut self) {
+        restore_ro();
+    }
 }
 
 fn euid_is_root() -> bool {

@@ -119,6 +119,7 @@ grep -q '"ev":"shrink_gpt"' "$WORK/dry.log" && grep -q '"ev":"plan".*"new_gpt"' 
 grep '"ev":"shrink_gpt"' "$WORK/dry.log" | cut -c1-160
 [ "$(gpt_sig "$IMG")" = "$GPT0" ] && ok "dry run wrote nothing" || fail "dry run changed the GPT"
 r "LEANDROS_INSTALL_BIN=$LI /tmp/leandros-installer --self-test-after-shrink /dev/nvme0n1" > "$WORK/gui.log" || { tail -8 "$WORK/gui.log"; fail "GUI self-test"; }
+RO=$(r "lsblk 2>/dev/null | grep '^/dev/nvme0n1 ' | tr -s ' ' | cut -d' ' -f3; true"); [ "$RO" = "1" ] && ok "nvme0n1 read-only again after session B" || fail "nvme0n1 left writable after session B (RO=$RO)"
 grep -q "page Done" "$WORK/gui.log" || { tail -8 "$WORK/gui.log"; fail "GUI: no page Done"; }
 ok "GUI: Finish installation reached Done"
 r "$LI shrink-status --json" | grep -q '"state":"none"' && ok "status none after session B" || fail "status after session B"

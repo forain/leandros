@@ -102,6 +102,8 @@ pub struct DiskOps {
     pub removed_gen: fn() -> usize,
     /// Enable writes on whole disk `idx` (an NVMe disk) until the next boot.
     pub set_rw: fn(usize) -> bool,
+    /// Make whole disk `idx` (an NVMe disk) read-only again.
+    pub set_ro: fn(usize) -> bool,
 }
 
 /// One backend entry as `DiskOps::describe` reports it.
@@ -1126,13 +1128,35 @@ pub fn ioctl(pid: u32, ofd_id: u32, dev: u16, cmd: usize, arg: usize) -> isize {
         BLKROGET => {
             put_user(arg, ro as i32)
         }
-        // Read-only-ness is the driver's (an NVMe disk without nvme.rw=1),
-        // never a userspace toggle: "make it writable" succeeds only where it
-        // already is, and "make it read-only" is EINVAL rather than a lie.
+        // Read-only-ness is the driver's (an NVMe disk without nvme.rw=1).
+        // "Make it writable" succeeds only where the driver allows it;
+        // "make it read-only" works only on a whole NVMe disk (root), to undo a
+        // runtime write enable; anything else is EINVAL rather than a lie.
         BLKROSET => {
             if arg == 0 { return -14; }
             let v = match sched::uaccess::read_user::<i32>(arg) { Some(v) => v, None => return -14 };
-            if v != 0 { return -22; }
+            if v != 0 {
+                if ro { return 0; }
+                if sched::euid_of(pid) != 0 { return -13; }
+                return match backing {
+                    Backing::Disk(i) => match ops() {
+                        Some(o) if (o.set_ro)(i as usize) => {
+                            let mut b = BDEVS.lock();
+                            let slot = b.iter().position(|e| e.in_use && e.backing == Backing::Disk(i));
+                            for (k, e) in b.iter_mut().enumerate().filter(|(_, e)| e.in_use) {
+                                let me = match e.backing {
+                                    Backing::Part { parent, .. } => Some(parent as usize) == slot,
+                                    _ => Some(k) == slot,
+                                };
+                                if me { e.ro = true; }
+                            }
+                            0
+                        }
+                        _ => -22,
+                    },
+                    _ => -22,
+                };
+            }
             if !ro { return 0; }
             // Runtime write enable: root only, whole NVMe disk only, this boot only.
             if sched::euid_of(pid) != 0 { return -13; }
