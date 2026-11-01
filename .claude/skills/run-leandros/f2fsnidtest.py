@@ -52,6 +52,24 @@ def patch_cp(img, value):
     return old
 
 
+def cursor_state(img):
+    """(checkpoint next_free_nid, highest live NAT nid) of the newest checkpoint."""
+    fk = load_fsck()
+    v = fk.Vol(img)
+    cpb = v.blk(v.cp_addr)
+    cur = struct.unpack_from("<I", cpb, 152)[0]
+    top = 0
+    for b in range(v.seg_cnt_nat // 2 * v.bps):
+        blk = v.blk(v.nat_blk + b)
+        for i in range(NAT_PER_BLK_T):
+            if struct.unpack_from("<I", blk, i * 9 + 5)[0] != 0:
+                top = b * NAT_PER_BLK_T + i
+    return cur, top
+
+
+NAT_PER_BLK_T = 455
+
+
 def main(argv):
     cmdline = None
     if "--cmdline" in argv:
@@ -120,8 +138,17 @@ def main(argv):
                     "echo \"file $i $((i*7919))\" > f$i; done; "
                     "cd /mnt/gc && sha256sum t/* > MANIFEST && sync && umount /mnt/gc", 600)
         verdict("populate", ok)
+        cur, top = cursor_state(img)
+        verdict("cursor-after-umount", cur > top, f"(cp.next_free_nid {cur}, max live nid {top})")
+        # Installer pattern: create more files, sync, remount read-only, then
+        # the VM is killed with no umount (live block copy).
+        ok, _ = run(f"{M} && cd /mnt/gc && mkdir u && cd u && i=0; while [ $i -lt 200 ]; do i=$((i+1)); "
+                    "echo r$i > r$i; done; cd /mnt/gc && sync && mount -o remount,ro /mnt/gc && echo REMOUNTED", 600)
+        verdict("populate-ro", ok and "REMOUNTED" in _)
     finally:
         drv("stop", timeout=120)
+    cur, top = cursor_state(img)
+    verdict("cursor-after-remount-ro", cur > top, f"(cp.next_free_nid {cur}, max live nid {top})")
     old = patch_cp(img, 100)
     print(f"patched checkpoint next_free_nid {old} -> 100")
     try:

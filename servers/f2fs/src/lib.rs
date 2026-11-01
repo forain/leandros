@@ -3468,26 +3468,41 @@ fn nat_raise_next_free_nid(ms: &mut MountState) {
     if !durable::nid_scan() { return; }
     let copies = if ms.sb.seg_cnt_sit >= 2 { 2 } else { 1 };
     let total = (ms.sb.seg_cnt_nat as u64 / copies * ms.sb.blocks_per_seg as u64).min(u32::MAX as u64 / NAT_ENTRY_PER_BLK as u64) as u32;
-    let mut b = total;
-    while b > 0 {
-        b -= 1;
-        let blk = ms.cache.read(ms.dev, ms.sb.nat_addr(b) as u64);
-        let mut i = NAT_ENTRY_PER_BLK;
-        while i > 0 {
-            i -= 1;
-            if r32(blk, i * NAT_ENTRY_SIZE + 5) != 0 {
-                let nid = b * NAT_ENTRY_PER_BLK as u32 + i as u32;
-                if nid >= ms.cp.next_free_nid {
-                    dbg_str("[F2FS] checkpoint next_free_nid ");
-                    dbg_dec(ms.cp.next_free_nid as usize);
-                    dbg_str(" is below live nid ");
-                    dbg_dec(nid as usize);
-                    dbg_str(": raised\n");
-                    ms.cp.next_free_nid = nid + 1;
+    // Descending, 64 blocks per device command (a segment's blocks are
+    // contiguous): one request per 256 KiB instead of one per 4 KiB, which
+    // is what keeps this cheap on a USB stick. Nothing is dirty at mount.
+    const CHUNK: u32 = 64;
+    let mut buf = alloc::vec![0u8; CHUNK as usize * BLOCK_SIZE];
+    let mut hi = total;
+    while hi > 0 {
+        let lo = (hi - 1) / CHUNK * CHUNK;
+        let n = (hi - lo) as usize;
+        let ok = ms.sb.blocks_per_seg % CHUNK == 0
+            && io_read_blocks(IO_READ_MISS, ms.dev, ms.sb.nat_addr(lo) as u64, &mut buf[..n * BLOCK_SIZE]);
+        let mut b = hi;
+        while b > lo {
+            b -= 1;
+            let k = (b - lo) as usize;
+            let blk: &[u8] = if ok { &buf[k * BLOCK_SIZE..(k + 1) * BLOCK_SIZE] }
+                             else { &ms.cache.read(ms.dev, ms.sb.nat_addr(b) as u64)[..] };
+            let mut i = NAT_ENTRY_PER_BLK;
+            while i > 0 {
+                i -= 1;
+                if r32(blk, i * NAT_ENTRY_SIZE + 5) != 0 {
+                    let nid = b * NAT_ENTRY_PER_BLK as u32 + i as u32;
+                    if nid >= ms.cp.next_free_nid {
+                        dbg_str("[F2FS] checkpoint next_free_nid ");
+                        dbg_dec(ms.cp.next_free_nid as usize);
+                        dbg_str(" is below live nid ");
+                        dbg_dec(nid as usize);
+                        dbg_str(": raised\n");
+                        ms.cp.next_free_nid = nid + 1;
+                    }
+                    return;
                 }
-                return;
             }
         }
+        hi = lo;
     }
 }
 
