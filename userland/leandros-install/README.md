@@ -143,7 +143,8 @@ With `--json`, `shrink` emits, one object per line:
   S9 stick space, S10 fsck). A failed gate is followed by `{"ev":"error"}`
   and exit status 1.
 - `{"ev":"shrink_info",...}` sizes, `{"ev":"step","name":"backup|rehearse|hash|fsck|resize|verify","pct":0..100}`,
-  `{"ev":"hash_progress","phase":"pre|verify|rollback","path":..,"bytes":N}` (every 64 MiB hashed of one file, so long hashes show motion)
+  `{"ev":"hash_progress","phase":"pre|verify|rollback","files_done":N,"files_total":M,"bytes":B}` (every 250 files and every 64 MiB hashed, so long hashes show motion). Files are hashed in batches of 1000 with one `debugfs -f` run per batch (sizes from a batched `stat`), streaming through SHA-256; `LEANDROS_TEST=1 LEANDROS_HASH_CROSSCHECK=1` also re-hashes each file with the old one-`debugfs`-per-file method and fails on any difference.
+- The installer restores the read-only state of an NVMe disk it made writable (BLKROSET 1) when the process ends, on success, error or early exit.
 - `{"ev":"done","part":..,"new_bytes":..,"old_bytes":..,"state":"boot_linux"}`
   (`--dry-run` adds `"dry_run":true`; `--recover` emits `"recovered":true`).
 

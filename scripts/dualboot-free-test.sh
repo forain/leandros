@@ -101,6 +101,7 @@ r "$LI install --mode dualboot --use-free --target /dev/nvme0n1 --yes --json" > 
 DONE="$(grep '"ev":"done"' "$WORK/install.log" | tail -1)"; [ -n "$DONE" ] || { tail -3 "$WORK/install.log"; fail "no done event"; }
 for s in backup gpt boot log home root verify esp; do grep -q "\"name\":\"$s\",\"pct\":100" "$WORK/install.log" || fail "step $s did not finish"; done
 ok "all steps finished"
+RO=$(r "lsblk 2>/dev/null | grep '^/dev/nvme0n1 ' | tr -s ' ' | cut -d' ' -f3; true"); [ "$RO" = "1" ] && ok "nvme0n1 read-only again after the install" || fail "nvme0n1 left writable after the install (RO=$RO)"
 ROOT_PU=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['root_partuuid'])" "$DONE")
 BK=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['backup_dir'])" "$DONE")
 r "ls -l $BK; cd $BK && sha256sum -c SHA256SUMS" | tail -9

@@ -163,7 +163,13 @@ r "$LI shrink --part $P2 --to 10G --dry-run --json 2>&1; true" > "$WORK/dry.log"
 grep -q '"ev":"done","dry_run":true' "$WORK/dry.log" && ok "dry run" || { tail -3 "$WORK/dry.log"; fail "dry run"; }
 grep '"ev":"shrink_info"' "$WORK/dry.log" | head -1 | cut -c1-220
 r "$LI shrink-status --json" | grep -q '"state":"none"' && ok "status none before"
-r "$LI shrink --part $P2 --to 10G --yes --json 2>&1; true" > "$WORK/shrink.log"
+RO0=$(r "lsblk 2>/dev/null | grep '^/dev/nvme0n1 ' | tr -s ' ' | cut -d' ' -f3; true")
+r "env LEANDROS_TEST=1 LEANDROS_HASH_CROSSCHECK=1 $LI shrink --part $P2 --to 10G --yes --json 2>&1; true" > "$WORK/shrink.log"
+RO1=$(r "lsblk 2>/dev/null | grep '^/dev/nvme0n1 ' | tr -s ' ' | cut -d' ' -f3; true")
+[ "$RO0" = "1" ] || ok "note: nvme0n1 was not read-only before the shrink (RO=$RO0)"
+[ "$RO0" != "1" ] || { [ "$RO1" = "1" ] && ok "nvme0n1 read-only again after the shrink" || fail "nvme0n1 left writable after the shrink (RO=$RO1)"; }
+grep -q 'cross-checked' "$WORK/shrink.log" && ok "batched hash == per-file hash (cross-check)" || fail "hash cross-check did not run"
+grep -o '\[hash [a-z]*\] [0-9]* files[^"]*' "$WORK/shrink.log" | sort -u | sed 's/^/timing: /'
 grep -q '"ev":"done","part"' "$WORK/shrink.log" || { tail -5 "$WORK/shrink.log"; fail "shrink did not finish"; }
 H=$(grep -o '"hashed":[0-9]*' "$WORK/shrink.log" | tail -1 | cut -d: -f2)
 [ "${H:-0}" -gt 0 ] && ok "data moved: $H files hashed (blocks above the new end)" || fail "no file had blocks above the new end (hashed=${H:-?}); the fixture does not exercise data moves"

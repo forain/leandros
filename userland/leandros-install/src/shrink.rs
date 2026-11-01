@@ -454,6 +454,155 @@ fn hash_path(dev: &str, path: &str, out: &Out, what: &str) -> Result<String, Str
     Ok(crate::copy::hex(&h.finalize()))
 }
 
+/// Files per debugfs run in the batched hasher.
+const HASH_CHUNK: usize = 1000;
+
+fn skippable(path: &str) -> bool {
+    path.contains('"') || path.contains('\n')
+}
+
+/// Byte sizes for `paths` via batched `stat` scripts (one debugfs run per chunk).
+fn sizes_of(dev: &str, paths: &[&str], dir: &str) -> Result<Vec<Option<u64>>, String> {
+    let mut res = vec![];
+    for ch in paths.chunks(HASH_CHUNK) {
+        let script: String = ch.iter().map(|p| format!("stat \"{}\"\n", p)).collect();
+        let text = debugfs_script(dev, &script, dir)?;
+        let mut v: Vec<Option<u64>> = vec![];
+        for l in text.lines() {
+            if l.starts_with("debugfs: stat ") {
+                v.push(None);
+            } else if let (Some(last), Some(i)) = (v.last_mut(), l.find("Size:")) {
+                if last.is_none() {
+                    *last = l[i + 5..].split_whitespace().next().and_then(|x| x.parse().ok());
+                }
+            }
+        }
+        if v.len() != ch.len() {
+            return Err(format!("stat batch returned {} entries for {} files", v.len(), ch.len()));
+        }
+        res.extend(v);
+    }
+    Ok(res)
+}
+
+/// Hash one chunk: a single `debugfs -f` run `cat`s every file; its stdout is
+/// "debugfs: cat \"p\"\n" followed by exactly `size` bytes, per file, which we
+/// split by the known sizes and verify against the echoed command line.
+fn hash_chunk(dev: &str, items: &[(&str, u64)], dir: &str, stream: &mut dyn FnMut(u64)) -> Result<Vec<String>, String> {
+    let script: String = items.iter().map(|(p, _)| format!("cat \"{}\"\n", p)).collect();
+    let sp = format!("{}/hash.cmd", dir);
+    std::fs::write(&sp, &script).map_err(|e| e.to_string())?;
+    let mut c = Command::new(tool("debugfs")).args(["-f", &sp, dev]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| e.to_string())?;
+    let mut o = std::io::BufReader::with_capacity(64 * 1024, c.stdout.take().unwrap());
+    let mut b = vec![0u8; HASH_BUF];
+    let mut hs = vec![];
+    let mut err = None;
+    for (p, size) in items {
+        let want = format!("debugfs: cat \"{}\"\n", p);
+        let mut got = vec![0u8; want.len()];
+        if o.read_exact(&mut got).is_err() || got != want.as_bytes() {
+            err = Some(format!("batched hash desynchronised before {}", p));
+            break;
+        }
+        let mut h = Sha256::new();
+        let mut left = *size;
+        while left > 0 {
+            let n = o.read(&mut b[..left.min(HASH_BUF as u64) as usize]).map_err(|e| e.to_string())?;
+            if n == 0 {
+                err = Some(format!("batched hash: short stream in {}", p));
+                break;
+            }
+            h.update(&b[..n]);
+            left -= n as u64;
+            stream(n as u64);
+        }
+        if err.is_some() {
+            break;
+        }
+        hs.push(crate::copy::hex(&h.finalize()));
+    }
+    if err.is_some() {
+        let _ = c.kill();
+    }
+    let _ = c.wait();
+    match err {
+        Some(e) => Err(e),
+        None => Ok(hs),
+    }
+}
+
+/// Hash many files with one debugfs run per chunk instead of one per file.
+/// Same digests as `hash_path` (cross-checked when LEANDROS_HASH_CROSSCHECK=1).
+/// A chunk that fails to parse falls back to the per-file method.
+fn hash_many(dev: &str, paths: &[&str], out: &Out, what: &str, dir: &str) -> Result<Vec<String>, String> {
+    let total = paths.len();
+    let t0 = std::time::Instant::now();
+    let sizes = sizes_of(dev, paths, dir)?;
+    let mut res: Vec<String> = Vec::with_capacity(total);
+    let (mut bytes, mut next_b) = (0u64, 64 * MIB);
+    let mut last_ev = 0usize;
+    let mut xcheck = std::time::Duration::ZERO;
+    let cross = test_env("LEANDROS_HASH_CROSSCHECK").is_some();
+    let mut start = 0;
+    while start < total {
+        let end = (start + HASH_CHUNK).min(total);
+        let ok: Vec<usize> = (start..end).filter(|&i| !skippable(paths[i]) && sizes[i].is_some()).collect();
+        let items: Vec<(&str, u64)> = ok.iter().map(|&i| (paths[i], sizes[i].unwrap())).collect();
+        let mut tick = |n: u64| {
+            bytes += n;
+            if bytes >= next_b {
+                out.event(
+                    &format!("{{\"ev\":\"hash_progress\",\"phase\":\"{}\",\"files_done\":{},\"files_total\":{},\"bytes\":{}}}", esc(what), start, total, bytes),
+                    &format!("[hash {}] {}/{} files {} MiB", what, start, total, bytes / MIB),
+                );
+                next_b = bytes + 64 * MIB;
+            }
+        };
+        let batch = if items.is_empty() { Ok(vec![]) } else { hash_chunk(dev, &items, dir, &mut tick) };
+        let hs = match batch {
+            Ok(h) => h,
+            Err(e) => {
+                out.info(&format!("[hash {}] {}; falling back to per-file for this chunk", what, e));
+                let mut v = vec![];
+                for &i in &ok {
+                    v.push(hash_path(dev, paths[i], out, what)?);
+                }
+                v
+            }
+        };
+        let mut it = hs.into_iter();
+        for i in start..end {
+            if ok.contains(&i) {
+                let h = it.next().unwrap();
+                if cross {
+                    let tc = std::time::Instant::now();
+                    let old = hash_path(dev, paths[i], out, what)?;
+                    xcheck += tc.elapsed();
+                    if old != h {
+                        return Err(format!("hash cross-check mismatch on {}", paths[i]));
+                    }
+                }
+                res.push(h);
+            } else if skippable(paths[i]) {
+                res.push("skipped".into());
+            } else {
+                // size unknown: per-file method
+                res.push(hash_path(dev, paths[i], out, what)?);
+            }
+        }
+        start = end;
+        if start - last_ev >= 250 || start == total {
+            last_ev = start;
+            out.event(
+                &format!("{{\"ev\":\"hash_progress\",\"phase\":\"{}\",\"files_done\":{},\"files_total\":{},\"bytes\":{}}}", esc(what), start, total, bytes),
+                &format!("[hash {}] {}/{} files {} MiB", what, start, total, bytes / MIB),
+            );
+        }
+    }
+    out.info(&format!("[hash {}] {} files, {} MiB in {:.1} s{}", what, total, bytes / MIB, (t0.elapsed() - xcheck).as_secs_f32(), if cross { " (cross-checked)" } else { "" }));
+    Ok(res)
+}
+
 // ------------------------------------------------------------------- state
 
 fn state_write(dir: &str, kv: &[(&str, String)]) -> Result<(), String> {
@@ -743,9 +892,12 @@ pub fn shrink(o: &Opts) -> Result<(), String> {
     out.step("hash", 20);
     let hi = high_files(&dev, &flist, new_blocks * sb.bs / sb.bs, &dir)?;
     let mut hashes: Vec<(String, String)> = vec![];
-    for (k, (_, path)) in hi.iter().enumerate() {
-        hashes.push((path.clone(), hash_path(&dev, path, &out, "pre")?));
-        out.step("hash", 20 + (k as u32 + 1) * 80 / hi.len() as u32);
+    {
+        let ps: Vec<&str> = hi.iter().map(|(_, p)| p.as_str()).collect();
+        let hs = hash_many(&dev, &ps, &out, "pre", &dir)?;
+        for (p, h) in ps.iter().zip(hs) {
+            hashes.push((p.to_string(), h));
+        }
     }
     out.step("hash", 100);
     put(&format!("{}/hashes.txt", dir), &hashes.iter().map(|(p, h)| format!("{}  {}\n", h, p)).collect::<String>())?;
@@ -856,10 +1008,13 @@ fn real_run(dev: &str, st: &mut Vec<(&str, String)>, dir: &str, undo: &str, new_
         return Err(format!("e2fsck -fn after the resize is not clean (rc {}): {}", c.rc, tail(&c.text)));
     }
     out.step("verify", 50);
-    for (path, want) in hashes {
-        let got = hash_path(dev, path, out, "verify")?;
-        if &got != want {
-            return Err(format!("file {} changed during the resize (sha256 mismatch)", path));
+    {
+        let ps: Vec<&str> = hashes.iter().map(|(p, _)| p.as_str()).collect();
+        let got = hash_many(dev, &ps, out, "verify", dir)?;
+        for ((path, want), g) in hashes.iter().zip(got) {
+            if &g != want {
+                return Err(format!("file {} changed during the resize (sha256 mismatch)", path));
+            }
         }
     }
     out.step("verify", 100);
@@ -949,17 +1104,15 @@ fn hdr_diff_allowed(o: usize) -> bool {
 
 fn rehash(dev: &str, dir: &str, out: &Out) -> Result<usize, String> {
     let t = crate::plan::read_to_string(&format!("{}/hashes.txt", dir));
-    let mut n = 0;
-    for l in t.lines() {
-        if let Some((h, path)) = l.split_once("  ") {
-            let got = hash_path(dev, path, out, "rollback")?;
-            if got != h {
-                return Err(format!("file {} differs from its hash after the rollback", path));
-            }
-            n += 1;
+    let ent: Vec<(&str, &str)> = t.lines().filter_map(|l| l.split_once("  ")).collect();
+    let ps: Vec<&str> = ent.iter().map(|(_, p)| *p).collect();
+    let got = hash_many(dev, &ps, out, "rollback", dir)?;
+    for ((h, path), g) in ent.iter().zip(got) {
+        if &g != h {
+            return Err(format!("file {} differs from its hash after the rollback", path));
         }
     }
-    Ok(n)
+    Ok(ent.len())
 }
 
 /// Final checks after a rollback / unchanged recovery: clean fsck, original size,

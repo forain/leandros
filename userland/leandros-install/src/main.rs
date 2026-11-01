@@ -2,11 +2,14 @@ use leandros_install::install::{self, Opts};
 use leandros_install::mkhome;
 use leandros_install::progress::Out;
 use leandros_install::shrink;
-use std::process::exit;
+fn bye(code: i32) -> ! {
+    install::restore_ro();
+    std::process::exit(code)
+}
 
 fn die(msg: &str) -> ! {
     eprintln!("leandros-install: {msg}");
-    exit(1);
+    bye(1);
 }
 
 const USAGE: &str = "usage:
@@ -136,6 +139,11 @@ fn shrink_cmd(args: &[String]) -> shrink::Opts {
 }
 
 fn main() {
+    let _ro = install::RoGuard;
+    run_main();
+}
+
+fn run_main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("repair-esp") => {
@@ -143,7 +151,7 @@ fn main() {
             let st = std::process::Command::new("espctl").arg("repair-esp").args(&args[1..]).status();
             match st {
                 Ok(s) if s.success() => {}
-                Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+                Ok(s) => bye(s.code().unwrap_or(1)),
                 Err(e) => die(&format!("cannot run espctl: {e}")),
             }
         }
@@ -152,7 +160,7 @@ fn main() {
             let r = if args[0] == "shrink" { shrink::shrink(&o) } else { shrink::status(&o) };
             if let Err(e) = r {
                 Out { json: o.json }.error(&e);
-                exit(1);
+                bye(1);
             }
         }
         Some("gaps") => gaps_cmd(&args),
@@ -162,7 +170,7 @@ fn main() {
             let o = parse_opts(&args);
             if let Err(e) = install::install(&o) {
                 Out { json: o.json }.error(&e);
-                exit(1);
+                bye(1);
             }
         }
         _ => die(USAGE),
