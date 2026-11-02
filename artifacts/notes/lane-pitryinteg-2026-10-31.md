@@ -54,3 +54,15 @@ espctl (with `pi`) is installed as /usr/sbin/espctl in the ROOT image, not the i
 - `pi-card stage` -> s0 (k8=cf29b898, i8=d815db67, read back); `pi-card try` -> firmware booted ee9b3a6803 straight from slots/s0 (uptime ~30 s, no kexec, deadline armed, eth0 + wifi0, root f2fs); `pi-card commit` -> config.txt sector 0 `os_prefix=slots/s0/`, "[tryboot] confirmed: deadline disarmed".
 - Cold power cycle 2026-11-01: firmware booted ee9b3a6803 from config.txt alone (uptime 24 s at first SSH, no kexec/tryboot lines, root /dev/vdb f2fs, eth0 192.168.2.12 answers ping, Wi-Fi SSH). `espctl pi status`: config.txt sha8=3728c720, s0 state=good, cmdline copies match. Factory kernel.img untouched.
 - Box regress main 7dfc27d2 (includes this lane, rpi5fix and f2fsnid): 66 suites, 0 bad, both arches.
+
+## /proc/tryboot on the real card, 2026-11-02
+
+Main b9884f06 (`b9884f062b-20261102T0543Z`): pi-deploy (kexec, `/proc/tryboot`
+`state=off`) -> pi-promote -> `pi-card stage` -> s1 -> `pi-card try`: firmware
+booted slots/s1 at uptime 22 s, `/proc/tryboot` `state=armed deadline_s=900
+left_s=878 holds=0` -> `pi-card commit`: config.txt `os_prefix=slots/s1/`,
+`state=confirmed left_s=0 holds=1`, klog "[tryboot] hold: commit in progress",
+"[tryboot] confirmed: deadline disarmed". s0 (ee9b3a6803) is now `prev`.
+The root's espctl predates 4889e2ec, so `espctl pi status` has no `tryboot:`
+line until a pi-sync. Card stage needs the default BUILD_TAG format
+(`<rev>-YYYYMMDDTHHMMZ`); a custom LEANDROS_KERNEL_TAG is refused.
