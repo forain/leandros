@@ -153,7 +153,14 @@ Tristate symbols and their module (all default to `y`; slot numbers in [modules/
 
 `rmmod <name>` or `kmodctl rmmod <name>` (root only; `delete_module(2)`). The kernel closes the module's upper gate and drains calls into it, checks for users, unbinds its devices, quiesces PCI/IRQ/hrtimer/kthread registrations, closes the lower gate, runs the module's `exit`, then frees the slot and unmaps the image. `kmodctl load` of the same file afterwards starts a fresh generation.
 
-- **EBUSY.** Returned, with the module left fully live, when something holds it: an open fd on a device node it registered (netdev, camera, input), a mounted filesystem on a block device it provides (usb_storage while mounted), or another module that depends on it. The check runs before the upper gate closes, and again after the drain to catch a race, so a busy refusal does not disturb traffic. Unload after `umount`/`close` succeeds.
+- **EBUSY.** Returned, with the module left fully live, when something holds it. The pins are:
+  - an open fd on the disk or on any of its partitions (`/dev/sdX`, `/dev/sdXN`, `/dev/vdX`): the VFS scans every process's fd table (`vfs_server::block_fd_open`). This also covers a userspace filesystem server or tool (mkfs, a loop or GPT editor) that holds the node open;
+  - a mount whose device is the disk or a partition (`busy: mounted`), and a mount in progress (`busy: mounting`);
+  - an open V4L2 capture device. There is one node, `/dev/video0`, and any open of it pins the camera's module;
+  - DRM/KMS (always busy: the display is active);
+  - another module that depends on it.
+
+  netdev, input, hwrng and USB class objects do not pin: they detach. The check runs before the upper gate closes (fast refusal, no disturbance) and again after the Upper drain (D9), so a pin taken while the gate was closing is still seen. A refused unload reopens the gate and the module keeps working (the open fd still reads). Unload after `umount`/`close` succeeds. A block fd opened in the instant between the second check and the module's removal is not pinned: its I/O fails because the disk is gone, and it never reaches freed module code.
 - **ENOENT / EPERM.** ENOENT for a name not loaded (or a module with no `exit`); EPERM for non-root.
 - **Zombie.** If `exit` does not return in time, or the module still holds registrations the kernel cannot revoke (fixtures `kmbad_hang`, `kmbad_leak`), it becomes `Zombie` in `/proc/modules` (`ZOMBIE:` on the console). Its slot and image are never freed, reload of that name is refused, and its gates stay closed. Only a reboot clears it.
 - **Unloadable today:** hello, virtio_rng, virtio_net, usb_hid, usb_storage, uvc, e1000e (the e1000e exit also returns its 258 DMA pages), plus the `kmbad_*` fixtures.

@@ -148,6 +148,7 @@ pub fn busy_reason(id: KmodId) -> Option<&'static str> {
                 let mounts = vfs_server::list_mounts();
                 for p in drivers::blkdev::family_paths(h as usize) {
                     if vfs_server::mounting_device(p) { return Some("mounting"); }
+                    if vfs_server::block_fd_open(p) { return Some("block device open"); }
                     let want = p.strip_prefix("/dev/").unwrap_or(p);
                     if mounts.iter().any(|m| m.in_use && m.device.strip_prefix("/dev/").unwrap_or(m.device) == want) { return Some("mounted"); }
                 }

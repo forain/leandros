@@ -2596,6 +2596,22 @@ pub fn mounting_device(device: &str) -> bool {
     MOUNT_PINS.lock().iter().any(|d| d.strip_prefix("/dev/").unwrap_or(d) == w)
 }
 
+/// True while any process holds an open fd on the block device node `device` ("/dev/x" or "x").
+/// A busy pin for module unload (D6/D9): the scan runs with the owner's Upper gate closed, and an
+/// open that races it lands on a disk whose I/O is gated, so it fails -ENODEV rather than reaching
+/// freed module code. Tables are locked one at a time.
+pub fn block_fd_open(device: &str) -> bool {
+    let mut path = alloc::string::String::from("/dev/");
+    path.push_str(device.strip_prefix("/dev/").unwrap_or(device));
+    let Some(dev) = block::lookup_dev_node(path.as_bytes()) else { return false };
+    all_tables().iter().any(|t| {
+        let mut g = t.lock();
+        if g.dead { return false; }
+        let hit = g.fds.iter_used().any(|(_, f)| matches!(f.kind, VnodeKind::BlockDev { dev: d, .. } if d == dev));
+        hit
+    })
+}
+
 /// Snapshot of every currently registered mount (for `/proc/mounts`, `mount`, `lsblk`).
 pub fn list_mounts() -> [MountEntry; MAX_MOUNTS] {
     *MOUNTS.lock()

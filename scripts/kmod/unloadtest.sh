@@ -76,6 +76,8 @@ if [ -n "${UPPER:-}" ]; then
     "mount -t f2fs -o ro /dev/sda /tmp/stk; echo MOUNT_RC=\$?; kmodctl rmmod usb_storage; echo BUSY_RC=\$?" \
     "umount /tmp/stk; kmodctl rmmod usb_storage; echo UMNT_RM_RC=\$?" \
     "sleep 1; kmodctl load $M/usb_storage.kmod; sleep 3; mount -t f2fs -o ro /dev/sda /tmp/stk; echo REMOUNT_RC=\$?; umount /tmp/stk; kmodctl rmmod usb_storage; echo RM2_RC=\$?" \
+    "sleep 1; kmodctl load $M/usb_storage.kmod; sleep 3; exec 3</dev/sda; kmodctl rmmod usb_storage; echo FDBUSY_RC=\$?; dd if=/dev/sda bs=512 count=1 of=/dev/null 2>/dev/null; echo FDREAD_RC=\$?; exec 3<&-; kmodctl rmmod usb_storage; echo FDCLOSE_RM_RC=\$?" \
+    "sleep 1; kmodctl load $M/usb_storage.kmod; sleep 3; for i in \$(seq 1 20); do exec 3</dev/sda; kmodctl rmmod usb_storage >/dev/null 2>&1; echo FDLOOP_RC=\$?; exec 3<&-; done; echo FDLOOP_DONE; kmodctl rmmod usb_storage; echo FDLOOP_RM_RC=\$?; cat /proc/modules" \
     "for i in \$(seq 1 10); do kmodctl rmmod usb_hid >/dev/null 2>&1; kmodctl load $M/usb_hid.kmod >/dev/null 2>&1 || echo HIDLOADFAIL \$i; sleep 1; done; echo HIDLOOP_DONE" \
     "kmodctl load $M/kmbad_leak.kmod; kmodctl rmmod kmbad_leak; echo LEAKRM_RC=\$?; cat /proc/modules" > /dev/null 2>&1
   L="${FFSESSION_OUT:-/tmp/ffsession}/tests-ul3/serial-full.log"
@@ -88,6 +90,14 @@ if [ -n "${UPPER:-}" ]; then
   check 'UMNT_RM_RC=0' "rmmod after umount ok"
   check 'REMOUNT_RC=0' "reload re-mounts"
   check 'RM2_RC=0' "second rmmod ok"
+  check 'FDBUSY_RC=1' "rmmod with an open /dev/sda fd is busy"
+  check 'busy: block device open' "busy reason names the open block fd"
+  check 'FDREAD_RC=0' "disk still reads after the refused rmmod"
+  check 'FDCLOSE_RM_RC=0' "rmmod after closing the fd ok"
+  check 'FDLOOP_DONE' "open-fd rmmod loop x20 finished"
+  nocheck 'FDLOOP_RC=0' "no rmmod succeeded while the fd was open"
+  check 'FDLOOP_RM_RC=0' "rmmod after the loop ok"
+  nocheck 'usb_storage .*Zombie' "no Zombie after the fd loop"
   check 'HIDLOOP_DONE' "usb_hid x10 finished"
   nocheck '^HIDLOADFAIL [0-9]' "usb_hid reload clean"
   check 'kmbad_leak ZOMBIE: ungated registrations left' "kmbad_leak becomes Zombie"
