@@ -12,7 +12,7 @@ build
 RT=.claude/skills/run-leandros/runtests.py
 [[ "$what" == all || "$what" == unload ]] && { UPPER=1 EXIT3=1 scripts/kmod/unloadtest.sh "$arch" || rc=1; }
 [[ "$arch" == x86_64 && ( "$what" == all || "$what" == e1000e ) ]] && { scripts/kmod/e1000etest.sh || rc=1; }
-[[ "$what" == all || "$what" == ctl ]] && { python3 "$RT" "$arch" kmodctl kmodctl || rc=1; }
+[[ "$what" == all || "$what" == ctl ]] && { python3 "$RT" "$arch" kmodctl --suite kmodctl || rc=1; }
 # autoload goes LAST: autoloadtest.sh writes its own .config and does its OWN stock build (modules found only through
 # modules.alias, no modules.load), so it must not inherit KMOD_TEST/KMOD_EXTRA, and it replaces the KMOD_TEST images
 # the groups above ran on. Two builds are inherent: the KMOD_TEST build above, then this stock one.
