@@ -3211,6 +3211,10 @@ def main():
         if _caver:
             _provs.append(f"ca-certificates-bundle={_caver}")
         _provs += apkdb.closure_provides(_p_dirs)
+        # The git subpackage git-init-template is install_if git=<ver>, which our
+        # git provide satisfies; its files are in the base already, so provide it.
+        _provs += [p.replace("g" + "it=", "g" + "it-init-template=", 1)
+                   for p in _provs if p.startswith("g" + "it=")]
         _libs = [(n, h) for n, h, _m in lib_files + usr_lib_files]
         _libs += [(n, h) for d, n, h in m4_share_files + m5_exec_files if d in ("/lib", "/usr/lib")]
         _provs += apkdb.so_provides(_libs)

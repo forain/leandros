@@ -77,7 +77,7 @@ grep -q 'refuse_rc=1' "$OUT/s9.log" && ok "del leandros-base refused" || bad "re
 step "10 sudo as leandro"
 python3 "$D" cmd "exit" 5 > /dev/null 2>&1
 python3 "$D" login leandro leandro >> "$OUT/boot.log" 2>&1
-run "sudo $APK add jq; echo sudo_rc=\$?; /usr/bin/jq --version" 600 > "$OUT/s10.log" 2>&1
+run "echo leandro | sudo -S -p '' $APK add jq; echo sudo_rc=\$?; /usr/bin/jq --version" 600 > "$OUT/s10.log" 2>&1
 if grep -q 'sudo_rc=0' "$OUT/s10.log" && grep -q 'jq-1\.7' "$OUT/s10.log"; then ok "sudo apk add jq"; else bad "sudo apk add"; fi
 
 python3 "$D" stop > /dev/null 2>&1
