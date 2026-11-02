@@ -34,12 +34,15 @@ REL=v3.21
 
 APK_TOOLS_VER=2.14.6-r3
 ALPINE_KEYS_VER=2.5-r0
+BUSYBOX_VER=1.37.0-r14
 pin() {  # pin <arch> <pkg-ver> -> expected sha256 (empty: unpinned)
   case "$1/$2" in
     x86_64/apk-tools-static-2.14.6-r3)  echo f0e0d34d6a8f1f9d8704bae6612b4627b96f13cd20db759e9b43085135cd234f ;;
     aarch64/apk-tools-static-2.14.6-r3) echo 910015ebcdb11f92966f5590cf5b538b3e4dddbc1b56bc441fae3a622d05dd0e ;;
     x86_64/alpine-keys-2.5-r0)          echo f68a8cf46058b77d2ebccc33fec2a645d8da9e3791ffc385cf80403ec4810512 ;;
     aarch64/alpine-keys-2.5-r0)         echo a70d3c55ee676d7d670714aa729285d5ab6fcf18146eb03e05319098bcb715c0 ;;
+    x86_64/busybox-static-1.37.0-r14)   echo feef45f02f31ee30b6b47eed9b643a0f99e63a21a08a90e7c680066a712405bd ;;
+    aarch64/busybox-static-1.37.0-r14)  echo 6fd7ea97062beb51fa785ba858f823e1dfe4daf6bfa91ff4d5359b1061988c69 ;;
   esac
 }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
@@ -75,8 +78,8 @@ for ARCH in $ARCHS; do
   [ -n "$CAVER" ] || { echo "❌ ca-certificates-bundle not in the $ARCH APKINDEX"; exit 1; }
 
   T="$OUT/$ARCH.new"
-  rm -rf "$T"; mkdir -p "$T/x" "$T/usr/sbin" "$T/etc/apk/keys" "$T/etc/ssl/certs"
-  for PV in "apk-tools-static-$APK_TOOLS_VER" "alpine-keys-$ALPINE_KEYS_VER" "ca-certificates-bundle-$CAVER"; do
+  rm -rf "$T"; mkdir -p "$T/x" "$T/usr/sbin" "$T/etc/apk/keys" "$T/etc/ssl/certs" "$T/lib/apk/db"
+  for PV in "apk-tools-static-$APK_TOOLS_VER" "alpine-keys-$ALPINE_KEYS_VER" "ca-certificates-bundle-$CAVER" "busybox-static-$BUSYBOX_VER"; do
     F=$(fetch "$ARCH" "$PV.apk")
     WANT=$(pin "$ARCH" "$PV")
     GOT=$(sha256 "$F")
@@ -97,10 +100,25 @@ for ARCH in $ARCHS; do
   chmod 0755 "$T/usr/sbin/alpine-sysroot"
   cp "$HERE/claude-code-install.sh" "$T/usr/sbin/claude-code-install"
   chmod 0755 "$T/usr/sbin/claude-code-install"
+  # Live-root apk (docs/userland/ports.md "Live-root apk"): the wrapper, the
+  # world file naming the generated leandros-base package, an empty db, and
+  # busybox-static + shims for packages' adduser/addgroup install scripts.
+  cp "$HERE/apk-wrapper.sh" "$T/usr/sbin/apk"
+  cp "$T/x/bin/busybox.static" "$T/usr/sbin/busybox.static"
+  for _a in adduser addgroup deluser delgroup; do
+    printf '#!/bin/sh\nexec /usr/sbin/busybox.static %s "$@"\n' "$_a" > "$T/usr/sbin/$_a"
+    chmod 0755 "$T/usr/sbin/$_a"
+  done
+  chmod 0755 "$T/usr/sbin/apk" "$T/usr/sbin/busybox.static"
+  printf 'leandros-base\n' > "$T/etc/apk/world"
+  printf '%s\n' "$ARCH" > "$T/etc/apk/arch"
+  : > "$T/lib/apk/db/lock"; : > "$T/lib/apk/db/triggers"
+  head -c 1024 /dev/zero > "$T/lib/apk/db/scripts.tar"
+  chmod 0644 "$T/etc/apk/world" "$T/etc/apk/arch" "$T/lib/apk/db/lock" "$T/lib/apk/db/triggers" "$T/lib/apk/db/scripts.tar"
   chmod 0644 "$T"/etc/apk/keys/* "$T/etc/apk/repositories" "$T/etc/ssl/cert.pem" "$T/etc/ssl/certs/ca-certificates.crt"
   rm -rf "$T/x"
-  printf 'apk-tools-static-%s alpine-keys-%s ca-certificates-bundle-%s\n' \
-    "$APK_TOOLS_VER" "$ALPINE_KEYS_VER" "$CAVER" > "$T/APK-VERSION"
+  printf 'apk-tools-static-%s alpine-keys-%s ca-certificates-bundle-%s busybox-static-%s\n' \
+    "$APK_TOOLS_VER" "$ALPINE_KEYS_VER" "$CAVER" "$BUSYBOX_VER" > "$T/APK-VERSION"
   rm -rf "$OUT/$ARCH"; mv "$T" "$OUT/$ARCH"
   touch "$OUT/$ARCH/.stamp"
   echo "✅ $OUT/$ARCH: $(cat "$OUT/$ARCH/APK-VERSION")"
