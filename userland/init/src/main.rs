@@ -520,6 +520,10 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     }
     write_str("F2FS mounted successfully at /mnt!\n");
 
+    // 1b. Keep this kernel's modules loadable by name when the disk root has
+    // no /lib/modules/<build-id> (see stage_modules).
+    stage_modules();
+
     // 2. Create old_root directory on F2FS mount for pivoting
     mkdir(b"/mnt/old_root\0".as_ptr(), 0o755);
 
@@ -2075,6 +2079,79 @@ fn parse_u32(s: &[u8]) -> Option<u32> {
         v = v.checked_mul(10)?.checked_add((b - b'0') as u32)?;
     }
     Some(v)
+}
+
+/// The initrd's files are not openable by path once the disk root is "/", so
+/// when /mnt has no /lib/modules/<this kernel's build-id>, copy the initrd's
+/// /lib/modules/<id>/ (regular files only, a few MB) into /run/modules/<id>/.
+/// /run is a VFS tmpfs that shadows the disk and survives the pivot; nothing
+/// is written to the disk root. kmodctl searches both places.
+unsafe fn stage_modules() {
+    let mut id = [0u8; 80];
+    let n = read_file(b"/proc/kmod_buildid\0", &mut id);
+    let mut il = 0;
+    while il < n && il < 64 && id[il].is_ascii_hexdigit() { il += 1; }
+    if il == 0 { return; }
+    let idv = &id[..il];
+    let mk = |pre: &[u8], tail: &[u8], out: &mut [u8; 256]| -> usize {
+        let mut l = 0;
+        for part in [pre, idv, tail] {
+            out[l..l + part.len()].copy_from_slice(part);
+            l += part.len();
+        }
+        out[l] = 0;
+        l
+    };
+    let mut p = [0u8; 256];
+    mk(b"/mnt/lib/modules/", b"", &mut p);
+    let fd = open(p.as_ptr(), O_RDONLY, 0);
+    if fd >= 0 {
+        close(fd);
+        // Test knob kmod.stage=1 stages anyway, to exercise the no-modules-on-root path.
+        let mut cl = [0u8; 2048];
+        let m = read_file(b"/proc/cmdline\0", &mut cl);
+        if !cl[..m].windows(12).any(|w| w == b"kmod.stage=1") { return; }
+    }
+    mk(b"/lib/modules/", b"", &mut p);
+    let mut q = [0u8; 256];
+    mkdir(b"/run/modules\0".as_ptr(), 0o755);
+    mk(b"/run/modules/", b"", &mut q);
+    mkdir(q.as_ptr(), 0o755);
+    static mut LIST: [u8; 61440] = [0; 61440];
+    static mut CHUNK: [u8; 32768] = [0; 32768];
+    let list = &mut *core::ptr::addr_of_mut!(LIST);
+    let chunk = &mut *core::ptr::addr_of_mut!(CHUNK);
+    let ll = read_file(b"/proc/kmod_initrd\0", list);
+    if ll == 0 { write_str("modules: no initrd /lib/modules/<id>; nothing to stage\n"); return; }
+    let (mut total, mut files) = (0usize, 0u32);
+    for name in list[..ll].split(|&b| b == b'\n') {
+        let nl = name.len();
+        if nl == 0 || nl > 100 || name[0] == b'.' { continue; }
+        let (mut sp, mut dp) = ([0u8; 256], [0u8; 256]);
+        let l = mk(b"/lib/modules/", b"/", &mut sp);
+        sp[l..l + nl].copy_from_slice(name); sp[l + nl] = 0;
+        let l = mk(b"/run/modules/", b"/", &mut dp);
+        dp[l..l + nl].copy_from_slice(name); dp[l + nl] = 0;
+        let sfd = open(sp.as_ptr(), O_RDONLY, 0);
+        if sfd < 0 { continue; }
+        let ofd = open(dp.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+        if ofd >= 0 {
+            loop {
+                let got = read(sfd, chunk.as_mut_ptr(), chunk.len());
+                if got <= 0 { break; }
+                write(ofd, chunk.as_ptr(), got as usize);
+                total += got as usize;
+            }
+            close(ofd);
+            files += 1;
+        }
+        close(sfd);
+    }
+    write_str("modules: staged ");
+    write_u32(files);
+    write_str(" files (");
+    write_u32((total / 1024) as u32);
+    write_str(" KiB) from the initrd into /run/modules/<build-id> (disk root has none)\n");
 }
 
 /// Raw mount(2): the negative errno, or 0.

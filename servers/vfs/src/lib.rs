@@ -6549,6 +6549,48 @@ fn gen_kmod_buildid() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.kmod_buildid", &out, false)
 }
 
+/// `/proc/kmod_initrd`: the regular files of the initrd's `lib/modules/<id>/`, one name per line
+/// (cpio directories cannot be listed by getdents). init copies them to /run/modules/<id> before
+/// the pivot when the disk root has no such directory.
+fn gen_kmod_initrd() -> Option<VnodeKind> {
+    extern "C" { fn arch_kmod_buildid(buf: *mut u8, cap: usize) -> usize; }
+    let mut idb = [0u8; 128];
+    let il = unsafe { arch_kmod_buildid(idb.as_mut_ptr(), idb.len()) };
+    let id = &idb[..il];
+    let id = if id.last() == Some(&b'\n') { &id[..id.len() - 1] } else { id };
+    let mut prefix: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    prefix.extend_from_slice(b"lib/modules/");
+    prefix.extend_from_slice(id);
+    prefix.push(b'/');
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let base = INITRD_BASE.load(atomic::Ordering::SeqCst);
+    let size = INITRD_SIZE.load(atomic::Ordering::SeqCst);
+    if base != 0 && size != 0 {
+        let data: &'static [u8] = unsafe { core::slice::from_raw_parts(mm::phys_to_virt(base) as *const u8, size) };
+        let hex = |b: &[u8]| -> usize { core::str::from_utf8(b).ok().and_then(|t| usize::from_str_radix(t, 16).ok()).unwrap_or(0) };
+        let mut off = 0usize;
+        while off + 110 <= data.len() && &data[off..off + 6] == b"070701" {
+            let mode = hex(&data[off + 14..off + 22]);
+            let fsz = hex(&data[off + 54..off + 62]);
+            let nsz = hex(&data[off + 94..off + 102]);
+            if nsz == 0 || off + 110 + nsz > data.len() { break; }
+            let name = &data[off + 110..off + 110 + nsz - 1];
+            let name = name.strip_prefix(b"./").unwrap_or(name);
+            let name = name.strip_prefix(b"/").unwrap_or(name);
+            if mode & 0o170000 == 0o100000 && name.starts_with(&prefix) {
+                let rest = &name[prefix.len()..];
+                if !rest.is_empty() && !rest.contains(&b'/') && out.len() + rest.len() < 60000 {
+                    out.extend_from_slice(rest);
+                    out.push(b'\n');
+                }
+            }
+            off = ((off + 110 + nsz + 3) & !3) + fsz;
+            off = (off + 3) & !3;
+        }
+    }
+    proc_snapshot(b"/tmp/.kmod_initrd", &out, false)
+}
+
 /// `/proc/pcache`: the unified page cache (`mm::pagecache`), one
 /// `name value` per line; counters are cumulative pages since boot.
 /// f2fs no-I/O request reruns / requests that gave up (cumulative), and the
@@ -7307,7 +7349,7 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/tryboot"];
+                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ"];
 
@@ -8091,6 +8133,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/modules" {
             match gen_modules() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/kmod_initrd" {
+            match gen_kmod_initrd() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }

@@ -19,7 +19,7 @@ if [ -n "$img" ]; then for e in target/kmod/$arch/*.elf; do [ -e "$e" ] && [ "$e
 export LEANDROS_RUN_ID="unloadtest-$arch"
 M='$MD'  # guest var: the lib/modules/<id> dir whose build-id this kernel accepts (there can be several)
 load() { echo "kmodctl load ${M}$1.kmod"; }
-python3 "$RT" "$arch" ul1 --cmdline "kmod.leaktick=1" \
+python3 "$RT" "$arch" ul1 --cmdline "kmod.leaktick=1 kmod.stage=1" \
   "for d in /lib/modules/*/; do if kmodctl load \${d}hello.kmod >/dev/null 2>&1; then kmodctl rmmod hello >/dev/null 2>&1; MD=\${d%/}; break; fi; done; echo MD=\$MD" \
   "for i in \$(seq 1 $N); do kmodctl load $M/hello.kmod >/dev/null 2>&1 || echo LOADFAIL \$i; kmodctl rmmod hello >/dev/null 2>&1 || echo UNLOADFAIL \$i; done; echo HELLOLOOP_DONE" \
   "kmodctl rmmod hello; echo ENOENT_RC=\$?" \
@@ -30,6 +30,7 @@ python3 "$RT" "$arch" ul1 --cmdline "kmod.leaktick=1" \
   "kmodctl rmmod virtio_rng; kmodctl rmmod virtio_net; for i in \$(seq 1 $N); do kmodctl load $M/virtio_rng.kmod >/dev/null 2>&1 || echo RNGLOADFAIL \$i; kmodctl rmmod virtio_rng >/dev/null 2>&1 || echo RNGUNLOADFAIL \$i; done; echo RNGLOOP_DONE" \
   "(ping -c 100000 -i 1 192.168.105.1 >/dev/null 2>&1 &); for i in \$(seq 1 ${NET_N:-20}); do kmodctl load $M/virtio_net.kmod >/dev/null 2>&1 || echo NETLOADFAIL \$i; sleep 4; echo NETRELOAD_OK \$i; echo NETCNT \$i \$(grep eth0 /proc/net/dev);  kmodctl rmmod virtio_net >/dev/null 2>&1 || echo NETUNLOADFAIL \$i; done; echo NETLOOP_DONE" \
   "kmodctl load hello; echo NAMELOAD_RC=\$?; kmodctl rmmod hello; kmodctl load hello.kmod; echo NAMELOAD2_RC=\$?; kmodctl rmmod hello; o=\$(kmodctl load nosuchmod 2>&1); echo NAMEMISS_RC=\$? OUT=\$o; cat /proc/kmod_buildid" \
+  "I=\$(cat /proc/kmod_buildid); mv /lib/modules/\$I /lib/modules/\$I.off; echo MVOFF_RC=\$?; kmodctl rmmod hello; kmodctl load hello; echo RUNLOAD_RC=\$?; kmodctl rmmod hello; mv /lib/modules/\$I.off /lib/modules/\$I; echo MVBACK_RC=\$?; ls /run/modules/\$I | head -3" \
   "kmodctl load $M/hello.kmod; o=\$(/bin/sudo -u leandro /bin/kmodctl rmmod hello 2>&1); echo NONROOT_RC=\$? OUT=\$o; kmodctl rmmod hello" > /dev/null 2>&1
 L="${FFSESSION_OUT:-/tmp/ffsession}/tests-ul1/serial-full.log"
 fail=0
@@ -70,6 +71,8 @@ PY
 n=$(grep -a 'DHCP configured, address: .* (eth0)' "$L" | wc -l)
 if [ "$n" -ge "${NET_N:-20}" ]; then echo "ok   eth0 DHCP + traffic after each reload ($n)"; else echo "FAIL eth0 DHCP after reloads ($n)"; fail=1; fi
 check 'NAMELOAD_RC=0' "kmodctl load <name> (build-id dir found via /proc/kmod_buildid; works with no /lib/modules on the root, the initrd copy is opened by path)"
+check 'RUNLOAD_RC=0' "kmodctl load <name> with /lib/modules/<id> renamed away succeeds from /run/modules (staged by init)"
+check 'modules: staged [0-9]* files' "init logs the staged module copy"
 check 'NAMELOAD2_RC=0' "kmodctl load <name>.kmod"
 check 'NAMEMISS_RC=1 OUT=.*module nosuchmod not found; searched /lib/modules/[0-9a-f]*/nosuchmod.kmod' "missing module error names the searched path"
 check 'NONROOT_RC=[0-9]* OUT=.*delete_module: Operation not permitted (errno 1)' "non-root errno is EPERM"

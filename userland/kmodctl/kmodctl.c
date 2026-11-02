@@ -1,7 +1,7 @@
 // kmodctl: list / load / unload / info for LeandrOS kernel modules.
 //   kmodctl list              pretty /proc/modules
 //   kmodctl load <path>       finit_module(fd, "", 0)
-//   kmodctl load <name>       same, for /lib/modules/<this kernel's build-id>/<name>.kmod (disk root or initrd)
+//   kmodctl load <name>       same, for /lib/modules/<this kernel's build-id>/<name>.kmod (disk root, else the /run/modules copy init stages)
 //   kmodctl unload <name>     delete_module(name, 0) (the kernel refuses: EBUSY)
 //   kmodctl info <path>       dump the 128-byte module header
 // Errors print strerror and the errno number; exit status 1.
@@ -39,9 +39,9 @@ static int cmd_list(void)
 }
 
 // Bare module name -> /lib/modules/<build-id>/<name>.kmod. The id is this kernel's own
-// (/proc/kmod_buildid); the path resolves on the disk root when it has /lib/modules, else in the
-// initrd (openable by path after pivot_root, but not listable, so the id cannot be guessed from a
-// directory scan on an installed root that has no /lib/modules).
+// (/proc/kmod_buildid); searched in /lib/modules/<id> on the root, then /run/modules/<id>, the
+// tmpfs copy init makes from the initrd when the disk root lacks the directory (initrd files are
+// not reachable by path after pivot_root).
 static int cmd_load_name(const char *name)
 {
     char id[128] = "", path[384], tried[768] = "";
@@ -51,17 +51,21 @@ static int cmd_load_name(const char *name)
     FILE *f = fopen("/proc/kmod_buildid", "r");
     if (f) { if (fgets(id, sizeof id, f)) id[strcspn(id, "\n")] = 0; fclose(f); }
     if (id[0]) {
-        snprintf(path, sizeof path, "/lib/modules/%s/%.*s.kmod", id, (int)n, name);
-        int fd = open(path, O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            long r = syscall(SYS_finit_module, fd, "", 0);
-            int e = errno;
-            close(fd);
-            if (r < 0) { errno = e; return fail("finit_module"); }
-            printf("loaded %s\n", path);
-            return 0;
+        static const char *const roots[] = { "/lib/modules", "/run/modules" };
+        for (int i = 0; i < 2; i++) {
+            snprintf(path, sizeof path, "%s/%s/%.*s.kmod", roots[i], id, (int)n, name);
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                long r = syscall(SYS_finit_module, fd, "", 0);
+                int e = errno;
+                close(fd);
+                if (r < 0) { errno = e; return fail("finit_module"); }
+                printf("loaded %s\n", path);
+                return 0;
+            }
+            size_t tl = strlen(tried);
+            snprintf(tried + tl, sizeof tried - tl, "%s%s", tl ? ", " : "", path);
         }
-        snprintf(tried, sizeof tried, "%s (on the root and in the initrd)", path);
     } else {
         snprintf(tried, sizeof tried, "/lib/modules/<build-id>/%.*s.kmod (/proc/kmod_buildid unreadable)", (int)n, name);
     }
