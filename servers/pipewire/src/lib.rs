@@ -515,7 +515,7 @@ pub fn attach(ops: &'static KSndOps, ctx: usize) -> Result<u32, i32> {
             Err(e) => { state.snd_driver = Backend::None; return Err(e); }
         }
     };
-    if ops.flags & KSND_CAPTURE != 0 { let _ = sched::kthread::spawn("[audio]", audio_service); }
+    if ops.flags & KSND_CAPTURE != 0 { spawn_audio(); }
     Ok(port)
 }
 
@@ -537,7 +537,7 @@ fn register_server(state: &mut PipeWireState) -> Result<u32, i32> {
 
     state.initialized = true;
     sched::register_tick_hook(tick_pump);
-    if matches!(state.snd_driver, Backend::Hda(_)) { let _ = sched::kthread::spawn("[audio]", audio_service); }
+    if matches!(state.snd_driver, Backend::Hda(_)) { spawn_audio(); }
     pci::rdebug("[PW] Ready on port ");
     pci::rdebug_hex(server_port);
     pci::rdebug("\n");
@@ -556,10 +556,14 @@ fn handle_msg(msg: &Message, caller_pid: u32, _target_port: u32) -> Message {
         0x10 => { // VFS_OPEN {dev_id, flags, _, pid, open_id}
             let flags = arg(msg, 1) as u32;
             if flags & 3 == 0 { // O_RDONLY: no claim
-                if flags & 0o4000 != 0 { nb_add(HOLD_OPEN | open_id_of(msg)); }
+                if flags & 0o4000 != 0 {
+                    nb_add(HOLD_OPEN | open_id_of(msg));
+                    if going_refuse(HOLD_OPEN | open_id_of(msg)) { return err_reply(-16); }
+                }
                 return val_reply(0);
             }
             return match claim(HOLD_OPEN | open_id_of(msg)) {
+                Ok(()) if going_refuse(HOLD_OPEN | open_id_of(msg)) => err_reply(-16),
                 Ok(()) => val_reply(0),
                 Err(e) => err_reply(e),
             };
@@ -669,13 +673,69 @@ fn tick_pump() {
     if ready { sched::try_wake_poll_tagged(capture_tag()); }
 }
 
+static AUDIO_ALIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Start the [audio] thread unless one is running. Called with STATE held, as the thread's exit check is.
+fn spawn_audio() {
+    use core::sync::atomic::Ordering::AcqRel;
+    if AUDIO_ALIVE.swap(true, AcqRel) { return; }
+    if sched::kthread::spawn("[audio]", audio_service).is_none() { AUDIO_ALIVE.store(false, core::sync::atomic::Ordering::Release); }
+}
+
+/// Module unload: forget the module backend. Takes STATE, so any call into the module's ops (all made under it)
+/// has finished; afterwards the server runs with no backend (silent, `Backend::None`).
+pub fn detach_module() {
+    let mut state = STATE.lock();
+    SND_GOING.store(false, core::sync::atomic::Ordering::SeqCst);
+    if matches!(state.snd_driver, Backend::Module { .. }) {
+        state.snd_driver.capture_close();
+        state.snd_driver = Backend::None;
+    }
+}
+
+/// Set by `seal_module` while an unload is past its last busy check. New opens that claim the device
+/// (writer, capture reader, non-blocking open) see it after claiming and fail with EBUSY, so no client
+/// can end up with a silent stream on a backend that is about to vanish. Cleared by detach/unseal.
+static SND_GOING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Dekker-style handshake with the open paths (claim, then test SND_GOING; here: set SND_GOING, then
+/// test busy). Either the open sees the flag and backs out, or this sees the open and refuses.
+/// Returns false (flag cleared) when a client holds the device.
+pub fn seal_module() -> bool {
+    use core::sync::atomic::{fence, Ordering::SeqCst};
+    SND_GOING.store(true, SeqCst);
+    fence(SeqCst);
+    if module_busy() { SND_GOING.store(false, SeqCst); return false; }
+    true
+}
+/// A refused/failed unload: open the device again.
+pub fn unseal_module() { SND_GOING.store(false, core::sync::atomic::Ordering::SeqCst); }
+
+fn going_refuse(h: u64) -> bool {
+    use core::sync::atomic::{fence, Ordering::SeqCst};
+    fence(SeqCst);
+    if SND_GOING.load(SeqCst) { release(h); nb_del(h); true } else { false }
+}
+
+/// True while a client holds the device: writer, capture reader or a non-blocking open.
+pub fn module_busy() -> bool {
+    use core::sync::atomic::Ordering::Acquire;
+    let w = WRITER.load(Acquire);
+    let writer = w != 0 && !(w & !0xffff_ffff == HOLD_IPC && !ipc_holder_alive(w as u32));
+    writer || READER.load(Acquire) != 0 || NB_OPENS.iter().any(|s| s.load(Acquire) != 0)
+}
+
 /// Thread context, every 100 ms: jack sense, capture health. Verbs and
 /// stream restarts never run in the timer IRQ.
 fn audio_service() {
     loop {
         sched::kthread::sleep_ns(100_000_000);
         if let Some(mut state) = STATE.try_lock() {
-            if !state.initialized { return; }
+            // Ends with the backend (module unload) so a reload starts exactly one fresh thread.
+            if !state.initialized || matches!(state.snd_driver, Backend::None) {
+                AUDIO_ALIVE.store(false, core::sync::atomic::Ordering::Release);
+                return;
+            }
             state.snd_driver.jack_service();
         }
     }

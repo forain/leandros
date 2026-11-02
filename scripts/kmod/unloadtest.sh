@@ -70,7 +70,7 @@ nocheck 'STALE REACHED' "stale registration never reaches the new generation"
 if [ -n "${UPPER:-}" ]; then
   stick="${TMPDIR:-/tmp}/ul-stick.img"; rm -f "$stick"; python3 scripts/mkfs-f2fs-home.py create "$stick" --size 128M >/dev/null
   export LEANDROS_QEMU_EXTRA="-device qemu-xhci,id=xhs -device usb-kbd,bus=xhs.0,id=kbd1 -drive if=none,id=stk,format=raw,file=$stick -device usb-storage,bus=xhs.0,drive=stk"
-  python3 "$RT" "$arch" ul3 \
+  python3 "$RT" "$arch" ul3 --cmdline "kmod.leakinput=1 modules.blacklist=virtio_keyboard" \
     "for d in /lib/modules/*/; do if kmodctl load \${d}hello.kmod >/dev/null 2>&1; then kmodctl rmmod hello >/dev/null 2>&1; MD=\${d%/}; break; fi; done; mkdir /tmp/stk" \
     "mount -t f2fs /dev/sda /tmp/stk; echo MOUNTRW_RC=\$?; kmodctl rmmod usb_storage; echo BUSYRW_RC=\$?; echo hi > /tmp/stk/f1 && sync; echo WRITEAFTER_RC=\$?; cat /tmp/stk/f1 > /tmp/f1copy; echo CATAFTER_RC=\$?; umount /tmp/stk; echo UMOUNTRW_RC=\$?" \
     "mount -t f2fs -o ro /dev/sda /tmp/stk; echo MOUNT_RC=\$?; kmodctl rmmod usb_storage; echo BUSY_RC=\$?" \
@@ -92,5 +92,46 @@ if [ -n "${UPPER:-}" ]; then
   nocheck '^HIDLOADFAIL [0-9]' "usb_hid reload clean"
   check 'kmbad_leak ZOMBIE: ungated registrations left' "kmbad_leak becomes Zombie"
   check 'kmbad_leak .* Zombie' "kmbad_leak Zombie in /proc/modules"
+fi
+# ---- kmodexit: virtio_keyboard, virtio_snd and hda unload/reload x${EXIT_N:-20} (EXIT3=1).
+# Needs KMOD_EXTRA to include "virtio_keyboard virtio_snd hda" and an untracked .config with CONFIG_VIRTIO_KEYBOARD=m
+# CONFIG_VIRTIO_SND=m CONFIG_HDA=m. QEMU's default virtio-keyboard/tablet/virtio-snd are used; an Intel HDA codec is added.
+# An open /dev/pipewire pins the sound module (-EBUSY); input detaches. hda attaches after virtio_snd is unloaded
+# (one sound backend at a time), which also proves the backend slot is freed on unload.
+if [ -n "${EXIT3:-}" ]; then
+  EN="${EXIT_N:-20}"
+  export LEANDROS_QEMU_EXTRA="-device ich9-intel-hda,id=hdax -device hda-duplex,bus=hdax.0,audiodev=snd0"
+  python3 "$RT" "$arch" ul4 \
+    "for d in /lib/modules/*/; do if kmodctl load \${d}hello.kmod >/dev/null 2>&1; then kmodctl rmmod hello >/dev/null 2>&1; MD=\${d%/}; break; fi; done; echo MD=\$MD; cat /proc/modules" \
+    "for i in \$(seq 1 $EN); do kmodctl rmmod virtio_keyboard >/dev/null 2>&1 || echo KBUNLOADFAIL \$i; kmodctl load $M/virtio_keyboard.kmod >/dev/null 2>&1 || echo KBLOADFAIL \$i; done; echo KBLOOP_DONE; cat /proc/modules" \
+    "for i in \$(seq 1 $EN); do kmodctl rmmod virtio_snd >/dev/null 2>&1 || echo SNDUNLOADFAIL \$i; kmodctl load $M/virtio_snd.kmod >/dev/null 2>&1 || echo SNDLOADFAIL \$i; done; echo SNDLOOP_DONE" \
+    "(sleep 6 > /dev/pipewire &); sleep 1; kmodctl rmmod virtio_snd; echo SNDBUSY_RC=\$?; sleep 7; kmodctl rmmod virtio_snd; echo SNDFREE_RC=\$?" \
+    "for i in \$(seq 1 $EN); do kmodctl load $M/hda.kmod >/dev/null 2>&1 || echo HDALOADFAIL \$i; kmodctl rmmod hda >/dev/null 2>&1 || echo HDAUNLOADFAIL \$i; done; echo HDALOOP_DONE" \
+    "kmodctl load $M/hda.kmod; (sleep 6 > /dev/pipewire &); sleep 1; kmodctl rmmod hda; echo HDABUSY_RC=\$?; sleep 7; kmodctl rmmod hda; echo HDAFREE_RC=\$?; kmodctl load $M/virtio_snd.kmod; echo SNDBACK_RC=\$?; cat /proc/modules" \
+    "for i in \$(seq 1 12); do rm -f /tmp/held\$i; ( if exec 3>/dev/pipewire; then grep -q virtio_snd /proc/modules && : > /tmp/held\$i; sleep 1; else echo RACEOPENFAIL \$i; fi ) & kmodctl rmmod virtio_snd >/dev/null 2>&1; rc=\$?; wait; if [ \$rc = 0 ] && [ -e /tmp/held\$i ]; then echo RACEBAD \$i; fi; echo RACE_RC \$i \$rc; [ \$rc = 0 ] && kmodctl load $M/virtio_snd.kmod >/dev/null 2>&1; done; echo RACE_DONE; echo EXIT3_DONE" > /dev/null 2>&1
+  L="${FFSESSION_OUT:-/tmp/ffsession}/tests-ul4/serial-full.log"
+  check 'KBLOOP_DONE' "virtio_keyboard x$EN finished"
+  nocheck '^KB\(UNLOAD\|LOAD\)FAIL' "virtio_keyboard x$EN unload/reload clean"
+  check 'SNDLOOP_DONE' "virtio_snd x$EN finished"
+  nocheck '^SND\(UNLOAD\|LOAD\)FAIL' "virtio_snd x$EN unload/reload clean"
+  check 'SNDBUSY_RC=1' "open /dev/pipewire pins virtio_snd (EBUSY)"
+  check 'SNDFREE_RC=0' "virtio_snd unloads after the fd closed"
+  check 'HDALOOP_DONE' "hda x$EN finished"
+  nocheck '^HDA\(UNLOAD\|LOAD\)FAIL' "hda x$EN unload/reload clean"
+  check 'HDABUSY_RC=1' "open /dev/pipewire pins hda (EBUSY)"
+  check 'HDAFREE_RC=0' "hda unloads after the fd closed"
+  check 'SNDBACK_RC=0' "virtio_snd attaches again after hda (backend slot freed)"
+  # Sound race: open /dev/pipewire as rmmod starts. Each round either rmmod is -EBUSY / the open failed, or
+  # the open landed after the unload; never a held fd while rmmod returned 0 (a silent stream).
+  check 'RACE_DONE' "pipewire open vs rmmod race loop finished"
+  nocheck '^RACEBAD' "no open held across a successful rmmod (no silent stream)"
+  # NOTE: held-key release (input_release pushes key-ups) is not tested here: the runner has no QEMU monitor
+  # sendkey channel; covered by review only.
+  check 'EXIT3_DONE' "kmodexit run finished"
+  n=$(grep -ac 'virtio_keyboard: freed' "$L"); if [ "$n" -ge "$EN" ]; then echo "ok   virtio_keyboard exit ran ($n)"; else echo "FAIL virtio_keyboard exit ($n)"; fail=1; fi
+  n=$(grep -ac 'hda: freed' "$L"); if [ "$n" -ge "$EN" ]; then echo "ok   hda exit ran ($n)"; else echo "FAIL hda exit ($n)"; fail=1; fi
+  nocheck 'ZOMBIE' "no Zombie"
+  nocheck 'exit left [0-9]* DMA pages owned' "no DMA pages left owned"
+  nocheck 'panic\|PANIC\|Data abort\|Oops' "no crash"
 fi
 exit $fail

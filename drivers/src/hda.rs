@@ -558,6 +558,22 @@ impl Hda {
         Ok(())
     }
 
+    /// Module unload: hand every DMA page back to the buddy allocator (controller already stopped by
+    /// `shutdown`). Built-in never calls it. Returns pages freed.
+    #[allow(dead_code)]
+    pub fn free_dma(&mut self) -> usize {
+        let order = (RING_BYTES / 4096).trailing_zeros() as usize;
+        let mut n = 0;
+        for (p, o) in [(self.corb_phys, 0), (self.bdl_phys, 0), (self.ring_phys, order), (self.ext.cap_ring_phys(), order)] {
+            if p != 0 { buddy::free(p, o); n += 1 << o; }
+        }
+        self.corb_phys = 0; self.corb = 0; self.rirb = 0; self.posbuf = 0; self.bdl_phys = 0; self.bdl = 0;
+        self.ring_phys = 0; self.ring = 0;
+        self.ext.clear_capture_dma();
+        self.initialized = false;
+        n
+    }
+
     fn alloc_dma(&mut self) -> Result<(), &'static str> {
         const LIMIT: usize = 0x1_0000_0000; // below 4 GiB whatever GCAP.64OK says
         // Page 0: CORB (1 KiB) + RIRB (2 KiB) + position buffer (at +3 KiB).
@@ -1349,6 +1365,7 @@ impl Hda {
         let stopped = wait_for(2000, || (0..streams as usize)
             .all(|i| self.r8(SD_BASE + i * SD_STRIDE + SD_CTL0) & SD_CTL_RUN == 0));
         let _ = write!(s, "streams stopped ({} were running{})", running, if stopped { "" } else { ", RUN stuck" });
+        if !stopped { pci::serial_debug("[HDA] shutdown: stream RUN stuck, DMA pages may still be written\n"); }
 
         // 2. Codec.
         if self.afg != 0 && !self.widgets.is_empty() {

@@ -66,6 +66,7 @@ fn user_name(ptr: usize) -> Result<[u8; 32], isize> {
 
 fn zombie(id: kmod_abi::KmodId, nm: &str, why: &str) -> isize {
     registry::abort_upper(id);
+    registry::unseal_sound();
     registry::set_state(id, State::Zombie);
     drivers::pci::serial_debug(&alloc::format!("[kmod] {} ZOMBIE: {}\n", nm, why));
     EBUSY
@@ -93,7 +94,9 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
     }
     // D9: close the Upper gate and re-judge against a quiescent upper edge (an open may have raced the check above)., then judge busy rules against a quiescent upper edge.
     if !g.close_and_drain(Class::Upper, 2000) { return zombie(m.id, s, "upper drain timeout"); }
-    if let Some(why) = registry::busy_reason(m.id) {
+    let sealed = registry::seal_sound(m.id);
+    if let Some(why) = registry::busy_reason(m.id).or(if sealed { None } else { Some("sound open") }) {
+        registry::unseal_sound();
         g.reopen(Class::Upper);
         registry::reopened(m.id);
         registry::set_state(m.id, State::Live);

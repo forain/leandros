@@ -33,9 +33,21 @@ pub extern "C" fn kapi_input_register(owner: KmodId, kind: u32, _name: *const u8
     kind as i32
 }
 
+/// Currently pressed key/button codes of the fixed nodes (0 keyboard, 1 pointer), one bit per code below
+/// 0x300. Lets `input_release` push the key-ups a vanishing source can no longer send.
+const KEY_WORDS: usize = 12;
+static PRESSED: [[AtomicU64; KEY_WORDS]; 2] = [const { [const { AtomicU64::new(0) }; KEY_WORDS] }; 2];
+
+fn track_key(node: i32, ty: u16, code: u16, value: i32) {
+    if ty != 1 || !(0..2).contains(&node) || code as usize >= KEY_WORDS * 64 { return; }
+    let (w, b) = (code as usize / 64, 1u64 << (code % 64));
+    if value == 0 { PRESSED[node as usize][w].fetch_and(!b, Ordering::AcqRel); }
+    else { PRESSED[node as usize][w].fetch_or(b, Ordering::AcqRel); }
+}
+
 #[no_mangle]
 pub extern "C" fn kapi_input_event(node: i32, ty: u16, code: u16, value: i32) {
-    if node_ok(node) { evdev_server::push_event(node as u32, ty, code, value); }
+    if node_ok(node) { track_key(node, ty, code, value); evdev_server::push_event(node as u32, ty, code, value); }
 }
 
 /// Publish a node's relative-axis and key/button bitmaps (EVIOCGBIT). 0, or -22.
@@ -63,6 +75,7 @@ pub extern "C" fn kapi_input_unregister(node: i32) -> i32 {
 /// A key edge or SYN for the kernel's own console/VT keyboard (fixed node 0 only).
 #[no_mangle]
 pub extern "C" fn kapi_input_event_console(ty: u16, code: u16, value: i32) {
+    track_key(0, ty, code, value);
     evdev_server::push_event_console(0, ty, code, value);
 }
 
@@ -93,13 +106,34 @@ pub extern "C" fn kapi_rel_pointer_advertise(buttons: u8, hwheel: bool, hires: b
 }
 
 /// Unload: take a registration back (per-device node, or a fixed node's claim bit).
-/// Fixed nodes stay claimed: the console keyboard and pointer feed from them, so the module becomes a Zombie.
+/// Per-device nodes are unregistered; a fixed node's claim bit is dropped (unless kmod.leakinput=1), after
+/// key-up edges for everything still held so the console/compositor never sees a stuck key or modifier.
 pub fn input_release(handle: u64) -> bool {
     if handle & 0x100 != 0 {
         let n = (handle & 0xff) as i32;
         let _ = kapi_input_unregister(n);
         true
     } else {
-        false
+        // Fixed node (0 keyboard, 1 pointer): drop the claim so a reload can take it again. The console and
+        // compositor only consume the node's events, so they just see the stream stop. kmod.leakinput=1 keeps
+        // the old irrevocable behaviour for the kmbad_leak Zombie fixture.
+        if crate::kmod::autoload::opt("kmod.leakinput") == Some("1") { return false; }
+        let node = (handle & 0x1f) as usize;
+        if node < 2 {
+            // Key-up for every code still held, then SYN, so no key or modifier stays stuck.
+            for w in 0..KEY_WORDS {
+                let mut bits = PRESSED[node][w].swap(0, Ordering::AcqRel);
+                while bits != 0 {
+                    let code = (w * 64) as u16 + bits.trailing_zeros() as u16;
+                    bits &= bits - 1;
+                    evdev_server::push_event(node as u32, 1, code, 0);
+                    if node == 0 { evdev_server::push_event_console(0, 1, code, 0); }
+                }
+            }
+            evdev_server::push_event(node as u32, 0, 0, 0);
+            if node == 0 { evdev_server::push_event_console(0, 0, 0, 0); }
+        }
+        CLAIMED.fetch_and(!(1u32 << (handle & 0x1f)), Ordering::AcqRel);
+        true
     }
 }

@@ -130,6 +130,7 @@ fn release_one(owner: KmodId, kind: RegKind, handle: u64) -> bool {
         RegKind::USB_CLASS => true, // torn down by `pre_exit`; the record is leaked (a snapshot may still point at it)
         RegKind::BLK => { drivers::blkdev::remove_disk(handle as usize); true }
         RegKind::INPUT => super::exports::input_release(handle),
+        RegKind::SND => super::exports::snd_release(),
         // The netif entry stays (name kept); its gate is closed for good, so nothing reaches the module.
         RegKind::NETDEV => true,
         _ => false,
@@ -152,6 +153,7 @@ pub fn busy_reason(id: KmodId) -> Option<&'static str> {
                     if mounts.iter().any(|m| m.in_use && m.device.strip_prefix("/dev/").unwrap_or(m.device) == want) { return Some("mounted"); }
                 }
             }
+            RegKind::SND => { if super::exports::snd_busy() { return Some("sound open"); } }
             RegKind::DRM | RegKind::KMS => return Some("display in use"),
             _ => {}
         }
@@ -162,7 +164,11 @@ pub fn busy_reason(id: KmodId) -> Option<&'static str> {
 /// Runs on the exit thread right before the module's `exit()`: take back what needs the module's own code.
 pub fn pre_exit(id: KmodId) {
     let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == id).map(|r| (r.1, r.2)).collect();
-    for (k, h) in recs { if k == RegKind::USB_CLASS { super::exports::usb_class_teardown(h); } }
+    for (k, h) in recs {
+        if k == RegKind::USB_CLASS { super::exports::usb_class_teardown(h); }
+        // The sound backend must be unreachable before exit() frees its DMA (pipewire's tick would write into it).
+        if k == RegKind::SND { super::exports::snd_release(); }
+    }
 }
 
 /// A refused unload reopened the Upper gate: replay what arrived while it was closed.
@@ -201,3 +207,12 @@ pub fn release_all(owner: KmodId) -> bool {
     }
     reg_count(owner) == 0
 }
+
+/// D9 last gate: after the Upper drain, stop new /dev/pipewire opens and re-check that none slipped in.
+/// False = busy (the caller backs out as for busy_reason). Sound opens bypass the Upper gate, so this is
+/// the sound equivalent of the closed-gate re-check.
+pub fn seal_sound(id: KmodId) -> bool {
+    let has = REGS.lock().iter().any(|r| r.0 == id && r.1 == RegKind::SND);
+    !has || super::exports::snd_seal()
+}
+pub fn unseal_sound() { super::exports::snd_unseal(); }

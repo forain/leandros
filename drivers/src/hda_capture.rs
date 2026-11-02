@@ -72,6 +72,11 @@ pub(super) struct Ext {
 }
 
 impl Ext {
+    /// Physical base of the capture ring (0 = never allocated); module unload frees it.
+    #[allow(dead_code)]
+    pub(super) fn cap_ring_phys(&self) -> usize { self.cap_ring_phys }
+    pub(super) fn clear_capture_dma(&mut self) { self.cap_ring_phys = 0; self.cap_ring = 0; self.cap_bdl = 0; self.cap_bdl_phys = 0; }
+
     pub(super) const fn new() -> Self {
         Self {
             int_path: Vec::new(), jack_path: Vec::new(), cur_path: Vec::new(),
