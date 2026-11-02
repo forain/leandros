@@ -6512,9 +6512,9 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         // the interpreter load below.
         // Resolved like any other path the task names, i.e. under its chroot:
         // a jailed Alpine binary's /lib/ld-musl-<arch>.so.1 is the JAIL's
-        // musl, not the image's libc.so (which lacks __stack_chk_guard and is
-        // a different libc build). For an unjailed task this is the same
-        // absolute path as before.
+        // musl, not the image's libc (a different musl build/revision and
+        // file). For an unjailed task this is the same absolute path as
+        // before.
         if plen == 0 || plen >= KPATH_MAX { drop(new_as); return -8; }
         let interp_kp = match resolve_ns(&raw[..plen]).and_then(KPath::from_ns) {
             Ok(k) => k,

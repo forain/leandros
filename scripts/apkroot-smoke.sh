@@ -10,6 +10,9 @@
 #   6. apk add nano installs nothing (the base provides it)
 #   7. apk del jq htop: rc 0, files gone
 #   8. base checksums unchanged, git still works
+#   8b. musl is Alpine's real package: loader sha256 == the pinned .apk's,
+#       libc.musl-* / usr/lib/libc.so are symlinks, `apk info -e musl` finds it, world pins it, `apk audit` is clean for it, `apk add --upgrade
+#       musl` is a no-op, `apk add musl-dev` works, `apk del musl` is refused
 #   9. apk del leandros-base is refused by the wrapper
 #  10. as the regular user: sudo apk add jq works
 #
@@ -69,6 +72,18 @@ run "sha256sum /lib/ld-musl-$ARCH.so.1 /usr/bin/git; /usr/bin/git --version" 120
 grep -E '^[0-9a-f]{64}' "$OUT/s8.log" > "$OUT/sums.after"
 cmp -s "$OUT/sums.before" "$OUT/sums.after" && ok "checksums unchanged" || bad "checksums changed"
 grep -q 'git version' "$OUT/s8.log" && ok "git works" || bad "git"
+
+step "8b real musl package"
+WANT_LD=$(PYTHONPATH=scripts python3 -c "import apkdb,hashlib,sys;print(hashlib.sha256(apkdb.apk_file('ports/apk/out/$ARCH/musl.apk','lib/ld-musl-$ARCH.so.1')).hexdigest())" 2>/dev/null)
+run "sha256sum /lib/ld-musl-$ARCH.so.1; readlink /lib/libc.musl-$ARCH.so.1 /usr/lib/libc.so; /usr/sbin/apk.static info -e musl; cat /etc/apk/world; echo audit_begin; /usr/sbin/apk.static audit 2>&1; echo audit_end;$APK add --upgrade musl; echo up_rc=\$?; $APK add musl-dev; echo dev_rc=\$?; $APK del musl; echo delmusl_rc=\$?; /lib/ld-musl-$ARCH.so.1 2>&1 | head -1" 600 > "$OUT/s8b.log" 2>&1
+[ -n "$WANT_LD" ] && grep -q "^$WANT_LD" "$OUT/s8b.log" && ok "loader == pinned Alpine musl" || bad "loader sha"
+grep -q "^ld-musl-$ARCH.so.1" "$OUT/s8b.log" && grep -q 'lib/ld-musl-'"$ARCH"'.so.1$' "$OUT/s8b.log" && ok "symlinks" || bad "symlinks"
+grep -qx 'musl' "$OUT/s8b.log" && grep -Eqx 'musl(=1.2.5-r12)?' "$OUT/s8b.log" && ok "musl installed + pinned" || bad "musl info/world"
+! sed -n '/audit_begin/,/audit_end/p' "$OUT/s8b.log" | grep -Eq 'lib/(ld-musl|libc.musl)' && ok "apk audit clean for musl" || bad "audit musl"
+grep -q 'up_rc=0' "$OUT/s8b.log" && ! grep -Eq '(Installing|Upgrading|Downgrading) musl \('"$OUT/s8b.log" && ok "upgrade musl no-op" || bad "upgrade musl"
+grep -q 'dev_rc=0' "$OUT/s8b.log" && ok "apk add musl-dev works" || bad "musl-dev"
+grep -q 'delmusl_rc=1' "$OUT/s8b.log" && ok "del musl refused" || bad "del musl"
+grep -q 'musl libc' "$OUT/s8b.log" && ok "loader still runs" || bad "loader run"
 
 step "9 wrapper refuses leandros-base"
 run "$APK del leandros-base; echo refuse_rc=\$?" 60 > "$OUT/s9.log" 2>&1

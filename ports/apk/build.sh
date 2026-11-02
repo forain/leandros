@@ -9,6 +9,11 @@
 #   usr/sbin/claude-code-install     installs the Claude Code CLI (a musl Bun
 #                                    binary) into an Alpine root; /bin/claude
 #                                    (userland/claude-run) runs it
+#   musl.apk                         Alpine's musl-1.2.5-r12 .apk, kept RAW (host-side
+#                                    only, not overlaid): mkfs-f2fs-populated.py
+#                                    (LEANDROS_LIBC=alpine) packs its ld-musl as the
+#                                    image's libc and scripts/apkdb.py derives the
+#                                    installed-db record from it
 #   etc/apk/keys/*.rsa.pub           alpine-keys: the trust root apk verifies
 #                                    every APKINDEX and package against
 #   etc/apk/repositories             Alpine 3.21 main + community
@@ -17,7 +22,7 @@
 #                                    OpenSSL/rustls-native client) can verify
 #                                    https:// — the image had no CA store
 #
-# Nothing is compiled and nothing runs in a container: the three .apk files are
+# Nothing is compiled and nothing runs in a container: the pinned .apk files are
 # fetched over https from dl-cdn.alpinelinux.org into $LEANDROS_APK_CACHE
 # (default ~/.cache/leandros/apk/<arch>/) once, and unpacked with tar (an .apk
 # is concatenated gzip'ed tar segments). apk-tools-static and alpine-keys are
@@ -35,6 +40,7 @@ REL=v3.21
 APK_TOOLS_VER=2.14.6-r3
 ALPINE_KEYS_VER=2.5-r0
 BUSYBOX_VER=1.37.0-r14
+MUSL_VER=1.2.5-r12
 pin() {  # pin <arch> <pkg-ver> -> expected sha256 (empty: unpinned)
   case "$1/$2" in
     x86_64/apk-tools-static-2.14.6-r3)  echo f0e0d34d6a8f1f9d8704bae6612b4627b96f13cd20db759e9b43085135cd234f ;;
@@ -43,6 +49,8 @@ pin() {  # pin <arch> <pkg-ver> -> expected sha256 (empty: unpinned)
     aarch64/alpine-keys-2.5-r0)         echo a70d3c55ee676d7d670714aa729285d5ab6fcf18146eb03e05319098bcb715c0 ;;
     x86_64/busybox-static-1.37.0-r14)   echo feef45f02f31ee30b6b47eed9b643a0f99e63a21a08a90e7c680066a712405bd ;;
     aarch64/busybox-static-1.37.0-r14)  echo 6fd7ea97062beb51fa785ba858f823e1dfe4daf6bfa91ff4d5359b1061988c69 ;;
+    x86_64/musl-1.2.5-r12)              echo abfcfe822d37bb6fa621d7d682e26eba95152c642dc5619b768b4e4a9789133e ;;
+    aarch64/musl-1.2.5-r12)             echo f37e73d41880bbc653b771c7d8962c8739bff773503f5155c14fab1bd7c4d52f ;;
   esac
 }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
@@ -79,14 +87,17 @@ for ARCH in $ARCHS; do
 
   T="$OUT/$ARCH.new"
   rm -rf "$T"; mkdir -p "$T/x" "$T/usr/sbin" "$T/etc/apk/keys" "$T/etc/ssl/certs" "$T/lib/apk/db"
-  for PV in "apk-tools-static-$APK_TOOLS_VER" "alpine-keys-$ALPINE_KEYS_VER" "ca-certificates-bundle-$CAVER" "busybox-static-$BUSYBOX_VER"; do
+  for PV in "apk-tools-static-$APK_TOOLS_VER" "alpine-keys-$ALPINE_KEYS_VER" "ca-certificates-bundle-$CAVER" "busybox-static-$BUSYBOX_VER" "musl-$MUSL_VER"; do
     F=$(fetch "$ARCH" "$PV.apk")
     WANT=$(pin "$ARCH" "$PV")
     GOT=$(sha256 "$F")
     if [ -n "$WANT" ] && [ "$GOT" != "$WANT" ]; then
       echo "❌ sha256 mismatch for $ARCH/$PV.apk (got $GOT, want $WANT)"; rm -f "$F"; exit 1
     fi
-    tar -xzf "$F" -C "$T/x" 2>/dev/null || true
+    case "$PV" in
+      musl-*) cp "$F" "$T/musl.apk" ;;          # raw, never unpacked into the tree
+      *) tar -xzf "$F" -C "$T/x" 2>/dev/null || true ;;
+    esac
   done
   cp "$T/x/sbin/apk.static" "$T/usr/sbin/apk.static"
   chmod 0755 "$T/usr/sbin/apk.static"
@@ -111,14 +122,16 @@ for ARCH in $ARCHS; do
   done
   chmod 0755 "$T/usr/sbin/apk" "$T/usr/sbin/busybox.static"
   printf 'leandros-base\n' > "$T/etc/apk/world"
+  # host-side: the world mkfs installs for LEANDROS_LIBC=alpine (musl pinned)
+  printf 'leandros-base\nmusl=%s\n' "$MUSL_VER" > "$T/world.alpine"
   printf '%s\n' "$ARCH" > "$T/etc/apk/arch"
   : > "$T/lib/apk/db/lock"; : > "$T/lib/apk/db/triggers"
   head -c 1024 /dev/zero > "$T/lib/apk/db/scripts.tar"
   chmod 0644 "$T/etc/apk/world" "$T/etc/apk/arch" "$T/lib/apk/db/lock" "$T/lib/apk/db/triggers" "$T/lib/apk/db/scripts.tar"
   chmod 0644 "$T"/etc/apk/keys/* "$T/etc/apk/repositories" "$T/etc/ssl/cert.pem" "$T/etc/ssl/certs/ca-certificates.crt"
   rm -rf "$T/x"
-  printf 'apk-tools-static-%s alpine-keys-%s ca-certificates-bundle-%s busybox-static-%s\n' \
-    "$APK_TOOLS_VER" "$ALPINE_KEYS_VER" "$CAVER" "$BUSYBOX_VER" > "$T/APK-VERSION"
+  printf 'apk-tools-static-%s alpine-keys-%s ca-certificates-bundle-%s busybox-static-%s musl-%s\n' \
+    "$APK_TOOLS_VER" "$ALPINE_KEYS_VER" "$CAVER" "$BUSYBOX_VER" "$MUSL_VER" > "$T/APK-VERSION"
   rm -rf "$OUT/$ARCH"; mv "$T" "$OUT/$ARCH"
   touch "$OUT/$ARCH/.stamp"
   echo "✅ $OUT/$ARCH: $(cat "$OUT/$ARCH/APK-VERSION")"
