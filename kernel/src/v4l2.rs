@@ -220,7 +220,8 @@ pub(crate) fn unregister_camera(ctx: usize) {
 
 /// True when /dev/video0 is open on a camera of `owner` (a busy pin for rmmod).
 pub(crate) fn open_by(owner: KmodId) -> bool {
-    DEV.lock().cam.as_ref().map_or(false, |c| c.owner == owner)
+    let d = DEV.lock();
+    d.owner != 0 && d.cam.as_ref().map_or(false, |c| c.owner == owner)
 }
 
 /// Registered cameras (ktest).

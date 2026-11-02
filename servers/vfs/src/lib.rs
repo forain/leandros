@@ -2596,6 +2596,51 @@ pub fn mounting_device(device: &str) -> bool {
     MOUNT_PINS.lock().iter().any(|d| d.strip_prefix("/dev/").unwrap_or(d) == w)
 }
 
+/// Queued SCM_RIGHTS copies of block-device fds, per registry slot (leaf lock; changed only
+/// under `FD_COPY_GATE` shared, read under `scan_gate()`).
+static BLK_INFLIGHT: Mutex<[u16; block::MAX_BDEV]> = Mutex::new([0u16; block::MAX_BDEV]);
+
+fn blk_inflight_add(kind: &VnodeKind, inc: bool) {
+    if let VnodeKind::BlockDev { dev, .. } = *kind {
+        if let Some(c) = BLK_INFLIGHT.lock().get_mut(dev as usize) {
+            *c = if inc { c.saturating_add(1) } else { c.saturating_sub(1) };
+        }
+    }
+}
+
+/// Why the block-device family rooted at `paths` ("/dev/x" or "x": a disk and its partitions)
+/// cannot lose its driver, or None. A busy pin for module unload (D6/D9). Matches by BDEVS slot
+/// (the disk, every `Backing::Part` whose parent is one of them, so BLKPG partitions count) and
+/// not by name. Checks, in order: a filesystem mounting, a mount on any family member, an open fd
+/// (any process table, or queued in SCM_RIGHTS), a loop bound directly to a family member.
+/// Scans run with the owner's Upper gate closed; an open that races it fails EIO (ENXIO once the
+/// slot is retired) rather than reaching freed module code, even if the unload is then refused.
+pub fn block_family_busy(paths: &[&str]) -> Option<&'static str> {
+    let mut roots: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
+    for p in paths {
+        if mounting_device(p) { return Some("mounting"); }
+        let mut path = alloc::string::String::from("/dev/");
+        path.push_str(p.strip_prefix("/dev/").unwrap_or(p));
+        if let Some(d) = block::lookup_dev_node(path.as_bytes()) { roots.push(d); }
+    }
+    let fam = block::family_slots(&roots);
+    let mounts = list_mounts();
+    for m in mounts.iter().filter(|m| m.in_use) {
+        let w = m.device.strip_prefix("/dev/").unwrap_or(m.device);
+        if fam.iter().any(|(_, n)| n.as_str() == w) { return Some("mounted"); }
+    }
+    {
+        let _gate = scan_gate();
+        let fl = BLK_INFLIGHT.lock();
+        if fam.iter().any(|(d, _)| fl.get(*d as usize).copied().unwrap_or(0) != 0) { return Some("block device open"); }
+        drop(fl);
+        let open = any_fd(|f| matches!(f.kind, VnodeKind::BlockDev { dev, .. } if fam.iter().any(|(d, _)| *d == dev)));
+        if open { return Some("block device open"); }
+    }
+    if block::loop_bound_on(&fam) { return Some("loop device bound"); }
+    None
+}
+
 /// Snapshot of every currently registered mount (for `/proc/mounts`, `mount`, `lsblk`).
 pub fn list_mounts() -> [MountEntry; MAX_MOUNTS] {
     *MOUNTS.lock()
@@ -5473,6 +5518,7 @@ fn mount_inflight(port: u32, file_id: u32) -> bool {
 
 /// Take an in-flight reference if `kind` is a tmpfs fd. No-op otherwise.
 fn tmp_inflight_inc(kind: &VnodeKind) {
+    blk_inflight_add(kind, true);
     if let VnodeKind::MountedFile { port, file_id } = *kind { mount_inflight_add(port, file_id, true); }
     if let VnodeKind::TmpFile { idx, .. } = *kind {
         if idx < MAX_TMP_FILES {
@@ -5488,6 +5534,7 @@ fn tmp_inflight_inc(kind: &VnodeKind) {
 /// must run *after* the descriptor is installed in the receiver's table, so the
 /// slot is never unreferenced for even an instant.
 fn tmp_inflight_dec(kind: &VnodeKind) {
+    blk_inflight_add(kind, false);
     if let VnodeKind::MountedFile { port, file_id } = *kind { mount_inflight_add(port, file_id, false); }
     if let VnodeKind::TmpFile { idx, .. } = *kind {
         if idx < MAX_TMP_FILES {

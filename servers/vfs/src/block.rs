@@ -377,6 +377,26 @@ pub fn lookup_dev_node(path: &[u8]) -> Option<u16> {
     find_name(&synced(), name)
 }
 
+/// Registry slots (with names) of `roots` and of every partition whose parent is one of them,
+/// one pass. BLKPG-created partitions live only here.
+pub fn family_slots(roots: &[u16]) -> alloc::vec::Vec<(u16, alloc::string::String)> {
+    let b = BDEVS.lock();
+    let mut out = alloc::vec::Vec::new();
+    for (i, e) in b.iter().enumerate() {
+        if !e.in_use { continue; }
+        let hit = roots.contains(&(i as u16))
+            || matches!(e.backing, Backing::Part { parent, .. } if roots.contains(&(parent as u16)));
+        if hit { out.push((i as u16, alloc::string::String::from_utf8_lossy(e.name()).into_owned())); }
+    }
+    out
+}
+
+/// True when a bound loop device is backed directly by one of `fam`.
+pub fn loop_bound_on(fam: &[(u16, alloc::string::String)]) -> bool {
+    LOOPS.lock().iter().any(|l| l.bound
+        && matches!(l.backing, VnodeKind::BlockDev { dev, .. } if fam.iter().any(|(d, _)| *d == dev)))
+}
+
 /// Name of the `idx`-th registry entry, for enumerating `/dev`.
 pub fn dev_node_name(idx: usize, out: &mut [u8; NAME_MAX]) -> Option<usize> {
     let b = synced();
