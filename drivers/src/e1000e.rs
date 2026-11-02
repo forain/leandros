@@ -405,7 +405,12 @@ impl Mmio {
 // ── shared state ────────────────────────────────────────────────────────────
 
 static BASE: AtomicUsize = AtomicUsize::new(0);
+/// The bound PCI function (for `shutdown`'s ring flush) and whether it is a PCH (I219) part.
+static FUNC: Mutex<Option<PciFunction>> = Mutex::new(None);
+static IS_PCH: AtomicBool = AtomicBool::new(false);
 static RUNNING: AtomicBool = AtomicBool::new(false);
+/// True when no driver thread is inside bring_up or its loop (set by the thread on exit; true when none was spawned).
+static THREAD_DONE: AtomicBool = AtomicBool::new(true);
 static PRESENT: AtomicBool = AtomicBool::new(false);
 /// Bit 0 link up, bit 1 full duplex, bits 8.. Mbit/s.
 static LINK: AtomicU32 = AtomicU32::new(0);
@@ -533,7 +538,7 @@ impl Hw {
         if self.sem_held { return Ok(()); }
         let mut ext = self.m.r32(EXTCNF_CTRL);
         let mut waited = 0;
-        while ext & EXTCNF_SWFLAG != 0 && waited < 100 {
+        while ext & EXTCNF_SWFLAG != 0 && waited < 100 && !sched::kthread::should_stop() {
             udelay(1000);
             waited += 1;
             ext = self.m.r32(EXTCNF_CTRL);
@@ -547,6 +552,7 @@ impl Hw {
         self.m.w32(EXTCNF_CTRL, ext | EXTCNF_SWFLAG);
         let limit = if self.pch() { 1000 } else { 20 };
         for _ in 0..limit {
+            if sched::kthread::should_stop() { break; }
             if self.m.r32(EXTCNF_CTRL) & EXTCNF_SWFLAG != 0 { self.sem_held = true; return Ok(()); }
             udelay(1000);
         }
@@ -728,7 +734,7 @@ impl Hw {
             let mut i = 0;
             let mut ok = true;
             while self.m.r32(FWSM) & hw::FWSM_ULP_CFG_DONE != 0 {
-                if i == 250 { ok = false; break; }
+                if i == 250 || sched::kthread::should_stop() { ok = false; break; }
                 i += 1;
                 msleep(10);
             }
@@ -1119,15 +1125,36 @@ impl Hw {
     /// before a reset, or the MAC can enter a unit hang only a PCI reset
     /// clears. Caller holds the ring lock (`r`).
     fn flush_desc_rings(&mut self, r: &mut Rings) -> String {
+        FlushCtx { m: self.m, func: self.func }.flush(r)
+    }
+}
+
+/// What the ring flush needs, so `shutdown()` can run it without a `Hw`.
+struct FlushCtx { m: Mmio, func: PciFunction }
+
+impl FlushCtx {
+    /// e1000_flush_desc_rings (SPT+): the rings must be empty before a reset, or the MAC can
+    /// enter a unit hang only a PCI reset clears. Caller holds the ring lock (`r`). State left by
+    /// a previous driver generation (FLUSH_DESC_REQUIRED, TDBA stale or TDLEN 0) is handled by
+    /// pointing TDBA/TDLEN at OUR ring first, so the flush never targets freed memory.
+    fn flush(&self, r: &mut Rings) -> String {
         self.m.set(FEXTNVM11, FEXTNVM11_DISABLE_MULR_FIX);
         let tdlen = self.m.r32(TDLEN);
         let hang = self.func.read16(PCICFG_DESC_RING_STATUS);
-        if hang & FLUSH_DESC_REQUIRED == 0 || tdlen == 0 {
+        if hang & FLUSH_DESC_REQUIRED == 0 {
             return format!("not needed (DESC_RING_STATUS {:04x}, TDLEN {})", hang, tdlen);
         }
         let tdba = self.m.r32(TDBAL) as u64 | (self.m.r32(TDBAH) as u64) << 32;
-        if tdba != r.tx_desc_phys {
-            return format!("REQUIRED but TDBA {:#x} is not our ring: skipped", tdba);
+        if tdlen == 0 || tdba != r.tx_desc_phys {
+            elog!("ring flush: stale state from a previous generation (TDBA {:#x} TDLEN {} DESC_RING_STATUS {:04x}): pointing TDBA/TDLEN at the new TX ring first", tdba, tdlen, hang);
+            // TX must be off while the ring registers are rewritten.
+            self.m.clr(TCTL, TCTL_EN);
+            self.m.flush();
+            self.m.w32(TDBAL, r.tx_desc_phys as u32);
+            self.m.w32(TDBAH, (r.tx_desc_phys >> 32) as u32);
+            self.m.w32(TDLEN, (NUM_TX * 16) as u32);
+            self.m.w32(TDH, 0);
+            self.m.w32(TDT, 0);
         }
         // TX: one dummy 512-byte descriptor pointing at the ring itself.
         self.m.set(TCTL, TCTL_EN);
@@ -1165,7 +1192,9 @@ impl Hw {
         }
         s
     }
+}
 
+impl Hw {
     /// e1000_initialize_hw_bits_ich8lan.
     fn init_hw_bits(&mut self) {
         if !self.pch() {
@@ -1812,6 +1841,8 @@ pub fn init(cmdline: &str) {
     elog!("rings: RX {} x {} B at {:#x}, TX {} x {} B at {:#x}", NUM_RX, BUF_SIZE, rings.rx_desc_phys, NUM_TX, BUF_SIZE, rings.tx_desc_phys);
     *RINGS.lock() = Some(rings);
     BASE.store(va, Ordering::SeqCst);
+    *FUNC.lock() = Some(func);
+    IS_PCH.store(pch, Ordering::SeqCst);
 
     let irq_desc = if !hwst.opts.msi {
         String::from("none (e1000e.msi=0, polled)")
@@ -1859,7 +1890,9 @@ pub fn init(cmdline: &str) {
     });
     PRESENT.store(true, Ordering::SeqCst);
 
-    if sched::kthread::spawn("e1000e", move || driver_thread(hwst)).is_none() {
+    THREAD_DONE.store(false, Ordering::SeqCst);
+    if sched::kthread::spawn("e1000e", move || { driver_thread(hwst); THREAD_DONE.store(true, Ordering::SeqCst); }).is_none() {
+        THREAD_DONE.store(true, Ordering::SeqCst);
         log("could not start the driver thread; NIC stays down");
     }
 }
@@ -1897,6 +1930,7 @@ fn bring_up(hw: &mut Hw) {
     if hw.pch() {
         let r = hw.phy_workarounds();
         hw.step("phy_init", r);
+        if sched::kthread::should_stop() { return; }
     }
     // PHY id (also for the 82574).
     if hw.phy_id == 0 {
@@ -1917,11 +1951,19 @@ fn bring_up(hw: &mut Hw) {
     hw.step("phy_id", format!("{:08x} {}{}", pid, hw::phy_name(pid),
                               if hw.pch() && pid & hw::PHY_REVISION_MASK != hw::I217_E_PHY_ID { " (UNEXPECTED for an I219)" } else { "" }));
     if let Some(i) = INFO.lock().as_mut() { i.phy_id = pid; }
+    if sched::kthread::should_stop() { return; }
+    // A previous generation may have left the MAC mid-DMA (TDLEN set, FLUSH_DESC_REQUIRED):
+    // flush against our own (valid) rings before the first MAC reset.
+    if hw.pch() {
+        let s = match RINGS.lock().as_mut() { Some(rg) => hw.flush_desc_rings(rg), None => String::from("-") };
+        hw.step("pre_flush", s);
+    }
     // Known state before reading the NVM (as Linux's probe).
     let r = hw.reset_hw();
     hw.step("reset_hw", r);
     let nvm = hw.nvm_summary();
     hw.step("nvm", nvm.clone());
+    if sched::kthread::should_stop() { return; }
     if let Some(i) = INFO.lock().as_mut() { i.nvm = nvm; }
     let k1 = hw.k1_state();
     hw.step("k1", k1.clone());
@@ -1929,6 +1971,7 @@ fn bring_up(hw: &mut Hw) {
     // e1000e_reset + open.
     let r = hw.full_reset(None, &mac);
     hw.step("reset", r);
+    if sched::kthread::should_stop() { return; }
     hw.pre_configure();
     {
         let mut g = RINGS.lock();
@@ -1941,6 +1984,7 @@ fn bring_up(hw: &mut Hw) {
 
 fn driver_thread(mut hw: Hw) {
     bring_up(&mut hw);
+    if sched::kthread::should_stop() { return; }
     let t_up = now_ms();
     let mut last_up = false;
     let mut reported_nolink = 0usize;
@@ -2264,7 +2308,24 @@ pub fn info_lines(out: &mut String) {
 /// (`e1000e_release_hw_control`). The caller clears bus mastering afterwards
 /// (Linux: `pci_clear_master`). No waits. `None` when the driver never bound
 /// a device.
-pub fn shutdown() -> Option<String> {
+pub fn shutdown() -> Option<String> { quiesce(false) }
+
+/// Module unload (rmmod), run with bus mastering still on and the gate's stopping flag set:
+/// RUNNING off, wait (bounded) for the driver thread to leave bring_up and its loop so nothing
+/// can re-enable RX/TX after the flush, then the same quiesce with a blocking ring lock and
+/// DRV_LOAD left alone (the next generation's reset sets it again; the ME never gets the MAC).
+#[allow(dead_code)]
+pub fn unload_quiesce() -> Option<String> {
+    if BASE.load(Ordering::Acquire) == 0 { return None; }
+    RUNNING.store(false, Ordering::SeqCst);
+    LINKMON.notify();
+    let mut waited = 0u32;
+    while !THREAD_DONE.load(Ordering::SeqCst) && waited < 3000 { msleep(1); waited += 1; LINKMON.notify(); }
+    if !THREAD_DONE.load(Ordering::SeqCst) { elog!("unload: driver thread still running after 3 s; flushing anyway"); }
+    quiesce(true)
+}
+
+fn quiesce(unload: bool) -> Option<String> {
     let base = BASE.load(Ordering::Acquire);
     if base == 0 { return None; }
     RUNNING.store(false, Ordering::SeqCst);
@@ -2273,10 +2334,39 @@ pub fn shutdown() -> Option<String> {
     if m.r32(STATUS) == !0 { return Some(String::from("e1000e: registers read all-ones; left alone")); }
     m.w32(IMC, !0);
     m.clr(RCTL, RCTL_EN);
-    m.clr(TCTL, TCTL_EN);
-    m.clr(CTRL_EXT, CTRL_EXT_DRV_LOAD);
     m.flush();
-    Some(format!("e1000e: interrupts masked, RX/TX off, DRV_LOAD released (CTRL_EXT {:08x})", m.r32(CTRL_EXT)))
+    udelay(10);
+    // Linux order: RX off, flush the descriptor rings (SPT+) while bus mastering is still on,
+    // TX off, then the MAC reset, so the DMA engine is idle and no ring address is left live.
+    let mut flush = String::from("-");
+    if IS_PCH.load(Ordering::SeqCst) {
+        let func = *FUNC.lock();
+        if let Some(func) = func {
+            if unload {
+                // Unload: the flush must not be skipped; retry the lock for up to 1 s.
+                let mut tries = 0;
+                loop {
+                    if let Some(mut g) = RINGS.try_lock() {
+                        flush = match g.as_mut() { Some(r) => FlushCtx { m, func }.flush(r), None => String::from("no rings") };
+                        break;
+                    }
+                    tries += 1;
+                    if tries > 1000 { flush = String::from("SKIPPED (ring lock busy 1 s)"); elog!("unload: ring flush skipped, ring lock busy"); break; }
+                    msleep(1);
+                }
+            } else if let Some(r) = RINGS.try_lock().as_mut().and_then(|g| g.as_mut()) {
+                flush = FlushCtx { m, func }.flush(r);
+            }
+        }
+    }
+    m.clr(TCTL, TCTL_EN);
+    m.flush();
+    // No MAC reset here: the next init's reset_hw does it, after its own ring flush.
+    m.w32(IMC, !0);
+    if !unload { m.clr(CTRL_EXT, CTRL_EXT_DRV_LOAD); }
+    m.flush();
+    Some(format!("e1000e: interrupts masked, RX off, ring flush {}, TX off, DRV_LOAD {} (CTRL_EXT {:08x})",
+                 flush, if unload { "kept" } else { "released" }, m.r32(CTRL_EXT)))
 }
 
 /// Module unload only: give the descriptor pages and RX/TX buffer pages back to the page

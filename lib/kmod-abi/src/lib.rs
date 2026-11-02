@@ -225,6 +225,8 @@ pub struct KPmOps {
     pub shutdown: Option<KPmFn>,
     pub kexec_quiesce: Option<KPmFn>,
     pub resume_check: Option<KPmFn>,
+    /// Module unload only (rmmod), run before the device goes inert; never at reboot.
+    pub unload_quiesce: Option<KPmFn>,
 }
 /// Interrupt handler: returns 1 when handled, 0 when the interrupt was not the device's.
 pub type KIrqHandler = extern "C" fn(ctx: usize) -> u32;

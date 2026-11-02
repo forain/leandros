@@ -104,9 +104,12 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
         return EBUSY;
     }
     registry::unbind_upper(m.id);
+    // The driver thread must see should_stop before the hook runs, or it can re-enable RX/TX after the flush.
+    g.stopping.store(true, Ordering::SeqCst);
+    // Driver-ordered stop while bus mastering is still on (RX/TX off, ring flush, MAC reset).
+    super::exports::pm_unload_quiesce(m.id);
     // D3 step 3: the device goes inert (INTx, MSI/MSI-X, bus mastering off) before the lower drain and exit().
     super::lower::quiesce_pci(m.id);
-    g.stopping.store(true, Ordering::SeqCst);
     if !g.close_and_drain(Class::Lower, 5000) { return zombie(m.id, s, "lower drain timeout"); }
     // exit() on its own thread so a hang only costs a Zombie.
     let done = alloc::sync::Arc::new(AtomicBool::new(false));

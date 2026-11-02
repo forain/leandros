@@ -66,7 +66,7 @@ fn init() -> i32 {
     let ops = kmod_kapi::pm::KPmOps {
         size: core::mem::size_of::<kmod_kapi::pm::KPmOps>() as u32, phase: kmod_kapi::pm::pm_phase::GPU,
         suspend: Some(pm_suspend), resume: Some(pm_resume), freeze: None, thaw: None, shutdown: None,
-        kexec_quiesce: Some(pm_kexec), resume_check: None,
+        kexec_quiesce: Some(pm_kexec), resume_check: None, unload_quiesce: None,
     };
     static OPS: spin::Once<kmod_kapi::pm::KPmOps> = spin::Once::new();
     let _ = kmod_kapi::pm::register2(OPS.call_once(|| ops), 0);

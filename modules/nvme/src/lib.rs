@@ -44,7 +44,7 @@ static PM: kmod_kapi::pm::KPmOps = kmod_kapi::pm::KPmOps {
     size: core::mem::size_of::<kmod_kapi::pm::KPmOps>() as u32,
     phase: kmod_kapi::pm::pm_phase::BLOCK,
     suspend: None, resume: None, freeze: None, thaw: None,
-    shutdown: Some(pm_shutdown), kexec_quiesce: Some(pm_kexec), resume_check: None,
+    shutdown: Some(pm_shutdown), kexec_quiesce: Some(pm_kexec), resume_check: None, unload_quiesce: None,
 };
 
 static DONE: AtomicBool = AtomicBool::new(false);
