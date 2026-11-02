@@ -154,18 +154,21 @@ FUNC sizes are not compared, Alpine builds `-Os`). Layout:
 `LEANDROS_LIBC=zig` rebuilds the previous image exactly (three hard links to our libc,
 fake `musl=1.2.5-r99` provide). `apk del musl` is refused; `musl` is pinned in
 `/etc/apk/world`, so any bump (3.24 / musl 1.2.6) needs the full test set. The build sysroot,
-the soname rewrite and the SSP shim below are unchanged (follow-up). Alpine's loader is
+the Firefox and git ports still apply the rewrite below (a parallel lane replaces them). Alpine's loader is
 stripped; install `musl-dbg` to symbolize it.
 
-Alpine's prebuilt packages (Firefox, PipeWire, the portal frontend) link `libc.musl-<arch>.so.1`;
-their ELFs are rewritten to the shipped `libc.so` soname. aarch64 GCC reads the stack canary
-from a global `__stack_chk_guard`. The original `libc.so` link did not export it: zig's
-compiler_rt carries a WEAK HIDDEN copy, and the linker kept the most restrictive visibility
-when merging it with musl's. `scripts/musl/relink-libc.sh` now localises compiler_rt's SSP
-symbols before the `dynamic.list` link and refuses an output that does not export
-`__stack_chk_guard` / `__stack_chk_fail`. The older workaround stays harmless: a tiny
-`libleandros_ssp.so.1` defining the guard is added as a `DT_NEEDED` to the libraries that
-import it, and the build fails if any shipped ELF still imports the guard without the shim.
+Alpine's prebuilt packages link `libc.musl-<arch>.so.1`, which is now a symlink to Alpine's own
+loader, so the repackaged PipeWire, GStreamer, portal frontend and GPU Mesa stage ship their ELFs
+unmodified: no soname rewrite and no `libleandros_ssp.so.1` `DT_NEEDED` injection. The loader
+exports `__stack_chk_guard` (aarch64 GCC reads the canary from that global), and each of those
+build scripts fails if the Alpine `ld-musl` it builds against does not export it. The Firefox
+and git ports still rewrite to `libc.so` and add the shim until they move to vanilla apk packages.
+`libleandros_ssp.so.1` stays in the image because older in-tree binaries may `DT_NEEDED` it.
+
+With `LEANDROS_LIBC=zig` the zig libc has no SONAME, but musl's loader maps any `libc.*` name to
+the loader itself, so an unmodified `libc.musl-<arch>.so.1` `DT_NEEDED` still resolves there.
+The zig libc exports `__stack_chk_guard` via `scripts/musl/relink-libc.sh`, which refuses an
+output without it.
 
 ## Threading (pthreads)
 

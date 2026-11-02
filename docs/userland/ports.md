@@ -14,7 +14,7 @@ Three shapes recur, and each port's recipe says which it uses:
 |---|---|---|
 | **Cross-built from source, static musl** | busd, greetd, `leandros-sysbus`, `mkfs.fat`, `mkfs.xfs`, brush, coreutils | `cargo +nightly` for `*-unknown-linux-musl`, `-C relocation-model=static`, Rust's or zig's musl ([libc.md](libc.md#static-musl)); each port's `build.sh` owns its toolchain details |
 | **Cross-built from source, dynamic musl** | COSMIC, Mesa, libinput/xkbcommon/pixman, pop-launcher, xdg-desktop-portal-cosmic | the shared toolchain in the artifacts tree (`build-rust.sh`, `gen-cargo-config.sh`, merged sysroots); meson cross files for C libraries |
-| **Repackaged from Alpine 3.21** | Firefox, PipeWire + WirePlumber, the xdg-desktop-portal frontend, the GPU Mesa stage | `apk add` inside Alpine 3.21 of the target architecture (a podman/docker container on the host, a chroot staged with `apk.static` inside LeandrOS — see [In-guest builds](#in-guest-builds-apk-without-containers)), collect the `DT_NEEDED` closure, rewrite the ELFs for the guest (libc soname, the `__stack_chk_guard` shim), write a rootfs-shaped tree to `ports/<name>/out/<arch>/` that mkfs overlays |
+| **Repackaged from Alpine 3.21** | Firefox, PipeWire + WirePlumber, the xdg-desktop-portal frontend, the GPU Mesa stage | `apk add` inside Alpine 3.21 of the target architecture (a podman/docker container on the host, a chroot staged with `apk.static` inside LeandrOS — see [In-guest builds](#in-guest-builds-apk-without-containers)), collect the `DT_NEEDED` closure, keep the ELFs as Alpine built them (no soname rewrite or SSP shim for PipeWire, GStreamer, the portal and the GPU Mesa stage; Firefox and git still rewrite), write a rootfs-shaped tree to `ports/<name>/out/<arch>/` that mkfs overlays |
 
 Repackaging was chosen where compiling the upstream C/C++ stack would have been the whole
 project (Gecko, GLib): the same binaries run on Linux, and LeandrOS's job is to be Linux enough
@@ -463,8 +463,7 @@ Kernel defects the bring-up found:
 ## GStreamer (ports/gstreamer)
 
 Alpine 3.21 repackage, same recipe as `ports/pipewire` (`build-in-alpine.sh` in a container of the target
-architecture, closure walk, `libc.musl-*` rewritten to `libc.so`, `libleandros_ssp.so.1` for
-`__stack_chk_guard`). It stages `usr/lib/gstreamer-1.0` (53 plugins: no alsa/pulse/v4l2/soup/gtk/gl),
+architecture, closure walk; ELFs unmodified, the runtime libc is Alpine musl). It stages `usr/lib/gstreamer-1.0` (53 plugins: no alsa/pulse/v4l2/soup/gtk/gl),
 `gst-plugin-scanner`, and `clip-mpeg4-vorbis.mkv` (30 s, MPEG-4 + Vorbis, generated in the container).
 GLib and FFmpeg are byte-identical to the copies the Firefox and PipeWire ports already stage, so the
 image grows by about 46 MiB (aarch64; the staged tree is 119 MiB before overlap). The same script

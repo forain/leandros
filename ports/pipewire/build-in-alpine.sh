@@ -133,18 +133,10 @@ esac
   $CC -shared -fPIC -fno-stack-protector -nostdlib -Wl,-soname,libleandros_ssp.so.1 \
     -o "$S/usr/lib/libleandros_ssp.so.1" /src/ssp_guard.c
   find "$S" -type f | while read -r f; do if file -b "$f" | grep -q '^ELF'; then echo "$f"; fi; done > /tmp/all-elves
-  for f in $(cat /tmp/all-elves); do
-    case "$f" in */libleandros_ssp.so.1) continue ;; esac
-    if readelf -d "$f" | grep -q "libc.musl-$ARCH.so.1"; then
-      patchelf --replace-needed "libc.musl-$ARCH.so.1" libc.so "$f"
-    fi
-    if readelf --dyn-syms -W "$f" | awk '$7=="UND"{print $8}' | sed 's/@.*//' | grep -qx '__stack_chk_guard'; then
-      patchelf --add-needed libleandros_ssp.so.1 "$f"
-    fi
-  done
-  for f in $(cat /tmp/all-elves); do
-    if readelf -d "$f" | grep -q 'libc\.musl'; then echo "musl soname still present: $f"; exit 5; fi
-  done
+  # Runtime libc is Alpine musl itself and exports __stack_chk_guard: no soname
+  # rewrite and no libleandros_ssp injection. Guard: the libc we build against
+  # (same package as the runtime one) must export it.
+  readelf --dyn-syms -W /lib/ld-musl-$ARCH.so.1 | grep -qw __stack_chk_guard || { echo "libc does not export __stack_chk_guard"; exit 5; }
 
   # -- unresolved-symbol audit (same method as ports/portal) ------------------------
   img_lib() {

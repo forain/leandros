@@ -174,16 +174,6 @@ fi
   cc -shared -fPIC -fno-stack-protector -Wl,-soname,libleandros_ssp.so.1 \
     -o "$S/usr/lib/libleandros_ssp.so.1" /src/ssp_guard.c
   cd "$S/usr/lib"
-  for f in libvulkan.so.1 libzstd.so.1; do
-    if readelf --dyn-syms -W "$f" | awk '$7=="UND"{print $8}' | grep -qx '__stack_chk_guard'; then
-      patchelf --add-needed libleandros_ssp.so.1 "$f"; echo "ssp shim: $f"
-    fi
-  done
-  for f in $(find . ../bin -type f); do
-    if file "$f" | grep -q ELF; then
-      patchelf --replace-needed "libc.musl-$ARCH.so.1" libc.so "$f" 2>/dev/null || true
-    fi
-  done
   echo "== gallium drivers in the megadriver =="
   for d in zink virgl softpipe v3d iris; do
     printf '%s: %s\n' "$d" "$(strings libgallium-25.3.6.so | grep -c "^${d}_\|${d}_create_screen\|pipe_${d}_create_screen")"
@@ -206,13 +196,10 @@ fi
     cat "$S/usr/share/vulkan/icd.d/"intel_icd*.json
     NVKLIB="$NVKLIB libvulkan_intel.so"
   fi
-  echo "== NEEDED (musl soname must be gone) =="
+  echo "== NEEDED (libc.musl-<arch> NEEDED is kept: it resolves to Alpine's loader via symlink) =="
   for f in libgallium-25.3.6.so libEGL.so.1.0.0 libGLESv2.so.2.0.0 libgbm.so.1.0.0 gbm/dri_gbm.so libvulkan_virtio.so $NVKLIB libvulkan.so.1 libzstd.so.1 libleandros_ssp.so.1; do
     printf '%s: ' "$f"; readelf -d "$f" | awk '/NEEDED/{printf "%s ", $5} END{print ""}'
   done
-  if readelf -d libgallium-25.3.6.so libvulkan_virtio.so $NVKLIB libvulkan.so.1 | grep -q 'libc.musl'; then
-    echo "musl soname still present"; exit 4
-  fi
   # No toolchain-only library may leak into the ship-set's NEEDED lists.
   if readelf -d libgallium-25.3.6.so libvulkan_virtio.so $NVKLIB | grep -E 'NEEDED.*(libLLVM|libclang|libSPIRV|libLLVMSPIRV)'; then
     echo "toolchain library leaked into NEEDED"; exit 6
@@ -223,13 +210,10 @@ fi
   for f in libgallium-25.3.6.so libvulkan_virtio.so $NVKLIB; do
     readelf -n "$f" | grep -q 'Build ID' || { echo "no GNU build-id note: $f"; exit 7; }
   done
-  # Every shipped ELF that imports __stack_chk_guard must be able to find it.
-  for f in $(find . ../bin -type f); do
-    file "$f" | grep -q ELF || continue
-    if readelf --dyn-syms -W "$f" | awk '$7=="UND"{print $8}' | grep -qx '__stack_chk_guard'; then
-      readelf -d "$f" | grep -q 'libleandros_ssp' || { echo "unresolved __stack_chk_guard: $f"; exit 5; }
-    fi
-  done
+  # Runtime libc is Alpine musl itself and exports __stack_chk_guard: no soname
+  # rewrite and no libleandros_ssp injection. Guard: the libc we build against
+  # (same package as the runtime one) must export it.
+  readelf --dyn-syms -W /lib/ld-musl-$ARCH.so.1 | grep -qw __stack_chk_guard || { echo "libc does not export __stack_chk_guard"; exit 5; }
   # Never copy anything but a finished stage: an empty $S here once made
   # `cp -a "$S/."` copy the container's whole root (with /proc) into /out.
   [ -n "$S" ] && [ "$S" != / ] && [ -f "$S/usr/lib/libgallium-25.3.6.so" ] && [ -x "$S/usr/bin/gpuprobe" ]
