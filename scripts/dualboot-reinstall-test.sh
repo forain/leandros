@@ -107,6 +107,7 @@ SRC="$FXDIR/fxgap-$ARCH.img"
 df -g "$HOME" | awk 'NR==2 && $4 < 60 { exit 1 }' || fail "less than 60 GiB free"
 for f in "$SRC"*; do cp -c "$f" "$WORK/$(basename "$f" | sed "s/fxgap-$ARCH/disk/")"; done
 STICK="$WORK/stick.img"
+export LEANDROS_USB_ALLOW_GENERIC_GPU=1  # QEMU fixture: non-INTEL image is fine
 "$ROOT/scripts/write-usb.sh" "$ARCH" --image "$STICK" --gpt >"$WORK/write-usb.log" 2>&1 || { tail -5 "$WORK/write-usb.log"; fail "write-usb.sh"; }
 
 echo "== phase 1: v1a free install"
