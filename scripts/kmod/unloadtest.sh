@@ -6,6 +6,12 @@ cd "$(cd "$(dirname "$0")/../.." && pwd)"
 arch="${1:-aarch64}"; N="${UNLOAD_N:-50}"
 RT=.claude/skills/run-leandros/runtests.py
 export FFSESSION_OUT="${FFSESSION_OUT:-/tmp/ffsession-$(basename "$PWD")}"
+# Guard: every module a selected section loads must be =m in the build's .config, else a built-in
+# driver makes the section fail misleadingly.
+need="VIRTIO_RNG VIRTIO_NET"; [ -n "${UPPER:-}" ] && need="$need USB_HID USB_STORAGE"
+for c in $need; do
+  grep -q "^CONFIG_$c=m" .config 2>/dev/null || { echo "CONFIG_$c is not =m in .config; this run would give misleading FAILs (fix .config and rebuild)" >&2; exit 2; }
+done
 # Guard: refuse to test a stale image or a half-written one.
 if ps aux | grep "[b]uild-all.sh" | grep -q "$PWD" >/dev/null; then echo "build-all running in this worktree; wait" >&2; exit 2; fi
 img=leandros-limine-$arch.img
@@ -98,6 +104,7 @@ if [ -n "${UPPER:-}" ]; then
   nocheck 'FDLOOP_RC=0' "no rmmod succeeded while the fd was open"
   check 'FDLOOP_RM_RC=0' "rmmod after the loop ok"
   nocheck 'usb_storage .*Zombie' "no Zombie after the fd loop"
+  echo "skip loop-on-device and BLKPG partition pins: the guest has no losetup or BLKPG tool (covered by code path block_family_busy only)"
   check 'HIDLOOP_DONE' "usb_hid x10 finished"
   nocheck '^HIDLOADFAIL [0-9]' "usb_hid reload clean"
   check 'kmbad_leak ZOMBIE: ungated registrations left' "kmbad_leak becomes Zombie"
