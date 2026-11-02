@@ -140,7 +140,7 @@ ESP="$SC@@2M"
 printf 'default leandros.conf\ntimeout 1\nconsole-mode keep\n' > "$WORK/loader.conf.test"
 mcopy -o -i "$ESP" "$WORK/loader.conf.test" ::/loader/loader.conf
 boot_vm leandros --boot-disk="$SC,nvme"
-CMD=$(r 'cat /proc/cmdline'); echo "$CMD" | cut -c1-240
+CMD=$(r 'cat /proc/cmdline'); echo "$CMD" | sed -E 's/([A-Za-z0-9_.]*(psk|password)[A-Za-z0-9_.]*=)[^ ]*/\1<redacted>/g' | cut -c1-240
 echo "$CMD" | grep -q 'blk.rw=' && ok "blk.rw= on the cmdline" || fail "blk.rw= missing"
 r 'cat /proc/mounts' | grep -Eq '^/dev/nvme0n1p5 / ' && ok "root is /dev/nvme0n1p5" || fail "root not on p5"
 o=$(r "dd if=/dev/zero of=/dev/nvme0n1p2 bs=512 count=1 conv=notrunc 2>&1; echo rc=\$?")

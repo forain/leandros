@@ -131,7 +131,7 @@ echo "== boot LeandrOS through systemd-boot"
 printf 'default leandros.conf\ntimeout 1\nconsole-mode keep\n' > "$WORK/loader.conf.test"
 mcopy -o -i "$ESP" "$WORK/loader.conf.test" ::/loader/loader.conf
 boot_vm boot1
-CMD=$(r 'cat /proc/cmdline'); echo "$CMD" | grep -qi "root=PARTUUID=$P5U" && ok "root from the private layout ($P5U)" || fail "cmdline: $CMD"
+CMD=$(r 'cat /proc/cmdline'); echo "$CMD" | grep -qi "root=PARTUUID=$P5U" && ok "root from the private layout ($P5U)" || fail "cmdline: $(echo "$CMD" | sed -E 's/([A-Za-z0-9_.]*(psk|password)[A-Za-z0-9_.]*=)[^ ]*/\1<redacted>/g')"
 ST=$(r 'espctl status'); echo "$ST" | head -4
 echo "$ST" | grep -q '^layout=shared' && ok "espctl: shared layout" || fail "espctl did not pick the shared layout"
 echo "$ST" | grep -q "^esp=${DEV}${PS}4" && ok "espctl picked the boot partition, not the ESP" || fail "wrong device"

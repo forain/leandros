@@ -183,7 +183,7 @@ ok "ESP: limine.conf rewritten, EFI/BOOT present"
 echo "== boot the target alone"
 boot_vm alone --boot-disk="$TGT,$BUS"
 CMD="$($REMOTE run 'cat /proc/cmdline' | tr -d '\r')"
-case "$CMD" in *"root=PARTUUID=$ROOT_PUUID"*) ok "booted with root=PARTUUID=$ROOT_PUUID" ;; *) fail "cmdline: $CMD" ;; esac
+case "$CMD" in *"root=PARTUUID=$ROOT_PUUID"*) ok "booted with root=PARTUUID=$ROOT_PUUID" ;; *) fail "cmdline: $(echo "$CMD" | sed -E 's/([A-Za-z0-9_.]*(psk|password)[A-Za-z0-9_.]*=)[^ ]*/\1<redacted>/g')" ;; esac
 MNT="$($REMOTE run 'cat /proc/mounts' | tr -d '\r')"
 echo "$MNT" | grep -Eq "^${TARGET_DEV}${PSEP}2 / " || { echo "$MNT" | head -5; fail "root is not ${TARGET_DEV}${PSEP}2"; }
 echo "$MNT" | grep -Eq "^${TARGET_DEV}[p]?4 /home " || { echo "$MNT" | head -8; fail "/home is not on the target"; }
@@ -203,7 +203,7 @@ stop_vm
 echo "== boot the target with the stick attached"
 LEANDROS_USB_IMAGE="$STICK" boot_vm both --boot-disk="$TGT,$BUS" --usb-stick=gpt
 CMD="$($REMOTE run 'cat /proc/cmdline' | tr -d '\r')"
-case "$CMD" in *"root=PARTUUID=$ROOT_PUUID"*) ;; *) fail "cmdline with stick: $CMD" ;; esac
+case "$CMD" in *"root=PARTUUID=$ROOT_PUUID"*) ;; *) fail "cmdline with stick: $(echo "$CMD" | sed -E 's/([A-Za-z0-9_.]*(psk|password)[A-Za-z0-9_.]*=)[^ ]*/\1<redacted>/g')" ;; esac
 MNT="$($REMOTE run 'cat /proc/mounts' | tr -d '\r')"
 echo "$MNT" | grep -Eq "^${TARGET_DEV}${PSEP}2 / " || { echo "$MNT" | head -5; fail "with the stick attached, root is not ${TARGET_DEV}${PSEP}2"; }
 echo "$MNT" | grep -Eq "^${TARGET_DEV}[p]?4 /home " || { echo "$MNT" | head -8; fail "with the stick attached, /home is not on the target"; }
