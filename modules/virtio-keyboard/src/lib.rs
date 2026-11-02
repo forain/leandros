@@ -32,7 +32,8 @@ fn init() -> i32 {
     0
 }
 
-/// Unload: the kernel released the IRQ/tick registrations and node claims; reset the devices and free the DMA.
+/// Unload: what protects this exit() is the Lower-gate drain (no tick/IRQ is inside the module any more);
+/// the kernel's release_all (IRQ/tick registrations, node claims) runs after exit(). Reset the devices and free the DMA.
 fn exit() {
     let n = virtio_keyboard::free_all();
     kmod_rt::kinfo!("virtio_keyboard: freed {} DMA pages", n);

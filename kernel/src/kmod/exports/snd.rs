@@ -32,3 +32,7 @@ pub fn snd_release() -> bool {
 
 /// D6: an open sound fd (writer, capture reader or non-blocking open) pins the module like video.
 pub fn snd_busy() -> bool { pipewire_server::module_busy() }
+
+/// Unload: stop new opens and re-check busy (see `pipewire_server::seal_module`). False = a client holds it.
+pub fn snd_seal() -> bool { pipewire_server::seal_module() }
+pub fn snd_unseal() { pipewire_server::unseal_module() }

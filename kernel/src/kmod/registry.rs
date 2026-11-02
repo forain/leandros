@@ -207,3 +207,12 @@ pub fn release_all(owner: KmodId) -> bool {
     }
     reg_count(owner) == 0
 }
+
+/// D9 last gate: after the Upper drain, stop new /dev/pipewire opens and re-check that none slipped in.
+/// False = busy (the caller backs out as for busy_reason). Sound opens bypass the Upper gate, so this is
+/// the sound equivalent of the closed-gate re-check.
+pub fn seal_sound(id: KmodId) -> bool {
+    let has = REGS.lock().iter().any(|r| r.0 == id && r.1 == RegKind::SND);
+    !has || super::exports::snd_seal()
+}
+pub fn unseal_sound() { super::exports::snd_unseal(); }

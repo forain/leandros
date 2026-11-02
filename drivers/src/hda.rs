@@ -569,6 +569,7 @@ impl Hda {
         }
         self.corb_phys = 0; self.corb = 0; self.rirb = 0; self.posbuf = 0; self.bdl_phys = 0; self.bdl = 0;
         self.ring_phys = 0; self.ring = 0;
+        self.ext.clear_capture_dma();
         self.initialized = false;
         n
     }
@@ -1364,6 +1365,7 @@ impl Hda {
         let stopped = wait_for(2000, || (0..streams as usize)
             .all(|i| self.r8(SD_BASE + i * SD_STRIDE + SD_CTL0) & SD_CTL_RUN == 0));
         let _ = write!(s, "streams stopped ({} were running{})", running, if stopped { "" } else { ", RUN stuck" });
+        if !stopped { pci::serial_debug("[HDA] shutdown: stream RUN stuck, DMA pages may still be written\n"); }
 
         // 2. Codec.
         if self.afg != 0 && !self.widgets.is_empty() {

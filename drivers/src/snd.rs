@@ -204,7 +204,18 @@ impl VirtioSnd {
     pub fn free_dma(&mut self) -> usize {
         let off = phys_to_virt(0);
         let mut n = 0;
-        if self.common_cfg != 0 { unsafe { self.write_common_8(20, 0); } }
+        if self.common_cfg != 0 {
+            unsafe { self.write_common_8(20, 0); }
+            // Reset is complete only when the status reads back 0 (virtio 1.x 2.1.2); bounded wait.
+            let t0 = monotonic_us();
+            while unsafe { self.read_common_8(20) } != 0 {
+                if monotonic_us().wrapping_sub(t0) > 100_000 {
+                    pci::serial_debug("[SND] reset: status did not read back 0 within 100 ms\n");
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
         for q in self.vqs.iter_mut() {
             if let Some(v) = q.take() { buddy::free(v.desc as usize - off, 1); n += 2; }
         }

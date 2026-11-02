@@ -107,7 +107,8 @@ if [ -n "${EXIT3:-}" ]; then
     "for i in \$(seq 1 $EN); do kmodctl rmmod virtio_snd >/dev/null 2>&1 || echo SNDUNLOADFAIL \$i; kmodctl load $M/virtio_snd.kmod >/dev/null 2>&1 || echo SNDLOADFAIL \$i; done; echo SNDLOOP_DONE" \
     "(sleep 6 > /dev/pipewire &); sleep 1; kmodctl rmmod virtio_snd; echo SNDBUSY_RC=\$?; sleep 7; kmodctl rmmod virtio_snd; echo SNDFREE_RC=\$?" \
     "for i in \$(seq 1 $EN); do kmodctl load $M/hda.kmod >/dev/null 2>&1 || echo HDALOADFAIL \$i; kmodctl rmmod hda >/dev/null 2>&1 || echo HDAUNLOADFAIL \$i; done; echo HDALOOP_DONE" \
-    "kmodctl load $M/hda.kmod; (sleep 6 > /dev/pipewire &); sleep 1; kmodctl rmmod hda; echo HDABUSY_RC=\$?; sleep 7; kmodctl rmmod hda; echo HDAFREE_RC=\$?; kmodctl load $M/virtio_snd.kmod; echo SNDBACK_RC=\$?; cat /proc/modules; echo EXIT3_DONE" > /dev/null 2>&1
+    "kmodctl load $M/hda.kmod; (sleep 6 > /dev/pipewire &); sleep 1; kmodctl rmmod hda; echo HDABUSY_RC=\$?; sleep 7; kmodctl rmmod hda; echo HDAFREE_RC=\$?; kmodctl load $M/virtio_snd.kmod; echo SNDBACK_RC=\$?; cat /proc/modules" \
+    "for i in \$(seq 1 12); do rm -f /tmp/held\$i; ( if exec 3>/dev/pipewire; then grep -q virtio_snd /proc/modules && : > /tmp/held\$i; sleep 1; else echo RACEOPENFAIL \$i; fi ) & kmodctl rmmod virtio_snd >/dev/null 2>&1; rc=\$?; wait; if [ \$rc = 0 ] && [ -e /tmp/held\$i ]; then echo RACEBAD \$i; fi; echo RACE_RC \$i \$rc; [ \$rc = 0 ] && kmodctl load $M/virtio_snd.kmod >/dev/null 2>&1; done; echo RACE_DONE; echo EXIT3_DONE" > /dev/null 2>&1
   L="${FFSESSION_OUT:-/tmp/ffsession}/tests-ul4/serial-full.log"
   check 'KBLOOP_DONE' "virtio_keyboard x$EN finished"
   nocheck '^KB\(UNLOAD\|LOAD\)FAIL' "virtio_keyboard x$EN unload/reload clean"
@@ -120,6 +121,12 @@ if [ -n "${EXIT3:-}" ]; then
   check 'HDABUSY_RC=1' "open /dev/pipewire pins hda (EBUSY)"
   check 'HDAFREE_RC=0' "hda unloads after the fd closed"
   check 'SNDBACK_RC=0' "virtio_snd attaches again after hda (backend slot freed)"
+  # Sound race: open /dev/pipewire as rmmod starts. Each round either rmmod is -EBUSY / the open failed, or
+  # the open landed after the unload; never a held fd while rmmod returned 0 (a silent stream).
+  check 'RACE_DONE' "pipewire open vs rmmod race loop finished"
+  nocheck '^RACEBAD' "no open held across a successful rmmod (no silent stream)"
+  # NOTE: held-key release (input_release pushes key-ups) is not tested here: the runner has no QEMU monitor
+  # sendkey channel; covered by review only.
   check 'EXIT3_DONE' "kmodexit run finished"
   n=$(grep -ac 'virtio_keyboard: freed' "$L"); if [ "$n" -ge "$EN" ]; then echo "ok   virtio_keyboard exit ran ($n)"; else echo "FAIL virtio_keyboard exit ($n)"; fail=1; fi
   n=$(grep -ac 'hda: freed' "$L"); if [ "$n" -ge "$EN" ]; then echo "ok   hda exit ran ($n)"; else echo "FAIL hda exit ($n)"; fail=1; fi

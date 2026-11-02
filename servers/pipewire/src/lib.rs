@@ -556,10 +556,14 @@ fn handle_msg(msg: &Message, caller_pid: u32, _target_port: u32) -> Message {
         0x10 => { // VFS_OPEN {dev_id, flags, _, pid, open_id}
             let flags = arg(msg, 1) as u32;
             if flags & 3 == 0 { // O_RDONLY: no claim
-                if flags & 0o4000 != 0 { nb_add(HOLD_OPEN | open_id_of(msg)); }
+                if flags & 0o4000 != 0 {
+                    nb_add(HOLD_OPEN | open_id_of(msg));
+                    if going_refuse(HOLD_OPEN | open_id_of(msg)) { return err_reply(-16); }
+                }
                 return val_reply(0);
             }
             return match claim(HOLD_OPEN | open_id_of(msg)) {
+                Ok(()) if going_refuse(HOLD_OPEN | open_id_of(msg)) => err_reply(-16),
                 Ok(()) => val_reply(0),
                 Err(e) => err_reply(e),
             };
@@ -682,10 +686,35 @@ fn spawn_audio() {
 /// has finished; afterwards the server runs with no backend (silent, `Backend::None`).
 pub fn detach_module() {
     let mut state = STATE.lock();
+    SND_GOING.store(false, core::sync::atomic::Ordering::SeqCst);
     if matches!(state.snd_driver, Backend::Module { .. }) {
         state.snd_driver.capture_close();
         state.snd_driver = Backend::None;
     }
+}
+
+/// Set by `seal_module` while an unload is past its last busy check. New opens that claim the device
+/// (writer, capture reader, non-blocking open) see it after claiming and fail with EBUSY, so no client
+/// can end up with a silent stream on a backend that is about to vanish. Cleared by detach/unseal.
+static SND_GOING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Dekker-style handshake with the open paths (claim, then test SND_GOING; here: set SND_GOING, then
+/// test busy). Either the open sees the flag and backs out, or this sees the open and refuses.
+/// Returns false (flag cleared) when a client holds the device.
+pub fn seal_module() -> bool {
+    use core::sync::atomic::{fence, Ordering::SeqCst};
+    SND_GOING.store(true, SeqCst);
+    fence(SeqCst);
+    if module_busy() { SND_GOING.store(false, SeqCst); return false; }
+    true
+}
+/// A refused/failed unload: open the device again.
+pub fn unseal_module() { SND_GOING.store(false, core::sync::atomic::Ordering::SeqCst); }
+
+fn going_refuse(h: u64) -> bool {
+    use core::sync::atomic::{fence, Ordering::SeqCst};
+    fence(SeqCst);
+    if SND_GOING.load(SeqCst) { release(h); nb_del(h); true } else { false }
 }
 
 /// True while a client holds the device: writer, capture reader or a non-blocking open.
