@@ -787,17 +787,25 @@ def via_linux_argv(via):
             via, VIA_LINUX_CMD]
 
 
+def is_linux_uname(stdout):
+    """True only when `uname -s` printed exactly Linux (LeandrOS prints Leandros)."""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", "replace")
+    return stdout.strip() == "Linux"
+
+
 def via_linux_hop(via, timeout):
     """After LeandrOS went down the firmware boots systemd-boot's default (Linux): wait for its sshd,
     set the one-shot to leandros.conf and reboot again. True when the command was issued."""
     t0 = time.time()
-    probe_argv = via_linux_argv(via)[:-1] + ["true"]
+    probe_argv = via_linux_argv(via)[:-1] + ["uname -s"]
     while time.time() - t0 < timeout:
         try:
-            r = subprocess.run(probe_argv, capture_output=True, timeout=20).returncode
+            pr = subprocess.run(probe_argv, capture_output=True, timeout=20)
+            ok = pr.returncode == 0 and is_linux_uname(pr.stdout)
         except subprocess.TimeoutExpired:
-            r = 255
-        if r == 0:
+            ok = False
+        if ok:
             print(f"linux up on {via} after {time.time() - t0:.0f} s: bootctl set-oneshot leandros.conf + reboot")
             try:
                 subprocess.run(via_linux_argv(via), capture_output=True, timeout=60)

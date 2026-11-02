@@ -11,6 +11,12 @@ class ViaLinux(unittest.TestCase):
         self.assertIn("systemctl reboot", a[-1])
         self.assertIn("BatchMode=yes", a)
 
+    def test_linux_detect(self):
+        self.assertTrue(remote.is_linux_uname("Linux\n"))
+        self.assertTrue(remote.is_linux_uname(b"Linux\n"))
+        self.assertFalse(remote.is_linux_uname("Leandros\n"))
+        self.assertFalse(remote.is_linux_uname(""))
+
     def test_off_by_default(self):
         self.assertEqual(remote.VIA_LINUX.get("host"), None)
 
