@@ -121,15 +121,19 @@ fi
 # Needs KMOD_EXTRA to include usb_hid and CONFIG_USB_HID=m. The keyboard is a QEMU usb-kbd on xHCI, bound by usb_hid
 # through the `usb * 03 01 01` alias. /dev/input/hotplug (a broadcast stream of add/remove eventN records) is read
 # by a background cat across the rounds; an open reader on the keyboard's event node must see EOF/error on unload
-# rather than pin rmmod (input detaches by design). Key injection needs a host-side QEMU monitor channel the runner
-# lacks, so the final-reload sendkey check is skipped.
+# rather than pin rmmod (input detaches by design). After the final reload, background readers on every event node are
+# started, the runner's `host:hidkeytest.py` step sends KEY_A over QMP, and the readers' output must hold an EV_KEY
+# KEY_A record (od 16-bit words "0001 001e" = type 1, code 30).
 if [ -n "${HID:-}" ]; then
   HN="${HID_N:-10}"
   export LEANDROS_QEMU_EXTRA="-device qemu-xhci,id=xhs -device usb-kbd,bus=xhs.0,id=kbd1"
   python3 "$RT" "$arch" ul5 --cmdline "modules.blacklist=virtio_keyboard" \
     "for d in /lib/modules/*/; do if kmodctl load \${d}hello.kmod >/dev/null 2>&1; then kmodctl rmmod hello >/dev/null 2>&1; MD=\${d%/}; break; fi; done; echo MD=\$MD; sleep 3; cat /proc/modules" \
     "(cat /dev/input/hotplug > /tmp/hp 2>&1 &); sleep 1; for i in \$(seq 1 $HN); do kmodctl rmmod usb_hid; echo HIDRM_RC \$i \$?; cat /proc/modules; echo HIDGONE \$i; ls /dev/input; kmodctl load $M/usb_hid.kmod; echo HIDLD_RC \$i \$?; sleep 2; echo HIDBACK \$i; cat /proc/modules; done; echo HIDLOOP_DONE; cat /tmp/hp" \
-    "(cat /dev/input/hotplug > /tmp/hp2 2>&1 &); for n in 0 1 2 3 4 5 6 7; do [ -e /dev/input/event\$n ] && echo EVNODE \$n; done; ( cat /dev/input/event2 > /dev/null; echo READER_EXIT \$? ) & sleep 2; echo PRE_RM; kmodctl rmmod usb_hid; echo OPENRM_RC=\$?; sleep 2; echo OPENWAIT_DONE; cat /tmp/hp2; kmodctl load $M/usb_hid.kmod; echo OPENRELOAD_RC=\$?; sleep 2; cat /proc/modules; echo HID_DONE" > /dev/null 2>&1
+    "(cat /dev/input/hotplug > /tmp/hp2 2>&1 &); for n in 0 1 2 3 4 5 6 7; do [ -e /dev/input/event\$n ] && echo EVNODE \$n; done; ( cat /dev/input/event2 > /dev/null; echo READER_EXIT \$? ) & sleep 2; echo PRE_RM; kmodctl rmmod usb_hid; echo OPENRM_RC=\$?; sleep 2; echo OPENWAIT_DONE; cat /tmp/hp2; kmodctl load $M/usb_hid.kmod; echo OPENRELOAD_RC=\$?; sleep 2; cat /proc/modules; echo HID_DONE" \
+    "rm -f /tmp/kk*; for f in /dev/input/event*; do (cat \$f > /tmp/kk\${f##*event} 2>/dev/null &); done; sleep 1; echo KEYREADERS_UP" \
+    "host:hidkeytest.py" \
+    "sleep 2; for f in /tmp/kk*; do echo KEYFILE \$f \$(od -An -tx2 -w24 \$f | tr -s ' ' | grep -c ' 0001 001e '); done; echo KEYCHECK_DONE" > /dev/null 2>&1
   L="${FFSESSION_OUT:-/tmp/ffsession}/tests-ul5/serial-full.log"
   check '\[USB-HID\].*keyboard' "usb_hid bound the QEMU keyboard"
   check 'HIDLOOP_DONE' "usb_hid x$HN with a bound keyboard finished"
@@ -144,7 +148,8 @@ if [ -n "${HID:-}" ]; then
   check 'OPENRM_RC=0' "open event-node reader does not pin rmmod"
   check 'OPENRELOAD_RC=0' "reload after the open-reader unload"
   check 'HID_DONE' "usb_hid bound-keyboard run finished"
-  echo "skip sendkey after the final reload: the runner has no host-side QEMU monitor channel during a command batch"
+  if grep -aq HOSTKEY_SENT "$(dirname "$L")/results.txt"; then echo "ok   KEY_A sent over QMP after the final reload"; else echo "FAIL KEY_A sent over QMP after the final reload"; fail=1; fi
+  if tr -d '\r' < "$L" | grep -aq '^KEYFILE /tmp/kk[0-9]* [1-9]'; then echo "ok   KEY_A (EV_KEY code 30) reached a keyboard event node after the final reload"; else echo "FAIL no KEY_A record on any event node after the final reload"; fail=1; fi
   unset LEANDROS_QEMU_EXTRA
 fi
 # ---- kmodexit: virtio_keyboard, virtio_snd and hda unload/reload x${EXIT_N:-20} (EXIT3=1).
