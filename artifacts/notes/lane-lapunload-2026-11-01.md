@@ -42,3 +42,26 @@ LeandrOS has no Wi-Fi link on this install; use wired eth0 (192.168.2.5).
 x86_64 66/0 bad; aarch64 66 with 1 bad (futextest `pi_handoff`, stolen=true),
 which then passed 3/3 alone: a TCG timing flake. An earlier wedged run was the
 box's `/tmp` tmpfs at 100 % (QEMU pauses guests on ENOSPC), not a kernel hang.
+
+## e1000e: cause and fix verified on the real I219, 2026-11-02
+
+Power cycle, then `remote.py logs`: the lost trial boot ended in
+`[BUDDY] CORRUPT LINK ... node[..]=... 0xa8c00102a8c08df4` /
+"buddy free list corrupt" (mm/src/buddy.rs:75). The corrupted free-list node
+holds packet bytes (192.168.x addresses). On the 2nd unload, 1.4 s after a
+reload and while the driver was still waiting for link, the I219 kept DMAing
+RX into the 258 ring pages exit() had just freed. That is the race the
+lane/e1kfix review ranked first: the driver kthread could re-enable the datapath
+under the unload.
+
+Fix merged main 08a04c25 (lane/e1kfix2 d9c0c435). The gate is marked stopping
+first, then a new `unload_quiesce` pm op runs while bus mastering is still on:
+the driver thread is waited out, IRQs are masked, RX goes off, the I219 ring is
+flushed when DESC_RING_STATUS asks for it, TX goes off, and DRV_LOAD is kept.
+Box regress: 66/0 on both arches.
+
+Trial 80bc981615ff (`#1 lapunload2`, never promoted): `LOOP e1000e ok=10 bad=0`
+with 10 s between rounds. There were 10 unloads, each with "[kmod] unload quiesce:
+e1000e: interrupts masked, RX off, ring flush not needed (DESC_RING_STATUS 0000),
+TX off, DRV_LOAD kept", 32 link-up lines, eth0 traffic afterwards, and no panic,
+BUDDY or zombie line. The laptop is back on good aa47abc412a5.
