@@ -46,7 +46,7 @@ Commands:
   espctl <args...>       run espctl in the guest
   logs [--out DIR]       console log (all 4 boots), status, /var/log, ... into
                          artifacts/remote-logs/<time>-<host>/
-  reboot [--no-wait] [--timeout S] [--no-logs]
+  reboot [--no-wait] [--timeout S] [--no-logs] [--via-linux USER@HOST]
                          sync + reboot, wait for sshd, report boot time,
                          fetch logs
   wait [--timeout S]     wait until sshd answers
@@ -778,6 +778,46 @@ def wait_up(t, timeout):
     return None
 
 
+VIA_LINUX_CMD = "sudo -n bootctl set-oneshot leandros.conf && sudo -n systemctl reboot"
+
+
+def via_linux_argv(via):
+    """ssh argv that runs the systemd-boot one-shot + reboot on the Linux side of a dual boot."""
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new",
+            via, VIA_LINUX_CMD]
+
+
+def is_linux_uname(stdout):
+    """True only when `uname -s` printed exactly Linux (LeandrOS prints Leandros)."""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", "replace")
+    return stdout.strip() == "Linux"
+
+
+def via_linux_hop(via, timeout):
+    """After LeandrOS went down the firmware boots systemd-boot's default (Linux): wait for its sshd,
+    set the one-shot to leandros.conf and reboot again. True when the command was issued."""
+    t0 = time.time()
+    probe_argv = via_linux_argv(via)[:-1] + ["uname -s"]
+    while time.time() - t0 < timeout:
+        try:
+            pr = subprocess.run(probe_argv, capture_output=True, timeout=20)
+            ok = pr.returncode == 0 and is_linux_uname(pr.stdout)
+        except subprocess.TimeoutExpired:
+            ok = False
+        if ok:
+            print(f"linux up on {via} after {time.time() - t0:.0f} s: bootctl set-oneshot leandros.conf + reboot")
+            try:
+                subprocess.run(via_linux_argv(via), capture_output=True, timeout=60)
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(20)  # let Linux go down before we look for LeandrOS again
+            return True
+        time.sleep(3)
+    print(f"--via-linux: no Linux sshd on {via} within {timeout} s", file=sys.stderr)
+    return False
+
+
 def do_reboot(t, timeout, expect_kid=None, logs=True, wait=True):
     before = espctl_status(t)
     t.run("echo remdbg > /tmp/.remdbg-alive && sync", check=False, timeout=60)
@@ -787,6 +827,11 @@ def do_reboot(t, timeout, expect_kid=None, logs=True, wait=True):
     t0 = time.time()
     t.run("/bin/reboot", check=False, timeout=30)
     t.close_master()
+    via = VIA_LINUX.get("host")
+    if via and not t.qemu and not t.pi:
+        # Wait for the old system to go down so the hop does not hit LeandrOS's own sshd.
+        time.sleep(10)
+        via_linux_hop(via, timeout)
     if not wait:
         return True
     # Up again = sshd answers and the /tmp marker (tmpfs) is gone.
@@ -979,6 +1024,9 @@ def cmd_pi_card(t, a):
     sys.exit(pi_card.main(t, sys.modules[__name__], a))
 
 
+VIA_LINUX = {}
+
+
 def cmd_reboot(t, a):
     ok = do_reboot(t, timeout=a.timeout, logs=not a.no_logs, wait=not a.no_wait)
     sys.exit(0 if ok else 1)
@@ -1101,11 +1149,13 @@ def main():
     p.add_argument("--no-rf-guard", action="store_true", help="do not add f2fs.rf=0 to the trial when the good kernel predates f2fs roll-forward (da51b45e)"); p.add_argument("--netwatch", type=int, metavar="S", default=None, help="append netwatch=S to the TRIAL entry's cmdline only: if the trial kernel has no IPv4 address S seconds after boot, or its gateway stops answering pings for netwatch.reach= (300 s), it reboots itself to the good entry (default 180 on real machines, off on qemu; 0 = off)"); p.add_argument("--trial-max", type=int, metavar="M", help="append netwatch.trial_max=M: an un-promoted trial reboots to the good entry after M minutes")
     p.add_argument("--append", metavar="ARGS", help="append ARGS (e.g. 'sched.wakestat=1') to the TRIAL entry's cmdline only, keeping the good entry's arguments")
     p.add_argument("--reboot", action="store_true"); p.add_argument("--promote", action="store_true")
+    p.add_argument("--via-linux", metavar="USER@HOST", help="with --reboot on a systemd-boot dual boot: hop through the default Linux (env LEANDROS_DUALBOOT_LINUX); see reboot")
     p.add_argument("--timeout", type=int, default=300); p.add_argument("--no-logs", action="store_true")
     sub.add_parser("promote"); sub.add_parser("discard")
     p = sub.add_parser("espctl"); p.add_argument("args", nargs=argparse.REMAINDER)
     p = sub.add_parser("logs"); p.add_argument("--out")
     p = sub.add_parser("reboot"); p.add_argument("--timeout", type=int, default=300)
+    p.add_argument("--via-linux", metavar="USER@HOST", help="systemd-boot dual boot: after LeandrOS goes down, ssh into the Linux that boots by default, run `bootctl set-oneshot leandros.conf` and reboot into LeandrOS (env LEANDROS_DUALBOOT_LINUX)")
     p.add_argument("--no-wait", action="store_true"); p.add_argument("--no-logs", action="store_true")
     p = sub.add_parser("wait"); p.add_argument("--timeout", type=int, default=300)
     sub.add_parser("forget-host")
@@ -1138,6 +1188,7 @@ def main():
     if a.cmd == "discover":
         return cmd_discover(None, a)
     t = Target(a.target or os.environ.get("LEANDROS_REMOTE"))
+    VIA_LINUX["host"] = getattr(a, "via_linux", None) or os.environ.get("LEANDROS_DUALBOOT_LINUX") or None
     if a.cmd == "run":
         if not a.command:
             die("run: no command")
