@@ -198,6 +198,25 @@ impl VirtioSnd {
         Ok(())
     }
 
+    /// Module unload: reset the device and return every DMA page (persistent block + the four
+    /// queues). Built-in never calls it. Returns pages freed.
+    #[allow(dead_code)]
+    pub fn free_dma(&mut self) -> usize {
+        let off = phys_to_virt(0);
+        let mut n = 0;
+        if self.common_cfg != 0 { unsafe { self.write_common_8(20, 0); } }
+        for q in self.vqs.iter_mut() {
+            if let Some(v) = q.take() { buddy::free(v.desc as usize - off, 1); n += 2; }
+        }
+        if !self.persistent.is_null() {
+            buddy::free(self.persistent as usize - off, PERSISTENT_ORDER);
+            n += 1 << PERSISTENT_ORDER;
+            self.persistent = core::ptr::null_mut();
+        }
+        self.initialized = false; self.stream_active = false; self.stream_started = false;
+        n
+    }
+
     unsafe fn init_vq(&mut self, qid: u16) -> Result<(), DriverError> {
         self.write_common_16(22, qid);
         let size = self.read_common_16(24).min(QUEUE_SIZE as u16);

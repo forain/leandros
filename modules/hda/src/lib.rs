@@ -20,6 +20,7 @@ mod hda;
 kmod_rt::module! {
     name: "hda",
     init: init,
+    exit: exit,
     ids: [kmod_rt::pci_class(0x040300, 0xffff00)]
 }
 
@@ -77,4 +78,13 @@ fn init() -> i32 {
         Ok(()) => { kmod_rt::kinfo!("hda attached"); 0 }
         Err(e) => { kmod_rt::kerr!("snd_register failed: {}", e); e }
     }
+}
+
+/// Unload: the pipewire server already dropped this backend (registry::pre_exit) and the kernel stopped
+/// bus mastering; stop the controller and return the DMA pages.
+fn exit() {
+    let mut d = DEV.lock();
+    let _ = d.shutdown(false, 300_000);
+    let n = d.free_dma();
+    kmod_rt::kinfo!("hda: freed {} DMA pages", n);
 }

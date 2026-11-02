@@ -19,6 +19,7 @@ mod snd;
 kmod_rt::module! {
     name: "virtio_snd",
     init: init,
+    exit: exit,
     ids: [kmod_rt::pci(0x1af4, 0x1059)]
 }
 
@@ -60,4 +61,10 @@ fn init() -> i32 {
         Ok(()) => { kmod_rt::kinfo!("virtio-sound attached"); 0 }
         Err(e) => { kmod_rt::kerr!("snd_register failed: {}", e); e }
     }
+}
+
+/// Unload: the pipewire server already dropped this backend (registry::pre_exit); reset the device and free its DMA.
+fn exit() {
+    let n = DEV.lock().free_dma();
+    kmod_rt::kinfo!("virtio_snd: freed {} DMA pages", n);
 }

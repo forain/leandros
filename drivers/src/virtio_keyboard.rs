@@ -641,6 +641,23 @@ pub fn init() {
     crate::kenv::pci::serial_debug("\n");
 }
 
+/// Module unload: reset every bound device and return its queue and event-buffer pages. The kernel has
+/// already stopped bus mastering and drained the IRQ/tick edge. Built-in never calls it. Returns pages freed.
+#[allow(dead_code)]
+pub fn free_all() -> usize {
+    let off = mm::phys_to_virt(0);
+    let mut n = 0;
+    let devs: alloc::vec::Vec<VirtioKeyboardDevice> = VIRTIO_INPUTS.lock().drain(..).collect();
+    for d in devs {
+        unsafe { core::ptr::addr_of_mut!((*d.common_cfg).device_status).write_volatile(0); }
+        if let Some(q) = d.queue {
+            for p in [q._desc as usize, q.avail as usize, q.used as usize] { mm::buddy::free(p - off, 0); n += 1; }
+        }
+        if d.event_buffer_phys != 0 { mm::buddy::free(d.event_buffer_phys, 0); n += 1; }
+    }
+    n
+}
+
 pub fn poll_events() {
     // try_lock, never lock: this runs in IRQ context off the timer tick, so
     // blocking on a lock held by the task context we interrupted would wedge

@@ -19,6 +19,7 @@ mod virtio_keyboard;
 kmod_rt::module! {
     name: "virtio_keyboard",
     init: init,
+    exit: exit,
     ids: [kmod_rt::pci(0x1af4, 0x1052)]
 }
 
@@ -29,4 +30,10 @@ fn init() -> i32 {
     if virtio_keyboard::VIRTIO_INPUTS.lock().is_empty() { return -19; }
     if kmod_kapi::tick::register(tick, 0).is_err() { return -12; }
     0
+}
+
+/// Unload: the kernel released the IRQ/tick registrations and node claims; reset the devices and free the DMA.
+fn exit() {
+    let n = virtio_keyboard::free_all();
+    kmod_rt::kinfo!("virtio_keyboard: freed {} DMA pages", n);
 }

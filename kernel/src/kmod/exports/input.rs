@@ -100,6 +100,11 @@ pub fn input_release(handle: u64) -> bool {
         let _ = kapi_input_unregister(n);
         true
     } else {
-        false
+        // Fixed node (0 keyboard, 1 pointer): drop the claim so a reload can take it again. The console and
+        // compositor only consume the node's events, so they just see the stream stop. kmod.leakinput=1 keeps
+        // the old irrevocable behaviour for the kmbad_leak Zombie fixture.
+        if crate::kmod::autoload::opt("kmod.leakinput") == Some("1") { return false; }
+        CLAIMED.fetch_and(!(1u32 << (handle & 0x1f)), Ordering::AcqRel);
+        true
     }
 }

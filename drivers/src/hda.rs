@@ -558,6 +558,21 @@ impl Hda {
         Ok(())
     }
 
+    /// Module unload: hand every DMA page back to the buddy allocator (controller already stopped by
+    /// `shutdown`). Built-in never calls it. Returns pages freed.
+    #[allow(dead_code)]
+    pub fn free_dma(&mut self) -> usize {
+        let order = (RING_BYTES / 4096).trailing_zeros() as usize;
+        let mut n = 0;
+        for (p, o) in [(self.corb_phys, 0), (self.bdl_phys, 0), (self.ring_phys, order), (self.ext.cap_ring_phys(), order)] {
+            if p != 0 { buddy::free(p, o); n += 1 << o; }
+        }
+        self.corb_phys = 0; self.corb = 0; self.rirb = 0; self.posbuf = 0; self.bdl_phys = 0; self.bdl = 0;
+        self.ring_phys = 0; self.ring = 0;
+        self.initialized = false;
+        n
+    }
+
     fn alloc_dma(&mut self) -> Result<(), &'static str> {
         const LIMIT: usize = 0x1_0000_0000; // below 4 GiB whatever GCAP.64OK says
         // Page 0: CORB (1 KiB) + RIRB (2 KiB) + position buffer (at +3 KiB).
