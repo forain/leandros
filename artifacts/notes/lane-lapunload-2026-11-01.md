@@ -65,3 +65,28 @@ with 10 s between rounds. There were 10 unloads, each with "[kmod] unload quiesc
 e1000e: interrupts masked, RX off, ring flush not needed (DESC_RING_STATUS 0000),
 TX off, DRV_LOAD kept", 32 link-up lines, eth0 traffic afterwards, and no panic,
 BUDDY or zombie line. The laptop is back on good aa47abc412a5.
+
+## Follow-ups closed, 2026-11-02
+
+- **Dual-boot reboot** (lane/dbreboot 29739f27): `remote.py reboot` and
+  `deploy-kernel --reboot` take `--via-linux USER@HOST` (or
+  `LEANDROS_DUALBOOT_LINUX`). After LeandrOS goes down the script waits for the
+  default Linux (`uname -s` must say Linux), runs `bootctl set-oneshot
+  leandros.conf` and reboots. LeandrOS has no EFI runtime services, so it cannot
+  set the one-shot itself. Laptop: deploy → trial and back to good, 64 s each
+  way, no manual step.
+- **Modules on a disk root** (lane/kmodroot 2e127ace + lane/kmodroot2 1ab0e0b8):
+  `/proc/kmod_buildid` and `kmodctl load <name>`. kmodroot assumed initrd files
+  stay openable after pivot_root. The laptop refuted that, so init now stages the
+  initrd's `lib/modules/<id>/` into `/run/modules/<id>` when the disk root has none
+  (laptop: 5 files, 291 KiB). `kmodctl load uvc` and `load uvc.kmod` then work on
+  the NVMe root, and a missing module lists both searched paths. `deploy-kernel`
+  swaps only the kernel and initrd, so the disk root's /bin/kmodctl stays old until
+  a rootfs update; the trial used a pushed copy.
+- **kmodregress kmodctl step** (lane/kmodctlverdict 0f031ee4): runtests' 2nd
+  argument is the run tag, so `kmodctl kmodctl` ran bare kmodctl (usage, rc 2) and
+  kmodctltest never ran. Now `kmodctl --suite kmodctl`: RC=0, overall PASS.
+- **Worktree pitfall:** build-all.sh looks for ripgrep at `$ROOT_DIR/../ripgrep`, so
+  a worktree under `.claude/worktrees/` builds an image without `/bin/rg`, and the
+  guest `grep` (an rg front end) fails. unloadtest's NETCNT parse then crashes.
+  The virtio_net reload itself is healthy.
