@@ -11,6 +11,24 @@ import os
 import subprocess
 import soundfont
 
+def sibling_dir(name):
+    """The shared sibling checkout ../NAME (same fallback as build-all.sh):
+    a worktree elsewhere has no sibling, so use the main checkout's."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    d = os.path.join(here, "..", name)
+    if not os.path.isdir(d):
+        try:
+            common = subprocess.check_output(
+                ["git", "-C", here, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                stderr=subprocess.DEVNULL, text=True).strip()
+            c = os.path.join(os.path.dirname(os.path.dirname(common)), name)
+            if os.path.isdir(c):
+                d = c
+        except Exception:
+            pass
+    return d
+
+
 # The image uses Linux's on-disk node layout ("lxnode2", scripts/f2fslx.py),
 # written by scripts/f2fslxpop.py; this script gathers the tree.
 
@@ -2042,7 +2060,7 @@ def main():
         bin_files.append(("disktester", p, 0o100755))
     # ripgrep (`rg`), built UNMODIFIED from the sibling checkout; the image
     # has no grep.
-    p = f"../ripgrep/target/{_musl_triple}/release/rg"
+    p = f"{sibling_dir('ripgrep')}/target/{_musl_triple}/release/rg"
     if os.path.exists(p):
         bin_files.append(("rg", p, 0o100755))
     # grep/egrep/fgrep: userland/grep, a POSIX grep front end that runs /bin/rg
@@ -2958,7 +2976,7 @@ def main():
     # Optional binaries are skipped silently when their build output is absent.
     # Say so, and let LEANDROS_REQUIRE=rg,grep,dmesg,coreutils make it fatal.
     _opt_src = {
-        "rg": f"../ripgrep/target/{_musl_triple}/release/rg",
+        "rg": f"{sibling_dir('ripgrep')}/target/{_musl_triple}/release/rg",
         "grep": f"userland/grep/target/{_musl_triple}/release/grep",
         "dmesg": "userland/dmesg/dmesg.sh",
         "coreutils": coreutils_bin,
