@@ -117,6 +117,36 @@ if [ -n "${UPPER:-}" ]; then
   check 'kmbad_leak ZOMBIE: ungated registrations left' "kmbad_leak becomes Zombie"
   check 'kmbad_leak .* Zombie' "kmbad_leak Zombie in /proc/modules"
 fi
+# ---- usb_hid unload/reload x10 WHILE a USB keyboard is bound (HID=1; also part of UPPER=1 builds' needs).
+# Needs KMOD_EXTRA to include usb_hid and CONFIG_USB_HID=m. The keyboard is a QEMU usb-kbd on xHCI, bound by usb_hid
+# through the `usb * 03 01 01` alias. /dev/input/hotplug (a broadcast stream of add/remove eventN records) is read
+# by a background cat across the rounds; an open reader on the keyboard's event node must see EOF/error on unload
+# rather than pin rmmod (input detaches by design). Key injection needs a host-side QEMU monitor channel the runner
+# lacks, so the final-reload sendkey check is skipped.
+if [ -n "${HID:-}" ]; then
+  HN="${HID_N:-10}"
+  export LEANDROS_QEMU_EXTRA="-device qemu-xhci,id=xhs -device usb-kbd,bus=xhs.0,id=kbd1"
+  python3 "$RT" "$arch" ul5 --cmdline "modules.blacklist=virtio_keyboard" \
+    "for d in /lib/modules/*/; do if kmodctl load \${d}hello.kmod >/dev/null 2>&1; then kmodctl rmmod hello >/dev/null 2>&1; MD=\${d%/}; break; fi; done; echo MD=\$MD; sleep 3; cat /proc/modules" \
+    "(cat /dev/input/hotplug > /tmp/hp 2>&1 &); sleep 1; for i in \$(seq 1 $HN); do kmodctl rmmod usb_hid; echo HIDRM_RC \$i \$?; cat /proc/modules; echo HIDGONE \$i; ls /dev/input; kmodctl load $M/usb_hid.kmod; echo HIDLD_RC \$i \$?; sleep 2; echo HIDBACK \$i; cat /proc/modules; done; echo HIDLOOP_DONE; cat /tmp/hp" \
+    "(cat /dev/input/hotplug > /tmp/hp2 2>&1 &); for n in 0 1 2 3 4 5 6 7; do [ -e /dev/input/event\$n ] && echo EVNODE \$n; done; ( cat /dev/input/event2 > /dev/null; echo READER_EXIT \$? ) & sleep 2; echo PRE_RM; kmodctl rmmod usb_hid; echo OPENRM_RC=\$?; sleep 2; echo OPENWAIT_DONE; cat /tmp/hp2; kmodctl load $M/usb_hid.kmod; echo OPENRELOAD_RC=\$?; sleep 2; cat /proc/modules; echo HID_DONE" > /dev/null 2>&1
+  L="${FFSESSION_OUT:-/tmp/ffsession}/tests-ul5/serial-full.log"
+  check '\[USB-HID\].*keyboard' "usb_hid bound the QEMU keyboard"
+  check 'HIDLOOP_DONE' "usb_hid x$HN with a bound keyboard finished"
+  n=$(grep -ac '^HIDRM_RC [0-9]* 0' "$L"); if [ "$n" -ge "$HN" ]; then echo "ok   rmmod rc 0 every round ($n)"; else echo "FAIL rmmod rc 0 ($n/$HN)"; fail=1; fi
+  n=$(grep -ac '^HIDLD_RC [0-9]* 0' "$L"); if [ "$n" -ge "$HN" ]; then echo "ok   load rc 0 every round ($n)"; else echo "FAIL load rc 0 ($n/$HN)"; fail=1; fi
+  nocheck 'usb_hid .*Zombie' "no Zombie in /proc/modules"
+  nocheck '\[BUDDY\]\|panic\|PANIC\|Data abort\|Oops' "no [BUDDY] / panic in the serial log"
+  n=$(grep -ac '^remove event[0-9]* kbd' "$L"); if [ "$n" -ge "$HN" ]; then echo "ok   keyboard event node removed on each unload ($n remove records)"; else echo "FAIL keyboard remove records ($n/$HN)"; fail=1; fi
+  n=$(grep -ac '^add event[0-9]* kbd' "$L"); if [ "$n" -ge "$HN" ]; then echo "ok   keyboard event node re-added on each load ($n add records)"; else echo "FAIL keyboard add records ($n/$HN)"; fail=1; fi
+  check 'OPENWAIT_DONE' "rmmod with open readers on event nodes did not block"
+  if tr -d '\r' < "$L" | grep -a '^\(PRE_RM\|READER_EXIT\)' | tr '\n' ' ' | grep -aq 'PRE_RM READER_EXIT'; then echo "ok   open reader on the keyboard node ended only after the unload (EOF/error, no pin)"; else echo "FAIL open reader did not end after the unload"; fail=1; fi
+  check 'OPENRM_RC=0' "open event-node reader does not pin rmmod"
+  check 'OPENRELOAD_RC=0' "reload after the open-reader unload"
+  check 'HID_DONE' "usb_hid bound-keyboard run finished"
+  echo "skip sendkey after the final reload: the runner has no host-side QEMU monitor channel during a command batch"
+  unset LEANDROS_QEMU_EXTRA
+fi
 # ---- kmodexit: virtio_keyboard, virtio_snd and hda unload/reload x${EXIT_N:-20} (EXIT3=1).
 # Needs KMOD_EXTRA to include "virtio_keyboard virtio_snd hda" and an untracked .config with CONFIG_VIRTIO_KEYBOARD=m
 # CONFIG_VIRTIO_SND=m CONFIG_HDA=m. QEMU's default virtio-keyboard/tablet/virtio-snd are used; an Intel HDA codec is added.

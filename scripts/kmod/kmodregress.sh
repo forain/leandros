@@ -10,7 +10,7 @@ export KMOD_TEST=1 KMOD_EXTRA="${KMOD_EXTRA:-hello kmbad_hang kmbad_reload kmbad
 build() { "$PWD/scripts/build-all.sh" --arch "$arch" > "${TMPDIR:-/tmp}/kmodregress-build.log" 2>&1 || { tail -n 20 "${TMPDIR:-/tmp}/kmodregress-build.log"; exit 1; }; }
 build
 RT=.claude/skills/run-leandros/runtests.py
-[[ "$what" == all || "$what" == unload ]] && { UPPER=1 EXIT3=1 scripts/kmod/unloadtest.sh "$arch" || rc=1; }
+[[ "$what" == all || "$what" == unload ]] && { UPPER=1 EXIT3=1 HID=1 scripts/kmod/unloadtest.sh "$arch" || rc=1; }
 [[ "$arch" == x86_64 && ( "$what" == all || "$what" == e1000e ) ]] && { scripts/kmod/e1000etest.sh || rc=1; }
 [[ "$what" == all || "$what" == ctl ]] && { python3 "$RT" "$arch" kmodctl --suite kmodctl || rc=1; }
 # autoload goes LAST: autoloadtest.sh writes its own .config and does its OWN stock build (modules found only through
