@@ -73,6 +73,9 @@ ok "fake: dual-boot install reaches Done (gates, plan, steps)"
 r "FAKE_GATE_FAIL=1 $G --self-test-dualboot /dev/nvme0n1; echo rc=\$?" > "$WORK/fake-gate.log"
 grep -q "G8 power fail" "$WORK/fake-gate.log" && grep -q "blocked" "$WORK/fake-gate.log" && grep -q "rc=1" "$WORK/fake-gate.log" || { tail -5 "$WORK/fake-gate.log"; fail "gate failure not reported"; }
 ok "fake: gate failure blocks the install"
+r "$G --self-test-reinstall /dev/nvme0n1" > "$WORK/fake-re.log"; grep -q "page Done" "$WORK/fake-re.log" || { tail -5 "$WORK/fake-re.log"; fail "fake reinstall did not reach Done"; }
+ok "fake: reinstall reaches Done"
+r "FAKE_GATE_FAIL=1 $G --self-test-reinstall /dev/nvme0n1; echo rc=\$?" | grep -q "rc=1" && ok "fake: reinstall gate failure blocks" || fail "fake reinstall gate failure"
 r "$G --self-test-shrink /dev/nvme1n1 120G" > "$WORK/fake-shrink.log"; grep -q "page ShrinkDone" "$WORK/fake-shrink.log" || { tail -5 "$WORK/fake-shrink.log"; fail "fake shrink"; }
 ok "fake: shrink reaches ShrinkDone"
 r "FAKE_GATE_FAIL=1 $G --self-test-shrink /dev/nvme1n1 120G; echo rc=\$?" | grep -q "rc=1" && ok "fake: shrink gate failure is an error" || fail "shrink gate failure"
@@ -85,6 +88,10 @@ echo "== real backend"
 r "LEANDROS_INSTALL_BIN=/tmp/leandros-install /tmp/leandros-installer --self-test-dualboot /dev/nvme0n1" > "$WORK/real-db.log" || { tail -8 "$WORK/real-db.log"; fail "real dualboot self-test"; }
 grep -q "page Done" "$WORK/real-db.log" || fail "real: no page Done"
 ok "real: GUI dual-boot path reached Done"
+r "LEANDROS_INSTALL_BIN=/tmp/leandros-install /tmp/leandros-installer --self-test-list" | grep -q '"reinstall":true\|reinstall' || true
+r "LEANDROS_INSTALL_BIN=/tmp/leandros-install /tmp/leandros-installer --self-test-reinstall /dev/nvme0n1" > "$WORK/real-re.log" || { tail -8 "$WORK/real-re.log"; fail "real reinstall self-test"; }
+grep -q "page Done" "$WORK/real-re.log" || fail "real: reinstall did not reach Done"
+ok "real: GUI reinstall path reached Done"
 stop_vm
 
 echo "== host checks"

@@ -21,6 +21,9 @@ const USAGE: &str = "usage:
   leandros-install install --mode dualboot --target /dev/X --after-shrink --yes [--root-gib N]
                            [--json] [--dry-run]   (session B: needs shrink-status ready_b; shrinks the
                            p2 GPT entry to the shrunk filesystem, then installs into the freed gap)
+  leandros-install install --mode dualboot --target /dev/X --reinstall [--keep-home|--wipe-home]
+                           --yes [--json] [--dry-run]   (rewrite the existing LeandrOS partition set in
+                           place: GPT untouched, home kept by default, marker-owned ESP files only)
   leandros-install repair-esp [--boot DEV] [--esp DEV]
       recreate the three LeandrOS files on a dual-boot disk's shared ESP (runs espctl repair-esp)
   leandros-install gaps --dev FILE|/dev/X [--sector-size 512|4096]
@@ -99,6 +102,9 @@ fn parse_opts(args: &[String]) -> Opts {
             "--no-verify" => { o.no_verify = true; i += 1; }
             "--zero-fill" => { o.zero_fill = true; i += 1; }
             "--json" => { o.json = true; i += 1; }
+            "--reinstall" => { o.reinstall = true; i += 1; }
+            "--keep-home" => { o.wipe_home = false; i += 1; }
+            "--wipe-home" => { o.wipe_home = true; i += 1; }
             "--use-free" => { o.use_free = true; i += 1; }
             "--after-shrink" => { o.after_shrink = true; o.use_free = true; i += 1; }
             "--backup-root" => { o.backup_root = Some(args.get(i + 1).cloned().unwrap_or_else(|| die("missing value"))); i += 2; }

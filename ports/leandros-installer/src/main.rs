@@ -46,7 +46,7 @@ fn bounds(d: &Disk, mode: Mode) -> (u64, u64) {
             // At least 19 GiB must be freed for the install.
             (lo, (d.shrink_cur / GIB).saturating_sub(19))
         }
-        Mode::Erase | Mode::Finish => (MIN_ROOT_GIB, MIN_ROOT_GIB),
+        Mode::Erase | Mode::Finish | Mode::Reinstall => (MIN_ROOT_GIB, MIN_ROOT_GIB),
     }
 }
 
@@ -131,7 +131,7 @@ impl App {
     }
 
     fn root_gib(&self) -> Option<u64> {
-        (!matches!(self.mode, Mode::Shrink | Mode::Erase | Mode::Finish)).then_some(self.slider)
+        (!matches!(self.mode, Mode::Shrink | Mode::Erase | Mode::Finish | Mode::Reinstall)).then_some(self.slider)
     }
 
     fn begin(&mut self, op: Op, args: Vec<String>) -> Task<Message> {
@@ -243,7 +243,7 @@ impl Application for App {
                     Page::Disk => Page::Welcome,
                     Page::Mode => Page::Disk,
                     Page::Size => Page::Mode,
-                    Page::Confirm if matches!(self.mode, Mode::Erase | Mode::Finish) => Page::Mode,
+                    Page::Confirm if matches!(self.mode, Mode::Erase | Mode::Finish | Mode::Reinstall) => Page::Mode,
                     Page::Confirm => Page::Size,
                     Page::Progress if !self.installing && self.op == Op::Recover => Page::Welcome,
                     Page::Progress if !self.installing => Page::Mode,
@@ -255,6 +255,7 @@ impl Application for App {
                 Page::Disk if self.selected.is_some() => {
                     self.mode = match self.disk() {
                         Some(d) if d.finish == "ready_b" => Mode::Finish,
+                        Some(d) if d.reinstall => Mode::Reinstall,
                         Some(d) if d.dualboot => Mode::Free,
                         Some(d) if !d.shrink_part.is_empty() => Mode::Shrink,
                         _ => Mode::Erase,
@@ -268,10 +269,10 @@ impl Application for App {
                     self.backed_up = false;
                     if self.mode == Mode::Erase {
                         self.page = Page::Confirm;
-                    } else if self.mode == Mode::Finish {
+                    } else if matches!(self.mode, Mode::Finish | Mode::Reinstall) {
                         self.page = Page::Confirm;
                         if let Some(d) = self.disk() {
-                            let a = backend::install_args(&d.dev, Mode::Finish, None, true);
+                            let a = backend::install_args(&d.dev, self.mode, None, true);
                             return self.begin(Op::Dry, a);
                         }
                     } else if let Some(d) = self.disk() {
@@ -503,6 +504,12 @@ impl Application for App {
                         .width(Length::Fill)
                         .on_press_maybe(on.then_some(Message::SetMode(m)))
                 };
+                if d.reinstall {
+                    col = col.push(opt(Mode::Reinstall, "Reinstall LeandrOS (keep home)", true));
+                    col = col.push(widget::text::caption(
+                        "Rewrites only the existing LeandrOS partitions and its boot files. Your other systems and your LeandrOS home are not touched.",
+                    ));
+                }
                 col = col.push(opt(Mode::Free, "Install alongside (use free space)", d.dualboot));
                 if d.dualboot {
                     col = col.push(widget::text::caption(
@@ -583,7 +590,7 @@ impl Application for App {
                             "If that happens: switch the laptop off, keep this USB stick plugged in, open the boot menu and boot the stick again, then choose Recover. Do not run fsck, GParted or other disk tools on the Linux partition before that.",
                         ));
                     }
-                    Mode::Free | Mode::Finish => {
+                    Mode::Free | Mode::Finish | Mode::Reinstall => {
                         if self.mode == Mode::Finish && d.finish != "ready_b" {
                             col = col.push(widget::checkbox(false).label("Linux booted fine after the shrink").on_toggle(Message::Booted));
                         }
@@ -595,7 +602,16 @@ impl Application for App {
                             col = col.push(widget::text::title3(self.error.clone()));
                         }
                         col = col.push(self.gates_view());
-                        if let Some(p) = &self.plan {
+                        if let Some(p) = self.plan.as_ref().filter(|p| self.mode == Mode::Reinstall && !p.actions.is_empty()) {
+                            col = col.push(widget::text::title3("Partitions (the partition table is not changed)"));
+                            for a in &p.actions {
+                                col = col.push(widget::text::caption(format!("  {a}")));
+                            }
+                            col = col.push(widget::text::body("Files rewritten on the shared boot partition (ESP):"));
+                            for (path, bytes) in &p.esp_files {
+                                col = col.push(widget::text::caption(format!("  {path}  ({bytes} bytes)")));
+                            }
+                        } else if let Some(p) = &self.plan {
                             col = col.push(widget::text::title3("Partition table"));
                             col = col.push(widget::text::body("Before:"));
                             for r in &p.old_gpt {
@@ -633,12 +649,13 @@ impl Application for App {
                 let mut ok = self.ack && self.backed_up && self.typed.trim() == d.dev;
                 ok &= match self.mode {
                     Mode::Erase => self.typed_erase.trim() == "ERASE",
-                    Mode::Free | Mode::Finish => self.dry_ok,
+                    Mode::Free | Mode::Finish | Mode::Reinstall => self.dry_ok,
                     Mode::Shrink => true,
                 };
                 let label = match self.mode {
                     Mode::Shrink => "Shrink Linux",
                     Mode::Free => "Install",
+                    Mode::Reinstall => "Reinstall",
                     Mode::Finish => "Finish installation",
                     Mode::Erase => "Erase and install",
                 };
@@ -782,6 +799,19 @@ fn self_test_dualboot(dev: &str) -> i32 {
     if done && !gfail && code == Some(0) { 0 } else { 1 }
 }
 
+fn self_test_reinstall(dev: &str) -> i32 {
+    println!("page Mode: Reinstall LeandrOS (keep home); dry run");
+    let (_, dry, gfail, _) = drain(backend::install_args(dev, Mode::Reinstall, None, true), "dry");
+    if gfail || !dry {
+        println!("dry run -> page Confirm (blocked: gate failed or no plan)");
+        return 1;
+    }
+    println!("dry run ok -> Reinstall enabled");
+    let (done, _, gfail, code) = drain(backend::install_args(dev, Mode::Reinstall, None, false), "install");
+    println!("exit {:?} -> page {}", code, if done { "Done" } else { "Error" });
+    if done && !gfail && code == Some(0) { 0 } else { 1 }
+}
+
 fn self_test_after_shrink(dev: &str) -> i32 {
     let (_, _, _, sc) = drain(backend::shrink_status_args(), "status");
     println!("shrink-status exit {:?}", sc);
@@ -890,6 +920,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("--self-test-dualboot") => {
             let dev = args.get(1).map(String::as_str).unwrap_or("/dev/nvme0n1");
             std::process::exit(self_test_dualboot(dev));
+        }
+        Some("--self-test-reinstall") => {
+            let dev = args.get(1).map(String::as_str).unwrap_or("/dev/nvme0n1");
+            std::process::exit(self_test_reinstall(dev));
         }
         Some("--self-test-recover") => std::process::exit(self_test_recover()),
         Some("--self-test-after-shrink") => {

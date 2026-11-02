@@ -25,6 +25,8 @@ pub struct Opts {
     pub use_free: bool,
     pub after_shrink: bool,
     pub backup_root: Option<String>,
+    pub reinstall: bool,
+    pub wipe_home: bool,
 }
 
 pub fn list(o: &Opts) {
@@ -110,7 +112,13 @@ fn round_up(v: u64, to: u64) -> u64 {
 }
 
 pub fn install(o: &Opts) -> Result<(), String> {
+    if o.reinstall && !o.dualboot {
+        return Err("--reinstall needs --mode dualboot".into());
+    }
     if o.dualboot {
+        if o.reinstall {
+            return crate::dualboot::reinstall(o);
+        }
         return crate::dualboot::install(o);
     }
     let out = Out { json: o.json };

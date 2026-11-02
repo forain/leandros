@@ -29,6 +29,16 @@ list)
 install)
   case " $* " in
   *" --mode dualboot "*)
+    case " $* " in *" --reinstall "*)
+      gate R3 set pass "one boot, root, home and log partition with bit 63"
+      gate R4 markers pass "markers match"
+      [ -n "$FAKE_GATE_FAIL" ] && { gate R2 mounts fail "a partition of the target is mounted"; echo '{"ev":"error","msg":"preflight failed: R2"}'; exit 1; }
+      echo '{"ev":"plan","mode":"reinstall","target":"/dev/nvme0n1","keep_home":true,"root_partuuid":"00000000-1111-2222-3333-444444444444","partitions":[{"role":"boot","n":3,"action":"reformat and rewrite"},{"role":"root","n":4,"action":"block copy of the running root"},{"role":"home","n":5,"action":"keep"},{"role":"log","n":6,"action":"reformat"}],"esp_files":[{"path":"/EFI/leandros/BOOTAA64.EFI","bytes":1500000}]}'
+      case " $* " in *" --dry-run "*) echo '{"ev":"done","dry_run":true}'; exit 0;; esac
+      steps backup boot log root verify esp
+      echo '{"ev":"done","target":"/dev/nvme0n1","mode":"reinstall","root_partuuid":"00000000-1111-2222-3333-444444444444","boot_partuuid":"cc","backup_dir":"/home/dualboot-backup/bk-1"}'
+      exit 0;;
+    esac
     gates
     echo "{\"ev\":\"plan\",\"mode\":\"dualboot\",\"target\":\"/dev/nvme0n1\",\"root_partuuid\":\"00000000-1111-2222-3333-444444444444\",\"old_gpt\":$OLD,\"new_gpt\":$NEW,\"esp_files\":[{\"path\":\"/EFI/leandros/BOOTAA64.EFI\",\"bytes\":1500000},{\"path\":\"/EFI/leandros/limine.conf\",\"bytes\":120},{\"path\":\"/loader/entries/leandros.conf\",\"bytes\":90},{\"path\":\"/EFI/leandros/.leandros-owned\",\"bytes\":1}]}"
     case " $* " in *" --dry-run "*) echo '{"ev":"done","dry_run":true}'; exit 0;; esac
