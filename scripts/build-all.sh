@@ -58,6 +58,20 @@ echo "🏗️  Architecture(s): $ARCH"
 
 ROOT_DIR="$PWD"
 
+# sibling_dir NAME: the shared sibling checkout `../NAME`. A git worktree that
+# lives elsewhere (e.g. under .claude/worktrees/) has no such sibling, so fall
+# back to the sibling of the main checkout (parent of the common .git dir).
+sibling_dir() {
+    local name="$1" dir="$ROOT_DIR/../$1" common
+    if [[ ! -d "$dir" ]]; then
+        common="$(git -C "$ROOT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
+        if [[ -n "$common" && -d "$(dirname "$(dirname "$common")")/$name" ]]; then
+            dir="$(dirname "$(dirname "$common")")/$name"
+        fi
+    fi
+    echo "$dir"
+}
+
 # Toolchain wrappers (linker/cc/ar) are referenced from RUSTFLAGS and CC_*/AR_*
 # env vars, which cargo fingerprints. Referencing them through $ROOT_DIR makes
 # every worktree's flags differ, so the shared sibling target dirs (bottom,
@@ -374,7 +388,7 @@ create_disk_image() {
 build_doom() {
     local arch="$1"
     echo "🎮 Building $arch doomgeneric..."
-    local doom_dir="$ROOT_DIR/../doomgeneric"
+    local doom_dir="$(sibling_dir doomgeneric)"
     if [[ ! -d "$doom_dir" ]]; then
         echo "⚠️  doomgeneric source not found at $doom_dir, skipping"
         return 0
@@ -475,7 +489,7 @@ build_memcpybench() {
 build_mame() {
     local arch="$1"
     echo "🕹️  Building $arch MAME..."
-    local mame_dir="$ROOT_DIR/../mame"
+    local mame_dir="$(sibling_dir mame)"
     if [[ ! -d "$mame_dir" ]]; then
         echo "⚠️  MAME source not found at $mame_dir, skipping"
         return 0
@@ -665,7 +679,7 @@ build_apk() {
 build_bottom() {
     local arch="$1"
     echo "📊 Building $arch bottom..."
-    local bottom_dir="$ROOT_DIR/../bottom-leandros"
+    local bottom_dir="$(sibling_dir bottom-leandros)"
     if [[ ! -d "$bottom_dir" ]]; then
         echo "⚠️  bottom source not found at $bottom_dir, skipping"
         return 0
@@ -688,7 +702,7 @@ build_bottom() {
 build_coreutils() {
     local arch="$1"
     echo "🧰 Building $arch coreutils..."
-    local coreutils_dir="$ROOT_DIR/../coreutils"
+    local coreutils_dir="$(sibling_dir coreutils)"
     if [[ ! -d "$coreutils_dir" ]]; then
         echo "⚠️  coreutils source not found at $coreutils_dir, skipping"
         return 0
@@ -727,7 +741,7 @@ build_coreutils() {
 build_brush() {
     local arch="$1"
     echo "🐚 Building $arch brush..."
-    local brush_dir="${LEANDROS_BRUSH_DIR:-$ROOT_DIR/../brush}"
+    local brush_dir="${LEANDROS_BRUSH_DIR:-$(sibling_dir brush)}"
     if [[ ! -d "$brush_dir" ]]; then
         echo "⚠️  brush source not found at $brush_dir, skipping"
         return 0
@@ -1019,7 +1033,7 @@ build_mkfs_xfs() {
 build_disktester() {
     local arch="$1"
     echo "🧪 Building $arch disktester (disks-rs)..."
-    local disks_dir="$ROOT_DIR/../disks-rs"
+    local disks_dir="$(sibling_dir disks-rs)"
     if [[ ! -d "$disks_dir" ]]; then
         echo "⚠️  disks-rs source not found at $disks_dir, skipping"
         return 0
@@ -1055,7 +1069,7 @@ build_grep() {
 build_ripgrep() {
     local arch="$1"
     echo "🔎 Building $arch ripgrep..."
-    local rg_dir="$ROOT_DIR/../ripgrep"
+    local rg_dir="${LEANDROS_RIPGREP_DIR:-$(sibling_dir ripgrep)}"
     if [[ ! -d "$rg_dir" ]]; then
         echo "⚠️  ripgrep source not found at $rg_dir, skipping"
         return 0
@@ -1153,7 +1167,7 @@ build_relibc() {
     local arch="$1"
     echo "📚 Building $arch relibc..."
     local target_spec="$ROOT_DIR/targets/$arch-unknown-leandros.json"
-    local relibc_dir="${LEANDROS_RELIBC_DIR:-$ROOT_DIR/../relibc}"
+    local relibc_dir="${LEANDROS_RELIBC_DIR:-$(sibling_dir relibc)}"
     if [[ ! -d "$relibc_dir" ]]; then
         echo "⚠️  relibc source not found at $relibc_dir, skipping"
         return 0
@@ -1186,7 +1200,7 @@ LIMINE_DIR="$LIMINE_CACHE_DIR/limine-$LIMINE_VERSION-binary"
 build_input_stack_shims
 
 # Doom's General MIDI music uses the same pinned SoundFont on both CPUs.
-if [[ -d "$ROOT_DIR/../doomgeneric" ]]; then
+if [[ -d "$(sibling_dir doomgeneric)" ]]; then
     python3 "$ROOT_DIR/scripts/soundfont.py"
 fi
 
