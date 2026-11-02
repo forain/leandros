@@ -11,7 +11,11 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
 
 use core::ffi::c_void;
 
@@ -96,10 +100,6 @@ pub struct epoll_event {
 }
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> isize;
     pub fn exit(status: c_int) -> !;
@@ -124,19 +124,6 @@ pub struct pollfd { fd: c_int, events: i16, revents: i16 }
 #[derive(Default, Clone, Copy)]
 struct timespec { tv_sec: i64, tv_nsec: i64 }
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start", ".global _start", "_start:",
-    "   xor rbp, rbp", "   mov rdi, rsp", "   mov rsi, offset ev_main",
-    "   and rsp, -16", "   call relibc_start_v1", "   ud2"
-);
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start", ".global _start", "_start:",
-    "   mov x29, #0", "   mov x30, #0", "   mov x0, sp",
-    "   adrp x1, ev_main", "   add x1, x1, :lo12:ev_main",
-    "   and sp, x0, #-16", "   bl relibc_start_v1", "   brk #0"
-);
 
 /// `name=<decimal>` on one line. Used to publish the raw timestamp-resolution
 /// counts alongside the PASS/FAIL lines, so a run that fails the sub-tick check
@@ -672,7 +659,8 @@ unsafe fn cap_main(argc: isize, argv: *mut *mut u8) -> i32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ev_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    let argc = argc_c as isize;
     if argc >= 2 {
         let a1 = *argv.add(1);
         match arg_bytes(argc, argv, 1) {

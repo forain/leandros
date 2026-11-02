@@ -14,7 +14,13 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
+#[allow(unused_imports)]
+use rt::syscall;
 
 use core::ffi::c_void;
 
@@ -100,10 +106,6 @@ pub struct timespec { pub tv_sec: i64, pub tv_nsec: i64 }
 const CLOCK_MONOTONIC: c_int = 1;
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
 
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
@@ -135,7 +137,6 @@ extern "C" {
     pub fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_int) -> pid_t;
     pub fn _exit(status: c_int) -> !;
     pub fn fcntl(fildes: c_int, cmd: c_int, ...) -> c_int;
-    pub fn syscall(sysno: i64, ...) -> i64;
     pub fn open(path: *const u8, flags: c_int, ...) -> c_int;
     pub fn unlink(path: *const u8) -> c_int;
     pub fn sendmsg(socket: c_int, msg: *const msghdr, flags: c_int) -> ssize_t;
@@ -161,36 +162,10 @@ pub struct cmsghdr { pub cmsg_len: size_t, pub cmsg_level: c_int, pub cmsg_type:
 
 // ── Assembly entry point (identical to timertest's) ──────────────────────────
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset poll_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, poll_main",
-    "   add x1, x1, :lo12:poll_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 #[no_mangle]
-pub unsafe extern "C" fn poll_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0;
 
     if !test_pipe_epoll_no_false_positive() { failures += 1; }

@@ -46,7 +46,11 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
 
 use core::ffi::c_void;
 
@@ -218,10 +222,6 @@ const POLLIN: i16 = 0x0001;
 const F_DUPFD_CLOEXEC: c_int = 1030;
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
 
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> isize;
@@ -258,33 +258,7 @@ extern "C" {
 fn wifexited(status: c_int) -> bool { (status & 0x7f) == 0 }
 fn wexitstatus(status: c_int) -> c_int { (status >> 8) & 0xff }
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset venus_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, venus_main",
-    "   add x1, x1, :lo12:venus_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 fn out(s: &[u8]) {
     unsafe { write(1, s.as_ptr() as *const c_void, s.len()) };
@@ -1040,7 +1014,7 @@ unsafe fn map_bo_rc(fd: c_int, handle: u32) -> c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0i32;
 
     out(b"--- venustest: virtio-gpu Venus transport (M1) ---\n");

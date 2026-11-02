@@ -26,7 +26,13 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
+#[allow(unused_imports)]
+use rt::syscall;
 
 use core::ffi::c_void;
 
@@ -42,7 +48,6 @@ const EINVAL: i32 = 22;
 const ENODEV: i32 = 19;
 
 extern "C" {
-    pub fn relibc_start_v1(sp: *const c_void, main: unsafe extern "C" fn(isize, *mut *mut u8, *mut *mut u8) -> i32) -> !;
     pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     pub fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     pub fn open(path: *const u8, oflag: c_int, ...) -> c_int;
@@ -55,7 +60,6 @@ extern "C" {
     pub fn pipe(fds: *mut c_int) -> c_int;
     pub fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     pub fn _exit(code: c_int) -> !;
-    pub fn syscall(n: i64, ...) -> i64;
     pub fn ftruncate(fd: c_int, len: i64) -> c_int;
     pub fn socketpair(domain: c_int, ty: c_int, proto: c_int, sv: *mut c_int) -> c_int;
     pub fn sendmsg(fd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
@@ -68,19 +72,7 @@ extern "C" {
 #[repr(C)]
 pub struct PollFd { fd: c_int, events: i16, revents: i16 }
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start", ".global _start", "_start:",
-    "   xor rbp, rbp", "   mov rdi, rsp", "   mov rsi, offset i915_main", "   and rsp, -16",
-    "   call relibc_start_v1", "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start", ".global _start", "_start:",
-    "   mov x29, #0", "   mov x30, #0", "   mov x0, sp", "   adrp x1, i915_main", "   add x1, x1, :lo12:i915_main",
-    "   and sp, x0, #-16", "   bl relibc_start_v1", "   brk #0"
-);
 
 // ── ioctl codes ──────────────────────────────────────────────────────────────
 
@@ -749,7 +741,8 @@ unsafe fn wakebench(fd: c_int, n: u32) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    let argc = argc_c as isize;
     let mut churn_only = 0u32;
     let mut wake_only = 0u32;
     for i in 1..argc.max(1) as usize {

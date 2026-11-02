@@ -31,7 +31,11 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicI32, Ordering};
@@ -42,14 +46,15 @@ type c_ulong = u64;
 type time_t = i64;
 type pid_t = c_int;
 
-pub type sigset_t = u64;
+/// musl: 1024-bit sigset_t.
+pub type sigset_t = [u64; 16];
 
 #[repr(C)]
 pub struct sigaction {
     pub sa_handler: Option<extern "C" fn(c_int)>,
+    pub sa_mask: sigset_t,
     pub sa_flags: c_int,
     pub sa_restorer: Option<unsafe extern "C" fn()>,
-    pub sa_mask: sigset_t,
 }
 
 #[repr(C)]
@@ -112,10 +117,6 @@ fn wstopsig(s: c_int) -> c_int    { (s >> 8) & 0xff }
 fn wifcontinued(s: c_int) -> bool { s == 0xffff }
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
 
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
@@ -142,36 +143,11 @@ extern "C" {
 
 // ── Assembly entry point (identical to sigtest2's) ──────────────────────────
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset job_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, job_main",
-    "   add x1, x1, :lo12:job_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 #[no_mangle]
-pub unsafe extern "C" fn job_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    let argc = argc_c as isize;
     // `jobtest sessionhup`: only the session-leader-exit case.
     if argc > 1 && core::slice::from_raw_parts(*argv.add(1), 10) == b"sessionhup" {
         let ok = test_session_leader_exit_hups_foreground();
@@ -646,7 +622,7 @@ unsafe fn test_orphaned_pgrp_gets_sighup(_slave: c_int, _me: pid_t) -> bool {
         if g == 0 {
             close(gfds[0]);
             HUP_PIPE.store(wfd, Ordering::SeqCst);
-            let act = sigaction { sa_handler: Some(on_hup), sa_flags: 0, sa_restorer: None, sa_mask: 0 };
+            let act = sigaction { sa_handler: Some(on_hup), sa_flags: 0, sa_restorer: None, sa_mask: [0; 16] };
             sigaction(SIGHUP, &act, core::ptr::null_mut());
             write(gfds[1], b"g".as_ptr(), 1);
             loop { nap(); }
@@ -700,7 +676,7 @@ unsafe fn test_orphaned_child_pgrp_gets_sighup() -> bool {
             close(gfds[0]);
             if !own_pgrp() { _exit(90); }
             HUP_PIPE.store(wfd, Ordering::SeqCst);
-            let act = sigaction { sa_handler: Some(on_hup), sa_flags: 0, sa_restorer: None, sa_mask: 0 };
+            let act = sigaction { sa_handler: Some(on_hup), sa_flags: 0, sa_restorer: None, sa_mask: [0; 16] };
             sigaction(SIGHUP, &act, core::ptr::null_mut());
             write(gfds[1], b"c".as_ptr(), 1);
             loop { nap(); }
@@ -754,7 +730,7 @@ unsafe fn slh_job(ch: u8, hup_w: c_int, ready_w: c_int) -> ! {
     if !own_pgrp() { _exit(90); }
     HUP_PIPE.store(hup_w, Ordering::SeqCst);
     SLH_CHAR.store(ch as i32, Ordering::SeqCst);
-    let act = sigaction { sa_handler: Some(on_slh), sa_flags: 0, sa_restorer: None, sa_mask: 0 };
+    let act = sigaction { sa_handler: Some(on_slh), sa_flags: 0, sa_restorer: None, sa_mask: [0; 16] };
     sigaction(SIGHUP, &act, core::ptr::null_mut());
     write(ready_w, b"r".as_ptr(), 1);
     loop { nap(); }

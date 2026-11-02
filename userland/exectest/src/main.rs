@@ -33,7 +33,13 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
+#[allow(unused_imports)]
+use rt::syscall;
 
 use core::ffi::c_void;
 
@@ -71,10 +77,6 @@ fn wifexited(s: c_int) -> bool    { s & 0x7f == 0 }
 fn wexitstatus(s: c_int) -> c_int { (s >> 8) & 0xff }
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
 
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
@@ -95,7 +97,6 @@ extern "C" {
     pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> c_int;
     pub fn getppid() -> pid_t;
     pub fn lseek(fd: c_int, off: i64, whence: c_int) -> i64;
-    pub fn syscall(n: i64, ...) -> i64;
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
     pub fn socketpair(domain: c_int, kind: c_int, protocol: c_int, sv: *mut c_int) -> c_int;
     pub fn pthread_create(
@@ -106,33 +107,7 @@ extern "C" {
     ) -> c_int;
 }
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset exec_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, exec_main",
-    "   add x1, x1, :lo12:exec_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 const ENVP: [*const u8; 3] = [
     b"PATH=/usr/bin:/bin\0".as_ptr(),
@@ -141,7 +116,8 @@ const ENVP: [*const u8; 3] = [
 ];
 
 #[no_mangle]
-pub unsafe extern "C" fn exec_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    let argc = argc_c as isize;
     // Re-exec target for test 10: exit at once, touching nothing.
     if argc > 1 && cstr_is(*argv.add(1), b"--exit0\0") { return 0; }
     // Re-exec targets for test 11.

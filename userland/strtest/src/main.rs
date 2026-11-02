@@ -5,16 +5,16 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
 
 use core::ffi::{c_char, c_int, c_long, c_ulong, c_void, c_double, c_longlong, c_ulonglong};
 use core::ptr::{null, null_mut};
 
 extern "C" {
-    fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
     fn _exit(status: c_int) -> !;
     fn write(fd: c_int, b: *const c_void, n: usize) -> isize;
     fn strtol(s: *const c_char, e: *mut *mut c_char, b: c_int) -> c_long;
@@ -35,19 +35,6 @@ extern "C" {
     static mut environ: *mut *mut c_char;
 }
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start", ".global _start", "_start:",
-    "   xor rbp, rbp", "   mov rdi, rsp", "   mov rsi, offset str_main",
-    "   and rsp, -16", "   call relibc_start_v1", "   ud2"
-);
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start", ".global _start", "_start:",
-    "   mov x29, #0", "   mov x30, #0", "   mov x0, sp",
-    "   adrp x1, str_main", "   add x1, x1, :lo12:str_main",
-    "   and sp, x0, #-16", "   bl relibc_start_v1", "   brk #0"
-);
 
 #[panic_handler]
 fn panic(_i: &core::panic::PanicInfo) -> ! { unsafe { _exit(134) } }
@@ -111,7 +98,7 @@ fn genv(n: &'static [u8]) -> Option<&'static [u8]> {
 }
 
 #[no_mangle]
-unsafe extern "C" fn str_main(_a: isize, _v: *mut *mut u8, _e: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(_a: i32, _v: *mut *mut u8, _e: *mut *mut u8) -> i32 {
     // ---- strtol ----
     check("strtol_null_endptr", unsafe { strtol(cs(b"123\0"), null_mut(), 10) } == 123);
     check("strtol_null_endptr_junk", unsafe { strtol(cs(b"12x\0"), null_mut(), 0) } == 12);

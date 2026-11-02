@@ -35,7 +35,11 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
 
 use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
@@ -83,10 +87,6 @@ fn wifexited(status: c_int) -> bool { (status & 0x7f) == 0 }
 fn wexitstatus(status: c_int) -> c_int { (status >> 8) & 0xff }
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> isize;
     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> isize;
     pub fn open(path: *const u8, flags: c_int, ...) -> c_int;
@@ -108,33 +108,7 @@ extern "C" {
     pub fn pthread_join(thread: *mut c_void, retval: *mut *mut c_void) -> c_int;
 }
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset shm_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, shm_main",
-    "   add x1, x1, :lo12:shm_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
@@ -676,7 +650,8 @@ unsafe fn bench() {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn shm_main(argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(argc_c: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    let argc = argc_c as isize;
     if argc >= 2 { bench(); return 0; }
     let cases: [unsafe fn() -> bool; 13] = [
         t_live_both_ways, t_multi_fork, t_munmap, t_madvise, t_mprotect, t_threads_fork,

@@ -33,29 +33,39 @@ if [[ "$MODE" == "release" ]]; then
     CARGO_ARGS+=(--release)
 fi
 
-# Programs that link against real relibc directly (TLS, real sigaction/
-# pthread/timer syscalls) rather than the minimal leandros-libc, and so need
-# the custom leandros target JSON + build-std instead of the bare
-# *-unknown-none target the rest of userland uses.
-RELIBC_LINKED=(pthreadtest timertest sigtest polltest fdmaxtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest sigtest2 jobtest exectest epolltest wakepolltest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest)
+# Programs that need a real libc (TLS, sigaction/pthread/timer, stdio-less C
+# ABI): no_std crates linked against static musl (<arch>-unknown-linux-musl)
+# through the zig linker wrapper, the same path as spawnwedge/killmt. Their
+# start-up is musl's crt1 -> `main`; userland/muslrt holds the shared pieces.
+# pthreadtest sigtest sigtest2 timertest epolltest wakepolltest still build
+# against relibc (RELIBC_LINKED) until they are ported too.
+MUSL_LINKED=(polltest fdmaxtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest jobtest exectest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest)
+RELIBC_LINKED=(pthreadtest timertest sigtest sigtest2 epolltest wakepolltest)
 
 EXCLUDE_ARGS=()
-for prog in "${RELIBC_LINKED[@]}"; do
+for prog in "${MUSL_LINKED[@]}" "${RELIBC_LINKED[@]}"; do
     EXCLUDE_ARGS+=(--exclude "$prog")
 done
 
 if [[ "$TARGET" == "aarch64-unknown-none" ]]; then
     LEANDROS_TARGET="targets/aarch64-unknown-leandros.json"
     LEANDROS_TARGET_NAME="aarch64-unknown-leandros"
+    MUSL_ARCH="aarch64"
 else
     LEANDROS_TARGET="targets/x86_64-unknown-leandros.json"
     LEANDROS_TARGET_NAME="x86_64-unknown-leandros"
+    MUSL_ARCH="x86_64"
 fi
+MUSL_TARGET="${MUSL_ARCH}-unknown-linux-musl"
+MUSL_RUSTFLAGS="-C linker=$PWD/scripts/linker-${MUSL_ARCH}-musl.sh -C link-self-contained=no -C relocation-model=static"
 
 if $CHECK; then
     echo "[userland] cargo check …"
     cargo check "${CARGO_ARGS[@]}" "${EXCLUDE_ARGS[@]}"
 
+    for prog in "${MUSL_LINKED[@]}"; do
+        RUSTFLAGS="$MUSL_RUSTFLAGS" cargo check --manifest-path userland/Cargo.toml -p "$prog" --target "$MUSL_TARGET"
+    done
     for prog in "${RELIBC_LINKED[@]}"; do
         cargo check --manifest-path userland/Cargo.toml -p "$prog" --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec
     done
@@ -70,6 +80,13 @@ cargo build "${CARGO_ARGS[@]}" "${EXCLUDE_ARGS[@]}"
 
 OUT="userland/target/${TARGET}/${MODE}"
 mkdir -p "$OUT"
+
+for prog in "${MUSL_LINKED[@]}"; do
+    echo "[userland] Building $prog (musl)..."
+    RUSTFLAGS="$MUSL_RUSTFLAGS" \
+    cargo build --manifest-path userland/Cargo.toml -p "$prog" --target "$MUSL_TARGET" --release
+    cp "userland/target/${MUSL_TARGET}/release/$prog" "${OUT}/$prog"
+done
 
 for prog in "${RELIBC_LINKED[@]}"; do
     echo "[userland] Building $prog..."

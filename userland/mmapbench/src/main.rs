@@ -9,7 +9,11 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -35,10 +39,6 @@ const O_CREAT: c_int = 0x40;
 pub struct timespec { pub tv_sec: time_t, pub tv_nsec: c_long }
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> isize;
     pub fn _exit(status: c_int) -> !;
     pub fn open(path: *const u8, flags: c_int, mode: c_int) -> c_int;
@@ -55,33 +55,7 @@ extern "C" {
 
 // ── Assembly entry point (identical to forktest's) ───────────────────────────
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset bench_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, bench_main",
-    "   add x1, x1, :lo12:bench_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 #[cfg(target_arch = "aarch64")]
 const NR_MEMFD: usize = 279;
@@ -193,7 +167,7 @@ unsafe fn sysstat() {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn bench_main(_argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(_argc: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut iters = 2000u64;
     if _argc > 1 {
         let a = *argv.add(1);

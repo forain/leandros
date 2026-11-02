@@ -4,7 +4,11 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
 
 use core::ffi::c_void;
 
@@ -52,10 +56,6 @@ const ABS_RZ: u16 = 5;
 const ABS_HAT0X: u16 = 0x10;
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> isize;
     pub fn exit(status: c_int) -> !;
@@ -65,19 +65,6 @@ extern "C" {
     pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
 }
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start", ".global _start", "_start:",
-    "   xor rbp, rbp", "   mov rdi, rsp", "   mov rsi, offset ui_main",
-    "   and rsp, -16", "   call relibc_start_v1", "   ud2"
-);
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start", ".global _start", "_start:",
-    "   mov x29, #0", "   mov x30, #0", "   mov x0, sp",
-    "   adrp x1, ui_main", "   add x1, x1, :lo12:ui_main",
-    "   and sp, x0, #-16", "   bl relibc_start_v1", "   brk #0"
-);
 
 fn report(name: &[u8], ok: bool) -> bool {
     unsafe {
@@ -129,7 +116,7 @@ fn path_of(n: u32, p: &mut [u8; 20]) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ui_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut fails = 0;
     macro_rules! chk { ($n:expr, $c:expr) => { if !report($n, $c) { fails += 1; } } }
     puts(b"--- uinputtest ---\n\0".as_ptr());

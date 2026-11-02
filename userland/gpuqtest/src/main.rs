@@ -38,7 +38,11 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
 
 use core::ffi::c_void;
 
@@ -151,10 +155,6 @@ struct SyncobjWait {
 }
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> isize;
     pub fn exit(status: c_int) -> !;
     pub fn _exit(status: c_int) -> !;
@@ -170,33 +170,7 @@ extern "C" {
     pub fn __errno_location() -> *mut c_int;
 }
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset gpuq_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, gpuq_main",
-    "   add x1, x1, :lo12:gpuq_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 unsafe fn errno() -> i32 { *__errno_location() }
 
@@ -386,7 +360,8 @@ static mut SOLO: Lat = Lat::new();
 static mut STRESSED: Lat = Lat::new();
 
 #[no_mangle]
-pub unsafe extern "C" fn gpuq_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    let argc = argc_c as isize;
     let mut venus = false;
     let mut iters = 300usize;
     let mut i = 1isize;

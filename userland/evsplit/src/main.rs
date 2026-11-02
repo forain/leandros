@@ -32,7 +32,11 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
 
 use core::ffi::c_void;
 
@@ -104,10 +108,6 @@ pub struct epoll_event {
 }
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> isize;
     pub fn exit(status: c_int) -> !;
@@ -128,19 +128,6 @@ extern "C" {
 /// `EVIOCGRAB`, int by value.
 const EVIOCGRAB: u64 = 0x4004_4590;
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start", ".global _start", "_start:",
-    "   xor rbp, rbp", "   mov rdi, rsp", "   mov rsi, offset evsplit_main",
-    "   and rsp, -16", "   call relibc_start_v1", "   ud2"
-);
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start", ".global _start", "_start:",
-    "   mov x29, #0", "   mov x30, #0", "   mov x0, sp",
-    "   adrp x1, evsplit_main", "   add x1, x1, :lo12:evsplit_main",
-    "   and sp, x0, #-16", "   bl relibc_start_v1", "   brk #0"
-);
 
 /// What one reader observed.
 #[repr(C)]
@@ -243,7 +230,8 @@ unsafe fn drain(dev: u32, deadline_ms: i64, grab: bool) -> Tally {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn evsplit_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    let argc = argc_c as isize;
     let expect = if argc > 1 { atou(*argv.offset(1)) } else { 0 };
     // Node to drain: 1 (tablet) by default, 0 (keyboard) to put the two readers
     // up against the in-kernel console drain, which is the third consumer of
