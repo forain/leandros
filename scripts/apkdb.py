@@ -11,8 +11,11 @@ import base64
 import hashlib
 import os
 import re
+import io
 import struct
+import tarfile
 import time
+import zlib
 
 PKG = "leandros-base"
 
@@ -22,8 +25,10 @@ EXCLUDE_FILES = {"etc/apk/world", "etc/apk/arch", "etc/passwd", "etc/group",
 EXCLUDE_PREFIXES = ("lib/apk/", "home/", "root/", "tmp/", "var/", "run/", "proc/",
                     "sys/", "dev/", "mnt/", "media/")
 
+# musl=1.2.5-r99 (the fake provide) is added by mkfs only for LEANDROS_LIBC=zig;
+# with alpine, musl is a real package record (apk_stanza) leandros-base depends on.
 STATIC_PROVIDES = [
-    "musl=1.2.5-r99", "/bin/sh=1", "cmd:sh=1",
+    "/bin/sh=1", "cmd:sh=1",
     "alpine-baselayout=3.6.8-r99", "alpine-baselayout-data=3.6.8-r99",
     "alpine-keys=2.5-r0", "apk-tools-static=2.14.6-r3",
 ]
@@ -138,7 +143,109 @@ def excluded(rel):
     return rel in EXCLUDE_FILES or rel.startswith(EXCLUDE_PREFIXES)
 
 
-def build_installed(files, dir_meta, provides, arch, build_time):
+def musl_excluded(rel):
+    """Paths owned by the real musl package (LEANDROS_LIBC=alpine) or left
+    unowned (/usr/lib/libc.so: a symlink a later `apk add musl-dev` may take)."""
+    return (rel.startswith("lib/ld-musl-") or rel.startswith("lib/libc.musl-")
+            or rel == "usr/lib/libc.so")
+
+
+def _b64sha1(data):
+    return "Q1" + base64.b64encode(hashlib.sha1(data).digest()).decode()
+
+
+def _apk_segments(data):
+    """Split an .apk (concatenated gzip members) -> list of (gz bytes, plain bytes)."""
+    segs = []
+    while data:
+        o = zlib.decompressobj(31)
+        plain = o.decompress(data)
+        n = len(data) - len(o.unused_data)
+        segs.append((data[:n], plain))
+        data = o.unused_data
+    return segs
+
+
+def read_apk(apk_path):
+    """Returns (control_gz, pkginfo{key: [values]}, [(tarinfo, content bytes)])."""
+    raw = open(apk_path, "rb").read()
+    segs = _apk_segments(raw)
+    if len(segs) != 3:
+        raise ValueError("%s: expected signature+control+data segments, got %d" % (apk_path, len(segs)))
+    ctl_gz, ctl = segs[1]
+    t = tarfile.open(fileobj=io.BytesIO(ctl))
+    info = {}
+    for line in t.extractfile(".PKGINFO").read().decode().splitlines():
+        if line and not line.startswith("#") and " = " in line:
+            k, v = line.split(" = ", 1)
+            info.setdefault(k, []).append(v)
+    members = []
+    d = tarfile.open(fileobj=io.BytesIO(segs[2][1]))
+    for m in d:
+        members.append((m, d.extractfile(m).read() if m.isreg() else b""))
+    return len(raw), ctl_gz, info, members
+
+
+def apk_file(apk_path, name):
+    """Content of one regular file of the .apk's data tar."""
+    for m, content in read_apk(apk_path)[3]:
+        if m.name == name and m.isreg():
+            return content
+    raise KeyError(name)
+
+
+def index_checksum(index_tar_gz, pkg):
+    """The C: line of package `pkg` in a signed APKINDEX.tar.gz."""
+    t = tarfile.open(index_tar_gz)
+    idx = t.extractfile("APKINDEX").read().decode()
+    for stanza in idx.split("\n\n"):
+        lines = stanza.split("\n")
+        if "P:" + pkg in lines:
+            return [l for l in lines if l.startswith("C:")][0][2:]
+    raise KeyError(pkg)
+
+
+def apk_stanza(apk_path, index_tar_gz=None):
+    """Installed-db record of a real .apk (what `apk add` would have written).
+    With index_tar_gz, asserts C: equals the repo index's (so apk sees the
+    repository package as identical to the installed one)."""
+    size, ctl_gz, info, members = read_apk(apk_path)
+    chk = _b64sha1(ctl_gz)
+    pkg = info["pkgname"][0]
+    if index_tar_gz:
+        want = index_checksum(index_tar_gz, pkg)
+        if want != chk:
+            raise SystemExit("apkdb: %s C: %s != repository index %s" % (pkg, chk, want))
+    one = lambda k: info.get(k, [""])[0]
+    L = ["C:" + chk, "P:" + pkg, "V:" + one("pkgver"), "A:" + one("arch"),
+         "S:%d" % size, "I:%s" % one("size"), "T:" + one("pkgdesc"), "U:" + one("url"),
+         "L:" + one("license"), "o:" + one("origin"), "m:" + one("maintainer"),
+         "t:" + one("builddate")]
+    if one("commit"):
+        L.append("c:" + one("commit"))
+    for dep in info.get("depend", []):
+        L.append("D:" + dep)
+    if info.get("provides"):
+        L.append("p:" + " ".join(info["provides"]))
+    for m, content in members:
+        if m.isdir():
+            L.append("F:" + m.name.rstrip("/"))
+            L.append("M:%d:%d:%o" % (m.uid, m.gid, m.mode & 0o7777))
+            continue
+        d, _, n = m.name.rpartition("/")
+        L.append("R:" + n)
+        if m.mode & 0o7777 != 0o644 or m.uid or m.gid:
+            L.append("a:%d:%d:%o" % (m.uid, m.gid, m.mode & 0o7777))
+        if m.issym():
+            L.append("Z:" + _b64sha1(m.linkname.encode()))
+        else:
+            sha = m.pax_headers.get("APK-TOOLS.checksum.SHA1")
+            L.append("Z:Q1" + base64.b64encode(bytes.fromhex(sha)).decode() if sha
+                     else "Z:" + _b64sha1(content))
+    return ("\n".join(L) + "\n\n").encode()
+
+
+def build_installed(files, dir_meta, provides, arch, build_time, depends=(), musl_owned=False):
     """files: iterable of absolute image paths (regular files and hard links).
     dir_meta: {absolute dir path: (uid, gid, mode)}.
     Returns the bytes of /lib/apk/db/installed."""
@@ -147,7 +254,7 @@ def build_installed(files, dir_meta, provides, arch, build_time):
     by_dir = {}
     for p in files:
         rel = p.lstrip("/")
-        if excluded(rel):
+        if excluded(rel) or (musl_owned and musl_excluded(rel)):
             continue
         d, _, n = rel.rpartition("/")
         if not d:
@@ -157,6 +264,8 @@ def build_installed(files, dir_meta, provides, arch, build_time):
          "T:LeandrOS base system (owned by the image, not apk)",
          "U:https://leandros.invalid", "L:custom", "o:" + PKG, "t:%d" % build_time,
          "p:" + " ".join(provides)]
+    if depends:
+        L.append("D:" + " ".join(depends))
     for d in sorted(by_dir):
         L.append("F:" + d)
         uid, gid, mode = dir_meta.get("/" + d, (0, 0, 0o755))

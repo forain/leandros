@@ -11,6 +11,24 @@ import os
 import subprocess
 import soundfont
 
+def sibling_dir(name):
+    """The shared sibling checkout ../NAME (same fallback as build-all.sh):
+    a worktree elsewhere has no sibling, so use the main checkout's."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    d = os.path.join(here, "..", name)
+    if not os.path.isdir(d):
+        try:
+            common = subprocess.check_output(
+                ["git", "-C", here, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                stderr=subprocess.DEVNULL, text=True).strip()
+            c = os.path.join(os.path.dirname(os.path.dirname(common)), name)
+            if os.path.isdir(c):
+                d = c
+        except Exception:
+            pass
+    return d
+
+
 # The image uses Linux's on-disk node layout ("lxnode2", scripts/f2fslx.py),
 # written by scripts/f2fslxpop.py; this script gathers the tree.
 
@@ -712,12 +730,39 @@ def main():
               f"dynamic.list (run scripts/musl/relink-libc.sh {arch})",
               file=sys.stderr)
     usr_lib_files = []
-    if os.path.exists(libc_so):
+    # LEANDROS_LIBC=alpine (default): the runtime libc is Alpine 3.21's unmodified
+    # musl-1.2.5-r12 (ports/apk/out/<arch>/musl.apk), owned by apk as a real
+    # package. /lib/ld-musl-<arch>.so.1 is its regular file (PT_INTERP target: the
+    # kernel never resolves a symlink for the interpreter); libc.musl-<arch>.so.1
+    # and /usr/lib/libc.so are symlinks to it. Our zig-linked libc is kept as
+    # /lib/ld-musl-<arch>.so.1.zig for recovery from a static shell.
+    # LEANDROS_LIBC=zig: the previous layout, three hard links to our libc.so.
+    import apkdb
+    _musl_apk = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "..", "ports", "apk", "out", arch, "musl.apk"))
+    libc_mode = os.environ.get("LEANDROS_LIBC", "alpine")
+    if libc_mode not in ("alpine", "zig"):
+        sys.exit(f"LEANDROS_LIBC must be alpine or zig, not {libc_mode!r}")
+    if libc_mode == "alpine" and not os.path.isfile(_musl_apk):
+        if "LEANDROS_LIBC" in os.environ:
+            sys.exit(f"LEANDROS_LIBC=alpine but {_musl_apk} is missing (ports/apk/build.sh {arch})")
+        print(f"WARNING: {_musl_apk} missing; packing the zig libc "
+              f"(run ports/apk/build.sh {arch})", file=sys.stderr)
+        libc_mode = "zig"
+    if libc_mode == "alpine":
+        lib_files.append((f"ld-musl-{arch}.so.1", apkdb.apk_file(_musl_apk, f"lib/ld-musl-{arch}.so.1"), 0o100755))
+        lib_files.append((f"libc.musl-{arch}.so.1", f"ld-musl-{arch}.so.1".encode(), S_IFLNK | 0o777))
+        usr_lib_files.append(("libc.so", f"/lib/ld-musl-{arch}.so.1".encode(), S_IFLNK | 0o777))
+        if os.path.exists(libc_so):
+            lib_files.append((f"ld-musl-{arch}.so.1.zig", libc_so, 0o100755))
+        print(f"libc: Alpine musl-1.2.5-r12 (apk-owned); zig libc kept as ld-musl-{arch}.so.1.zig")
+    elif os.path.exists(libc_so):
         lib_files.append((f"ld-musl-{arch}.so.1", libc_so, 0o100755))
         usr_lib_files.append(("libc.so", libc_so, 0o100755))
         # The musl soname by name (ctypes, ldd-like tools, apk's so: provide);
         # deduped by host path, so a hard link to the loader's inode.
         lib_files.append((f"libc.musl-{arch}.so.1", libc_so, 0o100755))
+        print("libc: zig-linked musl (hard links)")
     for name, rel in (
         ("hello-dyn",    f"test/hello-dyn/hello-dyn-{arch}"),
         ("hello-dyn-rs", f"test/hello-dyn-rs/hello-dyn-rs-{arch}"),
@@ -2015,7 +2060,7 @@ def main():
         bin_files.append(("disktester", p, 0o100755))
     # ripgrep (`rg`), built UNMODIFIED from the sibling checkout; the image
     # has no grep.
-    p = f"../ripgrep/target/{_musl_triple}/release/rg"
+    p = f"{sibling_dir('ripgrep')}/target/{_musl_triple}/release/rg"
     if os.path.exists(p):
         bin_files.append(("rg", p, 0o100755))
     # grep/egrep/fgrep: userland/grep, a POSIX grep front end that runs /bin/rg
@@ -2872,6 +2917,10 @@ def main():
                                               "..", "ports", "apk", "out", arch))
     if os.path.isfile(os.path.join(_apk_root, "usr", "sbin", "apk.static")):
         _apk_n, _apk_bytes, _apk_won = _overlay_port_tree(_apk_root)
+        if libc_mode == "alpine":        # pin the real musl package in world
+            m4_share_files[:] = [(d, n, os.path.join(_apk_root, "world.alpine"))
+                                 if (d, n) == ("/etc/apk", "world") else (d, n, h)
+                                 for d, n, h in m4_share_files]
         bin_files.append(("apk", os.path.join(_apk_root, "usr", "sbin", "apk"), 0o100755))
         print(f"  apk-tools: {_apk_n} file(s), {_apk_bytes // 1024} KiB from {_apk_root}")
     else:
@@ -2927,7 +2976,7 @@ def main():
     # Optional binaries are skipped silently when their build output is absent.
     # Say so, and let LEANDROS_REQUIRE=rg,grep,dmesg,coreutils make it fatal.
     _opt_src = {
-        "rg": f"../ripgrep/target/{_musl_triple}/release/rg",
+        "rg": f"{sibling_dir('ripgrep')}/target/{_musl_triple}/release/rg",
         "grep": f"userland/grep/target/{_musl_triple}/release/grep",
         "dmesg": "userland/dmesg/dmesg.sh",
         "coreutils": coreutils_bin,
@@ -3207,7 +3256,9 @@ def main():
                       if t.startswith("ca-certificates-bundle-")][0][len("ca-certificates-bundle-"):]
         except (OSError, IndexError):
             pass
-        _provs = list(apkdb.STATIC_PROVIDES) + [f"so:libc.musl-{arch}.so.1=1"]
+        _provs = list(apkdb.STATIC_PROVIDES)
+        if libc_mode == "zig":
+            _provs += ["musl=1.2.5-r99", f"so:libc.musl-{arch}.so.1=1"]
         if _caver:
             _provs.append(f"ca-certificates-bundle={_caver}")
         _provs += apkdb.closure_provides(_p_dirs)
@@ -3223,7 +3274,13 @@ def main():
                   if (lx_pop.files[nid]["mode"] & 0o170000) == 0o100000]
         _dmeta = {pth: (o[1], o[2], o[0]) for ino, pth in dir_nodes.items()
                   for o in [dir_owner.get(ino, (0o040755, 0, 0))]}
-        _db = apkdb.build_installed(_files, _dmeta, _provs, arch, BUILD_TIME)
+        _db = apkdb.build_installed(_files, _dmeta, _provs, arch, BUILD_TIME,
+                                    depends=["musl"] if libc_mode == "alpine" else (),
+                                    musl_owned=libc_mode == "alpine")
+        if libc_mode == "alpine":
+            _idx = os.path.expanduser(os.path.join(os.environ.get("LEANDROS_APK_CACHE", "~/.cache/leandros/apk"),
+                                                   arch, "APKINDEX.tar.gz"))
+            _db += apkdb.apk_stanza(_musl_apk, _idx if os.path.isfile(_idx) else None)
         add_files_to_dir(_path_to_ino["/lib/apk/db"], [("installed", _db, 0o100644)])
         _nr = _db.count(b"\nR:")
         print(f"apk: leandros-base owns {_nr} files, "

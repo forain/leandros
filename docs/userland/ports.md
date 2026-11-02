@@ -65,26 +65,28 @@ apk-tools-static and alpine-keys are pinned by version and sha256. It runs as a
 
 `sudo apk add jq htop` and `apk del jq htop` work on the running root. `/usr/sbin/apk` (also
 `/bin/apk`) is a `#!/bin/sh` wrapper from [apk-wrapper.sh](../../ports/apk/apk-wrapper.sh): it
-refuses `leandros-base`, `musl` and `--purge` as arguments, creates `/lib/apk/exec` and the
+refuses `leandros-base`, `--purge` and `del musl` as arguments (`add musl-dev`, `upgrade` and `fix` work), creates `/lib/apk/exec` and the
 cache directories, and execs `apk.static`. apk runs install scripts in a chroot, so it needs
 root (`sudo`).
 
 mkfs ([apkdb.py](../../scripts/apkdb.py)) generates `/lib/apk/db/installed` with one package,
-`leandros-base`, and `/etc/apk/world` keeps it. The package owns every base file except
-`/lib/apk`, `/etc/apk/{world,arch}`, `passwd`/`group`/`shadow`/`resolv.conf` and the
+`leandros-base`, plus (default `LEANDROS_LIBC=alpine`) a real `musl-1.2.5-r12` record generated
+from the pinned `.apk` (`apkdb.apk_stanza`, `C:` checked against the repository index);
+`/etc/apk/world` keeps `leandros-base` and `musl=1.2.5-r12`, and `leandros-base` depends on
+`musl`. The package owns every base file except the musl files, `/usr/lib/libc.so` (unowned, so
+`apk add musl-dev` can take it), `/lib/apk`, `/etc/apk/{world,arch}`, `passwd`/`group`/`shadow`/`resolv.conf` and the
 `home root tmp var run proc sys dev mnt media` trees. It provides:
 
 - `so:<soname>=<ver>` for every ELF in `/lib` and `/usr/lib`, so apk does not pull Alpine
   copies of natively built libraries (wayland, drm, mesa);
-- `so:libc.musl-<arch>.so.1`, `musl`, `/bin/sh`, `alpine-baselayout*`, `alpine-keys`,
+- `/bin/sh`, `alpine-baselayout*`, `alpine-keys`,
   `apk-tools-static`, `ca-certificates-bundle`;
 - one `<pkg>=<ver>` for each Alpine package named in the ports' `CLOSURE.txt` and `GIT-VERSION`
   (so `apk add nano` is satisfied by the base).
 
 Conflict policy: a package that ships a base file fails with apk's own `trying to overwrite X
-owned by leandros-base`. `--force-overwrite` bypasses it and is unsupported. The libc is also
-packed as `/lib/libc.musl-<arch>.so.1` (a hard link to the loader) for tools that open it by
-name. Install scripts run under brush; `/usr/sbin/busybox.static` plus `adduser`, `addgroup`,
+owned by leandros-base`. `--force-overwrite` bypasses it and is unsupported. See [libc.md](libc.md#alpine-musl-as-the-runtime-libc) for the libc layout
+(`LEANDROS_LIBC=zig` restores the old fake `musl=1.2.5-r99` provide and the hard links). Install scripts run under brush; `/usr/sbin/busybox.static` plus `adduser`, `addgroup`,
 `deluser` and `delgroup` shims serve the packages that call them. Triggers, openrc and
 services are out of scope.
 

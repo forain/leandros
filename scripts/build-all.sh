@@ -670,9 +670,14 @@ build_apk() {
     if [[ -f "$stamp" ]] \
        && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
         echo "  up to date ($port/out/$arch)"
-        return 0
+    else
+        "$port/build.sh" "$arch" || echo "⚠️  apk-tools $arch staging failed; the image ships without apk.static"
     fi
-    "$port/build.sh" "$arch" || echo "⚠️  apk-tools $arch staging failed; the image ships without apk.static"
+    # LEANDROS_LIBC=alpine (default): the image's libc is Alpine's musl .apk
+    # staged above; fail the build if its exported ABI drifted from the golden list.
+    if [[ "${LEANDROS_LIBC:-alpine}" == alpine && -f "$port/out/$arch/musl.apk" ]]; then
+        "$ROOT_DIR/scripts/musl/alpine-parity.sh" "$arch" || exit 1
+    fi
 }
 
 # Function to build bottom
