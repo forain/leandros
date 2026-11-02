@@ -104,6 +104,8 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
         return EBUSY;
     }
     registry::unbind_upper(m.id);
+    // Driver-ordered stop while bus mastering is still on (RX/TX off, ring flush, MAC reset).
+    super::exports::pm_unload_quiesce(m.id);
     // D3 step 3: the device goes inert (INTx, MSI/MSI-X, bus mastering off) before the lower drain and exit().
     super::lower::quiesce_pci(m.id);
     g.stopping.store(true, Ordering::SeqCst);

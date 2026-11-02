@@ -42,6 +42,22 @@ pub extern "C" fn kapi_pm_register(owner: KmodId, suspend: Option<KPmFn>, resume
 /// Failed init: drop every hook table of `owner`.
 pub fn pm_unregister_owner(owner: KmodId) { PM_LIST.lock().retain(|m| m.owner != owner); }
 
+/// Unload step 0 (before `quiesce_pci`): run the module's own `shutdown` hooks while bus mastering
+/// is still on, so a driver can stop its DMA engine in order (RX/TX off, ring flush, MAC reset).
+/// Returns how many hooks ran.
+pub fn pm_unload_quiesce(owner: KmodId) -> usize {
+    let mods: alloc::vec::Vec<ModPm> = PM_LIST.lock().iter().filter(|m| m.owner == owner).copied().collect();
+    let mut n = 0;
+    for m in &mods {
+        if let Some(r) = pm_run(m, PmOp::Shutdown) {
+            n += 1;
+            let line = match r { Ok(s) | Err(s) => s };
+            if !line.is_empty() { drivers::pci::serial_debug(&alloc::format!("[kmod] unload quiesce: {}\n", line)); }
+        }
+    }
+    n
+}
+
 /// Number of hook tables registered by `owner` (ktest).
 pub fn pm_count(owner: KmodId) -> usize { PM_LIST.lock().iter().filter(|m| m.owner == owner).count() }
 
