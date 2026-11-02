@@ -6538,6 +6538,17 @@ fn gen_modules() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.modules", &out, false)
 }
 
+/// `/proc/kmod_buildid`: this kernel's build-id in hex (the `lib/modules/<id>/` directory
+/// name). The initrd's copy of that directory is openable by path but not listable, and an
+/// installed disk root has no /lib/modules at all, so `kmodctl load <name>` asks here.
+fn gen_kmod_buildid() -> Option<VnodeKind> {
+    let mut out = alloc::vec![0u8; 128];
+    extern "C" { fn arch_kmod_buildid(buf: *mut u8, cap: usize) -> usize; }
+    let n = unsafe { arch_kmod_buildid(out.as_mut_ptr(), out.len()) };
+    out.truncate(n);
+    proc_snapshot(b"/tmp/.kmod_buildid", &out, false)
+}
+
 /// `/proc/pcache`: the unified page cache (`mm::pagecache`), one
 /// `name value` per line; counters are cumulative pages since boot.
 /// f2fs no-I/O request reruns / requests that gave up (cumulative), and the
@@ -7296,7 +7307,7 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/tryboot"];
+                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/tryboot"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ"];
 
@@ -8080,6 +8091,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/modules" {
             match gen_modules() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/kmod_buildid" {
+            match gen_kmod_buildid() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }

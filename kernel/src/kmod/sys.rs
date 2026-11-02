@@ -159,6 +159,16 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
     0
 }
 
+/// `/proc/kmod_buildid`: the kernel's build-id as lowercase hex plus a newline.
+#[no_mangle]
+pub extern "C" fn arch_kmod_buildid(buf: *mut u8, cap: usize) -> usize {
+    if buf.is_null() || cap == 0 { return 0; }
+    let s = alloc::format!("{}\n", super::buildid::build_id_hex());
+    let n = s.len().min(cap);
+    unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), buf, n); }
+    n
+}
+
 /// `/proc/modules`: `<name> <size> <regs> - <Live|Failed|Loading> 0x<base>` per module.
 #[no_mangle]
 pub extern "C" fn arch_kmod_report(buf: *mut u8, cap: usize) -> usize {

@@ -1,6 +1,7 @@
 // kmodctl: list / load / unload / info for LeandrOS kernel modules.
 //   kmodctl list              pretty /proc/modules
 //   kmodctl load <path>       finit_module(fd, "", 0)
+//   kmodctl load <name>       same, for /lib/modules/<this kernel's build-id>/<name>.kmod (disk root or initrd)
 //   kmodctl unload <name>     delete_module(name, 0) (the kernel refuses: EBUSY)
 //   kmodctl info <path>       dump the 128-byte module header
 // Errors print strerror and the errno number; exit status 1.
@@ -37,8 +38,40 @@ static int cmd_list(void)
     return 0;
 }
 
+// Bare module name -> /lib/modules/<build-id>/<name>.kmod. The id is this kernel's own
+// (/proc/kmod_buildid); the path resolves on the disk root when it has /lib/modules, else in the
+// initrd (openable by path after pivot_root, but not listable, so the id cannot be guessed from a
+// directory scan on an installed root that has no /lib/modules).
+static int cmd_load_name(const char *name)
+{
+    char id[128] = "", path[384], tried[768] = "";
+    size_t n = strlen(name);
+    if (n > 5 && !strcmp(name + n - 5, ".kmod")) n -= 5;
+    if (n == 0 || n > 100) { errno = EINVAL; return fail(name); }
+    FILE *f = fopen("/proc/kmod_buildid", "r");
+    if (f) { if (fgets(id, sizeof id, f)) id[strcspn(id, "\n")] = 0; fclose(f); }
+    if (id[0]) {
+        snprintf(path, sizeof path, "/lib/modules/%s/%.*s.kmod", id, (int)n, name);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            long r = syscall(SYS_finit_module, fd, "", 0);
+            int e = errno;
+            close(fd);
+            if (r < 0) { errno = e; return fail("finit_module"); }
+            printf("loaded %s\n", path);
+            return 0;
+        }
+        snprintf(tried, sizeof tried, "%s (on the root and in the initrd)", path);
+    } else {
+        snprintf(tried, sizeof tried, "/lib/modules/<build-id>/%.*s.kmod (/proc/kmod_buildid unreadable)", (int)n, name);
+    }
+    fprintf(stderr, "kmodctl: module %.*s not found; searched %s\n", (int)n, name, tried);
+    return 1;
+}
+
 static int cmd_load(const char *path)
 {
+    if (!strchr(path, '/')) return cmd_load_name(path);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return fail(path);
     long r = syscall(SYS_finit_module, fd, "", 0);
@@ -92,6 +125,6 @@ int main(int argc, char **argv)
     if (argc == 3 && !strcmp(argv[1], "load")) return cmd_load(argv[2]);
     if (argc == 3 && (!strcmp(argv[1], "unload") || !strcmp(argv[1], "rmmod"))) return cmd_unload(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "info")) return cmd_info(argv[2]);
-    fprintf(stderr, "usage: kmodctl list | load <path> | unload|rmmod <name> | info <path>\n");
+    fprintf(stderr, "usage: kmodctl list | load <path|name> | unload|rmmod <name> | info <path>\n");
     return 2;
 }
