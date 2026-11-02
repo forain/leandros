@@ -28,7 +28,7 @@ python3 scripts/remote.py status          # kernel, uptime, booted slot, boot en
 ## Everyday commands
 
 ```sh
-remote.py run 'uname -a; cat /proc/cmdline'      # exit status passes through
+remote.py run 'uname -a; uptime'                # exit status passes through
 remote.py shell                                  # interactive (pty)
 remote.py push ./file /root/file                 # sha256-verified, temp + rename, skips identical
 remote.py push ./dir /root/dir                   # recursive
