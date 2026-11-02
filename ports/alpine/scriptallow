@@ -1,0 +1,4 @@
+# <pkg> <script>   # justification
+# pre-/post-install scripts are fatal (triggers and *-deinstall/upgrade are recorded, not run at mkfs) unless listed here.
+icu-data-en post-install   # only prints a hint about icu-data-full to stderr
+libglycin post-install   # only prints a hint about loader subpackages to stderr
