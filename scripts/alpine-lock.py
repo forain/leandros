@@ -471,7 +471,7 @@ def make_stub_apk(path, provides):
     pi = "\n".join(["pkgname = leandros-held", "pkgver = 1-r0", "pkgdesc = held stub", "url = https://leandros.invalid",
                     "builddate = 0", "packager = leandros", "size = 0", "arch = noarch",
                     "origin = leandros-held", "license = custom",
-                    "provides = " + " ".join(provides),
+                    ] + ["provides = " + x for x in provides] + [
                     "datahash = " + hashlib.sha256(dgz).hexdigest()]) + "\n"
     ctl = io.BytesIO()
     with tarfile.open(fileobj=ctl, mode="w") as t:
