@@ -90,3 +90,6 @@ BUDDY or zombie line. The laptop is back on good aa47abc412a5.
   a worktree under `.claude/worktrees/` builds an image without `/bin/rg`, and the
   guest `grep` (an rg front end) fails. unloadtest's NETCNT parse then crashes.
   The virtio_net reload itself is healthy.
+- **Laptop /bin/kmodctl** updated on the NVMe root to main 71fa927a's kmodctl
+  (the old one is kept as /bin/kmodctl.prev). On trial 68c5474dd098 the disk's own
+  binary loads `uvc` by name from /run/modules; on good it still lists modules.
