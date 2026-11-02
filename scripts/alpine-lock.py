@@ -501,7 +501,7 @@ apk add --root /R --allow-untrusted --keys-dir /etc/apk/keys --repositories-file
 mkdir -p /out/db
 cp /R/lib/apk/db/installed /out/db/installed
 cp /R/lib/apk/db/triggers /out/db/triggers 2>/dev/null || :
-cp /R/lib/apk/db/scripts.tar /out/db/scripts.tar 2>/dev/null || :
+cp /R/lib/apk/db/scripts.tar* /out/db/ 2>/dev/null || :   # apk-tools 3 writes scripts.tar.gz
 python3 /s/alpine-lock.py _unowned /R /G
 python3 /s/alpine-lock.py _icons /icons.txt /G
 python3 /s/alpine-lock.py _tar /G /out/generated.tar

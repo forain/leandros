@@ -124,11 +124,20 @@ def canon(st):
                 cur.append(line)
             else:
                 cur[-1].append(line)
+        elif line[:2] == "f:":
+            continue        # container artefact: apk flags a package "s" when its post-install failed in the scaffold
         else:
             head.append(line)
     blocks = [(b[0], [x for x in b[1:] if isinstance(x, str)], sorted(map(tuple, (x for x in b[1:] if isinstance(x, list)))))
               for b in blocks]
     return sorted(head), sorted(blocks)
+
+
+def _q1(name):
+    """The container's apk-tools 3 names scripts.tar members <pkg>-<ver>.X1<hex sha1>.<script>;
+    the target apk-tools 2.14 (ports/apk) uses Q1<base64 sha1> of the same control hash. Normalise."""
+    import base64, re
+    return re.sub(r"\.X1([0-9a-f]{40})\.", lambda m: ".Q1" + base64.b64encode(bytes.fromhex(m.group(1))).decode() + ".", name)
 
 
 def crosscheck(arch, dbdir):
@@ -151,16 +160,24 @@ def crosscheck(arch, dbdir):
                 n, [x for x in a[0] if x not in b[0]][:3], [x for x in b[0] if x not in a[0]][:3]))
             if a[1] != b[1]:
                 print("    file blocks differ (%d vs %d dirs)" % (len(a[1]), len(b[1])))
+                for x, y in zip(a[1], b[1]):
+                    if x != y:
+                        print("      ours   %s" % (x,))
+                        print("      theirs %s" % (y,))
+                        break
             bad += 1
     # scripts.tar names and triggers
     import tarfile
     want = {"%s-%s.%s.%s" % (p["name"], p["ver"], p["chk"], s) for p in pkgs for s in p["scripts"]}
     try:
-        have = {m.name for m in tarfile.open(os.path.join(dbdir, "scripts.tar"))}
+        st = os.path.join(dbdir, "scripts.tar")
+        st = st if os.path.exists(st) else st + ".gz"       # apk-tools 3.x names it scripts.tar.gz
+        have = {_q1(m.name) for m in tarfile.open(st)}
     except (OSError, tarfile.TarError):
         have = set()
     have_l = {h for h in have if any(h.startswith("%s-%s." % (p["name"], p["ver"])) for p in pkgs)}
     if want != have_l:
+        print("crosscheck: scripts.tar has %d entries (%d for lock pkgs), e.g. %s" % (len(have), len(have_l), sorted(have)[:3]))
         print("crosscheck: scripts.tar differs: ours-only %s theirs-only %s" % (
             sorted(want - have_l)[:3], sorted(have_l - want)[:3]))
         bad += 1

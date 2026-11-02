@@ -222,27 +222,44 @@ def apk_stanza(apk_path, index_tar_gz=None):
          "S:%d" % size, "I:%s" % one("size"), "T:" + one("pkgdesc"), "U:" + one("url"),
          "L:" + one("license"), "o:" + one("origin"), "m:" + one("maintainer"),
          "t:" + one("builddate")]
+    L = [l for l in L if len(l) > 2 or l[0] in "CPVAS"]        # apk omits empty fields
     if one("commit"):
         L.append("c:" + one("commit"))
-    for dep in info.get("depend", []):
-        L.append("D:" + dep)
+    if one("provider_priority"):
+        L.append("k:" + one("provider_priority"))
+    # apk-tools keeps one D:/p:/r:/i: line per record, space separated
+    if info.get("depend"):
+        L.append("D:" + " ".join(info["depend"]))
     if info.get("provides"):
         L.append("p:" + " ".join(info["provides"]))
+    if info.get("replaces"):
+        L.append("r:" + " ".join(info["replaces"]))
+    if info.get("install_if"):
+        L.append("i:" + " ".join(info["install_if"]))
+    # file records grouped per directory, like apk's db (a package need not ship
+    # explicit directory entries for every directory it puts files in)
+    groups = {}
     for m, content in members:
         if m.isdir():
-            L.append("F:" + m.name.rstrip("/"))
-            L.append("M:%d:%d:%o" % (m.uid, m.gid, m.mode & 0o7777))
+            g = groups.setdefault(m.name.rstrip("/"), {"meta": None, "files": []})
+            g["meta"] = (m.uid, m.gid, m.mode & 0o7777)
             continue
         d, _, n = m.name.rpartition("/")
-        L.append("R:" + n)
+        f = ["R:" + n]
         if m.mode & 0o7777 != 0o644 or m.uid or m.gid:
-            L.append("a:%d:%d:%o" % (m.uid, m.gid, m.mode & 0o7777))
+            f.append("a:%d:%d:%o" % (m.uid, m.gid, m.mode & 0o7777))
         if m.issym():
-            L.append("Z:" + _b64sha1(m.linkname.encode()))
+            f.append("Z:" + _b64sha1(m.linkname.encode()))
         else:
             sha = m.pax_headers.get("APK-TOOLS.checksum.SHA1")
-            L.append("Z:Q1" + base64.b64encode(bytes.fromhex(sha)).decode() if sha
+            f.append("Z:Q1" + base64.b64encode(bytes.fromhex(sha)).decode() if sha
                      else "Z:" + _b64sha1(content))
+        groups.setdefault(d, {"meta": None, "files": []})["files"].extend(f)
+    for d, g in groups.items():
+        L.append("F:" + d)
+        if g["meta"] and g["meta"] != (0, 0, 0o755):      # apk omits the default dir mode
+            L.append("M:%d:%d:%o" % g["meta"])
+        L.extend(g["files"])
     return ("\n".join(L) + "\n\n").encode()
 
 
