@@ -55,6 +55,9 @@ f2fsync, so no knob is added; only the flashed `factory` entry (a3f226cc)
 predates it. It is never guarded, so booting factory after an unclean shutdown
 of a new kernel loses the last <=30 s of fsyncs until the stick is re-flashed.
 
+**systemd-boot dual boot (EliteBook NVMe).** The firmware boots systemd-boot whose default is Linux; LeandrOS is `leandros.conf`. The kernel has no EFI runtime SetVariable, so LeandrOS cannot set `LoaderEntryOneShot` itself. Use `--via-linux USER@HOST` (or `LEANDROS_DUALBOOT_LINUX=forain@172.16.149.179`) with `reboot` / `deploy-kernel --reboot`: after the trial is armed and LeandrOS reboots, remote.py waits for the Linux sshd, runs `sudo -n bootctl set-oneshot leandros.conf && sudo -n systemctl reboot`, then waits for LeandrOS as usual. Opt-in; a no-op when unset, and ignored on QEMU and the Pi.
+
+
 Promote: `remote.py promote` (or `deploy-kernel --reboot --promote`, which
 promotes only when the check passed). Promoting copies the trial's cmdline to
 the good entry and then strips `netwatch=`/`netwatch.*` from it, and `espctl

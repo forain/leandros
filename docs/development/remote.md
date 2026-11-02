@@ -67,6 +67,9 @@ Since lane netwatch2 (2026-10-24) the watchdog does not only look at boot. When 
 
 ### When a trial does not come back
 
+**systemd-boot dual boot (EliteBook NVMe).** The firmware boots systemd-boot whose default is Linux; LeandrOS is `leandros.conf`. The kernel has no EFI runtime SetVariable, so LeandrOS cannot set `LoaderEntryOneShot` itself. Use `--via-linux USER@HOST` (or `LEANDROS_DUALBOOT_LINUX=forain@172.16.149.179`) with `reboot` / `deploy-kernel --reboot`: after the trial is armed and LeandrOS reboots, remote.py waits for the Linux sshd, runs `sudo -n bootctl set-oneshot leandros.conf && sudo -n systemctl reboot`, then waits for LeandrOS as usual. Opt-in; a no-op when unset, and ignored on QEMU and the Pi.
+
+
 `deploy-kernel --reboot` and `reboot` wait 300 s by default and then say what to do:
 
 1. The trial reached init: it already set the default back to the fallback, so a power cycle boots the good kernel. With `netwatch=` this happens by itself when the network is what broke.
