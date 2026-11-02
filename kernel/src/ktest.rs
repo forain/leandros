@@ -931,7 +931,7 @@ fn kmodkapi_w2(t: &mut T) {
         t.check(preg(owner, Some(kt_pm_w2), Some(kt_pm_w2), None, 1) == 0, "w2: pm_register ok");
         t.check(preg(other, Some(kt_pm_w2), None, None, 2) == 0, "w2: second pm_register ok (list, no -16)");
         let ops = KPmOps { size: core::mem::size_of::<KPmOps>() as u32, phase: pm_phase::GPU, suspend: Some(kt_pm_w2),
-                           resume: None, freeze: None, thaw: None, shutdown: Some(kt_pm_w2), kexec_quiesce: None, resume_check: None };
+                           resume: None, freeze: None, thaw: None, shutdown: Some(kt_pm_w2), kexec_quiesce: None, resume_check: None, unload_quiesce: None };
         t.check(preg2(owner, &ops, 3) == 0, "w2: pm_register2 ok");
         t.check(preg2(owner, core::ptr::null(), 3) == -22, "w2: pm_register2 null -> -22");
         let bad = KPmOps { phase: 99, ..ops };

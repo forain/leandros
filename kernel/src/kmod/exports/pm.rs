@@ -12,11 +12,11 @@ pub(super) static PM_LIST: spin::Mutex<alloc::vec::Vec<ModPm>> = spin::Mutex::ne
 
 /// Which hook of a `KPmOps` to run.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PmOp { Suspend, Resume, Shutdown, KexecQuiesce }
+pub enum PmOp { Suspend, Resume, Shutdown, KexecQuiesce, UnloadQuiesce }
 
 pub(super) fn pick(o: &KPmOps, op: PmOp) -> Option<KPmFn> {
     match op { PmOp::Suspend => o.suspend, PmOp::Resume => o.resume, PmOp::Shutdown => o.shutdown,
-               PmOp::KexecQuiesce => o.kexec_quiesce }
+               PmOp::KexecQuiesce => o.kexec_quiesce, PmOp::UnloadQuiesce => o.unload_quiesce }
 }
 
 /// Register a hook table in `ops.phase`. 0 ok, -22 bad table. Several modules may register.
@@ -35,21 +35,21 @@ pub extern "C" fn kapi_pm_register2(owner: KmodId, ops: *const KPmOps, ctx: usiz
 pub extern "C" fn kapi_pm_register(owner: KmodId, suspend: Option<KPmFn>, resume: Option<KPmFn>,
                                    shutdown: Option<KPmFn>, ctx: usize) -> i32 {
     let o = KPmOps { size: core::mem::size_of::<KPmOps>() as u32, phase: pm_phase::NET, suspend, resume,
-                     freeze: None, thaw: None, shutdown, kexec_quiesce: None, resume_check: None };
+                     freeze: None, thaw: None, shutdown, kexec_quiesce: None, resume_check: None, unload_quiesce: None };
     kapi_pm_register2(owner, &o, ctx)
 }
 
 /// Failed init: drop every hook table of `owner`.
 pub fn pm_unregister_owner(owner: KmodId) { PM_LIST.lock().retain(|m| m.owner != owner); }
 
-/// Unload step 0 (before `quiesce_pci`): run the module's own `shutdown` hooks while bus mastering
+/// Unload step 0 (before `quiesce_pci`): run the module's own `unload_quiesce` hooks (not the reboot `shutdown` ones) while bus mastering
 /// is still on, so a driver can stop its DMA engine in order (RX/TX off, ring flush, MAC reset).
 /// Returns how many hooks ran.
 pub fn pm_unload_quiesce(owner: KmodId) -> usize {
     let mods: alloc::vec::Vec<ModPm> = PM_LIST.lock().iter().filter(|m| m.owner == owner).copied().collect();
     let mut n = 0;
     for m in &mods {
-        if let Some(r) = pm_run(m, PmOp::Shutdown) {
+        if let Some(r) = pm_run(m, PmOp::UnloadQuiesce) {
             n += 1;
             let line = match r { Ok(s) | Err(s) => s };
             if !line.is_empty() { drivers::pci::serial_debug(&alloc::format!("[kmod] unload quiesce: {}\n", line)); }

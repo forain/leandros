@@ -137,6 +137,10 @@ extern "C" fn pm_shutdown(_: usize, buf: *mut u8, cap: usize) -> i32 {
     match e1000e::shutdown() { Some(m) => copy_out(&m, buf, cap) as i32, None => 0 }
 }
 
+extern "C" fn pm_unload(_: usize, buf: *mut u8, cap: usize) -> i32 {
+    match e1000e::unload_quiesce() { Some(m) => copy_out(&m, buf, cap) as i32, None => 0 }
+}
+
 static DONE: AtomicBool = AtomicBool::new(false);
 
 fn init() -> i32 {
@@ -147,12 +151,16 @@ fn init() -> i32 {
         Ok(id) => kmod_rt::kinfo!("registered netif {}", id),
         Err(e) => { kmod_rt::kerr!("netdev_register failed: {}", e); return e; }
     }
-    let _ = kmod_kapi::pm::register(Some(pm_suspend), Some(pm_resume), Some(pm_shutdown), 0);
+    let ops = kmod_kapi::pm::KPmOps {
+        size: core::mem::size_of::<kmod_kapi::pm::KPmOps>() as u32, phase: kmod_kapi::pm::pm_phase::NET,
+        suspend: Some(pm_suspend), resume: Some(pm_resume), freeze: None, thaw: None, shutdown: Some(pm_shutdown),
+        kexec_quiesce: None, resume_check: None, unload_quiesce: Some(pm_unload),
+    };
+    let _ = kmod_kapi::pm::register2(&ops, 0);
     0
 }
 
 fn exit() {
-    e1000e::unload_keep_drv_load();
     let n = e1000e::free_rings();
     kmod_rt::kinfo!("freed {} DMA pages", n);
 }

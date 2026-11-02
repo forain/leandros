@@ -198,7 +198,7 @@ fn init() -> i32 {
     }
     let ops = kmod_abi::KPmOps {
         size: core::mem::size_of::<kmod_abi::KPmOps>() as u32, phase: kmod_abi::pm_phase::WIFI,
-        suspend: None, resume: None, freeze: None, thaw: None, shutdown: Some(pm_shutdown), kexec_quiesce: None, resume_check: None,
+        suspend: None, resume: None, freeze: None, thaw: None, shutdown: Some(pm_shutdown), kexec_quiesce: None, resume_check: None, unload_quiesce: None,
     };
     let _ = kmod_kapi::pm::register2(&ops, 0);
     // Probe (power cycle + SDIO host bring-up, up to ~2 s), then the bring-up chain, off the loader's thread.
