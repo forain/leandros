@@ -452,7 +452,10 @@ def cmd_fetch(arch, verify_only=False):
 # ---- generated tar (container) ------------------------------------------------------------
 def _held_provides(arch):
     out = []
-    for h in read_list(os.path.join(ADIR, "held")):
+    # the held file plus every dependency the lock recorded as held (some are
+    # held only because all their providers are, e.g. so:libEGL.so.1)
+    names = sorted(set(read_list(os.path.join(ADIR, "held"))) | {d for d, _ in read_lock(arch)[1]})
+    for h in names:
         if h.startswith("so:"):
             out.append(h + "=0")
         elif h.startswith("/") or h.startswith("cmd:"):
