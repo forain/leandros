@@ -61,16 +61,45 @@ apk-tools-static and alpine-keys are pinned by version and sha256. It runs as a
 | `/etc/apk/keys`, `/etc/apk/repositories` | the Alpine release keys, and 3.21 main + community over https |
 | `/etc/ssl/certs/ca-certificates.crt`, `/etc/ssl/cert.pem` | Alpine's CA bundle. The image had no CA store before; Firefox uses NSS's own |
 
-The image deliberately has no `apk` command. A bare `apk.static add` without `--root` would
-install Alpine's musl over the guest's `/lib/ld-musl-<arch>.so.1`, which is the image's own
-`libc.so`.
+### Live-root apk
+
+`sudo apk add jq htop` and `apk del jq htop` work on the running root. `/usr/sbin/apk` (also
+`/bin/apk`) is a `#!/bin/sh` wrapper from [apk-wrapper.sh](../../ports/apk/apk-wrapper.sh): it
+refuses `leandros-base`, `musl` and `--purge` as arguments, creates `/lib/apk/exec` and the
+cache directories, and execs `apk.static`. apk runs install scripts in a chroot, so it needs
+root (`sudo`).
+
+mkfs ([apkdb.py](../../scripts/apkdb.py)) generates `/lib/apk/db/installed` with one package,
+`leandros-base`, and `/etc/apk/world` keeps it. The package owns every base file except
+`/lib/apk`, `/etc/apk/{world,arch}`, `passwd`/`group`/`shadow`/`resolv.conf` and the
+`home root tmp var run proc sys dev mnt media` trees. It provides:
+
+- `so:<soname>=<ver>` for every ELF in `/lib` and `/usr/lib`, so apk does not pull Alpine
+  copies of natively built libraries (wayland, drm, mesa);
+- `so:libc.musl-<arch>.so.1`, `musl`, `/bin/sh`, `alpine-baselayout*`, `alpine-keys`,
+  `apk-tools-static`, `ca-certificates-bundle`;
+- one `<pkg>=<ver>` for each Alpine package named in the ports' `CLOSURE.txt` and `GIT-VERSION`
+  (so `apk add nano` is satisfied by the base).
+
+Conflict policy: a package that ships a base file fails with apk's own `trying to overwrite X
+owned by leandros-base`. `--force-overwrite` bypasses it and is unsupported. The libc is also
+packed as `/lib/libc.musl-<arch>.so.1` (a hard link to the loader) for tools that open it by
+name. Install scripts run under brush; `/usr/sbin/busybox.static` plus `adduser`, `addgroup`,
+`deluser` and `delgroup` shims serve the packages that call them. Triggers, openrc and
+services are out of scope.
+
+Limits: `apk upgrade` is unsupported (a newer repository library could be picked over a base
+provide and then hit the file conflict). An image refresh (pi_sync, the installer reinstall,
+deploy) rewrites `installed` and `world`: files of user-installed packages stay on disk but the
+database forgets them. [scripts/apkroot-smoke.sh](../../scripts/apkroot-smoke.sh) drives it.
 
 Running Alpine binaries *outside* a chroot, against the guest's libc, is a separate matter:
 
 - `DT_NEEDED libc.musl-<arch>.so.1` needs neither a rewrite nor a symlink for the dynamic
   linker. musl's `load_library` treats any `libc.*` name as itself (the reserved-name check
   in `ldso/dynlink.c`), and the guest's interpreter is that same musl.
-- The real obstacle is aarch64's `__stack_chk_guard`, which the guest `libc.so` does not
+- (Obsolete: the guest `libc.so` exports exactly Alpine 3.21 musl's dynamic symbols, including
+  `__stack_chk_guard`; no preload is needed.) The old obstacle was aarch64's `__stack_chk_guard`, which the guest `libc.so` does not
   export. This is the zig/ld.lld visibility problem recorded in the musl-dynamic notes.
   Until libc exports it, use `LD_PRELOAD=/usr/lib/libleandros_ssp.so.1` for such binaries.
   The repackaged ports keep their `patchelf` rewrite, which is still the right tool for

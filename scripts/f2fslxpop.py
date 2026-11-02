@@ -77,6 +77,12 @@ class Pop:
                 self.by_path[key] = nid
             self.entries.append((parent_ino, name.encode(), nid, dt))
 
+    def paths(self, dir_nodes):
+        """Yields (full_path, nid) for every name added so far (same walk as
+        manifest()); hard-linked names each appear once."""
+        for pino, name, nid, _dt in self.entries:
+            yield dir_nodes[pino].rstrip("/") + "/" + name.decode(), nid
+
     def manifest(self, out_dir, dir_nodes, dir_owner):
         """Writes <out_dir>/manifest.json describing the tree instead of an image
         (scripts/pi_sync.py: update a live root in place). Inline (bytes) contents

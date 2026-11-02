@@ -715,6 +715,9 @@ def main():
     if os.path.exists(libc_so):
         lib_files.append((f"ld-musl-{arch}.so.1", libc_so, 0o100755))
         usr_lib_files.append(("libc.so", libc_so, 0o100755))
+        # The musl soname by name (ctypes, ldd-like tools, apk's so: provide);
+        # deduped by host path, so a hard link to the loader's inode.
+        lib_files.append((f"libc.musl-{arch}.so.1", libc_so, 0o100755))
     for name, rel in (
         ("hello-dyn",    f"test/hello-dyn/hello-dyn-{arch}"),
         ("hello-dyn-rs", f"test/hello-dyn-rs/hello-dyn-rs-{arch}"),
@@ -2869,6 +2872,7 @@ def main():
                                               "..", "ports", "apk", "out", arch))
     if os.path.isfile(os.path.join(_apk_root, "usr", "sbin", "apk.static")):
         _apk_n, _apk_bytes, _apk_won = _overlay_port_tree(_apk_root)
+        bin_files.append(("apk", os.path.join(_apk_root, "usr", "sbin", "apk"), 0o100755))
         print(f"  apk-tools: {_apk_n} file(s), {_apk_bytes // 1024} KiB from {_apk_root}")
     else:
         print(f"  (no apk-tools staged: {_apk_root} missing — ports/apk/build.sh {arch})")
@@ -3187,6 +3191,44 @@ def main():
             m5_exec_by_ino.setdefault(ino, []).append((name, hostpath, 0o100755))
         for ino in sorted(m5_exec_by_ino):
             add_files_to_dir(ino, m5_exec_by_ino[ino])
+
+    # Live-root apk: the generated leandros-base entry in /lib/apk/db/installed
+    # owns every base file, so apk add/del never replaces or removes one.
+    _apk_out = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "..", "ports", "apk", "out", arch))
+    if os.path.isfile(os.path.join(_apk_out, "usr", "sbin", "apk.static")) \
+            and "/lib/apk/db" in _path_to_ino:
+        import apkdb
+        _p_dirs = [os.path.normpath(os.path.join(_apk_out, "..", "..", "..", n, "out", arch))
+                   for n in sorted(os.listdir(os.path.join(_apk_out, "..", "..", "..")))]
+        _caver = ""
+        try:
+            _caver = [t for t in open(os.path.join(_apk_out, "APK-VERSION")).read().split()
+                      if t.startswith("ca-certificates-bundle-")][0][len("ca-certificates-bundle-"):]
+        except (OSError, IndexError):
+            pass
+        _provs = list(apkdb.STATIC_PROVIDES) + [f"so:libc.musl-{arch}.so.1=1"]
+        if _caver:
+            _provs.append(f"ca-certificates-bundle={_caver}")
+        _provs += apkdb.closure_provides(_p_dirs)
+        # The git subpackage git-init-template is install_if git=<ver>, which our
+        # git provide satisfies; its files are in the base already, so provide it.
+        _provs += [p.replace("g" + "it=", "g" + "it-init-template=", 1)
+                   for p in _provs if p.startswith("g" + "it=")]
+        _libs = [(n, h) for n, h, _m in lib_files + usr_lib_files]
+        _libs += [(n, h) for d, n, h in m4_share_files + m5_exec_files if d in ("/lib", "/usr/lib")]
+        _provs += apkdb.so_provides(_libs)
+        _provs = apkdb.dedupe_provides(_provs)
+        _files = [pth for pth, nid in lx_pop.paths(dir_nodes)
+                  if (lx_pop.files[nid]["mode"] & 0o170000) == 0o100000]
+        _dmeta = {pth: (o[1], o[2], o[0]) for ino, pth in dir_nodes.items()
+                  for o in [dir_owner.get(ino, (0o040755, 0, 0))]}
+        _db = apkdb.build_installed(_files, _dmeta, _provs, arch, BUILD_TIME)
+        add_files_to_dir(_path_to_ino["/lib/apk/db"], [("installed", _db, 0o100644)])
+        _nr = _db.count(b"\nR:")
+        print(f"apk: leandros-base owns {_nr} files, "
+              f"{len(_provs)} provides ({sum(p.startswith('so:') for p in _provs)} so:), "
+              f"db {len(_db) // 1024} KiB")
 
     # scripts/pi_sync.py: describe the tree (paths, modes, owners, sha256) and
     # stop; no image is written.
