@@ -26,6 +26,7 @@ import io
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -515,7 +516,7 @@ def cmd_generated(arch):
         make_stub_apk(os.path.join(out, "leandros-held-1-r0.apk"), _held_provides(arch))
         cmd_fetch(arch)
         r = subprocess.run(
-            ["docker", "run", "--rm", "--platform", DOCKER_PLATFORM[arch],
+            ["docker", "run", "--rm", "--name", "apkpkgs-gen-" + arch, "--pids-limit", "512", "--platform", DOCKER_PLATFORM[arch],
              "-v", os.path.join(adir(arch), REL) + ":/pkgs:ro", "-v", out + ":/out", "-v", HERE + ":/s:ro",
              "-v", os.path.join(ROOT, "ports", "firefox", "icons.txt") + ":/icons.txt:ro",
              "alpine:" + REL.lstrip("v"), "sh", "-c", CONTAINER_SH])
@@ -548,26 +549,52 @@ def _owned(R):
     return files, dirs
 
 
-def _unowned(R, G):
+UNOWNED_SKIP = ("lib/apk", "etc/apk", "var", "proc", "sys", "dev", "run", "tmp")
+
+
+def _unowned(R, G, cap=None):
+    """Copy files the packages did not own (trigger output) from R into G.
+    Safe by construction: regular files and symlinks only (never followed),
+    pseudo/host trees skipped, G must be outside R, other filesystems skipped,
+    and the total copied is capped (LEANDROS_UNOWNED_CAP_MB, default 2048)."""
+    if cap is None:
+        cap = int(os.environ.get("LEANDROS_UNOWNED_CAP_MB", "2048")) * 1048576
+    R, G = os.path.realpath(R), os.path.realpath(G)
+    if G == R or G.startswith(R + os.sep) or R.startswith(G + os.sep):
+        die("_unowned: output %s must not overlap the walked tree %s" % (G, R))
     files, _ = _owned(R)
-    for dp, dn, fn in os.walk(R):
+    root_dev = os.lstat(R).st_dev
+    total = 0
+    for dp, dn, fn in os.walk(R, followlinks=False):
         rel_d = os.path.relpath(dp, R)
         if rel_d == ".":
             rel_d = ""
-        if rel_d.startswith(("lib/apk", "etc/apk", "var")):
+        if rel_d.startswith(UNOWNED_SKIP):
             dn[:] = []
             continue
-        for n in fn + [d for d in dn if os.path.islink(os.path.join(dp, d))]:
+        dn[:] = [d for d in dn if not os.path.islink(os.path.join(dp, d))
+                 and os.lstat(os.path.join(dp, d)).st_dev == root_dev
+                 and (rel_d + "/" + d).lstrip("/") not in UNOWNED_SKIP]
+        for n in fn + [d for d in os.listdir(dp) if os.path.islink(os.path.join(dp, d)) and d not in fn]:
             rel = (rel_d + "/" + n).lstrip("/")
             if rel in files:
                 continue
+            src = os.path.join(dp, n)
+            st = os.lstat(src)
+            islnk = stat.S_ISLNK(st.st_mode)
+            if not islnk and not stat.S_ISREG(st.st_mode):
+                continue                       # devices, fifos, sockets
+            if not islnk:
+                total += st.st_size
+                if total > cap:
+                    die("_unowned: copied more than the %d MiB cap (at %s); aborting" % (cap >> 20, rel))
             dst = os.path.join(G, rel)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            src = os.path.join(dp, n)
-            if os.path.islink(src):
+            if islnk:
                 os.symlink(os.readlink(src), dst)
             else:
-                shutil.copy2(src, dst)
+                shutil.copy2(src, dst, follow_symlinks=False)
+    print("_unowned: %d bytes copied" % total)
 
 
 def _icons(listfile, G):
