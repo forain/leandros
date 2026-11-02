@@ -126,6 +126,7 @@ def pi_status_cmd(pi_dir="/boot/pi"):
     return ("uname -v; "
             "echo \"cmdline: $(wc -c < /proc/cmdline | tr -d ' ') bytes, sha256 $(sha256sum /proc/cmdline | cut -c1-8), "
             f"tryboot-marker=$(grep -qw {MARKER} /proc/cmdline && echo yes || echo no)\"; "
+            "echo \"tryboot: $(grep -vq state=off /proc/tryboot 2>/dev/null && cat /proc/tryboot || echo off)\"; "
             "echo booted slot: $(cat /tmp/.pi-booted-slot 2>/dev/null || echo card); "
             f"for s in trial good prev; do echo \"$s: $(cat {pi_dir}/$s/info 2>/dev/null || echo -)\"; done")
 

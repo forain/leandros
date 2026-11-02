@@ -6,19 +6,15 @@
 //! then reads `config.txt` and boots the good slot. Only the token is checked;
 //! the command line is never printed.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use crate::{boot_cmdline, serial_print_str};
 
 const S: u64 = 1_000_000_000;
 const DEFAULT_DEADLINE_S: u64 = 900;
 
-static CONFIRMED: AtomicBool = AtomicBool::new(false);
-/// This boot carries the `leandros.tryboot=1` token.
-static ACTIVE: AtomicBool = AtomicBool::new(false);
+use sched::tryboot_state::{ACTIVE, CONFIRMED, DEADLINE_S, HOLDS, HOLD_UNTIL};
 /// A tryboot reset was armed (RESTART2 "tryboot"); do not clear the flag.
 static ARMED: AtomicBool = AtomicBool::new(false);
-/// Lease end (monotonic ns) of a commit in progress; 0 = not held.
-static HOLD_UNTIL: AtomicU64 = AtomicU64::new(0);
 const HOLD_LEASE_S: u64 = 300;
 
 pub fn note_armed() { ARMED.store(true, Ordering::Release); }
@@ -32,6 +28,7 @@ pub fn before_plain_reset() {
 
 /// A commit is writing the boot FAT: the deadline waits (up to the lease).
 pub fn hold(on: bool) {
+    if on { HOLDS.fetch_add(1, Ordering::Relaxed); }
     HOLD_UNTIL.store(if on { sched::monotonic_ns() + HOLD_LEASE_S * S } else { 0 }, Ordering::Release);
     serial_print_str(if on { "[tryboot] hold: commit in progress\n" } else { "[tryboot] hold released\n" });
 }
@@ -49,6 +46,7 @@ fn watch() -> ! {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(DEFAULT_DEADLINE_S);
+    DEADLINE_S.store(secs, Ordering::Release);
     loop {
         if CONFIRMED.load(Ordering::Acquire) {
             loop { sched::kthread::sleep_ns(3600 * S); }
