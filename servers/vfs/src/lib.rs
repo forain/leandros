@@ -6188,6 +6188,23 @@ fn gen_sysstat() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.sysstat", s.as_bytes(), false)
 }
 
+/// `/proc/tryboot`: `state=off|armed|held|confirmed deadline_s= left_s= holds=`.
+fn gen_tryboot() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    use core::sync::atomic::Ordering::Acquire;
+    use sched::tryboot_state as t;
+    let now = sched::monotonic_ns();
+    let (state, dl) = if !t::ACTIVE.load(Acquire) { ("off", 0) } else {
+        let dl = t::DEADLINE_S.load(Acquire);
+        (if t::CONFIRMED.load(Acquire) { "confirmed" }
+         else if t::HOLD_UNTIL.load(Acquire) > now { "held" } else { "armed" }, dl)
+    };
+    let left = if state == "off" || state == "confirmed" { 0 } else { dl.saturating_sub(now / 1_000_000_000) };
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "state={} deadline_s={} left_s={} holds={}", state, dl, left, t::HOLDS.load(Acquire));
+    proc_snapshot(b"/tmp/.tryboot", s.as_bytes(), false)
+}
+
 /// `/proc/rqhold` (lane deskbusy2): RUN_QUEUE holds per acquire site,
 /// `file:line holds ns_held max_ns ns_spun` (time spent spinning for the lock
 /// before that acquire), cumulative since boot — diff two reads.
@@ -7232,7 +7249,7 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules"];
+                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/tryboot"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ"];
 
@@ -7966,6 +7983,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/sysstat" {
             match gen_sysstat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/tryboot" {
+            match gen_tryboot() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }

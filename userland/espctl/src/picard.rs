@@ -1121,6 +1121,11 @@ pub fn status<D: Disk>(f: &mut Fat<D>, sys: &dyn Sys) -> R<String> {
         s += &format!("s{} cmdline-copies={}\n", n, if silent_cmdline_check(f, n).is_ok() { "match" } else { "MISMATCH" });
     }
     s += &format!("running tag={} trial-marker={} noprefix-marker={}\n", sys.tag(), sys.has_word("leandros.tryboot=1"), sys.has_word("leandros.tryboot=noprefix"));
+    // /proc/tryboot: state=off|armed|held|confirmed deadline_s= left_s= holds=
+    match std::fs::read_to_string("/proc/tryboot") {
+        Ok(t) if !t.contains("state=off") => s += &format!("tryboot: {}\n", t.trim()),
+        _ => s += "tryboot: off\n",
+    }
     Ok(s)
 }
 

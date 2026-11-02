@@ -9078,3 +9078,15 @@ pub mod nvrm_state {
         match s { PROBING => "probing", READY => "ready", FAILED => "failed", _ => "absent" }
     }
 }
+
+/// Pi tryboot deadline state, written by `kernel/src/tryboot.rs`, read by
+/// `/proc/tryboot` (vfs). `DEADLINE_S` 0 = no trial boot.
+pub mod tryboot_state {
+    use core::sync::atomic::{AtomicBool, AtomicU64};
+    pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+    pub static CONFIRMED: AtomicBool = AtomicBool::new(false);
+    pub static DEADLINE_S: AtomicU64 = AtomicU64::new(0);
+    /// Lease end (monotonic ns) of a commit in progress; 0 = not held.
+    pub static HOLD_UNTIL: AtomicU64 = AtomicU64::new(0);
+    pub static HOLDS: AtomicU64 = AtomicU64::new(0);
+}
