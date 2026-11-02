@@ -98,3 +98,10 @@ BUDDY or zombie line. The laptop is back on good aa47abc412a5.
   6 pages freed", same /dev/input nodes before and after, no zombie/BUDDY/panic.
   Unload with a bound USB keyboard (detach of a live input node) is still untested
   anywhere: QEMU only covers autoload with a usb-kbd (autoloadtest.sh usb_hid).
+- **usb_hid with a real USB keyboard bound** (trial 68c5474dd098, keyboard
+  258a:002a as event4): `LOOP usb_hid ok=10 bad=0`. /dev/input/hotplug shows 10
+  `remove event4 kbd` and 11 `add event4 kbd` (one is the initial bind). An open
+  `cat /dev/input/event4` ended (rc 1) at the unload without pinning it. No zombie
+  or panic, and the laptop is back on good. QEMU: lane/hidunload adds the HID=1
+  bound-keyboard loop with an open reader, and lane/hidkey types KEY_A over QMP
+  after the 10th reload and checks that it arrives (82 ok, 0 FAIL).
