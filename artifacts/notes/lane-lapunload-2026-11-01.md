@@ -97,4 +97,4 @@ BUDDY or zombie line. The laptop is back on good aa47abc412a5.
   from /run/modules, `LOOP usb_hid ok=10 bad=0`, each unload "exit rc 0 in 1 ms,
   6 pages freed", same /dev/input nodes before and after, no zombie/BUDDY/panic.
   Unload with a bound USB keyboard (detach of a live input node) is still untested
-  on hardware; QEMU covers it (unloadtest usb_hid section).
+  anywhere: QEMU only covers autoload with a usb-kbd (autoloadtest.sh usb_hid).
