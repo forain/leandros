@@ -144,7 +144,7 @@ mtype -i "$ESP" ::/loader/loader.conf > "$WORK/loader.conf.orig"
 printf 'default leandros.conf\ntimeout 1\nconsole-mode keep\n' > "$WORK/loader.conf.test"
 mcopy -o -i "$ESP" "$WORK/loader.conf.test" ::/loader/loader.conf
 boot_vm leandros --boot-disk="$SC,nvme"
-CMD=$(r 'cat /proc/cmdline'); echo "$CMD" | cut -c1-260
+CMD=$(r 'cat /proc/cmdline'); echo "$CMD" | sed -E 's/([A-Za-z0-9_.]*(psk|password)[A-Za-z0-9_.]*=)[^ ]*/\1<redacted>/g' | cut -c1-260
 echo "$CMD" | grep -qi "root=PARTUUID=$ROOT_PU" && ok "root=PARTUUID=$ROOT_PU" || fail "cmdline root"
 echo "$CMD" | grep -q 'blk.rw=' && ok "blk.rw= on the cmdline" || fail "blk.rw= missing"
 echo "$CMD" | grep -q 'nvme.rw=1' && fail "nvme.rw=1 present"

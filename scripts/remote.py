@@ -94,7 +94,10 @@ STAGE_DIR = "/tmp/remdbg"
 
 
 def die(msg, code=1):
-    print(f"remote: {msg}", file=sys.stderr)
+    # msg may embed a command line or output carrying a kernel cmdline (kexec -l ...)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from cmdline_redact import redact
+    print(f"remote: {redact(str(msg))}", file=sys.stderr)
     sys.exit(code)
 
 

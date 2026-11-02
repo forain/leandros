@@ -43,6 +43,10 @@ RESEND_S = 3.0
 MAX_STALLS = 15
 
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cmdline_redact import redact  # noqa: E402
+
+
 def die(msg):
     print(f"pi-serial-push: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -314,7 +318,7 @@ def kexec_exec(port, marker, timeout):
             if all(a in text for a in marker.split()):
                 print(f"new kernel up, cmdline has: {marker}", file=sys.stderr)
                 return
-            die(f"new kernel up but cmdline lacks {marker}:\n{text}")
+            die(f"new kernel up but cmdline lacks {marker}:\n{redact(text)}")
     die(f"new kernel shell not reached in {timeout}s")
 
 
