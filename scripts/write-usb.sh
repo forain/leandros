@@ -35,6 +35,10 @@
 #             also be edited from any computer the stick is plugged into.
 #
 # Environment:
+#   (x86_64 + Intel-flavoured image (<img>.gpu == intel): the cmdline is
+#   prefixed with `iwlwifi.start=1 i915.uapi=1 i915.exec=1 i915.kms=1
+#   iwlwifi.mgr=1` unless EXTRA_CMDLINE already has `i915.uapi=`; the write
+#   fails if the final cmdline lacks i915.uapi=1 or i915.kms=1.)
 #   LEANDROS_USB_EXTRA_CMDLINE  extra kernel arguments appended to the stick's
 #             cmdline (e.g. `klog.testpanic` to test the panic log path)
 #             Slow-stick emulation for QEMU (lane fsio/readfirst), all off by
@@ -504,7 +508,17 @@ mcopy -oi "$ESP_IMG" "$INITRD"      ::/initrd.gz
 # The stick's own limine.conf: the repo file plus the root= cmdline.
 STICK_CONF="$WORK/limine.conf"
 if (( CMDLINE )); then
-    python3 - "$LIMINE_CONF" "$STICK_CONF" "root=PARTUUID=$ROOT_PARTUUID${LEANDROS_USB_EXTRA_CMDLINE:+ $LEANDROS_USB_EXTRA_CMDLINE}" <<'PY'
+    EXTRA_CL="${LEANDROS_USB_EXTRA_CMDLINE:-}"
+    if [[ "$ARCH" == x86_64 && "$(cat "$F2FS_IMG.gpu" 2>/dev/null)" == intel \
+          && "$EXTRA_CL" != *i915.uapi=* ]]; then
+        EXTRA_CL="iwlwifi.start=1 i915.uapi=1 i915.exec=1 i915.kms=1 iwlwifi.mgr=1${EXTRA_CL:+ $EXTRA_CL}"
+    fi
+    FULL_CL="root=PARTUUID=$ROOT_PARTUUID${EXTRA_CL:+ $EXTRA_CL}"
+    if [[ "$ARCH" == x86_64 && "$(cat "$F2FS_IMG.gpu" 2>/dev/null)" == intel ]]; then
+        [[ "$FULL_CL" == *i915.uapi=1* && "$FULL_CL" == *i915.kms=1* ]] \
+            || die "intel image but cmdline lacks i915.uapi=1 / i915.kms=1: $FULL_CL"
+    fi
+    python3 - "$LIMINE_CONF" "$STICK_CONF" "$FULL_CL" <<'PY'
 import re, sys
 src, dst, arg = sys.argv[1:]
 out, done = [], False
