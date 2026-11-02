@@ -93,3 +93,8 @@ BUDDY or zombie line. The laptop is back on good aa47abc412a5.
 - **Laptop /bin/kmodctl** updated on the NVMe root to main 71fa927a's kmodctl
   (the old one is kept as /bin/kmodctl.prev). On trial 68c5474dd098 the disk's own
   binary loads `uvc` by name from /run/modules; on good it still lists modules.
+- **usb_hid** (trial 68c5474dd098, no USB HID device attached): loaded by name
+  from /run/modules, `LOOP usb_hid ok=10 bad=0`, each unload "exit rc 0 in 1 ms,
+  6 pages freed", same /dev/input nodes before and after, no zombie/BUDDY/panic.
+  Unload with a bound USB keyboard (detach of a live input node) is still untested
+  on hardware; QEMU covers it (unloadtest usb_hid section).
