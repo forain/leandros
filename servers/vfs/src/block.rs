@@ -1094,7 +1094,7 @@ const BLKDISCARDZEROES: usize = 0x127C;
 /// the prober gives up and mkfs.xfs sees sector size 0).
 const BLKGETDISKSEQ: usize = 0x8008_1280;
 /// `BLKBSZGET` / `BLKBSZSET` = `_IOR/_IOW(0x12, 112/113, size_t)`: the soft
-/// block size of the buffer cache. We have no per-bdev buffer cache, so SET
+/// block size of the buffer cache (userspace passes an `int *`, despite `size_t` in the ioctl number). We have no per-bdev buffer cache, so SET
 /// only validates (power of two, 512..=4096, like Linux) and GET reports the
 /// logical block size.
 const BLKBSZGET: usize = 0x8008_1270;
@@ -1153,11 +1153,11 @@ pub fn ioctl(pid: u32, ofd_id: u32, dev: u16, cmd: usize, arg: usize) -> isize {
             put_user(arg, DISK_BLOCK as i32)
         }
         BLKBSZGET => {
-            put_user(arg, lbs as u64)
+            put_user(arg, lbs as i32)
         }
         BLKBSZSET => {
-            let v = match sched::uaccess::read_user::<u64>(arg) { Some(v) => v, None => return -14 };
-            if !(512..=4096).contains(&v) || !v.is_power_of_two() { return -22; }
+            let v = match sched::uaccess::read_user::<i32>(arg) { Some(v) => v, None => return -14 };
+            if !(512..=4096).contains(&v) || !(v as u32).is_power_of_two() { return -22; }
             0
         }
         BLKGETDISKSEQ => {
