@@ -115,9 +115,8 @@ pub unsafe extern "C" fn main(_a: i32, _v: *mut *mut u8, _e: *mut *mut u8) -> i3
     check("strtol_plus", tl(b"+7\0", 10) == (7, 2, 0));
     check("strtol_empty", tl(b"\0", 10) == (0, 0, 0));
     check("strtol_nodigits", tl(b"abc\0", 10) == (0, 0, 0));
-    // musl leaves endptr after skipped whitespace/sign when nothing converts.
-    check("strtol_only_ws", { let r = tl(b"   \0", 10); r.0 == 0 && r.2 == 0 });
-    check("strtol_sign_only", { let r = tl(b"-\0", 10); r.0 == 0 && r.2 == 0 });
+    check("strtol_only_ws", tl(b"   \0", 10) == (0, 0, 0));
+    check("strtol_sign_only", tl(b"-\0", 10) == (0, 0, 0));
     check("strtol_0x_alone", tl(b"0x\0", 0) == (0, 1, 0));
     check("strtol_0x_g", tl(b"0xg\0", 16) == (0, 1, 0));
     {
@@ -129,9 +128,8 @@ pub unsafe extern "C" fn main(_a: i32, _v: *mut *mut u8, _e: *mut *mut u8) -> i3
     check("strtol_base36", tl(b"zz\0", 36) == (1295, 2, 0));
     check("strtol_bad_base1", { let r = tl(b"1\0", 1); r.0 == 0 && r.2 == EINVAL });
     check("strtol_bad_base37", { let r = tl(b"1\0", 37); r.0 == 0 && r.2 == EINVAL });
-    // musl's endptr after an overflowing digit run is one short.
-    check("strtol_overflow", { let r = tl(b"99999999999999999999\0", 10); r.0 == c_long::MAX && (r.1 == 20 || r.1 == 19) && r.2 == ERANGE });
-    check("strtol_underflow", { let r = tl(b"-99999999999999999999\0", 10); r.0 == c_long::MIN && (r.1 == 21 || r.1 == 20) && r.2 == ERANGE });
+    check("strtol_overflow", tl(b"99999999999999999999\0", 10) == (c_long::MAX, 20, ERANGE));
+    check("strtol_underflow", tl(b"-99999999999999999999\0", 10) == (c_long::MIN, 21, ERANGE));
     check("strtol_max", tl(b"9223372036854775807\0", 10) == (c_long::MAX, 19, 0));
     check("strtol_min", tl(b"-9223372036854775808\0", 10) == (c_long::MIN, 20, 0));
     check("strtol_max_plus1", tl(b"9223372036854775808\0", 10) == (c_long::MAX, 19, ERANGE));

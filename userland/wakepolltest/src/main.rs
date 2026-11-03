@@ -20,7 +20,13 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
+#[allow(unused_imports)]
+use rt::syscall;
 
 use core::ffi::c_void;
 
@@ -117,10 +123,6 @@ pub struct itimerspec {
 }
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
 
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: c_int, buf: *const u8, count: size_t) -> ssize_t;
@@ -143,38 +145,11 @@ extern "C" {
     ) -> c_int;
     pub fn pthread_join(thread: pthread_t, retval: *mut *mut c_void) -> c_int;
 
-    pub fn syscall(sysno: c_long, ...) -> c_long;
 }
 
 // ── entry (identical shim to epolltest) ────────────────────────────────────
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset wake_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, wake_main",
-    "   add x1, x1, :lo12:wake_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
@@ -1065,7 +1040,7 @@ unsafe fn test_pipe_close_wakes_writer() -> bool {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wake_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     puts(b"--- wakepolltest start ---\n\0".as_ptr());
 
     // Core coverage: cross-thread eventfd wake stressed in BOTH writer modes.

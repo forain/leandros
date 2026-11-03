@@ -151,13 +151,14 @@ pub unsafe fn test_rt_handler_runs_per_instance() -> bool {
 #[repr(C)]
 struct sigaction_si {
     sa_sigaction: extern "C" fn(c_int, *mut siginfo_t, *mut c_void),
+    sa_mask: sigset_t,
+    _mask_pad: [u64; 15], // musl sigset_t is 1024 bits
     sa_flags: c_int,
     sa_restorer: Option<unsafe extern "C" fn()>,
-    sa_mask: sigset_t,
 }
 
 fn sigaction_info(h: extern "C" fn(c_int, *mut siginfo_t, *mut c_void)) -> sigaction_si {
-    sigaction_si { sa_sigaction: h, sa_flags: SA_SIGINFO, sa_restorer: None, sa_mask: 0 }
+    sigaction_si { sa_sigaction: h, sa_flags: SA_SIGINFO, sa_restorer: None, sa_mask: 0, _mask_pad: [0; 15] }
 }
 
 // ── signalfd: a record per instance, fields filled ─────────────────────────

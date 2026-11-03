@@ -37,10 +37,9 @@ fi
 # ABI): no_std crates linked against static musl (<arch>-unknown-linux-musl)
 # through the zig linker wrapper, the same path as spawnwedge/killmt. Their
 # start-up is musl's crt1 -> `main`; userland/muslrt holds the shared pieces.
-# pthreadtest sigtest sigtest2 timertest epolltest wakepolltest still build
-# against relibc (RELIBC_LINKED) until they are ported too.
-MUSL_LINKED=(polltest fdmaxtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest jobtest exectest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest)
-RELIBC_LINKED=(pthreadtest timertest sigtest sigtest2 epolltest wakepolltest)
+# RELIBC_LINKED is empty now; relibc itself is removed in a later step.
+MUSL_LINKED=(polltest fdmaxtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest jobtest exectest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest pthreadtest timertest sigtest sigtest2 epolltest wakepolltest)
+RELIBC_LINKED=()
 
 EXCLUDE_ARGS=()
 for prog in "${MUSL_LINKED[@]}" "${RELIBC_LINKED[@]}"; do
