@@ -20,7 +20,7 @@
 # over the guest's /lib/ld-musl-<arch>.so.1 (the image's libc.so), so the image
 # deliberately has no `apk` command, only apk.static and this wrapper.
 set -eu
-APK="${APK:-/usr/sbin/apk.static}"
+APK="${APK:-/sbin/apk.static}"
 ARCH=$(uname -m)
 if [ "${1:-}" = --arch ]; then
   [ "$2" = "$ARCH" ] || {

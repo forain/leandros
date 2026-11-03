@@ -44,7 +44,9 @@ def main():
     if "--against" in sys.argv:
         cur = dynsym(open(sys.argv[sys.argv.index("--against") + 1], "rb").read())
     else:
-        apk = os.path.join(HERE, "..", "..", "ports", "apk", "out", arch, "musl.apk")
+        sys.path.insert(0, os.path.join(HERE, ".."))
+        import alpinepkgs
+        apk = alpinepkgs.musl_apk(arch)
         cur = dynsym(apkdb.apk_file(apk, "lib/ld-musl-%s.so.1" % arch))
     if "--update" in sys.argv:
         open(golden, "w").write("\n".join(cur) + "\n")

@@ -8,7 +8,8 @@
 # Installs into the m3 sysroot (so pkg-config finds dbus-1 when the applet is
 # cross-built) and stages the runtime library at
 #   ~/code/leandros-artifacts/libdbus/out/<arch>/libdbus-1.so.3
-# which mkfs ships as /usr/lib/libdbus-1.so.3.
+# which is no longer shipped: the image's libdbus-1.so.3 is Alpine's dbus-libs
+# (ports/alpine); this port only provides the build-time sysroot.
 #
 # Usage: build.sh [aarch64|x86_64|both]   (default: both)
 set -euo pipefail

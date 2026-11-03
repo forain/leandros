@@ -30,7 +30,6 @@ EXCLUDE_PREFIXES = ("lib/apk/", "home/", "root/", "tmp/", "var/", "run/", "proc/
 STATIC_PROVIDES = [
     "/bin/sh=1", "cmd:sh=1",
     "alpine-baselayout=3.6.8-r99", "alpine-baselayout-data=3.6.8-r99",
-    "alpine-keys=2.5-r0", "apk-tools-static=2.14.6-r3",
 ]
 
 
@@ -312,14 +311,19 @@ def control_files(apk_path):
     return scripts, globs
 
 
-def scripts_tar(pkgs):
+def _x1(chk):
+    """apk-tools 3 names script members by the hex sha1 (X1...), the db keeps Q1<base64>."""
+    return "X1" + base64.b64decode(chk[2:]).hex()
+
+
+def scripts_tar(pkgs, x1=False):
     """/lib/apk/db/scripts.tar. pkgs: (name, ver, chk 'Q1...', {script: bytes});
     members are `<name>-<ver>.<chk>.<script>` (apk 2 format), mode 0755."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as t:
         for name, ver, chk, scripts in sorted(pkgs, key=lambda x: x[0]):
             for sc in sorted(scripts):
-                ti = tarfile.TarInfo("%s-%s.%s.%s" % (name, ver, chk, sc))
+                ti = tarfile.TarInfo("%s-%s.%s.%s" % (name, ver, _x1(chk) if x1 else chk, sc))
                 ti.size = len(scripts[sc])
                 ti.mode = 0o755
                 t.addfile(ti, io.BytesIO(scripts[sc]))

@@ -12,6 +12,7 @@ import importlib.util
 import os
 import shutil
 import sys
+import tarfile
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -66,6 +67,54 @@ def stage(arch):
     return entries, stanzas, pkgs
 
 
+def generated_entries(arch):
+    """Entries of the lock's generated tar (trigger outputs: gschemas, mime db, icon caches,
+    fonts.dir, the Firefox icon subset), owned by leandros-base. Busybox applet symlinks
+    that the scaffolding's busybox post-install left behind are skipped."""
+    _, _, gen = lk.read_lock(arch)
+    if not gen:
+        sys.exit("alpinepkgs: %s.lock has no generated tar; run alpine-lock.py refresh %s --generated" % (arch, arch))
+    f = os.path.join(lk.adir(arch), "generated-%s.tar" % gen)
+    if not os.path.exists(f):
+        sys.exit("alpinepkgs: %s missing (the generated tar is part of the cache)" % f)
+    d = os.path.join(lk.adir(arch), "x", "gen-" + gen)
+    if not os.path.exists(os.path.join(d, ".done")):
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+        with tarfile.open(f) as t:
+            t.extractall(d, filter="tar")
+        open(os.path.join(d, ".done"), "w").close()
+    out, dirs = [], set()
+    with tarfile.open(f) as t:
+        for m in t:
+            path = "/" + m.name.rstrip("/").lstrip("./")
+            if m.isdir():
+                continue
+            if m.issym() and (m.linkname.endswith("/busybox") or m.linkname == "busybox"):
+                continue
+            e = {"path": path, "mode": m.mode & 0o7777, "uid": 0, "gid": 0, "pkg": "leandros-base", "size": 0}
+            if m.issym():
+                e.update(kind="symlink", linkname=m.linkname)
+            elif m.isreg():
+                e.update(kind="file", host=os.path.join(d, m.name), size=m.size)
+            else:
+                sys.exit("alpinepkgs: generated tar: unexpected member %s" % m.name)
+            out.append(e)
+            dirs.add(os.path.dirname(path))
+    return out, dirs
+
+
+def musl_apk(arch):
+    """Path of the locked musl .apk in the cache."""
+    lock, _, _ = lk.read_lock(arch)
+    return lk.apk_path(arch, lock["musl"])
+
+
+def world_names(arch):
+    lock, _, _ = lk.read_lock(arch)
+    return [n for n in lk.read_list(os.path.join(lk.ADIR, "world")) if n in lock]
+
+
 def materialize(entries, dest):
     for e in sorted(entries, key=lambda e: (e["kind"] != "dir", e["path"])):
         p = os.path.join(dest, e["path"].lstrip("/"))
@@ -90,8 +139,18 @@ def write_db(pkgs, stanzas, dest):
     open(os.path.join(d, "installed"), "wb").write(b"".join(s for _, s in stanzas))
     open(os.path.join(d, "triggers"), "wb").write(
         apkdb.triggers_lines([(p["chk"], p["globs"]) for p in pkgs]))
-    open(os.path.join(d, "scripts.tar"), "wb").write(
-        apkdb.scripts_tar([(p["name"], p["ver"], p["chk"], p["scripts"]) for p in pkgs if p["scripts"]]))
+    open(os.path.join(d, "scripts.tar.gz"), "wb").write(lk.apkdb_gzip(
+        apkdb.scripts_tar([(p["name"], p["ver"], p["chk"], p["scripts"]) for p in pkgs if p["scripts"]], x1=True)))
+
+
+def db_files(pkgs, stanzas):
+    """{name: bytes} of the vanilla part of /lib/apk/db (installed is appended to by mkfs)."""
+    return {
+        "installed": b"".join(s for _, s in stanzas),
+        "triggers": apkdb.triggers_lines([(p["chk"], p["globs"]) for p in pkgs]),
+        "scripts.tar.gz": lk.apkdb_gzip(apkdb.scripts_tar(
+            [(p["name"], p["ver"], p["chk"], p["scripts"]) for p in pkgs if p["scripts"]], x1=True)),
+    }
 
 
 def base_provides():
