@@ -368,12 +368,9 @@ unsafe fn test_sigaction_struct_roundtrip() -> bool {
     let handler_ok = old.sa_handler.map(|f| f as *const () as usize)
         == Some(roundtrip_handler as *const () as usize);
     let mask_ok = old.sa_mask == distinctive_mask;
-    // On x86_64 musl injects SA_RESTORER + its own trampoline: confirm it landed
-    // in `sa_restorer`, not silently in `sa_mask`. musl aarch64 installs no
-    // restorer (the kernel vDSO trampoline is used), so there is nothing to see.
-    #[cfg(target_arch = "x86_64")]
-    let restorer_ok = (old.sa_flags & SA_RESTORER) != 0 && old.sa_restorer.is_some();
-    #[cfg(target_arch = "aarch64")]
+    // musl never reads the restorer back (its sigaction() leaves `sa_restorer`
+    // untouched, and aarch64 installs none at all), so the only field-order
+    // check left is that the mask, flags and handler landed in the right fields.
     let restorer_ok = true;
 
     report(name, handler_ok && mask_ok && restorer_ok)

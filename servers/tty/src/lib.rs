@@ -877,7 +877,7 @@ fn handle_timer_create(pid: u32, signo: u32, timerid_ptr: usize, sigev_value: u6
         // first timer) *is* NULL once cast to `*mut c_void`. See
         // `handle_timer_settime`/etc. below, which undo the offset.
         let ok = sched::with_current_address_space_mut(|as_| {
-            as_.write_user_buf(timerid_ptr, &((slot as u64) + 1).to_ne_bytes())
+            as_.write_user_buf(timerid_ptr, &((slot as u32) + 1).to_ne_bytes())
         }).unwrap_or(false);
         if !ok {
             // Roll back: the pointer turned out to be unmapped even though
