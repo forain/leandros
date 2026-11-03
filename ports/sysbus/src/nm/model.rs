@@ -540,6 +540,16 @@ impl Model {
         if meta.kind != if_kind::WIFI {
             return;
         }
+        // `wifi.ssid=` on the command line (or an ssid-only wifi.conf) makes the
+        // kernel publish a legacy profile with no passphrase. Showing it as a
+        // saved connection makes a client believe the network is known: the
+        // COSMIC applet then activates it without asking for a password, and
+        // the kernel can only fail it (unsupported-security). Such a profile
+        // carries nothing to reuse, so it is not exported; the client sees an
+        // unknown network, asks, and AddAndActivateConnection saves the real one.
+        if meta.flags & profile_flags::LEGACY != 0 && meta.akm == akm::NONE {
+            return;
+        }
         let uuid = uuid_string(&meta.uuid);
         let s = settings::settings_from_meta(&meta, &uuid);
         match self.conn_by_uuid.get(&uuid).copied() {
@@ -1027,4 +1037,37 @@ impl Ap {
 /// `a{sv}` helper for IP4Config dicts.
 pub fn dict(pairs: Vec<(&str, OwnedValue)>) -> HashMap<String, OwnedValue> {
     pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+}
+
+#[cfg(test)]
+mod legacy_profile_tests {
+    use super::*;
+    use netctl_abi::profiles::Profile;
+
+    fn model() -> Model {
+        Model::new(true, 0)
+    }
+
+    fn profile(ssid: &[u8], psk: &[u8], legacy: bool) -> NcProfileMeta {
+        let p = netctl_abi::profiles::legacy_profile(ssid, psk).expect("profile");
+        let _: &Profile = &p;
+        p.meta(1, if legacy { profile_flags::LEGACY } else { 0 })
+    }
+
+    /// `wifi.ssid=Anvara` without a passphrase: the kernel's legacy profile has
+    /// no secret. It must not appear as a saved connection, or the applet
+    /// treats the secured network as known and never asks for a password.
+    #[test]
+    fn secretless_legacy_profile_is_not_a_saved_connection() {
+        let mut m = model();
+        m.apply(Event::Profile(profile(b"Anvara", b"", true)), Instant::now());
+        assert!(m.conns.values().all(|c| c.ssid != b"Anvara"), "secret-less legacy profile exported");
+    }
+
+    #[test]
+    fn legacy_profile_with_passphrase_is_exported() {
+        let mut m = model();
+        m.apply(Event::Profile(profile(b"Anvara", b"correct-horse", true)), Instant::now());
+        assert!(m.conns.values().any(|c| c.ssid == b"Anvara"));
+    }
 }
