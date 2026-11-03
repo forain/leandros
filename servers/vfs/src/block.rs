@@ -1089,6 +1089,16 @@ const BLKIOMIN: usize = 0x1278;
 const BLKIOOPT: usize = 0x1279;
 const BLKALIGNOFF: usize = 0x127A;
 const BLKDISCARDZEROES: usize = 0x127C;
+/// `BLKGETDISKSEQ` = `_IOR(0x12, 128, __u64)`: a nonzero, per-registration
+/// disk sequence number. libblkid's ioctl topology prober needs it (without it
+/// the prober gives up and mkfs.xfs sees sector size 0).
+const BLKGETDISKSEQ: usize = 0x8008_1280;
+/// `BLKBSZGET` / `BLKBSZSET` = `_IOR/_IOW(0x12, 112/113, size_t)`: the soft
+/// block size of the buffer cache. We have no per-bdev buffer cache, so SET
+/// only validates (power of two, 512..=4096, like Linux) and GET reports the
+/// logical block size.
+const BLKBSZGET: usize = 0x8008_1270;
+const BLKBSZSET: usize = 0x4008_1271;
 
 // Loop device ioctls.
 const LOOP_SET_FD: usize = 0x4C00;
@@ -1141,6 +1151,17 @@ pub fn ioctl(pid: u32, ofd_id: u32, dev: u16, cmd: usize, arg: usize) -> isize {
         }
         BLKPBSZGET | BLKIOOPT => {
             put_user(arg, DISK_BLOCK as i32)
+        }
+        BLKBSZGET => {
+            put_user(arg, lbs as u64)
+        }
+        BLKBSZSET => {
+            let v = match sched::uaccess::read_user::<u64>(arg) { Some(v) => v, None => return -14 };
+            if !(512..=4096).contains(&v) || !v.is_power_of_two() { return -22; }
+            0
+        }
+        BLKGETDISKSEQ => {
+            put_user(arg, dev as u64 + 1)
         }
         BLKALIGNOFF | BLKDISCARDZEROES => {
             put_user(arg, 0i32)
