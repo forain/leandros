@@ -531,9 +531,9 @@ unsafe fn thr_reset() {
     THR_TID.store(0, Ordering::SeqCst);
 }
 
-/// SIGEV_THREAD: relibc runs sigev_notify_function on its own thread with
+/// SIGEV_THREAD: libc runs sigev_notify_function on its own thread with
 /// sigev_value; periodic timers keep calling; timer_delete stops them, also
-/// from inside the callback; a NULL function is EINVAL.
+/// from inside the callback; a NULL function is EINVAL (relibc) or accepted (musl).
 pub unsafe fn test_sigev_thread_callback() -> bool {
     let name = b"sigev_thread_callback\0";
     let me = syscall(nr::GETTID, 0 as c_long) as i32;
@@ -584,8 +584,13 @@ pub unsafe fn test_sigev_thread_callback() -> bool {
 
     // 4. NULL sigev_notify_function -> EINVAL.
     let mut ev = thr_ev(None, 0);
-    let ok4 = timer_create(CLOCK_MONOTONIC, &mut ev as *mut sigevent_thr as *mut sigevent, &mut id) == -1
-        && *__errno_location() == 22;
+    // musl does not validate it (POSIX leaves it undefined): creation succeeds
+    // and the never-armed timer is simply deleted again.
+    let r4 = timer_create(CLOCK_MONOTONIC, &mut ev as *mut sigevent_thr as *mut sigevent, &mut id);
+    let ok4 = if r4 == 0 { timer_delete(id) == 0 } else { r4 == -1 && *__errno_location() == 22 };
 
+    let sub = [b'0' + ok1 as u8, b'0' + ok2 as u8, b'0' + ok3 as u8, b'0' + ok4 as u8, b'\n'];
+    write(1, b"sigev_thread_callback sub-cases: ".as_ptr(), 33);
+    write(1, sub.as_ptr(), 5);
     report(name, ok1 && ok2 && ok3 && ok4)
 }
