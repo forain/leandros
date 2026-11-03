@@ -42,7 +42,7 @@ MUSL_LINKED=(polltest fdmaxtest pipebw ptytest forktest shmtest racetest mmapben
 RELIBC_LINKED=()
 
 EXCLUDE_ARGS=()
-for prog in "${MUSL_LINKED[@]}" "${RELIBC_LINKED[@]}"; do
+for prog in "${MUSL_LINKED[@]}" ${RELIBC_LINKED[@]+"${RELIBC_LINKED[@]}"}; do
     EXCLUDE_ARGS+=(--exclude "$prog")
 done
 
@@ -65,7 +65,7 @@ if $CHECK; then
     for prog in "${MUSL_LINKED[@]}"; do
         RUSTFLAGS="$MUSL_RUSTFLAGS" cargo check --manifest-path userland/Cargo.toml -p "$prog" --target "$MUSL_TARGET"
     done
-    for prog in "${RELIBC_LINKED[@]}"; do
+    for prog in ${RELIBC_LINKED[@]+"${RELIBC_LINKED[@]}"}; do
         cargo check --manifest-path userland/Cargo.toml -p "$prog" --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec
     done
 
@@ -87,7 +87,7 @@ for prog in "${MUSL_LINKED[@]}"; do
     cp "userland/target/${MUSL_TARGET}/release/$prog" "${OUT}/$prog"
 done
 
-for prog in "${RELIBC_LINKED[@]}"; do
+for prog in ${RELIBC_LINKED[@]+"${RELIBC_LINKED[@]}"}; do
     echo "[userland] Building $prog..."
     RUSTFLAGS="-C link-arg=--entry=_start -C link-arg=-static -C linker=rust-lld -C relocation-model=static" \
     cargo build --manifest-path userland/Cargo.toml -p "$prog" --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec --release
