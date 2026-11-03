@@ -13,7 +13,7 @@ LeandrOS userland comes from three places and is linked three ways.
 | Source | Examples | Linked against | Built by |
 |---|---|---|---|
 | In-tree `no_std` programs ([userland/](../../userland/)) | `init`, `login`, `greeter-launch`, `mount`, `lsblk`, `aplay`, `vfstest` | `leandros-libc`, static `ET_EXEC` on `*-unknown-none` | [scripts/build-userland.sh](../../scripts/build-userland.sh) |
-| In-tree tests that need a full libc | `pthreadtest`, `sigtest`, `polltest`, `drmsmoke`, `vttest`, `ping` | relibc (`librelibc.a`), custom `*-unknown-leandros` target | the same script, with `-Z build-std` |
+| In-tree tests that need a full libc | `pthreadtest`, `sigtest`, `polltest`, `drmsmoke`, `vttest`, `ping` | musl, static (`<arch>-unknown-linux-musl`, zig linker wrapper) | the same script (`MUSL_LINKED`) |
 | In-tree `std` crates and ports | `killmt`, `spawnwedge`, `ports/sysbus`, `ports/mkfs-xfs`, greetd, busd | musl, static (`-C relocation-model=static`) | each crate's own `build.sh` |
 | Sibling checkouts | brush, uutils coreutils, bottom, disks-rs | musl, static, through `zig cc` | `scripts/build-all.sh` |
 | Prebuilt or cross-built third-party | COSMIC (including its panel applets, files, edit and screenshot), Mesa, libinput, Firefox, PipeWire, ripgrep, the portal | musl, **dynamic** against the shipped `ld-musl` | `ports/*` recipes, the artifacts tree, Alpine containers |
@@ -24,7 +24,7 @@ accounts, `/etc` files, icon themes and desktop entries are seeded.
 
 | Page | What it covers |
 |---|---|
-| [libc.md](libc.md) | relibc, `leandros-libc`, musl (static and dynamic), and how pthreads are layered between kernel and libc |
+| [libc.md](libc.md) | `leandros-libc`, musl (static and dynamic), and how pthreads are layered between kernel and libc |
 | [programs.md](programs.md) | every program in the image: init, login, the shells, utilities, coreutils, and where the tests are documented |
 | [ports.md](ports.md) | the `ports/` directory — one entry per port with its recipe and design notes — plus Firefox, brush, DOOM, MAME and disks-rs |
 

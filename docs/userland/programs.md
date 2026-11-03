@@ -223,7 +223,7 @@ for a Linux host, so the two runs' result lines can be diffed — Linux is the o
 | Where | What |
 |---|---|
 | [userland/Cargo.toml](../../userland/Cargo.toml) | the workspace and its members |
-| [scripts/build-userland.sh](../../scripts/build-userland.sh) | build, and which programs link relibc |
+| [scripts/build-userland.sh](../../scripts/build-userland.sh) | build, and which programs link musl |
 | [scripts/build-all.sh](../../scripts/build-all.sh) | sibling and port builds (`build_brush`, `build_coreutils`, `build_bottom`, …) |
 | [scripts/mkfs-f2fs-populated.py](../../scripts/mkfs-f2fs-populated.py) | what is installed where, accounts, hardlinks |
 

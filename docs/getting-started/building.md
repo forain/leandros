@@ -1,6 +1,6 @@
 # Building
 
-[`scripts/build-all.sh`](../../scripts/build-all.sh) builds everything — the kernel twice per architecture, the in-tree userland, relibc, the ported software — and writes three disk images per architecture. Always build **release**; there is no supported debug build.
+[`scripts/build-all.sh`](../../scripts/build-all.sh) builds everything — the kernel twice per architecture, the in-tree userland, the ported software — and writes three disk images per architecture. Always build **release**; there is no supported debug build.
 
 ## Usage
 
@@ -21,16 +21,15 @@ A full build from clean takes from several minutes on a fast machine to most of 
 
 Once per run it downloads and caches the Limine bootloader binaries (version 11.4.1, in `.limine-cache/`), builds the input-stack shims (`libseat`, `libudev`, needs zig) and, when `../doomgeneric` exists, stages the SoundFont. Then, for each architecture:
 
-1. **relibc** (`../relibc`), with its C sources pointed at the zig musl wrapper.
-2. **In-tree userland** (`scripts/build-userland.sh --release`): the programs and regression suites under `userland/`, plus the two C conformance tests (`privtest`, `nettest`) when zig is present.
-3. **Ported software**: DOOM, MAME, Firefox, the desktop portal, PipeWire, `bottom`, brush, coreutils, mkfs.fat, mkfs.xfs, `spawnwedge`, `killmt`, disks-rs's `disktester`, then the D-Bus session package (busd, `dbus-run-session`, `session.conf`), the system-bus services (`ports/sysbus`) and the iso-codes data.
-4. **initrd** — a `newc` CPIO holding `/bin/init` and, for any driver configured `=m`, `lib/modules/<build-id>/` ([loadable modules](../kernel/modules.md)); everything else comes from the root file system. It is written uncompressed (`initrd-<arch>.cpio`) and copied to `initrd-<arch>.cpio.gz`, because the kernel's initrd parser does not decompress.
-5. **Kernel**, built twice with `-Z build-std=core,alloc` against the custom target spec `targets/<arch>-unknown-kernel.json`:
+1. **In-tree userland** (`scripts/build-userland.sh --release`): the programs and regression suites under `userland/`, plus the two C conformance tests (`privtest`, `nettest`) when zig is present.
+2. **Ported software**: DOOM, MAME, Firefox, the desktop portal, PipeWire, `bottom`, brush, coreutils, mkfs.fat, mkfs.xfs, `spawnwedge`, `killmt`, disks-rs's `disktester`, then the D-Bus session package (busd, `dbus-run-session`, `session.conf`), the system-bus services (`ports/sysbus`) and the iso-codes data.
+3. **initrd** — a `newc` CPIO holding `/bin/init` and, for any driver configured `=m`, `lib/modules/<build-id>/` ([loadable modules](../kernel/modules.md)); everything else comes from the root file system. It is written uncompressed (`initrd-<arch>.cpio`) and copied to `initrd-<arch>.cpio.gz`, because the kernel's initrd parser does not decompress.
+4. **Kernel**, built twice with `-Z build-std=core,alloc` against the custom target spec `targets/<arch>-unknown-kernel.json`:
    - the **standard** kernel, linked with `linkers/<arch>.ld`, booted by Limine → `target/final-<arch>/kernel`;
    - the **direct-boot** kernel, linked with `linkers/<arch>-direct.ld` → `target/final-<arch>/kernel-direct`, plus a flat binary `kernel-direct.bin` (and, on x86-64, a 32-bit ELF `kernel-direct-32.elf`) when `llvm-objcopy`/`rust-objcopy` is installed.
-6. **Boot image** `leandros-limine-<arch>.img` — 512 MiB, one GPT EFI system partition (FAT32, label `LEANDROS`) holding Limine's EFI loader, `kernel.elf`, the initrd and [`limine/limine.conf`](../../limine/limine.conf). On x86-64 Limine's BIOS stage is installed as well, and a `.vdi` copy is written when `VBoxManage` exists.
-7. **Root volume** `f2fs-data0-<arch>.img`, written by [`scripts/mkfs-f2fs-populated.py`](../../scripts/mkfs-f2fs-populated.py): the full userland — shell, coreutils, test binaries, Mesa, the COSMIC session set, Firefox, accounts in `/etc/shadow`. It is sized from its content and then doubled, so it ships about half free (roughly 3.5 GiB per architecture with everything staged).
-8. **Home volume** `f2fs-data1-<arch>.img` — the persistent `/home` (f2fs label `leandros-home`, written by [`scripts/mkfs-f2fs-home.py`](../../scripts/mkfs-f2fs-home.py)): 8 GiB sparse, seeded with the home skeleton (`/home/leandro`, `/home/cosmic-greeter`). Created only when missing and **never rewritten by a build**, so Claude Code credentials, the Firefox profile and COSMIC settings survive rebuilds. An old-layout data1 (a clone of the root, mounted at `/data` before 2026-10-15) is replaced once, with a message. `--reset-home` (or `LEANDROS_RESET_HOME=1`) recreates it.
+5. **Boot image** `leandros-limine-<arch>.img` — 512 MiB, one GPT EFI system partition (FAT32, label `LEANDROS`) holding Limine's EFI loader, `kernel.elf`, the initrd and [`limine/limine.conf`](../../limine/limine.conf). On x86-64 Limine's BIOS stage is installed as well, and a `.vdi` copy is written when `VBoxManage` exists.
+6. **Root volume** `f2fs-data0-<arch>.img`, written by [`scripts/mkfs-f2fs-populated.py`](../../scripts/mkfs-f2fs-populated.py): the full userland — shell, coreutils, test binaries, Mesa, the COSMIC session set, Firefox, accounts in `/etc/shadow`. It is sized from its content and then doubled, so it ships about half free (roughly 3.5 GiB per architecture with everything staged).
+7. **Home volume** `f2fs-data1-<arch>.img` — the persistent `/home` (f2fs label `leandros-home`, written by [`scripts/mkfs-f2fs-home.py`](../../scripts/mkfs-f2fs-home.py)): 8 GiB sparse, seeded with the home skeleton (`/home/leandro`, `/home/cosmic-greeter`). Created only when missing and **never rewritten by a build**, so Claude Code credentials, the Firefox profile and COSMIC settings survive rebuilds. An old-layout data1 (a clone of the root, mounted at `/data` before 2026-10-15) is replaced once, with a message. `--reset-home` (or `LEANDROS_RESET_HOME=1`) recreates it.
 
 ### Two build gates
 
@@ -65,7 +64,7 @@ When no container tool answers within `LEANDROS_CT_TIMEOUT` seconds (default 20)
 | `LEANDROS_FIREFOX_REBUILD=1`, `LEANDROS_PORTAL_REBUILD=1`, `LEANDROS_PIPEWIRE_REBUILD=1` | Force the container run even when up to date |
 | `LEANDROS_PORTAL_BACKEND=<file>` | Use a prebuilt `xdg-desktop-portal-cosmic` on machines that cannot cross-build it |
 | `LEANDROS_CT_TIMEOUT=<s>` | Container probe timeout |
-| `LEANDROS_RELIBC_DIR`, `LEANDROS_BRUSH_DIR` | Build relibc / brush from another checkout |
+| `LEANDROS_BRUSH_DIR` | Build brush from another checkout |
 | `LEANDROS_BRUSH_UNCHECKED=1` | Build an off-pin brush (local brush development) |
 
 The brush pin check exists because an unpatched `../brush` once shipped a `/bin/sh` whose `cmd &` was still an unstarted in-process task when the next command ran, so `daemon & exec session` dropped PipeWire from the session — on one architecture only, because only one machine's checkout lagged. Fix a mismatch with `ports/brush/sync.sh apply ../brush`.

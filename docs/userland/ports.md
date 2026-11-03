@@ -338,7 +338,7 @@ uses a pinned SoundFont. x86_64 audio clipping, from DOOM's own mixing, is open.
 
 MAME is built from the sibling `../mame` with a LeandrOS OSD (`src/osd/leandros/`) and
 `Makefile.leandros`: GENie project generation, `zig` as the C/C++ toolchain targeting
-`<arch>-linux-musl` for the C++ runtime, compiled against relibc's sysroot. Points worth
+`<arch>-linux-musl` for the C++ runtime, compiled against zig's bundled musl headers. Points worth
 knowing before touching it: GENie needs `--PLATFORM` even for non-Android builds and an empty
 `ARCH=` in the sub-make; `USE_QTDEBUG` must be forced to 0 before `modules.lua` runs, with a
 stub `qtdbg_leandros` project satisfying the unconditional link; musl's `PAGE_SIZE` macro

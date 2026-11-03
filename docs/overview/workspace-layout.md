@@ -47,7 +47,7 @@ Loadable-module support adds `lib/` crates, listed in the root workspace: [`lib/
 | [`artifacts/`](../../artifacts) | Versioned investigation instruments — session drivers, capture harnesses — and `artifacts/notes/`, the lane notes each measured claim in this handbook rests on. Authored sources, notes and harnesses only; large binaries live outside the repository. |
 | [`.claude/skills/run-leandros/`](../../.claude/skills/run-leandros) | The scriptable QEMU driver (`driver.py`) and the test and session runners built on it. See [workflow](../development/workflow.md). |
 | [`linkers/`](../../linkers) | Kernel linker scripts: Limine and direct-boot variants per architecture. |
-| [`targets/`](../../targets) | Custom target specs: `*-unknown-kernel.json` for the kernel, `*-unknown-leandros.json` for relibc. |
+| [`targets/`](../../targets) | Custom target specs: `*-unknown-kernel.json` for the kernel, `x86_64-unknown-leandros.json` for the hard-float leandros-libc (DOOM). |
 | [`limine/`](../../limine) | `limine.conf` copied into the boot image. |
 | [`docs/`](../README.md) | This handbook and the historic [design records](../design/README.md). |
 | [`TODO.md`](../../TODO.md) | The live tracker of open work. |
@@ -60,7 +60,6 @@ Large dependencies live outside this tree, as siblings of the repository root (`
 
 | Path | Purpose |
 |---|---|
-| `../relibc` | The C standard library shipped as the userspace libc (path overridable with `LEANDROS_RELIBC_DIR`) |
 | `../brush` | The `brush` shell. Must be the pinned revision plus `ports/brush/patches` — `ports/brush/sync.sh apply ../brush` sets it up; the build refuses an off-pin checkout unless `LEANDROS_BRUSH_UNCHECKED=1`. Path overridable with `LEANDROS_BRUSH_DIR`. |
 | `../crossterm` | The crossterm fork brush builds against through `[patch.crates-io]` |
 | `../coreutils` | uutils coreutils |

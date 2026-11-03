@@ -51,7 +51,7 @@ New here? Read [Overview](overview/README.md), then [Getting started](getting-st
 - [Limitations](desktop/limitations.md) — what the desktop still cannot do
 
 ### 7. [Userland](userland/README.md)
-- [C libraries](userland/libc.md) — relibc, leandros-libc, musl
+- [C libraries](userland/libc.md) — leandros-libc, musl
 - [Programs](userland/programs.md) — init, login, shells, utilities
 - [Ports](userland/ports.md) — third-party software and how it is built
 

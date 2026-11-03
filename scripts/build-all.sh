@@ -1167,37 +1167,6 @@ stage_dbus_session() {
         echo "⚠️  ports/iso-codes/build.sh FAILED for $arch (Region page stays empty)"
 }
 
-# Function to build relibc
-build_relibc() {
-    local arch="$1"
-    echo "📚 Building $arch relibc..."
-    local target_spec="$ROOT_DIR/targets/$arch-unknown-leandros.json"
-    local relibc_dir="${LEANDROS_RELIBC_DIR:-$(sibling_dir relibc)}"
-    if [[ ! -d "$relibc_dir" ]]; then
-        echo "⚠️  relibc source not found at $relibc_dir, skipping"
-        return 0
-    fi
-    # relibc's C sources go through the cc crate, which with no CC set falls
-    # back to the HOST compiler. That only works by accident on an aarch64 host:
-    # relibc passes -mno-outline-atomics, an aarch64-only flag that x86_64 gcc
-    # rejects outright ("unrecognized command-line option"), so an aarch64 build
-    # dies on an x86_64 box. Point the cc crate at the same zig wrapper the rest
-    # of the cross-build uses, keyed by the custom target's name, so the result
-    # does not depend on which machine ran the build.
-    local target_name="$arch-unknown-leandros"
-    (
-        cd "$relibc_dir" || exit 1
-        # Build relibc using cargo
-        env "CC_$target_name=$TOOLS_DIR/cc-$arch-musl.sh" \
-            "AR_$target_name=$TOOLS_DIR/ar-musl.sh" \
-        cargo build --target "$target_spec" --release -Z build-std=core,alloc,compiler_builtins
-
-        # Also build ld_so and crt if they are part of the workspace and needed
-        # (Already handled by workspace if configured correctly, but relibc's Makefile 
-        # is the traditional way to get the full sysroot. For now we use cargo to get libc.a)
-    )
-}
-
 # Main
 download_limine "$LIMINE_VERSION"
 LIMINE_DIR="$LIMINE_CACHE_DIR/limine-$LIMINE_VERSION-binary"
@@ -1217,7 +1186,6 @@ else
 fi
 
 for arch in "${ARCHS[@]}"; do
-    build_relibc "$arch"
     build_userland "$arch"
     build_doom "$arch"
     build_floattest "$arch" || exit 1
