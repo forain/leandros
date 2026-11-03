@@ -1,7 +1,6 @@
 # Alpine packages (latest stable, release recorded in the lock) shipped vanilla in the LeandrOS image (both arches).
 # `scripts/alpine-lock.py refresh <arch>` resolves this into <arch>.lock.
 # kmscube stays gl-stack-built (Alpine's depends on mesa-gl + gstreamer).
-# kbd-bkeymaps is out of scope (no de/fr/br/uk maps): ports/kbd-keymaps stays.
 apk-tools-static
 alpine-keys
 ca-certificates-bundle
@@ -23,6 +22,7 @@ wayland-libs-server
 wayland-libs-cursor
 wayland-libs-egl
 iso-codes
+kbd-bkeymaps
 ripgrep
 dosfstools
 xfsprogs

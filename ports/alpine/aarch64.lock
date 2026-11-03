@@ -42,6 +42,7 @@ pkg icu-data-en 78.1-r0 main Q17Laif12iHw4CsLP+czfKj+4aNtY= 3fa1dfb91a081f73c32a
 pkg icu-libs 78.1-r0 main Q1YULmZdkQfFs4QsGjjH+pMK5XHR8= 2393882dcf1e3f5be98696665c3468dd0d2a85cd568d50abd232729863df9738 -
 pkg inih 62-r0 main Q1y0egRdFgJmjOsdfMAcILIvvG9vE= a85dba72b9443d587e1bb27ea863b15763eced90b47911af519e465e7e971616 -
 pkg iso-codes 4.20.1-r0 main Q1LuDQR4RydwYIve+Gea8VKrHe6nY= eec1dfa77f283a5a4b1e95c7657f03c1e7634ef8ff9ff4ab9ed3512caa11c8ad -
+pkg kbd-bkeymaps 2.8.0-r0 main Q1p14X575JCV6vPFJjTxEruMeWGUQ= 11420d1bf0aa7b364e4284d652c04d6c2acb1cead2c866d22c320f1b73720832 -
 pkg lame-libs 3.100-r5 main Q15xEsz+tbfUAw4uThIuXuf4MVAMw= f419c674f87667947534be07c1f5388a12d614da464a9be97522e3d932d8f48f -
 pkg lcms2 2.19-r0 main Q1PK8RcWKZOypue1JpamvL4DmU1Vc= 05c9e865ac443b8ff467c8e7c176ef323fac6c34f710410ef4f26c94478be7cd -
 pkg less 702-r0 main Q1QamNEFgz56YSL7hHHx9hKvltF+U= 21cd153170e11b656e2e96c60356cc184f0466879c9d94e35a7e2815c73446a1 -

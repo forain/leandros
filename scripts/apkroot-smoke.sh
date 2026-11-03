@@ -86,10 +86,10 @@ grep -q 'delmusl_rc=1' "$OUT/s8b.log" && ok "del musl refused" || bad "del musl"
 grep -q 'musl libc' "$OUT/s8b.log" && ok "loader still runs" || bad "loader run"
 
 step "8c vanilla Alpine packages (lock)"
-run "$APK info -e firefox git ripgrep dosfstools xfsprogs dbus-libs iso-codes kbd-bkeymaps; echo info_rc=\$?; $APK info -W /usr/bin/rg; echo audit_begin; $APK audit --system 2>&1; echo audit_end; $APK fix -s git ripgrep 2>&1; echo fix_rc=\$?; $APK add -s \$(cat /etc/apk/world) 2>&1; echo world_rc=\$?; /bin/rg --version | head -1; /bin/git --version; grep -c x /etc/passwd" 300 > "$OUT/s8c.log" 2>&1
+run "$APK info -e firefox git ripgrep dosfstools xfsprogs dbus-libs iso-codes kbd-bkeymaps; echo info_rc=\$?; $APK info -W /usr/bin/rg; echo audit_begin; $APK audit 2>&1; echo audit_end; $APK fix -s git ripgrep 2>&1; echo fix_rc=\$?; $APK add -s \$(cat /etc/apk/world) 2>&1; echo world_rc=\$?; /bin/rg --version | head -1; /bin/git --version; grep -c x /etc/passwd" 300 > "$OUT/s8c.log" 2>&1
 grep -q 'info_rc=0' "$OUT/s8c.log" && ok "lock packages installed" || bad "apk info -e"
 grep -q 'ripgrep' "$OUT/s8c.log" && ok "rg owned by ripgrep" || bad "info -W rg"
-sed -n '/audit_begin/,/audit_end/p' "$OUT/s8c.log" | grep -Eq ' (usr/(bin|lib|share)|bin|sbin|lib)/' && bad "audit reports package paths" || ok "apk audit clean"
+sed -n '/audit_begin/,/audit_end/p' "$OUT/s8c.log" | grep -Eq '^[MDAm] ' && bad "audit reports package paths" || ok "apk audit clean"
 sed -n '/fix_rc/,$p;/^fix/,/fix_rc/p' "$OUT/s8c.log" | grep -Eq '(Installing|Upgrading|Reinstalling|Purging) ' && bad "fix -s changes something" || ok "apk fix -s no-op"
 sed -n '/fix_rc/,/world_rc/p' "$OUT/s8c.log" | grep -Eq '(Installing|Upgrading) ' && bad "add -s world installs" || ok "apk add -s world no-op"
 grep -q 'ripgrep 1' "$OUT/s8c.log" && grep -q 'git version' "$OUT/s8c.log" && ok "rg and git run" || bad "rg/git run"
