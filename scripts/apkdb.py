@@ -30,7 +30,6 @@ EXCLUDE_PREFIXES = ("lib/apk/", "home/", "root/", "tmp/", "var/", "run/", "proc/
 STATIC_PROVIDES = [
     "/bin/sh=1", "cmd:sh=1",
     "alpine-baselayout=3.6.8-r99", "alpine-baselayout-data=3.6.8-r99",
-    "alpine-keys=2.5-r0", "apk-tools-static=2.14.6-r3",
 ]
 
 
@@ -166,8 +165,9 @@ def _apk_segments(data):
     return segs
 
 
-def read_apk(apk_path):
-    """Returns (control_gz, pkginfo{key: [values]}, [(tarinfo, content bytes)])."""
+def read_apk(apk_path, content=True):
+    """Returns (size, control_gz, pkginfo{key: [values]}, [(tarinfo, content bytes)]);
+    with content=False the member contents are left empty (headers only)."""
     raw = open(apk_path, "rb").read()
     segs = _apk_segments(raw)
     if len(segs) != 3:
@@ -182,7 +182,7 @@ def read_apk(apk_path):
     members = []
     d = tarfile.open(fileobj=io.BytesIO(segs[2][1]))
     for m in d:
-        members.append((m, d.extractfile(m).read() if m.isreg() else b""))
+        members.append((m, d.extractfile(m).read() if content and m.isreg() else b""))
     return len(raw), ctl_gz, info, members
 
 
@@ -221,40 +221,61 @@ def apk_stanza(apk_path, index_tar_gz=None):
          "S:%d" % size, "I:%s" % one("size"), "T:" + one("pkgdesc"), "U:" + one("url"),
          "L:" + one("license"), "o:" + one("origin"), "m:" + one("maintainer"),
          "t:" + one("builddate")]
+    L = [l for l in L if len(l) > 2 or l[0] in "CPVAS"]        # apk omits empty fields
     if one("commit"):
         L.append("c:" + one("commit"))
-    for dep in info.get("depend", []):
-        L.append("D:" + dep)
+    if one("provider_priority"):
+        L.append("k:" + one("provider_priority"))
+    # apk-tools keeps one D:/p:/r:/i: line per record, space separated
+    if info.get("depend"):
+        L.append("D:" + " ".join(info["depend"]))
     if info.get("provides"):
         L.append("p:" + " ".join(info["provides"]))
+    if info.get("replaces"):
+        L.append("r:" + " ".join(info["replaces"]))
+    if info.get("install_if"):
+        L.append("i:" + " ".join(info["install_if"]))
+    # file records grouped per directory, like apk's db (a package need not ship
+    # explicit directory entries for every directory it puts files in)
+    groups = {}
     for m, content in members:
         if m.isdir():
-            L.append("F:" + m.name.rstrip("/"))
-            L.append("M:%d:%d:%o" % (m.uid, m.gid, m.mode & 0o7777))
+            g = groups.setdefault(m.name.rstrip("/"), {"meta": None, "files": []})
+            g["meta"] = (m.uid, m.gid, m.mode & 0o7777)
             continue
         d, _, n = m.name.rpartition("/")
-        L.append("R:" + n)
+        f = ["R:" + n]
         if m.mode & 0o7777 != 0o644 or m.uid or m.gid:
-            L.append("a:%d:%d:%o" % (m.uid, m.gid, m.mode & 0o7777))
+            f.append("a:%d:%d:%o" % (m.uid, m.gid, m.mode & 0o7777))
         if m.issym():
-            L.append("Z:" + _b64sha1(m.linkname.encode()))
+            f.append("Z:" + _b64sha1(m.linkname.encode()))
         else:
             sha = m.pax_headers.get("APK-TOOLS.checksum.SHA1")
-            L.append("Z:Q1" + base64.b64encode(bytes.fromhex(sha)).decode() if sha
+            f.append("Z:Q1" + base64.b64encode(bytes.fromhex(sha)).decode() if sha
                      else "Z:" + _b64sha1(content))
+        groups.setdefault(d, {"meta": None, "files": []})["files"].extend(f)
+    for d, g in groups.items():
+        L.append("F:" + d)
+        if g["meta"] and g["meta"] != (0, 0, 0o755):      # apk omits the default dir mode
+            L.append("M:%d:%d:%o" % g["meta"])
+        L.extend(g["files"])
     return ("\n".join(L) + "\n\n").encode()
 
 
-def build_installed(files, dir_meta, provides, arch, build_time, depends=(), musl_owned=False):
+def build_installed(files, dir_meta, provides, arch, build_time, depends=(), musl_owned=False,
+                    owned_elsewhere=frozenset()):
     """files: iterable of absolute image paths (regular files and hard links).
     dir_meta: {absolute dir path: (uid, gid, mode)}.
+    owned_elsewhere: absolute paths owned by another package record (vanilla
+    Alpine packages); leandros-base lists none of them. musl_owned is the older
+    spelling for the musl subset and goes away once musl is a lock entry.
     Returns the bytes of /lib/apk/db/installed."""
     ver = time.strftime("%Y.%m.%d", time.gmtime(build_time)) + "-r0"
     chk = base64.b64encode(hashlib.sha1(("leandros-base-" + ver).encode()).digest()).decode()
     by_dir = {}
     for p in files:
         rel = p.lstrip("/")
-        if excluded(rel) or (musl_owned and musl_excluded(rel)):
+        if excluded(rel) or (musl_owned and musl_excluded(rel)) or ("/" + rel) in owned_elsewhere:
             continue
         d, _, n = rel.rpartition("/")
         if not d:
@@ -273,3 +294,104 @@ def build_installed(files, dir_meta, provides, arch, build_time, depends=(), mus
         for n in sorted(by_dir[d]):
             L.append("R:" + n)
     return ("\n".join(L) + "\n\n").encode()
+
+
+# ---- vanilla packages: scripts, triggers, dependency satisfaction ------------------------
+def control_files(apk_path):
+    """({name: bytes} of the control tar's maintainer scripts, [trigger globs])."""
+    segs = _apk_segments(open(apk_path, "rb").read())
+    t = tarfile.open(fileobj=io.BytesIO(segs[1][1]))
+    scripts = {m.name[1:]: t.extractfile(m).read() for m in t
+               if m.name in (".pre-install", ".post-install", ".pre-upgrade", ".post-upgrade",
+                             ".pre-deinstall", ".post-deinstall", ".trigger")}
+    globs = []
+    for line in t.extractfile(".PKGINFO").read().decode().splitlines():
+        if line.startswith("triggers = "):
+            globs += line[len("triggers = "):].split()
+    return scripts, globs
+
+
+def _x1(chk):
+    """apk-tools 3 names script members by the hex sha1 (X1...), the db keeps Q1<base64>."""
+    return "X1" + base64.b64decode(chk[2:]).hex()
+
+
+def scripts_tar(pkgs, x1=False):
+    """/lib/apk/db/scripts.tar. pkgs: (name, ver, chk 'Q1...', {script: bytes});
+    members are `<name>-<ver>.<chk>.<script>` (apk 2 format), mode 0755."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as t:
+        for name, ver, chk, scripts in sorted(pkgs, key=lambda x: x[0]):
+            for sc in sorted(scripts):
+                ti = tarfile.TarInfo("%s-%s.%s.%s" % (name, ver, _x1(chk) if x1 else chk, sc))
+                ti.size = len(scripts[sc])
+                ti.mode = 0o755
+                t.addfile(ti, io.BytesIO(scripts[sc]))
+    return buf.getvalue()
+
+
+def triggers_lines(pkgs):
+    """/lib/apk/db/triggers. pkgs: (chk 'Q1...', [globs]) -> `Q1.. glob glob` lines."""
+    return "".join("%s %s\n" % (chk, " ".join(globs)) for chk, globs in pkgs if globs).encode()
+
+
+def parse_db(data):
+    """installed-db bytes -> list of {'P','V','D':[..],'p':[..],'F':{dir:[files]},...}."""
+    out = []
+    for st in data.decode().split("\n\n"):
+        if not st.strip():
+            continue
+        d = {"D": [], "p": [], "F": {}, "M": {}}
+        cur = None
+        for line in st.split("\n"):
+            k, v = line[:1], line[2:]
+            if k == "F":
+                cur = v
+                d["F"].setdefault(cur, [])
+            elif k == "R" and cur is not None:
+                d["F"][cur].append(v)
+            elif k == "M" and cur is not None:
+                d["M"][cur] = v
+            elif k == "D":
+                d["D"] += v.split()
+            elif k == "p":
+                d["p"] += v.split()
+            elif k in ("P", "V", "C", "A", "I", "S"):
+                d[k] = v
+        out.append(d)
+    return out
+
+
+def _lock_mod():
+    global _LOCK
+    if "_LOCK" not in globals():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "alpine_lock", os.path.join(os.path.dirname(os.path.abspath(__file__)), "alpine-lock.py"))
+        _LOCK = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_LOCK)
+    return _LOCK
+
+
+def check_deps(stanzas, base_provides):
+    """Dependency satisfaction over parsed stanzas plus leandros-base's provides
+    (list of 'name[=ver]'). Returns [(package, dependency)] nothing satisfies."""
+    lk = _lock_mod()
+    prov = {}
+    for s in stanzas:
+        prov.setdefault(s["P"], []).append(s.get("V"))
+        for p in s["p"]:
+            n, _, v = p.partition("=")
+            prov.setdefault(n, []).append(v or None)
+    for p in base_provides:
+        n, _, v = p.partition("=")
+        prov.setdefault(n, []).append(v or None)
+    bad = []
+    for s in stanzas:
+        for dep in s["D"]:
+            neg, name, op, ver = lk.parse_dep(dep)
+            if neg:
+                continue
+            if not any(lk.satisfies(v, op, ver) for v in prov.get(name, [])):
+                bad.append((s["P"], dep))
+    return bad

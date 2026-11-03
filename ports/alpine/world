@@ -1,0 +1,28 @@
+# Alpine packages (latest stable, release recorded in the lock) shipped vanilla in the LeandrOS image (both arches).
+# `scripts/alpine-lock.py refresh <arch>` resolves this into <arch>.lock.
+# kmscube stays gl-stack-built (Alpine's depends on mesa-gl + gstreamer).
+apk-tools-static
+alpine-keys
+ca-certificates-bundle
+busybox-static
+musl
+firefox
+ffmpeg-libavcodec
+libpulse
+font-dejavu
+git
+less
+nano
+openssh-sftp-server
+ncurses-terminfo-base
+dbus-libs
+libffi
+wayland-libs-client
+wayland-libs-server
+wayland-libs-cursor
+wayland-libs-egl
+iso-codes
+kbd-bkeymaps
+ripgrep
+dosfstools
+xfsprogs

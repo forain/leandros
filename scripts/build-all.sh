@@ -538,43 +538,6 @@ stage_container_port() {
     return 1
 }
 
-# Function to stage Firefox
-#
-# Firefox is not compiled: ports/firefox/build.sh `apk add`s Alpine 3.21's
-# prebuilt firefox inside an Alpine container of the target arch, collects its
-# GTK3/NSS closure and fonts, rewrites the ELFs for the guest's libc (soname +
-# the __stack_chk_guard shim) and writes a rootfs-shaped tree to
-# ports/firefox/out/<arch>/, which mkfs-f2fs-populated.py overlays onto the
-# image when it exists (~290 MB). Without a working container tool (or when
-# the run fails) a previously packaged tree is reused, see
-# stage_container_port. The container run takes minutes (the foreign arch runs under
-# emulation), so it is skipped while out/<arch>/.stamp is newer than the port
-# scripts; LEANDROS_FIREFOX_REBUILD=1 forces it, LEANDROS_SKIP_FIREFOX=1
-# skips the step entirely. The launcher (/bin/firefox) and the default prefs
-# are staged by mkfs straight from ports/firefox, so editing them needs no
-# rebuild here.
-build_firefox() {
-    local arch="$1"
-    echo "🦊 Staging $arch Firefox..."
-    if [[ "${LEANDROS_SKIP_FIREFOX:-0}" == 1 ]]; then
-        echo "⚠️  LEANDROS_SKIP_FIREFOX=1, skipping"
-        return 0
-    fi
-    local port="$ROOT_DIR/ports/firefox"
-    local stamp="$port/out/$arch/.stamp"
-    # Any port file counts (dlopen-in-alpine.sh and friends included), except
-    # the launcher and prefs, which mkfs stages directly.
-    if [[ "${LEANDROS_FIREFOX_REBUILD:-0}" != 1 && -f "$stamp" \
-          && ! "$ROOT_DIR/ports/mesa/ssp_guard.c" -nt "$stamp" ]] \
-       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f \
-                   ! -name firefox.sh ! -name leandros-prefs.js \
-                   -newer "$stamp" -print)" ]]; then
-        echo "  up to date ($port/out/$arch)"
-        return 0
-    fi
-    stage_container_port "$port" "$arch" firefox Firefox FIREFOX
-}
-
 # Function to stage the desktop portal (org.freedesktop.portal.Desktop)
 #
 # ports/portal/build.sh: Alpine 3.21's prebuilt xdg-desktop-portal frontend and
@@ -648,6 +611,15 @@ build_pipewire() {
     stage_container_port "$port" "$arch" pipewire PipeWire PIPEWIRE
 }
 
+# Function to fetch the vanilla Alpine packages (ports/alpine/<arch>.lock):
+# firefox, git, ripgrep, dosfstools, xfsprogs, musl, apk-tools, ... Offline
+# when the cache (~/.cache/leandros/apk) is warm; mkfs requires it.
+build_alpine_pkgs() {
+    local arch="$1"
+    echo "📦 Fetching $arch Alpine packages (lock)..."
+    python3 "$ROOT_DIR/scripts/alpine-lock.py" fetch "$arch" || exit 1
+}
+
 # Function to stage apk-tools (ports/apk)
 #
 # Alpine 3.21's statically linked apk.static, the alpine-sysroot wrapper, the
@@ -673,9 +645,9 @@ build_apk() {
     else
         "$port/build.sh" "$arch" || echo "⚠️  apk-tools $arch staging failed; the image ships without apk.static"
     fi
-    # LEANDROS_LIBC=alpine (default): the image's libc is Alpine's musl .apk
-    # staged above; fail the build if its exported ABI drifted from the golden list.
-    if [[ "${LEANDROS_LIBC:-alpine}" == alpine && -f "$port/out/$arch/musl.apk" ]]; then
+    # LEANDROS_LIBC=alpine (default): the image's libc is the locked Alpine musl
+    # .apk; fail the build if its exported ABI drifted from the golden list.
+    if [[ "${LEANDROS_LIBC:-alpine}" == alpine ]]; then
         "$ROOT_DIR/scripts/musl/alpine-parity.sh" "$arch" || exit 1
     fi
 }
@@ -777,22 +749,6 @@ build_brush() {
         RUSTFLAGS="-C linker=$TOOLS_DIR/linker-$arch-musl.sh -C link-self-contained=no" \
         cargo "$PINNED_TOOLCHAIN" build -p brush-shell --target "$target_triple" --release
     )
-}
-
-# Function to build mkfs.fat — the FAT32 formatter disks-rs execs by bare name
-# for every ESP and XBOOTLDR partition it lays down. Unlike brush/coreutils this
-# is in-tree Rust (ports/mkfs-fat), so it has its own build.sh that owns the
-# musl/ET_EXEC toolchain details, exactly as ports/greetd and ports/busd do; all
-# that belongs here is the call. A failure is fatal, not a warning: the source
-# is checked in, so the only way it breaks is a real regression.
-build_mkfs_fat() {
-    local arch="$1"
-    echo "🗂️  Building $arch mkfs.fat..."
-    if [[ ! -x "$ROOT_DIR/ports/mkfs-fat/build.sh" ]]; then
-        echo "⚠️  ports/mkfs-fat not found, skipping"
-        return 0
-    fi
-    "$ROOT_DIR/ports/mkfs-fat/build.sh" "$arch"
 }
 
 # Function to build spawnwedge — the musl thread/fork lock-handoff regression
@@ -974,27 +930,6 @@ build_leandros_install() {
     "$ROOT_DIR/userland/leandros-install/build.sh" "$arch"
 }
 
-# Function to stage git (ports/git): Alpine 3.21's git + less + nano +
-# sftp-server, repackaged like PipeWire (see stage_container_port). Skipped
-# while out/<arch>/.stamp is newer than the port sources;
-# LEANDROS_GIT_REBUILD=1 forces it, LEANDROS_SKIP_GIT=1 skips it.
-build_git() {
-    local arch="$1"
-    echo "🌿 Staging $arch git..."
-    if [[ "${LEANDROS_SKIP_GIT:-0}" == 1 ]]; then
-        echo "⚠️  LEANDROS_SKIP_GIT=1, skipping"
-        return 0
-    fi
-    local port="$ROOT_DIR/ports/git"
-    local stamp="$port/out/$arch/.stamp"
-    if [[ "${LEANDROS_GIT_REBUILD:-0}" != 1 && -f "$stamp" ]] \
-       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
-        echo "  up to date ($port/out/$arch)"
-        return 0
-    fi
-    stage_container_port "$port" "$arch" git git GIT
-}
-
 # Function to stage e2fsprogs (ports/e2fsprogs): Alpine 3.21's e2fsck,
 # resize2fs, dumpe2fs, e2undo and mke2fs (dual-boot installer, ext4 shrink).
 # LEANDROS_E2FSPROGS_REBUILD=1 forces it, LEANDROS_SKIP_E2FSPROGS=1 skips it.
@@ -1013,20 +948,6 @@ build_e2fsprogs() {
         return 0
     fi
     stage_container_port "$port" "$arch" e2fsprogs e2fsprogs E2FSPROGS
-}
-
-# Function to build mkfs.xfs — the XFS v5 formatter for the root partition.
-# Same shape as build_mkfs_fat; its build.sh takes one arch (or "all") and
-# installs the binary, which cargo builds as mkfs_xfs because a target name
-# cannot contain a dot, to ports/mkfs-xfs/out/<arch>/mkfs.xfs.
-build_mkfs_xfs() {
-    local arch="$1"
-    echo "🗃️  Building $arch mkfs.xfs..."
-    if [[ ! -x "$ROOT_DIR/ports/mkfs-xfs/build.sh" ]]; then
-        echo "⚠️  ports/mkfs-xfs not found, skipping"
-        return 0
-    fi
-    "$ROOT_DIR/ports/mkfs-xfs/build.sh" "$arch"
 }
 
 # Function to build disktester — AerynOS's disks-rs end-to-end provisioning
@@ -1056,10 +977,6 @@ build_disktester() {
     )
 }
 
-# Function to build ripgrep (`rg`) -- the guest image ships no grep. The
-# checkout is a sibling repo pinned at release tag 15.2.0 (e89fff8) and stays
-# UNMODIFIED, built like disktester: same pinned nightly, same musl linker
-# wrapper, skipped with a warning when the checkout is absent.
 # grep/egrep/fgrep: userland/grep, a POSIX grep front end that runs /bin/rg.
 build_grep() {
     local arch="$1"
@@ -1069,35 +986,6 @@ build_grep() {
         return 0
     fi
     "$ROOT_DIR/userland/grep/build.sh" "$arch"
-}
-
-build_ripgrep() {
-    local arch="$1"
-    echo "🔎 Building $arch ripgrep..."
-    local rg_dir="${LEANDROS_RIPGREP_DIR:-$(sibling_dir ripgrep)}"
-    if [[ ! -d "$rg_dir" ]]; then
-        echo "⚠️  ripgrep source not found at $rg_dir, skipping"
-        return 0
-    fi
-    local target_triple
-    if [[ "$arch" == "aarch64" ]]; then
-        target_triple="aarch64-unknown-linux-musl"
-    else
-        target_triple="x86_64-unknown-linux-musl"
-    fi
-    (
-        cd "$rg_dir" || exit 1
-        # ports/ripgrep/jemalloc-stub stands in for tikv-jemallocator, whose C
-        # build does not cross-compile here (the patch edits Cargo.lock, which
-        # is restored below so the checkout stays clean).
-        RUSTFLAGS="-C linker=$TOOLS_DIR/linker-$arch-musl.sh -C link-self-contained=no" \
-        cargo "$PINNED_TOOLCHAIN" build --target "$target_triple" --release \
-            --config "patch.crates-io.tikv-jemallocator.path=\"$ROOT_DIR/ports/ripgrep/jemalloc-stub\"" \
-            --config 'profile.release.strip="symbols"'
-        local rc=$?
-        git checkout -q -- Cargo.lock 2>/dev/null
-        exit $rc
-    )
 }
 
 # Function to build the input-stack ABI shims (libseat, libudev). These are
@@ -1162,9 +1050,6 @@ stage_dbus_session() {
         echo "⚠️  ports/leandros-installer/build.sh FAILED for $arch (no installer GUI)"
     ./ports/cosmic-applets-panel/build.sh "$arch" || \
         echo "⚠️  ports/cosmic-applets-panel/build.sh FAILED for $arch (no Time/Battery/Notifications/... applets)"
-    # iso-codes tables for cosmic-settings' Region & language page (data only).
-    ./ports/iso-codes/build.sh "$arch" || \
-        echo "⚠️  ports/iso-codes/build.sh FAILED for $arch (Region page stays empty)"
 }
 
 # Main
@@ -1191,16 +1076,14 @@ for arch in "${ARCHS[@]}"; do
     build_floattest "$arch" || exit 1
     build_memcpybench "$arch" || exit 1
     build_mame "$arch"
-    build_firefox "$arch"
     build_portal "$arch"
     build_pipewire "$arch"
     build_gstreamer "$arch"
+    build_alpine_pkgs "$arch"
     build_apk "$arch"
     build_bottom "$arch"
     build_brush "$arch"
     build_coreutils "$arch"
-    build_mkfs_fat "$arch"
-    build_mkfs_xfs "$arch"
     build_spawnwedge "$arch"
     build_killmt "$arch"
     build_futextest "$arch"
@@ -1215,10 +1098,8 @@ for arch in "${ARCHS[@]}"; do
     build_sshd "$arch"
     build_espctl "$arch"
     build_leandros_install "$arch"
-    build_git "$arch"
     build_e2fsprogs "$arch"
     build_disktester "$arch"
-    build_ripgrep "$arch"
     build_grep "$arch"
     stage_dbus_session "$arch"
     build_kernel "$arch"

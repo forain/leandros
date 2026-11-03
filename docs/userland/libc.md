@@ -84,9 +84,9 @@ Building that musl world on macOS had two traps worth recording:
 
 #### Alpine musl as the runtime libc
 
-By default (`LEANDROS_LIBC=alpine`) the image's libc is Alpine 3.21's unmodified
-`musl-1.2.5-r12` (pinned by sha256 in [ports/apk/build.sh](../../ports/apk/build.sh), kept as
-`ports/apk/out/<arch>/musl.apk`) and is owned by apk as a real package
+By default (`LEANDROS_LIBC=alpine`) the image's libc is unmodified Alpine
+`musl` package (the version and sha256 are pinned in `ports/alpine/<arch>.lock`; cached `.apk` under
+`~/.cache/leandros/apk/<arch>/`) and is owned by apk as a real package
 ([ports.md](ports.md#live-root-apk)). Our own musl was the same upstream 1.2.5 source; the
 exported dynsym is identical, and `scripts/musl/alpine-parity.sh` (run by `build-all.sh`) fails
 the build if the Alpine libc drifts from the golden list (`alpine-parity.<arch>.golden`;

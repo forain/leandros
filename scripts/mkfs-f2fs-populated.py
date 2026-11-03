@@ -733,24 +733,17 @@ def main():
     # /lib/ld-musl-<arch>.so.1.zig for recovery from a static shell.
     # LEANDROS_LIBC=zig: the previous layout, three hard links to our libc.so.
     import apkdb
-    _musl_apk = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                              "..", "ports", "apk", "out", arch, "musl.apk"))
     libc_mode = os.environ.get("LEANDROS_LIBC", "alpine")
     if libc_mode not in ("alpine", "zig"):
         sys.exit(f"LEANDROS_LIBC must be alpine or zig, not {libc_mode!r}")
-    if libc_mode == "alpine" and not os.path.isfile(_musl_apk):
-        if "LEANDROS_LIBC" in os.environ:
-            sys.exit(f"LEANDROS_LIBC=alpine but {_musl_apk} is missing (ports/apk/build.sh {arch})")
-        print(f"WARNING: {_musl_apk} missing; packing the zig libc "
-              f"(run ports/apk/build.sh {arch})", file=sys.stderr)
-        libc_mode = "zig"
     if libc_mode == "alpine":
-        lib_files.append((f"ld-musl-{arch}.so.1", apkdb.apk_file(_musl_apk, f"lib/ld-musl-{arch}.so.1"), 0o100755))
-        lib_files.append((f"libc.musl-{arch}.so.1", f"ld-musl-{arch}.so.1".encode(), S_IFLNK | 0o777))
+        # /lib/ld-musl-<arch>.so.1 and libc.musl-<arch>.so.1 belong to the musl
+        # package of the Alpine lock (staged below); the image only adds the
+        # /usr/lib/libc.so link and the zig libc for recovery.
         usr_lib_files.append(("libc.so", f"/lib/ld-musl-{arch}.so.1".encode(), S_IFLNK | 0o777))
         if os.path.exists(libc_so):
             lib_files.append((f"ld-musl-{arch}.so.1.zig", libc_so, 0o100755))
-        print(f"libc: Alpine musl-1.2.5-r12 (apk-owned); zig libc kept as ld-musl-{arch}.so.1.zig")
+        print(f"libc: Alpine musl from ports/alpine/{arch}.lock (apk-owned); zig libc kept as ld-musl-{arch}.so.1.zig")
     elif os.path.exists(libc_so):
         lib_files.append((f"ld-musl-{arch}.so.1", libc_so, 0o100755))
         usr_lib_files.append(("libc.so", libc_so, 0o100755))
@@ -1705,20 +1698,19 @@ def main():
     # cosmic-applet-bluetooth, the panel's Bluetooth applet (already named in
     # upstream's default plugins_wings): unmodified upstream, built by
     # ports/cosmic-applet-bluetooth/build.sh. It reaches leandros-sysbus bluez
-    # through bluer 0.17.4, i.e. the C libdbus-1 (ports/libdbus) -- its only
+    # through bluer 0.17.4, i.e. the C libdbus-1 (Alpine dbus-libs) -- its only
     # DT_NEEDED beyond libxkbcommon/libc, so binary, library and .desktop are
     # staged together or not at all (a binary without the library dies in the
     # loader and the panel just respawns it).
     _btapplet = m6_pick(f"{m6_out}/cosmic-applet-bluetooth-{arch}")
-    _libdbus = os.path.expanduser(f"~/code/leandros-artifacts/libdbus/out/{arch}/libdbus-1.so.3")
-    if os.path.exists(_btapplet) and os.path.exists(_libdbus):
+    # libdbus-1.so.3 comes from the vanilla Alpine dbus-libs package (ports/alpine).
+    if os.path.exists(_btapplet):
         bin_files.append(("cosmic-applet-bluetooth", _btapplet, 0o100755))
-        usr_lib_files.append(("libdbus-1.so.3", _libdbus, 0o100755))
         m4_share_dirs.add("/usr/share/applications")
         m4_share_files.append(("/usr/share/applications", "com.system76.CosmicAppletBluetooth.desktop",
                                "ports/cosmic-applet-bluetooth/com.system76.CosmicAppletBluetooth.desktop"))
     else:
-        print(f"  WARNING: {_btapplet} or {_libdbus} absent, no Bluetooth applet in the panel: "
+        print(f"  WARNING: {_btapplet} absent, no Bluetooth applet in the panel: "
               f"./ports/cosmic-applet-bluetooth/build.sh {arch}")
 
     # cosmic-applet-power, the panel's Power menu (already named in upstream's
@@ -1915,18 +1907,10 @@ def main():
     #                            is what greetd runs after a successful login;
     #                            with none of these the greeter still renders,
     #                            with an empty session dropdown
-    # Console keymaps for /bin/loadkmap (kbd's binary `loadkeys -b` format;
-    # ports/kbd-keymaps/README.md). /etc/vconsole.conf KEYMAP=<name> selects
-    # one at boot; with no vconsole.conf the kernel keeps Linux's default map.
-    _kmap_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "..", "ports", "kbd-keymaps")
-    if os.path.isdir(_kmap_dir):
-        for _kf in sorted(os.listdir(_kmap_dir)):
-            if _kf.endswith(".bmap"):
-                m4_share_dirs.add("/usr/share/keymaps")
-                m4_share_files.append(("/usr/share/keymaps", _kf,
-                                       os.path.normpath(os.path.join(_kmap_dir, _kf))))
-
+    # Console keymaps for /bin/loadkmap come from Alpine's kbd-bkeymaps
+    # (/usr/share/bkeymaps/<dir>/<name>.bmap.gz, ports/alpine/world);
+    # /etc/vconsole.conf KEYMAP=<name> selects one at boot (loadkmap aliases
+    # kbd's names such as de-latin1 onto them).
     for _dirpath, _name, _srcname in (("/etc/greetd", "greetd.conf", "greetd.conf"),
                                       ("/etc/pam.d",  "greetd",      "pam.d-greetd"),
                                       ("/etc",        "profile",     "profile"),
@@ -2033,7 +2017,7 @@ def main():
     # checkout) drives the whole block layer in one run: ftruncate a 32 GiB
     # sparse image, attach it to /dev/loopN, write a GPT, sync the partition
     # nodes through BLKPG, then format them. The two formatters are ours
-    # (ports/mkfs-fat, ports/mkfs-xfs) and are execed BY BARE NAME through
+    # (Alpine dosfstools and xfsprogs) and are execed BY BARE NAME through
     # std::process::Command — partitioning/src/formatter.rs hardcodes
     # "mkfs.fat" and "mkfs.xfs" — so they have to sit on the guest's PATH,
     # which is /usr/bin:/bin. /bin is where every other static binary lives
@@ -2044,20 +2028,9 @@ def main():
     # needs a sibling repo build-all.sh skips with a warning when absent.
     _musl_triple = ("aarch64-unknown-linux-musl" if arch == "aarch64"
                     else "x86_64-unknown-linux-musl")
-    p = f"ports/mkfs-fat/target/{_musl_triple}/release/mkfs.fat"
-    if os.path.exists(p):
-        bin_files.append(("mkfs.fat", p, 0o100755))
-    p = f"ports/mkfs-xfs/out/{arch}/mkfs.xfs"
-    if os.path.exists(p):
-        bin_files.append(("mkfs.xfs", p, 0o100755))
     p = f"../disks-rs/target/{_musl_triple}/release/disktester"
     if os.path.exists(p):
         bin_files.append(("disktester", p, 0o100755))
-    # ripgrep (`rg`), built UNMODIFIED from the sibling checkout; the image
-    # has no grep.
-    p = f"{sibling_dir('ripgrep')}/target/{_musl_triple}/release/rg"
-    if os.path.exists(p):
-        bin_files.append(("rg", p, 0o100755))
     # grep/egrep/fgrep: userland/grep, a POSIX grep front end that runs /bin/rg
     # (argv0 selects -E / -F). One binary, three names.
     p = f"userland/grep/target/{_musl_triple}/release/grep"
@@ -2825,54 +2798,6 @@ def main():
         print(f"  (no PipeWire staged: {_pw_root} missing — ports/pipewire/build.sh {arch}; "
               f"packing the inert libpipewire stub)")
 
-    _ff_port = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "firefox")
-    _ff_root = os.path.normpath(os.path.join(_ff_port, "out", arch))
-    if os.path.isfile(os.path.join(_ff_root, "usr", "lib", "firefox", "libxul.so")):
-        _ff_n, _ff_bytes, _ff_img_won = _overlay_port_tree(_ff_root)
-        _ff_prefs = os.path.join(_ff_port, "leandros-prefs.js")
-        if os.path.isfile(_ff_prefs):
-            m4_share_dirs.update(("/usr/lib/firefox/defaults", "/usr/lib/firefox/defaults/pref"))
-            m4_share_files.append(("/usr/lib/firefox/defaults/pref", "leandros-prefs.js", _ff_prefs))
-        bin_files.append(("firefox", os.path.join(_ff_port, "firefox.sh"), 0o100755))
-        # Launcher entry + hicolor icons so Firefox shows in the app library
-        # and Super-search. The file is named firefox.desktop to match the
-        # Wayland app_id. Staged only together with Firefox itself.
-        _ff_desktop = os.path.join(_ff_port, "firefox.desktop")
-        if os.path.isfile(_ff_desktop):
-            m4_share_dirs.add("/usr/share/applications")
-            m4_share_files.append(("/usr/share/applications", "firefox.desktop", _ff_desktop))
-        _ff_icon_dir = os.path.join(_ff_root, "usr", "lib", "firefox", "browser", "chrome", "icons", "default")
-        for _sz in (16, 32, 48, 64, 128, 256):
-            _ff_png = os.path.join(_ff_icon_dir, f"default{_sz}.png")
-            if os.path.isfile(_ff_png):
-                _ff_idir = f"/usr/share/icons/hicolor/{_sz}x{_sz}/apps"
-                m4_share_dirs.update(("/usr/share", "/usr/share/icons", "/usr/share/icons/hicolor",
-                                      f"/usr/share/icons/hicolor/{_sz}x{_sz}", _ff_idir))
-                m4_share_files.append((_ff_idir, "firefox.png", _ff_png))
-            else:
-                print(f"  WARNING: Firefox icon absent: {_ff_png}")
-        _ff_ver = ""
-        try:
-            with open(os.path.join(_ff_root, "FIREFOX-VERSION")) as _f:
-                _ff_ver = _f.read().strip()
-        except OSError:
-            pass
-        print(f"  Firefox ({_ff_ver or 'unknown version'}): {_ff_n} file(s), "
-              f"{_ff_bytes // (1024 * 1024)} MiB from {_ff_root}; image copy kept for "
-              f"{len(_ff_img_won)}: {' '.join(sorted(_ff_img_won))}")
-        # ffmpeg/vainfo (x86_64 dlopen stage) exit 127 when a library of their
-        # closure never reached the image (laptop trial 2026-10-19: the image
-        # was built before `build.sh --dlopen-only` ran). Fail the build loudly.
-        _ff_lib_names = {n for n, _p, _m in usr_lib_files}
-        _ff_stage_libs = [n for n in os.listdir(os.path.join(_ff_root, "usr", "lib"))
-                          if os.path.isfile(os.path.join(_ff_root, "usr", "lib", n))]
-        _ff_lost = sorted(n for n in _ff_stage_libs if n not in _ff_lib_names)
-        if _ff_lost:
-            print(f"  ERROR: staged Firefox libraries missing from /usr/lib: {' '.join(_ff_lost)}")
-            sys.exit(1)
-    else:
-        print(f"  (no Firefox staged: {_ff_root} missing — ports/firefox/build.sh {arch})")
-
     # ── xdg-desktop-portal (optional, ports/portal) ──────────────────────────
     # org.freedesktop.portal.Desktop: Alpine 3.21's frontend + permission store
     # (+ GLib closure) and xdg-desktop-portal-cosmic, with their busd .service
@@ -2903,55 +2828,6 @@ def main():
     else:
         print(f"  (no GStreamer staged: {_gst_root} missing — ports/gstreamer/build.sh {arch})")
 
-    # ── apk-tools (optional, ports/apk) ──────────────────────────────────────
-    # /usr/sbin/apk.static (static, runs as-is), /usr/sbin/alpine-sysroot, the
-    # Alpine keys + 3.21 repositories under /etc/apk, and a CA bundle at
-    # /etc/ssl: what an in-guest build needs to stage an Alpine root without a
-    # container (scripts/container-lib.sh, local backend). Same overlay rules.
-    _apk_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                              "..", "ports", "apk", "out", arch))
-    if os.path.isfile(os.path.join(_apk_root, "usr", "sbin", "apk.static")):
-        _apk_n, _apk_bytes, _apk_won = _overlay_port_tree(_apk_root)
-        if libc_mode == "alpine":        # pin the real musl package in world
-            m4_share_files[:] = [(d, n, os.path.join(_apk_root, "world.alpine"))
-                                 if (d, n) == ("/etc/apk", "world") else (d, n, h)
-                                 for d, n, h in m4_share_files]
-        bin_files.append(("apk", os.path.join(_apk_root, "usr", "sbin", "apk"), 0o100755))
-        print(f"  apk-tools: {_apk_n} file(s), {_apk_bytes // 1024} KiB from {_apk_root}")
-    else:
-        print(f"  (no apk-tools staged: {_apk_root} missing — ports/apk/build.sh {arch})")
-
-    # ── git (optional, ports/git) ─────────────────────────────────────────────
-    # Alpine 3.21's git 2.47 with git-remote-https (libcurl/OpenSSL, CA bundle
-    # from ports/apk), plus less (git's pager), nano (/etc/gitconfig's
-    # core.editor), /usr/lib/ssh/sftp-server (sshd's sftp subsystem) and
-    # /etc/terminfo. Same overlay rules as the other ports. git also gets
-    # /bin names -- hard links to the same inode -- because the console
-    # login's PATH is /bin alone, and so a non-interactive `ssh host git ...`
-    # finds it whatever PATH the remote shell has.
-    _git_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                              "..", "ports", "git", "out", arch))
-    if os.path.isfile(os.path.join(_git_root, "usr", "bin", "git")):
-        _git_n, _git_bytes, _git_won = _overlay_port_tree(_git_root)
-        _git_bin = os.path.realpath(os.path.join(_git_root, "usr", "bin", "git"))
-        for _name in ("git", "git-upload-pack", "git-receive-pack", "git-upload-archive"):
-            bin_files.append((_name, _git_bin, 0o100755))
-        for _name in ("less", "nano"):
-            _p = os.path.realpath(os.path.join(_git_root, "usr", "bin", _name))
-            if os.path.isfile(_p):
-                bin_files.append((_name, _p, 0o100755))
-        _git_ver = ""
-        try:
-            with open(os.path.join(_git_root, "GIT-VERSION")) as _f:
-                _git_ver = _f.read().strip()
-        except OSError:
-            pass
-        print(f"  git ({_git_ver or 'unknown version'}): {_git_n} file(s), "
-              f"{_git_bytes // (1024 * 1024)} MiB from {_git_root}; image copy kept for "
-              f"{len(_git_won)}: {' '.join(sorted(_git_won))}")
-    else:
-        print(f"  (no git staged: {_git_root} missing — ports/git/build.sh {arch})")
-
     # ── e2fsprogs (optional, ports/e2fsprogs) ─────────────────────────────────
     # Alpine's e2fsck/resize2fs/dumpe2fs/e2undo/mke2fs in /usr/sbin (+ closure
     # in /usr/lib, /etc/mke2fs.conf). Also hard-linked into /bin (the console
@@ -2968,10 +2844,108 @@ def main():
     else:
         print(f"  (no e2fsprogs staged: {_e2_root} missing — ports/e2fsprogs/build.sh {arch})")
 
+    # ── Vanilla Alpine packages (ports/alpine/<arch>.lock) ───────────────────
+    # Firefox, git, ripgrep, dosfstools, xfsprogs, musl, apk-tools, ... are the
+    # unmodified Alpine packages from the lock cache (scripts/alpine-lock.py
+    # fetch). They are staged host-side with their own /lib/apk/db records;
+    # leandros-base owns everything else. A path some other ship set also
+    # staged is dropped in favour of the package's (apk-shadow below).
+    import alpinepkgs, filecmp
+    _ap_entries, _ap_stanzas, _ap_pkgs = alpinepkgs.stage(arch)
+    if libc_mode == "zig":
+        _ap_entries = [e for e in _ap_entries if e["pkg"] != "musl"]
+        _ap_stanzas = [x for x in _ap_stanzas if x[0] != "musl"]
+        _ap_pkgs = [x for x in _ap_pkgs if x["name"] != "musl"]
+    _ap_gen, _ap_gen_dirs = alpinepkgs.generated_entries(arch)
+    _apk_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "..", "ports", "apk", "out", arch))
+    if not os.path.isfile(os.path.join(_apk_root, "usr", "sbin", "apk")):
+        sys.exit(f"{_apk_root} missing (ports/apk/build.sh {arch})")
+    _overlay_port_tree(_apk_root)
+    bin_files.append(("apk", os.path.join(_apk_root, "usr", "sbin", "apk"), 0o100755))
+    _ap_world = ["leandros-base", "musl=" + next(e_s for e_s in [alpinepkgs.lk.read_lock(arch)[0]["musl"]["ver"]])] \
+        if libc_mode == "alpine" else ["leandros-base"]
+    _ap_world += [n for n in alpinepkgs.world_names(arch) if n != "musl"]
+    m4_share_dirs.add("/etc/apk")
+    m4_share_files.append(("/etc/apk", "world", ("\n".join(_ap_world) + "\n").encode()))
+    _ap_rel = alpinepkgs.lk.REL
+    m4_share_files.append(("/etc/apk", "repositories", "".join(
+        f"{alpinepkgs.lk.MIRROR}/{_ap_rel}/{r}\n" for r in ("main", "community")).encode()))
+    # LeandrOS files that sit beside the packages
+    _ff_port = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "firefox")
+    bin_files.append(("firefox", os.path.join(_ff_port, "firefox.sh"), 0o100755))
+    m4_share_dirs.update(("/usr/lib/firefox", "/usr/lib/firefox/defaults", "/usr/lib/firefox/defaults/pref",
+                          "/usr/local", "/usr/local/share", "/usr/local/share/applications"))
+    m4_share_files.append(("/usr/lib/firefox/defaults/pref", "leandros-prefs.js", os.path.join(_ff_port, "leandros-prefs.js")))
+    # Exec=/bin/firefox keeps the LeandrOS environment; /usr/local/share shadows Alpine's entry.
+    m4_share_files.append(("/usr/local/share/applications", "firefox.desktop", os.path.join(_ff_port, "firefox.desktop")))
+    # gitconfig stays ours (ports/git/data)
+    _gitconf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "git", "data", "gitconfig")
+    if os.path.isfile(_gitconf):
+        etc_files.append(("gitconfig", _gitconf, 0o100644))
+    # /bin compat names (PATH on the console login is /bin alone); symlinks, unowned by the db.
+    for _n in ("git", "git-upload-pack", "git-receive-pack", "git-upload-archive", "less", "nano", "rg"):
+        bin_files.append((_n, f"/usr/bin/{_n}".encode(), S_IFLNK | 0o777))
+    for _n in ("mkfs.fat", "mkfs.xfs"):
+        bin_files.append((_n, f"/sbin/{_n}".encode(), S_IFLNK | 0o777))
+
+    # apk-shadow: the choke point. After every ship set is appended, a non-apk
+    # entry whose image path a package owns is dropped.
+    _ap_owned = {e["path"]: e for e in _ap_entries if e["kind"] != "dir"}
+    _deny = re.compile(r"libEGL|libGLES|libgbm|libgallium|libvulkan|libdrm|libpipewire|libgst|libext2fs")
+    _sh = {"n": 0, "diff": 0}
+    def _shadow(d, n, h):
+        e = _ap_owned.get(("" if d == "/" else d) + "/" + n)
+        if e is None:
+            return False
+        _sh["n"] += 1
+        same = e["kind"] == "file" and isinstance(h, str) and filecmp.cmp(e["host"], h, shallow=False)
+        if not same:
+            _sh["diff"] += 1
+            if _deny.search(n):
+                sys.exit(f"apk-shadow: {d}/{n} differs from the Alpine package {e['pkg']}'s copy")
+        return True
+    for _d, _lst in (("/bin", bin_files), ("/lib", lib_files), ("/usr/lib", usr_lib_files),
+                     ("/usr/lib/gbm", gbm_files), ("/", root_files), ("/etc", etc_files)):
+        _lst[:] = [t for t in _lst if not _shadow(_d, t[0], t[1])]
+    for _lst in (m4_share_files, m5_exec_files):
+        _lst[:] = [t for t in _lst if not _shadow(t[0], t[1], t[2])]
+    print(f"apk-shadow: {_sh['n']} dropped ({_sh['diff']} differ)")
+    # the generated (trigger output) tar: base-owned, loses to packages and ship sets
+    _base_paths = set()
+    for _d, _lst in (("/bin", bin_files), ("/lib", lib_files), ("/usr/lib", usr_lib_files),
+                     ("/usr/lib/gbm", gbm_files), ("/", root_files), ("/etc", etc_files)):
+        _base_paths |= {("" if _d == "/" else _d) + "/" + t[0] for t in _lst}
+    for _lst in (m4_share_files, m5_exec_files):
+        _base_paths |= {t[0] + "/" + t[1] for t in _lst}
+    _ap_gen = [e for e in _ap_gen if e["path"] not in _ap_owned and e["path"] not in _base_paths]
+    _ap_hosts = {e["path"]: e["host"] for e in _ap_entries + _ap_gen if e["kind"] == "file"}
+    alpine_files = []          # (image dir, name, host path | symlink bytes, full mode)
+    _ap_dirs, _ap_dirmode = set(), {}
+    for e in _ap_entries + _ap_gen:
+        d, n = os.path.split(e["path"])
+        if e["kind"] == "dir":
+            _ap_dirs.add(e["path"])
+            if e["pkg"] != "leandros-base":
+                _ap_dirmode[e["path"]] = e["mode"]
+            continue
+        _ap_dirs.add(d)
+        if e["kind"] == "symlink":
+            alpine_files.append((d, n, e["linkname"].encode(), S_IFLNK | 0o777))
+        else:
+            h = e["host"] if e["kind"] == "file" else _ap_hosts[e["linkname"]]
+            alpine_files.append((d, n, h, 0o100000 | e["mode"]))
+    for _d in set(_ap_dirs):
+        while _d not in ("/", ""):
+            _ap_dirs.add(_d)
+            _d = os.path.dirname(_d)
+    m4_share_dirs.update(_ap_dirs - {"/"})
+    _ap_bytes = sum(e["size"] for e in _ap_entries if e["kind"] == "file")
+    print(f"apk: {len(_ap_pkgs)} Alpine packages, {len(alpine_files)} files, {_ap_bytes // (1024 * 1024)} MiB staged")
+
     # Optional binaries are skipped silently when their build output is absent.
     # Say so, and let LEANDROS_REQUIRE=rg,grep,dmesg,coreutils make it fatal.
     _opt_src = {
-        "rg": f"{sibling_dir('ripgrep')}/target/{_musl_triple}/release/rg",
         "grep": f"userland/grep/target/{_musl_triple}/release/grep",
         "dmesg": "userland/dmesg/dmesg.sh",
         "coreutils": coreutils_bin,
@@ -3044,6 +3018,7 @@ def main():
     for name, path, mode in (bin_files + lib_files + usr_lib_files + gbm_files + root_files + etc_files
                              + [(n, p, 0) for (_d, n, p) in m4_share_files]
                              + [(n, p, 0) for (_d, n, p) in m5_exec_files]
+                             + [(n, p, 0) for (_d, n, p, _m) in alpine_files]
                              + [(n, c, 0) for (_d, n, c, _m) in sysfs_files]):
         if not isinstance(path, (bytes, bytearray)):
             if path in _sized:
@@ -3187,6 +3162,10 @@ def main():
         dir_nodes[ino] = d
         _path_to_ino[d] = ino
         subdirs.setdefault(parent_ino, []).append((os.path.basename(d), ino))
+    for _p, _m in _ap_dirmode.items():
+        _i = _path_to_ino.get(_p)
+        if _i is not None and _i not in dir_owner and (_m & 0o7777) != 0o755:
+            dir_owner[_i] = (0o040000 | (_m & 0o7777), 0, 0)
     # /etc/leandros/network: root:netdev 0770, slots root:netdev 0660.
     GID_NETDEV = 108
     dir_owner[_path_to_ino["/etc/leandros/network"]] = (0o040770, 0, GID_NETDEV)
@@ -3236,34 +3215,34 @@ def main():
         for ino in sorted(m5_exec_by_ino):
             add_files_to_dir(ino, m5_exec_by_ino[ino])
 
+    _ap_by_ino = {}
+    for _d, _n, _h, _m in alpine_files:
+        _ap_by_ino.setdefault(_path_to_ino[_d], []).append((_n, _h, _m))
+    print("Packing Alpine packages...")
+    for ino in sorted(_ap_by_ino):
+        add_files_to_dir(ino, _ap_by_ino[ino])
+
     # Live-root apk: the generated leandros-base entry in /lib/apk/db/installed
     # owns every base file, so apk add/del never replaces or removes one.
-    _apk_out = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                             "..", "ports", "apk", "out", arch))
-    if os.path.isfile(os.path.join(_apk_out, "usr", "sbin", "apk.static")) \
-            and "/lib/apk/db" in _path_to_ino:
-        import apkdb
-        _p_dirs = [os.path.normpath(os.path.join(_apk_out, "..", "..", "..", n, "out", arch))
-                   for n in sorted(os.listdir(os.path.join(_apk_out, "..", "..", "..")))]
-        _caver = ""
-        try:
-            _caver = [t for t in open(os.path.join(_apk_out, "APK-VERSION")).read().split()
-                      if t.startswith("ca-certificates-bundle-")][0][len("ca-certificates-bundle-"):]
-        except (OSError, IndexError):
-            pass
+    if "/lib/apk/db" in _path_to_ino:
+        _p_dirs = [os.path.normpath(os.path.join(_apk_root, "..", "..", "..", n, "out", arch))
+                   for n in sorted(os.listdir(os.path.join(_apk_root, "..", "..", "..")))]
         _provs = list(apkdb.STATIC_PROVIDES)
         if libc_mode == "zig":
             _provs += ["musl=1.2.5-r99", f"so:libc.musl-{arch}.so.1=1"]
-        if _caver:
-            _provs.append(f"ca-certificates-bundle={_caver}")
-        _provs += apkdb.closure_provides(_p_dirs)
-        # The git subpackage git-init-template is install_if git=<ver>, which our
-        # git provide satisfies; its files are in the base already, so provide it.
-        _provs += [p.replace("g" + "it=", "g" + "it-init-template=", 1)
-                   for p in _provs if p.startswith("g" + "it=")]
+        _lock_names = {x[0] for x in _ap_stanzas}
+        _provs += [p for p in apkdb.closure_provides(_p_dirs) if p.split("=")[0] not in _lock_names]
         _libs = [(n, h) for n, h, _m in lib_files + usr_lib_files]
         _libs += [(n, h) for d, n, h in m4_share_files + m5_exec_files if d in ("/lib", "/usr/lib")]
-        _provs += apkdb.so_provides(_libs)
+        _sop = apkdb.so_provides(_libs)
+        _provs += _sop
+        _held_explicit = set(alpinepkgs.lk.read_list(os.path.join(alpinepkgs.lk.ADIR, "held")))
+        for _h in alpinepkgs.lk._held_provides(arch):
+            if _h.startswith("so:") and _h.split("=")[0] in _held_explicit:
+                if not any(p.startswith(_h.split("=")[0] + "=") for p in _sop):
+                    sys.exit(f"apk: held dependency {_h.split('=')[0]} is provided by no base library")
+            else:
+                _provs.append(_h)
         _provs = apkdb.dedupe_provides(_provs)
         _files = [pth for pth, nid in lx_pop.paths(dir_nodes)
                   if (lx_pop.files[nid]["mode"] & 0o170000) == 0o100000]
@@ -3271,16 +3250,19 @@ def main():
                   for o in [dir_owner.get(ino, (0o040755, 0, 0))]}
         _db = apkdb.build_installed(_files, _dmeta, _provs, arch, BUILD_TIME,
                                     depends=["musl"] if libc_mode == "alpine" else (),
-                                    musl_owned=libc_mode == "alpine")
-        if libc_mode == "alpine":
-            _idx = os.path.expanduser(os.path.join(os.environ.get("LEANDROS_APK_CACHE", "~/.cache/leandros/apk"),
-                                                   arch, "APKINDEX.tar.gz"))
-            _db += apkdb.apk_stanza(_musl_apk, _idx if os.path.isfile(_idx) else None)
-        add_files_to_dir(_path_to_ino["/lib/apk/db"], [("installed", _db, 0o100644)])
+                                    owned_elsewhere=frozenset(_ap_owned))
+        _vdb = alpinepkgs.db_files(_ap_pkgs, _ap_stanzas)
+        _bad = apkdb.check_deps(apkdb.parse_db(_db + _vdb["installed"]), [])
+        if _bad:
+            sys.exit("apk: unsatisfied dependencies: " + "; ".join(f"{a} -> {b}" for a, b in _bad[:20]))
+        add_files_to_dir(_path_to_ino["/lib/apk/db"], [
+            ("installed", _db + _vdb["installed"], 0o100644),
+            ("triggers", _vdb["triggers"], 0o100644),
+            ("scripts.tar.gz", _vdb["scripts.tar.gz"], 0o100644)])
         _nr = _db.count(b"\nR:")
         print(f"apk: leandros-base owns {_nr} files, "
               f"{len(_provs)} provides ({sum(p.startswith('so:') for p in _provs)} so:), "
-              f"db {len(_db) // 1024} KiB")
+              f"db {(len(_db) + len(_vdb['installed'])) // 1024} KiB")
 
     # scripts/pi_sync.py: describe the tree (paths, modes, owners, sha256) and
     # stop; no image is written.

@@ -1,10 +1,10 @@
 #!/bin/sh
 # alpine-sysroot [--arch ARCH] ROOT [PKG...]
 #
-# Stage (or extend) an Alpine 3.21 root at ROOT with the image's static
+# Stage (or extend) an Alpine root at ROOT with the image's static
 # apk-tools, never touching LeandrOS's own /. Installed as
 # /usr/sbin/alpine-sysroot by ports/apk; scripts/container-lib.sh's local
-# backend uses it to build the root that replaces the alpine:3.21 container
+# backend uses it to build the root that replaces the alpine container
 # when a port is built inside LeandrOS.
 #
 #   alpine-sysroot /var/lib/alp busybox make
@@ -20,7 +20,7 @@
 # over the guest's /lib/ld-musl-<arch>.so.1 (the image's libc.so), so the image
 # deliberately has no `apk` command, only apk.static and this wrapper.
 set -eu
-APK="${APK:-/usr/sbin/apk.static}"
+APK="${APK:-/sbin/apk.static}"
 ARCH=$(uname -m)
 if [ "${1:-}" = --arch ]; then
   [ "$2" = "$ARCH" ] || {

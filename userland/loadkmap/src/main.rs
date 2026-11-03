@@ -9,7 +9,10 @@
 //! does, so a loaded map defines the whole layout.
 //!
 //!     loadkmap < file.bmap        busybox-compatible
-//!     loadkmap NAME|PATH          NAME = /usr/share/keymaps/NAME.bmap
+//!     loadkmap NAME|PATH          NAME = /usr/share/bkeymaps/<dir>/<file>.bmap.gz
+//!                                 (Alpine's kbd-bkeymaps; the aliases de-latin1,
+//!                                 fr-latin1, uk, br-abnt2... map onto its layout;
+//!                                 .gz files are read through `busybox.static zcat`)
 //!     loadkmap --vconsole         /etc/vconsole.conf KEYMAP= (none: no-op)
 //!
 //! Keymaps are global to the console, as on Linux; any VT fd will do, and
@@ -20,7 +23,7 @@
 
 extern crate leandros_libc;
 
-use leandros_libc::{close, ioctl, open, read, write, O_RDONLY, O_RDWR, STDIN_FILENO};
+use leandros_libc::{close, dup3, execve, exit, fork, ioctl, open, pipe, read, wait4, write, O_RDONLY, O_RDWR, STDIN_FILENO};
 
 const KDSKBENT: usize = 0x4B47;
 const K_NOSUCHMAP: u16 = 0x027f;
@@ -79,17 +82,61 @@ unsafe fn vconsole_keymap(name: &mut [u8; 128]) -> Option<usize> {
     found
 }
 
+/// Alias table: console keymap names from kbd that kbd-bkeymaps lays out
+/// differently -> (directory, file) under /usr/share/bkeymaps. Anything else
+/// is `<name>/<name>`.
+fn alias(arg: &[u8]) -> (&[u8], &[u8]) {
+    match arg {
+        b"de" | b"de-latin1" => (b"de", b"de"),
+        b"de-latin1-nodeadkeys" => (b"de", b"de-nodeadkeys"),
+        b"fr-latin1" => (b"fr", b"fr"),
+        b"uk" => (b"gb", b"gb"),
+        b"br-abnt2" => (b"br", b"br"),
+        _ => (arg, arg),
+    }
+}
+
 /// Resolve NAME or PATH to a NUL-terminated path in `path`.
 fn resolve(arg: &[u8], path: &mut [u8; 256]) -> bool {
-    let (pre, suf): (&[u8], &[u8]) = if arg.contains(&b'/') { (b"", b"") }
-                                     else { (b"/usr/share/keymaps/", b".bmap") };
-    let n = pre.len() + arg.len() + suf.len();
-    if n + 1 > path.len() { return false; }
-    path[..pre.len()].copy_from_slice(pre);
-    path[pre.len()..pre.len() + arg.len()].copy_from_slice(arg);
-    path[pre.len() + arg.len()..n].copy_from_slice(suf);
+    let parts: [&[u8]; 5];
+    if arg.contains(&b'/') {
+        parts = [arg, b"", b"", b"", b""];
+    } else {
+        let (d, f) = alias(arg);
+        parts = [b"/usr/share/bkeymaps/", d, b"/", f, b".bmap.gz"];
+    }
+    let mut n = 0;
+    for p in parts {
+        if n + p.len() + 1 > path.len() { return false; }
+        path[n..n + p.len()].copy_from_slice(p);
+        n += p.len();
+    }
     path[n] = 0;
     true
+}
+
+/// Read a .gz keymap by spawning `busybox.static zcat PATH` (no inflate here).
+unsafe fn read_gz(path: *const u8) -> Option<usize> {
+    let mut fds = [0i32; 2];
+    if pipe(fds.as_mut_ptr()) < 0 { return None; }
+    let pid = fork();
+    if pid < 0 { close(fds[0]); close(fds[1]); return None; }
+    if pid == 0 {
+        dup3(fds[1], 1, 0);
+        close(fds[0]);
+        close(fds[1]);
+        let argv: [*const u8; 4] = [b"busybox.static\0".as_ptr(), b"zcat\0".as_ptr(), path, core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        execve(b"/bin/busybox.static\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    close(fds[1]);
+    let n = read_all(fds[0]);
+    close(fds[0]);
+    let mut st = 0i32;
+    wait4(pid, &mut st, 0, core::ptr::null_mut());
+    if st != 0 { return None; }
+    n
 }
 
 unsafe fn apply(len: usize, label: &[u8]) -> i32 {
@@ -160,13 +207,19 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     };
     let mut path = [0u8; 256];
     if !resolve(arg, &mut path) { out(b"loadkmap: name too long\n"); return 1; }
-    let fd = open(path.as_ptr(), O_RDONLY, 0);
-    if fd < 0 {
-        out(b"loadkmap: cannot open "); out(&path[..path.iter().position(|&c| c == 0).unwrap_or(0)]); out(b"\n");
-        return 1;
-    }
-    let n = read_all(fd);
-    close(fd);
+    let plen = path.iter().position(|&c| c == 0).unwrap_or(0);
+    let n = if path[..plen].ends_with(b".gz") {
+        read_gz(path.as_ptr())
+    } else {
+        let fd = open(path.as_ptr(), O_RDONLY, 0);
+        if fd < 0 {
+            out(b"loadkmap: cannot open "); out(&path[..plen]); out(b"\n");
+            return 1;
+        }
+        let n = read_all(fd);
+        close(fd);
+        n
+    };
     match n {
         Some(n) => apply(n, arg),
         None => { out(b"loadkmap: read error\n"); 1 }

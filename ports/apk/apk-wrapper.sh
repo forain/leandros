@@ -19,4 +19,4 @@ for a in "$@"; do
   esac
 done
 mkdir -p /lib/apk/exec /var/cache/misc /var/cache/apk
-exec /usr/sbin/apk.static "$@"
+exec /sbin/apk.static "$@"

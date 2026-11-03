@@ -1,4 +1,0 @@
-# Build outputs. Cargo.lock is checked in on purpose: this is a binary crate
-# and the port must build reproducibly against a pinned libc.
-/target
-/out

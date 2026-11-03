@@ -1,0 +1,17 @@
+# Dependencies leandros-base satisfies itself; the closure never pulls their
+# providers. A dependency is held if its name is listed here, or if every
+# package that could provide it is listed here (so mesa-egl also holds
+# so:libEGL.so.1). Each held NAME becomes a `<name>=<ver>-r99` provide of
+# leandros-base; `so:` entries must exist in the base library set.
+/bin/sh
+cmd:sh
+so:libdrm.so.2
+so:libpixman-1.so.0
+so:libxkbcommon.so.0
+so:libudev.so.1
+so:libseat.so.1
+mesa-egl
+mesa-gl
+mesa-gles
+mesa-gbm
+bubblewrap
