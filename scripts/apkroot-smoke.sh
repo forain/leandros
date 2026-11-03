@@ -67,6 +67,10 @@ step "7 apk del"
 run "$APK del jq htop; echo del_rc=\$?; ls /usr/bin/jq /usr/lib/libonig.so.5 2>&1" 300 > "$OUT/s7.log" 2>&1
 if grep -q 'del_rc=0' "$OUT/s7.log" && ! grep -q '^/usr/bin/jq$' "$OUT/s7.log" && grep -q 'No such file' "$OUT/s7.log"; then ok "del removed files"; else bad "del"; fi
 
+step "7b installed db stays text"
+run "ls /lib/apk/db/; head -c 2 /lib/apk/db/installed | od -An -c | head -1; grep -c '^P:' /lib/apk/db/installed; apk --version 2>&1 | head -1" 60 > "$OUT/s7b.log" 2>&1
+if ! grep -q 'installed.adb' "$OUT/s7b.log" && grep -Eq '^ *C *:' "$OUT/s7b.log"; then ok "installed db is still text"; else bad "installed db not text"; fi
+
 step "8 base unchanged"
 run "sha256sum /lib/ld-musl-$ARCH.so.1 /usr/bin/git; /usr/bin/git --version" 120 > "$OUT/s8.log" 2>&1
 grep -E '^[0-9a-f]{64}' "$OUT/s8.log" > "$OUT/sums.after"
