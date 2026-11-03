@@ -36,7 +36,7 @@ python3 "$D" start "$ARCH" > "$OUT/boot.log" 2>&1 || { echo "boot failed"; exit 
 python3 "$D" login root root >> "$OUT/boot.log" 2>&1
 
 step "1 base package"
-run "/usr/sbin/apk.static info -e leandros-base; echo info_rc=\$?; cat /etc/apk/world" 120 > "$OUT/s1.log" 2>&1
+run "/sbin/apk.static info -e leandros-base; echo info_rc=\$?; cat /etc/apk/world" 120 > "$OUT/s1.log" 2>&1
 if grep -q 'info_rc=0' "$OUT/s1.log" && grep -q '^leandros-base' "$OUT/s1.log"; then ok "leandros-base installed and in world"; else bad "base package"; fi
 
 step "2 checksums"
@@ -55,7 +55,7 @@ if grep -Eiq '(Installing|Upgrading) (musl|ncurses-libs|busybox)' "$OUT/s4.log";
 
 step "5 run"
 run "/usr/bin/jq --version; echo '{\"a\":1}' | /usr/bin/jq .a; /usr/bin/htop --version" 120 > "$OUT/s5.log" 2>&1
-grep -q 'jq-1\.7' "$OUT/s5.log" && ok "jq --version" || bad "jq --version"
+grep -q 'jq-1\.[78]' "$OUT/s5.log" && ok "jq --version" || bad "jq --version"
 grep -qx '1' "$OUT/s5.log" && ok "jq .a" || bad "jq .a"
 grep -q 'htop 3' "$OUT/s5.log" && ok "htop --version" || bad "htop --version"
 
@@ -74,16 +74,25 @@ cmp -s "$OUT/sums.before" "$OUT/sums.after" && ok "checksums unchanged" || bad "
 grep -q 'git version' "$OUT/s8.log" && ok "git works" || bad "git"
 
 step "8b real musl package"
-WANT_LD=$(PYTHONPATH=scripts python3 -c "import apkdb,hashlib,sys;print(hashlib.sha256(apkdb.apk_file('ports/apk/out/$ARCH/musl.apk','lib/ld-musl-$ARCH.so.1')).hexdigest())" 2>/dev/null)
-run "sha256sum /lib/ld-musl-$ARCH.so.1; readlink /lib/libc.musl-$ARCH.so.1 /usr/lib/libc.so; /usr/sbin/apk.static info -e musl; cat /etc/apk/world; echo audit_begin; /usr/sbin/apk.static audit 2>&1; echo audit_end;$APK add --upgrade musl; echo up_rc=\$?; $APK add musl-dev; echo dev_rc=\$?; $APK del musl; echo delmusl_rc=\$?; /lib/ld-musl-$ARCH.so.1 2>&1 | head -1" 600 > "$OUT/s8b.log" 2>&1
+WANT_LD=$(PYTHONPATH=scripts python3 -c "import apkdb,hashlib,sys;print(hashlib.sha256(apkdb.apk_file(__import__('alpinepkgs').musl_apk('$ARCH'),'lib/ld-musl-$ARCH.so.1')).hexdigest())" 2>/dev/null)
+run "sha256sum /lib/ld-musl-$ARCH.so.1; readlink /lib/libc.musl-$ARCH.so.1 /usr/lib/libc.so; /sbin/apk.static info -e musl; cat /etc/apk/world; echo audit_begin; /sbin/apk.static audit 2>&1; echo audit_end;$APK add --upgrade musl; echo up_rc=\$?; $APK add musl-dev; echo dev_rc=\$?; $APK del musl; echo delmusl_rc=\$?; /lib/ld-musl-$ARCH.so.1 2>&1 | head -1" 600 > "$OUT/s8b.log" 2>&1
 [ -n "$WANT_LD" ] && grep -q "^$WANT_LD" "$OUT/s8b.log" && ok "loader == pinned Alpine musl" || bad "loader sha"
 grep -q "^ld-musl-$ARCH.so.1" "$OUT/s8b.log" && grep -q 'lib/ld-musl-'"$ARCH"'.so.1$' "$OUT/s8b.log" && ok "symlinks" || bad "symlinks"
-grep -qx 'musl' "$OUT/s8b.log" && grep -Eqx 'musl(=1.2.5-r12)?' "$OUT/s8b.log" && ok "musl installed + pinned" || bad "musl info/world"
+grep -qx 'musl' "$OUT/s8b.log" && grep -Eqx 'musl(=[0-9.]+-r[0-9]+)?' "$OUT/s8b.log" && ok "musl installed + pinned" || bad "musl info/world"
 ! sed -n '/audit_begin/,/audit_end/p' "$OUT/s8b.log" | grep -Eq 'lib/(ld-musl|libc.musl)' && ok "apk audit clean for musl" || bad "audit musl"
 grep -q 'up_rc=0' "$OUT/s8b.log" && ! grep -Eq '(Installing|Upgrading|Downgrading) musl \('"$OUT/s8b.log" && ok "upgrade musl no-op" || bad "upgrade musl"
 grep -q 'dev_rc=0' "$OUT/s8b.log" && ok "apk add musl-dev works" || bad "musl-dev"
 grep -q 'delmusl_rc=1' "$OUT/s8b.log" && ok "del musl refused" || bad "del musl"
 grep -q 'musl libc' "$OUT/s8b.log" && ok "loader still runs" || bad "loader run"
+
+step "8c vanilla Alpine packages (lock)"
+run "$APK info -e firefox git ripgrep dosfstools xfsprogs dbus-libs iso-codes kbd-bkeymaps; echo info_rc=\$?; $APK info -W /usr/bin/rg; echo audit_begin; $APK audit --system 2>&1; echo audit_end; $APK fix -s git ripgrep 2>&1; echo fix_rc=\$?; $APK add -s \$(cat /etc/apk/world) 2>&1; echo world_rc=\$?; /bin/rg --version | head -1; /bin/git --version; grep -c x /etc/passwd" 300 > "$OUT/s8c.log" 2>&1
+grep -q 'info_rc=0' "$OUT/s8c.log" && ok "lock packages installed" || bad "apk info -e"
+grep -q 'ripgrep' "$OUT/s8c.log" && ok "rg owned by ripgrep" || bad "info -W rg"
+sed -n '/audit_begin/,/audit_end/p' "$OUT/s8c.log" | grep -Eq ' (usr/(bin|lib|share)|bin|sbin|lib)/' && bad "audit reports package paths" || ok "apk audit clean"
+sed -n '/fix_rc/,$p;/^fix/,/fix_rc/p' "$OUT/s8c.log" | grep -Eq '(Installing|Upgrading|Reinstalling|Purging) ' && bad "fix -s changes something" || ok "apk fix -s no-op"
+sed -n '/fix_rc/,/world_rc/p' "$OUT/s8c.log" | grep -Eq '(Installing|Upgrading) ' && bad "add -s world installs" || ok "apk add -s world no-op"
+grep -q 'ripgrep 1' "$OUT/s8c.log" && grep -q 'git version' "$OUT/s8c.log" && ok "rg and git run" || bad "rg/git run"
 
 step "9 wrapper refuses leandros-base"
 run "$APK del leandros-base; echo refuse_rc=\$?" 60 > "$OUT/s9.log" 2>&1
@@ -93,7 +102,7 @@ step "10 sudo as leandro"
 python3 "$D" cmd "exit" 5 > /dev/null 2>&1
 python3 "$D" login leandro leandro >> "$OUT/boot.log" 2>&1
 run "echo leandro | sudo -S -p '' $APK add jq; echo sudo_rc=\$?; /usr/bin/jq --version" 600 > "$OUT/s10.log" 2>&1
-if grep -q 'sudo_rc=0' "$OUT/s10.log" && grep -q 'jq-1\.7' "$OUT/s10.log"; then ok "sudo apk add jq"; else bad "sudo apk add"; fi
+if grep -q 'sudo_rc=0' "$OUT/s10.log" && grep -q 'jq-1\.[78]' "$OUT/s10.log"; then ok "sudo apk add jq"; else bad "sudo apk add"; fi
 
 python3 "$D" stop > /dev/null 2>&1
 echo "apkroot-smoke $ARCH: $fails failure(s); logs in $OUT"

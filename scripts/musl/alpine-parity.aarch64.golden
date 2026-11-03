@@ -42,6 +42,7 @@ __fwritable 2 0 1 0
 __fwriting 2 0 1 0
 __fxstat 2 0 1 0
 __fxstatat 2 0 1 0
+__getauxval 2 0 1 0
 __getdelim 2 0 2 0
 __h_errno_location 2 0 1 0
 __isalnum_l 2 0 1 0
@@ -267,7 +268,7 @@ cfgetospeed 2 0 1 0
 cfmakeraw 2 0 1 0
 cfsetispeed 2 0 1 0
 cfsetospeed 2 0 1 0
-cfsetspeed 2 0 2 0
+cfsetspeed 2 0 1 0
 chdir 2 0 1 0
 chmod 2 0 1 0
 chown 2 0 1 0
@@ -988,6 +989,7 @@ popen 2 0 1 0
 posix_close 2 0 1 0
 posix_fadvise 2 0 1 0
 posix_fallocate 2 0 1 0
+posix_getdents 2 0 1 0
 posix_madvise 2 0 1 0
 posix_memalign 2 0 1 0
 posix_openpt 2 0 1 0
@@ -1104,6 +1106,7 @@ pthread_mutexattr_getpshared 2 0 1 0
 pthread_mutexattr_getrobust 2 0 1 0
 pthread_mutexattr_gettype 2 0 1 0
 pthread_mutexattr_init 2 0 1 0
+pthread_mutexattr_setprioceiling 2 0 1 0
 pthread_mutexattr_setprotocol 2 0 1 0
 pthread_mutexattr_setpshared 2 0 1 0
 pthread_mutexattr_setrobust 2 0 1 0
@@ -1202,6 +1205,7 @@ remquof 2 0 1 0
 remquol 2 0 1 0
 rename 2 0 1 0
 renameat 2 0 1 0
+renameat2 2 0 1 0
 res_init 2 0 1 0
 res_mkquery 2 0 2 0
 res_query 2 0 1 0

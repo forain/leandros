@@ -69,24 +69,39 @@ refuses `leandros-base`, `--purge` and `del musl` as arguments (`add musl-dev`, 
 cache directories, and execs `apk.static`. apk runs install scripts in a chroot, so it needs
 root (`sudo`).
 
-mkfs ([apkdb.py](../../scripts/apkdb.py)) generates `/lib/apk/db/installed` with one package,
-`leandros-base`, plus (default `LEANDROS_LIBC=alpine`) a real `musl-1.2.5-r12` record generated
-from the pinned `.apk` (`apkdb.apk_stanza`, `C:` checked against the repository index);
-`/etc/apk/world` keeps `leandros-base` and `musl=1.2.5-r12`, and `leandros-base` depends on
-`musl`. The package owns every base file except the musl files, `/usr/lib/libc.so` (unowned, so
-`apk add musl-dev` can take it), `/lib/apk`, `/etc/apk/{world,arch}`, `passwd`/`group`/`shadow`/`resolv.conf` and the
-`home root tmp var run proc sys dev mnt media` trees. It provides:
+mkfs stages the vanilla Alpine packages named in [ports/alpine/world](../../ports/alpine/world)
+(firefox, git, ripgrep, dosfstools, xfsprogs, dbus-libs, iso-codes, kbd-bkeymaps, apk-tools-static,
+busybox-static, musl, ca-certificates-bundle, alpine-keys, fonts, ffmpeg, ...; ~150 packages) from the
+lock `ports/alpine/<arch>.lock` ([alpine-lock.py](../../scripts/alpine-lock.py) `refresh` writes it,
+`fetch` verifies and caches the `.apk` files in `~/.cache/leandros/apk`; the lock records the Alpine
+release, no release is hard-coded). [alpinepkgs.py](../../scripts/alpinepkgs.py) + [apkdb.py](../../scripts/apkdb.py)
+install them host-side with no container: every file lands in the image, and
+`/lib/apk/db/{installed,triggers,scripts.tar.gz}` get one real record per package (checked against apk's
+own records by `alpinepkgs.py crosscheck`). Maintainer scripts are recorded, not run: trigger outputs
+(gschemas, mime db, icon caches, fonts.dir) come from the lock's *generated tar*, owned by leandros-base.
+`/etc/apk/world` is `leandros-base`, `musl=<ver>` and the lock's world names.
 
-- `so:<soname>=<ver>` for every ELF in `/lib` and `/usr/lib`, so apk does not pull Alpine
-  copies of natively built libraries (wayland, drm, mesa);
-- `/bin/sh`, `alpine-baselayout*`, `alpine-keys`,
-  `apk-tools-static`, `ca-certificates-bundle`;
-- one `<pkg>=<ver>` for each Alpine package named in the ports' `CLOSURE.txt` and `GIT-VERSION`
-  (so `apk add nano` is satisfied by the base).
+`leandros-base` owns the rest: the LeandrOS binaries and data, `/bin/firefox` (the launcher; a
+`firefox.desktop` in `/usr/local/share/applications` shadows Alpine's), `/etc/gitconfig`, the
+apk wrapper and shims (`/usr/sbin/{apk,adduser,...}` exec `/sbin/apk.static` and `/bin/busybox.static`),
+and compat symlinks `/bin/{git,less,nano,rg}` -> `/usr/bin`, `/bin/mkfs.{fat,xfs}` -> `/sbin`.
+It does not own `/lib/apk`, `/etc/apk/{world,arch}`, `passwd`/`group`/`shadow`/`resolv.conf` or the
+`home root tmp var run proc sys dev mnt media` trees. A LeandrOS ship-set file at a path a package owns
+is dropped by mkfs (`apk-shadow: N dropped (M differ)`; a differing GPU/pipewire/gstreamer library is fatal).
+It provides:
+
+- `so:<soname>=<ver>` for every ELF of its own in `/lib` and `/usr/lib` (libdrm, libpixman, libxkbcommon,
+  libudev, libseat, the Mesa stage); `ports/alpine/held` lists the dependencies it satisfies instead of
+  the Alpine packages (`mesa-egl`, `mesa-gl`, ... are provided as `<name>=0-r99`);
+- `/bin/sh`, `alpine-baselayout*`;
+- one `<pkg>=<ver>` for each remaining ports' `CLOSURE.txt` (pipewire, gstreamer, portal) that is not
+  itself a lock package.
+
+mkfs checks that every dependency of every record is satisfied.
 
 Conflict policy: a package that ships a base file fails with apk's own `trying to overwrite X
 owned by leandros-base`. `--force-overwrite` bypasses it and is unsupported. See [libc.md](libc.md#alpine-musl-as-the-runtime-libc) for the libc layout
-(`LEANDROS_LIBC=zig` restores the old fake `musl=1.2.5-r99` provide and the hard links). Install scripts run under brush; `/usr/sbin/busybox.static` plus `adduser`, `addgroup`,
+(`LEANDROS_LIBC=zig` restores the old fake `musl=1.2.5-r99` provide and the hard links). Install scripts run under brush; `/bin/busybox.static` plus `adduser`, `addgroup`,
 `deluser` and `delgroup` shims serve the packages that call them. Triggers, openrc and
 services are out of scope.
 
@@ -162,18 +177,18 @@ Known gaps:
 | [cosmic-applets-panel](../../ports/cosmic-applets-panel/) | the upstream panel applets (time, battery, notifications, status-area, workspaces, input-sources, a11y, app-list) with their `.desktop` files, staged together or not at all | [build.sh](../../ports/cosmic-applets-panel/build.sh), [../desktop/session.md](../desktop/session.md#the-panel-and-its-applets) |
 | [cosmic-applet-power](../../ports/cosmic-applet-power/), [cosmic-applet-bluetooth](../../ports/cosmic-applet-bluetooth/) | the power and Bluetooth applets; the latter links `libdbus-1.so.3` from [libdbus](../../ports/libdbus/) (client library only, sha256-pinned) | [../desktop/session.md](../desktop/session.md#the-panel-and-its-applets) |
 | [cosmic-apps](../../ports/cosmic-apps/) | cosmic-files, cosmic-edit and cosmic-screenshot (epoch-1.3.0, no gvfs or io-uring) with icons | [../desktop/session.md](../desktop/session.md#the-panel-and-its-applets) |
-| [ripgrep](../../ports/ripgrep/) | `rg`, behind the `grep` shim | [programs.md](programs.md) |
+| ripgrep (vanilla Alpine package, [lock](../../ports/alpine/)) | `rg`, behind the `grep` shim | [programs.md](programs.md) |
 | [portal](../../ports/portal/) | xdg-desktop-portal frontend (Alpine) + xdg-desktop-portal-cosmic (cross-built, unmodified) | [build.sh](../../ports/portal/build.sh), [../desktop/session.md](../desktop/session.md#the-desktop-portal) |
 | [apk](../../ports/apk/) | `apk.static`, `alpine-sysroot`, Alpine keys/repositories and a CA bundle for in-guest builds; `claude-code-install` and its `claude` launcher | [build.sh](../../ports/apk/build.sh), [In-guest builds](#in-guest-builds-apk-without-containers), [below](#the-claude-code-cli) |
-| [git](../../ports/git/) | git 2.47 + git-remote-https, less, nano, OpenSSH's `sftp-server` and `/etc/terminfo`, repackaged from Alpine 3.21 like PipeWire; symlinks in the staged tree become hard links in the image | [build-in-alpine.sh](../../ports/git/build-in-alpine.sh), [programs.md](programs.md#sshd) |
+| git (vanilla Alpine package, [lock](../../ports/alpine/)) | git 2.47 + git-remote-https, less, nano, OpenSSH's `sftp-server` and `/etc/terminfo`, repackaged from Alpine 3.21 like PipeWire; symlinks in the staged tree become hard links in the image | [build-in-alpine.sh](../../ports/git/build-in-alpine.sh), [programs.md](programs.md#sshd) |
 | [pipewire](../../ports/pipewire/) | PipeWire 1.2.7 + WirePlumber from Alpine, the `leandros-snd-sink` virtio-snd sink, `pipewire-pulse`, `cosmic-applet-audio`, a ScreenCast-enabled `cosmic.portal` | [build.sh](../../ports/pipewire/build.sh), [../audio.md](../audio.md) |
 | [gstreamer](../../ports/gstreamer/) | GStreamer 1.24.11 (core, plugins-base/good whitelist, gst-libav on FFmpeg 6.1) and the PipeWire plugin 1.2.7 from Alpine 3.21, `gst-launch-1.0`/`gst-inspect-1.0`, a 30 s test clip, and the `-dev` files merged into the cross sysroot for cosmic-player's gstreamer-rs crates | this file |
-| [iso-codes](../../ports/iso-codes/) | Debian iso-codes 4.18.0 JSON tables (sha256-pinned) for Settings' Region page | [build.sh](../../ports/iso-codes/build.sh) |
-| [kbd-keymaps](../../ports/kbd-keymaps/) | binary console keymaps for `loadkmap` | [README.md](../../ports/kbd-keymaps/README.md) |
-| [firefox](../../ports/firefox/) | Alpine's prebuilt Firefox, its closure, FFmpeg and libpulse, the launcher and prefs | [below](#firefox) |
+| iso-codes (vanilla Alpine package, [lock](../../ports/alpine/)) | Debian iso-codes 4.18.0 JSON tables (sha256-pinned) for Settings' Region page | [build.sh](../../ports/iso-codes/build.sh) |
+| kbd-bkeymaps (Alpine) + [kbd-keymaps](../../ports/kbd-keymaps/) | `/usr/share/bkeymaps/<dir>/<name>.bmap.gz` for `loadkmap` (aliases for kbd names such as `de-latin1`, `uk`); the README and `gen-defkeymap.py` (kernel default map) stay |
+| firefox (vanilla Alpine package, [lock](../../ports/alpine/)) | Alpine's prebuilt Firefox, its closure, FFmpeg and libpulse, the launcher and prefs | [below](#firefox) |
 | [sudo-rs](../../ports/sudo-rs/) | `su` and `sudo` (sudo-rs v0.2.15, static musl, `pam-leandros`), five patches, `/etc/sudoers` and `/etc/shells` | [README.md](../../ports/sudo-rs/README.md), [../servers/security.md](../servers/security.md#su-and-sudo) |
 | [brush](../../ports/brush/) | the pin and patches for the sibling brush checkout, and `sync.sh` | [README.md](../../ports/brush/README.md), [below](#brush) |
-| [mkfs-fat](../../ports/mkfs-fat/), [mkfs-xfs](../../ports/mkfs-xfs/) | in-tree Rust formatters for disks-rs | [mkfs-xfs README](../../ports/mkfs-xfs/README.md), [below](#disks-rs-mkfsfat-and-mkfsxfs) |
+| dosfstools, xfsprogs (vanilla Alpine packages, [lock](../../ports/alpine/)) | `mkfs.fat`, `mkfs.xfs` for disks-rs, found by bare name via /bin symlinks |
 | [openrm](../../ports/openrm/) | NVIDIA's open GPU resource manager built freestanding for the x86_64 kernel (feature `nvidia`) | [../hardware/pc.md](../hardware/pc.md) |
 
 ## Design notes by port
