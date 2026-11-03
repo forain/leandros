@@ -10,14 +10,14 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
 
 use core::ffi::c_void;
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
     pub fn fork() -> i32;
     pub fn waitpid(pid: i32, stat_loc: *mut i32, options: i32) -> i32;
     pub fn _exit(status: i32) -> !;
@@ -145,7 +145,7 @@ unsafe fn full_write(buf: usize) -> bool {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pipebw_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     // ~500 separate VMAs (alternating protections defeat merging), touched.
     for i in 0..500 {
         let a = map(8192, if i & 1 == 0 { PROT_RW } else { PROT_R });
@@ -162,19 +162,6 @@ pub unsafe extern "C" fn pipebw_main(_argc: isize, _argv: *mut *mut u8, _envp: *
     if ok { 0 } else { 1 }
 }
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start", ".global _start", "_start:",
-    "   xor rbp, rbp", "   mov rdi, rsp", "   mov rsi, offset pipebw_main",
-    "   and rsp, -16", "   call relibc_start_v1", "   ud2"
-);
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start", ".global _start", "_start:",
-    "   mov x29, #0", "   mov x30, #0", "   mov x0, sp",
-    "   adrp x1, pipebw_main", "   add x1, x1, :lo12:pipebw_main",
-    "   and sp, x0, #-16", "   bl relibc_start_v1", "   brk #0"
-);
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

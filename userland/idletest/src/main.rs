@@ -30,7 +30,13 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
+#[allow(unused_imports)]
+use rt::syscall;
 
 use core::ffi::c_void;
 
@@ -138,10 +144,6 @@ pub struct rusage {
 }
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
 
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
@@ -157,38 +159,11 @@ extern "C" {
 
     // eventfd2/timerfd_create/timerfd_settime have no relibc C wrapper —
     // go straight through the raw syscall entry point (nr module above).
-    pub fn syscall(sysno: c_long, ...) -> c_long;
 }
 
 // ── Assembly entry point (identical to polltest's/timertest's) ─────────────
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset idle_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, idle_main",
-    "   add x1, x1, :lo12:idle_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 /// PASS threshold: at most this many microseconds of utime+stime may be
 /// consumed while blocked across the ~3s wall-clock idle window. A busy
@@ -202,7 +177,7 @@ const IDLE_CPU_THRESHOLD_US: i64 = 150_000;
 const MAX_ITERATIONS: u32 = 100;
 
 #[no_mangle]
-pub unsafe extern "C" fn idle_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0;
 
     let (idle_cpu_ok, timer_wake_ok) = run_idle_scenario();

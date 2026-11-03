@@ -21,7 +21,11 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
 
 use core::ffi::c_void;
 
@@ -73,10 +77,6 @@ struct sockaddr_in {
 }
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
 
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     pub fn close(fd: i32) -> i32;
@@ -100,33 +100,7 @@ extern "C" {
 
 // ── Assembly entry point (identical to polltest's/timertest's) ──────────────
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset ping_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, ping_main",
-    "   add x1, x1, :lo12:ping_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -254,7 +228,8 @@ fn build_packet(ident: u16, seq: u16, send_time_ms: i64, buf: &mut [u8; PACKET_L
 // ── Entry point ───────────────────────────────────────────────────────────
 
 #[no_mangle]
-pub unsafe extern "C" fn ping_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    let argc = argc_c as isize;
     let mut count = PING_COUNT;
     let mut timeout_ms = TIMEOUT_MS;
     let mut interval_ms = INTERVAL_MS;

@@ -1,73 +1,22 @@
 # C libraries
 
-LeandrOS userland runs on three C runtimes: **relibc**, the Redox OS libc, retargeted to
-LeandrOS and used by the in-tree tests that need a complete POSIX library; **leandros-libc**,
-a minimal in-tree runtime for small `no_std` programs; and **musl**, both static and as a
-real dynamic `ld-musl`, which is what every ported program and the whole desktop run on.
-All three issue the same Linux-numbered syscalls; none of them translates anything.
+LeandrOS userland runs on two C runtimes: **leandros-libc**, a minimal in-tree runtime for
+small `no_std` programs, and **musl**, both static and as a real dynamic `ld-musl`, which is
+what every ported program, the whole desktop and the in-tree tests that need a complete POSIX
+library run on. Both issue the same Linux-numbered syscalls; neither translates anything.
+(The Redox `relibc` used to be a third runtime; it was retired once every test moved to static
+musl, and the `../relibc` sibling checkout is no longer needed.)
 
 ## Overview
 
 | Library | Where | Used by | Linkage |
 |---|---|---|---|
-| relibc | sibling checkout `../relibc` (override `LEANDROS_RELIBC_DIR`) | `pthreadtest`, `sigtest`, `timertest`, `polltest`, `drmsmoke`, `vttest`, `ping`, … (the `RELIBC_LINKED` list in [scripts/build-userland.sh](../../scripts/build-userland.sh)); MAME | static `librelibc.a`, target `<arch>-unknown-leandros` |
 | leandros-libc | [userland/libc](../../userland/libc/src/lib.rs) | `init`, `login`, `shell`, `greeter-launch`, `mount`, `aplay`, `vfstest`, DOOM, … | static, target `<arch>-unknown-none` |
-| musl 1.2.5 | Rust's self-contained musl, zig's bundled musl, and a shipped `ld-musl` + `libc.so` | brush, coreutils, busd, greetd, COSMIC, Mesa, PipeWire, Firefox | static or dynamic |
+| musl 1.2.5 | Rust's self-contained musl, zig's bundled musl, and a shipped `ld-musl` + `libc.so` | brush, coreutils, busd, greetd, COSMIC, Mesa, PipeWire, Firefox, MAME, and the `MUSL_LINKED` tests in [scripts/build-userland.sh](../../scripts/build-userland.sh) | static or dynamic |
 
-## relibc
-
-LeandrOS ships **relibc**, a full-featured C standard library originally developed for Redox
-OS, as the C runtime for in-tree programs that need more than a minimal one:
-
-- A complete POSIX libc implementation in Rust, compiled to a `staticlib`.
-- Covers `stdio`, `stdlib`, `string`, `math`, `pthread`, `signal`, `time`, `unistd`,
-  `sys/mman`, `dlfcn` and many more headers.
-- Backed by `dlmalloc` for heap allocation and `openlibm` for `libm` functions.
-- Includes `crt0`, `crti`, `crtn` and a dynamic linker (`ld_so`) for position-independent
-  executables.
-- Enables porting existing C/C++ software with minimal changes; MAME's LeandrOS build
-  compiles against relibc's sysroot ([ports.md](ports.md#mame)).
-
-### How it is retargeted
-
-relibc gains a `target_os = "leandros"` and a platform module,
-`src/platform/leandros/`, whose job is deliberately small. Because LeandrOS implements the
-Linux syscall ABI — numbers, calling convention, signal-frame layout — relibc's **Linux**
-`Pal` implementation is reused as-is rather than maintained as a parallel copy. The LeandrOS
-module only supplies what that code expects from the external `sc` crate (syscall trampolines
-and number tables, vendored unchanged, because `sc`'s own platform dispatch does not
-recognise a custom `target_os`) plus the few LeandrOS-only calls with no Linux equivalent
-(IPC ports, `spawn`).
-
-The LeandrOS changes are a short series of commits on top of upstream in the sibling checkout
-(currently at `fd1967e1`): target recognition across headers and build config, reuse of the
-Linux `Pal`, an aarch64 `rlct_clone`, the per-architecture `epoll_event` ABI,
-`timer_getoverrun`, `exit_group` for process exit, an aarch64 thread-entry stack alignment
-fix, and Linux semantics for `poll()` on non-epoll and duplicate fds. Two checkouts at
-different commits produce different test results (the `poll_linux_semantics` case fails
-without `fd1967e1`), which is why the build accepts `LEANDROS_RELIBC_DIR` and records which
-checkout it used.
-
-### How it is built and linked
-
-`build_relibc` in [scripts/build-all.sh](../../scripts/build-all.sh) runs
-`cargo build --target targets/<arch>-unknown-leandros.json --release -Z build-std=core,alloc,compiler_builtins`
-in the sibling checkout. relibc's C sources go through the `cc` crate, which with no `CC` set
-falls back to the *host* compiler; the build points it at the same `zig cc` wrapper the rest of
-the cross-build uses, because relibc passes the aarch64-only `-mno-outline-atomics` and a host
-x86_64 gcc rejects it.
-
-The [target specs](../../targets/) are plain bare-metal targets (`llvm-target`
-`<arch>-unknown-none`, static relocation model, no PIE, `rust-lld`) with `os = "leandros"`.
-Each relibc-linked test has a `build.rs` that links `librelibc.a` from the sibling with
-`-z muldefs` and declares `rerun-if-changed` on the archive — cargo does not track external
-native libraries, and without that line every binary silently keeps the libc it was first
-linked against.
-
-Only `cargo build` runs, never relibc's own `make sysroot`, so a C program that wants relibc
-needs its headers (generated with `cbindgen`; relibc's `make headers` uses a GNU-only `find`
-flag and silently breaks on macOS), `crt0`, and the small C shims in `src/c/stdlib.c`
-(`strtold` and friends) built by hand. The recipe is recorded with the MAME port.
+The `MUSL_LINKED` tests (`pthreadtest`, `sigtest`, `timertest`, `polltest`, `drmsmoke`, `vttest`,
+`ping`, …) are `no_std` crates linked against static `<arch>-unknown-linux-musl` through the zig
+linker wrapper; their start-up is musl's `crt1` and `userland/muslrt` holds the shared pieces.
 
 ## leandros-libc
 
@@ -182,13 +131,9 @@ kernel, and everything POSIX-shaped is built on top of them in userspace:
   caller's address space, distinct from the `CLONE_VM`-clear `fork` path) and `futex`
   (`FUTEX_WAIT`/`FUTEX_WAIT_BITSET`, `FUTEX_WAKE`, and the PI family for musl/Firefox) are the
   thread-related kernel syscalls. See [../kernel/threads-and-futex.md](../kernel/threads-and-futex.md).
-- **Userspace** — in relibc, `RlctMutex`/`RlctCondvar` (built on `futex`), a `#[thread_local]`
-  TSD map with destructor-on-exit support, and `pthread_cleanup_push`/`pop`; in musl, its own
-  equivalents. This is the same layering glibc and musl use on Linux: the kernel has no mutex,
+- **Userspace** — in musl, its own mutex, condvar, TSD and cleanup-handler implementation. This is the same layering glibc and musl use on Linux: the kernel has no mutex,
   condvar or TSD syscalls of its own.
-- Both `x86_64` and `aarch64` implement relibc's raw thread-spawn path (`rlct_clone`) that
-  `pthread_create` calls into; a contended mutex, condvar wait/signal and TSD destructor
-  ordering are exercised by `pthreadtest` in QEMU on both targets.
+- `pthreadtest` exercises contended mutexes, condvar wait/signal and TSD destructor ordering in QEMU on both targets.
 
 The libc-level contracts the kernel had to honour exactly are the instructive part: musl
 needs `CLONE_PARENT_SETTID` for every thread's tid (`8897e02`; without it a keybinding spawn
@@ -198,15 +143,13 @@ it), and private futexes are keyed per process, not by address alone.
 
 ### Thread exit and fork (October 2026 fixes)
 
-- **Exited threads are freed.** relibc never unmapped an exited thread's 1 MiB pthread stack or its TCB/TLS mapping, so every thread left two VMAs and about 1 MiB of address space behind (`pthreadtest churn 5000`: VMAs 208 to 10208 and VmSize 113 MB to 5.29 GB; after the fix 8 VMAs and 9544 kB, flat). The kernel was innocent. The review follow-up blocks all signals and disables cancellation before a thread exits (as musl's `pthread_exit` does), makes `pthread_detach` of an already-exited thread push it on the zombie list instead of blocking, and has a fork child forget the parent's zombie list.
-- **`fork()` holds relibc's thread-map lock.** `pthread::create` inserts into `OS_TID_TO_PTHREAD` (a futex mutex) after the clone; a fork from another thread at that moment gave the child a locked mutex and its first `pthread_create` hung forever. `fork` now takes the lock around the fork, and `epolltest churn 20 tfork` is in `regress`.
-- **Affinity.** `sched_getcpu`, `sched_setaffinity`/`getaffinity` and `waitid` exist in relibc, and the scheduler honours the mask (placement, wake CPU choice, EEVDF pick, load balance).
+- **Exited threads are freed.** the old relibc never unmapped an exited thread's 1 MiB pthread stack or its TCB/TLS mapping, so every thread left two VMAs and about 1 MiB of address space behind (`pthreadtest churn 5000`: VMAs 208 to 10208 and VmSize 113 MB to 5.29 GB; after the fix 8 VMAs and 9544 kB, flat). The kernel was innocent. The review follow-up blocks all signals and disables cancellation before a thread exits (as musl's `pthread_exit` does), makes `pthread_detach` of an already-exited thread push it on the zombie list instead of blocking, and has a fork child forget the parent's zombie list.
+- **`fork()` holds the libc thread-map lock (historical, relibc).** `pthread::create` inserts into `OS_TID_TO_PTHREAD` (a futex mutex) after the clone; a fork from another thread at that moment gave the child a locked mutex and its first `pthread_create` hung forever. `fork` now takes the lock around the fork, and `epolltest churn 20 tfork` is in `regress`.
+- **Affinity.** `sched_getcpu`, `sched_setaffinity`/`getaffinity` and `waitid` exist in the libc, and the scheduler honours the mask (placement, wake CPU choice, EEVDF pick, load balance).
 - **`memset` in zig-static musl builds** on aarch64 was a byte loop (musl's C fallback); an assembly version is used. Every other C library in the image already used word or vector `mem*`.
 
 ## Limitations & open work
 
-- relibc's full sysroot (headers, `crt0`, C shims) is not produced by the build; C programs
-  against relibc need the manual recipe.
 - No in-tree crate is a shared library today; `scripts/build-userland.sh` emits static
   binaries only. A Rust `libpam.so.0` replacing the C lock-screen shim would be a new build
   shape ([../desktop/limitations.md](../desktop/limitations.md#login-and-privilege)).
@@ -216,9 +159,9 @@ it), and private futexes are keyed per process, not by address alone.
 | Where | What |
 |---|---|
 | [userland/libc/src/](../../userland/libc/src/) | leandros-libc |
-| [targets/](../../targets/) | the `<arch>-unknown-leandros` and kernel target specs |
-| [scripts/build-userland.sh](../../scripts/build-userland.sh) | which programs link relibc vs leandros-libc |
-| [scripts/build-all.sh](../../scripts/build-all.sh) | `build_relibc`, the musl builds of sibling projects |
+| [targets/](../../targets/) | the kernel target specs and `x86_64-unknown-leandros` (hard-float leandros-libc for DOOM) |
+| [scripts/build-userland.sh](../../scripts/build-userland.sh) | which programs link musl vs leandros-libc |
+| [scripts/build-all.sh](../../scripts/build-all.sh) | the musl builds of sibling projects |
 | [elf/src/lib.rs](../../elf/src/lib.rs), [kernel/src/syscall.rs](../../kernel/src/syscall.rs) | loader bias, `PT_INTERP`, auxv |
 | [userland/pthreadtest](../../userland/pthreadtest/), [userland/spawnwedge](../../userland/spawnwedge/), [userland/killmt](../../userland/killmt/) | thread-layer regressions |
 

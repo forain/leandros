@@ -16,7 +16,13 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
+#[allow(unused_imports)]
+use rt::syscall;
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -31,9 +37,10 @@ pub type sigset_t = u64;
 #[repr(C)]
 pub struct sigaction {
     pub sa_handler: Option<extern "C" fn(c_int)>,
+    pub sa_mask: sigset_t,
+    pub _mask_pad: [u64; 15], // musl sigset_t is 1024 bits
     pub sa_flags: c_int,
     pub sa_restorer: Option<unsafe extern "C" fn()>,
-    pub sa_mask: sigset_t,
 }
 
 const SIGALRM: c_int = 14;
@@ -106,10 +113,6 @@ mod nr { pub const SIGNALFD4: i64 = 74; pub const FUTEX: i64 = 98; pub const GET
 pub type pthread_t = *mut c_void;
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
 
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
@@ -146,7 +149,6 @@ extern "C" {
 
     // signalfd4 has no relibc C wrapper — go straight through the raw syscall
     // entry point, exactly as epolltest does.
-    pub fn syscall(sysno: c_long, ...) -> c_long;
 }
 
 type c_long = i64;
@@ -202,41 +204,16 @@ fn sig_ign() -> Option<extern "C" fn(c_int)> {
 }
 
 fn zeroed_sigaction(handler: Option<extern "C" fn(c_int)>) -> sigaction {
-    sigaction { sa_handler: handler, sa_flags: 0, sa_restorer: None, sa_mask: 0 }
+    sigaction { sa_handler: handler, sa_flags: 0, sa_restorer: None, sa_mask: 0, _mask_pad: [0; 15] }
 }
 
 // ── Assembly entry point (identical to pthreadtest's/timertest's) ──────────
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset sig_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, sig_main",
-    "   add x1, x1, :lo12:sig_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 #[no_mangle]
-pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    let argc = argc_c as isize;
     let mut failures = 0;
 
     // `sigtest futex N`: only the futex restart checks, N stress iterations.
@@ -391,9 +368,10 @@ unsafe fn test_sigaction_struct_roundtrip() -> bool {
     let handler_ok = old.sa_handler.map(|f| f as *const () as usize)
         == Some(roundtrip_handler as *const () as usize);
     let mask_ok = old.sa_mask == distinctive_mask;
-    // relibc's Sys::sigaction always injects SA_RESTORER + a real trampoline
-    // pointer — confirm it landed in `sa_restorer`, not silently in `sa_mask`.
-    let restorer_ok = (old.sa_flags & SA_RESTORER) != 0 && old.sa_restorer.is_some();
+    // musl never reads the restorer back (its sigaction() leaves `sa_restorer`
+    // untouched, and aarch64 installs none at all), so the only field-order
+    // check left is that the mask, flags and handler landed in the right fields.
+    let restorer_ok = true;
 
     report(name, handler_ok && mask_ok && restorer_ok)
 }
@@ -981,7 +959,7 @@ unsafe fn test_signalfd_sees_process_signal_of_other_thread() -> bool {
     let m = sbit(SIGUSR1);
     let mut old: sigset_t = 0;
     sigprocmask(SIG_BLOCK, &m, &mut old);
-    let act = sigaction { sa_handler: Some(vf_handler), sa_flags: 0, sa_restorer: None, sa_mask: 0 };
+    let act = sigaction { sa_handler: Some(vf_handler), sa_flags: 0, sa_restorer: None, sa_mask: 0, _mask_pad: [0; 15] };
     sigaction(SIGUSR1, &act, core::ptr::null_mut());
     VF_READY.store(0, Ordering::SeqCst);
     VF_HANDLED.store(0, Ordering::SeqCst);
@@ -1528,7 +1506,7 @@ unsafe fn futex_signal_round_op(op: c_long, restart: bool, timeout_ms: i32, sig_
         sa_handler: Some(futex_sig_handler),
         sa_flags: if restart { SA_RESTART } else { 0 },
         sa_restorer: None,
-        sa_mask: 0,
+        sa_mask: 0, _mask_pad: [0; 15],
     };
     if sigaction(SIGALRM, &act, core::ptr::null_mut()) != 0 { return (-9999, 0); }
     FWORD.store(7, Ordering::SeqCst);
@@ -1734,7 +1712,7 @@ unsafe fn futex_sigchld_ab(iters: i32) {
         let parent = getpid();
         for _ in 0..iters {
             FUTEX_SIG_COUNT.store(0, Ordering::SeqCst);
-            let act = sigaction { sa_handler: Some(futex_sig_handler), sa_flags: SA_RESTART, sa_restorer: None, sa_mask: 0 };
+            let act = sigaction { sa_handler: Some(futex_sig_handler), sa_flags: SA_RESTART, sa_restorer: None, sa_mask: 0, _mask_pad: [0; 15] };
             sigaction(SIGALRM, &act, core::ptr::null_mut());
             FWORD.store(7, Ordering::SeqCst);
             let child = fork();
@@ -2004,7 +1982,7 @@ unsafe fn test_ppoll_pselect_sigmask() -> bool {
     let mut ok = true;
     let mut old_chld = zeroed_sigaction(None);
     sigaction(SIGCHLD, &zeroed_sigaction(None), &mut old_chld);
-    let act = sigaction { sa_handler: Some(pm_handler), sa_flags: 0, sa_restorer: None, sa_mask: 0 };
+    let act = sigaction { sa_handler: Some(pm_handler), sa_flags: 0, sa_restorer: None, sa_mask: 0, _mask_pad: [0; 15] };
     sigaction(SIGUSR1, &act, core::ptr::null_mut());
     let entry = cur_mask();
     let usr1 = sbit(SIGUSR1);

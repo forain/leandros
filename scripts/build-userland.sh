@@ -33,31 +33,31 @@ if [[ "$MODE" == "release" ]]; then
     CARGO_ARGS+=(--release)
 fi
 
-# Programs that link against real relibc directly (TLS, real sigaction/
-# pthread/timer syscalls) rather than the minimal leandros-libc, and so need
-# the custom leandros target JSON + build-std instead of the bare
-# *-unknown-none target the rest of userland uses.
-RELIBC_LINKED=(pthreadtest timertest sigtest polltest fdmaxtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest sigtest2 jobtest exectest epolltest wakepolltest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest)
+# Programs that need a real libc (TLS, sigaction/pthread/timer, stdio-less C
+# ABI): no_std crates linked against static musl (<arch>-unknown-linux-musl)
+# through the zig linker wrapper, the same path as spawnwedge/killmt. Their
+# start-up is musl's crt1 -> `main`; userland/muslrt holds the shared pieces.
+MUSL_LINKED=(polltest fdmaxtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest jobtest exectest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest pthreadtest timertest sigtest sigtest2 epolltest wakepolltest)
 
 EXCLUDE_ARGS=()
-for prog in "${RELIBC_LINKED[@]}"; do
+for prog in "${MUSL_LINKED[@]}"; do
     EXCLUDE_ARGS+=(--exclude "$prog")
 done
 
 if [[ "$TARGET" == "aarch64-unknown-none" ]]; then
-    LEANDROS_TARGET="targets/aarch64-unknown-leandros.json"
-    LEANDROS_TARGET_NAME="aarch64-unknown-leandros"
+    MUSL_ARCH="aarch64"
 else
-    LEANDROS_TARGET="targets/x86_64-unknown-leandros.json"
-    LEANDROS_TARGET_NAME="x86_64-unknown-leandros"
+    MUSL_ARCH="x86_64"
 fi
+MUSL_TARGET="${MUSL_ARCH}-unknown-linux-musl"
+MUSL_RUSTFLAGS="-C linker=$PWD/scripts/linker-${MUSL_ARCH}-musl.sh -C link-self-contained=no -C relocation-model=static"
 
 if $CHECK; then
     echo "[userland] cargo check …"
     cargo check "${CARGO_ARGS[@]}" "${EXCLUDE_ARGS[@]}"
 
-    for prog in "${RELIBC_LINKED[@]}"; do
-        cargo check --manifest-path userland/Cargo.toml -p "$prog" --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec
+    for prog in "${MUSL_LINKED[@]}"; do
+        RUSTFLAGS="$MUSL_RUSTFLAGS" cargo check --manifest-path userland/Cargo.toml -p "$prog" --target "$MUSL_TARGET"
     done
 
     echo "[userland] OK — type-check passed"
@@ -71,11 +71,11 @@ cargo build "${CARGO_ARGS[@]}" "${EXCLUDE_ARGS[@]}"
 OUT="userland/target/${TARGET}/${MODE}"
 mkdir -p "$OUT"
 
-for prog in "${RELIBC_LINKED[@]}"; do
-    echo "[userland] Building $prog..."
-    RUSTFLAGS="-C link-arg=--entry=_start -C link-arg=-static -C linker=rust-lld -C relocation-model=static" \
-    cargo build --manifest-path userland/Cargo.toml -p "$prog" --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec --release
-    cp "userland/target/${LEANDROS_TARGET_NAME}/release/$prog" "${OUT}/$prog"
+for prog in "${MUSL_LINKED[@]}"; do
+    echo "[userland] Building $prog (musl)..."
+    RUSTFLAGS="$MUSL_RUSTFLAGS" \
+    cargo build --manifest-path userland/Cargo.toml -p "$prog" --target "$MUSL_TARGET" --release
+    cp "userland/target/${MUSL_TARGET}/release/$prog" "${OUT}/$prog"
 done
 
 # C programs (DOOM, floattest) link libleandros_libc.a and are compiled by clang
@@ -88,7 +88,7 @@ done
 if [[ "$TARGET" == "x86_64-unknown-none" ]]; then
     echo "[userland] Building hard-float libleandros_libc.a for C programs..."
     RUSTFLAGS="-C link-arg=--entry=_start -C link-arg=-static -C linker=rust-lld -C relocation-model=static" \
-    cargo build --manifest-path userland/Cargo.toml -p leandros-libc --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec --release
+    cargo build --manifest-path userland/Cargo.toml -p leandros-libc --target targets/x86_64-unknown-leandros.json -Z build-std=core,alloc -Zjson-target-spec --release
 fi
 
 # privtest is plain C, shared verbatim with a host Linux run (cc privtest.c)
@@ -101,7 +101,7 @@ if command -v zig >/dev/null 2>&1; then
     esac
     echo "[userland] Building privtest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/privtest" userland/privtest/privtest.c
-    # memcpybench-musl: memcpybench built against zig's static musl (its compiler_rt mem*), to compare with the libc/relibc/musl-dynamic mem* (lane relibcmem).
+    # memcpybench-musl: memcpybench built against zig's static musl (its compiler_rt mem*), to compare with the libc/musl-dynamic mem* (lane relibcmem).
     zig cc -target "$ZT" -static -O2 -fno-builtin -s -o "${OUT}/memcpybench-musl" userland/memcpybench-c/memcpybench.c "$(scripts/musl-mem-obj.sh "${ZT%%-*}")"
     # nettest: same idea (ICMP/UDP/TCP basics, checked against a host kernel).
     echo "[userland] Building nettest (zig cc -target $ZT)..."

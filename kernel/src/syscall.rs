@@ -11852,7 +11852,7 @@ fn sys_timer_create(clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) -> 
     // struct sigevent: sigev_value(8) + sigev_signo(4) + sigev_notify(4) +
     // sigev_notify_thread_id(4) + ... . We read the first 20 bytes: value,
     // signo, notify, and (for SIGEV_THREAD_ID) the target tid.
-    if timerid_ptr != 0 && !validate_user_buf(timerid_ptr, core::mem::size_of::<usize>()) { return -14; }
+    if timerid_ptr != 0 && !validate_user_buf(timerid_ptr, core::mem::size_of::<u32>()) { return -14; }
     // sigev_notify at offset 12: SIGEV_SIGNAL = 0, SIGEV_NONE = 1 (armed,
     // readable via timer_gettime, never signals — encoded as signo 0),
     // SIGEV_THREAD = 2, SIGEV_THREAD_ID = 4 (delivered to the named thread —

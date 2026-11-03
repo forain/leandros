@@ -2,6 +2,7 @@
 name = "polltest"
 version.workspace = true
 edition.workspace = true
+build = "../muslrt/build.rs"
 
 [[bin]]
 name = "polltest"

@@ -9,27 +9,30 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
+#[allow(unused_imports)]
+use rt::syscall;
 
 use core::ffi::c_void;
 
 mod churn;
 
 pub type pthread_t = *mut c_void;
-pub type pthread_key_t = u64;
+pub type pthread_key_t = u32; // musl: unsigned int
 
-#[repr(C)]
-pub union pthread_mutex_t {
-    __relibc_internal_size: [u8; 12],
-    __relibc_internal_align: i32,
-}
+/// musl 64-bit pthread_mutex_t is 40 bytes; over-sized and 8-aligned here.
+#[repr(C, align(8))]
+pub struct pthread_mutex_t([u64; 8]);
 
-#[repr(C)]
-pub union pthread_cond_t {
-    __relibc_internal_size: [u8; 8],
-    __relibc_internal_align: i32,
-}
+/// musl 64-bit pthread_cond_t is 48 bytes; over-sized and 8-aligned here.
+#[repr(C, align(8))]
+pub struct pthread_cond_t([u64; 8]);
 
+/// musl `struct __ptcb { void (*__f)(void *); void *__x; struct __ptcb *__next; }`.
 #[repr(C)]
 pub struct CleanupLinkedListEntry {
     routine: extern "C" fn(*mut c_void),
@@ -38,16 +41,11 @@ pub struct CleanupLinkedListEntry {
 }
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
 
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     pub fn exit(status: i32) -> !;
     pub fn usleep(usec: u32) -> i32;
-    pub fn syscall(sysno: i64, ...) -> i64;
     pub fn open(path: *const u8, flags: i32, ...) -> i32;
     pub fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
     pub fn close(fd: i32) -> i32;
@@ -82,8 +80,12 @@ extern "C" {
     pub fn pthread_setspecific(key: pthread_key_t, value: *const c_void) -> i32;
     pub fn pthread_getspecific(key: pthread_key_t) -> *mut c_void;
 
-    pub fn __relibc_internal_pthread_cleanup_push(new_entry: *mut c_void);
-    pub fn __relibc_internal_pthread_cleanup_pop(execute: i32);
+    pub fn _pthread_cleanup_push(
+        cb: *mut CleanupLinkedListEntry,
+        f: extern "C" fn(*mut c_void),
+        x: *mut c_void,
+    );
+    pub fn _pthread_cleanup_pop(cb: *mut CleanupLinkedListEntry, execute: i32);
     pub fn pthread_exit(retval: *mut c_void) -> !;
 }
 
@@ -94,48 +96,23 @@ macro_rules! pthread_cleanup_push {
             arg: $arg,
             prev: core::ptr::null(),
         };
-        __relibc_internal_pthread_cleanup_push(core::ptr::from_mut(&mut $entry).cast());
+        _pthread_cleanup_push(core::ptr::from_mut(&mut $entry), $routine, $arg);
     };
 }
 
 macro_rules! pthread_cleanup_pop {
-    ($execute:expr) => {
-        __relibc_internal_pthread_cleanup_pop($execute);
+    ($entry:ident, $execute:expr) => {
+        _pthread_cleanup_pop(core::ptr::from_mut(&mut $entry), $execute);
     };
 }
 
 // ── Assembly Entry point ─────────────────────────────────────────────────────
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset pthread_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, pthread_main",
-    "   add x1, x1, :lo12:pthread_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 #[no_mangle]
-pub unsafe extern "C" fn pthread_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    let argc = argc_c as isize;
     // Mode `pthreadtest exitkill`: regression coverage for "plain libc exit()
     // must kill sibling threads". A sibling parks in a long sleep; the main
     // thread calls libc exit(3). Correct (exit_group) semantics tear the whole
@@ -454,7 +431,7 @@ unsafe fn test_getrandom_quality() -> bool {
 // ── 2. Mutex Contention ─────────────────────────────────────────────────────
 
 static mut MUTEX_SHARED_COUNTER: i32 = 0;
-static mut MUTEX_LOCK: pthread_mutex_t = pthread_mutex_t { __relibc_internal_align: 0 };
+static mut MUTEX_LOCK: pthread_mutex_t = pthread_mutex_t([0; 8]);
 
 extern "C" fn mutex_worker(_arg: *mut c_void) -> *mut c_void {
     unsafe {
@@ -496,8 +473,8 @@ unsafe fn test_pthread_mutex() -> bool {
 
 // ── 3. Condvar Wait/Signal ──────────────────────────────────────────────────
 
-static mut COND_MUTEX: pthread_mutex_t = pthread_mutex_t { __relibc_internal_align: 0 };
-static mut COND_VAR: pthread_cond_t = pthread_cond_t { __relibc_internal_align: 0 };
+static mut COND_MUTEX: pthread_mutex_t = pthread_mutex_t([0; 8]);
+static mut COND_VAR: pthread_cond_t = pthread_cond_t([0; 8]);
 static mut COND_READY: i32 = 0;
 
 extern "C" fn cond_worker(_arg: *mut c_void) -> *mut c_void {
@@ -588,7 +565,7 @@ extern "C" fn cleanup_routine(arg: *mut c_void) {
 extern "C" fn cleanup_worker(_arg: *mut c_void) -> *mut c_void {
     unsafe {
         pthread_cleanup_push!(entry, cleanup_routine, 10 as *mut c_void);
-        pthread_cleanup_pop!(1);
+        pthread_cleanup_pop!(entry, 1);
 
         pthread_cleanup_push!(entry2, cleanup_routine, 100 as *mut c_void);
         pthread_exit(core::ptr::null_mut());

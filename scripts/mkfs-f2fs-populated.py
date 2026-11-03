@@ -581,11 +581,6 @@ def main():
 
 
     lib_files = []
-    relibc_target = "aarch64-unknown-leandros" if arch == "aarch64" else "x86_64-unknown-leandros"
-    p = f"{os.environ.get('LEANDROS_RELIBC_DIR', '../relibc')}/target/{relibc_target}/release/librelibc.a"
-    if os.path.exists(p):
-        lib_files.append(("libc.a", p, 0o100644))
-        
     root_files = []
     p = "userland/aplay/car-horn.wav"
     if os.path.exists(p):

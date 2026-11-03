@@ -36,7 +36,6 @@ On the laptop with the screen lit, YouTube plays with RUN_QUEUE at about 90 k ac
 **Open, scheduler, epoll and wakes:**
 - **Per-CPU run queues: `lane/percpu` is in progress.** Phases 0-2 are running; 3a, 3b and 4 come later. deskbusy2 measured the pick/dispatch/charge path as the largest remaining RUN_QUEUE spin, about 0.43 CPU.
 - **The epoll ready list has no laptop A/B.** The plan is a laptop boot with and without `epoll.ready=0`, during YouTube, comparing cosmic-comp's epoll cost against deskbusy2's 613 µs/call baseline. Since lane procfix the number can be taken: diff two reads of the `e` line of cosmic-comp in `/proc/sysstat` (debugging.md, "epoll cost per call"); a thread parked in epoll_wait shows in its `w` line.
-- **relibc's `poll()` misses the ready-list cache on every call.** It creates a fresh epoll instance per call, so it misses every time (11 % of desktop calls). A per-thread cache keyed by the fd set would fix it.
 - **Wake producers that still broadcast or skip refinement:**
   - The net daemon's 100 ms broadcast safety net is off by default since lane/wakeherd (`net.bcastnet=1` restores it); laptop idle + YouTube `/proc/wakestat` follow-up still to do.
   - Inet listeners report no tag, so sshd parks with a broadcast mask.
@@ -882,7 +881,7 @@ master scoped to the VT and the evdev VT gate all landed; what is left:
   `m4-input-ship` blob cache, `build-all.sh` skips the shim build, `mkfs` omits them and the build
   still succeeds; a COSMIC session then fails at runtime. Same shape as every
   `os.path.exists()`-guarded blob in `mkfs-f2fs-populated.py`.
-- **Doom does not link relibc.** `../doomgeneric/Makefile.leandros` links
+- **Doom links `leandros-libc`.** `../doomgeneric/Makefile.leandros` links
   `libleandros_libc.a`, whose allocator (`userland/libc/src/mem.rs`) is a ~20-line bump allocator
   over `brk(2)` with no free list and no `mmap` path. Start there when debugging a Doom allocation.
 - **Crate layering:** `drivers` has no Cargo edge to the arch crates. Use a `#[no_mangle] extern
@@ -923,8 +922,7 @@ master scoped to the VT and the evdev VT gate all landed; what is left:
   prints `⚠️ brush source not found … skipping`; the failure appears at runtime as
   `login: exec failed` / `session ended, restarting login`, i.e. `/bin/login` execve()ing a
   shell that is not in the image. `brush`, `coreutils` and `bottom-leandros` symlinks were
-  added under `.claude/worktrees/` alongside the pre-existing `doomgeneric`, `mame` and
-  `relibc`, and are left there deliberately.
+  added under `.claude/worktrees/` alongside the pre-existing `doomgeneric`, `mame` and are left there deliberately.
 - **`/bin/wl-globals` is staged when the host binary exists** —
   `~/code/leandros-artifacts/m9-wlglobals/out/wl-globals-<arch>` — a HOST path, not the
   in-repo copy: `out/` holds built binaries and is gitignored. Same conditional pattern

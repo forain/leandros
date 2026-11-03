@@ -2,6 +2,7 @@
 name = "evtest2"
 version.workspace = true
 edition.workspace = true
+build = "../muslrt/build.rs"
 
 [[bin]]
 name = "evtest2"

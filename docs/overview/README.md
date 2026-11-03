@@ -31,7 +31,7 @@ The dated record of how it got here is in [History](history.md); the live list o
 │  │ desktop  │  │  shell   │  │  DOOM …  │  │ tests …  │      │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘      │
 │  ┌────┴─────────────┴─────────────┴─────────────┴─────┐      │
-│  │ Mesa (Zink/Venus, virgl) · libinput · relibc/musl  │      │
+│  │ Mesa (Zink/Venus, virgl) · libinput · musl  │      │
 │  └────────────────────────┬───────────────────────────┘      │
 ├───────────────────────────┼──────────────────────────────────┤
 │                     Linux syscall ABI                        │

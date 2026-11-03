@@ -14,7 +14,6 @@ Beyond the pin:
 
 - **`llvm-tools`** for the pinned toolchain (`rustup component add llvm-tools --toolchain nightly-2026-04-16`). Without `llvm-objcopy`/`rust-objcopy` the build skips — and deletes any stale copy of — the direct-boot flat binary and 32-bit ELF that Raspberry Pi deployment and `--direct` x86-64 boots use.
 - **A bare, undated `nightly`** with both musl targets and `rust-src`. Some port builds (for example `ports/busd/build.sh`) call `cargo +nightly`; a missing target there fails quietly in `build-all.sh` and is only caught later, when the image builder refuses stale D-Bus staging.
-- **relibc's own pin** (`nightly-2025-11-15`, from `../relibc/rust-toolchain.toml`), which rustup installs when relibc is built.
 
 The sibling repositories (brush, coreutils, …) are built from their own directories, which `rust-toolchain.toml` does not reach; `build-all.sh` passes the pinned toolchain to them explicitly so every crate compiles with one compiler version.
 
@@ -61,13 +60,13 @@ sudo apt install lld    # ld.lld is used for both targets
 
 ## zig and the musl cross toolchain
 
-Third-party userspace (Mesa, COSMIC, brush, coreutils, relibc's C parts) is built for `{x86_64,aarch64}-unknown-linux-musl` and dynamically linked against a real `ld-musl`. The wrappers in `scripts/` drive that cross-build through **zig** (0.16.0 is the version in use):
+Third-party userspace (Mesa, COSMIC, brush, coreutils) is built for `{x86_64,aarch64}-unknown-linux-musl` and dynamically linked against a real `ld-musl`. The wrappers in `scripts/` drive that cross-build through **zig** (0.16.0 is the version in use):
 
 - `scripts/cc-<arch>-musl.sh` — `zig cc -target <arch>-linux-musl`, stripping the `--target=` spelling that `cc-rs` appends and zig rejects.
 - `scripts/linker-<arch>-musl.sh` — the Rust linker wrapper for the musl targets.
 - `scripts/ar-musl.sh` — needed because `cc-rs` otherwise uses the host macOS `ar`, whose Mach-O archives `ld.lld` cannot read: the objects compile and every symbol in them comes back undefined at link time.
 
-relibc's C sources are pointed at the same wrappers, because the host compiler only works by accident on an AArch64 host (relibc passes the AArch64-only `-mno-outline-atomics`). Without zig, the input-stack shims and the C conformance tests are skipped with a warning.
+Without zig, the input-stack shims and the C conformance tests are skipped with a warning.
 
 ## Container tooling
 
@@ -85,7 +84,6 @@ Some large dependencies live outside this tree, as siblings of the repository ro
 
 | Path | Purpose |
 |---|---|
-| `../relibc` | The C standard library shipped as the userspace libc |
 | `../doomgeneric` | DOOM port |
 | `../cosmic-epoch` | COSMIC desktop sources (built unmodified) |
 | `../brush` | The `brush` shell, at the pinned revision plus `ports/brush/patches` (`ports/brush/sync.sh apply ../brush`) |

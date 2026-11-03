@@ -10,7 +10,13 @@
 
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 #![allow(non_camel_case_types)]
+
+#[path = "../../muslrt/rt.rs"]
+mod rt;
+#[allow(unused_imports)]
+use rt::syscall;
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicI32, Ordering};
@@ -75,9 +81,10 @@ pub type sigset_t = u64;
 #[repr(C)]
 pub struct sigaction {
     pub sa_handler: Option<extern "C" fn(c_int)>,
+    pub sa_mask: sigset_t,
+    pub _mask_pad: [u64; 15], // musl sigset_t is 1024 bits
     pub sa_flags: c_int,
     pub sa_restorer: Option<unsafe extern "C" fn()>,
-    pub sa_mask: sigset_t,
 }
 
 const SIGEV_SIGNAL: c_int = 0;
@@ -142,10 +149,6 @@ pub struct pollfd {
 }
 
 extern "C" {
-    pub fn relibc_start_v1(
-        sp: *const c_void,
-        main: unsafe extern "C" fn(argc: isize, argv: *mut *mut u8, envp: *mut *mut u8) -> i32,
-    ) -> !;
 
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
@@ -154,7 +157,6 @@ extern "C" {
     pub fn close(fd: c_int) -> c_int;
     pub fn exit(status: i32) -> !;
     pub fn __errno_location() -> *mut c_int;
-    pub fn syscall(sysno: c_long, ...) -> c_long;
 
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
     pub fn poll(fds: *mut pollfd, nfds: u64, timeout: c_int) -> c_int;
@@ -202,36 +204,10 @@ pub type pthread_t = *mut c_void;
 
 // ── Assembly entry point (identical to pthreadtest's) ───────────────────────
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   xor rbp, rbp",
-    "   mov rdi, rsp",
-    "   mov rsi, offset timer_main",
-    "   and rsp, -16",
-    "   call relibc_start_v1",
-    "   ud2"
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start",
-    ".global _start",
-    "_start:",
-    "   mov x29, #0",
-    "   mov x30, #0",
-    "   mov x0, sp",
-    "   adrp x1, timer_main",
-    "   add x1, x1, :lo12:timer_main",
-    "   and sp, x0, #-16",
-    "   bl relibc_start_v1",
-    "   brk #0"
-);
 
 #[no_mangle]
-pub unsafe extern "C" fn timer_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0;
 
     if !test_timer_create_delete_slot_zero() { failures += 1; }
@@ -293,7 +269,7 @@ unsafe fn install_sigalrm_handler() -> bool {
         sa_handler: Some(sigalrm_handler),
         sa_flags: 0,
         sa_restorer: None,
-        sa_mask: 0,
+        sa_mask: 0, _mask_pad: [0; 15],
     };
     sigaction(SIGALRM, &act, core::ptr::null_mut()) == 0
 }
@@ -1284,7 +1260,7 @@ unsafe fn cancel_waiter(tfd: c_int, use_poll: bool) -> c_int {
     let pid = fork();
     if pid == 0 {
         // SIG_DFL, so a hang is killed by the alarm (→ FAIL), not EINTR'd.
-        let dfl = sigaction { sa_handler: None, sa_flags: 0, sa_restorer: None, sa_mask: 0 };
+        let dfl = sigaction { sa_handler: None, sa_flags: 0, sa_restorer: None, sa_mask: 0, _mask_pad: [0; 15] };
         sigaction(SIGALRM, &dfl, core::ptr::null_mut());
         alarm(3);
         if use_poll && !tfd_readable(tfd, 3000) { _exit(2); }
@@ -1472,7 +1448,7 @@ extern "C" fn sigrt_handler(_sig: c_int) { SIGRT_COUNT.fetch_add(1, Ordering::Se
 fn bit(sig: c_int) -> sigset_t { 1u64 << (sig - 1) }
 
 unsafe fn set_handler(sig: c_int, h: extern "C" fn(c_int), flags: c_int) -> bool {
-    let act = sigaction { sa_handler: Some(h), sa_flags: flags, sa_restorer: None, sa_mask: 0 };
+    let act = sigaction { sa_handler: Some(h), sa_flags: flags, sa_restorer: None, sa_mask: 0, _mask_pad: [0; 15] };
     sigaction(sig, &act, core::ptr::null_mut()) == 0
 }
 

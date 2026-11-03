@@ -44,7 +44,6 @@ Scarce machines are arbitrated by `lock.sh <kind> <command…>` in the orchestra
 - *Lanes test AArch64 only; both architectures run once per merge batch on `main`.* An x86-64 or hardware claim is made on the machine that can make it ([the accelerator is not the arch](methodology.md#the-accelerator-is-not-the-architecture)).
 - *A lane worktree is about 4 GiB* (images are dense; it was 9 to 18 GiB before the image slimming), and a full disk failed lanes twice on 2026-10-19/20. Remove the worktree after merging, and copy images with `cp -c` (clone) on macOS. The ports' target cache (`~/Library/Caches/leandros-ports`) grew to 236 GB once; check it first when the disk fills.
 - *Never `git stash`* (the stash is shared by every worktree) and never switch the branch of the main checkout: commit work in progress on the lane branch and merge `main` into it.
-- *The relibc sibling is shared*: commit relibc edits at once and small, on its `master`.
 - *Pushes are deliberate.* Before any push, scan the commit messages of the new range for tool-attribution trailers; one once reached the remote and had to be force-fixed.
 - Every tool call in a lane carries the lane name as a prefix in its description, so a log of many concurrent lanes can be read.
 
