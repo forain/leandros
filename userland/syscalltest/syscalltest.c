@@ -1486,6 +1486,52 @@ static void fchmodat_flags(const char *dir) {
 static long rwv2(long nr, int fd, struct iovec *iov, int cnt, long long off, int flags) {
     return syscall(nr, fd, iov, cnt, (long)off, 0L, flags);
 }
+/* musl 1.2.6 pwrite() tries pwritev2(.., RWF_NOAPPEND) first. */
+#ifndef RWF_APPEND
+#define RWF_APPEND 0x10
+#endif
+#ifndef RWF_NOAPPEND
+#define RWF_NOAPPEND 0x20
+#endif
+static void pwritev2_append_cases(const char *dir) {
+    const char *name = "pwritev2_append";
+    char path[256], buf[16] = {0};
+    int fd = make_file(dir, "noapp", 0, path, sizeof path);
+    if (fd < 0) { skip(name, "no file"); return; }
+    close(fd);
+    struct iovec w[1] = { { "AB", 2 } };
+    int p[2] = { -1, -1 };
+    const char *why = NULL;
+    long n = 0;
+    fd = open(path, O_RDWR | O_APPEND);
+    if (fd < 0) { fail(name, "open O_APPEND: %s", strerror(errno)); unlink(path); return; }
+    if (write(fd, "0123456789", 10) != 10) why = "seed write";
+    else if ((n = rwv2(SYS_pwritev2, fd, w, 1, 0, RWF_NOAPPEND)) != 2) why = "NOAPPEND on O_APPEND fd did not write";
+    else if (pread(fd, buf, 4, 0) != 4 || memcmp(buf, "AB23", 4)) why = "NOAPPEND did not write at offset 0";
+    else if (lseek(fd, 0, SEEK_END) != 10) why = "NOAPPEND changed the file size";
+    else if ((n = rwv2(SYS_pwritev2, fd, w, 1, 0, 0)) != 2) why = "plain pwritev2 on O_APPEND fd";
+    else if (lseek(fd, 0, SEEK_END) != 12) why = "plain pwritev2 on O_APPEND fd did not append";
+    else if (rwv2(SYS_pwritev2, fd, w, 1, 0, 0x40000000) != -1 || errno != EOPNOTSUPP)
+        why = "unknown flag is not EOPNOTSUPP";
+    else if (rwv2(SYS_pwritev2, 9999, w, 1, 0, RWF_NOAPPEND) != -1 || errno != EBADF)
+        why = "NOAPPEND on a bad fd is not EBADF";
+    else if (pipe(p)) why = "pipe";
+    else if (rwv2(SYS_pwritev2, p[1], w, 1, 0, RWF_NOAPPEND) != -1 || errno != ESPIPE)
+        why = "NOAPPEND with an offset on a pipe is not ESPIPE";
+    if (!why) {
+        close(fd);
+        fd = open(path, O_RDWR);
+        if (fd < 0) why = "reopen";
+        else if ((n = rwv2(SYS_pwritev2, fd, w, 1, 0, RWF_APPEND)) != 2) why = "RWF_APPEND did not write";
+        else if (lseek(fd, 0, SEEK_END) != 14) why = "RWF_APPEND on a non-append fd did not append";
+        else if (pread(fd, buf, 2, 12) != 2 || memcmp(buf, "AB", 2)) why = "RWF_APPEND data not at EOF";
+    }
+    if (why) fail(name, "%s (n=%ld, %s)", why, n, strerror(errno));
+    else pass(name);
+    if (p[0] >= 0) { close(p[0]); close(p[1]); }
+    if (fd >= 0) close(fd);
+    unlink(path);
+}
 static void preadv2_cases(const char *dir) {
     const char *name = "preadv2";
     char path[256];
@@ -2588,6 +2634,7 @@ int main(int argc, char **argv) {
     poll_redirected_stdin(dirs[0]);
     fchmodat_flags(dirs[0]);
     preadv2_cases(dirs[0]);
+    pwritev2_append_cases(dirs[0]);
     statx_matches_stat(dirs[0]);
     exec_many_args(self);
     uaccess_cases();
