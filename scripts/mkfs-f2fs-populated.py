@@ -3241,8 +3241,9 @@ def main():
         _libs += [(n, h) for d, n, h in m4_share_files + m5_exec_files if d in ("/lib", "/usr/lib")]
         _sop = apkdb.so_provides(_libs)
         _provs += _sop
+        _held_explicit = set(alpinepkgs.lk.read_list(os.path.join(alpinepkgs.lk.ADIR, "held")))
         for _h in alpinepkgs.lk._held_provides(arch):
-            if _h.startswith("so:"):
+            if _h.startswith("so:") and _h.split("=")[0] in _held_explicit:
                 if not any(p.startswith(_h.split("=")[0] + "=") for p in _sop):
                     sys.exit(f"apk: held dependency {_h.split('=')[0]} is provided by no base library")
             else:
