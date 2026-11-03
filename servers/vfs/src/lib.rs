@@ -4771,7 +4771,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_READ         => handle_read(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_WRITE        => handle_write(caller_pid, arg(msg,0) as usize,
-                                          arg(msg,1) as usize, arg(msg,2) as usize),
+                                          arg(msg,1) as usize, arg(msg,2) as usize, arg(msg,3)),
         VFS_PREAD        => handle_pio(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize,
                                        arg(msg,2) as usize, arg(msg,3), false),
         VFS_PWRITE       => handle_pio(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize,
@@ -8814,7 +8814,9 @@ fn handle_pio(pid: u32, fd: usize, buf_ptr: usize, count: usize, off: u64, write
     val_reply(n as u64)
 }
 
-fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
+/// `ap` is the per-call append override of pwritev2 (arg 3): 1 = RWF_NOAPPEND,
+/// 2 = RWF_APPEND, 0 = follow the descriptor's O_APPEND.
+fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> Message {
     if count == 0 { return val_reply(0); }
     let mut tbls = TblSlot::new();
     let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
@@ -8930,7 +8932,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             if !*writable { return err_reply(-9); } // not open for writing
             let kind = tbl.fds[fd].kind;
             let idx = tmp_idx_of(&kind);
-            let append = tbl.fds[fd].flags & O_APPEND != 0;
+            let append = match ap { 1 => false, 2 => true, _ => tbl.fds[fd].flags & O_APPEND != 0 };
             drop(tbls);
             let ofd = match kind { VnodeKind::TmpFile { ofd, .. } => ofd, _ => 0 };
             // A writable /proc/<tid>/comm snapshot: the bytes are the new name.
@@ -9063,7 +9065,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 VnodeKind::DevStdio { .. } | VnodeKind::DevVt { .. });
             drop(tbls);
             if !target_ok { return err_reply(-9); }
-            handle_write(pid, 0, buf_ptr, count)
+            handle_write(pid, 0, buf_ptr, count, 0)
         }
         VnodeKind::DevFb { pos } => {
             let base = FB_BASE.load(atomic::Ordering::SeqCst);
@@ -9138,7 +9140,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             //
             // Message::empty() zeroes the payload, so any other sender of
             // VFS_WRITE to a mount port defaults to "not appending".
-            let append = tbl.fds[fd].flags & O_APPEND != 0;
+            let append = match ap { 1 => false, 2 => true, _ => tbl.fds[fd].flags & O_APPEND != 0 };
             drop(tbls);
             let mut proxy = Message::empty();
             proxy.tag = VFS_WRITE;

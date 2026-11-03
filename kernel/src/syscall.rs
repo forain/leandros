@@ -4409,12 +4409,16 @@ fn sys_pwrite64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize
     if !validate_user_buf(buf_ptr, count) { return -14; }
     // As for write(2): see sys_pread64.
     prefault_user_ro(buf_ptr, count);
-    pwrite_at(current_pid(), fd, buf_ptr, count, offset)
+    pwrite_at(current_pid(), fd, buf_ptr, count, offset, 0)
 }
 
 /// The positional write behind pwrite64(2), on an already validated (user or
 /// kernel) buffer — see `pread_at`.
-fn pwrite_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize {
+///
+/// `ap` is the per-call append override of pwritev2: 0 follows the descriptor's
+/// O_APPEND, 1 (RWF_NOAPPEND) writes at `offset` even on an O_APPEND descriptor,
+/// 2 (RWF_APPEND) writes at end-of-file whatever the descriptor says.
+fn pwrite_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize, ap: u64) -> isize {
     if (offset as isize) < 0 { return -22; }
     // A file on a mounted volume: positional (see sys_pread64). An O_APPEND
     // descriptor appends, as on Linux.
@@ -4423,7 +4427,7 @@ fn pwrite_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) -
         const O_APPEND: u32 = 0o2000;
         if flags & O_PATH != 0 { return -9; }
         return f2fs_server::pwrite_fd(port, file_id as u64, buf_ptr as *const u8, count, offset as u64,
-                                      flags & O_APPEND != 0, pid);
+                                      match ap { 1 => false, 2 => true, _ => flags & O_APPEND != 0 }, pid);
     }
     // A block-device node: positional in the VFS itself, so threads sharing
     // the descriptor cannot interleave their seeks (e2fsprogs reads bitmaps
@@ -4441,7 +4445,7 @@ fn pwrite_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) -
     let seek_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, offset as u64, 0]);
     let _ = vfs::handle(&seek_msg, pid);
     // Write.
-    let write_msg = make_vfs_msg(vfs::VFS_WRITE, &[fd as u64, buf_ptr as u64, count as u64]);
+    let write_msg = make_vfs_msg(vfs::VFS_WRITE, &[fd as u64, buf_ptr as u64, count as u64, ap]);
     let n = vfs_reply_val(&vfs::handle(&write_msg, pid));
     // Restore position.
     let back_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, cur as u64, 0]);
@@ -4454,13 +4458,17 @@ fn pwrite_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) -
 /// `RWF_*` flags (include/uapi/linux/fs.h) that preadv2/pwritev2 accept.
 /// HIPRI is a polling hint (a no-op here); DSYNC/SYNC make the write durable
 /// like O_DSYNC/O_SYNC; NOWAIT is the per-call "never block". The later flags
-/// (APPEND, NOAPPEND, ATOMIC, DONTCACHE) get EOPNOTSUPP, which is what a
+/// (ATOMIC, DONTCACHE) get EOPNOTSUPP, which is what a
 /// kernel that predates them answers and what callers probe for.
 const RWF_HIPRI: usize = 0x1;
 const RWF_DSYNC: usize = 0x2;
 const RWF_SYNC: usize = 0x4;
 const RWF_NOWAIT: usize = 0x8;
-const RWF_SUPPORTED: usize = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT;
+/// APPEND writes at end-of-file for this call; NOAPPEND writes at the given
+/// offset even on an O_APPEND descriptor (musl 1.2.6 pwrite() sends it first).
+const RWF_APPEND: usize = 0x10;
+const RWF_NOAPPEND: usize = 0x20;
+const RWF_SUPPORTED: usize = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT | RWF_APPEND | RWF_NOAPPEND;
 
 /// One `struct iovec` of an already validated vector.
 fn iov_at(iov_ptr: usize, i: usize) -> (usize, usize) {
@@ -4527,6 +4535,7 @@ fn rw_vectored(fd: usize, iov_ptr: usize, iovcnt: usize, pos: usize, flags: usiz
     if pos < -1 || (pos == -1 && !v2) { return -22; } // EINVAL
     let pid = current_pid();
     let nowait = flags & RWF_NOWAIT != 0;
+    let ap: u64 = if flags & RWF_NOAPPEND != 0 { 1 } else if flags & RWF_APPEND != 0 { 2 } else { 0 };
     if nowait && !is_sock_handle(fd) {
         match vfs::fd_rwf_nowait_capable(pid, fd) {
             None => return -9,          // EBADF
@@ -4555,7 +4564,7 @@ fn rw_vectored(fd: usize, iov_ptr: usize, iovcnt: usize, pos: usize, flags: usiz
                 // block on locks or data that is not there yet, not one of
                 // zero I/O.
                 let at = (pos as usize).saturating_add(total as usize);
-                if write { pwrite_at(pid, fd, base, len, at) } else { pread_at(pid, fd, base, len, at) }
+                if write { pwrite_at(pid, fd, base, len, at, ap) } else { pread_at(pid, fd, base, len, at) }
             };
             if n < 0 { return if total > 0 { total } else { n }; }
             total = total.saturating_add(n);
@@ -15931,7 +15940,7 @@ fn sys_splice(fd_in: usize, off_in: usize, fd_out: usize, off_out: usize, len: u
                     Err(e) => break e as isize,
                 };
                 let w = match oout {
-                    Some(off) => pwrite_at(pid, fd_out, kbuf.as_ptr() as usize, n, off as usize),
+                    Some(off) => pwrite_at(pid, fd_out, kbuf.as_ptr() as usize, n, off as usize, 0),
                     None => splice_write_out(pid, fd_out, &kbuf[..n]),
                 };
                 if w < 0 { break if w == -11 { SPLICE_OTHER_EAGAIN } else { w }; }
