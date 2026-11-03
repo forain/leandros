@@ -19,15 +19,16 @@ esac
 
 for ARCH in $ARCHS; do
   T="$OUT/$ARCH.new"
-  rm -rf "$T"; mkdir -p "$T/usr/sbin" "$T/etc/apk" "$T/lib/apk/db"
+  rm -rf "$T"; mkdir -p "$T/usr/sbin" "$T/usr/bin" "$T/etc/apk" "$T/lib/apk/db"
   cp "$HERE/alpine-sysroot.sh" "$T/usr/sbin/alpine-sysroot"
   cp "$HERE/claude-code-install.sh" "$T/usr/sbin/claude-code-install"
   cp "$HERE/apk-wrapper.sh" "$T/usr/sbin/apk"
+  cp "$HERE/bwrap.sh" "$T/usr/bin/bwrap"
   for _a in adduser addgroup deluser delgroup; do
     printf '#!/bin/sh\nexec /bin/busybox.static %s "$@"\n' "$_a" > "$T/usr/sbin/$_a"
     chmod 0755 "$T/usr/sbin/$_a"
   done
-  chmod 0755 "$T/usr/sbin/apk" "$T/usr/sbin/alpine-sysroot" "$T/usr/sbin/claude-code-install"
+  chmod 0755 "$T/usr/bin/bwrap" "$T/usr/sbin/apk" "$T/usr/sbin/alpine-sysroot" "$T/usr/sbin/claude-code-install"
   printf '%s\n' "$ARCH" > "$T/etc/apk/arch"
   : > "$T/lib/apk/db/lock"
   chmod 0644 "$T/etc/apk/arch" "$T/lib/apk/db/lock"

@@ -8,7 +8,6 @@ pkg at-spi2-core 2.60.5-r0 main Q1J7di2EoKFuQu5fLEUvDDTw21hR8= c9989ba9b2ff44f87
 pkg at-spi2-core-libs 2.60.5-r0 main Q1gMhUKYmeJ7LyeX0UuK/g+oGUyy0= bcd4846311c8b19ad7e08ffc3cf726ddbe3d36bbc524386bda64758f5c5981a6 -
 pkg avahi-libs 0.9_rc4-r0 main Q1MxdZZH9w8iSaM9INDfEBnaDtjn8= 380d59c58cfce9cb5cf342cf73947749ca77a880f729970e2f508aaa6fc2f713 -
 pkg brotli-libs 1.2.1-r0 main Q19ILQ4/bsNv1JEDWEcsa0i+Y4hYQ= 62a7e37e43bbfc1f8525a00ad2125fd5897135dc93b849733884cb78ffd8e26c -
-pkg bubblewrap 0.12.0-r0 main Q1FMzri/p0D+kt6pUekO1LBSFqrvw= 7755592c3f7c6de79a5c3c13554ada6302dbd98e520fe6dd8064f87ba77092e5 -
 pkg busybox-static 1.37.0-r31 main Q1rG2Ti02YkmD/IpILCMmN4jW0ftI= b0d6cfc585d7fdd12df359cc5d38d5e45894e9e9e78c4059eb41577d022ec734 -
 pkg c-ares 1.34.9-r0 main Q17RXrqEwqOyT57+GUGh3XDItYJdI= 3539a3e11c1ef1516117d8179a546ac882086e94e0d78ad51d687b3fa2b3b5f2 -
 pkg ca-certificates-bundle 20261020-r0 main Q1fG5jX4aq+0bLOwFdhQWzpfYRVr0= bb008f6d214b6af7576324659856fb63dc8dcb4373f8345ff706388696f1254d -
@@ -53,7 +52,6 @@ pkg libatk-bridge-2.0 2.60.5-r0 main Q1LjZOB7l0KrzCE/swyWviKOXsIOE= f5e38bc54bae
 pkg libblkid 2.42.3-r1 main Q1B0eyM6avTem7+AUq2YfRl/hqcrQ= 2512c2bff496ac2b8561a3c814d21d35ce10cda579b3d410f9f96da93a5aaac1 -
 pkg libbsd 0.12.2-r0 main Q1gkX/ff7mAMnaZ+N1ehVr2FJ2QlE= 407597c04b41dbfe8a05b35d45a3453e32fae7df84aed3a06ff48dd4df1338b6 -
 pkg libbz2 1.0.8-r6 main Q1CFZrpcevl8JUdL6LJOi0jwEWtn0= 2737e2b23ed08d4911ee62cd0163b5f4bf0379cacf4dc35b23a00209584c98fd -
-pkg libcap2 2.78-r0 main Q1Vi3y8KkXpS2XsFrXvtM0FK2izUs= 42886a7b4bcde26347c712925c8dc7db202b6029ef9b8c7ee81577ab7bdd8fad -
 pkg libcrypto3 3.5.9-r0 main Q1HA3ulzTPIvyXzdGBkTu9cQ5t+wg= 6632d758d8f5e9ea3b650fe966f23bbf9a202f8b8dceecac93da135dec5e3689 -
 pkg libcurl 8.23.0-r0 main Q1etqr/7fR+stc096aUitDvGM3O9Q= 1f70ca404818805a6465b615bbfe84ef861488a963d7e630108ebd7fbaa51665 -
 pkg libdav1d 1.5.3-r0 main Q19QMIkG43lvBAaJ48gBGbWDlGvKY= 40a2b1b92cdcc6fd295934f799ee80ef67e2e384097624d565c6222d827f8480 -
@@ -161,6 +159,7 @@ held /bin/sh libglycin
 held /bin/sh librsvg
 held /bin/sh mkfontscale
 held /bin/sh shared-mime-info
+held bubblewrap libglycin
 held so:libEGL.so.1 firefox
 held so:libGL.so.1 firefox
 held so:libdrm.so.2 ffmpeg-libavutil

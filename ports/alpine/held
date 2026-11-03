@@ -14,3 +14,4 @@ mesa-egl
 mesa-gl
 mesa-gles
 mesa-gbm
+bubblewrap
