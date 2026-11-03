@@ -156,7 +156,8 @@ def db_files(pkgs, stanzas):
 def base_provides():
     """Stand-in for leandros-base's provides (step 1: the held list only)."""
     out = ["/bin/sh=1", "cmd:sh=1"]
-    out += lk._held_provides(None)
+    for arch in lk.ARCHS:
+        out += [h for h in lk._held_provides(arch) if h not in out]
     # so: deps held because every provider is held (mesa-egl -> so:libEGL.so.1) are recorded in the lock
     for arch in lk.ARCHS:
         try:
