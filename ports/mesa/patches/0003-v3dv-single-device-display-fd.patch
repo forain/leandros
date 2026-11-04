@@ -1,0 +1,16 @@
+--- a/src/broadcom/vulkan/v3dv_device.c
++++ b/src/broadcom/vulkan/v3dv_device.c
+@@ -1572,6 +1572,13 @@
+       if ((devices[i]->available_nodes & 1 << DRM_NODE_RENDER)) {
+          try_device(devices[i]->nodes[DRM_NODE_PRIMARY], &primary_fd, "v3d");
+          try_device(devices[i]->nodes[DRM_NODE_RENDER], &render_fd, "v3d");
++         /* LeandrOS: one v3d device with primary+render nodes and no
++          * separate display device (Raspberry Pi 5 single-device design).
++          * Open the v3d primary node as the display fd so the Wayland WSI
++          * has a DRM fd to initialise and compare against.
++          */
++         if (display_fd == -1)
++            try_device(devices[i]->nodes[DRM_NODE_PRIMARY], &display_fd, "v3d");
+       } else if (display_fd == -1 &&
+                  (devices[i]->available_nodes & 1 << DRM_NODE_PRIMARY)) {
+          try_display_device(instance, devices[i]->nodes[DRM_NODE_PRIMARY], &display_fd);

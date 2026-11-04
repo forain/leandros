@@ -1356,6 +1356,7 @@ pub fn sg_pages_of_obj(obj: u32) -> Option<alloc::vec::Vec<usize>> {
 
 /// Return a dumb buffer's pages to the buddy allocator, contiguous or scattered.
 fn dumb_free_backing(b: &DumbBuf) {
+    v3d_dumb_va_release(b.obj);
     if !b.sg {
         bo_free_block(b.phys, b.order);
         return;
@@ -4632,6 +4633,41 @@ fn v3d_va_alloc(bytes: u64) -> Option<u64> {
     if cursor.checked_add(need)? > V3D_VA_TOP { return None; }
     spans.insert(cursor, need);
     Some(cursor)
+}
+
+/// GPU VA of a PRIME-imported dumb buffer, keyed by object id: v3dv's WSI path
+/// creates its swapchain images as dumb BOs, exports them, and imports them back
+/// on the render node, where GET_BO_OFFSET must answer a GPU address for them.
+static V3D_DUMB_VA: Mutex<BTreeMap<u32, (u64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// Map a contiguous dumb buffer into the GPU address space (once per object).
+/// Returns (va, phys, bytes).
+fn v3d_dumb_va(handle: u32) -> Option<(u64, usize, u64)> {
+    let b = dumb_lookup(handle)?;
+    if b.sg || b.phys == 0 { return None; }
+    let bytes = ((1usize << b.order) * 4096) as u64;
+    if let Some(&(va, _)) = V3D_DUMB_VA.lock().get(&b.obj) { return Some((va, b.phys, bytes)); }
+    let va = v3d_va_alloc(bytes)?;
+    if let Some(v) = crate::v3d_class::registered() {
+        if (v.map_bo)(va, b.phys as u64, bytes) < 0 { v3d_va_free(va); return None; }
+    }
+    let mut m = V3D_DUMB_VA.lock();
+    if let Some(&(va2, _)) = m.get(&b.obj) {
+        drop(m);
+        if let Some(v) = crate::v3d_class::registered() { (v.unmap_bo)(va, bytes); }
+        v3d_va_free(va);
+        return Some((va2, b.phys, bytes));
+    }
+    m.insert(b.obj, (va, bytes));
+    Some((va, b.phys, bytes))
+}
+
+fn v3d_dumb_va_release(obj: u32) {
+    let e = V3D_DUMB_VA.lock().remove(&obj);
+    if let Some((va, bytes)) = e {
+        if let Some(v) = crate::v3d_class::registered() { (v.unmap_bo)(va, bytes); }
+        v3d_va_free(va);
+    }
 }
 
 /// Release a reservation previously returned by `v3d_va_alloc`.
@@ -10710,13 +10746,14 @@ impl DrmDeviceInterface {
         let flags = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
         if flags != 0 { return Err(DriverError::InvalidParameter); }
 
-        let b = blob_lookup(handle, open_id).ok_or(DriverError::NotFound)?;
-        // Scoped to v3d BOs even though the registry is shared: a virtgpu blob
-        // reached through a v3d ioctl would be a caller confusing two ABIs, and
-        // its token is not derived the same way.
-        if b.v3d_va == 0 || b.phys == 0 { return Err(DriverError::NotFound); }
-
-        let off = crate::drm_offset::offset_for(b.phys as u64, b.size).ok_or(DriverError::Unsupported)?;
+        let (phys, size) = match blob_lookup(handle, open_id).filter(|b| b.v3d_va != 0 && b.phys != 0) {
+            Some(b) => (b.phys as u64, b.size),
+            None => match v3d_dumb_va(handle) {
+                Some((_, p, n)) => (p as u64, n),
+                None => return Err(DriverError::NotFound),
+            },
+        };
+        let off = crate::drm_offset::offset_for(phys, size).ok_or(DriverError::Unsupported)?;
         unsafe { ((arg as *mut u8).add(8) as *mut u64).write_unaligned(off) };
         Ok(0)
     }
@@ -10732,9 +10769,13 @@ impl DrmDeviceInterface {
     fn v3d_handle_get_bo_offset(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let handle = uread::<u32>(arg)?;
-        let b = blob_lookup(handle, open_id).ok_or(DriverError::NotFound)?;
-        if b.v3d_va == 0 { return Err(DriverError::NotFound); }
-        unsafe { (arg as *mut u8).add(4).cast::<u32>().write_unaligned(b.v3d_va as u32) };
+        let blob = blob_lookup(handle, open_id).filter(|b| b.v3d_va != 0);
+        let va = match blob {
+            Some(b) => b.v3d_va,
+            // A PRIME-imported dumb buffer (v3dv WSI swapchain image).
+            None => v3d_dumb_va(handle).ok_or(DriverError::NotFound)?.0,
+        };
+        unsafe { (arg as *mut u8).add(4).cast::<u32>().write_unaligned(va as u32) };
         Ok(0)
     }
 

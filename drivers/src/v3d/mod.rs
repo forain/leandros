@@ -8,7 +8,7 @@
 //!
 //! Inert on failure: any failing step logs one `[v3d] fail ...` line, leaves
 //! [`DEVICE`] empty and the DRM backend on its stub path. The probe is opt-in:
-//! it runs only with `v3d.probe=1` on the kernel command line.
+//! it runs by default on rpi5; `v3d.probe=0` skips it.
 pub mod regs;
 pub mod power;
 pub mod mmu;
@@ -26,7 +26,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub const PROBE_NONE: u32 = 0;
 /// Powered and identified; [`DEVICE`] holds the block.
 pub const PROBE_UP: u32 = 1;
-/// Skipped: opt-in only (`v3d.probe=1`) until the probe is proven on a Pi 5.
+/// Skipped by `v3d.probe=0`.
 pub const PROBE_SKIPPED: u32 = 2;
 /// A region could not be mapped.
 pub const PROBE_NOMAP: u32 = 3;
@@ -36,10 +36,10 @@ pub const PROBE_FAILED_BASE: u32 = 0x100;
 /// the block is treated as absent.
 pub const PROBE_SERROR: u32 = 4;
 
-/// `v3d.probe=1` opts in. The default is off: the first Pi 5 boot of the probe
-/// (2026-10-26) ended in an SError at the first EL0 entry.
+/// Default on (rpi5 only); `v3d.probe=0` opts out. SErrors are caught by the
+/// checkpoints around the probe, so a failed probe never blocks boot.
 pub fn probe_enabled(cmdline: &str) -> bool {
-    cmdline.split_ascii_whitespace().any(|t| t == "v3d.probe=1")
+    !cmdline.split_ascii_whitespace().any(|t| t == "v3d.probe=0")
 }
 
 /// After-probe SError check, provided by the arch layer: `Some(syndrome)` if an SError
@@ -191,7 +191,7 @@ mod hw {
     /// every outcome is one `[v3d]` line and a [`PROBE_STATE`] value.
     pub fn probe_boot(cmdline: &str, hhdm_offset: u64, serror_check: SerrorCheck) -> bool {
         if !probe_enabled(cmdline) {
-            serial_debug("[v3d] skipped (default off; v3d.probe=1 enables)\n");
+            serial_debug("[v3d] skipped (v3d.probe=0)\n");
             PROBE_STATE.store(PROBE_SKIPPED, Ordering::Relaxed);
             return false;
         }
