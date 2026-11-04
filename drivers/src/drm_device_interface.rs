@@ -4750,12 +4750,12 @@ fn v3d_fence_done(fence: u64) -> bool {
 }
 
 /// A v3d BO pinned for scanout by a KMS backend (`v3d_scanout`).
-#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d-core"))]
 pub struct V3dScanoutBo { pub obj: u32, pub phys: u64, pub size: u64 }
 
 /// Take a framebuffer reference on the v3d BO `handle` names (None: not a v3d BO this open may
 /// reach). The reference keeps the pages alive past GEM_CLOSE until `v3d_scanout_unref`.
-#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d-core"))]
 pub fn v3d_scanout_ref(handle: u32, open_id: u32) -> Option<V3dScanoutBo> {
     let b = blob_lookup(handle, open_id)?;
     if b.v3d_va == 0 || b.phys == 0 { return None; }
@@ -4763,11 +4763,11 @@ pub fn v3d_scanout_ref(handle: u32, open_id: u32) -> Option<V3dScanoutBo> {
     Some(V3dScanoutBo { obj, phys: b.phys as u64, size: b.size })
 }
 
-#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d-core"))]
 pub fn v3d_scanout_unref(obj: u32) { fb_bo_unref(obj); }
 
 /// Wait (task context, bounded) for the last job that named BO `obj`. False on timeout.
-#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d-core"))]
 pub fn v3d_scanout_wait(obj: u32, timeout_ns: u64) -> bool {
     let fence = BLOB_OBJS.lock().get(&obj).map(|o| o.last_fence).unwrap_or(0);
     if let Some(v) = crate::v3d_class::ops() { return (v.wait_bo)(fence, timeout_ns); }
@@ -4782,7 +4782,7 @@ pub fn v3d_scanout_wait(obj: u32, timeout_ns: u64) -> bool {
 /// `/proc/v3d_headless` (`dump` false) and `/proc/v3d_headless_fb` (`dump` true); `None` unless
 /// the Pi 5 Headless scanout sink is active.
 pub fn proc_v3d_headless(dump: bool) -> Option<Vec<u8>> {
-    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d-core"))]
     { return crate::v3d_scanout::proc_headless(dump); }
     #[allow(unreachable_code)]
     { let _ = dump; None }

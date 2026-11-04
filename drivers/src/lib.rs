@@ -90,7 +90,7 @@ pub mod hda {
 pub mod framebuffer;
 pub mod kms;
 pub mod kms_v3d;
-#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d-core"))]
 pub mod v3d_scanout;
 pub mod v3d_class;
 pub mod vector_font;
@@ -268,6 +268,7 @@ pub mod pi5_board;
 pub mod bcm2712_dma40;
 /// Broadcom V3D 7.1 GPU (Pi 5): register map, power-up, MMU. Pure logic
 /// everywhere; the hardware probe is rpi5-only.
+#[cfg(feature = "v3d")]
 pub mod v3d;
 
 /// Block-device trait and types every backend implements (always built).

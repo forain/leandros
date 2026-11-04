@@ -175,7 +175,7 @@ pub mod hdmi {
 /// What the V3D driver (`drivers/src/v3d`) needs from the kernel. The built-in build answers with the
 /// kernel's own functions; the module build (K3) answers the same names through `kapi_mbox_property`,
 /// `kapi_pm_base`, `kapi_v3d_arm`, `kapi_v3d_va_alloc/free` and the existing irq/dma/fence exports.
-#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d"))]
 pub mod v3d {
     pub use crate::irq::{request_irq, IrqReturn, IrqSource};
     pub use crate::pci::serial_debug;
