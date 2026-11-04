@@ -312,6 +312,7 @@ pub use hw::*;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 mod hw {
     use super::*;
+    use crate::kenv::v3d::mm;
     use core::fmt::Write;
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use spin::Mutex;
@@ -346,7 +347,7 @@ mod hw {
     impl LineBuf {
         pub const fn new() -> Self { LineBuf { buf: [0; 256], len: 0 } }
         pub fn emit(&self) {
-            crate::pci::serial_debug(core::str::from_utf8(&self.buf[..self.len]).unwrap_or("[v3d] ?\n"));
+            crate::kenv::v3d::serial_debug(core::str::from_utf8(&self.buf[..self.len]).unwrap_or("[v3d] ?\n"));
         }
     }
     impl Write for LineBuf {
