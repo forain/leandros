@@ -200,8 +200,18 @@ pub mod v3d {
     /// Kernel-owned GPU VA (`kapi_v3d_va_alloc` / `kapi_v3d_va_free`).
     pub fn va_alloc(bytes: u64) -> Option<u64> { crate::drm_device_interface::v3d_kernel_va_alloc(bytes) }
     pub fn va_free(va: u64) { crate::drm_device_interface::v3d_kernel_va_free(va) }
-    /// Tell the DRM layer the hardware is up (`kapi_v3d_arm`).
-    pub fn arm() { crate::drm_device_interface::v3d_arm_hw() }
+    /// Tell the DRM layer the hardware is up, then pick the scanout sink (`kapi_v3d_arm`).
+    pub fn arm(cmdline: &str, _serror: crate::v3d::SerrorCheck) {
+        crate::drm_device_interface::v3d_arm_hw();
+        crate::v3d_scanout::register(cmdline);
+    }
+    /// Hand the driver's `KV3dOps` table to core (`kapi_v3d_register`).
+    pub fn register_ops(t: &'static crate::v3d_class::KV3dOps) { crate::v3d_class::register(t); }
+    /// GIC line state for the IRQ self-test / poll fallback (`kapi_irq_line_state`).
+    pub fn irq_line_state(id: u32) -> u32 {
+        extern "C" { fn arch_irq_line_state(id: u32) -> u32; }
+        unsafe { arch_irq_line_state(id) }
+    }
     pub fn alloc_fence_id() -> u64 { crate::drm_device_interface::v3d_alloc_fence_id() }
     pub fn fence_signalled(f: u64) -> bool { crate::drm_device_interface::v3d_fence_signalled(f) }
     pub fn syncobj_retire_fence(f: u64) { crate::drm_device_interface::syncobj_retire_fence(f) }

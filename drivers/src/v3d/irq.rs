@@ -208,10 +208,6 @@ mod hw {
     use core::fmt::Write;
     use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-    extern "C" {
-        fn arch_irq_line_state(id: u32) -> u32;
-    }
-
     struct RegsCell(UnsafeCell<Option<&'static (dyn V3dRegs + Sync)>>);
     unsafe impl Sync for RegsCell {}
     /// Written once in `bring_up`, before `READY` is released and before any line is requested.
@@ -295,7 +291,7 @@ mod hw {
     struct Env { id: u32, counter: &'static AtomicU64 }
     impl SelftestEnv for Env {
         fn delivered(&self) -> u64 { self.counter.load(Ordering::Acquire) }
-        fn gic_state(&self) -> u32 { unsafe { arch_irq_line_state(self.id) } }
+        fn gic_state(&self) -> u32 { crate::kenv::v3d::irq_line_state(self.id) }
         fn cpu_irqs_masked(&self) -> bool {
             let daif: u64;
             unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }

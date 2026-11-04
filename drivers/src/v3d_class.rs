@@ -70,7 +70,3 @@ pub fn submit_result(r: i64) -> Result<usize, crate::DriverError> {
         e => E::Errno(e as i32),
     })
 }
-
-/// Register the built-in (`V3D=y`) driver. Called once the hardware probe succeeded.
-#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-pub fn register_builtin() { register(&crate::v3d::ops::TABLE); }

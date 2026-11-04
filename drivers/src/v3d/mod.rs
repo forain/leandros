@@ -189,12 +189,13 @@ mod hw {
 
     /// Boot-time probe (task context, after kva is up). Never panics or hangs:
     /// every outcome is one `[v3d]` line and a [`PROBE_STATE`] value.
-    pub fn probe_boot(cmdline: &str, hhdm_offset: u64, serror_check: SerrorCheck) {
+    pub fn probe_boot(cmdline: &str, hhdm_offset: u64, serror_check: SerrorCheck) -> bool {
         if !probe_enabled(cmdline) {
             serial_debug("[v3d] skipped (default off; v3d.probe=1 enables)\n");
             PROBE_STATE.store(PROBE_SKIPPED, Ordering::Relaxed);
-            return;
+            return false;
         }
+        let mut hw_live = false;
         let map = |phys: u64, len: usize| ioremap(phys, len, CacheMode::Uncached);
         let (hub, core, sms, pm, mbox) = match (
             map(HUB_PHYS, HUB_SIZE),
@@ -207,7 +208,7 @@ mod hw {
             _ => {
                 serial_debug("[v3d] fail map ioremap\n");
                 PROBE_STATE.store(PROBE_NOMAP, Ordering::Relaxed);
-                return;
+                return false;
             }
         };
         // The HHDM does not cover the mailbox registers this late in boot.
@@ -221,7 +222,7 @@ mod hw {
             if let Err((e, rep)) = &res { serial_debug(&fail_line(*e, rep)); }
             serial_debug(&serror_line("power", syn));
             PROBE_STATE.store(PROBE_SERROR, Ordering::Relaxed);
-            return;
+            return false;
         }
         match res {
             Ok((dev, rep)) => {
@@ -244,6 +245,7 @@ mod hw {
                 PROBE_STATE.store(PROBE_UP, Ordering::Relaxed);
                 // Phase C (pv3d-cl): the CL queue + boot self-test, only once the MMU is up.
                 let mmu_up = super::mmu::after_probe(regs, ver, va_width);
+                hw_live = true;
                 if mmu_up {
                     super::submit::after_mmu(regs, ver, cmdline);
                 }
@@ -253,12 +255,11 @@ mod hw {
                     serial_debug(&serror_line("mmu-cl", syn));
                     *DEVICE.lock() = None;
                     PROBE_STATE.store(PROBE_SERROR, Ordering::Relaxed);
-                    return;
+                    return false;
                 }
                 if super::submit::auto_arm_decision(mmu_up, cmdline) {
-                    crate::v3d_class::register_builtin();
-                    crate::kenv::v3d::arm();
-                    crate::v3d_scanout::register(cmdline);
+                    crate::kenv::v3d::register_ops(&super::ops::TABLE);
+                    crate::kenv::v3d::arm(cmdline, serror_check);
                     serial_debug("[v3d] armed: card0+renderD128 report v3d (auto, probe ok)\n");
                 } else {
                     serial_debug(&alloc::format!("[v3d] not armed mmu={} (v3d.arm=0 or MMU down)\n",
@@ -270,5 +271,6 @@ mod hw {
                 PROBE_STATE.store(PROBE_FAILED_BASE + e.step() as u32, Ordering::Relaxed);
             }
         }
+        hw_live
     }
 }
