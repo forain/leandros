@@ -16,6 +16,7 @@ pub mod irq;
 pub mod queue;
 pub mod submit;
 pub mod selftest_cl;
+pub mod ops;
 
 pub use regs::{V3d, V3dRegs};
 

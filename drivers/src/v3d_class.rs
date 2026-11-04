@@ -7,7 +7,7 @@
 //!
 //! The table is `repr(C)` and size-gated so a later `v3d.kmod` can register it through
 //! `kapi_v3d_register`. Today the `=y` build registers the same table statically.
-//! Codes: `submit` returns `>= 0` or `-errno`; `map_bo` 0 mapped, 1 driver inactive (skip), `< 0` failure.
+//! Codes: `submit` returns `>= 0` or `-errno` and its `arg` is a KERNEL pointer to a copy of the ioctl struct; `map_bo` 0 mapped, 1 driver inactive (skip), `< 0` failure.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -71,53 +71,6 @@ pub fn submit_result(r: i64) -> Result<usize, crate::DriverError> {
     })
 }
 
-#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-mod builtin {
-    use super::KV3dOps;
-    use crate::drm_device_interface as drm;
-    use crate::DriverError;
-    use crate::v3d::{mmu, submit};
-
-    fn code(r: Result<usize, DriverError>) -> i64 {
-        match r {
-            Ok(v) => v as i64,
-            Err(DriverError::InvalidParameter) => -22,
-            Err(DriverError::NotFound) => -2,
-            Err(DriverError::Busy) => -16,
-            Err(DriverError::Errno(e)) => -(e as i64),
-            Err(_) => -5,
-        }
-    }
-    extern "C" fn active() -> bool { submit::active() }
-    extern "C" fn map_bo(va: u64, phys: u64, bytes: u64) -> i32 {
-        if !mmu::active() { return 1; }
-        if mmu::map_bo(va, phys, bytes).is_err() { -5 } else { 0 }
-    }
-    extern "C" fn unmap_bo(va: u64, bytes: u64) { mmu::unmap_bo(va, bytes) }
-    extern "C" fn param(p: u32, out: *mut u64) -> bool {
-        match submit::param(p) { Some(v) => { unsafe { out.write_unaligned(v) }; true } None => false }
-    }
-    extern "C" fn submit_(nr: u32, arg: usize, open_id: u32) -> i64 {
-        code(drm::v3d_real_submit(nr, arg, open_id))
-    }
-    extern "C" fn reap() { drm::v3d_real_reap() }
-    extern "C" fn tick() { submit::tick() }
-    extern "C" fn wait_bo(fence: u64, timeout_ns: u64) -> bool {
-        let deadline = ::sched::monotonic_ns().saturating_add(timeout_ns);
-        loop {
-            drm::v3d_real_reap();
-            if drm::v3d_fence_signalled(fence) { return true; }
-            if ::sched::monotonic_ns() >= deadline { return false; }
-            ::sched::yield_now("v3d-scanout");
-        }
-    }
-
-    pub static TABLE: KV3dOps = KV3dOps {
-        size: core::mem::size_of::<KV3dOps>(),
-        active, map_bo, unmap_bo, param, submit: submit_, reap, tick, wait_bo,
-    };
-}
-
 /// Register the built-in (`V3D=y`) driver. Called once the hardware probe succeeded.
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-pub fn register_builtin() { register(&builtin::TABLE); }
+pub fn register_builtin() { register(&crate::v3d::ops::TABLE); }

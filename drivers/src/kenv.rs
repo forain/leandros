@@ -205,4 +205,27 @@ pub mod v3d {
     pub fn alloc_fence_id() -> u64 { crate::drm_device_interface::v3d_alloc_fence_id() }
     pub fn fence_signalled(f: u64) -> bool { crate::drm_device_interface::v3d_fence_signalled(f) }
     pub fn syncobj_retire_fence(f: u64) { crate::drm_device_interface::syncobj_retire_fence(f) }
+
+    pub use crate::DriverError;
+    pub fn yield_now(why: &'static str) { ::sched::yield_now(why) }
+    /// Range-checked copy from user memory (`kapi_copy_from_user`).
+    pub fn copy_from_user(src: usize, buf: &mut [u8]) -> bool {
+        unsafe { ::sched::uaccess::copy_from_user(buf.as_mut_ptr(), src, buf.len()) == 0 }
+    }
+    /// Append the pending fences of in-sync `h` to `out`; no fence yet counts as satisfied.
+    pub fn syncobj_deps(h: u32, open_id: u32, out: &mut alloc::vec::Vec<u64>) -> Result<(), DriverError> {
+        match crate::drm_device_interface::syncobj_in_fences(h, open_id, 0) {
+            Ok(v) => { out.extend(v); Ok(()) }
+            Err(DriverError::InvalidParameter) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    pub fn syncobj_exists(h: u32, open_id: u32) -> bool { crate::drm_device_interface::syncobj_exists(h, open_id) }
+    pub fn syncobj_install(h: u32, open_id: u32, fence: u64) {
+        let _ = crate::drm_device_interface::syncobj_install(h, open_id, 0, fence);
+    }
+    pub fn bo_hold(h: u32, open_id: u32) -> i64 { crate::drm_device_interface::v3d_bo_hold(h, open_id) }
+    pub fn bo_unref(obj: u32) { crate::drm_device_interface::v3d_bo_unref(obj) }
+    pub fn bo_fence(h: u32, open_id: u32, f: u64) { crate::drm_device_interface::v3d_bo_fence(h, open_id, f) }
+    pub fn queue_wait(deadline: u64) -> bool { crate::drm_device_interface::v3d_queue_wait(deadline) }
 }
