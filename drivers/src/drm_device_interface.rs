@@ -3221,8 +3221,7 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
         // here, unconditionally, from the one place the object dies.
         if o.v3d_va != 0 {
             // PTEs go before the span is reusable and before the pages go back below.
-            #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-            crate::v3d::mmu::unmap_bo(o.v3d_va, o.size);
+            if let Some(v) = crate::v3d_class::registered() { (v.unmap_bo)(o.v3d_va, o.size as u64); }
             v3d_va_free(o.v3d_va);
             // The 2D scanout resource ADDFB2 put over this BO's pages, if any:
             // released before the pages go back, so the host never holds a
@@ -4721,8 +4720,7 @@ fn v3d_submit_fence() -> Option<u64> {
 /// is a couple of compares per tick in the worst case.
 fn v3d_tick() {
     // Real V3D (Pi 5): polled IRQ fallback, hang timer, dependency re-checks.
-    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-    crate::v3d::submit::tick();
+    if let Some(v) = crate::v3d_class::ops() { (v.tick)(); }
     if V3D_INFLIGHT_N.load(Ordering::Relaxed) == 0 { return; }
     let now = sched::ticks();
     let mut highest = 0u64;
@@ -4772,9 +4770,9 @@ pub fn v3d_scanout_unref(obj: u32) { fb_bo_unref(obj); }
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub fn v3d_scanout_wait(obj: u32, timeout_ns: u64) -> bool {
     let fence = BLOB_OBJS.lock().get(&obj).map(|o| o.last_fence).unwrap_or(0);
+    if let Some(v) = crate::v3d_class::ops() { return (v.wait_bo)(fence, timeout_ns); }
     let deadline = sched::monotonic_ns().saturating_add(timeout_ns);
     loop {
-        if crate::v3d::submit::active() { v3d_real_reap(); }
         if v3d_fence_done(fence) { return true; }
         if sched::monotonic_ns() >= deadline { return false; }
         sched::yield_now("v3d-scanout");
@@ -4798,7 +4796,7 @@ pub(crate) fn v3d_kernel_va_free(va: u64) { v3d_va_free(va) }
 
 /// Real V3D (Pi 5): release the BO references of jobs whose fences have signalled.
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-fn v3d_real_reap() {
+pub(crate) fn v3d_real_reap() {
     crate::v3d::submit::reap(&mut |obj| { blob_unref(obj, 0); });
 }
 
@@ -4817,6 +4815,17 @@ fn v3d_bo_hold(handle: u32, open_id: u32) -> Option<u32> {
     let o = objs.get_mut(&obj)?;
     o.refs = o.refs.saturating_add(1);
     Some(obj)
+}
+
+/// `KV3dOps::submit` body for the built-in driver: route the ioctl word to its shim.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub(crate) fn v3d_real_submit(nr: u32, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+    match nr {
+        DRM_IOCTL_V3D_SUBMIT_CL => v3d_real_submit_cl(arg, open_id),
+        DRM_IOCTL_V3D_SUBMIT_TFU => v3d_real_submit_tfu(arg, open_id),
+        DRM_IOCTL_V3D_SUBMIT_CSD => v3d_real_submit_csd(arg, open_id),
+        _ => Err(DriverError::Unsupported),
+    }
 }
 
 /// Real V3D SUBMIT_CL: bin/render job on the hardware queue, MULTI_SYNC, BO refs held until the
@@ -10641,9 +10650,8 @@ impl DrmDeviceInterface {
     /// cannot flood the console.
     /// SUBMIT_TFU / SUBMIT_CSD: the real Pi 5 queue (phase D) once it is up; ENOSYS on the stub.
     fn v3d_handle_submit_tfu_csd(&mut self, cmd: u32, arg: usize, open_id: u32) -> Result<usize, DriverError> {
-        #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-        if crate::v3d::submit::active() {
-            return if cmd == DRM_IOCTL_V3D_SUBMIT_TFU { v3d_real_submit_tfu(arg, open_id) } else { v3d_real_submit_csd(arg, open_id) };
+        if let Some(v) = crate::v3d_class::ops() {
+            return crate::v3d_class::submit_result((v.submit)(cmd, arg, open_id));
         }
         let _ = (arg, open_id);
         Self::v3d_enosys(cmd)
@@ -10680,10 +10688,10 @@ impl DrmDeviceInterface {
         if pad != 0 { return Err(DriverError::InvalidParameter); }
 
         // Real V3D (Pi 5): identity from the registers, real feature bits, live reset counter.
-        #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-        if crate::v3d::submit::active() {
-            if let Some(v) = crate::v3d::submit::param(param) {
-                unsafe { ((arg as *mut u8).add(8) as *mut u64).write_unaligned(v) };
+        if let Some(v) = crate::v3d_class::ops() {
+            let mut val = 0u64;
+            if (v.param)(param, &mut val) {
+                unsafe { ((arg as *mut u8).add(8) as *mut u64).write_unaligned(val) };
                 return Ok(0);
             }
         }
@@ -10787,9 +10795,9 @@ impl DrmDeviceInterface {
 
         // Real V3D (Pi 5, probed): back the GPU address with PTEs. Inactive (QEMU, stub, failed
         // probe) leaves this path exactly as it was.
-        #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-        if crate::v3d::mmu::active() {
-            if crate::v3d::mmu::map_bo(va, phys as u64, alloc_bytes).is_err() {
+        if let Some(v) = crate::v3d_class::registered() {
+            // 0 mapped, 1 driver inactive (leave the path as it was), < 0 failed.
+            if (v.map_bo)(va, phys as u64, alloc_bytes as u64) < 0 {
                 v3d_va_free(va);
                 mm::buddy::free(phys, order);
                 return Err(DriverError::Io);
@@ -10900,8 +10908,7 @@ impl DrmDeviceInterface {
     /// v3d table only for v3d ioctls). An unknown handle is EINVAL, matching
     /// upstream's `drm_gem_dma_resv_wait`, not ENOENT.
     fn v3d_handle_wait_bo(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
-        #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-        if crate::v3d::submit::active() { v3d_real_reap(); }
+        if let Some(v) = crate::v3d_class::ops() { (v.reap)(); }
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let handle = uread::<u32>(arg)?;
         let pad = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
@@ -10985,8 +10992,9 @@ impl DrmDeviceInterface {
     /// therefore retires first. A second queue (TFU, CSD) would break that and
     /// is exactly why neither exists yet.
     fn v3d_handle_submit_cl(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
-        #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-        if crate::v3d::submit::active() { return v3d_real_submit_cl(arg, open_id); }
+        if let Some(v) = crate::v3d_class::ops() {
+            return crate::v3d_class::submit_result((v.submit)(DRM_IOCTL_V3D_SUBMIT_CL, arg, open_id));
+        }
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let u32_at = |i: usize| -> u32 { unsafe { ptr::read_unaligned((arg as *const u32).add(i)) } };
         let u64_at = |b: usize| -> u64 { unsafe { ((arg as *const u8).add(b) as *const u64).read_unaligned() } };

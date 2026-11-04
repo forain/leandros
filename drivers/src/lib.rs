@@ -92,6 +92,7 @@ pub mod kms;
 pub mod kms_v3d;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod v3d_scanout;
+pub mod v3d_class;
 pub mod vector_font;
 pub mod glyphs;
 pub mod drm;
