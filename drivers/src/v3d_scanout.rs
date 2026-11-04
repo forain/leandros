@@ -10,7 +10,9 @@
 //!     the compositor can run on the real GPU and be checked over SSH.
 //!   * `FwCopy`: `kms_v3d::present`, a stride copy into the firmware framebuffer (needs a monitor
 //!     at power-on for the mailbox to grant one).
-//!   * `HvsPlane` (later): rewrite the plane pointer in the firmware's display list.
+//!   * `HvsPlane` (`hvs_plane`, the default when firmware channel 0 runs a matching one-plane list;
+//!     `hvs.plane=0` opts out): the BO is scanned out directly, vblank paced, no copy. A frame it
+//!     cannot show goes through `FwCopy`.
 //!
 //! Nothing registers when no sink exists, so ADDFB2 of a v3d BO fails instead of looking usable.
 //! A present first waits for the BO's last job: the GPU is not coherent with the copy.
@@ -31,6 +33,9 @@ pub struct Sink {
     pub name: &'static str,
     pub mode: fn() -> (u32, u32, u32),
     pub present: fn(src_phys: u64, w: u32, h: u32, pitch: u32) -> Result<(), DriverError>,
+    /// Zero-copy scanout of the BO (`obj`, window at `phys`). `Err`: this frame cannot be shown
+    /// that way; the backend then puts it on screen with `FWCOPY`.
+    pub flip: Option<fn(obj: u32, phys: u64, w: u32, h: u32, pitch: u32) -> Result<(), DriverError>>,
 }
 
 struct Fb { obj: u32, phys: u64, w: u32, h: u32, pitch: u32 }
@@ -100,7 +105,7 @@ fn headless_present(src_phys: u64, w: u32, h: u32, pitch: u32) -> Result<(), Dri
     Ok(())
 }
 
-static HEADLESS: Sink = Sink { name: "headless", mode: headless_mode, present: headless_present };
+static HEADLESS: Sink = Sink { name: "headless", mode: headless_mode, present: headless_present, flip: None };
 
 // ---- FwCopy sink --------------------------------------------------------------------------
 
@@ -108,7 +113,39 @@ fn fw_mode() -> (u32, u32, u32) {
     crate::framebuffer::get_hardware_fb_info().map_or((0, 0, 60), |(_, w, h, _)| (w, h, 60))
 }
 
-static FWCOPY: Sink = Sink { name: "fwcopy", mode: fw_mode, present: kms_v3d::present };
+static FWCOPY: Sink = Sink { name: "fwcopy", mode: fw_mode, present: kms_v3d::present, flip: None };
+
+// ---- HvsPlane sink ------------------------------------------------------------------------
+
+fn hvs_never_copy(_src_phys: u64, _w: u32, _h: u32, _pitch: u32) -> Result<(), DriverError> { Err(DriverError::Unsupported) }
+
+static HVS: Sink = Sink { name: "hvs", mode: fw_mode, present: hvs_never_copy, flip: Some(crate::hvs_plane::flip) };
+
+fn f_queue(token: u32, src_x: u32, src_y: u32, ev: u32) -> Result<(), DriverError> {
+    let (obj, phys, w, h, pitch) = {
+        let g = FBS.lock();
+        let fb = g.get(&token).ok_or(DriverError::NotFound)?;
+        (fb.obj, fb.phys, fb.w, fb.h, fb.pitch)
+    };
+    if src_x >= w || src_y >= h { return Err(DriverError::InvalidParameter); }
+    if !dri::v3d_scanout_wait(obj, 200_000_000) {
+        let n = WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+        if kms_v3d::flip_log_due(n) { log("[kms] pi-scanout: BO job wait timed out, presenting anyway\n"); }
+    }
+    let off = src_y as u64 * pitch as u64 + src_x as u64 * 4;
+    if crate::hvs_plane::queue(obj, phys + off, w - src_x, h - src_y, pitch, ev).is_ok() { return Ok(()); }
+    // Cannot scan out directly: firmware framebuffer back, copy, and finish the event now.
+    crate::hvs_plane::restore();
+    let r = (FWCOPY.present)(phys + off, w - src_x, h - src_y, pitch);
+    if ev != 0 { dri::ext_event_complete(ev, 0, sched::monotonic_ns()); }
+    r
+}
+
+fn f_event(ev: u32) { crate::hvs_plane::event(ev) }
+fn f_busy() -> bool { crate::hvs_plane::busy() }
+fn f_wait(timeout_ns: u64) -> bool { crate::hvs_plane::wait_idle(timeout_ns) }
+
+static HVS_FLIP: gpu_kms::KmsFlip = gpu_kms::KmsFlip { queue: f_queue, event: f_event, busy: f_busy, wait_idle: f_wait };
 
 // ---- The KmsBackend -----------------------------------------------------------------------
 
@@ -146,6 +183,13 @@ fn present(token: u32, src_x: u32, src_y: u32, _rects: Option<&[(i32, i32, i32, 
         if kms_v3d::flip_log_due(n) { log("[kms] pi-scanout: BO job wait timed out, presenting anyway\n"); }
     }
     let off = src_y as u64 * pitch as u64 + src_x as u64 * 4;
+    if let Some(flip) = sink.flip {
+        if flip(obj, phys + off, w - src_x, h - src_y, pitch).is_ok() { return Ok(()); }
+        // This frame (or the HVS) cannot scan out directly: show the firmware framebuffer again
+        // and copy into it.
+        crate::hvs_plane::restore();
+        return (FWCOPY.present)(phys + off, w - src_x, h - src_y, pitch);
+    }
     (sink.present)(phys + off, w - src_x, h - src_y, pitch)
 }
 
@@ -160,13 +204,15 @@ static BACKEND: KmsBackend = KmsBackend {
     fb_create,
     fb_destroy,
     present,
-    console_restore: None,
+    console_restore: Some(crate::hvs_plane::restore),
 };
 
 /// Choose a sink and register the backend. Called once, when the v3d probe armed the GPU.
-pub fn register(cmdline: &str) {
+pub fn register(cmdline: &str, serror_check: fn() -> Option<u64>) {
     let chosen: Option<&'static Sink> = if let Some((w, h)) = kms_v3d::parse_headless(cmdline) {
         if headless_init(w, h) { Some(&HEADLESS) } else { None }
+    } else if crate::hvs_plane::init(cmdline, serror_check).is_some() {
+        Some(&HVS)
     } else if crate::framebuffer::get_hardware_fb_info().is_some() {
         Some(&FWCOPY)
     } else {
@@ -177,6 +223,7 @@ pub fn register(cmdline: &str) {
         return;
     };
     SINK.store(s as *const Sink as *mut Sink, Ordering::Release);
+    if core::ptr::eq(s, &HVS) { gpu_kms::register_flip(&HVS_FLIP); }
     gpu_kms::register(&BACKEND);
     let (w, h, hz) = (s.mode)();
     log(&alloc::format!("[kms] pi-scanout registered sink={} {}x{}@{}\n", s.name, w, h, hz));

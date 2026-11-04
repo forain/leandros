@@ -56,7 +56,7 @@ pub extern "C" fn kapi_v3d_arm(cmdline: *const u8, len: usize) -> i32 {
         if drivers::v3d_class::registered().is_none() { return -22; }
         let cl = if cmdline.is_null() { "" } else { core::str::from_utf8(unsafe { core::slice::from_raw_parts(cmdline, len) }).unwrap_or("") };
         real::drm::v3d_arm_hw();
-        drivers::v3d_scanout::register(cl);
+        drivers::v3d_scanout::register(cl, arch_aarch64::exception::serror_checkpoint);
         0
     }, { let _ = (cmdline, len); -19 })
 }

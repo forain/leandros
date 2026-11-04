@@ -201,9 +201,9 @@ pub mod v3d {
     pub fn va_alloc(bytes: u64) -> Option<u64> { crate::drm_device_interface::v3d_kernel_va_alloc(bytes) }
     pub fn va_free(va: u64) { crate::drm_device_interface::v3d_kernel_va_free(va) }
     /// Tell the DRM layer the hardware is up, then pick the scanout sink (`kapi_v3d_arm`).
-    pub fn arm(cmdline: &str, _serror: crate::v3d::SerrorCheck) {
+    pub fn arm(cmdline: &str, serror: crate::v3d::SerrorCheck) {
         crate::drm_device_interface::v3d_arm_hw();
-        crate::v3d_scanout::register(cmdline);
+        crate::v3d_scanout::register(cmdline, serror);
     }
     /// Hand the driver's `KV3dOps` table to core (`kapi_v3d_register`).
     pub fn register_ops(t: &'static crate::v3d_class::KV3dOps) { crate::v3d_class::register(t); }
