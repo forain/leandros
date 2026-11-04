@@ -171,3 +171,38 @@ pub mod hdmi {
     /// Fallback SError checkpoint when the boot has not installed one.
     pub fn serror() -> Option<u64> { None }
 }
+
+/// What the V3D driver (`drivers/src/v3d`) needs from the kernel. The built-in build answers with the
+/// kernel's own functions; the module build (K3) answers the same names through `kapi_mbox_property`,
+/// `kapi_pm_base`, `kapi_v3d_arm`, `kapi_v3d_va_alloc/free` and the existing irq/dma/fence exports.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod v3d {
+    pub use crate::irq::{request_irq, IrqReturn, IrqSource};
+    pub use crate::pci::serial_debug;
+    pub use crate::rpi_mailbox::MBOX_BASE_PHYS;
+
+    pub mod mm { pub use ::mm::{buddy, kva, phys_to_virt}; }
+    pub mod sched { pub use ::sched::monotonic_ns; }
+
+    /// One firmware property-tag call (`kapi_mbox_property`).
+    ///
+    /// # Safety
+    /// Boot CPU only, nothing else touching the mailbox; `hhdm` as for `rpi_mailbox::property_call`.
+    pub unsafe fn mbox_property(hhdm: usize, words: &[u32]) -> Result<&'static [u32], crate::rpi_mailbox::MboxError> {
+        crate::rpi_mailbox::property_call(hhdm, words)
+    }
+    /// Record the ioremapped mailbox window (`kapi_mbox_property` owns it in the module build).
+    pub fn mbox_set_virt(virt: usize) { crate::rpi_mailbox::set_mbox_virt(virt) }
+    /// Shared PM window (`kapi_pm_base`).
+    pub fn pm_base() -> Option<usize> { crate::rpi_pm::base() }
+    /// Register the kexec stop hook (`kapi_dma_quiesce_register`).
+    pub fn dma_quiesce_register(name: &'static str, f: fn() -> bool) { super::dma_quiesce_register(name, f) }
+    /// Kernel-owned GPU VA (`kapi_v3d_va_alloc` / `kapi_v3d_va_free`).
+    pub fn va_alloc(bytes: u64) -> Option<u64> { crate::drm_device_interface::v3d_kernel_va_alloc(bytes) }
+    pub fn va_free(va: u64) { crate::drm_device_interface::v3d_kernel_va_free(va) }
+    /// Tell the DRM layer the hardware is up (`kapi_v3d_arm`).
+    pub fn arm() { crate::drm_device_interface::v3d_arm_hw() }
+    pub fn alloc_fence_id() -> u64 { crate::drm_device_interface::v3d_alloc_fence_id() }
+    pub fn fence_signalled(f: u64) -> bool { crate::drm_device_interface::v3d_fence_signalled(f) }
+    pub fn syncobj_retire_fence(f: u64) { crate::drm_device_interface::syncobj_retire_fence(f) }
+}

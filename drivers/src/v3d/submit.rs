@@ -350,6 +350,7 @@ pub use hw::*;
 mod hw {
     use super::super::queue::{ClJob, ClQueue, JobKind, QueueEnv, Stats, EV_TFU_DONE, OVERFLOW_BYTES};
     use super::super::regs::V3dRegs;
+    use crate::kenv::v3d::{mm, sched};
     use super::super::{irq, mmu, MmioRegs};
     use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
     use spin::Mutex;
@@ -368,8 +369,8 @@ mod hw {
     struct HwEnv;
     impl QueueEnv for HwEnv {
         fn now_ns(&self) -> u64 { sched::monotonic_ns() }
-        fn fence_done(&self, f: u64) -> bool { crate::drm_device_interface::v3d_fence_signalled(f) }
-        fn signal(&self, f: u64) { crate::drm_device_interface::syncobj_retire_fence(f) }
+        fn fence_done(&self, f: u64) -> bool { crate::kenv::v3d::fence_signalled(f) }
+        fn signal(&self, f: u64) { crate::kenv::v3d::syncobj_retire_fence(f) }
         fn reinit(&self, regs: &dyn V3dRegs) -> bool {
             let ok = mmu::reenable(regs);
             irq::enable(regs, VER.load(Ordering::Relaxed));
@@ -428,12 +429,12 @@ mod hw {
     fn add_chunk() -> bool {
         if CHUNKS.load(Ordering::Relaxed) >= POOL_MAX { return false; }
         let pa = match mm::buddy::alloc(CHUNK_ORDER) { Some(p) => p, None => return false };
-        let va = match crate::drm_device_interface::v3d_kernel_va_alloc(OVERFLOW_BYTES as u64) {
+        let va = match crate::kenv::v3d::va_alloc(OVERFLOW_BYTES as u64) {
             Some(v) => v,
             None => { mm::buddy::free(pa, CHUNK_ORDER); return false; }
         };
         if mmu::map_bo(va, pa as u64, OVERFLOW_BYTES as u64).is_err() {
-            crate::drm_device_interface::v3d_kernel_va_free(va);
+            crate::kenv::v3d::va_free(va);
             mm::buddy::free(pa, CHUNK_ORDER);
             return false;
         }
@@ -530,13 +531,13 @@ mod hw {
         irq::set_core_hook(core_hook);
         irq::set_hub_hook(hub_hook);
         ACTIVE.store(true, Ordering::Release);
-        crate::dma_shutdown::register("v3d", crate::dma_shutdown::Stage::Device, kexec_shutdown);
+        crate::kenv::v3d::dma_quiesce_register("v3d", kexec_shutdown);
         for _ in 0..POOL_START { if !add_chunk() { break; } }
-        crate::pci::serial_debug(&alloc::format!(
+        crate::kenv::v3d::serial_debug(&alloc::format!(
             "[v3d] cl queue up pool={}x256K mode={}\n",
             CHUNKS.load(Ordering::Relaxed), if irq::polled() { "poll" } else { "irq" }));
         if cmdline.split_ascii_whitespace().any(|t| t == "v3d.selftest=0") {
-            crate::pci::serial_debug("[v3d] selftest skipped (v3d.selftest=0)\n");
+            crate::kenv::v3d::serial_debug("[v3d] selftest skipped (v3d.selftest=0)\n");
             return;
         }
         selftest(r);
@@ -548,10 +549,10 @@ mod hw {
         use super::{tfu_selftest_check, tfu_selftest_fill, tfu_selftest_regs, TFU_BO_SIZE, TFU_DST_OFF, TFU_H, TFU_W};
         let t0 = sched::monotonic_ns();
         let order = 3; // 32 KiB
-        let fail = |why: &str| crate::pci::serial_debug(&alloc::format!("[v3d] selftest tfu fail {}\n", why));
+        let fail = |why: &str| crate::kenv::v3d::serial_debug(&alloc::format!("[v3d] selftest tfu fail {}\n", why));
         let pa = match mm::buddy::alloc(order) { Some(p) => p, None => return fail("nomem") };
         let k = mm::phys_to_virt(pa) as *mut u8;
-        let va = match crate::drm_device_interface::v3d_kernel_va_alloc(TFU_BO_SIZE as u64) {
+        let va = match crate::kenv::v3d::va_alloc(TFU_BO_SIZE as u64) {
             Some(v) => v,
             None => { mm::buddy::free(pa, order); return fail("nova"); }
         };
@@ -559,13 +560,13 @@ mod hw {
         bo.fill(0);
         tfu_selftest_fill(bo);
         if mmu::map_bo(va, pa as u64, TFU_BO_SIZE as u64).is_err() {
-            crate::drm_device_interface::v3d_kernel_va_free(va);
+            crate::kenv::v3d::va_free(va);
             mm::buddy::free(pa, order);
             return fail("map");
         }
         let before = QUEUE.lock().stats;
         let job = ClJob { kind: JobKind::Tfu(tfu_selftest_regs(va as u32)), ..Default::default() };
-        let fence = match submit(job, &mut || crate::drm_device_interface::v3d_alloc_fence_id()) {
+        let fence = match submit(job, &mut || crate::kenv::v3d::alloc_fence_id()) {
             Ok(f) => f,
             Err(_) => return fail("queue-full"),
         };
@@ -574,7 +575,7 @@ mod hw {
         while sched::monotonic_ns() < deadline {
             irq::poll();
             service();
-            if crate::drm_device_interface::v3d_fence_signalled(fence) { done = true; break; }
+            if crate::kenv::v3d::fence_signalled(fence) { done = true; break; }
             core::hint::spin_loop();
         }
         if !done { QUEUE.lock().reset(r, &HwEnv); }
@@ -583,7 +584,7 @@ mod hw {
         let tfuc = after.tfu_done - before.tfu_done;
         let t = (sched::monotonic_ns() - t0) / 1000;
         if !done || after.resets != before.resets {
-            return crate::pci::serial_debug(&alloc::format!(
+            return crate::kenv::v3d::serial_debug(&alloc::format!(
                 "[v3d] selftest tfu fail timeout tfuc={} tfu_cs=0x{:08x} hub_int=0x{:08x} t={}us\n",
                 tfuc, r.hub_r(super::super::regs::TFU_CS), r.hub_r(super::super::regs::HUB_INT_STS), t));
         }
@@ -594,13 +595,13 @@ mod hw {
         let (found, dup, foreign) = tfu_selftest_check(img);
         let px0 = u32::from_le_bytes([img[0], img[1], img[2], img[3]]);
         mmu::unmap_bo(va, TFU_BO_SIZE as u64);
-        crate::drm_device_interface::v3d_kernel_va_free(va);
+        crate::kenv::v3d::va_free(va);
         mm::buddy::free(pa, order);
         if found == TFU_W * TFU_H {
-            crate::pci::serial_debug(&alloc::format!(
+            crate::kenv::v3d::serial_debug(&alloc::format!(
                 "[v3d] selftest tfu copy ok perm={}/4096 crc=0x{:08x} tfuc={} t={}us\n", found, crc, tfuc, t));
         } else {
-            crate::pci::serial_debug(&alloc::format!(
+            crate::kenv::v3d::serial_debug(&alloc::format!(
                 "[v3d] selftest tfu fail mismatch perm={}/4096 dup={} foreign={} px0=0x{:08x} crc=0x{:08x} tfuc={} t={}us\n",
                 found, dup, foreign, px0, crc, tfuc, t));
         }
@@ -610,10 +611,10 @@ mod hw {
         use super::super::selftest_cl::*;
         let t0 = sched::monotonic_ns();
         let order = 3; // 32 KiB >= BO_SIZE
-        let fail = |why: &str| crate::pci::serial_debug(&alloc::format!("[v3d] selftest clear fail {}\n", why));
+        let fail = |why: &str| crate::kenv::v3d::serial_debug(&alloc::format!("[v3d] selftest clear fail {}\n", why));
         let pa = match mm::buddy::alloc(order) { Some(p) => p, None => return fail("nomem") };
         let k = mm::phys_to_virt(pa) as *mut u8;
-        let va = match crate::drm_device_interface::v3d_kernel_va_alloc(BO_SIZE as u64) {
+        let va = match crate::kenv::v3d::va_alloc(BO_SIZE as u64) {
             Some(v) => v,
             None => { mm::buddy::free(pa, order); return fail("nova"); }
         };
@@ -622,13 +623,13 @@ mod hw {
         let (rs, re) = super::selftest_fill(bo, va as u32);
         // map_bo cleans + invalidates the cacheable alias, so the GPU sees the CL bytes.
         if mmu::map_bo(va, pa as u64, BO_SIZE as u64).is_err() {
-            crate::drm_device_interface::v3d_kernel_va_free(va);
+            crate::kenv::v3d::va_free(va);
             mm::buddy::free(pa, order);
             return fail("map");
         }
         let before = QUEUE.lock().stats;
         let job = ClJob { rcl_start: rs, rcl_end: re, ..Default::default() };
-        let fence = match submit(job, &mut || crate::drm_device_interface::v3d_alloc_fence_id()) {
+        let fence = match submit(job, &mut || crate::kenv::v3d::alloc_fence_id()) {
             Ok(f) => f,
             Err(_) => return fail("queue-full"),
         };
@@ -637,7 +638,7 @@ mod hw {
         while sched::monotonic_ns() < deadline {
             irq::poll(); // harmless in IRQ mode; the only driver when IRQs are off this early
             service();
-            if crate::drm_device_interface::v3d_fence_signalled(fence) { done = true; break; }
+            if crate::kenv::v3d::fence_signalled(fence) { done = true; break; }
             core::hint::spin_loop();
         }
         if !done {
@@ -650,7 +651,7 @@ mod hw {
         let t = (sched::monotonic_ns() - t0) / 1000;
         if !done || after.resets != before.resets {
             // The GPU may still hold the BO: leak it.
-            return crate::pci::serial_debug(&alloc::format!(
+            return crate::kenv::v3d::serial_debug(&alloc::format!(
                 "[v3d] selftest clear fail timeout frdone={} ct1ca=0x{:08x} ct1cs=0x{:08x} int=0x{:08x} t={}us\n",
                 frdone, r.core_r(super::super::regs::CLE_CT1CA), r.core_r(super::super::regs::CLE_CT1CS),
                 r.core_r(super::super::regs::CTL_INT_STS), t));
@@ -662,12 +663,12 @@ mod hw {
         let bad = img.chunks_exact(4).filter(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]) != CLEAR_COLOR).count();
         let first = u32::from_le_bytes([img[0], img[1], img[2], img[3]]);
         mmu::unmap_bo(va, BO_SIZE as u64);
-        crate::drm_device_interface::v3d_kernel_va_free(va);
+        crate::kenv::v3d::va_free(va);
         mm::buddy::free(pa, order);
         if crc == want {
-            crate::pci::serial_debug(&alloc::format!("[v3d] selftest clear crc=0x{:08x} ok frdone={} t={}us\n", crc, frdone, t));
+            crate::kenv::v3d::serial_debug(&alloc::format!("[v3d] selftest clear crc=0x{:08x} ok frdone={} t={}us\n", crc, frdone, t));
         } else {
-            crate::pci::serial_debug(&alloc::format!(
+            crate::kenv::v3d::serial_debug(&alloc::format!(
                 "[v3d] selftest clear fail mismatch crc=0x{:08x} want=0x{:08x} bad={}/4096 px0=0x{:08x} frdone={} t={}us\n",
                 crc, want, bad, first, frdone, t));
         }

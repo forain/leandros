@@ -85,9 +85,10 @@ mod hw {
     use super::power::{self, PowerEnv, ProbeReport};
     use super::regs::*;
     use super::*;
-    use crate::pci::serial_debug;
+    use crate::kenv::v3d::serial_debug;
     use leandros_lib::mmio::{MmioRd, MmioWr};
-    use mm::kva::{ioremap, CacheMode};
+    use crate::kenv::v3d::mm::kva::{ioremap, CacheMode};
+    use crate::kenv::v3d::{mm, sched};
     use spin::Mutex;
 
     /// MMIO implementation of [`V3dRegs`] over ioremapped (Device) windows.
@@ -125,7 +126,7 @@ mod hw {
         /// Raw reply words [buffer status, tag code, tag len, v0, v1] or empty on failure.
         fn raw(&mut self, tag: u32, vals: &[u32; 2]) -> alloc::vec::Vec<u32> {
             let msg = [32u32, 0, tag, 8, 0, vals[0], vals[1], 0];
-            match unsafe { crate::rpi_mailbox::property_call(self.hhdm, &msg[..8]) } {
+            match unsafe { crate::kenv::v3d::mbox_property(self.hhdm, &msg[..8]) } {
                 Ok(r) => alloc::vec![r[1], r[4], r[5], r[6]],
                 Err(e) => { serial_debug(&alloc::format!("[v3d] fw mbox err {:?}\n", e)); alloc::vec::Vec::new() }
             }
@@ -139,7 +140,7 @@ mod hw {
             msg[2] = tag;
             msg[3] = (n * 4) as u32;
             msg[5..5 + n].copy_from_slice(&vals[..n]);
-            let r = unsafe { crate::rpi_mailbox::property_call(self.hhdm, &msg[..words]) }.ok()?;
+            let r = unsafe { crate::kenv::v3d::mbox_property(self.hhdm, &msg[..words]) }.ok()?;
             // Tag response bit set by the firmware when it handled the tag.
             if r[4] & 0x8000_0000 == 0 {
                 return None;
@@ -198,8 +199,8 @@ mod hw {
             map(HUB_PHYS, HUB_SIZE),
             map(CORE0_PHYS, CORE0_SIZE),
             map(SMS_PHYS, SMS_SIZE),
-            crate::rpi_pm::base(), // shared PM window (rpi_pm.rs)
-            map(crate::rpi_mailbox::MBOX_BASE_PHYS as u64, 0x40),
+            crate::kenv::v3d::pm_base(), // shared PM window (rpi_pm.rs)
+            map(crate::kenv::v3d::MBOX_BASE_PHYS as u64, 0x40),
         ) {
             (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, c, d, e),
             _ => {
@@ -209,7 +210,7 @@ mod hw {
             }
         };
         // The HHDM does not cover the mailbox registers this late in boot.
-        crate::rpi_mailbox::set_mbox_virt(mbox);
+        crate::kenv::v3d::mbox_set_virt(mbox);
         let mut env = Env { pm, hhdm: hhdm_offset as usize, nogate: cmdline.split_ascii_whitespace().any(|t| t == "v3d.pwr=nogate"), fw_dom: cmdline.split_ascii_whitespace().any(|t| t == "v3d.pwr=fw") };
         let t0 = sched::monotonic_ns();
         let res = power::power_on(MmioRegs { hub, core, sms }, &mut env);
@@ -254,7 +255,7 @@ mod hw {
                     return;
                 }
                 if super::submit::auto_arm_decision(mmu_up, cmdline) {
-                    crate::drm_device_interface::v3d_arm_hw();
+                    crate::kenv::v3d::arm();
                     serial_debug("[v3d] armed: card0+renderD128 report v3d (auto, probe ok)\n");
                 } else {
                     serial_debug(&alloc::format!("[v3d] not armed mmu={} (v3d.arm=0 or MMU down)\n",
