@@ -4789,14 +4789,14 @@ pub fn proc_v3d_headless(dump: bool) -> Option<Vec<u8>> {
 }
 
 /// Phase C (pv3d-cl) seams for `crate::v3d::submit`: the shared fence namespace and V3D VA space.
-pub(crate) fn v3d_fence_signalled(fence: u64) -> bool { v3d_fence_done(fence) }
-pub(crate) fn v3d_alloc_fence_id() -> u64 { V3D_FENCE_NEXT.fetch_add(1, Ordering::Relaxed) }
-pub(crate) fn v3d_kernel_va_alloc(bytes: u64) -> Option<u64> { v3d_va_alloc(bytes) }
-pub(crate) fn v3d_kernel_va_free(va: u64) { v3d_va_free(va) }
+pub fn v3d_fence_signalled(fence: u64) -> bool { v3d_fence_done(fence) }
+pub fn v3d_alloc_fence_id() -> u64 { V3D_FENCE_NEXT.fetch_add(1, Ordering::Relaxed) }
+pub fn v3d_kernel_va_alloc(bytes: u64) -> Option<u64> { v3d_va_alloc(bytes) }
+pub fn v3d_kernel_va_free(va: u64) { v3d_va_free(va) }
 
 /// Real V3D: one reference on a blob BO for the lifetime of a job (`kapi_v3d_bo_hold`).
 /// `> 0` held (object id), `0` a dumb BO (no reference), `-2` not reachable by this open.
-pub(crate) fn v3d_bo_hold(handle: u32, open_id: u32) -> i64 {
+pub fn v3d_bo_hold(handle: u32, open_id: u32) -> i64 {
     let obj = {
         let blobs = BLOB_BUFFERS.lock();
         match blobs.get(&handle) {
@@ -4812,14 +4812,14 @@ pub(crate) fn v3d_bo_hold(handle: u32, open_id: u32) -> i64 {
 }
 
 /// Drop a reference taken by `v3d_bo_hold` (`kapi_v3d_bo_unref`).
-pub(crate) fn v3d_bo_unref(obj: u32) { blob_unref(obj, 0); }
+pub fn v3d_bo_unref(obj: u32) { blob_unref(obj, 0); }
 
 /// Fence a BO by handle (`kapi_v3d_bo_fence`).
-pub(crate) fn v3d_bo_fence(handle: u32, open_id: u32, fence: u64) { bo_attach_fence(handle, open_id, fence); }
+pub fn v3d_bo_fence(handle: u32, open_id: u32, fence: u64) { bo_attach_fence(handle, open_id, fence); }
 
 /// Park the submitter for up to 1 ms of queue room (`kapi_v3d_queue_wait`); true when a signal is
 /// pending and the submit must give up.
-pub(crate) fn v3d_queue_wait(deadline: u64) -> bool {
+pub fn v3d_queue_wait(deadline: u64) -> bool {
     if sched::has_deliverable_signal() { return true; }
     SYNCOBJ_WAITERS.fetch_add(1, Ordering::Relaxed);
     syncobj_park(deadline);

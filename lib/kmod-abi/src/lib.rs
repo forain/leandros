@@ -96,6 +96,7 @@ impl RegKind {
     pub const DMAQ: RegKind = RegKind(16);
     pub const BACKLIGHT: RegKind = RegKind(17);
     pub const HRTIMER: RegKind = RegKind(18);
+    pub const V3D: RegKind = RegKind(19);
 }
 
 /// Device-id table entry (`.kmod.ids`), 16 bytes. PCI: a=vendor, b=device (0xffff = any).

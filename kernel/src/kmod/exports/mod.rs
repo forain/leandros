@@ -39,6 +39,7 @@ mod plat;
 mod dma40;
 mod rp1;
 mod pi5pins;
+mod v3d;
 
 pub use pci::*;
 pub use usbfn::{usb_class_teardown, usb_class_reopened};
@@ -55,6 +56,7 @@ pub use plat::*;
 pub use dma40::*;
 pub use rp1::*;
 pub use pi5pins::*;
+pub use v3d::*;
 pub use v4l2::*;
 pub use usbfn::*;
 pub use hci::*;
@@ -196,6 +198,21 @@ const _: kmod_abi::plat::sys_dma40::Dma40PeriodsFn = kapi_dma40_periods;
 const _: kmod_abi::plat::sys_dma40::Dma40PollFn = kapi_dma40_poll;
 const _: kmod_abi::plat::sys_dma40::Dma40PolledFn = kapi_dma40_polled;
 const _: kmod_abi::plat::sys_dma40::HdmiSinkInfoFn = kapi_hdmi_sink_info;
+const _: kmod_abi::plat::sys_v3d::BoHoldFn = kapi_v3d_bo_hold;
+const _: kmod_abi::plat::sys_v3d::BoUnrefFn = kapi_v3d_bo_unref;
+const _: kmod_abi::plat::sys_v3d::BoFenceFn = kapi_v3d_bo_fence;
+const _: kmod_abi::plat::sys_v3d::QueueWaitFn = kapi_v3d_queue_wait;
+const _: kmod_abi::plat::sys_v3d::FenceAllocFn = kapi_v3d_fence_alloc;
+const _: kmod_abi::plat::sys_v3d::FenceDoneFn = kapi_v3d_fence_done;
+const _: kmod_abi::plat::sys_v3d::FenceRetireFn = kapi_v3d_fence_retire;
+const _: kmod_abi::plat::sys_v3d::VaAllocFn = kapi_v3d_va_alloc;
+const _: kmod_abi::plat::sys_v3d::VaFreeFn = kapi_v3d_va_free;
+const _: kmod_abi::plat::sys_v3d::RegisterFn = kapi_v3d_register;
+const _: kmod_abi::plat::sys_v3d::ArmFn = kapi_v3d_arm;
+const _: kmod_abi::plat::sys_v3d::MboxPropertyFn = kapi_mbox_property;
+const _: kmod_abi::plat::sys_v3d::PmBaseFn = kapi_pm_base;
+const _: kmod_abi::plat::sys_v3d::IrqRequestSpiFn = kapi_irq_request_spi;
+const _: kmod_abi::plat::sys_v3d::IrqLineStateFn = kapi_irq_line_state;
 const _: kmod_abi::plat::sys_plat::Rp1IrqRequestFn = kapi_rp1_irq_request;
 const _: kmod_abi::plat::sys_plat::Rp1IrqFreeFn = kapi_rp1_irq_free;
 const _: () = {
@@ -205,7 +222,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 152;
+pub const NEXPORTS: usize = 167;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -358,6 +375,21 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_dma40_periods", kapi_dma40_periods),
     sym!("kapi_dma40_poll", kapi_dma40_poll),
     sym!("kapi_dma40_polled", kapi_dma40_polled),
+    sym!("kapi_v3d_bo_hold", kapi_v3d_bo_hold),
+    sym!("kapi_v3d_bo_unref", kapi_v3d_bo_unref),
+    sym!("kapi_v3d_bo_fence", kapi_v3d_bo_fence),
+    sym!("kapi_v3d_queue_wait", kapi_v3d_queue_wait),
+    sym!("kapi_v3d_fence_alloc", kapi_v3d_fence_alloc),
+    sym!("kapi_v3d_fence_done", kapi_v3d_fence_done),
+    sym!("kapi_v3d_fence_retire", kapi_v3d_fence_retire),
+    sym!("kapi_v3d_va_alloc", kapi_v3d_va_alloc),
+    sym!("kapi_v3d_va_free", kapi_v3d_va_free),
+    sym!("kapi_v3d_register", kapi_v3d_register),
+    sym!("kapi_v3d_arm", kapi_v3d_arm),
+    sym!("kapi_mbox_property", kapi_mbox_property),
+    sym!("kapi_pm_base", kapi_pm_base),
+    sym!("kapi_irq_request_spi", kapi_irq_request_spi),
+    sym!("kapi_irq_line_state", kapi_irq_line_state),
     sym!("kapi_hdmi_sink_info", kapi_hdmi_sink_info),
     sym!("kapi_rp1_irq_request", kapi_rp1_irq_request),
     sym!("kapi_rp1_irq_free", kapi_rp1_irq_free),

@@ -73,6 +73,18 @@ pub fn fw_tag(tag: u32, vals: &[u32]) -> Option<[u32; fw::VAL_WORDS]> {
     fw::parse(r)
 }
 
+/// Raw property call for `kapi_mbox_property`: serialised against `fw_tag`, reply copied out
+/// under the lock. Err(-19): mailbox not up yet; Err(-22): oversize; Err(-5): firmware/timeout.
+pub fn fw_raw(words: &[u32], out: &mut [u32]) -> Result<usize, i32> {
+    if !MBOX_READY.load(Ordering::Acquire) { return Err(-19); }
+    let _g = FW_LOCK.lock();
+    match unsafe { crate::rpi_mailbox::property_call(HHDM.load(Ordering::Relaxed), words) } {
+        Ok(r) => { let n = r.len().min(out.len()); out[..n].copy_from_slice(&r[..n]); Ok(n) }
+        Err(crate::rpi_mailbox::MboxError::TooLong) => Err(-22),
+        Err(_) => Err(-5),
+    }
+}
+
 static TRIAL_BOOT: AtomicBool = AtomicBool::new(false);
 static TRIAL_CLEARED: AtomicBool = AtomicBool::new(false);
 
