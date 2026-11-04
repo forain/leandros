@@ -4634,6 +4634,17 @@ fn v3d_va_alloc(bytes: u64) -> Option<u64> {
     Some(cursor)
 }
 
+/// Diagnostic: report the first few CREATE_BO failures (why, size) on the serial console.
+fn v3d_bo_fail(why: &str, bytes: u64) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    crate::pci::serial_debug("[V3D] CREATE_BO failed: ");
+    crate::pci::serial_debug(why);
+    crate::pci::serial_debug(" bytes=");
+    crate::pci::serial_debug_hex_64(bytes);
+    crate::pci::serial_debug("\n");
+}
+
 /// Release a reservation previously returned by `v3d_va_alloc`.
 fn v3d_va_free(va: u64) {
     if va == 0 { return; }
@@ -10778,7 +10789,10 @@ impl DrmDeviceInterface {
         let order = pages.next_power_of_two().trailing_zeros() as usize;
         let alloc_bytes = ((1usize << order) * 4096) as u64;
 
-        let phys = mm::buddy::alloc(order).ok_or(DriverError::Io)?;
+        let phys = match mm::buddy::alloc(order) {
+            Some(p) => p,
+            None => { v3d_bo_fail("buddy", alloc_bytes); return Err(DriverError::Io); }
+        };
         // Zeroed, like every other BO this driver hands out. A GPU BO whose
         // contents are whatever the buddy allocator last had there is an
         // information leak across processes, and the one class of bug that
@@ -10789,6 +10803,7 @@ impl DrmDeviceInterface {
             Some(v) => v,
             None => {
                 mm::buddy::free(phys, order);
+                v3d_bo_fail("va", alloc_bytes);
                 return Err(DriverError::Io);
             }
         };
@@ -10798,6 +10813,7 @@ impl DrmDeviceInterface {
         if let Some(v) = crate::v3d_class::registered() {
             // 0 mapped, 1 driver inactive (leave the path as it was), < 0 failed.
             if (v.map_bo)(va, phys as u64, alloc_bytes as u64) < 0 {
+                v3d_bo_fail("map_bo", alloc_bytes);
                 v3d_va_free(va);
                 mm::buddy::free(phys, order);
                 return Err(DriverError::Io);
