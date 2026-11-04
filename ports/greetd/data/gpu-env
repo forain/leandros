@@ -251,6 +251,38 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
         unset _gpu_ikms _gpu_iicd _gpu_iwgl
     fi
 
+    # -- v3d (Raspberry Pi 5, Mesa v3dv/v3d) ----------------------------------
+    # GL is native v3d; clients use wgpu on Vulkan (v3dv), because wgpu's GLES
+    # backend cannot run on v3d (0 vertex SSBOs).
+    if [ -z "$LEANDROS_RENDERER_PATH" ] && [ "$GPU_DRM_NAME" = v3d ] \
+       && { [ "$_gpu_want" = auto ] || [ "$_gpu_want" = v3d ]; }; then
+        _gpu_icd=
+        for _gpu_f in /usr/share/vulkan/icd.d/broadcom_icd.*.json; do
+            [ -r "$_gpu_f" ] && _gpu_icd=$_gpu_f
+        done
+        unset _gpu_f
+        if [ -n "$_gpu_icd" ] && [ -r /usr/lib/libvulkan.so.1 ]; then
+            VK_ICD_FILENAMES=$_gpu_icd
+            export VK_ICD_FILENAMES
+            GL_RENDERER=
+            _gpu_out=$(/bin/gpuprobe gl 2>/dev/null)
+            _gpu_rc=$?
+            eval "$_gpu_out"
+            case "$GL_RENDERER" in
+            *llvmpipe*|*softpipe*) _gpu_rc=1 ;;
+            esac
+            if [ "$_gpu_rc" = 0 ]; then
+                LEANDROS_RENDERER_PATH=v3d
+                LEANDROS_GL_RENDERER=$GL_RENDERER
+            else
+                echo "gpu-env: v3d probe failed (rc=$_gpu_rc renderer='$GL_RENDERER')" >&2
+                unset VK_ICD_FILENAMES
+            fi
+        else
+            echo "gpu-env: v3d present but the broadcom ICD manifest or /usr/lib/libvulkan.so.1 is not in the image" >&2
+        fi
+    fi
+
     # -- virgl ----------------------------------------------------------------
     # No override needed: card0 reports `virtio_gpu` whenever virgl was
     # negotiated, and Mesa's loader maps that name to the virgl driver.
@@ -319,7 +351,7 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
         read -r LEANDROS_ICED_BACKEND < /etc/leandros/iced-backend || true
     fi
     case $LEANDROS_RENDERER_PATH in
-    zink)  ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu}; WGPU_BACKEND=vulkan ;;
+    zink|v3d)  ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu}; WGPU_BACKEND=vulkan ;;
     # virgl: wgpu's GLES backend, verified by `gpuprobe gl` (GL_WGPU=1) doing
     # the same robust-then-plain context creation wgpu-hal does. A Mesa
     # without ports/mesa/patches/0001-egl-robust-access-unsupported-is-bad-

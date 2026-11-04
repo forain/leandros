@@ -11,7 +11,7 @@ if [ -r /bin/gpu-env ]; then
     . /bin/gpu-env
 fi
 case "${LEANDROS_RENDERER_PATH:-}" in
-zink|iris|virgl) ;;
+zink|iris|virgl|v3d) ;;
 *)
     if [ "${LEANDROS_FIREFOX_ALLOW_SOFTWARE:-0}" != 1 ]; then
         echo "firefox: no GPU renderer (LEANDROS_RENDERER_PATH=${LEANDROS_RENDERER_PATH:-unset}); refusing to start" >&2
