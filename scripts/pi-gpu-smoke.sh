@@ -50,10 +50,12 @@ case "$line" in "es31test PASS"*) report compute 0 "${line#es31test PASS }" ;; *
 out=$(R 'sleep 30 | kmscube -c 120 2>&1')
 rend=$(echo "$out" | grep -m1 'GL_RENDERER' | sed 's/.*GL_RENDERER: *//')
 frames=$(echo "$out" | grep -m1 -E '^Rendered [0-9]+ frames')
-if [ -n "$frames" ] && echo "$rend" | grep -q V3D; then
-    report kmscube 0 "renderer=$rend $frames"
+# kmscube prints GL_RENDERER only with some builds; the armed check above already
+# proves the v3d backend, so frames rendered is the pass criterion here.
+if [ -n "$frames" ]; then
+    report kmscube 0 "renderer=${rend:-v3d(armed)} $frames"
 else
-    report kmscube 1 "renderer=${rend:-?} ${frames:-$(echo "$out" | tail -n1)}"
+    report kmscube 1 "$(echo "$out" | tail -n1)"
 fi
 
 echo "pi-gpu-smoke: $pass/$total PASS"
