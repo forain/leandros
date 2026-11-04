@@ -333,6 +333,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             drivers::pci::serial_debug(&alloc::format!("[SERROR] pending before the hdmi probe syn=0x{:016x} (an earlier probe)\n", syn));
         }
         drivers::hdmi_probe::probe_boot(crate::boot_cmdline().unwrap_or(""), boot_info.hhdm_offset, arch_aarch64::exception::serror_checkpoint);
+        // BCM2712 HVS read-only probe, opt-in with hvs.probe=1 (no register writes).
+        drivers::hvs_probe::probe_boot(crate::boot_cmdline().unwrap_or(""), arch_aarch64::exception::serror_checkpoint);
     }
     // dma40 engine self-test (64 KiB mem-to-mem copy, one [dma40] line), checkpointed like v3d.
     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))] {
