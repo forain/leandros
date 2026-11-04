@@ -203,7 +203,7 @@ pub use hw::*;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 mod hw {
     use super::*;
-    use crate::irq::{IrqReturn, IrqSource};
+    use crate::kenv::v3d::{IrqReturn, IrqSource};
     use core::cell::UnsafeCell;
     use core::fmt::Write;
     use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -310,12 +310,12 @@ mod hw {
         READY.store(true, Ordering::Release);
         enable(regs, ver);
         let clock = super::super::mmu::CntClock;
-        let hub = match crate::irq::request_irq(IrqSource::Line(HUB_INTID), hub_isr, 0) {
+        let hub = match crate::kenv::v3d::request_irq(IrqSource::Line(HUB_INTID), hub_isr, 0) {
             Ok(h) => { core::mem::forget(h); selftest_line(regs, Block::Hub, HUB_INT_TFUC,
                 &Env { id: HUB_INTID, counter: &HUB_DELIVERED }, &clock, SELFTEST_TIMEOUT_US) }
             Err(_) => LineResult::Busy,
         };
-        let core = match crate::irq::request_irq(IrqSource::Line(CORE_INTID), core_isr, 0) {
+        let core = match crate::kenv::v3d::request_irq(IrqSource::Line(CORE_INTID), core_isr, 0) {
             Ok(h) => { core::mem::forget(h); selftest_line(regs, Block::Core, INT_FRDONE,
                 &Env { id: CORE_INTID, counter: &CORE_DELIVERED }, &clock, SELFTEST_TIMEOUT_US) }
             Err(_) => LineResult::Busy,

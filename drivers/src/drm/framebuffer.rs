@@ -73,9 +73,6 @@ pub struct DrmFramebuffer {
     /// guest pages and no virtio resource: it is presented and destroyed
     /// through the backend.
     pub ext_fb: u32,
-    /// A v3d BO (Raspberry Pi 5): presented by `kms_v3d::present`, which converts the BO's
-    /// tight pitch to the firmware framebuffer's and does the cache maintenance.
-    pub v3d_scanout: bool,
 }
 
 impl DrmFramebuffer {
@@ -110,7 +107,6 @@ impl DrmFramebuffer {
             bo_obj: 0,
             owner: 0,
             ext_fb: 0,
-            v3d_scanout: false,
         }
     }
 
@@ -133,7 +129,6 @@ impl DrmFramebuffer {
             bo_obj: 0,
             owner: 0,
             ext_fb: 0,
-            v3d_scanout: false,
         }
     }
 

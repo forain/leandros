@@ -366,12 +366,6 @@ impl DrmDevice {
     fn perform_software_scaling(&self, state: &DrmPlaneState) -> Result<(), DriverError> {
         let fb_id = state.fb_id.ok_or(DriverError::InvalidParameter)?;
         let drm_fb = self.framebuffers.get(&fb_id).ok_or(DriverError::NotFound)?;
-        #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-        if drm_fb.v3d_scanout {
-            SCANOUT_WRITES.fetch_add(1, Ordering::Relaxed);
-            return crate::kms_v3d::present(drm_fb.physical_addresses[0], drm_fb.width,
-                                           drm_fb.height, drm_fb.pitch);
-        }
 
         let (hw_base, hw_width, hw_height, hw_pitch) = crate::framebuffer::get_hardware_fb_info()
             .ok_or(DriverError::NotFound)?;
@@ -444,12 +438,6 @@ impl DrmDevice {
         if !self.fb_integration { return Ok(()); }
 
         let drm_fb = self.framebuffers.get(&fb_id).ok_or(DriverError::NotFound)?;
-        #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-        if drm_fb.v3d_scanout {
-            SCANOUT_WRITES.fetch_add(1, Ordering::Relaxed);
-            return crate::kms_v3d::present(drm_fb.physical_addresses[0], drm_fb.width,
-                                           drm_fb.height, drm_fb.pitch);
-        }
         let (hw_base, hw_width, hw_height, hw_pitch) =
             crate::framebuffer::get_hardware_fb_info().ok_or(DriverError::NotFound)?;
 
