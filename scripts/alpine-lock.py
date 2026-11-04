@@ -6,7 +6,7 @@
   alpine-lock.py verify  <arch>
   alpine-lock.py check   <arch>     exit 1 when latest-stable or any locked package is newer
 
-ports/alpine/world lists the wanted packages, ports/alpine/held what
+ports/alpine/world lists the wanted packages (ports/alpine/world.<arch> adds per-arch ones), ports/alpine/held what
 leandros-base satisfies itself, ports/alpine/scriptallow the maintainer scripts
 (other than .trigger) that are accepted. refresh resolves them against the
 Alpine APKINDEX (main + community) and writes ports/alpine/<arch>.lock:
@@ -343,12 +343,21 @@ def policy_violations(pkgs):
     return bad
 
 
+def world_for(arch):
+    """Shared world plus the optional per-arch ports/alpine/world.<arch>."""
+    w = read_list(os.path.join(ADIR, "world"))
+    pa = os.path.join(ADIR, "world." + arch)
+    if os.path.exists(pa):
+        w += [n for n in read_list(pa) if n not in w]
+    return w
+
+
 def cmd_refresh(arch, cached, generated):
     global REL
     if not REL:
         old_rel = lock_release(arch)
         REL = old_rel if (PIN and old_rel) else latest_stable(arch)
-    world = read_list(os.path.join(ADIR, "world"))
+    world = world_for(arch)
     held = set(read_list(os.path.join(ADIR, "held")))
     idx = load_index(arch, cached)
     chosen, heldrec = resolve(idx, world, held)

@@ -40,6 +40,8 @@ pkg harfbuzz 13.2.1-r0 main Q1lx2ZwfHbq7wVFRmDPYUIiSzzLhk= 01f7862265ef2256bbadd
 pkg icu-data-en 78.1-r0 main Q1UKJU3SreKbZBDHrr4zMZcr6yst0= 7fc4d3abd06b6e3301c82e9f872e4555d4a41e2abc28087f4286aba01e5dd5a7 post-install
 pkg icu-libs 78.1-r0 main Q1Rr02F/bREvA12AbSTFz46m5Zf1A= ef9a3035f23886cf0da5869902c736a775cf3db151ae1ab7f1406e2a0f84bd64 -
 pkg inih 62-r0 main Q1AMXU0/ouQ0beZoKbOkmhYLyNMbU= 73b68ca06aaeddf4709838fbab3eae888c615fc4bd6bb821379785e2646bd14b -
+pkg intel-gmmlib 22.10.1-r0 community Q1UzPIP2+tAegZVs0W+pxFzhQE+Bc= 6b7d2f7ec0d28216c4f4a8f9a737bf5eb05cb835cf00ddb069344f194db6fe43 -
+pkg intel-media-driver 26.2.1-r0 community Q1+ETYybBFSLJ2rxNTUbdjg9tqTas= af46dd5c13bdbab4e22831a3e5d6be706a9dd1d0f9dbcfa6ac09557ef101f8f4 -
 pkg iso-codes 4.20.1-r0 main Q1KM4rePbBg6erFi+CC8coaIDvGLU= 12cdc1d8b49f20640bd45bd2d76c7b343644f3bb352d3d0ee48b160808471b54 -
 pkg kbd-bkeymaps 2.8.0-r0 main Q13r6BB3hF1ldyeS+pNx8IifECuyE= 3d3e5bee73628f8eb3bf73c06ec1f99728969a3ebfab8e0bd5e8f07e39ef21d2 -
 pkg lame-libs 3.100-r5 main Q1zEPleXcO8hgXJyg8pX+nhzxIQTE= 3f9df27e0451f8e1b32941c70bf73d7f3ec136b1b665921538f638d039a04e25 -
@@ -89,6 +91,7 @@ pkg libtheora 1.2.0-r1 main Q1TiKmMjCXl/a+g44HUcBE2gBkGyc= d3cd6213cbf316656c0d0
 pkg libunistring 1.4.2-r0 main Q19QnIAdBw+OqfdADVCTyIj/H+4C4= 3aa6030e603e34d96192742f327c0509f409c6769ce2e7b1463685dede38d714 -
 pkg libuuid 2.42.3-r1 main Q1jwQe9jetdfOBzAwDTyr7uwMDJk4= 8306e5bb577696c9069fe1dfd9e1dcc39d2d481c6a1b0e707fd03c3e21aa6aa2 -
 pkg libva 2.23.0-r0 main Q1KCyIfyfDpFH6lCtnp1bxfI7pl1Q= 90d7fa9a7a1ac5b9c879a218d0818bfb726b1d32482c6b6c174a01c4337c5bba -
+pkg libva-utils 2.23.0-r0 community Q1Y+Fa5r4vo6AWsahzddVhZeo8M4Y= c936a6b8a5fea06f4b1fd5e8143b7beb663f37386f82855063efe4a8c211979b -
 pkg libvdpau 1.5-r4 main Q1w6C71Z6nWUi2Jvi0duZoIv8dJ+U= 1f200646e6d5fcd757d457d8e13232690fd6facfff9c5ee130b81c87da5f64ac -
 pkg libvorbis 1.3.7-r2 main Q1WJhCIqu4fgL3OkjP953HUoC/QzU= 3a9f459499e52caf84c091ddea59a4da183152ab97cff39980a5703674d40c47 -
 pkg libvpl 2.15.0-r1 community Q1xhv0pU51kqTI9argQ4i2z9hMZnw= ce89c7c73f3615606dd94cde42868d1b4ca1ce6ec7feca8c8102c8e089dce0ba -
@@ -164,6 +167,7 @@ held so:libEGL.so.1 firefox
 held so:libGL.so.1 firefox
 held so:libdrm.so.2 ffmpeg-libavutil
 held so:libdrm.so.2 libva
+held so:libdrm.so.2 libva-utils
 held so:libpixman-1.so.0 cairo
 held so:libpixman-1.so.0 firefox
 held so:libxkbcommon.so.0 gtk+3.0

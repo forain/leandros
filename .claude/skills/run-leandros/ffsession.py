@@ -131,8 +131,8 @@ def put_file(src, dst):
     import base64
     b = base64.b64encode(open(src, "rb").read()).decode()
     sh(f"rm -f {dst}.b64")
-    for i in range(0, len(b), 1000):
-        sh(f"printf '%s' '{b[i:i + 1000]}' >> {dst}.b64")
+    for i in range(0, len(b), 4000):
+        sh(f"printf '%s' '{b[i:i + 4000]}' >> {dst}.b64")
     log(sh(f"base64 -d {dst}.b64 > {dst}; rm -f {dst}.b64; chmod 644 {dst}; wc -c {dst}"))
 
 

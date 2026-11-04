@@ -1,0 +1,6 @@
+# x86_64-only Alpine packages (added to ports/alpine/world by alpine-lock.py).
+# Intel VA-API hardware decode: Firefox's RDD dlopens libva, which loads iHD
+# (firefox.sh sets LIBVA_DRIVER_NAME=iHD when it exists). vainfo for diagnosis.
+intel-media-driver
+intel-gmmlib
+libva-utils
