@@ -257,7 +257,7 @@ mod hw {
                 if super::submit::auto_arm_decision(mmu_up, cmdline) {
                     crate::v3d_class::register_builtin();
                     crate::kenv::v3d::arm();
-                    crate::v3d_scanout::register(cmdline);
+                    crate::v3d_scanout::register(cmdline, serror_check);
                     serial_debug("[v3d] armed: card0+renderD128 report v3d (auto, probe ok)\n");
                 } else {
                     serial_debug(&alloc::format!("[v3d] not armed mmu={} (v3d.arm=0 or MMU down)\n",

@@ -4766,6 +4766,16 @@ pub fn v3d_scanout_ref(handle: u32, open_id: u32) -> Option<V3dScanoutBo> {
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub fn v3d_scanout_unref(obj: u32) { fb_bo_unref(obj); }
 
+/// One more reference on the v3d BO `obj` (from `V3dScanoutBo`), for a scanout engine that keeps
+/// reading it after the framebuffer is gone. Released with `v3d_scanout_unref`. False: not a live BO.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub fn v3d_scanout_ref_obj(obj: u32) -> bool {
+    match BLOB_OBJS.lock().get_mut(&obj) {
+        Some(o) => { o.refs = o.refs.saturating_add(1); true }
+        None => false,
+    }
+}
+
 /// Wait (task context, bounded) for the last job that named BO `obj`. False on timeout.
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub fn v3d_scanout_wait(obj: u32, timeout_ns: u64) -> bool {

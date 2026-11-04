@@ -19,6 +19,8 @@ pub mod selftest_cl;
 extern crate alloc;
 #[path = "../../src/kms_v3d.rs"]
 pub mod kms_v3d;
+#[path = "../../src/hvs_plane.rs"]
+pub mod hvs_plane;
 
 /// Same paths as in the kernel (`crate::v3d::mmu`, ...).
 pub mod v3d {
