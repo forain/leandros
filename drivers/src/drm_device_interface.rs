@@ -2617,6 +2617,11 @@ fn v3d_framebuffer(
     offset: u32,
     modifier: u64,
 ) -> Option<Result<DrmFramebuffer, DriverError>> {
+    // Pi 5: the `pi-scanout` KMS backend (`v3d_scanout`) owns v3d framebuffers; when it
+    // registered nothing (no sink) ADDFB2 of a v3d BO must not look usable.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    { let _ = (handle, open_id, width, height, pitch, offset, modifier); return None; }
+    #[allow(unreachable_code)]
     let b = blob_lookup(handle, open_id)?;
     if b.v3d_va == 0 { return None; }
     if b.phys == 0 || offset != 0 || modifier != 0 || pitch != width * 4
@@ -2626,13 +2631,6 @@ fn v3d_framebuffer(
     }
     let mut fb = DrmFramebuffer::new(width, height, DrmFormat::Xrgb8888, handle, pitch);
     fb.physical_addresses[0] = b.phys as u64;
-    // Pi 5: no virtio-gpu; the present copies into the firmware framebuffer (`kms_v3d`).
-    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-    {
-        fb.v3d_scanout = true;
-        return Some(Ok(fb));
-    }
-    #[allow(unreachable_code)]
     let existing = V3D_SCANOUT_RES.lock().get(&b.obj).copied();
     if let Some(gpu) = &mut crate::virtio_gpu::lock_gpu() {
         let res = match existing {
@@ -4751,6 +4749,45 @@ fn v3d_tick() {
 /// WAIT_BO and SYNCOBJ_WAIT can never disagree about one fence.
 fn v3d_fence_done(fence: u64) -> bool {
     fence == 0 || fence <= SYNCOBJ_FENCE_DONE.load(Ordering::Acquire)
+}
+
+/// A v3d BO pinned for scanout by a KMS backend (`v3d_scanout`).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub struct V3dScanoutBo { pub obj: u32, pub phys: u64, pub size: u64 }
+
+/// Take a framebuffer reference on the v3d BO `handle` names (None: not a v3d BO this open may
+/// reach). The reference keeps the pages alive past GEM_CLOSE until `v3d_scanout_unref`.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub fn v3d_scanout_ref(handle: u32, open_id: u32) -> Option<V3dScanoutBo> {
+    let b = blob_lookup(handle, open_id)?;
+    if b.v3d_va == 0 || b.phys == 0 { return None; }
+    let obj = fb_bo_ref(handle, open_id)?;
+    Some(V3dScanoutBo { obj, phys: b.phys as u64, size: b.size })
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub fn v3d_scanout_unref(obj: u32) { fb_bo_unref(obj); }
+
+/// Wait (task context, bounded) for the last job that named BO `obj`. False on timeout.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub fn v3d_scanout_wait(obj: u32, timeout_ns: u64) -> bool {
+    let fence = BLOB_OBJS.lock().get(&obj).map(|o| o.last_fence).unwrap_or(0);
+    let deadline = sched::monotonic_ns().saturating_add(timeout_ns);
+    loop {
+        if crate::v3d::submit::active() { v3d_real_reap(); }
+        if v3d_fence_done(fence) { return true; }
+        if sched::monotonic_ns() >= deadline { return false; }
+        sched::yield_now("v3d-scanout");
+    }
+}
+
+/// `/proc/v3d_headless` (`dump` false) and `/proc/v3d_headless_fb` (`dump` true); `None` unless
+/// the Pi 5 Headless scanout sink is active.
+pub fn proc_v3d_headless(dump: bool) -> Option<Vec<u8>> {
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+    { return crate::v3d_scanout::proc_headless(dump); }
+    #[allow(unreachable_code)]
+    { let _ = dump; None }
 }
 
 /// Phase C (pv3d-cl) seams for `crate::v3d::submit`: the shared fence namespace and V3D VA space.
