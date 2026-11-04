@@ -78,7 +78,7 @@ The kapi is a table of `extern "C"` functions in [kernel/src/kmod/exports/](../.
 
 - `kmod=0` disables the window and all loading (and the USB module hook). If the initrd's `modules.load` lists modules anyway, the kernel logs an error instead of silently running without drivers.
 - `modules.load=a,b,c` replaces the initrd's `modules.load` list for this boot.
-- `modules.blacklist=a,b` refuses those names, both for the early list and for alias autoload.
+- `modules.blacklist=a,b` refuses those names for the early list and for alias autoload. An explicit `kmodctl load` (finit_module/init_module as root) is still allowed, so a blacklisted driver can be brought up late.
 
 **`modules.alias` and autoload.** `kmod-build.sh` writes `lib/modules/<build-id>/modules.alias` from each module's id table. Line forms (parsed by `kmod_abi::alias`, `*` = any):
 
@@ -128,7 +128,9 @@ Tristate symbols and their module (all default to `y`; slot numbers in [modules/
 | `BT` | `bt` | HCI over USB (Intel), `usb_bt_*` pipes |
 | `SDHCI` | `sdhci` | SD/eMMC host, block kapi, `of:` aliases `brcm,bcm2712-sdhci` and `brcm,bcm2711-emmc2`, in BOOT; fixed 256 GiB capacity (no C_SIZE) |
 
-**Y-only (bool) drivers:** `VIRTIO_GPU`, `V3D`, `R8169`, `I915`, plus the platform pieces (RP1, bcm2712 blocks, PSMOUSE, I2C-HID, ...). Several already have reserved SLOTS entries (i915, virtio_gpu, v3d, r8169) but **no module crate**, so they cannot be set to `m`. The DRM class kapi (`KDrmOps`) is merged; i915 is the intended first user but first needs a `kenv` seam over its direct kernel dependencies. `VIRTIO_GPU` and `V3D` were deliberately kept `bool`.
+**Y-only (bool) drivers:** `VIRTIO_GPU`, `R8169`, `I915`, plus the platform pieces (RP1, bcm2712 blocks, PSMOUSE, I2C-HID, ...). Several already have reserved SLOTS entries (i915, virtio_gpu, r8169) but **no module crate**, so they cannot be set to `m`. The DRM class kapi (`KDrmOps`) is merged; i915 is the intended first user but first needs a `kenv` seam over its direct kernel dependencies. `VIRTIO_GPU` and `V3D` were deliberately kept `bool`.
+
+**`V3D` (tristate, Pi 5 only):** `modules/v3d` includes `drivers/src/v3d/*` (power, MMU, queue, IRQ, selftests, ioctl ops). Core DRM keeps the BO table, VA allocator, PRIME and syncobjs and reaches the driver through the `KV3dOps` table (`drivers/src/v3d_class.rs`); the module registers it with `kapi_v3d_register`, claims `of brcm,2712-v3d`, and gets the SPI, MMIO, mailbox and queue-wait services from `kapi_*` (`kapi_irq_request_spi`, `kapi_irq_line_state`, `kapi_v3d_queue_wait`, `kapi_v3d_bo_hold/_fence`). The scanout sink (`v3d_scanout`) stays in the kernel in all three modes. `=y` links the driver in and registers the same table statically; `=n` leaves the stub path (no `v3d_real`, no `ClQueue` in the kernel). The module is permanently resident (`RegKind::V3D` is busy forever), so `kmodctl unload v3d` refuses; `modules.blacklist=v3d` plus a late `kmodctl load v3d` brings card0 up after boot. Success shows `[v3d] mmu irq mode=irq` (`poll` means the SPI export is wrong) and `/proc/modules` lists `v3d Live`.
 
 **`HDMI_AUDIO` (tristate, Pi 5 only):** `modules/hdmi-audio` includes `drivers/src/hdmi_audio/mod.rs` and reaches the hardware through `kenv::hdmi` (dma40 kapi, `hdmi_sink_info`, `iounmap`, `dma_sync`, `serror_checkpoint`). The built-in `kenv::hdmi` lives in `drivers/src/kenv.rs`. The boot probe (`hdmi_probe`) always stays in the kernel; `drivers::hdmi_plat` holds the OF compatible `leandros,pi5-hdmi-audio`, the built-in claimer and `announce()`. `KHdmiSink` gained a `d0` field (ABI: same size class, export fills it; NEXPORTS unchanged). The module's `PROBE_/PORT_/SINK_` literals are pinned to `hdmi_probe` by const asserts in `kernel/src/kmod/exports/dma40.rs`. The module's init returns -19 when the sink state is NOT_RUN (virt).
 

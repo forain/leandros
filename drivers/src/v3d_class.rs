@@ -5,8 +5,8 @@
 //! `ops()`. With nothing registered (V3D=n, QEMU, failed probe) every call site falls through to
 //! the stub path, so the answers equal the pre-table behaviour.
 //!
-//! The table is `repr(C)` and size-gated so a later `v3d.kmod` can register it through
-//! `kapi_v3d_register`. Today the `=y` build registers the same table statically.
+//! The table is `repr(C)` and size-gated. `V3D=y` registers it statically at probe; `V3D=m`
+//! (`v3d.kmod`) registers the same table through `kapi_v3d_register`; `V3D=n` registers nothing.
 //! Codes: `submit` returns `>= 0` or `-errno` and its `arg` is a KERNEL pointer to a copy of the ioctl struct; `map_bo` 0 mapped, 1 driver inactive (skip), `< 0` failure.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
