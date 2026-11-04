@@ -2,7 +2,7 @@
 """videotest.py <arch> <tag> [--secs 30] [-- extra ffsession.py args]
 
 Local 1080p AV1 playback regression test, run through ffsession.py (no
-Marionette, no network). A looping 12 s AV1 webm is generated with the host
+Marionette, no network). A looping 6 s AV1 webm is generated with the host
 ffmpeg (libsvtav1; cached in $FFSESSION_OUT/hwvideo) and put into the guest
 with a page whose script dump()s one sample per second to Firefox's stdout
 (browser.dom.window.dump.enabled), i.e. /tmp/ff.log:
@@ -29,8 +29,8 @@ W = os.path.join(OUTD, "hwvideo")
 os.makedirs(W, exist_ok=True)
 webm = os.path.join(W, "av1-1080p.webm")
 if not os.path.exists(webm):
-    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=25:duration=12",
-                    "-c:v", "libsvtav1", "-preset", "10", "-crf", "55", "-g", "50", "-pix_fmt", "yuv420p", webm],
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=25:duration=6",
+                    "-c:v", "libsvtav1", "-preset", "10", "-crf", "63", "-g", "50", "-pix_fmt", "yuv420p", webm],
                    check=True)
 page = os.path.join(W, "hwv.html")
 open(page, "w").write("""<html><title>hwv</title><body style="margin:0;background:#000">
