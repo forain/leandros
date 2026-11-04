@@ -101,7 +101,7 @@ pub fn pick_slots(base: usize, step: usize, tries: usize, mut read: impl FnMut(u
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-pub use hw::{console_restore as restore, flip, init, is_live};
+pub use hw::{busy, console_restore as restore, event, flip, init, is_live, queue, wait_idle};
 
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 mod hw {
@@ -115,6 +115,7 @@ mod hw {
     use leandros_lib::mmio::{Mmio, MmioRd};
     use mm::kva::{ioremap, CacheMode};
     use spin::Mutex;
+    use core::sync::atomic::AtomicPtr;
 
     const HVS_PHYS: u64 = 0x10_7c58_0000;
     const HVS_LEN: usize = 0x8000;
@@ -131,6 +132,10 @@ mod hw {
     const SLOT_STEP: usize = 32;
     const LATCH_TIMEOUT_NS: u64 = 100_000_000;
 
+    const FRAME_NS: u64 = 16_666_667;
+    static PENDING: AtomicBool = AtomicBool::new(false);
+    static TIMER: AtomicPtr<sched::hrtimer::HrTimer> = AtomicPtr::new(core::ptr::null_mut());
+    static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     static VA: AtomicUsize = AtomicUsize::new(0);
     static FW_LPTRS: AtomicU32 = AtomicU32::new(0);
     /// Our list is (or may be) on screen; false after `restore`.
@@ -154,6 +159,12 @@ mod hw {
         retire: Vec<(u32, u64)>,
         flips: u64,
         waits: u64,
+        /// Event cookie of the flip in flight (0: none).
+        ev: u32,
+        /// No-pixel commits waiting for a vblank.
+        extra: Vec<u32>,
+        /// When the last latch was seen (0: never).
+        phase_ns: u64,
     }
 
     static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -200,8 +211,10 @@ mod hw {
         FW_LPTRS.store(lp, Ordering::Relaxed);
         *STATE.lock() = Some(State {
             fw, slots, cur: 1, pending: false, cur_obj: 0, issued_ns: 0, frames: 0,
-            last_frcnt: (st >> 16) & 0x3f, retire: Vec::new(), flips: 0, waits: 0,
+            last_frcnt: (st >> 16) & 0x3f, retire: Vec::new(), flips: 0, waits: 0, ev: 0, extra: Vec::new(), phase_ns: 0,
         });
+        let tm = alloc::boxed::Box::into_raw(sched::hrtimer::HrTimer::new(tick, 0, sched::hrtimer::TimerMode::Worker));
+        TIMER.store(tm, Ordering::Release);
         crate::kenv::dma_quiesce_register("hvs-plane", quiesce);
         serial_debug(&format!(
             "[hvs] plane ready {}x{} pitch={} fw ptr={:#x} lptrs={:#x} lact={:#x} slots={},{}\n",
@@ -268,23 +281,118 @@ mod hw {
         serial_debug(&format!("[hvs] plane off, falling back to the copy sink: {}\n", why));
     }
 
-    /// Show the BO window (`obj` pinned by the caller's framebuffer) on channel 0. Returns once the
-    /// list is written; the previous flip is waited for first, so calls are paced to the display.
+    fn complete(ev: u32, frames: u64, now: u64) {
+        if ev != 0 { dri::ext_event_complete(ev, frames as u32, now); }
+    }
+
+    /// The `cur` list is the one on screen: finish the flip in flight (its event and any no-pixel
+    /// events waiting for a vblank).
+    fn latched(s: &mut State, now: u64) {
+        s.pending = false;
+        s.phase_ns = now;
+        poll(s);
+        let ev = core::mem::take(&mut s.ev);
+        complete(ev, s.frames, now);
+        for e in core::mem::take(&mut s.extra) { complete(e, s.frames, now); }
+        PENDING.store(false, Ordering::Release);
+    }
+
+    /// When to look at the HVS next: just before the next frame boundary predicted from the last
+    /// observed latch, then in 250 us steps; 1 ms steps until a boundary has been observed.
+    fn next_check(s: &State, now: u64) -> u64 {
+        if s.phase_ns == 0 { return now + 1_000_000; }
+        let k = now.saturating_sub(s.phase_ns) / FRAME_NS + 1;
+        let t = (s.phase_ns + k * FRAME_NS).saturating_sub(300_000);
+        if t <= now + 50_000 { now + 250_000 } else { t }
+    }
+
+    fn arm(at: u64) {
+        let p = TIMER.load(Ordering::Acquire);
+        if p.is_null() { return; }
+        let t = unsafe { &*p };
+        t.cancel();
+        t.start_at(at, 0);
+    }
+
+    extern "C" fn tick(_ctx: usize) {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+        if DEAD.load(Ordering::Relaxed) { return; }
+        let Some(mut g) = STATE.try_lock() else { arm(sched::monotonic_ns() + 500_000); return };
+        let Some(s) = g.as_mut() else { return };
+        let now = sched::monotonic_ns();
+        if !ACTIVE.load(Ordering::Acquire) {
+            // The firmware list is back (VT switch, restore): nothing is in flight any more.
+            if s.pending || PENDING.load(Ordering::Relaxed) { latched(s, now); }
+            return;
+        }
+        poll(s);
+        if s.pending {
+            if (rd(CH_DL) & 0xfff) as usize == s.slots[s.cur] {
+                latched(s, now);
+            } else if now.wrapping_sub(s.issued_ns) > LATCH_TIMEOUT_NS {
+                let cur = s.slots[s.cur];
+                give_up(&format!("slot {} never became active (lact={:#x})", cur, rd(CH_DL) & 0xfff));
+                latched(s, now);
+                return;
+            } else {
+                arm(next_check(s, now));
+                return;
+            }
+        } else if !s.extra.is_empty() {
+            latched(s, now);
+        }
+        if !s.retire.is_empty() { arm(now + 3 * FRAME_NS); }
+    }
+
+    /// A flip or a no-pixel event is queued and has not completed (lock-free).
+    pub fn busy() -> bool { PENDING.load(Ordering::Acquire) }
+
+    /// Sleep until not `busy` or `timeout_ns` passed.
+    pub fn wait_idle(timeout_ns: u64) -> bool {
+        let t0 = sched::monotonic_ns();
+        while busy() {
+            if sched::monotonic_ns().wrapping_sub(t0) > timeout_ns { return false; }
+            sched::kthread::sleep_ns(500_000);
+        }
+        true
+    }
+
+    /// Complete `ev` at the next vblank without changing the picture.
+    pub fn event(ev: u32) {
+        let mut g = STATE.lock();
+        let Some(s) = g.as_mut() else { complete(ev, 0, sched::monotonic_ns()); return };
+        s.extra.push(ev);
+        PENDING.store(true, Ordering::Release);
+        let now = sched::monotonic_ns();
+        arm(next_check(s, now));
+    }
+
+    /// Show the BO window (`obj` pinned by the caller's framebuffer) on channel 0, blocking form
+    /// (SETCRTC): the picture is queued and the call returns; no event.
     pub fn flip(obj: u32, phys: u64, w: u32, h: u32, pitch: u32) -> Result<(), DriverError> {
+        queue(obj, phys, w, h, pitch, 0)
+    }
+
+    /// Queue the BO window on channel 0 and return at once. `ev` (nonzero) is completed by `tick`
+    /// when the list has latched. Only one flip is in flight: the caller checks `busy` first
+    /// (EBUSY / wait_idle); a flip that still finds one pending waits for its latch.
+    pub fn queue(obj: u32, phys: u64, w: u32, h: u32, pitch: u32, ev: u32) -> Result<(), DriverError> {
         if DEAD.load(Ordering::Relaxed) { return Err(DriverError::NotFound); }
         let mut g = STATE.lock();
         let s = g.as_mut().ok_or(DriverError::NotFound)?;
         if !bo_matches(&s.fw, w, h, phys, pitch) { return Err(DriverError::InvalidParameter); }
-        if !ACTIVE.load(Ordering::Acquire) { s.pending = false; }
+        if !ACTIVE.load(Ordering::Acquire) && s.pending { let n = sched::monotonic_ns(); latched(s, n); }
         poll(s);
         if s.pending {
             let cur = s.slots[s.cur];
             if !wait_latch(s, cur) {
                 give_up(&format!("slot {} never became active (lact={:#x})", cur, rd(CH_DL) & 0xfff));
+                let n = sched::monotonic_ns();
+                latched(s, n);
                 return Err(DriverError::Io);
             }
-            s.pending = false;
-            poll(s);
+            let n = sched::monotonic_ns();
+            latched(s, n);
         }
         if !dri::v3d_scanout_ref_obj(obj) { return Err(DriverError::NotFound); }
         let next = s.cur ^ 1;
@@ -298,20 +406,29 @@ mod hw {
         s.cur = next;
         s.cur_obj = obj;
         s.pending = true;
+        s.ev = ev;
+        PENDING.store(true, Ordering::Release);
         s.issued_ns = sched::monotonic_ns();
         s.flips += 1;
         if s.flips == 1 {
             // Prove the takeover took before trusting it for good.
             if !wait_latch(s, off) {
                 give_up("first list never latched");
+                let n = sched::monotonic_ns();
+                latched(s, n);
                 return Err(DriverError::Io);
             }
-            s.pending = false;
+            let n = sched::monotonic_ns();
+            latched(s, n);
+        } else {
+            let n = s.issued_ns;
+            arm(next_check(s, n));
         }
         if crate::kms_v3d::flip_log_due(s.flips) {
             serial_debug(&format!(
-                "[hvs] flip {} slot={} ptr={:#x} pitch={} lptrs={:#x} lact={:#x} frcnt={} frames={} waits={}\n",
-                s.flips, off, phys, pitch, rd(CH_LPTRS) & 0xfff, rd(CH_DL) & 0xfff, s.last_frcnt, s.frames, s.waits));
+                "[hvs] flip {} slot={} ptr={:#x} pitch={} lptrs={:#x} lact={:#x} frcnt={} frames={} waits={} ticks={}\n",
+                s.flips, off, phys, pitch, rd(CH_LPTRS) & 0xfff, rd(CH_DL) & 0xfff, s.last_frcnt, s.frames, s.waits,
+                TICKS.load(Ordering::Relaxed)));
         }
         Ok(())
     }

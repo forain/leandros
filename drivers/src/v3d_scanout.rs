@@ -121,6 +121,32 @@ fn hvs_never_copy(_src_phys: u64, _w: u32, _h: u32, _pitch: u32) -> Result<(), D
 
 static HVS: Sink = Sink { name: "hvs", mode: fw_mode, present: hvs_never_copy, flip: Some(crate::hvs_plane::flip) };
 
+fn f_queue(token: u32, src_x: u32, src_y: u32, ev: u32) -> Result<(), DriverError> {
+    let (obj, phys, w, h, pitch) = {
+        let g = FBS.lock();
+        let fb = g.get(&token).ok_or(DriverError::NotFound)?;
+        (fb.obj, fb.phys, fb.w, fb.h, fb.pitch)
+    };
+    if src_x >= w || src_y >= h { return Err(DriverError::InvalidParameter); }
+    if !dri::v3d_scanout_wait(obj, 200_000_000) {
+        let n = WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+        if kms_v3d::flip_log_due(n) { log("[kms] pi-scanout: BO job wait timed out, presenting anyway\n"); }
+    }
+    let off = src_y as u64 * pitch as u64 + src_x as u64 * 4;
+    if crate::hvs_plane::queue(obj, phys + off, w - src_x, h - src_y, pitch, ev).is_ok() { return Ok(()); }
+    // Cannot scan out directly: firmware framebuffer back, copy, and finish the event now.
+    crate::hvs_plane::restore();
+    let r = (FWCOPY.present)(phys + off, w - src_x, h - src_y, pitch);
+    if ev != 0 { dri::ext_event_complete(ev, 0, sched::monotonic_ns()); }
+    r
+}
+
+fn f_event(ev: u32) { crate::hvs_plane::event(ev) }
+fn f_busy() -> bool { crate::hvs_plane::busy() }
+fn f_wait(timeout_ns: u64) -> bool { crate::hvs_plane::wait_idle(timeout_ns) }
+
+static HVS_FLIP: gpu_kms::KmsFlip = gpu_kms::KmsFlip { queue: f_queue, event: f_event, busy: f_busy, wait_idle: f_wait };
+
 // ---- The KmsBackend -----------------------------------------------------------------------
 
 const MOD_LINEAR: u64 = 0;
@@ -197,6 +223,7 @@ pub fn register(cmdline: &str, serror_check: fn() -> Option<u64>) {
         return;
     };
     SINK.store(s as *const Sink as *mut Sink, Ordering::Release);
+    if core::ptr::eq(s, &HVS) { gpu_kms::register_flip(&HVS_FLIP); }
     gpu_kms::register(&BACKEND);
     let (w, h, hz) = (s.mode)();
     log(&alloc::format!("[kms] pi-scanout registered sink={} {}x{}@{}\n", s.name, w, h, hz));
