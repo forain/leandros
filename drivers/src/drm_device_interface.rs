@@ -10621,6 +10621,16 @@ impl DrmDeviceInterface {
         } else {
             cmd
         };
+        if out.is_err() {
+            static ERRN: AtomicUsize = AtomicUsize::new(0);
+            if ERRN.fetch_add(1, Ordering::Relaxed) < 24 {
+                crate::pci::serial_debug("[V3D] ioctl failed nr=");
+                crate::pci::serial_debug_hex(cmd & 0xFF);
+                crate::pci::serial_debug(" arg0=");
+                crate::pci::serial_debug_hex(if arg != 0 { uread::<u32>(arg).unwrap_or(0) } else { 0 });
+                crate::pci::serial_debug("\n");
+            }
+        }
         if V3D_FIRST_SEEN.lock().first(key) {
             crate::pci::serial_debug("[V3D] first ");
             if cmd == DRM_IOCTL_V3D_GET_PARAM {
