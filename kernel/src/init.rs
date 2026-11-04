@@ -369,6 +369,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     drivers::platform::set_autoload(crate::kmod::autoload::of_hook);
     // BRCMF=m: the sdio2 `wifi@1` child is not announced by scan_dt; announce it so the alias autoloads brcmf.
     #[cfg(all(target_arch = "aarch64", feature = "rpi5", not(feature = "drv-brcmf")))] { let d = drivers::platform::announce_board("brcm,bcm4329-fmac"); crate::serial_print_str(if d { "[plat] announced brcm,bcm4329-fmac (dt)\n" } else { "[plat] announced brcm,bcm4329-fmac (board)\n" }); }
+    // V3D=m: the node is disabled in the DT and a kexec FDT is synthetic; announce the board compatible so the alias autoloads v3d.
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "mod-v3d"))] { let d = drivers::platform::announce_board("brcm,2712-v3d"); crate::serial_print_str(if d { "[plat] announced brcm,2712-v3d (dt)\n" } else { "[plat] announced brcm,2712-v3d (board)\n" }); }
     { let n = drivers::platform::scan_dt(); let (t, u) = drivers::platform::counts(); crate::serial_print_str(&alloc::format!("[plat] DT compatibles {} announced {} unclaimed {}\n", n, t, u)); }
     }
     crate::kmod::autoload::boot(); // modules.load= / kmod=0
