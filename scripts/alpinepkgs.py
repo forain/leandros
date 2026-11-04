@@ -112,7 +112,7 @@ def musl_apk(arch):
 
 def world_names(arch):
     lock, _, _ = lk.read_lock(arch)
-    return [n for n in lk.read_list(os.path.join(lk.ADIR, "world")) if n in lock]
+    return [n for n in lk.world_for(arch) if n in lock]
 
 
 def materialize(entries, dest):
