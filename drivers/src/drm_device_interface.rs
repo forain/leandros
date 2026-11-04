@@ -4637,7 +4637,7 @@ fn v3d_va_alloc(bytes: u64) -> Option<u64> {
 /// Diagnostic: report the first few CREATE_BO failures (why, size) on the serial console.
 fn v3d_bo_fail(why: &str, bytes: u64) {
     static N: AtomicUsize = AtomicUsize::new(0);
-    if N.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    if N.fetch_add(1, Ordering::Relaxed) >= 24 { return; }
     crate::pci::serial_debug("[V3D] CREATE_BO failed: ");
     crate::pci::serial_debug(why);
     crate::pci::serial_debug(" bytes=");
@@ -10885,13 +10885,19 @@ impl DrmDeviceInterface {
         let flags = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
         if flags != 0 { return Err(DriverError::InvalidParameter); }
 
-        let b = blob_lookup(handle, open_id).ok_or(DriverError::NotFound)?;
+        let b = match blob_lookup(handle, open_id) {
+            Some(b) => b,
+            None => { v3d_bo_fail("mmap-lookup", open_id as u64); return Err(DriverError::NotFound); }
+        };
         // Scoped to v3d BOs even though the registry is shared: a virtgpu blob
         // reached through a v3d ioctl would be a caller confusing two ABIs, and
         // its token is not derived the same way.
-        if b.v3d_va == 0 || b.phys == 0 { return Err(DriverError::NotFound); }
+        if b.v3d_va == 0 || b.phys == 0 { v3d_bo_fail("mmap-nova", b.size); return Err(DriverError::NotFound); }
 
-        let off = crate::drm_offset::offset_for(b.phys as u64, b.size).ok_or(DriverError::Unsupported)?;
+        let off = match crate::drm_offset::offset_for(b.phys as u64, b.size) {
+            Some(o) => o,
+            None => { v3d_bo_fail("mmap-offset", b.size); return Err(DriverError::Unsupported); }
+        };
         unsafe { ((arg as *mut u8).add(8) as *mut u64).write_unaligned(off) };
         Ok(0)
     }
