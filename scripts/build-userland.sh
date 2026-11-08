@@ -153,6 +153,9 @@ if command -v zig >/dev/null 2>&1; then
     # chroottest: openat2, vfork/clone3, PATH_MAX paths, /proc in a chroot (checked against a host kernel).
     echo "[userland] Building chroottest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/chroottest" userland/chroottest/chroottest.c
+    # seccomptest: prctl/seccomp(2) behaviour (lane seccore).
+    echo "[userland] Building seccomptest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/seccomptest" userland/seccomptest/seccomptest.c
     # preadtest: 8 threads pread/pwrite one shared block-device fd (positional VFS ops).
     echo "[userland] Building preadtest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/preadtest" userland/preadtest/preadtest.c -lpthread
