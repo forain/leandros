@@ -4253,6 +4253,8 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
     const PR_SET_SECCOMP: usize = 22;
     const PR_SET_NO_NEW_PRIVS: usize = 38;
     const PR_GET_NO_NEW_PRIVS: usize = 39;
+    const PR_CAPBSET_READ: usize = 23;
+    const PR_CAPBSET_DROP: usize = 24;
     const PR_SET_NAME: usize = 15;
     const PR_GET_NAME: usize = 16;
     const PR_SET_DUMPABLE: usize = 4;
@@ -4330,6 +4332,11 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
             if arg2 != 0 || a3 != 0 || a4 != 0 || a5 != 0 { return -22; }
             sched::no_new_privs() as isize
         }
+        PR_CAPBSET_READ => match sched::caps::caps_of(0) {
+            Some(c) if arg2 <= sched::caps::CAP_LAST as usize => (c[3] >> arg2 & 1) as isize,
+            _ => -22,
+        },
+        PR_CAPBSET_DROP => sched::caps::bset_drop(arg2.min(255) as u32),
         // seccomp is not installable yet (lane seccore S1): report mode 0 and
         // refuse to set, so a prober (Firefox) sees "unsupported" and skips
         // the sandbox instead of installing a filter and crashing.
@@ -8137,10 +8144,8 @@ fn cap_header_words(hdr_ptr: usize) -> Result<(usize, i32), isize> {
     }
 }
 
-/// capget(hdr, data). There are no per-process capability sets: a task whose
-/// euid is 0 holds all of them (CAP_CHOWN..CAP_CHECKPOINT_RESTORE, bits 0..40)
-/// in its effective and permitted sets, any other task holds none — which is
-/// what Linux reports for root and for an ordinary user without file caps.
+/// capget(hdr, data): the target thread's effective / permitted /
+/// inheritable sets (see `sched::caps`).
 fn sys_capget(hdr_ptr: usize, data_ptr: usize) -> isize {
     let (words, pid) = match cap_header_words(hdr_ptr) {
         Ok(v) => v,
@@ -8148,34 +8153,34 @@ fn sys_capget(hdr_ptr: usize, data_ptr: usize) -> isize {
         Err(e) => return e,
     };
     if pid < 0 { return -22; }
-    let euid = if pid == 0 { sched::current_euid() } else {
-        if sched::exists_probe(pid as u32) != 0 { return -3; } // ESRCH
-        sched::euid_of(pid as u32)
-    };
+    if pid != 0 && sched::exists_probe(pid as u32) != 0 { return -3; } // ESRCH
+    let c = match sched::caps::caps_of(pid as u32) { Some(c) => c, None => return -3 };
     if data_ptr == 0 { return 0; }
     if !validate_user_buf(data_ptr, 12 * words) { return -14; }
-    let (lo, hi) = if euid == 0 { (0xFFFF_FFFFu32, 0x1FFu32) } else { (0, 0) };
-    let caps = [lo, lo, 0, hi, hi, 0]; // eff, perm, inh — low word, then high word
-    for (i, v) in caps.iter().take(3 * words).enumerate() {
-        if !ua::write_user::<u32>(data_ptr + 4 * i, *v) { return -14; }
+    let w = |v: u64, hi: bool| if hi { (v >> 32) as u32 } else { v as u32 };
+    // Per word i: eff, perm, inh (struct __user_cap_data_struct[i]).
+    for i in 0..words {
+        for (j, v) in [c[0], c[1], c[2]].iter().enumerate() {
+            if !ua::write_user::<u32>(data_ptr + 4 * (3 * i + j), w(*v, i == 1)) { return -14; }
+        }
     }
     0
 }
 
-/// capset(hdr, data): only the caller's own sets (pid 0 or self, else EPERM).
-/// Root may set anything — nothing is stored, it stays all-powerful while its
-/// euid is 0. Anyone else holds no capabilities, so the only allowed request
-/// is "none": any bit in effective, permitted or inheritable is EPERM.
+/// capset(hdr, data): only the caller's own sets (pid 0 or self, else EPERM);
+/// Linux rules in `sched::caps::set_caps`.
 fn sys_capset(hdr_ptr: usize, data_ptr: usize) -> isize {
     let (words, pid) = match cap_header_words(hdr_ptr) { Ok(v) => v, Err(e) => return e };
     if pid != 0 && pid as u32 != sched::current_tgid() && pid as u32 != current_pid() { return -1; }
     if !validate_user_buf(data_ptr, 12 * words) { return -14; }
-    if sched::current_euid() == 0 { return 0; }
-    for i in 0..3 * words {
-        let v = match ua::read_user::<u32>(data_ptr + 4 * i) { Some(v) => v, None => return -14 };
-        if v != 0 { return -1; } // EPERM
+    let mut v = [[0u32; 2]; 3]; // [eff, prm, inh][word]
+    for i in 0..words {
+        for j in 0..3 {
+            v[j][i] = match ua::read_user::<u32>(data_ptr + 12 * i + 4 * j) { Some(x) => x, None => return -14 };
+        }
     }
-    0
+    let q = |a: [u32; 2]| a[0] as u64 | (a[1] as u64) << 32;
+    sched::caps::set_caps(q(v[0]), q(v[1]), q(v[2]))
 }
 
 /// sys_statx(dirfd, path, flags, mask, statxbuf) — extended stat.
@@ -10389,7 +10394,7 @@ fn sys_getcwd(buf_ptr: usize, size: usize) -> isize {
 /// lies within — closing that hole while still satisfying "cwd is somewhere
 /// under the root".
 fn sys_chroot(path_ptr: usize) -> isize {
-    if sched::current_euid() != 0 { return -1; } // EPERM
+    if !sched::caps::capable(sched::caps::CAP_SYS_CHROOT) { return -1; } // EPERM
     let path = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
 
     // Must exist and be a directory.

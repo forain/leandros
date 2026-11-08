@@ -27,6 +27,7 @@ pub mod wedge;
 pub mod fdkey;
 pub mod playstat;
 pub mod context;
+pub mod caps;
 pub mod cred;
 pub mod futex;
 pub mod robust;
@@ -2989,6 +2990,7 @@ pub fn exec_commit_ids(euid: Option<u32>, egid: Option<u32>, secure: bool) {
             if let Some(u) = euid { t.euid = u; }
             if let Some(g) = egid { t.egid = g; }
             t.suid = t.euid;
+            caps::on_exec(t);
             t.sgid = t.egid;
             t.fsuid = t.euid;
             t.fsgid = t.egid;
@@ -3051,10 +3053,12 @@ pub fn set_current_resuid(ruid: u32, euid: u32, suid: u32) -> bool {
                 if suid != u32::MAX && !allowed(suid) { return false; }
             }
             let before = dump_ids(t);
+            let old_uids = (t.uid, t.euid, t.suid);
             if ruid != u32::MAX { uidcount::moved(t.uid, ruid); t.uid = ruid; }
             if euid != u32::MAX { t.euid = euid; }
             if suid != u32::MAX { t.suid = suid; }
             t.fsuid = t.euid;
+            caps::on_uid_change(t, old_uids);
             before
         }
         None => return false,
@@ -3102,8 +3106,10 @@ pub fn set_current_uid(new_uid: u32) -> bool {
     let before = match rq.find_pid_mut(pid) {
         Some(t) if new_uid == t.uid || new_uid == t.suid => {
             let before = dump_ids(t);
+            let old_uids = (t.uid, t.euid, t.suid);
             t.euid = new_uid;
             t.fsuid = new_uid;
+            caps::on_uid_change(t, old_uids);
             before
         }
         _ => return false,
