@@ -472,6 +472,10 @@ pub struct Task {
     pub caps: [u64; 4],
     /// User namespace (0 = initial); one counted reference.
     pub userns: crate::ns::NsRef,
+    /// Active pid namespace (0 = initial); immutable after creation. One counted reference.
+    pub pidns: crate::ns::NsRef,
+    /// pid_for_children: the namespace this task's children are placed in.
+    pub pidns_child: crate::ns::NsRef,
     pub egid: u32,
     pub suid: u32,
     pub sgid: u32,
@@ -872,6 +876,8 @@ impl Task {
             euid: 0,
             caps: crate::caps::ROOT_CAPS,
             userns: crate::ns::NsRef::INIT,
+            pidns: crate::ns::NsRef::INIT,
+            pidns_child: crate::ns::NsRef::INIT,
             egid: 0,
             suid: 0,
             sgid: 0,
@@ -1302,6 +1308,8 @@ impl Task {
             euid: 0,
             caps: crate::caps::ROOT_CAPS,
             userns: crate::ns::NsRef::INIT,
+            pidns: crate::ns::NsRef::INIT,
+            pidns_child: crate::ns::NsRef::INIT,
             egid: 0,
             suid: 0,
             sgid: 0,

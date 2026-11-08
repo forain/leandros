@@ -61,6 +61,8 @@ pub struct SchedSlot {
     pub weight: AtomicU32,
     pub m_pid: AtomicU32,
     pub m_tgid: AtomicU32,
+    /// Active pid namespace id (fits the padding before `vr`).
+    pub m_pidns: AtomicU32,
     /// EEVDF virtual runtime / deadline (NICE0 tick units, see task.rs).
     pub vr: AtomicU64,
     pub vd: AtomicU64,
@@ -137,7 +139,7 @@ impl SchedSlot {
             state: AtomicU8::new(0), sb_slow: AtomicU8::new(0), on_cpu: AtomicU32::new(0),
             cpu: AtomicU32::new(0), on_rq: AtomicU32::new(0), gen: AtomicU32::new(0),
             q_gen: AtomicU32::new(0), weight: AtomicU32::new(0),
-            m_pid: AtomicU32::new(0), m_tgid: AtomicU32::new(0),
+            m_pid: AtomicU32::new(0), m_tgid: AtomicU32::new(0), m_pidns: AtomicU32::new(0),
             vr: AtomicU64::new(0), vd: AtomicU64::new(0),
             m_ctx: AtomicUsize::new(0), m_kst: AtomicUsize::new(0), m_pt: AtomicUsize::new(0),
             m_as: AtomicUsize::new(0), m_sighint: AtomicUsize::new(0), m_seccomp: AtomicUsize::new(0), m_gs: AtomicU64::new(0),
@@ -431,6 +433,7 @@ pub fn publish(t: &Task) {
     s.m_reply.store(t.reply_port, Ordering::Relaxed);
     s.m_pid.store(t.pid, Ordering::Relaxed);
     s.mm_borrowed.store(t.mm_borrowed, Ordering::Relaxed);
+    s.m_pidns.store(t.pidns.id() as u32, Ordering::Relaxed);
     s.m_tgid.store(t.tgid, Ordering::Release);
 }
 
@@ -462,6 +465,7 @@ pub(crate) struct Dispatch {
     pub reply: u32,
     pub pid: u32,
     pub tgid: u32,
+    pub pidns: u32,
 }
 
 #[inline]
@@ -474,6 +478,7 @@ pub(crate) fn dispatch_values(idx: usize) -> Dispatch {
         sighint: s.m_sighint.load(Ordering::Relaxed), seccomp: s.m_seccomp.load(Ordering::Relaxed), gs: s.m_gs.load(Ordering::Relaxed),
         rseq_addr: s.m_rseq_addr.load(Ordering::Relaxed), rseq_sig: s.m_rseq_sig.load(Ordering::Relaxed),
         reply: s.m_reply.load(Ordering::Relaxed), pid: s.m_pid.load(Ordering::Relaxed), tgid,
+        pidns: s.m_pidns.load(Ordering::Relaxed),
     }
 }
 
