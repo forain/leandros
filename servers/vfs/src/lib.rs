@@ -7511,6 +7511,15 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
                 p = write_lit(buf, p, b" ");
             }
         }
+        if let Some(c) = sched::caps::caps_of(pid) {
+            for (label, v) in [(&b"\nCapInh:\t"[..], c[2]), (&b"\nCapPrm:\t"[..], c[1]),
+                               (&b"\nCapEff:\t"[..], c[0]), (&b"\nCapBnd:\t"[..], c[3])] {
+                p = write_lit(buf, p, label);
+                let mut hex = [b'0'; 16];
+                for i in 0..16 { hex[i] = b"0123456789abcdef"[(v >> (60 - 4 * i) & 15) as usize]; }
+                p = write_lit(buf, p, &hex);
+            }
+        }
         p = write_lit(buf, p, b"\n");
         let kb = |pages: usize| pages as u64 * KB_PER_PAGE;
         let rows: [(&[u8], u64); 11] = [

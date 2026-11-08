@@ -392,6 +392,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         // ── Step 6: gather parent credentials ────────────────────────────────
         let mut rlimits = crate::task::RLIMIT_DEFAULTS;
         let mut affinity = 0u64;
+        let caps = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.caps).unwrap_or(crate::caps::ROOT_CAPS);
         let (heap_start, heap_end, pid, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, cwd, tls_base,
              nice, umask, root, signal_mask, groups, altstack, no_new_privs) = {
             let rq = super::RUN_QUEUE.lock();
@@ -464,6 +465,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.uid           = uid;
         child.gid           = gid;
         child.euid          = euid;
+        child.caps          = caps;
         child.egid          = egid;
         child.suid          = suid;
         child.sgid          = sgid;
@@ -726,6 +728,7 @@ pub fn clone_thread(
         // ── Collect parent credentials and page table ─────────────────────────
         let mut rlimits = crate::task::RLIMIT_DEFAULTS;
         let mut affinity = 0u64;
+        let caps = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.caps).unwrap_or(crate::caps::ROOT_CAPS);
         let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, heap_start, heap_end,
              ctid_phys, ptid_phys, cwd, leader_as, nice, umask, root, signal_mask, groups,
              no_new_privs) = {
@@ -820,6 +823,7 @@ pub fn clone_thread(
         child.affinity   = affinity;
         child.uid        = uid;  child.gid  = gid;
         child.euid       = euid; child.egid = egid;
+        child.caps       = caps;
         child.suid       = suid; child.sgid = sgid;
         child.ngroups    = groups.0; child.groups = groups.1;
         (child.no_new_privs, child.fsuid, child.fsgid, child.dumpable) = no_new_privs;
