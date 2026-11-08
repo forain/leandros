@@ -155,6 +155,9 @@ if command -v zig >/dev/null 2>&1; then
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/chroottest" userland/chroottest/chroottest.c
     echo "[userland] Building captest..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/captest" userland/captest/captest.c
+    # seccomptest: prctl/seccomp(2) behaviour (lane seccore).
+    echo "[userland] Building seccomptest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/seccomptest" userland/seccomptest/seccomptest.c
     # preadtest: 8 threads pread/pwrite one shared block-device fd (positional VFS ops).
     echo "[userland] Building preadtest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/preadtest" userland/preadtest/preadtest.c -lpthread

@@ -531,6 +531,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.exit_signal = opts.exit_signal;
         let mut rq = super::RUN_QUEUE.lock();
         if opts.share_fs { join_fs_group(&mut rq, parent_pid, &mut child); }
+        if let Some(p) = rq.find_pid(parent_pid) { child.seccomp.inherit_from(&p.seccomp); }
         if super::group_exiting_locked(&rq, parent_pid) {
             // Lane exitexec: see `group_exiting_locked`.
             drop(rq);
@@ -873,6 +874,7 @@ pub fn clone_thread(
         child.exit_signal = if flags & CLONE_THREAD == 0 { (flags & 0xff) as u8 } else { 0 };
         let mut rq = super::RUN_QUEUE.lock();
         if flags & CLONE_FS != 0 { join_fs_group(&mut rq, parent_pid, &mut child); }
+        if let Some(p) = rq.find_pid(parent_pid) { child.seccomp.inherit_from(&p.seccomp); }
         if super::group_exiting_locked(&rq, parent_pid) {
             // Lane exitexec: see `group_exiting_locked`.
             drop(rq);

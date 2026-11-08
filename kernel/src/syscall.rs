@@ -732,6 +732,7 @@ mod nr {
     pub const GETITIMER:      usize = 102;
     pub const SIGPENDING:     usize = 136;
     pub const GETRANDOM:      usize = 278;
+    pub const SECCOMP:        usize = 277;
     pub const PRCTL:          usize = 167;
     pub const MADVISE:        usize = 233;
     pub const MSYNC:          usize = 227;
@@ -988,6 +989,7 @@ mod nr {
     pub const GETITIMER:      usize = 36;
     pub const SIGPENDING:     usize = 127;
     pub const GETRANDOM:      usize = 318;
+    pub const SECCOMP:        usize = 317;
     pub const PRCTL:          usize = 157;
     pub const MADVISE:        usize = 28;
     pub const MSYNC:          usize = 26;
@@ -2402,6 +2404,7 @@ fn dispatch_inner(
         #[cfg(not(target_arch = "aarch64"))]
         ALARM        => sys_alarm(a0),
         GETRANDOM    => sys_getrandom(a0, a1, a2),
+        SECCOMP      => sys_seccomp(a0, a1, a2),
         PRCTL        => sys_prctl(a0, a1, a2, a3, a4),
         MADVISE      => sys_madvise(a0, a1, a2),
         MSYNC        => sys_msync(a0, a1, a2),
@@ -4246,6 +4249,8 @@ fn sys_getrandom(buf_ptr: usize, count: usize, flags: usize) -> isize {
 /// PR_SET_NAME (15) / PR_GET_NAME (16): per-thread name (sched::set_comm/comm_of).
 /// All others: return 0 (silently ignore).
 fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+    const PR_GET_SECCOMP: usize = 21;
+    const PR_SET_SECCOMP: usize = 22;
     const PR_SET_NO_NEW_PRIVS: usize = 38;
     const PR_GET_NO_NEW_PRIVS: usize = 39;
     const PR_CAPBSET_READ: usize = 23;
@@ -4332,9 +4337,17 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
             _ => -22,
         },
         PR_CAPBSET_DROP => sched::caps::bset_drop(arg2.min(255) as u32),
+        // seccomp is not installable yet (lane seccore S1): report mode 0 and
+        // refuse to set, so a prober (Firefox) sees "unsupported" and skips
+        // the sandbox instead of installing a filter and crashing.
+        PR_GET_SECCOMP => 0,
+        PR_SET_SECCOMP => -22,
         _ => 0, // silently accept anything else
     }
 }
+
+/// seccomp(2): not implemented until the hook lane; every operation is EINVAL.
+fn sys_seccomp(_op: usize, _flags: usize, _args: usize) -> isize { -22 }
 
 /// Resolution of the clock `sys_clock_gettime` reports, in nanoseconds.
 #[inline]

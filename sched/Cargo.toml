@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 leandros-lib = { path = "../lib" }
 mm = { path = "../mm" }
+seccomp-bpf = { path = "../lib/seccomp-bpf" }
 spin.workspace = true

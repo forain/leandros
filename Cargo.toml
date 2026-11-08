@@ -23,6 +23,7 @@ members = [
     "lib/netctl-abi",
     "lib/bt-host",
     "lib/kmod-abi",
+    "lib/seccomp-bpf",
     "lib/kmod-elf",
     "lib/kmod-rt",
     "modules/hello",
