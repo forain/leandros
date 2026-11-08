@@ -325,6 +325,122 @@ static int t_netns_isolate_reverse(void)
     return 0;
 }
 
+/* ---- nsnet2: netns captured at socket() ---- */
+static int inet_listener(unsigned port, int *fdout)
+{
+    int one = 1, l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (bind(l, (void *)&a, sizeof a) || listen(l, 4)) return -errno;
+    *fdout = l; return 0;
+}
+static int inet_connect_fd(int s, unsigned port)
+{
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    return connect(s, (void *)&a, sizeof a) == 0 ? 0 : -errno;
+}
+static int sockcap_child_inherited(void)
+{
+    /* the fd was created by the parent: parent netns, may reach the host listener */
+    extern int g_cap_sock;
+    CHECK(inet_connect_fd(g_cap_sock, 41011) == 0);
+    int fresh = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(inet_connect_fd(fresh, 41011) == -ENETUNREACH);
+    return 0;
+}
+int g_cap_sock;
+static int t_sock_netns_inherited(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int l; CHECK(inet_listener(41011, &l) == 0);
+    g_cap_sock = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(ns_child_netns(sockcap_child_inherited) == 0);
+    return 0;
+}
+static int t_sock_netns_scm(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int l; CHECK(inet_listener(41012, &l) == 0);
+    int sv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+    if (c == 0) {
+        char b; struct iovec iv = { &b, 1 };
+        char cb[CMSG_SPACE(sizeof(int))];
+        struct msghdr m = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof cb };
+        if (recvmsg(sv[1], &m, 0) != 1) _exit(1);
+        struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+        if (!cm || cm->cmsg_type != SCM_RIGHTS) _exit(2);
+        int fd; memcpy(&fd, CMSG_DATA(cm), sizeof fd);
+        if (inet_connect_fd(fd, 41012) != 0) _exit(3);
+        int fresh = socket(AF_INET, SOCK_STREAM, 0);
+        _exit(inet_connect_fd(fresh, 41012) == -ENETUNREACH ? 0 : 4);
+    }
+    CHECK(c > 0);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    char b = 'x'; struct iovec iv = { &b, 1 };
+    char cb[CMSG_SPACE(sizeof(int))]; memset(cb, 0, sizeof cb);
+    struct msghdr m = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof cb };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+    cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &s, sizeof s);
+    CHECK(sendmsg(sv[0], &m, 0) == 1);
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+static int t_sock_before_unshare(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int l; CHECK(inet_listener(41013, &l) == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        int old = socket(AF_INET, SOCK_STREAM, 0);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) _exit(1);
+        if (inet_connect_fd(old, 41013) != 0) _exit(2);
+        int fresh = socket(AF_INET, SOCK_STREAM, 0);
+        _exit(inet_connect_fd(fresh, 41013) == -ENETUNREACH ? 0 : 3);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+
+/* ---- nsnet2: per-netns port space ---- */
+static int wild_listener(unsigned port, int *fdout)
+{
+    int one = 1, l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (bind(l, (void *)&a, sizeof a)) return -errno;
+    if (listen(l, 4)) return -errno;
+    *fdout = l; return 0;
+}
+static int t_netns_portspace(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int hp; CHECK(wild_listener(41021, &hp) == 0);       /* host holds P */
+    int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
+    pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+    if (c == 0) {
+        int a, b;
+        char ok = wild_listener(41021, &a) == 0 && wild_listener(41022, &b) == 0;
+        write(pfd[1], &ok, 1);
+        char x; read(qfd[0], &x, 1);
+        _exit(0);
+    }
+    CHECK(c > 0);
+    char ok = 0; CHECK(read(pfd[0], &ok, 1) == 1 && ok);  /* child bound P too, and Q */
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(inet_connect_fd(s, 41022) == -ECONNREFUSED);    /* child's listener unreachable */
+    int h2; CHECK(wild_listener(41022, &h2) == 0);        /* and Q is free on the host */
+    write(qfd[1], "x", 1);
+    int st; waitpid(c, &st, 0);
+    return 0;
+}
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -333,6 +449,8 @@ static int run_userns_cases(void)
         { "unshare_threaded_einval", t_unshare_threaded }, { "other_new_einval", t_other_new_einval },
         { "depth_limit_32", t_depth_limit }, { "ns_leak", t_leak }, { "suid_ignored_in_userns", t_suid_ignored },
         { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
+        { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
+        { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();
