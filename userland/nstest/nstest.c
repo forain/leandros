@@ -105,7 +105,7 @@ static pid_t root_sleeper;
 static int host_guards(void)
 {
     CHECK(full_caps());
-    CHECK(geteuid() == 1000);
+    CHECK(geteuid() == 65534);                                /* unmapped: overflow id */
     CHECK(setuid(0) == -1);                                   /* credentials are host ids */
     CHECK(sethostname("nstest", 6) == -1);
     CHECK(mount("none", "/tmp", "tmpfs", 0, "") == -1);
@@ -185,7 +185,7 @@ static int t_leak(void)
     return 0;
 }
 
-static int print_euid(void) { printf("  euid=%d\n", geteuid()); return geteuid() == 1000 ? 0 : 7; }
+static int print_euid(void) { printf("  euid=%d\n", geteuid()); return (geteuid() == 1000 || geteuid() == 65534) ? 0 : 7; }
 static int exec_suid(void)
 {
     execl("/tmp/nstest-suid", "nstest-suid", "--euid", (char *)0);
@@ -217,6 +217,135 @@ static void reap(long r)
     if (r > 0) waitpid((pid_t)r, NULL, 0);
 }
 
+
+/* ---- L2: /proc/<pid>/{uid_map,gid_map,setgroups}, /proc/<pid>/ns/* ---- */
+static int wr(const char *path, const char *txt)
+{
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -errno;
+    ssize_t n = write(fd, txt, strlen(txt));
+    int e = errno;
+    close(fd);
+    return n == (ssize_t)strlen(txt) ? 0 : -e;
+}
+static int rd(const char *path, char *buf, size_t sz)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, sz - 1);
+    close(fd);
+    if (n < 0) return -1;
+    buf[n] = 0;
+    return (int)n;
+}
+static int nslink(const char *path, char *buf, size_t sz)
+{
+    ssize_t n = readlink(path, buf, sz - 1);
+    if (n < 0) return -1;
+    buf[n] = 0;
+    return (int)n;
+}
+
+/* Sync helper: child tells the parent "ready" and waits for "go". */
+static int p2c[2], c2p[2];
+static void child_ready_wait(void) { char c = 'r'; (void)!write(c2p[1], &c, 1); (void)!read(p2c[0], &c, 1); }
+
+static int ff_seq_child(void)
+{
+    char m[64]; char num[64];
+    int uid = 1000, gid = 1000;
+    CHECK(getuid() == 65534 && getgid() == 65534);        /* unmapped: overflow ids */
+    CHECK(wr("/proc/self/gid_map", "1000 1000 1\n") == -EPERM); /* gid_map before deny */
+    CHECK(wr("/proc/self/uid_map", "0 1000 1\n") == -EPERM);    /* non-identity */
+    CHECK(wr("/proc/self/uid_map", "0 0 1\n") == -EPERM);       /* foreign uid */
+    CHECK(wr("/proc/self/setgroups", "deny") == 0);
+    snprintf(num, sizeof num, "%d %d 1", uid, uid);
+    CHECK(wr("/proc/self/uid_map", num) == 0);
+    snprintf(num, sizeof num, "%d %d 1", gid, gid);
+    CHECK(wr("/proc/self/gid_map", num) == 0);
+    CHECK(wr("/proc/self/uid_map", num) == -EPERM);             /* write once */
+    CHECK(wr("/proc/self/gid_map", num) == -EPERM);
+    CHECK(wr("/proc/self/setgroups", "deny") == -EPERM);        /* after gid_map */
+    CHECK(getuid() == 1000 && geteuid() == 1000 && getgid() == 1000 && getegid() == 1000);
+    CHECK(setgroups(0, NULL) == -1 && errno == EPERM);
+    CHECK(rd("/proc/self/setgroups", m, sizeof m) > 0 && !strncmp(m, "deny", 4));
+    CHECK(rd("/proc/self/uid_map", m, sizeof m) > 0 && strstr(m, "1000") && strstr(m, " 1\n"));
+    child_ready_wait();
+    return 0;
+}
+static int t_ff_seq(void)
+{
+    CHECK(drop_to(1000) == 0);
+    CHECK(pipe(p2c) == 0 && pipe(c2p) == 0);
+    pid_t c = syscall(SYS_clone, SIGCHLD | CLONE_NEWUSER, 0, 0, 0, 0);
+    if (c == 0) _exit(ff_seq_child());
+    CHECK(c > 0);
+    char b; (void)!read(c2p[0], &b, 1);
+    char path[64], m[128];
+    snprintf(path, sizeof path, "/proc/%d/uid_map", (int)c);
+    CHECK(rd(path, m, sizeof m) > 0 && strstr(m, "1000       1000          1\n"));
+    snprintf(path, sizeof path, "/proc/%d/gid_map", (int)c);
+    CHECK(rd(path, m, sizeof m) > 0 && strstr(m, "1000       1000          1\n"));
+    CHECK(rd("/proc/self/uid_map", m, sizeof m) > 0 && strstr(m, "4294967295"));
+    CHECK(getuid() == 1000);
+    (void)!write(p2c[1], "g", 1);
+    int st = 0; waitpid(c, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1;
+}
+static int links_child(void)
+{
+    char a[64], b[64];
+    CHECK(nslink("/proc/self/ns/user", a, sizeof a) > 0);
+    CHECK(strncmp(a, "user:[", 6) == 0 && strcmp(a, "user:[4026531837]") != 0);
+    (void)b;
+    return 0;
+}
+static int t_ns_links(void)
+{
+    const char *n[] = { "user", "pid", "net", "ipc", "mnt", "uts", "cgroup" };
+    char p[64], a[64], b[64]; struct stat sb;
+    for (int i = 0; i < 7; i++) {
+        snprintf(p, sizeof p, "/proc/self/ns/%s", n[i]);
+        CHECK(access(p, F_OK) == 0);
+        CHECK(nslink(p, a, sizeof a) > 0 && !strncmp(a, n[i], strlen(n[i])) && a[strlen(n[i])] == ':');
+        CHECK(lstat(p, &sb) == 0 && S_ISLNK(sb.st_mode));
+        CHECK(stat(p, &sb) == 0 && S_ISREG(sb.st_mode));
+    }
+    CHECK(nslink("/proc/self/ns/user", a, sizeof a) > 0 && !strcmp(a, "user:[4026531837]"));
+    CHECK(stat("/proc/self/ns/user", &sb) == 0 && sb.st_ino == 4026531837UL);
+    CHECK(nslink("/proc/self/ns/net", a, sizeof a) > 0 && !strcmp(a, "net:[4026531840]"));
+    /* same ns => same text; sibling in same ns equal, child userns differs */
+    pid_t c = fork();
+    if (c == 0) { int r = nslink("/proc/self/ns/user", b, sizeof b) > 0 && !strcmp(b, "user:[4026531837]"); _exit(r ? 0 : 1); }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(newuser_child(links_child) == 0);
+    return 0;
+}
+static int t_void_root_link(void)
+{
+    char buf[128], path[64];
+    CHECK(pipe(p2c) == 0 && pipe(c2p) == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        if (chroot("/proc") != 0) _exit(2);
+        char r[64]; ssize_t n = readlink("/proc/self/root", r, sizeof r);
+        /* inside the void, our own root reads as "/" */
+        child_ready_wait();
+        _exit(n < 0 ? 3 : 0);
+    }
+    char x; (void)!read(c2p[0], &x, 1);
+    snprintf(path, sizeof path, "/proc/%d/root", (int)c);
+    ssize_t n = readlink(path, buf, sizeof buf - 1);
+    int ok = n > 0;
+    if (ok) { buf[n] = 0; ok = strcmp(buf, "/") != 0; }
+    (void)!write(p2c[1], "g", 1);
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(ok);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) != 2);
+    return 0;
+}
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -224,6 +353,7 @@ static int run_userns_cases(void)
         { "host_root_unaffected", t_host_unaffected }, { "unshare_basic", t_unshare_basic },
         { "unshare_threaded_einval", t_unshare_threaded }, { "other_new_einval", t_other_new_einval },
         { "depth_limit_32", t_depth_limit }, { "ns_leak", t_leak }, { "suid_ignored_in_userns", t_suid_ignored },
+        { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();
