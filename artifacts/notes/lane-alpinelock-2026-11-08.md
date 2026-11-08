@@ -13,4 +13,4 @@ Second finding: box/regress.sh did not ship the generated-<sha>.tar from the Mac
 "generated tar ... missing". regress.sh now rsyncs ~/.cache/leandros/apk/<arch>/generated-*.tar to the box before building.
 
 Evidence: aarch64 build ok; default regress aarch64 overall PASS (0 boots failed); ffsandbox aarch64 --mode off: Firefox
-processes up, test video currentTime advancing (SBV samples 0.02..2.98+). Box x86_64 result: see merge report.
+processes up, test video currentTime advancing (SBV samples 0.02..2.98+). Box x86_64 full regress: 68 suites, 0 bad, overall PASS (776 s wall).
