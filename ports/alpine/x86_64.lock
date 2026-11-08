@@ -3,7 +3,7 @@
 pkg alpine-keys 2.6-r0 main Q12Na4DlPAWad+SRXaeLqWTz/+okA= dd211936d544f4050924ce8aec078d24e7b1b036ae70b30bd07867349587c708 -
 pkg alsa-lib 1.2.15.3-r0 main Q1rwPJIBVSVLxnBPBc41rvUNUZhFc= 052de5639df635a03cfae1d7504ed4ed75c4e2d2cfff59efc116bb847c1f4ac4 -
 pkg aom-libs 3.14.1-r0 main Q1+owZ+EjlRnyn+TuagGVfzNRP3fQ= 075ea8eafeb9cca01aa158e54e3fea962834dc73bbddacceb522bceb5bdbfd35 -
-pkg apk-tools-static 3.0.8-r0 main Q1TCE/mRpC4Bbpa1h1MzU8PnPgVrQ= c8e2c88c13ba12a12269b79a3543e1190ff8c0ab0beb32b58cadfd5881c619e3 -
+pkg apk-tools-static 3.0.9-r0 main Q1znofFzN4t41fk4j271Xv8GrnpA4= 0a1a0682375f66a83b7b903f6e4638ccfe312547d50d336b5f2be9fc391281be -
 pkg at-spi2-core 2.60.5-r0 main Q1J7di2EoKFuQu5fLEUvDDTw21hR8= c9989ba9b2ff44f87a2106ca9560c2e554a56811d0fc2863b22741d576f1d84f -
 pkg at-spi2-core-libs 2.60.5-r0 main Q1gMhUKYmeJ7LyeX0UuK/g+oGUyy0= bcd4846311c8b19ad7e08ffc3cf726ddbe3d36bbc524386bda64758f5c5981a6 -
 pkg avahi-libs 0.9_rc4-r0 main Q1MxdZZH9w8iSaM9INDfEBnaDtjn8= 380d59c58cfce9cb5cf342cf73947749ca77a880f729970e2f508aaa6fc2f713 -
@@ -125,7 +125,7 @@ pkg nghttp2-libs 1.70.0-r0 main Q1Y70xm5rxw9PHMMlrBKiJlkaW82c= f0c4014eb2f10308d
 pkg nspr 4.38.2-r0 main Q13wb4/JHmWkW3GbArgZb0nKITqhw= 0b918a47c9e625f2b7001424dc64d6738e192594c584cecce4ae67d72199c4b0 -
 pkg nss 3.124-r0 main Q1vJybxhWPsYTPkxSCJ95GjjnEO7c= 1df40eb4fccf83653c166bd843e8193eb82a969dedb6d1e7760263d1adc078a8 -
 pkg numactl 2.0.19-r0 main Q1PcAOVrefQ5JrXxK1PMPrntCQZ4Y= 4a78670a16d9ae7377906e2084be7430197d4b4c24877d65712dd1d4597b59db -
-pkg openssh-sftp-server 10.3_p1-r1 main Q1WLJNJreKekCwCwgqrFLCdBrMpeg= bdc87cdb63c3c9cdb9fbdb14f9125a44d2fdb846cb7d7a81a6ae3a7209105937 -
+pkg openssh-sftp-server 10.3_p1-r2 main Q1/9EXDJ54gv8dCIZPNHlm0r73aP4= 2d97de275784c7d85c4e796a4a5992dbc4bb813ba64cb137a8dfaa7131805290 -
 pkg opus 1.6.1-r0 main Q1DHHBO1zyeGJTXduPomH5Yjx6iPI= 8aecfcbe5b02eb8642ebc8703880ac3bbcdbeac537495bd98c5e4269c904f9e0 -
 pkg orc 0.4.41-r0 main Q1SO7Qku4e700NiKYI/K2zJB5reW0= 4a340f33fa4e180a22e6428fb8089e2ef0a14bb07322138f9c2d87b7afa2e995 -
 pkg p11-kit 0.26.2-r0 main Q1LnVzyqXTfa2bTyKUwAVGF6UIN8Q= 134d653aeeb4ada32746fbc3e2a7ae4201f584725de9263e4f32503658f3ddd8 -
@@ -151,7 +151,7 @@ pkg x265-libs 4.1-r0 main Q1bBdKRlA7sjMAMIttZn4xketqAZo= c33429b93d0c7c12beb7963
 pkg xfsprogs 7.0.1-r0 main Q1BQbG9ys84X3FopAXWG06uLyTtf0= acd93aeab5e2c28aca708e03796dd7f12c124cfb8831430b948fb6fb0bb1fa0d -
 pkg xvidcore 1.3.7-r2 community Q1Kdouwbh2Er48RDeOWHxWBW2Rfm0= 12d4497edecb8ae5f82fa149e1e9ecab3b2bb2644dfd3654dbcd3ee8ddd0f81b -
 pkg xz-libs 5.8.4-r0 main Q1hQEGWxhighYwF0xmO0WXRGLCluE= ab362dd515ead04c31a6c302163248da7aa4813e283c971e6dd3f789b453a1d9 -
-pkg zlib 1.3.2-r1 main Q1T1JcjMIE+EuLTKQNs744mVjwVsY= 63aeea03c15a2f9018f81805cfc8aa926bdf5cd68921f22149c2fbb5d0ee9f47 -
+pkg zlib 1.4-r0 main Q14j+c5OMsvdJ78cidhOg7phxCkLw= 7b05bc778b8b25cd880835b40114182bd4d1581717504d0129c810c0a14291cb -
 pkg zstd-libs 1.5.7-r2 main Q1lWnOOpfEEJ6OU93enz4b0nJhNUA= 23c6065b0049b2406441564bcf0032515a43f78e80d76fcb85535a3803ef5d4e -
 held /bin/sh fontconfig
 held /bin/sh gdk-pixbuf

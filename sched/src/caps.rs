@@ -15,11 +15,29 @@ pub const CAP_SETPCAP: u32 = 8;
 pub const CAP_SYS_CHROOT: u32 = 18;
 pub const CAP_LAST: u32 = 40;
 
-/// Does the calling thread hold `cap` in its effective set?
-pub fn capable(cap: u32) -> bool {
+/// Capabilities of the first task inside a fresh user namespace: everything
+/// effective and permitted, nothing inheritable, the bounding set unchanged.
+pub fn userns_root_caps(bnd: u64) -> [u64; 4] { [ALL_CAPS, ALL_CAPS, 0, bnd] }
+
+/// Does the calling thread hold `cap` in its effective set, in ITS user
+/// namespace? In the initial namespace that is host power; in a child one it
+/// is power over that namespace only (see `host_capable`).
+pub fn ns_capable(cap: u32) -> bool {
     cap <= CAP_LAST
         && RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.caps[0] >> cap & 1 != 0).unwrap_or(false)
 }
+
+/// Like `ns_capable` but only true in the initial user namespace: for
+/// operations that act on the host (never convert an euid==0 site to a
+/// namespace-scoped check without a reason).
+pub fn host_capable(cap: u32) -> bool {
+    cap <= CAP_LAST
+        && RUN_QUEUE.lock().find_pid(current_pid())
+            .map(|t| t.userns.id() == 0 && t.caps[0] >> cap & 1 != 0).unwrap_or(false)
+}
+
+/// Historic name of `ns_capable`.
+pub fn capable(cap: u32) -> bool { ns_capable(cap) }
 
 /// [eff, prm, inh, bnd] of `pid` (0 = caller); None when it does not exist.
 pub fn caps_of(pid: u32) -> Option<[u64; 4]> {
