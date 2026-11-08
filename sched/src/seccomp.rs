@@ -10,17 +10,13 @@
 //! `prev` while the owning thread may still be walking it. All writers hold
 //! `RUN_QUEUE`; the only lock-free reader is the owning thread.
 //!
-//! The cBPF checker/interpreter is NOT here: lane bpfcore provides it as
-//! `lib/seccomp-bpf`; `SockFilter` below is the placeholder instruction type.
+//! The cBPF checker/interpreter lives in the pure crate `lib/seccomp-bpf`
+//! (`check_filter`, `run_stack`).
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-/// One classic-BPF instruction (`struct sock_filter`).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SockFilter { pub code: u16, pub jt: u8, pub jf: u8, pub k: u32 }
+pub use seccomp_bpf::{Program, SeccompData, SockFilter};
 
 /// Linux MAX_INSNS_PER_PATH.
 pub const MAX_INSNS_PER_PATH: u32 = 32768;
@@ -31,7 +27,7 @@ pub const MODE_FILTER: u32 = 2;
 
 pub struct FilterNode {
     /// Verified program.
-    pub prog: Box<[SockFilter]>,
+    pub prog: Program,
     /// Older filter (chain = newest -> oldest).
     pub prev: Option<Arc<FilterNode>>,
     /// Sum over the chain of (len + 4); bounded by `MAX_INSNS_PER_PATH`.
@@ -44,7 +40,7 @@ pub struct FilterNode {
 
 impl FilterNode {
     /// New node on top of `prev`; `None` if the per-path budget is exceeded.
-    pub fn push(prog: Box<[SockFilter]>, prev: Option<Arc<FilterNode>>, log: bool)
+    pub fn push(prog: Program, prev: Option<Arc<FilterNode>>, log: bool)
         -> Option<Arc<FilterNode>>
     {
         let (pi, d) = prev.as_ref().map(|p| (p.path_insns, p.depth)).unwrap_or((0, 0));
@@ -125,4 +121,16 @@ impl SeccompSlot {
 
 impl Drop for SeccompSlot {
     fn drop(&mut self) { Self::release(*self.head.get_mut()); }
+}
+
+impl SeccompSlot {
+    /// Run the whole chain (newest -> oldest) for one syscall; the lowest
+    /// precedence verdict wins. `None` when no filter is installed.
+    /// Lock-free: owning thread only.
+    pub fn evaluate(&self, d: &SeccompData) -> Option<u32> {
+        let h = self.head()?;
+        let mut n = Some(h);
+        let it = core::iter::from_fn(|| { let c = n?; n = c.prev.as_deref(); Some(&c.prog) });
+        Some(seccomp_bpf::run_stack(it, d))
+    }
 }
