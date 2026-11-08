@@ -16,7 +16,7 @@ pub const NS_MAX: usize = 256;
 /// Linux `/proc/sys/user/max_user_namespaces` nesting limit.
 pub const MAX_USERNS_LEVEL: u8 = 32;
 /// Clone/unshare flags the namespace layer accepts so far.
-pub const SUPPORTED: usize = 0x1000_0000; // CLONE_NEWUSER
+pub const SUPPORTED: usize = 0x1000_0000 | 0x4000_0000 | 0x0800_0000; // NEWUSER | NEWNET | NEWIPC
 
 const ZERO32: AtomicU32 = AtomicU32::new(0);
 const ZERO16: AtomicU16 = AtomicU16::new(0);
@@ -75,6 +75,47 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
         }
     }
     Err(-28)
+}
+
+/// Create a flat (parentless) namespace id: net or ipc. Errors: ENOSPC (28).
+pub fn new_flat() -> Result<NsRef, isize> {
+    for id in 1..NS_MAX {
+        if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
+            PARENT[id].store(0, Release);
+            LEVEL[id].store(0, Release);
+            return Ok(NsRef(id as NsId));
+        }
+    }
+    Err(-28)
+}
+
+/// Network namespace of `pid` (0 = initial, also when `pid` is unknown).
+pub fn netns_of(pid: u32) -> NsId {
+    crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.netns.id()).unwrap_or(0)
+}
+/// IPC namespace of `pid`.
+pub fn ipcns_of(pid: u32) -> NsId {
+    crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.ipcns.id()).unwrap_or(0)
+}
+
+/// unshare(CLONE_NEWNET / CLONE_NEWIPC) for the calling thread: it moves
+/// into a fresh namespace of that kind. 0 or a negative errno.
+pub fn unshare_flat(net: bool, ipc: bool) -> isize {
+    let nn = if net { match new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let ni = if ipc { match new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let pid = crate::current_pid();
+    let (o1, o2) = {
+        let mut rq = crate::RUN_QUEUE.lock();
+        match rq.find_pid_mut(pid) {
+            Some(t) => (
+                nn.map(|n| core::mem::replace(&mut t.netns, n)),
+                ni.map(|n| core::mem::replace(&mut t.ipcns, n)),
+            ),
+            None => return -3,
+        }
+    };
+    drop((o1, o2));
+    0
 }
 
 /// Nesting depth of a user namespace (0 for the initial one).
