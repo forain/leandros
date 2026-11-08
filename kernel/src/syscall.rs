@@ -10400,7 +10400,13 @@ fn sys_chroot(path_ptr: usize) -> isize {
     if vfs_reply_val(&vfs::handle(&smsg, current_pid())) < 0 { return -2; } // ENOENT
     if vfs::read_stat_mode(stat_buf.as_ptr() as usize) & S_IFMT != S_IFDIR { return -20; } // ENOTDIR
 
-    let new_root = path.ns_bytes();
+    // A procfs directory is never a usable root: the VFS matches /proc files
+    // by suffix, so a root joined as text under /proc would leak
+    // /proc/self/status. Root into the empty read-only void directory instead
+    // (Firefox's chroot("/proc/self/fdinfo") wants a root that holds nothing).
+    let ns = path.ns_bytes();
+    let in_proc = ns == b"/proc" || ns.starts_with(b"/proc/");
+    let new_root: &[u8] = if in_proc { vfs::VOID_ROOT } else { ns };
     // Decide whether the current cwd survives: keep it only if it is at or below
     // the new root, otherwise re-anchor at the root.
     let cwd_under_root = match sched::current_cwd_arc() {
@@ -11071,6 +11077,10 @@ fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
     }
     if out.is_empty() { out.push(b'/'); }
     if out.len() > 1 && out.last() == Some(&b'/') { out.pop(); }
+    // The void root's name is not observable from outside it.
+    if vfs::alias::under(&out, vfs::VOID_ROOT) && root.as_deref() != Some(vfs::VOID_ROOT) {
+        return Err(-2);
+    }
     Ok(out)
 }
 

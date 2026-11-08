@@ -49,6 +49,10 @@
  *   chroot_unix_socket   AF_UNIX bind in the chroot (absolute, and relative
  *                        to the cwd) lands in the jail, under its bind-mounted
  *                        /tmp; the host connects to it there
+ * ff_chroot_helper_{fs,vm}  Firefox's CLONE_FS helper chroots into
+ *                      /proc/self/fdinfo; the parent's root is empty, nothing
+ *                      (incl. /proc/self/status) opens, '..' stays, fds work
+ * procfd_info          /proc/<pid>/fdinfo dir and fdinfo/N (pos, flags, mnt_id)
  * /proc/self/fd/N/ as a directory:
  *   procfd_walk          mkdir, create, lstat, rewrite, unlink and chdir
  *                        through /proc/self/fd/N/<name> of an O_PATH
@@ -68,6 +72,7 @@
  * "chroottest: N passed, M failed, K skipped". Exit status = failures.
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -1118,6 +1123,106 @@ static void f2fs_mount_child(void) {
     if (ok) pass(N);
 }
 
+/* ── Firefox's chroot helper (StartChrootServer) ────────────────────────────
+ * A CLONE_FS helper chroots into /proc/self/fdinfo, chdirs to "/" and exits;
+ * the sandboxed parent is left with a root that holds nothing. The kernel
+ * joins roots onto paths as text, so a procfs root must not stay a /proc
+ * prefix: /proc/self/status would still open. */
+static int ff_helper_fn(void *arg) {
+    (void)arg;
+    if (chroot("/proc/self/fdinfo") != 0) _exit(10 + (errno & 0x3f));
+    if (chdir("/") != 0) _exit(9);
+    _exit(0);
+}
+
+static int ff_sandboxed(int vm, char *why, size_t wl) {
+    int pre = open("/etc/passwd", O_RDONLY);
+    if (pre < 0) { snprintf(why, wl, "no /etc/passwd to pre-open"); return 1; }
+    static char stack[64 * 1024] __attribute__((aligned(16)));
+    int fl = CLONE_FS | SIGCHLD | (vm ? CLONE_VM : 0);
+    pid_t h = clone(ff_helper_fn, stack + sizeof stack, fl, NULL);
+    if (h < 0) { snprintf(why, wl, "clone: %d", errno); return 1; }
+    int st = 0;
+    if (waitpid(h, &st, 0) != h || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        snprintf(why, wl, "helper status 0x%x", st); return 1;
+    }
+    struct stat sb;
+    if (stat("/", &sb) != 0 || !S_ISDIR(sb.st_mode)) { snprintf(why, wl, "stat(/) not a dir"); return 1; }
+    int fd = open("/proc/self/status", O_RDONLY);
+    if (fd >= 0) { snprintf(why, wl, "LEAK: /proc/self/status opens in the void root"); return 1; }
+    if (open("/etc/passwd", O_RDONLY) >= 0) { snprintf(why, wl, "/etc/passwd visible"); return 1; }
+    if (open("/proc/self/fdinfo", O_RDONLY) >= 0) { snprintf(why, wl, "/proc/self/fdinfo visible"); return 1; }
+    DIR *d = opendir("/");
+    if (!d) { snprintf(why, wl, "opendir(/): %d", errno); return 1; }
+    struct dirent *de; int n = 0;
+    while ((de = readdir(d))) if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..")) n++;
+    closedir(d);
+    if (n) { snprintf(why, wl, "root not empty (%d entries)", n); return 1; }
+    char cwd[64];
+    if (chdir("..") != 0 || !getcwd(cwd, sizeof cwd) || strcmp(cwd, "/")) {
+        snprintf(why, wl, "'..' escaped or getcwd=%s", getcwd(cwd, sizeof cwd) ? cwd : "?"); return 1;
+    }
+    char c;
+    if (read(pre, &c, 1) != 1) { snprintf(why, wl, "pre-opened fd unreadable"); return 1; }
+    return 0;
+}
+
+static void ff_chroot_helper(void) {
+    const char *names[2] = { "ff_chroot_helper_fs", "ff_chroot_helper_vm" };
+    if (geteuid() != 0) { skip("ff_chroot_helper", "needs root"); return; }
+    for (int vm = 0; vm < 2; vm++) {
+        int p[2];
+        if (pipe(p) != 0) { fail(names[vm], "pipe"); continue; }
+        pid_t c = fork();
+        if (c == 0) {
+            char why[160] = "";
+            int r = ff_sandboxed(vm, why, sizeof why);
+            if (r) { (void)!write(p[1], why, strlen(why)); }
+            _exit(r);
+        }
+        close(p[1]);
+        char why[160] = ""; ssize_t k = read(p[0], why, sizeof why - 1); if (k > 0) why[k] = 0;
+        close(p[0]);
+        int st = 0; waitpid(c, &st, 0);
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 0) pass(names[vm]);
+        else fail(names[vm], "%s (status 0x%x)", why, st);
+    }
+}
+
+/* /proc/<pid>/fdinfo: directory of fd numbers, pos/flags/mnt_id per fd. */
+static void procfd_info(void) {
+    const char *N = "procfd_info";
+    char path[96], buf[256];
+    char tf[64]; snprintf(tf, sizeof tf, "/tmp/fdinfo.%d", (int)getpid());
+    int fd = open(tf, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { fail(N, "open"); return; }
+    unlink(tf);
+    if (write(fd, "abcdef", 6) != 6) { fail(N, "write"); return; }
+    if (lseek(fd, 0, SEEK_SET) != 0) { fail(N, "lseek"); return; }
+    char c3[3]; if (read(fd, c3, 3) != 3) { fail(N, "read"); return; }
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    int f = open(path, O_RDONLY);
+    if (f < 0) { fail(N, "open %s: %d", path, errno); return; }
+    ssize_t n = read(f, buf, sizeof buf - 1); close(f);
+    if (n <= 0) { fail(N, "empty fdinfo"); return; }
+    buf[n] = 0;
+    if (!strstr(buf, "pos:\t3\n") || !strstr(buf, "flags:\t01") || !strstr(buf, "mnt_id:")) {
+        fail(N, "bad fdinfo: %.80s", buf); return;
+    }
+    struct stat sb;
+    if (stat("/proc/self/fdinfo", &sb) != 0 || !S_ISDIR(sb.st_mode)) { fail(N, "stat dir"); return; }
+    DIR *d = opendir("/proc/self/fdinfo");
+    if (!d) { fail(N, "opendir"); return; }
+    struct dirent *de; int seen = 0;
+    while ((de = readdir(d))) if (atoi(de->d_name) == fd && de->d_name[0] != '.') seen = 1;
+    closedir(d);
+    close(fd);
+    if (!seen) { fail(N, "fd %d not listed", fd); return; }
+    snprintf(path, sizeof path, "/proc/%d/fdinfo", (int)getpid());
+    if (stat(path, &sb) != 0 || !S_ISDIR(sb.st_mode)) { fail(N, "stat %s", path); return; }
+    pass(N);
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "--exit")) return atoi(argv[2]);
     if (argc > 1 && !strcmp(argv[1], "--in-jail")) return in_jail();
@@ -1162,6 +1267,8 @@ int main(int argc, char **argv) {
     procfd_walk();
     procfd_walk_chroot();
     f2fs_mount_child();
+    procfd_info();
+    ff_chroot_helper();
 
 done:
     if (chdir("/") == 0) rm_rf(work);
