@@ -33,19 +33,24 @@ MOZ_ACCELERATED=1
 MOZ_WEBRENDER=1
 export MOZ_ACCELERATED MOZ_WEBRENDER
 
-# The kernel has no seccomp-bpf and no user/pid namespaces, which every
-# Firefox sandbox is built on. Turn each process type's sandbox off rather
-# than let it fail half-way.
-MOZ_DISABLE_CONTENT_SANDBOX=1
-MOZ_DISABLE_GMP_SANDBOX=1
-MOZ_DISABLE_RDD_SANDBOX=1
-MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
-MOZ_DISABLE_UTILITY_SANDBOX=1
-MOZ_DISABLE_GPU_SANDBOX=1
-MOZ_DISABLE_VR_SANDBOX=1
-export MOZ_DISABLE_CONTENT_SANDBOX MOZ_DISABLE_GMP_SANDBOX MOZ_DISABLE_RDD_SANDBOX \
-       MOZ_DISABLE_SOCKET_PROCESS_SANDBOX MOZ_DISABLE_UTILITY_SANDBOX \
-       MOZ_DISABLE_GPU_SANDBOX MOZ_DISABLE_VR_SANDBOX
+# Sandboxes are off by default: until the kernel has seccomp-bpf and user/pid
+# namespaces, each process type's sandbox fails half-way. LEANDROS_FIREFOX_SANDBOX=1
+# turns them all on (and Firefox's own "Sandbox:" logging) to see what happens.
+if [ "${LEANDROS_FIREFOX_SANDBOX:-0}" = 1 ]; then
+    MOZ_SANDBOX_LOGGING=1
+    export MOZ_SANDBOX_LOGGING
+else
+    MOZ_DISABLE_CONTENT_SANDBOX=1
+    MOZ_DISABLE_GMP_SANDBOX=1
+    MOZ_DISABLE_RDD_SANDBOX=1
+    MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
+    MOZ_DISABLE_UTILITY_SANDBOX=1
+    MOZ_DISABLE_GPU_SANDBOX=1
+    MOZ_DISABLE_VR_SANDBOX=1
+    export MOZ_DISABLE_CONTENT_SANDBOX MOZ_DISABLE_GMP_SANDBOX MOZ_DISABLE_RDD_SANDBOX \
+           MOZ_DISABLE_SOCKET_PROCESS_SANDBOX MOZ_DISABLE_UTILITY_SANDBOX \
+           MOZ_DISABLE_GPU_SANDBOX MOZ_DISABLE_VR_SANDBOX
+fi
 
 # VA-API video decode. iHD only exists on x86_64 Intel images; elsewhere the
 # variable stays unset and VA-API init fails, so decode stays in software.
