@@ -62,7 +62,7 @@ pub mod cpuq;
 pub use percpu::{SchedStatsLine, wake_up_an_idle_cpu_sync, flush_sync_kick};
 
 pub use clone::{fork_current, fork_current_with, ForkOpts, clone_thread};
-pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec, fault_signal};
+pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec, fault_signal, force_sigsys_seccomp};
 pub use futex::{futex_wait, futex_wake, futex_requeue, futex_wait_keyed, futex_wait_intr, FUTEX_INTERRUPTED, futex_wake_keyed, futex_requeue_keyed};
 pub use futex::{futex_wait_intr_realtime, futex_has_waiters, task_exists as futex_task_exists, futex_wait_pi, futex_unlock_pi, FUTEX_HANDOFF, futex_key, FutexKey};
 pub use task::{SigInfo, SI_USER, SI_KERNEL, SI_TIMER, SI_TKILL, CLD_EXITED, CLD_KILLED, CLD_DUMPED,

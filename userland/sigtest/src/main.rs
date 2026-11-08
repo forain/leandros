@@ -296,6 +296,8 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     }
 
     if !test_sigaction_struct_roundtrip() { failures += 1; }
+    if !test_handler_edits_saved_regs() { failures += 1; }
+    if !test_sigsys_siginfo_signo() { failures += 1; }
     if !test_signal_delivery_and_return() { failures += 1; }
     if !test_handler_preserves_vector_regs() { failures += 1; }
     if !test_two_signals_distinct_handlers() { failures += 1; }
@@ -686,6 +688,59 @@ impl Recorder {
         self.n.fetch_add(1, Ordering::SeqCst);
     }
     fn fired(&self) -> bool { self.n.load(Ordering::SeqCst) > 0 }
+}
+
+// ── sigreturn restores the handler-edited register set ─────────────────────
+//
+// The Chromium/Firefox seccomp `Trap::SigSysAction` handler writes the
+// emulated syscall result into the saved return register (and may touch
+// others) of the ucontext; rt_sigreturn must hand exactly that back to user
+// mode, with no syscall-restart logic overriding it.
+
+const EDIT_RET: u64 = 0x5eed_0000_0000_0001;
+const EDIT_CALLEE: u64 = 0x5eed_0000_0000_0002;
+
+extern "C" fn edit_regs_handler(_sig: c_int, _info: *const siginfo_t, uc: *mut c_void) {
+    unsafe {
+        // aarch64: uc_mcontext.regs at ucontext+176; x86_64: gregs at +40.
+        let g = (uc as *mut u8).add(
+            if cfg!(target_arch = "aarch64") { 176 } else { 40 }) as *mut u64;
+        #[cfg(target_arch = "aarch64")]
+        { *g.add(0) = EDIT_RET; *g.add(20) = EDIT_CALLEE; }
+        // x86_64 gregs: REG_R12 = 4, REG_RAX = 13.
+        #[cfg(target_arch = "x86_64")]
+        { *g.add(13) = EDIT_RET; *g.add(4) = EDIT_CALLEE; }
+    }
+}
+
+unsafe fn test_handler_edits_saved_regs() -> bool {
+    let name = b"handler_edits_saved_regs\0";
+    if !install_siginfo(SIGUSR1, edit_regs_handler) { return report(name, false); }
+    let me = getpid() as u64;
+    let ret: u64;
+    let callee: u64;
+    // kill(me, SIGUSR1): the signal is delivered on the way back to user mode.
+    #[cfg(target_arch = "aarch64")]
+    core::arch::asm!("svc 0", in("x8") 129u64, inout("x0") me => ret, in("x1") SIGUSR1 as u64,
+        inout("x20") 0x1111u64 => callee, options(nostack));
+    #[cfg(target_arch = "x86_64")]
+    core::arch::asm!("syscall", inout("rax") 62u64 => ret, in("rdi") me, in("rsi") SIGUSR1 as u64,
+        inout("r12") 0x1111u64 => callee, out("rcx") _, out("r11") _, options(nostack));
+    report(name, ret == EDIT_RET && callee == EDIT_CALLEE)
+}
+
+// ── SIGSYS siginfo: si_signo is 31 on both architectures ────────────────────
+
+static SYS_SIGNO: AtomicI32 = AtomicI32::new(0);
+extern "C" fn sigsys_handler(_sig: c_int, info: *const siginfo_t, _uc: *mut c_void) {
+    unsafe { SYS_SIGNO.store((*info).si_signo, Ordering::SeqCst); }
+}
+
+unsafe fn test_sigsys_siginfo_signo() -> bool {
+    let name = b"sigsys_siginfo_signo\0";
+    if !install_siginfo(31, sigsys_handler) { return report(name, false); }
+    if raise(31) != 0 { return report(name, false); }
+    report(name, wait_until(|| SYS_SIGNO.load(Ordering::SeqCst) == 31))
 }
 
 // ── 7. si_code distinguishes kill(2) from raise() ───────────────────────────
