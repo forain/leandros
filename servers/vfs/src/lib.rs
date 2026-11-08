@@ -7264,7 +7264,8 @@ fn proc_stat_kind(path: &[u8]) -> Option<Option<(bool, u32, &[u8])>> {
 /// What `/proc/<pid>` (and `/proc/<pid>/task/<tid>`) directories list.
 fn proc_dir_entry(i: usize, with_task: bool) -> Option<(&'static [u8], u8)> {
     if i < PROC_PID_FILES.len() { return Some((PROC_PID_FILES[i], 8)); }
-    if with_task && i == PROC_PID_FILES.len() { return Some((b"task", 4)); }
+    if i == PROC_PID_FILES.len() { return Some((b"ns", 4)); }
+    if with_task && i == PROC_PID_FILES.len() + 1 { return Some((b"task", 4)); }
     None
 }
 
@@ -7289,6 +7290,46 @@ fn gen_proc_args(pid: u32, environ: bool) -> Option<VnodeKind> {
 }
 
 const PROC_COMM_W: &[u8] = b"/tmp/.proc_comm_";
+const PROC_NSMAP_W: &[u8] = b"/tmp/.proc_nsmap_";
+
+/// `/proc/<pid|self>/{uid_map,gid_map,setgroups}` → (thread group, 0|1|2).
+fn proc_nsmap_target(path: &[u8], caller: u32) -> Option<(u32, usize)> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let (who, name) = (&rest[..slash], &rest[slash + 1..]);
+    let kind = match name { b"uid_map" => 0, b"gid_map" => 1, b"setgroups" => 2, _ => return None };
+    let pid = if who == b"self" { sched::tgid_of(caller) } else { sched::tgid_of(proc_parse_num(who)?) };
+    Some((pid, kind))
+}
+
+/// A writable snapshot of a namespace map file; the fake path carries
+/// `<kind><tgid>` so `handle_write` can route the bytes to `sched::ns`.
+fn gen_proc_nsmap_writable(tgid: u32, kind: usize) -> Option<VnodeKind> {
+    let mut fake = [0u8; 40];
+    fake[..PROC_NSMAP_W.len()].copy_from_slice(PROC_NSMAP_W);
+    let mut n = PROC_NSMAP_W.len();
+    fake[n] = b'0' + kind as u8; n += 1;
+    let mut d = [0u8; 10]; let mut k = 0; let mut v = tgid;
+    loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+    while k > 0 { k -= 1; fake[n] = d[k]; n += 1; }
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, &fake[..n]);
+    if !tmp_fill_kernel(&mut tmp, idx, b"") { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
+
+/// `/proc/<pid|self>/ns/<name>`: `None` not such a path; `Some(None)` no such
+/// namespace link; `Some(Some((pid, kind)))` the link's process and kind.
+fn proc_ns_file(path: &[u8], caller: u32) -> Option<Option<(u32, usize)>> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let (who, tail) = (&rest[..slash], &rest[slash + 1..]);
+    let name = tail.strip_prefix(b"ns/")?;
+    let pid = if who == b"self" { sched::tgid_of(caller) } else { proc_parse_num(who)? };
+    Some(sched::ns::NS_NAMES.iter().position(|n| *n == name).map(|k| (pid, k)))
+}
 
 /// A writable snapshot of `/proc/<tid>/comm`; the fake path carries the tid so
 /// `handle_write` can route the bytes to `sched::set_comm`.
@@ -7315,6 +7356,15 @@ fn gen_proc_comm_writable(tid: u32) -> Option<VnodeKind> {
 /// Generate dynamic content for a /proc/self/<name> path.
 /// Allocates a TmpFile slot, writes the content, and returns the vnode.
 fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
+    if path.ends_with(b"/uid_map") || path.ends_with(b"/gid_map") || path.ends_with(b"/setgroups") {
+        let ns = sched::ns::userns_of(pid);
+        let mut b = [0u8; 128];
+        let n = if path.ends_with(b"/setgroups") {
+            let t: &[u8] = if sched::ns::setgroups_denied(ns) { b"deny\n" } else { b"allow\n" };
+            b[..t.len()].copy_from_slice(t); t.len()
+        } else { sched::ns::map_text(path.ends_with(b"/gid_map") as usize, ns, &mut b) };
+        return proc_snapshot(b"/tmp/.proc_nsmap", &b[..n], false);
+    }
     if path.ends_with(b"/smaps") || path.ends_with(b"/smaps_rollup") || path.ends_with(b"/maps") {
         let kind = if path.ends_with(b"/smaps_rollup") { MapsKind::Rollup }
             else if path.ends_with(b"/smaps") { MapsKind::Smaps } else { MapsKind::Maps };
@@ -7359,7 +7409,7 @@ const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
                                      b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
-                                   b"smaps_rollup", b"environ"];
+                                   b"smaps_rollup", b"environ", b"uid_map", b"gid_map", b"setgroups"];
 
 /// `/proc/<pid|self>/root` or `/proc/<pid|self>/root/<rest>` → `rest`
 /// (empty for the root itself) when the process is alive. See handle_open.
@@ -8079,6 +8129,23 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // The caller's descriptors, one entry each (see handle_getdents64).
             if flags & 0o3 != 0 { return err_reply(-21); } // EISDIR for write opens
             VnodeKind::RamFile { data: PROC_SELF_FD_DIR, pos: 0, is_dir: true }
+        } else if flags & 0o3 != 0 && proc_nsmap_target(lookup_path, pid).is_some() {
+            // Open /proc/<pid>/{uid_map,gid_map,setgroups} for writing.
+            let (tpid, kind) = proc_nsmap_target(lookup_path, pid).unwrap();
+            if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
+            match gen_proc_nsmap_writable(tpid, kind) {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
+        } else if let Some(r) = proc_ns_file(lookup_path, pid) {
+            // /proc/<pid>/ns/<name> followed: an empty nsfs-like file.
+            let Some((tpid, _)) = r else { return err_reply(-2) };
+            if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
+            if flags & 0o3 != 0 { return err_reply(-13); }
+            match proc_snapshot(b"/tmp/.proc_nsfile", b"", false) {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
         } else if flags & 0o3 != 0 && proc_comm_target(lookup_path, pid).is_some() {
             // Open /proc/<tid>/comm for writing: owner (or root) only.
             let tpid = proc_comm_target(lookup_path, pid).unwrap();
@@ -9029,6 +9096,24 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                     Some(t)
                 } else { None }
             };
+            let nsmap = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                if e.in_use() && e.ephemeral() && e.path().starts_with(PROC_NSMAP_W) {
+                    let p = &e.path()[PROC_NSMAP_W.len()..];
+                    let mut t = 0u32;
+                    for &c in &p[1..] { t = t * 10 + (c.wrapping_sub(b'0')) as u32; }
+                    Some(((p[0] - b'0') as usize, t))
+                } else { None }
+            };
+            if let Some((k, tgid)) = nsmap {
+                let n = count.min(512);
+                let mut data = [0u8; 512];
+                if unsafe { sched::uaccess::copy_raw(data.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let r = if k == 2 { sched::ns::write_setgroups(pid, tgid, &data[..n]) }
+                        else { sched::ns::write_map(pid, tgid, k, &data[..n]) };
+                return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
+            }
             let sc_path = {
                 let tmp = TMP_FILES.lock();
                 let e = &tmp[idx];
@@ -14071,10 +14156,17 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
 
     // /proc/<pid>, /proc/<pid>/<file>, /proc/<pid>/task[/<tid>[/<file>]]:
     // owned by the process's effective ids, as on Linux.
+    if let Some(r) = proc_ns_file(path, sched::current_pid()) {
+        let Some((pid, k)) = r else { return err_reply(-2) };
+        if sched::proc_stat_of(pid).is_none() { return err_reply(-2); }
+        let (u, g) = sched::cred::ids_of(pid).map(|(u, g)| (u[1], g[1])).unwrap_or((0, 0));
+        write_stat_full(stat_ptr, 0o100444, 1, 0, sched::ns::ns_ino(k, sched::ns::ns_id_of(pid, k)), u, g);
+        return ok_reply();
+    }
     if let Some(k) = proc_stat_kind(path) {
         let Some((dir, owner, name)) = k else { return err_reply(-2) };
         let (u, g) = sched::cred::ids_of(owner).map(|(u, g)| (u[1], g[1])).unwrap_or((0, 0));
-        let mode = if dir { 0o040555 } else if name == b"comm" { 0o100644 } else { 0o100444 };
+        let mode = if dir { 0o040555 } else if name == b"comm" || name == b"uid_map" || name == b"gid_map" || name == b"setgroups" { 0o100644 } else { 0o100444 };
         write_stat_full(stat_ptr, mode, if dir { 2 } else { 1 }, 0, path_ino(path, 7), u, g);
         return ok_reply();
     }
