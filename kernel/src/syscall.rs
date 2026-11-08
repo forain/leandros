@@ -1197,6 +1197,17 @@ pub extern "C" fn syscall_dispatch(
     // IF=0 here on x86: answer a pending TLB shootdown now rather than
     // leaving its initiator spinning for the length of this syscall.
     mm::paging::tlb_service_pending();
+    // seccomp: per-CPU pointer + one Acquire load when the thread has no filter.
+    if sched::current_seccomp().is_some() {
+        let ip = if frame_ptr == 0 { 0 } else {
+            let uf = unsafe { &*(frame_ptr as *const sched::context::UserFrame) };
+            #[cfg(target_arch = "x86_64")] { uf.rip }
+            #[cfg(target_arch = "aarch64")] { uf.elr_el1 }
+        };
+        if let Some(r) = sched::seccomp::on_syscall(number, [a0, a1, a2, a3, a4, a5], ip) {
+            return r;
+        }
+    }
     let ret = dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr);
     if number != RT_SIGRETURN && (ret == ERESTARTSYS || ret == ERESTARTNOHAND) {
         // Never reaches user space: the frame gets EINTR, and the signal
@@ -4337,17 +4348,30 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
             _ => -22,
         },
         PR_CAPBSET_DROP => sched::caps::bset_drop(arg2.min(255) as u32),
-        // seccomp is not installable yet (lane seccore S1): report mode 0 and
-        // refuse to set, so a prober (Firefox) sees "unsupported" and skips
-        // the sandbox instead of installing a filter and crashing.
-        PR_GET_SECCOMP => 0,
-        PR_SET_SECCOMP => -22,
+        PR_GET_SECCOMP => sched::seccomp::current_mode() as isize,
+        PR_SET_SECCOMP => match arg2 {
+            1 if a3 == 0 => sched::seccomp::set_mode_strict(),
+            2 => sched::seccomp::set_mode_filter(0, a3),
+            _ => -22,
+        },
         _ => 0, // silently accept anything else
     }
 }
 
-/// seccomp(2): not implemented until the hook lane; every operation is EINVAL.
-fn sys_seccomp(_op: usize, _flags: usize, _args: usize) -> isize { -22 }
+/// seccomp(2): STRICT, FILTER (no TSYNC/NEW_LISTENER yet) and GET_ACTION_AVAIL.
+fn sys_seccomp(op: usize, flags: usize, args: usize) -> isize {
+    match op {
+        0 => if flags == 0 && args == 0 { sched::seccomp::set_mode_strict() } else { -22 },
+        1 => sched::seccomp::set_mode_filter(flags as u32, args),
+        2 => {
+            if flags != 0 || !validate_user_buf(args, 4) { return -22; }
+            let mut a = [0u8; 4];
+            if unsafe { sched::uaccess::copy_from_user(a.as_mut_ptr(), args, 4) } != 0 { return -14; }
+            sched::seccomp::action_avail(u32::from_ne_bytes(a))
+        }
+        _ => -22,
+    }
+}
 
 /// Resolution of the clock `sys_clock_gettime` reports, in nanoseconds.
 #[inline]
