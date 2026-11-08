@@ -734,7 +734,7 @@ pub fn futex_unlock_pi(uaddr: usize, private: bool, tid: u32) -> isize {
         // Step 2: the word names the new owner (or nobody). Only the owner
         // changes the TID bits; lockers only add FUTEX_WAITERS, so retry the
         // cas until it lands. FUTEX_OWNER_DIED goes with the old ownership.
-        let new = match pick { Some((_, p)) => p | WAITERS, None => 0 };
+        let new = match pick { Some((_, p)) => crate::pidns::own_v(p) | WAITERS, None => 0 };
         let mut faulted = false;
         loop {
             let Some(w) = crate::uaccess::load_user_u32(uaddr) else { faulted = true; break };

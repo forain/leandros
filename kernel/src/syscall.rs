@@ -3823,9 +3823,12 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, rusage: usize) -
     } else if pid_i == 0 {
         sched::WaitSel::Pgid(sched::current_pgid())
     } else if pid_i < -1 {
-        sched::WaitSel::Pgid((-(pid_i as i64)) as u32)
+        // Pid numbers are the caller's pid-namespace view; a child is never
+        // the waiter namespace's init, so the values wait returns are
+        // identity (lane nspid).
+        match sched::pidns::from_cur((-(pid_i as i64)) as u32) { Ok(k) => sched::WaitSel::Pgid(k), Err(_) => return -10 }
     } else {
-        sched::WaitSel::Pid(pid_i as u32)
+        match sched::pidns::from_cur(pid_i as u32) { Ok(k) => sched::WaitSel::Pid(k), Err(_) => return -10 }
     };
     let caller_tgid = sched::current_tgid();
 
@@ -3896,8 +3899,8 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
     let mut pidfd_nonblock = false;
     let sel = match idtype {
         0 => sched::WaitSel::Any,
-        1 => sched::WaitSel::Pid(id as u32),
-        2 => sched::WaitSel::Pgid(id as u32),
+        1 => match sched::pidns::from_cur(id as u32) { Ok(k) => sched::WaitSel::Pid(k), Err(_) => return -10 },
+        2 => match sched::pidns::from_cur(id as u32) { Ok(k) => sched::WaitSel::Pgid(k), Err(_) => return -10 },
         3 => {
             // The process the pidfd names; an O_NONBLOCK pidfd makes a wait
             // for a still-running child EAGAIN instead of blocking (Linux).
@@ -5428,10 +5431,13 @@ fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
         // kill(2) is process-directed: route to a thread in the target group
         // that hasn't masked `sig`, not blindly its leader. A thread id names
         // its process, as on Linux.
-        return sched::cred::kill_process(sched::tgid_of(pid_i as u32), sig, info);
+        let k = match sched::pidns::from_cur(pid_i as u32) { Ok(k) => k, Err(e) => return e };
+        return sched::cred::kill_process(sched::tgid_of(k), sig, info);
     }
     if pid_i == -1 { return sched::cred::kill_all_checked(sig, info); }
-    let pgid = if pid_i == 0 { sched::current_pgid() } else { (-(pid_i as i64)) as u32 };
+    let pgid = if pid_i == 0 { sched::current_pgid() } else {
+        match sched::pidns::from_cur((-(pid_i as i64)) as u32) { Ok(k) => k, Err(e) => return e }
+    };
     sched::cred::kill_pgrp_checked(pgid, sig, info)
 }
 
@@ -5453,7 +5459,7 @@ fn sys_getppid() -> isize {
 /// Another thread's only within the caller's group, or for root (Linux
 /// asks ptrace_may_access).
 fn sys_get_robust_list(tid: usize, head_ptr: usize, len_ptr: usize) -> isize {
-    let tid = tid as u32;
+    let Ok(tid) = sched::pidns::from_cur(tid as u32) else { return -3 };
     if tid != 0 && sched::tgid_of(tid) != sched::current_tgid() && sched::current_euid() != 0 {
         return -1; // EPERM
     }
@@ -5682,7 +5688,9 @@ const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 /// ETIMEDOUT at the deadline; a restartable interruption on a signal (musl
 /// retries EINTR itself).
 fn futex_lock_pi(uaddr: usize, private: bool, deadline: Option<u64>, try_only: bool) -> isize {
-    let tid = current_pid() as u32;
+    let ktid = current_pid() as u32;
+    // The tid written to the word is the caller's own view (1 for a pid-ns init).
+    let tid = sched::pidns::self_v(ktid);
     // The word goes through the fault-tolerant uaccess helpers: a bad
     // pointer is EFAULT, not a kernel fault.
     let cas = |old: u32, new: u32| -> Result<bool, isize> {
@@ -5695,13 +5703,14 @@ fn futex_lock_pi(uaddr: usize, private: bool, deadline: Option<u64>, try_only: b
             // Free: take it. Keep FUTEX_WAITERS set while anyone else is
             // queued, so our unlock comes through the kernel and wakes them.
             let mut new = tid | (w & FUTEX_OWNER_DIED);
-            if sched::futex_has_waiters(uaddr, private, tid) { new |= FUTEX_WAITERS; }
+            if sched::futex_has_waiters(uaddr, private, ktid) { new |= FUTEX_WAITERS; }
             match cas(w, new) { Ok(true) => return 0, Ok(false) => {}, Err(e) => return e }
             continue;
         }
         if owner == tid { return -35; } // EDEADLK
         if try_only { return -11; }     // EWOULDBLOCK
-        if !sched::futex_task_exists(owner) { return -3; } // ESRCH
+        let owner_k = match sched::pidns::from_cur(owner) { Ok(k) => k, Err(e) => return e };
+        if !sched::futex_task_exists(owner_k) { return -3; } // ESRCH
         // Held: make the owner's unlock come to the kernel, then park
         // expecting exactly that word. FUTEX_WAITERS goes in BEFORE any
         // timeout verdict: a woken locker that lost the free word to a
@@ -5731,7 +5740,7 @@ fn futex_lock_pi(uaddr: usize, private: bool, deadline: Option<u64>, try_only: b
 /// to the first queued locker, or release it to 0 (FUTEX_OWNER_DIED is
 /// dropped with the ownership). See sched::futex_unlock_pi.
 fn futex_unlock_pi(uaddr: usize, private: bool) -> isize {
-    sched::futex_unlock_pi(uaddr, private, current_pid() as u32)
+    sched::futex_unlock_pi(uaddr, private, sched::pidns::self_v(current_pid() as u32))
 }
 
 fn sys_arch_prctl(code: usize, addr: usize) -> isize {
@@ -7699,7 +7708,8 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
 fn sys_tgkill(tgid: usize, tid: usize, sig: usize) -> isize {
     if sig > 64 { return -22; } // EINVAL
     if (tgid as i32) <= 0 || (tid as i32) <= 0 { return -22; } // EINVAL
-    sched::cred::kill_thread(Some(tgid as u32), tid as u32, sig as u32, tkill_info())
+    let (Ok(tgid), Ok(tid)) = (sched::pidns::from_cur(tgid as u32), sched::pidns::from_cur(tid as u32)) else { return -3 };
+    sched::cred::kill_thread(Some(tgid), tid, sig as u32, tkill_info())
 }
 
 /// sys_tkill(tid, sig) — send a signal to a specific thread (legacy form of
@@ -7707,7 +7717,8 @@ fn sys_tgkill(tgid: usize, tid: usize, sig: usize) -> isize {
 fn sys_tkill(tid: usize, sig: usize) -> isize {
     if sig > 64 { return -22; } // EINVAL
     if (tid as i32) <= 0 { return -22; } // EINVAL
-    sched::cred::kill_thread(None, tid as u32, sig as u32, tkill_info())
+    let Ok(tid) = sched::pidns::from_cur(tid as u32) else { return -3 };
+    sched::cred::kill_thread(None, tid, sig as u32, tkill_info())
 }
 
 /// rt_sigqueueinfo(tgid, sig, info) / rt_tgsigqueueinfo(tgid, tid, sig, info)
@@ -7726,9 +7737,15 @@ fn sys_rt_sigqueueinfo(tgid_opt: Option<usize>, pid: usize, sig: usize, uinfo: u
     let pid_i = pid as u32 as i32;
     if pid_i <= 0 { return if tgid_opt.is_some() { -22 } else { -3 }; } // EINVAL / ESRCH
     let me = sched::current_tgid();
+    // Pid numbers are the caller's namespace view (lane nspid).
+    let Ok(pid_k) = sched::pidns::from_cur(pid_i as u32) else { return -3 };
+    let tgid_opt = match tgid_opt {
+        Some(t) => { if (t as i32) <= 0 { return -22; } match sched::pidns::from_cur(t as u32) { Ok(k) => Some(k as usize), Err(e) => return e } }
+        None => None,
+    };
     let target_tgid = match tgid_opt {
-        Some(t) => { if (t as i32) <= 0 { return -22; } t as u32 }
-        None => sched::tgid_of(pid_i as u32),
+        Some(t) => t as u32,
+        None => sched::tgid_of(pid_k),
     };
     if (code >= 0 || code == sched::SI_TKILL) && target_tgid != me { return -1; } // EPERM
     let info = sched::SigInfo {
@@ -7736,7 +7753,7 @@ fn sys_rt_sigqueueinfo(tgid_opt: Option<usize>, pid: usize, sig: usize, uinfo: u
         si_value: u64::from_le_bytes(raw[24..32].try_into().unwrap()),
     };
     match tgid_opt {
-        Some(t) => sched::cred::kill_thread(Some(t as u32), pid_i as u32, sig as u32, info),
+        Some(t) => sched::cred::kill_thread(Some(t as u32), pid_k, sig as u32, info),
         None => sched::cred::kill_process(target_tgid, sig as u32, info),
     }
 }

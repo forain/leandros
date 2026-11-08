@@ -140,6 +140,7 @@ pub fn new_pidns(parent: NsId) -> Result<NsRef, isize> {
             LEVEL[id].store(level + 1, Release);
             PID_INIT[id].store(0, Release);
             PID_FLAGS[id].store(0, Release);
+            crate::pidns::USED.store(true, Relaxed);
             return Ok(NsRef(id as NsId));
         }
     }

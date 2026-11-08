@@ -7,7 +7,10 @@
 
 use crate::ns::{self, NsId};
 use crate::runqueue::RunQueue;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Set once any pid namespace has been created: lets cold paths skip lookups.
+pub(crate) static USED: AtomicBool = AtomicBool::new(false);
 
 /// Pid namespace of the calling CPU's current task (0 = initial).
 #[inline]
@@ -149,4 +152,32 @@ pub fn fork_target(parent: u32, thread: bool, explicit: NsId) -> Result<NsId, is
 /// becomes its init.
 pub fn claim_init(target: NsId, child_pid: u32) {
     if target != 0 && ns::pid_init(target) == 0 { ns::claim_pid_init(target, child_pid); }
+}
+
+/// `si_pid` of a user-sent signal as the receiver (in namespace `tn`) sees the
+/// sender (kernel pid in namespace `sn`). Only SI_USER/SI_TKILL (pid set by the kernel) are
+/// translated; a user-supplied SI_QUEUE si_pid passes through as given; kernel-generated infos are returned untouched.
+pub fn fix_info(mut info: crate::task::SigInfo, tn: NsId, sn: NsId) -> crate::task::SigInfo {
+    if tn == 0 && sn == 0 { return info; }
+    if matches!(info.si_code, 0 | -6) {
+        info.si_pid = view(tn, info.si_pid as u32, sn) as i32;
+    }
+    info
+}
+
+/// Task `k`'s own number for itself (1 when it is its namespace's init): what
+/// it writes into futex words and robust lists. Identity when the caller is
+/// outside any pid namespace (avoids a RUN_QUEUE lookup).
+pub fn own_v(k: u32) -> u32 {
+    if cur() == 0 { return k; }
+    let n = pidns_of(k);
+    if n != 0 && ns::pid_init(n) == k { 1 } else { k }
+}
+
+/// Like `own_v` for a (possibly exiting, possibly other-CPU) task regardless of
+/// the caller's namespace; falls back to `k` when the task is already gone.
+pub fn own_v_of_task(k: u32) -> u32 {
+    if !USED.load(Ordering::Relaxed) { return k; }
+    let n = pidns_of(k);
+    if n != 0 && ns::pid_init(n) == k { 1 } else { k }
 }
