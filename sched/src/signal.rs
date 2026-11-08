@@ -1144,6 +1144,39 @@ pub fn fault_signal(sig: u32, si_code: i32, addr: usize) -> bool {
     true
 }
 
+/// Seccomp `SECCOMP_RET_TRAP`: force SIGSYS onto the CURRENT thread with
+/// Linux's siginfo (`si_errno` = `errno_data`, `si_code` = SYS_SECCOMP,
+/// `si_call_addr`, `si_syscall`, `si_arch`). Like `force_sig_info`, a blocked
+/// SIGSYS or one with SIG_DFL/SIG_IGN is fatal: the group dies by SIGSYS.
+/// Returns true when a handler will run (signal queued; the delivery pass on
+/// the way back to user mode runs it), false when the group was claimed to
+/// die — the caller should then `exit_group_signal(31)`.
+pub fn force_sigsys_seccomp(syscall_nr: i32, arch: u32, call_addr: u64, errno_data: u32) -> bool {
+    const SIGSYS: u32 = 31;
+    let pid = super::current_pid();
+    if pid == 0 { return false; }
+    let bit = 1u64 << (SIGSYS - 1);
+    let mut rq = super::RUN_QUEUE.lock();
+    let (tgid, mask) = match rq.find_pid(pid) {
+        Some(t) => (t.tgid, t.signal_mask),
+        None => return false,
+    };
+    let handler = rq.find_pid(tgid)
+        .map(|l| l.signal_actions[(SIGSYS - 1) as usize].handler)
+        .unwrap_or(0);
+    if handler <= 1 || mask & bit != 0 {
+        super::claim_fatal_signal_locked(&mut *rq, pid, SIGSYS);
+        return false;
+    }
+    if let Some(t) = rq.find_pid_mut(pid) {
+        t.signal_info[(SIGSYS - 1) as usize] =
+            crate::task::SigInfo::sigsys(errno_data, arch, syscall_nr, call_addr);
+        t.signal_pending |= bit;
+        t.sig_kick();
+    }
+    true
+}
+
 /// Restore user context from the saved signal frame on the user stack.
 ///
 /// Called from `sys_rt_sigreturn` (syscall 139 / 15) with `frame_ptr` pointing
@@ -1474,6 +1507,14 @@ pub fn write_siginfo(buf: &mut [u8], base: usize, sig: u32, info: crate::task::S
     if is_fault {
         buf[base + si_off::ADDR..base + si_off::ADDR + 8]
             .copy_from_slice(&(info.si_addr as u64).to_le_bytes());
+    } else if sig == 31 && info.si_code == crate::task::SYS_SECCOMP {
+        // SIGSYS/SYS_SECCOMP: si_errno at +4, then _sigsys = call_addr (+16),
+        // syscall (+24), arch (+28).
+        put(buf, 4, info.si_pid.to_le_bytes());
+        buf[base + si_off::ADDR..base + si_off::ADDR + 8]
+            .copy_from_slice(&info.si_value.to_le_bytes());
+        put(buf, si_off::STATUS, info.si_status.to_le_bytes());
+        put(buf, 28, info.si_uid.to_le_bytes());
     } else if info.si_code == crate::task::SI_TIMER {
         put(buf, si_off::PID, info.si_pid.to_le_bytes());          // si_tid
         put(buf, si_off::UID, info.si_uid.to_le_bytes());          // si_overrun

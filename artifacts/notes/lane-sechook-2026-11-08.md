@@ -11,6 +11,8 @@ FIXED (aarch64): seccomp(2) STRICT/FILTER(+LOG, SPEC_ALLOW)/GET_ACTION_AVAIL, pr
   non-main-thread-exec inheritance, NNP EACCES, verifier EINVAL/EFAULT, flags, strict, action_avail).
 - Baseline with hook disabled (filters install, not enforced): 12 of 19 FAIL; with hook: 19/19.
 
+Regress: default aarch64 suite PASS on Mac (box build failed: Alpine v3.24 404 in alpine-lock, infra).
+
 OPEN: TRAP -> real SIGSYS (lane sectrap); KILL_THREAD in a multithreaded process kills the whole group
 (TODO in on_syscall_slow); TSYNC (lane sectsync), NEW_LISTENER; /proc Seccomp lines; ip is the frame pc
 (insn after svc/syscall, as Linux).

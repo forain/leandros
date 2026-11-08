@@ -27,6 +27,7 @@ pub mod wedge;
 pub mod fdkey;
 pub mod playstat;
 pub mod context;
+pub mod caps;
 pub mod cred;
 pub mod futex;
 pub mod robust;
@@ -63,7 +64,7 @@ pub mod cpuq;
 pub use percpu::{SchedStatsLine, wake_up_an_idle_cpu_sync, flush_sync_kick};
 
 pub use clone::{fork_current, fork_current_with, ForkOpts, clone_thread};
-pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec, fault_signal};
+pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec, fault_signal, force_sigsys_seccomp};
 pub use futex::{futex_wait, futex_wake, futex_requeue, futex_wait_keyed, futex_wait_intr, FUTEX_INTERRUPTED, futex_wake_keyed, futex_requeue_keyed};
 pub use futex::{futex_wait_intr_realtime, futex_has_waiters, task_exists as futex_task_exists, futex_wait_pi, futex_unlock_pi, FUTEX_HANDOFF, futex_key, FutexKey};
 pub use task::{SigInfo, SI_USER, SI_KERNEL, SI_TIMER, SI_TKILL, CLD_EXITED, CLD_KILLED, CLD_DUMPED,
@@ -3006,6 +3007,7 @@ pub fn exec_commit_ids(euid: Option<u32>, egid: Option<u32>, secure: bool) {
             if let Some(u) = euid { t.euid = u; }
             if let Some(g) = egid { t.egid = g; }
             t.suid = t.euid;
+            caps::on_exec(t);
             t.sgid = t.egid;
             t.fsuid = t.euid;
             t.fsgid = t.egid;
@@ -3068,10 +3070,12 @@ pub fn set_current_resuid(ruid: u32, euid: u32, suid: u32) -> bool {
                 if suid != u32::MAX && !allowed(suid) { return false; }
             }
             let before = dump_ids(t);
+            let old_uids = (t.uid, t.euid, t.suid);
             if ruid != u32::MAX { uidcount::moved(t.uid, ruid); t.uid = ruid; }
             if euid != u32::MAX { t.euid = euid; }
             if suid != u32::MAX { t.suid = suid; }
             t.fsuid = t.euid;
+            caps::on_uid_change(t, old_uids);
             before
         }
         None => return false,
@@ -3119,8 +3123,10 @@ pub fn set_current_uid(new_uid: u32) -> bool {
     let before = match rq.find_pid_mut(pid) {
         Some(t) if new_uid == t.uid || new_uid == t.suid => {
             let before = dump_ids(t);
+            let old_uids = (t.uid, t.euid, t.suid);
             t.euid = new_uid;
             t.fsuid = new_uid;
+            caps::on_uid_change(t, old_uids);
             before
         }
         _ => return false,
