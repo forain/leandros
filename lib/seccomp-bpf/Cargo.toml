@@ -1,0 +1,14 @@
+# Pure seccomp classic-BPF core: seccomp_data, filter verifier (Linux
+# bpf_check_classic + seccomp_check_filter), interpreter and action helpers.
+# No kernel integration; no dependencies.
+#
+# Host tests (the repo's .cargo config defaults to the kernel target):
+#   cargo test -p seccomp-bpf --target aarch64-apple-darwin
+[package]
+name = "seccomp-bpf"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[dependencies]
