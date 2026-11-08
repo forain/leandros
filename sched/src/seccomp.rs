@@ -262,3 +262,13 @@ fn log_syscall(nr: usize) {
     let m = alloc::format!("seccomp: pid {} syscall {}\n", crate::current_pid(), nr);
     unsafe { serial_print(m.as_ptr(), m.len()); }
 }
+
+/// (NoNewPrivs, Seccomp mode, filter count) of `pid` (0 = caller) for /proc status.
+pub fn status_of(pid: u32) -> Option<(bool, u32, u32)> {
+    let pid = if pid == 0 { crate::current_pid() } else { pid };
+    let rq = crate::RUN_QUEUE.lock();
+    rq.find_pid(pid).map(|t| {
+        let n = t.seccomp.head_arc().map(|h| h.depth).unwrap_or(0);
+        (t.no_new_privs, t.seccomp.mode(), n)
+    })
+}
