@@ -174,6 +174,8 @@ if command -v zig >/dev/null 2>&1; then
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kmodctl" userland/kmodctl/kmodctl.c
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kmodctltest" userland/kmodctltest/kmodctltest.c
     # serrx: framed, ACKed file receiver over the serial console (scripts/pi-serial-push.py).
+    echo "[userland] Building nstest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nstest" userland/nstest/nstest.c
     echo "[userland] Building serrx (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -Os -s -Wall -o "${OUT}/serrx" userland/serrx/serrx.c
 else
