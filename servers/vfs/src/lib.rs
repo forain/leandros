@@ -7620,6 +7620,16 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
             }
         }
         p = write_lit(buf, p, b"\n");
+        // Linux order: ... CapBnd, CapAmb, NoNewPrivs, Seccomp, Seccomp_filters.
+        if let Some((nnp, mode, nf)) = sched::seccomp::status_of(pid) {
+            p = write_lit(buf, p, b"NoNewPrivs:\t");
+            p = write_u32(buf, p, nnp as u32);
+            p = write_lit(buf, p, b"\nSeccomp:\t");
+            p = write_u32(buf, p, mode);
+            p = write_lit(buf, p, b"\nSeccomp_filters:\t");
+            p = write_u32(buf, p, nf);
+            p = write_lit(buf, p, b"\n");
+        }
         let kb = |pages: usize| pages as u64 * KB_PER_PAGE;
         let rows: [(&[u8], u64); 11] = [
             (b"VmPeak:\t", kb(mc.peak)),
