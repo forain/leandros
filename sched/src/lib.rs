@@ -41,6 +41,7 @@ pub mod signal;
 pub mod random;
 pub mod rseq;
 pub mod rtq;
+pub mod seccomp;
 pub mod task;
 pub mod uaccess;
 // Kernel facilities for in-kernel drivers (lane kfacil, 2026-10-07): IRQ

@@ -477,6 +477,9 @@ pub struct Task {
     /// (set-user-ID / set-group-ID bits are ignored). One-way, inherited by
     /// clone/fork and kept across execve, as on Linux.
     pub no_new_privs: bool,
+    /// seccomp filter chain head (lane seccore); inherited at clone/fork under
+    /// the child-insert RUN_QUEUE hold, kept across execve.
+    pub seccomp: crate::seccomp::SeccompSlot,
     /// Resource limits (`getrlimit`/`setrlimit`/`prlimit64`), `[cur, max]`
     /// per `RLIMIT_*`. Per process: read and written on the thread-group
     /// leader only, copied to a forked child, kept across execve.
@@ -894,6 +897,7 @@ impl Task {
             exiting: false,
             kthread: false,
             sig_hint: core::sync::atomic::AtomicU32::new(1),
+            seccomp: crate::seccomp::SeccompSlot::new(),
             listen: crate::PollListen::OFF,
             ep_cache: None,
             slot: crate::slot::NO_SLOT,
@@ -1200,6 +1204,9 @@ impl Task {
         let sig_hint_ptr = (dest as usize + core::mem::offset_of!(Task, sig_hint))
             as *mut core::sync::atomic::AtomicU32;
         core::ptr::write(sig_hint_ptr, core::sync::atomic::AtomicU32::new(1));
+        let seccomp_ptr = (dest as usize + core::mem::offset_of!(Task, seccomp))
+            as *mut crate::seccomp::SeccompSlot;
+        core::ptr::write(seccomp_ptr, crate::seccomp::SeccompSlot::new());
         let listen_ptr = (dest as usize + core::mem::offset_of!(Task, listen)) as *mut crate::PollListen;
         core::ptr::write_volatile(listen_ptr, crate::PollListen::OFF);
         let ep_cache_ptr = (dest as usize + core::mem::offset_of!(Task, ep_cache))
@@ -1318,6 +1325,7 @@ impl Task {
             exiting: false,
             kthread: false,
             sig_hint: core::sync::atomic::AtomicU32::new(1),
+            seccomp: crate::seccomp::SeccompSlot::new(),
             listen: crate::PollListen::OFF,
             ep_cache: None,
             slot: crate::slot::NO_SLOT,
