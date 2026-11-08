@@ -28,6 +28,7 @@ pub mod fdkey;
 pub mod playstat;
 pub mod context;
 pub mod caps;
+pub mod ns;
 pub mod cred;
 pub mod futex;
 pub mod robust;
