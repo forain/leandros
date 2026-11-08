@@ -2492,10 +2492,10 @@ fn dispatch_inner(
         FREMOVEXATTR => sys_removexattr(a0, a1, true, false),
 
         // ── Credentials ───────────────────────────────────────────────────────
-        GETUID  => sched::current_uid()  as isize,
-        GETEUID => sched::current_euid() as isize,
-        GETGID  => sched::current_gid()  as isize,
-        GETEGID => sched::current_egid() as isize,
+        GETUID  => sched::ns::view_id(0, sched::current_uid())  as isize,
+        GETEUID => sched::ns::view_id(0, sched::current_euid()) as isize,
+        GETGID  => sched::ns::view_id(1, sched::current_gid())  as isize,
+        GETEGID => sched::ns::view_id(1, sched::current_egid()) as isize,
         GETTID    => sched::pidns::self_v(current_pid()) as isize,
         TGKILL    => sys_tgkill(a0, a1, a2),
         TKILL     => sys_tkill(a0, a1),
@@ -8629,6 +8629,12 @@ fn sys_openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize
 /// inodes; exe/cwd/root are 0777, fd links 0700), size 0. `None` when `ns`
 /// is no magic link; ENOENT when the process (or the descriptor) is gone.
 fn lstat_magic_link(ns: &[u8], statbuf_ptr: usize) -> Option<isize> {
+    if let Some((pid, k)) = proc_ns_link(ns) {
+        if sched::exists_probe(pid) != 0 { return Some(-2); }
+        let (u, g) = sched::cred::ids_of(pid).map(|(u, g)| (u[1], g[1])).unwrap_or((0, 0));
+        vfs::write_stat_full(statbuf_ptr, 0o120777, 1, 0, 0x7200_0000_0000u64 | ((pid as u64) << 8) | k as u64, u, g);
+        return Some(0);
+    }
     if !is_magic_link(ns) { return None; }
     let b = backing_of(ns).unwrap_or_else(|| ns.to_vec());
     let mut found = None;
@@ -8837,6 +8843,7 @@ fn ns_readlink(ns: &[u8]) -> Result<Vec<u8>, isize> {
 /// `/proc/<pid>/fd/<n>`.
 fn is_magic_link(ns: &[u8]) -> bool {
     let b = backing_of(ns).unwrap_or_else(|| ns.to_vec());
+    if proc_ns_link(&b).is_some() { return true; }
     for what in [&b"exe"[..], b"cwd", b"root"] {
         if let Some((_, rest)) = proc_magic(&b, what) { if rest.is_empty() { return true; } }
     }
@@ -9918,6 +9925,7 @@ fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, flags: us
 /// exec like the other credentials; consulted by every filesystem permission
 /// check through `xattr::Cred::in_group`.
 fn sys_setgroups(size: usize, list_ptr: usize) -> isize {
+    if sched::ns::setgroups_denied(sched::ns::current_userns()) { return -1; } // EPERM after "deny"
     if size > xattr::NGROUPS_MAX { return -22; } // EINVAL
     let mut groups = [0u32; xattr::NGROUPS_MAX];
     if size > 0 {
@@ -10515,6 +10523,8 @@ fn sys_getresxid(r_ptr: usize, e_ptr: usize, s_ptr: usize, is_gid: bool) -> isiz
     } else {
         (sched::current_uid(), sched::current_euid(), sched::current_suid())
     };
+    let k = is_gid as usize;
+    let (r, e, s) = (sched::ns::view_id(k, r), sched::ns::view_id(k, e), sched::ns::view_id(k, s));
     if r_ptr != 0 && !ua::write_user::<u32>(r_ptr, r) { return -14; }
     if e_ptr != 0 && !ua::write_user::<u32>(e_ptr, e) { return -14; }
     if s_ptr != 0 && !ua::write_user::<u32>(s_ptr, s) { return -14; }
@@ -10638,6 +10648,20 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
                 None => -2,
             };
         }
+    }
+    if let Some((pid, k)) = proc_ns_link(path) {
+        if sched::exists_probe(pid) != 0 { return -2; }
+        let mut b = [0u8; 48];
+        let name = sched::ns::NS_NAMES[k];
+        let mut n = name.len();
+        b[..n].copy_from_slice(name);
+        b[n] = b':'; b[n + 1] = b'['; n += 2;
+        let mut d = [0u8; 20]; let mut j = 0;
+        let mut v = sched::ns::ns_ino(k, sched::ns::ns_id_of(pid, k));
+        loop { d[j] = b'0' + (v % 10) as u8; j += 1; v /= 10; if v == 0 { break; } }
+        while j > 0 { j -= 1; b[n] = d[j]; n += 1; }
+        b[n] = b']'; n += 1;
+        return reply(&b[..n]);
     }
     if let Some((pid, rest)) = proc_magic(path, b"root") {
         if rest.is_empty() {
@@ -10823,6 +10847,14 @@ impl KPath {
     /// The namespace path: what chdir/chroot record.
     #[inline]
     fn ns_bytes(&self) -> &[u8] { self.ns.as_deref().unwrap_or(self.bytes()) }
+}
+
+/// `/proc/<pid|self|thread-self>/ns/<name>` → (pid, index into NS_NAMES).
+fn proc_ns_link(p: &[u8]) -> Option<(u32, usize)> {
+    let (pid, rest) = proc_magic(p, b"ns")?;
+    let name = rest.strip_prefix(b"/")?;
+    let k = sched::ns::NS_NAMES.iter().position(|n| *n == name)?;
+    Some((pid, k))
 }
 
 /// `/proc/<pid|self|thread-self>/<what>` → (pid, rest after `<what>`).
