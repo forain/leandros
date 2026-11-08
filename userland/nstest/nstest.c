@@ -20,9 +20,14 @@
 #include <unistd.h>
 #include <linux/sched.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <pthread.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #ifndef CLONE_NEWCGROUP
 #define CLONE_NEWCGROUP 0x02000000
@@ -38,7 +43,6 @@ static void check(const char *name, int ok)
 
 static const struct { const char *n; unsigned long f; } flags[] = {
     {"NEWPID", CLONE_NEWPID},
-    {"NEWNET", CLONE_NEWNET},   {"NEWIPC", CLONE_NEWIPC},
     {"NEWUTS", CLONE_NEWUTS},   {"NEWNS", CLONE_NEWNS},
     {"NEWCGROUP", CLONE_NEWCGROUP},
 };
@@ -144,9 +148,9 @@ static int t_unshare_threaded(void)
 }
 static int t_other_new_einval(void)
 {
-    int fl[] = { 0x00020000, 0x02000000, 0x04000000, 0x08000000, 0x20000000, 0x40000000 };
+    int fl[] = { 0x00020000, 0x02000000, 0x04000000, 0x20000000 };
     CHECK(drop_to(1000) == 0);
-    for (unsigned i = 0; i < 6; i++) {
+    for (unsigned i = 0; i < 4; i++) {
         CHECK(unshare(fl[i]) == -1 && errno == EINVAL);
         long r = syscall(SYS_clone, SIGCHLD | fl[i], 0, 0, 0, 0);
         CHECK(r == -1 && errno == EINVAL);
@@ -217,6 +221,110 @@ static void reap(long r)
     if (r > 0) waitpid((pid_t)r, NULL, 0);
 }
 
+
+/* ---- net / ipc namespaces (lanes nsnet, nsipc) ---- */
+#define NSALL (CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWIPC)
+static int abs_addr(struct sockaddr_un *a, const char *n)
+{
+    memset(a, 0, sizeof *a); a->sun_family = AF_UNIX;
+    memcpy(a->sun_path + 1, n, strlen(n));
+    return offsetof(struct sockaddr_un, sun_path) + 1 + strlen(n);
+}
+static int abs_bind(const char *n)
+{
+    struct sockaddr_un a; int len = abs_addr(&a, n);
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0 || bind(s, (void *)&a, len) || listen(s, 4)) return -1;
+    return s;
+}
+static int abs_connect(const char *n)
+{
+    struct sockaddr_un a; int len = abs_addr(&a, n);
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    return (s >= 0 && connect(s, (void *)&a, len) == 0) ? 0 : -errno;
+}
+static int ns_child_netns(int (*fn)(void))
+{
+    pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+    if (c == 0) _exit(fn());
+    if (c < 0) return -1;
+    int st = 0; waitpid(c, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 100;
+}
+static int netns_child_body(void)
+{
+    /* parent's name is invisible; same name binds fine here */
+    CHECK(abs_connect("nsnet-par") == -ECONNREFUSED);
+    int s = abs_bind("nsnet-par");
+    CHECK(s >= 0);
+    /* path sockets are NOT netns-scoped */
+    struct sockaddr_un p; memset(&p, 0, sizeof p); p.sun_family = AF_UNIX;
+    strcpy(p.sun_path, "/tmp/nsnet-path.sock");
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(connect(c, (void *)&p, sizeof p) == 0);
+    /* INET: socket works, nothing routes, lo is down */
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(t >= 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(80) };
+    a.sin_addr.s_addr = htonl(0x0a000001);
+    CHECK(connect(t, (void *)&a, sizeof a) == -1 && errno == ENETUNREACH);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(connect(t, (void *)&a, sizeof a) == -1 && errno == ENETUNREACH);
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(sendto(u, "x", 1, 0, (void *)&a, sizeof a) == -1 && errno == ENETUNREACH);
+    struct sockaddr_in b = { .sin_family = AF_INET };
+    b.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(t, (void *)&b, sizeof b) == -1 && errno == EADDRNOTAVAIL);
+    b.sin_addr.s_addr = htonl(INADDR_ANY);
+    CHECK(bind(t, (void *)&b, sizeof b) == 0);
+    return 0;
+}
+static int t_netns_ipcns(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int ls = abs_bind("nsnet-par");
+    CHECK(ls >= 0);
+    int ps = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un p; memset(&p, 0, sizeof p); p.sun_family = AF_UNIX;
+    strcpy(p.sun_path, "/tmp/nsnet-path.sock"); unlink(p.sun_path);
+    CHECK(bind(ps, (void *)&p, sizeof p) == 0 && listen(ps, 4) == 0);
+    /* parent networking unaffected: loopback TCP listener + connect */
+    int tl = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET };
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(tl, (void *)&a, sizeof a) == 0 && listen(tl, 4) == 0);
+    socklen_t al = sizeof a; getsockname(tl, (void *)&a, &al);
+    int tc = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(connect(tc, (void *)&a, sizeof a) == 0);
+    CHECK(ns_child_netns(netns_child_body) == 0);
+    /* reverse: name bound in the child is invisible to the parent */
+    CHECK(abs_connect("nsnet-par") == 0);              /* still the parent's own listener */
+    CHECK(abs_connect("nsnet-child-only") == -ECONNREFUSED);
+    /* unshare in a plain process needs CAP_SYS_ADMIN */
+    CHECK(unshare(CLONE_NEWNET) == -1 && errno == EPERM);
+    CHECK(unshare(CLONE_NEWIPC) == -1 && errno == EPERM);
+    unlink(p.sun_path);
+    return 0;
+}
+static int t_netns_isolate_reverse(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
+    pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+    if (c == 0) {
+        int s = abs_bind("nsnet-child-only");
+        char ok = s >= 0; write(pfd[1], &ok, 1);
+        char b; read(qfd[0], &b, 1);
+        _exit(0);
+    }
+    CHECK(c > 0);
+    char ok = 0; CHECK(read(pfd[0], &ok, 1) == 1 && ok);
+    CHECK(abs_connect("nsnet-child-only") == -ECONNREFUSED);
+    write(qfd[1], "x", 1);
+    int st; waitpid(c, &st, 0);
+    return 0;
+}
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -224,6 +332,7 @@ static int run_userns_cases(void)
         { "host_root_unaffected", t_host_unaffected }, { "unshare_basic", t_unshare_basic },
         { "unshare_threaded_einval", t_unshare_threaded }, { "other_new_einval", t_other_new_einval },
         { "depth_limit_32", t_depth_limit }, { "ns_leak", t_leak }, { "suid_ignored_in_userns", t_suid_ignored },
+        { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();
