@@ -4388,6 +4388,7 @@ const _: () = assert!(sched::runqueue::MAX_TASKS == 4096, "update /proc/sys/kern
 /// Known directories for getdents64.
 static RAMFS_DIRS: &[&[u8]] = &[
     b"/",
+    VOID_ROOT,
     b"/etc",
     b"/dev",
     b"/proc",
@@ -4965,6 +4966,7 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
     if path.starts_with(b"/dev/") || path.starts_with(b"/proc/")
        || path.starts_with(b"/tmp/") || path.starts_with(b"/etc/")
        || path == b"/dev" || path == b"/proc" || path == b"/tmp" || path == b"/etc"
+       || path == VOID_ROOT
        // The /run and /run/user tmpfs mounts (pid/lock files, Wayland, D-Bus
        // and service sockets). /dev/shm rides the /dev/ prefix above; /tmp
        // rides /tmp/. Intercept /run before the mount table so it lands on
@@ -5183,6 +5185,7 @@ fn is_tmp_path(path: &[u8]) -> bool {
 fn ramfs_dir_mode(dir: &[u8]) -> u32 {
     match dir {
         b"/tmp" | b"/dev/shm" => 0o041777,
+        VOID_ROOT             => 0o040555,
         _                     => 0o040755,
     }
 }
@@ -7243,6 +7246,11 @@ fn proc_stat_kind(path: &[u8]) -> Option<Option<(bool, u32, &[u8])>> {
         }));
     }
     let alive = |p: u32| sched::proc_stat_of(p).is_some();
+    if path == PROC_SELF_FDINFO_DIR { return Some(Some((true, sched::current_tgid(), &b""[..]))); }
+    if let Some((p, n)) = proc_fdinfo_file(path, sched::current_pid()) {
+        let ok = alive(p) && vfs_get_node_kind(p, n).is_some();
+        return Some(if ok { Some((false, p, &b"fdinfo"[..])) } else { None });
+    }
     if let Some(p) = proc_pid_dir(path).or_else(|| proc_pid_fd_dir(path)) {
         return Some(if alive(p) { Some((true, p, &b""[..])) } else { None });
     }
@@ -7396,25 +7404,66 @@ fn proc_pid_dir(path: &[u8]) -> Option<u32> {
     Some(pid)
 }
 
-/// `/proc/<digits>/fd` (the directory itself) → that pid.
+/// The path the kernel substitutes for the root of a task that chroots into
+/// procfs (Firefox's `chroot("/proc/self/fdinfo")`): an empty read-only
+/// directory under which nothing resolves. It is not listed in "/" and the
+/// kernel refuses it to a task whose root is not this directory.
+pub const VOID_ROOT: &[u8] = b"/.leandros-void";
+
+const PROC_SELF_FDINFO_DIR: &[u8] = b"/proc/self/fdinfo";
+
+/// `/proc/<digits>/fd` or `/proc/<digits>/fdinfo` (the directory itself) → that pid.
 fn proc_pid_fd_dir(path: &[u8]) -> Option<u32> {
     let rest = path.strip_prefix(b"/proc/")?;
-    let digits = rest.strip_suffix(b"/fd")?;
+    let digits = rest.strip_suffix(b"/fd").or_else(|| rest.strip_suffix(b"/fdinfo"))?;
     proc_parse_num(digits)
+}
+
+/// `(pid, N)` of `/proc/<pid|self|thread-self>/fdinfo/N`; `me` stands for self.
+fn proc_fdinfo_file(path: &[u8], me: u32) -> Option<(u32, usize)> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let slash = rest.iter().position(|&c| c == b'/')?;
+    let who = &rest[..slash];
+    let digits = rest[slash..].strip_prefix(b"/fdinfo/")?;
+    if digits.is_empty() || digits.len() > 7 || !digits.iter().all(|d| d.is_ascii_digit()) { return None; }
+    let n = digits.iter().fold(0usize, |a, &d| a * 10 + (d - b'0') as usize);
+    let pid = if who == b"self" || who == b"thread-self" { me } else { proc_parse_num(who)? };
+    Some((pid, n))
+}
+
+/// The text of `/proc/<pid>/fdinfo/N`: `pos`, `flags` (octal), `mnt_id`.
+fn gen_proc_fdinfo(path: &[u8], target: u32, fd: usize) -> Result<VnodeKind, i32> {
+    let kind = vfs_get_node_kind(target, fd).ok_or(-2)?;
+    let flags = fd_flags(target, fd).unwrap_or(0);
+    let pos: u64 = match kind {
+        VnodeKind::TmpFile { pos, .. } => pos as u64,
+        VnodeKind::RamFile { pos, .. } => pos as u64,
+        _ => 0,
+    };
+    let mut buf = [0u8; TMP_BUF_SIZE];
+    let mut p = write_lit(&mut buf, 0, b"pos:\t");
+    p = write_u64(&mut buf, p, pos);
+    p = write_lit(&mut buf, p, b"\nflags:\t0");
+    let mut o = [0u8; 12]; let mut k = o.len(); let mut v = flags;
+    loop { k -= 1; o[k] = b'0' + (v & 7) as u8; v >>= 3; if v == 0 { break; } }
+    p = write_lit(&mut buf, p, &o[k..]);
+    p = write_lit(&mut buf, p, b"\nmnt_id:\t0\n");
+    proc_snapshot(path, &buf[..p], false).ok_or(-23)
 }
 
 /// Open of the directory `/proc/<pid>/fd`: an ephemeral pool directory whose
 /// path is `/proc/<pid>/fd`, listed by `handle_getdents64` from the target's
 /// descriptor table.
-fn gen_proc_fd_dir(pid: u32) -> Option<VnodeKind> {
-    let mut path = [0u8; 24];
+fn gen_proc_fd_dir(pid: u32, info: bool) -> Option<VnodeKind> {
+    let mut path = [0u8; 28];
     path[..6].copy_from_slice(b"/proc/");
     let mut n = 6;
     let mut d = [0u8; 10]; let mut k = 0; let mut v = pid;
     loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
     while k > 0 { k -= 1; path[n] = d[k]; n += 1; }
-    path[n..n + 3].copy_from_slice(b"/fd");
-    n += 3;
+    let sfx: &[u8] = if info { b"/fdinfo" } else { b"/fd" };
+    path[n..n + sfx.len()].copy_from_slice(sfx);
+    n += sfx.len();
     proc_snapshot(&path[..n], b"", true)
 }
 
@@ -7509,6 +7558,15 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
             for g in &gl[..n] {
                 p = write_u32(buf, p, *g);
                 p = write_lit(buf, p, b" ");
+            }
+        }
+        if let Some(c) = sched::caps::caps_of(pid) {
+            for (label, v) in [(&b"\nCapInh:\t"[..], c[2]), (&b"\nCapPrm:\t"[..], c[1]),
+                               (&b"\nCapEff:\t"[..], c[0]), (&b"\nCapBnd:\t"[..], c[3])] {
+                p = write_lit(buf, p, label);
+                let mut hex = [b'0'; 16];
+                for i in 0..16 { hex[i] = b"0123456789abcdef"[(v >> (60 - 4 * i) & 15) as usize]; }
+                p = write_lit(buf, p, &hex);
             }
         }
         p = write_lit(buf, p, b"\n");
@@ -7972,6 +8030,20 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 None => return err_reply(-2), // ENOENT
             }
             }
+        } else if let Some((tpid, n)) = proc_fdinfo_file(lookup_path, pid) {
+            // /proc/<pid>/fdinfo/N: pos, flags, mnt_id of one descriptor.
+            if sched::proc_stat_of(tpid).is_none() || sched::leaderless(tpid) { return err_reply(-2); }
+            if flags & 0o3 != 0 { return err_reply(-13); }
+            if sched::tgid_of(tpid) != sched::tgid_of(pid) && !proc_environ_allowed(pid, tpid) {
+                return err_reply(-13);
+            }
+            match gen_proc_fdinfo(lookup_path, tpid, n) {
+                Ok(k) => k,
+                Err(e) => return err_reply(e),
+            }
+        } else if lookup_path == PROC_SELF_FDINFO_DIR {
+            if flags & 0o3 != 0 { return err_reply(-21); }
+            VnodeKind::RamFile { data: PROC_SELF_FDINFO_DIR, pos: 0, is_dir: true }
         } else if let Some(n) = proc_self_fd_number(lookup_path) {
             // open("/proc/self/fd/N") opens what fd N names afresh, with the
             // new flags — not a dup: its own offset and its own access mode.
@@ -8038,14 +8110,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
-        } else if let Some(tpid) = if lookup_path == b"/proc/thread-self/fd" { Some(sched::current_pid()) }
+        } else if let Some(tpid) = if lookup_path == b"/proc/thread-self/fd" || lookup_path == b"/proc/thread-self/fdinfo" { Some(sched::current_pid()) }
                                    else { proc_pid_fd_dir(lookup_path) } {
             // /proc/<pid>/fd of any live process the caller may inspect
             // (own uid or root, like /proc/<pid>/environ).
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
             if flags & 0o3 != 0 { return err_reply(-21); }
             if !proc_environ_allowed(pid, tpid) { return err_reply(-13); }
-            match gen_proc_fd_dir(tpid) {
+            match gen_proc_fd_dir(tpid, lookup_path.ends_with(b"/fdinfo")) {
                 Some(v) => v,
                 None    => return err_reply(-23),
             }
@@ -10478,7 +10550,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     // + 2, so a descriptor closed or opened between two calls neither
     // repeats nor shifts the listing. 0-2 are always listed: an untracked
     // one is the console, which is open.
-    let fd_tgt: Option<u32> = if !dir_is_tmp && dir_path == PROC_SELF_FD_DIR { Some(sched::tgid_of(pid)) }
+    let fd_tgt: Option<u32> = if !dir_is_tmp && (dir_path == PROC_SELF_FD_DIR || dir_path == PROC_SELF_FDINFO_DIR) { Some(sched::tgid_of(pid)) }
                               else if dir_is_tmp { proc_pid_fd_dir(dir_path) } else { None };
     if let Some(tp) = fd_tgt {
         let from = pos - 2;
@@ -10511,7 +10583,8 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         for &f in fds.iter() {
             let mut d = [0u8; 20]; let mut k = d.len(); let mut v = f;
             loop { k -= 1; d[k] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
-            match write_dirent(buf, off, count, 0x6800_0000 + f as u64, &d[k..], 10) { // DT_LNK
+            let dt = if dir_path.ends_with(b"/fdinfo") { 8 } else { 10 }; // DT_REG / DT_LNK
+            match write_dirent(buf, off, count, 0x6800_0000 + f as u64, &d[k..], dt) {
                 Some(r) => { off += r; next = f + 1; }
                 None => break,
             }
@@ -10588,7 +10661,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
 
     // RAMFS directories
     for &child_dir in RAMFS_DIRS {
-        if child_dir == dir_path { continue; }
+        if child_dir == dir_path || child_dir == VOID_ROOT { continue; }
         let is_root = dir_path == b"/";
         let is_child = if is_root {
             child_dir.len() > 1 && child_dir[0] == b'/' && !child_dir[1..].contains(&b'/')

@@ -215,6 +215,7 @@ pub fn set_re_ids(r: u32, e: u32, gid: bool) -> isize {
     let pid = current_pid();
     let t = match rq.find_pid_mut(pid) { Some(t) => t, None => return ESRCH };
     let before = [t.euid, t.egid, t.fsuid, t.fsgid];
+    let old_uids = (t.uid, t.euid, t.suid);
     let privileged = t.euid == 0; // CAP_SETUID / CAP_SETGID
     let (or, oe, os) = if gid { (t.gid, t.egid, t.sgid) } else { (t.uid, t.euid, t.suid) };
     let (mut nr, mut ne, mut ns) = (or, oe, os);
@@ -229,7 +230,7 @@ pub fn set_re_ids(r: u32, e: u32, gid: bool) -> isize {
     if r != u32::MAX || (e != u32::MAX && e != or) { ns = ne; }
     // The filesystem id follows the effective one (Linux `__sys_setreuid`).
     if gid { t.gid = nr; t.egid = ne; t.sgid = ns; t.fsgid = ne; }
-    else   { crate::uidcount::moved(t.uid, nr); t.uid = nr; t.euid = ne; t.suid = ns; t.fsuid = ne; }
+    else   { crate::uidcount::moved(t.uid, nr); t.uid = nr; t.euid = ne; t.suid = ns; t.fsuid = ne; crate::caps::on_uid_change(t, old_uids); }
     crate::commit_id_change(&mut rq, pid, before);
     0
 }
