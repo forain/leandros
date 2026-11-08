@@ -23,6 +23,8 @@
 #include <pthread.h>
 #include <signal.h>
 #include <string.h>
+#include <fcntl.h>
+#include <stdlib.h>
 #include <sys/wait.h>
 
 #ifndef SYS_seccomp
@@ -221,6 +223,54 @@ static int c_action_avail(void) {
     return (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &a) == -1 && errno == EOPNOTSUPP) ? 0 : 2;
 }
 
+
+/* Value of "<key>:\t<n>" in /proc/self/status (or /proc/self/task/<tid>/status), -1 if absent. */
+static long pstat_in(const char *path, const char *key) {
+    char b[4096]; int fd = open(path, O_RDONLY); if (fd < 0) return -2;
+    ssize_t n = read(fd, b, sizeof b - 1); close(fd); if (n <= 0) return -3;
+    b[n] = 0;
+    size_t kl = strlen(key);
+    for (char *l = b; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : 0)
+        if (!strncmp(l, key, kl) && l[kl] == ':') return strtol(l + kl + 1, 0, 10);
+    return -1;
+}
+static long pstat(const char *key) { return pstat_in("/proc/self/status", key); }
+static int c_proc_status(void) {
+    char tp[64]; snprintf(tp, sizeof tp, "/proc/self/task/%ld/status", (long)syscall(SYS_gettid));
+    if (pstat("Seccomp") != 0 || pstat("Seccomp_filters") != 0 || pstat("NoNewPrivs") != 0) return 1;
+    nnp();
+    if (pstat("NoNewPrivs") != 1) return 2;
+    if (install_getppid(RET_ALLOW, 0) != 0) return 3;
+    if (pstat("Seccomp") != 2 || pstat("Seccomp_filters") != 1) return 4;
+    if (install_getppid(RET_ALLOW, 0) != 0) return 5;
+    if (pstat("Seccomp_filters") != 2) return 6;
+    if (pstat_in(tp, "Seccomp") != 2 || pstat_in(tp, "Seccomp_filters") != 2) return 7;
+    return 0;
+}
+/* Strict mode allows only read/write/exit, and /proc content is generated at
+ * open(), so a strict child blocks in read() on a pipe while the parent reads
+ * the child's /proc/<pid>/status. */
+static int c_proc_strict(void) {
+    int up[2], dn[2];
+    if (pipe(up) || pipe(dn)) return 1;
+    pid_t c = fork();
+    if (c == 0) {
+        char x;
+        if (syscall(SYS_seccomp, SECCOMP_SET_MODE_STRICT, 0, 0) != 0) _exit(2);
+        if (write(up[1], "r", 1) != 1) _exit(3);
+        if (read(dn[0], &x, 1) != 1) _exit(4);
+        _exit(0);
+    }
+    if (c < 0) return 5;
+    char x, p[64]; int ok = 0, st = 0;
+    if (read(up[0], &x, 1) == 1) {
+        snprintf(p, sizeof p, "/proc/%d/status", (int)c);
+        ok = pstat_in(p, "Seccomp") == 1 && pstat_in(p, "Seccomp_filters") == 0;
+    }
+    if (write(dn[1], "g", 1) != 1) return 6;
+    if (waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return 7;
+    return ok ? 0 : 8;
+}
 int main(int argc, char **argv) {
     self = argv[0];
     if (argc > 1 && !strcmp(argv[1], "exec-child"))
@@ -252,6 +302,8 @@ int main(int argc, char **argv) {
     exit0("strict_allows_rw_exit", c_strict_ok);
     killed("strict_kills_other_syscall", c_strict_kill, SIGKILL);
     exit0("action_avail", c_action_avail);
+    exit0("proc_status_seccomp", c_proc_status);
+    exit0("proc_status_strict", c_proc_strict);
 
     printf("seccomptest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail;
