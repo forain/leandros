@@ -849,6 +849,23 @@ static CURRENT_REPLY_PORT: [AtomicU32; MAX_CPUS] =
 /// `Task`, which is never freed or moved while it runs (reaping happens at
 /// its own switch-back, after this slot is cleared; `take_over_leader`
 /// exchanges pids, not boxes), and the readers run with IRQs masked.
+/// `&Task::seccomp` of the task running on each CPU (null = none); same
+/// lifetime argument as [`CURRENT_SIGHINT`]. exec's non-leader identity
+/// exchange swaps pids, not Task boxes, so the caller keeps its own slot.
+static CURRENT_SECCOMP: [core::sync::atomic::AtomicPtr<seccomp::SeccompSlot>; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+
+/// Seccomp state of the running task, when (and only when) it is active.
+/// Lock-free: one per-CPU load + one Acquire load (no RUN_QUEUE).
+#[inline]
+pub fn current_seccomp() -> Option<&'static seccomp::SeccompSlot> {
+    let cpu = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    let p = CURRENT_SECCOMP[cpu].load(Ordering::Relaxed);
+    if p.is_null() { return None; }
+    let r = unsafe { &*p };
+    if r.active() { Some(r) } else { None }
+}
+
 static CURRENT_SIGHINT: [core::sync::atomic::AtomicPtr<AtomicU32>; MAX_CPUS] =
     [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
 
@@ -7405,6 +7422,7 @@ fn scheduler_run_loop() -> ! {
             rseq::on_dispatch(id, &rseq::RseqReg { addr: d.rseq_addr, len: 0, sig: d.rseq_sig });
             if d.rseq_addr != 0 { rseq::cid_acquire(id, tgid); }
             CURRENT_SIGHINT[id].store(d.sighint as *mut AtomicU32, Ordering::Relaxed);
+            CURRENT_SECCOMP[id].store(d.seccomp as *mut seccomp::SeccompSlot, Ordering::Relaxed);
             CURRENT_SLOT[id].store(idx, Ordering::Relaxed);
             IDLE_SINCE[id].store(0, Ordering::Relaxed);
             let dispatched_ns = unsafe { arch_monotonic_ns() };
@@ -7452,6 +7470,7 @@ fn scheduler_run_loop() -> ! {
                 CURRENT_TGID[id].store(0, Ordering::Relaxed);
                 CURRENT_AS[id].store(core::ptr::null_mut(), Ordering::Release);
                 CURRENT_SIGHINT[id].store(core::ptr::null_mut(), Ordering::Relaxed);
+                CURRENT_SECCOMP[id].store(core::ptr::null_mut(), Ordering::Relaxed);
                 CURRENT_SLOT[id].store(usize::MAX, Ordering::Relaxed);
                 rseq::cid_release(id);
 

@@ -134,3 +134,131 @@ impl SeccompSlot {
         Some(seccomp_bpf::run_stack(it, d))
     }
 }
+
+// ── Install + syscall hook (lane sechook, S3) ──────────────────────────────
+
+pub use seccomp_bpf::{
+    check_filter, SECCOMP_RET_ACTION_FULL, SECCOMP_RET_ALLOW, SECCOMP_RET_DATA, SECCOMP_RET_ERRNO,
+    SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD, SECCOMP_RET_LOG, SECCOMP_RET_TRACE,
+    SECCOMP_RET_TRAP, SECCOMP_RET_USER_NOTIF,
+};
+
+#[cfg(target_arch = "x86_64")]
+pub const AUDIT_ARCH_NATIVE: u32 = 0xc000_003e;
+#[cfg(target_arch = "aarch64")]
+pub const AUDIT_ARCH_NATIVE: u32 = 0xc000_00b7;
+
+pub const FLAG_TSYNC: u32 = 1;
+pub const FLAG_LOG: u32 = 2;
+pub const FLAG_SPEC_ALLOW: u32 = 4;
+
+const SIGKILL: u32 = 9;
+const SIGSYS: u32 = 31;
+const EPERM: isize = 1;
+const EACCES: isize = 13;
+const EFAULT: isize = 14;
+const EINVAL: isize = 22;
+const ENOSYS: isize = 38;
+
+/// Mode of the calling thread (PR_GET_SECCOMP).
+pub fn current_mode() -> u32 {
+    let rq = crate::RUN_QUEUE.lock();
+    rq.find_pid(crate::current_pid()).map_or(0, |t| t.seccomp.mode())
+}
+
+/// seccomp(SECCOMP_SET_MODE_STRICT) / prctl(PR_SET_SECCOMP, 1).
+pub fn set_mode_strict() -> isize {
+    let rq = crate::RUN_QUEUE.lock();
+    match rq.find_pid(crate::current_pid()) {
+        Some(t) => match t.seccomp.mode() {
+            MODE_DISABLED => { t.seccomp.set_strict(); 0 }
+            MODE_STRICT => 0,
+            _ => -EINVAL,
+        },
+        None => -EINVAL,
+    }
+}
+
+/// seccomp(SECCOMP_SET_MODE_FILTER, flags, fprog) / prctl(PR_SET_SECCOMP, 2,
+/// fprog) with `flags = 0`. `fprog` is a user `struct sock_fprog`.
+pub fn set_mode_filter(flags: u32, fprog: usize) -> isize {
+    if flags & !(FLAG_LOG | FLAG_SPEC_ALLOW) != 0 { return -EINVAL; } // TSYNC: lane sectsync
+    let mut hdr = [0u8; 16]; // { u16 len; pad; u64 filter }
+    if unsafe { crate::uaccess::copy_from_user(hdr.as_mut_ptr(), fprog, 16) } != 0 { return -EFAULT; }
+    let len = u16::from_ne_bytes([hdr[0], hdr[1]]) as usize;
+    let ptr = u64::from_ne_bytes(hdr[8..16].try_into().unwrap()) as usize;
+    if len == 0 || len > seccomp_bpf::BPF_MAXINSNS { return -EINVAL; }
+    if !crate::no_new_privs() && !crate::caps::capable(21 /* CAP_SYS_ADMIN */) { return -EACCES; }
+    let mut insns: alloc::vec::Vec<SockFilter> = alloc::vec::Vec::new();
+    insns.resize(len, SockFilter { code: 0, jt: 0, jf: 0, k: 0 });
+    if unsafe { crate::uaccess::copy_from_user(insns.as_mut_ptr() as *mut u8, ptr, len * 8) } != 0 {
+        return -EFAULT;
+    }
+    let prog = match check_filter(&insns) { Ok(p) => p, Err(_) => return -EINVAL };
+    let rq = crate::RUN_QUEUE.lock();
+    let Some(t) = rq.find_pid(crate::current_pid()) else { return -EINVAL };
+    if t.seccomp.mode() == MODE_STRICT { return -EINVAL; }
+    match FilterNode::push(prog, t.seccomp.head_arc(), flags & FLAG_LOG != 0) {
+        Some(n) => { t.seccomp.install(n); 0 }
+        None => -12, // ENOMEM: path budget exceeded (Linux)
+    }
+}
+
+/// seccomp(SECCOMP_GET_ACTION_AVAIL): 0 if the kernel knows the action.
+pub fn action_avail(action: u32) -> isize {
+    match action {
+        SECCOMP_RET_KILL_PROCESS | SECCOMP_RET_KILL_THREAD | SECCOMP_RET_TRAP | SECCOMP_RET_ERRNO
+        | SECCOMP_RET_TRACE | SECCOMP_RET_LOG | SECCOMP_RET_ALLOW => 0,
+        _ => -95, // EOPNOTSUPP
+    }
+}
+
+fn strict_allows(nr: usize) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    { matches!(nr, 63 | 64 | 93 | 94 | 139) } // read write exit exit_group rt_sigreturn
+    #[cfg(target_arch = "x86_64")]
+    { matches!(nr, 0 | 1 | 60 | 231 | 15) }
+}
+
+/// Syscall-entry hook. `None` = run the syscall; `Some(ret)` = skip it and
+/// return `ret`. Lock-free when the thread has no seccomp state.
+#[inline]
+pub fn on_syscall(nr: usize, args: [usize; 6], ip: u64) -> Option<isize> {
+    let s = crate::current_seccomp()?;
+    on_syscall_slow(s, nr, args, ip)
+}
+
+#[inline(never)]
+fn on_syscall_slow(s: &SeccompSlot, nr: usize, args: [usize; 6], ip: u64) -> Option<isize> {
+    if s.mode() == MODE_STRICT {
+        if strict_allows(nr) { return None; }
+        crate::exit_group_signal(SIGKILL);
+    }
+    let d = SeccompData {
+        nr: nr as i32, arch: AUDIT_ARCH_NATIVE, instruction_pointer: ip,
+        args: [args[0] as u64, args[1] as u64, args[2] as u64,
+               args[3] as u64, args[4] as u64, args[5] as u64],
+    };
+    let ret = s.evaluate(&d)?;
+    let data = ret & SECCOMP_RET_DATA;
+    match ret & SECCOMP_RET_ACTION_FULL {
+        SECCOMP_RET_ALLOW => None,
+        SECCOMP_RET_LOG => { log_syscall(nr); None }
+        SECCOMP_RET_ERRNO => Some(-(data.min(4095) as isize)),
+        // No tracer / no listener attached: Linux answers ENOSYS.
+        SECCOMP_RET_TRACE | SECCOMP_RET_USER_NOTIF => Some(-ENOSYS),
+        // TODO(lane sectrap): deliver a synchronous SIGSYS instead.
+        SECCOMP_RET_TRAP | SECCOMP_RET_KILL_THREAD => {
+            // TODO: a multithreaded KILL_THREAD should end only this thread.
+            log_syscall(nr);
+            crate::exit_group_signal(SIGSYS)
+        }
+        _ => { log_syscall(nr); crate::exit_group_signal(SIGSYS) } // KILL_PROCESS + unknown
+    }
+}
+
+fn log_syscall(nr: usize) {
+    extern "C" { fn serial_print(s: *const u8, len: usize); }
+    let m = alloc::format!("seccomp: pid {} syscall {}\n", crate::current_pid(), nr);
+    unsafe { serial_print(m.as_ptr(), m.len()); }
+}
