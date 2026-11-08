@@ -4343,25 +4343,17 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
             if arg2 != 0 || a3 != 0 || a4 != 0 || a5 != 0 { return -22; }
             sched::no_new_privs() as isize
         }
-<<<<<<< HEAD
+        PR_CAPBSET_READ => match sched::caps::caps_of(0) {
+            Some(c) if arg2 <= sched::caps::CAP_LAST as usize => (c[3] >> arg2 & 1) as isize,
+            _ => -22,
+        },
+        PR_CAPBSET_DROP => sched::caps::bset_drop(arg2.min(255) as u32),
         PR_GET_SECCOMP => sched::seccomp::current_mode() as isize,
         PR_SET_SECCOMP => match arg2 {
             1 if a3 == 0 => sched::seccomp::set_mode_strict(),
             2 => sched::seccomp::set_mode_filter(0, a3),
             _ => -22,
         },
-=======
-        PR_CAPBSET_READ => match sched::caps::caps_of(0) {
-            Some(c) if arg2 <= sched::caps::CAP_LAST as usize => (c[3] >> arg2 & 1) as isize,
-            _ => -22,
-        },
-        PR_CAPBSET_DROP => sched::caps::bset_drop(arg2.min(255) as u32),
-        // seccomp is not installable yet (lane seccore S1): report mode 0 and
-        // refuse to set, so a prober (Firefox) sees "unsupported" and skips
-        // the sandbox instead of installing a filter and crashing.
-        PR_GET_SECCOMP => 0,
-        PR_SET_SECCOMP => -22,
->>>>>>> main
         _ => 0, // silently accept anything else
     }
 }

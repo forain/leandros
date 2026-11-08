@@ -188,7 +188,7 @@ pub fn set_mode_filter(flags: u32, fprog: usize) -> isize {
     let len = u16::from_ne_bytes([hdr[0], hdr[1]]) as usize;
     let ptr = u64::from_ne_bytes(hdr[8..16].try_into().unwrap()) as usize;
     if len == 0 || len > seccomp_bpf::BPF_MAXINSNS { return -EINVAL; }
-    if !crate::no_new_privs() && crate::current_euid() != 0 { return -EACCES; }
+    if !crate::no_new_privs() && !crate::caps::capable(21 /* CAP_SYS_ADMIN */) { return -EACCES; }
     let mut insns: alloc::vec::Vec<SockFilter> = alloc::vec::Vec::new();
     insns.resize(len, SockFilter { code: 0, jt: 0, jf: 0, k: 0 });
     if unsafe { crate::uaccess::copy_from_user(insns.as_mut_ptr() as *mut u8, ptr, len * 8) } != 0 {
