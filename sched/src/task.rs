@@ -476,6 +476,9 @@ pub struct Task {
     pub pidns: crate::ns::NsRef,
     /// pid_for_children: the namespace this task's children are placed in.
     pub pidns_child: crate::ns::NsRef,
+    /// Network / IPC namespace ids (0 = initial); inherited by clone.
+    pub netns: crate::ns::NsRef,
+    pub ipcns: crate::ns::NsRef,
     pub egid: u32,
     pub suid: u32,
     pub sgid: u32,
@@ -878,6 +881,8 @@ impl Task {
             userns: crate::ns::NsRef::INIT,
             pidns: crate::ns::NsRef::INIT,
             pidns_child: crate::ns::NsRef::INIT,
+            netns: crate::ns::NsRef::INIT,
+            ipcns: crate::ns::NsRef::INIT,
             egid: 0,
             suid: 0,
             sgid: 0,
@@ -1310,6 +1315,8 @@ impl Task {
             userns: crate::ns::NsRef::INIT,
             pidns: crate::ns::NsRef::INIT,
             pidns_child: crate::ns::NsRef::INIT,
+            netns: crate::ns::NsRef::INIT,
+            ipcns: crate::ns::NsRef::INIT,
             egid: 0,
             suid: 0,
             sgid: 0,
