@@ -470,6 +470,8 @@ pub struct Task {
     pub euid: u32,
     /// Capability sets [effective, permitted, inheritable, bounding] (bits 0..40).
     pub caps: [u64; 4],
+    /// User namespace (0 = initial); one counted reference.
+    pub userns: crate::ns::NsRef,
     pub egid: u32,
     pub suid: u32,
     pub sgid: u32,
@@ -869,6 +871,7 @@ impl Task {
             gid: 0,
             euid: 0,
             caps: crate::caps::ROOT_CAPS,
+            userns: crate::ns::NsRef::INIT,
             egid: 0,
             suid: 0,
             sgid: 0,
@@ -1298,6 +1301,7 @@ impl Task {
             gid: 0,
             euid: 0,
             caps: crate::caps::ROOT_CAPS,
+            userns: crate::ns::NsRef::INIT,
             egid: 0,
             suid: 0,
             sgid: 0,
