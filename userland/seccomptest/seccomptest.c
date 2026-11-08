@@ -14,6 +14,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -200,8 +201,6 @@ static int c_verifier(void) {
     if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &pf) != -1 || errno != EFAULT) return 4;
     errno = 0;
     if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 8 /*unknown flag*/, &prog) != -1 || errno != EINVAL) return 5;
-    errno = 0;
-    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 1 /*TSYNC*/, &prog) != -1 || errno != EINVAL) return 6;
     return prctl(PR_GET_SECCOMP, 0, 0, 0, 0) == 0 ? 0 : 7;   /* nothing got installed */
 }
 static int c_strict_ok(void) {
@@ -221,6 +220,84 @@ static int c_action_avail(void) {
     a = 0x12340000u;
     errno = 0;
     return (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &a) == -1 && errno == EOPNOTSUPP) ? 0 : 2;
+}
+
+/* ---- Group I: SECCOMP_FILTER_FLAG_TSYNC ---- */
+#define F_TSYNC 1UL
+#define F_TSYNC_ESRCH 16UL
+static volatile int g_go, g_ready, g_spin_saw, g_blk_saw, g_done, g_tid, g_nnp;
+static void futex_wait(volatile int *a, int v) { syscall(SYS_futex, a, 0 /*WAIT*/, v, 0, 0, 0); }
+static void futex_wake(volatile int *a) { syscall(SYS_futex, a, 1 /*WAKE*/, 1 << 20, 0, 0, 0); }
+static void wait_for(volatile int *a, int v) { while (*a < v) sched_yield(); }
+
+static void *t_spin(void *a) {
+    (void)a; g_ready++;
+    for (long i = 0; i < 50000000 && !g_spin_saw; i++)
+        if (PPID_IS(EPERM)) g_spin_saw = 1;
+    return 0;
+}
+static void *t_block(void *a) {
+    (void)a; g_ready++;
+    while (!g_go) futex_wait(&g_go, 0);       /* blocked in a syscall across the install */
+    if (PPID_IS(EPERM)) g_blk_saw = 1;
+    return 0;
+}
+static int c_tsync_threads(void) {
+    pthread_t a, b;
+    nnp();
+    pthread_create(&a, 0, t_spin, 0); pthread_create(&b, 0, t_block, 0);
+    wait_for(&g_ready, 2);
+    usleep(50000);
+    if (install_getppid(RET_ERRNO(EPERM), F_TSYNC) != 0) return 1;
+    g_go = 1; futex_wake(&g_go);
+    pthread_join(a, 0); pthread_join(b, 0);
+    if (!g_spin_saw) return 2;
+    if (!g_blk_saw) return 3;
+    return 0;
+}
+static void *t_diverge(void *a) {
+    (void)a; nnp();
+    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) != 0) { g_tid = -1; return 0; }
+    g_tid = syscall(SYS_gettid); g_ready++;
+    while (!g_done) sched_yield();
+    return 0;
+}
+static int diverge(unsigned long extra, int want_esrch) {
+    pthread_t t;
+    nnp();
+    pthread_create(&t, 0, t_diverge, 0);
+    wait_for(&g_ready, 1);
+    errno = 0;
+    long r = install_getppid(RET_ERRNO(EPERM), F_TSYNC | extra);
+    int rc = 0;
+    if (want_esrch) { if (!(r == -1 && errno == ESRCH)) rc = 1; }
+    else if (r != g_tid || r <= 0) rc = 2;
+    if (PPID_IS(EPERM)) rc = 3;       /* a failed TSYNC must not install anywhere */
+    g_done = 1; pthread_join(t, 0);
+    return rc;
+}
+static int c_tsync_diverge(void) { return diverge(0, 0); }
+static int c_tsync_esrch(void) { return diverge(F_TSYNC_ESRCH, 1); }
+static void *t_nnp(void *a) {
+    (void)a; g_ready++;
+    while (!g_done) sched_yield();
+    g_nnp = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+    return 0;
+}
+static int c_tsync_nnp(void) {
+    pthread_t t;
+    pthread_create(&t, 0, t_nnp, 0);
+    wait_for(&g_ready, 1);
+    nnp();
+    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, F_TSYNC, &prog) != 0) return 1;
+    g_done = 1; pthread_join(t, 0);
+    return g_nnp == 1 ? 0 : 2;
+}
+static int c_esrch_alone(void) {
+    nnp();
+    errno = 0;
+    long r = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, F_TSYNC_ESRCH, &prog);
+    return (r == -1 && errno == EINVAL) ? 0 : 1;
 }
 
 
@@ -302,6 +379,11 @@ int main(int argc, char **argv) {
     exit0("strict_allows_rw_exit", c_strict_ok);
     killed("strict_kills_other_syscall", c_strict_kill, SIGKILL);
     exit0("action_avail", c_action_avail);
+    exit0("tsync_reaches_running_and_blocked_threads", c_tsync_threads);
+    exit0("tsync_divergent_thread_returns_tid", c_tsync_diverge);
+    exit0("tsync_esrch_variant", c_tsync_esrch);
+    exit0("tsync_propagates_no_new_privs", c_tsync_nnp);
+    exit0("tsync_esrch_without_tsync_einval", c_esrch_alone);
     exit0("proc_status_seccomp", c_proc_status);
     exit0("proc_status_strict", c_proc_strict);
 
