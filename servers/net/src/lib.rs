@@ -1031,6 +1031,8 @@ struct BoundPath {
     /// True for a Linux abstract-namespace address (sun_path[0] == 0): matched
     /// by bytes here, never backed by a VFS node.
     is_abstract: bool,
+    /// Network namespace of the binder: abstract names are scoped by it.
+    netns:      u16,
     /// How many things still hold this bound address: one per `UnixListening`
     /// fd naming it, plus one per in-flight SCM_RIGHTS copy. The address stops
     /// resolving only when the LAST of them goes away.
@@ -1049,7 +1051,7 @@ struct BoundPath {
 impl BoundPath {
     const fn new() -> Self {
         Self { in_use: false, path: [0u8; PATH_MAX], path_len: 0,
-               sock_id: 0, is_abstract: false, refs: 0,
+               sock_id: 0, is_abstract: false, netns: 0, refs: 0,
                _owner_pid: 0, _owner_sock: 0 }
     }
 }
@@ -3833,7 +3835,7 @@ pub fn force_bind_unix(path_str: &str, _port: u32) {
             path,
             path_len,
             sock_id: alloc_sock_id(),
-            is_abstract: false,
+            is_abstract: false, netns: 0,
             // No fd names this one — it is bound on behalf of the system, and
             // the single reference is what keeps it alive for good.
             refs: 1,
@@ -3989,6 +3991,9 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             if port != 0 && port < 1024 && sched::euid_of(pid) != 0 { return err_reply(-13); }
             let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
             let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+            // A fresh network namespace has only a DOWN loopback: no address
+            // can be bound but the wildcard.
+            if !ip.is_unspecified() && sched::ns::netns_of(pid) != 0 { return err_reply(-99); }
 
             // An address no interface owns is EADDRNOTAVAIL on Linux. INADDR_ANY
             // and 127.0.0.0/8 always bind; anything else must be an address the
@@ -4131,9 +4136,10 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 }
             } else {
                 // Abstract namespace: byte-matched here, never a VFS node.
+                let nsid = sched::ns::netns_of(pid);
                 let bound = BOUND_PATHS.lock();
                 for bp in bound.iter() {
-                    if bp.in_use && bp.is_abstract && bp.path_len == path_len
+                    if bp.in_use && bp.is_abstract && bp.netns == nsid && bp.path_len == path_len
                        && bp.path[..path_len] == pbytes[..path_len] {
                         return err_reply(-98); // EADDRINUSE
                     }
@@ -4148,7 +4154,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 None => return err_reply(-12),
             };
             bound[idx] = BoundPath { in_use: true, path: pbytes, path_len,
-                                     sock_id, is_abstract, refs: 1,
+                                     sock_id, is_abstract, netns: if is_abstract { sched::ns::netns_of(pid) } else { 0 }, refs: 1,
                                      _owner_pid: pid, _owner_sock: slot };
             drop(bound);
 
@@ -4740,6 +4746,8 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
     if addrlen < 2 { return err_reply(-22); }
 
     let sa_family = match sched::uaccess::read_user::<u16>(addr_ptr) { Some(f) => f as usize, None => return err_reply(-14) };
+    // A fresh network namespace has no routes and a DOWN loopback.
+    if (sa_family == AF_INET || sa_family == 10) && sched::ns::netns_of(pid) != 0 { return err_reply(-101); }
 
     // connect(AF_UNSPEC) on an AF_INET socket (it used to fall into the
     // AF_UNIX path below): see `inet_disconnect`.
@@ -4914,10 +4922,11 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         // names byte-match here; pathnames resolve through the VFS (symlinks,
         // the /dev/shm and /run/user tmpfs mounts, S_IFSOCK check).
         let sock_id = if is_abstract {
+            let nsid = sched::ns::netns_of(pid);
             let bound = BOUND_PATHS.lock();
             let mut found = None;
             for bp in bound.iter() {
-                if bp.in_use && bp.is_abstract && bp.path_len == path_len
+                if bp.in_use && bp.is_abstract && bp.netns == nsid && bp.path_len == path_len
                    && bp.path[..path_len] == pbytes[..path_len] {
                     found = Some(bp.sock_id);
                     break;
@@ -5107,6 +5116,11 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                  kdata: Option<alloc::vec::Vec<u8>>) -> Message {
     let len = match kdata { Some(ref d) => d.len(), None => len };
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
+    if addr_ptr != 0 && addrlen >= 2 && sched::ns::netns_of(pid) != 0 {
+        if let Some(f) = sched::uaccess::read_user::<u16>(addr_ptr) {
+            if f as usize == AF_INET || f as usize == 10 { return err_reply(-101); }
+        }
+    }
     // Shared: a send only reads the table (lane ipcfast: the write lock here
     // serialized every send in the system and stalled all readers).
     let tbls = SOCK_TABLES.read();

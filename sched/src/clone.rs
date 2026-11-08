@@ -154,11 +154,16 @@ pub struct ForkOpts {
     pub set_tid: Option<u32>,
     /// CLONE_FS: share cwd, root and umask with the parent.
     pub share_fs: bool,
+    /// CLONE_NEWUSER: the pre-created user namespace id for the child (0 = inherit).
+    pub userns: crate::ns::NsId,
+    /// CLONE_NEWNET / CLONE_NEWIPC: pre-created ids for the child (0 = inherit).
+    pub netns: crate::ns::NsId,
+    pub ipcns: crate::ns::NsId,
 }
 
 impl Default for ForkOpts {
     fn default() -> Self {
-        ForkOpts { vfork: false, child_stack: 0, tls: None, exit_signal: 17, set_tid: None, share_fs: false }
+        ForkOpts { vfork: false, child_stack: 0, tls: None, exit_signal: 17, set_tid: None, share_fs: false, userns: 0, netns: 0, ipcns: 0 }
     }
 }
 
@@ -392,7 +397,13 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         // ── Step 6: gather parent credentials ────────────────────────────────
         let mut rlimits = crate::task::RLIMIT_DEFAULTS;
         let mut affinity = 0u64;
-        let caps = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.caps).unwrap_or(crate::caps::ROOT_CAPS);
+        let (caps, puser) = super::RUN_QUEUE.lock().find_pid(parent_pid)
+            .map(|t| (t.caps, t.userns.id())).unwrap_or((crate::caps::ROOT_CAPS, 0));
+        let (pnet, pipc) = super::RUN_QUEUE.lock().find_pid(parent_pid)
+            .map(|t| (t.netns.id(), t.ipcns.id())).unwrap_or((0, 0));
+        let pnet = if opts.netns != 0 { opts.netns } else { pnet };
+        let pipc = if opts.ipcns != 0 { opts.ipcns } else { pipc };
+        let (caps, puser) = if opts.userns != 0 { (crate::caps::userns_root_caps(caps[3]), opts.userns) } else { (caps, puser) };
         let (heap_start, heap_end, pid, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, cwd, tls_base,
              nice, umask, root, signal_mask, groups, altstack, no_new_privs) = {
             let rq = super::RUN_QUEUE.lock();
@@ -466,6 +477,9 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.gid           = gid;
         child.euid          = euid;
         child.caps          = caps;
+        child.userns        = crate::ns::NsRef::get(puser);
+        child.netns         = crate::ns::NsRef::get(pnet);
+        child.ipcns         = crate::ns::NsRef::get(pipc);
         child.egid          = egid;
         child.suid          = suid;
         child.sgid          = sgid;
@@ -729,7 +743,10 @@ pub fn clone_thread(
         // ── Collect parent credentials and page table ─────────────────────────
         let mut rlimits = crate::task::RLIMIT_DEFAULTS;
         let mut affinity = 0u64;
-        let caps = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.caps).unwrap_or(crate::caps::ROOT_CAPS);
+        let (caps, puser) = super::RUN_QUEUE.lock().find_pid(parent_pid)
+            .map(|t| (t.caps, t.userns.id())).unwrap_or((crate::caps::ROOT_CAPS, 0));
+        let (pnet, pipc) = super::RUN_QUEUE.lock().find_pid(parent_pid)
+            .map(|t| (t.netns.id(), t.ipcns.id())).unwrap_or((0, 0));
         let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, heap_start, heap_end,
              ctid_phys, ptid_phys, cwd, leader_as, nice, umask, root, signal_mask, groups,
              no_new_privs) = {
@@ -825,6 +842,9 @@ pub fn clone_thread(
         child.uid        = uid;  child.gid  = gid;
         child.euid       = euid; child.egid = egid;
         child.caps       = caps;
+        child.userns     = crate::ns::NsRef::get(puser);
+        child.netns      = crate::ns::NsRef::get(pnet);
+        child.ipcns      = crate::ns::NsRef::get(pipc);
         child.suid       = suid; child.sgid = sgid;
         child.ngroups    = groups.0; child.groups = groups.1;
         (child.no_new_privs, child.fsuid, child.fsgid, child.dumpable) = no_new_privs;

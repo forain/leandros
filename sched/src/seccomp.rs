@@ -151,6 +151,8 @@ pub const AUDIT_ARCH_NATIVE: u32 = 0xc000_00b7;
 pub const FLAG_TSYNC: u32 = 1;
 pub const FLAG_LOG: u32 = 2;
 pub const FLAG_SPEC_ALLOW: u32 = 4;
+pub const FLAG_TSYNC_ESRCH: u32 = 16;
+const ESRCH: isize = 3;
 
 const SIGKILL: u32 = 9;
 const SIGSYS: u32 = 31;
@@ -182,7 +184,9 @@ pub fn set_mode_strict() -> isize {
 /// seccomp(SECCOMP_SET_MODE_FILTER, flags, fprog) / prctl(PR_SET_SECCOMP, 2,
 /// fprog) with `flags = 0`. `fprog` is a user `struct sock_fprog`.
 pub fn set_mode_filter(flags: u32, fprog: usize) -> isize {
-    if flags & !(FLAG_LOG | FLAG_SPEC_ALLOW) != 0 { return -EINVAL; } // TSYNC: lane sectsync
+    if flags & !(FLAG_TSYNC | FLAG_LOG | FLAG_SPEC_ALLOW | FLAG_TSYNC_ESRCH) != 0 { return -EINVAL; }
+    // ESRCH only makes sense with TSYNC (Linux).
+    if flags & FLAG_TSYNC_ESRCH != 0 && flags & FLAG_TSYNC == 0 { return -EINVAL; }
     let mut hdr = [0u8; 16]; // { u16 len; pad; u64 filter }
     if unsafe { crate::uaccess::copy_from_user(hdr.as_mut_ptr(), fprog, 16) } != 0 { return -EFAULT; }
     let len = u16::from_ne_bytes([hdr[0], hdr[1]]) as usize;
@@ -195,13 +199,51 @@ pub fn set_mode_filter(flags: u32, fprog: usize) -> isize {
         return -EFAULT;
     }
     let prog = match check_filter(&insns) { Ok(p) => p, Err(_) => return -EINVAL };
-    let rq = crate::RUN_QUEUE.lock();
-    let Some(t) = rq.find_pid(crate::current_pid()) else { return -EINVAL };
+    let mut rq = crate::RUN_QUEUE.lock();
+    let me = crate::current_pid();
+    let Some(t) = rq.find_pid(me) else { return -EINVAL };
     if t.seccomp.mode() == MODE_STRICT { return -EINVAL; }
-    match FilterNode::push(prog, t.seccomp.head_arc(), flags & FLAG_LOG != 0) {
-        Some(n) => { t.seccomp.install(n); 0 }
-        None => -12, // ENOMEM: path budget exceeded (Linux)
+    let tgid = t.tgid;
+    let nnp = t.no_new_privs;
+    let old_head: *const FilterNode = t.seccomp.head().map_or(core::ptr::null(), |h| h as *const _);
+    let node = match FilterNode::push(prog, t.seccomp.head_arc(), flags & FLAG_LOG != 0) {
+        Some(n) => n,
+        None => return -12, // ENOMEM: path budget exceeded (Linux)
+    };
+    if flags & FLAG_TSYNC == 0 { t.seccomp.install(node); return 0; }
+    // TSYNC: every other thread's chain must be an ancestor of (or equal to)
+    // the caller's, or be empty. The check and the installs share this one
+    // RUN_QUEUE hold, so no thread can clone or install in between. Each
+    // sibling reads its own slot (the per-CPU mirror points at the slot, not
+    // the head), so a swap here is seen at its next syscall entry.
+    let mut targets: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    for i in rq.live_slots() {
+        let Some(o) = rq.get(i) else { continue };
+        if o.tgid != tgid || o.pid == me { continue; }
+        match o.seccomp.mode() {
+            MODE_DISABLED => {}
+            MODE_FILTER => {
+                let mut ok = false;
+                let mut n = if old_head.is_null() { None } else { Some(unsafe { &*old_head }) };
+                let oh = o.seccomp.head().map_or(core::ptr::null(), |h| h as *const FilterNode);
+                while let Some(c) = n {
+                    if c as *const FilterNode == oh { ok = true; break; }
+                    n = c.prev.as_deref();
+                }
+                if !ok { return if flags & FLAG_TSYNC_ESRCH != 0 { -ESRCH } else { o.pid as isize }; }
+            }
+            _ => return if flags & FLAG_TSYNC_ESRCH != 0 { -ESRCH } else { o.pid as isize },
+        }
+        targets.push(i);
     }
+    for &i in &targets {
+        if let Some(o) = rq.get_mut(i) {
+            o.seccomp.install(node.clone());
+            if nnp { o.no_new_privs = true; }
+        }
+    }
+    if let Some(t) = rq.find_pid(me) { t.seccomp.install(node); }
+    0
 }
 
 /// seccomp(SECCOMP_GET_ACTION_AVAIL): 0 if the kernel knows the action.
@@ -277,4 +319,14 @@ fn log_syscall(nr: usize) {
     extern "C" { fn serial_print(s: *const u8, len: usize); }
     let m = alloc::format!("seccomp: pid {} syscall {}\n", crate::current_pid(), nr);
     unsafe { serial_print(m.as_ptr(), m.len()); }
+}
+
+/// (NoNewPrivs, Seccomp mode, filter count) of `pid` (0 = caller) for /proc status.
+pub fn status_of(pid: u32) -> Option<(bool, u32, u32)> {
+    let pid = if pid == 0 { crate::current_pid() } else { pid };
+    let rq = crate::RUN_QUEUE.lock();
+    rq.find_pid(pid).map(|t| {
+        let n = t.seccomp.head_arc().map(|h| h.depth).unwrap_or(0);
+        (t.no_new_privs, t.seccomp.mode(), n)
+    })
 }
