@@ -16371,6 +16371,10 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
     let flags = req.flags;
     // A pidfd names a process; thread pidfds (PIDFD_THREAD) are not offered.
     if flags & CLONE_PIDFD != 0 && flags & CLONE_THREAD != 0 { return -22; }
+    // No namespace type is implemented yet: refuse rather than silently run
+    // the child unconfined in the parent's namespaces (same as unshare).
+    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER
+                | CLONE_NEWPID | CLONE_NEWNET) != 0 { return -22; }
     // Linux's copy_process consistency rules.
     if flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0 { return -22; }
     if flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0 { return -22; }
