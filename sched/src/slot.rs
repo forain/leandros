@@ -70,6 +70,7 @@ pub struct SchedSlot {
     pub m_pt: AtomicUsize,
     pub m_as: AtomicUsize,
     pub m_sighint: AtomicUsize,
+    pub m_seccomp: AtomicUsize,
     pub m_gs: AtomicU64,
     pub m_rseq_addr: AtomicUsize,
     pub m_rseq_sig: AtomicU32,
@@ -139,7 +140,7 @@ impl SchedSlot {
             m_pid: AtomicU32::new(0), m_tgid: AtomicU32::new(0),
             vr: AtomicU64::new(0), vd: AtomicU64::new(0),
             m_ctx: AtomicUsize::new(0), m_kst: AtomicUsize::new(0), m_pt: AtomicUsize::new(0),
-            m_as: AtomicUsize::new(0), m_sighint: AtomicUsize::new(0), m_gs: AtomicU64::new(0),
+            m_as: AtomicUsize::new(0), m_sighint: AtomicUsize::new(0), m_seccomp: AtomicUsize::new(0), m_gs: AtomicU64::new(0),
             m_rseq_addr: AtomicUsize::new(0), m_rseq_sig: AtomicU32::new(0), m_reply: AtomicU32::new(0),
             ready_since: AtomicU64::new(0), cpu_ns: AtomicU64::new(0), sys_ns: AtomicU64::new(0),
             sc_ns: AtomicU64::new(0), sc_t0: AtomicU64::new(0), sc_nr: AtomicU32::new(0),
@@ -425,6 +426,7 @@ pub fn publish(t: &Task) {
     s.m_rseq_addr.store(t.rseq.addr, Ordering::Relaxed);
     s.m_rseq_sig.store(t.rseq.sig, Ordering::Relaxed);
     s.m_sighint.store(&t.sig_hint as *const _ as usize, Ordering::Relaxed);
+    s.m_seccomp.store(&t.seccomp as *const _ as usize, Ordering::Relaxed);
     s.m_gs.store(t.user_gs_base, Ordering::Relaxed);
     s.m_reply.store(t.reply_port, Ordering::Relaxed);
     s.m_pid.store(t.pid, Ordering::Relaxed);
@@ -453,6 +455,7 @@ pub(crate) struct Dispatch {
     pub pt: usize,
     pub as_ptr: usize,
     pub sighint: usize,
+    pub seccomp: usize,
     pub gs: u64,
     pub rseq_addr: usize,
     pub rseq_sig: u32,
@@ -468,7 +471,7 @@ pub(crate) fn dispatch_values(idx: usize) -> Dispatch {
     Dispatch {
         ctx: s.m_ctx.load(Ordering::Relaxed), kst: s.m_kst.load(Ordering::Relaxed),
         pt: s.m_pt.load(Ordering::Relaxed), as_ptr: s.m_as.load(Ordering::Relaxed),
-        sighint: s.m_sighint.load(Ordering::Relaxed), gs: s.m_gs.load(Ordering::Relaxed),
+        sighint: s.m_sighint.load(Ordering::Relaxed), seccomp: s.m_seccomp.load(Ordering::Relaxed), gs: s.m_gs.load(Ordering::Relaxed),
         rseq_addr: s.m_rseq_addr.load(Ordering::Relaxed), rseq_sig: s.m_rseq_sig.load(Ordering::Relaxed),
         reply: s.m_reply.load(Ordering::Relaxed), pid: s.m_pid.load(Ordering::Relaxed), tgid,
     }
