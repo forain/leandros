@@ -125,6 +125,8 @@ pub const SI_USER:   i32 = 0;
 /// Sent by the kernel itself (VT switch's SIGUSR1/SIGUSR2, and anything else
 /// with no originating process).
 pub const SI_KERNEL: i32 = 0x80;
+/// SIGSYS `si_code` for a seccomp trap.
+pub const SYS_SECCOMP: i32 = 1;
 /// POSIX timer expiry (`timer_settime`).
 pub const SI_TIMER:  i32 = -2;
 /// `tkill(2)`/`tgkill(2)` â thread-directed, which `raise()` and
@@ -246,6 +248,16 @@ impl SigInfo {
     /// `sig` (`CLD_STOPPED`) or resumed (`CLD_CONTINUED`, `sig == SIGCONT`).
     pub const fn child_state(code: i32, pid: Pid, uid: u32, sig: u32) -> SigInfo {
         SigInfo { si_code: code, si_pid: pid as i32, si_uid: uid, si_status: sig as i32, si_addr: 0, si_value: 0 }
+    }
+
+    /// SIGSYS from a seccomp `SECCOMP_RET_TRAP` (Linux `force_sig_seccomp`):
+    /// `siginfo_t._sifields._sigsys`. Packed into the existing slots so the
+    /// per-signal payload does not grow: `si_pid` = `si_errno`
+    /// (SECCOMP_RET_DATA), `si_uid` = `si_arch`, `si_status` = `si_syscall`,
+    /// `si_value` = `si_call_addr`. `write_siginfo` unpacks it for `SYS_SECCOMP`.
+    pub const fn sigsys(errno: u32, arch: u32, syscall: i32, call_addr: u64) -> SigInfo {
+        SigInfo { si_code: SYS_SECCOMP, si_pid: errno as i32, si_uid: arch, si_status: syscall,
+                  si_addr: 0, si_value: call_addr }
     }
 
     /// A POSIX timer (`timer_create(2)`) expiry: `timerid` is the `timer_t`

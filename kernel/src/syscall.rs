@@ -1198,14 +1198,14 @@ pub extern "C" fn syscall_dispatch(
     // leaving its initiator spinning for the length of this syscall.
     mm::paging::tlb_service_pending();
     let ret = dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr);
-    if ret == ERESTARTSYS || ret == ERESTARTNOHAND {
+    if number != RT_SIGRETURN && (ret == ERESTARTSYS || ret == ERESTARTNOHAND) {
         // Never reaches user space: the frame gets EINTR, and the signal
         // pass that runs next rewinds to re-execute the syscall when no
         // handler runs, or (ERESTARTSYS only) when the handler has SA_RESTART.
         sched::signal::note_syscall_restart(number, a0, ret == ERESTARTSYS);
         return -4;
     }
-    if ret == ERESTART_RESTARTBLOCK {
+    if number != RT_SIGRETURN && ret == ERESTART_RESTARTBLOCK {
         // Same rule as ERESTARTNOHAND, but what gets re-executed is
         // restart_syscall(2), which resumes this thread's `restart_block`
         // (the original absolute deadline) rather than the original call
