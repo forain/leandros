@@ -702,9 +702,9 @@ const EDIT_CALLEE: u64 = 0x5eed_0000_0000_0002;
 
 extern "C" fn edit_regs_handler(_sig: c_int, _info: *const siginfo_t, uc: *mut c_void) {
     unsafe {
-        // aarch64: uc_mcontext.regs at ucontext+176; x86_64: gregs at +40.
+        // aarch64: uc_mcontext.regs at ucontext+184 (mcontext@176, fault_address first); x86_64: gregs at +40.
         let g = (uc as *mut u8).add(
-            if cfg!(target_arch = "aarch64") { 176 } else { 40 }) as *mut u64;
+            if cfg!(target_arch = "aarch64") { 184 } else { 40 }) as *mut u64;
         #[cfg(target_arch = "aarch64")]
         { *g.add(0) = EDIT_RET; *g.add(20) = EDIT_CALLEE; }
         // x86_64 gregs: REG_R12 = 4, REG_RAX = 13.

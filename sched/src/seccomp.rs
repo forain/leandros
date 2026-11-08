@@ -247,11 +247,27 @@ fn on_syscall_slow(s: &SeccompSlot, nr: usize, args: [usize; 6], ip: u64) -> Opt
         SECCOMP_RET_ERRNO => Some(-(data.min(4095) as isize)),
         // No tracer / no listener attached: Linux answers ENOSYS.
         SECCOMP_RET_TRACE | SECCOMP_RET_USER_NOTIF => Some(-ENOSYS),
-        // TODO(lane sectrap): deliver a synchronous SIGSYS instead.
-        SECCOMP_RET_TRAP | SECCOMP_RET_KILL_THREAD => {
-            // TODO: a multithreaded KILL_THREAD should end only this thread.
+        // The syscall is not executed. SIGSYS is forced with Linux's siginfo;
+        // the frame return register holds Linux's "rolled back" value (x86:
+        // the syscall number, which chromium's handler checks against REG_RAX;
+        // aarch64: the original x0) so the handler sees what it would on Linux.
+        SECCOMP_RET_TRAP => {
+            if crate::signal::force_sigsys_seccomp(nr as i32, AUDIT_ARCH_NATIVE, ip, data as u32) {
+                #[cfg(target_arch = "x86_64")] { Some(nr as isize) }
+                #[cfg(target_arch = "aarch64")] { Some(args[0] as isize) }
+            } else {
+                log_syscall(nr);
+                crate::exit_group_signal(SIGSYS)
+            }
+        }
+        // Kills only the calling thread; the last thread takes the process
+        // down with SIGSYS.
+        SECCOMP_RET_KILL_THREAD => {
             log_syscall(nr);
-            crate::exit_group_signal(SIGSYS)
+            if crate::thread_count(crate::current_tgid()) <= 1 {
+                crate::exit_group_signal(SIGSYS)
+            }
+            crate::exit(128 + SIGSYS as i32)
         }
         _ => { log_syscall(nr); crate::exit_group_signal(SIGSYS) } // KILL_PROCESS + unknown
     }

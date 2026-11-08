@@ -24,6 +24,7 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <ucontext.h>
 
 #ifndef SYS_seccomp
 # if defined(__aarch64__)
@@ -51,6 +52,7 @@ struct sfprog { uint16_t len; struct sf *filter; };
 #define RET_KILL_PROCESS 0x80000000u
 #define RET_KILL_THREAD 0u
 #define RET_ERRNO(e) (0x00050000u | (e))
+#define RET_TRAP(d) (0x00030000u | (d))
 #define RET_TRACE 0x7ff00000u
 #define RET_LOG 0x7ffc0000u
 #define LD_NR   { 0x20, 0, 0, 0 }
@@ -221,6 +223,113 @@ static int c_action_avail(void) {
     return (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &a) == -1 && errno == EOPNOTSUPP) ? 0 : 2;
 }
 
+
+/* ---- group F/G/H: SECCOMP_RET_TRAP and KILL_THREAD (lane sectrap) ---- */
+#if defined(__aarch64__)
+# define AUDIT_ARCH_NATIVE 0xc00000b7u
+# define UC_SYSNR(uc)  ((long)(uc)->uc_mcontext.regs[8])
+# define UC_PC(uc)     ((unsigned long)(uc)->uc_mcontext.pc)
+# define UC_RET(uc)    ((uc)->uc_mcontext.regs[0])
+#else
+# define AUDIT_ARCH_NATIVE 0xc000003eu
+# define UC_SYSNR(uc)  ((long)(uc)->uc_mcontext.gregs[REG_RAX])
+# define UC_PC(uc)     ((unsigned long)(uc)->uc_mcontext.gregs[REG_RIP])
+# define UC_RET(uc)    ((uc)->uc_mcontext.gregs[REG_RAX])
+#endif
+#define TRAP_DATA 0x77
+static volatile int trap_ok, trap_hits;
+static volatile int trap_bad_field;
+static volatile unsigned long dbg[7];
+static void sigsys_handler(int sig, siginfo_t *si, void *vuc) {
+    ucontext_t *uc = vuc;
+    int bad = 0;
+    /* chromium Trap::SigSysAction sanity checks */
+    if (sig != SIGSYS || si->si_signo != SIGSYS) bad |= 1;
+    if (si->si_code != 1) bad |= 2;                       /* SYS_SECCOMP */
+    if (si->si_syscall != SYS_getpid) bad |= 4;
+    if (si->si_arch != AUDIT_ARCH_NATIVE) bad |= 8;
+    if (si->si_errno != TRAP_DATA) bad |= 16;
+    if ((unsigned long)si->si_call_addr == 0) bad |= 32;
+    if ((unsigned long)si->si_call_addr != UC_PC(uc)) bad |= 64;
+    if (UC_SYSNR(uc) != SYS_getpid) bad |= 128;           /* x86 rax / a64 x8 == nr */
+    trap_bad_field = bad;
+    dbg[0]=(unsigned long)si->si_call_addr; dbg[1]=UC_PC(uc); dbg[2]=UC_SYSNR(uc); dbg[3]=si->si_syscall; dbg[4]=si->si_arch; dbg[5]=si->si_errno; dbg[6]=si->si_code;
+    trap_ok = (bad == 0);
+    trap_hits++;
+    UC_RET(uc) = 4242;
+}
+static void set_sigsys_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = sigsys_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGSYS, &sa, 0);
+}
+static long install_nr(long nr, unsigned act) {
+    struct sf f[4] = { LD_NR, JEQ(nr), RET(act), RET(RET_ALLOW) };
+    struct sfprog p = { 4, f };
+    return syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &p);
+}
+static int c_trap(void) {
+    set_sigsys_handler(); nnp();
+    if (install_nr(SYS_getpid, RET_TRAP(TRAP_DATA)) != 0) return 90;
+    long r = syscall(SYS_getpid);
+    if (trap_bad_field) { printf("trap dbg: call=%lx pc=%lx nr=%lx sys=%lx arch=%lx errno=%lx code=%lx\n", dbg[0],dbg[1],dbg[2],dbg[3],dbg[4],dbg[5],dbg[6]); fflush(stdout); }
+    if (trap_bad_field) return 100 + (trap_bad_field & 0xff) / 2 + 1;
+    if (!trap_ok || trap_hits != 1) return 91;
+    return r == 4242 ? 0 : 92;
+}
+static int c_trap_renter(void) { /* NODEFER: a second trap works after the first returned */
+    set_sigsys_handler(); nnp();
+    if (install_nr(SYS_getpid, RET_TRAP(TRAP_DATA)) != 0) return 90;
+    long a = syscall(SYS_getpid), b = syscall(SYS_getpid);
+    return (a == 4242 && b == 4242 && trap_hits == 2) ? 0 : 91;
+}
+static int c_trap_blocked(void) {
+    set_sigsys_handler(); nnp();
+    sigset_t m; sigemptyset(&m); sigaddset(&m, SIGSYS);
+    sigprocmask(SIG_BLOCK, &m, 0);
+    install_nr(SYS_getpid, RET_TRAP(TRAP_DATA));
+    syscall(SYS_getpid);
+    return 0;
+}
+static int c_trap_default(void) {
+    signal(SIGSYS, SIG_DFL); nnp();
+    install_nr(SYS_getpid, RET_TRAP(TRAP_DATA));
+    syscall(SYS_getpid);
+    return 0;
+}
+static int c_trap_ignored(void) {
+    signal(SIGSYS, SIG_IGN); nnp();
+    install_nr(SYS_getpid, RET_TRAP(TRAP_DATA));
+    syscall(SYS_getpid);
+    return 0;
+}
+static volatile int after_kill, kt_tid;
+static void *kt_thread(void *a) {
+    (void)a;
+    kt_tid = syscall(SYS_gettid);
+    syscall(SYS_getppid);
+    after_kill = 1;
+    return 0;
+}
+static int c_kill_thread_mt(void) {
+    pthread_t t;
+    nnp();
+    install_getppid(RET_KILL_THREAD, 0);
+    if (pthread_create(&t, 0, kt_thread, 0)) return 90;
+    /* musl's join waits for a self-set detach_state a killed thread never writes
+     * (same on Linux), so poll for the tid disappearing instead. */
+    int gone = 0;
+    for (int i = 0; i < 200 && !gone; i++) {
+        usleep(10000);
+        if (kt_tid && syscall(SYS_tgkill, getpid(), kt_tid, 0) == -1 && errno == ESRCH) gone = 1;
+    }
+    if (!gone) return 93;
+    if (after_kill) return 91;
+    usleep(20000);                 /* the process must still be alive and working */
+    return getpid() > 0 ? 0 : 92;
+}
 int main(int argc, char **argv) {
     self = argv[0];
     if (argc > 1 && !strcmp(argv[1], "exec-child"))
@@ -252,6 +361,12 @@ int main(int argc, char **argv) {
     exit0("strict_allows_rw_exit", c_strict_ok);
     killed("strict_kills_other_syscall", c_strict_kill, SIGKILL);
     exit0("action_avail", c_action_avail);
+    exit0("trap_sigsys_siginfo_and_emulation", c_trap);
+    exit0("trap_nodefer_repeat", c_trap_renter);
+    killed("trap_blocked_sigsys_fatal", c_trap_blocked, SIGSYS);
+    killed("trap_sig_dfl_fatal", c_trap_default, SIGSYS);
+    killed("trap_sig_ign_fatal", c_trap_ignored, SIGSYS);
+    exit0("kill_thread_only_that_thread", c_kill_thread_mt);
 
     printf("seccomptest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail;
