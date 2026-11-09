@@ -7861,7 +7861,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
     // /dev/mqueue/<name>: an open of a POSIX message queue (mqueue mount).
     if let Some(name) = mqueue::path_name(path) {
         let r = mqueue::open_path(pid, name, flags);
-        return if r < 0 { err_reply(r) } else { val_reply(r as u64) };
+        return if r < 0 { err_reply(r as i32) } else { val_reply(r as u64) };
     }
 
     // `/proc/<pid>/root[/...]` (and `/proc/self/root`) of a live process is
@@ -12389,7 +12389,7 @@ fn handle_unlink(pid: u32, path_ptr: usize) -> Message {
 
     if let Some(name) = mqueue::path_name(strip_trailing_slash(raw)) {
         let r = mqueue::unlink(pid, name);
-        return if r < 0 { err_reply(r) } else { ok_reply() };
+        return if r < 0 { err_reply(r as i32) } else { ok_reply() };
     }
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-21); } // EISDIR — mount root
