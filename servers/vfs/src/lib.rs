@@ -4606,6 +4606,9 @@ pub fn init(owner_pid: u32) -> Option<u32> {
         let e = &mut tmp[0];
         e.is_dir = true;
         e.mode   = 0o700;
+        // The hidden superblock space for namespace tmpfs instances: created
+        // here, at boot, root-owned and 0711, before any user can run.
+        let _ = tmpfs_inst_parents(&mut tmp);
     }
     
     // Register IPC handler to respond to PINGs (prevents deadlocks during discovery scans)
@@ -5201,9 +5204,12 @@ fn is_tmpfs_root(path: &[u8]) -> bool {
 /// The tmpfs root that owns `path` (the root itself, or a descendant under it),
 /// or `None` when no tmpfs mount owns it.
 fn tmpfs_root_of(path: &[u8]) -> Option<&'static [u8]> {
-    TMPFS_ROOTS.iter().copied().find(|&r| {
-        path == r || (path.len() > r.len() && path.starts_with(r) && path[r.len()] == b'/')
-    })
+    let under = |r: &[u8]| path == r || (path.len() > r.len() && path.starts_with(r) && path[r.len()] == b'/');
+    // The hidden namespace-instance pool counts as a tmpfs space, but only
+    // strictly below its kind directory (the directory itself is a plain
+    // pool entry created at boot).
+    if path.len() > TMPFS_INST_DIR.len() && under(TMPFS_INST_DIR) { return Some(TMPFS_INST_DIR); }
+    TMPFS_ROOTS.iter().copied().find(|&r| under(r))
 }
 
 /// Return true if `path` lives under any tmpfs mount root (root or descendant).
@@ -5692,6 +5698,7 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
 
     let mut cur = normalize_abs_floor(input, floor);
     let mut hops = 0u32;
+    let start_in_sb = mnt::is_sb_path(&cur);
 
     // The caller's credentials, for the traversal check on each directory the
     // walk passes through. Taken before TMP_FILES (RUN_QUEUE is never taken
@@ -5775,6 +5782,8 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
 
         drop(push);
         cur = normalize_abs_floor(&next[..n], floor);
+        // A link may not lead into the hidden superblock space.
+        if !start_in_sb && mnt::is_sb_path(&cur) { return Err(-2); }
     }
 
     Ok(cur)
@@ -6310,22 +6319,42 @@ fn gen_mntselftest() -> Option<VnodeKind> {
 }
 
 /// Interim tmpfs instances for mount namespaces (lane M1; lane M5 replaces
-/// this with real per-superblock roots under `/.leandros-sb`). An instance is
-/// a hidden directory in the `/tmp` pool: `/tmp/.leandros-sb/tmpfs/<n>`.
-/// Its parents are root-owned 0711 (traversable by name only) and the
-/// instance directory is 0700 owned by the creating uid, so only that uid
-/// reaches it from the initial namespace.
-const TMPFS_INST_PARENT: &[u8] = b"/tmp/.leandros-sb";
-const TMPFS_INST_DIR: &[u8] = b"/tmp/.leandros-sb/tmpfs";
+/// this with real per-superblock roots). An instance is a directory of the
+/// tmpfs pool under the hidden, root-owned backing prefix
+/// `/.leandros-sb/tmpfs/<n>`: no namespace path reaches the prefix (resolve_ns
+/// returns ENOENT, getdents hides it, a link hop into it from outside is
+/// ENOENT, and the mount-tree walk refuses it unless the mount root is itself
+/// there). The parents are created at boot, root-owned 0711; each instance
+/// directory is created exclusively (EEXIST if anything is there), 0700,
+/// owned by the creating uid.
+const TMPFS_INST_PARENT: &[u8] = b"/.leandros-sb";
+const TMPFS_INST_DIR: &[u8] = b"/.leandros-sb/tmpfs";
 
+/// Create the directory `path` exclusively: fails with EEXIST if any entry is
+/// there, whatever it is (an entry we did not create is never adopted).
 fn tmpfs_inst_mkdir(tmp: &mut TmpPool, path: &[u8], uid: u32, gid: u32, mode: u16) -> Result<(), i32> {
-    if tmp_find(tmp, path).is_some() { return Ok(()); }
+    if tmp_find(tmp, path).is_some() { return Err(-17); }
     let idx = tmp_free_slot(tmp).ok_or(-28)?;
     tmp.claim(idx, path, false);
     tmp[idx].is_dir = true;
     tmp[idx].uid = uid;
     tmp[idx].gid = gid;
     tmp_init_created(tmp, idx, path, mode, 0, true);
+    Ok(())
+}
+
+/// Ensure the root-owned parents exist. An existing entry is accepted only
+/// if it is a directory owned by root:root with mode 0711 (our own).
+fn tmpfs_inst_parents(tmp: &mut TmpPool) -> Result<(), i32> {
+    for p in [TMPFS_INST_PARENT, TMPFS_INST_DIR] {
+        match tmp_find(tmp, p) {
+            None => tmpfs_inst_mkdir(tmp, p, 0, 0, 0o711)?,
+            Some(i) => {
+                let e = &tmp[i];
+                if !e.is_dir || e.uid != 0 || e.gid != 0 || e.is_link { return Err(-17); }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -6343,8 +6372,7 @@ fn tmpfs_inst_root(n: u32) -> Vec<u8> {
 pub fn tmpfs_instance_create(n: u32, uid: u32, gid: u32) -> Result<Vec<u8>, i32> {
     let root = tmpfs_inst_root(n);
     let mut tmp = TMP_FILES.lock();
-    tmpfs_inst_mkdir(&mut tmp, TMPFS_INST_PARENT, 0, 0, 0o711)?;
-    tmpfs_inst_mkdir(&mut tmp, TMPFS_INST_DIR, 0, 0, 0o711)?;
+    tmpfs_inst_parents(&mut tmp)?;
     tmpfs_inst_mkdir(&mut tmp, &root, uid, gid, 0o700)?;
     Ok(root)
 }

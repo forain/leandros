@@ -3810,7 +3810,15 @@ fn wait_clone_sel(options: usize) -> u8 {
     else { sched::WAIT_NORMAL }
 }
 
+/// wait4(2): after a child is reaped its mount namespace may have died;
+/// free dead trees here (no scheduler lock held) instead of at the next create.
 fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, rusage: usize) -> isize {
+    let r = sys_wait4_inner(pid_raw, status_ptr, options, rusage);
+    if sched::ns::has_zombies() { vfs::mnt::reap(); }
+    r
+}
+
+fn sys_wait4_inner(pid_raw: usize, status_ptr: usize, options: usize, rusage: usize) -> isize {
     // Validate before blocking — catches bad pointers before we yield.
     if status_ptr != 0 && !validate_user_ptr_aligned(status_ptr, core::mem::size_of::<i32>(), 4) {
         return -14;
@@ -3921,6 +3929,12 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, rusage: usize) -
 /// child, returns 0 with a zeroed siginfo (si_pid == 0), per waitid(2) —
 /// brush polls exactly this shape after every SIGCHLD.
 fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
+    let r = sys_waitid_inner(idtype, id, infop, options);
+    if sched::ns::has_zombies() { vfs::mnt::reap(); }
+    r
+}
+
+fn sys_waitid_inner(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
     const WNOHANG:    usize = 1;
     const WSTOPPED:   usize = 2;
     const WEXITED:    usize = 4;
@@ -8779,7 +8793,7 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
     }
     if let Some((pid, rest)) = proc_magic(b, b"cwd") {
         if rest.is_empty() {
-            if sched::exists_probe(pid) == 0 && !proc_link_allowed(pid) { return Err(-13); }
+            if sched::exists_probe(pid) == 0 && !proc_root_allowed(pid) { return Err(-13); }
             let c = sched::cwd_arc_of(pid).ok_or(-2isize)?;
             return KPath::from_ns(c.to_vec());
         }
@@ -8787,7 +8801,7 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
     if let Some((pid, rest)) = proc_magic(b, b"root") {
         if rest.is_empty() {
             if sched::exists_probe(pid) != 0 { return Err(-2); }
-            if !proc_link_allowed(pid) { return Err(-13); }
+            if !proc_root_allowed(pid) { return Err(-13); }
             let r = sched::root_arc_of(pid).map(|r| r.to_vec()).unwrap_or_else(|| b"/".to_vec());
             return KPath::from_ns(r);
         }
@@ -9279,7 +9293,7 @@ fn sys_mount(
             let r = vfs_reply_val(&vfs::handle(&m, current_pid()));
             if r < 0 { return r; }
             let sdir = vfs::read_stat_mode(ss.as_ptr() as usize) & S_IFMT == S_IFDIR;
-            if sdir != tdir { return if sdir { -20 } else { -21 }; } // ENOTDIR / EISDIR
+            if sdir != tdir { return -20; } // ENOTDIR (both directions, as Linux graft_tree)
         } else if !tdir {
             return -20; // ENOTDIR
         }
@@ -9407,7 +9421,7 @@ fn sys_mount(
 /// May the caller change the mount table of mount namespace `mns`?
 /// CAP_SYS_ADMIN over the user namespace that owns it.
 fn mnt_may_mount(mns: sched::ns::NsId) -> bool {
-    match vfs::mnt::owner_of(mns) { Some(o) => sched::caps::ns_capable_in(21, o), None => false }
+    match vfs::mnt::owner_of(mns) { Some(o) => sched::caps::ns_capable_in(o, 21), None => false }
 }
 
 /// stat(2) the backing file of `kp`: Ok(is_dir).
@@ -9433,6 +9447,20 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
     const MS_PROPAGATION: usize = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
     vfs::mnt::reap();
     if !mnt_may_mount(mns) { return -1; } // EPERM
+    // Strip the legacy magic value, as do_mount does.
+    let flags = if flags & 0xffff_0000 == 0xc0ed_0000 { flags & 0xffff } else { flags };
+    // MS_PRIVATE / MS_SLAVE (optionally MS_REC): every mount in a namespace
+    // other than the initial one is already private (a copy of ns 0 has no
+    // peer groups, and a cross-owner copy turns shared into slave), so the
+    // change is a no-op once the target resolves. MS_SHARED and
+    // MS_UNBINDABLE stay EINVAL until propagation state exists.
+    const MS_PRIVATE: usize = 1 << 18;
+    const MS_SLAVE: usize = 1 << 19;
+    if flags & (MS_PRIVATE | MS_SLAVE) != 0
+        && flags & !(MS_PRIVATE | MS_SLAVE | MS_REC) == 0
+        && flags & (MS_PRIVATE | MS_SLAVE) != (MS_PRIVATE | MS_SLAVE) {
+        return match resolve_user_path(target_ptr) { Ok(_) => 0, Err(e) => e };
+    }
     if flags & (MS_REMOUNT | MS_MOVE | MS_PROPAGATION) != 0 { return -22; }
     let target = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
     let tns = target.ns_bytes().to_vec();
@@ -9440,7 +9468,7 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
     if flags & MS_BIND != 0 {
         let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
         let sdir = match kpath_is_dir(&src) { Ok(d) => d, Err(e) => return e };
-        if sdir != tdir { return if sdir { -20 } else { -21 }; } // ENOTDIR / EISDIR
+        if sdir != tdir { return -20; } // ENOTDIR (both directions, as Linux graft_tree)
         return match vfs::mnt::bind(mns, src.ns_bytes(), &tns, flags & MS_REC != 0) { Ok(_) => 0, Err(e) => e as isize };
     }
     let fstype = match read_user_short_str(fstype_ptr) { Ok(v) => v, Err(e) => return e };
@@ -9495,6 +9523,9 @@ fn sys_umount2(target_ptr: usize, flags: usize) -> isize {
 }
 
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
+    // The pivot rewrites the global (ns 0) mount table; inside a mount
+    // namespace it would re-root the host. Per-namespace pivot is lane M4.
+    if sched::current_mntns() != 0 { return -22; }
     if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
     let pid = current_pid();
     let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
@@ -10852,7 +10883,7 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
     // /proc/<pid>/cwd and /proc/<pid>/root.
     if let Some((pid, rest)) = proc_magic(path, b"cwd") {
         if rest.is_empty() {
-            if sched::exists_probe(pid) == 0 && !proc_link_allowed(pid) { return -13; }
+            if sched::exists_probe(pid) == 0 && !proc_root_allowed(pid) { return -13; }
             return match sched::cwd_arc_of(pid) {
                 Some(c) => reply(&jail_relative(&c)),
                 None => -2,
@@ -10877,7 +10908,7 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
     if let Some((pid, rest)) = proc_magic(path, b"root") {
         if rest.is_empty() {
             if sched::exists_probe(pid) != 0 { return -2; }
-            if !proc_link_allowed(pid) { return -13; }
+            if !proc_root_allowed(pid) { return -13; }
             return match sched::root_arc_of(pid) {
                 Some(r) => reply(&jail_relative(&r)),
                 None => reply(&jail_relative(b"/")),
@@ -11079,7 +11110,8 @@ impl KPath {
         let (mut mid, mut plen) = (0u32, 0usize);
         let backing = backing_walk_m(&ns, &mut crossed, &mut denied, mns, &mut mid, &mut plen);
         if denied { return Err(-13); }
-        let backing = match backing { Some(b) => b, None => ns.clone() };
+        // Fail closed: a task whose mount tree is missing never sees the host view.
+        let backing = match backing { Some(b) => b, None => return Err(-2) };
         if backing.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
         let mut kp = KPath::raw(&backing);
         kp.mnt_id = mid;
@@ -11116,6 +11148,14 @@ fn proc_link_allowed(pid: u32) -> bool {
     let tgt = sched::tgid_of(pid);
     if tgt == sched::current_tgid() { return true; }
     sched::host_root() || sched::euid_of(current_pid()) == sched::euid_of(tgt)
+}
+
+/// `proc_link_allowed` for the /proc/<pid>/{root,cwd} links, which are path
+/// strings of the target's mount namespace: until they can be translated
+/// through that namespace's tree, a link into a different mount namespace is
+/// refused (EACCES) instead of being resolved in the caller's view.
+fn proc_root_allowed(pid: u32) -> bool {
+    proc_link_allowed(pid) && sched::ns::mntns_of(pid) == sched::current_mntns()
 }
 
 fn proc_magic<'a>(p: &'a [u8], what: &[u8]) -> Option<(u32, &'a [u8])> {
@@ -11179,7 +11219,7 @@ fn backing_walk_m(ns: &[u8], crossed: &mut bool, denied: &mut bool, mns: sched::
         let hit = proc_magic(p, b"root").map(|(pid, rest)| (pid, rest, true))
             .or_else(|| proc_magic(p, b"cwd").map(|(pid, rest)| (pid, rest, false)));
         let (pid, rest, is_root) = match hit { Some(h) if !h.1.is_empty() => h, _ => break };
-        if sched::exists_probe(pid) == 0 && !proc_link_allowed(pid) { *denied = true; break; }
+        if sched::exists_probe(pid) == 0 && !proc_root_allowed(pid) { *denied = true; break; }
         let base: alloc::sync::Arc<[u8]> = if is_root {
             match sched::root_arc_of(pid) {
                 Some(r) => r,
@@ -11207,7 +11247,7 @@ fn backing_walk_ns0(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<
         let hit = proc_magic(p, b"root").map(|(pid, rest)| (pid, rest, true))
             .or_else(|| proc_magic(p, b"cwd").map(|(pid, rest)| (pid, rest, false)));
         let (pid, rest, is_root) = match hit { Some(h) if !h.1.is_empty() => h, _ => break };
-        if sched::exists_probe(pid) == 0 && !proc_link_allowed(pid) { *denied = true; break; }
+        if sched::exists_probe(pid) == 0 && !proc_root_allowed(pid) { *denied = true; break; }
         let base: alloc::sync::Arc<[u8]> = if is_root {
             match sched::root_arc_of(pid) {
                 Some(r) => r,
@@ -11276,8 +11316,10 @@ fn host_to_view(p: &[u8]) -> Vec<u8> {
     let root = sched::current_root_arc();
     let mns = sched::current_mntns();
     if mns != 0 {
-        // The namespace's own tree answers; its root is the task's root.
+        // The namespace's own tree answers; its root is the task's root. A
+        // hidden superblock path with no namespace name never leaks out.
         let v = vfs::mnt::reverse(mns, p, 0);
+        if v.is_none() && vfs::mnt::is_sb_path(p) { return b"/".to_vec(); }
         let p: &[u8] = v.as_deref().unwrap_or(p);
         if let Some(r) = root.as_deref() {
             if r.len() > 1 && vfs::alias::under(p, r) {

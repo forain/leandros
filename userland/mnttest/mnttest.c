@@ -309,6 +309,148 @@ static void newns_suite(void) {
     report("newns_leak", live0 >= 0 && live1 == live0 && sb1 == sb0);
 }
 
+/* ── Review fixes (mntunshare): pool squatting, pivot, private, proc ────── */
+#ifndef MS_PRIVATE_
+#define MS_PRIVATE_ (1UL << 18)
+#define MS_SLAVE_ (1UL << 19)
+#define MS_SHARED_ (1UL << 20)
+#endif
+
+static int in_ns_dying0(void) {
+    static char buf[1024];
+    return slurp("/proc/mntselftest", buf, sizeof buf) > 0 && strstr(buf, "ns_dying=0") != NULL;
+}
+
+static void hardening_suite(void) {
+    char sq[64];
+    int st = 0;
+    pid_t pid;
+    int k;
+
+    /* pool_squat: an unprivileged user pre-creates the old /tmp pool and a
+     * reachable directory for every likely instance number; a later tmpfs
+     * mount (root, in its own mount namespace) must land elsewhere and the
+     * squatter's directories stay untouched and are not the backing store. */
+    pid = fork();
+    if (pid == 0) {
+        if (setgid(65534) || setuid(65534)) _exit(99);
+        mkdir("/tmp/.leandros-sb", 0777);
+        mkdir("/tmp/.leandros-sb/tmpfs", 0777);
+        for (k = 1; k <= 24; k++) {
+            snprintf(sq, sizeof sq, "/tmp/.leandros-sb/tmpfs/%d", k);
+            mkdir(sq, 0777);
+            strcat(sq, "/sentinel");
+            put(sq, "S", 0666);
+        }
+        /* and the real hidden space is not creatable by name */
+        errno = 0;
+        int r1 = mkdir("/.leandros-sb/tmpfs/9999", 0777);
+        _exit(r1 == -1 && errno == ENOENT ? 0 : 1);
+    }
+    waitpid(pid, &st, 0);
+    report("pool_squat_hidden_mkdir_enoent", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    char base[64], tm[96], mk[128];
+    snprintf(base, sizeof base, "/tmp/mh.%d", (int)getpid());
+    dir(base);
+    path(tm, sizeof tm, base, "t");
+    dir(tm);
+    path(mk, sizeof mk, tm, "mark");
+    pid = fork();
+    if (pid == 0) {
+        int ok = unshare(CLONE_NEWNS) == 0 && mount_("tmpfs", tm, "tmpfs", 0) == 0;
+        if (ok) put(mk, "M", 0644);
+        ok = ok && exists(mk);
+        _exit(ok ? 0 : 1);
+    }
+    waitpid(pid, &st, 0);
+    report("pool_squat_tmpfs_mounts", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    int leaked = 0, sent_ok = 1, reach = 0;
+    for (k = 1; k <= 64; k++) {
+        snprintf(sq, sizeof sq, "/tmp/.leandros-sb/tmpfs/%d/mark", k);
+        if (exists(sq)) leaked = 1;
+        if (k <= 24) {
+            snprintf(sq, sizeof sq, "/tmp/.leandros-sb/tmpfs/%d/sentinel", k);
+            if (!exists(sq)) sent_ok = 0;
+        }
+        snprintf(sq, sizeof sq, "/.leandros-sb/tmpfs/%d", k);
+        if (exists(sq)) reach = 1;
+    }
+    report("pool_squat_not_adopted", !leaked && sent_ok);
+    report("pool_hidden_from_ns0", !reach);
+
+    /* pivot_root inside a mount namespace never touches ns 0 */
+    pid = fork();
+    if (pid == 0) {
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        errno = 0;
+        long r = syscall(SYS_pivot_root, "/tmp", "/tmp");
+        _exit(r == -1 && errno == EINVAL ? 0 : 1);
+    }
+    waitpid(pid, &st, 0);
+    report("pivot_in_ns_einval", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    report("pivot_ns0_untouched", exists("/bin/mnttest") && exists("/dev/shm"));
+
+    /* MS_PRIVATE / MS_SLAVE are accepted no-ops; MS_SHARED is not */
+    pid = fork();
+    if (pid == 0) {
+        if (setgid(65534) || setuid(65534)) _exit(99);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) _exit(2);
+        int ok = mount_("none", "/", NULL, M_REC | MS_PRIVATE_) == 0
+              && mount_("none", "/", NULL, M_REC | MS_SLAVE_) == 0
+              && mount_("none", "/", NULL, MS_PRIVATE_) == 0;
+        errno = 0;
+        ok = ok && mount_("none", "/", NULL, MS_SHARED_) == -1 && errno == EINVAL;
+        _exit(ok ? 0 : 1);
+    }
+    waitpid(pid, &st, 0);
+    report("ns_private_slave_noop", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    /* clone(NEWNS|VM|VFORK) as Linux allows */
+    pid = (pid_t)syscall(SYS_clone, CLONE_NEWNS | CLONE_VM | 0x4000UL /* CLONE_VFORK */ | SIGCHLD, 0, 0, 0, 0);
+    if (pid == 0) { execl("/bin/mnttest", "/bin/mnttest", "child-ok", (char *)NULL); _exit(97); }
+    int okvm = 0;
+    if (pid > 0 && waitpid(pid, &st, 0) > 0) okvm = WIFEXITED(st) && WEXITSTATUS(st) == 42;
+    report("clone_newns_vm", okvm);
+
+    /* /proc/<pid>/{root,cwd} of a task in another mount namespace is refused */
+    int c2p[2], p2c[2];
+    if (pipe(c2p) || pipe(p2c)) { report("proc_root_pipe", 0); return; }
+    pid = fork();
+    if (pid == 0) {
+        char c = 'x';
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        write(c2p[1], &c, 1);
+        read(p2c[0], &c, 1);
+        _exit(0);
+    }
+    char c;
+    int up = read(c2p[0], &c, 1) == 1;
+    char pp[64];
+    int e1 = 0, e2 = 0, e3 = 0, f1;
+    snprintf(pp, sizeof pp, "/proc/%d/root/etc", (int)pid);
+    errno = 0; f1 = open(pp, O_RDONLY); e1 = errno;
+    int bad1 = f1 >= 0; if (f1 >= 0) close(f1);
+    snprintf(pp, sizeof pp, "/proc/%d/cwd", (int)pid);
+    errno = 0; int bad2 = chdir(pp) == 0; e2 = errno;
+    if (bad2) chdir("/");
+    snprintf(pp, sizeof pp, "/proc/%d/root", (int)pid);
+    errno = 0; f1 = open(pp, O_RDONLY); e3 = errno;
+    int bad3 = f1 >= 0; if (f1 >= 0) close(f1);
+    report("proc_root_cross_ns_refused", up && !bad1 && !bad2 && !bad3
+           && (e1 == EACCES || e1 == ENOENT) && (e2 == EACCES || e2 == ENOENT) && (e3 == EACCES || e3 == ENOENT));
+    report("proc_root_same_ns_ok", exists("/proc/self/root/etc"));
+    write(p2c[1], &c, 1);
+    waitpid(pid, &st, 0);
+    close(c2p[0]); close(c2p[1]); close(p2c[0]); close(p2c[1]);
+
+    /* ns 0 cost: a dead namespace is freed by the wait that reaps its task */
+    pid = fork();
+    if (pid == 0) _exit(unshare(CLONE_NEWNS) == 0 ? 0 : 1);
+    waitpid(pid, &st, 0);
+    report("dead_ns_reaped_on_wait", in_ns_dying0());
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -317,6 +459,7 @@ int main(int argc, char **argv) {
     sb_hidden_ns0();
     ns0_invariants();
     newns_suite();
+    hardening_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }

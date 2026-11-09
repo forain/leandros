@@ -130,7 +130,11 @@ fn walk(t: &[Mnt], path: &[u8]) -> Option<Xlat> {
         }
     }
     let m = &t[cur];
-    Some(Xlat { backing: join(&m.root, rem), mnt_id: m.id, ns_prefix_len: consumed, flags: m.flags })
+    let backing = join(&m.root, rem);
+    // The hidden superblock space is reachable only through a mount whose
+    // root is in it (a bind of `/` must not expose it).
+    if is_sb_path(&backing) && !is_sb_path(&m.root) { return None; }
+    Some(Xlat { backing, mnt_id: m.id, ns_prefix_len: consumed, flags: m.flags })
 }
 
 /// Rewrite namespace path `path` (absolute, normalised) of mount namespace
@@ -206,7 +210,7 @@ pub fn copy(src: NsId, dst: NsId, dst_owner: NsId, owner_changed: bool) -> Resul
 // ── Mount, bind and umount inside a namespace (lane M1) ─────────────────────
 
 /// Upper bound on mounts per namespace (Linux `fs.mount-max` is 100000).
-pub const MNT_MAX: usize = 4096;
+pub const MNT_MAX: usize = 1024;
 
 /// Like [`walk`] but returns the final mount's index and how many bytes of
 /// `path` the walk consumed up to and including that mount's mountpoint.
@@ -277,7 +281,13 @@ pub fn bind(ns: NsId, src: &[u8], dst: &[u8], rec: bool) -> Result<u32, i32> {
         let mut work: Vec<u32> = alloc::vec![sid];
         while let Some(old) = work.pop() {
             let new_parent = map.iter().find(|r| r.0 == old).map(|r| r.1).unwrap_or(0);
-            for c in t.iter().filter(|c| c.parent == old && !c.unbindable) {
+            for c in t.iter().filter(|c| c.parent == old) {
+                // Linux copy_tree: skipping a locked unbindable child would
+                // reveal what it covers, so the bind fails with EPERM.
+                if c.unbindable {
+                    if c.locked & LOCK_MNT != 0 { return Err(-1); }
+                    continue;
+                }
                 if old == sid && !(&*c.mp != b"/" && (sub.is_empty() || under(&c.mp, sub))) { continue; }
                 let mut n = c.clone();
                 n.id = alloc_mnt_id();
