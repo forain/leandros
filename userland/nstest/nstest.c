@@ -893,6 +893,215 @@ static int t_netns_isolate_reverse(void)
     return 0;
 }
 
+/* ---- pid namespace init semantics (lane nspidinit) ---------------------- */
+#include <sys/resource.h>
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_send_signal
+#define SYS_pidfd_send_signal 424
+#endif
+static pid_t outer_pid;
+static volatile int usr1_cnt;
+static void usr1_h(int s) { (void)s; usr1_cnt++; }
+
+/* init is signalled from inside: SIGTERM/SIGKILL dropped (return 0), init lives. */
+static int ib_ign(void)
+{
+    int p[2]; CHECK(pipe(p) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        CHECK(kill(1, SIGTERM) == 0);
+        CHECK(kill(1, SIGKILL) == 0);
+        char b = 'x'; (void)!write(p[1], &b, 1);
+        _exit(0);
+    }
+    char b = 0;
+    CHECK(read(p[0], &b, 1) == 1 && b == 'x');   /* we survived both signals */
+    return child_ok(c);
+}
+static int ub_init_ignores(void) { return in_init(ib_ign); }
+PCASE(init_ignores_inside, ub_init_ignores)
+
+static int ub_init_kill_outside(void)
+{
+    alarm(10);
+    int a[2], b[2];
+    CHECK(pipe(a) == 0 && pipe(b) == 0);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    pid_t init = fork();
+    CHECK(init >= 0);
+    if (init == 0) {
+        char ch;
+        while (read(a[0], &ch, 1) == 1) (void)!write(b[1], "q", 1);
+        _exit(0);
+    }
+    char ch = 'p';
+    CHECK(kill(init, SIGTERM) == 0);
+    CHECK(write(a[1], &ch, 1) == 1 && read(b[0], &ch, 1) == 1);  /* still alive */
+    CHECK(kill(init, SIGKILL) == 0);
+    int st = 0;
+    CHECK(waitpid(init, &st, 0) == init && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+    return 0;
+}
+PCASE(init_kill_outside, ub_init_kill_outside)
+
+static int ib_handler(void)
+{
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = usr1_h;
+    CHECK(sigaction(SIGUSR1, &sa, 0) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) _exit(kill(1, SIGUSR1) == 0 ? 0 : 1);
+    for (int n = 0; !usr1_cnt && n < 5000; n++) usleep(1000);
+    CHECK(usr1_cnt == 1);
+    return child_ok(c);
+}
+static int ub_init_handler(void) { return in_init(ib_handler); }
+PCASE(init_handler, ub_init_handler)
+
+static int ib_orphan(void)
+{
+    pid_t a = fork();
+    CHECK(a >= 0);
+    if (a == 0) {
+        pid_t b = fork();
+        if (b == 0) {
+            for (int n = 0; getppid() != 1 && n < 5000; n++) usleep(1000);
+            _exit(getppid() == 1 ? 0 : 1);
+        }
+        _exit(b > 0 ? 0 : 2);
+    }
+    int st, got = 0, bad = 0;
+    for (int i = 0; i < 2; i++) {
+        pid_t r = waitpid(-1, &st, 0);
+        if (r > 0) { got++; if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) bad++; }
+    }
+    CHECK(got == 2 && bad == 0);
+    return 0;
+}
+static int ub_orphan(void) { return in_init(ib_orphan); }
+PCASE(orphan_to_init, ub_orphan)
+
+static int ub_init_death(void)
+{
+    alarm(10);
+    int p[2]; CHECK(pipe(p) == 0);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    pid_t init = fork();
+    CHECK(init >= 0);
+    if (init == 0) {
+        pid_t m = fork();
+        if (m == 0) { for (;;) pause(); }
+        usleep(100000);
+        _exit(m > 0 ? 0 : 1);
+    }
+    close(p[1]);
+    int st = 0;
+    CHECK(waitpid(init, &st, 0) == init);
+    char ch;
+    CHECK(read(p[0], &ch, 1) == 0);   /* every member died: EOF */
+    return 0;
+}
+PCASE(init_death_kills, ub_init_death)
+
+static int ib_minus1(void)
+{
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = usr1_h;
+    CHECK(sigaction(SIGUSR1, &sa, 0) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) { (void)kill(-1, SIGUSR1); _exit(0); }
+    CHECK(child_ok(c) == 0);
+    usleep(100000);
+    CHECK(usr1_cnt == 0);
+    return 0;
+}
+static int ub_minus1(void)
+{
+    alarm(10);
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = usr1_h;
+    CHECK(sigaction(SIGUSR1, &sa, 0) == 0);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        sa.sa_handler = SIG_DFL; sigaction(SIGUSR1, &sa, 0);
+        _exit(ib_minus1());
+    }
+    CHECK(child_ok(c) == 0);
+    usleep(100000);
+    CHECK(usr1_cnt == 0);
+    return 0;
+}
+PCASE(kill_minus1_scoped, ub_minus1)
+
+static int ib_sidpgid(void)
+{
+    CHECK(setsid() == 1);
+    CHECK(getsid(0) == 1 && getpgid(0) == 1 && getpgrp() == 1);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        if (getpgid(1) != 1 || getsid(1) != 1) _exit(1);
+        if (setpgid(0, 0) != 0 || getpgrp() != getpid()) _exit(2);
+        _exit(0);
+    }
+    return child_ok(c);
+}
+static int ub_sidpgid(void) { return in_init(ib_sidpgid); }
+PCASE(sid_pgid, ub_sidpgid)
+
+static int ib_byid(void)
+{
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        struct rlimit r; unsigned long m[16];
+        if (prlimit(1, RLIMIT_NOFILE, 0, &r) != 0) { printf("  byid step %d errno %d\n", 1, errno); _exit(1); }
+        errno = 0; if (getpriority(PRIO_PROCESS, 1) == -1 && errno) { printf("  byid step %d errno %d\n", 2, errno); _exit(2); }
+        if (sched_getaffinity(1, sizeof m, (cpu_set_t *)m) != 0) { printf("  byid step %d errno %d\n", 3, errno); _exit(3); }
+        int fd = syscall(SYS_pidfd_open, 1, 0);
+        if (fd < 0) { printf("  byid step %d errno %d\n", 4, errno); _exit(4); }
+        if (syscall(SYS_pidfd_send_signal, fd, 0, 0, 0) != 0) { printf("  byid step %d errno %d\n", 5, errno); _exit(5); }
+        errno = 0; if (prlimit(outer_pid, RLIMIT_NOFILE, 0, &r) != -1 || errno != ESRCH) { printf("  byid step %d errno %d\n", 6, errno); _exit(6); }
+        errno = 0; getpriority(PRIO_PROCESS, outer_pid); if (errno != ESRCH) { printf("  byid step %d errno %d\n", 7, errno); _exit(7); }
+        errno = 0; if (sched_getaffinity(outer_pid, sizeof m, (cpu_set_t *)m) != -1 || errno != ESRCH) { printf("  byid step %d errno %d\n", 8, errno); _exit(8); }
+        errno = 0; if (syscall(SYS_pidfd_open, outer_pid, 0) != -1 || errno != ESRCH) { printf("  byid step %d errno %d\n", 9, errno); _exit(9); }
+        _exit(0);
+    }
+    return child_ok(c);
+}
+static int ub_byid(void) { outer_pid = getpid(); return in_init(ib_byid); }
+PCASE(byid_calls, ub_byid)
+
+static int ucred_pid(int fd)
+{
+    struct ucred u; socklen_t l = sizeof u;
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &u, &l) != 0) return -1;
+    return u.pid;
+}
+static int sp_out[2];
+static int ib_peercred(void)
+{
+    int sp[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) _exit(ucred_pid(sp[1]) == 1 && ucred_pid(sp_out[1]) == 0 ? 0 : 1);
+    return child_ok(c);
+}
+static int ub_peercred(void)
+{
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp_out) == 0);
+    return in_init(ib_peercred);
+}
+PCASE(peercred, ub_peercred)
+
 
 /* ---- nsids: id-changing syscalls and id translation inside a userns ---- */
 #include <sys/stat.h>
@@ -1232,6 +1441,151 @@ static int t_netns_udp_bind(void)
     return 0;
 }
 
+/* ---- nsmapsec: map-file confused deputy, write race, chrooted NEWUSER, fdinfo ---- */
+static pid_t spawn_userns(int *go_w, int (*after)(void))
+{
+    int go[2];
+    if (pipe(go)) return -1;
+    pid_t c = syscall(SYS_clone, SIGCHLD | CLONE_NEWUSER, 0, 0, 0, 0);
+    if (c == 0) { char b; close(go[1]); (void)!read(go[0], &b, 1); _exit(after ? after() : 0); }
+    close(go[0]);
+    *go_w = go[1];
+    return c;
+}
+static int deputy_child_check(void)
+{
+    CHECK(getuid() == 65534);
+    CHECK(setuid(0) != 0);
+    CHECK(geteuid() != 0);
+    return 0;
+}
+static void send_fd(int sk, int fd)
+{
+    char b = 'x'; struct iovec iov = { &b, 1 };
+    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
+    struct msghdr m; memset(&m, 0, sizeof m); memset(&u, 0, sizeof u);
+    m.msg_iov = &iov; m.msg_iovlen = 1; m.msg_control = u.buf; m.msg_controllen = sizeof u.buf;
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = SOL_SOCKET; h->cmsg_type = SCM_RIGHTS; h->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(h), &fd, sizeof fd);
+    (void)!sendmsg(sk, &m, 0);
+}
+static int recv_fd(int sk)
+{
+    char b; struct iovec iov = { &b, 1 };
+    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
+    struct msghdr m; memset(&m, 0, sizeof m);
+    m.msg_iov = &iov; m.msg_iovlen = 1; m.msg_control = u.buf; m.msg_controllen = sizeof u.buf;
+    if (recvmsg(sk, &m, 0) <= 0) return -1;
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    if (!h || h->cmsg_type != SCM_RIGHTS) return -1;
+    int fd; memcpy(&fd, CMSG_DATA(h), sizeof fd);
+    return fd;
+}
+/* Attacker (uid 1000) opens the child's uid_map and passes the fd to a root
+ * helper that writes "0 0 1". Must not map host root. */
+static int t_map_deputy(void)
+{
+    int sp[2], res[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0 && pipe(res) == 0);
+    pid_t h = fork();
+    if (h == 0) {   /* root helper */
+        close(sp[0]); close(res[0]);
+        int fd = recv_fd(sp[1]);
+        int e = 0;
+        if (fd >= 0) { ssize_t n = write(fd, "0 0 1", 5); e = n == 5 ? 0 : errno; }
+        else e = 255;
+        (void)!write(res[1], &e, sizeof e);
+        _exit(0);
+    }
+    pid_t a = fork();
+    if (a == 0) {   /* attacker */
+        close(sp[1]); close(res[1]);
+        if (drop_to(1000)) _exit(2);
+        int go;
+        pid_t c = spawn_userns(&go, deputy_child_check);
+        if (c < 0) _exit(3);
+        char p[64]; snprintf(p, sizeof p, "/proc/%d/uid_map", (int)c);
+        int fd = open(p, O_WRONLY);
+        int opened = fd >= 0;
+        if (opened) send_fd(sp[0], fd); else close(sp[0]);
+        int e = 0;
+        if (read(res[0], &e, sizeof e) != (ssize_t)sizeof e) e = 254;
+        int blocked = !opened || (e != 0);
+        (void)!write(go, "g", 1);
+        int st = 0; waitpid(c, &st, 0);
+        printf("  deputy: opened=%d helper_errno=%d child=%d\n", opened, e, WIFEXITED(st) ? WEXITSTATUS(st) : 100);
+        _exit(blocked && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1);
+    }
+    close(sp[0]); close(sp[1]);
+    int st = 0; waitpid(a, &st, 0); waitpid(h, NULL, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 100;
+}
+
+struct wrarg { const char *p, *txt; int r; pthread_barrier_t *b; };
+static void *wr_thr(void *v)
+{
+    struct wrarg *w = v;
+    int fd = open(w->p, O_WRONLY);
+    pthread_barrier_wait(w->b);
+    if (fd < 0) { w->r = -1; return NULL; }
+    w->r = write(fd, w->txt, strlen(w->txt)) == (ssize_t)strlen(w->txt) ? 0 : -1;
+    close(fd);
+    return NULL;
+}
+static int t_map_race(void)
+{
+    for (int it = 0; it < 20; it++) {
+        int go; pid_t c = spawn_userns(&go, NULL);
+        CHECK(c > 0);
+        char p[64]; snprintf(p, sizeof p, "/proc/%d/uid_map", (int)c);
+        pthread_barrier_t b; pthread_barrier_init(&b, NULL, 2);
+        struct wrarg a = { p, "1000 1000 1\n", 99, &b }, d = { p, "2000 2000 5\n", 99, &b };
+        pthread_t t1, t2;
+        pthread_create(&t1, NULL, wr_thr, &a); pthread_create(&t2, NULL, wr_thr, &d);
+        pthread_join(t1, NULL); pthread_join(t2, NULL);
+        char buf[256]; int n = rd(p, buf, sizeof buf);
+        int ok = (a.r == 0) != (d.r == 0) && n > 0;
+        if (ok) {
+            const char *want = a.r == 0 ? "1000 1000 1" : "2000 2000 5";
+            unsigned x, y, z; ok = sscanf(buf, "%u %u %u", &x, &y, &z) == 3 && strchr(buf, '\n') == buf + strlen(buf) - 1;
+            char exp[64]; if (ok) { snprintf(exp, sizeof exp, "%u %u %u", x, y, z); ok = !strcmp(exp, want); }
+        }
+        (void)!write(go, "g", 1); waitpid(c, NULL, 0);
+        if (!ok) { printf("  race iter %d: a=%d d=%d map=[%s]\n", it, a.r, d.r, buf); return 1; }
+    }
+    return 0;
+}
+
+static int t_chroot_newuser(void)
+{
+    CHECK(chroot("/tmp") == 0);
+    CHECK(chdir("/") == 0);
+    errno = 0; CHECK(unshare(CLONE_NEWUSER) == -1 && errno == EPERM);
+    errno = 0; long r = syscall(SYS_clone, SIGCHLD | CLONE_NEWUSER, 0, 0, 0, 0);
+    if (r == 0) _exit(0);
+    CHECK(r == -1 && errno == EPERM);
+    return 0;
+}
+
+static int t_fdinfo_other_uid(void)
+{
+    int fd = open("/dev/null", O_RDONLY);
+    CHECK(fd >= 0);
+    char p[64]; snprintf(p, sizeof p, "/proc/%d/fdinfo/%d", (int)getpid(), fd);
+    int own = open(p, O_RDONLY);
+    CHECK(own >= 0);
+    pid_t c = fork();
+    if (c == 0) {
+        if (drop_to(1000)) _exit(2);
+        errno = 0; int f = open(p, O_RDONLY);
+        _exit(f < 0 && (errno == EACCES || errno == EPERM) ? 0 : 1);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -1246,6 +1600,10 @@ static int run_userns_cases(void)
         { "wait_inside", t_wait_inside }, { "siginfo_pid", t_siginfo_pid }, { "siginfo_outside", t_siginfo_outside },
         { "pthread_in_pidns", t_pthread_in_pidns }, { "nested", t_nested },
         { "pidns_leak", t_pidns_leak }, { "fork_enomem", t_fork_enomem },
+        { "init_ignores_inside", t_init_ignores_inside }, { "init_kill_outside", t_init_kill_outside },
+        { "init_handler", t_init_handler }, { "orphan_to_init", t_orphan_to_init },
+        { "init_death_kills", t_init_death_kills }, { "kill_minus1_scoped", t_kill_minus1_scoped },
+        { "sid_pgid", t_sid_pgid }, { "byid_calls", t_byid_calls }, { "peercred", t_peercred },
         { "proc_self_tgid", t_proc_self_tgid }, { "proc_self_init", t_proc_self_init },
         { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
@@ -1254,6 +1612,8 @@ static int run_userns_cases(void)
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
         { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
+        { "map_deputy", t_map_deputy }, { "map_race", t_map_race }, { "chroot_newuser_eperm", t_chroot_newuser },
+        { "fdinfo_other_uid", t_fdinfo_other_uid },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();

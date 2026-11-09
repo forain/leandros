@@ -130,7 +130,17 @@ impl SeccompSlot {
     pub fn evaluate(&self, d: &SeccompData) -> Option<u32> {
         let h = self.head()?;
         let mut n = Some(h);
-        let it = core::iter::from_fn(|| { let c = n?; n = c.prev.as_deref(); Some(&c.prog) });
+        // Syscalls run with IRQs masked by design (no kernel preemption), so
+        // the whole evaluation does too; open an interrupt window before each
+        // filter of the chain to bound the latency. The decision is still
+        // taken before the syscall runs, and the task cannot migrate (no
+        // preemption), so the per-CPU slot pointer stays valid.
+        let it = core::iter::from_fn(|| {
+            let c = n?;
+            n = c.prev.as_deref();
+            crate::irq_window();
+            Some(&c.prog)
+        });
         Some(seccomp_bpf::run_stack(it, d))
     }
 }

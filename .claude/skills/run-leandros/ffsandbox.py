@@ -2,7 +2,7 @@
 """ffsandbox.py <arch> <tag> [--mode on|off|both] [--secs 60] [-- extra ffsession.py args]
 
 Firefox sandbox acceptance check, run through ffsession.py. For each mode it boots, starts
-/bin/firefox (with LEANDROS_FIREFOX_SANDBOX=1 for "on") on a local page holding a looping
+/bin/firefox (default env for "on"; LEANDROS_FIREFOX_SANDBOX=0 for "off") on a local page holding a looping
 <video> (so the RDD process starts), then from the guest collects for every firefox process
 its type (-contentproc ... <type>, or parent) and /proc/<pid>/status Seccomp:, Seccomp_filters:,
 NoNewPrivs:, NSpid: plus the /proc/<pid>/root target. "Sandbox:" lines come from Firefox's
@@ -49,6 +49,7 @@ open(collect, "w").write(r'''for d in /proc/[0-9]*; do
     case "$k" in Seccomp:|Seccomp_filters:|NoNewPrivs:|NSpid:) echo "SBST $p $k $v" ;; esac
   done < $d/status
   echo "SBROOT $p $(readlink $d/root 2>&1)"
+  echo "SBNS $p user=$(readlink $d/ns/user 2>&1) net=$(readlink $d/ns/net 2>&1) ipc=$(readlink $d/ns/ipc 2>&1)"
 done
 echo SBDONE
 ''')
@@ -76,7 +77,9 @@ def run(mode):
            "--url", "file:///tmp/sb.html", "--prefs", "browser.dom.window.dump.enabled=true;media.autoplay.default=0",
            "--wait", str(SECS), "--shot-every", str(SECS), "--post", "sh /tmp/sbcollect.sh", "--post-timeout", "120"]
     if mode == "on":
-        cmd += ["--env", "LEANDROS_FIREFOX_SANDBOX=1"]
+        cmd += ["--env", "LEANDROS_FIREFOX_SANDBOX_LOG=1"]
+    else:
+        cmd += ["--env", "LEANDROS_FIREFOX_SANDBOX=0"]
     rc = subprocess.run(cmd + EXTRA, env=env).returncode
     d = os.path.join(OUTD, f"run-{tag}")
     rd = lambda n: open(os.path.join(d, n), errors="replace").read() if os.path.exists(os.path.join(d, n)) else ""
@@ -85,20 +88,30 @@ def run(mode):
     for l in post.splitlines():
         m = re.match(r"SBPID (\d+) CMD (.*)", l)
         if m:
-            procs[m[1]] = {"cmd": m[2], "st": {}, "root": "?"}
+            procs[m[1]] = {"cmd": m[2], "st": {}, "root": "?", "ns": {}}
             continue
         m = re.match(r"SBST (\d+) (\S+) ?(.*)", l)
         if m and m[1] in procs:
             procs[m[1]]["st"][m[2]] = m[3].strip()
+        m = re.match(r"SBNS (\d+) (.*)", l)
+        if m and m[1] in procs:
+            procs[m[1]]["ns"] = dict(x.split("=", 1) for x in m[2].split() if "=" in x)
         m = re.match(r"SBROOT (\d+) ?(.*)", l)
         if m and m[1] in procs:
             procs[m[1]]["root"] = m[2].strip() or "-"
     # MOZ_SANDBOX_LOGGING also prints policy-building chatter; only the rest counts as an error.
     noise = re.compile(r"policy for |fixing recursive|removing redundant|Couldn't open video device|adding (read|write)"
-                       r"|using seccomp tsync|Parent path is|Adding paths from|[Ff]ailed errno -2\b")
+                       r"|\[fslock\]|using seccomp tsync|Parent path is|Adding paths from|[Ff]ailed errno -2\b")
     real = re.compile(r"errno -13\b|EACCES|denied|seccomp sandbox violation", re.I)
 
     def counted(l):
+        # Broker denials of RELATIVE paths: known musl/fork-server LD_LIBRARY_PATH stale-pointer
+        # issue (orch/designs/ffpath-findings.md); the broker can never allow them.
+        m = re.search(r"(?:denied|EACCES)[^\n]*?(?:for|path|open|access|stat)?[^\n]*?[\"' ]([^\"' ]+)[\"']?\s*$", l)
+        if re.search(r"(?:denied|EACCES|errno -13)", l, re.I):
+            mm = re.search(r"(?:path|for|of)[: =]+\"?'?(\S+?)\"?'?[,.\s]*$", l)
+            if mm and not mm[1].startswith("/") and "violation" not in l:
+                return False
         if real.search(l):
             return True  # broker denials and SIGSYS violations always count
         if "Sandbox:" in l and not noise.search(l):
@@ -121,6 +134,23 @@ def run(mode):
     print(f"  Sandbox log lines: {len(sbl)}")
     kids = {t: v for t, v in types.items() if t not in ("parent", "wrapper", "forkserver")}
     ok = bool(kids) and all(x == "2" for v in kids.values() for x in v) and not sbl
+    parent = [v for v in procs.values() if ptype(v["cmd"]) == "parent"]
+    pns = parent[0]["ns"] if parent else {}
+    for p, v in sorted(procs.items(), key=lambda kv: int(kv[0])):
+        t = ptype(v["cmd"])
+        if t in ("tab", "rdd", "socket", "utility", "gmplugin", "gpu"):
+            diff = ",".join(k for k in ("user", "net", "ipc") if v["ns"].get(k) and v["ns"].get(k) != pns.get(k))
+            print(f"  NS {t} {p} differs-from-parent: {diff or 'none'}")
+    if mode == "on":
+        for p, v in procs.items():
+            t = ptype(v["cmd"])
+            if t in ("tab", "rdd", "socket", "utility", "gmplugin"):
+                if v["st"].get("NoNewPrivs:") != "1":
+                    ok = False; print(f"  FAIL {t} {p} NoNewPrivs={v['st'].get('NoNewPrivs:')}")
+                if t in ("tab", "rdd", "utility") and v["root"] != "/.leandros-void":
+                    ok = False; print(f"  FAIL {t} {p} root={v['root']}")
+        if not any(ptype(v["cmd"]) == "tab" for v in procs.values()):
+            ok = False; print("  FAIL no tab process")
     return ok
 
 
