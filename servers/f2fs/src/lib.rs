@@ -33,6 +33,7 @@ const VFS_GETDENTS64: u64 = 0x1D;
 const VFS_UNLINK:     u64 = 0x1F;
 const VFS_MKDIR:      u64 = 0x20;
 const VFS_FTRUNCATE:  u64 = 0x21;
+const VFS_MKNOD:      u64 = 0x32;
 const VFS_FALLOCATE:  u64 = vfs_server::VFS_FALLOCATE;
 const VFS_RENAME:     u64 = 0x22;
 const VFS_RMDIR:      u64 = 0x29;
@@ -320,6 +321,13 @@ const S_IFMT:  u16 = 0o170000;
 const S_IFDIR: u16 = 0o040000;
 const S_IFREG: u16 = 0o100000;
 const S_IFLNK: u16 = 0o120000;
+const S_IFCHR: u16 = 0o020000;
+const S_IFBLK: u16 = 0o060000;
+const S_IFIFO: u16 = 0o010000;
+const S_IFSOCK: u16 = 0o140000;
+/// Open of a device node answers `-(DEVNODE_BASE + (is_blk << 32 | rdev))`;
+/// the VFS finds the driver (see `devnode_open` there).
+const DEVNODE_BASE: i64 = 1 << 40;
 
 /// Symlink traversals allowed in one path resolution before the walk gives up.
 /// Matches Linux's MAXSYMLINKS and the VFS server's `SYMLINK_MAX_HOPS`; the
@@ -435,6 +443,8 @@ fn inode_set_blkaddr(blk: &mut [u8], idx: usize, addr: u32) {
 }
 
 fn inode_max_direct(blk: &[u8]) -> usize {
+    // A device node keeps its dev_t where a file keeps block addresses.
+    if matches!(r16(blk, INO_MODE) & S_IFMT, S_IFCHR | S_IFBLK) { return 0; }
     let base = inode_addr_base(blk);
     let end = inode_addr_end(blk);
     if end <= base { return 0; }
@@ -1931,7 +1941,7 @@ fn act_name(code: u64) -> &'static str {
         ACT_CHECKPOINT => "checkpoint write-back",
         VFS_OPEN => "open", VFS_READ => "read", VFS_WRITE => "write", VFS_CLOSE => "close",
         VFS_STAT | VFS_LSTAT | VFS_FSTAT => "stat", VFS_GETDENTS64 => "getdents",
-        VFS_UNLINK => "unlink", VFS_MKDIR => "mkdir", VFS_RMDIR => "rmdir",
+        VFS_UNLINK => "unlink", VFS_MKDIR => "mkdir", VFS_MKNOD => "mknod", VFS_RMDIR => "rmdir",
         VFS_RENAME => "rename", VFS_FTRUNCATE => "ftruncate", VFS_FSYNC => "fsync",
         VFS_SYMLINK => "symlink", VFS_LINK => "link", VFS_READLINK => "readlink",
         VFS_FALLOCATE => "fallocate", VFS_ACCESS => "access",
@@ -7116,6 +7126,15 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
                 return err_reply(-13); // EACCES
             }
         }
+        {
+            let a = nat_lookup(ms, ino);
+            let iblk = ms.cache.read(ms.dev, a as u64);
+            let fmt = inode_mode(iblk) & S_IFMT;
+            if fmt == S_IFCHR || fmt == S_IFBLK {
+                let v = ((fmt == S_IFBLK) as i64) << 32 | inode_get_rdev(iblk) as i64;
+                return make_reply(-(DEVNODE_BASE + v));
+            }
+        }
         if flags & O_TRUNC != 0 {
             // Truncate to zero: free the data blocks, not just the size field.
             // Opening an existing file O_WRONLY|O_TRUNC is the usual way a
@@ -7279,8 +7298,15 @@ fn stat_common(ms: &mut MountState, path_ptr: u64, stat_ptr: u64, follow: bool) 
     // the /bin binaries), and `links` the real hard-link count. `uid`/`gid`
     // used to be hardcoded 0/0 since nothing ever persisted a chown — now
     // that handle_chown writes INO_UID/INO_GID, stat reflects it.
-    vfs_server::write_stat_full_blocks(stat_ptr as usize, mode, links as u64, size,
-                                       ino as u64, uid, gid, blks);
+    let fmt = (mode as u16) & S_IFMT;
+    if fmt == S_IFCHR || fmt == S_IFBLK {
+        let rdev = inode_get_rdev(iblk) as u64;
+        vfs_server::write_stat_full_rdev(stat_ptr as usize, mode, links as u64, size,
+                                         ino as u64, uid, gid, rdev);
+    } else {
+        vfs_server::write_stat_full_blocks(stat_ptr as usize, mode, links as u64, size,
+                                           ino as u64, uid, gid, blks);
+    }
     vfs_server::write_stat_times(stat_ptr as usize, at, mt, ct);
     ok_reply()
 }
@@ -7638,6 +7664,82 @@ pub fn unpin_inode(port: u32, ino: u32) {
 /// The volume is built with `^inline_data`, so even a two-byte target costs a
 /// full data block. That matches how every other file on this volume is
 /// stored and keeps the read path (`read_file_data`) the single one.
+/// Linux `old_encode_dev`/`new_encode_dev` as f2fs stores them: `i_addr[0]`
+/// holds the 16-bit form when major and minor both fit a byte, else
+/// `i_addr[0] = 0` and `i_addr[1]` holds the 32-bit form.
+fn inode_set_rdev(blk: &mut [u8], major: u32, minor: u32) {
+    let base = inode_addr_base(blk);
+    if major < 256 && minor < 256 {
+        w32(blk, base, (major << 8) | minor);
+        w32(blk, base + 4, 0);
+    } else {
+        w32(blk, base, 0);
+        w32(blk, base + 4, (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12));
+    }
+}
+
+/// Inverse of `inode_set_rdev` (Linux `__get_inode_rdev`), as a `dev_t`.
+fn inode_get_rdev(blk: &[u8]) -> u32 {
+    let base = inode_addr_base(blk);
+    let a0 = r32(blk, base);
+    if a0 != 0 { return a0; } // old encoding is (major << 8) | minor == new for < 256
+    r32(blk, base + 4)
+}
+
+/// mknod(2): `ftype` is S_IFMT >> 12, `dev` the Linux dev_t.
+fn handle_mknod(ms: &mut MountState, path_ptr: u64, packed: u64, ftype: u64, dev: u64,
+                cred: &xattr::Cred) -> Message {
+    let path_bytes = unsafe {
+        let ptr = path_ptr as *const u8;
+        let mut len = 0;
+        while *ptr.add(len) != 0 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    };
+    let fmt: u16 = match (ftype as u16) << 12 {
+        0 | S_IFREG => S_IFREG,
+        S_IFCHR => S_IFCHR, S_IFBLK => S_IFBLK, S_IFIFO => S_IFIFO, S_IFSOCK => S_IFSOCK,
+        _ => return err_reply(-22),
+    };
+    let dt: u8 = match fmt { S_IFCHR => 2, S_IFBLK => 6, S_IFIFO => 1, S_IFSOCK => 12, _ => DT_REG };
+    let rel = match get_relative_path(ms, path_bytes) {
+        Some(r) => r,
+        None    => return err_reply(-2),
+    };
+    let (parent_rel, name) = path_split(rel);
+    if name.is_empty() { return err_reply(-17); } // EEXIST — the mount point
+    let parent_ino = match resolve_parent(ms, parent_rel) {
+        Ok(p) => p,
+        Err(e) => return err_reply(e),
+    };
+    {
+        let pa = nat_lookup(ms, parent_ino);
+        let iblk = ms.cache.read(ms.dev, pa as u64);
+        if !inode_is_dir(iblk) { return err_reply(-20); }
+    }
+    if let Err(e) = create_gate(ms, parent_ino, name) { return err_reply(e); }
+
+    let (m, um) = xattr::unpack_create_mode(packed);
+    let created = inherit_create_mode(ms, parent_ino, m, um, false);
+    let imode = fmt | (created.mode & 0o7777);
+    let (new_ino, _) = match create_inode(ms, imode, cred.euid, cred.egid, parent_ino, name) {
+        Some(v) => v,
+        None    => return err_reply(-28),
+    };
+    if fmt == S_IFCHR || fmt == S_IFBLK {
+        let (major, minor) = vfs_server::dev_major_minor(dev);
+        let a = nat_lookup(ms, new_ino);
+        let b = ms.cache.get_mut(ms.dev, a as u64);
+        inode_set_rdev(b, major, minor);
+    }
+    store_inherited_acls(ms, new_ino, parent_ino, &created);
+    if !dir_add_entry(ms, parent_ino, name, new_ino, dt) {
+        discard_new_inode(ms, new_ino);
+        return err_reply(-28);
+    }
+    namespace_changed(ms);
+    ok_reply()
+}
+
 fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64,
                   cred: &xattr::Cred) -> Message {
     let target = unsafe {
@@ -8962,6 +9064,7 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
         VFS_STAT       => handle_stat(ms, arg(msg,0), arg(msg,1)),
         VFS_FSTAT      => handle_fstat(ms, arg(msg,0), arg(msg,1)),
         VFS_MKDIR      => handle_mkdir(ms, arg(msg,0), arg(msg,1), &cred),
+        VFS_MKNOD      => handle_mknod(ms, arg(msg,0), arg(msg,1), arg(msg,2), arg(msg,3), &cred),
         VFS_UNLINK     => handle_unlink(ms, arg(msg,0)),
         VFS_RMDIR      => handle_rmdir(ms, arg(msg,0)),
         VFS_RENAME     => handle_rename(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
@@ -9044,7 +9147,7 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
 /// (VFS_OPEN is gated on its flags in `handle_open`.)
 fn is_mutating(tag: u64) -> bool {
     matches!(tag,
-        VFS_WRITE | VFS_MKDIR | VFS_UNLINK | VFS_RMDIR | VFS_RENAME | VFS_FTRUNCATE
+        VFS_WRITE | VFS_MKDIR | VFS_MKNOD | VFS_UNLINK | VFS_RMDIR | VFS_RENAME | VFS_FTRUNCATE
         | VFS_FALLOCATE | VFS_SYMLINK | VFS_LINK | VFS_CHMOD | VFS_LCHMOD | VFS_FCHMOD
         | VFS_CHOWN | VFS_LCHOWN | VFS_FCHOWN | VFS_SETXATTR | VFS_LSETXATTR
         | VFS_FSETXATTR | VFS_REMOVEXATTR | VFS_LREMOVEXATTR | VFS_FREMOVEXATTR

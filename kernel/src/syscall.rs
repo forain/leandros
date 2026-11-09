@@ -10425,27 +10425,35 @@ fn sys_mkdirat(dirfd: usize, path_ptr: usize, mode: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_mknodat(dirfd: usize, path_ptr: usize, mode: usize, _dev: usize) -> isize {
+fn sys_mknodat(dirfd: usize, path_ptr: usize, mode: usize, dev: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
 
-    // Decode the requested node type from the S_IFMT bits of `mode`, exactly
-    // as mknod(2)/mknodat(2) do. tmpfs can only back a plain file (S_IFREG,
-    // or the type left unset — 0 — which mknod also treats as "regular") or
-    // a FIFO (S_IFIFO); see the scope note on vfs::handle_mknod for what
-    // "FIFO" means here. Character/block devices (S_IFCHR/S_IFBLK) and
-    // sockets (S_IFSOCK) require CAP_MKNOD on Linux, which an unprivileged
-    // caller never has, so return EPERM exactly like Linux does rather than
-    // pretending to create a device tmpfs can't back.
+    // Linux `may_mknod`/`vfs_mknod`: regular files, FIFOs and sockets are open
+    // to everyone; character and block devices need CAP_MKNOD in the initial
+    // user namespace -- except the whiteout (char 0:0), which anyone may make
+    // (overlayfs and its userspace tooling rely on it). Anything else in the
+    // S_IFMT bits is EINVAL, a directory EPERM (as Linux).
     const S_IFMT:  usize = 0o170000;
     const S_IFREG: usize = 0o100000;
+    const S_IFCHR: usize = 0o020000;
+    const S_IFBLK: usize = 0o060000;
     const S_IFIFO: usize = 0o010000;
+    const S_IFSOCK: usize = 0o140000;
+    const CAP_MKNOD: u32 = 27;
     let ftype = mode & S_IFMT;
-    if ftype != 0 && ftype != S_IFREG && ftype != S_IFIFO {
-        return -1; // EPERM
+    let dev = dev as u32 as u64; // dev_t arrives in a 64-bit register; only the low 32 bits are used by glibc/musl encodings
+    match ftype {
+        0 | S_IFREG | S_IFIFO | S_IFSOCK => {}
+        S_IFCHR | S_IFBLK => {
+            let whiteout = ftype == S_IFCHR && dev == 0;
+            if !whiteout && !sched::caps::host_capable(CAP_MKNOD) { return -1; } // EPERM
+        }
+        0o040000 => return -1, // EPERM: directories are mkdir's job
+        _ => return -22, // EINVAL
     }
 
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_MKNOD, &[path.ptr() as u64, mode as u64]);
+    let msg = make_vfs_msg(vfs::VFS_MKNOD, &[path.ptr() as u64, mode as u64, dev]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
