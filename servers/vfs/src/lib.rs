@@ -8998,8 +8998,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
     // (`task_dump_owner`), so fstat on the fd agrees: newuidmap fstats the
     // /proc/<pid> dirfd it opened and wants the caller's uid.
     if let VnodeKind::TmpFile { idx, .. } = kind {
-        if lookup_path.starts_with(b"/proc/") {
-            if let Some(Some((_, owner, _))) = proc_stat_kind(lookup_path) {
+        if path.starts_with(b"/proc/") {
+            if let Some(Some((_, owner, _))) = proc_stat_kind(path) {
                 let (u, g) = sched::cred::proc_dump_owner(owner);
                 let mut t = TMP_FILES.lock();
                 t[idx].uid = u;
