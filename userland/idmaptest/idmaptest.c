@@ -128,6 +128,8 @@ static int owner_newuser_body(void)
         int mfd = fd < 0 ? -1 : openat(fd, "uid_map", O_RDONLY);
         if (mfd < 0 || fstat(mfd, &st) || st.st_uid != 1000) rc = rc ? rc : 5;
         if (mfd >= 0) close(mfd);
+        if (fd < 0 || fstatat(fd, "uid_map", &st, 0) || st.st_uid != 1000 || st.st_gid != 1000) rc = rc ? rc : 6;
+        if (fd < 0 || fstatat(fd, ".", &st, 0) || st.st_uid != 1000) rc = rc ? rc : 7;
         if (fd >= 0) close(fd);
     }
     write(a[1], "x", 1);
