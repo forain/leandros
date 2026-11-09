@@ -272,7 +272,7 @@ PY
         sha0=$(head -c 134217728 "$DISK" | tail -c 100000000 | shasum -a 256 | cut -c1-64)
         . "$ROOT/scripts/container-lib.sh"
         if leandros_pick_container; then
-            $CT run --rm -v "$WORK:/w:ro" alpine:3.21 sh -c 'apk add -q e2fsprogs >/dev/null 2>&1; e2fsck -fn "/w/disk.img?offset='$((2101248 * 512))'" >/dev/null 2>&1; echo STOCKRC=$?' 2>&1 | tail -1 > "$WORK/stock-rc-$PCT.log"
+            $CT run --rm -v "$WORK:/w:ro" "$(leandros_alpine_image)" sh -c 'apk add -q e2fsprogs >/dev/null 2>&1; e2fsck -fn "/w/disk.img?offset='$((2101248 * 512))'" >/dev/null 2>&1; echo STOCKRC=$?' 2>&1 | tail -1 > "$WORK/stock-rc-$PCT.log"
             grep -q 'STOCKRC=8' "$WORK/stock-rc-$PCT.log" || { cat "$WORK/stock-rc-$PCT.log"; fail "stock e2fsck did not exit 8 on the guarded image ($PCT)"; }
             sha1=$(head -c 134217728 "$DISK" | tail -c 100000000 | shasum -a 256 | cut -c1-64)
             [ "$sha0" = "$sha1" ] || fail "stock e2fsck changed the image ($PCT)"

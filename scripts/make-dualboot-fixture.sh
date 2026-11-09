@@ -42,7 +42,7 @@ rm -f "$BUILD"/fixture.*
 $CT run --rm -e ARCH="$ARCH" -e CACHE=/cache -e OUTDIR=/out \
   -e FX_FILLER_GIB="${FX_FILLER_GIB:-10}" -e FX_DATA_MIB="${FX_DATA_MIB:-2048}" -e FX_NOPLACE="${FX_NOPLACE:-}" -e FX_GAP_GIB="${FX_GAP_GIB:-0}" \
   -v "$HERE/dualboot-fixture:/scripts:ro" -v "$CACHE:/cache" -v "$BUILD:/out" \
-  alpine:3.21 sh /scripts/inner.sh
+  "$(leandros_alpine_image)" sh /scripts/inner.sh
 
 mkdir -p "$(dirname "$OUT")"
 rm -f "$OUT"
