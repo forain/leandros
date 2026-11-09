@@ -1461,7 +1461,7 @@ fn sock_netns(pid: u32, slot: usize) -> u16 {
 /// host stack for it.
 fn sock_inet_domain_in_netns(pid: u32, slot: usize) -> Option<u8> {
     SOCK_TABLES.read().iter().find(|t| t.in_use && t.pid == pid)
-        .and_then(|t| t.socks.get(slot)).filter(|e| e.in_use && e.netns != 0)
+        .and_then(|t| t.socks.get(slot)).filter(|e| e.in_use && e.netns() != 0)
         .and_then(|e| if matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) { Some(2) }
                       else if e.domain == 2 || e.domain == 10 { Some(e.domain) } else { None })
 }
@@ -4623,7 +4623,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     let tbl = find_tbl(pid, &mut *tbls).ok_or(-9i32)?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return Err(-9); }
     // Backstop: a socket of a non-initial netns never gets a host-stack socket.
-    if tbl.socks[slot].netns != 0 { return Err(-101); }
+    if tbl.socks[slot].netns() != 0 { return Err(-101); }
     let local_addr = match tbl.socks[slot].state {
         SockState::Unbound { .. } => None,
         SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
