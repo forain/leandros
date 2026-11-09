@@ -284,8 +284,8 @@ crashed the media process; without `libpulse` there was no audio backend.
 
 `/bin/firefox` ([firefox.sh](../../ports/firefox/firefox.sh)) refuses to start without a GPU
 renderer rather than let WebRender fall back to software, and
-[leandros-prefs.js](../../ports/firefox/leandros-prefs.js) forces WebRender on, disables the
-content sandbox level and Fission (one content process), and turns off telemetry, updates and
+[leandros-prefs.js](../../ports/firefox/leandros-prefs.js) forces WebRender on, disables
+Fission (one content process), and turns off telemetry, updates and
 first-run pages.
 
 **Fewer disk writes (lane quietio, lane ffchurn).** On the PC's USB 2.0 stick a write command costs up to 1 s and stalls the whole system, so the profile writes as little as it can: the disk cache is off (`browser.cache.disk.enable` false, memory cache 256 MiB), session store snapshots every 5 minutes instead of 15 s, Safe Browsing list downloads, telemetry, Normandy/studies, search and add-on update checks, speculative prefetch and Contile are off. `security.remote_settings.intermediates.enabled=false` stops the intermediate-CA preloading churn: on a new profile Remote Settings fetches the 1771 certificate attachments of `security-state/intermediates` and caches each as an IndexedDB Blob, i.e. one file and one `fsync` per certificate (PC boot 17: files 1..380, one about every 5 s, each fsync a multi-second F2FS checkpoint). Measured on a new profile in the first 6 minutes in QEMU on example.com: aarch64 4568 to 623 fsyncs and 1993 to 49 blob files, x86_64 4533 to 671. The certificates only help TLS servers that send an incomplete chain. Two prefs that did nothing were dropped: `services.settings.server=""` (release builds ignore any override of the server URL, so it never turned Remote Settings off) and `toolkit.storage.synchronous` (the pref does not exist in Firefox 136; IndexedDB runs WAL with `synchronous=NORMAL`, so a commit does not fsync, only WAL checkpoints and Blob files do). With `f2fs.fsync=lazy` ([filesystems.md](../servers/filesystems.md#performance-on-slow-media)) the remaining fsyncs return at once.

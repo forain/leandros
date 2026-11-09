@@ -218,7 +218,10 @@ pub fn reaper_for(dead: u32) -> u32 {
     let mut steps = 0;
     while n != 0 && steps <= ns::MAX_PIDNS_LEVEL as usize + 1 {
         let i = ns::pid_init(n);
-        if i != 0 && i != dead && crate::RUN_QUEUE.lock().find_pid(i).is_some() { return i; }
+        if i != 0 && i != dead && !ns::pid_dead(n) {
+            let rq = crate::RUN_QUEUE.lock();
+            if rq.find_pid(i).map_or(false, |t| t.state != crate::task::TaskState::Zombie) { return i; }
+        }
         n = ns::parent(n);
         steps += 1;
     }
@@ -228,28 +231,44 @@ pub fn reaper_for(dead: u32) -> u32 {
 /// Init `tgid` of namespace `n` is dying: SIGKILL every other process in `n`
 /// and its descendants, then wait (bounded) until they are all zombies.
 pub fn zap(n: NsId, tgid: u32) {
-    let mut victims: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
-    let collect = |v: &mut alloc::vec::Vec<u32>| {
+    // (tid, tgid) of every live task in the subtree: leaderless groups (main
+    // thread exited, other threads running) have no live leader to find.
+    let mut victims: alloc::vec::Vec<(u32, u32)> = alloc::vec::Vec::new();
+    let collect = |v: &mut alloc::vec::Vec<(u32, u32)>| {
         v.clear();
         let rq = crate::RUN_QUEUE.lock();
         for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
-                if t.pid == t.tgid && t.tgid != tgid && is_ancestor_or_eq(n, t.pidns.id())
+                if t.tgid != tgid && is_ancestor_or_eq(n, t.pidns.id())
                     && t.state != crate::task::TaskState::Zombie && t.address_space.is_some() {
                     let _ = v.try_reserve(1);
-                    if v.len() < v.capacity() { v.push(t.pid); }
+                    if v.len() < v.capacity() { v.push((t.pid, t.tgid)); }
                 }
             }
         }
     };
+    let kill = |v: &[(u32, u32)]| {
+        let mut last = 0u32;
+        for &(tid, tg) in v.iter() {
+            if tg == last { continue; }
+            last = tg;
+            let sig = || crate::task::SigInfo::user(tgid, 0);
+            if crate::deliver_signal_process(tg, 9, sig()) != 0 {
+                let _ = crate::deliver_signal(tid, 9, sig());
+            }
+        }
+        // Threads of a leaderless group: signal each one directly.
+        for &(tid, tg) in v.iter() {
+            if tid != tg { let _ = crate::deliver_signal(tid, 9, crate::task::SigInfo::user(tgid, 0)); }
+        }
+    };
     collect(&mut victims);
-    for &p in victims.iter() {
-        let _ = crate::deliver_signal_process(p, 9, crate::task::SigInfo::user(tgid, 0));
-    }
+    kill(&victims);
     let deadline = crate::monotonic_ns().saturating_add(5_000_000_000);
     loop {
         collect(&mut victims);
         if victims.is_empty() || crate::monotonic_ns() > deadline { return; }
+        kill(&victims);
         crate::irq_window();
         crate::yield_now("pidns_zap");
     }

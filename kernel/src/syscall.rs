@@ -10662,6 +10662,7 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
     if let Some((pid, rest)) = proc_magic(path, b"exe") {
         if rest.is_empty() {
             if sched::exists_probe(pid) != 0 { return -2; }
+            if !proc_link_allowed(pid) { return -13; }
             // A leaderless group (leader pthread_exited) has no exe, as on Linux.
             if sched::leaderless(sched::tgid_of(pid)) { return -2; }
             let mut kb: Vec<u8> = alloc::vec![0u8; HOST_PATH_MAX];
@@ -10674,6 +10675,7 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
     // /proc/<pid>/cwd and /proc/<pid>/root.
     if let Some((pid, rest)) = proc_magic(path, b"cwd") {
         if rest.is_empty() {
+            if sched::exists_probe(pid) == 0 && !proc_link_allowed(pid) { return -13; }
             return match sched::cwd_arc_of(pid) {
                 Some(c) => reply(&jail_relative(&c)),
                 None => -2,
@@ -10697,6 +10699,7 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
     if let Some((pid, rest)) = proc_magic(path, b"root") {
         if rest.is_empty() {
             if sched::exists_probe(pid) != 0 { return -2; }
+            if !proc_link_allowed(pid) { return -13; }
             return match sched::root_arc_of(pid) {
                 Some(r) => reply(&jail_relative(&r)),
                 None => reply(&jail_relative(b"/")),
@@ -10889,6 +10892,14 @@ fn proc_ns_link(p: &[u8]) -> Option<(u32, usize)> {
 }
 
 /// `/proc/<pid|self|thread-self>/<what>` → (pid, rest after `<what>`).
+/// ptrace-read-style check for exe/cwd/root of another process: same euid or root.
+fn proc_link_allowed(pid: u32) -> bool {
+    let tgt = sched::tgid_of(pid);
+    if tgt == sched::current_tgid() { return true; }
+    let c = sched::euid_of(current_pid());
+    c == 0 || c == sched::euid_of(tgt)
+}
+
 fn proc_magic<'a>(p: &'a [u8], what: &[u8]) -> Option<(u32, &'a [u8])> {
     let rest = p.strip_prefix(b"/proc/")?;
     let slash = rest.iter().position(|&b| b == b'/')?;
@@ -10901,7 +10912,9 @@ fn proc_magic<'a>(p: &'a [u8], what: &[u8]) -> Option<(u32, &'a [u8])> {
         if who.is_empty() || who.len() > 9 || !who.iter().all(|b| b.is_ascii_digit()) { return None; }
         let mut n = 0u32;
         for &d in who { n = n * 10 + (d - b'0') as u32; }
-        n
+        // Translate through the caller's pid namespace: invisible pids are
+        // ENOENT, and 1 names the namespace init, not the global init.
+        sched::pidns::from_cur(n).ok()?
     };
     Some((pid, tail))
 }

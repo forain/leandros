@@ -568,6 +568,14 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
             mm::buddy::free(stack_base_phys, stack_pages);
             return -11; // EAGAIN
         }
+        // Re-check under the RUN_QUEUE hold: zap sets pid_dead before it takes
+        // the lock, so every child is either seen by zap's collect or refused.
+        if pidns_target != 0 && crate::ns::pid_dead(pidns_target) {
+            drop(rq);
+            drop(child);
+            mm::buddy::free(stack_base_phys, stack_pages);
+            return -12; // ENOMEM
+        }
         crate::pidns::claim_init(pidns_target, child_pid);
         if !rq.enqueue(child) {
             if pidns_target != 0 { crate::ns::set_pid_dead(pidns_target); }
@@ -920,6 +928,14 @@ pub fn clone_thread(
             report_task_table_full();
             mm::buddy::free(stack_base_phys, stack_pages);
             return -11; // EAGAIN
+        }
+        // Re-check under the RUN_QUEUE hold: zap sets pid_dead before it takes
+        // the lock, so every child is either seen by zap's collect or refused.
+        if pidns_target != 0 && crate::ns::pid_dead(pidns_target) {
+            drop(rq);
+            drop(child);
+            mm::buddy::free(stack_base_phys, stack_pages);
+            return -12; // ENOMEM
         }
         crate::pidns::claim_init(pidns_target, child_pid);
         if !rq.enqueue(child) {

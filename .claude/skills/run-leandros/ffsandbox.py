@@ -44,13 +44,15 @@ open(collect, "w").write(r'''for d in /proc/[0-9]*; do
   p=${d#/proc/}
   c=$(cat $d/cmdline 2>/dev/null | tr '\0' ' ')
   case "$c" in *firefox*) ;; *) continue ;; esac
-  echo "SBPID $p CMD ${c:0:400}"
+  echo "SBPID $p CMD ${c:0:2000}"
   while read k v; do
     case "$k" in Seccomp:|Seccomp_filters:|NoNewPrivs:|NSpid:) echo "SBST $p $k $v" ;; esac
   done < $d/status
   echo "SBROOT $p $(readlink $d/root 2>&1)"
   echo "SBNS $p user=$(readlink $d/ns/user 2>&1) net=$(readlink $d/ns/net 2>&1) ipc=$(readlink $d/ns/ipc 2>&1)"
 done
+echo "SBETC ld.so.conf: $(cat /etc/ld.so.conf 2>&1 | tr '\n' ' ')"
+echo "SBETC localtime: $(ls -l /etc/localtime 2>&1)"
 echo SBDONE
 ''')
 
@@ -86,6 +88,8 @@ def run(mode):
     post, ff = rd("post.txt"), rd("ff.log")
     procs = {}
     for l in post.splitlines():
+        if l.startswith("SBETC "):
+            print(" ", l[:140])
         m = re.match(r"SBPID (\d+) CMD (.*)", l)
         if m:
             procs[m[1]] = {"cmd": m[2], "st": {}, "root": "?", "ns": {}}
@@ -129,6 +133,8 @@ def run(mode):
         print(f"{p:>5} {t:9} {s.get('Seccomp:', '?'):7} {s.get('Seccomp_filters:', '?'):4} {s.get('NoNewPrivs:', '?'):3} "
               f"{s.get('NSpid:', '?')[:9]:9} {v['root'][:30]}")
         types.setdefault(t, []).append(s.get("Seccomp:", "?"))
+        ns = " ".join(f"{k}={v['ns'].get(k, '?').replace(k + ':', '')}" for k in ("user", "net", "ipc"))
+        print(f"      args-tail: ...{v['cmd'].strip()[-70:]} | {ns}")
     for l in sbl[:10]:
         print("  LOG", l[:150])
     print(f"  Sandbox log lines: {len(sbl)}")
