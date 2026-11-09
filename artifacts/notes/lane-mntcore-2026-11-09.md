@@ -30,9 +30,7 @@ Status: see RESULTS at the bottom. Design: leandros-artifacts/orch/designs/desig
   `fd_host_path` / `/proc/self/fd/N` (backing already): correct, already backing paths.
 - mount(2) bind source (`syscall.rs` ~9207): `src` comes from resolve; in M1 it must be built
   with `from_ns` so the source is translated through the caller's tree.
-- `read_user_cstr_kpath` (one caller, symlink target around `:10415`): a user-derived path left
-  UNtranslated (raw ns path used as a backing path). Harmless in ns 0 (same single exception
-  as today), but M1 must route it through `resolve_ns` + `from_ns`.
+- `read_user_cstr_kpath` (symlinkat target): verbatim by design (the link body is data, not a path lookup): correct.
 - PT_INTERP / shebang: not `raw` sites; they reopen through `open_kernel_path`, so an
   interpreter path in a mntns task is resolved as a backing path. M1/M6 must translate it
   (the design's M0 audit item): left unchanged here because no task can have mntns != 0 yet.
