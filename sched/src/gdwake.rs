@@ -176,7 +176,7 @@ pub fn for_each_park(mut f: impl FnMut(u32, u32, u32, u32, u32, u32)) {
 // the same bloom bit and the same 16-bit fingerprint: the victim must stay
 // parked (false wake = the 16-bit-fingerprint bug). Then a wake for K must
 // wake it (lost wake = a broken fix). One serial line reports the result.
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering as KOrd};
+use core::sync::atomic::Ordering as KOrd;
 
 static KST_PARKED: AtomicBool = AtomicBool::new(false);
 static KST_WOKE: AtomicU32 = AtomicU32::new(0);
