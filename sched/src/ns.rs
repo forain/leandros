@@ -839,6 +839,10 @@ pub fn join(items: alloc::vec::Vec<(usize, NsRef)>, alone: bool, chrooted: bool)
             }
         }
     }
+    drop(old);
+    0
+}
+
 // ── cgroup namespaces (design-cgroup lane CG0/CG1; append-only) ─────────────
 //
 // A cgroup namespace is a flat id that records its root cgroup and its owner

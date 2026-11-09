@@ -8,4 +8,4 @@ setns(2) (x86_64 308, aarch64 268) and openable /proc/<pid>/ns/* files.
 - net/ipc/pid namespaces now record their owning userns (OWNER_UNS, counted ref).
 - ioctls NS_GET_USERNS / PARENT / NSTYPE / OWNER_UID on ns fds.
 - Evidence: nstest 12 new cases failed on main (75/12), 87/0 after; default aarch64 regress PASS.
-- Open: mnt/cgroup (EINVAL), uts hook is the `_ => -22` arm in `check_join` and `setns_fd` (lane utsns); bind-mounting an ns fd path to keep a namespace alive; no ptrace-style permission check on open of other users' ns files; NS_GET_* skip Linux's reachability checks; joined net ns has down loopback (existing design).
+- UTS and cgroup joins supported. Open: mnt (EINVAL: needs root/cwd reset); bind-mounting an ns fd path to keep a namespace alive; no ptrace-style permission check on open of other users' ns files; NS_GET_* skip Linux's reachability checks; joined net ns has down loopback (existing design).
