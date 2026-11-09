@@ -12,8 +12,8 @@ pref("layers.acceleration.force-enabled", true);
 pref("media.hardware-video-decoding.enabled", false);
 pref("media.ffmpeg.vaapi.enabled", false);
 
-// No seccomp or namespaces in the kernel (see /bin/firefox).
-pref("security.sandbox.content.level", 0);
+// The content sandbox keeps Firefox's default level; /bin/firefox decides
+// whether the sandboxes are on (LEANDROS_FIREFOX_SANDBOX=0 turns them off).
 
 // JIT code W^X in content processes too. The kernel refuses a mapping that is
 // writable and executable at once, and with this off a content process's JIT
