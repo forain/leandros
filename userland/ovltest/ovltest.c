@@ -25,6 +25,7 @@
 
 static int npass, nfail;
 static char fsname[16];
+static int keep;
 
 static void check(const char *name, int ok)
 {
@@ -175,7 +176,8 @@ static void run_group(const char *base0, const char *label)
           (snprintf(p, sizeof p, "%s/nulllink", base), link(q, p)) == 0
           && lstat(p, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 && st.st_nlink == 2);
 
-    /* cleanup */
+    /* cleanup (skipped with argv[1]=keep so an image can be checked on Linux) */
+    if (keep) return;
     {
         const char *names[] = { "nulllink", "null2", "zero", "big", "blk", "fifo", "sock",
                                 "uwh", "ufifo", "usock", "wh", "file" };
@@ -188,8 +190,9 @@ static void run_group(const char *base0, const char *label)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    keep = argc > 1 && !strcmp(argv[1], "keep");
     run_group("/home", "f2fs");
     run_group("/tmp", "tmpfs");
     printf("ovltest: %d passed, %d failed\n", npass, nfail);
