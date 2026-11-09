@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 static int fails;
 static void report(const char *name, int ok) { printf("%s: %s\n", name, ok ? "PASS" : "FAIL"); if (!ok) fails++; }
@@ -34,6 +35,20 @@ static void kernel_selftest(void) {
         else if (!strncmp(c, ": FAIL", 6)) { *c = 0; report(l, 0); rows++; bad++; }
     }
     report("selftest_rows", rows >= 15 && bad == 0);
+}
+
+/* New mount API (lane newmntapi, M8): every call returns ENOSYS. */
+static void newapi_enosys(void) {
+    static const struct { const char *n; long nr; } c[] = {
+        {"open_tree", 428}, {"move_mount", 429}, {"fsopen", 430}, {"fsconfig", 431},
+        {"fsmount", 432}, {"fspick", 433}, {"mount_setattr", 442} };
+    int ok = 1;
+    for (unsigned i = 0; i < sizeof c / sizeof c[0]; i++) {
+        errno = 0;
+        long r = syscall(c[i].nr, 0L, 0L, 0L, 0L, 0L, 0L);
+        if (!(r == -1 && errno == ENOSYS)) ok = 0;
+    }
+    report("newapi_enosys", ok);
 }
 
 /* The hidden superblock prefix must not be reachable or listed. */
@@ -84,6 +99,7 @@ static void bench(void) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
+    newapi_enosys();
     kernel_selftest();
     sb_hidden_ns0();
     ns0_invariants();
