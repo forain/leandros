@@ -1887,7 +1887,6 @@ static int ib_ttypg(void)
 static int ub_ttypg(void) { return in_init(ib_ttypg); }
 PCASE(tty_pgrp_view, ub_ttypg)
 
-<<<<<<< HEAD
 /* ---- SCM_CREDENTIALS / SO_PASSCRED translation (lane credxlate) ---- */
 #include <sys/prctl.h>
 #include <linux/filter.h>
@@ -2126,7 +2125,6 @@ static int ib_timer_sig(void)
 }
 static int ub_timer_sig(void) { return in_init(ib_timer_sig); }
 PCASE(timer_sig_in_pidns, ub_timer_sig)
-=======
 
 /* ── UTS namespaces ─────────────────────────────────────────────────────── */
 static int hn_is(const char *want)
@@ -2208,7 +2206,6 @@ static int t_uts_in_host_userns(void)
     CHECK(sethostname("evil", 4) == -1 && errno == EPERM);
     return 0;
 }
->>>>>>> main
 
 static int run_userns_cases(void)
 {
@@ -2239,13 +2236,10 @@ static int run_userns_cases(void)
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
         { "map_deputy", t_map_deputy }, { "map_race", t_map_race }, { "chroot_newuser_eperm", t_chroot_newuser },
         { "fdinfo_other_uid", t_fdinfo_other_uid },
-<<<<<<< HEAD
         { "scm_cred_into_pidns", t_scm_cred_into_pidns }, { "scm_cred_from_pidns", t_scm_cred_from_pidns },
         { "scm_cred_self_in_pidns", t_scm_cred_self_in_pidns }, { "scm_cred_unmapped", t_scm_cred_unmapped },
         { "scm_cred_forge", t_scm_cred_forge }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
-=======
         { "uts_unpriv", t_uts_unpriv }, { "uts_copy_inherit", t_uts_copy_inherit }, { "uts_host_userns_eperm", t_uts_in_host_userns },
->>>>>>> main
         { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
