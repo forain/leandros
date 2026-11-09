@@ -1926,7 +1926,7 @@ const DBG_SERIAL_WRITE: bool = false;
 ///         held. Kills the caller (SIGSEGV); the lock must be released.
 /// x86_64: the same ops with SMAP for PAN and SMEP for PXN.
 fn sys_secprobe(op: usize, addr: usize) -> isize {
-    if !sched::cred::current_is_root() { return -1; }
+    if !sched::host_root() { return -1; }
     {
         use core::sync::atomic::Ordering::SeqCst;
         use sched::uaccess as ua;
@@ -1978,7 +1978,7 @@ fn sys_secprobe(op: usize, addr: usize) -> isize {
 }
 
 fn sys_dbg_serial_write(ptr: usize, len: usize) -> isize {
-    if !sched::cred::current_is_root() { return -1; }
+    if !sched::host_root() { return -1; }
     if !DBG_SERIAL_WRITE { return 0; }
     let n = len.min(256);
     if n == 0 || ptr == 0 { return 0; }
@@ -2536,14 +2536,14 @@ fn dispatch_inner(
         // caller gets Linux's answer (EPERM — the capability check comes before
         // anything else there), root gets ENOSYS.
         ACCT | VHANGUP | SWAPON | SWAPOFF | KEXEC_LOAD => {
-            if sched::current_euid() != 0 { -1 } else { log_enosys(number) }
+            if !sched::host_root() { -1 } else { log_enosys(number) }
         }
         INIT_MODULE   => crate::kmod::sys::sys_init_module(a0, a1, a2),
         FINIT_MODULE  => crate::kmod::sys::sys_finit_module(a0, a1, a2),
         DELETE_MODULE => crate::kmod::sys::sys_delete_module(a0, a1),
         KEXEC_FILE_LOAD => crate::kexec::sys_kexec_file_load(a0, a1, a2, a3, a4),
         #[cfg(not(target_arch = "aarch64"))]
-        IOPL | IOPERM => if sched::current_euid() != 0 { -1 } else { log_enosys(number) },
+        IOPL | IOPERM => if !sched::host_root() { -1 } else { log_enosys(number) },
         SETHOSTNAME   => sys_setxname(a0, a1, false),
         SETDOMAINNAME => sys_setxname(a0, a1, true),
 
@@ -3744,7 +3744,7 @@ fn sys_mremap(
 ///                   primitive (no exec, no credential setup), so only a
 ///                   privileged server may use it
 fn sys_spawn(entry_va: usize, stack_va: usize, priority_raw: usize) -> isize {
-    if !sched::cred::current_is_root() { return -1; }
+    if !sched::host_root() { return -1; }
     // Reject entries that point into the kernel half of the address space.
     if entry_va == 0 || entry_va >= USER_SPACE_END { return -22; }
     if stack_va  >= USER_SPACE_END                 { return -22; }
@@ -4221,7 +4221,7 @@ fn pidfd_reaped_wake(pid: u32) {
 fn sys_clock_settime(clkid: usize, tp_ptr: usize) -> isize {
     if clkid != CLOCK_REALTIME { return -22; }
     let ns = match read_user_timespec(tp_ptr) { Ok(n) => n, Err(e) => return e };
-    if sched::current_euid() != 0 { return -1; } // EPERM
+    if !sched::host_root() { return -1; } // EPERM
     step_realtime_ns(ns);
     0
 }
@@ -4254,7 +4254,7 @@ fn sys_settimeofday(tv_ptr: usize, _tz_ptr: usize) -> isize {
     let tv_sec  = match sched::uaccess::read_user::<i64>(tv_ptr) { Some(v) => v, None => return -14 };
     let tv_usec = match sched::uaccess::read_user::<i64>(tv_ptr + 8) { Some(v) => v, None => return -14 };
     if tv_sec < 0 || tv_usec < 0 || tv_usec >= 1_000_000 { return -22; }
-    if sched::current_euid() != 0 { return -1; } // EPERM
+    if !sched::host_root() { return -1; } // EPERM
     step_realtime_ns((tv_sec as u64).saturating_mul(1_000_000_000) + (tv_usec as u64) * 1_000);
     0
 }
@@ -5514,7 +5514,7 @@ fn sys_getppid() -> isize {
 /// asks ptrace_may_access).
 fn sys_get_robust_list(tid: usize, head_ptr: usize, len_ptr: usize) -> isize {
     let Ok(tid) = sched::pidns::from_cur(tid as u32) else { return -3 };
-    if tid != 0 && sched::tgid_of(tid) != sched::current_tgid() && sched::current_euid() != 0 {
+    if tid != 0 && sched::tgid_of(tid) != sched::current_tgid() && !sched::host_root() {
         return -1; // EPERM
     }
     let Some(head) = sched::robust::get(tid) else { return -3 }; // ESRCH
@@ -9186,7 +9186,7 @@ fn sys_mount(
     const MS_NOSUID:  usize = 2;
     const MS_REMOUNT: usize = 32;
     // Every form of mount(2) needs CAP_SYS_ADMIN (Linux `may_mount`).
-    if sched::current_euid() != 0 { return -1; } // EPERM
+    if !sched::host_root() { return -1; } // EPERM
     if flags & MS_REMOUNT != 0 {
         let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
         let t = match core::str::from_utf8(target_path.bytes()) { Ok(s) => s, Err(_) => return -22 };
@@ -9378,7 +9378,7 @@ fn sys_mount(
 }
 
 fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
-    if sched::current_euid() != 0 { return -1; } // EPERM (CAP_SYS_ADMIN)
+    if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
     let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
     // An alias mount (a chroot's /proc, a bind mount) is named by where the
     // caller sees it, i.e. its namespace path.
@@ -9396,7 +9396,7 @@ fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
 }
 
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
-    if sched::current_euid() != 0 { return -1; } // EPERM (CAP_SYS_ADMIN)
+    if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
     let pid = current_pid();
     let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
     let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };
@@ -10798,7 +10798,7 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
             let tgt = sched::tgid_of(pid);
             if tgt != sched::current_tgid() {
                 let c = sched::euid_of(current_pid());
-                if c != 0 && c != sched::euid_of(tgt) { return -13; }
+                if !sched::host_root() && c != sched::euid_of(tgt) { return -13; }
             }
             let mut fd = 0usize;
             for &d in num_str { fd = fd * 10 + (d - b'0') as usize; }
@@ -11016,8 +11016,7 @@ fn proc_ns_link(p: &[u8]) -> Option<(u32, usize)> {
 fn proc_link_allowed(pid: u32) -> bool {
     let tgt = sched::tgid_of(pid);
     if tgt == sched::current_tgid() { return true; }
-    let c = sched::euid_of(current_pid());
-    c == 0 || c == sched::euid_of(tgt)
+    sched::host_root() || sched::euid_of(current_pid()) == sched::euid_of(tgt)
 }
 
 fn proc_magic<'a>(p: &'a [u8], what: &[u8]) -> Option<(u32, &'a [u8])> {
@@ -12211,7 +12210,7 @@ fn tty_ioctl_bounce(cmd: usize, arg: usize, f: impl FnOnce(usize) -> isize) -> i
 fn sys_timer_create(clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) -> isize {
     match clockid as i32 {
         0 | 1 | 2 | 3 | 7 | 11 => {}
-        8 | 9 => if sched::current_euid() != 0 { return -1; } // EPERM: CAP_WAKE_ALARM
+        8 | 9 => if !sched::host_root() { return -1; } // EPERM: CAP_WAKE_ALARM
         4 | 5 | 6 => return -95, // EOPNOTSUPP
         _ => return -22,
     }
@@ -16735,7 +16734,7 @@ fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
         if want < 1 || want as u32 >= sched::PID_MAX { return -22; }
         // Linux: CAP_CHECKPOINT_RESTORE (or CAP_SYS_ADMIN) in the owning
         // user namespace.
-        if sched::current_euid() != 0 { return -1; }
+        if !sched::host_root() { return -1; }
         Some(want as u32)
     } else { None };
     // Default handlers in the child: what the child of a fork that is about
