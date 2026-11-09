@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
@@ -675,6 +676,102 @@ static int nested_view(void)
     return run_nest(&n, 1);
 }
 
+/* ---- idcaps: capability transitions are relative to the namespace root --- */
+
+#define CAP_EXIT_NONE 20
+#define CAP_EXIT_SOME 21
+static char selfexe[256] = "/bin/idmaptest";
+
+/* "--capprobe" image: exit CAP_EXIT_NONE if effective and permitted are empty. */
+static int capprobe(void)
+{
+    char b[1024];
+    unsigned long long eff = ~0ULL, prm = ~0ULL;
+    if (rd("/proc/self/status", b, sizeof b) <= 0) return 99;
+    char *p = strstr(b, "CapEff:");
+    if (p) eff = strtoull(p + 7, NULL, 16);
+    p = strstr(b, "CapPrm:");
+    if (p) prm = strtoull(p + 7, NULL, 16);
+    return (eff == 0 && prm == 0) ? CAP_EXIT_NONE : CAP_EXIT_SOME;
+}
+static int cap_exec(void)
+{
+    execl(selfexe, selfexe, "--capprobe", (char *)NULL);
+    return 98;
+}
+static int caps_empty_now(void) { return capprobe() == CAP_EXIT_NONE; }
+
+/* Host root that gave up its uid but kept caps (KEEPCAPS): exec must drop them. */
+static int exec_drops_caps_host(void)
+{
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        if (prctl(PR_SET_KEEPCAPS, 1)) _exit(90);
+        if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) _exit(91);
+        if (caps_empty_now()) _exit(92);          /* KEEPCAPS must have kept them */
+        _exit(cap_exec());
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == CAP_EXIT_NONE);
+    return 0;
+}
+
+#define CAPMAP "0 1000 1\n5 5 1\n"
+static int c_exec_nsroot(void *a) { (void)a; return cap_exec(); }
+static int exec_nsroot_keeps_caps(void)
+{
+    if (!knob) return SKIP;
+    int go; pid_t c = spawn(1000, c_exec_nsroot, NULL, &go);
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", CAPMAP) == 0);
+    return fin(c, go) == CAP_EXIT_SOME ? 0 : 1;
+}
+
+static int c_setuid_drop(void *a)
+{
+    (void)a;
+    CHECK(!caps_empty_now());
+    CHECK(setresuid(5, 5, 5) == 0);
+    CHECK(caps_empty_now());
+    return 0;
+}
+static int setuid_drops_caps(void)
+{
+    if (!knob) return SKIP;
+    int go; pid_t c = spawn(1000, c_setuid_drop, NULL, &go);
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", CAPMAP) == 0);
+    return fin(c, go);
+}
+
+static int c_exec_nonroot(void *a)
+{
+    (void)a;
+    if (prctl(PR_SET_KEEPCAPS, 1)) return 90;
+    if (setresuid(5, 5, 5)) return 91;
+    if (caps_empty_now()) return 92;
+    return cap_exec();
+}
+static int exec_nonroot_nocaps(void)
+{
+    if (!knob) return SKIP;
+    int go; pid_t c = spawn(1000, c_exec_nonroot, NULL, &go);
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", CAPMAP) == 0);
+    return fin(c, go) == CAP_EXIT_NONE ? 0 : 1;
+}
+
+/* kuid 0 inside a namespace whose root is another kuid is not root there. */
+static int kuid0_not_nsroot(void)
+{
+    if (!knob) return SKIP;
+    int go; pid_t c = spawn(-1, c_exec_nsroot, NULL, &go);   /* stays kuid 0 */
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", CAPMAP) == 0);
+    return fin(c, go) == CAP_EXIT_NONE ? 0 : 1;
+}
+
 /* ---- table -------------------------------------------------------------- */
 
 static const struct { const char *name; int (*fn)(void); } cases[] = {
@@ -692,6 +789,11 @@ static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "nested_view", nested_view },
     { "podman_map_text", podman_map_text },
     { "unpriv_root_map", unpriv_root_map },
+    { "exec_drops_caps_host", exec_drops_caps_host },
+    { "exec_nsroot_keeps_caps", exec_nsroot_keeps_caps },
+    { "setuid_drops_caps", setuid_drops_caps },
+    { "exec_nonroot_nocaps", exec_nonroot_nocaps },
+    { "kuid0_not_nsroot", kuid0_not_nsroot },
 };
 
 static int probe_knob(void)
@@ -720,8 +822,13 @@ static void idcore_cases(void)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc > 1 && strcmp(argv[1], "--capprobe") == 0) return capprobe();
+    {
+        ssize_t n = readlink("/proc/self/exe", selfexe, sizeof selfexe - 1);
+        if (n > 0) selfexe[n] = 0;
+    }
     statx_matches_stat();
     proc_pid_owner();
     status_groups_view();

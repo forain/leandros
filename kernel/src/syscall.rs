@@ -9236,6 +9236,7 @@ fn sys_mount(
             b"sysfs"    => Some((b"/sys".to_vec(), "sysfs")),
             b"devpts"   => Some((b"/dev/pts".to_vec(), "devpts")),
             b"mqueue"   => Some((b"/dev/mqueue".to_vec(), "mqueue")),
+            b"cgroup2"  => Some((b"/sys/fs/cgroup".to_vec(), "cgroup2")),
             _ => None,
         }
     };
@@ -9269,7 +9270,10 @@ fn sys_mount(
         } else {
             fstype.as_bytes().to_vec()
         };
-        return match vfs::alias::add(mp, &src, fstype, &device) { Ok(()) => 0, Err(e) => e as isize };
+        return match vfs::alias::add(mp, &src, fstype, &device) {
+            Ok(()) => { if fstype == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
+            Err(e) => e as isize,
+        };
     }
 
     let source_raw = match read_user_short_str(source_ptr) { Ok(v) => v, Err(e) => return e };
