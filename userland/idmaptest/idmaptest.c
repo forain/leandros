@@ -681,6 +681,8 @@ static int chown_maps_down(void)
     return r;
 }
 
+static int setfsuid(unsigned u) { return (int)syscall(SYS_setfsuid, u); }
+
 static int c_fsuid(void *x)
 {
     const char *p = x; struct stat st;
