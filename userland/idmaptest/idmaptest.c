@@ -164,8 +164,9 @@ static int body_sigchld(void)
     if (k == 0) _exit(0);
     for (int i = 0; i < 200 && chld_uid == -2; i++) usleep(10000);
     waitpid(k, NULL, 0);
-    /* We are ns-root (kuid 100000): the handler must see 0, not 100000. */
-    return chld_uid == 0 ? 0 : 3;
+    /* The child's kuid is 0, unmapped in "0 100000 1" (set*id does not translate
+     * until lane idxlate): the handler must see the overflow id, not 0. */
+    return chld_uid == 65534 ? 0 : 3;
 }
 static void sigchld_si_uid_view(void) { run_ns_case("sigchld_si_uid_view", body_sigchld); }
 
