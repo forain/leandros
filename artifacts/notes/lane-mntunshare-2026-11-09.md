@@ -26,3 +26,33 @@ Spec: orch/designs/design-mntns.md, M1. Branch lane/mntunshare. NOT merged.
 - Fail-first: kernel files from 58fd6c9d with the new tests -> mnttest fails=7 (newns_unpriv_unshare, newns_bind_invisible_out, newns_tmpfs_invisible_out, newns_child_clean, newns_perm, clone3_newns, newns_root_umount_ns_ino).
 - Fixed tree: mnttest 0 fails, nstest 0, chroottest 0, ffsandbox RESULT on=True off=False.
 - Full aarch64 regress on the Mac (HVF, runtests.py, all suites): overall PASS, 0 failures. Box regress not run (queued 30+ min; box boots currently fail with "login: exec failed" per BOX_STATUS). x86_64 NOT run.
+
+## Review fixes (reviews A and B, 2026-11-09)
+
+Merged main (NEWCGROUP, setns; main's `ns_capable_in(target, cap)` wins, the lane copy is gone).
+nstest: NEWNS is implemented, so the "still unimplemented" probes now use CLONE_NEWTIME (0x80).
+
+FIXED (mnttest `hardening_suite` cases in parentheses):
+- A-H1, B-BLOCKER2 (B2), A-M1, A-L3, A-L4: the tmpfs instance pool moved to the hidden `/.leandros-sb/tmpfs/<n>`
+  pool space. Parents are created at VFS init, root 0711; an existing parent is accepted only if it is a root-owned
+  directory; each instance directory is created exclusively (EEXIST otherwise), 0700. The pool is unreachable by
+  name (resolve_ns ENOENT), a symlink hop into it from outside is ENOENT, the mount-tree walk refuses a hidden
+  backing path unless the mount root is itself hidden (bind of `/` cannot expose it), and host_to_view never
+  returns a raw backing path (pool_squat_*, pool_hidden_from_ns0).
+- A-M5, B-BLOCKER1 (B1): pivot_root in mntns != 0 is EINVAL (pivot_in_ns_einval, pivot_ns0_untouched).
+- B-BLOCKER3 (B3): `ns::put` for mount namespaces uses CAS 1->DYING; lookups fail closed (ENOENT) when the tree is missing.
+- B-BLOCKER4 (B4): MNT_LIVE is decremented when the slot goes DYING; wait4/waitid reap dead trees (dead_ns_reaped_on_wait).
+- A-M2: /proc/<pid>/{root,cwd} (open, chdir, readlink, path below) of a task in another mntns is EACCES until a correct
+  translation exists (proc_root_cross_ns_refused).
+- B-S2 (MS_PRIVATE/MS_SLAVE, +REC, no-op; MS_SHARED/UNBINDABLE stay EINVAL; mntinfo is not on main so no real state)
+  (ns_private_slave_noop), B-S3 (clone NEWNS|CLONE_VM; mntns plumbed into clone_thread) (clone_newns_vm), B-S1 (merge).
+- B-N1 (ENOTDIR both ways), B-N4 (MS_MGC_VAL stripped), A-L2 (locked unbindable child -> EPERM),
+  A-L5 / B-S7 (mntns pins its owner userns, dropped in reap), A-L6/B-S8 partly (MNT_MAX 4096 -> 1024).
+
+## Deferred
+- A-M3 (late-bound bind roots), A-M4 (ns-space symlinks / `..`, lane M6): mntns is NOT a security boundary for
+  root-run workloads until these land.
+- A-L1 (sb_get after dropping NS lock), A-L6 (per-uid ns limit, global mount cap, O(n^2) walks), A-L7 (EXDEV/EBUSY at
+  mount boundaries), A-L8 / B-S9 (ns-0 umount retargets copies; EBUSY).
+- B-S4 (tmpfs data options, mode, size), B-S5 (walk picks the longest mp; should pick the newest top), B-S6 (/proc/self/fd
+  sources and targets), B-N2, N3, N5, N6, N7, N8, N9, N10 (x86_64 run is part of the regress batch).
