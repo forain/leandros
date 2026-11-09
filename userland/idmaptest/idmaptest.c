@@ -118,9 +118,9 @@ static int owner_newuser_body(void)
     else {
         char p[64]; struct stat st;
         snprintf(p, sizeof p, "/proc/%d", c);
-        if (stat(p, &st) || st.st_uid != 1000 || st.st_gid != 1000) rc = 3;
+        if (stat(p, &st) || st.st_uid != 1000 || st.st_gid != 1000) { rc = 3; printf("stat uid=%u gid=%u\n", st.st_uid, st.st_gid); }
         int fd = open(p, O_RDONLY | O_DIRECTORY);
-        if (fd < 0 || fstat(fd, &st) || st.st_uid != 1000 || st.st_gid != 1000) rc = rc ? rc : 4;
+        if (fd < 0 || fstat(fd, &st) || st.st_uid != 1000 || st.st_gid != 1000) { rc = rc ? rc : 4; printf("fstat fd=%d uid=%u\n", fd, st.st_uid); }
         int mfd = fd < 0 ? -1 : openat(fd, "uid_map", O_RDONLY);
         if (mfd < 0 || fstat(mfd, &st) || st.st_uid != 1000) rc = rc ? rc : 5;
         if (mfd >= 0) close(mfd);
@@ -135,6 +135,7 @@ static void proc_owner_newuser(void)
     pid_t m = fork();
     if (m == 0) _exit(owner_newuser_body());
     int st; waitpid(m, &st, 0);
+    if (WIFEXITED(st) && WEXITSTATUS(st)) printf("proc_owner_newuser rc=%d\n", WEXITSTATUS(st));
     report("proc_owner_newuser", WIFEXITED(st) && WEXITSTATUS(st) == 0);
 }
 
