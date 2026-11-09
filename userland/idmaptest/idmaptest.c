@@ -825,7 +825,7 @@ static int setuid_maps_down(void) { return run_obs(c_setuid_down, chk_owner_1000
 static int c_chown_down(void *x)
 {
     const char *p = x; struct stat st;
-    int fd = open(p, O_CREAT | O_WRONLY, 0644);
+    int fd = open(p, O_WRONLY);   /* created by the parent: kuid 0 is unmapped here, create => EOVERFLOW */
     CHECK(fd >= 0);
     CHECK(chown(p, 50, -1) == -1 && errno == EINVAL);
     CHECK(chown(p, 5, 6) == 0);
@@ -846,6 +846,10 @@ static int chown_maps_down(void)
 {
     const char *p = "/tmp/idxlate-chown";
     unlink(p);
+    int pf = open(p, O_CREAT | O_WRONLY, 0644);
+    if (pf < 0) return 1;
+    close(pf);
+    if (knob && chown(p, 100000, 100000)) { unlink(p); return 1; }
     int r = run_obs(c_chown_down, chk_chown, p);
     unlink(p);
     return r;
@@ -861,6 +865,7 @@ static int c_fsuid(void *x)
     CHECK(setfsuid(-1) == 6);
     CHECK(setfsuid(50) == 6);                          /* unmapped: unchanged */
     CHECK(setfsuid(-1) == 6);
+    CHECK(syscall(SYS_setfsgid, 6) >= 0);              /* fsgid kuid 0 is unmapped too: create => EOVERFLOW */
     int fd = open(p, O_CREAT | O_WRONLY, 0644);
     CHECK(fd >= 0);
     CHECK(fstat(fd, &st) == 0 && st.st_uid == 6);
@@ -907,10 +912,7 @@ static int getgroups_view(void) { return run_obs(c_groups, chk_groups, NULL); }
 /* No knob needed: an unmapped namespace takes no ids at all. */
 static int c_unmapped_ids(void *x)
 {
-    const char *p = x;
-    int fd = open(p, O_CREAT | O_WRONLY, 0644);
-    CHECK(fd >= 0);
-    close(fd);
+    const char *p = x;   /* created by the parent: an unmapped creator gets EOVERFLOW */
     CHECK(chown(p, 5, -1) == -1 && errno == EINVAL);
     CHECK(chown(p, -1, 5) == -1 && errno == EINVAL);
     CHECK(chown(p, -1, -1) == 0);
@@ -920,6 +922,7 @@ static int chown_unmapped_einval(void)
 {
     const char *p = "/tmp/idxlate-unmapped";
     unlink(p);
+    { int fd = open(p, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd); }
     int go; pid_t c = spawn(-1, c_unmapped_ids, (void *)p, &go);   /* no map written */
     CHECK(c > 0);
     int r = fin(c, go);
@@ -938,6 +941,250 @@ static int setgroups_needs_gidmap(void)
     int go; pid_t c = spawn(-1, c_sg_nomap, NULL, &go);
     CHECK(c > 0);
     return fin(c, go);
+}
+
+
+/* ---- idperm-x: filesystem permission gates (tmpfs /tmp) ------------------ */
+
+#define MAP100 "0 100000 100\n"
+#define PXD "/tmp/idpx"
+
+static int px_setx(const char *p, const char *n, const char *v, size_t l)
+{ return (int)syscall(SYS_setxattr, p, n, v, l, 0); }
+static int px_getx(const char *p, const char *n)
+{ char b[64]; return (int)syscall(SYS_getxattr, p, n, b, sizeof b); }
+static int px_listhas(const char *p, const char *pfx)
+{
+    char b[512]; long n = syscall(SYS_listxattr, p, b, sizeof b);
+    for (long i = 0; i < n; i += strlen(b + i) + 1) if (!strncmp(b + i, pfx, strlen(pfx))) return 1;
+    return 0;
+}
+/* Host root makes a file/dir owned by kuid u:g (raw, ns 0). */
+static int px_mk(const char *p, int dir, unsigned u, unsigned g, unsigned mode)
+{
+    if (dir) { if (mkdir(p, 0700) && errno != EEXIST) return -1; }
+    else { int fd = open(p, O_CREAT | O_WRONLY, 0600); if (fd < 0) return -1; close(fd); }
+    return chown(p, u, g) || chmod(p, mode) ? -1 : 0;
+}
+static void px_clean(void)
+{
+    (void)!system("rm -rf " PXD);
+    mkdir(PXD, 0777); chmod(PXD, 0777);
+}
+/* ns child: becomes ns root (kuid 100000 once the map is written) */
+static int px_nsroot(void) { return setresgid(0, 0, 0) || setresuid(0, 0, 0) ? 1 : 0; }
+
+typedef int (*pxfn)(void);
+static pxfn px_cur;
+static int c_px(void *a) { (void)a; return px_cur(); }
+/* Run fn in a fresh user ns of a kuid-0 child; maps (if any) written by us. */
+static int px_run(pxfn fn, const char *map)
+{
+    px_cur = fn;
+    int go; pid_t c = spawn(-1, c_px, NULL, &go);
+    CHECK(c > 0);
+    if (map) { CHECK(wrp(c, "uid_map", map) == 0); CHECK(wrp(c, "gid_map", map) == 0); }
+    return fin(c, go);
+}
+static int px_hostuser(pxfn f)
+{
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) _exit(97);
+        _exit(f());
+    }
+    int st = 0; waitpid(c, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 100;
+}
+
+/* -- host root is unaffected -- */
+static int host_root_fs_unaffected(void)
+{
+    struct timespec ts[2] = { { 5, 0 }, { 6, 0 } };
+    struct stat st;
+    px_clean();
+    CHECK(px_mk(PXD "/f", 0, 1000, 1000, 0600) == 0);
+    CHECK(px_mk(PXD "/d", 1, 1000, 1000, 0700) == 0);
+    CHECK(px_mk(PXD "/d/g", 0, 1000, 1000, 0000) == 0);
+    int fd = open(PXD "/f", O_RDWR); CHECK(fd >= 0); CHECK(write(fd, "x", 1) == 1); close(fd);
+    fd = open(PXD "/d/g", O_RDWR); CHECK(fd >= 0); close(fd);
+    CHECK(chmod(PXD "/f", 0640) == 0);
+    CHECK(chown(PXD "/f", 7, 8) == 0);
+    CHECK(utimensat(AT_FDCWD, PXD "/f", ts, 0) == 0);
+    CHECK(stat(PXD "/f", &st) == 0 && st.st_uid == 7 && st.st_gid == 8 && (st.st_mode & 0777) == 0640);
+    CHECK(px_setx(PXD "/f", "trusted.t", "1", 1) == 0);
+    CHECK(px_getx(PXD "/f", "trusted.t") == 1 && px_listhas(PXD "/f", "trusted."));
+    CHECK(px_setx(PXD "/f", "security.s", "1", 1) == 0);
+    CHECK(unlink(PXD "/d/g") == 0);
+    return 0;
+}
+
+/* -- trusted.* is host root only -- */
+static int c_trusted(void)
+{
+    CHECK(px_setx(PXD "/t", "trusted.t", "2", 1) == -1 && errno == EPERM);
+    CHECK(px_getx(PXD "/t", "trusted.t") == -1 && errno == ENODATA);
+    CHECK(!px_listhas(PXD "/t", "trusted."));
+    return 0;
+}
+static int trusted_xattr_host_only(void)
+{
+    px_clean();
+    CHECK(px_mk(PXD "/t", 0, 0, 0, 0666) == 0);
+    CHECK(px_setx(PXD "/t", "trusted.t", "1", 1) == 0);
+    CHECK(px_getx(PXD "/t", "trusted.t") == 1 && px_listhas(PXD "/t", "trusted."));
+    CHECK(px_hostuser(c_trusted) == 0);
+    /* kuid 0 in a fresh user namespace holds caps there, but is not host root */
+    return px_run(c_trusted, NULL);
+}
+
+/* -- security.capability needs the host: EPERM in ns != 0 -- */
+static const char FCAP[20] = { 0, 0, 0, 2 };   /* VFS_CAP_REVISION_2, no caps */
+static int c_fcap_ns(void)
+{
+    CHECK(px_setx(PXD "/c", "security.capability", FCAP, sizeof FCAP) == -1 && errno == EPERM);
+    CHECK(px_setx(PXD "/c", "security.other", "1", 1) == -1 && errno == EPERM);
+    return 0;
+}
+static int fcap_xattr_eperm_in_ns(void)
+{
+    px_clean();
+    CHECK(px_mk(PXD "/c", 0, 0, 0, 0666) == 0);
+    CHECK(px_setx(PXD "/c", "security.other", "1", 1) == 0);   /* host root still may */
+    return px_run(c_fcap_ns, NULL);
+}
+
+/* -- creating a file whose owner is unmapped: EOVERFLOW -- */
+static int c_create_unmapped(void)
+{
+    int fd = open(PXD "/n", O_CREAT | O_WRONLY, 0644);
+    CHECK(fd < 0 && errno == EOVERFLOW);
+    CHECK(mkdir(PXD "/nd", 0755) == -1 && errno == EOVERFLOW);
+    CHECK(symlink("x", PXD "/ns") == -1 && errno == EOVERFLOW);
+    return 0;
+}
+static int create_unmapped_eoverflow(void)
+{
+    px_clean();
+    int r = px_run(c_create_unmapped, NULL);
+    struct stat st;
+    CHECK(stat(PXD "/n", &st) == -1 && stat(PXD "/nd", &st) == -1);
+    return r;
+}
+
+/* -- ns root (kuid 100000, caps in the ns) over mapped / unmapped inodes -- */
+static int c_chown_mapped(void)
+{
+    struct stat st;
+    CHECK(px_nsroot() == 0);
+    CHECK(chown(PXD "/f", 5, 42) == 0);
+    CHECK(stat(PXD "/f", &st) == 0 && st.st_uid == 5 && st.st_gid == 42);
+    return 0;
+}
+static int nsroot_chown_mapped(void)
+{
+    if (!knob) return SKIP;
+    px_clean();
+    CHECK(px_mk(PXD "/f", 0, 100000, 100000, 0644) == 0);
+    CHECK(px_run(c_chown_mapped, MAP100) == 0);
+    struct stat st;
+    CHECK(stat(PXD "/f", &st) == 0 && st.st_uid == 100005 && st.st_gid == 100042);
+    return 0;
+}
+
+static int c_chmod_sub(void)
+{
+    struct stat st;
+    CHECK(px_nsroot() == 0);
+    CHECK(chmod(PXD "/f", 0644) == 0);
+    CHECK(stat(PXD "/f", &st) == 0 && (st.st_mode & 07777) == 0644);
+    return 0;
+}
+static int nsroot_chmod_subuid_file(void)
+{
+    if (!knob) return SKIP;
+    px_clean();
+    CHECK(px_mk(PXD "/f", 0, 100007, 100007, 0600) == 0);
+    return px_run(c_chmod_sub, MAP100);
+}
+
+static int c_write_sub(void)
+{
+    CHECK(px_nsroot() == 0);
+    int fd = open(PXD "/d/f", O_RDWR); CHECK(fd >= 0);
+    CHECK(write(fd, "hi", 2) == 2); close(fd);
+    fd = open(PXD "/d/new", O_CREAT | O_WRONLY, 0600); CHECK(fd >= 0); close(fd);
+    CHECK(unlink(PXD "/d/f") == 0);
+    return 0;
+}
+static int nsroot_write_in_subuid_0700_dir(void)
+{
+    if (!knob) return SKIP;
+    px_clean();
+    CHECK(px_mk(PXD "/d", 1, 100003, 100003, 0700) == 0);
+    CHECK(px_mk(PXD "/d/f", 0, 100003, 100003, 0600) == 0);
+    return px_run(c_write_sub, MAP100);
+}
+
+static int c_untouchable(void)
+{
+    CHECK(px_nsroot() == 0);
+    CHECK(open(PXD "/u", O_RDWR) == -1 && errno == EACCES);
+    CHECK(open(PXD "/u", O_RDONLY) == -1 && errno == EACCES);
+    CHECK(chmod(PXD "/u", 0777) == -1 && errno == EPERM);
+    CHECK(chown(PXD "/u", 5, -1) == -1 && errno == EPERM);
+    CHECK(open(PXD "/ud/f", O_RDONLY) == -1 && errno == EACCES);
+    CHECK(unlink(PXD "/ud/f") == -1 && errno == EACCES);
+    CHECK(open(PXD "/ud/new", O_CREAT | O_WRONLY, 0600) == -1 && errno == EACCES);
+    CHECK(chmod(PXD "/r", 0777) == -1 && errno == EPERM);   /* host-root-owned */
+    CHECK(px_setx(PXD "/u", "user.x", "1", 1) == -1);
+    CHECK(px_setx(PXD "/r", "trusted.x", "1", 1) == -1 && errno == EPERM);
+    return 0;
+}
+static int nsroot_cannot_touch_unmapped(void)
+{
+    if (!knob) return SKIP;
+    px_clean();
+    CHECK(px_mk(PXD "/u", 0, 2000, 2000, 0600) == 0);
+    CHECK(px_mk(PXD "/ud", 1, 2000, 2000, 0700) == 0);
+    CHECK(px_mk(PXD "/ud/f", 0, 2000, 2000, 0600) == 0);
+    CHECK(px_mk(PXD "/r", 0, 0, 0, 0644) == 0);
+    return px_run(c_untouchable, MAP100);
+}
+
+static int c_hu_subuid(void)
+{
+    CHECK(open(PXD "/f", O_RDWR) == -1 && errno == EACCES);
+    CHECK(chmod(PXD "/f", 0666) == -1 && errno == EPERM);
+    CHECK(chown(PXD "/f", 1000, -1) == -1 && errno == EPERM);
+    CHECK(open(PXD "/d/f", O_RDONLY) == -1 && errno == EACCES);
+    return 0;
+}
+static int host_user_cannot_touch_subuid(void)
+{
+    px_clean();
+    CHECK(px_mk(PXD "/f", 0, 100000, 100000, 0600) == 0);
+    CHECK(px_mk(PXD "/d", 1, 100000, 100000, 0700) == 0);
+    CHECK(px_mk(PXD "/d/f", 0, 100000, 100000, 0644) == 0);
+    return px_hostuser(c_hu_subuid);
+}
+
+static int c_sticky(void)
+{
+    CHECK(px_nsroot() == 0);
+    CHECK(unlink(PXD "/s/x") == 0);                                   /* owner mapped: FOWNER over it */
+    CHECK(unlink(PXD "/s/y") == -1 && errno == EPERM);                /* owner unmapped */
+    return 0;
+}
+static int sticky_fowner_ns(void)
+{
+    if (!knob) return SKIP;
+    px_clean();
+    CHECK(px_mk(PXD "/s", 1, 0, 0, 01777) == 0);
+    CHECK(px_mk(PXD "/s/x", 0, 100003, 100003, 0644) == 0);
+    CHECK(px_mk(PXD "/s/y", 0, 2000, 2000, 0644) == 0);
+    return px_run(c_sticky, MAP100);
 }
 
 static const struct { const char *name; int (*fn)(void); } cases[] = {
@@ -966,6 +1213,16 @@ static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "setuid_drops_caps", setuid_drops_caps },
     { "exec_nonroot_nocaps", exec_nonroot_nocaps },
     { "kuid0_not_nsroot", kuid0_not_nsroot },
+    { "host_root_fs_unaffected", host_root_fs_unaffected },
+    { "trusted_xattr_host_only", trusted_xattr_host_only },
+    { "fcap_xattr_eperm_in_ns", fcap_xattr_eperm_in_ns },
+    { "create_unmapped_eoverflow", create_unmapped_eoverflow },
+    { "nsroot_chown_mapped", nsroot_chown_mapped },
+    { "nsroot_chmod_subuid_file", nsroot_chmod_subuid_file },
+    { "nsroot_write_in_subuid_0700_dir", nsroot_write_in_subuid_0700_dir },
+    { "nsroot_cannot_touch_unmapped", nsroot_cannot_touch_unmapped },
+    { "host_user_cannot_touch_subuid", host_user_cannot_touch_subuid },
+    { "sticky_fowner_ns", sticky_fowner_ns },
 };
 
 static int probe_knob(void)
