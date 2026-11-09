@@ -456,6 +456,54 @@ static int c_proc_strict(void) {
     if (waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return 7;
     return ok ? 0 : 8;
 }
+
+/* ── max-length (4096 insns) filter: correctness + the timer stays live ── */
+#define BIG_INSNS 4096
+#define BIG_THREADS 4
+#define BIG_ITERS 400
+static volatile int big_bad, big_done;
+static pid_t big_pid;
+static void *big_worker(void *a) {
+    (void)a;
+    for (int i = 0; i < BIG_ITERS; i++)
+        if (syscall(SYS_getpid) != big_pid) big_bad++;
+    __sync_fetch_and_add(&big_done, 1);
+    return 0;
+}
+static long ms_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+static int c_big_filter(void) {
+    static struct sf f[BIG_INSNS];
+    f[0] = (struct sf){ 0x20, 0, 0, 0 };                         /* LD nr */
+    for (int i = 1; i < BIG_INSNS - 1; i++) f[i] = (struct sf){ 0x04, 0, 0, 1 }; /* A += 1 */
+    f[BIG_INSNS - 1] = (struct sf){ 0x06, 0, 0, RET_ALLOW };
+    struct sfprog p = { BIG_INSNS, f };
+    big_pid = getpid();
+    nnp();
+    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &p) != 0) return 1;
+    pthread_t t[BIG_THREADS];
+    for (int i = 0; i < BIG_THREADS; i++) if (pthread_create(&t[i], 0, big_worker, 0)) return 2;
+    /* Meanwhile, TSYNC a second filter over the running threads (the old
+     * head must stay alive while they walk it) and watch scheduling latency. */
+    long last = ms_now(), maxgap = 0;
+    int synced = 0;
+    while (big_done < BIG_THREADS) {
+        usleep(1000);
+        long n = ms_now();
+        if (n - last > maxgap) maxgap = n - last;
+        last = n;
+        if (!synced) {
+            synced = 1;
+            if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 1 /*TSYNC*/, &prog) != 0) return 3;
+        }
+    }
+    printf("big_filter: max sleep-loop gap %ld ms\n", maxgap);
+    if (big_bad) return 4;
+    if (syscall(SYS_getpid) != big_pid) return 5;
+    return maxgap > 1000 ? 6 : 0;
+}
 int main(int argc, char **argv) {
     self = argv[0];
     if (argc > 1 && !strcmp(argv[1], "exec-child"))
@@ -499,6 +547,7 @@ int main(int argc, char **argv) {
     exit0("tsync_esrch_variant", c_tsync_esrch);
     exit0("tsync_propagates_no_new_privs", c_tsync_nnp);
     exit0("tsync_esrch_without_tsync_einval", c_esrch_alone);
+    exit0("max_len_filter_threads_tsync", c_big_filter);
     exit0("proc_status_seccomp", c_proc_status);
     exit0("proc_status_strict", c_proc_strict);
 
