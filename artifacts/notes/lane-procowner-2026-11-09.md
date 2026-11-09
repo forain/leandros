@@ -22,3 +22,9 @@ Tests (userland/idmaptest): proc_owner_newuser (stat, dirfd fstat, openat uid_ma
 proc_owner_nondumpable, newuidmap_e2e (needs idmap=test: uid 1000 runs
 `newuidmap <pid> 0 1000 1 1 100000 65536`, uid_map shows the extents). All existing
 cases kept.
+
+## Verification (box, 2026-11-09, head ce702afd, main merged)
+- aarch64 `--cmdline idmap=test /bin/idmaptest`: 1/1 RC=0, 0 bad.
+- x86_64 full regress: 76 suites run, 0 bad.
+- aarch64 full regress: 76 suites run, 0 bad.
+- Fail-first: proc_owner_newuser failed on main with `fstat fd=7 uid=0` (see above).
