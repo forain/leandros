@@ -6088,7 +6088,7 @@ fn parse_scm_creds(pid: u32, ctrl_ptr: usize, ctrl_len: usize) -> Result<Option<
             let vgid = sched::uaccess::read_user::<u32>(b + 8).ok_or(-14)?;
             // Ids are in the sender's user namespace: translate to kernel ids
             // (kuids) before any permission check; an unmapped one is invalid.
-            let (Some(uid), Some(gid)) = (sched::ns::kid_from_view(0, vuid), sched::ns::kid_from_view(1, vgid))
+            let (Some(uid), Some(gid)) = (sched::ns::to_k(0, sched::ns::current_userns(), vuid), sched::ns::to_k(1, sched::ns::current_userns(), vgid))
                 else { return Err(-22); };
             let kpid = match sched::pidns::from_cur(vpid) {
                 Ok(k) => k,
