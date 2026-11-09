@@ -17,7 +17,11 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+<<<<<<< HEAD
 #include <sys/vfs.h>
+=======
+#include <sys/un.h>
+>>>>>>> main
 #include <netinet/in.h>
 #include <time.h>
 #include <sys/syscall.h>
@@ -1484,6 +1488,100 @@ static int sticky_fowner_ns(void)
     return px_run(c_sticky, MAP100);
 }
 
+/* ---- SCM_CREDENTIALS / SO_PEERCRED through the user namespaces (knob) ---- */
+#define MAP10 "0 100000 10\n"
+static int send_cred(int fd, unsigned uid)
+{
+    struct ucred uc = { getpid(), uid, uid };
+    char d = 'c';
+    struct iovec iov = { &d, 1 };
+    union { char b[CMSG_SPACE(sizeof uc)]; struct cmsghdr a; } u;
+    memset(&u, 0, sizeof u);
+    struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = u.b, .msg_controllen = sizeof u.b };
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_CREDENTIALS; c->cmsg_len = CMSG_LEN(sizeof uc);
+    memcpy(CMSG_DATA(c), &uc, sizeof uc);
+    return (int)sendmsg(fd, &m, 0);
+}
+static int c_scm_ok(void *a) { int fd = *(int *)a; CHECK(send_cred(fd, 0) == 1); return 0; }
+static int c_scm_unmapped(void *a)
+{
+    int fd = *(int *)a;
+    CHECK(send_cred(fd, 5000) == -1 && errno == EINVAL);
+    return 0;
+}
+static int scm_run(int (*body)(void *), int want_recv)
+{
+    int sv[2], go;
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    int one = 1;
+    CHECK(setsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &one, sizeof one) == 0);
+    pid_t c = spawn(1000, body, &sv[1], &go);
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", MAP10) == 0);
+    CHECK(wrp(c, "setgroups", "deny\n") == 0);
+    CHECK(wrp(c, "gid_map", MAP10) == 0);
+    CHECK(fin(c, go) == 0);
+    if (want_recv) {
+        char d; struct ucred uc;
+        struct iovec iov = { &d, 1 };
+        union { char b[CMSG_SPACE(sizeof uc)]; struct cmsghdr a; } u;
+        struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = u.b, .msg_controllen = sizeof u.b };
+        CHECK(recvmsg(sv[0], &m, 0) == 1);
+        struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+        CHECK(h && h->cmsg_type == SCM_CREDENTIALS);
+        memcpy(&uc, CMSG_DATA(h), sizeof uc);
+        CHECK(uc.uid == 100000 && uc.gid == 100000);
+        CHECK(uc.pid == c);
+    }
+    return 0;
+}
+static int scm_creds_in_translate(void) { if (!knob) return SKIP; return scm_run(c_scm_ok, 1); }
+static int scm_creds_unmapped_einval(void) { if (!knob) return SKIP; return scm_run(c_scm_unmapped, 0); }
+
+#define PC_SOCK "/tmp/idscm-peercred.sock"
+static int c_peercred(void *a)
+{
+    (void)a;
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    strcpy(sa.sun_path, PC_SOCK);
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(s >= 0 && connect(s, (struct sockaddr *)&sa, sizeof sa) == 0);
+    struct ucred uc; socklen_t l = sizeof uc;
+    CHECK(getsockopt(s, SOL_SOCKET, SO_PEERCRED, &uc, &l) == 0);
+    CHECK(uc.uid == 65534 && uc.gid == 65534);      /* host root is unmapped here */
+    char b; CHECK(read(s, &b, 1) == 1);
+    return 0;
+}
+static int peercred_view(void)
+{
+    if (!knob) return SKIP;
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    strcpy(sa.sun_path, PC_SOCK);
+    unlink(PC_SOCK);
+    int l = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(l >= 0 && bind(l, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(l, 1) == 0);
+    chmod(PC_SOCK, 0777);
+    int go; pid_t c = spawn(1000, c_peercred, NULL, &go);
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", MAP10) == 0);
+    CHECK(wrp(c, "setgroups", "deny\n") == 0);
+    CHECK(wrp(c, "gid_map", MAP10) == 0);
+    (void)!write(go, "g", 1);
+    int a = accept(l, NULL, NULL);
+    CHECK(a >= 0);
+    struct ucred uc; socklen_t n = sizeof uc;
+    CHECK(getsockopt(a, SOL_SOCKET, SO_PEERCRED, &uc, &n) == 0);
+    int ok = uc.uid == 1000;                         /* host reader: the peer's kuid */
+    (void)!write(a, "x", 1);
+    close(go);
+    int st = 0; waitpid(c, &st, 0);
+    unlink(PC_SOCK);
+    CHECK(ok);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+
 static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "map_identity_still_ok", map_identity_still_ok },
     { "map_overlap_lower_einval", map_overlap_lower_einval },
@@ -1531,6 +1629,9 @@ static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "host_user_cannot_touch_subuid", host_user_cannot_touch_subuid },
     { "host_user_cannot_touch_subuid_f2fs", host_user_cannot_touch_subuid_f2 },
     { "sticky_fowner_ns", sticky_fowner_ns },
+    { "scm_creds_in_translate", scm_creds_in_translate },
+    { "scm_creds_unmapped_einval", scm_creds_unmapped_einval },
+    { "peercred_view", peercred_view },
 };
 
 static int probe_knob(void)
