@@ -422,6 +422,9 @@ pub struct Task {
     pub poll_kbits:    u64,
     pub poll_nfp:      u16,
     pub poll_fps:      [u16; crate::POLL_FP_MAX],
+    /// Full keys of the first `POLL_FK_MAX` fingerprints (index-aligned with
+    /// `poll_fps`): a fingerprint hit in that range must match the full key.
+    pub poll_fks:      [u64; crate::POLL_FK_MAX],
     /// EPOLLEXCLUSIVE (lane epollabi): exact keys for which this park is
     /// wake-one — a keyed wake on one of them that already woke another
     /// such parker leaves this one parked. Valid under `poll_mask`'s rule;
@@ -878,6 +881,7 @@ impl Task {
             poll_wakes:    0,
             poll_nfp:      0,
             poll_fps:      [0; crate::POLL_FP_MAX],
+            poll_fks:      [0; crate::POLL_FK_MAX],
             poll_xkeys:    [0; crate::POLL_XKEYS],
             poll_nx:       0,
             blocked_futex: 0,
@@ -1319,6 +1323,7 @@ impl Task {
             poll_wakes:    0,
             poll_nfp:      0,
             poll_fps:      [0; crate::POLL_FP_MAX],
+            poll_fks:      [0; crate::POLL_FK_MAX],
             poll_xkeys:    [0; crate::POLL_XKEYS],
             poll_nx:       0,
             blocked_futex: 0,
