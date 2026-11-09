@@ -198,7 +198,7 @@ static void subuid_present(void)
     for (int i = 0; i < 2; i++) {
         char b[128];
         struct stat st;
-        if (slurp_file(files[i], b, sizeof b) < 0 || strcmp(b, "leandro:100000:65536\n") != 0) ok = 0;
+        if (slurp_file(files[i], b, sizeof b) < 0 || strncmp(b, "leandro:100000:65536\n", 21) != 0) ok = 0; /* first line; root range may follow */
         else if (stat(files[i], &st) != 0 || st.st_uid != 0 || st.st_gid != 0 || (st.st_mode & 07777) != 0644) ok = 0;
     }
     report("subuid_present", ok);
