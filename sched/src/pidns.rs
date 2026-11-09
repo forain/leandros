@@ -267,9 +267,36 @@ pub fn zap(n: NsId, tgid: u32) {
     let deadline = crate::monotonic_ns().saturating_add(5_000_000_000);
     loop {
         collect(&mut victims);
-        if victims.is_empty() || crate::monotonic_ns() > deadline { return; }
+        if victims.is_empty() { return; }
+        if crate::monotonic_ns() > deadline {
+            warn_timeout(n, tgid, &victims);
+            return;
+        }
         kill(&victims);
         crate::irq_window();
         crate::yield_now("pidns_zap");
     }
+}
+
+/// Minimum spacing between two zap-timeout warnings.
+const ZAP_WARN_INTERVAL_NS: u64 = 10_000_000_000;
+static ZAP_WARN_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `zap` gave up with `victims` still alive: say so on the kernel log (rate
+/// limited to one line per 10 s) with the namespace id, the survivor count and
+/// the first few pids.
+fn warn_timeout(n: NsId, tgid: u32, victims: &[(u32, u32)]) {
+    use core::sync::atomic::Ordering;
+    let now = crate::monotonic_ns().max(1);
+    let last = ZAP_WARN_LAST.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < ZAP_WARN_INTERVAL_NS { return; }
+    if ZAP_WARN_LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() { return; }
+    let mut pids = alloc::string::String::new();
+    for &(tid, _) in victims.iter().take(8) {
+        use core::fmt::Write;
+        let _ = write!(pids, " {}", tid);
+    }
+    crate::klog_line(format_args!(
+        "[pidns] zap timeout: ns {} init {} still has {} live task(s), first:{}\n",
+        n, tgid, victims.len(), pids));
 }
