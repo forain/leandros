@@ -176,3 +176,25 @@ pub fn on_exec(t: &mut Task, setid: bool) {
     t.caps[1] = p;
     t.caps[SEC] &= !SECURE_KEEP_CAPS;
 }
+
+/// Linux `ns_capable(target, cap)`: does the calling thread hold `cap` over
+/// user namespace `target`? True when it holds the capability in `target`
+/// itself, or in an ancestor of `target` whose child on the way down was
+/// created by the caller's effective uid (the owner of a namespace has every
+/// capability in it).
+pub fn ns_capable_in(cap: u32, target: crate::ns::NsId) -> bool {
+    if cap > CAP_LAST { return false; }
+    let (cur, euid, has) = match RUN_QUEUE.lock().find_pid(current_pid()) {
+        Some(t) => (t.userns.id(), t.euid, t.caps[0] >> cap & 1 != 0),
+        None => return false,
+    };
+    let mut ns = target;
+    for _ in 0..64 {
+        if ns == cur { return has; }
+        if crate::ns::level(ns) <= crate::ns::level(cur) { return false; }
+        let p = crate::ns::parent(ns);
+        if p == cur && crate::ns::owner(ns).0 == euid { return true; }
+        ns = p;
+    }
+    false
+}

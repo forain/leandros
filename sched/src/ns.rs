@@ -134,6 +134,14 @@ pub fn new_mntns(owner_user: NsId) -> Result<NsRef, isize> {
     Err(-28)
 }
 
+/// Move the calling thread into mount namespace `n`, returning the old
+/// reference (dropped by the caller outside any lock).
+pub fn swap_mntns(n: NsRef) -> Result<NsRef, isize> {
+    let pid = crate::current_pid();
+    let mut rq = crate::RUN_QUEUE.lock();
+    match rq.find_pid_mut(pid) { Some(t) => Ok(core::mem::replace(&mut t.mntns, n)), None => Err(-3) }
+}
+
 /// Mount namespace of `pid` (0 = initial, also when `pid` is unknown).
 pub fn mntns_of(pid: u32) -> NsId {
     crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.mntns.id()).unwrap_or(0)

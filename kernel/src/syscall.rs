@@ -8433,7 +8433,9 @@ fn sys_unshare(flags: usize) -> isize {
     // CLONE_THREAD/SIGHAND/VM: Linux allows them only for a single-threaded
     // caller, where they are no-ops.
     if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && !alone { return -22; }
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP) != 0 { return -22; }
+    if flags & CLONE_NEWCGROUP != 0 { return -22; }
+    // CLONE_NEWNS needs CAP_SYS_ADMIN in the (possibly new) user namespace.
+    if flags & CLONE_NEWNS != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     let flat = flags & (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS);
     if flat != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; } // CAP_SYS_ADMIN
     if flat != 0 && !alone { return -22; }
@@ -8459,9 +8461,31 @@ fn sys_unshare(flags: usize) -> isize {
         let r = sched::ns::unshare_uts();
         if r < 0 { return r; }
     }
+    if flags & CLONE_NEWNS != 0 {
+        // The mount namespace copy is made under the caller's (new) user
+        // namespace. CLONE_NEWNS implies CLONE_FS: the root and cwd strings
+        // are private to the new namespace.
+        vfs::mnt::reap();
+        let owner = sched::ns::current_userns();
+        let n = match mntns_copy_for(owner) { Ok(n) => n, Err(e) => return e };
+        let old = match sched::ns::swap_mntns(n) { Ok(o) => o, Err(e) => return e };
+        sched::unshare_fs();
+        drop(old);
+    }
     if flags & CLONE_FILES != 0 { let r = fd_unshare_current(); if r < 0 { return r; } }
     if flags & CLONE_FS != 0 { sched::unshare_fs(); }
     0
+}
+
+/// A fresh mount namespace owned by user namespace `owner` holding a copy of
+/// the calling thread's tree. Copying into a different user namespace locks
+/// the mounts and turns shared mounts into slaves (see `vfs::mnt::copy`).
+fn mntns_copy_for(owner: sched::ns::NsId) -> Result<sched::ns::NsRef, isize> {
+    let src = sched::current_mntns();
+    let n = sched::ns::new_mntns(owner)?;
+    let changed = owner != sched::ns::owner_user(src);
+    if let Err(e) = vfs::mnt::copy(src, n.id(), owner, changed) { return Err(e as isize); }
+    Ok(n)
 }
 
 /// sys_close_range(first, last, flags) — close (or, with CLOSE_RANGE_CLOEXEC,
@@ -9176,6 +9200,10 @@ fn sys_mount(
     const MS_RDONLY:  usize = 1;
     const MS_NOSUID:  usize = 2;
     const MS_REMOUNT: usize = 32;
+    // A task in a mount namespace of its own mounts into that namespace's
+    // tree only (and needs CAP_SYS_ADMIN over the namespace's owner).
+    let mns = sched::current_mntns();
+    if mns != 0 { return sys_mount_ns(mns, source_ptr, target_ptr, fstype_ptr, flags); }
     // Every form of mount(2) needs CAP_SYS_ADMIN (Linux `may_mount`).
     if sched::current_euid() != 0 { return -1; } // EPERM
     if flags & MS_REMOUNT != 0 {
@@ -9368,7 +9396,79 @@ fn sys_mount(
     }
 }
 
-fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
+/// May the caller change the mount table of mount namespace `mns`?
+/// CAP_SYS_ADMIN over the user namespace that owns it.
+fn mnt_may_mount(mns: sched::ns::NsId) -> bool {
+    match vfs::mnt::owner_of(mns) { Some(o) => sched::caps::ns_capable_in(21, o), None => false }
+}
+
+/// stat(2) the backing file of `kp`: Ok(is_dir).
+fn kpath_is_dir(kp: &KPath) -> Result<bool, isize> {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFDIR: u32 = 0o040000;
+    let mut st = [0u8; STAT_SIZE];
+    let m = make_vfs_msg(vfs::VFS_STAT, &[kp.ptr() as u64, st.as_mut_ptr() as u64]);
+    let r = vfs_reply_val(&vfs::handle(&m, current_pid()));
+    if r < 0 { return Err(r); }
+    Ok(vfs::read_stat_mode(st.as_ptr() as usize) & S_IFMT == S_IFDIR)
+}
+
+/// mount(2) for a task in a mount namespace other than the initial one: bind
+/// (and rbind) and fresh tmpfs mounts, applied to that namespace's tree only.
+/// Remount, move and the propagation flags belong to lane M2; every other
+/// filesystem type to lane M5.
+fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fstype_ptr: usize, flags: usize) -> isize {
+    const MS_BIND: usize = 4096;
+    const MS_REC: usize = 0x4000;
+    const MS_REMOUNT: usize = 32;
+    const MS_MOVE: usize = 8192;
+    const MS_PROPAGATION: usize = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+    vfs::mnt::reap();
+    if !mnt_may_mount(mns) { return -1; } // EPERM
+    if flags & (MS_REMOUNT | MS_MOVE | MS_PROPAGATION) != 0 { return -22; }
+    let target = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+    let tns = target.ns_bytes().to_vec();
+    let tdir = match kpath_is_dir(&target) { Ok(d) => d, Err(e) => return e };
+    if flags & MS_BIND != 0 {
+        let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
+        let sdir = match kpath_is_dir(&src) { Ok(d) => d, Err(e) => return e };
+        if sdir != tdir { return if sdir { -20 } else { -21 }; } // ENOTDIR / EISDIR
+        return match vfs::mnt::bind(mns, src.ns_bytes(), &tns, flags & MS_REC != 0) { Ok(_) => 0, Err(e) => e as isize };
+    }
+    let fstype = match read_user_short_str(fstype_ptr) { Ok(v) => v, Err(e) => return e };
+    if &fstype[..] != b"tmpfs" { return -22; } // EINVAL: other filesystems are lane M5's
+    if !tdir { return -20; }
+    let (sb, _) = vfs::mnt::sb_create("tmpfs", Some(vfs::tmpfs_instance_destroy));
+    let root = match vfs::tmpfs_instance_create(sb, sched::current_euid(), sched::current_egid()) {
+        Ok(r) => r,
+        Err(e) => { vfs::mnt::sb_put(sb); return e as isize; }
+    };
+    // Per-mount flags share their bit values with MS_RDONLY/NOSUID/NODEV/NOEXEC.
+    let mflags = (flags as u8 & 0x0f) | vfs::mnt::MNT_RELATIME;
+    let r = vfs::mnt::add_mount(mns, &tns, &root, sb, "tmpfs", b"tmpfs", mflags);
+    // The instance lives while a mount holds a reference; a failed attach
+    // leaves it with none, so putting it destroys it.
+    match r { Ok(_) => 0, Err(e) => { vfs::mnt::sb_put(sb); e as isize } }
+}
+
+/// umount2(2) in a namespace other than the initial one.
+fn sys_umount_ns(mns: sched::ns::NsId, target_ptr: usize, flags: usize) -> isize {
+    const MNT_FORCE: usize = 1;
+    const MNT_DETACH: usize = 2;
+    const MNT_EXPIRE: usize = 4;
+    const UMOUNT_NOFOLLOW: usize = 8;
+    vfs::mnt::reap();
+    if !mnt_may_mount(mns) { return -1; }
+    if flags as u32 as usize & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 { return -22; }
+    if flags & MNT_EXPIRE != 0 && flags & (MNT_FORCE | MNT_DETACH) != 0 { return -22; }
+    if flags & MNT_EXPIRE != 0 { return -22; }
+    let target = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+    match vfs::mnt::umount(mns, target.ns_bytes(), flags & MNT_DETACH != 0) { Ok(()) => 0, Err(e) => e as isize }
+}
+
+fn sys_umount2(target_ptr: usize, flags: usize) -> isize {
+    let mns = sched::current_mntns();
+    if mns != 0 { return sys_umount_ns(mns, target_ptr, flags); }
     if sched::current_euid() != 0 { return -1; } // EPERM (CAP_SYS_ADMIN)
     let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
     // An alias mount (a chroot's /proc, a bind mount) is named by where the
@@ -16539,6 +16639,8 @@ struct CloneReq {
     netns: sched::ns::NsId,
     ipcns: sched::ns::NsId,
     utsns: sched::ns::NsId,
+    /// Pre-created mount namespace id for CLONE_NEWNS (0 = none).
+    mntns: sched::ns::NsId,
     /// CLONE_* flags; the low byte (CSIGNAL) is the signal a new process
     /// sends its parent when it exits (SIGCHLD normally, 0 for none).
     flags: usize,
@@ -16616,7 +16718,7 @@ fn sys_clone_or_fork(
         return -22;
     }
     let pidfd = if flags & CLONE_PIDFD != 0 { ptid } else { 0 };
-    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr)
+    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, mntns: 0 }, frame_ptr)
 }
 
 /// vfork(2): `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` — the child runs on
@@ -16626,7 +16728,7 @@ fn sys_clone_or_fork(
 fn sys_vfork(frame_ptr: usize) -> isize {
     const SIGCHLD: usize = 17;
     do_clone(CloneReq { flags: CLONE_VM | CLONE_VFORK | SIGCHLD, stack: 0, ptid: 0, ctid: 0,
-                        tls: 0, pidfd: 0, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr)
+                        tls: 0, pidfd: 0, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, mntns: 0 }, frame_ptr)
 }
 
 /// clone3(uargs, size): `struct clone_args` translated onto the clone path.
@@ -16719,7 +16821,7 @@ fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
         if let Err(e) = sched::reserve_pid(p) { return e; }
     }
     let r = do_clone(CloneReq { flags, stack: sp, ptid: parent_tid as usize, ctid: child_tid as usize,
-                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr);
+                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, mntns: 0 }, frame_ptr);
     if let Some(p) = set_tid_pid { sched::release_reserved_pid(p); }
     r
 }
@@ -16736,9 +16838,15 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
     if flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0 { return -22; }
     if flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0 { return -22; }
 
-    // Namespaces: only CLONE_NEWUSER is implemented (nsbox lane L1); every
-    // other CLONE_NEW* is refused instead of silently ignored.
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP) != 0 { return -22; }
+    // Namespaces: CLONE_NEWCGROUP is refused instead of silently ignored.
+    if flags & CLONE_NEWCGROUP != 0 { return -22; }
+    // Mount namespaces: root/cwd strings only mean something inside one
+    // namespace, so a CLONE_FS group cannot be split across two (EINVAL, as
+    // Linux), and a shared-VM child has no namespace plumbing.
+    if flags & CLONE_NEWNS != 0 {
+        if flags & (CLONE_FS | CLONE_THREAD | CLONE_VM) != 0 { return -22; }
+        if flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; } // CAP_SYS_ADMIN
+    }
     // Pid namespaces (lane nspid). Linux copy_process rules: NEWPID excludes
     // CLONE_THREAD/SIGHAND; here also CLONE_VM (the vfork-style arm has no
     // namespace plumbing). A thread or CLONE_PARENT child cannot be placed
@@ -16786,6 +16894,15 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
         match sched::ns::new_uts(sched::ns::utsns_of(current_pid()), owner) { Ok(n) => Some(n), Err(e) => return e }
     } else { None };
     req.utsns = new_uts.as_ref().map_or(0, |n| n.id());
+    // The mount namespace: a copy of the caller's tree, owned by the new user
+    // namespace when there is one. Created before the child exists so a full
+    // table fails the whole clone; the child takes its own reference.
+    vfs::mnt::reap();
+    let new_mnt = if flags & CLONE_NEWNS != 0 {
+        let owner = new_user.as_ref().map_or_else(sched::ns::current_userns, |n| n.id());
+        match mntns_copy_for(owner) { Ok(n) => Some(n), Err(e) => return e }
+    } else { None };
+    req.mntns = new_mnt.as_ref().map_or(0, |n| n.id());
 
     let pidfd = if flags & CLONE_PIDFD != 0 {
         if !validate_user_buf(req.pidfd, 4) { return -14; }
@@ -16879,7 +16996,7 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
         let parent_pid = sched::tgid_of(current_pid());
         if !vfs::fd_table_slot_free() { return -11; } // EAGAIN, as for FORK
         let opts = sched::ForkOpts {
-            mntns: 0,
+            mntns: req.mntns,
             vfork: flags & CLONE_VFORK != 0,
             child_stack,
             tls: if flags & CLONE_SETTLS != 0 { Some(tls as u64) } else { None },

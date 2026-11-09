@@ -203,6 +203,149 @@ pub fn copy(src: NsId, dst: NsId, dst_owner: NsId, owner_changed: bool) -> Resul
     Ok(())
 }
 
+// ── Mount, bind and umount inside a namespace (lane M1) ─────────────────────
+
+/// Upper bound on mounts per namespace (Linux `fs.mount-max` is 100000).
+pub const MNT_MAX: usize = 4096;
+
+/// Like [`walk`] but returns the final mount's index and how many bytes of
+/// `path` the walk consumed up to and including that mount's mountpoint.
+fn walk_idx(t: &[Mnt], path: &[u8]) -> Option<(usize, usize)> {
+    let mut cur = top_of(t, root_idx(t)?);
+    let mut consumed = 0usize;
+    for _ in 0..256 {
+        let id = t[cur].id;
+        let rem = &path[consumed..];
+        let best = t.iter().enumerate()
+            .filter(|(_, m)| m.parent == id && &*m.mp != b"/" && under(rem, &m.mp))
+            .max_by_key(|(_, m)| (m.mp.len(), m.id));
+        match best {
+            Some((i, m)) => { consumed += m.mp.len(); cur = top_of(t, i); }
+            None => break,
+        }
+    }
+    Some((cur, consumed))
+}
+
+/// Indices of every mount below mount id `id` (transitively).
+fn descendants(t: &[Mnt], id: u32) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    let mut frontier: Vec<u32> = alloc::vec![id];
+    while let Some(p) = frontier.pop() {
+        for (i, m) in t.iter().enumerate() {
+            if m.parent == p && !out.contains(&i) { out.push(i); frontier.push(m.id); }
+        }
+    }
+    out
+}
+
+/// Where a new mount for `dst` attaches: (parent id, mountpoint relative to it).
+fn attach_point(t: &[Mnt], dst: &[u8]) -> Result<(u32, Vec<u8>), i32> {
+    let (di, doff) = walk_idx(t, dst).ok_or(-22)?;
+    let rem = &dst[doff..];
+    let mp: Vec<u8> = if rem.is_empty() || rem == b"/" { b"/".to_vec() } else { rem.to_vec() };
+    Ok((t[di].id, mp))
+}
+
+/// `mount --bind` (`rec == false`) or `--rbind` of namespace path `src` onto
+/// `dst`, in namespace `ns` only. A non-recursive bind of a tree with locked
+/// children is EINVAL (it would expose what the locks cover); an unbindable
+/// source is EINVAL. Returns the new top mount id.
+pub fn bind(ns: NsId, src: &[u8], dst: &[u8], rec: bool) -> Result<u32, i32> {
+    let mut g = NS.lock();
+    let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+    if t.len() >= MNT_MAX { return Err(-28); }
+    let (si, soff) = walk_idx(t, src).ok_or(-2)?;
+    let sub: &[u8] = &src[soff..];
+    let sm = &t[si];
+    if sm.unbindable { return Err(-22); }
+    let sid = sm.id;
+    let in_sub = |mp: &[u8]| sub.is_empty() || (mp != b"/" && under(mp, sub));
+    if !rec && t.iter().any(|c| c.parent == sid && c.locked & LOCK_MNT != 0 && in_sub(&c.mp)) { return Err(-22); }
+    let (pid, mp) = attach_point(t, dst)?;
+    let mut top = sm.clone();
+    top.id = alloc_mnt_id();
+    top.parent = pid;
+    top.mp = mp.into_boxed_slice();
+    top.root = join(&sm.root, sub).into_boxed_slice();
+    top.locked &= !LOCK_MNT;
+    let top_id = top.id;
+    let mut add: Vec<Mnt> = alloc::vec![top];
+    if rec {
+        // old id -> new id for every cloned mount
+        let mut map: Vec<(u32, u32)> = alloc::vec![(sid, top_id)];
+        let mut work: Vec<u32> = alloc::vec![sid];
+        while let Some(old) = work.pop() {
+            let new_parent = map.iter().find(|r| r.0 == old).map(|r| r.1).unwrap_or(0);
+            for c in t.iter().filter(|c| c.parent == old && !c.unbindable) {
+                if old == sid && !(&*c.mp != b"/" && (sub.is_empty() || under(&c.mp, sub))) { continue; }
+                let mut n = c.clone();
+                n.id = alloc_mnt_id();
+                n.parent = new_parent;
+                if old == sid && !sub.is_empty() {
+                    let rest = &c.mp[sub.len()..];
+                    n.mp = (if rest.is_empty() { b"/".to_vec() } else { rest.to_vec() }).into_boxed_slice();
+                }
+                map.push((c.id, n.id));
+                work.push(c.id);
+                add.push(n);
+            }
+        }
+    }
+    if t.len() + add.len() > MNT_MAX { return Err(-28); }
+    for m in add.iter() { sb_get(m.sb); }
+    t.extend(add);
+    Ok(top_id)
+}
+
+/// Attach a brand-new mount (a fresh superblock, already referenced by the
+/// caller's `sb_create` + this call) at namespace path `dst`.
+pub fn add_mount(ns: NsId, dst: &[u8], root: &[u8], sb: SbId, fstype: &'static str, device: &[u8], flags: u8) -> Result<u32, i32> {
+    let mut g = NS.lock();
+    let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+    if t.len() >= MNT_MAX { return Err(-28); }
+    let (pid, mp) = attach_point(t, dst)?;
+    let mut m = mk(alloc_mnt_id(), pid, &mp, root, sb);
+    m.flags = flags;
+    m.fstype = fstype;
+    m.device = device.to_vec().into_boxed_slice();
+    let id = m.id;
+    sb_get(sb);
+    t.push(m);
+    Ok(id)
+}
+
+/// umount2 of the mount at namespace path `target`. The mount must be the
+/// final component's mountpoint (EINVAL otherwise), not the namespace root,
+/// not locked (EINVAL), and without submounts unless `detach` (EBUSY). A
+/// detach takes every descendant, locked or not, with it.
+pub fn umount(ns: NsId, target: &[u8], detach: bool) -> Result<(), i32> {
+    let dead_sbs: Vec<SbId> = {
+        let mut g = NS.lock();
+        let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+        let (i, off) = walk_idx(t, target).ok_or(-22)?;
+        if off != target.len() { return Err(-22); }
+        let m = &t[i];
+        if m.parent == 0 { return Err(-22); }
+        if m.locked & LOCK_MNT != 0 { return Err(-22); }
+        let kids = descendants(t, m.id);
+        if !kids.is_empty() && !detach { return Err(-16); }
+        let mut gone: Vec<u32> = kids.iter().map(|&k| t[k].id).collect();
+        gone.push(m.id);
+        let sbs: Vec<SbId> = t.iter().filter(|x| gone.contains(&x.id)).map(|x| x.sb).collect();
+        t.retain(|x| !gone.contains(&x.id));
+        sbs
+    };
+    for sb in dead_sbs { sb_put(sb); }
+    Ok(())
+}
+
+/// Owner user namespace of `ns`'s mount tree.
+pub fn owner_of(ns: NsId) -> Option<NsId> { NS.lock().get(&ns).map(|n| n.owner_user) }
+
+/// Number of mounts in `ns` (tests).
+pub fn mount_count(ns: NsId) -> usize { NS.lock().get(&ns).map_or(0, |n| n.mnts.len()) }
+
 /// Free the tree of `ns`, dropping its superblock references.
 pub fn release(ns: NsId) {
     let t = NS.lock().remove(&ns);

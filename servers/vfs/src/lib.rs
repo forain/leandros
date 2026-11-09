@@ -6303,6 +6303,70 @@ fn gen_mntselftest() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.mntselftest", s.as_bytes(), false)
 }
 
+/// Interim tmpfs instances for mount namespaces (lane M1; lane M5 replaces
+/// this with real per-superblock roots under `/.leandros-sb`). An instance is
+/// a hidden directory in the `/tmp` pool: `/tmp/.leandros-sb/tmpfs/<n>`.
+/// Its parents are root-owned 0711 (traversable by name only) and the
+/// instance directory is 0700 owned by the creating uid, so only that uid
+/// reaches it from the initial namespace.
+const TMPFS_INST_PARENT: &[u8] = b"/tmp/.leandros-sb";
+const TMPFS_INST_DIR: &[u8] = b"/tmp/.leandros-sb/tmpfs";
+
+fn tmpfs_inst_mkdir(tmp: &mut TmpPool, path: &[u8], uid: u32, gid: u32, mode: u16) -> Result<(), i32> {
+    if tmp_find(tmp, path).is_some() { return Ok(()); }
+    let idx = tmp_free_slot(tmp).ok_or(-28)?;
+    tmp.claim(idx, path, false);
+    tmp[idx].is_dir = true;
+    tmp[idx].uid = uid;
+    tmp[idx].gid = gid;
+    tmp_init_created(tmp, idx, path, mode, 0, true);
+    Ok(())
+}
+
+fn tmpfs_inst_root(n: u32) -> Vec<u8> {
+    let mut root = TMPFS_INST_DIR.to_vec();
+    root.push(b'/');
+    let mut d = [0u8; 10]; let mut k = 0; let mut v = n;
+    loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+    for i in (0..k).rev() { root.push(d[i]); }
+    root
+}
+
+/// Create tmpfs instance `n` (the superblock id) owned by `uid`:`gid`;
+/// returns its backing root.
+pub fn tmpfs_instance_create(n: u32, uid: u32, gid: u32) -> Result<Vec<u8>, i32> {
+    let root = tmpfs_inst_root(n);
+    let mut tmp = TMP_FILES.lock();
+    tmpfs_inst_mkdir(&mut tmp, TMPFS_INST_PARENT, 0, 0, 0o711)?;
+    tmpfs_inst_mkdir(&mut tmp, TMPFS_INST_DIR, 0, 0, 0o711)?;
+    tmpfs_inst_mkdir(&mut tmp, &root, uid, gid, 0o700)?;
+    Ok(root)
+}
+
+/// Superblock destroy hook: free the tmpfs instance of the superblock whose
+/// registry root is `sb_root` (`/.leandros-sb/tmpfs/<n>`) and everything
+/// below it (its last mount is gone). A file an fd still holds survives
+/// nameless.
+pub fn tmpfs_instance_destroy(sb_root: &[u8]) {
+    let name = match sb_root.iter().rposition(|&c| c == b'/') { Some(i) => &sb_root[i + 1..], None => return };
+    let n: u32 = match core::str::from_utf8(name).ok().and_then(|x| x.parse().ok()) { Some(n) => n, None => return };
+    let root_buf = tmpfs_inst_root(n);
+    let root = &root_buf[..];
+    let mut objs: Vec<u32> = Vec::new();
+    {
+        let mut tmp = TMP_FILES.lock();
+        let Some(top) = tmp_find(&tmp, root) else { return };
+        let mut all = tmp.subtree(top);
+        all.reverse(); // children before parents
+        all.push(top);
+        for idx in all {
+            if !tmp[idx].in_use() { continue; }
+            if let Some(o) = tmp_drop_name(&mut tmp, idx, TmpOpen) { objs.push(o); }
+        }
+    }
+    for o in objs { dmabuf_release(o); }
+}
+
 /// The initial namespace's mount table as a tree, for copying into a new
 /// mount namespace: MOUNTS, the built-in tmpfs roots, the synthesized
 /// `/proc` `/dev` `/dev/pts` `/sys`, and the ns-0 alias/bind mounts, nested
