@@ -9506,7 +9506,6 @@ fn sys_mount(
     }
 }
 
-<<<<<<< HEAD
 /// May the caller change the mount table of mount namespace `mns`?
 /// CAP_SYS_ADMIN over the user namespace that owns it.
 fn mnt_may_mount(mns: sched::ns::NsId) -> bool {
@@ -9587,11 +9586,6 @@ fn sys_umount_ns(mns: sched::ns::NsId, target_ptr: usize, flags: usize) -> isize
     match vfs::mnt::umount(mns, target.ns_bytes(), flags & MNT_DETACH != 0) { Ok(()) => 0, Err(e) => e as isize }
 }
 
-fn sys_umount2(target_ptr: usize, flags: usize) -> isize {
-    let mns = sched::current_mntns();
-    if mns != 0 { return sys_umount_ns(mns, target_ptr, flags); }
-    if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
-=======
 /// mount(2) of a FUSE filesystem: `data` names the daemon's /dev/fuse fd.
 fn sys_mount_fuse(source: &str, target: &[u8], fstype: &str, flags: usize, data_ptr: usize) -> isize {
     const MS_RDONLY: usize = 1;
@@ -9622,8 +9616,9 @@ fn sys_mount_fuse(source: &str, target: &[u8], fstype: &str, flags: usize, data_
 }
 
 fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
+    let mns = sched::current_mntns();
+    if mns != 0 { return sys_umount_ns(mns, target_ptr, umount_flags); }
     if !may_mount() { return -1; } // EPERM (CAP_SYS_ADMIN over the mntns owner)
->>>>>>> main
     let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
     // An alias mount (a chroot's /proc, a bind mount) is named by where the
     // caller sees it, i.e. its namespace path.
@@ -9646,14 +9641,10 @@ fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
 }
 
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
-<<<<<<< HEAD
     // The pivot rewrites the global (ns 0) mount table; inside a mount
     // namespace it would re-root the host. Per-namespace pivot is lane M4.
     if sched::current_mntns() != 0 { return -22; }
-    if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
-=======
     if !may_mount() { return -1; } // EPERM (CAP_SYS_ADMIN over the mntns owner)
->>>>>>> main
     let pid = current_pid();
     let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
     let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };
