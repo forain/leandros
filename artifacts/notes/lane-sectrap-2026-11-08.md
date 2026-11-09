@@ -18,3 +18,8 @@ Status: FIXED (SECCOMP_RET_TRAP / KILL_THREAD) + FIXED (aarch64 sigframe ABI).
   - Rust userland via libc crate: Linux layout, fine.
 - Tests: see lane report (seccomptest, sigtest, sigtest2, default regress aarch64 on Mac; x86_64 full regress on box).
 - Open: namespace probe for the Firefox sandbox is not complete.
+
+## Results
+- aarch64 (Mac): seccomptest, sigtest, sigtest2 PASS; default regress PASS. x86_64 (box) full regress: 69 suites, 0 bad.
+- ffsandbox aarch64 --mode on: 9 firefox procs, all alive. Seccomp: parent 0, forkserver 0, socket 2, tab 2 (x4), rdd 2, utility 2 (NNP 1 on filtered).
+  Remaining RESULT on=False: namespace probe incomplete; sandbox broker denies /sys/devices/system/cpu/present for tab.
