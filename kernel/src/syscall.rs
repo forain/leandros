@@ -11466,7 +11466,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     // (0x4C00..) collides with nothing here but the BLK* range (0x12xx) would
     // otherwise have to be enumerated twice — and because an ioctl aimed at a
     // block device must never fall through to the TTY server's ENOTTY.
-    if let Some(vfs::VnodeKind::BlockDev { .. }) = vfs::vfs_get_node_kind(pid, fd) {
+    if let Some(vfs::VnodeKind::BlockDev { .. } | vfs::VnodeKind::NsFd { .. }) = vfs::vfs_get_node_kind(pid, fd) {
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
         return vfs_reply_val(&vfs::handle(&msg, pid));
     }
