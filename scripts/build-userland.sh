@@ -37,7 +37,7 @@ fi
 # ABI): no_std crates linked against static musl (<arch>-unknown-linux-musl)
 # through the zig linker wrapper, the same path as spawnwedge/killmt. Their
 # start-up is musl's crt1 -> `main`; userland/muslrt holds the shared pieces.
-MUSL_LINKED=(polltest fdmaxtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest jobtest exectest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest pthreadtest timertest sigtest sigtest2 epolltest wakepolltest)
+MUSL_LINKED=(polltest fdmaxtest mqtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest jobtest exectest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest pthreadtest timertest sigtest sigtest2 epolltest wakepolltest)
 
 EXCLUDE_ARGS=()
 for prog in "${MUSL_LINKED[@]}"; do
@@ -153,6 +153,8 @@ if command -v zig >/dev/null 2>&1; then
     # chroottest: openat2, vfork/clone3, PATH_MAX paths, /proc in a chroot (checked against a host kernel).
     echo "[userland] Building chroottest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/chroottest" userland/chroottest/chroottest.c
+    echo "[userland] Building mnttest..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/mnttest" userland/mnttest/mnttest.c
     echo "[userland] Building captest..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/captest" userland/captest/captest.c
     # seccomptest: prctl/seccomp(2) behaviour (lane seccore).
