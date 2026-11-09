@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/mount.h>
+#include <sys/wait.h>
 #include <sys/syscall.h>
 
 static int fails;
@@ -185,6 +186,46 @@ static void bench(void) {
     chdir("/");
 }
 
+/* lane mountperm: CAP_SYS_ADMIN in a child userns must NOT allow mounting into
+ * the initial mount namespace (owned by the initial userns). */
+static void wr(const char *p, const char *v) { int fd = open(p, O_WRONLY); if (fd >= 0) { if (write(fd, v, strlen(v)) < 0) {} close(fd); } }
+
+static int userns_child(void) {
+    static char before[16384], after[16384];
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    if (unshare(CLONE_NEWUSER) < 0) return 91;
+    wr("/proc/self/setgroups", "deny");
+    wr("/proc/self/uid_map", "0 1000 1");
+    wr("/proc/self/gid_map", "0 1000 1");
+    if (slurp("/proc/self/mountinfo", before, sizeof before) <= 0) return 92;
+    const char *d = "/tmp/mountperm.d";
+    static const char *fs[] = { "devpts", "mqueue", "tmpfs", "cgroup2" };
+    for (int i = 0; i < 4; i++) {
+        errno = 0;
+        int r = mount("none", d, fs[i], 0, NULL);
+        if (!(r < 0 && errno == EPERM)) { if (r == 0) umount(d); return 10 + i; }
+    }
+    errno = 0;
+    int r = mount("/etc", d, NULL, MS_BIND, NULL);
+    if (!(r < 0 && errno == EPERM)) { if (r == 0) umount(d); return 20; }
+    if (slurp("/proc/self/mountinfo", after, sizeof after) <= 0) return 93;
+    return strcmp(before, after) ? 94 : 0;
+}
+
+static void mount_userns_perm(void) {
+    mkdir("/tmp/mountperm.d", 0777);
+    chmod("/tmp/mountperm.d", 0777);
+    pid_t c = fork();
+    if (c == 0) _exit(userns_child());
+    int st = 0; waitpid(c, &st, 0);
+    if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) printf("userns_child status=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    report("userns_root_mount_eperm", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    int r = mount("none", "/tmp/mountperm.d", "devpts", 0, NULL);
+    report("host_root_devpts_ok", r == 0);
+    if (r == 0) umount("/tmp/mountperm.d");
+    rmdir("/tmp/mountperm.d");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     newapi_enosys();
@@ -192,6 +233,7 @@ int main(int argc, char **argv) {
     sb_hidden_ns0();
     ns0_invariants();
     mountinfo_tests();
+    mount_userns_perm();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
