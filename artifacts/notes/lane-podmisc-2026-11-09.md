@@ -10,3 +10,4 @@ Three small pod-compat gaps.
 - userland/exectest: 6 execveat cases; userland/proctest: cpuinfo_arm64_fields; sshsmoke.py: session_path_standard.
 - Fail-first on main + test files only (box, aarch64): exectest 7 fails (execveat_* cases), proctest cpuinfo_arm64_fields "missing BogoMIPS".
 - Full regress on lane/podmisc, box, both arches: see merge commit / below.
+- Box results: x86_64 full regress 73 suites 0 bad (exectest + sshsmoke pass). aarch64 full regress 59 suites 0 bad (earlier run; later reruns hit box timeouts/ENOSPC unrelated to the lane); aarch64 exectest, proctest and sshsmoke re-run green after the final commit.
