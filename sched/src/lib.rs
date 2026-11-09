@@ -2791,6 +2791,29 @@ pub fn cwd_arc_of(pid: Pid) -> Option<alloc::sync::Arc<[u8]>> {
     Some(cwd.unwrap_or_else(|| alloc::sync::Arc::from(&b"/"[..])))
 }
 
+/// The calling task's `(root, cwd, mntns)` under ONE run-queue lock: a path
+/// operation in a mount namespace needs all three consistently, and every
+/// extra RUN_QUEUE acquisition costs on the path-lookup hot path.
+pub fn current_fs_ctx() -> (Option<alloc::sync::Arc<[u8]>>, alloc::sync::Arc<[u8]>, ns::NsId) {
+    let pid = current_pid();
+    let (root, cwd, m) = {
+        let rq = RUN_QUEUE.lock();
+        match rq.find_pid(pid) {
+            Some(t) => (t.root.clone(), t.cwd.clone(), t.mntns.id()),
+            None => (None, None, 0),
+        }
+    };
+    (root, cwd.unwrap_or_else(|| alloc::sync::Arc::from(&b"/"[..])), m)
+}
+
+/// Mount namespace of the calling task, but only while any non-initial one
+/// exists (otherwise 0 without taking the run-queue lock).
+#[inline]
+pub fn current_mntns() -> ns::NsId {
+    if !ns::mnt_active() { return 0; }
+    ns::mntns_of(current_pid())
+}
+
 /// Copy `pid`'s chroot root (host-absolute) into `buf`, truncated to
 /// `max_len`. Returns its full length, or 0 when the task is not chrooted —
 /// the caller's cue to skip all root handling. `-1` if there is no such task.

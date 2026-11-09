@@ -57,7 +57,10 @@ pub mod mqueue;
 
 /// Alias mounts (proc/devtmpfs/sysfs/bind) — how a chroot gets its /proc.
 pub mod alias;
+pub mod mnt;
 pub mod cmdline_redact;
+/// Overlay plumbing: real-layer helpers, per-mount pseudo-pid creds.
+pub mod ovl;
 mod tmppool;
 
 /// PATH_MAX: the longest path string a caller may name, NUL included.
@@ -4767,7 +4770,15 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
     // VFS_CLOSE_ALL, VFS_EXEC_CLOEXEC) take them as message args and are
     // unaffected by this canonicalization.
     let caller_pid = sched::tgid_of(caller_pid);
+    handle_as(msg, caller_pid)
+}
 
+/// Close every descriptor of `pid` (used to tear down an overlay pseudo-pid).
+pub(crate) fn handle_close_all_pub(pid: u32) -> Message { handle_close_all(pid) }
+
+/// `handle` for a caller that is already canonical (no tgid mapping): the
+/// overlay's pseudo-pids are not scheduler tasks, so `tgid_of` must not see them.
+pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
     // Symlink resolution happens here, once, for every path-taking operation —
     // rather than in each of the fifteen handlers that would otherwise each
     // need their own copy of the walk. The rewritten paths live in this
@@ -6281,6 +6292,65 @@ fn gen_sysstat() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.sysstat", s.as_bytes(), false)
 }
 
+/// `/proc/mntselftest`: `case: PASS|FAIL` rows from the mount-tree selftest
+/// (walk/reverse/copy/registry on a synthetic tree), plus the live counters
+/// `mnt_ns_live=`, `sb_count=`.
+fn gen_mntselftest() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    for (name, ok) in mnt::selftest() { let _ = writeln!(s, "{}: {}", name, if ok { "PASS" } else { "FAIL" }); }
+    let _ = writeln!(s, "ns_live={} ns_dying={} sb_count={}", sched::ns::live_count(), sched::ns::dying_count(), mnt::sb_count());
+    proc_snapshot(b"/tmp/.mntselftest", s.as_bytes(), false)
+}
+
+/// The initial namespace's mount table as a tree, for copying into a new
+/// mount namespace: MOUNTS, the built-in tmpfs roots, the synthesized
+/// `/proc` `/dev` `/dev/pts` `/sys`, and the ns-0 alias/bind mounts, nested
+/// by namespace path. Every mount is private; superblock 0 (not registered).
+pub(crate) fn ns0_snapshot() -> Vec<mnt::Mnt> {
+    use alloc::boxed::Box;
+    // (ns mountpoint, backing root, fstype, device, flags)
+    let mut raw: Vec<(Vec<u8>, Vec<u8>, &'static str, Vec<u8>, u8)> = Vec::new();
+    let mut have_root = false;
+    for m in list_mounts().iter().filter(|m| m.in_use) {
+        if m.prefix == "/" { have_root = true; }
+        let mut fl = mnt::MNT_RELATIME;
+        if m.nosuid { fl |= mnt::MNT_NOSUID; }
+        if m.rdonly { fl |= mnt::MNT_RDONLY; }
+        raw.push((m.prefix.as_bytes().to_vec(), m.prefix.as_bytes().to_vec(), m.fstype, m.device.as_bytes().to_vec(), fl));
+    }
+    if !have_root { raw.insert(0, (b"/".to_vec(), b"/".to_vec(), "rootfs", b"rootfs".to_vec(), mnt::MNT_RELATIME)); }
+    for r in TMPFS_ROOTS.iter() { raw.push((r.to_vec(), r.to_vec(), "tmpfs", b"tmpfs".to_vec(), mnt::MNT_RELATIME)); }
+    for (p, fs) in [(&b"/proc"[..], "proc"), (b"/dev", "devtmpfs"), (b"/dev/pts", "devpts"), (b"/sys", "sysfs")] {
+        raw.push((p.to_vec(), p.to_vec(), fs, fs.as_bytes().to_vec(), mnt::MNT_RELATIME));
+    }
+    for (mp, src, fs, dev) in alias::entries() {
+        raw.push((mp, src, fs, dev, mnt::MNT_NOSUID | mnt::MNT_RELATIME));
+    }
+    // Parents: the deepest earlier-or-equal mountpoint covering ours (the
+    // root first, so "/" is its own tree root and later duplicates overmount).
+    raw.sort_by_key(|r| r.0.len());
+    let ids: Vec<u32> = raw.iter().map(|_| mnt::alloc_mnt_id()).collect();
+    let mut out: Vec<mnt::Mnt> = Vec::new();
+    for (i, r) in raw.iter().enumerate() {
+        let parent = (0..i).filter(|&j| alias::under(&r.0, &raw[j].0)).max_by_key(|&j| (raw[j].0.len(), j));
+        let (pid, rel): (u32, Vec<u8>) = match parent {
+            None => (0, b"/".to_vec()),
+            Some(j) => {
+                let pm = &raw[j].0;
+                let rest = if pm == b"/" { &r.0[..] } else { &r.0[pm.len()..] };
+                (ids[j], if rest.is_empty() { b"/".to_vec() } else { rest.to_vec() })
+            }
+        };
+        let mut m = mnt::Mnt { id: ids[i], parent: pid, mp: rel.into_boxed_slice(), root: r.1.clone().into_boxed_slice(),
+            sb: 0, flags: r.4, locked: 0, group: 0, master: 0, unbindable: false, fstype: r.2,
+            device: r.3.clone().into_boxed_slice(), opts: Box::from(&b""[..]) };
+        if pid == 0 && i != 0 { m.parent = ids[0]; m.mp = r.0.clone().into_boxed_slice(); }
+        out.push(m);
+    }
+    out
+}
+
 /// `/proc/tryboot`: `state=off|armed|held|confirmed deadline_s= left_s= holds=`.
 fn gen_tryboot() -> Option<VnodeKind> {
     use core::fmt::Write;
@@ -6814,6 +6884,15 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
     if path == b"/proc/sys/fs/file-max" {
         let p = write_u32(buf, 0, ofd::MAX_OFDS as u32);
         return Some(write_lit(buf, p, b"\n"));
+    }
+    if path == b"/proc/sys/fs/ovl_selftest" {
+        // Runs the overlay real-op selftest at read time (root only).
+        if !root { return None; }
+        let mut o = Vec::new();
+        ovl::selftest(&mut o);
+        let n = o.len().min(buf.len());
+        buf[..n].copy_from_slice(&o[..n]);
+        return Some(n);
     }
     if path == b"/proc/sys/fs/file-nr" {
         let live = ofd::census().map_or(0, |(l, _)| l);
@@ -7508,7 +7587,7 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot"];
+                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ", b"uid_map", b"gid_map", b"setgroups", b"oom_score_adj"];
 
@@ -8381,6 +8460,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if lookup_path == b"/proc/mntselftest" {
+            match gen_mntselftest() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
         } else if lookup_path == b"/proc/tryboot" {
             match gen_tryboot() {
                 Some(v) => v,
@@ -8462,7 +8546,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts"
                || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/etc/resolv.conf"
                || lookup_path == b"/proc/sys/fs/nr_open" || lookup_path == b"/proc/sys/fs/file-max"
-               || lookup_path == b"/proc/sys/fs/file-nr" {
+               || lookup_path == b"/proc/sys/fs/file-nr"
+               || lookup_path == b"/proc/sys/fs/ovl_selftest" {
             match gen_proc_system(lookup_path, sched::fsuid_of(pid) == 0) {
                 Some(v) => v,
                 None    => return err_reply(-2),
@@ -10944,7 +11029,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
 
     // RAMFS directories
     for &child_dir in RAMFS_DIRS {
-        if child_dir == dir_path || child_dir == VOID_ROOT { continue; }
+        if child_dir == dir_path || child_dir == VOID_ROOT || child_dir == mnt::SB_ROOT { continue; }
         let is_root = dir_path == b"/";
         let is_child = if is_root {
             child_dir.len() > 1 && child_dir[0] == b'/' && !child_dir[1..].contains(&b'/')
@@ -13224,6 +13309,7 @@ fn tmp_kill_setid(tmp: &mut [TmpFileEntry], idx: usize, fsuid: u32) {
 /// it cannot find (the boot-time mount path), so an unknown caller is root,
 /// exactly as before.
 pub fn cred_of(pid: u32) -> xattr::Cred {
+    if let Some(c) = ovl::cred_override(pid) { return c; }
     let (fsuid, fsgid) = sched::fsids_of(pid);
     let mut c = xattr::Cred::new(fsuid, fsgid);
     c.ngroups = sched::groups_of(pid, &mut c.groups) as u8;
