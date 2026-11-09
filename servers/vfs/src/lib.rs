@@ -13899,7 +13899,8 @@ fn tmp_listxattr_local(tmp: &TmpPool, owner: usize, host_root: bool, list_ptr: u
     if xattr::is_empty(&xa[..]) { return val_reply(0); }
     let out: &mut [u8] = if size == 0 { &mut [] }
                          else { unsafe { core::slice::from_raw_parts_mut(list_ptr as *mut u8, size) } };
-    match xattr::list(&xa[..], out, host_root) // trusted.* is host root only {
+    // trusted.* is host root only
+    match xattr::list(&xa[..], out, host_root) {
         Ok(n) => val_reply(n as u64), Err(er) => err_reply(-er),
     }
 }

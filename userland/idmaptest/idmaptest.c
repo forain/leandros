@@ -825,7 +825,7 @@ static int setuid_maps_down(void) { return run_obs(c_setuid_down, chk_owner_1000
 static int c_chown_down(void *x)
 {
     const char *p = x; struct stat st;
-    int fd = open(p, O_CREAT | O_WRONLY, 0644);
+    int fd = open(p, O_WRONLY);   /* created by the parent: kuid 0 is unmapped here, create => EOVERFLOW */
     CHECK(fd >= 0);
     CHECK(chown(p, 50, -1) == -1 && errno == EINVAL);
     CHECK(chown(p, 5, 6) == 0);
@@ -846,6 +846,10 @@ static int chown_maps_down(void)
 {
     const char *p = "/tmp/idxlate-chown";
     unlink(p);
+    int pf = open(p, O_CREAT | O_WRONLY, 0644);
+    if (pf < 0) return 1;
+    close(pf);
+    if (knob && chown(p, 100000, 100000)) { unlink(p); return 1; }
     int r = run_obs(c_chown_down, chk_chown, p);
     unlink(p);
     return r;
@@ -861,6 +865,7 @@ static int c_fsuid(void *x)
     CHECK(setfsuid(-1) == 6);
     CHECK(setfsuid(50) == 6);                          /* unmapped: unchanged */
     CHECK(setfsuid(-1) == 6);
+    CHECK(syscall(SYS_setfsgid, 6) >= 0);              /* fsgid kuid 0 is unmapped too: create => EOVERFLOW */
     int fd = open(p, O_CREAT | O_WRONLY, 0644);
     CHECK(fd >= 0);
     CHECK(fstat(fd, &st) == 0 && st.st_uid == 6);
