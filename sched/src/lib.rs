@@ -1316,6 +1316,49 @@ pub fn init_pid() -> Pid { INIT_PID.load(Ordering::Acquire) }
 /// `ppid == exiting` — which by then was never true — so a stopped job whose
 /// shell died (jobtest's TOSTOP writer, left behind on both arches) stayed
 /// stopped for ever instead of getting SIGHUP + SIGCONT.
+/// Set once any process has called PR_SET_CHILD_SUBREAPER (exit then walks
+/// the ancestors; before that it never pays for the search).
+static SUBREAPERS: AtomicBool = AtomicBool::new(false);
+
+/// prctl(PR_SET_CHILD_SUBREAPER, v): process-wide, so every thread of the
+/// caller's group carries it.
+pub fn set_child_subreaper(on: bool) {
+    let tgid = tgid_of(current_pid());
+    let mut rq = RUN_QUEUE.lock();
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get_mut(i) { if t.tgid == tgid { t.child_subreaper = on; } }
+    }
+    if on { SUBREAPERS.store(true, Ordering::Relaxed); }
+}
+pub fn child_subreaper() -> bool {
+    RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.child_subreaper).unwrap_or(false)
+}
+
+/// personality(2): `want` 0xffffffff only queries. Returns the previous word.
+pub fn personality(want: u32) -> u32 {
+    let mut rq = RUN_QUEUE.lock();
+    match rq.find_pid_mut(current_pid()) {
+        Some(t) => { let old = t.persona; if want != 0xffff_ffff { t.persona = want; } old }
+        None => 0,
+    }
+}
+
+/// /proc/<pid>/oom_score_adj.
+pub fn oom_score_adj_of(pid: Pid) -> Option<i32> { RUN_QUEUE.lock().find_pid(pid).map(|t| t.oom_score_adj) }
+
+/// Write /proc/<pid>/oom_score_adj on every thread of `pid`'s group. Lowering
+/// the value needs CAP_SYS_RESOURCE (Linux oom_score_adj_min rule).
+pub fn set_oom_score_adj(caller: Pid, pid: Pid, v: i32) -> isize {
+    if !(-1000..=1000).contains(&v) { return -22; }
+    let cap = RUN_QUEUE.lock().find_pid(caller).map_or(false, |t| t.caps[0] >> 24 & 1 != 0);
+    let mut rq = RUN_QUEUE.lock();
+    let tgid = match rq.find_pid(pid) { Some(t) => { if v < t.oom_score_adj && !cap { return -13; } t.tgid } None => return -3 };
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get_mut(i) { if t.tgid == tgid { t.oom_score_adj = v; } }
+    }
+    0
+}
+
 fn reparent_children(dead_tgid: Pid) {
     let init = if pidns::USED.load(core::sync::atomic::Ordering::Relaxed) {
         pidns::on_process_exit(dead_tgid);
@@ -1323,6 +1366,9 @@ fn reparent_children(dead_tgid: Pid) {
     } else {
         init_pid()
     };
+    // PR_SET_CHILD_SUBREAPER: the nearest subreaper ancestor in the dying
+    // process's pid namespace beats the namespace's init.
+    let init = if SUBREAPERS.load(Ordering::Relaxed) { pidns::subreaper_for(dead_tgid, init) } else { init };
     if init == 0 || init == dead_tgid { return; }
     let mut cands = [0 as Pid; signal::ORPHAN_MAX_GROUPS];
     let mut nc = 0usize;
@@ -2745,6 +2791,29 @@ pub fn cwd_arc_of(pid: Pid) -> Option<alloc::sync::Arc<[u8]>> {
     Some(cwd.unwrap_or_else(|| alloc::sync::Arc::from(&b"/"[..])))
 }
 
+/// The calling task's `(root, cwd, mntns)` under ONE run-queue lock: a path
+/// operation in a mount namespace needs all three consistently, and every
+/// extra RUN_QUEUE acquisition costs on the path-lookup hot path.
+pub fn current_fs_ctx() -> (Option<alloc::sync::Arc<[u8]>>, alloc::sync::Arc<[u8]>, ns::NsId) {
+    let pid = current_pid();
+    let (root, cwd, m) = {
+        let rq = RUN_QUEUE.lock();
+        match rq.find_pid(pid) {
+            Some(t) => (t.root.clone(), t.cwd.clone(), t.mntns.id()),
+            None => (None, None, 0),
+        }
+    };
+    (root, cwd.unwrap_or_else(|| alloc::sync::Arc::from(&b"/"[..])), m)
+}
+
+/// Mount namespace of the calling task, but only while any non-initial one
+/// exists (otherwise 0 without taking the run-queue lock).
+#[inline]
+pub fn current_mntns() -> ns::NsId {
+    if !ns::mnt_active() { return 0; }
+    ns::mntns_of(current_pid())
+}
+
 /// Copy `pid`'s chroot root (host-absolute) into `buf`, truncated to
 /// `max_len`. Returns its full length, or 0 when the task is not chrooted —
 /// the caller's cue to skip all root handling. `-1` if there is no such task.
@@ -3021,7 +3090,7 @@ pub fn exec_commit_ids(euid: Option<u32>, egid: Option<u32>, secure: bool) {
             if let Some(u) = euid { t.euid = u; }
             if let Some(g) = egid { t.egid = g; }
             t.suid = t.euid;
-            caps::on_exec(t);
+            caps::on_exec(t, euid.is_some() || egid.is_some());
             t.sgid = t.egid;
             t.fsuid = t.euid;
             t.fsgid = t.egid;
@@ -3463,6 +3532,8 @@ pub mod poll_class {
     /// The raw HCI node /dev/hci0 (drivers/src/bt/hcidev): a packet queued
     /// for the reader, TX room, or the controller died.
     pub const BT: u32 = 25;
+    /// A POSIX message queue (mq_open), indexed by its slot.
+    pub const MQ: u32 = 27;
     /// A V4L2 capture node (kernel/src/v4l2.rs), index 0.
     pub const VIDEO: u32 = 26;
 }
@@ -9141,4 +9212,22 @@ pub mod tryboot_state {
     /// Lease end (monotonic ns) of a commit in progress; 0 = not held.
     pub static HOLD_UNTIL: AtomicU64 = AtomicU64::new(0);
     pub static HOLDS: AtomicU64 = AtomicU64::new(0);
+}
+
+// ── Kernel log hook ──────────────────────────────────────────────────────────
+/// Registered by the kernel: writes one already-formatted line to the console
+/// and kernel log. The sched crate has no log facility of its own.
+static LOG_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn register_log_hook(f: fn(&[u8])) {
+    LOG_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Format and emit one line through the registered hook (dropped if none).
+pub(crate) fn klog_line(args: core::fmt::Arguments) {
+    let h = LOG_HOOK.load(Ordering::Acquire);
+    if h == 0 { return; }
+    let f: fn(&[u8]) = unsafe { core::mem::transmute(h) };
+    let s = alloc::fmt::format(args);
+    f(s.as_bytes());
 }
