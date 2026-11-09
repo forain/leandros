@@ -18,6 +18,8 @@ const MAX_QUEUED: usize = 64;
 
 struct NlSock {
     pid: u32,
+    /// Network namespace the socket was created in.
+    ns: sched::ns::NsRef,
     groups: u32,
     q: VecDeque<Vec<u8>>,
     /// Bumped on every enqueue: the poll edge sequence.
@@ -28,10 +30,10 @@ static NL: Mutex<BTreeMap<u32, NlSock>> = Mutex::new(BTreeMap::new());
 static NL_EVER: AtomicU32 = AtomicU32::new(0);
 
 /// A new netlink description `ofd` owned by process `tgid`.
-pub fn create(ofd: u32, tgid: u32) {
+pub fn create(ofd: u32, tgid: u32, netns: u16) {
     let mut m = NL.lock();
     m.retain(|&k, _| vfs::ofd::live(k));
-    m.insert(ofd, NlSock { pid: tgid, groups: 0, q: VecDeque::new(), gen: 0 });
+    m.insert(ofd, NlSock { pid: tgid, ns: sched::ns::NsRef::get(netns), groups: 0, q: VecDeque::new(), gen: 0 });
     NL_EVER.store(1, Ordering::Release);
 }
 
@@ -71,9 +73,12 @@ pub fn getsockname(ofd: u32, addr_ptr: usize, addrlen_ptr: usize) -> Message {
 
 /// A request arrived: queue the replies and wake pollers. Returns the length.
 pub fn send(ofd: u32, data: &[u8]) -> Message {
-    let pid = match NL.lock().get(&ofd) { Some(s) => s.pid, None => return err_reply(-9) };
-    let links = rt::current_links();
-    let replies = rt::handle_request_r(data, &links, pid, &rt::route_lookup);
+    let (pid, ns) = match NL.lock().get(&ofd) { Some(s) => (s.pid, s.ns.id()), None => return err_reply(-9) };
+    let links = rt::current_links(ns);
+    let routes = rt::current_routes(ns);
+    let lo_set = |up: bool| { if ns == 0 { false } else { sched::ns::set_lo_admin_up(ns, up); true } };
+    let env = rt::Env { links: &links, routes: &routes, route: &|d| if ns == 0 { rt::route_lookup(d) } else { None }, lo_set: &lo_set };
+    let replies = rt::handle_request_env(data, pid, &env);
     if !replies.is_empty() {
         let mut m = NL.lock();
         if let Some(s) = m.get_mut(&ofd) {

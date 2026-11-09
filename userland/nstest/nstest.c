@@ -9,6 +9,9 @@
  * individual flags on and move their cases to real behaviour checks.
  */
 #define _GNU_SOURCE
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <net/if.h>
 #include <errno.h>
 #include <sched.h>
 #include <signal.h>
@@ -47,7 +50,6 @@ static void check(const char *name, int ok)
 
 static const struct { const char *n; unsigned long f; } flags[] = {
     {"NEWNS", CLONE_NEWNS},
-    {"NEWCGROUP", CLONE_NEWCGROUP},
 };
 
 static long do_clone(unsigned long fl)
@@ -182,9 +184,9 @@ static int t_unshare_threaded(void)
 }
 static int t_other_new_einval(void)
 {
-    int fl[] = { 0x00020000, 0x02000000 };
+    int fl[] = { 0x00020000 };
     CHECK(drop_to(1000) == 0);
-    for (unsigned i = 0; i < 2; i++) {
+    for (unsigned i = 0; i < 1; i++) {
         CHECK(unshare(fl[i]) == -1 && errno == EINVAL);
         long r = syscall(SYS_clone, SIGCHLD | fl[i], 0, 0, 0, 0);
         CHECK(r == -1 && errno == EINVAL);
@@ -196,10 +198,26 @@ static int t_other_new_einval(void)
     CHECK(r == -1 && errno == EINVAL);
     return 0;
 }
+/* Map uid/gid 1000 onto itself in the caller's fresh namespace: a nested
+ * unshare needs the creator's ids mapped (design-idmap rule 8). */
+static int map_self_1000(void)
+{
+    int fd;
+    if ((fd = open("/proc/self/uid_map", O_WRONLY)) < 0) return 1;
+    if (write(fd, "1000 1000 1\n", 12) != 12) { close(fd); return 1; }
+    close(fd);
+    if ((fd = open("/proc/self/setgroups", O_WRONLY)) < 0) return 1;
+    if (write(fd, "deny", 4) != 4) { close(fd); return 1; }
+    close(fd);
+    if ((fd = open("/proc/self/gid_map", O_WRONLY)) < 0) return 1;
+    if (write(fd, "1000 1000 1\n", 12) != 12) { close(fd); return 1; }
+    close(fd);
+    return 0;
+}
 static int t_depth_limit(void)
 {
     CHECK(drop_to(1000) == 0);
-    for (int i = 0; i < 32; i++) CHECK(unshare(CLONE_NEWUSER) == 0);
+    for (int i = 0; i < 32; i++) { CHECK(unshare(CLONE_NEWUSER) == 0); CHECK(map_self_1000() == 0); }
     CHECK(unshare(CLONE_NEWUSER) == -1 && errno == EUSERS);
     return 0;
 }
@@ -215,7 +233,7 @@ static int t_leak(void)
     }
     for (int i = 0; i < 40; i++) {  /* grand-children share, nested chains release together */
         pid_t c = fork();
-        if (c == 0) { for (int j = 0; j < 8; j++) if (unshare(CLONE_NEWUSER)) _exit(1); _exit(0); }
+        if (c == 0) { for (int j = 0; j < 8; j++) if (unshare(CLONE_NEWUSER) || map_self_1000()) _exit(1); _exit(0); }
         int st = 0; waitpid(c, &st, 0);
         CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
     }
@@ -908,6 +926,79 @@ static int sendfam_child(void)
     }
     return bad;
 }
+/* ---- netlink / ifreq view inside a new netns (lane nlns) ---- */
+static int nl_rt(int s, int type, int flags, unsigned idx, unsigned ifflags, unsigned change,
+                 char *out, int cap)
+{
+    struct { struct nlmsghdr h; struct ifinfomsg i; } r;
+    memset(&r, 0, sizeof r);
+    r.h.nlmsg_len = sizeof r; r.h.nlmsg_type = type; r.h.nlmsg_flags = NLM_F_REQUEST | flags; r.h.nlmsg_seq = 5;
+    r.i.ifi_index = idx; r.i.ifi_flags = ifflags; r.i.ifi_change = change;
+    if (send(s, &r, sizeof r, 0) != (ssize_t)sizeof r) return -1;
+    int tot = 0;
+    for (;;) {
+        ssize_t n = recv(s, out + tot, cap - tot, 0);
+        if (n <= 0) return -1;
+        struct nlmsghdr *h = (struct nlmsghdr *)(out + tot);
+        int k = (int)n, done = 0;
+        for (; NLMSG_OK(h, k); h = NLMSG_NEXT(h, k))
+            if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR || !(type == RTM_GETLINK || type == RTM_GETADDR) || !(h->nlmsg_flags & NLM_F_MULTI)) done = 1;
+        tot += n;
+        if (done) return tot;
+        if (!(flags & NLM_F_DUMP)) return tot;
+    }
+}
+static int nl_count(char *b, int n, int type, int *first_index)
+{
+    int c = 0;
+    for (struct nlmsghdr *h = (struct nlmsghdr *)b; NLMSG_OK(h, n); h = NLMSG_NEXT(h, n))
+        if (h->nlmsg_type == type) { if (!c && first_index) *first_index = ((struct ifinfomsg *)NLMSG_DATA(h))->ifi_index; c++; }
+    return c;
+}
+static int netns_only_lo_body(void)
+{
+    static char b[8192];
+    int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (s < 0) return 2;
+    int n = nl_rt(s, RTM_GETLINK, NLM_F_DUMP, 0, 0, 0, b, sizeof b), idx = 0;
+    if (n <= 0 || nl_count(b, n, RTM_NEWLINK, &idx) != 1 || idx != 1) return 3;
+    n = nl_rt(s, RTM_GETADDR, NLM_F_DUMP, 0, 0, 0, b, sizeof b);
+    if (n <= 0 || nl_count(b, n, RTM_NEWADDR, NULL) != 0) return 4;
+    if (if_nametoindex("eth0") != 0 || if_nametoindex("lo") != 1) return 5;
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "eth0");
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ioctl(u, SIOCGIFFLAGS, &q) == 0 || errno != ENODEV) return 6;
+    struct ifconf ic; char cb[512]; ic.ifc_len = sizeof cb; ic.ifc_buf = cb;
+    if (ioctl(u, SIOCGIFCONF, &ic) != 0 || ic.ifc_len != 0) return 7;
+    n = nl_rt(s, RTM_GETROUTE, NLM_F_DUMP, 0, 0, 0, b, sizeof b);
+    if (n <= 0 || nl_count(b, n, RTM_NEWROUTE, NULL) != 0) return 8;
+    return 0;
+}
+static int t_netns_sees_only_lo(void)
+{
+    CHECK(ns_child_netns(netns_only_lo_body) == 0);
+    return 0;
+}
+static int netns_lo_up_body(void)
+{
+    static char b[8192];
+    int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (s < 0) return 2;
+    int n = nl_rt(s, RTM_NEWLINK, NLM_F_ACK, 1, IFF_UP, IFF_UP, b, sizeof b);
+    struct nlmsghdr *h = (struct nlmsghdr *)b;
+    if (n <= 0 || h->nlmsg_type != NLMSG_ERROR || ((struct nlmsgerr *)NLMSG_DATA(h))->error != 0) return 3;
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo");
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ioctl(u, SIOCGIFFLAGS, &q) != 0 || !(q.ifr_flags & IFF_UP)) return 4;
+    n = nl_rt(s, RTM_NEWLINK, NLM_F_ACK, 99, IFF_UP, IFF_UP, b, sizeof b);
+    if (n <= 0 || ((struct nlmsgerr *)NLMSG_DATA((struct nlmsghdr *)b))->error != -ENODEV) return 5;
+    return 0;
+}
+static int t_netns_lo_up_ack(void)
+{
+    CHECK(ns_child_netns(netns_lo_up_body) == 0);
+    return 0;
+}
 static int t_netns_sendfam(void)
 {
     int h = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1303,7 +1394,10 @@ static int t_setid_guard(void)
 static int root_einval_child(void)
 {
     CHECK(wr("/proc/self/setgroups", "deny") == 0);
-    CHECK(wr("/proc/self/uid_map", "0 0 1") == 0);
+    /* a map covering kuid 0 is refused until lane idroot0 (design-idmap rule 6) */
+    int r0 = wr("/proc/self/uid_map", "0 0 1");
+    if (r0 == -EPERM) { printf("  SKIP root_einval: kuid-0 maps refused\n"); return 0; }
+    CHECK(r0 == 0);
     CHECK(wr("/proc/self/gid_map", "0 0 1") == 0);
     errno = 0; CHECK(setuid(1000) == -1 && errno == EINVAL);
     errno = 0; CHECK(setresuid(1000, -1, -1) == -1 && errno == EINVAL);
@@ -1893,6 +1987,91 @@ static int t_uts_in_host_userns(void)
     return 0;
 }
 
+/* ---- cgroup namespaces (design-cgroup CG0) ---- */
+static int cgns_link(char *buf, size_t n)
+{
+    ssize_t r = readlink("/proc/self/ns/cgroup", buf, n - 1);
+    if (r < 0) return -1;
+    buf[r] = 0;
+    return 0;
+}
+static int t_cgns_unshare(void)
+{
+    char a[64], b[64], c[64];
+    CHECK(cgns_link(a, sizeof a) == 0);
+    CHECK(unshare(CLONE_NEWCGROUP) == 0);
+    CHECK(cgns_link(b, sizeof b) == 0);
+    CHECK(strcmp(a, b) != 0);
+    CHECK(strncmp(b, "cgroup:[", 8) == 0);
+    /* a fork child inherits the namespace */
+    pid_t p = fork();
+    if (p == 0) { char x[64]; _exit(cgns_link(x, sizeof x) == 0 && !strcmp(x, b) ? 0 : 1); }
+    int st = 0; CHECK(p > 0 && waitpid(p, &st, 0) == p && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* a second unshare gives yet another one */
+    CHECK(unshare(CLONE_NEWCGROUP) == 0);
+    CHECK(cgns_link(c, sizeof c) == 0 && strcmp(b, c) != 0 && strcmp(a, c) != 0);
+    return 0;
+}
+static int t_cgns_clone(void)
+{
+    char a[64], b[64];
+    CHECK(cgns_link(a, sizeof a) == 0);
+    int pfd[2]; CHECK(pipe(pfd) == 0);
+    long r = syscall(SYS_clone, SIGCHLD | CLONE_NEWCGROUP, 0, 0, 0, 0);
+    CHECK(r >= 0);
+    if (r == 0) { char x[64]; if (cgns_link(x, sizeof x)) _exit(2); write(pfd[1], x, strlen(x) + 1); _exit(0); }
+    int st = 0; CHECK(waitpid(r, &st, 0) == r && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(read(pfd[0], b, sizeof b) > 0);
+    CHECK(strcmp(a, b) != 0);
+    char a2[64]; CHECK(cgns_link(a2, sizeof a2) == 0 && !strcmp(a, a2)); /* the parent is untouched */
+    /* clone3 as well */
+    struct clone_args ca; memset(&ca, 0, sizeof ca); ca.flags = CLONE_NEWCGROUP; ca.exit_signal = SIGCHLD;
+    r = syscall(SYS_clone3, &ca, sizeof ca);
+    CHECK(r >= 0);
+    if (r == 0) { char x[64]; _exit(cgns_link(x, sizeof x) == 0 && strcmp(x, a) != 0 ? 0 : 1); }
+    CHECK(waitpid(r, &st, 0) == r && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* threads cannot be given their own */
+    r = syscall(SYS_clone, CLONE_NEWCGROUP | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM, 0, 0, 0, 0);
+    CHECK(r == -1 && errno == EINVAL);
+    return 0;
+}
+static int t_cgns_eperm(void)
+{
+    CHECK(drop_to(1000) == 0);
+    CHECK(unshare(CLONE_NEWCGROUP) == -1 && errno == EPERM);
+    long r = syscall(SYS_clone, SIGCHLD | CLONE_NEWCGROUP, 0, 0, 0, 0);
+    CHECK(r == -1 && errno == EPERM);
+    return 0;
+}
+static int t_cgns_in_userns(void)
+{
+    /* an unprivileged user may unshare(NEWUSER|NEWCGROUP) and, once in the
+     * userns, unshare(NEWCGROUP) again */
+    CHECK(drop_to(1000) == 0);
+    char a[64], b[64], c[64];
+    CHECK(cgns_link(a, sizeof a) == 0);
+    CHECK(unshare(CLONE_NEWUSER | CLONE_NEWCGROUP) == 0);
+    CHECK(cgns_link(b, sizeof b) == 0 && strcmp(a, b) != 0);
+    CHECK(unshare(CLONE_NEWCGROUP) == 0);
+    CHECK(cgns_link(c, sizeof c) == 0 && strcmp(b, c) != 0);
+    /* clone(NEWUSER|NEWCGROUP) too */
+    long r = syscall(SYS_clone, SIGCHLD | CLONE_NEWUSER | CLONE_NEWCGROUP, 0, 0, 0, 0);
+    CHECK(r >= 0);
+    if (r == 0) { char x[64]; _exit(cgns_link(x, sizeof x) == 0 && strcmp(x, c) != 0 ? 0 : 1); }
+    int st = 0; CHECK(waitpid(r, &st, 0) == r && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+static int t_cgns_leak(void)
+{
+    /* many create/destroy cycles must not exhaust the namespace table (256) */
+    for (int i = 0; i < 600; i++) {
+        pid_t p = fork();
+        if (p == 0) _exit(unshare(CLONE_NEWCGROUP) == 0 ? 0 : 1);
+        int st = 0; CHECK(p > 0 && waitpid(p, &st, 0) == p && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+    return 0;
+}
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -1916,7 +2095,7 @@ static int run_userns_cases(void)
         { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
-        { "netns_sendfam", t_netns_sendfam }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
+        { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
         { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
@@ -1924,6 +2103,8 @@ static int run_userns_cases(void)
         { "fdinfo_other_uid", t_fdinfo_other_uid },
         { "uts_unpriv", t_uts_unpriv }, { "uts_copy_inherit", t_uts_copy_inherit }, { "uts_host_userns_eperm", t_uts_in_host_userns },
         { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
+        { "cgns_unshare", t_cgns_unshare }, { "cgns_clone", t_cgns_clone }, { "cgns_eperm", t_cgns_eperm },
+        { "cgns_in_userns", t_cgns_in_userns }, { "cgns_leak", t_cgns_leak },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();

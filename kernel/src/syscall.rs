@@ -8433,10 +8433,11 @@ fn sys_unshare(flags: usize) -> isize {
     // CLONE_THREAD/SIGHAND/VM: Linux allows them only for a single-threaded
     // caller, where they are no-ops.
     if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && !alone { return -22; }
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP) != 0 { return -22; }
+    if flags & CLONE_NEWNS != 0 { return -22; }
     let flat = flags & (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS);
     if flat != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; } // CAP_SYS_ADMIN
     if flat != 0 && !alone { return -22; }
+    if flags & CLONE_NEWCGROUP != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     if flags & CLONE_NEWUSER != 0 {
         // Linux: a chrooted task may not create a user namespace (EPERM).
         if sched::current_root_arc().is_some() { return -1; }
@@ -8457,6 +8458,11 @@ fn sys_unshare(flags: usize) -> isize {
     }
     if flags & CLONE_NEWUTS != 0 {
         let r = sched::ns::unshare_uts();
+        if r < 0 { return r; }
+    }
+    // After NEWUSER, so the namespace is owned by the new user namespace.
+    if flags & CLONE_NEWCGROUP != 0 {
+        let r = sched::ns::unshare_cgroup();
         if r < 0 { return r; }
     }
     if flags & CLONE_FILES != 0 { let r = fd_unshare_current(); if r < 0 { return r; } }
@@ -10012,7 +10018,8 @@ fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, flags: us
 /// exec like the other credentials; consulted by every filesystem permission
 /// check through `xattr::Cred::in_group`.
 fn sys_setgroups(size: usize, list_ptr: usize) -> isize {
-    if sched::ns::setgroups_denied(sched::ns::current_userns()) { return -1; } // EPERM after "deny"
+    let ns = sched::ns::current_userns();
+    if sched::ns::setgroups_denied(ns) || !sched::ns::gid_map_written(ns) { return -1; } // EPERM after "deny" / before gid_map
     if size > xattr::NGROUPS_MAX { return -22; } // EINVAL
     let mut groups = [0u32; xattr::NGROUPS_MAX];
     if size > 0 {
@@ -10914,6 +10921,21 @@ struct KPath {
     buf: Vec<u8>,
     /// Namespace path, when an alias rewrote it.
     ns: Option<Vec<u8>>,
+    /// Final mount id (mount namespace != 0 only; 0 otherwise).
+    #[allow(dead_code)]
+    mnt_id: u32,
+    /// Length of the namespace-path prefix naming the final mount point.
+    #[allow(dead_code)]
+    ns_prefix_len: usize,
+    /// Thread pid under which a `vfs::mnt::CALLCTX` entry for `ptr()` is
+    /// registered (0 = none: the ns-0 path takes no extra work).
+    ctx_pid: u32,
+}
+
+impl Drop for KPath {
+    fn drop(&mut self) {
+        if self.ctx_pid != 0 { vfs::mnt::callctx_clear(self.ctx_pid, self.buf.as_ptr() as usize); }
+    }
 }
 
 impl KPath {
@@ -10922,12 +10944,14 @@ impl KPath {
         let mut buf = Vec::with_capacity(bytes.len() + 1);
         buf.extend_from_slice(bytes);
         buf.push(0);
-        KPath { buf, ns: None }
+        KPath { buf, ns: None, mnt_id: 0, ns_prefix_len: 0, ctx_pid: 0 }
     }
 
     /// A namespace path (host-absolute, normalised), translated through the
     /// alias mounts and the `/proc/<pid>/{root,cwd}` magic links.
     fn from_ns(ns: Vec<u8>) -> Result<KPath, isize> {
+        let mns = sched::current_mntns();
+        if mns != 0 { return KPath::from_ns_mnt(ns, mns); }
         // Below /proc/self/fd/N: the namespace path is where that directory
         // really is, not the magic link, so chdir does not record a path
         // that depends on fd N staying open.
@@ -10948,6 +10972,27 @@ impl KPath {
         } };
         if backing.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
         let mut kp = KPath::raw(&backing);
+        kp.ns = Some(ns);
+        Ok(kp)
+    }
+
+    /// [`KPath::from_ns`] for a task in mount namespace `mns` != 0: the
+    /// namespace path goes through that namespace's mount tree, and the
+    /// (pointer -> ns path, mount id) pair is published to the VFS chokepoint
+    /// keyed by thread pid.
+    fn from_ns_mnt(ns: Vec<u8>, mns: sched::ns::NsId) -> Result<KPath, isize> {
+        let (mut denied, mut crossed) = (false, false);
+        let (mut mid, mut plen) = (0u32, 0usize);
+        let backing = backing_walk_m(&ns, &mut crossed, &mut denied, mns, &mut mid, &mut plen);
+        if denied { return Err(-13); }
+        let backing = match backing { Some(b) => b, None => ns.clone() };
+        if backing.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
+        let mut kp = KPath::raw(&backing);
+        kp.mnt_id = mid;
+        kp.ns_prefix_len = plen;
+        let pid = current_pid();
+        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: ns.clone(), mnt_id: mid });
+        kp.ctx_pid = pid;
         kp.ns = Some(ns);
         Ok(kp)
     }
@@ -11017,6 +11062,50 @@ fn backing_walk(ns: &[u8], crossed: &mut bool) -> Option<Vec<u8>> {
 /// [`backing_walk`], also reporting in `denied` that a `/proc/<pid>/{root,cwd}`
 /// hop named another user's process (the readlink gate, `proc_link_allowed`).
 fn backing_walk_d(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<Vec<u8>> {
+    let mns = sched::current_mntns();
+    if mns != 0 { return backing_walk_m(ns, crossed, denied, mns, &mut 0, &mut 0); }
+    backing_walk_ns0(ns, crossed, denied)
+}
+
+/// Translate one path through mount namespace `mns`'s tree; the first call
+/// records the final mount id and mountpoint prefix length.
+fn mnt_xlate(mns: sched::ns::NsId, p: &[u8], crossed: &mut bool, mid: &mut u32, plen: &mut usize, first: bool) -> Option<Vec<u8>> {
+    let x = vfs::mnt::translate(mns, p)?;
+    *crossed |= x.flags & vfs::mnt::MNT_NOSUID != 0;
+    if first { *mid = x.mnt_id; *plen = x.ns_prefix_len; }
+    Some(x.backing)
+}
+
+/// [`backing_walk_d`] for a task in mount namespace `mns` != 0.
+fn backing_walk_m(ns: &[u8], crossed: &mut bool, denied: &mut bool, mns: sched::ns::NsId,
+                  mid: &mut u32, plen: &mut usize) -> Option<Vec<u8>> {
+    let mut cur: Option<Vec<u8>> = mnt_xlate(mns, ns, crossed, mid, plen, true);
+    for _ in 0..4 {
+        let p: &[u8] = cur.as_deref().unwrap_or(ns);
+        if let Some(b) = proc_fd_below(p) { return Some(b); }
+        let hit = proc_magic(p, b"root").map(|(pid, rest)| (pid, rest, true))
+            .or_else(|| proc_magic(p, b"cwd").map(|(pid, rest)| (pid, rest, false)));
+        let (pid, rest, is_root) = match hit { Some(h) if !h.1.is_empty() => h, _ => break };
+        if sched::exists_probe(pid) == 0 && !proc_link_allowed(pid) { *denied = true; break; }
+        let base: alloc::sync::Arc<[u8]> = if is_root {
+            match sched::root_arc_of(pid) {
+                Some(r) => r,
+                None if sched::exists_probe(pid) == 0 => alloc::sync::Arc::from(&b"/"[..]),
+                None => break,
+            }
+        } else {
+            match sched::cwd_arc_of(pid) { Some(c) => c, None => break }
+        };
+        let mut v = Vec::with_capacity(base.len() + rest.len());
+        if &*base != b"/" { v.extend_from_slice(&base); }
+        v.extend_from_slice(rest);
+        cur = Some(mnt_xlate(mns, &v, crossed, mid, plen, false).unwrap_or(v));
+    }
+    cur
+}
+
+/// The ns-0 body of [`backing_walk_d`]: identity plus the alias table.
+fn backing_walk_ns0(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<Vec<u8>> {
     *crossed |= vfs::alias::crosses(ns);
     let mut cur: Option<Vec<u8>> = vfs::alias::translate(ns);
     for _ in 0..4 {
@@ -11092,6 +11181,19 @@ fn proc_own_fd(p: &[u8]) -> Option<(usize, &[u8])> {
 /// root, come back unchanged.
 fn host_to_view(p: &[u8]) -> Vec<u8> {
     let root = sched::current_root_arc();
+    let mns = sched::current_mntns();
+    if mns != 0 {
+        // The namespace's own tree answers; its root is the task's root.
+        let v = vfs::mnt::reverse(mns, p, 0);
+        let p: &[u8] = v.as_deref().unwrap_or(p);
+        if let Some(r) = root.as_deref() {
+            if r.len() > 1 && vfs::alias::under(p, r) {
+                if p.len() == r.len() { return b"/".to_vec(); }
+                return p[r.len()..].to_vec();
+            }
+        }
+        return p.to_vec();
+    }
     let ns = vfs::alias::reverse(p, root.as_deref());
     let p: &[u8] = ns.as_deref().unwrap_or(p);
     if let Some(r) = root.as_deref() {
@@ -11265,7 +11367,7 @@ fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
 
     // The caller's chroot root (host-absolute). `None` means "not chrooted" —
     // the overwhelmingly common case, which takes the same path it always did.
-    let root = sched::current_root_arc();
+    let (root, cwd_arc, _mntns) = sched::current_fs_ctx();
     let rlen = root.as_ref().map(|r| r.len()).filter(|&n| n > 1).unwrap_or(0);
     // `..` may never climb above this offset. For a jailed task it is the end
     // of the root prefix; otherwise it is 1 (the real "/").
@@ -11277,8 +11379,8 @@ fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
         // An absolute path is relative to the jail root, so start there.
         match &root { Some(r) if rlen > 1 => out.extend_from_slice(r), _ => out.push(b'/') }
     } else {
-        match sched::current_cwd_arc() {
-            Some(c) if c.first() == Some(&b'/') => out.extend_from_slice(&c),
+        match &cwd_arc {
+            c if c.first() == Some(&b'/') => out.extend_from_slice(c),
             _ => out.push(b'/'),
         }
         // A cwd that somehow lies outside the jail (it cannot be set there)
@@ -11312,6 +11414,10 @@ fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
     if out.len() > 1 && out.last() == Some(&b'/') { out.pop(); }
     // The void root's name is not observable from outside it.
     if vfs::alias::under(&out, vfs::VOID_ROOT) && root.as_deref() != Some(vfs::VOID_ROOT) {
+        return Err(-2);
+    }
+    // Superblock backing roots are never reachable by name.
+    if out.len() >= vfs::mnt::SB_ROOT.len() && vfs::alias::under(&out, vfs::mnt::SB_ROOT) {
         return Err(-2);
     }
     Ok(out)
@@ -11495,7 +11601,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         && net_server::rtnetlink::is_if_ioctl(cmd as u32)
     {
         use net_server::rtnetlink as nl;
-        let links = nl::current_links();
+        let links = nl::current_links(sched::ns::netns_of(pid as u32));
         if cmd as u32 == nl::SIOCGIFCONF {
             // struct ifconf { int ifc_len; (pad) char *ifc_buf; }
             if arg == 0 { return -14; }
@@ -16448,6 +16554,7 @@ struct CloneReq {
     netns: sched::ns::NsId,
     ipcns: sched::ns::NsId,
     utsns: sched::ns::NsId,
+    cgns: sched::ns::NsId,
     /// CLONE_* flags; the low byte (CSIGNAL) is the signal a new process
     /// sends its parent when it exits (SIGCHLD normally, 0 for none).
     flags: usize,
@@ -16525,7 +16632,7 @@ fn sys_clone_or_fork(
         return -22;
     }
     let pidfd = if flags & CLONE_PIDFD != 0 { ptid } else { 0 };
-    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr)
+    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, cgns: 0 }, frame_ptr)
 }
 
 /// vfork(2): `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` — the child runs on
@@ -16535,7 +16642,7 @@ fn sys_clone_or_fork(
 fn sys_vfork(frame_ptr: usize) -> isize {
     const SIGCHLD: usize = 17;
     do_clone(CloneReq { flags: CLONE_VM | CLONE_VFORK | SIGCHLD, stack: 0, ptid: 0, ctid: 0,
-                        tls: 0, pidfd: 0, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr)
+                        tls: 0, pidfd: 0, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, cgns: 0 }, frame_ptr)
 }
 
 /// clone3(uargs, size): `struct clone_args` translated onto the clone path.
@@ -16628,7 +16735,7 @@ fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
         if let Err(e) = sched::reserve_pid(p) { return e; }
     }
     let r = do_clone(CloneReq { flags, stack: sp, ptid: parent_tid as usize, ctid: child_tid as usize,
-                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr);
+                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, cgns: 0 }, frame_ptr);
     if let Some(p) = set_tid_pid { sched::release_reserved_pid(p); }
     r
 }
@@ -16647,7 +16754,7 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
 
     // Namespaces: only CLONE_NEWUSER is implemented (nsbox lane L1); every
     // other CLONE_NEW* is refused instead of silently ignored.
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP) != 0 { return -22; }
+    if flags & CLONE_NEWNS != 0 { return -22; }
     // Pid namespaces (lane nspid). Linux copy_process rules: NEWPID excludes
     // CLONE_THREAD/SIGHAND; here also CLONE_VM (the vfork-style arm has no
     // namespace plumbing). A thread or CLONE_PARENT child cannot be placed
@@ -16667,6 +16774,12 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
     // NEWNET/NEWIPC: need CAP_SYS_ADMIN in the (possibly new) user namespace;
     // a thread or a shared-VM child cannot get its own.
     if flags & (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS) != 0 {
+        if flags & (CLONE_THREAD | CLONE_VM) != 0 { return -22; }
+        if flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
+    }
+    // NEWCGROUP: CAP_SYS_ADMIN in the (possibly new) user namespace; like
+    // NEWNET it cannot be given to a thread or a shared-VM child.
+    if flags & CLONE_NEWCGROUP != 0 {
         if flags & (CLONE_THREAD | CLONE_VM) != 0 { return -22; }
         if flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     }
@@ -16695,6 +16808,12 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
         match sched::ns::new_uts(sched::ns::utsns_of(current_pid()), owner) { Ok(n) => Some(n), Err(e) => return e }
     } else { None };
     req.utsns = new_uts.as_ref().map_or(0, |n| n.id());
+    // Rooted at the parent's current cgroup, owned by the child's user namespace.
+    let new_cgns = if flags & CLONE_NEWCGROUP != 0 {
+        let owner = if req.userns != 0 { req.userns } else { sched::ns::current_userns() };
+        match sched::ns::new_cgns(sched::cgroup::current(), owner) { Ok(n) => Some(n), Err(e) => return e }
+    } else { None };
+    req.cgns = new_cgns.as_ref().map_or(0, |n| n.id());
 
     let pidfd = if flags & CLONE_PIDFD != 0 {
         if !validate_user_buf(req.pidfd, 4) { return -14; }
@@ -16788,6 +16907,7 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
         let parent_pid = sched::tgid_of(current_pid());
         if !vfs::fd_table_slot_free() { return -11; } // EAGAIN, as for FORK
         let opts = sched::ForkOpts {
+            mntns: 0,
             vfork: flags & CLONE_VFORK != 0,
             child_stack,
             tls: if flags & CLONE_SETTLS != 0 { Some(tls as u64) } else { None },
@@ -16799,6 +16919,7 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
             netns: req.netns,
             ipcns: req.ipcns,
             utsns: req.utsns,
+            cgns: req.cgns,
         };
         // Duplicate the fd table before the child becomes runnable (see the
         // FORK arm of syscall_dispatch for the SMP race this prevents).
