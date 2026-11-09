@@ -558,29 +558,41 @@ static void hardening_suite(void) {
 #define O_PATH 010000000
 #endif
 
-static int enoent_open(const char *p) { errno = 0; int fd = open(p, O_RDONLY); if (fd >= 0) { close(fd); return 0; } return errno == ENOENT; }
+/* A live pool instance holding "marker" must exist while the checks run: a
+ * sibling task keeps a tmpfs mounted in its own namespace. A check passes when
+ * no instance number 1..79 is reachable through the given route. */
+static int pool_hit(const char *fmt_prefix) {
+    char p[160];
+    for (int m = 1; m < 80; m++) {
+        snprintf(p, sizeof p, "%s.leandros-sb/tmpfs/%d/marker", fmt_prefix, m);
+        int fd = open(p, O_RDONLY);
+        if (fd >= 0) { close(fd); return 1; }
+    }
+    return 0;
+}
 
 static int pool_proc_ok(void) {
-    int ok = enoent_open("/proc/self/root/.leandros-sb")
-          && enoent_open("/proc/self/root/.leandros-sb/tmpfs/1")
-          && enoent_open("/proc/self/root/.leandros-sb/tmpfs/1/x");
-    return ok;
+    return !pool_hit("/proc/self/root/") && !pool_hit("/") ;
 }
 static int pool_cwd_ok(void) {
     if (chdir("/") != 0) return 0;
-    return enoent_open("/proc/self/cwd/.leandros-sb")
-        && enoent_open("/proc/self/cwd/.leandros-sb/tmpfs/1");
+    return !pool_hit("/proc/self/cwd/");
 }
 static int pool_fd_ok(void) {
     int dfd = open("/", O_RDONLY | O_DIRECTORY);
     if (dfd < 0) return 0;
     int ok = 1;
-    errno = 0; int f = openat(dfd, ".leandros-sb/tmpfs/1", O_RDONLY); if (f >= 0) { close(f); ok = 0; } else if (errno != ENOENT) ok = 0;
-    char p[96]; snprintf(p, sizeof p, "/proc/self/fd/%d/.leandros-sb/tmpfs/1", dfd);
-    if (!enoent_open(p)) ok = 0;
+    char p[96];
+    for (int m = 1; m < 80 && ok; m++) {
+        snprintf(p, sizeof p, ".leandros-sb/tmpfs/%d/marker", m);
+        int f = openat(dfd, p, O_RDONLY); if (f >= 0) { close(f); ok = 0; }
+    }
+    snprintf(p, sizeof p, "/proc/self/fd/%d/", dfd);
+    if (pool_hit(p)) ok = 0;
     if (fchdir(dfd) != 0) ok = 0;
-    else if (!enoent_open(".leandros-sb/tmpfs/1")) ok = 0;
+    else if (pool_hit("")) ok = 0;
     close(dfd);
+    chdir("/");
     return ok;
 }
 
@@ -592,6 +604,7 @@ static int pool_in_child(int mode, int (*fn)(void)) {
             if (unshare(CLONE_NEWNS) != 0) _exit(2);
             mkdir("/mnt", 0755);
             if (mount("t", "/mnt", "tmpfs", 0, NULL) != 0) _exit(3);
+            { int mf = open("/mnt/marker", O_CREAT | O_WRONLY, 0666); if (mf >= 0) close(mf); }
         }
         _exit(fn() ? 0 : 1);
     }
@@ -631,6 +644,23 @@ static int mountinfo_nopool_ok(void) {
 }
 
 static void pool_tests(void) {
+    int hp[2], rp[2];
+    pid_t holder = -1;
+    if (pipe(hp) == 0 && pipe(rp) == 0 && (holder = fork()) == 0) {
+        char c = 'x';
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        mkdir("/mnt", 0755);
+        if (mount("h", "/mnt", "tmpfs", 0, NULL) != 0) _exit(3);
+        int f = open("/mnt/marker", O_CREAT | O_WRONLY, 0666);
+        if (f < 0) _exit(4);
+        close(f);
+        write(hp[1], &c, 1);
+        read(rp[0], &c, 1);
+        _exit(0);
+    }
+    char hc;
+    int up = holder > 0 && read(hp[0], &hc, 1) == 1;
+    report("pool_holder_up", up);
     report("pool_via_proc_root_ns0", pool_in_child(0, pool_proc_ok));
     report("pool_via_proc_root_mntns", pool_in_child(1, pool_proc_ok));
     report("pool_via_proc_cwd_ns0", pool_in_child(0, pool_cwd_ok));
@@ -639,6 +669,7 @@ static void pool_tests(void) {
     report("pool_via_fd_relative_mntns", pool_in_child(1, pool_fd_ok));
     report("pool_cross_instance_symlink", pool_in_child(1, cross_symlink_ok));
     report("mountinfo_no_pool_path", pool_in_child(1, mountinfo_nopool_ok));
+    if (holder > 0) { write(rp[1], &hc, 1); waitpid(holder, NULL, 0); }
 }
 
 int main(int argc, char **argv) {
