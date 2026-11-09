@@ -81,7 +81,10 @@ fn put(mut id: NsId) {
         if CGNS_FLAG[id as usize].swap(0, AcqRel) != 0 {
             crate::cgroup::ns_unpin(CGNS_ROOT[id as usize].load(Acquire));
         }
-        // Last reference: the slot is free again; release the parent.
+        // Last reference: the slot is free again; release the parent and any
+        // owning user namespace (setns lane).
+        let ou = OWNER_UNS[id as usize].swap(0, AcqRel);
+        if ou != 0 { put(ou); }
         id = PARENT[id as usize].load(Acquire);
     }
 }
@@ -173,11 +176,12 @@ pub fn reap(mut free: impl FnMut(NsId)) {
 pub fn dying_count() -> usize { (1..NS_MAX).filter(|&i| REFS[i].load(Relaxed) == DYING).count() }
 
 /// Create a flat (parentless) namespace id: net or ipc. Errors: ENOSPC (28).
-pub fn new_flat() -> Result<NsRef, isize> {
+pub fn new_flat(owner: NsId) -> Result<NsRef, isize> {
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             PARENT[id].store(0, Release);
             LEVEL[id].store(0, Release);
+            set_owner_userns(id as NsId, owner);
             LO_UP[id].store(0, Release);
             return Ok(NsRef(id as NsId));
         }
@@ -197,8 +201,9 @@ pub fn ipcns_of(pid: u32) -> NsId {
 /// unshare(CLONE_NEWNET / CLONE_NEWIPC) for the calling thread: it moves
 /// into a fresh namespace of that kind. 0 or a negative errno.
 pub fn unshare_flat(net: bool, ipc: bool) -> isize {
-    let nn = if net { match new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
-    let ni = if ipc { match new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let ou = current_userns();
+    let nn = if net { match new_flat(ou) { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let ni = if ipc { match new_flat(ou) { Ok(n) => Some(n), Err(e) => return e } } else { None };
     let pid = crate::current_pid();
     let (o1, o2) = {
         let mut rq = crate::RUN_QUEUE.lock();
@@ -235,7 +240,7 @@ static UTS: [spin::Mutex<UtsNames>; NS_MAX] = [const { spin::Mutex::new(UTS_INIT
 /// Create a UTS namespace owned by user namespace `owner`, names copied from `src`.
 pub fn new_uts(src: NsId, owner: NsId) -> Result<NsRef, isize> {
     let names = *UTS[src as usize].lock();
-    let r = new_flat()?;
+    let r = new_flat(owner)?;
     *UTS[r.0 as usize].lock() = UtsNames { owner, ..names };
     Ok(r)
 }
@@ -342,7 +347,7 @@ static PID_FLAGS: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 
 /// New pid namespace, a child of pid namespace `parent`. ENOSPC when too deep
 /// or the table is full (as Linux).
-pub fn new_pidns(parent: NsId) -> Result<NsRef, isize> {
+pub fn new_pidns(parent: NsId, owner: NsId) -> Result<NsRef, isize> {
     let level = level(parent);
     if level >= MAX_PIDNS_LEVEL { return Err(-28); }
     for id in 1..NS_MAX {
@@ -353,6 +358,7 @@ pub fn new_pidns(parent: NsId) -> Result<NsRef, isize> {
             LEVEL[id].store(level + 1, Release);
             PID_INIT[id].store(0, Release);
             PID_FLAGS[id].store(0, Release);
+            set_owner_userns(id as NsId, owner);
             crate::pidns::USED.store(true, Relaxed);
             return Ok(NsRef(id as NsId));
         }
@@ -413,6 +419,14 @@ pub fn from_k(kind: usize, ns: NsId, kid: u32) -> Option<u32> {
         if kid >= l && (kid - l) < c { return Some(u + (kid - l)); }
     }
     None
+}
+
+/// The kernel id for id `vid` as the calling task names it (its user
+/// namespace's view); None when that namespace has no mapping for it. Inverse
+/// of `view_id`: the one place a non-identity map must change.
+pub fn kid_from_view(kind: usize, vid: u32) -> Option<u32> {
+    let ns = current_userns();
+    if mapped(kind, ns, vid) { Some(vid) } else { None }
 }
 
 /// Overflow id shown for ids with no mapping.
@@ -668,6 +682,7 @@ pub fn write_setgroups(opener: Opener, writer: u32, target: u32, data: &[u8]) ->
 /// inode of namespace link `kind` (0 user,1 pid,2 net,3 ipc,4 mnt,5 uts,
 /// 6 cgroup,7 pid_for_children). Only the user namespace is per-task so far.
 pub fn ns_ino(kind: usize, id: NsId) -> u64 {
+    let kind = if kind == 7 { 1 } else { kind };
     if id != 0 { return 0xF000_0000 + id as u64 * 4 + (kind as u64 & 3); }
     match kind { 0 => 4026531837, 1 | 7 => 4026531836, 2 => 4026531840, 3 => 4026531839,
                  4 => 4026531841, 5 => 4026531838, _ => 4026531835 }
@@ -686,6 +701,146 @@ pub fn ns_id_of(pid: u32, kind: usize) -> NsId {
         5 => utsns_of(pid),
         _ => 0,
     }
+}
+
+// ── setns(2) and nsfs-like fds (lane setns; append-only) ────────────────────
+
+/// Owning user namespace of a net/ipc/pid namespace (a counted reference,
+/// released when the namespace itself is freed).
+static OWNER_UNS: [AtomicU16; NS_MAX] = [ZERO16; NS_MAX];
+
+/// Record `owner` as the user namespace that owns the fresh namespace `id`.
+pub fn set_owner_userns(id: NsId, owner: NsId) {
+    if id == 0 { return; }
+    core::mem::forget(NsRef::get(owner));
+    OWNER_UNS[id as usize].store(owner, Release);
+}
+
+/// Take one raw reference on `id` (an nsfd's hold); pair with `put_raw`.
+pub fn hold_raw(id: NsId) { core::mem::forget(NsRef::get(id)); }
+/// Drop a reference taken by `hold_raw`.
+pub fn put_raw(id: NsId) { drop(NsRef(id)); }
+
+/// Take a reference on the namespace of link `kind` of `pid`, atomically with
+/// reading it. `None` when the task does not exist. Kinds without a per-task
+/// table (mnt, uts, cgroup) yield the initial namespace 0.
+pub fn grab(pid: u32, kind: usize) -> Option<NsId> {
+    let rq = crate::RUN_QUEUE.lock();
+    let t = rq.find_pid(pid)?;
+    let id = match kind {
+        0 => t.userns.id(), 1 => t.pidns.id(), 2 => t.netns.id(), 3 => t.ipcns.id(),
+        7 => t.pidns_child.id(), 5 => t.utsns.id(), 4 => t.mntns.id(), 6 => t.cgns.id(), _ => 0,
+    };
+    core::mem::forget(NsRef::get(id));
+    Some(id)
+}
+
+pub const CLONE_NEWNS: usize = 0x0002_0000;
+pub const CLONE_NEWCGROUP: usize = 0x0200_0000;
+pub const CLONE_NEWUTS: usize = 0x0400_0000;
+pub const CLONE_NEWIPC: usize = 0x0800_0000;
+pub const CLONE_NEWUSER: usize = 0x1000_0000;
+pub const CLONE_NEWPID: usize = 0x2000_0000;
+pub const CLONE_NEWNET: usize = 0x4000_0000;
+
+/// CLONE_NEW* flag of link `kind` (NS_GET_NSTYPE).
+pub fn clone_flag(kind: usize) -> usize {
+    match kind {
+        0 => CLONE_NEWUSER, 1 | 7 => CLONE_NEWPID, 2 => CLONE_NEWNET, 3 => CLONE_NEWIPC,
+        4 => CLONE_NEWNS, 5 => CLONE_NEWUTS, _ => CLONE_NEWCGROUP,
+    }
+}
+
+/// `anc` is `n` or one of its ancestors in the same (user or pid) tree.
+pub fn covers(anc: NsId, mut n: NsId) -> bool {
+    if anc == 0 { return true; }
+    let mut steps = 0;
+    while steps <= MAX_USERNS_LEVEL as usize + 2 {
+        if n == anc { return true; }
+        if n == 0 { return false; }
+        n = PARENT[n as usize].load(Acquire);
+        steps += 1;
+    }
+    false
+}
+
+/// Owning user namespace of namespace `id` of link `kind` (the parent for a
+/// user namespace). 0 for the initial namespaces.
+pub fn owner_userns(kind: usize, id: NsId) -> NsId {
+    if id == 0 { return 0; }
+    if kind == 0 { PARENT[id as usize].load(Acquire) } else { OWNER_UNS[id as usize].load(Acquire) }
+}
+
+/// The caller's state a join is checked against.
+struct Ctx { userns: NsId, admin: bool, pidns: NsId, euid: u32 }
+
+fn cap_in(ctx: &Ctx, target_userns: NsId) -> bool { ctx.admin && covers(ctx.userns, target_userns) }
+
+/// Linux's per-type install checks for joining namespace `id` of link `kind`.
+/// A user-namespace join updates `ctx` so later entries are checked with the
+/// caps it grants. 0 or a negative errno.
+fn check_join(ctx: &mut Ctx, kind: usize, id: NsId, alone: bool, chrooted: bool) -> isize {
+    match kind {
+        0 => {
+            if id == ctx.userns { return -22; }
+            if !alone { return -22; }
+            if chrooted { return -1; }
+            let creator = id != 0 && PARENT[id as usize].load(Acquire) == ctx.userns
+                && OWNER_EUID[id as usize].load(Acquire) == ctx.euid;
+            if !cap_in(ctx, id) && !creator { return -1; }
+            ctx.userns = id; ctx.admin = true;
+            0
+        }
+        1 | 7 => {
+            if !cap_in(ctx, owner_userns(1, id)) { return -1; }
+            if !covers(ctx.pidns, id) { return -22; }
+            0
+        }
+        2 | 3 => if cap_in(ctx, owner_userns(kind, id)) { 0 } else { -1 },
+        5 => if cap_in(ctx, UTS[id as usize].lock().owner) { 0 } else { -1 },
+        6 => if !is_cgns(id) { -22 } else if cap_in(ctx, cgns_owner(id)) { 0 } else { -1 },
+        _ => -22, // mnt: not yet (needs per-namespace root/cwd reset)
+    }
+}
+
+/// Join the namespaces in `items` (kind, held reference). All entries are
+/// checked before any is applied. 0 or a negative errno.
+pub fn join(items: alloc::vec::Vec<(usize, NsRef)>, alone: bool, chrooted: bool) -> isize {
+    let pid = crate::current_pid();
+    let mut ctx = {
+        let rq = crate::RUN_QUEUE.lock();
+        match rq.find_pid(pid) {
+            Some(t) => Ctx { userns: t.userns.id(), admin: t.caps[0] >> 21 & 1 != 0, pidns: t.pidns.id(), euid: t.euid },
+            None => return -3,
+        }
+    };
+    // The user namespace first: later entries are judged with its caps.
+    let mut order: alloc::vec::Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&i| if items[i].0 == 0 { 0 } else { 1 });
+    for &i in &order {
+        let r = check_join(&mut ctx, items[i].0, items[i].1.id(), alone, chrooted);
+        if r < 0 { return r; }
+    }
+    let mut old: alloc::vec::Vec<NsRef> = alloc::vec::Vec::new();
+    {
+        let mut rq = crate::RUN_QUEUE.lock();
+        let Some(t) = rq.find_pid_mut(pid) else { return -3 };
+        for (kind, n) in items {
+            match kind {
+                0 => {
+                    t.caps = crate::caps::userns_root_caps(t.caps[3]);
+                    old.push(core::mem::replace(&mut t.userns, n));
+                }
+                1 | 7 => old.push(core::mem::replace(&mut t.pidns_child, n)),
+                2 => old.push(core::mem::replace(&mut t.netns, n)),
+                5 => old.push(core::mem::replace(&mut t.utsns, n)),
+                6 => old.push(core::mem::replace(&mut t.cgns, n)),
+                _ => old.push(core::mem::replace(&mut t.ipcns, n)),
+            }
+        }
+    }
+    drop(old);
+    0
 }
 
 // ── cgroup namespaces (design-cgroup lane CG0/CG1; append-only) ─────────────
@@ -744,6 +899,32 @@ pub fn unshare_cgroup() -> isize {
     };
     drop(old);
     0
+}
+
+/// setns(nsfd, nstype): `kind`/`id` come from the fd, which keeps `id` alive.
+pub fn setns_fd(kind: usize, id: NsId, nstype: usize, alone: bool, chrooted: bool) -> isize {
+    if nstype != 0 && nstype != clone_flag(kind) { return -22; }
+    if !matches!(kind, 0 | 1 | 2 | 3 | 5 | 6 | 7) { return -22; }
+    join(alloc::vec![(kind, NsRef::get(id))], alone, chrooted)
+}
+
+/// setns(pidfd, flags): join the namespaces of process `tgid` named by `flags`.
+pub fn setns_pid(tgid: u32, flags: usize, alone: bool, chrooted: bool) -> isize {
+    const KNOWN: usize = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+    if flags == 0 || flags & !KNOWN != 0 { return -22; }
+    if flags & CLONE_NEWNS != 0 { return -22; }
+    let mut items = alloc::vec::Vec::new();
+    {
+        let rq = crate::RUN_QUEUE.lock();
+        let Some(t) = rq.find_pid(tgid) else { return -3 };
+        if flags & CLONE_NEWUSER != 0 { items.push((0usize, t.userns.clone())); }
+        if flags & CLONE_NEWPID != 0 { items.push((1usize, t.pidns.clone())); }
+        if flags & CLONE_NEWNET != 0 { items.push((2usize, t.netns.clone())); }
+        if flags & CLONE_NEWIPC != 0 { items.push((3usize, t.ipcns.clone())); }
+        if flags & CLONE_NEWUTS != 0 { items.push((5usize, t.utsns.clone())); }
+        if flags & CLONE_NEWCGROUP != 0 { items.push((6usize, t.cgns.clone())); }
+    }
+    join(items, alone, chrooted)
 }
 
 /// Hook for setns(fd, CLONE_NEWCGROUP) (lane setns): move the calling thread

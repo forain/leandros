@@ -14,7 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <netinet/in.h>
+#include <time.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -171,6 +174,76 @@ static int body_sigchld(void)
 }
 static void sigchld_si_uid_view(void) { run_ns_case("sigchld_si_uid_view", body_sigchld); }
 
+/* ---- idroot cases ---- */
+static int raw_socket_refused(void)
+{
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (fd >= 0) { close(fd); return 0; }
+    return errno == EPERM || errno == EACCES;
+}
+
+static int alarm_timer_refused(void)   /* CAP_WAKE_ALARM */
+{
+    timer_t t;
+    struct sigevent sev;
+    memset(&sev, 0, sizeof sev);
+    sev.sigev_notify = SIGEV_NONE;
+    if (timer_create(CLOCK_REALTIME_ALARM, &sev, &t) == 0) { timer_delete(t); return 0; }
+    return errno == EPERM;
+}
+
+static int reboot_refused(void)        /* CAP_SYS_BOOT is checked before the magics */
+{
+    long r = syscall(SYS_reboot, 0, 0, 0, 0);
+    return r == -1 && errno == EPERM;
+}
+
+static int set_mm_refused(void)        /* prctl(PR_SET_MM, ...): host root only */
+{
+    long r = syscall(SYS_prctl, 35 /* PR_SET_MM */, 8 /* PR_SET_MM_ARG_START */, 0, 0, 0);
+    return r == -1 && errno == EPERM;
+}
+
+static int run_child(int (*fn)(void))
+{
+    pid_t p = fork();
+    if (p < 0) return 0;
+    if (p == 0) _exit(fn() ? 0 : 1);
+    int st = 0;
+    waitpid(p, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+/* Root that unshares CLONE_NEWUSER keeps euid 0 but is not host root. */
+static int in_ns_all_refused(void)
+{
+    if (unshare(CLONE_NEWUSER) != 0) return 0;
+    return raw_socket_refused() && alarm_timer_refused() && reboot_refused() && set_mm_refused();
+}
+
+static int host_all_allowed(void)
+{
+    /* Host root: raw socket and alarm timer succeed; reboot/set_mm get past
+     * the privilege check (reboot: EINVAL on bad magic; set_mm: not EPERM). */
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (fd < 0) return 0;
+    close(fd);
+    if (alarm_timer_refused()) return 0;
+    if (reboot_refused()) return 0;
+    if (set_mm_refused()) return 0;
+    return 1;
+}
+
+static void case_ns_euid0_not_host(void)
+{
+    report("ns_euid0_not_host", run_child(in_ns_all_refused));
+}
+
+static void case_host_root_unaffected(void)
+{
+    report("host_root_unaffected", run_child(host_all_allowed));
+}
+
 /* ---- lane subids: /etc/subuid, /etc/subgid, procsys id files ---- */
 static int slurp_file(const char *path, char *buf, int cap)
 {
@@ -199,7 +272,7 @@ static void subuid_present(void)
     for (int i = 0; i < 2; i++) {
         char b[128];
         struct stat st;
-        if (slurp_file(files[i], b, sizeof b) < 0 || strcmp(b, "leandro:100000:65536\n") != 0) ok = 0;
+        if (slurp_file(files[i], b, sizeof b) < 0 || strncmp(b, "leandro:100000:65536\n", 21) != 0) ok = 0; /* first line; root range may follow */
         else if (stat(files[i], &st) != 0 || st.st_uid != 0 || st.st_gid != 0 || (st.st_mode & 07777) != 0644) ok = 0;
     }
     report("subuid_present", ok);
@@ -761,6 +834,8 @@ int main(int argc, char **argv)
     status_groups_view();
     stat_unmapped_65534();
     sigchld_si_uid_view();
+    case_ns_euid0_not_host();
+    case_host_root_unaffected();
     subuid_present();
     procsys_overflow();
     idcore_cases();
