@@ -29,6 +29,7 @@ pub mod playstat;
 pub mod context;
 pub mod caps;
 pub mod ns;
+pub mod pidns;
 pub mod cred;
 pub mod futex;
 pub mod robust;
@@ -73,7 +74,7 @@ pub use task::{SigInfo, SI_USER, SI_KERNEL, SI_TIMER, SI_TKILL, CLD_EXITED, CLD_
                SEGV_MAPERR, SEGV_ACCERR, BUS_ADRALN, BUS_ADRERR, ILL_ILLOPC, FPE_INTDIV, FPE_FLTINV,
                TRAP_BRKPT, TRAP_TRACE};
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 use task::{Pid, Task, TaskState};
 use context::CpuContext;
@@ -817,6 +818,10 @@ static CURRENT_PID: [AtomicU32; MAX_CPUS] =
 /// non-leader `execve` changes the thread's *pid*, never its tgid.)
 static CURRENT_TGID: [AtomicU32; MAX_CPUS] =
     [const { AtomicU32::new(0) }; MAX_CPUS];
+/// Active pid namespace of the task running on each CPU (0 = initial). Safe to
+/// cache: `Task.pidns` is immutable after creation.
+pub(crate) static CURRENT_PIDNS: [AtomicU16; MAX_CPUS] =
+    [const { AtomicU16::new(0) }; MAX_CPUS];
 /// Address space of the task running on each CPU (its own `Arc`'s pointee;
 /// null = none / not dispatched), published at dispatch, cleared at
 /// switch-back and re-published by `replace_address_space` (execve). Lets
@@ -1312,6 +1317,7 @@ pub fn init_pid() -> Pid { INIT_PID.load(Ordering::Acquire) }
 /// shell died (jobtest's TOSTOP writer, left behind on both arches) stayed
 /// stopped for ever instead of getting SIGHUP + SIGCONT.
 fn reparent_children(dead_tgid: Pid) {
+    pidns::on_process_exit(dead_tgid);
     let init = init_pid();
     if init == 0 || init == dead_tgid { return; }
     let mut cands = [0 as Pid; signal::ORPHAN_MAX_GROUPS];
@@ -7455,6 +7461,7 @@ fn scheduler_run_loop() -> ! {
                 CURRENT_CTX[id] = ctx_ptr as *mut CpuContext;
                 CURRENT_PID[id].store(dispatched_pid, Ordering::Relaxed);
                 CURRENT_TGID[id].store(tgid, Ordering::Relaxed);
+                CURRENT_PIDNS[id].store(d.pidns as u16, Ordering::Relaxed);
                 CURRENT_REPLY_PORT[id].store(reply_port, Ordering::Relaxed);
                 CURRENT_AS[id].store(as_ptr, Ordering::Release);
 
@@ -7479,6 +7486,7 @@ fn scheduler_run_loop() -> ! {
                 CURRENT_CTX[id] = core::ptr::null_mut();
                 CURRENT_PID[id].store(0, Ordering::Relaxed);
                 CURRENT_TGID[id].store(0, Ordering::Relaxed);
+                CURRENT_PIDNS[id].store(0, Ordering::Relaxed);
                 CURRENT_AS[id].store(core::ptr::null_mut(), Ordering::Release);
                 CURRENT_SIGHINT[id].store(core::ptr::null_mut(), Ordering::Relaxed);
                 CURRENT_SECCOMP[id].store(core::ptr::null_mut(), Ordering::Relaxed);
