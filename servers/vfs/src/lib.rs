@@ -7623,7 +7623,7 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
             let mut gl = [0u32; xattr::NGROUPS_MAX];
             let n = sched::groups_of(pid, &mut gl);
             for g in &gl[..n] {
-                p = write_u32(buf, p, *g);
+                p = write_u32(buf, p, sched::ns::view_id(1, *g));
                 p = write_lit(buf, p, b" ");
             }
         }
@@ -13616,6 +13616,17 @@ pub fn read_stat_owner(stat_ptr: usize) -> (u32, u32) {
     }
 }
 
+/// Rewrite `(st_uid, st_gid)` of a kernel-resident `struct stat` from kuids to
+/// the calling task's user-namespace view (65534 unmapped). Called on the way
+/// to user memory: kernel buffers carry kuids (idmap design H1).
+pub fn translate_stat_owner_for_user(stat_ptr: usize) {
+    let (u, g) = read_stat_owner(stat_ptr);
+    unsafe {
+        ((stat_ptr + ST_UID_OFF) as *mut u32).write_unaligned(sched::ns::view_id(0, u));
+        ((stat_ptr + ST_UID_OFF + 4) as *mut u32).write_unaligned(sched::ns::view_id(1, g));
+    }
+}
+
 /// Synthesise a stable, path-unique inode number.
 ///
 /// tmpfs and the initrd have no real inode numbers, so `st_ino` used to be
@@ -13711,9 +13722,16 @@ pub fn write_stat_full_rdev(
     gid:      u32,
     rdev:     u64,
 ) {
-    // Owners as the calling task's user namespace sees them (65534 unmapped).
-    let uid = sched::ns::view_id(0, uid);
-    let gid = sched::ns::view_id(1, gid);
+    // Kernel buffers carry kuids; translation happens only on the copy to
+    // user memory, as the calling task's user namespace sees them (65534
+    // unmapped). Kernel callers (exec_setid, access checks) read raw kuids.
+    let to_user = sched::uaccess::user_range_ok(stat_ptr, STAT_SIZE);
+    // View translation uses current_userns(): the fill must run on the
+    // caller's own thread (fs ports are direct kernel handlers).
+    debug_assert!(!to_user || sched::current_pid() != 0, "stat fill off the caller's thread");
+    let (uid, gid) = if to_user {
+        (sched::ns::view_id(0, uid), sched::ns::view_id(1, gid))
+    } else { (uid, gid) };
     unsafe {
         // Built in a kernel buffer, then one PAN-safe copy out.
         let mut kb = [0u8; STAT_SIZE];
