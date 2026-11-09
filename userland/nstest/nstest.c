@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <linux/sched.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <stddef.h>
 #include <pthread.h>
 #include <sys/mount.h>
@@ -520,6 +521,129 @@ static int ub_fork_enomem(void)
 PCASE(fork_enomem, ub_fork_enomem)
 
 
+/* ---- /proc in a pid namespace (lane nspidproc) --------------------------- */
+static int slurp(const char *p, char *b, int n)
+{
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) return -1;
+    int r = read(fd, b, n - 1);
+    close(fd);
+    if (r >= 0) b[r] = 0;
+    return r;
+}
+/* Tab-separated values of the "<key>:" line of a status buffer into out (as text). */
+static int status_line(const char *st, const char *key, char *out, int n)
+{
+    char k[32]; snprintf(k, sizeof k, "\n%s:\t", key);
+    const char *a = strstr(st, k);
+    if (!a) return -1;
+    a += strlen(k);
+    int i = 0;
+    while (*a && *a != '\n' && i < n - 1) out[i++] = *a++;
+    out[i] = 0;
+    return 0;
+}
+static int ntabs(const char *s) { int n = 1; for (; *s; s++) if (*s == '\t') n++; return n; }
+static pid_t g_outer;
+
+static int ib_proc_self(void)
+{
+    char b[64] = {0};
+    ssize_t r = readlink("/proc/self", b, sizeof b - 1);
+    if (r != 1 || b[0] != '1') return 1;
+    char st[4096], v[64];
+    if (slurp("/proc/self/status", st, sizeof st) < 0) return 2;
+    if (status_line(st, "Pid", v, sizeof v) || strcmp(v, "1")) return 3;
+    if (status_line(st, "PPid", v, sizeof v) || strcmp(v, "0")) return 4;
+    if (status_line(st, "NSpid", v, sizeof v) || strcmp(v, "1")) return 5;
+    return 0;
+}
+static int ub_proc_self(void) { return in_init(ib_proc_self); }
+PCASE(proc_self_init, ub_proc_self)
+
+/* init forks a child that blocks; init lists /proc. */
+static int ib_listing(void)
+{
+    int p[2];
+    if (pipe(p)) return 1;
+    pid_t c = fork();
+    if (c == 0) { char x; close(p[1]); read(p[0], &x, 1); _exit(0); }
+    if (c <= 1) return 2;
+    int saw1 = 0, sawc = 0, bad = 0;
+    DIR *d = opendir("/proc");
+    if (!d) return 3;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        long v = atol(e->d_name);
+        if (v == 1) saw1 = 1; else if (v == c) sawc = 1; else bad++;
+    }
+    closedir(d);
+    /* hidden: the outside pid and the host-view number of init */
+    char path[64]; struct stat sb;
+    snprintf(path, sizeof path, "/proc/%d", (int)g_outer);
+    int hid_outer = stat(path, &sb) == -1 && errno == ENOENT;
+    int ok_c;
+    snprintf(path, sizeof path, "/proc/%d", (int)c);
+    ok_c = stat(path, &sb) == 0;
+    write(p[1], "x", 1); close(p[1]);
+    if (child_ok(c)) return 4;
+    if (!saw1 || !sawc || bad) return 5;
+    if (!hid_outer) return 6;
+    if (!ok_c) return 7;
+    return 0;
+}
+static int ub_listing(void) { g_outer = getpid(); return in_init(ib_listing); }
+PCASE(proc_listing, ub_listing)
+
+/* Outside reader sees host pid + 1, and three levels when nested. */
+static int ub_status_views(void)
+{
+    alarm(10);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    int up[2], dn[2], gp[2];
+    CHECK(pipe(up) == 0 && pipe(dn) == 0 && pipe(gp) == 0);
+    pid_t i = fork();
+    CHECK(i > 0 || i == 0);
+    if (i == 0) {
+        if (unshare(CLONE_NEWPID)) _exit(1);
+        pid_t g = fork();
+        if (g == 0) { char x; read(gp[0], &x, 1); _exit(0); }
+        if (g <= 0) _exit(2);
+        write(up[1], &g, sizeof g);
+        char x; read(dn[0], &x, 1);
+        write(gp[1], "x", 1);
+        int st; waitpid(g, &st, 0);
+        _exit(0);
+    }
+    pid_t g = 0;
+    CHECK(read(up[0], &g, sizeof g) == sizeof g);
+    char st[4096], v[64], path[64];
+    snprintf(path, sizeof path, "/proc/%d/status", (int)i);
+    CHECK(slurp(path, st, sizeof st) > 0);
+    CHECK(status_line(st, "NSpid", v, sizeof v) == 0 && ntabs(v) == 2);
+    char want[64]; snprintf(want, sizeof want, "%d\t1", (int)i);
+    CHECK(strcmp(v, want) == 0);
+    CHECK(status_line(st, "Pid", v, sizeof v) == 0 && atoi(v) == (int)i);
+    CHECK(status_line(st, "NStgid", v, sizeof v) == 0 && ntabs(v) == 2);
+    snprintf(path, sizeof path, "/proc/%d/status", (int)g);
+    CHECK(slurp(path, st, sizeof st) > 0);
+    CHECK(status_line(st, "NSpid", v, sizeof v) == 0 && ntabs(v) == 3);
+    write(dn[1], "x", 1);
+    int s2; waitpid(i, &s2, 0);
+    CHECK(WIFEXITED(s2) && WEXITSTATUS(s2) == 0);
+    return 0;
+}
+PCASE(status_views, ub_status_views)
+
+static int t_proc_self_tgid(void)
+{
+    char b[32] = {0};
+    ssize_t r = readlink("/proc/self", b, sizeof b - 1);
+    CHECK(r > 0 && atoi(b) == (int)getpid());
+    return 0;
+}
+
 static void reap(long r)
 {
     if (r == 0) _exit(0);
@@ -990,6 +1114,40 @@ static int t_netns_portspace(void)
     return 0;
 }
 
+static int t_netns_udp_bind(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
+    pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+    if (c == 0) {
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41031) };
+        int u = socket(AF_INET, SOCK_DGRAM, 0);
+        struct timeval tv = { 0, 300000 };
+        setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        char ok = bind(u, (void *)&a, sizeof a) == 0;
+        write(pfd[1], &ok, 1);
+        char x; read(qfd[0], &x, 1);               /* host has sent */
+        char buf[8];
+        ssize_t r = recv(u, buf, sizeof buf, 0);
+        char res = (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        write(pfd[1], &res, 1);
+        _exit(0);
+    }
+    CHECK(c > 0);
+    char ok = 0; CHECK(read(pfd[0], &ok, 1) == 1 && ok);
+    int h = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in d = { .sin_family = AF_INET, .sin_port = htons(41031) };
+    d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sendto(h, "hi", 2, 0, (void *)&d, sizeof d);
+    write(qfd[1], "x", 1);
+    char res = 0; CHECK(read(pfd[0], &res, 1) == 1 && res);   /* child got nothing */
+    int hb = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41031) };
+    CHECK(bind(hb, (void *)&a, sizeof a) == 0);               /* P free on the host */
+    int st; waitpid(c, &st, 0);
+    return 0;
+}
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -1004,11 +1162,13 @@ static int run_userns_cases(void)
         { "wait_inside", t_wait_inside }, { "siginfo_pid", t_siginfo_pid }, { "siginfo_outside", t_siginfo_outside },
         { "pthread_in_pidns", t_pthread_in_pidns }, { "nested", t_nested },
         { "pidns_leak", t_pidns_leak }, { "fork_enomem", t_fork_enomem },
+        { "proc_self_tgid", t_proc_self_tgid }, { "proc_self_init", t_proc_self_init },
+        { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
         { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
-        { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace },
+        { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();
