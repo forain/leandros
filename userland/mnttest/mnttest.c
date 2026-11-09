@@ -724,8 +724,6 @@ int main(int argc, char **argv) {
     hardening_suite();
     mountinfo_tests();
     pool_tests();
-}
-
     mount_userns_perm();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
