@@ -9303,7 +9303,7 @@ fn sys_mount(
     // A task in a mount namespace of its own mounts into that namespace's
     // tree only (and needs CAP_SYS_ADMIN over the namespace's owner).
     let mns = sched::current_mntns();
-    if mns != 0 { return sys_mount_ns(mns, source_ptr, target_ptr, fstype_ptr, flags); }
+    if mns != 0 { return sys_mount_ns(mns, source_ptr, target_ptr, fstype_ptr, flags, data_ptr); }
     // Every form of mount(2) needs CAP_SYS_ADMIN (Linux `may_mount`).
     // A devpts mount is also allowed to a task holding CAP_SYS_ADMIN in its
     // own user namespace (a container's runtime mounts its /dev/pts there).
@@ -9430,7 +9430,17 @@ fn sys_mount(
     // The tmpfs roots are built in: mounting tmpfs onto one sets its
     // nosuid/nodev/noexec flags (its contents stay). Elsewhere: EINVAL.
     if fstype_str == "tmpfs" {
-        return if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { 0 } else { -22 };
+        if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { return 0; }
+        // Anywhere else: a fresh instance, exposed as an alias mount. The
+        // alias holds the reference that keeps it alive; umount frees it.
+        let mp = target_path.ns_bytes();
+        if mp == b"/" { return -16; } // EBUSY
+        match kpath_is_dir(&target_path) { Ok(true) => {} Ok(false) => return -20, Err(e) => return e }
+        let (sb, root) = match tmpfs_new_instance(flags, data_ptr) { Ok(x) => x, Err(e) => return e };
+        vfs::mnt::sb_get(sb); // creator's reference, dropped below
+        let r = vfs::alias::add(mp, &root, "tmpfs", b"tmpfs");
+        vfs::mnt::sb_put(sb);
+        return match r { Ok(()) => 0, Err(e) => e as isize };
     }
     if fstype_str == "fuse" || fstype_str.starts_with("fuse.") {
         return sys_mount_fuse(source_str, target_path.bytes(), fstype_str, flags, data_ptr);
@@ -9548,7 +9558,26 @@ fn kpath_is_dir(kp: &KPath) -> Result<bool, isize> {
 /// (and rbind) and fresh tmpfs mounts, applied to that namespace's tree only.
 /// Remount, move and the propagation flags belong to lane M2; every other
 /// filesystem type to lane M5.
-fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fstype_ptr: usize, flags: usize) -> isize {
+/// A fresh tmpfs superblock for mount(2): parses `data` (mode=, uid=, gid=,
+/// size=; ids as the caller's user namespace names them), creates the backing
+/// instance and records nosuid/nodev/noexec and the size limit. Returns the
+/// superblock id (zero references: the caller attaches it) and its root.
+fn tmpfs_new_instance(flags: usize, data_ptr: usize) -> Result<(u32, Vec<u8>), isize> {
+    let data = if data_ptr == 0 { Vec::new() } else { copy_user_str(data_ptr, 1024)? };
+    let o = vfs::parse_tmpfs_opts(&data).map_err(|e| e as isize)?;
+    let uid = match o.uid { Some(v) => sched::ns::kid_from_view(0, v).ok_or(-22isize)?, None => sched::current_euid() };
+    let gid = match o.gid { Some(v) => sched::ns::kid_from_view(1, v).ok_or(-22isize)?, None => sched::current_egid() };
+    let mode = o.mode.unwrap_or(0o1777);
+    let (sb, _) = vfs::mnt::sb_create("tmpfs", Some(vfs::tmpfs_instance_destroy));
+    let root = match vfs::tmpfs_instance_create(sb, uid, gid, mode) {
+        Ok(r) => r,
+        Err(e) => { vfs::mnt::sb_put(sb); return Err(e as isize); }
+    };
+    vfs::tmpfs_instance_set_attr(sb, flags, o.size_pages);
+    Ok((sb, root))
+}
+
+fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fstype_ptr: usize, flags: usize, data_ptr: usize) -> isize {
     const MS_BIND: usize = 4096;
     const MS_REC: usize = 0x4000;
     const MS_REMOUNT: usize = 32;
@@ -9579,11 +9608,7 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
     let fstype = match read_user_short_str(fstype_ptr) { Ok(v) => v, Err(e) => return e };
     if &fstype[..] != b"tmpfs" { return -22; } // EINVAL: other filesystems are lane M5's
     if !tdir { return -20; }
-    let (sb, _) = vfs::mnt::sb_create("tmpfs", Some(vfs::tmpfs_instance_destroy));
-    let root = match vfs::tmpfs_instance_create(sb, sched::current_euid(), sched::current_egid()) {
-        Ok(r) => r,
-        Err(e) => { vfs::mnt::sb_put(sb); return e as isize; }
-    };
+    let (sb, root) = match tmpfs_new_instance(flags, data_ptr) { Ok(x) => x, Err(e) => return e };
     // Per-mount flags share their bit values with MS_RDONLY/NOSUID/NODEV/NOEXEC.
     let mflags = (flags as u8 & 0x0f) | vfs::mnt::MNT_RELATIME;
     let r = vfs::mnt::add_mount(mns, &tns, &root, sb, "tmpfs", b"tmpfs", mflags);

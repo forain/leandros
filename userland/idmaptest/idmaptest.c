@@ -17,6 +17,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <sys/un.h>
 #include <netinet/in.h>
 #include <time.h>
@@ -1327,6 +1328,146 @@ static int host_user_cannot_touch_subuid(void)
     return px_hostuser(c_hu_subuid);
 }
 
+
+/* ---- idperm-f2fs: the same gates on the f2fs root volume ------------------ */
+#define PXF "/idpx-f2fs"
+static int on_f2fs(void)
+{
+    struct statfs sf;
+    return statfs(PXF, &sf) == 0 && sf.f_type == 0xF2F52010;
+}
+static void px_clean_f2(void)
+{
+    (void)!system("rm -rf " PXF);
+    mkdir(PXF, 0777); chmod(PXF, 0777);
+}
+static int c_create_unmapped_f2(void)
+{
+    int fd = open(PXF "/n", O_CREAT | O_WRONLY, 0644);
+    CHECK(fd < 0 && errno == EOVERFLOW);
+    CHECK(mkdir(PXF "/nd", 0755) == -1 && errno == EOVERFLOW);
+    CHECK(symlink("x", PXF "/ns") == -1 && errno == EOVERFLOW);
+    return 0;
+}
+static int create_unmapped_eoverflow_f2(void)
+{
+    mkdir(PXF, 0777);
+    CHECK(on_f2fs());
+    px_clean_f2();
+    int r = px_run(c_create_unmapped_f2, NULL);
+    struct stat st;
+    CHECK(stat(PXF "/n", &st) == -1 && stat(PXF "/nd", &st) == -1);
+    return r;
+}
+
+/* -- ns root (kuid 100000, caps in the ns) over mapped / unmapped inodes -- */
+static int c_chown_mapped_f2(void)
+{
+    struct stat st;
+    CHECK(px_nsroot() == 0);
+    CHECK(chown(PXF "/f", 5, 42) == 0);
+    CHECK(stat(PXF "/f", &st) == 0 && st.st_uid == 5 && st.st_gid == 42);
+    return 0;
+}
+static int nsroot_chown_mapped_f2(void)
+{
+    if (!knob) return SKIP;
+    mkdir(PXF, 0777);
+    CHECK(on_f2fs());
+    px_clean_f2();
+    CHECK(px_mk(PXF "/f", 0, 100000, 100000, 0644) == 0);
+    CHECK(px_run(c_chown_mapped_f2, MAP100) == 0);
+    struct stat st;
+    CHECK(stat(PXF "/f", &st) == 0 && st.st_uid == 100005 && st.st_gid == 100042);
+    return 0;
+}
+
+static int c_chmod_sub_f2(void)
+{
+    struct stat st;
+    CHECK(px_nsroot() == 0);
+    CHECK(chmod(PXF "/f", 0644) == 0);
+    CHECK(stat(PXF "/f", &st) == 0 && (st.st_mode & 07777) == 0644);
+    return 0;
+}
+static int nsroot_chmod_subuid_file_f2(void)
+{
+    if (!knob) return SKIP;
+    mkdir(PXF, 0777);
+    CHECK(on_f2fs());
+    px_clean_f2();
+    CHECK(px_mk(PXF "/f", 0, 100007, 100007, 0600) == 0);
+    return px_run(c_chmod_sub_f2, MAP100);
+}
+
+static int c_write_sub_f2(void)
+{
+    CHECK(px_nsroot() == 0);
+    int fd = open(PXF "/d/f", O_RDWR); CHECK(fd >= 0);
+    CHECK(write(fd, "hi", 2) == 2); close(fd);
+    fd = open(PXF "/d/new", O_CREAT | O_WRONLY, 0600); CHECK(fd >= 0); close(fd);
+    CHECK(unlink(PXF "/d/f") == 0);
+    return 0;
+}
+static int nsroot_write_in_subuid_0700_dir_f2(void)
+{
+    if (!knob) return SKIP;
+    mkdir(PXF, 0777);
+    CHECK(on_f2fs());
+    px_clean_f2();
+    CHECK(px_mk(PXF "/d", 1, 100003, 100003, 0700) == 0);
+    CHECK(px_mk(PXF "/d/f", 0, 100003, 100003, 0600) == 0);
+    return px_run(c_write_sub_f2, MAP100);
+}
+
+static int c_untouchable_f2(void)
+{
+    CHECK(px_nsroot() == 0);
+    CHECK(open(PXF "/u", O_RDWR) == -1 && errno == EACCES);
+    CHECK(open(PXF "/u", O_RDONLY) == -1 && errno == EACCES);
+    CHECK(chmod(PXF "/u", 0777) == -1 && errno == EPERM);
+    CHECK(chown(PXF "/u", 5, -1) == -1 && errno == EPERM);
+    CHECK(open(PXF "/ud/f", O_RDONLY) == -1 && errno == EACCES);
+    CHECK(unlink(PXF "/ud/f") == -1 && errno == EACCES);
+    CHECK(open(PXF "/ud/new", O_CREAT | O_WRONLY, 0600) == -1 && errno == EACCES);
+    CHECK(chmod(PXF "/r", 0777) == -1 && errno == EPERM);   /* host-root-owned */
+    CHECK(px_setx(PXF "/u", "user.x", "1", 1) == -1);
+    CHECK(px_setx(PXF "/r", "trusted.x", "1", 1) == -1 && errno == EPERM);
+    return 0;
+}
+static int nsroot_cannot_touch_unmapped_f2(void)
+{
+    if (!knob) return SKIP;
+    mkdir(PXF, 0777);
+    CHECK(on_f2fs());
+    px_clean_f2();
+    CHECK(px_mk(PXF "/u", 0, 2000, 2000, 0600) == 0);
+    CHECK(px_mk(PXF "/ud", 1, 2000, 2000, 0700) == 0);
+    CHECK(px_mk(PXF "/ud/f", 0, 2000, 2000, 0600) == 0);
+    CHECK(px_mk(PXF "/r", 0, 0, 0, 0644) == 0);
+    return px_run(c_untouchable_f2, MAP100);
+}
+
+static int c_hu_subuid_f2(void)
+{
+    CHECK(open(PXF "/f", O_RDWR) == -1 && errno == EACCES);
+    CHECK(chmod(PXF "/f", 0666) == -1 && errno == EPERM);
+    CHECK(chown(PXF "/f", 1000, -1) == -1 && errno == EPERM);
+    CHECK(open(PXF "/d/f", O_RDONLY) == -1 && errno == EACCES);
+    return 0;
+}
+static int host_user_cannot_touch_subuid_f2(void)
+{
+    mkdir(PXF, 0777);
+    CHECK(on_f2fs());
+    px_clean_f2();
+    CHECK(px_mk(PXF "/f", 0, 100000, 100000, 0600) == 0);
+    CHECK(px_mk(PXF "/d", 1, 100000, 100000, 0700) == 0);
+    CHECK(px_mk(PXF "/d/f", 0, 100000, 100000, 0644) == 0);
+    return px_hostuser(c_hu_subuid_f2);
+}
+
+
 static int c_sticky(void)
 {
     CHECK(px_nsroot() == 0);
@@ -1473,11 +1614,17 @@ static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "trusted_xattr_host_only", trusted_xattr_host_only },
     { "fcap_xattr_eperm_in_ns", fcap_xattr_eperm_in_ns },
     { "create_unmapped_eoverflow", create_unmapped_eoverflow },
+    { "create_unmapped_eoverflow_f2fs", create_unmapped_eoverflow_f2 },
     { "nsroot_chown_mapped", nsroot_chown_mapped },
+    { "nsroot_chown_mapped_f2fs", nsroot_chown_mapped_f2 },
     { "nsroot_chmod_subuid_file", nsroot_chmod_subuid_file },
+    { "nsroot_chmod_subuid_file_f2fs", nsroot_chmod_subuid_file_f2 },
     { "nsroot_write_in_subuid_0700_dir", nsroot_write_in_subuid_0700_dir },
+    { "nsroot_write_in_subuid_0700_dir_f2fs", nsroot_write_in_subuid_0700_dir_f2 },
     { "nsroot_cannot_touch_unmapped", nsroot_cannot_touch_unmapped },
+    { "nsroot_cannot_touch_unmapped_f2fs", nsroot_cannot_touch_unmapped_f2 },
     { "host_user_cannot_touch_subuid", host_user_cannot_touch_subuid },
+    { "host_user_cannot_touch_subuid_f2fs", host_user_cannot_touch_subuid_f2 },
     { "sticky_fowner_ns", sticky_fowner_ns },
     { "scm_creds_in_translate", scm_creds_in_translate },
     { "scm_creds_unmapped_einval", scm_creds_unmapped_einval },
