@@ -321,6 +321,12 @@ static int in_ns_dying0(void) {
     return slurp("/proc/mntselftest", buf, sizeof buf) > 0 && strstr(buf, "ns_dying=0") != NULL;
 }
 
+static int vm_child(void *arg) {
+    (void)arg;
+    execl("/bin/mnttest", "/bin/mnttest", "child-ok", (char *)NULL);
+    _exit(97);
+}
+
 static void hardening_suite(void) {
     char sq[64];
     int st = 0;
@@ -407,8 +413,8 @@ static void hardening_suite(void) {
     report("ns_private_slave_noop", WIFEXITED(st) && WEXITSTATUS(st) == 0);
 
     /* clone(NEWNS|VM|VFORK) as Linux allows */
-    pid = (pid_t)syscall(SYS_clone, CLONE_NEWNS | CLONE_VM | 0x4000UL /* CLONE_VFORK */ | SIGCHLD, 0, 0, 0, 0);
-    if (pid == 0) { execl("/bin/mnttest", "/bin/mnttest", "child-ok", (char *)NULL); _exit(97); }
+    static char vmstack[16384] __attribute__((aligned(16)));
+    pid = (pid_t)clone(vm_child, vmstack + sizeof vmstack, CLONE_NEWNS | CLONE_VM | CLONE_VFORK | SIGCHLD, NULL);
     int okvm = 0;
     if (pid > 0 && waitpid(pid, &st, 0) > 0) okvm = WIFEXITED(st) && WEXITSTATUS(st) == 42;
     report("clone_newns_vm", okvm);

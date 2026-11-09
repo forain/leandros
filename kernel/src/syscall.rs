@@ -17040,7 +17040,7 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
         if flags & CLONE_THREAD == 0 && !vfs::fd_table_slot_free() { return -11; }
         let mut child = 0u32;
         let mut threaded = 0u32;
-        let ret = clone_thread(flags, req.set_tid, child_stack, tls, ptid, ctid, frame_ptr, |child_pid| {
+        let ret = clone_thread(flags, req.set_tid, child_stack, tls, ptid, ctid, frame_ptr, req.mntns, |child_pid| {
             // Real CLONE_THREAD siblings (pthread_create) share the leader's
             // tgid and, today, have no fd table of their own at all — every
             // VFS call from such a thread already resolves fds by its own

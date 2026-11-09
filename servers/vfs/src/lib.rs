@@ -2202,7 +2202,7 @@ pub fn fd_epoll_eperm(pid: u32, fd: usize) -> bool {
             let tmp = TMP_FILES.lock();
             let e = &tmp[idx];
             let path = e.path();
-            e.in_use() && !e.ephemeral() && !path.starts_with(b"/tmp/.") && !path.starts_with(b"/tmp/dmabuf")
+            e.in_use() && !e.ephemeral() && !path.starts_with(b"/tmp/.") && !path.starts_with(b"/.leandros-sb/") && !path.starts_with(b"/tmp/dmabuf")
         }
         VnodeKind::MountedFile { .. } => {
             let mut buf = [0u8; 128];
@@ -5012,6 +5012,8 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
        // rides /tmp/. Intercept /run before the mount table so it lands on
        // tmpfs, not the pivoted F2FS root.
        || path == b"/run" || path.starts_with(b"/run/")
+       // Namespace tmpfs instances (hidden pool).
+       || path == TMPFS_INST_PARENT || path == TMPFS_INST_DIR || path.starts_with(b"/.leandros-sb/tmpfs/")
        // Only the synthesized `/sys/class/block` subtree. Like /proc it is not
        // a mount and must be intercepted before `find_mount_port()`, which
        // matches every absolute path once init has pivot_root'ed the F2FS
