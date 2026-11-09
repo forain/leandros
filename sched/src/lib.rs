@@ -2964,7 +2964,8 @@ pub fn set_current_groups(groups: &[u32]) -> bool {
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
     if let Some(t) = rq.find_pid_mut(pid) {
-        if t.euid != 0 { return false; }
+        if !setid_priv(t, true) { return false; }
+        if groups.iter().any(|&g| !ns::mapped(1, t.userns.id(), g)) { return false; }
         let n = groups.len().min(task::NGROUPS_MAX);
         t.groups[..n].copy_from_slice(&groups[..n]);
         t.ngroups = n as u8;
@@ -3051,6 +3052,14 @@ pub fn set_dumpable(v: bool) {
     for_each_thread_mut(&mut rq, tgid, |t| t.dumpable = v);
 }
 
+/// May `t` change uids (`gid == false`, CAP_SETUID) or gids (CAP_SETGID)
+/// freely? Initial namespace: euid 0 (as before). In a user namespace the
+/// capability held there decides; targets are limited to mapped ids by the
+/// syscall layer (`ns::ids_mapped`), so privilege never reaches unmapped ids.
+pub(crate) fn setid_priv(t: &task::Task, gid: bool) -> bool {
+    if t.userns.id() == 0 { t.euid == 0 } else { t.caps[0] >> (if gid { 6 } else { 7 }) & 1 != 0 }
+}
+
 /// setresuid(2) semantics. Each argument u32::MAX (-1) means "leave unchanged".
 /// A privileged caller (euid==0 on entry) may set each id to any value; an
 /// unprivileged caller may set each id only to one of its current real,
@@ -3063,7 +3072,7 @@ pub fn set_current_resuid(ruid: u32, euid: u32, suid: u32) -> bool {
     let before = match rq.find_pid_mut(pid) {
         Some(t) => {
             let (cur_r, cur_e, cur_s) = (t.uid, t.euid, t.suid);
-            let priv_ = cur_e == 0;
+            let priv_ = setid_priv(t, false);
             let allowed = |v: u32| v == cur_r || v == cur_e || v == cur_s;
             if !priv_ {
                 if ruid != u32::MAX && !allowed(ruid) { return false; }
@@ -3092,7 +3101,7 @@ pub fn set_current_resgid(rgid: u32, egid: u32, sgid: u32) -> bool {
     let before = match rq.find_pid_mut(pid) {
         Some(t) => {
             let (cur_r, cur_e, cur_s) = (t.gid, t.egid, t.sgid);
-            let priv_ = t.euid == 0;
+            let priv_ = setid_priv(t, true);
             let allowed = |v: u32| v == cur_r || v == cur_e || v == cur_s;
             if !priv_ {
                 if rgid != u32::MAX && !allowed(rgid) { return false; }
@@ -3116,7 +3125,7 @@ pub fn set_current_resgid(rgid: u32, egid: u32, sgid: u32) -> bool {
 /// saved uid; an unprivileged caller may set only its effective uid, and only
 /// to its current real or saved uid. Returns false (⇒ EPERM) on violation.
 pub fn set_current_uid(new_uid: u32) -> bool {
-    if current_euid() == 0 {
+    if RUN_QUEUE.lock().find_pid(current_pid()).map(|t| setid_priv(t, false)).unwrap_or(false) {
         return set_current_resuid(new_uid, new_uid, new_uid);
     }
     let pid = current_pid();
@@ -3138,7 +3147,7 @@ pub fn set_current_uid(new_uid: u32) -> bool {
 
 /// setgid(2) semantics — mirrors [`set_current_uid`] for the group identity.
 pub fn set_current_gid(new_gid: u32) -> bool {
-    if current_euid() == 0 {
+    if RUN_QUEUE.lock().find_pid(current_pid()).map(|t| setid_priv(t, true)).unwrap_or(false) {
         return set_current_resgid(new_gid, new_gid, new_gid);
     }
     let pid = current_pid();
@@ -3169,7 +3178,9 @@ pub fn set_current_fsid(id: u32, gid: bool) -> u32 {
             let before = dump_ids(t);
             let (r, e, s, f) = if gid { (t.gid, t.egid, t.sgid, t.fsgid) }
                                else   { (t.uid, t.euid, t.suid, t.fsuid) };
-            if id != u32::MAX && (id == r || id == e || id == s || id == f || t.euid == 0) {
+            let kind = if gid { 1 } else { 0 };
+            let ok_ns = ns::mapped(kind, t.userns.id(), id);
+            if id != u32::MAX && ok_ns && (id == r || id == e || id == s || id == f || setid_priv(t, gid)) {
                 if gid { t.fsgid = id; } else { t.fsuid = id; }
             }
             (f, before)

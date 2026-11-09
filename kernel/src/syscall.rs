@@ -2254,16 +2254,16 @@ fn dispatch_inner(
         // number as GETPGID on AArch64, so only emit this arm on x86-64.
         #[cfg(target_arch = "x86_64")]
         GETPGRP     => sched::current_pgid() as isize,
-        SETUID => if sched::set_current_uid(a0 as u32) { 0 } else { -1 }, // EPERM
-        SETGID => if sched::set_current_gid(a0 as u32) { 0 } else { -1 }, // EPERM
-        SETRESUID => if sched::set_current_resuid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
-        SETRESGID => if sched::set_current_resgid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
+        SETUID => if !sched::ns::ids_mapped(0, &[a0 as u32]) { -22 } else if sched::set_current_uid(a0 as u32) { 0 } else { -1 }, // EPERM
+        SETGID => if !sched::ns::ids_mapped(1, &[a0 as u32]) { -22 } else if sched::set_current_gid(a0 as u32) { 0 } else { -1 }, // EPERM
+        SETRESUID => if !sched::ns::ids_mapped(0, &[a0 as u32, a1 as u32, a2 as u32]) { -22 } else if sched::set_current_resuid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
+        SETRESGID => if !sched::ns::ids_mapped(1, &[a0 as u32, a1 as u32, a2 as u32]) { -22 } else if sched::set_current_resgid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
         SETGROUPS => sys_setgroups(a0, a1),
         // Both answer the previous filesystem id, changed or not (Linux).
         SETFSUID => sched::set_current_fsid(a0 as u32, false) as isize,
         SETFSGID => sched::set_current_fsid(a0 as u32, true) as isize,
-        SETREUID  => sched::cred::set_re_ids(a0 as u32, a1 as u32, false),
-        SETREGID  => sched::cred::set_re_ids(a0 as u32, a1 as u32, true),
+        SETREUID  => if !sched::ns::ids_mapped(0, &[a0 as u32, a1 as u32]) { -22 } else { sched::cred::set_re_ids(a0 as u32, a1 as u32, false) },
+        SETREGID  => if !sched::ns::ids_mapped(1, &[a0 as u32, a1 as u32]) { -22 } else { sched::cred::set_re_ids(a0 as u32, a1 as u32, true) },
         GETRESUID   => sys_getresxid(a0, a1, a2, false),
         GETRESGID   => sys_getresxid(a0, a1, a2, true),
         GETGROUPS   => sys_getgroups(a0, a1),
@@ -9882,12 +9882,20 @@ fn sys_removexattr(target: usize, name: usize, is_fd: bool, nofollow: bool) -> i
 }
 
 fn sys_fchown(fd: usize, uid: usize, gid: usize) -> isize {
+    if !chown_ids_mapped(uid, gid) { return -22; } // EINVAL: unmapped in the caller's userns
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_FCHOWN, &[fd as u64, uid as u64, gid as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
+/// chown family ids are taken in the caller's namespace view; an id with no
+/// mapping there is EINVAL (-1 = leave unchanged).
+fn chown_ids_mapped(uid: usize, gid: usize) -> bool {
+    sched::ns::ids_mapped(0, &[uid as u32]) && sched::ns::ids_mapped(1, &[gid as u32])
+}
+
 fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, flags: usize) -> isize {
+    if !chown_ids_mapped(uid, gid) { return -22; }
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
     let tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LCHOWN } else { vfs::VFS_CHOWN };
