@@ -4434,7 +4434,6 @@ static RAMFS_DIRS: &[&[u8]] = &[
     // `handle_open` does not depend on it, but ttyname()'s readlink+stat
     // cross-check and `ls /dev/pts` do.
     b"/dev/pts",
-<<<<<<< HEAD
     // Backing directories of devpts mounts (see devpts.rs).
     b"/dev/.devpts",
     b"/dev/.devpts/1",
@@ -4453,9 +4452,7 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/dev/.devpts/14",
     b"/dev/.devpts/15",
     b"/dev/.devpts/16",
-=======
     b"/dev/mqueue",
->>>>>>> main
     b"/run",
     b"/run/user",
     b"/mnt",
