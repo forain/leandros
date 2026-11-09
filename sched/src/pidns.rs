@@ -228,6 +228,28 @@ pub fn reaper_for(dead: u32) -> u32 {
     crate::init_pid()
 }
 
+/// Linux find_new_reaper's subreaper walk: the nearest live ancestor of `dead`
+/// that is a child subreaper and lives in `dead`'s own pid namespace, else
+/// `default`. Never applies to a namespace init or the global init (they are
+/// reaped by their parent namespace's rules).
+pub fn subreaper_for(dead: u32, default: u32) -> u32 {
+    let rq = crate::RUN_QUEUE.lock();
+    let d = match rq.find_pid(dead) { Some(t) => t, None => return default };
+    let ns = d.pidns.id();
+    if dead == crate::init_pid() || (ns != 0 && ns::pid_init(ns) == dead) { return default; }
+    let mut cur = rq.find_pid(d.ppid).map(|p| p.tgid).unwrap_or(d.ppid);
+    for _ in 0..4096 {
+        if cur == 0 || cur == dead || cur == crate::init_pid() { break; }
+        let t = match rq.find_pid(cur) { Some(t) => t, None => break };
+        if t.pidns.id() != ns { break; }
+        if t.child_subreaper && t.state != crate::task::TaskState::Zombie { return cur; }
+        let next = rq.find_pid(t.ppid).map(|p| p.tgid).unwrap_or(t.ppid);
+        if next == cur { break; }
+        cur = next;
+    }
+    default
+}
+
 /// Init `tgid` of namespace `n` is dying: SIGKILL every other process in `n`
 /// and its descendants, then wait (bounded) until they are all zombies.
 pub fn zap(n: NsId, tgid: u32) {
@@ -267,9 +289,36 @@ pub fn zap(n: NsId, tgid: u32) {
     let deadline = crate::monotonic_ns().saturating_add(5_000_000_000);
     loop {
         collect(&mut victims);
-        if victims.is_empty() || crate::monotonic_ns() > deadline { return; }
+        if victims.is_empty() { return; }
+        if crate::monotonic_ns() > deadline {
+            warn_timeout(n, tgid, &victims);
+            return;
+        }
         kill(&victims);
         crate::irq_window();
         crate::yield_now("pidns_zap");
     }
+}
+
+/// Minimum spacing between two zap-timeout warnings.
+const ZAP_WARN_INTERVAL_NS: u64 = 10_000_000_000;
+static ZAP_WARN_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `zap` gave up with `victims` still alive: say so on the kernel log (rate
+/// limited to one line per 10 s) with the namespace id, the survivor count and
+/// the first few pids.
+fn warn_timeout(n: NsId, tgid: u32, victims: &[(u32, u32)]) {
+    use core::sync::atomic::Ordering;
+    let now = crate::monotonic_ns().max(1);
+    let last = ZAP_WARN_LAST.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < ZAP_WARN_INTERVAL_NS { return; }
+    if ZAP_WARN_LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() { return; }
+    let mut pids = alloc::string::String::new();
+    for &(tid, _) in victims.iter().take(8) {
+        use core::fmt::Write;
+        let _ = write!(pids, " {}", tid);
+    }
+    crate::klog_line(format_args!(
+        "[pidns] zap timeout: ns {} init {} still has {} live task(s), first:{}\n",
+        n, tgid, victims.len(), pids));
 }

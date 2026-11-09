@@ -1,200 +1,113 @@
 /*
- * ovltest -- overlayfs groundwork and (later) overlay semantics. Builds for
- * LeandrOS (zig cc -target <arch>-linux-musl -static) and for a Linux host.
+ * ovltest - overlayfs groundwork (lane ovlreal).
  *
- * Group O (lane ovlmknod): mknod(2) for chr/blk/fifo/sock nodes on f2fs and
- * tmpfs. Whiteouts (char 0:0) are open to everyone, other devices need
- * CAP_MKNOD, st_rdev / d_type / open() behave as on Linux.
- * Run as root; the unprivileged cases fork and drop to uid 1000.
+ *  1. /proc/sys/fs/ovl_selftest runs the kernel's real-op helpers
+ *     (servers/vfs/src/ovl/real.rs) as per-mount pseudo-pids with a captured
+ *     credential, on tmpfs (/tmp) and f2fs (/home): data, stat, symlink,
+ *     chmod/lchown, getdents, xattr round trip, ENODATA audit, and the
+ *     credential override (an unprivileged "mounter" gets EACCES / owns what
+ *     it creates). The kernel replies "RESULT pass=N fail=M" plus FAIL lines.
+ *  2. The user-visible xattr ENODATA audit: get/list/remove of an absent
+ *     user.* name on files and directories, every path/l/f variant, on tmpfs
+ *     and f2fs. Overlay's storage layer maps ONLY ENODATA to "absent".
+ *
+ * Runs as root. Builds for LeandrOS with zig cc -target <arch>-linux-musl.
  */
 #define _GNU_SOURCE
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
-#include <sys/syscall.h>
 #include <sys/types.h>
-#include <sys/un.h>
-#include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 static int npass, nfail;
-static char fsname[16];
-static int keep;
 
 static void check(const char *name, int ok)
 {
-    printf("%s %s [%s]\n", ok ? "PASS" : "FAIL", name, fsname);
+    printf("%s %s\n", ok ? "PASS" : "FAIL", name);
     if (ok) npass++; else nfail++;
 }
 
-static int dtype_of(const char *dir, const char *name)
+static void kernel_selftest(void)
 {
-    DIR *d = opendir(dir);
-    struct dirent *e;
-    int t = -1;
-    if (!d) return -2;
-    while ((e = readdir(d)))
-        if (!strcmp(e->d_name, name)) { t = e->d_type; break; }
-    closedir(d);
-    return t;
+    char buf[4096];
+    int fd = open("/proc/sys/fs/ovl_selftest", O_RDONLY);
+    if (fd < 0) { check("selftest_open", 0); return; }
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) { check("selftest_read", 0); return; }
+    buf[n] = 0;
+    char *res = strstr(buf, "RESULT pass=");
+    int pass = 0, fail = -1;
+    if (res) sscanf(res, "RESULT pass=%d fail=%d", &pass, &fail);
+    if (fail != 0) fputs(buf, stdout);
+    printf("  (kernel selftest: %d passed)\n", pass);
+    check("kernel_selftest_no_failures", res && fail == 0 && pass >= 60);
 }
 
-/* Run fn as uid 1000 in a child; returns its exit code. */
-static int as_user(int (*fn)(const char *), const char *base)
+#define NAME_N 96
+
+static void audit(const char *base, const char *tag)
 {
-    pid_t p = fork();
-    int st;
-    if (p == 0) {
-        if (setgid(1000) || setuid(1000)) _exit(90);
-        _exit(fn(base));
+    char dir[128], file[160], c[NAME_N], lbuf[256], vbuf[64];
+    snprintf(dir, sizeof dir, "%s/.ovltest", base);
+    snprintf(file, sizeof file, "%s/f", dir);
+    unlink(file);
+    rmdir(dir);
+    if (mkdir(dir, 0755) != 0) { snprintf(c, sizeof c, "%s_mkdir", tag); check(c, 0); return; }
+    int fd = open(file, O_RDWR | O_CREAT, 0644);
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (fd < 0 || dfd < 0) { snprintf(c, sizeof c, "%s_open", tag); check(c, 0); return; }
+
+    const char *paths[2] = { dir, file };
+    const char *kind[2] = { "dir", "file" };
+    int fds[2] = { dfd, fd };
+    for (int i = 0; i < 2; i++) {
+        const char *p = paths[i];
+        int f = fds[i];
+#define T(what, expr) do { snprintf(c, sizeof c, "%s_%s_%s", tag, kind[i], what); \
+                           errno = 0; check(c, (expr)); } while (0)
+        T("getxattr_absent",   getxattr(p, "user.absent", vbuf, sizeof vbuf) == -1 && errno == ENODATA);
+        T("lgetxattr_absent",  lgetxattr(p, "user.absent", vbuf, sizeof vbuf) == -1 && errno == ENODATA);
+        T("fgetxattr_absent",  fgetxattr(f, "user.absent", vbuf, sizeof vbuf) == -1 && errno == ENODATA);
+        T("getxattr_probe",    getxattr(p, "user.absent", NULL, 0) == -1 && errno == ENODATA);
+        T("removexattr_absent",  removexattr(p, "user.absent") == -1 && errno == ENODATA);
+        T("lremovexattr_absent", lremovexattr(p, "user.absent") == -1 && errno == ENODATA);
+        T("fremovexattr_absent", fremovexattr(f, "user.absent") == -1 && errno == ENODATA);
+        T("listxattr_empty",   listxattr(p, lbuf, sizeof lbuf) == 0);
+        T("llistxattr_empty",  llistxattr(p, lbuf, sizeof lbuf) == 0);
+        T("flistxattr_empty",  flistxattr(f, lbuf, sizeof lbuf) == 0);
+        T("listxattr_size0",   listxattr(p, NULL, 0) == 0);
+        /* round trip, then the name is absent again */
+        T("setxattr",          setxattr(p, "user.k", "v", 1, 0) == 0);
+        T("getxattr_present",  getxattr(p, "user.k", vbuf, sizeof vbuf) == 1 && vbuf[0] == 'v');
+        T("getxattr_other_absent", getxattr(p, "user.k2", vbuf, sizeof vbuf) == -1 && errno == ENODATA);
+        T("listxattr_has_name", listxattr(p, lbuf, sizeof lbuf) == 7 && !memcmp(lbuf, "user.k\0", 7));
+        T("removexattr_present", removexattr(p, "user.k") == 0);
+        T("getxattr_after_remove", getxattr(p, "user.k", vbuf, sizeof vbuf) == -1 && errno == ENODATA);
+        T("removexattr_twice", removexattr(p, "user.k") == -1 && errno == ENODATA);
+        T("listxattr_after",   listxattr(p, lbuf, sizeof lbuf) == 0);
+        /* absent name in a non-user namespace is also "absent", not "unsupported" */
+        T("security_absent",   getxattr(p, "security.ovltest", vbuf, sizeof vbuf) == -1 && errno == ENODATA);
+        T("trusted_overlay_absent", getxattr(p, "trusted.overlay.opaque", vbuf, sizeof vbuf) == -1 && errno == ENODATA);
+#undef T
     }
-    if (p < 0 || waitpid(p, &st, 0) < 0 || !WIFEXITED(st)) return -1;
-    return WEXITSTATUS(st);
+    close(fd);
+    close(dfd);
+    unlink(file);
+    rmdir(dir);
 }
 
-/* Child: bit i of the exit code = case i passed. */
-static int user_cases(const char *base)
+int main(void)
 {
-    char p[256];
-    struct stat st;
-    int r = 0;
-    snprintf(p, sizeof p, "%s/uwh", base);
-    if (mknod(p, S_IFCHR | 0600, makedev(0, 0)) == 0) r |= 1;
-    if (lstat(p, &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == 0 && st.st_uid == 1000) r |= 2;
-    snprintf(p, sizeof p, "%s/uchr", base);
-    if (mknod(p, S_IFCHR | 0600, makedev(1, 3)) < 0 && errno == EPERM) r |= 4;
-    snprintf(p, sizeof p, "%s/ublk", base);
-    if (mknod(p, S_IFBLK | 0600, makedev(7, 0)) < 0 && errno == EPERM) r |= 8;
-    snprintf(p, sizeof p, "%s/ufifo", base);
-    if (mknod(p, S_IFIFO | 0600, 0) == 0 && lstat(p, &st) == 0 && S_ISFIFO(st.st_mode)) r |= 16;
-    snprintf(p, sizeof p, "%s/usock", base);
-    if (mknod(p, S_IFSOCK | 0600, 0) == 0 && lstat(p, &st) == 0 && S_ISSOCK(st.st_mode)) r |= 32;
-    snprintf(p, sizeof p, "%s/udir", base);
-    if (mknod(p, S_IFDIR | 0700, 0) < 0 && errno == EPERM) r |= 64;
-    return r;
-}
-
-static void run_group(const char *base0, const char *label)
-{
-    char base[256], p[300], q[300];
-    struct stat st;
-    int fd, r;
-
-    snprintf(fsname, sizeof fsname, "%s", label);
-    snprintf(base, sizeof base, "%s/ovltest.%d", base0, (int)getpid());
-    mkdir(base, 0777);
-    chmod(base, 01777);
-
-    /* root: whiteout */
-    snprintf(p, sizeof p, "%s/wh", base);
-    check("O1 root mknod whiteout 0:0", mknod(p, S_IFCHR | 0600, 0) == 0);
-    check("O2 whiteout is S_IFCHR rdev 0",
-          lstat(p, &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == 0 && (st.st_mode & 07777) == 0600);
-    errno = 0;
-    check("O3 open whiteout -> ENXIO", open(p, O_RDONLY) < 0 && errno == ENXIO);
-    check("O4 getdents d_type DT_CHR", dtype_of(base, "wh") == DT_CHR);
-    check("O5 mknod over existing -> EEXIST",
-          mknod(p, S_IFCHR | 0600, 0) < 0 && errno == EEXIST);
-
-    /* unprivileged */
-    r = as_user(user_cases, base);
-    check("O6 user whiteout allowed", r >= 0 && (r & 1));
-    check("O7 user whiteout stat chr rdev0 owner", r >= 0 && (r & 2));
-    check("O8 user chr 1:3 -> EPERM", r >= 0 && (r & 4));
-    check("O9 user blk -> EPERM", r >= 0 && (r & 8));
-    check("O10 user fifo allowed", r >= 0 && (r & 16));
-    check("O11 user socket allowed", r >= 0 && (r & 32));
-    check("O12 mknod S_IFDIR -> EPERM", r >= 0 && (r & 64));
-
-    /* root: real device nodes reach the driver */
-    snprintf(p, sizeof p, "%s/null", base);
-    check("O13 root mknod chr 1:3", mknod(p, S_IFCHR | 0666, makedev(1, 3)) == 0);
-    check("O14 chr stat rdev 1:3",
-          stat(p, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 && minor(st.st_rdev) == 3);
-    fd = open(p, O_RDWR);
-    check("O15 open chr 1:3 acts as /dev/null",
-          fd >= 0 && write(fd, "abc", 3) == 3 && read(fd, q, 8) == 0);
-    if (fd >= 0) close(fd);
-    snprintf(p, sizeof p, "%s/zero", base);
-    mknod(p, S_IFCHR | 0666, makedev(1, 5));
-    fd = open(p, O_RDONLY);
-    memset(q, 0xff, 8);
-    check("O16 open chr 1:5 acts as /dev/zero", fd >= 0 && read(fd, q, 4) == 4 && !q[0] && !q[3]);
-    if (fd >= 0) close(fd);
-    snprintf(p, sizeof p, "%s/big", base);
-    check("O17 big dev_t mknod+stat roundtrip",
-          mknod(p, S_IFCHR | 0600, makedev(300, 70000)) == 0 && lstat(p, &st) == 0
-          && major(st.st_rdev) == 300 && minor(st.st_rdev) == 70000);
-    errno = 0;
-    check("O18 open chr unknown major -> ENXIO", open(p, O_RDONLY) < 0 && errno == ENXIO);
-    snprintf(p, sizeof p, "%s/blk", base);
-    check("O19 root mknod blk 7:0", mknod(p, S_IFBLK | 0660, makedev(7, 0)) == 0);
-    check("O20 blk stat S_IFBLK rdev 7:0 (stat)",
-          lstat(p, &st) == 0 && S_ISBLK(st.st_mode) && major(st.st_rdev) == 7 && minor(st.st_rdev) == 0);
-    snprintf(p, sizeof p, "%s/fifo", base);
-    check("O21 root mknod fifo", mknod(p, S_IFIFO | 0644, 0) == 0 && lstat(p, &st) == 0 && S_ISFIFO(st.st_mode));
-    snprintf(p, sizeof p, "%s/sock", base);
-    check("O22 root mknod socket", mknod(p, S_IFSOCK | 0644, 0) == 0 && lstat(p, &st) == 0 && S_ISSOCK(st.st_mode));
-    check("O23 getdents d_type BLK/FIFO/SOCK",
-          dtype_of(base, "blk") == DT_BLK && dtype_of(base, "fifo") == DT_FIFO
-          && dtype_of(base, "sock") == DT_SOCK && dtype_of(base, "null") == DT_CHR);
-    {
-        struct sockaddr_un a;
-        int s = socket(AF_UNIX, SOCK_STREAM, 0);
-        memset(&a, 0, sizeof a);
-        a.sun_family = AF_UNIX;
-        snprintf(a.sun_path, sizeof a.sun_path, "%s", p);
-        errno = 0;
-        /* AF_UNIX connect only resolves tmpfs nodes (see unix_resolve_node):
-         * on f2fs a listener-less node reads as ENOENT, not ECONNREFUSED. */
-        check("O24 connect to listener-less socket node fails (ECONNREFUSED)",
-              connect(s, (struct sockaddr *)&a, sizeof a) < 0
-              && (errno == ECONNREFUSED || (errno == ENOENT && !strcmp(fsname, "f2fs"))));
-        close(s);
-    }
-
-    /* unlink / rename */
-    snprintf(p, sizeof p, "%s/wh", base);
-    snprintf(q, sizeof q, "%s/file", base);
-    fd = open(q, O_CREAT | O_WRONLY, 0644);
-    if (fd >= 0) { write(fd, "x", 1); close(fd); }
-    check("O25 rename whiteout over regular file",
-          rename(p, q) == 0 && lstat(q, &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == 0
-          && lstat(p, &st) < 0);
-    check("O26 unlink whiteout", unlink(q) == 0 && lstat(q, &st) < 0 && errno == ENOENT);
-    snprintf(p, sizeof p, "%s/null", base);
-    snprintf(q, sizeof q, "%s/null2", base);
-    check("O27 rename keeps chr rdev",
-          rename(p, q) == 0 && lstat(q, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 && minor(st.st_rdev) == 3);
-    check("O28 link keeps chr rdev",
-          (snprintf(p, sizeof p, "%s/nulllink", base), link(q, p)) == 0
-          && lstat(p, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 && st.st_nlink == 2);
-
-    /* cleanup (skipped with argv[1]=keep so an image can be checked on Linux) */
-    if (keep) return;
-    {
-        const char *names[] = { "nulllink", "null2", "zero", "big", "blk", "fifo", "sock",
-                                "uwh", "ufifo", "usock", "wh", "file" };
-        unsigned i;
-        for (i = 0; i < sizeof names / sizeof *names; i++) {
-            snprintf(p, sizeof p, "%s/%s", base, names[i]);
-            unlink(p);
-        }
-        check("O29 cleanup: rmdir after unlinking every node", rmdir(base) == 0);
-    }
-}
-
-int main(int argc, char **argv)
-{
-    keep = argc > 1 && !strcmp(argv[1], "keep");
-    run_group("/home", "f2fs");
-    run_group("/tmp", "tmpfs");
+    if (geteuid() != 0) { printf("SKIP: not root\n"); return 0; }
+    kernel_selftest();
+    audit("/tmp", "tmpfs");
+    audit("/home", "f2fs");
     printf("ovltest: %d passed, %d failed\n", npass, nfail);
-    return nfail ? 1 : 0;
+    return nfail != 0;
 }
