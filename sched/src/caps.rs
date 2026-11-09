@@ -36,6 +36,26 @@ pub fn host_capable(cap: u32) -> bool {
             .map(|t| t.userns.id() == 0 && t.caps[0] >> cap & 1 != 0).unwrap_or(false)
 }
 
+/// Linux `cap_capable` walk for a credential snapshot (user namespace `cns`,
+/// kuid `euid`, effective caps `caps`) against `target` namespace.
+pub fn capable_snap(cns: crate::ns::NsId, euid: u32, caps: u64, target: crate::ns::NsId, cap: u32) -> bool {
+    if cap > CAP_LAST { return false; }
+    let mut ns = target;
+    loop {
+        if ns == cns { return caps >> cap & 1 != 0; }
+        if crate::ns::level(ns) <= crate::ns::level(cns) { return false; }
+        if crate::ns::parent(ns) == cns && crate::ns::owner(ns).0 == euid { return true; }
+        ns = crate::ns::parent(ns);
+    }
+}
+
+/// Does the calling thread hold `cap` over user namespace `target_ns`: it has
+/// the cap in an ancestor namespace, or owns a namespace whose parent is its own.
+pub fn ns_capable_in(target_ns: crate::ns::NsId, cap: u32) -> bool {
+    RUN_QUEUE.lock().find_pid(current_pid())
+        .map(|t| capable_snap(t.userns.id(), t.euid, t.caps[0], target_ns, cap)).unwrap_or(false)
+}
+
 /// Historic name of `ns_capable`.
 pub fn capable(cap: u32) -> bool { ns_capable(cap) }
 

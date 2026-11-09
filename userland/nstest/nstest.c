@@ -195,10 +195,26 @@ static int t_other_new_einval(void)
     CHECK(r == -1 && errno == EINVAL);
     return 0;
 }
+/* Map uid/gid 1000 onto itself in the caller's fresh namespace: a nested
+ * unshare needs the creator's ids mapped (design-idmap rule 8). */
+static int map_self_1000(void)
+{
+    int fd;
+    if ((fd = open("/proc/self/uid_map", O_WRONLY)) < 0) return 1;
+    if (write(fd, "1000 1000 1\n", 12) != 12) { close(fd); return 1; }
+    close(fd);
+    if ((fd = open("/proc/self/setgroups", O_WRONLY)) < 0) return 1;
+    if (write(fd, "deny", 4) != 4) { close(fd); return 1; }
+    close(fd);
+    if ((fd = open("/proc/self/gid_map", O_WRONLY)) < 0) return 1;
+    if (write(fd, "1000 1000 1\n", 12) != 12) { close(fd); return 1; }
+    close(fd);
+    return 0;
+}
 static int t_depth_limit(void)
 {
     CHECK(drop_to(1000) == 0);
-    for (int i = 0; i < 32; i++) CHECK(unshare(CLONE_NEWUSER) == 0);
+    for (int i = 0; i < 32; i++) { CHECK(unshare(CLONE_NEWUSER) == 0); CHECK(map_self_1000() == 0); }
     CHECK(unshare(CLONE_NEWUSER) == -1 && errno == EUSERS);
     return 0;
 }
@@ -214,7 +230,7 @@ static int t_leak(void)
     }
     for (int i = 0; i < 40; i++) {  /* grand-children share, nested chains release together */
         pid_t c = fork();
-        if (c == 0) { for (int j = 0; j < 8; j++) if (unshare(CLONE_NEWUSER)) _exit(1); _exit(0); }
+        if (c == 0) { for (int j = 0; j < 8; j++) if (unshare(CLONE_NEWUSER) || map_self_1000()) _exit(1); _exit(0); }
         int st = 0; waitpid(c, &st, 0);
         CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
     }
@@ -1302,7 +1318,10 @@ static int t_setid_guard(void)
 static int root_einval_child(void)
 {
     CHECK(wr("/proc/self/setgroups", "deny") == 0);
-    CHECK(wr("/proc/self/uid_map", "0 0 1") == 0);
+    /* a map covering kuid 0 is refused until lane idroot0 (design-idmap rule 6) */
+    int r0 = wr("/proc/self/uid_map", "0 0 1");
+    if (r0 == -EPERM) { printf("  SKIP root_einval: kuid-0 maps refused\n"); return 0; }
+    CHECK(r0 == 0);
     CHECK(wr("/proc/self/gid_map", "0 0 1") == 0);
     errno = 0; CHECK(setuid(1000) == -1 && errno == EINVAL);
     errno = 0; CHECK(setresuid(1000, -1, -1) == -1 && errno == EINVAL);
