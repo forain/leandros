@@ -668,6 +668,7 @@ pub fn clone_thread(
     ptid:        usize,
     ctid:        usize,
     frame_ptr:   usize,
+    mntns:       crate::ns::NsId,
     before_enqueue: impl FnOnce(u32),
 ) -> isize {
     #[allow(dead_code)]
@@ -783,6 +784,8 @@ pub fn clone_thread(
         let (pnet, pipc) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.netns.id(), t.ipcns.id())).unwrap_or((0, 0));
         let pmnt = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.mntns.id()).unwrap_or(0);
+        // CLONE_NEWNS|CLONE_VM (not a thread): the child starts in the new tree.
+        let pmnt = if mntns != 0 { mntns } else { pmnt };
         let putsns = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.utsns.id()).unwrap_or(0);
         let (pcg, pcgns) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.cgroup, t.cgns.id())).unwrap_or((0, 0));

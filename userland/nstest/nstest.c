@@ -49,7 +49,7 @@ static void check(const char *name, int ok)
 }
 
 static const struct { const char *n; unsigned long f; } flags[] = {
-    {"NEWNS", CLONE_NEWNS},
+    {"NEWTIME", 0x80},
 };
 
 static long do_clone(unsigned long fl)
@@ -184,13 +184,13 @@ static int t_unshare_threaded(void)
 }
 static int t_other_new_einval(void)
 {
-    int fl[] = { 0x00020000 };
+    int fl[] = { 0x80 }; /* CLONE_NEWTIME: still unimplemented */
     CHECK(drop_to(1000) == 0);
     for (unsigned i = 0; i < 1; i++) {
         CHECK(unshare(fl[i]) == -1 && errno == EINVAL);
-        long r = syscall(SYS_clone, SIGCHLD | fl[i], 0, 0, 0, 0);
+        long r = do_clone3(fl[i]);
         CHECK(r == -1 && errno == EINVAL);
-        r = syscall(SYS_clone, SIGCHLD | CLONE_NEWUSER | fl[i], 0, 0, 0, 0);
+        r = do_clone3(CLONE_NEWUSER | fl[i]);
         CHECK(r == -1 && errno == EINVAL);
     }
     /* NEWUSER excludes CLONE_FS */
@@ -2676,13 +2676,8 @@ int main(int argc, char **argv)
         char nm[64];
         long r;
 
-        errno = 0; r = do_clone(flags[i].f);
-        int e = errno; reap(r);
-        snprintf(nm, sizeof nm, "clone_%s_einval", flags[i].n);
-        check(nm, r == -1 && e == EINVAL);
-
         errno = 0; r = do_clone3(flags[i].f);
-        e = errno; reap(r);
+        int e = errno; reap(r);
         snprintf(nm, sizeof nm, "clone3_%s_einval", flags[i].n);
         check(nm, r == -1 && e == EINVAL);
 
