@@ -1317,8 +1317,12 @@ pub fn init_pid() -> Pid { INIT_PID.load(Ordering::Acquire) }
 /// shell died (jobtest's TOSTOP writer, left behind on both arches) stayed
 /// stopped for ever instead of getting SIGHUP + SIGCONT.
 fn reparent_children(dead_tgid: Pid) {
-    pidns::on_process_exit(dead_tgid);
-    let init = pidns::reaper_for(dead_tgid);
+    let init = if pidns::USED.load(core::sync::atomic::Ordering::Relaxed) {
+        pidns::on_process_exit(dead_tgid);
+        pidns::reaper_for(dead_tgid)
+    } else {
+        init_pid()
+    };
     if init == 0 || init == dead_tgid { return; }
     let mut cands = [0 as Pid; signal::ORPHAN_MAX_GROUPS];
     let mut nc = 0usize;
