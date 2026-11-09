@@ -357,6 +357,39 @@ static void status_groups(void) {
     else fail(n, "child status %#x (13: a group missing, 14: no Threads: line = truncated)", st);
 }
 
+/* /sys/devices/system/cpu and /sys/devices/cpu: Firefox's sandbox broker AddTree()s
+ * both (stat + S_ISDIR) and its content processes read present/possible/online. */
+static void sys_devices_cpu(void) {
+    const char *n = "sys_devices_cpu";
+    struct stat st;
+    static const char *dirs[] = { "/sys/devices/system/cpu", "/sys/devices/cpu", "/sys/devices/system/cpu/cpu0" };
+    for (int i = 0; i < 3; i++) {
+        if (stat(dirs[i], &st) != 0 || !S_ISDIR(st.st_mode)) { fail(n, "%s not a directory (errno %d)", dirs[i], errno); return; }
+    }
+    static const char *files[] = { "present", "possible", "online", "kernel_max" };
+    char path[128], buf[64];
+    long onln = sysconf(_SC_NPROCESSORS_ONLN);
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/%s", files[i]);
+        ssize_t r = read_whole(path, buf, sizeof buf - 1);
+        if (r <= 0) { fail(n, "%s unreadable (%zd, errno %d)", path, r, errno); return; }
+        buf[r] = 0;
+        if (i == 3) { if (atol(buf) != onln - 1) { fail(n, "kernel_max '%s' vs %ld cpus", buf, onln); return; } }
+        else {
+            char want[32];
+            snprintf(want, sizeof want, "0-%ld\n", onln - 1);
+            if (onln > 1 ? strcmp(buf, want) != 0 : strcmp(buf, "0\n") != 0) { fail(n, "%s = '%s' (%ld cpus)", path, buf, onln); return; }
+        }
+    }
+    DIR *d = opendir("/sys/devices/system/cpu");
+    int saw0 = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d))) if (!strcmp(e->d_name, "cpu0")) saw0 = 1;
+    if (d) closedir(d);
+    if (!saw0) { fail(n, "cpu0 not listed"); return; }
+    pass(n);
+}
+
 static void sysstat_whole(void) {
     const char *n = "sysstat_whole";
     size_t cap = 16 << 20;
@@ -1415,6 +1448,7 @@ int main(int argc, char **argv) {
     vfork_exec_faults("/proc/self/exe");
 
     status_groups();
+    sys_devices_cpu();
     sysstat_whole();
     sysstat_subrows();
     lstat_magic();
