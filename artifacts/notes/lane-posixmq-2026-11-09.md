@@ -12,4 +12,4 @@ Status: FIXED (mq_open/mq_unlink/mq_timedsend/mq_timedreceive/mq_notify/mq_getse
 - Not supported: SIGEV_THREAD (EINVAL; it needs a libc helper thread); sysctl values are not writable.
 
 Evidence: userland/mqtest (musl-linked, raw syscalls) fails with MQ_OPEN dispatch disabled (RC=51) and passes
-with it restored (0 failed, aarch64). Default aarch64 regress and x86_64 box regress results: see lane report.
+with it restored (0 failed, aarch64). Default aarch64 regress (Mac, HVF) and x86_64 box regress: all green except host:vfstagtest.py (wake-count case), which failed under full-suite load on both arches and passed on a solo rerun on both.
