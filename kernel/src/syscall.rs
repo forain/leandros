@@ -10432,7 +10432,12 @@ fn sys_chdir(path_ptr: usize) -> isize {
     // fchdir(N), not a cwd inside /proc.
     if let Some((fd, b"")) = proc_own_fd(path.bytes()) { return sys_fchdir(fd); }
     // chdir("/proc/<pid>/cwd|root") follows the magic link; another user's is EACCES.
+    // The link target is another live process's cwd/root, reached by the magic
+    // jump rather than a walk, so it needs no search-permission probe.
+    let magic = proc_magic(path.bytes(), b"cwd").map_or(false, |(_, r)| r.is_empty())
+        || proc_magic(path.bytes(), b"root").map_or(false, |(_, r)| r.is_empty());
     let path = match follow_magic_final(path) { Ok(p) => p, Err(e) => return e };
+    if magic { sched::set_cwd(path.ns_bytes()); return 0; }
 
     // Check the target exists by opening it O_RDONLY. Probe the *resolved*
     // path: re-resolving the user pointer here would repeat the work, and
