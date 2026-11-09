@@ -33,8 +33,11 @@ static LO_UP: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 pub fn lo_admin_up(id: NsId) -> bool { id != 0 && LO_UP[id as usize].load(Acquire) != 0 }
 pub fn set_lo_admin_up(id: NsId, up: bool) { if id != 0 { LO_UP[id as usize].store(up as u8, Release); } }
 
-/// Identity-only uid/gid maps: up to `MAP_EXT` extents per namespace, each
-/// `[inside, outside, count]` (inside == outside is enforced on write).
+/// uid/gid maps stored COMPOSED: up to `MAP_EXT` extents per namespace, each
+/// `[upper_first, lower_kuid_first, count]` where the lower id is already a
+/// kernel id (translated through the parent map at write time), so a
+/// translation is one lookup at any nesting depth. While `idmap_real()` is
+/// false the write path only accepts identity extents.
 pub const MAP_EXT: usize = 5;
 static MAP_DATA: [[AtomicU32; NS_MAX * MAP_EXT * 3]; 2] =
     [[ZERO32; NS_MAX * MAP_EXT * 3], [ZERO32; NS_MAX * MAP_EXT * 3]];
@@ -87,6 +90,9 @@ fn put(mut id: NsId) {
 /// The returned reference is the caller's; clone it for each holder.
 /// Errors are negative errnos: EUSERS (87) too deep, ENOSPC (28) table full.
 pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
+    // Linux create_user_ns: the creator's euid and egid must be mapped in its
+    // own (current) namespace, else EPERM (rule 8).
+    if from_k(0, parent, euid).is_none() || from_k(1, parent, egid).is_none() { return Err(-1); }
     let level = if parent == 0 { 0 } else { LEVEL[parent as usize].load(Acquire) };
     if level >= MAX_USERNS_LEVEL { return Err(-87); }
     for id in 1..NS_MAX {
@@ -97,7 +103,8 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
             LEVEL[id].store(level + 1, Release);
             MAP_N[0][id].store(0, Release);
             MAP_N[1][id].store(0, Release);
-            SETGROUPS_DENY[id].store(0, Release);
+            // setgroups=deny is inherited from the parent (rule 7).
+            SETGROUPS_DENY[id].store(if parent != 0 { SETGROUPS_DENY[parent as usize].load(Acquire) } else { 0 }, Release);
             OWNER_EUID[id].store(euid, Release);
             OWNER_EGID[id].store(egid, Release);
             return Ok(NsRef(id as NsId));
@@ -375,30 +382,92 @@ fn ext(kind: usize, id: usize, i: usize) -> (u32, u32, u32) {
     (MAP_DATA[kind][b].load(Acquire), MAP_DATA[kind][b + 1].load(Acquire), MAP_DATA[kind][b + 2].load(Acquire))
 }
 
-/// Is kernel id `kid` mapped in namespace `ns` (id 0 maps everything)?
-pub fn mapped(kind: usize, ns: NsId, kid: u32) -> bool {
-    if ns == 0 { return true; }
+/// Set once the composed maps may be non-identity for everyone. While false,
+/// `write_map` still refuses `upper != lower` unless the `idmap=test` knob is on.
+pub const IDMAP_REAL: bool = false;
+static IDMAP_TEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Kernel cmdline `idmap=test`: exercise real maps before the flip. It never
+/// lifts the kuid-0 refusal.
+pub fn set_idmap_test() { IDMAP_TEST.store(true, Release); }
+pub fn idmap_real() -> bool { IDMAP_REAL || IDMAP_TEST.load(Acquire) }
+
+/// Namespace id `id` -> kernel id through namespace `ns` (None if unmapped or
+/// `id` is u32::MAX). Namespace 0 is the identity.
+pub fn to_k(kind: usize, ns: NsId, id: u32) -> Option<u32> {
+    if id == u32::MAX { return None; }
+    if ns == 0 { return Some(id); }
     let n = MAP_N[kind][ns as usize].load(Acquire) as usize;
-    (0..n).any(|i| { let (_, o, c) = ext(kind, ns as usize, i); kid >= o && (kid - o) < c })
+    for i in 0..n {
+        let (u, l, c) = ext(kind, ns as usize, i);
+        if id >= u && (id - u) < c { return Some(l + (id - u)); }
+    }
+    None
 }
 
-/// Every id of `ids` (u32::MAX = "leave unchanged" is skipped) is mapped in
-/// the caller's user namespace (kind 0 uid, 1 gid)? Unmapped targets of the
-/// set*id/chown family are EINVAL.
-pub fn ids_mapped(kind: usize, ids: &[u32]) -> bool {
-    let ns = current_userns();
-    ids.iter().all(|&i| i == u32::MAX || mapped(kind, ns, i))
+/// Kernel id `kid` -> the id namespace `ns` calls it (None if unmapped).
+pub fn from_k(kind: usize, ns: NsId, kid: u32) -> Option<u32> {
+    if ns == 0 { return Some(kid); }
+    let n = MAP_N[kind][ns as usize].load(Acquire) as usize;
+    for i in 0..n {
+        let (u, l, c) = ext(kind, ns as usize, i);
+        if kid >= l && (kid - l) < c { return Some(u + (kid - l)); }
+    }
+    None
 }
 
 /// Overflow id shown for ids with no mapping.
 pub const OVERFLOW_ID: u32 = 65534;
 
-/// The id `kid` as the calling task sees it (identity maps: itself, or the
-/// overflow id when unmapped in its user namespace).
-pub fn view_id(kind: usize, kid: u32) -> u32 {
+pub fn from_k_munged(kind: usize, ns: NsId, kid: u32) -> u32 { from_k(kind, ns, kid).unwrap_or(OVERFLOW_ID) }
+
+/// The kernel uid that is root (id 0) of `ns`, if mapped.
+pub fn root_k(ns: NsId) -> Option<u32> { to_k(0, ns, 0) }
+
+/// Is kernel id `kid` mapped in namespace `ns` (id 0 maps everything)?
+pub fn mapped(kind: usize, ns: NsId, kid: u32) -> bool { from_k(kind, ns, kid).is_some() }
+
+/// Every id of `ids` (u32::MAX = "leave unchanged" is skipped) is mapped in
+/// the caller's user namespace (kind 0 uid, 1 gid)? Thin wrapper kept so main
+/// compiles; it is a membership test, callers must still translate with
+/// `to_k` (lane idxlate removes it).
+pub fn ids_mapped(kind: usize, ids: &[u32]) -> bool {
     let ns = current_userns();
-    if mapped(kind, ns, kid) { kid } else { OVERFLOW_ID }
+    ids.iter().all(|&i| i == u32::MAX || mapped(kind, ns, i))
 }
+
+/// The id `kid` as the calling task sees it (overflow id when unmapped).
+pub fn view_id(kind: usize, kid: u32) -> u32 {
+    from_k_munged(kind, current_userns(), kid)
+}
+
+/// Copyable snapshot of a user namespace's maps (for credentials that must
+/// translate without touching the scheduler).
+#[derive(Clone, Copy)]
+pub struct IdView { pub ns: NsId, pub n: [u8; 2], pub ext: [[(u32, u32, u32); MAP_EXT]; 2] }
+impl IdView {
+    pub fn to_k(&self, kind: usize, id: u32) -> Option<u32> {
+        if id == u32::MAX { return None; }
+        if self.ns == 0 { return Some(id); }
+        (0..self.n[kind] as usize).find_map(|i| { let (u, l, c) = self.ext[kind][i]; if id >= u && id - u < c { Some(l + (id - u)) } else { None } })
+    }
+    pub fn from_k(&self, kind: usize, kid: u32) -> Option<u32> {
+        if self.ns == 0 { return Some(kid); }
+        (0..self.n[kind] as usize).find_map(|i| { let (u, l, c) = self.ext[kind][i]; if kid >= l && kid - l < c { Some(u + (kid - l)) } else { None } })
+    }
+    pub fn from_k_munged(&self, kind: usize, kid: u32) -> u32 { self.from_k(kind, kid).unwrap_or(OVERFLOW_ID) }
+}
+pub fn view_of_ns(ns: NsId) -> IdView {
+    let mut v = IdView { ns, n: [0; 2], ext: [[(0, 0, 0); MAP_EXT]; 2] };
+    if ns != 0 {
+        for k in 0..2 {
+            let n = (MAP_N[k][ns as usize].load(Acquire) as usize).min(MAP_EXT);
+            v.n[k] = n as u8;
+            for i in 0..n { v.ext[k][i] = ext(k, ns as usize, i); }
+        }
+    }
+    v
+}
+pub fn view_of(pid: u32) -> IdView { view_of_ns(userns_of(pid)) }
 
 fn put_num(v: u32, out: &mut [u8], n: &mut usize) {
     let mut d = [b' '; 10];
@@ -412,14 +481,26 @@ fn put_line(a: u32, b: u32, c: u32, out: &mut [u8], n: &mut usize) {
     put_num(c, out, n); if *n < out.len() { out[*n] = b'\n'; *n += 1; }
 }
 
-/// Text of uid_map (kind 0) / gid_map (kind 1) of user namespace `ns`.
-pub fn map_text(kind: usize, ns: NsId, out: &mut [u8]) -> usize {
+/// Text of uid_map (kind 0) / gid_map (kind 1) of user namespace `map_ns` as
+/// read from `reader_ns`: lower ids are shown in the reader's namespace (the
+/// parent's, when the reader sits in `map_ns` itself); unmapped -> 4294967295.
+pub fn map_text_for(kind: usize, map_ns: NsId, reader_ns: NsId, out: &mut [u8]) -> usize {
     let mut n = 0;
-    if ns == 0 { put_line(0, 0, u32::MAX, out, &mut n); return n; }
-    let c = MAP_N[kind][ns as usize].load(Acquire) as usize;
-    for i in 0..c { let (a, b, l) = ext(kind, ns as usize, i); put_line(a, b, l, out, &mut n); }
+    if map_ns == 0 { put_line(0, 0, u32::MAX, out, &mut n); return n; }
+    let l = if reader_ns == map_ns { parent(map_ns) } else { reader_ns };
+    let c = MAP_N[kind][map_ns as usize].load(Acquire) as usize;
+    for i in 0..c {
+        let (u, lk, cnt) = ext(kind, map_ns as usize, i);
+        put_line(u, from_k(kind, l, lk).unwrap_or(u32::MAX), cnt, out, &mut n);
+    }
     n
 }
+
+/// Text of the map as seen from the parent namespace.
+pub fn map_text(kind: usize, ns: NsId, out: &mut [u8]) -> usize { map_text_for(kind, ns, ns, out) }
+
+/// Has `ns` written its gid_map (setgroups(2) needs it, rule 7)? Namespace 0: always.
+pub fn gid_map_written(ns: NsId) -> bool { ns == 0 || MAP_N[1][ns as usize].load(Acquire) != 0 }
 
 pub fn setgroups_denied(ns: NsId) -> bool { ns != 0 && SETGROUPS_DENY[ns as usize].load(Acquire) != 0 }
 
@@ -464,13 +545,15 @@ fn rights(op: Opener, tns: NsId, kind: usize) -> (bool, bool, u32) {
     let Opener(wns, eu, eg, caps) = op;
     let cap: u32 = if kind == 0 { 7 } else { 6 };
     let has = caps >> cap & 1 != 0;
-    let (oe, og) = owner(tns);
-    let (me, owner_id) = if kind == 0 { (eu, oe) } else { (eg, og) };
-    let ownerish = me == owner_id;
+    let (oe, _) = owner(tns);
+    let me = if kind == 0 { eu } else { eg };
+    let ownerish = eu == oe;
     let in_ns = wns == tns;
     let in_parent = wns == parent(tns);
     let ok = (in_ns || in_parent) && (has || ownerish);
-    (ok, in_parent && has, me)
+    // CAP_SETUID / CAP_SETGID over the parent namespace (rule 5).
+    let privileged = crate::caps::capable_snap(wns, eu, caps, parent(tns), cap);
+    (ok, privileged, me)
 }
 
 fn parse_u32(s: &[u8]) -> Option<u32> {
@@ -480,22 +563,37 @@ fn parse_u32(s: &[u8]) -> Option<u32> {
     if v > u32::MAX as u64 { None } else { Some(v as u32) }
 }
 
+/// Translate the lower range `[lower, lower+count)` (given in the parent's
+/// view) to kernel ids; the whole range must lie in ONE parent extent.
+fn lower_to_k(par: NsId, lower: u32, count: u32, kind: usize) -> Option<u32> {
+    if par == 0 { return Some(lower); }
+    let n = MAP_N[kind][par as usize].load(Acquire) as usize;
+    for i in 0..n {
+        let (u, l, c) = ext(kind, par as usize, i);
+        if lower >= u && (lower as u64 + count as u64) <= u as u64 + c as u64 { return Some(l + (lower - u)); }
+    }
+    None
+}
+
 /// Write uid_map (kind 0) / gid_map (kind 1) of `target`'s user namespace on
-/// behalf of `writer`. Identity-only. Returns bytes consumed or -errno.
+/// behalf of `writer` (Linux map_write / new_idmap_permitted). Returns bytes
+/// consumed or -errno.
 pub fn write_map(opener: Opener, writer: u32, target: u32, kind: usize, data: &[u8]) -> isize {
     let _g = MapGuard::lock();
     let tns = userns_of(target);
     if tns == 0 { return -1; }
     let t = tns as usize;
     if MAP_N[kind][t].load(Acquire) != 0 { return -1; } // written once
-    // Both the opener (f_cred) and the writer must be permitted; the
-    // privileged branch needs both privileged, and both must be the same id.
+    // Rule 1: both the opener (f_cred) and the writer sit in the target
+    // namespace or its parent; the privileged branch needs both privileged,
+    // and both must be the same id.
     let (ok_o, priv_o, me_o) = rights(opener, tns, kind);
     let (ok_w, priv_w, me_w) = writer_rights(writer, tns, kind);
     if !ok_o || !ok_w { return -1; }
     let privileged = priv_o && priv_w;
     let me = me_o;
     if !privileged && me_w != me_o { return -1; }
+    // Rule 2: syntax, at most MAP_EXT lines, no u32::MAX, no wrap, no overlap.
     let mut exts = [(0u32, 0u32, 0u32); MAP_EXT];
     let mut n = 0usize;
     for line in data.split(|&c| c == b'\n') {
@@ -508,36 +606,41 @@ pub fn write_map(opener: Opener, writer: u32, target: u32, kind: usize, data: &[
             k += 1;
         }
         if k != 3 || f[2] == 0 { return -22; }
-        if (f[0] as u64 + f[2] as u64) > u32::MAX as u64 + 1 || (f[1] as u64 + f[2] as u64) > u32::MAX as u64 + 1 { return -22; }
+        if f[0] == u32::MAX || f[1] == u32::MAX { return -22; }
+        if (f[0] as u64 + f[2] as u64) > u32::MAX as u64 || (f[1] as u64 + f[2] as u64) > u32::MAX as u64 { return -22; }
         exts[n] = (f[0], f[1], f[2]); n += 1;
     }
     if n == 0 { return -22; }
     for i in 0..n {
-        if exts[i].0 != exts[i].1 { return -1; } // identity maps only
         for j in 0..i {
             let (a, c) = (exts[i], exts[j]);
-            if (a.0 as u64) < c.0 as u64 + c.2 as u64 && (c.0 as u64) < a.0 as u64 + a.2 as u64 { return -22; }
+            if (a.0 as u64) < c.0 as u64 + c.2 as u64 && (c.0 as u64) < a.0 as u64 + a.2 as u64 { return -22; } // upper
+            if (a.1 as u64) < c.1 as u64 + c.2 as u64 && (c.1 as u64) < a.1 as u64 + a.2 as u64 { return -22; } // lower
         }
     }
+    // Rule 3: lower ranges translated through the parent map.
     let par = parent(tns);
-    if privileged {
-        for i in 0..n {
-            if par != 0 {
-                let (a, _, c) = exts[i];
-                let covered = mapped(kind, par, a) && mapped(kind, par, a + (c - 1));
-                if !covered { return -1; }
-            }
-        }
-    } else {
-        if n != 1 || exts[0].2 != 1 || exts[0].1 != me { return -1; }
-        if par != 0 && !mapped(kind, par, me) { return -1; }
+    let mut comp = [(0u32, 0u32, 0u32); MAP_EXT];
+    for i in 0..n {
+        let Some(lk) = lower_to_k(par, exts[i].1, exts[i].2, kind) else { return -1 };
+        comp[i] = (exts[i].0, lk, exts[i].2);
+        // Rule 6: no extent covers kuid 0 until lane idroot0.
+        if lk == 0 { return -1; }
+        // Rule 9: identity maps only until the flip (or the test knob).
+        if !idmap_real() && exts[i].0 != lk { return -1; }
+    }
+    if !privileged {
+        // Rule 4: one single-id extent, the translated lower id is the
+        // opener's own euid (egid for gid_map); owner is the opener.
+        if n != 1 || comp[0].2 != 1 || comp[0].1 != me { return -1; }
+        if owner(tns).0 != opener.1 { return -1; }
         if kind == 1 && SETGROUPS_DENY[t].load(Acquire) == 0 { return -1; }
     }
     for i in 0..n {
         let b = (t * MAP_EXT + i) * 3;
-        MAP_DATA[kind][b].store(exts[i].0, Release);
-        MAP_DATA[kind][b + 1].store(exts[i].1, Release);
-        MAP_DATA[kind][b + 2].store(exts[i].2, Release);
+        MAP_DATA[kind][b].store(comp[i].0, Release);
+        MAP_DATA[kind][b + 1].store(comp[i].1, Release);
+        MAP_DATA[kind][b + 2].store(comp[i].2, Release);
     }
     MAP_N[kind][t].store(n as u8, Release);
     data.len() as isize
