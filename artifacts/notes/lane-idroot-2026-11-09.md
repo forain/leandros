@@ -32,5 +32,5 @@ host-wide privilege check now uses host_root. Cases: userland/idmaptest
 ## Evidence
 - aarch64: captest, nstest (incl. uts_*), idmaptest 5/5 pass.
 - x86_64 box full regress: 70 suites, 0 bad (one vfstagtest wake-count flake, passes on re-run).
-- Guard: ns_euid0_not_host fails when host_root_of ignores the userns (see below).
+- Guard: ns_euid0_not_host fails when host_root_of ignores the userns (Mac aarch64: FAIL ns_euid0_not_host, 4 passed 1 failed; with the check: 5/5 PASS).
 - Test cases removed vs main: none.
