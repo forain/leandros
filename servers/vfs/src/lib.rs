@@ -50,6 +50,7 @@ extern crate mm;
 /// sysfs is generated on demand rather than stored.
 pub mod block;
 pub mod sysclass;
+pub mod cgroupfs;
 
 /// Open file descriptions (see the module docs): what epoll keys by.
 pub mod ofd;
@@ -57,6 +58,7 @@ pub mod mqueue;
 
 /// Alias mounts (proc/devtmpfs/sysfs/bind) — how a chroot gets its /proc.
 pub mod alias;
+pub mod devpts;
 pub mod mnt;
 pub mod cmdline_redact;
 /// Overlay plumbing: real-layer helpers, per-mount pseudo-pid creds.
@@ -4363,7 +4365,7 @@ static RAMFS: &[RamEntry] = &[
                data: b"processor\t: 0\nmodel name\t: Leandros Virtual CPU\ncpu MHz\t\t: 1000.000\n\
                        cache size\t: 4096 KB\nflags\t\t: fpu vme de pse tsc msr pae mce\n" },
     RamEntry { path: b"/proc/filesystems",
-               data: b"nodev\ttmpfs\nnodev\tramfs\nnodev\tprocfs\n\text2\n" },
+               data: b"nodev\ttmpfs\nnodev\tramfs\nnodev\tprocfs\nnodev\tcgroup\nnodev\tcgroup2\n\text2\n" },
     // /proc/mounts is generated from list_mounts() by gen_proc_system_content
     // (see the "/proc/mounts" arm there) — a static entry here would shadow
     // the generated one and go stale the moment a real filesystem is
@@ -4442,6 +4444,24 @@ static RAMFS_DIRS: &[&[u8]] = &[
     // `handle_open` does not depend on it, but ttyname()'s readlink+stat
     // cross-check and `ls /dev/pts` do.
     b"/dev/pts",
+    // Backing directories of devpts mounts (see devpts.rs).
+    b"/dev/.devpts",
+    b"/dev/.devpts/1",
+    b"/dev/.devpts/2",
+    b"/dev/.devpts/3",
+    b"/dev/.devpts/4",
+    b"/dev/.devpts/5",
+    b"/dev/.devpts/6",
+    b"/dev/.devpts/7",
+    b"/dev/.devpts/8",
+    b"/dev/.devpts/9",
+    b"/dev/.devpts/10",
+    b"/dev/.devpts/11",
+    b"/dev/.devpts/12",
+    b"/dev/.devpts/13",
+    b"/dev/.devpts/14",
+    b"/dev/.devpts/15",
+    b"/dev/.devpts/16",
     b"/dev/mqueue",
     b"/run",
     b"/run/user",
@@ -5018,6 +5038,8 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
        // Hook-backed power_supply/backlight classes, only while they have devices.
        || sysclass::is_path(path)
        || sysclass::is_tables_path(path)
+       // The cgroup2 tree: exactly /sys/fs/cgroup, and only once mounted.
+       || cgroupfs::is_path(path)
        // A GPU backend's PCI identity for the DRM nodes — only the attribute
        // files it answers, only while it is registered (`drm_sysfs_attr`).
        || is_drm_sysfs_override(path)
@@ -5075,8 +5097,13 @@ fn pts_meta(n: usize) -> xattr::FileMeta {
 
 /// A fresh pair `n` from `/dev/ptmx`, opened by `pid`.
 fn pts_meta_init(n: usize, pid: u32) {
-    let uid = sched::fsuid_of(pid);
-    if let Some(e) = PTS_META.lock().get_mut(n) { *e = (uid, GID_TTY, 0o620); }
+    let (inst, _) = tty_server::pty::ident(n);
+    let (uid, gid, mode) = match devpts::opts(inst) {
+        Some(o) => (if o.set_uid { o.uid } else { sched::fsuid_of(pid) },
+                    if o.set_gid { o.gid } else { sched::fsgid_of(pid) }, o.mode),
+        None => (sched::fsuid_of(pid), GID_TTY, 0o620),
+    };
+    if let Some(e) = PTS_META.lock().get_mut(n) { *e = (uid, gid, mode); }
 }
 
 /// chmod(2) of `/dev/pts/N`: the owner or root.
@@ -5112,14 +5139,22 @@ fn pts_chown(pid: u32, n: usize, uid: u32, gid: u32) -> Message {
 /// multi-component tail, and for a number no live master owns — so the caller
 /// falls through to the ordinary ENOENT rather than inventing a device.
 fn pts_number(path: &[u8]) -> Option<usize> {
-    let rest = path.strip_prefix(b"/dev/pts/".as_slice())?;
-    if rest.is_empty() || rest.len() > 3 { return None; }
-    let mut n = 0usize;
-    for &c in rest {
-        if !c.is_ascii_digit() { return None; }
-        n = n * 10 + (c - b'0') as usize;
+    match devpts::parse(path)? {
+        (inst, devpts::Tail::Slave(n)) => tty_server::pty::find(inst, n),
+        _ => None,
     }
-    if tty_server::pty::exists(n) { Some(n) } else { None }
+}
+
+/// Instance whose `ptmx` `path` names (`/dev/ptmx` is the default's).
+fn ptmx_inst(path: &[u8]) -> Option<u16> {
+    if path == b"/dev/ptmx" { return Some(0); }
+    match devpts::parse(path)? { (inst, devpts::Tail::Ptmx) => Some(inst), _ => None }
+}
+
+/// Owner/mode of an instance's `ptmx` node.
+fn ptmx_meta(inst: u16) -> xattr::FileMeta {
+    let mode = devpts::opts(inst).map_or(0o666, |o| o.ptmxmode);
+    xattr::FileMeta { mode: 0o020000 | mode, uid: 0, gid: 0 }
 }
 
 /// The `N` in `/dev/ttyN`, if `path` names a virtual console.
@@ -5915,6 +5950,12 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         let start = p;
         p = write_lit(buf, p, b"mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec 0 0\n");
         if p >= buf.len() { return start; }
+        // cgroup2, once mounted (the initial-namespace line only).
+        if cgroupfs::mounted() {
+            let start = p;
+            p = write_lit(buf, p, b"cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n");
+            if p >= buf.len() { return start; }
+        }
     }
     p
 }
@@ -5936,6 +5977,41 @@ fn alias_mounts_for_reader() -> Vec<(Vec<u8>, Vec<u8>, &'static str)> {
     }).collect()
 }
 
+/// ` shared:N`, ` master:N`, ` unbindable` for the ns-0 mount at `path`.
+fn write_prop_fields(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize, path: &[u8]) -> usize {
+    let (g, m, u) = mnt::ns0_prop(path);
+    if g != 0 { p = write_lit(buf, p, b" shared:"); p = write_u32(buf, p, g); }
+    if m != 0 { p = write_lit(buf, p, b" master:"); p = write_u32(buf, p, m); }
+    if u { p = write_lit(buf, p, b" unbindable"); }
+    p
+}
+
+/// mountinfo (`info`) or mounts of mount namespace `ns`: its own tree when it
+/// has one, else the initial namespace's tables.
+fn gen_mount_view(ns: sched::ns::NsId, info: bool, buf: &mut [u8; TMP_BUF_SIZE]) -> usize {
+    if ns != 0 {
+        if let Some(v) = mnt::render_tree(ns, info) {
+            // Drop a trailing partial line rather than truncating mid-field.
+            let mut n = v.len().min(TMP_BUF_SIZE);
+            if n < v.len() { while n > 0 && v[n - 1] != b'\n' { n -= 1; } }
+            buf[..n].copy_from_slice(&v[..n]);
+            return n;
+        }
+    }
+    if info { write_mountinfo_lines(buf, 0) } else { write_mtab_lines(buf, 0) }
+}
+
+/// Namespace mountpoints of the initial namespace (see `ns0_snapshot`).
+pub(crate) fn ns0_mountpoints() -> Vec<Vec<u8>> {
+    let mut v: Vec<Vec<u8>> = alloc::vec![b"/".to_vec()];
+    for m in list_mounts().iter().filter(|m| m.in_use) { v.push(m.prefix.as_bytes().to_vec()); }
+    for r in TMPFS_ROOTS.iter() { v.push(r.to_vec()); }
+    for p in [&b"/proc"[..], b"/dev", b"/dev/pts", b"/sys"] { v.push(p.to_vec()); }
+    for (mp, ..) in alias::entries() { v.push(mp); }
+    v.sort(); v.dedup();
+    v
+}
+
 /// Append one `/proc/self/mountinfo`-format line per in-use mount:
 /// `<id> <parent-id> <major>:<minor> <root> <mountpoint> <options> - <fstype> <source> <superoptions>`.
 ///
@@ -5946,12 +6022,15 @@ fn alias_mounts_for_reader() -> Vec<(Vec<u8>, Vec<u8>, &'static str)> {
 /// options. Emitting exactly zero optional fields (the "-" lands at index 6)
 /// keeps that scan trivial. Bounded the same way as `write_mtab_lines`.
 fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
-    let mut mount_id: u32 = 20;
+    const ROOT_ID: u32 = 20;
+    let mut mount_id: u32 = ROOT_ID;
     for m in list_mounts().iter() {
         if !m.in_use { continue; }
         let start = p;
         p = write_u32(buf, p, mount_id);
-        p = write_lit(buf, p, b" 1 ");
+        p = write_lit(buf, p, b" ");
+        p = write_u32(buf, p, ROOT_ID);
+        p = write_lit(buf, p, b" ");
         let (maj, min) = dev_major_minor(m.dev);
         p = write_u32(buf, p, maj);
         p = write_lit(buf, p, b":");
@@ -5960,7 +6039,9 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, m.prefix.as_bytes());
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, mount_opts(m));
-        p = write_lit(buf, p, b",relatime - ");
+        p = write_lit(buf, p, b",relatime");
+        p = write_prop_fields(buf, p, m.prefix.as_bytes());
+        p = write_lit(buf, p, b" - ");
         p = write_lit(buf, p, m.fstype.as_bytes());
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, m.device.as_bytes());
@@ -5973,30 +6054,43 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
     for (ri, root) in TMPFS_ROOTS.iter().enumerate() {
         let start = p;
         p = write_u32(buf, p, mount_id);
-        p = write_lit(buf, p, b" 1 0:");
+        p = write_lit(buf, p, b" 20 0:");
         p = write_u32(buf, p, dev_major_minor(tmpfs_root_dev(ri)).1);
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, root);
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, tmpfs_opts(root));
-        p = write_lit(buf, p, b",relatime - tmpfs tmpfs rw\n");
+        p = write_lit(buf, p, b",relatime");
+        p = write_prop_fields(buf, p, root);
+        p = write_lit(buf, p, b" - tmpfs tmpfs rw\n");
         if p >= buf.len() { return start; }
         mount_id += 1;
     }
     for (dev, mp, fstype) in alias_mounts_for_reader() {
         let start = p;
         p = write_u32(buf, p, mount_id);
-        p = write_lit(buf, p, b" 1 0:");
+        p = write_lit(buf, p, b" 20 0:");
         p = write_u32(buf, p, mount_id);
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, &mp);
-        p = write_lit(buf, p, b" rw,nosuid,relatime - ");
+        p = write_lit(buf, p, b" rw,nosuid,relatime");
+        p = write_prop_fields(buf, p, &mp);
+        p = write_lit(buf, p, b" - ");
         p = write_lit(buf, p, fstype.as_bytes());
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, &dev);
         p = write_lit(buf, p, b" rw\n");
         if p >= buf.len() { return start; }
         mount_id += 1;
+    }
+    // cgroup2, once mounted (the initial-namespace line only).
+    if cgroupfs::mounted() && !matches!(sched::current_root_arc().as_deref(), Some(r) if r.len() > 1) {
+        let start = p;
+        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" 1 0:");
+        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n");
+        if p >= buf.len() { return start; }
     }
     p
 }
@@ -6348,8 +6442,9 @@ pub(crate) fn ns0_snapshot() -> Vec<mnt::Mnt> {
                 (ids[j], if rest.is_empty() { b"/".to_vec() } else { rest.to_vec() })
             }
         };
+        let pg = mnt::ns0_prop(&r.0);
         let mut m = mnt::Mnt { id: ids[i], parent: pid, mp: rel.into_boxed_slice(), root: r.1.clone().into_boxed_slice(),
-            sb: 0, flags: r.4, locked: 0, group: 0, master: 0, unbindable: false, fstype: r.2,
+            sb: 0, flags: r.4, locked: 0, group: pg.0, master: pg.1, unbindable: pg.2, fstype: r.2,
             device: r.3.clone().into_boxed_slice(), opts: Box::from(&b""[..]) };
         if pid == 0 && i != 0 { m.parent = ids[0]; m.mp = r.0.clone().into_boxed_slice(); }
         out.push(m);
@@ -6820,6 +6915,18 @@ fn gen_sysclass_writable(path: &[u8]) -> Option<VnodeKind> {
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
 }
 
+/// A cgroupfs control file opened for writing: an ephemeral tmpfs slot named
+/// `cgroupfs::SNAP_W` + `<cg>/<file>`, which handle_write routes to cgroupfs.
+fn gen_cgroup_writable(cg: sched::cgroup::CgId, f: cgroupfs::F, data: &[u8]) -> Option<VnodeKind> {
+    let fake = cgroupfs::snap_w_path(cg, f);
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, fake.as_bytes());
+    if !tmp_fill_kernel(&mut tmp, idx, data) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
+
 fn gen_sysfs(path: &[u8]) -> Option<VnodeKind> {
     let mut buf = [0u8; TMP_BUF_SIZE];
     let len = block::sysfs_attr(path, &mut buf)?;
@@ -7093,7 +7200,7 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
     if path == b"/proc/mounts" {
         // Legacy mtab-format mount table, generated from the live mount
         // registry — see write_mtab_lines for the field layout and why.
-        return Some(write_mtab_lines(buf, 0));
+        return Some(gen_mount_view(sched::current_mntns(), false, buf));
     }
 
     None
@@ -7551,6 +7658,9 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
             else if path.ends_with(b"/smaps") { MapsKind::Smaps } else { MapsKind::Maps };
         return gen_proc_maps(pid, kind);
     }
+    if path.ends_with(b"/cgroup") {
+        return proc_snapshot(b"/tmp/.proc_cgroup", &cgroupfs::proc_cgroup(pid, reader), false);
+    }
     if path.ends_with(b"/oom_score_adj") {
         let mut b = [0u8; 12];
         let n = oom_text(sched::oom_score_adj_of(pid)?, &mut b);
@@ -7593,9 +7703,10 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest"];
+                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
-                                   b"smaps_rollup", b"environ", b"uid_map", b"gid_map", b"setgroups", b"oom_score_adj"];
+                                   b"smaps_rollup", b"environ", b"uid_map", b"gid_map", b"setgroups", b"oom_score_adj", b"cgroup",
+                                   b"mountinfo", b"mounts"];
 
 /// `/proc/<pid|self>/root` or `/proc/<pid|self>/root/<rest>` → `rest`
 /// (empty for the root itself) when the process is alive. See handle_open.
@@ -7990,8 +8101,12 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
 
     if path == b"/proc/self/mountinfo" || path.ends_with(b"/mountinfo") {
         // This is the file `df`/`read_fs_list()` prefers over /etc/mtab —
-        // see write_mountinfo_lines for the field layout and why.
-        return Some(write_mountinfo_lines(buf, 0));
+        // see write_mountinfo_lines for the field layout and why. Per
+        // namespace: the target process's mount namespace.
+        return Some(gen_mount_view(sched::ns::mntns_of(pid), true, buf));
+    }
+    if path == b"/proc/self/mounts" || path.ends_with(b"/mounts") {
+        return Some(gen_mount_view(sched::ns::mntns_of(pid), false, buf));
     }
 
     None
@@ -8121,6 +8236,19 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 return err_reply(-13); // EACCES
             }
             VnodeKind::DevFb { pos: 0 }
+        } else if cgroupfs::is_path(lookup_path) {
+            match cgroupfs::open(pid, lookup_path, flags) {
+                cgroupfs::Open::Err(e) => return err_reply(e),
+                cgroupfs::Open::Dir(cg) => VnodeKind::SysBlock { dev: cgroupfs::DEV_BASE | cg, level: cgroupfs::LVL, pos: 0 },
+                cgroupfs::Open::Read(d) => match proc_snapshot(cgroupfs::SNAP_R, &d, false) {
+                    Some(v) => v,
+                    None => return err_reply(-23),
+                },
+                cgroupfs::Open::Write(cg, f, d) => match gen_cgroup_writable(cg, f, &d) {
+                    Some(v) => v,
+                    None => return err_reply(-23),
+                },
+            }
         } else if is_drm_sysfs_override(lookup_path) {
             if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-13); } // EACCES
             match gen_drm_sysfs(lookup_path) {
@@ -8186,11 +8314,15 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
             let pos = if flags & O_APPEND != 0 { block::dev_size(dev) } else { 0 };
             VnodeKind::BlockDev { dev, pos }
-        } else if lookup_path == b"/dev/ptmx" {
+        } else if let Some(inst) = ptmx_inst(lookup_path) {
             // Every open of the multiplexor is a *new* pair, not a new handle
             // on a shared object — that is the whole ptmx contract, and what
-            // TIOCGPTN then reports.
-            match tty_server::pty::alloc() {
+            // TIOCGPTN then reports. A devpts instance's ptmx allocates in
+            // that instance's number space.
+            if inst != 0 && !xattr::may_access(&ptmx_meta(inst), &cred_of(pid), None, open_mask(flags)) {
+                return err_reply(-13); // EACCES
+            }
+            match tty_server::pty::alloc_in(inst) {
                 Some(pair) => { pts_meta_init(pair, pid); VnodeKind::Pty { pair: pair as u16, is_master: true } }
                 // ENOSPC, as Linux's devpts answers at its pty limit.
                 None => { report_pool_full("pty", tty_server::pty::MAX_PTYS); return err_reply(-28) }
@@ -8524,6 +8656,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/sys/kernel/hostname" || lookup_path == b"/proc/sys/kernel/domainname" {
             match gen_proc_uts(pid, lookup_path == b"/proc/sys/kernel/domainname") {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/cgroups" {
+            match proc_snapshot(b"/tmp/.proc_cgroups", &cgroupfs::proc_cgroups(), false) {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
@@ -9381,6 +9518,20 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let Some(op) = NSMAP_OPENERS.lock()[idx] else { return err_reply(-1) };
                 let r = if k == 2 { sched::ns::write_setgroups(op, pid, tgid, &data[..n]) }
                         else { sched::ns::write_map(op, pid, tgid, k, &data[..n]) };
+                return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
+            }
+            let cg_w = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                if e.in_use() && e.ephemeral() && e.path().starts_with(cgroupfs::SNAP_W) {
+                    cgroupfs::parse_snap_w(e.path())
+                } else { None }
+            };
+            if let Some((cg, f)) = cg_w {
+                let n = count.min(256);
+                let mut data = [0u8; 256];
+                if unsafe { sched::uaccess::copy_raw(data.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let r = cgroupfs::write(pid, cg, f, &data[..n]);
                 return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
             }
             let sc_path = {
@@ -10832,6 +10983,38 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     // A synthesized sysfs directory has no path to walk and no static table to
     // sweep — the block registry is enumerated directly. Handled here rather
     // than in the sweeps below because nothing in them applies.
+    if let VnodeKind::SysBlock { dev, .. } = tbl.fds[fd].kind {
+      if cgroupfs::is_dev(dev) {
+        let list = cgroupfs::entries(cgroupfs::dev_cg(dev));
+        let buf = buf_ptr as *mut u8;
+        let mut off = 0usize;
+        let mut cur = desc_pos(&tbl.fds[fd]);
+        loop {
+            let (name, is_dir, ino): (&[u8], bool, u64) = if cur == 0 { (b".", true, 1) }
+                else if cur == 1 { (b"..", true, 1) }
+                else { match list.get(cur - 2) {
+                    Some((n, d)) => (n.as_bytes(), *d, 0x6100_0000 + cur as u64),
+                    None => break,
+                } };
+            let nlen = name.len();
+            let reclen = ((8 + 8 + 2 + 1 + nlen + 1) + 7) & !7;
+            if off + reclen > count { break; }
+            unsafe {
+                let p = buf.add(off);
+                core::ptr::write(p as *mut u64, ino);
+                core::ptr::write(p.add(8) as *mut u64, 0u64);
+                core::ptr::write(p.add(16) as *mut u16, reclen as u16);
+                *p.add(18) = if is_dir { 4 } else { 8 };
+                core::ptr::copy_nonoverlapping(name.as_ptr(), p.add(19), nlen);
+                *p.add(19 + nlen) = 0;
+            }
+            off += reclen;
+            cur += 1;
+        }
+        set_dir_pos(&mut tbl.fds[fd], cur);
+        return val_reply(off as u64);
+      }
+    }
     if let VnodeKind::SysBlock { dev, level, .. } = tbl.fds[fd].kind {
         let (dev, level) = (dev, level);
         let buf = buf_ptr as *mut u8;
@@ -11128,12 +11311,12 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     // Live pty slaves (/dev/pts). The pool is the only source of truth here —
     // there is no static table to walk — and `ls /dev/pts` is how a user (and
     // ttyname's fallback scan) finds which pairs exist.
-    if dir_path == b"/dev/pts" {
+    if let Some(dinst) = devpts::dir_inst(dir_path) {
         // Snapshot under the pool lock, then emit: write_dirent touches user
         // memory, which can demand-page, and a fault taken while holding a
         // server spinlock re-enters the scheduler (see the 82d0cc3 rule).
         let mut live = [false; tty_server::pty::MAX_PTYS];
-        tty_server::pty::each_allocated(|n| { if n < live.len() { live[n] = true; } });
+        tty_server::pty::each_in(dinst, |n| { if n < live.len() { live[n] = true; } });
         for (n, &alive) in live.iter().enumerate() {
             if !alive { continue; }
             if virtual_idx >= pos {
@@ -12664,6 +12847,7 @@ fn handle_unlink(pid: u32, path_ptr: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
 
+    if cgroupfs::is_path(strip_trailing_slash(raw)) { return err_reply(-1); } // EPERM
     if let Some(name) = mqueue::path_name(strip_trailing_slash(raw)) {
         let r = mqueue::unlink(pid, name);
         return if r < 0 { err_reply(r as i32) } else { ok_reply() };
@@ -12712,6 +12896,11 @@ fn handle_unlink(pid: u32, path_ptr: usize) -> Message {
 fn handle_mkdir(pid: u32, path_ptr: usize, mode: u32) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
+
+    if cgroupfs::is_path(strip_trailing_slash(raw)) {
+        let r = cgroupfs::mkdir(pid, strip_trailing_slash(raw));
+        return if r < 0 { err_reply(r as i32) } else { ok_reply() };
+    }
 
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-17); }              // EEXIST — mount root
@@ -13135,6 +13324,11 @@ fn handle_rmdir(pid: u32, path_ptr: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
 
+    if cgroupfs::is_path(strip_trailing_slash(raw)) {
+        let r = cgroupfs::rmdir(pid, strip_trailing_slash(raw));
+        return if r < 0 { err_reply(r as i32) } else { ok_reply() };
+    }
+
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-16); } // EBUSY — mount root
         let cred = cred_of(pid);
@@ -13256,6 +13450,10 @@ fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
 fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32, follow: bool) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
+    if cgroupfs::is_path(strip_trailing_slash(raw)) {
+        let r = cgroupfs::chown(pid, strip_trailing_slash(raw), uid, gid);
+        return if r < 0 { err_reply(r as i32) } else { ok_reply() };
+    }
     if let Some(path) = tmpfs_path(raw) {
         let cred = cred_of(pid);
         // Mount roots: root:root and fixed (see handle_chmod).
@@ -13839,6 +14037,7 @@ fn fb_meta() -> xattr::FileMeta {
 fn handle_access(pid: u32, path_ptr: usize, amode: u32, eaccess: bool) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
+    if cgroupfs::is_path(strip_trailing_slash(raw)) { return err_reply(-38); } // stat-based fallback
     if let Some(path) = tmpfs_path(raw) {
         let cred = if eaccess { cred_of(pid) } else { real_cred_of(pid) };
         let tmp = TMP_FILES.lock();
@@ -14286,6 +14485,10 @@ fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
     // pivot_root has made "/" a prefix match for everything. Only the
     // synthesized `/sys/class/block` subtree is synthetic the same way; the
     // rest of /sys is staged on disk and falls through to the mount lookup.
+    if cgroupfs::is_path(path) {
+        write_statfs(buf_ptr, &cgroup_statfs());
+        return statfs_reply();
+    }
     if !is_tmp_path(path)
         && (path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path) || sysclass::is_path(path)) {
         write_statfs(buf_ptr, &procfs_statfs());
@@ -14324,6 +14527,7 @@ fn statfs_set_flags(buf_ptr: usize, flags: u64) {
 fn handle_fstatfs(pid: u32, fd: usize, buf_ptr: usize) -> Message {
     if buf_ptr == 0 { return err_reply(-14); }
     let mut tmp_idx = None;
+    let mut is_cg = false;
     let port = {
         let mut tbls = TblSlot::new();
         let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
@@ -14331,9 +14535,19 @@ fn handle_fstatfs(pid: u32, fd: usize, buf_ptr: usize) -> Message {
         match tbl.fds[fd].kind {
             VnodeKind::MountedFile { port, .. } => Some(port),
             VnodeKind::TmpFile { idx, .. } => { tmp_idx = Some(idx); None }
+            VnodeKind::SysBlock { dev, .. } if cgroupfs::is_dev(dev) => { is_cg = true; None }
             _ => None,
         }
     };
+    if let Some(idx) = tmp_idx {
+        let tmp = TMP_FILES.lock();
+        let p = tmp[idx].path();
+        if tmp[idx].ephemeral() && (p.starts_with(cgroupfs::SNAP_R) || p.starts_with(cgroupfs::SNAP_W)) { is_cg = true; }
+    }
+    if is_cg {
+        write_statfs(buf_ptr, &cgroup_statfs());
+        return statfs_reply();
+    }
     if let Some(port) = port {
         let mut proxy = Message::empty();
         proxy.tag = VFS_STATFS;
@@ -14379,6 +14593,13 @@ fn tmpfs_statfs() -> StatfsVals {
 /// /proc and /dev: zero-capacity pseudo-filesystems, exactly as Linux reports
 /// them. `df` filters these out by fstype long before f_blocks matters, and
 /// `df /proc` prints a 0-block line rather than an error — both match Linux.
+fn cgroup_statfs() -> StatfsVals {
+    StatfsVals {
+        f_type: cgroupfs::MAGIC, bsize: 4096, blocks: 0, bfree: 0, bavail: 0,
+        files: 0, ffree: 0, fsid: 0, namelen: 255,
+    }
+}
+
 fn procfs_statfs() -> StatfsVals {
     StatfsVals {
         f_type: PROC_MAGIC, bsize: 4096, blocks: 0, bfree: 0, bavail: 0,
@@ -14447,6 +14668,15 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
     // A synthesized sysfs directory. musl's `fdopendir` (issued by every
     // `opendir`, and therefore by `fs::read_dir`) fstats the fd and answers
     // ENOTDIR unless this says S_IFDIR.
+    if let VnodeKind::SysBlock { dev, .. } = kind {
+        if cgroupfs::is_dev(dev) {
+            let cg = cgroupfs::dev_cg(dev);
+            let (u, g) = sched::cgroup::dir_owner(cg);
+            write_stat_full(stat_ptr, S_IFDIR | 0o755, (2 + sched::cgroup::nr_children(cg)) as u64, 0,
+                            0x6000_0000 + (cg as u64) * 64, u, g);
+            return ok_reply();
+        }
+    }
     if let VnodeKind::SysBlock { dev, level, .. } = kind {
         write_stat_full(stat_ptr, S_IFDIR | 0o755, 1, 0,
                         0x5000_0000 + (dev as u64) * 8 + level as u64, 0, 0);
@@ -14584,7 +14814,7 @@ fn char_dev_rdev(kind: &VnodeKind) -> u64 {
     match *kind {
         VnodeKind::Pty { is_master: true, .. } => makedev(5, 2),
         VnodeKind::Pty { pair, .. } => match tty_server::pty::vt_of(pair as usize) {
-            0 => pts_rdev(pair as u32),
+            0 => pts_rdev(tty_server::pty::ident(pair as usize).1 as u32),
             n => makedev(4, n as u32),
         },
         VnodeKind::DevStdio { .. } => makedev(5, 1),
@@ -14614,7 +14844,7 @@ fn dev_node_rdev(path: &[u8]) -> u64 {
         b"/dev/ptmx" => makedev(5, 2),
         b"/dev/fb0" => makedev(29, 0),
         _ => if let Some(vt) = vt_number(path) { makedev(4, vt as u32) }
-             else if let Some(n) = pts_number(path) { pts_rdev(n as u32) }
+             else if let Some(n) = pts_number(path) { pts_rdev(tty_server::pty::ident(n).1 as u32) }
              else { 0 },
     }
 }
@@ -14736,7 +14966,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
             // ttyname() treats as "this fd is not that path".
             if lookup_path == b"/dev/tty" {
                 if let Some(n) = tty_server::pty::ctty_for_sid(sched::current_sid()) {
-                    let rdev = match tty_server::pty::vt_of(n) { 0 => pts_rdev(n as u32), v => makedev(4, v as u32) };
+                    let rdev = match tty_server::pty::vt_of(n) { 0 => pts_rdev(tty_server::pty::ident(n).1 as u32), v => makedev(4, v as u32) };
                     write_stat_full_rdev(stat_ptr, 0o020620, 1, 0, pty_ino(n as u16, false), 0, 0, rdev);
                     return ok_reply();
                 }
@@ -14771,13 +15001,14 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
         // what fstat reports on the corresponding fd — see pty_ino. Answered
         // ahead of the RAMFS sweep, which would otherwise report /dev/ptmx as
         // a zero-byte S_IFREG and make ttyname() reject the fd.
-        if lookup_path == b"/dev/ptmx" {
-            write_stat_full_rdev(stat_ptr, 0o020666, 1, 0, pty_ino(0, true), 0, 0, makedev(5, 2));
+        if let Some(inst) = ptmx_inst(lookup_path) {
+            let m = ptmx_meta(inst);
+            write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, pty_ino(0, true), 0, 0, makedev(5, 2));
             return ok_reply();
         }
         if let Some(n) = pts_number(lookup_path) {
             let m = pts_meta(n);
-            write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, pty_ino(n as u16, false), m.uid, m.gid, pts_rdev(n as u32));
+            write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, pty_ino(n as u16, false), m.uid, m.gid, pts_rdev(tty_server::pty::ident(n).1 as u32));
             return ok_reply();
         }
         // Block device nodes. Must agree byte for byte with what `handle_fstat`
@@ -14794,6 +15025,12 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
         // their attribute files. `/sys` and `/sys/class` themselves, and
         // everything outside this subtree, are staged on disk and answered
         // by the ordinary mount lookup below, not here.
+        if cgroupfs::is_path(lookup_path) {
+            return match cgroupfs::stat(sched::current_pid(), lookup_path) {
+                Some((m, nl, ino, u, g)) => { write_stat_full(stat_ptr, m, nl as u64, 0, ino, u, g); ok_reply() }
+                None => err_reply(-2),
+            };
+        }
         if sysclass::is_path(lookup_path) {
             if let Some((dev, level)) = sysclass::dir(lookup_path) {
                 write_stat(stat_ptr, 0o040755, 0, 0x5000_0000 + (dev as u64) * 8 + level as u64);
@@ -14964,7 +15201,7 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             // "anon_inode" placeholder.
             VnodeKind::Pty { is_master: true, .. } => FdInfo::Static(b"/dev/ptmx"),
             VnodeKind::Pty { pair, is_master: false } => match tty_server::pty::vt_of(*pair as usize) {
-                0 => FdInfo::PtsSlave(*pair),
+                0 => FdInfo::PtsSlave(tty_server::pty::ident(*pair as usize).1),
                 2 => FdInfo::Static(b"/dev/tty2"), 3 => FdInfo::Static(b"/dev/tty3"),
                 4 => FdInfo::Static(b"/dev/tty4"), 5 => FdInfo::Static(b"/dev/tty5"),
                 _ => FdInfo::Static(b"/dev/tty6"),

@@ -166,6 +166,13 @@ pub fn dir_owner(cg: CgId) -> (u32, u32) {
     t.owner[cg as usize % CG_MAX]
 }
 
+/// chown of a cgroup directory (cgroupfs; the DAC check is the caller's).
+pub fn set_dir_owner(cg: CgId, uid: u32, gid: u32) {
+    let mut t = TREE.lock();
+    init_tree(&mut t);
+    if alive(cg) { t.owner[cg as usize % CG_MAX] = (uid, gid); }
+}
+
 /// mkdir: a new child of `parent_cg`. Errors: ENOENT parent gone, EEXIST,
 /// EINVAL bad name, EAGAIN depth/descendant limit, ENOSPC table full.
 pub fn create(parent_cg: CgId, name: &str, uid: u32, gid: u32) -> Result<CgId, isize> {

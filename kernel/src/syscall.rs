@@ -9182,7 +9182,7 @@ fn sys_mount(
     target_ptr: usize,
     fstype_ptr: usize,
     flags: usize,
-    _data_ptr: usize,
+    data_ptr: usize,
 ) -> isize {
     // mount(2) MS_REMOUNT: change the flags of an existing mount; source and
     // fstype are ignored (and may be NULL, as `mount -o remount,ro /` passes
@@ -9193,7 +9193,17 @@ fn sys_mount(
     const MS_NOSUID:  usize = 2;
     const MS_REMOUNT: usize = 32;
     // Every form of mount(2) needs CAP_SYS_ADMIN (Linux `may_mount`).
-    if !sched::host_root() { return -1; } // EPERM
+    // A devpts mount is also allowed to a task holding CAP_SYS_ADMIN in its
+    // own user namespace (a container's runtime mounts its /dev/pts there).
+    let devpts_mount = flags & (MS_REMOUNT | 4096) == 0 && fstype_ptr != 0
+        && read_user_short_str(fstype_ptr).map_or(false, |v| v.as_slice() == b"devpts");
+    if !sched::host_root() && !(devpts_mount && sched::caps::ns_capable(21)) { return -1; } // EPERM
+    // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC):
+    // only the mount's propagation state changes; source/fstype are ignored.
+    if flags & (vfs::mnt::MS_UNBINDABLE | vfs::mnt::MS_PRIVATE | vfs::mnt::MS_SLAVE | vfs::mnt::MS_SHARED) != 0 {
+        let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+        return vfs::mnt::set_propagation(sched::current_mntns(), target_path.ns_bytes(), flags) as isize;
+    }
     if flags & MS_REMOUNT != 0 {
         let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
         let t = match core::str::from_utf8(target_path.bytes()) { Ok(s) => s, Err(_) => return -22 };
@@ -9237,6 +9247,7 @@ fn sys_mount(
             b"sysfs"    => Some((b"/sys".to_vec(), "sysfs")),
             b"devpts"   => Some((b"/dev/pts".to_vec(), "devpts")),
             b"mqueue"   => Some((b"/dev/mqueue".to_vec(), "mqueue")),
+            b"cgroup2"  => Some((b"/sys/fs/cgroup".to_vec(), "cgroup2")),
             _ => None,
         }
     };
@@ -9270,7 +9281,20 @@ fn sys_mount(
         } else {
             fstype.as_bytes().to_vec()
         };
-        return match vfs::alias::add(mp, &src, fstype, &device) { Ok(()) => 0, Err(e) => e as isize };
+        // Each devpts mount is a new instance with its own pty numbers.
+        let src = if fstype == "devpts" && flags & MS_BIND == 0 {
+            let opts = if data_ptr == 0 { Vec::new() } else {
+                match read_user_short_str(data_ptr) { Ok(v) => v, Err(e) => return e }
+            };
+            match vfs::devpts::create(&opts) { Ok(id) => vfs::devpts::backing(id), Err(e) => return e }
+        } else { src };
+        return match vfs::alias::add(mp, &src, fstype, &device) {
+            Ok(()) => { if fstype == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
+            Err(e) => {
+                if let Some(id) = vfs::devpts::inst_of_backing(&src) { vfs::devpts::destroy(id); }
+                e as isize
+            }
+        };
     }
 
     let source_raw = match read_user_short_str(source_ptr) { Ok(v) => v, Err(e) => return e };
