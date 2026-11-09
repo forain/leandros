@@ -235,6 +235,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mqtest"
+version = "0.1.0"
+
+[[package]]
 name = "netctl"
 version = "0.1.0"
 dependencies = [

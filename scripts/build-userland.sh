@@ -37,7 +37,7 @@ fi
 # ABI): no_std crates linked against static musl (<arch>-unknown-linux-musl)
 # through the zig linker wrapper, the same path as spawnwedge/killmt. Their
 # start-up is musl's crt1 -> `main`; userland/muslrt holds the shared pieces.
-MUSL_LINKED=(polltest fdmaxtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest jobtest exectest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest pthreadtest timertest sigtest sigtest2 epolltest wakepolltest)
+MUSL_LINKED=(polltest fdmaxtest mqtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest jobtest exectest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest pthreadtest timertest sigtest sigtest2 epolltest wakepolltest)
 
 EXCLUDE_ARGS=()
 for prog in "${MUSL_LINKED[@]}"; do
@@ -178,8 +178,12 @@ if command -v zig >/dev/null 2>&1; then
     # serrx: framed, ACKed file receiver over the serial console (scripts/pi-serial-push.py).
     echo "[userland] Building nstest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nstest" userland/nstest/nstest.c
+    echo "[userland] Building ovltest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ovltest" userland/ovltest/ovltest.c
     echo "[userland] Building idmaptest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/idmaptest" userland/idmaptest/idmaptest.c
+    echo "[userland] Building cgtest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/cgtest" userland/cgtest/cgtest.c
     echo "[userland] Building serrx (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -Os -s -Wall -o "${OUT}/serrx" userland/serrx/serrx.c
 else

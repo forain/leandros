@@ -468,8 +468,17 @@ pub struct Task {
     pub uid:  u32,
     pub gid:  u32,
     pub euid: u32,
-    /// Capability sets [effective, permitted, inheritable, bounding] (bits 0..40).
-    pub caps: [u64; 4],
+    /// Capability sets [effective, permitted, inheritable, bounding, ambient]
+    /// (bits 0..40) and, in slot 5, the securebits word (see `caps`).
+    pub caps: [u64; 6],
+    /// `prctl(PR_SET_CHILD_SUBREAPER)`: orphaned descendants reparent to
+    /// this process rather than to init. Per process (kept on every thread),
+    /// not inherited by fork.
+    pub child_subreaper: bool,
+    /// /proc/<pid>/oom_score_adj (-1000..=1000), inherited by fork.
+    pub oom_score_adj: i32,
+    /// personality(2) word, inherited by fork and kept across execve.
+    pub persona: u32,
     /// User namespace (0 = initial); one counted reference.
     pub userns: crate::ns::NsRef,
     /// Active pid namespace (0 = initial); immutable after creation. One counted reference.
@@ -479,7 +488,12 @@ pub struct Task {
     /// Network / IPC namespace ids (0 = initial); inherited by clone.
     pub netns: crate::ns::NsRef,
     pub ipcns: crate::ns::NsRef,
+    /// Mount namespace (0 = initial: the global path space).
+    pub mntns: crate::ns::NsRef,
     pub utsns: crate::ns::NsRef,
+    /// cgroup namespace (0 = initial) and the cgroup this thread belongs to.
+    pub cgns: crate::ns::NsRef,
+    pub cgroup: crate::cgroup::CgId,
     pub egid: u32,
     pub suid: u32,
     pub sgid: u32,
@@ -884,7 +898,10 @@ impl Task {
             pidns_child: crate::ns::NsRef::INIT,
             netns: crate::ns::NsRef::INIT,
             ipcns: crate::ns::NsRef::INIT,
+            mntns: crate::ns::NsRef::INIT,
             utsns: crate::ns::NsRef::INIT,
+            cgns: crate::ns::NsRef::INIT,
+            cgroup: 0,
             egid: 0,
             suid: 0,
             sgid: 0,
@@ -894,6 +911,9 @@ impl Task {
             ngroups: 0,
             groups: [0; NGROUPS_MAX],
             no_new_privs: false,
+            child_subreaper: false,
+            oom_score_adj: 0,
+            persona: 0,
             rlimits: RLIMIT_DEFAULTS,
             signal_pending: 0,
             signal_mask: 0,
@@ -1319,7 +1339,10 @@ impl Task {
             pidns_child: crate::ns::NsRef::INIT,
             netns: crate::ns::NsRef::INIT,
             ipcns: crate::ns::NsRef::INIT,
+            mntns: crate::ns::NsRef::INIT,
             utsns: crate::ns::NsRef::INIT,
+            cgns: crate::ns::NsRef::INIT,
+            cgroup: 0,
             egid: 0,
             suid: 0,
             sgid: 0,
@@ -1329,6 +1352,9 @@ impl Task {
             ngroups: 0,
             groups: [0; NGROUPS_MAX],
             no_new_privs: false,
+            child_subreaper: false,
+            oom_score_adj: 0,
+            persona: 0,
             rlimits: RLIMIT_DEFAULTS,
             signal_pending: 0,
             signal_mask: 0,

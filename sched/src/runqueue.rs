@@ -419,6 +419,8 @@ impl RunQueue {
         crate::slot::on_insert(i, &mut task);
         crate::slot::SCHED[i].aff.store(task.affinity, Ordering::Relaxed);
         if task.state != TaskState::Zombie { crate::uidcount::inc(task.uid); }
+        task.cgroup = crate::cgroup::adopt(task.cgroup);
+        crate::cgroup::charge(task.cgroup);
         self.tasks[i] = Some(task);
         self.note_ppid(i);
         self.pk_port[i] = u32::MAX;
@@ -1720,6 +1722,7 @@ impl RunQueue {
             g.remove(idx);
             crate::slot::clear_woken(idx);
             if task.state != TaskState::Zombie { crate::uidcount::dec(task.uid); }
+            crate::cgroup::uncharge(task.cgroup, task.cpu_ns().saturating_sub(task.sys_ns()), task.sys_ns());
             crate::slot::on_remove(idx, task);
             drop(g);
         }
