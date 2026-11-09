@@ -94,9 +94,17 @@ def run(mode):
         if m and m[1] in procs:
             procs[m[1]]["root"] = m[2].strip() or "-"
     # MOZ_SANDBOX_LOGGING also prints policy-building chatter; only the rest counts as an error.
-    noise = re.compile(r"policy for |fixing recursive|removing redundant|Couldn't open video device|adding (read|write)")
-    sbl = [l.strip() for l in ff.splitlines() if ("Sandbox:" in l and not noise.search(l))
-           or ("andbox" in l and re.search(r"unsupported|not supported|disabled|failed", l, re.I))]
+    noise = re.compile(r"policy for |fixing recursive|removing redundant|Couldn't open video device|adding (read|write)"
+                       r"|using seccomp tsync|Parent path is|Adding paths from|[Ff]ailed errno -2\b")
+    real = re.compile(r"errno -13\b|EACCES|denied|seccomp sandbox violation", re.I)
+
+    def counted(l):
+        if real.search(l):
+            return True  # broker denials and SIGSYS violations always count
+        if "Sandbox:" in l and not noise.search(l):
+            return True
+        return "andbox" in l and not noise.search(l) and re.search(r"unsupported|not supported|disabled|failed", l, re.I)
+    sbl = [l.strip() for l in ff.splitlines() if ("andbox" in l or "seccomp" in l.lower()) and counted(l)]
     exitl = [l for l in ff.splitlines() if l.startswith("EXIT=")]
     print(f"== mode={mode} ffsession rc={rc} firefox procs={len(procs)} {exitl[-1] if exitl else 'still running'} "
           f"video={'SBV' in ff}")
@@ -108,7 +116,7 @@ def run(mode):
         print(f"{p:>5} {t:9} {s.get('Seccomp:', '?'):7} {s.get('Seccomp_filters:', '?'):4} {s.get('NoNewPrivs:', '?'):3} "
               f"{s.get('NSpid:', '?')[:9]:9} {v['root'][:30]}")
         types.setdefault(t, []).append(s.get("Seccomp:", "?"))
-    for l in sbl[:8]:
+    for l in sbl[:10]:
         print("  LOG", l[:150])
     print(f"  Sandbox log lines: {len(sbl)}")
     kids = {t: v for t, v in types.items() if t not in ("parent", "wrapper", "forkserver")}
