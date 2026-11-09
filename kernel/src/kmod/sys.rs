@@ -18,7 +18,7 @@ fn errno(e: KmodErr) -> isize {
 }
 
 fn check() -> Option<isize> {
-    if sched::current_euid() != 0 || super::disabled() { Some(EPERM) } else { None }
+    if !sched::host_root() || super::disabled() { Some(EPERM) } else { None }
 }
 
 pub fn sys_init_module(ptr: usize, len: usize, _params: usize) -> isize {

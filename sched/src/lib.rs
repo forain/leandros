@@ -3010,6 +3010,15 @@ pub fn euid_of(pid: Pid) -> u32 {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.euid).unwrap_or(0)
 }
 
+/// True when `pid` is root of the *host*: euid 0 in the initial user
+/// namespace. Root of a child user namespace is not (it holds capabilities
+/// only over that namespace). Unknown pids are not root. One RUN_QUEUE hold.
+pub fn host_root_of(pid: Pid) -> bool {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.euid == 0 && t.userns.id() == 0).unwrap_or(false)
+}
+
+pub fn host_root() -> bool { host_root_of(current_pid()) }
+
 pub fn egid_of(pid: Pid) -> u32 {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.egid).unwrap_or(0)
 }
@@ -5050,7 +5059,7 @@ pub enum MmArgField { ArgStart, ArgEnd, EnvStart, EnvEnd }
 pub fn set_mm_arg_field(field: MmArgField, addr: usize) -> isize {
     const MMAP_MIN_ADDR: usize = 4096;
     const TASK_SIZE: usize = 0x0000_8000_0000_0000;
-    if current_euid() != 0 { return -1; } // EPERM
+    if !host_root() { return -1; } // EPERM
     if addr >= TASK_SIZE || addr < MMAP_MIN_ADDR { return -22; }
     let tgid = current_tgid();
     let mut a = ARG_AREAS.lock().get(&tgid).copied()
@@ -7240,7 +7249,7 @@ pub fn fork_admission(new_process: bool) -> isize {
     if admit_locked(&rq, new_process) != 0 { return -11; }
     let Some(me) = rq.find_pid(pid) else { return 0 };
     if cgroup::fork_check(me.cgroup) != 0 { return -11; }
-    if me.uid == 0 || me.euid == 0 { return 0; }
+    if me.uid == 0 || me.euid == 0 { if me.userns.id() == 0 { return 0; } }
     let uid = me.uid;
     let limit = rq.find_pid(me.tgid).map_or(task::RLIM_INFINITY, |l| l.rlimits[task::RLIMIT_NPROC][0]);
     if limit == task::RLIM_INFINITY { return 0; }
