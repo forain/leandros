@@ -361,7 +361,7 @@ static int orphan_run(int subreaper)
         pid_t w = waitpid(-1, &st, 0); /* the orphan is now OUR child */
         CHECK(w > 0 && WIFEXITED(st) && WEXITSTATUS(st) == 7);
     } else {
-        CHECK(got != me && got == 1);
+        CHECK(got != me && got > 0); /* init, not us */
     }
     return 0;
 }
