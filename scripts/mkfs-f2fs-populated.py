@@ -640,17 +640,14 @@ def main():
         b"leandro:x:1000:1000:leandro:/home/leandro:/bin/brush\n"
     )
     etc_files.append(("passwd", passwd_bytes, 0o100644))
-    # Reserved: uids/gids 100000-165535 belong to leandro's subuid/subgid range.
-    # Subordinate id ranges for rootless containers (newuidmap/newgidmap).
-    # 100000-165535 is RESERVED for leandro: no passwd/group entry may use it
+    # Subordinate id ranges for containers, read by newuidmap/newgidmap
+    # (shadow-subids). 100000-165535 is RESERVED for leandro and
+    # 200000-265535 for root: no passwd/group entry may use them
     # (design-idmap). Root-owned 0644 as shadow-utils requires.
-    etc_files.append(("subuid", b"leandro:100000:65536\n", 0o100644))
-    etc_files.append(("subgid", b"leandro:100000:65536\n", 0o100644))
-    # Firefox's sandbox builds its library path policy from /etc/ld.so.conf;
-    # list musl's default search dirs so policy and loader agree.
-    # rootless podman: newuidmap/newgidmap read these (shadow-subids).
     etc_files.append(("subuid", b"leandro:100000:65536\nroot:200000:65536\n", 0o100644))
     etc_files.append(("subgid", b"leandro:100000:65536\nroot:200000:65536\n", 0o100644))
+    # Firefox's sandbox builds its library path policy from /etc/ld.so.conf;
+    # list musl's default search dirs so policy and loader agree.
     etc_files.append(("ld.so.conf", b"/lib\n/usr/lib\n/usr/local/lib\n", 0o100644))
     # Minimal v1 TZif file for UTC (no zoneinfo package in the image).
     etc_files.append(("localtime", b"\x54\x5a\x69\x66" + b"\x00" * 35 + b"\x01\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00UTC\x00", 0o100644))
