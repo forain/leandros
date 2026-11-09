@@ -173,6 +173,57 @@ int main(void) {
     CHECK("SOCK_DGRAM|SOCK_NONBLOCK netlink socket", nb >= 0);
     CHECK("empty recv -> EAGAIN", recv(nb, buf, sizeof buf, 0) < 0 && errno == EAGAIN);
     close(nb);
+    /* RTM_GETROUTE dump: the default route and a connected route, via eth0 */
+    {
+        n = dump(s, RTM_GETROUTE, 21, buf, sizeof buf);
+        int got_route = n > 0;
+        int ndef = 0, nconn = 0, oif_ok = 1;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_type != RTM_NEWROUTE) continue;
+            struct rtmsg *rm = NLMSG_DATA(h);
+            int gw = 0, oif = 0, len = RTM_PAYLOAD(h);
+            for (struct rtattr *a = RTM_RTA(rm); RTA_OK(a, len); a = RTA_NEXT(a, len)) {
+                if (a->rta_type == RTA_GATEWAY) gw = 1;
+                if (a->rta_type == RTA_OIF) oif = *(int *)RTA_DATA(a);
+            }
+            if (rm->rtm_dst_len == 0 && gw) ndef++;
+            if (rm->rtm_dst_len > 0 && !gw) nconn++;
+            if (oif < 2) oif_ok = 0;
+        }
+        CHECK("route_dump_has_default", got_route && ndef == 1 && nconn >= 1 && oif_ok);
+    }
+
+    /* RTM_GETLINK by ifindex, with NLM_F_ACK: the link, then an NLMSG_ERROR{0} */
+    {
+        struct { struct nlmsghdr h; struct ifinfomsg i; } r;
+        memset(&r, 0, sizeof r);
+        r.h.nlmsg_len = sizeof r;
+        r.h.nlmsg_type = RTM_GETLINK;
+        r.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+        r.h.nlmsg_seq = 31;
+        r.i.ifi_index = 1;
+        int sent = send(s, &r, sizeof r, 0) == (ssize_t)sizeof r;
+        char rb[2048];
+        ssize_t m = 0;
+        int saw_lo1 = 0, ack = 0;
+        for (int tries = 0; sent && tries < 4 && !ack; tries++) {
+            m = recv(s, rb, sizeof rb, 0);
+            int k = (int)m;
+            for (struct nlmsghdr *h = (struct nlmsghdr *)rb; m > 0 && NLMSG_OK(h, k); h = NLMSG_NEXT(h, k)) {
+                if (h->nlmsg_type == RTM_NEWLINK && ((struct ifinfomsg *)NLMSG_DATA(h))->ifi_index == 1) saw_lo1 = 1;
+                if (h->nlmsg_type == NLMSG_ERROR && ((struct nlmsgerr *)NLMSG_DATA(h))->error == 0) ack = 1;
+            }
+        }
+        CHECK("getlink_by_index", sent && saw_lo1);
+        CHECK("ack_flag", ack);
+        r.i.ifi_index = 999;
+        r.h.nlmsg_flags = NLM_F_REQUEST;
+        sent = send(s, &r, sizeof r, 0) == (ssize_t)sizeof r;
+        m = sent ? recv(s, rb, sizeof rb, 0) : -1;
+        struct nlmsghdr *h = (struct nlmsghdr *)rb;
+        CHECK("getlink_unknown_index_enodev", m > 0 && h->nlmsg_type == NLMSG_ERROR
+              && ((struct nlmsgerr *)NLMSG_DATA(h))->error == -ENODEV);
+    }
     close(s);
 
     // libc consumers.
@@ -238,6 +289,7 @@ int main(void) {
     strcpy(q.ifr_name, "eth0");
     CHECK("SIOCETHTOOL -> EOPNOTSUPP", ioctl(u, 0x8946, &q) < 0 && errno == EOPNOTSUPP);
     close(u);
+
 
     printf("netlinktest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
