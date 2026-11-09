@@ -18,6 +18,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <sys/utsname.h>
 #include <linux/sched.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -45,7 +46,7 @@ static void check(const char *name, int ok)
 }
 
 static const struct { const char *n; unsigned long f; } flags[] = {
-    {"NEWUTS", CLONE_NEWUTS},   {"NEWNS", CLONE_NEWNS},
+    {"NEWNS", CLONE_NEWNS},
     {"NEWCGROUP", CLONE_NEWCGROUP},
 };
 
@@ -181,9 +182,9 @@ static int t_unshare_threaded(void)
 }
 static int t_other_new_einval(void)
 {
-    int fl[] = { 0x00020000, 0x02000000, 0x04000000 };
+    int fl[] = { 0x00020000, 0x02000000 };
     CHECK(drop_to(1000) == 0);
-    for (unsigned i = 0; i < 3; i++) {
+    for (unsigned i = 0; i < 2; i++) {
         CHECK(unshare(fl[i]) == -1 && errno == EINVAL);
         long r = syscall(SYS_clone, SIGCHLD | fl[i], 0, 0, 0, 0);
         CHECK(r == -1 && errno == EINVAL);
@@ -2060,6 +2061,30 @@ static int t_setns_pidfd(void)
     return 0;
 }
 
+static int t_setns_uts(void)
+{
+    int rdy[2], hold[2];
+    CHECK(pipe(rdy) == 0 && pipe(hold) == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        if (unshare(CLONE_NEWUTS) || sethostname("nsjoin", 6)) _exit(1);
+        char b = 'r'; (void)!write(rdy[1], &b, 1); (void)!read(hold[0], &b, 1); _exit(0);
+    }
+    char b; CHECK(read(rdy[0], &b, 1) == 1);
+    int uf = ns_open(c, "uts");
+    CHECK(uf >= 0);
+    char h[64];
+    CHECK(gethostname(h, sizeof h) == 0 && strcmp(h, "nsjoin") != 0);
+    pid_t g = fork();
+    if (g == 0) { if (drop_to(1000)) _exit(1); errno = 0; _exit(sys_setns(uf, 0) == -1 && errno == EPERM ? 0 : 2); }
+    int st = 0; waitpid(g, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(sys_setns(uf, CLONE_NEWUTS) == 0);
+    CHECK(gethostname(h, sizeof h) == 0 && strcmp(h, "nsjoin") == 0);
+    close(hold[1]); waitpid(c, &st, 0);
+    return 0;
+}
+
 static int t_setns_fd_holds(void)
 {
     int hw; pid_t c = ns_spawn(CLONE_NEWNET, 0, &hw);
@@ -2073,6 +2098,84 @@ static int t_setns_fd_holds(void)
     CHECK(sys_setns(nf, CLONE_NEWNET) == 0);
     CHECK(link_ino("/proc/self/ns/net") == ino);
     ns_release(c2, hw2);
+/* ── UTS namespaces ─────────────────────────────────────────────────────── */
+static int hn_is(const char *want)
+{
+    char b[80] = {0};
+    return gethostname(b, sizeof b) == 0 && !strcmp(b, want);
+}
+static int proc_hn_is(const char *path, const char *want)
+{
+    char b[80] = {0};
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    int n = read(fd, b, sizeof b - 1); close(fd);
+    if (n > 0 && b[n - 1] == '\n') b[n - 1] = 0;
+    return !strcmp(b, want);
+}
+static int rd_link(const char *p, char *out, size_t n)
+{
+    ssize_t r = readlink(p, out, n - 1);
+    if (r < 0) return -1;
+    out[r] = 0; return 0;
+}
+static int t_uts_unpriv(void)
+{
+    char before[80], after[80], l1[80], l2[80];
+    CHECK(gethostname(before, sizeof before) == 0);
+    CHECK(drop_to(1000) == 0);
+    CHECK(sethostname("nope", 4) == -1 && errno == EPERM);
+    CHECK(unshare(CLONE_NEWUTS) == -1 && errno == EPERM);
+    CHECK(rd_link("/proc/self/ns/uts", l1, sizeof l1) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWUTS) != 0) _exit(1);
+        if (rd_link("/proc/self/ns/uts", l2, sizeof l2) != 0 || !strcmp(l1, l2)) _exit(2);
+        if (sethostname("inner", 5) != 0) _exit(3);
+        if (setdomainname("innerdom", 8) != 0) _exit(4);
+        if (!hn_is("inner")) _exit(5);
+        if (!proc_hn_is("/proc/sys/kernel/hostname", "inner")) _exit(6);
+        if (!proc_hn_is("/proc/sys/kernel/domainname", "innerdom")) _exit(7);
+        struct utsname u;
+        if (uname(&u) != 0 || strcmp(u.nodename, "inner") || strcmp(u.domainname, "innerdom")) _exit(8);
+        pid_t g = fork();
+        if (g == 0) _exit(hn_is("inner") ? 0 : 1);   /* inherited on fork */
+        int gs = 0; waitpid(g, &gs, 0);
+        if (!WIFEXITED(gs) || WEXITSTATUS(gs) != 0) _exit(9);
+        _exit(0);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { printf("  child exit %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1); return 1; }
+    CHECK(gethostname(after, sizeof after) == 0 && !strcmp(before, after));
+    CHECK(rd_link("/proc/self/ns/uts", l2, sizeof l2) == 0 && !strcmp(l1, l2));
+    return 0;
+}
+static int t_uts_copy_inherit(void)
+{
+    CHECK(sethostname("parenthost", 10) == 0);
+    pid_t c = syscall(SYS_clone, SIGCHLD | CLONE_NEWUTS, 0, 0, 0, 0);
+    CHECK(c >= 0);
+    if (c == 0) {
+        if (!hn_is("parenthost")) _exit(1);          /* copied from the parent */
+        if (sethostname("childhost", 9) != 0) _exit(2);
+        _exit(hn_is("childhost") ? 0 : 3);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(hn_is("parenthost"));
+    pid_t f = fork();
+    if (f == 0) _exit(hn_is("parenthost") ? 0 : 1);  /* plain fork shares the name */
+    waitpid(f, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(sethostname("leandros", 8) == 0);
+    return 0;
+}
+static int t_uts_in_host_userns(void)
+{
+    /* a child userns holds no power over the host's UTS namespace */
+    CHECK(unshare(CLONE_NEWUSER) == 0);
+    CHECK(sethostname("evil", 4) == -1 && errno == EPERM);
     return 0;
 }
 
@@ -2109,7 +2212,8 @@ static int run_userns_cases(void)
         { "setns_userns_owner", t_setns_userns_owner }, { "setns_userns_root", t_setns_userns_root },
         { "setns_userns_threaded", t_setns_userns_threaded }, { "setns_userns_chroot", t_setns_userns_chroot },
         { "setns_misc", t_setns_misc }, { "setns_pid_children", t_setns_pid_children },
-        { "setns_ioctl", t_setns_ioctl }, { "setns_pidfd", t_setns_pidfd }, { "setns_fd_holds", t_setns_fd_holds },
+        { "setns_ioctl", t_setns_ioctl }, { "setns_pidfd", t_setns_pidfd }, { "setns_fd_holds", t_setns_fd_holds }, { "setns_uts", t_setns_uts },
+        { "uts_unpriv", t_uts_unpriv }, { "uts_copy_inherit", t_uts_copy_inherit }, { "uts_host_userns_eperm", t_uts_in_host_userns },
         { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
