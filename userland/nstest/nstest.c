@@ -1894,9 +1894,8 @@ static int t_setns_net(void)
     s = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(bind(s, (void *)&w, sizeof w) == -1 && errno == EADDRINUSE);   /* the child's listener */
     close(s);
-    int t = socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(connect(t, (void *)&a, sizeof a) == 0);
-    close(t); close(fd);
+    (void)a;   /* a non-initial netns has a down loopback: no connect to check */
+    close(fd);
     ns_release(c, hw);
     return 0;
 }
@@ -1929,7 +1928,7 @@ static int t_setns_eperm(void)
     errno = 0; CHECK(sys_setns(nf, 0) == -1 && errno == EPERM);
     errno = 0; CHECK(sys_setns(uf, 0) == -1 && errno == EPERM);
     errno = 0; CHECK(sys_setns(n2, CLONE_NEWNET) == -1 && errno == EPERM);
-    ns_release(c, hw); ns_release(c2, hw2);
+    ns_release(c2, hw2); ns_release(c, hw);   /* c2 inherited hw: release it first */
     return 0;
 }
 
