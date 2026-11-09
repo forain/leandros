@@ -33,4 +33,4 @@ No other test changed. nstest/captest/vfstest/chroottest are green unmodified (a
 - Fail-first: on main + the new idmaptest (branch lane/idpermx-guard, box aarch64, idmap=test) 7 cases FAIL (trusted_xattr_host_only, fcap_xattr_eperm_in_ns, create_unmapped_eov, ...); on the lane 0 fails.
 - Mac aarch64: idmaptest (knob) pass; idmaptest/nstest/captest/vfstest/chroottest pass without knob.
 - fsbench statwalk /tmp + statlat /tmp, Mac aarch64 HVF, main vs lane x2: statwalk p50 3us both, p99 7/6us, passes ~308k vs ~307k; statlat p50 17us both, p99 34-39us. Neutral.
-- Box full regress: see merge commit.
+- Box full regress: x86_64 75 suites 0 bad; aarch64 75 suites, only host:nettag2test (known wake-count flake) failed, rerun alone green.
