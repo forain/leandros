@@ -1073,7 +1073,8 @@ def main():
     for d in ("/sys", "/sys/bus", "/sys/bus/pci", "/sys/bus/pci/devices",
               "/sys/class", "/sys/class/block",
               "/sys/class/power_supply", "/sys/class/backlight",
-              "/sys/firmware", "/sys/firmware/acpi", "/sys/firmware/acpi/tables"):
+              "/sys/firmware", "/sys/firmware/acpi", "/sys/firmware/acpi/tables",
+              "/sys/fs", "/sys/fs/cgroup"):
         m4_share_dirs.add(d)
 
     for _minor, _node in ((0, "card0"), (128, "renderD128")):
