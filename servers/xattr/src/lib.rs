@@ -125,6 +125,22 @@ impl IdView {
         let n = (self.n[kind] as usize).min(MAP_EXT);
         self.ext[kind][..n].iter().any(|&(_, l, c)| kid >= l && kid - l < c)
     }
+    /// Namespace id -> kernel id (`None` when unmapped).
+    pub fn to_k(&self, kind: usize, id: u32) -> Option<u32> {
+        if self.ns == 0 { return Some(id); }
+        let n = (self.n[kind] as usize).min(MAP_EXT);
+        self.ext[kind][..n].iter()
+            .find(|&&(u, _, c)| id >= u && id - u < c)
+            .map(|&(u, l, _)| l + (id - u))
+    }
+    /// Kernel id -> namespace id (`None` when unmapped).
+    pub fn from_k(&self, kind: usize, kid: u32) -> Option<u32> {
+        if self.ns == 0 { return Some(kid); }
+        let n = (self.n[kind] as usize).min(MAP_EXT);
+        self.ext[kind][..n].iter()
+            .find(|&&(_, l, c)| kid >= l && kid - l < c)
+            .map(|&(u, l, _)| u + (kid - l))
+    }
 }
 
 /// The caller's identity as every permission gate sees it: effective uid,
@@ -858,6 +874,35 @@ pub fn unpack_create_mode(arg: u64) -> (u16, u16) {
 
 /// Longest ACL value the inheritance path handles (32 entries).
 pub const ACL_INHERIT_MAX: usize = ACL_HDR + 32 * ACL_ENT;
+
+/// Rewrite the named-entry ids of a posix_acl_xattr value through `f`
+/// (`kind` 0 = ACL_USER, 1 = ACL_GROUP). `Err(EINVAL)` when `f` refuses.
+fn acl_map_ids(v: &[u8], out: &mut [u8; ACL_INHERIT_MAX],
+               f: &dyn Fn(usize, u32) -> Option<u32>) -> Result<usize, i32> {
+    if v.len() > ACL_INHERIT_MAX || v.len() < ACL_HDR { return Err(EINVAL); }
+    out[..v.len()].copy_from_slice(v);
+    for i in 0..acl_entry_count(v) {
+        let e = acl_entry(v, i);
+        let kind = match e.tag { ACL_USER => 0, ACL_GROUP => 1, _ => continue };
+        let id = f(kind, e.id).ok_or(EINVAL)?;
+        let o = ACL_HDR + i * ACL_ENT + 4;
+        out[o..o + 4].copy_from_slice(&id.to_le_bytes());
+    }
+    Ok(v.len())
+}
+
+/// setxattr: translate the named entries of a user-supplied ACL from the
+/// caller's namespace to kernel ids (Linux `posix_acl_from_xattr`).
+/// EINVAL when an id is unmapped.
+pub fn acl_to_kernel(view: &IdView, v: &[u8], out: &mut [u8; ACL_INHERIT_MAX]) -> Result<usize, i32> {
+    acl_map_ids(v, out, &|k, id| view.to_k(k, id))
+}
+
+/// getxattr: translate stored (kernel-id) named entries into the reader's
+/// namespace; unmapped ids read as the overflow id 65534.
+pub fn acl_from_kernel(view: &IdView, v: &[u8], out: &mut [u8; ACL_INHERIT_MAX]) -> Result<usize, i32> {
+    acl_map_ids(v, out, &|k, id| Some(view.from_k(k, id).unwrap_or(65534)))
+}
 
 /// What a new inode gets at creation.
 pub struct Created {

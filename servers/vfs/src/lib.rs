@@ -13977,6 +13977,14 @@ fn tmp_setxattr_local(tmp: &mut TmpPool, owner: usize, cred: &xattr::Cred,
             return ok_reply();
         }
         let val = unsafe { core::slice::from_raw_parts(val_ptr as *const u8, size) };
+        let mut kbuf = [0u8; xattr::ACL_INHERIT_MAX];
+        let val = match xattr::acl_validate(val) {
+            Ok(_) => match xattr::acl_to_kernel(&cred.view, val, &mut kbuf) {
+                Ok(n) => &kbuf[..n],
+                Err(er) => return err_reply(-er),
+            },
+            Err(_) => return err_reply(-xattr::EINVAL),
+        };
         let summary = match xattr::acl_validate(val) {
             Ok(s) => s, Err(_) => return err_reply(-xattr::EINVAL),
         };
@@ -14023,6 +14031,14 @@ fn tmp_getxattr_local(tmp: &TmpPool, owner: usize, cred: &xattr::Cred,
     let value = match xattr::find(&xa[..], idx, suf) {
         Some(v) => v, None => return err_reply(-xattr::ENODATA),
     };
+    let mut kbuf = [0u8; xattr::ACL_INHERIT_MAX];
+    let value: &[u8] = if (idx == xattr::IDX_ACL_ACCESS || idx == xattr::IDX_ACL_DEFAULT)
+        && cred.view.ns != 0 {
+        match xattr::acl_from_kernel(&cred.view, value, &mut kbuf) {
+            Ok(n) => &kbuf[..n],
+            Err(er) => return err_reply(-er),
+        }
+    } else { value };
     let len = value.len();
     if size == 0 { return val_reply(len as u64); }
     if size < len { return err_reply(-xattr::ERANGE); }
