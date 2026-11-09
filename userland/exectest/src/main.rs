@@ -813,7 +813,7 @@ unsafe fn execveat_status(dirfd: i64, path: &[u8], argv: &[*const u8], flags: i6
     if child < 0 { return None; }
     if child == 0 {
         let r = syscall(SYS_EXECVEAT, dirfd, path.as_ptr(), argv.as_ptr(), ENVP.as_ptr(), flags);
-        let e = if r < 0 && *__errno_location() != 0 { *__errno_location() } else { 255 };
+        let e = if r < 0 { (-r) as c_int } else { 255 };
         _exit(e);
     }
     let mut st: c_int = 0;
