@@ -2067,9 +2067,12 @@ static int t_setns_uts(void)
     CHECK(pipe(rdy) == 0 && pipe(hold) == 0);
     pid_t c = fork();
     if (c == 0) {
-        if (unshare(CLONE_NEWUTS) || sethostname("nsjoin", 6)) _exit(1);
+        close(rdy[0]); close(hold[1]);
+        if (unshare(CLONE_NEWUTS)) _exit(1);
+        if (sethostname("nsjoin", 6)) _exit(2);
         char b = 'r'; (void)!write(rdy[1], &b, 1); (void)!read(hold[0], &b, 1); _exit(0);
     }
+    close(rdy[1]);
     char b; CHECK(read(rdy[0], &b, 1) == 1);
     int uf = ns_open(c, "uts");
     CHECK(uf >= 0);
