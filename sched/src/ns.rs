@@ -426,13 +426,12 @@ pub fn root_k(ns: NsId) -> Option<u32> { to_k(0, ns, 0) }
 /// Is kernel id `kid` mapped in namespace `ns` (id 0 maps everything)?
 pub fn mapped(kind: usize, ns: NsId, kid: u32) -> bool { from_k(kind, ns, kid).is_some() }
 
-/// Every id of `ids` (u32::MAX = "leave unchanged" is skipped) is mapped in
-/// the caller's user namespace (kind 0 uid, 1 gid)? Thin wrapper kept so main
-/// compiles; it is a membership test, callers must still translate with
-/// `to_k` (lane idxlate removes it).
-pub fn ids_mapped(kind: usize, ids: &[u32]) -> bool {
-    let ns = current_userns();
-    ids.iter().all(|&i| i == u32::MAX || mapped(kind, ns, i))
+/// An id argument taken from user space, in the caller's user namespace, as a
+/// kernel id. u32::MAX ("leave unchanged") passes through; an id with no
+/// mapping is None (callers answer EINVAL). Never pass the raw argument on.
+pub fn arg_id(kind: usize, id: u32) -> Option<u32> {
+    if id == u32::MAX { return Some(u32::MAX); }
+    to_k(kind, current_userns(), id)
 }
 
 /// The id `kid` as the calling task sees it (overflow id when unmapped).

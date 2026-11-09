@@ -2274,16 +2274,23 @@ fn dispatch_inner(
         // number as GETPGID on AArch64, so only emit this arm on x86-64.
         #[cfg(target_arch = "x86_64")]
         GETPGRP     => sched::pidns::out(sched::current_pgid()) as isize,
-        SETUID => if !sched::ns::ids_mapped(0, &[a0 as u32]) { -22 } else if sched::set_current_uid(a0 as u32) { 0 } else { -1 }, // EPERM
-        SETGID => if !sched::ns::ids_mapped(1, &[a0 as u32]) { -22 } else if sched::set_current_gid(a0 as u32) { 0 } else { -1 }, // EPERM
-        SETRESUID => if !sched::ns::ids_mapped(0, &[a0 as u32, a1 as u32, a2 as u32]) { -22 } else if sched::set_current_resuid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
-        SETRESGID => if !sched::ns::ids_mapped(1, &[a0 as u32, a1 as u32, a2 as u32]) { -22 } else if sched::set_current_resgid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
+        SETUID => match sched::ns::arg_id(0, a0 as u32) { None => -22, Some(u) => if sched::set_current_uid(u) { 0 } else { -1 } }, // EPERM
+        SETGID => match sched::ns::arg_id(1, a0 as u32) { None => -22, Some(g) => if sched::set_current_gid(g) { 0 } else { -1 } }, // EPERM
+        SETRESUID => match (sched::ns::arg_id(0, a0 as u32), sched::ns::arg_id(0, a1 as u32), sched::ns::arg_id(0, a2 as u32)) {
+            (Some(r), Some(e), Some(s)) => if sched::set_current_resuid(r, e, s) { 0 } else { -1 }, // EPERM
+            _ => -22,
+        },
+        SETRESGID => match (sched::ns::arg_id(1, a0 as u32), sched::ns::arg_id(1, a1 as u32), sched::ns::arg_id(1, a2 as u32)) {
+            (Some(r), Some(e), Some(s)) => if sched::set_current_resgid(r, e, s) { 0 } else { -1 }, // EPERM
+            _ => -22,
+        },
         SETGROUPS => sys_setgroups(a0, a1),
         // Both answer the previous filesystem id, changed or not (Linux).
-        SETFSUID => sched::set_current_fsid(a0 as u32, false) as isize,
-        SETFSGID => sched::set_current_fsid(a0 as u32, true) as isize,
-        SETREUID  => if !sched::ns::ids_mapped(0, &[a0 as u32, a1 as u32]) { -22 } else { sched::cred::set_re_ids(a0 as u32, a1 as u32, false) },
-        SETREGID  => if !sched::ns::ids_mapped(1, &[a0 as u32, a1 as u32]) { -22 } else { sched::cred::set_re_ids(a0 as u32, a1 as u32, true) },
+        // The argument is a namespace id (translated in); the answer is the old id as the caller sees it.
+        SETFSUID => match sched::ns::arg_id(0, a0 as u32) { Some(u) => sched::ns::view_id(0, sched::set_current_fsid(u, false)) as isize, None => sched::ns::view_id(0, sched::set_current_fsid(u32::MAX, false)) as isize },
+        SETFSGID => match sched::ns::arg_id(1, a0 as u32) { Some(g) => sched::ns::view_id(1, sched::set_current_fsid(g, true)) as isize, None => sched::ns::view_id(1, sched::set_current_fsid(u32::MAX, true)) as isize },
+        SETREUID  => match (sched::ns::arg_id(0, a0 as u32), sched::ns::arg_id(0, a1 as u32)) { (Some(r), Some(e)) => sched::cred::set_re_ids(r, e, false), _ => -22 },
+        SETREGID  => match (sched::ns::arg_id(1, a0 as u32), sched::ns::arg_id(1, a1 as u32)) { (Some(r), Some(e)) => sched::cred::set_re_ids(r, e, true), _ => -22 },
         GETRESUID   => sys_getresxid(a0, a1, a2, false),
         GETRESGID   => sys_getresxid(a0, a1, a2, true),
         GETGROUPS   => sys_getgroups(a0, a1),
@@ -9992,7 +9999,7 @@ fn sys_removexattr(target: usize, name: usize, is_fd: bool, nofollow: bool) -> i
 }
 
 fn sys_fchown(fd: usize, uid: usize, gid: usize) -> isize {
-    if !chown_ids_mapped(uid, gid) { return -22; } // EINVAL: unmapped in the caller's userns
+    let (uid, gid) = match chown_kids(uid, gid) { Some(v) => v, None => return -22 }; // EINVAL: unmapped in the caller's userns
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_FCHOWN, &[fd as u64, uid as u64, gid as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
@@ -10000,12 +10007,18 @@ fn sys_fchown(fd: usize, uid: usize, gid: usize) -> isize {
 
 /// chown family ids are taken in the caller's namespace view; an id with no
 /// mapping there is EINVAL (-1 = leave unchanged).
-fn chown_ids_mapped(uid: usize, gid: usize) -> bool {
-    sched::ns::ids_mapped(0, &[uid as u32]) && sched::ns::ids_mapped(1, &[gid as u32])
+/// Returns the kernel ids to hand on (usize::MAX-style -1 stays 0xFFFF_FFFF as given).
+fn chown_kids(uid: usize, gid: usize) -> Option<(usize, usize)> {
+    let u = sched::ns::arg_id(0, uid as u32)?;
+    let g = sched::ns::arg_id(1, gid as u32)?;
+    // Keep the caller's -1 encoding (usize::MAX when passed as -1 sign-extended).
+    let u = if u == u32::MAX { uid } else { u as usize };
+    let g = if g == u32::MAX { gid } else { g as usize };
+    Some((u, g))
 }
 
 fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, flags: usize) -> isize {
-    if !chown_ids_mapped(uid, gid) { return -22; }
+    let (uid, gid) = match chown_kids(uid, gid) { Some(v) => v, None => return -22 };
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
     let tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LCHOWN } else { vfs::VFS_CHOWN };
@@ -10028,6 +10041,10 @@ fn sys_setgroups(size: usize, list_ptr: usize) -> isize {
         let bytes = unsafe { core::slice::from_raw_parts_mut(groups.as_mut_ptr() as *mut u8, size * 4) };
         let ok = with_current_address_space(|as_| as_.read_user_buf(list_ptr, bytes)).unwrap_or(false);
         if !ok { return -14; }
+        // Groups arrive as namespace ids; the task stores kernel ids.
+        for g in groups[..size].iter_mut() {
+            match sched::ns::to_k(1, ns, *g) { Some(k) => *g = k, None => return -22 } // EINVAL: unmapped
+        }
     }
     if sched::set_current_groups(&groups[..size]) { 0 } else { -1 } // EPERM
 }
@@ -10042,6 +10059,8 @@ fn sys_getgroups(size: usize, list_ptr: usize) -> isize {
     if n > 0 {
         if !validate_user_buf(list_ptr, n * 4) { return -14; }
         prefault_user(list_ptr, n * 4);
+        // Kernel ids out, as the caller's namespace sees them.
+        for g in groups[..n].iter_mut() { *g = sched::ns::view_id(1, *g); }
         let bytes = unsafe { core::slice::from_raw_parts(groups.as_ptr() as *const u8, n * 4) };
         let ok = copy_to_user_bytes(list_ptr, bytes);
         if !ok { return -14; }
