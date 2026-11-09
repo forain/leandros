@@ -9414,7 +9414,6 @@ fn sys_mount_fuse(source: &str, target: &[u8], fstype: &str, flags: usize, data_
 }
 
 fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
-fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
     if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
     let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
     // An alias mount (a chroot's /proc, a bind mount) is named by where the
