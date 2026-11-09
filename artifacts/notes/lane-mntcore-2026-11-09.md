@@ -34,3 +34,11 @@ Status: see RESULTS at the bottom. Design: leandros-artifacts/orch/designs/desig
 - PT_INTERP / shebang: not `raw` sites; they reopen through `open_kernel_path`, so an
   interpreter path in a mntns task is resolved as a backing path. M1/M6 must translate it
   (the design's M0 audit item): left unchanged here because no task can have mntns != 0 yet.
+
+## RESULTS: DELIVERED
+- aarch64 (Mac HVF) default regress: all green except host:vfstagtest (flock_wait/setlkw_wait wake counts, load flake); passes alone on aarch64 and x86_64 (box).
+- x86_64 box regress: 71 suites, only vfstagtest (same flake); mnttest passes both arches.
+- ffsandbox.py aarch64 --mode on: RESULT {'on': True}.
+- Path-lookup bench (`mnttest bench`, aarch64 HVF, base main 5dbe46da vs lane, 2 interleaved runs x 3 rounds):
+  absolute paths: base 4.46-4.67 us/stat, lane 4.46-4.63 us (same); relative paths: base 3.02-3.41 us, lane 2.82-2.88 us (about 7% faster, one RUN_QUEUE lock instead of two in resolve_ns).
+- Mount selftest (/proc/mntselftest): 20 rows PASS (walk, overmount, file bind, nested, reverse, copy, locks, sb refs, linkscan, callctx).
