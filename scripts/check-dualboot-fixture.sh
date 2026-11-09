@@ -26,7 +26,7 @@ if [ -z "$BOOT" ] || [ "$MODE" = installed ]; then
   . "$HERE/container-lib.sh"; leandros_pick_container || { echo "no container: $CT_WHY" >&2; exit 1; }
   $CT run --rm -e MODE=$MODE -e SHRUNK=$SHRUNK -e SESSB=$SESSB -e P2ATTRS=$P2ATTRS -v "$HERE/dualboot-fixture:/scripts:ro" \
     -v "$IMG:/img:ro" $(for s in meta manifest esp.sha256; do [ -f "$IMG.$s" ] && printf -- '-v %s:/img.%s:ro ' "$IMG.$s" "$s"; done) \
-    alpine:3.21 sh /scripts/check-inner.sh || RC=$?
+    "$(leandros_alpine_image)" sh /scripts/check-inner.sh || RC=$?
 fi
 if [ -n "$BOOT" ]; then
   case "$BOOT" in

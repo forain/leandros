@@ -3146,7 +3146,7 @@ pub fn set_dumpable(v: bool) {
 /// May `t` change uids (`gid == false`, CAP_SETUID) or gids (CAP_SETGID)
 /// freely? Initial namespace: euid 0 (as before). In a user namespace the
 /// capability held there decides; targets are limited to mapped ids by the
-/// syscall layer (`ns::ids_mapped`), so privilege never reaches unmapped ids.
+/// syscall layer (`ns::arg_id`, which translates to kernel ids), so privilege never reaches unmapped ids.
 pub(crate) fn setid_priv(t: &task::Task, gid: bool) -> bool {
     if t.userns.id() == 0 { t.euid == 0 } else { t.caps[0] >> (if gid { 6 } else { 7 }) & 1 != 0 }
 }

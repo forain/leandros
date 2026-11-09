@@ -2592,6 +2592,7 @@ pub fn register_mount(prefix: &'static str, port: u32, device: &'static str, fst
         let dev = bdev.filter(|&d| !m.iter().any(|e| e.in_use && e.dev == d))
             .unwrap_or(makedev(0, 32 + i as u32));
         m[i] = MountEntry { prefix, port, in_use: true, device, fstype, nosuid: false, rdonly: false, dev };
+        recount_tmp_nested(&*m);
     }
 }
 
@@ -2665,6 +2666,7 @@ pub fn unregister_mount(prefix: &str) -> bool {
     let mut m = MOUNTS.lock();
     if let Some(slot) = m.iter_mut().find(|e| e.in_use && e.prefix == prefix) {
         *slot = MountEntry::empty();
+        recount_tmp_nested(&*m);
         true
     } else {
         false
@@ -2677,7 +2679,7 @@ pub fn unregister_mount(prefix: &str) -> bool {
 fn mounted_inside_tmpfs(path: &[u8]) -> bool {
     MOUNTS.lock().iter().any(|e| {
         let pb = e.prefix.as_bytes();
-        e.in_use && is_tmp_path(pb) && path.starts_with(pb)
+        e.in_use && tmpfs_root_of(pb).is_some() && path.starts_with(pb)
             && (path.len() == pb.len() || path.get(pb.len()) == Some(&b'/'))
     })
 }
@@ -5243,7 +5245,16 @@ fn tmpfs_root_of(path: &[u8]) -> Option<&'static [u8]> {
 
 /// Return true if `path` lives under any tmpfs mount root (root or descendant).
 fn is_tmp_path(path: &[u8]) -> bool {
-    tmpfs_root_of(path).is_some()
+    tmpfs_root_of(path).is_some() && !(TMP_NESTED_MOUNTS.load(atomic::Ordering::Relaxed) != 0 && mounted_inside_tmpfs(path))
+}
+
+/// Mounts whose mount point lies inside a tmpfs root (a FUSE filesystem on
+/// /tmp/x): paths under them belong to the mount, not to the tmpfs.
+static TMP_NESTED_MOUNTS: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+
+fn recount_tmp_nested(m: &[MountEntry]) {
+    let n = m.iter().filter(|e| e.in_use && tmpfs_root_of(e.prefix.as_bytes()).is_some()).count();
+    TMP_NESTED_MOUNTS.store(n, atomic::Ordering::Relaxed);
 }
 
 /// S_IFDIR mode (type | permission bits) for a RAMFS_DIRS pseudo-directory.
