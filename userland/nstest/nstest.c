@@ -131,6 +131,37 @@ static int t_host_unaffected(void)
     return 0;
 }
 
+
+/* H1: chdir/open/stat through another user's /proc/<pid>/{cwd,root,ns} are EACCES. */
+static int magic_unpriv(void)
+{
+    char p[96], buf[8]; struct stat sb;
+    if (drop_to(1000)) return 2;
+    snprintf(p, sizeof p, "/proc/%d/cwd", (int)root_sleeper);
+    CHECK(chdir(p) == -1 && errno == EACCES);
+    CHECK(stat(p, &sb) == -1 && errno == EACCES);
+    CHECK(lstat(p, &sb) == -1 && errno == EACCES);
+    snprintf(p, sizeof p, "/proc/%d/root/etc/hostname", (int)root_sleeper);
+    CHECK(open(p, O_RDONLY) == -1 && errno == EACCES);
+    snprintf(p, sizeof p, "/proc/%d/ns/net", (int)root_sleeper);
+    CHECK(readlink(p, buf, sizeof buf) == -1 && errno == EACCES);
+    CHECK(chdir("/proc/self/cwd") == 0);
+    int fd = open("/proc/self/root/etc/hostname", O_RDONLY);
+    CHECK(fd >= 0); if (fd >= 0) close(fd);
+    return 0;
+}
+static int t_magic_link_access(void)
+{
+    root_sleeper = fork();
+    if (root_sleeper == 0) { pause(); _exit(0); }
+    pid_t c = fork();
+    if (c == 0) _exit(magic_unpriv());
+    int st = 0; waitpid(c, &st, 0);
+    kill(root_sleeper, SIGKILL); waitpid(root_sleeper, 0, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+
 static int t_unshare_basic(void)
 {
     CHECK(drop_to(1000) == 0);
@@ -1719,7 +1750,7 @@ static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
         { "unpriv_clone_full_caps", t_unpriv_clone }, { "ns_chroot", t_ns_chroot },
-        { "host_root_unaffected", t_host_unaffected }, { "unshare_basic", t_unshare_basic },
+        { "host_root_unaffected", t_host_unaffected }, { "magic_link_access", t_magic_link_access }, { "unshare_basic", t_unshare_basic },
         { "unshare_threaded_einval", t_unshare_threaded }, { "other_new_einval", t_other_new_einval },
         { "depth_limit_32", t_depth_limit }, { "ns_leak", t_leak }, { "suid_ignored_in_userns", t_suid_ignored },
         { "ff_probe", t_ff_probe }, { "unshare_pid_eperm", t_unshare_pid_eperm },
