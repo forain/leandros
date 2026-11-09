@@ -734,6 +734,7 @@ mod nr {
     pub const GETRANDOM:      usize = 278;
     pub const SECCOMP:        usize = 277;
     pub const PRCTL:          usize = 167;
+    pub const PERSONALITY:    usize = 92;
     pub const MADVISE:        usize = 233;
     pub const MSYNC:          usize = 227;
     pub const MLOCK:          usize = 228;
@@ -998,6 +999,7 @@ mod nr {
     pub const GETRANDOM:      usize = 318;
     pub const SECCOMP:        usize = 317;
     pub const PRCTL:          usize = 157;
+    pub const PERSONALITY:    usize = 135;
     pub const MADVISE:        usize = 28;
     pub const MSYNC:          usize = 26;
     pub const MLOCK:          usize = 149;
@@ -2551,6 +2553,7 @@ fn dispatch_inner(
 
         // ── Misc ──────────────────────────────────────────────────────────────
         UNAME      => sys_uname(a0),
+        PERSONALITY => sched::personality(a0 as u32) as isize,
         PRLIMIT64  => sys_prlimit64(a0, a1, a2, a3),
         // Linux exit_group(2) kills every thread in the calling process, not
         // just the caller. `sched::exit_group` owns that sequence (single
@@ -4296,7 +4299,26 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
     const PR_SET_MM: usize = 35;
     const PR_SET_PDEATHSIG: usize = 1;
     const PR_GET_PDEATHSIG: usize = 2;
+    const PR_GET_KEEPCAPS: usize = 7;
+    const PR_SET_KEEPCAPS: usize = 8;
+    const PR_GET_SECUREBITS: usize = 27;
+    const PR_SET_SECUREBITS: usize = 28;
+    const PR_SET_CHILD_SUBREAPER: usize = 36;
+    const PR_GET_CHILD_SUBREAPER: usize = 37;
+    const PR_CAP_AMBIENT: usize = 47;
     match option {
+        PR_GET_KEEPCAPS => sched::caps::keepcaps(),
+        PR_SET_KEEPCAPS => sched::caps::set_keepcaps(arg2),
+        PR_GET_SECUREBITS => sched::caps::securebits(),
+        PR_SET_SECUREBITS => sched::caps::set_securebits(arg2 as u64),
+        PR_CAP_AMBIENT => sched::caps::ambient(arg2, a3, a4, a5),
+        PR_SET_CHILD_SUBREAPER => { sched::set_child_subreaper(arg2 != 0); 0 }
+        PR_GET_CHILD_SUBREAPER => {
+            let v = (sched::child_subreaper() as i32).to_ne_bytes();
+            if !validate_user_buf(arg2, 4) { return -14; }
+            if unsafe { sched::uaccess::copy_to_user(arg2, v.as_ptr(), 4) } != 0 { return -14; }
+            0
+        }
         PR_SET_NAME => {
             // Up to 15 bytes of the NUL-terminated user string (Linux
             // truncates silently); shared with /proc/<tid>/comm.
