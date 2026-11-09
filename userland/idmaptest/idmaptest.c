@@ -32,8 +32,10 @@ static int slurp(const char *path, char *buf, int cap)
 static int writable(const char *path)
 {
     int fd = open(path, O_WRONLY);
-    if (fd >= 0) { close(fd); return 1; }
-    return 0;
+    if (fd < 0) return 0;
+    int w = write(fd, "1\n", 2);
+    close(fd);
+    return w == 2;
 }
 
 static void subuid_present(void)
