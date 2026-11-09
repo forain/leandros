@@ -274,6 +274,7 @@ static void ns_child(const char *base, int wr, int rd) {
         ok = write(fd, "hi", 2) == 2 && lseek(fd, 0, SEEK_SET) == 0 && read(fd, rb, 7) == 2 && !memcmp(rb, "hi", 2);
         close(fd);
     }
+    if (!ok) printf("newns_tmpfs_rw: errno=%d fd=%d uid=%d\n", errno, fd, (int)getuid());
     report("newns_tmpfs_rw", ok);
     sync_parent(wr, rd);
     report("newns_umount", umount_(t, 0) == 0);
