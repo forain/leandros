@@ -222,7 +222,7 @@ pub fn ctty_dev_of_sid(sid: u32) -> Option<(u32, u32, u32)> {
     if sid == 0 { return None; }
     if let Some((n, vt, pgrp)) = pty::ctty_of_sid(sid) {
         return Some(if vt != 0 { (4, vt as u32, pgrp) }
-                    else { (136 + n as u32 / 256, n as u32 % 256, pgrp) });
+                    else { let n = pty::ident(n).1 as u32; (136 + n / 256, n % 256, pgrp) });
     }
     if *CONSOLE_SID.lock() == sid {
         return Some((5, 1, *CONSOLE_FG_PGID.lock()));
