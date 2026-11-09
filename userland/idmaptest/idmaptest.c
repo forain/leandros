@@ -292,7 +292,7 @@ static void procsys_overflow(void)
     report("procsys_overflow",
            procsys_is("/proc/sys/kernel/overflowuid", "65534\n")
         && procsys_is("/proc/sys/kernel/overflowgid", "65534\n")
-        && procsys_is("/proc/sys/user/max_user_namespaces", "255\n"));
+        && procsys_is("/proc/sys/user/max_user_namespaces", "32\n"));
 }
 
 /* ===== lane idcore: composed map cases ===== */
