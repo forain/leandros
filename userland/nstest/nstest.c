@@ -49,7 +49,6 @@ static void check(const char *name, int ok)
 }
 
 static const struct { const char *n; unsigned long f; } flags[] = {
-    {"NEWNS", CLONE_NEWNS},
     {"NEWCGROUP", CLONE_NEWCGROUP},
 };
 
@@ -185,9 +184,9 @@ static int t_unshare_threaded(void)
 }
 static int t_other_new_einval(void)
 {
-    int fl[] = { 0x00020000, 0x02000000 };
+    int fl[] = { 0x02000000 };
     CHECK(drop_to(1000) == 0);
-    for (unsigned i = 0; i < 2; i++) {
+    for (unsigned i = 0; i < 1; i++) {
         CHECK(unshare(fl[i]) == -1 && errno == EINVAL);
         long r = syscall(SYS_clone, SIGCHLD | fl[i], 0, 0, 0, 0);
         CHECK(r == -1 && errno == EINVAL);

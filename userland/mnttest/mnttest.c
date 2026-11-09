@@ -70,14 +70,11 @@ static void sb_hidden_ns0(void) {
 }
 
 /* Counters: no mount namespace may exist at baseline, and CLONE_NEWNS is
- * still rejected until M1. */
+ *  */
 static void ns0_invariants(void) {
     static char buf[1024];
     int ok = slurp("/proc/mntselftest", buf, sizeof buf) > 0 && strstr(buf, "ns_dying=0") != NULL;
     report("no_dying_ns", ok);
-    errno = 0;
-    int r = unshare(CLONE_NEWNS);
-    report("newns_still_rejected", r < 0 && (errno == EINVAL || errno == EPERM));
     char cwd[256];
     report("getcwd_ns0", getcwd(cwd, sizeof cwd) != NULL);
     struct stat st;
@@ -163,6 +160,7 @@ static void ns_child(const char *base, int wr, int rd) {
     char a[96], b[96], c[96], t[96], f[96], d[96], x[128], bsub[128], bmark[128], cwd[256];
     path(a, sizeof a, base, "a"); path(b, sizeof b, base, "b"); path(c, sizeof c, base, "c");
     path(t, sizeof t, base, "t"); path(f, sizeof f, base, "f"); path(d, sizeof d, base, "d");
+    fails = 0; /* inherited from the parent */
     if (setgid(65534) || setuid(65534)) _exit(99);
     if (chdir(a)) _exit(98);
     int r = unshare(CLONE_NEWUSER | CLONE_NEWNS);
