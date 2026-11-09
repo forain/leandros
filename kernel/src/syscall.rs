@@ -10431,6 +10431,8 @@ fn sys_chdir(path_ptr: usize) -> isize {
     // chdir("/proc/self/fd/N") follows the magic link, as on Linux: it is
     // fchdir(N), not a cwd inside /proc.
     if let Some((fd, b"")) = proc_own_fd(path.bytes()) { return sys_fchdir(fd); }
+    // chdir("/proc/<pid>/cwd|root") follows the magic link; another user's is EACCES.
+    let path = match follow_magic_final(path) { Ok(p) => p, Err(e) => return e };
 
     // Check the target exists by opening it O_RDONLY. Probe the *resolved*
     // path: re-resolving the user pointer here would repeat the work, and
