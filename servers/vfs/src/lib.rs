@@ -921,6 +921,7 @@ fn dmabuf_release(obj: u32) {
 /// function lock-order-neutral.
 #[must_use = "the dmabuf reference must be dropped, with TMP_FILES released"]
 fn vmo_free_slot(owner: usize) -> Option<u32> {
+    NSMAP_OPENERS.lock()[owner] = None; // drops the captured namespace reference
     let vmo = TMP_VMOS.lock()[owner].take()?;
     vmo_free_owned(vmo)
 }
@@ -4412,7 +4413,7 @@ static RAMFS: &[RamEntry] = &[
     // user-namespace limit (ns::NS_MAX - 1 usable). Read-only.
     RamEntry { path: b"/proc/sys/kernel/overflowuid", data: b"65534\n" },
     RamEntry { path: b"/proc/sys/kernel/overflowgid", data: b"65534\n" },
-    RamEntry { path: b"/proc/sys/user/max_user_namespaces", data: b"255\n" },
+    RamEntry { path: b"/proc/sys/user/max_user_namespaces", data: b"32\n" },
 ];
 const _: () = assert!(sched::runqueue::MAX_TASKS == 4096, "update /proc/sys/kernel/threads-max");
 
@@ -7619,7 +7620,7 @@ fn open_proc_task(caller: u32, t: ProcTask, flags: u32) -> Result<VnodeKind, i32
 /// (Linux: a PTRACE_MODE_READ check).
 fn proc_environ_allowed(caller: u32, target: u32) -> bool {
     let me = sched::euid_of(caller);
-    me == 0 || me == sched::euid_of(target)
+    sched::host_root_of(caller) || me == sched::euid_of(target)
 }
 
 /// stat of a per-process procfs path: `None` not one; `Some(None)` it names
@@ -7718,7 +7719,7 @@ fn gen_proc_oom_writable(tid: u32) -> Option<VnodeKind> {
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
 }
 /// Opener credentials of each writable map file, by tmp-pool slot.
-static NSMAP_OPENERS: Mutex<[Option<sched::ns::Opener>; MAX_TMP_FILES]> = Mutex::new([None; MAX_TMP_FILES]);
+static NSMAP_OPENERS: Mutex<[Option<sched::ns::Opener>; MAX_TMP_FILES]> = Mutex::new([const { None }; MAX_TMP_FILES]);
 
 /// `/proc/<pid|self>/{uid_map,gid_map,setgroups}` → (thread group, 0|1|2).
 fn proc_nsmap_target(path: &[u8], caller: u32) -> Option<(u32, usize)> {
@@ -8632,8 +8633,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // Open /proc/<pid>/{uid_map,gid_map,setgroups} for writing.
             let (tpid, kind) = proc_nsmap_target(lookup_path, pid).unwrap();
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
-            let Some(op) = sched::ns::snapshot(pid) else { return err_reply(-1) };
-            if !sched::ns::open_allowed(op, tpid, kind) { return err_reply(-1); } // EPERM
+            let Some(op) = sched::ns::snapshot(pid, tpid) else { return err_reply(-1) };
+            if !sched::ns::open_allowed(&op, kind) { return err_reply(-1); } // EPERM
             match gen_proc_nsmap_writable(tpid, kind, op) {
                 Some(v) => v,
                 None    => return err_reply(-23),
@@ -8656,7 +8657,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
             if flags & 0o3 == 0o0 { return err_reply(-13); }
             let me = sched::euid_of(pid);
-            if me != 0 && me != sched::euid_of(tpid) { return err_reply(-13); }
+            if !sched::host_root_of(pid) && me != sched::euid_of(tpid) { return err_reply(-13); }
             match gen_proc_oom_writable(tpid) {
                 Some(v) => v,
                 None    => return err_reply(-23),
@@ -8667,7 +8668,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
             if flags & 0o3 == 0o0 { return err_reply(-13); }
             let me = sched::euid_of(pid);
-            if me != 0 && me != sched::euid_of(tpid) { return err_reply(-13); } // EACCES
+            if !sched::host_root_of(pid) && me != sched::euid_of(tpid) { return err_reply(-13); } // EACCES
             match gen_proc_comm_writable(tpid) {
                 Some(v) => v,
                 None    => return err_reply(-23),
@@ -9468,7 +9469,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                         core::ptr::write_unaligned(rec.add(SSI_PTR)     as *mut u64, info.si_value);
                     } else {
                         core::ptr::write_unaligned(rec.add(SSI_PID) as *mut u32, info.si_pid as u32);
-                        core::ptr::write_unaligned(rec.add(SSI_UID) as *mut u32, info.si_uid);
+                        core::ptr::write_unaligned(rec.add(SSI_UID) as *mut u32, sched::ns::view_id(0, info.si_uid));
                         if info.si_code == SI_QUEUE {
                             core::ptr::write_unaligned(rec.add(SSI_INT) as *mut i32, info.si_value as i32);
                             core::ptr::write_unaligned(rec.add(SSI_PTR) as *mut u64, info.si_value);
@@ -9661,9 +9662,11 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let n = count.min(512);
                 let mut data = [0u8; 512];
                 if unsafe { sched::uaccess::copy_raw(data.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
-                let Some(op) = NSMAP_OPENERS.lock()[idx] else { return err_reply(-1) };
-                let r = if k == 2 { sched::ns::write_setgroups(op, pid, tgid, &data[..n]) }
-                        else { sched::ns::write_map(op, pid, tgid, k, &data[..n]) };
+                let g = NSMAP_OPENERS.lock();
+                let Some(op) = g[idx].as_ref() else { return err_reply(-1) };
+                let r = if k == 2 { sched::ns::write_setgroups(op, pid, &data[..n]) }
+                        else { sched::ns::write_map(op, pid, k, &data[..n]) };
+                drop(g); let _ = tgid;
                 return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
             }
             let cg_w = {
@@ -9720,7 +9723,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
             }
             if let Some(tid) = comm_tid {
                 let me = sched::euid_of(pid);
-                if me != 0 && me != sched::euid_of(tid) { return err_reply(-13); }
+                if !sched::host_root_of(pid) && me != sched::euid_of(tid) { return err_reply(-13); }
                 if sched::proc_stat_of(tid).is_none() { return err_reply(-3); } // ESRCH
                 let n = count.min(15);
                 let mut name = [0u8; 15];

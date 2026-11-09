@@ -101,6 +101,42 @@ fn put(mut id: NsId) {
     }
 }
 
+/// Per-kuid namespace quota (Linux ucounts; host root exempt): a creator may
+/// own at most `MAX_USERNS_PER_UID` user namespaces and `MAX_NS_PER_UID`
+/// namespaces of all kinds, so one uid cannot exhaust the shared table.
+pub const MAX_USERNS_PER_UID: usize = 32;
+pub const MAX_NS_PER_UID: usize = 64;
+static SLOT_USER: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
+
+/// kuid that created live slot `id` (0 for host-created ones).
+fn slot_creator(id: usize) -> u32 {
+    if SLOT_USER[id].load(Acquire) != 0 { return OWNER_EUID[id].load(Acquire); }
+    let o = if IS_MNT[id].load(Acquire) != 0 { OWNER_USER[id].load(Acquire) }
+            else if CGNS_FLAG[id].load(Acquire) != 0 { PARENT[id].load(Acquire) as NsId }
+            else { OWNER_UNS[id].load(Acquire) };
+    if o == 0 { 0 } else { OWNER_EUID[o as usize].load(Acquire) }
+}
+
+/// ENOSPC when `kuid` already owns its share of namespaces.
+fn quota_ok(kuid: u32, want_user: bool) -> bool {
+    if kuid == 0 { return true; }
+    let (mut all, mut users) = (0usize, 0usize);
+    for id in 1..NS_MAX {
+        let r = REFS[id].load(Relaxed);
+        if r == 0 || r == DYING { continue; }
+        if slot_creator(id) == kuid {
+            all += 1;
+            if SLOT_USER[id].load(Acquire) != 0 { users += 1; }
+        }
+    }
+    all < MAX_NS_PER_UID && !(want_user && users >= MAX_USERNS_PER_UID)
+}
+
+/// Quota check for a non-user namespace created under owner user namespace `owner`.
+fn quota_owner_ok(owner: NsId) -> bool {
+    owner == 0 || quota_ok(OWNER_EUID[owner as usize].load(Acquire), false)
+}
+
 /// Create a user namespace owned by (`euid`, `egid`) as a child of `parent`.
 /// The returned reference is the caller's; clone it for each holder.
 /// Errors are negative errnos: EUSERS (87) too deep, ENOSPC (28) table full.
@@ -110,6 +146,7 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
     if from_k(0, parent, euid).is_none() || from_k(1, parent, egid).is_none() { return Err(-1); }
     let level = if parent == 0 { 0 } else { LEVEL[parent as usize].load(Acquire) };
     if level >= MAX_USERNS_LEVEL { return Err(-87); }
+    if !quota_ok(euid, true) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             let p = NsRef::get(parent); // the child's reference on its parent
@@ -122,6 +159,7 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
             SETGROUPS_DENY[id].store(if parent != 0 { SETGROUPS_DENY[parent as usize].load(Acquire) } else { 0 }, Release);
             OWNER_EUID[id].store(euid, Release);
             OWNER_EGID[id].store(egid, Release);
+            SLOT_USER[id].store(1, Release);
             return Ok(NsRef(id as NsId));
         }
     }
@@ -148,6 +186,7 @@ pub fn owner_user(id: NsId) -> NsId { if id == 0 { 0 } else { OWNER_USER[id as u
 
 /// Create a mount namespace id owned by user namespace `owner_user`.
 pub fn new_mntns(owner_user: NsId) -> Result<NsRef, isize> {
+    if !quota_owner_ok(owner_user) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             PARENT[id].store(0, Release);
@@ -156,6 +195,7 @@ pub fn new_mntns(owner_user: NsId) -> Result<NsRef, isize> {
             // the owner id cannot be reused while the mount tree lives.
             core::mem::forget(NsRef::get(owner_user));
             OWNER_USER[id].store(owner_user, Release);
+            SLOT_USER[id].store(0, Release);
             IS_MNT[id].store(1, Release);
             MNT_LIVE.fetch_add(1, AcqRel);
             return Ok(NsRef(id as NsId));
@@ -204,12 +244,14 @@ pub fn dying_count() -> usize { (1..NS_MAX).filter(|&i| REFS[i].load(Relaxed) ==
 
 /// Create a flat (parentless) namespace id: net or ipc. Errors: ENOSPC (28).
 pub fn new_flat(owner: NsId) -> Result<NsRef, isize> {
+    if !quota_owner_ok(owner) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             PARENT[id].store(0, Release);
             LEVEL[id].store(0, Release);
             set_owner_userns(id as NsId, owner);
             LO_UP[id].store(0, Release);
+            SLOT_USER[id].store(0, Release);
             return Ok(NsRef(id as NsId));
         }
     }
@@ -377,6 +419,7 @@ static PID_FLAGS: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 pub fn new_pidns(parent: NsId, owner: NsId) -> Result<NsRef, isize> {
     let level = level(parent);
     if level >= MAX_PIDNS_LEVEL { return Err(-28); }
+    if !quota_owner_ok(owner) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             let p = NsRef::get(parent);
@@ -385,6 +428,7 @@ pub fn new_pidns(parent: NsId, owner: NsId) -> Result<NsRef, isize> {
             LEVEL[id].store(level + 1, Release);
             PID_INIT[id].store(0, Release);
             PID_FLAGS[id].store(0, Release);
+            SLOT_USER[id].store(0, Release);
             set_owner_userns(id as NsId, owner);
             crate::pidns::USED.store(true, Relaxed);
             return Ok(NsRef(id as NsId));
@@ -448,14 +492,6 @@ pub fn from_k(kind: usize, ns: NsId, kid: u32) -> Option<u32> {
     None
 }
 
-/// The kernel id for id `vid` as the calling task names it (its user
-/// namespace's view); None when that namespace has no mapping for it. Inverse
-/// of `view_id`: the one place a non-identity map must change.
-pub fn kid_from_view(kind: usize, vid: u32) -> Option<u32> {
-    let ns = current_userns();
-    if mapped(kind, ns, vid) { Some(vid) } else { None }
-}
-
 /// Overflow id shown for ids with no mapping.
 pub const OVERFLOW_ID: u32 = 65534;
 
@@ -463,9 +499,6 @@ pub fn from_k_munged(kind: usize, ns: NsId, kid: u32) -> u32 { from_k(kind, ns, 
 
 /// The kernel uid that is root (id 0) of `ns`, if mapped.
 pub fn root_k(ns: NsId) -> Option<u32> { to_k(0, ns, 0) }
-
-/// Is kernel id `kid` mapped in namespace `ns` (id 0 maps everything)?
-pub fn mapped(kind: usize, ns: NsId, kid: u32) -> bool { from_k(kind, ns, kid).is_some() }
 
 /// An id argument taken from user space, in the caller's user namespace, as a
 /// kernel id. u32::MAX ("leave unchanged") passes through; an id with no
@@ -544,24 +577,32 @@ pub fn gid_map_written(ns: NsId) -> bool { ns == 0 || MAP_N[1][ns as usize].load
 
 pub fn setgroups_denied(ns: NsId) -> bool { ns != 0 && SETGROUPS_DENY[ns as usize].load(Acquire) != 0 }
 
-/// Identity of a process (userns, host euid/egid, effective caps) frozen at
-/// open() time, like Linux `file->f_cred` of a map file.
+/// Credentials (userns, host euid/egid, effective caps) of a process.
 #[derive(Clone, Copy)]
-pub struct Opener(NsId, u32, u32, u64);
+pub struct Cr(NsId, u32, u32, u64);
 
-pub fn snapshot(pid: u32) -> Option<Opener> {
-    writer_info(pid)
+/// Identity of a process frozen at open() time, like Linux `file->f_cred` of a
+/// map file, plus the target namespace captured at open (a counted reference,
+/// so the slot cannot be reused under the fd) and the target thread group.
+pub struct Opener { cr: Cr, _own: NsRef, tns: NsRef, tgid: u32 }
+
+/// Snapshot `pid` (the opener) and the user namespace of `target` (a tgid).
+pub fn snapshot(pid: u32, target: u32) -> Option<Opener> {
+    let rq = crate::RUN_QUEUE.lock();
+    let o = rq.find_pid(pid)?;
+    let t = rq.find_pid(target)?;
+    Some(Opener { cr: Cr(o.userns.id(), o.euid, o.egid, o.caps[0]), _own: o.userns.clone(), tns: t.userns.clone(), tgid: target })
 }
 
-fn writer_info(pid: u32) -> Option<Opener> {
-    crate::RUN_QUEUE.lock().find_pid(pid).map(|t| Opener(t.userns.id(), t.euid, t.egid, t.caps[0]))
+fn writer_info(pid: u32) -> Option<Cr> {
+    crate::RUN_QUEUE.lock().find_pid(pid).map(|t| Cr(t.userns.id(), t.euid, t.egid, t.caps[0]))
 }
 
-/// May the opener write `target`'s maps at all? (open-time EPERM)
-pub fn open_allowed(op: Opener, target: u32, kind: usize) -> bool {
-    let tns = userns_of(target);
+/// May the opener write the captured target namespace's maps at all? (open-time EPERM)
+pub fn open_allowed(op: &Opener, kind: usize) -> bool {
+    let tns = op.tns.id();
     if tns == 0 { return false; }
-    rights(op, tns, kind.min(1)).0
+    rights(op.cr, tns, kind.min(1)).0
 }
 
 static MAP_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -581,8 +622,8 @@ fn writer_rights(w: u32, tns: NsId, kind: usize) -> (bool, bool, u32) {
     rights(op, tns, kind)
 }
 
-fn rights(op: Opener, tns: NsId, kind: usize) -> (bool, bool, u32) {
-    let Opener(wns, eu, eg, caps) = op;
+fn rights(op: Cr, tns: NsId, kind: usize) -> (bool, bool, u32) {
+    let Cr(wns, eu, eg, caps) = op;
     let cap: u32 = if kind == 0 { 7 } else { 6 };
     let has = caps >> cap & 1 != 0;
     let (oe, _) = owner(tns);
@@ -618,16 +659,19 @@ fn lower_to_k(par: NsId, lower: u32, count: u32, kind: usize) -> Option<u32> {
 /// Write uid_map (kind 0) / gid_map (kind 1) of `target`'s user namespace on
 /// behalf of `writer` (Linux map_write / new_idmap_permitted). Returns bytes
 /// consumed or -errno.
-pub fn write_map(opener: Opener, writer: u32, target: u32, kind: usize, data: &[u8]) -> isize {
+pub fn write_map(opener: &Opener, writer: u32, kind: usize, data: &[u8]) -> isize {
     let _g = MapGuard::lock();
-    let tns = userns_of(target);
+    // The namespace captured at open; if the target no longer lives in it
+    // (exited, pid reused) the write fails instead of landing elsewhere.
+    let tns = opener.tns.id();
     if tns == 0 { return -1; }
+    if userns_of(opener.tgid) != tns { return -3; }
     let t = tns as usize;
     if MAP_N[kind][t].load(Acquire) != 0 { return -1; } // written once
     // Rule 1: both the opener (f_cred) and the writer sit in the target
     // namespace or its parent; the privileged branch needs both privileged,
     // and both must be the same id.
-    let (ok_o, priv_o, me_o) = rights(opener, tns, kind);
+    let (ok_o, priv_o, me_o) = rights(opener.cr, tns, kind);
     let (ok_w, priv_w, me_w) = writer_rights(writer, tns, kind);
     if !ok_o || !ok_w { return -1; }
     let privileged = priv_o && priv_w;
@@ -673,7 +717,7 @@ pub fn write_map(opener: Opener, writer: u32, target: u32, kind: usize, data: &[
         // Rule 4: one single-id extent, the translated lower id is the
         // opener's own euid (egid for gid_map); owner is the opener.
         if n != 1 || comp[0].2 != 1 || comp[0].1 != me { return -1; }
-        if owner(tns).0 != opener.1 { return -1; }
+        if owner(tns).0 != opener.cr.1 { return -1; }
         if kind == 1 && SETGROUPS_DENY[t].load(Acquire) == 0 { return -1; }
     }
     for i in 0..n {
@@ -687,12 +731,13 @@ pub fn write_map(opener: Opener, writer: u32, target: u32, kind: usize, data: &[
 }
 
 /// Write /proc/<target>/setgroups ("allow" / "deny"). Bytes consumed or -errno.
-pub fn write_setgroups(opener: Opener, writer: u32, target: u32, data: &[u8]) -> isize {
+pub fn write_setgroups(opener: &Opener, writer: u32, data: &[u8]) -> isize {
     let _g = MapGuard::lock();
-    let tns = userns_of(target);
+    let tns = opener.tns.id();
     if tns == 0 { return -1; }
+    if userns_of(opener.tgid) != tns { return -3; }
     let (ok, _, _) = writer_rights(writer, tns, 1);
-    let (ok_o, _, _) = rights(opener, tns, 1);
+    let (ok_o, _, _) = rights(opener.cr, tns, 1);
     if !ok || !ok_o { return -1; }
     let t = tns as usize;
     let s = data.strip_suffix(b"\n").unwrap_or(data);
@@ -881,6 +926,7 @@ static CGNS_FLAG: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 /// New cgroup namespace rooted at cgroup `root`, owned by user namespace
 /// `owner`. The returned reference is the caller's. ENOSPC (28) when full.
 pub fn new_cgns(root: crate::cgroup::CgId, owner: NsId) -> Result<NsRef, isize> {
+    if !quota_owner_ok(owner) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             let p = NsRef::get(owner);
@@ -889,6 +935,7 @@ pub fn new_cgns(root: crate::cgroup::CgId, owner: NsId) -> Result<NsRef, isize> 
             LEVEL[id].store(0, Release);
             CGNS_ROOT[id].store(root, Release);
             crate::cgroup::ns_pin(root);
+            SLOT_USER[id].store(0, Release);
             CGNS_FLAG[id].store(1, Release);
             return Ok(NsRef(id as NsId));
         }

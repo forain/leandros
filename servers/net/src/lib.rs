@@ -6090,11 +6090,14 @@ fn parse_scm_creds(pid: u32, ctrl_ptr: usize, ctrl_len: usize) -> Result<Option<
             // (kuids) before any permission check; an unmapped one is invalid.
             let (Some(uid), Some(gid)) = (sched::ns::to_k(0, sched::ns::current_userns(), vuid), sched::ns::to_k(1, sched::ns::current_userns(), vgid))
                 else { return Err(-22); };
+            // Linux scm_check_creds: CAP_SYS_ADMIN over the user namespace that
+            // owns the sender's PID namespace (not the sender's own userns).
+            let pid_admin = sched::caps::ns_capable_in(sched::ns::owner_userns(1, sched::pidns::pidns_of(pid)), CAP_SYS_ADMIN);
             let kpid = match sched::pidns::from_cur(vpid) {
                 Ok(k) => k,
-                Err(_) => return Err(if sched::caps::ns_capable(CAP_SYS_ADMIN) { -3 } else { -1 }),
+                Err(_) => return Err(if pid_admin { -3 } else { -1 }),
             };
-            if kpid != pid && !sched::caps::ns_capable(CAP_SYS_ADMIN) { return Err(-1); }
+            if kpid != pid && !pid_admin { return Err(-1); }
             if uid != sched::ruid_of(pid) && uid != sched::euid_of(pid) && uid != sched::current_suid()
                 && !sched::caps::ns_capable(CAP_SETUID) { return Err(-1); }
             if gid != sched::rgid_of(pid) && gid != sched::egid_of(pid) && gid != sched::current_sgid()

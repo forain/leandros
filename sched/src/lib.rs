@@ -1351,7 +1351,7 @@ pub fn oom_score_adj_of(pid: Pid) -> Option<i32> { RUN_QUEUE.lock().find_pid(pid
 /// the value needs CAP_SYS_RESOURCE (Linux oom_score_adj_min rule).
 pub fn set_oom_score_adj(caller: Pid, pid: Pid, v: i32) -> isize {
     if !(-1000..=1000).contains(&v) { return -22; }
-    let cap = RUN_QUEUE.lock().find_pid(caller).map_or(false, |t| t.caps[0] >> 24 & 1 != 0);
+    let cap = RUN_QUEUE.lock().find_pid(caller).map_or(false, |t| t.userns.id() == 0 && t.caps[0] >> 24 & 1 != 0); // CAP_SYS_RESOURCE in the initial userns (Linux capable())
     let mut rq = RUN_QUEUE.lock();
     let tgid = match rq.find_pid(pid) { Some(t) => { if v < t.oom_score_adj && !cap { return -13; } t.tgid } None => return -3 };
     for i in rq.live_slots() {
@@ -3056,7 +3056,7 @@ pub fn set_current_groups(groups: &[u32]) -> bool {
     let mut rq = RUN_QUEUE.lock();
     if let Some(t) = rq.find_pid_mut(pid) {
         if !setid_priv(t, true) { return false; }
-        if groups.iter().any(|&g| !ns::mapped(1, t.userns.id(), g)) { return false; }
+        if groups.iter().any(|&g| !ns::from_k(1, t.userns.id(), g).is_some()) { return false; }
         let n = groups.len().min(task::NGROUPS_MAX);
         t.groups[..n].copy_from_slice(&groups[..n]);
         t.ngroups = n as u8;
@@ -3270,7 +3270,7 @@ pub fn set_current_fsid(id: u32, gid: bool) -> u32 {
             let (r, e, s, f) = if gid { (t.gid, t.egid, t.sgid, t.fsgid) }
                                else   { (t.uid, t.euid, t.suid, t.fsuid) };
             let kind = if gid { 1 } else { 0 };
-            let ok_ns = ns::mapped(kind, t.userns.id(), id);
+            let ok_ns = ns::from_k(kind, t.userns.id(), id).is_some();
             if id != u32::MAX && ok_ns && (id == r || id == e || id == s || id == f || setid_priv(t, gid)) {
                 if gid { t.fsgid = id; } else { t.fsuid = id; }
             }

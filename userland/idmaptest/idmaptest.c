@@ -1579,6 +1579,203 @@ static int peercred_view(void)
     return 0;
 }
 
+
+/* ---- idfix1: M1 scm pid, M2 oom_score_adj, M4 captured map ns, L1, L7, B-items ---- */
+#include <sys/signalfd.h>
+#define MAP1000 "1000 1000 1\n"
+
+static int send_cred_pid(int fd, pid_t pid, unsigned uid)
+{
+    struct ucred uc = { pid, uid, uid };
+    char d = 'c';
+    struct iovec iov = { &d, 1 };
+    union { char b[CMSG_SPACE(sizeof uc)]; struct cmsghdr a; } u;
+    memset(&u, 0, sizeof u);
+    struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = u.b, .msg_controllen = sizeof u.b };
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_CREDENTIALS; c->cmsg_len = CMSG_LEN(sizeof uc);
+    memcpy(CMSG_DATA(c), &uc, sizeof uc);
+    return (int)sendmsg(fd, &m, 0);
+}
+static int c_scm_forge(void *a)
+{
+    int fd = *(int *)a;
+    CHECK(send_cred_pid(fd, 1, 1000) == -1 && errno == EPERM);      /* pid 1 of the host pidns */
+    CHECK(send_cred_pid(fd, getpid(), 1000) == 1);                  /* own pid stays fine */
+    return 0;
+}
+static int scm_pid_forge_hostpidns(void)
+{
+    int sv[2], go;
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    pid_t c = spawn(1000, c_scm_forge, &sv[1], &go);
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", MAP1000) == 0);
+    CHECK(wrp(c, "setgroups", "deny\n") == 0);
+    CHECK(wrp(c, "gid_map", MAP1000) == 0);
+    CHECK(fin(c, go) == 0);
+    return 0;
+}
+
+static int c_oom_lower(void *a)
+{
+    (void)a;
+    CHECK(wr("/proc/self/oom_score_adj", "100\n") == 0);
+    CHECK(wr("/proc/self/oom_score_adj", "-1000\n") == -EACCES);
+    return 0;
+}
+static int oom_adj_lower_in_userns_eacces(void)
+{
+    int go;
+    pid_t c = spawn(1000, c_oom_lower, NULL, &go);
+    CHECK(c > 0);
+    CHECK(fin(c, go) == 0);
+    /* host root may still lower it */
+    pid_t h = fork();
+    if (h == 0) _exit(wr("/proc/self/oom_score_adj", "100\n") == 0 && wr("/proc/self/oom_score_adj", "-1000\n") == 0 ? 0 : 1);
+    int st = 0; waitpid(h, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+
+/* M4: the map file is bound to the namespace captured at open. */
+static int nsmap_write_captured_ns(void)
+{
+    int go1, go2;
+    pid_t c1 = spawn(1000, NULL, NULL, &go1);
+    pid_t c2 = spawn(1000, NULL, NULL, &go2);
+    CHECK(c1 > 0 && c2 > 0);
+    char p[64];
+    snprintf(p, sizeof p, "/proc/%d/uid_map", (int)c1);
+    int fd = open(p, O_WRONLY);
+    CHECK(fd >= 0);
+    kill(c1, SIGKILL); close(go1); waitpid(c1, NULL, 0);          /* target gone and reaped */
+    ssize_t n = write(fd, MAP1000, strlen(MAP1000));
+    int e = errno;
+    close(fd);
+    CHECK(n == -1 && (e == ESRCH || e == EINVAL));
+    char b[128];
+    CHECK(rdp(c2, "uid_map", b, sizeof b) >= 0);
+    CHECK(strchr(b, '1') == NULL);                                /* the other ns stayed unmapped */
+    CHECK(wrp(c2, "uid_map", MAP1000) == 0);                      /* and is still writable */
+    fin(c2, go2);
+    return 0;
+}
+
+/* L1: kuid 0 inside a child userns (host root unshared, no map) is not host root. */
+static int c_comm_other(void *a)
+{
+    char p[64]; snprintf(p, sizeof p, "/proc/%d/comm", *(int *)a);
+    CHECK(wr(p, "zz\n") == -EACCES);
+    return 0;
+}
+static int ns_kuid0_comm_eacces(void)
+{
+    int sg, ng;
+    pid_t t = spawn_sleeper(1000, &sg);
+    CHECK(t > 0);
+    char p[64]; snprintf(p, sizeof p, "/proc/%d/comm", (int)t);
+    CHECK(wr(p, "ok\n") == 0);                                    /* host root can */
+    int tt = (int)t;
+    pid_t c = spawn(-1, c_comm_other, &tt, &ng);
+    CHECK(c > 0);
+    int rc = fin(c, ng);
+    reap_sleeper(t, sg);
+    CHECK(rc == 0);
+    return 0;
+}
+
+/* L7: per-kuid namespace quota; host root exempt. */
+static int quota_run(int uid, int *made, int *err)
+{
+    int gos[64], n = 0; *err = 0;
+    for (int i = 0; i < 48; i++) {
+        int g[2], r[2];
+        if (pipe(g) || pipe(r)) return -1;
+        pid_t c = fork();
+        if (c == 0) {
+            char b = 0; close(g[1]); close(r[0]);
+            if (uid >= 0 && (setresgid(uid, uid, uid) || setresuid(uid, uid, uid))) _exit(98);
+            b = unshare(CLONE_NEWUSER) ? (char)errno : 0;
+            (void)!write(r[1], &b, 1);
+            if (b) _exit(0);
+            (void)!read(g[0], &b, 1);
+            _exit(0);
+        }
+        close(g[0]); close(r[1]);
+        char b = 0;
+        (void)!read(r[0], &b, 1); close(r[0]);
+        if (b) { *err = b; close(g[1]); waitpid(c, NULL, 0); break; }
+        gos[n++] = g[1];
+    }
+    *made = n;
+    for (int i = 0; i < n; i++) close(gos[i]);  /* children exit on EOF */
+    while (waitpid(-1, NULL, 0) > 0) {}
+    return 0;
+}
+static int userns_quota_enospc(void)
+{
+    int made, err;
+    CHECK(quota_run(1000, &made, &err) == 0);
+    CHECK(err == ENOSPC && made >= 8 && made <= 32);
+    CHECK(quota_run(-1, &made, &err) == 0);
+    CHECK(err == 0 && made == 48);
+    return 0;
+}
+
+/* (a) signalfd ssi_uid is in the reader's view. */
+struct sfa { int rfd; };
+static int c_sfd_uid(void *a)
+{
+    int rfd = ((struct sfa *)a)->rfd;
+    sigset_t m; sigemptyset(&m); sigaddset(&m, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &m, NULL);
+    int sfd = signalfd(-1, &m, 0);
+    CHECK(sfd >= 0);
+    (void)!write(rfd, "r", 1);
+    struct signalfd_siginfo si;
+    CHECK(read(sfd, &si, sizeof si) == (ssize_t)sizeof si);
+    CHECK(si.ssi_uid == 65534);   /* sender (host root, kuid 0) is unmapped here */
+    return 0;
+}
+static int signalfd_ssi_uid_view(void)
+{
+    int rp[2], go; CHECK(pipe(rp) == 0);
+    struct sfa a = { rp[1] };
+    pid_t c = spawn(1000, c_sfd_uid, &a, &go);
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", MAP1000) == 0);
+    CHECK(wrp(c, "setgroups", "deny\n") == 0);
+    CHECK(wrp(c, "gid_map", MAP1000) == 0);
+    (void)!write(go, "g", 1); close(go);
+    char b; CHECK(read(rp[0], &b, 1) == 1);
+    kill(c, SIGUSR1);
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+
+/* (b) PRIO_USER `who` is a uid in the caller's namespace. */
+static int c_prio_user(void *a)
+{
+    (void)a;
+    errno = 0; getpriority(PRIO_USER, 7);
+    CHECK(errno == 0);                 /* 7 is us (kuid 1000) */
+    errno = 0; getpriority(PRIO_USER, 1000);
+    CHECK(errno == ESRCH || errno == EINVAL);   /* 1000 is unmapped here */
+    return 0;
+}
+static int prio_user_who_view(void)
+{
+    if (!knob) return SKIP;
+    int go;
+    pid_t c = spawn(1000, c_prio_user, NULL, &go);
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", "7 1000 1\n") == 0);
+    CHECK(fin(c, go) == 0);
+    return 0;
+}
+
 static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "map_identity_still_ok", map_identity_still_ok },
     { "map_overlap_lower_einval", map_overlap_lower_einval },
@@ -1629,6 +1826,13 @@ static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "scm_creds_in_translate", scm_creds_in_translate },
     { "scm_creds_unmapped_einval", scm_creds_unmapped_einval },
     { "peercred_view", peercred_view },
+    { "scm_pid_forge_hostpidns", scm_pid_forge_hostpidns },
+    { "oom_adj_lower_in_userns_eacces", oom_adj_lower_in_userns_eacces },
+    { "nsmap_write_captured_ns", nsmap_write_captured_ns },
+    { "ns_kuid0_comm_eacces", ns_kuid0_comm_eacces },
+    { "userns_quota_enospc", userns_quota_enospc },
+    { "signalfd_ssi_uid_view", signalfd_ssi_uid_view },
+    { "prio_user_who_view", prio_user_who_view },
 };
 
 static int probe_knob(void)

@@ -8039,8 +8039,11 @@ fn nice_target(which: usize, who: usize) -> Option<sched::NiceTarget> {
             if who == 0 { current_pid() } else { who })),
         PRIO_PGRP => Some(sched::NiceTarget::Pgrp(
             if who == 0 { sched::current_pgid() } else { who })),
+        // `who` is a uid in the caller's user namespace; the scheduler
+        // compares kuids. Unmapped -> None (EINVAL).
         PRIO_USER => Some(sched::NiceTarget::User(
-            if who == 0 { sched::current_euid() } else { who })),
+            if who == 0 { sched::current_euid() }
+            else { sched::ns::to_k(0, sched::ns::current_userns(), who)? })),
         _ => None,
     }
 }
