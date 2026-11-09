@@ -2292,7 +2292,9 @@ static int t_cgns_in_userns(void)
     CHECK(cgns_link(b, sizeof b) == 0 && strcmp(a, b) != 0);
     CHECK(unshare(CLONE_NEWCGROUP) == 0);
     CHECK(cgns_link(c, sizeof c) == 0 && strcmp(b, c) != 0);
-    /* clone(NEWUSER|NEWCGROUP) too */
+    /* clone(NEWUSER|NEWCGROUP) too; a nested userns needs the creator's ids
+     * mapped (Linux create_user_ns: EPERM when !kuid_has_mapping) */
+    CHECK(map_self_1000() == 0);
     long r = syscall(SYS_clone, SIGCHLD | CLONE_NEWUSER | CLONE_NEWCGROUP, 0, 0, 0, 0);
     CHECK(r >= 0);
     if (r == 0) { char x[64]; _exit(cgns_link(x, sizeof x) == 0 && strcmp(x, c) != 0 ? 0 : 1); }
