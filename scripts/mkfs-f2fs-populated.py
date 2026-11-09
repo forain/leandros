@@ -593,6 +593,11 @@ def main():
     if os.path.exists(p):
         root_files.append(("captcomm.zip", p, 0o100644))
 
+    # Optional local OCI/docker image archive (tracing podman without registry access): /<basename>
+    _img_arch = os.environ.get("LEANDROS_IMAGE_ARCHIVE")
+    if _img_arch and os.path.isfile(_img_arch):
+        root_files.append((os.path.basename(_img_arch), _img_arch, 0o100644))
+
     # /etc/fstab — /dev/root is the root F2FS volume userland/init already
     # mounts via a hardcoded bootstrap call before pivot_root (chicken-and-egg:
     # fstab itself lives on that filesystem); the kernel resolves it (root= on
@@ -643,6 +648,9 @@ def main():
     etc_files.append(("subgid", b"leandro:100000:65536\n", 0o100644))
     # Firefox's sandbox builds its library path policy from /etc/ld.so.conf;
     # list musl's default search dirs so policy and loader agree.
+    # rootless podman: newuidmap/newgidmap read these (shadow-subids).
+    etc_files.append(("subuid", b"leandro:100000:65536\nroot:200000:65536\n", 0o100644))
+    etc_files.append(("subgid", b"leandro:100000:65536\nroot:200000:65536\n", 0o100644))
     etc_files.append(("ld.so.conf", b"/lib\n/usr/lib\n/usr/local/lib\n", 0o100644))
     # Minimal v1 TZif file for UTC (no zoneinfo package in the image).
     etc_files.append(("localtime", b"\x54\x5a\x69\x66" + b"\x00" * 35 + b"\x01\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00UTC\x00", 0o100644))
@@ -2902,6 +2910,8 @@ def main():
 
     # apk-shadow: the choke point. After every ship set is appended, a non-apk
     # entry whose image path a package owns is dropped.
+    # shadow-subids ships empty /etc/subuid|subgid; ours (etc_files) carry the rootless ranges
+    _ap_entries = [e for e in _ap_entries if e["path"] not in ("/etc/subuid", "/etc/subgid")]
     _ap_owned = {e["path"]: e for e in _ap_entries if e["kind"] != "dir"}
     _deny = re.compile(r"libEGL|libGLES|libgbm|libgallium|libvulkan|libdrm|libpipewire|libgst|libext2fs")
     _sh = {"n": 0, "diff": 0}
@@ -2930,6 +2940,17 @@ def main():
     for _lst in (m4_share_files, m5_exec_files):
         _base_paths |= {t[0] + "/" + t[1] for t in _lst}
     _ap_gen = [e for e in _ap_gen if e["path"] not in _ap_owned and e["path"] not in _base_paths]
+    # podman: storage.conf is ours (vfs default until overlay works; ports/podman/storage.conf)
+    _podconf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "podman", "storage.conf")
+    for e in _ap_entries:
+        if e["path"] == "/etc/containers/storage.conf" and e["kind"] == "file" and os.path.isfile(_podconf):
+            e["host"] = _podconf
+            e["size"] = os.path.getsize(_podconf)
+    # Alpine gives newuidmap/newgidmap file capabilities (security.capability xattr), which the image does not
+    # carry; setuid root is the equivalent until file caps exist (see podtrace-findings).
+    for e in _ap_entries:
+        if e["path"] in ("/usr/bin/newuidmap", "/usr/bin/newgidmap"):
+            e["mode"] |= 0o4000
     _ap_hosts = {e["path"]: e["host"] for e in _ap_entries + _ap_gen if e["kind"] == "file"}
     alpine_files = []          # (image dir, name, host path | symlink bytes, full mode)
     _ap_dirs, _ap_dirmode = set(), {}
@@ -2946,6 +2967,9 @@ def main():
         else:
             h = e["host"] if e["kind"] == "file" else _ap_hosts[e["linkname"]]
             alpine_files.append((d, n, h, 0o100000 | e["mode"]))
+    # /var/tmp: containers/storage and podman stage image copies there
+    _ap_dirs.add("/var/tmp")
+    _ap_dirmode["/var/tmp"] = 0o1777
     for _d in set(_ap_dirs):
         while _d not in ("/", ""):
             _ap_dirs.add(_d)
