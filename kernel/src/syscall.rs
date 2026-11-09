@@ -9187,6 +9187,12 @@ fn sys_mount(
     const MS_REMOUNT: usize = 32;
     // Every form of mount(2) needs CAP_SYS_ADMIN (Linux `may_mount`).
     if !sched::host_root() { return -1; } // EPERM
+    // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC):
+    // only the mount's propagation state changes; source/fstype are ignored.
+    if flags & (vfs::mnt::MS_UNBINDABLE | vfs::mnt::MS_PRIVATE | vfs::mnt::MS_SLAVE | vfs::mnt::MS_SHARED) != 0 {
+        let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+        return vfs::mnt::set_propagation(sched::current_mntns(), target_path.ns_bytes(), flags) as isize;
+    }
     if flags & MS_REMOUNT != 0 {
         let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
         let t = match core::str::from_utf8(target_path.bytes()) { Ok(s) => s, Err(_) => return -22 };
