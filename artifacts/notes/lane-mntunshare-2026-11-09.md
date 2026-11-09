@@ -25,4 +25,4 @@ Spec: orch/designs/design-mntns.md, M1. Branch lane/mntunshare. NOT merged.
 ## Verification (aarch64, Mac HVF)
 - Fail-first: kernel files from 58fd6c9d with the new tests -> mnttest fails=7 (newns_unpriv_unshare, newns_bind_invisible_out, newns_tmpfs_invisible_out, newns_child_clean, newns_perm, clone3_newns, newns_root_umount_ns_ino).
 - Fixed tree: mnttest 0 fails, nstest 0, chroottest 0, ffsandbox RESULT on=True off=False.
-- Full regress: see lane report (box queue).
+- Full aarch64 regress on the Mac (HVF, runtests.py, all suites): overall PASS, 0 failures. Box regress not run (queued 30+ min; box boots currently fail with "login: exec failed" per BOX_STATUS). x86_64 NOT run.
