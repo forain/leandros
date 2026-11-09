@@ -885,6 +885,40 @@ static int t_netns_portspace(void)
     return 0;
 }
 
+static int t_netns_udp_bind(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
+    pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+    if (c == 0) {
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41031) };
+        int u = socket(AF_INET, SOCK_DGRAM, 0);
+        struct timeval tv = { 0, 300000 };
+        setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        char ok = bind(u, (void *)&a, sizeof a) == 0;
+        write(pfd[1], &ok, 1);
+        char x; read(qfd[0], &x, 1);               /* host has sent */
+        char buf[8];
+        ssize_t r = recv(u, buf, sizeof buf, 0);
+        char res = (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        write(pfd[1], &res, 1);
+        _exit(0);
+    }
+    CHECK(c > 0);
+    char ok = 0; CHECK(read(pfd[0], &ok, 1) == 1 && ok);
+    int h = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in d = { .sin_family = AF_INET, .sin_port = htons(41031) };
+    d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sendto(h, "hi", 2, 0, (void *)&d, sizeof d);
+    write(qfd[1], "x", 1);
+    char res = 0; CHECK(read(pfd[0], &res, 1) == 1 && res);   /* child got nothing */
+    int hb = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41031) };
+    CHECK(bind(hb, (void *)&a, sizeof a) == 0);               /* P free on the host */
+    int st; waitpid(c, &st, 0);
+    return 0;
+}
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -902,7 +936,7 @@ static int run_userns_cases(void)
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
-        { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace },
+        { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();

@@ -4119,7 +4119,11 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 // another interface was refused with a port unreachable and
                 // its sends left by the first stack's route (lane udp2).
                 let server = ip.is_unspecified();
-                if let Err(e) = udp_materialize(pid, slot, None, server) { return err_reply(e); }
+                // A non-initial netns has only a down loopback: its UDP bind
+                // stays a pure table entry, no host-stack socket (unreachable).
+                if me.netns == 0 {
+                    if let Err(e) = udp_materialize(pid, slot, None, server) { return err_reply(e); }
+                }
             }
             ok_reply()
         }
@@ -5729,6 +5733,9 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
     match state {
         // A UDP socket: the next datagram (from its peer if connected; from
         // any stack for a wildcard server), see `udp_recv_k`.
+        // A UDP socket bound in a non-initial netns has no stack socket: nothing
+        // can ever arrive, so a read just reports no data (blocking waits on its key).
+        SockState::InetBound { .. } if sock_type == SOCK_DGRAM as u8 => err_reply(-11),
         SockState::InetConnected { .. } if sock_type == SOCK_DGRAM as u8 => {
             match udp_recv_k(pid, fd, len, peek, false) {
                 Ok((data, full, m)) => {
