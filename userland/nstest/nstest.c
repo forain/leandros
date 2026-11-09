@@ -1715,6 +1715,70 @@ static int t_fdinfo_other_uid(void)
     return 0;
 }
 
+/* ---- lane pidmisc: nice / SIGEV_THREAD_ID / tty pgrp translation -------- */
+#include <termios.h>
+#include <sys/ioctl.h>
+static int ib_prio(void)
+{
+    CHECK(setpriority(PRIO_USER, 0, 19) == 0);
+    errno = 0;
+    CHECK(getpriority(PRIO_USER, 0) == 19 || errno == 0);
+    return 0;
+}
+static int ub_prio(void)
+{
+    CHECK(setpriority(PRIO_PROCESS, 0, 5) == 0);
+    int r = in_init(ib_prio);
+    CHECK(r == 0);
+    errno = 0;
+    int n = getpriority(PRIO_PROCESS, 0);
+    CHECK(errno == 0 && n == 5);          /* outside process untouched */
+    return 0;
+}
+PCASE(prio_user_scoped, ub_prio)
+
+struct pm_sigev { long val; int signo; int notify; int tid; char pad[44]; };
+static int ib_sigev_tid(void)
+{
+    struct pm_sigev sev; memset(&sev, 0, sizeof sev);
+    sev.signo = SIGUSR1; sev.notify = 4 /* SIGEV_THREAD_ID */; sev.tid = (int)syscall(SYS_gettid);
+    CHECK(sev.tid == 1);
+    int id = -1;
+    CHECK(syscall(SYS_timer_create, CLOCK_MONOTONIC, &sev, &id) == 0);
+    syscall(SYS_timer_delete, id);
+    sev.tid = 99999;
+    errno = 0;
+    CHECK(syscall(SYS_timer_create, CLOCK_MONOTONIC, &sev, &id) == -1 && errno == EINVAL);
+    return 0;
+}
+static int ub_sigev_tid(void) { return in_init(ib_sigev_tid); }
+PCASE(timer_thread_id, ub_sigev_tid)
+
+static int ib_ttypg(void)
+{
+    CHECK(setsid() == 1);
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    CHECK(m >= 0 && grantpt(m) == 0 && unlockpt(m) == 0);
+    int s = open(ptsname(m), O_RDWR | O_NOCTTY);
+    CHECK(s >= 0);
+    CHECK(ioctl(s, TIOCSCTTY, 0) == 0);
+    int sid = 0;
+    CHECK(ioctl(s, TIOCGSID, &sid) == 0 && sid == 1);
+    CHECK(tcsetpgrp(s, getpgrp()) == 0);
+    CHECK(tcgetpgrp(s) == 1);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) { setpgid(0, 0); pause(); _exit(0); }
+    CHECK(setpgid(c, c) == 0 || errno == EACCES);
+    CHECK(tcsetpgrp(s, c) == 0);
+    CHECK(tcgetpgrp(s) == c);
+    CHECK(tcsetpgrp(s, 1) == 0);
+    kill(c, SIGKILL); waitpid(c, NULL, 0);
+    return 0;
+}
+static int ub_ttypg(void) { return in_init(ib_ttypg); }
+PCASE(tty_pgrp_view, ub_ttypg)
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -1744,6 +1808,7 @@ static int run_userns_cases(void)
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
         { "map_deputy", t_map_deputy }, { "map_race", t_map_race }, { "chroot_newuser_eperm", t_chroot_newuser },
         { "fdinfo_other_uid", t_fdinfo_other_uid },
+        { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();

@@ -1102,6 +1102,7 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
     // inversion the `Pending` dance at the end of this function exists to
     // avoid — see its doc comment. Cheap enough to read unconditionally.
     let (cur_sid, cur_pgid) = sched::current_sid_pgid();
+    let mut set_pgid = 0u32;
     if cmd == TIOCSPGRP {
         // tcsetpgrp(3), Linux `tiocspgrp()`, evaluated before the pool lock
         // because the SIGTTOU leg can park the caller: the pty must be the
@@ -1123,6 +1124,9 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
             return -25; // ENOTTY
         }
         let pgid = unsafe { core::ptr::read(arg as *const u32) };
+        // The pgid is in the caller's pid-namespace view (RUN_QUEUE: outside the pool lock).
+        let pgid = match sched::pidns::arg(pgid) { Ok(k) => k, Err(e) => return e };
+        set_pgid = pgid;
         if !sched::pgrp_in_session(pgid, term_sid) {
             return -1; // EPERM
         }
@@ -1210,7 +1214,7 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
                 if arg == 0 {
                     -14
                 } else {
-                    p.pgrp = unsafe { core::ptr::read(arg as *const u32) };
+                    p.pgrp = set_pgid;
                     0
                 }
             }
@@ -1353,6 +1357,14 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
     pending.fire();
     if committed {
         sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PTY, pair as u32));
+    }
+    // Report pgrp/sid in the caller's pid-namespace view (needs RUN_QUEUE, so
+    // after the pool lock is dropped; `arg` is the kernel bounce copy).
+    if rc == 0 && arg != 0 && (cmd == TIOCGPGRP || cmd == TIOCGSID) {
+        unsafe {
+            let v = core::ptr::read(arg as *const u32);
+            core::ptr::write(arg as *mut u32, sched::pidns::out(v));
+        }
     }
     rc
 }
