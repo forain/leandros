@@ -798,7 +798,7 @@ pub fn owner_userns(kind: usize, id: NsId) -> NsId {
 }
 
 /// The caller's state a join is checked against.
-struct Ctx { userns: NsId, admin: bool, pidns: NsId, euid: u32 }
+struct Ctx { userns: NsId, admin: bool, chroot: bool, pidns: NsId, euid: u32 }
 
 fn cap_in(ctx: &Ctx, target_userns: NsId) -> bool { ctx.admin && covers(ctx.userns, target_userns) }
 
@@ -814,7 +814,7 @@ fn check_join(ctx: &mut Ctx, kind: usize, id: NsId, alone: bool, chrooted: bool)
             let creator = id != 0 && PARENT[id as usize].load(Acquire) == ctx.userns
                 && OWNER_EUID[id as usize].load(Acquire) == ctx.euid;
             if !cap_in(ctx, id) && !creator { return -1; }
-            ctx.userns = id; ctx.admin = true;
+            ctx.userns = id; ctx.admin = true; ctx.chroot = true;
             0
         }
         1 | 7 => {
@@ -825,7 +825,14 @@ fn check_join(ctx: &mut Ctx, kind: usize, id: NsId, alone: bool, chrooted: bool)
         2 | 3 => if cap_in(ctx, owner_userns(kind, id)) { 0 } else { -1 },
         5 => if cap_in(ctx, UTS[id as usize].lock().owner) { 0 } else { -1 },
         6 => if !is_cgns(id) { -22 } else if cap_in(ctx, cgns_owner(id)) { 0 } else { -1 },
-        _ => -22, // mnt: not yet (needs per-namespace root/cwd reset)
+        // Linux mntns_install: CAP_SYS_ADMIN over the namespace's owner, plus
+        // CAP_SYS_CHROOT and CAP_SYS_ADMIN in the caller's own user namespace.
+        // A slot that is not a live mount namespace fails closed.
+        4 => {
+            if id != 0 && (IS_MNT[id as usize].load(Acquire) == 0 || REFS[id as usize].load(Acquire) & DYING != 0) { return -22; }
+            if !cap_in(ctx, owner_user(id)) || !ctx.chroot || !ctx.admin { -1 } else { 0 }
+        }
+        _ => -22,
     }
 }
 
@@ -836,7 +843,7 @@ pub fn join(items: alloc::vec::Vec<(usize, NsRef)>, alone: bool, chrooted: bool)
     let mut ctx = {
         let rq = crate::RUN_QUEUE.lock();
         match rq.find_pid(pid) {
-            Some(t) => Ctx { userns: t.userns.id(), admin: t.caps[0] >> 21 & 1 != 0, pidns: t.pidns.id(), euid: t.euid },
+            Some(t) => Ctx { userns: t.userns.id(), admin: t.caps[0] >> 21 & 1 != 0, chroot: t.caps[0] >> 18 & 1 != 0, pidns: t.pidns.id(), euid: t.euid },
             None => return -3,
         }
     };
@@ -850,9 +857,25 @@ pub fn join(items: alloc::vec::Vec<(usize, NsRef)>, alone: bool, chrooted: bool)
     let mut old: alloc::vec::Vec<NsRef> = alloc::vec::Vec::new();
     {
         let mut rq = crate::RUN_QUEUE.lock();
+        let Some(t) = rq.find_pid(pid) else { return -3 };
+        // A mount-namespace join replaces the task's fs struct view: refuse
+        // while root/cwd are shared with other tasks (CLONE_FS), before any
+        // entry is applied.
+        if items.iter().any(|(k, _)| *k == 4) && t.fs_id != 0 {
+            let fid = t.fs_id;
+            if rq.live_slots().filter_map(|i| rq.get(i)).any(|o| o.pid != pid && o.fs_id == fid && o.state != crate::task::TaskState::Zombie) {
+                return -22;
+            }
+        }
         let Some(t) = rq.find_pid_mut(pid) else { return -3 };
         for (kind, n) in items {
             match kind {
+                4 => {
+                    // Root and cwd become the root of the new namespace.
+                    t.root = None;
+                    t.cwd = None;
+                    old.push(core::mem::replace(&mut t.mntns, n));
+                }
                 0 => {
                     t.caps = crate::caps::userns_root_caps(t.caps[3]);
                     old.push(core::mem::replace(&mut t.userns, n));
@@ -930,7 +953,7 @@ pub fn unshare_cgroup() -> isize {
 /// setns(nsfd, nstype): `kind`/`id` come from the fd, which keeps `id` alive.
 pub fn setns_fd(kind: usize, id: NsId, nstype: usize, alone: bool, chrooted: bool) -> isize {
     if nstype != 0 && nstype != clone_flag(kind) { return -22; }
-    if !matches!(kind, 0 | 1 | 2 | 3 | 5 | 6 | 7) { return -22; }
+    if !matches!(kind, 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7) { return -22; }
     join(alloc::vec![(kind, NsRef::get(id))], alone, chrooted)
 }
 
@@ -938,7 +961,6 @@ pub fn setns_fd(kind: usize, id: NsId, nstype: usize, alone: bool, chrooted: boo
 pub fn setns_pid(tgid: u32, flags: usize, alone: bool, chrooted: bool) -> isize {
     const KNOWN: usize = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
     if flags == 0 || flags & !KNOWN != 0 { return -22; }
-    if flags & CLONE_NEWNS != 0 { return -22; }
     let mut items = alloc::vec::Vec::new();
     {
         let rq = crate::RUN_QUEUE.lock();
@@ -948,6 +970,7 @@ pub fn setns_pid(tgid: u32, flags: usize, alone: bool, chrooted: bool) -> isize 
         if flags & CLONE_NEWNET != 0 { items.push((2usize, t.netns.clone())); }
         if flags & CLONE_NEWIPC != 0 { items.push((3usize, t.ipcns.clone())); }
         if flags & CLONE_NEWUTS != 0 { items.push((5usize, t.utsns.clone())); }
+        if flags & CLONE_NEWNS != 0 { items.push((4usize, t.mntns.clone())); }
         if flags & CLONE_NEWCGROUP != 0 { items.push((6usize, t.cgns.clone())); }
     }
     join(items, alone, chrooted)
