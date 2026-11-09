@@ -405,6 +405,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         let mut affinity = 0u64;
         let (caps, puser) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.caps, t.userns.id())).unwrap_or((crate::caps::ROOT_CAPS, 0));
+        let (oom_adj, persona) = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| (t.oom_score_adj, t.persona)).unwrap_or((0, 0));
         let (pnet, pipc) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.netns.id(), t.ipcns.id())).unwrap_or((0, 0));
         let pmnt = { let m = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.mntns.id()).unwrap_or(0);
@@ -487,6 +488,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.gid           = gid;
         child.euid          = euid;
         child.caps          = caps;
+        child.oom_score_adj = oom_adj; child.persona = persona;
         child.userns        = crate::ns::NsRef::get(puser);
         child.pidns         = crate::ns::NsRef::get(pidns_target);
         child.pidns_child   = crate::ns::NsRef::get(pidns_target);
@@ -770,6 +772,7 @@ pub fn clone_thread(
         let mut affinity = 0u64;
         let (caps, puser) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.caps, t.userns.id())).unwrap_or((crate::caps::ROOT_CAPS, 0));
+        let (oom_adj, persona) = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| (t.oom_score_adj, t.persona)).unwrap_or((0, 0));
         let (pnet, pipc) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.netns.id(), t.ipcns.id())).unwrap_or((0, 0));
         let pmnt = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.mntns.id()).unwrap_or(0);
@@ -871,6 +874,7 @@ pub fn clone_thread(
         child.uid        = uid;  child.gid  = gid;
         child.euid       = euid; child.egid = egid;
         child.caps       = caps;
+        child.oom_score_adj = oom_adj; child.persona = persona;
         child.userns     = crate::ns::NsRef::get(puser);
         child.pidns      = crate::ns::NsRef::get(pidns_target);
         child.pidns_child = crate::ns::NsRef::get(pidns_target);

@@ -27,6 +27,11 @@ static LEVEL: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 /// Host euid / egid of the creator (the namespace owner).
 static OWNER_EUID: [AtomicU32; NS_MAX] = [ZERO32; NS_MAX];
 static OWNER_EGID: [AtomicU32; NS_MAX] = [ZERO32; NS_MAX];
+/// Admin state of a network namespace's `lo` (recorded by RTM_NEWLINK; reset
+/// when the id is allocated).
+static LO_UP: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
+pub fn lo_admin_up(id: NsId) -> bool { id != 0 && LO_UP[id as usize].load(Acquire) != 0 }
+pub fn set_lo_admin_up(id: NsId, up: bool) { if id != 0 { LO_UP[id as usize].store(up as u8, Release); } }
 
 /// Identity-only uid/gid maps: up to `MAP_EXT` extents per namespace, each
 /// `[inside, outside, count]` (inside == outside is enforced on write).
@@ -161,6 +166,7 @@ pub fn new_flat() -> Result<NsRef, isize> {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             PARENT[id].store(0, Release);
             LEVEL[id].store(0, Release);
+            LO_UP[id].store(0, Release);
             return Ok(NsRef(id as NsId));
         }
     }

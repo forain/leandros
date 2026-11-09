@@ -168,6 +168,54 @@ static int body_sigchld(void)
 }
 static void sigchld_si_uid_view(void) { run_ns_case("sigchld_si_uid_view", body_sigchld); }
 
+/* ---- lane subids: /etc/subuid, /etc/subgid, procsys id files ---- */
+static int slurp_file(const char *path, char *buf, int cap)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    int n = read(fd, buf, cap - 1);
+    close(fd);
+    if (n < 0) return -1;
+    buf[n] = 0;
+    return n;
+}
+
+static int write_succeeds(const char *path)
+{
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return 0;
+    int w = write(fd, "1\n", 2);
+    close(fd);
+    return w == 2;
+}
+
+static void subuid_present(void)
+{
+    const char *files[2] = { "/etc/subuid", "/etc/subgid" };
+    int ok = 1;
+    for (int i = 0; i < 2; i++) {
+        char b[128];
+        struct stat st;
+        if (slurp_file(files[i], b, sizeof b) < 0 || strcmp(b, "leandro:100000:65536\n") != 0) ok = 0;
+        else if (stat(files[i], &st) != 0 || st.st_uid != 0 || st.st_gid != 0 || (st.st_mode & 07777) != 0644) ok = 0;
+    }
+    report("subuid_present", ok);
+}
+
+static int procsys_is(const char *path, const char *want)
+{
+    char b[32];
+    return slurp_file(path, b, sizeof b) >= 0 && strcmp(b, want) == 0 && !write_succeeds(path);
+}
+
+static void procsys_overflow(void)
+{
+    report("procsys_overflow",
+           procsys_is("/proc/sys/kernel/overflowuid", "65534\n")
+        && procsys_is("/proc/sys/kernel/overflowgid", "65534\n")
+        && procsys_is("/proc/sys/user/max_user_namespaces", "255\n"));
+}
+
 int main(void)
 {
     statx_matches_stat();
@@ -175,6 +223,8 @@ int main(void)
     status_groups_view();
     stat_unmapped_65534();
     sigchld_si_uid_view();
+    subuid_present();
+    procsys_overflow();
     printf("idmaptest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
