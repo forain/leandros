@@ -156,6 +156,9 @@ def quick(ssh, user, pw):
     lines = out.split("\n")
     step("password_exec", rc == 0 and lines[:1] == [user],
          f"rc={rc} out={out.strip()!r} err={err.strip()[-200:]!r}")
+    step("session_path_standard",
+         len(lines) > 3 and lines[3] == "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+         f"PATH={lines[3] if len(lines) > 3 else None!r}")
     rc, out, err = ssh.run(user, "echo to-out; echo to-err >&2; exit 7", password=pw)
     step("exit_status_stderr", rc == 7 and out.strip() == "to-out" and err.strip() == "to-err",
          f"rc={rc} out={out.strip()!r} err={err.strip()!r}")
