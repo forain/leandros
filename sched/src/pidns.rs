@@ -106,7 +106,7 @@ pub fn unshare_pid() -> isize {
             None => return -3,
         }
     };
-    let new = match ns::new_pidns(parent) { Ok(n) => n, Err(e) => return e };
+    let new = match ns::new_pidns(parent, crate::ns::current_userns()) { Ok(n) => n, Err(e) => return e };
     let old = {
         let mut rq = crate::RUN_QUEUE.lock();
         match rq.find_pid_mut(pid) {
