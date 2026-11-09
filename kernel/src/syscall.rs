@@ -664,6 +664,7 @@ mod nr {
     pub const SCHED_YIELD:    usize = 124;
     pub const CLONE:          usize = 220;
     pub const EXECVE:         usize = 221;
+    pub const EXECVEAT:       usize = 281;
     pub const EXIT:           usize = 93;
     pub const WAIT4:          usize = 260;
     pub const KILL:           usize = 129;
@@ -929,6 +930,7 @@ mod nr {
     pub const FORK:           usize = 57;
     pub const VFORK:          usize = 58;
     pub const EXECVE:         usize = 59;
+    pub const EXECVEAT:       usize = 322;
     pub const EXIT:           usize = 60;
     pub const WAIT4:          usize = 61;
     pub const KILL:           usize = 62;
@@ -2171,6 +2173,7 @@ fn dispatch_inner(
             }
             res
         }
+        EXECVEAT => sys_execveat(a0, a1, a2, a3, a4),
         CLONE   => sys_clone_or_fork(a0, a1, a2, a3, a4, frame_ptr),
         CLONE3  => sys_clone3(a0, a1, frame_ptr),
         #[cfg(not(target_arch = "aarch64"))]
@@ -6415,15 +6418,48 @@ fn jail_relative(p: &[u8]) -> alloc::vec::Vec<u8> {
 }
 
 fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
-    let pid = current_pid();
-
     // Resolve against the cwd through the shared helper, so `./prog` and
     // `prog` name the same file execve sees as every other path syscall.
-    let mut kpath = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
+    let kpath = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
     // execve follows a final /proc magic link like open does:
     // `execv("/proc/self/exe")` re-runs the binary itself (and fd/N of a
     // mounted file runs that file) instead of failing on the link.
-    kpath = match follow_magic_final(kpath) { Ok(p) => p, Err(e) => return e };
+    let kpath = match follow_magic_final(kpath) { Ok(p) => p, Err(e) => return e };
+    sys_execve_kp(kpath, argv_ptr, envp_ptr, false)
+}
+
+/// execveat(dirfd, path, argv, envp, flags). The path is resolved to a
+/// KPath here and then runs the exact execve path (creds, setid, NNP,
+/// seccomp, cloexec sweep), so nothing is duplicated.
+fn sys_execveat(dirfd: usize, path_ptr: usize, argv_ptr: usize, envp_ptr: usize, flags: usize) -> isize {
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 { return -22; }
+    let dirfd = dirfd as u32 as i32 as isize as usize;
+    let empty = path_ptr != 0 && validate_user_buf(path_ptr, 1) && ur::<u8>(path_ptr) == 0;
+    if flags & AT_EMPTY_PATH != 0 && empty {
+        // fexecve: run the file `dirfd` names (it may be O_PATH).
+        const F_GETFD: usize = 1;
+        let cloexec = sys_fcntl(fd_handle(dirfd), F_GETFD, 0);
+        if cloexec < 0 { return -9; } // EBADF
+        let host = match fd_host_path(dirfd) { Some(h) => h, None => return -9 };
+        let kp = KPath::raw(&host);
+        return sys_execve_kp(kp, argv_ptr, envp_ptr, cloexec & 1 != 0);
+    }
+    let kp = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        // The final component must not be a symlink: Linux gives ELOOP.
+        if ns_readlink(kp.ns_bytes()).is_ok() { return -40; }
+        return sys_execve_kp(kp, argv_ptr, envp_ptr, false);
+    }
+    let kp = match follow_magic_final(kp) { Ok(p) => p, Err(e) => return e };
+    sys_execve_kp(kp, argv_ptr, envp_ptr, false)
+}
+
+/// `fd_cloexec`: the file came from a close-on-exec fd (fexecve); a `#!`
+/// script would then name an fd that is closed by the time the interpreter
+/// opens /dev/fd/N, which Linux reports as ENOENT.
+fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: bool) -> isize {
+    let pid = current_pid();
+
     // MS_NOEXEC (Linux `path_noexec`): the file named, script or binary.
     if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
 
@@ -6448,6 +6484,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
             None => break, // unreadable: the ELF path below reports it
         };
         if head.len() < 2 || &head[..2] != b"#!" { break; }
+        if fd_cloexec && depth == 0 { return -2; } // ENOENT, as Linux
         if depth >= SHEBANG_MAX_DEPTH { return -40; } // ELOOP
         let perm = exec_permitted(&kpath, pid);
         if perm != 0 { return perm; }
