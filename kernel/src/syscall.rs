@@ -11314,8 +11314,15 @@ fn proc_fd_below(p: &[u8]) -> Option<Vec<u8>> {
     let (fd, below) = proc_own_fd(p)?;
     if below.is_empty() { return None; }
     let mut host = fd_host_path(fd)?;
+    // The hidden pool is reachable only through a descriptor already inside it
+    // (a mount of this namespace), and then never out of its instance by "..".
+    let base_in_sb = vfs::mnt::is_sb_path(&host);
+    let dotdot = below.split(|&c| c == b'/').any(|c| c == b"..");
     if host.last() != Some(&b'/') { host.push(b'/'); }
     host.extend_from_slice(below);
+    if (!base_in_sb && vfs::mnt::is_sb_path(&host)) || (base_in_sb && dotdot) {
+        return Some(b"/.leandros-hidden".to_vec());
+    }
     Some(host)
 }
 
