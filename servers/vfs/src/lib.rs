@@ -4672,7 +4672,7 @@ pub fn tmpfs_read_all(path: &str, out: &mut [u8]) -> Option<usize> {
     let p = path.as_bytes();
     let tmp = TMP_FILES.lock();
     let idx = tmp_find(&tmp, p)?;
-    if tmp[idx].is_dir || tmp[idx].is_link || tmp[idx].is_fifo || tmp[idx].is_sock {
+    if tmp[idx].is_dir || tmp[idx].is_link || tmp[idx].is_fifo || tmp[idx].is_sock || tmp[idx].devtype != 0 {
         return None;
     }
     let owner = tmp_owner(&tmp, idx);
@@ -4835,7 +4835,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_ALLOC_FD     => handle_alloc_fd(caller_pid, arg(msg,0) as usize),
         VFS_UNLINK       => handle_unlink(caller_pid, arg(msg,0) as usize),
         VFS_MKDIR        => handle_mkdir(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
-        VFS_MKNOD        => handle_mknod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        VFS_MKNOD        => handle_mknod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2)),
         VFS_FTRUNCATE    => handle_ftruncate(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_FALLOCATE    => handle_fallocate(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32,
                                              arg(msg,2) as i64, arg(msg,3) as i64),
@@ -8262,6 +8262,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                             return err_reply(-13); // EACCES
                         }
                     }
+                    if tmp[idx].devtype != 0 {
+                        let (blk, rdev) = (tmp[idx].devtype == 2, tmp[idx].rdev);
+                        drop(tmp);
+                        return devnode_open(pid, blk, rdev, flags, mode);
+                    }
                     // Linux `handle_truncate`: any O_TRUNC open strips set-ID bits.
                     if trunc && !tmp[idx].is_link { tmp_kill_setid(&mut tmp, idx, cred.euid); }
                     if trunc && tmp[idx].len != 0 && !tmp[idx].is_link {
@@ -8658,6 +8663,10 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     proxy.data[16..24].copy_from_slice(&(mode as u64).to_le_bytes());
                     let reply = call_port(port, proxy);
                     let file_id_raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
+                    if file_id_raw <= -DEVNODE_BASE {
+                        let v = (-file_id_raw - DEVNODE_BASE) as u64;
+                        return devnode_open(pid, v >> 32 & 1 != 0, v as u32, flags, mode);
+                    }
                     if file_id_raw < 0 {
                         return make_reply(file_id_raw);
                     }
@@ -8677,6 +8686,10 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             proxy.data[16..24].copy_from_slice(&(mode as u64).to_le_bytes());
             let reply = call_port(port, proxy);
             let file_id_raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
+            if file_id_raw <= -DEVNODE_BASE {
+                let v = (-file_id_raw - DEVNODE_BASE) as u64;
+                return devnode_open(pid, v >> 32 & 1 != 0, v as u32, flags, mode);
+            }
             if file_id_raw < 0 {
                 return make_reply(file_id_raw);
             }
@@ -11020,7 +11033,8 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         for c in tmp.children_from(dir_path, pos - 2) {
             let e = &tmp[c];
             let d_type = if e.is_dir { 4 } else if e.is_fifo { 1 } else if e.is_link { 10 }
-                         else if e.is_sock { 12 } else { 8 };
+                         else if e.is_sock { 12 } else if e.devtype == 1 { 2 }
+                         else if e.devtype == 2 { 6 } else { 8 };
             match write_dirent(buf, off, count, 400 + c as u64, &e.path()[dir_len + 1..], d_type) {
                 Some(r) => off += r,
                 None => { i = c; break; }
@@ -11181,6 +11195,8 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                              else if e.is_fifo { 1 }
                              else if e.is_link { 10 }
                              else if e.is_sock { 12 } // DT_SOCK
+                             else if e.devtype == 1 { 2 } // DT_CHR
+                             else if e.devtype == 2 { 6 } // DT_BLK
                              else { 8 };
                 if let Some(r) = write_dirent(buf, off, count, 400 + i as u64, name, d_type) {
                     off += r; pos += 1;
@@ -12744,12 +12760,16 @@ fn handle_mkdir(pid: u32, path_ptr: usize, mode: u32) -> Message {
 /// behaves like an empty regular file (no blocking open, no rendezvous
 /// between reader and writer). Real FIFO semantics would need their own
 /// vnode kind, the way `Pipe` already has one.
-fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
+fn handle_mknod(pid: u32, path_ptr: usize, mode: u32, dev: u64) -> Message {
     const S_IFMT:  u32 = 0o170000;
+    const S_IFCHR: u32 = 0o020000;
+    const S_IFBLK: u32 = 0o060000;
     const S_IFIFO: u32 = 0o010000;
+    const S_IFSOCK: u32 = 0o140000;
 
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
+    let ftype = mode & S_IFMT;
 
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-17); }              // EEXIST — mount root
@@ -12763,7 +12783,17 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
         };
         tmp.claim(idx, path, false);
         tmp[idx].is_dir  = false;
-        tmp[idx].is_fifo = mode & S_IFMT == S_IFIFO;
+        tmp[idx].is_fifo = ftype == S_IFIFO;
+        if ftype == S_IFSOCK {
+            // A bare socket node (no listener): connect() finds it but
+            // there is nothing behind it -> ECONNREFUSED.
+            tmp[idx].is_sock = true;
+            tmp[idx].sock_id = u64::MAX;
+        }
+        if ftype == S_IFCHR || ftype == S_IFBLK {
+            tmp[idx].devtype = if ftype == S_IFCHR { 1 } else { 2 };
+            tmp[idx].rdev    = dev as u32;
+        }
         tmp[idx].uid  = cred.euid;
         tmp[idx].gid  = cred.egid;
         // mknod's mode arrives unpacked (it carries the S_IFMT type bits).
@@ -12771,8 +12801,71 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
                          sched::umask(u32::MAX) as u16, false);
         return ok_reply();
     }
+    if let Some(port) = find_mount_port(raw) {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_MKNOD;
+        proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+        // The server gets the S_IFMT bits plus the caller's umask packed
+        // above bit 16 (see `xattr::pack_create_mode`); the type sits at
+        // bits 12..16 of `mode`, which the packed word's 0o7777 mask would
+        // drop, so it travels in its own word.
+        let packed = xattr::pack_create_mode(mode & 0o7777, sched::umask(u32::MAX));
+        proxy.data[8..16].copy_from_slice(&packed.to_le_bytes());
+        proxy.data[16..24].copy_from_slice(&((ftype >> 12) as u64).to_le_bytes());
+        proxy.data[24..32].copy_from_slice(&dev.to_le_bytes());
+        return call_port(port, proxy);
+    }
     for &dir in RAMFS_DIRS { if raw == dir { return err_reply(-17); } }
     err_reply(-30) // EROFS
+}
+
+
+/// f2fs (and any mount server) answers an open of a character/block device
+/// node with `-(DEVNODE_BASE + (is_blk << 32 | rdev))`: the node's driver
+/// lives in the VFS, not in the filesystem.
+const DEVNODE_BASE: i64 = 1 << 40;
+
+/// Finish an open of an on-disk device node: find the driver that owns
+/// `rdev` and re-enter `handle_open` on its /dev name. Unknown numbers (and
+/// the whiteout 0:0) are ENXIO, as on Linux.
+fn devnode_open(pid: u32, is_blk: bool, rdev: u32, flags: u32, mode: u32) -> Message {
+    let (major, minor) = dev_major_minor(rdev as u64);
+    let mut buf: Vec<u8> = Vec::new();
+    if is_blk {
+        if !block::path_for_rdev(major, minor, &mut buf) { return err_reply(-6); }
+    } else {
+        let fixed: Option<&[u8]> = match (major, minor) {
+            (1, 3) => Some(b"/dev/null"), (1, 5) => Some(b"/dev/zero"),
+            (1, 8) => Some(b"/dev/random"), (1, 9) => Some(b"/dev/urandom"),
+            (5, 0) => Some(b"/dev/tty"), (5, 1) => Some(b"/dev/console"),
+            (5, 2) => Some(b"/dev/ptmx"), (29, 0) => Some(b"/dev/fb0"),
+            _ => None,
+        };
+        if let Some(p) = fixed {
+            buf.extend_from_slice(p);
+        } else if major == 4 && (1..=63).contains(&minor) {
+            buf.extend_from_slice(b"/dev/tty");
+            push_decimal(&mut buf, minor);
+        } else if major >= 136 && major <= 143 {
+            buf.extend_from_slice(b"/dev/pts/");
+            push_decimal(&mut buf, (major - 136) * 256 + minor);
+        } else {
+            let devices = DYNAMIC_DEVICES.lock();
+            match devices.iter().find(|d| d.in_use && d.major == major && d.minor == minor && (major, minor) != (0, 0)) {
+                Some(d) => buf.extend_from_slice(d.path.as_bytes()),
+                None => return err_reply(-6), // ENXIO
+            }
+        }
+    }
+    buf.push(0);
+    handle_open(pid, buf.as_ptr() as usize, flags, mode)
+}
+
+fn push_decimal(buf: &mut Vec<u8>, mut n: u32) {
+    let mut tmp = [0u8; 10];
+    let mut i = tmp.len();
+    loop { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; if n == 0 { break; } }
+    buf.extend_from_slice(&tmp[i..]);
 }
 
 // ── AF_UNIX socket nodes (called from the net server) ────────────────────────
@@ -12845,7 +12938,8 @@ pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 {
     match tmp_find(&tmp, tpath) {
         Some(idx) if tmp[idx].is_sock => {
             if !tmp_may(&tmp, idx, &cred, xattr::MAY_WRITE) { return -13; } // EACCES
-            tmp[tmp_owner(&tmp, idx)].sock_id as i64
+            let sid = tmp[tmp_owner(&tmp, idx)].sock_id;
+            if sid == u64::MAX { -111 } else { sid as i64 } // mknod'ed node: no listener
         }
         Some(_) => -111, // exists, not a socket → ECONNREFUSED
         None    => -2,   // ENOENT
@@ -13011,6 +13105,8 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
             tmp[idx].is_link = tmp[owner].is_link;
             tmp[idx].is_sock = tmp[owner].is_sock;
             tmp[idx].sock_id = tmp[owner].sock_id;
+            tmp[idx].devtype = tmp[owner].devtype;
+            tmp[idx].rdev    = tmp[owner].rdev;
             tmp[idx].mode    = tmp[owner].mode;
             tmp[idx].uid     = tmp[owner].uid;
             tmp[idx].gid     = tmp[owner].gid;
@@ -13331,6 +13427,8 @@ fn tmp_ifmt(e: &TmpFileEntry) -> u16 {
     else if e.is_link { 0o120000 }
     else if e.is_sock { 0o140000 }
     else if e.is_fifo { 0o010000 }
+    else if e.devtype == 1 { 0o020000 }
+    else if e.devtype == 2 { 0o060000 }
     else { 0o100000 }
 }
 
@@ -14426,6 +14524,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
             if e.is_dir       { (S_IFDIR | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
             else if e.is_sock { (S_IFSOCK | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
             else if e.is_fifo { (S_IFIFO | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
+            else if e.devtype != 0 { ((if e.devtype == 1 { 0o020000 } else { 0o060000 }) | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
             else              { (S_IFREG | (e.mode & 0o7777), e.len as u64, 0x2000_0000 + idx as u64) }
         }
         // eventfd/timerfd/signalfd/inotify are anon-inode files and report S_IFREG.
@@ -14762,6 +14861,8 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
                 let ifmt: u32 = if !follow && tmp[idx].is_link { 0o120000 }
                                 else if e.is_sock { 0o140000 }
                                 else if e.is_fifo { 0o010000 }
+                                else if e.devtype == 1 { 0o020000 }
+                                else if e.devtype == 2 { 0o060000 }
                                 else { 0o100000 };
                 let default_mode = if ifmt == 0o120000 { 0o777 } else { 0o644 };
                 let mode = ifmt | if e.mode != 0 { e.mode } else { default_mode };
@@ -14769,11 +14870,14 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
                 let (uid, gid) = (e.uid, e.gid);
                 let (at, mt, ct) = (e.atime, e.mtime, e.ctime);
                 let blocks = if ifmt == 0o100000 { Some(tmp_st_blocks(owner)) } else { None };
+                let rdev = if e.devtype != 0 { e.rdev as u64 } else { 0 };
                 drop(tmp);
-                match blocks {
+                if rdev != 0 || ifmt == 0o020000 || ifmt == 0o060000 {
+                    write_stat_full_rdev(stat_ptr, mode, nlink, size, ino, uid, gid, rdev);
+                } else { match blocks {
                     Some(b) => write_stat_full_blocks(stat_ptr, mode, nlink, size, ino, uid, gid, b),
                     None    => write_stat_full(stat_ptr, mode, nlink, size, ino, uid, gid),
-                }
+                } }
                 write_stat_times(stat_ptr, at, mt, ct);
                 return ok_reply();
             }
