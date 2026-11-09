@@ -314,7 +314,7 @@ unsafe fn execute_binary(args: &[&str], count: usize) {
         // default "/usr/local/bin:/bin:/usr/bin" and tries /usr/local/bin
         // first, which doesn't exist on this OS's F2FS image at all -
         // everything ships under /bin (see mkfs-f2fs-populated.py).
-        static PATH_ENV: &[u8] = b"PATH=/bin\0";
+        static PATH_ENV: &[u8] = b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0";
         static HOME_ENV: &[u8] = b"HOME=/\0";
         static TERM_ENV: &[u8] = b"TERM=xterm-256color\0";
         // Surfaces real panic messages from Rust std children (human-panic

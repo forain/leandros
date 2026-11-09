@@ -7014,12 +7014,22 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
         for cpu in 0..n {
             p = write_lit(buf, p, b"processor\t: ");
             p = write_u32(buf, p, cpu as u32);
+            // Linux arm64 layout: podman (getCPUInfo) and lscpu key off
+            // "CPU architecture".
+            #[cfg(target_arch = "aarch64")]
+            {
+                let _ = khz;
+                p = write_lit(buf, p, b"\nBogoMIPS\t: 50.00\nFeatures\t: fp asimd evtstrm crc32 cpuid\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd08\nCPU revision\t: 3\n\n");
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
             p = write_lit(buf, p, b"\nmodel name\t: Leandros Virtual CPU\ncpu MHz\t\t: ");
             p = write_u32(buf, p, (khz / 1000) as u32);
             let frac = (khz % 1000) as u32;
             p = write_lit(buf, p, if frac < 10 { b".00" } else if frac < 100 { b".0" } else { b"." });
             p = write_u32(buf, p, frac);
             p = write_lit(buf, p, b"\n\n");
+            }
         }
         return Some(p);
     }

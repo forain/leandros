@@ -94,6 +94,8 @@ extern "C" {
     pub fn fork() -> pid_t;
     pub fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_int) -> pid_t;
     pub fn kill(pid: pid_t, sig: c_int) -> c_int;
+    pub fn syscall(num: i64, ...) -> i64;
+    pub fn symlink(target: *const u8, linkpath: *const u8) -> c_int;
     pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> c_int;
     pub fn getppid() -> pid_t;
     pub fn lseek(fd: c_int, off: i64, whence: c_int) -> i64;
@@ -141,6 +143,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if !test_missing_interpreter_enoent() { failures += 1; }
     if !test_self_interpreter_eloop() { failures += 1; }
     if !test_launcher_has_shebang() { failures += 1; }
+    failures += test_execveat_all();
     if !test_exec_hides_cloexec_from_siblings() { failures += 1; }
     failures += test_bgfd_all();
     for base in [b"/tmp/.exectest-redir\0".as_slice(), b"/home/.exectest-redir\0".as_slice()] {
@@ -788,5 +791,75 @@ unsafe fn test_bgfd_all() -> c_int {
         b"/bin/exectest --bgfd /tmp/.exectest-bgfd-s > /tmp/.exectest-bgfd.so 2>&1 &\0") { f += 1; }
     if !test_bgfd(b"bgfd_sh_bg_tail\0", b's', b"/tmp/.exectest-bgfd-t\0",
         b"true; /bin/exectest --bgfd /tmp/.exectest-bgfd-t >> /tmp/.exectest-bgfd.so &\0") { f += 1; }
+    f
+}
+
+// ── execveat(2): dirfd-relative, AT_EMPTY_PATH (fexecve), AT_SYMLINK_NOFOLLOW ──
+
+#[cfg(target_arch = "x86_64")]
+const SYS_EXECVEAT: i64 = 322;
+#[cfg(target_arch = "aarch64")]
+const SYS_EXECVEAT: i64 = 281;
+const AT_FDCWD: i64 = -100;
+const AT_SYMLINK_NOFOLLOW: i64 = 0x100;
+const AT_EMPTY_PATH: i64 = 0x1000;
+const O_PATH: c_int = 0o10000000;
+const O_CLOEXEC: c_int = 0o2000000;
+const O_DIRECTORY: c_int = 0o200000;
+
+/// Fork, execveat in the child; returns the child's exit status: 0 when the
+/// new image (`exectest --exit0` or the echo script) ran, else the errno.
+unsafe fn execveat_status(dirfd: i64, path: &[u8], argv: &[*const u8], flags: i64) -> Option<c_int> {
+    let child = fork();
+    if child < 0 { return None; }
+    if child == 0 {
+        let r = syscall(SYS_EXECVEAT, dirfd, path.as_ptr(), argv.as_ptr(), ENVP.as_ptr(), flags);
+        let e = if r < 0 && *__errno_location() != 0 { *__errno_location() } else { 255 };
+        _exit(e);
+    }
+    let mut st: c_int = 0;
+    if waitpid(child, &mut st, 0) != child || !wifexited(st) { return None; }
+    Some(wexitstatus(st))
+}
+
+unsafe fn eat_case(name: &[u8], got: Option<c_int>, want: c_int) -> bool {
+    match got {
+        Some(g) if g == want => report(name, true),
+        _ => fail_at(name, 1),
+    }
+}
+
+unsafe fn test_execveat_all() -> c_int {
+    let mut f = 0;
+    let argv: [*const u8; 3] = [b"x\0".as_ptr(), b"--exit0\0".as_ptr(), core::ptr::null()];
+    // fexecve on an O_PATH descriptor.
+    let fd = open(b"/bin/exectest\0".as_ptr(), O_PATH | O_CLOEXEC);
+    let ok = fd >= 0 && execveat_status(fd as i64, b"\0", &argv, AT_EMPTY_PATH) == Some(0);
+    if !report(b"execveat_empty_path_opath\0", ok) { f += 1; }
+    if fd >= 0 { close(fd); }
+    // dirfd-relative path.
+    let dfd = open(b"/bin\0".as_ptr(), O_RDONLY | O_DIRECTORY);
+    let ok = dfd >= 0 && execveat_status(dfd as i64, b"exectest\0", &argv, 0) == Some(0);
+    if !report(b"execveat_dirfd_relative\0", ok) { f += 1; }
+    if dfd >= 0 { close(dfd); }
+    // AT_SYMLINK_NOFOLLOW on a symlink: ELOOP; without it the link is followed.
+    unlink(b"/tmp/.exectest-lnk\0".as_ptr());
+    symlink(b"/bin/exectest\0".as_ptr(), b"/tmp/.exectest-lnk\0".as_ptr());
+    if !eat_case(b"execveat_nofollow_eloop\0",
+        execveat_status(AT_FDCWD, b"/tmp/.exectest-lnk\0", &argv, AT_SYMLINK_NOFOLLOW), ELOOP) { f += 1; }
+    if !eat_case(b"execveat_follow_symlink\0",
+        execveat_status(AT_FDCWD, b"/tmp/.exectest-lnk\0", &argv, 0), 0) { f += 1; }
+    unlink(b"/tmp/.exectest-lnk\0".as_ptr());
+    // A script run through a close-on-exec fd: ENOENT (the interpreter could
+    // never reopen /dev/fd/N); without CLOEXEC it runs.
+    let sargv: [*const u8; 2] = [b"x\0".as_ptr(), core::ptr::null()];
+    let cfd = open(b"/bin/exectest-echo.sh\0".as_ptr(), O_RDONLY | O_CLOEXEC);
+    if !eat_case(b"execveat_script_cloexec_enoent\0",
+        if cfd >= 0 { execveat_status(cfd as i64, b"\0", &sargv, AT_EMPTY_PATH) } else { None }, ENOENT) { f += 1; }
+    if cfd >= 0 { close(cfd); }
+    let nfd = open(b"/bin/exectest-echo.sh\0".as_ptr(), O_RDONLY);
+    if !eat_case(b"execveat_script_plain_fd\0",
+        if nfd >= 0 { execveat_status(nfd as i64, b"\0", &sargv, AT_EMPTY_PATH) } else { None }, 0) { f += 1; }
+    if nfd >= 0 { close(nfd); }
     f
 }
