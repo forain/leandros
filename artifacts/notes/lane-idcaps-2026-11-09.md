@@ -32,3 +32,6 @@ H14: comment block in caps.rs (fsuid DAC-cap fixup not modelled).
   kuid0_not_nsroot (task stays kuid 0, map root=1000, exec -> empty).
 - Guard on main (tests only, box aarch64 `--cmdline idmap=test /bin/idmaptest`): FAIL exec_nsroot_keeps_caps,
   setuid_drops_caps, kuid0_not_nsroot; pass exec_drops_caps_host, exec_nonroot_nocaps.
+
+## x86_64 box regress (2026-11-09)
+lane/idcaps ecbf2592: 75 suites run, 0 bad, boots failed 0/1, PASS (1014s).
