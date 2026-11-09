@@ -1203,6 +1203,15 @@ impl RunQueue {
                         }
                     }
                     if task.poll_mask == crate::POLL_TAG_ALL { allmask += 1; }
+                    if crate::gdwake::log_enabled() && task.poll_mask.count_ones() <= 2 && task.poll_mask != crate::POLL_TAG_ALL {
+                        let kind = match key {
+                            Some(_) if task.poll_kbits & tag != 0 => "key-fp",
+                            Some(_) => "key-unrefined",
+                            None => "bits",
+                        };
+                        crate::gdwake::log_wake(task.pid as u32, task.tgid as u32,
+                            task.poll_mask, tag, key, kind, crate::current_pid() as u32);
+                    }
                     if crate::gdwake::enabled() {
                         crate::gdwake::mark(task.pid, crate::gdwake::SITE.load(core::sync::atomic::Ordering::Relaxed));
                     }

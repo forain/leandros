@@ -23,6 +23,35 @@ pub fn enabled() -> bool { ON.load(Relaxed) }
 /// Turn the census on (boot, from `sched.wakestat=1`, before user space).
 pub fn set_enabled(on: bool) { ON.store(on, Relaxed); }
 
+static LOG: AtomicBool = AtomicBool::new(false);
+
+/// `sched.wakelog=1`: one serial line per keyed/tagged wake that lands on a
+/// task parked with a narrow (<= 2 bits) poll mask. Off by default; the only
+/// cost when off is one relaxed load inside the already-rare wake delivery.
+#[inline(always)]
+pub fn log_enabled() -> bool { LOG.load(Relaxed) }
+pub fn set_log(on: bool) { LOG.store(on, Relaxed); }
+
+/// Serial line `[WAKELOG] tid= tgid= mask= tag= key= kind= waker= site=file:line`.
+/// `kind`: `key-fp` (delivered on a 16-bit fingerprint match), `key-unrefined`
+/// (keyed wake, the bit is explained by unkeyed interests), `bits` (tag-only).
+/// Caller holds RUN_QUEUE, so the waker's pid comes from the per-CPU slot.
+pub fn log_wake(tid: u32, tgid: u32, mask: u64, tag: u64, key: Option<u64>, kind: &str, waker: u32) {
+    extern "C" { fn arch_serial_putc(c: u8); }
+    use core::fmt::Write;
+    struct S;
+    impl Write for S {
+        fn write_str(&mut self, m: &str) -> core::fmt::Result {
+            for &b in m.as_bytes() { unsafe { arch_serial_putc(b) } }
+            Ok(())
+        }
+    }
+    let site = SITE.load(Relaxed);
+    let _ = write!(S, "[WAKELOG] tid={} tgid={} mask={:#x} tag={:#x} key={:#x} kind={} waker={} site=", tid, tgid, mask, tag, key.unwrap_or(0), kind, waker);
+    site_name(site, &mut |f, l| { let _ = write!(S, "{}:{}", f, l); });
+    let _ = write!(S, "\r\n");
+}
+
 /// The waker of the task in slot `pid & 1023`: a `&'static Location` address
 /// for a tagged wake, or one of the small codes below.
 static WOKE: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
