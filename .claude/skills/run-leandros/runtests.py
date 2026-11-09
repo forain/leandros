@@ -196,6 +196,7 @@ SUITES = {
     "netctl": ["/bin/netctltest"],
     "kmodctl": ["/bin/kmodctltest"],
     "ns": ["/bin/nstest"],
+    "mnt": ["/bin/mnttest"],
     "ovl": ["/bin/ovltest"],
     "idmap": ["/bin/idmaptest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.

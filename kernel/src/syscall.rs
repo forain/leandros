@@ -10906,6 +10906,21 @@ struct KPath {
     buf: Vec<u8>,
     /// Namespace path, when an alias rewrote it.
     ns: Option<Vec<u8>>,
+    /// Final mount id (mount namespace != 0 only; 0 otherwise).
+    #[allow(dead_code)]
+    mnt_id: u32,
+    /// Length of the namespace-path prefix naming the final mount point.
+    #[allow(dead_code)]
+    ns_prefix_len: usize,
+    /// Thread pid under which a `vfs::mnt::CALLCTX` entry for `ptr()` is
+    /// registered (0 = none: the ns-0 path takes no extra work).
+    ctx_pid: u32,
+}
+
+impl Drop for KPath {
+    fn drop(&mut self) {
+        if self.ctx_pid != 0 { vfs::mnt::callctx_clear(self.ctx_pid, self.buf.as_ptr() as usize); }
+    }
 }
 
 impl KPath {
@@ -10914,12 +10929,14 @@ impl KPath {
         let mut buf = Vec::with_capacity(bytes.len() + 1);
         buf.extend_from_slice(bytes);
         buf.push(0);
-        KPath { buf, ns: None }
+        KPath { buf, ns: None, mnt_id: 0, ns_prefix_len: 0, ctx_pid: 0 }
     }
 
     /// A namespace path (host-absolute, normalised), translated through the
     /// alias mounts and the `/proc/<pid>/{root,cwd}` magic links.
     fn from_ns(ns: Vec<u8>) -> Result<KPath, isize> {
+        let mns = sched::current_mntns();
+        if mns != 0 { return KPath::from_ns_mnt(ns, mns); }
         // Below /proc/self/fd/N: the namespace path is where that directory
         // really is, not the magic link, so chdir does not record a path
         // that depends on fd N staying open.
@@ -10940,6 +10957,27 @@ impl KPath {
         } };
         if backing.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
         let mut kp = KPath::raw(&backing);
+        kp.ns = Some(ns);
+        Ok(kp)
+    }
+
+    /// [`KPath::from_ns`] for a task in mount namespace `mns` != 0: the
+    /// namespace path goes through that namespace's mount tree, and the
+    /// (pointer -> ns path, mount id) pair is published to the VFS chokepoint
+    /// keyed by thread pid.
+    fn from_ns_mnt(ns: Vec<u8>, mns: sched::ns::NsId) -> Result<KPath, isize> {
+        let (mut denied, mut crossed) = (false, false);
+        let (mut mid, mut plen) = (0u32, 0usize);
+        let backing = backing_walk_m(&ns, &mut crossed, &mut denied, mns, &mut mid, &mut plen);
+        if denied { return Err(-13); }
+        let backing = match backing { Some(b) => b, None => ns.clone() };
+        if backing.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
+        let mut kp = KPath::raw(&backing);
+        kp.mnt_id = mid;
+        kp.ns_prefix_len = plen;
+        let pid = current_pid();
+        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: ns.clone(), mnt_id: mid });
+        kp.ctx_pid = pid;
         kp.ns = Some(ns);
         Ok(kp)
     }
@@ -11009,6 +11047,50 @@ fn backing_walk(ns: &[u8], crossed: &mut bool) -> Option<Vec<u8>> {
 /// [`backing_walk`], also reporting in `denied` that a `/proc/<pid>/{root,cwd}`
 /// hop named another user's process (the readlink gate, `proc_link_allowed`).
 fn backing_walk_d(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<Vec<u8>> {
+    let mns = sched::current_mntns();
+    if mns != 0 { return backing_walk_m(ns, crossed, denied, mns, &mut 0, &mut 0); }
+    backing_walk_ns0(ns, crossed, denied)
+}
+
+/// Translate one path through mount namespace `mns`'s tree; the first call
+/// records the final mount id and mountpoint prefix length.
+fn mnt_xlate(mns: sched::ns::NsId, p: &[u8], crossed: &mut bool, mid: &mut u32, plen: &mut usize, first: bool) -> Option<Vec<u8>> {
+    let x = vfs::mnt::translate(mns, p)?;
+    *crossed |= x.flags & vfs::mnt::MNT_NOSUID != 0;
+    if first { *mid = x.mnt_id; *plen = x.ns_prefix_len; }
+    Some(x.backing)
+}
+
+/// [`backing_walk_d`] for a task in mount namespace `mns` != 0.
+fn backing_walk_m(ns: &[u8], crossed: &mut bool, denied: &mut bool, mns: sched::ns::NsId,
+                  mid: &mut u32, plen: &mut usize) -> Option<Vec<u8>> {
+    let mut cur: Option<Vec<u8>> = mnt_xlate(mns, ns, crossed, mid, plen, true);
+    for _ in 0..4 {
+        let p: &[u8] = cur.as_deref().unwrap_or(ns);
+        if let Some(b) = proc_fd_below(p) { return Some(b); }
+        let hit = proc_magic(p, b"root").map(|(pid, rest)| (pid, rest, true))
+            .or_else(|| proc_magic(p, b"cwd").map(|(pid, rest)| (pid, rest, false)));
+        let (pid, rest, is_root) = match hit { Some(h) if !h.1.is_empty() => h, _ => break };
+        if sched::exists_probe(pid) == 0 && !proc_link_allowed(pid) { *denied = true; break; }
+        let base: alloc::sync::Arc<[u8]> = if is_root {
+            match sched::root_arc_of(pid) {
+                Some(r) => r,
+                None if sched::exists_probe(pid) == 0 => alloc::sync::Arc::from(&b"/"[..]),
+                None => break,
+            }
+        } else {
+            match sched::cwd_arc_of(pid) { Some(c) => c, None => break }
+        };
+        let mut v = Vec::with_capacity(base.len() + rest.len());
+        if &*base != b"/" { v.extend_from_slice(&base); }
+        v.extend_from_slice(rest);
+        cur = Some(mnt_xlate(mns, &v, crossed, mid, plen, false).unwrap_or(v));
+    }
+    cur
+}
+
+/// The ns-0 body of [`backing_walk_d`]: identity plus the alias table.
+fn backing_walk_ns0(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<Vec<u8>> {
     *crossed |= vfs::alias::crosses(ns);
     let mut cur: Option<Vec<u8>> = vfs::alias::translate(ns);
     for _ in 0..4 {
@@ -11084,6 +11166,19 @@ fn proc_own_fd(p: &[u8]) -> Option<(usize, &[u8])> {
 /// root, come back unchanged.
 fn host_to_view(p: &[u8]) -> Vec<u8> {
     let root = sched::current_root_arc();
+    let mns = sched::current_mntns();
+    if mns != 0 {
+        // The namespace's own tree answers; its root is the task's root.
+        let v = vfs::mnt::reverse(mns, p, 0);
+        let p: &[u8] = v.as_deref().unwrap_or(p);
+        if let Some(r) = root.as_deref() {
+            if r.len() > 1 && vfs::alias::under(p, r) {
+                if p.len() == r.len() { return b"/".to_vec(); }
+                return p[r.len()..].to_vec();
+            }
+        }
+        return p.to_vec();
+    }
     let ns = vfs::alias::reverse(p, root.as_deref());
     let p: &[u8] = ns.as_deref().unwrap_or(p);
     if let Some(r) = root.as_deref() {
@@ -11257,7 +11352,7 @@ fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
 
     // The caller's chroot root (host-absolute). `None` means "not chrooted" —
     // the overwhelmingly common case, which takes the same path it always did.
-    let root = sched::current_root_arc();
+    let (root, cwd_arc, _mntns) = sched::current_fs_ctx();
     let rlen = root.as_ref().map(|r| r.len()).filter(|&n| n > 1).unwrap_or(0);
     // `..` may never climb above this offset. For a jailed task it is the end
     // of the root prefix; otherwise it is 1 (the real "/").
@@ -11269,8 +11364,8 @@ fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
         // An absolute path is relative to the jail root, so start there.
         match &root { Some(r) if rlen > 1 => out.extend_from_slice(r), _ => out.push(b'/') }
     } else {
-        match sched::current_cwd_arc() {
-            Some(c) if c.first() == Some(&b'/') => out.extend_from_slice(&c),
+        match &cwd_arc {
+            c if c.first() == Some(&b'/') => out.extend_from_slice(c),
             _ => out.push(b'/'),
         }
         // A cwd that somehow lies outside the jail (it cannot be set there)
@@ -11304,6 +11399,10 @@ fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
     if out.len() > 1 && out.last() == Some(&b'/') { out.pop(); }
     // The void root's name is not observable from outside it.
     if vfs::alias::under(&out, vfs::VOID_ROOT) && root.as_deref() != Some(vfs::VOID_ROOT) {
+        return Err(-2);
+    }
+    // Superblock backing roots are never reachable by name.
+    if out.len() >= vfs::mnt::SB_ROOT.len() && vfs::alias::under(&out, vfs::mnt::SB_ROOT) {
         return Err(-2);
     }
     Ok(out)
@@ -16780,6 +16879,7 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
         let parent_pid = sched::tgid_of(current_pid());
         if !vfs::fd_table_slot_free() { return -11; } // EAGAIN, as for FORK
         let opts = sched::ForkOpts {
+            mntns: 0,
             vfork: flags & CLONE_VFORK != 0,
             child_stack,
             tls: if flags & CLONE_SETTLS != 0 { Some(tls as u64) } else { None },
