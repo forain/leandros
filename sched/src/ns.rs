@@ -415,6 +415,14 @@ pub fn from_k(kind: usize, ns: NsId, kid: u32) -> Option<u32> {
     None
 }
 
+/// The kernel id for id `vid` as the calling task names it (its user
+/// namespace's view); None when that namespace has no mapping for it. Inverse
+/// of `view_id`: the one place a non-identity map must change.
+pub fn kid_from_view(kind: usize, vid: u32) -> Option<u32> {
+    let ns = current_userns();
+    if mapped(kind, ns, vid) { Some(vid) } else { None }
+}
+
 /// Overflow id shown for ids with no mapping.
 pub const OVERFLOW_ID: u32 = 65534;
 
