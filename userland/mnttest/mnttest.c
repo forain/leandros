@@ -765,6 +765,45 @@ static void tmpfs_anywhere(void) {
     errno = 0;
     report("tfs_umount_twice_einval", umount(d) < 0 && errno == EINVAL);
 
+    /* a namespace copy keeps the instance alive and is isolated from reuse */
+    {
+        int up[2], dn[2];
+        char fa[128], fb[128];
+        snprintf(fa, sizeof fa, "%s/a", d);
+        snprintf(fb, sizeof fb, "%s/b", d);
+        if (mount("shm", d, "tmpfs", 0, "") == 0 && pipe(up) == 0 && pipe(dn) == 0) {
+            put(fa, "old", 0644);
+            pid_t cp = fork();
+            if (cp == 0) {
+                char c = 0, b2[64];
+                int res = 0;
+                if (unshare(CLONE_NEWNS) != 0) _exit(128);
+                write(up[1], "r", 1);
+                read(dn[0], &c, 1);
+                int m = slurp(fa, b2, sizeof b2);
+                if (m == 3 && !strcmp(b2, "old")) res |= 1;
+                if (access(fb, F_OK) != 0) res |= 2;
+                _exit(res);
+            }
+            char c;
+            read(up[0], &c, 1);
+            int ur = umount(d);
+            int mr = mount("shm", d, "tmpfs", 0, "");
+            if (mr == 0) put(fb, "new", 0644);
+            write(dn[1], "g", 1);
+            int stt = 0;
+            waitpid(cp, &stt, 0);
+            int code = WIFEXITED(stt) ? WEXITSTATUS(stt) : 255;
+            report("tfs_copy_keeps_instance", ur == 0 && (code & 1));
+            report("tfs_no_reuse_after_umount", mr == 0 && (code & 2));
+            umount(d);
+            close(up[0]); close(up[1]); close(dn[0]); close(dn[1]);
+        } else {
+            report("tfs_copy_keeps_instance", 0);
+            report("tfs_no_reuse_after_umount", 0);
+        }
+    }
+
     /* options: mode/uid/gid/size */
     r = mount("shm", d, "tmpfs", 0, "mode=0750,uid=1234,gid=5678,size=64k");
     report("tfs_opts_mount", r == 0);
