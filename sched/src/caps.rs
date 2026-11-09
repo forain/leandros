@@ -84,7 +84,10 @@ pub fn on_uid_change(t: &mut Task, old: (u32, u32, u32)) {
 /// execve transition (no file caps): a task with uid or euid 0 gets
 /// P' = I | bounding, E' = P'; anyone else ends with empty P and E.
 pub fn on_exec(t: &mut Task) {
-    let p = if t.uid == 0 || t.euid == 0 { t.caps[2] | t.caps[3] } else { 0 };
+    let mut p = if t.uid == 0 || t.euid == 0 { t.caps[2] | t.caps[3] } else { 0 };
+    // Linux cap_bprm_creds_from_file under no_new_privs: the new permitted set
+    // may not exceed the old one (no privilege gain on exec).
+    if t.no_new_privs { p &= t.caps[1]; }
     t.caps[0] = p;
     t.caps[1] = p;
 }

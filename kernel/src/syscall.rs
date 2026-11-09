@@ -8398,6 +8398,8 @@ fn sys_unshare(flags: usize) -> isize {
     if flat != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; } // CAP_SYS_ADMIN
     if flat != 0 && !alone { return -22; }
     if flags & CLONE_NEWUSER != 0 {
+        // Linux: a chrooted task may not create a user namespace (EPERM).
+        if sched::current_root_arc().is_some() { return -1; }
         // Linux: a multithreaded caller cannot change user namespace.
         if !alone { return -22; }
         let r = sched::ns::unshare_user();
@@ -16548,6 +16550,7 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
     // namespace plumbing). A thread or CLONE_PARENT child cannot be placed
     // when unshare(NEWPID) left pid_for_children differing from our own
     // namespace; CLONE_PARENT from a namespace init is refused too.
+    if flags & CLONE_NEWUSER != 0 && sched::current_root_arc().is_some() { return -1; } // EPERM when chrooted
     let (cur_pidns, cur_pidns_child) = sched::pidns::cur_and_child();
     if flags & CLONE_NEWPID != 0 {
         if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 { return -22; }
