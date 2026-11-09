@@ -1085,6 +1085,7 @@ static int c_setuid_down(void *x)
     CHECK(setuid(50) == -1 && errno == EINVAL);        /* unmapped */
     CHECK(setgid(5) == 0 && setuid(5) == 0);
     CHECK(getuid() == 5 && geteuid() == 5 && getgid() == 5);
+    prctl(PR_SET_DUMPABLE, 1);   /* the id change cleared it; /proc/<pid> shows root until then */
     x_sync();
     return 0;
 }
