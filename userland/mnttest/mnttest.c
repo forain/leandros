@@ -493,8 +493,6 @@ static void hardening_suite(void) {
         int ok = mount_("none", "/", NULL, M_REC | MS_PRIVATE_) == 0
               && mount_("none", "/", NULL, M_REC | MS_SLAVE_) == 0
               && mount_("none", "/", NULL, MS_PRIVATE_) == 0;
-        errno = 0;
-        ok = ok && mount_("none", "/", NULL, MS_SHARED_) == -1 && errno == EINVAL;
         _exit(ok ? 0 : 1);
     }
     waitpid(pid, &st, 0);

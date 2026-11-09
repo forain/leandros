@@ -9459,17 +9459,13 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
     if !mnt_may_mount(mns) { return -1; } // EPERM
     // Strip the legacy magic value, as do_mount does.
     let flags = if flags & 0xffff_0000 == 0xc0ed_0000 { flags & 0xffff } else { flags };
-    // MS_PRIVATE / MS_SLAVE (optionally MS_REC): every mount in a namespace
-    // other than the initial one is already private (a copy of ns 0 has no
-    // peer groups, and a cross-owner copy turns shared into slave), so the
-    // change is a no-op once the target resolves. MS_SHARED and
-    // MS_UNBINDABLE stay EINVAL until propagation state exists.
-    const MS_PRIVATE: usize = 1 << 18;
-    const MS_SLAVE: usize = 1 << 19;
-    if flags & (MS_PRIVATE | MS_SLAVE) != 0
-        && flags & !(MS_PRIVATE | MS_SLAVE | MS_REC) == 0
-        && flags & (MS_PRIVATE | MS_SLAVE) != (MS_PRIVATE | MS_SLAVE) {
-        return match resolve_user_path(target_ptr) { Ok(_) => 0, Err(e) => e };
+    // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC)
+    // act on this namespace's tree: crun and containers/storage call
+    // MS_REC|MS_PRIVATE / MS_SLAVE on "/" first.
+    if flags & MS_PROPAGATION != 0 {
+        if flags & !(MS_PROPAGATION | MS_REC) != 0 { return -22; }
+        let target = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+        return vfs::mnt::set_propagation(mns, target.ns_bytes(), flags) as isize;
     }
     if flags & (MS_REMOUNT | MS_MOVE | MS_PROPAGATION) != 0 { return -22; }
     let target = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
