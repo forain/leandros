@@ -371,6 +371,146 @@ pub fn with_ns<R>(ns: NsId, f: impl FnOnce(&mut MntNs) -> R) -> Option<R> {
     NS.lock().get_mut(&ns).map(f)
 }
 
+// ── Propagation state and mountinfo rendering (M3) ───────────────────────────
+
+pub const MS_UNBINDABLE: usize = 1 << 17;
+pub const MS_PRIVATE: usize = 1 << 18;
+pub const MS_SLAVE: usize = 1 << 19;
+pub const MS_SHARED: usize = 1 << 20;
+pub const MS_REC: usize = 0x4000;
+
+/// Peer-group id the initial namespace's `/` starts in (`shared:1`).
+pub const ROOT_GROUP: u32 = 1;
+static NEXT_GROUP: AtomicU32 = AtomicU32::new(2);
+
+/// (group, master, unbindable) of one propagation state.
+pub type Prop = (u32, u32, bool);
+
+/// Propagation state of namespace-0 mounts, keyed by namespace mountpoint.
+/// A mount without an entry is private, except `/` which starts shared.
+static PROP0: Mutex<BTreeMap<Vec<u8>, Prop>> = Mutex::new(BTreeMap::new());
+
+pub fn ns0_prop(path: &[u8]) -> Prop {
+    match PROP0.lock().get(path) {
+        Some(p) => *p,
+        None if path == b"/" => (ROOT_GROUP, 0, false),
+        None => (0, 0, false),
+    }
+}
+
+fn apply_mode(p: Prop, mode: usize) -> Prop {
+    match mode {
+        MS_SHARED => (if p.0 != 0 { p.0 } else { NEXT_GROUP.fetch_add(1, Ordering::Relaxed) }, p.1, false),
+        MS_SLAVE => (0, if p.0 != 0 { p.0 } else { p.1 }, false),
+        MS_UNBINDABLE => (0, 0, true),
+        _ => (0, 0, false),
+    }
+}
+
+/// mount(2) MS_SHARED/PRIVATE/SLAVE/UNBINDABLE (+MS_REC) on `path`, a
+/// namespace path in `ns`. EINVAL when it is not a mount point or `flags`
+/// names several propagation types.
+pub fn set_propagation(ns: NsId, path: &[u8], flags: usize) -> i32 {
+    let mode = flags & (MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED);
+    if mode.count_ones() != 1 { return -22; }
+    let rec = flags & MS_REC != 0;
+    let hit = |p: &[u8]| p == path || (rec && under(p, path));
+    if ns == 0 || !has_tree(ns) {
+        let mps = crate::ns0_mountpoints();
+        if !mps.iter().any(|m| m.as_slice() == path) { return -22; }
+        let mut g = PROP0.lock();
+        for m in mps.iter().filter(|m| hit(m)) {
+            let cur = g.get(m.as_slice()).copied().unwrap_or(if m.as_slice() == b"/" { (ROOT_GROUP, 0, false) } else { (0, 0, false) });
+            let mut n = apply_mode(cur, mode);
+            // `/` is the one peer group of ns 0 at id 1: re-sharing it returns there.
+            if m.as_slice() == b"/" && mode == MS_SHARED && cur.0 == 0 { n.0 = ROOT_GROUP; }
+            g.insert(m.clone(), n);
+        }
+        return 0;
+    }
+    with_ns(ns, |n| {
+        let paths: Vec<Vec<u8>> = (0..n.mnts.len()).map(|i| ns_mountpoint(&n.mnts, i)).collect();
+        if !paths.iter().any(|p| p.as_slice() == path) { return -22; }
+        for (i, p) in paths.iter().enumerate() {
+            if !hit(p) { continue; }
+            let m = &mut n.mnts[i];
+            let r = apply_mode((m.group, m.master, m.unbindable), mode);
+            m.group = r.0; m.master = r.1; m.unbindable = r.2;
+        }
+        0
+    }).unwrap_or(-22)
+}
+
+fn push_u32(v: &mut Vec<u8>, mut n: u32) {
+    let mut d = [0u8; 10]; let mut i = 0;
+    loop { d[i] = b'0' + (n % 10) as u8; i += 1; n /= 10; if n == 0 { break; } }
+    while i > 0 { i -= 1; v.push(d[i]); }
+}
+
+/// Per-mount option list: `rw|ro` then the nosuid/nodev/... flags.
+fn flag_opts(flags: u8) -> Vec<u8> {
+    let mut v: Vec<u8> = (if flags & MNT_RDONLY != 0 { &b"ro"[..] } else { &b"rw"[..] }).to_vec();
+    for (bit, name) in [(MNT_NOSUID, &b",nosuid"[..]), (MNT_NODEV, b",nodev"), (MNT_NOEXEC, b",noexec"),
+                        (MNT_NOATIME, b",noatime"), (MNT_NODIRATIME, b",nodiratime")] {
+        if flags & bit != 0 { v.extend_from_slice(name); }
+    }
+    if flags & MNT_STRICTATIME == 0 && flags & MNT_NOATIME == 0 { v.extend_from_slice(b",relatime"); }
+    v
+}
+
+/// Linux escapes space, tab, newline and backslash as octal in path fields.
+fn push_esc(v: &mut Vec<u8>, s: &[u8]) {
+    for &c in s {
+        if matches!(c, b' ' | b'\t' | b'\n' | b'\\') {
+            v.extend_from_slice(&[b'\\', b'0' + (c >> 6), b'0' + ((c >> 3) & 7), b'0' + (c & 7)]);
+        } else { v.push(c); }
+    }
+}
+
+/// `/proc/<pid>/mountinfo` (`info`) or `/proc/<pid>/mounts` for a namespace
+/// that has a tree; None when `ns` has none (the caller renders ns 0 itself).
+pub fn render_tree(ns: NsId, info: bool) -> Option<Vec<u8>> {
+    let g = NS.lock();
+    let t = &g.get(&ns)?.mnts;
+    let mut out = Vec::new();
+    for (i, m) in t.iter().enumerate() {
+        let mp = ns_mountpoint(t, i);
+        let dev = sb_dev(m.sb).unwrap_or(m.id);
+        let src: &[u8] = if m.device.is_empty() { b"none" } else { &m.device };
+        if info {
+            push_u32(&mut out, m.id);
+            out.push(b' ');
+            push_u32(&mut out, if m.parent == 0 { m.id } else { m.parent });
+            out.push(b' ');
+            push_u32(&mut out, dev >> 8); out.push(b':'); push_u32(&mut out, dev & 0xff);
+            out.push(b' ');
+            push_esc(&mut out, &m.root);
+            out.push(b' ');
+            push_esc(&mut out, &mp);
+            out.push(b' ');
+            out.extend_from_slice(&flag_opts(m.flags));
+            if m.group != 0 { out.extend_from_slice(b" shared:"); push_u32(&mut out, m.group); }
+            if m.master != 0 { out.extend_from_slice(b" master:"); push_u32(&mut out, m.master); }
+            if m.unbindable { out.extend_from_slice(b" unbindable"); }
+            out.extend_from_slice(b" - ");
+            out.extend_from_slice(m.fstype.as_bytes());
+            out.push(b' ');
+            push_esc(&mut out, src);
+            out.extend_from_slice(if m.flags & MNT_RDONLY != 0 { b" ro\n" } else { b" rw\n" });
+        } else {
+            push_esc(&mut out, src);
+            out.push(b' ');
+            push_esc(&mut out, &mp);
+            out.push(b' ');
+            out.extend_from_slice(m.fstype.as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(&flag_opts(m.flags));
+            out.extend_from_slice(b" 0 0\n");
+        }
+    }
+    Some(out)
+}
+
 // ── Superblock registry ──────────────────────────────────────────────────────
 
 pub struct SbEntry {

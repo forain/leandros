@@ -9228,6 +9228,12 @@ fn sys_mount(
     if mns != 0 { return sys_mount_ns(mns, source_ptr, target_ptr, fstype_ptr, flags); }
     // Every form of mount(2) needs CAP_SYS_ADMIN (Linux `may_mount`).
     if !sched::host_root() { return -1; } // EPERM
+    // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC):
+    // only the mount's propagation state changes; source/fstype are ignored.
+    if flags & (vfs::mnt::MS_UNBINDABLE | vfs::mnt::MS_PRIVATE | vfs::mnt::MS_SLAVE | vfs::mnt::MS_SHARED) != 0 {
+        let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+        return vfs::mnt::set_propagation(sched::current_mntns(), target_path.ns_bytes(), flags) as isize;
+    }
     if flags & MS_REMOUNT != 0 {
         let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
         let t = match core::str::from_utf8(target_path.bytes()) { Ok(s) => s, Err(_) => return -22 };
@@ -9271,6 +9277,7 @@ fn sys_mount(
             b"sysfs"    => Some((b"/sys".to_vec(), "sysfs")),
             b"devpts"   => Some((b"/dev/pts".to_vec(), "devpts")),
             b"mqueue"   => Some((b"/dev/mqueue".to_vec(), "mqueue")),
+            b"cgroup2"  => Some((b"/sys/fs/cgroup".to_vec(), "cgroup2")),
             _ => None,
         }
     };
@@ -9304,7 +9311,10 @@ fn sys_mount(
         } else {
             fstype.as_bytes().to_vec()
         };
-        return match vfs::alias::add(mp, &src, fstype, &device) { Ok(()) => 0, Err(e) => e as isize };
+        return match vfs::alias::add(mp, &src, fstype, &device) {
+            Ok(()) => { if fstype == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
+            Err(e) => e as isize,
+        };
     }
 
     let source_raw = match read_user_short_str(source_ptr) { Ok(v) => v, Err(e) => return e };
@@ -10555,27 +10565,35 @@ fn sys_mkdirat(dirfd: usize, path_ptr: usize, mode: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_mknodat(dirfd: usize, path_ptr: usize, mode: usize, _dev: usize) -> isize {
+fn sys_mknodat(dirfd: usize, path_ptr: usize, mode: usize, dev: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
 
-    // Decode the requested node type from the S_IFMT bits of `mode`, exactly
-    // as mknod(2)/mknodat(2) do. tmpfs can only back a plain file (S_IFREG,
-    // or the type left unset — 0 — which mknod also treats as "regular") or
-    // a FIFO (S_IFIFO); see the scope note on vfs::handle_mknod for what
-    // "FIFO" means here. Character/block devices (S_IFCHR/S_IFBLK) and
-    // sockets (S_IFSOCK) require CAP_MKNOD on Linux, which an unprivileged
-    // caller never has, so return EPERM exactly like Linux does rather than
-    // pretending to create a device tmpfs can't back.
+    // Linux `may_mknod`/`vfs_mknod`: regular files, FIFOs and sockets are open
+    // to everyone; character and block devices need CAP_MKNOD in the initial
+    // user namespace -- except the whiteout (char 0:0), which anyone may make
+    // (overlayfs and its userspace tooling rely on it). Anything else in the
+    // S_IFMT bits is EINVAL, a directory EPERM (as Linux).
     const S_IFMT:  usize = 0o170000;
     const S_IFREG: usize = 0o100000;
+    const S_IFCHR: usize = 0o020000;
+    const S_IFBLK: usize = 0o060000;
     const S_IFIFO: usize = 0o010000;
+    const S_IFSOCK: usize = 0o140000;
+    const CAP_MKNOD: u32 = 27;
     let ftype = mode & S_IFMT;
-    if ftype != 0 && ftype != S_IFREG && ftype != S_IFIFO {
-        return -1; // EPERM
+    let dev = dev as u32 as u64; // dev_t arrives in a 64-bit register; only the low 32 bits are used by glibc/musl encodings
+    match ftype {
+        0 | S_IFREG | S_IFIFO | S_IFSOCK => {}
+        S_IFCHR | S_IFBLK => {
+            let whiteout = ftype == S_IFCHR && dev == 0;
+            if !whiteout && !sched::caps::host_capable(CAP_MKNOD) { return -1; } // EPERM
+        }
+        0o040000 => return -1, // EPERM: directories are mkdir's job
+        _ => return -22, // EINVAL
     }
 
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_MKNOD, &[path.ptr() as u64, mode as u64]);
+    let msg = make_vfs_msg(vfs::VFS_MKNOD, &[path.ptr() as u64, mode as u64, dev]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 

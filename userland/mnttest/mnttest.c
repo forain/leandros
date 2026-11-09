@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdlib.h>
+#include <sys/mount.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <stdlib.h>
@@ -79,6 +81,92 @@ static void ns0_invariants(void) {
     report("getcwd_ns0", getcwd(cwd, sizeof cwd) != NULL);
     struct stat st;
     report("proc_mounts_readable", stat("/proc/self/mountinfo", &st) == 0);
+}
+
+
+/* ---- M3 mntinfo ---- */
+#ifndef MS_PRIVATE
+#define MS_PRIVATE (1 << 18)
+#endif
+#ifndef MS_SHARED
+#define MS_SHARED (1 << 20)
+#endif
+struct mi { int id, parent, maj, min; char root[256], mp[256], opts[128], fs[64], src[256], sopts[128], opt[8][32]; int nopt; };
+/* libmount-style parse: 6 fixed fields, optional fields up to a lone "-", then fstype source superopts. */
+static int parse_mi(char *line, struct mi *m) {
+    char *f[24]; int n = 0;
+    for (char *t = strtok(line, " "); t && n < 24; t = strtok(NULL, " ")) f[n++] = t;
+    if (n < 10) return -1;
+    if (sscanf(f[2], "%d:%d", &m->maj, &m->min) != 2) return -1;
+    m->id = atoi(f[0]); m->parent = atoi(f[1]);
+    snprintf(m->root, sizeof m->root, "%s", f[3]); snprintf(m->mp, sizeof m->mp, "%s", f[4]); snprintf(m->opts, sizeof m->opts, "%s", f[5]);
+    int i = 6; m->nopt = 0;
+    while (i < n && strcmp(f[i], "-")) { if (m->nopt < 8) snprintf(m->opt[m->nopt++], 32, "%s", f[i]); i++; }
+    if (i + 3 >= n + 0 && i + 3 > n) return -1;
+    if (i + 2 >= n) return -1;
+    snprintf(m->fs, sizeof m->fs, "%s", f[i + 1]); snprintf(m->src, sizeof m->src, "%s", f[i + 2]);
+    snprintf(m->sopts, sizeof m->sopts, "%s", i + 3 < n ? f[i + 3] : "");
+    return 0;
+}
+static struct mi MI[64];
+static int read_mi(const char *path) {
+    static char buf[16384];
+    if (slurp(path, buf, sizeof buf) <= 0) return -1;
+    int n = 0;
+    for (char *l = strtok(buf, "\n"); l && n < 64; l = strtok(NULL, "\n")) {
+        char tmp[1024]; snprintf(tmp, sizeof tmp, "%s", l);
+        if (parse_mi(tmp, &MI[n]) != 0) return -1;
+        n++;
+    }
+    return n;
+}
+static const char *opt_of(struct mi *m, const char *pfx) {
+    for (int i = 0; i < m->nopt; i++) if (!strncmp(m->opt[i], pfx, strlen(pfx))) return m->opt[i];
+    return NULL;
+}
+static struct mi *find_mp(int n, const char *mp) { for (int i = 0; i < n; i++) if (!strcmp(MI[i].mp, mp)) return &MI[i]; return NULL; }
+
+static void mountinfo_tests(void) {
+    int n = read_mi("/proc/self/mountinfo");
+    report("mountinfo_layout", n > 0);
+    if (n <= 0) return;
+    struct mi *r = find_mp(n, "/");
+    report("mountinfo_root_present", r != NULL && r->fs[0] != 0 && r->src[0] != 0);
+    const char *o = r ? opt_of(r, "shared:") : NULL;
+    report("mountinfo_root_shared1", o && !strcmp(o, "shared:1"));
+    report("mountinfo_pid_matches_self", ({ char p[64]; snprintf(p, sizeof p, "/proc/%d/mountinfo", getpid());
+        struct mi save = MI[0]; int n2 = read_mi(p); int ok = n2 == n && MI[0].id == save.id; ok; }));
+    /* ids vs /proc/self/mounts */
+    n = read_mi("/proc/self/mountinfo");
+    int uniq = 1, parents = 1;
+    for (int i = 0; i < n; i++) {
+        int pf = 0;
+        for (int j = 0; j < n; j++) { if (j != i && MI[j].id == MI[i].id) uniq = 0; if (MI[j].id == MI[i].parent) pf = 1; }
+        if (!pf) parents = 0;
+    }
+    report("mountinfo_ids_unique", uniq);
+    report("mountinfo_parents_exist", parents);
+    static char mb[16384]; int mn = slurp("/proc/self/mounts", mb, sizeof mb);
+    int ok = mn > 0;
+    for (int i = 0; ok && i < n; i++) {
+        char key[600]; snprintf(key, sizeof key, " %s %s ", MI[i].mp, MI[i].fs);
+        if (!strstr(mb, key)) ok = 0;
+    }
+    report("mountinfo_consistent_with_mounts", ok);
+    int lines = 0; for (char *c = mb; *c; c++) if (*c == '\n') lines++;
+    report("mounts_covers_mountinfo", lines >= n);
+    /* propagation */
+    errno = 0; mkdir("/tmp/mi_nonmp", 0755);
+    int rc = mount("", "/tmp/mi_nonmp", NULL, MS_PRIVATE, NULL);
+    report("private_nonmountpoint_einval", rc < 0 && errno == EINVAL);
+    rmdir("/tmp/mi_nonmp");
+    rc = mount("", "/", NULL, MS_PRIVATE, NULL);
+    n = read_mi("/proc/self/mountinfo"); r = find_mp(n, "/");
+    report("private_root_clears_shared", rc == 0 && r && !opt_of(r, "shared:"));
+    rc = mount("", "/", NULL, MS_SHARED, NULL);
+    n = read_mi("/proc/self/mountinfo"); r = find_mp(n, "/");
+    o = r ? opt_of(r, "shared:") : NULL;
+    report("shared_root_restored", rc == 0 && o && !strcmp(o, "shared:1"));
 }
 
 /* "mnttest bench": path-lookup cost (ns per call), for A/B against a base kernel. */
@@ -466,6 +554,7 @@ int main(int argc, char **argv) {
     ns0_invariants();
     newns_suite();
     hardening_suite();
+    mountinfo_tests();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
