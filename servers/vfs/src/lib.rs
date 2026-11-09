@@ -2204,7 +2204,7 @@ pub fn fd_epoll_eperm(pid: u32, fd: usize) -> bool {
             let tmp = TMP_FILES.lock();
             let e = &tmp[idx];
             let path = e.path();
-            e.in_use() && !e.ephemeral() && !path.starts_with(b"/tmp/.") && !path.starts_with(b"/tmp/dmabuf")
+            e.in_use() && !e.ephemeral() && !path.starts_with(b"/tmp/.") && !path.starts_with(b"/.leandros-sb/") && !path.starts_with(b"/tmp/dmabuf")
         }
         VnodeKind::MountedFile { .. } => {
             let mut buf = [0u8; 128];
@@ -4628,6 +4628,9 @@ pub fn init(owner_pid: u32) -> Option<u32> {
         let e = &mut tmp[0];
         e.is_dir = true;
         e.mode   = 0o700;
+        // The hidden superblock space for namespace tmpfs instances: created
+        // here, at boot, root-owned and 0711, before any user can run.
+        let _ = tmpfs_inst_parents(&mut tmp);
     }
     
     // Register IPC handler to respond to PINGs (prevents deadlocks during discovery scans)
@@ -5031,6 +5034,8 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
        // rides /tmp/. Intercept /run before the mount table so it lands on
        // tmpfs, not the pivoted F2FS root.
        || path == b"/run" || path.starts_with(b"/run/")
+       // Namespace tmpfs instances (hidden pool).
+       || path == TMPFS_INST_PARENT || path == TMPFS_INST_DIR || path.starts_with(b"/.leandros-sb/tmpfs/")
        // Only the synthesized `/sys/class/block` subtree. Like /proc it is not
        // a mount and must be intercepted before `find_mount_port()`, which
        // matches every absolute path once init has pivot_root'ed the F2FS
@@ -5240,9 +5245,12 @@ fn is_tmpfs_root(path: &[u8]) -> bool {
 /// The tmpfs root that owns `path` (the root itself, or a descendant under it),
 /// or `None` when no tmpfs mount owns it.
 fn tmpfs_root_of(path: &[u8]) -> Option<&'static [u8]> {
-    TMPFS_ROOTS.iter().copied().find(|&r| {
-        path == r || (path.len() > r.len() && path.starts_with(r) && path[r.len()] == b'/')
-    })
+    let under = |r: &[u8]| path == r || (path.len() > r.len() && path.starts_with(r) && path[r.len()] == b'/');
+    // The hidden namespace-instance pool counts as a tmpfs space, but only
+    // strictly below its kind directory (the directory itself is a plain
+    // pool entry created at boot).
+    if path.len() > TMPFS_INST_DIR.len() && under(TMPFS_INST_DIR) { return Some(TMPFS_INST_DIR); }
+    TMPFS_ROOTS.iter().copied().find(|&r| under(r))
 }
 
 /// Return true if `path` lives under any tmpfs mount root (root or descendant).
@@ -5745,6 +5753,17 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
 
     let mut cur = normalize_abs_floor(input, floor);
     let mut hops = 0u32;
+    let start_in_sb = mnt::is_sb_path(&cur);
+    // Instance root `/.leandros-sb/tmpfs/<n>` of a walk that starts in the pool:
+    // hops may not leave it for another instance (relative `..` or absolute).
+    let sb_inst: Option<Vec<u8>> = if start_in_sb {
+        let mut cnt = 0usize;
+        let mut end = cur.len();
+        for (i, &c) in cur.iter().enumerate() {
+            if c == b'/' { cnt += 1; if cnt == 4 { end = i; break; } }
+        }
+        Some(cur[..end].to_vec())
+    } else { None };
 
     // The caller's credentials, for the traversal check on each directory the
     // walk passes through. Taken before TMP_FILES (RUN_QUEUE is never taken
@@ -5828,6 +5847,17 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
 
         drop(push);
         cur = normalize_abs_floor(&next[..n], floor);
+        // A link may not lead into the hidden superblock space.
+        if mnt::is_sb_path(&cur) {
+            match &sb_inst {
+                None => return Err(-2),
+                Some(inst) => {
+                    let ok = cur.starts_with(&inst[..])
+                        && (cur.len() == inst.len() || cur[inst.len()] == b'/');
+                    if !ok { return Err(-2); }
+                }
+            }
+        }
     }
 
     Ok(cur)
@@ -6419,6 +6449,89 @@ fn gen_mntselftest() -> Option<VnodeKind> {
     for (name, ok) in mnt::selftest() { let _ = writeln!(s, "{}: {}", name, if ok { "PASS" } else { "FAIL" }); }
     let _ = writeln!(s, "ns_live={} ns_dying={} sb_count={}", sched::ns::live_count(), sched::ns::dying_count(), mnt::sb_count());
     proc_snapshot(b"/tmp/.mntselftest", s.as_bytes(), false)
+}
+
+/// Interim tmpfs instances for mount namespaces (lane M1; lane M5 replaces
+/// this with real per-superblock roots). An instance is a directory of the
+/// tmpfs pool under the hidden, root-owned backing prefix
+/// `/.leandros-sb/tmpfs/<n>`: no namespace path reaches the prefix (resolve_ns
+/// returns ENOENT, getdents hides it, a link hop into it from outside is
+/// ENOENT, and the mount-tree walk refuses it unless the mount root is itself
+/// there). The parents are created at boot, root-owned 0711; each instance
+/// directory is created exclusively (EEXIST if anything is there), 0700,
+/// owned by the creating uid.
+const TMPFS_INST_PARENT: &[u8] = b"/.leandros-sb";
+const TMPFS_INST_DIR: &[u8] = b"/.leandros-sb/tmpfs";
+
+/// Create the directory `path` exclusively: fails with EEXIST if any entry is
+/// there, whatever it is (an entry we did not create is never adopted).
+fn tmpfs_inst_mkdir(tmp: &mut TmpPool, path: &[u8], uid: u32, gid: u32, mode: u16) -> Result<(), i32> {
+    if tmp_find(tmp, path).is_some() { return Err(-17); }
+    let idx = tmp_free_slot(tmp).ok_or(-28)?;
+    tmp.claim(idx, path, false);
+    tmp[idx].is_dir = true;
+    tmp[idx].uid = uid;
+    tmp[idx].gid = gid;
+    tmp_init_created(tmp, idx, path, mode, 0, true);
+    Ok(())
+}
+
+/// Ensure the root-owned parents exist. An existing entry is accepted only
+/// if it is a directory owned by root:root with mode 0711 (our own).
+fn tmpfs_inst_parents(tmp: &mut TmpPool) -> Result<(), i32> {
+    for p in [TMPFS_INST_PARENT, TMPFS_INST_DIR] {
+        match tmp_find(tmp, p) {
+            None => tmpfs_inst_mkdir(tmp, p, 0, 0, 0o711)?,
+            Some(i) => {
+                let e = &tmp[i];
+                if !e.is_dir || e.uid != 0 || e.gid != 0 || e.is_link { return Err(-17); }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tmpfs_inst_root(n: u32) -> Vec<u8> {
+    let mut root = TMPFS_INST_DIR.to_vec();
+    root.push(b'/');
+    let mut d = [0u8; 10]; let mut k = 0; let mut v = n;
+    loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+    for i in (0..k).rev() { root.push(d[i]); }
+    root
+}
+
+/// Create tmpfs instance `n` (the superblock id) owned by `uid`:`gid`;
+/// returns its backing root.
+pub fn tmpfs_instance_create(n: u32, uid: u32, gid: u32) -> Result<Vec<u8>, i32> {
+    let root = tmpfs_inst_root(n);
+    let mut tmp = TMP_FILES.lock();
+    tmpfs_inst_parents(&mut tmp)?;
+    tmpfs_inst_mkdir(&mut tmp, &root, uid, gid, 0o700)?;
+    Ok(root)
+}
+
+/// Superblock destroy hook: free the tmpfs instance of the superblock whose
+/// registry root is `sb_root` (`/.leandros-sb/tmpfs/<n>`) and everything
+/// below it (its last mount is gone). A file an fd still holds survives
+/// nameless.
+pub fn tmpfs_instance_destroy(sb_root: &[u8]) {
+    let name = match sb_root.iter().rposition(|&c| c == b'/') { Some(i) => &sb_root[i + 1..], None => return };
+    let n: u32 = match core::str::from_utf8(name).ok().and_then(|x| x.parse().ok()) { Some(n) => n, None => return };
+    let root_buf = tmpfs_inst_root(n);
+    let root = &root_buf[..];
+    let mut objs: Vec<u32> = Vec::new();
+    {
+        let mut tmp = TMP_FILES.lock();
+        let Some(top) = tmp_find(&tmp, root) else { return };
+        let mut all = tmp.subtree(top);
+        all.reverse(); // children before parents
+        all.push(top);
+        for idx in all {
+            if !tmp[idx].in_use() { continue; }
+            if let Some(o) = tmp_drop_name(&mut tmp, idx, TmpOpen) { objs.push(o); }
+        }
+    }
+    for o in objs { dmabuf_release(o); }
 }
 
 /// The initial namespace's mount table as a tree, for copying into a new

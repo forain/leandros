@@ -67,15 +67,27 @@ impl Drop for NsRef {
 
 fn put(mut id: NsId) {
     while id != 0 {
-        if REFS[id as usize].fetch_sub(1, AcqRel) != 1 { return; }
         if IS_MNT[id as usize].load(Acquire) != 0 {
-            // Freeing a mount tree can drop superblock refs (port calls), and
-            // put may run under RUN_QUEUE: park the slot as DYING and let
-            // `reap` (next mntns create / mount syscall) free it.
-            REFS[id as usize].store(DYING, Release);
-            ZOMBIES[id as usize / 64].fetch_or(1u64 << (id as usize % 64), AcqRel);
-            return;
+            // Mount namespace: the last reference moves the slot straight from
+            // 1 to DYING with one CAS, so the slot is never visible as free
+            // (0) between the count reaching zero and the DYING mark. Freeing
+            // the tree can drop superblock refs (port calls) and put may run
+            // under RUN_QUEUE: `reap` frees it later from a lock-free context.
+            let r = &REFS[id as usize];
+            loop {
+                let c = r.load(Acquire);
+                if c == 1 {
+                    if r.compare_exchange(1, DYING, AcqRel, Relaxed).is_ok() {
+                        ZOMBIES[id as usize / 64].fetch_or(1u64 << (id as usize % 64), AcqRel);
+                        MNT_LIVE.fetch_sub(1, AcqRel);
+                        return;
+                    }
+                } else if r.compare_exchange(c, c - 1, AcqRel, Relaxed).is_ok() {
+                    return;
+                }
+            }
         }
+        if REFS[id as usize].fetch_sub(1, AcqRel) != 1 { return; }
         // A cgroup namespace unpins its root cgroup (its owner userns, held as
         // PARENT, is released by the loop below).
         if CGNS_FLAG[id as usize].swap(0, AcqRel) != 0 {
@@ -140,6 +152,9 @@ pub fn new_mntns(owner_user: NsId) -> Result<NsRef, isize> {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             PARENT[id].store(0, Release);
             LEVEL[id].store(0, Release);
+            // The namespace pins its owner user namespace (dropped by reap), so
+            // the owner id cannot be reused while the mount tree lives.
+            core::mem::forget(NsRef::get(owner_user));
             OWNER_USER[id].store(owner_user, Release);
             IS_MNT[id].store(1, Release);
             MNT_LIVE.fetch_add(1, AcqRel);
@@ -147,6 +162,14 @@ pub fn new_mntns(owner_user: NsId) -> Result<NsRef, isize> {
         }
     }
     Err(-28)
+}
+
+/// Move the calling thread into mount namespace `n`, returning the old
+/// reference (dropped by the caller outside any lock).
+pub fn swap_mntns(n: NsRef) -> Result<NsRef, isize> {
+    let pid = crate::current_pid();
+    let mut rq = crate::RUN_QUEUE.lock();
+    match rq.find_pid_mut(pid) { Some(t) => Ok(core::mem::replace(&mut t.mntns, n)), None => Err(-3) }
 }
 
 /// Mount namespace of `pid` (0 = initial, also when `pid` is unknown).
@@ -166,11 +189,15 @@ pub fn reap(mut free: impl FnMut(NsId)) {
             let id = w * 64 + b;
             free(id as NsId);
             IS_MNT[id].store(0, Release);
-            MNT_LIVE.fetch_sub(1, AcqRel);
+            let ou = OWNER_USER[id].swap(0, AcqRel);
             REFS[id].store(0, Release);
+            drop(NsRef(ou)); // the owner pin taken by new_mntns
         }
     }
 }
+
+/// True when a dead mount namespace awaits `reap`.
+pub fn has_zombies() -> bool { ZOMBIES.iter().any(|z| z.load(Relaxed) != 0) }
 
 /// Number of parked (DYING) mount namespaces.
 pub fn dying_count() -> usize { (1..NS_MAX).filter(|&i| REFS[i].load(Relaxed) == DYING).count() }

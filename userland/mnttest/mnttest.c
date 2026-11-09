@@ -15,6 +15,11 @@
 #include <sys/mount.h>
 #include <sys/wait.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <stdint.h>
+#include <linux/sched.h>
 
 static int fails;
 static void report(const char *name, int ok) { printf("%s: %s\n", name, ok ? "PASS" : "FAIL"); if (!ok) fails++; }
@@ -68,14 +73,11 @@ static void sb_hidden_ns0(void) {
 }
 
 /* Counters: no mount namespace may exist at baseline, and CLONE_NEWNS is
- * still rejected until M1. */
+ *  */
 static void ns0_invariants(void) {
     static char buf[1024];
     int ok = slurp("/proc/mntselftest", buf, sizeof buf) > 0 && strstr(buf, "ns_dying=0") != NULL;
     report("no_dying_ns", ok);
-    errno = 0;
-    int r = unshare(CLONE_NEWNS);
-    report("newns_still_rejected", r < 0 && (errno == EINVAL || errno == EPERM));
     char cwd[256];
     report("getcwd_ns0", getcwd(cwd, sizeof cwd) != NULL);
     struct stat st;
@@ -186,6 +188,494 @@ static void bench(void) {
     chdir("/");
 }
 
+
+/* ── Mount namespaces (lane M1, mntunshare) ─────────────────────────────── */
+#ifndef CLONE_NEWNS
+#define CLONE_NEWNS 0x00020000
+#endif
+#ifndef CLONE_NEWUSER
+#define CLONE_NEWUSER 0x10000000
+#endif
+#ifndef CLONE_FS
+#define CLONE_FS 0x00000200
+#endif
+#define M_BIND 4096UL
+#define M_REC 0x4000UL
+#define M_DETACH 2
+
+static int mount_(const char *s, const char *t, const char *f, unsigned long fl) {
+    return (int)syscall(SYS_mount, s, t, f, fl, NULL);
+}
+static int umount_(const char *t, int fl) { return (int)syscall(SYS_umount2, t, fl); }
+static int exists(const char *p) { struct stat st; return stat(p, &st) == 0; }
+static void put(const char *p, const char *c, int mode) {
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd >= 0) { if (c) write(fd, c, strlen(c)); close(fd); }
+    chmod(p, mode);
+}
+static void dir(const char *p) { mkdir(p, 0777); chmod(p, 0777); }
+static void path(char *o, size_t n, const char *b, const char *r) { snprintf(o, n, "%s/%s", b, r); }
+
+/* Run `file` with one argument; true when it exits 42 (see main). */
+static int exec42(const char *file, const char *arg) {
+    pid_t p = fork();
+    if (p == 0) { execl(file, file, arg, (char *)NULL); _exit(97); }
+    int st = 0;
+    if (p < 0 || waitpid(p, &st, 0) < 0) return 0;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 42;
+}
+
+struct cl3 { uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls; };
+static long clone3_(uint64_t flags) {
+    struct cl3 a; memset(&a, 0, sizeof a);
+    a.flags = flags; a.exit_signal = SIGCHLD;
+    return syscall(SYS_clone3, &a, sizeof a);
+}
+
+/* ns_live / sb_count from the kernel selftest snapshot. */
+static int ns_counts(int *live, int *sbs) {
+    static char buf[8192];
+    if (slurp("/proc/mntselftest", buf, sizeof buf) <= 0) return -1;
+    char *q = strstr(buf, "ns_live=");
+    if (!q) return -1;
+    int dying = 0;
+    return sscanf(q, "ns_live=%d ns_dying=%d sb_count=%d", live, &dying, sbs) == 3 ? 0 : -1;
+}
+
+static void sync_parent(int wr, int rd) { char c = 'x'; write(wr, &c, 1); read(rd, &c, 1); }
+
+/* The unprivileged child: user + mount namespace, then the whole tour. */
+static void ns_child(const char *base, int wr, int rd) {
+    char a[96], b[96], c[96], t[96], f[96], d[96], x[128], bsub[128], bmark[128], cwd[256];
+    path(a, sizeof a, base, "a"); path(b, sizeof b, base, "b"); path(c, sizeof c, base, "c");
+    path(t, sizeof t, base, "t"); path(f, sizeof f, base, "f"); path(d, sizeof d, base, "d");
+    fails = 0; /* inherited from the parent */
+    if (setgid(65534) || setuid(65534)) _exit(99);
+    if (chdir(a)) _exit(98);
+    int r = unshare(CLONE_NEWUSER | CLONE_NEWNS);
+    report("newns_unpriv_unshare", r == 0);
+    if (r) { fflush(stdout); _exit(1); }
+    /* Map our own ids (identity): creating files with unmapped ids is EOVERFLOW. */
+    { static const char *mp[][2] = { {"/proc/self/setgroups", "deny"}, {"/proc/self/uid_map", "65534 65534 1"}, {"/proc/self/gid_map", "65534 65534 1"} };
+      for (int mi = 0; mi < 3; mi++) { int mfd = open(mp[mi][0], O_WRONLY); if (mfd >= 0) { if (write(mfd, mp[mi][1], strlen(mp[mi][1])) < 0) {} close(mfd); } } }
+    /* cwd survives the unshare: a relative open still finds the file. */
+    report("newns_cwd_kept", access("marker", F_OK) == 0 && getcwd(cwd, sizeof cwd) && !strcmp(cwd, a));
+    /* a bind: visible here, not outside */
+    report("newns_bind_mount", mount_(a, b, NULL, M_BIND) == 0);
+    path(bmark, sizeof bmark, b, "marker");
+    report("newns_bind_visible_in", exists(bmark));
+    sync_parent(wr, rd);
+    report("newns_rel_bind", chdir(b) == 0 && access("marker", F_OK) == 0 && getcwd(cwd, sizeof cwd) && !strcmp(cwd, b));
+    report("newns_rel_dotdot", chdir("..") == 0 && chdir("a") == 0 && access("marker", F_OK) == 0);
+    /* a tmpfs mount of our own */
+    report("newns_tmpfs_mount", mount_("tmpfs", t, "tmpfs", 0) == 0);
+    path(x, sizeof x, t, "x");
+    int ok = 0;
+    int fd = open(x, O_RDWR | O_CREAT, 0644);
+    if (fd >= 0) {
+        char rb[8] = {0};
+        ok = write(fd, "hi", 2) == 2 && lseek(fd, 0, SEEK_SET) == 0 && read(fd, rb, 7) == 2 && !memcmp(rb, "hi", 2);
+        close(fd);
+    }
+    report("newns_tmpfs_rw", ok);
+    sync_parent(wr, rd);
+    report("newns_umount", umount_(t, 0) == 0);
+    report("newns_umount_gone", !exists(x));
+    /* exec through a file bind and a #! script through a dir bind */
+    report("newns_bind_file", mount_("/bin/mnttest", f, NULL, M_BIND) == 0);
+    report("newns_exec_bind", exec42(f, "child-ok"));
+    char s[128]; path(s, sizeof s, b, "script");
+    report("newns_exec_script_bind", exec42(s, "unused"));
+    /* locks inherited across the userns boundary */
+    errno = 0; r = umount_("/tmp", 0);
+    report("umount_locked_einval", r == -1 && errno == EINVAL);
+    errno = 0; r = mount_("/", d, NULL, M_BIND);
+    report("bind_locked_children_einval", r == -1 && errno == EINVAL);
+    report("rbind_ok", mount_("/", d, NULL, M_BIND | M_REC) == 0);
+    path(x, sizeof x, d, "tmp");
+    errno = 0; r = umount_(x, 0);
+    report("rbind_child_locked", r == -1 && errno == EINVAL);
+    report("rbind_detach", umount_(d, M_DETACH) == 0);
+    errno = 0; r = umount_(d, 0);
+    report("umount_not_mountpoint", r == -1 && errno == EINVAL);
+    /* busy and detach: a submount keeps its parent busy */
+    path(bsub, sizeof bsub, b, "sub");
+    report("detach_setup", mount_(c, bsub, NULL, M_BIND) == 0);
+    errno = 0; r = umount_(b, 0);
+    report("umount_busy", r == -1 && errno == EBUSY);
+    report("detach_subtree", umount_(b, M_DETACH) == 0 && !exists(bmark));
+    sync_parent(wr, rd);
+    fflush(stdout);
+    _exit(fails ? 1 : 0);
+}
+
+static void newns_suite(void) {
+    char base[64], p[128], q[128];
+    snprintf(base, sizeof base, "/tmp/mt.%d", (int)getpid());
+    dir(base);
+    path(p, sizeof p, base, "a"); dir(p);
+    path(q, sizeof q, p, "marker"); put(q, "A", 0666);
+    path(q, sizeof q, p, "sub"); dir(q);
+    path(q, sizeof q, p, "script");
+    { char body[160]; snprintf(body, sizeof body, "#!%s/f child-ok\n", base); put(q, body, 0755); }
+    path(p, sizeof p, base, "b"); dir(p);
+    path(p, sizeof p, base, "c"); dir(p);
+    path(q, sizeof q, p, "cmark"); put(q, "C", 0666);
+    path(p, sizeof p, base, "t"); dir(p);
+    path(p, sizeof p, base, "d"); dir(p);
+    path(p, sizeof p, base, "f"); put(p, "", 0755);
+
+    /* ns inode differs inside */
+    char mine[64] = {0}, theirs[64] = {0};
+    ssize_t n = readlink("/proc/self/ns/mnt", mine, sizeof mine - 1); if (n > 0) mine[n] = 0;
+    int live0 = -1, sb0 = -1;
+    ns_counts(&live0, &sb0);
+
+    int c2p[2], p2c[2];
+    if (pipe(c2p) || pipe(p2c)) { report("newns_pipe", 0); return; }
+    pid_t pid = fork();
+    if (pid == 0) { close(c2p[0]); close(p2c[1]); ns_child(base, c2p[1], p2c[0]); _exit(98); }
+    close(c2p[1]); close(p2c[0]);
+    char ch;
+    char bm[128], tx[128];
+    path(bm, sizeof bm, base, "b/marker"); path(tx, sizeof tx, base, "t/x");
+    int got = read(c2p[0], &ch, 1) == 1;
+    report("newns_bind_invisible_out", got && !exists(bm));
+    write(p2c[1], &ch, 1);
+    got = read(c2p[0], &ch, 1) == 1;
+    report("newns_tmpfs_invisible_out", got && !exists(tx));
+    write(p2c[1], &ch, 1);
+    got = read(c2p[0], &ch, 1) == 1;
+    write(p2c[1], &ch, 1);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    report("newns_child_clean", got && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    close(c2p[0]); close(p2c[1]);
+
+    /* NEWNS|CLONE_FS is EINVAL; unprivileged NEWNS without NEWUSER is EPERM */
+    errno = 0; long r = clone3_(CLONE_NEWNS | CLONE_FS);
+    report("newns_fs_einval", r == -1 && errno == EINVAL);
+    pid = fork();
+    if (pid == 0) {
+        if (setgid(65534) || setuid(65534)) _exit(99);
+        errno = 0;
+        _exit(unshare(CLONE_NEWNS) == -1 && errno == EPERM ? 0 : 1);
+    }
+    waitpid(pid, &st, 0);
+    report("newns_perm", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    /* clone3(NEWNS|NEWUSER): the child owns a private mount tree */
+    r = clone3_(CLONE_NEWNS | CLONE_NEWUSER);
+    if (r == 0) {
+        char a2[96], b2[96], m2[128];
+        path(a2, sizeof a2, base, "a"); path(b2, sizeof b2, base, "b"); path(m2, sizeof m2, b2, "marker");
+        int ok = mount_(a2, b2, NULL, M_BIND) == 0 && exists(m2) && umount_(b2, 0) == 0 && !exists(m2);
+        _exit(ok ? 0 : 1);
+    }
+    if (r > 0) { waitpid((pid_t)r, &st, 0); }
+    report("clone3_newns", r > 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0 && !exists(bm));
+
+    /* root, NEWNS only: nothing locked, the namespace is its own */
+    pid = fork();
+    if (pid == 0) {
+        char in[64] = {0};
+        int ok = unshare(CLONE_NEWNS) == 0;
+        ssize_t k = readlink("/proc/self/ns/mnt", in, sizeof in - 1); if (k > 0) in[k] = 0;
+        ok = ok && strcmp(in, mine) != 0;
+        ok = ok && umount_("/dev/shm", 0) == 0;
+        errno = 0;
+        ok = ok && umount_("/dev/shm", 0) == -1 && errno == EINVAL;
+        _exit(ok ? 0 : 1);
+    }
+    waitpid(pid, &st, 0);
+    report("newns_root_umount_ns_ino", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    (void)theirs;
+    report("newns_ns0_still_mounted", exists("/dev/shm"));
+
+    /* leak: a further namespace creation reaps the dead ones */
+    pid = fork();
+    if (pid == 0) _exit(unshare(CLONE_NEWNS) == 0 ? 0 : 1);
+    waitpid(pid, &st, 0);
+    int live1 = -2, sb1 = -2;
+    ns_counts(&live1, &sb1);
+    report("newns_leak", live0 >= 0 && live1 == live0 && sb1 == sb0);
+}
+
+/* ── Review fixes (mntunshare): pool squatting, pivot, private, proc ────── */
+#ifndef MS_PRIVATE_
+#define MS_PRIVATE_ (1UL << 18)
+#define MS_SLAVE_ (1UL << 19)
+#define MS_SHARED_ (1UL << 20)
+#endif
+
+static int in_ns_dying0(void) {
+    static char buf[1024];
+    return slurp("/proc/mntselftest", buf, sizeof buf) > 0 && strstr(buf, "ns_dying=0") != NULL;
+}
+
+static int vm_child(void *arg) {
+    (void)arg;
+    execl("/bin/mnttest", "/bin/mnttest", "child-ok", (char *)NULL);
+    _exit(97);
+}
+
+static void hardening_suite(void) {
+    char sq[64];
+    int st = 0;
+    pid_t pid;
+    int k;
+
+    /* pool_squat: an unprivileged user pre-creates the old /tmp pool and a
+     * reachable directory for every likely instance number; a later tmpfs
+     * mount (root, in its own mount namespace) must land elsewhere and the
+     * squatter's directories stay untouched and are not the backing store. */
+    pid = fork();
+    if (pid == 0) {
+        if (setgid(65534) || setuid(65534)) _exit(99);
+        mkdir("/tmp/.leandros-sb", 0777);
+        mkdir("/tmp/.leandros-sb/tmpfs", 0777);
+        for (k = 1; k <= 24; k++) {
+            snprintf(sq, sizeof sq, "/tmp/.leandros-sb/tmpfs/%d", k);
+            mkdir(sq, 0777);
+            strcat(sq, "/sentinel");
+            put(sq, "S", 0666);
+        }
+        /* and the real hidden space is not creatable by name */
+        errno = 0;
+        int r1 = mkdir("/.leandros-sb/tmpfs/9999", 0777);
+        _exit(r1 == -1 && errno == ENOENT ? 0 : 1);
+    }
+    waitpid(pid, &st, 0);
+    report("pool_squat_hidden_mkdir_enoent", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    char base[64], tm[96], mk[128];
+    snprintf(base, sizeof base, "/tmp/mh.%d", (int)getpid());
+    dir(base);
+    path(tm, sizeof tm, base, "t");
+    dir(tm);
+    path(mk, sizeof mk, tm, "mark");
+    pid = fork();
+    if (pid == 0) {
+        int ok = unshare(CLONE_NEWNS) == 0 && mount_("tmpfs", tm, "tmpfs", 0) == 0;
+        if (ok) put(mk, "M", 0644);
+        ok = ok && exists(mk);
+        _exit(ok ? 0 : 1);
+    }
+    waitpid(pid, &st, 0);
+    report("pool_squat_tmpfs_mounts", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    int leaked = 0, sent_ok = 1, reach = 0;
+    for (k = 1; k <= 64; k++) {
+        snprintf(sq, sizeof sq, "/tmp/.leandros-sb/tmpfs/%d/mark", k);
+        if (exists(sq)) leaked = 1;
+        if (k <= 24) {
+            snprintf(sq, sizeof sq, "/tmp/.leandros-sb/tmpfs/%d/sentinel", k);
+            if (!exists(sq)) sent_ok = 0;
+        }
+        snprintf(sq, sizeof sq, "/.leandros-sb/tmpfs/%d", k);
+        if (exists(sq)) reach = 1;
+    }
+    report("pool_squat_not_adopted", !leaked && sent_ok);
+    report("pool_hidden_from_ns0", !reach);
+
+    /* pivot_root inside a mount namespace never touches ns 0 */
+    pid = fork();
+    if (pid == 0) {
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        errno = 0;
+        long r = syscall(SYS_pivot_root, "/tmp", "/tmp");
+        _exit(r == -1 && errno == EINVAL ? 0 : 1);
+    }
+    waitpid(pid, &st, 0);
+    report("pivot_in_ns_einval", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    report("pivot_ns0_untouched", exists("/bin/mnttest") && exists("/dev/shm"));
+
+    /* MS_PRIVATE / MS_SLAVE are accepted no-ops; MS_SHARED is not */
+    pid = fork();
+    if (pid == 0) {
+        if (setgid(65534) || setuid(65534)) _exit(99);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) _exit(2);
+        int ok = mount_("none", "/", NULL, M_REC | MS_PRIVATE_) == 0
+              && mount_("none", "/", NULL, M_REC | MS_SLAVE_) == 0
+              && mount_("none", "/", NULL, MS_PRIVATE_) == 0;
+        _exit(ok ? 0 : 1);
+    }
+    waitpid(pid, &st, 0);
+    report("ns_private_slave_noop", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    /* clone(NEWNS|VM|VFORK) as Linux allows */
+    static char vmstack[16384] __attribute__((aligned(16)));
+    pid = (pid_t)clone(vm_child, vmstack + sizeof vmstack, CLONE_NEWNS | CLONE_VM | CLONE_VFORK | SIGCHLD, NULL);
+    int okvm = 0;
+    if (pid > 0 && waitpid(pid, &st, 0) > 0) okvm = WIFEXITED(st) && WEXITSTATUS(st) == 42;
+    report("clone_newns_vm", okvm);
+
+    /* /proc/<pid>/{root,cwd} of a task in another mount namespace is refused */
+    int c2p[2], p2c[2];
+    if (pipe(c2p) || pipe(p2c)) { report("proc_root_pipe", 0); return; }
+    pid = fork();
+    if (pid == 0) {
+        char c = 'x';
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        write(c2p[1], &c, 1);
+        read(p2c[0], &c, 1);
+        _exit(0);
+    }
+    char c;
+    int up = read(c2p[0], &c, 1) == 1;
+    char pp[64];
+    int e1 = 0, e2 = 0, e3 = 0, f1;
+    snprintf(pp, sizeof pp, "/proc/%d/root/etc", (int)pid);
+    errno = 0; f1 = open(pp, O_RDONLY); e1 = errno;
+    int bad1 = f1 >= 0; if (f1 >= 0) close(f1);
+    snprintf(pp, sizeof pp, "/proc/%d/cwd", (int)pid);
+    errno = 0; int bad2 = chdir(pp) == 0; e2 = errno;
+    if (bad2) chdir("/");
+    snprintf(pp, sizeof pp, "/proc/%d/root", (int)pid);
+    errno = 0; f1 = open(pp, O_RDONLY); e3 = errno;
+    int bad3 = f1 >= 0; if (f1 >= 0) close(f1);
+    report("proc_root_cross_ns_refused", up && !bad1 && !bad2 && !bad3
+           && (e1 == EACCES || e1 == ENOENT) && (e2 == EACCES || e2 == ENOENT) && (e3 == EACCES || e3 == ENOENT));
+    report("proc_root_same_ns_ok", exists("/proc/self/root/etc"));
+    write(p2c[1], &c, 1);
+    waitpid(pid, &st, 0);
+    close(c2p[0]); close(c2p[1]); close(p2c[0]); close(p2c[1]);
+
+    /* ns 0 cost: a dead namespace is freed by the wait that reaps its task */
+    pid = fork();
+    if (pid == 0) _exit(unshare(CLONE_NEWNS) == 0 ? 0 : 1);
+    waitpid(pid, &st, 0);
+    /* The task's reference can drop a moment after wait returns on SMP; each
+     * further wait reaps. ns 0 pays nothing meanwhile (MNT_LIVE is already 0). */
+    int reaped = in_ns_dying0();
+    for (k = 0; !reaped && k < 100; k++) {
+        usleep(20000);
+        pid = fork();
+        if (pid == 0) _exit(0);
+        waitpid(pid, &st, 0);
+        reaped = in_ns_dying0();
+    }
+    report("dead_ns_reaped_on_wait", reaped);
+}
+
+/* ---- Pool reachability via /proc magic links, fd-relative paths, symlinks ---- */
+#ifndef O_PATH
+#define O_PATH 010000000
+#endif
+
+/* A live pool instance holding "marker" must exist while the checks run: a
+ * sibling task keeps a tmpfs mounted in its own namespace. A check passes when
+ * no instance number 1..79 is reachable through the given route. */
+static int pool_hit(const char *fmt_prefix) {
+    char p[160];
+    for (int m = 1; m < 80; m++) {
+        snprintf(p, sizeof p, "%s.leandros-sb/tmpfs/%d/marker", fmt_prefix, m);
+        int fd = open(p, O_RDONLY);
+        if (fd >= 0) { close(fd); return 1; }
+    }
+    return 0;
+}
+
+static int pool_proc_ok(void) {
+    return !pool_hit("/proc/self/root/") && !pool_hit("/") ;
+}
+static int pool_cwd_ok(void) {
+    if (chdir("/") != 0) return 0;
+    return !pool_hit("/proc/self/cwd/");
+}
+static int pool_fd_ok(void) {
+    int dfd = open("/", O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) return 0;
+    int ok = 1;
+    char p[96];
+    for (int m = 1; m < 80 && ok; m++) {
+        snprintf(p, sizeof p, ".leandros-sb/tmpfs/%d/marker", m);
+        int f = openat(dfd, p, O_RDONLY); if (f >= 0) { close(f); ok = 0; }
+    }
+    snprintf(p, sizeof p, "/proc/self/fd/%d/", dfd);
+    if (pool_hit(p)) ok = 0;
+    if (fchdir(dfd) != 0) ok = 0;
+    else if (pool_hit("")) ok = 0;
+    close(dfd);
+    chdir("/");
+    return ok;
+}
+
+/* Each check runs in ns 0 (mode 0) or in a fresh mount namespace with a tmpfs (mode 1). */
+static int pool_in_child(int mode, int (*fn)(void)) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (mode) {
+            if (unshare(CLONE_NEWNS) != 0) _exit(2);
+            mkdir("/mnt", 0755);
+            if (mount("t", "/mnt", "tmpfs", 0, NULL) != 0) _exit(3);
+            { int mf = open("/mnt/marker", O_CREAT | O_WRONLY, 0666); if (mf >= 0) close(mf); }
+        }
+        _exit(fn() ? 0 : 1);
+    }
+    int st = 0;
+    if (pid < 0 || waitpid(pid, &st, 0) < 0) return 0;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+static int cross_symlink_ok(void) {
+    mkdir("/mnt/ia", 0755); mkdir("/mnt/ib", 0755);
+    if (mount("a", "/mnt/ia", "tmpfs", 0, NULL) || mount("b", "/mnt/ib", "tmpfs", 0, NULL)) return 0;
+    int f = open("/mnt/ib/secret", O_CREAT | O_WRONLY, 0666);
+    if (f < 0) return 0;
+    close(f);
+    /* The secret exists in ib only; no link inside ia may ever reach it. */
+    for (int m = 1; m < 80; m++) {
+        char body[96];
+        for (int abs = 0; abs < 2; abs++) {
+            if (abs) snprintf(body, sizeof body, "/.leandros-sb/tmpfs/%d/secret", m);
+            else snprintf(body, sizeof body, "../%d/secret", m);
+            unlink("/mnt/ia/l");
+            if (symlink(body, "/mnt/ia/l") != 0) return 0;
+            int g = open("/mnt/ia/l", O_RDONLY);
+            if (g >= 0) { close(g); return 0; }
+        }
+    }
+    return 1;
+}
+
+static int mountinfo_nopool_ok(void) {
+    static char b[16384];
+    for (int k = 0; k < 2; k++) {
+        if (slurp(k ? "/proc/self/mounts" : "/proc/self/mountinfo", b, sizeof b) <= 0) return 0;
+        if (strstr(b, ".leandros-sb")) return 0;
+    }
+    return 1;
+}
+
+static void pool_tests(void) {
+    int hp[2], rp[2];
+    pid_t holder = -1;
+    if (pipe(hp) == 0 && pipe(rp) == 0 && (holder = fork()) == 0) {
+        char c = 'x';
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        mkdir("/mnt", 0755);
+        if (mount("h", "/mnt", "tmpfs", 0, NULL) != 0) _exit(3);
+        int f = open("/mnt/marker", O_CREAT | O_WRONLY, 0666);
+        if (f < 0) _exit(4);
+        close(f);
+        write(hp[1], &c, 1);
+        read(rp[0], &c, 1);
+        _exit(0);
+    }
+    char hc;
+    int up = holder > 0 && read(hp[0], &hc, 1) == 1;
+    report("pool_holder_up", up);
+    report("pool_via_proc_root_ns0", pool_in_child(0, pool_proc_ok));
+    report("pool_via_proc_root_mntns", pool_in_child(1, pool_proc_ok));
+    report("pool_via_proc_cwd_ns0", pool_in_child(0, pool_cwd_ok));
+    report("pool_via_proc_cwd_mntns", pool_in_child(1, pool_cwd_ok));
+    report("pool_via_fd_relative_ns0", pool_in_child(0, pool_fd_ok));
+    report("pool_via_fd_relative_mntns", pool_in_child(1, pool_fd_ok));
+    report("pool_cross_instance_symlink", pool_in_child(1, cross_symlink_ok));
+    report("mountinfo_no_pool_path", pool_in_child(1, mountinfo_nopool_ok));
+    if (holder > 0) { write(rp[1], &hc, 1); waitpid(holder, NULL, 0); }
+}
+
 /* lane mountperm: CAP_SYS_ADMIN in a child userns must NOT allow mounting into
  * the initial mount namespace (owned by the initial userns). */
 static void wr(const char *p, const char *v) { int fd = open(p, O_WRONLY); if (fd >= 0) { if (write(fd, v, strlen(v)) < 0) {} close(fd); } }
@@ -228,11 +718,15 @@ static void mount_userns_perm(void) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
     newapi_enosys();
     kernel_selftest();
     sb_hidden_ns0();
     ns0_invariants();
+    newns_suite();
+    hardening_suite();
     mountinfo_tests();
+    pool_tests();
     mount_userns_perm();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
