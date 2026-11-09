@@ -476,7 +476,18 @@ pub fn render_tree(ns: NsId, info: bool) -> Option<Vec<u8>> {
     for (i, m) in t.iter().enumerate() {
         let mp = ns_mountpoint(t, i);
         let dev = sb_dev(m.sb).unwrap_or(m.id);
-        let src: &[u8] = if m.device.is_empty() { b"none" } else { &m.device };
+        // Never print the hidden pool: the source of a pool-backed mount is its
+        // fstype, and its root is relative to the instance directory.
+        let src: &[u8] = if m.device.is_empty() { b"none" }
+            else if is_sb_path(&m.device) { m.fstype.as_bytes() } else { &m.device };
+        let shown_root: Vec<u8> = if is_sb_path(&m.root) {
+            let mut cnt = 0usize;
+            let mut at = m.root.len();
+            for (i, &c) in m.root.iter().enumerate() {
+                if c == b'/' { cnt += 1; if cnt == 4 { at = i; break; } }
+            }
+            if at >= m.root.len() { b"/".to_vec() } else { m.root[at..].to_vec() }
+        } else { m.root.to_vec() };
         if info {
             push_u32(&mut out, m.id);
             out.push(b' ');
@@ -484,7 +495,7 @@ pub fn render_tree(ns: NsId, info: bool) -> Option<Vec<u8>> {
             out.push(b' ');
             push_u32(&mut out, dev >> 8); out.push(b':'); push_u32(&mut out, dev & 0xff);
             out.push(b' ');
-            push_esc(&mut out, &m.root);
+            push_esc(&mut out, &shown_root);
             out.push(b' ');
             push_esc(&mut out, &mp);
             out.push(b' ');

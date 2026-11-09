@@ -8478,6 +8478,10 @@ fn sys_unshare(flags: usize) -> isize {
         let r = sched::ns::unshare_uts();
         if r < 0 { return r; }
     }
+    // TODO (M6): mount namespaces are NOT an isolation boundary for root-run
+    // workloads until M6 (A-M3 late-bound bind source, A-M4 symlink/.. bodies
+    // resolved in ns-0 space); rootless (mapped kuid) workloads only reach what
+    // their kuid already can.
     if flags & CLONE_NEWNS != 0 {
         // The mount namespace copy is made under the caller's (new) user
         // namespace. CLONE_NEWNS implies CLONE_FS: the root and cwd strings
@@ -11246,7 +11250,13 @@ fn backing_walk_m(ns: &[u8], crossed: &mut bool, denied: &mut bool, mns: sched::
         let mut v = Vec::with_capacity(base.len() + rest.len());
         if &*base != b"/" { v.extend_from_slice(&base); }
         v.extend_from_slice(rest);
-        cur = Some(mnt_xlate(mns, &v, crossed, mid, plen, false).unwrap_or(v));
+        // Fail closed: a path that does not translate (hidden pool, missing
+        // tree) must never fall back to the raw host path.
+        if vfs::mnt::is_sb_path(&v) { return None; }
+        match mnt_xlate(mns, &v, crossed, mid, plen, false) {
+            Some(t) => cur = Some(t),
+            None => return None,
+        }
     }
     cur
 }
@@ -11275,7 +11285,11 @@ fn backing_walk_ns0(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<
         if &*base != b"/" { v.extend_from_slice(&base); }
         v.extend_from_slice(rest);
         *crossed |= vfs::alias::crosses(&v);
-        cur = Some(vfs::alias::translate(&v).unwrap_or(v));
+        let t = vfs::alias::translate(&v).unwrap_or(v);
+        // ns 0 has no "missing tree" None (None means identity), so hand the VFS a
+        // name that cannot exist: ENOENT.
+        if vfs::mnt::is_sb_path(&t) { return Some(b"/.leandros-hidden".to_vec()); }
+        cur = Some(t);
     }
     cur
 }

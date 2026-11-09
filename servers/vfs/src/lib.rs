@@ -5704,6 +5704,16 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
     let mut cur = normalize_abs_floor(input, floor);
     let mut hops = 0u32;
     let start_in_sb = mnt::is_sb_path(&cur);
+    // Instance root `/.leandros-sb/tmpfs/<n>` of a walk that starts in the pool:
+    // hops may not leave it for another instance (relative `..` or absolute).
+    let sb_inst: Option<Vec<u8>> = if start_in_sb {
+        let mut cnt = 0usize;
+        let mut end = cur.len();
+        for (i, &c) in cur.iter().enumerate() {
+            if c == b'/' { cnt += 1; if cnt == 4 { end = i; break; } }
+        }
+        Some(cur[..end].to_vec())
+    } else { None };
 
     // The caller's credentials, for the traversal check on each directory the
     // walk passes through. Taken before TMP_FILES (RUN_QUEUE is never taken
@@ -5788,7 +5798,16 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
         drop(push);
         cur = normalize_abs_floor(&next[..n], floor);
         // A link may not lead into the hidden superblock space.
-        if !start_in_sb && mnt::is_sb_path(&cur) { return Err(-2); }
+        if mnt::is_sb_path(&cur) {
+            match &sb_inst {
+                None => return Err(-2),
+                Some(inst) => {
+                    let ok = cur.starts_with(&inst[..])
+                        && (cur.len() == inst.len() || cur[inst.len()] == b'/');
+                    if !ok { return Err(-2); }
+                }
+            }
+        }
     }
 
     Ok(cur)

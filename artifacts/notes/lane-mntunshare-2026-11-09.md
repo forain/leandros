@@ -44,7 +44,7 @@ FIXED (mnttest `hardening_suite` cases in parentheses):
 - B-BLOCKER4 (B4): MNT_LIVE is decremented when the slot goes DYING; wait4/waitid reap dead trees (dead_ns_reaped_on_wait).
 - A-M2: /proc/<pid>/{root,cwd} (open, chdir, readlink, path below) of a task in another mntns is EACCES until a correct
   translation exists (proc_root_cross_ns_refused).
-- B-S2 (MS_PRIVATE/MS_SLAVE, +REC, no-op; MS_SHARED/UNBINDABLE stay EINVAL; mntinfo is not on main so no real state)
+- B-S2 (MS_PRIVATE/MS_SLAVE, +REC, no-op; all four propagation modes (PRIVATE/SLAVE/SHARED/UNBINDABLE) are accepted with real per-tree state; nothing is propagated)
   (ns_private_slave_noop), B-S3 (clone NEWNS|CLONE_VM; mntns plumbed into clone_thread) (clone_newns_vm), B-S1 (merge).
 - B-N1 (ENOTDIR both ways), B-N4 (MS_MGC_VAL stripped), A-L2 (locked unbindable child -> EPERM),
   A-L5 / B-S7 (mntns pins its owner userns, dropped in reap), A-L6/B-S8 partly (MNT_MAX 4096 -> 1024).
@@ -56,3 +56,11 @@ FIXED (mnttest `hardening_suite` cases in parentheses):
   mount boundaries), A-L8 / B-S9 (ns-0 umount retargets copies; EBUSY).
 - B-S4 (tmpfs data options, mode, size), B-S5 (walk picks the longest mp; should pick the newest top), B-S6 (/proc/self/fd
   sources and targets), B-N2, N3, N5, N6, N7, N8, N9, N10 (x86_64 run is part of the regress batch).
+
+## TODO (prominent)
+**Mount namespaces are NOT an isolation boundary for root-run workloads until M6 (A-M3 late-bound bind source, A-M4 symlink/.. bodies resolved in ns-0 space); rootless (mapped kuid) workloads only reach what their kuid already can.**
+
+## Review C fixes
+- C1: `/proc/self/{root,cwd}/.leandros-sb/...` refused in both walks (ns 0 -> ENOENT sentinel, mntns -> None/ENOENT, no raw fallback).
+- C2: symlink hops starting inside `/.leandros-sb/tmpfs/<n>` stay inside that instance.
+- A-L3: mountinfo shows fstype as source and an instance-relative root, never the pool path.
