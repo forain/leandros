@@ -9177,6 +9177,15 @@ fn fstat_into(fd: usize, statbuf_ptr: usize, user_dest: bool) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
+/// Linux `may_mount`: the caller needs CAP_SYS_ADMIN in the user namespace
+/// that owns its CURRENT mount namespace. The initial mount namespace (0) is
+/// owned by the initial user namespace, so that is host root only.
+fn may_mount() -> bool {
+    let mntns = sched::current_mntns();
+    if mntns == 0 { return sched::host_root(); }
+    sched::caps::ns_capable_in(sched::ns::owner_user(mntns), 21)
+}
+
 fn sys_mount(
     source_ptr: usize,
     target_ptr: usize,
@@ -9197,7 +9206,11 @@ fn sys_mount(
     // own user namespace (a container's runtime mounts its /dev/pts there).
     let devpts_mount = flags & (MS_REMOUNT | 4096) == 0 && fstype_ptr != 0
         && read_user_short_str(fstype_ptr).map_or(false, |v| v.as_slice() == b"devpts");
-    if !sched::host_root() && !(devpts_mount && sched::caps::ns_capable(21)) { return -1; } // EPERM
+    // Linux `may_mount`: CAP_SYS_ADMIN in the user namespace that OWNS the
+    // caller's mount namespace. Non-host-root callers are only ever allowed
+    // devpts (other types stay host-root until their userns story exists).
+    if !may_mount() { return -1; } // EPERM
+    if !sched::host_root() && !devpts_mount { return -1; } // EPERM
     // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC):
     // only the mount's propagation state changes; source/fstype are ignored.
     if flags & (vfs::mnt::MS_UNBINDABLE | vfs::mnt::MS_PRIVATE | vfs::mnt::MS_SLAVE | vfs::mnt::MS_SHARED) != 0 {
@@ -9441,7 +9454,7 @@ fn sys_mount_fuse(source: &str, target: &[u8], fstype: &str, flags: usize, data_
 }
 
 fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
-    if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
+    if !may_mount() { return -1; } // EPERM (CAP_SYS_ADMIN over the mntns owner)
     let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
     // An alias mount (a chroot's /proc, a bind mount) is named by where the
     // caller sees it, i.e. its namespace path.
@@ -9464,7 +9477,7 @@ fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
 }
 
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
-    if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
+    if !may_mount() { return -1; } // EPERM (CAP_SYS_ADMIN over the mntns owner)
     let pid = current_pid();
     let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
     let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };
