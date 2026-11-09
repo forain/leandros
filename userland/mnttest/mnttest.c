@@ -744,10 +744,6 @@ static int joiner(pid_t target, const char *d, int mode) {
     n = readlink("/proc/self/ns/pid", pid0, sizeof pid0 - 1); if (n > 0) pid0[n] = 0;
     n = readlink("/proc/self/ns/user", usr0, sizeof usr0 - 1); if (n > 0) usr0[n] = 0;
     if (exists(tx)) return 10; /* must not be visible before the join */
-    if (mode == 1) {
-        if (chdir(d) || chroot(d)) return 11;   /* root and cwd inside the old tree */
-        if (exists("/bin/mnttest")) return 12;
-    }
     int fd, pfd = -1;
     if (mode == 4) {
         pfd = (int)syscall(SYS_pidfd_open, (long)target, 0L);
@@ -756,6 +752,10 @@ static int joiner(pid_t target, const char *d, int mode) {
         fd = open(np, O_RDONLY);
         if (fd < 0) return 14;
         pfd = fd;
+    }
+    if (mode == 1) {
+        if (chdir(d) || chroot(d)) return 11;   /* root and cwd inside the old tree */
+        if (exists("/bin/mnttest")) return 12;
     }
     if (mode == 2) {
         if (setgid(65534) || setuid(65534)) return 15;
