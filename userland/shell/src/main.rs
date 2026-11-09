@@ -308,7 +308,7 @@ unsafe fn execute_binary(args: &[&str], count: usize) {
     } else if pid == 0 {
         // Child
         //
-        // Children get PATH=/bin so libc-level PATH search (e.g. musl's
+        // Children get the standard default PATH so libc-level PATH search (e.g. musl's
         // execvp, used by non-native binaries like bottom) finds userland
         // tools. Without this, execvp falls back to its compiled-in
         // default "/usr/local/bin:/bin:/usr/bin" and tries /usr/local/bin
