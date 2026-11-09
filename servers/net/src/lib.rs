@@ -3956,7 +3956,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
     // SOCK_DGRAM/IPPROTO_ICMP instead, which Linux allows for every group in
     // net.ipv4.ping_group_range (all of them on common distributions) and
     // which lands on the same ICMP socket below.
-    if domain == AF_INET && sock_type & 0xf == SOCK_RAW && sched::euid_of(pid) != 0 {
+    if domain == AF_INET && sock_type & 0xf == SOCK_RAW && !sched::host_root_of(pid) {
         return err_reply(-1);
     }
     let mut tbls = SOCK_TABLES.lock();
@@ -4005,7 +4005,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             let explicit_port = port != 0;
             // Ports below 1024 need CAP_NET_BIND_SERVICE (root): Linux's
             // net.ipv4.ip_unprivileged_port_start default, EACCES.
-            if port != 0 && port < 1024 && sched::euid_of(pid) != 0 { return err_reply(-13); }
+            if port != 0 && port < 1024 && !sched::host_root_of(pid) { return err_reply(-13); }
             let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
             let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
             // A fresh network namespace has only a DOWN loopback: no address

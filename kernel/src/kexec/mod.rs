@@ -105,7 +105,7 @@ fn hex(v: u64) -> alloc::string::String { alloc::format!("{:#x}", v) }
 
 pub fn sys_kexec_file_load(kernel_fd: usize, initrd_fd: usize, cmdline_len: usize,
                            cmdline_ptr: usize, flags: usize) -> isize {
-    if sched::current_euid() != 0 { return EPERM; } // CAP_SYS_BOOT
+    if !sched::host_root() { return EPERM; } // CAP_SYS_BOOT
     let flags = flags & 0xffff_ffff;
     if flags & !(KEXEC_FILE_UNLOAD | KEXEC_FILE_NO_INITRAMFS) != 0 { return EINVAL; }
 
