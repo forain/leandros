@@ -17,11 +17,8 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-<<<<<<< HEAD
 #include <sys/vfs.h>
-=======
 #include <sys/un.h>
->>>>>>> main
 #include <netinet/in.h>
 #include <time.h>
 #include <sys/syscall.h>
