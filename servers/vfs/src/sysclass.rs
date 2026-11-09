@@ -91,11 +91,12 @@ fn split(path: &[u8]) -> Option<Split<'_>> {
 
 /// True when `path` is inside an active overlay class directory.
 pub fn is_path(path: &[u8]) -> bool {
-    split(path).is_some()
+    cpu_split(path).is_some() || split(path).is_some()
 }
 
 /// Resolve `path` to an overlay directory as `(dev, level)`.
 pub fn dir(path: &[u8]) -> Option<(u16, u8)> {
+    if let Some(c) = cpu_split(path) { return cpu_dir(c); }
     let s = split(path)?;
     if s.cls == POWER { return if s.attr.is_none() { Some((SC_BASE | (POWER as u16) << 8 | 0xFF, LVL_SC_CLASS)) } else { None }; }
     match (s.dev, s.attr) {
@@ -110,6 +111,7 @@ pub fn dir(path: &[u8]) -> Option<(u16, u8)> {
 
 /// Read an attribute file.
 pub fn attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    if let Some(c) = cpu_split(path) { return cpu_attr(c, out); }
     let s = split(path)?;
     if s.cls == POWER { return (s.o.read)("power", "", s.attr?, out); }
     let (d, a) = (s.dev?, s.attr?);
@@ -177,6 +179,7 @@ pub fn write(path: &[u8], data: &[u8]) -> i32 {
 /// The `idx`-th entry of an overlay directory: `(name length, is_dir)`.
 pub fn dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)> {
     if dev == SC_TABLES { return tables_dirent(idx, out); }
+    if (dev >> 8) & 0xF == CPU_CLS as u16 { return cpu_dirent(dev, idx, out); }
     let o = ops()?;
     let cls = ((dev >> 8) & 0xF) as usize;
     let class = CLASSES.get(cls)?;
@@ -234,4 +237,85 @@ pub fn is_tables_path(path: &[u8]) -> bool {
 /// The `idx`-th entry of the tables directory.
 pub fn tables_dirent(idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)> {
     Some((tables()?(idx, out)?.0, false))
+}
+
+// ---------------------------------------------------------------------------
+// `/sys/devices/system/cpu` and `/sys/devices/cpu`: the CPU topology files
+// userspace (Firefox's sandbox broker, glibc/musl sysconf, nproc) reads.
+// Purely additive: ONLY these two subtrees are claimed (not `/sys/devices` or
+// `/sys/devices/system`, which stay on-disk lookups), so no existing /sys
+// entry changes resolution. Dirs reuse `SC_BASE | CPU_CLS << 8 | id` with id
+// 0xFF = system/cpu, 0xFE = devices/cpu, n = cpu<n>.
+
+const CPU_CLS: u8 = 0xE;
+const CPU_ROOT: &[u8] = b"/sys/devices/system/cpu";
+const PMU_ROOT: &[u8] = b"/sys/devices/cpu";
+const CPU_FILES: [&str; 4] = ["present", "possible", "online", "kernel_max"];
+
+/// `(id, file)`: id 0xFF system/cpu, 0xFE devices/cpu, n = cpu<n>; `file` is the leaf, if any.
+#[derive(Clone, Copy)]
+struct CpuSplit<'a> { id: u8, file: Option<&'a str> }
+
+fn ncpu() -> usize { sched::active_cpu_count().clamp(1, 0xF0) }
+
+fn cpu_split(path: &[u8]) -> Option<CpuSplit<'_>> {
+    if let Some(r) = path.strip_prefix(PMU_ROOT) {
+        return if r.is_empty() || r == b"/" { Some(CpuSplit { id: 0xFE, file: None }) } else { None };
+    }
+    let r = path.strip_prefix(CPU_ROOT)?;
+    if r.is_empty() || r == b"/" { return Some(CpuSplit { id: 0xFF, file: None }); }
+    let r = core::str::from_utf8(r.strip_prefix(b"/")?).ok()?;
+    let mut it = r.split('/');
+    let first = it.next()?;
+    let rest = it.next().filter(|s| !s.is_empty());
+    if it.next().is_some() { return None; }
+    if let Some(n) = first.strip_prefix("cpu") {
+        if n.is_empty() || n.starts_with('0') && n.len() > 1 { return None; }
+        let n: usize = n.parse().ok()?;
+        if n >= ncpu() { return None; }
+        return match rest { None => Some(CpuSplit { id: n as u8, file: None }),
+                            Some(f) if f == "online" && n > 0 => Some(CpuSplit { id: n as u8, file: Some("online") }),
+                            _ => None };
+    }
+    if rest.is_some() || !CPU_FILES.contains(&first) { return None; }
+    Some(CpuSplit { id: 0xFF, file: Some(first) })
+}
+
+fn cpu_dir(c: CpuSplit<'_>) -> Option<(u16, u8)> {
+    if c.file.is_some() { return None; }
+    Some((SC_BASE | (CPU_CLS as u16) << 8 | c.id as u16, LVL_SC_CLASS))
+}
+
+fn cpu_attr(c: CpuSplit<'_>, out: &mut [u8]) -> Option<usize> {
+    let f = c.file?;
+    let n = ncpu();
+    let mut s = alloc::string::String::new();
+    use core::fmt::Write;
+    let _ = match f {
+        "kernel_max" => writeln!(s, "{}", n - 1),
+        "online" if c.id != 0xFF => writeln!(s, "1"),
+        _ if n > 1 => writeln!(s, "0-{}", n - 1),
+        _ => writeln!(s, "0"),
+    };
+    let b = s.as_bytes();
+    if b.len() > out.len() { return None; }
+    out[..b.len()].copy_from_slice(b);
+    Some(b.len())
+}
+
+fn cpu_dirent(dev: u16, idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)> {
+    let id = (dev & 0xFF) as u8;
+    let (name, dir): (alloc::string::String, bool) = match id {
+        0xFF => {
+            if idx < CPU_FILES.len() { (CPU_FILES[idx].into(), false) }
+            else if idx - CPU_FILES.len() < ncpu() { (alloc::format!("cpu{}", idx - CPU_FILES.len()), true) }
+            else { return None }
+        }
+        0xFE => return None,
+        n if (n as usize) < ncpu() && n > 0 && idx == 0 => ("online".into(), false),
+        _ => return None,
+    };
+    let b = name.as_bytes();
+    out[..b.len()].copy_from_slice(b);
+    Some((b.len(), dir))
 }

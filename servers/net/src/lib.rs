@@ -1122,13 +1122,16 @@ struct SockEntry {
     /// connection that ends in Closed while it is still set was refused,
     /// which is what SO_ERROR, POLLERR and send/recv report.
     connecting: bool,
+    /// Network namespace captured at socket() (Linux sock_net): every later
+    /// op uses this, never the calling task's. Travels with SCM_RIGHTS copies.
+    netns:      u16,
 }
 
 impl SockEntry {
     const fn empty() -> Self {
         Self { state: SockState::None, in_use: false, bound_port: 0, domain: 0,
                sock_type: 0, cloexec: false, nonblock: false, reuseaddr: false, ofd: 0, hidden: false,
-               connecting: false }
+               connecting: false, netns: 0 }
     }
 }
 
@@ -1442,6 +1445,14 @@ pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
     tbls.iter().filter(|t| t.in_use && t.pid != pid).find_map(find)
 }
 
+/// Network namespace captured when the socket at `slot` was created. Takes the
+/// table read lock: never call it with SOCK_TABLES held.
+fn sock_netns(pid: u32, slot: usize) -> u16 {
+    SOCK_TABLES.read().iter().find(|t| t.in_use && t.pid == pid)
+        .and_then(|t| t.socks.get(slot)).filter(|e| e.in_use)
+        .map(|e| e.netns).unwrap_or_else(|| sched::ns::netns_of(pid))
+}
+
 fn fd_to_slot(fd: usize) -> Option<usize> {
     if fd >= SOCK_FD_BASE && fd < SOCK_FD_END { Some(fd - SOCK_FD_BASE) } else { None }
 }
@@ -1734,6 +1745,8 @@ fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, por
     for t in tbls.iter().filter(|t| t.in_use) {
         for e in t.socks.iter() {
             if !e.in_use || e.bound_port != port || e.domain != AF_INET as u8 || e.sock_type != me.sock_type { continue; }
+            // Each network namespace has its own port space.
+            if e.netns != me.netns { continue; }
             if me.ofd != 0 && e.ofd == me.ofd { continue; }
             let (addr, listening) = match e.state {
                 SockState::InetBound { local_endpoint, .. } => (local_endpoint.addr, false),
@@ -3965,6 +3978,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         ofd:        vfs::ofd::alloc(),
         hidden:     false,
         connecting: false,
+        netns:      sched::ns::netns_of(pid),
     };
     if domain == AF_NETLINK { nlsock::create(tbl.socks[slot].ofd, sched::tgid_of(pid)); }
     val_reply((slot + SOCK_FD_BASE) as u64)
@@ -3993,7 +4007,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
             // A fresh network namespace has only a DOWN loopback: no address
             // can be bound but the wildcard.
-            if !ip.is_unspecified() && sched::ns::netns_of(pid) != 0 { return err_reply(-99); }
+            if !ip.is_unspecified() && sock_netns(pid, slot) != 0 { return err_reply(-99); }
 
             // An address no interface owns is EADDRNOTAVAIL on Linux. INADDR_ANY
             // and 127.0.0.0/8 always bind; anything else must be an address the
@@ -4047,7 +4061,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             // is EADDRINUSE unless the caller asked for SO_REUSEADDR — the
             // Linux answer, and the reason every server sets that option.
             // Live ports are `bind_conflict`'s, above.
-            if port != 0 && !reuseaddr && resv[..nresv].contains(&port) {
+            if port != 0 && !reuseaddr && me.netns == 0 && resv[..nresv].contains(&port) {
                 return err_reply(-98); // EADDRINUSE
             }
             // Port 0 means "any free port". Assigning it *here* rather than at
@@ -4105,7 +4119,11 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 // another interface was refused with a port unreachable and
                 // its sends left by the first stack's route (lane udp2).
                 let server = ip.is_unspecified();
-                if let Err(e) = udp_materialize(pid, slot, None, server) { return err_reply(e); }
+                // A non-initial netns has only a down loopback: its UDP bind
+                // stays a pure table entry, no host-stack socket (unreachable).
+                if me.netns == 0 {
+                    if let Err(e) = udp_materialize(pid, slot, None, server) { return err_reply(e); }
+                }
             }
             ok_reply()
         }
@@ -4120,6 +4138,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             if !ucopy_in(&mut pbytes[..path_len], path_ptr as usize) { return err_reply(-14); }
             let is_abstract = pbytes[0] == 0;
             let sock_id = alloc_sock_id();
+            let nsid_b = sock_netns(pid, slot);
 
             // ── Pathname socket: the VFS owns uniqueness via a real S_IFSOCK
             // node. Bind does not follow a symlink for the final component.
@@ -4136,7 +4155,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 }
             } else {
                 // Abstract namespace: byte-matched here, never a VFS node.
-                let nsid = sched::ns::netns_of(pid);
+                let nsid = sock_netns(pid, slot);
                 let bound = BOUND_PATHS.lock();
                 for bp in bound.iter() {
                     if bp.in_use && bp.is_abstract && bp.netns == nsid && bp.path_len == path_len
@@ -4154,7 +4173,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 None => return err_reply(-12),
             };
             bound[idx] = BoundPath { in_use: true, path: pbytes, path_len,
-                                     sock_id, is_abstract, netns: if is_abstract { sched::ns::netns_of(pid) } else { 0 }, refs: 1,
+                                     sock_id, is_abstract, netns: if is_abstract { nsid_b } else { 0 }, refs: 1,
                                      _owner_pid: pid, _owner_sock: slot };
             drop(bound);
 
@@ -4210,6 +4229,15 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
         // and roam without being touched.
         // Registered first: a stack built after this point (wifi0, once
         // its MAC is known) adopts the listener (`listen::adopt`).
+        if tbl.socks[slot].netns != 0 {
+            // A non-initial netns has no interface: the listener lives in
+            // its own port space only, no stack socket, unreachable from
+            // the host.
+            let lid = listen::new_lid();
+            tbl.socks[slot].state = SockState::InetListening { lid, local };
+            share_state(&mut *tbls, pid, slot);
+            return ok_reply();
+        }
         let lid = listen::new_lid();
         listen::register(lid, local);
         let mut any = false;
@@ -4278,13 +4306,13 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
     let acc_nonblock = flags & SOCK_NONBLOCK != 0;
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
 
-    let (state, _bound_port, sock_type, listen_ofd) = {
+    let (state, _bound_port, sock_type, listen_ofd, lnetns) = {
         let tbls = SOCK_TABLES.read();
         let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
             Some(t) => t, None => return err_reply(-9),
         };
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
-        (tbl.socks[slot].state, tbl.socks[slot].bound_port, tbl.socks[slot].sock_type, tbl.socks[slot].ofd)
+        (tbl.socks[slot].state, tbl.socks[slot].bound_port, tbl.socks[slot].sock_type, tbl.socks[slot].ofd, tbl.socks[slot].netns)
     };
 
     match state {
@@ -4342,6 +4370,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     ofd: vfs::ofd::alloc(),
                     hidden: false,
                     connecting: false,
+                    netns: 0,
                 };
                 // Linux clones the accepted socket from the listener, so it
                 // inherits TCP_NODELAY and the keepalive settings. The
@@ -4430,6 +4459,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                         reuseaddr:  false,
                         ofd:        vfs::ofd::alloc(),
                         hidden:     false,
+                        netns:      lnetns,
                         connecting: false,
                     };
 
@@ -4747,7 +4777,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
 
     let sa_family = match sched::uaccess::read_user::<u16>(addr_ptr) { Some(f) => f as usize, None => return err_reply(-14) };
     // A fresh network namespace has no routes and a DOWN loopback.
-    if (sa_family == AF_INET || sa_family == 10) && sched::ns::netns_of(pid) != 0 { return err_reply(-101); }
+    if (sa_family == AF_INET || sa_family == 10) && sock_netns(pid, slot) != 0 { return err_reply(-101); }
 
     // connect(AF_UNSPEC) on an AF_INET socket (it used to fall into the
     // AF_UNIX path below): see `inet_disconnect`.
@@ -4922,7 +4952,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         // names byte-match here; pathnames resolve through the VFS (symlinks,
         // the /dev/shm and /run/user tmpfs mounts, S_IFSOCK check).
         let sock_id = if is_abstract {
-            let nsid = sched::ns::netns_of(pid);
+            let nsid = sock_netns(pid, slot);
             let bound = BOUND_PATHS.lock();
             let mut found = None;
             for bp in bound.iter() {
@@ -5022,7 +5052,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_a] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: true },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
-        cloexec, nonblock, reuseaddr: false, ofd: 0, hidden: false, connecting: false,
+        cloexec, nonblock, reuseaddr: false, ofd: 0, hidden: false, connecting: false, netns: sched::ns::netns_of(pid),
     };
     let slot_b = match tbl.alloc() { Some(s) => s, None => {
         tbl.socks[slot_a] = SockEntry::empty(); return err_reply(-24);
@@ -5030,7 +5060,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_b] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: false },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
-        cloexec, nonblock, reuseaddr: false, ofd: vfs::ofd::alloc(), hidden: false, connecting: false,
+        cloexec, nonblock, reuseaddr: false, ofd: vfs::ofd::alloc(), hidden: false, connecting: false, netns: sched::ns::netns_of(pid),
     };
     tbl.socks[slot_a].ofd = vfs::ofd::alloc();
     drop(tbls);
@@ -5116,7 +5146,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                  kdata: Option<alloc::vec::Vec<u8>>) -> Message {
     let len = match kdata { Some(ref d) => d.len(), None => len };
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
-    if addr_ptr != 0 && addrlen >= 2 && sched::ns::netns_of(pid) != 0 {
+    if addr_ptr != 0 && addrlen >= 2 && sock_netns(pid, slot) != 0 {
         if let Some(f) = sched::uaccess::read_user::<u16>(addr_ptr) {
             if f as usize == AF_INET || f as usize == 10 { return err_reply(-101); }
         }
@@ -5703,6 +5733,9 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
     match state {
         // A UDP socket: the next datagram (from its peer if connected; from
         // any stack for a wildcard server), see `udp_recv_k`.
+        // A UDP socket bound in a non-initial netns has no stack socket: nothing
+        // can ever arrive, so a read just reports no data (blocking waits on its key).
+        SockState::InetBound { .. } if sock_type == SOCK_DGRAM as u8 => err_reply(-11),
         SockState::InetConnected { .. } if sock_type == SOCK_DGRAM as u8 => {
             match udp_recv_k(pid, fd, len, peek, false) {
                 Ok((data, full, m)) => {
@@ -7252,7 +7285,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         // The peer's pid as the caller's pid namespace sees it (0 when invisible).
         let vn = sched::pidns::pidns_of(pid);
         if vn != 0 && cred.pid != 0 { cred.pid = sched::pidns::to_v(vn, cred.pid); }
-        if !wr_user(optval_ptr, [cred.pid, cred.uid, cred.gid]) { return err_reply(-14); }
+        if !wr_user(optval_ptr, [cred.pid, sched::ns::view_id(0, cred.uid), sched::ns::view_id(1, cred.gid)]) { return err_reply(-14); }
         if optlen_ptr != 0 && !wr_user(optlen_ptr, 12u32) { return err_reply(-14); }
         return ok_reply();
     }

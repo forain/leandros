@@ -4336,6 +4336,11 @@ static RAMFS: &[RamEntry] = &[
                data: b"hosts: files dns\npasswd: files\ngroup: files\n" },
     RamEntry { path: b"/etc/os-release",
                data: b"NAME=\"Leandros\"\nVERSION=\"1.0\"\nID=leandros\nPRETTY_NAME=\"Leandros 1.0\"\n" },
+    // Firefox's sandbox builds its library path policy from /etc/ld.so.conf;
+    // list musl's default search dirs so policy and loader agree.
+    RamEntry { path: b"/etc/ld.so.conf", data: b"/lib\n/usr/lib\n/usr/local/lib\n" },
+    // Minimal v1 TZif file for UTC (no zoneinfo package in the image).
+    RamEntry { path: b"/etc/localtime", data: b"\x54\x5a\x69\x66\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x55\x54\x43\x00" },
     RamEntry { path: b"/proc/version",
                data: b"Linux version 6.0.0-leandros (Leandros Project) (gcc 13.0)\n" },
     // /proc/cpuinfo is generated dynamically (see gen_proc_system_content) —
@@ -6925,7 +6930,7 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
     if path == b"/proc/self" {
         // Symlink target: just return pid as a string (used by some programs as a dir)
         let mut p = 0;
-        p = write_u32(buf, p, sched::current_pid());
+        p = write_u32(buf, p, pv(sched::tgid_of(sched::current_pid())));
         return Some(p);
     }
 
@@ -7103,7 +7108,7 @@ fn gen_proc_pid_dir(pid: u32) -> Option<VnodeKind> {
     let mut path = [0u8; 16];
     path[..6].copy_from_slice(b"/proc/");
     let mut n = 6;
-    let mut d = [0u8; 10]; let mut k = 0; let mut v = pid;
+    let mut d = [0u8; 10]; let mut k = 0; let mut v = pv(pid);
     loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
     while k > 0 { k -= 1; path[n] = d[k]; n += 1; }
     proc_snapshot(&path[..n], b"", true)
@@ -7128,7 +7133,19 @@ fn proc_parse_num(s: &[u8]) -> Option<u32> {
     if s.is_empty() || s.len() > 9 || !s.iter().all(|b| b.is_ascii_digit()) { return None; }
     let mut v = 0u32;
     for &d in s { v = v * 10 + (d - b'0') as u32; }
-    Some(v)
+    pv_in(v)
+}
+
+/// A pid number from a /proc path, as the reader's pid namespace sees it, to
+/// the kernel pid (None = not visible, so ENOENT).
+fn pv_in(v: u32) -> Option<u32> {
+    sched::pidns::from_cur(v).ok()
+}
+
+/// Kernel pid `k` as the reader's pid namespace numbers it (0 = invisible).
+fn pv(k: u32) -> u32 {
+    let n = sched::pidns::cur();
+    if n == 0 { k } else { sched::pidns::to_v(n, k) }
 }
 
 /// A path below `/proc/<pid>/task` or `/proc/thread-self`, resolved to the
@@ -7183,9 +7200,9 @@ fn proc_task_parse<'a>(path: &'a [u8], caller: u32) -> Option<Option<ProcTask<'a
 /// "/proc/<tgid>/task[/<tid>[/<name>]]" into `out`; returns the length.
 fn proc_task_path(out: &mut [u8; 96], tgid: u32, tid: Option<u32>, name: &[u8]) -> usize {
     let mut b = Buf96 { b: out, n: 0 };
-    b.push(b"/proc/"); b.num(tgid); b.push(b"/task");
+    b.push(b"/proc/"); b.num(pv(tgid)); b.push(b"/task");
     if let Some(t) = tid {
-        b.push(b"/"); b.num(t);
+        b.push(b"/"); b.num(pv(t));
         if !name.is_empty() { b.push(b"/"); b.push(name); }
     }
     b.n
@@ -7439,6 +7456,7 @@ fn proc_pid_root_split(path: &[u8]) -> Option<(bool, &[u8])> {
     }
     let mut pid = 0u32;
     for &d in who { pid = pid * 10 + (d - b'0') as u32; }
+    let pid = pv_in(pid)?;
     Some((sched::proc_stat_of(pid).is_some(), tail))
 }
 
@@ -7451,7 +7469,7 @@ fn proc_pid_dir(path: &[u8]) -> Option<u32> {
     }
     let mut pid = 0u32;
     for &d in digits { pid = pid * 10 + (d - b'0') as u32; }
-    Some(pid)
+    pv_in(pid)
 }
 
 /// The path the kernel substitutes for the root of a task that chroots into
@@ -7508,7 +7526,7 @@ fn gen_proc_fd_dir(pid: u32, info: bool) -> Option<VnodeKind> {
     let mut path = [0u8; 28];
     path[..6].copy_from_slice(b"/proc/");
     let mut n = 6;
-    let mut d = [0u8; 10]; let mut k = 0; let mut v = pid;
+    let mut d = [0u8; 10]; let mut k = 0; let mut v = pv(pid);
     loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
     while k > 0 { k -= 1; path[n] = d[k]; n += 1; }
     let sfx: &[u8] = if info { b"/fdinfo" } else { b"/fd" };
@@ -7530,7 +7548,7 @@ fn proc_pid_path(path: &[u8]) -> Option<u32> {
     }
     let mut pid = 0u32;
     for &d in digits { pid = pid * 10 + (d - b'0') as u32; }
-    Some(pid)
+    pv_in(pid)
 }
 
 fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<usize> {
@@ -7581,22 +7599,23 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         p = write_lit(buf, p, b"\nState:\t");
         p = write_lit(buf, p, state_word);
         p = write_lit(buf, p, b"\nTgid:\t");
-        p = write_u32(buf, p, sched::tgid_of(pid));
+        p = write_u32(buf, p, pv(sched::tgid_of(pid)));
         p = write_lit(buf, p, b"\nPid:\t");
-        p = write_u32(buf, p, pid);
+        p = write_u32(buf, p, pv(pid));
         p = write_lit(buf, p, b"\nPPid:\t");
-        p = write_u32(buf, p, ppid);
+        p = write_u32(buf, p, pv(ppid));
+        p = write_lit(buf, p, b"\nTracerPid:\t0");
         p = write_lit(buf, p, b"\nPGid:\t");
-        p = write_u32(buf, p, pgid);
+        p = write_u32(buf, p, pv(pgid));
         // Real, effective, saved, filesystem ids. These were hardcoded 0,
         // so every process — the uid-1000 session included — looked like
         // root to anything reading status.
         let (u, g) = sched::cred::ids_of(pid).unwrap_or(([0; 4], [0; 4]));
-        for (label, ids) in [(&b"\nUid:"[..], u), (&b"\nGid:"[..], g)] {
+        for (label, ids, kind) in [(&b"\nUid:"[..], u, 0usize), (&b"\nGid:"[..], g, 1usize)] {
             p = write_lit(buf, p, label);
             for v in ids {
                 p = write_lit(buf, p, b"\t");
-                p = write_u32(buf, p, v);
+                p = write_u32(buf, p, sched::ns::view_id(kind, v));
             }
         }
         // Supplementary groups, as Linux prints them (each followed by a
@@ -7608,6 +7627,31 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
             for g in &gl[..n] {
                 p = write_u32(buf, p, *g);
                 p = write_lit(buf, p, b" ");
+            }
+        }
+        // NSpid / NSpgid / NSsid / NStgid: the id at every pid-namespace level
+        // from the reader's namespace down to the task's own, outermost first.
+        {
+            let rn = sched::pidns::cur();
+            let tn = sched::pidns::pidns_of(pid);
+            let mut chain = [0u16; 34];
+            let mut cl = 0usize;
+            let mut x = tn;
+            loop {
+                chain[cl] = x; cl += 1;
+                if x == rn || x == 0 || cl >= chain.len() { break; }
+                x = sched::ns::parent(x);
+            }
+            let tg = sched::tgid_of(pid);
+            for (label, k) in [(&b"\nNStgid:"[..], tg), (&b"\nNSpid:"[..], pid),
+                               (&b"\nNSpgid:"[..], pgid), (&b"\nNSsid:"[..], sid)] {
+                p = write_lit(buf, p, label);
+                for i in (0..cl).rev() {
+                    p = write_lit(buf, p, b"\t");
+                    let v = if k == pid || k == tg { sched::pidns::view(chain[i], k, tn) }
+                            else { sched::pidns::to_v(chain[i], k) };
+                    p = write_u32(buf, p, v);
+                }
             }
         }
         if let Some(c) = sched::caps::caps_of(pid) {
@@ -7674,17 +7718,17 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         // rsslim, then 27..52. Until 2026-09-26 two fields were missing
         // before `priority`, which shifted num_threads/vsize/rss by two.
         let mut p = 0;
-        p = write_u32(buf, p, pid);
+        p = write_u32(buf, p, pv(pid));
         p = write_lit(buf, p, b" (");
         p = write_lit(buf, p, comm);
         p = write_lit(buf, p, b") ");
         p = write_lit(buf, p, &[state]);
         p = write_lit(buf, p, b" ");
-        p = write_u32(buf, p, ppid);
+        p = write_u32(buf, p, pv(ppid));
         p = write_lit(buf, p, b" ");
-        p = write_u32(buf, p, pgid);
+        p = write_u32(buf, p, pv(pgid));
         p = write_lit(buf, p, b" ");
-        p = write_u32(buf, p, sid); // field 6: session id
+        p = write_u32(buf, p, pv(sid)); // field 6: session id
         // 7 tty_nr .. 13 cmajflt, 14 utime, 15 stime, 16 cutime, 17 cstime,
         // 18 priority, 19 nice. utime / stime are the thread group's CPU
         // time outside / inside system calls (`Task::cpu_ns` minus / and
@@ -10715,7 +10759,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         let n = sched::thread_ids_from(tgid, next, &mut tids);
         let mut stopped = false;
         for &t in &tids[..n] {
-            let mut d = [0u8; 10]; let mut k = d.len(); let mut v = t;
+            let mut d = [0u8; 10]; let mut k = d.len(); let mut v = pv(t);
             loop { k -= 1; d[k] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
             match write_dirent(buf, off, count, 0x7800_0000 + t as u64, &d[k..], 4) {
                 Some(r) => { off += r; next = t + 1; }
@@ -11033,8 +11077,11 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         // Snapshot first: write_dirent touches user memory (may fault).
         let mut pids = [0u32; 256];
         let n = sched::process_pids_from(next, &mut pids);
+        let rn = sched::pidns::cur();
         for &p in &pids[..n] {
-            let mut name = [0u8; 10]; let mut k = 0; let mut v = p;
+            let pvv = if rn == 0 { p } else { sched::pidns::to_v(rn, p) };
+            if pvv == 0 { next = p + 1; continue; }
+            let mut name = [0u8; 10]; let mut k = 0; let mut v = pvv;
             let mut d = [0u8; 10];
             loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
             let len = k;
@@ -12548,6 +12595,28 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
 
+    // /proc/self -> "<tgid>", /proc/thread-self -> "<tgid>/task/<tid>", both
+    // numbered in the reader's pid namespace.
+    if raw == b"/proc/self" || raw == b"/proc/thread-self" {
+        let me = sched::current_pid();
+        let tgv = pv(sched::tgid_of(me));
+        let mut tmp = [0u8; 48];
+        let mut n = 0;
+        let mut put = |v: u32, tmp: &mut [u8; 48], n: &mut usize| {
+            let mut d = [0u8; 10]; let mut k = 0; let mut x = v;
+            loop { d[k] = b'0' + (x % 10) as u8; k += 1; x /= 10; if x == 0 { break; } }
+            while k > 0 { k -= 1; tmp[*n] = d[k]; *n += 1; }
+        };
+        put(tgv, &mut tmp, &mut n);
+        if raw == b"/proc/thread-self" {
+            for &c in b"/task/" { tmp[n] = c; n += 1; }
+            put(pv(me), &mut tmp, &mut n);
+        }
+        let n = n.min(buf_len);
+        unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, tmp.as_ptr(), n); }
+        return val_reply(n as u64);
+    }
+
     if let Some(path) = tmpfs_path(raw) {
         let tmp = TMP_FILES.lock();
         return match tmp_find(&tmp, path) {
@@ -13641,6 +13710,9 @@ pub fn write_stat_full_rdev(
     gid:      u32,
     rdev:     u64,
 ) {
+    // Owners as the calling task's user namespace sees them (65534 unmapped).
+    let uid = sched::ns::view_id(0, uid);
+    let gid = sched::ns::view_id(1, gid);
     unsafe {
         // Built in a kernel buffer, then one PAN-safe copy out.
         let mut kb = [0u8; STAT_SIZE];

@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <linux/sched.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <stddef.h>
 #include <pthread.h>
 #include <sys/mount.h>
@@ -520,6 +521,129 @@ static int ub_fork_enomem(void)
 PCASE(fork_enomem, ub_fork_enomem)
 
 
+/* ---- /proc in a pid namespace (lane nspidproc) --------------------------- */
+static int slurp(const char *p, char *b, int n)
+{
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) return -1;
+    int r = read(fd, b, n - 1);
+    close(fd);
+    if (r >= 0) b[r] = 0;
+    return r;
+}
+/* Tab-separated values of the "<key>:" line of a status buffer into out (as text). */
+static int status_line(const char *st, const char *key, char *out, int n)
+{
+    char k[32]; snprintf(k, sizeof k, "\n%s:\t", key);
+    const char *a = strstr(st, k);
+    if (!a) return -1;
+    a += strlen(k);
+    int i = 0;
+    while (*a && *a != '\n' && i < n - 1) out[i++] = *a++;
+    out[i] = 0;
+    return 0;
+}
+static int ntabs(const char *s) { int n = 1; for (; *s; s++) if (*s == '\t') n++; return n; }
+static pid_t g_outer;
+
+static int ib_proc_self(void)
+{
+    char b[64] = {0};
+    ssize_t r = readlink("/proc/self", b, sizeof b - 1);
+    if (r != 1 || b[0] != '1') return 1;
+    char st[4096], v[64];
+    if (slurp("/proc/self/status", st, sizeof st) < 0) return 2;
+    if (status_line(st, "Pid", v, sizeof v) || strcmp(v, "1")) return 3;
+    if (status_line(st, "PPid", v, sizeof v) || strcmp(v, "0")) return 4;
+    if (status_line(st, "NSpid", v, sizeof v) || strcmp(v, "1")) return 5;
+    return 0;
+}
+static int ub_proc_self(void) { return in_init(ib_proc_self); }
+PCASE(proc_self_init, ub_proc_self)
+
+/* init forks a child that blocks; init lists /proc. */
+static int ib_listing(void)
+{
+    int p[2];
+    if (pipe(p)) return 1;
+    pid_t c = fork();
+    if (c == 0) { char x; close(p[1]); read(p[0], &x, 1); _exit(0); }
+    if (c <= 1) return 2;
+    int saw1 = 0, sawc = 0, bad = 0;
+    DIR *d = opendir("/proc");
+    if (!d) return 3;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        long v = atol(e->d_name);
+        if (v == 1) saw1 = 1; else if (v == c) sawc = 1; else bad++;
+    }
+    closedir(d);
+    /* hidden: the outside pid and the host-view number of init */
+    char path[64]; struct stat sb;
+    snprintf(path, sizeof path, "/proc/%d", (int)g_outer);
+    int hid_outer = stat(path, &sb) == -1 && errno == ENOENT;
+    int ok_c;
+    snprintf(path, sizeof path, "/proc/%d", (int)c);
+    ok_c = stat(path, &sb) == 0;
+    write(p[1], "x", 1); close(p[1]);
+    if (child_ok(c)) return 4;
+    if (!saw1 || !sawc || bad) return 5;
+    if (!hid_outer) return 6;
+    if (!ok_c) return 7;
+    return 0;
+}
+static int ub_listing(void) { g_outer = getpid(); return in_init(ib_listing); }
+PCASE(proc_listing, ub_listing)
+
+/* Outside reader sees host pid + 1, and three levels when nested. */
+static int ub_status_views(void)
+{
+    alarm(10);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    int up[2], dn[2], gp[2];
+    CHECK(pipe(up) == 0 && pipe(dn) == 0 && pipe(gp) == 0);
+    pid_t i = fork();
+    CHECK(i > 0 || i == 0);
+    if (i == 0) {
+        if (unshare(CLONE_NEWPID)) _exit(1);
+        pid_t g = fork();
+        if (g == 0) { char x; read(gp[0], &x, 1); _exit(0); }
+        if (g <= 0) _exit(2);
+        write(up[1], &g, sizeof g);
+        char x; read(dn[0], &x, 1);
+        write(gp[1], "x", 1);
+        int st; waitpid(g, &st, 0);
+        _exit(0);
+    }
+    pid_t g = 0;
+    CHECK(read(up[0], &g, sizeof g) == sizeof g);
+    char st[4096], v[64], path[64];
+    snprintf(path, sizeof path, "/proc/%d/status", (int)i);
+    CHECK(slurp(path, st, sizeof st) > 0);
+    CHECK(status_line(st, "NSpid", v, sizeof v) == 0 && ntabs(v) == 2);
+    char want[64]; snprintf(want, sizeof want, "%d\t1", (int)i);
+    CHECK(strcmp(v, want) == 0);
+    CHECK(status_line(st, "Pid", v, sizeof v) == 0 && atoi(v) == (int)i);
+    CHECK(status_line(st, "NStgid", v, sizeof v) == 0 && ntabs(v) == 2);
+    snprintf(path, sizeof path, "/proc/%d/status", (int)g);
+    CHECK(slurp(path, st, sizeof st) > 0);
+    CHECK(status_line(st, "NSpid", v, sizeof v) == 0 && ntabs(v) == 3);
+    write(dn[1], "x", 1);
+    int s2; waitpid(i, &s2, 0);
+    CHECK(WIFEXITED(s2) && WEXITSTATUS(s2) == 0);
+    return 0;
+}
+PCASE(status_views, ub_status_views)
+
+static int t_proc_self_tgid(void)
+{
+    char b[32] = {0};
+    ssize_t r = readlink("/proc/self", b, sizeof b - 1);
+    CHECK(r > 0 && atoi(b) == (int)getpid());
+    return 0;
+}
+
 static void reap(long r)
 {
     if (r == 0) _exit(0);
@@ -979,6 +1103,260 @@ static int ub_peercred(void)
 PCASE(peercred, ub_peercred)
 
 
+/* ---- nsids: id-changing syscalls and id translation inside a userns ---- */
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <signal.h>
+#define NSF "/tmp/nstest-ids-file"
+
+static int setid_attempts(int uid_before)
+{
+    gid_t gl[1] = { 0 };
+    CHECK(setuid(0) == -1 && setuid(1001) == -1);
+    CHECK(setreuid(1001, 1001) == -1 && setreuid(0, 0) == -1);
+    CHECK(setresuid(1001, 1001, 1001) == -1 && setresuid(0, 0, 0) == -1);
+    syscall(SYS_setfsuid, 1001); syscall(SYS_setfsgid, 1001);
+    CHECK(setgid(0) == -1 && setgid(1001) == -1);
+    CHECK(setregid(0, 0) == -1 && setresgid(0, 0, 0) == -1);
+    CHECK(setgroups(1, gl) == -1);
+    CHECK((int)getuid() == uid_before && (int)geteuid() == uid_before);
+    return 0;
+}
+static int setid_nomap_child(void) { return setid_attempts(65534); }
+static int setid_map_child(void)
+{
+    CHECK(wr("/proc/self/setgroups", "deny") == 0);
+    CHECK(wr("/proc/self/uid_map", "1000 1000 1") == 0);
+    CHECK(wr("/proc/self/gid_map", "1000 1000 1") == 0);
+    return setid_attempts(1000);
+}
+static int t_setid_guard(void)
+{
+    CHECK(drop_to(1000) == 0);
+    CHECK(newuser_child(setid_nomap_child) == 0);
+    CHECK(newuser_child(setid_map_child) == 0);
+    CHECK((int)getuid() == 1000);
+    return 0;
+}
+/* host root in a userns whose only mapped id is 0: other ids are EINVAL */
+static int root_einval_child(void)
+{
+    CHECK(wr("/proc/self/setgroups", "deny") == 0);
+    CHECK(wr("/proc/self/uid_map", "0 0 1") == 0);
+    CHECK(wr("/proc/self/gid_map", "0 0 1") == 0);
+    errno = 0; CHECK(setuid(1000) == -1 && errno == EINVAL);
+    errno = 0; CHECK(setresuid(1000, -1, -1) == -1 && errno == EINVAL);
+    errno = 0; CHECK(setreuid(-1, 1000) == -1 && errno == EINVAL);
+    errno = 0; CHECK(setgid(1000) == -1 && errno == EINVAL);
+    errno = 0; CHECK(setresgid(-1, 1000, -1) == -1 && errno == EINVAL);
+    errno = 0; CHECK(setregid(1000, -1) == -1 && errno == EINVAL);
+    CHECK(setuid(0) == 0 && setgid(0) == 0);       /* mapped id still fine */
+    CHECK(getuid() == 0 && getgid() == 0);
+    return 0;
+}
+static int t_root_einval(void) { return newuser_child(root_einval_child); }
+
+static volatile int got_siuid = -1;
+static void sigh(int s, siginfo_t *si, void *u) { (void)s; (void)u; got_siuid = (int)si->si_uid; }
+static int tr_probe(int want_u, int want_g)
+{
+    struct stat st; struct ucred uc; socklen_t l = sizeof uc; int sv[2];
+    char b[1024];
+    CHECK(stat(NSF, &st) == 0 && (int)st.st_uid == want_u && (int)st.st_gid == want_g);
+    CHECK(lstat(NSF, &st) == 0 && (int)st.st_uid == want_u);
+    int fd = open(NSF, O_RDONLY); CHECK(fd >= 0);
+    CHECK(fstat(fd, &st) == 0 && (int)st.st_uid == want_u && (int)st.st_gid == want_g);
+    close(fd);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    CHECK(getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED, &uc, &l) == 0);
+    CHECK((int)uc.uid == want_u && (int)uc.gid == want_g);
+    int n = rd("/proc/self/status", b, sizeof b);
+    char *u = n > 0 ? strstr(b, "Uid:") : 0;
+    CHECK(u != 0);
+    int a, bb, c, d; CHECK(sscanf(u, "Uid:\t%d\t%d\t%d\t%d", &a, &bb, &c, &d) == 4 && a == want_u && bb == want_u);
+    char *g = strstr(b, "\nGid:"); CHECK(g != 0); g++;
+    CHECK(sscanf(g, "Gid:\t%d\t%d\t%d\t%d", &a, &bb, &c, &d) == 4 && a == want_g);
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = sigh; sa.sa_flags = SA_SIGINFO; sigaction(SIGUSR1, &sa, 0);
+    got_siuid = -1; kill(getpid(), SIGUSR1);
+    CHECK(got_siuid == want_u);
+    return 0;
+}
+static int tr_child(void)
+{
+    CHECK(tr_probe(65534, 65534) == 0);          /* unmapped: overflow ids */
+    CHECK(wr("/proc/self/setgroups", "deny") == 0);
+    CHECK(wr("/proc/self/uid_map", "1000 1000 1") == 0);
+    CHECK(wr("/proc/self/gid_map", "1000 1000 1") == 0);
+    CHECK(tr_probe(1000, 1000) == 0);
+    CHECK(chown(NSF, 1000, 1000) == 0 && chown(NSF, -1, -1) == 0);
+    errno = 0; CHECK(chown(NSF, 1001, -1) == -1 && errno == EINVAL);
+    errno = 0; CHECK(chown(NSF, -1, 1001) == -1 && errno == EINVAL);
+    int fd = open(NSF, O_RDONLY);
+    errno = 0; CHECK(fchown(fd, 0, -1) == -1 && errno == EINVAL);
+    errno = 0; CHECK(fchownat(AT_FDCWD, NSF, 1001, -1, 0) == -1 && errno == EINVAL);
+    close(fd);
+    return 0;
+}
+static int t_id_translate(void)
+{
+    int fd = open(NSF, O_WRONLY | O_CREAT | O_TRUNC, 0666); CHECK(fd >= 0); close(fd);
+    CHECK(chown(NSF, 1000, 1000) == 0 && chmod(NSF, 0666) == 0);
+    CHECK(drop_to(1000) == 0);
+    int r = newuser_child(tr_child);
+    return r;
+}
+
+/* ---- nsnet2: netns captured at socket() ---- */
+static int inet_listener(unsigned port, int *fdout)
+{
+    int one = 1, l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (bind(l, (void *)&a, sizeof a) || listen(l, 4)) return -errno;
+    *fdout = l; return 0;
+}
+static int inet_connect_fd(int s, unsigned port)
+{
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    return connect(s, (void *)&a, sizeof a) == 0 ? 0 : -errno;
+}
+static int sockcap_child_inherited(void)
+{
+    /* the fd was created by the parent: parent netns, may reach the host listener */
+    extern int g_cap_sock;
+    CHECK(inet_connect_fd(g_cap_sock, 41011) == 0);
+    int fresh = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(inet_connect_fd(fresh, 41011) == -ENETUNREACH);
+    return 0;
+}
+int g_cap_sock;
+static int t_sock_netns_inherited(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int l; CHECK(inet_listener(41011, &l) == 0);
+    g_cap_sock = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(ns_child_netns(sockcap_child_inherited) == 0);
+    return 0;
+}
+static int t_sock_netns_scm(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int l; CHECK(inet_listener(41012, &l) == 0);
+    int sv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+    if (c == 0) {
+        char b; struct iovec iv = { &b, 1 };
+        char cb[CMSG_SPACE(sizeof(int))];
+        struct msghdr m = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof cb };
+        if (recvmsg(sv[1], &m, 0) != 1) _exit(1);
+        struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+        if (!cm || cm->cmsg_type != SCM_RIGHTS) _exit(2);
+        int fd; memcpy(&fd, CMSG_DATA(cm), sizeof fd);
+        if (inet_connect_fd(fd, 41012) != 0) _exit(3);
+        int fresh = socket(AF_INET, SOCK_STREAM, 0);
+        _exit(inet_connect_fd(fresh, 41012) == -ENETUNREACH ? 0 : 4);
+    }
+    CHECK(c > 0);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    char b = 'x'; struct iovec iv = { &b, 1 };
+    char cb[CMSG_SPACE(sizeof(int))]; memset(cb, 0, sizeof cb);
+    struct msghdr m = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof cb };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+    cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &s, sizeof s);
+    CHECK(sendmsg(sv[0], &m, 0) == 1);
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+static int t_sock_before_unshare(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int l; CHECK(inet_listener(41013, &l) == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        int old = socket(AF_INET, SOCK_STREAM, 0);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) _exit(1);
+        if (inet_connect_fd(old, 41013) != 0) _exit(2);
+        int fresh = socket(AF_INET, SOCK_STREAM, 0);
+        _exit(inet_connect_fd(fresh, 41013) == -ENETUNREACH ? 0 : 3);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+
+/* ---- nsnet2: per-netns port space ---- */
+static int wild_listener(unsigned port, int *fdout)
+{
+    int one = 1, l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (bind(l, (void *)&a, sizeof a)) return -errno;
+    if (listen(l, 4)) return -errno;
+    *fdout = l; return 0;
+}
+static int t_netns_portspace(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int hp; CHECK(wild_listener(41021, &hp) == 0);       /* host holds P */
+    int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
+    pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+    if (c == 0) {
+        int a, b;
+        char ok = wild_listener(41021, &a) == 0 && wild_listener(41022, &b) == 0;
+        write(pfd[1], &ok, 1);
+        char x; read(qfd[0], &x, 1);
+        _exit(0);
+    }
+    CHECK(c > 0);
+    char ok = 0; CHECK(read(pfd[0], &ok, 1) == 1 && ok);  /* child bound P too, and Q */
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(inet_connect_fd(s, 41022) == -ECONNREFUSED);    /* child's listener unreachable */
+    int h2; CHECK(wild_listener(41022, &h2) == 0);        /* and Q is free on the host */
+    write(qfd[1], "x", 1);
+    int st; waitpid(c, &st, 0);
+    return 0;
+}
+
+static int t_netns_udp_bind(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
+    pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+    if (c == 0) {
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41031) };
+        int u = socket(AF_INET, SOCK_DGRAM, 0);
+        struct timeval tv = { 0, 300000 };
+        setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        char ok = bind(u, (void *)&a, sizeof a) == 0;
+        write(pfd[1], &ok, 1);
+        char x; read(qfd[0], &x, 1);               /* host has sent */
+        char buf[8];
+        ssize_t r = recv(u, buf, sizeof buf, 0);
+        char res = (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        write(pfd[1], &res, 1);
+        _exit(0);
+    }
+    CHECK(c > 0);
+    char ok = 0; CHECK(read(pfd[0], &ok, 1) == 1 && ok);
+    int h = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in d = { .sin_family = AF_INET, .sin_port = htons(41031) };
+    d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sendto(h, "hi", 2, 0, (void *)&d, sizeof d);
+    write(qfd[1], "x", 1);
+    char res = 0; CHECK(read(pfd[0], &res, 1) == 1 && res);   /* child got nothing */
+    int hb = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41031) };
+    CHECK(bind(hb, (void *)&a, sizeof a) == 0);               /* P free on the host */
+    int st; waitpid(c, &st, 0);
+    return 0;
+}
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -997,8 +1375,13 @@ static int run_userns_cases(void)
         { "init_handler", t_init_handler }, { "orphan_to_init", t_orphan_to_init },
         { "init_death_kills", t_init_death_kills }, { "kill_minus1_scoped", t_kill_minus1_scoped },
         { "sid_pgid", t_sid_pgid }, { "byid_calls", t_byid_calls }, { "peercred", t_peercred },
+        { "proc_self_tgid", t_proc_self_tgid }, { "proc_self_init", t_proc_self_init },
+        { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
+        { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
         { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
+        { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
+        { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();
