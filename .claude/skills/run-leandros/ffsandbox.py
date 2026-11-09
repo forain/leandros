@@ -51,6 +51,8 @@ open(collect, "w").write(r'''for d in /proc/[0-9]*; do
   echo "SBROOT $p $(readlink $d/root 2>&1)"
   echo "SBNS $p user=$(readlink $d/ns/user 2>&1) net=$(readlink $d/ns/net 2>&1) ipc=$(readlink $d/ns/ipc 2>&1)"
 done
+echo "SBETC ld.so.conf: $(cat /etc/ld.so.conf 2>&1 | tr '\n' ' ')"
+echo "SBETC localtime: $(ls -l /etc/localtime 2>&1)"
 echo SBDONE
 ''')
 
@@ -86,6 +88,8 @@ def run(mode):
     post, ff = rd("post.txt"), rd("ff.log")
     procs = {}
     for l in post.splitlines():
+        if l.startswith("SBETC "):
+            print(" ", l[:140])
         m = re.match(r"SBPID (\d+) CMD (.*)", l)
         if m:
             procs[m[1]] = {"cmd": m[2], "st": {}, "root": "?", "ns": {}}
