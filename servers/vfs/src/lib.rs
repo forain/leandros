@@ -53,6 +53,7 @@ pub mod sysclass;
 
 /// Open file descriptions (see the module docs): what epoll keys by.
 pub mod ofd;
+pub mod mqueue;
 
 /// Alias mounts (proc/devtmpfs/sysfs/bind) — how a chroot gets its /proc.
 pub mod alias;
@@ -1689,6 +1690,8 @@ pub enum VnodeKind {
     TmpFile { idx: usize, pos: usize, writable: bool, ofd: u16 },
     /// eventfd: counter value; read returns counter as u64, write adds to it.
     EventFd { slot: usize },
+    /// POSIX message queue descriptor (mq_open, or open of /dev/mqueue/NAME).
+    Mq { slot: usize },
     /// timerfd: index into TIMERFD_POOL.
     TimerFd { slot: usize },
     /// /dev/urandom — reads return LFSR pseudo-random bytes.
@@ -1812,7 +1815,7 @@ pub fn fd_rwf_nowait_capable(pid: u32, fd: usize) -> Option<bool> {
     Some(matches!(tbl.fds[fd].kind,
         VnodeKind::RamFile { .. } | VnodeKind::DevNull | VnodeKind::DevZero
         | VnodeKind::Pipe { .. } | VnodeKind::TmpFile { .. } | VnodeKind::EventFd { .. }
-        | VnodeKind::TimerFd { .. } | VnodeKind::DevUrandom | VnodeKind::MountedFile { .. }
+        | VnodeKind::Mq { .. } | VnodeKind::TimerFd { .. } | VnodeKind::DevUrandom | VnodeKind::MountedFile { .. }
         | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. }))
 }
 
@@ -1897,6 +1900,7 @@ pub fn fd_wake_tag(pid: u32, fd: usize, write: bool) -> Option<sched::PollTag> {
         VnodeKind::Pipe { ring, is_write } => return local(sched::poll_key_bit(pipe_end_key(*ring, *is_write))),
         VnodeKind::Pty { pair, .. }   => return local(poll_tag(poll_class::PTY, *pair as u32)),
         VnodeKind::EventFd { slot }   => return local(poll_tag(poll_class::EVENTFD, *slot as u32)),
+        VnodeKind::Mq { slot }        => return local(poll_tag(poll_class::MQ, *slot as u32)),
         VnodeKind::TimerFd { slot }   => return local(poll_tag(poll_class::TIMERFD, *slot as u32)),
         VnodeKind::DevVt { .. }       => return local(sched::POLL_TAG_VT_SWITCH),
         VnodeKind::SignalFd { .. } if !write => return local(signalfd_wake_tag()),
@@ -2034,6 +2038,7 @@ pub fn fd_object_identity(k: &VnodeKind) -> Option<(u8, u64)> {
         VnodeKind::Pty { pair, is_master } => Some((2, (pair as u64) << 1 | is_master as u64)),
         VnodeKind::TmpFile { idx, .. } => Some((3, idx as u64)),
         VnodeKind::EventFd { slot } => Some((4, slot as u64)),
+        VnodeKind::Mq { slot } => Some((8, slot as u64)),
         VnodeKind::TimerFd { slot } => Some((5, slot as u64)),
         VnodeKind::DynamicDevice { port, open_id, .. } => Some((6, (port as u64) << 32 | open_id as u64)),
         VnodeKind::MountedFile { port, file_id } => Some((7, (port as u64) << 32 | file_id as u64)),
@@ -2950,6 +2955,7 @@ fn pipe_ref_inc(kind: &VnodeKind) {
         // eventfd/timerfd slots are pooled and shared across dup'd fds; bump the
         // slot refcount so the pool entry survives until the last fd closes.
         VnodeKind::EventFd { slot } => { EVENTFD_REFS.lock()[*slot] += 1; }
+        VnodeKind::Mq { slot } => { mqueue::ref_inc(*slot); }
         VnodeKind::TimerFd { slot } => { TIMERFD_REFS.lock()[*slot] += 1; }
         // A dynamic-device open is shared by every duplicate of its fd, so the
         // device server must not be told "closed" until the last one goes. This
@@ -3021,6 +3027,7 @@ fn pipe_ref_dec(kind: &VnodeKind) {
             refs[*slot] = refs[*slot].saturating_sub(1);
             if refs[*slot] == 0 { TIMERFD_POOL.lock()[*slot] = TimerFdEntry::free(); }
         }
+        VnodeKind::Mq { slot } => { mqueue::ref_dec(*slot, sched::current_pid()); }
         // Symmetric with pipe_ref_inc. This also closes a pre-existing leak:
         // the dup2/dup3 overwrite path retired a dynamic-device fd without ever
         // sending VFS_CLOSE, so the server kept the open alive forever.
@@ -4381,6 +4388,11 @@ static RAMFS: &[RamEntry] = &[
     // Linux's ceiling; threads-max is the task table (`runqueue::MAX_TASKS`,
     // asserted below).
     RamEntry { path: b"/proc/sys/kernel/pid_max",    data: b"4194304\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/msg_max", data: b"10\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/msgsize_max", data: b"8192\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/queues_max", data: b"256\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/msg_default", data: b"10\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/msgsize_default", data: b"8192\n" },
     RamEntry { path: b"/proc/sys/kernel/threads-max", data: b"4096\n" },
     RamEntry { path: b"/proc/sys/vm/overcommit_memory", data: b"0\n" },
     // Id the kernel shows for an unmapped uid/gid (ns::OVERFLOW_ID), and the
@@ -4421,6 +4433,7 @@ static RAMFS_DIRS: &[&[u8]] = &[
     // `handle_open` does not depend on it, but ttyname()'s readlink+stat
     // cross-check and `ls /dev/pts` do.
     b"/dev/pts",
+    b"/dev/mqueue",
     b"/run",
     b"/run/user",
     b"/mnt",
@@ -5875,6 +5888,15 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, fstype.as_bytes());
         // Alias mounts are always nosuid (see alias.rs).
         p = write_lit(buf, p, b" rw,nosuid 0 0\n");
+        if p >= buf.len() { return start; }
+    }
+    // The built-in mqueue tree (served at /dev/mqueue like /dev/pts) is a mount
+    // too; an explicit `mount -t mqueue` at the same place is a no-op alias
+    // and would otherwise leave /proc/mounts without it.
+    let jailed = matches!(sched::current_root_arc().as_deref(), Some(r) if r.len() > 1);
+    if !jailed {
+        let start = p;
+        p = write_lit(buf, p, b"mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec 0 0\n");
         if p >= buf.len() { return start; }
     }
     p
@@ -7914,6 +7936,12 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         path = strip_trailing_slash(path);
     }
 
+    // /dev/mqueue/<name>: an open of a POSIX message queue (mqueue mount).
+    if let Some(name) = mqueue::path_name(path) {
+        let r = mqueue::open_path(pid, name, flags);
+        return if r < 0 { err_reply(r as i32) } else { val_reply(r as u64) };
+    }
+
     // `/proc/<pid>/root[/...]` (and `/proc/self/root`) of a live process is
     // that process's root directory. LeandrOS has one filesystem namespace,
     // so it is "/" itself. xdg-desktop-portal opens it for every caller to
@@ -8944,6 +8972,18 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             if unsafe { sched::uaccess::copy_raw(buf, &val as *const u64 as *const u8, 8) } != 0 { return err_reply(-14); }
             val_reply(8)
         }
+        VnodeKind::Mq { slot } => {
+            let slot = *slot;
+            let o = tbl.fds[fd].ofd;
+            drop(tbls);
+            let txt = mqueue::qsize_text(slot);
+            let pos = ofd::pos(o).unwrap_or(0) as usize;
+            if pos >= txt.len() { return val_reply(0); }
+            let n = (txt.len() - pos).min(count);
+            if unsafe { sched::uaccess::copy_raw(buf, txt[pos..].as_ptr(), n) } != 0 { return err_reply(-14); }
+            ofd::set_pos(o, (pos + n) as u64);
+            val_reply(n as u64)
+        }
         VnodeKind::TimerFd { slot } => {
             let slot = *slot;
             drop(tbls);
@@ -9501,6 +9541,7 @@ fn handle_close(pid: u32, fd: usize) -> Message {
         VnodeKind::Pty { pair, is_master } => {
             tty_server::pty::drop_ref(pair as usize, is_master);
         }
+        VnodeKind::Mq { slot } => { mqueue::ref_dec(slot, pid); }
         VnodeKind::EventFd { slot } => {
             // Refcounted: an eventfd is dup-able, so free the pool slot only when
             // the last fd sharing it closes. Freeing early let a later eventfd()
@@ -10049,6 +10090,7 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
         VnodeKind::Pty { pair, is_master } => {
             tty_server::pty::drop_ref(pair as usize, is_master);
         }
+        VnodeKind::Mq { slot } => { mqueue::ref_dec(slot, pid); }
         VnodeKind::EventFd { slot } => {
             // Only free the slot when the LAST dup of this eventfd closes;
             // otherwise a surviving dup keeps using a counter a new eventfd
@@ -11008,6 +11050,21 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         }
     }
 
+    // POSIX message queues of the caller's IPC namespace.
+    if dir_path == b"/dev/mqueue" {
+        for (name, ino) in mqueue::list(pid) {
+            if virtual_idx >= pos {
+                if let Some(r) = write_dirent(buf, off, count, ino, &name, 8 /* DT_REG */) {
+                    off += r; pos += 1;
+                } else {
+                    set_dir_pos(&mut tbl.fds[fd], pos);
+                    return val_reply(off as u64);
+                }
+            }
+            virtual_idx += 1;
+        }
+    }
+
     // Writable tmpfs pool (/tmp and anything mkdir'd underneath it).
     //
     // Without this pass every tmpfs directory enumerated as empty: `/tmp`
@@ -11901,6 +11958,7 @@ fn poll_vnode_key(kind: &VnodeKind) -> Option<u64> {
     match kind {
         VnodeKind::Pipe { ring, is_write } => Some(pipe_end_key(*ring, *is_write)),
         VnodeKind::EventFd { slot } => Some(eventfd_key(*slot)),
+        VnodeKind::Mq { slot } => Some(mqueue::key(*slot)),
         VnodeKind::TimerFd { slot } => Some(timerfd_key(*slot)),
         // Exit / reap wake it keyed (sched exit paths, pidfd_reaped_wake).
         VnodeKind::PidFd { pid } => Some(sched::poll_key(sched::poll_class::PIDFD, *pid)),
@@ -11978,6 +12036,11 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             // interest set) wake on every wake in the system; the static tag
             // has no producer because there is nothing to announce.
             (POLLIN | POLLOUT, 0, static_poll_tag())
+        }
+        VnodeKind::Mq { slot } => {
+            let s = *slot;
+            let (r, w, seq) = mqueue::readiness(s);
+            (if r { POLLIN } else { 0 } | if w { POLLOUT } else { 0 }, seq, sched::poll_tag(sched::poll_class::MQ, s as u32))
         }
         VnodeKind::EventFd { slot } => {
             let s = *slot;
@@ -12439,6 +12502,10 @@ fn handle_unlink(pid: u32, path_ptr: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
 
+    if let Some(name) = mqueue::path_name(strip_trailing_slash(raw)) {
+        let r = mqueue::unlink(pid, name);
+        return if r < 0 { err_reply(r as i32) } else { ok_reply() };
+    }
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-21); } // EISDIR — mount root
         let cred = cred_of(pid);
@@ -14215,7 +14282,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
             else              { (S_IFREG | (e.mode & 0o7777), e.len as u64, 0x2000_0000 + idx as u64) }
         }
         // eventfd/timerfd/signalfd/inotify are anon-inode files and report S_IFREG.
-        VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. }
+        VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. } | VnodeKind::Mq { .. }
         | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. }
         | VnodeKind::PidFd { .. } => (S_IFREG | 0o600, 0, 0),
         // Handled by the early return above (proxied to the owning mount);
@@ -14333,6 +14400,13 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
     if stat_ptr == 0 { return err_reply(-14); }
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let path = &pbuf[..plen];
+
+    if let Some(name) = mqueue::path_name(strip_trailing_slash(path)) {
+        return match mqueue::stat_path(sched::current_pid(), name) {
+            Some((mode, u, g, ino, size)) => { write_stat_owned(stat_ptr, mode, size, ino, u, g); ok_reply() }
+            None => err_reply(-2),
+        };
+    }
 
     // `/proc/<pid>/root[/...]` stats what it names under "/" (see handle_open).
     if let Some(rest) = proc_pid_root_rest(path) {
@@ -14650,6 +14724,7 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             VnodeKind::RamFile { data, .. } => FdInfo::RamData(data.as_ptr()),
             VnodeKind::TmpFile { idx, .. } => FdInfo::TmpIdx(*idx),
             VnodeKind::EventFd { .. } => FdInfo::Static(b"eventfd"),
+            VnodeKind::Mq { .. } => FdInfo::Static(b"mqueue"),
             VnodeKind::TimerFd { .. } => FdInfo::Static(b"timerfd"),
             VnodeKind::PidFd { .. } => FdInfo::Static(b"anon_inode:[pidfd]"),
             VnodeKind::DevUrandom => FdInfo::Static(b"/dev/urandom"),
