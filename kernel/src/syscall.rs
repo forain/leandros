@@ -16897,8 +16897,8 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
     // The mount namespace: a copy of the caller's tree, owned by the new user
     // namespace when there is one. Created before the child exists so a full
     // table fails the whole clone; the child takes its own reference.
-    vfs::mnt::reap();
     let new_mnt = if flags & CLONE_NEWNS != 0 {
+        vfs::mnt::reap();
         let owner = new_user.as_ref().map_or_else(sched::ns::current_userns, |n| n.id());
         match mntns_copy_for(owner) { Ok(n) => Some(n), Err(e) => return e }
     } else { None };
