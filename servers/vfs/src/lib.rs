@@ -7308,6 +7308,8 @@ fn gen_proc_args(pid: u32, environ: bool) -> Option<VnodeKind> {
 
 const PROC_COMM_W: &[u8] = b"/tmp/.proc_comm_";
 const PROC_NSMAP_W: &[u8] = b"/tmp/.proc_nsmap_";
+/// Opener credentials of each writable map file, by tmp-pool slot.
+static NSMAP_OPENERS: Mutex<[Option<sched::ns::Opener>; MAX_TMP_FILES]> = Mutex::new([None; MAX_TMP_FILES]);
 
 /// `/proc/<pid|self>/{uid_map,gid_map,setgroups}` → (thread group, 0|1|2).
 fn proc_nsmap_target(path: &[u8], caller: u32) -> Option<(u32, usize)> {
@@ -7321,7 +7323,7 @@ fn proc_nsmap_target(path: &[u8], caller: u32) -> Option<(u32, usize)> {
 
 /// A writable snapshot of a namespace map file; the fake path carries
 /// `<kind><tgid>` so `handle_write` can route the bytes to `sched::ns`.
-fn gen_proc_nsmap_writable(tgid: u32, kind: usize) -> Option<VnodeKind> {
+fn gen_proc_nsmap_writable(tgid: u32, kind: usize, opener: sched::ns::Opener) -> Option<VnodeKind> {
     let mut fake = [0u8; 40];
     fake[..PROC_NSMAP_W.len()].copy_from_slice(PROC_NSMAP_W);
     let mut n = PROC_NSMAP_W.len();
@@ -7334,6 +7336,7 @@ fn gen_proc_nsmap_writable(tgid: u32, kind: usize) -> Option<VnodeKind> {
     tmp.claim(idx, b"", true);
     tmp.set_path(idx, &fake[..n]);
     if !tmp_fill_kernel(&mut tmp, idx, b"") { tmp.release(idx); return None; }
+    NSMAP_OPENERS.lock()[idx] = Some(opener);
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
 }
 
@@ -8177,7 +8180,9 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // Open /proc/<pid>/{uid_map,gid_map,setgroups} for writing.
             let (tpid, kind) = proc_nsmap_target(lookup_path, pid).unwrap();
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
-            match gen_proc_nsmap_writable(tpid, kind) {
+            let Some(op) = sched::ns::snapshot(pid) else { return err_reply(-1) };
+            if !sched::ns::open_allowed(op, tpid, kind) { return err_reply(-1); } // EPERM
+            match gen_proc_nsmap_writable(tpid, kind, op) {
                 Some(v) => v,
                 None    => return err_reply(-23),
             }
@@ -9154,8 +9159,9 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let n = count.min(512);
                 let mut data = [0u8; 512];
                 if unsafe { sched::uaccess::copy_raw(data.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
-                let r = if k == 2 { sched::ns::write_setgroups(pid, tgid, &data[..n]) }
-                        else { sched::ns::write_map(pid, tgid, k, &data[..n]) };
+                let Some(op) = NSMAP_OPENERS.lock()[idx] else { return err_reply(-1) };
+                let r = if k == 2 { sched::ns::write_setgroups(op, pid, tgid, &data[..n]) }
+                        else { sched::ns::write_map(op, pid, tgid, k, &data[..n]) };
                 return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
             }
             let sc_path = {
