@@ -9195,6 +9195,19 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
     }
 
     if let Some(id) = trunc_zap { sched::zap_backing_all(0, id, 0, u64::MAX); }
+    // A /proc/<pid>[/<file>] snapshot is owned as path stat reports it
+    // (`task_dump_owner`), so fstat on the fd agrees: newuidmap fstats the
+    // /proc/<pid> dirfd it opened and wants the caller's uid.
+    if let VnodeKind::TmpFile { idx, .. } = kind {
+        if path.starts_with(b"/proc/") {
+            if let Some(Some((_, owner, _))) = proc_stat_kind(path) {
+                let (u, g) = sched::cred::proc_dump_owner(owner);
+                let mut t = TMP_FILES.lock();
+                t[idx].uid = u;
+                t[idx].gid = g;
+            }
+        }
+    }
     // A regular tmpfs file gets its own open file description, so every
     // dup/fork copy of this fd shares one offset (see `TMP_OFDS`).
     let mut kind = kind;
@@ -15331,7 +15344,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
     }
     if let Some(k) = proc_stat_kind(path) {
         let Some((dir, owner, name)) = k else { return err_reply(-2) };
-        let (u, g) = sched::cred::ids_of(owner).map(|(u, g)| (u[1], g[1])).unwrap_or((0, 0));
+        let (u, g) = sched::cred::proc_dump_owner(owner);
         let mode = if dir { 0o040555 } else if name == b"comm" || name == b"uid_map" || name == b"gid_map" || name == b"setgroups" || name == b"oom_score_adj" { 0o100644 } else { 0o100444 };
         write_stat_full(stat_ptr, mode, if dir { 2 } else { 1 }, 0, path_ino(path, 7), u, g);
         return ok_reply();
