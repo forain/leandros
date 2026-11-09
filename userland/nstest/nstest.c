@@ -50,7 +50,6 @@ static void check(const char *name, int ok)
 
 static const struct { const char *n; unsigned long f; } flags[] = {
     {"NEWNS", CLONE_NEWNS},
-    {"NEWCGROUP", CLONE_NEWCGROUP},
 };
 
 static long do_clone(unsigned long fl)
@@ -185,9 +184,9 @@ static int t_unshare_threaded(void)
 }
 static int t_other_new_einval(void)
 {
-    int fl[] = { 0x00020000, 0x02000000 };
+    int fl[] = { 0x00020000 };
     CHECK(drop_to(1000) == 0);
-    for (unsigned i = 0; i < 2; i++) {
+    for (unsigned i = 0; i < 1; i++) {
         CHECK(unshare(fl[i]) == -1 && errno == EINVAL);
         long r = syscall(SYS_clone, SIGCHLD | fl[i], 0, 0, 0, 0);
         CHECK(r == -1 && errno == EINVAL);
@@ -1988,6 +1987,91 @@ static int t_uts_in_host_userns(void)
     return 0;
 }
 
+/* ---- cgroup namespaces (design-cgroup CG0) ---- */
+static int cgns_link(char *buf, size_t n)
+{
+    ssize_t r = readlink("/proc/self/ns/cgroup", buf, n - 1);
+    if (r < 0) return -1;
+    buf[r] = 0;
+    return 0;
+}
+static int t_cgns_unshare(void)
+{
+    char a[64], b[64], c[64];
+    CHECK(cgns_link(a, sizeof a) == 0);
+    CHECK(unshare(CLONE_NEWCGROUP) == 0);
+    CHECK(cgns_link(b, sizeof b) == 0);
+    CHECK(strcmp(a, b) != 0);
+    CHECK(strncmp(b, "cgroup:[", 8) == 0);
+    /* a fork child inherits the namespace */
+    pid_t p = fork();
+    if (p == 0) { char x[64]; _exit(cgns_link(x, sizeof x) == 0 && !strcmp(x, b) ? 0 : 1); }
+    int st = 0; CHECK(p > 0 && waitpid(p, &st, 0) == p && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* a second unshare gives yet another one */
+    CHECK(unshare(CLONE_NEWCGROUP) == 0);
+    CHECK(cgns_link(c, sizeof c) == 0 && strcmp(b, c) != 0 && strcmp(a, c) != 0);
+    return 0;
+}
+static int t_cgns_clone(void)
+{
+    char a[64], b[64];
+    CHECK(cgns_link(a, sizeof a) == 0);
+    int pfd[2]; CHECK(pipe(pfd) == 0);
+    long r = syscall(SYS_clone, SIGCHLD | CLONE_NEWCGROUP, 0, 0, 0, 0);
+    CHECK(r >= 0);
+    if (r == 0) { char x[64]; if (cgns_link(x, sizeof x)) _exit(2); write(pfd[1], x, strlen(x) + 1); _exit(0); }
+    int st = 0; CHECK(waitpid(r, &st, 0) == r && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(read(pfd[0], b, sizeof b) > 0);
+    CHECK(strcmp(a, b) != 0);
+    char a2[64]; CHECK(cgns_link(a2, sizeof a2) == 0 && !strcmp(a, a2)); /* the parent is untouched */
+    /* clone3 as well */
+    struct clone_args ca; memset(&ca, 0, sizeof ca); ca.flags = CLONE_NEWCGROUP; ca.exit_signal = SIGCHLD;
+    r = syscall(SYS_clone3, &ca, sizeof ca);
+    CHECK(r >= 0);
+    if (r == 0) { char x[64]; _exit(cgns_link(x, sizeof x) == 0 && strcmp(x, a) != 0 ? 0 : 1); }
+    CHECK(waitpid(r, &st, 0) == r && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* threads cannot be given their own */
+    r = syscall(SYS_clone, CLONE_NEWCGROUP | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM, 0, 0, 0, 0);
+    CHECK(r == -1 && errno == EINVAL);
+    return 0;
+}
+static int t_cgns_eperm(void)
+{
+    CHECK(drop_to(1000) == 0);
+    CHECK(unshare(CLONE_NEWCGROUP) == -1 && errno == EPERM);
+    long r = syscall(SYS_clone, SIGCHLD | CLONE_NEWCGROUP, 0, 0, 0, 0);
+    CHECK(r == -1 && errno == EPERM);
+    return 0;
+}
+static int t_cgns_in_userns(void)
+{
+    /* an unprivileged user may unshare(NEWUSER|NEWCGROUP) and, once in the
+     * userns, unshare(NEWCGROUP) again */
+    CHECK(drop_to(1000) == 0);
+    char a[64], b[64], c[64];
+    CHECK(cgns_link(a, sizeof a) == 0);
+    CHECK(unshare(CLONE_NEWUSER | CLONE_NEWCGROUP) == 0);
+    CHECK(cgns_link(b, sizeof b) == 0 && strcmp(a, b) != 0);
+    CHECK(unshare(CLONE_NEWCGROUP) == 0);
+    CHECK(cgns_link(c, sizeof c) == 0 && strcmp(b, c) != 0);
+    /* clone(NEWUSER|NEWCGROUP) too */
+    long r = syscall(SYS_clone, SIGCHLD | CLONE_NEWUSER | CLONE_NEWCGROUP, 0, 0, 0, 0);
+    CHECK(r >= 0);
+    if (r == 0) { char x[64]; _exit(cgns_link(x, sizeof x) == 0 && strcmp(x, c) != 0 ? 0 : 1); }
+    int st = 0; CHECK(waitpid(r, &st, 0) == r && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+static int t_cgns_leak(void)
+{
+    /* many create/destroy cycles must not exhaust the namespace table (256) */
+    for (int i = 0; i < 600; i++) {
+        pid_t p = fork();
+        if (p == 0) _exit(unshare(CLONE_NEWCGROUP) == 0 ? 0 : 1);
+        int st = 0; CHECK(p > 0 && waitpid(p, &st, 0) == p && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+    return 0;
+}
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -2019,6 +2103,8 @@ static int run_userns_cases(void)
         { "fdinfo_other_uid", t_fdinfo_other_uid },
         { "uts_unpriv", t_uts_unpriv }, { "uts_copy_inherit", t_uts_copy_inherit }, { "uts_host_userns_eperm", t_uts_in_host_userns },
         { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
+        { "cgns_unshare", t_cgns_unshare }, { "cgns_clone", t_cgns_clone }, { "cgns_eperm", t_cgns_eperm },
+        { "cgns_in_userns", t_cgns_in_userns }, { "cgns_leak", t_cgns_leak },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();
