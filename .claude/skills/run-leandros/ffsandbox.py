@@ -101,7 +101,7 @@ def run(mode):
             procs[m[1]]["root"] = m[2].strip() or "-"
     # MOZ_SANDBOX_LOGGING also prints policy-building chatter; only the rest counts as an error.
     noise = re.compile(r"policy for |fixing recursive|removing redundant|Couldn't open video device|adding (read|write)"
-                       r"|using seccomp tsync|Parent path is|Adding paths from|[Ff]ailed errno -2\b")
+                       r"|\[fslock\]|using seccomp tsync|Parent path is|Adding paths from|[Ff]ailed errno -2\b")
     real = re.compile(r"errno -13\b|EACCES|denied|seccomp sandbox violation", re.I)
 
     def counted(l):
