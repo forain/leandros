@@ -144,10 +144,40 @@ static int child_empty(void)
     return cget(d) == 0 && !d[0].eff && !d[0].prm && !d[1].eff && !d[1].prm ? 0 : 1;
 }
 
+static int drop_all(void)
+{
+    struct dat d[2]; memset(d, 0, sizeof d);
+    return cset(d);
+}
+
+static int child_full(void)
+{
+    struct dat d[2];
+    return cget(d) == 0 && u64(d[0].eff, d[1].eff) == (1ULL << 41) - 1
+        && u64(d[0].prm, d[1].prm) == (1ULL << 41) - 1 ? 0 : 1;
+}
+
+static int t_exec_nnp_keeps_dropped(void)
+{
+    /* root, caps dropped, NNP set: exec must not regain anything */
+    CHECK(drop_all() == 0);
+    CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+    execl("/bin/captest", "captest", "--child-empty", (char *)0);
+    return 1;
+}
+
+static int t_exec_no_nnp_regains(void)
+{
+    CHECK(drop_all() == 0);
+    execl("/bin/captest", "captest", "--child-full", (char *)0);
+    return 1;
+}
+
 struct tc { const char *n; int (*f)(void); };
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--child-empty")) return child_empty();
+    if (argc > 1 && !strcmp(argv[1], "--child-full")) return child_full();
     if (geteuid() != 0) { printf("SKIP: not root\n"); return 0; }
     struct tc cs[] = {
         { "root_full", t_root_full }, { "status_matches", t_status_matches },
@@ -155,6 +185,8 @@ int main(int argc, char **argv)
         { "drop_cannot_regain", t_drop_cannot_regain }, { "drop_effective_only", t_drop_effective_only },
         { "fork_inherits", t_fork_inherits }, { "bset_drop", t_bset_drop },
         { "exec_nonroot_clears", t_exec_nonroot_clears },
+        { "exec_nnp_keeps_dropped", t_exec_nnp_keeps_dropped },
+        { "exec_no_nnp_regains", t_exec_no_nnp_regains },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();
