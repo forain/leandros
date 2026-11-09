@@ -763,7 +763,7 @@ impl RunQueue {
     /// `fps` their fingerprints. More fingerprints than fit leave every keyed
     /// bit unrefined (safe: refinement only ever removes wakes).
     pub fn block_on_port_until_keyed(&mut self, pid: Pid, port: u32, deadline: u64,
-                                     mask: u64, kbits: u64, fps: &[u16], xk: &[u64]) {
+                                     mask: u64, kbits: u64, fps: &[u16], fks: &[u64], xk: &[u64]) {
         let Some(idx) = self.find_pid_idx(pid) else { return };
         // This park overwrites `poll_fps`, which a listener's filter shares:
         // a poll()/select()/other-instance park ends the listener.
@@ -784,6 +784,7 @@ impl RunQueue {
             crate::put_xkeys(&mut task.poll_xkeys, &mut task.poll_nx, xk);
             if fps.len() <= crate::POLL_FP_MAX && kbits != 0 {
                 task.poll_fps[..fps.len()].copy_from_slice(fps);
+                task.poll_fks[..fks.len()].copy_from_slice(fks);
                 task.poll_nfp   = fps.len() as u16;
                 task.poll_kbits = kbits & mask;
             } else {
@@ -801,7 +802,7 @@ impl RunQueue {
     }
 
     /// Start listening (see `crate::poll_listen_begin`); returns the new id.
-    pub fn listen_begin(&mut self, pid: Pid, mask: u64, kbits: u64, fps: &[u16], xk: &[u64]) -> u32 {
+    pub fn listen_begin(&mut self, pid: Pid, mask: u64, kbits: u64, fps: &[u16], fks: &[u64], xk: &[u64]) -> u32 {
         let Some(idx) = self.find_pid_idx(pid) else { return 0 };
         let mask = if mask == 0 { crate::POLL_TAG_ALL } else { mask };
         self.listening[idx / 64] |= 1u64 << (idx % 64);
@@ -809,7 +810,7 @@ impl RunQueue {
         self.ls_install_mirror(idx, mask, kbits, fps);
         match self.tasks[idx].as_deref_mut() {
             Some(t) => {
-                Self::listen_install(t, mask, kbits, fps, xk);
+                Self::listen_install(t, mask, kbits, fps, fks, xk);
                 t.listen.on   = true;
                 t.listen.id   = t.listen.id.wrapping_add(1);
                 t.listen.ring = crate::WakeRing::EMPTY;
@@ -901,11 +902,12 @@ impl RunQueue {
         self.wx_all[w] | self.ux_row[k][w] | (self.wx_row[k][w] & self.kx_row[(fp & 255) as usize][w])
     }
 
-    fn listen_install(t: &mut Task, mask: u64, kbits: u64, fps: &[u16], xk: &[u64]) {
+    fn listen_install(t: &mut Task, mask: u64, kbits: u64, fps: &[u16], fks: &[u64], xk: &[u64]) {
         t.listen.mask = mask;
         crate::put_xkeys(&mut t.listen.xkeys, &mut t.listen.nx, xk);
         if fps.len() <= crate::POLL_FP_MAX && kbits != 0 {
             t.poll_fps[..fps.len()].copy_from_slice(fps);
+            t.poll_fks[..fks.len()].copy_from_slice(fks);
             t.listen.nfp   = fps.len() as u16;
             t.listen.kbits = kbits & mask;
         } else {
@@ -923,7 +925,7 @@ impl RunQueue {
     }
 
     /// See `crate::poll_listen_update`.
-    pub fn listen_update(&mut self, pid: Pid, id: u32, mask: u64, kbits: u64, fps: &[u16], xk: &[u64])
+    pub fn listen_update(&mut self, pid: Pid, id: u32, mask: u64, kbits: u64, fps: &[u16], fks: &[u64], xk: &[u64])
         -> Option<crate::WakeRing>
     {
         let idx = self.listener(pid, id)?;
@@ -931,7 +933,7 @@ impl RunQueue {
         self.ls_mask[idx] = mask;
         self.ls_install_mirror(idx, mask, kbits, fps);
         let t = self.tasks[idx].as_deref_mut()?;
-        Self::listen_install(t, mask, kbits, fps, xk);
+        Self::listen_install(t, mask, kbits, fps, fks, xk);
         Some(core::mem::replace(&mut t.listen.ring, crate::WakeRing::EMPTY))
     }
 
@@ -1000,8 +1002,7 @@ impl RunQueue {
         if exclusive && l.mask == crate::POLL_TAG_ALL { return false; }
         match key {
             Some(k) if l.kbits & tag != 0 => {
-                let fp = crate::poll_key_fp(k);
-                t.poll_fps[..l.nfp as usize].iter().any(|&f| f == fp)
+                crate::fp_has_key(&t.poll_fps[..l.nfp as usize], &t.poll_fks, k)
             }
             _ => true,
         }
@@ -1032,7 +1033,7 @@ impl RunQueue {
                     let b = crate::poll_key_bit(k);
                     if b & hit == 0 { continue; }
                     if b & t.listen.kbits != 0
-                        && !t.poll_fps[..t.listen.nfp as usize].contains(&crate::poll_key_fp(k)) { continue; }
+                        && !crate::fp_has_key(&t.poll_fps[..t.listen.nfp as usize], &t.poll_fks, k) { continue; }
                     t.listen.ring.push_key(k);
                 }
             }
@@ -1180,8 +1181,7 @@ impl RunQueue {
                         // Keyed wake on a bit only keyed interests explain:
                         // deliver on a fingerprint match only.
                         Some(k) if task.poll_kbits & tag != 0 => {
-                            let fp = crate::poll_key_fp(k);
-                            let hit = task.poll_fps[..task.poll_nfp as usize].iter().any(|&f| f == fp);
+                            let hit = crate::fp_has_key(&task.poll_fps[..task.poll_nfp as usize], &task.poll_fks, k);
                             let c = if hit { &crate::wakestat::KEY_FP_HIT } else { &crate::wakestat::KEY_SKIPPED };
                             c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                             hit
@@ -1203,6 +1203,15 @@ impl RunQueue {
                         }
                     }
                     if task.poll_mask == crate::POLL_TAG_ALL { allmask += 1; }
+                    if crate::gdwake::log_enabled() && task.poll_mask.count_ones() <= 2 && task.poll_mask != crate::POLL_TAG_ALL {
+                        let kind = match key {
+                            Some(_) if task.poll_kbits & tag != 0 => "key-fp",
+                            Some(_) => "key-unrefined",
+                            None => "bits",
+                        };
+                        crate::gdwake::log_wake(task.pid as u32, task.tgid as u32,
+                            task.poll_mask, tag, key, kind, crate::current_pid() as u32);
+                    }
                     if crate::gdwake::enabled() {
                         crate::gdwake::mark(task.pid, crate::gdwake::SITE.load(core::sync::atomic::Ordering::Relaxed));
                     }
@@ -1334,7 +1343,7 @@ impl RunQueue {
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
                     && (task.poll_mask & match_tag) != 0
                     && (task.poll_kbits & match_tag == 0
-                        || task.poll_fps[..task.poll_nfp as usize].contains(&fp)) {
+                        || crate::fp_has_key(&task.poll_fps[..task.poll_nfp as usize], &task.poll_fks, match_key)) {
                     task.poll_mask |= add;
                     self.pk_mask[i] |= add;
                     self.wd_mask[i / 64] |= add;
@@ -1552,7 +1561,7 @@ impl RunQueue {
                 Some(ks) if hit & !task.poll_kbits == 0 => {
                     let fps = &task.poll_fps[..task.poll_nfp as usize];
                     ks.iter().any(|&k| crate::poll_key_bit(k) & hit != 0
-                        && fps.contains(&crate::poll_key_fp(k)))
+                        && crate::fp_has_key(fps, &task.poll_fks, k))
                 }
                 _ => true,
             }
