@@ -228,6 +228,28 @@ pub fn reaper_for(dead: u32) -> u32 {
     crate::init_pid()
 }
 
+/// Linux find_new_reaper's subreaper walk: the nearest live ancestor of `dead`
+/// that is a child subreaper and lives in `dead`'s own pid namespace, else
+/// `default`. Never applies to a namespace init or the global init (they are
+/// reaped by their parent namespace's rules).
+pub fn subreaper_for(dead: u32, default: u32) -> u32 {
+    let rq = crate::RUN_QUEUE.lock();
+    let d = match rq.find_pid(dead) { Some(t) => t, None => return default };
+    let ns = d.pidns.id();
+    if dead == crate::init_pid() || (ns != 0 && ns::pid_init(ns) == dead) { return default; }
+    let mut cur = rq.find_pid(d.ppid).map(|p| p.tgid).unwrap_or(d.ppid);
+    for _ in 0..4096 {
+        if cur == 0 || cur == dead || cur == crate::init_pid() { break; }
+        let t = match rq.find_pid(cur) { Some(t) => t, None => break };
+        if t.pidns.id() != ns { break; }
+        if t.child_subreaper && t.state != crate::task::TaskState::Zombie { return cur; }
+        let next = rq.find_pid(t.ppid).map(|p| p.tgid).unwrap_or(t.ppid);
+        if next == cur { break; }
+        cur = next;
+    }
+    default
+}
+
 /// Init `tgid` of namespace `n` is dying: SIGKILL every other process in `n`
 /// and its descendants, then wait (bounded) until they are all zombies.
 pub fn zap(n: NsId, tgid: u32) {
