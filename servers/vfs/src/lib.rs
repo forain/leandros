@@ -58,6 +58,7 @@ pub mod mqueue;
 
 /// Alias mounts (proc/devtmpfs/sysfs/bind) — how a chroot gets its /proc.
 pub mod alias;
+pub mod devpts;
 pub mod mnt;
 pub mod cmdline_redact;
 /// Overlay plumbing: real-layer helpers, per-mount pseudo-pid creds.
@@ -2591,6 +2592,7 @@ pub fn register_mount(prefix: &'static str, port: u32, device: &'static str, fst
         let dev = bdev.filter(|&d| !m.iter().any(|e| e.in_use && e.dev == d))
             .unwrap_or(makedev(0, 32 + i as u32));
         m[i] = MountEntry { prefix, port, in_use: true, device, fstype, nosuid: false, rdonly: false, dev };
+        recount_tmp_nested(&*m);
     }
 }
 
@@ -2664,6 +2666,7 @@ pub fn unregister_mount(prefix: &str) -> bool {
     let mut m = MOUNTS.lock();
     if let Some(slot) = m.iter_mut().find(|e| e.in_use && e.prefix == prefix) {
         *slot = MountEntry::empty();
+        recount_tmp_nested(&*m);
         true
     } else {
         false
@@ -2676,7 +2679,7 @@ pub fn unregister_mount(prefix: &str) -> bool {
 fn mounted_inside_tmpfs(path: &[u8]) -> bool {
     MOUNTS.lock().iter().any(|e| {
         let pb = e.prefix.as_bytes();
-        e.in_use && is_tmp_path(pb) && path.starts_with(pb)
+        e.in_use && tmpfs_root_of(pb).is_some() && path.starts_with(pb)
             && (path.len() == pb.len() || path.get(pb.len()) == Some(&b'/'))
     })
 }
@@ -4443,6 +4446,24 @@ static RAMFS_DIRS: &[&[u8]] = &[
     // `handle_open` does not depend on it, but ttyname()'s readlink+stat
     // cross-check and `ls /dev/pts` do.
     b"/dev/pts",
+    // Backing directories of devpts mounts (see devpts.rs).
+    b"/dev/.devpts",
+    b"/dev/.devpts/1",
+    b"/dev/.devpts/2",
+    b"/dev/.devpts/3",
+    b"/dev/.devpts/4",
+    b"/dev/.devpts/5",
+    b"/dev/.devpts/6",
+    b"/dev/.devpts/7",
+    b"/dev/.devpts/8",
+    b"/dev/.devpts/9",
+    b"/dev/.devpts/10",
+    b"/dev/.devpts/11",
+    b"/dev/.devpts/12",
+    b"/dev/.devpts/13",
+    b"/dev/.devpts/14",
+    b"/dev/.devpts/15",
+    b"/dev/.devpts/16",
     b"/dev/mqueue",
     b"/run",
     b"/run/user",
@@ -5083,16 +5104,22 @@ fn pts_meta(n: usize) -> xattr::FileMeta {
 
 /// A fresh pair `n` from `/dev/ptmx`, opened by `pid`.
 fn pts_meta_init(n: usize, pid: u32) {
-    let uid = sched::fsuid_of(pid);
-    if let Some(e) = PTS_META.lock().get_mut(n) { *e = (uid, GID_TTY, 0o620); }
+    let (inst, _) = tty_server::pty::ident(n);
+    let (uid, gid, mode) = match devpts::opts(inst) {
+        Some(o) => (if o.set_uid { o.uid } else { sched::fsuid_of(pid) },
+                    if o.set_gid { o.gid } else { sched::fsgid_of(pid) }, o.mode),
+        None => (sched::fsuid_of(pid), GID_TTY, 0o620),
+    };
+    if let Some(e) = PTS_META.lock().get_mut(n) { *e = (uid, gid, mode); }
 }
 
 /// chmod(2) of `/dev/pts/N`: the owner or root.
 fn pts_chmod(pid: u32, n: usize, mode: u32) -> Message {
-    let euid = sched::fsuid_of(pid);
+    let cred = cred_of(pid);
     let mut t = PTS_META.lock();
     let Some(e) = t.get_mut(n) else { return err_reply(-2) };
-    if euid != 0 && euid != e.0 { return err_reply(-1); } // EPERM
+    // Owner, or CAP_FOWNER over the inode in the caller's user namespace.
+    if cred.euid != e.0 && !cred.cap_inode(xattr::CAP_FOWNER, e.0, e.1) { return err_reply(-1); } // EPERM
     e.2 = (mode & 0o7777) as u16;
     ok_reply()
 }
@@ -5104,7 +5131,8 @@ fn pts_chown(pid: u32, n: usize, uid: u32, gid: u32) -> Message {
     let cred = cred_of(pid);
     let mut t = PTS_META.lock();
     let Some(e) = t.get_mut(n) else { return err_reply(-2) };
-    if cred.euid != 0 {
+    // CAP_CHOWN over the inode in the caller's user namespace (host root: all).
+    if !cred.cap_inode(xattr::CAP_CHOWN, e.0, e.1) {
         if cred.euid != e.0 { return err_reply(-1); }
         if uid != u32::MAX && uid != e.0 { return err_reply(-1); }
         if gid != u32::MAX && !cred.in_group(gid) { return err_reply(-1); }
@@ -5120,14 +5148,22 @@ fn pts_chown(pid: u32, n: usize, uid: u32, gid: u32) -> Message {
 /// multi-component tail, and for a number no live master owns — so the caller
 /// falls through to the ordinary ENOENT rather than inventing a device.
 fn pts_number(path: &[u8]) -> Option<usize> {
-    let rest = path.strip_prefix(b"/dev/pts/".as_slice())?;
-    if rest.is_empty() || rest.len() > 3 { return None; }
-    let mut n = 0usize;
-    for &c in rest {
-        if !c.is_ascii_digit() { return None; }
-        n = n * 10 + (c - b'0') as usize;
+    match devpts::parse(path)? {
+        (inst, devpts::Tail::Slave(n)) => tty_server::pty::find(inst, n),
+        _ => None,
     }
-    if tty_server::pty::exists(n) { Some(n) } else { None }
+}
+
+/// Instance whose `ptmx` `path` names (`/dev/ptmx` is the default's).
+fn ptmx_inst(path: &[u8]) -> Option<u16> {
+    if path == b"/dev/ptmx" { return Some(0); }
+    match devpts::parse(path)? { (inst, devpts::Tail::Ptmx) => Some(inst), _ => None }
+}
+
+/// Owner/mode of an instance's `ptmx` node.
+fn ptmx_meta(inst: u16) -> xattr::FileMeta {
+    let mode = devpts::opts(inst).map_or(0o666, |o| o.ptmxmode);
+    xattr::FileMeta { mode: 0o020000 | mode, uid: 0, gid: 0 }
 }
 
 /// The `N` in `/dev/ttyN`, if `path` names a virtual console.
@@ -5219,7 +5255,16 @@ fn tmpfs_root_of(path: &[u8]) -> Option<&'static [u8]> {
 
 /// Return true if `path` lives under any tmpfs mount root (root or descendant).
 fn is_tmp_path(path: &[u8]) -> bool {
-    tmpfs_root_of(path).is_some()
+    tmpfs_root_of(path).is_some() && !(TMP_NESTED_MOUNTS.load(atomic::Ordering::Relaxed) != 0 && mounted_inside_tmpfs(path))
+}
+
+/// Mounts whose mount point lies inside a tmpfs root (a FUSE filesystem on
+/// /tmp/x): paths under them belong to the mount, not to the tmpfs.
+static TMP_NESTED_MOUNTS: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+
+fn recount_tmp_nested(m: &[MountEntry]) {
+    let n = m.iter().filter(|e| e.in_use && tmpfs_root_of(e.prefix.as_bytes()).is_some()).count();
+    TMP_NESTED_MOUNTS.store(n, atomic::Ordering::Relaxed);
 }
 
 /// S_IFDIR mode (type | permission bits) for a RAMFS_DIRS pseudo-directory.
@@ -5289,25 +5334,30 @@ fn tmp_create_gate(tmp: &TmpPool, path: &[u8], cred: &xattr::Cred) -> Result<(),
     let parent = match tmp_parent(path) { Some(p) => p, None => return Err(-2) }; // ENOENT
     tmp_dir_may(tmp, parent, cred, xattr::MAY_EXEC)?;
     if tmp_find(tmp, path).is_some() { return Err(-17); }                        // EEXIST
-    tmp_dir_may(tmp, parent, cred, xattr::MAY_WRITE | xattr::MAY_EXEC)
+    tmp_dir_may(tmp, parent, cred, xattr::MAY_WRITE | xattr::MAY_EXEC)?;
+    // Linux `fsuidgid_has_mapping`: a caller whose fsuid/fsgid is unmapped in
+    // its own user namespace (between unshare and the map write) cannot
+    // create files whose owner would not exist. EOVERFLOW.
+    if !cred.owner_mapped() { return Err(-75); }
+    Ok(())
 }
 
 /// The sticky rule for removing/replacing pool entry `victim` inside `parent`
 /// (`xattr::sticky_denies`): true means EPERM.
-fn tmp_sticky_denies(tmp: &TmpPool, parent: &[u8], victim: usize, euid: u32) -> bool {
+fn tmp_sticky_denies(tmp: &TmpPool, parent: &[u8], victim: usize, cred: &xattr::Cred) -> bool {
     let dmeta = if is_tmpfs_root(parent) {
         tmp_root_meta(parent)
     } else {
         match tmp_find(tmp, parent) { Some(i) => tmp_meta(&tmp[i]), None => return false }
     };
-    let vuid = tmp[tmp_owner(tmp, victim)].uid;
-    xattr::sticky_denies(&dmeta, vuid, euid)
+    let vmeta = tmp_meta(&tmp[tmp_owner(tmp, victim)]);
+    xattr::sticky_denies_c(&dmeta, &vmeta, cred)
 }
 
 /// Removal gate: write + search on `parent`, then the sticky rule for `victim`.
 fn tmp_may_delete(tmp: &TmpPool, parent: &[u8], victim: usize, cred: &xattr::Cred) -> Result<(), i32> {
     tmp_dir_may(tmp, parent, cred, xattr::MAY_WRITE | xattr::MAY_EXEC)?;
-    if tmp_sticky_denies(tmp, parent, victim, cred.euid) { Err(-1) } else { Ok(()) }
+    if tmp_sticky_denies(tmp, parent, victim, cred) { Err(-1) } else { Ok(()) }
 }
 
 /// Search permission on every directory component of `path` strictly between
@@ -5330,7 +5380,7 @@ fn tmp_check_traversal(tmp: &TmpPool, path: &[u8], upto: usize, cred: &xattr::Cr
         match tmp_find(tmp, &path[..ce]) {
             None => return Err(-2),
             Some(i) if !tmp[i].is_dir => return Err(-20),
-            Some(i) => if cred.euid != 0 && !tmp_may(tmp, i, cred, xattr::MAY_EXEC) { return Err(-13); },
+            Some(i) => if !cred.host_root && !tmp_may(tmp, i, cred, xattr::MAY_EXEC) { return Err(-13); },
         }
         end = ce;
     }
@@ -6976,7 +7026,7 @@ const SYSCLASS_W: &[u8] = b"/tmp/.syscw";
 fn sysclass_write_ok(pid: u32, path: &[u8]) -> bool {
     let mut g = [0u32; xattr::NGROUPS_MAX];
     let n = sched::groups_of(pid, &mut g).min(g.len());
-    sysclass::write_allowed(sched::euid_of(pid), sched::egid_of(pid), &g[..n],
+    sysclass::write_allowed(host_root_of(pid), sched::egid_of(pid), &g[..n],
                             sysclass::is_writable(path), sysclass::is_video_writable(path))
 }
 
@@ -7268,12 +7318,22 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
         for cpu in 0..n {
             p = write_lit(buf, p, b"processor\t: ");
             p = write_u32(buf, p, cpu as u32);
+            // Linux arm64 layout: podman (getCPUInfo) and lscpu key off
+            // "CPU architecture".
+            #[cfg(target_arch = "aarch64")]
+            {
+                let _ = khz;
+                p = write_lit(buf, p, b"\nBogoMIPS\t: 50.00\nFeatures\t: fp asimd evtstrm crc32 cpuid\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd08\nCPU revision\t: 3\n\n");
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
             p = write_lit(buf, p, b"\nmodel name\t: Leandros Virtual CPU\ncpu MHz\t\t: ");
             p = write_u32(buf, p, (khz / 1000) as u32);
             let frac = (khz % 1000) as u32;
             p = write_lit(buf, p, if frac < 10 { b".00" } else if frac < 100 { b".0" } else { b"." });
             p = write_u32(buf, p, frac);
             p = write_lit(buf, p, b"\n\n");
+            }
         }
         return Some(p);
     }
@@ -8341,7 +8401,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             VnodeKind::SysBlock { dev: sysclass::SC_TABLES, level: sysclass::LVL_SC_CLASS, pos: 0 }
         } else if let Some(t) = sysclass::acpi_table(lookup_path) {
             // Raw firmware tables are root-only, as on Linux (mode 0400).
-            if flags & (O_WRONLY | O_RDWR) != 0 || sched::euid_of(pid) != 0 { return err_reply(-13); }
+            if flags & (O_WRONLY | O_RDWR) != 0 || !host_root_of(pid) { return err_reply(-13); }
             let mut tmp = TMP_FILES.lock();
             let Some(idx) = tmp_free_slot(&mut *tmp) else { return err_reply(-23) };
             tmp.claim(idx, b"", true);
@@ -8395,11 +8455,15 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
             let pos = if flags & O_APPEND != 0 { block::dev_size(dev) } else { 0 };
             VnodeKind::BlockDev { dev, pos }
-        } else if lookup_path == b"/dev/ptmx" {
+        } else if let Some(inst) = ptmx_inst(lookup_path) {
             // Every open of the multiplexor is a *new* pair, not a new handle
             // on a shared object — that is the whole ptmx contract, and what
-            // TIOCGPTN then reports.
-            match tty_server::pty::alloc() {
+            // TIOCGPTN then reports. A devpts instance's ptmx allocates in
+            // that instance's number space.
+            if inst != 0 && !xattr::may_access(&ptmx_meta(inst), &cred_of(pid), None, open_mask(flags)) {
+                return err_reply(-13); // EACCES
+            }
+            match tty_server::pty::alloc_in(inst) {
                 Some(pair) => { pts_meta_init(pair, pid); VnodeKind::Pty { pair: pair as u16, is_master: true } }
                 // ENOSPC, as Linux's devpts answers at its pty limit.
                 None => { report_pool_full("pty", tty_server::pty::MAX_PTYS); return err_reply(-28) }
@@ -8477,7 +8541,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                         return devnode_open(pid, blk, rdev, flags, mode);
                     }
                     // Linux `handle_truncate`: any O_TRUNC open strips set-ID bits.
-                    if trunc && !tmp[idx].is_link { tmp_kill_setid(&mut tmp, idx, cred.euid); }
+                    if trunc && !tmp[idx].is_link { tmp_kill_setid(&mut tmp, idx, &cred); }
                     if trunc && tmp[idx].len != 0 && !tmp[idx].is_link {
                         let mut vmos = TMP_VMOS.lock();
                         // Mapped: its mappings lose every page once the locks
@@ -8502,6 +8566,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                         Some(p) => if let Err(e) = tmp_dir_may(&tmp, p, &cred,
                                                                xattr::MAY_WRITE | xattr::MAY_EXEC) {
                             return err_reply(e);
+                        } else if !cred.owner_mapped() {
+                            return err_reply(-75); // EOVERFLOW (fsuidgid_has_mapping)
                         },
                         None => return err_reply(-2), // ENOENT
                     }
@@ -9663,11 +9729,11 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
             }
             // Looked up before TMP_FILES is retaken, and only for a file
             // that has a set-ID bit to lose.
-            let fsuid = if setid { sched::fsuid_of(pid) } else { 0 };
+            let kcred = if setid { cred_of(pid) } else { xattr::Cred::ROOT };
             // RLIMIT_FSIZE (RUN_QUEUE: before the tmpfs locks).
             let fsize = sched::rlimit_of(pid, sched::task::RLIMIT_FSIZE);
             let mut tmp = TMP_FILES.lock();
-            if setid { tmp_kill_setid(&mut tmp, idx, fsuid); }
+            if setid { tmp_kill_setid(&mut tmp, idx, &kcred); }
             let mut vmos = TMP_VMOS.lock();
             // The starting offset is read under TMP_FILES and the shared one
             // advanced before it is released, so writers sharing a description
@@ -11388,12 +11454,12 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     // Live pty slaves (/dev/pts). The pool is the only source of truth here —
     // there is no static table to walk — and `ls /dev/pts` is how a user (and
     // ttyname's fallback scan) finds which pairs exist.
-    if dir_path == b"/dev/pts" {
+    if let Some(dinst) = devpts::dir_inst(dir_path) {
         // Snapshot under the pool lock, then emit: write_dirent touches user
         // memory, which can demand-page, and a fault taken while holding a
         // server spinlock re-enters the scheduler (see the 82d0cc3 rule).
         let mut live = [false; tty_server::pty::MAX_PTYS];
-        tty_server::pty::each_allocated(|n| { if n < live.len() { live[n] = true; } });
+        tty_server::pty::each_in(dinst, |n| { if n < live.len() { live[n] = true; } });
         for (n, &alive) in live.iter().enumerate() {
             if !alive { continue; }
             if virtual_idx >= pos {
@@ -12601,13 +12667,13 @@ fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => {
             drop(tbls);
-            let fsuid = sched::fsuid_of(pid);
+            let kcred = cred_of(pid);
             let mapped = vmo_id_of(idx);
             let mut tmp = TMP_FILES.lock();
             let mut vmos = TMP_VMOS.lock();
             let r = tmp_set_size(&mut tmp, &mut vmos[..], idx, new_len);
             if r != 0 { return make_reply(r); }
-            tmp_kill_setid(&mut tmp, idx, fsuid);
+            tmp_kill_setid(&mut tmp, idx, &kcred);
             tmp_touch_mtime(&mut tmp[idx]);
             drop(vmos);
             drop(tmp);
@@ -12665,12 +12731,12 @@ fn handle_fallocate(pid: u32, fd: usize, mode: u32, offset: i64, len: i64) -> Me
     match kind {
         VnodeKind::TmpFile { writable, .. } => {
             let idx = tmp_idx_of(&kind);
-            let fsuid = sched::fsuid_of(pid);
+            let kcred = cred_of(pid);
             let mut tmp = TMP_FILES.lock();
             if tmp[idx].is_dir { return err_reply(-21); } // EISDIR
             if !writable { return err_reply(-9); }
             if end > MAX_TMP_FILE_SIZE { return err_reply(-27); } // EFBIG
-            tmp_kill_setid(&mut tmp, idx, fsuid); // Linux file_modified
+            tmp_kill_setid(&mut tmp, idx, &kcred); // Linux file_modified
             let mut vmos = TMP_VMOS.lock();
             let len = tmp[idx].len;
             let vmo = vmos[idx].get_or_insert_with(|| { let mut v = TmpVmo::new_owned(false); v.len = len; v });
@@ -12861,7 +12927,7 @@ fn tmpfs_rename(pid: u32, old: &[u8], new: &[u8], flags: usize) -> Message {
     // implicit removal of an existing target.
     if let Some(didx) = tmp_find(&tmp, new) {
         if flags & RENAME_NOREPLACE != 0 { return err_reply(-17); } // EEXIST
-        if tmp_sticky_denies(&tmp, parent, didx, cred.euid) { return err_reply(-1); } // EPERM
+        if tmp_sticky_denies(&tmp, parent, didx, &cred) { return err_reply(-1); } // EPERM
         let dst_is_dir = tmp[didx].is_dir;
         if src_is_dir && !dst_is_dir { return err_reply(-20); }  // ENOTDIR
         if !src_is_dir && dst_is_dir { return err_reply(-21); }  // EISDIR
@@ -13354,7 +13420,7 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
             if let Err(e) = tmp_create_gate(&tmp, new, &cred) { return err_reply(e); }
             let owner = tmp_owner(&tmp, src);
             let may_rw = tmp_may(&tmp, src, &cred, xattr::MAY_READ | xattr::MAY_WRITE);
-            if xattr::hardlink_denied(&tmp_meta(&tmp[owner]), cred.euid, may_rw) {
+            if xattr::hardlink_denied_c(&tmp_meta(&tmp[owner]), &cred, may_rw) {
                 return err_reply(-1); // EPERM — protected_hardlinks
             }
             let idx = match tmp_free_slot(&mut *tmp) {
@@ -13452,19 +13518,21 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
     // find_mount_port() probe here matched every /tmp path and turned every
     // chmod under /tmp into EROFS.
     if let Some(path) = tmpfs_path(raw) {
-        let euid = sched::fsuid_of(pid);
+        let cred = cred_of(pid);
         // A tmpfs mount root is root-owned with a fixed mode: anyone else is
         // EPERM (not the owner), and root may only "set" the mode it has.
+        // HOST root only (design idmap 2.3): never a namespace root.
         if is_tmpfs_root(path) {
             let cur = ramfs_dir_mode(path) & 0o7777;
-            return if euid == 0 && mode & 0o7777 == cur { ok_reply() } else { err_reply(-1) };
+            return if cred.host_root && mode & 0o7777 == cur { ok_reply() } else { err_reply(-1) };
         }
         let mut tmp = TMP_FILES.lock();
         return match tmp_find(&tmp, path) {
             Some(idx) => {
                 let owner = tmp_owner(&tmp, idx);
-                if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
-                let mode = xattr::chmod_filter_mode(&cred_of(pid), tmp[owner].gid, mode);
+                let om = tmp_meta(&tmp[owner]);
+                if cred.euid != om.uid && !cred.cap_inode(xattr::CAP_FOWNER, om.uid, om.gid) { return err_reply(-1); } // EPERM
+                let mode = xattr::chmod_filter_mode_c(&cred, &om, mode);
                 tmp[owner].mode = mode & 0o7777;
                 tmp_acl_chmod_sync(&mut tmp, owner, mode);
                 tmp_touch_ctime(&mut tmp[owner]);
@@ -13495,11 +13563,12 @@ fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => {
             drop(tbls);
-            let euid = sched::fsuid_of(pid);
+            let cred = cred_of(pid);
             let mut tmp = TMP_FILES.lock();
             let owner = tmp_owner(&tmp, idx);
-            if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
-            let mode = xattr::chmod_filter_mode(&cred_of(pid), tmp[owner].gid, mode);
+            let om = tmp_meta(&tmp[owner]);
+            if cred.euid != om.uid && !cred.cap_inode(xattr::CAP_FOWNER, om.uid, om.gid) { return err_reply(-1); } // EPERM
+            let mode = xattr::chmod_filter_mode_c(&cred, &om, mode);
             tmp[owner].mode = mode & 0o7777;
             tmp_acl_chmod_sync(&mut tmp, owner, mode);
             tmp_touch_ctime(&mut tmp[owner]);
@@ -13536,7 +13605,7 @@ fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32, follow: bool) -> 
         // Mount roots: root:root and fixed (see handle_chmod).
         if is_tmpfs_root(path) {
             let same = (uid == u32::MAX || uid == 0) && (gid == u32::MAX || gid == 0);
-            return if cred.euid == 0 && same { ok_reply() } else { err_reply(-1) };
+            return if cred.host_root && same { ok_reply() } else { err_reply(-1) }; // host root only
         }
         let mut tmp = TMP_FILES.lock();
         return match tmp_find(&tmp, path) {
@@ -13591,10 +13660,13 @@ fn handle_fchown(pid: u32, fd: usize, uid: u32, gid: u32) -> Message {
 /// change the gid only to a group it belongs to, which with no supplementary
 /// groups means its egid; anyone else is EPERM. All-or-nothing.
 fn apply_chown(e: &mut TmpFileEntry, cred: &xattr::Cred, uid: u32, gid: u32) -> Message {
-    if cred.euid != 0 {
+    // Linux chown_ok/chgrp_ok: CAP_CHOWN over the inode (held in the caller's
+    // user namespace, owner and group of the inode mapped there), else the
+    // owner restating its uid and moving the group to one of its own.
+    if !cred.cap_inode(xattr::CAP_CHOWN, e.uid, e.gid) {
         if cred.euid != e.uid { return err_reply(-1); }                // EPERM
         if uid != u32::MAX && uid != e.uid { return err_reply(-1); }
-        if gid != u32::MAX && !cred.in_group(gid) { return err_reply(-1); }
+        if gid != u32::MAX && gid != e.gid && !cred.in_group(gid) { return err_reply(-1); }
     }
     if uid != u32::MAX { e.uid = uid; }
     if gid != u32::MAX { e.gid = gid; }
@@ -13608,7 +13680,7 @@ fn apply_chown(e: &mut TmpFileEntry, cred: &xattr::Cred, uid: u32, gid: u32) -> 
 /// needs ownership or root (EPERM); "now" needs ownership, root, or write
 /// permission on the inode (EACCES). Returns the errno to reply with, or 0.
 fn utimens_permission(meta: &xattr::FileMeta, acl: Option<&[u8]>, cred: &xattr::Cred, explicit: bool) -> i32 {
-    if cred.euid == 0 || cred.euid == meta.uid { return 0; }
+    if cred.euid == meta.uid || cred.cap_inode(xattr::CAP_FOWNER, meta.uid, meta.gid) { return 0; }
     if explicit { return -1; } // EPERM
     if xattr::may_access(meta, cred, acl, xattr::MAY_WRITE) { 0 } else { -13 } // EACCES
 }
@@ -13631,8 +13703,8 @@ fn handle_utimens(pid: u32, msg: &Message, follow: bool) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
     if let Some(path) = tmpfs_path(raw) {
-        if is_tmpfs_root(path) { return if sched::fsuid_of(pid) == 0 { ok_reply() } else { err_reply(-1) }; }
         let cred = cred_of(pid);
+        if is_tmpfs_root(path) { return if cred.host_root { ok_reply() } else { err_reply(-1) }; } // host root only
         let mut tmp = TMP_FILES.lock();
         let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
         let owner = tmp_owner(&tmp, idx);
@@ -13726,9 +13798,9 @@ fn tmp_has_setid(tmp: &[TmpFileEntry], idx: usize) -> bool {
 /// Strip the set-ID bits of tmpfs file `idx` as a write, truncate or O_TRUNC
 /// open by `fsuid` requires (`xattr::setid_kill_bits`, Linux
 /// `file_remove_privs`).
-fn tmp_kill_setid(tmp: &mut [TmpFileEntry], idx: usize, fsuid: u32) {
+fn tmp_kill_setid(tmp: &mut [TmpFileEntry], idx: usize, cred: &xattr::Cred) {
     let o = tmp_owner(tmp, idx);
-    let kill = xattr::setid_kill_bits(tmp_meta(&tmp[o]).mode, fsuid);
+    let kill = xattr::setid_kill_bits_c(&tmp_meta(&tmp[o]), cred);
     if kill != 0 {
         tmp[o].mode &= !(kill as u32);
         tmp_touch_ctime(&mut tmp[o]);
@@ -13747,7 +13819,33 @@ pub fn cred_of(pid: u32) -> xattr::Cred {
     let (fsuid, fsgid) = sched::fsids_of(pid);
     let mut c = xattr::Cred::new(fsuid, fsgid);
     c.ngroups = sched::groups_of(pid, &mut c.groups) as u8;
-    c
+    cred_with_ns(c, pid, false)
+}
+
+/// Effective uid 0 in the INITIAL user namespace: the "host root only" gates
+/// (trusted.*, device and sysclass nodes, tmpfs mount roots). A namespace
+/// root (kuid != 0) and a kuid-0 task that left namespace 0 are both false.
+fn host_root_of(pid: u32) -> bool {
+    sched::euid_of(pid) == 0 && sched::ns::userns_of(pid) == 0
+}
+
+/// Attach the caller's user-namespace view and effective capabilities to
+/// `c`. Namespace 0 (every task today without a userns) keeps the identity
+/// view, so `host_root` is exactly the old `euid == 0`. `real` = the
+/// `access(2)` flavour: the capabilities follow the REAL uid (Linux
+/// `access_override_creds`): effective if real == effective uid, else the
+/// permitted set when the real uid is the namespace root, else none.
+fn cred_with_ns(c: xattr::Cred, pid: u32, real: bool) -> xattr::Cred {
+    let ns = sched::ns::userns_of(pid);
+    if ns == 0 { return c; }
+    let sv = sched::ns::view_of_ns(ns);
+    let v = xattr::IdView { ns: sv.ns, n: sv.n, ext: sv.ext };
+    let caps = match sched::caps::caps_of(pid) {
+        Some(cs) if !real || sched::euid_of(pid) == c.euid => cs[0],
+        Some(cs) if sched::ns::root_k(ns) == Some(c.euid) => cs[1],
+        _ => 0,
+    };
+    c.with_ns(v, caps)
 }
 
 /// The caller's credentials built from the REAL uid/gid rather than the
@@ -13758,7 +13856,7 @@ pub fn cred_of(pid: u32) -> xattr::Cred {
 pub fn real_cred_of(pid: u32) -> xattr::Cred {
     let mut c = xattr::Cred::new(sched::ruid_of(pid), sched::rgid_of(pid));
     c.ngroups = sched::groups_of(pid, &mut c.groups) as u8;
-    c
+    cred_with_ns(c, pid, true)
 }
 
 /// Stamp all three timestamps with "now" — a freshly created entry.
@@ -13929,13 +14027,14 @@ fn tmp_getxattr_local(tmp: &TmpPool, owner: usize, cred: &xattr::Cred,
     val_reply(len as u64)
 }
 
-fn tmp_listxattr_local(tmp: &TmpPool, owner: usize, euid: u32, list_ptr: usize, size: usize) -> Message {
+fn tmp_listxattr_local(tmp: &TmpPool, owner: usize, host_root: bool, list_ptr: usize, size: usize) -> Message {
     let xa = tmp.xattr(owner);
     // O(1) fast path — the `ls -l` stat storm hits this on every entry.
     if xattr::is_empty(&xa[..]) { return val_reply(0); }
     let out: &mut [u8] = if size == 0 { &mut [] }
                          else { unsafe { core::slice::from_raw_parts_mut(list_ptr as *mut u8, size) } };
-    match xattr::list(&xa[..], out, euid == 0) {
+    // trusted.* is host root only
+    match xattr::list(&xa[..], out, host_root) {
         Ok(n) => val_reply(n as u64), Err(er) => err_reply(-er),
     }
 }
@@ -13999,7 +14098,7 @@ fn handle_listxattr(pid: u32, tag: u64, path_ptr: usize, list_ptr: usize, size: 
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
     if let Some(path) = tmpfs_path(raw) {
-        let euid = sched::euid_of(pid);
+        let euid = host_root_of(pid);
         let tmp = TMP_FILES.lock();
         let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
         let owner = tmp_owner(&tmp, idx);
@@ -14220,7 +14319,7 @@ fn handle_flistxattr(pid: u32, fd: usize, list_ptr: usize, size: usize) -> Messa
     };
     match kind {
         VnodeKind::TmpFile { idx, .. } => {
-            let euid = sched::euid_of(pid);
+            let euid = host_root_of(pid);
             let tmp = TMP_FILES.lock();
             let owner = tmp_owner(&tmp, idx);
             tmp_listxattr_local(&tmp, owner, euid, list_ptr, size)
@@ -14891,7 +14990,7 @@ fn char_dev_rdev(kind: &VnodeKind) -> u64 {
     match *kind {
         VnodeKind::Pty { is_master: true, .. } => makedev(5, 2),
         VnodeKind::Pty { pair, .. } => match tty_server::pty::vt_of(pair as usize) {
-            0 => pts_rdev(pair as u32),
+            0 => pts_rdev(tty_server::pty::ident(pair as usize).1 as u32),
             n => makedev(4, n as u32),
         },
         VnodeKind::DevStdio { .. } => makedev(5, 1),
@@ -14921,7 +15020,7 @@ fn dev_node_rdev(path: &[u8]) -> u64 {
         b"/dev/ptmx" => makedev(5, 2),
         b"/dev/fb0" => makedev(29, 0),
         _ => if let Some(vt) = vt_number(path) { makedev(4, vt as u32) }
-             else if let Some(n) = pts_number(path) { pts_rdev(n as u32) }
+             else if let Some(n) = pts_number(path) { pts_rdev(tty_server::pty::ident(n).1 as u32) }
              else { 0 },
     }
 }
@@ -15043,7 +15142,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
             // ttyname() treats as "this fd is not that path".
             if lookup_path == b"/dev/tty" {
                 if let Some(n) = tty_server::pty::ctty_for_sid(sched::current_sid()) {
-                    let rdev = match tty_server::pty::vt_of(n) { 0 => pts_rdev(n as u32), v => makedev(4, v as u32) };
+                    let rdev = match tty_server::pty::vt_of(n) { 0 => pts_rdev(tty_server::pty::ident(n).1 as u32), v => makedev(4, v as u32) };
                     write_stat_full_rdev(stat_ptr, 0o020620, 1, 0, pty_ino(n as u16, false), 0, 0, rdev);
                     return ok_reply();
                 }
@@ -15078,13 +15177,14 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
         // what fstat reports on the corresponding fd — see pty_ino. Answered
         // ahead of the RAMFS sweep, which would otherwise report /dev/ptmx as
         // a zero-byte S_IFREG and make ttyname() reject the fd.
-        if lookup_path == b"/dev/ptmx" {
-            write_stat_full_rdev(stat_ptr, 0o020666, 1, 0, pty_ino(0, true), 0, 0, makedev(5, 2));
+        if let Some(inst) = ptmx_inst(lookup_path) {
+            let m = ptmx_meta(inst);
+            write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, pty_ino(0, true), 0, 0, makedev(5, 2));
             return ok_reply();
         }
         if let Some(n) = pts_number(lookup_path) {
             let m = pts_meta(n);
-            write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, pty_ino(n as u16, false), m.uid, m.gid, pts_rdev(n as u32));
+            write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, pty_ino(n as u16, false), m.uid, m.gid, pts_rdev(tty_server::pty::ident(n).1 as u32));
             return ok_reply();
         }
         // Block device nodes. Must agree byte for byte with what `handle_fstat`
@@ -15277,7 +15377,7 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             // "anon_inode" placeholder.
             VnodeKind::Pty { is_master: true, .. } => FdInfo::Static(b"/dev/ptmx"),
             VnodeKind::Pty { pair, is_master: false } => match tty_server::pty::vt_of(*pair as usize) {
-                0 => FdInfo::PtsSlave(*pair),
+                0 => FdInfo::PtsSlave(tty_server::pty::ident(*pair as usize).1),
                 2 => FdInfo::Static(b"/dev/tty2"), 3 => FdInfo::Static(b"/dev/tty3"),
                 4 => FdInfo::Static(b"/dev/tty4"), 5 => FdInfo::Static(b"/dev/tty5"),
                 _ => FdInfo::Static(b"/dev/tty6"),

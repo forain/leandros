@@ -780,6 +780,7 @@ pub fn add(mountpoint: &[u8], source: &[u8], fstype: &'static str, device: &[u8]
     if under(source, mountpoint) { return Err(-22); }
     let mut t = ALIASES.lock();
     if let Some(a) = t.iter_mut().find(|a| a.mountpoint == mountpoint) {
+        if let Some(id) = crate::devpts::inst_of_backing(&a.source) { crate::devpts::destroy(id); }
         a.source = source.to_vec();
         a.fstype = fstype;
         a.device = device.to_vec();
@@ -796,8 +797,11 @@ pub fn add(mountpoint: &[u8], source: &[u8], fstype: &'static str, device: &[u8]
 pub fn remove(mountpoint: &[u8]) -> bool {
     let mut t = ALIASES.lock();
     let before = t.len();
+    let gone = t.iter().find(|a| a.mountpoint == mountpoint).and_then(|a| crate::devpts::inst_of_backing(&a.source));
     t.retain(|a| a.mountpoint != mountpoint);
     ACTIVE.store(t.len(), Ordering::Release);
+    // A devpts instance lives as long as its mount.
+    if let Some(id) = gone { crate::devpts::destroy(id); }
     t.len() != before
 }
 

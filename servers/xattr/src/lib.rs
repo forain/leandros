@@ -94,6 +94,39 @@ pub struct FileMeta {
 /// task struct).
 pub const NGROUPS_MAX: usize = 32;
 
+// Linux capability numbers the permission gates consult.
+pub const CAP_CHOWN: u32 = 0;
+pub const CAP_DAC_OVERRIDE: u32 = 1;
+pub const CAP_DAC_READ_SEARCH: u32 = 2;
+pub const CAP_FOWNER: u32 = 3;
+pub const CAP_FSETID: u32 = 4;
+
+/// Extents per id map (must equal `sched::ns::MAP_EXT`; `vfs::cred_of`
+/// copies the arrays, so a mismatch is a compile error there).
+pub const MAP_EXT: usize = 5;
+
+/// Snapshot of the caller's user-namespace id maps (dependency-free copy of
+/// `sched::ns::IdView`): `ext[kind]` holds `(upper_first, lower_kuid, count)`
+/// extents, kind 0 = uid, 1 = gid. `ns == 0` is the identity (host) view.
+#[derive(Clone, Copy)]
+pub struct IdView {
+    pub ns: u16,
+    pub n: [u8; 2],
+    pub ext: [[(u32, u32, u32); MAP_EXT]; 2],
+}
+
+impl IdView {
+    pub const HOST: IdView = IdView { ns: 0, n: [0; 2], ext: [[(0, 0, 0); MAP_EXT]; 2] };
+    /// Is kernel id `kid` of `kind` (0 = uid, 1 = gid) mapped in this namespace?
+    #[inline]
+    pub fn maps_k(&self, kind: usize, kid: u32) -> bool {
+        if self.ns == 0 { return true; }
+        if kid == u32::MAX { return false; }
+        let n = (self.n[kind] as usize).min(MAP_EXT);
+        self.ext[kind][..n].iter().any(|&(_, l, c)| kid >= l && kid - l < c)
+    }
+}
+
 /// The caller's identity as every permission gate sees it: effective uid,
 /// effective gid, and the supplementary group list. Group membership is
 /// `egid` OR any supplementary group — there is exactly one place that
@@ -105,6 +138,14 @@ pub struct Cred {
     pub egid: u32,
     pub ngroups: u8,
     pub groups: [u32; NGROUPS_MAX],
+    /// fsuid == 0 in the initial user namespace: exactly the old `euid == 0`.
+    /// The ONLY thing the host-only gates (trusted.*, security.*, mount roots,
+    /// devices) accept.
+    pub host_root: bool,
+    /// Effective capabilities; meaningful only when `view.ns != 0`.
+    pub caps: u64,
+    /// The caller's user-namespace id maps (kuid <-> ns id).
+    pub view: IdView,
 }
 
 /// chmod(2) by a caller that is neither root nor in the file's group drops
@@ -116,11 +157,48 @@ pub fn chmod_filter_mode(cred: &Cred, file_gid: u32, mode: u32) -> u32 {
     if cred.euid != 0 && !cred.in_group(file_gid) { mode & !S_ISGID } else { mode }
 }
 
+/// `chmod_filter_mode` with CAP_FSETID over the inode (`setattr_prepare`):
+/// the capability must be held in the caller's user namespace AND the
+/// inode's owner/group must be mapped there.
+pub fn chmod_filter_mode_c(cred: &Cred, meta: &FileMeta, mode: u32) -> u32 {
+    const S_ISGID: u32 = 0o2000;
+    if !cred.in_group(meta.gid) && !cred.cap_inode(CAP_FSETID, meta.uid, meta.gid) { mode & !S_ISGID } else { mode }
+}
+
 impl Cred {
     pub const fn new(euid: u32, egid: u32) -> Self {
-        Cred { euid, egid, ngroups: 0, groups: [0; NGROUPS_MAX] }
+        Cred { euid, egid, ngroups: 0, groups: [0; NGROUPS_MAX],
+               host_root: euid == 0, caps: 0, view: IdView::HOST }
     }
     pub const ROOT: Cred = Cred::new(0, 0);
+    /// Attach the caller's namespace view and effective caps. A fsuid-0 task
+    /// outside the initial user namespace is NOT host root.
+    pub fn with_ns(mut self, view: IdView, caps: u64) -> Self {
+        self.host_root = self.euid == 0 && view.ns == 0;
+        self.caps = caps;
+        self.view = view;
+        self
+    }
+    /// Linux `capable_wrt_inode_uidgid`: `cap` held in the caller's user
+    /// namespace AND the inode's uid and gid mapped in it. Host root passes
+    /// (identical to the old `euid == 0`). Never "euid 0 in any namespace".
+    #[inline]
+    pub fn cap_inode(&self, cap: u32, uid: u32, gid: u32) -> bool {
+        self.host_root
+            || (self.view.ns != 0 && cap < 64 && self.caps >> cap & 1 != 0
+                && self.view.maps_k(0, uid) && self.view.maps_k(1, gid))
+    }
+    /// Namespace-scoped capability not tied to an inode.
+    #[inline]
+    pub fn cap_any(&self, cap: u32) -> bool {
+        self.host_root || (self.view.ns != 0 && cap < 64 && self.caps >> cap & 1 != 0)
+    }
+    /// Linux `fsuidgid_has_mapping`: false when the caller's fsuid or fsgid
+    /// is unmapped in its own namespace (creating a file would be EOVERFLOW).
+    #[inline]
+    pub fn owner_mapped(&self) -> bool {
+        self.view.maps_k(0, self.euid) && self.view.maps_k(1, self.egid)
+    }
     #[inline]
     pub fn in_group(&self, gid: u32) -> bool {
         if self.egid == gid { return true; }
@@ -353,7 +431,7 @@ pub fn may_read_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>)
         IDX_ACL_ACCESS | IDX_ACL_DEFAULT => Ok(()),
         IDX_SECURITY => Ok(()), // readable by all, on any inode type
         IDX_TRUSTED => {
-            if cred.euid == 0 {
+            if cred.host_root { // Linux: CAP_SYS_ADMIN in the init ns
                 Ok(())
             } else {
                 Err(ENODATA)
@@ -368,7 +446,9 @@ pub fn may_write_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>
     if idx == IDX_SECURITY {
         // security.* (incl. security.capability, CAP_SETFCAP): root only,
         // allowed on every inode type (labels on symlinks are legal).
-        return if cred.euid == 0 { Ok(()) } else { Err(EPERM) };
+        // host only: security.capability needs SETFCAP over the inode, which
+        // is EPERM outside the initial namespace (design idmap 2.8).
+        return if cred.host_root { Ok(()) } else { Err(EPERM) };
     }
     if is_lnk(meta.mode) {
         return Err(EPERM); // no user.* and no ACLs on symlinks
@@ -378,7 +458,7 @@ pub fn may_write_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>
             if !is_reg(meta.mode) && !is_dir(meta.mode) {
                 return Err(EPERM);
             }
-            if is_dir(meta.mode) && meta.mode & S_ISVTX != 0 && cred.euid != meta.uid && cred.euid != 0 {
+            if is_dir(meta.mode) && meta.mode & S_ISVTX != 0 && cred.euid != meta.uid && !cred.cap_inode(CAP_FOWNER, meta.uid, meta.gid) {
                 return Err(EPERM);
             }
             if access_check(meta, cred, acl, false, true, false) {
@@ -388,7 +468,7 @@ pub fn may_write_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>
             }
         }
         IDX_ACL_ACCESS | IDX_ACL_DEFAULT => {
-            if cred.euid != meta.uid && cred.euid != 0 {
+            if cred.euid != meta.uid && !cred.cap_inode(CAP_FOWNER, meta.uid, meta.gid) {
                 return Err(EPERM);
             }
             if idx == IDX_ACL_DEFAULT && !is_dir(meta.mode) {
@@ -397,7 +477,7 @@ pub fn may_write_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>
             Ok(())
         }
         IDX_TRUSTED => {
-            if cred.euid == 0 {
+            if cred.host_root {
                 Ok(())
             } else {
                 Err(EPERM)
@@ -583,6 +663,15 @@ pub fn sticky_denies(dir: &FileMeta, victim_uid: u32, euid: u32) -> bool {
     dir.mode & S_ISVTX != 0 && euid != 0 && euid != victim_uid && euid != dir.uid
 }
 
+/// `sticky_denies` for a namespace-aware caller (Linux `check_sticky`): the
+/// owner of the entry (`victim`), the owner of the directory, or CAP_FOWNER
+/// over the victim inode in the caller's user namespace.
+#[inline]
+pub fn sticky_denies_c(dir: &FileMeta, victim: &FileMeta, cred: &Cred) -> bool {
+    dir.mode & S_ISVTX != 0 && cred.euid != victim.uid && cred.euid != dir.uid
+        && !cred.cap_inode(CAP_FOWNER, victim.uid, victim.gid)
+}
+
 /// The set-ID bits a write, truncate or O_TRUNC open by `fsuid` must strip
 /// from a file of mode `mode` (Linux `file_remove_privs` /
 /// `should_remove_suid`): S_ISUID always, S_ISGID only with group execute
@@ -601,6 +690,14 @@ pub fn setid_kill_bits(mode: u16, fsuid: u32) -> u16 {
     kill
 }
 
+/// `setid_kill_bits` with CAP_FSETID over the inode in the caller's user
+/// namespace (a mapped owner is required; host root passes as before).
+#[inline]
+pub fn setid_kill_bits_c(meta: &FileMeta, cred: &Cred) -> u16 {
+    if cred.cap_inode(CAP_FSETID, meta.uid, meta.gid) { return 0; }
+    setid_kill_bits(meta.mode, u32::MAX)
+}
+
 /// fs.protected_hardlinks (Linux `may_linkat`, on by default on every major
 /// distribution): a caller that does not own the source may hard-link it only
 /// if it is a regular file, not set-uid, not set-gid-and-group-executable,
@@ -615,6 +712,13 @@ pub fn hardlink_denied(src: &FileMeta, euid: u32, may_rw: bool) -> bool {
     if src.mode & S_ISUID != 0 { return true; }
     if src.mode & (S_ISGID | S_IXGRP) == (S_ISGID | S_IXGRP) { return true; }
     !may_rw
+}
+
+/// `hardlink_denied` with CAP_FOWNER over the source inode (Linux `may_linkat`
+/// exempts the owner and `capable_wrt_inode_uidgid(CAP_FOWNER)`).
+pub fn hardlink_denied_c(src: &FileMeta, cred: &Cred, may_rw: bool) -> bool {
+    if cred.euid == src.uid || cred.cap_inode(CAP_FOWNER, src.uid, src.gid) { return false; }
+    hardlink_denied(src, u32::MAX, may_rw)
 }
 
 /// Unified permission check for open/faccessat: POSIX 1003.1e ACL walk when
@@ -634,11 +738,23 @@ pub fn access_check(
 ) -> bool {
     let want: u16 = (want_r as u16) << 2 | (want_w as u16) << 1 | want_x as u16;
     let euid = cred.euid;
-    if euid == 0 {
+    if cred.host_root {
         if want_x && !is_dir(meta.mode) {
             return meta.mode & 0o111 != 0;
         }
         return true;
+    }
+    if cred.view.ns != 0 {
+        // Linux generic_permission, capabilities taken in the caller's user
+        // namespace over an inode whose uid AND gid are mapped there.
+        let ovr = cred.cap_inode(CAP_DAC_OVERRIDE, meta.uid, meta.gid);
+        let rs = |c: &Cred| c.cap_inode(CAP_DAC_READ_SEARCH, meta.uid, meta.gid);
+        if is_dir(meta.mode) {
+            if ovr || (!want_w && rs(cred)) { return true; }
+        } else {
+            if ovr && (!want_x || meta.mode & 0o111 != 0) { return true; }
+            if want_r && !want_w && !want_x && rs(cred) { return true; }
+        }
     }
     if let Some(bytes) = acl {
         if acl_validate(bytes).is_ok() {

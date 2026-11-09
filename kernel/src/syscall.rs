@@ -664,6 +664,7 @@ mod nr {
     pub const SCHED_YIELD:    usize = 124;
     pub const CLONE:          usize = 220;
     pub const EXECVE:         usize = 221;
+    pub const EXECVEAT:       usize = 281;
     pub const EXIT:           usize = 93;
     pub const WAIT4:          usize = 260;
     pub const KILL:           usize = 129;
@@ -929,6 +930,7 @@ mod nr {
     pub const FORK:           usize = 57;
     pub const VFORK:          usize = 58;
     pub const EXECVE:         usize = 59;
+    pub const EXECVEAT:       usize = 322;
     pub const EXIT:           usize = 60;
     pub const WAIT4:          usize = 61;
     pub const KILL:           usize = 62;
@@ -2171,6 +2173,7 @@ fn dispatch_inner(
             }
             res
         }
+        EXECVEAT => sys_execveat(a0, a1, a2, a3, a4),
         CLONE   => sys_clone_or_fork(a0, a1, a2, a3, a4, frame_ptr),
         CLONE3  => sys_clone3(a0, a1, frame_ptr),
         #[cfg(not(target_arch = "aarch64"))]
@@ -2276,16 +2279,23 @@ fn dispatch_inner(
         // number as GETPGID on AArch64, so only emit this arm on x86-64.
         #[cfg(target_arch = "x86_64")]
         GETPGRP     => sched::pidns::out(sched::current_pgid()) as isize,
-        SETUID => if !sched::ns::ids_mapped(0, &[a0 as u32]) { -22 } else if sched::set_current_uid(a0 as u32) { 0 } else { -1 }, // EPERM
-        SETGID => if !sched::ns::ids_mapped(1, &[a0 as u32]) { -22 } else if sched::set_current_gid(a0 as u32) { 0 } else { -1 }, // EPERM
-        SETRESUID => if !sched::ns::ids_mapped(0, &[a0 as u32, a1 as u32, a2 as u32]) { -22 } else if sched::set_current_resuid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
-        SETRESGID => if !sched::ns::ids_mapped(1, &[a0 as u32, a1 as u32, a2 as u32]) { -22 } else if sched::set_current_resgid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
+        SETUID => match sched::ns::arg_id(0, a0 as u32) { None => -22, Some(u) => if sched::set_current_uid(u) { 0 } else { -1 } }, // EPERM
+        SETGID => match sched::ns::arg_id(1, a0 as u32) { None => -22, Some(g) => if sched::set_current_gid(g) { 0 } else { -1 } }, // EPERM
+        SETRESUID => match (sched::ns::arg_id(0, a0 as u32), sched::ns::arg_id(0, a1 as u32), sched::ns::arg_id(0, a2 as u32)) {
+            (Some(r), Some(e), Some(s)) => if sched::set_current_resuid(r, e, s) { 0 } else { -1 }, // EPERM
+            _ => -22,
+        },
+        SETRESGID => match (sched::ns::arg_id(1, a0 as u32), sched::ns::arg_id(1, a1 as u32), sched::ns::arg_id(1, a2 as u32)) {
+            (Some(r), Some(e), Some(s)) => if sched::set_current_resgid(r, e, s) { 0 } else { -1 }, // EPERM
+            _ => -22,
+        },
         SETGROUPS => sys_setgroups(a0, a1),
         // Both answer the previous filesystem id, changed or not (Linux).
-        SETFSUID => sched::set_current_fsid(a0 as u32, false) as isize,
-        SETFSGID => sched::set_current_fsid(a0 as u32, true) as isize,
-        SETREUID  => if !sched::ns::ids_mapped(0, &[a0 as u32, a1 as u32]) { -22 } else { sched::cred::set_re_ids(a0 as u32, a1 as u32, false) },
-        SETREGID  => if !sched::ns::ids_mapped(1, &[a0 as u32, a1 as u32]) { -22 } else { sched::cred::set_re_ids(a0 as u32, a1 as u32, true) },
+        // The argument is a namespace id (translated in); the answer is the old id as the caller sees it.
+        SETFSUID => match sched::ns::arg_id(0, a0 as u32) { Some(u) => sched::ns::view_id(0, sched::set_current_fsid(u, false)) as isize, None => sched::ns::view_id(0, sched::set_current_fsid(u32::MAX, false)) as isize },
+        SETFSGID => match sched::ns::arg_id(1, a0 as u32) { Some(g) => sched::ns::view_id(1, sched::set_current_fsid(g, true)) as isize, None => sched::ns::view_id(1, sched::set_current_fsid(u32::MAX, true)) as isize },
+        SETREUID  => match (sched::ns::arg_id(0, a0 as u32), sched::ns::arg_id(0, a1 as u32)) { (Some(r), Some(e)) => sched::cred::set_re_ids(r, e, false), _ => -22 },
+        SETREGID  => match (sched::ns::arg_id(1, a0 as u32), sched::ns::arg_id(1, a1 as u32)) { (Some(r), Some(e)) => sched::cred::set_re_ids(r, e, true), _ => -22 },
         GETRESUID   => sys_getresxid(a0, a1, a2, false),
         GETRESGID   => sys_getresxid(a0, a1, a2, true),
         GETGROUPS   => sys_getgroups(a0, a1),
@@ -6422,15 +6432,48 @@ fn jail_relative(p: &[u8]) -> alloc::vec::Vec<u8> {
 }
 
 fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
-    let pid = current_pid();
-
     // Resolve against the cwd through the shared helper, so `./prog` and
     // `prog` name the same file execve sees as every other path syscall.
-    let mut kpath = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
+    let kpath = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
     // execve follows a final /proc magic link like open does:
     // `execv("/proc/self/exe")` re-runs the binary itself (and fd/N of a
     // mounted file runs that file) instead of failing on the link.
-    kpath = match follow_magic_final(kpath) { Ok(p) => p, Err(e) => return e };
+    let kpath = match follow_magic_final(kpath) { Ok(p) => p, Err(e) => return e };
+    sys_execve_kp(kpath, argv_ptr, envp_ptr, false)
+}
+
+/// execveat(dirfd, path, argv, envp, flags). The path is resolved to a
+/// KPath here and then runs the exact execve path (creds, setid, NNP,
+/// seccomp, cloexec sweep), so nothing is duplicated.
+fn sys_execveat(dirfd: usize, path_ptr: usize, argv_ptr: usize, envp_ptr: usize, flags: usize) -> isize {
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 { return -22; }
+    let dirfd = dirfd as u32 as i32 as isize as usize;
+    let empty = path_ptr != 0 && validate_user_buf(path_ptr, 1) && ur::<u8>(path_ptr) == 0;
+    if flags & AT_EMPTY_PATH != 0 && empty {
+        // fexecve: run the file `dirfd` names (it may be O_PATH).
+        const F_GETFD: usize = 1;
+        let cloexec = sys_fcntl(fd_handle(dirfd), F_GETFD, 0);
+        if cloexec < 0 { return -9; } // EBADF
+        let host = match fd_host_path(dirfd) { Some(h) => h, None => return -9 };
+        let kp = KPath::raw(&host);
+        return sys_execve_kp(kp, argv_ptr, envp_ptr, cloexec & 1 != 0);
+    }
+    let kp = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        // The final component must not be a symlink: Linux gives ELOOP.
+        if ns_readlink(kp.ns_bytes()).is_ok() { return -40; }
+        return sys_execve_kp(kp, argv_ptr, envp_ptr, false);
+    }
+    let kp = match follow_magic_final(kp) { Ok(p) => p, Err(e) => return e };
+    sys_execve_kp(kp, argv_ptr, envp_ptr, false)
+}
+
+/// `fd_cloexec`: the file came from a close-on-exec fd (fexecve); a `#!`
+/// script would then name an fd that is closed by the time the interpreter
+/// opens /dev/fd/N, which Linux reports as ENOENT.
+fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: bool) -> isize {
+    let pid = current_pid();
+
     // MS_NOEXEC (Linux `path_noexec`): the file named, script or binary.
     if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
 
@@ -6455,6 +6498,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
             None => break, // unreadable: the ELF path below reports it
         };
         if head.len() < 2 || &head[..2] != b"#!" { break; }
+        if fd_cloexec && depth == 0 { return -2; } // ENOENT, as Linux
         if depth >= SHEBANG_MAX_DEPTH { return -40; } // ELOOP
         let perm = exec_permitted(&kpath, pid);
         if perm != 0 { return perm; }
@@ -9211,12 +9255,21 @@ fn fstat_into(fd: usize, statbuf_ptr: usize, user_dest: bool) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
+/// Linux `may_mount`: the caller needs CAP_SYS_ADMIN in the user namespace
+/// that owns its CURRENT mount namespace. The initial mount namespace (0) is
+/// owned by the initial user namespace, so that is host root only.
+fn may_mount() -> bool {
+    let mntns = sched::current_mntns();
+    if mntns == 0 { return sched::host_root(); }
+    sched::caps::ns_capable_in(sched::ns::owner_user(mntns), 21)
+}
+
 fn sys_mount(
     source_ptr: usize,
     target_ptr: usize,
     fstype_ptr: usize,
     flags: usize,
-    _data_ptr: usize,
+    data_ptr: usize,
 ) -> isize {
     // mount(2) MS_REMOUNT: change the flags of an existing mount; source and
     // fstype are ignored (and may be NULL, as `mount -o remount,ro /` passes
@@ -9231,7 +9284,15 @@ fn sys_mount(
     let mns = sched::current_mntns();
     if mns != 0 { return sys_mount_ns(mns, source_ptr, target_ptr, fstype_ptr, flags); }
     // Every form of mount(2) needs CAP_SYS_ADMIN (Linux `may_mount`).
-    if !sched::host_root() { return -1; } // EPERM
+    // A devpts mount is also allowed to a task holding CAP_SYS_ADMIN in its
+    // own user namespace (a container's runtime mounts its /dev/pts there).
+    let devpts_mount = flags & (MS_REMOUNT | 4096) == 0 && fstype_ptr != 0
+        && read_user_short_str(fstype_ptr).map_or(false, |v| v.as_slice() == b"devpts");
+    // Linux `may_mount`: CAP_SYS_ADMIN in the user namespace that OWNS the
+    // caller's mount namespace. Non-host-root callers are only ever allowed
+    // devpts (other types stay host-root until their userns story exists).
+    if !may_mount() { return -1; } // EPERM
+    if !sched::host_root() && !devpts_mount { return -1; } // EPERM
     // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC):
     // only the mount's propagation state changes; source/fstype are ignored.
     if flags & (vfs::mnt::MS_UNBINDABLE | vfs::mnt::MS_PRIVATE | vfs::mnt::MS_SLAVE | vfs::mnt::MS_SHARED) != 0 {
@@ -9315,9 +9376,19 @@ fn sys_mount(
         } else {
             fstype.as_bytes().to_vec()
         };
+        // Each devpts mount is a new instance with its own pty numbers.
+        let src = if fstype == "devpts" && flags & MS_BIND == 0 {
+            let opts = if data_ptr == 0 { Vec::new() } else {
+                match read_user_short_str(data_ptr) { Ok(v) => v, Err(e) => return e }
+            };
+            match vfs::devpts::create(&opts) { Ok(id) => vfs::devpts::backing(id), Err(e) => return e }
+        } else { src };
         return match vfs::alias::add(mp, &src, fstype, &device) {
             Ok(()) => { if fstype == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
-            Err(e) => e as isize,
+            Err(e) => {
+                if let Some(id) = vfs::devpts::inst_of_backing(&src) { vfs::devpts::destroy(id); }
+                e as isize
+            }
         };
     }
 
@@ -9339,6 +9410,9 @@ fn sys_mount(
     // nosuid/nodev/noexec flags (its contents stay). Elsewhere: EINVAL.
     if fstype_str == "tmpfs" {
         return if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { 0 } else { -22 };
+    }
+    if fstype_str == "fuse" || fstype_str.starts_with("fuse.") {
+        return sys_mount_fuse(source_str, target_path.bytes(), fstype_str, flags, data_ptr);
     }
     if fstype_str != "f2fs" {
         return -22; // EINVAL
@@ -9432,6 +9506,7 @@ fn sys_mount(
     }
 }
 
+<<<<<<< HEAD
 /// May the caller change the mount table of mount namespace `mns`?
 /// CAP_SYS_ADMIN over the user namespace that owns it.
 fn mnt_may_mount(mns: sched::ns::NsId) -> bool {
@@ -9516,6 +9591,39 @@ fn sys_umount2(target_ptr: usize, flags: usize) -> isize {
     let mns = sched::current_mntns();
     if mns != 0 { return sys_umount_ns(mns, target_ptr, flags); }
     if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
+=======
+/// mount(2) of a FUSE filesystem: `data` names the daemon's /dev/fuse fd.
+fn sys_mount_fuse(source: &str, target: &[u8], fstype: &str, flags: usize, data_ptr: usize) -> isize {
+    const MS_RDONLY: usize = 1;
+    const MS_NOSUID: usize = 2;
+    let data = if data_ptr == 0 { Vec::new() } else { match read_user_short_str(data_ptr) { Ok(v) => v, Err(e) => return e } };
+    let opts = match core::str::from_utf8(&data).ok().and_then(fuse_server::parse_opts) { Some(o) => o, None => return -22 };
+    let pid = current_pid();
+    let open_id = match vfs::vfs_get_node_kind(pid, opts.fd as usize) {
+        Some(vfs::VnodeKind::DynamicDevice { port, dev_id, open_id }) if fuse_server::is_fuse_device(port, dev_id) => open_id,
+        _ => return -9, // EBADF: not a /dev/fuse descriptor
+    };
+    let mut st = [0u8; STAT_SIZE];
+    let mut tk = target.to_vec();
+    tk.push(0);
+    let m = make_vfs_msg(vfs::VFS_STAT, &[tk.as_ptr() as u64, st.as_mut_ptr() as u64]);
+    let r = vfs_reply_val(&vfs::handle(&m, pid));
+    if r < 0 { return r; }
+    if vfs::read_stat_mode(st.as_ptr() as usize) & 0o170000 != 0o040000 { return -20; }
+    let prefix: &'static str = match core::str::from_utf8(target) {
+        Ok(s) => alloc::boxed::Box::leak(alloc::string::String::from(s.trim_end_matches('/')).into_boxed_str()),
+        Err(_) => return -22,
+    };
+    let source: &'static str = alloc::boxed::Box::leak(alloc::string::String::from(source).into_boxed_str());
+    let fst: &'static str = alloc::boxed::Box::leak(alloc::string::String::from(fstype).into_boxed_str());
+    let r = fuse_server::mount(open_id, prefix, source, fst, &opts, flags & MS_RDONLY != 0);
+    if r == 0 { vfs::set_mount_nosuid(prefix, flags & MS_NOSUID != 0); }
+    r
+}
+
+fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
+    if !may_mount() { return -1; } // EPERM (CAP_SYS_ADMIN over the mntns owner)
+>>>>>>> main
     let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
     // An alias mount (a chroot's /proc, a bind mount) is named by where the
     // caller sees it, i.e. its namespace path.
@@ -9525,6 +9633,11 @@ fn sys_umount2(target_ptr: usize, flags: usize) -> isize {
         Err(_) => return -22, // EINVAL
     };
 
+    if let Some(m) = vfs::list_mounts().iter().find(|e| e.in_use && e.prefix == target_str && e.fstype.starts_with("fuse")) {
+        let _ = m;
+        // MNT_FORCE (1) | MNT_DETACH (2)
+        return fuse_server::unmount(target_str, umount_flags & 3 != 0);
+    }
     if f2fs_server::unmount(target_str) {
         0
     } else {
@@ -9533,10 +9646,14 @@ fn sys_umount2(target_ptr: usize, flags: usize) -> isize {
 }
 
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
+<<<<<<< HEAD
     // The pivot rewrites the global (ns 0) mount table; inside a mount
     // namespace it would re-root the host. Per-namespace pivot is lane M4.
     if sched::current_mntns() != 0 { return -22; }
     if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
+=======
+    if !may_mount() { return -1; } // EPERM (CAP_SYS_ADMIN over the mntns owner)
+>>>>>>> main
     let pid = current_pid();
     let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
     let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };
@@ -10135,7 +10252,7 @@ fn sys_removexattr(target: usize, name: usize, is_fd: bool, nofollow: bool) -> i
 }
 
 fn sys_fchown(fd: usize, uid: usize, gid: usize) -> isize {
-    if !chown_ids_mapped(uid, gid) { return -22; } // EINVAL: unmapped in the caller's userns
+    let (uid, gid) = match chown_kids(uid, gid) { Some(v) => v, None => return -22 }; // EINVAL: unmapped in the caller's userns
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_FCHOWN, &[fd as u64, uid as u64, gid as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
@@ -10143,12 +10260,18 @@ fn sys_fchown(fd: usize, uid: usize, gid: usize) -> isize {
 
 /// chown family ids are taken in the caller's namespace view; an id with no
 /// mapping there is EINVAL (-1 = leave unchanged).
-fn chown_ids_mapped(uid: usize, gid: usize) -> bool {
-    sched::ns::ids_mapped(0, &[uid as u32]) && sched::ns::ids_mapped(1, &[gid as u32])
+/// Returns the kernel ids to hand on (usize::MAX-style -1 stays 0xFFFF_FFFF as given).
+fn chown_kids(uid: usize, gid: usize) -> Option<(usize, usize)> {
+    let u = sched::ns::arg_id(0, uid as u32)?;
+    let g = sched::ns::arg_id(1, gid as u32)?;
+    // Keep the caller's -1 encoding (usize::MAX when passed as -1 sign-extended).
+    let u = if u == u32::MAX { uid } else { u as usize };
+    let g = if g == u32::MAX { gid } else { g as usize };
+    Some((u, g))
 }
 
 fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, flags: usize) -> isize {
-    if !chown_ids_mapped(uid, gid) { return -22; }
+    let (uid, gid) = match chown_kids(uid, gid) { Some(v) => v, None => return -22 };
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
     let tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LCHOWN } else { vfs::VFS_CHOWN };
@@ -10171,6 +10294,10 @@ fn sys_setgroups(size: usize, list_ptr: usize) -> isize {
         let bytes = unsafe { core::slice::from_raw_parts_mut(groups.as_mut_ptr() as *mut u8, size * 4) };
         let ok = with_current_address_space(|as_| as_.read_user_buf(list_ptr, bytes)).unwrap_or(false);
         if !ok { return -14; }
+        // Groups arrive as namespace ids; the task stores kernel ids.
+        for g in groups[..size].iter_mut() {
+            match sched::ns::to_k(1, ns, *g) { Some(k) => *g = k, None => return -22 } // EINVAL: unmapped
+        }
     }
     if sched::set_current_groups(&groups[..size]) { 0 } else { -1 } // EPERM
 }
@@ -10185,6 +10312,8 @@ fn sys_getgroups(size: usize, list_ptr: usize) -> isize {
     if n > 0 {
         if !validate_user_buf(list_ptr, n * 4) { return -14; }
         prefault_user(list_ptr, n * 4);
+        // Kernel ids out, as the caller's namespace sees them.
+        for g in groups[..n].iter_mut() { *g = sched::ns::view_id(1, *g); }
         let bytes = unsafe { core::slice::from_raw_parts(groups.as_ptr() as *const u8, n * 4) };
         let ok = copy_to_user_bytes(list_ptr, bytes);
         if !ok { return -14; }

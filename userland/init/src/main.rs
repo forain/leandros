@@ -1616,7 +1616,7 @@ unsafe fn spawn_display_manager() -> (i32, i32) {
     }
     let argv: [*const u8; 3] = [DM_SHELL.as_ptr(), DM_LAUNCHER.as_ptr(), core::ptr::null()];
     let envp: [*const u8; 3] = [
-        b"PATH=/usr/bin:/bin\0".as_ptr(),
+        b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0".as_ptr(),
         b"HOME=/root\0".as_ptr(),
         core::ptr::null(),
     ];

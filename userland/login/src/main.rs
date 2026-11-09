@@ -354,7 +354,7 @@ unsafe fn do_login(rec: &UserRec) -> ! {
         build_env(&mut xdg_env, "XDG_RUNTIME_DIR", &val[..prefix.len() + n]);
     }
 
-    static PATH_ENV: &[u8] = b"PATH=/bin\0";
+    static PATH_ENV: &[u8] = b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0";
     static TERM_ENV: &[u8] = b"TERM=xterm-256color\0";
 
     let envp: [*const u8; 8] = [
