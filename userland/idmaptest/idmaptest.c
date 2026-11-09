@@ -96,6 +96,48 @@ static void proc_pid_owner(void)
     report("proc_pid_owner", ok);
 }
 
+/* ---- proc_owner_newuser: /proc/<child> of a fresh userns child ---------- */
+/* newuidmap fstats /proc/<pid> and wants st_uid == its real uid (1000) before
+ * the child's uid_map is written. */
+static int owner_newuser_body(void)
+{
+    int a[2], b[2];
+    if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) return 1;
+    pipe(a); pipe(b);
+    pid_t c = fork();
+    if (c == 0) {
+        char x = 0;
+        if (unshare(CLONE_NEWUSER)) { x = 'u'; write(b[1], &x, 1); _exit(1); }
+        write(b[1], &x, 1);
+        read(a[0], &x, 1);
+        _exit(0);
+    }
+    char x;
+    int rc = 0;
+    if (read(b[0], &x, 1) != 1 || x) rc = 2;
+    else {
+        char p[64]; struct stat st;
+        snprintf(p, sizeof p, "/proc/%d", c);
+        if (stat(p, &st) || st.st_uid != 1000 || st.st_gid != 1000) rc = 3;
+        int fd = open(p, O_RDONLY | O_DIRECTORY);
+        if (fd < 0 || fstat(fd, &st) || st.st_uid != 1000 || st.st_gid != 1000) rc = rc ? rc : 4;
+        int mfd = fd < 0 ? -1 : openat(fd, "uid_map", O_RDONLY);
+        if (mfd < 0 || fstat(mfd, &st) || st.st_uid != 1000) rc = rc ? rc : 5;
+        if (mfd >= 0) close(mfd);
+        if (fd >= 0) close(fd);
+    }
+    write(a[1], "x", 1);
+    waitpid(c, NULL, 0);
+    return rc;
+}
+static void proc_owner_newuser(void)
+{
+    pid_t m = fork();
+    if (m == 0) _exit(owner_newuser_body());
+    int st; waitpid(m, &st, 0);
+    report("proc_owner_newuser", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
 /* ---- status_groups_view ------------------------------------------------- */
 static void status_groups_view(void)
 {
@@ -1421,6 +1463,7 @@ int main(int argc, char **argv)
     }
     statx_matches_stat();
     proc_pid_owner();
+    proc_owner_newuser();
     status_groups_view();
     stat_unmapped_65534();
     sigchld_si_uid_view();
