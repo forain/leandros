@@ -1840,7 +1840,6 @@ static pid_t ns_spawn(unsigned long fl, int uid, int *hold_w)
         if (fl & CLONE_NEWNET) {
             int s = socket(AF_INET, SOCK_STREAM, 0);
             struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41500) };
-            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             if (s < 0 || bind(s, (void *)&a, sizeof a) || listen(s, 4)) _exit(3);
         }
         char b = 'r'; (void)!write(rdy[1], &b, 1);
@@ -1887,13 +1886,13 @@ static int t_setns_net(void)
     CHECK(c > 0);
     int fd = ns_open(c, "net");
     CHECK(fd >= 0);
-    struct sockaddr_in a = ns_lo();
+    struct sockaddr_in a = ns_lo(), w = { .sin_family = AF_INET, .sin_port = htons(41500) };
     int s = socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(bind(s, (void *)&a, sizeof a) == 0);   /* host namespace: port is free */
+    CHECK(bind(s, (void *)&w, sizeof w) == 0);   /* host namespace: port is free */
     close(s);
     CHECK(sys_setns(fd, CLONE_NEWNET) == 0);
     s = socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(bind(s, (void *)&a, sizeof a) == -1 && errno == EADDRINUSE);   /* the child's listener */
+    CHECK(bind(s, (void *)&w, sizeof w) == -1 && errno == EADDRINUSE);   /* the child's listener */
     close(s);
     int t = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(connect(t, (void *)&a, sizeof a) == 0);
