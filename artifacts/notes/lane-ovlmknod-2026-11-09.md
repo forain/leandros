@@ -18,3 +18,9 @@ registered in build-userland.sh, mkfs-f2fs-populated.py and runtests.py. ovlreal
 - Before the rename: 58 PASS / 0 FAIL on aarch64 (f2fs /home + tmpfs).
 - Box regress lane/ovlmknod 5a92973b after the main merge: aarch64 74 suites, 0 bad (939s); x86_64 74 suites, 0 bad (686s).
 - Box fsck.f2fs on the x86_64 guest image after the run: all [Ok].
+
+## Not done: Linux stat of kept device nodes
+Skipped (over the 6-call budget). `box/regress.sh ... /bin/ovlmknodtest keep` treats extra args as separate
+runtests commands (RC=127 for "keep"); quoting it as one command still gave "2 suites, 1 bad", cause not
+investigated. The image fsck.f2fs after the normal run is clean. Open: stat the kept nodes on Linux
+(sudo loop mount works on the box, passwordless) once runtests can pass the argument through.
