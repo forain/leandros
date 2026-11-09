@@ -1775,6 +1775,10 @@ pub enum VnodeKind {
     /// stable identity and close needs no teardown. POLLIN once the process
     /// has exited; see `sched::process_exit_state`.
     PidFd { pid: u32 },
+    /// An opened /proc/<pid>/ns/<name> (nsfs-like): `kind` indexes
+    /// `sched::ns::NS_NAMES`, `id` is the namespace, on which every copy of
+    /// the descriptor holds one reference (`pipe_ref_inc` / `pipe_ref_dec`).
+    NsFd { kind: u8, id: u16 },
 }
 
 // `VnodeKind` is embedded in `FdEntry`, one per open descriptor of every
@@ -2958,6 +2962,7 @@ fn pipe_ref_inc(kind: &VnodeKind) {
         // eventfd/timerfd slots are pooled and shared across dup'd fds; bump the
         // slot refcount so the pool entry survives until the last fd closes.
         VnodeKind::EventFd { slot } => { EVENTFD_REFS.lock()[*slot] += 1; }
+        VnodeKind::NsFd { id, .. } => sched::ns::hold_raw(*id),
         VnodeKind::Mq { slot } => { mqueue::ref_inc(*slot); }
         VnodeKind::TimerFd { slot } => { TIMERFD_REFS.lock()[*slot] += 1; }
         // A dynamic-device open is shared by every duplicate of its fd, so the
@@ -3025,6 +3030,7 @@ fn pipe_ref_dec(kind: &VnodeKind) {
                 EVENTFD_SEQ.lock()[*slot] = 0;
             }
         }
+        VnodeKind::NsFd { id, .. } => sched::ns::put_raw(*id),
         VnodeKind::TimerFd { slot } => {
             let mut refs = TIMERFD_REFS.lock();
             refs[*slot] = refs[*slot].saturating_sub(1);
@@ -7420,7 +7426,7 @@ fn open_proc_task(caller: u32, t: ProcTask, flags: u32) -> Result<VnodeKind, i32
         ProcTask::File { tgid, tid, name } => {
             if name == b"environ" && !proc_environ_allowed(caller, tid) { return Err(-13); }
             let n = proc_task_path(&mut p, tgid, Some(tid), name);
-            gen_proc_self(tid, &p[..n]).ok_or(-2)
+            gen_proc_self(caller, tid, &p[..n]).ok_or(-2)
         }
     }
 }
@@ -7594,14 +7600,14 @@ fn gen_proc_comm_writable(tid: u32) -> Option<VnodeKind> {
 
 /// Generate dynamic content for a /proc/self/<name> path.
 /// Allocates a TmpFile slot, writes the content, and returns the vnode.
-fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
+fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
     if path.ends_with(b"/uid_map") || path.ends_with(b"/gid_map") || path.ends_with(b"/setgroups") {
         let ns = sched::ns::userns_of(pid);
         let mut b = [0u8; 128];
         let n = if path.ends_with(b"/setgroups") {
             let t: &[u8] = if sched::ns::setgroups_denied(ns) { b"deny\n" } else { b"allow\n" };
             b[..t.len()].copy_from_slice(t); t.len()
-        } else { sched::ns::map_text(path.ends_with(b"/gid_map") as usize, ns, &mut b) };
+        } else { sched::ns::map_text_for(path.ends_with(b"/gid_map") as usize, ns, sched::ns::userns_of(reader), &mut b) };
         return proc_snapshot(b"/tmp/.proc_nsmap", &b[..n], false);
     }
     if path.ends_with(b"/smaps") || path.ends_with(b"/smaps_rollup") || path.ends_with(b"/maps") {
@@ -8418,12 +8424,13 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if let Some(r) = proc_ns_file(lookup_path, pid) {
             // /proc/<pid>/ns/<name> followed: an empty nsfs-like file.
-            let Some((tpid, _)) = r else { return err_reply(-2) };
+            let Some((tpid, k)) = r else { return err_reply(-2) };
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
             if flags & 0o3 != 0 { return err_reply(-13); }
-            match proc_snapshot(b"/tmp/.proc_nsfile", b"", false) {
-                Some(v) => v,
-                None    => return err_reply(-23),
+            // The fd holds the namespace alive (taken atomically with the read).
+            match sched::ns::grab(tpid, k) {
+                Some(id) => VnodeKind::NsFd { kind: k as u8, id },
+                None     => return err_reply(-2),
             }
         } else if flags & 0o3 != 0 && proc_oom_target(lookup_path, pid).is_some() {
             let tpid = proc_oom_target(lookup_path, pid).unwrap();
@@ -8464,7 +8471,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 None    => return err_reply(-23),
             }
         } else if lookup_path.starts_with(b"/proc/self/") && lookup_path != b"/proc/self/" {
-            let kind = gen_proc_self(pid, lookup_path);
+            let kind = gen_proc_self(pid, pid, lookup_path);
             match kind {
                 Some(v) => v,
                 None    => return err_reply(-2),
@@ -8472,7 +8479,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         } else if let Some(tpid) = proc_pid_path(lookup_path) {
             // /proc/<pid>/<file> of another live process (PROC_PID_FILES).
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
-            match gen_proc_self(tpid, lookup_path) {
+            match gen_proc_self(pid, tpid, lookup_path) {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
@@ -11590,6 +11597,55 @@ pub fn pidfd_target(pid: u32, fd: usize) -> Result<u32, i32> {
     }
 }
 
+/// The namespace an nsfs-like fd names: `Ok((kind, id))`, `Err(-9)` closed,
+/// `Err(-22)` an open fd of another kind.
+pub fn nsfd_target(pid: u32, fd: usize) -> Result<(u8, u16), i32> {
+    if fd >= FD_NUMBER_CEIL { return Err(-9); }
+    let pid = sched::tgid_of(pid);
+    let kind = with_tbl(pid, |t| t.fds.get(fd).map(|e| e.kind)).flatten().ok_or(-9)?;
+    match kind {
+        VnodeKind::NsFd { kind, id } => Ok((kind, id)),
+        _ => Err(-22),
+    }
+}
+
+/// Install an nsfs-like fd for namespace `id` of link `kind`, taking a reference.
+fn install_nsfd(pid: u32, kind: u8, id: u16) -> isize {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return -23 };
+    let fd = match tbl.alloc_fd() { Some(f) => f, None => return -24 };
+    sched::ns::hold_raw(id);
+    tbl.fds.set(fd, FdEntry { kind: VnodeKind::NsFd { kind, id }, flags: O_CLOEXEC, in_use: true, ofd: ofd::alloc() });
+    fd as isize
+}
+
+/// ioctl on an nsfs-like fd: NS_GET_USERNS / NS_GET_PARENT / NS_GET_NSTYPE /
+/// NS_GET_OWNER_UID.
+fn ns_ioctl(pid: u32, kind: u8, id: u16, cmd: usize, arg: usize) -> isize {
+    let k = kind as usize;
+    match cmd {
+        0xb701 => { // NS_GET_USERNS: the owning user namespace (the parent of a user namespace)
+            if k == 0 && id == 0 { return -1; }
+            install_nsfd(pid, 0, sched::ns::owner_userns(k, id))
+        }
+        0xb702 => { // NS_GET_PARENT: user and pid namespaces only
+            if !matches!(k, 0 | 1 | 7) { return -22; }
+            if id == 0 { return -1; }
+            install_nsfd(pid, if k == 0 { 0 } else { 1 }, sched::ns::parent(id))
+        }
+        0xb703 => sched::ns::clone_flag(k) as isize,
+        0xb704 => { // NS_GET_OWNER_UID
+            if k != 0 { return -22; }
+            let uid = sched::ns::view_id(0, sched::ns::owner(id).0);
+            if arg == 0 { return -14; }
+            unsafe { sched::uaccess::copy_raw(arg as *mut u8, &uid as *const u32 as *const u8, 4); }
+            0
+        }
+        _ => -25,
+    }
+}
+
 /// Re-masked signalfd descriptions: (ofd id, mask). A signalfd's mask belongs
 /// to its open file description, not to one fd entry: signalfd4(fd, newmask)
 /// used to rewrite only the caller's entry, so a dup, a fork child's copy or
@@ -11940,6 +11996,10 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
     // table lock is dropped first: LOOP_SET_FD re-enters this server to
     // resolve and open the backing file, and every arm touches user memory
     // through `arg`, which must be able to demand-page.
+    if let VnodeKind::NsFd { kind, id } = tbl.fds[fd].kind {
+        drop(tbls);
+        return make_reply(ns_ioctl(pid, kind, id, cmd, arg) as i64);
+    }
     if let VnodeKind::BlockDev { dev, .. } = tbl.fds[fd].kind {
         let ofd_id = tbl.fds[fd].ofd;
         drop(tbls);
@@ -12237,6 +12297,7 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             let ev = if reaped { POLLIN | POLLHUP } else if exited { POLLIN } else { 0 };
             (ev, exited as u64, sched::poll_tag(sched::poll_class::PIDFD, pid))
         }
+        VnodeKind::NsFd { .. } => (0, 0, sched::poll_tag(sched::poll_class::PIDFD, 0)),
         VnodeKind::Inotify { .. } => {
             // Never fires: accepted watches silently produce no events. Its
             // own tag, not the broadcast mask — with POLL_TAG_ALL every event
@@ -14435,6 +14496,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. } | VnodeKind::Mq { .. }
         | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. }
         | VnodeKind::PidFd { .. } => (S_IFREG | 0o600, 0, 0),
+        VnodeKind::NsFd { kind, id } => (S_IFREG | 0o444, 0, sched::ns::ns_ino(kind as usize, id)),
         // Handled by the early return above (proxied to the owning mount);
         // this arm exists only for match exhaustiveness.
         VnodeKind::MountedFile { .. } => return err_reply(-9),
@@ -14877,6 +14939,7 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             VnodeKind::Mq { .. } => FdInfo::Static(b"mqueue"),
             VnodeKind::TimerFd { .. } => FdInfo::Static(b"timerfd"),
             VnodeKind::PidFd { .. } => FdInfo::Static(b"anon_inode:[pidfd]"),
+            VnodeKind::NsFd { .. } => FdInfo::Static(b"anon_inode:[nsfs]"),
             VnodeKind::DevUrandom => FdInfo::Static(b"/dev/urandom"),
             // ttyname(3) readlinks /proc/self/fd/N and stats what it reads
             // back, so a VT fd must name the node it was opened by.

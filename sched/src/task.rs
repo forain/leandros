@@ -491,6 +491,9 @@ pub struct Task {
     /// Mount namespace (0 = initial: the global path space).
     pub mntns: crate::ns::NsRef,
     pub utsns: crate::ns::NsRef,
+    /// cgroup namespace (0 = initial) and the cgroup this thread belongs to.
+    pub cgns: crate::ns::NsRef,
+    pub cgroup: crate::cgroup::CgId,
     pub egid: u32,
     pub suid: u32,
     pub sgid: u32,
@@ -897,6 +900,8 @@ impl Task {
             ipcns: crate::ns::NsRef::INIT,
             mntns: crate::ns::NsRef::INIT,
             utsns: crate::ns::NsRef::INIT,
+            cgns: crate::ns::NsRef::INIT,
+            cgroup: 0,
             egid: 0,
             suid: 0,
             sgid: 0,
@@ -1336,6 +1341,8 @@ impl Task {
             ipcns: crate::ns::NsRef::INIT,
             mntns: crate::ns::NsRef::INIT,
             utsns: crate::ns::NsRef::INIT,
+            cgns: crate::ns::NsRef::INIT,
+            cgroup: 0,
             egid: 0,
             suid: 0,
             sgid: 0,

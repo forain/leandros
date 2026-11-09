@@ -2,3 +2,7 @@
 # pre-/post-install scripts are fatal (triggers and *-deinstall/upgrade are recorded, not run at mkfs) unless listed here.
 icu-data-en post-install   # only prints a hint about icu-data-full to stderr
 libglycin post-install   # only prints a hint about loader subpackages to stderr
+podman post-install   # only prints rootless setup hints to stderr
+fuse-overlayfs post-install   # only runs modprobe fuse (no modules at mkfs time)
+slirp4netns post-install   # only runs modprobe tun (no modules at mkfs time)
+pinentry post-install   # only symlinks /usr/bin/pinentry (gpg is unused by the podman trace)
