@@ -34,3 +34,12 @@ host-wide privilege check now uses host_root. Cases: userland/idmaptest
 - x86_64 box full regress: 70 suites, 0 bad (one vfstagtest wake-count flake, passes on re-run).
 - Guard: ns_euid0_not_host fails when host_root_of ignores the userns (Mac aarch64: FAIL ns_euid0_not_host, 4 passed 1 failed; with the check: 5/5 PASS).
 - Test cases removed vs main: none.
+
+## Final verification (merged tree)
+- aarch64 (Mac): captest, idmaptest pass; ffsandbox (mode on) passes; default regress green except host:vfstagtest (known load flake, passes alone).
+- x86_64 box regress: 71 suites, only vfstagtest.
+- nstest on the final merged tree: 85 pass / 1 fail, cgns_in_userns (nstest.c:2297, clone(NEWUSER|NEWCGROUP) from an
+  already-unmapped userns gets EPERM). new_userns rule 8 (unmapped euid, sched/src/ns.rs:94) is identical on main and
+  was not touched by this lane; cgcore (77/0) predates it. Looks like a main-level cgcore x idcore interaction, not an idroot regression
+  (not verified on a pure-main build). Left open for the owners.
+- Final x86_64 re-run after the last main merge skipped: the box tmpfs was 93% full.
