@@ -81,7 +81,7 @@ import driver  # noqa: E402
 
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest",
-                "/bin/polltest", "/bin/fdmaxtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/pthreadtest", "/bin/futextest",
+                "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/pthreadtest", "/bin/futextest",
                 "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest",
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
                 "/bin/f2fstest mmaporphan /root",
@@ -106,7 +106,7 @@ SUITES = {
                 "if [ \"$(uname -m)\" = aarch64 ]; then drmsmoke --arm-v3d && MESA_LOADER_DRIVER_OVERRIDE=v3d kmscube -c 30; __k=$?; drmsmoke --disarm-v3d; test $__k = 0; fi",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/netlinktest", "/bin/udpselftest", "/bin/udptest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/mnttest", "/bin/nstest", "/bin/cgtest", "/bin/idmaptest", "/bin/captest", "/bin/seccomptest", "/bin/preadtest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
+                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/mnttest", "/bin/nstest", "/bin/cgtest", "/bin/ovltest", "/bin/idmaptest", "/bin/captest", "/bin/seccomptest", "/bin/preadtest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
                 # kexec tool: load + unload only (non-destructive).
                 # A blocking pipe write of >PIPE_BUF delivers every byte (lane pipefix).
                 "/bin/sh -c '[ \"$(dd if=/dev/zero bs=1M count=2 2>/dev/null | wc -c)\" = 2097152 ]'",
@@ -196,6 +196,8 @@ SUITES = {
     "netctl": ["/bin/netctltest"],
     "kmodctl": ["/bin/kmodctltest"],
     "ns": ["/bin/nstest"],
+    "mnt": ["/bin/mnttest"],
+    "ovl": ["/bin/ovltest"],
     "idmap": ["/bin/idmaptest"],
     "cgroup": ["/bin/cgtest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.

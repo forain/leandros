@@ -163,12 +163,14 @@ pub struct ForkOpts {
     /// Pre-created cgroup namespace for CLONE_NEWCGROUP (0 = inherit).
     pub cgns: crate::ns::NsId,
     pub ipcns: crate::ns::NsId,
+    /// Mount namespace for the child; 0 = inherit the parent's.
+    pub mntns: crate::ns::NsId,
     pub utsns: crate::ns::NsId,
 }
 
 impl Default for ForkOpts {
     fn default() -> Self {
-        ForkOpts { vfork: false, child_stack: 0, tls: None, exit_signal: 17, set_tid: None, share_fs: false, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, cgns: 0 }
+        ForkOpts { vfork: false, child_stack: 0, tls: None, exit_signal: 17, set_tid: None, share_fs: false, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, mntns: 0, cgns: 0 }
     }
 }
 
@@ -405,8 +407,11 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         let mut affinity = 0u64;
         let (caps, puser) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.caps, t.userns.id())).unwrap_or((crate::caps::ROOT_CAPS, 0));
+        let (oom_adj, persona) = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| (t.oom_score_adj, t.persona)).unwrap_or((0, 0));
         let (pnet, pipc) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.netns.id(), t.ipcns.id())).unwrap_or((0, 0));
+        let pmnt = { let m = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.mntns.id()).unwrap_or(0);
+                     if opts.mntns != 0 { opts.mntns } else { m } };
         let putsns = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.utsns.id()).unwrap_or(0);
         let putsns = if opts.utsns != 0 { opts.utsns } else { putsns };
         let (pcg, pcgns) = super::RUN_QUEUE.lock().find_pid(parent_pid)
@@ -488,11 +493,13 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.gid           = gid;
         child.euid          = euid;
         child.caps          = caps;
+        child.oom_score_adj = oom_adj; child.persona = persona;
         child.userns        = crate::ns::NsRef::get(puser);
         child.pidns         = crate::ns::NsRef::get(pidns_target);
         child.pidns_child   = crate::ns::NsRef::get(pidns_target);
         child.netns         = crate::ns::NsRef::get(pnet);
         child.ipcns         = crate::ns::NsRef::get(pipc);
+        child.mntns         = crate::ns::NsRef::get(pmnt);
         child.utsns         = crate::ns::NsRef::get(putsns);
         child.cgns          = crate::ns::NsRef::get(pcgns);
         child.cgroup        = pcg;
@@ -772,8 +779,10 @@ pub fn clone_thread(
         let mut affinity = 0u64;
         let (caps, puser) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.caps, t.userns.id())).unwrap_or((crate::caps::ROOT_CAPS, 0));
+        let (oom_adj, persona) = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| (t.oom_score_adj, t.persona)).unwrap_or((0, 0));
         let (pnet, pipc) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.netns.id(), t.ipcns.id())).unwrap_or((0, 0));
+        let pmnt = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.mntns.id()).unwrap_or(0);
         let putsns = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.utsns.id()).unwrap_or(0);
         let (pcg, pcgns) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.cgroup, t.cgns.id())).unwrap_or((0, 0));
@@ -874,11 +883,13 @@ pub fn clone_thread(
         child.uid        = uid;  child.gid  = gid;
         child.euid       = euid; child.egid = egid;
         child.caps       = caps;
+        child.oom_score_adj = oom_adj; child.persona = persona;
         child.userns     = crate::ns::NsRef::get(puser);
         child.pidns      = crate::ns::NsRef::get(pidns_target);
         child.pidns_child = crate::ns::NsRef::get(pidns_target);
         child.netns      = crate::ns::NsRef::get(pnet);
         child.ipcns      = crate::ns::NsRef::get(pipc);
+        child.mntns      = crate::ns::NsRef::get(pmnt);
         child.utsns      = crate::ns::NsRef::get(putsns);
         child.cgns       = crate::ns::NsRef::get(pcgns);
         child.cgroup     = pcg;

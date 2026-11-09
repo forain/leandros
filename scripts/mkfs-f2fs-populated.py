@@ -465,11 +465,11 @@ def main():
     bin_files = []
     bins = [
         "shell", "login", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "permtest", "f2fstest", "tput",
-        "pthreadtest", "timertest", "sigtest", "polltest", "fdmaxtest", "pipebw", "ptytest", "forktest", "shmtest", "racetest", "mmapbench",
+        "pthreadtest", "timertest", "sigtest", "polltest", "fdmaxtest", "mqtest", "pipebw", "ptytest", "forktest", "shmtest", "racetest", "mmapbench",
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "uinputtest", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "netlinktest", "udpselftest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
-        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "nstest", "cgtest", "idmaptest", "captest", "mnttest", "seccomptest", "preadtest", "kexectest", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid",
+        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "nstest", "cgtest", "ovltest", "idmaptest", "captest", "mnttest", "seccomptest", "preadtest", "kexectest", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)

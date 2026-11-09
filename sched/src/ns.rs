@@ -9,7 +9,7 @@
 //! table is all atomics: it has no lock, so it can be used under RUN_QUEUE.
 //! A user namespace holds a reference on its parent.
 
-use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU8, Ordering::*};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::*};
 
 pub type NsId = u16;
 pub const NS_MAX: usize = 256;
@@ -27,6 +27,11 @@ static LEVEL: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 /// Host euid / egid of the creator (the namespace owner).
 static OWNER_EUID: [AtomicU32; NS_MAX] = [ZERO32; NS_MAX];
 static OWNER_EGID: [AtomicU32; NS_MAX] = [ZERO32; NS_MAX];
+/// Admin state of a network namespace's `lo` (recorded by RTM_NEWLINK; reset
+/// when the id is allocated).
+static LO_UP: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
+pub fn lo_admin_up(id: NsId) -> bool { id != 0 && LO_UP[id as usize].load(Acquire) != 0 }
+pub fn set_lo_admin_up(id: NsId, up: bool) { if id != 0 { LO_UP[id as usize].store(up as u8, Release); } }
 
 /// Identity-only uid/gid maps: up to `MAP_EXT` extents per namespace, each
 /// `[inside, outside, count]` (inside == outside is enforced on write).
@@ -60,6 +65,14 @@ impl Drop for NsRef {
 fn put(mut id: NsId) {
     while id != 0 {
         if REFS[id as usize].fetch_sub(1, AcqRel) != 1 { return; }
+        if IS_MNT[id as usize].load(Acquire) != 0 {
+            // Freeing a mount tree can drop superblock refs (port calls), and
+            // put may run under RUN_QUEUE: park the slot as DYING and let
+            // `reap` (next mntns create / mount syscall) free it.
+            REFS[id as usize].store(DYING, Release);
+            ZOMBIES[id as usize / 64].fetch_or(1u64 << (id as usize % 64), AcqRel);
+            return;
+        }
         // A cgroup namespace unpins its root cgroup (its owner userns, held as
         // PARENT, is released by the loop below).
         if CGNS_FLAG[id as usize].swap(0, AcqRel) != 0 {
@@ -93,12 +106,72 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
     Err(-28)
 }
 
+/// Slot marker: a mount namespace whose tree has not been freed yet.
+const DYING: u32 = 0x8000_0000;
+static IS_MNT: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
+/// Owner user namespace of a mount namespace (also for netns/cgroupns later).
+static OWNER_USER: [AtomicU16; NS_MAX] = [ZERO16; NS_MAX];
+const ZERO64: AtomicU64 = AtomicU64::new(0);
+static ZOMBIES: [AtomicU64; NS_MAX / 64] = [ZERO64; NS_MAX / 64];
+/// Number of live mount namespaces other than the initial one: lets every
+/// path operation skip the per-task lookup while it is zero.
+static MNT_LIVE: AtomicU32 = AtomicU32::new(0);
+
+/// True while any non-initial mount namespace exists.
+#[inline]
+pub fn mnt_active() -> bool { MNT_LIVE.load(Relaxed) != 0 }
+
+/// Owner user namespace recorded for namespace `id`.
+pub fn owner_user(id: NsId) -> NsId { if id == 0 { 0 } else { OWNER_USER[id as usize].load(Acquire) } }
+
+/// Create a mount namespace id owned by user namespace `owner_user`.
+pub fn new_mntns(owner_user: NsId) -> Result<NsRef, isize> {
+    for id in 1..NS_MAX {
+        if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
+            PARENT[id].store(0, Release);
+            LEVEL[id].store(0, Release);
+            OWNER_USER[id].store(owner_user, Release);
+            IS_MNT[id].store(1, Release);
+            MNT_LIVE.fetch_add(1, AcqRel);
+            return Ok(NsRef(id as NsId));
+        }
+    }
+    Err(-28)
+}
+
+/// Mount namespace of `pid` (0 = initial, also when `pid` is unknown).
+pub fn mntns_of(pid: u32) -> NsId {
+    crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.mntns.id()).unwrap_or(0)
+}
+
+/// Mount namespace ids whose last reference is gone but whose slot is still
+/// parked: call `free` for each (it frees the vfs tree; no scheduler locks
+/// are held here), then the slot becomes reusable.
+pub fn reap(mut free: impl FnMut(NsId)) {
+    for w in 0..NS_MAX / 64 {
+        let mut bits = ZOMBIES[w].swap(0, AcqRel);
+        while bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let id = w * 64 + b;
+            free(id as NsId);
+            IS_MNT[id].store(0, Release);
+            MNT_LIVE.fetch_sub(1, AcqRel);
+            REFS[id].store(0, Release);
+        }
+    }
+}
+
+/// Number of parked (DYING) mount namespaces.
+pub fn dying_count() -> usize { (1..NS_MAX).filter(|&i| REFS[i].load(Relaxed) == DYING).count() }
+
 /// Create a flat (parentless) namespace id: net or ipc. Errors: ENOSPC (28).
 pub fn new_flat() -> Result<NsRef, isize> {
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             PARENT[id].store(0, Release);
             LEVEL[id].store(0, Release);
+            LO_UP[id].store(0, Release);
             return Ok(NsRef(id as NsId));
         }
     }
@@ -219,7 +292,7 @@ pub fn owner(id: NsId) -> (u32, u32) {
     if id == 0 { (0, 0) } else { (OWNER_EUID[id as usize].load(Acquire), OWNER_EGID[id as usize].load(Acquire)) }
 }
 /// Live non-initial namespaces (debug/leak checks).
-pub fn live_count() -> usize { (1..NS_MAX).filter(|&i| REFS[i].load(Relaxed) != 0).count() }
+pub fn live_count() -> usize { (1..NS_MAX).filter(|&i| { let r = REFS[i].load(Relaxed); r != 0 && r != DYING }).count() }
 
 /// User namespace of the calling thread.
 pub fn current_userns() -> NsId { userns_of(crate::current_pid()) }
@@ -506,6 +579,7 @@ pub fn ns_id_of(pid: u32, kind: usize) -> NsId {
         0 => userns_of(pid), 2 => netns_of(pid), 3 => ipcns_of(pid),
         1 => crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.pidns.id()).unwrap_or(0),
         7 => crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.pidns_child.id()).unwrap_or(0),
+        4 => mntns_of(pid),
         5 => utsns_of(pid),
         _ => 0,
     }

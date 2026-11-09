@@ -734,6 +734,7 @@ mod nr {
     pub const GETRANDOM:      usize = 278;
     pub const SECCOMP:        usize = 277;
     pub const PRCTL:          usize = 167;
+    pub const PERSONALITY:    usize = 92;
     pub const MADVISE:        usize = 233;
     pub const MSYNC:          usize = 227;
     pub const MLOCK:          usize = 228;
@@ -810,6 +811,8 @@ mod nr {
     pub const EPOLL_PWAIT:    usize = 22;
     pub const EPOLL_PWAIT2:   usize = 441;
     pub const EVENTFD2:       usize = 19;
+    pub const MQ_OPEN: usize = 180; pub const MQ_UNLINK: usize = 181; pub const MQ_TIMEDSEND: usize = 182;
+    pub const MQ_TIMEDRECEIVE: usize = 183; pub const MQ_NOTIFY: usize = 184; pub const MQ_GETSETATTR: usize = 185;
     pub const SIGNALFD4:      usize = 74;
     pub const RT_SIGSUSPEND:  usize = 133;
     pub const WAITID:         usize = 95;
@@ -998,6 +1001,7 @@ mod nr {
     pub const GETRANDOM:      usize = 318;
     pub const SECCOMP:        usize = 317;
     pub const PRCTL:          usize = 157;
+    pub const PERSONALITY:    usize = 135;
     pub const MADVISE:        usize = 28;
     pub const MSYNC:          usize = 26;
     pub const MLOCK:          usize = 149;
@@ -1092,6 +1096,8 @@ mod nr {
     pub const EPOLL_PWAIT:    usize = 281;
     pub const EPOLL_PWAIT2:   usize = 441;
     pub const EVENTFD2:       usize = 290;
+    pub const MQ_OPEN: usize = 240; pub const MQ_UNLINK: usize = 241; pub const MQ_TIMEDSEND: usize = 242;
+    pub const MQ_TIMEDRECEIVE: usize = 243; pub const MQ_NOTIFY: usize = 244; pub const MQ_GETSETATTR: usize = 245;
     pub const SIGNALFD4:      usize = 289;
     pub const RT_SIGSUSPEND:  usize = 130;
     pub const PAUSE:          usize = 34;
@@ -2453,6 +2459,12 @@ fn dispatch_inner(
         EPOLL_PWAIT  => sys_epoll_pwait(a0, a1, a2, a3, a4, a5),
         EPOLL_PWAIT2 => sys_epoll_pwait2(a0, a1, a2, a3, a4, a5),
         EVENTFD2       => sys_eventfd2(a0, a1, frame_ptr),
+        MQ_OPEN        => sys_mq_open(a0, a1, a2, a3),
+        MQ_UNLINK      => sys_mq_unlink(a0),
+        MQ_TIMEDSEND   => sys_mq_timedsend(a0, a1, a2, a3, a4),
+        MQ_TIMEDRECEIVE => sys_mq_timedreceive(a0, a1, a2, a3, a4),
+        MQ_NOTIFY      => sys_mq_notify(a0, a1),
+        MQ_GETSETATTR  => sys_mq_getsetattr(a0, a1, a2),
         SIGNALFD4      => sys_signalfd4(a0, a1, a2, a3),
 
         // ── Scheduling policy/affinity ────────────────────────────────────────
@@ -2551,6 +2563,7 @@ fn dispatch_inner(
 
         // ── Misc ──────────────────────────────────────────────────────────────
         UNAME      => sys_uname(a0),
+        PERSONALITY => sched::personality(a0 as u32) as isize,
         PRLIMIT64  => sys_prlimit64(a0, a1, a2, a3),
         // Linux exit_group(2) kills every thread in the calling process, not
         // just the caller. `sched::exit_group` owns that sequence (single
@@ -4296,7 +4309,26 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
     const PR_SET_MM: usize = 35;
     const PR_SET_PDEATHSIG: usize = 1;
     const PR_GET_PDEATHSIG: usize = 2;
+    const PR_GET_KEEPCAPS: usize = 7;
+    const PR_SET_KEEPCAPS: usize = 8;
+    const PR_GET_SECUREBITS: usize = 27;
+    const PR_SET_SECUREBITS: usize = 28;
+    const PR_SET_CHILD_SUBREAPER: usize = 36;
+    const PR_GET_CHILD_SUBREAPER: usize = 37;
+    const PR_CAP_AMBIENT: usize = 47;
     match option {
+        PR_GET_KEEPCAPS => sched::caps::keepcaps(),
+        PR_SET_KEEPCAPS => sched::caps::set_keepcaps(arg2),
+        PR_GET_SECUREBITS => sched::caps::securebits(),
+        PR_SET_SECUREBITS => sched::caps::set_securebits(arg2 as u64),
+        PR_CAP_AMBIENT => sched::caps::ambient(arg2, a3, a4, a5),
+        PR_SET_CHILD_SUBREAPER => { sched::set_child_subreaper(arg2 != 0); 0 }
+        PR_GET_CHILD_SUBREAPER => {
+            let v = (sched::child_subreaper() as i32).to_ne_bytes();
+            if !validate_user_buf(arg2, 4) { return -14; }
+            if unsafe { sched::uaccess::copy_to_user(arg2, v.as_ptr(), 4) } != 0 { return -14; }
+            0
+        }
         PR_SET_NAME => {
             // Up to 15 bytes of the NUL-terminated user string (Linux
             // truncates silently); shared with /proc/<tid>/comm.
@@ -9194,6 +9226,7 @@ fn sys_mount(
             b"devtmpfs" => Some((b"/dev".to_vec(), "devtmpfs")),
             b"sysfs"    => Some((b"/sys".to_vec(), "sysfs")),
             b"devpts"   => Some((b"/dev/pts".to_vec(), "devpts")),
+            b"mqueue"   => Some((b"/dev/mqueue".to_vec(), "mqueue")),
             _ => None,
         }
     };
@@ -10879,6 +10912,21 @@ struct KPath {
     buf: Vec<u8>,
     /// Namespace path, when an alias rewrote it.
     ns: Option<Vec<u8>>,
+    /// Final mount id (mount namespace != 0 only; 0 otherwise).
+    #[allow(dead_code)]
+    mnt_id: u32,
+    /// Length of the namespace-path prefix naming the final mount point.
+    #[allow(dead_code)]
+    ns_prefix_len: usize,
+    /// Thread pid under which a `vfs::mnt::CALLCTX` entry for `ptr()` is
+    /// registered (0 = none: the ns-0 path takes no extra work).
+    ctx_pid: u32,
+}
+
+impl Drop for KPath {
+    fn drop(&mut self) {
+        if self.ctx_pid != 0 { vfs::mnt::callctx_clear(self.ctx_pid, self.buf.as_ptr() as usize); }
+    }
 }
 
 impl KPath {
@@ -10887,12 +10935,14 @@ impl KPath {
         let mut buf = Vec::with_capacity(bytes.len() + 1);
         buf.extend_from_slice(bytes);
         buf.push(0);
-        KPath { buf, ns: None }
+        KPath { buf, ns: None, mnt_id: 0, ns_prefix_len: 0, ctx_pid: 0 }
     }
 
     /// A namespace path (host-absolute, normalised), translated through the
     /// alias mounts and the `/proc/<pid>/{root,cwd}` magic links.
     fn from_ns(ns: Vec<u8>) -> Result<KPath, isize> {
+        let mns = sched::current_mntns();
+        if mns != 0 { return KPath::from_ns_mnt(ns, mns); }
         // Below /proc/self/fd/N: the namespace path is where that directory
         // really is, not the magic link, so chdir does not record a path
         // that depends on fd N staying open.
@@ -10913,6 +10963,27 @@ impl KPath {
         } };
         if backing.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
         let mut kp = KPath::raw(&backing);
+        kp.ns = Some(ns);
+        Ok(kp)
+    }
+
+    /// [`KPath::from_ns`] for a task in mount namespace `mns` != 0: the
+    /// namespace path goes through that namespace's mount tree, and the
+    /// (pointer -> ns path, mount id) pair is published to the VFS chokepoint
+    /// keyed by thread pid.
+    fn from_ns_mnt(ns: Vec<u8>, mns: sched::ns::NsId) -> Result<KPath, isize> {
+        let (mut denied, mut crossed) = (false, false);
+        let (mut mid, mut plen) = (0u32, 0usize);
+        let backing = backing_walk_m(&ns, &mut crossed, &mut denied, mns, &mut mid, &mut plen);
+        if denied { return Err(-13); }
+        let backing = match backing { Some(b) => b, None => ns.clone() };
+        if backing.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
+        let mut kp = KPath::raw(&backing);
+        kp.mnt_id = mid;
+        kp.ns_prefix_len = plen;
+        let pid = current_pid();
+        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: ns.clone(), mnt_id: mid });
+        kp.ctx_pid = pid;
         kp.ns = Some(ns);
         Ok(kp)
     }
@@ -10982,6 +11053,50 @@ fn backing_walk(ns: &[u8], crossed: &mut bool) -> Option<Vec<u8>> {
 /// [`backing_walk`], also reporting in `denied` that a `/proc/<pid>/{root,cwd}`
 /// hop named another user's process (the readlink gate, `proc_link_allowed`).
 fn backing_walk_d(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<Vec<u8>> {
+    let mns = sched::current_mntns();
+    if mns != 0 { return backing_walk_m(ns, crossed, denied, mns, &mut 0, &mut 0); }
+    backing_walk_ns0(ns, crossed, denied)
+}
+
+/// Translate one path through mount namespace `mns`'s tree; the first call
+/// records the final mount id and mountpoint prefix length.
+fn mnt_xlate(mns: sched::ns::NsId, p: &[u8], crossed: &mut bool, mid: &mut u32, plen: &mut usize, first: bool) -> Option<Vec<u8>> {
+    let x = vfs::mnt::translate(mns, p)?;
+    *crossed |= x.flags & vfs::mnt::MNT_NOSUID != 0;
+    if first { *mid = x.mnt_id; *plen = x.ns_prefix_len; }
+    Some(x.backing)
+}
+
+/// [`backing_walk_d`] for a task in mount namespace `mns` != 0.
+fn backing_walk_m(ns: &[u8], crossed: &mut bool, denied: &mut bool, mns: sched::ns::NsId,
+                  mid: &mut u32, plen: &mut usize) -> Option<Vec<u8>> {
+    let mut cur: Option<Vec<u8>> = mnt_xlate(mns, ns, crossed, mid, plen, true);
+    for _ in 0..4 {
+        let p: &[u8] = cur.as_deref().unwrap_or(ns);
+        if let Some(b) = proc_fd_below(p) { return Some(b); }
+        let hit = proc_magic(p, b"root").map(|(pid, rest)| (pid, rest, true))
+            .or_else(|| proc_magic(p, b"cwd").map(|(pid, rest)| (pid, rest, false)));
+        let (pid, rest, is_root) = match hit { Some(h) if !h.1.is_empty() => h, _ => break };
+        if sched::exists_probe(pid) == 0 && !proc_link_allowed(pid) { *denied = true; break; }
+        let base: alloc::sync::Arc<[u8]> = if is_root {
+            match sched::root_arc_of(pid) {
+                Some(r) => r,
+                None if sched::exists_probe(pid) == 0 => alloc::sync::Arc::from(&b"/"[..]),
+                None => break,
+            }
+        } else {
+            match sched::cwd_arc_of(pid) { Some(c) => c, None => break }
+        };
+        let mut v = Vec::with_capacity(base.len() + rest.len());
+        if &*base != b"/" { v.extend_from_slice(&base); }
+        v.extend_from_slice(rest);
+        cur = Some(mnt_xlate(mns, &v, crossed, mid, plen, false).unwrap_or(v));
+    }
+    cur
+}
+
+/// The ns-0 body of [`backing_walk_d`]: identity plus the alias table.
+fn backing_walk_ns0(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<Vec<u8>> {
     *crossed |= vfs::alias::crosses(ns);
     let mut cur: Option<Vec<u8>> = vfs::alias::translate(ns);
     for _ in 0..4 {
@@ -11057,6 +11172,19 @@ fn proc_own_fd(p: &[u8]) -> Option<(usize, &[u8])> {
 /// root, come back unchanged.
 fn host_to_view(p: &[u8]) -> Vec<u8> {
     let root = sched::current_root_arc();
+    let mns = sched::current_mntns();
+    if mns != 0 {
+        // The namespace's own tree answers; its root is the task's root.
+        let v = vfs::mnt::reverse(mns, p, 0);
+        let p: &[u8] = v.as_deref().unwrap_or(p);
+        if let Some(r) = root.as_deref() {
+            if r.len() > 1 && vfs::alias::under(p, r) {
+                if p.len() == r.len() { return b"/".to_vec(); }
+                return p[r.len()..].to_vec();
+            }
+        }
+        return p.to_vec();
+    }
     let ns = vfs::alias::reverse(p, root.as_deref());
     let p: &[u8] = ns.as_deref().unwrap_or(p);
     if let Some(r) = root.as_deref() {
@@ -11230,7 +11358,7 @@ fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
 
     // The caller's chroot root (host-absolute). `None` means "not chrooted" —
     // the overwhelmingly common case, which takes the same path it always did.
-    let root = sched::current_root_arc();
+    let (root, cwd_arc, _mntns) = sched::current_fs_ctx();
     let rlen = root.as_ref().map(|r| r.len()).filter(|&n| n > 1).unwrap_or(0);
     // `..` may never climb above this offset. For a jailed task it is the end
     // of the root prefix; otherwise it is 1 (the real "/").
@@ -11242,8 +11370,8 @@ fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
         // An absolute path is relative to the jail root, so start there.
         match &root { Some(r) if rlen > 1 => out.extend_from_slice(r), _ => out.push(b'/') }
     } else {
-        match sched::current_cwd_arc() {
-            Some(c) if c.first() == Some(&b'/') => out.extend_from_slice(&c),
+        match &cwd_arc {
+            c if c.first() == Some(&b'/') => out.extend_from_slice(c),
             _ => out.push(b'/'),
         }
         // A cwd that somehow lies outside the jail (it cannot be set there)
@@ -11277,6 +11405,10 @@ fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
     if out.len() > 1 && out.last() == Some(&b'/') { out.pop(); }
     // The void root's name is not observable from outside it.
     if vfs::alias::under(&out, vfs::VOID_ROOT) && root.as_deref() != Some(vfs::VOID_ROOT) {
+        return Err(-2);
+    }
+    // Superblock backing roots are never reachable by name.
+    if out.len() >= vfs::mnt::SB_ROOT.len() && vfs::alias::under(&out, vfs::mnt::SB_ROOT) {
         return Err(-2);
     }
     Ok(out)
@@ -11460,7 +11592,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         && net_server::rtnetlink::is_if_ioctl(cmd as u32)
     {
         use net_server::rtnetlink as nl;
-        let links = nl::current_links();
+        let links = nl::current_links(sched::ns::netns_of(pid as u32));
         if cmd as u32 == nl::SIOCGIFCONF {
             // struct ifconf { int ifc_len; (pad) char *ifc_buf; }
             if arg == 0 { return -14; }
@@ -16766,6 +16898,7 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
         let parent_pid = sched::tgid_of(current_pid());
         if !vfs::fd_table_slot_free() { return -11; } // EAGAIN, as for FORK
         let opts = sched::ForkOpts {
+            mntns: 0,
             vfork: flags & CLONE_VFORK != 0,
             child_stack,
             tls: if flags & CLONE_SETTLS != 0 { Some(tls as u64) } else { None },
@@ -16800,3 +16933,116 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
 }
 
 
+
+
+// ---- POSIX message queues (servers/vfs/src/mqueue.rs holds the data) --------
+
+const MQ_NONBLOCK: u32 = 0o4000;
+
+/// Retry `op` until it stops answering EAGAIN: fail at once for an O_NONBLOCK
+/// mqd, else park until the queue changes, a signal arrives (EINTR) or the
+/// absolute CLOCK_REALTIME timeout `ts_ptr` (0 = none) passes (ETIMEDOUT).
+fn mq_blocking<T>(slot: usize, fdflags: u32, ts_ptr: usize, recv: bool,
+                  mut op: impl FnMut() -> Result<T, isize>) -> Result<T, isize> {
+    let mut deadline = u64::MAX;
+    let mut parsed = false;
+    loop {
+        match op() { Err(-11) => {} other => return other }
+        if fdflags & MQ_NONBLOCK != 0 { return Err(-11); }
+        if !parsed {
+            parsed = true;
+            if ts_ptr != 0 {
+                match read_user_timespec(ts_ptr) {
+                    Ok(ns) => deadline = sched::realtime_to_monotonic_ns(ns),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        if monotonic_ns() >= deadline { return Err(-110); } // ETIMEDOUT
+        if interrupted() { return Err(-4); }
+        if recv { vfs::mqueue::recv_waiter(slot, true); }
+        sched::block_on_poll_prepare_until(deadline);
+        let (r, w, _) = vfs::mqueue::readiness(slot);
+        if (if recv { r } else { w }) || monotonic_ns() >= deadline || interrupted() {
+            sched::block_on_poll_cancel();
+        } else {
+            sched::block_on_poll_commit();
+        }
+        if recv { vfs::mqueue::recv_waiter(slot, false); }
+    }
+}
+
+fn sys_mq_open(name_ptr: usize, oflag: usize, mode: usize, attr_ptr: usize) -> isize {
+    let name = match read_user_short_str(name_ptr) { Ok(v) => v, Err(e) => return e };
+    let mut attr = None;
+    if oflag & 0o100 != 0 && attr_ptr != 0 {
+        if !validate_user_buf(attr_ptr, 64) { return -14; }
+        let a = match ua::read_user::<[i64; 8]>(attr_ptr) { Some(v) => v, None => return -14 };
+        attr = Some((a[1], a[2]));
+    }
+    vfs::mqueue::open(current_pid(), &name, oflag as u32, mode as u32, attr)
+}
+
+fn sys_mq_unlink(name_ptr: usize) -> isize {
+    let name = match read_user_short_str(name_ptr) { Ok(v) => v, Err(e) => return e };
+    vfs::mqueue::unlink(current_pid(), &name)
+}
+
+fn sys_mq_timedsend(fd: usize, msg_ptr: usize, len: usize, prio: usize, ts_ptr: usize) -> isize {
+    let (slot, fl) = match vfs::mqueue::lookup_fd(current_pid(), fd) { Ok(v) => v, Err(e) => return e };
+    if len > (1 << 20) { return -90; }
+    let mut data = alloc::vec![0u8; len];
+    if len > 0 {
+        if !validate_user_buf(msg_ptr, len) { return -14; }
+        if unsafe { sched::uaccess::copy_raw(data.as_mut_ptr(), msg_ptr as *const u8, len) } != 0 { return -14; }
+    }
+    match mq_blocking(slot, fl, ts_ptr, false, || vfs::mqueue::try_send(slot, fl, &data, prio as u32)) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_mq_timedreceive(fd: usize, buf_ptr: usize, len: usize, prio_ptr: usize, ts_ptr: usize) -> isize {
+    let (slot, fl) = match vfs::mqueue::lookup_fd(current_pid(), fd) { Ok(v) => v, Err(e) => return e };
+    match mq_blocking(slot, fl, ts_ptr, true, || vfs::mqueue::try_recv(slot, fl, len)) {
+        Ok((data, prio)) => {
+            if !data.is_empty() {
+                if !validate_user_buf(buf_ptr, data.len()) { return -14; }
+                if unsafe { sched::uaccess::copy_raw(buf_ptr as *mut u8, data.as_ptr(), data.len()) } != 0 { return -14; }
+            }
+            if prio_ptr != 0 && !ua::write_user::<u32>(prio_ptr, prio) { return -14; }
+            data.len() as isize
+        }
+        Err(e) => e,
+    }
+}
+
+fn sys_mq_notify(fd: usize, sev_ptr: usize) -> isize {
+    let pid = current_pid();
+    let (slot, _) = match vfs::mqueue::lookup_fd(pid, fd) { Ok(v) => v, Err(e) => return e };
+    if sev_ptr == 0 { return vfs::mqueue::notify(pid, slot, None); }
+    // struct sigevent { sigev_value (8), sigev_signo (4), sigev_notify (4), ... }
+    let w = match ua::read_user::<[u64; 2]>(sev_ptr) { Some(v) => v, None => return -14 };
+    let (value, signo, notify) = (w[0], (w[1] & 0xffff_ffff) as u32, (w[1] >> 32) as u32);
+    match notify {
+        0 => { if signo == 0 || signo > 64 { return -22; } vfs::mqueue::notify(pid, slot, Some((signo, value))) }
+        1 => vfs::mqueue::notify(pid, slot, Some((0, 0))), // SIGEV_NONE
+        _ => -22, // SIGEV_THREAD is a libc helper thread; not served here
+    }
+}
+
+fn sys_mq_getsetattr(fd: usize, new_ptr: usize, old_ptr: usize) -> isize {
+    let pid = current_pid();
+    let (slot, fl) = match vfs::mqueue::lookup_fd(pid, fd) { Ok(v) => v, Err(e) => return e };
+    if new_ptr != 0 && !validate_user_buf(new_ptr, 64) { return -14; }
+    if old_ptr != 0 {
+        let (maxmsg, msgsize, cur) = vfs::mqueue::attr(slot);
+        let a: [i64; 8] = [(fl & MQ_NONBLOCK) as i64, maxmsg, msgsize, cur, 0, 0, 0, 0];
+        if !ua::write_user::<[i64; 8]>(old_ptr, a) { return -14; }
+    }
+    if new_ptr != 0 {
+        let n = match ua::read_user::<[i64; 8]>(new_ptr) { Some(v) => v, None => return -14 };
+        vfs::mqueue::set_nonblock(pid, fd, n[0] as u32 & MQ_NONBLOCK != 0);
+    }
+    0
+}

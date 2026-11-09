@@ -9,6 +9,9 @@
  * individual flags on and move their cases to real behaviour checks.
  */
 #define _GNU_SOURCE
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <net/if.h>
 #include <errno.h>
 #include <sched.h>
 #include <signal.h>
@@ -906,6 +909,79 @@ static int sendfam_child(void)
         if (sendto(ic, pkt, sizeof pkt, 0, (void *)&a, sizeof a) != -1) bad |= 128;
     }
     return bad;
+}
+/* ---- netlink / ifreq view inside a new netns (lane nlns) ---- */
+static int nl_rt(int s, int type, int flags, unsigned idx, unsigned ifflags, unsigned change,
+                 char *out, int cap)
+{
+    struct { struct nlmsghdr h; struct ifinfomsg i; } r;
+    memset(&r, 0, sizeof r);
+    r.h.nlmsg_len = sizeof r; r.h.nlmsg_type = type; r.h.nlmsg_flags = NLM_F_REQUEST | flags; r.h.nlmsg_seq = 5;
+    r.i.ifi_index = idx; r.i.ifi_flags = ifflags; r.i.ifi_change = change;
+    if (send(s, &r, sizeof r, 0) != (ssize_t)sizeof r) return -1;
+    int tot = 0;
+    for (;;) {
+        ssize_t n = recv(s, out + tot, cap - tot, 0);
+        if (n <= 0) return -1;
+        struct nlmsghdr *h = (struct nlmsghdr *)(out + tot);
+        int k = (int)n, done = 0;
+        for (; NLMSG_OK(h, k); h = NLMSG_NEXT(h, k))
+            if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR || !(type == RTM_GETLINK || type == RTM_GETADDR) || !(h->nlmsg_flags & NLM_F_MULTI)) done = 1;
+        tot += n;
+        if (done) return tot;
+        if (!(flags & NLM_F_DUMP)) return tot;
+    }
+}
+static int nl_count(char *b, int n, int type, int *first_index)
+{
+    int c = 0;
+    for (struct nlmsghdr *h = (struct nlmsghdr *)b; NLMSG_OK(h, n); h = NLMSG_NEXT(h, n))
+        if (h->nlmsg_type == type) { if (!c && first_index) *first_index = ((struct ifinfomsg *)NLMSG_DATA(h))->ifi_index; c++; }
+    return c;
+}
+static int netns_only_lo_body(void)
+{
+    static char b[8192];
+    int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (s < 0) return 2;
+    int n = nl_rt(s, RTM_GETLINK, NLM_F_DUMP, 0, 0, 0, b, sizeof b), idx = 0;
+    if (n <= 0 || nl_count(b, n, RTM_NEWLINK, &idx) != 1 || idx != 1) return 3;
+    n = nl_rt(s, RTM_GETADDR, NLM_F_DUMP, 0, 0, 0, b, sizeof b);
+    if (n <= 0 || nl_count(b, n, RTM_NEWADDR, NULL) != 0) return 4;
+    if (if_nametoindex("eth0") != 0 || if_nametoindex("lo") != 1) return 5;
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "eth0");
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ioctl(u, SIOCGIFFLAGS, &q) == 0 || errno != ENODEV) return 6;
+    struct ifconf ic; char cb[512]; ic.ifc_len = sizeof cb; ic.ifc_buf = cb;
+    if (ioctl(u, SIOCGIFCONF, &ic) != 0 || ic.ifc_len != 0) return 7;
+    n = nl_rt(s, RTM_GETROUTE, NLM_F_DUMP, 0, 0, 0, b, sizeof b);
+    if (n <= 0 || nl_count(b, n, RTM_NEWROUTE, NULL) != 0) return 8;
+    return 0;
+}
+static int t_netns_sees_only_lo(void)
+{
+    CHECK(ns_child_netns(netns_only_lo_body) == 0);
+    return 0;
+}
+static int netns_lo_up_body(void)
+{
+    static char b[8192];
+    int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (s < 0) return 2;
+    int n = nl_rt(s, RTM_NEWLINK, NLM_F_ACK, 1, IFF_UP, IFF_UP, b, sizeof b);
+    struct nlmsghdr *h = (struct nlmsghdr *)b;
+    if (n <= 0 || h->nlmsg_type != NLMSG_ERROR || ((struct nlmsgerr *)NLMSG_DATA(h))->error != 0) return 3;
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo");
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ioctl(u, SIOCGIFFLAGS, &q) != 0 || !(q.ifr_flags & IFF_UP)) return 4;
+    n = nl_rt(s, RTM_NEWLINK, NLM_F_ACK, 99, IFF_UP, IFF_UP, b, sizeof b);
+    if (n <= 0 || ((struct nlmsgerr *)NLMSG_DATA((struct nlmsghdr *)b))->error != -ENODEV) return 5;
+    return 0;
+}
+static int t_netns_lo_up_ack(void)
+{
+    CHECK(ns_child_netns(netns_lo_up_body) == 0);
+    return 0;
 }
 static int t_netns_sendfam(void)
 {
@@ -2000,7 +2076,7 @@ static int run_userns_cases(void)
         { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
-        { "netns_sendfam", t_netns_sendfam }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
+        { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
         { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
