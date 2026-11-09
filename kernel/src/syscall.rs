@@ -734,6 +734,7 @@ mod nr {
     pub const GETRANDOM:      usize = 278;
     pub const SECCOMP:        usize = 277;
     pub const PRCTL:          usize = 167;
+    pub const PERSONALITY:    usize = 92;
     pub const MADVISE:        usize = 233;
     pub const MSYNC:          usize = 227;
     pub const MLOCK:          usize = 228;
@@ -810,6 +811,8 @@ mod nr {
     pub const EPOLL_PWAIT:    usize = 22;
     pub const EPOLL_PWAIT2:   usize = 441;
     pub const EVENTFD2:       usize = 19;
+    pub const MQ_OPEN: usize = 180; pub const MQ_UNLINK: usize = 181; pub const MQ_TIMEDSEND: usize = 182;
+    pub const MQ_TIMEDRECEIVE: usize = 183; pub const MQ_NOTIFY: usize = 184; pub const MQ_GETSETATTR: usize = 185;
     pub const SIGNALFD4:      usize = 74;
     pub const RT_SIGSUSPEND:  usize = 133;
     pub const WAITID:         usize = 95;
@@ -998,6 +1001,7 @@ mod nr {
     pub const GETRANDOM:      usize = 318;
     pub const SECCOMP:        usize = 317;
     pub const PRCTL:          usize = 157;
+    pub const PERSONALITY:    usize = 135;
     pub const MADVISE:        usize = 28;
     pub const MSYNC:          usize = 26;
     pub const MLOCK:          usize = 149;
@@ -1092,6 +1096,8 @@ mod nr {
     pub const EPOLL_PWAIT:    usize = 281;
     pub const EPOLL_PWAIT2:   usize = 441;
     pub const EVENTFD2:       usize = 290;
+    pub const MQ_OPEN: usize = 240; pub const MQ_UNLINK: usize = 241; pub const MQ_TIMEDSEND: usize = 242;
+    pub const MQ_TIMEDRECEIVE: usize = 243; pub const MQ_NOTIFY: usize = 244; pub const MQ_GETSETATTR: usize = 245;
     pub const SIGNALFD4:      usize = 289;
     pub const RT_SIGSUSPEND:  usize = 130;
     pub const PAUSE:          usize = 34;
@@ -2453,6 +2459,12 @@ fn dispatch_inner(
         EPOLL_PWAIT  => sys_epoll_pwait(a0, a1, a2, a3, a4, a5),
         EPOLL_PWAIT2 => sys_epoll_pwait2(a0, a1, a2, a3, a4, a5),
         EVENTFD2       => sys_eventfd2(a0, a1, frame_ptr),
+        MQ_OPEN        => sys_mq_open(a0, a1, a2, a3),
+        MQ_UNLINK      => sys_mq_unlink(a0),
+        MQ_TIMEDSEND   => sys_mq_timedsend(a0, a1, a2, a3, a4),
+        MQ_TIMEDRECEIVE => sys_mq_timedreceive(a0, a1, a2, a3, a4),
+        MQ_NOTIFY      => sys_mq_notify(a0, a1),
+        MQ_GETSETATTR  => sys_mq_getsetattr(a0, a1, a2),
         SIGNALFD4      => sys_signalfd4(a0, a1, a2, a3),
 
         // ── Scheduling policy/affinity ────────────────────────────────────────
@@ -2551,6 +2563,7 @@ fn dispatch_inner(
 
         // ── Misc ──────────────────────────────────────────────────────────────
         UNAME      => sys_uname(a0),
+        PERSONALITY => sched::personality(a0 as u32) as isize,
         PRLIMIT64  => sys_prlimit64(a0, a1, a2, a3),
         // Linux exit_group(2) kills every thread in the calling process, not
         // just the caller. `sched::exit_group` owns that sequence (single
@@ -4296,7 +4309,26 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
     const PR_SET_MM: usize = 35;
     const PR_SET_PDEATHSIG: usize = 1;
     const PR_GET_PDEATHSIG: usize = 2;
+    const PR_GET_KEEPCAPS: usize = 7;
+    const PR_SET_KEEPCAPS: usize = 8;
+    const PR_GET_SECUREBITS: usize = 27;
+    const PR_SET_SECUREBITS: usize = 28;
+    const PR_SET_CHILD_SUBREAPER: usize = 36;
+    const PR_GET_CHILD_SUBREAPER: usize = 37;
+    const PR_CAP_AMBIENT: usize = 47;
     match option {
+        PR_GET_KEEPCAPS => sched::caps::keepcaps(),
+        PR_SET_KEEPCAPS => sched::caps::set_keepcaps(arg2),
+        PR_GET_SECUREBITS => sched::caps::securebits(),
+        PR_SET_SECUREBITS => sched::caps::set_securebits(arg2 as u64),
+        PR_CAP_AMBIENT => sched::caps::ambient(arg2, a3, a4, a5),
+        PR_SET_CHILD_SUBREAPER => { sched::set_child_subreaper(arg2 != 0); 0 }
+        PR_GET_CHILD_SUBREAPER => {
+            let v = (sched::child_subreaper() as i32).to_ne_bytes();
+            if !validate_user_buf(arg2, 4) { return -14; }
+            if unsafe { sched::uaccess::copy_to_user(arg2, v.as_ptr(), 4) } != 0 { return -14; }
+            0
+        }
         PR_SET_NAME => {
             // Up to 15 bytes of the NUL-terminated user string (Linux
             // truncates silently); shared with /proc/<tid>/comm.
@@ -9188,6 +9220,7 @@ fn sys_mount(
             b"devtmpfs" => Some((b"/dev".to_vec(), "devtmpfs")),
             b"sysfs"    => Some((b"/sys".to_vec(), "sysfs")),
             b"devpts"   => Some((b"/dev/pts".to_vec(), "devpts")),
+            b"mqueue"   => Some((b"/dev/mqueue".to_vec(), "mqueue")),
             _ => None,
         }
     };
@@ -16780,3 +16813,116 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
 }
 
 
+
+
+// ---- POSIX message queues (servers/vfs/src/mqueue.rs holds the data) --------
+
+const MQ_NONBLOCK: u32 = 0o4000;
+
+/// Retry `op` until it stops answering EAGAIN: fail at once for an O_NONBLOCK
+/// mqd, else park until the queue changes, a signal arrives (EINTR) or the
+/// absolute CLOCK_REALTIME timeout `ts_ptr` (0 = none) passes (ETIMEDOUT).
+fn mq_blocking<T>(slot: usize, fdflags: u32, ts_ptr: usize, recv: bool,
+                  mut op: impl FnMut() -> Result<T, isize>) -> Result<T, isize> {
+    let mut deadline = u64::MAX;
+    let mut parsed = false;
+    loop {
+        match op() { Err(-11) => {} other => return other }
+        if fdflags & MQ_NONBLOCK != 0 { return Err(-11); }
+        if !parsed {
+            parsed = true;
+            if ts_ptr != 0 {
+                match read_user_timespec(ts_ptr) {
+                    Ok(ns) => deadline = sched::realtime_to_monotonic_ns(ns),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        if monotonic_ns() >= deadline { return Err(-110); } // ETIMEDOUT
+        if interrupted() { return Err(-4); }
+        if recv { vfs::mqueue::recv_waiter(slot, true); }
+        sched::block_on_poll_prepare_until(deadline);
+        let (r, w, _) = vfs::mqueue::readiness(slot);
+        if (if recv { r } else { w }) || monotonic_ns() >= deadline || interrupted() {
+            sched::block_on_poll_cancel();
+        } else {
+            sched::block_on_poll_commit();
+        }
+        if recv { vfs::mqueue::recv_waiter(slot, false); }
+    }
+}
+
+fn sys_mq_open(name_ptr: usize, oflag: usize, mode: usize, attr_ptr: usize) -> isize {
+    let name = match read_user_short_str(name_ptr) { Ok(v) => v, Err(e) => return e };
+    let mut attr = None;
+    if oflag & 0o100 != 0 && attr_ptr != 0 {
+        if !validate_user_buf(attr_ptr, 64) { return -14; }
+        let a = match ua::read_user::<[i64; 8]>(attr_ptr) { Some(v) => v, None => return -14 };
+        attr = Some((a[1], a[2]));
+    }
+    vfs::mqueue::open(current_pid(), &name, oflag as u32, mode as u32, attr)
+}
+
+fn sys_mq_unlink(name_ptr: usize) -> isize {
+    let name = match read_user_short_str(name_ptr) { Ok(v) => v, Err(e) => return e };
+    vfs::mqueue::unlink(current_pid(), &name)
+}
+
+fn sys_mq_timedsend(fd: usize, msg_ptr: usize, len: usize, prio: usize, ts_ptr: usize) -> isize {
+    let (slot, fl) = match vfs::mqueue::lookup_fd(current_pid(), fd) { Ok(v) => v, Err(e) => return e };
+    if len > (1 << 20) { return -90; }
+    let mut data = alloc::vec![0u8; len];
+    if len > 0 {
+        if !validate_user_buf(msg_ptr, len) { return -14; }
+        if unsafe { sched::uaccess::copy_raw(data.as_mut_ptr(), msg_ptr as *const u8, len) } != 0 { return -14; }
+    }
+    match mq_blocking(slot, fl, ts_ptr, false, || vfs::mqueue::try_send(slot, fl, &data, prio as u32)) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_mq_timedreceive(fd: usize, buf_ptr: usize, len: usize, prio_ptr: usize, ts_ptr: usize) -> isize {
+    let (slot, fl) = match vfs::mqueue::lookup_fd(current_pid(), fd) { Ok(v) => v, Err(e) => return e };
+    match mq_blocking(slot, fl, ts_ptr, true, || vfs::mqueue::try_recv(slot, fl, len)) {
+        Ok((data, prio)) => {
+            if !data.is_empty() {
+                if !validate_user_buf(buf_ptr, data.len()) { return -14; }
+                if unsafe { sched::uaccess::copy_raw(buf_ptr as *mut u8, data.as_ptr(), data.len()) } != 0 { return -14; }
+            }
+            if prio_ptr != 0 && !ua::write_user::<u32>(prio_ptr, prio) { return -14; }
+            data.len() as isize
+        }
+        Err(e) => e,
+    }
+}
+
+fn sys_mq_notify(fd: usize, sev_ptr: usize) -> isize {
+    let pid = current_pid();
+    let (slot, _) = match vfs::mqueue::lookup_fd(pid, fd) { Ok(v) => v, Err(e) => return e };
+    if sev_ptr == 0 { return vfs::mqueue::notify(pid, slot, None); }
+    // struct sigevent { sigev_value (8), sigev_signo (4), sigev_notify (4), ... }
+    let w = match ua::read_user::<[u64; 2]>(sev_ptr) { Some(v) => v, None => return -14 };
+    let (value, signo, notify) = (w[0], (w[1] & 0xffff_ffff) as u32, (w[1] >> 32) as u32);
+    match notify {
+        0 => { if signo == 0 || signo > 64 { return -22; } vfs::mqueue::notify(pid, slot, Some((signo, value))) }
+        1 => vfs::mqueue::notify(pid, slot, Some((0, 0))), // SIGEV_NONE
+        _ => -22, // SIGEV_THREAD is a libc helper thread; not served here
+    }
+}
+
+fn sys_mq_getsetattr(fd: usize, new_ptr: usize, old_ptr: usize) -> isize {
+    let pid = current_pid();
+    let (slot, fl) = match vfs::mqueue::lookup_fd(pid, fd) { Ok(v) => v, Err(e) => return e };
+    if new_ptr != 0 && !validate_user_buf(new_ptr, 64) { return -14; }
+    if old_ptr != 0 {
+        let (maxmsg, msgsize, cur) = vfs::mqueue::attr(slot);
+        let a: [i64; 8] = [(fl & MQ_NONBLOCK) as i64, maxmsg, msgsize, cur, 0, 0, 0, 0];
+        if !ua::write_user::<[i64; 8]>(old_ptr, a) { return -14; }
+    }
+    if new_ptr != 0 {
+        let n = match ua::read_user::<[i64; 8]>(new_ptr) { Some(v) => v, None => return -14 };
+        vfs::mqueue::set_nonblock(pid, fd, n[0] as u32 & MQ_NONBLOCK != 0);
+    }
+    0
+}
