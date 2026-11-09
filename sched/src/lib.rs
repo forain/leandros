@@ -3463,6 +3463,8 @@ pub mod poll_class {
     /// The raw HCI node /dev/hci0 (drivers/src/bt/hcidev): a packet queued
     /// for the reader, TX room, or the controller died.
     pub const BT: u32 = 25;
+    /// A POSIX message queue (mq_open), indexed by its slot.
+    pub const MQ: u32 = 27;
     /// A V4L2 capture node (kernel/src/v4l2.rs), index 0.
     pub const VIDEO: u32 = 26;
 }
