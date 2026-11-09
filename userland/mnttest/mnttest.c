@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sched.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <time.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -716,6 +717,100 @@ static void mount_userns_perm(void) {
     rmdir("/tmp/mountperm.d");
 }
 
+/* lane podsys: tmpfs mountable on any directory in the initial mount
+ * namespace (podman's shm, crun's /dev), options honoured, umount frees it. */
+static int tfs_unpriv_child(void) {
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    if (unshare(CLONE_NEWUSER) < 0) return 91;
+    wr("/proc/self/setgroups", "deny");
+    wr("/proc/self/uid_map", "0 1000 1");
+    wr("/proc/self/gid_map", "0 1000 1");
+    errno = 0;
+    int r = mount("shm", "/root/mt-tfs.d", "tmpfs", 0, "mode=1777");
+    if (r == 0) { umount("/root/mt-tfs.d"); return 10; }
+    return errno == EPERM ? 0 : 11;
+}
+
+static void tmpfs_anywhere(void) {
+    const char *d = "/root/mt-tfs.d";
+    int live0 = 0, sb0 = 0, live1 = 0, sb1 = 0;
+    char buf[8192];
+    struct stat st0, st1;
+    int n;
+    /* /proc/sys/kernel entries podman/crun read */
+    n = slurp("/proc/sys/kernel/cap_last_cap", buf, sizeof buf);
+    report("proc_cap_last_cap", n > 0 && atoi(buf) == 40);
+    n = slurp("/proc/sys/kernel/ngroups_max", buf, sizeof buf);
+    report("proc_ngroups_max", n > 0 && atoi(buf) > 0);
+    mkdir(d, 0755);
+    ns_counts(&live0, &sb0);
+    stat(d, &st0);
+    int r = mount("shm", d, "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777,size=65536k");
+    report("tfs_mount_arbitrary_dir", r == 0);
+    if (r != 0) { rmdir(d); return; }
+    char f[128];
+    snprintf(f, sizeof f, "%s/a", d);
+    put(f, "hello", 0644);
+    n = slurp(f, buf, sizeof buf);
+    report("tfs_content_independent", n == 5 && !strcmp(buf, "hello") && stat(d, &st1) == 0 && st1.st_dev != st0.st_dev);
+    report("tfs_mode_default_opts", stat(d, &st1) == 0 && (st1.st_mode & 07777) == 01777);
+    struct statfs sf;
+    report("tfs_nosuid_flag", statfs(d, &sf) == 0 && (sf.f_flags & 2));
+    ns_counts(&live1, &sb1);
+    report("tfs_sb_registered", sb1 == sb0 + 1);
+    r = umount(d);
+    report("tfs_umount_ok", r == 0);
+    report("tfs_umount_frees", stat(f, &st1) != 0 && ns_counts(&live1, &sb1) == 0 && sb1 == sb0);
+    /* a second umount is not a mountpoint */
+    errno = 0;
+    report("tfs_umount_twice_einval", umount(d) < 0 && errno == EINVAL);
+
+    /* options: mode/uid/gid/size */
+    r = mount("shm", d, "tmpfs", 0, "mode=0750,uid=1234,gid=5678,size=64k");
+    report("tfs_opts_mount", r == 0);
+    if (r == 0) {
+        report("tfs_opts_mode_uid_gid", stat(d, &st1) == 0 && (st1.st_mode & 07777) == 0750 && st1.st_uid == 1234 && st1.st_gid == 5678);
+        snprintf(f, sizeof f, "%s/big", d);
+        int fd = open(f, O_WRONLY | O_CREAT, 0644);
+        static char blk[4096];
+        long total = 0; int err = 0;
+        for (int i = 0; i < 40 && fd >= 0; i++) {
+            ssize_t w = write(fd, blk, sizeof blk);
+            if (w < 0) { err = errno; break; }
+            total += w;
+        }
+        if (fd >= 0) close(fd);
+        report("tfs_size_enforced", total == 65536 && err == ENOSPC);
+        umount(d);
+    }
+
+    /* noexec: a copy of this binary will not run from it */
+    r = mount("shm", d, "tmpfs", MS_NOEXEC, "mode=755");
+    report("tfs_noexec_mount", r == 0);
+    if (r == 0) {
+        snprintf(f, sizeof f, "%s/x", d);
+        int in = open("/bin/mnttest", O_RDONLY), out = open(f, O_WRONLY | O_CREAT, 0755);
+        static char cb[65536]; ssize_t k;
+        while (in >= 0 && out >= 0 && (k = read(in, cb, sizeof cb)) > 0) if (write(out, cb, (size_t)k) != k) break;
+        if (in >= 0) close(in);
+        if (out >= 0) close(out);
+        pid_t c = fork();
+        if (c == 0) { execl(f, f, "child-ok", (char *)NULL); _exit(errno == EACCES ? 0 : 1); }
+        int st = 0; waitpid(c, &st, 0);
+        report("tfs_noexec_eacces", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        umount(d);
+    }
+
+    /* an unprivileged user namespace cannot mount it in ns 0 */
+    pid_t c = fork();
+    if (c == 0) _exit(tfs_unpriv_child());
+    int st = 0; waitpid(c, &st, 0);
+    if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) printf("tfs_unpriv status=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    report("tfs_userns_eperm_ns0", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    rmdir(d);
+
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -728,6 +823,7 @@ int main(int argc, char **argv) {
     mountinfo_tests();
     pool_tests();
     mount_userns_perm();
+    tmpfs_anywhere();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }

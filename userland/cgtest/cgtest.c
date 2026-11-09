@@ -245,6 +245,15 @@ static int rmdir_retry(const char *p)
     return -1;
 }
 
+/* Booted by init: /sys/fs/cgroup is cgroup2 before anything mounts it. */
+static int t_cg_boot_mounted(void)
+{
+    struct statfs sf;
+    CHECK(statfs(CGR, &sf) == 0);
+    CHECK((unsigned long)sf.f_type == CGROUP2_SUPER_MAGIC);
+    return 0;
+}
+
 static int t_cg_magic(void)
 {
     CHECK(mnt() == 0);
@@ -591,7 +600,7 @@ int main(int argc, char **argv)
         { "ns_exec_keeps", t_exec_keeps }, { "ns_clone_new", t_clone_new },
         { "ns_eperm_nonroot", t_eperm_nonroot }, { "ns_userns_unshare", t_userns_unshare },
         { "membership_churn", t_churn }, { "ns_leak", t_ns_leak },
-        { "cg_magic", t_cg_magic }, { "cg_mkdir_rmdir", t_cg_mkdir_rmdir },
+        { "cg_boot_mounted", t_cg_boot_mounted }, { "cg_magic", t_cg_magic }, { "cg_mkdir_rmdir", t_cg_mkdir_rmdir },
         { "cg_files", t_cg_files }, { "cg_busy_noproc", t_cg_busy_noproc },
         { "cg_migrate", t_cg_migrate }, { "cg_cgns_rel", t_cg_cgns_rel },
         { "cg_delegate", t_cg_delegate }, { "cg_pids_balance", t_cg_pids_balance },

@@ -541,6 +541,14 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // that one since fstab itself lives on the filesystem being mounted).
     mount_from_fstab();
 
+    // 4b'. cgroup2 at /sys/fs/cgroup, as distros do at boot (podman and
+    // systemd-style tools look for it). nsdelegate makes a cgroup namespace
+    // a delegation boundary. Failure only costs the cgroup tree.
+    if mount(b"none\0".as_ptr(), b"/sys/fs/cgroup\0".as_ptr(), b"cgroup2\0".as_ptr(), 0,
+             b"nsdelegate\0".as_ptr()) < 0 {
+        write_str("WARNING: mounting cgroup2 on /sys/fs/cgroup failed\n");
+    }
+
     // 4c. One XDG runtime directory per account, owned by it, before any login
     // can need one.
     seed_runtime_dirs();
