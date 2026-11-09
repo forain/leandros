@@ -736,6 +736,12 @@ static void tmpfs_anywhere(void) {
     int live0 = 0, sb0 = 0, live1 = 0, sb1 = 0;
     char buf[8192];
     struct stat st0, st1;
+    int n;
+    /* /proc/sys/kernel entries podman/crun read */
+    n = slurp("/proc/sys/kernel/cap_last_cap", buf, sizeof buf);
+    report("proc_cap_last_cap", n > 0 && atoi(buf) == 40);
+    n = slurp("/proc/sys/kernel/ngroups_max", buf, sizeof buf);
+    report("proc_ngroups_max", n > 0 && atoi(buf) > 0);
     mkdir(d, 0755);
     ns_counts(&live0, &sb0);
     stat(d, &st0);
@@ -745,7 +751,7 @@ static void tmpfs_anywhere(void) {
     char f[128];
     snprintf(f, sizeof f, "%s/a", d);
     put(f, "hello", 0644);
-    int n = slurp(f, buf, sizeof buf);
+    n = slurp(f, buf, sizeof buf);
     report("tfs_content_independent", n == 5 && !strcmp(buf, "hello") && stat(d, &st1) == 0 && st1.st_dev != st0.st_dev);
     report("tfs_mode_default_opts", stat(d, &st1) == 0 && (st1.st_mode & 07777) == 01777);
     struct statfs sf;
@@ -803,11 +809,6 @@ static void tmpfs_anywhere(void) {
     report("tfs_userns_eperm_ns0", WIFEXITED(st) && WEXITSTATUS(st) == 0);
     rmdir(d);
 
-    /* /proc/sys/kernel entries podman/crun read */
-    n = slurp("/proc/sys/kernel/cap_last_cap", buf, sizeof buf);
-    report("proc_cap_last_cap", n > 0 && atoi(buf) == 40);
-    n = slurp("/proc/sys/kernel/ngroups_max", buf, sizeof buf);
-    report("proc_ngroups_max", n > 0 && atoi(buf) > 0);
 }
 
 int main(int argc, char **argv) {
