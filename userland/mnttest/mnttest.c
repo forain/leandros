@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sched.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static int fails;
@@ -63,7 +64,26 @@ static void ns0_invariants(void) {
     report("proc_mounts_readable", stat("/proc/self/mountinfo", &st) == 0);
 }
 
-int main(void) {
+/* "mnttest bench": path-lookup cost (ns per call), for A/B against a base kernel. */
+static long long now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000LL + t.tv_nsec; }
+static void bench(void) {
+    static const char *paths[] = { "/bin/mnttest", "/etc/../bin/./mnttest", "/proc/self/status", "/tmp", "/dev/null" };
+    mkdir("/tmp/mb", 0755); mkdir("/tmp/mb/d", 0755);
+    if (chdir("/tmp/mb") != 0) return;
+    struct stat st;
+    for (int round = 0; round < 3; round++) {
+        long long t0 = now_ns(); int n = 0;
+        for (int i = 0; i < 20000; i++) for (int k = 0; k < 5; k++) { stat(paths[k], &st); n++; }
+        long long t1 = now_ns();
+        for (int i = 0; i < 20000; i++) { stat("d/../d", &st); stat("d", &st); n += 2; }
+        long long t2 = now_ns();
+        printf("bench round %d: abs %lld ns/op, rel %lld ns/op\n", round, (t1 - t0) / 100000, (t2 - t1) / 40000);
+    }
+    chdir("/");
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     kernel_selftest();
     sb_hidden_ns0();
     ns0_invariants();
