@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
@@ -772,6 +773,161 @@ static int kuid0_not_nsroot(void)
     return fin(c, go) == CAP_EXIT_NONE ? 0 : 1;
 }
 
+
+/* ---- idsig: signals, rlimits, priorities and /proc/<pid>/ns/* across user namespaces -- */
+
+/* Fork a helper that waits for `go`, becomes `uid` (>= 0) and then sleeps; writes 'r' when ready. */
+static pid_t spawn_sleeper(int uid, int *go)
+{
+    int g[2], r[2];
+    if (pipe(g) || pipe(r)) return -1;
+    pid_t c = fork();
+    if (c < 0) return -1;
+    if (c == 0) {
+        char b = 'r';
+        close(g[1]); close(r[0]);
+        if (uid >= 0 && (setresgid(uid, uid, uid) || setresuid(uid, uid, uid))) _exit(98);
+        (void)!write(r[1], &b, 1);
+        (void)!read(g[0], &b, 1);
+        _exit(0);
+    }
+    close(g[0]); close(r[1]);
+    char b = 0;
+    int ok = read(r[0], &b, 1) == 1 && b == 'r';
+    close(r[0]);
+    if (!ok) { close(g[1]); kill(c, SIGKILL); waitpid(c, NULL, 0); return -1; }
+    *go = g[1];
+    return c;
+}
+static void reap_sleeper(pid_t c, int go) { close(go); kill(c, SIGKILL); waitpid(c, NULL, 0); }
+
+/* In ns N1 (root = kuid 1000, "1 100000 65536"): a child of ours that setuid(1) is kuid 100000. */
+static pid_t fork_subuid_child(int *go)
+{
+    int g[2], r[2];
+    if (pipe(g) || pipe(r)) return -1;
+    pid_t c = fork();
+    if (c < 0) return -1;
+    if (c == 0) {
+        char b = 'r';
+        close(g[1]); close(r[0]);
+        if (setresuid(1, 1, 1)) _exit(98);
+        (void)!write(r[1], &b, 1);
+        (void)!read(g[0], &b, 1);
+        _exit(0);
+    }
+    close(g[0]); close(r[1]);
+    char b = 0;
+    int ok = read(r[0], &b, 1) == 1 && b == 'r';
+    close(r[0]);
+    if (!ok) { close(g[1]); kill(c, SIGKILL); waitpid(c, NULL, 0); return -1; }
+    *go = g[1];
+    return c;
+}
+
+static int c_kill_subuid(void *a)
+{
+    (void)a;
+    int go; pid_t t = fork_subuid_child(&go);
+    CHECK(t > 0);
+    CHECK(kill(t, 0) == 0);                 /* CAP_KILL in the target's userns */
+    CHECK(kill(t, SIGKILL) == 0);
+    int st = 0;
+    CHECK(waitpid(t, &st, 0) == t);
+    close(go);
+    CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+    return 0;
+}
+static int kill_subuid_capkill_ns(void)
+{
+    if (!knob) return SKIP;
+    int go; pid_t c = spawn(1000, c_kill_subuid, NULL, &go);
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", PODMAN) == 0);
+    return fin(c, go);
+}
+
+/* CAP_KILL in a child namespace is no power over a host task, even one whose numeric id (0) matches. */
+static int c_kill_host(void *a)
+{
+    pid_t h = *(pid_t *)a;
+    CHECK(kill(h, 0) == -1 && errno == EPERM);
+    CHECK(kill(h, SIGKILL) == -1 && errno == EPERM);
+    errno = 0;
+    CHECK(setpriority(PRIO_PROCESS, h, 5) == -1 && errno == EPERM);
+    return 0;
+}
+static int kill_host_same_kuid_denied(void)
+{
+    int hgo; pid_t h = spawn_sleeper(-1, &hgo);          /* host root */
+    CHECK(h > 0);
+    int go; pid_t c = spawn(1000, c_kill_host, &h, &go);   /* no map needed: caps exist in N1 */
+    CHECK(c > 0);
+    int r = fin(c, go);
+    reap_sleeper(h, hgo);
+    return r;
+}
+
+static int c_prlimit_child(void *a)
+{
+    pid_t h = *(pid_t *)a;
+    struct rlimit rl;
+    int go; pid_t t = fork_subuid_child(&go);
+    CHECK(t > 0);
+    CHECK(prlimit(t, RLIMIT_NOFILE, NULL, &rl) == 0);       /* CAP_SYS_PTRACE in the target's userns */
+    CHECK(setpriority(PRIO_PROCESS, t, 5) == 0);            /* CAP_SYS_NICE likewise */
+    close(go); kill(t, SIGKILL); waitpid(t, NULL, 0);
+    CHECK(prlimit(h, RLIMIT_NOFILE, NULL, &rl) == -1 && errno == EPERM);   /* host root: no */
+    return 0;
+}
+static int prlimit_ns_child(void)
+{
+    if (!knob) return SKIP;
+    int hgo; pid_t h = spawn_sleeper(-1, &hgo);
+    CHECK(h > 0);
+    int go; pid_t c = spawn(1000, c_prlimit_child, &h, &go);
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", PODMAN) == 0);
+    int r = fin(c, go);
+    reap_sleeper(h, hgo);
+    return r;
+}
+
+/* ns-root opens the ns file of a task it is privileged over (a mapped sub-uid). */
+static int c_opens_ns_mapped(void *a)
+{
+    (void)a;
+    int go; pid_t t = fork_subuid_child(&go);
+    CHECK(t > 0);
+    char p[64];
+    snprintf(p, sizeof p, "/proc/%d/ns/net", (int)t);
+    int fd = open(p, O_RDONLY);
+    CHECK(fd >= 0);
+    close(fd);
+    close(go); kill(t, SIGKILL); waitpid(t, NULL, 0);
+    return 0;
+}
+static int nsroot_opens_ns_of_mapped_user(void)
+{
+    if (!knob) return SKIP;
+    int go; pid_t c = spawn(1000, c_opens_ns_mapped, NULL, &go);
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", PODMAN) == 0);
+    return fin(c, go);
+}
+
+/* An unprivileged user cannot open root's /proc/1/ns/*; its own is fine. */
+static int ns_open_needs_ptrace_access(void)
+{
+    if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) return 98;
+    int fd = open("/proc/1/ns/net", O_RDONLY);
+    CHECK(fd < 0 && errno == EACCES);
+    fd = open("/proc/self/ns/net", O_RDONLY);
+    CHECK(fd >= 0);
+    close(fd);
+    return 0;
+}
+
 /* ---- table -------------------------------------------------------------- */
 
 /* ---- idxlate: ids coming in are translated (set*id, chown, setfs*id, groups) ---- */
@@ -1213,6 +1369,11 @@ static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "setuid_drops_caps", setuid_drops_caps },
     { "exec_nonroot_nocaps", exec_nonroot_nocaps },
     { "kuid0_not_nsroot", kuid0_not_nsroot },
+    { "kill_subuid_capkill_ns", kill_subuid_capkill_ns },
+    { "kill_host_same_kuid_denied", kill_host_same_kuid_denied },
+    { "nsroot_opens_ns_of_mapped_user", nsroot_opens_ns_of_mapped_user },
+    { "prlimit_ns_child", prlimit_ns_child },
+    { "ns_open_needs_ptrace_access", ns_open_needs_ptrace_access },
     { "host_root_fs_unaffected", host_root_fs_unaffected },
     { "trusted_xattr_host_only", trusted_xattr_host_only },
     { "fcap_xattr_eperm_in_ns", fcap_xattr_eperm_in_ns },
