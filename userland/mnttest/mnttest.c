@@ -255,6 +255,9 @@ static void ns_child(const char *base, int wr, int rd) {
     int r = unshare(CLONE_NEWUSER | CLONE_NEWNS);
     report("newns_unpriv_unshare", r == 0);
     if (r) { fflush(stdout); _exit(1); }
+    /* Map our own ids (identity): creating files with unmapped ids is EOVERFLOW. */
+    { static const char *mp[][2] = { {"/proc/self/setgroups", "deny"}, {"/proc/self/uid_map", "65534 65534 1"}, {"/proc/self/gid_map", "65534 65534 1"} };
+      for (int mi = 0; mi < 3; mi++) { int mfd = open(mp[mi][0], O_WRONLY); if (mfd >= 0) { if (write(mfd, mp[mi][1], strlen(mp[mi][1])) < 0) {} close(mfd); } } }
     /* cwd survives the unshare: a relative open still finds the file. */
     report("newns_cwd_kept", access("marker", F_OK) == 0 && getcwd(cwd, sizeof cwd) && !strcmp(cwd, a));
     /* a bind: visible here, not outside */
@@ -274,7 +277,6 @@ static void ns_child(const char *base, int wr, int rd) {
         ok = write(fd, "hi", 2) == 2 && lseek(fd, 0, SEEK_SET) == 0 && read(fd, rb, 7) == 2 && !memcmp(rb, "hi", 2);
         close(fd);
     }
-    if (!ok) printf("newns_tmpfs_rw: errno=%d fd=%d uid=%d\n", errno, fd, (int)getuid());
     report("newns_tmpfs_rw", ok);
     sync_parent(wr, rd);
     report("newns_umount", umount_(t, 0) == 0);
