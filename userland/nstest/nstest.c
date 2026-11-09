@@ -2098,6 +2098,9 @@ static int t_setns_fd_holds(void)
     CHECK(sys_setns(nf, CLONE_NEWNET) == 0);
     CHECK(link_ino("/proc/self/ns/net") == ino);
     ns_release(c2, hw2);
+    return 0;
+}
+
 /* ── UTS namespaces ─────────────────────────────────────────────────────── */
 static int hn_is(const char *want)
 {
