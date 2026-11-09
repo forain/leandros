@@ -570,7 +570,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         }
         // Re-check under the RUN_QUEUE hold: zap sets pid_dead before it takes
         // the lock, so every child is either seen by zap's collect or refused.
-        if pidns_target != 0 && crate::ns::pid_dead(pidns_target) {
+        if pidns_target != 0 && crate::ns::pid_dead_in_chain(pidns_target) {
             drop(rq);
             drop(child);
             mm::buddy::free(stack_base_phys, stack_pages);
@@ -931,7 +931,7 @@ pub fn clone_thread(
         }
         // Re-check under the RUN_QUEUE hold: zap sets pid_dead before it takes
         // the lock, so every child is either seen by zap's collect or refused.
-        if pidns_target != 0 && crate::ns::pid_dead(pidns_target) {
+        if pidns_target != 0 && crate::ns::pid_dead_in_chain(pidns_target) {
             drop(rq);
             drop(child);
             mm::buddy::free(stack_base_phys, stack_pages);

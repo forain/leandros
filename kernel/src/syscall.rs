@@ -8649,18 +8649,23 @@ fn sys_openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize
 fn lstat_magic_link(ns: &[u8], statbuf_ptr: usize) -> Option<isize> {
     if let Some((pid, k)) = proc_ns_link(ns) {
         if sched::exists_probe(pid) != 0 { return Some(-2); }
+        if !proc_link_allowed(pid) { return Some(-13); }
         let (u, g) = sched::cred::ids_of(pid).map(|(u, g)| (u[1], g[1])).unwrap_or((0, 0));
         vfs::write_stat_full(statbuf_ptr, 0o120777, 1, 0, 0x7200_0000_0000u64 | ((pid as u64) << 8) | k as u64, u, g);
         return Some(0);
     }
     if !is_magic_link(ns) { return None; }
-    let b = backing_of(ns).unwrap_or_else(|| ns.to_vec());
+    let mut denied = false;
+    let walked = backing_walk_d(ns, &mut false, &mut denied);
+    if denied { return Some(-13); }
+    let b = walked.unwrap_or_else(|| ns.to_vec());
     let mut found = None;
     for (k, what) in [&b"exe"[..], b"cwd", b"root", b"fd"].iter().enumerate() {
         if let Some((pid, rest)) = proc_magic(&b, what) { found = Some((k, pid, rest.to_vec())); break; }
     }
     let (k, pid, rest) = found?;
     if sched::exists_probe(pid) != 0 { return Some(-2); }
+    if k != 3 && !proc_link_allowed(pid) { return Some(-13); }
     let mut mode = 0o120777;
     let mut ino = 0x7000_0000_0000u64 | ((pid as u64) << 8) | k as u64;
     if k == 3 {
@@ -8688,6 +8693,7 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
     if let Some((pid, rest)) = proc_magic(b, b"exe") {
         if rest.is_empty() {
             if sched::exists_probe(pid) != 0 { return Err(-2); }
+            if !proc_link_allowed(pid) { return Err(-13); }
             let mut kb: Vec<u8> = alloc::vec![0u8; HOST_PATH_MAX];
             return Ok(match sched::exe_path(sched::tgid_of(pid), &mut kb) {
                 Some(n) => KPath::raw(&kb[..n]),
@@ -8697,6 +8703,7 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
     }
     if let Some((pid, rest)) = proc_magic(b, b"cwd") {
         if rest.is_empty() {
+            if sched::exists_probe(pid) == 0 && !proc_link_allowed(pid) { return Err(-13); }
             let c = sched::cwd_arc_of(pid).ok_or(-2isize)?;
             return KPath::from_ns(c.to_vec());
         }
@@ -8704,6 +8711,7 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
     if let Some((pid, rest)) = proc_magic(b, b"root") {
         if rest.is_empty() {
             if sched::exists_probe(pid) != 0 { return Err(-2); }
+            if !proc_link_allowed(pid) { return Err(-13); }
             let r = sched::root_arc_of(pid).map(|r| r.to_vec()).unwrap_or_else(|| b"/".to_vec());
             return KPath::from_ns(r);
         }
@@ -10423,6 +10431,13 @@ fn sys_chdir(path_ptr: usize) -> isize {
     // chdir("/proc/self/fd/N") follows the magic link, as on Linux: it is
     // fchdir(N), not a cwd inside /proc.
     if let Some((fd, b"")) = proc_own_fd(path.bytes()) { return sys_fchdir(fd); }
+    // chdir("/proc/<pid>/cwd|root") follows the magic link; another user's is EACCES.
+    // The link target is another live process's cwd/root, reached by the magic
+    // jump rather than a walk, so it needs no search-permission probe.
+    let magic = proc_magic(path.bytes(), b"cwd").map_or(false, |(_, r)| r.is_empty())
+        || proc_magic(path.bytes(), b"root").map_or(false, |(_, r)| r.is_empty());
+    let path = match follow_magic_final(path) { Ok(p) => p, Err(e) => return e };
+    if magic { sched::set_cwd(path.ns_bytes()); return 0; }
 
     // Check the target exists by opening it O_RDONLY. Probe the *resolved*
     // path: re-resolving the user pointer here would repeat the work, and
@@ -10684,6 +10699,7 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
     }
     if let Some((pid, k)) = proc_ns_link(path) {
         if sched::exists_probe(pid) != 0 { return -2; }
+        if !proc_link_allowed(pid) { return -13; }
         let mut b = [0u8; 48];
         let name = sched::ns::NS_NAMES[k];
         let mut n = name.len();
@@ -10862,7 +10878,10 @@ impl KPath {
             kp.ns = Some(ns);
             return Ok(kp);
         }
-        let backing = match backing_of(&ns) { Some(b) => b, None => {
+        let mut denied = false;
+        let walked = backing_walk_d(&ns, &mut false, &mut denied);
+        if denied { return Err(-13); }
+        let backing = match walked { Some(b) => b, None => {
             if ns.len() >= HOST_PATH_MAX { return Err(-36); }
             return Ok(KPath::raw(&ns));
         } };
@@ -10931,6 +10950,12 @@ fn backing_of(ns: &[u8]) -> Option<Vec<u8>> {
 /// [`backing_of`], also reporting in `crossed` whether any step of the walk
 /// went through an alias mount (all of which are nosuid).
 fn backing_walk(ns: &[u8], crossed: &mut bool) -> Option<Vec<u8>> {
+    backing_walk_d(ns, crossed, &mut false)
+}
+
+/// [`backing_walk`], also reporting in `denied` that a `/proc/<pid>/{root,cwd}`
+/// hop named another user's process (the readlink gate, `proc_link_allowed`).
+fn backing_walk_d(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<Vec<u8>> {
     *crossed |= vfs::alias::crosses(ns);
     let mut cur: Option<Vec<u8>> = vfs::alias::translate(ns);
     for _ in 0..4 {
@@ -10939,6 +10964,7 @@ fn backing_walk(ns: &[u8], crossed: &mut bool) -> Option<Vec<u8>> {
         let hit = proc_magic(p, b"root").map(|(pid, rest)| (pid, rest, true))
             .or_else(|| proc_magic(p, b"cwd").map(|(pid, rest)| (pid, rest, false)));
         let (pid, rest, is_root) = match hit { Some(h) if !h.1.is_empty() => h, _ => break };
+        if sched::exists_probe(pid) == 0 && !proc_link_allowed(pid) { *denied = true; break; }
         let base: alloc::sync::Arc<[u8]> = if is_root {
             match sched::root_arc_of(pid) {
                 Some(r) => r,

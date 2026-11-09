@@ -147,7 +147,7 @@ pub fn fork_target(parent: u32, thread: bool, explicit: NsId) -> Result<NsId, is
             None => 0,
         }
     };
-    if t != 0 && ns::pid_dead(t) { return Err(-12); }
+    if t != 0 && ns::pid_dead_in_chain(t) { return Err(-12); }
     Ok(t)
 }
 

@@ -200,6 +200,15 @@ pub fn new_pidns(parent: NsId) -> Result<NsRef, isize> {
 }
 pub fn pid_init(id: NsId) -> u32 { if id == 0 { 0 } else { PID_INIT[id as usize].load(Acquire) } }
 pub fn pid_dead(id: NsId) -> bool { id != 0 && PID_FLAGS[id as usize].load(Acquire) & 1 != 0 }
+/// `id` or any ancestor pid namespace is dying.
+pub fn pid_dead_in_chain(id: NsId) -> bool {
+    let mut n = id; let mut steps = 0;
+    while n != 0 && steps <= MAX_PIDNS_LEVEL as usize + 1 {
+        if pid_dead(n) { return true; }
+        n = parent(n); steps += 1;
+    }
+    false
+}
 pub fn set_pid_dead(id: NsId) { if id != 0 { PID_FLAGS[id as usize].fetch_or(1, AcqRel); } }
 pub fn claim_pid_init(id: NsId, kpid: u32) -> bool {
     id != 0 && PID_INIT[id as usize].compare_exchange(0, kpid, AcqRel, Relaxed).is_ok()
