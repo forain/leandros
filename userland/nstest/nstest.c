@@ -1276,7 +1276,7 @@ static int t_sock_netns_scm(void)
 /* A socket keeps its network namespace alive (counted ref): once the creating
  * tasks are gone the id must not be reused by a new namespace that would then
  * inherit the old abstract listeners. */
-static int send_fd(int sv, int fd)
+static int nsr_send_fd(int sv, int fd)
 {
     char b = 'x'; struct iovec iv = { &b, 1 };
     char cb[CMSG_SPACE(sizeof(int))]; memset(cb, 0, sizeof cb);
@@ -1286,7 +1286,7 @@ static int send_fd(int sv, int fd)
     memcpy(CMSG_DATA(cm), &fd, sizeof fd);
     return sendmsg(sv, &m, 0) == 1 ? 0 : -1;
 }
-static int recv_fd(int sv)
+static int nsr_recv_fd(int sv)
 {
     char b; struct iovec iv = { &b, 1 };
     char cb[CMSG_SPACE(sizeof(int))];
@@ -1305,11 +1305,11 @@ static int t_sock_ns_reuse(void)
     pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
     if (c == 0) {
         int s = abs_bind("nssockref-x");
-        if (s < 0 || send_fd(sv[0], s)) _exit(1);
+        if (s < 0 || nsr_send_fd(sv[0], s)) _exit(1);
         _exit(0);
     }
     CHECK(c > 0);
-    int fd = recv_fd(sv[1]);
+    int fd = nsr_recv_fd(sv[1]);
     CHECK(fd >= 0);
     int st = 0; waitpid(c, &st, 0);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
