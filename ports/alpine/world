@@ -26,3 +26,13 @@ kbd-bkeymaps
 ripgrep
 dosfstools
 xfsprogs
+podman
+crun
+conmon
+netavark
+aardvark-dns
+passt
+fuse-overlayfs
+slirp4netns
+shadow-subids
+containers-common

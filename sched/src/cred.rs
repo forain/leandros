@@ -25,12 +25,13 @@ const SIGCONT: u32 = 18;
 
 /// Snapshot of the identity a check needs from the calling thread.
 #[derive(Clone, Copy)]
-struct Caller { tgid: Pid, sid: Pid, uid: u32, euid: u32, gid: u32, pidns: crate::ns::NsId }
+struct Caller { tgid: Pid, sid: Pid, uid: u32, euid: u32, gid: u32, pidns: crate::ns::NsId, root: bool }
 
 fn caller(rq: &runqueue::RunQueue) -> Option<Caller> {
     rq.find_pid(current_pid()).map(|t| Caller {
         tgid: t.tgid, sid: t.sid,
         uid: t.uid, euid: t.euid, gid: t.gid, pidns: t.pidns.id(),
+        root: t.euid == 0 && t.userns.id() == 0,
     })
 }
 
@@ -38,7 +39,7 @@ fn caller(rq: &runqueue::RunQueue) -> Option<Caller> {
 /// the caller's own thread group, and SIGCONT within the caller's session.
 fn may_signal(c: &Caller, t: &Task, sig: u32) -> bool {
     if t.tgid == c.tgid { return true; }
-    if c.euid == 0 { return true; } // CAP_KILL
+    if c.root { return true; } // CAP_KILL (host root; idsig adds the ns-scoped term)
     if c.euid == t.suid || c.euid == t.uid || c.uid == t.suid || c.uid == t.uid { return true; }
     sig == SIGCONT && t.sid == c.sid
 }
@@ -270,7 +271,7 @@ pub fn set_re_ids(r: u32, e: u32, gid: bool) -> isize {
 /// Linux `set_one_prio_perm`: root, or the caller's euid is the target's real
 /// or effective uid.
 fn same_owner(c: &Caller, t: &Task) -> bool {
-    c.euid == 0 || c.euid == t.uid || c.euid == t.euid
+    c.root || c.euid == t.uid || c.euid == t.euid
 }
 
 fn leader_rlimit(rq: &runqueue::RunQueue, tgid: Pid, res: usize) -> u64 {
@@ -287,7 +288,7 @@ pub fn set_nice_checked(matches: impl Fn(&Task) -> bool, nice: i8) -> isize {
     let mut rq = RUN_QUEUE.lock();
     let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
     let rlim_nice = leader_rlimit(&rq, c.tgid, task::RLIMIT_NICE);
-    let can_nice = c.euid == 0 || (20 - nice as i64) as u64 <= rlim_nice;
+    let can_nice = c.root || (20 - nice as i64) as u64 <= rlim_nice;
     let mut err = ESRCH;
     for i in rq.live_slots() {
         let (m, owner_ok, lowering) = match rq.get(i) {
@@ -326,7 +327,7 @@ pub fn sched_policy_check(pid: Pid, policy: Option<u32>, prio: i32) -> isize {
     let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
     let pid = if pid == 0 { current_pid() } else { pid };
     let t = match rq.find_pid(pid) { Some(t) => t, None => return ESRCH };
-    if c.euid == 0 { return 0; }
+    if c.root { return 0; }
     if !same_owner(&c, t) { return EPERM; }
     if rt && (prio as u64) > leader_rlimit(&rq, t.tgid, task::RLIMIT_RTPRIO) { return EPERM; }
     0
@@ -376,7 +377,7 @@ pub fn prlimit(pid: Pid, res: usize, new: Option<[u64; 2]>) -> Result<[u64; 2], 
     let tgid = if pid == 0 { c.tgid } else {
         match rq.find_pid(pid) {
             Some(t) => {
-                if t.tgid != c.tgid && c.euid != 0
+                if t.tgid != c.tgid && !c.root
                     && !(c.uid == t.uid && c.uid == t.euid && c.uid == t.suid
                          && c.gid == t.gid && c.gid == t.egid && c.gid == t.sgid) {
                     return Err(EPERM);
@@ -389,7 +390,7 @@ pub fn prlimit(pid: Pid, res: usize, new: Option<[u64; 2]>) -> Result<[u64; 2], 
     let l = match rq.find_pid_mut(tgid) { Some(l) => l, None => return Err(ESRCH) };
     let old = l.rlimits[res];
     if let Some(nl) = new {
-        if nl[1] > old[1] && c.euid != 0 { return Err(EPERM); }
+        if nl[1] > old[1] && !c.root { return Err(EPERM); }
         l.rlimits[res] = nl;
         if res == task::RLIMIT_CPU && nl[0] != task::RLIM_INFINITY {
             super::CPU_RLIMIT_SET.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -423,7 +424,7 @@ pub fn ids_of(pid: Pid) -> Option<([u32; 4], [u32; 4])> {
 pub fn ipc_send_check(owner: Pid) -> isize {
     let rq = RUN_QUEUE.lock();
     let c = match rq.find_pid(current_pid()) { Some(t) => t, None => return EPERM };
-    if c.euid == 0 { return 0; }
+    if c.euid == 0 && c.userns.id() == 0 { return 0; }
     let t = match rq.find_pid(owner) { Some(t) => t, None => return EPERM };
     if t.tgid == c.tgid { return 0; }
     let u = c.euid;
@@ -450,7 +451,7 @@ pub fn ptrace_attach_check(target: Pid) -> isize {
     let c = match rq.find_pid(current_pid()) { Some(t) => t, None => return ESRCH };
     let t = match rq.find_pid(target) { Some(t) => t, None => return ESRCH };
     if t.tgid == c.tgid { return 0; }
-    if c.euid == 0 { return 0; } // CAP_SYS_PTRACE
+    if c.euid == 0 && c.userns.id() == 0 { return 0; } // CAP_SYS_PTRACE (host)
     let (u, g) = (c.uid, c.gid);
     let ids_ok = t.uid == u && t.euid == u && t.suid == u
               && t.gid == g && t.egid == g && t.sgid == g;
@@ -461,5 +462,5 @@ pub fn ptrace_attach_check(target: Pid) -> isize {
 /// True when the calling thread is privileged (euid 0) — the gate for the
 /// Leandros-private debug/bring-up syscalls (SYS_SPAWN, SYS_DBG_SERIAL_WRITE).
 pub fn current_is_root() -> bool {
-    RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.euid == 0).unwrap_or(false)
+    RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.euid == 0 && t.userns.id() == 0).unwrap_or(false)
 }
