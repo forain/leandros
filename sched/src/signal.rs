@@ -1520,8 +1520,9 @@ pub fn write_siginfo(buf: &mut [u8], base: usize, sig: u32, info: crate::task::S
         put(buf, si_off::UID, info.si_uid.to_le_bytes());          // si_overrun
         buf[base + si_off::VALUE..base + si_off::VALUE + 8]
             .copy_from_slice(&info.si_value.to_le_bytes());        // si_value
-    } else if info.si_code == -1 {
-        // SI_QUEUE (rt_sigqueueinfo / sigqueue): `_rt` = pid, uid, sigval.
+    } else if info.si_code == -1 || info.si_code == -3 {
+        // SI_QUEUE (rt_sigqueueinfo / sigqueue) and SI_MESGQ (mq_notify):
+        // `_rt` = pid, uid, sigval.
         put(buf, si_off::PID, info.si_pid.to_le_bytes());
         put(buf, si_off::UID, crate::ns::view_id(0, info.si_uid).to_le_bytes());
         buf[base + si_off::VALUE..base + si_off::VALUE + 8]

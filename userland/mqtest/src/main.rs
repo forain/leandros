@@ -4,6 +4,7 @@
 //! and the mqueue filesystem (mount, readdir, QSIZE read, unlink).
 //! Exits with the number of failed checks.
 
+#![feature(c_variadic)]
 #![no_std]
 #![no_main]
 
@@ -117,7 +118,7 @@ unsafe fn t_nonblock_and_timeout() {
     check(b"send 1", send(fd, b"a", 0, 0), 0); check(b"send 2", send(fd, b"b", 0, 0), 0);
     check(b"O_NONBLOCK send on full is EAGAIN", send(fd, b"c", 0, 0), EAGAIN);
     // mq_setattr clears O_NONBLOCK; a timed receive then blocks until the timeout.
-    let mut a = [0i64; 8];
+    let a = [0i64; 8];
     sc(nr::MQ_GETSETATTR, [fd, a.as_ptr() as i64, 0, 0, 0, 0]);
     check(b"drain 1", recv(fd, &mut buf, &mut pr, 0), 1); check(b"drain 2", recv(fd, &mut buf, &mut pr, 0), 1);
     let t0 = now_ns();
@@ -187,6 +188,8 @@ unsafe fn t_notify() {
     check(b"no signal before a message", sc(nr::SIGTIMEDWAIT, [&mask as *const u64 as i64, info.as_mut_ptr() as i64, ts.as_ptr() as i64, 8, 0, 0]), -11);
     send(fd, b"n", 0, 0);
     check(b"SIGEV_SIGNAL delivered on first message", sc(nr::SIGTIMEDWAIT, [&mask as *const u64 as i64, info.as_mut_ptr() as i64, ts.as_ptr() as i64, 8, 0, 0]), usr1);
+    check(b"siginfo si_code is SI_MESGQ", i32::from_ne_bytes([info[8], info[9], info[10], info[11]]) as i64, -3);
+    check(b"siginfo si_value carries sigev_value", i64::from_ne_bytes([info[24], info[25], info[26], info[27], info[28], info[29], info[30], info[31]]), 0x1234);
     send(fd, b"m", 0, 0);
     check(b"notification is one-shot", sc(nr::SIGTIMEDWAIT, [&mask as *const u64 as i64, info.as_mut_ptr() as i64, ts.as_ptr() as i64, 8, 0, 0]), -11);
     close(fd); mq_unlink(b"/mqt_nf");
@@ -258,6 +261,27 @@ unsafe fn t_fs() {
     close(fd);
 }
 
+unsafe fn t_proc() {
+    let mut p = [0u8; 96]; let mut buf = [0u8; 2048];
+    let f = sc(nr::OPENAT, [AT_FDCWD, cs(b"/proc/sys/fs/mqueue/msg_max", &mut p), O_RDONLY, 0, 0, 0]);
+    truth(b"/proc/sys/fs/mqueue/msg_max opens", f >= 0);
+    let n = sc(nr::READ, [f, buf.as_mut_ptr() as i64, 64, 0, 0, 0]);
+    truth(b"msg_max reads 10", n >= 2 && &buf[..2] == b"10");
+    close(f);
+    for nm in [&b"/proc/sys/fs/mqueue/msgsize_max"[..], b"/proc/sys/fs/mqueue/queues_max", b"/proc/sys/fs/mqueue/msg_default", b"/proc/sys/fs/mqueue/msgsize_default"] {
+        let f = sc(nr::OPENAT, [AT_FDCWD, cs(nm, &mut p), O_RDONLY, 0, 0, 0]);
+        truth(b"mqueue sysctl file opens", f >= 0);
+        close(f);
+    }
+    let f = sc(nr::OPENAT, [AT_FDCWD, cs(b"/proc/mounts", &mut p), O_RDONLY, 0, 0, 0]);
+    let n = sc(nr::READ, [f, buf.as_mut_ptr() as i64, 2048, 0, 0, 0]);
+    let needle = b"mqueue /dev/mqueue mqueue";
+    let mut found = false;
+    if n > 0 { let n = n as usize; let mut i = 0; while i + needle.len() <= n { if &buf[i..i + needle.len()] == needle { found = true; break; } i += 1; } }
+    truth(b"/proc/mounts lists /dev/mqueue", found);
+    close(f);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     t_priority_order();
@@ -267,6 +291,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
     t_notify();
     t_ipcns();
     t_fs();
+    t_proc();
     puts(b"--- mqtest done: "); putn(FAILS as i64); puts(b" failed ---\n");
     FAILS
 }

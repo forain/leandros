@@ -4387,6 +4387,11 @@ static RAMFS: &[RamEntry] = &[
     // Linux's ceiling; threads-max is the task table (`runqueue::MAX_TASKS`,
     // asserted below).
     RamEntry { path: b"/proc/sys/kernel/pid_max",    data: b"4194304\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/msg_max", data: b"10\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/msgsize_max", data: b"8192\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/queues_max", data: b"256\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/msg_default", data: b"10\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/msgsize_default", data: b"8192\n" },
     RamEntry { path: b"/proc/sys/kernel/threads-max", data: b"4096\n" },
     RamEntry { path: b"/proc/sys/vm/overcommit_memory", data: b"0\n" },
 ];
@@ -5876,6 +5881,15 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, fstype.as_bytes());
         // Alias mounts are always nosuid (see alias.rs).
         p = write_lit(buf, p, b" rw,nosuid 0 0\n");
+        if p >= buf.len() { return start; }
+    }
+    // The built-in mqueue tree (served at /dev/mqueue like /dev/pts) is a mount
+    // too; an explicit `mount -t mqueue` at the same place is a no-op alias
+    // and would otherwise leave /proc/mounts without it.
+    let jailed = matches!(sched::current_root_arc().as_deref(), Some(r) if r.len() > 1);
+    if !jailed {
+        let start = p;
+        p = write_lit(buf, p, b"mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec 0 0\n");
         if p >= buf.len() { return start; }
     }
     p
