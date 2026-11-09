@@ -122,7 +122,10 @@ pub fn unshare_pid() -> isize {
 /// If it is a namespace init, further forks into that namespace fail ENOMEM.
 pub fn on_process_exit(tgid: u32) {
     let n = pidns_of(tgid);
-    if n != 0 && ns::pid_init(n) == tgid { ns::set_pid_dead(n); }
+    if n != 0 && ns::pid_init(n) == tgid {
+        ns::set_pid_dead(n);
+        zap(n, tgid);
+    }
 }
 
 /// (active, for-children) pid namespaces of the calling task.
@@ -180,4 +183,74 @@ pub fn own_v_of_task(k: u32) -> u32 {
     if !USED.load(Ordering::Relaxed) { return k; }
     let n = pidns_of(k);
     if n != 0 && ns::pid_init(n) == k { 1 } else { k }
+}
+
+// ---- P2 (lane nspidinit) ----
+
+/// A pid argument of a by-pid syscall: 0 ("self") stays 0, else `from_cur`.
+#[inline]
+pub fn arg(v: u32) -> Result<u32, isize> {
+    if v == 0 { Ok(0) } else { from_cur(v) }
+}
+
+/// A kernel pid/pgid/sid as the caller sees it (identity outside a namespace).
+#[inline]
+pub fn out(k: u32) -> u32 {
+    let n = cur();
+    if n == 0 { k } else { to_v(n, k) }
+}
+
+/// Should a user-sent `sig` from a task in `sender_ns` to `target` (a thread
+/// group leader) be silently dropped? Only for a namespace init without a
+/// handler: same-ns senders can't kill/stop it, ancestors may (SIGKILL/SIGSTOP).
+pub fn init_drops(sender_ns: NsId, target: &crate::task::Task, sig: u32) -> bool {
+    let tn = target.pidns.id();
+    if tn == 0 || sig == 0 || sig > 64 || target.tgid != ns::pid_init(tn) { return false; }
+    if target.signal_actions[(sig - 1) as usize].handler != 0 { return false; }
+    if sender_ns == tn { return true; }
+    !matches!(sig, 9 | 19)
+}
+
+/// Reaper for the orphans of exiting process `dead`: the nearest live
+/// namespace init up the chain, else the global init (0 if none).
+pub fn reaper_for(dead: u32) -> u32 {
+    let mut n = pidns_of(dead);
+    let mut steps = 0;
+    while n != 0 && steps <= ns::MAX_PIDNS_LEVEL as usize + 1 {
+        let i = ns::pid_init(n);
+        if i != 0 && i != dead && crate::RUN_QUEUE.lock().find_pid(i).is_some() { return i; }
+        n = ns::parent(n);
+        steps += 1;
+    }
+    crate::init_pid()
+}
+
+/// Init `tgid` of namespace `n` is dying: SIGKILL every other process in `n`
+/// and its descendants, then wait (bounded) until they are all zombies.
+pub fn zap(n: NsId, tgid: u32) {
+    let mut victims: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    let collect = |v: &mut alloc::vec::Vec<u32>| {
+        v.clear();
+        let rq = crate::RUN_QUEUE.lock();
+        for i in rq.live_slots() {
+            if let Some(t) = rq.get(i) {
+                if t.pid == t.tgid && t.tgid != tgid && is_ancestor_or_eq(n, t.pidns.id())
+                    && t.state != crate::task::TaskState::Zombie && t.address_space.is_some() {
+                    let _ = v.try_reserve(1);
+                    if v.len() < v.capacity() { v.push(t.pid); }
+                }
+            }
+        }
+    };
+    collect(&mut victims);
+    for &p in victims.iter() {
+        let _ = crate::deliver_signal_process(p, 9, crate::task::SigInfo::user(tgid, 0));
+    }
+    let deadline = crate::monotonic_ns().saturating_add(5_000_000_000);
+    loop {
+        collect(&mut victims);
+        if victims.is_empty() || crate::monotonic_ns() > deadline { return; }
+        crate::irq_window();
+        crate::yield_now("pidns_zap");
+    }
 }

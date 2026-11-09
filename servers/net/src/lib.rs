@@ -7281,7 +7281,10 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
     // D-Bus EXTERNAL auth reads the uid from here.
     if level == SOL_SOCKET as usize && optname == SO_PEERCRED {
         if optval_ptr == 0 { return err_reply(-14); }
-        let cred = unix_peer_cred(pid, fd);
+        let mut cred = unix_peer_cred(pid, fd);
+        // The peer's pid as the caller's pid namespace sees it (0 when invisible).
+        let vn = sched::pidns::pidns_of(pid);
+        if vn != 0 && cred.pid != 0 { cred.pid = sched::pidns::to_v(vn, cred.pid); }
         if !wr_user(optval_ptr, [cred.pid, sched::ns::view_id(0, cred.uid), sched::ns::view_id(1, cred.gid)]) { return err_reply(-14); }
         if optlen_ptr != 0 && !wr_user(optlen_ptr, 12u32) { return err_reply(-14); }
         return ok_reply();
