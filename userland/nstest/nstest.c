@@ -1007,6 +1007,90 @@ static int ub_init_death(void)
 }
 PCASE(init_death_kills, ub_init_death)
 
+/* pidsec G2: /proc/<outside pid>/{exe,cwd} are invisible inside a pid ns; /proc/1/exe is the ns init's. */
+static int ub_proc_magic_ns(void)
+{
+    alarm(10);
+    pid_t outside = getpid();
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    pid_t init = fork();
+    CHECK(init >= 0);
+    if (init == 0) {
+        char b[256], mine[256], path[64];
+        int bad = 0;
+        snprintf(path, sizeof path, "/proc/%d/exe", (int)outside);
+        if (readlink(path, b, sizeof b) >= 0 || errno != ENOENT) bad |= 1;
+        snprintf(path, sizeof path, "/proc/%d/cwd", (int)outside);
+        if (readlink(path, b, sizeof b) >= 0 || errno != ENOENT) bad |= 2;
+        ssize_t a = readlink("/proc/1/exe", b, sizeof b - 1);
+        ssize_t m = readlink("/proc/self/exe", mine, sizeof mine - 1);
+        if (a <= 0 || a != m || memcmp(b, mine, (size_t)a)) bad |= 4;
+        _exit(bad);
+    }
+    CHECK(child_ok(init) == 0);
+    return 0;
+}
+PCASE(proc_magic_pidns, ub_proc_magic_ns)
+
+static void *leaderless_thr(void *a) { (void)a; for (;;) pause(); return 0; }
+/* pidsec G3: a member whose main thread exited (thread still runs) dies with the ns init. */
+static int ub_zap_leaderless(void)
+{
+    alarm(10);
+    int p[2]; CHECK(pipe(p) == 0);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    pid_t init = fork();
+    CHECK(init >= 0);
+    if (init == 0) {
+        pid_t m = fork();
+        if (m == 0) {
+            pthread_t t;
+            if (pthread_create(&t, 0, leaderless_thr, 0)) _exit(1);
+            pthread_exit(0);
+        }
+        usleep(300000);
+        _exit(m > 0 ? 0 : 1);
+    }
+    close(p[1]);
+    int st = 0;
+    CHECK(waitpid(init, &st, 0) == init);
+    char ch;
+    CHECK(read(p[0], &ch, 1) == 0);
+    return 0;
+}
+PCASE(zap_leaderless, ub_zap_leaderless)
+
+/* pidsec G4: init exits while a member forks in a loop; no task survives the zap. */
+static int ub_zap_forkrace(void)
+{
+    alarm(20);
+    int p[2]; CHECK(pipe(p) == 0);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    pid_t init = fork();
+    CHECK(init >= 0);
+    if (init == 0) {
+        for (int w = 0; w < 3; w++) {
+            if (fork() == 0) {
+                for (int i = 0; i < 3000; i++) {
+                    pid_t c = fork();
+                    if (c == 0) { for (;;) pause(); }
+                    if (c < 0) break;
+                }
+                for (;;) pause();
+            }
+        }
+        usleep(20000);
+        _exit(0);
+    }
+    close(p[1]);
+    int st = 0;
+    CHECK(waitpid(init, &st, 0) == init);
+    char ch;
+    CHECK(read(p[0], &ch, 1) == 0);
+    return 0;
+}
+PCASE(zap_forkrace, ub_zap_forkrace)
+
 static int ib_minus1(void)
 {
     struct sigaction sa; memset(&sa, 0, sizeof sa);
@@ -1518,7 +1602,8 @@ static int run_userns_cases(void)
         { "pidns_leak", t_pidns_leak }, { "fork_enomem", t_fork_enomem },
         { "init_ignores_inside", t_init_ignores_inside }, { "init_kill_outside", t_init_kill_outside },
         { "init_handler", t_init_handler }, { "orphan_to_init", t_orphan_to_init },
-        { "init_death_kills", t_init_death_kills }, { "kill_minus1_scoped", t_kill_minus1_scoped },
+        { "init_death_kills", t_init_death_kills }, { "proc_magic_pidns", t_proc_magic_pidns },
+        { "zap_leaderless", t_zap_leaderless }, { "zap_forkrace", t_zap_forkrace }, { "kill_minus1_scoped", t_kill_minus1_scoped },
         { "sid_pgid", t_sid_pgid }, { "byid_calls", t_byid_calls }, { "peercred", t_peercred },
         { "proc_self_tgid", t_proc_self_tgid }, { "proc_self_init", t_proc_self_init },
         { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
