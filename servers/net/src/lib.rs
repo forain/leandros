@@ -763,7 +763,7 @@ impl Ucred {
 /// `Copy` like the `vfs::TransferFd` it wraps, and for the same reason: the
 /// reference it carries is released by an explicit `xfer_drop`, never by going
 /// out of scope, so the queued batch can be indexed rather than moved out of.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum XferFd {
     Vfs(vfs::TransferFd),
     /// A lifted `SockEntry`. The in-flight reference it holds on the underlying
@@ -1089,7 +1089,7 @@ enum SockState {
     IcmpBound { socket_handle: SocketHandle, sid: Sid },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SockEntry {
     state:      SockState,
     in_use:     bool,
@@ -1124,14 +1124,17 @@ struct SockEntry {
     connecting: bool,
     /// Network namespace captured at socket() (Linux sock_net): every later
     /// op uses this, never the calling task's. Travels with SCM_RIGHTS copies.
-    netns:      u16,
+    /// Counted reference: keeps the namespace id from being freed and reused
+    /// while this socket (or an in-flight copy of it) exists.
+    ns:         sched::ns::NsRef,
 }
 
 impl SockEntry {
+    fn netns(&self) -> u16 { self.ns.id() }
     const fn empty() -> Self {
         Self { state: SockState::None, in_use: false, bound_port: 0, domain: 0,
                sock_type: 0, cloexec: false, nonblock: false, reuseaddr: false, ofd: 0, hidden: false,
-               connecting: false, netns: 0 }
+               connecting: false, ns: sched::ns::NsRef::INIT }
     }
 }
 
@@ -1450,7 +1453,7 @@ pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
 fn sock_netns(pid: u32, slot: usize) -> u16 {
     SOCK_TABLES.read().iter().find(|t| t.in_use && t.pid == pid)
         .and_then(|t| t.socks.get(slot)).filter(|e| e.in_use)
-        .map(|e| e.netns).unwrap_or_else(|| sched::ns::netns_of(pid))
+        .map(|e| e.netns()).unwrap_or_else(|| sched::ns::netns_of(pid))
 }
 
 fn fd_to_slot(fd: usize) -> Option<usize> {
@@ -1527,7 +1530,7 @@ fn inet_shareable(e: &SockEntry) -> bool {
 /// An unshared socket costs one leaf-lock probe.
 fn share_state(tbls: &mut SockTables, pid: u32, slot: usize) {
     let Some(src) = tbls.iter().find(|t| t.in_use && t.pid == pid)
-        .and_then(|t| t.socks.get(slot).copied()) else { return };
+        .and_then(|t| t.socks.get(slot).cloned()) else { return };
     // Only inet states (and an AF_INET socket not bound yet, for
     // SO_REUSEADDR): an AF_UNIX object (a bound address, a connection end) is
     // refcounted per holder, so copying one into a holder that took no
@@ -1563,7 +1566,7 @@ fn inet_put(tbls: &mut SockTables, e: &SockEntry) -> InetPut {
     let (last, hook) = vfs::ofd::put_deferred(e.ofd);
     let mut release = None;
     if last {
-        let mut cur = *e;
+        let mut cur = e.clone();
         if let Some(sh) = tbls.inet.remove(&e.ofd) { sh.apply(&mut cur); }
         if is_inet_state(&cur.state) { release = Some((cur.state, cur.sock_type)); }
     }
@@ -1746,7 +1749,7 @@ fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, por
         for e in t.socks.iter() {
             if !e.in_use || e.bound_port != port || e.domain != AF_INET as u8 || e.sock_type != me.sock_type { continue; }
             // Each network namespace has its own port space.
-            if e.netns != me.netns { continue; }
+            if e.netns() != me.netns() { continue; }
             if me.ofd != 0 && e.ofd == me.ofd { continue; }
             let (addr, listening) = match e.state {
                 SockState::InetBound { local_endpoint, .. } => (local_endpoint.addr, false),
@@ -2065,7 +2068,7 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
         let tbls = SOCK_TABLES.read();
         let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
-        let e = tbl.socks[slot];
+        let e = tbl.socks[slot].clone();
         // An inet socket: the in-flight copy is one more holder of its
         // description, which is the socket's refcount (see "Shared inet
         // sockets"), so the reference is taken in the same SOCK_TABLES hold
@@ -2109,17 +2112,17 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
 /// Returns the new fd, or a negative errno **without consuming** it — the
 /// caller still owns it and must `xfer_drop` it (see the recvmsg overflow path).
 fn xfer_import(pid: u32, x: XferFd, cloexec: bool) -> isize {
-    match x {
-        XferFd::Vfs(tf) => vfs::import_fd(pid, tf, cloexec),
+    match &x {
+        XferFd::Vfs(tf) => vfs::import_fd(pid, *tf, cloexec),
         XferFd::Sock(entry) => {
             let slot = {
                 let mut tbls = SOCK_TABLES.lock();
                 let Some(tbl) = get_or_create(pid, &mut *tbls) else { return -23 }; // ENFILE
                 let Some(slot) = tbl.alloc() else { return -24 };                   // EMFILE
-                let mut e = entry;
+                let mut e = entry.clone();
                 e.cloexec = cloexec;
                 e.hidden = false; // the receiver holds a plain socket
-                tbl.socks[slot] = e;
+                tbl.socks[slot] = e.clone();
                 // An inet socket changed by another holder while this copy
                 // was queued: take the state they published.
                 if let Some(row) = tbls.inet.get(&e.ofd).copied() {
@@ -2183,7 +2186,7 @@ fn xfer_drop(x: XferFd) {
 /// EBADF for a descriptor that cannot be transferred.
 pub fn dup_fd_across(src: u32, fd: usize, dst: u32) -> isize {
     let Some(x) = xfer_export(src, fd) else { return -9 };
-    let r = xfer_import(dst, x, true);
+    let r = xfer_import(dst, x.clone(), true);
     if r < 0 { xfer_drop(x); }
     r
 }
@@ -2195,8 +2198,8 @@ pub fn dup_fd_across(src: u32, fd: usize, dst: u32) -> isize {
 /// the description table, the VFS pipe/tmpfs refcounts) are leaves. Returns
 /// `None` when what `x` names is already gone, and then takes no reference.
 fn xfer_clone_locked(conns: &mut [UnixConn], x: &XferFd) -> Option<XferFd> {
-    match *x {
-        XferFd::Vfs(tf) => Some(XferFd::Vfs(vfs::clone_transfer(&tf))),
+    match x {
+        XferFd::Vfs(tf) => Some(XferFd::Vfs(vfs::clone_transfer(tf))),
         XferFd::Sock(entry) => {
             match entry.state {
                 SockState::UnixListening { bound_idx } => bound_ref_inc(bound_idx),
@@ -2209,7 +2212,7 @@ fn xfer_clone_locked(conns: &mut [UnixConn], x: &XferFd) -> Option<XferFd> {
             }
             vfs::ofd::get(entry.ofd);
             inflight_adj(x, true);
-            Some(XferFd::Sock(entry))
+            Some(XferFd::Sock(entry.clone()))
         }
     }
 }
@@ -2613,7 +2616,7 @@ fn sock_state_moved(keys: &[u64]) {
 /// paths that change a state outside these calls (the first sendto/send,
 /// `udp_migrate`) wake on their own.
 fn with_state_wake(pid: u32, fd: usize, always: bool, f: impl FnOnce() -> Message) -> Message {
-    let before = sock_entry(pid, fd).map(|e| (e, sock_wake_set(&e)));
+    let before = sock_entry(pid, fd).map(|e| { let k = sock_wake_set(&e); (e, k) });
     let r = f();
     if let Some((b, keys)) = before {
         let moved = always || sock_entry(pid, fd).map_or(true, |a| a.state != b.state);
@@ -3978,7 +3981,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         ofd:        vfs::ofd::alloc(),
         hidden:     false,
         connecting: false,
-        netns:      sched::ns::netns_of(pid),
+        ns:         sched::ns::NsRef::get(sched::ns::netns_of(pid)),
     };
     if domain == AF_NETLINK { nlsock::create(tbl.socks[slot].ofd, sched::tgid_of(pid)); }
     val_reply((slot + SOCK_FD_BASE) as u64)
@@ -4026,7 +4029,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             // The entry (and its SO_REUSEADDR) is read through a shared
             // borrow, before the mutable one below.
             let me = match tbls.iter().find(|t| t.in_use && t.pid == pid)
-                .and_then(|t| t.socks.get(slot).copied()).filter(|e| e.in_use)
+                .and_then(|t| t.socks.get(slot).cloned()).filter(|e| e.in_use)
             {
                 Some(e) => e,
                 None => return err_reply(-9),
@@ -4061,7 +4064,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             // is EADDRINUSE unless the caller asked for SO_REUSEADDR — the
             // Linux answer, and the reason every server sets that option.
             // Live ports are `bind_conflict`'s, above.
-            if port != 0 && !reuseaddr && me.netns == 0 && resv[..nresv].contains(&port) {
+            if port != 0 && !reuseaddr && me.netns() == 0 && resv[..nresv].contains(&port) {
                 return err_reply(-98); // EADDRINUSE
             }
             // Port 0 means "any free port". Assigning it *here* rather than at
@@ -4121,7 +4124,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 let server = ip.is_unspecified();
                 // A non-initial netns has only a down loopback: its UDP bind
                 // stays a pure table entry, no host-stack socket (unreachable).
-                if me.netns == 0 {
+                if me.netns() == 0 {
                     if let Err(e) = udp_materialize(pid, slot, None, server) { return err_reply(e); }
                 }
             }
@@ -4229,7 +4232,7 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
         // and roam without being touched.
         // Registered first: a stack built after this point (wifi0, once
         // its MAC is known) adopts the listener (`listen::adopt`).
-        if tbl.socks[slot].netns != 0 {
+        if tbl.socks[slot].netns() != 0 {
             // A non-initial netns has no interface: the listener lives in
             // its own port space only, no stack socket, unreachable from
             // the host.
@@ -4312,7 +4315,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
             Some(t) => t, None => return err_reply(-9),
         };
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
-        (tbl.socks[slot].state, tbl.socks[slot].bound_port, tbl.socks[slot].sock_type, tbl.socks[slot].ofd, tbl.socks[slot].netns)
+        (tbl.socks[slot].state, tbl.socks[slot].bound_port, tbl.socks[slot].sock_type, tbl.socks[slot].ofd, tbl.socks[slot].netns())
     };
 
     match state {
@@ -4370,7 +4373,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     ofd: vfs::ofd::alloc(),
                     hidden: false,
                     connecting: false,
-                    netns: 0,
+                    ns: sched::ns::NsRef::INIT,
                 };
                 // Linux clones the accepted socket from the listener, so it
                 // inherits TCP_NODELAY and the keepalive settings. The
@@ -4459,7 +4462,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                         reuseaddr:  false,
                         ofd:        vfs::ofd::alloc(),
                         hidden:     false,
-                        netns:      lnetns,
+                        ns:         sched::ns::NsRef::get(lnetns),
                         connecting: false,
                     };
 
@@ -4673,7 +4676,7 @@ fn inet_disconnect(pid: u32, slot: usize) -> Option<Message> {
     let mut tbls = SOCK_TABLES.lock();
     let tbl = find_tbl(pid, &mut *tbls)?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
-    let e = tbl.socks[slot];
+    let e = tbl.socks[slot].clone();
     if e.domain != AF_INET as u8 { return None; }
     let lock = sock_opts(e.ofd).bind_lock;
     match e.state {
@@ -4755,7 +4758,7 @@ fn udp_rebind_port(pid: u32, slot: usize) -> Result<(), i32> {
     let ephemeral = alloc_ephemeral_port(&*tbls, &resv[..nresv]);
     let tbl = find_tbl(pid, &mut *tbls).ok_or(-9i32)?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return Err(-9); }
-    let e = tbl.socks[slot];
+    let e = tbl.socks[slot].clone();
     let SockState::InetConnected { socket_handle, sid, .. } = e.state else { return Ok(()) };
     if e.sock_type != SOCK_DGRAM as u8 || e.bound_port != 0 { return Ok(()); }
     let port = ephemeral.ok_or(-98i32)?; // EADDRINUSE: range exhausted
@@ -4801,8 +4804,8 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         let (bound_addr, dgram_ofd) = {
             let tbls = SOCK_TABLES.read();
             let e = tbls.iter().find(|t| t.in_use && t.pid == pid)
-                .and_then(|t| t.socks.get(slot).filter(|e| e.in_use).copied());
-            (e.and_then(|e| match e.state {
+                .and_then(|t| t.socks.get(slot).filter(|e| e.in_use).cloned());
+            (e.clone().and_then(|e| match e.state {
                 SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
                 _ => None,
             }),
@@ -5052,7 +5055,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_a] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: true },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
-        cloexec, nonblock, reuseaddr: false, ofd: 0, hidden: false, connecting: false, netns: sched::ns::netns_of(pid),
+        cloexec, nonblock, reuseaddr: false, ofd: 0, hidden: false, connecting: false, ns: sched::ns::NsRef::get(sched::ns::netns_of(pid)),
     };
     let slot_b = match tbl.alloc() { Some(s) => s, None => {
         tbl.socks[slot_a] = SockEntry::empty(); return err_reply(-24);
@@ -5060,7 +5063,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_b] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: false },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
-        cloexec, nonblock, reuseaddr: false, ofd: vfs::ofd::alloc(), hidden: false, connecting: false, netns: sched::ns::netns_of(pid),
+        cloexec, nonblock, reuseaddr: false, ofd: vfs::ofd::alloc(), hidden: false, connecting: false, ns: sched::ns::NsRef::get(sched::ns::netns_of(pid)),
     };
     tbl.socks[slot_a].ofd = vfs::ofd::alloc();
     drop(tbls);
@@ -6762,7 +6765,7 @@ fn deliver_scm(pid: u32, deliver: Option<alloc::vec::Vec<XferFd>>, ctrl_ptr: usi
         let mut installed = [0i32; SCM_MAX_FD];
         let mut i = 0usize;
         while i < fit {
-            let newfd = xfer_import(pid, fds[i], cloexec);
+            let newfd = xfer_import(pid, fds[i].clone(), cloexec);
             if newfd < 0 {
                 // Receiver's fd table is full: everything from here truncates.
                 // `import_fd` consumes a descriptor only when it returns an fd,
@@ -6778,7 +6781,7 @@ fn deliver_scm(pid: u32, deliver: Option<alloc::vec::Vec<XferFd>>, ctrl_ptr: usi
         }
         // Close every fd that didn't fit — including the one whose import just
         // failed (Linux drops the overflow).
-        for j in fit..nfds { xfer_drop(fds[j]); }
+        for j in fit..nfds { xfer_drop(fds[j].clone()); }
         if fit > 0 {
             let clen = CMSG_HDR_LEN + fit * 4;
             let mut ok = wr_user(ctrl_ptr, clen)
@@ -7014,7 +7017,7 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
         let tbls = SOCK_TABLES.read();
         let Some(e) = tbls.iter().find(|t| t.in_use && t.pid == pid)
-            .and_then(|t| t.socks.get(slot).copied()).filter(|e| e.in_use) else { return err_reply(-9) };
+            .and_then(|t| t.socks.get(slot).cloned()).filter(|e| e.in_use) else { return err_reply(-9) };
         drop(tbls);
         let mut o = sock_opts(e.ofd);
         if gso_opt {
@@ -7073,7 +7076,7 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             Some(t) => t, None => return err_reply(-9),
         };
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
-        let e = tbl.socks[slot];
+        let e = tbl.socks[slot].clone();
         let is_tcp = is_tcp_entry(&e);
         // SOL_TCP on anything else: an AF_UNIX socket has no protocol-level
         // setsockopt (EOPNOTSUPP); UDP, ping and raw sockets hand the level
@@ -7135,7 +7138,7 @@ fn sock_entry(pid: u32, fd: usize) -> Option<SockEntry> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.read();
     tbls.iter().find(|t| t.in_use && t.pid == pid)
-        .and_then(|t| t.socks.get(slot).copied()).filter(|e| e.in_use)
+        .and_then(|t| t.socks.get(slot).cloned()).filter(|e| e.in_use)
 }
 
 /// setsockopt(IPPROTO_IP, ...): Linux's do_ip_setsockopt for the options a
@@ -7331,7 +7334,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         let entry = fd_to_slot(fd).and_then(|slot| {
             let tbls = SOCK_TABLES.read();
             let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
-            if slot < t.socks.len() && t.socks[slot].in_use { Some(t.socks[slot]) } else { None }
+            if slot < t.socks.len() && t.socks[slot].in_use { Some(t.socks[slot].clone()) } else { None }
         });
         let Some(e) = entry else { return err_reply(-9) };
         let v: Option<u32> = match (level, optname) {
@@ -7494,13 +7497,13 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
     }
     let mut conns = UNIX_CONNS.lock();
     for i in 0..n {
-        let e = tbls[parent_pos].socks[i];
+        let e = tbls[parent_pos].socks[i].clone();
         if !e.in_use { continue; }
         match e.state {
             SockState::UnixConnected { conn_idx, is_a } => {
                 if conn_idx >= conns.len() || !conns[conn_idx].in_use { continue; }
                 if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
-                tbls[child_pos].socks[i] = e;
+                tbls[child_pos].socks[i] = e.clone();
                 vfs::ofd::get(e.ofd);
             }
             // An unaccepted connect() is end A of a real connection — see the
@@ -7509,23 +7512,23 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
             SockState::UnixPendingAccept { conn_idx, .. } => {
                 if conn_idx >= conns.len() || !conns[conn_idx].in_use { continue; }
                 conns[conn_idx].refs_a += 1; // the connector is always end A
-                tbls[child_pos].socks[i] = e;
+                tbls[child_pos].socks[i] = e.clone();
                 vfs::ofd::get(e.ofd);
                 if NET_DEBUG { traced.push((i, conn_idx)); }
             }
-            SockState::Unbound { .. } => { tbls[child_pos].socks[i] = e; vfs::ofd::get(e.ofd); }
+            SockState::Unbound { .. } => { tbls[child_pos].socks[i] = e.clone(); vfs::ofd::get(e.ofd); }
             // A listener: one more reference on its bound address, as
             // `handle_dup` takes. BOUND_PATHS is a leaf (nothing is locked
             // under it), so taking it here, under both locks, is safe.
             SockState::UnixListening { bound_idx } => {
                 bound_ref_inc(bound_idx);
-                tbls[child_pos].socks[i] = e;
+                tbls[child_pos].socks[i] = e.clone();
                 vfs::ofd::get(e.ofd);
             }
             // An inet socket: the child is one more holder of the description,
             // which is the socket's refcount (see "Shared inet sockets").
             ref s if is_inet_state(s) && inet_shareable(&e) => {
-                tbls[child_pos].socks[i] = e;
+                tbls[child_pos].socks[i] = e.clone();
                 vfs::ofd::get(e.ofd);
             }
             _ => {} // no object, or an inet socket with no description
@@ -7702,7 +7705,7 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
         Some(t) => t, None => return err_reply(-9),
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
-    let entry = tbl.socks[slot];
+    let entry = tbl.socks[slot].clone();
     let new_slot = match tbl.alloc() { Some(s) => s, None => return err_reply(-24) };
     if let SockState::UnixConnected { conn_idx, is_a } = entry.state {
         let mut conns = UNIX_CONNS.lock();
@@ -7728,7 +7731,7 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
         let mut tbls = SOCK_TABLES.lock();
         let placed = match find_tbl(pid, &mut *tbls) {
             Some(t) => match t.alloc() {
-                Some(s) => { let mut e = entry; e.cloexec = cloexec; t.socks[s] = e; t.set_hidden(s, hidden); Some(s) }
+                Some(s) => { let mut e = entry.clone(); e.cloexec = cloexec; t.socks[s] = e; t.set_hidden(s, hidden); Some(s) }
                 None => None,
             },
             None => None,
@@ -7751,7 +7754,7 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
     else if !matches!(entry.state, SockState::Unbound { .. }) {
         return err_reply(-22); // EINVAL — dup of this socket kind unsupported
     }
-    let mut new_entry = entry;
+    let mut new_entry = entry.clone();
     new_entry.cloexec = cloexec;
     tbl.socks[new_slot] = new_entry;
     tbl.set_hidden(new_slot, hidden);
@@ -7842,7 +7845,7 @@ fn close_entry(pid: u32, sockfd: usize) -> (Message, Option<Closed>) {
         None    => return (err_reply(-9), None),
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return (err_reply(-9), None); }
-    let entry = tbl.socks[slot];
+    let entry = tbl.socks[slot].clone();
     let state = entry.state;
     // There is no port to release here, which is why `bound_port` is not read:
     // `alloc_ephemeral_port` derives "free" from the live tables (any socket
@@ -7974,7 +7977,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
     let ofd = tbl.socks[slot].ofd;
     // The tag of every state but the AF_UNIX objects comes from `sock_tag`,
     // the helper `fd_wake_tag` and the state-change wake share.
-    let ent = tbl.socks[slot];
+    let ent = tbl.socks[slot].clone();
 
     let (revents, seq, tag): (u64, Option<u64>, Option<sched::PollTag>) = match state {
         SockState::UnixConnected { conn_idx, is_a } => {
@@ -8221,7 +8224,7 @@ fn handle_close_all(pid: u32) -> bool {
         let mut ofds: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
         for s in tbl.socks.iter() {
             if !s.in_use { continue; }
-            if inet_family(s) { inet_held.push(*s); continue; }
+            if inet_family(s) { inet_held.push(s.clone()); continue; }
             if s.ofd != 0 { ofds.push(s.ofd); }
             match s.state {
                 SockState::UnixConnected { conn_idx, is_a } => {

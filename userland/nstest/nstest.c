@@ -1063,6 +1063,90 @@ static int t_sock_netns_scm(void)
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
     return 0;
 }
+
+/* A socket keeps its network namespace alive (counted ref): once the creating
+ * tasks are gone the id must not be reused by a new namespace that would then
+ * inherit the old abstract listeners. */
+static int send_fd(int sv, int fd)
+{
+    char b = 'x'; struct iovec iv = { &b, 1 };
+    char cb[CMSG_SPACE(sizeof(int))]; memset(cb, 0, sizeof cb);
+    struct msghdr m = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof cb };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+    cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &fd, sizeof fd);
+    return sendmsg(sv, &m, 0) == 1 ? 0 : -1;
+}
+static int recv_fd(int sv)
+{
+    char b; struct iovec iv = { &b, 1 };
+    char cb[CMSG_SPACE(sizeof(int))];
+    struct msghdr m = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof cb };
+    if (recvmsg(sv, &m, 0) != 1) return -1;
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+    if (!cm || cm->cmsg_type != SCM_RIGHTS) return -1;
+    int fd; memcpy(&fd, CMSG_DATA(cm), sizeof fd);
+    return fd;
+}
+static int probe_child(void) { return abs_connect("nssockref-x") == -ECONNREFUSED ? 0 : 1; }
+static int t_sock_ns_reuse(void)
+{
+    CHECK(drop_to(1000) == 0);
+    int sv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+    if (c == 0) {
+        int s = abs_bind("nssockref-x");
+        if (s < 0 || send_fd(sv[0], s)) _exit(1);
+        _exit(0);
+    }
+    CHECK(c > 0);
+    int fd = recv_fd(sv[1]);
+    CHECK(fd >= 0);
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* the creator is gone; only the passed fd keeps its netns alive */
+    for (int i = 0; i < 40; i++) {
+        pid_t p = syscall(SYS_clone, SIGCHLD | ((i & 1) ? NSALL : (CLONE_NEWUSER | CLONE_NEWNET)), 0, 0, 0, 0);
+        if (p == 0) _exit(probe_child());
+        CHECK(p > 0);
+        st = 0; waitpid(p, &st, 0);
+        if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) { printf("  stale abstract name seen by new ns #%d\n", i); return 1; }
+        p = syscall(SYS_clone, SIGCHLD | CLONE_NEWUSER, 0, 0, 0, 0);
+        if (p == 0) _exit(probe_child());
+        CHECK(p > 0);
+        st = 0; waitpid(p, &st, 0);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+    /* the original socket is still a working listener */
+    int fl = fcntl(fd, F_GETFL); fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    errno = 0; CHECK(accept(fd, 0, 0) == -1 && errno == EAGAIN);
+    struct sockaddr_un a; socklen_t al = sizeof a;
+    CHECK(getsockname(fd, (void *)&a, &al) == 0 && al > 2 && a.sun_path[0] == 0);
+    return 0;
+}
+static int leak_child(void)
+{
+    for (int i = 0; i < 4; i++) {
+        int s = socket(AF_UNIX, SOCK_STREAM, 0), u = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s < 0 || u < 0) return 1;
+        close(s); close(u);
+    }
+    int sv[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return 2;
+    int l = abs_bind("nssockref-leak"); if (l < 0) return 3;
+    return 0; /* l, sv left open at exit */
+}
+static int t_sock_ns_leak(void)
+{
+    CHECK(drop_to(1000) == 0);
+    for (int i = 0; i < 200; i++) {   /* 200 x 11 sockets > 2000, ns table is 256 */
+        pid_t p = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+        if (p == 0) _exit(leak_child());
+        if (p < 0) { printf("  clone failed at %d (errno %d): ns table exhausted\n", i, errno); return 1; }
+        int st = 0; waitpid(p, &st, 0);
+        if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) { printf("  child %d status %d\n", i, st); return 1; }
+    }
+    return 0;
+}
 static int t_sock_before_unshare(void)
 {
     CHECK(drop_to(1000) == 0);
@@ -1169,6 +1253,7 @@ static int run_userns_cases(void)
         { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
         { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
+        { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();
