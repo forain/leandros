@@ -27,6 +27,8 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/uio.h>
+#include <netinet/in.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -847,6 +849,49 @@ static int netns_child_body(void)
     CHECK(bind(t, (void *)&b, sizeof b) == 0);
     return 0;
 }
+/* netsec: a send in a child netns must be refused by the SOCKET's domain,
+ * whatever sa_family user memory claims (it used to gate on sa_family). */
+static int sendfam_child(void)
+{
+    int bad = 0;
+    unsigned char pkt[8] = { 8, 0, 0, 0, 0x12, 0x34, 0, 1 };
+    struct sockaddr_in a = { .sin_family = AF_UNIX, .sin_port = htons(41047) };
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    unsigned short fams[3] = { AF_UNIX, AF_INET6, 0 };
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (u < 0) return 1;
+    for (int i = 0; i < 3; i++) {
+        a.sin_family = fams[i];
+        errno = 0;
+        if (sendto(u, "evil", 4, 0, (void *)&a, sizeof a) != -1) bad |= 2 << i;
+        else if (errno != ENETUNREACH && errno != EAFNOSUPPORT && errno != EINVAL) bad |= 2 << i;
+        struct iovec iv = { "evil", 4 };
+        struct msghdr m = { .msg_name = &a, .msg_namelen = sizeof a, .msg_iov = &iv, .msg_iovlen = 1 };
+        if (sendmsg(u, &m, 0) != -1) bad |= 16 << i;
+    }
+    int ic = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (ic >= 0) {
+        a.sin_family = AF_UNIX;
+        if (sendto(ic, pkt, sizeof pkt, 0, (void *)&a, sizeof a) != -1) bad |= 128;
+    }
+    return bad;
+}
+static int t_netns_sendfam(void)
+{
+    int h = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41047) };
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(h >= 0 && bind(h, (void *)&a, sizeof a) == 0);
+    pid_t c = fork();
+    if (c == 0) { if (unshare(CLONE_NEWNET) != 0) _exit(255); _exit(sendfam_child()); }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    usleep(200000);
+    char buf[16];
+    CHECK(recv(h, buf, sizeof buf, MSG_DONTWAIT) == -1 && errno == EAGAIN);  /* host listener got nothing */
+    close(h);
+    return 0;
+}
 static int t_netns_ipcns(void)
 {
     CHECK(drop_to(1000) == 0);
@@ -1608,7 +1653,7 @@ static int run_userns_cases(void)
         { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
-        { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
+        { "netns_sendfam", t_netns_sendfam }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
         { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
