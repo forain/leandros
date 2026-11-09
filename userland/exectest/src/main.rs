@@ -94,7 +94,6 @@ extern "C" {
     pub fn fork() -> pid_t;
     pub fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_int) -> pid_t;
     pub fn kill(pid: pid_t, sig: c_int) -> c_int;
-    pub fn syscall(num: i64, ...) -> i64;
     pub fn symlink(target: *const u8, linkpath: *const u8) -> c_int;
     pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> c_int;
     pub fn getppid() -> pid_t;
