@@ -71,6 +71,7 @@ boot       = { path = "../boot" }
 drivers    = { path = "../drivers" }
 vfs-server  = { path = "../servers/vfs" }
 evdev-server = { path = "../servers/evdev" }
+fuse-server = { path = "../servers/fuse" }
 drm-server = { path = "../servers/drm" }
 pipewire-server = { path = "../servers/pipewire" }
 f2fs-server = { path = "../servers/f2fs" }

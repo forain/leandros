@@ -211,6 +211,27 @@ _leandros_q() {
   printf "'%s'" "$_q_r$_q_s"
 }
 
+# leandros_alpine_image [aarch64|x86_64|linux/arm64|linux/amd64]: print an
+# arch-specific local tag (alpine:3.21-arm64 / -amd64) for alpine:3.21. A
+# --platform pull or run of alpine:3.21 REPLACES that tag with the pulled
+# architecture (docker and podman), so nothing runs the bare tag any more:
+# each arch gets its own tag, (re)pulled only when missing or wrong-arch.
+# Needs $CT (leandros_pick_container). No arch = the host's architecture.
+leandros_alpine_image() {
+  case "${1:-$(uname -m)}" in
+    aarch64|arm64|linux/arm64) _ai_a=arm64 ;;
+    x86_64|amd64|linux/amd64)  _ai_a=amd64 ;;
+    *) echo "leandros_alpine_image: unknown arch $1" >&2; return 2 ;;
+  esac
+  _ai_t="alpine:3.21-$_ai_a"
+  if [ "$("$CT" image inspect --format '{{.Architecture}}' "$_ai_t" 2>/dev/null)" != "$_ai_a" ]; then
+    "$CT" pull -q --platform "linux/$_ai_a" alpine:3.21 >/dev/null 2>&1 \
+      && "$CT" tag alpine:3.21 "$_ai_t" \
+      || { echo "leandros_alpine_image: cannot pull $_ai_t" >&2; return 1; }
+  fi
+  printf '%s\n' "$_ai_t"
+}
+
 leandros_alpine_run() {
   _ar_arch="" _ar_image="alpine:3.21" _ar_env="" _ar_cenv="" _ar_cmnt="" _ar_mlist=""
   while [ $# -gt 0 ]; do
@@ -238,6 +259,9 @@ leandros_alpine_run() {
       "")      _ar_plat="" ;;
       *) echo "leandros_alpine_run: unknown arch $_ar_arch" >&2; return 2 ;;
     esac
+    if [ "$_ar_image" = alpine:3.21 ]; then
+      _ar_image=$(leandros_alpine_image "${_ar_arch:-}") || return 1
+    fi
     eval "\"\$CT\" run --rm $_ar_plat $_ar_cenv $_ar_cmnt $(_leandros_q "$_ar_image") \"\$@\""
     return
   fi

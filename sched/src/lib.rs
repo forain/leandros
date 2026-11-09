@@ -29,6 +29,7 @@ pub mod playstat;
 pub mod context;
 pub mod caps;
 pub mod ns;
+pub mod cgroup;
 pub mod pidns;
 pub mod cred;
 pub mod futex;
@@ -2791,6 +2792,29 @@ pub fn cwd_arc_of(pid: Pid) -> Option<alloc::sync::Arc<[u8]>> {
     Some(cwd.unwrap_or_else(|| alloc::sync::Arc::from(&b"/"[..])))
 }
 
+/// The calling task's `(root, cwd, mntns)` under ONE run-queue lock: a path
+/// operation in a mount namespace needs all three consistently, and every
+/// extra RUN_QUEUE acquisition costs on the path-lookup hot path.
+pub fn current_fs_ctx() -> (Option<alloc::sync::Arc<[u8]>>, alloc::sync::Arc<[u8]>, ns::NsId) {
+    let pid = current_pid();
+    let (root, cwd, m) = {
+        let rq = RUN_QUEUE.lock();
+        match rq.find_pid(pid) {
+            Some(t) => (t.root.clone(), t.cwd.clone(), t.mntns.id()),
+            None => (None, None, 0),
+        }
+    };
+    (root, cwd.unwrap_or_else(|| alloc::sync::Arc::from(&b"/"[..])), m)
+}
+
+/// Mount namespace of the calling task, but only while any non-initial one
+/// exists (otherwise 0 without taking the run-queue lock).
+#[inline]
+pub fn current_mntns() -> ns::NsId {
+    if !ns::mnt_active() { return 0; }
+    ns::mntns_of(current_pid())
+}
+
 /// Copy `pid`'s chroot root (host-absolute) into `buf`, truncated to
 /// `max_len`. Returns its full length, or 0 when the task is not chrooted —
 /// the caller's cue to skip all root handling. `-1` if there is no such task.
@@ -2986,6 +3010,15 @@ pub fn euid_of(pid: Pid) -> u32 {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.euid).unwrap_or(0)
 }
 
+/// True when `pid` is root of the *host*: euid 0 in the initial user
+/// namespace. Root of a child user namespace is not (it holds capabilities
+/// only over that namespace). Unknown pids are not root. One RUN_QUEUE hold.
+pub fn host_root_of(pid: Pid) -> bool {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.euid == 0 && t.userns.id() == 0).unwrap_or(false)
+}
+
+pub fn host_root() -> bool { host_root_of(current_pid()) }
+
 pub fn egid_of(pid: Pid) -> u32 {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.egid).unwrap_or(0)
 }
@@ -3113,7 +3146,7 @@ pub fn set_dumpable(v: bool) {
 /// May `t` change uids (`gid == false`, CAP_SETUID) or gids (CAP_SETGID)
 /// freely? Initial namespace: euid 0 (as before). In a user namespace the
 /// capability held there decides; targets are limited to mapped ids by the
-/// syscall layer (`ns::ids_mapped`), so privilege never reaches unmapped ids.
+/// syscall layer (`ns::arg_id`, which translates to kernel ids), so privilege never reaches unmapped ids.
 pub(crate) fn setid_priv(t: &task::Task, gid: bool) -> bool {
     if t.userns.id() == 0 { t.euid == 0 } else { t.caps[0] >> (if gid { 6 } else { 7 }) & 1 != 0 }
 }
@@ -5026,7 +5059,7 @@ pub enum MmArgField { ArgStart, ArgEnd, EnvStart, EnvEnd }
 pub fn set_mm_arg_field(field: MmArgField, addr: usize) -> isize {
     const MMAP_MIN_ADDR: usize = 4096;
     const TASK_SIZE: usize = 0x0000_8000_0000_0000;
-    if current_euid() != 0 { return -1; } // EPERM
+    if !host_root() { return -1; } // EPERM
     if addr >= TASK_SIZE || addr < MMAP_MIN_ADDR { return -22; }
     let tgid = current_tgid();
     let mut a = ARG_AREAS.lock().get(&tgid).copied()
@@ -7215,7 +7248,8 @@ pub fn fork_admission(new_process: bool) -> isize {
     let rq = RUN_QUEUE.lock();
     if admit_locked(&rq, new_process) != 0 { return -11; }
     let Some(me) = rq.find_pid(pid) else { return 0 };
-    if me.uid == 0 || me.euid == 0 { return 0; }
+    if cgroup::fork_check(me.cgroup) != 0 { return -11; }
+    if me.uid == 0 || me.euid == 0 { if me.userns.id() == 0 { return 0; } }
     let uid = me.uid;
     let limit = rq.find_pid(me.tgid).map_or(task::RLIM_INFINITY, |l| l.rlimits[task::RLIMIT_NPROC][0]);
     if limit == task::RLIM_INFINITY { return 0; }
