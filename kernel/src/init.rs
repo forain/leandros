@@ -75,6 +75,11 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             serial_print_str("\n");
         }
     }
+    if let Some(p) = fuse_server::init(0) {
+        serial_print_str("[INIT] fuse server port: ");
+        crate::print_number(p);
+        serial_print_str("\n");
+    }
     drivers::virtio_keyboard::init();
 
     // Initialize DRM server and check for success

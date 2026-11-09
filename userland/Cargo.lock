@@ -93,6 +93,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fusetest"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
+]
+
+[[package]]
 name = "gpuqtest"
 version = "0.1.0"
 

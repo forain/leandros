@@ -9118,7 +9118,7 @@ fn sys_mount(
     target_ptr: usize,
     fstype_ptr: usize,
     flags: usize,
-    _data_ptr: usize,
+    data_ptr: usize,
 ) -> isize {
     // mount(2) MS_REMOUNT: change the flags of an existing mount; source and
     // fstype are ignored (and may be NULL, as `mount -o remount,ro /` passes
@@ -9227,6 +9227,9 @@ fn sys_mount(
     if fstype_str == "tmpfs" {
         return if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { 0 } else { -22 };
     }
+    if fstype_str == "fuse" || fstype_str.starts_with("fuse.") {
+        return sys_mount_fuse(source_str, target_path.bytes(), fstype_str, flags, data_ptr);
+    }
     if fstype_str != "f2fs" {
         return -22; // EINVAL
     }
@@ -9319,7 +9322,36 @@ fn sys_mount(
     }
 }
 
-fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
+/// mount(2) of a FUSE filesystem: `data` names the daemon's /dev/fuse fd.
+fn sys_mount_fuse(source: &str, target: &[u8], fstype: &str, flags: usize, data_ptr: usize) -> isize {
+    const MS_RDONLY: usize = 1;
+    const MS_NOSUID: usize = 2;
+    let data = if data_ptr == 0 { Vec::new() } else { match read_user_short_str(data_ptr) { Ok(v) => v, Err(e) => return e } };
+    let opts = match core::str::from_utf8(&data).ok().and_then(fuse_server::parse_opts) { Some(o) => o, None => return -22 };
+    let pid = current_pid();
+    let open_id = match vfs::vfs_get_node_kind(pid, opts.fd as usize) {
+        Some(vfs::VnodeKind::DynamicDevice { port, dev_id, open_id }) if fuse_server::is_fuse_device(port, dev_id) => open_id,
+        _ => return -9, // EBADF: not a /dev/fuse descriptor
+    };
+    let mut st = [0u8; STAT_SIZE];
+    let mut tk = target.to_vec();
+    tk.push(0);
+    let m = make_vfs_msg(vfs::VFS_STAT, &[tk.as_ptr() as u64, st.as_mut_ptr() as u64]);
+    let r = vfs_reply_val(&vfs::handle(&m, pid));
+    if r < 0 { return r; }
+    if vfs::read_stat_mode(st.as_ptr() as usize) & 0o170000 != 0o040000 { return -20; }
+    let prefix: &'static str = match core::str::from_utf8(target) {
+        Ok(s) => alloc::boxed::Box::leak(alloc::string::String::from(s.trim_end_matches('/')).into_boxed_str()),
+        Err(_) => return -22,
+    };
+    let source: &'static str = alloc::boxed::Box::leak(alloc::string::String::from(source).into_boxed_str());
+    let fst: &'static str = alloc::boxed::Box::leak(alloc::string::String::from(fstype).into_boxed_str());
+    let r = fuse_server::mount(open_id, prefix, source, fst, &opts, flags & MS_RDONLY != 0);
+    if r == 0 { vfs::set_mount_nosuid(prefix, flags & MS_NOSUID != 0); }
+    r
+}
+
+fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
     if sched::current_euid() != 0 { return -1; } // EPERM (CAP_SYS_ADMIN)
     let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
     // An alias mount (a chroot's /proc, a bind mount) is named by where the
@@ -9330,6 +9362,11 @@ fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
         Err(_) => return -22, // EINVAL
     };
 
+    if let Some(m) = vfs::list_mounts().iter().find(|e| e.in_use && e.prefix == target_str && e.fstype.starts_with("fuse")) {
+        let _ = m;
+        // MNT_FORCE (1) | MNT_DETACH (2)
+        return fuse_server::unmount(target_str, umount_flags & 3 != 0);
+    }
     if f2fs_server::unmount(target_str) {
         0
     } else {

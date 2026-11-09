@@ -80,7 +80,7 @@ os.chdir(REPO)
 import driver  # noqa: E402
 
 SUITES = {
-    "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest",
+    "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/pthreadtest", "/bin/futextest",
                 "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest",
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
