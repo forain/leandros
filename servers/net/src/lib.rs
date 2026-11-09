@@ -3983,7 +3983,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         connecting: false,
         ns:         sched::ns::NsRef::get(sched::ns::netns_of(pid)),
     };
-    if domain == AF_NETLINK { nlsock::create(tbl.socks[slot].ofd, sched::tgid_of(pid)); }
+    if domain == AF_NETLINK { nlsock::create(tbl.socks[slot].ofd, sched::tgid_of(pid), sched::ns::netns_of(pid)); }
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
 

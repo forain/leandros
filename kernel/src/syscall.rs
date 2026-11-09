@@ -11487,7 +11487,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         && net_server::rtnetlink::is_if_ioctl(cmd as u32)
     {
         use net_server::rtnetlink as nl;
-        let links = nl::current_links();
+        let links = nl::current_links(sched::ns::netns_of(pid as u32));
         if cmd as u32 == nl::SIOCGIFCONF {
             // struct ifconf { int ifc_len; (pad) char *ifc_buf; }
             if arg == 0 { return -14; }
