@@ -479,6 +479,7 @@ pub struct Task {
     /// Network / IPC namespace ids (0 = initial); inherited by clone.
     pub netns: crate::ns::NsRef,
     pub ipcns: crate::ns::NsRef,
+    pub utsns: crate::ns::NsRef,
     pub egid: u32,
     pub suid: u32,
     pub sgid: u32,
@@ -883,6 +884,7 @@ impl Task {
             pidns_child: crate::ns::NsRef::INIT,
             netns: crate::ns::NsRef::INIT,
             ipcns: crate::ns::NsRef::INIT,
+            utsns: crate::ns::NsRef::INIT,
             egid: 0,
             suid: 0,
             sgid: 0,
@@ -1317,6 +1319,7 @@ impl Task {
             pidns_child: crate::ns::NsRef::INIT,
             netns: crate::ns::NsRef::INIT,
             ipcns: crate::ns::NsRef::INIT,
+            utsns: crate::ns::NsRef::INIT,
             egid: 0,
             suid: 0,
             sgid: 0,
