@@ -156,6 +156,8 @@ pub struct ForkOpts {
     pub share_fs: bool,
     /// CLONE_NEWUSER: the pre-created user namespace id for the child (0 = inherit).
     pub userns: crate::ns::NsId,
+    /// CLONE_NEWPID: the pre-created pid namespace id for the child (0 = pid_for_children).
+    pub pidns: crate::ns::NsId,
     /// CLONE_NEWNET / CLONE_NEWIPC: pre-created ids for the child (0 = inherit).
     pub netns: crate::ns::NsId,
     pub ipcns: crate::ns::NsId,
@@ -163,7 +165,7 @@ pub struct ForkOpts {
 
 impl Default for ForkOpts {
     fn default() -> Self {
-        ForkOpts { vfork: false, child_stack: 0, tls: None, exit_signal: 17, set_tid: None, share_fs: false, userns: 0, netns: 0, ipcns: 0 }
+        ForkOpts { vfork: false, child_stack: 0, tls: None, exit_signal: 17, set_tid: None, share_fs: false, userns: 0, pidns: 0, netns: 0, ipcns: 0 }
     }
 }
 
@@ -195,6 +197,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
 
         let parent_pid = super::current_pid();
         if parent_pid == 0 { return -38; }
+        let pidns_target = match crate::pidns::fork_target(parent_pid, false, opts.pidns) { Ok(t) => t, Err(e) => return e };
 
         // Task, process and RLIMIT_NPROC limits: EAGAIN before any work.
         let adm = super::fork_admission(true);
@@ -478,6 +481,8 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.euid          = euid;
         child.caps          = caps;
         child.userns        = crate::ns::NsRef::get(puser);
+        child.pidns         = crate::ns::NsRef::get(pidns_target);
+        child.pidns_child   = crate::ns::NsRef::get(pidns_target);
         child.netns         = crate::ns::NsRef::get(pnet);
         child.ipcns         = crate::ns::NsRef::get(pipc);
         child.egid          = egid;
@@ -563,7 +568,9 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
             mm::buddy::free(stack_base_phys, stack_pages);
             return -11; // EAGAIN
         }
+        crate::pidns::claim_init(pidns_target, child_pid);
         if !rq.enqueue(child) {
+            if pidns_target != 0 { crate::ns::set_pid_dead(pidns_target); }
             drop(rq);
             report_task_table_full();
             // A failed `enqueue` drops the `Box<Task>` it was handed, which
@@ -660,6 +667,7 @@ pub fn clone_thread(
 
         let parent_pid = super::current_pid();
         if parent_pid == 0 { return -38; }
+        let pidns_target = match crate::pidns::fork_target(parent_pid, flags & CLONE_THREAD != 0, 0) { Ok(t) => t, Err(e) => return e };
 
         // Task, process and RLIMIT_NPROC limits: EAGAIN before any work.
         let adm = super::fork_admission(flags & CLONE_THREAD == 0);
@@ -798,7 +806,9 @@ pub fn clone_thread(
         // store is the child's view too.
         if let Some(phys) = ctid_phys {
             let virt = mm::phys_to_virt(phys);
-            unsafe { core::ptr::write_volatile(virt as *mut u32, child_pid); }
+            // The child's own view: 1 when it is about to become a namespace init.
+            let ctid_val = if pidns_target != 0 && crate::ns::pid_init(pidns_target) == 0 { 1 } else { child_pid };
+            unsafe { core::ptr::write_volatile(virt as *mut u32, ctid_val); }
         }
         if let Some(phys) = ptid_phys {
             let virt = mm::phys_to_virt(phys);
@@ -843,6 +853,8 @@ pub fn clone_thread(
         child.euid       = euid; child.egid = egid;
         child.caps       = caps;
         child.userns     = crate::ns::NsRef::get(puser);
+        child.pidns      = crate::ns::NsRef::get(pidns_target);
+        child.pidns_child = crate::ns::NsRef::get(pidns_target);
         child.netns      = crate::ns::NsRef::get(pnet);
         child.ipcns      = crate::ns::NsRef::get(pipc);
         child.suid       = suid; child.sgid = sgid;
@@ -909,7 +921,9 @@ pub fn clone_thread(
             mm::buddy::free(stack_base_phys, stack_pages);
             return -11; // EAGAIN
         }
+        crate::pidns::claim_init(pidns_target, child_pid);
         if !rq.enqueue(child) {
+            if pidns_target != 0 { crate::ns::set_pid_dead(pidns_target); }
             drop(rq);
             report_task_table_full();
             mm::buddy::free(stack_base_phys, stack_pages);

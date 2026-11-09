@@ -2132,7 +2132,7 @@ fn dispatch_inner(
         // its own process: Firefox's IPC endpoints record getpid() when
         // created and MOZ_RELEASE_ASSERT it on bind from another thread
         // (`mMyProcInfo == EndpointProcInfo::Current()`), and died there.
-        GETPID  => sched::current_tgid() as isize,
+        GETPID  => sched::pidns::self_v(sched::current_tgid()) as isize,
         GETPPID => sys_getppid(),
 
         // ── exec / fork ───────────────────────────────────────────────────────
@@ -2492,11 +2492,11 @@ fn dispatch_inner(
         FREMOVEXATTR => sys_removexattr(a0, a1, true, false),
 
         // ── Credentials ───────────────────────────────────────────────────────
-        GETUID  => sched::current_uid()  as isize,
-        GETEUID => sched::current_euid() as isize,
-        GETGID  => sched::current_gid()  as isize,
-        GETEGID => sched::current_egid() as isize,
-        GETTID    => current_pid() as isize,
+        GETUID  => sched::ns::view_id(0, sched::current_uid())  as isize,
+        GETEUID => sched::ns::view_id(0, sched::current_euid()) as isize,
+        GETGID  => sched::ns::view_id(1, sched::current_gid())  as isize,
+        GETEGID => sched::ns::view_id(1, sched::current_egid()) as isize,
+        GETTID    => sched::pidns::self_v(current_pid()) as isize,
         TGKILL    => sys_tgkill(a0, a1, a2),
         TKILL     => sys_tkill(a0, a1),
         RT_SIGQUEUEINFO   => sys_rt_sigqueueinfo(None, a0, a1, a2),
@@ -3823,9 +3823,12 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, rusage: usize) -
     } else if pid_i == 0 {
         sched::WaitSel::Pgid(sched::current_pgid())
     } else if pid_i < -1 {
-        sched::WaitSel::Pgid((-(pid_i as i64)) as u32)
+        // Pid numbers are the caller's pid-namespace view; a child is never
+        // the waiter namespace's init, so the values wait returns are
+        // identity (lane nspid).
+        match sched::pidns::from_cur((-(pid_i as i64)) as u32) { Ok(k) => sched::WaitSel::Pgid(k), Err(_) => return -10 }
     } else {
-        sched::WaitSel::Pid(pid_i as u32)
+        match sched::pidns::from_cur(pid_i as u32) { Ok(k) => sched::WaitSel::Pid(k), Err(_) => return -10 }
     };
     let caller_tgid = sched::current_tgid();
 
@@ -3896,8 +3899,8 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
     let mut pidfd_nonblock = false;
     let sel = match idtype {
         0 => sched::WaitSel::Any,
-        1 => sched::WaitSel::Pid(id as u32),
-        2 => sched::WaitSel::Pgid(id as u32),
+        1 => match sched::pidns::from_cur(id as u32) { Ok(k) => sched::WaitSel::Pid(k), Err(_) => return -10 },
+        2 => match sched::pidns::from_cur(id as u32) { Ok(k) => sched::WaitSel::Pgid(k), Err(_) => return -10 },
         3 => {
             // The process the pidfd names; an O_NONBLOCK pidfd makes a wait
             // for a still-running child EAGAIN instead of blocking (Linux).
@@ -5428,10 +5431,13 @@ fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
         // kill(2) is process-directed: route to a thread in the target group
         // that hasn't masked `sig`, not blindly its leader. A thread id names
         // its process, as on Linux.
-        return sched::cred::kill_process(sched::tgid_of(pid_i as u32), sig, info);
+        let k = match sched::pidns::from_cur(pid_i as u32) { Ok(k) => k, Err(e) => return e };
+        return sched::cred::kill_process(sched::tgid_of(k), sig, info);
     }
     if pid_i == -1 { return sched::cred::kill_all_checked(sig, info); }
-    let pgid = if pid_i == 0 { sched::current_pgid() } else { (-(pid_i as i64)) as u32 };
+    let pgid = if pid_i == 0 { sched::current_pgid() } else {
+        match sched::pidns::from_cur((-(pid_i as i64)) as u32) { Ok(k) => k, Err(e) => return e }
+    };
     sched::cred::kill_pgrp_checked(pgid, sig, info)
 }
 
@@ -5441,7 +5447,10 @@ fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
 /// thread group id.
 fn sys_getppid() -> isize {
     let leader_ppid = sched::task_ppid(sched::current_tgid()).unwrap_or_else(|| current_ppid());
-    sched::tgid_of(leader_ppid) as isize
+    let n = sched::pidns::cur();
+    let p = sched::tgid_of(leader_ppid);
+    // Outside the namespace (or the init's parent) -> 0, as Linux.
+    (if n == 0 { p } else { sched::pidns::to_v(n, p) }) as isize
 }
 
 // ── Thread primitives (futex, TID address, TLS base) ──────────────────────────
@@ -5450,7 +5459,7 @@ fn sys_getppid() -> isize {
 /// Another thread's only within the caller's group, or for root (Linux
 /// asks ptrace_may_access).
 fn sys_get_robust_list(tid: usize, head_ptr: usize, len_ptr: usize) -> isize {
-    let tid = tid as u32;
+    let Ok(tid) = sched::pidns::from_cur(tid as u32) else { return -3 };
     if tid != 0 && sched::tgid_of(tid) != sched::current_tgid() && sched::current_euid() != 0 {
         return -1; // EPERM
     }
@@ -5464,7 +5473,7 @@ fn sys_get_robust_list(tid: usize, head_ptr: usize, len_ptr: usize) -> isize {
 
 fn sys_set_tid_address(tidptr: usize) -> isize {
     set_clear_child_tid(tidptr);
-    current_pid() as isize
+    sched::pidns::self_v(current_pid()) as isize
 }
 
 /// Timed FUTEX_WAIT with its relative timeout already turned into the
@@ -5679,7 +5688,9 @@ const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 /// ETIMEDOUT at the deadline; a restartable interruption on a signal (musl
 /// retries EINTR itself).
 fn futex_lock_pi(uaddr: usize, private: bool, deadline: Option<u64>, try_only: bool) -> isize {
-    let tid = current_pid() as u32;
+    let ktid = current_pid() as u32;
+    // The tid written to the word is the caller's own view (1 for a pid-ns init).
+    let tid = sched::pidns::self_v(ktid);
     // The word goes through the fault-tolerant uaccess helpers: a bad
     // pointer is EFAULT, not a kernel fault.
     let cas = |old: u32, new: u32| -> Result<bool, isize> {
@@ -5692,13 +5703,14 @@ fn futex_lock_pi(uaddr: usize, private: bool, deadline: Option<u64>, try_only: b
             // Free: take it. Keep FUTEX_WAITERS set while anyone else is
             // queued, so our unlock comes through the kernel and wakes them.
             let mut new = tid | (w & FUTEX_OWNER_DIED);
-            if sched::futex_has_waiters(uaddr, private, tid) { new |= FUTEX_WAITERS; }
+            if sched::futex_has_waiters(uaddr, private, ktid) { new |= FUTEX_WAITERS; }
             match cas(w, new) { Ok(true) => return 0, Ok(false) => {}, Err(e) => return e }
             continue;
         }
         if owner == tid { return -35; } // EDEADLK
         if try_only { return -11; }     // EWOULDBLOCK
-        if !sched::futex_task_exists(owner) { return -3; } // ESRCH
+        let owner_k = match sched::pidns::from_cur(owner) { Ok(k) => k, Err(e) => return e };
+        if !sched::futex_task_exists(owner_k) { return -3; } // ESRCH
         // Held: make the owner's unlock come to the kernel, then park
         // expecting exactly that word. FUTEX_WAITERS goes in BEFORE any
         // timeout verdict: a woken locker that lost the free word to a
@@ -5728,7 +5740,7 @@ fn futex_lock_pi(uaddr: usize, private: bool, deadline: Option<u64>, try_only: b
 /// to the first queued locker, or release it to 0 (FUTEX_OWNER_DIED is
 /// dropped with the ownership). See sched::futex_unlock_pi.
 fn futex_unlock_pi(uaddr: usize, private: bool) -> isize {
-    sched::futex_unlock_pi(uaddr, private, current_pid() as u32)
+    sched::futex_unlock_pi(uaddr, private, sched::pidns::self_v(current_pid() as u32))
 }
 
 fn sys_arch_prctl(code: usize, addr: usize) -> isize {
@@ -7696,7 +7708,8 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
 fn sys_tgkill(tgid: usize, tid: usize, sig: usize) -> isize {
     if sig > 64 { return -22; } // EINVAL
     if (tgid as i32) <= 0 || (tid as i32) <= 0 { return -22; } // EINVAL
-    sched::cred::kill_thread(Some(tgid as u32), tid as u32, sig as u32, tkill_info())
+    let (Ok(tgid), Ok(tid)) = (sched::pidns::from_cur(tgid as u32), sched::pidns::from_cur(tid as u32)) else { return -3 };
+    sched::cred::kill_thread(Some(tgid), tid, sig as u32, tkill_info())
 }
 
 /// sys_tkill(tid, sig) — send a signal to a specific thread (legacy form of
@@ -7704,7 +7717,8 @@ fn sys_tgkill(tgid: usize, tid: usize, sig: usize) -> isize {
 fn sys_tkill(tid: usize, sig: usize) -> isize {
     if sig > 64 { return -22; } // EINVAL
     if (tid as i32) <= 0 { return -22; } // EINVAL
-    sched::cred::kill_thread(None, tid as u32, sig as u32, tkill_info())
+    let Ok(tid) = sched::pidns::from_cur(tid as u32) else { return -3 };
+    sched::cred::kill_thread(None, tid, sig as u32, tkill_info())
 }
 
 /// rt_sigqueueinfo(tgid, sig, info) / rt_tgsigqueueinfo(tgid, tid, sig, info)
@@ -7723,9 +7737,15 @@ fn sys_rt_sigqueueinfo(tgid_opt: Option<usize>, pid: usize, sig: usize, uinfo: u
     let pid_i = pid as u32 as i32;
     if pid_i <= 0 { return if tgid_opt.is_some() { -22 } else { -3 }; } // EINVAL / ESRCH
     let me = sched::current_tgid();
+    // Pid numbers are the caller's namespace view (lane nspid).
+    let Ok(pid_k) = sched::pidns::from_cur(pid_i as u32) else { return -3 };
+    let tgid_opt = match tgid_opt {
+        Some(t) => { if (t as i32) <= 0 { return -22; } match sched::pidns::from_cur(t as u32) { Ok(k) => Some(k as usize), Err(e) => return e } }
+        None => None,
+    };
     let target_tgid = match tgid_opt {
-        Some(t) => { if (t as i32) <= 0 { return -22; } t as u32 }
-        None => sched::tgid_of(pid_i as u32),
+        Some(t) => t as u32,
+        None => sched::tgid_of(pid_k),
     };
     if (code >= 0 || code == sched::SI_TKILL) && target_tgid != me { return -1; } // EPERM
     let info = sched::SigInfo {
@@ -7733,7 +7753,7 @@ fn sys_rt_sigqueueinfo(tgid_opt: Option<usize>, pid: usize, sig: usize, uinfo: u
         si_value: u64::from_le_bytes(raw[24..32].try_into().unwrap()),
     };
     match tgid_opt {
-        Some(t) => sched::cred::kill_thread(Some(t as u32), pid_i as u32, sig as u32, info),
+        Some(t) => sched::cred::kill_thread(Some(t as u32), pid_k, sig as u32, info),
         None => sched::cred::kill_process(target_tgid, sig as u32, info),
     }
 }
@@ -8359,7 +8379,7 @@ fn sys_unshare(flags: usize) -> isize {
     // CLONE_THREAD/SIGHAND/VM: Linux allows them only for a single-threaded
     // caller, where they are no-ops.
     if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && !alone { return -22; }
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWPID) != 0 { return -22; }
+    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS) != 0 { return -22; }
     let flat = flags & (CLONE_NEWNET | CLONE_NEWIPC);
     if flat != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; } // CAP_SYS_ADMIN
     if flat != 0 && !alone { return -22; }
@@ -8369,6 +8389,11 @@ fn sys_unshare(flags: usize) -> isize {
         let r = sched::ns::unshare_user();
         if r < 0 { return r; }
         sched::unshare_fs(); // CLONE_NEWUSER implies CLONE_FS
+    }
+    // Run after the NEWUSER block: NEWUSER|NEWPID gets its caps from the new userns.
+    if flags & CLONE_NEWPID != 0 {
+        let r = sched::pidns::unshare_pid();
+        if r < 0 { return r; }
     }
     if flat != 0 {
         let r = sched::ns::unshare_flat(flat & CLONE_NEWNET != 0, flat & CLONE_NEWIPC != 0);
@@ -8604,6 +8629,12 @@ fn sys_openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize
 /// inodes; exe/cwd/root are 0777, fd links 0700), size 0. `None` when `ns`
 /// is no magic link; ENOENT when the process (or the descriptor) is gone.
 fn lstat_magic_link(ns: &[u8], statbuf_ptr: usize) -> Option<isize> {
+    if let Some((pid, k)) = proc_ns_link(ns) {
+        if sched::exists_probe(pid) != 0 { return Some(-2); }
+        let (u, g) = sched::cred::ids_of(pid).map(|(u, g)| (u[1], g[1])).unwrap_or((0, 0));
+        vfs::write_stat_full(statbuf_ptr, 0o120777, 1, 0, 0x7200_0000_0000u64 | ((pid as u64) << 8) | k as u64, u, g);
+        return Some(0);
+    }
     if !is_magic_link(ns) { return None; }
     let b = backing_of(ns).unwrap_or_else(|| ns.to_vec());
     let mut found = None;
@@ -8812,6 +8843,7 @@ fn ns_readlink(ns: &[u8]) -> Result<Vec<u8>, isize> {
 /// `/proc/<pid>/fd/<n>`.
 fn is_magic_link(ns: &[u8]) -> bool {
     let b = backing_of(ns).unwrap_or_else(|| ns.to_vec());
+    if proc_ns_link(&b).is_some() { return true; }
     for what in [&b"exe"[..], b"cwd", b"root"] {
         if let Some((_, rest)) = proc_magic(&b, what) { if rest.is_empty() { return true; } }
     }
@@ -9893,6 +9925,7 @@ fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, flags: us
 /// exec like the other credentials; consulted by every filesystem permission
 /// check through `xattr::Cred::in_group`.
 fn sys_setgroups(size: usize, list_ptr: usize) -> isize {
+    if sched::ns::setgroups_denied(sched::ns::current_userns()) { return -1; } // EPERM after "deny"
     if size > xattr::NGROUPS_MAX { return -22; } // EINVAL
     let mut groups = [0u32; xattr::NGROUPS_MAX];
     if size > 0 {
@@ -10490,6 +10523,8 @@ fn sys_getresxid(r_ptr: usize, e_ptr: usize, s_ptr: usize, is_gid: bool) -> isiz
     } else {
         (sched::current_uid(), sched::current_euid(), sched::current_suid())
     };
+    let k = is_gid as usize;
+    let (r, e, s) = (sched::ns::view_id(k, r), sched::ns::view_id(k, e), sched::ns::view_id(k, s));
     if r_ptr != 0 && !ua::write_user::<u32>(r_ptr, r) { return -14; }
     if e_ptr != 0 && !ua::write_user::<u32>(e_ptr, e) { return -14; }
     if s_ptr != 0 && !ua::write_user::<u32>(s_ptr, s) { return -14; }
@@ -10613,6 +10648,20 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
                 None => -2,
             };
         }
+    }
+    if let Some((pid, k)) = proc_ns_link(path) {
+        if sched::exists_probe(pid) != 0 { return -2; }
+        let mut b = [0u8; 48];
+        let name = sched::ns::NS_NAMES[k];
+        let mut n = name.len();
+        b[..n].copy_from_slice(name);
+        b[n] = b':'; b[n + 1] = b'['; n += 2;
+        let mut d = [0u8; 20]; let mut j = 0;
+        let mut v = sched::ns::ns_ino(k, sched::ns::ns_id_of(pid, k));
+        loop { d[j] = b'0' + (v % 10) as u8; j += 1; v /= 10; if v == 0 { break; } }
+        while j > 0 { j -= 1; b[n] = d[j]; n += 1; }
+        b[n] = b']'; n += 1;
+        return reply(&b[..n]);
     }
     if let Some((pid, rest)) = proc_magic(path, b"root") {
         if rest.is_empty() {
@@ -10798,6 +10847,14 @@ impl KPath {
     /// The namespace path: what chdir/chroot record.
     #[inline]
     fn ns_bytes(&self) -> &[u8] { self.ns.as_deref().unwrap_or(self.bytes()) }
+}
+
+/// `/proc/<pid|self|thread-self>/ns/<name>` → (pid, index into NS_NAMES).
+fn proc_ns_link(p: &[u8]) -> Option<(u32, usize)> {
+    let (pid, rest) = proc_magic(p, b"ns")?;
+    let name = rest.strip_prefix(b"/")?;
+    let k = sched::ns::NS_NAMES.iter().position(|n| *n == name)?;
+    Some((pid, k))
 }
 
 /// `/proc/<pid|self|thread-self>/<what>` → (pid, rest after `<what>`).
@@ -16248,6 +16305,8 @@ fn sys_alarm(seconds: usize) -> isize {
 struct CloneReq {
     /// Pre-created user namespace id for CLONE_NEWUSER (0 = none); set by do_clone.
     userns: sched::ns::NsId,
+    /// Pre-created pid namespace id for CLONE_NEWPID (0 = none); set by do_clone.
+    pidns: sched::ns::NsId,
     netns: sched::ns::NsId,
     ipcns: sched::ns::NsId,
     /// CLONE_* flags; the low byte (CSIGNAL) is the signal a new process
@@ -16327,7 +16386,7 @@ fn sys_clone_or_fork(
         return -22;
     }
     let pidfd = if flags & CLONE_PIDFD != 0 { ptid } else { 0 };
-    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None, userns: 0, netns: 0, ipcns: 0 }, frame_ptr)
+    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0 }, frame_ptr)
 }
 
 /// vfork(2): `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` — the child runs on
@@ -16337,7 +16396,7 @@ fn sys_clone_or_fork(
 fn sys_vfork(frame_ptr: usize) -> isize {
     const SIGCHLD: usize = 17;
     do_clone(CloneReq { flags: CLONE_VM | CLONE_VFORK | SIGCHLD, stack: 0, ptid: 0, ctid: 0,
-                        tls: 0, pidfd: 0, set_tid: None, userns: 0, netns: 0, ipcns: 0 }, frame_ptr)
+                        tls: 0, pidfd: 0, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0 }, frame_ptr)
 }
 
 /// clone3(uargs, size): `struct clone_args` translated onto the clone path.
@@ -16430,7 +16489,7 @@ fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
         if let Err(e) = sched::reserve_pid(p) { return e; }
     }
     let r = do_clone(CloneReq { flags, stack: sp, ptid: parent_tid as usize, ctid: child_tid as usize,
-                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid, userns: 0, netns: 0, ipcns: 0 }, frame_ptr);
+                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid, userns: 0, pidns: 0, netns: 0, ipcns: 0 }, frame_ptr);
     if let Some(p) = set_tid_pid { sched::release_reserved_pid(p); }
     r
 }
@@ -16449,7 +16508,22 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
 
     // Namespaces: only CLONE_NEWUSER is implemented (nsbox lane L1); every
     // other CLONE_NEW* is refused instead of silently ignored.
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWPID) != 0 { return -22; }
+    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS) != 0 { return -22; }
+    // Pid namespaces (lane nspid). Linux copy_process rules: NEWPID excludes
+    // CLONE_THREAD/SIGHAND; here also CLONE_VM (the vfork-style arm has no
+    // namespace plumbing). A thread or CLONE_PARENT child cannot be placed
+    // when unshare(NEWPID) left pid_for_children differing from our own
+    // namespace; CLONE_PARENT from a namespace init is refused too.
+    let (cur_pidns, cur_pidns_child) = sched::pidns::cur_and_child();
+    if flags & CLONE_NEWPID != 0 {
+        if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 { return -22; }
+        if flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
+        if cur_pidns_child != cur_pidns { return -22; }
+        if req.set_tid.is_some() { return -22; }
+    }
+    if flags & (CLONE_THREAD | CLONE_PARENT) != 0 && cur_pidns_child != cur_pidns { return -22; }
+    if flags & CLONE_PARENT != 0 && cur_pidns != 0 && sched::pidns::self_v(sched::current_tgid()) == 1 { return -22; }
+    if req.set_tid.is_some() && cur_pidns_child != 0 { return -22; }
     // NEWNET/NEWIPC: need CAP_SYS_ADMIN in the (possibly new) user namespace;
     // a thread or a shared-VM child cannot get its own.
     if flags & (CLONE_NEWNET | CLONE_NEWIPC) != 0 {
@@ -16468,6 +16542,10 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
     } else { None };
     let mut req = req;
     req.userns = new_user.as_ref().map_or(0, |n| n.id());
+    let new_pid_ns = if flags & CLONE_NEWPID != 0 {
+        match sched::ns::new_pidns(cur_pidns) { Ok(n) => Some(n), Err(e) => return e }
+    } else { None };
+    req.pidns = new_pid_ns.as_ref().map_or(0, |n| n.id());
     let new_net = if flags & CLONE_NEWNET != 0 { match sched::ns::new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
     let new_ipc = if flags & CLONE_NEWIPC != 0 { match sched::ns::new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
     req.netns = new_net.as_ref().map_or(0, |n| n.id());
@@ -16572,6 +16650,7 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
             set_tid: req.set_tid,
             share_fs: flags & CLONE_FS != 0,
             userns: req.userns,
+            pidns: req.pidns,
             netns: req.netns,
             ipcns: req.ipcns,
         };
