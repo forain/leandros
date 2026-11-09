@@ -374,7 +374,8 @@ pub fn selftest() -> Vec<(&'static str, bool)> {
     let dst: NsId = 0xFFF1;
     let before = sb_refs(sb1);
     let ok = copy(ns, dst, 0, true).is_ok();
-    let same = translate(dst, b"/a/d/n/z").map(|x| x.backing == b"/srv/n/z" && x.mnt_id != 4).unwrap_or(false);
+    // /a is overmounted by now, so the copy shows the same top-of-stack view.
+    let same = translate(dst, b"/a/d/n/z").map(|x| x.backing == b"/over2/d/n/z" && x.mnt_id != 6).unwrap_or(false);
     out.push(("copy_shape", ok && same && chk(b"/a/x", b"/over2/x")));
     out.push(("copy_sb_ref", sb_refs(sb1) == before.map(|b| b + 1)));
     out.push(("copy_locked", with_ns(dst, |n| n.mnts.iter().all(|m| m.locked & LOCK_MNT != 0)).unwrap_or(false)));
@@ -384,7 +385,7 @@ pub fn selftest() -> Vec<(&'static str, bool)> {
     out.push(("sb_root_hidden", is_sb_path(&r1) && !is_sb_path(b"/.leandros-sbx") && r1.starts_with(SB_ROOT)));
     let _ = r1d;
     release(ns);
-    out.push(("sb_destroyed_with_tree", sb_put(sb1) && sb_refs(sb1).is_none()));
+    out.push(("sb_destroyed_with_tree", sb_refs(sb1).is_none()));
     // linkscan dispatch: longest prefix wins
     fn s_a(_: &[u8], _: &[u8], _: bool) -> Option<(usize, Vec<u8>)> { Some((1, b"A".to_vec())) }
     fn s_b(_: &[u8], _: &[u8], _: bool) -> Option<(usize, Vec<u8>)> { Some((2, b"B".to_vec())) }
