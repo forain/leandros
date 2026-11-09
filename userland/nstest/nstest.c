@@ -1869,12 +1869,11 @@ static int map_self(void)
 static int sc_types[2] = { SOCK_DGRAM, SOCK_STREAM };
 
 /* Parent outside the pidns sends to a child inside: pid 0, uid 1000. */
-static int ub_scm_in(void)
+static int sc_in_one(int ty)
 {
-    alarm(20);
-    CHECK(map_self() == 0);
-    CHECK(unshare(CLONE_NEWPID) == 0);
-    for (int t = 0; t < 2; t++) {
+    {
+        int t = ty;
+        CHECK(unshare(CLONE_NEWPID) == 0);
         int sp[2], rd[2];
         CHECK(socketpair(AF_UNIX, sc_types[t], 0, sp) == 0 && pipe(rd) == 0);
         pid_t c = fork();
@@ -1892,15 +1891,26 @@ static int ub_scm_in(void)
     }
     return 0;
 }
-PCASE(scm_cred_into_pidns, ub_scm_in)
-
-/* Child inside the pidns sends to the outside parent: the real pid. */
-static int ub_scm_out(void)
+static int ub_scm_in(void)
 {
     alarm(20);
     CHECK(map_self() == 0);
-    CHECK(unshare(CLONE_NEWPID) == 0);
     for (int t = 0; t < 2; t++) {
+        pid_t w = fork();
+        CHECK(w >= 0);
+        if (w == 0) _exit(sc_in_one(t));
+        CHECK(child_ok(w) == 0);
+    }
+    return 0;
+}
+PCASE(scm_cred_into_pidns, ub_scm_in)
+
+/* Child inside the pidns sends to the outside parent: the real pid. */
+static int sc_out_one(int ty)
+{
+    {
+        int t = ty;
+        CHECK(unshare(CLONE_NEWPID) == 0);
         int sp[2];
         CHECK(socketpair(AF_UNIX, sc_types[t], 0, sp) == 0);
         CHECK(set_passcred(sp[0]) == 0);
@@ -1911,6 +1921,18 @@ static int ub_scm_out(void)
         CHECK(cred_recv(sp[0], &u) == 0);
         CHECK(u.pid == c && u.uid == 1000 && u.gid == 1000);
         CHECK(child_ok(c) == 0);
+    }
+    return 0;
+}
+static int ub_scm_out(void)
+{
+    alarm(20);
+    CHECK(map_self() == 0);
+    for (int t = 0; t < 2; t++) {
+        pid_t w = fork();
+        CHECK(w >= 0);
+        if (w == 0) _exit(sc_out_one(t));
+        CHECK(child_ok(w) == 0);
     }
     return 0;
 }
