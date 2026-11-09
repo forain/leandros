@@ -1557,12 +1557,13 @@ mod aarch64 {
     // [144 ..  168)  uc.uc_stack (stack_t: void*, int, pad4, size_t = 24 bytes)
     // [168 ..  176)  uc.uc_sigmask (sigset_t = u64)
     // [176 ..  296)  uc.__unused[120]  (pad to 128-byte sigmask area)
-    // [296 ..  304)  uc.uc_mcontext.fault_address
-    // [304 ..  552)  uc.uc_mcontext.regs[31]  (31 × 8 bytes = 248 bytes)
-    // [552 ..  560)  uc.uc_mcontext.sp
-    // [560 ..  568)  uc.uc_mcontext.pc
-    // [568 ..  576)  uc.uc_mcontext.pstate
-    // [576 .. 4672)  uc.uc_mcontext.__reserved[4096]
+    // [296 ..  304)  padding (uc_mcontext is aligned(16))
+    // [304 ..  312)  uc.uc_mcontext.fault_address
+    // [312 ..  560)  uc.uc_mcontext.regs[31]  (31 × 8 bytes = 248 bytes)
+    // [560 ..  568)  uc.uc_mcontext.sp
+    // [568 ..  576)  uc.uc_mcontext.pc
+    // [576 ..  584)  uc.uc_mcontext.pstate
+    // [592 .. 4688)  uc.uc_mcontext.__reserved[4096] (aligned(16))
     //                  → fpsimd_context (magic FPSIMD_MAGIC, size 528:
     //                    fpsr u32, fpcr u32, vregs[32] u128), then the
     //                    null _aarch64_ctx terminator (8 zero bytes)
@@ -1579,13 +1580,16 @@ mod aarch64 {
     const SIGINFO_SIZE:       usize = 128;
     const UC_OFFSET:          usize = SIGINFO_SIZE;              // 128
     const SIGMASK_OFFSET:     usize = UC_OFFSET + 8 + 8 + 24;   // 168
-    const MCONTEXT_OFFSET:    usize = SIGMASK_OFFSET + 128;      // 296
-    const REGS_OFFSET:        usize = MCONTEXT_OFFSET + 8;       // 304
-    const SP_OFFSET:          usize = REGS_OFFSET + 31 * 8;      // 552
-    const PC_OFFSET:          usize = SP_OFFSET + 8;             // 560
-    const PSTATE_OFFSET:      usize = PC_OFFSET + 8;             // 568
-    const RESERVED_OFFSET:    usize = PSTATE_OFFSET + 8;         // 576
-    pub const SIGFRAME_SIZE:  usize = RESERVED_OFFSET + 4096;    // 4672
+    // Linux declares `uc_mcontext` aligned(16): it follows the 128-byte
+    // sigmask area at the next 16-byte boundary (296 -> 304). musl/glibc
+    // handlers (seccomp SIGSYS, Firefox/chromium) index regs[] from there.
+    const MCONTEXT_OFFSET:    usize = (SIGMASK_OFFSET + 128 + 15) & !15; // 304
+    const REGS_OFFSET:        usize = MCONTEXT_OFFSET + 8;       // 312
+    const SP_OFFSET:          usize = REGS_OFFSET + 31 * 8;      // 560
+    const PC_OFFSET:          usize = SP_OFFSET + 8;             // 568
+    const PSTATE_OFFSET:      usize = PC_OFFSET + 8;             // 576
+    const RESERVED_OFFSET:    usize = (PSTATE_OFFSET + 8 + 15) & !15; // 592 (aligned(16))
+    pub const SIGFRAME_SIZE:  usize = RESERVED_OFFSET + 4096;    // 4688
 
     /// `struct fpsimd_context` (arch/arm64/include/uapi/asm/sigcontext.h).
     const FPSIMD_MAGIC: u32 = 0x4650_8001;
