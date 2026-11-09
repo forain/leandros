@@ -33,10 +33,13 @@ MOZ_ACCELERATED=1
 MOZ_WEBRENDER=1
 export MOZ_ACCELERATED MOZ_WEBRENDER
 
-# Sandboxes are ON by default (seccomp-bpf, user/pid/net/ipc namespaces, chroot).
-# LEANDROS_FIREFOX_SANDBOX=0 disables every process type's sandbox (debug only).
-# LEANDROS_FIREFOX_SANDBOX_LOG=1 turns on Firefox's own "Sandbox:" logging.
-if [ "${LEANDROS_FIREFOX_SANDBOX:-1}" = 0 ]; then
+# Sandboxes are off by default: until the kernel has seccomp-bpf and user/pid
+# namespaces, each process type's sandbox fails half-way. LEANDROS_FIREFOX_SANDBOX=1
+# turns them all on (and Firefox's own "Sandbox:" logging) to see what happens.
+if [ "${LEANDROS_FIREFOX_SANDBOX:-0}" = 1 ]; then
+    MOZ_SANDBOX_LOGGING=1
+    export MOZ_SANDBOX_LOGGING
+else
     MOZ_DISABLE_CONTENT_SANDBOX=1
     MOZ_DISABLE_GMP_SANDBOX=1
     MOZ_DISABLE_RDD_SANDBOX=1
@@ -47,10 +50,6 @@ if [ "${LEANDROS_FIREFOX_SANDBOX:-1}" = 0 ]; then
     export MOZ_DISABLE_CONTENT_SANDBOX MOZ_DISABLE_GMP_SANDBOX MOZ_DISABLE_RDD_SANDBOX \
            MOZ_DISABLE_SOCKET_PROCESS_SANDBOX MOZ_DISABLE_UTILITY_SANDBOX \
            MOZ_DISABLE_GPU_SANDBOX MOZ_DISABLE_VR_SANDBOX
-fi
-if [ "${LEANDROS_FIREFOX_SANDBOX_LOG:-0}" = 1 ]; then
-    MOZ_SANDBOX_LOGGING=1
-    export MOZ_SANDBOX_LOGGING
 fi
 
 # VA-API video decode. iHD only exists on x86_64 Intel images; elsewhere the
