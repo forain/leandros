@@ -265,11 +265,23 @@ fn check_load_and_stores(p: &[Insn]) -> Result<(), Error> {
 
 /// Run a verified program. Division by X == 0 at runtime returns 0.
 pub fn run(prog: &Program, d: &SeccompData) -> u32 {
+    run_ticked(prog, d, &mut || {})
+}
+
+/// Instructions between `tick` calls inside one filter run.
+pub const TICK_INSNS: u32 = 256;
+
+/// Like `run`, but calls `tick` every `TICK_INSNS` executed instructions so
+/// the caller can open an interrupt window inside one long filter.
+pub fn run_ticked<T: FnMut()>(prog: &Program, d: &SeccompData, tick: &mut T) -> u32 {
     let p = &prog.insns;
+    let mut budget = TICK_INSNS;
     let (mut a, mut x) = (0u32, 0u32);
     let mut m = [0u32; BPF_MEMWORDS];
     let mut pc = 0usize;
     loop {
+        budget -= 1;
+        if budget == 0 { budget = TICK_INSNS; tick(); }
         let f = p[pc];
         pc += 1;
         let c = f.code;
@@ -344,6 +356,18 @@ pub fn run_stack<'a, I: IntoIterator<Item = &'a Program>>(newest_first: I, d: &S
     let mut ret = SECCOMP_RET_ALLOW;
     for p in newest_first {
         ret = precedence_min(ret, run(p, d));
+    }
+    ret
+}
+
+/// `run_stack` with `tick` called between filters and every `TICK_INSNS`
+/// instructions inside each filter.
+pub fn run_stack_ticked<'a, I: IntoIterator<Item = &'a Program>, T: FnMut()>(
+    newest_first: I, d: &SeccompData, tick: &mut T) -> u32 {
+    let mut ret = SECCOMP_RET_ALLOW;
+    for p in newest_first {
+        tick();
+        ret = precedence_min(ret, run_ticked(p, d, tick));
     }
     ret
 }
