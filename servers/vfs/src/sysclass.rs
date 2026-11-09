@@ -143,9 +143,9 @@ pub fn is_video_writable(path: &[u8]) -> bool {
 /// Permission decision for opening a sysclass attribute for writing.
 /// Root always (when the attribute is writable at all); members of
 /// `VIDEO_GID` (egid or supplementary) only for `video_attr`.
-pub fn write_allowed(euid: u32, egid: u32, groups: &[u32], writable: bool, video_attr: bool) -> bool {
+pub fn write_allowed(host_root: bool, egid: u32, groups: &[u32], writable: bool, video_attr: bool) -> bool {
     if !writable { return false; }
-    euid == 0 || (video_attr && (egid == VIDEO_GID || groups.contains(&VIDEO_GID)))
+    host_root || (video_attr && (egid == VIDEO_GID || groups.contains(&VIDEO_GID)))
 }
 
 #[cfg(test)]
@@ -153,13 +153,13 @@ mod perm_tests {
     use super::*;
     #[test]
     fn decision() {
-        assert!(write_allowed(0, 0, &[], true, false));
-        assert!(!write_allowed(0, 0, &[], false, false));
-        assert!(write_allowed(1000, 1000, &[1000, 44], true, true));
-        assert!(write_allowed(1000, 44, &[], true, true));
-        assert!(!write_allowed(1000, 1000, &[1000, 10], true, true));
-        assert!(!write_allowed(1000, 1000, &[44], true, false));
-        assert!(!write_allowed(1000, 44, &[], false, true));
+        assert!(write_allowed(true, 0, &[], true, false));
+        assert!(!write_allowed(true, 0, &[], false, false));
+        assert!(write_allowed(false, 1000, &[1000, 44], true, true));
+        assert!(write_allowed(false, 44, &[], true, true));
+        assert!(!write_allowed(false, 1000, &[1000, 10], true, true));
+        assert!(!write_allowed(false, 1000, &[44], true, false));
+        assert!(!write_allowed(false, 44, &[], false, true));
     }
 }
 

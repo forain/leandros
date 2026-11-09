@@ -308,13 +308,13 @@ unsafe fn execute_binary(args: &[&str], count: usize) {
     } else if pid == 0 {
         // Child
         //
-        // Children get PATH=/bin so libc-level PATH search (e.g. musl's
+        // Children get the standard default PATH so libc-level PATH search (e.g. musl's
         // execvp, used by non-native binaries like bottom) finds userland
         // tools. Without this, execvp falls back to its compiled-in
         // default "/usr/local/bin:/bin:/usr/bin" and tries /usr/local/bin
         // first, which doesn't exist on this OS's F2FS image at all -
         // everything ships under /bin (see mkfs-f2fs-populated.py).
-        static PATH_ENV: &[u8] = b"PATH=/bin\0";
+        static PATH_ENV: &[u8] = b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0";
         static HOME_ENV: &[u8] = b"HOME=/\0";
         static TERM_ENV: &[u8] = b"TERM=xterm-256color\0";
         // Surfaces real panic messages from Rust std children (human-panic

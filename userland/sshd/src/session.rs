@@ -211,7 +211,7 @@ impl Conn {
         let path = if user.uid == 0 {
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         } else {
-            "/usr/local/bin:/usr/bin:/bin"
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         };
         let mut env = vec![
             ("HOME".to_string(), user.home.clone()),

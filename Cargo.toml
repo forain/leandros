@@ -14,6 +14,7 @@ members = [
     "servers/drm",
     "servers/pipewire",
     "servers/f2fs",
+    "servers/fuse",
     "servers/xattr",
     "drivers",
     "drivers/usb",

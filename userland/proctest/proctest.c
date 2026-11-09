@@ -1419,6 +1419,24 @@ static void vfork_exec_faults(const char *self) {
     pass(n);
 }
 
+/* aarch64 /proc/cpuinfo carries the Linux arm64 fields (podman's getCPUInfo
+ * looks for "CPU architecture"). */
+static void cpuinfo_arm64_fields(void) {
+#ifdef __aarch64__
+    static const char *want[] = { "processor", "BogoMIPS", "Features", "CPU implementer",
+        "CPU architecture: 8", "CPU variant", "CPU part", "CPU revision" };
+    char buf[4096];
+    int fd = open("/proc/cpuinfo", O_RDONLY);
+    ssize_t n = fd < 0 ? -1 : read(fd, buf, sizeof buf - 1);
+    if (fd >= 0) close(fd);
+    if (n <= 0) { fail("cpuinfo_arm64_fields", "read failed"); return; }
+    buf[n] = 0;
+    for (unsigned i = 0; i < sizeof want / sizeof *want; i++)
+        if (!strstr(buf, want[i])) { fail("cpuinfo_arm64_fields", "missing %s", want[i]); return; }
+    pass("cpuinfo_arm64_fields");
+#endif
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--print-faults") == 0) {
         unsigned long mi = 0, ma = 0;
@@ -1440,6 +1458,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("proctest: uid %d, %ld cpus\n", (int)geteuid(), sysconf(_SC_NPROCESSORS_ONLN));
 
+    cpuinfo_arm64_fields();
     wait4_rusage();
     getrusage_maxrss();
     for (int i = 0; i < ndirs; i++) majflt_cache_hit(dirs[i]);

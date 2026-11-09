@@ -664,6 +664,7 @@ mod nr {
     pub const SCHED_YIELD:    usize = 124;
     pub const CLONE:          usize = 220;
     pub const EXECVE:         usize = 221;
+    pub const EXECVEAT:       usize = 281;
     pub const EXIT:           usize = 93;
     pub const WAIT4:          usize = 260;
     pub const KILL:           usize = 129;
@@ -929,6 +930,7 @@ mod nr {
     pub const FORK:           usize = 57;
     pub const VFORK:          usize = 58;
     pub const EXECVE:         usize = 59;
+    pub const EXECVEAT:       usize = 322;
     pub const EXIT:           usize = 60;
     pub const WAIT4:          usize = 61;
     pub const KILL:           usize = 62;
@@ -2171,6 +2173,7 @@ fn dispatch_inner(
             }
             res
         }
+        EXECVEAT => sys_execveat(a0, a1, a2, a3, a4),
         CLONE   => sys_clone_or_fork(a0, a1, a2, a3, a4, frame_ptr),
         CLONE3  => sys_clone3(a0, a1, frame_ptr),
         #[cfg(not(target_arch = "aarch64"))]
@@ -6415,15 +6418,48 @@ fn jail_relative(p: &[u8]) -> alloc::vec::Vec<u8> {
 }
 
 fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
-    let pid = current_pid();
-
     // Resolve against the cwd through the shared helper, so `./prog` and
     // `prog` name the same file execve sees as every other path syscall.
-    let mut kpath = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
+    let kpath = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
     // execve follows a final /proc magic link like open does:
     // `execv("/proc/self/exe")` re-runs the binary itself (and fd/N of a
     // mounted file runs that file) instead of failing on the link.
-    kpath = match follow_magic_final(kpath) { Ok(p) => p, Err(e) => return e };
+    let kpath = match follow_magic_final(kpath) { Ok(p) => p, Err(e) => return e };
+    sys_execve_kp(kpath, argv_ptr, envp_ptr, false)
+}
+
+/// execveat(dirfd, path, argv, envp, flags). The path is resolved to a
+/// KPath here and then runs the exact execve path (creds, setid, NNP,
+/// seccomp, cloexec sweep), so nothing is duplicated.
+fn sys_execveat(dirfd: usize, path_ptr: usize, argv_ptr: usize, envp_ptr: usize, flags: usize) -> isize {
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 { return -22; }
+    let dirfd = dirfd as u32 as i32 as isize as usize;
+    let empty = path_ptr != 0 && validate_user_buf(path_ptr, 1) && ur::<u8>(path_ptr) == 0;
+    if flags & AT_EMPTY_PATH != 0 && empty {
+        // fexecve: run the file `dirfd` names (it may be O_PATH).
+        const F_GETFD: usize = 1;
+        let cloexec = sys_fcntl(fd_handle(dirfd), F_GETFD, 0);
+        if cloexec < 0 { return -9; } // EBADF
+        let host = match fd_host_path(dirfd) { Some(h) => h, None => return -9 };
+        let kp = KPath::raw(&host);
+        return sys_execve_kp(kp, argv_ptr, envp_ptr, cloexec & 1 != 0);
+    }
+    let kp = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        // The final component must not be a symlink: Linux gives ELOOP.
+        if ns_readlink(kp.ns_bytes()).is_ok() { return -40; }
+        return sys_execve_kp(kp, argv_ptr, envp_ptr, false);
+    }
+    let kp = match follow_magic_final(kp) { Ok(p) => p, Err(e) => return e };
+    sys_execve_kp(kp, argv_ptr, envp_ptr, false)
+}
+
+/// `fd_cloexec`: the file came from a close-on-exec fd (fexecve); a `#!`
+/// script would then name an fd that is closed by the time the interpreter
+/// opens /dev/fd/N, which Linux reports as ENOENT.
+fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: bool) -> isize {
+    let pid = current_pid();
+
     // MS_NOEXEC (Linux `path_noexec`): the file named, script or binary.
     if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
 
@@ -6448,6 +6484,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
             None => break, // unreadable: the ELF path below reports it
         };
         if head.len() < 2 || &head[..2] != b"#!" { break; }
+        if fd_cloexec && depth == 0 { return -2; } // ENOENT, as Linux
         if depth >= SHEBANG_MAX_DEPTH { return -40; } // ELOOP
         let perm = exec_permitted(&kpath, pid);
         if perm != 0 { return perm; }
@@ -9177,6 +9214,15 @@ fn fstat_into(fd: usize, statbuf_ptr: usize, user_dest: bool) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
+/// Linux `may_mount`: the caller needs CAP_SYS_ADMIN in the user namespace
+/// that owns its CURRENT mount namespace. The initial mount namespace (0) is
+/// owned by the initial user namespace, so that is host root only.
+fn may_mount() -> bool {
+    let mntns = sched::current_mntns();
+    if mntns == 0 { return sched::host_root(); }
+    sched::caps::ns_capable_in(sched::ns::owner_user(mntns), 21)
+}
+
 fn sys_mount(
     source_ptr: usize,
     target_ptr: usize,
@@ -9197,7 +9243,11 @@ fn sys_mount(
     // own user namespace (a container's runtime mounts its /dev/pts there).
     let devpts_mount = flags & (MS_REMOUNT | 4096) == 0 && fstype_ptr != 0
         && read_user_short_str(fstype_ptr).map_or(false, |v| v.as_slice() == b"devpts");
-    if !sched::host_root() && !(devpts_mount && sched::caps::ns_capable(21)) { return -1; } // EPERM
+    // Linux `may_mount`: CAP_SYS_ADMIN in the user namespace that OWNS the
+    // caller's mount namespace. Non-host-root callers are only ever allowed
+    // devpts (other types stay host-root until their userns story exists).
+    if !may_mount() { return -1; } // EPERM
+    if !sched::host_root() && !devpts_mount { return -1; } // EPERM
     // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC):
     // only the mount's propagation state changes; source/fstype are ignored.
     if flags & (vfs::mnt::MS_UNBINDABLE | vfs::mnt::MS_PRIVATE | vfs::mnt::MS_SLAVE | vfs::mnt::MS_SHARED) != 0 {
@@ -9316,6 +9366,9 @@ fn sys_mount(
     if fstype_str == "tmpfs" {
         return if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { 0 } else { -22 };
     }
+    if fstype_str == "fuse" || fstype_str.starts_with("fuse.") {
+        return sys_mount_fuse(source_str, target_path.bytes(), fstype_str, flags, data_ptr);
+    }
     if fstype_str != "f2fs" {
         return -22; // EINVAL
     }
@@ -9408,8 +9461,37 @@ fn sys_mount(
     }
 }
 
-fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
-    if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
+/// mount(2) of a FUSE filesystem: `data` names the daemon's /dev/fuse fd.
+fn sys_mount_fuse(source: &str, target: &[u8], fstype: &str, flags: usize, data_ptr: usize) -> isize {
+    const MS_RDONLY: usize = 1;
+    const MS_NOSUID: usize = 2;
+    let data = if data_ptr == 0 { Vec::new() } else { match read_user_short_str(data_ptr) { Ok(v) => v, Err(e) => return e } };
+    let opts = match core::str::from_utf8(&data).ok().and_then(fuse_server::parse_opts) { Some(o) => o, None => return -22 };
+    let pid = current_pid();
+    let open_id = match vfs::vfs_get_node_kind(pid, opts.fd as usize) {
+        Some(vfs::VnodeKind::DynamicDevice { port, dev_id, open_id }) if fuse_server::is_fuse_device(port, dev_id) => open_id,
+        _ => return -9, // EBADF: not a /dev/fuse descriptor
+    };
+    let mut st = [0u8; STAT_SIZE];
+    let mut tk = target.to_vec();
+    tk.push(0);
+    let m = make_vfs_msg(vfs::VFS_STAT, &[tk.as_ptr() as u64, st.as_mut_ptr() as u64]);
+    let r = vfs_reply_val(&vfs::handle(&m, pid));
+    if r < 0 { return r; }
+    if vfs::read_stat_mode(st.as_ptr() as usize) & 0o170000 != 0o040000 { return -20; }
+    let prefix: &'static str = match core::str::from_utf8(target) {
+        Ok(s) => alloc::boxed::Box::leak(alloc::string::String::from(s.trim_end_matches('/')).into_boxed_str()),
+        Err(_) => return -22,
+    };
+    let source: &'static str = alloc::boxed::Box::leak(alloc::string::String::from(source).into_boxed_str());
+    let fst: &'static str = alloc::boxed::Box::leak(alloc::string::String::from(fstype).into_boxed_str());
+    let r = fuse_server::mount(open_id, prefix, source, fst, &opts, flags & MS_RDONLY != 0);
+    if r == 0 { vfs::set_mount_nosuid(prefix, flags & MS_NOSUID != 0); }
+    r
+}
+
+fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
+    if !may_mount() { return -1; } // EPERM (CAP_SYS_ADMIN over the mntns owner)
     let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
     // An alias mount (a chroot's /proc, a bind mount) is named by where the
     // caller sees it, i.e. its namespace path.
@@ -9419,6 +9501,11 @@ fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
         Err(_) => return -22, // EINVAL
     };
 
+    if let Some(m) = vfs::list_mounts().iter().find(|e| e.in_use && e.prefix == target_str && e.fstype.starts_with("fuse")) {
+        let _ = m;
+        // MNT_FORCE (1) | MNT_DETACH (2)
+        return fuse_server::unmount(target_str, umount_flags & 3 != 0);
+    }
     if f2fs_server::unmount(target_str) {
         0
     } else {
@@ -9427,7 +9514,7 @@ fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
 }
 
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
-    if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
+    if !may_mount() { return -1; } // EPERM (CAP_SYS_ADMIN over the mntns owner)
     let pid = current_pid();
     let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
     let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };

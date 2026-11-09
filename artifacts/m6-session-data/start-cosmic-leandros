@@ -87,7 +87,7 @@ fi
 # those internal spawns to resolve. (brush's own exec PATH-search does NOT fall
 # through /usr/bin→/bin — that is why this launcher hands brush FULL PATHS below
 # and relies on PATH only for cosmic-session's internal spawns.)
-: "${PATH:=/usr/bin:/bin}"
+: "${PATH:=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 case ":$PATH:" in *:/usr/bin:*) : ;; *) PATH="/usr/bin:$PATH" ;; esac
 case ":$PATH:" in *:/bin:*)     : ;; *) PATH="$PATH:/bin"     ;; esac
 export PATH
