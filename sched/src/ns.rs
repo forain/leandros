@@ -172,6 +172,39 @@ pub fn unshare_user() -> isize {
     0
 }
 
+// ── pid namespaces (lane nspid; append-only) ────────────────────────────────
+pub const MAX_PIDNS_LEVEL: u8 = 32;
+/// Kernel tgid of the namespace's init; 0 = none yet.
+static PID_INIT: [AtomicU32; NS_MAX] = [ZERO32; NS_MAX];
+/// bit0 PIDNS_DEAD: the init exited, so fork into the namespace fails ENOMEM.
+static PID_FLAGS: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
+
+/// New pid namespace, a child of pid namespace `parent`. ENOSPC when too deep
+/// or the table is full (as Linux).
+pub fn new_pidns(parent: NsId) -> Result<NsRef, isize> {
+    let level = level(parent);
+    if level >= MAX_PIDNS_LEVEL { return Err(-28); }
+    for id in 1..NS_MAX {
+        if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
+            let p = NsRef::get(parent);
+            PARENT[id].store(p.0, Release);
+            core::mem::forget(p);
+            LEVEL[id].store(level + 1, Release);
+            PID_INIT[id].store(0, Release);
+            PID_FLAGS[id].store(0, Release);
+            crate::pidns::USED.store(true, Relaxed);
+            return Ok(NsRef(id as NsId));
+        }
+    }
+    Err(-28)
+}
+pub fn pid_init(id: NsId) -> u32 { if id == 0 { 0 } else { PID_INIT[id as usize].load(Acquire) } }
+pub fn pid_dead(id: NsId) -> bool { id != 0 && PID_FLAGS[id as usize].load(Acquire) & 1 != 0 }
+pub fn set_pid_dead(id: NsId) { if id != 0 { PID_FLAGS[id as usize].fetch_or(1, AcqRel); } }
+pub fn claim_pid_init(id: NsId, kpid: u32) -> bool {
+    id != 0 && PID_INIT[id as usize].compare_exchange(0, kpid, AcqRel, Relaxed).is_ok()
+}
+
 // ---- /proc/<pid>/{uid_map,gid_map,setgroups} and uid/gid views ----------
 
 fn ext(kind: usize, id: usize, i: usize) -> (u32, u32, u32) {
@@ -330,5 +363,10 @@ pub const NS_NAMES: [&[u8]; 8] = [b"user", b"pid", b"net", b"ipc", b"mnt", b"uts
 
 /// Namespace id of `pid` for link `kind` (non-user kinds are initial).
 pub fn ns_id_of(pid: u32, kind: usize) -> NsId {
-    match kind { 0 => userns_of(pid), 2 => netns_of(pid), 3 => ipcns_of(pid), _ => 0 }
+    match kind {
+        0 => userns_of(pid), 2 => netns_of(pid), 3 => ipcns_of(pid),
+        1 => crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.pidns.id()).unwrap_or(0),
+        7 => crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.pidns_child.id()).unwrap_or(0),
+        _ => 0,
+    }
 }

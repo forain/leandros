@@ -93,6 +93,8 @@ fn fetch_entry(at: usize) -> Option<(usize, bool)> {
 
 /// Linux `exit_robust_list` for the list at `head`, owned by `tid`.
 fn walk(head: usize, tid: Pid) {
+    // The lock words hold the dying thread's own view of its tid.
+    let tid = crate::pidns::own_v_of_task(tid);
     if head & 7 != 0 || !user_range_ok(head, HEAD_LEN) { return; }
     let Some((mut entry, mut pi)) = fetch_entry(head) else { return };
     let Some(offset) = read_user::<isize>(head + 8) else { return };

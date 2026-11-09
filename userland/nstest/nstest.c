@@ -42,7 +42,6 @@ static void check(const char *name, int ok)
 }
 
 static const struct { const char *n; unsigned long f; } flags[] = {
-    {"NEWPID", CLONE_NEWPID},
     {"NEWUTS", CLONE_NEWUTS},   {"NEWNS", CLONE_NEWNS},
     {"NEWCGROUP", CLONE_NEWCGROUP},
 };
@@ -148,9 +147,9 @@ static int t_unshare_threaded(void)
 }
 static int t_other_new_einval(void)
 {
-    int fl[] = { 0x00020000, 0x02000000, 0x04000000, 0x20000000 };
+    int fl[] = { 0x00020000, 0x02000000, 0x04000000 };
     CHECK(drop_to(1000) == 0);
-    for (unsigned i = 0; i < 4; i++) {
+    for (unsigned i = 0; i < 3; i++) {
         CHECK(unshare(fl[i]) == -1 && errno == EINVAL);
         long r = syscall(SYS_clone, SIGCHLD | fl[i], 0, 0, 0, 0);
         CHECK(r == -1 && errno == EINVAL);
@@ -213,6 +212,312 @@ static int t_suid_ignored(void)
     CHECK(newuser_child(exec_suid) == 0);
     return 0;
 }
+
+
+/* ---- pid namespaces (lane nspid) ---------------------------------------- */
+/* An "init" is the first child forked after unshare(CLONE_NEWPID) inside a
+ * user namespace. Every case is a user-namespace child body (newuser_child)
+ * that arms alarm(10) itself. */
+#define PCASE(name, ub) static int t_##name(void) { CHECK(drop_to(1000) == 0); return newuser_child(ub); }
+static int child_ok(pid_t c)
+{
+    int st = 0;
+    if (waitpid(c, &st, 0) != c) return 1;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1;
+}
+/* In a userns child: unshare(NEWPID), fork the init running body; 0 = it returned 0. */
+static int in_init(int (*body)(void))
+{
+    alarm(10);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) _exit(body());
+    return child_ok(c);
+}
+
+static int ub_ff(void) { return unshare(CLONE_NEWPID) == 0 ? 0 : 1; }
+PCASE(ff_probe, ub_ff)
+
+static int t_unshare_pid_eperm(void)
+{
+    CHECK(drop_to(1000) == 0);
+    CHECK(unshare(CLONE_NEWPID) == -1 && errno == EPERM);
+    return 0;
+}
+
+static int ub_twice(void)
+{
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    CHECK(unshare(CLONE_NEWPID) == -1 && errno == EINVAL);
+    return 0;
+}
+PCASE(unshare_pid_twice, ub_twice)
+
+static int ub_thread_after(void)
+{
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    pthread_t t;
+    CHECK(pthread_create(&t, 0, idle_thread, 0) != 0);
+    return 0;
+}
+PCASE(thread_after_unshare, ub_thread_after)
+
+static int tidword;
+static int ib_pid1(void)
+{
+    CHECK(getpid() == 1);
+    CHECK(syscall(SYS_gettid) == 1);
+    CHECK(getppid() == 0);
+    CHECK(syscall(SYS_set_tid_address, &tidword) == 1);
+    return 0;
+}
+static int ub_pid1(void) { return in_init(ib_pid1); }
+PCASE(pid1_self, ub_pid1)
+
+static int ub_parent_view(void)
+{
+    alarm(10);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    int p[2]; CHECK(pipe(p) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) { char b; read(p[0], &b, 1); _exit(0); }
+    CHECK(c > 1);
+    CHECK(kill(c, 0) == 0);
+    CHECK(write(p[1], "x", 1) == 1);
+    int st = 0;
+    CHECK(waitpid(-1, &st, 0) == c);
+    return 0;
+}
+PCASE(parent_view, ub_parent_view)
+
+static int ib_child(void)
+{
+    pid_t c = fork();
+    if (c == 0) _exit(getppid() == 1 && kill(1, 0) == 0 && getpid() != 1 ? 0 : 1);
+    return child_ok(c);
+}
+static int ub_child_of_init(void) { return in_init(ib_child); }
+PCASE(child_of_init, ub_child_of_init)
+
+static int ub_visibility(void)
+{
+    alarm(10);
+    pid_t outside = getpid();
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    int p[2]; CHECK(pipe(p) == 0);
+    pid_t i = fork();
+    CHECK(i >= 0);
+    if (i == 0) {
+        pid_t c = fork();
+        if (c == 0) {
+            pid_t kinit = 0;
+            if (read(p[0], &kinit, sizeof kinit) != sizeof kinit) _exit(2);
+            if (kill(outside, 0) != -1 || errno != ESRCH) _exit(3);
+            if (kill(kinit, 0) != -1 || errno != ESRCH) _exit(4);
+            _exit(0);
+        }
+        _exit(child_ok(c));
+    }
+    CHECK(write(p[1], &i, sizeof i) == sizeof i);
+    return child_ok(i);
+}
+PCASE(visibility, ub_visibility)
+
+static int ub_member(void)
+{
+    alarm(10);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    int p[2]; CHECK(pipe(p) == 0);
+    pid_t a = fork();
+    CHECK(a >= 0);
+    if (a == 0) { char b; read(p[0], &b, 1); _exit(0); }
+    pid_t b = fork();
+    CHECK(b >= 0);
+    if (b == 0) _exit(getpid() != 1 && getppid() == 0 && kill(1, 0) == 0 ? 0 : 1);
+    CHECK(child_ok(b) == 0);
+    CHECK(write(p[1], "x", 1) == 1);
+    return child_ok(a);
+}
+PCASE(member_after_unshare, ub_member)
+
+static int ib_wait(void)
+{
+    pid_t c[3];
+    for (int i = 0; i < 3; i++) {
+        c[i] = fork();
+        if (c[i] == 0) _exit(10 + i);
+        CHECK(c[i] > 1);
+    }
+    for (int i = 2; i >= 0; i--) {
+        int st = 0;
+        CHECK(waitpid(c[i], &st, 0) == c[i]);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 10 + i);
+    }
+    return 0;
+}
+static int ub_wait_inside(void) { return in_init(ib_wait); }
+PCASE(wait_inside, ub_wait_inside)
+
+static volatile pid_t got_pid = -1;
+static volatile int got;
+static void sig_h(int s, siginfo_t *si, void *u) { (void)s; (void)u; got_pid = si->si_pid; got = 1; }
+static void arm_h(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = sig_h; sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGUSR1, &sa, 0);
+}
+static int wait_got(void) { for (int n = 0; !got && n < 8000; n++) usleep(1000); return got; }
+static int ib_siginfo(void)
+{
+    int a[2]; if (pipe(a)) return 1;
+    arm_h();
+    pid_t c = fork();
+    if (c == 0) {
+        got = 0; got_pid = -1;
+        if (write(a[1], "x", 1) != 1) _exit(2);
+        if (!wait_got() || got_pid != 1) _exit(3);          /* init -> C: si_pid == 1 */
+        if (kill(1, SIGUSR1) != 0) _exit(4);
+        _exit(0);
+    }
+    char b; if (read(a[0], &b, 1) != 1) return 2;
+    if (kill(c, SIGUSR1) != 0) return 3;
+    if (!wait_got() || got_pid != c) return 4;               /* C -> init: si_pid == C */
+    return child_ok(c);
+}
+static int ub_siginfo(void) { return in_init(ib_siginfo); }
+PCASE(siginfo_pid, ub_siginfo)
+
+/* An outside parent signalling the init: si_pid is 0. */
+static int ub_siginfo_out(void)
+{
+    alarm(10);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    int a[2]; CHECK(pipe(a) == 0);
+    pid_t i = fork();
+    CHECK(i >= 0);
+    if (i == 0) {
+        arm_h();
+        if (write(a[1], "x", 1) != 1) _exit(2);
+        _exit(wait_got() && got_pid == 0 ? 0 : 3);
+    }
+    char b; CHECK(read(a[0], &b, 1) == 1);
+    CHECK(kill(i, SIGUSR1) == 0);
+    return child_ok(i);
+}
+PCASE(siginfo_outside, ub_siginfo_out)
+
+static volatile int thr_tid, thr_flag, thr_pi_ok, thr_busy;
+static pthread_mutex_t pimx, rmx;
+static void *thr_fn(void *a)
+{
+    (void)a;
+    thr_tid = (int)syscall(SYS_gettid);
+    thr_flag = 1;
+    return 0;
+}
+static void *thr_pi(void *a)
+{
+    (void)a;
+    thr_busy = pthread_mutex_trylock(&pimx);
+    thr_flag = 1;
+    thr_pi_ok = pthread_mutex_lock(&pimx) == 0;
+    if (thr_pi_ok) pthread_mutex_unlock(&pimx);
+    return 0;
+}
+static void *thr_robust(void *a) { (void)a; pthread_mutex_lock(&rmx); return 0; }
+static void usr2(int s) { (void)s; thr_flag = 2; }
+static void *thr_wait_sig(void *a)
+{
+    (void)a;
+    thr_flag = 1;
+    for (int n = 0; thr_flag != 2 && n < 8000; n++) usleep(1000);
+    return 0;
+}
+static int ib_threads(void)
+{
+    pthread_t t;
+    CHECK(getpid() == 1 && syscall(SYS_gettid) == 1);
+    CHECK(pthread_create(&t, 0, thr_fn, 0) == 0);
+    pthread_join(t, 0);
+    CHECK(thr_tid != 1 && thr_tid > 0);
+    /* pthread_kill uses the tid musl cached from CLONE_PARENT_SETTID. */
+    signal(SIGUSR2, usr2);
+    thr_flag = 0;
+    CHECK(pthread_create(&t, 0, thr_wait_sig, 0) == 0);
+    while (!thr_flag) usleep(1000);
+    CHECK(pthread_kill(t, SIGUSR2) == 0);
+    pthread_join(t, 0);
+    CHECK(thr_flag == 2);
+    /* Priority-inheritance mutex owned by the main thread (owner word == 1). */
+    pthread_mutexattr_t at; pthread_mutexattr_init(&at);
+    pthread_mutexattr_setprotocol(&at, PTHREAD_PRIO_INHERIT);
+    pthread_mutex_init(&pimx, &at);
+    CHECK(pthread_mutex_lock(&pimx) == 0);
+    thr_flag = 0;
+    CHECK(pthread_create(&t, 0, thr_pi, 0) == 0);
+    while (!thr_flag) usleep(1000);
+    usleep(20000);
+    CHECK(thr_busy == EBUSY);
+    CHECK(pthread_mutex_unlock(&pimx) == 0);
+    pthread_join(t, 0);
+    CHECK(thr_pi_ok);
+    /* Robust mutex whose owner thread exits. */
+    pthread_mutexattr_t ra; pthread_mutexattr_init(&ra);
+    pthread_mutexattr_setrobust(&ra, PTHREAD_MUTEX_ROBUST);
+    pthread_mutex_init(&rmx, &ra);
+    CHECK(pthread_create(&t, 0, thr_robust, 0) == 0);
+    pthread_join(t, 0);
+    CHECK(pthread_mutex_lock(&rmx) == EOWNERDEAD);
+    return 0;
+}
+static int ub_threads(void) { return in_init(ib_threads); }
+PCASE(pthread_in_pidns, ub_threads)
+
+static int ib_nested(void)
+{
+    if (unshare(CLONE_NEWPID) != 0) return 1;
+    pid_t g = fork();
+    if (g == 0) _exit(getpid() == 1 && getppid() == 0 ? 0 : 1);
+    if (g <= 1) return 2;
+    int st = 0;
+    if (waitpid(g, &st, 0) != g) return 3;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 4;
+}
+static int ub_nested(void) { return in_init(ib_nested); }
+PCASE(nested, ub_nested)
+
+static int ub_leak1(void)
+{
+    if (unshare(CLONE_NEWPID) != 0) return 1;
+    pid_t c = fork();
+    if (c == 0) _exit(0);
+    return c > 0 ? child_ok(c) : 2;
+}
+static int t_pidns_leak(void)
+{
+    for (int i = 0; i < 600; i++) CHECK(newuser_child(ub_leak1) == 0);
+    CHECK(drop_to(1000) == 0);
+    CHECK(newuser_child(ub_ff) == 0);
+    return 0;
+}
+
+static int ub_fork_enomem(void)
+{
+    alarm(10);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) _exit(0);
+    CHECK(child_ok(c) == 0);
+    errno = 0;
+    CHECK(fork() == -1 && errno == ENOMEM);
+    return 0;
+}
+PCASE(fork_enomem, ub_fork_enomem)
 
 
 static void reap(long r)
@@ -471,6 +776,13 @@ static int run_userns_cases(void)
         { "host_root_unaffected", t_host_unaffected }, { "unshare_basic", t_unshare_basic },
         { "unshare_threaded_einval", t_unshare_threaded }, { "other_new_einval", t_other_new_einval },
         { "depth_limit_32", t_depth_limit }, { "ns_leak", t_leak }, { "suid_ignored_in_userns", t_suid_ignored },
+        { "ff_probe", t_ff_probe }, { "unshare_pid_eperm", t_unshare_pid_eperm },
+        { "unshare_pid_twice", t_unshare_pid_twice }, { "thread_after_unshare", t_thread_after_unshare },
+        { "pid1_self", t_pid1_self }, { "parent_view", t_parent_view }, { "child_of_init", t_child_of_init },
+        { "visibility", t_visibility }, { "member_after_unshare", t_member_after_unshare },
+        { "wait_inside", t_wait_inside }, { "siginfo_pid", t_siginfo_pid }, { "siginfo_outside", t_siginfo_outside },
+        { "pthread_in_pidns", t_pthread_in_pidns }, { "nested", t_nested },
+        { "pidns_leak", t_pidns_leak }, { "fork_enomem", t_fork_enomem },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
     };

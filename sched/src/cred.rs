@@ -25,12 +25,12 @@ const SIGCONT: u32 = 18;
 
 /// Snapshot of the identity a check needs from the calling thread.
 #[derive(Clone, Copy)]
-struct Caller { tgid: Pid, sid: Pid, uid: u32, euid: u32, gid: u32 }
+struct Caller { tgid: Pid, sid: Pid, uid: u32, euid: u32, gid: u32, pidns: crate::ns::NsId }
 
 fn caller(rq: &runqueue::RunQueue) -> Option<Caller> {
     rq.find_pid(current_pid()).map(|t| Caller {
         tgid: t.tgid, sid: t.sid,
-        uid: t.uid, euid: t.euid, gid: t.gid,
+        uid: t.uid, euid: t.euid, gid: t.gid, pidns: t.pidns.id(),
     })
 }
 
@@ -46,36 +46,48 @@ fn may_signal(c: &Caller, t: &Task, sig: u32) -> bool {
 /// Permission and existence check for a process-directed signal (`kill(pid)`,
 /// `rt_sigqueueinfo`). 0 = allowed, else -ESRCH / -EPERM. `sig == 0` (the
 /// existence probe) is checked like any other signal, as on Linux.
-pub fn kill_check(tgid: Pid, sig: u32) -> isize {
+pub fn kill_check(tgid: Pid, sig: u32) -> isize { kill_check_ns(tgid, sig).0 }
+
+/// `kill_check` plus the target's pid namespace and the caller's (for `si_pid`).
+/// A target outside the caller's namespace subtree does not exist (ESRCH).
+fn kill_check_ns(tgid: Pid, sig: u32) -> (isize, crate::ns::NsId, crate::ns::NsId) {
     let rq = RUN_QUEUE.lock();
-    let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
+    let c = match caller(&rq) { Some(c) => c, None => return (ESRCH, 0, 0) };
     match rq.find_pid(tgid) {
-        Some(t) if t.pid == t.tgid => if may_signal(&c, t, sig) { 0 } else { EPERM },
-        _ => ESRCH,
+        Some(t) if t.pid == t.tgid => {
+            let tn = t.pidns.id();
+            if !crate::pidns::is_ancestor_or_eq(c.pidns, tn) { return (ESRCH, tn, c.pidns); }
+            (if may_signal(&c, t, sig) { 0 } else { EPERM }, tn, c.pidns)
+        }
+        _ => (ESRCH, 0, c.pidns),
     }
 }
 
 /// `kill(pid > 0, sig)`.
 pub fn kill_process(tgid: Pid, sig: u32, info: task::SigInfo) -> isize {
-    let r = kill_check(tgid, sig);
+    let (r, tn, sn) = kill_check_ns(tgid, sig);
     if r != 0 || sig == 0 { return r; }
-    deliver_signal_process(tgid, sig, info)
+    deliver_signal_process(tgid, sig, crate::pidns::fix_info(info, tn, sn))
 }
 
 /// `tkill(tid)` / `tgkill(tgid, tid)` (`tgid == None` for tkill): the thread
 /// must exist (and belong to `tgid`), then the usual kill permission against
 /// its process. Signal 0 stops after the checks.
 pub fn kill_thread(tgid: Option<Pid>, tid: Pid, sig: u32, info: task::SigInfo) -> isize {
+    let (tn, sn);
     {
         let rq = RUN_QUEUE.lock();
         let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
         let t = match rq.find_pid(tid) { Some(t) => t, None => return ESRCH };
         if let Some(g) = tgid { if t.tgid != g { return ESRCH; } }
+        if !crate::pidns::is_ancestor_or_eq(c.pidns, t.pidns.id()) { return ESRCH; }
         let owner = rq.find_pid(t.tgid).unwrap_or(t);
         if !may_signal(&c, owner, sig) { return EPERM; }
+        tn = t.pidns.id();
+        sn = c.pidns;
     }
     if sig == 0 { return 0; }
-    deliver_signal(tid, sig, info)
+    deliver_signal(tid, sig, crate::pidns::fix_info(info, tn, sn))
 }
 
 /// `kill(-pgid, sig)` / `killpg`: every process in the group the caller may
@@ -83,18 +95,21 @@ pub fn kill_thread(tgid: Option<Pid>, tid: Pid, sig: u32, info: task::SigInfo) -
 /// succeeded, else the last error (EPERM); ESRCH for an empty group.
 pub fn kill_pgrp_checked(pgid: Pid, sig: u32, info: task::SigInfo) -> isize {
     // Heap, reserved before RUN_QUEUE (16 KiB as a stack array at 4096 tasks).
-    let mut targets: alloc::vec::Vec<Pid> = alloc::vec::Vec::new();
+    let mut targets: alloc::vec::Vec<(Pid, crate::ns::NsId)> = alloc::vec::Vec::new();
     if targets.try_reserve_exact(runqueue::MAX_TASKS).is_err() { return -12; } // ENOMEM
     let mut found = false;
+    let mut sn = 0;
     {
         let rq = RUN_QUEUE.lock();
         let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
+        sn = c.pidns;
         for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
                 if t.pgid != pgid || t.pid != t.tgid { continue; }
+                if !crate::pidns::is_ancestor_or_eq(c.pidns, t.pidns.id()) { continue; }
                 found = true;
                 if may_signal(&c, t, sig) && targets.len() < targets.capacity() {
-                    targets.push(t.pid);
+                    targets.push((t.pid, t.pidns.id()));
                 }
             }
         }
@@ -102,8 +117,8 @@ pub fn kill_pgrp_checked(pgid: Pid, sig: u32, info: task::SigInfo) -> isize {
     if !found { return ESRCH; }
     if targets.is_empty() { return EPERM; }
     if sig != 0 {
-        for &pid in targets.iter() {
-            let _ = deliver_signal_process(pid, sig, info);
+        for &(pid, tn) in targets.iter() {
+            let _ = deliver_signal_process(pid, sig, crate::pidns::fix_info(info, tn, sn));
         }
     }
     0
@@ -116,27 +131,32 @@ pub fn kill_pgrp_checked(pgid: Pid, sig: u32, info: task::SigInfo) -> isize {
 /// Kernel tasks (no address space) and zombies are not candidates.
 pub fn kill_all_checked(sig: u32, info: task::SigInfo) -> isize {
     let init = init_pid();
-    let mut targets: alloc::vec::Vec<Pid> = alloc::vec::Vec::new();
+    let mut targets: alloc::vec::Vec<(Pid, crate::ns::NsId)> = alloc::vec::Vec::new();
     if targets.try_reserve_exact(runqueue::MAX_TASKS).is_err() { return -12; } // ENOMEM
     let mut count = 0;
+    let sn;
     {
         let rq = RUN_QUEUE.lock();
         let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
+        sn = c.pidns;
         for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
                 if t.pid != t.tgid || t.tgid == init || t.tgid == c.tgid { continue; }
+                if !crate::pidns::is_ancestor_or_eq(c.pidns, t.pidns.id()) { continue; }
+                // The caller namespace's own init is skipped like the global one.
+                if c.pidns != 0 && t.tgid == crate::ns::pid_init(c.pidns) { continue; }
                 if t.address_space.is_none() || t.state == TaskState::Zombie { continue; }
                 count += 1;
                 if may_signal(&c, t, sig) && targets.len() < targets.capacity() {
-                    targets.push(t.pid);
+                    targets.push((t.pid, t.pidns.id()));
                 }
             }
         }
     }
     if count == 0 { return ESRCH; }
     if sig != 0 {
-        for &pid in targets.iter() {
-            let _ = deliver_signal_process(pid, sig, info);
+        for &(pid, tn) in targets.iter() {
+            let _ = deliver_signal_process(pid, sig, crate::pidns::fix_info(info, tn, sn));
         }
     }
     0
