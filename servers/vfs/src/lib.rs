@@ -57,6 +57,8 @@ pub mod ofd;
 /// Alias mounts (proc/devtmpfs/sysfs/bind) — how a chroot gets its /proc.
 pub mod alias;
 pub mod cmdline_redact;
+/// Overlay plumbing: real-layer helpers, per-mount pseudo-pid creds.
+pub mod ovl;
 mod tmppool;
 
 /// PATH_MAX: the longest path string a caller may name, NUL included.
@@ -4747,7 +4749,15 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
     // VFS_CLOSE_ALL, VFS_EXEC_CLOEXEC) take them as message args and are
     // unaffected by this canonicalization.
     let caller_pid = sched::tgid_of(caller_pid);
+    handle_as(msg, caller_pid)
+}
 
+/// Close every descriptor of `pid` (used to tear down an overlay pseudo-pid).
+pub(crate) fn handle_close_all_pub(pid: u32) -> Message { handle_close_all(pid) }
+
+/// `handle` for a caller that is already canonical (no tgid mapping): the
+/// overlay's pseudo-pids are not scheduler tasks, so `tgid_of` must not see them.
+pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
     // Symlink resolution happens here, once, for every path-taking operation —
     // rather than in each of the fifteen handlers that would otherwise each
     // need their own copy of the walk. The rewritten paths live in this
@@ -6772,6 +6782,15 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
         let p = write_u32(buf, 0, ofd::MAX_OFDS as u32);
         return Some(write_lit(buf, p, b"\n"));
     }
+    if path == b"/proc/sys/fs/ovl_selftest" {
+        // Runs the overlay real-op selftest at read time (root only).
+        if !root { return None; }
+        let mut o = Vec::new();
+        ovl::selftest(&mut o);
+        let n = o.len().min(buf.len());
+        buf[..n].copy_from_slice(&o[..n]);
+        return Some(n);
+    }
     if path == b"/proc/sys/fs/file-nr" {
         let live = ofd::census().map_or(0, |(l, _)| l);
         let mut p = write_u32(buf, 0, live as u32);
@@ -8355,7 +8374,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts"
                || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/etc/resolv.conf"
                || lookup_path == b"/proc/sys/fs/nr_open" || lookup_path == b"/proc/sys/fs/file-max"
-               || lookup_path == b"/proc/sys/fs/file-nr" {
+               || lookup_path == b"/proc/sys/fs/file-nr"
+               || lookup_path == b"/proc/sys/fs/ovl_selftest" {
             match gen_proc_system(lookup_path, sched::fsuid_of(pid) == 0) {
                 Some(v) => v,
                 None    => return err_reply(-2),
@@ -13056,6 +13076,7 @@ fn tmp_kill_setid(tmp: &mut [TmpFileEntry], idx: usize, fsuid: u32) {
 /// it cannot find (the boot-time mount path), so an unknown caller is root,
 /// exactly as before.
 pub fn cred_of(pid: u32) -> xattr::Cred {
+    if let Some(c) = ovl::cred_override(pid) { return c; }
     let (fsuid, fsgid) = sched::fsids_of(pid);
     let mut c = xattr::Cred::new(fsuid, fsgid);
     c.ngroups = sched::groups_of(pid, &mut c.groups) as u8;
