@@ -635,6 +635,12 @@ def main():
         b"leandro:x:1000:1000:leandro:/home/leandro:/bin/brush\n"
     )
     etc_files.append(("passwd", passwd_bytes, 0o100644))
+    # Reserved: uids/gids 100000-165535 belong to leandro's subuid/subgid range.
+    # Subordinate id ranges for rootless containers (newuidmap/newgidmap).
+    # 100000-165535 is RESERVED for leandro: no passwd/group entry may use it
+    # (design-idmap). Root-owned 0644 as shadow-utils requires.
+    etc_files.append(("subuid", b"leandro:100000:65536\n", 0o100644))
+    etc_files.append(("subgid", b"leandro:100000:65536\n", 0o100644))
     # Firefox's sandbox builds its library path policy from /etc/ld.so.conf;
     # list musl's default search dirs so policy and loader agree.
     etc_files.append(("ld.so.conf", b"/lib\n/usr/lib\n/usr/local/lib\n", 0o100644))
