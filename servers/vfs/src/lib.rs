@@ -2766,6 +2766,7 @@ pub fn set_tmpfs_root_flags(path: &[u8], ms_flags: usize) -> bool {
 }
 
 fn tmpfs_flags_of(path: &[u8]) -> u8 {
+    if let Some(n) = mnt::ns0::tmpfs_inst_of(path) { return tmpfs_inst_attr(n).0; }
     tmpfs_root_index(path).map_or(0, |i| TMPFS_ROOT_FLAGS[i].load(atomic::Ordering::Relaxed))
 }
 
@@ -4413,7 +4414,14 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/sys/kernel/overflowuid", data: b"65534\n" },
     RamEntry { path: b"/proc/sys/kernel/overflowgid", data: b"65534\n" },
     RamEntry { path: b"/proc/sys/user/max_user_namespaces", data: b"255\n" },
+    // Highest capability number the caps implementation knows (CAP_LAST,
+    // asserted below): podman and crun read it to size capability sets.
+    RamEntry { path: b"/proc/sys/kernel/cap_last_cap", data: b"40\n" },
+    // Supplementary-group limit (sched::task::NGROUPS_MAX, asserted below).
+    RamEntry { path: b"/proc/sys/kernel/ngroups_max", data: b"32\n" },
 ];
+const _: () = assert!(sched::caps::CAP_LAST == 40, "update /proc/sys/kernel/cap_last_cap");
+const _: () = assert!(sched::task::NGROUPS_MAX == 32, "update /proc/sys/kernel/ngroups_max");
 const _: () = assert!(sched::runqueue::MAX_TASKS == 4096, "update /proc/sys/kernel/threads-max");
 
 /// Known directories for getdents64.
@@ -6500,14 +6508,94 @@ fn tmpfs_inst_root(n: u32) -> Vec<u8> {
     root
 }
 
-/// Create tmpfs instance `n` (the superblock id) owned by `uid`:`gid`;
-/// returns its backing root.
-pub fn tmpfs_instance_create(n: u32, uid: u32, gid: u32) -> Result<Vec<u8>, i32> {
+/// Per-instance attributes of the tmpfs mounts made by mount(2):
+/// (superblock id, MS_NOSUID|NODEV|NOEXEC bits, size limit in pages, 0 = none).
+static TMPFS_INST_ATTR: Mutex<Vec<(u32, u8, usize)>> = Mutex::new(Vec::new());
+
+fn tmpfs_inst_attr(n: u32) -> (u8, usize) {
+    TMPFS_INST_ATTR.lock().iter().find(|e| e.0 == n).map_or((0, 0), |e| (e.1, e.2))
+}
+
+/// Record the mount flags (MS_* bits) and size limit of instance `n`.
+pub fn tmpfs_instance_set_attr(n: u32, ms_flags: usize, size_pages: usize) {
+    let f = (ms_flags & (TMPFS_MS_NOSUID | TMPFS_MS_NODEV | TMPFS_MS_NOEXEC) as usize) as u8;
+    let mut t = TMPFS_INST_ATTR.lock();
+    t.retain(|e| e.0 != n);
+    if f != 0 || size_pages != 0 { t.push((n, f, size_pages)); }
+}
+
+/// Options of a tmpfs mount(2) data string.
+#[derive(Default, Clone, Copy)]
+pub struct TmpfsOpts {
+    pub mode: Option<u16>,
+    /// uid/gid as the caller names them (the kernel translates).
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// Size limit in pages, 0 = default (the global tmpfs budget).
+    pub size_pages: usize,
+}
+
+/// Parse `mode=,uid=,gid=,size=` (size: bytes, k/m/g suffix, or N% of RAM).
+/// `nr_inodes=` and unknown options are accepted and ignored. EINVAL on a
+/// malformed value.
+pub fn parse_tmpfs_opts(data: &[u8]) -> Result<TmpfsOpts, i32> {
+    fn num(v: &[u8], radix: u32) -> Option<u64> {
+        if v.is_empty() { return None; }
+        u64::from_str_radix(core::str::from_utf8(v).ok()?, radix).ok()
+    }
+    let mut o = TmpfsOpts::default();
+    for opt in data.split(|&c| c == b',') {
+        if opt.is_empty() { continue; }
+        let (k, v) = match opt.iter().position(|&c| c == b'=') {
+            Some(i) => (&opt[..i], &opt[i + 1..]),
+            None => continue,
+        };
+        match k {
+            b"mode" => o.mode = Some((num(v, 8).ok_or(-22)? & 0o7777) as u16),
+            b"uid" => o.uid = Some(num(v, 10).ok_or(-22)? as u32),
+            b"gid" => o.gid = Some(num(v, 10).ok_or(-22)? as u32),
+            b"size" => {
+                let pages = if let Some(pc) = v.strip_suffix(b"%".as_slice()) {
+                    let p = num(pc, 10).ok_or(-22)?.min(100) as usize;
+                    mm::buddy::total_pages() * p / 100
+                } else {
+                    let (digits, mult) = match v.last() {
+                        Some(b'k') | Some(b'K') => (&v[..v.len() - 1], 1u64 << 10),
+                        Some(b'm') | Some(b'M') => (&v[..v.len() - 1], 1u64 << 20),
+                        Some(b'g') | Some(b'G') => (&v[..v.len() - 1], 1u64 << 30),
+                        _ => (v, 1u64),
+                    };
+                    let bytes = num(digits, 10).ok_or(-22)?.saturating_mul(mult);
+                    ((bytes + 4095) / 4096) as usize
+                };
+                // size=0 means unlimited on Linux.
+                o.size_pages = pages;
+            }
+            _ => {}
+        }
+    }
+    Ok(o)
+}
+
+/// Create tmpfs instance `n` (the superblock id) owned by `uid`:`gid` with
+/// permission bits `mode`; returns its backing root.
+pub fn tmpfs_instance_create(n: u32, uid: u32, gid: u32, mode: u16) -> Result<Vec<u8>, i32> {
     let root = tmpfs_inst_root(n);
     let mut tmp = TMP_FILES.lock();
     tmpfs_inst_parents(&mut tmp)?;
-    tmpfs_inst_mkdir(&mut tmp, &root, uid, gid, 0o700)?;
+    tmpfs_inst_mkdir(&mut tmp, &root, uid, gid, mode)?;
     Ok(root)
+}
+
+/// Pages resident in instance `n` (every file below its root).
+fn tmpfs_inst_used_pages(tmp: &TmpPool, vmos: &[Option<TmpVmo>], n: u32) -> usize {
+    let root = tmpfs_inst_root(n);
+    let Some(top) = tmp_find(tmp, &root) else { return 0 };
+    let mut used = 0;
+    for idx in tmp.subtree(top) {
+        if let Some(v) = vmos[idx].as_ref() { if !v.borrowed { used += v.resident_pages(); } }
+    }
+    used
 }
 
 /// Superblock destroy hook: free the tmpfs instance of the superblock whose
@@ -6517,6 +6605,7 @@ pub fn tmpfs_instance_create(n: u32, uid: u32, gid: u32) -> Result<Vec<u8>, i32>
 pub fn tmpfs_instance_destroy(sb_root: &[u8]) {
     let name = match sb_root.iter().rposition(|&c| c == b'/') { Some(i) => &sb_root[i + 1..], None => return };
     let n: u32 = match core::str::from_utf8(name).ok().and_then(|x| x.parse().ok()) { Some(n) => n, None => return };
+    TMPFS_INST_ATTR.lock().retain(|e| e.0 != n);
     let root_buf = tmpfs_inst_root(n);
     let root = &root_buf[..];
     let mut objs: Vec<u32> = Vec::new();
@@ -9757,6 +9846,33 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 want = want.min((fsize - cur as u64) as usize);
             }
             let len = tmp[idx].len;
+            // size= of a tmpfs mount: cap the write at the instance's limit.
+            if let Some(n) = mnt::ns0::tmpfs_inst_of(tmp[idx].path()) {
+                let limit = tmpfs_inst_attr(n).1;
+                if limit != 0 {
+                    let used = tmpfs_inst_used_pages(&*tmp, &vmos[..], n);
+                    let first = cur / 4096;
+                    let last = (cur + want.max(1) - 1) / 4096;
+                    let have = |p: usize| vmos[idx].as_ref().map_or(false, |v| v.page(p) != 0);
+                    let mut fresh = 0;
+                    for p in first..=last { if !have(p) { fresh += 1; } }
+                    if used + fresh > limit {
+                        // Fit what the remaining room allows, else ENOSPC.
+                        let room = limit.saturating_sub(used);
+                        let mut fit_end = cur;
+                        let mut p = first;
+                        let mut r = room;
+                        while p <= last {
+                            if !have(p) { if r == 0 { break; } r -= 1; }
+                            fit_end = (p + 1) * 4096;
+                            p += 1;
+                        }
+                        let allowed = fit_end.saturating_sub(cur).min(want);
+                        if allowed == 0 { return err_reply(-28); }
+                        want = allowed;
+                    }
+                }
+            }
             let vmo = vmos[idx].get_or_insert_with(|| { let mut v = TmpVmo::new_owned(false); v.len = len; v });
             // Pages are allocated as the bytes land (F_SEAL_WRITE/GROW are out
             // of scope — not enforced here). A borrowed (dmabuf) VMO never
