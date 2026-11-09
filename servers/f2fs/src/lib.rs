@@ -5371,10 +5371,15 @@ fn inode_set_ctime(blk: &mut [u8], t: (i64, i64)) { w64(blk, I_CTIME, t.0 as u64
 /// caller of the current request) requires — see `xattr::setid_kill_bits`.
 /// A no-op (one cached inode read) for the common file without them.
 fn kill_setid(ms: &mut MountState, ino: u32) {
-    if ms.cred.euid == 0 { return; }
+    if ms.cred.host_root { return; }
     let addr = nat_lookup(ms, ino);
-    let mode = inode_mode(ms.cache.read(ms.dev, addr as u64));
-    let kill = xattr::setid_kill_bits(mode, ms.cred.euid);
+    let (mode, ouid, ogid) = {
+        let b = ms.cache.read(ms.dev, addr as u64);
+        (inode_mode(b), inode_uid(b), inode_gid(b))
+    };
+    // CAP_FSETID over the inode in the caller's userns (Linux should_remove_suid).
+    if ms.cred.cap_inode(xattr::CAP_FSETID, ouid, ogid) { return; }
+    let kill = xattr::setid_kill_bits(mode, u32::MAX);
     if kill == 0 { return; }
     let iblk = ms.cache.get_mut(ms.dev, addr as u64);
     w16(iblk, INO_MODE, mode & !kill);
@@ -6793,8 +6798,8 @@ fn read_link_target(ms: &mut MountState, ino: u32) -> alloc::vec::Vec<u8> {
 fn may_access_ino(ms: &mut MountState, ino: u32, mask: u8) -> bool {
     let cred = ms.cred;
     let (meta, xnid) = load_meta_xnid(ms, ino);
-    if cred.euid == 0 && !(mask & xattr::MAY_EXEC != 0 && !xattr::is_dir(meta.mode)) {
-        return true; // root: skip the xattr read entirely
+    if cred.host_root && !(mask & xattr::MAY_EXEC != 0 && !xattr::is_dir(meta.mode)) {
+        return true; // host root: skip the xattr read entirely
     }
     let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, ino, xnid)) } else { None };
     let acl = match &xbuf {
@@ -6825,7 +6830,10 @@ fn create_gate(ms: &mut MountState, parent: u32, name: &[u8]) -> Result<(), i32>
     if name.len() > NAME_MAX { return Err(-36); } // ENAMETOOLONG
     if !may_access_ino(ms, parent, xattr::MAY_EXEC) { return Err(-13); }
     if dir_lookup(ms, parent, name) != 0 { return Err(-17); } // EEXIST
-    may_modify_dir(ms, parent)
+    may_modify_dir(ms, parent)?;
+    // Linux fsuidgid_has_mapping: unmapped fsuid/fsgid in the caller's userns.
+    if !ms.cred.owner_mapped() { return Err(-75); } // EOVERFLOW
+    Ok(())
 }
 
 /// Removal/replacement of `victim` inside `dir`: `may_modify_dir` plus the
@@ -6835,7 +6843,7 @@ fn may_delete_in(ms: &mut MountState, dir: u32, victim: u32) -> Result<(), i32> 
     may_modify_dir(ms, dir)?;
     let (dmeta, _) = load_meta_xnid(ms, dir);
     let (vmeta, _) = load_meta_xnid(ms, victim);
-    if xattr::sticky_denies(&dmeta, vmeta.uid, ms.cred.euid) { Err(-1) } else { Ok(()) }
+    if xattr::sticky_denies_c(&dmeta, &vmeta, &ms.cred) { Err(-1) } else { Ok(()) }
 }
 
 /// Resolve the parent of a to-be-created / to-be-removed entry. `parent_rel`
@@ -7070,6 +7078,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         };
         // Creating an entry needs write + search on the parent directory.
         if let Err(e) = may_modify_dir(ms, parent_ino) { return err_reply(e); }
+        if !cred.owner_mapped() { return err_reply(-75); } // EOVERFLOW
         // The caller's mode, not a hardcoded 0644. The umask travels with it
         // (`xattr::pack_create_mode`) and `acl_create` applies it — or the
         // parent's default ACL instead, when there is one — through the same
@@ -7111,7 +7120,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         // (init/getty/login all run as root before setuid) is unaffected; the
         // freshly-created branch above is not gated (the creator owns it). The
         // check precedes O_TRUNC so an unwritable file is never truncated.
-        if cred.euid != 0 {
+        if !cred.host_root {
             let want_read  = flags & O_WRONLY == 0; // RDONLY/RDWR read; WRONLY does not
             // O_TRUNC destroys content, so it needs write permission even on
             // an O_RDONLY open (Linux may_open: O_TRUNC implies MAY_WRITE).
@@ -7880,10 +7889,10 @@ fn handle_link(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
     // `may_linkat` after `filename_create`, i.e. after the new name's checks.
     {
         let (smeta, _) = load_meta_xnid(ms, src_ino);
-        let euid = ms.cred.euid;
-        let may_rw = euid == 0 || euid == smeta.uid
+        let scred = ms.cred;
+        let may_rw = scred.cap_inode(xattr::CAP_FOWNER, smeta.uid, smeta.gid) || scred.euid == smeta.uid
             || may_access_ino(ms, src_ino, xattr::MAY_READ | xattr::MAY_WRITE);
-        if xattr::hardlink_denied(&smeta, euid, may_rw) { return err_reply(-1); } // EPERM
+        if xattr::hardlink_denied_c(&smeta, &scred, may_rw) { return err_reply(-1); } // EPERM
     }
 
     let ftype = match mode & S_IFMT {
@@ -7946,8 +7955,11 @@ fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32, cred: &xattr::Cred) -> 
     let mode = {
         let iblk = ms.cache.read(ms.dev, addr as u64);
         let owner = inode_uid(iblk);
-        if cred.euid != 0 && cred.euid != owner { return err_reply(-1); } // EPERM
-        xattr::chmod_filter_mode(cred, inode_gid(iblk), mode)
+        let ogid = inode_gid(iblk);
+        // Owner, or CAP_FOWNER over the inode in the caller's userns.
+        if cred.euid != owner && !cred.cap_inode(xattr::CAP_FOWNER, owner, ogid) { return err_reply(-1); } // EPERM
+        let m = xattr::FileMeta { uid: owner, gid: ogid, mode: inode_mode(iblk) };
+        xattr::chmod_filter_mode_c(cred, &m, mode)
     };
     let new_mode;
     {
@@ -8025,13 +8037,13 @@ fn chown_inode(ms: &mut MountState, ino: u32, uid: u32, gid: u32,
     {
         let iblk = ms.cache.read(ms.dev, addr as u64);
         let owner = inode_uid(iblk);
-        if cred.euid != 0 {
-            // Non-root: must own the file, may never hand it to someone else,
-            // and may only set a group it belongs to (effective gid or any
-            // supplementary group).
+        let ogid = inode_gid(iblk);
+        // CAP_CHOWN over the inode in the caller's userns (host root: all);
+        // else the owner restating its uid and moving the group to its own.
+        if !cred.cap_inode(xattr::CAP_CHOWN, owner, ogid) {
             if cred.euid != owner { return err_reply(-1); }          // EPERM
             if uid != u32::MAX && uid != owner { return err_reply(-1); }
-            if gid != u32::MAX && !cred.in_group(gid) { return err_reply(-1); }
+            if gid != u32::MAX && gid != ogid && !cred.in_group(gid) { return err_reply(-1); }
         }
     }
     let iblk = ms.cache.get_mut(ms.dev, addr as u64);
@@ -8641,7 +8653,7 @@ fn xattr_get(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
     val_reply(val.len() as u64)
 }
 
-fn xattr_list(ms: &mut MountState, ino: u32, list_ptr: u64, size: u64, euid: u32) -> Message {
+fn xattr_list(ms: &mut MountState, ino: u32, list_ptr: u64, size: u64, host_root: bool) -> Message {
     let (_meta, xnid) = load_meta_xnid(ms, ino);
     // ls -l fast path: no xattr node means an empty list, answered without a
     // block read.
@@ -8654,7 +8666,7 @@ fn xattr_list(ms: &mut MountState, ino: u32, list_ptr: u64, size: u64, euid: u32
     } else {
         unsafe { core::slice::from_raw_parts_mut(list_ptr as *mut u8, size as usize) }
     };
-    match xattr::list(arena, out, euid == 0) {
+    match xattr::list(arena, out, host_root) {
         Ok(n) => val_reply(n as u64),
         Err(e) => err_reply(-e),
     }
@@ -8854,7 +8866,7 @@ fn store_inherited_acls(ms: &mut MountState, ino: u32, parent_ino: u32, c: &xatt
 fn utimens_inode(ms: &mut MountState, ino: u32, at: (i64, i64), mt: (i64, i64), explicit: bool,
                  cred: &xattr::Cred) -> Message {
     let (meta, xnid) = load_meta_xnid(ms, ino);
-    if cred.euid != 0 && cred.euid != meta.uid {
+    if cred.euid != meta.uid && !cred.cap_inode(xattr::CAP_FOWNER, meta.uid, meta.gid) {
         if explicit { return err_reply(-1); } // EPERM
         let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, ino, xnid)) } else { None };
         let acl = match &xbuf {
@@ -9110,12 +9122,12 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
             },
         VFS_LISTXATTR | VFS_LLISTXATTR =>
             match xattr_path_ino(ms, arg(msg,0), msg.tag == VFS_LISTXATTR) {
-                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.euid),
+                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.host_root),
                 Err(m) => m,
             },
         VFS_FLISTXATTR =>
             match xattr_fd_ino(ms, arg(msg,0)) {
-                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.euid),
+                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.host_root),
                 Err(m) => m,
             },
         VFS_REMOVEXATTR | VFS_LREMOVEXATTR =>
