@@ -1889,6 +1889,9 @@ static int t_uts_in_host_userns(void)
     /* a child userns holds no power over the host's UTS namespace */
     CHECK(unshare(CLONE_NEWUSER) == 0);
     CHECK(sethostname("evil", 4) == -1 && errno == EPERM);
+    return 0;
+}
+
 /* ---- cgroup namespaces (design-cgroup CG0) ---- */
 static int cgns_link(char *buf, size_t n)
 {
