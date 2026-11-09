@@ -31,6 +31,7 @@ static void report(const char *name, int ok)
     if (ok) npass++; else nfail++;
 }
 static void skip(const char *name, const char *why) { printf("%s: SKIP (%s)\n", name, why); }
+static int slurp_file(const char *path, char *buf, int cap);
 
 static int write_file(const char *path, const char *s)
 {
