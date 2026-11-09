@@ -852,6 +852,7 @@ mod nr {
     pub const CLONE3:              usize = 435;
     pub const CLOSE_RANGE:         usize = 436;
     pub const UNSHARE:             usize = 97;
+    pub const SETNS:               usize = 268;
     pub const PIDFD_OPEN:          usize = 434;
     pub const OPEN_TREE: usize = 428;
     pub const MOVE_MOUNT: usize = 429;
@@ -1140,6 +1141,7 @@ mod nr {
     pub const CLONE3:              usize = 435;
     pub const CLOSE_RANGE:         usize = 436;
     pub const UNSHARE:             usize = 272;
+    pub const SETNS:               usize = 308;
     pub const PIDFD_OPEN:          usize = 434;
     pub const OPEN_TREE: usize = 428;
     pub const MOVE_MOUNT: usize = 429;
@@ -2497,6 +2499,7 @@ fn dispatch_inner(
         OPENAT2     => sys_openat2(a0, a1, a2, a3),
         CLOSE_RANGE => sys_close_range(a0, a1, a2),
         UNSHARE => sys_unshare(a0),
+        SETNS => sys_setns(a0, a1),
         // tokio (brush's runtime) reaps children through these when
         // pidfd_open succeeds; see sys_pidfd_open.
         PIDFD_OPEN        => sys_pidfd_open(a0, a1),
@@ -11629,7 +11632,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     // (0x4C00..) collides with nothing here but the BLK* range (0x12xx) would
     // otherwise have to be enumerated twice — and because an ioctl aimed at a
     // block device must never fall through to the TTY server's ENOTTY.
-    if let Some(vfs::VnodeKind::BlockDev { .. }) = vfs::vfs_get_node_kind(pid, fd) {
+    if let Some(vfs::VnodeKind::BlockDev { .. } | vfs::VnodeKind::NsFd { .. }) = vfs::vfs_get_node_kind(pid, fd) {
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
         return vfs_reply_val(&vfs::handle(&msg, pid));
     }
@@ -16381,6 +16384,25 @@ fn sys_pidfd_open(pid: usize, flags: usize) -> isize {
     vfs::install_pidfd(current_pid(), pid_k, flags as u32)
 }
 
+/// setns(fd, nstype): join the namespace an nsfs-like fd (an opened
+/// /proc/<pid>/ns/<name>) names, or, given a pidfd, the namespaces of that
+/// process selected by the CLONE_NEW* mask in `nstype`.
+fn sys_setns(fd: usize, nstype: usize) -> isize {
+    let nstype = nstype as u32 as usize;
+    let me = current_pid();
+    let alone = sched::thread_count(sched::current_tgid()) <= 1;
+    let chrooted = sched::current_root_arc().is_some();
+    match vfs::nsfd_target(me, fd) {
+        Ok((kind, id)) => return sched::ns::setns_fd(kind as usize, id, nstype, alone, chrooted),
+        Err(-9) => return -9,
+        Err(_) => {}
+    }
+    match vfs::pidfd_target(me, fd) {
+        Ok(tgid) => sched::ns::setns_pid(tgid, nstype, alone, chrooted),
+        Err(e) => e as isize,
+    }
+}
+
 /// pidfd_send_signal(pidfd, sig, info, flags): kill(2) / rt_sigqueueinfo(2)
 /// aimed through a pidfd, so the target cannot have been replaced by an
 /// unrelated process. As on Linux, a zombie still accepts (and discards) a
@@ -16794,12 +16816,13 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
     } else { None };
     let mut req = req;
     req.userns = new_user.as_ref().map_or(0, |n| n.id());
+    let ns_owner = if new_user.is_some() { req.userns } else { sched::ns::current_userns() };
     let new_pid_ns = if flags & CLONE_NEWPID != 0 {
-        match sched::ns::new_pidns(cur_pidns) { Ok(n) => Some(n), Err(e) => return e }
+        match sched::ns::new_pidns(cur_pidns, ns_owner) { Ok(n) => Some(n), Err(e) => return e }
     } else { None };
     req.pidns = new_pid_ns.as_ref().map_or(0, |n| n.id());
-    let new_net = if flags & CLONE_NEWNET != 0 { match sched::ns::new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
-    let new_ipc = if flags & CLONE_NEWIPC != 0 { match sched::ns::new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let new_net = if flags & CLONE_NEWNET != 0 { match sched::ns::new_flat(ns_owner) { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let new_ipc = if flags & CLONE_NEWIPC != 0 { match sched::ns::new_flat(ns_owner) { Ok(n) => Some(n), Err(e) => return e } } else { None };
     req.netns = new_net.as_ref().map_or(0, |n| n.id());
     req.ipcns = new_ipc.as_ref().map_or(0, |n| n.id());
     let new_uts = if flags & CLONE_NEWUTS != 0 {
