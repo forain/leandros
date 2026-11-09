@@ -377,6 +377,16 @@ pub fn lookup_dev_node(path: &[u8]) -> Option<u16> {
     find_name(&synced(), name)
 }
 
+/// `/dev/<name>` of the block device numbered `major:minor`, appended to `out`.
+pub fn path_for_rdev(major: u32, minor: u32, out: &mut alloc::vec::Vec<u8>) -> bool {
+    if (major, minor) == (10, 237) { out.extend_from_slice(b"/dev/loop-control"); return true; }
+    let b = synced();
+    match b.iter().find(|e| e.in_use && e.major == major && e.minor == minor) {
+        Some(e) => { out.extend_from_slice(b"/dev/"); out.extend_from_slice(e.name()); true }
+        None => false,
+    }
+}
+
 /// Registry slots (with names) of `roots` and of every partition whose parent is one of them,
 /// one pass. BLKPG-created partitions live only here.
 pub fn family_slots(roots: &[u16]) -> alloc::vec::Vec<(u16, alloc::string::String)> {
