@@ -38,6 +38,12 @@ page = os.path.join(W, "sb.html")
 open(page, "w").write("""<html><title>sb</title><body><h1>sandbox check</h1>
 <video id=v src="file:///tmp/sb.webm" autoplay muted loop width=320></video>
 <script>var v=document.getElementById('v');v.play();
+(async function(){try{
+var a=await navigator.requestMediaKeySystemAccess('org.w3.clearkey',[{initDataTypes:['keyids'],videoCapabilities:[{contentType:'video/webm; codecs="vp9"'}]}]);
+dump('SBE access\\n');var mk=await a.createMediaKeys();window.keepMK=mk;dump('SBE mediakeys\\n');
+var se=mk.createSession();window.keepSE=se;se.addEventListener('message',function(e){dump('SBE message '+e.messageType+'\\n');});
+await se.generateRequest('keyids',new TextEncoder().encode(JSON.stringify({kids:['AAECAwQFBgcICQoLDA0ODw']})));
+dump('SBE generateRequest-resolved\\n');}catch(e){dump('SBE error '+e+'\\n');}})();
 setInterval(function(){dump('SBV '+v.currentTime.toFixed(2)+'\\n');},2000);</script></body></html>""")
 collect = os.path.join(W, "sbcollect.sh")
 open(collect, "w").write(r'''for d in /proc/[0-9]*; do
@@ -76,7 +82,7 @@ def run(mode):
     env = dict(os.environ, FFSESSION_OUT=OUTD, LEANDROS_RUN_ID=f"{os.environ.get('LEANDROS_RUN_ID', 'ffsb')}-{mode}")
     puts = [f"{page}:/tmp/sb.html", f"{collect}:/tmp/sbcollect.sh"] + ([f"{clip}:/tmp/sb.webm"] if clip else [])
     cmd = [sys.executable, os.path.join(HERE, "ffsession.py"), ARCH, tag, "--put", ",".join(puts),
-           "--url", "file:///tmp/sb.html", "--prefs", "browser.dom.window.dump.enabled=true;media.autoplay.default=0",
+           "--url", "file:///tmp/sb.html", "--prefs", "browser.dom.window.dump.enabled=true;media.autoplay.default=0;media.eme.enabled=true",
            "--wait", str(SECS), "--shot-every", str(SECS), "--post", "sh /tmp/sbcollect.sh", "--post-timeout", "120"]
     if mode == "on":
         cmd += ["--env", "LEANDROS_FIREFOX_SANDBOX_LOG=1"]
@@ -105,7 +111,7 @@ def run(mode):
             procs[m[1]]["root"] = m[2].strip() or "-"
     # MOZ_SANDBOX_LOGGING also prints policy-building chatter; only the rest counts as an error.
     noise = re.compile(r"policy for |fixing recursive|removing redundant|Couldn't open video device|adding (read|write)"
-                       r"|\[fslock\]|using seccomp tsync|Parent path is|Adding paths from|[Ff]ailed errno -2\b")
+                       r"|\[fslock\]|attempt to open unexpected file /usr/lib/lib(?:softokn3|freeblpriv3)\.so|using seccomp tsync|Parent path is|Adding paths from|[Ff]ailed errno -2\b")
     real = re.compile(r"errno -13\b|EACCES|denied|seccomp sandbox violation", re.I)
 
     def counted(l):
@@ -153,10 +159,18 @@ def run(mode):
             if t in ("tab", "rdd", "socket", "utility", "gmplugin"):
                 if v["st"].get("NoNewPrivs:") != "1":
                     ok = False; print(f"  FAIL {t} {p} NoNewPrivs={v['st'].get('NoNewPrivs:')}")
-                if t in ("tab", "rdd", "utility") and v["root"] != "/.leandros-void":
+                if t in ("tab", "rdd", "utility", "gmplugin") and v["root"] != "/.leandros-void":
                     ok = False; print(f"  FAIL {t} {p} root={v['root']}")
         if not any(ptype(v["cmd"]) == "tab" for v in procs.values()):
             ok = False; print("  FAIL no tab process")
+        eme = [l.strip() for l in ff.splitlines() if "SBE " in l]
+        print("  EME:", "; ".join(x[-60:] for x in eme[:6]) or "none")
+        gm = [v for v in procs.values() if ptype(v["cmd"]) == "gmplugin"]
+        if not gm:
+            ok = False; print("  FAIL no gmplugin process")
+        for v in gm:
+            if v["st"].get("Seccomp:") != "2" or v["root"] != "/.leandros-void":
+                ok = False; print(f"  FAIL gmplugin Seccomp={v['st'].get('Seccomp:')} root={v['root']}")
     return ok
 
 
