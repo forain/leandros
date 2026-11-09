@@ -1148,6 +1148,151 @@ static int t_netns_udp_bind(void)
     return 0;
 }
 
+/* ---- nsmapsec: map-file confused deputy, write race, chrooted NEWUSER, fdinfo ---- */
+static pid_t spawn_userns(int *go_w, int (*after)(void))
+{
+    int go[2];
+    if (pipe(go)) return -1;
+    pid_t c = syscall(SYS_clone, SIGCHLD | CLONE_NEWUSER, 0, 0, 0, 0);
+    if (c == 0) { char b; close(go[1]); (void)!read(go[0], &b, 1); _exit(after ? after() : 0); }
+    close(go[0]);
+    *go_w = go[1];
+    return c;
+}
+static int deputy_child_check(void)
+{
+    CHECK(getuid() == 65534);
+    CHECK(setuid(0) != 0);
+    CHECK(geteuid() != 0);
+    return 0;
+}
+static void send_fd(int sk, int fd)
+{
+    char b = 'x'; struct iovec iov = { &b, 1 };
+    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
+    struct msghdr m; memset(&m, 0, sizeof m); memset(&u, 0, sizeof u);
+    m.msg_iov = &iov; m.msg_iovlen = 1; m.msg_control = u.buf; m.msg_controllen = sizeof u.buf;
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = SOL_SOCKET; h->cmsg_type = SCM_RIGHTS; h->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(h), &fd, sizeof fd);
+    (void)!sendmsg(sk, &m, 0);
+}
+static int recv_fd(int sk)
+{
+    char b; struct iovec iov = { &b, 1 };
+    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
+    struct msghdr m; memset(&m, 0, sizeof m);
+    m.msg_iov = &iov; m.msg_iovlen = 1; m.msg_control = u.buf; m.msg_controllen = sizeof u.buf;
+    if (recvmsg(sk, &m, 0) <= 0) return -1;
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    if (!h || h->cmsg_type != SCM_RIGHTS) return -1;
+    int fd; memcpy(&fd, CMSG_DATA(h), sizeof fd);
+    return fd;
+}
+/* Attacker (uid 1000) opens the child's uid_map and passes the fd to a root
+ * helper that writes "0 0 1". Must not map host root. */
+static int t_map_deputy(void)
+{
+    int sp[2], res[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0 && pipe(res) == 0);
+    pid_t h = fork();
+    if (h == 0) {   /* root helper */
+        close(sp[0]); close(res[0]);
+        int fd = recv_fd(sp[1]);
+        int e = 0;
+        if (fd >= 0) { ssize_t n = write(fd, "0 0 1", 5); e = n == 5 ? 0 : errno; }
+        else e = 255;
+        (void)!write(res[1], &e, sizeof e);
+        _exit(0);
+    }
+    pid_t a = fork();
+    if (a == 0) {   /* attacker */
+        close(sp[1]); close(res[1]);
+        if (drop_to(1000)) _exit(2);
+        int go;
+        pid_t c = spawn_userns(&go, deputy_child_check);
+        if (c < 0) _exit(3);
+        char p[64]; snprintf(p, sizeof p, "/proc/%d/uid_map", (int)c);
+        int fd = open(p, O_WRONLY);
+        int opened = fd >= 0;
+        if (opened) send_fd(sp[0], fd); else close(sp[0]);
+        int e = 0;
+        if (read(res[0], &e, sizeof e) != (ssize_t)sizeof e) e = 254;
+        int blocked = !opened || (e != 0);
+        (void)!write(go, "g", 1);
+        int st = 0; waitpid(c, &st, 0);
+        printf("  deputy: opened=%d helper_errno=%d child=%d\n", opened, e, WIFEXITED(st) ? WEXITSTATUS(st) : 100);
+        _exit(blocked && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1);
+    }
+    close(sp[0]); close(sp[1]);
+    int st = 0; waitpid(a, &st, 0); waitpid(h, NULL, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 100;
+}
+
+struct wrarg { const char *p, *txt; int r; pthread_barrier_t *b; };
+static void *wr_thr(void *v)
+{
+    struct wrarg *w = v;
+    int fd = open(w->p, O_WRONLY);
+    pthread_barrier_wait(w->b);
+    if (fd < 0) { w->r = -1; return NULL; }
+    w->r = write(fd, w->txt, strlen(w->txt)) == (ssize_t)strlen(w->txt) ? 0 : -1;
+    close(fd);
+    return NULL;
+}
+static int t_map_race(void)
+{
+    for (int it = 0; it < 20; it++) {
+        int go; pid_t c = spawn_userns(&go, NULL);
+        CHECK(c > 0);
+        char p[64]; snprintf(p, sizeof p, "/proc/%d/uid_map", (int)c);
+        pthread_barrier_t b; pthread_barrier_init(&b, NULL, 2);
+        struct wrarg a = { p, "1000 1000 1\n", 99, &b }, d = { p, "2000 2000 5\n", 99, &b };
+        pthread_t t1, t2;
+        pthread_create(&t1, NULL, wr_thr, &a); pthread_create(&t2, NULL, wr_thr, &d);
+        pthread_join(t1, NULL); pthread_join(t2, NULL);
+        char buf[256]; int n = rd(p, buf, sizeof buf);
+        int ok = (a.r == 0) != (d.r == 0) && n > 0;
+        if (ok) {
+            const char *want = a.r == 0 ? "1000 1000 1" : "2000 2000 5";
+            unsigned x, y, z; ok = sscanf(buf, "%u %u %u", &x, &y, &z) == 3 && strchr(buf, '\n') == buf + strlen(buf) - 1;
+            char exp[64]; if (ok) { snprintf(exp, sizeof exp, "%u %u %u", x, y, z); ok = !strcmp(exp, want); }
+        }
+        (void)!write(go, "g", 1); waitpid(c, NULL, 0);
+        if (!ok) { printf("  race iter %d: a=%d d=%d map=[%s]\n", it, a.r, d.r, buf); return 1; }
+    }
+    return 0;
+}
+
+static int t_chroot_newuser(void)
+{
+    CHECK(chroot("/tmp") == 0);
+    CHECK(chdir("/") == 0);
+    errno = 0; CHECK(unshare(CLONE_NEWUSER) == -1 && errno == EPERM);
+    errno = 0; long r = syscall(SYS_clone, SIGCHLD | CLONE_NEWUSER, 0, 0, 0, 0);
+    if (r == 0) _exit(0);
+    CHECK(r == -1 && errno == EPERM);
+    return 0;
+}
+
+static int t_fdinfo_other_uid(void)
+{
+    int fd = open("/dev/null", O_RDONLY);
+    CHECK(fd >= 0);
+    char p[64]; snprintf(p, sizeof p, "/proc/%d/fdinfo/%d", (int)getpid(), fd);
+    int own = open(p, O_RDONLY);
+    CHECK(own >= 0);
+    pid_t c = fork();
+    if (c == 0) {
+        if (drop_to(1000)) _exit(2);
+        errno = 0; int f = open(p, O_RDONLY);
+        _exit(f < 0 && (errno == EACCES || errno == EPERM) ? 0 : 1);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -1169,6 +1314,8 @@ static int run_userns_cases(void)
         { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
         { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
+        { "map_deputy", t_map_deputy }, { "map_race", t_map_race }, { "chroot_newuser_eperm", t_chroot_newuser },
+        { "fdinfo_other_uid", t_fdinfo_other_uid },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();

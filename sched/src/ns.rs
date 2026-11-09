@@ -260,14 +260,45 @@ pub fn map_text(kind: usize, ns: NsId, out: &mut [u8]) -> usize {
 
 pub fn setgroups_denied(ns: NsId) -> bool { ns != 0 && SETGROUPS_DENY[ns as usize].load(Acquire) != 0 }
 
-fn writer_info(pid: u32) -> Option<(NsId, u32, u32, u64)> {
-    crate::RUN_QUEUE.lock().find_pid(pid).map(|t| (t.userns.id(), t.euid, t.egid, t.caps[0]))
+/// Identity of a process (userns, host euid/egid, effective caps) frozen at
+/// open() time, like Linux `file->f_cred` of a map file.
+#[derive(Clone, Copy)]
+pub struct Opener(NsId, u32, u32, u64);
+
+pub fn snapshot(pid: u32) -> Option<Opener> {
+    writer_info(pid)
 }
+
+fn writer_info(pid: u32) -> Option<Opener> {
+    crate::RUN_QUEUE.lock().find_pid(pid).map(|t| Opener(t.userns.id(), t.euid, t.egid, t.caps[0]))
+}
+
+/// May the opener write `target`'s maps at all? (open-time EPERM)
+pub fn open_allowed(op: Opener, target: u32, kind: usize) -> bool {
+    let tns = userns_of(target);
+    if tns == 0 { return false; }
+    rights(op, tns, kind.min(1)).0
+}
+
+static MAP_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+struct MapGuard;
+impl MapGuard {
+    fn lock() -> MapGuard {
+        while MAP_LOCK.compare_exchange(false, true, Acquire, Relaxed).is_err() { core::hint::spin_loop(); }
+        MapGuard
+    }
+}
+impl Drop for MapGuard { fn drop(&mut self) { MAP_LOCK.store(false, Release); } }
 
 /// May `w` (writer pid) set up namespace `tns`'s ids: it sits in `tns` or its
 /// parent and holds `cap` or is the owner. Returns (ok, privileged-over-parent).
 fn writer_rights(w: u32, tns: NsId, kind: usize) -> (bool, bool, u32) {
-    let Some((wns, eu, eg, caps)) = writer_info(w) else { return (false, false, 0) };
+    let Some(op) = writer_info(w) else { return (false, false, 0) };
+    rights(op, tns, kind)
+}
+
+fn rights(op: Opener, tns: NsId, kind: usize) -> (bool, bool, u32) {
+    let Opener(wns, eu, eg, caps) = op;
     let cap: u32 = if kind == 0 { 7 } else { 6 };
     let has = caps >> cap & 1 != 0;
     let (oe, og) = owner(tns);
@@ -288,13 +319,20 @@ fn parse_u32(s: &[u8]) -> Option<u32> {
 
 /// Write uid_map (kind 0) / gid_map (kind 1) of `target`'s user namespace on
 /// behalf of `writer`. Identity-only. Returns bytes consumed or -errno.
-pub fn write_map(writer: u32, target: u32, kind: usize, data: &[u8]) -> isize {
+pub fn write_map(opener: Opener, writer: u32, target: u32, kind: usize, data: &[u8]) -> isize {
+    let _g = MapGuard::lock();
     let tns = userns_of(target);
     if tns == 0 { return -1; }
     let t = tns as usize;
     if MAP_N[kind][t].load(Acquire) != 0 { return -1; } // written once
-    let (ok, privileged, me) = writer_rights(writer, tns, kind);
-    if !ok { return -1; }
+    // Both the opener (f_cred) and the writer must be permitted; the
+    // privileged branch needs both privileged, and both must be the same id.
+    let (ok_o, priv_o, me_o) = rights(opener, tns, kind);
+    let (ok_w, priv_w, me_w) = writer_rights(writer, tns, kind);
+    if !ok_o || !ok_w { return -1; }
+    let privileged = priv_o && priv_w;
+    let me = me_o;
+    if !privileged && me_w != me_o { return -1; }
     let mut exts = [(0u32, 0u32, 0u32); MAP_EXT];
     let mut n = 0usize;
     for line in data.split(|&c| c == b'\n') {
@@ -343,11 +381,13 @@ pub fn write_map(writer: u32, target: u32, kind: usize, data: &[u8]) -> isize {
 }
 
 /// Write /proc/<target>/setgroups ("allow" / "deny"). Bytes consumed or -errno.
-pub fn write_setgroups(writer: u32, target: u32, data: &[u8]) -> isize {
+pub fn write_setgroups(opener: Opener, writer: u32, target: u32, data: &[u8]) -> isize {
+    let _g = MapGuard::lock();
     let tns = userns_of(target);
     if tns == 0 { return -1; }
     let (ok, _, _) = writer_rights(writer, tns, 1);
-    if !ok { return -1; }
+    let (ok_o, _, _) = rights(opener, tns, 1);
+    if !ok || !ok_o { return -1; }
     let t = tns as usize;
     let s = data.strip_suffix(b"\n").unwrap_or(data);
     if s == b"deny" {
