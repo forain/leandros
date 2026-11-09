@@ -219,6 +219,14 @@ pub fn mapped(kind: usize, ns: NsId, kid: u32) -> bool {
     (0..n).any(|i| { let (_, o, c) = ext(kind, ns as usize, i); kid >= o && (kid - o) < c })
 }
 
+/// Every id of `ids` (u32::MAX = "leave unchanged" is skipped) is mapped in
+/// the caller's user namespace (kind 0 uid, 1 gid)? Unmapped targets of the
+/// set*id/chown family are EINVAL.
+pub fn ids_mapped(kind: usize, ids: &[u32]) -> bool {
+    let ns = current_userns();
+    ids.iter().all(|&i| i == u32::MAX || mapped(kind, ns, i))
+}
+
 /// Overflow id shown for ids with no mapping.
 pub const OVERFLOW_ID: u32 = 65534;
 
