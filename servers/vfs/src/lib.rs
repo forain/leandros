@@ -488,6 +488,9 @@ struct TmpVmo {
     seals: u32,
     /// Seals are only permitted on memfd inodes; also gates `F_GET_SEALS`.
     is_memfd: bool,
+    /// memfd_create's name (debug label; /proc/self/exe of a memfd exec).
+    mname: [u8; 32],
+    mnlen: u8,
     /// A **borrowed** VMO aliases physical frames it does not own — currently a
     /// PRIME/dmabuf export whose pages ARE a DRM dumb buffer's contiguous buddy
     /// block. Teardown (`vmo_free_slot`) must NOT free these frames: the DRM
@@ -580,7 +583,13 @@ fn tmp_free_slot(tmp: &mut TmpPool) -> Option<usize> {
 // Linux memfd/fcntl seal bits (values fixed by the ABI).
 const F_ADD_SEALS:   usize = 1033;
 const F_GET_SEALS:   usize = 1034;
+const F_SEAL_SEAL:   u32   = 0x0001;
 const F_SEAL_SHRINK: u32   = 0x0002;
+const F_SEAL_GROW:   u32   = 0x0004;
+const F_SEAL_WRITE:  u32   = 0x0008;
+const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
+const F_SEAL_EXEC:   u32   = 0x0020;
+const F_SEAL_KNOWN:  u32   = 0x003f;
 
 /// Allocate one zeroed 4 KiB buddy frame for a VMO. Zeroing touches HHDM
 /// (kernel) memory only, never user memory.
@@ -631,7 +640,7 @@ static TMP_ZERO_PAGE: [u8; 4096] = [0u8; 4096];
 impl TmpVmo {
     /// An empty, owning VMO (no pages: the whole file is a hole).
     const fn new_owned(is_memfd: bool) -> Self {
-        TmpVmo { pages: alloc::vec::Vec::new(), len: 0, seals: 0, is_memfd,
+        TmpVmo { pages: alloc::vec::Vec::new(), len: 0, seals: 0, is_memfd, mname: [0; 32], mnlen: 0,
                  borrowed: false, dmabuf_handle: 0, dmabuf_obj: 0, id: 0, maps: 0 }
     }
 
@@ -756,6 +765,8 @@ fn tmp_set_size(tmp: &mut TmpPool, vmos: &mut [Option<TmpVmo>], owner: usize,
         // let you ftruncate a dmabuf either.
         if vmo.borrowed { return -1; } // EPERM
         if new_len < old_len && vmo.seals & F_SEAL_SHRINK != 0 { return -1; } // EPERM
+        if new_len > old_len && vmo.seals & F_SEAL_GROW != 0 { return -1; } // EPERM
+        if vmo.seals & F_SEAL_WRITE != 0 && new_len != old_len { return -1; } // EPERM
         if new_len > old_len {
             vmo_zero_range(vmo, old_len, new_len);
         } else if new_len < old_len {
@@ -1089,19 +1100,112 @@ pub fn vmo_debug_probe(idx: usize) -> Option<(usize, usize, u64, usize)> {
 
 /// Mark the tmpfs inode behind `fd` as a memfd: create an empty seal-capable
 /// VMO on its owner slot. Called by `sys_memfd_create` right after open.
-pub fn mark_memfd(pid: u32, fd: usize) {
+pub fn mark_memfd(pid: u32, fd: usize, name: &[u8]) {
     let idx = match tmpfile_owner_of(pid, fd) { Some(i) => i, None => return };
     // Lock order TMP_FILES -> TMP_VMOS, even though only `len` is read.
     let tmp = TMP_FILES.lock();
     let mut vmos = TMP_VMOS.lock();
+    let n = name.len().min(32);
     match vmos[idx].as_mut() {
-        Some(vmo) => vmo.is_memfd = true,
+        Some(vmo) => { vmo.is_memfd = true; vmo.mname[..n].copy_from_slice(&name[..n]); vmo.mnlen = n as u8; }
         None => {
             let mut v = TmpVmo::new_owned(true);
             v.len = tmp[idx].len;
+            v.mname[..n].copy_from_slice(&name[..n]); v.mnlen = n as u8;
             vmos[idx] = Some(v);
         }
     }
+}
+
+// ── memfd as the running executable ─────────────────────────────────────────
+// fexecve(memfd) / execve("/proc/self/fd/N"): the nameless tmpfs inode keeps
+// living as the task's /proc/self/exe ("/memfd:<name> (deleted)"), so crun's
+// "am I already the sealed clone" check (open /proc/self/exe, F_GET_SEALS)
+// sees the memfd after the close-on-exec sweep. The pin is one TMP_FDREFS
+// count; it is dropped when the tgid's exe path stops being a memfd one
+// (re-exec, exit), lazily, by `exe_pin_gc`.
+
+/// A pending pin: holds the slot alive until committed or dropped.
+pub struct ExeRef { idx: usize, name: [u8; 32], nlen: usize, live: bool }
+
+impl ExeRef {
+    /// The exe path string, "/memfd:<name> (deleted)".
+    pub fn path(&self) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::from(&b"/memfd:"[..]);
+        v.extend_from_slice(&self.name[..self.nlen]);
+        v.extend_from_slice(b" (deleted)");
+        v
+    }
+}
+impl Drop for ExeRef {
+    fn drop(&mut self) {
+        if self.live {
+            TMP_FDREFS[self.idx].fetch_update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire,
+                |n| Some(n.saturating_sub(1))).ok();
+            tmp_release_ephemeral(self.idx);
+        }
+    }
+}
+
+static EXE_PINS: spin::Mutex<[Option<(u32, ExeRef)>; 16]> =
+    spin::Mutex::new([const { None }; 16]);
+
+/// Pin the memfd behind `fd` of `pid` (None if it is not a memfd).
+pub fn memfd_exe_take(pid: u32, fd: usize) -> Option<ExeRef> {
+    let idx = tmpfile_owner_of(pid, fd)?;
+    let tmp = TMP_FILES.lock();
+    let vmos = TMP_VMOS.lock();
+    let vmo = vmos[idx].as_ref()?;
+    if !vmo.is_memfd || !tmp[idx].in_use() { return None; }
+    let mut name = [0u8; 32];
+    name[..vmo.mnlen as usize].copy_from_slice(&vmo.mname[..vmo.mnlen as usize]);
+    let nlen = vmo.mnlen as usize;
+    TMP_FDREFS[idx].fetch_add(1, atomic::Ordering::AcqRel);
+    Some(ExeRef { idx, name, nlen, live: true })
+}
+
+/// Record `r` as `tgid`'s exe memfd, releasing what it pinned before.
+pub fn exe_pin_commit(tgid: u32, r: ExeRef) {
+    exe_pin_gc(tgid);
+    let mut old = None;
+    {
+        let mut t = EXE_PINS.lock();
+        let mut slot = t.iter().position(|e| matches!(e, Some((g, _)) if *g == tgid));
+        if slot.is_none() { slot = t.iter().position(|e| e.is_none()); }
+        if let Some(i) = slot { old = t[i].replace((tgid, r)); }
+    }
+    drop(old);
+}
+
+/// Release pins whose tgid no longer runs a memfd image (`keep` is spared).
+pub fn exe_pin_gc(keep: u32) {
+    let mut dead: alloc::vec::Vec<ExeRef> = alloc::vec::Vec::new();
+    {
+        let mut t = EXE_PINS.lock();
+        for e in t.iter_mut() {
+            let stale = match e {
+                Some((g, _)) if *g != keep => {
+                    let mut b = [0u8; 16];
+                    !matches!(sched::exe_path(*g, &mut b), Some(n) if n >= 7 && &b[..7] == b"/memfd:")
+                }
+                _ => false,
+            };
+            if stale { if let Some((_, r)) = e.take() { dead.push(r); } }
+        }
+    }
+    drop(dead);
+}
+
+/// A fresh open of `tgid`'s pinned exe memfd (`flags` as for open).
+fn exe_memfd_kind(pid: u32, tgid: u32, flags: u32) -> Result<VnodeKind, i32> {
+    let idx = {
+        let t = EXE_PINS.lock();
+        match t.iter().find_map(|e| match e { Some((g, r)) if *g == tgid => Some(r.idx), _ => None }) {
+            Some(i) => i,
+            None => return Err(-2),
+        }
+    };
+    reopen_tmp_idx(pid, idx, flags)
 }
 
 /// Promote the tmpfs inode behind `fd` into a **borrowed dmabuf VMO** for the
@@ -1177,7 +1281,7 @@ pub fn install_dmabuf_vmo_pages(pid: u32, fd: usize, pages: alloc::vec::Vec<usiz
     }
     tmp[idx].len = len;
     vmos[idx] = Some(TmpVmo {
-        pages, len, seals: 0, is_memfd: true,
+        pages, len, seals: 0, is_memfd: true, mname: [0; 32], mnlen: 0,
         borrowed: true, dmabuf_handle: handle, dmabuf_obj: obj, id: 0, maps: 0,
     });
     true
@@ -2359,21 +2463,7 @@ fn reopen_fd_kind(pid: u32, fd: usize, flags: u32) -> Result<VnodeKind, i32> {
 fn reopen_fd_kind_of(pid: u32, target: u32, fd: usize, flags: u32) -> Result<VnodeKind, i32> {
     let kind = match vfs_get_node_kind(target, fd) { Some(k) => k, None => return Err(-2) };
     match kind {
-        VnodeKind::TmpFile { idx, .. } => {
-            let accmode = flags & 0x3;
-            let want_read = accmode != O_WRONLY;
-            let want_write = accmode == O_WRONLY || accmode == O_RDWR;
-            let cred = cred_of(pid);
-            let tmp = TMP_FILES.lock();
-            let (e, xa) = (&tmp[idx], tmp.xattr(idx));
-            if !e.in_use() || e.is_dir { return Err(-2); }
-            let meta = tmp_meta(e);
-            let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
-            if !xattr::access_check(&meta, &cred, acl, want_read, want_write, false) {
-                return Err(-13); // EACCES
-            }
-            Ok(VnodeKind::TmpFile { idx, pos: 0, writable: want_write, ofd: 0 })
-        }
+        VnodeKind::TmpFile { idx, .. } => reopen_tmp_idx(pid, idx, flags),
         VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom => Ok(kind),
         // A pipe: a new description on the same pipe, whose end follows the
         // access mode asked for (O_RDONLY reads, O_WRONLY writes) whichever
@@ -2405,6 +2495,22 @@ fn reopen_fd_kind_of(pid: u32, target: u32, fd: usize, flags: u32) -> Result<Vno
         VnodeKind::SockAlias { .. } | VnodeKind::EpollFd { .. } => Err(-6), // ENXIO
         _ => Err(-2),
     }
+}
+
+fn reopen_tmp_idx(pid: u32, idx: usize, flags: u32) -> Result<VnodeKind, i32> {
+    let accmode = flags & 0x3;
+    let want_read = accmode != O_WRONLY;
+    let want_write = accmode == O_WRONLY || accmode == O_RDWR;
+    let cred = cred_of(pid);
+    let tmp = TMP_FILES.lock();
+    let (e, xa) = (&tmp[idx], tmp.xattr(idx));
+    if !e.in_use() || e.is_dir { return Err(-2); }
+    let meta = tmp_meta(e);
+    let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
+    if !xattr::access_check(&meta, &cred, acl, want_read, want_write, false) {
+        return Err(-13); // EACCES
+    }
+    Ok(VnodeKind::TmpFile { idx, pos: 0, writable: want_write, ofd: 0 })
 }
 
 /// Identify the kind of a vnode from a process's FD table.
@@ -8603,6 +8709,12 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         } else if lookup_path == PROC_SELF_FDINFO_DIR {
             if flags & 0o3 != 0 { return err_reply(-21); }
             VnodeKind::RamFile { data: PROC_SELF_FDINFO_DIR, pos: 0, is_dir: true }
+        } else if let Some(t) = lookup_path.strip_prefix(b"/proc/.memfd-exe/").and_then(proc_parse_num) {
+            // open("/proc/self/exe") of a task running a memfd image.
+            match exe_memfd_kind(pid, t, flags) {
+                Ok(k) => k,
+                Err(e) => return err_reply(e),
+            }
         } else if let Some(n) = proc_self_fd_number(lookup_path) {
             // open("/proc/self/fd/N") opens what fd N names afresh, with the
             // new flags — not a dup: its own offset and its own access mode.
@@ -9763,6 +9875,16 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
             // grows: a write past the frames the DRM layer lent us is ENOSPC.
             // Writing past EOF leaves a hole; whatever stale bytes sit between
             // the old EOF and `cur` inside an existing page are zeroed first.
+            if vmo.is_memfd {
+                // memfd seals: WRITE / FUTURE_WRITE refuse every write, GROW
+                // refuses one that would extend the file (Linux: EPERM).
+                if vmo.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 && want > 0 {
+                    return err_reply(-1);
+                }
+                if vmo.seals & F_SEAL_GROW != 0 && cur + want > len && want > 0 {
+                    return err_reply(-1);
+                }
+            }
             if cur > len { vmo_zero_range(vmo, len, cur); }
             let n = match unsafe { vmo_copy_in(vmo, cur, buf, want, true) } {
                 Ok(n) => n,
@@ -10938,7 +11060,13 @@ fn handle_fcntl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
             if let VnodeKind::TmpFile { idx, .. } = kind {
                 let mut vmos = TMP_VMOS.lock();
                 match vmos[idx].as_mut() {
-                    Some(vmo) if vmo.is_memfd => { vmo.seals |= arg as u32; ok_reply() }
+                    Some(vmo) if vmo.is_memfd => {
+                        // Linux memfd_add_seals: no new seals once F_SEAL_SEAL is
+                        // set; unknown bits are EINVAL.
+                        if arg as u32 & !F_SEAL_KNOWN != 0 { return err_reply(-22); }
+                        if vmo.seals & F_SEAL_SEAL != 0 { return err_reply(-1); } // EPERM
+                        vmo.seals |= arg as u32; ok_reply()
+                    }
                     _ => err_reply(-22), // EINVAL — not a memfd
                 }
             } else { err_reply(-22) }

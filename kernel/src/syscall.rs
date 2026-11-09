@@ -6454,7 +6454,14 @@ fn sys_execveat(dirfd: usize, path_ptr: usize, argv_ptr: usize, envp_ptr: usize,
         const F_GETFD: usize = 1;
         let cloexec = sys_fcntl(fd_handle(dirfd), F_GETFD, 0);
         if cloexec < 0 { return -9; } // EBADF
-        let host = match fd_host_path(dirfd) { Some(h) => h, None => return -9 };
+        // A tmpfs inode (a memfd is nameless; fd_host_path may name its
+        // stale pool path) is exec'd through the VFS' by-identity route.
+        let host = if matches!(vfs::vfs_get_node_kind(current_pid(), dirfd),
+                               Some(vfs::VnodeKind::TmpFile { .. })) {
+            alloc::format!("/proc/self/fd/{}", dirfd).into_bytes()
+        } else {
+            match fd_host_path(dirfd) { Some(h) => h, None => return -9 }
+        };
         let kp = KPath::raw(&host);
         return sys_execve_kp(kp, argv_ptr, envp_ptr, cloexec & 1 != 0);
     }
@@ -6473,6 +6480,12 @@ fn sys_execveat(dirfd: usize, path_ptr: usize, argv_ptr: usize, envp_ptr: usize,
 /// opens /dev/fd/N, which Linux reports as ENOENT.
 fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: bool) -> isize {
     let pid = current_pid();
+    // A memfd image stays the task's /proc/self/exe past the close-on-exec
+    // sweep: pin it now (dropped again on any early return).
+    let mut memfd_ref = match proc_own_fd(kpath.bytes()) {
+        Some((fd, below)) if below.is_empty() => vfs::memfd_exe_take(pid, fd),
+        _ => None,
+    };
 
     // MS_NOEXEC (Linux `path_noexec`): the file named, script or binary.
     if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
@@ -7064,7 +7077,13 @@ fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec:
     // Record the executable path for /proc/self/exe (tgid-keyed side table);
     // kpath is the resolved absolute path. Must precede replace_address_space,
     // which never returns.
-    sched::set_exe_path(fd_owner, kpath.bytes());
+    if let Some(r) = memfd_ref.take() {
+        let p = r.path();
+        vfs::exe_pin_commit(fd_owner, r);
+        sched::set_exe_path(fd_owner, &p);
+    } else {
+        sched::set_exe_path(fd_owner, kpath.bytes());
+    }
     // Where argv/envp strings sit on the new stack: /proc/<pid>/cmdline and
     // environ read them back from there (see sched::read_proc_args).
     sched::set_arg_area(fd_owner, sched::ArgArea {
@@ -8834,6 +8853,8 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
             if !proc_link_allowed(pid) { return Err(-13); }
             let mut kb: Vec<u8> = alloc::vec![0u8; HOST_PATH_MAX];
             return Ok(match sched::exe_path(sched::tgid_of(pid), &mut kb) {
+                Some(n) if kb[..n].starts_with(b"/memfd:") =>
+                    KPath::raw(alloc::format!("/proc/.memfd-exe/{}", sched::tgid_of(pid)).as_bytes()),
                 Some(n) => KPath::raw(&kb[..n]),
                 None => KPath::raw(b"/bin/init"),
             });
@@ -15968,7 +15989,8 @@ fn sys_inotify_add_watch(fd: usize, _path_ptr: usize, _mask: usize) -> isize {
 fn sys_inotify_rm_watch(_fd: usize, _wd: usize) -> isize { 0 }
 
 /// memfd_create(name_ptr, flags) → writable anonymous fd backed by a TmpFile.
-fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
+fn sys_memfd_create(name_ptr: usize, flags: usize) -> isize {
+    vfs::exe_pin_gc(0); // release memfd-exe pins of tasks that moved on
     // A memfd must be a DISTINCT anonymous inode every call, even when two calls
     // pass identical names (Linux semantics — the name is only a debug label).
     // We back memfds with named tmpfs nodes "/tmp/memfd:<name>", so a reused name
@@ -16022,7 +16044,7 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
                                        // no O_TRUNC (which a sealed reopen would
                                        // reject). O_RDWR keeps the wl_shm
                                        // read()-coherence path legal (K1).
-            0o600u64,
+            0o777u64, // Linux memfd inodes are 0777 (exec of a memfd needs x)
         ]);
         let fd = vfs_reply_val(&vfs::handle(&msg, pid));
         if fd == EEXIST {
@@ -16032,7 +16054,8 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
         if fd >= 0 {
             // Mark the inode as a memfd: creates an empty seal-capable VMO so the
             // file is genuinely shareable and F_ADD_SEALS/F_GET_SEALS are honored.
-            vfs::mark_memfd(pid, fd as usize);
+            vfs::mark_memfd(pid, fd as usize, &name[..name.len().min(32)]);
+            if flags & 1 != 0 { let _ = sys_fcntl(fd_handle(fd as usize), 2 /*F_SETFD*/, 1); } // MFD_CLOEXEC
             // [GAP2] Name the memfd, its owner pid and its tmpfs slot, so every
             // later [G2*] line can be attributed to a process and a pool. Also
             // arms the [G2SUM] content sampler on the applet's pool.
