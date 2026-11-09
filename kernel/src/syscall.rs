@@ -8300,7 +8300,9 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
         // that its private temp directory is its own, and the Claude Code
         // CLI run as a regular user refused /tmp/claude-1000 ("owned by
         // uid 0, expected 1000").
+        // The kernel stat buffer carries kuids; translate here, on the copy out.
         let (uid, gid) = vfs::read_stat_owner(stat_ptr);
+        let (uid, gid) = (sched::ns::view_id(0, uid), sched::ns::view_id(1, gid));
         core::ptr::write_unaligned((statxbuf + 20) as *mut u32, uid);
         core::ptr::write_unaligned((statxbuf + 24) as *mut u32, gid);
         // Timestamps: struct stat keeps (sec, nsec) pairs at 72/88/104 for
@@ -9053,7 +9055,11 @@ fn fstat_into(fd: usize, statbuf_ptr: usize, user_dest: bool) -> isize {
         if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
         let mut kb = [0u64; STAT_SIZE.div_ceil(8)];
         let r = fstat_into(fd, kb.as_mut_ptr() as usize, false);
-        if r >= 0 && unsafe { ua::copy_to_user(statbuf_ptr, kb.as_ptr() as *const u8, STAT_SIZE) } != 0 { return -14; }
+        if r >= 0 {
+            // Kernel buffer carries kuids; translate on the copy to user memory.
+            vfs::translate_stat_owner_for_user(kb.as_mut_ptr() as usize);
+            if unsafe { ua::copy_to_user(statbuf_ptr, kb.as_ptr() as *const u8, STAT_SIZE) } != 0 { return -14; }
+        }
         return r;
     }
     if user_dest {
@@ -9479,7 +9485,11 @@ fn fstatat_into(
         if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
         let mut kb = [0u64; STAT_SIZE.div_ceil(8)];
         let r = fstatat_into(dirfd, path_ptr, kb.as_mut_ptr() as usize, flags, false);
-        if r >= 0 && unsafe { ua::copy_to_user(statbuf_ptr, kb.as_ptr() as *const u8, STAT_SIZE) } != 0 { return -14; }
+        if r >= 0 {
+            // Kernel buffer carries kuids; translate on the copy to user memory.
+            vfs::translate_stat_owner_for_user(kb.as_mut_ptr() as usize);
+            if unsafe { ua::copy_to_user(statbuf_ptr, kb.as_ptr() as *const u8, STAT_SIZE) } != 0 { return -14; }
+        }
         return r;
     }
     if user_dest {
