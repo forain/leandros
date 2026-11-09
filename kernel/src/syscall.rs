@@ -8426,6 +8426,8 @@ fn sys_unshare(flags: usize) -> isize {
     }
     if flags & CLONE_NEWUTS != 0 {
         let r = sched::ns::unshare_uts();
+        if r < 0 { return r; }
+    }
     // After NEWUSER, so the namespace is owned by the new user namespace.
     if flags & CLONE_NEWCGROUP != 0 {
         let r = sched::ns::unshare_cgroup();
