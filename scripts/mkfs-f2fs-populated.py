@@ -2875,7 +2875,7 @@ def main():
     _ff_port = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "firefox")
     bin_files.append(("firefox", os.path.join(_ff_port, "firefox.sh"), 0o100755))
     m4_share_dirs.update(("/usr/lib/firefox", "/usr/lib/firefox/defaults", "/usr/lib/firefox/defaults/pref",
-                          "/usr/local", "/usr/local/share", "/usr/local/share/applications"))
+                          "/usr/local", "/usr/local/lib", "/usr/local/share", "/usr/local/share/applications"))
     m4_share_files.append(("/usr/lib/firefox/defaults/pref", "leandros-prefs.js", os.path.join(_ff_port, "leandros-prefs.js")))
     # Exec=/bin/firefox keeps the LeandrOS environment; /usr/local/share shadows Alpine's entry.
     m4_share_files.append(("/usr/local/share/applications", "firefox.desktop", os.path.join(_ff_port, "firefox.desktop")))
