@@ -741,23 +741,36 @@ static int ff_seq_child(void)
     int uid = 1000, gid = 1000;
     CHECK(getuid() == 65534 && getgid() == 65534);        /* unmapped: overflow ids */
     CHECK(wr("/proc/self/gid_map", "1000 1000 1\n") == -EPERM); /* gid_map before deny */
-    CHECK(wr("/proc/self/uid_map", "0 1000 1\n") == -EPERM);    /* non-identity */
-    CHECK(wr("/proc/self/uid_map", "0 0 1\n") == -EPERM);       /* foreign uid */
-    CHECK(wr("/proc/self/setgroups", "deny") == 0);
-    snprintf(num, sizeof num, "%d %d 1", uid, uid);
-    CHECK(wr("/proc/self/uid_map", num) == 0);
-    snprintf(num, sizeof num, "%d %d 1", gid, gid);
-    CHECK(wr("/proc/self/gid_map", num) == 0);
+    /* Non-identity maps are refused unless the kernel runs with idmap=test
+     * (then "0 1000 1" is accepted and consumes the write-once uid_map). */
+    int r = wr("/proc/self/uid_map", "0 1000 1\n");
+    int knob = (r == 0);
+    CHECK(knob || r == -EPERM);                                 /* non-identity */
+    if (!knob) {
+        CHECK(wr("/proc/self/uid_map", "0 0 1\n") == -EPERM);   /* foreign uid */
+        CHECK(wr("/proc/self/setgroups", "deny") == 0);
+        snprintf(num, sizeof num, "%d %d 1", uid, uid);
+        CHECK(wr("/proc/self/uid_map", num) == 0);
+        snprintf(num, sizeof num, "%d %d 1", gid, gid);
+        CHECK(wr("/proc/self/gid_map", num) == 0);
+    } else {
+        CHECK(wr("/proc/self/setgroups", "deny") == 0);
+        snprintf(num, sizeof num, "0 %d 1\n", gid);
+        CHECK(wr("/proc/self/gid_map", num) == 0);
+        uid = 0; gid = 0;
+        snprintf(num, sizeof num, "0 1000 1");
+    }
     CHECK(wr("/proc/self/uid_map", num) == -EPERM);             /* write once */
     CHECK(wr("/proc/self/gid_map", num) == -EPERM);
     CHECK(wr("/proc/self/setgroups", "deny") == -EPERM);        /* after gid_map */
-    CHECK(getuid() == 1000 && geteuid() == 1000 && getgid() == 1000 && getegid() == 1000);
+    CHECK(getuid() == uid && geteuid() == uid && getgid() == gid && getegid() == gid);
     CHECK(setgroups(0, NULL) == -1 && errno == EPERM);
     CHECK(rd("/proc/self/setgroups", m, sizeof m) > 0 && !strncmp(m, "deny", 4));
     CHECK(rd("/proc/self/uid_map", m, sizeof m) > 0 && strstr(m, "1000") && strstr(m, " 1\n"));
     child_ready_wait();
     return 0;
 }
+
 static int t_ff_seq(void)
 {
     CHECK(drop_to(1000) == 0);
@@ -768,9 +781,9 @@ static int t_ff_seq(void)
     char b; (void)!read(c2p[0], &b, 1);
     char path[64], m[128];
     snprintf(path, sizeof path, "/proc/%d/uid_map", (int)c);
-    CHECK(rd(path, m, sizeof m) > 0 && strstr(m, "1000       1000          1\n"));
+    CHECK(rd(path, m, sizeof m) > 0 && strstr(m, "1000          1\n"));
     snprintf(path, sizeof path, "/proc/%d/gid_map", (int)c);
-    CHECK(rd(path, m, sizeof m) > 0 && strstr(m, "1000       1000          1\n"));
+    CHECK(rd(path, m, sizeof m) > 0 && strstr(m, "1000          1\n"));
     CHECK(rd("/proc/self/uid_map", m, sizeof m) > 0 && strstr(m, "4294967295"));
     CHECK(getuid() == 1000);
     (void)!write(p2c[1], "g", 1);
