@@ -7362,7 +7362,7 @@ fn open_proc_task(caller: u32, t: ProcTask, flags: u32) -> Result<VnodeKind, i32
         ProcTask::File { tgid, tid, name } => {
             if name == b"environ" && !proc_environ_allowed(caller, tid) { return Err(-13); }
             let n = proc_task_path(&mut p, tgid, Some(tid), name);
-            gen_proc_self(tid, &p[..n]).ok_or(-2)
+            gen_proc_self(caller, tid, &p[..n]).ok_or(-2)
         }
     }
 }
@@ -7536,14 +7536,14 @@ fn gen_proc_comm_writable(tid: u32) -> Option<VnodeKind> {
 
 /// Generate dynamic content for a /proc/self/<name> path.
 /// Allocates a TmpFile slot, writes the content, and returns the vnode.
-fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
+fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
     if path.ends_with(b"/uid_map") || path.ends_with(b"/gid_map") || path.ends_with(b"/setgroups") {
         let ns = sched::ns::userns_of(pid);
         let mut b = [0u8; 128];
         let n = if path.ends_with(b"/setgroups") {
             let t: &[u8] = if sched::ns::setgroups_denied(ns) { b"deny\n" } else { b"allow\n" };
             b[..t.len()].copy_from_slice(t); t.len()
-        } else { sched::ns::map_text(path.ends_with(b"/gid_map") as usize, ns, &mut b) };
+        } else { sched::ns::map_text_for(path.ends_with(b"/gid_map") as usize, ns, sched::ns::userns_of(reader), &mut b) };
         return proc_snapshot(b"/tmp/.proc_nsmap", &b[..n], false);
     }
     if path.ends_with(b"/smaps") || path.ends_with(b"/smaps_rollup") || path.ends_with(b"/maps") {
@@ -8407,7 +8407,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 None    => return err_reply(-23),
             }
         } else if lookup_path.starts_with(b"/proc/self/") && lookup_path != b"/proc/self/" {
-            let kind = gen_proc_self(pid, lookup_path);
+            let kind = gen_proc_self(pid, pid, lookup_path);
             match kind {
                 Some(v) => v,
                 None    => return err_reply(-2),
@@ -8415,7 +8415,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         } else if let Some(tpid) = proc_pid_path(lookup_path) {
             // /proc/<pid>/<file> of another live process (PROC_PID_FILES).
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
-            match gen_proc_self(tpid, lookup_path) {
+            match gen_proc_self(pid, tpid, lookup_path) {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
