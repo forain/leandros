@@ -1873,10 +1873,10 @@ static int ub_scm_in(void)
 {
     alarm(20);
     CHECK(map_self() == 0);
+    CHECK(unshare(CLONE_NEWPID) == 0);
     for (int t = 0; t < 2; t++) {
         int sp[2], rd[2];
         CHECK(socketpair(AF_UNIX, sc_types[t], 0, sp) == 0 && pipe(rd) == 0);
-        CHECK(unshare(CLONE_NEWPID) == 0);
         pid_t c = fork();
         CHECK(c >= 0);
         if (c == 0) {
@@ -1899,11 +1899,11 @@ static int ub_scm_out(void)
 {
     alarm(20);
     CHECK(map_self() == 0);
+    CHECK(unshare(CLONE_NEWPID) == 0);
     for (int t = 0; t < 2; t++) {
         int sp[2];
         CHECK(socketpair(AF_UNIX, sc_types[t], 0, sp) == 0);
         CHECK(set_passcred(sp[0]) == 0);
-        CHECK(unshare(CLONE_NEWPID) == 0);
         pid_t c = fork();
         CHECK(c >= 0);
         if (c == 0) _exit(cred_send(sp[1], 0) == 0 ? 0 : 2);
