@@ -1,0 +1,12 @@
+[package]
+name = "mqtest"
+version.workspace = true
+edition.workspace = true
+build = "../muslrt/build.rs"
+
+[[bin]]
+name = "mqtest"
+path = "src/main.rs"
+
+[dependencies]
+# Linked against librelibc.a like polltest (relibc_start_v1, fork, poll).
