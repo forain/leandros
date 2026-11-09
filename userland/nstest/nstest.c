@@ -9,6 +9,9 @@
  * individual flags on and move their cases to real behaviour checks.
  */
 #define _GNU_SOURCE
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <net/if.h>
 #include <errno.h>
 #include <sched.h>
 #include <signal.h>
@@ -18,6 +21,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <sys/utsname.h>
 #include <linux/sched.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -45,7 +49,7 @@ static void check(const char *name, int ok)
 }
 
 static const struct { const char *n; unsigned long f; } flags[] = {
-    {"NEWUTS", CLONE_NEWUTS},   {"NEWNS", CLONE_NEWNS},
+    {"NEWNS", CLONE_NEWNS},
     {"NEWCGROUP", CLONE_NEWCGROUP},
 };
 
@@ -181,9 +185,9 @@ static int t_unshare_threaded(void)
 }
 static int t_other_new_einval(void)
 {
-    int fl[] = { 0x00020000, 0x02000000, 0x04000000 };
+    int fl[] = { 0x00020000, 0x02000000 };
     CHECK(drop_to(1000) == 0);
-    for (unsigned i = 0; i < 3; i++) {
+    for (unsigned i = 0; i < 2; i++) {
         CHECK(unshare(fl[i]) == -1 && errno == EINVAL);
         long r = syscall(SYS_clone, SIGCHLD | fl[i], 0, 0, 0, 0);
         CHECK(r == -1 && errno == EINVAL);
@@ -906,6 +910,79 @@ static int sendfam_child(void)
         if (sendto(ic, pkt, sizeof pkt, 0, (void *)&a, sizeof a) != -1) bad |= 128;
     }
     return bad;
+}
+/* ---- netlink / ifreq view inside a new netns (lane nlns) ---- */
+static int nl_rt(int s, int type, int flags, unsigned idx, unsigned ifflags, unsigned change,
+                 char *out, int cap)
+{
+    struct { struct nlmsghdr h; struct ifinfomsg i; } r;
+    memset(&r, 0, sizeof r);
+    r.h.nlmsg_len = sizeof r; r.h.nlmsg_type = type; r.h.nlmsg_flags = NLM_F_REQUEST | flags; r.h.nlmsg_seq = 5;
+    r.i.ifi_index = idx; r.i.ifi_flags = ifflags; r.i.ifi_change = change;
+    if (send(s, &r, sizeof r, 0) != (ssize_t)sizeof r) return -1;
+    int tot = 0;
+    for (;;) {
+        ssize_t n = recv(s, out + tot, cap - tot, 0);
+        if (n <= 0) return -1;
+        struct nlmsghdr *h = (struct nlmsghdr *)(out + tot);
+        int k = (int)n, done = 0;
+        for (; NLMSG_OK(h, k); h = NLMSG_NEXT(h, k))
+            if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR || !(type == RTM_GETLINK || type == RTM_GETADDR) || !(h->nlmsg_flags & NLM_F_MULTI)) done = 1;
+        tot += n;
+        if (done) return tot;
+        if (!(flags & NLM_F_DUMP)) return tot;
+    }
+}
+static int nl_count(char *b, int n, int type, int *first_index)
+{
+    int c = 0;
+    for (struct nlmsghdr *h = (struct nlmsghdr *)b; NLMSG_OK(h, n); h = NLMSG_NEXT(h, n))
+        if (h->nlmsg_type == type) { if (!c && first_index) *first_index = ((struct ifinfomsg *)NLMSG_DATA(h))->ifi_index; c++; }
+    return c;
+}
+static int netns_only_lo_body(void)
+{
+    static char b[8192];
+    int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (s < 0) return 2;
+    int n = nl_rt(s, RTM_GETLINK, NLM_F_DUMP, 0, 0, 0, b, sizeof b), idx = 0;
+    if (n <= 0 || nl_count(b, n, RTM_NEWLINK, &idx) != 1 || idx != 1) return 3;
+    n = nl_rt(s, RTM_GETADDR, NLM_F_DUMP, 0, 0, 0, b, sizeof b);
+    if (n <= 0 || nl_count(b, n, RTM_NEWADDR, NULL) != 0) return 4;
+    if (if_nametoindex("eth0") != 0 || if_nametoindex("lo") != 1) return 5;
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "eth0");
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ioctl(u, SIOCGIFFLAGS, &q) == 0 || errno != ENODEV) return 6;
+    struct ifconf ic; char cb[512]; ic.ifc_len = sizeof cb; ic.ifc_buf = cb;
+    if (ioctl(u, SIOCGIFCONF, &ic) != 0 || ic.ifc_len != 0) return 7;
+    n = nl_rt(s, RTM_GETROUTE, NLM_F_DUMP, 0, 0, 0, b, sizeof b);
+    if (n <= 0 || nl_count(b, n, RTM_NEWROUTE, NULL) != 0) return 8;
+    return 0;
+}
+static int t_netns_sees_only_lo(void)
+{
+    CHECK(ns_child_netns(netns_only_lo_body) == 0);
+    return 0;
+}
+static int netns_lo_up_body(void)
+{
+    static char b[8192];
+    int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (s < 0) return 2;
+    int n = nl_rt(s, RTM_NEWLINK, NLM_F_ACK, 1, IFF_UP, IFF_UP, b, sizeof b);
+    struct nlmsghdr *h = (struct nlmsghdr *)b;
+    if (n <= 0 || h->nlmsg_type != NLMSG_ERROR || ((struct nlmsgerr *)NLMSG_DATA(h))->error != 0) return 3;
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo");
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ioctl(u, SIOCGIFFLAGS, &q) != 0 || !(q.ifr_flags & IFF_UP)) return 4;
+    n = nl_rt(s, RTM_NEWLINK, NLM_F_ACK, 99, IFF_UP, IFF_UP, b, sizeof b);
+    if (n <= 0 || ((struct nlmsgerr *)NLMSG_DATA((struct nlmsghdr *)b))->error != -ENODEV) return 5;
+    return 0;
+}
+static int t_netns_lo_up_ack(void)
+{
+    CHECK(ns_child_netns(netns_lo_up_body) == 0);
+    return 0;
 }
 static int t_netns_sendfam(void)
 {
@@ -1810,6 +1887,88 @@ static int ib_ttypg(void)
 static int ub_ttypg(void) { return in_init(ib_ttypg); }
 PCASE(tty_pgrp_view, ub_ttypg)
 
+
+/* ── UTS namespaces ─────────────────────────────────────────────────────── */
+static int hn_is(const char *want)
+{
+    char b[80] = {0};
+    return gethostname(b, sizeof b) == 0 && !strcmp(b, want);
+}
+static int proc_hn_is(const char *path, const char *want)
+{
+    char b[80] = {0};
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    int n = read(fd, b, sizeof b - 1); close(fd);
+    if (n > 0 && b[n - 1] == '\n') b[n - 1] = 0;
+    return !strcmp(b, want);
+}
+static int rd_link(const char *p, char *out, size_t n)
+{
+    ssize_t r = readlink(p, out, n - 1);
+    if (r < 0) return -1;
+    out[r] = 0; return 0;
+}
+static int t_uts_unpriv(void)
+{
+    char before[80], after[80], l1[80], l2[80];
+    CHECK(gethostname(before, sizeof before) == 0);
+    CHECK(drop_to(1000) == 0);
+    CHECK(sethostname("nope", 4) == -1 && errno == EPERM);
+    CHECK(unshare(CLONE_NEWUTS) == -1 && errno == EPERM);
+    CHECK(rd_link("/proc/self/ns/uts", l1, sizeof l1) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWUTS) != 0) _exit(1);
+        if (rd_link("/proc/self/ns/uts", l2, sizeof l2) != 0 || !strcmp(l1, l2)) _exit(2);
+        if (sethostname("inner", 5) != 0) _exit(3);
+        if (setdomainname("innerdom", 8) != 0) _exit(4);
+        if (!hn_is("inner")) _exit(5);
+        if (!proc_hn_is("/proc/sys/kernel/hostname", "inner")) _exit(6);
+        if (!proc_hn_is("/proc/sys/kernel/domainname", "innerdom")) _exit(7);
+        struct utsname u;
+        if (uname(&u) != 0 || strcmp(u.nodename, "inner") || strcmp(u.domainname, "innerdom")) _exit(8);
+        pid_t g = fork();
+        if (g == 0) _exit(hn_is("inner") ? 0 : 1);   /* inherited on fork */
+        int gs = 0; waitpid(g, &gs, 0);
+        if (!WIFEXITED(gs) || WEXITSTATUS(gs) != 0) _exit(9);
+        _exit(0);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { printf("  child exit %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1); return 1; }
+    CHECK(gethostname(after, sizeof after) == 0 && !strcmp(before, after));
+    CHECK(rd_link("/proc/self/ns/uts", l2, sizeof l2) == 0 && !strcmp(l1, l2));
+    return 0;
+}
+static int t_uts_copy_inherit(void)
+{
+    CHECK(sethostname("parenthost", 10) == 0);
+    pid_t c = syscall(SYS_clone, SIGCHLD | CLONE_NEWUTS, 0, 0, 0, 0);
+    CHECK(c >= 0);
+    if (c == 0) {
+        if (!hn_is("parenthost")) _exit(1);          /* copied from the parent */
+        if (sethostname("childhost", 9) != 0) _exit(2);
+        _exit(hn_is("childhost") ? 0 : 3);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(hn_is("parenthost"));
+    pid_t f = fork();
+    if (f == 0) _exit(hn_is("parenthost") ? 0 : 1);  /* plain fork shares the name */
+    waitpid(f, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(sethostname("leandros", 8) == 0);
+    return 0;
+}
+static int t_uts_in_host_userns(void)
+{
+    /* a child userns holds no power over the host's UTS namespace */
+    CHECK(unshare(CLONE_NEWUSER) == 0);
+    CHECK(sethostname("evil", 4) == -1 && errno == EPERM);
+    return 0;
+}
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -1833,12 +1992,13 @@ static int run_userns_cases(void)
         { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
-        { "netns_sendfam", t_netns_sendfam }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
+        { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
         { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
         { "map_deputy", t_map_deputy }, { "map_race", t_map_race }, { "chroot_newuser_eperm", t_chroot_newuser },
         { "fdinfo_other_uid", t_fdinfo_other_uid },
+        { "uts_unpriv", t_uts_unpriv }, { "uts_copy_inherit", t_uts_copy_inherit }, { "uts_host_userns_eperm", t_uts_in_host_userns },
         { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
