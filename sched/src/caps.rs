@@ -49,6 +49,26 @@ pub fn host_capable(cap: u32) -> bool {
             .map(|t| t.userns.id() == 0 && t.caps[0] >> cap & 1 != 0).unwrap_or(false)
 }
 
+/// Linux `cap_capable` walk for a credential snapshot (user namespace `cns`,
+/// kuid `euid`, effective caps `caps`) against `target` namespace.
+pub fn capable_snap(cns: crate::ns::NsId, euid: u32, caps: u64, target: crate::ns::NsId, cap: u32) -> bool {
+    if cap > CAP_LAST { return false; }
+    let mut ns = target;
+    loop {
+        if ns == cns { return caps >> cap & 1 != 0; }
+        if crate::ns::level(ns) <= crate::ns::level(cns) { return false; }
+        if crate::ns::parent(ns) == cns && crate::ns::owner(ns).0 == euid { return true; }
+        ns = crate::ns::parent(ns);
+    }
+}
+
+/// Does the calling thread hold `cap` over user namespace `target_ns`: it has
+/// the cap in an ancestor namespace, or owns a namespace whose parent is its own.
+pub fn ns_capable_in(target_ns: crate::ns::NsId, cap: u32) -> bool {
+    RUN_QUEUE.lock().find_pid(current_pid())
+        .map(|t| capable_snap(t.userns.id(), t.euid, t.caps[0], target_ns, cap)).unwrap_or(false)
+}
+
 /// Historic name of `ns_capable`.
 pub fn capable(cap: u32) -> bool { ns_capable(cap) }
 
@@ -143,28 +163,45 @@ pub fn bset_drop(cap: u32) -> isize {
     0
 }
 
+/// The kernel uid that is "root" for `t`: id 0 of its user namespace
+/// (`ns::root_k`). None (id 0 unmapped, e.g. before the map is written) means
+/// nobody is root and no root-style capability transition applies. Kernel uids
+/// are compared, never the literal 0: kuid 0 is root only in namespace 0 or a
+/// namespace that maps it (idmap refuses such maps for now).
+fn root_of(t: &Task) -> Option<u32> { crate::ns::root_k(t.userns.id()) }
+
+// H14 (design-idmap): Linux `cap_task_fix_setuid` also drops the DAC caps
+// (CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID) from the
+// effective set when fsuid leaves ns-root (LSM_SETID_FS), and restores them
+// when it returns. That fsuid fixup is NOT modelled here: setfsuid() changes
+// fsuid without touching `caps`. Low impact: VFS gates convert to
+// `cap_inode(cap, uid, gid)` on fsuid/caps (idperm lanes), not on this fixup.
+
 /// Linux `cap_emulate_setxuid`, given the (ruid, euid, suid) before the change.
+/// "Root" is `root_k(task's userns)`, not literal kuid 0.
 pub fn on_uid_change(t: &mut Task, old: (u32, u32, u32)) {
     if t.caps[SEC] & SECURE_NO_SETUID_FIXUP != 0 { return; }
-    let had_root = old.0 == 0 || old.1 == 0 || old.2 == 0;
-    if had_root && t.uid != 0 && t.euid != 0 && t.suid != 0 && t.caps[SEC] & SECURE_KEEP_CAPS == 0 {
+    let rk = match root_of(t) { Some(k) => k, None => return };
+    let had_root = old.0 == rk || old.1 == rk || old.2 == rk;
+    if had_root && t.uid != rk && t.euid != rk && t.suid != rk && t.caps[SEC] & SECURE_KEEP_CAPS == 0 {
         t.caps[0] = 0;
         t.caps[1] = 0;
         t.caps[AMB] = 0;
     }
-    if old.1 == 0 && t.euid != 0 { t.caps[0] = 0; }
-    if old.1 != 0 && t.euid == 0 { t.caps[0] = t.caps[1]; }
+    if old.1 == rk && t.euid != rk { t.caps[0] = 0; }
+    if old.1 != rk && t.euid == rk { t.caps[0] = t.caps[1]; }
     t.caps[AMB] &= t.caps[1] & t.caps[2];
 }
 
 /// execve transition (no file caps), Linux cap_bprm_creds_from_file:
-/// P' = (root ? I | bounding : 0) | A', E' = P' if euid 0 (and root rules on)
-/// else A'. A set-id exec clears the ambient set first; KEEP_CAPS never
-/// survives an exec.
+/// P' = (root ? I | bounding : 0) | A', E' = P' if euid is root (and root rules
+/// on) else A'. "Root" is `root_k(task's userns)`; None = nobody. A set-id exec
+/// clears the ambient set first; KEEP_CAPS never survives an exec.
 pub fn on_exec(t: &mut Task, setid: bool) {
     let sb = t.caps[SEC];
+    let rk = root_of(t);
     let root_rules = sb & SECURE_NOROOT == 0;
-    let mut p = if root_rules && (t.uid == 0 || t.euid == 0) { t.caps[2] | t.caps[3] } else { 0 };
+    let mut p = if root_rules && (Some(t.uid) == rk || Some(t.euid) == rk) { t.caps[2] | t.caps[3] } else { 0 };
     if setid { t.caps[AMB] = 0; }
     // Linux cap_bprm_creds_from_file under no_new_privs: the new permitted set
     // may not exceed the old one (no privilege gain on exec).
@@ -172,7 +209,7 @@ pub fn on_exec(t: &mut Task, setid: bool) {
     let amb = t.caps[AMB] & t.caps[1] & t.caps[2];
     t.caps[AMB] = amb;
     p |= amb;
-    t.caps[0] = if root_rules && t.euid == 0 { p } else { amb };
+    t.caps[0] = if root_rules && Some(t.euid) == rk { p } else { amb };
     t.caps[1] = p;
     t.caps[SEC] &= !SECURE_KEEP_CAPS;
 }
