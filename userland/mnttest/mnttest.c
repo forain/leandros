@@ -553,6 +553,94 @@ static void hardening_suite(void) {
     report("dead_ns_reaped_on_wait", reaped);
 }
 
+/* ---- Pool reachability via /proc magic links, fd-relative paths, symlinks ---- */
+#ifndef O_PATH
+#define O_PATH 010000000
+#endif
+
+static int enoent_open(const char *p) { errno = 0; int fd = open(p, O_RDONLY); if (fd >= 0) { close(fd); return 0; } return errno == ENOENT; }
+
+static int pool_proc_ok(void) {
+    int ok = enoent_open("/proc/self/root/.leandros-sb")
+          && enoent_open("/proc/self/root/.leandros-sb/tmpfs/1")
+          && enoent_open("/proc/self/root/.leandros-sb/tmpfs/1/x");
+    return ok;
+}
+static int pool_cwd_ok(void) {
+    if (chdir("/") != 0) return 0;
+    return enoent_open("/proc/self/cwd/.leandros-sb")
+        && enoent_open("/proc/self/cwd/.leandros-sb/tmpfs/1");
+}
+static int pool_fd_ok(void) {
+    int dfd = open("/", O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) return 0;
+    int ok = 1;
+    errno = 0; int f = openat(dfd, ".leandros-sb/tmpfs/1", O_RDONLY); if (f >= 0) { close(f); ok = 0; } else if (errno != ENOENT) ok = 0;
+    char p[96]; snprintf(p, sizeof p, "/proc/self/fd/%d/.leandros-sb/tmpfs/1", dfd);
+    if (!enoent_open(p)) ok = 0;
+    if (fchdir(dfd) != 0) ok = 0;
+    else if (!enoent_open(".leandros-sb/tmpfs/1")) ok = 0;
+    close(dfd);
+    return ok;
+}
+
+/* Each check runs in ns 0 (mode 0) or in a fresh mount namespace with a tmpfs (mode 1). */
+static int pool_in_child(int mode, int (*fn)(void)) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (mode) {
+            if (unshare(CLONE_NEWNS) != 0) _exit(2);
+            mkdir("/mnt", 0755);
+            if (mount("t", "/mnt", "tmpfs", 0, NULL) != 0) _exit(3);
+        }
+        _exit(fn() ? 0 : 1);
+    }
+    int st = 0;
+    if (pid < 0 || waitpid(pid, &st, 0) < 0) return 0;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+static int cross_symlink_ok(void) {
+    mkdir("/mnt/ia", 0755); mkdir("/mnt/ib", 0755);
+    if (mount("a", "/mnt/ia", "tmpfs", 0, NULL) || mount("b", "/mnt/ib", "tmpfs", 0, NULL)) return 0;
+    int f = open("/mnt/ib/secret", O_CREAT | O_WRONLY, 0666);
+    if (f < 0) return 0;
+    close(f);
+    /* The secret exists in ib only; no link inside ia may ever reach it. */
+    for (int m = 1; m < 80; m++) {
+        char body[96];
+        for (int abs = 0; abs < 2; abs++) {
+            if (abs) snprintf(body, sizeof body, "/.leandros-sb/tmpfs/%d/secret", m);
+            else snprintf(body, sizeof body, "../%d/secret", m);
+            unlink("/mnt/ia/l");
+            if (symlink(body, "/mnt/ia/l") != 0) return 0;
+            int g = open("/mnt/ia/l", O_RDONLY);
+            if (g >= 0) { close(g); return 0; }
+        }
+    }
+    return 1;
+}
+
+static int mountinfo_nopool_ok(void) {
+    static char b[16384];
+    for (int k = 0; k < 2; k++) {
+        if (slurp(k ? "/proc/self/mounts" : "/proc/self/mountinfo", b, sizeof b) <= 0) return 0;
+        if (strstr(b, ".leandros-sb")) return 0;
+    }
+    return 1;
+}
+
+static void pool_tests(void) {
+    report("pool_via_proc_root_ns0", pool_in_child(0, pool_proc_ok));
+    report("pool_via_proc_root_mntns", pool_in_child(1, pool_proc_ok));
+    report("pool_via_proc_cwd_ns0", pool_in_child(0, pool_cwd_ok));
+    report("pool_via_proc_cwd_mntns", pool_in_child(1, pool_cwd_ok));
+    report("pool_via_fd_relative_ns0", pool_in_child(0, pool_fd_ok));
+    report("pool_via_fd_relative_mntns", pool_in_child(1, pool_fd_ok));
+    report("pool_cross_instance_symlink", pool_in_child(1, cross_symlink_ok));
+    report("mountinfo_no_pool_path", pool_in_child(1, mountinfo_nopool_ok));
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -563,6 +651,7 @@ int main(int argc, char **argv) {
     newns_suite();
     hardening_suite();
     mountinfo_tests();
+    pool_tests();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
