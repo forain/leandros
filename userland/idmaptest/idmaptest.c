@@ -83,6 +83,7 @@ static void proc_pid_owner(void)
     if (c == 0) {
         close(sync[1]);
         if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) _exit(1);
+        prctl(PR_SET_DUMPABLE, 1);   /* the id change cleared it; Linux shows root then */
         char b; read(sync[0], &b, 1);
         _exit(0);
     }
@@ -108,6 +109,7 @@ static int owner_newuser_body(void)
     if (c == 0) {
         char x = 0;
         if (unshare(CLONE_NEWUSER)) { x = 'u'; write(b[1], &x, 1); _exit(1); }
+        prctl(PR_SET_DUMPABLE, 1);
         write(b[1], &x, 1);
         read(a[0], &x, 1);
         _exit(0);
@@ -137,6 +139,29 @@ static void proc_owner_newuser(void)
     int st; waitpid(m, &st, 0);
     if (WIFEXITED(st) && WEXITSTATUS(st)) printf("proc_owner_newuser rc=%d\n", WEXITSTATUS(st));
     report("proc_owner_newuser", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+/* A non-dumpable task shows root (task_dump_owner). */
+static void proc_owner_nondumpable(void)
+{
+    int sync[2];
+    pipe(sync);
+    pid_t c = fork();
+    if (c == 0) {
+        close(sync[1]);
+        if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) _exit(1);
+        prctl(PR_SET_DUMPABLE, 0);
+        char b; read(sync[0], &b, 1);
+        _exit(0);
+    }
+    close(sync[0]);
+    usleep(200000);
+    char p[32]; struct stat st;
+    snprintf(p, sizeof p, "/proc/%d", c);
+    int ok = stat(p, &st) == 0 && st.st_uid == 0 && st.st_gid == 0;
+    close(sync[1]);
+    waitpid(c, NULL, 0);
+    report("proc_owner_nondumpable", ok);
 }
 
 /* ---- status_groups_view ------------------------------------------------- */
@@ -1465,6 +1490,7 @@ int main(int argc, char **argv)
     statx_matches_stat();
     proc_pid_owner();
     proc_owner_newuser();
+    proc_owner_nondumpable();
     status_groups_view();
     stat_unmapped_65534();
     sigchld_si_uid_view();
