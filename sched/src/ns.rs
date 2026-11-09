@@ -73,6 +73,11 @@ fn put(mut id: NsId) {
             ZOMBIES[id as usize / 64].fetch_or(1u64 << (id as usize % 64), AcqRel);
             return;
         }
+        // A cgroup namespace unpins its root cgroup (its owner userns, held as
+        // PARENT, is released by the loop below).
+        if CGNS_FLAG[id as usize].swap(0, AcqRel) != 0 {
+            crate::cgroup::ns_unpin(CGNS_ROOT[id as usize].load(Acquire));
+        }
         // Last reference: the slot is free again; release the parent.
         id = PARENT[id as usize].load(Acquire);
     }
@@ -570,6 +575,7 @@ pub const NS_NAMES: [&[u8]; 8] = [b"user", b"pid", b"net", b"ipc", b"mnt", b"uts
 /// Namespace id of `pid` for link `kind` (non-user kinds are initial).
 pub fn ns_id_of(pid: u32, kind: usize) -> NsId {
     match kind {
+        6 => cgns_of(pid),
         0 => userns_of(pid), 2 => netns_of(pid), 3 => ipcns_of(pid),
         1 => crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.pidns.id()).unwrap_or(0),
         7 => crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.pidns_child.id()).unwrap_or(0),
@@ -577,4 +583,79 @@ pub fn ns_id_of(pid: u32, kind: usize) -> NsId {
         5 => utsns_of(pid),
         _ => 0,
     }
+}
+
+// ── cgroup namespaces (design-cgroup lane CG0/CG1; append-only) ─────────────
+//
+// A cgroup namespace is a flat id that records its root cgroup and its owner
+// user namespace (held as PARENT, so the owner id cannot be reused while the
+// namespace lives). It pins the root cgroup against rmdir while alive.
+
+static CGNS_ROOT: [AtomicU16; NS_MAX] = [ZERO16; NS_MAX];
+static CGNS_FLAG: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
+
+/// New cgroup namespace rooted at cgroup `root`, owned by user namespace
+/// `owner`. The returned reference is the caller's. ENOSPC (28) when full.
+pub fn new_cgns(root: crate::cgroup::CgId, owner: NsId) -> Result<NsRef, isize> {
+    for id in 1..NS_MAX {
+        if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
+            let p = NsRef::get(owner);
+            PARENT[id].store(p.0, Release);
+            core::mem::forget(p);
+            LEVEL[id].store(0, Release);
+            CGNS_ROOT[id].store(root, Release);
+            crate::cgroup::ns_pin(root);
+            CGNS_FLAG[id].store(1, Release);
+            return Ok(NsRef(id as NsId));
+        }
+    }
+    Err(-28)
+}
+
+/// Is `id` a live cgroup namespace? (Id 0, the initial one, is: root cgroup 0.)
+pub fn is_cgns(id: NsId) -> bool { id == 0 || (id as usize) < NS_MAX && CGNS_FLAG[id as usize].load(Acquire) != 0 }
+/// Root cgroup of cgroup namespace `id` (0 for the initial one).
+pub fn cgns_root(id: NsId) -> crate::cgroup::CgId { if id == 0 { 0 } else { CGNS_ROOT[id as usize].load(Acquire) } }
+/// Owner user namespace of cgroup namespace `id` (0 for the initial one).
+pub fn cgns_owner(id: NsId) -> NsId { if id == 0 { 0 } else { PARENT[id as usize].load(Acquire) } }
+/// Cgroup namespace of `pid` (0 = initial, also when `pid` is unknown).
+pub fn cgns_of(pid: u32) -> NsId {
+    crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.cgns.id()).unwrap_or(0)
+}
+/// Cgroup namespace of the calling thread.
+pub fn current_cgns() -> NsId { cgns_of(crate::current_pid()) }
+
+/// unshare(CLONE_NEWCGROUP) for the calling thread: a fresh namespace rooted
+/// at its current cgroup, owned by its current user namespace. The caller has
+/// checked CAP_SYS_ADMIN (and run any NEWUSER first). Membership is unchanged.
+pub fn unshare_cgroup() -> isize {
+    let pid = crate::current_pid();
+    let (cg, owner) = {
+        let rq = crate::RUN_QUEUE.lock();
+        match rq.find_pid(pid) { Some(t) => (t.cgroup, t.userns.id()), None => return -3 }
+    };
+    let new = match new_cgns(cg, owner) { Ok(n) => n, Err(e) => return e };
+    let old = {
+        let mut rq = crate::RUN_QUEUE.lock();
+        match rq.find_pid_mut(pid) { Some(t) => core::mem::replace(&mut t.cgns, new), None => return -3 }
+    };
+    drop(old);
+    0
+}
+
+/// Hook for setns(fd, CLONE_NEWCGROUP) (lane setns): move the calling thread
+/// into existing cgroup namespace `id`, which the caller must hold a reference
+/// to (it came from an ns fd). The caller checks CAP_SYS_ADMIN in
+/// `cgns_owner(id)` and in its own user namespace. Membership is unchanged.
+/// 0, or -22 when `id` is not a cgroup namespace.
+pub fn setns_cgroup(id: NsId) -> isize {
+    if !is_cgns(id) { return -22; }
+    let new = NsRef::get(id);
+    let pid = crate::current_pid();
+    let old = {
+        let mut rq = crate::RUN_QUEUE.lock();
+        match rq.find_pid_mut(pid) { Some(t) => core::mem::replace(&mut t.cgns, new), None => return -3 }
+    };
+    drop(old);
+    0
 }

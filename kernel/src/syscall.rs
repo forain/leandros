@@ -8433,10 +8433,11 @@ fn sys_unshare(flags: usize) -> isize {
     // CLONE_THREAD/SIGHAND/VM: Linux allows them only for a single-threaded
     // caller, where they are no-ops.
     if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && !alone { return -22; }
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP) != 0 { return -22; }
+    if flags & CLONE_NEWNS != 0 { return -22; }
     let flat = flags & (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS);
     if flat != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; } // CAP_SYS_ADMIN
     if flat != 0 && !alone { return -22; }
+    if flags & CLONE_NEWCGROUP != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     if flags & CLONE_NEWUSER != 0 {
         // Linux: a chrooted task may not create a user namespace (EPERM).
         if sched::current_root_arc().is_some() { return -1; }
@@ -8457,6 +8458,11 @@ fn sys_unshare(flags: usize) -> isize {
     }
     if flags & CLONE_NEWUTS != 0 {
         let r = sched::ns::unshare_uts();
+        if r < 0 { return r; }
+    }
+    // After NEWUSER, so the namespace is owned by the new user namespace.
+    if flags & CLONE_NEWCGROUP != 0 {
+        let r = sched::ns::unshare_cgroup();
         if r < 0 { return r; }
     }
     if flags & CLONE_FILES != 0 { let r = fd_unshare_current(); if r < 0 { return r; } }
@@ -16539,6 +16545,7 @@ struct CloneReq {
     netns: sched::ns::NsId,
     ipcns: sched::ns::NsId,
     utsns: sched::ns::NsId,
+    cgns: sched::ns::NsId,
     /// CLONE_* flags; the low byte (CSIGNAL) is the signal a new process
     /// sends its parent when it exits (SIGCHLD normally, 0 for none).
     flags: usize,
@@ -16616,7 +16623,7 @@ fn sys_clone_or_fork(
         return -22;
     }
     let pidfd = if flags & CLONE_PIDFD != 0 { ptid } else { 0 };
-    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr)
+    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, cgns: 0 }, frame_ptr)
 }
 
 /// vfork(2): `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` — the child runs on
@@ -16626,7 +16633,7 @@ fn sys_clone_or_fork(
 fn sys_vfork(frame_ptr: usize) -> isize {
     const SIGCHLD: usize = 17;
     do_clone(CloneReq { flags: CLONE_VM | CLONE_VFORK | SIGCHLD, stack: 0, ptid: 0, ctid: 0,
-                        tls: 0, pidfd: 0, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr)
+                        tls: 0, pidfd: 0, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, cgns: 0 }, frame_ptr)
 }
 
 /// clone3(uargs, size): `struct clone_args` translated onto the clone path.
@@ -16719,7 +16726,7 @@ fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
         if let Err(e) = sched::reserve_pid(p) { return e; }
     }
     let r = do_clone(CloneReq { flags, stack: sp, ptid: parent_tid as usize, ctid: child_tid as usize,
-                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr);
+                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, cgns: 0 }, frame_ptr);
     if let Some(p) = set_tid_pid { sched::release_reserved_pid(p); }
     r
 }
@@ -16738,7 +16745,7 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
 
     // Namespaces: only CLONE_NEWUSER is implemented (nsbox lane L1); every
     // other CLONE_NEW* is refused instead of silently ignored.
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP) != 0 { return -22; }
+    if flags & CLONE_NEWNS != 0 { return -22; }
     // Pid namespaces (lane nspid). Linux copy_process rules: NEWPID excludes
     // CLONE_THREAD/SIGHAND; here also CLONE_VM (the vfork-style arm has no
     // namespace plumbing). A thread or CLONE_PARENT child cannot be placed
@@ -16758,6 +16765,12 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
     // NEWNET/NEWIPC: need CAP_SYS_ADMIN in the (possibly new) user namespace;
     // a thread or a shared-VM child cannot get its own.
     if flags & (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS) != 0 {
+        if flags & (CLONE_THREAD | CLONE_VM) != 0 { return -22; }
+        if flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
+    }
+    // NEWCGROUP: CAP_SYS_ADMIN in the (possibly new) user namespace; like
+    // NEWNET it cannot be given to a thread or a shared-VM child.
+    if flags & CLONE_NEWCGROUP != 0 {
         if flags & (CLONE_THREAD | CLONE_VM) != 0 { return -22; }
         if flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     }
@@ -16786,6 +16799,12 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
         match sched::ns::new_uts(sched::ns::utsns_of(current_pid()), owner) { Ok(n) => Some(n), Err(e) => return e }
     } else { None };
     req.utsns = new_uts.as_ref().map_or(0, |n| n.id());
+    // Rooted at the parent's current cgroup, owned by the child's user namespace.
+    let new_cgns = if flags & CLONE_NEWCGROUP != 0 {
+        let owner = if req.userns != 0 { req.userns } else { sched::ns::current_userns() };
+        match sched::ns::new_cgns(sched::cgroup::current(), owner) { Ok(n) => Some(n), Err(e) => return e }
+    } else { None };
+    req.cgns = new_cgns.as_ref().map_or(0, |n| n.id());
 
     let pidfd = if flags & CLONE_PIDFD != 0 {
         if !validate_user_buf(req.pidfd, 4) { return -14; }
@@ -16891,6 +16910,7 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
             netns: req.netns,
             ipcns: req.ipcns,
             utsns: req.utsns,
+            cgns: req.cgns,
         };
         // Duplicate the fd table before the child becomes runnable (see the
         // FORK arm of syscall_dispatch for the SMP race this prevents).
