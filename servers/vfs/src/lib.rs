@@ -11984,6 +11984,7 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             let ev = if reaped { POLLIN | POLLHUP } else if exited { POLLIN } else { 0 };
             (ev, exited as u64, sched::poll_tag(sched::poll_class::PIDFD, pid))
         }
+        VnodeKind::NsFd { .. } => (0, 0, sched::poll_tag(sched::poll_class::PIDFD, 0)),
         VnodeKind::Inotify { .. } => {
             // Never fires: accepted watches silently produce no events. Its
             // own tag, not the broadcast mask — with POLL_TAG_ALL every event
