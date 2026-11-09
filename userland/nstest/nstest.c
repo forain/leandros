@@ -2144,6 +2144,298 @@ static int ib_timer_sig(void)
 static int ub_timer_sig(void) { return in_init(ib_timer_sig); }
 PCASE(timer_sig_in_pidns, ub_timer_sig)
 
+/* ---- setns(2) and openable ns files ---- */
+#ifndef NS_GET_USERNS
+#define NS_GET_USERNS 0xb701
+#define NS_GET_PARENT 0xb702
+#define NS_GET_NSTYPE 0xb703
+#define NS_GET_OWNER_UID 0xb704
+#endif
+#ifdef __aarch64__
+#define NR_SETNS 268
+#else
+#define NR_SETNS 308
+#endif
+#define NR_PIDFD_OPEN 434
+static long sys_setns(int fd, int t) { return syscall(NR_SETNS, fd, t); }
+
+/* Fork a child that unshares `fl` (as `uid` when non-zero), listens on
+ * 127.0.0.1:41500 when it has a new netns, then parks until *hold_w closes. */
+static pid_t ns_spawn(unsigned long fl, int uid, int *hold_w)
+{
+    int rdy[2], hold[2];
+    if (pipe(rdy) || pipe(hold)) return -1;
+    pid_t c = fork();
+    if (c == 0) {
+        close(rdy[0]); close(hold[1]);
+        if (uid && drop_to(uid)) _exit(1);
+        if (unshare(fl)) _exit(2);
+        if (fl & CLONE_NEWNET) {
+            int s = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41500) };
+            if (s < 0 || bind(s, (void *)&a, sizeof a) || listen(s, 4)) _exit(3);
+        }
+        char b = 'r'; (void)!write(rdy[1], &b, 1);
+        (void)!read(hold[0], &b, 1);
+        _exit(0);
+    }
+    close(rdy[1]); close(hold[0]);
+    char b;
+    if (c < 0 || read(rdy[0], &b, 1) != 1) { close(rdy[0]); close(hold[1]); return -1; }
+    close(rdy[0]);
+    *hold_w = hold[1];
+    return c;
+}
+static void ns_release(pid_t c, int hold_w) { close(hold_w); int st; waitpid(c, &st, 0); }
+static int ns_open(pid_t pid, const char *nm)
+{
+    char p[64]; snprintf(p, sizeof p, "/proc/%d/ns/%s", pid, nm);
+    return open(p, O_RDONLY);
+}
+static unsigned long link_ino(const char *path)
+{
+    char b[96]; ssize_t n = readlink(path, b, sizeof b - 1);
+    if (n <= 0) return 0;
+    b[n] = 0;
+    char *q = strchr(b, '[');
+    return q ? strtoul(q + 1, 0, 10) : 0;
+}
+static unsigned long ns_link_ino(pid_t pid, const char *nm)
+{
+    char p[64]; snprintf(p, sizeof p, "/proc/%d/ns/%s", pid, nm);
+    return link_ino(p);
+}
+static unsigned long fd_ino(int fd) { struct stat st; return fstat(fd, &st) ? 0 : st.st_ino; }
+static struct sockaddr_in ns_lo(void)
+{
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41500) };
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    return a;
+}
+
+static int t_setns_net(void)
+{
+    int hw; pid_t c = ns_spawn(CLONE_NEWNET, 0, &hw);
+    CHECK(c > 0);
+    int fd = ns_open(c, "net");
+    CHECK(fd >= 0);
+    struct sockaddr_in a = ns_lo(), w = { .sin_family = AF_INET, .sin_port = htons(41500) };
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(bind(s, (void *)&w, sizeof w) == 0);   /* host namespace: port is free */
+    close(s);
+    CHECK(sys_setns(fd, CLONE_NEWNET) == 0);
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(bind(s, (void *)&w, sizeof w) == -1 && errno == EADDRINUSE);   /* the child's listener */
+    close(s);
+    (void)a;   /* a non-initial netns has a down loopback: no connect to check */
+    close(fd);
+    ns_release(c, hw);
+    return 0;
+}
+
+static int t_setns_stat(void)
+{
+    int hw; pid_t c = ns_spawn(CLONE_NEWNET | CLONE_NEWIPC, 0, &hw);
+    CHECK(c > 0);
+    int nf = ns_open(c, "net"), inf = ns_open(c, "ipc"), sf = open("/proc/self/ns/net", O_RDONLY);
+    CHECK(nf >= 0 && inf >= 0 && sf >= 0);
+    struct stat a, b, s;
+    CHECK(fstat(nf, &a) == 0 && fstat(inf, &b) == 0 && fstat(sf, &s) == 0);
+    CHECK(a.st_ino == ns_link_ino(c, "net") && a.st_ino != 0);
+    CHECK(b.st_ino == ns_link_ino(c, "ipc"));
+    CHECK(a.st_ino != s.st_ino && a.st_ino != b.st_ino);
+    CHECK(a.st_dev == b.st_dev && a.st_dev == s.st_dev);
+    ns_release(c, hw);
+    return 0;
+}
+
+static int t_setns_eperm(void)
+{
+    int hw, hw2;
+    pid_t c = ns_spawn(CLONE_NEWUSER | CLONE_NEWNET, 0, &hw);
+    pid_t c2 = ns_spawn(CLONE_NEWNET, 0, &hw2);
+    CHECK(c > 0 && c2 > 0);
+    int nf = ns_open(c, "net"), uf = ns_open(c, "user"), n2 = ns_open(c2, "net");
+    CHECK(nf >= 0 && uf >= 0 && n2 >= 0);
+    CHECK(drop_to(1000) == 0);
+    errno = 0; CHECK(sys_setns(nf, 0) == -1 && errno == EPERM);
+    errno = 0; CHECK(sys_setns(uf, 0) == -1 && errno == EPERM);
+    errno = 0; CHECK(sys_setns(n2, CLONE_NEWNET) == -1 && errno == EPERM);
+    ns_release(c2, hw2); ns_release(c, hw);   /* c2 inherited hw: release it first */
+    return 0;
+}
+
+static int t_setns_userns_owner(void)
+{
+    int hw; pid_t c = ns_spawn(CLONE_NEWUSER, 1000, &hw);
+    CHECK(c > 0);
+    int uf = ns_open(c, "user");
+    CHECK(uf >= 0);
+    CHECK(drop_to(1000) == 0);
+    struct dat d[2];
+    CHECK(cget(d) == 0 && !(d[0].eff & (1u << 21)));
+    CHECK(sys_setns(uf, CLONE_NEWUSER) == 0);   /* the creator may rejoin */
+    CHECK(cget(d) == 0 && (d[0].eff & (1u << 21)));
+    CHECK(link_ino("/proc/self/ns/user") == ns_link_ino(c, "user"));
+    errno = 0; CHECK(sys_setns(uf, CLONE_NEWUSER) == -1 && errno == EINVAL);   /* already there */
+    ns_release(c, hw);
+    return 0;
+}
+
+static int t_setns_userns_root(void)
+{
+    int hw; pid_t c = ns_spawn(CLONE_NEWUSER, 0, &hw);
+    CHECK(c > 0);
+    int uf = ns_open(c, "user");
+    CHECK(sys_setns(uf, 0) == 0);
+    CHECK(link_ino("/proc/self/ns/user") == ns_link_ino(c, "user"));
+    ns_release(c, hw);
+    return 0;
+}
+
+static int t_setns_userns_threaded(void)
+{
+    int hw; pid_t c = ns_spawn(CLONE_NEWUSER, 0, &hw);
+    CHECK(c > 0);
+    int uf = ns_open(c, "user");
+    pthread_t th;
+    CHECK(pthread_create(&th, 0, idle_thread, 0) == 0);
+    errno = 0; CHECK(sys_setns(uf, CLONE_NEWUSER) == -1 && errno == EINVAL);
+    ns_release(c, hw);
+    return 0;
+}
+
+static int t_setns_userns_chroot(void)
+{
+    int hw; pid_t c = ns_spawn(CLONE_NEWUSER, 0, &hw);
+    CHECK(c > 0);
+    int uf = ns_open(c, "user");
+    CHECK(chroot("/tmp") == 0);
+    errno = 0; CHECK(sys_setns(uf, CLONE_NEWUSER) == -1 && errno == EPERM);
+    ns_release(c, hw);
+    return 0;
+}
+
+static int t_setns_misc(void)
+{
+    errno = 0; CHECK(sys_setns(-1, 0) == -1 && errno == EBADF);
+    int z = open("/dev/null", O_RDONLY);
+    errno = 0; CHECK(sys_setns(z, 0) == -1 && errno == EINVAL);
+    int hw; pid_t c = ns_spawn(CLONE_NEWNET, 0, &hw);
+    int nf = ns_open(c, "net");
+    errno = 0; CHECK(sys_setns(nf, CLONE_NEWIPC) == -1 && errno == EINVAL);   /* wrong nstype */
+    int m = open("/proc/self/ns/mnt", O_RDONLY), g = open("/proc/self/ns/cgroup", O_RDONLY);
+    CHECK(m >= 0 && g >= 0);
+    errno = 0; CHECK(sys_setns(m, 0) == -1 && errno == EINVAL);
+    CHECK(sys_setns(g, CLONE_NEWCGROUP) == 0);   /* rejoining one's own cgroup namespace */
+    int self = open("/proc/self/ns/net", O_RDONLY);
+    CHECK(sys_setns(self, CLONE_NEWNET) == 0);
+    ns_release(c, hw);
+    return 0;
+}
+
+static int t_setns_pid_children(void)
+{
+    int hw; pid_t c = ns_spawn(CLONE_NEWPID, 0, &hw);
+    CHECK(c > 0);
+    int pf = ns_open(c, "pid_for_children"), p0 = open("/proc/self/ns/pid", O_RDONLY);
+    CHECK(pf >= 0 && p0 >= 0);
+    CHECK(sys_setns(pf, CLONE_NEWPID) == 0);
+    pid_t g = fork();
+    if (g == 0) {
+        if (getpid() != 1) _exit(4);
+        errno = 0;
+        _exit(sys_setns(p0, CLONE_NEWPID) == -1 && errno == EINVAL ? 0 : 5);   /* not a descendant */
+    }
+    int st = 0; waitpid(g, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(getpid() != 1);
+    ns_release(c, hw);
+    return 0;
+}
+
+static int t_setns_ioctl(void)
+{
+    int hw; pid_t c = ns_spawn(CLONE_NEWUSER | CLONE_NEWNET, 1000, &hw);
+    CHECK(c > 0);
+    int nf = ns_open(c, "net"), uf = ns_open(c, "user");
+    CHECK(nf >= 0 && uf >= 0);
+    CHECK(ioctl(nf, NS_GET_NSTYPE) == CLONE_NEWNET);
+    CHECK(ioctl(uf, NS_GET_NSTYPE) == CLONE_NEWUSER);
+    int o = ioctl(nf, NS_GET_USERNS);
+    CHECK(o >= 0 && fd_ino(o) == ns_link_ino(c, "user"));
+    int p = ioctl(uf, NS_GET_PARENT);
+    CHECK(p >= 0 && fd_ino(p) == link_ino("/proc/self/ns/user"));
+    errno = 0; CHECK(ioctl(nf, NS_GET_PARENT) == -1 && errno == EINVAL);
+    unsigned uid = 0;
+    CHECK(ioctl(uf, NS_GET_OWNER_UID, &uid) == 0 && uid == 1000);
+    errno = 0; CHECK(ioctl(nf, NS_GET_OWNER_UID, &uid) == -1 && errno == EINVAL);
+    int u0 = open("/proc/self/ns/user", O_RDONLY);
+    errno = 0; CHECK(ioctl(u0, NS_GET_PARENT) == -1 && errno == EPERM);
+    errno = 0; CHECK(ioctl(u0, NS_GET_USERNS) == -1 && errno == EPERM);
+    ns_release(c, hw);
+    return 0;
+}
+
+static int t_setns_pidfd(void)
+{
+    int hw; pid_t c = ns_spawn(CLONE_NEWNET | CLONE_NEWIPC, 0, &hw);
+    CHECK(c > 0);
+    int pf = syscall(NR_PIDFD_OPEN, c, 0);
+    CHECK(pf >= 0);
+    errno = 0; CHECK(sys_setns(pf, 0) == -1 && errno == EINVAL);
+    errno = 0; CHECK(sys_setns(pf, CLONE_NEWNS) == -1 && errno == EINVAL);
+    CHECK(link_ino("/proc/self/ns/net") != ns_link_ino(c, "net"));
+    CHECK(sys_setns(pf, CLONE_NEWNET | CLONE_NEWIPC) == 0);
+    CHECK(link_ino("/proc/self/ns/net") == ns_link_ino(c, "net"));
+    CHECK(link_ino("/proc/self/ns/ipc") == ns_link_ino(c, "ipc"));
+    ns_release(c, hw);
+    return 0;
+}
+
+static int t_setns_uts(void)
+{
+    int rdy[2], hold[2];
+    CHECK(pipe(rdy) == 0 && pipe(hold) == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        close(rdy[0]); close(hold[1]);
+        if (unshare(CLONE_NEWUTS)) _exit(1);
+        if (sethostname("nsjoin", 6)) _exit(2);
+        char b = 'r'; (void)!write(rdy[1], &b, 1); (void)!read(hold[0], &b, 1); _exit(0);
+    }
+    close(rdy[1]);
+    char b; CHECK(read(rdy[0], &b, 1) == 1);
+    int uf = ns_open(c, "uts");
+    CHECK(uf >= 0);
+    char h[64];
+    CHECK(gethostname(h, sizeof h) == 0 && strcmp(h, "nsjoin") != 0);
+    pid_t g = fork();
+    if (g == 0) { if (drop_to(1000)) _exit(1); errno = 0; _exit(sys_setns(uf, 0) == -1 && errno == EPERM ? 0 : 2); }
+    int st = 0; waitpid(g, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(sys_setns(uf, CLONE_NEWUTS) == 0);
+    CHECK(gethostname(h, sizeof h) == 0 && strcmp(h, "nsjoin") == 0);
+    close(hold[1]); waitpid(c, &st, 0);
+    return 0;
+}
+
+static int t_setns_fd_holds(void)
+{
+    int hw; pid_t c = ns_spawn(CLONE_NEWNET, 0, &hw);
+    CHECK(c > 0);
+    int nf = ns_open(c, "net");
+    unsigned long ino = fd_ino(nf);
+    CHECK(ino != 0);
+    ns_release(c, hw);   /* the last task is gone; only the fd keeps the namespace */
+    int hw2; pid_t c2 = ns_spawn(CLONE_NEWNET, 0, &hw2);
+    CHECK(c2 > 0 && ns_link_ino(c2, "net") != ino);   /* the held slot was not reused */
+    CHECK(sys_setns(nf, CLONE_NEWNET) == 0);
+    CHECK(link_ino("/proc/self/ns/net") == ino);
+    ns_release(c2, hw2);
+    return 0;
+}
+
 /* ── UTS namespaces ─────────────────────────────────────────────────────── */
 static int hn_is(const char *want)
 {
@@ -2292,7 +2584,9 @@ static int t_cgns_in_userns(void)
     CHECK(cgns_link(b, sizeof b) == 0 && strcmp(a, b) != 0);
     CHECK(unshare(CLONE_NEWCGROUP) == 0);
     CHECK(cgns_link(c, sizeof c) == 0 && strcmp(b, c) != 0);
-    /* clone(NEWUSER|NEWCGROUP) too */
+    /* clone(NEWUSER|NEWCGROUP) too; a nested userns needs the creator's ids
+     * mapped (Linux create_user_ns: EPERM when !kuid_has_mapping) */
+    CHECK(map_self_1000() == 0);
     long r = syscall(SYS_clone, SIGCHLD | CLONE_NEWUSER | CLONE_NEWCGROUP, 0, 0, 0, 0);
     CHECK(r >= 0);
     if (r == 0) { char x[64]; _exit(cgns_link(x, sizeof x) == 0 && strcmp(x, c) != 0 ? 0 : 1); }
@@ -2339,6 +2633,11 @@ static int run_userns_cases(void)
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
         { "map_deputy", t_map_deputy }, { "map_race", t_map_race }, { "chroot_newuser_eperm", t_chroot_newuser },
         { "fdinfo_other_uid", t_fdinfo_other_uid },
+        { "setns_net", t_setns_net }, { "setns_stat", t_setns_stat }, { "setns_eperm", t_setns_eperm },
+        { "setns_userns_owner", t_setns_userns_owner }, { "setns_userns_root", t_setns_userns_root },
+        { "setns_userns_threaded", t_setns_userns_threaded }, { "setns_userns_chroot", t_setns_userns_chroot },
+        { "setns_misc", t_setns_misc }, { "setns_pid_children", t_setns_pid_children },
+        { "setns_ioctl", t_setns_ioctl }, { "setns_pidfd", t_setns_pidfd }, { "setns_fd_holds", t_setns_fd_holds }, { "setns_uts", t_setns_uts },
         { "scm_cred_into_pidns", t_scm_cred_into_pidns }, { "scm_cred_from_pidns", t_scm_cred_from_pidns },
         { "scm_cred_self_in_pidns", t_scm_cred_self_in_pidns }, { "scm_cred_unmapped", t_scm_cred_unmapped },
         { "scm_cred_forge", t_scm_cred_forge }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },

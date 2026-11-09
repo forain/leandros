@@ -377,6 +377,16 @@ pub fn lookup_dev_node(path: &[u8]) -> Option<u16> {
     find_name(&synced(), name)
 }
 
+/// `/dev/<name>` of the block device numbered `major:minor`, appended to `out`.
+pub fn path_for_rdev(major: u32, minor: u32, out: &mut alloc::vec::Vec<u8>) -> bool {
+    if (major, minor) == (10, 237) { out.extend_from_slice(b"/dev/loop-control"); return true; }
+    let b = synced();
+    match b.iter().find(|e| e.in_use && e.major == major && e.minor == minor) {
+        Some(e) => { out.extend_from_slice(b"/dev/"); out.extend_from_slice(e.name()); true }
+        None => false,
+    }
+}
+
 /// Registry slots (with names) of `roots` and of every partition whose parent is one of them,
 /// one pass. BLKPG-created partitions live only here.
 pub fn family_slots(roots: &[u16]) -> alloc::vec::Vec<(u16, alloc::string::String)> {
@@ -736,7 +746,7 @@ fn window_check(i: u8, abs: u64, n: u64) -> WinCheck {
 }
 
 fn blkwrwin(pid: u32, ofd_id: u32, backing: Backing, size: u64, ro: bool, arg: usize) -> isize {
-    if sched::euid_of(pid) != 0 { return -13; } // EACCES
+    if !sched::host_root_of(pid) { return -13; } // EACCES
     let i = match backing { Backing::Disk(i) => i, _ => return -22 }; // whole disk only
     if arg == 0 { return -14; }
     let req = match sched::uaccess::read_user::<WrWin>(arg) { Some(v) => v, None => return -14 };
@@ -1178,7 +1188,7 @@ pub fn ioctl(pid: u32, ofd_id: u32, dev: u16, cmd: usize, arg: usize) -> isize {
             let v = match sched::uaccess::read_user::<i32>(arg) { Some(v) => v, None => return -14 };
             if v != 0 {
                 if ro { return 0; }
-                if sched::euid_of(pid) != 0 { return -13; }
+                if !sched::host_root_of(pid) { return -13; }
                 return match backing {
                     Backing::Disk(i) => match ops() {
                         Some(o) if (o.set_ro)(i as usize) => {
@@ -1200,7 +1210,7 @@ pub fn ioctl(pid: u32, ofd_id: u32, dev: u16, cmd: usize, arg: usize) -> isize {
             }
             if !ro { return 0; }
             // Runtime write enable: root only, whole NVMe disk only, this boot only.
-            if sched::euid_of(pid) != 0 { return -13; }
+            if !sched::host_root_of(pid) { return -13; }
             match backing {
                 Backing::Disk(i) => match ops() {
                     // blk.rw= still holds after the controller is writable.
