@@ -955,20 +955,17 @@ static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "nested_view", nested_view },
     { "podman_map_text", podman_map_text },
     { "unpriv_root_map", unpriv_root_map },
-<<<<<<< HEAD
     { "chown_unmapped_einval", chown_unmapped_einval },
     { "setgroups_needs_gidmap", setgroups_needs_gidmap },
     { "setuid_maps_down", setuid_maps_down },
     { "chown_maps_down", chown_maps_down },
     { "setfsuid_ret_view", setfsuid_ret_view },
     { "getgroups_view", getgroups_view },
-=======
     { "exec_drops_caps_host", exec_drops_caps_host },
     { "exec_nsroot_keeps_caps", exec_nsroot_keeps_caps },
     { "setuid_drops_caps", setuid_drops_caps },
     { "exec_nonroot_nocaps", exec_nonroot_nocaps },
     { "kuid0_not_nsroot", kuid0_not_nsroot },
->>>>>>> main
 };
 
 static int probe_knob(void)
