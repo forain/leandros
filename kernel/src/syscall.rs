@@ -852,6 +852,7 @@ mod nr {
     pub const CLONE3:              usize = 435;
     pub const CLOSE_RANGE:         usize = 436;
     pub const UNSHARE:             usize = 97;
+    pub const SETNS:               usize = 268;
     pub const PIDFD_OPEN:          usize = 434;
     pub const OPEN_TREE: usize = 428;
     pub const MOVE_MOUNT: usize = 429;
@@ -1140,6 +1141,7 @@ mod nr {
     pub const CLONE3:              usize = 435;
     pub const CLOSE_RANGE:         usize = 436;
     pub const UNSHARE:             usize = 272;
+    pub const SETNS:               usize = 308;
     pub const PIDFD_OPEN:          usize = 434;
     pub const OPEN_TREE: usize = 428;
     pub const MOVE_MOUNT: usize = 429;
@@ -1924,7 +1926,7 @@ const DBG_SERIAL_WRITE: bool = false;
 ///         held. Kills the caller (SIGSEGV); the lock must be released.
 /// x86_64: the same ops with SMAP for PAN and SMEP for PXN.
 fn sys_secprobe(op: usize, addr: usize) -> isize {
-    if !sched::cred::current_is_root() { return -1; }
+    if !sched::host_root() { return -1; }
     {
         use core::sync::atomic::Ordering::SeqCst;
         use sched::uaccess as ua;
@@ -1976,7 +1978,7 @@ fn sys_secprobe(op: usize, addr: usize) -> isize {
 }
 
 fn sys_dbg_serial_write(ptr: usize, len: usize) -> isize {
-    if !sched::cred::current_is_root() { return -1; }
+    if !sched::host_root() { return -1; }
     if !DBG_SERIAL_WRITE { return 0; }
     let n = len.min(256);
     if n == 0 || ptr == 0 { return 0; }
@@ -2497,6 +2499,7 @@ fn dispatch_inner(
         OPENAT2     => sys_openat2(a0, a1, a2, a3),
         CLOSE_RANGE => sys_close_range(a0, a1, a2),
         UNSHARE => sys_unshare(a0),
+        SETNS => sys_setns(a0, a1),
         // tokio (brush's runtime) reaps children through these when
         // pidfd_open succeeds; see sys_pidfd_open.
         PIDFD_OPEN        => sys_pidfd_open(a0, a1),
@@ -2533,14 +2536,14 @@ fn dispatch_inner(
         // caller gets Linux's answer (EPERM — the capability check comes before
         // anything else there), root gets ENOSYS.
         ACCT | VHANGUP | SWAPON | SWAPOFF | KEXEC_LOAD => {
-            if sched::current_euid() != 0 { -1 } else { log_enosys(number) }
+            if !sched::host_root() { -1 } else { log_enosys(number) }
         }
         INIT_MODULE   => crate::kmod::sys::sys_init_module(a0, a1, a2),
         FINIT_MODULE  => crate::kmod::sys::sys_finit_module(a0, a1, a2),
         DELETE_MODULE => crate::kmod::sys::sys_delete_module(a0, a1),
         KEXEC_FILE_LOAD => crate::kexec::sys_kexec_file_load(a0, a1, a2, a3, a4),
         #[cfg(not(target_arch = "aarch64"))]
-        IOPL | IOPERM => if sched::current_euid() != 0 { -1 } else { log_enosys(number) },
+        IOPL | IOPERM => if !sched::host_root() { -1 } else { log_enosys(number) },
         SETHOSTNAME   => sys_setxname(a0, a1, false),
         SETDOMAINNAME => sys_setxname(a0, a1, true),
 
@@ -3741,7 +3744,7 @@ fn sys_mremap(
 ///                   primitive (no exec, no credential setup), so only a
 ///                   privileged server may use it
 fn sys_spawn(entry_va: usize, stack_va: usize, priority_raw: usize) -> isize {
-    if !sched::cred::current_is_root() { return -1; }
+    if !sched::host_root() { return -1; }
     // Reject entries that point into the kernel half of the address space.
     if entry_va == 0 || entry_va >= USER_SPACE_END { return -22; }
     if stack_va  >= USER_SPACE_END                 { return -22; }
@@ -4218,7 +4221,7 @@ fn pidfd_reaped_wake(pid: u32) {
 fn sys_clock_settime(clkid: usize, tp_ptr: usize) -> isize {
     if clkid != CLOCK_REALTIME { return -22; }
     let ns = match read_user_timespec(tp_ptr) { Ok(n) => n, Err(e) => return e };
-    if sched::current_euid() != 0 { return -1; } // EPERM
+    if !sched::host_root() { return -1; } // EPERM
     step_realtime_ns(ns);
     0
 }
@@ -4251,7 +4254,7 @@ fn sys_settimeofday(tv_ptr: usize, _tz_ptr: usize) -> isize {
     let tv_sec  = match sched::uaccess::read_user::<i64>(tv_ptr) { Some(v) => v, None => return -14 };
     let tv_usec = match sched::uaccess::read_user::<i64>(tv_ptr + 8) { Some(v) => v, None => return -14 };
     if tv_sec < 0 || tv_usec < 0 || tv_usec >= 1_000_000 { return -22; }
-    if sched::current_euid() != 0 { return -1; } // EPERM
+    if !sched::host_root() { return -1; } // EPERM
     step_realtime_ns((tv_sec as u64).saturating_mul(1_000_000_000) + (tv_usec as u64) * 1_000);
     0
 }
@@ -5511,7 +5514,7 @@ fn sys_getppid() -> isize {
 /// asks ptrace_may_access).
 fn sys_get_robust_list(tid: usize, head_ptr: usize, len_ptr: usize) -> isize {
     let Ok(tid) = sched::pidns::from_cur(tid as u32) else { return -3 };
-    if tid != 0 && sched::tgid_of(tid) != sched::current_tgid() && sched::current_euid() != 0 {
+    if tid != 0 && sched::tgid_of(tid) != sched::current_tgid() && !sched::host_root() {
         return -1; // EPERM
     }
     let Some(head) = sched::robust::get(tid) else { return -3 }; // ESRCH
@@ -8433,10 +8436,11 @@ fn sys_unshare(flags: usize) -> isize {
     // CLONE_THREAD/SIGHAND/VM: Linux allows them only for a single-threaded
     // caller, where they are no-ops.
     if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && !alone { return -22; }
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP) != 0 { return -22; }
+    if flags & CLONE_NEWNS != 0 { return -22; }
     let flat = flags & (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS);
     if flat != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; } // CAP_SYS_ADMIN
     if flat != 0 && !alone { return -22; }
+    if flags & CLONE_NEWCGROUP != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     if flags & CLONE_NEWUSER != 0 {
         // Linux: a chrooted task may not create a user namespace (EPERM).
         if sched::current_root_arc().is_some() { return -1; }
@@ -8457,6 +8461,11 @@ fn sys_unshare(flags: usize) -> isize {
     }
     if flags & CLONE_NEWUTS != 0 {
         let r = sched::ns::unshare_uts();
+        if r < 0 { return r; }
+    }
+    // After NEWUSER, so the namespace is owned by the new user namespace.
+    if flags & CLONE_NEWCGROUP != 0 {
+        let r = sched::ns::unshare_cgroup();
         if r < 0 { return r; }
     }
     if flags & CLONE_FILES != 0 { let r = fd_unshare_current(); if r < 0 { return r; } }
@@ -9177,7 +9186,7 @@ fn sys_mount(
     const MS_NOSUID:  usize = 2;
     const MS_REMOUNT: usize = 32;
     // Every form of mount(2) needs CAP_SYS_ADMIN (Linux `may_mount`).
-    if sched::current_euid() != 0 { return -1; } // EPERM
+    if !sched::host_root() { return -1; } // EPERM
     // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC):
     // only the mount's propagation state changes; source/fstype are ignored.
     if flags & (vfs::mnt::MS_UNBINDABLE | vfs::mnt::MS_PRIVATE | vfs::mnt::MS_SLAVE | vfs::mnt::MS_SHARED) != 0 {
@@ -9375,7 +9384,7 @@ fn sys_mount(
 }
 
 fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
-    if sched::current_euid() != 0 { return -1; } // EPERM (CAP_SYS_ADMIN)
+    if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
     let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
     // An alias mount (a chroot's /proc, a bind mount) is named by where the
     // caller sees it, i.e. its namespace path.
@@ -9393,7 +9402,7 @@ fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
 }
 
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
-    if sched::current_euid() != 0 { return -1; } // EPERM (CAP_SYS_ADMIN)
+    if !sched::host_root() { return -1; } // EPERM (CAP_SYS_ADMIN)
     let pid = current_pid();
     let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
     let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };
@@ -10018,7 +10027,8 @@ fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, flags: us
 /// exec like the other credentials; consulted by every filesystem permission
 /// check through `xattr::Cred::in_group`.
 fn sys_setgroups(size: usize, list_ptr: usize) -> isize {
-    if sched::ns::setgroups_denied(sched::ns::current_userns()) { return -1; } // EPERM after "deny"
+    let ns = sched::ns::current_userns();
+    if sched::ns::setgroups_denied(ns) || !sched::ns::gid_map_written(ns) { return -1; } // EPERM after "deny" / before gid_map
     if size > xattr::NGROUPS_MAX { return -22; } // EINVAL
     let mut groups = [0u32; xattr::NGROUPS_MAX];
     if size > 0 {
@@ -10794,7 +10804,7 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
             let tgt = sched::tgid_of(pid);
             if tgt != sched::current_tgid() {
                 let c = sched::euid_of(current_pid());
-                if c != 0 && c != sched::euid_of(tgt) { return -13; }
+                if !sched::host_root() && c != sched::euid_of(tgt) { return -13; }
             }
             let mut fd = 0usize;
             for &d in num_str { fd = fd * 10 + (d - b'0') as usize; }
@@ -11012,8 +11022,7 @@ fn proc_ns_link(p: &[u8]) -> Option<(u32, usize)> {
 fn proc_link_allowed(pid: u32) -> bool {
     let tgt = sched::tgid_of(pid);
     if tgt == sched::current_tgid() { return true; }
-    let c = sched::euid_of(current_pid());
-    c == 0 || c == sched::euid_of(tgt)
+    sched::host_root() || sched::euid_of(current_pid()) == sched::euid_of(tgt)
 }
 
 fn proc_magic<'a>(p: &'a [u8], what: &[u8]) -> Option<(u32, &'a [u8])> {
@@ -11621,7 +11630,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     // (0x4C00..) collides with nothing here but the BLK* range (0x12xx) would
     // otherwise have to be enumerated twice — and because an ioctl aimed at a
     // block device must never fall through to the TTY server's ENOTTY.
-    if let Some(vfs::VnodeKind::BlockDev { .. }) = vfs::vfs_get_node_kind(pid, fd) {
+    if let Some(vfs::VnodeKind::BlockDev { .. } | vfs::VnodeKind::NsFd { .. }) = vfs::vfs_get_node_kind(pid, fd) {
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
         return vfs_reply_val(&vfs::handle(&msg, pid));
     }
@@ -12207,7 +12216,7 @@ fn tty_ioctl_bounce(cmd: usize, arg: usize, f: impl FnOnce(usize) -> isize) -> i
 fn sys_timer_create(clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) -> isize {
     match clockid as i32 {
         0 | 1 | 2 | 3 | 7 | 11 => {}
-        8 | 9 => if sched::current_euid() != 0 { return -1; } // EPERM: CAP_WAKE_ALARM
+        8 | 9 => if !sched::host_root() { return -1; } // EPERM: CAP_WAKE_ALARM
         4 | 5 | 6 => return -95, // EOPNOTSUPP
         _ => return -22,
     }
@@ -16373,6 +16382,25 @@ fn sys_pidfd_open(pid: usize, flags: usize) -> isize {
     vfs::install_pidfd(current_pid(), pid_k, flags as u32)
 }
 
+/// setns(fd, nstype): join the namespace an nsfs-like fd (an opened
+/// /proc/<pid>/ns/<name>) names, or, given a pidfd, the namespaces of that
+/// process selected by the CLONE_NEW* mask in `nstype`.
+fn sys_setns(fd: usize, nstype: usize) -> isize {
+    let nstype = nstype as u32 as usize;
+    let me = current_pid();
+    let alone = sched::thread_count(sched::current_tgid()) <= 1;
+    let chrooted = sched::current_root_arc().is_some();
+    match vfs::nsfd_target(me, fd) {
+        Ok((kind, id)) => return sched::ns::setns_fd(kind as usize, id, nstype, alone, chrooted),
+        Err(-9) => return -9,
+        Err(_) => {}
+    }
+    match vfs::pidfd_target(me, fd) {
+        Ok(tgid) => sched::ns::setns_pid(tgid, nstype, alone, chrooted),
+        Err(e) => e as isize,
+    }
+}
+
 /// pidfd_send_signal(pidfd, sig, info, flags): kill(2) / rt_sigqueueinfo(2)
 /// aimed through a pidfd, so the target cannot have been replaced by an
 /// unrelated process. As on Linux, a zombie still accepts (and discards) a
@@ -16545,6 +16573,7 @@ struct CloneReq {
     netns: sched::ns::NsId,
     ipcns: sched::ns::NsId,
     utsns: sched::ns::NsId,
+    cgns: sched::ns::NsId,
     /// CLONE_* flags; the low byte (CSIGNAL) is the signal a new process
     /// sends its parent when it exits (SIGCHLD normally, 0 for none).
     flags: usize,
@@ -16622,7 +16651,7 @@ fn sys_clone_or_fork(
         return -22;
     }
     let pidfd = if flags & CLONE_PIDFD != 0 { ptid } else { 0 };
-    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr)
+    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, cgns: 0 }, frame_ptr)
 }
 
 /// vfork(2): `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` — the child runs on
@@ -16632,7 +16661,7 @@ fn sys_clone_or_fork(
 fn sys_vfork(frame_ptr: usize) -> isize {
     const SIGCHLD: usize = 17;
     do_clone(CloneReq { flags: CLONE_VM | CLONE_VFORK | SIGCHLD, stack: 0, ptid: 0, ctid: 0,
-                        tls: 0, pidfd: 0, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr)
+                        tls: 0, pidfd: 0, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, cgns: 0 }, frame_ptr)
 }
 
 /// clone3(uargs, size): `struct clone_args` translated onto the clone path.
@@ -16711,7 +16740,7 @@ fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
         if want < 1 || want as u32 >= sched::PID_MAX { return -22; }
         // Linux: CAP_CHECKPOINT_RESTORE (or CAP_SYS_ADMIN) in the owning
         // user namespace.
-        if sched::current_euid() != 0 { return -1; }
+        if !sched::host_root() { return -1; }
         Some(want as u32)
     } else { None };
     // Default handlers in the child: what the child of a fork that is about
@@ -16725,7 +16754,7 @@ fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
         if let Err(e) = sched::reserve_pid(p) { return e; }
     }
     let r = do_clone(CloneReq { flags, stack: sp, ptid: parent_tid as usize, ctid: child_tid as usize,
-                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr);
+                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, cgns: 0 }, frame_ptr);
     if let Some(p) = set_tid_pid { sched::release_reserved_pid(p); }
     r
 }
@@ -16744,7 +16773,7 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
 
     // Namespaces: only CLONE_NEWUSER is implemented (nsbox lane L1); every
     // other CLONE_NEW* is refused instead of silently ignored.
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP) != 0 { return -22; }
+    if flags & CLONE_NEWNS != 0 { return -22; }
     // Pid namespaces (lane nspid). Linux copy_process rules: NEWPID excludes
     // CLONE_THREAD/SIGHAND; here also CLONE_VM (the vfork-style arm has no
     // namespace plumbing). A thread or CLONE_PARENT child cannot be placed
@@ -16767,6 +16796,12 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
         if flags & (CLONE_THREAD | CLONE_VM) != 0 { return -22; }
         if flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     }
+    // NEWCGROUP: CAP_SYS_ADMIN in the (possibly new) user namespace; like
+    // NEWNET it cannot be given to a thread or a shared-VM child.
+    if flags & CLONE_NEWCGROUP != 0 {
+        if flags & (CLONE_THREAD | CLONE_VM) != 0 { return -22; }
+        if flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
+    }
     // Linux: CLONE_NEWUSER excludes CLONE_THREAD and CLONE_FS; the vfork-style
     // CLONE_VM arm has no namespace plumbing.
     if flags & CLONE_NEWUSER != 0 && flags & (CLONE_THREAD | CLONE_FS | CLONE_VM) != 0 { return -22; }
@@ -16779,12 +16814,13 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
     } else { None };
     let mut req = req;
     req.userns = new_user.as_ref().map_or(0, |n| n.id());
+    let ns_owner = if new_user.is_some() { req.userns } else { sched::ns::current_userns() };
     let new_pid_ns = if flags & CLONE_NEWPID != 0 {
-        match sched::ns::new_pidns(cur_pidns) { Ok(n) => Some(n), Err(e) => return e }
+        match sched::ns::new_pidns(cur_pidns, ns_owner) { Ok(n) => Some(n), Err(e) => return e }
     } else { None };
     req.pidns = new_pid_ns.as_ref().map_or(0, |n| n.id());
-    let new_net = if flags & CLONE_NEWNET != 0 { match sched::ns::new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
-    let new_ipc = if flags & CLONE_NEWIPC != 0 { match sched::ns::new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let new_net = if flags & CLONE_NEWNET != 0 { match sched::ns::new_flat(ns_owner) { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let new_ipc = if flags & CLONE_NEWIPC != 0 { match sched::ns::new_flat(ns_owner) { Ok(n) => Some(n), Err(e) => return e } } else { None };
     req.netns = new_net.as_ref().map_or(0, |n| n.id());
     req.ipcns = new_ipc.as_ref().map_or(0, |n| n.id());
     let new_uts = if flags & CLONE_NEWUTS != 0 {
@@ -16792,6 +16828,12 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
         match sched::ns::new_uts(sched::ns::utsns_of(current_pid()), owner) { Ok(n) => Some(n), Err(e) => return e }
     } else { None };
     req.utsns = new_uts.as_ref().map_or(0, |n| n.id());
+    // Rooted at the parent's current cgroup, owned by the child's user namespace.
+    let new_cgns = if flags & CLONE_NEWCGROUP != 0 {
+        let owner = if req.userns != 0 { req.userns } else { sched::ns::current_userns() };
+        match sched::ns::new_cgns(sched::cgroup::current(), owner) { Ok(n) => Some(n), Err(e) => return e }
+    } else { None };
+    req.cgns = new_cgns.as_ref().map_or(0, |n| n.id());
 
     let pidfd = if flags & CLONE_PIDFD != 0 {
         if !validate_user_buf(req.pidfd, 4) { return -14; }
@@ -16897,6 +16939,7 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
             netns: req.netns,
             ipcns: req.ipcns,
             utsns: req.utsns,
+            cgns: req.cgns,
         };
         // Duplicate the fd table before the child becomes runnable (see the
         // FORK arm of syscall_dispatch for the SMP race this prevents).
