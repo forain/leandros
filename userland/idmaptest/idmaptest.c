@@ -164,6 +164,57 @@ static void proc_owner_nondumpable(void)
     report("proc_owner_nondumpable", ok);
 }
 
+/* ---- newuidmap_e2e: the setuid shadow helper writes a 2-extent map -------- */
+static int newuidmap_body(void)
+{
+    int a[2], b[2];
+    if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) return 1;
+    pipe(a); pipe(b);
+    pid_t c = fork();
+    if (c == 0) {
+        char x = 0;
+        if (unshare(CLONE_NEWUSER)) { x = 'u'; write(b[1], &x, 1); _exit(1); }
+        prctl(PR_SET_DUMPABLE, 1);
+        write(b[1], &x, 1);
+        read(a[0], &x, 1);
+        _exit(0);
+    }
+    char x; int rc = 0;
+    if (read(b[0], &x, 1) != 1 || x) rc = 2;
+    else {
+        char pid[16];
+        snprintf(pid, sizeof pid, "%d", c);
+        pid_t h = fork();
+        if (h == 0) {
+            execl("/usr/bin/newuidmap", "newuidmap", pid, "0", "1000", "1", "1", "100000", "65536", (char *)NULL);
+            _exit(127);
+        }
+        int st; waitpid(h, &st, 0);
+        if (!WIFEXITED(st) || WEXITSTATUS(st)) rc = 10 + (WIFEXITED(st) ? WEXITSTATUS(st) : 99);
+        else {
+            char p[48], buf[256];
+            snprintf(p, sizeof p, "/proc/%d/uid_map", c);
+            if (slurp_file(p, buf, sizeof buf) < 0 || !strstr(buf, "100000") || !strstr(buf, "65536")) rc = 3;
+        }
+    }
+    write(a[1], "x", 1);
+    waitpid(c, NULL, 0);
+    return rc;
+}
+static void newuidmap_e2e(void)
+{
+    struct stat st;
+    if (stat("/usr/bin/newuidmap", &st)) { skip("newuidmap_e2e", "no /usr/bin/newuidmap"); return; }
+    char cl[1024];
+    if (slurp_file("/proc/cmdline", cl, sizeof cl) < 0 || !strstr(cl, "idmap=test")) { skip("newuidmap_e2e", "needs idmap=test"); return; }
+    pid_t m = fork();
+    if (m == 0) _exit(newuidmap_body());
+    int s; waitpid(m, &s, 0);
+    int rc = WIFEXITED(s) ? WEXITSTATUS(s) : 99;
+    if (rc) printf("newuidmap_e2e rc=%d\n", rc);
+    report("newuidmap_e2e", rc == 0);
+}
+
 /* ---- status_groups_view ------------------------------------------------- */
 static void status_groups_view(void)
 {
@@ -1491,6 +1542,7 @@ int main(int argc, char **argv)
     proc_pid_owner();
     proc_owner_newuser();
     proc_owner_nondumpable();
+    newuidmap_e2e();
     status_groups_view();
     stat_unmapped_65534();
     sigchld_si_uid_view();
