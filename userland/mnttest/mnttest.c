@@ -745,7 +745,6 @@ static int joiner(pid_t target, const char *d, int mode) {
     n = readlink("/proc/self/ns/user", usr0, sizeof usr0 - 1); if (n > 0) usr0[n] = 0;
     if (exists(tx)) return 10; /* must not be visible before the join */
     if (mode == 1) {
-        char b[128]; snprintf(b, sizeof b, "%s/../c", d);
         if (chdir(d) || chroot(d)) return 11;   /* root and cwd inside the old tree */
         if (exists("/bin/mnttest")) return 12;
     }
@@ -776,7 +775,7 @@ static int joiner(pid_t target, const char *d, int mode) {
         close(cpipe[1]); waitpid(kid, NULL, 0);
         return r == -1 && e == EINVAL && !exists(tx) ? 0 : 19;
     }
-    if (setns_(pfd, mode == 4 ? CLONE_NEWNS : CLONE_NEWNS) != 0) return 20;
+    if (setns_(pfd, CLONE_NEWNS) != 0) return 20;
     if (!exists(tx)) return 21;                                  /* sees the child's tmpfs */
     if (!same_link("/proc/self/ns/mnt", np)) return 22;
     n = readlink("/proc/self/ns/pid", pidn, sizeof pidn - 1); if (n > 0) pidn[n] = 0;
@@ -831,7 +830,6 @@ static void setns_mnt_suite(void) {
     report("setns_mnt_pidfd", r == 0);
     /* the fd keeps the namespace alive after its creator exits */
     {
-        int kfd[2]; (void)kfd;
         char np[64]; snprintf(np, sizeof np, "/proc/%d/ns/mnt", (int)t);
         int fd = open(np, O_RDONLY);
         (void)!write(p2c[1], &ch, 1);
