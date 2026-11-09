@@ -16177,6 +16177,10 @@ fn sys_pidfd_send_signal(pidfd: usize, sig: usize, info: usize, flags: usize) ->
         (true, false) => return 0, // zombie: nothing left to signal
         _ => {}
     }
+    // sys_kill / sys_rt_sigqueueinfo take a pid number in the caller's pid
+    // namespace; the pidfd holds a kernel pid. Not visible from here: ESRCH.
+    let pid = sched::pidns::out(pid);
+    if pid == 0 { return -3; }
     if info == 0 { return sys_kill(pid as usize, sig); }
     match sched::uaccess::read_user::<i32>(info) {
         Some(signo) if signo as usize != sig => -22,

@@ -938,16 +938,16 @@ static int ib_byid(void)
     CHECK(c >= 0);
     if (c == 0) {
         struct rlimit r; unsigned long m[16];
-        if (prlimit(1, RLIMIT_NOFILE, 0, &r) != 0) _exit(1);
-        errno = 0; if (getpriority(PRIO_PROCESS, 1) == -1 && errno) _exit(2);
-        if (sched_getaffinity(1, sizeof m, (cpu_set_t *)m) != 0) _exit(3);
+        if (prlimit(1, RLIMIT_NOFILE, 0, &r) != 0) { printf("  byid step %d errno %d\n", 1, errno); _exit(1); }
+        errno = 0; if (getpriority(PRIO_PROCESS, 1) == -1 && errno) { printf("  byid step %d errno %d\n", 2, errno); _exit(2); }
+        if (sched_getaffinity(1, sizeof m, (cpu_set_t *)m) != 0) { printf("  byid step %d errno %d\n", 3, errno); _exit(3); }
         int fd = syscall(SYS_pidfd_open, 1, 0);
-        if (fd < 0) _exit(4);
-        if (syscall(SYS_pidfd_send_signal, fd, 0, 0, 0) != 0) _exit(5);
-        errno = 0; if (prlimit(outer_pid, RLIMIT_NOFILE, 0, &r) != -1 || errno != ESRCH) _exit(6);
-        errno = 0; getpriority(PRIO_PROCESS, outer_pid); if (errno != ESRCH) _exit(7);
-        errno = 0; if (sched_getaffinity(outer_pid, sizeof m, (cpu_set_t *)m) != -1 || errno != ESRCH) _exit(8);
-        errno = 0; if (syscall(SYS_pidfd_open, outer_pid, 0) != -1 || errno != ESRCH) _exit(9);
+        if (fd < 0) { printf("  byid step %d errno %d\n", 4, errno); _exit(4); }
+        if (syscall(SYS_pidfd_send_signal, fd, 0, 0, 0) != 0) { printf("  byid step %d errno %d\n", 5, errno); _exit(5); }
+        errno = 0; if (prlimit(outer_pid, RLIMIT_NOFILE, 0, &r) != -1 || errno != ESRCH) { printf("  byid step %d errno %d\n", 6, errno); _exit(6); }
+        errno = 0; getpriority(PRIO_PROCESS, outer_pid); if (errno != ESRCH) { printf("  byid step %d errno %d\n", 7, errno); _exit(7); }
+        errno = 0; if (sched_getaffinity(outer_pid, sizeof m, (cpu_set_t *)m) != -1 || errno != ESRCH) { printf("  byid step %d errno %d\n", 8, errno); _exit(8); }
+        errno = 0; if (syscall(SYS_pidfd_open, outer_pid, 0) != -1 || errno != ESRCH) { printf("  byid step %d errno %d\n", 9, errno); _exit(9); }
         _exit(0);
     }
     return child_ok(c);
