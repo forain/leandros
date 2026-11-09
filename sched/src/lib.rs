@@ -3684,6 +3684,24 @@ pub fn poll_reply_put_keys(data: &mut [u8], keys: &[u64]) {
 /// overflowed the first cut's 128 and left it unrefined. 1 KiB per task.
 pub const POLL_FP_MAX: usize = 512;
 
+/// Fingerprints (the first ones, index-aligned) that also keep the full
+/// 64-bit key. A 16-bit fingerprint alone lets a key sharing the bloom bit
+/// and the fingerprint wake a parked task falsely (lane wakecatch); narrow
+/// parks fit here, wide ones past this index stay fingerprint-only.
+pub const POLL_FK_MAX: usize = 16;
+
+/// Does `key` match one of the parked interests `fps` (full keys `fks` for
+/// the first `POLL_FK_MAX`)? A hit beyond the full-key range is accepted on
+/// the fingerprint (only ever an extra wake).
+#[inline]
+pub fn fp_has_key(fps: &[u16], fks: &[u64; POLL_FK_MAX], key: u64) -> bool {
+    let fp = poll_key_fp(key);
+    for (i, &f) in fps.iter().enumerate() {
+        if f == fp && (i >= POLL_FK_MAX || fks[i] == key) { return true; }
+    }
+    false
+}
+
 /// The targeted-wake answer of one probe: the bloom `bits` it contributes and,
 /// optionally, up to three exact object keys explaining (some of) those bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3734,6 +3752,7 @@ pub struct PollSet {
     unkeyed: u64,
     nfp:     usize,
     fps:     [u16; POLL_FP_MAX],
+    fks:     [u64; POLL_FK_MAX],
     /// Interests added with / without keys (diagnostics, `gdwake::note_park`).
     n_keyed:   u16,
     n_unkeyed: u16,
@@ -3756,7 +3775,7 @@ const POLL_VETO: usize = 32;
 
 impl PollSet {
     pub const fn new() -> PollSet {
-        PollSet { mask: 0, unkeyed: 0, nfp: 0, fps: [0; POLL_FP_MAX], n_keyed: 0, n_unkeyed: 0,
+        PollSet { mask: 0, unkeyed: 0, nfp: 0, fps: [0; POLL_FP_MAX], fks: [0; POLL_FK_MAX], n_keyed: 0, n_unkeyed: 0,
                   xkeys: [0; POLL_XKEYS], nx: 0, veto: [0; POLL_VETO], nv: 0, xoff: false }
     }
     /// Add one interest's probe answer.
@@ -3806,6 +3825,7 @@ impl PollSet {
             if t.bits & b == 0 { continue; } // inconsistent answer: ignore the key
             if self.nfp < POLL_FP_MAX {
                 self.fps[self.nfp] = poll_key_fp(k);
+                if self.nfp < POLL_FK_MAX { self.fks[self.nfp] = k; }
                 self.nfp += 1;
                 keyed |= b;
             }
@@ -3821,8 +3841,9 @@ impl PollSet {
     pub fn add_key(&mut self, k: u64) {
         let b = poll_key_bit(k);
         if self.nfp >= POLL_FP_MAX { self.add_bits(b); return; }
-        if !self.fps[..self.nfp].contains(&poll_key_fp(k)) {
+        if !fp_has_key(&self.fps[..self.nfp], &self.fks, k) {
             self.fps[self.nfp] = poll_key_fp(k);
+            if self.nfp < POLL_FK_MAX { self.fks[self.nfp] = k; }
             self.nfp += 1;
         }
         self.mask |= b;
@@ -3854,6 +3875,7 @@ impl PollSet {
     /// The bits only keyed interests explain (see `Task::poll_kbits`).
     pub fn kbits(&self) -> u64 { self.mask & !self.unkeyed }
     pub fn fps(&self) -> &[u16] { &self.fps[..self.nfp] }
+    pub fn fks(&self) -> &[u64] { &self.fks[..self.nfp.min(POLL_FK_MAX)] }
 }
 
 /// Phase 1: publish Blocked-on-poll intent while still executing. No deadline
@@ -3940,7 +3962,7 @@ pub fn block_on_poll_prepare_set(deadline: u64, set: &PollSet) {
     } else {
         let (xk, nx) = set.exclusive_keys();
         RUN_QUEUE.lock().block_on_port_until_keyed(pid, POLL_WAIT_CHANNEL, deadline,
-            set.mask(), set.kbits(), set.fps(), &xk[..nx as usize]);
+            set.mask(), set.kbits(), set.fps(), set.fks(), &xk[..nx as usize]);
     }
     if deadline != u64::MAX {
         register_poll_deadline(deadline);
@@ -3959,12 +3981,14 @@ pub fn block_on_poll_prepare_tag(deadline: u64, t: &PollTag) {
         return;
     }
     let mut fps = [0u16; 3];
+    let mut fks = [0u64; 3];
     let mut nfp = 0;
     let mut keyed = 0u64;
     for &k in &t.keys[..(t.n as usize).min(3)] {
         let b = poll_key_bit(k);
         if t.bits & b == 0 { continue; }
         fps[nfp] = poll_key_fp(k);
+        fks[nfp] = k;
         nfp += 1;
         keyed |= b;
     }
@@ -3976,7 +4000,7 @@ pub fn block_on_poll_prepare_tag(deadline: u64, t: &PollTag) {
         RUN_QUEUE.lock().block_on_port_until(pid, POLL_WAIT_CHANNEL, deadline, t.bits);
     } else {
         RUN_QUEUE.lock().block_on_port_until_keyed(pid, POLL_WAIT_CHANNEL, deadline,
-            t.bits, kbits, &fps[..nfp], &[]);
+            t.bits, kbits, &fps[..nfp], &fks[..nfp], &[]);
     }
     if deadline != u64::MAX {
         register_poll_deadline(deadline);
@@ -4129,8 +4153,8 @@ pub fn poll_listen_begin(set: Option<&PollSet>) -> u32 {
     let mut rq = RUN_QUEUE.lock();
     match set {
         Some(s) => { let (xk, nx) = s.exclusive_keys();
-                     rq.listen_begin(pid, s.mask(), s.kbits(), s.fps(), &xk[..nx as usize]) }
-        None    => rq.listen_begin(pid, POLL_TAG_ALL, 0, &[], &[]),
+                     rq.listen_begin(pid, s.mask(), s.kbits(), s.fps(), s.fks(), &xk[..nx as usize]) }
+        None    => rq.listen_begin(pid, POLL_TAG_ALL, 0, &[], &[], &[]),
     }
 }
 
@@ -4155,7 +4179,7 @@ pub fn poll_listen_begin_since(set: &PollSet, epoch: u64) -> (u32, bool) {
     let mut rq = RUN_QUEUE.lock();
     let moved = POLL_WAKE_EPOCH.load(Ordering::SeqCst) != epoch;
     let (xk, nx) = set.exclusive_keys();
-    (rq.listen_begin(pid, set.mask(), set.kbits(), set.fps(), &xk[..nx as usize]), moved)
+    (rq.listen_begin(pid, set.mask(), set.kbits(), set.fps(), set.fks(), &xk[..nx as usize]), moved)
 }
 
 /// Replace the listener's filter with `set`'s (same id) and take the ring.
@@ -4163,7 +4187,7 @@ pub fn poll_listen_begin_since(set: &PollSet, epoch: u64) -> (u32, bool) {
 pub fn poll_listen_update(id: u32, set: &PollSet) -> Option<WakeRing> {
     let pid = current_pid();
     let (xk, nx) = set.exclusive_keys();
-    RUN_QUEUE.lock().listen_update(pid, id, set.mask(), set.kbits(), set.fps(), &xk[..nx as usize])
+    RUN_QUEUE.lock().listen_update(pid, id, set.mask(), set.kbits(), set.fps(), set.fks(), &xk[..nx as usize])
 }
 
 /// Take the ring (`None` when not listening under `id`).

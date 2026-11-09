@@ -781,16 +781,30 @@ pub fn add(mountpoint: &[u8], source: &[u8], fstype: &'static str, device: &[u8]
     let mut t = ALIASES.lock();
     if let Some(a) = t.iter_mut().find(|a| a.mountpoint == mountpoint) {
         if let Some(id) = crate::devpts::inst_of_backing(&a.source) { crate::devpts::destroy(id); }
+        let old = tmpfs_inst_of(&a.source);
         a.source = source.to_vec();
         a.fstype = fstype;
         a.device = device.to_vec();
+        if let Some(n) = tmpfs_inst_of(source) { super::sb_get(n); }
+        drop(t);
+        if let Some(n) = old { super::sb_put(n); }
         return Ok(());
     }
     if t.len() >= MAX_ALIASES { return Err(-28); }
     t.push(Alias { mountpoint: mountpoint.to_vec(), source: source.to_vec(), fstype,
                    device: device.to_vec() });
     ACTIVE.store(t.len(), Ordering::Release);
+    // A mount holds a reference on the tmpfs instance it exposes.
+    if let Some(n) = tmpfs_inst_of(source) { super::sb_get(n); }
     Ok(())
+}
+
+/// The superblock id when `p` names (or lies below) a tmpfs instance root
+/// `/.leandros-sb/tmpfs/<id>`.
+pub fn tmpfs_inst_of(p: &[u8]) -> Option<u32> {
+    let r = p.strip_prefix(b"/.leandros-sb/tmpfs/".as_slice())?;
+    let end = r.iter().position(|&c| c == b'/').unwrap_or(r.len());
+    core::str::from_utf8(&r[..end]).ok()?.parse().ok()
 }
 
 /// Remove the alias mounted exactly at `mountpoint`. False when none is.
@@ -798,11 +812,16 @@ pub fn remove(mountpoint: &[u8]) -> bool {
     let mut t = ALIASES.lock();
     let before = t.len();
     let gone = t.iter().find(|a| a.mountpoint == mountpoint).and_then(|a| crate::devpts::inst_of_backing(&a.source));
+    let tmp_inst = t.iter().find(|a| a.mountpoint == mountpoint).and_then(|a| tmpfs_inst_of(&a.source));
     t.retain(|a| a.mountpoint != mountpoint);
     ACTIVE.store(t.len(), Ordering::Release);
+    let removed = t.len() != before;
+    drop(t);
     // A devpts instance lives as long as its mount.
     if let Some(id) = gone { crate::devpts::destroy(id); }
-    t.len() != before
+    // The last mount of a tmpfs instance frees it.
+    if let Some(n) = tmp_inst { super::sb_put(n); }
+    removed
 }
 
 /// Rewrite a namespace path to the backing path the VFS serves, following
