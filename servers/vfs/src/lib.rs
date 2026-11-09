@@ -7592,11 +7592,11 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         // so every process — the uid-1000 session included — looked like
         // root to anything reading status.
         let (u, g) = sched::cred::ids_of(pid).unwrap_or(([0; 4], [0; 4]));
-        for (label, ids) in [(&b"\nUid:"[..], u), (&b"\nGid:"[..], g)] {
+        for (label, ids, kind) in [(&b"\nUid:"[..], u, 0usize), (&b"\nGid:"[..], g, 1usize)] {
             p = write_lit(buf, p, label);
             for v in ids {
                 p = write_lit(buf, p, b"\t");
-                p = write_u32(buf, p, v);
+                p = write_u32(buf, p, sched::ns::view_id(kind, v));
             }
         }
         // Supplementary groups, as Linux prints them (each followed by a
@@ -13641,6 +13641,9 @@ pub fn write_stat_full_rdev(
     gid:      u32,
     rdev:     u64,
 ) {
+    // Owners as the calling task's user namespace sees them (65534 unmapped).
+    let uid = sched::ns::view_id(0, uid);
+    let gid = sched::ns::view_id(1, gid);
     unsafe {
         // Built in a kernel buffer, then one PAN-safe copy out.
         let mut kb = [0u8; STAT_SIZE];

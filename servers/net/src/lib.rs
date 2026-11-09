@@ -7275,7 +7275,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
     if level == SOL_SOCKET as usize && optname == SO_PEERCRED {
         if optval_ptr == 0 { return err_reply(-14); }
         let cred = unix_peer_cred(pid, fd);
-        if !wr_user(optval_ptr, [cred.pid, cred.uid, cred.gid]) { return err_reply(-14); }
+        if !wr_user(optval_ptr, [cred.pid, sched::ns::view_id(0, cred.uid), sched::ns::view_id(1, cred.gid)]) { return err_reply(-14); }
         if optlen_ptr != 0 && !wr_user(optlen_ptr, 12u32) { return err_reply(-14); }
         return ok_reply();
     }

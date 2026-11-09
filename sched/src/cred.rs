@@ -236,7 +236,7 @@ pub fn set_re_ids(r: u32, e: u32, gid: bool) -> isize {
     let t = match rq.find_pid_mut(pid) { Some(t) => t, None => return ESRCH };
     let before = [t.euid, t.egid, t.fsuid, t.fsgid];
     let old_uids = (t.uid, t.euid, t.suid);
-    let privileged = t.euid == 0; // CAP_SETUID / CAP_SETGID
+    let privileged = crate::setid_priv(t, gid); // CAP_SETUID / CAP_SETGID
     let (or, oe, os) = if gid { (t.gid, t.egid, t.sgid) } else { (t.uid, t.euid, t.suid) };
     let (mut nr, mut ne, mut ns) = (or, oe, os);
     if r != u32::MAX {

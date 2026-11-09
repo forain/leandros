@@ -769,6 +769,111 @@ static int t_netns_isolate_reverse(void)
     return 0;
 }
 
+
+/* ---- nsids: id-changing syscalls and id translation inside a userns ---- */
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <signal.h>
+#define NSF "/tmp/nstest-ids-file"
+
+static int setid_attempts(int uid_before)
+{
+    gid_t gl[1] = { 0 };
+    CHECK(setuid(0) == -1 && setuid(1001) == -1);
+    CHECK(setreuid(1001, 1001) == -1 && setreuid(0, 0) == -1);
+    CHECK(setresuid(1001, 1001, 1001) == -1 && setresuid(0, 0, 0) == -1);
+    syscall(SYS_setfsuid, 1001); syscall(SYS_setfsgid, 1001);
+    CHECK(setgid(0) == -1 && setgid(1001) == -1);
+    CHECK(setregid(0, 0) == -1 && setresgid(0, 0, 0) == -1);
+    CHECK(setgroups(1, gl) == -1);
+    CHECK((int)getuid() == uid_before && (int)geteuid() == uid_before);
+    return 0;
+}
+static int setid_nomap_child(void) { return setid_attempts(65534); }
+static int setid_map_child(void)
+{
+    CHECK(wr("/proc/self/setgroups", "deny") == 0);
+    CHECK(wr("/proc/self/uid_map", "1000 1000 1") == 0);
+    CHECK(wr("/proc/self/gid_map", "1000 1000 1") == 0);
+    return setid_attempts(1000);
+}
+static int t_setid_guard(void)
+{
+    CHECK(drop_to(1000) == 0);
+    CHECK(newuser_child(setid_nomap_child) == 0);
+    CHECK(newuser_child(setid_map_child) == 0);
+    CHECK((int)getuid() == 1000);
+    return 0;
+}
+/* host root in a userns whose only mapped id is 0: other ids are EINVAL */
+static int root_einval_child(void)
+{
+    CHECK(wr("/proc/self/setgroups", "deny") == 0);
+    CHECK(wr("/proc/self/uid_map", "0 0 1") == 0);
+    CHECK(wr("/proc/self/gid_map", "0 0 1") == 0);
+    errno = 0; CHECK(setuid(1000) == -1 && errno == EINVAL);
+    errno = 0; CHECK(setresuid(1000, -1, -1) == -1 && errno == EINVAL);
+    errno = 0; CHECK(setreuid(-1, 1000) == -1 && errno == EINVAL);
+    errno = 0; CHECK(setgid(1000) == -1 && errno == EINVAL);
+    errno = 0; CHECK(setresgid(-1, 1000, -1) == -1 && errno == EINVAL);
+    errno = 0; CHECK(setregid(1000, -1) == -1 && errno == EINVAL);
+    CHECK(setuid(0) == 0 && setgid(0) == 0);       /* mapped id still fine */
+    CHECK(getuid() == 0 && getgid() == 0);
+    return 0;
+}
+static int t_root_einval(void) { return newuser_child(root_einval_child); }
+
+static volatile int got_siuid = -1;
+static void sigh(int s, siginfo_t *si, void *u) { (void)s; (void)u; got_siuid = (int)si->si_uid; }
+static int tr_probe(int want_u, int want_g)
+{
+    struct stat st; struct ucred uc; socklen_t l = sizeof uc; int sv[2];
+    char b[1024];
+    CHECK(stat(NSF, &st) == 0 && (int)st.st_uid == want_u && (int)st.st_gid == want_g);
+    CHECK(lstat(NSF, &st) == 0 && (int)st.st_uid == want_u);
+    int fd = open(NSF, O_RDONLY); CHECK(fd >= 0);
+    CHECK(fstat(fd, &st) == 0 && (int)st.st_uid == want_u && (int)st.st_gid == want_g);
+    close(fd);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    CHECK(getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED, &uc, &l) == 0);
+    CHECK((int)uc.uid == want_u && (int)uc.gid == want_g);
+    int n = rd("/proc/self/status", b, sizeof b);
+    char *u = n > 0 ? strstr(b, "Uid:") : 0;
+    CHECK(u != 0);
+    int a, bb, c, d; CHECK(sscanf(u, "Uid:\t%d\t%d\t%d\t%d", &a, &bb, &c, &d) == 4 && a == want_u && bb == want_u);
+    char *g = strstr(b, "\nGid:"); CHECK(g != 0); g++;
+    CHECK(sscanf(g, "Gid:\t%d\t%d\t%d\t%d", &a, &bb, &c, &d) == 4 && a == want_g);
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = sigh; sa.sa_flags = SA_SIGINFO; sigaction(SIGUSR1, &sa, 0);
+    got_siuid = -1; kill(getpid(), SIGUSR1);
+    CHECK(got_siuid == want_u);
+    return 0;
+}
+static int tr_child(void)
+{
+    CHECK(tr_probe(65534, 65534) == 0);          /* unmapped: overflow ids */
+    CHECK(wr("/proc/self/setgroups", "deny") == 0);
+    CHECK(wr("/proc/self/uid_map", "1000 1000 1") == 0);
+    CHECK(wr("/proc/self/gid_map", "1000 1000 1") == 0);
+    CHECK(tr_probe(1000, 1000) == 0);
+    CHECK(chown(NSF, 1000, 1000) == 0 && chown(NSF, -1, -1) == 0);
+    errno = 0; CHECK(chown(NSF, 1001, -1) == -1 && errno == EINVAL);
+    errno = 0; CHECK(chown(NSF, -1, 1001) == -1 && errno == EINVAL);
+    int fd = open(NSF, O_RDONLY);
+    errno = 0; CHECK(fchown(fd, 0, -1) == -1 && errno == EINVAL);
+    errno = 0; CHECK(fchownat(AT_FDCWD, NSF, 1001, -1, 0) == -1 && errno == EINVAL);
+    close(fd);
+    return 0;
+}
+static int t_id_translate(void)
+{
+    int fd = open(NSF, O_WRONLY | O_CREAT | O_TRUNC, 0666); CHECK(fd >= 0); close(fd);
+    CHECK(chown(NSF, 1000, 1000) == 0 && chmod(NSF, 0666) == 0);
+    CHECK(drop_to(1000) == 0);
+    int r = newuser_child(tr_child);
+    return r;
+}
+
 /* ---- nsnet2: netns captured at socket() ---- */
 static int inet_listener(unsigned port, int *fdout)
 {
@@ -900,6 +1005,7 @@ static int run_userns_cases(void)
         { "pthread_in_pidns", t_pthread_in_pidns }, { "nested", t_nested },
         { "pidns_leak", t_pidns_leak }, { "fork_enomem", t_fork_enomem },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
+        { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
         { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
         { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace },
