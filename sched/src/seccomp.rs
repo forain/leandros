@@ -129,19 +129,20 @@ impl SeccompSlot {
     /// Lock-free: owning thread only.
     pub fn evaluate(&self, d: &SeccompData) -> Option<u32> {
         let h = self.head()?;
-        let mut n = Some(h);
         // Syscalls run with IRQs masked by design (no kernel preemption), so
-        // the whole evaluation does too; open an interrupt window before each
-        // filter of the chain to bound the latency. The decision is still
-        // taken before the syscall runs, and the task cannot migrate (no
-        // preemption), so the per-CPU slot pointer stays valid.
-        let it = core::iter::from_fn(|| {
-            let c = n?;
-            n = c.prev.as_deref();
-            crate::irq_window();
+        // the evaluation does too; open an interrupt window before each
+        // filter and every TICK_INSNS instructions inside one filter to bound
+        // the latency. The chain stays alive meanwhile (the head only ever
+        // gets replaced by a node containing it via `prev`, see module doc)
+        // and the task cannot migrate (no preemption), so the per-CPU slot
+        // pointer stays valid.
+        let mut it = Some(h);
+        let chain = core::iter::from_fn(|| {
+            let c = it?;
+            it = c.prev.as_deref();
             Some(&c.prog)
         });
-        Some(seccomp_bpf::run_stack(it, d))
+        Some(seccomp_bpf::run_stack_ticked(chain, d, &mut || crate::irq_window()))
     }
 }
 
