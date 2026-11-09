@@ -1453,6 +1453,16 @@ fn sock_netns(pid: u32, slot: usize) -> u16 {
         .map(|e| e.netns).unwrap_or_else(|| sched::ns::netns_of(pid))
 }
 
+/// `Some(domain)` when the socket at `slot` is an inet socket (any type, ICMP
+/// included) created in a non-initial netns: nothing may leave through the
+/// host stack for it.
+fn sock_inet_domain_in_netns(pid: u32, slot: usize) -> Option<u8> {
+    SOCK_TABLES.read().iter().find(|t| t.in_use && t.pid == pid)
+        .and_then(|t| t.socks.get(slot)).filter(|e| e.in_use && e.netns != 0)
+        .and_then(|e| if matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) { Some(2) }
+                      else if e.domain == 2 || e.domain == 10 { Some(e.domain) } else { None })
+}
+
 fn fd_to_slot(fd: usize) -> Option<usize> {
     if fd >= SOCK_FD_BASE && fd < SOCK_FD_END { Some(fd - SOCK_FD_BASE) } else { None }
 }
@@ -4609,6 +4619,8 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     let ephemeral = alloc_ephemeral_port(&*tbls, &resv[..nresv]);
     let tbl = find_tbl(pid, &mut *tbls).ok_or(-9i32)?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return Err(-9); }
+    // Backstop: a socket of a non-initial netns never gets a host-stack socket.
+    if tbl.socks[slot].netns != 0 { return Err(-101); }
     let local_addr = match tbl.socks[slot].state {
         SockState::Unbound { .. } => None,
         SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
@@ -5146,10 +5158,17 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                  kdata: Option<alloc::vec::Vec<u8>>) -> Message {
     let len = match kdata { Some(ref d) => d.len(), None => len };
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
-    if addr_ptr != 0 && addrlen >= 2 && sock_netns(pid, slot) != 0 {
-        if let Some(f) = sched::uaccess::read_user::<u16>(addr_ptr) {
-            if f as usize == AF_INET || f as usize == 10 { return err_reply(-101); }
+    // Gate on the SOCKET's own domain and captured netns, never on the user
+    // sa_family (which a sibling thread can flip, or which can simply lie).
+    if let Some(dom) = sock_inet_domain_in_netns(pid, slot) {
+        // Error selection only (Linux: a mismatched family is EAFNOSUPPORT);
+        // the refusal below does not depend on what user memory says.
+        if addr_ptr != 0 && addrlen >= 2 {
+            if let Some(f) = sched::uaccess::read_user::<u16>(addr_ptr) {
+                if f as usize != dom as usize && f as usize != AF_UNSPEC { return err_reply(-97); }
+            }
         }
+        return err_reply(-101);
     }
     // Shared: a send only reads the table (lane ipcfast: the write lock here
     // serialized every send in the system and stalled all readers).
