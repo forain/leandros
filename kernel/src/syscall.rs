@@ -850,6 +850,13 @@ mod nr {
     pub const CLOSE_RANGE:         usize = 436;
     pub const UNSHARE:             usize = 97;
     pub const PIDFD_OPEN:          usize = 434;
+    pub const OPEN_TREE: usize = 428;
+    pub const MOVE_MOUNT: usize = 429;
+    pub const FSOPEN: usize = 430;
+    pub const FSCONFIG: usize = 431;
+    pub const FSMOUNT: usize = 432;
+    pub const FSPICK: usize = 433;
+    pub const MOUNT_SETATTR: usize = 442;
     pub const PIDFD_SEND_SIGNAL:   usize = 424;
     pub const PIDFD_GETFD:         usize = 438;
     pub const RT_SIGTIMEDWAIT:     usize = 137;
@@ -1128,6 +1135,13 @@ mod nr {
     pub const CLOSE_RANGE:         usize = 436;
     pub const UNSHARE:             usize = 272;
     pub const PIDFD_OPEN:          usize = 434;
+    pub const OPEN_TREE: usize = 428;
+    pub const MOVE_MOUNT: usize = 429;
+    pub const FSOPEN: usize = 430;
+    pub const FSCONFIG: usize = 431;
+    pub const FSMOUNT: usize = 432;
+    pub const FSPICK: usize = 433;
+    pub const MOUNT_SETATTR: usize = 442;
     pub const PIDFD_SEND_SIGNAL:   usize = 424;
     pub const PIDFD_GETFD:         usize = 438;
     pub const RT_SIGTIMEDWAIT:     usize = 128;
@@ -2552,6 +2566,11 @@ fn dispatch_inner(
         INOTIFY_INIT1     => sys_inotify_init1(a0),
         INOTIFY_ADD_WATCH => sys_inotify_add_watch(a0, a1, a2),
         INOTIFY_RM_WATCH  => sys_inotify_rm_watch(a0, a1),
+
+        // New mount API (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
+        // mount_setattr): not implemented. Quiet, explicit ENOSYS so callers
+        // (crun, runc, libmount) fall back to mount(2).
+        OPEN_TREE | MOVE_MOUNT | FSOPEN | FSCONFIG | FSMOUNT | FSPICK | MOUNT_SETATTR => -38,
 
         _ => log_enosys(number),
     }
