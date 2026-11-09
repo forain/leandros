@@ -178,8 +178,12 @@ if command -v zig >/dev/null 2>&1; then
     # serrx: framed, ACKed file receiver over the serial console (scripts/pi-serial-push.py).
     echo "[userland] Building nstest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nstest" userland/nstest/nstest.c
+    echo "[userland] Building ovltest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ovltest" userland/ovltest/ovltest.c
     echo "[userland] Building idmaptest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/idmaptest" userland/idmaptest/idmaptest.c
+    echo "[userland] Building cgtest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/cgtest" userland/cgtest/cgtest.c
     echo "[userland] Building serrx (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -Os -s -Wall -o "${OUT}/serrx" userland/serrx/serrx.c
 else
