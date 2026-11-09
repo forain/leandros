@@ -734,6 +734,7 @@ mod nr {
     pub const GETRANDOM:      usize = 278;
     pub const SECCOMP:        usize = 277;
     pub const PRCTL:          usize = 167;
+    pub const PERSONALITY:    usize = 92;
     pub const MADVISE:        usize = 233;
     pub const MSYNC:          usize = 227;
     pub const MLOCK:          usize = 228;
@@ -852,6 +853,13 @@ mod nr {
     pub const CLOSE_RANGE:         usize = 436;
     pub const UNSHARE:             usize = 97;
     pub const PIDFD_OPEN:          usize = 434;
+    pub const OPEN_TREE: usize = 428;
+    pub const MOVE_MOUNT: usize = 429;
+    pub const FSOPEN: usize = 430;
+    pub const FSCONFIG: usize = 431;
+    pub const FSMOUNT: usize = 432;
+    pub const FSPICK: usize = 433;
+    pub const MOUNT_SETATTR: usize = 442;
     pub const PIDFD_SEND_SIGNAL:   usize = 424;
     pub const PIDFD_GETFD:         usize = 438;
     pub const RT_SIGTIMEDWAIT:     usize = 137;
@@ -993,6 +1001,7 @@ mod nr {
     pub const GETRANDOM:      usize = 318;
     pub const SECCOMP:        usize = 317;
     pub const PRCTL:          usize = 157;
+    pub const PERSONALITY:    usize = 135;
     pub const MADVISE:        usize = 28;
     pub const MSYNC:          usize = 26;
     pub const MLOCK:          usize = 149;
@@ -1132,6 +1141,13 @@ mod nr {
     pub const CLOSE_RANGE:         usize = 436;
     pub const UNSHARE:             usize = 272;
     pub const PIDFD_OPEN:          usize = 434;
+    pub const OPEN_TREE: usize = 428;
+    pub const MOVE_MOUNT: usize = 429;
+    pub const FSOPEN: usize = 430;
+    pub const FSCONFIG: usize = 431;
+    pub const FSMOUNT: usize = 432;
+    pub const FSPICK: usize = 433;
+    pub const MOUNT_SETATTR: usize = 442;
     pub const PIDFD_SEND_SIGNAL:   usize = 424;
     pub const PIDFD_GETFD:         usize = 438;
     pub const RT_SIGTIMEDWAIT:     usize = 128;
@@ -2547,6 +2563,7 @@ fn dispatch_inner(
 
         // ── Misc ──────────────────────────────────────────────────────────────
         UNAME      => sys_uname(a0),
+        PERSONALITY => sched::personality(a0 as u32) as isize,
         PRLIMIT64  => sys_prlimit64(a0, a1, a2, a3),
         // Linux exit_group(2) kills every thread in the calling process, not
         // just the caller. `sched::exit_group` owns that sequence (single
@@ -2562,6 +2579,11 @@ fn dispatch_inner(
         INOTIFY_INIT1     => sys_inotify_init1(a0),
         INOTIFY_ADD_WATCH => sys_inotify_add_watch(a0, a1, a2),
         INOTIFY_RM_WATCH  => sys_inotify_rm_watch(a0, a1),
+
+        // New mount API (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
+        // mount_setattr): not implemented. Quiet, explicit ENOSYS so callers
+        // (crun, runc, libmount) fall back to mount(2).
+        OPEN_TREE | MOVE_MOUNT | FSOPEN | FSCONFIG | FSMOUNT | FSPICK | MOUNT_SETATTR => -38,
 
         _ => log_enosys(number),
     }
@@ -4287,7 +4309,26 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
     const PR_SET_MM: usize = 35;
     const PR_SET_PDEATHSIG: usize = 1;
     const PR_GET_PDEATHSIG: usize = 2;
+    const PR_GET_KEEPCAPS: usize = 7;
+    const PR_SET_KEEPCAPS: usize = 8;
+    const PR_GET_SECUREBITS: usize = 27;
+    const PR_SET_SECUREBITS: usize = 28;
+    const PR_SET_CHILD_SUBREAPER: usize = 36;
+    const PR_GET_CHILD_SUBREAPER: usize = 37;
+    const PR_CAP_AMBIENT: usize = 47;
     match option {
+        PR_GET_KEEPCAPS => sched::caps::keepcaps(),
+        PR_SET_KEEPCAPS => sched::caps::set_keepcaps(arg2),
+        PR_GET_SECUREBITS => sched::caps::securebits(),
+        PR_SET_SECUREBITS => sched::caps::set_securebits(arg2 as u64),
+        PR_CAP_AMBIENT => sched::caps::ambient(arg2, a3, a4, a5),
+        PR_SET_CHILD_SUBREAPER => { sched::set_child_subreaper(arg2 != 0); 0 }
+        PR_GET_CHILD_SUBREAPER => {
+            let v = (sched::child_subreaper() as i32).to_ne_bytes();
+            if !validate_user_buf(arg2, 4) { return -14; }
+            if unsafe { sched::uaccess::copy_to_user(arg2, v.as_ptr(), 4) } != 0 { return -14; }
+            0
+        }
         PR_SET_NAME => {
             // Up to 15 bytes of the NUL-terminated user string (Linux
             // truncates silently); shared with /proc/<tid>/comm.
@@ -7778,30 +7819,17 @@ fn tkill_info() -> sched::SigInfo {
 
 // ── Misc syscalls ─────────────────────────────────────────────────────────────
 
-/// Host and NIS domain names (`uname` nodename/domainname), as (bytes, len)
-/// without the NUL — the rest of each 65-byte field is zero-filled by uname.
-static UTS_NAMES: spin::Mutex<(([u8; 64], usize), ([u8; 64], usize))> =
-    spin::Mutex::new((uts_name(b"leandros"), uts_name(b"(none)")));
-
-const fn uts_name(s: &[u8]) -> ([u8; 64], usize) {
-    let mut b = [0u8; 64];
-    let mut i = 0;
-    while i < s.len() { b[i] = s[i]; i += 1; }
-    (b, s.len())
-}
-
 /// sethostname(name, len) / setdomainname(name, len) (`domain`): CAP_SYS_ADMIN
 /// (root) only — EPERM first, as on Linux — and at most 64 bytes (EINVAL).
 fn sys_setxname(name_ptr: usize, len: usize, domain: bool) -> isize {
-    if sched::current_euid() != 0 { return -1; } // EPERM
+    if !sched::ns::uts_admin() { return -1; } // EPERM
     if len > 64 { return -22; } // EINVAL
     if len > 0 && !validate_user_buf(name_ptr, len) { return -14; }
     let mut buf = [0u8; 64];
     if len > 0 {
         if unsafe { sched::uaccess::copy_from_user(buf.as_mut_ptr(), name_ptr, len) } != 0 { return -14; }
     }
-    let mut names = UTS_NAMES.lock();
-    if domain { names.1 = (buf, len); } else { names.0 = (buf, len); }
+    sched::ns::uts_set(domain, &buf[..len]);
     0
 }
 
@@ -7817,7 +7845,7 @@ fn sys_uname(buf_ptr_user: usize) -> isize {
 
 
 
-    let names = UTS_NAMES.lock();
+    let names = sched::ns::uts_names(sched::ns::utsns_of(current_pid()));
     // version: "#1 <build tag>" (crate::BUILD_TAG, set by build-all.sh), so
     // `uname -v` tells which kernel image is running.
     let mut version = [0u8; 65];
@@ -8323,7 +8351,9 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
         // that its private temp directory is its own, and the Claude Code
         // CLI run as a regular user refused /tmp/claude-1000 ("owned by
         // uid 0, expected 1000").
+        // The kernel stat buffer carries kuids; translate here, on the copy out.
         let (uid, gid) = vfs::read_stat_owner(stat_ptr);
+        let (uid, gid) = (sched::ns::view_id(0, uid), sched::ns::view_id(1, gid));
         core::ptr::write_unaligned((statxbuf + 20) as *mut u32, uid);
         core::ptr::write_unaligned((statxbuf + 24) as *mut u32, gid);
         // Timestamps: struct stat keeps (sec, nsec) pairs at 72/88/104 for
@@ -8403,8 +8433,8 @@ fn sys_unshare(flags: usize) -> isize {
     // CLONE_THREAD/SIGHAND/VM: Linux allows them only for a single-threaded
     // caller, where they are no-ops.
     if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && !alone { return -22; }
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS) != 0 { return -22; }
-    let flat = flags & (CLONE_NEWNET | CLONE_NEWIPC);
+    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP) != 0 { return -22; }
+    let flat = flags & (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS);
     if flat != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; } // CAP_SYS_ADMIN
     if flat != 0 && !alone { return -22; }
     if flags & CLONE_NEWUSER != 0 {
@@ -8423,6 +8453,10 @@ fn sys_unshare(flags: usize) -> isize {
     }
     if flat != 0 {
         let r = sched::ns::unshare_flat(flat & CLONE_NEWNET != 0, flat & CLONE_NEWIPC != 0);
+        if r < 0 { return r; }
+    }
+    if flags & CLONE_NEWUTS != 0 {
+        let r = sched::ns::unshare_uts();
         if r < 0 { return r; }
     }
     if flags & CLONE_FILES != 0 { let r = fd_unshare_current(); if r < 0 { return r; } }
@@ -9072,7 +9106,11 @@ fn fstat_into(fd: usize, statbuf_ptr: usize, user_dest: bool) -> isize {
         if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
         let mut kb = [0u64; STAT_SIZE.div_ceil(8)];
         let r = fstat_into(fd, kb.as_mut_ptr() as usize, false);
-        if r >= 0 && unsafe { ua::copy_to_user(statbuf_ptr, kb.as_ptr() as *const u8, STAT_SIZE) } != 0 { return -14; }
+        if r >= 0 {
+            // Kernel buffer carries kuids; translate on the copy to user memory.
+            vfs::translate_stat_owner_for_user(kb.as_mut_ptr() as usize);
+            if unsafe { ua::copy_to_user(statbuf_ptr, kb.as_ptr() as *const u8, STAT_SIZE) } != 0 { return -14; }
+        }
         return r;
     }
     if user_dest {
@@ -9499,7 +9537,11 @@ fn fstatat_into(
         if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
         let mut kb = [0u64; STAT_SIZE.div_ceil(8)];
         let r = fstatat_into(dirfd, path_ptr, kb.as_mut_ptr() as usize, flags, false);
-        if r >= 0 && unsafe { ua::copy_to_user(statbuf_ptr, kb.as_ptr() as *const u8, STAT_SIZE) } != 0 { return -14; }
+        if r >= 0 {
+            // Kernel buffer carries kuids; translate on the copy to user memory.
+            vfs::translate_stat_owner_for_user(kb.as_mut_ptr() as usize);
+            if unsafe { ua::copy_to_user(statbuf_ptr, kb.as_ptr() as *const u8, STAT_SIZE) } != 0 { return -14; }
+        }
         return r;
     }
     if user_dest {
@@ -16397,6 +16439,7 @@ struct CloneReq {
     pidns: sched::ns::NsId,
     netns: sched::ns::NsId,
     ipcns: sched::ns::NsId,
+    utsns: sched::ns::NsId,
     /// CLONE_* flags; the low byte (CSIGNAL) is the signal a new process
     /// sends its parent when it exits (SIGCHLD normally, 0 for none).
     flags: usize,
@@ -16474,7 +16517,7 @@ fn sys_clone_or_fork(
         return -22;
     }
     let pidfd = if flags & CLONE_PIDFD != 0 { ptid } else { 0 };
-    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0 }, frame_ptr)
+    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr)
 }
 
 /// vfork(2): `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` — the child runs on
@@ -16484,7 +16527,7 @@ fn sys_clone_or_fork(
 fn sys_vfork(frame_ptr: usize) -> isize {
     const SIGCHLD: usize = 17;
     do_clone(CloneReq { flags: CLONE_VM | CLONE_VFORK | SIGCHLD, stack: 0, ptid: 0, ctid: 0,
-                        tls: 0, pidfd: 0, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0 }, frame_ptr)
+                        tls: 0, pidfd: 0, set_tid: None, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr)
 }
 
 /// clone3(uargs, size): `struct clone_args` translated onto the clone path.
@@ -16577,7 +16620,7 @@ fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
         if let Err(e) = sched::reserve_pid(p) { return e; }
     }
     let r = do_clone(CloneReq { flags, stack: sp, ptid: parent_tid as usize, ctid: child_tid as usize,
-                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid, userns: 0, pidns: 0, netns: 0, ipcns: 0 }, frame_ptr);
+                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0 }, frame_ptr);
     if let Some(p) = set_tid_pid { sched::release_reserved_pid(p); }
     r
 }
@@ -16596,7 +16639,7 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
 
     // Namespaces: only CLONE_NEWUSER is implemented (nsbox lane L1); every
     // other CLONE_NEW* is refused instead of silently ignored.
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS) != 0 { return -22; }
+    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP) != 0 { return -22; }
     // Pid namespaces (lane nspid). Linux copy_process rules: NEWPID excludes
     // CLONE_THREAD/SIGHAND; here also CLONE_VM (the vfork-style arm has no
     // namespace plumbing). A thread or CLONE_PARENT child cannot be placed
@@ -16615,7 +16658,7 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
     if req.set_tid.is_some() && cur_pidns_child != 0 { return -22; }
     // NEWNET/NEWIPC: need CAP_SYS_ADMIN in the (possibly new) user namespace;
     // a thread or a shared-VM child cannot get its own.
-    if flags & (CLONE_NEWNET | CLONE_NEWIPC) != 0 {
+    if flags & (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS) != 0 {
         if flags & (CLONE_THREAD | CLONE_VM) != 0 { return -22; }
         if flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     }
@@ -16639,6 +16682,11 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
     let new_ipc = if flags & CLONE_NEWIPC != 0 { match sched::ns::new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
     req.netns = new_net.as_ref().map_or(0, |n| n.id());
     req.ipcns = new_ipc.as_ref().map_or(0, |n| n.id());
+    let new_uts = if flags & CLONE_NEWUTS != 0 {
+        let owner = new_user.as_ref().map_or_else(sched::ns::current_userns, |n| n.id());
+        match sched::ns::new_uts(sched::ns::utsns_of(current_pid()), owner) { Ok(n) => Some(n), Err(e) => return e }
+    } else { None };
+    req.utsns = new_uts.as_ref().map_or(0, |n| n.id());
 
     let pidfd = if flags & CLONE_PIDFD != 0 {
         if !validate_user_buf(req.pidfd, 4) { return -14; }
@@ -16742,6 +16790,7 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
             pidns: req.pidns,
             netns: req.netns,
             ipcns: req.ipcns,
+            utsns: req.utsns,
         };
         // Duplicate the fd table before the child becomes runnable (see the
         // FORK arm of syscall_dispatch for the SMP race this prevents).

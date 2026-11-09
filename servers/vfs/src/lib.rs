@@ -4381,6 +4381,7 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/net/if_inet6",  data: b"" },
     RamEntry { path: b"/proc/net/fib_trie",  data: b"Main:\n  +-- 0.0.0.0/0\n" },
     RamEntry { path: b"/proc/sys/kernel/hostname",   data: b"leandros\n" },
+    RamEntry { path: b"/proc/sys/kernel/domainname", data: b"(none)\n" },
     RamEntry { path: b"/proc/sys/kernel/ostype",     data: b"Linux\n" },
     RamEntry { path: b"/proc/sys/kernel/osrelease",  data: b"6.0.0-leandros\n" },
     // pids are never reused here (a monotonic u32), so pid_max reports
@@ -4394,6 +4395,11 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/sys/fs/mqueue/msgsize_default", data: b"8192\n" },
     RamEntry { path: b"/proc/sys/kernel/threads-max", data: b"4096\n" },
     RamEntry { path: b"/proc/sys/vm/overcommit_memory", data: b"0\n" },
+    // Id the kernel shows for an unmapped uid/gid (ns::OVERFLOW_ID), and the
+    // user-namespace limit (ns::NS_MAX - 1 usable). Read-only.
+    RamEntry { path: b"/proc/sys/kernel/overflowuid", data: b"65534\n" },
+    RamEntry { path: b"/proc/sys/kernel/overflowgid", data: b"65534\n" },
+    RamEntry { path: b"/proc/sys/user/max_user_namespaces", data: b"255\n" },
 ];
 const _: () = assert!(sched::runqueue::MAX_TASKS == 4096, "update /proc/sys/kernel/threads-max");
 
@@ -4441,6 +4447,7 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/proc/sys",
     b"/proc/sys/kernel",
     b"/proc/sys/vm",
+    b"/proc/sys/user",
 ];
 
 // ── Server port ───────────────────────────────────────────────────────────────
@@ -6050,6 +6057,20 @@ fn proc_net_open(path: &[u8]) -> Option<VnodeKind> {
 fn gen_proc_system(path: &[u8], root: bool) -> Option<VnodeKind> {
     let mut buf = [0u8; TMP_BUF_SIZE];
     let len = gen_proc_system_content(path, root, &mut buf)?;
+    gen_proc_system_file(&buf, len)
+}
+
+/// `/proc/sys/kernel/{hostname,domainname}` as seen from `pid`'s UTS namespace.
+fn gen_proc_uts(pid: u32, domain: bool) -> Option<VnodeKind> {
+    let (h, d) = sched::ns::uts_names(sched::ns::utsns_of(pid));
+    let (b, l) = if domain { d } else { h };
+    let mut buf = [0u8; TMP_BUF_SIZE];
+    buf[..l].copy_from_slice(&b[..l]);
+    buf[l] = b'\n';
+    gen_proc_system_file(&buf, l + 1)
+}
+
+fn gen_proc_system_file(buf: &[u8; TMP_BUF_SIZE], len: usize) -> Option<VnodeKind> {
     let mut tmp = TMP_FILES.lock();
     let idx = tmp_free_slot(&mut *tmp)?;
     tmp.claim(idx, b"", true);
@@ -7325,6 +7346,44 @@ fn gen_proc_args(pid: u32, environ: bool) -> Option<VnodeKind> {
 
 const PROC_COMM_W: &[u8] = b"/tmp/.proc_comm_";
 const PROC_NSMAP_W: &[u8] = b"/tmp/.proc_nsmap_";
+const PROC_OOM_W: &[u8] = b"/tmp/.proc_oom_";
+
+/// `/proc/<pid|self>/oom_score_adj` -> the process it names.
+fn proc_oom_target(path: &[u8], caller: u32) -> Option<u32> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let who = rest.strip_suffix(b"/oom_score_adj")?;
+    if who == b"self" { return Some(caller); }
+    proc_parse_num(who)
+}
+
+fn oom_text(v: i32, out: &mut [u8; 12]) -> usize {
+    let mut d = [0u8; 10]; let mut k = 0; let mut a = v.unsigned_abs();
+    loop { d[k] = b'0' + (a % 10) as u8; k += 1; a /= 10; if a == 0 { break; } }
+    let mut n = 0;
+    if v < 0 { out[0] = b'-'; n = 1; }
+    while k > 0 { k -= 1; out[n] = d[k]; n += 1; }
+    out[n] = b'\n';
+    n + 1
+}
+
+/// A writable snapshot of `/proc/<pid>/oom_score_adj`; the fake path carries
+/// the pid so `handle_write` can route the digits to `sched::set_oom_score_adj`.
+fn gen_proc_oom_writable(tid: u32) -> Option<VnodeKind> {
+    let mut fake = [0u8; 40];
+    fake[..PROC_OOM_W.len()].copy_from_slice(PROC_OOM_W);
+    let mut n = PROC_OOM_W.len();
+    let mut d = [0u8; 10]; let mut k = 0; let mut v = tid;
+    loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+    while k > 0 { k -= 1; fake[n] = d[k]; n += 1; }
+    let mut data = [0u8; 12];
+    let l = oom_text(sched::oom_score_adj_of(tid).unwrap_or(0), &mut data);
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, &fake[..n]);
+    if !tmp_fill_kernel(&mut tmp, idx, &data[..l]) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
 /// Opener credentials of each writable map file, by tmp-pool slot.
 static NSMAP_OPENERS: Mutex<[Option<sched::ns::Opener>; MAX_TMP_FILES]> = Mutex::new([None; MAX_TMP_FILES]);
 
@@ -7407,6 +7466,11 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
             else if path.ends_with(b"/smaps") { MapsKind::Smaps } else { MapsKind::Maps };
         return gen_proc_maps(pid, kind);
     }
+    if path.ends_with(b"/oom_score_adj") {
+        let mut b = [0u8; 12];
+        let n = oom_text(sched::oom_score_adj_of(pid)?, &mut b);
+        return proc_snapshot(b"/tmp/.proc_oom", &b[..n], false);
+    }
     if path.ends_with(b"/cmdline") || path.ends_with(b"/environ") {
         return gen_proc_args(pid, path.ends_with(b"/environ"));
     }
@@ -7446,7 +7510,7 @@ const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
                                      b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
-                                   b"smaps_rollup", b"environ", b"uid_map", b"gid_map", b"setgroups"];
+                                   b"smaps_rollup", b"environ", b"uid_map", b"gid_map", b"setgroups", b"oom_score_adj"];
 
 /// `/proc/<pid|self>/root` or `/proc/<pid|self>/root/<rest>` → `rest`
 /// (empty for the root itself) when the process is alive. See handle_open.
@@ -7645,7 +7709,7 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
             let mut gl = [0u32; xattr::NGROUPS_MAX];
             let n = sched::groups_of(pid, &mut gl);
             for g in &gl[..n] {
-                p = write_u32(buf, p, *g);
+                p = write_u32(buf, p, sched::ns::view_id(1, *g));
                 p = write_lit(buf, p, b" ");
             }
         }
@@ -7676,7 +7740,7 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         }
         if let Some(c) = sched::caps::caps_of(pid) {
             for (label, v) in [(&b"\nCapInh:\t"[..], c[2]), (&b"\nCapPrm:\t"[..], c[1]),
-                               (&b"\nCapEff:\t"[..], c[0]), (&b"\nCapBnd:\t"[..], c[3])] {
+                               (&b"\nCapEff:\t"[..], c[0]), (&b"\nCapBnd:\t"[..], c[3]), (&b"\nCapAmb:\t"[..], c[4])] {
                 p = write_lit(buf, p, label);
                 let mut hex = [b'0'; 16];
                 for i in 0..16 { hex[i] = b"0123456789abcdef"[(v >> (60 - 4 * i) & 15) as usize]; }
@@ -8218,6 +8282,16 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-23),
             }
+        } else if flags & 0o3 != 0 && proc_oom_target(lookup_path, pid).is_some() {
+            let tpid = proc_oom_target(lookup_path, pid).unwrap();
+            if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
+            if flags & 0o3 == 0o0 { return err_reply(-13); }
+            let me = sched::euid_of(pid);
+            if me != 0 && me != sched::euid_of(tpid) { return err_reply(-13); }
+            match gen_proc_oom_writable(tpid) {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
         } else if flags & 0o3 != 0 && proc_comm_target(lookup_path, pid).is_some() {
             // Open /proc/<tid>/comm for writing: owner (or root) only.
             let tpid = proc_comm_target(lookup_path, pid).unwrap();
@@ -8349,6 +8423,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/thermal" {
             match gen_thermal() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/sys/kernel/hostname" || lookup_path == b"/proc/sys/kernel/domainname" {
+            match gen_proc_uts(pid, lookup_path == b"/proc/sys/kernel/domainname") {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
@@ -9214,6 +9293,28 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 if unsafe { sched::uaccess::copy_raw(data.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
                 let r = sysclass::write(&p[..l], &data[..n]);
                 return if r < 0 { err_reply(r) } else { val_reply(count as u64) };
+            }
+            let oom_tid = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                if e.in_use() && e.ephemeral() && e.path().starts_with(PROC_OOM_W) {
+                    let mut t = 0u32;
+                    for &c in &e.path()[PROC_OOM_W.len()..] { t = t * 10 + (c.wrapping_sub(b'0')) as u32; }
+                    Some(t)
+                } else { None }
+            };
+            if let Some(tid) = oom_tid {
+                let n = count.min(15);
+                let mut b = [0u8; 15];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let mut s = &b[..n];
+                while let Some((&l, r)) = s.split_last() { if l == b'\n' || l == b' ' { s = r } else { break } }
+                let (neg, digs) = match s.first() { Some(b'-') => (true, &s[1..]), _ => (false, s) };
+                if digs.is_empty() || !digs.iter().all(|c| c.is_ascii_digit()) { return err_reply(-22); }
+                let mut v = 0i32;
+                for &c in digs { v = v.saturating_mul(10).saturating_add((c - b'0') as i32); }
+                let r = sched::set_oom_score_adj(pid, tid, if neg { -v } else { v });
+                return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
             }
             if let Some(tid) = comm_tid {
                 let me = sched::euid_of(pid);
@@ -13683,6 +13784,17 @@ pub fn read_stat_owner(stat_ptr: usize) -> (u32, u32) {
     }
 }
 
+/// Rewrite `(st_uid, st_gid)` of a kernel-resident `struct stat` from kuids to
+/// the calling task's user-namespace view (65534 unmapped). Called on the way
+/// to user memory: kernel buffers carry kuids (idmap design H1).
+pub fn translate_stat_owner_for_user(stat_ptr: usize) {
+    let (u, g) = read_stat_owner(stat_ptr);
+    unsafe {
+        ((stat_ptr + ST_UID_OFF) as *mut u32).write_unaligned(sched::ns::view_id(0, u));
+        ((stat_ptr + ST_UID_OFF + 4) as *mut u32).write_unaligned(sched::ns::view_id(1, g));
+    }
+}
+
 /// Synthesise a stable, path-unique inode number.
 ///
 /// tmpfs and the initrd have no real inode numbers, so `st_ino` used to be
@@ -13778,9 +13890,16 @@ pub fn write_stat_full_rdev(
     gid:      u32,
     rdev:     u64,
 ) {
-    // Owners as the calling task's user namespace sees them (65534 unmapped).
-    let uid = sched::ns::view_id(0, uid);
-    let gid = sched::ns::view_id(1, gid);
+    // Kernel buffers carry kuids; translation happens only on the copy to
+    // user memory, as the calling task's user namespace sees them (65534
+    // unmapped). Kernel callers (exec_setid, access checks) read raw kuids.
+    let to_user = sched::uaccess::user_range_ok(stat_ptr, STAT_SIZE);
+    // View translation uses current_userns(): the fill must run on the
+    // caller's own thread (fs ports are direct kernel handlers).
+    debug_assert!(!to_user || sched::current_pid() != 0, "stat fill off the caller's thread");
+    let (uid, gid) = if to_user {
+        (sched::ns::view_id(0, uid), sched::ns::view_id(1, gid))
+    } else { (uid, gid) };
     unsafe {
         // Built in a kernel buffer, then one PAN-safe copy out.
         let mut kb = [0u8; STAT_SIZE];
@@ -14313,7 +14432,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
     if let Some(k) = proc_stat_kind(path) {
         let Some((dir, owner, name)) = k else { return err_reply(-2) };
         let (u, g) = sched::cred::ids_of(owner).map(|(u, g)| (u[1], g[1])).unwrap_or((0, 0));
-        let mode = if dir { 0o040555 } else if name == b"comm" || name == b"uid_map" || name == b"gid_map" || name == b"setgroups" { 0o100644 } else { 0o100444 };
+        let mode = if dir { 0o040555 } else if name == b"comm" || name == b"uid_map" || name == b"gid_map" || name == b"setgroups" || name == b"oom_score_adj" { 0o100644 } else { 0o100444 };
         write_stat_full(stat_ptr, mode, if dir { 2 } else { 1 }, 0, path_ino(path, 7), u, g);
         return ok_reply();
     }
