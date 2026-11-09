@@ -540,7 +540,17 @@ static void hardening_suite(void) {
     pid = fork();
     if (pid == 0) _exit(unshare(CLONE_NEWNS) == 0 ? 0 : 1);
     waitpid(pid, &st, 0);
-    report("dead_ns_reaped_on_wait", in_ns_dying0());
+    /* The task's reference can drop a moment after wait returns on SMP; each
+     * further wait reaps. ns 0 pays nothing meanwhile (MNT_LIVE is already 0). */
+    int reaped = in_ns_dying0();
+    for (k = 0; !reaped && k < 100; k++) {
+        usleep(20000);
+        pid = fork();
+        if (pid == 0) _exit(0);
+        waitpid(pid, &st, 0);
+        reaped = in_ns_dying0();
+    }
+    report("dead_ns_reaped_on_wait", reaped);
 }
 
 int main(int argc, char **argv) {
