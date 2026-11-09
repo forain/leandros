@@ -2804,6 +2804,8 @@ pub enum NiceTarget {
 
 impl NiceTarget {
     pub fn matches(&self, t: &task::Task) -> bool {
+        // Only tasks visible in the caller's pid namespace (Linux skips pid_vnr == 0).
+        if !pidns::is_ancestor_or_eq(pidns::cur(), t.pidns.id()) { return false; }
         match *self {
             NiceTarget::Process(pid) => t.pid  == pid,
             NiceTarget::Pgrp(pgid)   => t.pgid == pgid,

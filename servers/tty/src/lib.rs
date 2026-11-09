@@ -330,12 +330,14 @@ fn jobctl_ioctl(cmd: usize, arg_ptr: usize) -> Option<Message> {
             // Never report "no foreground pgrp": fall back to the caller's
             // own pgid so tcgetpgrp always looks sane during bring-up.
             let fg = if fg == 0 { sched::current_pgid() } else { fg };
-            unsafe { core::ptr::write(arg_ptr as *mut u32, fg); }
+            unsafe { core::ptr::write(arg_ptr as *mut u32, sched::pidns::out(fg)); }
             Some(ok_reply())
         }
         TIOCSPGRP => {
             if arg_ptr == 0 { return Some(err_reply(-14)); }
             let pgid = unsafe { core::ptr::read(arg_ptr as *const u32) };
+            // The pgid is in the caller's pid-namespace view.
+            let pgid = match sched::pidns::arg(pgid) { Ok(k) => k, Err(e) => return Some(err_reply(e as i32)) };
             // tcsetpgrp(3), Linux `tiocspgrp()`: the console must be the
             // caller's controlling terminal (ENOTTY), the new foreground
             // group must be a group of that session (EPERM), and a caller
@@ -370,7 +372,7 @@ fn jobctl_ioctl(cmd: usize, arg_ptr: usize) -> Option<Message> {
         }
         TIOCGSID => {
             if arg_ptr == 0 { return Some(err_reply(-14)); }
-            unsafe { core::ptr::write(arg_ptr as *mut u32, sched::current_sid()); }
+            unsafe { core::ptr::write(arg_ptr as *mut u32, sched::pidns::out(sched::current_sid())); }
             Some(ok_reply())
         }
         _ => None,

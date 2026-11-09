@@ -12043,6 +12043,8 @@ fn sys_timer_create(clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) -> 
             0 | 2 if (1..=64).contains(&signo) => (signo, value, 0),
             4 if (1..=64).contains(&signo) => {
                 let tid = u32::from_ne_bytes(buf[16..20].try_into().unwrap());
+                // The tid is in the caller's pid-namespace view.
+                let Ok(tid) = sched::pidns::from_cur(tid) else { return -22 };
                 // The target must be a live thread of the caller's group.
                 if tid == 0 || !sched::futex_task_exists(tid) || sched::tgid_of(tid) != sched::current_tgid() {
                     return -22;
