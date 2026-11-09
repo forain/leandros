@@ -8500,6 +8500,9 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             let Some((tpid, k)) = r else { return err_reply(-2) };
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
             if flags & 0o3 != 0 { return err_reply(-13); }
+            // PTRACE_MODE_READ_FSCREDS on the target (Linux proc_ns_get_link).
+            let pr = sched::cred::ptrace_read_check(pid, tpid);
+            if pr != 0 { return err_reply(pr); }
             // The fd holds the namespace alive (taken atomically with the read).
             match sched::ns::grab(tpid, k) {
                 Some(id) => VnodeKind::NsFd { kind: k as u8, id },
