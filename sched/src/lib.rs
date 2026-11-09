@@ -29,6 +29,7 @@ pub mod playstat;
 pub mod context;
 pub mod caps;
 pub mod ns;
+pub mod cgroup;
 pub mod pidns;
 pub mod cred;
 pub mod futex;
@@ -7238,6 +7239,7 @@ pub fn fork_admission(new_process: bool) -> isize {
     let rq = RUN_QUEUE.lock();
     if admit_locked(&rq, new_process) != 0 { return -11; }
     let Some(me) = rq.find_pid(pid) else { return 0 };
+    if cgroup::fork_check(me.cgroup) != 0 { return -11; }
     if me.uid == 0 || me.euid == 0 { return 0; }
     let uid = me.uid;
     let limit = rq.find_pid(me.tgid).map_or(task::RLIM_INFINITY, |l| l.rlimits[task::RLIMIT_NPROC][0]);
