@@ -164,13 +164,13 @@ static int body_sigchld(void)
     sa.sa_sigaction = on_chld;
     sa.sa_flags = SA_SIGINFO;
     sigaction(SIGCHLD, &sa, NULL);
+    if (setresgid(0, 0, 0) || setresuid(0, 0, 0)) return 2;   /* ns-root = kuid 100000 */
     pid_t k = fork();
     if (k == 0) _exit(0);
     for (int i = 0; i < 200 && chld_uid == -2; i++) usleep(10000);
     waitpid(k, NULL, 0);
-    /* The child's kuid is 0, unmapped in "0 100000 1" (set*id does not translate
-     * until lane idxlate): the handler must see the overflow id, not 0. */
-    return chld_uid == 65534 ? 0 : 3;
+    /* We are ns-root (kuid 100000): the handler must see 0, not 100000. */
+    return chld_uid == 0 ? 0 : 3;
 }
 static void sigchld_si_uid_view(void) { run_ns_case("sigchld_si_uid_view", body_sigchld); }
 
@@ -774,6 +774,172 @@ static int kuid0_not_nsroot(void)
 
 /* ---- table -------------------------------------------------------------- */
 
+/* ---- idxlate: ids coming in are translated (set*id, chown, setfs*id, groups) ---- */
+
+#define MAP10 "0 100000 10\n"
+static int xup[2], xdn[2];
+static void x_sync(void) { char b = 's'; (void)!write(xup[1], &b, 1); (void)!read(xdn[0], &b, 1); }
+
+/* Child (root, own user ns, maps "0 100000 10" written by us) runs fn, pauses
+ * at x_sync() so check(pid, path) can look from ns 0, then exits. */
+static int run_obs(int (*fn)(void *), int (*check)(pid_t, const char *), const char *path)
+{
+    if (!knob) return SKIP;
+    if (pipe(xup) || pipe(xdn)) return 1;
+    int go; pid_t c = spawn(-1, fn, (void *)path, &go);
+    CHECK(c > 0);
+    close(xup[1]); close(xdn[0]);
+    CHECK(wrp(c, "uid_map", MAP10) == 0);
+    CHECK(wrp(c, "gid_map", MAP10) == 0);
+    (void)!write(go, "g", 1);
+    close(go);
+    char b = 0;
+    int got = read(xup[0], &b, 1) == 1;
+    int rc = got && check ? check(c, path) : 0;
+    (void)!write(xdn[1], "d", 1);
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(got);
+    CHECK(rc == 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 100;
+}
+
+static int c_setuid_down(void *x)
+{
+    (void)x;
+    CHECK(setuid(50) == -1 && errno == EINVAL);        /* unmapped */
+    CHECK(setgid(5) == 0 && setuid(5) == 0);
+    CHECK(getuid() == 5 && geteuid() == 5 && getgid() == 5);
+    x_sync();
+    return 0;
+}
+static int chk_owner_100005(pid_t c, const char *p)
+{
+    char q[64]; struct stat st;
+    (void)p;
+    snprintf(q, sizeof q, "/proc/%d", (int)c);
+    if (stat(q, &st)) return 1;
+    return st.st_uid == 100005 && st.st_gid == 100005 ? 0 : 2;
+}
+static int setuid_maps_down(void) { return run_obs(c_setuid_down, chk_owner_100005, NULL); }
+
+static int c_chown_down(void *x)
+{
+    const char *p = x; struct stat st;
+    int fd = open(p, O_CREAT | O_WRONLY, 0644);
+    CHECK(fd >= 0);
+    CHECK(chown(p, 50, -1) == -1 && errno == EINVAL);
+    CHECK(chown(p, 5, 6) == 0);
+    CHECK(stat(p, &st) == 0 && st.st_uid == 5 && st.st_gid == 6);
+    CHECK(fchown(fd, 7, -1) == 0);
+    CHECK(fstat(fd, &st) == 0 && st.st_uid == 7 && st.st_gid == 6);
+    x_sync();
+    close(fd);
+    return 0;
+}
+static int chk_chown(pid_t c, const char *p)
+{
+    struct stat st; (void)c;
+    if (stat(p, &st)) return 1;
+    return st.st_uid == 100007 && st.st_gid == 100006 ? 0 : 2;
+}
+static int chown_maps_down(void)
+{
+    const char *p = "/tmp/idxlate-chown";
+    unlink(p);
+    int r = run_obs(c_chown_down, chk_chown, p);
+    unlink(p);
+    return r;
+}
+
+static int setfsuid(unsigned u) { return (int)syscall(SYS_setfsuid, u); }
+
+static int c_fsuid(void *x)
+{
+    const char *p = x; struct stat st;
+    CHECK(setfsuid(4) == 65534);                       /* old fsuid: kuid 0, unmapped here */
+    CHECK(setfsuid(6) == 4);                           /* old fsuid as the caller sees it */
+    CHECK(setfsuid(-1) == 6);
+    CHECK(setfsuid(50) == 6);                          /* unmapped: unchanged */
+    CHECK(setfsuid(-1) == 6);
+    int fd = open(p, O_CREAT | O_WRONLY, 0644);
+    CHECK(fd >= 0);
+    CHECK(fstat(fd, &st) == 0 && st.st_uid == 6);
+    x_sync();
+    close(fd);
+    return 0;
+}
+static int chk_fsuid(pid_t c, const char *p)
+{
+    struct stat st; (void)c;
+    if (stat(p, &st)) return 1;
+    return st.st_uid == 100006 ? 0 : 2;
+}
+static int setfsuid_ret_view(void)
+{
+    const char *p = "/tmp/idxlate-fsuid";
+    unlink(p);
+    int r = run_obs(c_fsuid, chk_fsuid, p);
+    unlink(p);
+    return r;
+}
+
+static int c_groups(void *x)
+{
+    gid_t g[4] = { 7, 8 }, o[4];
+    (void)x;
+    CHECK(setgroups(2, g) == 0);
+    CHECK(getgroups(0, NULL) == 2);
+    CHECK(getgroups(4, o) == 2 && o[0] == 7 && o[1] == 8);
+    g[0] = 50;
+    CHECK(setgroups(1, g) == -1 && errno == EINVAL);   /* unmapped */
+    CHECK(getgroups(4, o) == 2 && o[0] == 7 && o[1] == 8);
+    x_sync();
+    return 0;
+}
+static int chk_groups(pid_t c, const char *p)
+{
+    char b[512]; (void)p;
+    if (rdp(c, "status", b, sizeof b) <= 0) return 1;
+    return strstr(b, "100007 100008") ? 0 : 2;
+}
+static int getgroups_view(void) { return run_obs(c_groups, chk_groups, NULL); }
+
+/* No knob needed: an unmapped namespace takes no ids at all. */
+static int c_unmapped_ids(void *x)
+{
+    const char *p = x;
+    int fd = open(p, O_CREAT | O_WRONLY, 0644);
+    CHECK(fd >= 0);
+    close(fd);
+    CHECK(chown(p, 5, -1) == -1 && errno == EINVAL);
+    CHECK(chown(p, -1, 5) == -1 && errno == EINVAL);
+    CHECK(chown(p, -1, -1) == 0);
+    return 0;
+}
+static int chown_unmapped_einval(void)
+{
+    const char *p = "/tmp/idxlate-unmapped";
+    unlink(p);
+    int go; pid_t c = spawn(-1, c_unmapped_ids, (void *)p, &go);   /* no map written */
+    CHECK(c > 0);
+    int r = fin(c, go);
+    unlink(p);
+    return r;
+}
+
+static int c_sg_nomap(void *x)
+{
+    (void)x;
+    CHECK(setgroups(0, NULL) == -1 && errno == EPERM);   /* gid_map not written yet */
+    return 0;
+}
+static int setgroups_needs_gidmap(void)
+{
+    int go; pid_t c = spawn(-1, c_sg_nomap, NULL, &go);
+    CHECK(c > 0);
+    return fin(c, go);
+}
+
 static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "map_identity_still_ok", map_identity_still_ok },
     { "map_overlap_lower_einval", map_overlap_lower_einval },
@@ -789,6 +955,12 @@ static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "nested_view", nested_view },
     { "podman_map_text", podman_map_text },
     { "unpriv_root_map", unpriv_root_map },
+    { "chown_unmapped_einval", chown_unmapped_einval },
+    { "setgroups_needs_gidmap", setgroups_needs_gidmap },
+    { "setuid_maps_down", setuid_maps_down },
+    { "chown_maps_down", chown_maps_down },
+    { "setfsuid_ret_view", setfsuid_ret_view },
+    { "getgroups_view", getgroups_view },
     { "exec_drops_caps_host", exec_drops_caps_host },
     { "exec_nsroot_keeps_caps", exec_nsroot_keeps_caps },
     { "setuid_drops_caps", setuid_drops_caps },
