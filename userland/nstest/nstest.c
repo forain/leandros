@@ -769,6 +769,216 @@ static int t_netns_isolate_reverse(void)
     return 0;
 }
 
+/* ---- pid namespace init semantics (lane nspidinit) ---------------------- */
+#include <sys/resource.h>
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_send_signal
+#define SYS_pidfd_send_signal 424
+#endif
+static pid_t outer_pid;
+static volatile int usr1_cnt;
+static void usr1_h(int s) { (void)s; usr1_cnt++; }
+
+/* init is signalled from inside: SIGTERM/SIGKILL dropped (return 0), init lives. */
+static int ib_ign(void)
+{
+    int p[2]; CHECK(pipe(p) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        CHECK(kill(1, SIGTERM) == 0);
+        CHECK(kill(1, SIGKILL) == 0);
+        char b = 'x'; (void)!write(p[1], &b, 1);
+        _exit(0);
+    }
+    char b = 0;
+    CHECK(read(p[0], &b, 1) == 1 && b == 'x');   /* we survived both signals */
+    return child_ok(c);
+}
+static int ub_init_ignores(void) { return in_init(ib_ign); }
+PCASE(init_ignores_inside, ub_init_ignores)
+
+static int ub_init_kill_outside(void)
+{
+    alarm(10);
+    int a[2], b[2];
+    CHECK(pipe(a) == 0 && pipe(b) == 0);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    pid_t init = fork();
+    CHECK(init >= 0);
+    if (init == 0) {
+        char ch;
+        while (read(a[0], &ch, 1) == 1) (void)!write(b[1], "q", 1);
+        _exit(0);
+    }
+    char ch = 'p';
+    CHECK(kill(init, SIGTERM) == 0);
+    CHECK(write(a[1], &ch, 1) == 1 && read(b[0], &ch, 1) == 1);  /* still alive */
+    CHECK(kill(init, SIGKILL) == 0);
+    int st = 0;
+    CHECK(waitpid(init, &st, 0) == init && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+    return 0;
+}
+PCASE(init_kill_outside, ub_init_kill_outside)
+
+static int ib_handler(void)
+{
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = usr1_h;
+    CHECK(sigaction(SIGUSR1, &sa, 0) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) _exit(kill(1, SIGUSR1) == 0 ? 0 : 1);
+    for (int n = 0; !usr1_cnt && n < 5000; n++) usleep(1000);
+    CHECK(usr1_cnt == 1);
+    return child_ok(c);
+}
+static int ub_init_handler(void) { return in_init(ib_handler); }
+PCASE(init_handler, ub_init_handler)
+
+static int ib_orphan(void)
+{
+    pid_t a = fork();
+    CHECK(a >= 0);
+    if (a == 0) {
+        pid_t b = fork();
+        if (b == 0) {
+            for (int n = 0; getppid() != 1 && n < 5000; n++) usleep(1000);
+            _exit(getppid() == 1 ? 0 : 1);
+        }
+        _exit(b > 0 ? 0 : 2);
+    }
+    int st, got = 0, bad = 0;
+    for (int i = 0; i < 2; i++) {
+        pid_t r = waitpid(-1, &st, 0);
+        if (r > 0) { got++; if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) bad++; }
+    }
+    CHECK(got == 2 && bad == 0);
+    return 0;
+}
+static int ub_orphan(void) { return in_init(ib_orphan); }
+PCASE(orphan_to_init, ub_orphan)
+
+static int ub_init_death(void)
+{
+    alarm(10);
+    int p[2]; CHECK(pipe(p) == 0);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    pid_t init = fork();
+    CHECK(init >= 0);
+    if (init == 0) {
+        pid_t m = fork();
+        if (m == 0) { for (;;) pause(); }
+        usleep(100000);
+        _exit(m > 0 ? 0 : 1);
+    }
+    close(p[1]);
+    int st = 0;
+    CHECK(waitpid(init, &st, 0) == init);
+    char ch;
+    CHECK(read(p[0], &ch, 1) == 0);   /* every member died: EOF */
+    return 0;
+}
+PCASE(init_death_kills, ub_init_death)
+
+static int ib_minus1(void)
+{
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = usr1_h;
+    CHECK(sigaction(SIGUSR1, &sa, 0) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) { (void)kill(-1, SIGUSR1); _exit(0); }
+    CHECK(child_ok(c) == 0);
+    usleep(100000);
+    CHECK(usr1_cnt == 0);
+    return 0;
+}
+static int ub_minus1(void)
+{
+    alarm(10);
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = usr1_h;
+    CHECK(sigaction(SIGUSR1, &sa, 0) == 0);
+    CHECK(unshare(CLONE_NEWPID) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        sa.sa_handler = SIG_DFL; sigaction(SIGUSR1, &sa, 0);
+        _exit(ib_minus1());
+    }
+    CHECK(child_ok(c) == 0);
+    usleep(100000);
+    CHECK(usr1_cnt == 0);
+    return 0;
+}
+PCASE(kill_minus1_scoped, ub_minus1)
+
+static int ib_sidpgid(void)
+{
+    CHECK(setsid() == 1);
+    CHECK(getsid(0) == 1 && getpgid(0) == 1 && getpgrp() == 1);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        if (getpgid(1) != 1 || getsid(1) != 1) _exit(1);
+        if (setpgid(0, 0) != 0 || getpgrp() != getpid()) _exit(2);
+        _exit(0);
+    }
+    return child_ok(c);
+}
+static int ub_sidpgid(void) { return in_init(ib_sidpgid); }
+PCASE(sid_pgid, ub_sidpgid)
+
+static int ib_byid(void)
+{
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        struct rlimit r; unsigned long m[16];
+        if (prlimit(1, RLIMIT_NOFILE, 0, &r) != 0) _exit(1);
+        errno = 0; if (getpriority(PRIO_PROCESS, 1) == -1 && errno) _exit(2);
+        if (sched_getaffinity(1, sizeof m, (cpu_set_t *)m) != 0) _exit(3);
+        int fd = syscall(SYS_pidfd_open, 1, 0);
+        if (fd < 0) _exit(4);
+        if (syscall(SYS_pidfd_send_signal, fd, 0, 0, 0) != 0) _exit(5);
+        errno = 0; if (prlimit(outer_pid, RLIMIT_NOFILE, 0, &r) != -1 || errno != ESRCH) _exit(6);
+        errno = 0; getpriority(PRIO_PROCESS, outer_pid); if (errno != ESRCH) _exit(7);
+        errno = 0; if (sched_getaffinity(outer_pid, sizeof m, (cpu_set_t *)m) != -1 || errno != ESRCH) _exit(8);
+        errno = 0; if (syscall(SYS_pidfd_open, outer_pid, 0) != -1 || errno != ESRCH) _exit(9);
+        _exit(0);
+    }
+    return child_ok(c);
+}
+static int ub_byid(void) { outer_pid = getpid(); return in_init(ib_byid); }
+PCASE(byid_calls, ub_byid)
+
+static int ucred_pid(int fd)
+{
+    struct ucred u; socklen_t l = sizeof u;
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &u, &l) != 0) return -1;
+    return u.pid;
+}
+static int sp_out[2];
+static int ib_peercred(void)
+{
+    int sp[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) _exit(ucred_pid(sp[1]) == 1 && ucred_pid(sp_out[1]) == 0 ? 0 : 1);
+    return child_ok(c);
+}
+static int ub_peercred(void)
+{
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp_out) == 0);
+    return in_init(ib_peercred);
+}
+PCASE(peercred, ub_peercred)
+
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -783,6 +993,10 @@ static int run_userns_cases(void)
         { "wait_inside", t_wait_inside }, { "siginfo_pid", t_siginfo_pid }, { "siginfo_outside", t_siginfo_outside },
         { "pthread_in_pidns", t_pthread_in_pidns }, { "nested", t_nested },
         { "pidns_leak", t_pidns_leak }, { "fork_enomem", t_fork_enomem },
+        { "init_ignores_inside", t_init_ignores_inside }, { "init_kill_outside", t_init_kill_outside },
+        { "init_handler", t_init_handler }, { "orphan_to_init", t_orphan_to_init },
+        { "init_death_kills", t_init_death_kills }, { "kill_minus1_scoped", t_kill_minus1_scoped },
+        { "sid_pgid", t_sid_pgid }, { "byid_calls", t_byid_calls }, { "peercred", t_peercred },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
     };

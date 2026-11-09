@@ -2248,12 +2248,12 @@ fn dispatch_inner(
         GETCWD      => sys_getcwd(a0, a1),
         SETPGID     => sys_setpgid(a0, a1),
         GETPGID     => sys_getpgid(a0),
-        SETSID      => sched::setsid(),
-        GETSID      => sched::cred::sid_of(a0 as u32),
+        SETSID      => { let r = sched::setsid(); if r > 0 { sched::pidns::self_v(r as u32) as isize } else { r } }
+        GETSID      => match sched::pidns::arg(a0 as u32) { Ok(k) => { let r = sched::cred::sid_of(k); if r > 0 { sched::pidns::out(r as u32) as isize } else { r } } Err(e) => e },
         // GETPGRP is an alias for GETPGID(0) on x86-64 but shares the same
         // number as GETPGID on AArch64, so only emit this arm on x86-64.
         #[cfg(target_arch = "x86_64")]
-        GETPGRP     => sched::current_pgid() as isize,
+        GETPGRP     => sched::pidns::out(sched::current_pgid()) as isize,
         SETUID => if sched::set_current_uid(a0 as u32) { 0 } else { -1 }, // EPERM
         SETGID => if sched::set_current_gid(a0 as u32) { 0 } else { -1 }, // EPERM
         SETRESUID => if sched::set_current_resuid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
@@ -7925,6 +7925,14 @@ const PRIO_USER:    usize = 2;
 
 /// Resolve a `(which, who)` pair, where `who == 0` means "the caller's own
 /// process / process group / user".
+/// PRIO_PROCESS / PRIO_PGRP `who` is a pid number in the caller's pid namespace.
+fn nice_who(which: usize, who: usize) -> Result<usize, isize> {
+    if (which == PRIO_PROCESS || which == PRIO_PGRP) && who != 0 {
+        return sched::pidns::arg(who as u32).map(|k| k as usize);
+    }
+    Ok(who)
+}
+
 fn nice_target(which: usize, who: usize) -> Option<sched::NiceTarget> {
     let who = who as u32;
     match which {
@@ -7944,6 +7952,7 @@ fn nice_target(which: usize, who: usize) -> Option<sched::NiceTarget> {
 /// tasks they own; Linux gates the other direction on RLIMIT_NICE/CAP_SYS_NICE,
 /// and root is exempt.
 fn sys_setpriority(which: usize, who: usize, prio: usize) -> isize {
+    let who = match nice_who(which, who) { Ok(w) => w, Err(e) => return e };
     let target = match nice_target(which, who) { Some(t) => t, None => return -22 };
     // `prio` arrives as a sign-extended int; clamping happens in the scheduler.
     let want = ((prio as u32) as i32).clamp(-20, 19) as i8;
@@ -7960,6 +7969,7 @@ fn sys_setpriority(which: usize, who: usize, prio: usize) -> isize {
 /// result of -1 indistinguishable from an error return; the biased form is
 /// 1..40, entirely positive. musl's `getpriority(3)` undoes the bias.
 fn sys_getpriority(which: usize, who: usize) -> isize {
+    let who = match nice_who(which, who) { Ok(w) => w, Err(e) => return e };
     let target = match nice_target(which, who) { Some(t) => t, None => return -22 };
     match sched::get_nice_for(target) {
         Some(nice) => 20 - nice as isize,
@@ -7968,7 +7978,8 @@ fn sys_getpriority(which: usize, who: usize) -> isize {
 }
 
 /// sys_sched_getparam(pid, param_ptr) — fill sched_param with priority 0.
-fn sys_sched_getparam(_pid: usize, param_ptr: usize) -> isize {
+fn sys_sched_getparam(pid: usize, param_ptr: usize) -> isize {
+    if let Err(e) = sched::pidns::arg(pid as u32) { return e; }
     // struct sched_param { int sched_priority; } = 4 bytes
     if param_ptr != 0 && validate_user_buf(param_ptr, 4) {
         unsafe { let _ = sched::uaccess::write_user::<i32>(param_ptr, 0); }
@@ -7987,6 +7998,7 @@ fn sys_sched_getparam(_pid: usize, param_ptr: usize) -> isize {
 /// sched_setaffinity(2): the mask is stored on the thread and read back by
 /// sched_getaffinity; EINVAL when it names no online CPU, as on Linux.
 fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize) -> isize {
+    let pid = match sched::pidns::arg(pid as u32) { Ok(k) => k as usize, Err(e) => return e };
     if (pid as isize) < 0 { return -22; }
     if mask_ptr == 0 { return -14; }
     let bytes = cpusetsize.min(8);
@@ -8012,6 +8024,7 @@ fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize) -> isiz
 }
 
 fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr_user: usize) -> isize {
+    let pid = match sched::pidns::arg(pid as u32) { Ok(k) => k as usize, Err(e) => return e };
     if (pid as isize) < 0 { return -22; }
     let stored = match sched::cred::sched_affinity_of(pid as u32) { Ok(m) => m, Err(e) => return e };
     if mask_ptr_user == 0 { return -14; }
@@ -8200,6 +8213,7 @@ fn sys_capget(hdr_ptr: usize, data_ptr: usize) -> isize {
         Err(e) => return e,
     };
     if pid < 0 { return -22; }
+    let pid = match sched::pidns::arg(pid as u32) { Ok(k) => k as i32, Err(e) => return e };
     if pid != 0 && sched::exists_probe(pid as u32) != 0 { return -3; } // ESRCH
     let c = match sched::caps::caps_of(pid as u32) { Some(c) => c, None => return -3 };
     if data_ptr == 0 { return 0; }
@@ -8469,6 +8483,7 @@ fn sys_prlimit64(
 ) -> isize {
     // struct rlimit64 { rlim_cur: u64, rlim_max: u64 } = 16 bytes
     if (pid as i32) < 0 { return -3; } // ESRCH
+    let pid = match sched::pidns::arg(pid as u32) { Ok(k) => k as usize, Err(e) => return e };
     let new = if new_ptr != 0 {
         if !validate_user_buf(new_ptr, 16) { return -14; }
         match ua::read_user::<[u64; 2]>(new_ptr) { Some(v) => Some(v), None => return -14 }
@@ -8492,6 +8507,7 @@ fn sys_prlimit64(
 /// sched_setscheduler(pid, policy, param) and sched_setparam(pid, param)
 /// (`policy == None`). Admission only — see `sched::cred::sched_policy_check`.
 fn sys_sched_setscheduler(pid: usize, policy: Option<usize>, param_ptr: usize) -> isize {
+    let pid = match sched::pidns::arg(pid as u32) { Ok(k) => k as usize, Err(e) => return e };
     const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
     if (pid as i32) < 0 || param_ptr == 0 { return -22; } // EINVAL
     if !validate_user_buf(param_ptr, 4) { return -14; }
@@ -10502,17 +10518,22 @@ fn sys_chroot(path_ptr: usize) -> isize {
 fn sys_setpgid(pid_raw: usize, pgid_raw: usize) -> isize {
     // Linux rules (own process or own child, same session, no session
     // leaders, target group in the caller's session) — see sched::cred.
-    sched::cred::set_pgid_checked(pid_raw as u32 as i32, pgid_raw as u32 as i32)
+    // Negative values stay negative (EINVAL); nonzero ids are translated.
+    let (mut pid, mut pgid) = (pid_raw as u32 as i32, pgid_raw as u32 as i32);
+    if pid > 0 { match sched::pidns::arg(pid as u32) { Ok(k) => pid = k as i32, Err(e) => return e } }
+    if pgid > 0 { match sched::pidns::arg(pgid as u32) { Ok(k) => pgid = k as i32, Err(e) => return e } }
+    sched::cred::set_pgid_checked(pid, pgid)
 }
 
 fn sys_getpgid(pid_raw: usize) -> isize {
-    if pid_raw == 0 { return sched::current_pgid() as isize; }
+    if pid_raw == 0 { return sched::pidns::out(sched::current_pgid()) as isize; }
+    let pid_raw = match sched::pidns::arg(pid_raw as u32) { Ok(k) => k as usize, Err(e) => return e };
     // Honour the argument. Returning the *caller's* pgid for every pid made
     // getpgid(other) silently wrong, which job control cannot survive: a shell
     // uses it to decide whether a child ever made it into the group it was
     // placed in, and "yes, always" is the one answer that hides the failure.
     match sched::pgid_of(pid_raw as u32) {
-        Some(pgid) => pgid as isize,
+        Some(pgid) => sched::pidns::out(pgid) as isize,
         None       => -3, // ESRCH
     }
 }
@@ -16138,8 +16159,9 @@ fn sys_pidfd_open(pid: usize, flags: usize) -> isize {
     if flags & !PIDFD_NONBLOCK != 0 { return -22; }
     let pid_i = pid as u32 as i32;
     if pid_i <= 0 { return -22; }
-    if let Err(e) = sched::pidfd_target_check(pid_i as u32) { return e; }
-    vfs::install_pidfd(current_pid(), pid_i as u32, flags as u32)
+    let pid_k = match sched::pidns::arg(pid_i as u32) { Ok(k) => k, Err(e) => return e };
+    if let Err(e) = sched::pidfd_target_check(pid_k) { return e; }
+    vfs::install_pidfd(current_pid(), pid_k, flags as u32)
 }
 
 /// pidfd_send_signal(pidfd, sig, info, flags): kill(2) / rt_sigqueueinfo(2)

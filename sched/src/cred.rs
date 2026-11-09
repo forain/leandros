@@ -46,7 +46,10 @@ fn may_signal(c: &Caller, t: &Task, sig: u32) -> bool {
 /// Permission and existence check for a process-directed signal (`kill(pid)`,
 /// `rt_sigqueueinfo`). 0 = allowed, else -ESRCH / -EPERM. `sig == 0` (the
 /// existence probe) is checked like any other signal, as on Linux.
-pub fn kill_check(tgid: Pid, sig: u32) -> isize { kill_check_ns(tgid, sig).0 }
+pub fn kill_check(tgid: Pid, sig: u32) -> isize { let r = kill_check_ns(tgid, sig).0; if r == DROPPED { 0 } else { r } }
+
+/// Internal marker: permitted but silently dropped (namespace init).
+const DROPPED: isize = isize::MIN;
 
 /// `kill_check` plus the target's pid namespace and the caller's (for `si_pid`).
 /// A target outside the caller's namespace subtree does not exist (ESRCH).
@@ -57,7 +60,10 @@ fn kill_check_ns(tgid: Pid, sig: u32) -> (isize, crate::ns::NsId, crate::ns::NsI
         Some(t) if t.pid == t.tgid => {
             let tn = t.pidns.id();
             if !crate::pidns::is_ancestor_or_eq(c.pidns, tn) { return (ESRCH, tn, c.pidns); }
-            (if may_signal(&c, t, sig) { 0 } else { EPERM }, tn, c.pidns)
+            let r = if may_signal(&c, t, sig) { 0 } else { EPERM };
+            // A namespace init without a handler ignores this signal: dropped, success.
+            if r == 0 && sig != 0 && crate::pidns::init_drops(c.pidns, t, sig) { return (DROPPED, tn, c.pidns); }
+            (r, tn, c.pidns)
         }
         _ => (ESRCH, 0, c.pidns),
     }
@@ -66,6 +72,7 @@ fn kill_check_ns(tgid: Pid, sig: u32) -> (isize, crate::ns::NsId, crate::ns::NsI
 /// `kill(pid > 0, sig)`.
 pub fn kill_process(tgid: Pid, sig: u32, info: task::SigInfo) -> isize {
     let (r, tn, sn) = kill_check_ns(tgid, sig);
+    if r == DROPPED { return 0; }
     if r != 0 || sig == 0 { return r; }
     deliver_signal_process(tgid, sig, crate::pidns::fix_info(info, tn, sn))
 }
@@ -83,6 +90,7 @@ pub fn kill_thread(tgid: Option<Pid>, tid: Pid, sig: u32, info: task::SigInfo) -
         if !crate::pidns::is_ancestor_or_eq(c.pidns, t.pidns.id()) { return ESRCH; }
         let owner = rq.find_pid(t.tgid).unwrap_or(t);
         if !may_signal(&c, owner, sig) { return EPERM; }
+        if sig != 0 && crate::pidns::init_drops(c.pidns, owner, sig) { return 0; }
         tn = t.pidns.id();
         sn = c.pidns;
     }
@@ -98,6 +106,7 @@ pub fn kill_pgrp_checked(pgid: Pid, sig: u32, info: task::SigInfo) -> isize {
     let mut targets: alloc::vec::Vec<(Pid, crate::ns::NsId)> = alloc::vec::Vec::new();
     if targets.try_reserve_exact(runqueue::MAX_TASKS).is_err() { return -12; } // ENOMEM
     let mut found = false;
+    let mut dropped = false;
     let mut sn = 0;
     {
         let rq = RUN_QUEUE.lock();
@@ -108,14 +117,16 @@ pub fn kill_pgrp_checked(pgid: Pid, sig: u32, info: task::SigInfo) -> isize {
                 if t.pgid != pgid || t.pid != t.tgid { continue; }
                 if !crate::pidns::is_ancestor_or_eq(c.pidns, t.pidns.id()) { continue; }
                 found = true;
-                if may_signal(&c, t, sig) && targets.len() < targets.capacity() {
+                if may_signal(&c, t, sig) && sig != 0 && crate::pidns::init_drops(c.pidns, t, sig) {
+                    dropped = true;
+                } else if may_signal(&c, t, sig) && targets.len() < targets.capacity() {
                     targets.push((t.pid, t.pidns.id()));
                 }
             }
         }
     }
     if !found { return ESRCH; }
-    if targets.is_empty() { return EPERM; }
+    if targets.is_empty() { return if dropped { 0 } else { EPERM }; }
     if sig != 0 {
         for &(pid, tn) in targets.iter() {
             let _ = deliver_signal_process(pid, sig, crate::pidns::fix_info(info, tn, sn));
@@ -147,7 +158,8 @@ pub fn kill_all_checked(sig: u32, info: task::SigInfo) -> isize {
                 if c.pidns != 0 && t.tgid == crate::ns::pid_init(c.pidns) { continue; }
                 if t.address_space.is_none() || t.state == TaskState::Zombie { continue; }
                 count += 1;
-                if may_signal(&c, t, sig) && targets.len() < targets.capacity() {
+                if may_signal(&c, t, sig) && !(sig != 0 && crate::pidns::init_drops(c.pidns, t, sig))
+                    && targets.len() < targets.capacity() {
                     targets.push((t.pid, t.pidns.id()));
                 }
             }
