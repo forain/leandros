@@ -87,6 +87,11 @@ pub(crate) struct TmpFileEntry {
     /// AF_UNIX bound-socket node; `sock_id` names the net server's listener.
     pub(crate) is_sock:  bool,
     pub(crate) sock_id:  u64,
+    /// mknod(S_IFCHR / S_IFBLK) node: 0 = not a device, 1 = char, 2 = block.
+    /// `rdev` is the Linux `dev_t` (see `makedev`). Opening one is redirected
+    /// to the driver that owns that number (`devnode_open`).
+    pub(crate) devtype:  u8,
+    pub(crate) rdev:     u32,
     pub(crate) mode:     u32, // permission bits (rwxrwxrwx), set at creation from umask
     pub(crate) uid:      u32, // owner, set at creation from the creating task's euid
     pub(crate) gid:      u32, // owner group, set at creation from the creating task's egid
@@ -101,7 +106,7 @@ impl TmpFileEntry {
     const fn empty() -> Self {
         Self { path: alloc::vec::Vec::new(), in_use: false, ephemeral: false, unlinked: false,
                link_to: 0, link: alloc::vec::Vec::new(), len: 0,
-               is_dir: false, is_fifo: false, is_link: false, is_sock: false, sock_id: 0,
+               is_dir: false, is_fifo: false, is_link: false, is_sock: false, sock_id: 0, devtype: 0, rdev: 0,
                mode: 0, uid: 0, gid: 0,
                atime: (0, 0), mtime: (0, 0), ctime: (0, 0) }
     }
