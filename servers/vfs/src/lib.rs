@@ -4374,6 +4374,7 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/net/if_inet6",  data: b"" },
     RamEntry { path: b"/proc/net/fib_trie",  data: b"Main:\n  +-- 0.0.0.0/0\n" },
     RamEntry { path: b"/proc/sys/kernel/hostname",   data: b"leandros\n" },
+    RamEntry { path: b"/proc/sys/kernel/domainname", data: b"(none)\n" },
     RamEntry { path: b"/proc/sys/kernel/ostype",     data: b"Linux\n" },
     RamEntry { path: b"/proc/sys/kernel/osrelease",  data: b"6.0.0-leandros\n" },
     // pids are never reused here (a monotonic u32), so pid_max reports
@@ -4382,6 +4383,11 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/sys/kernel/pid_max",    data: b"4194304\n" },
     RamEntry { path: b"/proc/sys/kernel/threads-max", data: b"4096\n" },
     RamEntry { path: b"/proc/sys/vm/overcommit_memory", data: b"0\n" },
+    // Id the kernel shows for an unmapped uid/gid (ns::OVERFLOW_ID), and the
+    // user-namespace limit (ns::NS_MAX - 1 usable). Read-only.
+    RamEntry { path: b"/proc/sys/kernel/overflowuid", data: b"65534\n" },
+    RamEntry { path: b"/proc/sys/kernel/overflowgid", data: b"65534\n" },
+    RamEntry { path: b"/proc/sys/user/max_user_namespaces", data: b"255\n" },
 ];
 const _: () = assert!(sched::runqueue::MAX_TASKS == 4096, "update /proc/sys/kernel/threads-max");
 
@@ -4428,6 +4434,7 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/proc/sys",
     b"/proc/sys/kernel",
     b"/proc/sys/vm",
+    b"/proc/sys/user",
 ];
 
 // ── Server port ───────────────────────────────────────────────────────────────
@@ -6028,6 +6035,20 @@ fn proc_net_open(path: &[u8]) -> Option<VnodeKind> {
 fn gen_proc_system(path: &[u8], root: bool) -> Option<VnodeKind> {
     let mut buf = [0u8; TMP_BUF_SIZE];
     let len = gen_proc_system_content(path, root, &mut buf)?;
+    gen_proc_system_file(&buf, len)
+}
+
+/// `/proc/sys/kernel/{hostname,domainname}` as seen from `pid`'s UTS namespace.
+fn gen_proc_uts(pid: u32, domain: bool) -> Option<VnodeKind> {
+    let (h, d) = sched::ns::uts_names(sched::ns::utsns_of(pid));
+    let (b, l) = if domain { d } else { h };
+    let mut buf = [0u8; TMP_BUF_SIZE];
+    buf[..l].copy_from_slice(&b[..l]);
+    buf[l] = b'\n';
+    gen_proc_system_file(&buf, l + 1)
+}
+
+fn gen_proc_system_file(buf: &[u8; TMP_BUF_SIZE], len: usize) -> Option<VnodeKind> {
     let mut tmp = TMP_FILES.lock();
     let idx = tmp_free_slot(&mut *tmp)?;
     tmp.claim(idx, b"", true);
@@ -7623,7 +7644,7 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
             let mut gl = [0u32; xattr::NGROUPS_MAX];
             let n = sched::groups_of(pid, &mut gl);
             for g in &gl[..n] {
-                p = write_u32(buf, p, *g);
+                p = write_u32(buf, p, sched::ns::view_id(1, *g));
                 p = write_lit(buf, p, b" ");
             }
         }
@@ -8321,6 +8342,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/thermal" {
             match gen_thermal() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/sys/kernel/hostname" || lookup_path == b"/proc/sys/kernel/domainname" {
+            match gen_proc_uts(pid, lookup_path == b"/proc/sys/kernel/domainname") {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
@@ -13616,6 +13642,17 @@ pub fn read_stat_owner(stat_ptr: usize) -> (u32, u32) {
     }
 }
 
+/// Rewrite `(st_uid, st_gid)` of a kernel-resident `struct stat` from kuids to
+/// the calling task's user-namespace view (65534 unmapped). Called on the way
+/// to user memory: kernel buffers carry kuids (idmap design H1).
+pub fn translate_stat_owner_for_user(stat_ptr: usize) {
+    let (u, g) = read_stat_owner(stat_ptr);
+    unsafe {
+        ((stat_ptr + ST_UID_OFF) as *mut u32).write_unaligned(sched::ns::view_id(0, u));
+        ((stat_ptr + ST_UID_OFF + 4) as *mut u32).write_unaligned(sched::ns::view_id(1, g));
+    }
+}
+
 /// Synthesise a stable, path-unique inode number.
 ///
 /// tmpfs and the initrd have no real inode numbers, so `st_ino` used to be
@@ -13711,9 +13748,16 @@ pub fn write_stat_full_rdev(
     gid:      u32,
     rdev:     u64,
 ) {
-    // Owners as the calling task's user namespace sees them (65534 unmapped).
-    let uid = sched::ns::view_id(0, uid);
-    let gid = sched::ns::view_id(1, gid);
+    // Kernel buffers carry kuids; translation happens only on the copy to
+    // user memory, as the calling task's user namespace sees them (65534
+    // unmapped). Kernel callers (exec_setid, access checks) read raw kuids.
+    let to_user = sched::uaccess::user_range_ok(stat_ptr, STAT_SIZE);
+    // View translation uses current_userns(): the fill must run on the
+    // caller's own thread (fs ports are direct kernel handlers).
+    debug_assert!(!to_user || sched::current_pid() != 0, "stat fill off the caller's thread");
+    let (uid, gid) = if to_user {
+        (sched::ns::view_id(0, uid), sched::ns::view_id(1, gid))
+    } else { (uid, gid) };
     unsafe {
         // Built in a kernel buffer, then one PAN-safe copy out.
         let mut kb = [0u8; STAT_SIZE];

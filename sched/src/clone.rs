@@ -163,11 +163,12 @@ pub struct ForkOpts {
     /// Pre-created cgroup namespace for CLONE_NEWCGROUP (0 = inherit).
     pub cgns: crate::ns::NsId,
     pub ipcns: crate::ns::NsId,
+    pub utsns: crate::ns::NsId,
 }
 
 impl Default for ForkOpts {
     fn default() -> Self {
-        ForkOpts { vfork: false, child_stack: 0, tls: None, exit_signal: 17, set_tid: None, share_fs: false, userns: 0, pidns: 0, netns: 0, ipcns: 0, cgns: 0 }
+        ForkOpts { vfork: false, child_stack: 0, tls: None, exit_signal: 17, set_tid: None, share_fs: false, userns: 0, pidns: 0, netns: 0, ipcns: 0, utsns: 0, cgns: 0 }
     }
 }
 
@@ -406,6 +407,8 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
             .map(|t| (t.caps, t.userns.id())).unwrap_or((crate::caps::ROOT_CAPS, 0));
         let (pnet, pipc) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.netns.id(), t.ipcns.id())).unwrap_or((0, 0));
+        let putsns = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.utsns.id()).unwrap_or(0);
+        let putsns = if opts.utsns != 0 { opts.utsns } else { putsns };
         let (pcg, pcgns) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.cgroup, t.cgns.id())).unwrap_or((0, 0));
         let pcgns = if opts.cgns != 0 { opts.cgns } else { pcgns };
@@ -490,6 +493,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.pidns_child   = crate::ns::NsRef::get(pidns_target);
         child.netns         = crate::ns::NsRef::get(pnet);
         child.ipcns         = crate::ns::NsRef::get(pipc);
+        child.utsns         = crate::ns::NsRef::get(putsns);
         child.cgns          = crate::ns::NsRef::get(pcgns);
         child.cgroup        = pcg;
         child.egid          = egid;
@@ -770,6 +774,7 @@ pub fn clone_thread(
             .map(|t| (t.caps, t.userns.id())).unwrap_or((crate::caps::ROOT_CAPS, 0));
         let (pnet, pipc) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.netns.id(), t.ipcns.id())).unwrap_or((0, 0));
+        let putsns = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.utsns.id()).unwrap_or(0);
         let (pcg, pcgns) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.cgroup, t.cgns.id())).unwrap_or((0, 0));
         let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, heap_start, heap_end,
@@ -874,6 +879,7 @@ pub fn clone_thread(
         child.pidns_child = crate::ns::NsRef::get(pidns_target);
         child.netns      = crate::ns::NsRef::get(pnet);
         child.ipcns      = crate::ns::NsRef::get(pipc);
+        child.utsns      = crate::ns::NsRef::get(putsns);
         child.cgns       = crate::ns::NsRef::get(pcgns);
         child.cgroup     = pcg;
         child.suid       = suid; child.sgid = sgid;

@@ -9144,3 +9144,21 @@ pub mod tryboot_state {
     pub static HOLD_UNTIL: AtomicU64 = AtomicU64::new(0);
     pub static HOLDS: AtomicU64 = AtomicU64::new(0);
 }
+
+// ── Kernel log hook ──────────────────────────────────────────────────────────
+/// Registered by the kernel: writes one already-formatted line to the console
+/// and kernel log. The sched crate has no log facility of its own.
+static LOG_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn register_log_hook(f: fn(&[u8])) {
+    LOG_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Format and emit one line through the registered hook (dropped if none).
+pub(crate) fn klog_line(args: core::fmt::Arguments) {
+    let h = LOG_HOOK.load(Ordering::Acquire);
+    if h == 0 { return; }
+    let f: fn(&[u8]) = unsafe { core::mem::transmute(h) };
+    let s = alloc::fmt::format(args);
+    f(s.as_bytes());
+}

@@ -16,7 +16,7 @@ pub const NS_MAX: usize = 256;
 /// Linux `/proc/sys/user/max_user_namespaces` nesting limit.
 pub const MAX_USERNS_LEVEL: u8 = 32;
 /// Clone/unshare flags the namespace layer accepts so far.
-pub const SUPPORTED: usize = 0x1000_0000 | 0x4000_0000 | 0x0800_0000; // NEWUSER | NEWNET | NEWIPC
+pub const SUPPORTED: usize = 0x1000_0000 | 0x4000_0000 | 0x0800_0000 | 0x0400_0000; // NEWUSER | NEWNET | NEWIPC | NEWUTS
 
 const ZERO32: AtomicU32 = AtomicU32::new(0);
 const ZERO16: AtomicU16 = AtomicU16::new(0);
@@ -131,6 +131,82 @@ pub fn unshare_flat(net: bool, ipc: bool) -> isize {
         }
     };
     drop((o1, o2));
+    0
+}
+
+// ── UTS namespaces ───────────────────────────────────────────────────────────
+
+/// Host and NIS domain names of one UTS namespace (bytes, length) plus the
+/// user namespace that owns it. Slot 0 is the initial namespace.
+#[derive(Clone, Copy)]
+struct UtsNames { host: [u8; 64], hl: usize, dom: [u8; 64], dl: usize, owner: NsId }
+const UTS_INIT: UtsNames = {
+    let mut host = [0u8; 64];
+    let mut dom = [0u8; 64];
+    let (h, d) = (b"leandros", b"(none)");
+    let mut i = 0;
+    while i < h.len() { host[i] = h[i]; i += 1; }
+    i = 0;
+    while i < d.len() { dom[i] = d[i]; i += 1; }
+    UtsNames { host, hl: h.len(), dom, dl: d.len(), owner: 0 }
+};
+static UTS: [spin::Mutex<UtsNames>; NS_MAX] = [const { spin::Mutex::new(UTS_INIT) }; NS_MAX];
+
+/// Create a UTS namespace owned by user namespace `owner`, names copied from `src`.
+pub fn new_uts(src: NsId, owner: NsId) -> Result<NsRef, isize> {
+    let names = *UTS[src as usize].lock();
+    let r = new_flat()?;
+    *UTS[r.0 as usize].lock() = UtsNames { owner, ..names };
+    Ok(r)
+}
+
+/// (host, domain) names of UTS namespace `id`, with their lengths.
+pub fn uts_names(id: NsId) -> (([u8; 64], usize), ([u8; 64], usize)) {
+    let u = *UTS[id as usize].lock();
+    ((u.host, u.hl), (u.dom, u.dl))
+}
+
+/// UTS namespace of `pid` (0 = initial).
+pub fn utsns_of(pid: u32) -> NsId {
+    crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.utsns.id()).unwrap_or(0)
+}
+
+/// Does the caller hold CAP_SYS_ADMIN over its own UTS namespace, i.e. in the
+/// owning user namespace (its own, or an ancestor of the owner)?
+pub fn uts_admin() -> bool {
+    let (caps, mut u, uts) = match crate::RUN_QUEUE.lock().find_pid(crate::current_pid()) {
+        Some(t) => (t.caps[0], t.userns.id(), t.utsns.id()),
+        None => return false,
+    };
+    if caps >> 21 & 1 == 0 { return false; }
+    let mut o = UTS[uts as usize].lock().owner;
+    loop {
+        if o == u { return true; }
+        if o == 0 { return false; }
+        o = parent(o);
+    }
+}
+
+/// sethostname / setdomainname for the caller's UTS namespace.
+pub fn uts_set(domain: bool, name: &[u8]) {
+    let uts = utsns_of(crate::current_pid());
+    let mut u = UTS[uts as usize].lock();
+    let mut b = [0u8; 64];
+    b[..name.len()].copy_from_slice(name);
+    if domain { u.dom = b; u.dl = name.len(); } else { u.host = b; u.hl = name.len(); }
+}
+
+/// unshare(CLONE_NEWUTS): the caller moves into a copy of its UTS namespace
+/// owned by its (possibly just created) user namespace. 0 or a negative errno.
+pub fn unshare_uts() -> isize {
+    let pid = crate::current_pid();
+    let owner = userns_of(pid);
+    let n = match new_uts(utsns_of(pid), owner) { Ok(n) => n, Err(e) => return e };
+    let old = {
+        let mut rq = crate::RUN_QUEUE.lock();
+        match rq.find_pid_mut(pid) { Some(t) => core::mem::replace(&mut t.utsns, n), None => return -3 }
+    };
+    drop(old);
     0
 }
 
@@ -430,6 +506,7 @@ pub fn ns_id_of(pid: u32, kind: usize) -> NsId {
         0 => userns_of(pid), 2 => netns_of(pid), 3 => ipcns_of(pid),
         1 => crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.pidns.id()).unwrap_or(0),
         7 => crate::RUN_QUEUE.lock().find_pid(pid).map(|t| t.pidns_child.id()).unwrap_or(0),
+        5 => utsns_of(pid),
         _ => 0,
     }
 }
