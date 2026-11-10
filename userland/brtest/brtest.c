@@ -839,6 +839,7 @@ static int route_default(int s, int oif, const char *gw) {
     nl_attr(&m, RTA_GATEWAY, &g, 4); nl_attr(&m, RTA_OIF, &oif, 4);
     return nl_do(s, &m);
 }
+static const unsigned char VICTIM_MAC[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0xaa };
 static int g_fwd_mode; /* 0 = UDP DNS query, 1 = ping the QEMU gateway; expect success */
 static int g_fwd_expect = 1;
 static void fwd_resolver(char *out) {
@@ -898,9 +899,7 @@ static int tcp_conn(const char *ip, int port) {
     if (connect(fd, (struct sockaddr *)&to, sizeof to)) { close(fd); return -1; }
     return fd;
 }
-static int tcp_dns_c(const char *srv) {
-    int fd = tcp_conn(srv, 53);
-    if (fd < 0) return 0;
+static int tcp_dns_fd(int fd) {
     unsigned char q[] = { 0, 29, 0x4c, 0x45, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
                           7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0, 0, 1, 0, 1 };
     int ok = 0;
@@ -914,6 +913,12 @@ static int tcp_dns_c(const char *srv) {
         }
         ok = got >= 14 && got >= want && rb[2] == 0x4c && rb[3] == 0x45 && (rb[4] & 0x80);
     }
+    return ok;
+}
+static int tcp_dns_c(const char *srv) {
+    int fd = tcp_conn(srv, 53);
+    if (fd < 0) return 0;
+    int ok = tcp_dns_fd(fd);
     close(fd);
     return ok;
 }
@@ -958,6 +963,7 @@ static int fwd_body(void) {
     g_ip = "10.97.0.2";
     int s = nl_sock();
     int idx = link_get(s, "eth0", NULL, NULL);
+    if (g_fwd_mode >= 6) link_set_mac(s, idx, VICTIM_MAC);
     if (!idx || addr_add(s, idx, g_ip, 24) || link_set_up(s, idx)) return 1;
     int lo = link_get(s, "lo", NULL, NULL); link_set_up(s, lo);
     if (route_default(s, idx, "10.97.0.1")) return 2;
@@ -971,6 +977,15 @@ static int fwd_body(void) {
         ok = tcp_dns_c(srv);
         if (ok && g_http) ok = http_get(g_http);
     }
+    else if (g_fwd_mode >= 6) { /* hold a flow; after the attacker acted, the same connection must still work */
+        char srv[64]; fwd_resolver(srv);
+        int fd = tcp_conn(srv, 53);
+        if (fd < 0) return 9;
+        write(done_[1], &ch, 1);
+        rd_to(ctl[0], &ch);
+        ok = tcp_dns_fd(fd);
+        close(fd);
+    }
     else if (g_fwd_mode >= 4) { /* hold an established TCP flow open until released */
         char srv[64]; fwd_resolver(srv);
         int fd = tcp_conn(srv, 53);
@@ -982,6 +997,15 @@ static int fwd_body(void) {
     }
     else { char gw[32]; fwd_gateway(gw); ok = icmp_ping(gw); }
     return ok == g_fwd_expect ? 0 : 4 + ok;
+}
+/* Attacker netns: takes the victim's MAC and the victim-network address, then pings the bridge to get learned. */
+static int spoof_body(void) {
+    int s = nl_sock();
+    int idx = link_get(s, "eth0", NULL, NULL);
+    if (!idx || link_set_mac(s, idx, VICTIM_MAC) || addr_add(s, idx, "10.97.0.3", 24) || link_set_up(s, idx)) return 1;
+    int ok = icmp_ping("10.97.0.1");
+    char ch = 'r'; write(done_[1], &ch, 1);
+    return ok ? 0 : 2;
 }
 static int ip_forward_set(int on) {
     int fd = open("/proc/sys/net/ipv4/ip_forward", O_WRONLY);
@@ -1025,6 +1049,34 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
             snprintf(msg, sizeof msg, "%s: host bind() to the in-use NAT port gets EADDRINUSE (port %d)", name, natp);
             CHECK(msg, natp > 0);
             write(cc[1], &ch, 1);
+        } else if (mode >= 6) {
+            /* attacker B: own netns, veth with the victim's MAC, then act (6: delete it, 7: join br0 and get learned) */
+            int bc[2] = { ctl[0], ctl[1] };
+            (void)bc;
+            pid_t b = spawn_ns(mode == 7 ? spoof_body : idle_body);
+            int bcc[2] = { ctl[0], ctl[1] }, bdd[2] = { done_[0], done_[1] };
+            snprintf(msg, sizeof msg, "%s: attacker netns spawned", name); CHECK(msg, b > 0);
+            int fb = b > 0 ? netns_fd_of(b) : -1;
+            int mst = mode == 7 ? bidx : 0;
+            int vr = veth_new_m(s, "vethB", "eth0", fb, mst);
+            if (fb >= 0) close(fb);
+            int ib = link_get(s, "vethB", NULL, NULL);
+            snprintf(msg, sizeof msg, "%s: attacker veth created", name); CHECK(msg, vr == 0 && ib > 0);
+            if (mode == 6) {
+                link_set_mac(s, ib, VICTIM_MAC);
+                link_del(s, ib);
+                snprintf(msg, sizeof msg, "%s: attacker veth deleted", name); CHECK(msg, gone_within(s, "vethB", 3000));
+                usleep(300000);
+            } else {
+                link_set_up(s, ib);
+                write(bcc[1], &ch, 1);
+                snprintf(msg, sizeof msg, "%s: attacker (victim MAC) pinged br0", name); CHECK(msg, rd_to(bdd[0], &ch) == 1);
+                usleep(200000);
+            }
+            write(cc[1], &ch, 1);   /* victim: query on its held flow */
+            int brc = 0;
+            if (b > 0) { kill(b, SIGKILL); brc = wait_child(b); }
+            (void)brc;
         } else kill(c, SIGKILL);
     }
     int rc = wait_child(c);
@@ -1037,6 +1089,8 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     }
     printf("%s child exit %d\n", name, rc);
     if (mode == 2) snprintf(msg, sizeof msg, "%s: TCP DNS query to the resolver%s is answered through NAT", name, g_http ? " and an HTTP GET" : "");
+    else if (mode == 6) snprintf(msg, sizeof msg, "%s: victim flow survives another netns deleting a link with its MAC", name);
+    else if (mode == 7) snprintf(msg, sizeof msg, "%s: spoofed MAC does not steal the victim's return traffic", name);
     else if (mode >= 4) snprintf(msg, sizeof msg, "%s: flow holder exited cleanly", name);
     else if (mode == 0 && ipfwd) snprintf(msg, sizeof msg, "%s: UDP DNS query to the resolver is answered through NAT", name);
     else if (mode == 1 && ipfwd) snprintf(msg, sizeof msg, "%s: ICMP echo to the default gateway is answered through NAT", name);
@@ -1052,6 +1106,8 @@ static void fwd_ping(void) { fwd_case("fwd_ping", 1, 1); }
 static void fwd_off(void) { fwd_case("fwd_off", 0, 0); }
 static void fwd_tcp(void) { fwd_case("fwd_tcp", 2, 1); }
 static void fwd_port_reserved(void) { fwd_case("fwd_port_reserved", 4, 1); }
+static void fwd_mac_forge(void) { fwd_case("fwd_mac_forge", 6, 1); }
+static void fwd_mac_steal(void) { fwd_case("fwd_mac_steal", 7, 1); }
 static void fwd_reap(void) { fwd_case("fwd_reap", 5, 1); }
 
 int main(int argc, char **argv) {
@@ -1075,6 +1131,8 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "fwd_tcp")) fwd_tcp();
     if (!only || !strcmp(only, "fwd_port_reserved")) fwd_port_reserved();
     if (!only || !strcmp(only, "fwd_reap")) fwd_reap();
+    if (!only || !strcmp(only, "fwd_mac_forge")) fwd_mac_forge();
+    if (!only || !strcmp(only, "fwd_mac_steal")) fwd_mac_steal();
     printf("brtest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
