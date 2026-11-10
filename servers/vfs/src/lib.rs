@@ -5151,6 +5151,8 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
        || path == b"/run" || path.starts_with(b"/run/")
        // Namespace tmpfs instances (hidden pool).
        || path == TMPFS_INST_PARENT || path == TMPFS_INST_DIR || path.starts_with(b"/.leandros-sb/tmpfs/")
+       // Bind-mounted nsfs files (`alias::NS_SRC`).
+       || path.starts_with(alias::NS_SRC)
        // Only the synthesized `/sys/class/block` subtree. Like /proc it is not
        // a mount and must be intercepted before `find_mount_port()`, which
        // matches every absolute path once init has pivot_root'ed the F2FS
@@ -6171,6 +6173,7 @@ pub(crate) fn ns0_mountpoints() -> Vec<Vec<u8>> {
     for r in TMPFS_ROOTS.iter() { v.push(r.to_vec()); }
     for p in [&b"/proc"[..], b"/dev", b"/dev/pts", b"/sys"] { v.push(p.to_vec()); }
     for (mp, ..) in alias::entries() { v.push(mp); }
+    for mp in alias::self_binds() { v.push(mp); }
     v.sort(); v.dedup();
     v
 }
@@ -8840,6 +8843,12 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-23),
             }
+        } else if let Some((k, id)) = alias::ns_src(lookup_path) {
+            // A bind-mounted nsfs file (`ip netns add`, netavark): the mount
+            // holds the namespace, each open takes its own reference.
+            if flags & 0o3 != 0 { return err_reply(-13); }
+            sched::ns::hold_raw(id);
+            VnodeKind::NsFd { kind: k, id }
         } else if let Some(r) = proc_ns_file(lookup_path, pid) {
             // /proc/<pid>/ns/<name> followed: an empty nsfs-like file.
             let Some((tpid, k)) = r else { return err_reply(-2) };
@@ -12136,6 +12145,27 @@ pub fn pidfd_target(pid: u32, fd: usize) -> Result<u32, i32> {
         VnodeKind::PidFd { pid } => Ok(pid),
         _ => Err(-22),
     }
+}
+
+pub(crate) fn sched_ns_put(id: u16) { sched::ns::put_raw(id); }
+
+/// bind(2)-style mount of /proc/<pid>/ns/<name>: take a reference on that
+/// namespace and return the synthetic source the alias mount stands for
+/// (see `mnt::ns0::NS_SRC`). `Ok(None)` when `path` is not an nsfs file.
+pub fn nsfs_bind_source(path: &[u8], caller: u32) -> Result<Option<Vec<u8>>, isize> {
+    let Some(r) = proc_ns_file(path, caller) else { return Ok(None) };
+    let Some((tpid, k)) = r else { return Err(-2) };
+    let pr = sched::cred::ptrace_read_check(caller, tpid);
+    if pr != 0 { return Err(pr as isize); }
+    let Some(id) = sched::ns::grab(tpid, k) else { return Err(-2) };
+    let mut v = alias::NS_SRC.to_vec();
+    push_dec(&mut v, k as u32); v.push(b'/'); push_dec(&mut v, id as u32);
+    Ok(Some(v))
+}
+fn push_dec(v: &mut Vec<u8>, mut n: u32) {
+    let mut d = [0u8; 10]; let mut i = 0;
+    loop { d[i] = b'0' + (n % 10) as u8; i += 1; n /= 10; if n == 0 { break; } }
+    while i > 0 { i -= 1; v.push(d[i]); }
 }
 
 /// The namespace an nsfs-like fd names: `Ok((kind, id))`, `Err(-9)` closed,

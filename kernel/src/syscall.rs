@@ -8520,7 +8520,7 @@ fn sys_unshare(flags: usize) -> isize {
     if flags & CLONE_NEWNS != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     let flat = flags & (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS);
     if flat != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; } // CAP_SYS_ADMIN
-    if flat != 0 && !alone { return -22; }
+    // Linux allows these from a multithreaded caller: the namespace is per thread (Go's LockOSThread + unshare).
     if flags & CLONE_NEWCGROUP != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     if flags & CLONE_NEWUSER != 0 {
         // Linux: a chrooted task may not create a user namespace (EPERM).
@@ -9358,6 +9358,24 @@ fn sys_mount(
     };
     let alias_src: Option<(Vec<u8>, &'static str)> = if flags & MS_BIND != 0 {
         let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
+        // Binding /proc/<pid>/ns/<name> keeps that namespace alive.
+        match vfs::nsfs_bind_source(src.ns_bytes(), current_pid()) {
+            Err(e) => return e,
+            Ok(Some(synth)) => {
+                let mp = target_path.ns_bytes();
+                let mut st = [0u8; STAT_SIZE];
+                let m = make_vfs_msg(vfs::VFS_STAT, &[target_path.ptr() as u64, st.as_mut_ptr() as u64]);
+                let r = vfs_reply_val(&vfs::handle(&m, current_pid()));
+                let ok = r >= 0 && vfs::read_stat_mode(st.as_ptr() as usize) & 0o170000 != 0o040000;
+                let put = |s: &[u8]| if let Some((_, id)) = vfs::alias::ns_src(s) { sched::ns::put_raw(id); };
+                if !ok { put(&synth); return if r < 0 { r } else { -20 }; }
+                return match vfs::alias::add(mp, &synth, "nsfs", b"nsfs") {
+                    Ok(()) => 0,
+                    Err(e) => { put(&synth); e as isize }
+                };
+            }
+            Ok(None) => {}
+        }
         Some((src.bytes().to_vec(), "none"))
     } else {
         match &fstype_raw[..] {
