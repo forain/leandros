@@ -462,7 +462,9 @@ pub fn handle_request_env(req: &[u8], pid: u32, env: &Env) -> Vec<Vec<u8>> {
         let flags = rd16(req, off + 6);
         let seq = rd32(req, off + 8);
         let msg = &req[off..off + len];
-        let dump = flags & NLM_F_DUMP != 0; // Linux: ROOT or MATCH alone is a dump
+        // Linux: ROOT or MATCH alone is a dump, but only for GET requests (RTM_GET* = 2 mod 4);
+        // on NEW/DEL the same bits are REPLACE/EXCL and must not read as a dump.
+        let dump = flags & NLM_F_DUMP != 0 && ty >= 16 && ty & 3 == 2;
         let fam = if len > 16 { msg[16] } else { AF_UNSPEC };
         let mut ack = flags & NLM_F_ACK != 0 && !dump;
         match ty {

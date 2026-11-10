@@ -103,7 +103,7 @@ fn nltrace() -> bool {
     v == 2
 }
 
-pub(crate) fn trace_out(line: &str) {
+fn trace_out(line: &str) {
     extern "C" { fn arch_serial_putc(c: u8); }
     for &b in line.as_bytes() { unsafe { arch_serial_putc(b); } }
     unsafe { arch_serial_putc(b'\n'); }
