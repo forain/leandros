@@ -71,14 +71,19 @@ pub(crate) fn lo_up_sid(ns: u16) -> Option<Sid> {
     v[l as usize].as_ref().filter(|x| x.admin_up).map(|_| l)
 }
 
+/// A previous owner of namespace id `ns` may not have been reaped yet: do it
+/// now, before the new owner creates or looks up any state under the id.
+pub(crate) fn claim(ns: u16) {
+    let (w, b) = (ns as usize / 64 & 3, ns % 64);
+    if GONE[w].fetch_and(!(1 << b), Ordering::AcqRel) & (1 << b) != 0 { reap(ns); }
+}
+
 /// Bring `ns`'s `lo` up or down. The first up allocates its stack (127.0.0.1/8,
 /// the same `LoopDev` as sid 0); later ups and downs only flip the admin bit,
 /// the stack and its sockets stay.
 pub(crate) fn set_lo(ns: u16, up: bool) {
     if ns == 0 { return; }
-    // A previous owner of this id may not have been reaped yet.
-    let (w, b) = (ns as usize / 64 & 3, ns % 64);
-    if GONE[w].fetch_and(!(1 << b), Ordering::AcqRel) & (1 << b) != 0 { reap(ns); }
+    claim(ns);
     // Existing lo: flip the bit.
     {
         let n = NETNS.lock();

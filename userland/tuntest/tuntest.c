@@ -9,6 +9,8 @@
  *   tun_l3       IFF_TUN: raw IP packets, ARP answered by the kernel
  *   tun_getiff   TUNGETIFF / TUNSETIFF errors (VNET_HDR, MULTI_QUEUE: EINVAL)
  *   tun_eperm    an unprivileged task in the initial namespaces: EPERM
+ *   tcp_out / tcp_in  TCP in a netns over a tap: connect (SYN frame, injected
+ *                SYN-ACK, data, FIN) and listen/accept (injected SYN)
  * Run as root.
  */
 #define _GNU_SOURCE
@@ -262,7 +264,6 @@ static int next_tcp(int fd, unsigned char *b, int ms)
     for (;;) {
         int n = rd_timeout(fd, b, 2048, ms);
         if (n < 0) return -1;
-        printf("  frame len %d type %02x%02x proto %d\n", n, b[12], b[13], b[23]);
         if (n >= 42 && b[12] == 0x08 && b[13] == 0x06 && b[21] == 1) {
             memcpy(t_mac, b + 22, 6);
             unsigned char a[42];
@@ -297,7 +298,6 @@ static int tcp_cases(void)
     struct sockaddr_in peer = { .sin_family = AF_INET, .sin_port = htons(80) };
     memcpy(&peer.sin_addr, P_IP, 4);
     int rc = connect(s, (struct sockaddr *)&peer, sizeof peer);
-    printf("  connect rc %d errno %d\n", rc, errno);
     CHECK("tcp_connect_inprogress", rc < 0 && errno == EINPROGRESS);
     n = rc < 0 ? next_tcp(fd, b, 3000) : -1;
     int syn = n > 0 && TFLAGS(b) == 0x02 && memcmp(b + 30, P_IP, 4) == 0 && ((b[36] << 8) | b[37]) == 80;
