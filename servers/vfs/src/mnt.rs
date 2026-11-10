@@ -308,6 +308,53 @@ pub fn bind(ns: NsId, src: &[u8], dst: &[u8], rec: bool) -> Result<u32, i32> {
     Ok(top_id)
 }
 
+/// Namespace references held by `nsfs` superblocks: sb id -> namespace id.
+static NSFS_SB: Mutex<Vec<(SbId, u16)>> = Mutex::new(Vec::new());
+
+fn nsfs_destroy(root: &[u8]) {
+    let n = root.iter().rev().take_while(|c| c.is_ascii_digit()).count();
+    let sbid: SbId = core::str::from_utf8(&root[root.len() - n..]).ok().and_then(|d| d.parse().ok()).unwrap_or(0);
+    let id = {
+        let mut t = NSFS_SB.lock();
+        t.iter().position(|e| e.0 == sbid).map(|i| t.remove(i).1)
+    };
+    if let Some(id) = id { crate::sched_ns_put(id); }
+}
+
+/// A superblock for a bound nsfs file: it OWNS one namespace reference
+/// (already taken by the caller) and drops it when the last mount (or mount
+/// namespace copy) of the file goes away.
+pub fn nsfs_sb_new(id: u16) -> SbId {
+    let (sb, _) = sb_create("nsfs", Some(nsfs_destroy));
+    NSFS_SB.lock().push((sb, id));
+    sb
+}
+
+/// Bind a namespace file (synthetic source `/.leandros-ns/<kind>/<id>`, one
+/// namespace reference already taken for `synth`) onto the file at namespace
+/// path `dst` of mount namespace `ns`. On error the reference is dropped.
+pub fn bind_nsfs(ns: NsId, synth: &[u8], dst: &[u8]) -> Result<u32, i32> {
+    let Some((_, id)) = ns0::ns_src(synth) else { return Err(-22) };
+    let sb = nsfs_sb_new(id);
+    let r = (|| {
+        let mut g = NS.lock();
+        let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+        if t.len() >= MNT_MAX { return Err(-28); }
+        let (pid, mp) = attach_point(t, dst)?;
+        let mut m = mk(alloc_mnt_id(), pid, &mp, synth, sb);
+        m.flags = MNT_NOSUID | MNT_RELATIME;
+        m.fstype = "nsfs";
+        m.device = Box::from(&b"nsfs"[..]);
+        let mid = m.id;
+        sb_get(sb);
+        t.push(m);
+        Ok(mid)
+    })();
+    // No mount took the reference: putting an unreferenced sb destroys it.
+    if r.is_err() { sb_put(sb); }
+    r
+}
+
 /// Attach a brand-new mount (a fresh superblock, already referenced by the
 /// caller's `sb_create` + this call) at namespace path `dst`.
 pub fn add_mount(ns: NsId, dst: &[u8], root: &[u8], sb: SbId, fstype: &'static str, device: &[u8], flags: u8) -> Result<u32, i32> {

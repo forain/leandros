@@ -4987,13 +4987,14 @@ pub fn set_errtrace(comm: &str) {
 #[inline(always)]
 pub fn errtrace_enabled() -> bool { ERRTRACE_ON.load(Ordering::Relaxed) }
 
-/// True when `tid`'s comm equals the `sched.errtrace` name.
+/// True when `tid`'s comm starts with the `sched.errtrace` name (prefix, so
+/// crun's re-exec'd `crun.XXXXXX` is traced).
 pub fn errtrace_match(tid: Pid) -> bool {
     if !errtrace_enabled() { return false; }
     let (want, n) = *ERRTRACE.lock();
     let mut c = [0u8; 15];
     let m = comm_of(tid, &mut c);
-    m == n && c[..m] == want[..n]
+    m >= n && c[..n] == want[..n]
 }
 
 fn errtrace_exit(pid: Pid, code: i32, signo: u32, kind: &str) {
