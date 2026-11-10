@@ -466,6 +466,20 @@ pub fn ipc_send_check(owner: Pid) -> isize {
     }
 }
 
+/// Linux `ns_capable(ns, CAP_SYS_PTRACE)` for the caller `c`: host root, or the cap over `ns`.
+fn ptrace_cap(c: &task::Task, ns: crate::ns::NsId) -> bool {
+    (c.euid == 0 && c.userns.id() == 0)
+        || crate::caps::capable_snap(c.userns.id(), c.euid, c.caps[0], ns, CAP_SYS_PTRACE)
+}
+
+/// The `__ptrace_may_access` tail: the ids match or the caller has CAP_SYS_PTRACE in the target's
+/// cred userns; then a non-dumpable mm also needs CAP_SYS_PTRACE in `mm->user_ns`.
+fn ptrace_gate(rq: &runqueue::RunQueue, c: &task::Task, t: &task::Task, ids_ok: bool) -> bool {
+    if !(ids_ok || ptrace_cap(c, t.userns.id())) { return false; }
+    let leader = rq.find_pid(t.tgid).unwrap_or(t);
+    leader.dumpable || ptrace_cap(c, leader.mm_userns.id())
+}
+
 /// Linux `__ptrace_may_access(target, PTRACE_MODE_ATTACH_REALCREDS)`, the
 /// check pidfd_getfd(2) applies: the caller's own thread group always; else
 /// the caller's REAL uid must be the target's real, effective and saved uid,
@@ -481,14 +495,10 @@ pub fn ptrace_attach_check(target: Pid) -> isize {
     let c = match rq.find_pid(current_pid()) { Some(t) => t, None => return ESRCH };
     let t = match rq.find_pid(target) { Some(t) => t, None => return ESRCH };
     if t.tgid == c.tgid { return 0; }
-    // CAP_SYS_PTRACE in the target's user namespace (host root included).
-    if (c.euid == 0 && c.userns.id() == 0)
-        || crate::caps::capable_snap(c.userns.id(), c.euid, c.caps[0], t.userns.id(), CAP_SYS_PTRACE) { return 0; }
     let (u, g) = (c.uid, c.gid);
     let ids_ok = t.uid == u && t.euid == u && t.suid == u
               && t.gid == g && t.egid == g && t.sgid == g;
-    let dumpable = rq.find_pid(t.tgid).unwrap_or(t).dumpable;
-    if ids_ok && dumpable { 0 } else { EPERM }
+    if ptrace_gate(&rq, c, t, ids_ok) { 0 } else { EPERM }
 }
 
 /// True when the calling thread is privileged (euid 0) — the gate for the
@@ -506,12 +516,7 @@ pub fn ptrace_read_check(caller_pid: Pid, target: Pid) -> isize {
     let c = match rq.find_pid(caller_pid) { Some(t) => t, None => return ESRCH };
     let t = match rq.find_pid(target) { Some(t) => t, None => return ESRCH };
     if t.tgid == c.tgid { return 0; }
-    if (c.euid == 0 && c.userns.id() == 0)
-        || crate::caps::capable_snap(c.userns.id(), c.euid, c.caps[0], t.userns.id(), CAP_SYS_PTRACE) { return 0; }
     let (u, g) = (c.fsuid, c.fsgid);
     let ids_ok = t.uid == u && t.euid == u && t.suid == u && t.gid == g && t.egid == g && t.sgid == g;
-    let dumpable = rq.find_pid(t.tgid).unwrap_or(t).dumpable;
-    // Non-dumpable targets need CAP_SYS_PTRACE in their userns (checked above); the
-    // caller lacks it here, so ids_ok && dumpable is the only way in.
-    if ids_ok && dumpable { 0 } else { EACCES }
+    if ptrace_gate(&rq, c, t, ids_ok) { 0 } else { EACCES }
 }
