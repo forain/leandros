@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sched.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <time.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -716,6 +717,235 @@ static void mount_userns_perm(void) {
     rmdir("/tmp/mountperm.d");
 }
 
+
+/* setns(CLONE_NEWNS) (lane mntsetns, M7). A helper child unshares into its own
+ * mount namespace and mounts a tmpfs; joiners are forked from the parent so the
+ * parent's own namespace never changes. */
+#ifndef SYS_setns
+#define SYS_setns 268
+#endif
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+static int setns_(int fd, int t) { return (int)syscall(SYS_setns, fd, t); }
+
+static int same_link(const char *a, const char *b) {
+    char x[64] = {0}, y[64] = {0};
+    ssize_t n = readlink(a, x, sizeof x - 1), m = readlink(b, y, sizeof y - 1);
+    return n > 0 && m > 0 && n == m && !memcmp(x, y, (size_t)n);
+}
+
+/* mode: 0 join via fd, 1 root/cwd reset, 2 unprivileged, 3 shared fs, 4 pidfd */
+static int joiner(pid_t target, const char *d, int mode) {
+    char np[64], tx[160];
+    snprintf(np, sizeof np, "/proc/%d/ns/mnt", (int)target);
+    snprintf(tx, sizeof tx, "%s/x", d);
+    char pid0[64] = {0}, usr0[64] = {0}, pidn[64] = {0}, usrn[64] = {0};
+    ssize_t n;
+    n = readlink("/proc/self/ns/pid", pid0, sizeof pid0 - 1); if (n > 0) pid0[n] = 0;
+    n = readlink("/proc/self/ns/user", usr0, sizeof usr0 - 1); if (n > 0) usr0[n] = 0;
+    if (exists(tx)) return 10; /* must not be visible before the join */
+    int fd, pfd = -1;
+    if (mode == 4) {
+        pfd = (int)syscall(SYS_pidfd_open, (long)target, 0L);
+        if (pfd < 0) return 13;
+    } else {
+        fd = open(np, O_RDONLY);
+        if (fd < 0) return 14;
+        pfd = fd;
+    }
+    if (mode == 1) {
+        if (chdir(d) || chroot(d)) return 11;   /* root and cwd inside the old tree */
+        if (exists("/bin/mnttest")) return 12;
+    }
+    if (mode == 2) {
+        if (setgid(65534) || setuid(65534)) return 15;
+        errno = 0;
+        return setns_(pfd, CLONE_NEWNS) == -1 && errno == EPERM ? 0 : 16;
+    }
+    int cpipe[2] = {-1, -1};
+    pid_t kid = 0;
+    if (mode == 3) {
+        if (pipe(cpipe)) return 17;
+        kid = (pid_t)syscall(SYS_clone, (long)(CLONE_FS | SIGCHLD), 0L, 0L, 0L, 0L);
+        if (kid == 0) { char c; close(cpipe[1]); (void)!read(cpipe[0], &c, 1); _exit(0); }
+        if (kid < 0) return 18;
+        errno = 0;
+        int r = setns_(pfd, CLONE_NEWNS);
+        int e = errno;
+        close(cpipe[1]); waitpid(kid, NULL, 0);
+        return r == -1 && e == EINVAL && !exists(tx) ? 0 : 19;
+    }
+    if (setns_(pfd, CLONE_NEWNS) != 0) return 20;
+    if (!exists(tx)) return 21;                                  /* sees the child's tmpfs */
+    if (!same_link("/proc/self/ns/mnt", np)) return 22;
+    n = readlink("/proc/self/ns/pid", pidn, sizeof pidn - 1); if (n > 0) pidn[n] = 0;
+    n = readlink("/proc/self/ns/user", usrn, sizeof usrn - 1); if (n > 0) usrn[n] = 0;
+    if (strcmp(pid0, pidn) || strcmp(usr0, usrn)) return 23;    /* pid/user ns untouched */
+    if (mode == 1) {
+        char cw[64] = {0};
+        if (!getcwd(cw, sizeof cw) || strcmp(cw, "/")) return 24;
+        if (!exists("/bin/mnttest")) return 25;                   /* chroot is gone */
+    }
+    return 0;
+}
+
+static int run_joiner(pid_t target, const char *d, int mode) {
+    pid_t j = fork();
+    if (j == 0) _exit(joiner(target, d, mode));
+    int st = 0; waitpid(j, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 200;
+}
+
+static void setns_mnt_suite(void) {
+    char base[64], d[128], q[128];
+    snprintf(base, sizeof base, "/tmp/ms.%d", (int)getpid());
+    dir(base); path(d, sizeof d, base, "d"); dir(d);
+    path(q, sizeof q, base, "c"); dir(q);
+    int c2p[2], p2c[2];
+    if (pipe(c2p) || pipe(p2c)) { report("setns_mnt_pipe", 0); return; }
+    pid_t t = fork();
+    if (t == 0) {
+        close(c2p[0]); close(p2c[1]);
+        char ch = 1, x[160];
+        if (unshare(CLONE_NEWNS)) _exit(90);
+        if (mount_("none", d, "tmpfs", 0)) _exit(91);
+        snprintf(x, sizeof x, "%s/x", d); put(x, "T", 0666);
+        (void)!write(c2p[1], &ch, 1);
+        (void)!read(p2c[0], &ch, 1);
+        _exit(0);
+    }
+    close(c2p[1]); close(p2c[0]);
+    char ch;
+    if (read(c2p[0], &ch, 1) != 1) { report("setns_mnt_child_ready", 0); return; }
+    int r;
+    r = run_joiner(t, d, 0); if (r) printf("join=%d\n", r);
+    report("setns_mnt_join", r == 0);
+    r = run_joiner(t, d, 1); if (r) printf("root_cwd=%d\n", r);
+    report("setns_mnt_root_cwd_reset", r == 0);
+    r = run_joiner(t, d, 2); if (r) printf("eperm=%d\n", r);
+    report("setns_mnt_eperm_unpriv", r == 0);
+    r = run_joiner(t, d, 3); if (r) printf("clonefs=%d\n", r);
+    report("setns_mnt_clone_fs_einval", r == 0);
+    r = run_joiner(t, d, 4); if (r) printf("pidfd=%d\n", r);
+    report("setns_mnt_pidfd", r == 0);
+    /* the fd keeps the namespace alive after its creator exits */
+    {
+        char np[64]; snprintf(np, sizeof np, "/proc/%d/ns/mnt", (int)t);
+        int fd = open(np, O_RDONLY);
+        (void)!write(p2c[1], &ch, 1);
+        int st = 0; waitpid(t, &st, 0);
+        int ok = fd >= 0;
+        if (ok) {
+            pid_t j = fork();
+            if (j == 0) {
+                if (setns_(fd, CLONE_NEWNS)) _exit(1);
+                char x[160]; snprintf(x, sizeof x, "%s/x", d);
+                _exit(exists(x) ? 0 : 2);
+            }
+            waitpid(j, &st, 0);
+            ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        }
+        report("setns_mnt_fd_keeps_alive", ok);
+        if (fd >= 0) close(fd);
+    }
+    close(c2p[0]); close(p2c[1]);
+}
+
+/* lane podsys: tmpfs mountable on any directory in the initial mount
+ * namespace (podman's shm, crun's /dev), options honoured, umount frees it. */
+static int tfs_unpriv_child(void) {
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    if (unshare(CLONE_NEWUSER) < 0) return 91;
+    wr("/proc/self/setgroups", "deny");
+    wr("/proc/self/uid_map", "0 1000 1");
+    wr("/proc/self/gid_map", "0 1000 1");
+    errno = 0;
+    int r = mount("shm", "/root/mt-tfs.d", "tmpfs", 0, "mode=1777");
+    if (r == 0) { umount("/root/mt-tfs.d"); return 10; }
+    return errno == EPERM ? 0 : 11;
+}
+
+static void tmpfs_anywhere(void) {
+    const char *d = "/root/mt-tfs.d";
+    int live0 = 0, sb0 = 0, live1 = 0, sb1 = 0;
+    char buf[8192];
+    struct stat st0, st1;
+    int n;
+    /* /proc/sys/kernel entries podman/crun read */
+    n = slurp("/proc/sys/kernel/cap_last_cap", buf, sizeof buf);
+    report("proc_cap_last_cap", n > 0 && atoi(buf) == 40);
+    n = slurp("/proc/sys/kernel/ngroups_max", buf, sizeof buf);
+    report("proc_ngroups_max", n > 0 && atoi(buf) > 0);
+    mkdir(d, 0755);
+    ns_counts(&live0, &sb0);
+    stat(d, &st0);
+    int r = mount("shm", d, "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777,size=65536k");
+    report("tfs_mount_arbitrary_dir", r == 0);
+    if (r != 0) { rmdir(d); return; }
+    char f[128];
+    snprintf(f, sizeof f, "%s/a", d);
+    put(f, "hello", 0644);
+    n = slurp(f, buf, sizeof buf);
+    report("tfs_content_independent", n == 5 && !strcmp(buf, "hello") && stat(d, &st1) == 0 && st1.st_dev != st0.st_dev);
+    report("tfs_mode_default_opts", stat(d, &st1) == 0 && (st1.st_mode & 07777) == 01777);
+    struct statfs sf;
+    report("tfs_nosuid_flag", statfs(d, &sf) == 0 && (sf.f_flags & 2));
+    ns_counts(&live1, &sb1);
+    report("tfs_sb_registered", sb1 == sb0 + 1);
+    r = umount(d);
+    report("tfs_umount_ok", r == 0);
+    report("tfs_umount_frees", stat(f, &st1) != 0 && ns_counts(&live1, &sb1) == 0 && sb1 == sb0);
+    /* a second umount is not a mountpoint */
+    errno = 0;
+    report("tfs_umount_twice_einval", umount(d) < 0 && errno == EINVAL);
+
+    /* options: mode/uid/gid/size */
+    r = mount("shm", d, "tmpfs", 0, "mode=0750,uid=1234,gid=5678,size=64k");
+    report("tfs_opts_mount", r == 0);
+    if (r == 0) {
+        report("tfs_opts_mode_uid_gid", stat(d, &st1) == 0 && (st1.st_mode & 07777) == 0750 && st1.st_uid == 1234 && st1.st_gid == 5678);
+        snprintf(f, sizeof f, "%s/big", d);
+        int fd = open(f, O_WRONLY | O_CREAT, 0644);
+        static char blk[4096];
+        long total = 0; int err = 0;
+        for (int i = 0; i < 40 && fd >= 0; i++) {
+            ssize_t w = write(fd, blk, sizeof blk);
+            if (w < 0) { err = errno; break; }
+            total += w;
+        }
+        if (fd >= 0) close(fd);
+        report("tfs_size_enforced", total == 65536 && err == ENOSPC);
+        umount(d);
+    }
+
+    /* noexec: a copy of this binary will not run from it */
+    r = mount("shm", d, "tmpfs", MS_NOEXEC, "mode=755");
+    report("tfs_noexec_mount", r == 0);
+    if (r == 0) {
+        snprintf(f, sizeof f, "%s/x", d);
+        int in = open("/bin/mnttest", O_RDONLY), out = open(f, O_WRONLY | O_CREAT, 0755);
+        static char cb[65536]; ssize_t k;
+        while (in >= 0 && out >= 0 && (k = read(in, cb, sizeof cb)) > 0) if (write(out, cb, (size_t)k) != k) break;
+        if (in >= 0) close(in);
+        if (out >= 0) close(out);
+        pid_t c = fork();
+        if (c == 0) { execl(f, f, "child-ok", (char *)NULL); _exit(errno == EACCES ? 0 : 1); }
+        int st = 0; waitpid(c, &st, 0);
+        report("tfs_noexec_eacces", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        umount(d);
+    }
+
+    /* an unprivileged user namespace cannot mount it in ns 0 */
+    pid_t c = fork();
+    if (c == 0) _exit(tfs_unpriv_child());
+    int st = 0; waitpid(c, &st, 0);
+    if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) printf("tfs_unpriv status=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    report("tfs_userns_eperm_ns0", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    rmdir(d);
+
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -728,6 +958,8 @@ int main(int argc, char **argv) {
     mountinfo_tests();
     pool_tests();
     mount_userns_perm();
+    setns_mnt_suite();
+    tmpfs_anywhere();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }

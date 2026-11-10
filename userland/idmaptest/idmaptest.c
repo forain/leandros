@@ -33,6 +33,7 @@ static void report(const char *name, int ok)
     if (ok) npass++; else nfail++;
 }
 static void skip(const char *name, const char *why) { printf("%s: SKIP (%s)\n", name, why); }
+static int slurp_file(const char *path, char *buf, int cap);
 
 static int write_file(const char *path, const char *s)
 {
@@ -85,6 +86,7 @@ static void proc_pid_owner(void)
     if (c == 0) {
         close(sync[1]);
         if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) _exit(1);
+        prctl(PR_SET_DUMPABLE, 1);   /* the id change cleared it; Linux shows root then */
         char b; read(sync[0], &b, 1);
         _exit(0);
     }
@@ -96,6 +98,126 @@ static void proc_pid_owner(void)
     close(sync[1]);
     waitpid(c, NULL, 0);
     report("proc_pid_owner", ok);
+}
+
+/* ---- proc_owner_newuser: /proc/<child> of a fresh userns child ---------- */
+/* newuidmap fstats /proc/<pid> and wants st_uid == its real uid (1000) before
+ * the child's uid_map is written. */
+static int owner_newuser_body(void)
+{
+    int a[2], b[2];
+    if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) return 1;
+    pipe(a); pipe(b);
+    pid_t c = fork();
+    if (c == 0) {
+        char x = 0;
+        if (unshare(CLONE_NEWUSER)) { x = 'u'; write(b[1], &x, 1); _exit(1); }
+        prctl(PR_SET_DUMPABLE, 1);
+        write(b[1], &x, 1);
+        read(a[0], &x, 1);
+        _exit(0);
+    }
+    char x;
+    int rc = 0;
+    if (read(b[0], &x, 1) != 1 || x) rc = 2;
+    else {
+        char p[64]; struct stat st;
+        snprintf(p, sizeof p, "/proc/%d", c);
+        if (stat(p, &st) || st.st_uid != 1000 || st.st_gid != 1000) { rc = 3; printf("stat uid=%u gid=%u\n", st.st_uid, st.st_gid); }
+        int fd = open(p, O_RDONLY | O_DIRECTORY);
+        if (fd < 0 || fstat(fd, &st) || st.st_uid != 1000 || st.st_gid != 1000) { rc = rc ? rc : 4; printf("fstat fd=%d uid=%u\n", fd, st.st_uid); }
+        int mfd = fd < 0 ? -1 : openat(fd, "uid_map", O_RDONLY);
+        if (mfd < 0 || fstat(mfd, &st) || st.st_uid != 1000) rc = rc ? rc : 5;
+        if (mfd >= 0) close(mfd);
+        if (fd < 0 || fstatat(fd, "uid_map", &st, 0) || st.st_uid != 1000 || st.st_gid != 1000) rc = rc ? rc : 6;
+        if (fd < 0 || fstatat(fd, ".", &st, 0) || st.st_uid != 1000) rc = rc ? rc : 7;
+        if (fd >= 0) close(fd);
+    }
+    write(a[1], "x", 1);
+    waitpid(c, NULL, 0);
+    return rc;
+}
+static void proc_owner_newuser(void)
+{
+    pid_t m = fork();
+    if (m == 0) _exit(owner_newuser_body());
+    int st; waitpid(m, &st, 0);
+    if (WIFEXITED(st) && WEXITSTATUS(st)) printf("proc_owner_newuser rc=%d\n", WEXITSTATUS(st));
+    report("proc_owner_newuser", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+/* A non-dumpable task shows root (task_dump_owner). */
+static void proc_owner_nondumpable(void)
+{
+    int sync[2];
+    pipe(sync);
+    pid_t c = fork();
+    if (c == 0) {
+        close(sync[1]);
+        if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) _exit(1);
+        prctl(PR_SET_DUMPABLE, 0);
+        char b; read(sync[0], &b, 1);
+        _exit(0);
+    }
+    close(sync[0]);
+    usleep(200000);
+    char p[32]; struct stat st;
+    snprintf(p, sizeof p, "/proc/%d", c);
+    int ok = stat(p, &st) == 0 && st.st_uid == 0 && st.st_gid == 0;
+    close(sync[1]);
+    waitpid(c, NULL, 0);
+    report("proc_owner_nondumpable", ok);
+}
+
+/* ---- newuidmap_e2e: the setuid shadow helper writes a 2-extent map -------- */
+static int newuidmap_body(void)
+{
+    int a[2], b[2];
+    if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) return 1;
+    pipe(a); pipe(b);
+    pid_t c = fork();
+    if (c == 0) {
+        char x = 0;
+        if (unshare(CLONE_NEWUSER)) { x = 'u'; write(b[1], &x, 1); _exit(1); }
+        prctl(PR_SET_DUMPABLE, 1);
+        write(b[1], &x, 1);
+        read(a[0], &x, 1);
+        _exit(0);
+    }
+    char x; int rc = 0;
+    if (read(b[0], &x, 1) != 1 || x) rc = 2;
+    else {
+        char pid[16];
+        snprintf(pid, sizeof pid, "%d", c);
+        pid_t h = fork();
+        if (h == 0) {
+            execl("/usr/bin/newuidmap", "newuidmap", pid, "0", "1000", "1", "1", "100000", "65536", (char *)NULL);
+            _exit(127);
+        }
+        int st; waitpid(h, &st, 0);
+        if (!WIFEXITED(st) || WEXITSTATUS(st)) rc = 10 + (WIFEXITED(st) ? WEXITSTATUS(st) : 99);
+        else {
+            char p[48], buf[256];
+            snprintf(p, sizeof p, "/proc/%d/uid_map", c);
+            if (slurp_file(p, buf, sizeof buf) < 0 || !strstr(buf, "100000") || !strstr(buf, "65536")) rc = 3;
+        }
+    }
+    write(a[1], "x", 1);
+    waitpid(c, NULL, 0);
+    return rc;
+}
+static void newuidmap_e2e(void)
+{
+    struct stat st;
+    if (stat("/usr/bin/newuidmap", &st)) { skip("newuidmap_e2e", "no /usr/bin/newuidmap"); return; }
+    char cl[1024];
+    if (slurp_file("/proc/cmdline", cl, sizeof cl) < 0 || !strstr(cl, "idmap=test")) { skip("newuidmap_e2e", "needs idmap=test"); return; }
+    pid_t m = fork();
+    if (m == 0) _exit(newuidmap_body());
+    int s; waitpid(m, &s, 0);
+    int rc = WIFEXITED(s) ? WEXITSTATUS(s) : 99;
+    if (rc) printf("newuidmap_e2e rc=%d\n", rc);
+    report("newuidmap_e2e", rc == 0);
 }
 
 /* ---- status_groups_view ------------------------------------------------- */
@@ -967,6 +1089,7 @@ static int c_setuid_down(void *x)
     CHECK(setuid(50) == -1 && errno == EINVAL);        /* unmapped */
     CHECK(setgid(5) == 0 && setuid(5) == 0);
     CHECK(getuid() == 5 && geteuid() == 5 && getgid() == 5);
+    prctl(PR_SET_DUMPABLE, 1);   /* the id change cleared it; /proc/<pid> shows root until then */
     x_sync();
     return 0;
 }
@@ -1870,6 +1993,9 @@ int main(int argc, char **argv)
     }
     statx_matches_stat();
     proc_pid_owner();
+    proc_owner_newuser();
+    proc_owner_nondumpable();
+    newuidmap_e2e();
     status_groups_view();
     stat_unmapped_65534();
     sigchld_si_uid_view();
