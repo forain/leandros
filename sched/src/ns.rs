@@ -23,6 +23,8 @@ const ZERO16: AtomicU16 = AtomicU16::new(0);
 const ZERO8: AtomicU8 = AtomicU8::new(0);
 static REFS: [AtomicU32; NS_MAX] = [ZERO32; NS_MAX];
 static PARENT: [AtomicU16; NS_MAX] = [ZERO16; NS_MAX];
+/// Class of each allocated slot (see `slot_class`), set at allocation.
+static SLOT_KIND: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 static LEVEL: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 /// Host euid / egid of the creator (the namespace owner).
 static OWNER_EUID: [AtomicU32; NS_MAX] = [ZERO32; NS_MAX];
@@ -100,7 +102,20 @@ fn put(mut id: NsId) {
                 }
             }
         }
-        if REFS[id as usize].fetch_sub(1, AcqRel) != 1 { return; }
+        // Last reference: 1 -> DYING in one CAS so the slot cannot be
+        // reallocated (or held by name) while its fields are torn down; it
+        // becomes free (0) only after PARENT/owner state is cleared.
+        {
+            let r = &REFS[id as usize];
+            loop {
+                let c = r.load(Acquire);
+                if c == 1 {
+                    if r.compare_exchange(1, DYING, AcqRel, Relaxed).is_ok() { break; }
+                } else if r.compare_exchange(c, c - 1, AcqRel, Relaxed).is_ok() {
+                    return;
+                }
+            }
+        }
         // A cgroup namespace unpins its root cgroup (its owner userns, held as
         // PARENT, is released by the loop below).
         if CGNS_FLAG[id as usize].swap(0, AcqRel) != 0 {
@@ -116,7 +131,12 @@ fn put(mut id: NsId) {
             let f: fn(NsId) = unsafe { core::mem::transmute(h) };
             f(id);
         }
-        id = PARENT[id as usize].load(Acquire);
+        let next = PARENT[id as usize].swap(0, AcqRel);
+        OWNER_EUID[id as usize].store(0, Release);
+        OWNER_EGID[id as usize].store(0, Release);
+        LEVEL[id as usize].store(0, Release);
+        REFS[id as usize].store(0, Release);
+        id = next;
     }
 }
 
@@ -168,6 +188,7 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
     if !quota_ok(euid, true) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
+            SLOT_KIND[id].store(1, Release);
             let p = NsRef::get(parent); // the child's reference on its parent
             PARENT[id].store(p.0, Release);
             core::mem::forget(p);
@@ -216,6 +237,7 @@ pub fn new_mntns(owner_user: NsId) -> Result<NsRef, isize> {
     if !quota_owner_ok(owner_user) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
+            SLOT_KIND[id].store(2, Release);
             PARENT[id].store(0, Release);
             LEVEL[id].store(0, Release);
             // The namespace pins its owner user namespace (dropped by reap), so
@@ -274,6 +296,7 @@ pub fn new_flat(owner: NsId) -> Result<NsRef, isize> {
     if !quota_owner_ok(owner) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
+            SLOT_KIND[id].store(3, Release);
             PARENT[id].store(0, Release);
             LEVEL[id].store(0, Release);
             set_owner_userns(id as NsId, owner);
@@ -450,6 +473,7 @@ pub fn new_pidns(parent: NsId, owner: NsId) -> Result<NsRef, isize> {
     if !quota_owner_ok(owner) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
+            SLOT_KIND[id].store(4, Release);
             let p = NsRef::get(parent);
             PARENT[id].store(p.0, Release);
             core::mem::forget(p);
@@ -817,6 +841,28 @@ pub fn set_owner_userns(id: NsId, owner: NsId) {
 
 /// Take one raw reference on `id` (an nsfd's hold); pair with `put_raw`.
 pub fn hold_raw(id: NsId) { core::mem::forget(NsRef::get(id)); }
+
+/// Class of an nsfs link kind: 1 user, 2 mnt, 3 net/ipc/uts, 4 pid, 6 cgroup.
+fn link_class(kind: u8) -> u8 {
+    match kind { 0 => 1, 4 => 2, 2 | 3 | 5 => 3, 1 | 7 => 4, 6 => 6, _ => 0 }
+}
+
+/// Take a reference on a namespace named by an id that did not come from a
+/// held reference (a synthetic nsfs source). Refuses ids past the table,
+/// free or dying slots, and slots of another kind. `false` = nothing taken.
+pub fn hold_checked(kind: u8, id: NsId) -> bool {
+    let i = id as usize;
+    if i >= NS_MAX { return false; }
+    if id == 0 { return true; }
+    let c = link_class(kind);
+    if c == 0 || SLOT_KIND[i].load(Acquire) != c { return false; }
+    let r = &REFS[i];
+    loop {
+        let v = r.load(Acquire);
+        if v == 0 || v & DYING != 0 { return false; }
+        if r.compare_exchange(v, v + 1, AcqRel, Relaxed).is_ok() { return true; }
+    }
+}
 /// Drop a reference taken by `hold_raw`.
 pub fn put_raw(id: NsId) { drop(NsRef(id)); }
 
@@ -980,6 +1026,7 @@ pub fn new_cgns(root: crate::cgroup::CgId, owner: NsId) -> Result<NsRef, isize> 
     if !quota_owner_ok(owner) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
+            SLOT_KIND[id].store(6, Release);
             let p = NsRef::get(owner);
             PARENT[id].store(p.0, Release);
             core::mem::forget(p);

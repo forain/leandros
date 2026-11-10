@@ -12222,6 +12222,11 @@ fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
     if vfs::alias::under(&out, vfs::VOID_ROOT) && root.as_deref() != Some(vfs::VOID_ROOT) {
         return Err(-2);
     }
+    // nsfs has no path (Linux): `/.leandros-ns/..` is the synthetic source of a
+    // bound namespace file, produced only by the mount translation.
+    if out == b"/.leandros-ns" || out.starts_with(vfs::alias::NS_SRC) {
+        return Err(-2);
+    }
     // Superblock backing roots are never reachable by name.
     if out.len() >= vfs::mnt::SB_ROOT.len() && vfs::alias::under(&out, vfs::mnt::SB_ROOT) {
         return Err(-2);

@@ -9079,7 +9079,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // A bind-mounted nsfs file (`ip netns add`, netavark): the mount
             // holds the namespace, each open takes its own reference.
             if flags & 0o3 != 0 { return err_reply(-13); }
-            sched::ns::hold_raw(id);
+            if !sched::ns::hold_checked(k, id) { return err_reply(-2); }
             VnodeKind::NsFd { kind: k, id }
         } else if let Some(r) = proc_ns_file(lookup_path, pid) {
             // /proc/<pid>/ns/<name> followed: an empty nsfs-like file.
