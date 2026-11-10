@@ -663,6 +663,28 @@ static int t_cg_child_pids_enforced(void)
     return 0;
 }
 
+/* crun opens control files relative to a cgroup directory fd (openat, openat2). */
+static int t_cg_dirfd_open(void)
+{
+    char b[64];
+    CHECK(mnt() == 0);
+    CHECK(mkdir(CGR "/cgt_df", 0755) == 0);
+    int d = open(CGR "/cgt_df", O_RDONLY | O_DIRECTORY);
+    CHECK(d >= 0);
+    int f = openat(d, "pids.max", O_WRONLY);
+    CHECK(f >= 0);
+    CHECK(write(f, "9", 1) == 1);
+    close(f);
+    struct { unsigned long long flags, mode, resolve; } how = { O_RDONLY, 0, 0 };
+    long r = syscall(SYS_openat2, d, "pids.max", &how, sizeof how);
+    CHECK(r >= 0);
+    CHECK(read((int)r, b, sizeof b) > 0 && b[0] == '9');
+    close((int)r);
+    close(d);
+    CHECK(rmdir(CGR "/cgt_df") == 0);
+    return 0;
+}
+
 static int t_cg_proc_files(void)
 {
     CHECK(mnt() == 0);
@@ -698,7 +720,7 @@ int main(int argc, char **argv)
         { "cg_delegate", t_cg_delegate }, { "cg_pids_balance", t_cg_pids_balance },
         { "cg_pids_max", t_cg_pids_max }, { "cg_proc_files", t_cg_proc_files },
         { "cg_boot_controllers", t_cg_boot_controllers }, { "cg_child_ctrl_files", t_cg_child_ctrl_files },
-        { "cg_child_pids_enforced", t_cg_child_pids_enforced },
+        { "cg_child_pids_enforced", t_cg_child_pids_enforced }, { "cg_dirfd_open", t_cg_dirfd_open },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();
