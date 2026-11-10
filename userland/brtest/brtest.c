@@ -995,8 +995,16 @@ static int ip_forward_set(int on) {
     close(fd);
     return r == 2 ? 0 : -1;
 }
+static int g_early_listen; /* mode 6: bind the host listener before br0 exists (httpd before podman0) */
 static void fwd_case(const char *name, int mode, int ipfwd) {
     char msg[96];
+    int hl = -1;
+    if (mode == 6 && g_early_listen) {
+        hl = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7779) };
+        snprintf(msg, sizeof msg, "%s: host wildcard listener on 7779 (before br0)", name);
+        CHECK(msg, !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
+    }
     int s = nl_sock();
     unsigned char brmac[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x01 };
     int ok = br_new(s, "br0", brmac) == 0;
@@ -1005,8 +1013,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     snprintf(msg, sizeof msg, "%s: br0 10.97.0.1/24 up", name); CHECK(msg, ok);
     snprintf(msg, sizeof msg, "%s: ip_forward=%d", name, ipfwd); CHECK(msg, ip_forward_set(ipfwd) == 0);
     g_fwd_mode = mode; g_fwd_expect = ipfwd;
-    int hl = -1;
-    if (mode == 6) {
+    if (mode == 6 && !g_early_listen) {
         hl = socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7779) };
         snprintf(msg, sizeof msg, "%s: host wildcard listener on 7779", name);
@@ -1067,6 +1074,7 @@ static void fwd_off(void) { fwd_case("fwd_off", 0, 0); }
 static void fwd_tcp(void) { fwd_case("fwd_tcp", 2, 1); }
 static void fwd_port_reserved(void) { fwd_case("fwd_port_reserved", 4, 1); }
 static void fwd_hostlisten(void) { fwd_case("fwd_hostlisten", 6, 1); }
+static void fwd_hostlisten_early(void) { g_early_listen = 1; fwd_case("fwd_hostlisten_early", 6, 1); g_early_listen = 0; }
 static void fwd_reap(void) { fwd_case("fwd_reap", 5, 1); }
 
 /* A host wildcard listener must not leak into a container netns: a netns
@@ -1136,6 +1144,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "fwd_port_reserved")) fwd_port_reserved();
     if (!only || !strcmp(only, "fwd_reap")) fwd_reap();
     if (!only || !strcmp(only, "fwd_hostlisten")) fwd_hostlisten();
+    if (!only || !strcmp(only, "fwd_hostlisten_early")) fwd_hostlisten_early();
     if (!only || !strcmp(only, "hostlisten_not_in_ns")) hostlisten_not_in_ns();
     printf("brtest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
