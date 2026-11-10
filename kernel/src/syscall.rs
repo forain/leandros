@@ -9410,7 +9410,7 @@ fn sys_mount(
         return match vfs::alias::add(mp, &src, fstype, &device) {
             Ok(()) => { if fstype == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
             Err(e) => {
-                if let Some(id) = vfs::devpts::inst_of_backing(&src) { vfs::devpts::destroy(id); }
+                if let Some(id) = vfs::devpts::inst_of_backing(&src) { vfs::devpts::discard(id); }
                 e as isize
             }
         };
