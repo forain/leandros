@@ -16,3 +16,9 @@ Rootless `podman run --rm --network=none alpine:3.21 echo hi` as leandro (Mac aa
 Regress (no knob): x86_64 box (KVM) 81 suites 0 bad, overall PASS. aarch64: box disk was full (ENOSPC from other lanes, twice), so the full default regress ran on the Mac under lock.sh qemu: overall PASS, idmaptest 0 fails, nstest 0 fails (ff_seq_identity + ff_seq_nsroot green).
 
 Not done (review B leftovers, not flip-blocking per B): delete `kid_from_view` (N1), S10 grep gate reword (sched/src/lib.rs:3059,3273 apply to already-translated kuids).
+
+## idflip2 (2026-11-10): finish
+Merged main (conflicts only in runtests.py; kept podpasta + podbridge, dropped idmap=test forcing). nstest quota_hier now runs by default (skips only on idmap=off). Removed idmap=test remnants in podpastatest/runtests docs.
+Regress, no knob, box farm: aarch64 and x86_64 both PASS after rerunning the known flakes once (brtest fwd_mac_steal errno 98, nettag2test connect_pending).
+Mac aarch64, no knob: ffsandbox --mode on RESULT {'on': True}. Desktop: the same ffsession run logged leandro in through cosmic-greeter and waited for cosmic-panel; ps shows cosmic-session, cosmic-comp, cosmic-panel running.
+Podman as leandro (Mac aarch64): `--network=none echo hi` rc 0 and pasta `echo hi` rc 0 (both verified in-VM). podpasta suite (not in regress): pasta_echo (stderr "Refreshing container" noise), pasta_portfwd and pasta_leaks (mounts:1) fail identically with idmap=off, so they are not flip-related. 5x churn passed with 0 fails; 20x churn: 1-4 fails under default, 0 in one idmap=off run (flaky, not root-caused).
