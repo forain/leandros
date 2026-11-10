@@ -372,6 +372,22 @@ pub fn add_mount(ns: NsId, dst: &[u8], root: &[u8], sb: SbId, fstype: &'static s
     Ok(id)
 }
 
+/// Linux `mnt_already_visible` for proc and sysfs mounts by a task in a
+/// non-initial user namespace: some mount of `fstype` exposing the whole
+/// filesystem (root = its tree root) is in `ns`, with nothing locked stacked
+/// on it and no locked flag the new mount would drop.
+pub fn fully_visible(ns: NsId, fstype: &str, new_flags: u8) -> bool {
+    let g = NS.lock();
+    let Some(n) = g.get(&ns) else { return false };
+    let t = &n.mnts;
+    let full: &[u8] = if fstype == "proc" { b"/proc" } else { b"/sys" };
+    t.iter().any(|m| {
+        m.fstype == fstype && &*m.root == full
+            && (m.locked & 0x7f) & !new_flags == 0
+            && !t.iter().any(|c| c.parent == m.id && c.locked & LOCK_MNT != 0)
+    })
+}
+
 /// umount2 of the mount at namespace path `target`. The mount must be the
 /// final component's mountpoint (EINVAL otherwise), not the namespace root,
 /// not locked (EINVAL), and without submounts unless `detach` (EBUSY). A
