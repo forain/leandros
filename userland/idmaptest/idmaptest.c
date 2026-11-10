@@ -2097,7 +2097,98 @@ static int prio_user_who_view(void)
     return 0;
 }
 
+
+/* ---- devpts uid=/gid= are translated through the mounter's userns -------- */
+#include <sys/mount.h>
+#include <sys/ioctl.h>
+struct dpa { int up, dn, sv; char dir[64]; char opts[64]; };
+static int c_devpts(void *a)
+{
+    struct dpa *d = a;
+    CHECK(unshare(CLONE_NEWNS) == 0);
+    int r = mount("none", d->dir, "devpts", 0, d->opts);
+    char b = r == 0 ? 'o' : 'e';
+    int e = r == 0 ? 0 : errno;
+    if (r) { (void)!write(d->up, &b, 1); return e == EINVAL ? 0 : 50; }
+    char p[96]; snprintf(p, sizeof p, "%s/ptmx", d->dir);
+    int m = open(p, O_RDWR | O_NOCTTY);
+    if (m < 0) { printf("  devpts ptmx open errno %d\n", errno); }
+    CHECK(m >= 0);
+    unsigned n = 0;
+    CHECK(ioctl(m, TIOCGPTN, &n) == 0);
+    struct stat st; snprintf(p, sizeof p, "%s/%u", d->dir, n);
+    CHECK(stat(p, &st) == 0);
+    int view = st.st_gid == 5 ? 0 : 1; /* ns-relative view must read 5 */
+    { int z = 0; ioctl(m, 0x40045431, &z); }
+    int sl = open(p, O_RDWR | O_NOCTTY);
+    CHECK(sl >= 0);
+    { char cb[CMSG_SPACE(sizeof(int))] = {0}; char x = 'x';
+      struct iovec io = { &x, 1 };
+      struct msghdr mh = { 0 }; mh.msg_iov = &io; mh.msg_iovlen = 1; mh.msg_control = cb; mh.msg_controllen = sizeof cb;
+      struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int));
+      memcpy(CMSG_DATA(cm), &sl, sizeof sl);
+      CHECK(sendmsg(d->sv, &mh, 0) == 1); }
+    (void)!write(d->up, &b, 1); (void)!write(d->up, &n, sizeof n);
+    char g; (void)!read(d->dn, &g, 1);
+    return view;
+}
+static int devpts_run2(const char *opts, int want_mount, unsigned *kgid, int *dnw)
+{
+    if (!knob) return SKIP;
+    struct dpa d; int up[2], dn[2];
+    CHECK(pipe(up) == 0 && pipe(dn) == 0);
+    *dnw = dn[1];
+    int sv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    d.up = up[1]; d.dn = dn[0]; d.sv = sv[1];
+    snprintf(d.dir, sizeof d.dir, "/tmp/dpm.%d", (int)getpid());
+    snprintf(d.opts, sizeof d.opts, "%s", opts);
+    mkdir(d.dir, 0755);
+    int go; pid_t c = spawn(-1, c_devpts, &d, &go);
+    CHECK(c > 0);
+    CHECK(wrp(c, "uid_map", "0 100000 65536\n") == 0);
+    wrp(c, "setgroups", "deny");
+    CHECK(wrp(c, "gid_map", "0 100000 65536\n") == 0);
+    (void)!write(go, "g", 1);
+    char b = 0; CHECK(read(up[0], &b, 1) == 1);
+    int ok = 1;
+    if (want_mount) {
+        unsigned n = 0; CHECK(b == 'o' && read(up[0], &n, sizeof n) == sizeof n);
+        struct stat st; int sl = -1;
+        { char cb[CMSG_SPACE(sizeof(int))] = {0}; char x;
+          struct iovec io = { &x, 1 };
+          struct msghdr mh = { 0 }; mh.msg_iov = &io; mh.msg_iovlen = 1; mh.msg_control = cb; mh.msg_controllen = sizeof cb;
+          struct cmsghdr *cm;
+          if (recvmsg(sv[0], &mh, 0) == 1 && (cm = CMSG_FIRSTHDR(&mh))) memcpy(&sl, CMSG_DATA(cm), sizeof sl); }
+        ok = sl >= 0 && fstat(sl, &st) == 0;
+        if (ok) *kgid = st.st_gid;
+        (void)!write(dn[1], "x", 1);
+    } else ok = b == 'e';
+    int s; waitpid(c, &s, 0); rmdir(d.dir);
+    CHECK(ok);
+    return WIFEXITED(s) && WEXITSTATUS(s) == 0 ? 0 : 3;
+}
+static int devpts_run(const char *opts, int want_mount, unsigned *kgid)
+{
+    int dnw = -1;
+    int r = devpts_run2(opts, want_mount, kgid, &dnw);
+    if (dnw >= 0) close(dnw); /* releases a child still waiting */
+    return r;
+}
+static int devpts_gid_translated(void)
+{
+    unsigned k = 0;
+    int r = devpts_run("newinstance,ptmxmode=0666,gid=5", 1, &k);
+    if (r) return r;
+    printf("  devpts host kgid=%u\n", k);
+    return k == 100005 ? 0 : 4;
+}
+static int devpts_gid_unmapped_einval(void) { return devpts_run("newinstance,gid=70000", 0, NULL); }
+static int devpts_uid_unmapped_einval(void) { return devpts_run("newinstance,uid=70000", 0, NULL); }
+
 static const struct { const char *name; int (*fn)(void); } cases[] = {
+    { "devpts_gid_translated", devpts_gid_translated },
+    { "devpts_gid_unmapped_einval", devpts_gid_unmapped_einval },
+    { "devpts_uid_unmapped_einval", devpts_uid_unmapped_einval },
     { "map_identity_still_ok", map_identity_still_ok },
     { "map_overlap_lower_einval", map_overlap_lower_einval },
     { "lower_minus1_einval", lower_minus1_einval },

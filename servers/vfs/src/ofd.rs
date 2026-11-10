@@ -150,6 +150,7 @@ pub fn put_deferred(id: u32) -> (bool, bool) {
 /// Run the release hook for `id`, whose last reference `put_deferred` dropped
 /// with `watched` set.
 pub fn release(id: u32) {
+    crate::inotify::released(id);
     let f = RELEASE_HOOK.load(core::sync::atomic::Ordering::Acquire);
     if f != 0 {
         let f: fn(u32) = unsafe { core::mem::transmute(f) };

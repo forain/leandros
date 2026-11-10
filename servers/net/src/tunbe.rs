@@ -91,7 +91,7 @@ fn attach(ns: u16, name: &[u8; 16], tap: bool, h: TunHandle) -> Result<(u32, [u8
         st.next_ifindex += 1;
         let mac = [0x02, 0x00, 0x5e, 0x10, (sid as u8), 0x01];
         v[sid] = Some(Vif { netns: ns, ifindex, name: fin, kind, admin_up: false, mtu: 1500, mac,
-                            addrs: Vec::new(), rxq: VecDeque::new(), tun: h, pending: false, peer: NO_PEER, master: NO_PEER });
+                            addrs: Vec::new(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: h, pending: false, peer: NO_PEER, master: NO_PEER });
         st.sids.push(sid as Sid);
         (sid as Sid, fin, ifindex, mac)
     };
@@ -110,7 +110,7 @@ fn detach(h: TunHandle, keep: bool) {
     let Some((ns, sid)) = found else { return };
     if keep {
         let mut v = VIFS.lock();
-        if let Some(x) = v[sid as usize].as_mut() { x.tun = NO_TUN; x.rxq.clear(); }
+        if let Some(x) = v[sid as usize].as_mut() { x.tun = NO_TUN; x.rxq.clear(); x.rxsrc.clear(); }
         return;
     }
     {
@@ -278,15 +278,15 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
     }
     for sid in sids {
         // Drain the vif's queue before the stack lock is taken.
-        let (rx, mtu, h, l3, mac, peer, kind, master) = {
+        let (rx, rxsrc, mtu, h, l3, mac, peer, kind, master) = {
             let mut v = VIFS.lock();
             let Some(x) = v[sid as usize].as_mut() else { continue };
             x.pending = false;
             let peer = if x.kind == VifKind::Veth { Some(x.peer) } else { None };
-            (core::mem::take(&mut x.rxq), x.mtu as usize, x.tun, x.kind == VifKind::Tun, x.mac, peer, x.kind, x.master)
+            (core::mem::take(&mut x.rxq), core::mem::take(&mut x.rxsrc), x.mtu as usize, x.tun, x.kind == VifKind::Tun, x.mac, peer, x.kind, x.master)
         };
         // Frames to the bridge MAC for another network may be forwarded (fwd.rs).
-        let rx = if kind == VifKind::Bridge { crate::fwd::divert(sid, rx) } else { rx };
+        let rx = if kind == VifKind::Bridge { crate::fwd::divert(sid, rx, rxsrc) } else { rx };
         // A bridge port has no stack: what its peer sent goes into the switch.
         if kind == VifKind::Veth && master != NO_PEER {
             if !rx.is_empty() { crate::l2::forward(master, sid, rx.into_iter().collect()); }
@@ -394,7 +394,7 @@ pub fn sock_set(ns: u16, cmd: u32, ifr: &[u8; 40]) -> Option<i32> {
             0x8914 => { // SIFFLAGS
                 let f = u16::from_ne_bytes([ifr[16], ifr[17]]);
                 x.admin_up = f & 1 != 0;
-                if !x.admin_up { x.rxq.clear(); }
+                if !x.admin_up { x.rxq.clear(); x.rxsrc.clear(); }
             }
             0x8916 | 0x891c => { // SIFADDR / SIFNETMASK
                 let a = [ifr[20], ifr[21], ifr[22], ifr[23]];
@@ -525,7 +525,7 @@ pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
                 if let Some(m) = mtu { x.mtu = m; }
                 if let Some(m) = mac { x.mac = m; }
                 if let Some(n) = name.as_ref() { x.name = [0; 16]; x.name[..n.len()].copy_from_slice(n.as_bytes()); }
-                if let Some(u) = up { x.admin_up = u; if !u { x.rxq.clear(); } }
+                if let Some(u) = up { x.admin_up = u; if !u { x.rxq.clear(); x.rxsrc.clear(); } }
             }
             if let Some(m) = mac {
                 if let Some(s) = stack_for(sid).as_mut() {
@@ -713,7 +713,7 @@ fn veth_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>, m
         let ib = { let st = nss.get_mut(&pns).unwrap(); let i = st.next_ifindex; st.next_ifindex += 1; i };
         let mk = |ns, ifindex, name, up, mtu: Option<u32>, mac, peer| Vif {
             netns: ns, ifindex, name, kind: VifKind::Veth, admin_up: up, mtu: mtu.unwrap_or(1500), mac,
-            addrs: Vec::new(), rxq: VecDeque::new(), tun: NO_TUN, pending: false, peer, master: NO_PEER,
+            addrs: Vec::new(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: NO_TUN, pending: false, peer, master: NO_PEER,
         };
         v[sa] = Some(mk(ns, ia, na, up, mtu, ma, sb as Sid));
         v[sb] = Some(mk(pns, ib, nb, peer.up, peer.mtu, mb, sa as Sid));
@@ -748,7 +748,7 @@ fn enslave(ns: u16, sid: Sid, br_index: u32) -> i32 {
         if x.master != NO_PEER { return 16; } // EBUSY: enslaved to another master
         x.master = b;
         x.addrs.clear();
-        x.rxq.clear();
+        x.rxq.clear(); x.rxsrc.clear();
     }
     {
         let mut nss = NETNS.lock();
@@ -768,7 +768,7 @@ fn release(sid: Sid) -> i32 {
         let Some(x) = v[sid as usize].as_mut() else { return 19 };
         if x.master == NO_PEER { return 0; }
         x.master = NO_PEER;
-        x.rxq.clear();
+        x.rxq.clear(); x.rxsrc.clear();
         x.mac
     };
     crate::l2::forget(sid);
@@ -794,7 +794,7 @@ fn bridge_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>,
         st.next_ifindex += 1;
         v[sid] = Some(Vif {
             netns: ns, ifindex, name: nm, kind: VifKind::Bridge, admin_up: up, mtu: mtu.unwrap_or(1500), mac: m,
-            addrs: Vec::new(), rxq: VecDeque::new(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER,
+            addrs: Vec::new(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER,
         });
         st.sids.push(sid as Sid);
         (sid as Sid, m)
