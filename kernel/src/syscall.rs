@@ -8884,14 +8884,16 @@ fn lstat_magic_link(ns: &[u8], statbuf_ptr: usize) -> Option<isize> {
 const OPEN_O_NOFOLLOW: usize = 0o400000;
 
 /// `/proc/<own>/fd/N` (final component, magic link followed) naming a
-/// descriptor that has no filesystem path (socket, pipe, eventfd, ...): N.
+/// descriptor that has no filesystem path (socket, pipe, eventfd, ...): its
+/// VFS handle (see fd_handle).
 /// Linux resolves those to the anonymous inode, so stat describes the object
 /// and chmod/chown succeed without touching a file (conmon chmods its bound
 /// console socket as "/proc/self/fd/N").
 fn proc_own_anon_fd(ns_path: &[u8]) -> Option<usize> {
     let (fd, below) = proc_own_fd(ns_path)?;
-    if !below.is_empty() || fd_host_path(fd).is_some() { return None; }
-    Some(fd)
+    let h = fd_handle(fd);
+    if !below.is_empty() || fd_host_path(h).is_some() { return None; }
+    Some(h)
 }
 
 /// The host path of fd `fd` when it names a live directory the VFS can
