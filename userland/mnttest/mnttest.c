@@ -1267,6 +1267,7 @@ static int nsfs_thread_bind(int mode) {
     snprintf(file, sizeof file, "/tmp/nsfst.%d", (int)getpid());
     if (mode == 1) {
         if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+        int pf = open(file, O_RDONLY | O_CREAT | O_EXCL, 0); if (pf < 0) return 89; close(pf);
         if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
         wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
     } else if (mode == 2 && unshare(CLONE_NEWNS) < 0) return 91;
@@ -1285,7 +1286,7 @@ static int nsfs_thread_bind(int mode) {
     if (stat(src, &ls) < 0 || ls.st_ino != tb_ino) { rc = 97; goto out; }
     snprintf(src, sizeof src, "/proc/self/task/%d/ns/net", tb_tid);
     /* podman: O_CREAT|O_EXCL, mode 0 */
-    int cf = open(file, O_RDONLY | O_CREAT | O_EXCL, 0); if (cf < 0) { rc = 98; goto out; } close(cf);
+    if (mode != 1) { int cf = open(file, O_RDONLY | O_CREAT | O_EXCL, 0); if (cf < 0) { rc = 98; goto out; } close(cf); }
     if (mount(src, file, "none", MS_BIND, NULL) < 0) { printf("  thread nsfs bind errno=%d\n", errno); rc = 1; goto out; }
     int fd = open(file, O_RDONLY);
     struct stat a;
