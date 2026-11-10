@@ -49,13 +49,13 @@ pub enum F {
     Procs, Threads, Controllers, SubtreeControl, MaxDepth, MaxDescendants, Stat,
     Type, Events, PidsCurrent, PidsMax, PidsPeak, PidsEvents,
     MemCurrent, MemMax, MemHigh, MemLow, MemMin, MemSwapMax, MemSwapCurrent, MemEvents, MemStat,
-    MemOomGroup, CpuMax, CpuWeight, CpuStat, IoMax, IoWeight, IoStat,
+    MemOomGroup, CpuMax, CpuWeight, CpuStat, IoMax, IoWeight, IoStat, Freeze, Kill,
 }
-const ALL: [F; 29] = [F::Procs, F::Threads, F::Controllers, F::SubtreeControl, F::MaxDepth,
+const ALL: [F; 31] = [F::Procs, F::Threads, F::Controllers, F::SubtreeControl, F::MaxDepth,
     F::MaxDescendants, F::Stat, F::Type, F::Events, F::PidsCurrent, F::PidsMax, F::PidsPeak,
     F::PidsEvents, F::MemCurrent, F::MemMax, F::MemHigh, F::MemLow, F::MemMin, F::MemSwapMax,
     F::MemSwapCurrent, F::MemEvents, F::MemStat, F::MemOomGroup, F::CpuMax, F::CpuWeight,
-    F::CpuStat, F::IoMax, F::IoWeight, F::IoStat];
+    F::CpuStat, F::IoMax, F::IoWeight, F::IoStat, F::Freeze, F::Kill];
 
 /// Stored (not enforced) controller knobs, keyed by (cgroup, file index).
 static KNOBS: Mutex<BTreeMap<(CgId, u8), String>> = Mutex::new(BTreeMap::new());
@@ -73,7 +73,7 @@ fn ctrl_of(f: F) -> u8 {
 }
 fn stored(f: F) -> bool {
     matches!(f, F::MemMax | F::MemHigh | F::MemLow | F::MemMin | F::MemSwapMax | F::MemOomGroup
-        | F::CpuMax | F::CpuWeight | F::IoMax | F::IoWeight)
+        | F::CpuMax | F::CpuWeight | F::IoMax | F::IoWeight | F::Freeze)
 }
 fn knob_default(f: F) -> &'static str {
     match f {
@@ -83,6 +83,7 @@ fn knob_default(f: F) -> &'static str {
         F::MemStat => "anon 0\nfile 0\n",
         F::CpuMax => "max 100000\n",
         F::CpuWeight => "100\n",
+        F::Freeze => "0\n",
         F::CpuStat => "usage_usec 0\nuser_usec 0\nsystem_usec 0\n",
         F::IoWeight => "default 100\n",
         _ => "",
@@ -103,12 +104,13 @@ fn fname(f: F) -> &'static str {
         F::MemStat => "memory.stat", F::MemOomGroup => "memory.oom.group",
         F::CpuMax => "cpu.max", F::CpuWeight => "cpu.weight", F::CpuStat => "cpu.stat",
         F::IoMax => "io.max", F::IoWeight => "io.weight", F::IoStat => "io.stat",
+        F::Freeze => "cgroup.freeze", F::Kill => "cgroup.kill",
     }
 }
 
 fn has_file(cg: CgId, f: F) -> bool {
     match f {
-        F::Type | F::Events => cg != 0,
+        F::Type | F::Events | F::Freeze | F::Kill => cg != 0,
         _ if ctrl_of(f) != 0 => cg != 0 && cgroup::controllers(cg) & ctrl_of(f) != 0,
         _ => true,
     }
@@ -183,7 +185,9 @@ pub fn read(cg: CgId, f: F) -> Vec<u8> {
         F::Type => s.push_str("domain\n"),
         F::Events => {
             s.push_str(if cgroup::populated(cg) { "populated 1\n" } else { "populated 0\n" });
-            s.push_str("frozen 0\n");
+            // cgroup.freeze is a recorded request, not scheduler enforcement:
+            // cgroup.events reports it as `frozen 1` (see freeze_requested).
+            s.push_str(if freeze_requested(cg) { "frozen 1\n" } else { "frozen 0\n" });
         }
         F::PidsCurrent => { push_u(&mut s, cgroup::subtree_tasks(cg) as u64); s.push('\n'); }
         F::PidsMax => limit_text(cgroup::pids_max(cg), &mut s),
@@ -195,6 +199,10 @@ pub fn read(cg: CgId, f: F) -> Vec<u8> {
         },
     }
     s.into_bytes()
+}
+
+fn freeze_requested(cg: CgId) -> bool {
+    KNOBS.lock().get(&(cg, F::Freeze as u8)).map(|v| v.starts_with('1')).unwrap_or(false)
 }
 
 fn parse_limit(d: &[u8]) -> Result<u32, isize> {
@@ -248,7 +256,7 @@ pub fn write(pid: u32, cg: CgId, f: F, data: &[u8]) -> isize {
             if t.is_empty() && f != F::IoMax { return -22; }
             let ok = match f {
                 F::CpuWeight => t.parse::<u32>().map(|v| (1..=10000).contains(&v)).unwrap_or(false),
-                F::MemOomGroup => t == "0" || t == "1",
+                F::MemOomGroup | F::Freeze => t == "0" || t == "1",
                 F::MemMax | F::MemHigh | F::MemLow | F::MemMin | F::MemSwapMax =>
                     t == "max" || t.parse::<u64>().is_ok(),
                 _ => true,
@@ -256,6 +264,14 @@ pub fn write(pid: u32, cg: CgId, f: F, data: &[u8]) -> isize {
             if !ok { return -22; }
             let mut v = String::from(t); v.push('\n');
             KNOBS.lock().insert((cg, f as u8), v);
+            0
+        }
+        F::Kill => {
+            // Write-only; only "1" is valid. SIGKILL every process of the subtree.
+            if core::str::from_utf8(data).map(|s| s.trim() != "1").unwrap_or(true) { return -22; }
+            for t in cgroup::subtree_tgids(cg) {
+                let _ = sched::deliver_signal_process(t, 9, sched::task::SigInfo::KERNEL);
+            }
             0
         }
         F::Type => if core::str::from_utf8(data).map(|s| s.trim() == "domain").unwrap_or(false) { 0 } else { -22 },
@@ -272,7 +288,7 @@ pub fn stat(pid: u32, path: &[u8]) -> Option<(u32, u32, u64, u32, u32)> {
         }
         Node::File(cg, f) => {
             let (u, g) = cgroup::dir_owner(cg);
-            Some((if read_only(f) { 0o100444 } else { 0o100644 }, 1,
+            Some((if f == F::Kill { 0o100200 } else if read_only(f) { 0o100444 } else { 0o100644 }, 1,
                   0x6000_0000 + (cg as u64) * 64 + 1 + f as u64, u, g))
         }
     }
@@ -291,7 +307,10 @@ pub fn open(pid: u32, path: &[u8], flags: u32) -> Open {
         Some(_) if flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) => Open::Err(-17),
         Some(Node::Dir(cg)) => if wr { Open::Err(-21) } else { Open::Dir(cg) },
         Some(Node::File(cg, f)) => {
-            if !wr { return Open::Read(read(cg, f)); }
+            if !wr {
+                if f == F::Kill { return Open::Err(-22); }
+                return Open::Read(read(cg, f));
+            }
             if read_only(f) || !may_write(pid, cgroup::dir_owner(cg).0) {
                 return Open::Err(-13);
             }
