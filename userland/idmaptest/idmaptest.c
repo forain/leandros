@@ -1052,6 +1052,9 @@ static pid_t fork_subuid_child(int *go)
         char b = 'r';
         close(g[1]); close(r[0]);
         if (setresuid(1, 1, 1)) _exit(98);
+        /* setresuid clears dumpable; Linux __ptrace_may_access then needs CAP_SYS_PTRACE in mm->user_ns
+         * (the init ns here: never exec'd inside the userns), so opt in like a real exec would. */
+        prctl(PR_SET_DUMPABLE, 1);
         (void)!write(r[1], &b, 1);
         (void)!read(g[0], &b, 1);
         _exit(0);
