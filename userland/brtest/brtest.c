@@ -980,6 +980,11 @@ static int fwd_body(void) {
         close(fd);
         ok = 1;
     }
+    else if (g_fwd_mode == 6) { /* TCP to the bridge's own address: a host 0.0.0.0 listener, with forwarding on */
+        int fd = tcp_conn("10.97.0.1", 7779);
+        ok = fd >= 0;
+        if (fd >= 0) close(fd);
+    }
     else { char gw[32]; fwd_gateway(gw); ok = icmp_ping(gw); }
     return ok == g_fwd_expect ? 0 : 4 + ok;
 }
@@ -1000,6 +1005,13 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     snprintf(msg, sizeof msg, "%s: br0 10.97.0.1/24 up", name); CHECK(msg, ok);
     snprintf(msg, sizeof msg, "%s: ip_forward=%d", name, ipfwd); CHECK(msg, ip_forward_set(ipfwd) == 0);
     g_fwd_mode = mode; g_fwd_expect = ipfwd;
+    int hl = -1;
+    if (mode == 6) {
+        hl = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7779) };
+        snprintf(msg, sizeof msg, "%s: host wildcard listener on 7779", name);
+        CHECK(msg, !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
+    }
     pid_t c = spawn_ns(fwd_body);
     int cc[2] = { ctl[0], ctl[1] }, dd[2] = { done_[0], done_[1] };
     snprintf(msg, sizeof msg, "%s: netns spawned", name); CHECK(msg, c > 0);
@@ -1036,13 +1048,15 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
         rc = 0;
     }
     printf("%s child exit %d\n", name, rc);
-    if (mode == 2) snprintf(msg, sizeof msg, "%s: TCP DNS query to the resolver%s is answered through NAT", name, g_http ? " and an HTTP GET" : "");
+    if (mode == 6) snprintf(msg, sizeof msg, "%s: connect to the bridge address reaches the host 0.0.0.0 listener", name);
+    else if (mode == 2) snprintf(msg, sizeof msg, "%s: TCP DNS query to the resolver%s is answered through NAT", name, g_http ? " and an HTTP GET" : "");
     else if (mode >= 4) snprintf(msg, sizeof msg, "%s: flow holder exited cleanly", name);
     else if (mode == 0 && ipfwd) snprintf(msg, sizeof msg, "%s: UDP DNS query to the resolver is answered through NAT", name);
     else if (mode == 1 && ipfwd) snprintf(msg, sizeof msg, "%s: ICMP echo to the default gateway is answered through NAT", name);
     else snprintf(msg, sizeof msg, "%s: ip_forward=0 means no reply (nothing forwarded)", name);
     CHECK(msg, rc == 0);
     ip_forward_set(0);
+    if (hl >= 0) close(hl);
     if (iv > 0) link_del(s, iv);
     link_del(s, bidx);
     close(s);
@@ -1052,6 +1066,7 @@ static void fwd_ping(void) { fwd_case("fwd_ping", 1, 1); }
 static void fwd_off(void) { fwd_case("fwd_off", 0, 0); }
 static void fwd_tcp(void) { fwd_case("fwd_tcp", 2, 1); }
 static void fwd_port_reserved(void) { fwd_case("fwd_port_reserved", 4, 1); }
+static void fwd_hostlisten(void) { fwd_case("fwd_hostlisten", 6, 1); }
 static void fwd_reap(void) { fwd_case("fwd_reap", 5, 1); }
 
 int main(int argc, char **argv) {
@@ -1075,6 +1090,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "fwd_tcp")) fwd_tcp();
     if (!only || !strcmp(only, "fwd_port_reserved")) fwd_port_reserved();
     if (!only || !strcmp(only, "fwd_reap")) fwd_reap();
+    if (!only || !strcmp(only, "fwd_hostlisten")) fwd_hostlisten();
     printf("brtest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
