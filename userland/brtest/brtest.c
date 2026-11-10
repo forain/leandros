@@ -971,6 +971,11 @@ static int fwd_body(void) {
         ok = tcp_dns_c(srv);
         if (ok && g_http) ok = http_get(g_http);
     }
+    else if (g_fwd_mode == 6) { /* TCP to the bridge's own address: a host 0.0.0.0 listener, with forwarding on */
+        int fd = tcp_conn("10.97.0.1", 7779);
+        ok = fd >= 0;
+        if (fd >= 0) close(fd);
+    }
     else if (g_fwd_mode >= 4) { /* hold an established TCP flow open until released */
         char srv[64]; fwd_resolver(srv);
         int fd = tcp_conn(srv, 53);
@@ -979,11 +984,6 @@ static int fwd_body(void) {
         rd_to(ctl[0], &ch);
         close(fd);
         ok = 1;
-    }
-    else if (g_fwd_mode == 6) { /* TCP to the bridge's own address: a host 0.0.0.0 listener, with forwarding on */
-        int fd = tcp_conn("10.97.0.1", 7779);
-        ok = fd >= 0;
-        if (fd >= 0) close(fd);
     }
     else { char gw[32]; fwd_gateway(gw); ok = icmp_ping(gw); }
     return ok == g_fwd_expect ? 0 : 4 + ok;
@@ -1027,7 +1027,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     snprintf(msg, sizeof msg, "%s: netns configured eth0 + default via 10.97.0.1", name); CHECK(msg, rd == 1);
     if (rd == 1) write(cc[1], &ch, 1); /* go */
     int natp = 0;
-    if (mode >= 4) {
+    if (mode >= 4 && mode != 6) {
         snprintf(msg, sizeof msg, "%s: precondition: no NAT port is held yet", name);
         CHECK(msg, nat_scan() == 0);
         rd = rd_to(dd[0], &ch);
@@ -1103,6 +1103,7 @@ static void hostlisten_not_in_ns(void) {
         _exit(errno == ECONNREFUSED ? 0 : 6);
     }
     int rc = wait_child(h);
+    printf("hostlisten_not_in_ns child exit %d (5 = connected, 6 = other errno)\n", rc);
     CHECK("hostlisten_not_in_ns: connect to the netns's own address is refused", rc == 0);
     int fl = fcntl(hl, F_GETFL); fcntl(hl, F_SETFL, fl | O_NONBLOCK);
     int a = accept(hl, NULL, NULL);
