@@ -1254,13 +1254,43 @@ static int fdp_root_mntns(int m) {
  * /proc/self/task/<tid>/ns/net onto an O_EXCL mode-0 file). */
 static volatile int tb_tid, tb_state;           /* state: 0 start, 1 ready, 2 quit */
 static volatile ino_t tb_ino;
+static const char *tb_self_bind;                /* thread binds thread-self itself */
+static volatile int tb_bind_rc;
 static void *tb_thread(void *a) {
     (void)a;
     struct stat st;
     if (unshare(CLONE_NEWNET) < 0 || stat("/proc/thread-self/ns/net", &st) < 0) { tb_state = -1; return NULL; }
-    tb_ino = st.st_ino; tb_tid = (int)syscall(SYS_gettid); tb_state = 1;
+    tb_ino = st.st_ino; tb_tid = (int)syscall(SYS_gettid);
+    if (tb_self_bind) {
+        tb_bind_rc = mount("/proc/thread-self/ns/net", tb_self_bind, "none", MS_BIND, NULL) < 0 ? errno : 0;
+    }
+    tb_state = 1;
     while (tb_state == 1) usleep(1000);
     return NULL;
+}
+static int nsfs_thread_selfbind(int mode) {
+    (void)mode;
+    mkdir("/run", 0755); mkdir("/run/netns", 0755);
+    if (mount("/run/netns", "/run/netns", "none", MS_BIND | MS_REC, NULL) < 0) return 90;
+    if (mount("", "/run/netns", NULL, MS_SHARED | MS_REC, NULL) < 0) return 91;
+    static char file[] = "/run/netns/netns-tb";
+    int cf = open(file, O_RDONLY | O_CREAT | O_EXCL, 0); if (cf < 0) return 92; close(cf);
+    tb_self_bind = file; tb_state = 0;
+    pthread_t th;
+    if (pthread_create(&th, NULL, tb_thread, NULL)) return 93;
+    for (int i = 0; i < 2000 && tb_state == 0; i++) usleep(1000);
+    int rc = tb_state != 1 ? 94 : 0;
+    if (!rc && tb_bind_rc) { printf("  thread-self bind errno=%d\n", tb_bind_rc); rc = 1; }
+    if (!rc) {
+        int fd = open(file, O_RDONLY); struct stat a;
+        if (fd < 0 || fstat(fd, &a) < 0 || a.st_ino != tb_ino) rc = 4;
+        if (fd >= 0) close(fd);
+        if (umount(file) < 0 && !rc) rc = 7;
+        if (unlink(file) < 0 && !rc) rc = 8;
+    }
+    tb_state = 2; pthread_join(th, NULL);
+    umount2("/run/netns", MNT_DETACH);
+    return rc;
 }
 static int nsfs_thread_bind(int mode) {
     char file[64], src[96];
@@ -1385,6 +1415,7 @@ static void fdpath_suite(void) {
     report("nsfs_bind_in_mntns_root", nn_in_child(nsfs_in_mntns, 0));
     report("nsfs_bind_in_userns_mntns", nn_in_child(nsfs_in_mntns, 1));
     report("nsfs_bind_in_mntns_then_unshare_newns", nn_in_child(nsfs_in_mntns, 2));
+    report("nsfs_thread_self_bind_run_netns", nn_in_child(nsfs_thread_selfbind, 0));
     report("nsfs_thread_task_bind_root", nn_in_child(nsfs_thread_bind, 0));
     report("nsfs_thread_task_bind_mntns", nn_in_child(nsfs_thread_bind, 2));
     report("nsfs_thread_task_bind_userns_mntns", nn_in_child(nsfs_thread_bind, 1));
