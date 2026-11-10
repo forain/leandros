@@ -195,6 +195,8 @@ if command -v zig >/dev/null 2>&1; then
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ovltest" userland/ovltest/ovltest.c
     echo "[userland] Building ovlmknodtest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ovlmknodtest" userland/ovlmknodtest/ovlmknodtest.c
+    echo "[userland] Building inotifytest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/inotifytest" userland/inotifytest/inotifytest.c
     echo "[userland] Building idmaptest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/idmaptest" userland/idmaptest/idmaptest.c
     echo "[userland] Building cgtest (zig cc -target $ZT)..."
