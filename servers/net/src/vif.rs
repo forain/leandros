@@ -41,7 +41,7 @@ pub(crate) fn all_dyn_sids() -> Vec<Sid> {
 
 /// The user namespace that owns `ns`, for the CAP_NET_ADMIN check
 /// (`ns_capable(CAP_NET_ADMIN, owner_userns(netns))`). 0 for the initial one.
-pub(crate) fn owner_userns(ns: u16) -> u16 { sched::ns::owner_userns(ns) }
+pub(crate) fn owner_userns(ns: u16) -> u16 { sched::ns::owner_userns(1, ns) }
 
 // ---- namespace death ------------------------------------------------------
 
