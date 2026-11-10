@@ -3393,7 +3393,7 @@ static void nsforge_detached_theft(void)
 {
     mkdir("/tmp/nsforge_mp", 0755);
     mkdir("/tmp/nsforge_src", 0755);
-    int tree = syscall(SYS_open_tree, AT_FDCWD, "/tmp/nsforge_src", 1 /*OPEN_TREE_CLONE*/ | 0x80000 /*CLOEXEC*/);
+    int tree = syscall(SYS_open_tree, AT_FDCWD, "/tmp", 1 /*OPEN_TREE_CLONE*/ | 0x80000 /*CLOEXEC*/);
     if (tree < 0) { printf("  open_tree errno %d\n", errno); check("nsforge_detached_theft_denied", 0); return; }
     pid_t c = fork();
     if (c == 0) {
