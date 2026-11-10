@@ -1925,6 +1925,155 @@ static int t_netns_udp_bind(void)
     return 0;
 }
 
+/* ---- lane nslo: a real loopback per netns ---- */
+#include <netinet/ip_icmp.h>
+static int ns_lo_set(int up)
+{
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo");
+    q.ifr_flags = up ? (IFF_UP | IFF_RUNNING) : 0;
+    int r = ioctl(u, SIOCSIFFLAGS, &q);
+    close(u);
+    return r;
+}
+static struct sockaddr_in lo_addr(unsigned port)
+{
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    return a;
+}
+/* TCP echo + UDP echo + ping on 127.0.0.1 inside the current netns. 0 = ok. */
+static int lo_traffic(unsigned port)
+{
+    struct sockaddr_in a = lo_addr(port);
+    struct timeval tv = { 2, 0 };
+    char buf[16];
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    if (l < 0 || bind(l, (void *)&a, sizeof a) || listen(l, 4)) return 10;
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (connect(c, (void *)&a, sizeof a)) return 11;
+    int s = accept(l, 0, 0);
+    if (s < 0) return 12;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (write(c, "ping", 4) != 4) return 13;
+    if (read(s, buf, sizeof buf) != 4 || memcmp(buf, "ping", 4)) return 14;
+    if (write(s, "pong", 4) != 4) return 15;
+    if (read(c, buf, sizeof buf) != 4 || memcmp(buf, "pong", 4)) return 16;
+    close(c); close(s); close(l);
+    int u = socket(AF_INET, SOCK_DGRAM, 0), v = socket(AF_INET, SOCK_DGRAM, 0);
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (bind(u, (void *)&a, sizeof a)) return 20;
+    if (sendto(v, "dg", 2, 0, (void *)&a, sizeof a) != 2) return 21;
+    if (recv(u, buf, sizeof buf, 0) != 2) return 22;
+    close(u); close(v);
+    int p = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (p < 0) return 30;
+    setsockopt(p, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct icmphdr h; memset(&h, 0, sizeof h); h.type = ICMP_ECHO; h.un.echo.id = 7; h.un.echo.sequence = 1;
+    struct sockaddr_in pa = lo_addr(0);
+    if (sendto(p, &h, sizeof h, 0, (void *)&pa, sizeof pa) != (ssize_t)sizeof h) return 31;
+    unsigned char r[64];
+    if (recv(p, r, sizeof r, 0) < 8) return 32;
+    close(p);
+    return 0;
+}
+static int lo_updown_body(void)
+{
+    struct sockaddr_in a = lo_addr(41600);
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    if (!(connect(t, (void *)&a, sizeof a) == -1 && errno == ENETUNREACH)) return 1;   /* lo down */
+    if (ns_lo_set(1)) return 2;
+    int r = lo_traffic(41600);
+    if (r) return r;
+    if (ns_lo_set(0)) return 3;
+    int t2 = socket(AF_INET, SOCK_STREAM, 0);
+    if (!(connect(t2, (void *)&a, sizeof a) == -1 && errno == ENETUNREACH)) return 4;   /* down again */
+    return 0;
+}
+static int t_netns_lo_echo(void)
+{
+    CHECK(ns_child_netns(lo_updown_body) == 0);
+    return 0;
+}
+static int lo_same_port_body(void)
+{
+    if (ns_lo_set(1)) return 2;
+    int l; struct sockaddr_in a = lo_addr(41610);
+    l = socket(AF_INET, SOCK_STREAM, 0);
+    if (bind(l, (void *)&a, sizeof a) || listen(l, 4)) return 3;
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(c, (void *)&a, sizeof a)) return 4;
+    return 0;
+}
+static int t_netns_lo_two_ns_same_port(void)
+{
+    int hp; CHECK(wild_listener(41610, &hp) == 0);       /* the host holds the port too */
+    int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
+    pid_t cs[2];
+    for (int i = 0; i < 2; i++) {
+        cs[i] = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+        if (cs[i] == 0) {
+            int r = lo_same_port_body();
+            char b = (char)r;
+            write(pfd[1], &b, 1);
+            char x; read(qfd[0], &x, 1);
+            _exit(r);
+        }
+        CHECK(cs[i] > 0);
+    }
+    char r0 = 99, r1 = 99;
+    CHECK(read(pfd[0], &r0, 1) == 1 && read(pfd[0], &r1, 1) == 1);
+    CHECK(r0 == 0 && r1 == 0);
+    write(qfd[1], "xx", 2);
+    for (int i = 0; i < 2; i++) { int st; waitpid(cs[i], &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0); }
+    return 0;
+}
+static int lo_host_unreach_body(void)
+{
+    if (ns_lo_set(1)) return 2;
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = lo_addr(41620);
+    if (!(connect(c, (void *)&a, sizeof a) == -1 && errno == ECONNREFUSED)) return 3;   /* host's service is not here */
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct timeval tv = { 0, 300000 };
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct sockaddr_in b = lo_addr(41621);
+    if (sendto(u, "x", 1, 0, (void *)&b, sizeof b) < 0) return 4;
+    char buf[4];
+    if (recv(u, buf, sizeof buf, 0) >= 0) return 5;     /* nothing echoes back from the host */
+    return 0;
+}
+static int t_netns_lo_host_unreachable(void)
+{
+    int hp; CHECK(wild_listener(41620, &hp) == 0);
+    int hu = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = lo_addr(41621);
+    CHECK(bind(hu, (void *)&a, sizeof a) == 0);
+    CHECK(ns_child_netns(lo_host_unreach_body) == 0);
+    /* and the host saw no datagram from the netns */
+    struct timeval tv = { 0, 100000 };
+    setsockopt(hu, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    char buf[4];
+    CHECK(recv(hu, buf, sizeof buf, 0) < 0);
+    /* the netns's listener is not reachable from the host */
+    return 0;
+}
+static int lo_slot_body(void)
+{
+    if (ns_lo_set(1)) return 2;
+    return lo_traffic(41630) ? 3 : 0;
+}
+static int t_netns_lo_slots_reclaimed(void)
+{
+    /* 100 netns with lo up in a row: the 64 stack slots are reused */
+    for (int i = 0; i < 100; i++) {
+        int r = ns_child_netns(lo_slot_body);
+        if (r != 0) { printf("  iteration %d: rc %d\n", i, r); return 1; }
+    }
+    return 0;
+}
+
 /* ---- nsmapsec: map-file confused deputy, write race, chrooted NEWUSER, fdinfo ---- */
 static pid_t spawn_userns(int *go_w, int (*after)(void))
 {
@@ -2858,7 +3007,7 @@ static int run_userns_cases(void)
         { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
         { "procsysnet_defaults", t_procsysnet_defaults }, { "procsysnet_netns_isolated", t_procsysnet_netns_isolated }, { "procsysnet_root_write", t_procsysnet_root_write }, { "procsysnet_unpriv_denied", t_procsysnet_unpriv_denied }, { "procsysnet_port_start", t_procsysnet_port_start }, { "procsysnet_ping_range", t_procsysnet_ping_range }, { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_siocsifflags_lo", t_netns_siocsifflags_lo }, { "netns_siocsifflags_lo_userns", t_netns_siocsifflags_lo_userns }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
-        { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
+        { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind }, { "netns_lo_echo", t_netns_lo_echo }, { "netns_lo_two_ns_same_port", t_netns_lo_two_ns_same_port }, { "netns_lo_host_unreachable", t_netns_lo_host_unreachable }, { "netns_lo_slots_reclaimed", t_netns_lo_slots_reclaimed },
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
         { "map_deputy", t_map_deputy }, { "map_race", t_map_race }, { "chroot_newuser_eperm", t_chroot_newuser },
         { "fdinfo_other_uid", t_fdinfo_other_uid },

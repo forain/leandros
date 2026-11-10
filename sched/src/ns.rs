@@ -31,7 +31,20 @@ static OWNER_EGID: [AtomicU32; NS_MAX] = [ZERO32; NS_MAX];
 /// when the id is allocated).
 static LO_UP: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 pub fn lo_admin_up(id: NsId) -> bool { id != 0 && LO_UP[id as usize].load(Acquire) != 0 }
-pub fn set_lo_admin_up(id: NsId, up: bool) { if id != 0 { LO_UP[id as usize].store(up as u8, Release); } }
+pub fn set_lo_admin_up(id: NsId, up: bool) {
+    if id == 0 { return; }
+    LO_UP[id as usize].store(up as u8, Release);
+    let h = LO_HOOK.load(Acquire);
+    if h != 0 {
+        // SAFETY: only `set_lo_hook` stores here, always a `fn(NsId, bool)`.
+        let f: fn(NsId, bool) = unsafe { core::mem::transmute(h) };
+        f(id, up);
+    }
+}
+static LO_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Register the callback that makes a namespace's loopback stack follow its admin state
+/// (runs in the caller's process context, after the state is stored).
+pub fn set_lo_hook(f: fn(NsId, bool)) { LO_HOOK.store(f as usize, Release); }
 
 /// uid/gid maps stored COMPOSED: up to `MAP_EXT` extents per namespace, each
 /// `[upper_first, lower_kuid_first, count]` where the lower id is already a

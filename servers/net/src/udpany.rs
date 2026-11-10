@@ -96,7 +96,8 @@ pub(crate) fn create(ns: u16, ofd: u32, psid: Sid, primary: SocketHandle, port: 
         hs[sid as usize] = Some(s.socket_set.add(socket));
     }
     MIRRORS.lock().insert(ofd, hs);
-    PORTS.lock().register(ofd, port);
+    // Only netns 0's servers follow a late NIC stack (`adopt`).
+    if ns == 0 { PORTS.lock().register(ofd, port); }
 }
 
 /// The socket is gone (its last holder let go): remove the mirrors (the
