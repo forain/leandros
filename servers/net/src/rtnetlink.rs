@@ -34,6 +34,11 @@ const RTM_DELROUTE: u16 = 25;
 const IFLA_TXQLEN: u16 = 13;
 const IFLA_LINKINFO: u16 = 18;
 const IFLA_MASTER: u16 = 10;
+const IFLA_BR_FORWARD_DELAY: u16 = 1;
+const IFLA_BR_AGEING_TIME: u16 = 4;
+const IFLA_BR_STP_STATE: u16 = 5;
+const IFLA_BR_VLAN_FILTERING: u16 = 7;
+const NLA_F_NESTED: u16 = 0x8000;
 const IFLA_INFO_KIND: u16 = 1;
 const RTA_DST: u16 = 1;
 const NLM_F_REPLACE: u16 = 0x100;
@@ -103,6 +108,10 @@ pub struct Link {
     pub veth: bool,
     /// Veth: the other end's ifindex (IFLA_LINK), else 0.
     pub peer: u32,
+    /// The ifindex of the bridge this link is enslaved to (IFLA_MASTER), else 0.
+    pub master: u32,
+    /// A bridge (IFLA_INFO_KIND "bridge"): (ageing, forward_delay, stp_state, vlan_filtering).
+    pub br: Option<(u32, u32, u32, u8)>,
     /// IPv4 address and prefix length, when configured.
     pub addr: Option<([u8; 4], u8)>,
 }
@@ -184,9 +193,18 @@ fn link_msg(l: &Link, seq: u32, pid: u32) -> Vec<u8> {
     attr(&mut v, IFLA_OPERSTATE, &[if l.loopback { 0 } else if l.running { 6 } else { 2 }]);
     attr(&mut v, IFLA_TXQLEN, &1000u32.to_ne_bytes());
     if l.veth && l.peer != 0 { attr(&mut v, IFLA_LINK, &l.peer.to_ne_bytes()); }
+    if l.master != 0 { attr(&mut v, IFLA_MASTER, &l.master.to_ne_bytes()); }
     if l.tap {
         let mut li = Vec::new();
-        attr_str(&mut li, IFLA_INFO_KIND, if l.veth { "veth" } else { "tun" });
+        attr_str(&mut li, IFLA_INFO_KIND, if l.br.is_some() { "bridge" } else if l.veth { "veth" } else { "tun" });
+        if let Some((ageing, fwd, stp, vlan)) = l.br {
+            let mut d = Vec::new();
+            attr(&mut d, IFLA_BR_FORWARD_DELAY, &fwd.to_ne_bytes());
+            attr(&mut d, IFLA_BR_AGEING_TIME, &ageing.to_ne_bytes());
+            attr(&mut d, IFLA_BR_STP_STATE, &stp.to_ne_bytes());
+            attr(&mut d, IFLA_BR_VLAN_FILTERING, &[vlan]);
+            attr(&mut li, IFLA_INFO_DATA | NLA_F_NESTED, &d);
+        }
         attr(&mut v, IFLA_LINKINFO, &li);
     }
     end_msg(&mut v, s);
@@ -310,11 +328,13 @@ pub struct Env<'a> {
 /// A rtnetlink write, parsed and validated by [`parse_write`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum RtOp {
-    SetLink { index: u32, up: Option<bool>, mtu: Option<u32>, mac: Option<[u8; 6]>, name: Option<String> },
+    SetLink { index: u32, up: Option<bool>, mtu: Option<u32>, mac: Option<[u8; 6]>, name: Option<String>, master: Option<u32> },
     AddAddr { index: u32, addr: [u8; 4], prefix: u8, excl: bool },
     DelAddr { index: u32, addr: [u8; 4], prefix: u8 },
     /// RTM_NEWLINK kind=veth with VETH_INFO_PEER.
-    NewVeth { name: Option<String>, mtu: Option<u32>, mac: Option<[u8; 6]>, up: bool, peer: VethPeer },
+    NewVeth { name: Option<String>, mtu: Option<u32>, mac: Option<[u8; 6]>, up: bool, master: Option<u32>, peer: VethPeer },
+    /// RTM_NEWLINK kind=bridge.
+    NewBridge { name: Option<String>, mtu: Option<u32>, mac: Option<[u8; 6]>, up: bool, opts: BrOpts },
     /// RTM_DELLINK of a veth end: removes both ends.
     DelLink { index: u32 },
     AddRoute { dst: [u8; 4], prefix: u8, gw: Option<[u8; 4]>, oif: u32, metric: u32, excl: bool, replace: bool },
@@ -326,7 +346,11 @@ pub enum RtOp {
 pub enum PeerNs { Same, Fd(i32), Pid(u32) }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct VethPeer { pub name: Option<String>, pub mtu: Option<u32>, pub mac: Option<[u8; 6]>, pub up: bool, pub ns: PeerNs }
+pub struct VethPeer { pub name: Option<String>, pub mtu: Option<u32>, pub mac: Option<[u8; 6]>, pub up: bool, pub ns: PeerNs, pub master: Option<u32> }
+
+/// IFLA_BR_* options of a bridge create request.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BrOpts { pub ageing: Option<u32>, pub fwd_delay: Option<u32>, pub stp: Option<u32>, pub vlan: Option<u8> }
 
 fn a4(a: Option<&[u8]>) -> Option<[u8; 4]> {
     let a = a?;
@@ -423,7 +447,8 @@ fn veth_end(b: &[u8], ifi_flags: u32, ifi_change: u32) -> Result<VethPeer, i32> 
         if p.len() < 4 { return Err(22); }
         PeerNs::Pid(rd32(p, 0))
     } else { PeerNs::Same };
-    Ok(VethPeer { name: nla_name(nla_find(b, IFLA_IFNAME)), mtu, mac, up: ifi_change & IFF_UP != 0 && ifi_flags & IFF_UP != 0, ns })
+    let master = match nla_find(b, IFLA_MASTER) { Some(m) if m.len() >= 4 => Some(rd32(m, 0)), Some(_) => return Err(22), None => None };
+    Ok(VethPeer { name: nla_name(nla_find(b, IFLA_IFNAME)), mtu, mac, up: ifi_change & IFF_UP != 0 && ifi_flags & IFF_UP != 0, ns, master })
 }
 
 /// RTM_NEWLINK with NLM_F_CREATE naming a link kind. `None` = not a create
@@ -432,20 +457,33 @@ fn create_link(msg: &[u8], flags: u16, env: &Env) -> Option<i32> {
     if flags & NLM_F_CREATE == 0 { return None; }
     let li = find_attr(msg, 16, IFLA_LINKINFO)?;
     let kind = nla_find(li, IFLA_INFO_KIND)?;
-    if !cstr_eq(kind, "veth") { return None; }
+    let is_br = cstr_eq(kind, "bridge");
+    if !cstr_eq(kind, "veth") && !is_br { return None; }
     let name = nla_name(find_attr(msg, 16, IFLA_IFNAME));
     if let Some(n) = name.as_ref() { if env.links.iter().any(|l| l.name == *n) { return Some(17); } }
     let (f, c) = (rd32(msg, 24), rd32(msg, 28));
+    if is_br {
+        let me = match veth_end(&msg[16 + 16..], f, c) { Ok(e) => e, Err(e) => return Some(e) };
+        let mut opts = BrOpts::default();
+        if let Some(d) = nla_find(li, IFLA_INFO_DATA) {
+            let u32a = |t: u16| nla_find(d, t).filter(|a| a.len() == 4).map(|a| rd32(a, 0));
+            opts.ageing = u32a(IFLA_BR_AGEING_TIME);
+            opts.fwd_delay = u32a(IFLA_BR_FORWARD_DELAY);
+            opts.stp = u32a(IFLA_BR_STP_STATE);
+            opts.vlan = nla_find(d, IFLA_BR_VLAN_FILTERING).filter(|a| a.len() == 1).map(|a| a[0]);
+        }
+        return Some((env.apply)(RtOp::NewBridge { name, mtu: me.mtu, mac: me.mac, up: me.up, opts }));
+    }
     let me = match veth_end(&msg[16 + 16..], f, c) { Ok(e) => e, Err(e) => return Some(e) };
     // VETH_INFO_PEER: a full ifinfomsg, then the peer's attributes.
     let Some(data) = nla_find(li, IFLA_INFO_DATA) else { return Some(22) };
     let peer = match nla_find(data, VETH_INFO_PEER) {
         Some(p) if p.len() >= 16 => match veth_end(&p[16..], rd32(p, 8), rd32(p, 12)) { Ok(e) => e, Err(e) => return Some(e) },
         Some(_) => return Some(22),
-        None => VethPeer { name: None, mtu: None, mac: None, up: false, ns: PeerNs::Same },
+        None => VethPeer { name: None, mtu: None, mac: None, up: false, ns: PeerNs::Same, master: None },
     };
     if let (Some(a), PeerNs::Same) = (name.as_ref(), peer.ns) { if peer.name.as_ref() == Some(a) { return Some(17); } }
-    Some((env.apply)(RtOp::NewVeth { name, mtu: me.mtu, mac: me.mac, up: me.up, peer }))
+    Some((env.apply)(RtOp::NewVeth { name, mtu: me.mtu, mac: me.mac, up: me.up, master: me.master, peer }))
 }
 
 fn cstr_eq(a: &[u8], name: &str) -> bool {
@@ -480,7 +518,8 @@ fn new_link(msg: &[u8], flags_nl: u16, env: &Env) -> i32 {
             let n = &n[..n.iter().position(|&b| b == 0).unwrap_or(n.len())];
             core::str::from_utf8(n).ok().map(String::from)
         }).filter(|n| *n != t.name);
-        return (env.apply)(RtOp::SetLink { index: t.index, up, mtu, mac, name });
+        let master = match find_attr(msg, 16, IFLA_MASTER) { Some(m) if m.len() >= 4 => Some(rd32(m, 0)), Some(_) => return 22, None => None };
+        return (env.apply)(RtOp::SetLink { index: t.index, up, mtu, mac, name, master });
     }
     if let Some(m) = find_attr(msg, 16, IFLA_MTU) {
         if m.len() < 4 || rd32(m, 0) != t.mtu { return 95; }
@@ -542,9 +581,9 @@ pub fn handle_request_env(req: &[u8], pid: u32, env: &Env) -> Vec<Vec<u8>> {
         let mut ack = flags & NLM_F_ACK != 0 && !dump;
         match ty {
             RTM_GETLINK if dump => {
-                // IFLA_MASTER filter: no link has a master yet.
-                let filt = len >= 32 && find_attr(msg, 16, IFLA_MASTER).is_some();
-                let msgs = links.iter().filter(|_| !filt).map(|l| link_msg(l, seq, pid)).collect();
+                // IFLA_MASTER filter: only the links enslaved to that bridge.
+                let filt = if len >= 32 { find_attr(msg, 16, IFLA_MASTER).filter(|m| m.len() >= 4).map(|m| rd32(m, 0)) } else { None };
+                let msgs = links.iter().filter(|l| filt.map_or(true, |m| l.master == m)).map(|l| link_msg(l, seq, pid)).collect();
                 pack(msgs, &mut out);
                 out.push(done_msg(seq, pid));
             }
@@ -584,7 +623,7 @@ pub fn handle_request_env(req: &[u8], pid: u32, env: &Env) -> Vec<Vec<u8>> {
             }
             RTM_DELLINK if flags & NLM_F_REQUEST != 0 => {
                 let e = if len < 32 { 22 } else {
-                    match target_link(msg, links) { Some(t) if t.veth => (env.apply)(RtOp::DelLink { index: t.index }), Some(_) => 95, None => 19 }
+                    match target_link(msg, links) { Some(t) if t.veth || t.br.is_some() => (env.apply)(RtOp::DelLink { index: t.index }), Some(_) => 95, None => 19 }
                 };
                 if e != 0 { out.push(error_msg(e, msg, seq, pid)); ack = false; }
             }
@@ -752,7 +791,7 @@ pub fn current_links(ns: u16) -> Vec<Link> {
         let up = sched::ns::lo_admin_up(ns);
         v.push(Link {
             index: 1, name: String::from("lo"), mac: [0; 6], mtu: 65536,
-            up, running: up, tap: false, veth: false, peer: 0, loopback: true,
+            up, running: up, tap: false, veth: false, peer: 0, master: 0, br: None, loopback: true,
             addr: if up { Some(([127, 0, 0, 1], 8)) } else { None },
         });
         v.extend(super::tunbe::links(ns));
@@ -760,7 +799,7 @@ pub fn current_links(ns: u16) -> Vec<Link> {
     }
     v.push(Link {
         index: 1, name: String::from("lo"), mac: [0; 6], mtu: 65536,
-        up: true, running: true, tap: false, veth: false, peer: 0, loopback: true, addr: Some(([127, 0, 0, 1], 8)),
+        up: true, running: true, tap: false, veth: false, peer: 0, master: 0, br: None, loopback: true, addr: Some(([127, 0, 0, 1], 8)),
     });
     for s in super::iface::snapshot() {
         v.push(Link {
@@ -770,7 +809,7 @@ pub fn current_links(ns: u16) -> Vec<Link> {
             mtu: 1500,
             up: s.admin_up,
             running: s.carrier && s.admin_up,
-            tap: false, veth: false, peer: 0, loopback: false,
+            tap: false, veth: false, peer: 0, master: 0, br: None, loopback: false,
             addr: if s.admin_up { s.addr } else { None },
         });
     }
@@ -806,11 +845,11 @@ mod tests {
     fn links() -> Vec<Link> {
         alloc::vec![
             Link { index: 1, name: "lo".into(), mac: [0; 6], mtu: 65536, up: true, running: true,
-                   tap: false, veth: false, peer: 0, loopback: true, addr: Some(([127, 0, 0, 1], 8)) },
+                   tap: false, veth: false, peer: 0, master: 0, br: None, loopback: true, addr: Some(([127, 0, 0, 1], 8)) },
             Link { index: 2, name: "eth0".into(), mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56], mtu: 1500,
-                   up: true, running: true, tap: false, veth: false, peer: 0, loopback: false, addr: Some(([10, 0, 2, 15], 24)) },
+                   up: true, running: true, tap: false, veth: false, peer: 0, master: 0, br: None, loopback: false, addr: Some(([10, 0, 2, 15], 24)) },
             Link { index: 3, name: "wifi0".into(), mac: [2; 6], mtu: 1500, up: true, running: false,
-                   tap: false, veth: false, peer: 0, loopback: false, addr: None },
+                   tap: false, veth: false, peer: 0, master: 0, br: None, loopback: false, addr: None },
         ]
     }
 
@@ -951,7 +990,7 @@ mod tests {
         let mut ls = Vec::new();
         for i in 0..100 {
             ls.push(Link { index: i + 1, name: alloc::format!("eth{}", i), mac: [1; 6], mtu: 1500,
-                           up: true, running: true, tap: false, veth: false, peer: 0, loopback: false, addr: Some(([10, 0, 0, 1], 24)) });
+                           up: true, running: true, tap: false, veth: false, peer: 0, master: 0, br: None, loopback: false, addr: Some(([10, 0, 0, 1], 24)) });
         }
         let out = handle_request(&req(RTM_GETLINK, 0x301, 1), &ls, 1);
         assert!(out.len() > 2);
