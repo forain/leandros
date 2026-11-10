@@ -60,6 +60,21 @@ fn on_ns_gone(id: sched::ns::NsId) {
 pub(crate) fn init() {
     sched::ns::set_ns_gone_hook(on_ns_gone);
     sched::ns::set_lo_hook(set_lo);
+    sched::ns::set_ifnames_hook(ifnames);
+}
+
+/// `sched::ns` hook: the `idx`-th non-loopback link of `ns` (0 = none), for /proc/sys/net/*/conf/<if>.
+fn ifnames(ns: u16, idx: usize, out: &mut [u8; 16]) -> usize {
+    let v = VIFS.lock();
+    let mut n = 0;
+    for x in v.iter().flatten() {
+        if x.netns != ns || x.kind == VifKind::Lo { continue; }
+        let l = x.name.iter().position(|&c| c == 0).unwrap_or(16);
+        if l == 0 { continue; }
+        if n == idx { out[..l].copy_from_slice(&x.name[..l]); return l; }
+        n += 1;
+    }
+    0
 }
 
 /// The sid of `ns`'s loopback stack when its lo is up (never for ns 0).
@@ -71,14 +86,19 @@ pub(crate) fn lo_up_sid(ns: u16) -> Option<Sid> {
     v[l as usize].as_ref().filter(|x| x.admin_up).map(|_| l)
 }
 
+/// A previous owner of namespace id `ns` may not have been reaped yet: do it
+/// now, before the new owner creates or looks up any state under the id.
+pub(crate) fn claim(ns: u16) {
+    let (w, b) = (ns as usize / 64 & 3, ns % 64);
+    if GONE[w].fetch_and(!(1 << b), Ordering::AcqRel) & (1 << b) != 0 { reap(ns); }
+}
+
 /// Bring `ns`'s `lo` up or down. The first up allocates its stack (127.0.0.1/8,
 /// the same `LoopDev` as sid 0); later ups and downs only flip the admin bit,
 /// the stack and its sockets stay.
 pub(crate) fn set_lo(ns: u16, up: bool) {
     if ns == 0 { return; }
-    // A previous owner of this id may not have been reaped yet.
-    let (w, b) = (ns as usize / 64 & 3, ns % 64);
-    if GONE[w].fetch_and(!(1 << b), Ordering::AcqRel) & (1 << b) != 0 { reap(ns); }
+    claim(ns);
     // Existing lo: flip the bit.
     {
         let n = NETNS.lock();
