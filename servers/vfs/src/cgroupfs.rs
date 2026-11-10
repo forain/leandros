@@ -16,7 +16,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
-use sched::cgroup::{self, CgId, C_ALL, C_PIDS, CTRL_NAMES, UNLIMITED};
+use sched::cgroup::{self, CgId, C_ALL, C_CPU, C_IO, C_MEMORY, C_PIDS, CTRL_NAMES, UNLIMITED};
+use alloc::collections::BTreeMap;
+use spin::Mutex;
 
 pub const ROOT: &[u8] = b"/sys/fs/cgroup";
 /// Directory descriptors are `SysBlock { dev: DEV_BASE | cg, level: LVL }`.
@@ -49,7 +51,41 @@ pub enum F {
 }
 const ALL: [F; 13] = [F::Procs, F::Threads, F::Controllers, F::SubtreeControl, F::MaxDepth,
     F::MaxDescendants, F::Stat, F::Type, F::Events, F::PidsCurrent, F::PidsMax, F::PidsPeak,
-    F::PidsEvents];
+    F::PidsEvents, F::MemCurrent, F::MemMax, F::MemHigh, F::MemLow, F::MemMin, F::MemSwapMax,
+    F::MemSwapCurrent, F::MemEvents, F::MemStat, F::MemOomGroup, F::CpuMax, F::CpuWeight,
+    F::CpuStat, F::IoMax, F::IoWeight, F::IoStat];
+
+/// Stored (not enforced) controller knobs, keyed by (cgroup, file index).
+static KNOBS: Mutex<BTreeMap<(CgId, u8), String>> = Mutex::new(BTreeMap::new());
+pub fn forget_knobs(cg: CgId) { KNOBS.lock().retain(|k, _| k.0 != cg); }
+
+fn ctrl_of(f: F) -> u8 {
+    match f {
+        F::PidsCurrent | F::PidsMax | F::PidsPeak | F::PidsEvents => C_PIDS,
+        F::CpuMax | F::CpuWeight | F::CpuStat => C_CPU,
+        F::IoMax | F::IoWeight | F::IoStat => C_IO,
+        F::MemCurrent | F::MemMax | F::MemHigh | F::MemLow | F::MemMin | F::MemSwapMax
+        | F::MemSwapCurrent | F::MemEvents | F::MemStat | F::MemOomGroup => C_MEMORY,
+        _ => 0,
+    }
+}
+fn stored(f: F) -> bool {
+    matches!(f, F::MemMax | F::MemHigh | F::MemLow | F::MemMin | F::MemSwapMax | F::MemOomGroup
+        | F::CpuMax | F::CpuWeight | F::IoMax | F::IoWeight)
+}
+fn knob_default(f: F) -> &'static str {
+    match f {
+        F::MemMax | F::MemHigh | F::MemSwapMax => "max\n",
+        F::MemLow | F::MemMin | F::MemOomGroup | F::MemCurrent | F::MemSwapCurrent => "0\n",
+        F::MemEvents => "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+        F::MemStat => "anon 0\nfile 0\n",
+        F::CpuMax => "max 100000\n",
+        F::CpuWeight => "100\n",
+        F::CpuStat => "usage_usec 0\nuser_usec 0\nsystem_usec 0\n",
+        F::IoWeight => "default 100\n",
+        _ => "",
+    }
+}
 
 fn fname(f: F) -> &'static str {
     match f {
@@ -59,20 +95,26 @@ fn fname(f: F) -> &'static str {
         F::Stat => "cgroup.stat", F::Type => "cgroup.type", F::Events => "cgroup.events",
         F::PidsCurrent => "pids.current", F::PidsMax => "pids.max", F::PidsPeak => "pids.peak",
         F::PidsEvents => "pids.events",
+        F::MemCurrent => "memory.current", F::MemMax => "memory.max", F::MemHigh => "memory.high",
+        F::MemLow => "memory.low", F::MemMin => "memory.min", F::MemSwapMax => "memory.swap.max",
+        F::MemSwapCurrent => "memory.swap.current", F::MemEvents => "memory.events",
+        F::MemStat => "memory.stat", F::MemOomGroup => "memory.oom.group",
+        F::CpuMax => "cpu.max", F::CpuWeight => "cpu.weight", F::CpuStat => "cpu.stat",
+        F::IoMax => "io.max", F::IoWeight => "io.weight", F::IoStat => "io.stat",
     }
 }
 
 fn has_file(cg: CgId, f: F) -> bool {
     match f {
         F::Type | F::Events => cg != 0,
-        F::PidsCurrent | F::PidsMax | F::PidsPeak | F::PidsEvents =>
-            cg != 0 && cgroup::controllers(cg) & C_PIDS != 0,
+        _ if ctrl_of(f) != 0 => cg != 0 && cgroup::controllers(cg) & ctrl_of(f) != 0,
         _ => true,
     }
 }
 
 fn read_only(f: F) -> bool {
-    matches!(f, F::Controllers | F::Stat | F::Events | F::PidsCurrent | F::PidsPeak | F::PidsEvents)
+    matches!(f, F::Controllers | F::Stat | F::Events | F::PidsCurrent | F::PidsPeak | F::PidsEvents
+        | F::MemCurrent | F::MemSwapCurrent | F::MemEvents | F::MemStat | F::CpuStat | F::IoStat)
 }
 
 fn file_by_name(cg: CgId, name: &[u8]) -> Option<F> {
@@ -145,6 +187,10 @@ pub fn read(cg: CgId, f: F) -> Vec<u8> {
         F::PidsMax => limit_text(cgroup::pids_max(cg), &mut s),
         F::PidsPeak => { push_u(&mut s, cgroup::pids_peak(cg) as u64); s.push('\n'); }
         F::PidsEvents => { s.push_str("max "); push_u(&mut s, cgroup::pids_events_max(cg) as u64); s.push('\n'); }
+        _ => match KNOBS.lock().get(&(cg, f as u8)) {
+            Some(v) => s = v.clone(),
+            None => s.push_str(knob_default(f)),
+        },
     }
     s.into_bytes()
 }
@@ -194,6 +240,22 @@ pub fn write(pid: u32, cg: CgId, f: F, data: &[u8]) -> isize {
         F::MaxDepth => match parse_limit(data) { Ok(v) => { cgroup::set_max_depth(cg, v); 0 } Err(e) => e },
         F::MaxDescendants => match parse_limit(data) { Ok(v) => { cgroup::set_max_descendants(cg, v); 0 } Err(e) => e },
         F::PidsMax => match parse_limit(data) { Ok(v) => { cgroup::set_pids_max(cg, v); 0 } Err(e) => e },
+        _ if stored(f) => {
+            let Ok(t) = core::str::from_utf8(data) else { return -22 };
+            let t = t.trim();
+            if t.is_empty() && f != F::IoMax { return -22; }
+            let ok = match f {
+                F::CpuWeight => t.parse::<u32>().map(|v| (1..=10000).contains(&v)).unwrap_or(false),
+                F::MemOomGroup => t == "0" || t == "1",
+                F::MemMax | F::MemHigh | F::MemLow | F::MemMin | F::MemSwapMax =>
+                    t == "max" || t.parse::<u64>().is_ok(),
+                _ => true,
+            };
+            if !ok { return -22; }
+            let mut v = String::from(t); v.push('\n');
+            KNOBS.lock().insert((cg, f as u8), v);
+            0
+        }
         F::Type => if core::str::from_utf8(data).map(|s| s.trim() == "domain").unwrap_or(false) { 0 } else { -22 },
         _ => -13,
     }
@@ -270,7 +332,7 @@ pub fn mkdir(pid: u32, path: &[u8]) -> isize {
     let Ok(n) = core::str::from_utf8(name) else { return -22 };
     // A name that collides with a control file of the parent is EEXIST.
     if file_by_name(cg, name).is_some() { return -17; }
-    match cgroup::create(cg, n, fsuid, sched::fsgid_of(pid)) { Ok(_) => 0, Err(e) => e }
+    match cgroup::create(cg, n, fsuid, sched::fsgid_of(pid)) { Ok(c) => { forget_knobs(c); 0 } Err(e) => e }
 }
 
 /// rmdir(path) by `pid`; 0 or -errno.
@@ -282,7 +344,9 @@ pub fn rmdir(pid: u32, path: &[u8]) -> isize {
             if cg == view_root(pid) { return -16; }
             let p = cgroup::parent(cg);
             if !may_write(pid, cgroup::dir_owner(p).0) { return -13; }
-            cgroup::remove(cg)
+            let r = cgroup::remove(cg);
+            if r == 0 { forget_knobs(cg); }
+            r
         }
     }
 }
