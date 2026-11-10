@@ -2101,7 +2101,7 @@ static int prio_user_who_view(void)
 /* ---- devpts uid=/gid= are translated through the mounter's userns -------- */
 #include <sys/mount.h>
 #include <sys/ioctl.h>
-struct dpa { int up, dn; char dir[64]; char opts[64]; };
+struct dpa { int up, dn, sv; char dir[64]; char opts[64]; };
 static int c_devpts(void *a)
 {
     struct dpa *d = a;
@@ -2119,6 +2119,15 @@ static int c_devpts(void *a)
     struct stat st; snprintf(p, sizeof p, "%s/%u", d->dir, n);
     CHECK(stat(p, &st) == 0);
     int view = st.st_gid == 5 ? 0 : 1; /* ns-relative view must read 5 */
+    { int z = 0; ioctl(m, 0x40045431, &z); }
+    int sl = open(p, O_RDWR | O_NOCTTY);
+    CHECK(sl >= 0);
+    { char cb[CMSG_SPACE(sizeof(int))] = {0}; char x = 'x';
+      struct iovec io = { &x, 1 };
+      struct msghdr mh = { 0 }; mh.msg_iov = &io; mh.msg_iovlen = 1; mh.msg_control = cb; mh.msg_controllen = sizeof cb;
+      struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int));
+      memcpy(CMSG_DATA(cm), &sl, sizeof sl);
+      CHECK(sendmsg(d->sv, &mh, 0) == 1); }
     (void)!write(d->up, &b, 1); (void)!write(d->up, &n, sizeof n);
     char g; (void)!read(d->dn, &g, 1);
     return view;
@@ -2129,7 +2138,8 @@ static int devpts_run2(const char *opts, int want_mount, unsigned *kgid, int *dn
     struct dpa d; int up[2], dn[2];
     CHECK(pipe(up) == 0 && pipe(dn) == 0);
     *dnw = dn[1];
-    d.up = up[1]; d.dn = dn[0];
+    int sv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    d.up = up[1]; d.dn = dn[0]; d.sv = sv[1];
     snprintf(d.dir, sizeof d.dir, "/tmp/dpm.%d", (int)getpid());
     snprintf(d.opts, sizeof d.opts, "%s", opts);
     mkdir(d.dir, 0755);
@@ -2143,9 +2153,13 @@ static int devpts_run2(const char *opts, int want_mount, unsigned *kgid, int *dn
     int ok = 1;
     if (want_mount) {
         unsigned n = 0; CHECK(b == 'o' && read(up[0], &n, sizeof n) == sizeof n);
-        char p[96]; struct stat st;
-        snprintf(p, sizeof p, "/proc/%d/root%s/%u", (int)c, d.dir, n);
-        ok = stat(p, &st) == 0;
+        struct stat st; int sl = -1;
+        { char cb[CMSG_SPACE(sizeof(int))] = {0}; char x;
+          struct iovec io = { &x, 1 };
+          struct msghdr mh = { 0 }; mh.msg_iov = &io; mh.msg_iovlen = 1; mh.msg_control = cb; mh.msg_controllen = sizeof cb;
+          struct cmsghdr *cm;
+          if (recvmsg(sv[0], &mh, 0) == 1 && (cm = CMSG_FIRSTHDR(&mh))) memcpy(&sl, CMSG_DATA(cm), sizeof sl); }
+        ok = sl >= 0 && fstat(sl, &st) == 0;
         if (ok) *kgid = st.st_gid;
         (void)!write(dn[1], "x", 1);
     } else ok = b == 'e';
