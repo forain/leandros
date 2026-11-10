@@ -13,5 +13,5 @@ Status: FIXED (device programs attached via bpf(BPF_PROG_ATTACH, BPF_CGROUP_DEVI
 ## Evidence
 - bpftest `enforce` case: with enforcement disabled (TEMP `if true {return Ok(())}`, never committed) bpftest fails `enforce` (fails=1); with the real code 11/11 pass (aarch64 Mac HVF).
 - ffsandbox.py aarch64 mode on: RESULT True.
-- Box full regress x86_64 and aarch64: see merge commit report.
+- Box full regress x86_64 and aarch64: box x86_64 full regress PASS (0 bad); box aarch64 full regress 78 suites 0 bad (PASS).
 - crun container run in-guest was not done (no crun harness reproducible from the tree); not a blocker for the kernel path.
