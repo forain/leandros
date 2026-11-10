@@ -2944,6 +2944,14 @@ def main():
         if e["path"] == "/etc/containers/storage.conf" and e["kind"] == "file" and os.path.isfile(_podconf):
             e["host"] = _podconf
             e["size"] = os.path.getsize(_podconf)
+    # podman: containers.conf selects netavark's "none" firewall driver (no iptables/nft in the image)
+    _podcc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "podman", "containers.conf")
+    _stor = next((e for e in _ap_entries if e["path"] == "/etc/containers/storage.conf" and e["kind"] == "file"), None)
+    if _stor is not None and os.path.isfile(_podcc):
+        _ap_entries = [e for e in _ap_entries if e["path"] != "/etc/containers/containers.conf"]
+        _cc = dict(_stor)
+        _cc.update(path="/etc/containers/containers.conf", host=_podcc, size=os.path.getsize(_podcc))
+        _ap_entries.append(_cc)
     # Alpine gives newuidmap/newgidmap file capabilities (security.capability xattr), which the image does not
     # carry; setuid root is the equivalent until file caps exist (see podtrace-findings).
     for e in _ap_entries:

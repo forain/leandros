@@ -92,6 +92,80 @@ pub fn getsockname(ofd: u32, addr_ptr: usize, addrlen_ptr: usize) -> Message {
     ok_reply()
 }
 
+static NLTRACE: AtomicU8 = AtomicU8::new(0); // 0 unread, 1 off, 2 on
+
+fn nltrace() -> bool {
+    let mut v = NLTRACE.load(Ordering::Relaxed);
+    if v == 0 {
+        v = if drivers::nvidia_probe::cmdline_opt("net.nltrace") == Some(1) { 2 } else { 1 };
+        NLTRACE.store(v, Ordering::Relaxed);
+    }
+    v == 2
+}
+
+fn trace_out(line: &str) {
+    extern "C" { fn arch_serial_putc(c: u8); }
+    for &b in line.as_bytes() { unsafe { arch_serial_putc(b); } }
+    unsafe { arch_serial_putc(b'\n'); }
+}
+
+/// Attribute types at one level of `b` (nested ones as `t{..}` one level deep).
+fn attr_list(b: &[u8], depth: u32) -> alloc::string::String {
+    use alloc::format;
+    let mut o = alloc::string::String::new();
+    let mut p = 0usize;
+    while p + 4 <= b.len() {
+        let l = u16::from_ne_bytes([b[p], b[p + 1]]) as usize;
+        let t = u16::from_ne_bytes([b[p + 2], b[p + 3]]);
+        if l < 4 || p + l > b.len() { break; }
+        let body = &b[p + 4..p + l];
+        if !o.is_empty() { o.push(','); }
+        if t & 0x8000 != 0 && depth == 0 {
+            o.push_str(&format!("{}{{{}}}", t & 0x3fff, attr_list(body, 1)));
+        } else if body.len() >= 1 && body.len() <= 16 && body.iter().take(body.len().saturating_sub(1)).all(|&c| (0x20..0x7f).contains(&c)) && body.last() == Some(&0) {
+            o.push_str(&format!("{}=\"{}\"", t, core::str::from_utf8(&body[..body.len() - 1]).unwrap_or("?")));
+        } else if body.len() == 4 {
+            o.push_str(&format!("{}={}", t, u32::from_ne_bytes([body[0], body[1], body[2], body[3]])));
+        } else {
+            o.push_str(&format!("{}[{}]", t, body.len()));
+        }
+        p += (l + 3) & !3;
+    }
+    o
+}
+
+fn trace_req(data: &[u8], ns: u16, pid: u32) {
+    use alloc::format;
+    let mut off = 0usize;
+    while off + 16 <= data.len() {
+        let len = u32::from_ne_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+        if len < 16 || off + len > data.len() { break; }
+        let ty = u16::from_ne_bytes([data[off + 4], data[off + 5]]);
+        let fl = u16::from_ne_bytes([data[off + 6], data[off + 7]]);
+        let hdr = match ty { 16..=19 => 16, 20 | 21 => 8, 24 | 25 => 12, _ => 0 };
+        let body = &data[off + 16..off + len];
+        let fixed = body.get(..hdr.min(body.len())).unwrap_or(&[]);
+        let attrs = if body.len() > hdr { attr_list(&body[hdr..], 0) } else { alloc::string::String::new() };
+        let mut hx = alloc::string::String::new();
+        for c in fixed { hx.push_str(&format!("{:02x}", c)); }
+        trace_out(&format!("nltrace: ns={} pid={} REQ type={} flags={:#x} len={} fixed={} attrs=[{}]", ns, pid, ty, fl, len, hx, attrs));
+        off += (len + 3) & !3;
+    }
+}
+
+fn trace_rep(replies: &[Vec<u8>], ns: u16) {
+    use alloc::format;
+    for r in replies {
+        if r.len() < 16 { continue; }
+        let ty = u16::from_ne_bytes([r[4], r[5]]);
+        if ty == 2 && r.len() >= 20 {
+            trace_out(&format!("nltrace: ns={} REP ERROR errno={}", ns, i32::from_ne_bytes([r[16], r[17], r[18], r[19]])));
+        } else {
+            trace_out(&format!("nltrace: ns={} REP type={} len={}", ns, ty, r.len()));
+        }
+    }
+}
+
 /// A request arrived: queue the replies and wake pollers. Returns the length.
 pub fn send(ofd: u32, data: &[u8]) -> Message {
     let (pid, ns) = match NL.lock().get(&ofd) { Some(s) => (s.pid, s.ns.id()), None => return err_reply(-9) };
@@ -101,7 +175,10 @@ pub fn send(ofd: u32, data: &[u8]) -> Message {
     let env = rt::Env { links: &links, routes: &routes, route: &|d| if ns == 0 { rt::route_lookup(d) } else { None }, lo_set: &lo_set,
         apply: &|op| crate::tunbe::rtnl_apply(ns, op),
         admin: sched::caps::ns_capable_in(sched::ns::owner_userns(1, ns), 12) };
+    let tr = nltrace();
+    if tr { trace_req(data, ns, pid); }
     let replies = rt::handle_request_env(data, pid, &env);
+    if tr { trace_rep(&replies, ns); }
     if !replies.is_empty() {
         let mut m = NL.lock();
         if let Some(s) = m.get_mut(&ofd) {
