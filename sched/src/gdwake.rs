@@ -23,6 +23,35 @@ pub fn enabled() -> bool { ON.load(Relaxed) }
 /// Turn the census on (boot, from `sched.wakestat=1`, before user space).
 pub fn set_enabled(on: bool) { ON.store(on, Relaxed); }
 
+static LOG: AtomicBool = AtomicBool::new(false);
+
+/// `sched.wakelog=1`: one serial line per keyed/tagged wake that lands on a
+/// task parked with a narrow (<= 2 bits) poll mask. Off by default; the only
+/// cost when off is one relaxed load inside the already-rare wake delivery.
+#[inline(always)]
+pub fn log_enabled() -> bool { LOG.load(Relaxed) }
+pub fn set_log(on: bool) { LOG.store(on, Relaxed); }
+
+/// Serial line `[WAKELOG] tid= tgid= mask= tag= key= kind= waker= site=file:line`.
+/// `kind`: `key-fp` (delivered on a 16-bit fingerprint match), `key-unrefined`
+/// (keyed wake, the bit is explained by unkeyed interests), `bits` (tag-only).
+/// Caller holds RUN_QUEUE, so the waker's pid comes from the per-CPU slot.
+pub fn log_wake(tid: u32, tgid: u32, mask: u64, tag: u64, key: Option<u64>, kind: &str, waker: u32) {
+    extern "C" { fn arch_serial_putc(c: u8); }
+    use core::fmt::Write;
+    struct S;
+    impl Write for S {
+        fn write_str(&mut self, m: &str) -> core::fmt::Result {
+            for &b in m.as_bytes() { unsafe { arch_serial_putc(b) } }
+            Ok(())
+        }
+    }
+    let site = SITE.load(Relaxed);
+    let _ = write!(S, "[WAKELOG] tid={} tgid={} mask={:#x} tag={:#x} key={:#x} kind={} waker={} site=", tid, tgid, mask, tag, key.unwrap_or(0), kind, waker);
+    site_name(site, &mut |f, l| { let _ = write!(S, "{}:{}", f, l); });
+    let _ = write!(S, "\r\n");
+}
+
 /// The waker of the task in slot `pid & 1023`: a `&'static Location` address
 /// for a tagged wake, or one of the small codes below.
 static WOKE: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
@@ -139,3 +168,76 @@ pub fn for_each_park(mut f: impl FnMut(u32, u32, u32, u32, u32, u32)) {
           (v >> 16 & 0xff) as u32, (v >> 8 & 0xff) as u32, (v & 0xff) as u32);
     }
 }
+
+// ── Keyed-wake collision selftest (`sched.keyselftest=1`, lane wakecatch) ────
+//
+// A kernel thread parks narrowly on key K (`POLL_WAIT_CHANNEL`, one keyed
+// bit). A driver thread then delivers a wake for K2, a DIFFERENT key with
+// the same bloom bit and the same 16-bit fingerprint: the victim must stay
+// parked (false wake = the 16-bit-fingerprint bug). Then a wake for K must
+// wake it (lost wake = a broken fix). One serial line reports the result.
+use core::sync::atomic::Ordering as KOrd;
+
+static KST_PARKED: AtomicBool = AtomicBool::new(false);
+static KST_WOKE: AtomicU32 = AtomicU32::new(0);
+static KST_VICTIM: AtomicU32 = AtomicU32::new(0);
+
+fn kst_keys() -> (u64, u64) {
+    let k = crate::poll_key(77, 1234);
+    // Same low 6 bits (bloom bit) and bits 32..48 (fingerprint); differs in bit 20.
+    (k, k ^ (1 << 20))
+}
+
+extern "C" fn kst_victim(_: usize) -> ! {
+    let (k, _) = kst_keys();
+    let tag = crate::PollTag { bits: crate::poll_key_bit(k), n: 1, keys: [k, 0, 0], nested: 0, foreign: false };
+    crate::block_on_poll_prepare_tag(u64::MAX, &tag);
+    KST_PARKED.store(true, KOrd::SeqCst);
+    crate::block_on_poll_commit();
+    KST_WOKE.fetch_add(1, KOrd::SeqCst);
+    loop { crate::yield_now("keyselftest"); }
+}
+
+fn kst_victim_blocked() -> bool {
+    let pid = KST_VICTIM.load(KOrd::SeqCst);
+    let mut rq = crate::RUN_QUEUE.lock();
+    rq.find_pid_mut(pid).map_or(false, |t| t.state == crate::task::TaskState::Blocked)
+}
+
+fn kst_wait(mut f: impl FnMut() -> bool) -> bool {
+    for _ in 0..200_000 {
+        if f() { return true; }
+        crate::yield_now("keyselftest");
+    }
+    false
+}
+
+extern "C" fn kst_driver(_: usize) -> ! {
+    let (k, k2) = kst_keys();
+    let ok_setup = match crate::spawn_with_arg(kst_victim, 0) {
+        Some(p) => { KST_VICTIM.store(p as u32, KOrd::SeqCst); true }
+        None => false,
+    };
+    let parked = ok_setup && kst_wait(|| KST_PARKED.load(KOrd::SeqCst)) && kst_wait(kst_victim_blocked);
+    let mut false_wake = 0u32;
+    let mut lost_wake = 1u32;
+    if parked {
+        crate::wake_poll_key(k2);
+        for _ in 0..2000 { crate::yield_now("keyselftest"); }
+        false_wake = KST_WOKE.load(KOrd::SeqCst);
+        if false_wake == 0 {
+            crate::wake_poll_key(k);
+            if kst_wait(|| KST_WOKE.load(KOrd::SeqCst) != 0) { lost_wake = 0; }
+        }
+    }
+    let line = if !parked { "[KEYSELFTEST] result=FAIL setup (victim never parked)\n" }
+        else if false_wake != 0 { "[KEYSELFTEST] result=FAIL false_wake=1 (colliding key woke the waiter)\n" }
+        else if lost_wake != 0 { "[KEYSELFTEST] result=FAIL lost_wake=1 (real key did not wake the waiter)\n" }
+        else { "[KEYSELFTEST] result=PASS false_wake=0 lost_wake=0\n" };
+    extern "C" { fn arch_serial_putc(c: u8); }
+    for &b in line.as_bytes() { unsafe { arch_serial_putc(b) } }
+    loop { crate::yield_now("keyselftest"); }
+}
+
+/// `sched.keyselftest=1`: spawn the selftest threads (see above).
+pub fn key_selftest_start() { let _ = crate::spawn_with_arg(kst_driver, 0); }
