@@ -971,6 +971,11 @@ static int fwd_body(void) {
         ok = tcp_dns_c(srv);
         if (ok && g_http) ok = http_get(g_http);
     }
+    else if (g_fwd_mode == 6) { /* TCP to the bridge's own address: a host 0.0.0.0 listener, with forwarding on */
+        int fd = tcp_conn("10.97.0.1", 7779);
+        ok = fd >= 0;
+        if (fd >= 0) close(fd);
+    }
     else if (g_fwd_mode >= 4) { /* hold an established TCP flow open until released */
         char srv[64]; fwd_resolver(srv);
         int fd = tcp_conn(srv, 53);
@@ -990,8 +995,16 @@ static int ip_forward_set(int on) {
     close(fd);
     return r == 2 ? 0 : -1;
 }
+static int g_early_listen; /* mode 6: bind the host listener before br0 exists (httpd before podman0) */
 static void fwd_case(const char *name, int mode, int ipfwd) {
     char msg[96];
+    int hl = -1;
+    if (mode == 6 && g_early_listen) {
+        hl = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7779) };
+        snprintf(msg, sizeof msg, "%s: host wildcard listener on 7779 (before br0)", name);
+        CHECK(msg, !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
+    }
     int s = nl_sock();
     unsigned char brmac[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x01 };
     int ok = br_new(s, "br0", brmac) == 0;
@@ -1000,6 +1013,12 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     snprintf(msg, sizeof msg, "%s: br0 10.97.0.1/24 up", name); CHECK(msg, ok);
     snprintf(msg, sizeof msg, "%s: ip_forward=%d", name, ipfwd); CHECK(msg, ip_forward_set(ipfwd) == 0);
     g_fwd_mode = mode; g_fwd_expect = ipfwd;
+    if (mode == 6 && !g_early_listen) {
+        hl = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7779) };
+        snprintf(msg, sizeof msg, "%s: host wildcard listener on 7779", name);
+        CHECK(msg, !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
+    }
     pid_t c = spawn_ns(fwd_body);
     int cc[2] = { ctl[0], ctl[1] }, dd[2] = { done_[0], done_[1] };
     snprintf(msg, sizeof msg, "%s: netns spawned", name); CHECK(msg, c > 0);
@@ -1015,7 +1034,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     snprintf(msg, sizeof msg, "%s: netns configured eth0 + default via 10.97.0.1", name); CHECK(msg, rd == 1);
     if (rd == 1) write(cc[1], &ch, 1); /* go */
     int natp = 0;
-    if (mode >= 4) {
+    if (mode >= 4 && mode != 6) {
         snprintf(msg, sizeof msg, "%s: precondition: no NAT port is held yet", name);
         CHECK(msg, nat_scan() == 0);
         rd = rd_to(dd[0], &ch);
@@ -1036,13 +1055,15 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
         rc = 0;
     }
     printf("%s child exit %d\n", name, rc);
-    if (mode == 2) snprintf(msg, sizeof msg, "%s: TCP DNS query to the resolver%s is answered through NAT", name, g_http ? " and an HTTP GET" : "");
+    if (mode == 6) snprintf(msg, sizeof msg, "%s: connect to the bridge address reaches the host 0.0.0.0 listener", name);
+    else if (mode == 2) snprintf(msg, sizeof msg, "%s: TCP DNS query to the resolver%s is answered through NAT", name, g_http ? " and an HTTP GET" : "");
     else if (mode >= 4) snprintf(msg, sizeof msg, "%s: flow holder exited cleanly", name);
     else if (mode == 0 && ipfwd) snprintf(msg, sizeof msg, "%s: UDP DNS query to the resolver is answered through NAT", name);
     else if (mode == 1 && ipfwd) snprintf(msg, sizeof msg, "%s: ICMP echo to the default gateway is answered through NAT", name);
     else snprintf(msg, sizeof msg, "%s: ip_forward=0 means no reply (nothing forwarded)", name);
     CHECK(msg, rc == 0);
     ip_forward_set(0);
+    if (hl >= 0) close(hl);
     if (iv > 0) link_del(s, iv);
     link_del(s, bidx);
     close(s);
@@ -1052,7 +1073,54 @@ static void fwd_ping(void) { fwd_case("fwd_ping", 1, 1); }
 static void fwd_off(void) { fwd_case("fwd_off", 0, 0); }
 static void fwd_tcp(void) { fwd_case("fwd_tcp", 2, 1); }
 static void fwd_port_reserved(void) { fwd_case("fwd_port_reserved", 4, 1); }
+static void fwd_hostlisten(void) { fwd_case("fwd_hostlisten", 6, 1); }
+static void fwd_hostlisten_early(void) { g_early_listen = 1; fwd_case("fwd_hostlisten_early", 6, 1); g_early_listen = 0; }
 static void fwd_reap(void) { fwd_case("fwd_reap", 5, 1); }
+
+/* A host wildcard listener must not leak into a container netns: a netns
+ * stack that connects to its OWN address on the listener's port gets
+ * ECONNREFUSED, and the host listener never sees a connection. */
+static void hostlisten_not_in_ns(void) {
+    int s = nl_sock();
+    int hl = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7781) };
+    CHECK("hostlisten_not_in_ns: host wildcard listener on 7781",
+          !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
+    pid_t c = spawn_ns(idle_body);
+    int nsfd = netns_fd_of(c);
+    int e = veth_new(s, "vethH", "eth0", nsfd);
+    close(nsfd);
+    int ia = link_get(s, "vethH", NULL, NULL);
+    CHECK("hostlisten_not_in_ns: pair created", e == 0 && ia > 0);
+    addr_add(s, ia, "10.99.2.1", 24); link_set_up(s, ia);
+    int ns = netns_fd_of(c);
+    pid_t h = fork();
+    if (h == 0) {
+        if (setns(ns, CLONE_NEWNET)) _exit(1);
+        int cs = nl_sock();
+        int idx = link_get(cs, "eth0", NULL, NULL);
+        if (!idx || addr_add(cs, idx, "10.99.2.2", 24) || link_set_up(cs, idx)) _exit(2);
+        int lo = link_get(cs, "lo", NULL, NULL); link_set_up(cs, lo);
+        int t = socket(AF_INET, SOCK_STREAM, 0);
+        struct timeval tv = { 5, 0 };
+        setsockopt(t, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        setsockopt(t, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7781) };
+        inet_pton(AF_INET, "10.99.2.2", &to.sin_addr);
+        if (connect(t, (struct sockaddr *)&to, sizeof to) == 0) _exit(200);
+        _exit(errno == ECONNREFUSED ? 0 : errno);
+    }
+    int rc = wait_child(h);
+    printf("hostlisten_not_in_ns child exit %d (200 = connected, else errno)\n", rc);
+    CHECK("hostlisten_not_in_ns: connect to the netns's own address is refused", rc == 0);
+    int fl = fcntl(hl, F_GETFL); fcntl(hl, F_SETFL, fl | O_NONBLOCK);
+    int a = accept(hl, NULL, NULL);
+    CHECK("hostlisten_not_in_ns: the host listener saw no connection", a < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    if (a >= 0) close(a);
+    close(ns); close(hl);
+    kill(c, SIGKILL); wait_child(c);
+    close(s);
+}
 
 int main(int argc, char **argv) {
     const char *only = NULL;
@@ -1075,6 +1143,9 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "fwd_tcp")) fwd_tcp();
     if (!only || !strcmp(only, "fwd_port_reserved")) fwd_port_reserved();
     if (!only || !strcmp(only, "fwd_reap")) fwd_reap();
+    if (!only || !strcmp(only, "fwd_hostlisten")) fwd_hostlisten();
+    if (!only || !strcmp(only, "fwd_hostlisten_early")) fwd_hostlisten_early();
+    if (!only || !strcmp(only, "hostlisten_not_in_ns")) hostlisten_not_in_ns();
     printf("brtest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }

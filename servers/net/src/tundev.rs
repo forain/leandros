@@ -179,18 +179,58 @@ fn is_attached(open_id: u32) -> Result<(), i32> {
     }
 }
 
+fn pop_frame(open_id: u32) -> Result<alloc::vec::Vec<u8>, i32> {
+    let mut o = OPENS.lock();
+    let Some(t) = o.iter_mut().find(|x| x.id == open_id) else { return Err(22) };
+    if t.att.is_none() { return Err(77); }
+    match t.rq.pop_front() { Some(f) => Ok(f), None => Err(11) }
+}
+
 fn do_read(buf: usize, count: usize, open_id: u32) -> Message {
-    let f = {
-        let mut o = OPENS.lock();
-        let Some(t) = o.iter_mut().find(|x| x.id == open_id) else { return err(22) };
-        if t.att.is_none() { return err(77); }
-        match t.rq.pop_front() { Some(f) => f, None => return err(11) }
-    };
+    let f = match pop_frame(open_id) { Ok(f) => f, Err(e) => return err(e) };
     let n = f.len().min(count);
     if buf == 0 || !sched::with_current_address_space_mut(|a| a.write_user_buf(buf, &f[..n])).unwrap_or(false) {
         return err(14);
     }
     reply(n as i64)
+}
+
+/// readv(2) on a tun/tap fd: ONE frame, scattered over the iovecs (the rest
+/// of the frame is dropped, like read(2) with a short buffer).
+pub fn readv(open_id: u32, iov_ptr: usize, iovcnt: usize) -> Message {
+    let mut iovs: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+    for i in 0..iovcnt.min(1024) {
+        let (Some(b), Some(l)) = (rd::<usize>(iov_ptr + i * 16), rd::<usize>(iov_ptr + i * 16 + 8)) else { return err(14) };
+        iovs.push((b, l));
+    }
+    let f = match pop_frame(open_id) { Ok(f) => f, Err(e) => return err(e) };
+    let mut off = 0usize;
+    for (b, l) in iovs {
+        if off >= f.len() { break; }
+        let k = l.min(f.len() - off);
+        if k == 0 { continue; }
+        if b == 0 || !sched::with_current_address_space_mut(|a| a.write_user_buf(b, &f[off..off + k])).unwrap_or(false) {
+            return err(14);
+        }
+        off += k;
+    }
+    reply(off as i64)
+}
+
+/// writev(2) on a tun/tap fd: the gathered iovecs are ONE frame.
+pub fn writev(open_id: u32, iov_ptr: usize, iovcnt: usize) -> Message {
+    let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    for i in 0..iovcnt.min(1024) {
+        let (Some(b), Some(l)) = (rd::<usize>(iov_ptr + i * 16), rd::<usize>(iov_ptr + i * 16 + 8)) else { return err(14) };
+        if l == 0 { continue; }
+        if data.len() + l > 65535 { return err(22); }
+        let at = data.len();
+        data.resize(at + l, 0);
+        if b == 0 || !sched::with_current_address_space(|a| a.read_user_buf(b, &mut data[at..])).unwrap_or(false) {
+            return err(14);
+        }
+    }
+    do_write_data(data, open_id)
 }
 
 fn do_write(buf: usize, count: usize, open_id: u32) -> Message {
@@ -206,6 +246,22 @@ fn do_write(buf: usize, count: usize, open_id: u32) -> Message {
     if count > 0 && (buf == 0 || !sched::with_current_address_space(|a| a.read_user_buf(buf, &mut data)).unwrap_or(false)) {
         return err(14);
     }
+    write_frame(data, pi, open_id)
+}
+
+fn do_write_data(data: alloc::vec::Vec<u8>, open_id: u32) -> Message {
+    let pi = {
+        let o = OPENS.lock();
+        match o.iter().find(|x| x.id == open_id) {
+            Some(t) => match t.att.as_ref() { Some(a) => a.pi, None => return err(77) },
+            None => return err(22),
+        }
+    };
+    write_frame(data, pi, open_id)
+}
+
+fn write_frame(data: alloc::vec::Vec<u8>, pi: bool, open_id: u32) -> Message {
+    let count = data.len();
     let d = if pi {
         if data.len() < 4 { return err(22); }
         &data[4..]
