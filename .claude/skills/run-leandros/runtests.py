@@ -195,7 +195,7 @@ SUITES = {
     "kparks": ["host:kparkstest.py"],
     # Root podman on the default bridge network (needs LEANDROS_IMAGE_ARCHIVE image).
     "podbridge": ["host:podbridgetest.py"],
-    # Rootless podman on the default pasta network, as user leandro (needs LEANDROS_IMAGE_ARCHIVE image + idmap=test).
+    # Rootless podman on the default pasta network, as user leandro (needs LEANDROS_IMAGE_ARCHIVE image).
     "podpasta": ["host:podpastatest.py"],
     # /proc/<pid>/comm, prctl names and /bin/ps.
     "procps": ["/bin/pstest"],

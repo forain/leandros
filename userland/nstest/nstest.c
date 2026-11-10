@@ -3096,14 +3096,14 @@ static int t_cgns_leak(void)
 /* Namespace quota is charged up the userns tree (Linux inc_ucount): a container
  * whose ns-root is kuid 1000 and that maps subuids 100000.. may not multiply
  * its quota by setuid()ing across them, and must not starve other users.
- * Needs idmap=test (multi-range map) until the flip. */
+ * Skips on idmap=off. */
 static int t_quota_hier(void)
 {
     char cl[512]; int fd = open("/proc/cmdline", O_RDONLY), n = 0;
     if (fd >= 0) { n = read(fd, cl, sizeof cl - 1); close(fd); }
     if (n < 0) n = 0;
     cl[n] = 0;
-    if (!strstr(cl, "idmap=test")) { printf("  quota_hier: SKIP (needs idmap=test)\n"); return 0; }
+    if (strstr(cl, "idmap=off")) { printf("  quota_hier: SKIP (idmap=off)\n"); return 0; }
     int ready[2], go[2], res[2];
     CHECK(pipe(ready) == 0 && pipe(go) == 0 && pipe(res) == 0);
     pid_t c = fork();
