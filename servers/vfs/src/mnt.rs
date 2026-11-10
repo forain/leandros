@@ -178,6 +178,25 @@ pub fn reverse(ns: NsId, backing: &[u8], hint: u32) -> Option<Vec<u8>> {
     None
 }
 
+/// Like [`reverse`] for a descriptor whose mount is unknown: among the mounts
+/// whose path round-trips, the newest wins (a container's rootfs mounts are
+/// newer than the copies of the host's, which cover the same backing paths).
+pub fn reverse_newest(ns: NsId, backing: &[u8]) -> Option<Vec<u8>> {
+    let g = NS.lock();
+    let t = &g.get(&ns)?.mnts;
+    let mut order: Vec<usize> = (0..t.len()).collect();
+    order.sort_by_key(|&i| core::cmp::Reverse(t[i].id));
+    for i in order {
+        let m = &t[i];
+        if !under(backing, &m.root) { continue; }
+        let mp = ns_mountpoint(t, i);
+        let rest: &[u8] = if &*m.root == b"/" { backing } else { &backing[m.root.len()..] };
+        let cand = join(&mp, rest);
+        if let Some(x) = walk(t, &cand) { if x.backing == backing { return Some(cand); } }
+    }
+    None
+}
+
 /// Does the namespace have a tree (i.e. was it created through [`copy`])?
 pub fn has_tree(ns: NsId) -> bool { NS.lock().contains_key(&ns) }
 
@@ -370,6 +389,22 @@ pub fn add_mount(ns: NsId, dst: &[u8], root: &[u8], sb: SbId, fstype: &'static s
     sb_get(sb);
     t.push(m);
     Ok(id)
+}
+
+/// Linux `mnt_already_visible` for proc and sysfs mounts by a task in a
+/// non-initial user namespace: some mount of `fstype` exposing the whole
+/// filesystem (root = its tree root) is in `ns`, with nothing locked stacked
+/// on it and no locked flag the new mount would drop.
+pub fn fully_visible(ns: NsId, fstype: &str, new_flags: u8) -> bool {
+    let g = NS.lock();
+    let Some(n) = g.get(&ns) else { return false };
+    let t = &n.mnts;
+    let full: &[u8] = if fstype == "proc" { b"/proc" } else { b"/sys" };
+    t.iter().any(|m| {
+        m.fstype == fstype && &*m.root == full
+            && (m.locked & 0x7f) & !new_flags == 0
+            && !t.iter().any(|c| c.parent == m.id && c.locked & LOCK_MNT != 0)
+    })
 }
 
 /// umount2 of the mount at namespace path `target`. The mount must be the
