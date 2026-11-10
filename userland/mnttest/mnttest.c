@@ -874,6 +874,7 @@ static int dpts_open(const char *d, int *mfd) {
     int fd = open(f, O_RDWR | O_NOCTTY);
     if (fd < 0) return -1;
     if (ioctl(fd, 0x80045430 /* TIOCGPTN */, &n) != 0) { close(fd); return -1; }
+    { int z = 0; ioctl(fd, 0x40045431 /* TIOCSPTLCK */, &z); }
     *mfd = fd;
     return (int)n;
 }
@@ -883,7 +884,7 @@ static void devpts_copies(void) {
     int up[2], dn[2], m0 = -1;
     mkdir(d, 0755);
     if (mount("none", d, "devpts", 0, "ptmxmode=0666") != 0 || pipe(up) != 0 || pipe(dn) != 0) {
-        report("devpts_copy_keeps_instance", 0);
+    report("devpts_copy_keeps_instance", 0);
         report("devpts_no_reuse_after_umount", 0);
         return;
     }
