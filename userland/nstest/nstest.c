@@ -3392,34 +3392,40 @@ static void nsforge_freed_slot_cycles(void)
 static void nsforge_detached_theft(void)
 {
     mkdir("/tmp/nsforge_mp", 0755);
-    mkdir("/tmp/nsforge_src", 0755);
-    int tree = syscall(SYS_open_tree, AT_FDCWD, "/tmp", 1 /*OPEN_TREE_CLONE*/ | 0x80000 /*CLOEXEC*/);
-    if (tree < 0) { printf("  open_tree errno %d\n", errno); check("nsforge_detached_theft_denied", 0); return; }
-    pid_t c = fork();
-    if (c == 0) {
-        if (drop_to(1000)) _exit(2);
-        if (unshare(CLONE_NEWUSER | CLONE_NEWNS)) _exit(3);
-        int stolen = 0;
-        for (int id = 1; id < 256; id++) {
-            char p[64];
-            snprintf(p, sizeof p, "/.leandros-ns/4/%d", id);
-            int fd = open(p, O_RDONLY);
-            if (fd < 0) continue;
-            if (syscall(SYS_move_mount, fd, "", AT_FDCWD, "/tmp/nsforge_mp", 0x4 /*F_EMPTY_PATH*/) == 0) stolen++;
-            stolen++; /* merely opening is already a forged fd */
-            close(fd);
+    pid_t h = fork();
+    if (h == 0) {
+        /* The holder: a root process in its own mount namespace (as crun). */
+        if (unshare(CLONE_NEWNS)) { printf("  holder unshare %d\n", errno); _exit(2); }
+        mount(0, "/", 0, MS_REC | MS_PRIVATE, 0);
+        int tree = syscall(SYS_open_tree, AT_FDCWD, "/tmp", 1 /*OPEN_TREE_CLONE*/ | 0x80000 /*CLOEXEC*/);
+        if (tree < 0) { printf("  open_tree errno %d\n", errno); _exit(3); }
+        pid_t c = fork();
+        if (c == 0) {
+            close(tree);
+            if (drop_to(1000)) _exit(2);
+            if (unshare(CLONE_NEWUSER | CLONE_NEWNS)) _exit(3);
+            int stolen = 0;
+            for (int id = 1; id < 256; id++) {
+                char p[64];
+                snprintf(p, sizeof p, "/.leandros-ns/4/%d", id);
+                int fd = open(p, O_RDONLY);
+                if (fd < 0) continue;
+                syscall(SYS_move_mount, fd, "", AT_FDCWD, "/tmp/nsforge_mp", 0x4 /*F_EMPTY_PATH*/);
+                stolen++; /* merely opening is already a forged fd */
+                close(fd);
+            }
+            _exit(stolen ? 1 : 0);
         }
-        _exit(stolen ? 1 : 0);
+        int st = 0; waitpid(c, &st, 0);
+        int ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        if (!ok) printf("  theft child st=%d\n", st);
+        /* The genuine holder can still attach its own tree. */
+        long r = syscall(SYS_move_mount, tree, "", AT_FDCWD, "/tmp/nsforge_mp", 0x4);
+        if (r != 0) { printf("  genuine move_mount: %d\n", errno); ok = 0; }
+        _exit(ok ? 0 : 1);
     }
-    int st = 0; waitpid(c, &st, 0);
-    int ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
-    if (!ok) printf("  theft child st=%d\n", st);
-    /* The genuine holder can still attach its own tree. */
-    long r = syscall(SYS_move_mount, tree, "", AT_FDCWD, "/tmp/nsforge_mp", 0x4);
-    if (r != 0) { printf("  genuine move_mount: %d\n", errno); ok = 0; }
-    else umount2("/tmp/nsforge_mp", MNT_DETACH);
-    close(tree);
-    check("nsforge_detached_theft_denied", ok);
+    int st = 0; waitpid(h, &st, 0);
+    check("nsforge_detached_theft_denied", WIFEXITED(st) && WEXITSTATUS(st) == 0);
 }
 
 /* Regression: a bound /proc/self/ns/net (podman/netavark) opens and setns works. */
