@@ -196,6 +196,8 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
             let peer = if x.kind == VifKind::Veth { Some(x.peer) } else { None };
             (core::mem::take(&mut x.rxq), x.mtu as usize, x.tun, x.kind == VifKind::Tun, x.mac, peer, x.kind, x.master)
         };
+        // Frames to the bridge MAC for another network may be forwarded (fwd.rs).
+        let rx = if kind == VifKind::Bridge { crate::fwd::divert(sid, rx) } else { rx };
         // A bridge port has no stack: what its peer sent goes into the switch.
         if kind == VifKind::Veth && master != NO_PEER {
             if !rx.is_empty() { crate::l2::forward(master, sid, rx.into_iter().collect()); }
