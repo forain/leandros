@@ -2031,7 +2031,38 @@ static int mro_nodev(int m) {
     if (fd >= 0 || errno != EACCES) { printf("  nodev open fd=%d errno=%d\n", fd, errno); return 11; }
     return 0;
 }
+static int mns_exec_euid(const char *f) {
+    pid_t p = fork();
+    if (p == 0) { if (setgid(1000) < 0 || setuid(1000) < 0) _exit(90); execl(f, f, "euid-chk", (char *)0); _exit(99); }
+    int st = 0; waitpid(p, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+static int mns_nosuid_bind(int m) {
+    (void)m;
+    mkdir("/tmp/mns", 0755); mkdir("/tmp/mnb", 0755); mkdir("/tmp/mnc", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    if (mount("tmpfs", "/tmp/mns", "tmpfs", 0, NULL) < 0) return 92;
+    chmod("/tmp/mns", 0755);
+    int in = open("/bin/mnttest", O_RDONLY); if (in < 0) return 94;
+    int a = open("/tmp/mns/m", O_WRONLY | O_CREAT, 0755); if (a < 0) return 95;
+    char buf[4096]; ssize_t n;
+    while ((n = read(in, buf, sizeof buf)) > 0) { if (write(a, buf, n) != n) return 96; }
+    close(a); close(in);
+    if (chown("/tmp/mns/m", 0, 0) < 0 || chmod("/tmp/mns/m", 04755) < 0) return 97;
+    if (mount("/tmp/mns", "/tmp/mnb", NULL, MS_BIND, NULL) < 0) return 98;
+    if (mount("/tmp/mns", "/tmp/mnc", NULL, MS_BIND, NULL) < 0) return 99;
+    int r = mns_exec_euid("/tmp/mnb/m");
+    if (r != 44) { printf("  control (suid bind) r=%d\n", r); return 10; }
+    if (mount(NULL, "/tmp/mnc", NULL, MS_BIND | MS_REMOUNT | MS_NOSUID, NULL) < 0) { printf("  remount errno=%d\n", errno); return 11; }
+    r = mns_exec_euid("/tmp/mnc/m");
+    if (r != 42) { printf("  nosuid bind exec r=%d\n", r); return 12; }
+    r = mns_exec_euid("/tmp/mnb/m");
+    if (r != 44) { printf("  sibling lost suid r=%d\n", r); return 13; }
+    return 0;
+}
 static void mro_suite(void) {
+    report("mntnosuid_bind_ignores_setuid", nn_in_child(mns_nosuid_bind, 0));
     report("mntro_ro_bind_erofs", nn_in_child(mro_erofs, 0));
     report("mntro_rw_fd_survives_remount_ro", nn_in_child(mro_openfd_keeps_writing, 0));
     report("mntro_noexec_eacces", nn_in_child(mro_noexec, 0));
@@ -2241,6 +2272,7 @@ static void devbind_suite(void) {
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
+    if (argc > 1 && !strcmp(argv[1], "euid-chk")) return geteuid() == 1000 ? 42 : geteuid() == 0 ? 44 : 45;
     newapi_enosys();
     kernel_selftest();
     sb_hidden_ns0();

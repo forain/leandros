@@ -6,7 +6,7 @@ LEANDROS_IMAGE_ARCHIVE=<alpine-oci.tar> (non-identity maps are on by default).  
   podman_echo      podman run --rm alpine:3.21 echo hi: RC=0, no "Rolling back"
   podman_hostnet   wget from a container to a host-side python http.server
                    at the guest's default gateway
-  podman_bridge_ip wget to 10.88.0.1 (busybox.static httpd in the guest host netns)
+  podman_bridge_ip wget to 10.88.0.1 (nc listener in a --network=host container)
   podman_dns       nslookup (skipped, not failed, if the guest has no resolver reach)
   podman_churn     20x `run --rm true`, then no veth/podman0 link, no netns
                    file or bind mount under /run/netns, no conntrack entry
@@ -78,9 +78,11 @@ def main():
         check("podman_hostnet", rc == 0 and "hello-from-host-podbridge" in out,
               f"rc={rc} " + out.strip()[-200:].replace("\n", " | "))
 
-        # The guest has no httpd applet: serve from a --network=host container (guest host netns).
-        run("mkdir -p /tmp/www && echo hello-from-guest-httpd > /tmp/www/index.html && "
-            f"podman run -d --rm --name pbhttpd --network=host -v /tmp/www:/www:ro {IMG} httpd -f -p 18080 -h /www 2>&1")
+        # The alpine busybox has no httpd applet: serve one reply per connection with nc from a
+        # --network=host container (guest host netns, listening on 0.0.0.0 before podman0 exists).
+        rc, out = run(f"podman run -d --rm --name pbhttpd --network=host {IMG} sh -c "
+                      "'while :; do printf \"HTTP/1.0 200 OK\\r\\n\\r\\nhello-from-guest-httpd\\n\" | nc -l -p 18080; done' 2>&1; sleep 2; podman ps 2>&1")
+        check("podman_hostnet_server_up", rc == 0 and "pbhttpd" in out, f"rc={rc} " + out.strip()[-200:].replace("\n", " | "))
         rc, out = run(f"podman run --rm {IMG} wget -T 15 -qO- http://10.88.0.1:18080/ 2>&1")
         check("podman_bridge_ip", rc == 0 and "hello-from-guest-httpd" in out,
               f"rc={rc} " + out.strip()[-200:].replace("\n", " | "))

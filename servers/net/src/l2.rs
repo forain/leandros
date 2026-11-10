@@ -52,10 +52,11 @@ pub(crate) fn fdb_len(br: Sid) -> usize { L2.lock().fdb.iter().filter(|e| e.br =
 fn now_cs() -> u64 { sched::monotonic_ns() / 10_000_000 }
 
 /// Queue `f` on vif `to`'s rxq if it is up and the frame fits; true if queued.
-fn push(v: &mut crate::vifsel::VifTable, to: Sid, f: &[u8]) -> bool {
+fn push(v: &mut crate::vifsel::VifTable, to: Sid, f: &[u8], src: Sid) -> bool {
     let Some(x) = v[to as usize].as_mut() else { return false };
     if !x.admin_up || f.len() > x.mtu as usize + 14 || x.rxq.len() >= RXQ_CAP { return false; }
     x.rxq.push_back(f.to_vec());
+    if x.kind == VifKind::Bridge { x.rxsrc.push_back(src); }
     x.pending = true;
     true
 }
@@ -65,7 +66,19 @@ fn out_port(v: &mut crate::vifsel::VifTable, p: Sid, f: &[u8]) {
     let Some(x) = v[p as usize].as_ref() else { return };
     if !x.admin_up { return; }
     let peer = x.peer;
-    if peer != NO_PEER { push(v, peer, f); }
+    if peer != NO_PEER { push(v, peer, f, NO_PEER); }
+}
+
+/// Hand `f` to port `port` of bridge `br` directly, bypassing the FDB (conntrack return path:
+/// the flow owns its port; a MAC learned from another port cannot redirect it).
+pub(crate) fn deliver(br: Sid, port: Sid, f: &[u8]) {
+    {
+        let mut v = VIFS.lock();
+        let ok = v[port as usize].as_ref().map_or(false, |x| x.master == br && x.kind == VifKind::Veth);
+        if !ok { return; }
+        out_port(&mut v, port, f);
+    }
+    drivers::netdev::kick();
 }
 
 /// Switch `frames` that entered bridge `br` at `in_port` (a port sid, or `br`
@@ -97,12 +110,12 @@ pub(crate) fn forward(br: Sid, in_port: Sid, frames: Vec<Vec<u8>>) {
             }
             let flood = |v: &mut crate::vifsel::VifTable, to_bridge: bool| {
                 for &p in ports.iter().filter(|&&p| p != in_port) { out_port(v, p, &f); }
-                if to_bridge && in_port != br { push(v, br, &f); }
+                if to_bridge && in_port != br { push(v, br, &f, in_port); }
             };
             if dst[0] & 1 != 0 {
                 flood(&mut v, true);
             } else if dst == bmac {
-                if in_port != br { push(&mut v, br, &f); }
+                if in_port != br { push(&mut v, br, &f, in_port); }
             } else {
                 let hit = s.fdb.iter().find(|e| e.br == br && e.mac == dst && now.saturating_sub(e.t) < ageing)
                     .map(|e| e.port).filter(|p| ports.contains(p));

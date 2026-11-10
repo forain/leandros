@@ -7845,6 +7845,68 @@ fn sys_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
         if !kbuf.is_empty() { console_write_user(kbuf.as_slice()); }
         return total;
     }
+    // A writev is ONE write operation. Record-oriented targets must see the
+    // gathered iovecs as a single record (a tap frame, a datagram, a message):
+    // pasta writes each tap frame as three iovecs (eth, IP, TCP header), and
+    // one write per iovec delivered three runt frames.
+    if let Some(tp) = net_server::tundev::device_port() {
+        if let Some(vfs::VnodeKind::DynamicDevice { port, open_id, .. }) = vfs::vfs_get_node_kind(pid, fd) {
+            if port == tp {
+                return vfs_reply_val(&net_server::tundev::writev(open_id, iov_ptr, iovcnt));
+            }
+        }
+    }
+    let mut sock_skip = 0usize;
+    if is_sock_handle(fd) {
+        let msg = make_vfs_msg(net_server::NET_SENDMSG,
+            &[fd as u64, 0, 0, iov_ptr as u64, iovcnt as u64]);
+        let r = net_blocking_op(pid, fd, 0, true, &msg);
+        if r != -38 {
+            // A stream socket may take only part of the vector. A blocking fd
+            // goes on writing the rest (as the per-iovec loop below always did);
+            // records are all-or-nothing and never get here short.
+            let mut want = 0usize;
+            for i in 0..iovcnt {
+                if let Some([_, len]) = ua::read_user::<[usize; 2]>(iov_ptr + i * 16) { want = want.saturating_add(len); }
+            }
+            if r < 0 || (r as usize) >= want || vfs::fd_nonblock(pid, fd) { return r; }
+            sock_skip = r as usize;
+        }
+    }
+    // A pipe write of at most PIPE_BUF bytes is atomic: gather it and hand the
+    // ring one write, so another writer's bytes cannot land between iovecs.
+    if matches!(vfs::pipe_end_of(pid, fd), Some((_, true))) {
+        let mut total = 0usize;
+        let mut ok = iovcnt <= 1024;
+        if ok {
+            for i in 0..iovcnt {
+                match ua::read_user::<[usize; 2]>(iov_ptr + i * 16) {
+                    Some([_, len]) => total = total.saturating_add(len),
+                    None => return -14,
+                }
+            }
+            ok = total > 0 && total <= vfs::PIPE_BUF;
+        }
+        if ok {
+            let mut kbuf: Vec<u8> = alloc::vec![0u8; total];
+            let mut off = 0usize;
+            for i in 0..iovcnt {
+                let [base, len] = match ua::read_user::<[usize; 2]>(iov_ptr + i * 16) { Some(v) => v, None => return -14 };
+                if len == 0 { continue; }
+                if !validate_user_buf(base, len) { return -14; }
+                prefault_user(base, len);
+                let o = off;
+                let good = with_current_address_space(|as_| as_.read_user_buf(base, &mut kbuf[o..o + len])).unwrap_or(false);
+                if !good { return -14; }
+                off += len;
+            }
+            let msg = make_vfs_msg(vfs::VFS_WRITE, &[fd as u64, kbuf.as_ptr() as u64, total as u64]);
+            let nonblock = vfs::fd_nonblock(pid, fd);
+            return block_until_ready(nonblock,
+                || vfs_reply_val(&vfs::handle(&msg, pid)),
+                || vfs_block_hint(pid, fd, true));
+        }
+    }
     // Everything else: one sys_write per iovec, which already routes sockets,
     // pipes and files correctly and blocks on a full pipe. On an O_APPEND
     // file the append lock is held across the whole vector, so it lands as
@@ -7852,11 +7914,13 @@ fn sys_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
     // iovec, and a concurrent appender could land between them).
     let _append = append_lock_for(pid, fd).map(|m| m.lock());
     let append_held = _append.is_some();
-    let mut total: isize = 0;
+    let mut total: isize = sock_skip as isize;
     for i in 0..iovcnt {
         let iov_addr = iov_ptr + i * 16;
-        let [base, len] = match ua::read_user::<[usize; 2]>(iov_addr) { Some(v) => v, None => return -14 };
+        let [mut base, mut len] = match ua::read_user::<[usize; 2]>(iov_addr) { Some(v) => v, None => return -14 };
         if len == 0 { continue; }
+        if sock_skip >= len { sock_skip -= len; continue; }
+        base += sock_skip; len -= sock_skip; sock_skip = 0;
         let n = sys_write_impl(fd, base, len, append_held);
         if n < 0 { return if total > 0 { total } else { n }; }
         total = total.saturating_add(n);
@@ -7885,6 +7949,14 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
         // already queued, like one recvmsg over the whole vector.
         f if is_sock_handle(f) => {
             const MSG_DONTWAIT: usize = 0x40;
+            // One recvmsg over the whole vector: a datagram / SEQPACKET record
+            // is scattered over the iovecs and never spills into the next one.
+            {
+                let msg = make_vfs_msg(net_server::NET_RECVMSG,
+                    &[fd as u64, 0, 0, iov_ptr as u64, iovcnt as u64]);
+                let r = net_blocking_op(current_pid(), fd, 0, false, &msg);
+                if r != -38 { return r; } // -38: netlink socket, per-iovec below
+            }
             let mut total: isize = 0;
             let mut first = true;
             for i in 0..iovcnt {
@@ -7902,6 +7974,22 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
         }
         _ => {
             let pid = current_pid();
+            // tun/tap: one frame scattered over the iovecs.
+            if let Some(tp) = net_server::tundev::device_port() {
+                if let Some(vfs::VnodeKind::DynamicDevice { port, open_id, .. }) = vfs::vfs_get_node_kind(pid, fd) {
+                    if port == tp {
+                        for i in 0..iovcnt {
+                            if let Some([b, l]) = ua::read_user::<[usize; 2]>(iov_ptr + i * 16) {
+                                if l > 0 { prefault_user(b, l); }
+                            }
+                        }
+                        let nonblock = vfs::fd_nonblock(pid, fd);
+                        return block_until_ready(nonblock,
+                            || vfs_reply_val(&net_server::tundev::readv(open_id, iov_ptr, iovcnt)),
+                            || vfs_block_hint(pid, fd, false));
+                    }
+                }
+            }
             let mut total: isize = 0;
             for i in 0..iovcnt {
                 let iov_addr = iov_ptr + i * 16;
@@ -9641,7 +9729,7 @@ fn sys_mount(
             let opts = if data_ptr == 0 { Vec::new() } else {
                 match read_user_short_str(data_ptr) { Ok(v) => v, Err(e) => return e }
             };
-            match vfs::devpts::create(&opts) { Ok(id) => vfs::devpts::backing(id), Err(e) => return e }
+            match vfs::devpts::create(&opts, &|g, v| sched::ns::to_k(g as usize, sched::ns::current_userns(), v)) { Ok(id) => vfs::devpts::backing(id), Err(e) => return e }
         } else { src };
         return match vfs::alias::add(mp, &src, fstype, &device) {
             Ok(()) => { if fstype == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
@@ -10034,7 +10122,7 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
         }
         b"devpts" => {
             let opts = if data_ptr == 0 { Vec::new() } else { match copy_user_str(data_ptr, 1024) { Ok(v) => v, Err(e) => return e } };
-            let id = match vfs::devpts::create(&opts) { Ok(id) => id, Err(e) => return e };
+            let id = match vfs::devpts::create(&opts, &|g, v| sched::ns::to_k(g as usize, sched::ns::current_userns(), v)) { Ok(id) => id, Err(e) => return e };
             let root = vfs::devpts::backing(id);
             return match vfs::mnt::add_mount(mns, &tns, &root, id, "devpts", b"devpts", mflags0) {
                 Ok(_) => 0,
@@ -12220,6 +12308,11 @@ fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
     if out.len() > 1 && out.last() == Some(&b'/') { out.pop(); }
     // The void root's name is not observable from outside it.
     if vfs::alias::under(&out, vfs::VOID_ROOT) && root.as_deref() != Some(vfs::VOID_ROOT) {
+        return Err(-2);
+    }
+    // nsfs has no path (Linux): `/.leandros-ns/..` is the synthetic source of a
+    // bound namespace file, produced only by the mount translation.
+    if out == b"/.leandros-ns" || out.starts_with(vfs::alias::NS_SRC) {
         return Err(-2);
     }
     // Superblock backing roots are never reachable by name.
@@ -16554,16 +16647,32 @@ fn sys_inotify_init1(flags: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-/// inotify_add_watch(fd, path, mask) → a fake watch descriptor (≥1). The path
-/// and mask are accepted and discarded — the watch never fires.
-fn sys_inotify_add_watch(fd: usize, _path_ptr: usize, _mask: usize) -> isize {
+/// inotify_add_watch(fd, path, mask) → watch descriptor. Unless `vfs.inotify=0`
+/// the path is resolved like any path syscall (mntns, chroot, symlinks unless
+/// IN_DONT_FOLLOW) and the VFS registers a real watch; otherwise the path and
+/// mask are discarded and a fake wd returned (the silent stub).
+fn sys_inotify_add_watch(fd: usize, path_ptr: usize, mask: usize) -> isize {
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_INOTIFY_ADD, &[fd as u64]);
+    if !vfs::inotify_enabled() {
+        let msg = make_vfs_msg(vfs::VFS_INOTIFY_ADD, &[fd as u64]);
+        return vfs_reply_val(&vfs::handle(&msg, pid));
+    }
+    const IN_DONT_FOLLOW: usize = 0x0200_0000;
+    let path = match resolve_at_path(AT_FDCWD, path_ptr) { Ok(p) => p, Err(e) => return e };
+    let path = if mask & IN_DONT_FOLLOW == 0 {
+        match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
+    } else { path };
+    let msg = make_vfs_msg(vfs::VFS_INOTIFY_ADD, &[fd as u64, path.ptr() as u64, mask as u64 & 0xFFFF_FFFF]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-/// inotify_rm_watch(fd, wd) → 0 (nothing to remove; watches never fired).
-fn sys_inotify_rm_watch(_fd: usize, _wd: usize) -> isize { 0 }
+/// inotify_rm_watch(fd, wd): a no-op with the silent stub, a real removal
+/// (IN_IGNORED, EINVAL for an unknown wd) unless `vfs.inotify=0`.
+fn sys_inotify_rm_watch(fd: usize, wd: usize) -> isize {
+    if !vfs::inotify_enabled() { return 0; }
+    let msg = make_vfs_msg(vfs::VFS_INOTIFY_RM, &[fd as u64, wd as u32 as u64]);
+    vfs_reply_val(&vfs::handle(&msg, current_pid()))
+}
 
 /// memfd_create(name_ptr, flags) → writable anonymous fd backed by a TmpFile.
 fn sys_memfd_create(name_ptr: usize, flags: usize) -> isize {
