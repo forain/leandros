@@ -244,6 +244,7 @@ static int ns_counts(int *live, int *sbs) {
     return sscanf(q, "ns_live=%d ns_dying=%d sb_count=%d", live, &dying, sbs) == 3 ? 0 : -1;
 }
 
+#define DBGC() do{int l,sb;ns_counts(&l,&sb);printf("DBG live=%d sb=%d line=%d\n",l,sb,__LINE__);}while(0)
 static void sync_parent(int wr, int rd) { char c = 'x'; write(wr, &c, 1); read(rd, &c, 1); }
 
 /* The unprivileged child: user + mount namespace, then the whole tour. */
@@ -1260,23 +1261,29 @@ static int nsfs_in_mntns(int mode) {
         if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
         wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
     } else if (unshare(CLONE_NEWNS) < 0) return 91;
+    DBGC();
     if (unshare(CLONE_NEWNET) < 0) return 92;
     struct stat orig, a, b;
     if (stat("/proc/self/ns/net", &orig) < 0) return 93;
     int fd;
     if (mode != 1) { fd = open(file, O_RDWR | O_CREAT, 0444); if (fd < 0) return 94; close(fd); }
+    DBGC();
     if (mount("/proc/self/ns/net", file, "none", MS_BIND, NULL) < 0) { printf("  nsfs bind errno=%d\n", errno); return 1; }
     if (mode == 2 && unshare(CLONE_NEWNS) < 0) return 95;
     static char mi[16384];
     if (slurp("/proc/self/mountinfo", mi, sizeof mi) <= 0 || !strstr(mi, file)) return 2;
+    DBGC();
     if (unshare(CLONE_NEWNET) < 0) return 96;       /* the bind now holds the old netns alone */
     fd = open(file, O_RDONLY);
     if (fd < 0) return 3;
     if (fstat(fd, &a) < 0 || a.st_ino != orig.st_ino) return 4;
+    DBGC();
     if (setns_(fd, CLONE_NEWNET) < 0) return 5;
     if (stat("/proc/self/ns/net", &b) < 0 || b.st_ino != orig.st_ino) return 6;
     close(fd);
+    DBGC();
     if (umount(file) < 0) return 7;
+    DBGC();
     return 0;
 }
 static int selfbind_copied(int m) {
@@ -1300,7 +1307,6 @@ static int nsfs_ns0_copied(int m) {
     int r = nn_join_check(file);
     return r ? 10 + r : 0;
 }
-#define DBGC() do{int l,sb;ns_counts(&l,&sb);printf("DBG live=%d sb=%d line=%d\n",l,sb,__LINE__);}while(0)
 static void fdpath_suite(void) {
     report("mount_private_via_fd_link_root", nn_in_child(fdp_direct, 0)); DBGC();
     report("crun_make_private_walk_root", nn_in_child(fdp_walk, 0)); DBGC();
