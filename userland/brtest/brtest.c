@@ -562,6 +562,8 @@ static int br_client_body(void) {
     struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7777) };
     inet_pton(AF_INET, "10.98.0.2", &to.sin_addr);
     char b[64] = {0};
+    if (!icmp_ping("10.98.0.1")) return 14;
+    if (!icmp_ping("10.98.0.2")) return 15;
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     if (sendto(u, "b-udp", 5, 0, (struct sockaddr *)&to, sizeof to) != 5) return 10;
@@ -572,8 +574,6 @@ static int br_client_body(void) {
     memset(b, 0, sizeof b);
     if (write(t, "b-tcp", 5) != 5 || read(t, b, sizeof b) != 5 || memcmp(b, "b-tcp", 5)) return 13;
     close(t);
-    if (!icmp_ping("10.98.0.1")) return 14;
-    if (!icmp_ping("10.98.0.2")) return 15;
     int h = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in hh = { .sin_family = AF_INET, .sin_port = htons(7778) };
     inet_pton(AF_INET, "10.98.0.1", &hh.sin_addr);
@@ -640,22 +640,25 @@ static void bridge_l2(void) {
     CHECK("bridge_l2: B: UDP+TCP to A, ping bridge addr, ping A, TCP to host", rb == 0);
     CHECK("bridge_l2: A served B and exited 0", wait_child(ca) == 0);
     close(hl);
-    /* bridge_getlink */
+    /* bridge_getlink (ports whose peer stays in the host netns, so they outlive the children) */
+    CHECK("bridge_getlink: persistent ports vethQ/vethR enslaved at create",
+          veth_new_m(s, "vethQ", "vethX", -1, bidx) == 0 && veth_new_m(s, "vethR", "vethY", -1, bidx) == 0);
+    int ia = link_get(s, "vethQ", NULL, NULL), ib = link_get(s, "vethR", NULL, NULL);
     CHECK("bridge_getlink: br0 INFO_DATA has exact-size AGEING_TIME/FORWARD_DELAY/STP_STATE/VLAN_FILTERING",
           link_info(s, "br0", &bi) > 0 && bi.ageing_sz == 4 && bi.fwd_sz == 4 && bi.stp_sz == 4 && bi.vlan_sz == 1);
     CHECK("bridge_getlink: defaults ageing 30000, fwd_delay 1500, stp 0, vlan_filtering 0",
           bi.ageing == 30000 && bi.fwd == 1500 && bi.stp == 0 && bi.vlan == 0);
-    CHECK("bridge_getlink: a non-bridge has no bridge INFO_DATA", link_info(s, "vethA", &pa) > 0 && !pa.isbr);
-    /* SETLINK master release / enslave, and the bridge MAC */
-    CHECK("bridge_getlink: SETLINK IFLA_MASTER=0 releases vethA", link_set_master(s, ia, 0) == 0 && link_info(s, "vethA", &pa) > 0 && pa.master == 0);
+    CHECK("bridge_getlink: a non-bridge has no bridge INFO_DATA", link_info(s, "vethQ", &pa) > 0 && !pa.isbr && pa.master == bidx);
+    CHECK("bridge_getlink: dump filter lists the two ports", count_master(s, bidx) == 2);
+    CHECK("bridge_getlink: SETLINK IFLA_MASTER=0 releases vethQ", link_set_master(s, ia, 0) == 0 && link_info(s, "vethQ", &pa) > 0 && pa.master == 0);
     CHECK("bridge_getlink: dump filter now lists one port", count_master(s, bidx) == 1);
-    CHECK("bridge_getlink: SETLINK IFLA_MASTER=br0 re-enslaves vethA", link_set_master(s, ia, bidx) == 0 && link_info(s, "vethA", &pa) > 0 && pa.master == bidx);
+    CHECK("bridge_getlink: SETLINK IFLA_MASTER=br0 re-enslaves vethQ", link_set_master(s, ia, bidx) == 0 && link_info(s, "vethQ", &pa) > 0 && pa.master == bidx);
     CHECK("bridge_getlink: IFLA_MASTER to a non-bridge is rejected", link_set_master(s, ia, ib) != 0);
     unsigned char m2[6] = { 0x02, 0x00, 0x5e, 0x98, 0x00, 0x09 };
     CHECK("bridge_getlink: SETLINK changes the bridge MAC", link_set_mac(s, bidx, m2) == 0 && link_info(s, "br0", &bi) > 0 && !memcmp(bi.mac, m2, 6));
     /* bridge_teardown */
-    CHECK("bridge_teardown: DELLINK vethA", link_del(s, ia) == 0 && !link_get(s, "vethA", NULL, NULL));
-    CHECK("bridge_teardown: DELLINK vethB", link_del(s, ib) == 0 && !link_get(s, "vethB", NULL, NULL));
+    CHECK("bridge_teardown: DELLINK vethQ", link_del(s, ia) == 0 && !link_get(s, "vethQ", NULL, NULL));
+    CHECK("bridge_teardown: DELLINK vethR", link_del(s, ib) == 0 && !link_get(s, "vethR", NULL, NULL));
     CHECK("bridge_teardown: DELLINK br0", link_del(s, bidx) == 0 && !link_get(s, "br0", NULL, NULL));
     CHECK("bridge_teardown: no vifs left", count_veth(s) == 0);
     /* a bridge deleted with a port still attached releases the port */
