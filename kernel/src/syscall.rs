@@ -9745,9 +9745,10 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
             Ok(Some(synth)) => {
                 let put = |s: &[u8]| if let Some((_, id)) = vfs::alias::ns_src(s) { sched::ns::put_raw(id); };
                 if tdir { put(&synth); return -20; }
+                // bind_nsfs drops the reference itself on failure.
                 return match vfs::mnt::bind_nsfs(mns, &synth, &tns) {
                     Ok(_) => 0,
-                    Err(e) => { put(&synth); e as isize }
+                    Err(e) => e as isize,
                 };
             }
             Ok(None) => {}

@@ -10227,6 +10227,7 @@ fn handle_close(pid: u32, fd: usize) -> Message {
         }
         VnodeKind::Mq { slot } => { mqueue::ref_dec(slot, pid); }
         VnodeKind::BpfProg { id } => sched::bpfcg::prog_put(id),
+        VnodeKind::NsFd { id, .. } => sched::ns::put_raw(id),
         VnodeKind::EventFd { slot } => {
             // Refcounted: an eventfd is dup-able, so free the pool slot only when
             // the last fd sharing it closes. Freeing early let a later eventfd()
@@ -10776,6 +10777,7 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
             tty_server::pty::drop_ref(pair as usize, is_master);
         }
         VnodeKind::Mq { slot } => { mqueue::ref_dec(slot, pid); }
+        VnodeKind::NsFd { id, .. } => sched::ns::put_raw(id),
         VnodeKind::EventFd { slot } => {
             // Only free the slot when the LAST dup of this eventfd closes;
             // otherwise a surviving dup keeps using a counter a new eventfd

@@ -244,7 +244,6 @@ static int ns_counts(int *live, int *sbs) {
     return sscanf(q, "ns_live=%d ns_dying=%d sb_count=%d", live, &dying, sbs) == 3 ? 0 : -1;
 }
 
-#define DBGC() do{int l,sb;ns_counts(&l,&sb);printf("DBG live=%d sb=%d line=%d\n",l,sb,__LINE__);}while(0)
 static void sync_parent(int wr, int rd) { char c = 'x'; write(wr, &c, 1); read(rd, &c, 1); }
 
 /* The unprivileged child: user + mount namespace, then the whole tour. */
@@ -1261,44 +1260,45 @@ static int nsfs_in_mntns(int mode) {
         if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
         wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
     } else if (unshare(CLONE_NEWNS) < 0) return 91;
-    DBGC();
     if (unshare(CLONE_NEWNET) < 0) return 92;
     struct stat orig, a, b;
     if (stat("/proc/self/ns/net", &orig) < 0) return 93;
     int fd;
     if (mode != 1) { fd = open(file, O_RDWR | O_CREAT, 0444); if (fd < 0) return 94; close(fd); }
-    DBGC();
     if (mount("/proc/self/ns/net", file, "none", MS_BIND, NULL) < 0) { printf("  nsfs bind errno=%d\n", errno); return 1; }
     if (mode == 2 && unshare(CLONE_NEWNS) < 0) return 95;
     static char mi[16384];
     if (slurp("/proc/self/mountinfo", mi, sizeof mi) <= 0 || !strstr(mi, file)) return 2;
-    DBGC();
     if (unshare(CLONE_NEWNET) < 0) return 96;       /* the bind now holds the old netns alone */
     fd = open(file, O_RDONLY);
     if (fd < 0) return 3;
-    DBGC();
     if (fstat(fd, &a) < 0 || a.st_ino != orig.st_ino) return 4;
-    DBGC();
     if (setns_(fd, CLONE_NEWNET) < 0) return 5;
     if (stat("/proc/self/ns/net", &b) < 0 || b.st_ino != orig.st_ino) return 6;
-    close(fd); DBGC();
+    close(fd);
     if (umount(file) < 0) return 7;
-    DBGC();
-    DBGC();
     return 0;
 }
-static int leakvar(int v) {
-    char file[64]; snprintf(file, sizeof file, "/tmp/lv.%d", (int)getpid());
-    if (v >= 20 && unshare(CLONE_NEWNS) < 0) return 91;
-    v %= 20;
+/* Closing an nsfs fd must drop the namespace reference its open took. */
+static int nsfd_close_child(int m) {
+    (void)m;
     if (unshare(CLONE_NEWNET) < 0) return 92;
-    int fd = open(file, O_RDWR | O_CREAT, 0444); if (fd < 0) return 94; close(fd);
-    if (mount("/proc/self/ns/net", file, "none", MS_BIND, NULL) < 0) return 1;
-    if (v >= 1) { if (unshare(CLONE_NEWNET) < 0) return 96; }
-    if (v >= 2) { fd = open(file, O_RDONLY); if (fd < 0) return 3; if (v >= 3) { if (setns_(fd, CLONE_NEWNET) < 0) return 5; } close(fd); }
-    if (umount(file) < 0) return 7;
-    unlink(file);
+    for (int i = 0; i < 4; i++) {
+        int fd = open("/proc/self/ns/net", O_RDONLY);
+        if (fd < 0) return 93;
+        int d = dup(fd);
+        close(fd); close(d);
+    }
     return 0;
+}
+static void nsfd_close_leak(void) {
+    int l0, s0, l1, s1;
+    ns_counts(&l0, &s0);
+    int ok = 1;
+    for (int i = 0; i < 100; i++) if (nn_in_child(nsfd_close_child, 0) != 1) ok = 0;
+    ns_counts(&l1, &s1);
+    if (l1 != l0) printf("  nsfd leak: live %d -> %d\n", l0, l1);
+    report("nsfd_close_releases_namespace_refs", ok && l1 == l0);
 }
 static int selfbind_copied(int m) {
     (void)m;
@@ -1322,16 +1322,16 @@ static int nsfs_ns0_copied(int m) {
     return r ? 10 + r : 0;
 }
 static void fdpath_suite(void) {
-    for (int v = 0; v < 24; v++) { if (v % 20 > 3) continue; int l0,s0,l1,s1; ns_counts(&l0,&s0); nn_in_child(leakvar, v); ns_counts(&l1,&s1); printf("LV v=%d live %d->%d\n", v, l0, l1); }
-    report("mount_private_via_fd_link_root", nn_in_child(fdp_direct, 0)); DBGC();
-    report("crun_make_private_walk_root", nn_in_child(fdp_walk, 0)); DBGC();
-    report("crun_make_private_walk_mntns", nn_in_child(fdp_root_mntns, 0)); DBGC();
-    report("crun_make_private_walk_userns_mntns", nn_in_child(fdp_userns_mntns, 0)); DBGC();
-    report("selfbind_visible_after_unshare_newns", nn_in_child(selfbind_copied, 0)); DBGC();
+    nsfd_close_leak();
+    report("mount_private_via_fd_link_root", nn_in_child(fdp_direct, 0));
+    report("crun_make_private_walk_root", nn_in_child(fdp_walk, 0));
+    report("crun_make_private_walk_mntns", nn_in_child(fdp_root_mntns, 0));
+    report("crun_make_private_walk_userns_mntns", nn_in_child(fdp_userns_mntns, 0));
+    report("selfbind_visible_after_unshare_newns", nn_in_child(selfbind_copied, 0));
     umount2("/tmp/fdp.m", MNT_DETACH);
-    report("nsfs_bind_in_mntns_root", nn_in_child(nsfs_in_mntns, 0)); DBGC();
-    report("nsfs_bind_in_userns_mntns", nn_in_child(nsfs_in_mntns, 1)); DBGC();
-    report("nsfs_bind_in_mntns_then_unshare_newns", nn_in_child(nsfs_in_mntns, 2)); DBGC();
+    report("nsfs_bind_in_mntns_root", nn_in_child(nsfs_in_mntns, 0));
+    report("nsfs_bind_in_userns_mntns", nn_in_child(nsfs_in_mntns, 1));
+    report("nsfs_bind_in_mntns_then_unshare_newns", nn_in_child(nsfs_in_mntns, 2));
     /* an ns-0 nsfs bind is copied into new mount namespaces */
     int p[2], q[2];
     if (pipe(p) || pipe(q)) { report("nsfs_ns0_bind_copied_by_unshare", 0); return; }
@@ -1351,7 +1351,7 @@ static void fdpath_suite(void) {
     if (write(q[1], "x", 1) != 1) {}
     int st = 0; waitpid(c, &st, 0);
     report("nsfs_ns0_bind_copied_by_unshare", ok && br == 0 && nn_in_child(nsfs_ns0_copied, 0));
-    umount2(file, MNT_DETACH); unlink(file); DBGC();
+    umount2(file, MNT_DETACH); unlink(file);
 }
 
 int main(int argc, char **argv) {
