@@ -308,6 +308,18 @@ SUITES = {
 HOST_TIMEOUTS = {"podbridgetest.py": 2400, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "usbisochtest.py": 900}
 
 
+def find_fails(out):
+    """Failing case names from every guest print format:
+    `name: FAIL`, `FAIL name: detail`, `FAIL: name`, `[FAIL] name`."""
+    pats = (r"^\s*(\S+): FAIL\b", r"^\s*FAIL:?\s+([^\s:]+)", r"^\s*\[FAIL\]\s+([^\s:]+)")
+    seen = []
+    for pat in pats:
+        for n in re.findall(pat, out, re.M):
+            if n not in seen:
+                seen.append(n)
+    return seen
+
+
 def host_run(c, timeout, arch=None, scale=1.0):
     """`host:<script> [args]`: run a script of this directory ON THE HOST
     (same LEANDROS_RUN_ID, so it finds this VM), in serial_run's result shape.
@@ -463,7 +475,7 @@ def main(argv):
                         r = driver.serial_run(c, timeout=timeout, arch=arch)
                 except Exception as e:  # noqa: BLE001
                     r = {"rc": None, "status": f"error {e}", "output": "", "secs": 0}
-                fails = re.findall(r"^\s*(\S+): FAIL\b", r["output"], re.M)
+                fails = find_fails(r["output"])
                 rc = r["rc"] if r["rc"] is not None else "?"
                 ok = r["rc"] == 0 and r["status"] in ("ok", "rc-file")
                 # Belt and braces for session/gate scripts: a RESULT line that
@@ -474,8 +486,13 @@ def main(argv):
                     r["rc"] = 1
                     fails.append("RESULT-gate")
                 all_ok &= ok
-                print(f"=== {c}: RC={rc} [{r['status']}, {r['secs']}s] fails={len(fails)}"
-                      + (f" {','.join(fails)}" if fails else ""), flush=True)
+                if fails:
+                    fcount = f"{len(fails)} {','.join(fails)}"
+                elif not ok:
+                    fcount = "? rc-only"  # failed with no parsable FAIL line
+                else:
+                    fcount = "0"
+                print(f"=== {c}: RC={rc} [{r['status']}, {r['secs']}s] fails={fcount}", flush=True)
                 res.write(f"=== {c}: RC={rc} [{r['status']}, {r['secs']}s]\n{r['output']}\n")
                 res.flush()
                 entry["results"].append({"cmd": c, "rc": r["rc"], "status": r["status"],
