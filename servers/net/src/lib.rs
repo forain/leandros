@@ -1683,6 +1683,7 @@ fn release_inet_state(state: SockState, sock_type: u8, park: bool) {
     for (sid, h) in inet_handles(&state) {
         let mut stack = stack_for(sid);
         let Some(ref mut s) = *stack else { continue };
+        if !s.socket_set.contains(h) { continue; }
         if park && sock_type == SOCK_STREAM as u8
             && matches!(state, SockState::InetConnected { .. })
         {
@@ -1756,7 +1757,10 @@ pub fn tcp_connect_status(pid: u32, fd: usize) -> isize {
         let mut stack = stack_for(sid);
         match stack.as_mut() {
             Some(s) => {
-                let t = s.socket_set.get_mut::<tcp::Socket>(handle);
+                let Some(t) = s.socket_set.try_get_mut::<tcp::Socket>(handle) else {
+                    tbl.socks[slot].connecting = false;
+                    return -(111i32 as isize); // ECONNREFUSED: the socket is gone
+                };
                 let st = t.state();
                 // The handshake is over: arm the keepalive timeout that
                 // connect() held back (see apply_tcp_opts).
@@ -1788,6 +1792,43 @@ pub fn tcp_connect_status(pid: u32, fd: usize) -> isize {
 #[inline]
 fn stack_for(sid: Sid) -> spin::MutexGuard<'static, Option<NetStack>> {
     STACKS[(sid as usize).min(MAX_STACKS - 1)].lock()
+}
+
+/// A socket whose smoltcp socket is gone (its stack was freed by a link
+/// delete / namespace reap, or the slot was reused) must fail like a socket on
+/// a dead link, never reach `SocketSet::get`, which panics on a stale handle.
+/// Called before every fd operation: a stale connected/ICMP entry (and every
+/// holder sharing its description) is demoted to the unconnected state the
+/// handlers already answer with an error. Common case: one table read.
+fn heal_stale(pid: u32, fd: usize) {
+    let Some(e) = sock_entry(pid, fd) else { return };
+    let (sid, h) = match e.state {
+        SockState::InetConnected { socket_handle, sid, .. } => (sid, socket_handle),
+        SockState::IcmpBound { socket_handle, sid } => (sid, socket_handle),
+        _ => return,
+    };
+    if stack_for(sid).as_ref().map_or(false, |s| s.socket_set.contains(h)) { return; }
+    let Some(slot) = fd_to_slot(fd) else { return };
+    let mut tbls = SOCK_TABLES.lock();
+    {
+        let Some(tbl) = find_tbl(pid, &mut *tbls) else { return };
+        let Some(e) = tbl.socks.get_mut(slot).filter(|e| e.in_use) else { return };
+        let same = match e.state {
+            SockState::InetConnected { socket_handle, sid: s2, .. } => s2 == sid && socket_handle == h,
+            SockState::IcmpBound { socket_handle, sid: s2 } => s2 == sid && socket_handle == h,
+            _ => false,
+        };
+        if !same { return; }
+        e.state = match e.state {
+            SockState::InetConnected { .. } => SockState::InetBound {
+                domain: e.domain, sock_type: e.sock_type,
+                local_endpoint: IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), e.bound_port),
+            },
+            _ => SockState::IcmpUnbound,
+        };
+        e.connecting = false;
+    }
+    share_state(&mut *tbls, pid, slot);
 }
 
 /// True for an address the loopback stack owns (127.0.0.0/8).
@@ -3999,6 +4040,11 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         // pass on an idle system.
         _ => false,
     };
+    if matches!(msg.tag, NET_BIND | NET_LISTEN | NET_ACCEPT | NET_CONNECT | NET_SEND | NET_RECV
+        | NET_SENDMSG | NET_RECVMSG | NET_SHUTDOWN | NET_GETSOCKNAME | NET_GETPEERNAME
+        | NET_SETSOCKOPT | NET_GETSOCKOPT | NET_CLOSE | NET_POLL | NET_DUP | NET_QUEUE_LEN) {
+        heal_stale(caller_pid, arg(msg,0) as usize);
+    }
     let reply = match msg.tag {
         NET_SOCKET      => handle_socket(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize),

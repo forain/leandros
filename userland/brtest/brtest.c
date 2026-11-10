@@ -1178,6 +1178,42 @@ static void hostlisten_not_in_ns(void) {
     close(s);
 }
 
+/* A socket bound to a stack that was freed (DELLINK) must fail like a socket on a
+ * dead link; the net server used to hit SocketSet::get on the stale handle and panic. */
+static void stale_stack(void) {
+    int s = nl_sock();
+    pid_t c = spawn_ns(idle_body);
+    int nsfd = netns_fd_of(c);
+    int e = veth_new(s, "vethZ", "eth0", nsfd);
+    close(nsfd);
+    int iz = link_get(s, "vethZ", NULL, NULL);
+    CHECK("stale_stack: pair created", e == 0 && iz > 0);
+    addr_add(s, iz, "10.99.9.1", 24); link_set_up(s, iz);
+    int t = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7777) };
+    inet_pton(AF_INET, "10.99.9.2", &to.sin_addr);
+    int r = connect(t, (struct sockaddr *)&to, sizeof to);
+    CHECK("stale_stack: connect in flight on the veth stack", r < 0 && errno == EINPROGRESS);
+    CHECK("stale_stack: DELLINK of the stack's link", link_del(s, iz) == 0);
+    /* a new pair reuses the freed stack slot */
+    int e2 = veth_new(s, "vethY", "eth1", -1);
+    (void)e2;
+    struct pollfd p = { t, POLLIN | POLLOUT, 0 };
+    int n = poll(&p, 1, 0);
+    CHECK("stale_stack: poll answers (no panic)", n >= 0);
+    char b[8];
+    ssize_t w = send(t, "x", 1, MSG_NOSIGNAL);
+    CHECK("stale_stack: send fails, not hangs", w < 0);
+    ssize_t rd = recv(t, b, sizeof b, 0);
+    CHECK("stale_stack: recv fails", rd < 0);
+    int soerr = 0; socklen_t sl = sizeof soerr;
+    CHECK("stale_stack: getsockopt answers", getsockopt(t, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0);
+    CHECK("stale_stack: close", close(t) == 0);
+    CHECK("stale_stack: net server alive", link_get(s, "lo", NULL, NULL) > 0);
+    kill(c, SIGKILL); wait_child(c);
+    close(s);
+}
+
 int main(int argc, char **argv) {
     const char *only = NULL;
     for (int i = 1; i < argc; i++) {
@@ -1192,6 +1228,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "veth_dellink")) veth_dellink();
     if (!only || !strcmp(only, "veth_naming")) veth_naming();
     if (!only || !strcmp(only, "veth_nsgone")) veth_nsgone();
+    if (!only || !strcmp(only, "stale_stack")) stale_stack();
     if (!only || !strcmp(only, "bridge_l2")) bridge_l2();
     if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
     if (!only || !strcmp(only, "fwd_ping")) fwd_ping();
