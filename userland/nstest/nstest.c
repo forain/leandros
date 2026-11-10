@@ -1061,6 +1061,173 @@ static int t_netns_siocsifflags_lo_userns(void)
     CHECK(sioc_lo_run(1) == 0);
     return 0;
 }
+/* ---- /proc/sys/net is per network namespace ---- */
+#define PSN "/proc/sys/net/"
+static int psn_rd(const char *f, char *b, int n) { char p[128]; snprintf(p, sizeof p, PSN "%s", f); return slurp(p, b, n); }
+static int psn_wr(const char *f, const char *v)
+{
+    char p[128]; snprintf(p, sizeof p, PSN "%s", f);
+    int fd = open(p, O_WRONLY | O_TRUNC);
+    if (fd < 0) return -errno;
+    int r = write(fd, v, strlen(v)); int e = errno;
+    close(fd);
+    return r < 0 ? -e : 0;
+}
+static int psn_is(const char *f, const char *want)
+{
+    char b[64]; return psn_rd(f, b, sizeof b) > 0 && strcmp(b, want) == 0;
+}
+static int t_procsysnet_defaults(void)
+{
+    CHECK(psn_is("ipv4/ip_unprivileged_port_start", "1024\n"));
+    CHECK(psn_is("ipv4/ip_forward", "0\n"));
+    CHECK(psn_is("ipv4/conf/all/forwarding", "0\n"));
+    CHECK(psn_is("ipv4/conf/default/forwarding", "0\n"));
+    CHECK(psn_is("ipv4/conf/lo/forwarding", "0\n"));
+    CHECK(psn_is("ipv4/ip_local_port_range", "32768\t60999\n"));
+    CHECK(psn_is("ipv6/conf/all/disable_ipv6", "0\n"));
+    CHECK(psn_is("ipv6/conf/default/disable_ipv6", "0\n"));
+    CHECK(psn_is("core/somaxconn", "4096\n"));
+    char b[64]; CHECK(psn_rd("ipv4/ping_group_range", b, sizeof b) > 0);
+    return 0;
+}
+/* Fresh netns of a new userns: Linux defaults, writable by its root, host untouched. */
+static int psn_child_userns(void)
+{
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) return 2;
+    if (!psn_is("ipv4/ping_group_range", "1\t0\n")) return 3;
+    if (!psn_is("ipv4/ip_unprivileged_port_start", "1024\n")) return 4;
+    if (psn_wr("ipv4/ping_group_range", "0 0") != 0) return 5;
+    if (!psn_is("ipv4/ping_group_range", "0\t0\n")) return 6;
+    if (psn_wr("ipv4/ip_unprivileged_port_start", "80") != 0) return 7;
+    if (!psn_is("ipv4/ip_unprivileged_port_start", "80\n")) return 8;
+    if (psn_wr("ipv4/ip_forward", "1") != 0 || !psn_is("ipv4/ip_forward", "1\n")) return 9;
+    if (psn_wr("ipv6/conf/all/disable_ipv6", "1") != 0 || !psn_is("ipv6/conf/all/disable_ipv6", "1\n")) return 10;
+    if (psn_wr("ipv4/ip_forward", "7") != -EINVAL) return 11;
+    /* port 81 is now unprivileged for an unprivileged-uid thread of this netns */
+    return 0;
+}
+static int t_procsysnet_netns_isolated(void)
+{
+    char before[64], after[64];
+    CHECK(psn_rd("ipv4/ip_unprivileged_port_start", before, sizeof before) > 0);
+    char pb[64]; CHECK(psn_rd("ipv4/ping_group_range", pb, sizeof pb) > 0);
+    pid_t c = fork();
+    if (c == 0) _exit(psn_child_userns());
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(psn_rd("ipv4/ip_unprivileged_port_start", after, sizeof after) > 0 && strcmp(before, after) == 0);
+    CHECK(psn_is("ipv4/ip_forward", "0\n") && psn_is("ipv6/conf/all/disable_ipv6", "0\n"));
+    CHECK(psn_rd("ipv4/ping_group_range", after, sizeof after) > 0 && strcmp(pb, after) == 0);
+    /* a second new netns starts from defaults again */
+    c = fork();
+    if (c == 0) { if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) _exit(2); _exit(psn_is("ipv4/ip_forward", "0\n") && psn_is("ipv4/ping_group_range", "1\t0\n") ? 0 : 3); }
+    waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+/* Root in the init ns writes and restores; init-ns writes are visible to later reads. */
+static int t_procsysnet_root_write(void)
+{
+    char old[64]; CHECK(psn_rd("core/somaxconn", old, sizeof old) > 0);
+    CHECK(psn_wr("core/somaxconn", "1234") == 0);
+    CHECK(psn_is("core/somaxconn", "1234\n"));
+    CHECK(psn_wr("core/somaxconn", "abc") == -EINVAL);
+    CHECK(psn_wr("core/somaxconn", old) == 0 && psn_is("core/somaxconn", old));
+    return 0;
+}
+static int t_procsysnet_unpriv_denied(void)
+{
+    pid_t c = fork();
+    if (c == 0) {
+        if (drop_to(1000) != 0) _exit(2);
+        int r = psn_wr("ipv4/ip_forward", "1");
+        if (r != -EACCES && r != -EPERM) _exit(3);
+        /* from an unprivileged user namespace over the HOST netns: still denied */
+        if (unshare(CLONE_NEWUSER) != 0) _exit(4);
+        r = psn_wr("ipv4/ip_forward", "1");
+        if (r != -EACCES && r != -EPERM) _exit(5);
+        _exit(psn_is("ipv4/ip_forward", "0\n") ? 0 : 6);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(psn_is("ipv4/ip_forward", "0\n"));
+    return 0;
+}
+static int t_procsysnet_port_start(void)
+{
+    CHECK(psn_wr("ipv4/ip_unprivileged_port_start", "1024") == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        if (drop_to(1000) != 0) _exit(2);
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(81) };
+        if (bind(s, (void *)&a, sizeof a) == 0 || errno != EACCES) _exit(3);
+        _exit(0);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* lower the host threshold: unprivileged bind of 81 now works */
+    CHECK(psn_wr("ipv4/ip_unprivileged_port_start", "80") == 0);
+    c = fork();
+    if (c == 0) {
+        if (drop_to(1000) != 0) _exit(2);
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(81) };
+        if (bind(s, (void *)&a, sizeof a) != 0) _exit(3);
+        a.sin_port = htons(79); int s2 = socket(AF_INET, SOCK_DGRAM, 0);
+        if (bind(s2, (void *)&a, sizeof a) == 0 || errno != EACCES) _exit(4);
+        _exit(0);
+    }
+    waitpid(c, &st, 0);
+    int ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    CHECK(psn_wr("ipv4/ip_unprivileged_port_start", "1024") == 0);
+    CHECK(ok);
+    return 0;
+}
+static int t_procsysnet_ping_range(void)
+{
+    /* a new netns defaults to "1 0": an unprivileged ping socket is refused; widening it allows it */
+    pid_t c = fork();
+    if (c == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) _exit(2);
+        /* give up the namespace root's CAP_NET_RAW bypass: be a non-zero gid with no caps */
+        if (psn_wr("ipv4/ping_group_range", "1 0") != 0) _exit(3);
+        if (setgid(1000) < 0 || setuid(1000) < 0) {
+            /* unmapped ids in a bare userns: fall back to checking the stored range only */
+            _exit(psn_is("ipv4/ping_group_range", "1\t0\n") ? 0 : 5);
+        }
+        int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+        if (s >= 0 || errno != EACCES) _exit(6);
+        _exit(0);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* init ns: unprivileged gid 1000 within the range may ping; out of range may not (init-ns range narrowed, restored) */
+    char old[64]; CHECK(psn_rd("ipv4/ping_group_range", old, sizeof old) > 0);
+    CHECK(psn_wr("ipv4/ping_group_range", "2000 3000") == 0);
+    c = fork();
+    if (c == 0) {
+        if (drop_to(1000) != 0) _exit(2);
+        int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+        _exit(s < 0 && errno == EACCES ? 0 : 3);
+    }
+    waitpid(c, &st, 0);
+    int ok1 = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    CHECK(psn_wr("ipv4/ping_group_range", "900 1100") == 0);
+    c = fork();
+    if (c == 0) {
+        if (drop_to(1000) != 0) _exit(2);
+        int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+        _exit(s >= 0 ? 0 : 3);
+    }
+    waitpid(c, &st, 0);
+    int ok2 = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    for (char *q = old; *q; q++) if (*q == '\t') *q = ' ';
+    CHECK(psn_wr("ipv4/ping_group_range", old) == 0);
+    CHECK(ok1 && ok2);
+    return 0;
+}
 static int t_netns_sendfam(void)
 {
     int h = socket(AF_INET, SOCK_DGRAM, 0);
@@ -2689,7 +2856,7 @@ static int run_userns_cases(void)
         { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
-        { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_siocsifflags_lo", t_netns_siocsifflags_lo }, { "netns_siocsifflags_lo_userns", t_netns_siocsifflags_lo_userns }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
+        { "procsysnet_defaults", t_procsysnet_defaults }, { "procsysnet_netns_isolated", t_procsysnet_netns_isolated }, { "procsysnet_root_write", t_procsysnet_root_write }, { "procsysnet_unpriv_denied", t_procsysnet_unpriv_denied }, { "procsysnet_port_start", t_procsysnet_port_start }, { "procsysnet_ping_range", t_procsysnet_ping_range }, { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_siocsifflags_lo", t_netns_siocsifflags_lo }, { "netns_siocsifflags_lo_userns", t_netns_siocsifflags_lo_userns }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
         { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
