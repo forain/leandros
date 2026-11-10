@@ -327,6 +327,13 @@ pub fn sock_set(ns: u16, cmd: u32, ifr: &[u8; 40]) -> Option<i32> {
     Some(0)
 }
 
+/// Does `ns` have any tun/tap interface?
+pub(crate) fn has_vifs(ns: u16) -> bool {
+    let nss = NETNS.lock();
+    let v = VIFS.lock();
+    nss.get(&ns).map_or(false, |st| st.sids.iter().any(|&s| v[s as usize].as_ref().map_or(false, |x| is_tun_kind(x.kind))))
+}
+
 /// The tun/tap interfaces of `ns` as netlink/ioctl links.
 pub(crate) fn links(ns: u16) -> Vec<rtnetlink::Link> {
     let nss = NETNS.lock();
