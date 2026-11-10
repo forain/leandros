@@ -383,7 +383,6 @@ static int vec_cases(void)
     }
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in me = { .sin_family = AF_INET, .sin_port = htons(4242) };
-    me.sin_addr.s_addr = inet_addr("10.9.0.1");
     CHECK("vec_udp_bind", bind(u, (struct sockaddr *)&me, sizeof me) == 0);
 
     /* tap writev of 3 iovecs (eth | ip | udp+payload) is ONE frame */
