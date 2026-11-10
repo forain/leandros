@@ -4650,6 +4650,11 @@ fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>) -> Resu
             return stack_holding(ns, a).ok_or(-99);
         }
         let d = dest.and_then(|d| if let IpAddress::Ipv4(x) = d { Some(x.0) } else { None });
+        if d.is_none() {
+            // A wildcard bind with no peer yet: the namespace's first interface stack, else its lo.
+            let lo = vif::lo_up_sid(ns);
+            return vif::ns_sids_dyn(ns).into_iter().find(|&s| Some(s) != lo).or(lo).ok_or(-101);
+        }
         return d.and_then(|d| vif::route_in_ns(ns, d)).ok_or(-101);
     }
     if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) { return Ok(LO); }
