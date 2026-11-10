@@ -1069,6 +1069,50 @@ static void fwd_port_reserved(void) { fwd_case("fwd_port_reserved", 4, 1); }
 static void fwd_hostlisten(void) { fwd_case("fwd_hostlisten", 6, 1); }
 static void fwd_reap(void) { fwd_case("fwd_reap", 5, 1); }
 
+/* A host wildcard listener must not leak into a container netns: a netns
+ * stack that connects to its OWN address on the listener's port gets
+ * ECONNREFUSED, and the host listener never sees a connection. */
+static void hostlisten_not_in_ns(void) {
+    int s = nl_sock();
+    int hl = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7781) };
+    CHECK("hostlisten_not_in_ns: host wildcard listener on 7781",
+          !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
+    pid_t c = spawn_ns(idle_body);
+    int nsfd = netns_fd_of(c);
+    int e = veth_new(s, "vethH", "eth0", nsfd);
+    close(nsfd);
+    int ia = link_get(s, "vethH", NULL, NULL);
+    CHECK("hostlisten_not_in_ns: pair created", e == 0 && ia > 0);
+    addr_add(s, ia, "10.99.2.1", 24); link_set_up(s, ia);
+    int ns = netns_fd_of(c);
+    pid_t h = fork();
+    if (h == 0) {
+        if (setns(ns, CLONE_NEWNET)) _exit(1);
+        int cs = nl_sock();
+        int idx = link_get(cs, "eth0", NULL, NULL);
+        if (!idx || addr_add(cs, idx, "10.99.2.2", 24) || link_set_up(cs, idx)) _exit(2);
+        int lo = link_get(cs, "lo", NULL, NULL); link_set_up(cs, lo);
+        int t = socket(AF_INET, SOCK_STREAM, 0);
+        struct timeval tv = { 5, 0 };
+        setsockopt(t, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        setsockopt(t, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7781) };
+        inet_pton(AF_INET, "10.99.2.2", &to.sin_addr);
+        if (connect(t, (struct sockaddr *)&to, sizeof to) == 0) _exit(5);
+        _exit(errno == ECONNREFUSED ? 0 : 6);
+    }
+    int rc = wait_child(h);
+    CHECK("hostlisten_not_in_ns: connect to the netns's own address is refused", rc == 0);
+    int fl = fcntl(hl, F_GETFL); fcntl(hl, F_SETFL, fl | O_NONBLOCK);
+    int a = accept(hl, NULL, NULL);
+    CHECK("hostlisten_not_in_ns: the host listener saw no connection", a < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    if (a >= 0) close(a);
+    close(ns); close(hl);
+    kill(c, SIGKILL); wait_child(c);
+    close(s);
+}
+
 int main(int argc, char **argv) {
     const char *only = NULL;
     for (int i = 1; i < argc; i++) {
@@ -1091,6 +1135,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "fwd_port_reserved")) fwd_port_reserved();
     if (!only || !strcmp(only, "fwd_reap")) fwd_reap();
     if (!only || !strcmp(only, "fwd_hostlisten")) fwd_hostlisten();
+    if (!only || !strcmp(only, "hostlisten_not_in_ns")) hostlisten_not_in_ns();
     printf("brtest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
