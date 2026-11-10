@@ -1276,8 +1276,9 @@ fn errtrace_log(number: usize, ret: isize, a0: usize, a1: usize, a2: usize) {
     // Path-like arguments: a printable NUL-terminated string at a pointer arg.
     for (i, a) in [a0, a1, a2].into_iter().enumerate() {
         if a < 0x1000 || a >= 0x0000_8000_0000_0000 { continue; }
-        if let Ok(v) = copy_user_str(a, 96) {
-            if v.len() >= 2 && v.iter().all(|&c| (0x20..0x7f).contains(&c)) {
+        if let Ok(v) = copy_user_str(a, 300) {
+            if v.len() >= 2 && v.iter().filter(|&&c| (0x20..0x7f).contains(&c)).count() * 2 >= v.len() {
+                let v: Vec<u8> = v.iter().map(|&c| if (0x20..0x7f).contains(&c) { c } else { b'.' }).collect();
                 crate::serial_print_str(" s");
                 crate::serial_print_hex(i);
                 crate::serial_print_str("=\"");
@@ -8882,6 +8883,17 @@ fn lstat_magic_link(ns: &[u8], statbuf_ptr: usize) -> Option<isize> {
 /// O_NOFOLLOW in the VFS (x86_64) open-flag layout.
 const OPEN_O_NOFOLLOW: usize = 0o400000;
 
+/// `/proc/<own>/fd/N` (final component, magic link followed) naming a
+/// descriptor that has no filesystem path (socket, pipe, eventfd, ...): N.
+/// Linux resolves those to the anonymous inode, so stat describes the object
+/// and chmod/chown succeed without touching a file (conmon chmods its bound
+/// console socket as "/proc/self/fd/N").
+fn proc_own_anon_fd(ns_path: &[u8]) -> Option<usize> {
+    let (fd, below) = proc_own_fd(ns_path)?;
+    if !below.is_empty() || fd_host_path(fd).is_some() { return None; }
+    Some(fd)
+}
+
 /// The host path of fd `fd` when it names a live directory the VFS can
 /// resolve by path; None for anything else (files keep identity reopen).
 fn fd_dir_host_path(fd: usize) -> Option<Vec<u8>> {
@@ -9920,6 +9932,11 @@ fn fstatat_into(
     }
 
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        if let Some(fd) = proc_own_anon_fd(path.ns_bytes()) {
+            return fstat_into(fd, statbuf_ptr, user_dest);
+        }
+    }
     let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
         match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
     } else {
@@ -10175,6 +10192,13 @@ fn sys_fchmodat2(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> is
 
 fn sys_fchmodat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        if let Some(fd) = proc_own_anon_fd(path.ns_bytes()) {
+            let mut kb = [0u64; STAT_SIZE.div_ceil(8)];
+            let r = fstat_into(fd, kb.as_mut_ptr() as usize, false);
+            return if r >= 0 { 0 } else { r };
+        }
+    }
     let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
         match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
     } else { path };

@@ -43,10 +43,30 @@ static void dirfd_proc_path(const char *tag, int oflags)
     close(so); unlink(r); close(fd); rmdir(d);
 }
 
+// conmon: bind a unix socket, then chmod("/proc/self/fd/<socket fd>", 0700).
+// On Linux the magic link resolves to the socket's anonymous inode: success.
+static void chmod_socket_fd(void)
+{
+    char d[64], r[96], p[64];
+    snprintf(d, sizeof d, "/tmp/conmontest.s%d", getpid());
+    rmdir(d); mkdir(d, 0755);
+    snprintf(r, sizeof r, "%s/console.sock", d);
+    int so = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    strncpy(a.sun_path, r, sizeof a.sun_path - 1);
+    ok("sock: bind", bind(so, (struct sockaddr *)&a, sizeof a) == 0);
+    snprintf(p, sizeof p, "/proc/self/fd/%d", so);
+    struct stat st;
+    ok("sock: stat /proc/self/fd/N is a socket", stat(p, &st) == 0 && S_ISSOCK(st.st_mode));
+    ok("sock: chmod /proc/self/fd/N", chmod(p, 0700) == 0);
+    close(so); unlink(r); rmdir(d);
+}
+
 int main(void)
 {
     dirfd_proc_path("o_path", O_PATH | O_DIRECTORY | O_CLOEXEC);
     dirfd_proc_path("o_rdonly", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    chmod_socket_fd();
     printf(fails ? "conmontest: %d FAILED\n" : "conmontest: ALL PASS\n", fails);
     return fails != 0;
 }
