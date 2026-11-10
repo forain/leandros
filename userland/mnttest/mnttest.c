@@ -1549,6 +1549,86 @@ static void fdmounts_suite(void) {
     report("fdmounts_proc_not_fully_visible_eperm", nn_in_child(fdm_visible_eperm, 0));
 }
 
+/* ── lane mntpivot (M4): pivot_root inside a mount namespace ─────────────── */
+static int pv_prepare(const char *root) {
+    mkdir("/tmp/pv", 0755); mkdir(root, 0755);
+    char p[128];
+    snprintf(p, sizeof p, "%s/hello", root);
+    int fd = open(p, O_CREAT | O_WRONLY, 0644);
+    if (fd < 0) return -1;
+    if (write(fd, "hi", 2) < 0) {}
+    close(fd);
+    snprintf(p, sizeof p, "%s/old", root);
+    mkdir(p, 0755);
+    return 0;
+}
+/* crun's sequence: chdir(root); pivot_root(".", "."); fchdir(oldroot);
+ * rslave; umount2(".", MNT_DETACH); chdir("/") */
+static int pv_crun_seq(const char *root) {
+    if (mount("", "/", NULL, MS_REC | MS_SLAVE, NULL) < 0) { printf("  rslave errno=%d\n", errno); return 10; }
+    if (mount(root, root, NULL, MS_BIND | MS_REC, NULL) < 0) { printf("  bind errno=%d\n", errno); return 11; }
+    if (chdir(root) < 0) return 12;
+    int oldroot = open("/", O_DIRECTORY | O_RDONLY);
+    if (oldroot < 0) return 13;
+    if (syscall(SYS_pivot_root, ".", ".") < 0) { printf("  pivot errno=%d\n", errno); return 14; }
+    if (fchdir(oldroot) < 0) { printf("  fchdir errno=%d\n", errno); return 15; }
+    close(oldroot);
+    if (mount("", ".", NULL, MS_SLAVE | MS_REC, NULL) < 0) { printf("  rslave2 errno=%d\n", errno); return 16; }
+    if (umount2(".", MNT_DETACH) < 0) { printf("  detach errno=%d\n", errno); return 17; }
+    if (chdir("/") < 0) return 18;
+    char cwd[64];
+    if (!getcwd(cwd, sizeof cwd) || strcmp(cwd, "/")) { printf("  cwd=%s\n", cwd); return 19; }
+    if (!exists("/hello")) return 20;
+    if (exists("/bin/mnttest") || exists("/proc/self")) { printf("  old root still visible\n"); return 21; }
+    return 0;
+}
+static int pv_dotdot(int m) {
+    (void)m;
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (pv_prepare("/tmp/pv/r1") < 0) return 92;
+    return pv_crun_seq("/tmp/pv/r1");
+}
+static int pv_errs(int m) {
+    (void)m;
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (pv_prepare("/tmp/pv/r2") < 0) return 92;
+    if (mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) return 93;
+    errno = 0;
+    if (!(syscall(SYS_pivot_root, "/tmp/pv/r2", "/tmp/pv/r2") == -1 && errno == EINVAL)) { printf("  nonmp errno=%d\n", errno); return 1; }
+    if (mount("/tmp/pv/r2", "/tmp/pv/r2", NULL, MS_BIND, NULL) < 0) return 94;
+    errno = 0;
+    if (!(syscall(SYS_pivot_root, "/tmp/pv/r2", "/tmp") == -1 && errno == EINVAL)) { printf("  put_old outside errno=%d\n", errno); return 2; }
+    errno = 0;
+    if (!(syscall(SYS_pivot_root, "/", "/") == -1 && errno == EBUSY)) { printf("  root errno=%d\n", errno); return 3; }
+    if (mount("", "/tmp/pv/r2", NULL, MS_SHARED, NULL) < 0) return 95;
+    errno = 0;
+    if (!(syscall(SYS_pivot_root, "/tmp/pv/r2", "/tmp/pv/r2/old") == -1 && errno == EINVAL)) { printf("  shared errno=%d\n", errno); return 4; }
+    if (mount("", "/tmp/pv/r2", NULL, MS_PRIVATE, NULL) < 0) return 96;
+    /* with a subdirectory as put_old the old root stays reachable there */
+    if (chdir("/tmp/pv/r2") < 0) return 97;
+    if (syscall(SYS_pivot_root, "/tmp/pv/r2", "/tmp/pv/r2/old") < 0) { printf("  ok pivot errno=%d\n", errno); return 5; }
+    if (chdir("/") < 0) return 98;
+    if (!exists("/hello") || !exists("/old/bin/mnttest")) { printf("  layout wrong\n"); return 6; }
+    if (umount2("/old", MNT_DETACH) < 0) { printf("  umount old errno=%d\n", errno); return 7; }
+    if (exists("/old/bin/mnttest")) return 8;
+    return 0;
+}
+static int pv_locked_userns(int m) {
+    (void)m;
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    mkdir("/tmp/pv", 0755);
+    if (pv_prepare("/tmp/pvu3") < 0) return 92;
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
+    wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
+    return pv_crun_seq("/tmp/pvu3");
+}
+static void pivot_suite(void) {
+    report("pivot_dotdot", nn_in_child(pv_dotdot, 0));
+    report("pivot_errs", nn_in_child(pv_errs, 0));
+    report("pivot_locked_userns", nn_in_child(pv_locked_userns, 0));
+    report("pivot_ns0_intact", exists("/bin/mnttest") && exists("/tmp/pv/r1/hello"));
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -1566,6 +1646,7 @@ int main(int argc, char **argv) {
     netns_suite();
     fdpath_suite();
     fdmounts_suite();
+    pivot_suite();
     devpts_copies();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;

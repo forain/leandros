@@ -9882,11 +9882,28 @@ fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
     }
 }
 
+/// pivot_root(2) inside a mount namespace: re-root that namespace's tree
+/// and rebase the stored root/cwd of every task in it. The caller must not
+/// be chrooted (Linux needs its root to be a mountpoint).
+fn sys_pivot_root_ns(mns: sched::ns::NsId, new_root_ptr: usize, put_old_ptr: usize) -> isize {
+    vfs::mnt::reap();
+    let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
+    let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };
+    if let (Some(r), _, _) = sched::current_fs_ctx() { if r.len() > 1 { return -22; } }
+    let pm = match vfs::mnt::pivot_root(mns, new_path.ns_bytes(), old_path.ns_bytes()) {
+        Ok(m) => m,
+        Err(e) => return e as isize,
+    };
+    sched::rebase_fs_paths(mns, &|p| pm.map(p));
+    0
+}
+
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
-    // The pivot rewrites the global (ns 0) mount table; inside a mount
-    // namespace it would re-root the host. Per-namespace pivot is lane M4.
-    if sched::current_mntns() != 0 { return -22; }
+    // In ns 0 the pivot rewrites the global mount table; a mount namespace
+    // pivots its own tree (sys_pivot_root_ns).
+    let mns = sched::current_mntns();
     if !may_mount() { return -1; } // EPERM (CAP_SYS_ADMIN over the mntns owner)
+    if mns != 0 { return sys_pivot_root_ns(mns, new_root_ptr, put_old_ptr); }
     let pid = current_pid();
     let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
     let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };
