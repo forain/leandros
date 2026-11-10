@@ -2112,6 +2112,7 @@ static int c_devpts(void *a)
     if (r) { (void)!write(d->up, &b, 1); return e == EINVAL ? 0 : 50; }
     char p[96]; snprintf(p, sizeof p, "%s/ptmx", d->dir);
     int m = open(p, O_RDWR | O_NOCTTY);
+    if (m < 0) { printf("  devpts ptmx open errno %d\n", errno); }
     CHECK(m >= 0);
     unsigned n = 0;
     CHECK(ioctl(m, TIOCGPTN, &n) == 0);
@@ -2122,11 +2123,12 @@ static int c_devpts(void *a)
     char g; (void)!read(d->dn, &g, 1);
     return view;
 }
-static int devpts_run(const char *opts, int want_mount, unsigned *kgid)
+static int devpts_run2(const char *opts, int want_mount, unsigned *kgid, int *dnw)
 {
     if (!knob) return SKIP;
     struct dpa d; int up[2], dn[2];
     CHECK(pipe(up) == 0 && pipe(dn) == 0);
+    *dnw = dn[1];
     d.up = up[1]; d.dn = dn[0];
     snprintf(d.dir, sizeof d.dir, "/tmp/dpm.%d", (int)getpid());
     snprintf(d.opts, sizeof d.opts, "%s", opts);
@@ -2150,6 +2152,13 @@ static int devpts_run(const char *opts, int want_mount, unsigned *kgid)
     int s; waitpid(c, &s, 0); rmdir(d.dir);
     CHECK(ok);
     return WIFEXITED(s) && WEXITSTATUS(s) == 0 ? 0 : 3;
+}
+static int devpts_run(const char *opts, int want_mount, unsigned *kgid)
+{
+    int dnw = -1;
+    int r = devpts_run2(opts, want_mount, kgid, &dnw);
+    if (dnw >= 0) close(dnw); /* releases a child still waiting */
+    return r;
 }
 static int devpts_gid_translated(void)
 {
