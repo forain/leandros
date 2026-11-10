@@ -10006,7 +10006,9 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
             Ok(None) => {}
         }
         let sdir = match kpath_is_dir(&src) { Ok(d) => d, Err(e) => return e };
-        if sdir != tdir { return -20; } // ENOTDIR (both directions, as Linux graft_tree)
+        if sdir != tdir {
+            return -20;
+        } // ENOTDIR (both directions, as Linux graft_tree)
         return match vfs::mnt::bind(mns, src.ns_bytes(), &tns, flags & MS_REC != 0) { Ok(_) => 0, Err(e) => e as isize };
     }
     let fstype = match read_user_short_str(fstype_ptr) { Ok(v) => v, Err(e) => return e };
