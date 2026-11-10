@@ -1907,9 +1907,35 @@ static int fb_seq(int mode) {
     close(fd);
     return 0;
 }
+/* crun's new-API variant: open_tree(CLONE) the source, move_mount it onto the
+ * target, then setattr / make-private through the SAME descriptor. */
+static int fb_mv(int isdir) {
+    mkdir("/tmp/fm", 0755); mkdir("/tmp/fm/r", 0755); mkdir("/tmp/fm/r/etc", 0755); mkdir("/tmp/fm/s", 0755);
+    const char *src = isdir ? "/tmp/fm/s/d" : "/tmp/fm/s/hosts";
+    const char *dst = isdir ? "/tmp/fm/r/etc/d" : "/tmp/fm/r/etc/hosts";
+    if (isdir) { mkdir(src, 0755); mkdir(dst, 0755); }
+    else { int f = open(src, O_CREAT | O_WRONLY, 0644); if (f < 0) return 90; close(f);
+           f = open(dst, O_CREAT | O_WRONLY, 0644); if (f < 0) return 90; close(f); }
+    if (ot_userns() < 0) return 91;
+    if (mount("/tmp/fm/r", "/tmp/fm/r", NULL, MS_BIND | MS_REC, NULL) < 0) return 10;
+    int fd = otree(AT_FDCWD, src, OT_CLONE | OT_CLOEXEC);
+    if (fd < 0) { printf("  open_tree errno=%d\n", errno); return 11; }
+    if (omove(fd, "", AT_FDCWD, dst, 4) < 0) { printf("  move_mount errno=%d\n", errno); return 12; }
+    if (osetattr(fd, "", 0x1000 | OT_REC, 0, 0) < 0) { printf("  mount_setattr errno=%d\n", errno); return 13; }
+    char p[48]; snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    if (mount(NULL, p, NULL, MS_REC | MS_PRIVATE, NULL) < 0) { printf("  propagation errno=%d\n", errno); return 14; }
+    static char mi[16384];
+    if (slurp("/proc/self/mountinfo", mi, sizeof mi) <= 0 || !strstr(mi, isdir ? "/tmp/fm/r/etc/d " : "/tmp/fm/r/etc/hosts ")) return 15;
+    close(fd);
+    return 0;
+}
+static int fb_mvf(int m) { (void)m; return fb_mv(0); }
+static int fb_mvd(int m) { (void)m; return fb_mv(1); }
 static int fb_m(int m) { return fb_seq(m); }
 static void fdbindprop_suite(void) {
     static const char *nm[] = { "file_tmp", "dir_tmp", "file_disk", "dir_disk", "file_tmp_pre", "dir_tmp_pre", "file_disk_pre", "dir_disk_pre", "file_tmp_rel", "dir_tmp_rel", "file_disk_rel", "dir_disk_rel", "file_tmp_pre_rel", "dir_tmp_pre_rel", "file_disk_pre_rel", "dir_disk_pre_rel" };
+    report("fdbindprop_open_tree_move_file_then_setattr_private", nn_in_child(fb_mvf, 0));
+    report("fdbindprop_open_tree_move_dir_then_setattr_private", nn_in_child(fb_mvd, 0));
     for (int m = 0; m < 16; m++) {
         char n[64]; snprintf(n, sizeof n, "fdbindprop_%s", nm[m]);
         report(n, nn_in_child(fb_m, m));
