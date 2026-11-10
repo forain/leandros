@@ -175,6 +175,57 @@ fn make_stack(sid: Sid, mac: [u8; 6]) {
         listens: Vec::new(),
         inet_seq: alloc::collections::BTreeMap::new(),
     });
+    // Host wildcard listeners set up before this stack existed (httpd on
+    // 0.0.0.0 before podman0 is created) belong on it too: Linux delivers to
+    // them on every host address. `adopt` skips stacks of other namespaces
+    // (listen::stacks_for) and is a no-op with none.
+    let _ = crate::listen::adopt(sid);
+}
+
+/// Take from `tx` the frames a stack built for one of its own interface
+/// addresses and queue them on its own receive side: an ARP request for an
+/// own address is answered (with the interface MAC) and an IPv4 frame
+/// addressed to the interface's own MAC is received as sent, so a connect()
+/// to the netns's own address reaches its listener or an RST from it.
+fn loop_own(sid: Sid, mac: [u8; 6], tx: &mut Vec<Vec<u8>>) {
+    if tx.is_empty() { return; }
+    let addrs: Vec<[u8; 4]> = {
+        let v = VIFS.lock();
+        match v[sid as usize].as_ref() { Some(x) => x.addrs.iter().map(|&(a, _)| a).collect(), None => return }
+    };
+    let mut back: Vec<Vec<u8>> = Vec::new();
+    tx.retain(|f| {
+        if f.len() < 14 { return true; }
+        let et = u16::from_be_bytes([f[12], f[13]]);
+        if et == 0x0806 && f.len() >= 42 && f[20..22] == [0, 1] && addrs.iter().any(|a| a[..] == f[38..42]) {
+            let mut r = alloc::vec![0u8; 42];
+            r[0..6].copy_from_slice(&f[6..12]);
+            r[6..12].copy_from_slice(&mac);
+            r[12..14].copy_from_slice(&[0x08, 0x06]);
+            r[14..20].copy_from_slice(&f[14..20]);
+            r[20..22].copy_from_slice(&[0, 2]);
+            r[22..28].copy_from_slice(&mac);
+            r[28..32].copy_from_slice(&f[38..42]);
+            r[32..38].copy_from_slice(&f[22..28]);
+            r[38..42].copy_from_slice(&f[28..32]);
+            back.push(r);
+            return false;
+        }
+        if et == 0x0800 && f[0] & 1 == 0 && f[0..6] == mac {
+            back.push(f.clone());
+            return false;
+        }
+        true
+    });
+    if back.is_empty() { return; }
+    {
+        let mut v = VIFS.lock();
+        if let Some(x) = v[sid as usize].as_mut() {
+            for f in back { if x.rxq.len() < RXQ_CAP { x.rxq.push_back(f); } }
+            x.pending = true;
+        }
+    }
+    drivers::netdev::kick();
 }
 
 /// Poll every up tun/tap stack once. Called from the daemon pass.
@@ -215,6 +266,11 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
                 }
             }
         }
+        // A stack talking to its own interface address: Linux delivers it
+        // locally (the `local` table); here the frames loop back to its own
+        // receive queue instead of waiting on a neighbour that is itself.
+        let mut dev = dev;
+        loop_own(sid, mac, &mut dev.tx);
         // Stack lock released: the bridge's own frames enter the switch.
         if kind == VifKind::Bridge {
             if !dev.tx.is_empty() { crate::l2::forward(sid, sid, dev.tx); }
