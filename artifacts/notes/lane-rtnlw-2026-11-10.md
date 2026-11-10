@@ -18,3 +18,7 @@ Fix: a dump is only recognized on RTM_GET* requests (`ty & 3 == 2`), as in Linux
 - Traced the reply path with temporary serial markers: apply returned, handle_request_env returned, replies n=0.
 - Box aarch64 /bin/netlinktest after fix: 1/1 PASS (76 case PASS lines); before: FAIL addr_dump_has, deladdr, delroute_* (see handoff).
 - Host unit tests in rtnetlink.rs cannot be built on the Mac (crate has kernel asm); covered by netlinktest on the guest.
+
+## netavark follow-up
+First failing request after the fix: RTM_NEWLINK (flags 0x605) with IFLA_LINKINFO kind=bridge + IFLA_IFNAME=podman0 -> ENODEV. Full sequence in design-podnet3.md section 7 Observed.
+Regress: box aarch64 full 80 suites, 0 bad (bd19b27a, includes main 0aeca481).
