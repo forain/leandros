@@ -11174,20 +11174,21 @@ fn find_conflict(locks: &[LockRecord], key: LockKey, pid: u32, start: u64, end: 
     }).copied()
 }
 
-/// The tag a waiter for a lock on `key` (F_SETLKW, blocking flock) parks
-/// on and every release of a record on `key` wakes: the one helper for both
-/// sides. A collision between two domains only costs a re-probe.
-fn lock_wake_tag(key: LockKey) -> u64 {
+/// The key a waiter for a lock on `key` (F_SETLKW, blocking flock) parks on and
+/// every release of a record on `key` wakes. A collision between two domains
+/// only costs a re-probe. Waiters park on it and releases wake it, so an unrelated keyed wake sharing only the bloom bit never reaches a
+/// lock waiter (a bits-only park woke on every such collision).
+fn lock_wake_key(key: LockKey) -> u64 {
     let index = match key {
         LockKey::Tmp(idx) => idx as u32,
         LockKey::Mount(port, file_id) =>
             0x8000_0000 | (port.wrapping_mul(0x9E37_79B1) ^ file_id) & 0x7fff_ffff,
     };
-    sched::poll_tag(sched::poll_class::FLOCK, index)
+    sched::poll_key(sched::poll_class::FLOCK, index)
 }
 
 /// Lock waiters re-probe at least this often even without a wake. Every
-/// path that clears a record wakes `lock_wake_tag`, so this is only a
+/// path that clears a record wakes `lock_wake_key`, so this is only a
 /// backstop for a release path added later without one.
 const LOCK_WAIT_BACKSTOP_NS: u64 = 1_000_000_000;
 
@@ -11210,7 +11211,7 @@ fn locks_clear(locks: &mut [LockRecord], key: LockKey, pid: u32,
 }
 
 /// Wake the waiters for a lock on `key` (after some record on it was cleared).
-fn locks_released(key: LockKey) { sched::wake_poll_tagged(lock_wake_tag(key)); }
+fn locks_released(key: LockKey) { sched::wake_poll_key(lock_wake_key(key)); }
 
 /// Release every lock `pid` holds on `key`.
 fn release_locks(key: LockKey, pid: u32) {
@@ -11224,8 +11225,8 @@ fn release_locks(key: LockKey, pid: u32) {
 fn lock_wait(key: LockKey, mut try_grant: impl FnMut() -> Option<Message>) -> Message {
     loop {
         if let Some(m) = try_grant() { return m; }
-        sched::block_on_poll_prepare_masked(sched::monotonic_ns() + LOCK_WAIT_BACKSTOP_NS,
-                                            lock_wake_tag(key));
+        sched::block_on_poll_prepare_tag(sched::monotonic_ns() + LOCK_WAIT_BACKSTOP_NS,
+                                         &sched::PollTag::keyed(&[lock_wake_key(key)], 0));
         if let Some(m) = try_grant() { sched::block_on_poll_cancel(); return m; }
         sched::block_on_poll_commit();
     }
@@ -14696,6 +14697,14 @@ fn tmp_setxattr_local(tmp: &mut TmpPool, owner: usize, cred: &xattr::Cred,
             return ok_reply();
         }
         let val = unsafe { core::slice::from_raw_parts(val_ptr as *const u8, size) };
+        let mut kbuf = [0u8; xattr::ACL_INHERIT_MAX];
+        let val = match xattr::acl_validate(val) {
+            Ok(_) => match xattr::acl_to_kernel(&cred.view, val, &mut kbuf) {
+                Ok(n) => &kbuf[..n],
+                Err(er) => return err_reply(-er),
+            },
+            Err(_) => return err_reply(-xattr::EINVAL),
+        };
         let summary = match xattr::acl_validate(val) {
             Ok(s) => s, Err(_) => return err_reply(-xattr::EINVAL),
         };
@@ -14742,6 +14751,14 @@ fn tmp_getxattr_local(tmp: &TmpPool, owner: usize, cred: &xattr::Cred,
     let value = match xattr::find(&xa[..], idx, suf) {
         Some(v) => v, None => return err_reply(-xattr::ENODATA),
     };
+    let mut kbuf = [0u8; xattr::ACL_INHERIT_MAX];
+    let value: &[u8] = if (idx == xattr::IDX_ACL_ACCESS || idx == xattr::IDX_ACL_DEFAULT)
+        && cred.view.ns != 0 {
+        match xattr::acl_from_kernel(&cred.view, value, &mut kbuf) {
+            Ok(n) => &kbuf[..n],
+            Err(er) => return err_reply(-er),
+        }
+    } else { value };
     let len = value.len();
     if size == 0 { return val_reply(len as u64); }
     if size < len { return err_reply(-xattr::ERANGE); }
