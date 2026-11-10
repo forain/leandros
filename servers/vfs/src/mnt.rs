@@ -391,6 +391,7 @@ pub fn open_tree_clone(ns: NsId, src: &[u8], rec: bool, anon: NsId, anon_owner: 
         clone_subtree(t, src, rec)?
     };
     for m in add.iter() { sb_get(m.sb); }
+    ATTACHED.lock().retain(|a| a.0 != anon); // namespace ids are recycled
     ANON.lock().push((anon, is_dir));
     NS.lock().insert(anon, MntNs { owner_user: anon_owner, mnts: add, seq: 0 });
     Ok(())
