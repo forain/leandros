@@ -262,6 +262,7 @@ static int next_tcp(int fd, unsigned char *b, int ms)
     for (;;) {
         int n = rd_timeout(fd, b, 2048, ms);
         if (n < 0) return -1;
+        printf("  frame len %d type %02x%02x proto %d\n", n, b[12], b[13], b[23]);
         if (n >= 42 && b[12] == 0x08 && b[13] == 0x06 && b[21] == 1) {
             memcpy(t_mac, b + 22, 6);
             unsigned char a[42];
@@ -288,7 +289,7 @@ static int tcp_cases(void)
     int fd, n;
     if (enter_ns() != 0) { printf("tcp_out: FAIL (unshare errno %d)\n", errno); return 1; }
     fd = tun_open("tap%d", F_TAP | F_NO_PI, name);
-    if (fd < 0 || set_addr(name, "10.9.0.1", "255.255.255.0") != 0) { printf("tcp_out: FAIL (tap setup)\n"); return 1; }
+    if (fd < 0 || set_addr(name, "10.9.0.1", "255.255.255.0") != 0) { printf("tcp_out: FAIL (tap setup fd %d name %s errno %d)\n", fd, name, errno); return 1; }
 
     /* tcp_out: connect over the tap, SYN on the fd, inject SYN-ACK / data / FIN */
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -296,6 +297,7 @@ static int tcp_cases(void)
     struct sockaddr_in peer = { .sin_family = AF_INET, .sin_port = htons(80) };
     memcpy(&peer.sin_addr, P_IP, 4);
     int rc = connect(s, (struct sockaddr *)&peer, sizeof peer);
+    printf("  connect rc %d errno %d\n", rc, errno);
     CHECK("tcp_connect_inprogress", rc < 0 && errno == EINPROGRESS);
     n = rc < 0 ? next_tcp(fd, b, 3000) : -1;
     int syn = n > 0 && TFLAGS(b) == 0x02 && memcmp(b + 30, P_IP, 4) == 0 && ((b[36] << 8) | b[37]) == 80;
