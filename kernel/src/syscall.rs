@@ -12124,6 +12124,13 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         }
         if arg == 0 || !validate_user_buf(arg, nl::IFREQ_LEN) { return -14; }
         let mut ifr = match sched::uaccess::read_user::<[u8; nl::IFREQ_LEN]>(arg) { Some(v) => v, None => return -14 };
+        // A tun/tap of the caller's netns (/dev/net/tun): flags, address,
+        // netmask and MTU are set on its vif; any other name falls through.
+        if matches!(cmd as u32, 0x8914 | 0x8916 | 0x891c | 0x8922) {
+            if let Some(r) = net_server::tunbe::sock_set(sched::ns::netns_of(pid as u32), cmd as u32, &ifr) {
+                return r as isize;
+            }
+        }
         if cmd as u32 == nl::SIOCSIFFLAGS {
             // Only a netns's own `lo` has an admin state to set (the same
             // LO_UP netlink RTM_NEWLINK uses); needs CAP_NET_ADMIN over the
@@ -12577,6 +12584,16 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     // /dev/netctl: its 'N' commands (docs/servers/netctl.md) are answered by
     // the net server's device, keyed on the fd's device port like the audio
     // server above. It copies the argument itself with no lock held.
+    // /dev/net/tun: tundev answers every ioctl on its opens (TUN*, FIONREAD).
+    if let Some(tp) = net_server::tundev::device_port() {
+        if let Some(vfs::VnodeKind::DynamicDevice { port, .. }) = vfs::vfs_get_node_kind(pid, fd) {
+            if port == tp {
+                let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
+                return vfs_reply_val(&vfs::handle(&msg, pid));
+            }
+        }
+    }
+
     if let Some(nc_port) = net_server::netctl::device_port() {
         if let Some(vfs::VnodeKind::DynamicDevice { port, .. }) = vfs::vfs_get_node_kind(pid, fd) {
             if port == nc_port {

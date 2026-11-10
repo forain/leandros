@@ -223,8 +223,12 @@ pub(crate) fn weak_host_holder(netif: u8, dst: [u8; 4]) -> Option<Sid> {
 /// True when the stack can carry a new flow to `dst` (has an address and
 /// carrier, and `dst` is on-link or it has a default route).
 pub(crate) fn can_route(sid: Sid, dst: IpAddress) -> bool {
-    // A dynamic sid is a netns's lo for now (tap/veth later get their own arm).
-    if sid == LO || sid >= FIRST_DYN { return is_loopback(dst); }
+    if sid == LO { return is_loopback(dst); }
+    // A dynamic sid is a netns's lo or a tun/tap stack chosen by the netns's own route table.
+    if sid >= FIRST_DYN {
+        let lo = crate::vif::VIFS.lock()[sid as usize].as_ref().map_or(false, |v| v.kind == crate::vifsel::VifKind::Lo);
+        return if lo { is_loopback(dst) } else { v4(dst).is_some() && !is_loopback(dst) };
+    }
     let Some(d) = v4(dst) else { return false };
     let r = rt(sid - 1);
     match r.cfg {

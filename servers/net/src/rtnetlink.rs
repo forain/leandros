@@ -460,7 +460,7 @@ pub const IFREQ_LEN: usize = 40;
 /// True for the ioctls `ifreq_ioctl` / `ifconf` answer (including the ones
 /// answered EOPNOTSUPP).
 pub fn is_if_ioctl(cmd: u32) -> bool {
-    matches!(cmd, SIOCGIFNAME | SIOCGIFCONF | SIOCGIFFLAGS | SIOCSIFFLAGS | SIOCGIFADDR | SIOCGIFBRDADDR
+    matches!(cmd, SIOCGIFNAME | SIOCGIFCONF | SIOCGIFFLAGS | SIOCSIFFLAGS | 0x8916 | 0x891c | 0x8922 | SIOCGIFADDR | SIOCGIFBRDADDR
         | SIOCGIFNETMASK | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFINDEX | SIOCETHTOOL | SIOCGIWRATE)
 }
 
@@ -566,6 +566,7 @@ pub fn current_links(ns: u16) -> Vec<Link> {
             up, running: up, loopback: true,
             addr: if up { Some(([127, 0, 0, 1], 8)) } else { None },
         });
+        v.extend(super::tunbe::links(ns));
         return v;
     }
     v.push(Link {

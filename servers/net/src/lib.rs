@@ -13,6 +13,8 @@ mod nlsock;
 mod iface;
 mod vifsel;
 mod vif;
+pub mod tundev;
+pub mod tunbe;
 pub mod netwatch;
 
 use iface::{Sid, LO, MAX_STACKS};
@@ -3452,6 +3454,7 @@ fn poll_stack<D: syngate::Frames>(s: &mut NetStack, dev: &mut D, timestamp: Inst
 
 pub fn net_daemon() -> ! {
     vif::init();
+    tunbe::init();
     // Readiness snapshots of each stack's sockets taken just before a poll
     // (see `readiness_sigs`), reused across passes.
     let mut sigs: [alloc::vec::Vec<Sig>; MAX_STACKS] = [const { alloc::vec::Vec::new() }; MAX_STACKS];
@@ -3616,6 +3619,7 @@ pub fn net_daemon() -> ! {
             }
         }
 
+        tunbe::poll_all(timestamp, &mut sigs, &mut wake_keys, &mut readiness_changed, &mut wake_mask, &mut next_poll);
         // Every other netns's loopback stack, polled the same way.
         for sid in vif::all_dyn_sids() {
             let mut st = stack_for(sid);
@@ -4636,8 +4640,16 @@ fn no_route_err() -> i32 { if drivers::netdev::count() == 0 { -100 } else { -101
 /// `dest` (if known) lives on (see `udp_materialize`).
 fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>) -> Result<Sid, i32> {
     if ns != 0 {
-        // Its own lo is the only stack; down = no route.
-        return vif::lo_up_sid(ns).ok_or(-101);
+        // Loopback stays on the namespace's own lo (down = no route); anything
+        // else leaves over its own tun/tap interfaces only, never a host NIC.
+        if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) {
+            return vif::lo_up_sid(ns).ok_or(-101);
+        }
+        if let Some(a) = local.filter(|a| !a.is_unspecified()) {
+            return stack_holding(ns, a).ok_or(-99);
+        }
+        let d = dest.and_then(|d| if let IpAddress::Ipv4(x) = d { Some(x.0) } else { None });
+        return d.and_then(|d| vif::route_in_ns(ns, d)).ok_or(-101);
     }
     if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) { return Ok(LO); }
     if let Some(a) = local.filter(|a| !a.is_unspecified()) {
@@ -4659,9 +4671,10 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     let ephemeral = alloc_ephemeral_port(&*tbls, &resv[..nresv]);
     let tbl = find_tbl(pid, &mut *tbls).ok_or(-9i32)?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return Err(-9); }
-    // Backstop: a socket of a non-initial netns only ever lands on its own lo
-    // (`udp_stack`); with that down it fails here.
-    if tbl.socks[slot].netns() != 0 && vif::lo_up_sid(tbl.socks[slot].netns()).is_none() { return Err(-101); }
+    // Backstop: a socket of a non-initial netns only ever lands on its own
+    // lo or tun/tap interfaces (`udp_stack`); with neither it fails here.
+    if tbl.socks[slot].netns() != 0 && vif::lo_up_sid(tbl.socks[slot].netns()).is_none()
+        && !tunbe::has_vifs(tbl.socks[slot].netns()) { return Err(-101); }
     let local_addr = match tbl.socks[slot].state {
         SockState::Unbound { .. } => None,
         SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
