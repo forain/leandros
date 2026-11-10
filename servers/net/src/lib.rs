@@ -1762,6 +1762,10 @@ fn stack_holding(ns: u16, ip: IpAddress) -> Option<Sid> {
 /// documented order) for the address of a connected socket, and SOCK_OPTS.
 fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, port: u16) -> bool {
     let tcp = me.sock_type == SOCK_STREAM as u8;
+    // A port a NAT flow (fwd.rs) holds on the host's NIC address is taken. FWD is a leaf lock.
+    if me.netns() == 0 && me.domain == AF_INET as u8 && fwd::reserved(tcp, port) {
+        if ip.is_unspecified() || matches!(ip, IpAddress::Ipv4(a) if iface::is_nic_addr(a.0)) { return true; }
+    }
     let my_reuseport = sock_opts(me.ofd).reuseport;
     let my_uid = sched::euid_of(pid);
     for t in tbls.iter().filter(|t| t.in_use) {
@@ -1791,6 +1795,15 @@ fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, por
         }
     }
     false
+}
+
+/// True when a host (netns 0) socket of the given protocol is bound to `port`.
+/// Takes SOCK_TABLES; the caller holds no stack or FWD lock (fwd.rs NAT port pick).
+pub(crate) fn host_port_busy(tcp: bool, port: u16) -> bool {
+    let st = if tcp { SOCK_STREAM as u8 } else { SOCK_DGRAM as u8 };
+    let tbls = SOCK_TABLES.read();
+    tbls.iter().any(|t| t.in_use && t.socks.iter().any(|e| e.in_use && e.bound_port == port
+        && e.domain == AF_INET as u8 && e.sock_type == st && e.netns() == 0))
 }
 
 /// Pick a free local port from Linux's ephemeral range for a `bind()` to port 0

@@ -29,6 +29,7 @@ use spin::Mutex;
 use crate::vifsel::{Sid, VifKind};
 
 const PROTO_ICMP: u8 = 1;
+const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const CT_CAP: usize = 1024;
 const ARP_CAP: usize = 64;
@@ -38,6 +39,10 @@ const NAT_SPAN: u16 = 4000;
 const UDP_NS: u64 = 30_000_000_000;
 const UDP_REPLIED_NS: u64 = 180_000_000_000;
 const ICMP_NS: u64 = 30_000_000_000;
+const TCP_SYN_NS: u64 = 60_000_000_000;
+const TCP_EST_NS: u64 = 7_200_000_000_000;
+const TCP_FIN_NS: u64 = 60_000_000_000;
+const TCP_TW_NS: u64 = 10_000_000_000;
 const PEND_NS: u64 = 1_000_000_000;
 const ARP_NS: u64 = 300_000_000_000;
 
@@ -46,6 +51,8 @@ struct Ct {
     cip: [u8; 4], cport: u16, cmac: [u8; 6], br: Sid, bmac: [u8; 6],
     rip: [u8; 4], rport: u16,
     nic: u8, nicip: [u8; 4], last: u64, replied: bool,
+    /// TCP lite FSM: 0 SYN sent, 1 SYN-ACK seen, 2 established, 3 one side sent FIN, 4 closing (both FINs or RST: TIME_WAIT-lite).
+    tst: u8, fins: u8,
 }
 struct Arp { nic: u8, ip: [u8; 4], mac: [u8; 6], t: u64 }
 struct Pend { nic: u8, ip: [u8; 4], t: u64, frames: Vec<Vec<u8>> }
@@ -60,6 +67,44 @@ static FWD: Mutex<St> = Mutex::new(St { ct: Vec::new(), arp: Vec::new(), pend: V
 static USED: AtomicBool = AtomicBool::new(false);
 static TXQ_N: AtomicUsize = AtomicUsize::new(0);
 static INQ_N: AtomicUsize = AtomicUsize::new(0);
+
+fn ct_ttl(e: &Ct) -> u64 {
+    match e.proto {
+        PROTO_UDP => if e.replied { UDP_REPLIED_NS } else { UDP_NS },
+        PROTO_TCP => match e.tst { 0 | 1 => TCP_SYN_NS, 2 => TCP_EST_NS, 3 => TCP_FIN_NS, _ => TCP_TW_NS },
+        _ => ICMP_NS,
+    }
+}
+
+/// Advance the TCP lite FSM of `e` for a segment with `flags` (`from_ctr`: sent by the container).
+fn tcp_step(e: &mut Ct, flags: u8, from_ctr: bool) {
+    const FIN: u8 = 1; const SYN: u8 = 2; const RST: u8 = 4; const ACK: u8 = 16;
+    if flags & RST != 0 { e.tst = 4; return; }
+    if flags & SYN != 0 {
+        if from_ctr && flags & ACK == 0 { if e.tst >= 3 { e.tst = 0; e.fins = 0; } }
+        else if !from_ctr && flags & ACK != 0 && e.tst == 0 { e.tst = 1; }
+        return;
+    }
+    if from_ctr && e.tst == 1 && flags & ACK != 0 { e.tst = 2; }
+    if flags & FIN != 0 && e.tst >= 1 && e.tst < 4 {
+        e.fins |= if from_ctr { 1 } else { 2 };
+        e.tst = if e.fins == 3 { 4 } else { 3 };
+    }
+}
+
+/// True while a live NAT entry holds `port` of the given protocol (TCP or UDP) on the host's NIC address.
+pub(crate) fn reserved(tcp: bool, port: u16) -> bool {
+    if !USED.load(Ordering::Relaxed) || port < NAT_BASE || port >= NAT_BASE + NAT_SPAN { return false; }
+    let proto = if tcp { PROTO_TCP } else { PROTO_UDP };
+    let now = sched::monotonic_ns();
+    FWD.lock().ct.iter().any(|e| e.proto == proto && e.nat == port && now.saturating_sub(e.last) < ct_ttl(e))
+}
+
+/// Drop the entries of containers whose interface MAC is in `macs` (their netns or veth died).
+pub(crate) fn forget_macs(macs: &[[u8; 6]]) {
+    if macs.is_empty() || !USED.load(Ordering::Relaxed) { return; }
+    FWD.lock().ct.retain(|e| !macs.contains(&e.cmac));
+}
 
 /// Number of live conntrack entries (diagnostics).
 pub(crate) fn ct_len() -> usize { FWD.lock().ct.len() }
@@ -97,6 +142,14 @@ fn udp_csum(f: &mut [u8], ihl: usize, ulen: usize) {
     if c == 0 { c = 0xffff; }
     f[o + 6..o + 8].copy_from_slice(&c.to_be_bytes());
 }
+fn tcp_csum(f: &mut [u8], ihl: usize, tlen: usize) {
+    let o = 14 + ihl;
+    f[o + 16] = 0; f[o + 17] = 0;
+    let mut a = sum(&f[26..34], 0) + PROTO_TCP as u32 + tlen as u32;
+    a = sum(&f[o..o + tlen], a);
+    let c = fold(a);
+    f[o + 16..o + 18].copy_from_slice(&c.to_be_bytes());
+}
 fn icmp_csum(f: &mut [u8], ihl: usize, ilen: usize) {
     let o = 14 + ihl;
     f[o + 2] = 0; f[o + 3] = 0;
@@ -106,7 +159,7 @@ fn icmp_csum(f: &mut [u8], ihl: usize, ilen: usize) {
 
 // ---- parsing -----------------------------------------------------------------
 
-struct Pkt { ihl: usize, proto: u8, src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, l4len: usize }
+struct Pkt { flags: u8, ihl: usize, proto: u8, src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, l4len: usize }
 
 /// A well-formed unfragmented IPv4 UDP datagram or ICMP echo (request when
 /// `reply` is false, reply when true). The frame is trimmed to the IP length.
@@ -127,6 +180,12 @@ fn parse(f: &mut Vec<u8>, reply: bool) -> Option<Pkt> {
             if ul < 8 || ul > l4len { return None; }
             (u16::from_be_bytes([f[o], f[o + 1]]), u16::from_be_bytes([f[o + 2], f[o + 3]]))
         }
+        PROTO_TCP => {
+            if l4len < 20 { return None; }
+            let doff = (f[o + 12] >> 4) as usize * 4;
+            if doff < 20 || doff > l4len { return None; }
+            (u16::from_be_bytes([f[o], f[o + 1]]), u16::from_be_bytes([f[o + 2], f[o + 3]]))
+        }
         PROTO_ICMP => {
             if l4len < 8 || f[o] != if reply { 0 } else { 8 } || f[o + 1] != 0 { return None; }
             let id = u16::from_be_bytes([f[o + 4], f[o + 5]]);
@@ -134,12 +193,14 @@ fn parse(f: &mut Vec<u8>, reply: bool) -> Option<Pkt> {
         }
         _ => return None,
     };
-    Some(Pkt { ihl, proto, src: [f[26], f[27], f[28], f[29]], dst: [f[30], f[31], f[32], f[33]], sport, dport, l4len })
+    let flags = if proto == PROTO_TCP { f[o + 13] } else { 0 };
+    Some(Pkt { flags, ihl, proto, src: [f[26], f[27], f[28], f[29]], dst: [f[30], f[31], f[32], f[33]], sport, dport, l4len })
 }
 
 fn finish(f: &mut [u8], p: &Pkt) {
     ip_csum(f, p.ihl);
     match p.proto {
+        PROTO_TCP => tcp_csum(f, p.ihl, p.l4len),
         PROTO_UDP => { let ul = u16::from_be_bytes([f[14 + p.ihl + 4], f[14 + p.ihl + 5]]) as usize; udp_csum(f, p.ihl, ul) }
         _ => icmp_csum(f, p.ihl, p.l4len),
     }
@@ -198,32 +259,52 @@ fn ingress(br: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
     let Some((nic, nh, nicip)) = crate::iface::nic_route(p.dst) else { return };
     let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { return };
     let now = sched::monotonic_ns();
+    let cmac: [u8; 6] = f[6..12].try_into().unwrap();
+    let rport = if p.proto == PROTO_ICMP { 0 } else { p.dport };
     let mut st = FWD.lock();
     USED.store(true, Ordering::Relaxed);
     sweep(&mut st, now);
-    let cmac: [u8; 6] = f[6..12].try_into().unwrap();
-    let nat = match st.ct.iter_mut().find(|e| e.proto == p.proto && e.br == br && e.cip == p.src && e.cport == p.sport
-        && e.rip == p.dst && e.rport == if p.proto == PROTO_ICMP { 0 } else { p.dport }) {
-        Some(e) => { e.last = now; e.cmac = cmac; e.nat }
+    let found = st.ct.iter_mut().find(|e| e.proto == p.proto && e.br == br && e.cip == p.src && e.cport == p.sport
+        && e.rip == p.dst && e.rport == rport).map(|e| { e.last = now; e.cmac = cmac; e.nat });
+    let nat = match found {
+        Some(n) => n,
         None => {
-            if st.ct.len() >= CT_CAP { return; }
+            // A TCP flow starts with a bare SYN only.
+            if p.proto == PROTO_TCP && p.flags & 0x12 != 0x02 { return; }
+            drop(st);
             let mut pick = None;
-            for _ in 0..NAT_SPAN {
-                let c = NAT_BASE + st.next % NAT_SPAN;
-                st.next = st.next.wrapping_add(1);
-                if !st.ct.iter().any(|e| e.nat == c && e.proto == p.proto) { pick = Some(c); break; }
+            for _ in 0..16 {
+                let mut g = FWD.lock();
+                if g.ct.len() >= CT_CAP { return; }
+                let mut cand = None;
+                for _ in 0..NAT_SPAN {
+                    let c = NAT_BASE + g.next % NAT_SPAN;
+                    g.next = g.next.wrapping_add(1);
+                    if !g.ct.iter().any(|e| e.nat == c && e.proto == p.proto) { cand = Some(c); break; }
+                }
+                let Some(c) = cand else { return };
+                // Reserve first, then ask the host's port table: a bind racing with us
+                // sees the entry (bind_conflict) or we see its socket.
+                g.ct.push(Ct { proto: p.proto, nat: c, cip: p.src, cport: p.sport, cmac, br, bmac, rip: p.dst,
+                    rport, nic, nicip, last: now, replied: false, tst: 0, fins: 0 });
+                drop(g);
+                if p.proto == PROTO_ICMP || !crate::host_port_busy(p.proto == PROTO_TCP, c) { pick = Some(c); break; }
+                let mut g = FWD.lock();
+                if let Some(i) = g.ct.iter().position(|e| e.nat == c && e.proto == p.proto && e.cip == p.src && e.cport == p.sport) { g.ct.swap_remove(i); }
             }
-            let Some(nat) = pick else { return };
-            st.ct.push(Ct { proto: p.proto, nat, cip: p.src, cport: p.sport, cmac, br, bmac, rip: p.dst,
-                rport: if p.proto == PROTO_ICMP { 0 } else { p.dport }, nic, nicip, last: now, replied: false });
-            nat
+            let Some(n) = pick else { return };
+            st = FWD.lock();
+            n
         }
     };
+    if p.proto == PROTO_TCP {
+        if let Some(e) = st.ct.iter_mut().find(|e| e.nat == nat && e.proto == PROTO_TCP) { tcp_step(e, p.flags, true); }
+    }
     // Rewrite: TTL, source address, source port / echo id.
     f[22] -= 1;
     f[26..30].copy_from_slice(&nicip);
     let o = 14 + p.ihl;
-    if p.proto == PROTO_UDP { f[o..o + 2].copy_from_slice(&nat.to_be_bytes()); }
+    if p.proto != PROTO_ICMP { f[o..o + 2].copy_from_slice(&nat.to_be_bytes()); }
     else { f[o + 4..o + 6].copy_from_slice(&nat.to_be_bytes()); }
     finish(&mut f, &p);
     f[6..12].copy_from_slice(&nicmac);
@@ -263,10 +344,7 @@ fn arp_request(mac: [u8; 6], ip: [u8; 4], target: [u8; 4]) -> Vec<u8> {
 fn sweep(st: &mut St, now: u64) {
     if now.saturating_sub(st.swept) < 1_000_000_000 { return; }
     st.swept = now;
-    st.ct.retain(|e| now.saturating_sub(e.last) < match e.proto {
-        PROTO_UDP => if e.replied { UDP_REPLIED_NS } else { UDP_NS },
-        _ => ICMP_NS,
-    });
+    st.ct.retain(|e| now.saturating_sub(e.last) < ct_ttl(e));
     st.pend.retain(|q| now.saturating_sub(q.t) < PEND_NS);
     st.arp.retain(|a| now.saturating_sub(a.t) < ARP_NS);
 }
@@ -278,7 +356,7 @@ fn sweep(st: &mut St, now: u64) {
 pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
     if !USED.load(Ordering::Relaxed) || buf.len() < 34 { return false; }
     if buf[12] == 0x08 && buf[13] == 0x06 { arp_learn(nic, buf); return false; }
-    if buf[12] != 0x08 || buf[13] != 0x00 || (buf[23] != PROTO_UDP && buf[23] != PROTO_ICMP) { return false; }
+    if buf[12] != 0x08 || buf[13] != 0x00 || (buf[23] != PROTO_UDP && buf[23] != PROTO_ICMP && buf[23] != PROTO_TCP) { return false; }
     let mut st = FWD.lock();
     if st.ct.is_empty() { return false; }
     let mut f = buf.to_vec();
@@ -287,12 +365,13 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
     let Some(e) = st.ct.iter_mut().find(|e| e.nic == nic && e.proto == p.proto && e.nicip == p.dst && e.nat == p.dport
         && e.rip == p.src && (p.proto == PROTO_ICMP || e.rport == p.sport)) else { return false };
     e.last = now; e.replied = true;
+    if p.proto == PROTO_TCP { tcp_step(e, p.flags, false); }
     let (cip, cport, cmac, bmac, br) = (e.cip, e.cport, e.cmac, e.bmac, e.br);
     if f[22] <= 1 { return true; }
     f[22] -= 1;
     f[30..34].copy_from_slice(&cip);
     let o = 14 + p.ihl;
-    if p.proto == PROTO_UDP { f[o + 2..o + 4].copy_from_slice(&cport.to_be_bytes()); }
+    if p.proto != PROTO_ICMP { f[o + 2..o + 4].copy_from_slice(&cport.to_be_bytes()); }
     else { f[o + 4..o + 6].copy_from_slice(&cport.to_be_bytes()); }
     finish(&mut f, &p);
     f[0..6].copy_from_slice(&cmac);
@@ -340,6 +419,7 @@ pub(crate) fn take_txq(nic: u8) -> Vec<Vec<u8>> {
 
 /// Un-NATed replies for the bridge switch (after the NIC pass).
 pub(crate) fn drain_in() {
+    if USED.load(Ordering::Relaxed) { let mut st = FWD.lock(); sweep(&mut st, sched::monotonic_ns()); } // expiry timer
     if INQ_N.load(Ordering::Relaxed) == 0 { return; }
     let q: Vec<(Sid, Vec<u8>)> = { let mut st = FWD.lock(); INQ_N.store(0, Ordering::Relaxed); st.inq.drain(..).collect() };
     for (br, f) in q { crate::l2::forward(br, br, alloc::vec![f]); }
