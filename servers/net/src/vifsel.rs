@@ -24,6 +24,8 @@ pub(crate) struct Vif {
     pub addrs: Vec<([u8; 4], u8)>,
     /// Frames waiting to enter the stack (cap `RXQ_CAP`).
     pub rxq: VecDeque<Vec<u8>>,
+    /// Bridge only: the port sid each `rxq` frame entered on, parallel to `rxq` (`NO_PEER` = unknown).
+    pub rxsrc: VecDeque<Sid>,
     /// Tap/Tun: the tundev handle of the attached fd (`NO_TUN` = detached persistent).
     pub tun: u32,
     /// rxq non-empty or a timer is due: poll this pass.
@@ -102,7 +104,7 @@ mod tests {
 
     fn vif(up: bool, addrs: &[([u8; 4], u8)]) -> Vif {
         Vif { netns: 1, ifindex: 2, name: [0; 16], kind: VifKind::Lo, admin_up: up, mtu: 1500, mac: [0; 6],
-              addrs: addrs.to_vec(), rxq: VecDeque::new(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER }
+              addrs: addrs.to_vec(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER }
     }
 
     #[test]
