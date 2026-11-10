@@ -183,20 +183,20 @@ static int wait_child(pid_t c) { int st = 0; waitpid(c, &st, 0); return WIFEXITE
 static int echo_server_body(void) {
     int s = nl_sock();
     int idx = link_get(s, "eth0", NULL, NULL);
-    if (!idx) return 1;
-    if (addr_add(s, idx, "10.99.0.2", 24)) return 2;
-    if (link_set_up(s, idx)) return 3;
+    if (!idx) { printf(\"brtest child fail %d errno %d\n\", 1, errno); fflush(stdout); return 1; }
+    if (addr_add(s, idx, "10.99.0.2", 24)) { printf(\"brtest child fail %d errno %d\n\", 2, errno); fflush(stdout); return 2; }
+    if (link_set_up(s, idx)) { printf(\"brtest child fail %d errno %d\n\", 3, errno); fflush(stdout); return 3; }
     int lo = link_get(s, "lo", NULL, NULL);
     link_set_up(s, lo);
     int u = socket(AF_INET, SOCK_DGRAM, 0), t = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(7777) };
-    if (bind(u, (struct sockaddr *)&a, sizeof a)) return 4;
-    if (bind(t, (struct sockaddr *)&a, sizeof a) || listen(t, 4)) return 5;
+    if (bind(u, (struct sockaddr *)&a, sizeof a)) { printf(\"brtest child fail %d errno %d\n\", 4, errno); fflush(stdout); return 4; }
+    if (bind(t, (struct sockaddr *)&a, sizeof a) || listen(t, 4)) { printf(\"brtest child fail %d errno %d\n\", 5, errno); fflush(stdout); return 5; }
     char ch = 'r'; write(done_[1], &ch, 1);          /* listening */
     int served = 0;
     while (served < 2) {
         struct pollfd p[2] = { { u, POLLIN, 0 }, { t, POLLIN, 0 } };
-        if (poll(p, 2, 15000) <= 0) return 6;
+        if (poll(p, 2, 15000) <= 0) { printf(\"brtest child fail %d errno %d\n\", 6, errno); fflush(stdout); return 6; }
         if (p[0].revents & POLLIN) {
             char b[256]; struct sockaddr_in f; socklen_t fl = sizeof f;
             ssize_t n = recvfrom(u, b, sizeof b, 0, (struct sockaddr *)&f, &fl);
@@ -211,7 +211,7 @@ static int echo_server_body(void) {
             served++;
         }
     }
-    return 0;
+    { printf(\"brtest child fail %d errno %d\n\", 0, errno); fflush(stdout); return 0; }
 }
 
 static int noop_body(void) { return 0; }
