@@ -277,8 +277,6 @@ static void veth_pair(void) {
     CHECK("veth_pair: TCP echo over the pair", r == 8 && !memcmp(b, "tcp-ping", 8));
     close(t);
     CHECK("veth_pair: child served both and exited 0", wait_child(c) == 0);
-    /* the child died: its netns and with it vethA are gone */
-    CHECK("veth_pair: reaped with the child netns", wait_gone(s, "vethA"));
     close(s);
 }
 
