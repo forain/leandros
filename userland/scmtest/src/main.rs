@@ -2400,7 +2400,9 @@ unsafe fn test_seqpacket_long_dir_via_procfd() -> bool {
     check(asf >= 0, &mut step); // 7
     if asf >= 0 {
         let mut b = [0u8; 8];
-        check(raw_recv(asf, b.as_mut_ptr(), 8, 0) == 4 && &b[..4] == b"ping", &mut step); // 8
+        let rr = raw_recv(asf, b.as_mut_ptr(), 8, 0);
+        if rr != 4 { dbg2(b"[seqlong] recv ret=%ld errno=%ld\n\0", rr as i64, get_errno() as i64); }
+        check(rr == 4 && &b[..4] == b"ping", &mut step); // 8
         check(raw_send(asf, b"pong".as_ptr(), 4, 0) == 4, &mut step); // 9
         close(asf);
     }
