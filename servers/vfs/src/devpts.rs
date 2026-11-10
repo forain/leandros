@@ -12,7 +12,11 @@
 use alloc::vec::Vec;
 use spin::Mutex;
 
-/// Instances 1..=MAX_INST (0 is the default and always exists).
+use crate::mnt;
+
+/// At most MAX_INST live instances besides the default 0. Instance ids are
+/// superblock ids (monotonic, never reused), so a stale mount in a namespace
+/// copy can never name a later instance.
 pub const MAX_INST: usize = 16;
 pub const PREFIX: &[u8] = b"/dev/.devpts/";
 
@@ -28,7 +32,7 @@ pub struct Opts {
     pub set_gid: bool,
 }
 
-static INST: Mutex<[Option<Opts>; MAX_INST]> = Mutex::new([None; MAX_INST]);
+static INST: Mutex<Vec<(u32, Opts, &'static [u8])>> = Mutex::new(Vec::new());
 
 /// What a path below an instance names.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,7 +50,7 @@ fn parse_num(b: &[u8], radix: u32) -> Option<u32> {
 
 /// Parse a mount option string (`newinstance,ptmxmode=0666,mode=0620,gid=5`)
 /// and register a new instance. ENOSPC when all instances are in use.
-pub fn create(data: &[u8]) -> Result<u16, isize> {
+pub fn create(data: &[u8]) -> Result<u32, isize> {
     let mut o = Opts { mode: 0o600, ptmxmode: 0, uid: 0, gid: 0, set_uid: false, set_gid: false };
     for opt in data.split(|&c| c == b',') {
         let (k, v) = match opt.iter().position(|&c| c == b'=') {
@@ -63,46 +67,69 @@ pub fn create(data: &[u8]) -> Result<u16, isize> {
         }
     }
     let mut t = INST.lock();
-    let i = t.iter().position(|e| e.is_none()).ok_or(-28isize)?;
-    t[i] = Some(o);
-    Ok(i as u16 + 1)
+    if t.len() >= MAX_INST { return Err(-28); }
+    let (id, _) = mnt::sb_create("devpts", Some(sb_destroyed));
+    // One small leak per instance: directory vnodes carry a 'static path.
+    let path: &'static [u8] = alloc::boxed::Box::leak(backing(id).into_boxed_slice());
+    t.push((id, o, path));
+    Ok(id)
 }
 
-/// Drop instance `id` (its mount went away). Open ptys keep working.
-pub fn destroy(id: u16) {
-    if id >= 1 && (id as usize) <= MAX_INST { INST.lock()[id as usize - 1] = None; }
+/// Last mount of the instance went (superblock destroy hook; the root ends in
+/// the instance id). Open ptys keep working.
+fn sb_destroyed(root: &[u8]) {
+    let d = root.iter().rposition(|&c| c == b'/').map_or(root, |i| &root[i + 1..]);
+    let Some(id) = parse_num(d, 10) else { return };
+    INST.lock().retain(|e| e.0 != id);
+}
+
+/// A mount holds a counted reference on its instance.
+pub fn get(id: u32) { mnt::sb_get(id); }
+/// Drop a mount's reference; the last one frees the instance.
+pub fn put(id: u32) { mnt::sb_put(id); }
+
+/// Drop a freshly created instance that never got a mount (mount failed).
+pub fn discard(id: u32) {
+    // Created with zero references: take and drop one so the hook runs.
+    mnt::sb_get(id);
+    mnt::sb_put(id);
+}
+
+/// The 'static backing path of live instance `id`.
+pub fn backing_static(p: &[u8]) -> Option<&'static [u8]> {
+    INST.lock().iter().find(|e| e.2 == p).map(|e| e.2)
 }
 
 /// Options of instance `id`; `None` for 0 (the default) or an unknown id.
-pub fn opts(id: u16) -> Option<Opts> {
-    if id == 0 || id as usize > MAX_INST { return None; }
-    INST.lock()[id as usize - 1]
+pub fn opts(id: u32) -> Option<Opts> {
+    if id == 0 { return None; }
+    INST.lock().iter().find(|e| e.0 == id).map(|e| e.1)
 }
 
 /// The backing directory an instance's mount point aliases.
-pub fn backing(id: u16) -> Vec<u8> {
+pub fn backing(id: u32) -> Vec<u8> {
     let mut v = PREFIX.to_vec();
     v.extend_from_slice(alloc::format!("{}", id).as_bytes());
     v
 }
 
 /// Instance id of backing path `p` (`/dev/.devpts/<id>` exactly), if it is one.
-pub fn inst_of_backing(p: &[u8]) -> Option<u16> {
+pub fn inst_of_backing(p: &[u8]) -> Option<u32> {
     let id = parse_num(p.strip_prefix(PREFIX)?, 10)?;
-    if id >= 1 && (id as usize) <= MAX_INST && INST.lock()[id as usize - 1].is_some() { Some(id as u16) } else { None }
+    if id >= 1 && INST.lock().iter().any(|e| e.0 == id) { Some(id) } else { None }
 }
 
 /// Split `path` into (instance, tail) for `/dev/pts/<tail>` (instance 0) and
 /// `/dev/.devpts/<id>/<tail>`; `tail` is `ptmx` or a pty number.
-pub fn parse(path: &[u8]) -> Option<(u16, Tail)> {
+pub fn parse(path: &[u8]) -> Option<(u32, Tail)> {
     let (inst, rest) = if let Some(r) = path.strip_prefix(b"/dev/pts/".as_slice()) {
-        (0u16, r)
+        (0u32, r)
     } else {
         let r = path.strip_prefix(PREFIX)?;
         let slash = r.iter().position(|&c| c == b'/')?;
-        let id = parse_num(&r[..slash], 10)? as usize;
-        if id < 1 || id > MAX_INST || INST.lock()[id - 1].is_none() { return None; }
-        (id as u16, &r[slash + 1..])
+        let id = parse_num(&r[..slash], 10)?;
+        if id < 1 || !INST.lock().iter().any(|e| e.0 == id) { return None; }
+        (id, &r[slash + 1..])
     };
     if rest == b"ptmx" { return Some((inst, Tail::Ptmx)); }
     if rest.is_empty() || rest.len() > 3 { return None; }
@@ -110,6 +137,6 @@ pub fn parse(path: &[u8]) -> Option<(u16, Tail)> {
 }
 
 /// `Some(instance)` when `dir` is the directory of a devpts instance.
-pub fn dir_inst(dir: &[u8]) -> Option<u16> {
+pub fn dir_inst(dir: &[u8]) -> Option<u32> {
     if dir == b"/dev/pts" { Some(0) } else { inst_of_backing(dir) }
 }

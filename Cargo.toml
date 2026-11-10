@@ -25,6 +25,7 @@ members = [
     "lib/bt-host",
     "lib/kmod-abi",
     "lib/seccomp-bpf",
+    "lib/ebpf-cgdev",
     "lib/kmod-elf",
     "lib/kmod-rt",
     "modules/hello",

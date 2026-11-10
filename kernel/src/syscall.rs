@@ -734,6 +734,7 @@ mod nr {
     pub const SIGPENDING:     usize = 136;
     pub const GETRANDOM:      usize = 278;
     pub const SECCOMP:        usize = 277;
+    pub const BPF:            usize = 280;
     pub const PRCTL:          usize = 167;
     pub const PERSONALITY:    usize = 92;
     pub const MADVISE:        usize = 233;
@@ -1003,6 +1004,7 @@ mod nr {
     pub const SIGPENDING:     usize = 127;
     pub const GETRANDOM:      usize = 318;
     pub const SECCOMP:        usize = 317;
+    pub const BPF:            usize = 321;
     pub const PRCTL:          usize = 157;
     pub const PERSONALITY:    usize = 135;
     pub const MADVISE:        usize = 28;
@@ -2448,6 +2450,7 @@ fn dispatch_inner(
         ALARM        => sys_alarm(a0),
         GETRANDOM    => sys_getrandom(a0, a1, a2),
         SECCOMP      => sys_seccomp(a0, a1, a2),
+        BPF          => crate::bpf::sys_bpf(a0, a1, a2),
         PRCTL        => sys_prctl(a0, a1, a2, a3, a4),
         MADVISE      => sys_madvise(a0, a1, a2),
         MSYNC        => sys_msync(a0, a1, a2),
@@ -9428,7 +9431,7 @@ fn sys_mount(
         return match vfs::alias::add(mp, &src, fstype, &device) {
             Ok(()) => { if fstype == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
             Err(e) => {
-                if let Some(id) = vfs::devpts::inst_of_backing(&src) { vfs::devpts::destroy(id); }
+                if let Some(id) = vfs::devpts::inst_of_backing(&src) { vfs::devpts::discard(id); }
                 e as isize
             }
         };

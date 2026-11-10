@@ -1882,6 +1882,8 @@ pub enum VnodeKind {
     /// stable identity and close needs no teardown. POLLIN once the process
     /// has exited; see `sched::process_exit_state`.
     PidFd { pid: u32 },
+    /// bpf(2) program fd (lane bpfsys); one `sched::bpfcg` reference per fd.
+    BpfProg { id: u32 },
     /// An opened /proc/<pid>/ns/<name> (nsfs-like): `kind` indexes
     /// `sched::ns::NS_NAMES`, `id` is the namespace, on which every copy of
     /// the descriptor holds one reference (`pipe_ref_inc` / `pipe_ref_dec`).
@@ -3075,6 +3077,7 @@ fn pipe_ref_inc(kind: &VnodeKind) {
         // slot refcount so the pool entry survives until the last fd closes.
         VnodeKind::EventFd { slot } => { EVENTFD_REFS.lock()[*slot] += 1; }
         VnodeKind::NsFd { id, .. } => sched::ns::hold_raw(*id),
+        VnodeKind::BpfProg { id } => { sched::bpfcg::prog_get(*id); }
         VnodeKind::Mq { slot } => { mqueue::ref_inc(*slot); }
         VnodeKind::TimerFd { slot } => { TIMERFD_REFS.lock()[*slot] += 1; }
         // A dynamic-device open is shared by every duplicate of its fd, so the
@@ -3143,6 +3146,7 @@ fn pipe_ref_dec(kind: &VnodeKind) {
             }
         }
         VnodeKind::NsFd { id, .. } => sched::ns::put_raw(*id),
+        VnodeKind::BpfProg { id } => sched::bpfcg::prog_put(*id),
         VnodeKind::TimerFd { slot } => {
             let mut refs = TIMERFD_REFS.lock();
             refs[*slot] = refs[*slot].saturating_sub(1);
@@ -4563,22 +4567,6 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/dev/pts",
     // Backing directories of devpts mounts (see devpts.rs).
     b"/dev/.devpts",
-    b"/dev/.devpts/1",
-    b"/dev/.devpts/2",
-    b"/dev/.devpts/3",
-    b"/dev/.devpts/4",
-    b"/dev/.devpts/5",
-    b"/dev/.devpts/6",
-    b"/dev/.devpts/7",
-    b"/dev/.devpts/8",
-    b"/dev/.devpts/9",
-    b"/dev/.devpts/10",
-    b"/dev/.devpts/11",
-    b"/dev/.devpts/12",
-    b"/dev/.devpts/13",
-    b"/dev/.devpts/14",
-    b"/dev/.devpts/15",
-    b"/dev/.devpts/16",
     b"/dev/mqueue",
     b"/run",
     b"/run/user",
@@ -4836,6 +4824,7 @@ pub fn is_directory(path_ptr: usize) -> bool {
     for &dir in RAMFS_DIRS {
         if path_eq(&pbuf, plen, dir) { return true; }
     }
+    if devpts::inst_of_backing(&pbuf[..plen]).is_some() { return true; }
     // Check tmpfs dirs.
     let path = match tmpfs_path(&pbuf[..plen]) { Some(p) => p, None => return false };
     let tmp = TMP_FILES.lock();
@@ -5272,13 +5261,13 @@ fn pts_number(path: &[u8]) -> Option<usize> {
 }
 
 /// Instance whose `ptmx` `path` names (`/dev/ptmx` is the default's).
-fn ptmx_inst(path: &[u8]) -> Option<u16> {
+fn ptmx_inst(path: &[u8]) -> Option<u32> {
     if path == b"/dev/ptmx" { return Some(0); }
     match devpts::parse(path)? { (inst, devpts::Tail::Ptmx) => Some(inst), _ => None }
 }
 
 /// Owner/mode of an instance's `ptmx` node.
-fn ptmx_meta(inst: u16) -> xattr::FileMeta {
+fn ptmx_meta(inst: u32) -> xattr::FileMeta {
     let mode = devpts::opts(inst).map_or(0o666, |o| o.ptmxmode);
     xattr::FileMeta { mode: 0o020000 | mode, uid: 0, gid: 0 }
 }
@@ -6774,7 +6763,7 @@ pub(crate) fn ns0_snapshot() -> Vec<mnt::Mnt> {
         };
         let pg = mnt::ns0_prop(&r.0);
         let mut m = mnt::Mnt { id: ids[i], parent: pid, mp: rel.into_boxed_slice(), root: r.1.clone().into_boxed_slice(),
-            sb: mnt::ns0::tmpfs_inst_of(&r.1).unwrap_or(0), flags: r.4, locked: 0, group: pg.0, master: pg.1, unbindable: pg.2, fstype: r.2,
+            sb: mnt::ns0::tmpfs_inst_of(&r.1).or_else(|| devpts::inst_of_backing(&r.1)).unwrap_or(0), flags: r.4, locked: 0, group: pg.0, master: pg.1, unbindable: pg.2, fstype: r.2,
             device: r.3.clone().into_boxed_slice(), opts: Box::from(&b""[..]) };
         if pid == 0 && i != 0 { m.parent = ids[0]; m.mp = r.0.clone().into_boxed_slice(); }
         out.push(m);
@@ -9130,6 +9119,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     }
                 }
             }
+            if found.is_none() {
+                if let Some(sp) = devpts::backing_static(lookup_path) {
+                    found = Some(VnodeKind::RamFile { data: sp, pos: 0, is_dir: true });
+                }
+            }
             if found.is_none() && is_tmp_path(path) {
                 found = Some(VnodeKind::RamFile { data: b"/tmp", pos: 0, is_dir: true });
             }
@@ -10207,6 +10201,7 @@ fn handle_close(pid: u32, fd: usize) -> Message {
             tty_server::pty::drop_ref(pair as usize, is_master);
         }
         VnodeKind::Mq { slot } => { mqueue::ref_dec(slot, pid); }
+        VnodeKind::BpfProg { id } => sched::bpfcg::prog_put(id),
         VnodeKind::EventFd { slot } => {
             // Refcounted: an eventfd is dup-able, so free the pool slot only when
             // the last fd sharing it closes. Freeing early let a later eventfd()
@@ -12119,6 +12114,42 @@ pub fn install_pidfd(pid: u32, target: u32, flags: u32) -> isize {
     fd as isize
 }
 
+/// Install a bpf program fd for program `id` (the caller's reference moves to
+/// the fd). Always close-on-exec, as on Linux. On failure the reference stays
+/// with the caller.
+pub fn install_bpf_prog(pid: u32, id: u32) -> isize {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return -23 };
+    let fd = match tbl.alloc_fd() { Some(f) => f, None => return -24 };
+    tbl.fds.set(fd, FdEntry { kind: VnodeKind::BpfProg { id }, flags: O_CLOEXEC, in_use: true, ofd: ofd::alloc() });
+    fd as isize
+}
+
+/// The program a bpf fd names: `Ok(id)`, `Err(-9)` for a closed fd, `Err(-22)`
+/// for an open fd that is not a bpf program.
+pub fn bpf_prog_of_fd(pid: u32, fd: usize) -> Result<u32, i32> {
+    if fd >= FD_NUMBER_CEIL { return Err(-9); }
+    let pid = sched::tgid_of(pid);
+    let kind = with_tbl(pid, |t| t.fds.get(fd).map(|e| e.kind)).flatten().ok_or(-9)?;
+    match kind { VnodeKind::BpfProg { id } => Ok(id), _ => Err(-22) }
+}
+
+/// The live cgroup a directory fd names (bpf attach target): `Ok(cg)`, or
+/// `Err(-9)` for a closed fd / anything that is not a cgroupfs directory.
+pub fn cgroup_of_fd(pid: u32, fd: usize) -> Result<sched::cgroup::CgId, i32> {
+    if fd >= FD_NUMBER_CEIL { return Err(-9); }
+    let pid = sched::tgid_of(pid);
+    let kind = with_tbl(pid, |t| t.fds.get(fd).map(|e| e.kind)).flatten().ok_or(-9)?;
+    match kind {
+        VnodeKind::SysBlock { dev, .. } if cgroupfs::is_dev(dev) => {
+            let cg = cgroupfs::dev_cg(dev);
+            if sched::cgroup::alive(cg) { Ok(cg) } else { Err(-9) }
+        }
+        _ => Err(-9),
+    }
+}
+
 /// Point pidfd `fd` of process `pid` at `target`. clone(CLONE_PIDFD) reserves
 /// the descriptor (naming pid 0) before the child exists, so a full table
 /// fails the clone instead of orphaning a child, and names the child here.
@@ -12868,7 +12899,7 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             let ev = if reaped { POLLIN | POLLHUP } else if exited { POLLIN } else { 0 };
             (ev, exited as u64, sched::poll_tag(sched::poll_class::PIDFD, pid))
         }
-        VnodeKind::NsFd { .. } => (0, 0, sched::poll_tag(sched::poll_class::PIDFD, 0)),
+        VnodeKind::NsFd { .. } | VnodeKind::BpfProg { .. } => (0, 0, sched::poll_tag(sched::poll_class::PIDFD, 0)),
         VnodeKind::Inotify { .. } => {
             // Never fires: accepted watches silently produce no events. Its
             // own tag, not the broadcast mask — with POLL_TAG_ALL every event
@@ -15229,7 +15260,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         // eventfd/timerfd/signalfd/inotify are anon-inode files and report S_IFREG.
         VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. } | VnodeKind::Mq { .. }
         | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. }
-        | VnodeKind::PidFd { .. } => (S_IFREG | 0o600, 0, 0),
+        | VnodeKind::PidFd { .. } | VnodeKind::BpfProg { .. } => (S_IFREG | 0o600, 0, 0),
         VnodeKind::NsFd { kind, id } => (S_IFREG | 0o444, 0, sched::ns::ns_ino(kind as usize, id)),
         // Handled by the early return above (proxied to the owning mount);
         // this arm exists only for match exhaustiveness.
@@ -15685,6 +15716,7 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             VnodeKind::Mq { .. } => FdInfo::Static(b"mqueue"),
             VnodeKind::TimerFd { .. } => FdInfo::Static(b"timerfd"),
             VnodeKind::PidFd { .. } => FdInfo::Static(b"anon_inode:[pidfd]"),
+            VnodeKind::BpfProg { .. } => FdInfo::Static(b"anon_inode:bpf-prog"),
             VnodeKind::NsFd { .. } => FdInfo::Static(b"anon_inode:[nsfs]"),
             VnodeKind::DevUrandom => FdInfo::Static(b"/dev/urandom"),
             // ttyname(3) readlinks /proc/self/fd/N and stats what it reads

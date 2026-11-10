@@ -1,0 +1,14 @@
+# Pure eBPF core for BPF_PROG_TYPE_CGROUP_DEVICE: instruction decoding, verifier
+# and interpreter for the subset crun/runc/systemd emit. No kernel integration;
+# no dependencies.
+#
+# Host tests (the repo's .cargo config defaults to the kernel target):
+#   cargo test -p ebpf-cgdev --target aarch64-apple-darwin
+[package]
+name = "ebpf-cgdev"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[dependencies]

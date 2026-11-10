@@ -3,6 +3,7 @@
  * (/proc/mntselftest) and ns-0 invariants. Output: "case: PASS|FAIL|SKIP". */
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <sys/ioctl.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -866,6 +867,62 @@ static int tfs_unpriv_child(void) {
     return errno == EPERM ? 0 : 11;
 }
 
+/* devpts instance: pty index of a fresh <mnt>/ptmx (-1 on failure); *mfd gets the master. */
+static int dpts_open(const char *d, int *mfd) {
+    char f[128]; unsigned n = 0;
+    snprintf(f, sizeof f, "%s/ptmx", d);
+    int fd = open(f, O_RDWR | O_NOCTTY);
+    if (fd < 0) return -1;
+    if (ioctl(fd, 0x80045430 /* TIOCGPTN */, &n) != 0) { close(fd); return -1; }
+    { int z = 0; ioctl(fd, 0x40045431 /* TIOCSPTLCK */, &z); }
+    *mfd = fd;
+    return (int)n;
+}
+
+static void devpts_copies(void) {
+    const char *d = "/root/mt-dpts.d";
+    int up[2], dn[2], m0 = -1;
+    mkdir(d, 0755);
+    if (mount("none", d, "devpts", 0, "ptmxmode=0666") != 0 || pipe(up) != 0 || pipe(dn) != 0) {
+    report("devpts_copy_keeps_instance", 0);
+        report("devpts_no_reuse_after_umount", 0);
+        return;
+    }
+    int n0 = dpts_open(d, &m0);
+    pid_t cp = fork();
+    if (cp == 0) {
+        char c = 0, f[128];
+        int res = 0, m1 = -1;
+        if (unshare(CLONE_NEWNS) != 0) _exit(128);
+        write(up[1], "r", 1);
+        read(dn[0], &c, 1);
+        int n1 = dpts_open(d, &m1);
+        /* the old pair is still live in the old instance: next index is 1 */
+        if (n1 == 1) res |= 1;
+        snprintf(f, sizeof f, "%s/%d", d, n0);
+        int sfd = open(f, O_RDWR | O_NOCTTY);
+        if (sfd >= 0) res |= 4;
+        _exit(res);
+    }
+    char c;
+    read(up[0], &c, 1);
+    int ur = umount(d);
+    int m2 = -1, mr = mount("none", d, "devpts", 0, "ptmxmode=0666");
+    int n2 = (mr == 0) ? dpts_open(d, &m2) : -1;
+    write(dn[1], "g", 1);
+    int stt = 0;
+    waitpid(cp, &stt, 0);
+    int code = WIFEXITED(stt) ? WEXITSTATUS(stt) : 255;
+    report("devpts_copy_keeps_instance", n0 == 0 && ur == 0 && (code & 1) && (code & 4));
+    /* the new instance has a fresh index space (0), not the old one's (1) */
+    report("devpts_no_reuse_after_umount", mr == 0 && n2 == 0);
+    if (m2 >= 0) close(m2);
+    if (m0 >= 0) close(m0);
+    umount(d);
+    close(up[0]); close(up[1]); close(dn[0]); close(dn[1]);
+    rmdir(d);
+}
+
 static void tmpfs_anywhere(void) {
     const char *d = "/root/mt-tfs.d";
     int live0 = 0, sb0 = 0, live1 = 0, sb1 = 0;
@@ -1106,7 +1163,11 @@ int main(int argc, char **argv) {
     mount_userns_perm();
     setns_mnt_suite();
     tmpfs_anywhere();
+<<<<<<< HEAD
     netns_suite();
+=======
+    devpts_copies();
+>>>>>>> main
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
