@@ -1,0 +1,11 @@
+[package]
+name = "fusetest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fusetest"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

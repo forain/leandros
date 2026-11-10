@@ -37,7 +37,7 @@ fi
 # ABI): no_std crates linked against static musl (<arch>-unknown-linux-musl)
 # through the zig linker wrapper, the same path as spawnwedge/killmt. Their
 # start-up is musl's crt1 -> `main`; userland/muslrt holds the shared pieces.
-MUSL_LINKED=(polltest fdmaxtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest jobtest exectest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest pthreadtest timertest sigtest sigtest2 epolltest wakepolltest)
+MUSL_LINKED=(polltest fdmaxtest mqtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest jobtest exectest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest pthreadtest timertest sigtest sigtest2 epolltest wakepolltest)
 
 EXCLUDE_ARGS=()
 for prog in "${MUSL_LINKED[@]}"; do
@@ -153,8 +153,13 @@ if command -v zig >/dev/null 2>&1; then
     # chroottest: openat2, vfork/clone3, PATH_MAX paths, /proc in a chroot (checked against a host kernel).
     echo "[userland] Building chroottest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/chroottest" userland/chroottest/chroottest.c
+    echo "[userland] Building mnttest..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/mnttest" userland/mnttest/mnttest.c -lpthread
     echo "[userland] Building captest..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/captest" userland/captest/captest.c
+    # bpftest: bpf(2) cgroup device programs (lane bpfsys).
+    echo "[userland] Building bpftest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/bpftest" userland/bpftest/bpftest.c
     # seccomptest: prctl/seccomp(2) behaviour (lane seccore).
     echo "[userland] Building seccomptest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/seccomptest" userland/seccomptest/seccomptest.c
@@ -164,6 +169,12 @@ if command -v zig >/dev/null 2>&1; then
     # kexectest: kexec_file_load of /boot/kexec (load, re-load, bad flags, unload).
     echo "[userland] Building kexectest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kexectest" userland/kexectest/kexectest.c
+    # memfdtest: crun cloned-binary sequence (memfd_create, seals, sendfile, fexecve).
+    echo "[userland] Building memfdtest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/memfdtest" userland/memfdtest/memfdtest.c
+    # conmontest: syscall sequences conmon performs at start (lane conmondbg).
+    echo "[userland] Building conmontest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/conmontest" userland/conmontest/conmontest.c
     # suspendtest: one freeze-only device suspend/resume cycle (kernel pm).
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/suspendtest" userland/suspendtest/suspendtest.c
     # kexec: kexec-tools style front end (-l/-u/-e) over kexec_file_load + reboot(KEXEC).
@@ -176,6 +187,14 @@ if command -v zig >/dev/null 2>&1; then
     # serrx: framed, ACKed file receiver over the serial console (scripts/pi-serial-push.py).
     echo "[userland] Building nstest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nstest" userland/nstest/nstest.c
+    echo "[userland] Building ovltest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ovltest" userland/ovltest/ovltest.c
+    echo "[userland] Building ovlmknodtest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ovlmknodtest" userland/ovlmknodtest/ovlmknodtest.c
+    echo "[userland] Building idmaptest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/idmaptest" userland/idmaptest/idmaptest.c
+    echo "[userland] Building cgtest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/cgtest" userland/cgtest/cgtest.c
     echo "[userland] Building serrx (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -Os -s -Wall -o "${OUT}/serrx" userland/serrx/serrx.c
 else

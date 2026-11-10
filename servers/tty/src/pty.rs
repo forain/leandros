@@ -163,6 +163,11 @@ impl<const N: usize> Ring<N> {
 
 struct Pty {
     in_use: bool,
+    /// devpts instance this pair belongs to (0 = the default /dev/pts) and its
+    /// number inside that instance: the `TIOCGPTN` answer and the `N` in
+    /// `<mount>/N`. Set by `alloc`; the pool index is only the storage slot.
+    inst: u32,
+    num: u16,
     /// `TIOCSPTLCK` state. A freshly allocated pair is locked; `unlockpt(3)`
     /// clears it, and until then `open("/dev/pts/N")` is EIO. Real programs
     /// (and `openpty(3)`) always call it, so honouring the lock catches a
@@ -209,6 +214,8 @@ impl Pty {
     const fn new() -> Self {
         Self {
             in_use: false,
+            inst: 0,
+            num: 0,
             locked: false,
             master_refs: 0,
             slave_refs: 0,
@@ -373,11 +380,43 @@ pub fn session_leader_exited(sid: u32) {
 /// Allocate a pair for a fresh `open("/dev/ptmx")`. Returns the pty number,
 /// which is both the `TIOCGPTN` answer and the `N` in `/dev/pts/N`.
 pub fn alloc() -> Option<usize> {
+    alloc_in(0)
+}
+
+/// `alloc` inside devpts instance `inst`: the lowest free number of that
+/// instance's own index space. The pool slot is shared by all instances.
+pub fn alloc_in(inst: u32) -> Option<usize> {
     let mut ptys = PTYS.lock();
     let idx = ptys.iter().position(|p| !p.in_use)?;
+    let mut num = 0u16;
+    while ptys.iter().any(|p| p.in_use && p.inst == inst && p.num == num) { num += 1; }
     ptys[idx].in_use = true;
     ptys[idx].reset();
+    ptys[idx].inst = inst;
+    ptys[idx].num = num;
     Some(idx)
+}
+
+/// Instance number and in-instance number of pool slot `pair`.
+pub fn ident(pair: usize) -> (u32, u16) {
+    if pair >= MAX_PTYS { return (0, 0); }
+    let ptys = PTYS.lock();
+    (ptys[pair].inst, ptys[pair].num)
+}
+
+/// The pool slot of pty `num` in devpts instance `inst`, if its master is live.
+pub fn find(inst: u32, num: usize) -> Option<usize> {
+    let ptys = PTYS.lock();
+    ptys.iter().position(|p| p.in_use && p.master_refs > 0 && p.vt == 0
+                             && p.inst == inst && p.num as usize == num)
+}
+
+/// Call `f(num)` for each live pty of instance `inst`.
+pub fn each_in(inst: u32, mut f: impl FnMut(usize)) {
+    let ptys = PTYS.lock();
+    for p in ptys.iter() {
+        if p.in_use && p.master_refs > 0 && p.vt == 0 && p.inst == inst { f(p.num as usize); }
+    }
 }
 
 /// True if `n` names a pair with a live master — the precondition for
@@ -1152,7 +1191,7 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
                 if arg == 0 {
                     -14
                 } else {
-                    unsafe { core::ptr::write(arg as *mut u32, pair as u32) };
+                    unsafe { core::ptr::write(arg as *mut u32, p.num as u32) };
                     0
                 }
             }

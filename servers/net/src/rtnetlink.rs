@@ -30,13 +30,20 @@ const RTA_DST: u16 = 1;
 const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
 const RTA_PREFSRC: u16 = 7;
+const RTA_PRIORITY: u16 = 6;
 const RTA_TABLE: u16 = 15;
+const NLM_F_ACK: u16 = 0x4;
+const NLM_F_EXCL: u16 = 0x200;
+const RT_SCOPE_LINK: u8 = 253;
+const RTPROT_KERNEL: u8 = 2;
+const RTPROT_BOOT: u8 = 3;
 const RT_TABLE_MAIN: u8 = 254;
 const RTN_UNICAST: u8 = 1;
 
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_MULTI: u16 = 0x2;
 const NLM_F_DUMP: u16 = 0x300;
+const AF_INET6: u8 = 10;
 
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_BROADCAST: u16 = 2;
@@ -247,9 +254,116 @@ fn req_dst(msg: &[u8]) -> Option<[u8; 4]> {
     None
 }
 
+/// One entry of the main routing table, as the GETROUTE dump exports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteEnt {
+    pub dst: [u8; 4],
+    pub prefix: u8,
+    pub gw: Option<[u8; 4]>,
+    pub oif: u32,
+    pub prefsrc: Option<[u8; 4]>,
+}
+
+/// Everything a request is answered from. `lo_set(up)` applies an admin
+/// up/down to the caller namespace's loopback and returns false when the
+/// namespace cannot change it (the initial one).
+pub struct Env<'a> {
+    pub links: &'a [Link],
+    pub routes: &'a [RouteEnt],
+    pub route: &'a dyn Fn([u8; 4]) -> Option<RouteHit>,
+    pub lo_set: &'a dyn Fn(bool) -> bool,
+}
+
+fn route_ent_msg(r: &RouteEnt, seq: u32, pid: u32) -> Vec<u8> {
+    let mut v = Vec::new();
+    let s = begin_msg(&mut v, RTM_NEWROUTE, NLM_F_MULTI, seq, pid);
+    v.extend_from_slice(&[AF_INET, r.prefix, 0, 0, RT_TABLE_MAIN,
+        if r.gw.is_some() { RTPROT_BOOT } else { RTPROT_KERNEL },
+        if r.gw.is_some() { RT_SCOPE_UNIVERSE } else { RT_SCOPE_LINK }, RTN_UNICAST]);
+    put32(&mut v, 0);
+    attr(&mut v, RTA_TABLE, &(RT_TABLE_MAIN as u32).to_ne_bytes());
+    if r.prefix != 0 { attr(&mut v, RTA_DST, &r.dst); }
+    if let Some(g) = r.gw { attr(&mut v, RTA_GATEWAY, &g); }
+    attr(&mut v, RTA_OIF, &r.oif.to_ne_bytes());
+    attr(&mut v, RTA_PRIORITY, &0u32.to_ne_bytes());
+    if let Some(p) = r.prefsrc { attr(&mut v, RTA_PREFSRC, &p); }
+    end_msg(&mut v, s);
+    v
+}
+
+/// The attribute `ty` of `msg` (an rtnl message whose fixed part is `fixed`
+/// bytes after the 16-byte header).
+fn find_attr(msg: &[u8], fixed: usize, ty: u16) -> Option<&[u8]> {
+    let mut o = 16 + fixed;
+    while o + 4 <= msg.len() {
+        let l = rd16(msg, o) as usize;
+        if l < 4 || o + l > msg.len() { break; }
+        if rd16(msg, o + 2) & 0x3fff == ty { return Some(&msg[o + 4..o + l]); }
+        o += (l + 3) & !3;
+    }
+    None
+}
+
+fn cstr_eq(a: &[u8], name: &str) -> bool {
+    let n = a.iter().position(|&b| b == 0).unwrap_or(a.len());
+    &a[..n] == name.as_bytes()
+}
+
+/// The link a GETLINK/NEWLINK request names (ifi_index, else IFLA_IFNAME).
+fn target_link<'a>(msg: &[u8], links: &'a [Link]) -> Option<&'a Link> {
+    if msg.len() < 32 { return None; }
+    let idx = rd32(msg, 20);
+    if idx != 0 { return links.iter().find(|l| l.index == idx); }
+    let n = find_attr(msg, 16, IFLA_IFNAME)?;
+    links.iter().find(|l| cstr_eq(n, &l.name))
+}
+
+/// RTM_NEWLINK change request. 0 = acked, else a positive errno.
+fn new_link(msg: &[u8], env: &Env) -> i32 {
+    let Some(t) = target_link(msg, env.links) else { return 19 }; // ENODEV
+    let flags = rd32(msg, 24);
+    let change = rd32(msg, 28);
+    if let Some(m) = find_attr(msg, 16, IFLA_MTU) {
+        if m.len() < 4 || rd32(m, 0) != t.mtu { return 95; }
+    }
+    if let Some(n) = find_attr(msg, 16, IFLA_IFNAME) {
+        if !cstr_eq(n, &t.name) { return 95; }
+    }
+    if let Some(a) = find_attr(msg, 16, IFLA_ADDRESS) {
+        if a != &t.mac[..] { return 95; }
+    }
+    if change & IFF_UP != 0 {
+        let want = flags & IFF_UP != 0;
+        if want != t.up {
+            if !(t.loopback && (env.lo_set)(want)) { return 95; }
+        }
+    }
+    0
+}
+
+/// RTM_NEWADDR: only the address lo already carries is accepted.
+fn new_addr(msg: &[u8], flags: u16, env: &Env) -> i32 {
+    if msg.len() < 24 || msg[16] != AF_INET { return 97; } // EAFNOSUPPORT
+    let idx = rd32(msg, 20);
+    let Some(t) = env.links.iter().find(|l| l.index == idx) else { return 19 };
+    let a = find_attr(msg, 8, IFA_LOCAL).or_else(|| find_attr(msg, 8, IFA_ADDRESS));
+    match (a, t.addr) {
+        (Some(a), Some((cur, p))) if a.len() == 4 && a == &cur[..] && msg[17] == p => {
+            if flags & NLM_F_EXCL != 0 { 17 } else { 0 } // EEXIST
+        }
+        _ => 95,
+    }
+}
+
 /// [`handle_request`] with a route lookup for non-dump RTM_GETROUTE.
 pub fn handle_request_r(req: &[u8], links: &[Link], pid: u32,
                         route: &dyn Fn([u8; 4]) -> Option<RouteHit>) -> Vec<Vec<u8>> {
+    handle_request_env(req, pid, &Env { links, routes: &[], route, lo_set: &|_| false })
+}
+
+/// Answer the netlink request(s) in `req` from `env`.
+pub fn handle_request_env(req: &[u8], pid: u32, env: &Env) -> Vec<Vec<u8>> {
+    let links = env.links;
     let mut out: Vec<Vec<u8>> = Vec::new();
     let mut off = 0usize;
     while off + 16 <= req.len() {
@@ -260,31 +374,58 @@ pub fn handle_request_r(req: &[u8], links: &[Link], pid: u32,
         let seq = rd32(req, off + 8);
         let msg = &req[off..off + len];
         let dump = flags & NLM_F_DUMP != 0; // Linux: ROOT or MATCH alone is a dump
+        let fam = if len > 16 { msg[16] } else { AF_UNSPEC };
+        let mut ack = flags & NLM_F_ACK != 0 && !dump;
         match ty {
             RTM_GETLINK if dump => {
                 let msgs = links.iter().map(|l| link_msg(l, seq, pid)).collect();
                 pack(msgs, &mut out);
                 out.push(done_msg(seq, pid));
             }
+            RTM_GETLINK => match target_link(msg, links) {
+                Some(l) => {
+                    let mut m = link_msg(l, seq, pid);
+                    m[6..8].copy_from_slice(&0u16.to_ne_bytes()); // not multipart
+                    out.push(m);
+                }
+                None => { out.push(error_msg(19, msg, seq, pid)); ack = false; } // ENODEV
+            },
             RTM_GETADDR if dump => {
+                let want_idx = if len >= 24 { rd32(msg, 20) } else { 0 };
                 let msgs = links.iter()
+                    .filter(|l| want_idx == 0 || l.index == want_idx)
+                    .filter(|_| fam == AF_UNSPEC || fam == AF_INET)
                     .filter_map(|l| l.addr.map(|(a, p)| addr_msg(l, a, p, seq, pid)))
                     .collect();
                 pack(msgs, &mut out);
                 out.push(done_msg(seq, pid));
             }
-            // No routes are exported: an empty dump.
-            RTM_GETROUTE if dump => out.push(done_msg(seq, pid)),
-            RTM_GETROUTE => match req_dst(msg).and_then(|d| route(d).map(|h| (d, h))) {
+            RTM_GETROUTE if dump => {
+                let msgs = env.routes.iter()
+                    .filter(|_| fam == AF_UNSPEC || fam == AF_INET)
+                    .map(|r| route_ent_msg(r, seq, pid)).collect();
+                pack(msgs, &mut out);
+                out.push(done_msg(seq, pid));
+            }
+            RTM_GETROUTE => match req_dst(msg).and_then(|d| (env.route)(d).map(|h| (d, h))) {
                 Some((d, h)) => out.push(route_msg(d, h, links, seq, pid)),
-                None => out.push(error_msg(101, msg, seq, pid)), // ENETUNREACH
+                None => { out.push(error_msg(101, msg, seq, pid)); ack = false; } // ENETUNREACH
             },
             RTM_GETNEIGH if dump => out.push(done_msg(seq, pid)),
+            RTM_NEWLINK if flags & NLM_F_REQUEST != 0 => {
+                let e = if len < 32 { 22 } else { new_link(msg, env) };
+                if e != 0 { out.push(error_msg(e, msg, seq, pid)); ack = false; }
+            }
+            RTM_NEWADDR if flags & NLM_F_REQUEST != 0 => {
+                let e = new_addr(msg, flags, env);
+                if e != 0 { out.push(error_msg(e, msg, seq, pid)); ack = false; }
+            }
             // Control messages (NLMSG_NOOP..DONE) are ignored, as in Linux.
-            t if t < 16 => {}
-            _ if flags & NLM_F_REQUEST != 0 => out.push(error_msg(95, msg, seq, pid)), // EOPNOTSUPP
-            _ => {}
+            t if t < 16 => ack = false,
+            _ if flags & NLM_F_REQUEST != 0 => { out.push(error_msg(95, msg, seq, pid)); ack = false; } // EOPNOTSUPP
+            _ => ack = false,
         }
+        if ack { out.push(error_msg(0, msg, seq, pid)); }
         off += (len + 3) & !3;
     }
     out
@@ -304,6 +445,7 @@ pub fn sockaddr_nl(pid: u32, groups: u32) -> [u8; 12] {
 pub const SIOCGIFNAME: u32 = 0x8910;
 pub const SIOCGIFCONF: u32 = 0x8912;
 pub const SIOCGIFFLAGS: u32 = 0x8913;
+pub const SIOCSIFFLAGS: u32 = 0x8914;
 pub const SIOCGIFADDR: u32 = 0x8915;
 pub const SIOCGIFBRDADDR: u32 = 0x8919;
 pub const SIOCGIFNETMASK: u32 = 0x891b;
@@ -318,7 +460,7 @@ pub const IFREQ_LEN: usize = 40;
 /// True for the ioctls `ifreq_ioctl` / `ifconf` answer (including the ones
 /// answered EOPNOTSUPP).
 pub fn is_if_ioctl(cmd: u32) -> bool {
-    matches!(cmd, SIOCGIFNAME | SIOCGIFCONF | SIOCGIFFLAGS | SIOCGIFADDR | SIOCGIFBRDADDR
+    matches!(cmd, SIOCGIFNAME | SIOCGIFCONF | SIOCGIFFLAGS | SIOCSIFFLAGS | SIOCGIFADDR | SIOCGIFBRDADDR
         | SIOCGIFNETMASK | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFINDEX | SIOCETHTOOL | SIOCGIWRATE)
 }
 
@@ -411,9 +553,21 @@ pub fn route_lookup(d: [u8; 4]) -> Option<RouteHit> {
     Some((sid as u32 + 1, gw))
 }
 
+/// The links `ns` sees. The initial namespace has `lo` and every NIC; any
+/// other has only its own `lo`, whose admin state is recorded by
+/// `RTM_NEWLINK` (no stack behind it yet).
 #[cfg(not(test))]
-pub fn current_links() -> Vec<Link> {
+pub fn current_links(ns: u16) -> Vec<Link> {
     let mut v = Vec::new();
+    if ns != 0 {
+        let up = sched::ns::lo_admin_up(ns);
+        v.push(Link {
+            index: 1, name: String::from("lo"), mac: [0; 6], mtu: 65536,
+            up, running: up, loopback: true,
+            addr: if up { Some(([127, 0, 0, 1], 8)) } else { None },
+        });
+        return v;
+    }
     v.push(Link {
         index: 1, name: String::from("lo"), mac: [0; 6], mtu: 65536,
         up: true, running: true, loopback: true, addr: Some(([127, 0, 0, 1], 8)),
@@ -429,6 +583,26 @@ pub fn current_links() -> Vec<Link> {
             loopback: false,
             addr: if s.admin_up { s.addr } else { None },
         });
+    }
+    v
+}
+
+/// The main routing table `ns` exports: per configured NIC its connected
+/// route and, when set, the default route. Other namespaces have none.
+#[cfg(not(test))]
+pub fn current_routes(ns: u16) -> Vec<RouteEnt> {
+    let mut v = Vec::new();
+    if ns != 0 { return v; }
+    for s in super::iface::snapshot() {
+        let Some((a, p)) = s.addr else { continue };
+        if !s.admin_up { continue; }
+        let m = mask(p);
+        let net = [a[0] & m[0], a[1] & m[1], a[2] & m[2], a[3] & m[3]];
+        let oif = s.id as u32 + 2;
+        v.push(RouteEnt { dst: net, prefix: p, gw: None, oif, prefsrc: Some(a) });
+        if let Some(g) = s.gateway {
+            v.push(RouteEnt { dst: [0; 4], prefix: 0, gw: Some(g), oif, prefsrc: None });
+        }
     }
     v
 }
@@ -622,5 +796,68 @@ mod tests {
         assert_eq!(c.len(), 2 * IFREQ_LEN);
         assert_eq!(&c[..3], b"lo\0");
         assert_eq!(ifconf(&ls, 40).len(), 40);
+    }
+    fn ifinfo_req(ty: u16, flags: u16, index: u32, ifflags: u32, change: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        put32(&mut v, 32);
+        put16(&mut v, ty);
+        put16(&mut v, flags);
+        put32(&mut v, 7);
+        put32(&mut v, 0);
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        put32(&mut v, index);
+        put32(&mut v, ifflags);
+        put32(&mut v, change);
+        v
+    }
+
+    fn run(req: &[u8], ls: &[Link], routes: &[RouteEnt], lo: bool) -> Vec<(u16, Vec<u8>)> {
+        let env = Env { links: ls, routes, route: &|_| None, lo_set: &|_| lo };
+        split(&handle_request_env(req, 1, &env).concat())
+    }
+
+    #[test]
+    fn route_dump_lists_connected_and_default() {
+        let routes = alloc::vec![
+            RouteEnt { dst: [10, 0, 2, 0], prefix: 24, gw: None, oif: 2, prefsrc: Some([10, 0, 2, 15]) },
+            RouteEnt { dst: [0; 4], prefix: 0, gw: Some([10, 0, 2, 2]), oif: 2, prefsrc: None },
+        ];
+        let m = run(&req(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 1), &links(), &routes, false);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[0].0, RTM_NEWROUTE);
+        assert_eq!(m[2].0, NLMSG_DONE);
+        assert_eq!(m[1].1[1], 0); // default: dst_len 0
+        assert_eq!(&attrs(&m[1].1[12..]).iter().find(|a| a.0 == RTA_GATEWAY).unwrap().1[..], &[10, 0, 2, 2]);
+        // AF_INET6 dump: DONE only
+        let mut r6 = req(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 1);
+        r6[16] = AF_INET6;
+        assert_eq!(run(&r6, &links(), &routes, false).len(), 1);
+    }
+
+    #[test]
+    fn getlink_by_index_and_ack() {
+        let ls = links();
+        let m = run(&ifinfo_req(RTM_GETLINK, NLM_F_REQUEST | NLM_F_ACK, 3, 0, 0), &ls, &[], false);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].0, RTM_NEWLINK);
+        assert_eq!(rd32(&m[0].1, 4), 3);
+        assert_eq!(m[1].0, NLMSG_ERROR);
+        assert_eq!(rd32(&m[1].1, 0), 0);
+        let m = run(&ifinfo_req(RTM_GETLINK, NLM_F_REQUEST, 9, 0, 0), &ls, &[], false);
+        assert_eq!((m.len(), m[0].0, rd32(&m[0].1, 0) as i32), (1, NLMSG_ERROR, -19));
+    }
+
+    #[test]
+    fn newlink_lo_up_acked_only_when_allowed() {
+        let mut ls = links();
+        ls[0].up = false;
+        let up = ifinfo_req(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK, 1, IFF_UP, IFF_UP);
+        let m = run(&up, &ls, &[], true);
+        assert_eq!((m.len(), rd32(&m[0].1, 0)), (1, 0));
+        let m = run(&up, &ls, &[], false);
+        assert_eq!(rd32(&m[0].1, 0) as i32, -95);
+        // already up: no-op ack even where lo cannot be changed
+        let m = run(&up, &links(), &[], false);
+        assert_eq!(rd32(&m[0].1, 0), 0);
     }
 }

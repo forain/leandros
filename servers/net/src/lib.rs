@@ -160,6 +160,8 @@ const SCM_RIGHTS:       i32   = 1;
 const SO_ERROR:         usize = 4;
 const SO_SNDBUF:        usize = 7;
 const SO_PEERCRED:      usize = 17;
+const SO_PASSCRED:      usize = 16;
+const SCM_CREDENTIALS:  i32   = 2;
 const ENOPROTOOPT:      i32   = 92;
 const MSG_CTRUNC:       i32   = 0x08;
 const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
@@ -789,6 +791,8 @@ struct PendingFdBatch {
     seq_byte: u64,
     end_byte: u64,
     fds:      alloc::vec::Vec<XferFd>,
+    /// SCM_CREDENTIALS captured at send time (host pid/uid/gid).
+    cred:     Option<Ucred>,
 }
 
 /// In-flight copies of AF_UNIX sockets that can take part in a reference
@@ -852,6 +856,9 @@ struct UnixConn {
     /// Credentials of each end for the peer's SO_PEERCRED.
     cred_a: Ucred,
     cred_b: Ucred,
+    /// SO_PASSCRED of each end: a sender attaches SCM_CREDENTIALS for it.
+    pc_a: bool,
+    pc_b: bool,
     /// A pending ECONNRESET for end A (Linux `sk_err`): its listener was
     /// closed before accepting it (`unix_listener_gone`). Reported as
     /// POLLERR while set; the first recv that finds no data answers
@@ -904,6 +911,8 @@ impl UnixConn {
             fdq_ba: alloc::vec::Vec::new(),
             cred_a: Ucred::zero(),
             cred_b: Ucred::zero(),
+            pc_a: false,
+            pc_b: false,
             reset_a: false,
             pending_sid: 0,
             pending_ord: 0,
@@ -1287,6 +1296,8 @@ struct SockOpts {
     /// SO_SNDBUF as Linux stores it (twice the value set, clamped); 0 =
     /// never set (`UNIX_SNDBUF_DEFAULT`). Enforced on AF_UNIX datagrams.
     sndbuf:    u32,
+    /// SO_PASSCRED: recvmsg returns the sender's SCM_CREDENTIALS.
+    passcred:  bool,
 }
 
 /// Linux's `net.core.wmem_default` / `rmem_default`: an AF_UNIX socket's
@@ -1313,7 +1324,7 @@ impl SockOpts {
     const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
                                  reuseport: false, broadcast: false, gso: 0, shut: 0,
                                  mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0,
-                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0 };
+                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false };
 }
 
 /// Rows for live descriptions with a non-default `SockOpts`. Leaf lock: taken
@@ -3960,7 +3971,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
     // SOCK_DGRAM/IPPROTO_ICMP instead, which Linux allows for every group in
     // net.ipv4.ping_group_range (all of them on common distributions) and
     // which lands on the same ICMP socket below.
-    if domain == AF_INET && sock_type & 0xf == SOCK_RAW && sched::euid_of(pid) != 0 {
+    if domain == AF_INET && sock_type & 0xf == SOCK_RAW && !sched::host_root_of(pid) {
         return err_reply(-1);
     }
     let mut tbls = SOCK_TABLES.lock();
@@ -3987,7 +3998,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         connecting: false,
         ns:         sched::ns::NsRef::get(sched::ns::netns_of(pid)),
     };
-    if domain == AF_NETLINK { nlsock::create(tbl.socks[slot].ofd, sched::tgid_of(pid)); }
+    if domain == AF_NETLINK { nlsock::create(tbl.socks[slot].ofd, sched::tgid_of(pid), sched::ns::netns_of(pid)); }
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
 
@@ -4009,7 +4020,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             let explicit_port = port != 0;
             // Ports below 1024 need CAP_NET_BIND_SERVICE (root): Linux's
             // net.ipv4.ip_unprivileged_port_start default, EACCES.
-            if port != 0 && port < 1024 && sched::euid_of(pid) != 0 { return err_reply(-13); }
+            if port != 0 && port < 1024 && !sched::host_root_of(pid) { return err_reply(-13); }
             let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
             let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
             // A fresh network namespace has only a DOWN loopback: no address
@@ -4989,6 +5000,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
 
         // The connecting socket becomes end A at accept time; capture its creds.
         let cred = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
+        let my_pc = sock_entry(pid, fd).map_or(false, |e| sock_opts(e.ofd).passcred);
         let (conn_idx, orphans) = {
             let mut conns = UNIX_CONNS.lock();
             let idx = match unix_conn_slot(&mut conns) {
@@ -4998,6 +5010,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
             conns[idx] = UnixConn::new();
             conns[idx].in_use = true;
             conns[idx].cred_a = cred;
+            conns[idx].pc_a = my_pc;
             (idx, orphans)
         };
         for x in orphans { xfer_drop(x); }
@@ -5548,6 +5561,8 @@ struct StreamRead {
     /// The SCM_RIGHTS batch that rides with the bytes read, if the caller
     /// asked for fds. It is the dequeued batch, or a clone under MSG_PEEK.
     fds: Option<alloc::vec::Vec<XferFd>>,
+    /// SCM_CREDENTIALS of the batch taken (host ids).
+    cred: Option<Ucred>,
     /// Fds the read consumed and nobody will receive: a batch read by a call
     /// with no control buffer. Release them with `xfer_drop` once
     /// UNIX_CONNS is released.
@@ -5575,7 +5590,7 @@ struct StreamRead {
 fn unix_stream_read_locked(conns: &mut sched::lockwatch::TrackedGuard<'static, alloc::vec::Vec<UnixConn>>,
                            conn_idx: usize, is_a: bool,
                            iovs: &[(usize, usize)], peek: bool, want_fds: bool) -> StreamRead {
-    let mut out = StreamRead { nread: 0, fault: false, fds: None, discard: alloc::vec::Vec::new() };
+    let mut out = StreamRead { nread: 0, fault: false, fds: None, cred: None, discard: alloc::vec::Vec::new() };
     // Another reader of this direction is mid-copy: wait for its commit (it
     // moves rtotal and may consume the fd batch the limit below depends on).
     loop {
@@ -5638,6 +5653,7 @@ fn unix_stream_read_locked(conns: &mut sched::lockwatch::TrackedGuard<'static, a
     let c = &mut conns[conn_idx];
     let touched = c.rx_fdq(is_a).first().map_or(false, |b| b.seq_byte < rstart + out.nread as u64);
     if !touched { return out; }
+    out.cred = c.rx_fdq(is_a)[0].cred;
     if peek {
         if want_fds {
             let batch = c.rx_fdq(is_a)[0].fds.clone();
@@ -5695,6 +5711,7 @@ struct DgramRead {
     /// `(copied, full length)` of the record, `None` when none is queued.
     res: Result<Option<(usize, usize)>, i32>,
     fds: Option<alloc::vec::Vec<XferFd>>,
+    cred: Option<Ucred>,
     discard: alloc::vec::Vec<XferFd>,
 }
 
@@ -5707,7 +5724,7 @@ struct DgramRead {
 /// UNIX_CONNS and has checked that the connection is in use.
 fn unix_dgram_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
                           buf: usize, len: usize, peek: bool, want_fds: bool) -> DgramRead {
-    let mut out = DgramRead { res: Ok(None), fds: None, discard: alloc::vec::Vec::new() };
+    let mut out = DgramRead { res: Ok(None), fds: None, cred: None, discard: alloc::vec::Vec::new() };
     let c = &mut conns[conn_idx];
     let rstart = if is_a { c.ring_ba.rtotal } else { c.ring_ab.rtotal };
     {
@@ -5721,6 +5738,7 @@ fn unix_dgram_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
     let Ok(Some((_, full))) = out.res else { return out };
     let rend = rstart + 4 + full as u64;
     if !c.rx_fdq(is_a).first().map_or(false, |b| b.seq_byte < rend) { return out; }
+    out.cred = c.rx_fdq(is_a)[0].cred;
     if peek {
         if want_fds {
             let batch = c.rx_fdq(is_a)[0].fds.clone();
@@ -6051,11 +6069,69 @@ unsafe fn parse_scm_rights(ctrl_ptr: usize, ctrl_len: usize, out: &mut [i32; SCM
     Ok(nfd)
 }
 
+/// Find an SCM_CREDENTIALS cmsg in the control buffer and check it as Linux's
+/// scm_check_creds does. `Ok(None)` when there is none; Err(errno) for a
+/// malformed one (EINVAL), an unmapped id (EINVAL) or one the sender may not
+/// claim (EPERM): its own pid / ruid,euid,suid / rgid,egid,sgid, unless it
+/// holds CAP_SYS_ADMIN / CAP_SETUID / CAP_SETGID in its own namespace.
+fn parse_scm_creds(pid: u32, ctrl_ptr: usize, ctrl_len: usize) -> Result<Option<Ucred>, i32> {
+    const CAP_SETGID: u32 = 6;
+    const CAP_SETUID: u32 = 7;
+    const CAP_SYS_ADMIN: u32 = 21;
+    let mut pos = 0usize;
+    while pos + CMSG_HDR_LEN <= ctrl_len {
+        let cmsg_len   = rd_usize(ctrl_ptr + pos)?;
+        let cmsg_level = sched::uaccess::read_user::<i32>(ctrl_ptr + pos + 8).ok_or(-14)?;
+        let cmsg_type  = sched::uaccess::read_user::<i32>(ctrl_ptr + pos + 12).ok_or(-14)?;
+        if cmsg_len < CMSG_HDR_LEN || pos + cmsg_len > ctrl_len { return Err(-22); }
+        if cmsg_level == SOL_SOCKET && cmsg_type == SCM_CREDENTIALS {
+            if cmsg_len < CMSG_HDR_LEN + 12 { return Err(-22); }
+            let b = ctrl_ptr + pos + CMSG_HDR_LEN;
+            let vpid = sched::uaccess::read_user::<u32>(b).ok_or(-14)?;
+            let vuid = sched::uaccess::read_user::<u32>(b + 4).ok_or(-14)?;
+            let vgid = sched::uaccess::read_user::<u32>(b + 8).ok_or(-14)?;
+            // Ids are in the sender's user namespace: translate to kernel ids
+            // (kuids) before any permission check; an unmapped one is invalid.
+            let (Some(uid), Some(gid)) = (sched::ns::to_k(0, sched::ns::current_userns(), vuid), sched::ns::to_k(1, sched::ns::current_userns(), vgid))
+                else { return Err(-22); };
+            // Linux scm_check_creds: CAP_SYS_ADMIN over the user namespace that
+            // owns the sender's PID namespace (not the sender's own userns).
+            let pid_admin = sched::caps::ns_capable_in(sched::ns::owner_userns(1, sched::pidns::pidns_of(pid)), CAP_SYS_ADMIN);
+            let kpid = match sched::pidns::from_cur(vpid) {
+                Ok(k) => k,
+                Err(_) => return Err(if pid_admin { -3 } else { -1 }),
+            };
+            if kpid != pid && !pid_admin { return Err(-1); }
+            if uid != sched::ruid_of(pid) && uid != sched::euid_of(pid) && uid != sched::current_suid()
+                && !sched::caps::ns_capable(CAP_SETUID) { return Err(-1); }
+            if gid != sched::rgid_of(pid) && gid != sched::egid_of(pid) && gid != sched::current_sgid()
+                && !sched::caps::ns_capable(CAP_SETGID) { return Err(-1); }
+            return Ok(Some(Ucred { pid: kpid, uid, gid }));
+        }
+        let step = cmsg_align(cmsg_len);
+        if step == 0 { break; }
+        pos += step;
+    }
+    Ok(None)
+}
+
+/// The credentials a send on `(conn_idx, is_a)` queues: the explicit
+/// SCM_CREDENTIALS, else the sender's own when the peer end wants them.
+fn send_cred(pid: u32, conn_idx: usize, is_a: bool, explicit: Option<Ucred>) -> Option<Ucred> {
+    if explicit.is_some() { return explicit; }
+    let want = {
+        let c = UNIX_CONNS.lock();
+        conn_idx < c.len() && c[conn_idx].in_use && (if is_a { c[conn_idx].pc_b } else { c[conn_idx].pc_a })
+    };
+    if !want { return None; }
+    Some(Ucred { pid, uid: sched::ruid_of(pid), gid: sched::rgid_of(pid) })
+}
+
 /// sendmsg of one record with SCM_RIGHTS fds on a connected AF_UNIX
 /// datagram/seqpacket socket: the record is queued whole (or EAGAIN /
 /// EMSGSIZE, as a plain send) and the fd batch is pinned to its first byte,
 /// so `unix_dgram_read_locked` hands it to the recvmsg that takes the record.
-fn unix_dgram_send_fds(pid: u32, fd: usize, conn_idx: usize, is_a: bool, data: &[u8], fd_nums: &[i32]) -> Message {
+fn unix_dgram_send_fds(pid: u32, fd: usize, conn_idx: usize, is_a: bool, data: &[u8], fd_nums: &[i32], cred: Option<Ucred>) -> Message {
     let mut batch: alloc::vec::Vec<XferFd> = alloc::vec::Vec::new();
     for &n in fd_nums {
         match xfer_export(pid, n as usize) {
@@ -6082,7 +6158,7 @@ fn unix_dgram_send_fds(pid: u32, fd: usize, conn_idx: usize, is_a: bool, data: &
         Err(e) => { drop(conns); return fail(batch, e); }
     }
     let end = ring.wtotal;
-    conn.rx_fdq(!is_a).push(PendingFdBatch { seq_byte: seq, end_byte: end, fds: batch });
+    conn.rx_fdq(!is_a).push(PendingFdBatch { seq_byte: seq, end_byte: end, fds: batch, cred });
     conn.seq = conn.seq.wrapping_add(1);
     drop(conns);
     sched::wake_poll_key(unix_rd_key(conn_idx, !is_a));
@@ -6115,11 +6191,21 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
         }
     }
 
+    // SCM_CREDENTIALS: the explicit one (checked), else the sender's own
+    // when the peer end has SO_PASSCRED.
+    let mut cred: Option<Ucred> = None;
+    if let Some(&(ci, ia)) = unix_end.as_ref().or(dgram_end.as_ref()) {
+        let explicit = if ctrl_ptr != 0 && ctrl_len >= CMSG_HDR_LEN {
+            match parse_scm_creds(pid, ctrl_ptr, ctrl_len.min(MAX_CONTROL)) { Ok(c) => c, Err(e) => return err_reply(e) }
+        } else { None };
+        cred = send_cred(pid, ci, ia, explicit);
+    }
+
     // AF_INET datagram: the iovecs are ONE datagram, and msg_name is its
     // destination. Sending each iovec on its own (the stream path below) split
     // a datagram into several and dropped msg_name, so an unconnected socket
     // could not sendmsg() at all.
-    if nfd == 0 && inet_dgram(pid, fd) {
+    if nfd == 0 && cred.is_none() && inet_dgram(pid, fd) {
         let name_ptr = rd_or_efault!(msghdr_ptr);
         let name_len = match sched::uaccess::read_user::<u32>(msghdr_ptr + 8) {
             Some(v) => v as usize, None => return err_reply(-14),
@@ -6151,7 +6237,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     // AF_UNIX datagram / seqpacket: the iovecs are ONE record, as for UDP
     // above. Sent one iovec at a time, a two-iovec message reached the peer
     // as two datagrams.
-    if dgram_end.is_some() || (nfd == 0 && unix_dgram_connected(pid, fd)) {
+    if dgram_end.is_some() || (nfd == 0 && cred.is_none() && unix_dgram_connected(pid, fd)) {
         let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         for i in 0..iovcnt.min(UIO_MAXIOV) {
             let iov  = iov_ptr + i * 16;
@@ -6164,13 +6250,13 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
             data.resize(at + len, 0);
             if len > 0 && !ucopy_in(&mut data[at..], base) { return err_reply(-14); }
         }
-        if nfd == 0 { return handle_send_k(pid, fd, 0, 0, 0, 0, Some(data)); }
+        if nfd == 0 && cred.is_none() { return handle_send_k(pid, fd, 0, 0, 0, 0, Some(data)); }
         let (conn_idx, is_a) = dgram_end.unwrap();
-        return unix_dgram_send_fds(pid, fd, conn_idx, is_a, &data, &fd_nums[..nfd]);
+        return unix_dgram_send_fds(pid, fd, conn_idx, is_a, &data, &fd_nums[..nfd], cred);
     }
 
-    // No ancillary fds → original plain-data fast path (also covers inet).
-    if nfd == 0 {
+    // No ancillary fds or credentials → original plain-data fast path (also covers inet).
+    if nfd == 0 && cred.is_none() {
         let mut total = 0isize;
         for i in 0..iovcnt.min(16) {
             let iov  = iov_ptr + i * 16;
@@ -6310,9 +6396,9 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     }
     let end = seq + total as u64;
     if is_a {
-        conn.fdq_ab.push(PendingFdBatch { seq_byte: seq, end_byte: end, fds: batch });
+        conn.fdq_ab.push(PendingFdBatch { seq_byte: seq, end_byte: end, fds: batch, cred });
     } else {
-        conn.fdq_ba.push(PendingFdBatch { seq_byte: seq, end_byte: end, fds: batch });
+        conn.fdq_ba.push(PendingFdBatch { seq_byte: seq, end_byte: end, fds: batch, cred });
     }
     // New readable edge for the peer (total > 0 guaranteed above).
     conn.seq = conn.seq.wrapping_add(1);
@@ -6639,7 +6725,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
             }
             off += k;
         }
-        let (ctrl_written, ctrunc) = deliver_scm(pid, dr.fds, ctrl_ptr, ctrl_cap, flags);
+        let (ctrl_written, ctrunc) = deliver_scm(pid, dr.fds, rcv_cred(pid, fd, dr.cred), ctrl_ptr, ctrl_cap, flags);
         let truncated = full > n;
         let mflags = (if truncated { MSG_TRUNC } else { 0 }) | (if ctrunc { MSG_CTRUNC } else { 0 });
         unsafe { write_msg_tail(msghdr_ptr, ctrl_written, mflags); }
@@ -6760,7 +6846,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     for x in sr.discard { xfer_drop(x); }
     if freed { sched::wake_poll_key(unix_wr_key(conn_idx, !is_a)); }
 
-    let (ctrl_written, ctrunc) = deliver_scm(pid, deliver, ctrl_ptr, ctrl_cap, flags);
+    let (ctrl_written, ctrunc) = deliver_scm(pid, deliver, rcv_cred(pid, fd, sr.cred), ctrl_ptr, ctrl_cap, flags);
     unsafe { write_msg_tail(msghdr_ptr, ctrl_written, if ctrunc { MSG_CTRUNC } else { 0 }); }
     val_reply(nread as u64)
 }
@@ -6768,8 +6854,8 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
 /// Install the fds a recvmsg took into the receiver and write their
 /// SCM_RIGHTS cmsg into the control buffer: `(bytes written, MSG_CTRUNC)`.
 /// No net lock held (importing takes FD_TABLES).
-fn deliver_scm(pid: u32, deliver: Option<alloc::vec::Vec<XferFd>>, ctrl_ptr: usize, ctrl_cap: usize,
-               flags: usize) -> (usize, bool) {
+fn deliver_scm(pid: u32, deliver: Option<alloc::vec::Vec<XferFd>>, cred: Option<Ucred>,
+               ctrl_ptr: usize, ctrl_cap: usize, flags: usize) -> (usize, bool) {
     let cloexec = flags & MSG_CMSG_CLOEXEC != 0;
     let mut ctrunc = false;
     let mut ctrl_written = 0usize;
@@ -6813,6 +6899,23 @@ fn deliver_scm(pid: u32, deliver: Option<alloc::vec::Vec<XferFd>>, ctrl_ptr: usi
             // A control buffer that could not be written reports no cmsg
             // (the fds are installed either way, as on Linux's EFAULT path).
             if ok { ctrl_written = clen; } else { ctrunc = true; }
+        }
+    }
+    if let Some(c) = cred {
+        // SCM_CREDENTIALS, translated into the receiver's namespaces: a pid
+        // its pid namespace cannot see reads 0, an unmapped id 65534.
+        let clen = CMSG_HDR_LEN + 12;
+        let at = cmsg_align(ctrl_written);
+        if ctrl_ptr == 0 || ctrl_cap < at + clen {
+            ctrunc = true;
+        } else {
+            let vn = sched::pidns::pidns_of(pid);
+            let vpid = if vn != 0 && c.pid != 0 { sched::pidns::to_v(vn, c.pid) } else { c.pid };
+            let ok = wr_user(ctrl_ptr + at, clen)
+                && wr_user(ctrl_ptr + at + 8, SOL_SOCKET)
+                && wr_user(ctrl_ptr + at + 12, SCM_CREDENTIALS)
+                && wr_user(ctrl_ptr + at + 16, [vpid, sched::ns::view_id(0, c.uid), sched::ns::view_id(1, c.gid)]);
+            if ok { ctrl_written = at + cmsg_align(clen).min(ctrl_cap - at); } else { ctrunc = true; }
         }
     }
     (ctrl_written, ctrunc)
@@ -7064,6 +7167,27 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         let mut o = sock_opts(e.ofd);
         o.sndbuf = (v * 2).max(SNDBUF_MIN);
         set_sock_opts(e.ofd, o);
+        return ok_reply();
+    }
+    // SO_PASSCRED: recvmsg reports the sender's SCM_CREDENTIALS. The sender
+    // consults the connection's per-end flag, so a connected end updates it.
+    if level == SOL_SOCKET as usize && optname == SO_PASSCRED {
+        let val: Option<i32> = if optlen < 4 { None } else { sched::uaccess::read_user::<i32>(optval_ptr) };
+        let Some(v) = val else { return err_reply(if optlen < 4 { -22 } else { -14 }) };
+        let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
+        if e.domain as usize != AF_UNIX { return err_reply(-ENOPROTOOPT); }
+        let mut o = sock_opts(e.ofd);
+        o.passcred = v != 0;
+        set_sock_opts(e.ofd, o);
+        let end = match e.state {
+            SockState::UnixConnected { conn_idx, is_a } => Some((conn_idx, is_a)),
+            SockState::UnixPendingAccept { conn_idx, .. } => Some((conn_idx, true)),
+            _ => None,
+        };
+        if let Some((ci, ia)) = end {
+            let mut c = UNIX_CONNS.lock();
+            if ci < c.len() && c[ci].in_use { if ia { c[ci].pc_a = v != 0; } else { c[ci].pc_b = v != 0; } }
+        }
         return ok_reply();
     }
     // SO_RCVTIMEO / SO_SNDTIMEO: Linux's sock_set_timeout. EINVAL for a
@@ -7380,6 +7504,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             (SOL_UDP, UDP_SEGMENT) if is_udp_entry(&e) => Some(sock_opts(e.ofd).gso as u32),
             (SOL_UDP, UDP_GRO) if is_udp_entry(&e) => Some((sock_opts(e.ofd).recv & RECV_GRO != 0) as u32),
             (IPPROTO_IP, n) if e.domain as usize == AF_INET && n != IP_MULTICAST_IF => ip_getsockopt(&e, n),
+            (l, SO_PASSCRED) if l == SOL_SOCKET as usize && e.domain as usize == AF_UNIX => Some(sock_opts(e.ofd).passcred as u32),
             (l, SO_KEEPALIVE) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).keepalive as u32),
             (l, SO_REUSEADDR) if l == SOL_SOCKET as usize => Some(e.reuseaddr as u32),
             // As setsockopt: the TCP level exists only on a TCP socket.
@@ -7436,6 +7561,14 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
 
 /// The credentials of the peer of `fd` (the other end of the connection), for
 /// SO_PEERCRED. Falls back to zeroes for a non-connected/unknown fd.
+/// The credentials recvmsg on `fd` reports: those of the batch it took, when
+/// the receiving description has SO_PASSCRED.
+fn rcv_cred(pid: u32, fd: usize, c: Option<Ucred>) -> Option<Ucred> {
+    let c = c?;
+    let e = sock_entry(pid, fd)?;
+    if sock_opts(e.ofd).passcred { Some(c) } else { None }
+}
+
 fn unix_peer_cred(pid: u32, fd: usize) -> Ucred {
     let (conn_idx, is_a) = match unix_stream_end(pid, fd) {
         Some(e) => e,

@@ -149,6 +149,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ebpf-cgdev"
+version = "0.1.0"
+
+[[package]]
 name = "elf"
 version = "0.1.0"
 dependencies = [
@@ -177,6 +181,16 @@ dependencies = [
  "spin",
  "vfs-server",
  "xattr",
+]
+
+[[package]]
+name = "fuse-server"
+version = "0.1.0"
+dependencies = [
+ "ipc",
+ "sched",
+ "spin",
+ "vfs-server",
 ]
 
 [[package]]
@@ -220,6 +234,7 @@ dependencies = [
  "elf",
  "evdev-server",
  "f2fs-server",
+ "fuse-server",
  "ipc",
  "kmod-abi",
  "kmod-elf",
@@ -672,6 +687,7 @@ dependencies = [
 name = "sched"
 version = "0.1.0"
 dependencies = [
+ "ebpf-cgdev",
  "leandros-lib",
  "mm",
  "seccomp-bpf",

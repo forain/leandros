@@ -75,6 +75,11 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             serial_print_str("\n");
         }
     }
+    if let Some(p) = fuse_server::init(0) {
+        serial_print_str("[INIT] fuse server port: ");
+        crate::print_number(p);
+        serial_print_str("\n");
+    }
     drivers::virtio_keyboard::init();
 
     // Initialize DRM server and check for success
@@ -116,6 +121,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // their group's returns to user space.
     sched::register_cpu_timer_hook(tty_server::service_cpu_timers);
     sched::register_timer_dequeue_hook(tty_server::timer_dequeued);
+    sched::register_log_hook(crate::stat_line);
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     // SD-card boards: `sdhci.multi=1` / `sdhci.multitest=1` before the probe.

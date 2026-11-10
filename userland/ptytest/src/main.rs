@@ -160,6 +160,12 @@ extern "C" {
     pub fn exit(status: i32) -> !;
     pub fn __errno_location() -> *mut c_int;
 
+    pub fn mount(src: *const u8, tgt: *const u8, fstype: *const u8, flags: c_ulong, data: *const u8) -> c_int;
+    pub fn umount2(tgt: *const u8, flags: c_int) -> c_int;
+    pub fn mkdir(path: *const u8, mode: u32) -> c_int;
+    pub fn rmdir(path: *const u8) -> c_int;
+    pub fn stat(path: *const u8, buf: *mut u8) -> c_int;
+
     pub fn fork() -> pid_t;
     pub fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_int) -> pid_t;
     pub fn _exit(status: c_int) -> !;
@@ -1117,7 +1123,7 @@ unsafe fn with_pair(name: &[u8], f: unsafe fn(c_int, usize) -> bool) -> bool {
 
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
-    const TOTAL: usize = 17;
+    const TOTAL: usize = 18;
     let mut passed = 0usize;
 
     let (m, s) = match open_pair() {
@@ -1170,6 +1176,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
     if with_pair(b"devtty_enxio_after_hangup", test_devtty_after_hangup) { passed += 1; }
     if test_master_eio() { passed += 1; }
     if test_gptpeer() { passed += 1; }
+    if test_devpts_instances() { passed += 1; }
     if with_pair(b"brush_on_pty", test_brush) { passed += 1; }
 
     out(b"ptytest: ");
@@ -1178,4 +1185,126 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
     out_num(TOTAL);
     out(b"\n");
     (TOTAL - passed) as i32
+}
+
+// ── 17. devpts instances: mount(devpts, newinstance) ─────────────────────────
+//
+// A container mounts its own devpts at <rootfs>/dev/pts; the instance has its
+// own pty index space, its own ptmx and the mode/uid/gid it was mounted with.
+
+/// (st_mode, st_uid, st_gid) of `path`, or None. The struct stat layouts of
+/// the two architectures differ, hence the offsets.
+unsafe fn stat_mug(path: &[u8]) -> Option<(u32, u32, u32)> {
+    let mut b = [0u8; 256];
+    if stat(path.as_ptr(), b.as_mut_ptr()) != 0 { return None; }
+    let rd = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    #[cfg(target_arch = "x86_64")]
+    { Some((rd(24), rd(28), rd(32))) }
+    #[cfg(not(target_arch = "x86_64"))]
+    { Some((rd(16), rd(24), rd(28))) }
+}
+
+/// Open `<dir>/ptmx`, return (fd, TIOCGPTN) with the slave unlocked.
+unsafe fn inst_master(dir: &[u8]) -> Option<(c_int, u32)> {
+    let mut p = [0u8; 64];
+    p[..dir.len()].copy_from_slice(dir);
+    p[dir.len()..dir.len() + 5].copy_from_slice(b"/ptmx");
+    let m = open(p.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if m < 0 { return None; }
+    let mut n: u32 = 0xFFFF_FFFF;
+    let mut unlock: i32 = 0;
+    if ioctl(m, TIOCGPTN, &mut n as *mut u32 as *mut c_void) != 0
+        || ioctl(m, TIOCSPTLCK, &mut unlock as *mut i32 as *mut c_void) != 0 {
+        close(m);
+        return None;
+    }
+    Some((m, n))
+}
+
+/// `<dir>/<n>` as a NUL-terminated path.
+fn inst_slave_path(dir: &[u8], n: u32, out: &mut [u8; 64]) {
+    out[..dir.len()].copy_from_slice(dir);
+    let mut p = dir.len();
+    out[p] = b'/';
+    p += 1;
+    if n >= 10 { out[p] = b'0' + (n / 10) as u8; p += 1; }
+    out[p] = b'0' + (n % 10) as u8;
+    out[p + 1] = 0;
+}
+
+unsafe fn test_devpts_instances() -> bool {
+    // Occupy the default instance first, so a shared index space would not
+    // hand the new instance pty 0.
+    let mut mains = [-1 as c_int; 3];
+    let mut hi: u32 = 0;
+    for slot in mains.iter_mut() {
+        match open_master(true) {
+            Some((m, n)) => { *slot = m; if n as u32 > hi { hi = n as u32; } }
+            None => return report(b"devpts_instances", false),
+        }
+    }
+    let d1 = b"/tmp/dpt1";
+    let d2 = b"/tmp/dpt2";
+    mkdir(b"/tmp/dpt1\0".as_ptr(), 0o755);
+    mkdir(b"/tmp/dpt2\0".as_ptr(), 0o755);
+    let mut ok = true;
+    macro_rules! chk { ($c:expr) => { if !$c { ok = false; out(b"  devpts check failed, line "); out_num(line!() as usize); out(b"\n"); } } }
+    let r1 = mount(b"devpts\0".as_ptr(), b"/tmp/dpt1\0".as_ptr(), b"devpts\0".as_ptr(), 0,
+                   b"newinstance,ptmxmode=0666,mode=0620,gid=5\0".as_ptr());
+    let r2 = mount(b"devpts\0".as_ptr(), b"/tmp/dpt2\0".as_ptr(), b"devpts\0".as_ptr(), 0,
+                   b"newinstance,ptmxmode=0600,mode=0640,uid=0,gid=7\0".as_ptr());
+    chk!(r1 == 0 && r2 == 0);
+    if r1 == 0 && r2 == 0 {
+        // ptmx node: a character device with the mounted ptmxmode.
+        let pm = stat_mug(b"/tmp/dpt1/ptmx\0");
+        chk!(matches!(pm, Some((m, _, _)) if m & 0o170000 == 0o020000 && m & 0o7777 == 0o666));
+        let pm2 = stat_mug(b"/tmp/dpt2/ptmx\0");
+        chk!(matches!(pm2, Some((m, _, _)) if m & 0o7777 == 0o600));
+        // Index spaces are independent: 0 and 1 here, whatever the main pool holds.
+        let a = inst_master(d1);
+        let b = inst_master(d2);
+        chk!(matches!(a, Some((_, 0))));
+        chk!(matches!(b, Some((_, 0))));
+        let a2 = inst_master(d1);
+        chk!(matches!(a2, Some((_, 1))));
+        if let Some((m, _)) = a {
+            let mut sp = [0u8; 64];
+            inst_slave_path(d1, 0, &mut sp);
+            let s = open(sp.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+            chk!(s >= 0);
+            let sm = stat_mug(&sp);
+            chk!(matches!(sm, Some((md, _, g)) if md & 0o170000 == 0o020000 && md & 0o7777 == 0o620 && g == 5));
+            if s >= 0 {
+                // slave -> master
+                let w = write(s, b"x".as_ptr() as *const c_void, 1);
+                let mut buf = [0u8; 8];
+                let r = read(m, buf.as_mut_ptr() as *mut c_void, 8);
+                chk!(w == 1 && r == 1 && buf[0] == b'x');
+                // master -> slave (canonical: needs the newline)
+                let w = write(m, b"y\n".as_ptr() as *const c_void, 2);
+                let r = read(s, buf.as_mut_ptr() as *mut c_void, 8);
+                chk!(w == 2 && r == 2 && buf[0] == b'y');
+                close(s);
+            }
+            // The highest main-instance number does not exist in the new instance.
+            inst_slave_path(d1, hi + 8, &mut sp);
+            chk!(open(sp.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK) < 0);
+            close(m);
+        }
+        if let Some((m, _)) = b {
+            let mut sp = [0u8; 64];
+            inst_slave_path(d2, 0, &mut sp);
+            let sm = stat_mug(&sp);
+            chk!(matches!(sm, Some((md, _, g)) if md & 0o7777 == 0o640 && g == 7));
+            close(m);
+        }
+        if let Some((m, _)) = a2 { close(m); }
+    }
+    for &m in mains.iter() { if m >= 0 { close(m); } }
+    umount2(b"/tmp/dpt1\0".as_ptr(), 0);
+    umount2(b"/tmp/dpt2\0".as_ptr(), 0);
+    rmdir(b"/tmp/dpt1\0".as_ptr());
+    rmdir(b"/tmp/dpt2\0".as_ptr());
+    let _ = (d1, d2);
+    report(b"devpts_instances", ok)
 }

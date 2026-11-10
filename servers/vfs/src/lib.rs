@@ -50,13 +50,19 @@ extern crate mm;
 /// sysfs is generated on demand rather than stored.
 pub mod block;
 pub mod sysclass;
+pub mod cgroupfs;
 
 /// Open file descriptions (see the module docs): what epoll keys by.
 pub mod ofd;
+pub mod mqueue;
 
 /// Alias mounts (proc/devtmpfs/sysfs/bind) — how a chroot gets its /proc.
 pub mod alias;
+pub mod devpts;
+pub mod mnt;
 pub mod cmdline_redact;
+/// Overlay plumbing: real-layer helpers, per-mount pseudo-pid creds.
+pub mod ovl;
 mod tmppool;
 
 /// PATH_MAX: the longest path string a caller may name, NUL included.
@@ -482,6 +488,9 @@ struct TmpVmo {
     seals: u32,
     /// Seals are only permitted on memfd inodes; also gates `F_GET_SEALS`.
     is_memfd: bool,
+    /// memfd_create's name (debug label; /proc/self/exe of a memfd exec).
+    mname: [u8; 32],
+    mnlen: u8,
     /// A **borrowed** VMO aliases physical frames it does not own — currently a
     /// PRIME/dmabuf export whose pages ARE a DRM dumb buffer's contiguous buddy
     /// block. Teardown (`vmo_free_slot`) must NOT free these frames: the DRM
@@ -574,7 +583,13 @@ fn tmp_free_slot(tmp: &mut TmpPool) -> Option<usize> {
 // Linux memfd/fcntl seal bits (values fixed by the ABI).
 const F_ADD_SEALS:   usize = 1033;
 const F_GET_SEALS:   usize = 1034;
+const F_SEAL_SEAL:   u32   = 0x0001;
 const F_SEAL_SHRINK: u32   = 0x0002;
+const F_SEAL_GROW:   u32   = 0x0004;
+const F_SEAL_WRITE:  u32   = 0x0008;
+const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
+const F_SEAL_EXEC:   u32   = 0x0020;
+const F_SEAL_KNOWN:  u32   = 0x003f;
 
 /// Allocate one zeroed 4 KiB buddy frame for a VMO. Zeroing touches HHDM
 /// (kernel) memory only, never user memory.
@@ -625,7 +640,7 @@ static TMP_ZERO_PAGE: [u8; 4096] = [0u8; 4096];
 impl TmpVmo {
     /// An empty, owning VMO (no pages: the whole file is a hole).
     const fn new_owned(is_memfd: bool) -> Self {
-        TmpVmo { pages: alloc::vec::Vec::new(), len: 0, seals: 0, is_memfd,
+        TmpVmo { pages: alloc::vec::Vec::new(), len: 0, seals: 0, is_memfd, mname: [0; 32], mnlen: 0,
                  borrowed: false, dmabuf_handle: 0, dmabuf_obj: 0, id: 0, maps: 0 }
     }
 
@@ -750,6 +765,8 @@ fn tmp_set_size(tmp: &mut TmpPool, vmos: &mut [Option<TmpVmo>], owner: usize,
         // let you ftruncate a dmabuf either.
         if vmo.borrowed { return -1; } // EPERM
         if new_len < old_len && vmo.seals & F_SEAL_SHRINK != 0 { return -1; } // EPERM
+        if new_len > old_len && vmo.seals & F_SEAL_GROW != 0 { return -1; } // EPERM
+        if vmo.seals & F_SEAL_WRITE != 0 && new_len != old_len { return -1; } // EPERM
         if new_len > old_len {
             vmo_zero_range(vmo, old_len, new_len);
         } else if new_len < old_len {
@@ -915,6 +932,7 @@ fn dmabuf_release(obj: u32) {
 /// function lock-order-neutral.
 #[must_use = "the dmabuf reference must be dropped, with TMP_FILES released"]
 fn vmo_free_slot(owner: usize) -> Option<u32> {
+    NSMAP_OPENERS.lock()[owner] = None; // drops the captured namespace reference
     let vmo = TMP_VMOS.lock()[owner].take()?;
     vmo_free_owned(vmo)
 }
@@ -1083,19 +1101,112 @@ pub fn vmo_debug_probe(idx: usize) -> Option<(usize, usize, u64, usize)> {
 
 /// Mark the tmpfs inode behind `fd` as a memfd: create an empty seal-capable
 /// VMO on its owner slot. Called by `sys_memfd_create` right after open.
-pub fn mark_memfd(pid: u32, fd: usize) {
+pub fn mark_memfd(pid: u32, fd: usize, name: &[u8]) {
     let idx = match tmpfile_owner_of(pid, fd) { Some(i) => i, None => return };
     // Lock order TMP_FILES -> TMP_VMOS, even though only `len` is read.
     let tmp = TMP_FILES.lock();
     let mut vmos = TMP_VMOS.lock();
+    let n = name.len().min(32);
     match vmos[idx].as_mut() {
-        Some(vmo) => vmo.is_memfd = true,
+        Some(vmo) => { vmo.is_memfd = true; vmo.mname[..n].copy_from_slice(&name[..n]); vmo.mnlen = n as u8; }
         None => {
             let mut v = TmpVmo::new_owned(true);
             v.len = tmp[idx].len;
+            v.mname[..n].copy_from_slice(&name[..n]); v.mnlen = n as u8;
             vmos[idx] = Some(v);
         }
     }
+}
+
+// ── memfd as the running executable ─────────────────────────────────────────
+// fexecve(memfd) / execve("/proc/self/fd/N"): the nameless tmpfs inode keeps
+// living as the task's /proc/self/exe ("/memfd:<name> (deleted)"), so crun's
+// "am I already the sealed clone" check (open /proc/self/exe, F_GET_SEALS)
+// sees the memfd after the close-on-exec sweep. The pin is one TMP_FDREFS
+// count; it is dropped when the tgid's exe path stops being a memfd one
+// (re-exec, exit), lazily, by `exe_pin_gc`.
+
+/// A pending pin: holds the slot alive until committed or dropped.
+pub struct ExeRef { idx: usize, name: [u8; 32], nlen: usize, live: bool }
+
+impl ExeRef {
+    /// The exe path string, "/memfd:<name> (deleted)".
+    pub fn path(&self) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::from(&b"/memfd:"[..]);
+        v.extend_from_slice(&self.name[..self.nlen]);
+        v.extend_from_slice(b" (deleted)");
+        v
+    }
+}
+impl Drop for ExeRef {
+    fn drop(&mut self) {
+        if self.live {
+            TMP_FDREFS[self.idx].fetch_update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire,
+                |n| Some(n.saturating_sub(1))).ok();
+            tmp_release_ephemeral(self.idx);
+        }
+    }
+}
+
+static EXE_PINS: spin::Mutex<[Option<(u32, ExeRef)>; 16]> =
+    spin::Mutex::new([const { None }; 16]);
+
+/// Pin the memfd behind `fd` of `pid` (None if it is not a memfd).
+pub fn memfd_exe_take(pid: u32, fd: usize) -> Option<ExeRef> {
+    let idx = tmpfile_owner_of(pid, fd)?;
+    let tmp = TMP_FILES.lock();
+    let vmos = TMP_VMOS.lock();
+    let vmo = vmos[idx].as_ref()?;
+    if !vmo.is_memfd || !tmp[idx].in_use() { return None; }
+    let mut name = [0u8; 32];
+    name[..vmo.mnlen as usize].copy_from_slice(&vmo.mname[..vmo.mnlen as usize]);
+    let nlen = vmo.mnlen as usize;
+    TMP_FDREFS[idx].fetch_add(1, atomic::Ordering::AcqRel);
+    Some(ExeRef { idx, name, nlen, live: true })
+}
+
+/// Record `r` as `tgid`'s exe memfd, releasing what it pinned before.
+pub fn exe_pin_commit(tgid: u32, r: ExeRef) {
+    exe_pin_gc(tgid);
+    let mut old = None;
+    {
+        let mut t = EXE_PINS.lock();
+        let mut slot = t.iter().position(|e| matches!(e, Some((g, _)) if *g == tgid));
+        if slot.is_none() { slot = t.iter().position(|e| e.is_none()); }
+        if let Some(i) = slot { old = t[i].replace((tgid, r)); }
+    }
+    drop(old);
+}
+
+/// Release pins whose tgid no longer runs a memfd image (`keep` is spared).
+pub fn exe_pin_gc(keep: u32) {
+    let mut dead: alloc::vec::Vec<ExeRef> = alloc::vec::Vec::new();
+    {
+        let mut t = EXE_PINS.lock();
+        for e in t.iter_mut() {
+            let stale = match e {
+                Some((g, _)) if *g != keep => {
+                    let mut b = [0u8; 16];
+                    !matches!(sched::exe_path(*g, &mut b), Some(n) if n >= 7 && &b[..7] == b"/memfd:")
+                }
+                _ => false,
+            };
+            if stale { if let Some((_, r)) = e.take() { dead.push(r); } }
+        }
+    }
+    drop(dead);
+}
+
+/// A fresh open of `tgid`'s pinned exe memfd (`flags` as for open).
+fn exe_memfd_kind(pid: u32, tgid: u32, flags: u32) -> Result<VnodeKind, i32> {
+    let idx = {
+        let t = EXE_PINS.lock();
+        match t.iter().find_map(|e| match e { Some((g, r)) if *g == tgid => Some(r.idx), _ => None }) {
+            Some(i) => i,
+            None => return Err(-2),
+        }
+    };
+    reopen_tmp_idx(pid, idx, flags)
 }
 
 /// Promote the tmpfs inode behind `fd` into a **borrowed dmabuf VMO** for the
@@ -1171,7 +1282,7 @@ pub fn install_dmabuf_vmo_pages(pid: u32, fd: usize, pages: alloc::vec::Vec<usiz
     }
     tmp[idx].len = len;
     vmos[idx] = Some(TmpVmo {
-        pages, len, seals: 0, is_memfd: true,
+        pages, len, seals: 0, is_memfd: true, mname: [0; 32], mnlen: 0,
         borrowed: true, dmabuf_handle: handle, dmabuf_obj: obj, id: 0, maps: 0,
     });
     true
@@ -1689,6 +1800,8 @@ pub enum VnodeKind {
     TmpFile { idx: usize, pos: usize, writable: bool, ofd: u16 },
     /// eventfd: counter value; read returns counter as u64, write adds to it.
     EventFd { slot: usize },
+    /// POSIX message queue descriptor (mq_open, or open of /dev/mqueue/NAME).
+    Mq { slot: usize },
     /// timerfd: index into TIMERFD_POOL.
     TimerFd { slot: usize },
     /// /dev/urandom — reads return LFSR pseudo-random bytes.
@@ -1769,6 +1882,12 @@ pub enum VnodeKind {
     /// stable identity and close needs no teardown. POLLIN once the process
     /// has exited; see `sched::process_exit_state`.
     PidFd { pid: u32 },
+    /// bpf(2) program fd (lane bpfsys); one `sched::bpfcg` reference per fd.
+    BpfProg { id: u32 },
+    /// An opened /proc/<pid>/ns/<name> (nsfs-like): `kind` indexes
+    /// `sched::ns::NS_NAMES`, `id` is the namespace, on which every copy of
+    /// the descriptor holds one reference (`pipe_ref_inc` / `pipe_ref_dec`).
+    NsFd { kind: u8, id: u16 },
 }
 
 // `VnodeKind` is embedded in `FdEntry`, one per open descriptor of every
@@ -1812,7 +1931,7 @@ pub fn fd_rwf_nowait_capable(pid: u32, fd: usize) -> Option<bool> {
     Some(matches!(tbl.fds[fd].kind,
         VnodeKind::RamFile { .. } | VnodeKind::DevNull | VnodeKind::DevZero
         | VnodeKind::Pipe { .. } | VnodeKind::TmpFile { .. } | VnodeKind::EventFd { .. }
-        | VnodeKind::TimerFd { .. } | VnodeKind::DevUrandom | VnodeKind::MountedFile { .. }
+        | VnodeKind::Mq { .. } | VnodeKind::TimerFd { .. } | VnodeKind::DevUrandom | VnodeKind::MountedFile { .. }
         | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. }))
 }
 
@@ -1897,6 +2016,7 @@ pub fn fd_wake_tag(pid: u32, fd: usize, write: bool) -> Option<sched::PollTag> {
         VnodeKind::Pipe { ring, is_write } => return local(sched::poll_key_bit(pipe_end_key(*ring, *is_write))),
         VnodeKind::Pty { pair, .. }   => return local(poll_tag(poll_class::PTY, *pair as u32)),
         VnodeKind::EventFd { slot }   => return local(poll_tag(poll_class::EVENTFD, *slot as u32)),
+        VnodeKind::Mq { slot }        => return local(poll_tag(poll_class::MQ, *slot as u32)),
         VnodeKind::TimerFd { slot }   => return local(poll_tag(poll_class::TIMERFD, *slot as u32)),
         VnodeKind::DevVt { .. }       => return local(sched::POLL_TAG_VT_SWITCH),
         VnodeKind::SignalFd { .. } if !write => return local(signalfd_wake_tag()),
@@ -2034,6 +2154,7 @@ pub fn fd_object_identity(k: &VnodeKind) -> Option<(u8, u64)> {
         VnodeKind::Pty { pair, is_master } => Some((2, (pair as u64) << 1 | is_master as u64)),
         VnodeKind::TmpFile { idx, .. } => Some((3, idx as u64)),
         VnodeKind::EventFd { slot } => Some((4, slot as u64)),
+        VnodeKind::Mq { slot } => Some((8, slot as u64)),
         VnodeKind::TimerFd { slot } => Some((5, slot as u64)),
         VnodeKind::DynamicDevice { port, open_id, .. } => Some((6, (port as u64) << 32 | open_id as u64)),
         VnodeKind::MountedFile { port, file_id } => Some((7, (port as u64) << 32 | file_id as u64)),
@@ -2190,7 +2311,7 @@ pub fn fd_epoll_eperm(pid: u32, fd: usize) -> bool {
             let tmp = TMP_FILES.lock();
             let e = &tmp[idx];
             let path = e.path();
-            e.in_use() && !e.ephemeral() && !path.starts_with(b"/tmp/.") && !path.starts_with(b"/tmp/dmabuf")
+            e.in_use() && !e.ephemeral() && !path.starts_with(b"/tmp/.") && !path.starts_with(b"/.leandros-sb/") && !path.starts_with(b"/tmp/dmabuf")
         }
         VnodeKind::MountedFile { .. } => {
             let mut buf = [0u8; 128];
@@ -2345,21 +2466,7 @@ fn reopen_fd_kind(pid: u32, fd: usize, flags: u32) -> Result<VnodeKind, i32> {
 fn reopen_fd_kind_of(pid: u32, target: u32, fd: usize, flags: u32) -> Result<VnodeKind, i32> {
     let kind = match vfs_get_node_kind(target, fd) { Some(k) => k, None => return Err(-2) };
     match kind {
-        VnodeKind::TmpFile { idx, .. } => {
-            let accmode = flags & 0x3;
-            let want_read = accmode != O_WRONLY;
-            let want_write = accmode == O_WRONLY || accmode == O_RDWR;
-            let cred = cred_of(pid);
-            let tmp = TMP_FILES.lock();
-            let (e, xa) = (&tmp[idx], tmp.xattr(idx));
-            if !e.in_use() || e.is_dir { return Err(-2); }
-            let meta = tmp_meta(e);
-            let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
-            if !xattr::access_check(&meta, &cred, acl, want_read, want_write, false) {
-                return Err(-13); // EACCES
-            }
-            Ok(VnodeKind::TmpFile { idx, pos: 0, writable: want_write, ofd: 0 })
-        }
+        VnodeKind::TmpFile { idx, .. } => reopen_tmp_idx(pid, idx, flags),
         VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom => Ok(kind),
         // A pipe: a new description on the same pipe, whose end follows the
         // access mode asked for (O_RDONLY reads, O_WRONLY writes) whichever
@@ -2391,6 +2498,22 @@ fn reopen_fd_kind_of(pid: u32, target: u32, fd: usize, flags: u32) -> Result<Vno
         VnodeKind::SockAlias { .. } | VnodeKind::EpollFd { .. } => Err(-6), // ENXIO
         _ => Err(-2),
     }
+}
+
+fn reopen_tmp_idx(pid: u32, idx: usize, flags: u32) -> Result<VnodeKind, i32> {
+    let accmode = flags & 0x3;
+    let want_read = accmode != O_WRONLY;
+    let want_write = accmode == O_WRONLY || accmode == O_RDWR;
+    let cred = cred_of(pid);
+    let tmp = TMP_FILES.lock();
+    let (e, xa) = (&tmp[idx], tmp.xattr(idx));
+    if !e.in_use() || e.is_dir { return Err(-2); }
+    let meta = tmp_meta(e);
+    let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
+    if !xattr::access_check(&meta, &cred, acl, want_read, want_write, false) {
+        return Err(-13); // EACCES
+    }
+    Ok(VnodeKind::TmpFile { idx, pos: 0, writable: want_write, ofd: 0 })
 }
 
 /// Identify the kind of a vnode from a process's FD table.
@@ -2578,6 +2701,7 @@ pub fn register_mount(prefix: &'static str, port: u32, device: &'static str, fst
         let dev = bdev.filter(|&d| !m.iter().any(|e| e.in_use && e.dev == d))
             .unwrap_or(makedev(0, 32 + i as u32));
         m[i] = MountEntry { prefix, port, in_use: true, device, fstype, nosuid: false, rdonly: false, dev };
+        recount_tmp_nested(&*m);
     }
 }
 
@@ -2651,6 +2775,7 @@ pub fn unregister_mount(prefix: &str) -> bool {
     let mut m = MOUNTS.lock();
     if let Some(slot) = m.iter_mut().find(|e| e.in_use && e.prefix == prefix) {
         *slot = MountEntry::empty();
+        recount_tmp_nested(&*m);
         true
     } else {
         false
@@ -2663,7 +2788,7 @@ pub fn unregister_mount(prefix: &str) -> bool {
 fn mounted_inside_tmpfs(path: &[u8]) -> bool {
     MOUNTS.lock().iter().any(|e| {
         let pb = e.prefix.as_bytes();
-        e.in_use && is_tmp_path(pb) && path.starts_with(pb)
+        e.in_use && tmpfs_root_of(pb).is_some() && path.starts_with(pb)
             && (path.len() == pb.len() || path.get(pb.len()) == Some(&b'/'))
     })
 }
@@ -2750,6 +2875,7 @@ pub fn set_tmpfs_root_flags(path: &[u8], ms_flags: usize) -> bool {
 }
 
 fn tmpfs_flags_of(path: &[u8]) -> u8 {
+    if let Some(n) = mnt::ns0::tmpfs_inst_of(path) { return tmpfs_inst_attr(n).0; }
     tmpfs_root_index(path).map_or(0, |i| TMPFS_ROOT_FLAGS[i].load(atomic::Ordering::Relaxed))
 }
 
@@ -2950,6 +3076,9 @@ fn pipe_ref_inc(kind: &VnodeKind) {
         // eventfd/timerfd slots are pooled and shared across dup'd fds; bump the
         // slot refcount so the pool entry survives until the last fd closes.
         VnodeKind::EventFd { slot } => { EVENTFD_REFS.lock()[*slot] += 1; }
+        VnodeKind::NsFd { id, .. } => sched::ns::hold_raw(*id),
+        VnodeKind::BpfProg { id } => { sched::bpfcg::prog_get(*id); }
+        VnodeKind::Mq { slot } => { mqueue::ref_inc(*slot); }
         VnodeKind::TimerFd { slot } => { TIMERFD_REFS.lock()[*slot] += 1; }
         // A dynamic-device open is shared by every duplicate of its fd, so the
         // device server must not be told "closed" until the last one goes. This
@@ -3016,11 +3145,14 @@ fn pipe_ref_dec(kind: &VnodeKind) {
                 EVENTFD_SEQ.lock()[*slot] = 0;
             }
         }
+        VnodeKind::NsFd { id, .. } => sched::ns::put_raw(*id),
+        VnodeKind::BpfProg { id } => sched::bpfcg::prog_put(*id),
         VnodeKind::TimerFd { slot } => {
             let mut refs = TIMERFD_REFS.lock();
             refs[*slot] = refs[*slot].saturating_sub(1);
             if refs[*slot] == 0 { TIMERFD_POOL.lock()[*slot] = TimerFdEntry::free(); }
         }
+        VnodeKind::Mq { slot } => { mqueue::ref_dec(*slot, sched::current_pid()); }
         // Symmetric with pipe_ref_inc. This also closes a pre-existing leak:
         // the dup2/dup3 overwrite path retired a dynamic-device fd without ever
         // sending VFS_CLOSE, so the server kept the open alive forever.
@@ -4347,7 +4479,7 @@ static RAMFS: &[RamEntry] = &[
                data: b"processor\t: 0\nmodel name\t: Leandros Virtual CPU\ncpu MHz\t\t: 1000.000\n\
                        cache size\t: 4096 KB\nflags\t\t: fpu vme de pse tsc msr pae mce\n" },
     RamEntry { path: b"/proc/filesystems",
-               data: b"nodev\ttmpfs\nnodev\tramfs\nnodev\tprocfs\n\text2\n" },
+               data: b"nodev\ttmpfs\nnodev\tramfs\nnodev\tprocfs\nnodev\tcgroup\nnodev\tcgroup2\n\text2\n" },
     // /proc/mounts is generated from list_mounts() by gen_proc_system_content
     // (see the "/proc/mounts" arm there) — a static entry here would shadow
     // the generated one and go stale the moment a real filesystem is
@@ -4374,15 +4506,33 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/net/if_inet6",  data: b"" },
     RamEntry { path: b"/proc/net/fib_trie",  data: b"Main:\n  +-- 0.0.0.0/0\n" },
     RamEntry { path: b"/proc/sys/kernel/hostname",   data: b"leandros\n" },
+    RamEntry { path: b"/proc/sys/kernel/domainname", data: b"(none)\n" },
     RamEntry { path: b"/proc/sys/kernel/ostype",     data: b"Linux\n" },
     RamEntry { path: b"/proc/sys/kernel/osrelease",  data: b"6.0.0-leandros\n" },
     // pids are never reused here (a monotonic u32), so pid_max reports
     // Linux's ceiling; threads-max is the task table (`runqueue::MAX_TASKS`,
     // asserted below).
     RamEntry { path: b"/proc/sys/kernel/pid_max",    data: b"4194304\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/msg_max", data: b"10\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/msgsize_max", data: b"8192\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/queues_max", data: b"256\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/msg_default", data: b"10\n" },
+    RamEntry { path: b"/proc/sys/fs/mqueue/msgsize_default", data: b"8192\n" },
     RamEntry { path: b"/proc/sys/kernel/threads-max", data: b"4096\n" },
     RamEntry { path: b"/proc/sys/vm/overcommit_memory", data: b"0\n" },
+    // Id the kernel shows for an unmapped uid/gid (ns::OVERFLOW_ID), and the
+    // user-namespace limit (ns::NS_MAX - 1 usable). Read-only.
+    RamEntry { path: b"/proc/sys/kernel/overflowuid", data: b"65534\n" },
+    RamEntry { path: b"/proc/sys/kernel/overflowgid", data: b"65534\n" },
+    RamEntry { path: b"/proc/sys/user/max_user_namespaces", data: b"32\n" },
+    // Highest capability number the caps implementation knows (CAP_LAST,
+    // asserted below): podman and crun read it to size capability sets.
+    RamEntry { path: b"/proc/sys/kernel/cap_last_cap", data: b"40\n" },
+    // Supplementary-group limit (sched::task::NGROUPS_MAX, asserted below).
+    RamEntry { path: b"/proc/sys/kernel/ngroups_max", data: b"32\n" },
 ];
+const _: () = assert!(sched::caps::CAP_LAST == 40, "update /proc/sys/kernel/cap_last_cap");
+const _: () = assert!(sched::task::NGROUPS_MAX == 32, "update /proc/sys/kernel/ngroups_max");
 const _: () = assert!(sched::runqueue::MAX_TASKS == 4096, "update /proc/sys/kernel/threads-max");
 
 /// Known directories for getdents64.
@@ -4415,6 +4565,9 @@ static RAMFS_DIRS: &[&[u8]] = &[
     // `handle_open` does not depend on it, but ttyname()'s readlink+stat
     // cross-check and `ls /dev/pts` do.
     b"/dev/pts",
+    // Backing directories of devpts mounts (see devpts.rs).
+    b"/dev/.devpts",
+    b"/dev/mqueue",
     b"/run",
     b"/run/user",
     b"/mnt",
@@ -4428,6 +4581,7 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/proc/sys",
     b"/proc/sys/kernel",
     b"/proc/sys/vm",
+    b"/proc/sys/user",
 ];
 
 // ── Server port ───────────────────────────────────────────────────────────────
@@ -4577,6 +4731,9 @@ pub fn init(owner_pid: u32) -> Option<u32> {
         let e = &mut tmp[0];
         e.is_dir = true;
         e.mode   = 0o700;
+        // The hidden superblock space for namespace tmpfs instances: created
+        // here, at boot, root-owned and 0711, before any user can run.
+        let _ = tmpfs_inst_parents(&mut tmp);
     }
     
     // Register IPC handler to respond to PINGs (prevents deadlocks during discovery scans)
@@ -4643,7 +4800,7 @@ pub fn tmpfs_read_all(path: &str, out: &mut [u8]) -> Option<usize> {
     let p = path.as_bytes();
     let tmp = TMP_FILES.lock();
     let idx = tmp_find(&tmp, p)?;
-    if tmp[idx].is_dir || tmp[idx].is_link || tmp[idx].is_fifo || tmp[idx].is_sock {
+    if tmp[idx].is_dir || tmp[idx].is_link || tmp[idx].is_fifo || tmp[idx].is_sock || tmp[idx].devtype != 0 {
         return None;
     }
     let owner = tmp_owner(&tmp, idx);
@@ -4667,6 +4824,7 @@ pub fn is_directory(path_ptr: usize) -> bool {
     for &dir in RAMFS_DIRS {
         if path_eq(&pbuf, plen, dir) { return true; }
     }
+    if devpts::inst_of_backing(&pbuf[..plen]).is_some() { return true; }
     // Check tmpfs dirs.
     let path = match tmpfs_path(&pbuf[..plen]) { Some(p) => p, None => return false };
     let tmp = TMP_FILES.lock();
@@ -4747,7 +4905,15 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
     // VFS_CLOSE_ALL, VFS_EXEC_CLOEXEC) take them as message args and are
     // unaffected by this canonicalization.
     let caller_pid = sched::tgid_of(caller_pid);
+    handle_as(msg, caller_pid)
+}
 
+/// Close every descriptor of `pid` (used to tear down an overlay pseudo-pid).
+pub(crate) fn handle_close_all_pub(pid: u32) -> Message { handle_close_all(pid) }
+
+/// `handle` for a caller that is already canonical (no tgid mapping): the
+/// overlay's pseudo-pids are not scheduler tasks, so `tgid_of` must not see them.
+pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
     // Symlink resolution happens here, once, for every path-taking operation —
     // rather than in each of the fifteen handlers that would otherwise each
     // need their own copy of the walk. The rewritten paths live in this
@@ -4798,7 +4964,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_ALLOC_FD     => handle_alloc_fd(caller_pid, arg(msg,0) as usize),
         VFS_UNLINK       => handle_unlink(caller_pid, arg(msg,0) as usize),
         VFS_MKDIR        => handle_mkdir(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
-        VFS_MKNOD        => handle_mknod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        VFS_MKNOD        => handle_mknod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2)),
         VFS_FTRUNCATE    => handle_ftruncate(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_FALLOCATE    => handle_fallocate(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32,
                                              arg(msg,2) as i64, arg(msg,3) as i64),
@@ -4972,6 +5138,10 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
        // rides /tmp/. Intercept /run before the mount table so it lands on
        // tmpfs, not the pivoted F2FS root.
        || path == b"/run" || path.starts_with(b"/run/")
+       // Namespace tmpfs instances (hidden pool).
+       || path == TMPFS_INST_PARENT || path == TMPFS_INST_DIR || path.starts_with(b"/.leandros-sb/tmpfs/")
+       // Bind-mounted nsfs files (`alias::NS_SRC`).
+       || path.starts_with(alias::NS_SRC)
        // Only the synthesized `/sys/class/block` subtree. Like /proc it is not
        // a mount and must be intercepted before `find_mount_port()`, which
        // matches every absolute path once init has pivot_root'ed the F2FS
@@ -4981,6 +5151,8 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
        // Hook-backed power_supply/backlight classes, only while they have devices.
        || sysclass::is_path(path)
        || sysclass::is_tables_path(path)
+       // The cgroup2 tree: exactly /sys/fs/cgroup, and only once mounted.
+       || cgroupfs::is_path(path)
        // A GPU backend's PCI identity for the DRM nodes — only the attribute
        // files it answers, only while it is registered (`drm_sysfs_attr`).
        || is_drm_sysfs_override(path)
@@ -5038,16 +5210,22 @@ fn pts_meta(n: usize) -> xattr::FileMeta {
 
 /// A fresh pair `n` from `/dev/ptmx`, opened by `pid`.
 fn pts_meta_init(n: usize, pid: u32) {
-    let uid = sched::fsuid_of(pid);
-    if let Some(e) = PTS_META.lock().get_mut(n) { *e = (uid, GID_TTY, 0o620); }
+    let (inst, _) = tty_server::pty::ident(n);
+    let (uid, gid, mode) = match devpts::opts(inst) {
+        Some(o) => (if o.set_uid { o.uid } else { sched::fsuid_of(pid) },
+                    if o.set_gid { o.gid } else { sched::fsgid_of(pid) }, o.mode),
+        None => (sched::fsuid_of(pid), GID_TTY, 0o620),
+    };
+    if let Some(e) = PTS_META.lock().get_mut(n) { *e = (uid, gid, mode); }
 }
 
 /// chmod(2) of `/dev/pts/N`: the owner or root.
 fn pts_chmod(pid: u32, n: usize, mode: u32) -> Message {
-    let euid = sched::fsuid_of(pid);
+    let cred = cred_of(pid);
     let mut t = PTS_META.lock();
     let Some(e) = t.get_mut(n) else { return err_reply(-2) };
-    if euid != 0 && euid != e.0 { return err_reply(-1); } // EPERM
+    // Owner, or CAP_FOWNER over the inode in the caller's user namespace.
+    if cred.euid != e.0 && !cred.cap_inode(xattr::CAP_FOWNER, e.0, e.1) { return err_reply(-1); } // EPERM
     e.2 = (mode & 0o7777) as u16;
     ok_reply()
 }
@@ -5059,7 +5237,8 @@ fn pts_chown(pid: u32, n: usize, uid: u32, gid: u32) -> Message {
     let cred = cred_of(pid);
     let mut t = PTS_META.lock();
     let Some(e) = t.get_mut(n) else { return err_reply(-2) };
-    if cred.euid != 0 {
+    // CAP_CHOWN over the inode in the caller's user namespace (host root: all).
+    if !cred.cap_inode(xattr::CAP_CHOWN, e.0, e.1) {
         if cred.euid != e.0 { return err_reply(-1); }
         if uid != u32::MAX && uid != e.0 { return err_reply(-1); }
         if gid != u32::MAX && !cred.in_group(gid) { return err_reply(-1); }
@@ -5075,14 +5254,22 @@ fn pts_chown(pid: u32, n: usize, uid: u32, gid: u32) -> Message {
 /// multi-component tail, and for a number no live master owns — so the caller
 /// falls through to the ordinary ENOENT rather than inventing a device.
 fn pts_number(path: &[u8]) -> Option<usize> {
-    let rest = path.strip_prefix(b"/dev/pts/".as_slice())?;
-    if rest.is_empty() || rest.len() > 3 { return None; }
-    let mut n = 0usize;
-    for &c in rest {
-        if !c.is_ascii_digit() { return None; }
-        n = n * 10 + (c - b'0') as usize;
+    match devpts::parse(path)? {
+        (inst, devpts::Tail::Slave(n)) => tty_server::pty::find(inst, n),
+        _ => None,
     }
-    if tty_server::pty::exists(n) { Some(n) } else { None }
+}
+
+/// Instance whose `ptmx` `path` names (`/dev/ptmx` is the default's).
+fn ptmx_inst(path: &[u8]) -> Option<u32> {
+    if path == b"/dev/ptmx" { return Some(0); }
+    match devpts::parse(path)? { (inst, devpts::Tail::Ptmx) => Some(inst), _ => None }
+}
+
+/// Owner/mode of an instance's `ptmx` node.
+fn ptmx_meta(inst: u32) -> xattr::FileMeta {
+    let mode = devpts::opts(inst).map_or(0o666, |o| o.ptmxmode);
+    xattr::FileMeta { mode: 0o020000 | mode, uid: 0, gid: 0 }
 }
 
 /// The `N` in `/dev/ttyN`, if `path` names a virtual console.
@@ -5164,14 +5351,26 @@ fn is_tmpfs_root(path: &[u8]) -> bool {
 /// The tmpfs root that owns `path` (the root itself, or a descendant under it),
 /// or `None` when no tmpfs mount owns it.
 fn tmpfs_root_of(path: &[u8]) -> Option<&'static [u8]> {
-    TMPFS_ROOTS.iter().copied().find(|&r| {
-        path == r || (path.len() > r.len() && path.starts_with(r) && path[r.len()] == b'/')
-    })
+    let under = |r: &[u8]| path == r || (path.len() > r.len() && path.starts_with(r) && path[r.len()] == b'/');
+    // The hidden namespace-instance pool counts as a tmpfs space, but only
+    // strictly below its kind directory (the directory itself is a plain
+    // pool entry created at boot).
+    if path.len() > TMPFS_INST_DIR.len() && under(TMPFS_INST_DIR) { return Some(TMPFS_INST_DIR); }
+    TMPFS_ROOTS.iter().copied().find(|&r| under(r))
 }
 
 /// Return true if `path` lives under any tmpfs mount root (root or descendant).
 fn is_tmp_path(path: &[u8]) -> bool {
-    tmpfs_root_of(path).is_some()
+    tmpfs_root_of(path).is_some() && !(TMP_NESTED_MOUNTS.load(atomic::Ordering::Relaxed) != 0 && mounted_inside_tmpfs(path))
+}
+
+/// Mounts whose mount point lies inside a tmpfs root (a FUSE filesystem on
+/// /tmp/x): paths under them belong to the mount, not to the tmpfs.
+static TMP_NESTED_MOUNTS: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+
+fn recount_tmp_nested(m: &[MountEntry]) {
+    let n = m.iter().filter(|e| e.in_use && tmpfs_root_of(e.prefix.as_bytes()).is_some()).count();
+    TMP_NESTED_MOUNTS.store(n, atomic::Ordering::Relaxed);
 }
 
 /// S_IFDIR mode (type | permission bits) for a RAMFS_DIRS pseudo-directory.
@@ -5241,25 +5440,30 @@ fn tmp_create_gate(tmp: &TmpPool, path: &[u8], cred: &xattr::Cred) -> Result<(),
     let parent = match tmp_parent(path) { Some(p) => p, None => return Err(-2) }; // ENOENT
     tmp_dir_may(tmp, parent, cred, xattr::MAY_EXEC)?;
     if tmp_find(tmp, path).is_some() { return Err(-17); }                        // EEXIST
-    tmp_dir_may(tmp, parent, cred, xattr::MAY_WRITE | xattr::MAY_EXEC)
+    tmp_dir_may(tmp, parent, cred, xattr::MAY_WRITE | xattr::MAY_EXEC)?;
+    // Linux `fsuidgid_has_mapping`: a caller whose fsuid/fsgid is unmapped in
+    // its own user namespace (between unshare and the map write) cannot
+    // create files whose owner would not exist. EOVERFLOW.
+    if !cred.owner_mapped() { return Err(-75); }
+    Ok(())
 }
 
 /// The sticky rule for removing/replacing pool entry `victim` inside `parent`
 /// (`xattr::sticky_denies`): true means EPERM.
-fn tmp_sticky_denies(tmp: &TmpPool, parent: &[u8], victim: usize, euid: u32) -> bool {
+fn tmp_sticky_denies(tmp: &TmpPool, parent: &[u8], victim: usize, cred: &xattr::Cred) -> bool {
     let dmeta = if is_tmpfs_root(parent) {
         tmp_root_meta(parent)
     } else {
         match tmp_find(tmp, parent) { Some(i) => tmp_meta(&tmp[i]), None => return false }
     };
-    let vuid = tmp[tmp_owner(tmp, victim)].uid;
-    xattr::sticky_denies(&dmeta, vuid, euid)
+    let vmeta = tmp_meta(&tmp[tmp_owner(tmp, victim)]);
+    xattr::sticky_denies_c(&dmeta, &vmeta, cred)
 }
 
 /// Removal gate: write + search on `parent`, then the sticky rule for `victim`.
 fn tmp_may_delete(tmp: &TmpPool, parent: &[u8], victim: usize, cred: &xattr::Cred) -> Result<(), i32> {
     tmp_dir_may(tmp, parent, cred, xattr::MAY_WRITE | xattr::MAY_EXEC)?;
-    if tmp_sticky_denies(tmp, parent, victim, cred.euid) { Err(-1) } else { Ok(()) }
+    if tmp_sticky_denies(tmp, parent, victim, cred) { Err(-1) } else { Ok(()) }
 }
 
 /// Search permission on every directory component of `path` strictly between
@@ -5282,7 +5486,7 @@ fn tmp_check_traversal(tmp: &TmpPool, path: &[u8], upto: usize, cred: &xattr::Cr
         match tmp_find(tmp, &path[..ce]) {
             None => return Err(-2),
             Some(i) if !tmp[i].is_dir => return Err(-20),
-            Some(i) => if cred.euid != 0 && !tmp_may(tmp, i, cred, xattr::MAY_EXEC) { return Err(-13); },
+            Some(i) => if !cred.host_root && !tmp_may(tmp, i, cred, xattr::MAY_EXEC) { return Err(-13); },
         }
         end = ce;
     }
@@ -5655,6 +5859,17 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
 
     let mut cur = normalize_abs_floor(input, floor);
     let mut hops = 0u32;
+    let start_in_sb = mnt::is_sb_path(&cur);
+    // Instance root `/.leandros-sb/tmpfs/<n>` of a walk that starts in the pool:
+    // hops may not leave it for another instance (relative `..` or absolute).
+    let sb_inst: Option<Vec<u8>> = if start_in_sb {
+        let mut cnt = 0usize;
+        let mut end = cur.len();
+        for (i, &c) in cur.iter().enumerate() {
+            if c == b'/' { cnt += 1; if cnt == 4 { end = i; break; } }
+        }
+        Some(cur[..end].to_vec())
+    } else { None };
 
     // The caller's credentials, for the traversal check on each directory the
     // walk passes through. Taken before TMP_FILES (RUN_QUEUE is never taken
@@ -5738,6 +5953,17 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
 
         drop(push);
         cur = normalize_abs_floor(&next[..n], floor);
+        // A link may not lead into the hidden superblock space.
+        if mnt::is_sb_path(&cur) {
+            match &sb_inst {
+                None => return Err(-2),
+                Some(inst) => {
+                    let ok = cur.starts_with(&inst[..])
+                        && (cur.len() == inst.len() || cur[inst.len()] == b'/');
+                    if !ok { return Err(-2); }
+                }
+            }
+        }
     }
 
     Ok(cur)
@@ -5870,6 +6096,21 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, b" rw,nosuid 0 0\n");
         if p >= buf.len() { return start; }
     }
+    // The built-in mqueue tree (served at /dev/mqueue like /dev/pts) is a mount
+    // too; an explicit `mount -t mqueue` at the same place is a no-op alias
+    // and would otherwise leave /proc/mounts without it.
+    let jailed = matches!(sched::current_root_arc().as_deref(), Some(r) if r.len() > 1);
+    if !jailed {
+        let start = p;
+        p = write_lit(buf, p, b"mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec 0 0\n");
+        if p >= buf.len() { return start; }
+        // cgroup2, once mounted (the initial-namespace line only).
+        if cgroupfs::mounted() {
+            let start = p;
+            p = write_lit(buf, p, b"cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n");
+            if p >= buf.len() { return start; }
+        }
+    }
     p
 }
 
@@ -5890,6 +6131,42 @@ fn alias_mounts_for_reader() -> Vec<(Vec<u8>, Vec<u8>, &'static str)> {
     }).collect()
 }
 
+/// ` shared:N`, ` master:N`, ` unbindable` for the ns-0 mount at `path`.
+fn write_prop_fields(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize, path: &[u8]) -> usize {
+    let (g, m, u) = mnt::ns0_prop(path);
+    if g != 0 { p = write_lit(buf, p, b" shared:"); p = write_u32(buf, p, g); }
+    if m != 0 { p = write_lit(buf, p, b" master:"); p = write_u32(buf, p, m); }
+    if u { p = write_lit(buf, p, b" unbindable"); }
+    p
+}
+
+/// mountinfo (`info`) or mounts of mount namespace `ns`: its own tree when it
+/// has one, else the initial namespace's tables.
+fn gen_mount_view(ns: sched::ns::NsId, info: bool, buf: &mut [u8; TMP_BUF_SIZE]) -> usize {
+    if ns != 0 {
+        if let Some(v) = mnt::render_tree(ns, info) {
+            // Drop a trailing partial line rather than truncating mid-field.
+            let mut n = v.len().min(TMP_BUF_SIZE);
+            if n < v.len() { while n > 0 && v[n - 1] != b'\n' { n -= 1; } }
+            buf[..n].copy_from_slice(&v[..n]);
+            return n;
+        }
+    }
+    if info { write_mountinfo_lines(buf, 0) } else { write_mtab_lines(buf, 0) }
+}
+
+/// Namespace mountpoints of the initial namespace (see `ns0_snapshot`).
+pub(crate) fn ns0_mountpoints() -> Vec<Vec<u8>> {
+    let mut v: Vec<Vec<u8>> = alloc::vec![b"/".to_vec()];
+    for m in list_mounts().iter().filter(|m| m.in_use) { v.push(m.prefix.as_bytes().to_vec()); }
+    for r in TMPFS_ROOTS.iter() { v.push(r.to_vec()); }
+    for p in [&b"/proc"[..], b"/dev", b"/dev/pts", b"/sys"] { v.push(p.to_vec()); }
+    for (mp, ..) in alias::entries() { v.push(mp); }
+    for mp in alias::self_binds() { v.push(mp); }
+    v.sort(); v.dedup();
+    v
+}
+
 /// Append one `/proc/self/mountinfo`-format line per in-use mount:
 /// `<id> <parent-id> <major>:<minor> <root> <mountpoint> <options> - <fstype> <source> <superoptions>`.
 ///
@@ -5900,12 +6177,15 @@ fn alias_mounts_for_reader() -> Vec<(Vec<u8>, Vec<u8>, &'static str)> {
 /// options. Emitting exactly zero optional fields (the "-" lands at index 6)
 /// keeps that scan trivial. Bounded the same way as `write_mtab_lines`.
 fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
-    let mut mount_id: u32 = 20;
+    const ROOT_ID: u32 = 20;
+    let mut mount_id: u32 = ROOT_ID;
     for m in list_mounts().iter() {
         if !m.in_use { continue; }
         let start = p;
         p = write_u32(buf, p, mount_id);
-        p = write_lit(buf, p, b" 1 ");
+        p = write_lit(buf, p, b" ");
+        p = write_u32(buf, p, ROOT_ID);
+        p = write_lit(buf, p, b" ");
         let (maj, min) = dev_major_minor(m.dev);
         p = write_u32(buf, p, maj);
         p = write_lit(buf, p, b":");
@@ -5914,7 +6194,9 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, m.prefix.as_bytes());
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, mount_opts(m));
-        p = write_lit(buf, p, b",relatime - ");
+        p = write_lit(buf, p, b",relatime");
+        p = write_prop_fields(buf, p, m.prefix.as_bytes());
+        p = write_lit(buf, p, b" - ");
         p = write_lit(buf, p, m.fstype.as_bytes());
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, m.device.as_bytes());
@@ -5927,30 +6209,43 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
     for (ri, root) in TMPFS_ROOTS.iter().enumerate() {
         let start = p;
         p = write_u32(buf, p, mount_id);
-        p = write_lit(buf, p, b" 1 0:");
+        p = write_lit(buf, p, b" 20 0:");
         p = write_u32(buf, p, dev_major_minor(tmpfs_root_dev(ri)).1);
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, root);
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, tmpfs_opts(root));
-        p = write_lit(buf, p, b",relatime - tmpfs tmpfs rw\n");
+        p = write_lit(buf, p, b",relatime");
+        p = write_prop_fields(buf, p, root);
+        p = write_lit(buf, p, b" - tmpfs tmpfs rw\n");
         if p >= buf.len() { return start; }
         mount_id += 1;
     }
     for (dev, mp, fstype) in alias_mounts_for_reader() {
         let start = p;
         p = write_u32(buf, p, mount_id);
-        p = write_lit(buf, p, b" 1 0:");
+        p = write_lit(buf, p, b" 20 0:");
         p = write_u32(buf, p, mount_id);
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, &mp);
-        p = write_lit(buf, p, b" rw,nosuid,relatime - ");
+        p = write_lit(buf, p, b" rw,nosuid,relatime");
+        p = write_prop_fields(buf, p, &mp);
+        p = write_lit(buf, p, b" - ");
         p = write_lit(buf, p, fstype.as_bytes());
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, &dev);
         p = write_lit(buf, p, b" rw\n");
         if p >= buf.len() { return start; }
         mount_id += 1;
+    }
+    // cgroup2, once mounted (the initial-namespace line only).
+    if cgroupfs::mounted() && !matches!(sched::current_root_arc().as_deref(), Some(r) if r.len() > 1) {
+        let start = p;
+        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" 1 0:");
+        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n");
+        if p >= buf.len() { return start; }
     }
     p
 }
@@ -6028,6 +6323,20 @@ fn proc_net_open(path: &[u8]) -> Option<VnodeKind> {
 fn gen_proc_system(path: &[u8], root: bool) -> Option<VnodeKind> {
     let mut buf = [0u8; TMP_BUF_SIZE];
     let len = gen_proc_system_content(path, root, &mut buf)?;
+    gen_proc_system_file(&buf, len)
+}
+
+/// `/proc/sys/kernel/{hostname,domainname}` as seen from `pid`'s UTS namespace.
+fn gen_proc_uts(pid: u32, domain: bool) -> Option<VnodeKind> {
+    let (h, d) = sched::ns::uts_names(sched::ns::utsns_of(pid));
+    let (b, l) = if domain { d } else { h };
+    let mut buf = [0u8; TMP_BUF_SIZE];
+    buf[..l].copy_from_slice(&b[..l]);
+    buf[l] = b'\n';
+    gen_proc_system_file(&buf, l + 1)
+}
+
+fn gen_proc_system_file(buf: &[u8; TMP_BUF_SIZE], len: usize) -> Option<VnodeKind> {
     let mut tmp = TMP_FILES.lock();
     let idx = tmp_free_slot(&mut *tmp)?;
     tmp.claim(idx, b"", true);
@@ -6236,6 +6545,230 @@ fn gen_sysstat() -> Option<VnodeKind> {
     }
     let _ = writeln!(s, "# overflow {}", sched::sysacct::OVERFLOW.load(core::sync::atomic::Ordering::Relaxed));
     proc_snapshot(b"/tmp/.sysstat", s.as_bytes(), false)
+}
+
+/// `/proc/mntselftest`: `case: PASS|FAIL` rows from the mount-tree selftest
+/// (walk/reverse/copy/registry on a synthetic tree), plus the live counters
+/// `mnt_ns_live=`, `sb_count=`.
+fn gen_mntselftest() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    for (name, ok) in mnt::selftest() { let _ = writeln!(s, "{}: {}", name, if ok { "PASS" } else { "FAIL" }); }
+    let _ = writeln!(s, "ns_live={} ns_dying={} sb_count={}", sched::ns::live_count(), sched::ns::dying_count(), mnt::sb_count());
+    proc_snapshot(b"/tmp/.mntselftest", s.as_bytes(), false)
+}
+
+/// Interim tmpfs instances for mount namespaces (lane M1; lane M5 replaces
+/// this with real per-superblock roots). An instance is a directory of the
+/// tmpfs pool under the hidden, root-owned backing prefix
+/// `/.leandros-sb/tmpfs/<n>`: no namespace path reaches the prefix (resolve_ns
+/// returns ENOENT, getdents hides it, a link hop into it from outside is
+/// ENOENT, and the mount-tree walk refuses it unless the mount root is itself
+/// there). The parents are created at boot, root-owned 0711; each instance
+/// directory is created exclusively (EEXIST if anything is there), 0700,
+/// owned by the creating uid.
+const TMPFS_INST_PARENT: &[u8] = b"/.leandros-sb";
+const TMPFS_INST_DIR: &[u8] = b"/.leandros-sb/tmpfs";
+
+/// Create the directory `path` exclusively: fails with EEXIST if any entry is
+/// there, whatever it is (an entry we did not create is never adopted).
+fn tmpfs_inst_mkdir(tmp: &mut TmpPool, path: &[u8], uid: u32, gid: u32, mode: u16) -> Result<(), i32> {
+    if tmp_find(tmp, path).is_some() { return Err(-17); }
+    let idx = tmp_free_slot(tmp).ok_or(-28)?;
+    tmp.claim(idx, path, false);
+    tmp[idx].is_dir = true;
+    tmp[idx].uid = uid;
+    tmp[idx].gid = gid;
+    tmp_init_created(tmp, idx, path, mode, 0, true);
+    Ok(())
+}
+
+/// Ensure the root-owned parents exist. An existing entry is accepted only
+/// if it is a directory owned by root:root with mode 0711 (our own).
+fn tmpfs_inst_parents(tmp: &mut TmpPool) -> Result<(), i32> {
+    for p in [TMPFS_INST_PARENT, TMPFS_INST_DIR] {
+        match tmp_find(tmp, p) {
+            None => tmpfs_inst_mkdir(tmp, p, 0, 0, 0o711)?,
+            Some(i) => {
+                let e = &tmp[i];
+                if !e.is_dir || e.uid != 0 || e.gid != 0 || e.is_link { return Err(-17); }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tmpfs_inst_root(n: u32) -> Vec<u8> {
+    let mut root = TMPFS_INST_DIR.to_vec();
+    root.push(b'/');
+    let mut d = [0u8; 10]; let mut k = 0; let mut v = n;
+    loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+    for i in (0..k).rev() { root.push(d[i]); }
+    root
+}
+
+/// Per-instance attributes of the tmpfs mounts made by mount(2):
+/// (superblock id, MS_NOSUID|NODEV|NOEXEC bits, size limit in pages, 0 = none).
+static TMPFS_INST_ATTR: Mutex<Vec<(u32, u8, usize)>> = Mutex::new(Vec::new());
+
+fn tmpfs_inst_attr(n: u32) -> (u8, usize) {
+    TMPFS_INST_ATTR.lock().iter().find(|e| e.0 == n).map_or((0, 0), |e| (e.1, e.2))
+}
+
+/// Record the mount flags (MS_* bits) and size limit of instance `n`.
+pub fn tmpfs_instance_set_attr(n: u32, ms_flags: usize, size_pages: usize) {
+    let f = (ms_flags & (TMPFS_MS_NOSUID | TMPFS_MS_NODEV | TMPFS_MS_NOEXEC) as usize) as u8;
+    let mut t = TMPFS_INST_ATTR.lock();
+    t.retain(|e| e.0 != n);
+    if f != 0 || size_pages != 0 { t.push((n, f, size_pages)); }
+}
+
+/// Options of a tmpfs mount(2) data string.
+#[derive(Default, Clone, Copy)]
+pub struct TmpfsOpts {
+    pub mode: Option<u16>,
+    /// uid/gid as the caller names them (the kernel translates).
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// Size limit in pages, 0 = default (the global tmpfs budget).
+    pub size_pages: usize,
+}
+
+/// Parse `mode=,uid=,gid=,size=` (size: bytes, k/m/g suffix, or N% of RAM).
+/// `nr_inodes=` and unknown options are accepted and ignored. EINVAL on a
+/// malformed value.
+pub fn parse_tmpfs_opts(data: &[u8]) -> Result<TmpfsOpts, i32> {
+    fn num(v: &[u8], radix: u32) -> Option<u64> {
+        if v.is_empty() { return None; }
+        u64::from_str_radix(core::str::from_utf8(v).ok()?, radix).ok()
+    }
+    let mut o = TmpfsOpts::default();
+    for opt in data.split(|&c| c == b',') {
+        if opt.is_empty() { continue; }
+        let (k, v) = match opt.iter().position(|&c| c == b'=') {
+            Some(i) => (&opt[..i], &opt[i + 1..]),
+            None => continue,
+        };
+        match k {
+            b"mode" => o.mode = Some((num(v, 8).ok_or(-22)? & 0o7777) as u16),
+            b"uid" => o.uid = Some(num(v, 10).ok_or(-22)? as u32),
+            b"gid" => o.gid = Some(num(v, 10).ok_or(-22)? as u32),
+            b"size" => {
+                let pages = if let Some(pc) = v.strip_suffix(b"%".as_slice()) {
+                    let p = num(pc, 10).ok_or(-22)?.min(100) as usize;
+                    mm::buddy::total_pages() * p / 100
+                } else {
+                    let (digits, mult) = match v.last() {
+                        Some(b'k') | Some(b'K') => (&v[..v.len() - 1], 1u64 << 10),
+                        Some(b'm') | Some(b'M') => (&v[..v.len() - 1], 1u64 << 20),
+                        Some(b'g') | Some(b'G') => (&v[..v.len() - 1], 1u64 << 30),
+                        _ => (v, 1u64),
+                    };
+                    let bytes = num(digits, 10).ok_or(-22)?.saturating_mul(mult);
+                    ((bytes + 4095) / 4096) as usize
+                };
+                // size=0 means unlimited on Linux.
+                o.size_pages = pages;
+            }
+            _ => {}
+        }
+    }
+    Ok(o)
+}
+
+/// Create tmpfs instance `n` (the superblock id) owned by `uid`:`gid` with
+/// permission bits `mode`; returns its backing root.
+pub fn tmpfs_instance_create(n: u32, uid: u32, gid: u32, mode: u16) -> Result<Vec<u8>, i32> {
+    let root = tmpfs_inst_root(n);
+    let mut tmp = TMP_FILES.lock();
+    tmpfs_inst_parents(&mut tmp)?;
+    tmpfs_inst_mkdir(&mut tmp, &root, uid, gid, mode)?;
+    Ok(root)
+}
+
+/// Pages resident in instance `n` (every file below its root).
+fn tmpfs_inst_used_pages(tmp: &TmpPool, vmos: &[Option<TmpVmo>], n: u32) -> usize {
+    let root = tmpfs_inst_root(n);
+    let Some(top) = tmp_find(tmp, &root) else { return 0 };
+    let mut used = 0;
+    for idx in tmp.subtree(top) {
+        if let Some(v) = vmos[idx].as_ref() { if !v.borrowed { used += v.resident_pages(); } }
+    }
+    used
+}
+
+/// Superblock destroy hook: free the tmpfs instance of the superblock whose
+/// registry root is `sb_root` (`/.leandros-sb/tmpfs/<n>`) and everything
+/// below it (its last mount is gone). A file an fd still holds survives
+/// nameless.
+pub fn tmpfs_instance_destroy(sb_root: &[u8]) {
+    let name = match sb_root.iter().rposition(|&c| c == b'/') { Some(i) => &sb_root[i + 1..], None => return };
+    let n: u32 = match core::str::from_utf8(name).ok().and_then(|x| x.parse().ok()) { Some(n) => n, None => return };
+    TMPFS_INST_ATTR.lock().retain(|e| e.0 != n);
+    let root_buf = tmpfs_inst_root(n);
+    let root = &root_buf[..];
+    let mut objs: Vec<u32> = Vec::new();
+    {
+        let mut tmp = TMP_FILES.lock();
+        let Some(top) = tmp_find(&tmp, root) else { return };
+        let mut all = tmp.subtree(top);
+        all.reverse(); // children before parents
+        all.push(top);
+        for idx in all {
+            if !tmp[idx].in_use() { continue; }
+            if let Some(o) = tmp_drop_name(&mut tmp, idx, TmpOpen) { objs.push(o); }
+        }
+    }
+    for o in objs { dmabuf_release(o); }
+}
+
+/// The initial namespace's mount table as a tree, for copying into a new
+/// mount namespace: MOUNTS, the built-in tmpfs roots, the synthesized
+/// `/proc` `/dev` `/dev/pts` `/sys`, and the ns-0 alias/bind mounts, nested
+/// by namespace path. Every mount is private; superblock 0 (not registered).
+pub(crate) fn ns0_snapshot() -> Vec<mnt::Mnt> {
+    use alloc::boxed::Box;
+    // (ns mountpoint, backing root, fstype, device, flags)
+    let mut raw: Vec<(Vec<u8>, Vec<u8>, &'static str, Vec<u8>, u8)> = Vec::new();
+    let mut have_root = false;
+    for m in list_mounts().iter().filter(|m| m.in_use) {
+        if m.prefix == "/" { have_root = true; }
+        let mut fl = mnt::MNT_RELATIME;
+        if m.nosuid { fl |= mnt::MNT_NOSUID; }
+        if m.rdonly { fl |= mnt::MNT_RDONLY; }
+        raw.push((m.prefix.as_bytes().to_vec(), m.prefix.as_bytes().to_vec(), m.fstype, m.device.as_bytes().to_vec(), fl));
+    }
+    if !have_root { raw.insert(0, (b"/".to_vec(), b"/".to_vec(), "rootfs", b"rootfs".to_vec(), mnt::MNT_RELATIME)); }
+    for r in TMPFS_ROOTS.iter() { raw.push((r.to_vec(), r.to_vec(), "tmpfs", b"tmpfs".to_vec(), mnt::MNT_RELATIME)); }
+    for (p, fs) in [(&b"/proc"[..], "proc"), (b"/dev", "devtmpfs"), (b"/dev/pts", "devpts"), (b"/sys", "sysfs")] {
+        raw.push((p.to_vec(), p.to_vec(), fs, fs.as_bytes().to_vec(), mnt::MNT_RELATIME));
+    }
+    for (mp, src, fs, dev) in alias::entries() {
+        raw.push((mp, src, fs, dev, mnt::MNT_NOSUID | mnt::MNT_RELATIME));
+    }
+    // Parents: the deepest earlier-or-equal mountpoint covering ours (the
+    // root first, so "/" is its own tree root and later duplicates overmount).
+    raw.sort_by_key(|r| r.0.len());
+    let ids: Vec<u32> = raw.iter().map(|_| mnt::alloc_mnt_id()).collect();
+    let mut out: Vec<mnt::Mnt> = Vec::new();
+    for (i, r) in raw.iter().enumerate() {
+        let parent = (0..i).filter(|&j| alias::under(&r.0, &raw[j].0)).max_by_key(|&j| (raw[j].0.len(), j));
+        let (pid, rel): (u32, Vec<u8>) = match parent {
+            None => (0, b"/".to_vec()),
+            Some(j) => {
+                let pm = &raw[j].0;
+                let rest = if pm == b"/" { &r.0[..] } else { &r.0[pm.len()..] };
+                (ids[j], if rest.is_empty() { b"/".to_vec() } else { rest.to_vec() })
+            }
+        };
+        let pg = mnt::ns0_prop(&r.0);
+        let mut m = mnt::Mnt { id: ids[i], parent: pid, mp: rel.into_boxed_slice(), root: r.1.clone().into_boxed_slice(),
+            sb: mnt::ns0::tmpfs_inst_of(&r.1).or_else(|| devpts::inst_of_backing(&r.1)).unwrap_or(0), flags: r.4, locked: 0, group: pg.0, master: pg.1, unbindable: pg.2, fstype: r.2,
+            device: r.3.clone().into_boxed_slice(), opts: Box::from(&b""[..]) };
+        if pid == 0 && i != 0 { m.parent = ids[0]; m.mp = r.0.clone().into_boxed_slice(); }
+        out.push(m);
+    }
+    out
 }
 
 /// `/proc/tryboot`: `state=off|armed|held|confirmed deadline_s= left_s= holds=`.
@@ -6681,7 +7214,7 @@ const SYSCLASS_W: &[u8] = b"/tmp/.syscw";
 fn sysclass_write_ok(pid: u32, path: &[u8]) -> bool {
     let mut g = [0u32; xattr::NGROUPS_MAX];
     let n = sched::groups_of(pid, &mut g).min(g.len());
-    sysclass::write_allowed(sched::euid_of(pid), sched::egid_of(pid), &g[..n],
+    sysclass::write_allowed(host_root_of(pid), sched::egid_of(pid), &g[..n],
                             sysclass::is_writable(path), sysclass::is_video_writable(path))
 }
 
@@ -6698,6 +7231,18 @@ fn gen_sysclass_writable(path: &[u8]) -> Option<VnodeKind> {
     tmp.claim(idx, b"", true);
     tmp.set_path(idx, &fake[..fl]);
     if !tmp_fill_kernel(&mut tmp, idx, &data[..n]) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
+
+/// A cgroupfs control file opened for writing: an ephemeral tmpfs slot named
+/// `cgroupfs::SNAP_W` + `<cg>/<file>`, which handle_write routes to cgroupfs.
+fn gen_cgroup_writable(cg: sched::cgroup::CgId, f: cgroupfs::F, data: &[u8]) -> Option<VnodeKind> {
+    let fake = cgroupfs::snap_w_path(cg, f);
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, fake.as_bytes());
+    if !tmp_fill_kernel(&mut tmp, idx, data) { tmp.release(idx); return None; }
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
 }
 
@@ -6771,6 +7316,15 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
     if path == b"/proc/sys/fs/file-max" {
         let p = write_u32(buf, 0, ofd::MAX_OFDS as u32);
         return Some(write_lit(buf, p, b"\n"));
+    }
+    if path == b"/proc/sys/fs/ovl_selftest" {
+        // Runs the overlay real-op selftest at read time (root only).
+        if !root { return None; }
+        let mut o = Vec::new();
+        ovl::selftest(&mut o);
+        let n = o.len().min(buf.len());
+        buf[..n].copy_from_slice(&o[..n]);
+        return Some(n);
     }
     if path == b"/proc/sys/fs/file-nr" {
         let live = ofd::census().map_or(0, |(l, _)| l);
@@ -6952,12 +7506,22 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
         for cpu in 0..n {
             p = write_lit(buf, p, b"processor\t: ");
             p = write_u32(buf, p, cpu as u32);
+            // Linux arm64 layout: podman (getCPUInfo) and lscpu key off
+            // "CPU architecture".
+            #[cfg(target_arch = "aarch64")]
+            {
+                let _ = khz;
+                p = write_lit(buf, p, b"\nBogoMIPS\t: 50.00\nFeatures\t: fp asimd evtstrm crc32 cpuid\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd08\nCPU revision\t: 3\n\n");
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
             p = write_lit(buf, p, b"\nmodel name\t: Leandros Virtual CPU\ncpu MHz\t\t: ");
             p = write_u32(buf, p, (khz / 1000) as u32);
             let frac = (khz % 1000) as u32;
             p = write_lit(buf, p, if frac < 10 { b".00" } else if frac < 100 { b".0" } else { b"." });
             p = write_u32(buf, p, frac);
             p = write_lit(buf, p, b"\n\n");
+            }
         }
         return Some(p);
     }
@@ -6965,7 +7529,7 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
     if path == b"/proc/mounts" {
         // Legacy mtab-format mount table, generated from the live mount
         // registry — see write_mtab_lines for the field layout and why.
-        return Some(write_mtab_lines(buf, 0));
+        return Some(gen_mount_view(sched::current_mntns(), false, buf));
     }
 
     None
@@ -7234,7 +7798,7 @@ fn open_proc_task(caller: u32, t: ProcTask, flags: u32) -> Result<VnodeKind, i32
         ProcTask::File { tgid, tid, name } => {
             if name == b"environ" && !proc_environ_allowed(caller, tid) { return Err(-13); }
             let n = proc_task_path(&mut p, tgid, Some(tid), name);
-            gen_proc_self(tid, &p[..n]).ok_or(-2)
+            gen_proc_self(caller, tid, &p[..n]).ok_or(-2)
         }
     }
 }
@@ -7243,7 +7807,7 @@ fn open_proc_task(caller: u32, t: ProcTask, flags: u32) -> Result<VnodeKind, i32
 /// (Linux: a PTRACE_MODE_READ check).
 fn proc_environ_allowed(caller: u32, target: u32) -> bool {
     let me = sched::euid_of(caller);
-    me == 0 || me == sched::euid_of(target)
+    sched::host_root_of(caller) || me == sched::euid_of(target)
 }
 
 /// stat of a per-process procfs path: `None` not one; `Some(None)` it names
@@ -7303,8 +7867,46 @@ fn gen_proc_args(pid: u32, environ: bool) -> Option<VnodeKind> {
 
 const PROC_COMM_W: &[u8] = b"/tmp/.proc_comm_";
 const PROC_NSMAP_W: &[u8] = b"/tmp/.proc_nsmap_";
+const PROC_OOM_W: &[u8] = b"/tmp/.proc_oom_";
+
+/// `/proc/<pid|self>/oom_score_adj` -> the process it names.
+fn proc_oom_target(path: &[u8], caller: u32) -> Option<u32> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let who = rest.strip_suffix(b"/oom_score_adj")?;
+    if who == b"self" { return Some(caller); }
+    proc_parse_num(who)
+}
+
+fn oom_text(v: i32, out: &mut [u8; 12]) -> usize {
+    let mut d = [0u8; 10]; let mut k = 0; let mut a = v.unsigned_abs();
+    loop { d[k] = b'0' + (a % 10) as u8; k += 1; a /= 10; if a == 0 { break; } }
+    let mut n = 0;
+    if v < 0 { out[0] = b'-'; n = 1; }
+    while k > 0 { k -= 1; out[n] = d[k]; n += 1; }
+    out[n] = b'\n';
+    n + 1
+}
+
+/// A writable snapshot of `/proc/<pid>/oom_score_adj`; the fake path carries
+/// the pid so `handle_write` can route the digits to `sched::set_oom_score_adj`.
+fn gen_proc_oom_writable(tid: u32) -> Option<VnodeKind> {
+    let mut fake = [0u8; 40];
+    fake[..PROC_OOM_W.len()].copy_from_slice(PROC_OOM_W);
+    let mut n = PROC_OOM_W.len();
+    let mut d = [0u8; 10]; let mut k = 0; let mut v = tid;
+    loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+    while k > 0 { k -= 1; fake[n] = d[k]; n += 1; }
+    let mut data = [0u8; 12];
+    let l = oom_text(sched::oom_score_adj_of(tid).unwrap_or(0), &mut data);
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, &fake[..n]);
+    if !tmp_fill_kernel(&mut tmp, idx, &data[..l]) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
 /// Opener credentials of each writable map file, by tmp-pool slot.
-static NSMAP_OPENERS: Mutex<[Option<sched::ns::Opener>; MAX_TMP_FILES]> = Mutex::new([None; MAX_TMP_FILES]);
+static NSMAP_OPENERS: Mutex<[Option<sched::ns::Opener>; MAX_TMP_FILES]> = Mutex::new([const { None }; MAX_TMP_FILES]);
 
 /// `/proc/<pid|self>/{uid_map,gid_map,setgroups}` → (thread group, 0|1|2).
 fn proc_nsmap_target(path: &[u8], caller: u32) -> Option<(u32, usize)> {
@@ -7370,20 +7972,28 @@ fn gen_proc_comm_writable(tid: u32) -> Option<VnodeKind> {
 
 /// Generate dynamic content for a /proc/self/<name> path.
 /// Allocates a TmpFile slot, writes the content, and returns the vnode.
-fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
+fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
     if path.ends_with(b"/uid_map") || path.ends_with(b"/gid_map") || path.ends_with(b"/setgroups") {
         let ns = sched::ns::userns_of(pid);
         let mut b = [0u8; 128];
         let n = if path.ends_with(b"/setgroups") {
             let t: &[u8] = if sched::ns::setgroups_denied(ns) { b"deny\n" } else { b"allow\n" };
             b[..t.len()].copy_from_slice(t); t.len()
-        } else { sched::ns::map_text(path.ends_with(b"/gid_map") as usize, ns, &mut b) };
+        } else { sched::ns::map_text_for(path.ends_with(b"/gid_map") as usize, ns, sched::ns::userns_of(reader), &mut b) };
         return proc_snapshot(b"/tmp/.proc_nsmap", &b[..n], false);
     }
     if path.ends_with(b"/smaps") || path.ends_with(b"/smaps_rollup") || path.ends_with(b"/maps") {
         let kind = if path.ends_with(b"/smaps_rollup") { MapsKind::Rollup }
             else if path.ends_with(b"/smaps") { MapsKind::Smaps } else { MapsKind::Maps };
         return gen_proc_maps(pid, kind);
+    }
+    if path.ends_with(b"/cgroup") {
+        return proc_snapshot(b"/tmp/.proc_cgroup", &cgroupfs::proc_cgroup(pid, reader), false);
+    }
+    if path.ends_with(b"/oom_score_adj") {
+        let mut b = [0u8; 12];
+        let n = oom_text(sched::oom_score_adj_of(pid)?, &mut b);
+        return proc_snapshot(b"/tmp/.proc_oom", &b[..n], false);
     }
     if path.ends_with(b"/cmdline") || path.ends_with(b"/environ") {
         return gen_proc_args(pid, path.ends_with(b"/environ"));
@@ -7422,9 +8032,10 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot"];
+                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
-                                   b"smaps_rollup", b"environ", b"uid_map", b"gid_map", b"setgroups"];
+                                   b"smaps_rollup", b"environ", b"uid_map", b"gid_map", b"setgroups", b"oom_score_adj", b"cgroup",
+                                   b"mountinfo", b"mounts"];
 
 /// `/proc/<pid|self>/root` or `/proc/<pid|self>/root/<rest>` → `rest`
 /// (empty for the root itself) when the process is alive. See handle_open.
@@ -7623,7 +8234,7 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
             let mut gl = [0u32; xattr::NGROUPS_MAX];
             let n = sched::groups_of(pid, &mut gl);
             for g in &gl[..n] {
-                p = write_u32(buf, p, *g);
+                p = write_u32(buf, p, sched::ns::view_id(1, *g));
                 p = write_lit(buf, p, b" ");
             }
         }
@@ -7654,7 +8265,7 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         }
         if let Some(c) = sched::caps::caps_of(pid) {
             for (label, v) in [(&b"\nCapInh:\t"[..], c[2]), (&b"\nCapPrm:\t"[..], c[1]),
-                               (&b"\nCapEff:\t"[..], c[0]), (&b"\nCapBnd:\t"[..], c[3])] {
+                               (&b"\nCapEff:\t"[..], c[0]), (&b"\nCapBnd:\t"[..], c[3]), (&b"\nCapAmb:\t"[..], c[4])] {
                 p = write_lit(buf, p, label);
                 let mut hex = [b'0'; 16];
                 for i in 0..16 { hex[i] = b"0123456789abcdef"[(v >> (60 - 4 * i) & 15) as usize]; }
@@ -7819,8 +8430,12 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
 
     if path == b"/proc/self/mountinfo" || path.ends_with(b"/mountinfo") {
         // This is the file `df`/`read_fs_list()` prefers over /etc/mtab —
-        // see write_mountinfo_lines for the field layout and why.
-        return Some(write_mountinfo_lines(buf, 0));
+        // see write_mountinfo_lines for the field layout and why. Per
+        // namespace: the target process's mount namespace.
+        return Some(gen_mount_view(sched::ns::mntns_of(pid), true, buf));
+    }
+    if path == b"/proc/self/mounts" || path.ends_with(b"/mounts") {
+        return Some(gen_mount_view(sched::ns::mntns_of(pid), false, buf));
     }
 
     None
@@ -7848,6 +8463,12 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         path = b"/";
     } else {
         path = strip_trailing_slash(path);
+    }
+
+    // /dev/mqueue/<name>: an open of a POSIX message queue (mqueue mount).
+    if let Some(name) = mqueue::path_name(path) {
+        let r = mqueue::open_path(pid, name, flags);
+        return if r < 0 { err_reply(r as i32) } else { val_reply(r as u64) };
     }
 
     // `/proc/<pid>/root[/...]` (and `/proc/self/root`) of a live process is
@@ -7944,6 +8565,19 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 return err_reply(-13); // EACCES
             }
             VnodeKind::DevFb { pos: 0 }
+        } else if cgroupfs::is_path(lookup_path) {
+            match cgroupfs::open(pid, lookup_path, flags) {
+                cgroupfs::Open::Err(e) => return err_reply(e),
+                cgroupfs::Open::Dir(cg) => VnodeKind::SysBlock { dev: cgroupfs::DEV_BASE | cg, level: cgroupfs::LVL, pos: 0 },
+                cgroupfs::Open::Read(d) => match proc_snapshot(cgroupfs::SNAP_R, &d, false) {
+                    Some(v) => v,
+                    None => return err_reply(-23),
+                },
+                cgroupfs::Open::Write(cg, f, d) => match gen_cgroup_writable(cg, f, &d) {
+                    Some(v) => v,
+                    None => return err_reply(-23),
+                },
+            }
         } else if is_drm_sysfs_override(lookup_path) {
             if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-13); } // EACCES
             match gen_drm_sysfs(lookup_path) {
@@ -7955,7 +8589,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             VnodeKind::SysBlock { dev: sysclass::SC_TABLES, level: sysclass::LVL_SC_CLASS, pos: 0 }
         } else if let Some(t) = sysclass::acpi_table(lookup_path) {
             // Raw firmware tables are root-only, as on Linux (mode 0400).
-            if flags & (O_WRONLY | O_RDWR) != 0 || sched::euid_of(pid) != 0 { return err_reply(-13); }
+            if flags & (O_WRONLY | O_RDWR) != 0 || !host_root_of(pid) { return err_reply(-13); }
             let mut tmp = TMP_FILES.lock();
             let Some(idx) = tmp_free_slot(&mut *tmp) else { return err_reply(-23) };
             tmp.claim(idx, b"", true);
@@ -8009,11 +8643,15 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
             let pos = if flags & O_APPEND != 0 { block::dev_size(dev) } else { 0 };
             VnodeKind::BlockDev { dev, pos }
-        } else if lookup_path == b"/dev/ptmx" {
+        } else if let Some(inst) = ptmx_inst(lookup_path) {
             // Every open of the multiplexor is a *new* pair, not a new handle
             // on a shared object — that is the whole ptmx contract, and what
-            // TIOCGPTN then reports.
-            match tty_server::pty::alloc() {
+            // TIOCGPTN then reports. A devpts instance's ptmx allocates in
+            // that instance's number space.
+            if inst != 0 && !xattr::may_access(&ptmx_meta(inst), &cred_of(pid), None, open_mask(flags)) {
+                return err_reply(-13); // EACCES
+            }
+            match tty_server::pty::alloc_in(inst) {
                 Some(pair) => { pts_meta_init(pair, pid); VnodeKind::Pty { pair: pair as u16, is_master: true } }
                 // ENOSPC, as Linux's devpts answers at its pty limit.
                 None => { report_pool_full("pty", tty_server::pty::MAX_PTYS); return err_reply(-28) }
@@ -8085,8 +8723,13 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                             return err_reply(-13); // EACCES
                         }
                     }
+                    if tmp[idx].devtype != 0 {
+                        let (blk, rdev) = (tmp[idx].devtype == 2, tmp[idx].rdev);
+                        drop(tmp);
+                        return devnode_open(pid, blk, rdev, flags, mode);
+                    }
                     // Linux `handle_truncate`: any O_TRUNC open strips set-ID bits.
-                    if trunc && !tmp[idx].is_link { tmp_kill_setid(&mut tmp, idx, cred.euid); }
+                    if trunc && !tmp[idx].is_link { tmp_kill_setid(&mut tmp, idx, &cred); }
                     if trunc && tmp[idx].len != 0 && !tmp[idx].is_link {
                         let mut vmos = TMP_VMOS.lock();
                         // Mapped: its mappings lose every page once the locks
@@ -8111,6 +8754,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                         Some(p) => if let Err(e) = tmp_dir_may(&tmp, p, &cred,
                                                                xattr::MAY_WRITE | xattr::MAY_EXEC) {
                             return err_reply(e);
+                        } else if !cred.owner_mapped() {
+                            return err_reply(-75); // EOVERFLOW (fsuidgid_has_mapping)
                         },
                         None => return err_reply(-2), // ENOENT
                     }
@@ -8146,6 +8791,12 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         } else if lookup_path == PROC_SELF_FDINFO_DIR {
             if flags & 0o3 != 0 { return err_reply(-21); }
             VnodeKind::RamFile { data: PROC_SELF_FDINFO_DIR, pos: 0, is_dir: true }
+        } else if let Some(t) = lookup_path.strip_prefix(b"/proc/.memfd-exe/").and_then(proc_parse_num) {
+            // open("/proc/self/exe") of a task running a memfd image.
+            match exe_memfd_kind(pid, t, flags) {
+                Ok(k) => k,
+                Err(e) => return err_reply(e),
+            }
         } else if let Some(n) = proc_self_fd_number(lookup_path) {
             // open("/proc/self/fd/N") opens what fd N names afresh, with the
             // new flags — not a dup: its own offset and its own access mode.
@@ -8175,18 +8826,38 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // Open /proc/<pid>/{uid_map,gid_map,setgroups} for writing.
             let (tpid, kind) = proc_nsmap_target(lookup_path, pid).unwrap();
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
-            let Some(op) = sched::ns::snapshot(pid) else { return err_reply(-1) };
-            if !sched::ns::open_allowed(op, tpid, kind) { return err_reply(-1); } // EPERM
+            let Some(op) = sched::ns::snapshot(pid, tpid) else { return err_reply(-1) };
+            if !sched::ns::open_allowed(&op, kind) { return err_reply(-1); } // EPERM
             match gen_proc_nsmap_writable(tpid, kind, op) {
                 Some(v) => v,
                 None    => return err_reply(-23),
             }
+        } else if let Some((k, id)) = alias::ns_src(lookup_path) {
+            // A bind-mounted nsfs file (`ip netns add`, netavark): the mount
+            // holds the namespace, each open takes its own reference.
+            if flags & 0o3 != 0 { return err_reply(-13); }
+            sched::ns::hold_raw(id);
+            VnodeKind::NsFd { kind: k, id }
         } else if let Some(r) = proc_ns_file(lookup_path, pid) {
             // /proc/<pid>/ns/<name> followed: an empty nsfs-like file.
-            let Some((tpid, _)) = r else { return err_reply(-2) };
+            let Some((tpid, k)) = r else { return err_reply(-2) };
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
             if flags & 0o3 != 0 { return err_reply(-13); }
-            match proc_snapshot(b"/tmp/.proc_nsfile", b"", false) {
+            // PTRACE_MODE_READ_FSCREDS on the target (Linux proc_ns_get_link).
+            let pr = sched::cred::ptrace_read_check(pid, tpid);
+            if pr != 0 { return err_reply(pr as i32); }
+            // The fd holds the namespace alive (taken atomically with the read).
+            match sched::ns::grab(tpid, k) {
+                Some(id) => VnodeKind::NsFd { kind: k as u8, id },
+                None     => return err_reply(-2),
+            }
+        } else if flags & 0o3 != 0 && proc_oom_target(lookup_path, pid).is_some() {
+            let tpid = proc_oom_target(lookup_path, pid).unwrap();
+            if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
+            if flags & 0o3 == 0o0 { return err_reply(-13); }
+            let me = sched::euid_of(pid);
+            if !sched::host_root_of(pid) && me != sched::euid_of(tpid) { return err_reply(-13); }
+            match gen_proc_oom_writable(tpid) {
                 Some(v) => v,
                 None    => return err_reply(-23),
             }
@@ -8196,7 +8867,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
             if flags & 0o3 == 0o0 { return err_reply(-13); }
             let me = sched::euid_of(pid);
-            if me != 0 && me != sched::euid_of(tpid) { return err_reply(-13); } // EACCES
+            if !sched::host_root_of(pid) && me != sched::euid_of(tpid) { return err_reply(-13); } // EACCES
             match gen_proc_comm_writable(tpid) {
                 Some(v) => v,
                 None    => return err_reply(-23),
@@ -8219,7 +8890,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 None    => return err_reply(-23),
             }
         } else if lookup_path.starts_with(b"/proc/self/") && lookup_path != b"/proc/self/" {
-            let kind = gen_proc_self(pid, lookup_path);
+            let kind = gen_proc_self(pid, pid, lookup_path);
             match kind {
                 Some(v) => v,
                 None    => return err_reply(-2),
@@ -8227,7 +8898,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         } else if let Some(tpid) = proc_pid_path(lookup_path) {
             // /proc/<pid>/<file> of another live process (PROC_PID_FILES).
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
-            match gen_proc_self(tpid, lookup_path) {
+            match gen_proc_self(pid, tpid, lookup_path) {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
@@ -8279,6 +8950,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if lookup_path == b"/proc/mntselftest" {
+            match gen_mntselftest() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
         } else if lookup_path == b"/proc/tryboot" {
             match gen_tryboot() {
                 Some(v) => v,
@@ -8324,6 +9000,16 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if lookup_path == b"/proc/sys/kernel/hostname" || lookup_path == b"/proc/sys/kernel/domainname" {
+            match gen_proc_uts(pid, lookup_path == b"/proc/sys/kernel/domainname") {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/cgroups" {
+            match proc_snapshot(b"/tmp/.proc_cgroups", &cgroupfs::proc_cgroups(), false) {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
         } else if lookup_path == b"/proc/modules" {
             match gen_modules() {
                 Some(v) => v,
@@ -8355,7 +9041,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts"
                || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/etc/resolv.conf"
                || lookup_path == b"/proc/sys/fs/nr_open" || lookup_path == b"/proc/sys/fs/file-max"
-               || lookup_path == b"/proc/sys/fs/file-nr" {
+               || lookup_path == b"/proc/sys/fs/file-nr"
+               || lookup_path == b"/proc/sys/fs/ovl_selftest" {
             match gen_proc_system(lookup_path, sched::fsuid_of(pid) == 0) {
                 Some(v) => v,
                 None    => return err_reply(-2),
@@ -8432,6 +9119,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     }
                 }
             }
+            if found.is_none() {
+                if let Some(sp) = devpts::backing_static(lookup_path) {
+                    found = Some(VnodeKind::RamFile { data: sp, pos: 0, is_dir: true });
+                }
+            }
             if found.is_none() && is_tmp_path(path) {
                 found = Some(VnodeKind::RamFile { data: b"/tmp", pos: 0, is_dir: true });
             }
@@ -8459,6 +9151,10 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     proxy.data[16..24].copy_from_slice(&(mode as u64).to_le_bytes());
                     let reply = call_port(port, proxy);
                     let file_id_raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
+                    if file_id_raw <= -DEVNODE_BASE {
+                        let v = (-file_id_raw - DEVNODE_BASE) as u64;
+                        return devnode_open(pid, v >> 32 & 1 != 0, v as u32, flags, mode);
+                    }
                     if file_id_raw < 0 {
                         return make_reply(file_id_raw);
                     }
@@ -8478,6 +9174,10 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             proxy.data[16..24].copy_from_slice(&(mode as u64).to_le_bytes());
             let reply = call_port(port, proxy);
             let file_id_raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
+            if file_id_raw <= -DEVNODE_BASE {
+                let v = (-file_id_raw - DEVNODE_BASE) as u64;
+                return devnode_open(pid, v >> 32 & 1 != 0, v as u32, flags, mode);
+            }
             if file_id_raw < 0 {
                 return make_reply(file_id_raw);
             }
@@ -8499,6 +9199,19 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
     }
 
     if let Some(id) = trunc_zap { sched::zap_backing_all(0, id, 0, u64::MAX); }
+    // A /proc/<pid>[/<file>] snapshot is owned as path stat reports it
+    // (`task_dump_owner`), so fstat on the fd agrees: newuidmap fstats the
+    // /proc/<pid> dirfd it opened and wants the caller's uid.
+    if let VnodeKind::TmpFile { idx, .. } = kind {
+        if path.starts_with(b"/proc/") {
+            if let Some(Some((_, owner, _))) = proc_stat_kind(path) {
+                let (u, g) = sched::cred::proc_dump_owner(owner);
+                let mut t = TMP_FILES.lock();
+                t[idx].uid = u;
+                t[idx].gid = g;
+            }
+        }
+    }
     // A regular tmpfs file gets its own open file description, so every
     // dup/fork copy of this fd shares one offset (see `TMP_OFDS`).
     let mut kind = kind;
@@ -8865,6 +9578,18 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             if unsafe { sched::uaccess::copy_raw(buf, &val as *const u64 as *const u8, 8) } != 0 { return err_reply(-14); }
             val_reply(8)
         }
+        VnodeKind::Mq { slot } => {
+            let slot = *slot;
+            let o = tbl.fds[fd].ofd;
+            drop(tbls);
+            let txt = mqueue::qsize_text(slot);
+            let pos = ofd::pos(o).unwrap_or(0) as usize;
+            if pos >= txt.len() { return val_reply(0); }
+            let n = (txt.len() - pos).min(count);
+            if unsafe { sched::uaccess::copy_raw(buf, txt[pos..].as_ptr(), n) } != 0 { return err_reply(-14); }
+            ofd::set_pos(o, (pos + n) as u64);
+            val_reply(n as u64)
+        }
         VnodeKind::TimerFd { slot } => {
             let slot = *slot;
             drop(tbls);
@@ -8961,7 +9686,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                         core::ptr::write_unaligned(rec.add(SSI_PTR)     as *mut u64, info.si_value);
                     } else {
                         core::ptr::write_unaligned(rec.add(SSI_PID) as *mut u32, info.si_pid as u32);
-                        core::ptr::write_unaligned(rec.add(SSI_UID) as *mut u32, info.si_uid);
+                        core::ptr::write_unaligned(rec.add(SSI_UID) as *mut u32, sched::ns::view_id(0, info.si_uid));
                         if info.si_code == SI_QUEUE {
                             core::ptr::write_unaligned(rec.add(SSI_INT) as *mut i32, info.si_value as i32);
                             core::ptr::write_unaligned(rec.add(SSI_PTR) as *mut u64, info.si_value);
@@ -9154,9 +9879,25 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let n = count.min(512);
                 let mut data = [0u8; 512];
                 if unsafe { sched::uaccess::copy_raw(data.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
-                let Some(op) = NSMAP_OPENERS.lock()[idx] else { return err_reply(-1) };
-                let r = if k == 2 { sched::ns::write_setgroups(op, pid, tgid, &data[..n]) }
-                        else { sched::ns::write_map(op, pid, tgid, k, &data[..n]) };
+                let g = NSMAP_OPENERS.lock();
+                let Some(op) = g[idx].as_ref() else { return err_reply(-1) };
+                let r = if k == 2 { sched::ns::write_setgroups(op, pid, &data[..n]) }
+                        else { sched::ns::write_map(op, pid, k, &data[..n]) };
+                drop(g); let _ = tgid;
+                return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
+            }
+            let cg_w = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                if e.in_use() && e.ephemeral() && e.path().starts_with(cgroupfs::SNAP_W) {
+                    cgroupfs::parse_snap_w(e.path())
+                } else { None }
+            };
+            if let Some((cg, f)) = cg_w {
+                let n = count.min(256);
+                let mut data = [0u8; 256];
+                if unsafe { sched::uaccess::copy_raw(data.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let r = cgroupfs::write(pid, cg, f, &data[..n]);
                 return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
             }
             let sc_path = {
@@ -9175,9 +9916,31 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let r = sysclass::write(&p[..l], &data[..n]);
                 return if r < 0 { err_reply(r) } else { val_reply(count as u64) };
             }
+            let oom_tid = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                if e.in_use() && e.ephemeral() && e.path().starts_with(PROC_OOM_W) {
+                    let mut t = 0u32;
+                    for &c in &e.path()[PROC_OOM_W.len()..] { t = t * 10 + (c.wrapping_sub(b'0')) as u32; }
+                    Some(t)
+                } else { None }
+            };
+            if let Some(tid) = oom_tid {
+                let n = count.min(15);
+                let mut b = [0u8; 15];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let mut s = &b[..n];
+                while let Some((&l, r)) = s.split_last() { if l == b'\n' || l == b' ' { s = r } else { break } }
+                let (neg, digs) = match s.first() { Some(b'-') => (true, &s[1..]), _ => (false, s) };
+                if digs.is_empty() || !digs.iter().all(|c| c.is_ascii_digit()) { return err_reply(-22); }
+                let mut v = 0i32;
+                for &c in digs { v = v.saturating_mul(10).saturating_add((c - b'0') as i32); }
+                let r = sched::set_oom_score_adj(pid, tid, if neg { -v } else { v });
+                return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
+            }
             if let Some(tid) = comm_tid {
                 let me = sched::euid_of(pid);
-                if me != 0 && me != sched::euid_of(tid) { return err_reply(-13); }
+                if !sched::host_root_of(pid) && me != sched::euid_of(tid) { return err_reply(-13); }
                 if sched::proc_stat_of(tid).is_none() { return err_reply(-3); } // ESRCH
                 let n = count.min(15);
                 let mut name = [0u8; 15];
@@ -9189,11 +9952,11 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
             }
             // Looked up before TMP_FILES is retaken, and only for a file
             // that has a set-ID bit to lose.
-            let fsuid = if setid { sched::fsuid_of(pid) } else { 0 };
+            let kcred = if setid { cred_of(pid) } else { xattr::Cred::ROOT };
             // RLIMIT_FSIZE (RUN_QUEUE: before the tmpfs locks).
             let fsize = sched::rlimit_of(pid, sched::task::RLIMIT_FSIZE);
             let mut tmp = TMP_FILES.lock();
-            if setid { tmp_kill_setid(&mut tmp, idx, fsuid); }
+            if setid { tmp_kill_setid(&mut tmp, idx, &kcred); }
             let mut vmos = TMP_VMOS.lock();
             // The starting offset is read under TMP_FILES and the shared one
             // advanced before it is released, so writers sharing a description
@@ -9214,12 +9977,49 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 want = want.min((fsize - cur as u64) as usize);
             }
             let len = tmp[idx].len;
+            // size= of a tmpfs mount: cap the write at the instance's limit.
+            if let Some(n) = mnt::ns0::tmpfs_inst_of(tmp[idx].path()) {
+                let limit = tmpfs_inst_attr(n).1;
+                if limit != 0 {
+                    let used = tmpfs_inst_used_pages(&*tmp, &vmos[..], n);
+                    let first = cur / 4096;
+                    let last = (cur + want.max(1) - 1) / 4096;
+                    let have = |p: usize| vmos[idx].as_ref().map_or(false, |v| v.page(p) != 0);
+                    let mut fresh = 0;
+                    for p in first..=last { if !have(p) { fresh += 1; } }
+                    if used + fresh > limit {
+                        // Fit what the remaining room allows, else ENOSPC.
+                        let room = limit.saturating_sub(used);
+                        let mut fit_end = cur;
+                        let mut p = first;
+                        let mut r = room;
+                        while p <= last {
+                            if !have(p) { if r == 0 { break; } r -= 1; }
+                            fit_end = (p + 1) * 4096;
+                            p += 1;
+                        }
+                        let allowed = fit_end.saturating_sub(cur).min(want);
+                        if allowed == 0 { return err_reply(-28); }
+                        want = allowed;
+                    }
+                }
+            }
             let vmo = vmos[idx].get_or_insert_with(|| { let mut v = TmpVmo::new_owned(false); v.len = len; v });
             // Pages are allocated as the bytes land (F_SEAL_WRITE/GROW are out
             // of scope — not enforced here). A borrowed (dmabuf) VMO never
             // grows: a write past the frames the DRM layer lent us is ENOSPC.
             // Writing past EOF leaves a hole; whatever stale bytes sit between
             // the old EOF and `cur` inside an existing page are zeroed first.
+            if vmo.is_memfd {
+                // memfd seals: WRITE / FUTURE_WRITE refuse every write, GROW
+                // refuses one that would extend the file (Linux: EPERM).
+                if vmo.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 && want > 0 {
+                    return err_reply(-1);
+                }
+                if vmo.seals & F_SEAL_GROW != 0 && cur + want > len && want > 0 {
+                    return err_reply(-1);
+                }
+            }
             if cur > len { vmo_zero_range(vmo, len, cur); }
             let n = match unsafe { vmo_copy_in(vmo, cur, buf, want, true) } {
                 Ok(n) => n,
@@ -9400,6 +10200,8 @@ fn handle_close(pid: u32, fd: usize) -> Message {
         VnodeKind::Pty { pair, is_master } => {
             tty_server::pty::drop_ref(pair as usize, is_master);
         }
+        VnodeKind::Mq { slot } => { mqueue::ref_dec(slot, pid); }
+        VnodeKind::BpfProg { id } => sched::bpfcg::prog_put(id),
         VnodeKind::EventFd { slot } => {
             // Refcounted: an eventfd is dup-able, so free the pool slot only when
             // the last fd sharing it closes. Freeing early let a later eventfd()
@@ -9948,6 +10750,7 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
         VnodeKind::Pty { pair, is_master } => {
             tty_server::pty::drop_ref(pair as usize, is_master);
         }
+        VnodeKind::Mq { slot } => { mqueue::ref_dec(slot, pid); }
         VnodeKind::EventFd { slot } => {
             // Only free the slot when the LAST dup of this eventfd closes;
             // otherwise a surviving dup keeps using a counter a new eventfd
@@ -10393,7 +11196,13 @@ fn handle_fcntl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
             if let VnodeKind::TmpFile { idx, .. } = kind {
                 let mut vmos = TMP_VMOS.lock();
                 match vmos[idx].as_mut() {
-                    Some(vmo) if vmo.is_memfd => { vmo.seals |= arg as u32; ok_reply() }
+                    Some(vmo) if vmo.is_memfd => {
+                        // Linux memfd_add_seals: no new seals once F_SEAL_SEAL is
+                        // set; unknown bits are EINVAL.
+                        if arg as u32 & !F_SEAL_KNOWN != 0 { return err_reply(-22); }
+                        if vmo.seals & F_SEAL_SEAL != 0 { return err_reply(-1); } // EPERM
+                        vmo.seals |= arg as u32; ok_reply()
+                    }
                     _ => err_reply(-22), // EINVAL — not a memfd
                 }
             } else { err_reply(-22) }
@@ -10584,6 +11393,38 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     // A synthesized sysfs directory has no path to walk and no static table to
     // sweep — the block registry is enumerated directly. Handled here rather
     // than in the sweeps below because nothing in them applies.
+    if let VnodeKind::SysBlock { dev, .. } = tbl.fds[fd].kind {
+      if cgroupfs::is_dev(dev) {
+        let list = cgroupfs::entries(cgroupfs::dev_cg(dev));
+        let buf = buf_ptr as *mut u8;
+        let mut off = 0usize;
+        let mut cur = desc_pos(&tbl.fds[fd]);
+        loop {
+            let (name, is_dir, ino): (&[u8], bool, u64) = if cur == 0 { (b".", true, 1) }
+                else if cur == 1 { (b"..", true, 1) }
+                else { match list.get(cur - 2) {
+                    Some((n, d)) => (n.as_bytes(), *d, 0x6100_0000 + cur as u64),
+                    None => break,
+                } };
+            let nlen = name.len();
+            let reclen = ((8 + 8 + 2 + 1 + nlen + 1) + 7) & !7;
+            if off + reclen > count { break; }
+            unsafe {
+                let p = buf.add(off);
+                core::ptr::write(p as *mut u64, ino);
+                core::ptr::write(p.add(8) as *mut u64, 0u64);
+                core::ptr::write(p.add(16) as *mut u16, reclen as u16);
+                *p.add(18) = if is_dir { 4 } else { 8 };
+                core::ptr::copy_nonoverlapping(name.as_ptr(), p.add(19), nlen);
+                *p.add(19 + nlen) = 0;
+            }
+            off += reclen;
+            cur += 1;
+        }
+        set_dir_pos(&mut tbl.fds[fd], cur);
+        return val_reply(off as u64);
+      }
+    }
     if let VnodeKind::SysBlock { dev, level, .. } = tbl.fds[fd].kind {
         let (dev, level) = (dev, level);
         let buf = buf_ptr as *mut u8;
@@ -10785,7 +11626,8 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         for c in tmp.children_from(dir_path, pos - 2) {
             let e = &tmp[c];
             let d_type = if e.is_dir { 4 } else if e.is_fifo { 1 } else if e.is_link { 10 }
-                         else if e.is_sock { 12 } else { 8 };
+                         else if e.is_sock { 12 } else if e.devtype == 1 { 2 }
+                         else if e.devtype == 2 { 6 } else { 8 };
             match write_dirent(buf, off, count, 400 + c as u64, &e.path()[dir_len + 1..], d_type) {
                 Some(r) => off += r,
                 None => { i = c; break; }
@@ -10801,7 +11643,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
 
     // RAMFS directories
     for &child_dir in RAMFS_DIRS {
-        if child_dir == dir_path || child_dir == VOID_ROOT { continue; }
+        if child_dir == dir_path || child_dir == VOID_ROOT || child_dir == mnt::SB_ROOT { continue; }
         let is_root = dir_path == b"/";
         let is_child = if is_root {
             child_dir.len() > 1 && child_dir[0] == b'/' && !child_dir[1..].contains(&b'/')
@@ -10879,12 +11721,12 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     // Live pty slaves (/dev/pts). The pool is the only source of truth here —
     // there is no static table to walk — and `ls /dev/pts` is how a user (and
     // ttyname's fallback scan) finds which pairs exist.
-    if dir_path == b"/dev/pts" {
+    if let Some(dinst) = devpts::dir_inst(dir_path) {
         // Snapshot under the pool lock, then emit: write_dirent touches user
         // memory, which can demand-page, and a fault taken while holding a
         // server spinlock re-enters the scheduler (see the 82d0cc3 rule).
         let mut live = [false; tty_server::pty::MAX_PTYS];
-        tty_server::pty::each_allocated(|n| { if n < live.len() { live[n] = true; } });
+        tty_server::pty::each_in(dinst, |n| { if n < live.len() { live[n] = true; } });
         for (n, &alive) in live.iter().enumerate() {
             if !alive { continue; }
             if virtual_idx >= pos {
@@ -10897,6 +11739,21 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                 };
                 if let Some(r) = write_dirent(buf, off, count, pty_ino(n as u16, false),
                                               &name[..nlen], 2 /* DT_CHR */) {
+                    off += r; pos += 1;
+                } else {
+                    set_dir_pos(&mut tbl.fds[fd], pos);
+                    return val_reply(off as u64);
+                }
+            }
+            virtual_idx += 1;
+        }
+    }
+
+    // POSIX message queues of the caller's IPC namespace.
+    if dir_path == b"/dev/mqueue" {
+        for (name, ino) in mqueue::list(pid) {
+            if virtual_idx >= pos {
+                if let Some(r) = write_dirent(buf, off, count, ino, &name, 8 /* DT_REG */) {
                     off += r; pos += 1;
                 } else {
                     set_dir_pos(&mut tbl.fds[fd], pos);
@@ -10931,6 +11788,8 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                              else if e.is_fifo { 1 }
                              else if e.is_link { 10 }
                              else if e.is_sock { 12 } // DT_SOCK
+                             else if e.devtype == 1 { 2 } // DT_CHR
+                             else if e.devtype == 2 { 6 } // DT_BLK
                              else { 8 };
                 if let Some(r) = write_dirent(buf, off, count, 400 + i as u64, name, d_type) {
                     off += r; pos += 1;
@@ -11255,6 +12114,42 @@ pub fn install_pidfd(pid: u32, target: u32, flags: u32) -> isize {
     fd as isize
 }
 
+/// Install a bpf program fd for program `id` (the caller's reference moves to
+/// the fd). Always close-on-exec, as on Linux. On failure the reference stays
+/// with the caller.
+pub fn install_bpf_prog(pid: u32, id: u32) -> isize {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return -23 };
+    let fd = match tbl.alloc_fd() { Some(f) => f, None => return -24 };
+    tbl.fds.set(fd, FdEntry { kind: VnodeKind::BpfProg { id }, flags: O_CLOEXEC, in_use: true, ofd: ofd::alloc() });
+    fd as isize
+}
+
+/// The program a bpf fd names: `Ok(id)`, `Err(-9)` for a closed fd, `Err(-22)`
+/// for an open fd that is not a bpf program.
+pub fn bpf_prog_of_fd(pid: u32, fd: usize) -> Result<u32, i32> {
+    if fd >= FD_NUMBER_CEIL { return Err(-9); }
+    let pid = sched::tgid_of(pid);
+    let kind = with_tbl(pid, |t| t.fds.get(fd).map(|e| e.kind)).flatten().ok_or(-9)?;
+    match kind { VnodeKind::BpfProg { id } => Ok(id), _ => Err(-22) }
+}
+
+/// The live cgroup a directory fd names (bpf attach target): `Ok(cg)`, or
+/// `Err(-9)` for a closed fd / anything that is not a cgroupfs directory.
+pub fn cgroup_of_fd(pid: u32, fd: usize) -> Result<sched::cgroup::CgId, i32> {
+    if fd >= FD_NUMBER_CEIL { return Err(-9); }
+    let pid = sched::tgid_of(pid);
+    let kind = with_tbl(pid, |t| t.fds.get(fd).map(|e| e.kind)).flatten().ok_or(-9)?;
+    match kind {
+        VnodeKind::SysBlock { dev, .. } if cgroupfs::is_dev(dev) => {
+            let cg = cgroupfs::dev_cg(dev);
+            if sched::cgroup::alive(cg) { Ok(cg) } else { Err(-9) }
+        }
+        _ => Err(-9),
+    }
+}
+
 /// Point pidfd `fd` of process `pid` at `target`. clone(CLONE_PIDFD) reserves
 /// the descriptor (naming pid 0) before the child exists, so a full table
 /// fails the clone instead of orphaning a child, and names the child here.
@@ -11280,6 +12175,76 @@ pub fn pidfd_target(pid: u32, fd: usize) -> Result<u32, i32> {
     match kind {
         VnodeKind::PidFd { pid } => Ok(pid),
         _ => Err(-22),
+    }
+}
+
+pub(crate) fn sched_ns_put(id: u16) { sched::ns::put_raw(id); }
+
+/// bind(2)-style mount of /proc/<pid>/ns/<name>: take a reference on that
+/// namespace and return the synthetic source the alias mount stands for
+/// (see `mnt::ns0::NS_SRC`). `Ok(None)` when `path` is not an nsfs file.
+pub fn nsfs_bind_source(path: &[u8], caller: u32) -> Result<Option<Vec<u8>>, isize> {
+    let Some(r) = proc_ns_file(path, caller) else { return Ok(None) };
+    let Some((tpid, k)) = r else { return Err(-2) };
+    let pr = sched::cred::ptrace_read_check(caller, tpid);
+    if pr != 0 { return Err(pr as isize); }
+    let Some(id) = sched::ns::grab(tpid, k) else { return Err(-2) };
+    let mut v = alias::NS_SRC.to_vec();
+    push_dec(&mut v, k as u32); v.push(b'/'); push_dec(&mut v, id as u32);
+    Ok(Some(v))
+}
+fn push_dec(v: &mut Vec<u8>, mut n: u32) {
+    let mut d = [0u8; 10]; let mut i = 0;
+    loop { d[i] = b'0' + (n % 10) as u8; i += 1; n /= 10; if n == 0 { break; } }
+    while i > 0 { i -= 1; v.push(d[i]); }
+}
+
+/// The namespace an nsfs-like fd names: `Ok((kind, id))`, `Err(-9)` closed,
+/// `Err(-22)` an open fd of another kind.
+pub fn nsfd_target(pid: u32, fd: usize) -> Result<(u8, u16), i32> {
+    if fd >= FD_NUMBER_CEIL { return Err(-9); }
+    let pid = sched::tgid_of(pid);
+    let kind = with_tbl(pid, |t| t.fds.get(fd).map(|e| e.kind)).flatten().ok_or(-9)?;
+    match kind {
+        VnodeKind::NsFd { kind, id } => Ok((kind, id)),
+        _ => Err(-22),
+    }
+}
+
+/// Install an nsfs-like fd for namespace `id` of link `kind`, taking a reference.
+fn install_nsfd(pid: u32, kind: u8, id: u16) -> isize {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return -23 };
+    let fd = match tbl.alloc_fd() { Some(f) => f, None => return -24 };
+    sched::ns::hold_raw(id);
+    tbl.fds.set(fd, FdEntry { kind: VnodeKind::NsFd { kind, id }, flags: O_CLOEXEC, in_use: true, ofd: ofd::alloc() });
+    fd as isize
+}
+
+/// ioctl on an nsfs-like fd: NS_GET_USERNS / NS_GET_PARENT / NS_GET_NSTYPE /
+/// NS_GET_OWNER_UID.
+fn ns_ioctl(pid: u32, kind: u8, id: u16, cmd: usize, arg: usize) -> isize {
+    let k = kind as usize;
+    match cmd {
+        0xb701 => { // NS_GET_USERNS: the owning user namespace (the parent of a user namespace)
+            if k == 0 && id == 0 { return -1; }
+            install_nsfd(pid, 0, sched::ns::owner_userns(k, id))
+        }
+        0xb702 => { // NS_GET_PARENT: user and pid namespaces only
+            if !matches!(k, 0 | 1 | 7) { return -22; }
+            if id == 0 { return -1; }
+            install_nsfd(pid, if k == 0 { 0 } else { 1 }, sched::ns::parent(id))
+        }
+        0xb703 => sched::ns::clone_flag(k) as isize,
+        0xb704 => { // NS_GET_OWNER_UID
+            if k != 0 { return -22; }
+            let uid = sched::ns::view_id(0, sched::ns::owner(id).0);
+            if arg == 0 { return -14; }
+            unsafe { sched::uaccess::copy_raw(arg as *mut u8, &uid as *const u32 as *const u8, 4); }
+            0
+        }
+        _ => -25,
     }
 }
 
@@ -11633,6 +12598,10 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
     // table lock is dropped first: LOOP_SET_FD re-enters this server to
     // resolve and open the backing file, and every arm touches user memory
     // through `arg`, which must be able to demand-page.
+    if let VnodeKind::NsFd { kind, id } = tbl.fds[fd].kind {
+        drop(tbls);
+        return make_reply(ns_ioctl(pid, kind, id, cmd, arg) as i64);
+    }
     if let VnodeKind::BlockDev { dev, .. } = tbl.fds[fd].kind {
         let ofd_id = tbl.fds[fd].ofd;
         drop(tbls);
@@ -11800,6 +12769,7 @@ fn poll_vnode_key(kind: &VnodeKind) -> Option<u64> {
     match kind {
         VnodeKind::Pipe { ring, is_write } => Some(pipe_end_key(*ring, *is_write)),
         VnodeKind::EventFd { slot } => Some(eventfd_key(*slot)),
+        VnodeKind::Mq { slot } => Some(mqueue::key(*slot)),
         VnodeKind::TimerFd { slot } => Some(timerfd_key(*slot)),
         // Exit / reap wake it keyed (sched exit paths, pidfd_reaped_wake).
         VnodeKind::PidFd { pid } => Some(sched::poll_key(sched::poll_class::PIDFD, *pid)),
@@ -11878,6 +12848,11 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             // has no producer because there is nothing to announce.
             (POLLIN | POLLOUT, 0, static_poll_tag())
         }
+        VnodeKind::Mq { slot } => {
+            let s = *slot;
+            let (r, w, seq) = mqueue::readiness(s);
+            (if r { POLLIN } else { 0 } | if w { POLLOUT } else { 0 }, seq, sched::poll_tag(sched::poll_class::MQ, s as u32))
+        }
         VnodeKind::EventFd { slot } => {
             let s = *slot;
             let mut ev = POLLOUT; // only EINVAL's on overflow, never actually blocks
@@ -11924,6 +12899,7 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             let ev = if reaped { POLLIN | POLLHUP } else if exited { POLLIN } else { 0 };
             (ev, exited as u64, sched::poll_tag(sched::poll_class::PIDFD, pid))
         }
+        VnodeKind::NsFd { .. } | VnodeKind::BpfProg { .. } => (0, 0, sched::poll_tag(sched::poll_class::PIDFD, 0)),
         VnodeKind::Inotify { .. } => {
             // Never fires: accepted watches silently produce no events. Its
             // own tag, not the broadcast mask — with POLL_TAG_ALL every event
@@ -12015,13 +12991,13 @@ fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => {
             drop(tbls);
-            let fsuid = sched::fsuid_of(pid);
+            let kcred = cred_of(pid);
             let mapped = vmo_id_of(idx);
             let mut tmp = TMP_FILES.lock();
             let mut vmos = TMP_VMOS.lock();
             let r = tmp_set_size(&mut tmp, &mut vmos[..], idx, new_len);
             if r != 0 { return make_reply(r); }
-            tmp_kill_setid(&mut tmp, idx, fsuid);
+            tmp_kill_setid(&mut tmp, idx, &kcred);
             tmp_touch_mtime(&mut tmp[idx]);
             drop(vmos);
             drop(tmp);
@@ -12079,12 +13055,12 @@ fn handle_fallocate(pid: u32, fd: usize, mode: u32, offset: i64, len: i64) -> Me
     match kind {
         VnodeKind::TmpFile { writable, .. } => {
             let idx = tmp_idx_of(&kind);
-            let fsuid = sched::fsuid_of(pid);
+            let kcred = cred_of(pid);
             let mut tmp = TMP_FILES.lock();
             if tmp[idx].is_dir { return err_reply(-21); } // EISDIR
             if !writable { return err_reply(-9); }
             if end > MAX_TMP_FILE_SIZE { return err_reply(-27); } // EFBIG
-            tmp_kill_setid(&mut tmp, idx, fsuid); // Linux file_modified
+            tmp_kill_setid(&mut tmp, idx, &kcred); // Linux file_modified
             let mut vmos = TMP_VMOS.lock();
             let len = tmp[idx].len;
             let vmo = vmos[idx].get_or_insert_with(|| { let mut v = TmpVmo::new_owned(false); v.len = len; v });
@@ -12275,7 +13251,7 @@ fn tmpfs_rename(pid: u32, old: &[u8], new: &[u8], flags: usize) -> Message {
     // implicit removal of an existing target.
     if let Some(didx) = tmp_find(&tmp, new) {
         if flags & RENAME_NOREPLACE != 0 { return err_reply(-17); } // EEXIST
-        if tmp_sticky_denies(&tmp, parent, didx, cred.euid) { return err_reply(-1); } // EPERM
+        if tmp_sticky_denies(&tmp, parent, didx, &cred) { return err_reply(-1); } // EPERM
         let dst_is_dir = tmp[didx].is_dir;
         if src_is_dir && !dst_is_dir { return err_reply(-20); }  // ENOTDIR
         if !src_is_dir && dst_is_dir { return err_reply(-21); }  // EISDIR
@@ -12338,6 +13314,11 @@ fn handle_unlink(pid: u32, path_ptr: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
 
+    if cgroupfs::is_path(strip_trailing_slash(raw)) { return err_reply(-1); } // EPERM
+    if let Some(name) = mqueue::path_name(strip_trailing_slash(raw)) {
+        let r = mqueue::unlink(pid, name);
+        return if r < 0 { err_reply(r as i32) } else { ok_reply() };
+    }
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-21); } // EISDIR — mount root
         let cred = cred_of(pid);
@@ -12382,6 +13363,11 @@ fn handle_unlink(pid: u32, path_ptr: usize) -> Message {
 fn handle_mkdir(pid: u32, path_ptr: usize, mode: u32) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
+
+    if cgroupfs::is_path(strip_trailing_slash(raw)) {
+        let r = cgroupfs::mkdir(pid, strip_trailing_slash(raw));
+        return if r < 0 { err_reply(r as i32) } else { ok_reply() };
+    }
 
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-17); }              // EEXIST — mount root
@@ -12430,12 +13416,16 @@ fn handle_mkdir(pid: u32, path_ptr: usize, mode: u32) -> Message {
 /// behaves like an empty regular file (no blocking open, no rendezvous
 /// between reader and writer). Real FIFO semantics would need their own
 /// vnode kind, the way `Pipe` already has one.
-fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
+fn handle_mknod(pid: u32, path_ptr: usize, mode: u32, dev: u64) -> Message {
     const S_IFMT:  u32 = 0o170000;
+    const S_IFCHR: u32 = 0o020000;
+    const S_IFBLK: u32 = 0o060000;
     const S_IFIFO: u32 = 0o010000;
+    const S_IFSOCK: u32 = 0o140000;
 
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
+    let ftype = mode & S_IFMT;
 
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-17); }              // EEXIST — mount root
@@ -12449,7 +13439,17 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
         };
         tmp.claim(idx, path, false);
         tmp[idx].is_dir  = false;
-        tmp[idx].is_fifo = mode & S_IFMT == S_IFIFO;
+        tmp[idx].is_fifo = ftype == S_IFIFO;
+        if ftype == S_IFSOCK {
+            // A bare socket node (no listener): connect() finds it but
+            // there is nothing behind it -> ECONNREFUSED.
+            tmp[idx].is_sock = true;
+            tmp[idx].sock_id = u64::MAX;
+        }
+        if ftype == S_IFCHR || ftype == S_IFBLK {
+            tmp[idx].devtype = if ftype == S_IFCHR { 1 } else { 2 };
+            tmp[idx].rdev    = dev as u32;
+        }
         tmp[idx].uid  = cred.euid;
         tmp[idx].gid  = cred.egid;
         // mknod's mode arrives unpacked (it carries the S_IFMT type bits).
@@ -12457,8 +13457,71 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
                          sched::umask(u32::MAX) as u16, false);
         return ok_reply();
     }
+    if let Some(port) = find_mount_port(raw) {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_MKNOD;
+        proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+        // The server gets the S_IFMT bits plus the caller's umask packed
+        // above bit 16 (see `xattr::pack_create_mode`); the type sits at
+        // bits 12..16 of `mode`, which the packed word's 0o7777 mask would
+        // drop, so it travels in its own word.
+        let packed = xattr::pack_create_mode(mode & 0o7777, sched::umask(u32::MAX));
+        proxy.data[8..16].copy_from_slice(&packed.to_le_bytes());
+        proxy.data[16..24].copy_from_slice(&((ftype >> 12) as u64).to_le_bytes());
+        proxy.data[24..32].copy_from_slice(&dev.to_le_bytes());
+        return call_port(port, proxy);
+    }
     for &dir in RAMFS_DIRS { if raw == dir { return err_reply(-17); } }
     err_reply(-30) // EROFS
+}
+
+
+/// f2fs (and any mount server) answers an open of a character/block device
+/// node with `-(DEVNODE_BASE + (is_blk << 32 | rdev))`: the node's driver
+/// lives in the VFS, not in the filesystem.
+const DEVNODE_BASE: i64 = 1 << 40;
+
+/// Finish an open of an on-disk device node: find the driver that owns
+/// `rdev` and re-enter `handle_open` on its /dev name. Unknown numbers (and
+/// the whiteout 0:0) are ENXIO, as on Linux.
+fn devnode_open(pid: u32, is_blk: bool, rdev: u32, flags: u32, mode: u32) -> Message {
+    let (major, minor) = dev_major_minor(rdev as u64);
+    let mut buf: Vec<u8> = Vec::new();
+    if is_blk {
+        if !block::path_for_rdev(major, minor, &mut buf) { return err_reply(-6); }
+    } else {
+        let fixed: Option<&[u8]> = match (major, minor) {
+            (1, 3) => Some(b"/dev/null"), (1, 5) => Some(b"/dev/zero"),
+            (1, 8) => Some(b"/dev/random"), (1, 9) => Some(b"/dev/urandom"),
+            (5, 0) => Some(b"/dev/tty"), (5, 1) => Some(b"/dev/console"),
+            (5, 2) => Some(b"/dev/ptmx"), (29, 0) => Some(b"/dev/fb0"),
+            _ => None,
+        };
+        if let Some(p) = fixed {
+            buf.extend_from_slice(p);
+        } else if major == 4 && (1..=63).contains(&minor) {
+            buf.extend_from_slice(b"/dev/tty");
+            push_decimal(&mut buf, minor);
+        } else if major >= 136 && major <= 143 {
+            buf.extend_from_slice(b"/dev/pts/");
+            push_decimal(&mut buf, (major - 136) * 256 + minor);
+        } else {
+            let devices = DYNAMIC_DEVICES.lock();
+            match devices.iter().find(|d| d.in_use && d.major == major && d.minor == minor && (major, minor) != (0, 0)) {
+                Some(d) => buf.extend_from_slice(d.path.as_bytes()),
+                None => return err_reply(-6), // ENXIO
+            }
+        }
+    }
+    buf.push(0);
+    handle_open(pid, buf.as_ptr() as usize, flags, mode)
+}
+
+fn push_decimal(buf: &mut Vec<u8>, mut n: u32) {
+    let mut tmp = [0u8; 10];
+    let mut i = tmp.len();
+    loop { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; if n == 0 { break; } }
+    buf.extend_from_slice(&tmp[i..]);
 }
 
 // ── AF_UNIX socket nodes (called from the net server) ────────────────────────
@@ -12473,8 +13536,10 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
 /// component is created literally (bind does not follow a trailing symlink).
 ///
 /// 0 on success, else a negative errno: -17 EEXIST (net → EADDRINUSE), -2
-/// ENOENT (missing parent), -36 ENAMETOOLONG, -28 ENOSPC, -95 EOPNOTSUPP (not
-/// a tmpfs path — f2fs socket binds are unsupported).
+/// ENOENT (missing parent), -36 ENAMETOOLONG, -28 ENOSPC, -95 EOPNOTSUPP (the
+/// path is on no mount server). Sockets on mounted filesystems (f2fs) are a
+/// real S_IFSOCK inode plus an in-memory (path, inode) -> listener table
+/// (`mounted_sock_bind`).
 pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
     let resolved = match tmp_resolve_links(path, false) {
         Ok(v)  => v,
@@ -12483,7 +13548,7 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
     let rpath = &resolved[..];
     let tpath = match tmpfs_path(rpath) {
         Some(p) => p,
-        None    => return -95, // EOPNOTSUPP — sockets only bind on tmpfs
+        None    => return mounted_sock_bind(rpath, sock_id),
     };
     if is_tmpfs_root(tpath) { return -17; }             // EEXIST — the mount root
     if tpath.len() > MAX_TMP_PATH - 1 { return -36; }   // ENAMETOOLONG
@@ -12501,6 +13566,97 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
     tmp[idx].gid  = cred.egid;
     tmp_init_created(&mut tmp, idx, tpath, 0o777, sched::umask(u32::MAX) as u16, false);
     0
+}
+
+// ── AF_UNIX sockets on mounted filesystems ───────────────────────────────────
+//
+// bind() makes a real S_IFSOCK inode through the mount server (permission and
+// EEXIST checks are the server's own mknod gate), then records which listener
+// it belongs to. The listener identity lives only in memory, so after a reboot
+// the node is a stale socket file: connect finds the inode but no listener
+// (ECONNREFUSED), as on Linux. unlink needs no hook: connect re-stats the path
+// and only honours an entry whose inode number still matches.
+
+/// (mount-server path, st_ino, net sock_id)
+static MOUNTED_SOCKS: Mutex<Vec<(Vec<u8>, u64, u64)>> = Mutex::new(Vec::new());
+const MOUNTED_SOCKS_MAX: usize = 1024;
+
+/// lstat `path` on its mount server: (mode, uid, gid, ino) or -errno.
+fn mounted_lstat(port: u32, path: &[u8]) -> Result<(u32, u32, u32, u64), i32> {
+    let mut pb: Vec<u8> = Vec::new();
+    if pb.try_reserve_exact(path.len() + 1).is_err() { return Err(-12); }
+    pb.extend_from_slice(path);
+    pb.push(0);
+    let mut st = [0u64; 24];
+    let mut m = Message::empty();
+    m.tag = VFS_LSTAT;
+    m.data[0..8].copy_from_slice(&(pb.as_ptr() as u64).to_le_bytes());
+    m.data[8..16].copy_from_slice(&(st.as_mut_ptr() as u64).to_le_bytes());
+    let r = reply_val(&call_port(port, m));
+    if r < 0 { return Err(r as i32); }
+    let p = st.as_ptr() as *const u8;
+    unsafe {
+        let ino = (p.add(8) as *const u64).read_unaligned();
+        #[cfg(target_arch = "x86_64")]
+        let (mode, uid, gid) = ((p.add(24) as *const u32).read_unaligned(),
+            (p.add(28) as *const u32).read_unaligned(), (p.add(32) as *const u32).read_unaligned());
+        #[cfg(not(target_arch = "x86_64"))]
+        let (mode, uid, gid) = ((p.add(16) as *const u32).read_unaligned(),
+            (p.add(24) as *const u32).read_unaligned(), (p.add(28) as *const u32).read_unaligned());
+        Ok((mode, uid, gid, ino))
+    }
+}
+
+fn mounted_sock_bind(rpath: &[u8], sock_id: u64) -> i32 {
+    let port = match find_mount_port(rpath) { Some(p) => p, None => return -95 };
+    if rpath.len() >= PATH_MAX { return -36; }
+    let mut pb: Vec<u8> = Vec::new();
+    if pb.try_reserve_exact(rpath.len() + 1).is_err() { return -12; }
+    pb.extend_from_slice(rpath);
+    pb.push(0);
+    let packed = xattr::pack_create_mode(0o777, sched::umask(u32::MAX));
+    let mut m = Message::empty();
+    m.tag = VFS_MKNOD;
+    m.data[0..8].copy_from_slice(&(pb.as_ptr() as u64).to_le_bytes());
+    m.data[8..16].copy_from_slice(&packed.to_le_bytes());
+    m.data[16..24].copy_from_slice(&((0o140000u32 >> 12) as u64).to_le_bytes());
+    m.data[24..32].copy_from_slice(&0u64.to_le_bytes());
+    let r = reply_val(&call_port(port, m));
+    if r < 0 { return r as i32; } // -17 EEXIST, -2 ENOENT, -13 EACCES, -28 ENOSPC...
+    let ino = match mounted_lstat(port, rpath) { Ok((_, _, _, i)) => i, Err(e) => return e };
+    let mut t = MOUNTED_SOCKS.lock();
+    t.retain(|e| e.0 != rpath);
+    if t.len() >= MOUNTED_SOCKS_MAX {
+        // Drop entries whose node is gone or was replaced.
+        let snap: Vec<(Vec<u8>, u64, u64)> = core::mem::take(&mut *t);
+        drop(t);
+        let keep: Vec<_> = snap.into_iter().filter(|e| {
+            find_mount_port(&e.0).map_or(false, |p| matches!(mounted_lstat(p, &e.0), Ok((_, _, _, i)) if i == e.1))
+        }).collect();
+        t = MOUNTED_SOCKS.lock();
+        t.extend(keep);
+        if t.len() >= MOUNTED_SOCKS_MAX { return -28; }
+    }
+    t.push((rpath.to_vec(), ino, sock_id));
+    0
+}
+
+fn mounted_sock_resolve(pid: u32, rpath: &[u8]) -> i64 {
+    let port = match find_mount_port(rpath) { Some(p) => p, None => return -2 };
+    let (mode, uid, gid, ino) = match mounted_lstat(port, rpath) { Ok(v) => v, Err(e) => return e as i64 };
+    if mode & 0o170000 != 0o140000 { return -111; } // exists, not a socket
+    let cred = cred_of(pid);
+    if cred.euid != 0 {
+        let bits = if cred.euid == uid { (mode >> 6) & 7 }
+                   else if cred.egid == gid { (mode >> 3) & 7 } else { mode & 7 };
+        if bits & 2 == 0 { return -13; } // connect needs write on the socket inode
+    }
+    let mut t = MOUNTED_SOCKS.lock();
+    match t.iter().position(|e| e.0 == rpath) {
+        Some(i) if t[i].1 == ino => t[i].2 as i64,
+        Some(i) => { t.swap_remove(i); -111 } // replaced node
+        None => -111,                         // stale node: no listener
+    }
 }
 
 /// connect(): resolve `path` (following symlinks on every component) to the
@@ -12524,14 +13680,15 @@ pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 {
     let rpath = &resolved[..];
     let tpath = match tmpfs_path(rpath) {
         Some(p) => p,
-        None    => return -2, // ENOENT — no socket can exist off-tmpfs
+        None    => return mounted_sock_resolve(pid, rpath),
     };
     let cred = cred_of(pid);
     let tmp = TMP_FILES.lock();
     match tmp_find(&tmp, tpath) {
         Some(idx) if tmp[idx].is_sock => {
             if !tmp_may(&tmp, idx, &cred, xattr::MAY_WRITE) { return -13; } // EACCES
-            tmp[tmp_owner(&tmp, idx)].sock_id as i64
+            let sid = tmp[tmp_owner(&tmp, idx)].sock_id;
+            if sid == u64::MAX { -111 } else { sid as i64 } // mknod'ed node: no listener
         }
         Some(_) => -111, // exists, not a socket → ECONNREFUSED
         None    => -2,   // ENOENT
@@ -12680,7 +13837,7 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
             if let Err(e) = tmp_create_gate(&tmp, new, &cred) { return err_reply(e); }
             let owner = tmp_owner(&tmp, src);
             let may_rw = tmp_may(&tmp, src, &cred, xattr::MAY_READ | xattr::MAY_WRITE);
-            if xattr::hardlink_denied(&tmp_meta(&tmp[owner]), cred.euid, may_rw) {
+            if xattr::hardlink_denied_c(&tmp_meta(&tmp[owner]), &cred, may_rw) {
                 return err_reply(-1); // EPERM — protected_hardlinks
             }
             let idx = match tmp_free_slot(&mut *tmp) {
@@ -12697,6 +13854,8 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
             tmp[idx].is_link = tmp[owner].is_link;
             tmp[idx].is_sock = tmp[owner].is_sock;
             tmp[idx].sock_id = tmp[owner].sock_id;
+            tmp[idx].devtype = tmp[owner].devtype;
+            tmp[idx].rdev    = tmp[owner].rdev;
             tmp[idx].mode    = tmp[owner].mode;
             tmp[idx].uid     = tmp[owner].uid;
             tmp[idx].gid     = tmp[owner].gid;
@@ -12724,6 +13883,11 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
 fn handle_rmdir(pid: u32, path_ptr: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
+
+    if cgroupfs::is_path(strip_trailing_slash(raw)) {
+        let r = cgroupfs::rmdir(pid, strip_trailing_slash(raw));
+        return if r < 0 { err_reply(r as i32) } else { ok_reply() };
+    }
 
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-16); } // EBUSY — mount root
@@ -12771,19 +13935,21 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
     // find_mount_port() probe here matched every /tmp path and turned every
     // chmod under /tmp into EROFS.
     if let Some(path) = tmpfs_path(raw) {
-        let euid = sched::fsuid_of(pid);
+        let cred = cred_of(pid);
         // A tmpfs mount root is root-owned with a fixed mode: anyone else is
         // EPERM (not the owner), and root may only "set" the mode it has.
+        // HOST root only (design idmap 2.3): never a namespace root.
         if is_tmpfs_root(path) {
             let cur = ramfs_dir_mode(path) & 0o7777;
-            return if euid == 0 && mode & 0o7777 == cur { ok_reply() } else { err_reply(-1) };
+            return if cred.host_root && mode & 0o7777 == cur { ok_reply() } else { err_reply(-1) };
         }
         let mut tmp = TMP_FILES.lock();
         return match tmp_find(&tmp, path) {
             Some(idx) => {
                 let owner = tmp_owner(&tmp, idx);
-                if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
-                let mode = xattr::chmod_filter_mode(&cred_of(pid), tmp[owner].gid, mode);
+                let om = tmp_meta(&tmp[owner]);
+                if cred.euid != om.uid && !cred.cap_inode(xattr::CAP_FOWNER, om.uid, om.gid) { return err_reply(-1); } // EPERM
+                let mode = xattr::chmod_filter_mode_c(&cred, &om, mode);
                 tmp[owner].mode = mode & 0o7777;
                 tmp_acl_chmod_sync(&mut tmp, owner, mode);
                 tmp_touch_ctime(&mut tmp[owner]);
@@ -12814,11 +13980,12 @@ fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => {
             drop(tbls);
-            let euid = sched::fsuid_of(pid);
+            let cred = cred_of(pid);
             let mut tmp = TMP_FILES.lock();
             let owner = tmp_owner(&tmp, idx);
-            if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
-            let mode = xattr::chmod_filter_mode(&cred_of(pid), tmp[owner].gid, mode);
+            let om = tmp_meta(&tmp[owner]);
+            if cred.euid != om.uid && !cred.cap_inode(xattr::CAP_FOWNER, om.uid, om.gid) { return err_reply(-1); } // EPERM
+            let mode = xattr::chmod_filter_mode_c(&cred, &om, mode);
             tmp[owner].mode = mode & 0o7777;
             tmp_acl_chmod_sync(&mut tmp, owner, mode);
             tmp_touch_ctime(&mut tmp[owner]);
@@ -12846,12 +14013,16 @@ fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
 fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32, follow: bool) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
+    if cgroupfs::is_path(strip_trailing_slash(raw)) {
+        let r = cgroupfs::chown(pid, strip_trailing_slash(raw), uid, gid);
+        return if r < 0 { err_reply(r as i32) } else { ok_reply() };
+    }
     if let Some(path) = tmpfs_path(raw) {
         let cred = cred_of(pid);
         // Mount roots: root:root and fixed (see handle_chmod).
         if is_tmpfs_root(path) {
             let same = (uid == u32::MAX || uid == 0) && (gid == u32::MAX || gid == 0);
-            return if cred.euid == 0 && same { ok_reply() } else { err_reply(-1) };
+            return if cred.host_root && same { ok_reply() } else { err_reply(-1) }; // host root only
         }
         let mut tmp = TMP_FILES.lock();
         return match tmp_find(&tmp, path) {
@@ -12906,10 +14077,13 @@ fn handle_fchown(pid: u32, fd: usize, uid: u32, gid: u32) -> Message {
 /// change the gid only to a group it belongs to, which with no supplementary
 /// groups means its egid; anyone else is EPERM. All-or-nothing.
 fn apply_chown(e: &mut TmpFileEntry, cred: &xattr::Cred, uid: u32, gid: u32) -> Message {
-    if cred.euid != 0 {
+    // Linux chown_ok/chgrp_ok: CAP_CHOWN over the inode (held in the caller's
+    // user namespace, owner and group of the inode mapped there), else the
+    // owner restating its uid and moving the group to one of its own.
+    if !cred.cap_inode(xattr::CAP_CHOWN, e.uid, e.gid) {
         if cred.euid != e.uid { return err_reply(-1); }                // EPERM
         if uid != u32::MAX && uid != e.uid { return err_reply(-1); }
-        if gid != u32::MAX && !cred.in_group(gid) { return err_reply(-1); }
+        if gid != u32::MAX && gid != e.gid && !cred.in_group(gid) { return err_reply(-1); }
     }
     if uid != u32::MAX { e.uid = uid; }
     if gid != u32::MAX { e.gid = gid; }
@@ -12923,7 +14097,7 @@ fn apply_chown(e: &mut TmpFileEntry, cred: &xattr::Cred, uid: u32, gid: u32) -> 
 /// needs ownership or root (EPERM); "now" needs ownership, root, or write
 /// permission on the inode (EACCES). Returns the errno to reply with, or 0.
 fn utimens_permission(meta: &xattr::FileMeta, acl: Option<&[u8]>, cred: &xattr::Cred, explicit: bool) -> i32 {
-    if cred.euid == 0 || cred.euid == meta.uid { return 0; }
+    if cred.euid == meta.uid || cred.cap_inode(xattr::CAP_FOWNER, meta.uid, meta.gid) { return 0; }
     if explicit { return -1; } // EPERM
     if xattr::may_access(meta, cred, acl, xattr::MAY_WRITE) { 0 } else { -13 } // EACCES
 }
@@ -12946,8 +14120,8 @@ fn handle_utimens(pid: u32, msg: &Message, follow: bool) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
     if let Some(path) = tmpfs_path(raw) {
-        if is_tmpfs_root(path) { return if sched::fsuid_of(pid) == 0 { ok_reply() } else { err_reply(-1) }; }
         let cred = cred_of(pid);
+        if is_tmpfs_root(path) { return if cred.host_root { ok_reply() } else { err_reply(-1) }; } // host root only
         let mut tmp = TMP_FILES.lock();
         let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
         let owner = tmp_owner(&tmp, idx);
@@ -13017,6 +14191,8 @@ fn tmp_ifmt(e: &TmpFileEntry) -> u16 {
     else if e.is_link { 0o120000 }
     else if e.is_sock { 0o140000 }
     else if e.is_fifo { 0o010000 }
+    else if e.devtype == 1 { 0o020000 }
+    else if e.devtype == 2 { 0o060000 }
     else { 0o100000 }
 }
 
@@ -13039,9 +14215,9 @@ fn tmp_has_setid(tmp: &[TmpFileEntry], idx: usize) -> bool {
 /// Strip the set-ID bits of tmpfs file `idx` as a write, truncate or O_TRUNC
 /// open by `fsuid` requires (`xattr::setid_kill_bits`, Linux
 /// `file_remove_privs`).
-fn tmp_kill_setid(tmp: &mut [TmpFileEntry], idx: usize, fsuid: u32) {
+fn tmp_kill_setid(tmp: &mut [TmpFileEntry], idx: usize, cred: &xattr::Cred) {
     let o = tmp_owner(tmp, idx);
-    let kill = xattr::setid_kill_bits(tmp_meta(&tmp[o]).mode, fsuid);
+    let kill = xattr::setid_kill_bits_c(&tmp_meta(&tmp[o]), cred);
     if kill != 0 {
         tmp[o].mode &= !(kill as u32);
         tmp_touch_ctime(&mut tmp[o]);
@@ -13056,10 +14232,37 @@ fn tmp_kill_setid(tmp: &mut [TmpFileEntry], idx: usize, fsuid: u32) {
 /// it cannot find (the boot-time mount path), so an unknown caller is root,
 /// exactly as before.
 pub fn cred_of(pid: u32) -> xattr::Cred {
+    if let Some(c) = ovl::cred_override(pid) { return c; }
     let (fsuid, fsgid) = sched::fsids_of(pid);
     let mut c = xattr::Cred::new(fsuid, fsgid);
     c.ngroups = sched::groups_of(pid, &mut c.groups) as u8;
-    c
+    cred_with_ns(c, pid, false)
+}
+
+/// Effective uid 0 in the INITIAL user namespace: the "host root only" gates
+/// (trusted.*, device and sysclass nodes, tmpfs mount roots). A namespace
+/// root (kuid != 0) and a kuid-0 task that left namespace 0 are both false.
+fn host_root_of(pid: u32) -> bool {
+    sched::euid_of(pid) == 0 && sched::ns::userns_of(pid) == 0
+}
+
+/// Attach the caller's user-namespace view and effective capabilities to
+/// `c`. Namespace 0 (every task today without a userns) keeps the identity
+/// view, so `host_root` is exactly the old `euid == 0`. `real` = the
+/// `access(2)` flavour: the capabilities follow the REAL uid (Linux
+/// `access_override_creds`): effective if real == effective uid, else the
+/// permitted set when the real uid is the namespace root, else none.
+fn cred_with_ns(c: xattr::Cred, pid: u32, real: bool) -> xattr::Cred {
+    let ns = sched::ns::userns_of(pid);
+    if ns == 0 { return c; }
+    let sv = sched::ns::view_of_ns(ns);
+    let v = xattr::IdView { ns: sv.ns, n: sv.n, ext: sv.ext };
+    let caps = match sched::caps::caps_of(pid) {
+        Some(cs) if !real || sched::euid_of(pid) == c.euid => cs[0],
+        Some(cs) if sched::ns::root_k(ns) == Some(c.euid) => cs[1],
+        _ => 0,
+    };
+    c.with_ns(v, caps)
 }
 
 /// The caller's credentials built from the REAL uid/gid rather than the
@@ -13070,7 +14273,7 @@ pub fn cred_of(pid: u32) -> xattr::Cred {
 pub fn real_cred_of(pid: u32) -> xattr::Cred {
     let mut c = xattr::Cred::new(sched::ruid_of(pid), sched::rgid_of(pid));
     c.ngroups = sched::groups_of(pid, &mut c.groups) as u8;
-    c
+    cred_with_ns(c, pid, true)
 }
 
 /// Stamp all three timestamps with "now" — a freshly created entry.
@@ -13241,13 +14444,14 @@ fn tmp_getxattr_local(tmp: &TmpPool, owner: usize, cred: &xattr::Cred,
     val_reply(len as u64)
 }
 
-fn tmp_listxattr_local(tmp: &TmpPool, owner: usize, euid: u32, list_ptr: usize, size: usize) -> Message {
+fn tmp_listxattr_local(tmp: &TmpPool, owner: usize, host_root: bool, list_ptr: usize, size: usize) -> Message {
     let xa = tmp.xattr(owner);
     // O(1) fast path — the `ls -l` stat storm hits this on every entry.
     if xattr::is_empty(&xa[..]) { return val_reply(0); }
     let out: &mut [u8] = if size == 0 { &mut [] }
                          else { unsafe { core::slice::from_raw_parts_mut(list_ptr as *mut u8, size) } };
-    match xattr::list(&xa[..], out, euid == 0) {
+    // trusted.* is host root only
+    match xattr::list(&xa[..], out, host_root) {
         Ok(n) => val_reply(n as u64), Err(er) => err_reply(-er),
     }
 }
@@ -13311,7 +14515,7 @@ fn handle_listxattr(pid: u32, tag: u64, path_ptr: usize, list_ptr: usize, size: 
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
     if let Some(path) = tmpfs_path(raw) {
-        let euid = sched::euid_of(pid);
+        let euid = host_root_of(pid);
         let tmp = TMP_FILES.lock();
         let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
         let owner = tmp_owner(&tmp, idx);
@@ -13426,6 +14630,7 @@ fn fb_meta() -> xattr::FileMeta {
 fn handle_access(pid: u32, path_ptr: usize, amode: u32, eaccess: bool) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
+    if cgroupfs::is_path(strip_trailing_slash(raw)) { return err_reply(-38); } // stat-based fallback
     if let Some(path) = tmpfs_path(raw) {
         let cred = if eaccess { cred_of(pid) } else { real_cred_of(pid) };
         let tmp = TMP_FILES.lock();
@@ -13531,7 +14736,7 @@ fn handle_flistxattr(pid: u32, fd: usize, list_ptr: usize, size: usize) -> Messa
     };
     match kind {
         VnodeKind::TmpFile { idx, .. } => {
-            let euid = sched::euid_of(pid);
+            let euid = host_root_of(pid);
             let tmp = TMP_FILES.lock();
             let owner = tmp_owner(&tmp, idx);
             tmp_listxattr_local(&tmp, owner, euid, list_ptr, size)
@@ -13613,6 +14818,17 @@ pub fn read_stat_owner(stat_ptr: usize) -> (u32, u32) {
     unsafe {
         (((stat_ptr + ST_UID_OFF) as *const u32).read_unaligned(),
          ((stat_ptr + ST_UID_OFF + 4) as *const u32).read_unaligned())
+    }
+}
+
+/// Rewrite `(st_uid, st_gid)` of a kernel-resident `struct stat` from kuids to
+/// the calling task's user-namespace view (65534 unmapped). Called on the way
+/// to user memory: kernel buffers carry kuids (idmap design H1).
+pub fn translate_stat_owner_for_user(stat_ptr: usize) {
+    let (u, g) = read_stat_owner(stat_ptr);
+    unsafe {
+        ((stat_ptr + ST_UID_OFF) as *mut u32).write_unaligned(sched::ns::view_id(0, u));
+        ((stat_ptr + ST_UID_OFF + 4) as *mut u32).write_unaligned(sched::ns::view_id(1, g));
     }
 }
 
@@ -13711,9 +14927,16 @@ pub fn write_stat_full_rdev(
     gid:      u32,
     rdev:     u64,
 ) {
-    // Owners as the calling task's user namespace sees them (65534 unmapped).
-    let uid = sched::ns::view_id(0, uid);
-    let gid = sched::ns::view_id(1, gid);
+    // Kernel buffers carry kuids; translation happens only on the copy to
+    // user memory, as the calling task's user namespace sees them (65534
+    // unmapped). Kernel callers (exec_setid, access checks) read raw kuids.
+    let to_user = sched::uaccess::user_range_ok(stat_ptr, STAT_SIZE);
+    // View translation uses current_userns(): the fill must run on the
+    // caller's own thread (fs ports are direct kernel handlers).
+    debug_assert!(!to_user || sched::current_pid() != 0, "stat fill off the caller's thread");
+    let (uid, gid) = if to_user {
+        (sched::ns::view_id(0, uid), sched::ns::view_id(1, gid))
+    } else { (uid, gid) };
     unsafe {
         // Built in a kernel buffer, then one PAN-safe copy out.
         let mut kb = [0u8; STAT_SIZE];
@@ -13855,6 +15078,10 @@ fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
     // pivot_root has made "/" a prefix match for everything. Only the
     // synthesized `/sys/class/block` subtree is synthetic the same way; the
     // rest of /sys is staged on disk and falls through to the mount lookup.
+    if cgroupfs::is_path(path) {
+        write_statfs(buf_ptr, &cgroup_statfs());
+        return statfs_reply();
+    }
     if !is_tmp_path(path)
         && (path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path) || sysclass::is_path(path)) {
         write_statfs(buf_ptr, &procfs_statfs());
@@ -13893,6 +15120,7 @@ fn statfs_set_flags(buf_ptr: usize, flags: u64) {
 fn handle_fstatfs(pid: u32, fd: usize, buf_ptr: usize) -> Message {
     if buf_ptr == 0 { return err_reply(-14); }
     let mut tmp_idx = None;
+    let mut is_cg = false;
     let port = {
         let mut tbls = TblSlot::new();
         let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
@@ -13900,9 +15128,19 @@ fn handle_fstatfs(pid: u32, fd: usize, buf_ptr: usize) -> Message {
         match tbl.fds[fd].kind {
             VnodeKind::MountedFile { port, .. } => Some(port),
             VnodeKind::TmpFile { idx, .. } => { tmp_idx = Some(idx); None }
+            VnodeKind::SysBlock { dev, .. } if cgroupfs::is_dev(dev) => { is_cg = true; None }
             _ => None,
         }
     };
+    if let Some(idx) = tmp_idx {
+        let tmp = TMP_FILES.lock();
+        let p = tmp[idx].path();
+        if tmp[idx].ephemeral() && (p.starts_with(cgroupfs::SNAP_R) || p.starts_with(cgroupfs::SNAP_W)) { is_cg = true; }
+    }
+    if is_cg {
+        write_statfs(buf_ptr, &cgroup_statfs());
+        return statfs_reply();
+    }
     if let Some(port) = port {
         let mut proxy = Message::empty();
         proxy.tag = VFS_STATFS;
@@ -13948,6 +15186,13 @@ fn tmpfs_statfs() -> StatfsVals {
 /// /proc and /dev: zero-capacity pseudo-filesystems, exactly as Linux reports
 /// them. `df` filters these out by fstype long before f_blocks matters, and
 /// `df /proc` prints a 0-block line rather than an error — both match Linux.
+fn cgroup_statfs() -> StatfsVals {
+    StatfsVals {
+        f_type: cgroupfs::MAGIC, bsize: 4096, blocks: 0, bfree: 0, bavail: 0,
+        files: 0, ffree: 0, fsid: 0, namelen: 255,
+    }
+}
+
 fn procfs_statfs() -> StatfsVals {
     StatfsVals {
         f_type: PROC_MAGIC, bsize: 4096, blocks: 0, bfree: 0, bavail: 0,
@@ -14016,6 +15261,15 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
     // A synthesized sysfs directory. musl's `fdopendir` (issued by every
     // `opendir`, and therefore by `fs::read_dir`) fstats the fd and answers
     // ENOTDIR unless this says S_IFDIR.
+    if let VnodeKind::SysBlock { dev, .. } = kind {
+        if cgroupfs::is_dev(dev) {
+            let cg = cgroupfs::dev_cg(dev);
+            let (u, g) = sched::cgroup::dir_owner(cg);
+            write_stat_full(stat_ptr, S_IFDIR | 0o755, (2 + sched::cgroup::nr_children(cg)) as u64, 0,
+                            0x6000_0000 + (cg as u64) * 64, u, g);
+            return ok_reply();
+        }
+    }
     if let VnodeKind::SysBlock { dev, level, .. } = kind {
         write_stat_full(stat_ptr, S_IFDIR | 0o755, 1, 0,
                         0x5000_0000 + (dev as u64) * 8 + level as u64, 0, 0);
@@ -14093,12 +15347,14 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
             if e.is_dir       { (S_IFDIR | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
             else if e.is_sock { (S_IFSOCK | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
             else if e.is_fifo { (S_IFIFO | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
+            else if e.devtype != 0 { ((if e.devtype == 1 { 0o020000 } else { 0o060000 }) | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
             else              { (S_IFREG | (e.mode & 0o7777), e.len as u64, 0x2000_0000 + idx as u64) }
         }
         // eventfd/timerfd/signalfd/inotify are anon-inode files and report S_IFREG.
-        VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. }
+        VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. } | VnodeKind::Mq { .. }
         | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. }
-        | VnodeKind::PidFd { .. } => (S_IFREG | 0o600, 0, 0),
+        | VnodeKind::PidFd { .. } | VnodeKind::BpfProg { .. } => (S_IFREG | 0o600, 0, 0),
+        VnodeKind::NsFd { kind, id } => (S_IFREG | 0o444, 0, sched::ns::ns_ino(kind as usize, id)),
         // Handled by the early return above (proxied to the owning mount);
         // this arm exists only for match exhaustiveness.
         VnodeKind::MountedFile { .. } => return err_reply(-9),
@@ -14151,7 +15407,7 @@ fn char_dev_rdev(kind: &VnodeKind) -> u64 {
     match *kind {
         VnodeKind::Pty { is_master: true, .. } => makedev(5, 2),
         VnodeKind::Pty { pair, .. } => match tty_server::pty::vt_of(pair as usize) {
-            0 => pts_rdev(pair as u32),
+            0 => pts_rdev(tty_server::pty::ident(pair as usize).1 as u32),
             n => makedev(4, n as u32),
         },
         VnodeKind::DevStdio { .. } => makedev(5, 1),
@@ -14181,7 +15437,7 @@ fn dev_node_rdev(path: &[u8]) -> u64 {
         b"/dev/ptmx" => makedev(5, 2),
         b"/dev/fb0" => makedev(29, 0),
         _ => if let Some(vt) = vt_number(path) { makedev(4, vt as u32) }
-             else if let Some(n) = pts_number(path) { pts_rdev(n as u32) }
+             else if let Some(n) = pts_number(path) { pts_rdev(tty_server::pty::ident(n).1 as u32) }
              else { 0 },
     }
 }
@@ -14215,6 +15471,13 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let path = &pbuf[..plen];
 
+    if let Some(name) = mqueue::path_name(strip_trailing_slash(path)) {
+        return match mqueue::stat_path(sched::current_pid(), name) {
+            Some((mode, u, g, ino, size)) => { write_stat_owned(stat_ptr, mode, size, ino, u, g); ok_reply() }
+            None => err_reply(-2),
+        };
+    }
+
     // `/proc/<pid>/root[/...]` stats what it names under "/" (see handle_open).
     if let Some(rest) = proc_pid_root_rest(path) {
         let mut buf = alloc::vec![0u8; HOST_PATH_MAX];
@@ -14238,8 +15501,8 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
     }
     if let Some(k) = proc_stat_kind(path) {
         let Some((dir, owner, name)) = k else { return err_reply(-2) };
-        let (u, g) = sched::cred::ids_of(owner).map(|(u, g)| (u[1], g[1])).unwrap_or((0, 0));
-        let mode = if dir { 0o040555 } else if name == b"comm" || name == b"uid_map" || name == b"gid_map" || name == b"setgroups" { 0o100644 } else { 0o100444 };
+        let (u, g) = sched::cred::proc_dump_owner(owner);
+        let mode = if dir { 0o040555 } else if name == b"comm" || name == b"uid_map" || name == b"gid_map" || name == b"setgroups" || name == b"oom_score_adj" { 0o100644 } else { 0o100444 };
         write_stat_full(stat_ptr, mode, if dir { 2 } else { 1 }, 0, path_ino(path, 7), u, g);
         return ok_reply();
     }
@@ -14296,7 +15559,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
             // ttyname() treats as "this fd is not that path".
             if lookup_path == b"/dev/tty" {
                 if let Some(n) = tty_server::pty::ctty_for_sid(sched::current_sid()) {
-                    let rdev = match tty_server::pty::vt_of(n) { 0 => pts_rdev(n as u32), v => makedev(4, v as u32) };
+                    let rdev = match tty_server::pty::vt_of(n) { 0 => pts_rdev(tty_server::pty::ident(n).1 as u32), v => makedev(4, v as u32) };
                     write_stat_full_rdev(stat_ptr, 0o020620, 1, 0, pty_ino(n as u16, false), 0, 0, rdev);
                     return ok_reply();
                 }
@@ -14331,13 +15594,14 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
         // what fstat reports on the corresponding fd — see pty_ino. Answered
         // ahead of the RAMFS sweep, which would otherwise report /dev/ptmx as
         // a zero-byte S_IFREG and make ttyname() reject the fd.
-        if lookup_path == b"/dev/ptmx" {
-            write_stat_full_rdev(stat_ptr, 0o020666, 1, 0, pty_ino(0, true), 0, 0, makedev(5, 2));
+        if let Some(inst) = ptmx_inst(lookup_path) {
+            let m = ptmx_meta(inst);
+            write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, pty_ino(0, true), 0, 0, makedev(5, 2));
             return ok_reply();
         }
         if let Some(n) = pts_number(lookup_path) {
             let m = pts_meta(n);
-            write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, pty_ino(n as u16, false), m.uid, m.gid, pts_rdev(n as u32));
+            write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, pty_ino(n as u16, false), m.uid, m.gid, pts_rdev(tty_server::pty::ident(n).1 as u32));
             return ok_reply();
         }
         // Block device nodes. Must agree byte for byte with what `handle_fstat`
@@ -14354,6 +15618,12 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
         // their attribute files. `/sys` and `/sys/class` themselves, and
         // everything outside this subtree, are staged on disk and answered
         // by the ordinary mount lookup below, not here.
+        if cgroupfs::is_path(lookup_path) {
+            return match cgroupfs::stat(sched::current_pid(), lookup_path) {
+                Some((m, nl, ino, u, g)) => { write_stat_full(stat_ptr, m, nl as u64, 0, ino, u, g); ok_reply() }
+                None => err_reply(-2),
+            };
+        }
         if sysclass::is_path(lookup_path) {
             if let Some((dev, level)) = sysclass::dir(lookup_path) {
                 write_stat(stat_ptr, 0o040755, 0, 0x5000_0000 + (dev as u64) * 8 + level as u64);
@@ -14421,6 +15691,8 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
                 let ifmt: u32 = if !follow && tmp[idx].is_link { 0o120000 }
                                 else if e.is_sock { 0o140000 }
                                 else if e.is_fifo { 0o010000 }
+                                else if e.devtype == 1 { 0o020000 }
+                                else if e.devtype == 2 { 0o060000 }
                                 else { 0o100000 };
                 let default_mode = if ifmt == 0o120000 { 0o777 } else { 0o644 };
                 let mode = ifmt | if e.mode != 0 { e.mode } else { default_mode };
@@ -14428,11 +15700,14 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
                 let (uid, gid) = (e.uid, e.gid);
                 let (at, mt, ct) = (e.atime, e.mtime, e.ctime);
                 let blocks = if ifmt == 0o100000 { Some(tmp_st_blocks(owner)) } else { None };
+                let rdev = if e.devtype != 0 { e.rdev as u64 } else { 0 };
                 drop(tmp);
-                match blocks {
+                if rdev != 0 || ifmt == 0o020000 || ifmt == 0o060000 {
+                    write_stat_full_rdev(stat_ptr, mode, nlink, size, ino, uid, gid, rdev);
+                } else { match blocks {
                     Some(b) => write_stat_full_blocks(stat_ptr, mode, nlink, size, ino, uid, gid, b),
                     None    => write_stat_full(stat_ptr, mode, nlink, size, ino, uid, gid),
-                }
+                } }
                 write_stat_times(stat_ptr, at, mt, ct);
                 return ok_reply();
             }
@@ -14519,7 +15794,7 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             // "anon_inode" placeholder.
             VnodeKind::Pty { is_master: true, .. } => FdInfo::Static(b"/dev/ptmx"),
             VnodeKind::Pty { pair, is_master: false } => match tty_server::pty::vt_of(*pair as usize) {
-                0 => FdInfo::PtsSlave(*pair),
+                0 => FdInfo::PtsSlave(tty_server::pty::ident(*pair as usize).1),
                 2 => FdInfo::Static(b"/dev/tty2"), 3 => FdInfo::Static(b"/dev/tty3"),
                 4 => FdInfo::Static(b"/dev/tty4"), 5 => FdInfo::Static(b"/dev/tty5"),
                 _ => FdInfo::Static(b"/dev/tty6"),
@@ -14531,8 +15806,11 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             VnodeKind::RamFile { data, .. } => FdInfo::RamData(data.as_ptr()),
             VnodeKind::TmpFile { idx, .. } => FdInfo::TmpIdx(*idx),
             VnodeKind::EventFd { .. } => FdInfo::Static(b"eventfd"),
+            VnodeKind::Mq { .. } => FdInfo::Static(b"mqueue"),
             VnodeKind::TimerFd { .. } => FdInfo::Static(b"timerfd"),
             VnodeKind::PidFd { .. } => FdInfo::Static(b"anon_inode:[pidfd]"),
+            VnodeKind::BpfProg { .. } => FdInfo::Static(b"anon_inode:bpf-prog"),
+            VnodeKind::NsFd { .. } => FdInfo::Static(b"anon_inode:[nsfs]"),
             VnodeKind::DevUrandom => FdInfo::Static(b"/dev/urandom"),
             // ttyname(3) readlinks /proc/self/fd/N and stats what it reads
             // back, so a VT fd must name the node it was opened by.

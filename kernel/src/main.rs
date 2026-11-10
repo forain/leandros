@@ -23,6 +23,7 @@ mod direct_hhdm;
 mod netwatch;
 mod tryboot;
 mod syscall;
+mod bpf;
 mod mem;
 mod firmware;
 mod ktest;
@@ -1456,7 +1457,10 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // `sched.wakestat=1`: per-thread wake census and the useful/spurious
     // table of `/proc/wakestat` (sched::gdwake). The per-site wake counts
     // there are always on.
+    if let Some(c) = cmdline_knob("sched.errtrace") { sched::set_errtrace(c); }
     if let Some(c) = cmdline_knob("mm.pagein_eio") { sched::set_pagein_eio(c); }
+    sched::gdwake::set_log(cmdline_knob("sched.wakelog").map_or(false, |v| v != "0"));
+    if cmdline_knob("sched.keyselftest").map_or(false, |v| v != "0") { sched::gdwake::key_selftest_start(); }
     sched::gdwake::set_enabled(cmdline_knob("sched.wakestat").map_or(false, |v| v != "0"));
     // `sched.wakeidx=0`: poll-channel wake scans walk every parked task (the
     // pre-lane-wakescan scan); `=2`: the same, counting the wake index's
@@ -1481,6 +1485,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         arch_x86_64::cpufreq::configure(k("cpu.pstate"), k("cpu.hwp"), k("cpu.turbo"), k("cpu.perf"), k("cpu.epp"));
         arch_x86_64::cpufreq::set_msrtest(k("cpu.msrtest").unwrap_or(0) != 0);
     }
+    if boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "idmap=test")) { sched::ns::set_idmap_test(); }
     // `apic.x2apic=1`: run the local APICs in x2APIC mode even when no APIC
     // ID needs it (tests the mode firmware and kexec hand-offs leave us in).
     #[cfg(target_arch = "x86_64")]
