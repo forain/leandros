@@ -137,6 +137,8 @@ pub(crate) fn set_lo(ns: u16, up: bool) {
 /// reused id cannot race: the bit is cleared before the state is looked up,
 /// and a new owner of the id creates its state afresh.
 pub(crate) fn daemon_pass() {
+    // A closed or exited process's netlink socket still holds its netns.
+    crate::nlsock::prune();
     for w in 0..4 {
         if GONE[w].load(Ordering::Acquire) == 0 { continue; }
         let bits = GONE[w].swap(0, Ordering::AcqRel);
