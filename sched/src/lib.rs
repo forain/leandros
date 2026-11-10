@@ -3159,6 +3159,7 @@ pub fn exec_commit_ids(euid: Option<u32>, egid: Option<u32>, secure: bool) {
             t.sgid = t.egid;
             t.fsuid = t.euid;
             t.fsgid = t.egid;
+            if t.mm_userns.id() != t.userns.id() { t.mm_userns = t.userns.clone(); }
             t.tgid
         }
         None => return,
