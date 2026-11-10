@@ -348,10 +348,190 @@ pub(crate) fn links(ns: u16) -> Vec<rtnetlink::Link> {
                 index: x.ifindex,
                 name: alloc::string::String::from(core::str::from_utf8(&x.name[..name_len(&x.name)]).unwrap_or("?")),
                 mac: x.mac, mtu: x.mtu, up: x.admin_up, running: x.admin_up && x.tun != NO_TUN,
-                loopback: false,
+                tap: true, loopback: false,
                 addr: if x.admin_up { x.addrs.first().copied() } else { None },
             });
         }
+    }
+    out
+}
+
+// ── rtnetlink writes on an interface of the caller's namespace ──────────────
+
+use rtnetlink::RtOp;
+
+fn net_of(a: [u8; 4], p: u8) -> u32 {
+    let m = if p == 0 { 0 } else { u32::MAX << (32 - p.min(32) as u32) };
+    u32::from_be_bytes(a) & m
+}
+
+/// Push the vif's address list into its smoltcp stack (VIFS released).
+fn sync_addrs(sid: Sid, addrs: &[([u8; 4], u8)]) {
+    if let Some(s) = stack_for(sid).as_mut() {
+        s.interface.update_ip_addrs(|v| {
+            v.clear();
+            for &(a, p) in addrs { let _ = v.push(IpCidr::new(IpAddress::v4(a[0], a[1], a[2], a[3]), p)); }
+        });
+    }
+}
+
+/// Rebuild the stack's gateway routes from the namespace's route list.
+fn sync_routes(sid: Sid, routes: &[vifsel::Route]) {
+    if let Some(s) = stack_for(sid).as_mut() {
+        s.interface.routes_mut().update(|t| {
+            t.clear();
+            for r in routes.iter().filter(|r| r.oif == sid) {
+                let Some(g) = r.gw else { continue };
+                let _ = t.push(smoltcp::iface::Route {
+                    cidr: IpCidr::new(IpAddress::v4(r.dst[0], r.dst[1], r.dst[2], r.dst[3]), r.prefix),
+                    via_router: IpAddress::v4(g[0], g[1], g[2], g[3]),
+                    preferred_until: None, expires_at: None,
+                });
+            }
+        });
+    }
+}
+
+fn sid_of_index(st: &NetNsState, v: &vifsel::VifTable, index: u32) -> Option<Sid> {
+    st.sids.iter().copied().find(|&s| v[s as usize].as_ref().map_or(false, |x| is_tun_kind(x.kind) && x.ifindex == index))
+}
+
+/// Apply a parsed rtnetlink write to a tun/tap of `ns`. 0 or a positive errno.
+pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
+    if !sched::caps::ns_capable_in(sched::ns::owner_userns(1, ns), CAP_NET_ADMIN) { return 1; }
+    match op {
+        RtOp::SetLink { index, up, mtu, mac, name } => {
+            let sid;
+            {
+                let nss = NETNS.lock();
+                let mut v = VIFS.lock();
+                let Some(st) = nss.get(&ns) else { return 19 };
+                let Some(sd) = sid_of_index(st, &v, index) else { return 19 };
+                sid = sd;
+                if let Some(m) = mtu { if !(68..=65535).contains(&m) { return 22; } }
+                if let Some(n) = name.as_ref() {
+                    if n.is_empty() || n.len() > 15 { return 22; }
+                    if v[sid as usize].as_ref().map_or(false, |x| x.admin_up) { return 16; } // EBUSY
+                    let dup = st.sids.iter().any(|&o| o != sid && v[o as usize].as_ref()
+                        .map_or(false, |x| &x.name[..name_len(&x.name)] == n.as_bytes()));
+                    if dup { return 17; }
+                }
+                let x = v[sid as usize].as_mut().unwrap();
+                if let Some(m) = mtu { x.mtu = m; }
+                if let Some(m) = mac { x.mac = m; }
+                if let Some(n) = name.as_ref() { x.name = [0; 16]; x.name[..n.len()].copy_from_slice(n.as_bytes()); }
+                if let Some(u) = up { x.admin_up = u; if !u { x.rxq.clear(); } }
+            }
+            if let Some(m) = mac {
+                if let Some(s) = stack_for(sid).as_mut() {
+                    s.interface.set_hardware_addr(HardwareAddress::Ethernet(EthernetAddress(m)));
+                }
+            }
+            drivers::netdev::kick();
+            0
+        }
+        RtOp::AddAddr { index, addr, prefix, excl } => {
+            let (sid, addrs);
+            {
+                let nss = NETNS.lock();
+                let mut v = VIFS.lock();
+                let Some(st) = nss.get(&ns) else { return 19 };
+                let Some(sd) = sid_of_index(st, &v, index) else { return 19 };
+                sid = sd;
+                let x = v[sid as usize].as_mut().unwrap();
+                if x.addrs.iter().any(|&(a, _)| a == addr) { return if excl { 17 } else { 0 }; }
+                if x.addrs.len() >= 2 { return 105; } // ENOBUFS: smoltcp keeps two addresses
+                x.addrs.push((addr, prefix));
+                addrs = x.addrs.clone();
+            }
+            sync_addrs(sid, &addrs);
+            drivers::netdev::kick();
+            0
+        }
+        RtOp::DelAddr { index, addr, prefix } => {
+            let (sid, addrs);
+            {
+                let nss = NETNS.lock();
+                let mut v = VIFS.lock();
+                let Some(st) = nss.get(&ns) else { return 19 };
+                let Some(sd) = sid_of_index(st, &v, index) else { return 19 };
+                sid = sd;
+                let x = v[sid as usize].as_mut().unwrap();
+                let Some(i) = x.addrs.iter().position(|&(a, p)| a == addr && p == prefix) else { return 99 };
+                x.addrs.remove(i);
+                addrs = x.addrs.clone();
+            }
+            sync_addrs(sid, &addrs);
+            0
+        }
+        RtOp::AddRoute { dst, prefix, gw, oif, metric, excl: _, replace } => {
+            let (sid, routes);
+            {
+                let mut nss = NETNS.lock();
+                let v = VIFS.lock();
+                let Some(st) = nss.get_mut(&ns) else { return 3 }; // no tap here: ESRCH-like
+                let on_link = |s: Sid, g: [u8; 4]| v[s as usize].as_ref()
+                    .map_or(false, |x| x.addrs.iter().any(|&(a, p)| net_of(a, p) == net_of(g, p)));
+                let sd = if oif != 0 {
+                    match sid_of_index(st, &v, oif) { Some(s) => s, None => return 19 }
+                } else if let Some(g) = gw {
+                    match st.sids.iter().copied().find(|&s| Some(s) != st.lo && on_link(s, g)) { Some(s) => s, None => return 101 }
+                } else { return 22 };
+                if let Some(g) = gw { if !on_link(sd, g) { return 101; } }
+                sid = sd;
+                let same = |r: &vifsel::Route| r.dst == dst && r.prefix == prefix && r.metric == metric;
+                if st.routes.iter().any(same) {
+                    if !replace { return 17; }
+                    st.routes.retain(|r| !same(r));
+                }
+                if st.routes.len() >= 64 { return 105; }
+                st.routes.push(vifsel::Route { dst, prefix, gw, oif: sid, metric });
+                routes = st.routes.clone();
+            }
+            sync_routes(sid, &routes);
+            drivers::netdev::kick();
+            0
+        }
+        RtOp::DelRoute { dst, prefix, gw, oif, metric } => {
+            let (sid, routes);
+            {
+                let mut nss = NETNS.lock();
+                let v = VIFS.lock();
+                let Some(st) = nss.get_mut(&ns) else { return 3 };
+                let want_oif = if oif != 0 { sid_of_index(st, &v, oif) } else { None };
+                if oif != 0 && want_oif.is_none() { return 19; }
+                let pos = st.routes.iter().position(|r| r.dst == dst && r.prefix == prefix
+                    && gw.map_or(true, |g| r.gw == Some(g)) && want_oif.map_or(true, |o| r.oif == o)
+                    && metric.map_or(true, |m| r.metric == m));
+                let Some(i) = pos else { return 3 }; // ESRCH
+                sid = st.routes.remove(i).oif;
+                routes = st.routes.clone();
+            }
+            sync_routes(sid, &routes);
+            0
+        }
+    }
+}
+
+/// The routes `ns` exports from its tun/tap interfaces: connected routes of
+/// up ones plus the explicit routes.
+pub(crate) fn routes(ns: u16) -> Vec<rtnetlink::RouteEnt> {
+    let nss = NETNS.lock();
+    let v = VIFS.lock();
+    let mut out = Vec::new();
+    let Some(st) = nss.get(&ns) else { return out };
+    for &s in st.sids.iter() {
+        let Some(x) = v[s as usize].as_ref() else { continue };
+        if !is_tun_kind(x.kind) || !x.admin_up { continue; }
+        for &(a, p) in x.addrs.iter() {
+            let n = net_of(a, p).to_be_bytes();
+            out.push(rtnetlink::RouteEnt { dst: n, prefix: p, gw: None, oif: x.ifindex, prefsrc: Some(a) });
+        }
+    }
+    for r in st.routes.iter() {
+        let Some(x) = v[r.oif as usize].as_ref() else { continue };
+        if !x.admin_up { continue; }
+        out.push(rtnetlink::RouteEnt { dst: r.dst, prefix: r.prefix, gw: r.gw, oif: x.ifindex, prefsrc: None });
     }
     out
 }

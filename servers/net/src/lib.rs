@@ -4838,6 +4838,7 @@ fn udp_rebind_port(pid: u32, slot: usize) -> Result<(), i32> {
 }
 
 fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Option<&[u8]>) -> Message {
+    if let Some(o) = nlsock::of(pid, fd) { return nlsock::connect(o, addr_ptr, addrlen); }
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     if addrlen < 2 { return err_reply(-22); }
 
@@ -7149,6 +7150,7 @@ fn put_sockaddr_un(addr_ptr: usize, addrlen_ptr: usize, name: &[u8]) -> bool {
 
 fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Message {
     if addr_ptr == 0 || addrlen_ptr == 0 { return err_reply(-14); }
+    if let Some(o) = nlsock::of(pid, fd) { return nlsock::getpeername(o, addr_ptr, addrlen_ptr); }
     let endpoint = inet_remote_endpoint(pid, fd);
     match endpoint {
         Some(ep) => unsafe { write_sockaddr_in(addr_ptr, addrlen_ptr, ep); },
