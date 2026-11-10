@@ -1262,7 +1262,7 @@ static void *tb_thread(void *a) {
     if (unshare(CLONE_NEWNET) < 0 || stat("/proc/thread-self/ns/net", &st) < 0) { tb_state = -1; return NULL; }
     tb_ino = st.st_ino; tb_tid = (int)syscall(SYS_gettid);
     if (tb_self_bind) {
-        tb_bind_rc = mount("/proc/thread-self/ns/net", tb_self_bind, "none", MS_BIND, NULL) < 0 ? errno : 0;
+        tb_bind_rc = mount("/proc/thread-self/ns/net", tb_self_bind, "none", MS_BIND, "") < 0 ? errno : 0;
     }
     tb_state = 1;
     while (tb_state == 1) usleep(1000);
