@@ -9999,11 +9999,6 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
         }
         let sdir = match kpath_is_dir(&src) { Ok(d) => d, Err(e) => return e };
         if sdir != tdir {
-            crate::serial_print_str("[SHMDBG] sdir="); crate::serial_print_hex(sdir as usize);
-            crate::serial_print_str(" tdir="); crate::serial_print_hex(tdir as usize);
-            crate::serial_print_str(" src="); crate::serial_print_str(core::str::from_utf8(src.ns_bytes()).unwrap_or("?"));
-            crate::serial_print_str(" tgt="); crate::serial_print_str(core::str::from_utf8(tns.as_slice()).unwrap_or("?"));
-            crate::serial_print_str("\n");
             return -20;
         } // ENOTDIR (both directions, as Linux graft_tree)
         return match vfs::mnt::bind(mns, src.ns_bytes(), &tns, flags & MS_REC != 0) { Ok(_) => 0, Err(e) => e as isize };
