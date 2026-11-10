@@ -151,6 +151,7 @@ pub(crate) fn daemon_pass() {
 /// Free the given (netns, sid) vifs wherever they live: drop them from their
 /// namespace's sid list and routes, then the table slot, then the stack.
 pub(crate) fn free_vifs(list: &[(u16, Sid)]) {
+    let macs: Vec<[u8; 6]> = { let v = VIFS.lock(); list.iter().filter_map(|&(_, s)| v[s as usize].as_ref().map(|x| x.mac)).collect() };
     {
         let mut n = NETNS.lock();
         let mut v = VIFS.lock();
@@ -163,6 +164,7 @@ pub(crate) fn free_vifs(list: &[(u16, Sid)]) {
         }
     }
     for &(_, sid) in list { crate::l2::forget(sid); }
+    crate::fwd::forget_macs(&macs);
     // No table lock is held: the stack locks are taken alone.
     for &(_, sid) in list { *crate::STACKS[sid as usize].lock() = None; }
 }
@@ -171,8 +173,10 @@ fn reap(ns: u16) {
     let Some(st) = NETNS.lock().remove(&ns) else { return };
     // Veth ends in this namespace take their peers (any namespace) with them.
     let mut peers: Vec<(u16, Sid)> = Vec::new();
+    let mut macs: Vec<[u8; 6]> = Vec::new();
     {
         let mut v = VIFS.lock();
+        for &sid in st.sids.iter() { if let Some(x) = v[sid as usize].as_ref() { macs.push(x.mac); } }
         for &sid in st.sids.iter() {
             if let Some(x) = v[sid as usize].as_ref() {
                 if x.kind == VifKind::Veth && x.peer != NO_PEER {
@@ -186,6 +190,7 @@ fn reap(ns: u16) {
     }
     free_vifs(&peers);
     for &sid in st.sids.iter() { crate::l2::forget(sid); }
+    crate::fwd::forget_macs(&macs); // conntrack entries of the dead container
     // No stack lock is held here (VIFS/NETNS are released).
     for &sid in st.sids.iter() { *crate::STACKS[sid as usize].lock() = None; }
 }
