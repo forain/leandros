@@ -43,6 +43,7 @@ Options:
                              vfstag   host:vfstagtest.py alone
                              nettag2  host:nettag2test.py alone
                              kparks   host:kparkstest.py alone
+                             podpasta host:podpastatest.py alone (rootless podman on pasta: echo, host wget, -p port-forward, dns, churn, no leaks; implies --cmdline idmap=test)
                              podbridge host:podbridgetest.py alone (root podman default bridge: echo, host/bridge wget, dns, 20x churn, no leaks; implies --cmdline idmap=test)
                              drm      /bin/drmsmoke + /bin/gpuprobe gl (needs --gpu virgl|venus)
                            no commands and no --suite = regress
@@ -194,6 +195,8 @@ SUITES = {
     "kparks": ["host:kparkstest.py"],
     # Root podman on the default bridge network (needs LEANDROS_IMAGE_ARCHIVE image + --cmdline idmap=test).
     "podbridge": ["host:podbridgetest.py"],
+    # Rootless podman on the default pasta network, as user leandro (needs LEANDROS_IMAGE_ARCHIVE image + idmap=test).
+    "podpasta": ["host:podpastatest.py"],
     # /proc/<pid>/comm, prctl names and /bin/ps.
     "procps": ["/bin/pstest"],
     # /dev/netctl: permission model, event stream, profiles (runs as root).
@@ -302,7 +305,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"podbridgetest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "usbisochtest.py": 900}
+HOST_TIMEOUTS = {"podbridgetest.py": 2400, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "usbisochtest.py": 900}
 
 
 def host_run(c, timeout, arch=None, scale=1.0):
@@ -378,6 +381,8 @@ def main(argv):
             print(f"unknown suite {s!r}; known: {', '.join(SUITES)}")
             return 2
         cmds += SUITES[s]
+    if "podpasta" in suites and cmdline is None:
+        cmdline = "idmap=test"
     if "podbridge" in suites and cmdline is None:
         cmdline = "idmap=test"
     if "i915fake" in suites and cmdline is None:
