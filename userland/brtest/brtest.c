@@ -183,6 +183,113 @@ static pid_t spawn_ns(int (*body)(void)) {
 }
 static int wait_child(pid_t c) { int st = 0; waitpid(c, &st, 0); return WIFEXITED(st) ? WEXITSTATUS(st) : 100 + WTERMSIG(st); }
 
+
+/* ---- bridge helpers (lane bridge) ----------------------------------------- */
+#ifndef IFLA_BR_FORWARD_DELAY
+#define IFLA_BR_FORWARD_DELAY 1
+#define IFLA_BR_AGEING_TIME 4
+#define IFLA_BR_STP_STATE 5
+#define IFLA_BR_VLAN_FILTERING 7
+#endif
+static int br_new(int s, const char *name, const unsigned char *mac) {
+    struct ifinfomsg i; memset(&i, 0, sizeof i);
+    struct nlb m; nl_begin(&m, RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, &i, sizeof i);
+    nl_attr(&m, IFLA_IFNAME, name, strlen(name) + 1);
+    if (mac) nl_attr(&m, IFLA_ADDRESS, mac, 6);
+    int li = nl_nest(&m, IFLA_LINKINFO);
+    nl_attr(&m, IFLA_INFO_KIND, "bridge", 7);
+    nl_end(&m, li);
+    return nl_do(s, &m);
+}
+/* veth with the host end `a` enslaved to `master` at create time (IFLA_MASTER on the main message). */
+static int veth_new_m(int s, const char *a, const char *b, int nsfd, int master) {
+    struct ifinfomsg i; memset(&i, 0, sizeof i);
+    struct nlb m; nl_begin(&m, RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, &i, sizeof i);
+    nl_attr(&m, IFLA_IFNAME, a, strlen(a) + 1);
+    if (master) nl_attr(&m, IFLA_MASTER, &master, 4);
+    int li = nl_nest(&m, IFLA_LINKINFO);
+    nl_attr(&m, IFLA_INFO_KIND, "veth", 5);
+    int di = nl_nest(&m, IFLA_INFO_DATA);
+    int pi = nl_nest(&m, VETH_INFO_PEER);
+    m.len += sizeof i;
+    nl_attr(&m, IFLA_IFNAME, b, strlen(b) + 1);
+    if (nsfd >= 0) nl_attr(&m, IFLA_NET_NS_FD, &nsfd, 4);
+    nl_end(&m, pi); nl_end(&m, di); nl_end(&m, li);
+    return nl_do(s, &m);
+}
+static int link_set_master(int s, int idx, int master) {
+    struct ifinfomsg i; memset(&i, 0, sizeof i); i.ifi_index = idx;
+    struct nlb m; nl_begin(&m, RTM_SETLINK, 0, &i, sizeof i);
+    nl_attr(&m, IFLA_MASTER, &master, 4);
+    return nl_do(s, &m);
+}
+static int link_set_mac(int s, int idx, const unsigned char *mac) {
+    struct ifinfomsg i; memset(&i, 0, sizeof i); i.ifi_index = idx;
+    struct nlb m; nl_begin(&m, RTM_NEWLINK, 0, &i, sizeof i);
+    nl_attr(&m, IFLA_ADDRESS, mac, 6);
+    return nl_do(s, &m);
+}
+struct brinfo { int idx, master, isbr; unsigned char mac[6]; int have_mac;
+                int ageing_sz, stp_sz, vlan_sz, fwd_sz; unsigned ageing, fwd, stp; unsigned char vlan; };
+static int link_info(int s, const char *name, struct brinfo *o) {
+    struct ifinfomsg i; memset(&i, 0, sizeof i);
+    struct nlb m; nl_begin(&m, RTM_GETLINK, 0, &i, sizeof i);
+    nl_attr(&m, IFLA_IFNAME, name, strlen(name) + 1);
+    ((struct nlmsghdr *)m.b)->nlmsg_len = m.len;
+    memset(o, 0, sizeof *o);
+    if (send(s, m.b, m.len, 0) != m.len) return 0;
+    char rb[4096];
+    ssize_t n = recv(s, rb, sizeof rb, 0);
+    struct nlmsghdr *h = (struct nlmsghdr *)rb;
+    if (n < (ssize_t)NLMSG_HDRLEN || h->nlmsg_type != RTM_NEWLINK) return 0;
+    struct ifinfomsg *ifi = NLMSG_DATA(h);
+    o->idx = ifi->ifi_index;
+    int len = IFLA_PAYLOAD(h);
+    for (struct rtattr *a = IFLA_RTA(ifi); RTA_OK(a, len); a = RTA_NEXT(a, len)) {
+        int t = a->rta_type & 0x3fff;
+        if (t == IFLA_MASTER && RTA_PAYLOAD(a) == 4) memcpy(&o->master, RTA_DATA(a), 4);
+        if (t == IFLA_ADDRESS && RTA_PAYLOAD(a) == 6) { memcpy(o->mac, RTA_DATA(a), 6); o->have_mac = 1; }
+        if (t == IFLA_LINKINFO) {
+            int l2 = RTA_PAYLOAD(a);
+            for (struct rtattr *b = RTA_DATA(a); RTA_OK(b, l2); b = RTA_NEXT(b, l2)) {
+                int bt = b->rta_type & 0x3fff;
+                if (bt == IFLA_INFO_KIND && !strcmp(RTA_DATA(b), "bridge")) o->isbr = 1;
+                if (bt == IFLA_INFO_DATA) {
+                    int l3 = RTA_PAYLOAD(b);
+                    for (struct rtattr *c = RTA_DATA(b); RTA_OK(c, l3); c = RTA_NEXT(c, l3)) {
+                        int ct = c->rta_type & 0x3fff, pl = RTA_PAYLOAD(c);
+                        if (ct == IFLA_BR_AGEING_TIME) { o->ageing_sz = pl; if (pl == 4) memcpy(&o->ageing, RTA_DATA(c), 4); }
+                        if (ct == IFLA_BR_FORWARD_DELAY) { o->fwd_sz = pl; if (pl == 4) memcpy(&o->fwd, RTA_DATA(c), 4); }
+                        if (ct == IFLA_BR_STP_STATE) { o->stp_sz = pl; if (pl == 4) memcpy(&o->stp, RTA_DATA(c), 4); }
+                        if (ct == IFLA_BR_VLAN_FILTERING) { o->vlan_sz = pl; if (pl == 1) o->vlan = *(unsigned char *)RTA_DATA(c); }
+                    }
+                }
+            }
+        }
+    }
+    return o->idx;
+}
+/* Count links in a dump whose IFLA_MASTER == master. */
+static int count_master(int s, int master) {
+    struct { struct nlmsghdr h; struct ifinfomsg g; char pad[16]; } r;
+    memset(&r, 0, sizeof r);
+    r.h.nlmsg_type = RTM_GETLINK; r.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP; r.h.nlmsg_seq = 6;
+    struct rtattr *a = (struct rtattr *)r.pad;
+    a->rta_type = IFLA_MASTER; a->rta_len = RTA_LENGTH(4); memcpy(RTA_DATA(a), &master, 4);
+    r.h.nlmsg_len = NLMSG_HDRLEN + sizeof r.g + RTA_ALIGN(a->rta_len);
+    if (send(s, &r, r.h.nlmsg_len, 0) != (ssize_t)r.h.nlmsg_len) return -1;
+    int cnt = 0;
+    for (;;) {
+        char buf[8192];
+        ssize_t n = recv(s, buf, sizeof buf, 0);
+        if (n <= 0) return -1;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_type == NLMSG_DONE) return cnt;
+            if (h->nlmsg_type == RTM_NEWLINK) cnt++;
+        }
+    }
+}
+
 /* ---- child bodies --------------------------------------------------------- */
 
 static int echo_server_body(void) {
@@ -394,6 +501,174 @@ static void veth_nsgone(void) {
     close(s);
 }
 
+
+/* ---- bridge_l2: two netns behind br0 ------------------------------------- */
+static const char *g_ip;
+static int g_peer_is_client;
+static int br_conf_eth0(void) {
+    int s = nl_sock();
+    int idx = link_get(s, "eth0", NULL, NULL);
+    if (!idx) return 1;
+    if (addr_add(s, idx, g_ip, 24)) return 2;
+    if (link_set_up(s, idx)) return 3;
+    int lo = link_get(s, "lo", NULL, NULL); link_set_up(s, lo);
+    close(s);
+    return 0;
+}
+/* netns A: eth0 10.98.0.2, serves one UDP echo and one TCP echo on 7777 */
+static int br_server_body(void) {
+    int e = br_conf_eth0(); if (e) return e;
+    int u = socket(AF_INET, SOCK_DGRAM, 0), t = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(7777) };
+    if (bind(u, (struct sockaddr *)&a, sizeof a)) return 4;
+    if (bind(t, (struct sockaddr *)&a, sizeof a) || listen(t, 4)) return 5;
+    char ch = 'r'; write(done_[1], &ch, 1);
+    int served = 0;
+    while (served < 2) {
+        struct pollfd p[2] = { { u, POLLIN, 0 }, { t, POLLIN, 0 } };
+        if (poll(p, 2, 20000) <= 0) return 6;
+        if (p[0].revents & POLLIN) {
+            char b[256]; struct sockaddr_in f; socklen_t fl = sizeof f;
+            ssize_t n = recvfrom(u, b, sizeof b, 0, (struct sockaddr *)&f, &fl);
+            if (n > 0) sendto(u, b, n, 0, (struct sockaddr *)&f, fl);
+            served++;
+        }
+        if (p[1].revents & POLLIN) {
+            int c = accept(t, NULL, NULL);
+            char b[256]; ssize_t n = read(c, b, sizeof b);
+            if (n > 0) write(c, b, n);
+            close(c);
+            served++;
+        }
+    }
+    return 0;
+}
+static int icmp_ping(const char *ip) {
+    int ic = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (ic < 0) return 0;
+    struct timeval tv = { 5, 0 };
+    setsockopt(ic, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct sockaddr_in to = { .sin_family = AF_INET };
+    inet_pton(AF_INET, ip, &to.sin_addr);
+    unsigned char pk[8] = { 8, 0, 0, 0, 0x55, 0x66, 0, 1 }, rb[64];
+    ssize_t n = sendto(ic, pk, 8, 0, (struct sockaddr *)&to, sizeof to) == 8 ? recv(ic, rb, sizeof rb, 0) : -1;
+    close(ic);
+    return n >= 8 && rb[0] == 0;
+}
+/* netns B: eth0 10.98.0.3; talks to A (UDP+TCP), pings the bridge address, TCP to the host listener at 10.98.0.1:7778 */
+static int br_client_body(void) {
+    int e = br_conf_eth0(); if (e) return e;
+    struct timeval tv = { 5, 0 };
+    struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7777) };
+    inet_pton(AF_INET, "10.98.0.2", &to.sin_addr);
+    char b[64] = {0};
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (sendto(u, "b-udp", 5, 0, (struct sockaddr *)&to, sizeof to) != 5) return 10;
+    if (recv(u, b, sizeof b, 0) != 5 || memcmp(b, "b-udp", 5)) return 11;
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(t, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (connect(t, (struct sockaddr *)&to, sizeof to)) return 12;
+    memset(b, 0, sizeof b);
+    if (write(t, "b-tcp", 5) != 5 || read(t, b, sizeof b) != 5 || memcmp(b, "b-tcp", 5)) return 13;
+    close(t);
+    if (!icmp_ping("10.98.0.1")) return 14;
+    if (!icmp_ping("10.98.0.2")) return 15;
+    int h = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in hh = { .sin_family = AF_INET, .sin_port = htons(7778) };
+    inet_pton(AF_INET, "10.98.0.1", &hh.sin_addr);
+    setsockopt(h, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (connect(h, (struct sockaddr *)&hh, sizeof hh)) return 16;
+    if (write(h, "to-host", 7) != 7) return 17;
+    memset(b, 0, sizeof b);
+    if (read(h, b, sizeof b) != 2 || memcmp(b, "ok", 2)) return 18;
+    return 0;
+}
+
+static void bridge_l2(void) {
+    int s = nl_sock();
+    unsigned char brmac[6] = { 0x02, 0x00, 0x5e, 0x98, 0x00, 0x01 };
+    CHECK("bridge_l2: RTM_NEWLINK kind=bridge br0", br_new(s, "br0", brmac) == 0);
+    struct brinfo bi;
+    int bidx = link_info(s, "br0", &bi);
+    CHECK("bridge_l2: br0 exists, kind bridge", bidx > 0 && bi.isbr);
+    CHECK("bridge_l2: br0 IFLA_ADDRESS is the requested MAC", bi.have_mac && !memcmp(bi.mac, brmac, 6));
+    CHECK("bridge_l2: br0 10.98.0.1/24 + up", bidx > 0 && addr_add(s, bidx, "10.98.0.1", 24) == 0 && link_set_up(s, bidx) == 0);
+    CHECK("bridge_l2: duplicate br0 is EEXIST", br_new(s, "br0", NULL) == EEXIST);
+    /* host listener on 0.0.0.0:7778, reached through the bridge address */
+    int hl = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7778) };
+    CHECK("bridge_l2: host wildcard listener", !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
+    /* netns A and B, host ends enslaved at create time */
+    g_ip = "10.98.0.2";
+    pid_t ca = spawn_ns(br_server_body);
+    int cA[2] = { ctl[0], ctl[1] }, dA[2] = { done_[0], done_[1] };
+    g_ip = "10.98.0.3";
+    pid_t cb = spawn_ns(br_client_body);
+    int cB[2] = { ctl[0], ctl[1] }, dB[2] = { done_[0], done_[1] };
+    CHECK("bridge_l2: netns A and B spawned", ca > 0 && cb > 0);
+    if (ca <= 0 || cb <= 0) return;
+    int fa = netns_fd_of(ca), fb = netns_fd_of(cb);
+    CHECK("bridge_l2: veth A created enslaved to br0 (IFLA_MASTER at create)", veth_new_m(s, "vethA", "eth0", fa, bidx) == 0);
+    CHECK("bridge_l2: veth B created enslaved to br0", veth_new_m(s, "vethB", "eth0", fb, bidx) == 0);
+    close(fa); close(fb);
+    struct brinfo pa, pb;
+    int ia = link_info(s, "vethA", &pa), ib = link_info(s, "vethB", &pb);
+    CHECK("bridge_l2: ports report IFLA_MASTER = br0", ia > 0 && ib > 0 && pa.master == bidx && pb.master == bidx);
+    CHECK("bridge_l2: dump with IFLA_MASTER=br0 lists exactly the two ports", count_master(s, bidx) == 2);
+    CHECK("bridge_l2: ports up", link_set_up(s, ia) == 0 && link_set_up(s, ib) == 0);
+    char ch = 'g';
+    write(cA[1], &ch, 1);
+    int rd = rd_to(dA[0], &ch);
+    CHECK("bridge_l2: A configured eth0 and listens", rd == 1);
+    if (rd != 1) { kill(ca, SIGKILL); kill(cb, SIGKILL); wait_child(ca); wait_child(cb); return; }
+    CHECK("bridge_l2: host pings A across the bridge", icmp_ping("10.98.0.2"));
+    /* B runs its script; the host accepts B's connection on 7778 */
+    write(cB[1], &ch, 1);
+    struct pollfd pl = { hl, POLLIN, 0 };
+    int got = 0;
+    if (poll(&pl, 1, 20000) > 0) {
+        int c = accept(hl, NULL, NULL);
+        char b[32] = {0};
+        struct pollfd pc = { c, POLLIN, 0 };
+        if (c >= 0 && poll(&pc, 1, 10000) > 0 && read(c, b, sizeof b) == 7 && !memcmp(b, "to-host", 7)) { write(c, "ok", 2); got = 1; }
+        if (c >= 0) close(c);
+    }
+    CHECK("bridge_l2: B reached the host listener at 10.98.0.1", got);
+    int rb = wait_child(cb);
+    printf("B exit %d\n", rb);
+    CHECK("bridge_l2: B: UDP+TCP to A, ping bridge addr, ping A, TCP to host", rb == 0);
+    CHECK("bridge_l2: A served B and exited 0", wait_child(ca) == 0);
+    close(hl);
+    /* bridge_getlink */
+    CHECK("bridge_getlink: br0 INFO_DATA has exact-size AGEING_TIME/FORWARD_DELAY/STP_STATE/VLAN_FILTERING",
+          link_info(s, "br0", &bi) > 0 && bi.ageing_sz == 4 && bi.fwd_sz == 4 && bi.stp_sz == 4 && bi.vlan_sz == 1);
+    CHECK("bridge_getlink: defaults ageing 30000, fwd_delay 1500, stp 0, vlan_filtering 0",
+          bi.ageing == 30000 && bi.fwd == 1500 && bi.stp == 0 && bi.vlan == 0);
+    CHECK("bridge_getlink: a non-bridge has no bridge INFO_DATA", link_info(s, "vethA", &pa) > 0 && !pa.isbr);
+    /* SETLINK master release / enslave, and the bridge MAC */
+    CHECK("bridge_getlink: SETLINK IFLA_MASTER=0 releases vethA", link_set_master(s, ia, 0) == 0 && link_info(s, "vethA", &pa) > 0 && pa.master == 0);
+    CHECK("bridge_getlink: dump filter now lists one port", count_master(s, bidx) == 1);
+    CHECK("bridge_getlink: SETLINK IFLA_MASTER=br0 re-enslaves vethA", link_set_master(s, ia, bidx) == 0 && link_info(s, "vethA", &pa) > 0 && pa.master == bidx);
+    CHECK("bridge_getlink: IFLA_MASTER to a non-bridge is rejected", link_set_master(s, ia, ib) != 0);
+    unsigned char m2[6] = { 0x02, 0x00, 0x5e, 0x98, 0x00, 0x09 };
+    CHECK("bridge_getlink: SETLINK changes the bridge MAC", link_set_mac(s, bidx, m2) == 0 && link_info(s, "br0", &bi) > 0 && !memcmp(bi.mac, m2, 6));
+    /* bridge_teardown */
+    CHECK("bridge_teardown: DELLINK vethA", link_del(s, ia) == 0 && !link_get(s, "vethA", NULL, NULL));
+    CHECK("bridge_teardown: DELLINK vethB", link_del(s, ib) == 0 && !link_get(s, "vethB", NULL, NULL));
+    CHECK("bridge_teardown: DELLINK br0", link_del(s, bidx) == 0 && !link_get(s, "br0", NULL, NULL));
+    CHECK("bridge_teardown: no vifs left", count_veth(s) == 0);
+    /* a bridge deleted with a port still attached releases the port */
+    CHECK("bridge_teardown: br1 with a port", br_new(s, "br1", NULL) == 0 && veth_new_m(s, "vethC", "vethD", -1, link_get(s, "br1", NULL, NULL)) == 0);
+    int i1 = link_get(s, "br1", NULL, NULL);
+    CHECK("bridge_teardown: DELLINK br1 with a live port releases it", link_del(s, i1) == 0 && !link_get(s, "br1", NULL, NULL)
+          && link_info(s, "vethC", &pa) > 0 && pa.master == 0);
+    int ic = link_get(s, "vethC", NULL, NULL);
+    if (ic) link_del(s, ic);
+    CHECK("bridge_teardown: nothing left over", count_veth(s) == 0);
+    close(s);
+}
+
 int main(int argc, char **argv) {
     const char *only = argc > 1 ? argv[1] : NULL;
     if (!only || !strcmp(only, "veth_pair")) veth_pair();
@@ -401,6 +676,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "veth_dellink")) veth_dellink();
     if (!only || !strcmp(only, "veth_naming")) veth_naming();
     if (!only || !strcmp(only, "veth_nsgone")) veth_nsgone();
+    if (!only || !strcmp(only, "bridge_l2")) bridge_l2();
     printf("brtest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
