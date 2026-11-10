@@ -11,3 +11,13 @@ FIXED (d): ns-0 self-binds and ns-0 nsfs binds are now copied into new mount nam
 Tests (mnttest fdpath_suite, 9 cases): on unfixed main 8 FAIL (x86_64 box); all PASS on aarch64 Mac with fix. Userns cases make their fixtures before
 unshare(NEWUSER) because without idmap=test the new userns has no uid map (files created inside are EOVERFLOW/unmapped).
 NOT DONE: stat(2) on a bound nsfs path; mount(2) bind SOURCE/target given as /proc/self/fd/N (only propagation uses the link resolver).
+
+## nstest ENOSPC after mnttest: FIXED (root cause was pre-existing)
+- Cause: closing an nsfs fd (`VnodeKind::NsFd`) never dropped the namespace reference its open/dup took: `handle_close` and
+  `release_vnode` had no NsFd arm (only dup2's `pipe_ref_dec` did). Every open+close of /proc/<pid>/ns/* or a bound nsfs file leaked one
+  ref, so netns/userns slots (and the per-kuid quota) filled up; nstest depth_limit_32 then got ENOSPC. Found by bisecting the ns_live count
+  per syscall (open+close of a bound nsfs file: live 2->3).
+- Fix: NsFd arm in `handle_close` and `release_vnode` (servers/vfs/src/lib.rs). Also removed a double put on the bind_nsfs error path
+  (bind_nsfs already releases the ref). Guard: mnttest `nsfd_close_releases_namespace_refs` (100 children x open/dup/close, live count back to baseline).
+- openat2 lead: 0x1ac is open_tree (428), not openat2 (437); open_tree/move_mount/fsopen/... return ENOSYS by design so crun falls back
+  to mount(2). sys_openat2 already validates size/E2BIG/EFAULT/RESOLVE_*. The kernel-mode `SEGV addr=0x80801` was NOT reproduced; open.
