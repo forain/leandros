@@ -4564,6 +4564,9 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/sys/net/ipv6/conf/lo/forwarding", data: b"0\n" },
     RamEntry { path: b"/proc/sys/net/ipv6/conf/lo/accept_ra", data: b"1\n" },
     RamEntry { path: b"/proc/sys/net/ipv6/conf/lo/accept_dad", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/all/autoconf", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/default/autoconf", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/lo/autoconf", data: b"1\n" },
 ];
 const _: () = assert!(sched::caps::CAP_LAST == 40, "update /proc/sys/kernel/cap_last_cap");
 const _: () = assert!(sched::task::NGROUPS_MAX == 32, "update /proc/sys/kernel/ngroups_max");
@@ -7950,8 +7953,8 @@ fn oom_text(v: i32, out: &mut [u8; 12]) -> usize {
 const PROC_NETCTL_W: &[u8] = b"/tmp/.proc_netctl_";
 
 /// `/proc/sys/net/<rel>` file → slot in sched::ns::NETCTL.
-fn netctl_slot(path: &[u8]) -> Option<usize> {
-    sched::ns::netctl_find(path.strip_prefix(b"/proc/sys/net/")?)
+fn netctl_slot(ns: u16, path: &[u8]) -> Option<usize> {
+    sched::ns::netctl_find_ns(ns, path.strip_prefix(b"/proc/sys/net/")?)
 }
 
 fn gen_proc_netctl(pid: u32, k: usize, write: bool) -> Option<VnodeKind> {
@@ -9120,7 +9123,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
-        } else if let Some(k) = netctl_slot(lookup_path) {
+        } else if let Some(k) = netctl_slot(sched::ns::netns_of(pid), lookup_path) {
             // Per-netns sysctl; writing needs CAP_NET_ADMIN over the netns owner.
             let write = flags & 0o3 != 0;
             if write && !sched::caps::pid_capable_in(pid, sched::ns::owner_userns(2, sched::ns::netns_of(pid)), 12) {
