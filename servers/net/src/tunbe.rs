@@ -175,11 +175,6 @@ fn make_stack(sid: Sid, mac: [u8; 6]) {
         listens: Vec::new(),
         inet_seq: alloc::collections::BTreeMap::new(),
     });
-    // Host-netns wildcard listeners that were set up before this
-    // stack existed (httpd on 0.0.0.0 before podman0 is created) belong on it
-    // too: Linux delivers to them on every host address. `adopt` skips stacks
-    // of other namespaces (listen::stacks_for) and is a no-op with none.
-    let _ = crate::listen::adopt(sid);
 }
 
 /// Poll every up tun/tap stack once. Called from the daemon pass.
