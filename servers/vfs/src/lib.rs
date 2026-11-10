@@ -4978,6 +4978,46 @@ pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool)
     Ok(Some((cur, x.backing, x.mnt_id)))
 }
 
+/// Per-mount MS_RDONLY / MS_NODEV enforcement for a path resolved into a
+/// mount of a non-host mount namespace (`flags` are that mount's flags).
+/// EROFS for anything that modifies the tree or opens for write (special
+/// files stay writable, as on Linux); EACCES for opening a device node on a
+/// nodev mount. fds opened read-write before a remount-ro keep working.
+fn mnt_flag_check(tag: u64, msg: &Message, backing: &[u8], flags: u8) -> Result<(), i32> {
+    const S_IFMT: u32 = 0o170000;
+    let st = |b: &[u8]| -> Option<u32> {
+        let mut p = b.to_vec();
+        p.push(0);
+        let mut buf = [0u8; 256];
+        let r = handle_stat(p.as_ptr() as usize, buf.as_mut_ptr() as usize);
+        if reply_val(&r) < 0 { None } else { Some(read_stat_mode(buf.as_ptr() as usize)) }
+    };
+    if tag == VFS_OPEN {
+        let fl = arg(msg, 1) as u32;
+        if fl & O_PATH != 0 { return Ok(()); }
+        let mode = st(backing);
+        let special = matches!(mode.map(|m| m & S_IFMT), Some(0o020000) | Some(0o060000) | Some(0o010000) | Some(0o140000));
+        if flags & mnt::MNT_NODEV != 0 && matches!(mode.map(|m| m & S_IFMT), Some(0o020000) | Some(0o060000)) {
+            return Err(-13);
+        }
+        if flags & mnt::MNT_RDONLY != 0 && !special {
+            let write = fl & 3 != 0 || fl & O_TRUNC != 0;
+            if write { return Err(-30); }
+            if fl & O_CREAT != 0 && mode.is_none() { return Err(-30); }
+        }
+        return Ok(());
+    }
+    if flags & mnt::MNT_RDONLY != 0 {
+        match tag {
+            VFS_UNLINK | VFS_RMDIR | VFS_MKDIR | VFS_MKNOD | VFS_RENAME | VFS_LINK | VFS_SYMLINK
+            | VFS_CHMOD | VFS_LCHMOD | VFS_CHOWN | VFS_LCHOWN | VFS_UTIMENS | VFS_LUTIMENS
+            | VFS_SETXATTR | VFS_LSETXATTR | VFS_REMOVEXATTR | VFS_LREMOVEXATTR => return Err(-30),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>)
     -> Result<(), i32>
 {
@@ -4992,6 +5032,8 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
         let ns = sched::current_mntns();
         let rr = ns_resolve_links(ns, &cx.ns_path, follow);
         if let Some((nsp, backing, mid)) = rr? {
+            let fl = mnt::flags_of(ns, mid);
+            if fl & (mnt::MNT_RDONLY | mnt::MNT_NODEV) != 0 { mnt_flag_check(msg.tag, msg, &backing, fl)?; }
             if nsp != cx.ns_path {
                 *buf = backing;
                 buf.push(0);

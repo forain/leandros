@@ -189,6 +189,8 @@ if command -v zig >/dev/null 2>&1; then
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nstest" userland/nstest/nstest.c
     echo "[userland] Building tuntest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/tuntest" userland/tuntest/tuntest.c
+    echo "[userland] Building brtest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/brtest" userland/brtest/brtest.c
     echo "[userland] Building ovltest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ovltest" userland/ovltest/ovltest.c
     echo "[userland] Building ovlmknodtest (zig cc -target $ZT)..."
