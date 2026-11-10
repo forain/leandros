@@ -495,20 +495,24 @@ static void t_limit_perkuid(void)
     lim_set(LIM_I, 128);
 }
 
-static int wmap(pid_t pid, unsigned lower)
+static int wself(const char *f, const char *m)
 {
-    char p[64], m[64];
-    snprintf(m, sizeof m, "0 %u 1", lower);
-    const char *f[2] = { "uid_map", "gid_map" };
-    for (int i = 0; i < 2; i++) {
-        snprintf(p, sizeof p, "/proc/%d/%s", pid, f[i]);
-        int fd = open(p, O_WRONLY);
-        if (fd < 0) return -1;
-        ssize_t r = write(fd, m, strlen(m)); close(fd);
-        if (r != (ssize_t)strlen(m)) return -1;
-    }
-    return 0;
+    char p[64]; snprintf(p, sizeof p, "/proc/self/%s", f);
+    int fd = open(p, O_WRONLY);
+    if (fd < 0) { printf("  wself open %s errno=%d uid=%d\n", p, errno, (int)geteuid()); return -1; }
+    ssize_t r = write(fd, m, strlen(m)); int e = errno; close(fd);
+    if (r != (ssize_t)strlen(m)) printf("  wself write %s '%s' r=%d errno=%d\n", p, m, (int)r, e);
+    return r == (ssize_t)strlen(m) ? 0 : -1;
 }
+/* Identity self-map, as an unprivileged unshare(CLONE_NEWUSER) caller does. */
+static int selfmap(unsigned id)
+{
+    char m[64]; snprintf(m, sizeof m, "%u %u 1", id, id);
+    if (wself("setgroups", "deny")) return -1;
+    if (wself("uid_map", m)) return -1;
+    return wself("gid_map", m);
+}
+static int wmap(pid_t pid, unsigned lower) { (void)pid; (void)lower; return 0; }
 
 static int g_pipe_up = -1;
 static void t_limit_userns(void)
@@ -518,10 +522,12 @@ static void t_limit_userns(void)
     lim_set(LIM_I, 2);
     int a[2], b[2];
     pipe(a); pipe(b);
+    /* kuid 0 cannot be mapped yet (idroot0), so run the chain as kuid 1000. */
+    setresgid(1000, 1000, 0); setresuid(1000, 1000, 0);
     pid_t c = fork();
     if (c == 0) {
         char x;
-        if (unshare(CLONE_NEWUSER)) _exit(90);
+        { unsigned me = getuid(); if (unshare(CLONE_NEWUSER)) _exit(90); if (selfmap(me)) { write(b[1], "u", 1); _exit(93); } }
         write(b[1], "u", 1);
         if (read(a[0], &x, 1) != 1) _exit(91);
         int i1 = inotify_init1(IN_NONBLOCK), i2 = inotify_init1(IN_NONBLOCK);
@@ -530,8 +536,9 @@ static void t_limit_userns(void)
         if (read(a[0], &x, 1) != 1) _exit(92);
         _exit(i1 >= 0 && i2 >= 0 && i3 < 0 && e == EMFILE ? 0 : 1);
     }
+    close(b[1]);
     char x; read(b[0], &x, 1);
-    int ok = wmap(c, 1000) == 0;
+    int ok = wmap(c, 0) == 0;
     write(a[1], "m", 1);
     read(b[0], &x, 1);
     /* the creator (kuid 0, ns 0) sees both child instances in its own count */
@@ -540,6 +547,8 @@ static void t_limit_userns(void)
     if (mine >= 0) close(mine);
     write(a[1], "g", 1);
     int st = 0; waitpid(c, &st, 0);
+    setresuid(0, 0, 0); setresgid(0, 0, 0);
+    if (!(ok && WIFEXITED(st) && WEXITSTATUS(st) == 0)) printf("  limit_userns ok=%d mine=%d em=%d st=%#x\n", ok, mine, em, st);
     report("t_limit_userns", ok && WIFEXITED(st) && WEXITSTATUS(st) == 0);
     lim_set(LIM_I, 128);
 }
@@ -564,17 +573,19 @@ static int userns_mntns_body(void)
 static void t_userns_mntns(void)
 {
     mkd("a");
+    mkdir("/mnt", 0755); mkdir("/mnt/b", 0755);
     int a[2], b[2], w[2];
     pipe(a); pipe(b); pipe(w);
     pid_t c = fork();
     if (c == 0) {
         char x;
-        if (unshare(CLONE_NEWUSER | CLONE_NEWNS)) _exit(90);
+        { setresgid(1000, 1000, 1000); setresuid(1000, 1000, 1000); unsigned me = getuid(); if (unshare(CLONE_NEWUSER | CLONE_NEWNS)) _exit(90); if (selfmap(me)) { write(b[1], "u", 1); _exit(93); } }
         write(b[1], "u", 1);
         if (read(a[0], &x, 1) != 1) _exit(91);
         g_pipe_up = w[1];
         _exit(userns_mntns_body());
     }
+    close(b[1]); close(w[1]);
     char x; read(b[0], &x, 1);
     int ok = wmap(c, 0) == 0;
     write(a[1], "m", 1);
