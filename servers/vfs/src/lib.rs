@@ -15266,6 +15266,14 @@ fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
         write_statfs(buf_ptr, &cgroup_statfs());
         return statfs_reply();
     }
+    // A bound namespace file (/.leandros-ns/..) is nsfs: containers/common
+    // checks the magic of the file it bound at /run/netns/<name>.
+    if path.starts_with(alias::NS_SRC) {
+        let mut v = procfs_statfs();
+        v.f_type = 0x6e73_6673;
+        write_statfs(buf_ptr, &v);
+        return statfs_reply();
+    }
     if !is_tmp_path(path)
         && (path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path) || sysclass::is_path(path)) {
         write_statfs(buf_ptr, &procfs_statfs());
@@ -15305,11 +15313,13 @@ fn handle_fstatfs(pid: u32, fd: usize, buf_ptr: usize) -> Message {
     if buf_ptr == 0 { return err_reply(-14); }
     let mut tmp_idx = None;
     let mut is_cg = false;
+    let mut is_ns = false;
     let port = {
         let mut tbls = TblSlot::new();
         let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
         if !tbl.fds.used(fd) { return err_reply(-9); }
         match tbl.fds[fd].kind {
+            VnodeKind::NsFd { .. } => { is_ns = true; None }
             VnodeKind::MountedFile { port, .. } => Some(port),
             VnodeKind::TmpFile { idx, .. } => { tmp_idx = Some(idx); None }
             VnodeKind::SysBlock { dev, .. } if cgroupfs::is_dev(dev) => { is_cg = true; None }
@@ -15320,6 +15330,12 @@ fn handle_fstatfs(pid: u32, fd: usize, buf_ptr: usize) -> Message {
         let tmp = TMP_FILES.lock();
         let p = tmp[idx].path();
         if tmp[idx].ephemeral() && (p.starts_with(cgroupfs::SNAP_R) || p.starts_with(cgroupfs::SNAP_W)) { is_cg = true; }
+    }
+    if is_ns {
+        let mut v = procfs_statfs();
+        v.f_type = 0x6e73_6673;
+        write_statfs(buf_ptr, &v);
+        return statfs_reply();
     }
     if is_cg {
         write_statfs(buf_ptr, &cgroup_statfs());
