@@ -7982,10 +7982,9 @@ fn open_proc_task(caller: u32, t: ProcTask, flags: u32) -> Result<VnodeKind, i32
 }
 
 /// `/proc/<pid>/environ` is readable by root and by the process's owner
-/// (Linux: a PTRACE_MODE_READ check).
+/// (Linux: PTRACE_MODE_READ_FSCREDS, so non-dumpable targets need CAP_SYS_PTRACE).
 fn proc_environ_allowed(caller: u32, target: u32) -> bool {
-    let me = sched::euid_of(caller);
-    sched::host_root_of(caller) || me == sched::euid_of(target)
+    sched::host_root_of(caller) || sched::cred::ptrace_read_check(caller, target) == 0
 }
 
 /// stat of a per-process procfs path: `None` not one; `Some(None)` it names

@@ -33,7 +33,7 @@ fn peer_mac(mac: [u8; 6]) -> [u8; 6] { let mut m = mac; m[5] ^= 0x80; m }
 
 fn name_len(n: &[u8; 16]) -> usize { n.iter().position(|&b| b == 0).unwrap_or(16) }
 
-fn is_tun_kind(k: VifKind) -> bool { matches!(k, VifKind::Tap | VifKind::Tun | VifKind::Veth) }
+fn is_tun_kind(k: VifKind) -> bool { matches!(k, VifKind::Tap | VifKind::Tun | VifKind::Veth | VifKind::Bridge) }
 
 // ── hooks ────────────────────────────────────────────────────────────────────
 
@@ -91,7 +91,7 @@ fn attach(ns: u16, name: &[u8; 16], tap: bool, h: TunHandle) -> Result<(u32, [u8
         st.next_ifindex += 1;
         let mac = [0x02, 0x00, 0x5e, 0x10, (sid as u8), 0x01];
         v[sid] = Some(Vif { netns: ns, ifindex, name: fin, kind, admin_up: false, mtu: 1500, mac,
-                            addrs: Vec::new(), rxq: VecDeque::new(), tun: h, pending: false, peer: NO_PEER });
+                            addrs: Vec::new(), rxq: VecDeque::new(), tun: h, pending: false, peer: NO_PEER, master: NO_PEER });
         st.sids.push(sid as Sid);
         (sid as Sid, fin, ifindex, mac)
     };
@@ -189,13 +189,18 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
     }
     for sid in sids {
         // Drain the vif's queue before the stack lock is taken.
-        let (rx, mtu, h, l3, mac, peer) = {
+        let (rx, mtu, h, l3, mac, peer, kind, master) = {
             let mut v = VIFS.lock();
             let Some(x) = v[sid as usize].as_mut() else { continue };
             x.pending = false;
             let peer = if x.kind == VifKind::Veth { Some(x.peer) } else { None };
-            (core::mem::take(&mut x.rxq), x.mtu as usize, x.tun, x.kind == VifKind::Tun, x.mac, peer)
+            (core::mem::take(&mut x.rxq), x.mtu as usize, x.tun, x.kind == VifKind::Tun, x.mac, peer, x.kind, x.master)
         };
+        // A bridge port has no stack: what its peer sent goes into the switch.
+        if kind == VifKind::Veth && master != NO_PEER {
+            if !rx.is_empty() { crate::l2::forward(master, sid, rx.into_iter().collect()); }
+            continue;
+        }
         let mut dev = TapDev { rx, tx: Vec::new(), mtu };
         {
             let mut g = stack_for(sid);
@@ -208,7 +213,12 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
                 }
             }
         }
-        // Stack lock released: a veth end hands its frames to the other end.
+        // Stack lock released: the bridge's own frames enter the switch.
+        if kind == VifKind::Bridge {
+            if !dev.tx.is_empty() { crate::l2::forward(sid, sid, dev.tx); }
+            continue;
+        }
+        // A veth end hands its frames to the other end.
         if let Some(p) = peer {
             if dev.tx.is_empty() { continue; }
             let mut v = VIFS.lock();
@@ -332,12 +342,14 @@ pub(crate) fn links(ns: u16) -> Vec<rtnetlink::Link> {
                 index: x.ifindex,
                 name: alloc::string::String::from(core::str::from_utf8(&x.name[..name_len(&x.name)]).unwrap_or("?")),
                 mac: x.mac, mtu: x.mtu, up: x.admin_up,
-                running: x.admin_up && if x.kind == VifKind::Veth {
+                running: x.admin_up && if x.kind == VifKind::Bridge { true } else if x.kind == VifKind::Veth {
                     v.get(x.peer as usize).and_then(|p| p.as_ref()).map_or(false, |p| p.admin_up)
                 } else { x.tun != NO_TUN },
                 tap: true, loopback: false,
                 addr: if x.admin_up { x.addrs.first().copied() } else { None },
                 veth: x.kind == VifKind::Veth,
+                master: if x.master != NO_PEER { v.get(x.master as usize).and_then(|m| m.as_ref()).map_or(0, |m| m.ifindex) } else { 0 },
+                br: if x.kind == VifKind::Bridge { let c = crate::l2::cfg_get(s); Some((c.ageing, c.fwd_delay, c.stp, c.vlan)) } else { None },
                 peer: if x.kind == VifKind::Veth { v.get(x.peer as usize).and_then(|p| p.as_ref()).map_or(0, |p| p.ifindex) } else { 0 },
             });
         }
@@ -389,7 +401,7 @@ fn sid_of_index(st: &NetNsState, v: &vifsel::VifTable, index: u32) -> Option<Sid
 pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
     if !sched::caps::ns_capable_in(sched::ns::owner_userns(1, ns), CAP_NET_ADMIN) { return 1; }
     match op {
-        RtOp::SetLink { index, up, mtu, mac, name } => {
+        RtOp::SetLink { index, up, mtu, mac, name, master } => {
             let sid;
             {
                 let nss = NETNS.lock();
@@ -416,10 +428,15 @@ pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
                     s.interface.set_hardware_addr(HardwareAddress::Ethernet(EthernetAddress(m)));
                 }
             }
+            if let Some(m) = master {
+                let e = if m == 0 { release(sid) } else { enslave(ns, sid, m) };
+                if e != 0 { return e; }
+            }
             drivers::netdev::kick();
             0
         }
-        RtOp::NewVeth { name, mtu, mac, up, peer } => veth_create(ns, name, mtu, mac, up, peer),
+        RtOp::NewVeth { name, mtu, mac, up, master, peer } => veth_create(ns, name, mtu, mac, up, master, peer),
+        RtOp::NewBridge { name, mtu, mac, up, opts } => bridge_create(ns, name, mtu, mac, up, opts),
         RtOp::DelLink { index } => veth_delete(ns, index),
         RtOp::AddAddr { index, addr, prefix, excl } => {
             let (sid, addrs);
@@ -568,7 +585,7 @@ fn pick_name(st: &NetNsState, v: &vifsel::VifTable, base: &[u8], also: Option<&[
 }
 
 fn veth_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>, mac: Option<[u8; 6]>, up: bool,
-               peer: rtnetlink::VethPeer) -> i32 {
+               master: Option<u32>, peer: rtnetlink::VethPeer) -> i32 {
     let pns = match resolve_peer_ns(&peer.ns, ns) { Ok(n) => n, Err(e) => return e };
     if pns != ns && !sched::caps::ns_capable_in(sched::ns::owner_userns(1, pns), CAP_NET_ADMIN) { return 1; }
     for m in [mtu, peer.mtu].into_iter().flatten() { if !(68..=65535).contains(&m) { return 22; } }
@@ -592,7 +609,7 @@ fn veth_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>, m
         let ib = { let st = nss.get_mut(&pns).unwrap(); let i = st.next_ifindex; st.next_ifindex += 1; i };
         let mk = |ns, ifindex, name, up, mtu: Option<u32>, mac, peer| Vif {
             netns: ns, ifindex, name, kind: VifKind::Veth, admin_up: up, mtu: mtu.unwrap_or(1500), mac,
-            addrs: Vec::new(), rxq: VecDeque::new(), tun: NO_TUN, pending: false, peer,
+            addrs: Vec::new(), rxq: VecDeque::new(), tun: NO_TUN, pending: false, peer, master: NO_PEER,
         };
         v[sa] = Some(mk(ns, ia, na, up, mtu, ma, sb as Sid));
         v[sb] = Some(mk(pns, ib, nb, peer.up, peer.mtu, mb, sa as Sid));
@@ -602,22 +619,112 @@ fn veth_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>, m
     };
     make_stack(sa, ma);
     make_stack(sb, mb);
+    // IFLA_MASTER at create: the main end joins a bridge of `ns`, the peer one of `pns`.
+    for (n, s, m) in [(ns, sa, master), (pns, sb, peer.master)] {
+        let Some(m) = m.filter(|&m| m != 0) else { continue };
+        let e = enslave(n, s, m);
+        if e != 0 { crate::vif::free_vifs(&[(ns, sa), (pns, sb)]); return e; }
+    }
+    drivers::netdev::kick();
+    0
+}
+
+/// Enslave veth end `sid` of `ns` to the bridge with ifindex `br_index` (same namespace).
+/// The port gives up its own stack: its frames go to the switch (`l2`).
+fn enslave(ns: u16, sid: Sid, br_index: u32) -> i32 {
+    {
+        let nss = NETNS.lock();
+        let mut v = VIFS.lock();
+        let Some(st) = nss.get(&ns) else { return 19 };
+        let Some(b) = st.sids.iter().copied().find(|&s| v[s as usize].as_ref().map_or(false, |x| x.ifindex == br_index)) else { return 19 };
+        if v[b as usize].as_ref().map_or(true, |x| x.kind != VifKind::Bridge) { return 22; }
+        let Some(x) = v[sid as usize].as_mut() else { return 19 };
+        if x.kind != VifKind::Veth { return 22; }
+        if x.master == b { return 0; }
+        if x.master != NO_PEER { return 16; } // EBUSY: enslaved to another master
+        x.master = b;
+        x.addrs.clear();
+        x.rxq.clear();
+    }
+    {
+        let mut nss = NETNS.lock();
+        if let Some(st) = nss.get_mut(&ns) { st.routes.retain(|r| r.oif != sid); }
+    }
+    crate::l2::forget(sid);
+    // No table lock is held: the stack lock is taken alone.
+    *stack_for(sid) = None;
+    drivers::netdev::kick();
+    0
+}
+
+/// Release a port from its bridge: it owns a stack again.
+fn release(sid: Sid) -> i32 {
+    let mac = {
+        let mut v = VIFS.lock();
+        let Some(x) = v[sid as usize].as_mut() else { return 19 };
+        if x.master == NO_PEER { return 0; }
+        x.master = NO_PEER;
+        x.rxq.clear();
+        x.mac
+    };
+    crate::l2::forget(sid);
+    make_stack(sid, mac);
+    drivers::netdev::kick();
+    0
+}
+
+fn bridge_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>, mac: Option<[u8; 6]>, up: bool,
+                 opts: rtnetlink::BrOpts) -> i32 {
+    if let Some(m) = mtu { if !(68..=65535).contains(&m) { return 22; } }
+    crate::vif::claim(ns);
+    let (sid, m) = {
+        let mut nss = NETNS.lock();
+        let mut v = VIFS.lock();
+        nss.entry(ns).or_insert_with(|| NetNsState::new(ns));
+        if nss[&ns].sids.len() + 1 > ns_sid_cap(ns) { return 23; }
+        let nm = match pick_name(&nss[&ns], &v, name.as_deref().unwrap_or("br%d").as_bytes(), None) { Ok(n) => n, Err(e) => return e };
+        let Some(sid) = (FIRST_DYN as usize..MAX_STACKS).find(|&i| v[i].is_none()) else { return 23 };
+        let m = mac.unwrap_or([0x02, 0x00, 0x5e, 0x12, sid as u8, 0x01]);
+        let st = nss.get_mut(&ns).unwrap();
+        let ifindex = st.next_ifindex;
+        st.next_ifindex += 1;
+        v[sid] = Some(Vif {
+            netns: ns, ifindex, name: nm, kind: VifKind::Bridge, admin_up: up, mtu: mtu.unwrap_or(1500), mac: m,
+            addrs: Vec::new(), rxq: VecDeque::new(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER,
+        });
+        st.sids.push(sid as Sid);
+        (sid as Sid, m)
+    };
+    let d = crate::l2::DEFAULT_CFG;
+    crate::l2::cfg_set(sid, crate::l2::BrCfg {
+        ageing: opts.ageing.unwrap_or(d.ageing), fwd_delay: opts.fwd_delay.unwrap_or(d.fwd_delay),
+        stp: opts.stp.unwrap_or(d.stp), vlan: opts.vlan.unwrap_or(d.vlan),
+    });
+    make_stack(sid, m);
     drivers::netdev::kick();
     0
 }
 
 fn veth_delete(ns: u16, index: u32) -> i32 {
+    let mut ports: Vec<Sid> = Vec::new();
     let list = {
         let nss = NETNS.lock();
         let v = VIFS.lock();
         let Some(st) = nss.get(&ns) else { return 19 };
         let Some(sid) = st.sids.iter().copied().find(|&s| v[s as usize].as_ref().map_or(false, |x| x.ifindex == index)) else { return 19 };
         let x = v[sid as usize].as_ref().unwrap();
+        if x.kind == VifKind::Bridge {
+            ports = (0..v.len()).filter(|&i| v[i].as_ref().map_or(false, |p| p.master == sid)).map(|i| i as Sid).collect();
+            alloc::vec![(ns, sid)]
+        } else {
         if x.kind != VifKind::Veth { return 95; }
         let mut l = alloc::vec![(ns, sid)];
         if let Some(p) = v.get(x.peer as usize).and_then(|p| p.as_ref()) { l.push((p.netns, x.peer)); }
         l
+        }
     };
+    // Ports of a deleted bridge are released, not deleted (Linux).
+    for p in ports { release(p); }
     crate::vif::free_vifs(&list);
     0
 }

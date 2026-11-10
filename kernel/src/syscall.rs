@@ -7103,29 +7103,36 @@ fn sys_execve_kp(kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: boo
     // (or a private one shared with other processes) leaves it with a copy.
     let exec_tgid = sched::current_tgid();
     let mut exec_copied = false;
+    let mut exec_src = exec_tgid;
     if sched::fdkey::any() {
         match sched::fdkey::override_of(pre_tid) {
             None => {
                 if let Some(n) = fd_detach_sharers(exec_tgid) {
                     exec_copied = vfs::copy_fd_table(n, exec_tgid, exec_tgid);
+                    if exec_copied { exec_src = n; }
                 }
             }
             Some(k) => {
                 let shared = if k & sched::fdkey::FD_KEY_PRIVATE != 0 { sched::fdkey::users(k, exec_tgid) > 1 }
                              else { k != exec_tgid };
                 if shared && vfs::copy_fd_table(k, exec_tgid, exec_tgid) {
+                    exec_src = k;
                     let _ = sched::fdkey::drop(pre_tid);
                     exec_copied = true;
                 }
             }
         }
-        if exec_copied { fd_redup_handles(exec_tgid); }
+        if exec_copied { fd_redup_handles(exec_tgid, exec_src, exec_tgid); }
     }
     if let Some((key, tgid, _)) = sched::fdkey::drop(pre_tid) {
-        for (_, h) in vfs::handle_fds(tgid) { close_handle(pre_tid, h); }
+        let nm = make_vfs_msg(net_server::NET_CLOSE_ALL, &[tgid as u64]);
+        let _ = net_server::handle(&nm, tgid);
+        epoll_close_all(tgid);
         let m = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[tgid as u64]);
         let _ = vfs::handle(&m, tgid);
         vfs::rekey_table(key, tgid);
+        net_server::rekey_table(key, tgid);
+        epoll_rekey(key, tgid);
     }
     sched::robust::release_orphans(sched::current_tgid());
     let pid = current_pid();
@@ -7147,7 +7154,7 @@ fn sys_execve_kp(kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: boo
     let _ = vfs::handle(&cloexec_msg, fd_owner);
     let net_cloexec = make_vfs_msg(net_server::NET_EXEC_CLOEXEC, &[fd_owner as u64]);
     let _ = net_server::handle(&net_cloexec, fd_owner);
-    epoll_exec_cloexec(fd_owner);
+    epoll_exec_cloexec(ep_key(fd_owner));
     // A socket's or an epoll fd's close-on-exec flag lives on its handle,
     // which the sweeps above just closed if it was set; drop the descriptors
     // left naming nothing.
@@ -8563,11 +8570,9 @@ fn fd_private() -> bool {
 /// Re-create every descriptor of `tid`'s table as its own handle: a socket or
 /// epoll handle is owned by exactly one descriptor (dup makes a new handle),
 /// so a copied table must not share handle numbers with its source.
-fn fd_redup_handles(tid: u32) {
-    const F_GETFD: usize = 1;
+fn fd_redup_handles(tid: u32, src: u32, dst: u32) {
     for (fd, h) in vfs::handle_fds(tid) {
-        let cloexec = sys_fcntl(h, F_GETFD, 0) == 1;
-        let d = dup_handle(tid, h, cloexec);
+        let d = dup_handle_across(src, dst, h);
         if d >= 0 { let _ = vfs::install_handle_at(tid, fd, d as usize); }
         else { let m = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]); let _ = vfs::handle(&m, tid); }
     }
@@ -8580,7 +8585,10 @@ fn fd_detach_sharers(tgid: u32) -> Option<u32> {
     if !sched::fdkey::any() || !sched::fdkey::has_sharers(tgid) { return None; }
     let n = sched::fdkey::alloc_key();
     vfs::rekey_table(tgid, n);
-    if sched::fdkey::rekey_shared(tgid, n) { Some(n) } else { vfs::rekey_table(n, tgid); None }
+    net_server::rekey_table(tgid, n);
+    epoll_rekey(tgid, n);
+    if sched::fdkey::rekey_shared(tgid, n) { Some(n) }
+    else { vfs::rekey_table(n, tgid); net_server::rekey_table(n, tgid); epoll_rekey(n, tgid); None }
 }
 
 /// CLONE_FILES for a non-thread child: it names the creator's fd table.
@@ -8597,7 +8605,7 @@ fn fd_unshare_current() -> isize {
     // the caller continues on a copy.
     if old == tgid && sched::fdkey::thread_group_single(tgid) {
         if let Some(n) = fd_detach_sharers(tgid) {
-            if vfs::copy_fd_table(n, tgid, tgid) { fd_redup_handles(tgid); }
+            if vfs::copy_fd_table(n, tgid, tgid) { fd_redup_handles(tgid, n, tgid); }
             return 0;
         }
     }
@@ -8610,7 +8618,7 @@ fn fd_unshare_current() -> isize {
         let _ = vfs::handle(&m, tid);
         return -12;
     }
-    fd_redup_handles(tid);
+    fd_redup_handles(tid, old, new);
     0
 }
 
@@ -8717,7 +8725,7 @@ fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
     // Number-keyed registrations first, while the numbers still name the
     // files being closed (see `epoll_release_fd`); description-keyed ones go
     // with the description's last reference.
-    if !cloexec && !fd_private() { epoll_drop_range(tgid, first, end); }
+    if !cloexec && !fd_private() { epoll_drop_range(ep_cur(), first, end); }
     // One table holds every kind of descriptor (sockets and epoll fds are
     // entries in it), so one listing covers them all.
     let open: alloc::vec::Vec<usize> = vfs::open_fds(tgid).into_iter()
@@ -9315,7 +9323,7 @@ fn resolve_scoped(dirfd: usize, raw: &[u8], resolve: u64, follow_final: bool) ->
 /// names (see `sock_alias_args`), so those registrations are keyed by the
 /// hidden number: drop them first, before the number can be reused.
 fn close_sock_alias_target(pid: u32, sock: usize) {
-    if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), sock); }
+    if !fd_private() { epoll_release_fd(pid, ep_cur(), sock); }
     let msg = make_vfs_msg(net_server::NET_CLOSE, &[sock as u64]);
     let _ = net_server::handle(&msg, pid);
 }
@@ -9332,7 +9340,7 @@ fn sys_close(fd: usize) -> isize {
     // the number is closed (`vfs::close_console`): a write, fstat or second
     // close is EBADF, and the next open may reuse it, as on Linux.
     if fd <= 2 && !vfs::fd_redirected(pid, fd) {
-        if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), fd); }
+        if !fd_private() { epoll_release_fd(pid, ep_cur(), fd); }
         vfs::close_console(pid, fd);
         return 0;
     }
@@ -9346,7 +9354,7 @@ fn sys_close(fd: usize) -> isize {
         // register that — a forget after the close would then delete the
         // newcomer's registration (measured: a notify/mio waker lost that way
         // hung cosmic-term's exit in tokio's blocking-pool shutdown).
-        if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), fd); }
+        if !fd_private() { epoll_release_fd(pid, ep_cur(), fd); }
     }
     let msg = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
@@ -11009,7 +11017,7 @@ fn close_handle(pid: u32, h: usize) {
 /// Is handle `h` still open in thread group `tgid` (after an exec sweep or a
 /// fork that did not copy it)?
 fn handle_alive(tgid: u32, h: usize) -> bool {
-    if is_epoll_handle(h) { epoll_slot_for(h, tgid).is_some() }
+    if is_epoll_handle(h) { epoll_slot_for(h, ep_key(tgid)).is_some() }
     else if is_sock_handle(h) { net_server::sock_is_open(tgid, h) }
     else { true }
 }
@@ -11031,7 +11039,7 @@ const ANON_INODE_INO: u64 = 0x5000_0000;
 fn handle_stat(pid: u32, h: usize) -> Option<(u32, u64, u64)> {
     const S_IFSOCK: u32 = 0o140000;
     if is_epoll_handle(h) {
-        return epoll_slot_for(h, sched::tgid_of(pid)).map(|_| (0o600, ANON_INODE_INO, ANON_INODE_DEV));
+        return epoll_slot_for(h, ep_key(pid)).map(|_| (0o600, ANON_INODE_INO, ANON_INODE_DEV));
     }
     if is_sock_handle(h) {
         return net_server::fd_ofd(pid, h).map(|ofd| (S_IFSOCK | 0o777, ofd as u64, SOCKFS_DEV));
@@ -11057,7 +11065,7 @@ fn not_a_socket(number: usize, fd: usize) -> Option<isize> {
     // Epoll fds live above the socket range, in their own table: an open one
     // is a non-socket too, a closed (or never-held) number is EBADF.
     if is_epoll_handle(fd) {
-        return Some(if epoll_slot_for(fd, sched::current_tgid()).is_some() { -88 } else { -9 });
+        return Some(if epoll_slot_for(fd, ep_cur()).is_some() { -88 } else { -9 });
     }
     if is_sock_handle(fd) { return None; }
     Some(if vfs::fd_ofd(current_pid(), fd).is_some() { -88 } else { -9 }) // ENOTSOCK / EBADF
@@ -11120,7 +11128,7 @@ fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
             let target = fd_handle(newfd);
             if target != newfd { close_handle(pid, target); }
             else if vfs::vfs_get_node_kind(pid, newfd).is_some() {
-                if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), newfd); }
+                if !fd_private() { epoll_release_fd(pid, ep_cur(), newfd); }
             }
             let r = vfs::install_handle_at(pid, newfd, dup as usize);
             if r < 0 { close_handle(pid, dup as usize); }
@@ -11140,7 +11148,7 @@ fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     // registrations go with it, before the number is reused (Linux keys them
     // by file, and the file that lands on newfd was never registered).
     if newfd != usize::MAX && newfd != oldfd && vfs::vfs_get_node_kind(pid, oldfd).is_some() {
-        if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), newfd); }
+        if !fd_private() { epoll_release_fd(pid, ep_cur(), newfd); }
     }
     let msg = make_vfs_msg(tag, &[oldfd as u64, newfd as u64, flags as u64]);
     let r = vfs_reply_val(&vfs::handle(&msg, pid));
@@ -12267,7 +12275,9 @@ fn vfs_close_all_for(pid: u32) {
     if let Some((key, _tgid, last)) = sched::fdkey::drop(pid) {
         // (A plain key names another process's table: its owner frees it.)
         if last && key & sched::fdkey::FD_KEY_PRIVATE != 0 {
-            for (_, h) in vfs::handle_fds(key) { close_handle(pid, h); }
+            let nm = make_vfs_msg(net_server::NET_CLOSE_ALL, &[key as u64]);
+            let _ = net_server::handle(&nm, pid);
+            epoll_close_all(key);
             let m = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[key as u64]);
             let _ = vfs::handle(&m, pid);
         }
@@ -13911,6 +13921,39 @@ fn fork_dup_tables(parent_pid: u32, child_pid: u32) {
     }
 }
 
+/// The epoll holder id of process `pid`: its fd-table key, so CLONE_FILES
+/// sharers hold one set of epoll fds (like the VFS table).
+fn ep_key(pid: u32) -> u32 {
+    if pid & sched::fdkey::FD_KEY_PRIVATE != 0 { pid } else { vfs::tbl_key(sched::tgid_of(pid)) }
+}
+
+/// The calling thread's epoll holder id.
+fn ep_cur() -> u32 { vfs::tbl_key(sched::current_tgid()) }
+
+/// The fd table `from` becomes `to`: its epoll holds and instance ownership follow.
+fn epoll_rekey(from: u32, to: u32) {
+    let mut ep = EPOLL_INSTANCES.lock();
+    let mut t = EPOLL_FDS.lock();
+    for e in t.t.iter_mut() { if e.in_use && e.tgid == from { e.tgid = to; } }
+    for h in t.extra.iter_mut() { if h.tgid == from { h.tgid = to; } }
+    for inst in ep.iter_mut() {
+        if inst.in_use && inst.owner_tgid == from { inst.owner_tgid = to; inst.owner_pid = to; }
+    }
+}
+
+/// Duplicate handle `h` of table `src` into table `dst` (a split fd table:
+/// every descriptor gets its own handle). Returns the new handle.
+fn dup_handle_across(src: u32, dst: u32, h: usize) -> isize {
+    if is_epoll_handle(h) {
+        let cx = EPOLL_FDS.lock().held_by(src).iter().any(|&(i, c)| c && EPOLL_FD_BASE + i == h);
+        return epoll_dup_into(h, src, dst, cx);
+    }
+    let cx = net_server::sock_cloexec(src, h);
+    let d = net_server::dup_in(src, h, cx);
+    if d < 0 { return d; }
+    net_server::move_slot(src, d as usize, dst)
+}
+
 fn epoll_fork_dup(parent: u32, child: u32) {
     let mut t = EPOLL_FDS.lock();
     for (i, cloexec) in t.held_by(parent) { t.add_holder(i, child, cloexec); }
@@ -14067,7 +14110,7 @@ static EPOLL_INSTANCES: sched::lockwatch::TrackedMutex<alloc::vec::Vec<EpollInst
 /// (and all interests with it) when the last alias goes away.
 fn sys_epoll_close(epfd: usize) -> isize {
     match epoll_fd_index(epfd) {
-        Some(i) => epoll_fd_drop(i, sched::current_tgid()),
+        Some(i) => epoll_fd_drop(i, ep_cur()),
         None => -9,
     }
 }
@@ -14236,7 +14279,7 @@ fn sys_epoll_create1(flags: usize) -> isize {
     }
     // Owner is the thread group, not the creating thread: the instance must
     // survive its creator thread's exit and be cleaned up with the process.
-    let pid = sched::current_tgid();
+    let pid = ep_cur();
     let mut ep = EPOLL_INSTANCES.lock();
     let mut t = EPOLL_FDS.lock();
     let i = match ep.iter().position(|e| !e.in_use) {
@@ -14274,7 +14317,7 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     // process (real POSIX fd-table semantics) — see the identical comment on
     // sys_epoll_wait's check for the bug this fixes — and by a fork child's
     // copy of the number (`epoll_fork_dup`).
-    let tgid = sched::current_tgid();
+    let tgid = ep_cur();
     // The event is read before EPOLL_INSTANCES is taken, fault-tolerantly: a
     // fault under that lock stalls every epoll caller, and a bad pointer is
     // EFAULT, not a killed caller holding it. (Not necessarily 8-byte
@@ -14523,7 +14566,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
     if !validate_user_buf(events_ptr, maxevents * EPOLL_EVENT_SIZE) { return -14; }
 
     // Held by the caller's thread group: its creator, a dup, or a fork copy.
-    let slot = match epoll_slot_for(epfd, sched::current_tgid()) {
+    let slot = match epoll_slot_for(epfd, ep_cur()) {
         Some(s) => s,
         None => return -9, // EBADF
     };
@@ -16183,7 +16226,7 @@ fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
     // `poll_fd()` IS an epoll fd) returned from `dispatch(100ms)` ~4600×/s in
     // the COSMIC panel.
     if is_epoll_handle(fd) {
-        let slot = match epoll_slot_for(fd, sched::tgid_of(pid)) { Some(s) => s, None => return POLLNVAL };
+        let slot = match epoll_slot_for(fd, ep_key(pid)) { Some(s) => s, None => return POLLNVAL };
         {
             // Scoped: the lock must be dropped before the recursive probe —
             // epoll_any_ready_nested re-takes it per interest (invariant

@@ -10,7 +10,7 @@ pub(crate) type Sid = u8;
 pub(crate) const MAX_STACKS: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum VifKind { Lo, Tap, Tun, Veth }
+pub(crate) enum VifKind { Lo, Tap, Tun, Veth, Bridge }
 
 pub(crate) struct Vif {
     pub netns: u16,
@@ -30,6 +30,8 @@ pub(crate) struct Vif {
     pub pending: bool,
     /// Veth: the other end's sid (`NO_PEER` = none). The ends may live in different netns.
     pub peer: Sid,
+    /// Veth: the bridge this end is enslaved to (`NO_PEER` = none). A port owns no stack.
+    pub master: Sid,
 }
 
 pub(crate) const NO_PEER: Sid = 255;
@@ -100,7 +102,7 @@ mod tests {
 
     fn vif(up: bool, addrs: &[([u8; 4], u8)]) -> Vif {
         Vif { netns: 1, ifindex: 2, name: [0; 16], kind: VifKind::Lo, admin_up: up, mtu: 1500, mac: [0; 6],
-              addrs: addrs.to_vec(), rxq: VecDeque::new(), tun: NO_TUN, pending: false, peer: NO_PEER }
+              addrs: addrs.to_vec(), rxq: VecDeque::new(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER }
     }
 
     #[test]

@@ -511,10 +511,7 @@ pub fn ptrace_read_check(caller_pid: Pid, target: Pid) -> isize {
     let (u, g) = (c.fsuid, c.fsgid);
     let ids_ok = t.uid == u && t.euid == u && t.suid == u && t.gid == g && t.egid == g && t.sgid == g;
     let dumpable = rq.find_pid(t.tgid).unwrap_or(t).dumpable;
-        // A process that dropped privileges (root -> nobody, as passt/pasta do before
-    // spawning its namespace child) is not dumpable. A same-uid caller may still
-    // open the ns links of a process that lives in a non-initial user namespace:
-    // the fd only names a namespace, and rootless pasta/podman need it (lane pasta).
-    let in_userns = t.userns.id() != 0;
-    if ids_ok && (dumpable || in_userns) { 0 } else { EACCES }
+    // Non-dumpable targets need CAP_SYS_PTRACE in their userns (checked above); the
+    // caller lacks it here, so ids_ok && dumpable is the only way in.
+    if ids_ok && dumpable { 0 } else { EACCES }
 }
