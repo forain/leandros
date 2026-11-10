@@ -144,6 +144,11 @@ pub fn translate(ns: NsId, path: &[u8]) -> Option<Xlat> {
     walk(&g.get(&ns)?.mnts, path)
 }
 
+/// Flags of mount `id` in namespace `ns` (0 when unknown).
+pub fn flags_of(ns: NsId, id: u32) -> u8 {
+    NS.lock().get(&ns).and_then(|n| n.mnts.iter().find(|m| m.id == id)).map_or(0, |m| m.flags)
+}
+
 /// Absolute namespace path of the mountpoint of `m`.
 fn ns_mountpoint(t: &[Mnt], mut i: usize) -> Vec<u8> {
     let mut parts: Vec<&[u8]> = Vec::new();

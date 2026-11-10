@@ -6235,6 +6235,8 @@ fn parse_shebang(buf: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
 /// (ENOSYS: the initrd) falls back to the stat mode bits.
 fn exec_permitted(kp: &KPath, pid: u32) -> isize {
     const X_OK: u64 = 1;
+    // MS_NOEXEC on the file's mount (mount namespaces other than the host's).
+    if kp.mnt_id != 0 && vfs::mnt::flags_of(sched::current_mntns(), kp.mnt_id) & vfs::mnt::MNT_NOEXEC != 0 { return -13; }
     let amsg = make_vfs_msg(vfs::VFS_ACCESS, &[kp.ptr() as u64, X_OK]);
     let ar = vfs_reply_val(&vfs::handle(&amsg, pid));
     // Only a refusal is an answer: a missing file (ENOENT) or a filesystem
