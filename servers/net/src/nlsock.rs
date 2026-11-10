@@ -169,6 +169,7 @@ fn trace_rep(replies: &[Vec<u8>], ns: u16) {
 /// A request arrived: queue the replies and wake pollers. Returns the length.
 pub fn send(ofd: u32, data: &[u8]) -> Message {
     let (pid, ns) = match NL.lock().get(&ofd) { Some(s) => (s.pid, s.ns.id()), None => return err_reply(-9) };
+    crate::vif::daemon_pass(); // reap veth pairs of namespaces that died
     let links = rt::current_links(ns);
     let routes = rt::current_routes(ns);
     let lo_set = |up: bool| { if ns == 0 { false } else { sched::ns::set_lo_admin_up(ns, up); true } };

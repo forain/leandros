@@ -106,7 +106,7 @@ SUITES = {
                 "if [ \"$(uname -m)\" = aarch64 ]; then drmsmoke --arm-v3d && MESA_LOADER_DRIVER_OVERRIDE=v3d kmscube -c 30; __k=$?; drmsmoke --disarm-v3d; test $__k = 0; fi",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/netlinktest", "/bin/udpselftest", "/bin/udptest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/mnttest", "/bin/nstest", "/bin/tuntest", "/bin/cgtest", "/bin/ovltest", "/bin/ovlmknodtest", "/bin/idmaptest", "/bin/captest", "/bin/seccomptest", "/bin/bpftest", "/bin/preadtest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
+                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/mnttest", "/bin/nstest", "/bin/tuntest", "/bin/brtest", "/bin/cgtest", "/bin/ovltest", "/bin/ovlmknodtest", "/bin/idmaptest", "/bin/captest", "/bin/seccomptest", "/bin/bpftest", "/bin/preadtest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
                 # kexec tool: load + unload only (non-destructive).
                 # A blocking pipe write of >PIPE_BUF delivers every byte (lane pipefix).
                 "/bin/sh -c '[ \"$(dd if=/dev/zero bs=1M count=2 2>/dev/null | wc -c)\" = 2097152 ]'",
@@ -168,6 +168,7 @@ SUITES = {
     # cases resolve example.com, so the host needs internet access.
     "net": ["/bin/nettest"],
     "netlink": ["/bin/netlinktest"],
+    "bridge": ["/bin/brtest"],
     # socket_vmnet head-of-line guard (L5.13): wedges the shared bridge with a
     # client that never reads, checks driver.py's probe sees it and that it
     # heals. Not in regress: while it runs, every vmnet VM on this Mac is deaf.
