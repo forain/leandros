@@ -13,6 +13,6 @@ idmap=off); runtests `podbridge` no longer forces `idmap=test`; comment fixes in
 
 Results (no knob): ffsandbox --mode on (Mac aarch64): RESULT {'on': True}, all 8 children Seccomp 2 (only parents 740/835 are 0), no Sandbox errors.
 Rootless `podman run --rm --network=none alpine:3.21 echo hi` as leandro (Mac aarch64, default cmdline): `hi`, RC=0.
-Box regress: see lane report.
+Regress (no knob): x86_64 box (KVM) 81 suites 0 bad, overall PASS. aarch64: box disk was full (ENOSPC from other lanes, twice), so the full default regress ran on the Mac under lock.sh qemu: overall PASS, idmaptest 0 fails, nstest 0 fails (ff_seq_identity + ff_seq_nsroot green).
 
 Not done (review B leftovers, not flip-blocking per B): delete `kid_from_view` (N1), S10 grep gate reword (sched/src/lib.rs:3059,3273 apply to already-translated kuids).
