@@ -429,6 +429,12 @@ static int vec_cases(void)
         char rb[16];
         int g = poll(&p, 1, 1500) == 1 ? (int)recv(u, rb, sizeof rb, 0) : -1;
         CHECK("vec_tap_writev_one_frame", g == 4 && memcmp(rb, "pong", 4) == 0);
+        if (g != 4) {   /* control: the same frame in one write() */
+            ssize_t cw = write(fd, f, sizeof f);
+            struct pollfd p2 = { u, POLLIN, 0 };
+            int pr = poll(&p2, 1, 1500);
+            printf("vec_tap_control: write=%d poll=%d\n", (int)cw, pr);
+        }
     }
     close(u); close(fd);
 
