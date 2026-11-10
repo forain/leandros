@@ -21,6 +21,8 @@ struct NlSock {
     /// Network namespace the socket was created in.
     ns: sched::ns::NsRef,
     groups: u32,
+    /// connect(2) destination (pid, groups); only the kernel (pid 0) is meaningful.
+    peer: Option<(u32, u32)>,
     q: VecDeque<Vec<u8>>,
     /// Bumped on every enqueue: the poll edge sequence.
     gen: u64,
@@ -33,7 +35,7 @@ static NL_EVER: AtomicU32 = AtomicU32::new(0);
 pub fn create(ofd: u32, tgid: u32, netns: u16) {
     let mut m = NL.lock();
     m.retain(|&k, _| vfs::ofd::live(k));
-    m.insert(ofd, NlSock { pid: tgid, ns: sched::ns::NsRef::get(netns), groups: 0, q: VecDeque::new(), gen: 0 });
+    m.insert(ofd, NlSock { pid: tgid, ns: sched::ns::NsRef::get(netns), groups: 0, peer: None, q: VecDeque::new(), gen: 0 });
     NL_EVER.store(1, Ordering::Release);
 }
 
@@ -60,6 +62,25 @@ pub fn bind(ofd: u32, addr_ptr: usize, addrlen: usize) -> Message {
         if pid != 0 { s.pid = pid; }
         s.groups = groups;
     }
+    ok_reply()
+}
+
+pub fn connect(ofd: u32, addr_ptr: usize, addrlen: usize) -> Message {
+    if addrlen < 12 { return err_reply(-22); }
+    let mut sa = [0u8; 12];
+    if !ucopy_in(&mut sa, addr_ptr) { return err_reply(-14); }
+    if u16::from_ne_bytes([sa[0], sa[1]]) as usize != rt::AF_NETLINK { return err_reply(-97); }
+    let pid = u32::from_ne_bytes([sa[4], sa[5], sa[6], sa[7]]);
+    let groups = u32::from_ne_bytes([sa[8], sa[9], sa[10], sa[11]]);
+    if let Some(s) = NL.lock().get_mut(&ofd) { s.peer = Some((pid, groups)); }
+    ok_reply()
+}
+
+pub fn getpeername(ofd: u32, addr_ptr: usize, addrlen_ptr: usize) -> Message {
+    let Some(Some((pid, groups))) = NL.lock().get(&ofd).map(|s| s.peer) else { return err_reply(-107) };
+    let sa = rt::sockaddr_nl(pid, groups);
+    let cap = match sched::uaccess::read_user::<u32>(addrlen_ptr) { Some(c) => c as usize, None => return err_reply(-14) };
+    if !ucopy_out(addr_ptr, &sa[..cap.min(12)]) || !wr_user(addrlen_ptr, 12u32) { return err_reply(-14); }
     ok_reply()
 }
 
