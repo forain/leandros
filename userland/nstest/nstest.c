@@ -3114,6 +3114,37 @@ static int run_userns_cases(void)
     return 0;
 }
 
+/* pasta: a root that dropped to nobody (non-dumpable) opens the /proc/<pid>/ns/net of its
+ * own child that sits in a fresh user+net namespace, then setns()es nothing: open only. */
+static void nobody_opens_child_ns(void)
+{
+    int pfd[2], ok = 0;
+    char c;
+    if (pipe(pfd)) { check("nobody_opens_child_ns", 0); return; }
+    pid_t a = fork();
+    if (a == 0) {
+        if (drop_to(65534)) _exit(2);
+        pid_t b = fork();
+        if (b == 0) {
+            if (unshare(CLONE_NEWUSER | CLONE_NEWNET)) _exit(3);
+            c = 1; if (write(pfd[1], &c, 1) != 1) _exit(4);
+            for (;;) pause();
+        }
+        if (read(pfd[0], &c, 1) != 1) _exit(5);
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%d/ns/net", (int)b);
+        int fd = open(path, O_RDONLY);
+        int e = errno;
+        kill(b, SIGKILL); waitpid(b, NULL, 0);
+        if (fd < 0) _exit(e == 0 ? 6 : 10 + (e & 0x7f));
+        _exit(0);
+    }
+    int st = 0;
+    if (a > 0 && waitpid(a, &st, 0) == a && WIFEXITED(st) && WEXITSTATUS(st) == 0) ok = 1;
+    else printf("  nobody_opens_child_ns status 0x%x\n", st);
+    check("nobody_opens_child_ns", ok);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--euid")) return print_euid();
@@ -3132,7 +3163,7 @@ int main(int argc, char **argv)
         snprintf(nm, sizeof nm, "unshare_%s_einval", flags[i].n);
         check(nm, r == -1 && e == EINVAL);
     }
-    if (geteuid() == 0) run_userns_cases(); else printf("SKIP userns cases: not root\n");
+    if (geteuid() == 0) { run_userns_cases(); nobody_opens_child_ns(); } else printf("SKIP userns cases: not root\n");
     /* A plain fork-style clone still works. */
     long r = do_clone(0);
     int ok = r >= 0;
