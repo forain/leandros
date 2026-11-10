@@ -103,7 +103,7 @@ pub fn lookup(pid: u32, path: &[u8]) -> Option<Node> {
     Some(match file { Some(f) => Node::File(cg, f), None => Node::Dir(cg) })
 }
 
-fn may_write(fsuid: u32, owner: u32) -> bool { fsuid == 0 || fsuid == owner }
+fn may_write(pid: u32, owner: u32) -> bool { sched::host_root_of(pid) || sched::fsuid_of(pid) == owner }
 
 fn limit_text(v: u32, out: &mut String) {
     if v == UNLIMITED { out.push_str("max\n"); } else { push_u(out, v as u64); out.push('\n'); }
@@ -160,7 +160,7 @@ pub fn write(pid: u32, cg: CgId, f: F, data: &[u8]) -> isize {
     if !cgroup::alive(cg) { return -19; } // ENODEV
     if read_only(f) { return -13; }
     let fsuid = sched::fsuid_of(pid);
-    if !may_write(fsuid, cgroup::dir_owner(cg).0) { return -13; }
+    if !may_write(pid, cgroup::dir_owner(cg).0) { return -13; }
     match f {
         F::Procs | F::Threads => {
             let t = match core::str::from_utf8(data).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
@@ -173,8 +173,8 @@ pub fn write(pid: u32, cg: CgId, f: F, data: &[u8]) -> isize {
             // ancestor (Linux cgroup_procs_write_permission) and a writer
             // that owns the target process (or is host root).
             let anc = cgroup::common_ancestor(src, cg);
-            if !may_write(fsuid, cgroup::dir_owner(anc).0) { return -13; }
-            if fsuid != 0 && fsuid != sched::euid_of(tgid) && fsuid != sched::ruid_of(tgid) { return -13; }
+            if !may_write(pid, cgroup::dir_owner(anc).0) { return -13; }
+            if !sched::host_root_of(pid) && fsuid != sched::euid_of(tgid) && fsuid != sched::ruid_of(tgid) { return -13; }
             cgroup::migrate_tgid(tgid, cg, view_root(pid))
         }
         F::SubtreeControl => {
@@ -228,7 +228,7 @@ pub fn open(pid: u32, path: &[u8], flags: u32) -> Open {
         Some(Node::Dir(cg)) => if wr { Open::Err(-21) } else { Open::Dir(cg) },
         Some(Node::File(cg, f)) => {
             if !wr { return Open::Read(read(cg, f)); }
-            if read_only(f) || !may_write(sched::fsuid_of(pid), cgroup::dir_owner(cg).0) {
+            if read_only(f) || !may_write(pid, cgroup::dir_owner(cg).0) {
                 return Open::Err(-13);
             }
             Open::Write(cg, f, read(cg, f))
@@ -266,7 +266,7 @@ pub fn mkdir(pid: u32, path: &[u8]) -> isize {
         None => return -2,
     };
     let fsuid = sched::fsuid_of(pid);
-    if !may_write(fsuid, cgroup::dir_owner(cg).0) { return -13; }
+    if !may_write(pid, cgroup::dir_owner(cg).0) { return -13; }
     let Ok(n) = core::str::from_utf8(name) else { return -22 };
     // A name that collides with a control file of the parent is EEXIST.
     if file_by_name(cg, name).is_some() { return -17; }
@@ -281,7 +281,7 @@ pub fn rmdir(pid: u32, path: &[u8]) -> isize {
         Some(Node::Dir(cg)) => {
             if cg == view_root(pid) { return -16; }
             let p = cgroup::parent(cg);
-            if !may_write(sched::fsuid_of(pid), cgroup::dir_owner(p).0) { return -13; }
+            if !may_write(pid, cgroup::dir_owner(p).0) { return -13; }
             cgroup::remove(cg)
         }
     }
@@ -294,11 +294,11 @@ pub fn chown(pid: u32, path: &[u8], uid: u32, gid: u32) -> isize {
         Some(Node::File(c, _)) => {
             let (u, g) = cgroup::dir_owner(c);
             let same = (uid == u32::MAX || uid == u) && (gid == u32::MAX || gid == g);
-            return if same || sched::fsuid_of(pid) == 0 { 0 } else { -1 };
+            return if same || sched::host_root_of(pid) { 0 } else { -1 };
         }
         Some(Node::Dir(c)) => c,
     };
-    if sched::fsuid_of(pid) != 0 { 
+    if !sched::host_root_of(pid) { 
         let (u, g) = cgroup::dir_owner(cg);
         let same = (uid == u32::MAX || uid == u) && (gid == u32::MAX || gid == g);
         return if same { 0 } else { -1 };
