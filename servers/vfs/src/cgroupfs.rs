@@ -48,8 +48,10 @@ pub fn dev_cg(dev: u16) -> CgId { dev & 0x03FF }
 pub enum F {
     Procs, Threads, Controllers, SubtreeControl, MaxDepth, MaxDescendants, Stat,
     Type, Events, PidsCurrent, PidsMax, PidsPeak, PidsEvents,
+    MemCurrent, MemMax, MemHigh, MemLow, MemMin, MemSwapMax, MemSwapCurrent, MemEvents, MemStat,
+    MemOomGroup, CpuMax, CpuWeight, CpuStat, IoMax, IoWeight, IoStat,
 }
-const ALL: [F; 13] = [F::Procs, F::Threads, F::Controllers, F::SubtreeControl, F::MaxDepth,
+const ALL: [F; 29] = [F::Procs, F::Threads, F::Controllers, F::SubtreeControl, F::MaxDepth,
     F::MaxDescendants, F::Stat, F::Type, F::Events, F::PidsCurrent, F::PidsMax, F::PidsPeak,
     F::PidsEvents, F::MemCurrent, F::MemMax, F::MemHigh, F::MemLow, F::MemMin, F::MemSwapMax,
     F::MemSwapCurrent, F::MemEvents, F::MemStat, F::MemOomGroup, F::CpuMax, F::CpuWeight,
