@@ -2,8 +2,9 @@
  * bpftest - bpf(2) for the cgroup v2 device controller (lane bpfsys).
  * Replays crun's call sequence (LOAD with log retry, 7x QUERY, ATTACH with
  * BPF_F_ALLOW_MULTI, REPLACE, DETACH, GET_FD_BY_ID) and checks permissions,
- * attach rules, query counts and program-fd lifetime. Attaching changes no
- * device access yet (enforcement is lane bpfenf).
+ * attach rules, query counts and program-fd lifetime, then (lane bpfenf) that
+ * an attached program is ENFORCED on device open and mknod for tasks in the
+ * cgroup, and only for them.
  * Output: "<name>: PASS|FAIL ..." per case and a summary line.
  * Builds for the host (cc) and LeandrOS (zig cc -target <arch>-linux-musl -static).
  */
@@ -16,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -387,6 +389,78 @@ static int t_userns(void) {
     return 0;
 }
 
+
+/* --- enforcement (lane bpfenf) ------------------------------------------ */
+static void move_self(const char *dir) {
+    char p[96]; snprintf(p, sizeof p, "%s/cgroup.procs", dir);
+    int f = open(p, O_WRONLY); if (f < 0) _exit(90);
+    if (write(f, "0", 1) != 1) _exit(91);
+    close(f);
+}
+static int try_open(const char *path, int flags) {
+    int f = open(path, flags);
+    if (f < 0) return -errno;
+    close(f); return 0;
+}
+/* run fn in a child that first moves itself into cgroup `dir` */
+static int in_cg(const char *dir, int (*fn)(void)) {
+    pid_t c = fork();
+    if (c == 0) { move_self(dir); _exit(fn()); }
+    int st = 0; waitpid(c, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 99;
+}
+static char tnode[96];
+#define NCHK(c, n) do { if (!(c)) { printf("  child check %d failed (errno %d)\n", n, errno); return n; } } while (0)
+static int child_restricted(void) {
+    NCHK(try_open("/dev/null", O_RDWR) == 0, 1);
+    NCHK(try_open("/dev/zero", O_RDONLY) == -EPERM, 2);
+    NCHK(try_open("/dev/zero", O_WRONLY) == -EPERM, 3);
+    NCHK(try_open("/dev/zero", O_PATH) == 0, 4);              /* O_PATH is not an access */
+    NCHK(mknod("/tmp/bpft_c15", S_IFCHR | 0600, makedev(1, 5)) == -1 && errno == EPERM, 5);
+    NCHK(mknod("/tmp/bpft_c13", S_IFCHR | 0600, makedev(1, 3)) == 0, 6);     /* allowed by the program */
+    unlink("/tmp/bpft_c13");
+    NCHK(mknod("/tmp/bpft_wh", S_IFCHR | 0600, makedev(0, 0)) == 0, 7);      /* whiteout is exempt */
+    unlink("/tmp/bpft_wh");
+    NCHK(mknod("/tmp/bpft_b", S_IFBLK | 0600, makedev(7, 0)) == -1 && errno == EPERM, 8);
+    NCHK(try_open(tnode, O_RDONLY) == -EPERM, 9);            /* tmpfs node c 1:5 made by the host side */
+    NCHK(mknod("/tmp/bpft_fifo", S_IFIFO | 0600, 0) == 0, 10); /* non-device mknod untouched */
+    unlink("/tmp/bpft_fifo");
+    return 0;
+}
+static int child_open(void) {
+    NCHK(try_open("/dev/null", O_RDWR) == 0, 1);
+    NCHK(try_open("/dev/zero", O_RDONLY) == 0, 2);
+    NCHK(try_open(tnode, O_RDONLY) == 0, 3);
+    return 0;
+}
+static int t_enforce(void) {
+    int cg, pfd;
+    snprintf(tnode, sizeof tnode, "/tmp/bpft_z%d", (int)getpid());
+    unlink(tnode);
+    CHECK(mknod(tnode, S_IFCHR | 0600, makedev(1, 5)) == 0);
+    CHECK(mkcg("enf", &cg) == 0);
+    pfd = load(); CHECK(pfd >= 0);
+    CHECK(attach(cg, pfd, F_MULTI, -1) == 0);
+    int r = in_cg(cgpath, child_restricted);
+    if (r) { printf("  restricted child exit %d\n", r); return 1; }
+    CHECK(try_open("/dev/zero", O_RDONLY) == 0);              /* a task outside the cgroup is unaffected */
+    CHECK(mknod("/tmp/bpft_out", S_IFCHR | 0600, makedev(1, 5)) == 0);
+    unlink("/tmp/bpft_out");
+    CHECK(detach(cg, pfd) == 0);
+    r = in_cg(cgpath, child_open);
+    if (r) { printf("  after detach child exit %d\n", r); return 1; }
+    /* hierarchy: a grandchild inherits, and a MULTI program higher up ANDs */
+    CHECK(attach(cg, pfd, F_MULTI, -1) == 0);
+    char sub[96]; snprintf(sub, sizeof sub, "%s/g", cgpath);
+    CHECK(mkdir(sub, 0755) == 0);
+    r = in_cg(sub, child_restricted);
+    if (r) { printf("  grandchild exit %d\n", r); return 1; }
+    rmdir(sub);
+    CHECK(detach(cg, pfd) == 0);
+    unlink(tnode);
+    return 0;
+}
+
 static void case_run(const char *name, int (*fn)(void)) {
     fflush(stdout);
     pid_t c = fork();
@@ -411,6 +485,7 @@ int main(void) {
     case_run("fd_lifetime", t_fd_lifetime);
     case_run("unpriv_eperm", t_unpriv);
     case_run("userns_eperm", t_userns);
+    case_run("enforce", t_enforce);
     printf("bpftest: %d passed, %d failed\n", npass, nfail);
     return nfail != 0;
 }
