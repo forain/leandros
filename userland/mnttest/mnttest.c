@@ -717,6 +717,141 @@ static void mount_userns_perm(void) {
     rmdir("/tmp/mountperm.d");
 }
 
+
+/* setns(CLONE_NEWNS) (lane mntsetns, M7). A helper child unshares into its own
+ * mount namespace and mounts a tmpfs; joiners are forked from the parent so the
+ * parent's own namespace never changes. */
+#ifndef SYS_setns
+#define SYS_setns 268
+#endif
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+static int setns_(int fd, int t) { return (int)syscall(SYS_setns, fd, t); }
+
+static int same_link(const char *a, const char *b) {
+    char x[64] = {0}, y[64] = {0};
+    ssize_t n = readlink(a, x, sizeof x - 1), m = readlink(b, y, sizeof y - 1);
+    return n > 0 && m > 0 && n == m && !memcmp(x, y, (size_t)n);
+}
+
+/* mode: 0 join via fd, 1 root/cwd reset, 2 unprivileged, 3 shared fs, 4 pidfd */
+static int joiner(pid_t target, const char *d, int mode) {
+    char np[64], tx[160];
+    snprintf(np, sizeof np, "/proc/%d/ns/mnt", (int)target);
+    snprintf(tx, sizeof tx, "%s/x", d);
+    char pid0[64] = {0}, usr0[64] = {0}, pidn[64] = {0}, usrn[64] = {0};
+    ssize_t n;
+    n = readlink("/proc/self/ns/pid", pid0, sizeof pid0 - 1); if (n > 0) pid0[n] = 0;
+    n = readlink("/proc/self/ns/user", usr0, sizeof usr0 - 1); if (n > 0) usr0[n] = 0;
+    if (exists(tx)) return 10; /* must not be visible before the join */
+    int fd, pfd = -1;
+    if (mode == 4) {
+        pfd = (int)syscall(SYS_pidfd_open, (long)target, 0L);
+        if (pfd < 0) return 13;
+    } else {
+        fd = open(np, O_RDONLY);
+        if (fd < 0) return 14;
+        pfd = fd;
+    }
+    if (mode == 1) {
+        if (chdir(d) || chroot(d)) return 11;   /* root and cwd inside the old tree */
+        if (exists("/bin/mnttest")) return 12;
+    }
+    if (mode == 2) {
+        if (setgid(65534) || setuid(65534)) return 15;
+        errno = 0;
+        return setns_(pfd, CLONE_NEWNS) == -1 && errno == EPERM ? 0 : 16;
+    }
+    int cpipe[2] = {-1, -1};
+    pid_t kid = 0;
+    if (mode == 3) {
+        if (pipe(cpipe)) return 17;
+        kid = (pid_t)syscall(SYS_clone, (long)(CLONE_FS | SIGCHLD), 0L, 0L, 0L, 0L);
+        if (kid == 0) { char c; close(cpipe[1]); (void)!read(cpipe[0], &c, 1); _exit(0); }
+        if (kid < 0) return 18;
+        errno = 0;
+        int r = setns_(pfd, CLONE_NEWNS);
+        int e = errno;
+        close(cpipe[1]); waitpid(kid, NULL, 0);
+        return r == -1 && e == EINVAL && !exists(tx) ? 0 : 19;
+    }
+    if (setns_(pfd, CLONE_NEWNS) != 0) return 20;
+    if (!exists(tx)) return 21;                                  /* sees the child's tmpfs */
+    if (!same_link("/proc/self/ns/mnt", np)) return 22;
+    n = readlink("/proc/self/ns/pid", pidn, sizeof pidn - 1); if (n > 0) pidn[n] = 0;
+    n = readlink("/proc/self/ns/user", usrn, sizeof usrn - 1); if (n > 0) usrn[n] = 0;
+    if (strcmp(pid0, pidn) || strcmp(usr0, usrn)) return 23;    /* pid/user ns untouched */
+    if (mode == 1) {
+        char cw[64] = {0};
+        if (!getcwd(cw, sizeof cw) || strcmp(cw, "/")) return 24;
+        if (!exists("/bin/mnttest")) return 25;                   /* chroot is gone */
+    }
+    return 0;
+}
+
+static int run_joiner(pid_t target, const char *d, int mode) {
+    pid_t j = fork();
+    if (j == 0) _exit(joiner(target, d, mode));
+    int st = 0; waitpid(j, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 200;
+}
+
+static void setns_mnt_suite(void) {
+    char base[64], d[128], q[128];
+    snprintf(base, sizeof base, "/tmp/ms.%d", (int)getpid());
+    dir(base); path(d, sizeof d, base, "d"); dir(d);
+    path(q, sizeof q, base, "c"); dir(q);
+    int c2p[2], p2c[2];
+    if (pipe(c2p) || pipe(p2c)) { report("setns_mnt_pipe", 0); return; }
+    pid_t t = fork();
+    if (t == 0) {
+        close(c2p[0]); close(p2c[1]);
+        char ch = 1, x[160];
+        if (unshare(CLONE_NEWNS)) _exit(90);
+        if (mount_("none", d, "tmpfs", 0)) _exit(91);
+        snprintf(x, sizeof x, "%s/x", d); put(x, "T", 0666);
+        (void)!write(c2p[1], &ch, 1);
+        (void)!read(p2c[0], &ch, 1);
+        _exit(0);
+    }
+    close(c2p[1]); close(p2c[0]);
+    char ch;
+    if (read(c2p[0], &ch, 1) != 1) { report("setns_mnt_child_ready", 0); return; }
+    int r;
+    r = run_joiner(t, d, 0); if (r) printf("join=%d\n", r);
+    report("setns_mnt_join", r == 0);
+    r = run_joiner(t, d, 1); if (r) printf("root_cwd=%d\n", r);
+    report("setns_mnt_root_cwd_reset", r == 0);
+    r = run_joiner(t, d, 2); if (r) printf("eperm=%d\n", r);
+    report("setns_mnt_eperm_unpriv", r == 0);
+    r = run_joiner(t, d, 3); if (r) printf("clonefs=%d\n", r);
+    report("setns_mnt_clone_fs_einval", r == 0);
+    r = run_joiner(t, d, 4); if (r) printf("pidfd=%d\n", r);
+    report("setns_mnt_pidfd", r == 0);
+    /* the fd keeps the namespace alive after its creator exits */
+    {
+        char np[64]; snprintf(np, sizeof np, "/proc/%d/ns/mnt", (int)t);
+        int fd = open(np, O_RDONLY);
+        (void)!write(p2c[1], &ch, 1);
+        int st = 0; waitpid(t, &st, 0);
+        int ok = fd >= 0;
+        if (ok) {
+            pid_t j = fork();
+            if (j == 0) {
+                if (setns_(fd, CLONE_NEWNS)) _exit(1);
+                char x[160]; snprintf(x, sizeof x, "%s/x", d);
+                _exit(exists(x) ? 0 : 2);
+            }
+            waitpid(j, &st, 0);
+            ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        }
+        report("setns_mnt_fd_keeps_alive", ok);
+        if (fd >= 0) close(fd);
+    }
+    close(c2p[0]); close(p2c[1]);
+}
+
 /* lane podsys: tmpfs mountable on any directory in the initial mount
  * namespace (podman's shm, crun's /dev), options honoured, umount frees it. */
 static int tfs_unpriv_child(void) {
@@ -823,6 +958,7 @@ int main(int argc, char **argv) {
     mountinfo_tests();
     pool_tests();
     mount_userns_perm();
+    setns_mnt_suite();
     tmpfs_anywhere();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;

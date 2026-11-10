@@ -2339,7 +2339,7 @@ static int t_setns_misc(void)
     errno = 0; CHECK(sys_setns(nf, CLONE_NEWIPC) == -1 && errno == EINVAL);   /* wrong nstype */
     int m = open("/proc/self/ns/mnt", O_RDONLY), g = open("/proc/self/ns/cgroup", O_RDONLY);
     CHECK(m >= 0 && g >= 0);
-    errno = 0; CHECK(sys_setns(m, 0) == -1 && errno == EINVAL);
+    errno = 0; CHECK(sys_setns(m, CLONE_NEWNET) == -1 && errno == EINVAL);
     CHECK(sys_setns(g, CLONE_NEWCGROUP) == 0);   /* rejoining one's own cgroup namespace */
     int self = open("/proc/self/ns/net", O_RDONLY);
     CHECK(sys_setns(self, CLONE_NEWNET) == 0);
@@ -2397,7 +2397,7 @@ static int t_setns_pidfd(void)
     int pf = syscall(NR_PIDFD_OPEN, c, 0);
     CHECK(pf >= 0);
     errno = 0; CHECK(sys_setns(pf, 0) == -1 && errno == EINVAL);
-    errno = 0; CHECK(sys_setns(pf, CLONE_NEWNS) == -1 && errno == EINVAL);
+    errno = 0; CHECK(sys_setns(pf, 0x80 /* CLONE_NEWTIME: unsupported */) == -1 && errno == EINVAL);
     CHECK(link_ino("/proc/self/ns/net") != ns_link_ino(c, "net"));
     CHECK(sys_setns(pf, CLONE_NEWNET | CLONE_NEWIPC) == 0);
     CHECK(link_ino("/proc/self/ns/net") == ns_link_ino(c, "net"));
