@@ -4505,8 +4505,6 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/net/raw6",  data: b"" },
     RamEntry { path: b"/proc/net/if_inet6",  data: b"" },
     RamEntry { path: b"/proc/net/fib_trie",  data: b"Main:\n  +-- 0.0.0.0/0\n" },
-    RamEntry { path: b"/sys/kernel/cgroup/delegate", data: b"cgroup.procs\ncgroup.threads\ncgroup.subtree_control\ncgroup.freeze\ncgroup.kill\nmemory.oom.group\n" },
-    RamEntry { path: b"/sys/kernel/cgroup/features", data: b"nsdelegate\nmemory_localevents\n" },
     RamEntry { path: b"/proc/sys/kernel/hostname",   data: b"leandros\n" },
     RamEntry { path: b"/proc/sys/kernel/domainname", data: b"(none)\n" },
     RamEntry { path: b"/proc/sys/kernel/ostype",     data: b"Linux\n" },

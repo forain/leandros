@@ -36,8 +36,21 @@ pub fn mounted() -> bool { MOUNTED.load(Ordering::Acquire) }
 
 /// Is `path` inside the served tree (mounted, `/sys/fs/cgroup` or below)?
 pub fn is_path(path: &[u8]) -> bool {
+    if mounted() && static_file(path).is_some() { return true; }
     if !mounted() || !path.starts_with(ROOT) { return false; }
     path.len() == ROOT.len() || path[ROOT.len()] == b'/'
+}
+
+/// Read-only description files of the cgroup2 interface (Linux serves them
+/// under /sys/kernel/cgroup; `delegate` lists the files chowned along with a
+/// delegated directory, which here is every file: ownership is the directory's).
+const STATIC_FILES: [(&[u8], &[u8]); 2] = [
+    (b"/sys/kernel/cgroup/delegate",
+     b"cgroup.procs\ncgroup.threads\ncgroup.subtree_control\ncgroup.freeze\ncgroup.kill\nmemory.oom.group\n"),
+    (b"/sys/kernel/cgroup/features", b"nsdelegate\nmemory_localevents\n"),
+];
+fn static_file(path: &[u8]) -> Option<&'static [u8]> {
+    STATIC_FILES.iter().find(|(p, _)| *p == path).map(|(_, d)| *d)
 }
 
 pub fn is_dev(dev: u16) -> bool { dev & 0xFC00 == DEV_BASE }
@@ -125,12 +138,13 @@ fn file_by_name(cg: CgId, name: &[u8]) -> Option<F> {
     ALL.iter().copied().find(|&f| fname(f).as_bytes() == name && has_file(cg, f))
 }
 
-pub enum Node { Dir(CgId), File(CgId, F) }
+pub enum Node { Dir(CgId), File(CgId, F), Static(&'static [u8]) }
 
 fn view_root(pid: u32) -> CgId { sched::ns::cgns_root(sched::ns::cgns_of(pid)) }
 
 /// Resolve `path` (which `is_path`) for `pid`.
 pub fn lookup(pid: u32, path: &[u8]) -> Option<Node> {
+    if let Some(d) = static_file(path) { return Some(Node::Static(d)); }
     let root = view_root(pid);
     let rest = &path[ROOT.len().min(path.len())..];
     let mut cg = root;
@@ -286,6 +300,7 @@ pub fn stat(pid: u32, path: &[u8]) -> Option<(u32, u32, u64, u32, u32)> {
             let (u, g) = cgroup::dir_owner(cg);
             Some((0o040755, 2 + cgroup::nr_children(cg), 0x6000_0000 + (cg as u64) * 64, u, g))
         }
+        Node::Static(d) => Some((0o100444, 1, 0x6000_0000 - 1, 0, 0)).map(|x| { let _ = d; x }),
         Node::File(cg, f) => {
             let (u, g) = cgroup::dir_owner(cg);
             Some((if f == F::Kill { 0o100200 } else if read_only(f) { 0o100444 } else { 0o100644 }, 1,
@@ -305,6 +320,7 @@ pub fn open(pid: u32, path: &[u8], flags: u32) -> Open {
     match lookup(pid, path) {
         None => Open::Err(if flags & O_CREAT != 0 { -13 } else { -2 }),
         Some(_) if flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) => Open::Err(-17),
+        Some(Node::Static(d)) => if wr { Open::Err(-13) } else { Open::Read(d.to_vec()) },
         Some(Node::Dir(cg)) => if wr { Open::Err(-21) } else { Open::Dir(cg) },
         Some(Node::File(cg, f)) => {
             if !wr {
@@ -345,7 +361,7 @@ pub fn mkdir(pid: u32, path: &[u8]) -> isize {
     if lookup(pid, path).is_some() || name.is_empty() { return -17; }
     let cg = match lookup(pid, pp) {
         Some(Node::Dir(c)) => c,
-        Some(Node::File(..)) => return -20,
+        Some(Node::File(..)) | Some(Node::Static(_)) => return -20,
         None => return -2,
     };
     let fsuid = sched::fsuid_of(pid);
@@ -360,7 +376,7 @@ pub fn mkdir(pid: u32, path: &[u8]) -> isize {
 pub fn rmdir(pid: u32, path: &[u8]) -> isize {
     match lookup(pid, path) {
         None => -2,
-        Some(Node::File(..)) => -20,
+        Some(Node::File(..)) | Some(Node::Static(_)) => -20,
         Some(Node::Dir(cg)) => {
             if cg == view_root(pid) { return -16; }
             let p = cgroup::parent(cg);
@@ -381,6 +397,7 @@ pub fn chown(pid: u32, path: &[u8], uid: u32, gid: u32) -> isize {
             let same = (uid == u32::MAX || uid == u) && (gid == u32::MAX || gid == g);
             return if same || sched::host_root_of(pid) { 0 } else { -1 };
         }
+        Some(Node::Static(_)) => return -1,
         Some(Node::Dir(c)) => c,
     };
     if !sched::host_root_of(pid) { 
