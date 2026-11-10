@@ -25,6 +25,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -363,6 +364,123 @@ static int tcp_cases(void)
     return nfail != 0;
 }
 
+/* writev/readv are ONE operation: a record fd sees one record, a pipe write of
+ * at most PIPE_BUF is all-or-nothing. */
+static int vec_cases(void)
+{
+    char name[IFNAMSIZ];
+    if (enter_ns() != 0) { printf("vec: unshare failed\n"); return 1; }
+    int fd = tun_open("tap%d", F_TAP | F_NO_PI, name);
+    CHECK("vec_tap_create", fd >= 0);
+    if (fd < 0) return 1;
+    CHECK("vec_tap_addr_up", set_addr(name, "10.9.0.1", "255.255.255.0") == 0);
+    unsigned char tapmac[6] = { 0 };
+    {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        struct ifreq ifr; memset(&ifr, 0, sizeof ifr); strcpy(ifr.ifr_name, name);
+        if (ioctl(s, SIOCGIFHWADDR, &ifr) == 0) memcpy(tapmac, ifr.ifr_hwaddr.sa_data, 6);
+        close(s);
+    }
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in me = { .sin_family = AF_INET, .sin_port = htons(4242) };
+    me.sin_addr.s_addr = inet_addr("10.9.0.1");
+    CHECK("vec_udp_bind", bind(u, (struct sockaddr *)&me, sizeof me) == 0);
+
+    /* tap writev of 3 iovecs (eth | ip | udp+payload) is ONE frame */
+    {
+        unsigned char f[14 + 20 + 8 + 4];
+        memset(f, 0, sizeof f);
+        memcpy(f, tapmac, 6); memcpy(f + 6, p_mac, 6); f[12] = 8; f[13] = 0;
+        unsigned char *ip = f + 14;
+        ip[0] = 0x45; ip[3] = 20 + 8 + 4; ip[8] = 64; ip[9] = 17;
+        memcpy(ip + 12, "\x0a\x09\x00\x02", 4); memcpy(ip + 16, "\x0a\x09\x00\x01", 4);
+        uint16_t c = csum16(ip, 20); ip[10] = c >> 8; ip[11] = c & 0xff;
+        unsigned char *ud = ip + 20;
+        ud[0] = 9999 >> 8; ud[1] = 9999 & 0xff; ud[2] = 4242 >> 8; ud[3] = 4242 & 0xff;
+        ud[5] = 8 + 4;
+        memcpy(ud + 8, "pong", 4);
+        struct iovec iov[3] = { { f, 14 }, { f + 14, 20 }, { f + 34, 12 } };
+        CHECK("vec_tap_writev_len", writev(fd, iov, 3) == (ssize_t)sizeof f);
+        struct pollfd p = { u, POLLIN, 0 };
+        char rb[16];
+        int g = poll(&p, 1, 1500) == 1 ? (int)recv(u, rb, sizeof rb, 0) : -1;
+        CHECK("vec_tap_writev_one_frame", g == 4 && memcmp(rb, "pong", 4) == 0);
+    }
+    /* tap readv: one frame (the ARP request for 10.9.0.2) over two iovecs */
+    {
+        char peer_ok = 0;
+        int cs = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in peer = { .sin_family = AF_INET, .sin_port = htons(9999) };
+        peer.sin_addr.s_addr = inet_addr("10.9.0.2");
+        sendto(cs, "hello", 5, 0, (struct sockaddr *)&peer, sizeof peer);
+        struct pollfd p = { fd, POLLIN, 0 };
+        unsigned char h[14], r[100];
+        struct iovec iov[2] = { { h, sizeof h }, { r, sizeof r } };
+        ssize_t n = poll(&p, 1, 3000) == 1 ? readv(fd, iov, 2) : -1;
+        peer_ok = n == 42 && h[12] == 0x08 && h[13] == 0x06 && r[6] == 0 && r[7] == 1;
+        CHECK("vec_tap_readv_one_frame", peer_ok);
+        close(cs);
+    }
+    close(u); close(fd);
+
+    /* DGRAM and SEQPACKET socketpairs: one message per writev */
+    int types[2] = { SOCK_DGRAM, SOCK_SEQPACKET };
+    const char *tn[2] = { "vec_dgram", "vec_seqpacket" };
+    for (int k = 0; k < 2; k++) {
+        int sv[2];
+        char nm[40];
+        if (socketpair(AF_UNIX, types[k], 0, sv) != 0) { snprintf(nm, sizeof nm, "%s_pair", tn[k]); CHECK(nm, 0); continue; }
+        struct iovec iov[3] = { { "abc", 3 }, { "defg", 4 }, { "hi", 2 } };
+        snprintf(nm, sizeof nm, "%s_writev_len", tn[k]);
+        CHECK(nm, writev(sv[0], iov, 3) == 9);
+        char rb[32];
+        ssize_t g = recv(sv[1], rb, sizeof rb, MSG_DONTWAIT);
+        snprintf(nm, sizeof nm, "%s_writev_one_msg", tn[k]);
+        CHECK(nm, g == 9 && memcmp(rb, "abcdefghi", 9) == 0);
+        snprintf(nm, sizeof nm, "%s_writev_no_extra", tn[k]);
+        CHECK(nm, recv(sv[1], rb, sizeof rb, MSG_DONTWAIT) < 0 && errno == EAGAIN);
+        /* readv: one record over two iovecs, the next record stays queued */
+        send(sv[0], "abcdefgh", 8, 0); send(sv[0], "ij", 2, 0);
+        char a[3], b[10];
+        struct iovec rv[2] = { { a, sizeof a }, { b, sizeof b } };
+        ssize_t n = readv(sv[1], rv, 2);
+        snprintf(nm, sizeof nm, "%s_readv_one_record", tn[k]);
+        CHECK(nm, n == 8 && memcmp(a, "abc", 3) == 0 && memcmp(b, "defgh", 5) == 0);
+        g = recv(sv[1], rb, sizeof rb, MSG_DONTWAIT);
+        snprintf(nm, sizeof nm, "%s_readv_next_kept", tn[k]);
+        CHECK(nm, g == 2 && memcmp(rb, "ij", 2) == 0);
+        close(sv[0]); close(sv[1]);
+    }
+
+    /* pipe: a writev of <= PIPE_BUF is all or nothing */
+    {
+        int pv[2];
+        CHECK("vec_pipe_create", pipe(pv) == 0);
+        fcntl(pv[1], F_SETFL, O_NONBLOCK);
+        static char big[4096];
+        memset(big, 'z', sizeof big);
+        long filled = 0;
+        for (;;) { ssize_t w = write(pv[1], big, sizeof big); if (w <= 0) break; filled += w; }
+        for (;;) { ssize_t w = write(pv[1], big, 1); if (w <= 0) break; filled += w; }
+        static char sink[3000];
+        CHECK("vec_pipe_drain_some", read(pv[0], sink, sizeof sink) == (ssize_t)sizeof sink);
+        static char x[2048], y[2048];
+        memset(x, 'x', sizeof x); memset(y, 'y', sizeof y);
+        struct iovec iov[2] = { { x, sizeof x }, { y, sizeof y } };
+        errno = 0;
+        ssize_t w = writev(pv[1], iov, 2);
+        int queued = 0; ioctl(pv[0], FIONREAD, &queued);
+        CHECK("vec_pipe_writev_atomic", w < 0 && errno == EAGAIN && queued == filled - 3000);
+        /* with room it lands as one contiguous run */
+        for (long left = filled - 3000; left > 0;) { ssize_t r = read(pv[0], big, left > 4096 ? 4096 : left); if (r <= 0) break; left -= r; }
+        w = writev(pv[1], iov, 2);
+        CHECK("vec_pipe_writev_whole", w == 4096);
+        close(pv[0]); close(pv[1]);
+    }
+    printf("vec_cases: %d passed, %d failed\n", npass, nfail);
+    return nfail != 0;
+}
+
 int main(void)
 {
     pid_t c = fork();
@@ -374,6 +492,11 @@ int main(void)
     if (c == 0) _exit(tcp_cases());
     waitpid(c, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("tcp_cases: FAIL (status %d)\n", st); }
+
+    c = fork();
+    if (c == 0) _exit(vec_cases());
+    waitpid(c, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("vec_cases: FAIL (status %d)\n", st); }
 
     /* unprivileged, initial namespaces */
     c = fork();
