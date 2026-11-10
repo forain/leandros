@@ -6520,7 +6520,22 @@ fn sys_execveat(dirfd: usize, path_ptr: usize, argv_ptr: usize, envp_ptr: usize,
 /// `fd_cloexec`: the file came from a close-on-exec fd (fexecve); a `#!`
 /// script would then name an fd that is closed by the time the interpreter
 /// opens /dev/fd/N, which Linux reports as ENOENT.
-fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: bool) -> isize {
+/// Re-resolve the symlinks of `kp` in its mount namespace (exec reads the file
+/// from the backing path, past the VFS path chokepoint that does this for the
+/// other path syscalls). Namespace 0 and paths without a namespace form pass.
+fn ns_follow_links(kp: KPath) -> Result<KPath, isize> {
+    let mns = sched::current_mntns();
+    if mns == 0 { return Ok(kp); }
+    let nsb = match kp.ns.as_ref() { Some(n) => n.clone(), None => return Ok(kp) };
+    match vfs::ns_resolve_links(mns, &nsb, true) {
+        Ok(Some((nsp, _, _))) if nsp != nsb => KPath::from_ns(nsp),
+        Ok(_) => Ok(kp),
+        Err(e) => Err(e as isize),
+    }
+}
+
+fn sys_execve_kp(kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: bool) -> isize {
+    let mut kpath = match ns_follow_links(kpath) { Ok(k) => k, Err(e) => return e };
     let pid = current_pid();
     // A memfd image stays the task's /proc/self/exe past the close-on-exec
     // sweep: pin it now (dropped again on any early return).
@@ -6575,7 +6590,7 @@ fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec:
         next.extend(head_args.into_iter().skip(1));
         head_args = next;
 
-        kpath = match resolve_ns(interp).and_then(KPath::from_ns) {
+        kpath = match resolve_ns(interp).and_then(KPath::from_ns).and_then(ns_follow_links) {
             Ok(k) => k,
             Err(e) => return e,
         };

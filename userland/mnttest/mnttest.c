@@ -1644,6 +1644,7 @@ static int pl_prepare(const char *root) {
     char p[160];
     if (pv_prepare(root) < 0) return -1;
     snprintf(p, sizeof p, "%s/bin", root); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/proc", root); mkdir(p, 0755);
     snprintf(p, sizeof p, "%s/usr", root); mkdir(p, 0755);
     snprintf(p, sizeof p, "%s/usr/lib", root); mkdir(p, 0755);
     snprintf(p, sizeof p, "%s/bin/real", root);
@@ -1695,6 +1696,7 @@ static int pl_fdpath(int m) {
     if (pl_prepare("/tmp/pv/l3") < 0) return 92;
     int r = pv_crun_seq("/tmp/pv/l3");
     if (r) return r;
+    if (mount("proc", "/proc", "proc", 0, NULL) < 0) { printf("  proc mount errno=%d\n", errno); return 45; }
     int fd = open("/bin", O_DIRECTORY | O_RDONLY);
     if (fd < 0) return 40;
     char p[64], t[128]; snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
@@ -1702,7 +1704,7 @@ static int pl_fdpath(int m) {
     if (n < 0) return 41;
     t[n] = 0;
     if (strcmp(t, "/bin")) { printf("  fd path=%s\n", t); return 42; }
-    char q[96]; snprintf(q, sizeof q, "%s/abs", p);
+    char q[96]; snprintf(q, sizeof q, "%s/real", p);
     struct stat st;
     if (stat(q, &st) < 0) { printf("  stat %s errno=%d\n", q, errno); return 43; }
     if (!exists("/proc/self/fd")) return 44;
