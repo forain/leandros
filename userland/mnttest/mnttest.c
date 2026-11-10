@@ -1281,6 +1281,8 @@ static int nsfs_bind_with_shared(int mode) {
     } else {
         struct stat a, b;
         if (stat(file, &a) < 0 || stat("/proc/self/ns/net", &b) < 0 || a.st_ino != b.st_ino) rc = 4;
+        struct statfs sf;
+        if (!rc && (statfs(file, &sf) < 0 || (unsigned long)sf.f_type != 0x6e736673UL)) rc = 5;
         if (umount(file) < 0 && !rc) rc = 7;
     }
     unlink(file);

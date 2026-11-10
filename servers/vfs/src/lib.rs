@@ -15263,6 +15263,14 @@ fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
         write_statfs(buf_ptr, &cgroup_statfs());
         return statfs_reply();
     }
+    // A bound namespace file (/.leandros-ns/..) is nsfs: containers/common
+    // checks the magic of the file it bound at /run/netns/<name>.
+    if path.starts_with(mnt::NS_SRC) {
+        let mut v = procfs_statfs();
+        v.f_type = 0x6e73_6673;
+        write_statfs(buf_ptr, &v);
+        return statfs_reply();
+    }
     if !is_tmp_path(path)
         && (path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path) || sysclass::is_path(path)) {
         write_statfs(buf_ptr, &procfs_statfs());
