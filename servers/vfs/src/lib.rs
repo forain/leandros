@@ -6771,7 +6771,7 @@ pub(crate) fn ns0_snapshot() -> Vec<mnt::Mnt> {
         };
         let pg = mnt::ns0_prop(&r.0);
         let mut m = mnt::Mnt { id: ids[i], parent: pid, mp: rel.into_boxed_slice(), root: r.1.clone().into_boxed_slice(),
-            sb: 0, flags: r.4, locked: 0, group: pg.0, master: pg.1, unbindable: pg.2, fstype: r.2,
+            sb: mnt::ns0::tmpfs_inst_of(&r.1).unwrap_or(0), flags: r.4, locked: 0, group: pg.0, master: pg.1, unbindable: pg.2, fstype: r.2,
             device: r.3.clone().into_boxed_slice(), opts: Box::from(&b""[..]) };
         if pid == 0 && i != 0 { m.parent = ids[0]; m.mp = r.0.clone().into_boxed_slice(); }
         out.push(m);
