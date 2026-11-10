@@ -1269,7 +1269,7 @@ static void *tb_thread(void *a) {
     return NULL;
 }
 static int nsfs_thread_selfbind(int mode) {
-    (void)mode;
+    if (mode == 1 && unshare(CLONE_NEWNS) < 0) return 89;
     mkdir("/run", 0755); mkdir("/run/netns", 0755);
     if (mount("/run/netns", "/run/netns", "none", MS_BIND | MS_REC, NULL) < 0) return 90;
     if (mount("", "/run/netns", NULL, MS_SHARED | MS_REC, NULL) < 0) return 91;
@@ -1416,6 +1416,7 @@ static void fdpath_suite(void) {
     report("nsfs_bind_in_userns_mntns", nn_in_child(nsfs_in_mntns, 1));
     report("nsfs_bind_in_mntns_then_unshare_newns", nn_in_child(nsfs_in_mntns, 2));
     report("nsfs_thread_self_bind_run_netns", nn_in_child(nsfs_thread_selfbind, 0));
+    report("nsfs_thread_self_bind_run_netns_mntns", nn_in_child(nsfs_thread_selfbind, 1));
     report("nsfs_thread_task_bind_root", nn_in_child(nsfs_thread_bind, 0));
     report("nsfs_thread_task_bind_mntns", nn_in_child(nsfs_thread_bind, 2));
     report("nsfs_thread_task_bind_userns_mntns", nn_in_child(nsfs_thread_bind, 1));
