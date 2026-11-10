@@ -219,6 +219,148 @@ static int ns_cases(void)
     return r | (nfail != 0);
 }
 
+
+/* ---- TCP in a netns ---------------------------------------------------- */
+static unsigned char t_mac[6], p_mac[6] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
+static const unsigned char T_IP[4] = { 10, 9, 0, 1 }, P_IP[4] = { 10, 9, 0, 2 };
+
+static uint16_t tcp_csum(const unsigned char *src, const unsigned char *dst, const unsigned char *tcp, int len)
+{
+    uint32_t s = 0;
+    for (int i = 0; i < 4; i += 2) { s += (src[i] << 8) | src[i + 1]; s += (dst[i] << 8) | dst[i + 1]; }
+    s += 6; s += len;
+    for (int i = 0; i + 1 < len; i += 2) s += (tcp[i] << 8) | tcp[i + 1];
+    if (len & 1) s += tcp[len - 1] << 8;
+    while (s >> 16) s = (s & 0xffff) + (s >> 16);
+    return ~s;
+}
+
+/* Build an Ethernet+IPv4+TCP frame from the peer to the ns; returns length. */
+static int tcp_frame(unsigned char *f, int sport, int dport, uint32_t seq, uint32_t ack,
+                     int flags, const void *data, int dlen)
+{
+    memset(f, 0, 14 + 20 + 20 + dlen);
+    memcpy(f, t_mac, 6); memcpy(f + 6, p_mac, 6); f[12] = 8;
+    unsigned char *ip = f + 14, *t = ip + 20;
+    int tl = 20 + dlen;
+    ip[0] = 0x45; ip[2] = (20 + tl) >> 8; ip[3] = (20 + tl) & 0xff; ip[8] = 64; ip[9] = 6;
+    memcpy(ip + 12, P_IP, 4); memcpy(ip + 16, T_IP, 4);
+    uint16_t c = csum16(ip, 20); ip[10] = c >> 8; ip[11] = c & 0xff;
+    t[0] = sport >> 8; t[1] = sport & 0xff; t[2] = dport >> 8; t[3] = dport & 0xff;
+    t[4] = seq >> 24; t[5] = seq >> 16; t[6] = seq >> 8; t[7] = seq;
+    t[8] = ack >> 24; t[9] = ack >> 16; t[10] = ack >> 8; t[11] = ack;
+    t[12] = 5 << 4; t[13] = flags; t[14] = 0xff; t[15] = 0xff;
+    if (dlen) memcpy(t + 20, data, dlen);
+    c = tcp_csum(P_IP, T_IP, t, tl); t[16] = c >> 8; t[17] = c & 0xff;
+    return 14 + 20 + tl;
+}
+
+/* Next TCP frame the ns sends (ARP requests for the peer are answered on
+ * the way). Returns the frame length or -1 on timeout. */
+static int next_tcp(int fd, unsigned char *b, int ms)
+{
+    for (;;) {
+        int n = rd_timeout(fd, b, 2048, ms);
+        if (n < 0) return -1;
+        if (n >= 42 && b[12] == 0x08 && b[13] == 0x06 && b[21] == 1) {
+            memcpy(t_mac, b + 22, 6);
+            unsigned char a[42];
+            memcpy(a, t_mac, 6); memcpy(a + 6, p_mac, 6);
+            a[12] = 0x08; a[13] = 0x06;
+            memcpy(a + 14, "\x00\x01\x08\x00\x06\x04\x00\x02", 8);
+            memcpy(a + 22, p_mac, 6); memcpy(a + 28, P_IP, 4);
+            memcpy(a + 32, t_mac, 6); memcpy(a + 38, T_IP, 4);
+            write(fd, a, 42);
+            continue;
+        }
+        if (n >= 54 && b[12] == 8 && b[13] == 0 && b[14 + 9] == 6) return n;
+    }
+}
+#define TSEQ(b) (((uint32_t)(b)[38] << 24) | ((b)[39] << 16) | ((b)[40] << 8) | (b)[41])
+#define TACK(b) (((uint32_t)(b)[42] << 24) | ((b)[43] << 16) | ((b)[44] << 8) | (b)[45])
+#define TFLAGS(b) ((b)[47])
+#define TSPORT(b) (((b)[34] << 8) | (b)[35])
+
+static int tcp_cases(void)
+{
+    unsigned char b[2048], f[2048];
+    char name[IFNAMSIZ];
+    int fd, n;
+    if (enter_ns() != 0) { printf("tcp_out: FAIL (unshare errno %d)\n", errno); return 1; }
+    fd = tun_open("tap%d", F_TAP | F_NO_PI, name);
+    if (fd < 0 || set_addr(name, "10.9.0.1", "255.255.255.0") != 0) { printf("tcp_out: FAIL (tap setup)\n"); return 1; }
+
+    /* tcp_out: connect over the tap, SYN on the fd, inject SYN-ACK / data / FIN */
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    fcntl(s, F_SETFL, O_NONBLOCK);
+    struct sockaddr_in peer = { .sin_family = AF_INET, .sin_port = htons(80) };
+    memcpy(&peer.sin_addr, P_IP, 4);
+    int rc = connect(s, (struct sockaddr *)&peer, sizeof peer);
+    CHECK("tcp_connect_inprogress", rc < 0 && errno == EINPROGRESS);
+    n = rc < 0 ? next_tcp(fd, b, 3000) : -1;
+    int syn = n > 0 && TFLAGS(b) == 0x02 && memcmp(b + 30, P_IP, 4) == 0 && ((b[36] << 8) | b[37]) == 80;
+    CHECK("tcp_out_syn_frame", syn);
+    if (!syn) return 1;
+    int cport = TSPORT(b);
+    uint32_t iss = TSEQ(b), pseq = 5000;
+    n = tcp_frame(f, 80, cport, pseq, iss + 1, 0x12, NULL, 0);
+    write(fd, f, n);
+    struct pollfd pw = { s, POLLOUT, 0 };
+    int soerr = -1; socklen_t sl = sizeof soerr;
+    CHECK("tcp_out_established", poll(&pw, 1, 3000) == 1 && (pw.revents & POLLOUT) &&
+          getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0 && soerr == 0);
+    n = next_tcp(fd, b, 3000);
+    CHECK("tcp_out_ack", n > 0 && (TFLAGS(b) & 0x10) && TACK(b) == pseq + 1);
+    CHECK("tcp_out_send", write(s, "hello", 5) == 5);
+    n = next_tcp(fd, b, 3000);
+    CHECK("tcp_out_data_frame", n == 54 + 5 && memcmp(b + 54, "hello", 5) == 0 && TSEQ(b) == iss + 1);
+    n = tcp_frame(f, 80, cport, pseq + 1, iss + 6, 0x18, "world", 5);
+    write(fd, f, n);
+    {
+        char rb[16]; struct pollfd pr = { s, POLLIN, 0 };
+        int g = poll(&pr, 1, 3000) == 1 ? read(s, rb, sizeof rb) : -1;
+        CHECK("tcp_out_recv", g == 5 && memcmp(rb, "world", 5) == 0);
+    }
+    n = tcp_frame(f, 80, cport, pseq + 6, iss + 6, 0x11, NULL, 0);
+    write(fd, f, n);
+    {
+        char rb[16]; struct pollfd pr = { s, POLLIN, 0 };
+        int g = poll(&pr, 1, 3000) == 1 ? read(s, rb, sizeof rb) : -1;
+        CHECK("tcp_out_fin_eof", g == 0);
+    }
+    close(s);
+
+    /* tcp_in: a listener on the ns, injected SYN -> SYN-ACK, data -> recv */
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in me = { .sin_family = AF_INET, .sin_port = htons(8080) };
+    CHECK("tcp_listen", bind(l, (struct sockaddr *)&me, sizeof me) == 0 && listen(l, 4) == 0);
+    while (rd_timeout(fd, b, sizeof b, 50) > 0) ;
+    n = tcp_frame(f, 33333, 8080, 9000, 0, 0x02, NULL, 0);
+    write(fd, f, n);
+    n = next_tcp(fd, b, 3000);
+    int sa = n > 0 && TFLAGS(b) == 0x12 && TACK(b) == 9001 && TSPORT(b) == 8080;
+    CHECK("tcp_in_synack", sa);
+    if (!sa) return 1;
+    uint32_t iss2 = TSEQ(b);
+    n = tcp_frame(f, 33333, 8080, 9001, iss2 + 1, 0x10, NULL, 0);
+    write(fd, f, n);
+    struct pollfd pl = { l, POLLIN, 0 };
+    CHECK("tcp_in_accept_ready", poll(&pl, 1, 3000) == 1 && (pl.revents & POLLIN));
+    int a = accept(l, NULL, NULL);
+    CHECK("tcp_in_accept", a >= 0);
+    if (a < 0) return 1;
+    n = tcp_frame(f, 33333, 8080, 9001, iss2 + 1, 0x18, "ping", 4);
+    write(fd, f, n);
+    {
+        char rb[16]; struct pollfd pr = { a, POLLIN, 0 };
+        int g = poll(&pr, 1, 3000) == 1 ? read(a, rb, sizeof rb) : -1;
+        CHECK("tcp_in_recv", g == 4 && memcmp(rb, "ping", 4) == 0);
+    }
+    close(a); close(l); close(fd);
+    printf("tcp_cases: %d passed, %d failed\n", npass, nfail);
+    return nfail != 0;
+}
+
 int main(void)
 {
     pid_t c = fork();
@@ -226,6 +368,10 @@ int main(void)
     int st = 0;
     waitpid(c, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("ns_cases: FAIL (status %d)\n", st); }
+    c = fork();
+    if (c == 0) _exit(tcp_cases());
+    waitpid(c, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("tcp_cases: FAIL (status %d)\n", st); }
 
     /* unprivileged, initial namespaces */
     c = fork();
