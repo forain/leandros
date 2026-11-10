@@ -39,6 +39,20 @@ pub fn create(ofd: u32, tgid: u32, netns: u16) {
     NL_EVER.store(1, Ordering::Release);
 }
 
+/// Drop the netlink sockets whose description is gone (every holder closed or
+/// exited). Their namespace reference is the last thing keeping a dead netns
+/// (and its veth ends) alive, so the reaper calls this before it looks for
+/// namespaces that died; `create` alone only pruned on the next new socket.
+pub fn prune() {
+    if NL_EVER.load(Ordering::Acquire) == 0 { return; }
+    let dead: Vec<NlSock> = {
+        let mut m = NL.lock();
+        let ids: Vec<u32> = m.keys().copied().filter(|&k| !vfs::ofd::live(k)).collect();
+        ids.into_iter().filter_map(|k| m.remove(&k)).collect()
+    };
+    drop(dead); // the references drop with no netlink lock held
+}
+
 /// The description of `fd` when it is a netlink socket.
 pub fn of(pid: u32, fd: usize) -> Option<u32> {
     if NL_EVER.load(Ordering::Acquire) == 0 { return None; }
