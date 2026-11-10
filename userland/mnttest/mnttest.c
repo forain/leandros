@@ -2200,7 +2200,38 @@ static int db_dev(int m) {
     close(fd);
     return 0;
 }
+/* crun masks a directory (/sys/firmware) by moving a clone of a shared empty
+ * dir onto it, then re-opens the target with open_tree and requires the same
+ * st_dev/st_ino as the clone it moved ("race condition detected remounting
+ * masked path" otherwise). */
+static int db_maskdir(int m) {
+    (void)m;
+    const char *B = "/tmp/dbm";
+    char E[64], T[64];
+    mkdir(B, 0755); snprintf(E, sizeof E, "%s/empty", B); snprintf(T, sizeof T, "%s/target", B);
+    mkdir(E, 0755); mkdir(T, 0755);
+    chown(B, 1000, 1000); chown(E, 1000, 1000); chown(T, 1000, 1000);
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
+    wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "1000 1000 1"); wr("/proc/self/gid_map", "1000 1000 1");
+    if (mount("tmpfs", E, "tmpfs", 0, "mode=755") < 0) { printf("  tmpfs errno=%d\n", errno); return 11; }
+    int a = (int)syscall(428, AT_FDCWD, E, 0x1 | 0x80000 | 0x8000);
+    if (a < 0) { printf("  open_tree empty errno=%d\n", errno); return 12; }
+    struct stat before, after;
+    if (fstat(a, &before) < 0) return 13;
+    int tfd = open(T, O_PATH | O_DIRECTORY | O_CLOEXEC); if (tfd < 0) return 14;
+    if (syscall(429, a, "", tfd, "", 0x4 | 0x40) < 0) { printf("  move_mount errno=%d\n", errno); return 15; }
+    int b = (int)syscall(428, AT_FDCWD, T, 0x1 | 0x80000 | 0x8000);
+    if (b < 0) { printf("  open_tree target errno=%d\n", errno); return 16; }
+    if (fstat(b, &after) < 0) return 17;
+    if (before.st_dev != after.st_dev || before.st_ino != after.st_ino) {
+        printf("  dev/ino differ: %lx/%lx vs %lx/%lx\n", (unsigned long)before.st_dev, (unsigned long)before.st_ino, (unsigned long)after.st_dev, (unsigned long)after.st_ino);
+        return 18;
+    }
+    return 0;
+}
 static void devbind_suite(void) {
+    report("devbind_maskdir_same_ident", nn_in_child(db_maskdir, 0));
     for (int i = 0; i < 6; i++) for (int f = 0; f < 2; f++) {
         char n[64]; snprintf(n, sizeof n, "devbind_%s_%s", DB_DEV[i], f ? "fd" : "path");
         report(n, nn_in_child(db_dev, (i << 4) | f));
