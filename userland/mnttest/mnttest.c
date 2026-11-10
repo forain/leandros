@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/mount.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -1875,6 +1876,101 @@ static void opentree_suite(void) {
     report("opentree_setattr_ro_and_locked", nn_in_child(ot_setattr, 0));
 }
 
+/* ── lane mntro: per-mount ro / noexec / nodev enforcement ─────────────── */
+static int mro_setup(void) {
+    mkdir("/tmp/mro", 0755); mkdir("/tmp/mrb", 0755); mkdir("/tmp/mrw", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    if (mount("tmpfs", "/tmp/mro", "tmpfs", 0, NULL) < 0) return 92;
+    if (mount("tmpfs", "/tmp/mrw", "tmpfs", 0, NULL) < 0) return 93;
+    put("/tmp/mro/f", "x", 0644); mkdir("/tmp/mro/d", 0755); put("/tmp/mro/d/g", "y", 0644);
+    if (mount("/tmp/mro", "/tmp/mrb", NULL, MS_BIND, NULL) < 0) return 94;
+    if (mount(NULL, "/tmp/mrb", NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) return 95;
+    return 0;
+}
+static int mro_erofs(int m) {
+    (void)m;
+    int r = mro_setup(); if (r) return r;
+    errno = 0; if (open("/tmp/mrb/f", O_WRONLY) >= 0 || errno != EROFS) { printf("  open wr errno=%d\n", errno); return 10; }
+    errno = 0; if (open("/tmp/mrb/f", O_RDWR) >= 0 || errno != EROFS) return 11;
+    errno = 0; if (open("/tmp/mrb/f", O_RDONLY | O_TRUNC) >= 0 || errno != EROFS) return 12;
+    errno = 0; if (open("/tmp/mrb/new", O_WRONLY | O_CREAT, 0644) >= 0 || errno != EROFS) return 13;
+    int fd = open("/tmp/mrb/f", O_RDONLY | O_CREAT, 0644); if (fd < 0) return 14; /* existing: ok */
+    close(fd);
+    errno = 0; if (mkdir("/tmp/mrb/nd", 0755) == 0 || errno != EROFS) { printf("  mkdir errno=%d\n", errno); return 15; }
+    errno = 0; if (unlink("/tmp/mrb/f") == 0 || errno != EROFS) return 16;
+    errno = 0; if (rmdir("/tmp/mrb/d") == 0 || errno != EROFS) return 17;
+    errno = 0; if (rename("/tmp/mrw/none", "/tmp/mrb/x") == 0 || errno == 0) {}
+    put("/tmp/mrw/s", "z", 0644);
+    errno = 0; if (rename("/tmp/mrw/s", "/tmp/mrb/s") == 0 || (errno != EROFS && errno != EXDEV)) { printf("  rename onto errno=%d\n", errno); return 18; }
+    errno = 0; if (rename("/tmp/mrb/f", "/tmp/mrb/f2") == 0 || errno != EROFS) return 19;
+    errno = 0; if (symlink("a", "/tmp/mrb/sl") == 0 || errno != EROFS) return 20;
+    errno = 0; if (link("/tmp/mrb/f", "/tmp/mrb/hl") == 0 || errno != EROFS) return 21;
+    errno = 0; if (chmod("/tmp/mrb/f", 0600) == 0 || errno != EROFS) return 22;
+    errno = 0; if (truncate("/tmp/mrb/f", 0) == 0 || errno != EROFS) return 23;
+    /* the same files through the rw original and an rw sibling stay writable */
+    fd = open("/tmp/mro/f", O_WRONLY); if (fd < 0) { printf("  rw orig errno=%d\n", errno); return 30; }
+    close(fd);
+    if (mkdir("/tmp/mrw/nd", 0755) < 0) return 31;
+    put("/tmp/mrw/ok", "k", 0644); if (!exists("/tmp/mrw/ok")) return 32;
+    return 0;
+}
+static int mro_openfd_keeps_writing(int m) {
+    (void)m;
+    int r = mro_setup(); if (r) return r;
+    int fd = open("/tmp/mro/f", O_RDWR); if (fd < 0) return 10;
+    mkdir("/tmp/mrc", 0755);
+    if (mount("/tmp/mro", "/tmp/mrc", NULL, MS_BIND, NULL) < 0) return 11;
+    int fd2 = open("/tmp/mrc/f", O_RDWR); if (fd2 < 0) return 12;
+    if (mount(NULL, "/tmp/mrc", NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) return 13;
+    if (write(fd2, "q", 1) != 1) { printf("  write after remount-ro errno=%d\n", errno); return 14; }
+    close(fd); close(fd2);
+    errno = 0; if (open("/tmp/mrc/f", O_RDWR) >= 0 || errno != EROFS) return 15;
+    return 0;
+}
+static int mro_noexec(int m) {
+    (void)m;
+    mkdir("/tmp/mrx", 0755); mkdir("/tmp/mry", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (mount("tmpfs", "/tmp/mrx", "tmpfs", MS_NOEXEC, NULL) < 0) return 92;
+    if (mount("tmpfs", "/tmp/mry", "tmpfs", 0, NULL) < 0) return 93;
+    int in = open("/bin/mnttest", O_RDONLY); if (in < 0) return 94;
+    int a = open("/tmp/mrx/m", O_WRONLY | O_CREAT, 0755), b = open("/tmp/mry/m", O_WRONLY | O_CREAT, 0755);
+    if (a < 0 || b < 0) return 95;
+    char buf[4096]; ssize_t n;
+    while ((n = read(in, buf, sizeof buf)) > 0) { if (write(a, buf, n) != n || write(b, buf, n) != n) return 96; }
+    close(a); close(b); close(in);
+    pid_t p = fork();
+    if (p == 0) { execl("/tmp/mry/m", "m", "child-ok", (char *)0); _exit(99); }
+    int st = 0; waitpid(p, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 42) { printf("  control exec st=%d\n", st); return 10; }
+    p = fork();
+    if (p == 0) { execl("/tmp/mrx/m", "m", "child-ok", (char *)0); _exit(errno == EACCES ? 77 : 78); }
+    waitpid(p, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 77) { printf("  noexec exec st=%d\n", st); return 11; }
+    return 0;
+}
+static int mro_nodev(int m) {
+    (void)m;
+    mkdir("/tmp/mrn", 0755); mkdir("/tmp/mrv", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (mount("tmpfs", "/tmp/mrn", "tmpfs", MS_NODEV, NULL) < 0) return 92;
+    if (mount("tmpfs", "/tmp/mrv", "tmpfs", 0, NULL) < 0) return 93;
+    if (mknod("/tmp/mrn/null", S_IFCHR | 0666, makedev(1, 3)) < 0) { printf("  mknod nodev errno=%d\n", errno); return 94; }
+    if (mknod("/tmp/mrv/null", S_IFCHR | 0666, makedev(1, 3)) < 0) return 95;
+    int fd = open("/tmp/mrv/null", O_RDONLY); if (fd < 0) { printf("  control open errno=%d\n", errno); return 10; }
+    close(fd);
+    errno = 0; fd = open("/tmp/mrn/null", O_RDONLY);
+    if (fd >= 0 || errno != EACCES) { printf("  nodev open fd=%d errno=%d\n", fd, errno); return 11; }
+    return 0;
+}
+static void mro_suite(void) {
+    report("mntro_ro_bind_erofs", nn_in_child(mro_erofs, 0));
+    report("mntro_rw_fd_survives_remount_ro", nn_in_child(mro_openfd_keeps_writing, 0));
+    report("mntro_noexec_eacces", nn_in_child(mro_noexec, 0));
+    report("mntro_nodev_eacces", nn_in_child(mro_nodev, 0));
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -1896,6 +1992,7 @@ int main(int argc, char **argv) {
     podexec_suite();
     devpts_copies();
     opentree_suite();
+    mro_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
