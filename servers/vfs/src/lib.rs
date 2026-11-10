@@ -15679,7 +15679,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         // mount's root: Linux reports the type of that root, and crun decides
         // between creating a directory or a file mount point from it.
         VnodeKind::NsFd { kind: 4, id } if mnt::is_anon(id) && mnt::anon_is_dir(id) =>
-            (S_IFDIR | 0o755, 0, sched::ns::ns_ino(4, id)),
+            (S_IFDIR | 0o755, 0, mnt::anon_root_ident(id).unwrap_or_else(|| sched::ns::ns_ino(4, id))),
         VnodeKind::NsFd { kind, id } => (S_IFREG | 0o444, 0, sched::ns::ns_ino(kind as usize, id)),
         // Handled by the early return above (proxied to the owning mount);
         // this arm exists only for match exhaustiveness.
