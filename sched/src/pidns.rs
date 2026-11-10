@@ -207,6 +207,9 @@ pub fn init_drops(sender_ns: NsId, target: &crate::task::Task, sig: u32) -> bool
     let tn = target.pidns.id();
     if tn == 0 || sig == 0 || sig > 64 || target.tgid != ns::pid_init(tn) { return false; }
     if target.signal_actions[(sig - 1) as usize].handler != 0 { return false; }
+    // Linux sig_ignored(): a blocked signal is never ignored (the handler may
+    // change before it is unblocked), e.g. pasta's sigwaitinfo(SIGUSR1) child.
+    if target.signal_mask & (1u64 << (sig - 1)) != 0 { return false; }
     if sender_ns == tn { return true; }
     !matches!(sig, 9 | 19)
 }
