@@ -177,6 +177,44 @@ fn make_stack(sid: Sid, mac: [u8; 6]) {
     });
 }
 
+/// Frames this stack built for its own addresses never reach the wire: an
+/// ARP request for an own address is answered here and an IPv4 frame to the
+/// vif's own MAC is queued back to its receive side. Returns the frames that
+/// still leave. (The host NIC does the same in `local_delivery`.)
+fn local_loop(sid: Sid, mac: [u8; 6], own: &[[u8; 4]], tx: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(tx.len());
+    let mut back: Vec<Vec<u8>> = Vec::new();
+    for f in tx {
+        if f.len() >= 42 && f[12..14] == [0x08, 0x06] && f[20..22] == [0, 1] && own.iter().any(|a| a[..] == f[38..42]) {
+            let mut r = alloc::vec![0u8; 42];
+            r[0..6].copy_from_slice(&f[6..12]);
+            r[6..12].copy_from_slice(&mac);
+            r[12..14].copy_from_slice(&[0x08, 0x06]);
+            r[14..20].copy_from_slice(&f[14..20]);
+            r[20..22].copy_from_slice(&[0, 2]);
+            r[22..28].copy_from_slice(&mac);
+            r[28..32].copy_from_slice(&f[38..42]);
+            r[32..38].copy_from_slice(&f[22..28]);
+            r[38..42].copy_from_slice(&f[28..32]);
+            back.push(r);
+        } else if f.len() >= 14 && f[12..14] == [0x08, 0x00] && f[0..6] == mac {
+            back.push(f);
+        } else {
+            out.push(f);
+        }
+    }
+    if !back.is_empty() {
+        let mut v = VIFS.lock();
+        if let Some(x) = v[sid as usize].as_mut() {
+            for f in back { if x.rxq.len() < RXQ_CAP { x.rxq.push_back(f); } }
+            x.pending = true;
+        }
+        drop(v);
+        drivers::netdev::kick();
+    }
+    out
+}
+
 /// Poll every up tun/tap stack once. Called from the daemon pass.
 pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sched::WakeKeys,
                        changed: &mut bool, mask: &mut u64, next: &mut Option<smoltcp::time::Duration>) {
@@ -204,12 +242,16 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
             continue;
         }
         let mut dev = TapDev { rx, tx: Vec::new(), mtu };
+        let mut own: Vec<[u8; 4]> = Vec::new();
         {
             let mut g = stack_for(sid);
             if let Some(ref mut s) = *g {
                 let (c, m) = poll_stack(s, &mut dev, timestamp, &mut sigs[sid as usize], sid, keys);
                 *changed |= c; *mask |= m;
                 reap_orphans(s);
+                for c in s.interface.ip_addrs() {
+                    if let IpAddress::Ipv4(a) = c.address() { own.push(a.0); }
+                }
                 if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
                     *next = Some(next.map_or(d, |n| n.min(d)));
                 }
@@ -237,6 +279,10 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
                 }
             }
             continue;
+        }
+        // A namespace talking to its own interface address (Linux's `local` table).
+        if kind != VifKind::Veth && kind != VifKind::Bridge && !l3 {
+            dev.tx = local_loop(sid, mac, &own, dev.tx);
         }
         // Stack lock released: hand the frames to tundev.
         if h == NO_TUN { continue; }

@@ -11,6 +11,7 @@
  *   tun_eperm    an unprivileged task in the initial namespaces: EPERM
  *   tcp_out / tcp_in  TCP in a netns over a tap: connect (SYN frame, injected
  *                SYN-ACK, data, FIN) and listen/accept (injected SYN)
+ *   selfconn_*   connect to the ns's own tap address reaches its own listener, nothing on the tap
  * Run as root.
  */
 #define _GNU_SOURCE
@@ -498,6 +499,40 @@ static int vec_cases(void)
     return nfail != 0;
 }
 
+/* A namespace connecting to its OWN interface address reaches its own listener
+ * (Linux's local routing table); nothing may leave over the tap. pasta -t
+ * forwards into the container this way (connect to the guest address). */
+static int selfconn_cases(void)
+{
+    char name[IFNAMSIZ];
+    if (enter_ns() != 0) { printf("selfconn: unshare failed\n"); return 1; }
+    int fd = tun_open("tap%d", F_TAP | F_NO_PI, name);
+    CHECK("selfconn_tap", fd >= 0 && set_addr(name, "10.9.0.1", "255.255.255.0") == 0);
+    if (fd < 0) return 1;
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in any = { .sin_family = AF_INET, .sin_port = htons(7777) };
+    CHECK("selfconn_listen", bind(l, (struct sockaddr *)&any, sizeof any) == 0 && listen(l, 4) == 0);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in me = { .sin_family = AF_INET, .sin_port = htons(7777) };
+    me.sin_addr.s_addr = inet_addr("10.9.0.1");
+    struct timeval tv = { 3, 0 };
+    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    CHECK("selfconn_connect", connect(c, (struct sockaddr *)&me, sizeof me) == 0);
+    struct pollfd lp = { l, POLLIN, 0 };
+    int a = poll(&lp, 1, 3000) == 1 ? accept(l, NULL, NULL) : -1;
+    CHECK("selfconn_accept", a >= 0);
+    CHECK("selfconn_data", a >= 0 && write(c, "self", 4) == 4);
+    char rb[8] = { 0 };
+    struct pollfd ap = { a, POLLIN, 0 };
+    CHECK("selfconn_recv", a >= 0 && poll(&ap, 1, 3000) == 1 && read(a, rb, 8) == 4 && memcmp(rb, "self", 4) == 0);
+    /* nothing was written to the tap fd */
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    unsigned char b[2048];
+    CHECK("selfconn_tap_quiet", read(fd, b, sizeof b) < 0 && errno == EAGAIN);
+    printf("selfconn_cases: %d passed, %d failed\n", npass, nfail);
+    return nfail != 0;
+}
+
 int main(void)
 {
     pid_t c = fork();
@@ -514,6 +549,11 @@ int main(void)
     if (c == 0) _exit(vec_cases());
     waitpid(c, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("vec_cases: FAIL (status %d)\n", st); }
+
+    c = fork();
+    if (c == 0) _exit(selfconn_cases());
+    waitpid(c, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("selfconn_cases: FAIL (status %d)\n", st); }
 
     /* unprivileged, initial namespaces */
     c = fork();
