@@ -687,6 +687,7 @@ dependencies = [
 name = "sched"
 version = "0.1.0"
 dependencies = [
+ "ebpf-cgdev",
  "leandros-lib",
  "mm",
  "seccomp-bpf",
