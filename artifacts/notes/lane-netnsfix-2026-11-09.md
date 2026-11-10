@@ -20,3 +20,7 @@ stat(2) on the bound path (not fstat on the opened fd) is not special-cased.
 
 Tests: mnttest netns_suite (12 cases). On main: unshare_newnet_threaded, netns_make_rshared_ok/visible,
 netns_nsfs_bound_survives_and_setns FAIL; all PASS with the fix. Mac aarch64: mnttest, nstest, nettest pass; ffsandbox on=True off=False.
+
+FIXED (d): SIOCSIFFLAGS (0x8914) on a socket fd was ENOTTY (crun brings lo up). Now handled with SIOCGIF*: only "lo" of a
+non-initial netns, CAP_NET_ADMIN over the netns owner userns (EPERM otherwise), writes the same LO_UP state netlink
+RTM_NEWLINK uses. Other links: EOPNOTSUPP; ns 0 lo: EOPNOTSUPP. nstest: netns_siocsifflags_lo, netns_siocsifflags_lo_userns.
