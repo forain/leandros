@@ -8034,8 +8034,23 @@ fn gen_proc_nsmap_writable(tgid: u32, kind: usize, opener: sched::ns::Opener) ->
 /// namespace link; `Some(Some((pid, kind)))` the link's process and kind.
 fn proc_ns_file(path: &[u8], caller: u32) -> Option<Option<(u32, usize)>> {
     let rest = path.strip_prefix(b"/proc/")?;
+    // /proc/thread-self/ns/<name>: the calling thread's own namespaces.
+    if let Some(t) = rest.strip_prefix(b"thread-self/ns/") {
+        return Some(sched::ns::NS_NAMES.iter().position(|n| *n == t).map(|k| (caller, k)));
+    }
     let slash = rest.iter().position(|&b| b == b'/')?;
     let (who, tail) = (&rest[..slash], &rest[slash + 1..]);
+    // /proc/<pid|self>/task/<tid>/ns/<name>: that thread's namespaces (net
+    // can differ per thread after unshare/setns in one thread).
+    if let Some(t) = tail.strip_prefix(b"task/") {
+        let pid = if who == b"self" { sched::tgid_of(caller) } else { proc_parse_num(who)? };
+        let s2 = t.iter().position(|&b| b == b'/')?;
+        let name = t[s2 + 1..].strip_prefix(b"ns/")?;
+        let Some(tid) = proc_parse_num(&t[..s2]) else { return Some(None) };
+        if sched::proc_stat_of(pid).is_none() || sched::proc_stat_of(tid).is_none()
+            || sched::tgid_of(tid) != sched::tgid_of(pid) { return Some(None); }
+        return Some(sched::ns::NS_NAMES.iter().position(|n| *n == name).map(|k| (tid, k)));
+    }
     let name = tail.strip_prefix(b"ns/")?;
     let pid = if who == b"self" { sched::tgid_of(caller) } else { proc_parse_num(who)? };
     Some(sched::ns::NS_NAMES.iter().position(|n| *n == name).map(|k| (pid, k)))
