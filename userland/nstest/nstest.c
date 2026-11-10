@@ -1012,6 +1012,55 @@ static int t_netns_lo_up_ack(void)
     CHECK(ns_child_netns(netns_lo_up_body) == 0);
     return 0;
 }
+
+/* SIOCSIFFLAGS on a netns's lo (crun brings loopback up this way) agrees with netlink. */
+static int sioc_lo_body(int userns)
+{
+    static char b[8192];
+    if (unshare((userns ? CLONE_NEWUSER : 0) | CLONE_NEWNET) != 0) return 2;
+    int u = socket(AF_INET, SOCK_DGRAM, 0), s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (u < 0 || s < 0) return 3;
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo");
+    if (ioctl(u, SIOCGIFFLAGS, &q) != 0 || (q.ifr_flags & IFF_UP)) return 4;
+    if (ioctl(u, SIOCGIFINDEX, &q) != 0 || q.ifr_ifindex != 1) return 5;
+    memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo"); q.ifr_flags = IFF_UP | IFF_RUNNING;
+    if (ioctl(u, SIOCSIFFLAGS, &q) != 0) return 6;
+    memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo");
+    if (ioctl(u, SIOCGIFFLAGS, &q) != 0 || (q.ifr_flags & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING)) return 7;
+    int n = nl_rt(s, RTM_GETLINK, NLM_F_DUMP, 0, 0, 0, b, sizeof b);
+    int ok = 0;
+    for (struct nlmsghdr *h = (struct nlmsghdr *)b; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n))
+        if (h->nlmsg_type == RTM_NEWLINK && (((struct ifinfomsg *)NLMSG_DATA(h))->ifi_flags & IFF_UP)) ok = 1;
+    if (!ok) return 8;
+    memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo"); q.ifr_flags = 0;
+    if (ioctl(u, SIOCSIFFLAGS, &q) != 0) return 9;
+    memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo");
+    if (ioctl(u, SIOCGIFFLAGS, &q) != 0 || (q.ifr_flags & IFF_UP)) return 10;
+    if (!userns) { /* unprivileged user: EPERM */
+        if (setgid(1000) < 0 || setuid(1000) < 0) return 11;
+        memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo"); q.ifr_flags = IFF_UP;
+        errno = 0;
+        if (ioctl(u, SIOCSIFFLAGS, &q) == 0 || errno != EPERM) return 12;
+    }
+    return 0;
+}
+static int sioc_lo_run(int userns)
+{
+    pid_t c = fork();
+    if (c == 0) _exit(sioc_lo_body(userns));
+    int st = 0; waitpid(c, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 100;
+}
+static int t_netns_siocsifflags_lo(void)
+{
+    CHECK(sioc_lo_run(0) == 0);
+    return 0;
+}
+static int t_netns_siocsifflags_lo_userns(void)
+{
+    CHECK(sioc_lo_run(1) == 0);
+    return 0;
+}
 static int t_netns_sendfam(void)
 {
     int h = socket(AF_INET, SOCK_DGRAM, 0);
@@ -2640,7 +2689,7 @@ static int run_userns_cases(void)
         { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
-        { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
+        { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_siocsifflags_lo", t_netns_siocsifflags_lo }, { "netns_siocsifflags_lo_userns", t_netns_siocsifflags_lo_userns }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
         { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },

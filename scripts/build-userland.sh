@@ -154,7 +154,7 @@ if command -v zig >/dev/null 2>&1; then
     echo "[userland] Building chroottest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/chroottest" userland/chroottest/chroottest.c
     echo "[userland] Building mnttest..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/mnttest" userland/mnttest/mnttest.c
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/mnttest" userland/mnttest/mnttest.c -lpthread
     echo "[userland] Building captest..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/captest" userland/captest/captest.c
     # bpftest: bpf(2) cgroup device programs (lane bpfsys).
@@ -172,6 +172,9 @@ if command -v zig >/dev/null 2>&1; then
     # memfdtest: crun cloned-binary sequence (memfd_create, seals, sendfile, fexecve).
     echo "[userland] Building memfdtest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/memfdtest" userland/memfdtest/memfdtest.c
+    # conmontest: syscall sequences conmon performs at start (lane conmondbg).
+    echo "[userland] Building conmontest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/conmontest" userland/conmontest/conmontest.c
     # suspendtest: one freeze-only device suspend/resume cycle (kernel pm).
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/suspendtest" userland/suspendtest/suspendtest.c
     # kexec: kexec-tools style front end (-l/-u/-e) over kexec_file_load + reboot(KEXEC).

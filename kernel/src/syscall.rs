@@ -1235,6 +1235,10 @@ pub extern "C" fn syscall_dispatch(
         }
     }
     let ret = dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr);
+    if ret < 0 && ret > -4096 && ret != ERESTARTSYS && ret != ERESTARTNOHAND
+        && ret != ERESTART_RESTARTBLOCK && sched::errtrace_enabled() {
+        errtrace_log(number, ret, a0, a1, a2);
+    }
     if number != RT_SIGRETURN && (ret == ERESTARTSYS || ret == ERESTARTNOHAND) {
         // Never reaches user space: the frame gets EINTR, and the signal
         // pass that runs next rewinds to re-execute the syscall when no
@@ -1251,6 +1255,41 @@ pub extern "C" fn syscall_dispatch(
         return -4;
     }
     ret
+}
+
+/// `sched.errtrace=<comm>`: one line per failing syscall of a matching task.
+#[cold]
+fn errtrace_log(number: usize, ret: isize, a0: usize, a1: usize, a2: usize) {
+    let pid = current_pid();
+    if !sched::errtrace_match(pid) { return; }
+    let _g = TRACE_LOCK.lock();
+    crate::serial_print_str("[ERRTRACE] pid=");
+    crate::serial_print_hex(pid as usize);
+    crate::serial_print_str(" nr=");
+    crate::serial_print_hex(number);
+    crate::serial_print_str(" ret=-");
+    crate::serial_print_hex((-ret) as usize);
+    crate::serial_print_str(" a0=");
+    crate::serial_print_hex(a0);
+    crate::serial_print_str(" a1=");
+    crate::serial_print_hex(a1);
+    crate::serial_print_str(" a2=");
+    crate::serial_print_hex(a2);
+    // Path-like arguments: a printable NUL-terminated string at a pointer arg.
+    for (i, a) in [a0, a1, a2].into_iter().enumerate() {
+        if a < 0x1000 || a >= 0x0000_8000_0000_0000 { continue; }
+        if let Ok(v) = copy_user_str(a, 300) {
+            if v.len() >= 2 && v.iter().filter(|&&c| (0x20..0x7f).contains(&c)).count() * 2 >= v.len() {
+                let v: Vec<u8> = v.iter().map(|&c| if (0x20..0x7f).contains(&c) { c } else { b'.' }).collect();
+                crate::serial_print_str(" s");
+                crate::serial_print_hex(i);
+                crate::serial_print_str("=\"");
+                crate::serial_print_str(core::str::from_utf8(&v).unwrap_or("?"));
+                crate::serial_print_str("\"");
+            }
+        }
+    }
+    crate::serial_print_str("\n");
 }
 
 /// Kernel-internal "interrupted, restartable" return (Linux -ERESTARTSYS):
@@ -8523,7 +8562,7 @@ fn sys_unshare(flags: usize) -> isize {
     if flags & CLONE_NEWNS != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     let flat = flags & (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS);
     if flat != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; } // CAP_SYS_ADMIN
-    if flat != 0 && !alone { return -22; }
+    // Linux allows these from a multithreaded caller: the namespace is per thread (Go's LockOSThread + unshare).
     if flags & CLONE_NEWCGROUP != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     if flags & CLONE_NEWUSER != 0 {
         // Linux: a chrooted task may not create a user namespace (EPERM).
@@ -8847,6 +8886,48 @@ fn lstat_magic_link(ns: &[u8], statbuf_ptr: usize) -> Option<isize> {
 /// O_NOFOLLOW in the VFS (x86_64) open-flag layout.
 const OPEN_O_NOFOLLOW: usize = 0o400000;
 
+/// `/proc/<own>/fd/N` (final component, magic link followed) naming a
+/// descriptor that has no filesystem path (socket, pipe, eventfd, ...): its
+/// VFS handle (see fd_handle).
+/// Linux resolves those to the anonymous inode, so stat describes the object
+/// and chmod/chown succeed without touching a file (conmon chmods its bound
+/// console socket as "/proc/self/fd/N").
+fn proc_own_anon_fd(ns_path: &[u8]) -> Option<usize> {
+    let (fd, below) = proc_own_fd(ns_path)?;
+    let h = fd_handle(fd);
+    if !below.is_empty() || fd_host_path(h).is_some() { return None; }
+    Some(h)
+}
+
+/// `/proc/<own>/fd/N` naming a directory on a non-mounted filesystem (tmpfs
+/// instance, RamFS): the VFS handle. stat/chmod act on the descriptor itself
+/// (fstat / fchmod), so no backing path (the hidden `/.leandros-sb` pool in
+/// particular) is ever resolved and namespace translation cannot be bypassed.
+fn proc_own_tmpfs_dir_fd(ns_path: &[u8]) -> Option<usize> {
+    let (fd, below) = proc_own_fd(ns_path)?;
+    if !below.is_empty() || fd >= net_server::SOCK_FD_BASE { return None; }
+    if matches!(vfs::vfs_get_node_kind(current_pid(), fd), Some(vfs::VnodeKind::MountedFile { .. })) {
+        return None;
+    }
+    let h = fd_handle(fd);
+    // Kernel-internal is-directory query on the backing path; the path is
+    // never handed to anything that resolves it for the user.
+    let host = fd_host_path(h)?;
+    if host.ends_with(b" (deleted)") { return None; }
+    match kpath_is_dir(&KPath::raw(&host)) { Ok(true) => Some(h), _ => None }
+}
+
+/// The host path of fd `fd` when it names a live directory the VFS can
+/// resolve by path; None for anything else (files keep identity reopen).
+fn fd_dir_host_path(fd: usize) -> Option<Vec<u8>> {
+    let host = fd_host_path(fd)?;
+    if host.ends_with(b" (deleted)") { return None; }
+    // The hidden tmpfs pool is never a resolution base for a user path.
+    if vfs::mnt::is_sb_path(&host) { return None; }
+    let kp = KPath::raw(&host);
+    match kpath_is_dir(&kp) { Ok(true) => Some(host), _ => None }
+}
+
 /// Follow a final `/proc/<pid>/{exe,cwd,root}` magic link, as open and stat
 /// do on Linux: `open("/proc/self/exe")` opens the running binary,
 /// `stat("/proc/self/cwd")` the working directory. Anything else (including
@@ -8892,6 +8973,13 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
                 Some(vfs::VnodeKind::MountedFile { .. }));
             if mounted {
                 if let Some(host) = fd_host_path(fd) { return Ok(KPath::raw(&host)); }
+            } else if let Some(dir) = fd_dir_host_path(fd) {
+                // A directory descriptor on a non-mounted filesystem (tmpfs,
+                // RamFS): stat/chmod/bind below the magic link act on the
+                // directory itself, as on Linux (conmon chmods its
+                // O_PATH attach-socket directory this way). Directories have
+                // no unlinked-identity case worth keeping.
+                return Ok(KPath::raw(&dir));
             } else if !b.starts_with(b"/proc/self/fd/") {
                 // The VFS reopens by identity only under /proc/self/fd: give
                 // it /proc/<own pid>/fd/N (the Claude Code CLI reads its task
@@ -9361,6 +9449,24 @@ fn sys_mount(
     };
     let alias_src: Option<(Vec<u8>, &'static str)> = if flags & MS_BIND != 0 {
         let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
+        // Binding /proc/<pid>/ns/<name> keeps that namespace alive.
+        match vfs::nsfs_bind_source(src.ns_bytes(), current_pid()) {
+            Err(e) => return e,
+            Ok(Some(synth)) => {
+                let mp = target_path.ns_bytes();
+                let mut st = [0u8; STAT_SIZE];
+                let m = make_vfs_msg(vfs::VFS_STAT, &[target_path.ptr() as u64, st.as_mut_ptr() as u64]);
+                let r = vfs_reply_val(&vfs::handle(&m, current_pid()));
+                let ok = r >= 0 && vfs::read_stat_mode(st.as_ptr() as usize) & 0o170000 != 0o040000;
+                let put = |s: &[u8]| if let Some((_, id)) = vfs::alias::ns_src(s) { sched::ns::put_raw(id); };
+                if !ok { put(&synth); return if r < 0 { r } else { -20 }; }
+                return match vfs::alias::add(mp, &synth, "nsfs", b"nsfs") {
+                    Ok(()) => 0,
+                    Err(e) => { put(&synth); e as isize }
+                };
+            }
+            Ok(None) => {}
+        }
         Some((src.bytes().to_vec(), "none"))
     } else {
         match &fstype_raw[..] {
@@ -9869,6 +9975,11 @@ fn fstatat_into(
     }
 
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        if let Some(fd) = proc_own_tmpfs_dir_fd(path.ns_bytes()).or_else(|| proc_own_anon_fd(path.ns_bytes())) {
+            return fstat_into(fd, statbuf_ptr, user_dest);
+        }
+    }
     let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
         match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
     } else {
@@ -10124,6 +10235,19 @@ fn sys_fchmodat2(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> is
 
 fn sys_fchmodat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        if let Some(h) = proc_own_tmpfs_dir_fd(path.ns_bytes()) {
+            return sys_fchmod(h, mode);
+        }
+        if let Some(fd) = proc_own_anon_fd(path.ns_bytes()) {
+            let mut kb = [0u64; STAT_SIZE.div_ceil(8)];
+            let r = fstat_into(fd, kb.as_mut_ptr() as usize, false);
+            return if r >= 0 { 0 } else { r };
+        }
+    }
+    let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
+    } else { path };
     let pid = current_pid();
     let tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LCHMOD } else { vfs::VFS_CHMOD };
     let msg = make_vfs_msg(tag, &[path.ptr() as u64, mode as u64]);
@@ -11960,6 +12084,20 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         }
         if arg == 0 || !validate_user_buf(arg, nl::IFREQ_LEN) { return -14; }
         let mut ifr = match sched::uaccess::read_user::<[u8; nl::IFREQ_LEN]>(arg) { Some(v) => v, None => return -14 };
+        if cmd as u32 == nl::SIOCSIFFLAGS {
+            // Only a netns's own `lo` has an admin state to set (the same
+            // LO_UP netlink RTM_NEWLINK uses); needs CAP_NET_ADMIN over the
+            // netns owner's user namespace.
+            let ns = sched::ns::netns_of(pid as u32);
+            let owner = sched::ns::owner_userns(2, ns);
+            if !sched::caps::ns_capable_in(owner, 12) { return -1; }
+            let n = ifr[..16].iter().position(|&b| b == 0).unwrap_or(16);
+            if &ifr[..n] != b"lo" { return if links.iter().any(|l| l.name.as_bytes() == &ifr[..n]) { -95 } else { -19 }; }
+            if ns == 0 { return -95; }
+            let fl = u16::from_ne_bytes([ifr[16], ifr[17]]);
+            sched::ns::set_lo_admin_up(ns, fl & 1 != 0); // IFF_UP
+            return 0;
+        }
         let r = nl::ifreq_ioctl(cmd as u32, &mut ifr, &links);
         if r < 0 { return r as isize; }
         return if sched::uaccess::write_user(arg, ifr) { 0 } else { -14 };
