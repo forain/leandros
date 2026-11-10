@@ -192,7 +192,8 @@ static int wait_byte(int fd, int ms) {
 
 /* ── flock / F_SETLKW ─────────────────────────────────────────────────── */
 
-#define LOCKFILE "/tmp/vfstag.lock"
+static char lockfile[64] = "/tmp/vfstag.lock";
+#define LOCKFILE lockfile
 
 enum lock_api { API_FLOCK, API_SETLKW };
 enum release { REL_UNLOCK, REL_CLOSE, REL_EXIT };
@@ -283,15 +284,25 @@ static void lock_cases(void) {
         bad |= lock_round("setlkw_wait", API_SETLKW, REL_EXIT, 0);
         if (!bad) pass("setlkw_wait");
     }
-    /* A fresh socketpair + pipe per round gives the traffic ~6 new poll keys, so
-     * about one round in ten shares a bloom bit with the lock waiter's tag. A
+    /* The traffic's poll keys are nearly the same every round (small slot
+     * numbers), so whether one shares a bloom bit with the lock waiter's tag
+     * depends on the lock file. 64 files cover the 64 bits with high odds. A
      * waiter parked on the bit alone is woken once per trip then; one parked on
-     * its exact key is not. 48 rounds make a miss of every collision ~1 %. */
+     * its exact key is not. */
     if (!skipped("flock_collide")) {
         int bad = 0;
         traffic_ms = 100;
-        for (int i = 0; i < 48 && !bad; i++)
+        for (int i = 0; i < 64 && !bad; i++) {
+            /* The tag is a hash of the file's tmpfs slot: a new file per round
+             * moves it, and the earlier files stay put so no slot is reused. */
+            snprintf(lockfile, sizeof lockfile, "/tmp/vfstag.lock.%d", i);
             bad = lock_round("flock_collide", (i & 1) ? API_SETLKW : API_FLOCK, REL_UNLOCK, 1);
+        }
+        for (int i = 0; i < 64; i++) {
+            snprintf(lockfile, sizeof lockfile, "/tmp/vfstag.lock.%d", i);
+            unlink(lockfile);
+        }
+        strcpy(lockfile, "/tmp/vfstag.lock");
         traffic_ms = 1000;
         if (!bad) pass("flock_collide");
     }
