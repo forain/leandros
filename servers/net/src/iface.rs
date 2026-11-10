@@ -221,6 +221,8 @@ pub(crate) fn weak_host_holder(netif: u8, dst: [u8; 4]) -> Option<Sid> {
 /// carrier, and `dst` is on-link or it has a default route).
 pub(crate) fn can_route(sid: Sid, dst: IpAddress) -> bool {
     if sid == LO { return is_loopback(dst); }
+    // A dynamic (tun/tap) stack was chosen by the netns's own route table.
+    if sid >= FIRST_DYN { return v4(dst).is_some(); }
     let Some(d) = v4(dst) else { return false };
     let r = rt(sid - 1);
     match r.cfg {
