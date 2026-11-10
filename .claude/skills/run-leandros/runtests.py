@@ -43,7 +43,7 @@ Options:
                              vfstag   host:vfstagtest.py alone
                              nettag2  host:nettag2test.py alone
                              kparks   host:kparkstest.py alone
-                             podbridge host:podbridgetest.py alone (root podman default bridge: echo, host/bridge wget, dns, 20x churn, no leaks; implies --cmdline idmap=test)
+                             podbridge host:podbridgetest.py alone (root podman default bridge: echo, host/bridge wget, dns, 20x churn, no leaks)
                              drm      /bin/drmsmoke + /bin/gpuprobe gl (needs --gpu virgl|venus)
                            no commands and no --suite = regress
   --repeat N               boot N times, run the whole list each time
@@ -192,7 +192,7 @@ SUITES = {
     "nettag2": ["host:nettag2test.py"],
     # Narrow kernel parks: console poll/epoll, empty poll sets, VT_WAITACTIVE.
     "kparks": ["host:kparkstest.py"],
-    # Root podman on the default bridge network (needs LEANDROS_IMAGE_ARCHIVE image + --cmdline idmap=test).
+    # Root podman on the default bridge network (needs LEANDROS_IMAGE_ARCHIVE image).
     "podbridge": ["host:podbridgetest.py"],
     # /proc/<pid>/comm, prctl names and /bin/ps.
     "procps": ["/bin/pstest"],
@@ -375,8 +375,6 @@ def main(argv):
             print(f"unknown suite {s!r}; known: {', '.join(SUITES)}")
             return 2
         cmds += SUITES[s]
-    if "podbridge" in suites and cmdline is None:
-        cmdline = "idmap=test"
     if "i915fake" in suites and cmdline is None:
         cmdline = "i915.fake=2 i915.kms=1"
     if "i915crtc2" in suites and cmdline is None:
