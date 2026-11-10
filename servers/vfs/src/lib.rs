@@ -10065,6 +10065,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
         VnodeKind::Inotify { inst } => {
             let inst = *inst;
             drop(tbls);
+            if inst == 0 { return err_reply(-11); } // silent stub: never any events
             let mut out: Vec<u8> = Vec::new();
             match inotify::read(inst, count, &mut out) {
                 Err(e) => err_reply(e),
