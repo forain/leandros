@@ -4530,6 +4530,40 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/sys/kernel/cap_last_cap", data: b"40\n" },
     // Supplementary-group limit (sched::task::NGROUPS_MAX, asserted below).
     RamEntry { path: b"/proc/sys/kernel/ngroups_max", data: b"32\n" },
+    RamEntry { path: b"/proc/sys/net/core/somaxconn", data: b"4096\n" },
+    RamEntry { path: b"/proc/sys/net/core/rmem_max", data: b"212992\n" },
+    RamEntry { path: b"/proc/sys/net/core/wmem_max", data: b"212992\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/ip_forward", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/ip_unprivileged_port_start", data: b"1024\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/ip_local_port_range", data: b"32768\t60999\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/ping_group_range", data: b"1\t0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/ip_nonlocal_bind", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/ip_default_ttl", data: b"64\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/tcp_syncookies", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/conf/all/forwarding", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/conf/all/route_localnet", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/conf/all/rp_filter", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/conf/all/arp_notify", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/conf/default/forwarding", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/conf/default/route_localnet", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/conf/default/rp_filter", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/conf/default/arp_notify", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/conf/lo/forwarding", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/conf/lo/route_localnet", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/conf/lo/rp_filter", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/conf/lo/arp_notify", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/all/disable_ipv6", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/all/forwarding", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/all/accept_ra", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/all/accept_dad", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/default/disable_ipv6", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/default/forwarding", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/default/accept_ra", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/default/accept_dad", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/lo/disable_ipv6", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/lo/forwarding", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/lo/accept_ra", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/lo/accept_dad", data: b"1\n" },
 ];
 const _: () = assert!(sched::caps::CAP_LAST == 40, "update /proc/sys/kernel/cap_last_cap");
 const _: () = assert!(sched::task::NGROUPS_MAX == 32, "update /proc/sys/kernel/ngroups_max");
@@ -4582,6 +4616,18 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/proc/sys/kernel",
     b"/proc/sys/vm",
     b"/proc/sys/user",
+    b"/proc/sys/net",
+    b"/proc/sys/net/core",
+    b"/proc/sys/net/ipv4",
+    b"/proc/sys/net/ipv4/conf",
+    b"/proc/sys/net/ipv4/conf/all",
+    b"/proc/sys/net/ipv4/conf/default",
+    b"/proc/sys/net/ipv4/conf/lo",
+    b"/proc/sys/net/ipv6",
+    b"/proc/sys/net/ipv6/conf",
+    b"/proc/sys/net/ipv6/conf/all",
+    b"/proc/sys/net/ipv6/conf/default",
+    b"/proc/sys/net/ipv6/conf/lo",
 ];
 
 // ── Server port ───────────────────────────────────────────────────────────────
@@ -7900,6 +7946,40 @@ fn oom_text(v: i32, out: &mut [u8; 12]) -> usize {
     n + 1
 }
 
+/// Fake path of a writable `/proc/sys/net/...` snapshot: carries netns and slot.
+const PROC_NETCTL_W: &[u8] = b"/tmp/.proc_netctl_";
+
+/// `/proc/sys/net/<rel>` file → slot in sched::ns::NETCTL.
+fn netctl_slot(path: &[u8]) -> Option<usize> {
+    sched::ns::netctl_find(path.strip_prefix(b"/proc/sys/net/")?)
+}
+
+fn gen_proc_netctl(pid: u32, k: usize, write: bool) -> Option<VnodeKind> {
+    let ns = sched::ns::netns_of(pid);
+    let mut data = [0u8; 32];
+    let l = sched::ns::netctl_text(ns, k, &mut data);
+    if !write {
+        let mut buf = [0u8; TMP_BUF_SIZE];
+        buf[..l].copy_from_slice(&data[..l]);
+        return gen_proc_system_file(&buf, l);
+    }
+    let mut fake = [0u8; 48];
+    fake[..PROC_NETCTL_W.len()].copy_from_slice(PROC_NETCTL_W);
+    let mut n = PROC_NETCTL_W.len();
+    for v in [ns as usize, k] {
+        let mut d = [0u8; 8]; let mut i = 0; let mut x = v;
+        loop { d[i] = b'0' + (x % 10) as u8; i += 1; x /= 10; if x == 0 { break; } }
+        while i > 0 { i -= 1; fake[n] = d[i]; n += 1; }
+        fake[n] = b'_'; n += 1;
+    }
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, &fake[..n]);
+    if !tmp_fill_kernel(&mut tmp, idx, &data[..l]) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
+
 /// A writable snapshot of `/proc/<pid>/oom_score_adj`; the fake path carries
 /// the pid so `handle_write` can route the digits to `sched::set_oom_score_adj`.
 fn gen_proc_oom_writable(tid: u32) -> Option<VnodeKind> {
@@ -9025,6 +9105,16 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if let Some(k) = netctl_slot(lookup_path) {
+            // Per-netns sysctl; writing needs CAP_NET_ADMIN over the netns owner.
+            let write = flags & 0o3 != 0;
+            if write && !sched::caps::pid_capable_in(pid, sched::ns::owner_userns(2, sched::ns::netns_of(pid)), 12) {
+                return err_reply(-13);
+            }
+            match gen_proc_netctl(pid, k, write) {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
         } else if lookup_path == b"/proc/sys/kernel/hostname" || lookup_path == b"/proc/sys/kernel/domainname" {
             match gen_proc_uts(pid, lookup_path == b"/proc/sys/kernel/domainname") {
                 Some(v) => v,
@@ -9940,6 +10030,22 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 if unsafe { sched::uaccess::copy_raw(data.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
                 let r = sysclass::write(&p[..l], &data[..n]);
                 return if r < 0 { err_reply(r) } else { val_reply(count as u64) };
+            }
+            let netctl = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                if e.in_use() && e.ephemeral() && e.path().starts_with(PROC_NETCTL_W) {
+                    let mut it = e.path()[PROC_NETCTL_W.len()..].split(|&c| c == b'_').map(|d| d.iter().fold(0usize, |a, &c| a * 10 + c.wrapping_sub(b'0') as usize));
+                    let ns = it.next().unwrap_or(0); let k = it.next().unwrap_or(0);
+                    Some((ns as u16, k))
+                } else { None }
+            };
+            if let Some((ns, k)) = netctl {
+                let n = count.min(63);
+                let mut b = [0u8; 63];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let r = sched::ns::netctl_set(ns, k, &b[..n]);
+                return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
             }
             let oom_tid = {
                 let tmp = TMP_FILES.lock();
@@ -15814,7 +15920,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
 }
 
 enum FdInfo { Static(&'static [u8]), Pipe(usize), RamData(*const u8), TmpIdx(usize),
-              Mounted(u32, u32), PtsSlave(u16), Bad }
+              Mounted(u32, u32), PtsSlave(u16), Cg(sched::cgroup::CgId), Bad }
 
 fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Message {
     if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
@@ -15885,6 +15991,9 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             // A file on a mounted filesystem: only the owning mount server
             // knows the path behind its file_id, so ask it.
             VnodeKind::MountedFile { port, file_id } => FdInfo::Mounted(*port, *file_id),
+            // A cgroupfs directory fd names its tree path, so openat/openat2
+            // relative to it (crun) resolve.
+            VnodeKind::SysBlock { dev, .. } if cgroupfs::is_dev(*dev) => FdInfo::Cg(cgroupfs::dev_cg(*dev)),
             VnodeKind::SockAlias { .. } => FdInfo::Static(b"socket:[0]"),
             VnodeKind::EpollFd { .. } => FdInfo::Static(b"anon_inode:[eventpoll]"),
             _ => FdInfo::Bad,
@@ -15913,6 +16022,14 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             b[n] = b']'; n += 1;
             let c = n.min(buf_len);
             unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, b.as_ptr(), c); }
+            val_reply(c as u64)
+        }
+        FdInfo::Cg(cg) => {
+            let mut p = alloc::vec::Vec::from(cgroupfs::ROOT);
+            let rel = sched::cgroup::path_rel(cg, 0);
+            if rel != "/" { p.extend_from_slice(rel.as_bytes()); }
+            let c = p.len().min(buf_len);
+            unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, p.as_ptr(), c); }
             val_reply(c as u64)
         }
         FdInfo::PtsSlave(n) => {

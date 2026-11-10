@@ -77,15 +77,18 @@ pub(crate) fn new_lid() -> u32 {
 }
 
 /// The stacks a listener on `local` lives on.
-pub(crate) fn stacks_for(local: IpEndpoint) -> alloc::vec::Vec<Sid> {
+pub(crate) fn stacks_for(ns: u16, local: IpEndpoint) -> alloc::vec::Vec<Sid> {
     let mut v = alloc::vec::Vec::new();
+    let dynamic = crate::vif::ns_sids_dyn(ns);
     if local.addr.is_unspecified() {
         v.push(LO);
         v.extend(iface::nic_sids());
+        v.extend(dynamic);
     } else if is_loopback_addr(local.addr) {
         v.push(LO);
     } else {
         v.extend(iface::nic_sids());
+        v.extend(dynamic);
     }
     v
 }
@@ -98,8 +101,10 @@ pub(crate) fn stacks_for(local: IpEndpoint) -> alloc::vec::Vec<Sid> {
 /// tokio reactor) parked broadcast: ~2,800 wakes/s on the laptop.
 pub(crate) fn wake_key(lid: u32) -> u64 { sched::poll_key(sched::poll_class::LISTEN, lid) }
 
-/// Every stack, for the paths that look a listener up by id.
-pub(crate) fn all_sids() -> impl Iterator<Item = Sid> { core::iter::once(LO).chain(iface::nic_sids()) }
+/// Every stack of any namespace, for the paths that look a listener up by id.
+pub(crate) fn all_sids() -> impl Iterator<Item = Sid> {
+    core::iter::once(LO).chain(iface::nic_sids()).chain(crate::vif::all_dyn_sids())
+}
 
 fn listen_ep(local: IpEndpoint) -> IpListenEndpoint {
     IpListenEndpoint { addr: if local.addr.is_unspecified() { None } else { Some(local.addr) }, port: local.port }
@@ -135,7 +140,7 @@ pub(crate) fn register(lid: u32, local: IpEndpoint) { REGISTRY.lock().register(l
 /// on it there. Returns how many it carries. Caller holds no net lock.
 pub(crate) fn adopt(sid: Sid) -> usize {
     let snap = REGISTRY.lock().snapshot();
-    crate::latestack::adopt(&snap, |local| stacks_for(*local).contains(&sid),
+    crate::latestack::adopt(&snap, |local| stacks_for(0, *local).contains(&sid),
         |lid, local| create(sid, lid, *local),
         |lid| REGISTRY.lock().contains(lid),
         |lid| destroy(sid, lid))
@@ -358,7 +363,7 @@ pub(crate) fn proc_listen(w: &mut dyn core::fmt::Write) {
         }
     }
     for (lid, local) in REGISTRY.lock().snapshot() {
-        let want = stacks_for(local);
+        let want = stacks_for(0, local);
         let on = want.iter().filter(|sid| have.contains(&(**sid, lid))).count();
         let _ = write!(w, "registered lid {} {} on {}/{}", lid, local, on, want.len());
         for sid in want.iter().filter(|sid| !have.contains(&(**sid, lid))) { let _ = write!(w, " missing {}", name(*sid)); }

@@ -213,3 +213,9 @@ pub fn on_exec(t: &mut Task, setid: bool) {
     t.caps[1] = p;
     t.caps[SEC] &= !SECURE_KEEP_CAPS;
 }
+
+/// `ns_capable_in` for an arbitrary thread (the VFS and net servers act for `pid`).
+pub fn pid_capable_in(pid: u32, target_ns: crate::ns::NsId, cap: u32) -> bool {
+    RUN_QUEUE.lock().find_pid(pid)
+        .map(|t| capable_snap(t.userns.id(), t.euid, t.caps[0], target_ns, cap)).unwrap_or(false)
+}

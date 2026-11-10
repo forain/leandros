@@ -36,7 +36,7 @@ fn interface_of(group: [u8; 4], addr: [u8; 4], ifindex: i32) -> Result<Sid, i32>
         return iface::holder_of(a).ok_or(ENODEV);
     }
     let g = IpAddress::Ipv4(smoltcp::wire::Ipv4Address(group));
-    iface::route_select(g).or_else(iface::default_sid).ok_or(ENODEV)
+    iface::route_select(0, g).or_else(iface::default_sid).ok_or(ENODEV)
 }
 
 /// Make stack `sid`'s interface a member of `group` (or stop being one).
