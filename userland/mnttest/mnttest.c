@@ -655,8 +655,9 @@ static int procfd_tmpfs_dir_ok(void) {
     ssize_t n = readlink(p, lnk, sizeof lnk - 1);
     if (n > 0) { lnk[n] = 0; if (strstr(lnk, ".leandros-sb")) return 0; }
     for (int m = 1; m < 80; m++) {
+        /* "..": lexically folded, so /proc/self/fd/<m> for m == dfd is this very dir */
         snprintf(q, sizeof q, "%s/../%d/marker", p, m);
-        if (stat(q, &b) == 0) return 0;
+        if (m != dfd && stat(q, &b) == 0) return 0;
         snprintf(q, sizeof q, "%s/.leandros-sb/tmpfs/%d/marker", p, m);
         if (stat(q, &b) == 0) return 0;
         snprintf(q, sizeof q, "%s/../.leandros-sb/tmpfs/%d/marker", p, m);
