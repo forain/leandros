@@ -575,7 +575,7 @@ static int has_word(const char *buf, const char *w)
 {
     size_t n = strlen(w);
     for (const char *p = buf; (p = strstr(p, w)); p++)
-        if ((p == buf || p[-1] == ' ') && (p[n] == ' ' || p[n] == '\n' || p[n] == 0)) return 1;
+        if ((p == buf || p[-1] == ' ' || p[-1] == '\n') && (p[n] == ' ' || p[n] == '\n' || p[n] == 0)) return 1;
     return 0;
 }
 
