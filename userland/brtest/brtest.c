@@ -1196,7 +1196,7 @@ static void stale_stack(void) {
     CHECK("stale_stack: connect in flight on the veth stack", r < 0 && errno == EINPROGRESS);
     CHECK("stale_stack: DELLINK of the stack's link", link_del(s, iz) == 0);
     /* a new pair reuses the freed stack slot */
-    int e2 = veth_new(s, "vethY", "eth1", -1);
+    int e2 = veth_new(s, "vethSa", "vethSb", -1);
     (void)e2;
     struct pollfd p = { t, POLLIN | POLLOUT, 0 };
     int n = poll(&p, 1, 0);
@@ -1210,6 +1210,7 @@ static void stale_stack(void) {
     CHECK("stale_stack: getsockopt answers", getsockopt(t, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0);
     CHECK("stale_stack: close", close(t) == 0);
     CHECK("stale_stack: net server alive", link_get(s, "lo", NULL, NULL) > 0);
+    { int ia = link_get(s, "vethSa", NULL, NULL); if (ia > 0) link_del(s, ia); } /* leave no link behind */
     kill(c, SIGKILL); wait_child(c);
     close(s);
 }
