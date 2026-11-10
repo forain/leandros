@@ -79,11 +79,14 @@ def main():
         check("podman_hostnet", rc == 0 and "hello-from-host-podbridge" in out,
               f"rc={rc} " + out.strip()[-200:].replace("\n", " | "))
 
-        run("mkdir -p /tmp/www && echo hello-from-guest-httpd > /tmp/www/index.html && busybox.static httpd -p 18080 -h /tmp/www")
+        # The guest has no httpd applet: serve from a --network=host container (guest host netns).
+        run("mkdir -p /tmp/www && echo hello-from-guest-httpd > /tmp/www/index.html && "
+            f"podman run -d --rm --name pbhttpd --network=host -v /tmp/www:/www:ro {IMG} httpd -f -p 18080 -h /www 2>&1")
         rc, out = run(f"podman run --rm {IMG} wget -T 15 -qO- http://10.88.0.1:18080/ 2>&1")
         check("podman_bridge_ip", rc == 0 and "hello-from-guest-httpd" in out,
               f"rc={rc} " + out.strip()[-200:].replace("\n", " | "))
 
+        run("podman stop -t 1 pbhttpd 2>&1")
         rc, out = run(f"podman run --rm {IMG} nslookup example.com 2>&1")
         if rc == 0 and "Address" in out:
             check("podman_dns", True)
