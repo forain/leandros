@@ -1268,6 +1268,29 @@ static void *tb_thread(void *a) {
     while (tb_state == 1) usleep(1000);
     return NULL;
 }
+/* Go's containers/common netns bind passes MS_BIND|MS_REC|MS_SHARED together:
+ * bind wins, the propagation bits are ignored (Linux do_mount order). */
+static int nsfs_bind_with_shared(int mode) {
+    if (mode == 1 && unshare(CLONE_NEWNS) < 0) return 89;
+    mkdir("/run", 0755); mkdir("/run/netns", 0755);
+    static char file[] = "/run/netns/netns-bs";
+    int cf = open(file, O_RDONLY | O_CREAT | O_EXCL, 0); if (cf < 0) return 92; close(cf);
+    int rc = 0;
+    if (mount("/proc/self/ns/net", file, "none", MS_BIND | MS_REC | MS_SHARED, NULL) < 0) {
+        printf("  bind|rec|shared errno=%d\n", errno); rc = 1;
+    } else {
+        struct stat a, b;
+        if (stat(file, &a) < 0 || stat("/proc/self/ns/net", &b) < 0 || a.st_ino != b.st_ino) rc = 4;
+        struct statfs sf;
+        if (!rc && (statfs(file, &sf) < 0 || (unsigned long)sf.f_type != 0x6e736673UL)) rc = 5;
+        int ffd = open(file, O_RDONLY);
+        if (!rc && (ffd < 0 || fstatfs(ffd, &sf) < 0 || (unsigned long)sf.f_type != 0x6e736673UL)) rc = 6;
+        if (ffd >= 0) close(ffd);
+        if (umount(file) < 0 && !rc) rc = 7;
+    }
+    unlink(file);
+    return rc;
+}
 static int nsfs_thread_selfbind(int mode) {
     if (mode == 1 && unshare(CLONE_NEWNS) < 0) return 89;
     mkdir("/run", 0755); mkdir("/run/netns", 0755);
@@ -1415,6 +1438,8 @@ static void fdpath_suite(void) {
     report("nsfs_bind_in_mntns_root", nn_in_child(nsfs_in_mntns, 0));
     report("nsfs_bind_in_userns_mntns", nn_in_child(nsfs_in_mntns, 1));
     report("nsfs_bind_in_mntns_then_unshare_newns", nn_in_child(nsfs_in_mntns, 2));
+    report("nsfs_bind_with_shared_flag_root", nn_in_child(nsfs_bind_with_shared, 0));
+    report("nsfs_bind_with_shared_flag_mntns", nn_in_child(nsfs_bind_with_shared, 1));
     report("nsfs_thread_self_bind_run_netns", nn_in_child(nsfs_thread_selfbind, 0));
     report("nsfs_thread_self_bind_run_netns_mntns", nn_in_child(nsfs_thread_selfbind, 1));
     report("nsfs_thread_task_bind_root", nn_in_child(nsfs_thread_bind, 0));
