@@ -16,6 +16,7 @@ mod vif;
 pub mod tundev;
 pub mod tunbe;
 mod framedev;
+mod l2;
 pub mod netwatch;
 
 use iface::{Sid, LO, MAX_STACKS};
