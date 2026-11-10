@@ -445,6 +445,7 @@ pub fn sockaddr_nl(pid: u32, groups: u32) -> [u8; 12] {
 pub const SIOCGIFNAME: u32 = 0x8910;
 pub const SIOCGIFCONF: u32 = 0x8912;
 pub const SIOCGIFFLAGS: u32 = 0x8913;
+pub const SIOCSIFFLAGS: u32 = 0x8914;
 pub const SIOCGIFADDR: u32 = 0x8915;
 pub const SIOCGIFBRDADDR: u32 = 0x8919;
 pub const SIOCGIFNETMASK: u32 = 0x891b;
@@ -459,7 +460,7 @@ pub const IFREQ_LEN: usize = 40;
 /// True for the ioctls `ifreq_ioctl` / `ifconf` answer (including the ones
 /// answered EOPNOTSUPP).
 pub fn is_if_ioctl(cmd: u32) -> bool {
-    matches!(cmd, SIOCGIFNAME | SIOCGIFCONF | SIOCGIFFLAGS | SIOCGIFADDR | SIOCGIFBRDADDR
+    matches!(cmd, SIOCGIFNAME | SIOCGIFCONF | SIOCGIFFLAGS | SIOCSIFFLAGS | SIOCGIFADDR | SIOCGIFBRDADDR
         | SIOCGIFNETMASK | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFINDEX | SIOCETHTOOL | SIOCGIWRATE)
 }
 
