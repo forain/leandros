@@ -12437,7 +12437,7 @@ pub fn nsfd_target(pid: u32, fd: usize) -> Result<(u8, u16), i32> {
 }
 
 /// Install an nsfs-like fd for namespace `id` of link `kind`, taking a reference.
-fn install_nsfd(pid: u32, kind: u8, id: u16) -> isize {
+pub fn install_nsfd(pid: u32, kind: u8, id: u16) -> isize {
     let pid = sched::tgid_of(pid);
     let mut tbls = TblSlot::new();
     let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return -23 };
