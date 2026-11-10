@@ -3350,6 +3350,191 @@ static void userns_cap_case(const char *name, int do_exec)
     check(name, ok);
 }
 
+/* ---- lane nsforge: /.leandros-ns/<kind>/<id> is not a name space of ids ---- */
+#ifndef SYS_open_tree
+#define SYS_open_tree 428
+#endif
+#ifndef SYS_move_mount
+#define SYS_move_mount 429
+#endif
+
+static int nsforge_probe(int kind, int id)
+{
+    char p[64];
+    snprintf(p, sizeof p, "/.leandros-ns/%d/%d", kind, id);
+    int fd = open(p, O_RDONLY);
+    if (fd >= 0) { close(fd); return 0; }
+    return errno;
+}
+
+/* Out-of-range id: used to panic the kernel (REFS[300]). Unprivileged. */
+static void nsforge_oob(void)
+{
+    pid_t c = fork();
+    if (c == 0) {
+        if (drop_to(1000)) _exit(2);
+        _exit(nsforge_probe(0, 300) == ENOENT && nsforge_probe(2, 255) == ENOENT ? 0 : 1);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    check("nsforge_oob_id_enoent", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+/* Another user's live namespaces must not be openable by id (any kind). */
+static void nsforge_live_other_user(void)
+{
+    int pfd[2], rel[2];
+    if (pipe(pfd) || pipe(rel)) { check("nsforge_live_other_user_enoent", 0); return; }
+    pid_t v = fork();
+    if (v == 0) {
+        char x = 'r';
+        if (drop_to(1001)) _exit(2);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNET)) _exit(3);
+        if (write(pfd[1], &x, 1) != 1) _exit(4);
+        if (read(rel[0], &x, 1) < 0) _exit(5);
+        _exit(0);
+    }
+    char x;
+    int ok = read(pfd[0], &x, 1) == 1;
+    pid_t a = fork();
+    if (a == 0) {
+        if (drop_to(1000)) _exit(2);
+        int bad = 0;
+        for (int k = 0; k < 8; k++)
+            for (int id = 1; id < 256; id++)
+                if (nsforge_probe(k, id) != ENOENT) bad++;
+        _exit(bad ? 1 : 0);
+    }
+    int st = 0; waitpid(a, &st, 0);
+    ok = ok && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    if (write(rel[1], "r", 1) != 1) ok = 0;
+    waitpid(v, &st, 0);
+    check("nsforge_live_other_user_enoent", ok);
+}
+
+/* Open/close cycles on a freed userns slot must not touch its stale parent,
+ * so a later userns cannot be created over a slot that A's caps still name. */
+static void nsforge_freed_slot_cycles(void)
+{
+    int tell[2], go[2];
+    if (pipe(tell) || pipe(go)) { check("nsforge_freed_slot_cycles", 0); return; }
+    pid_t a = fork();
+    if (a == 0) {
+        char x = 'r';
+        if (drop_to(1000)) _exit(2);
+        if (unshare(CLONE_NEWUSER)) _exit(3);
+        pid_t b = fork();
+        if (b == 0) { if (unshare(CLONE_NEWUSER)) _exit(3); _exit(0); }
+        int st; waitpid(b, &st, 0);
+        int bad = 0;
+        for (int id = 1; id < 256; id++)
+            for (int i = 0; i < 4; i++)
+                if (nsforge_probe(0, id) != ENOENT) { bad++; break; }
+        if (write(tell[1], bad ? "b" : "g", 1) != 1) _exit(4);
+        if (read(go[0], &x, 1) < 0) _exit(5);
+        /* The victim (uid 1001) now exists; A, whatever slot it names, must not reach it. */
+        FILE *f = fopen("/tmp/nsforge_victim", "r");
+        int vp = 0;
+        if (f) { if (fscanf(f, "%d", &vp) != 1) vp = 0; fclose(f); }
+        errno = 0;
+        int k = vp ? kill(vp, 0) : -1;
+        _exit(bad == 0 && k == -1 && errno == EPERM ? 0 : 1);
+    }
+    char r = 0;
+    int ok = read(tell[0], &r, 1) == 1;
+    pid_t v = fork();
+    int vp[2]; pipe(vp);
+    if (v == 0) {
+        char x;
+        if (drop_to(1001)) _exit(2);
+        for (int i = 0; i < 16; i++) { pid_t g = fork(); if (g == 0) { unshare(CLONE_NEWUSER); pause(); _exit(0); } }
+        if (read(vp[0], &x, 1) < 0) _exit(0);
+        _exit(0);
+    }
+    FILE *f = fopen("/tmp/nsforge_victim", "w");
+    if (f) { fprintf(f, "%d\n", (int)v); fclose(f); }
+    usleep(200000);
+    if (write(go[1], "r", 1) != 1) ok = 0;
+    int st = 0; waitpid(a, &st, 0);
+    ok = ok && r == 'g' && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    kill(0 - 0 + v, SIGKILL); close(vp[1]); waitpid(v, &st, 0);
+    unlink("/tmp/nsforge_victim");
+    check("nsforge_freed_slot_cycles", ok);
+}
+
+/* A forged mntns fd must not let another user steal a detached tree. */
+static void nsforge_detached_theft(void)
+{
+    mkdir("/tmp/nsforge_mp", 0755);
+    pid_t h = fork();
+    if (h == 0) {
+        /* The holder: a root process in its own mount namespace (as crun). */
+        if (unshare(CLONE_NEWNS)) { printf("  holder unshare %d\n", errno); _exit(2); }
+        mount(0, "/", 0, MS_REC | MS_PRIVATE, 0);
+        int tree = syscall(SYS_open_tree, AT_FDCWD, "/tmp", 1 /*OPEN_TREE_CLONE*/ | 0x80000 /*CLOEXEC*/);
+        if (tree < 0) { printf("  open_tree errno %d\n", errno); _exit(3); }
+        pid_t c = fork();
+        if (c == 0) {
+            close(tree);
+            if (drop_to(1000)) _exit(2);
+            if (unshare(CLONE_NEWUSER | CLONE_NEWNS)) _exit(3);
+            int stolen = 0;
+            for (int id = 1; id < 256; id++) {
+                char p[64];
+                snprintf(p, sizeof p, "/.leandros-ns/4/%d", id);
+                int fd = open(p, O_RDONLY);
+                if (fd < 0) continue;
+                syscall(SYS_move_mount, fd, "", AT_FDCWD, "/tmp/nsforge_mp", 0x4 /*F_EMPTY_PATH*/);
+                stolen++; /* merely opening is already a forged fd */
+                close(fd);
+            }
+            _exit(stolen ? 1 : 0);
+        }
+        int st = 0; waitpid(c, &st, 0);
+        int ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        if (!ok) printf("  theft child st=%d\n", st);
+        /* The genuine holder can still attach its own tree. */
+        long r = syscall(SYS_move_mount, tree, "", AT_FDCWD, "/tmp/nsforge_mp", 0x4);
+        if (r != 0) { printf("  genuine move_mount: %d\n", errno); ok = 0; }
+        _exit(ok ? 0 : 1);
+    }
+    int st = 0; waitpid(h, &st, 0);
+    check("nsforge_detached_theft_denied", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+/* Regression: a bound /proc/self/ns/net (podman/netavark) opens and setns works. */
+static void nsforge_bind_regression(void)
+{
+    int fd = open("/tmp/nsforge_netfile", O_CREAT | O_WRONLY, 0644);
+    if (fd >= 0) close(fd);
+    int ok = 1;
+    pid_t c = fork();
+    if (c == 0) {
+        if (unshare(CLONE_NEWNS | CLONE_NEWNET)) _exit(2);
+        mount(0, "/", 0, MS_REC | MS_PRIVATE, 0);
+        if (mount("/proc/self/ns/net", "/tmp/nsforge_netfile", 0, MS_BIND, 0)) _exit(3);
+        int n = open("/tmp/nsforge_netfile", O_RDONLY);
+        if (n < 0) _exit(4);
+        if (setns(n, CLONE_NEWNET)) _exit(5);
+        close(n);
+        int p = open("/proc/self/ns/net", O_RDONLY);
+        if (p < 0 || setns(p, CLONE_NEWNET)) _exit(6);
+        _exit(0);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) { printf("  bind regression st=%d\n", st); ok = 0; }
+    unlink("/tmp/nsforge_netfile");
+    check("nsforge_bound_nsfs_open_and_setns", ok);
+}
+
+static void nsforge_cases(void)
+{
+    nsforge_detached_theft();
+    nsforge_bind_regression();
+    nsforge_live_other_user();
+    nsforge_freed_slot_cycles();
+    nsforge_oob();
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 3 && !strcmp(argv[1], "--nondump")) {
@@ -3375,7 +3560,7 @@ int main(int argc, char **argv)
         snprintf(nm, sizeof nm, "unshare_%s_einval", flags[i].n);
         check(nm, r == -1 && e == EINVAL);
     }
-    if (geteuid() == 0) { run_userns_cases(); nobody_drop_child_ns_denied(); user_opens_child_ns(); sibling_nondumpable_denied(); userns_cap_case("userns_cap_nondumpable_denied", 0); userns_cap_case("userns_cap_exec_in_ns_allowed", 1); } else printf("SKIP userns cases: not root\n");
+    if (geteuid() == 0) { nsforge_cases(); run_userns_cases(); nobody_drop_child_ns_denied(); user_opens_child_ns(); sibling_nondumpable_denied(); userns_cap_case("userns_cap_nondumpable_denied", 0); userns_cap_case("userns_cap_exec_in_ns_allowed", 1); } else printf("SKIP userns cases: not root\n");
     /* A plain fork-style clone still works. */
     long r = do_clone(0);
     int ok = r >= 0;
