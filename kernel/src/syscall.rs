@@ -16642,16 +16642,32 @@ fn sys_inotify_init1(flags: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-/// inotify_add_watch(fd, path, mask) → a fake watch descriptor (≥1). The path
-/// and mask are accepted and discarded — the watch never fires.
-fn sys_inotify_add_watch(fd: usize, _path_ptr: usize, _mask: usize) -> isize {
+/// inotify_add_watch(fd, path, mask) → watch descriptor. With `vfs.inotify=1`
+/// the path is resolved like any path syscall (mntns, chroot, symlinks unless
+/// IN_DONT_FOLLOW) and the VFS registers a real watch; otherwise the path and
+/// mask are discarded and a fake wd returned (the silent stub).
+fn sys_inotify_add_watch(fd: usize, path_ptr: usize, mask: usize) -> isize {
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_INOTIFY_ADD, &[fd as u64]);
+    if !vfs::inotify_enabled() {
+        let msg = make_vfs_msg(vfs::VFS_INOTIFY_ADD, &[fd as u64]);
+        return vfs_reply_val(&vfs::handle(&msg, pid));
+    }
+    const IN_DONT_FOLLOW: usize = 0x0200_0000;
+    let path = match resolve_at_path(AT_FDCWD, path_ptr) { Ok(p) => p, Err(e) => return e };
+    let path = if mask & IN_DONT_FOLLOW == 0 {
+        match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
+    } else { path };
+    let msg = make_vfs_msg(vfs::VFS_INOTIFY_ADD, &[fd as u64, path.ptr() as u64, mask as u64 & 0xFFFF_FFFF]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-/// inotify_rm_watch(fd, wd) → 0 (nothing to remove; watches never fired).
-fn sys_inotify_rm_watch(_fd: usize, _wd: usize) -> isize { 0 }
+/// inotify_rm_watch(fd, wd): a no-op with the silent stub, a real removal
+/// (IN_IGNORED, EINVAL for an unknown wd) with `vfs.inotify=1`.
+fn sys_inotify_rm_watch(fd: usize, wd: usize) -> isize {
+    if !vfs::inotify_enabled() { return 0; }
+    let msg = make_vfs_msg(vfs::VFS_INOTIFY_RM, &[fd as u64, wd as u32 as u64]);
+    vfs_reply_val(&vfs::handle(&msg, current_pid()))
+}
 
 /// memfd_create(name_ptr, flags) → writable anonymous fd backed by a TmpFile.
 fn sys_memfd_create(name_ptr: usize, flags: usize) -> isize {
