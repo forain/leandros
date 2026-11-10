@@ -137,6 +137,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
     if !test_clone_files_epoll_shared() { failures += 1; }
     if !test_clone_files_netlink_netns() { failures += 1; }
     if !test_sigwait_kill() { failures += 1; }
+    if !test_tcp_info() { failures += 1; }
     if !test_sigwait_kill_pidns() { failures += 1; }
 
     puts(b"--- forktest done ---\n\0".as_ptr());
@@ -856,12 +857,12 @@ unsafe fn test_failing_syscall_odd_args() -> bool {
 mod nr { pub const SOCKET: i64 = 198; pub const BIND: i64 = 200; pub const SENDTO: i64 = 206;
          pub const RECVFROM: i64 = 207; pub const EPOLL_CREATE1: i64 = 20; pub const EPOLL_CTL: i64 = 21;
          pub const UNSHARE: i64 = 97; pub const KILL: i64 = 129; pub const SIGPROCMASK: i64 = 135;
-         pub const SIGTIMEDWAIT: i64 = 137; }
+         pub const SIGTIMEDWAIT: i64 = 137; pub const GETSOCKOPT: i64 = 209; }
 #[cfg(target_arch = "x86_64")]
 mod nr { pub const SOCKET: i64 = 41; pub const BIND: i64 = 49; pub const SENDTO: i64 = 44;
          pub const RECVFROM: i64 = 45; pub const EPOLL_CREATE1: i64 = 291; pub const EPOLL_CTL: i64 = 233;
          pub const UNSHARE: i64 = 272; pub const KILL: i64 = 62; pub const SIGPROCMASK: i64 = 14;
-         pub const SIGTIMEDWAIT: i64 = 128; }
+         pub const SIGTIMEDWAIT: i64 = 128; pub const GETSOCKOPT: i64 = 55; }
 
 unsafe fn sys(n: i64, a: [i64; 6]) -> i64 { rt::raw_syscall(n, a) }
 
@@ -997,4 +998,18 @@ unsafe fn sigwait_kill_case(name: &[u8], flags: i64) -> bool {
 unsafe fn test_sigwait_kill() -> bool { sigwait_kill_case(b"sigwait_kill\0", 0) }
 unsafe fn test_sigwait_kill_pidns() -> bool {
     sigwait_kill_case(b"sigwait_kill_pidns\0", 0x1000_0000 | 0x2000_0000)
+}
+
+/// pasta reads SOL_TCP/TCP_INFO (11) on every connection: it must succeed with
+/// a tcp_info prefix (>= 104 bytes) whose first byte is the TCP state
+/// (TCP_CLOSE = 7 for a fresh socket). Was ENOPROTOOPT.
+unsafe fn test_tcp_info() -> bool {
+    let name = b"tcp_info_prefix\0";
+    let s = sys(nr::SOCKET, [2, 1, 0, 0, 0, 0]);
+    if s < 0 { return report(name, false); }
+    let mut buf = [0u8; 256];
+    let mut len: u32 = 256;
+    let r = sys(nr::GETSOCKOPT, [s, 6, 11, buf.as_mut_ptr() as i64, &mut len as *mut u32 as i64, 0]);
+    close(s as c_int);
+    report(name, r == 0 && len >= 104 && buf[0] == 7)
 }
