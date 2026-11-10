@@ -2850,6 +2850,60 @@ pub fn current_root_arc() -> Option<alloc::sync::Arc<[u8]>> {
     root_arc_of(current_pid())
 }
 
+/// Rewrite the root and cwd of every task in mount namespace `mntns` through
+/// `map` (an absolute-path to absolute-path function), as pivot_root requires.
+/// The run-queue lock is held only to snapshot and to swap pointers: every
+/// allocation (the snapshot vector, the mapped paths) happens outside it, and
+/// a task whose paths changed in between is left alone.
+pub fn rebase_fs_paths(mntns: ns::NsId, map: &dyn Fn(&[u8]) -> alloc::vec::Vec<u8>) {
+    type P = Option<alloc::sync::Arc<[u8]>>;
+    let mut snap: alloc::vec::Vec<(Pid, P, P)> = alloc::vec::Vec::new();
+    loop {
+        let need = {
+            let rq = RUN_QUEUE.lock();
+            rq.live_slots().into_iter().filter(|&i| rq.get(i).map_or(false, |t| t.mntns.id() == mntns)).count()
+        };
+        snap.clear();
+        if snap.try_reserve(need + 8).is_err() { return; }
+        let mut full = true;
+        {
+            let rq = RUN_QUEUE.lock();
+            for i in rq.live_slots() {
+                if let Some(t) = rq.get(i) {
+                    if t.mntns.id() != mntns || t.state == TaskState::Zombie { continue; }
+                    if snap.len() == snap.capacity() { full = false; break; }
+                    snap.push((t.pid, t.root.clone(), t.cwd.clone()));
+                }
+            }
+        }
+        if full { break; }
+    }
+    let root_of = |p: &P| -> P {
+        let np = match p { Some(a) => map(a), None => return None };
+        if np.len() <= 1 { None } else { Some(alloc::sync::Arc::from(&np[..])) }
+    };
+    let cwd_of = |p: &P| -> P {
+        let np = match p { Some(a) => map(a), None => map(b"/") };
+        if np.len() <= 1 { None } else { Some(alloc::sync::Arc::from(&np[..])) }
+    };
+    let mut news: alloc::vec::Vec<(P, P)> = alloc::vec::Vec::new();
+    if news.try_reserve(snap.len()).is_err() { return; }
+    for (_, r, c) in snap.iter() { news.push((root_of(r), cwd_of(c))); }
+    let mut old: alloc::vec::Vec<P> = alloc::vec::Vec::new();
+    if old.try_reserve(snap.len() * 2).is_err() { return; }
+    {
+        let mut rq = RUN_QUEUE.lock();
+        for ((pid, r0, c0), (rn, cn)) in snap.iter().zip(news.iter()) {
+            if let Some(t) = rq.find_pid_mut(*pid) {
+                let same = |a: &P, b: &P| match (a, b) { (None, None) => true, (Some(x), Some(y)) => alloc::sync::Arc::ptr_eq(x, y), _ => false };
+                if same(&t.root, r0) { old.push(core::mem::replace(&mut t.root, rn.clone())); }
+                if same(&t.cwd, c0) { old.push(core::mem::replace(&mut t.cwd, cn.clone())); }
+            }
+        }
+    }
+    drop(old);
+}
+
 /// Establish `path` (host-absolute) as the calling task's chroot root. A root
 /// of "/" (or empty) is the same as not being chrooted.
 pub fn set_root(path: &[u8]) -> bool {
