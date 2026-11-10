@@ -1408,30 +1408,27 @@ static int fdm_root_mntns(int m) { (void)m; if (unshare(CLONE_NEWNS) < 0) return
 static int fdm_userns_pid(int m) {
     (void)m;
     if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
-    mkdir("/tmp/fdm", 0755);
+    mkdir("/tmp/fdmu", 0755);
+    { static const char *pd[] = {"proc", "tmp", "pts", "mq", "cg"}; char q[64];
+      for (int i = 0; i < 5; i++) { snprintf(q, sizeof q, "/tmp/fdmu/%s", pd[i]); mkdir(q, 0755); } }
     if (unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID) < 0) return 91;
     wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
     pid_t c = fork();
     if (c < 0) return 92;
     if (c == 0) {
         if (getpid() != 1) _exit(93);
-        char d[64];
-        static const char *dirs[] = {"proc", "tmp", "pts", "mq", "cg"};
-        /* directories made by the parent before unshare would be unmapped; /tmp/fdm is 0755 root: use tmpfs */
-        if (mount("tmpfs", "/tmp/fdm", "tmpfs", 0, "mode=755") < 0) _exit(94);
-        for (int i = 0; i < 5; i++) { snprintf(d, sizeof d, "/tmp/fdm/%s", dirs[i]); if (mkdir(d, 0755) < 0) _exit(95); }
-        if (fdm_mount("/tmp/fdm/proc", "proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) _exit(errno == EPERM ? 96 : 1);
-        if (fdm_mount("/tmp/fdm/tmp", "tmpfs", "tmpfs", MS_NOSUID, "mode=755") < 0) _exit(2);
-        if (fdm_mount("/tmp/fdm/pts", "devpts", "devpts", MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666,mode=0620") < 0) _exit(4);
-        if (fdm_mount("/tmp/fdm/mq", "mqueue", "mqueue", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) _exit(5);
-        if (fdm_mount("/tmp/fdm/cg", "cgroup2", "cgroup2", MS_NOSUID | MS_NODEV | MS_NOEXEC, "nsdelegate") < 0) _exit(6);
+        if (fdm_mount("/tmp/fdmu/proc", "proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) _exit(errno == EPERM ? 96 : 1);
+        if (fdm_mount("/tmp/fdmu/tmp", "tmpfs", "tmpfs", MS_NOSUID, "mode=755") < 0) _exit(2);
+        if (fdm_mount("/tmp/fdmu/pts", "devpts", "devpts", MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666,mode=0620") < 0) _exit(4);
+        if (fdm_mount("/tmp/fdmu/mq", "mqueue", "mqueue", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) _exit(5);
+        if (fdm_mount("/tmp/fdmu/cg", "cgroup2", "cgroup2", MS_NOSUID | MS_NODEV | MS_NOEXEC, "nsdelegate") < 0) _exit(6);
         /* the new proc shows THIS pidns: pid 1 is us, and no host pids */
-        DIR *dp = opendir("/tmp/fdm/proc");
+        DIR *dp = opendir("/tmp/fdmu/proc");
         if (!dp) _exit(10);
         int saw1 = 0, n = 0; struct dirent *e;
         while ((e = readdir(dp))) if (e->d_name[0] >= '1' && e->d_name[0] <= '9') { n++; if (!strcmp(e->d_name, "1")) saw1 = 1; }
         closedir(dp);
-        char lnk[32]; ssize_t l = readlink("/tmp/fdm/proc/self", lnk, sizeof lnk - 1);
+        char lnk[32]; ssize_t l = readlink("/tmp/fdmu/proc/self", lnk, sizeof lnk - 1);
         if (l <= 0) _exit(11);
         lnk[l] = 0;
         if (!saw1 || n > 3 || strcmp(lnk, "1")) { printf("  proc pidns saw1=%d n=%d self=%s\n", saw1, n, lnk); _exit(12); }
