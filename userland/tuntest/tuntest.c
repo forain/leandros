@@ -215,7 +215,8 @@ static int ns_cases(void)
     }
     close(u);
     close(fd);
-    return r;
+    printf("ns_cases: %d passed, %d failed\n", npass, nfail);
+    return r | (nfail != 0);
 }
 
 int main(void)
