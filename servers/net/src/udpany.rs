@@ -76,7 +76,16 @@ pub(crate) fn adopt(sid: Sid) -> usize {
 /// server: one stack only).
 pub(crate) fn of(ofd: u32) -> Option<[Option<SocketHandle>; MAX_STACKS]> {
     if ofd == 0 { return None; }
-    MIRRORS.lock().get(&ofd).copied()
+    let mut hs = MIRRORS.lock().get(&ofd).copied()?;
+    // A mirror on a stack that was freed (DELLINK / netns reap) names a socket
+    // that is gone, or worse a socket of a new stack at the same id: callers
+    // `get_mut` these handles, which panics on a stale one. Map lock released.
+    for (sid, h) in hs.iter_mut().enumerate() {
+        let Some(x) = *h else { continue };
+        let live = stack_for(sid as Sid).as_ref().map_or(false, |s| s.socket_set.contains(x));
+        if !live { *h = None; }
+    }
+    Some(hs)
 }
 
 /// Give a just-materialized wildcard server socket (`primary` on `psid`,
