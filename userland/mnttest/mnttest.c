@@ -2038,6 +2038,113 @@ static void mro_suite(void) {
     report("mntro_nodev_eacces", nn_in_child(mro_nodev, 0));
 }
 
+/* ── lane shmbind: crun's dev/shm bind and bind-remount flags ─────────── */
+/* mode bit0: source on disk (/root), bit1: relative open after chdir(rootfs),
+ * bit2: mount the tmpfs through an O_PATH fd of the rootfs dev dir */
+static int sb_shm(int mode) {
+    static const char DEEP[] = "/home/leandro/.local/share/containers/storage/vfs/dir/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const char *B = (mode & 16) ? DEEP : (mode & 1) ? "/root/sbm" : "/tmp/sbm";
+    char R[256], D[256], SH[256], S[256];
+    mkdir("/root", 0700);
+    if (mode & 16) { char t[256]; size_t i; for (i = 1; B[i]; i++) if (B[i] == '/') { memcpy(t, B, i); t[i] = 0; mkdir(t, 0755); chown(t, 1000, 1000); } }
+    mkdir(B, 0755);
+    snprintf(R, sizeof R, "%s/r", B); snprintf(D, sizeof D, "%s/r/dev", B);
+    snprintf(SH, sizeof SH, "%s/r/dev/shm", B); snprintf(S, sizeof S, "%s/userdata", B);
+    mkdir(R, 0755); mkdir(D, 0755); mkdir(S, 0755);
+    char src[300]; snprintf(src, sizeof src, "%s/shm", S); mkdir(src, 0755);
+    /* uid 1000 in a fresh userns + mntns */
+    chmod("/root", 0711);
+    chown(B, 1000, 1000); chown(R, 1000, 1000); chown(D, 1000, 1000); chown(S, 1000, 1000); chown(src, 1000, 1000);
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
+    wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "1000 1000 1"); wr("/proc/self/gid_map", "1000 1000 1");
+    if (mount(R, R, NULL, MS_BIND | MS_REC, NULL) < 0) { printf("  rootfs bind errno=%d\n", errno); return 10; }
+    /* podman's userdata/shm is a tmpfs mounted in its own mntns */
+    if (mode & 8) { if (mount("tmpfs", src, "tmpfs", 0, "mode=1777,size=65536k") < 0) { printf("  src tmpfs errno=%d\n", errno); return 18; } }
+    if (mode & 8) {
+        /* crun decides file vs directory target from stat of the source */
+        struct stat a; struct statx sx;
+        if (stat(src, &a) < 0 || !S_ISDIR(a.st_mode)) { printf("  stat src mode=%o\n", a.st_mode); return 20; }
+        if (lstat(src, &a) < 0 || !S_ISDIR(a.st_mode)) { printf("  lstat src mode=%o\n", a.st_mode); return 21; }
+        if (statx(AT_FDCWD, src, AT_SYMLINK_NOFOLLOW, STATX_TYPE, &sx) < 0 || !S_ISDIR(sx.stx_mode)) { printf("  statx src mode=%o\n", sx.stx_mode); return 22; }
+        int sfd = open(src, O_PATH | O_CLOEXEC); if (sfd < 0) return 23;
+        if (fstat(sfd, &a) < 0 || !S_ISDIR(a.st_mode)) { printf("  fstat(O_PATH) mode=%o\n", a.st_mode); return 24; }
+        if (statx(sfd, "", AT_EMPTY_PATH, STATX_TYPE, &sx) < 0 || !S_ISDIR(sx.stx_mode)) { printf("  statx(EMPTY) mode=%o\n", sx.stx_mode); return 25; }
+        if (fstatat(sfd, "", &a, AT_EMPTY_PATH) < 0 || !S_ISDIR(a.st_mode)) { printf("  fstatat(EMPTY) mode=%o\n", a.st_mode); return 26; }
+        close(sfd);
+    }
+    if (mode & 32) {
+        /* crun clones the source with open_tree and decides file vs directory
+         * from fstat of that detached-mount descriptor */
+        struct stat a; struct statx sx;
+        int ofd = (int)syscall(428, AT_FDCWD, src, 0x1 | 0x80000 | 0x8000 /* CLONE|CLOEXEC|AT_RECURSIVE */);
+        if (ofd < 0) { printf("  open_tree errno=%d\n", errno); return 30; }
+        if (fstat(ofd, &a) < 0 || !S_ISDIR(a.st_mode)) { printf("  fstat(open_tree) mode=%o\n", a.st_mode); return 31; }
+        if (statx(ofd, "", AT_EMPTY_PATH, STATX_TYPE, &sx) < 0 || !S_ISDIR(sx.stx_mode)) { printf("  statx(open_tree) mode=%o\n", sx.stx_mode); return 32; }
+        close(ofd);
+    }
+    if (mode & 2) { if (chdir(R) < 0) return 16; }
+    if (mode & 4) {
+        int dfd = open(mode & 2 ? "dev" : D, O_PATH | O_CLOEXEC | O_DIRECTORY); if (dfd < 0) return 17;
+        char q[48]; snprintf(q, sizeof q, "/proc/self/fd/%d", dfd);
+        if (mount("tmpfs", q, "tmpfs", 0, "mode=755") < 0) { printf("  tmpfs(fd) errno=%d\n", errno); return 11; }
+        close(dfd);
+    } else if (mount("tmpfs", D, "tmpfs", 0, "mode=755") < 0) { printf("  tmpfs errno=%d\n", errno); return 11; }
+    if (mkdir(mode & 2 ? "dev/shm" : SH, 0755) < 0) { { static char um[256]; slurp("/proc/self/uid_map", um, sizeof um); printf("  mkdir shm errno=%d uid=%d map=[%s]\n", errno, (int)getuid(), um); } return 12; }
+    int fd = open(mode & 2 ? "dev/shm" : SH, O_PATH | O_CLOEXEC | O_DIRECTORY);
+    if (fd < 0) { printf("  open errno=%d\n", errno); return 13; }
+    char p[48]; snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    if (mount(src, p, NULL, MS_BIND, NULL) < 0) { printf("  shm bind errno=%d\n", errno); return 14; }
+    close(fd);
+    return 0;
+}
+static int sb_shm_m(int m) { return sb_shm(m); }
+/* MS_BIND|MS_REMOUNT inside a userns+mntns: set/clear ro, locked flags, EROFS */
+static int sb_remount(int m) {
+    (void)m;
+    mkdir("/tmp/sbr", 0755); mkdir("/tmp/sbr/a", 0755); mkdir("/tmp/sbr/b", 0755);
+    put("/tmp/sbr/a/f", "x", 0644);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    if (mount("/tmp/sbr/a", "/tmp/sbr/b", NULL, MS_BIND, NULL) < 0) return 10;
+    if (mount(NULL, "/tmp/sbr/b", NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) { printf("  remount ro errno=%d\n", errno); return 11; }
+    if (ot_userns() < 0) return 91; /* the copy locks the inherited mounts' flags */
+    errno = 0; if (open("/tmp/sbr/b/f", O_WRONLY) >= 0 || errno != EROFS) { printf("  wr errno=%d\n", errno); return 12; }
+    int fd = open("/tmp/sbr/a/f", O_WRONLY); if (fd < 0) return 13; close(fd); /* original stays rw */
+    /* flags locked by the userns transition cannot be cleared */
+    errno = 0;
+    if (mount(NULL, "/tmp/sbr/b", NULL, MS_BIND | MS_REMOUNT, NULL) == 0 || errno != EPERM) { printf("  clear locked errno=%d\n", errno); return 14; }
+    /* keeping them set is fine */
+    if (mount(NULL, "/tmp/sbr/b", NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) return 15;
+    return 0;
+}
+static int sb_remount_clear(int m) {
+    (void)m;
+    mkdir("/tmp/sbc", 0755); mkdir("/tmp/sbc/a", 0755); mkdir("/tmp/sbc/b", 0755);
+    put("/tmp/sbc/a/f", "x", 0644);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    if (mount("/tmp/sbc/a", "/tmp/sbc/b", NULL, MS_BIND, NULL) < 0) return 10;
+    if (mount(NULL, "/tmp/sbc/b", NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) return 11;
+    errno = 0; if (open("/tmp/sbc/b/f", O_WRONLY) >= 0 || errno != EROFS) return 12;
+    if (mount(NULL, "/tmp/sbc/b", NULL, MS_BIND | MS_REMOUNT, NULL) < 0) { printf("  clear ro errno=%d\n", errno); return 13; }
+    int fd = open("/tmp/sbc/b/f", O_WRONLY); if (fd < 0) { printf("  wr after clear errno=%d\n", errno); return 14; } close(fd);
+    return 0;
+}
+static void shmbind_suite(void) {
+    static const char *nm[] = {"tmp", "disk", "tmp_rel", "disk_rel", "tmp_fdtmpfs", "disk_fdtmpfs", "tmp_rel_fdtmpfs", "disk_rel_fdtmpfs"};
+    for (int m = 0; m < 8; m++) { char n[64]; snprintf(n, sizeof n, "shmbind_dev_shm_%s", nm[m]); report(n, nn_in_child(sb_shm_m, m)); }
+    report("shmbind_dev_shm_src_tmpfs", nn_in_child(sb_shm_m, 8));
+    report("shmbind_open_tree_fstat_dir", nn_in_child(sb_shm_m, 32));
+    report("shmbind_open_tree_fstat_dir_tmpfs", nn_in_child(sb_shm_m, 32 | 8));
+    report("shmbind_dev_shm_home_deep", nn_in_child(sb_shm_m, 16));
+    report("shmbind_dev_shm_home_deep_fdtmpfs", nn_in_child(sb_shm_m, 16 | 4));
+    report("shmbind_dev_shm_home_deep_rel_fdtmpfs_srctmpfs", nn_in_child(sb_shm_m, 16 | 2 | 4 | 8));
+    report("shmbind_dev_shm_src_tmpfs_disk_rel_fdtmpfs", nn_in_child(sb_shm_m, 8 | 1 | 2 | 4));
+    report("shmbind_bind_remount_userns_locked_flags", nn_in_child(sb_remount, 0));
+    report("shmbind_bind_remount_clear_ro", nn_in_child(sb_remount_clear, 0));
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -2061,6 +2168,7 @@ int main(int argc, char **argv) {
     opentree_suite();
     fdbindprop_suite();
     mro_suite();
+    shmbind_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
