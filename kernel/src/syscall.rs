@@ -9388,20 +9388,35 @@ fn may_mount() -> bool {
 /// the namespace (the hidden superblock space) never leaks out: EINVAL.
 fn resolve_mount_target(target_ptr: usize) -> Result<Vec<u8>, isize> {
     let p = resolve_user_path(target_ptr)?;
-    if let Some((fd, b"")) = proc_own_fd(p.ns_bytes()) {
-        let host = fd_host_path(fd).ok_or(-22isize)?;
-        let mns = sched::current_mntns();
-        let ns = if mns != 0 {
-            vfs::mnt::reverse(mns, &host, 0)
-        } else {
-            Some(host)
-        };
-        return match ns {
-            Some(n) if !vfs::mnt::is_sb_path(&n) => Ok(n),
-            _ => Err(-22),
-        };
-    }
+    if let Some((fd, b"")) = proc_own_fd(p.ns_bytes()) { return fd_mount_ns_path(fd); }
     Ok(p.ns_bytes().to_vec())
+}
+
+/// The namespace path of the directory descriptor `fd` for a mount(2) target.
+fn fd_mount_ns_path(fd: usize) -> Result<Vec<u8>, isize> {
+    let mut host = fd_host_path(fd).ok_or(-2isize)?;
+    // A cgroup2 directory reports its absolute cgroup path, but the tree is
+    // served relative to the reader's cgroup namespace root: a descriptor
+    // anywhere in it names the mount point /sys/fs/cgroup.
+    if vfs::cgroupfs::is_path(&host) { host.truncate(vfs::cgroupfs::ROOT.len()); }
+    let mns = sched::current_mntns();
+    let ns = if mns != 0 { vfs::mnt::reverse_newest(mns, &host) } else { Some(host) };
+    match ns {
+        Some(n) if !vfs::mnt::is_sb_path(&n) => Ok(n),
+        _ => Err(-22),
+    }
+}
+
+/// The mount point of a mount(2) that creates or binds a mount. A target that
+/// is exactly `/proc/self/fd/N` follows the magic link to where the descriptor
+/// really is in the caller's mount namespace (crun mounts proc, sysfs, tmpfs,
+/// devpts, mqueue and cgroup2 onto its O_PATH rootfs descriptors this way).
+/// A backing path with no name in the namespace never leaks out: EINVAL.
+fn mount_target_kpath(target_ptr: usize) -> Result<KPath, isize> {
+    if let Ok(raw) = copy_user_str(target_ptr, 4096) {
+        if let Some((fd, b"")) = proc_own_fd(&raw) { return KPath::from_ns(fd_mount_ns_path(fd)?); }
+    }
+    resolve_user_path(target_ptr)
 }
 
 fn sys_mount(
@@ -9462,7 +9477,7 @@ fn sys_mount(
     const MS_BIND: usize = 4096;
     // The mount point is a real path — resolve it against the cwd (and the
     // caller's chroot) so `mount /dev/vda mnt` and `mount /dev/vda /mnt` agree.
-    let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+    let target_path = match mount_target_kpath(target_ptr) { Ok(p) => p, Err(e) => return e };
 
     // Alias mounts: a bind mount, or one of the filesystems this kernel serves
     // under a fixed prefix (proc, devtmpfs, sysfs, devpts). Mounting one
@@ -9474,7 +9489,7 @@ fn sys_mount(
         match read_user_short_str(fstype_ptr) { Ok(v) => v, Err(e) => return e }
     };
     let alias_src: Option<(Vec<u8>, &'static str)> = if flags & MS_BIND != 0 {
-        let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
+        let src = match mount_target_kpath(source_ptr) { Ok(p) => p, Err(e) => return e };
         // Binding /proc/<pid>/ns/<name> keeps that namespace alive.
         match vfs::nsfs_bind_source(src.ns_bytes(), current_pid()) {
             Err(e) => return e,
@@ -9734,11 +9749,11 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
         return vfs::mnt::set_propagation(mns, &target, flags) as isize;
     }
     if flags & (MS_REMOUNT | MS_MOVE) != 0 || (flags & MS_PROPAGATION != 0 && flags & MS_BIND == 0) { return -22; }
-    let target = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+    let target = match mount_target_kpath(target_ptr) { Ok(p) => p, Err(e) => return e };
     let tns = target.ns_bytes().to_vec();
     let tdir = match kpath_is_dir(&target) { Ok(d) => d, Err(e) => return e };
     if flags & MS_BIND != 0 {
-        let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
+        let src = match mount_target_kpath(source_ptr) { Ok(p) => p, Err(e) => return e };
         // Binding /proc/<pid>/ns/<name> onto a file keeps that namespace
         // alive: the mount's superblock owns the reference.
         match vfs::nsfs_bind_source(src.ns_bytes(), current_pid()) {
@@ -9759,8 +9774,37 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
         return match vfs::mnt::bind(mns, src.ns_bytes(), &tns, flags & MS_REC != 0) { Ok(_) => 0, Err(e) => e as isize };
     }
     let fstype = match read_user_short_str(fstype_ptr) { Ok(v) => v, Err(e) => return e };
-    if &fstype[..] != b"tmpfs" { return -22; } // EINVAL: other filesystems are lane M5's
     if !tdir { return -20; }
+    let mflags0 = (flags as u8 & 0x0f) | vfs::mnt::MNT_RELATIME;
+    match &fstype[..] {
+        b"tmpfs" => {}
+        b"proc" | b"sysfs" => {
+            let fs: &'static str = if &fstype[..] == b"proc" { "proc" } else { "sysfs" };
+            // Linux mnt_already_visible: a mounter whose user namespace is not
+            // the initial one may mount proc/sysfs only if an unobstructed one
+            // is already fully visible in this mount namespace.
+            if sched::ns::current_userns() != 0 && !vfs::mnt::fully_visible(mns, fs, mflags0) { return -1; }
+            let root: &[u8] = if fs == "proc" { b"/proc" } else { b"/sys" };
+            return match vfs::mnt::add_mount(mns, &tns, root, 0, fs, fs.as_bytes(), mflags0) { Ok(_) => 0, Err(e) => e as isize };
+        }
+        b"mqueue" | b"cgroup2" => {
+            let (fs, root): (&'static str, &[u8]) = if &fstype[..] == b"mqueue" { ("mqueue", b"/dev/mqueue") } else { ("cgroup2", b"/sys/fs/cgroup") };
+            return match vfs::mnt::add_mount(mns, &tns, root, 0, fs, fs.as_bytes(), mflags0) {
+                Ok(_) => { if fs == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
+                Err(e) => e as isize,
+            };
+        }
+        b"devpts" => {
+            let opts = if data_ptr == 0 { Vec::new() } else { match copy_user_str(data_ptr, 1024) { Ok(v) => v, Err(e) => return e } };
+            let id = match vfs::devpts::create(&opts) { Ok(id) => id, Err(e) => return e };
+            let root = vfs::devpts::backing(id);
+            return match vfs::mnt::add_mount(mns, &tns, &root, id, "devpts", b"devpts", mflags0) {
+                Ok(_) => 0,
+                Err(e) => { vfs::devpts::discard(id); e as isize }
+            };
+        }
+        _ => return -22, // EINVAL
+    }
     let (sb, root) = match tmpfs_new_instance(flags, data_ptr) { Ok(x) => x, Err(e) => return e };
     // Per-mount flags share their bit values with MS_RDONLY/NOSUID/NODEV/NOEXEC.
     let mflags = (flags as u8 & 0x0f) | vfs::mnt::MNT_RELATIME;
@@ -9839,11 +9883,28 @@ fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
     }
 }
 
+/// pivot_root(2) inside a mount namespace: re-root that namespace's tree
+/// and rebase the stored root/cwd of every task in it. The caller must not
+/// be chrooted (Linux needs its root to be a mountpoint).
+fn sys_pivot_root_ns(mns: sched::ns::NsId, new_root_ptr: usize, put_old_ptr: usize) -> isize {
+    vfs::mnt::reap();
+    let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
+    let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };
+    if let (Some(r), _, _) = sched::current_fs_ctx() { if r.len() > 1 { return -22; } }
+    let pm = match vfs::mnt::pivot_root(mns, new_path.ns_bytes(), old_path.ns_bytes()) {
+        Ok(m) => m,
+        Err(e) => return e as isize,
+    };
+    sched::rebase_fs_paths(mns, &|p| pm.map(p));
+    0
+}
+
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
-    // The pivot rewrites the global (ns 0) mount table; inside a mount
-    // namespace it would re-root the host. Per-namespace pivot is lane M4.
-    if sched::current_mntns() != 0 { return -22; }
+    // In ns 0 the pivot rewrites the global mount table; a mount namespace
+    // pivots its own tree (sys_pivot_root_ns).
+    let mns = sched::current_mntns();
     if !may_mount() { return -1; } // EPERM (CAP_SYS_ADMIN over the mntns owner)
+    if mns != 0 { return sys_pivot_root_ns(mns, new_root_ptr, put_old_ptr); }
     let pid = current_pid();
     let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
     let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };

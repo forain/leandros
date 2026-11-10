@@ -178,6 +178,25 @@ pub fn reverse(ns: NsId, backing: &[u8], hint: u32) -> Option<Vec<u8>> {
     None
 }
 
+/// Like [`reverse`] for a descriptor whose mount is unknown: among the mounts
+/// whose path round-trips, the newest wins (a container's rootfs mounts are
+/// newer than the copies of the host's, which cover the same backing paths).
+pub fn reverse_newest(ns: NsId, backing: &[u8]) -> Option<Vec<u8>> {
+    let g = NS.lock();
+    let t = &g.get(&ns)?.mnts;
+    let mut order: Vec<usize> = (0..t.len()).collect();
+    order.sort_by_key(|&i| core::cmp::Reverse(t[i].id));
+    for i in order {
+        let m = &t[i];
+        if !under(backing, &m.root) { continue; }
+        let mp = ns_mountpoint(t, i);
+        let rest: &[u8] = if &*m.root == b"/" { backing } else { &backing[m.root.len()..] };
+        let cand = join(&mp, rest);
+        if let Some(x) = walk(t, &cand) { if x.backing == backing { return Some(cand); } }
+    }
+    None
+}
+
 /// Does the namespace have a tree (i.e. was it created through [`copy`])?
 pub fn has_tree(ns: NsId) -> bool { NS.lock().contains_key(&ns) }
 
@@ -372,6 +391,22 @@ pub fn add_mount(ns: NsId, dst: &[u8], root: &[u8], sb: SbId, fstype: &'static s
     Ok(id)
 }
 
+/// Linux `mnt_already_visible` for proc and sysfs mounts by a task in a
+/// non-initial user namespace: some mount of `fstype` exposing the whole
+/// filesystem (root = its tree root) is in `ns`, with nothing locked stacked
+/// on it and no locked flag the new mount would drop.
+pub fn fully_visible(ns: NsId, fstype: &str, new_flags: u8) -> bool {
+    let g = NS.lock();
+    let Some(n) = g.get(&ns) else { return false };
+    let t = &n.mnts;
+    let full: &[u8] = if fstype == "proc" { b"/proc" } else { b"/sys" };
+    t.iter().any(|m| {
+        m.fstype == fstype && &*m.root == full
+            && (m.locked & 0x7f) & !new_flags == 0
+            && !t.iter().any(|c| c.parent == m.id && c.locked & LOCK_MNT != 0)
+    })
+}
+
 /// umount2 of the mount at namespace path `target`. The mount must be the
 /// final component's mountpoint (EINVAL otherwise), not the namespace root,
 /// not locked (EINVAL), and without submounts unless `detach` (EBUSY). A
@@ -381,7 +416,8 @@ pub fn umount(ns: NsId, target: &[u8], detach: bool) -> Result<(), i32> {
         let mut g = NS.lock();
         let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
         let (i, off) = walk_idx(t, target).ok_or(-22)?;
-        if off != target.len() { return Err(-22); }
+        // `/` names the top of the root's overmount stack (offset 0).
+        if off != target.len() && !(target == b"/" && off == 0) { return Err(-22); }
         let m = &t[i];
         if m.parent == 0 { return Err(-22); }
         if m.locked & LOCK_MNT != 0 { return Err(-22); }
@@ -395,6 +431,80 @@ pub fn umount(ns: NsId, target: &[u8], detach: bool) -> Result<(), i32> {
     };
     for sb in dead_sbs { sb_put(sb); }
     Ok(())
+}
+
+/// Result of a tree pivot: how stored namespace paths move.
+pub struct PivotMap {
+    /// Namespace path of the new root before the pivot.
+    pub new_root: Vec<u8>,
+    /// Namespace path (in the new tree) at which the old root now sits.
+    pub old_at: Vec<u8>,
+}
+
+impl PivotMap {
+    /// Where the namespace path `p` (absolute, normalised) lives after the
+    /// pivot. A path under the new root loses that prefix; the rest of the
+    /// old tree is reached through the old root's new attachment point. The
+    /// old root itself (`/`) is the new root for the tasks standing on it.
+    pub fn map(&self, p: &[u8]) -> Vec<u8> {
+        if p == b"/" { return b"/".to_vec(); }
+        if under(p, &self.new_root) {
+            let rest = &p[self.new_root.len()..];
+            return if rest.is_empty() { b"/".to_vec() } else { rest.to_vec() };
+        }
+        if &*self.old_at == b"/" { return p.to_vec(); }
+        let mut v = self.old_at.clone();
+        v.extend_from_slice(p);
+        v
+    }
+}
+
+fn is_shared(m: &Mnt) -> bool { m.group != 0 }
+
+/// pivot_root(2) in mount namespace `ns` (not the initial one). The mount at
+/// `new_path` becomes the root mount and the old root mount is attached at
+/// `put_old`; `MNT_LOCKED` moves from the old root to the new one. Errors
+/// follow Linux: EINVAL (not a mountpoint, put_old not under new_root, a
+/// shared parent, new root locked), EBUSY (new_root or put_old on the current
+/// root mount).
+pub fn pivot_root(ns: NsId, new_path: &[u8], put_old: &[u8]) -> Result<PivotMap, i32> {
+    let mut g = NS.lock();
+    let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+    let (ri, _) = walk_idx(t, b"/").ok_or(-22)?;
+    if t[ri].parent != 0 { return Err(-22); }
+    let (ni, noff) = walk_idx(t, new_path).ok_or(-22)?;
+    if noff != new_path.len() && !(new_path == b"/" && noff == 0) { return Err(-22); }
+    let (yi, yoff) = walk_idx(t, put_old).ok_or(-22)?;
+    if ni == ri || yi == ri {
+        // The root mount: new_root on it is EBUSY; a put_old on it is either
+        // EBUSY or, outside the new root, EINVAL.
+        if ni == ri { return Err(-16); }
+    }
+    let xi = t.iter().position(|m| m.id == t[ni].parent).ok_or(-22)?;
+    if is_shared(&t[yi]) || is_shared(&t[xi]) { return Err(-22); }
+    if t[ni].locked & LOCK_MNT != 0 { return Err(-22); }
+    // put_old must lie inside the new root's tree.
+    let mut cur = yi;
+    let mut inside = false;
+    for _ in 0..256 {
+        if cur == ni { inside = true; break; }
+        match t.iter().position(|m| m.id == t[cur].parent) { Some(p) => cur = p, None => break }
+    }
+    if !inside { return Err(-22); }
+    if yi == ri { return Err(-16); }
+    let rel: Vec<u8> = if yoff >= put_old.len() { b"/".to_vec() } else { put_old[yoff..].to_vec() };
+    let new_root: Vec<u8> = if new_path.is_empty() { b"/".to_vec() } else { new_path.to_vec() };
+    let old_at: Vec<u8> = if put_old.len() <= new_root.len() || put_old == &new_root[..] { b"/".to_vec() }
+        else if new_root == b"/" { put_old.to_vec() } else { put_old[new_root.len()..].to_vec() };
+    let (nid, yid) = (t[ni].id, t[yi].id);
+    let _ = nid;
+    // Re-parent: the old root hangs off put_old, the new root becomes the root.
+    t[ri].parent = yid;
+    t[ri].mp = rel.into_boxed_slice();
+    t[ni].parent = 0;
+    t[ni].mp = b"/".to_vec().into_boxed_slice();
+    if t[ri].locked & LOCK_MNT != 0 { t[ri].locked &= !LOCK_MNT; t[ni].locked |= LOCK_MNT; }
+    Ok(PivotMap { new_root, old_at })
 }
 
 /// Owner user namespace of `ns`'s mount tree.

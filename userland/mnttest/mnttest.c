@@ -1467,6 +1467,193 @@ static void fdpath_suite(void) {
     umount2(file, MNT_DETACH); unlink(file);
 }
 
+/* ---- lane fdmounts: new-filesystem mounts onto /proc/self/fd/N (crun) ---- */
+static int fdm_mount(const char *dir, const char *src, const char *fs, unsigned long fl, const char *data) {
+    char t[64];
+    int fd = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) { printf("  open %s errno=%d\n", dir, errno); return -1; }
+    snprintf(t, sizeof t, "/proc/self/fd/%d", fd);
+    errno = 0;
+    int r = mount(src, t, fs, fl, data);
+    int e = errno;
+    close(fd);
+    if (r < 0) printf("  mount %s -> fd link errno=%d\n", fs, e);
+    errno = e;
+    return r;
+}
+static int fdm_has(const char *dir, const char *fs) {
+    static char mi[32768]; char pat[64];
+    if (slurp("/proc/self/mountinfo", mi, sizeof mi) <= 0) return 0;
+    snprintf(pat, sizeof pat, " %s ", dir);
+    for (char *l = strtok(mi, "\n"); l; l = strtok(NULL, "\n")) {
+        char *d = strstr(l, pat), *h = strstr(l, " - ");
+        if (d && h && !strncmp(h + 3, fs, strlen(fs))) return 1;
+    }
+    return 0;
+}
+static int fdm_all(void) {
+    static const char *dirs[] = {"proc", "tmp", "sys", "pts", "mq", "cg"};
+    char d[64];
+    mkdir("/tmp/fdm", 0755);
+    for (int i = 0; i < 6; i++) { snprintf(d, sizeof d, "/tmp/fdm/%s", dirs[i]); mkdir(d, 0755); }
+    if (fdm_mount("/tmp/fdm/proc", "proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) return 1;
+    if (fdm_mount("/tmp/fdm/tmp", "tmpfs", "tmpfs", MS_NOSUID | MS_STRICTATIME, "mode=755,size=65536k") < 0) return 2;
+    if (fdm_mount("/tmp/fdm/sys", "sysfs", "sysfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) return 3;
+    if (fdm_mount("/tmp/fdm/pts", "devpts", "devpts", MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666,mode=0620") < 0) return 4;
+    if (fdm_mount("/tmp/fdm/mq", "mqueue", "mqueue", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) return 5;
+    if (fdm_mount("/tmp/fdm/cg", "cgroup2", "cgroup2", MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME, "nsdelegate") < 0) return 6;
+    return 0;
+}
+static int fdm_check(void) {
+    struct stat st;
+    if (!fdm_has("/tmp/fdm/proc", "proc") || !fdm_has("/tmp/fdm/tmp", "tmpfs") || !fdm_has("/tmp/fdm/sys", "sysfs")
+        || !fdm_has("/tmp/fdm/pts", "devpts") || !fdm_has("/tmp/fdm/mq", "mqueue") || !fdm_has("/tmp/fdm/cg", "cgroup2")) return 10;
+    if (stat("/tmp/fdm/proc/self", &st) < 0) return 11;
+    if (stat("/tmp/fdm/sys/kernel", &st) < 0 && stat("/tmp/fdm/sys/class", &st) < 0) return 12;
+    if (stat("/tmp/fdm/pts/ptmx", &st) < 0) return 13;
+    if (open("/tmp/fdm/tmp/x", O_CREAT | O_WRONLY, 0600) < 0) return 14;
+    if (open("/tmp/fdm/sys/kernel/zz", O_CREAT | O_WRONLY, 0600) >= 0) return 15;   /* ro */
+    return 0;
+}
+static int fdm_root_ns0(int m) { (void)m; int r = fdm_all(); return r ? r : fdm_check(); }
+static int fdm_root_mntns(int m) { (void)m; if (unshare(CLONE_NEWNS) < 0) return 91; int r = fdm_all(); return r ? r : fdm_check(); }
+/* userns+mntns+pidns after fork; the grandchild is pid 1 of the new pidns */
+static int fdm_userns_pid(int m) {
+    (void)m;
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    mkdir("/tmp/fdmu", 0755);
+    { static const char *pd[] = {"proc", "tmp", "pts", "mq", "cg"}; char q[64];
+      for (int i = 0; i < 5; i++) { snprintf(q, sizeof q, "/tmp/fdmu/%s", pd[i]); mkdir(q, 0755); } }
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID) < 0) return 91;
+    wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
+    pid_t c = fork();
+    if (c < 0) return 92;
+    if (c == 0) {
+        if (getpid() != 1) _exit(93);
+        if (fdm_mount("/tmp/fdmu/proc", "proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) _exit(errno == EPERM ? 96 : 1);
+        if (fdm_mount("/tmp/fdmu/tmp", "tmpfs", "tmpfs", MS_NOSUID, "mode=755") < 0) _exit(2);
+        if (fdm_mount("/tmp/fdmu/pts", "devpts", "devpts", MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666,mode=0620") < 0) _exit(4);
+        if (fdm_mount("/tmp/fdmu/mq", "mqueue", "mqueue", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) _exit(5);
+        if (fdm_mount("/tmp/fdmu/cg", "cgroup2", "cgroup2", MS_NOSUID | MS_NODEV | MS_NOEXEC, "nsdelegate") < 0) _exit(6);
+        /* the new proc shows THIS pidns: pid 1 is us, and no host pids */
+        DIR *dp = opendir("/tmp/fdmu/proc");
+        if (!dp) _exit(10);
+        int saw1 = 0, n = 0; struct dirent *e;
+        while ((e = readdir(dp))) if (e->d_name[0] >= '1' && e->d_name[0] <= '9') { n++; if (!strcmp(e->d_name, "1")) saw1 = 1; }
+        closedir(dp);
+        char lnk[32]; ssize_t l = readlink("/tmp/fdmu/proc/self", lnk, sizeof lnk - 1);
+        if (l <= 0) _exit(11);
+        lnk[l] = 0;
+        if (!saw1 || n > 3 || strcmp(lnk, "1")) { printf("  proc pidns saw1=%d n=%d self=%s\n", saw1, n, lnk); _exit(12); }
+        _exit(0);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 99;
+}
+/* proc is mounted by a userns task only when an unobstructed proc is visible */
+static int fdm_visible(int obstruct) {
+    mkdir("/tmp/fdv", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (obstruct && mount("tmpfs", "/proc/sys", "tmpfs", 0, NULL) < 0) { printf("  obstruct errno=%d\n", errno); return 92; }
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 93;
+    wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 0 1"); wr("/proc/self/gid_map", "0 0 1");
+    errno = 0;
+    int r = mount("proc", "/tmp/fdv", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
+    if (obstruct) return (r < 0 && errno == EPERM) ? 0 : (printf("  obstructed proc r=%d errno=%d\n", r, errno), 1);
+    return r == 0 ? 0 : (printf("  visible proc errno=%d\n", errno), 2);
+}
+static int fdm_visible_ok(int m) { (void)m; return fdm_visible(0); }
+static int fdm_visible_eperm(int m) { (void)m; return fdm_visible(1); }
+static void fdmounts_suite(void) {
+    report("fdmounts_all_fstypes_root_ns0", nn_in_child(fdm_root_ns0, 0));
+    umount2("/tmp/fdm/proc", MNT_DETACH); umount2("/tmp/fdm/tmp", MNT_DETACH); umount2("/tmp/fdm/sys", MNT_DETACH);
+    umount2("/tmp/fdm/pts", MNT_DETACH); umount2("/tmp/fdm/mq", MNT_DETACH); umount2("/tmp/fdm/cg", MNT_DETACH);
+    report("fdmounts_all_fstypes_root_mntns", nn_in_child(fdm_root_mntns, 0));
+    report("fdmounts_userns_mntns_pidns_proc_shows_pidns", nn_in_child(fdm_userns_pid, 0));
+    report("fdmounts_proc_fully_visible_allowed", nn_in_child(fdm_visible_ok, 0));
+    report("fdmounts_proc_not_fully_visible_eperm", nn_in_child(fdm_visible_eperm, 0));
+}
+
+/* ── lane mntpivot (M4): pivot_root inside a mount namespace ─────────────── */
+static int pv_prepare(const char *root) {
+    mkdir("/tmp/pv", 0755); mkdir(root, 0755);
+    char p[128];
+    snprintf(p, sizeof p, "%s/hello", root);
+    int fd = open(p, O_CREAT | O_WRONLY, 0644);
+    if (fd < 0) return -1;
+    if (write(fd, "hi", 2) < 0) {}
+    close(fd);
+    snprintf(p, sizeof p, "%s/old", root);
+    mkdir(p, 0755);
+    return 0;
+}
+/* crun's sequence: chdir(root); pivot_root(".", "."); fchdir(oldroot);
+ * rslave; umount2(".", MNT_DETACH); chdir("/") */
+static int pv_crun_seq(const char *root) {
+    if (mount("", "/", NULL, MS_REC | MS_SLAVE, NULL) < 0) { printf("  rslave errno=%d\n", errno); return 10; }
+    if (mount(root, root, NULL, MS_BIND | MS_REC, NULL) < 0) { printf("  bind errno=%d\n", errno); return 11; }
+    if (chdir(root) < 0) return 12;
+    int oldroot = open("/", O_DIRECTORY | O_RDONLY);
+    if (oldroot < 0) return 13;
+    if (syscall(SYS_pivot_root, ".", ".") < 0) { printf("  pivot errno=%d\n", errno); return 14; }
+    if (fchdir(oldroot) < 0) { printf("  fchdir errno=%d\n", errno); return 15; }
+    close(oldroot);
+    if (mount("", ".", NULL, MS_SLAVE | MS_REC, NULL) < 0) { printf("  rslave2 errno=%d\n", errno); return 16; }
+    if (umount2(".", MNT_DETACH) < 0) { printf("  detach errno=%d\n", errno); return 17; }
+    if (chdir("/") < 0) return 18;
+    char cwd[64];
+    if (!getcwd(cwd, sizeof cwd) || strcmp(cwd, "/")) { printf("  cwd=%s\n", cwd); return 19; }
+    if (!exists("/hello")) return 20;
+    if (exists("/bin/mnttest") || exists("/proc/self")) { printf("  old root still visible\n"); return 21; }
+    return 0;
+}
+static int pv_dotdot(int m) {
+    (void)m;
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (pv_prepare("/tmp/pv/r1") < 0) return 92;
+    return pv_crun_seq("/tmp/pv/r1");
+}
+static int pv_errs(int m) {
+    (void)m;
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (pv_prepare("/tmp/pv/r2") < 0) return 92;
+    if (mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) return 93;
+    errno = 0;
+    if (!(syscall(SYS_pivot_root, "/tmp/pv/r2", "/tmp/pv/r2") == -1 && errno == EINVAL)) { printf("  nonmp errno=%d\n", errno); return 1; }
+    if (mount("/tmp/pv/r2", "/tmp/pv/r2", NULL, MS_BIND, NULL) < 0) return 94;
+    errno = 0;
+    if (!(syscall(SYS_pivot_root, "/tmp/pv/r2", "/tmp") == -1 && errno == EINVAL)) { printf("  put_old outside errno=%d\n", errno); return 2; }
+    errno = 0;
+    if (!(syscall(SYS_pivot_root, "/", "/") == -1 && errno == EBUSY)) { printf("  root errno=%d\n", errno); return 3; }
+    if (mount("", "/tmp/pv/r2", NULL, MS_SHARED, NULL) < 0) return 95;
+    errno = 0;
+    if (!(syscall(SYS_pivot_root, "/tmp/pv/r2", "/tmp/pv/r2/old") == -1 && errno == EINVAL)) { printf("  shared errno=%d\n", errno); return 4; }
+    if (mount("", "/tmp/pv/r2", NULL, MS_PRIVATE, NULL) < 0) return 96;
+    /* with a subdirectory as put_old the old root stays reachable there */
+    if (chdir("/tmp/pv/r2") < 0) return 97;
+    if (syscall(SYS_pivot_root, "/tmp/pv/r2", "/tmp/pv/r2/old") < 0) { printf("  ok pivot errno=%d\n", errno); return 5; }
+    if (chdir("/") < 0) return 98;
+    if (!exists("/hello") || !exists("/old/bin/mnttest")) { printf("  layout wrong\n"); return 6; }
+    if (umount2("/old", MNT_DETACH) < 0) { printf("  umount old errno=%d\n", errno); return 7; }
+    if (exists("/old/bin/mnttest")) return 8;
+    return 0;
+}
+static int pv_locked_userns(int m) {
+    (void)m;
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    mkdir("/tmp/pv", 0755);
+    if (pv_prepare("/tmp/pvu3") < 0) return 92;
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
+    wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
+    return pv_crun_seq("/tmp/pvu3");
+}
+static void pivot_suite(void) {
+    report("pivot_dotdot", nn_in_child(pv_dotdot, 0));
+    report("pivot_errs", nn_in_child(pv_errs, 0));
+    report("pivot_locked_userns", nn_in_child(pv_locked_userns, 0));
+    report("pivot_ns0_intact", exists("/bin/mnttest") && exists("/tmp/pv/r1/hello"));
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -1483,6 +1670,8 @@ int main(int argc, char **argv) {
     tmpfs_anywhere();
     netns_suite();
     fdpath_suite();
+    fdmounts_suite();
+    pivot_suite();
     devpts_copies();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
