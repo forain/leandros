@@ -1875,6 +1875,34 @@ static void opentree_suite(void) {
     report("opentree_setattr_ro_and_locked", nn_in_child(ot_setattr, 0));
 }
 
+/* lane fdbindprop: crun's etc/hosts sequence - bind a source onto a target in a
+ * rootfs, open the target O_PATH, mount_setattr(fd, "", EMPTY_PATH|RECURSIVE),
+ * then mount(NULL, "/proc/self/fd/N", MS_REC|MS_PRIVATE). */
+static int fb_seq(int isdir) {
+    mkdir("/tmp/fbr", 0755); mkdir("/tmp/fbr/etc", 0755); mkdir("/tmp/fbs", 0755);
+    const char *src = isdir ? "/tmp/fbs/d" : "/tmp/fbs/hosts";
+    const char *dst = isdir ? "/tmp/fbr/etc/d" : "/tmp/fbr/etc/hosts";
+    if (isdir) { mkdir(src, 0755); mkdir(dst, 0755); }
+    else { int f = open(src, O_CREAT | O_WRONLY, 0644); if (f < 0) return 90; close(f);
+           f = open(dst, O_CREAT | O_WRONLY, 0644); if (f < 0) return 90; close(f); }
+    if (ot_userns() < 0) return 91;
+    if (mount("/tmp/fbr", "/tmp/fbr", NULL, MS_BIND | MS_REC, NULL) < 0) { printf("  rootfs bind errno=%d\n", errno); return 10; }
+    if (mount(src, dst, NULL, MS_BIND, NULL) < 0) { printf("  bind errno=%d\n", errno); return 11; }
+    int fd = open(dst, O_PATH | O_CLOEXEC | (isdir ? O_DIRECTORY : 0));
+    if (fd < 0) { printf("  open errno=%d\n", errno); return 12; }
+    if (osetattr(fd, "", 0x1000 | OT_REC, 0, 0) < 0) { printf("  mount_setattr errno=%d\n", errno); return 13; }
+    char p[48]; snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    if (mount(NULL, p, NULL, MS_REC | MS_PRIVATE, NULL) < 0) { printf("  propagation errno=%d\n", errno); return 14; }
+    close(fd);
+    return 0;
+}
+static int fb_file(int m) { (void)m; return fb_seq(0); }
+static int fb_dir(int m) { (void)m; return fb_seq(1); }
+static void fdbindprop_suite(void) {
+    report("fdbindprop_file_bind_setattr_and_private", nn_in_child(fb_file, 0));
+    report("fdbindprop_dir_bind_setattr_and_private", nn_in_child(fb_dir, 0));
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -1896,6 +1924,7 @@ int main(int argc, char **argv) {
     podexec_suite();
     devpts_copies();
     opentree_suite();
+    fdbindprop_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
