@@ -166,7 +166,7 @@ struct Pty {
     /// devpts instance this pair belongs to (0 = the default /dev/pts) and its
     /// number inside that instance: the `TIOCGPTN` answer and the `N` in
     /// `<mount>/N`. Set by `alloc`; the pool index is only the storage slot.
-    inst: u16,
+    inst: u32,
     num: u16,
     /// `TIOCSPTLCK` state. A freshly allocated pair is locked; `unlockpt(3)`
     /// clears it, and until then `open("/dev/pts/N")` is EIO. Real programs
@@ -385,7 +385,7 @@ pub fn alloc() -> Option<usize> {
 
 /// `alloc` inside devpts instance `inst`: the lowest free number of that
 /// instance's own index space. The pool slot is shared by all instances.
-pub fn alloc_in(inst: u16) -> Option<usize> {
+pub fn alloc_in(inst: u32) -> Option<usize> {
     let mut ptys = PTYS.lock();
     let idx = ptys.iter().position(|p| !p.in_use)?;
     let mut num = 0u16;
@@ -398,21 +398,21 @@ pub fn alloc_in(inst: u16) -> Option<usize> {
 }
 
 /// Instance number and in-instance number of pool slot `pair`.
-pub fn ident(pair: usize) -> (u16, u16) {
+pub fn ident(pair: usize) -> (u32, u16) {
     if pair >= MAX_PTYS { return (0, 0); }
     let ptys = PTYS.lock();
     (ptys[pair].inst, ptys[pair].num)
 }
 
 /// The pool slot of pty `num` in devpts instance `inst`, if its master is live.
-pub fn find(inst: u16, num: usize) -> Option<usize> {
+pub fn find(inst: u32, num: usize) -> Option<usize> {
     let ptys = PTYS.lock();
     ptys.iter().position(|p| p.in_use && p.master_refs > 0 && p.vt == 0
                              && p.inst == inst && p.num as usize == num)
 }
 
 /// Call `f(num)` for each live pty of instance `inst`.
-pub fn each_in(inst: u16, mut f: impl FnMut(usize)) {
+pub fn each_in(inst: u32, mut f: impl FnMut(usize)) {
     let ptys = PTYS.lock();
     for p in ptys.iter() {
         if p.in_use && p.master_refs > 0 && p.vt == 0 && p.inst == inst { f(p.num as usize); }

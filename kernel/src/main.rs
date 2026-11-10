@@ -23,6 +23,7 @@ mod direct_hhdm;
 mod netwatch;
 mod tryboot;
 mod syscall;
+mod bpf;
 mod mem;
 mod firmware;
 mod ktest;

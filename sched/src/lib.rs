@@ -45,6 +45,7 @@ pub mod signal;
 pub mod random;
 pub mod rseq;
 pub mod rtq;
+pub mod bpfcg;
 pub mod seccomp;
 pub mod task;
 pub mod uaccess;

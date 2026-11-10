@@ -154,9 +154,12 @@ if command -v zig >/dev/null 2>&1; then
     echo "[userland] Building chroottest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/chroottest" userland/chroottest/chroottest.c
     echo "[userland] Building mnttest..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/mnttest" userland/mnttest/mnttest.c
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/mnttest" userland/mnttest/mnttest.c -lpthread
     echo "[userland] Building captest..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/captest" userland/captest/captest.c
+    # bpftest: bpf(2) cgroup device programs (lane bpfsys).
+    echo "[userland] Building bpftest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/bpftest" userland/bpftest/bpftest.c
     # seccomptest: prctl/seccomp(2) behaviour (lane seccore).
     echo "[userland] Building seccomptest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/seccomptest" userland/seccomptest/seccomptest.c

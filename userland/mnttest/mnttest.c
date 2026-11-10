@@ -3,6 +3,7 @@
  * (/proc/mntselftest) and ns-0 invariants. Output: "case: PASS|FAIL|SKIP". */
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <sys/ioctl.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -897,6 +898,62 @@ static int tfs_unpriv_child(void) {
     return errno == EPERM ? 0 : 11;
 }
 
+/* devpts instance: pty index of a fresh <mnt>/ptmx (-1 on failure); *mfd gets the master. */
+static int dpts_open(const char *d, int *mfd) {
+    char f[128]; unsigned n = 0;
+    snprintf(f, sizeof f, "%s/ptmx", d);
+    int fd = open(f, O_RDWR | O_NOCTTY);
+    if (fd < 0) return -1;
+    if (ioctl(fd, 0x80045430 /* TIOCGPTN */, &n) != 0) { close(fd); return -1; }
+    { int z = 0; ioctl(fd, 0x40045431 /* TIOCSPTLCK */, &z); }
+    *mfd = fd;
+    return (int)n;
+}
+
+static void devpts_copies(void) {
+    const char *d = "/root/mt-dpts.d";
+    int up[2], dn[2], m0 = -1;
+    mkdir(d, 0755);
+    if (mount("none", d, "devpts", 0, "ptmxmode=0666") != 0 || pipe(up) != 0 || pipe(dn) != 0) {
+    report("devpts_copy_keeps_instance", 0);
+        report("devpts_no_reuse_after_umount", 0);
+        return;
+    }
+    int n0 = dpts_open(d, &m0);
+    pid_t cp = fork();
+    if (cp == 0) {
+        char c = 0, f[128];
+        int res = 0, m1 = -1;
+        if (unshare(CLONE_NEWNS) != 0) _exit(128);
+        write(up[1], "r", 1);
+        read(dn[0], &c, 1);
+        int n1 = dpts_open(d, &m1);
+        /* the old pair is still live in the old instance: next index is 1 */
+        if (n1 == 1) res |= 1;
+        snprintf(f, sizeof f, "%s/%d", d, n0);
+        int sfd = open(f, O_RDWR | O_NOCTTY);
+        if (sfd >= 0) res |= 4;
+        _exit(res);
+    }
+    char c;
+    read(up[0], &c, 1);
+    int ur = umount(d);
+    int m2 = -1, mr = mount("none", d, "devpts", 0, "ptmxmode=0666");
+    int n2 = (mr == 0) ? dpts_open(d, &m2) : -1;
+    write(dn[1], "g", 1);
+    int stt = 0;
+    waitpid(cp, &stt, 0);
+    int code = WIFEXITED(stt) ? WEXITSTATUS(stt) : 255;
+    report("devpts_copy_keeps_instance", n0 == 0 && ur == 0 && (code & 1) && (code & 4));
+    /* the new instance has a fresh index space (0), not the old one's (1) */
+    report("devpts_no_reuse_after_umount", mr == 0 && n2 == 0);
+    if (m2 >= 0) close(m2);
+    if (m0 >= 0) close(m0);
+    umount(d);
+    close(up[0]); close(up[1]); close(dn[0]); close(dn[1]);
+    rmdir(d);
+}
+
 static void tmpfs_anywhere(void) {
     const char *d = "/root/mt-tfs.d";
     int live0 = 0, sb0 = 0, live1 = 0, sb1 = 0;
@@ -1016,6 +1073,113 @@ static void tmpfs_anywhere(void) {
 
 }
 
+
+/* netns lane (netnsfix): unshare(CLONE_NEWNET) alone / threaded / unprivileged,
+ * self-bind + make-rshared, nsfs bind mounts keeping a netns alive. */
+#include <pthread.h>
+#ifndef CLONE_NEWNET
+#define CLONE_NEWNET 0x40000000
+#endif
+static void *nn_thread(void *a) { *(int *)a = unshare(CLONE_NEWNET) == 0 ? 0 : errno; return NULL; }
+static int nn_threaded(void) {
+    int res = -1; pthread_t t;
+    if (pthread_create(&t, NULL, nn_thread, &res)) return 99;
+    pthread_join(t, NULL);
+    return res;
+}
+static int nn_unpriv(int mode) {
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    errno = 0;
+    switch (mode) {
+    case 0: return unshare(CLONE_NEWNET) < 0 && errno == EPERM ? 0 : 10;
+    case 1: return unshare(CLONE_NEWUSER | CLONE_NEWNET) == 0 ? 0 : 11;
+    case 2: return unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET) == 0 ? 0 : 12;
+    case 3:
+        if (unshare(CLONE_NEWUSER) < 0) return 91;
+        wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
+        return unshare(CLONE_NEWNET) == 0 ? 0 : 13;
+    case 4:
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
+        wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
+        return unshare(CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWIPC) == 0 ? 0 : 14;
+    }
+    return 98;
+}
+static int nn_in_child(int (*fn)(int), int arg) {
+    pid_t c = fork();
+    if (c == 0) _exit(fn(arg));
+    int st = 0; waitpid(c, &st, 0);
+    if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) printf("  child status=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+static int nn_root(int m) {
+    if (m == 0) return unshare(CLONE_NEWNET) == 0 ? 0 : 1;
+    if (m == 1) return unshare(CLONE_NEWNET | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC) == 0 ? 0 : 2;
+    return nn_threaded();
+}
+static int nn_join_check(const char *file) {
+    int fd = open(file, O_RDONLY);
+    if (fd < 0) return 1;
+    struct stat a, b, before; char me[] = "/proc/self/ns/net";
+    if (fstat(fd, &a) < 0) return 2;
+    stat(me, &before);
+    if (setns_(fd, CLONE_NEWNET) < 0) return 3;
+    if (stat(me, &b) < 0) return 4;
+    if (a.st_ino != b.st_ino || before.st_ino == b.st_ino) return 5;
+    return 0;
+}
+static void netns_suite(void) {
+    report("unshare_newnet_root", nn_in_child(nn_root, 0));
+    report("unshare_newnet_all_flat_newns", nn_in_child(nn_root, 1));
+    report("unshare_newnet_threaded", nn_in_child(nn_root, 2));
+    report("unshare_newnet_unpriv_eperm", nn_in_child(nn_unpriv, 0));
+    report("unshare_newuser_newnet_unpriv", nn_in_child(nn_unpriv, 1));
+    report("unshare_newuser_newns_newnet_unpriv", nn_in_child(nn_unpriv, 2));
+    report("unshare_newnet_in_userns", nn_in_child(nn_unpriv, 3));
+    report("unshare_newnet_uts_ipc_in_userns_mntns", nn_in_child(nn_unpriv, 4));
+
+    /* /run/netns: self-bind then make-rshared, as netavark and ip-netns do */
+    mkdir("/run", 0755); mkdir("/run/netns", 0755);
+    int okb = mount("/run/netns", "/run/netns", "none", MS_BIND | MS_REC, NULL) == 0;
+    int oks = mount("", "/run/netns", NULL, MS_SHARED | MS_REC, NULL) == 0;
+    static char mi[16384]; int shared = 0;
+    if (slurp("/proc/self/mountinfo", mi, sizeof mi) > 0) {
+        char *l = strstr(mi, " /run/netns ");
+        if (l) { char *e = strchr(l, '\n'); char *sh = strstr(l, "shared:"); shared = sh && (!e || sh < e); }
+    }
+    report("netns_self_bind_ok", okb);
+    report("netns_make_rshared_ok", oks);
+    report("netns_make_rshared_visible", shared);
+
+    /* nsfs bind mount keeps a netns alive after its creator exits */
+    int p[2], q[2];
+    if (pipe(p) || pipe(q)) { report("netns_nsfs_bind", 0); return; }
+    pid_t c = fork();
+    if (c == 0) {
+        char ch;
+        if (unshare(CLONE_NEWNET) < 0) _exit(1);
+        if (write(p[1], "x", 1) != 1) _exit(2);
+        if (read(q[0], &ch, 1) < 0) _exit(3);
+        _exit(0);
+    }
+    char ch; int ok = read(p[0], &ch, 1) == 1;
+    char src[64], file[] = "/run/netns/nsfstest";
+    snprintf(src, sizeof src, "/proc/%d/ns/net", (int)c);
+    int fd = open(file, O_RDWR | O_CREAT, 0444); if (fd >= 0) close(fd);
+    int br = mount(src, file, "none", MS_BIND, NULL);
+    if (br < 0) printf("  nsfs bind errno=%d\n", errno);
+    report("netns_nsfs_bind_mount", ok && br == 0);
+    if (write(q[1], "x", 1) != 1) {}
+    int st = 0; waitpid(c, &st, 0);
+    pid_t j = fork();
+    if (j == 0) _exit(br == 0 ? nn_join_check(file) : 77);
+    int js = 0; waitpid(j, &js, 0);
+    if (!(WIFEXITED(js) && WEXITSTATUS(js) == 0)) printf("  join status=%d\n", WIFEXITED(js) ? WEXITSTATUS(js) : -1);
+    report("netns_nsfs_bound_survives_and_setns", WIFEXITED(js) && WEXITSTATUS(js) == 0);
+    umount2(file, MNT_DETACH); unlink(file);
+    umount2("/run/netns", MNT_DETACH); rmdir("/run/netns");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -1030,6 +1194,8 @@ int main(int argc, char **argv) {
     mount_userns_perm();
     setns_mnt_suite();
     tmpfs_anywhere();
+    netns_suite();
+    devpts_copies();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }

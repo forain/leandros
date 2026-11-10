@@ -256,6 +256,7 @@ pub fn remove(cg: CgId) -> isize {
     }
     t.names[cg as usize].clear();
     ALIVE[cg as usize].store(0, Release);
+    crate::bpfcg::cg_released(cg);
     0
 }
 

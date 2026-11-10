@@ -734,6 +734,7 @@ mod nr {
     pub const SIGPENDING:     usize = 136;
     pub const GETRANDOM:      usize = 278;
     pub const SECCOMP:        usize = 277;
+    pub const BPF:            usize = 280;
     pub const PRCTL:          usize = 167;
     pub const PERSONALITY:    usize = 92;
     pub const MADVISE:        usize = 233;
@@ -1003,6 +1004,7 @@ mod nr {
     pub const SIGPENDING:     usize = 127;
     pub const GETRANDOM:      usize = 318;
     pub const SECCOMP:        usize = 317;
+    pub const BPF:            usize = 321;
     pub const PRCTL:          usize = 157;
     pub const PERSONALITY:    usize = 135;
     pub const MADVISE:        usize = 28;
@@ -2487,6 +2489,7 @@ fn dispatch_inner(
         ALARM        => sys_alarm(a0),
         GETRANDOM    => sys_getrandom(a0, a1, a2),
         SECCOMP      => sys_seccomp(a0, a1, a2),
+        BPF          => crate::bpf::sys_bpf(a0, a1, a2),
         PRCTL        => sys_prctl(a0, a1, a2, a3, a4),
         MADVISE      => sys_madvise(a0, a1, a2),
         MSYNC        => sys_msync(a0, a1, a2),
@@ -8559,7 +8562,7 @@ fn sys_unshare(flags: usize) -> isize {
     if flags & CLONE_NEWNS != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     let flat = flags & (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS);
     if flat != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; } // CAP_SYS_ADMIN
-    if flat != 0 && !alone { return -22; }
+    // Linux allows these from a multithreaded caller: the namespace is per thread (Go's LockOSThread + unshare).
     if flags & CLONE_NEWCGROUP != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     if flags & CLONE_NEWUSER != 0 {
         // Linux: a chrooted task may not create a user namespace (EPERM).
@@ -9446,6 +9449,24 @@ fn sys_mount(
     };
     let alias_src: Option<(Vec<u8>, &'static str)> = if flags & MS_BIND != 0 {
         let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
+        // Binding /proc/<pid>/ns/<name> keeps that namespace alive.
+        match vfs::nsfs_bind_source(src.ns_bytes(), current_pid()) {
+            Err(e) => return e,
+            Ok(Some(synth)) => {
+                let mp = target_path.ns_bytes();
+                let mut st = [0u8; STAT_SIZE];
+                let m = make_vfs_msg(vfs::VFS_STAT, &[target_path.ptr() as u64, st.as_mut_ptr() as u64]);
+                let r = vfs_reply_val(&vfs::handle(&m, current_pid()));
+                let ok = r >= 0 && vfs::read_stat_mode(st.as_ptr() as usize) & 0o170000 != 0o040000;
+                let put = |s: &[u8]| if let Some((_, id)) = vfs::alias::ns_src(s) { sched::ns::put_raw(id); };
+                if !ok { put(&synth); return if r < 0 { r } else { -20 }; }
+                return match vfs::alias::add(mp, &synth, "nsfs", b"nsfs") {
+                    Ok(()) => 0,
+                    Err(e) => { put(&synth); e as isize }
+                };
+            }
+            Ok(None) => {}
+        }
         Some((src.bytes().to_vec(), "none"))
     } else {
         match &fstype_raw[..] {
@@ -9498,7 +9519,7 @@ fn sys_mount(
         return match vfs::alias::add(mp, &src, fstype, &device) {
             Ok(()) => { if fstype == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
             Err(e) => {
-                if let Some(id) = vfs::devpts::inst_of_backing(&src) { vfs::devpts::destroy(id); }
+                if let Some(id) = vfs::devpts::inst_of_backing(&src) { vfs::devpts::discard(id); }
                 e as isize
             }
         };
@@ -12063,6 +12084,20 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         }
         if arg == 0 || !validate_user_buf(arg, nl::IFREQ_LEN) { return -14; }
         let mut ifr = match sched::uaccess::read_user::<[u8; nl::IFREQ_LEN]>(arg) { Some(v) => v, None => return -14 };
+        if cmd as u32 == nl::SIOCSIFFLAGS {
+            // Only a netns's own `lo` has an admin state to set (the same
+            // LO_UP netlink RTM_NEWLINK uses); needs CAP_NET_ADMIN over the
+            // netns owner's user namespace.
+            let ns = sched::ns::netns_of(pid as u32);
+            let owner = sched::ns::owner_userns(2, ns);
+            if !sched::caps::ns_capable_in(owner, 12) { return -1; }
+            let n = ifr[..16].iter().position(|&b| b == 0).unwrap_or(16);
+            if &ifr[..n] != b"lo" { return if links.iter().any(|l| l.name.as_bytes() == &ifr[..n]) { -95 } else { -19 }; }
+            if ns == 0 { return -95; }
+            let fl = u16::from_ne_bytes([ifr[16], ifr[17]]);
+            sched::ns::set_lo_admin_up(ns, fl & 1 != 0); // IFF_UP
+            return 0;
+        }
         let r = nl::ifreq_ioctl(cmd as u32, &mut ifr, &links);
         if r < 0 { return r as isize; }
         return if sched::uaccess::write_user(arg, ifr) { 0 } else { -14 };
