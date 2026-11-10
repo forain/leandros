@@ -43,6 +43,8 @@ pub(crate) fn forget(sid: Sid) {
     let mut s = L2.lock();
     s.cfg.retain(|e| e.0 != sid);
     s.fdb.retain(|e| e.br != sid && e.port != sid);
+    drop(s);
+    crate::fwd::forget(sid);
 }
 /// Number of learned entries on `br` (tests / diagnostics).
 pub(crate) fn fdb_len(br: Sid) -> usize { L2.lock().fdb.iter().filter(|e| e.br == br).count() }
