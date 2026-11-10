@@ -15799,7 +15799,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
 }
 
 enum FdInfo { Static(&'static [u8]), Pipe(usize), RamData(*const u8), TmpIdx(usize),
-              Mounted(u32, u32), PtsSlave(u16), Bad }
+              Mounted(u32, u32), PtsSlave(u16), Cg(sched::cgroup::CgId), Bad }
 
 fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Message {
     if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
@@ -15870,6 +15870,9 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             // A file on a mounted filesystem: only the owning mount server
             // knows the path behind its file_id, so ask it.
             VnodeKind::MountedFile { port, file_id } => FdInfo::Mounted(*port, *file_id),
+            // A cgroupfs directory fd names its tree path, so openat/openat2
+            // relative to it (crun) resolve.
+            VnodeKind::SysBlock { dev, .. } if cgroupfs::is_dev(*dev) => FdInfo::Cg(cgroupfs::dev_cg(*dev)),
             VnodeKind::SockAlias { .. } => FdInfo::Static(b"socket:[0]"),
             VnodeKind::EpollFd { .. } => FdInfo::Static(b"anon_inode:[eventpoll]"),
             _ => FdInfo::Bad,
@@ -15898,6 +15901,14 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             b[n] = b']'; n += 1;
             let c = n.min(buf_len);
             unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, b.as_ptr(), c); }
+            val_reply(c as u64)
+        }
+        FdInfo::Cg(cg) => {
+            let mut p = alloc::vec::Vec::from(cgroupfs::ROOT);
+            let rel = sched::cgroup::path_rel(cg, 0);
+            if rel != "/" { p.extend_from_slice(rel.as_bytes()); }
+            let c = p.len().min(buf_len);
+            unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, p.as_ptr(), c); }
             val_reply(c as u64)
         }
         FdInfo::PtsSlave(n) => {
