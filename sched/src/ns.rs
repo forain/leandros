@@ -251,6 +251,7 @@ pub fn new_flat(owner: NsId) -> Result<NsRef, isize> {
             LEVEL[id].store(0, Release);
             set_owner_userns(id as NsId, owner);
             LO_UP[id].store(0, Release);
+            netctl_reset(id);
             SLOT_USER[id].store(0, Release);
             return Ok(NsRef(id as NsId));
         }
@@ -1038,4 +1039,110 @@ pub fn setns_cgroup(id: NsId) -> isize {
     };
     drop(old);
     0
+}
+
+// ── /proc/sys/net (per network namespace) ────────────────────────────────────
+
+pub struct NetCtl { pub path: &'static str, pub def: u32, pub max: u32, pub pair: bool }
+pub const NETCTL_N: usize = 36;
+/// Entries with `pair` own this slot and the next ("lo hi" files); the next has an empty path.
+pub static NETCTL: [NetCtl; NETCTL_N] = [
+    NetCtl { path: "core/somaxconn", def: 4096, max: 2147483647, pair: false },
+    NetCtl { path: "core/rmem_max", def: 212992, max: 2147483647, pair: false },
+    NetCtl { path: "core/wmem_max", def: 212992, max: 2147483647, pair: false },
+    NetCtl { path: "ipv4/ip_forward", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/ip_unprivileged_port_start", def: 1024, max: 65535, pair: false },
+    NetCtl { path: "ipv4/ip_local_port_range", def: 32768, max: 65535, pair: true },
+    NetCtl { path: "", def: 60999, max: 65535, pair: false },
+    NetCtl { path: "ipv4/ping_group_range", def: 1, max: 4294967294, pair: true },
+    NetCtl { path: "", def: 0, max: 4294967294, pair: false },
+    NetCtl { path: "ipv4/ip_nonlocal_bind", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/ip_default_ttl", def: 64, max: 255, pair: false },
+    NetCtl { path: "ipv4/tcp_syncookies", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv4/conf/all/forwarding", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/all/route_localnet", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/all/rp_filter", def: 0, max: 2, pair: false },
+    NetCtl { path: "ipv4/conf/all/arp_notify", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/default/forwarding", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/default/route_localnet", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/default/rp_filter", def: 0, max: 2, pair: false },
+    NetCtl { path: "ipv4/conf/default/arp_notify", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/lo/forwarding", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/lo/route_localnet", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/lo/rp_filter", def: 0, max: 2, pair: false },
+    NetCtl { path: "ipv4/conf/lo/arp_notify", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/all/disable_ipv6", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/all/forwarding", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/all/accept_ra", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv6/conf/all/accept_dad", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv6/conf/default/disable_ipv6", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/default/forwarding", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/default/accept_ra", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv6/conf/default/accept_dad", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv6/conf/lo/disable_ipv6", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/lo/forwarding", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/lo/accept_ra", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv6/conf/lo/accept_dad", def: 1, max: 2, pair: false },
+];
+const fn netctl_init() -> [[AtomicU32; NETCTL_N]; NS_MAX] {
+    let mut out = [const { [const { AtomicU32::new(0) }; NETCTL_N] }; NS_MAX];
+    let mut i = 0;
+    while i < NS_MAX { let mut k = 0; while k < NETCTL_N { out[i][k] = AtomicU32::new(NETCTL[k].def); k += 1; } i += 1; }
+    // The initial namespace is open to every group, as on common distributions
+    // (systemd sysctl.d); a new namespace starts at the kernel default "1 0".
+    out[0][7] = AtomicU32::new(0); out[0][8] = AtomicU32::new(2147483647);
+    out
+}
+static NETCTL_V: [[AtomicU32; NETCTL_N]; NS_MAX] = netctl_init();
+fn netctl_reset(id: usize) { for k in 0..NETCTL_N { NETCTL_V[id][k].store(NETCTL[k].def, Release); } }
+/// Slot of the file `rel` (path below /proc/sys/net/).
+pub fn netctl_find(rel: &[u8]) -> Option<usize> {
+    NETCTL.iter().position(|c| !c.path.is_empty() && c.path.as_bytes() == rel)
+}
+pub fn netctl_get(ns: NsId, k: usize) -> u32 { NETCTL_V[ns as usize][k].load(Acquire) }
+/// Text of file `k` in netns `ns` (value, or "lo\thi" for pairs), with trailing newline.
+pub fn netctl_text(ns: NsId, k: usize, out: &mut [u8]) -> usize {
+    let mut n = 0;
+    fn num(mut v: u32, out: &mut [u8], n: &mut usize) {
+        let mut d = [0u8; 10]; let mut i = 0;
+        loop { d[i] = b'0' + (v % 10) as u8; i += 1; v /= 10; if v == 0 { break; } }
+        while i > 0 { i -= 1; out[*n] = d[i]; *n += 1; }
+    }
+    num(netctl_get(ns, k), out, &mut n);
+    if NETCTL[k].pair { out[n] = b'\t'; n += 1; num(netctl_get(ns, k + 1), out, &mut n); }
+    out[n] = b'\n';
+    n + 1
+}
+/// Parse and store a write to file `k` of netns `ns`. Negative errno on failure.
+pub fn netctl_set(ns: NsId, k: usize, data: &[u8]) -> isize {
+    let mut v = [0u64; 2]; let mut cnt = 0; let mut i = 0;
+    while i < data.len() {
+        let c = data[i];
+        if c.is_ascii_digit() {
+            if cnt >= 2 { return -22; }
+            let mut x = 0u64;
+            while i < data.len() && data[i].is_ascii_digit() { x = x * 10 + (data[i] - b'0') as u64; if x > u32::MAX as u64 { return -22; } i += 1; }
+            v[cnt] = x; cnt += 1;
+        } else if c == b' ' || c == b'\t' || c == b'\n' || c == b'\0' { i += 1; } else { return -22; }
+    }
+    let want = if NETCTL[k].pair { 2 } else { 1 };
+    if cnt != want { return -22; }
+    for j in 0..want { if v[j] > NETCTL[k + j].max as u64 { return -22; } }
+    if want == 2 && NETCTL[k].path != "ipv4/ping_group_range" && v[0] > v[1] { return -22; }
+    for j in 0..want { NETCTL_V[ns as usize][k + j].store(v[j] as u32, Release); }
+    0
+}
+/// May `pid` (an unprivileged ICMP "ping" socket) be created in its netns?
+pub fn ping_allowed(pid: u32) -> bool {
+    let ns = netns_of(pid);
+    let k = netctl_find(b"ipv4/ping_group_range").unwrap();
+    let (lo, hi) = (netctl_get(ns, k), netctl_get(ns, k + 1));
+    let g = crate::egid_of(pid);
+    if lo <= g && g <= hi { return true; }
+    crate::caps::pid_capable_in(pid, owner_userns(2, ns), 13) // CAP_NET_RAW
+}
+/// May `pid` bind `port` in its netns `ns` (ip_unprivileged_port_start / CAP_NET_BIND_SERVICE)?
+pub fn bind_port_allowed(pid: u32, ns: NsId, port: u16) -> bool {
+    let k = netctl_find(b"ipv4/ip_unprivileged_port_start").unwrap();
+    port as u32 >= netctl_get(ns, k) || crate::caps::pid_capable_in(pid, owner_userns(2, ns), 10)
 }
