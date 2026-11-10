@@ -1600,10 +1600,10 @@ static int pv_errs(int m) {
     if (!(syscall(SYS_pivot_root, "/tmp/pv/r2", "/tmp") == -1 && errno == EINVAL)) { printf("  put_old outside errno=%d\n", errno); return 2; }
     errno = 0;
     if (!(syscall(SYS_pivot_root, "/", "/") == -1 && errno == EBUSY)) { printf("  root errno=%d\n", errno); return 3; }
-    if (mount("", "/", NULL, MS_SHARED, NULL) < 0) return 95;
+    if (mount("", "/tmp/pv/r2", NULL, MS_SHARED, NULL) < 0) return 95;
     errno = 0;
     if (!(syscall(SYS_pivot_root, "/tmp/pv/r2", "/tmp/pv/r2/old") == -1 && errno == EINVAL)) { printf("  shared errno=%d\n", errno); return 4; }
-    if (mount("", "/", NULL, MS_PRIVATE, NULL) < 0) return 96;
+    if (mount("", "/tmp/pv/r2", NULL, MS_PRIVATE, NULL) < 0) return 96;
     /* with a subdirectory as put_old the old root stays reachable there */
     if (chdir("/tmp/pv/r2") < 0) return 97;
     if (syscall(SYS_pivot_root, "/tmp/pv/r2", "/tmp/pv/r2/old") < 0) { printf("  ok pivot errno=%d\n", errno); return 5; }
@@ -1617,10 +1617,10 @@ static int pv_locked_userns(int m) {
     (void)m;
     if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
     mkdir("/tmp/pv", 0755);
-    if (pv_prepare("/tmp/pv/r3") < 0) return 92;
+    if (pv_prepare("/tmp/pvu3") < 0) return 92;
     if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
     wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
-    return pv_crun_seq("/tmp/pv/r3");
+    return pv_crun_seq("/tmp/pvu3");
 }
 static void pivot_suite(void) {
     report("pivot_dotdot", nn_in_child(pv_dotdot, 0));
