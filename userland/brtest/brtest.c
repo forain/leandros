@@ -643,22 +643,22 @@ static void bridge_l2(void) {
     /* bridge_getlink (ports whose peer stays in the host netns, so they outlive the children) */
     CHECK("bridge_getlink: persistent ports vethQ/vethR enslaved at create",
           veth_new_m(s, "vethQ", "vethX", -1, bidx) == 0 && veth_new_m(s, "vethR", "vethY", -1, bidx) == 0);
-    int ia = link_get(s, "vethQ", NULL, NULL), ib = link_get(s, "vethR", NULL, NULL);
+    int qa = link_get(s, "vethQ", NULL, NULL), qb = link_get(s, "vethR", NULL, NULL);
     CHECK("bridge_getlink: br0 INFO_DATA has exact-size AGEING_TIME/FORWARD_DELAY/STP_STATE/VLAN_FILTERING",
           link_info(s, "br0", &bi) > 0 && bi.ageing_sz == 4 && bi.fwd_sz == 4 && bi.stp_sz == 4 && bi.vlan_sz == 1);
     CHECK("bridge_getlink: defaults ageing 30000, fwd_delay 1500, stp 0, vlan_filtering 0",
           bi.ageing == 30000 && bi.fwd == 1500 && bi.stp == 0 && bi.vlan == 0);
     CHECK("bridge_getlink: a non-bridge has no bridge INFO_DATA", link_info(s, "vethQ", &pa) > 0 && !pa.isbr && pa.master == bidx);
     CHECK("bridge_getlink: dump filter lists the two ports", count_master(s, bidx) == 2);
-    CHECK("bridge_getlink: SETLINK IFLA_MASTER=0 releases vethQ", link_set_master(s, ia, 0) == 0 && link_info(s, "vethQ", &pa) > 0 && pa.master == 0);
+    CHECK("bridge_getlink: SETLINK IFLA_MASTER=0 releases vethQ", link_set_master(s, qa, 0) == 0 && link_info(s, "vethQ", &pa) > 0 && pa.master == 0);
     CHECK("bridge_getlink: dump filter now lists one port", count_master(s, bidx) == 1);
-    CHECK("bridge_getlink: SETLINK IFLA_MASTER=br0 re-enslaves vethQ", link_set_master(s, ia, bidx) == 0 && link_info(s, "vethQ", &pa) > 0 && pa.master == bidx);
-    CHECK("bridge_getlink: IFLA_MASTER to a non-bridge is rejected", link_set_master(s, ia, ib) != 0);
+    CHECK("bridge_getlink: SETLINK IFLA_MASTER=br0 re-enslaves vethQ", link_set_master(s, qa, bidx) == 0 && link_info(s, "vethQ", &pa) > 0 && pa.master == bidx);
+    CHECK("bridge_getlink: IFLA_MASTER to a non-bridge is rejected", link_set_master(s, qa, qb) != 0);
     unsigned char m2[6] = { 0x02, 0x00, 0x5e, 0x98, 0x00, 0x09 };
     CHECK("bridge_getlink: SETLINK changes the bridge MAC", link_set_mac(s, bidx, m2) == 0 && link_info(s, "br0", &bi) > 0 && !memcmp(bi.mac, m2, 6));
     /* bridge_teardown */
-    CHECK("bridge_teardown: DELLINK vethQ", link_del(s, ia) == 0 && !link_get(s, "vethQ", NULL, NULL));
-    CHECK("bridge_teardown: DELLINK vethR", link_del(s, ib) == 0 && !link_get(s, "vethR", NULL, NULL));
+    CHECK("bridge_teardown: DELLINK vethQ", link_del(s, qa) == 0 && !link_get(s, "vethQ", NULL, NULL));
+    CHECK("bridge_teardown: DELLINK vethR", link_del(s, qb) == 0 && !link_get(s, "vethR", NULL, NULL));
     CHECK("bridge_teardown: DELLINK br0", link_del(s, bidx) == 0 && !link_get(s, "br0", NULL, NULL));
     CHECK("bridge_teardown: no vifs left", count_veth(s) == 0);
     /* a bridge deleted with a port still attached releases the port */
