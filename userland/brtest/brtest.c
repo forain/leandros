@@ -123,6 +123,11 @@ static int link_get(int s, const char *name, int *peer, int *kindveth) {
     }
     return ifi->ifi_index;
 }
+/* Poll (up to 1 s) until `name` is gone: namespace teardown is lazy. */
+static int wait_gone(int s, const char *name) {
+    for (int w = 0; w < 50; w++) { if (!link_get(s, name, NULL, NULL)) return 1; usleep(20000); }
+    return 0;
+}
 /* Count links named veth* in a full dump. */
 static int count_veth(int s) {
     struct { struct nlmsghdr h; struct rtgenmsg g; } r;
@@ -273,7 +278,7 @@ static void veth_pair(void) {
     close(t);
     CHECK("veth_pair: child served both and exited 0", wait_child(c) == 0);
     /* the child died: its netns and with it vethA are gone */
-    CHECK("veth_pair: reaped with the child netns", link_get(s, "vethA", NULL, NULL) == 0);
+    CHECK("veth_pair: reaped with the child netns", wait_gone(s, "vethA"));
     close(s);
 }
 
