@@ -7,4 +7,5 @@ edition.workspace = true
 leandros-lib = { path = "../lib" }
 mm = { path = "../mm" }
 seccomp-bpf = { path = "../lib/seccomp-bpf" }
+ebpf-cgdev = { path = "../lib/ebpf-cgdev" }
 spin.workspace = true
