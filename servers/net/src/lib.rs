@@ -17,6 +17,7 @@ pub mod tundev;
 pub mod tunbe;
 mod framedev;
 mod l2;
+mod fwd;
 pub mod netwatch;
 
 use iface::{Sid, LO, MAX_STACKS};
@@ -2873,6 +2874,7 @@ impl<'a> smoltcp::phy::Device for NicDevice {
                 }
             }
 
+            if fwd::nic_rx(self.netif.id, &buf[..len]) { return self.receive(_timestamp); }
             let mut data = alloc::vec![0u8; len];
             data.copy_from_slice(&buf[..len]);
             // Weak host: a unicast packet for another interface's address
@@ -3511,6 +3513,14 @@ pub fn net_daemon() -> ! {
                 }
                 rxpolicy::NifAction::Discard => { discard_rx(nif); continue; }
             }
+            for f in fwd::take_txq(nif.id) {
+                if nif.tx_ready() && nif.send(&f) {
+                    iface::STATS[nif.id as usize].tx(f.len());
+                    LAST_TRAFFIC_NS.store(sched::monotonic_ns(), Ordering::Relaxed);
+                } else {
+                    iface::STATS[nif.id as usize].tx_drop.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let mut device = NicDevice::new(nif);
             let ev = {
                 let mut stack = stack_for(sid);
@@ -3621,6 +3631,7 @@ pub fn net_daemon() -> ! {
             }
         }
 
+        fwd::drain_in();
         tunbe::poll_all(timestamp, &mut sigs, &mut wake_keys, &mut readiness_changed, &mut wake_mask, &mut next_poll);
         // Every other netns's loopback stack, polled the same way.
         for sid in vif::all_dyn_sids() {

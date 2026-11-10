@@ -429,3 +429,28 @@ pub fn any_ipv4_address() -> bool {
     let t = IFRT.lock();
     t.iter().take(n).any(|r| r.cfg.is_some())
 }
+
+/// True when `d` is the address of one of the NICs.
+pub(crate) fn is_nic_addr(d: [u8; 4]) -> bool {
+    let n = netdev::count().min(MAX_NETIF);
+    let t = IFRT.lock();
+    (0..n).any(|i| t[i].cfg.map_or(false, |c| c.addr == d))
+}
+
+/// The NIC a forwarded packet to `d` leaves through: (netif, next hop, NIC address).
+/// On-link (longest prefix, lowest metric) first, else the default route. NICs only.
+pub(crate) fn nic_route(d: [u8; 4]) -> Option<(u8, [u8; 4], [u8; 4])> {
+    let n = netdev::count().min(MAX_NETIF);
+    let t = IFRT.lock();
+    let mut best: Option<(u8, u32, usize)> = None;
+    for i in 0..n {
+        let r = &t[i];
+        let Some(c) = r.cfg else { continue };
+        if !r.carrier || !c.on_link(d) { continue; }
+        if best.map_or(true, |(p, m, _)| c.prefix > p || (c.prefix == p && r.metric < m)) { best = Some((c.prefix, r.metric, i)); }
+    }
+    if let Some((_, _, i)) = best { return Some((i as u8, d, t[i].cfg?.addr)); }
+    let i = default_route_locked(&t, n)? as usize;
+    let c = t[i].cfg?;
+    Some((i as u8, c.gateway?, c.addr))
+}

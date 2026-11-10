@@ -1,0 +1,346 @@
+//! Packet-level forwarding from an ns-0 bridge to a NIC (design-podnet3 L3).
+//!
+//! A container behind a bridge sends an IPv4 frame to the bridge MAC with a
+//! destination that is not the bridge's own network. The daemon diverts it
+//! here before the bridge's stack sees it ([`divert`]). It is forwarded only
+//! when the Linux forward gate is open for the ingress bridge
+//! (`sched::ns::forwarding(0, "<bridge>")`, set by `ip_forward=1`). It is then
+//! source-NATed to the egress NIC's address and a reserved port (UDP) or id
+//! (ICMP echo) and queued for the NIC pass ([`take_txq`]). Replies are matched
+//! by the NIC rx hook ([`nic_rx`]), rewritten back and handed to the bridge
+//! switch ([`drain_in`]), addressed to the container MAC recorded in the entry.
+//!
+//! Isolation: the only way out of a container is this path (bridge -> NIC) and
+//! the only way back is a conntrack hit on a flow the container opened. A
+//! frame whose destination is an address of the host itself (any ns-0 address,
+//! loopback, broadcast, multicast) is never forwarded; nothing here ever
+//! delivers into another netns or a host-local socket.
+//!
+//! Locks: `FWD` is a leaf. It is taken under a stack lock (NIC rx hook) and
+//! takes only `VIFS`/`IFRT` leaf locks in the non-hook paths, never both
+//! orders: the hook paths take `FWD` alone.
+#![allow(dead_code)]
+
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use spin::Mutex;
+
+use crate::vifsel::{Sid, VifKind};
+
+const PROTO_ICMP: u8 = 1;
+const PROTO_UDP: u8 = 17;
+const CT_CAP: usize = 1024;
+const ARP_CAP: usize = 64;
+const PEND_FRAMES: usize = 4;
+const NAT_BASE: u16 = 61000;
+const NAT_SPAN: u16 = 4000;
+const UDP_NS: u64 = 30_000_000_000;
+const UDP_REPLIED_NS: u64 = 180_000_000_000;
+const ICMP_NS: u64 = 30_000_000_000;
+const PEND_NS: u64 = 1_000_000_000;
+const ARP_NS: u64 = 300_000_000_000;
+
+struct Ct {
+    proto: u8, nat: u16,
+    cip: [u8; 4], cport: u16, cmac: [u8; 6], br: Sid, bmac: [u8; 6],
+    rip: [u8; 4], rport: u16,
+    nic: u8, nicip: [u8; 4], last: u64, replied: bool,
+}
+struct Arp { nic: u8, ip: [u8; 4], mac: [u8; 6], t: u64 }
+struct Pend { nic: u8, ip: [u8; 4], t: u64, frames: Vec<Vec<u8>> }
+struct St {
+    ct: Vec<Ct>, arp: Vec<Arp>, pend: Vec<Pend>,
+    txq: VecDeque<(u8, Vec<u8>)>, inq: VecDeque<(Sid, Vec<u8>)>,
+    next: u16, swept: u64,
+}
+static FWD: Mutex<St> = Mutex::new(St { ct: Vec::new(), arp: Vec::new(), pend: Vec::new(),
+    txq: VecDeque::new(), inq: VecDeque::new(), next: 0, swept: 0 });
+/// Set at the first forwarded flow: the NIC rx hook costs one load until then.
+static USED: AtomicBool = AtomicBool::new(false);
+static TXQ_N: AtomicUsize = AtomicUsize::new(0);
+static INQ_N: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of live conntrack entries (diagnostics).
+pub(crate) fn ct_len() -> usize { FWD.lock().ct.len() }
+
+/// Drop every entry that belongs to bridge `sid` (the bridge went away).
+pub(crate) fn forget(sid: Sid) {
+    if !USED.load(Ordering::Relaxed) { return; }
+    FWD.lock().ct.retain(|e| e.br != sid);
+}
+
+// ---- checksums ---------------------------------------------------------------
+
+fn sum(d: &[u8], mut acc: u32) -> u32 {
+    let mut i = 0;
+    while i + 1 < d.len() { acc += u16::from_be_bytes([d[i], d[i + 1]]) as u32; i += 2; }
+    if i < d.len() { acc += (d[i] as u32) << 8; }
+    acc
+}
+fn fold(mut a: u32) -> u16 {
+    while a >> 16 != 0 { a = (a & 0xffff) + (a >> 16); }
+    !(a as u16)
+}
+fn ip_csum(f: &mut [u8], ihl: usize) {
+    f[24] = 0; f[25] = 0;
+    let c = fold(sum(&f[14..14 + ihl], 0));
+    f[24..26].copy_from_slice(&c.to_be_bytes());
+}
+fn udp_csum(f: &mut [u8], ihl: usize, ulen: usize) {
+    let o = 14 + ihl;
+    if f[o + 6] == 0 && f[o + 7] == 0 { return; } // sender used no checksum
+    f[o + 6] = 0; f[o + 7] = 0;
+    let mut a = sum(&f[26..34], 0) + PROTO_UDP as u32 + ulen as u32;
+    a = sum(&f[o..o + ulen], a);
+    let mut c = fold(a);
+    if c == 0 { c = 0xffff; }
+    f[o + 6..o + 8].copy_from_slice(&c.to_be_bytes());
+}
+fn icmp_csum(f: &mut [u8], ihl: usize, ilen: usize) {
+    let o = 14 + ihl;
+    f[o + 2] = 0; f[o + 3] = 0;
+    let c = fold(sum(&f[o..o + ilen], 0));
+    f[o + 2..o + 4].copy_from_slice(&c.to_be_bytes());
+}
+
+// ---- parsing -----------------------------------------------------------------
+
+struct Pkt { ihl: usize, proto: u8, src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, l4len: usize }
+
+/// A well-formed unfragmented IPv4 UDP datagram or ICMP echo (request when
+/// `reply` is false, reply when true). The frame is trimmed to the IP length.
+fn parse(f: &mut Vec<u8>, reply: bool) -> Option<Pkt> {
+    if f.len() < 34 || f[12] != 0x08 || f[13] != 0x00 || f[14] >> 4 != 4 { return None; }
+    let ihl = (f[14] & 15) as usize * 4;
+    let tot = u16::from_be_bytes([f[16], f[17]]) as usize;
+    if ihl < 20 || tot < ihl || 14 + tot > f.len() { return None; }
+    if u16::from_be_bytes([f[20], f[21]]) & 0x3fff != 0 { return None; } // fragment
+    f.truncate(14 + tot);
+    let proto = f[23];
+    let l4len = tot - ihl;
+    let o = 14 + ihl;
+    let (sport, dport) = match proto {
+        PROTO_UDP => {
+            if l4len < 8 { return None; }
+            let ul = u16::from_be_bytes([f[o + 4], f[o + 5]]) as usize;
+            if ul < 8 || ul > l4len { return None; }
+            (u16::from_be_bytes([f[o], f[o + 1]]), u16::from_be_bytes([f[o + 2], f[o + 3]]))
+        }
+        PROTO_ICMP => {
+            if l4len < 8 || f[o] != if reply { 0 } else { 8 } || f[o + 1] != 0 { return None; }
+            let id = u16::from_be_bytes([f[o + 4], f[o + 5]]);
+            (id, id)
+        }
+        _ => return None,
+    };
+    Some(Pkt { ihl, proto, src: [f[26], f[27], f[28], f[29]], dst: [f[30], f[31], f[32], f[33]], sport, dport, l4len })
+}
+
+fn finish(f: &mut [u8], p: &Pkt) {
+    ip_csum(f, p.ihl);
+    match p.proto {
+        PROTO_UDP => { let ul = u16::from_be_bytes([f[14 + p.ihl + 4], f[14 + p.ihl + 5]]) as usize; udp_csum(f, p.ihl, ul) }
+        _ => icmp_csum(f, p.ihl, p.l4len),
+    }
+}
+
+// ---- policy helpers ------------------------------------------------------------
+
+fn mask(p: u8) -> u32 { if p == 0 { 0 } else { u32::MAX << (32 - p.min(32) as u32) } }
+
+/// True when `d` is an address of this host (netns 0): never forwarded.
+fn host_local(d: [u8; 4]) -> bool {
+    if d[0] == 127 || d[0] >= 224 || d == [0; 4] { return true; }
+    if crate::iface::is_nic_addr(d) { return true; }
+    let v = crate::vif::VIFS.lock();
+    v.iter().flatten().any(|x| x.netns == 0 && x.addrs.iter().any(|&(a, p)| a == d
+        || (p < 31 && u32::from_be_bytes(a) | !mask(p) == u32::from_be_bytes(d))))
+}
+
+/// Bridge `br`'s rx queue, before its stack runs: forward what is not for the
+/// bridge's own network, leave the rest.
+pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>) -> VecDeque<Vec<u8>> {
+    // Cheap pre-check: any unicast IPv4 frame to the bridge MAC at all?
+    let info = {
+        let v = crate::vif::VIFS.lock();
+        v[br as usize].as_ref().filter(|b| b.kind == VifKind::Bridge && b.netns == 0)
+            .map(|b| (b.mac, b.name, b.addrs.clone()))
+    };
+    let Some((bmac, name, addrs)) = info else { return rx };
+    let n = name.iter().position(|&c| c == 0).unwrap_or(16);
+    let on = sched::ns::forwarding(0, &name[..n]);
+    if !on { return rx; }
+    let mut keep = VecDeque::with_capacity(rx.len());
+    for mut f in rx {
+        if f.len() < 34 || f[0..6] != bmac || f[12] != 0x08 || f[13] != 0 {
+            keep.push_back(f);
+            continue;
+        }
+        let dst = [f[30], f[31], f[32], f[33]];
+        let src = [f[26], f[27], f[28], f[29]];
+        // The bridge's own network (and its broadcast) stays with the stack.
+        if addrs.iter().any(|&(a, p)| u32::from_be_bytes(a) & mask(p) == u32::from_be_bytes(dst) & mask(p)) {
+            keep.push_back(f);
+            continue;
+        }
+        // Anti-spoof: the source must belong to the bridge's network, and not be the bridge itself.
+        let srcok = addrs.iter().any(|&(a, p)| a != src && u32::from_be_bytes(a) & mask(p) == u32::from_be_bytes(src) & mask(p));
+        if !srcok || host_local(dst) { continue; }
+        let Some(p) = parse(&mut f, false) else { continue };
+        ingress(br, bmac, f, p);
+    }
+    keep
+}
+
+fn ingress(br: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
+    if f[22] <= 1 { return; } // TTL exhausted
+    let Some((nic, nh, nicip)) = crate::iface::nic_route(p.dst) else { return };
+    let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { return };
+    let now = sched::monotonic_ns();
+    let mut st = FWD.lock();
+    USED.store(true, Ordering::Relaxed);
+    sweep(&mut st, now);
+    let cmac: [u8; 6] = f[6..12].try_into().unwrap();
+    let nat = match st.ct.iter_mut().find(|e| e.proto == p.proto && e.br == br && e.cip == p.src && e.cport == p.sport
+        && e.rip == p.dst && e.rport == if p.proto == PROTO_ICMP { 0 } else { p.dport }) {
+        Some(e) => { e.last = now; e.cmac = cmac; e.nat }
+        None => {
+            if st.ct.len() >= CT_CAP { return; }
+            let mut pick = None;
+            for _ in 0..NAT_SPAN {
+                let c = NAT_BASE + st.next % NAT_SPAN;
+                st.next = st.next.wrapping_add(1);
+                if !st.ct.iter().any(|e| e.nat == c && e.proto == p.proto) { pick = Some(c); break; }
+            }
+            let Some(nat) = pick else { return };
+            st.ct.push(Ct { proto: p.proto, nat, cip: p.src, cport: p.sport, cmac, br, bmac, rip: p.dst,
+                rport: if p.proto == PROTO_ICMP { 0 } else { p.dport }, nic, nicip, last: now, replied: false });
+            nat
+        }
+    };
+    // Rewrite: TTL, source address, source port / echo id.
+    f[22] -= 1;
+    f[26..30].copy_from_slice(&nicip);
+    let o = 14 + p.ihl;
+    if p.proto == PROTO_UDP { f[o..o + 2].copy_from_slice(&nat.to_be_bytes()); }
+    else { f[o + 4..o + 6].copy_from_slice(&nat.to_be_bytes()); }
+    finish(&mut f, &p);
+    f[6..12].copy_from_slice(&nicmac);
+    match st.arp.iter().find(|a| a.nic == nic && a.ip == nh && now.saturating_sub(a.t) < ARP_NS).map(|a| a.mac) {
+        Some(m) => { f[0..6].copy_from_slice(&m); push_tx(&mut st, nic, f); }
+        None => {
+            let first = match st.pend.iter_mut().find(|q| q.nic == nic && q.ip == nh) {
+                Some(q) => { if q.frames.len() < PEND_FRAMES { q.frames.push(f); } false }
+                None => { st.pend.push(Pend { nic, ip: nh, t: now, frames: alloc::vec![f] }); true }
+            };
+            if first { push_tx(&mut st, nic, arp_request(nicmac, nicip, nh)); }
+        }
+    }
+    drop(st);
+    drivers::netdev::kick();
+}
+
+fn push_tx(st: &mut St, nic: u8, f: Vec<u8>) {
+    if st.txq.len() >= 256 { return; }
+    st.txq.push_back((nic, f));
+    TXQ_N.fetch_add(1, Ordering::Relaxed);
+}
+
+fn arp_request(mac: [u8; 6], ip: [u8; 4], target: [u8; 4]) -> Vec<u8> {
+    let mut r = alloc::vec![0u8; 42];
+    r[0..6].copy_from_slice(&[0xff; 6]);
+    r[6..12].copy_from_slice(&mac);
+    r[12..14].copy_from_slice(&[0x08, 0x06]);
+    r[14..20].copy_from_slice(&[0, 1, 8, 0, 6, 4]);
+    r[20..22].copy_from_slice(&[0, 1]);
+    r[22..28].copy_from_slice(&mac);
+    r[28..32].copy_from_slice(&ip);
+    r[38..42].copy_from_slice(&target);
+    r
+}
+
+fn sweep(st: &mut St, now: u64) {
+    if now.saturating_sub(st.swept) < 1_000_000_000 { return; }
+    st.swept = now;
+    st.ct.retain(|e| now.saturating_sub(e.last) < match e.proto {
+        PROTO_UDP => if e.replied { UDP_REPLIED_NS } else { UDP_NS },
+        _ => ICMP_NS,
+    });
+    st.pend.retain(|q| now.saturating_sub(q.t) < PEND_NS);
+    st.arp.retain(|a| now.saturating_sub(a.t) < ARP_NS);
+}
+
+// ---- NIC side --------------------------------------------------------------------
+
+/// NIC rx hook, before smoltcp. Learns ARP and un-NATs replies of forwarded
+/// flows. True = the frame was taken and must not reach the NIC's stack.
+pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
+    if !USED.load(Ordering::Relaxed) || buf.len() < 34 { return false; }
+    if buf[12] == 0x08 && buf[13] == 0x06 { arp_learn(nic, buf); return false; }
+    if buf[12] != 0x08 || buf[13] != 0x00 || (buf[23] != PROTO_UDP && buf[23] != PROTO_ICMP) { return false; }
+    let mut st = FWD.lock();
+    if st.ct.is_empty() { return false; }
+    let mut f = buf.to_vec();
+    let Some(p) = parse(&mut f, buf[23] == PROTO_ICMP) else { return false };
+    let now = sched::monotonic_ns();
+    let Some(e) = st.ct.iter_mut().find(|e| e.nic == nic && e.proto == p.proto && e.nicip == p.dst && e.nat == p.dport
+        && e.rip == p.src && (p.proto == PROTO_ICMP || e.rport == p.sport)) else { return false };
+    e.last = now; e.replied = true;
+    let (cip, cport, cmac, bmac, br) = (e.cip, e.cport, e.cmac, e.bmac, e.br);
+    if f[22] <= 1 { return true; }
+    f[22] -= 1;
+    f[30..34].copy_from_slice(&cip);
+    let o = 14 + p.ihl;
+    if p.proto == PROTO_UDP { f[o + 2..o + 4].copy_from_slice(&cport.to_be_bytes()); }
+    else { f[o + 4..o + 6].copy_from_slice(&cport.to_be_bytes()); }
+    finish(&mut f, &p);
+    f[0..6].copy_from_slice(&cmac);
+    f[6..12].copy_from_slice(&bmac);
+    if st.inq.len() < 256 { st.inq.push_back((br, f)); INQ_N.fetch_add(1, Ordering::Relaxed); }
+    drop(st);
+    drivers::netdev::kick();
+    true
+}
+
+fn arp_learn(nic: u8, b: &[u8]) {
+    if b.len() < 42 || b[14..20] != [0, 1, 8, 0, 6, 4] || (b[21] != 1 && b[21] != 2) { return; }
+    let mac: [u8; 6] = b[22..28].try_into().unwrap();
+    let ip: [u8; 4] = b[28..32].try_into().unwrap();
+    if mac[0] & 1 != 0 || ip == [0; 4] { return; }
+    // Only an on-link neighbour of that NIC is cached.
+    let Some(cfg) = crate::iface::rt(nic).cfg else { return };
+    if !cfg.on_link(ip) { return; }
+    let now = sched::monotonic_ns();
+    let mut st = FWD.lock();
+    if let Some(a) = st.arp.iter_mut().find(|a| a.nic == nic && a.ip == ip) { a.mac = mac; a.t = now; }
+    else {
+        if st.arp.len() >= ARP_CAP { st.arp.remove(0); }
+        st.arp.push(Arp { nic, ip, mac, t: now });
+    }
+    if let Some(i) = st.pend.iter().position(|q| q.nic == nic && q.ip == ip) {
+        let q = st.pend.remove(i);
+        for mut f in q.frames { f[0..6].copy_from_slice(&mac); push_tx(&mut st, nic, f); }
+        drop(st);
+        drivers::netdev::kick();
+    }
+}
+
+/// Frames the forwarder wants on the wire of NIC `nic` (NIC pass).
+pub(crate) fn take_txq(nic: u8) -> Vec<Vec<u8>> {
+    if TXQ_N.load(Ordering::Relaxed) == 0 { return Vec::new(); }
+    let mut st = FWD.lock();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < st.txq.len() {
+        if st.txq[i].0 == nic { out.push(st.txq.remove(i).unwrap().1); TXQ_N.fetch_sub(1, Ordering::Relaxed); } else { i += 1; }
+    }
+    out
+}
+
+/// Un-NATed replies for the bridge switch (after the NIC pass).
+pub(crate) fn drain_in() {
+    if INQ_N.load(Ordering::Relaxed) == 0 { return; }
+    let q: Vec<(Sid, Vec<u8>)> = { let mut st = FWD.lock(); INQ_N.store(0, Ordering::Relaxed); st.inq.drain(..).collect() };
+    for (br, f) in q { crate::l2::forward(br, br, alloc::vec![f]); }
+}

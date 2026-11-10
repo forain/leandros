@@ -779,6 +779,22 @@ static void fwd_resolver(char *out) {
     }
     fclose(f);
 }
+/* the host's default gateway, from /proc/net/route (10.0.2.2 on QEMU user-net, other on vmnet) */
+static void fwd_gateway(char *out) {
+    strcpy(out, "10.0.2.2");
+    FILE *f = fopen("/proc/net/route", "r");
+    if (!f) return;
+    char l[256];
+    while (fgets(l, sizeof l, f)) {
+        char ifn[32]; unsigned dst, gw, fl;
+        if (sscanf(l, "%31s %x %x %x", ifn, &dst, &gw, &fl) == 4 && dst == 0 && (fl & 2)) {
+            struct in_addr a = { .s_addr = gw };
+            inet_ntop(AF_INET, &a, out, 16);
+            break;
+        }
+    }
+    fclose(f);
+}
 static int dns_query(const char *srv) {
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     struct timeval tv = { 4, 0 };
@@ -809,7 +825,7 @@ static int fwd_body(void) {
     if (rd_to(ctl[0], &ch) != 1) return 3;
     int ok;
     if (g_fwd_mode == 0) { char srv[64]; fwd_resolver(srv); ok = dns_query(srv); }
-    else ok = icmp_ping("10.0.2.2");
+    else { char gw[32]; fwd_gateway(gw); ok = icmp_ping(gw); }
     return ok == g_fwd_expect ? 0 : 4 + ok;
 }
 static int ip_forward_set(int on) {
@@ -846,7 +862,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     int rc = wait_child(c);
     printf("%s child exit %d\n", name, rc);
     if (mode == 0 && ipfwd) snprintf(msg, sizeof msg, "%s: UDP DNS query to the resolver is answered through NAT", name);
-    else if (mode == 1 && ipfwd) snprintf(msg, sizeof msg, "%s: ICMP echo to the QEMU gateway is answered through NAT", name);
+    else if (mode == 1 && ipfwd) snprintf(msg, sizeof msg, "%s: ICMP echo to the default gateway is answered through NAT", name);
     else snprintf(msg, sizeof msg, "%s: ip_forward=0 means no reply (nothing forwarded)", name);
     CHECK(msg, rc == 0);
     ip_forward_set(0);
