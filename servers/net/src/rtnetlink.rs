@@ -22,11 +22,31 @@ const NLMSG_DONE: u16 = 3;
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
+const RTM_SETLINK: u16 = 19;
+const RTM_DELLINK: u16 = 17;
+const IFLA_LINK: u16 = 5;
+const IFLA_NET_NS_PID: u16 = 19;
+const IFLA_NET_NS_FD: u16 = 28;
+const IFLA_INFO_DATA: u16 = 2;
+const VETH_INFO_PEER: u16 = 1;
+const RTM_DELADDR: u16 = 21;
+const RTM_DELROUTE: u16 = 25;
+const IFLA_TXQLEN: u16 = 13;
+const IFLA_LINKINFO: u16 = 18;
+const IFLA_MASTER: u16 = 10;
+const IFLA_BR_FORWARD_DELAY: u16 = 1;
+const IFLA_BR_AGEING_TIME: u16 = 4;
+const IFLA_BR_STP_STATE: u16 = 5;
+const IFLA_BR_VLAN_FILTERING: u16 = 7;
+const NLA_F_NESTED: u16 = 0x8000;
+const IFLA_INFO_KIND: u16 = 1;
+const RTA_DST: u16 = 1;
+const NLM_F_REPLACE: u16 = 0x100;
+const NLM_F_CREATE: u16 = 0x400;
 const RTM_GETADDR: u16 = 22;
 const RTM_GETROUTE: u16 = 26;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_GETNEIGH: u16 = 30;
-const RTA_DST: u16 = 1;
 const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
 const RTA_PREFSRC: u16 = 7;
@@ -82,6 +102,16 @@ pub struct Link {
     pub up: bool,
     pub running: bool,
     pub loopback: bool,
+    /// A tun/tap device (IFLA_INFO_KIND "tun").
+    pub tap: bool,
+    /// A veth end (IFLA_INFO_KIND "veth"; also `tap`, i.e. dynamic and writable).
+    pub veth: bool,
+    /// Veth: the other end's ifindex (IFLA_LINK), else 0.
+    pub peer: u32,
+    /// The ifindex of the bridge this link is enslaved to (IFLA_MASTER), else 0.
+    pub master: u32,
+    /// A bridge (IFLA_INFO_KIND "bridge"): (ageing, forward_delay, stp_state, vlan_filtering).
+    pub br: Option<(u32, u32, u32, u8)>,
     /// IPv4 address and prefix length, when configured.
     pub addr: Option<([u8; 4], u8)>,
 }
@@ -161,6 +191,22 @@ fn link_msg(l: &Link, seq: u32, pid: u32) -> Vec<u8> {
     attr(&mut v, IFLA_MTU, &l.mtu.to_ne_bytes());
     // IF_OPER_UNKNOWN for lo, IF_OPER_UP / IF_OPER_DOWN otherwise.
     attr(&mut v, IFLA_OPERSTATE, &[if l.loopback { 0 } else if l.running { 6 } else { 2 }]);
+    attr(&mut v, IFLA_TXQLEN, &1000u32.to_ne_bytes());
+    if l.veth && l.peer != 0 { attr(&mut v, IFLA_LINK, &l.peer.to_ne_bytes()); }
+    if l.master != 0 { attr(&mut v, IFLA_MASTER, &l.master.to_ne_bytes()); }
+    if l.tap {
+        let mut li = Vec::new();
+        attr_str(&mut li, IFLA_INFO_KIND, if l.br.is_some() { "bridge" } else if l.veth { "veth" } else { "tun" });
+        if let Some((ageing, fwd, stp, vlan)) = l.br {
+            let mut d = Vec::new();
+            attr(&mut d, IFLA_BR_FORWARD_DELAY, &fwd.to_ne_bytes());
+            attr(&mut d, IFLA_BR_AGEING_TIME, &ageing.to_ne_bytes());
+            attr(&mut d, IFLA_BR_STP_STATE, &stp.to_ne_bytes());
+            attr(&mut d, IFLA_BR_VLAN_FILTERING, &[vlan]);
+            attr(&mut li, IFLA_INFO_DATA | NLA_F_NESTED, &d);
+        }
+        attr(&mut v, IFLA_LINKINFO, &li);
+    }
     end_msg(&mut v, s);
     v
 }
@@ -272,6 +318,78 @@ pub struct Env<'a> {
     pub routes: &'a [RouteEnt],
     pub route: &'a dyn Fn([u8; 4]) -> Option<RouteHit>,
     pub lo_set: &'a dyn Fn(bool) -> bool,
+    /// Applies a parsed write to an interface of the caller's namespace;
+    /// 0 or a positive errno.
+    pub apply: &'a dyn Fn(RtOp) -> i32,
+    /// The caller holds CAP_NET_ADMIN over the namespace (D7).
+    pub admin: bool,
+}
+
+/// A rtnetlink write, parsed and validated by [`parse_write`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum RtOp {
+    SetLink { index: u32, up: Option<bool>, mtu: Option<u32>, mac: Option<[u8; 6]>, name: Option<String>, master: Option<u32> },
+    AddAddr { index: u32, addr: [u8; 4], prefix: u8, excl: bool },
+    DelAddr { index: u32, addr: [u8; 4], prefix: u8 },
+    /// RTM_NEWLINK kind=veth with VETH_INFO_PEER.
+    NewVeth { name: Option<String>, mtu: Option<u32>, mac: Option<[u8; 6]>, up: bool, master: Option<u32>, peer: VethPeer },
+    /// RTM_NEWLINK kind=bridge.
+    NewBridge { name: Option<String>, mtu: Option<u32>, mac: Option<[u8; 6]>, up: bool, opts: BrOpts },
+    /// RTM_DELLINK of a veth end: removes both ends.
+    DelLink { index: u32 },
+    AddRoute { dst: [u8; 4], prefix: u8, gw: Option<[u8; 4]>, oif: u32, metric: u32, excl: bool, replace: bool },
+    DelRoute { dst: [u8; 4], prefix: u8, gw: Option<[u8; 4]>, oif: u32, metric: Option<u32> },
+}
+
+/// Where a veth peer end goes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PeerNs { Same, Fd(i32), Pid(u32) }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VethPeer { pub name: Option<String>, pub mtu: Option<u32>, pub mac: Option<[u8; 6]>, pub up: bool, pub ns: PeerNs, pub master: Option<u32> }
+
+/// IFLA_BR_* options of a bridge create request.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BrOpts { pub ageing: Option<u32>, pub fwd_delay: Option<u32>, pub stp: Option<u32>, pub vlan: Option<u8> }
+
+fn a4(a: Option<&[u8]>) -> Option<[u8; 4]> {
+    let a = a?;
+    if a.len() == 4 { Some([a[0], a[1], a[2], a[3]]) } else { None }
+}
+
+/// Parse an `RTM_NEWADDR/DELADDR/NEWROUTE/DELROUTE` message into a [`RtOp`].
+/// `Err` is a positive errno.
+pub fn parse_write(msg: &[u8], ty: u16, flags: u16) -> Result<RtOp, i32> {
+    match ty {
+        RTM_NEWADDR | RTM_DELADDR => {
+            if msg.len() < 24 { return Err(22); }
+            if msg[16] != AF_INET { return Err(97); }
+            let addr = a4(find_attr(msg, 8, IFA_LOCAL)).or_else(|| a4(find_attr(msg, 8, IFA_ADDRESS))).ok_or(22)?;
+            let (prefix, index) = (msg[17], rd32(msg, 20));
+            if prefix > 32 { return Err(22); }
+            Ok(if ty == RTM_NEWADDR { RtOp::AddAddr { index, addr, prefix, excl: flags & NLM_F_EXCL != 0 } }
+               else { RtOp::DelAddr { index, addr, prefix } })
+        }
+        _ => {
+            if msg.len() < 28 { return Err(22); }
+            if msg[16] != AF_INET { return Err(97); }
+            let prefix = msg[17];
+            if prefix > 32 { return Err(22); }
+            let table = find_attr(msg, 12, RTA_TABLE).filter(|t| t.len() == 4).map_or(msg[20] as u32, |t| rd32(t, 0));
+            if table != RT_TABLE_MAIN as u32 && table != 0 { return Err(95); }
+            if msg[23] != RTN_UNICAST && ty == RTM_NEWROUTE { return Err(95); }
+            let dst = if prefix == 0 { [0; 4] } else { a4(find_attr(msg, 12, RTA_DST)).ok_or(22)? };
+            let m = mask(prefix);
+            let dst = [dst[0] & m[0], dst[1] & m[1], dst[2] & m[2], dst[3] & m[3]];
+            let gw = a4(find_attr(msg, 12, RTA_GATEWAY));
+            let oif = find_attr(msg, 12, RTA_OIF).filter(|o| o.len() == 4).map_or(0, |o| rd32(o, 0));
+            let prio = find_attr(msg, 12, RTA_PRIORITY).filter(|o| o.len() == 4).map(|o| rd32(o, 0));
+            Ok(if ty == RTM_NEWROUTE {
+                RtOp::AddRoute { dst, prefix, gw, oif, metric: prio.unwrap_or(0),
+                                 excl: flags & NLM_F_EXCL != 0, replace: flags & NLM_F_REPLACE != 0 }
+            } else { RtOp::DelRoute { dst, prefix, gw, oif, metric: prio } })
+        }
+    }
 }
 
 fn route_ent_msg(r: &RouteEnt, seq: u32, pid: u32) -> Vec<u8> {
@@ -294,14 +412,78 @@ fn route_ent_msg(r: &RouteEnt, seq: u32, pid: u32) -> Vec<u8> {
 /// The attribute `ty` of `msg` (an rtnl message whose fixed part is `fixed`
 /// bytes after the 16-byte header).
 fn find_attr(msg: &[u8], fixed: usize, ty: u16) -> Option<&[u8]> {
-    let mut o = 16 + fixed;
-    while o + 4 <= msg.len() {
-        let l = rd16(msg, o) as usize;
-        if l < 4 || o + l > msg.len() { break; }
-        if rd16(msg, o + 2) & 0x3fff == ty { return Some(&msg[o + 4..o + l]); }
+    nla_find(msg.get(16 + fixed..)?, ty)
+}
+
+/// The attribute `ty` in a bare attribute list (a nested attribute's body).
+fn nla_find(b: &[u8], ty: u16) -> Option<&[u8]> {
+    let mut o = 0;
+    while o + 4 <= b.len() {
+        let l = rd16(b, o) as usize;
+        if l < 4 || o + l > b.len() { break; }
+        if rd16(b, o + 2) & 0x3fff == ty { return Some(&b[o + 4..o + l]); }
         o += (l + 3) & !3;
     }
     None
+}
+
+fn nla_name(a: Option<&[u8]>) -> Option<String> {
+    let n = a?;
+    let n = &n[..n.iter().position(|&b| b == 0).unwrap_or(n.len())];
+    core::str::from_utf8(n).ok().map(String::from)
+}
+
+/// The end-specific attributes of a veth request (the main message or the
+/// VETH_INFO_PEER body after its ifinfomsg): (name, mtu, mac, up, ns).
+fn veth_end(b: &[u8], ifi_flags: u32, ifi_change: u32) -> Result<VethPeer, i32> {
+    let mtu = match nla_find(b, IFLA_MTU) { Some(m) if m.len() >= 4 => Some(rd32(m, 0)), Some(_) => return Err(22), None => None };
+    let mac = match nla_find(b, IFLA_ADDRESS) {
+        Some(a) if a.len() == 6 => Some([a[0], a[1], a[2], a[3], a[4], a[5]]), Some(_) => return Err(22), None => None,
+    };
+    let ns = if let Some(f) = nla_find(b, IFLA_NET_NS_FD) {
+        if f.len() < 4 { return Err(22); }
+        PeerNs::Fd(rd32(f, 0) as i32)
+    } else if let Some(p) = nla_find(b, IFLA_NET_NS_PID) {
+        if p.len() < 4 { return Err(22); }
+        PeerNs::Pid(rd32(p, 0))
+    } else { PeerNs::Same };
+    let master = match nla_find(b, IFLA_MASTER) { Some(m) if m.len() >= 4 => Some(rd32(m, 0)), Some(_) => return Err(22), None => None };
+    Ok(VethPeer { name: nla_name(nla_find(b, IFLA_IFNAME)), mtu, mac, up: ifi_change & IFF_UP != 0 && ifi_flags & IFF_UP != 0, ns, master })
+}
+
+/// RTM_NEWLINK with NLM_F_CREATE naming a link kind. `None` = not a create
+/// request for a kind handled here; `Some(errno)` = handled.
+fn create_link(msg: &[u8], flags: u16, env: &Env) -> Option<i32> {
+    if flags & NLM_F_CREATE == 0 { return None; }
+    let li = find_attr(msg, 16, IFLA_LINKINFO)?;
+    let kind = nla_find(li, IFLA_INFO_KIND)?;
+    let is_br = cstr_eq(kind, "bridge");
+    if !cstr_eq(kind, "veth") && !is_br { return None; }
+    let name = nla_name(find_attr(msg, 16, IFLA_IFNAME));
+    if let Some(n) = name.as_ref() { if env.links.iter().any(|l| l.name == *n) { return Some(17); } }
+    let (f, c) = (rd32(msg, 24), rd32(msg, 28));
+    if is_br {
+        let me = match veth_end(&msg[16 + 16..], f, c) { Ok(e) => e, Err(e) => return Some(e) };
+        let mut opts = BrOpts::default();
+        if let Some(d) = nla_find(li, IFLA_INFO_DATA) {
+            let u32a = |t: u16| nla_find(d, t).filter(|a| a.len() == 4).map(|a| rd32(a, 0));
+            opts.ageing = u32a(IFLA_BR_AGEING_TIME);
+            opts.fwd_delay = u32a(IFLA_BR_FORWARD_DELAY);
+            opts.stp = u32a(IFLA_BR_STP_STATE);
+            opts.vlan = nla_find(d, IFLA_BR_VLAN_FILTERING).filter(|a| a.len() == 1).map(|a| a[0]);
+        }
+        return Some((env.apply)(RtOp::NewBridge { name, mtu: me.mtu, mac: me.mac, up: me.up, opts }));
+    }
+    let me = match veth_end(&msg[16 + 16..], f, c) { Ok(e) => e, Err(e) => return Some(e) };
+    // VETH_INFO_PEER: a full ifinfomsg, then the peer's attributes.
+    let Some(data) = nla_find(li, IFLA_INFO_DATA) else { return Some(22) };
+    let peer = match nla_find(data, VETH_INFO_PEER) {
+        Some(p) if p.len() >= 16 => match veth_end(&p[16..], rd32(p, 8), rd32(p, 12)) { Ok(e) => e, Err(e) => return Some(e) },
+        Some(_) => return Some(22),
+        None => VethPeer { name: None, mtu: None, mac: None, up: false, ns: PeerNs::Same, master: None },
+    };
+    if let (Some(a), PeerNs::Same) = (name.as_ref(), peer.ns) { if peer.name.as_ref() == Some(a) { return Some(17); } }
+    Some((env.apply)(RtOp::NewVeth { name, mtu: me.mtu, mac: me.mac, up: me.up, master: me.master, peer }))
 }
 
 fn cstr_eq(a: &[u8], name: &str) -> bool {
@@ -319,10 +501,26 @@ fn target_link<'a>(msg: &[u8], links: &'a [Link]) -> Option<&'a Link> {
 }
 
 /// RTM_NEWLINK change request. 0 = acked, else a positive errno.
-fn new_link(msg: &[u8], env: &Env) -> i32 {
+fn new_link(msg: &[u8], flags_nl: u16, env: &Env) -> i32 {
+    if let Some(e) = create_link(msg, flags_nl, env) { return e; }
     let Some(t) = target_link(msg, env.links) else { return 19 }; // ENODEV
     let flags = rd32(msg, 24);
     let change = rd32(msg, 28);
+    if t.tap {
+        let up = if change & IFF_UP != 0 { Some(flags & IFF_UP != 0) } else { None };
+        let mtu = match find_attr(msg, 16, IFLA_MTU) {
+            Some(m) if m.len() >= 4 => Some(rd32(m, 0)), Some(_) => return 22, None => None,
+        };
+        let mac = match find_attr(msg, 16, IFLA_ADDRESS) {
+            Some(a) if a.len() == 6 => Some([a[0], a[1], a[2], a[3], a[4], a[5]]), Some(_) => return 22, None => None,
+        };
+        let name = find_attr(msg, 16, IFLA_IFNAME).and_then(|n| {
+            let n = &n[..n.iter().position(|&b| b == 0).unwrap_or(n.len())];
+            core::str::from_utf8(n).ok().map(String::from)
+        }).filter(|n| *n != t.name);
+        let master = match find_attr(msg, 16, IFLA_MASTER) { Some(m) if m.len() >= 4 => Some(rd32(m, 0)), Some(_) => return 22, None => None };
+        return (env.apply)(RtOp::SetLink { index: t.index, up, mtu, mac, name, master });
+    }
     if let Some(m) = find_attr(msg, 16, IFLA_MTU) {
         if m.len() < 4 || rd32(m, 0) != t.mtu { return 95; }
     }
@@ -346,6 +544,9 @@ fn new_addr(msg: &[u8], flags: u16, env: &Env) -> i32 {
     if msg.len() < 24 || msg[16] != AF_INET { return 97; } // EAFNOSUPPORT
     let idx = rd32(msg, 20);
     let Some(t) = env.links.iter().find(|l| l.index == idx) else { return 19 };
+    if t.tap {
+        return match parse_write(msg, RTM_NEWADDR, flags) { Ok(op) => (env.apply)(op), Err(e) => e };
+    }
     let a = find_attr(msg, 8, IFA_LOCAL).or_else(|| find_attr(msg, 8, IFA_ADDRESS));
     match (a, t.addr) {
         (Some(a), Some((cur, p))) if a.len() == 4 && a == &cur[..] && msg[17] == p => {
@@ -358,7 +559,7 @@ fn new_addr(msg: &[u8], flags: u16, env: &Env) -> i32 {
 /// [`handle_request`] with a route lookup for non-dump RTM_GETROUTE.
 pub fn handle_request_r(req: &[u8], links: &[Link], pid: u32,
                         route: &dyn Fn([u8; 4]) -> Option<RouteHit>) -> Vec<Vec<u8>> {
-    handle_request_env(req, pid, &Env { links, routes: &[], route, lo_set: &|_| false })
+    handle_request_env(req, pid, &Env { links, routes: &[], route, lo_set: &|_| false, apply: &|_| 95, admin: true })
 }
 
 /// Answer the netlink request(s) in `req` from `env`.
@@ -373,12 +574,16 @@ pub fn handle_request_env(req: &[u8], pid: u32, env: &Env) -> Vec<Vec<u8>> {
         let flags = rd16(req, off + 6);
         let seq = rd32(req, off + 8);
         let msg = &req[off..off + len];
-        let dump = flags & NLM_F_DUMP != 0; // Linux: ROOT or MATCH alone is a dump
+        // Linux: ROOT or MATCH alone is a dump, but only for GET requests (RTM_GET* = 2 mod 4);
+        // on NEW/DEL the same bits are REPLACE/EXCL and must not read as a dump.
+        let dump = flags & NLM_F_DUMP != 0 && ty >= 16 && ty & 3 == 2;
         let fam = if len > 16 { msg[16] } else { AF_UNSPEC };
         let mut ack = flags & NLM_F_ACK != 0 && !dump;
         match ty {
             RTM_GETLINK if dump => {
-                let msgs = links.iter().map(|l| link_msg(l, seq, pid)).collect();
+                // IFLA_MASTER filter: only the links enslaved to that bridge.
+                let filt = if len >= 32 { find_attr(msg, 16, IFLA_MASTER).filter(|m| m.len() >= 4).map(|m| rd32(m, 0)) } else { None };
+                let msgs = links.iter().filter(|l| filt.map_or(true, |m| l.master == m)).map(|l| link_msg(l, seq, pid)).collect();
                 pack(msgs, &mut out);
                 out.push(done_msg(seq, pid));
             }
@@ -412,12 +617,35 @@ pub fn handle_request_env(req: &[u8], pid: u32, env: &Env) -> Vec<Vec<u8>> {
                 None => { out.push(error_msg(101, msg, seq, pid)); ack = false; } // ENETUNREACH
             },
             RTM_GETNEIGH if dump => out.push(done_msg(seq, pid)),
-            RTM_NEWLINK if flags & NLM_F_REQUEST != 0 => {
-                let e = if len < 32 { 22 } else { new_link(msg, env) };
+            RTM_NEWLINK | RTM_SETLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE
+                if flags & NLM_F_REQUEST != 0 && !env.admin => {
+                out.push(error_msg(1, msg, seq, pid)); ack = false; // EPERM
+            }
+            RTM_DELLINK if flags & NLM_F_REQUEST != 0 => {
+                let e = if len < 32 { 22 } else {
+                    match target_link(msg, links) { Some(t) if t.veth || t.br.is_some() => (env.apply)(RtOp::DelLink { index: t.index }), Some(_) => 95, None => 19 }
+                };
+                if e != 0 { out.push(error_msg(e, msg, seq, pid)); ack = false; }
+            }
+            RTM_NEWLINK | RTM_SETLINK if flags & NLM_F_REQUEST != 0 => {
+                let e = if len < 32 { 22 } else { new_link(msg, flags, env) };
                 if e != 0 { out.push(error_msg(e, msg, seq, pid)); ack = false; }
             }
             RTM_NEWADDR if flags & NLM_F_REQUEST != 0 => {
                 let e = new_addr(msg, flags, env);
+                if e != 0 { out.push(error_msg(e, msg, seq, pid)); ack = false; }
+            }
+            RTM_DELADDR if flags & NLM_F_REQUEST != 0 => {
+                let e = match parse_write(msg, ty, flags) {
+                    Ok(op @ RtOp::DelAddr { index, .. }) if links.iter().any(|l| l.index == index && l.tap) => (env.apply)(op),
+                    Ok(RtOp::DelAddr { index, .. }) if !links.iter().any(|l| l.index == index) => 19,
+                    Ok(_) => 95,
+                    Err(e) => e,
+                };
+                if e != 0 { out.push(error_msg(e, msg, seq, pid)); ack = false; }
+            }
+            RTM_NEWROUTE | RTM_DELROUTE if flags & NLM_F_REQUEST != 0 => {
+                let e = match parse_write(msg, ty, flags) { Ok(op) => (env.apply)(op), Err(e) => e };
                 if e != 0 { out.push(error_msg(e, msg, seq, pid)); ack = false; }
             }
             // Control messages (NLMSG_NOOP..DONE) are ignored, as in Linux.
@@ -445,6 +673,7 @@ pub fn sockaddr_nl(pid: u32, groups: u32) -> [u8; 12] {
 pub const SIOCGIFNAME: u32 = 0x8910;
 pub const SIOCGIFCONF: u32 = 0x8912;
 pub const SIOCGIFFLAGS: u32 = 0x8913;
+pub const SIOCSIFFLAGS: u32 = 0x8914;
 pub const SIOCGIFADDR: u32 = 0x8915;
 pub const SIOCGIFBRDADDR: u32 = 0x8919;
 pub const SIOCGIFNETMASK: u32 = 0x891b;
@@ -459,7 +688,7 @@ pub const IFREQ_LEN: usize = 40;
 /// True for the ioctls `ifreq_ioctl` / `ifconf` answer (including the ones
 /// answered EOPNOTSUPP).
 pub fn is_if_ioctl(cmd: u32) -> bool {
-    matches!(cmd, SIOCGIFNAME | SIOCGIFCONF | SIOCGIFFLAGS | SIOCGIFADDR | SIOCGIFBRDADDR
+    matches!(cmd, SIOCGIFNAME | SIOCGIFCONF | SIOCGIFFLAGS | SIOCSIFFLAGS | 0x8916 | 0x891c | 0x8922 | SIOCGIFADDR | SIOCGIFBRDADDR
         | SIOCGIFNETMASK | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFINDEX | SIOCETHTOOL | SIOCGIWRATE)
 }
 
@@ -543,7 +772,7 @@ pub fn ifconf(links: &[Link], cap: usize) -> Vec<u8> {
 #[cfg(not(test))]
 pub fn route_lookup(d: [u8; 4]) -> Option<RouteHit> {
     use smoltcp::wire::{IpAddress, Ipv4Address};
-    let sid = super::iface::route_select(IpAddress::Ipv4(Ipv4Address::from_bytes(&d)))?;
+    let sid = super::iface::route_select(0, IpAddress::Ipv4(Ipv4Address::from_bytes(&d)))?;
     let gw = super::iface::snapshot().into_iter().find(|s| s.id as u32 + 1 == sid as u32)
         .and_then(|s| match (s.addr, s.gateway) {
             (Some((a, p)), Some(g)) if !super::iface::IfCfg { addr: a, prefix: p, gateway: None }.on_link(d) => Some(g),
@@ -562,14 +791,15 @@ pub fn current_links(ns: u16) -> Vec<Link> {
         let up = sched::ns::lo_admin_up(ns);
         v.push(Link {
             index: 1, name: String::from("lo"), mac: [0; 6], mtu: 65536,
-            up, running: up, loopback: true,
+            up, running: up, tap: false, veth: false, peer: 0, master: 0, br: None, loopback: true,
             addr: if up { Some(([127, 0, 0, 1], 8)) } else { None },
         });
+        v.extend(super::tunbe::links(ns));
         return v;
     }
     v.push(Link {
         index: 1, name: String::from("lo"), mac: [0; 6], mtu: 65536,
-        up: true, running: true, loopback: true, addr: Some(([127, 0, 0, 1], 8)),
+        up: true, running: true, tap: false, veth: false, peer: 0, master: 0, br: None, loopback: true, addr: Some(([127, 0, 0, 1], 8)),
     });
     for s in super::iface::snapshot() {
         v.push(Link {
@@ -579,10 +809,11 @@ pub fn current_links(ns: u16) -> Vec<Link> {
             mtu: 1500,
             up: s.admin_up,
             running: s.carrier && s.admin_up,
-            loopback: false,
+            tap: false, veth: false, peer: 0, master: 0, br: None, loopback: false,
             addr: if s.admin_up { s.addr } else { None },
         });
     }
+    v.extend(super::tunbe::links(0));
     v
 }
 
@@ -591,7 +822,7 @@ pub fn current_links(ns: u16) -> Vec<Link> {
 #[cfg(not(test))]
 pub fn current_routes(ns: u16) -> Vec<RouteEnt> {
     let mut v = Vec::new();
-    if ns != 0 { return v; }
+    if ns != 0 { return super::tunbe::routes(ns); }
     for s in super::iface::snapshot() {
         let Some((a, p)) = s.addr else { continue };
         if !s.admin_up { continue; }
@@ -603,6 +834,7 @@ pub fn current_routes(ns: u16) -> Vec<RouteEnt> {
             v.push(RouteEnt { dst: [0; 4], prefix: 0, gw: Some(g), oif, prefsrc: None });
         }
     }
+    v.extend(super::tunbe::routes(0));
     v
 }
 
@@ -613,11 +845,11 @@ mod tests {
     fn links() -> Vec<Link> {
         alloc::vec![
             Link { index: 1, name: "lo".into(), mac: [0; 6], mtu: 65536, up: true, running: true,
-                   loopback: true, addr: Some(([127, 0, 0, 1], 8)) },
+                   tap: false, veth: false, peer: 0, master: 0, br: None, loopback: true, addr: Some(([127, 0, 0, 1], 8)) },
             Link { index: 2, name: "eth0".into(), mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56], mtu: 1500,
-                   up: true, running: true, loopback: false, addr: Some(([10, 0, 2, 15], 24)) },
+                   up: true, running: true, tap: false, veth: false, peer: 0, master: 0, br: None, loopback: false, addr: Some(([10, 0, 2, 15], 24)) },
             Link { index: 3, name: "wifi0".into(), mac: [2; 6], mtu: 1500, up: true, running: false,
-                   loopback: false, addr: None },
+                   tap: false, veth: false, peer: 0, master: 0, br: None, loopback: false, addr: None },
         ]
     }
 
@@ -758,7 +990,7 @@ mod tests {
         let mut ls = Vec::new();
         for i in 0..100 {
             ls.push(Link { index: i + 1, name: alloc::format!("eth{}", i), mac: [1; 6], mtu: 1500,
-                           up: true, running: true, loopback: false, addr: Some(([10, 0, 0, 1], 24)) });
+                           up: true, running: true, tap: false, veth: false, peer: 0, master: 0, br: None, loopback: false, addr: Some(([10, 0, 0, 1], 24)) });
         }
         let out = handle_request(&req(RTM_GETLINK, 0x301, 1), &ls, 1);
         assert!(out.len() > 2);
@@ -811,7 +1043,7 @@ mod tests {
     }
 
     fn run(req: &[u8], ls: &[Link], routes: &[RouteEnt], lo: bool) -> Vec<(u16, Vec<u8>)> {
-        let env = Env { links: ls, routes, route: &|_| None, lo_set: &|_| lo };
+        let env = Env { links: ls, routes, route: &|_| None, lo_set: &|_| lo, apply: &|_| 95, admin: true };
         split(&handle_request_env(req, 1, &env).concat())
     }
 

@@ -11,6 +11,13 @@ mod procnet;
 pub mod rtnetlink;
 mod nlsock;
 mod iface;
+mod vifsel;
+mod vif;
+pub mod tundev;
+pub mod tunbe;
+mod framedev;
+mod l2;
+mod fwd;
 pub mod netwatch;
 
 use iface::{Sid, LO, MAX_STACKS};
@@ -1391,12 +1398,61 @@ fn report_sock_tables_full() {
 
 // ── Table helpers ─────────────────────────────────────────────────────────────
 
+/// The fd-table key socket `pid` lives under: the VFS table id, so
+/// CLONE_FILES sharers resolve one fd number to one socket (`sched::fdkey`).
+#[inline]
+fn tk(pid: u32) -> u32 {
+    if pid & sched::fdkey::FD_KEY_PRIVATE != 0 { pid } else { vfs::tbl_key(sched::tgid_of(pid)) }
+}
+
+/// Move the socket table `from` to key `to` (the table follows its fd table).
+pub fn rekey_table(from: u32, to: u32) {
+    let mut tbls = SOCK_TABLES.lock();
+    if let Some(t) = tbls.iter_mut().find(|t| t.in_use && t.pid == from) { t.pid = to; }
+}
+
+/// Move the socket at `slot` of table `src` into a free slot of table `dst`
+/// (no refcount change). Returns the new handle. Used after a dup within
+/// `src` to hand the new reference to a split-off table.
+pub fn move_slot(src: u32, slot_fd: usize, dst: u32) -> isize {
+    let Some(slot) = fd_to_slot(slot_fd) else { return -9 };
+    let mut tbls = SOCK_TABLES.lock();
+    let (entry, hidden) = match tbls.iter().find(|t| t.in_use && t.pid == src) {
+        Some(t) if slot < t.socks.len() && t.socks[slot].in_use => (t.socks[slot].clone(), t.is_hidden(slot)),
+        _ => return -9,
+    };
+    let Some(d) = get_or_create(dst, &mut *tbls) else { return -23 };
+    let Some(ns) = d.alloc() else { return -24 };
+    d.socks[ns] = entry; d.set_hidden(ns, hidden);
+    if let Some(t) = tbls.iter_mut().find(|t| t.in_use && t.pid == src) { t.socks[slot] = SockEntry::empty(); }
+    (ns + SOCK_FD_BASE) as isize
+}
+
+fn find_tbl_key<'a>(key: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcSockTable> {
+    tbls.iter_mut().find(|t| t.in_use && t.pid == key)
+}
+
+/// Duplicate socket `fd` inside table `key` (exact key), returning the new fd.
+pub fn dup_in(key: u32, fd: usize, cloexec: bool) -> isize {
+    let m = handle_dup(key, fd, cloexec, false);
+    let b: [u8; 8] = m.data[0..8].try_into().unwrap_or([0u8; 8]);
+    i64::from_le_bytes(b) as isize
+}
+
+/// FD_CLOEXEC of socket `fd` in table `key` (exact key).
+pub fn sock_cloexec(key: u32, fd: usize) -> bool {
+    let Some(slot) = fd_to_slot(fd) else { return false };
+    let tbls = SOCK_TABLES.read();
+    tbls.iter().find(|t| t.in_use && t.pid == key)
+        .map_or(false, |t| slot < t.socks.len() && t.socks[slot].in_use && t.socks[slot].cloexec)
+}
+
 fn find_tbl<'a>(pid: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcSockTable> {
-    tbls.iter_mut().find(|t| t.in_use && t.pid == pid)
+    tbls.iter_mut().find(|t| t.in_use && t.pid == tk(pid))
 }
 
 fn get_or_create<'a>(pid: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcSockTable> {
-    if let Some(pos) = tbls.iter().position(|t| t.in_use && t.pid == pid) {
+    if let Some(pos) = tbls.iter().position(|t| t.in_use && t.pid == tk(pid)) {
         return Some(&mut tbls[pos]);
     }
     if let Some(pos) = tbls.claim() {
@@ -1413,7 +1469,7 @@ fn get_or_create<'a>(pid: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcS
 pub fn open_fds(pid: u32) -> alloc::vec::Vec<usize> {
     let pid = sched::tgid_of(pid);
     let tbls = SOCK_TABLES.read();
-    match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+    match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) => t.socks.iter().enumerate().filter(|(_, e)| e.in_use).map(|(i, _)| i + SOCK_FD_BASE).collect(),
         None => alloc::vec::Vec::new(),
     }
@@ -1425,7 +1481,7 @@ pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
     let pid = sched::tgid_of(pid);
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.read();
-    let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+    let t = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))?;
     if slot < t.socks.len() && t.socks[slot].in_use { Some(t.socks[slot].ofd) } else { None }
 }
 
@@ -1455,14 +1511,14 @@ pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
     let tbls = SOCK_TABLES.read();
     let find = |t: &ProcSockTable| t.socks.iter().position(|e| e.in_use && e.ofd == id)
         .map(|s| (t.pid, s + SOCK_FD_BASE));
-    if let Some(r) = tbls.iter().find(|t| t.in_use && t.pid == pid).and_then(find) { return Some(r); }
-    tbls.iter().filter(|t| t.in_use && t.pid != pid).find_map(find)
+    if let Some(r) = tbls.iter().find(|t| t.in_use && t.pid == tk(pid)).and_then(find) { return Some(r); }
+    tbls.iter().filter(|t| t.in_use && t.pid != tk(pid)).find_map(find)
 }
 
 /// Network namespace captured when the socket at `slot` was created. Takes the
 /// table read lock: never call it with SOCK_TABLES held.
 fn sock_netns(pid: u32, slot: usize) -> u16 {
-    SOCK_TABLES.read().iter().find(|t| t.in_use && t.pid == pid)
+    SOCK_TABLES.read().iter().find(|t| t.in_use && t.pid == tk(pid))
         .and_then(|t| t.socks.get(slot)).filter(|e| e.in_use)
         .map(|e| e.netns()).unwrap_or_else(|| sched::ns::netns_of(pid))
 }
@@ -1540,7 +1596,7 @@ fn inet_shareable(e: &SockEntry) -> bool {
 /// them, with SOCK_TABLES held (it is the `tbls` passed) and no stack lock.
 /// An unshared socket costs one leaf-lock probe.
 fn share_state(tbls: &mut SockTables, pid: u32, slot: usize) {
-    let Some(src) = tbls.iter().find(|t| t.in_use && t.pid == pid)
+    let Some(src) = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
         .and_then(|t| t.socks.get(slot).cloned()) else { return };
     // Only inet states (and an AF_INET socket not bound yet, for
     // SO_REUSEADDR): an AF_UNIX object (a bound address, a connection end) is
@@ -1737,8 +1793,9 @@ fn stack_for(sid: Sid) -> spin::MutexGuard<'static, Option<NetStack>> {
 fn is_loopback_addr(addr: IpAddress) -> bool { iface::is_loopback(addr) }
 
 /// The NIC stack whose interface holds `ip` now. One stack lock at a time.
-fn stack_holding(ip: IpAddress) -> Option<Sid> {
-    iface::nic_sids().find(|&sid| match *stack_for(sid) {
+fn stack_holding(ns: u16, ip: IpAddress) -> Option<Sid> {
+    let nics: alloc::vec::Vec<Sid> = if ns == 0 { iface::nic_sids().collect() } else { alloc::vec::Vec::new() };
+    nics.into_iter().chain(vif::ns_sids_dyn(ns)).find(|&sid| match *stack_for(sid) {
         Some(ref s) => s.interface.ip_addrs().iter().any(|c| c.address() == ip),
         None => false,
     })
@@ -1754,6 +1811,10 @@ fn stack_holding(ip: IpAddress) -> Option<Sid> {
 /// documented order) for the address of a connected socket, and SOCK_OPTS.
 fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, port: u16) -> bool {
     let tcp = me.sock_type == SOCK_STREAM as u8;
+    // A port a NAT flow (fwd.rs) holds on the host's NIC address is taken. FWD is a leaf lock.
+    if me.netns() == 0 && me.domain == AF_INET as u8 && fwd::reserved(tcp, port) {
+        if ip.is_unspecified() || matches!(ip, IpAddress::Ipv4(a) if iface::is_nic_addr(a.0)) { return true; }
+    }
     let my_reuseport = sock_opts(me.ofd).reuseport;
     let my_uid = sched::euid_of(pid);
     for t in tbls.iter().filter(|t| t.in_use) {
@@ -1783,6 +1844,15 @@ fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, por
         }
     }
     false
+}
+
+/// True when a host (netns 0) socket of the given protocol is bound to `port`.
+/// Takes SOCK_TABLES; the caller holds no stack or FWD lock (fwd.rs NAT port pick).
+pub(crate) fn host_port_busy(tcp: bool, port: u16) -> bool {
+    let st = if tcp { SOCK_STREAM as u8 } else { SOCK_DGRAM as u8 };
+    let tbls = SOCK_TABLES.read();
+    tbls.iter().any(|t| t.in_use && t.socks.iter().any(|e| e.in_use && e.bound_port == port
+        && e.domain == AF_INET as u8 && e.sock_type == st && e.netns() == 0))
 }
 
 /// Pick a free local port from Linux's ephemeral range for a `bind()` to port 0
@@ -1951,7 +2021,7 @@ pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<sched::PollTag> {
 fn inet_sock_info(pid: u32, fd: usize) -> Option<(SockState, u8, u16)> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.read();
-    let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+    let tbl = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
     Some((tbl.socks[slot].state, tbl.socks[slot].sock_type, tbl.socks[slot].bound_port))
 }
@@ -2077,7 +2147,7 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
     };
     let entry = {
         let tbls = SOCK_TABLES.read();
-        let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+        let tbl = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))?;
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
         let e = tbl.socks[slot].clone();
         // An inet socket: the in-flight copy is one more holder of its
@@ -2866,6 +2936,7 @@ impl<'a> smoltcp::phy::Device for NicDevice {
                 }
             }
 
+            if fwd::nic_rx(self.netif.id, &buf[..len]) { return self.receive(_timestamp); }
             let mut data = alloc::vec![0u8; len];
             data.copy_from_slice(&buf[..len]);
             // Weak host: a unicast packet for another interface's address
@@ -3200,6 +3271,15 @@ fn init_nic(nif: drivers::netdev::Netif) {
 /// Stand up the loopback stack. Unconditional, unlike the NICs': 127.0.0.1 has
 /// to work on a guest with no network device at all.
 fn init_loopback() {
+    *stack_for(LO) = Some(make_loopback_stack());
+    extern "C" { fn arch_serial_putc(b: u8); }
+    let msg = b"[NET] Loopback interface 127.0.0.1/8 up\r\n";
+    for &b in msg { unsafe { arch_serial_putc(b); } }
+}
+
+/// A fresh loopback stack: 127.0.0.1/8 on a `LoopDev`. netns 0's `LO` and
+/// every other netns's lo (`vif::set_lo`) are built the same way.
+pub(crate) fn make_loopback_stack() -> NetStack {
     let mut device = syngate::LoopDev::new();
     // A locally-administered MAC, distinct from the NIC's. It is never seen off
     // the box; smoltcp needs one only so the interface can answer its own ARP
@@ -3217,7 +3297,7 @@ fn init_loopback() {
     // No default route on purpose: 127.0.0.0/8 is on-link here, and nothing
     // else may ever leave through this interface.
 
-    *stack_for(LO) = Some(NetStack {
+    NetStack {
         interface,
         socket_set: SocketSet::new(alloc::vec![]),
         dhcp_handle: None,
@@ -3226,11 +3306,7 @@ fn init_loopback() {
         icmp_peeked: alloc::collections::BTreeMap::new(),
         listens: alloc::vec::Vec::new(),
         inet_seq: alloc::collections::BTreeMap::new(),
-    });
-
-    extern "C" { fn arch_serial_putc(b: u8); }
-    let msg = b"[NET] Loopback interface 127.0.0.1/8 up\r\n";
-    for &b in msg { unsafe { arch_serial_putc(b); } }
+    }
 }
 
 /// What one stack's DHCP client reported during a pass.
@@ -3443,6 +3519,8 @@ fn poll_stack<D: syngate::Frames>(s: &mut NetStack, dev: &mut D, timestamp: Inst
 }
 
 pub fn net_daemon() -> ! {
+    vif::init();
+    tunbe::init();
     // Readiness snapshots of each stack's sockets taken just before a poll
     // (see `readiness_sigs`), reused across passes.
     let mut sigs: [alloc::vec::Vec<Sig>; MAX_STACKS] = [const { alloc::vec::Vec::new() }; MAX_STACKS];
@@ -3455,6 +3533,7 @@ pub fn net_daemon() -> ! {
     read_net_knobs();
     let (mut prev_tx, mut prev_rx) = (0u64, 0u64);
     loop {
+        vif::daemon_pass();
         // This task runs with IRQs masked between parks: let the tick in on
         // every pass, so a pass that keeps restarting cannot starve the CPU
         // and the wedge scan / watchdog can still run on it (1-CPU boots).
@@ -3495,6 +3574,14 @@ pub fn net_daemon() -> ! {
                     if stack_for(sid).is_none() { discard_rx(nif); continue; }
                 }
                 rxpolicy::NifAction::Discard => { discard_rx(nif); continue; }
+            }
+            for f in fwd::take_txq(nif.id) {
+                if nif.tx_ready() && nif.send(&f) {
+                    iface::STATS[nif.id as usize].tx(f.len());
+                    LAST_TRAFFIC_NS.store(sched::monotonic_ns(), Ordering::Relaxed);
+                } else {
+                    iface::STATS[nif.id as usize].tx_drop.fetch_add(1, Ordering::Relaxed);
+                }
             }
             let mut device = NicDevice::new(nif);
             let ev = {
@@ -3595,6 +3682,25 @@ pub fn net_daemon() -> ! {
                 // stack); the stack lock stays held, so nobody sees it gone.
                 if let Some(mut dev) = s.loopback_dev.take() {
                     let (changed, mask) = poll_stack(s, &mut dev, timestamp, &mut sigs[LO as usize], LO, &mut wake_keys);
+                    s.loopback_dev = Some(dev);
+                    readiness_changed |= changed;
+                    wake_mask |= mask;
+                    reap_orphans(s);
+                    if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
+                        next_poll = Some(next_poll.map_or(d, |n| n.min(d)));
+                    }
+                }
+            }
+        }
+
+        fwd::drain_in();
+        tunbe::poll_all(timestamp, &mut sigs, &mut wake_keys, &mut readiness_changed, &mut wake_mask, &mut next_poll);
+        // Every other netns's loopback stack, polled the same way.
+        for sid in vif::all_dyn_sids() {
+            let mut st = stack_for(sid);
+            if let Some(ref mut s) = *st {
+                if let Some(mut dev) = s.loopback_dev.take() {
+                    let (changed, mask) = poll_stack(s, &mut dev, timestamp, &mut sigs[sid as usize], sid, &mut wake_keys);
                     s.loopback_dev = Some(dev);
                     readiness_changed |= changed;
                     wake_mask |= mask;
@@ -3933,11 +4039,11 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         NET_GETSOCKOPT  => handle_getsockopt(caller_pid, arg(msg,0) as usize,
                                              arg(msg,1) as usize, arg(msg,2) as usize,
                                              arg(msg,3) as usize, arg(msg,4) as usize),
-        NET_CLOSE_ALL   => { if handle_close_all(caller_pid) { drivers::netdev::kick(); } ok_reply() }
+        NET_CLOSE_ALL   => { if handle_close_all(arg(msg,0) as u32) { drivers::netdev::kick(); } ok_reply() }
         NET_CLOSE       => with_state_wake(caller_pid, arg(msg,0) as usize, true, ||
                                handle_close(caller_pid, arg(msg,0) as usize)),
         NET_POLL        => handle_poll(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32),
-        NET_DUP         => handle_dup(caller_pid, arg(msg,0) as usize, arg(msg,1) != 0, arg(msg,2) != 0),
+        NET_DUP         => handle_dup(tk(caller_pid), arg(msg,0) as usize, arg(msg,1) != 0, arg(msg,2) != 0),
         NET_FORK_DUP    => handle_fork_dup(arg(msg,0) as u32, arg(msg,1) as u32),
         NET_EXEC_CLOEXEC => handle_exec_cloexec(arg(msg,0) as u32),
         NET_SETFL       => handle_setfl(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
@@ -3969,6 +4075,10 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
     // which lands on the same ICMP socket below.
     if domain == AF_INET && sock_type & 0xf == SOCK_RAW && !sched::host_root_of(pid) {
         return err_reply(-1);
+    }
+    // net.ipv4.ping_group_range of the caller's netns gates SOCK_DGRAM ICMP.
+    if domain == AF_INET && sock_type & 0xf == SOCK_DGRAM && protocol == IPPROTO_ICMP && !sched::ns::ping_allowed(pid) {
+        return err_reply(-13);
     }
     let mut tbls = SOCK_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) {
@@ -4016,18 +4126,18 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             let explicit_port = port != 0;
             // Ports below 1024 need CAP_NET_BIND_SERVICE (root): Linux's
             // net.ipv4.ip_unprivileged_port_start default, EACCES.
-            if port != 0 && port < 1024 && !sched::host_root_of(pid) { return err_reply(-13); }
+            if port != 0 && !sched::ns::bind_port_allowed(pid, sock_netns(pid, slot), port) { return err_reply(-13); }
             let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
             let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
             // A fresh network namespace has only a DOWN loopback: no address
             // can be bound but the wildcard.
-            if !ip.is_unspecified() && sock_netns(pid, slot) != 0 { return err_reply(-99); }
+            if !ip.is_unspecified() && sock_netns(pid, slot) != 0 && vif::lo_up_sid(sock_netns(pid, slot)).is_none() { return err_reply(-99); }
 
             // An address no interface owns is EADDRNOTAVAIL on Linux. INADDR_ANY
             // and 127.0.0.0/8 always bind; anything else must be an address the
             // NIC currently holds. Without this a bind to a bogus address
             // "succeeded" and then silently never received anything.
-            if !ip.is_unspecified() && !is_loopback_addr(ip) && stack_holding(ip).is_none() {
+            if !ip.is_unspecified() && !is_loopback_addr(ip) && stack_holding(sock_netns(pid, slot), ip).is_none() {
                 return err_reply(-99); // EADDRNOTAVAIL
             }
 
@@ -4039,7 +4149,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             let mut tbls = SOCK_TABLES.lock();
             // The entry (and its SO_REUSEADDR) is read through a shared
             // borrow, before the mutable one below.
-            let me = match tbls.iter().find(|t| t.in_use && t.pid == pid)
+            let me = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
                 .and_then(|t| t.socks.get(slot).cloned()).filter(|e| e.in_use)
             {
                 Some(e) => e,
@@ -4135,7 +4245,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 let server = ip.is_unspecified();
                 // A non-initial netns has only a down loopback: its UDP bind
                 // stays a pure table entry, no host-stack socket (unreachable).
-                if me.netns() == 0 {
+                if me.netns() == 0 || vif::lo_up_sid(me.netns()).is_some() {
                     if let Err(e) = udp_materialize(pid, slot, None, server) { return err_reply(e); }
                 }
             }
@@ -4243,19 +4353,20 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
         // and roam without being touched.
         // Registered first: a stack built after this point (wifi0, once
         // its MAC is known) adopts the listener (`listen::adopt`).
-        if tbl.socks[slot].netns() != 0 {
-            // A non-initial netns has no interface: the listener lives in
-            // its own port space only, no stack socket, unreachable from
-            // the host.
-            let lid = listen::new_lid();
+        let lns = tbl.socks[slot].netns();
+        let lid = listen::new_lid();
+        if lns != 0 {
+            // A non-initial netns: the listener lives on its own lo stack, if
+            // that exists. With lo never brought up it is a table entry only
+            // (port space, nothing reachable), as on Linux.
+            for sid in listen::stacks_for(lns, local) { listen::create(sid, lid, local); }
             tbl.socks[slot].state = SockState::InetListening { lid, local };
             share_state(&mut *tbls, pid, slot);
             return ok_reply();
         }
-        let lid = listen::new_lid();
         listen::register(lid, local);
         let mut any = false;
-        for sid in listen::stacks_for(local) { any |= listen::create(sid, lid, local); }
+        for sid in listen::stacks_for(tbl.socks[slot].netns(), local) { any |= listen::create(sid, lid, local); }
         if !any { listen::destroy_all(lid); return err_reply(-100); } // ENETDOWN
 
         tbl.socks[slot].state = SockState::InetListening { lid, local };
@@ -4322,7 +4433,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
 
     let (state, _bound_port, sock_type, listen_ofd, lnetns) = {
         let tbls = SOCK_TABLES.read();
-        let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+        let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
             Some(t) => t, None => return err_reply(-9),
         };
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
@@ -4334,7 +4445,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
             // The oldest completed connection on any stack: the NICs', then
             // loopback. `listen::accept` holds one stack lock at a time and
             // hands the connection over (its queue no longer names it).
-            let order = iface::nic_sids().chain(core::iter::once(LO));
+            let order = iface::nic_sids().chain(core::iter::once(LO)).chain(vif::all_dyn_sids());
             let Some((from, established)) = order
                 .filter_map(|sid| listen::accept(sid, lid).map(|h| (sid, h)))
                 .next()
@@ -4369,6 +4480,8 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     Some(sn) => sn,
                     None => { drop(tbls); drop_conn(from, established); return err_reply(-24); }
                 };
+                // Linux sk_clone: the child lives in the listener's netns.
+                let lns = tbl.socks[slot].ns.clone();
                 tbl.socks[new_slot] = SockEntry {
                     state: SockState::InetConnected {
                         socket_handle: established, remote_endpoint: None, sid: from },
@@ -4384,7 +4497,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     ofd: vfs::ofd::alloc(),
                     hidden: false,
                     connecting: false,
-                    ns: sched::ns::NsRef::INIT,
+                    ns: lns,
                 };
                 // Linux clones the accepted socket from the listener, so it
                 // inherits TCP_NODELAY and the keepalive settings. The
@@ -4602,13 +4715,30 @@ fn no_route_err() -> i32 { if drivers::netdev::count() == 0 { -100 } else { -101
 
 /// The stack a UDP socket bound to `local` (if bound) and first sending to
 /// `dest` (if known) lives on (see `udp_materialize`).
-fn udp_stack(local: Option<IpAddress>, dest: Option<IpAddress>) -> Result<Sid, i32> {
+fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>) -> Result<Sid, i32> {
+    if ns != 0 {
+        // Loopback stays on the namespace's own lo (down = no route); anything
+        // else leaves over its own tun/tap interfaces only, never a host NIC.
+        if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) {
+            return vif::lo_up_sid(ns).ok_or(-101);
+        }
+        if let Some(a) = local.filter(|a| !a.is_unspecified()) {
+            return stack_holding(ns, a).ok_or(-99);
+        }
+        let d = dest.and_then(|d| if let IpAddress::Ipv4(x) = d { Some(x.0) } else { None });
+        if d.is_none() {
+            // A wildcard bind with no peer yet: the namespace's first interface stack, else its lo.
+            let lo = vif::lo_up_sid(ns);
+            return vif::ns_sids_dyn(ns).into_iter().find(|&s| Some(s) != lo).or(lo).ok_or(-101);
+        }
+        return d.and_then(|d| vif::route_in_ns(ns, d)).ok_or(-101);
+    }
     if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) { return Ok(LO); }
     if let Some(a) = local.filter(|a| !a.is_unspecified()) {
         if let Some(sid) = iface::holder_of(a) { return Ok(sid); }
     }
     match dest {
-        Some(d) => iface::route_select(d).ok_or_else(no_route_err),
+        Some(d) => iface::route_select(ns, d).ok_or_else(no_route_err),
         None => iface::default_sid().ok_or(-100),
     }
 }
@@ -4623,8 +4753,10 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     let ephemeral = alloc_ephemeral_port(&*tbls, &resv[..nresv]);
     let tbl = find_tbl(pid, &mut *tbls).ok_or(-9i32)?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return Err(-9); }
-    // Backstop: a socket of a non-initial netns never gets a host-stack socket.
-    if tbl.socks[slot].netns() != 0 { return Err(-101); }
+    // Backstop: a socket of a non-initial netns only ever lands on its own
+    // lo or tun/tap interfaces (`udp_stack`); with neither it fails here.
+    if tbl.socks[slot].netns() != 0 && vif::lo_up_sid(tbl.socks[slot].netns()).is_none()
+        && !tunbe::has_vifs(tbl.socks[slot].netns()) { return Err(-101); }
     let local_addr = match tbl.socks[slot].state {
         SockState::Unbound { .. } => None,
         SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
@@ -4638,9 +4770,9 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     } else {
         ephemeral.ok_or(-98i32)? // EADDRINUSE: range exhausted
     };
-    let sid = match udp_stack(local_addr, dest) {
+    let sid = match udp_stack(tbl.socks[slot].netns(), local_addr, dest) {
         Ok(s) => s,
-        Err(_) if server => LO,
+        Err(_) if server && tbl.socks[slot].netns() == 0 => LO,
         Err(e) => return Err(e),
     };
     // Multicast and limited broadcast leave through IP_MULTICAST_IF's
@@ -4663,7 +4795,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     };
     tbl.socks[slot].bound_port = port;
     tbl.socks[slot].state = SockState::InetConnected { socket_handle: handle, remote_endpoint: None, sid };
-    if server { udpany::create(tbl.socks[slot].ofd, sid, handle, port); }
+    if server { udpany::create(tbl.socks[slot].netns(), tbl.socks[slot].ofd, sid, handle, port); }
     share_state(&mut *tbls, pid, slot);
     drop(tbls);
     // A poller of the unbound socket (another thread, another holder) now
@@ -4788,12 +4920,13 @@ fn udp_rebind_port(pid: u32, slot: usize) -> Result<(), i32> {
 }
 
 fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Option<&[u8]>) -> Message {
+    if let Some(o) = nlsock::of(pid, fd) { return nlsock::connect(o, addr_ptr, addrlen); }
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     if addrlen < 2 { return err_reply(-22); }
 
     let sa_family = match sched::uaccess::read_user::<u16>(addr_ptr) { Some(f) => f as usize, None => return err_reply(-14) };
     // A fresh network namespace has no routes and a DOWN loopback.
-    if (sa_family == AF_INET || sa_family == 10) && sock_netns(pid, slot) != 0 { return err_reply(-101); }
+    if sa_family == 10 && sock_netns(pid, slot) != 0 { return err_reply(-101); }
 
     // connect(AF_UNSPEC) on an AF_INET socket (it used to fall into the
     // AF_UNIX path below): see `inet_disconnect`.
@@ -4816,7 +4949,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         // same socket set: an established flow stays on its interface.
         let (bound_addr, dgram_ofd) = {
             let tbls = SOCK_TABLES.read();
-            let e = tbls.iter().find(|t| t.in_use && t.pid == pid)
+            let e = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
                 .and_then(|t| t.socks.get(slot).filter(|e| e.in_use).cloned());
             (e.clone().and_then(|e| match e.state {
                 SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
@@ -4830,13 +4963,14 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
             // A port connect(AF_UNSPEC) gave up is replaced first.
             if let Err(e) = udp_rebind_port(pid, slot) { return err_reply(e); }
         }
-        let sid = match bound_addr.filter(|a| !a.is_unspecified() && !is_loopback_addr(*a))
+        let cns = sock_netns(pid, slot);
+        let sid = match bound_addr.filter(|a| cns == 0 && !a.is_unspecified() && !is_loopback_addr(*a))
             .and_then(iface::holder_of)
         {
             Some(sid) if !is_loopback_addr(remote_ip) => sid,
-            _ => match iface::route_select(remote_ip) {
+            _ => match iface::route_select(cns, remote_ip) {
                 Some(sid) => sid,
-                None => return err_reply(no_route_err()),
+                None => return err_reply(if cns != 0 { -101 } else { no_route_err() }),
             },
         };
 
@@ -5167,14 +5301,14 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
     // Shared: a send only reads the table (lane ipcfast: the write lock here
     // serialized every send in the system and stalled all readers).
     let tbls = SOCK_TABLES.read();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) => t, None => return err_reply(-9),
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     // Gate on the SOCKET's own domain and captured netns, never on the user
     // sa_family (which a sibling thread can flip, or which can simply lie).
     // Folded into this read: one table lock per send.
-    if tbl.socks[slot].netns() != 0 {
+    if tbl.socks[slot].netns() != 0 && tbl.socks[slot].domain == 10 {
         let e = &tbl.socks[slot];
         let dom = if matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) { Some(2u8) }
                   else if e.domain == 2 || e.domain == 10 { Some(e.domain) } else { None };
@@ -5266,6 +5400,25 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             // Pre-accept the connector is end A, so its own half-close counts
             // here too (accept preserves conn_idx, so the flag carries over).
             if conn.wr_shut(true) { return err_reply(-32); } // EPIPE
+            // A SOCK_SEQPACKET connector (conmon's attach socket: podman writes
+            // right after connect, before conmon accepts) queues a framed
+            // record, as the connected branch does: raw stream bytes here made
+            // the accepted end read "ping" as a record length and fail EFAULT.
+            if sock_type != SOCK_STREAM as u8 {
+                let sndbuf = unix_sndbuf(ofd);
+                let r = conns[conn_idx].ring_ab.write_dgram(buf_ptr as *const u8, len, sndbuf);
+                return match r {
+                    Ok(Some(n)) => {
+                        let conn = &mut conns[conn_idx];
+                        conn.seq = conn.seq.wrapping_add(1);
+                        drop(conns);
+                        sched::wake_poll_key(unix_rd_key(conn_idx, false));
+                        val_reply(n as u64)
+                    }
+                    Ok(None) => { drop(conns); err_reply(-11) }
+                    Err(e) => err_reply(e),
+                };
+            }
             let n = match unix_stream_write(&mut conns, conn_idx, true, buf_ptr, len) {
                 Ok(n) => n,
                 Err(e) => return err_reply(e), // EFAULT, EPIPE
@@ -5336,7 +5489,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             let mirrors = if sock_type == SOCK_DGRAM as u8 { udpany::of(ofd) } else { None };
             let (sid, socket_handle) = match (&mirrors, dest, mc_sid) {
                 (Some(hs), Some(_), Some(m)) if hs[m as usize].is_some() => (m, hs[m as usize].unwrap()),
-                (Some(hs), Some(ep), _) => udpany::send_via(hs, (sid, socket_handle), ep.addr),
+                (Some(hs), Some(ep), _) => udpany::send_via(sock_netns(pid, slot), hs, (sid, socket_handle), ep.addr),
                 _ => (sid, socket_handle),
             };
             // A UDP socket whose interface can no longer reach `dest` (it lost
@@ -5348,7 +5501,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                     let to = match mc_sid {
                         Some(m) => Some(m).filter(|&m| m != sid),
                         None if sid != LO && !iface::can_route(sid, ep.addr) =>
-                            iface::route_select(ep.addr).filter(|&t| t != sid),
+                            iface::route_select(sock_netns(pid, slot), ep.addr).filter(|&t| t != sid),
                         None => None,
                     };
                     if let Some(to) = to {
@@ -5470,7 +5623,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
 
             // The ping socket lives on the stack its first destination routes
             // through, and stays there.
-            let sid = match iface::route_select(dest_ip) { Some(s) => s, None => return err_reply(no_route_err()) };
+            let sid = match iface::route_select(sock_netns(pid, slot), dest_ip) { Some(s) => s, None => return err_reply(if sock_netns(pid, slot) != 0 { -101 } else { no_route_err() }) };
             let mut stack = stack_for(sid);
             if stack.is_none() { return err_reply(-100); }
             let s = stack.as_mut().unwrap();
@@ -5757,7 +5910,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
     let peek = flags & MSG_PEEK != 0;
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.read();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) => t, None => return err_reply(-9),
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
@@ -5869,6 +6022,22 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return val_reply(0); }
             if conn.rd_shut(true) { return val_reply(0); } // own read half retired
+            if sock_type != SOCK_STREAM as u8 {
+                // Records, not bytes (see the pre-accept send above).
+                let r = if peek { conn.ring_ba.peek_dgram(buf_ptr as *mut u8, len) }
+                        else { conn.ring_ba.read_dgram(buf_ptr as *mut u8, len) };
+                return match r {
+                    Ok(Some((n, full))) => {
+                        if !peek { conn.seq = conn.seq.wrapping_add(1); }
+                        drop(conns);
+                        if !peek { sched::wake_poll_key(unix_wr_key(conn_idx, false)); }
+                        val_reply((if flags & MSG_TRUNC as usize != 0 { full } else { n }) as u64)
+                    }
+                    Ok(None) if !conn.closed_b => err_reply(-11),
+                    Ok(None) => val_reply(0),
+                    Err(e) => err_reply(e),
+                };
+            }
             let n = match conn.ring_ba.read(buf_ptr as *mut u8, len) {
                 Ok(n) => n,
                 Err(e) => return err_reply(e), // EFAULT
@@ -5961,7 +6130,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
 fn unix_dgram_connected(pid: u32, fd: usize) -> bool {
     let Some(slot) = fd_to_slot(fd) else { return false };
     let tbls = SOCK_TABLES.read();
-    tbls.iter().find(|t| t.in_use && t.pid == pid).map_or(false, |t| {
+    tbls.iter().find(|t| t.in_use && t.pid == tk(pid)).map_or(false, |t| {
         slot < t.socks.len() && t.socks[slot].in_use
             && t.socks[slot].sock_type != SOCK_STREAM as u8
             && matches!(t.socks[slot].state, SockState::UnixConnected { .. })
@@ -5979,7 +6148,7 @@ fn unix_conn_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
 fn unix_stream_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.read();
-    let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+    let tbl = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
     if tbl.socks[slot].sock_type != SOCK_STREAM as u8 { return None; }
     match tbl.socks[slot].state {
@@ -6090,11 +6259,14 @@ fn parse_scm_creds(pid: u32, ctrl_ptr: usize, ctrl_len: usize) -> Result<Option<
             // (kuids) before any permission check; an unmapped one is invalid.
             let (Some(uid), Some(gid)) = (sched::ns::to_k(0, sched::ns::current_userns(), vuid), sched::ns::to_k(1, sched::ns::current_userns(), vgid))
                 else { return Err(-22); };
+            // Linux scm_check_creds: CAP_SYS_ADMIN over the user namespace that
+            // owns the sender's PID namespace (not the sender's own userns).
+            let pid_admin = sched::caps::ns_capable_in(sched::ns::owner_userns(1, sched::pidns::pidns_of(pid)), CAP_SYS_ADMIN);
             let kpid = match sched::pidns::from_cur(vpid) {
                 Ok(k) => k,
-                Err(_) => return Err(if sched::caps::ns_capable(CAP_SYS_ADMIN) { -3 } else { -1 }),
+                Err(_) => return Err(if pid_admin { -3 } else { -1 }),
             };
-            if kpid != pid && !sched::caps::ns_capable(CAP_SYS_ADMIN) { return Err(-1); }
+            if kpid != pid && !pid_admin { return Err(-1); }
             if uid != sched::ruid_of(pid) && uid != sched::euid_of(pid) && uid != sched::current_suid()
                 && !sched::caps::ns_capable(CAP_SETUID) { return Err(-1); }
             if gid != sched::rgid_of(pid) && gid != sched::egid_of(pid) && gid != sched::current_sgid()
@@ -6416,7 +6588,7 @@ const MSG_TRUNC: i32 = 0x20;
 fn inet_dgram(pid: u32, fd: usize) -> bool {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return false };
     let tbls = SOCK_TABLES.read();
-    match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+    match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) if slot < t.socks.len() && t.socks[slot].in_use =>
             matches!(t.socks[slot].state, SockState::IcmpUnbound | SockState::IcmpBound { .. })
                 || (t.socks[slot].domain == AF_INET as u8 && t.socks[slot].sock_type == SOCK_DGRAM as u8),
@@ -6935,7 +7107,7 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
     // stack lock is taken (K2 lock order), exactly as handle_recv does.
     let (state, sock_type, ofd) = {
         let tbls = SOCK_TABLES.read();
-        let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+        let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
             Some(t) => t, None => return err_reply(-9),
         };
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
@@ -7060,6 +7232,7 @@ fn put_sockaddr_un(addr_ptr: usize, addrlen_ptr: usize, name: &[u8]) -> bool {
 
 fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Message {
     if addr_ptr == 0 || addrlen_ptr == 0 { return err_reply(-14); }
+    if let Some(o) = nlsock::of(pid, fd) { return nlsock::getpeername(o, addr_ptr, addrlen_ptr); }
     let endpoint = inet_remote_endpoint(pid, fd);
     match endpoint {
         Some(ep) => unsafe { write_sockaddr_in(addr_ptr, addrlen_ptr, ep); },
@@ -7132,7 +7305,7 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         let Some(v) = val else { return err_reply(if optlen < 4 { -22 } else { -14 }) };
         let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
         let tbls = SOCK_TABLES.read();
-        let Some(e) = tbls.iter().find(|t| t.in_use && t.pid == pid)
+        let Some(e) = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
             .and_then(|t| t.socks.get(slot).cloned()).filter(|e| e.in_use) else { return err_reply(-9) };
         drop(tbls);
         let mut o = sock_opts(e.ofd);
@@ -7274,7 +7447,7 @@ pub fn sock_timeo(pid: u32, fd: usize, send: bool) -> u64 {
 fn sock_entry(pid: u32, fd: usize) -> Option<SockEntry> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.read();
-    tbls.iter().find(|t| t.in_use && t.pid == pid)
+    tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
         .and_then(|t| t.socks.get(slot).cloned()).filter(|e| e.in_use)
 }
 
@@ -7473,7 +7646,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         const SO_REUSEADDR: usize = 2;
         let entry = fd_to_slot(fd).and_then(|slot| {
             let tbls = SOCK_TABLES.read();
-            let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+            let t = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))?;
             if slot < t.socks.len() && t.socks[slot].in_use { Some(t.socks[slot].clone()) } else { None }
         });
         let Some(e) = entry else { return err_reply(-9) };
@@ -7608,7 +7781,7 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
     // Work by table index, copying one SockEntry at a time. Snapshotting the
     // whole `socks` array (as `let x = t.socks`) would put a ~24 KB copy
     // (MAX_SOCKS * SockEntry) on the kernel stack at every fork.
-    match tbls.iter().find(|t| t.in_use && t.pid == parent) {
+    match tbls.iter().find(|t| t.in_use && t.pid == tk(parent)) {
         None => return ok_reply(), // parent has no sockets — nothing to do
         // A table whose sockets are all closed: nothing to inherit, so do not
         // claim (and possibly heap-allocate, 32 KiB) a table for the child.
@@ -7620,8 +7793,8 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
     if get_or_create(child, &mut *tbls).is_none() {
         return err_reply(-12);
     }
-    let parent_pos = tbls.iter().position(|t| t.in_use && t.pid == parent).unwrap();
-    let child_pos  = tbls.iter().position(|t| t.in_use && t.pid == child).unwrap();
+    let parent_pos = tbls.iter().position(|t| t.in_use && t.pid == tk(parent)).unwrap();
+    let child_pos  = tbls.iter().position(|t| t.in_use && t.pid == tk(child)).unwrap();
 
     // TEMPORARY: (slot, conn_idx) of each inherited pending connector, printed
     // after both locks are released. `Vec::new` does not allocate, and nothing
@@ -7703,7 +7876,7 @@ fn handle_exec_cloexec(pid: u32) -> Message {
     loop {
         let is_cloexec = {
             let tbls = SOCK_TABLES.read();
-            match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+            match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
                 Some(t) if slot < t.socks.len() => t.socks[slot].in_use && t.socks[slot].cloexec,
                 _ => return ok_reply(),
             }
@@ -7743,7 +7916,7 @@ fn handle_setfl(pid: u32, sockfd: usize, flags: u32) -> Message {
 fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.read();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) { Some(t) => t, None => return err_reply(-9) };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
@@ -7799,7 +7972,7 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
 fn handle_getfl(pid: u32, sockfd: usize) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.read();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) { Some(t) => t, None => return err_reply(-9) };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     val_reply(if tbl.socks[slot].nonblock { 0x800 } else { 0 })
 }
@@ -7825,7 +7998,7 @@ fn handle_getfd(pid: u32, sockfd: usize) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let cloexec = {
         let tbls = SOCK_TABLES.read();
-        match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+        match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
             Some(t) if slot < t.socks.len() && t.socks[slot].in_use => Some(t.socks[slot].cloexec),
             _ => None,
         }
@@ -7847,10 +8020,10 @@ fn handle_getfd(pid: u32, sockfd: usize) -> Message {
 /// fcntl(F_DUPFD/F_DUPFD_CLOEXEC) on a socket fd: allocate a second slot
 /// aliasing the same connection end (tokio/mio clone the fd of one
 /// socketpair end this way for their signal driver).
-fn handle_dup(pid: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
+fn handle_dup(key: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let mut tbls = SOCK_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) {
+    let tbl = match find_tbl_key(key, &mut *tbls) {
         Some(t) => t, None => return err_reply(-9),
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
@@ -7878,7 +8051,7 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
         drop(tbls);
         bound_ref_inc(bound_idx);
         let mut tbls = SOCK_TABLES.lock();
-        let placed = match find_tbl(pid, &mut *tbls) {
+        let placed = match find_tbl_key(key, &mut *tbls) {
             Some(t) => match t.alloc() {
                 Some(s) => { let mut e = entry.clone(); e.cloexec = cloexec; t.socks[s] = e; t.set_hidden(s, hidden); Some(s) }
                 None => None,
@@ -7917,7 +8090,7 @@ pub fn sock_is_hidden(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid);
     let Some(slot) = fd_to_slot(fd) else { return false };
     let tbls = SOCK_TABLES.read();
-    tbls.iter().find(|t| t.in_use && t.pid == pid)
+    tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
         .map_or(false, |t| slot < t.socks.len() && t.socks[slot].in_use && t.is_hidden(slot))
 }
 
@@ -7927,7 +8100,7 @@ pub fn sock_is_hidden(pid: u32, fd: usize) -> bool {
 pub fn open_sock_fds(pid: u32) -> alloc::vec::Vec<usize> {
     let pid = sched::tgid_of(pid);
     let tbls = SOCK_TABLES.read();
-    match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+    match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) => t.socks.iter().enumerate().filter(|(_, e)| e.in_use).map(|(i, _)| SOCK_FD_BASE + i).collect(),
         None => alloc::vec::Vec::new(),
     }
@@ -7937,7 +8110,7 @@ pub fn sock_is_open(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid);
     let Some(slot) = fd_to_slot(fd) else { return false };
     let tbls = SOCK_TABLES.read();
-    tbls.iter().find(|t| t.in_use && t.pid == pid)
+    tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
         .map_or(false, |t| slot < t.socks.len() && t.socks[slot].in_use)
 }
 
@@ -7989,7 +8162,7 @@ fn close_entry(pid: u32, sockfd: usize) -> (Message, Option<Closed>) {
     if sockfd < SOCK_FD_BASE { return (err_reply(-9), None); }
     let slot = sockfd - SOCK_FD_BASE;
     let mut tbls = SOCK_TABLES.lock();
-    let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
+    let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) => t,
         None    => return (err_reply(-9), None),
     };
@@ -8006,7 +8179,7 @@ fn close_entry(pid: u32, sockfd: usize) -> (Message, Option<Closed>) {
             drop(tbls);
             unix_end_release(conn_idx, is_a);
             let mut tbls2 = SOCK_TABLES.lock();
-            if let Some(t2) = tbls2.iter_mut().find(|t| t.in_use && t.pid == pid) {
+            if let Some(t2) = tbls2.iter_mut().find(|t| t.in_use && t.pid == tk(pid)) {
                 t2.socks[slot] = SockEntry::empty();
             }
             drop(tbls2);
@@ -8115,7 +8288,7 @@ fn unix_end_keys(conn_idx: usize, is_a: bool, requested: u32) -> sched::PollTag 
 fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.read();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) => t, None => return err_reply(-9),
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }

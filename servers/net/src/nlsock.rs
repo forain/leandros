@@ -21,6 +21,8 @@ struct NlSock {
     /// Network namespace the socket was created in.
     ns: sched::ns::NsRef,
     groups: u32,
+    /// connect(2) destination (pid, groups); only the kernel (pid 0) is meaningful.
+    peer: Option<(u32, u32)>,
     q: VecDeque<Vec<u8>>,
     /// Bumped on every enqueue: the poll edge sequence.
     gen: u64,
@@ -33,8 +35,22 @@ static NL_EVER: AtomicU32 = AtomicU32::new(0);
 pub fn create(ofd: u32, tgid: u32, netns: u16) {
     let mut m = NL.lock();
     m.retain(|&k, _| vfs::ofd::live(k));
-    m.insert(ofd, NlSock { pid: tgid, ns: sched::ns::NsRef::get(netns), groups: 0, q: VecDeque::new(), gen: 0 });
+    m.insert(ofd, NlSock { pid: tgid, ns: sched::ns::NsRef::get(netns), groups: 0, peer: None, q: VecDeque::new(), gen: 0 });
     NL_EVER.store(1, Ordering::Release);
+}
+
+/// Drop the netlink sockets whose description is gone (every holder closed or
+/// exited). Their namespace reference is the last thing keeping a dead netns
+/// (and its veth ends) alive, so the reaper calls this before it looks for
+/// namespaces that died; `create` alone only pruned on the next new socket.
+pub fn prune() {
+    if NL_EVER.load(Ordering::Acquire) == 0 { return; }
+    let dead: Vec<NlSock> = {
+        let mut m = NL.lock();
+        let ids: Vec<u32> = m.keys().copied().filter(|&k| !vfs::ofd::live(k)).collect();
+        ids.into_iter().filter_map(|k| m.remove(&k)).collect()
+    };
+    drop(dead); // the references drop with no netlink lock held
 }
 
 /// The description of `fd` when it is a netlink socket.
@@ -63,6 +79,25 @@ pub fn bind(ofd: u32, addr_ptr: usize, addrlen: usize) -> Message {
     ok_reply()
 }
 
+pub fn connect(ofd: u32, addr_ptr: usize, addrlen: usize) -> Message {
+    if addrlen < 12 { return err_reply(-22); }
+    let mut sa = [0u8; 12];
+    if !ucopy_in(&mut sa, addr_ptr) { return err_reply(-14); }
+    if u16::from_ne_bytes([sa[0], sa[1]]) as usize != rt::AF_NETLINK { return err_reply(-97); }
+    let pid = u32::from_ne_bytes([sa[4], sa[5], sa[6], sa[7]]);
+    let groups = u32::from_ne_bytes([sa[8], sa[9], sa[10], sa[11]]);
+    if let Some(s) = NL.lock().get_mut(&ofd) { s.peer = Some((pid, groups)); }
+    ok_reply()
+}
+
+pub fn getpeername(ofd: u32, addr_ptr: usize, addrlen_ptr: usize) -> Message {
+    let Some(Some((pid, groups))) = NL.lock().get(&ofd).map(|s| s.peer) else { return err_reply(-107) };
+    let sa = rt::sockaddr_nl(pid, groups);
+    let cap = match sched::uaccess::read_user::<u32>(addrlen_ptr) { Some(c) => c as usize, None => return err_reply(-14) };
+    if !ucopy_out(addr_ptr, &sa[..cap.min(12)]) || !wr_user(addrlen_ptr, 12u32) { return err_reply(-14); }
+    ok_reply()
+}
+
 pub fn getsockname(ofd: u32, addr_ptr: usize, addrlen_ptr: usize) -> Message {
     let (pid, groups) = NL.lock().get(&ofd).map_or((0, 0), |s| (s.pid, s.groups));
     let sa = rt::sockaddr_nl(pid, groups);
@@ -71,14 +106,94 @@ pub fn getsockname(ofd: u32, addr_ptr: usize, addrlen_ptr: usize) -> Message {
     ok_reply()
 }
 
+static NLTRACE: AtomicU8 = AtomicU8::new(0); // 0 unread, 1 off, 2 on
+
+fn nltrace() -> bool {
+    let mut v = NLTRACE.load(Ordering::Relaxed);
+    if v == 0 {
+        v = if drivers::nvidia_probe::cmdline_opt("net.nltrace") == Some(1) { 2 } else { 1 };
+        NLTRACE.store(v, Ordering::Relaxed);
+    }
+    v == 2
+}
+
+fn trace_out(line: &str) {
+    extern "C" { fn arch_serial_putc(c: u8); }
+    for &b in line.as_bytes() { unsafe { arch_serial_putc(b); } }
+    unsafe { arch_serial_putc(b'\n'); }
+}
+
+/// Attribute types at one level of `b` (nested ones as `t{..}` one level deep).
+fn attr_list(b: &[u8], depth: u32) -> alloc::string::String {
+    use alloc::format;
+    let mut o = alloc::string::String::new();
+    let mut p = 0usize;
+    while p + 4 <= b.len() {
+        let l = u16::from_ne_bytes([b[p], b[p + 1]]) as usize;
+        let t = u16::from_ne_bytes([b[p + 2], b[p + 3]]);
+        if l < 4 || p + l > b.len() { break; }
+        let body = &b[p + 4..p + l];
+        if !o.is_empty() { o.push(','); }
+        if t & 0x8000 != 0 && depth == 0 {
+            o.push_str(&format!("{}{{{}}}", t & 0x3fff, attr_list(body, 1)));
+        } else if body.len() >= 1 && body.len() <= 16 && body.iter().take(body.len().saturating_sub(1)).all(|&c| (0x20..0x7f).contains(&c)) && body.last() == Some(&0) {
+            o.push_str(&format!("{}=\"{}\"", t, core::str::from_utf8(&body[..body.len() - 1]).unwrap_or("?")));
+        } else if body.len() == 4 {
+            o.push_str(&format!("{}={}", t, u32::from_ne_bytes([body[0], body[1], body[2], body[3]])));
+        } else {
+            o.push_str(&format!("{}[{}]", t, body.len()));
+        }
+        p += (l + 3) & !3;
+    }
+    o
+}
+
+fn trace_req(data: &[u8], ns: u16, pid: u32) {
+    use alloc::format;
+    let mut off = 0usize;
+    while off + 16 <= data.len() {
+        let len = u32::from_ne_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+        if len < 16 || off + len > data.len() { break; }
+        let ty = u16::from_ne_bytes([data[off + 4], data[off + 5]]);
+        let fl = u16::from_ne_bytes([data[off + 6], data[off + 7]]);
+        let hdr = match ty { 16..=19 => 16, 20 | 21 => 8, 24 | 25 => 12, _ => 0 };
+        let body = &data[off + 16..off + len];
+        let fixed = body.get(..hdr.min(body.len())).unwrap_or(&[]);
+        let attrs = if body.len() > hdr { attr_list(&body[hdr..], 0) } else { alloc::string::String::new() };
+        let mut hx = alloc::string::String::new();
+        for c in fixed { hx.push_str(&format!("{:02x}", c)); }
+        trace_out(&format!("nltrace: ns={} pid={} REQ type={} flags={:#x} len={} fixed={} attrs=[{}]", ns, pid, ty, fl, len, hx, attrs));
+        off += (len + 3) & !3;
+    }
+}
+
+fn trace_rep(replies: &[Vec<u8>], ns: u16) {
+    use alloc::format;
+    for r in replies {
+        if r.len() < 16 { continue; }
+        let ty = u16::from_ne_bytes([r[4], r[5]]);
+        if ty == 2 && r.len() >= 20 {
+            trace_out(&format!("nltrace: ns={} REP ERROR errno={}", ns, i32::from_ne_bytes([r[16], r[17], r[18], r[19]])));
+        } else {
+            trace_out(&format!("nltrace: ns={} REP type={} len={}", ns, ty, r.len()));
+        }
+    }
+}
+
 /// A request arrived: queue the replies and wake pollers. Returns the length.
 pub fn send(ofd: u32, data: &[u8]) -> Message {
     let (pid, ns) = match NL.lock().get(&ofd) { Some(s) => (s.pid, s.ns.id()), None => return err_reply(-9) };
+    crate::vif::daemon_pass(); // reap veth pairs of namespaces that died
     let links = rt::current_links(ns);
     let routes = rt::current_routes(ns);
     let lo_set = |up: bool| { if ns == 0 { false } else { sched::ns::set_lo_admin_up(ns, up); true } };
-    let env = rt::Env { links: &links, routes: &routes, route: &|d| if ns == 0 { rt::route_lookup(d) } else { None }, lo_set: &lo_set };
+    let env = rt::Env { links: &links, routes: &routes, route: &|d| if ns == 0 { rt::route_lookup(d) } else { None }, lo_set: &lo_set,
+        apply: &|op| crate::tunbe::rtnl_apply(ns, op),
+        admin: sched::caps::ns_capable_in(sched::ns::owner_userns(1, ns), 12) };
+    let tr = nltrace();
+    if tr { trace_req(data, ns, pid); }
     let replies = rt::handle_request_env(data, pid, &env);
+    if tr { trace_rep(&replies, ns); }
     if !replies.is_empty() {
         let mut m = NL.lock();
         if let Some(s) = m.get_mut(&ofd) {

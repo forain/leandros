@@ -405,6 +405,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         // ── Step 6: gather parent credentials ────────────────────────────────
         let mut rlimits = crate::task::RLIMIT_DEFAULTS;
         let mut affinity = 0u64;
+        let pmm = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.mm_userns.id()).unwrap_or(0);
         let (caps, puser) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.caps, t.userns.id())).unwrap_or((crate::caps::ROOT_CAPS, 0));
         let (oom_adj, persona) = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| (t.oom_score_adj, t.persona)).unwrap_or((0, 0));
@@ -495,6 +496,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.caps          = caps;
         child.oom_score_adj = oom_adj; child.persona = persona;
         child.userns        = crate::ns::NsRef::get(puser);
+        child.mm_userns     = crate::ns::NsRef::get(pmm);
         child.pidns         = crate::ns::NsRef::get(pidns_target);
         child.pidns_child   = crate::ns::NsRef::get(pidns_target);
         child.netns         = crate::ns::NsRef::get(pnet);
@@ -778,6 +780,7 @@ pub fn clone_thread(
         // ── Collect parent credentials and page table ─────────────────────────
         let mut rlimits = crate::task::RLIMIT_DEFAULTS;
         let mut affinity = 0u64;
+        let pmm = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| t.mm_userns.id()).unwrap_or(0);
         let (caps, puser) = super::RUN_QUEUE.lock().find_pid(parent_pid)
             .map(|t| (t.caps, t.userns.id())).unwrap_or((crate::caps::ROOT_CAPS, 0));
         let (oom_adj, persona) = super::RUN_QUEUE.lock().find_pid(parent_pid).map(|t| (t.oom_score_adj, t.persona)).unwrap_or((0, 0));
@@ -888,6 +891,7 @@ pub fn clone_thread(
         child.caps       = caps;
         child.oom_score_adj = oom_adj; child.persona = persona;
         child.userns     = crate::ns::NsRef::get(puser);
+        child.mm_userns  = crate::ns::NsRef::get(pmm);
         child.pidns      = crate::ns::NsRef::get(pidns_target);
         child.pidns_child = crate::ns::NsRef::get(pidns_target);
         child.netns      = crate::ns::NsRef::get(pnet);

@@ -110,7 +110,7 @@ fn pure_syn(f: &[u8]) -> bool {
     flags & 0x16 == 0x02
 }
 
-pub struct GateRx(alloc::vec::Vec<u8>);
+pub struct GateRx(pub(crate) alloc::vec::Vec<u8>);
 
 impl smoltcp::phy::RxToken for GateRx {
     fn consume<R, F>(mut self, f: F) -> R where F: FnOnce(&mut [u8]) -> R { f(&mut self.0) }

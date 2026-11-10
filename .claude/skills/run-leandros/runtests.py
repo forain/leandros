@@ -43,6 +43,7 @@ Options:
                              vfstag   host:vfstagtest.py alone
                              nettag2  host:nettag2test.py alone
                              kparks   host:kparkstest.py alone
+                             podbridge host:podbridgetest.py alone (root podman default bridge: echo, host/bridge wget, dns, 20x churn, no leaks; implies --cmdline idmap=test)
                              drm      /bin/drmsmoke + /bin/gpuprobe gl (needs --gpu virgl|venus)
                            no commands and no --suite = regress
   --repeat N               boot N times, run the whole list each time
@@ -81,7 +82,7 @@ import driver  # noqa: E402
 
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
-                "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/pthreadtest", "/bin/futextest",
+                "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/memfdtest", "/bin/conmontest", "/bin/pthreadtest", "/bin/futextest",
                 "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest",
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
                 "/bin/f2fstest mmaporphan /root",
@@ -106,7 +107,7 @@ SUITES = {
                 "if [ \"$(uname -m)\" = aarch64 ]; then drmsmoke --arm-v3d && MESA_LOADER_DRIVER_OVERRIDE=v3d kmscube -c 30; __k=$?; drmsmoke --disarm-v3d; test $__k = 0; fi",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/netlinktest", "/bin/udpselftest", "/bin/udptest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/mnttest", "/bin/nstest", "/bin/cgtest", "/bin/ovltest", "/bin/ovlmknodtest", "/bin/idmaptest", "/bin/captest", "/bin/seccomptest", "/bin/preadtest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
+                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/mnttest", "/bin/nstest", "/bin/tuntest", "/bin/brtest", "/bin/cgtest", "/bin/ovltest", "/bin/ovlmknodtest", "/bin/idmaptest", "/bin/captest", "/bin/seccomptest", "/bin/bpftest", "/bin/preadtest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
                 # kexec tool: load + unload only (non-destructive).
                 # A blocking pipe write of >PIPE_BUF delivers every byte (lane pipefix).
                 "/bin/sh -c '[ \"$(dd if=/dev/zero bs=1M count=2 2>/dev/null | wc -c)\" = 2097152 ]'",
@@ -168,6 +169,7 @@ SUITES = {
     # cases resolve example.com, so the host needs internet access.
     "net": ["/bin/nettest"],
     "netlink": ["/bin/netlinktest"],
+    "bridge": ["/bin/brtest"],
     # socket_vmnet head-of-line guard (L5.13): wedges the shared bridge with a
     # client that never reads, checks driver.py's probe sees it and that it
     # heals. Not in regress: while it runs, every vmnet VM on this Mac is deaf.
@@ -190,6 +192,8 @@ SUITES = {
     "nettag2": ["host:nettag2test.py"],
     # Narrow kernel parks: console poll/epoll, empty poll sets, VT_WAITACTIVE.
     "kparks": ["host:kparkstest.py"],
+    # Root podman on the default bridge network (needs LEANDROS_IMAGE_ARCHIVE image + --cmdline idmap=test).
+    "podbridge": ["host:podbridgetest.py"],
     # /proc/<pid>/comm, prctl names and /bin/ps.
     "procps": ["/bin/pstest"],
     # /dev/netctl: permission model, event stream, profiles (runs as root).
@@ -199,6 +203,7 @@ SUITES = {
     "mnt": ["/bin/mnttest"],
     "ovl": ["/bin/ovltest"],
     "ovlmknod": ["/bin/ovlmknodtest"],
+    "bpf": ["/bin/bpftest"],
     "idmap": ["/bin/idmaptest"],
     "cgroup": ["/bin/cgtest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
@@ -294,7 +299,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "usbisochtest.py": 900}
+HOST_TIMEOUTS = {"podbridgetest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "usbisochtest.py": 900}
 
 
 def host_run(c, timeout, arch=None, scale=1.0):
@@ -370,6 +375,8 @@ def main(argv):
             print(f"unknown suite {s!r}; known: {', '.join(SUITES)}")
             return 2
         cmds += SUITES[s]
+    if "podbridge" in suites and cmdline is None:
+        cmdline = "idmap=test"
     if "i915fake" in suites and cmdline is None:
         cmdline = "i915.fake=2 i915.kms=1"
     if "i915crtc2" in suites and cmdline is None:

@@ -734,6 +734,7 @@ mod nr {
     pub const SIGPENDING:     usize = 136;
     pub const GETRANDOM:      usize = 278;
     pub const SECCOMP:        usize = 277;
+    pub const BPF:            usize = 280;
     pub const PRCTL:          usize = 167;
     pub const PERSONALITY:    usize = 92;
     pub const MADVISE:        usize = 233;
@@ -1003,6 +1004,7 @@ mod nr {
     pub const SIGPENDING:     usize = 127;
     pub const GETRANDOM:      usize = 318;
     pub const SECCOMP:        usize = 317;
+    pub const BPF:            usize = 321;
     pub const PRCTL:          usize = 157;
     pub const PERSONALITY:    usize = 135;
     pub const MADVISE:        usize = 28;
@@ -1233,6 +1235,10 @@ pub extern "C" fn syscall_dispatch(
         }
     }
     let ret = dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr);
+    if ret < 0 && ret > -4096 && ret != ERESTARTSYS && ret != ERESTARTNOHAND
+        && ret != ERESTART_RESTARTBLOCK && sched::errtrace_enabled() {
+        errtrace_log(number, ret, a0, a1, a2);
+    }
     if number != RT_SIGRETURN && (ret == ERESTARTSYS || ret == ERESTARTNOHAND) {
         // Never reaches user space: the frame gets EINTR, and the signal
         // pass that runs next rewinds to re-execute the syscall when no
@@ -1249,6 +1255,41 @@ pub extern "C" fn syscall_dispatch(
         return -4;
     }
     ret
+}
+
+/// `sched.errtrace=<comm>`: one line per failing syscall of a matching task.
+#[cold]
+fn errtrace_log(number: usize, ret: isize, a0: usize, a1: usize, a2: usize) {
+    let pid = current_pid();
+    if !sched::errtrace_match(pid) { return; }
+    let _g = TRACE_LOCK.lock();
+    crate::serial_print_str("[ERRTRACE] pid=");
+    crate::serial_print_hex(pid as usize);
+    crate::serial_print_str(" nr=");
+    crate::serial_print_hex(number);
+    crate::serial_print_str(" ret=-");
+    crate::serial_print_hex((-ret) as usize);
+    crate::serial_print_str(" a0=");
+    crate::serial_print_hex(a0);
+    crate::serial_print_str(" a1=");
+    crate::serial_print_hex(a1);
+    crate::serial_print_str(" a2=");
+    crate::serial_print_hex(a2);
+    // Path-like arguments: a printable NUL-terminated string at a pointer arg.
+    for (i, a) in [a0, a1, a2].into_iter().enumerate() {
+        if a < 0x1000 || a >= 0x0000_8000_0000_0000 { continue; }
+        if let Ok(v) = copy_user_str(a, 300) {
+            if v.len() >= 2 && v.iter().filter(|&&c| (0x20..0x7f).contains(&c)).count() * 2 >= v.len() {
+                let v: Vec<u8> = v.iter().map(|&c| if (0x20..0x7f).contains(&c) { c } else { b'.' }).collect();
+                crate::serial_print_str(" s");
+                crate::serial_print_hex(i);
+                crate::serial_print_str("=\"");
+                crate::serial_print_str(core::str::from_utf8(&v).unwrap_or("?"));
+                crate::serial_print_str("\"");
+            }
+        }
+    }
+    crate::serial_print_str("\n");
 }
 
 /// Kernel-internal "interrupted, restartable" return (Linux -ERESTARTSYS):
@@ -2448,6 +2489,7 @@ fn dispatch_inner(
         ALARM        => sys_alarm(a0),
         GETRANDOM    => sys_getrandom(a0, a1, a2),
         SECCOMP      => sys_seccomp(a0, a1, a2),
+        BPF          => crate::bpf::sys_bpf(a0, a1, a2),
         PRCTL        => sys_prctl(a0, a1, a2, a3, a4),
         MADVISE      => sys_madvise(a0, a1, a2),
         MSYNC        => sys_msync(a0, a1, a2),
@@ -2596,7 +2638,10 @@ fn dispatch_inner(
         // New mount API (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
         // mount_setattr): not implemented. Quiet, explicit ENOSYS so callers
         // (crun, runc, libmount) fall back to mount(2).
-        OPEN_TREE | MOVE_MOUNT | FSOPEN | FSCONFIG | FSMOUNT | FSPICK | MOUNT_SETATTR => -38,
+        OPEN_TREE => sys_open_tree(a0, a1, a2),
+        MOVE_MOUNT => sys_move_mount(a0, a1, a2, a3, a4),
+        MOUNT_SETATTR => sys_mount_setattr(a0, a1, a2, a3, a4),
+        FSOPEN | FSCONFIG | FSMOUNT | FSPICK => -38,
 
         _ => log_enosys(number),
     }
@@ -6190,6 +6235,8 @@ fn parse_shebang(buf: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
 /// (ENOSYS: the initrd) falls back to the stat mode bits.
 fn exec_permitted(kp: &KPath, pid: u32) -> isize {
     const X_OK: u64 = 1;
+    // MS_NOEXEC on the file's mount (mount namespaces other than the host's).
+    if kp.mnt_id != 0 && vfs::mnt::flags_of(sched::current_mntns(), kp.mnt_id) & vfs::mnt::MNT_NOEXEC != 0 { return -13; }
     let amsg = make_vfs_msg(vfs::VFS_ACCESS, &[kp.ptr() as u64, X_OK]);
     let ar = vfs_reply_val(&vfs::handle(&amsg, pid));
     // Only a refusal is an answer: a missing file (ENOENT) or a filesystem
@@ -6454,7 +6501,14 @@ fn sys_execveat(dirfd: usize, path_ptr: usize, argv_ptr: usize, envp_ptr: usize,
         const F_GETFD: usize = 1;
         let cloexec = sys_fcntl(fd_handle(dirfd), F_GETFD, 0);
         if cloexec < 0 { return -9; } // EBADF
-        let host = match fd_host_path(dirfd) { Some(h) => h, None => return -9 };
+        // A tmpfs inode (a memfd is nameless; fd_host_path may name its
+        // stale pool path) is exec'd through the VFS' by-identity route.
+        let host = if matches!(vfs::vfs_get_node_kind(current_pid(), dirfd),
+                               Some(vfs::VnodeKind::TmpFile { .. })) {
+            alloc::format!("/proc/self/fd/{}", dirfd).into_bytes()
+        } else {
+            match fd_host_path(dirfd) { Some(h) => h, None => return -9 }
+        };
         let kp = KPath::raw(&host);
         return sys_execve_kp(kp, argv_ptr, envp_ptr, cloexec & 1 != 0);
     }
@@ -6471,8 +6525,29 @@ fn sys_execveat(dirfd: usize, path_ptr: usize, argv_ptr: usize, envp_ptr: usize,
 /// `fd_cloexec`: the file came from a close-on-exec fd (fexecve); a `#!`
 /// script would then name an fd that is closed by the time the interpreter
 /// opens /dev/fd/N, which Linux reports as ENOENT.
-fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: bool) -> isize {
+/// Re-resolve the symlinks of `kp` in its mount namespace (exec reads the file
+/// from the backing path, past the VFS path chokepoint that does this for the
+/// other path syscalls). Namespace 0 and paths without a namespace form pass.
+fn ns_follow_links(kp: KPath) -> Result<KPath, isize> {
+    let mns = sched::current_mntns();
+    if mns == 0 { return Ok(kp); }
+    let nsb = match kp.ns.as_ref() { Some(n) => n.clone(), None => return Ok(kp) };
+    match vfs::ns_resolve_links(mns, &nsb, true) {
+        Ok(Some((nsp, _, _))) if nsp != nsb => KPath::from_ns(nsp),
+        Ok(_) => Ok(kp),
+        Err(e) => Err(e as isize),
+    }
+}
+
+fn sys_execve_kp(kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: bool) -> isize {
+    let mut kpath = match ns_follow_links(kpath) { Ok(k) => k, Err(e) => return e };
     let pid = current_pid();
+    // A memfd image stays the task's /proc/self/exe past the close-on-exec
+    // sweep: pin it now (dropped again on any early return).
+    let mut memfd_ref = match proc_own_fd(kpath.bytes()) {
+        Some((fd, below)) if below.is_empty() => vfs::memfd_exe_take(pid, fd),
+        _ => None,
+    };
 
     // MS_NOEXEC (Linux `path_noexec`): the file named, script or binary.
     if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
@@ -6520,7 +6595,7 @@ fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec:
         next.extend(head_args.into_iter().skip(1));
         head_args = next;
 
-        kpath = match resolve_ns(interp).and_then(KPath::from_ns) {
+        kpath = match resolve_ns(interp).and_then(KPath::from_ns).and_then(ns_follow_links) {
             Ok(k) => k,
             Err(e) => return e,
         };
@@ -7023,12 +7098,41 @@ fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec:
     sched::robust::release_current();
     let pre_tid = current_pid();
     sched::dethread_current_group();
-    // exec unshares: a private table becomes the process table.
+    // exec unshares: an owner whose table CLONE_FILES children share keeps a
+    // private copy (they keep the original); a task on someone else's table
+    // (or a private one shared with other processes) leaves it with a copy.
+    let exec_tgid = sched::current_tgid();
+    let mut exec_copied = false;
+    let mut exec_src = exec_tgid;
+    if sched::fdkey::any() {
+        match sched::fdkey::override_of(pre_tid) {
+            None => {
+                if let Some(n) = fd_detach_sharers(exec_tgid) {
+                    exec_copied = vfs::copy_fd_table(n, exec_tgid, exec_tgid);
+                    if exec_copied { exec_src = n; }
+                }
+            }
+            Some(k) => {
+                let shared = if k & sched::fdkey::FD_KEY_PRIVATE != 0 { sched::fdkey::users(k, exec_tgid) > 1 }
+                             else { k != exec_tgid };
+                if shared && vfs::copy_fd_table(k, exec_tgid, exec_tgid) {
+                    exec_src = k;
+                    let _ = sched::fdkey::drop(pre_tid);
+                    exec_copied = true;
+                }
+            }
+        }
+        if exec_copied { fd_redup_handles(exec_tgid, exec_src, exec_tgid); }
+    }
     if let Some((key, tgid, _)) = sched::fdkey::drop(pre_tid) {
-        for (_, h) in vfs::handle_fds(tgid) { close_handle(pre_tid, h); }
+        let nm = make_vfs_msg(net_server::NET_CLOSE_ALL, &[tgid as u64]);
+        let _ = net_server::handle(&nm, tgid);
+        epoll_close_all(tgid);
         let m = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[tgid as u64]);
         let _ = vfs::handle(&m, tgid);
         vfs::rekey_table(key, tgid);
+        net_server::rekey_table(key, tgid);
+        epoll_rekey(key, tgid);
     }
     sched::robust::release_orphans(sched::current_tgid());
     let pid = current_pid();
@@ -7050,7 +7154,7 @@ fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec:
     let _ = vfs::handle(&cloexec_msg, fd_owner);
     let net_cloexec = make_vfs_msg(net_server::NET_EXEC_CLOEXEC, &[fd_owner as u64]);
     let _ = net_server::handle(&net_cloexec, fd_owner);
-    epoll_exec_cloexec(fd_owner);
+    epoll_exec_cloexec(ep_key(fd_owner));
     // A socket's or an epoll fd's close-on-exec flag lives on its handle,
     // which the sweeps above just closed if it was set; drop the descriptors
     // left naming nothing.
@@ -7064,7 +7168,13 @@ fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec:
     // Record the executable path for /proc/self/exe (tgid-keyed side table);
     // kpath is the resolved absolute path. Must precede replace_address_space,
     // which never returns.
-    sched::set_exe_path(fd_owner, kpath.bytes());
+    if let Some(r) = memfd_ref.take() {
+        let p = r.path();
+        vfs::exe_pin_commit(fd_owner, r);
+        sched::set_exe_path(fd_owner, &p);
+    } else {
+        sched::set_exe_path(fd_owner, kpath.bytes());
+    }
     // Where argv/envp strings sit on the new stack: /proc/<pid>/cmdline and
     // environ read them back from there (see sched::read_proc_args).
     sched::set_arg_area(fd_owner, sched::ArgArea {
@@ -8039,8 +8149,11 @@ fn nice_target(which: usize, who: usize) -> Option<sched::NiceTarget> {
             if who == 0 { current_pid() } else { who })),
         PRIO_PGRP => Some(sched::NiceTarget::Pgrp(
             if who == 0 { sched::current_pgid() } else { who })),
+        // `who` is a uid in the caller's user namespace; the scheduler
+        // compares kuids. Unmapped -> None (EINVAL).
         PRIO_USER => Some(sched::NiceTarget::User(
-            if who == 0 { sched::current_euid() } else { who })),
+            if who == 0 { sched::current_euid() }
+            else { sched::ns::to_k(0, sched::ns::current_userns(), who)? })),
         _ => None,
     }
 }
@@ -8454,12 +8567,50 @@ fn fd_private() -> bool {
     sched::fdkey::any() && sched::fdkey::override_of(current_pid()).is_some()
 }
 
+/// Re-create every descriptor of `tid`'s table as its own handle: a socket or
+/// epoll handle is owned by exactly one descriptor (dup makes a new handle),
+/// so a copied table must not share handle numbers with its source.
+fn fd_redup_handles(tid: u32, src: u32, dst: u32) {
+    for (fd, h) in vfs::handle_fds(tid) {
+        let d = dup_handle_across(src, dst, h);
+        if d >= 0 { let _ = vfs::install_handle_at(tid, fd, d as usize); }
+        else { let m = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]); let _ = vfs::handle(&m, tid); }
+    }
+}
+
+/// The owner of the plain process table `tgid` stops owning it while CLONE_FILES
+/// children still share it: the table moves to a private key those children
+/// now name (and the last of them frees). Returns that key.
+fn fd_detach_sharers(tgid: u32) -> Option<u32> {
+    if !sched::fdkey::any() || !sched::fdkey::has_sharers(tgid) { return None; }
+    let n = sched::fdkey::alloc_key();
+    vfs::rekey_table(tgid, n);
+    net_server::rekey_table(tgid, n);
+    epoll_rekey(tgid, n);
+    if sched::fdkey::rekey_shared(tgid, n) { Some(n) }
+    else { vfs::rekey_table(n, tgid); net_server::rekey_table(n, tgid); epoll_rekey(n, tgid); None }
+}
+
+/// CLONE_FILES for a non-thread child: it names the creator's fd table.
+fn fd_share_with(parent_pid: u32, child_pid: u32) -> bool {
+    let key = vfs::tbl_key(parent_pid);
+    sched::fdkey::share(child_pid, key)
+}
+
 fn fd_unshare_current() -> isize {
-    const F_GETFD: usize = 1;
     let tid = current_pid();
     let tgid = sched::current_tgid();
     let old = vfs::tbl_key(tgid);
-    if sched::fdkey::users(old, tgid) <= 1 { return 0; }
+    // The owner of a table CLONE_FILES children share: they keep the original,
+    // the caller continues on a copy.
+    if old == tgid && sched::fdkey::thread_group_single(tgid) {
+        if let Some(n) = fd_detach_sharers(tgid) {
+            if vfs::copy_fd_table(n, tgid, tgid) { fd_redup_handles(tgid, n, tgid); }
+            return 0;
+        }
+    }
+    let owner = if old & sched::fdkey::FD_KEY_PRIVATE != 0 { tgid } else { old };
+    if sched::fdkey::users(old, owner) <= 1 { return 0; }
     let new = sched::fdkey::alloc_key();
     if !vfs::copy_fd_table(tgid, new, tgid) { return 0; }
     if !sched::fdkey::set(tid, new, tgid) {
@@ -8467,15 +8618,7 @@ fn fd_unshare_current() -> isize {
         let _ = vfs::handle(&m, tid);
         return -12;
     }
-    // A socket or epoll handle is owned by exactly one descriptor (dup makes
-    // a new handle), so the copy must not share handle numbers with the old
-    // table.
-    for (fd, h) in vfs::handle_fds(tid) {
-        let cloexec = sys_fcntl(h, F_GETFD, 0) == 1;
-        let d = dup_handle(tid, h, cloexec);
-        if d >= 0 { let _ = vfs::install_handle_at(tid, fd, d as usize); }
-        else { let m = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]); let _ = vfs::handle(&m, tid); }
-    }
+    fd_redup_handles(tid, old, new);
     0
 }
 
@@ -8498,7 +8641,7 @@ fn sys_unshare(flags: usize) -> isize {
     if flags & CLONE_NEWNS != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     let flat = flags & (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS);
     if flat != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; } // CAP_SYS_ADMIN
-    if flat != 0 && !alone { return -22; }
+    // Linux allows these from a multithreaded caller: the namespace is per thread (Go's LockOSThread + unshare).
     if flags & CLONE_NEWCGROUP != 0 && flags & CLONE_NEWUSER == 0 && !sched::caps::ns_capable(21) { return -1; }
     if flags & CLONE_NEWUSER != 0 {
         // Linux: a chrooted task may not create a user namespace (EPERM).
@@ -8582,7 +8725,7 @@ fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
     // Number-keyed registrations first, while the numbers still name the
     // files being closed (see `epoll_release_fd`); description-keyed ones go
     // with the description's last reference.
-    if !cloexec && !fd_private() { epoll_drop_range(tgid, first, end); }
+    if !cloexec && !fd_private() { epoll_drop_range(ep_cur(), first, end); }
     // One table holds every kind of descriptor (sockets and epoll fds are
     // entries in it), so one listing covers them all.
     let open: alloc::vec::Vec<usize> = vfs::open_fds(tgid).into_iter()
@@ -8822,6 +8965,48 @@ fn lstat_magic_link(ns: &[u8], statbuf_ptr: usize) -> Option<isize> {
 /// O_NOFOLLOW in the VFS (x86_64) open-flag layout.
 const OPEN_O_NOFOLLOW: usize = 0o400000;
 
+/// `/proc/<own>/fd/N` (final component, magic link followed) naming a
+/// descriptor that has no filesystem path (socket, pipe, eventfd, ...): its
+/// VFS handle (see fd_handle).
+/// Linux resolves those to the anonymous inode, so stat describes the object
+/// and chmod/chown succeed without touching a file (conmon chmods its bound
+/// console socket as "/proc/self/fd/N").
+fn proc_own_anon_fd(ns_path: &[u8]) -> Option<usize> {
+    let (fd, below) = proc_own_fd(ns_path)?;
+    let h = fd_handle(fd);
+    if !below.is_empty() || fd_host_path(h).is_some() { return None; }
+    Some(h)
+}
+
+/// `/proc/<own>/fd/N` naming a directory on a non-mounted filesystem (tmpfs
+/// instance, RamFS): the VFS handle. stat/chmod act on the descriptor itself
+/// (fstat / fchmod), so no backing path (the hidden `/.leandros-sb` pool in
+/// particular) is ever resolved and namespace translation cannot be bypassed.
+fn proc_own_tmpfs_dir_fd(ns_path: &[u8]) -> Option<usize> {
+    let (fd, below) = proc_own_fd(ns_path)?;
+    if !below.is_empty() || fd >= net_server::SOCK_FD_BASE { return None; }
+    if matches!(vfs::vfs_get_node_kind(current_pid(), fd), Some(vfs::VnodeKind::MountedFile { .. })) {
+        return None;
+    }
+    let h = fd_handle(fd);
+    // Kernel-internal is-directory query on the backing path; the path is
+    // never handed to anything that resolves it for the user.
+    let host = fd_host_path(h)?;
+    if host.ends_with(b" (deleted)") { return None; }
+    match kpath_is_dir(&KPath::raw(&host)) { Ok(true) => Some(h), _ => None }
+}
+
+/// The host path of fd `fd` when it names a live directory the VFS can
+/// resolve by path; None for anything else (files keep identity reopen).
+fn fd_dir_host_path(fd: usize) -> Option<Vec<u8>> {
+    let host = fd_host_path(fd)?;
+    if host.ends_with(b" (deleted)") { return None; }
+    // The hidden tmpfs pool is never a resolution base for a user path.
+    if vfs::mnt::is_sb_path(&host) { return None; }
+    let kp = KPath::raw(&host);
+    match kpath_is_dir(&kp) { Ok(true) => Some(host), _ => None }
+}
+
 /// Follow a final `/proc/<pid>/{exe,cwd,root}` magic link, as open and stat
 /// do on Linux: `open("/proc/self/exe")` opens the running binary,
 /// `stat("/proc/self/cwd")` the working directory. Anything else (including
@@ -8834,6 +9019,8 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
             if !proc_link_allowed(pid) { return Err(-13); }
             let mut kb: Vec<u8> = alloc::vec![0u8; HOST_PATH_MAX];
             return Ok(match sched::exe_path(sched::tgid_of(pid), &mut kb) {
+                Some(n) if kb[..n].starts_with(b"/memfd:") =>
+                    KPath::raw(alloc::format!("/proc/.memfd-exe/{}", sched::tgid_of(pid)).as_bytes()),
                 Some(n) => KPath::raw(&kb[..n]),
                 None => KPath::raw(b"/bin/init"),
             });
@@ -8865,6 +9052,13 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
                 Some(vfs::VnodeKind::MountedFile { .. }));
             if mounted {
                 if let Some(host) = fd_host_path(fd) { return Ok(KPath::raw(&host)); }
+            } else if let Some(dir) = fd_dir_host_path(fd) {
+                // A directory descriptor on a non-mounted filesystem (tmpfs,
+                // RamFS): stat/chmod/bind below the magic link act on the
+                // directory itself, as on Linux (conmon chmods its
+                // O_PATH attach-socket directory this way). Directories have
+                // no unlinked-identity case worth keeping.
+                return Ok(KPath::raw(&dir));
             } else if !b.starts_with(b"/proc/self/fd/") {
                 // The VFS reopens by identity only under /proc/self/fd: give
                 // it /proc/<own pid>/fd/N (the Claude Code CLI reads its task
@@ -9129,7 +9323,7 @@ fn resolve_scoped(dirfd: usize, raw: &[u8], resolve: u64, follow_final: bool) ->
 /// names (see `sock_alias_args`), so those registrations are keyed by the
 /// hidden number: drop them first, before the number can be reused.
 fn close_sock_alias_target(pid: u32, sock: usize) {
-    if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), sock); }
+    if !fd_private() { epoll_release_fd(pid, ep_cur(), sock); }
     let msg = make_vfs_msg(net_server::NET_CLOSE, &[sock as u64]);
     let _ = net_server::handle(&msg, pid);
 }
@@ -9146,7 +9340,7 @@ fn sys_close(fd: usize) -> isize {
     // the number is closed (`vfs::close_console`): a write, fstat or second
     // close is EBADF, and the next open may reuse it, as on Linux.
     if fd <= 2 && !vfs::fd_redirected(pid, fd) {
-        if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), fd); }
+        if !fd_private() { epoll_release_fd(pid, ep_cur(), fd); }
         vfs::close_console(pid, fd);
         return 0;
     }
@@ -9160,7 +9354,7 @@ fn sys_close(fd: usize) -> isize {
         // register that — a forget after the close would then delete the
         // newcomer's registration (measured: a notify/mio waker lost that way
         // hung cosmic-term's exit in tokio's blocking-pool shutdown).
-        if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), fd); }
+        if !fd_private() { epoll_release_fd(pid, ep_cur(), fd); }
     }
     let msg = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
@@ -9264,6 +9458,53 @@ fn may_mount() -> bool {
     sched::caps::ns_capable_in(sched::ns::owner_user(mntns), 21)
 }
 
+/// The namespace path a mount(2) propagation target names. A target that is
+/// exactly `/proc/self/fd/N` (or `/proc/<own pid>/fd/N`) follows the magic
+/// link, as on Linux: it is the directory the descriptor was opened on, in the
+/// caller's mount namespace (crun's make-private parent walk opens the rootfs
+/// O_PATH and mounts on the link). The VFS answers with the backing path, so
+/// it is mapped back through the caller's tree; a backing path with no name in
+/// the namespace (the hidden superblock space) never leaks out: EINVAL.
+fn resolve_mount_target(target_ptr: usize) -> Result<Vec<u8>, isize> {
+    let p = resolve_user_path(target_ptr)?;
+    if let Some((fd, b"")) = proc_own_fd(p.ns_bytes()) { return fd_mount_ns_path(fd); }
+    Ok(p.ns_bytes().to_vec())
+}
+
+/// The namespace path of the directory descriptor `fd` for a mount(2) target.
+fn fd_mount_ns_path(fd: usize) -> Result<Vec<u8>, isize> {
+    // A detached tree (open_tree clone) that move_mount has attached: the
+    // descriptor names the moved mount at its new place.
+    if let Ok((4, id)) = vfs::nsfd_target(current_pid(), fd) {
+        if let Some((ns, p)) = vfs::mnt::attached_at(id as sched::ns::NsId) {
+            if ns == sched::current_mntns() { return Ok(p); }
+        }
+    }
+    let mut host = fd_host_path(fd).ok_or(-2isize)?;
+    // A cgroup2 directory reports its absolute cgroup path, but the tree is
+    // served relative to the reader's cgroup namespace root: a descriptor
+    // anywhere in it names the mount point /sys/fs/cgroup.
+    if vfs::cgroupfs::is_path(&host) { host.truncate(vfs::cgroupfs::ROOT.len()); }
+    let mns = sched::current_mntns();
+    let ns = if mns != 0 { vfs::mnt::reverse_newest(mns, &host) } else { Some(host) };
+    match ns {
+        Some(n) if !vfs::mnt::is_sb_path(&n) => Ok(n),
+        _ => Err(-22),
+    }
+}
+
+/// The mount point of a mount(2) that creates or binds a mount. A target that
+/// is exactly `/proc/self/fd/N` follows the magic link to where the descriptor
+/// really is in the caller's mount namespace (crun mounts proc, sysfs, tmpfs,
+/// devpts, mqueue and cgroup2 onto its O_PATH rootfs descriptors this way).
+/// A backing path with no name in the namespace never leaks out: EINVAL.
+fn mount_target_kpath(target_ptr: usize) -> Result<KPath, isize> {
+    if let Ok(raw) = copy_user_str(target_ptr, 4096) {
+        if let Some((fd, b"")) = proc_own_fd(&raw) { return KPath::from_ns(fd_mount_ns_path(fd)?); }
+    }
+    resolve_user_path(target_ptr)
+}
+
 fn sys_mount(
     source_ptr: usize,
     target_ptr: usize,
@@ -9282,7 +9523,7 @@ fn sys_mount(
     // A task in a mount namespace of its own mounts into that namespace's
     // tree only (and needs CAP_SYS_ADMIN over the namespace's owner).
     let mns = sched::current_mntns();
-    if mns != 0 { return sys_mount_ns(mns, source_ptr, target_ptr, fstype_ptr, flags); }
+    if mns != 0 { return sys_mount_ns(mns, source_ptr, target_ptr, fstype_ptr, flags, data_ptr); }
     // Every form of mount(2) needs CAP_SYS_ADMIN (Linux `may_mount`).
     // A devpts mount is also allowed to a task holding CAP_SYS_ADMIN in its
     // own user namespace (a container's runtime mounts its /dev/pts there).
@@ -9295,9 +9536,10 @@ fn sys_mount(
     if !sched::host_root() && !devpts_mount { return -1; } // EPERM
     // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC):
     // only the mount's propagation state changes; source/fstype are ignored.
-    if flags & (vfs::mnt::MS_UNBINDABLE | vfs::mnt::MS_PRIVATE | vfs::mnt::MS_SLAVE | vfs::mnt::MS_SHARED) != 0 {
-        let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
-        return vfs::mnt::set_propagation(sched::current_mntns(), target_path.ns_bytes(), flags) as isize;
+    // MS_BIND wins over propagation bits, as in Linux do_mount (Go netns bind passes both).
+    if flags & 4096 == 0 && flags & (vfs::mnt::MS_UNBINDABLE | vfs::mnt::MS_PRIVATE | vfs::mnt::MS_SLAVE | vfs::mnt::MS_SHARED) != 0 {
+        let target = match resolve_mount_target(target_ptr) { Ok(p) => p, Err(e) => return e };
+        return vfs::mnt::set_propagation(sched::current_mntns(), &target, flags) as isize;
     }
     if flags & MS_REMOUNT != 0 {
         let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
@@ -9321,7 +9563,7 @@ fn sys_mount(
     const MS_BIND: usize = 4096;
     // The mount point is a real path — resolve it against the cwd (and the
     // caller's chroot) so `mount /dev/vda mnt` and `mount /dev/vda /mnt` agree.
-    let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+    let target_path = match mount_target_kpath(target_ptr) { Ok(p) => p, Err(e) => return e };
 
     // Alias mounts: a bind mount, or one of the filesystems this kernel serves
     // under a fixed prefix (proc, devtmpfs, sysfs, devpts). Mounting one
@@ -9333,7 +9575,25 @@ fn sys_mount(
         match read_user_short_str(fstype_ptr) { Ok(v) => v, Err(e) => return e }
     };
     let alias_src: Option<(Vec<u8>, &'static str)> = if flags & MS_BIND != 0 {
-        let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
+        let src = match mount_target_kpath(source_ptr) { Ok(p) => p, Err(e) => return e };
+        // Binding /proc/<pid>/ns/<name> keeps that namespace alive.
+        match vfs::nsfs_bind_source(src.ns_bytes(), current_pid()) {
+            Err(e) => return e,
+            Ok(Some(synth)) => {
+                let mp = target_path.ns_bytes();
+                let mut st = [0u8; STAT_SIZE];
+                let m = make_vfs_msg(vfs::VFS_STAT, &[target_path.ptr() as u64, st.as_mut_ptr() as u64]);
+                let r = vfs_reply_val(&vfs::handle(&m, current_pid()));
+                let ok = r >= 0 && vfs::read_stat_mode(st.as_ptr() as usize) & 0o170000 != 0o040000;
+                let put = |s: &[u8]| if let Some((_, id)) = vfs::alias::ns_src(s) { sched::ns::put_raw(id); };
+                if !ok { put(&synth); return if r < 0 { r } else { -20 }; }
+                return match vfs::alias::add(mp, &synth, "nsfs", b"nsfs") {
+                    Ok(()) => 0,
+                    Err(e) => { put(&synth); e as isize }
+                };
+            }
+            Ok(None) => {}
+        }
         Some((src.bytes().to_vec(), "none"))
     } else {
         match &fstype_raw[..] {
@@ -9386,7 +9646,7 @@ fn sys_mount(
         return match vfs::alias::add(mp, &src, fstype, &device) {
             Ok(()) => { if fstype == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
             Err(e) => {
-                if let Some(id) = vfs::devpts::inst_of_backing(&src) { vfs::devpts::destroy(id); }
+                if let Some(id) = vfs::devpts::inst_of_backing(&src) { vfs::devpts::discard(id); }
                 e as isize
             }
         };
@@ -9409,7 +9669,17 @@ fn sys_mount(
     // The tmpfs roots are built in: mounting tmpfs onto one sets its
     // nosuid/nodev/noexec flags (its contents stay). Elsewhere: EINVAL.
     if fstype_str == "tmpfs" {
-        return if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { 0 } else { -22 };
+        if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { return 0; }
+        // Anywhere else: a fresh instance, exposed as an alias mount. The
+        // alias holds the reference that keeps it alive; umount frees it.
+        let mp = target_path.ns_bytes();
+        if mp == b"/" { return -16; } // EBUSY
+        match kpath_is_dir(&target_path) { Ok(true) => {} Ok(false) => return -20, Err(e) => return e }
+        let (sb, root) = match tmpfs_new_instance(flags, data_ptr) { Ok(x) => x, Err(e) => return e };
+        vfs::mnt::sb_get(sb); // creator's reference, dropped below
+        let r = vfs::alias::add(mp, &root, "tmpfs", b"tmpfs");
+        vfs::mnt::sb_put(sb);
+        return match r { Ok(()) => 0, Err(e) => e as isize };
     }
     if fstype_str == "fuse" || fstype_str.starts_with("fuse.") {
         return sys_mount_fuse(source_str, target_path.bytes(), fstype_str, flags, data_ptr);
@@ -9512,6 +9782,148 @@ fn mnt_may_mount(mns: sched::ns::NsId) -> bool {
     match vfs::mnt::owner_of(mns) { Some(o) => sched::caps::ns_capable_in(o, 21), None => false }
 }
 
+// ── New mount API: open_tree / move_mount / mount_setattr (lane opentree) ───
+
+/// What an open_tree/move_mount/mount_setattr operand names: a path in the
+/// caller's mount namespace, or a detached tree (an open_tree clone fd).
+enum TreeSrc { Path(Vec<u8>), Anon(sched::ns::NsId) }
+
+fn tree_src(dfd: usize, path_ptr: usize, empty_ok: bool) -> Result<TreeSrc, isize> {
+    let raw = copy_user_path(path_ptr)?;
+    let dfd_i = dfd as u32 as i32;
+    if raw.is_empty() {
+        if !empty_ok { return Err(-2); }
+        if dfd_i as isize as usize == AT_FDCWD { return Ok(TreeSrc::Path(resolve_ns(b".")?)); }
+        if dfd_i < 0 { return Err(-9); }
+        if let Ok((4, id)) = vfs::nsfd_target(current_pid(), dfd_i as usize) {
+            if vfs::mnt::is_anon(id as sched::ns::NsId) && vfs::mnt::attached_at(id as sched::ns::NsId).is_none() { return Ok(TreeSrc::Anon(id as sched::ns::NsId)); }
+        }
+        return Ok(TreeSrc::Path(fd_mount_ns_path(dfd_i as usize)?));
+    }
+    if let Some((fd, b"")) = proc_own_fd(&raw) { return Ok(TreeSrc::Path(fd_mount_ns_path(fd)?)); }
+    Ok(TreeSrc::Path(resolve_at_ns(dfd, &raw)?))
+}
+
+/// ns 0 has no tree to clone or edit: the host namespace keeps its old answer
+/// (ENOSYS for host root, EPERM for everyone else).
+fn newmnt_ns0() -> isize { if sched::host_root() { -38 } else { -1 } }
+
+fn sys_open_tree(dfd: usize, path_ptr: usize, flags: usize) -> isize {
+    const OPEN_TREE_CLONE: usize = 1;
+    const OPEN_TREE_CLOEXEC: usize = 0o2000000;
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_NO_AUTOMOUNT: usize = 0x800;
+    const AT_EMPTY_PATH: usize = 0x1000;
+    const AT_RECURSIVE: usize = 0x8000;
+    const O_PATH: usize = 0o10000000;
+    let flags = flags as u32 as usize;
+    if flags & !(OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_RECURSIVE) != 0 { return -22; }
+    if flags & AT_RECURSIVE != 0 && flags & OPEN_TREE_CLONE == 0 { return -22; }
+    if flags & OPEN_TREE_CLONE == 0 {
+        // A plain handle on the path (an O_PATH descriptor).
+        let mut of = O_PATH | (flags & OPEN_TREE_CLOEXEC);
+        if flags & AT_SYMLINK_NOFOLLOW != 0 { of |= 0o400000; } // O_NOFOLLOW
+        if flags & AT_EMPTY_PATH != 0 && copy_user_path(path_ptr).map_or(false, |p| p.is_empty()) {
+            let fd = dfd as u32 as i32;
+            if fd < 0 { return -9; }
+            return sys_fcntl(fd as usize, if flags & OPEN_TREE_CLOEXEC != 0 { 1030 } else { 0 }, 0);
+        }
+        return sys_openat(dfd, path_ptr, of, 0);
+    }
+    let mns = sched::current_mntns();
+    if mns == 0 { return newmnt_ns0(); }
+    if !may_mount() { return -1; }
+    vfs::mnt::reap();
+    let ns_path = match tree_src(dfd, path_ptr, flags & AT_EMPTY_PATH != 0) {
+        Ok(TreeSrc::Path(p)) => p,
+        Ok(TreeSrc::Anon(_)) => return -22,
+        Err(e) => return e,
+    };
+    if vfs::mnt::is_sb_path(&ns_path) { return -2; }
+    let kp = match KPath::from_ns(ns_path.clone()) { Ok(k) => k, Err(e) => return e };
+    let is_dir = match kpath_is_dir(&kp) { Ok(d) => d, Err(e) => return e };
+    let owner = match vfs::mnt::owner_of(mns) { Some(o) => o, None => return -22 };
+    let anon = match sched::ns::new_mntns(owner) { Ok(n) => n, Err(e) => return e };
+    if let Err(e) = vfs::mnt::open_tree_clone(mns, &ns_path, flags & AT_RECURSIVE != 0, anon.id(), owner, is_dir) {
+        return e as isize; // dropping `anon` frees the empty namespace
+    }
+    // The descriptor takes its own reference; ours drops with `anon`.
+    vfs::install_nsfd(current_pid(), 4, anon.id())
+}
+
+fn sys_move_mount(from_dfd: usize, from_ptr: usize, to_dfd: usize, to_ptr: usize, flags: usize) -> isize {
+    const F_EMPTY_PATH: usize = 4;
+    const T_EMPTY_PATH: usize = 0x40;
+    const KNOWN: usize = 1 | 2 | 4 | 0x10 | 0x20 | 0x40;
+    let flags = flags as u32 as usize;
+    if flags & !KNOWN != 0 { return -22; }
+    let mns = sched::current_mntns();
+    if mns == 0 { return newmnt_ns0(); }
+    if !may_mount() { return -1; }
+    vfs::mnt::reap();
+    let to = match tree_src(to_dfd, to_ptr, flags & T_EMPTY_PATH != 0) {
+        Ok(TreeSrc::Path(p)) => p,
+        Ok(TreeSrc::Anon(_)) => return -22,
+        Err(e) => return e,
+    };
+    if vfs::mnt::is_sb_path(&to) { return -2; }
+    let tk = match KPath::from_ns(to.clone()) { Ok(k) => k, Err(e) => return e };
+    let tdir = match kpath_is_dir(&tk) { Ok(d) => d, Err(e) => return e };
+    // A detached tree is consumed by its first move_mount.
+    if flags & F_EMPTY_PATH != 0 && (from_dfd as u32 as i32) >= 0 {
+        if let Ok((4, id)) = vfs::nsfd_target(current_pid(), from_dfd as u32 as usize) {
+            if vfs::mnt::attached_at(id as sched::ns::NsId).is_some() { return -22; }
+        }
+    }
+    match tree_src(from_dfd, from_ptr, flags & F_EMPTY_PATH != 0) {
+        Ok(TreeSrc::Anon(id)) => {
+            if vfs::mnt::anon_is_dir(id) != tdir { return if tdir { -20 } else { -21 }; }
+            match vfs::mnt::move_attach(mns, id, &to) { Ok(()) => 0, Err(e) => e as isize }
+        }
+        Ok(TreeSrc::Path(from)) => {
+            if vfs::mnt::is_sb_path(&from) { return -2; }
+            match vfs::mnt::move_mnt(mns, &from, &to) { Ok(()) => 0, Err(e) => e as isize }
+        }
+        Err(e) => e,
+    }
+}
+
+fn sys_mount_setattr(dfd: usize, path_ptr: usize, flags: usize, attr_ptr: usize, size: usize) -> isize {
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_NO_AUTOMOUNT: usize = 0x800;
+    const AT_EMPTY_PATH: usize = 0x1000;
+    const AT_RECURSIVE: usize = 0x8000;
+    const MS_PROP: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+    let flags = flags as u32 as usize;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_RECURSIVE) != 0 { return -22; }
+    if size < 32 { return -22; }
+    if size > 4096 { return -7; } // E2BIG
+    let a: [u64; 4] = match sched::uaccess::read_user(attr_ptr) { Some(v) => v, None => return -14 };
+    let (set, clr, prop, userns) = (a[0], a[1], a[2], a[3]);
+    if userns != 0 { return -22; } // idmapped mounts: not supported here
+    if prop & !MS_PROP != 0 || prop.count_ones() > 1 { return -22; }
+    // MOUNT_ATTR_RDONLY/NOSUID/NODEV/NOEXEC/NOATIME/STRICTATIME/NODIRATIME.
+    let conv = |v: u64| -> Option<u8> {
+        if v & !(0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x80) != 0 { return None; }
+        let mut r = (v & 0xf) as u8;
+        if v & 0x10 != 0 { r |= vfs::mnt::MNT_NOATIME; }
+        if v & 0x80 != 0 { r |= vfs::mnt::MNT_NODIRATIME; }
+        Some(r)
+    };
+    let (set, clr) = match (conv(set), conv(clr)) { (Some(s), Some(c)) => (s, c), _ => return -22 };
+    if set & clr != 0 { return -22; }
+    let mns = sched::current_mntns();
+    if mns == 0 { return newmnt_ns0(); }
+    vfs::mnt::reap();
+    let (ns, path) = match tree_src(dfd, path_ptr, flags & AT_EMPTY_PATH != 0) {
+        Ok(TreeSrc::Path(p)) => { if !may_mount() { return -1; } (mns, p) }
+        Ok(TreeSrc::Anon(id)) => { if !mnt_may_mount(id) { return -1; } (id, b"/".to_vec()) }
+        Err(e) => return e,
+    };
+    if vfs::mnt::is_sb_path(&path) { return -2; }
+    match vfs::mnt::setattr(ns, &path, set, clr, prop as usize, flags & AT_RECURSIVE != 0) { Ok(()) => 0, Err(e) => e as isize }
+}
+
 /// stat(2) the backing file of `kp`: Ok(is_dir).
 fn kpath_is_dir(kp: &KPath) -> Result<bool, isize> {
     const S_IFMT: u32 = 0o170000;
@@ -9527,7 +9939,26 @@ fn kpath_is_dir(kp: &KPath) -> Result<bool, isize> {
 /// (and rbind) and fresh tmpfs mounts, applied to that namespace's tree only.
 /// Remount, move and the propagation flags belong to lane M2; every other
 /// filesystem type to lane M5.
-fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fstype_ptr: usize, flags: usize) -> isize {
+/// A fresh tmpfs superblock for mount(2): parses `data` (mode=, uid=, gid=,
+/// size=; ids as the caller's user namespace names them), creates the backing
+/// instance and records nosuid/nodev/noexec and the size limit. Returns the
+/// superblock id (zero references: the caller attaches it) and its root.
+fn tmpfs_new_instance(flags: usize, data_ptr: usize) -> Result<(u32, Vec<u8>), isize> {
+    let data = if data_ptr == 0 { Vec::new() } else { copy_user_str(data_ptr, 1024)? };
+    let o = vfs::parse_tmpfs_opts(&data).map_err(|e| e as isize)?;
+    let uid = match o.uid { Some(v) => sched::ns::to_k(0, sched::ns::current_userns(), v).ok_or(-22isize)?, None => sched::current_euid() };
+    let gid = match o.gid { Some(v) => sched::ns::to_k(1, sched::ns::current_userns(), v).ok_or(-22isize)?, None => sched::current_egid() };
+    let mode = o.mode.unwrap_or(0o1777);
+    let (sb, _) = vfs::mnt::sb_create("tmpfs", Some(vfs::tmpfs_instance_destroy));
+    let root = match vfs::tmpfs_instance_create(sb, uid, gid, mode) {
+        Ok(r) => r,
+        Err(e) => { vfs::mnt::sb_put(sb); return Err(e as isize); }
+    };
+    vfs::tmpfs_instance_set_attr(sb, flags, o.size_pages);
+    Ok((sb, root))
+}
+
+fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fstype_ptr: usize, flags: usize, data_ptr: usize) -> isize {
     const MS_BIND: usize = 4096;
     const MS_REC: usize = 0x4000;
     const MS_REMOUNT: usize = 32;
@@ -9540,29 +9971,79 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
     // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC)
     // act on this namespace's tree: crun and containers/storage call
     // MS_REC|MS_PRIVATE / MS_SLAVE on "/" first.
-    if flags & MS_PROPAGATION != 0 {
+    if flags & MS_PROPAGATION != 0 && flags & MS_BIND == 0 {
         if flags & !(MS_PROPAGATION | MS_REC) != 0 { return -22; }
-        let target = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
-        return vfs::mnt::set_propagation(mns, target.ns_bytes(), flags) as isize;
+        let target = match resolve_mount_target(target_ptr) { Ok(p) => p, Err(e) => return e };
+        return vfs::mnt::set_propagation(mns, &target, flags) as isize;
     }
-    if flags & (MS_REMOUNT | MS_MOVE | MS_PROPAGATION) != 0 { return -22; }
-    let target = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+    // MS_REMOUNT (bind or not): the mount at the target gets exactly the new
+    // ro/nosuid/nodev/noexec set (clearing a locked flag is EPERM); fds opened
+    // read-write before keep working.
+    if flags & MS_REMOUNT != 0 && flags & MS_MOVE == 0 {
+        let target = match resolve_mount_target(target_ptr) { Ok(p) => p, Err(e) => return e };
+        let set = (flags & 0x0f) as u8;
+        return match vfs::mnt::setattr(mns, &target, set, !set & 0x0f, 0, flags & MS_REC != 0) { Ok(()) => 0, Err(e) => e as isize };
+    }
+    if flags & (MS_REMOUNT | MS_MOVE) != 0 || (flags & MS_PROPAGATION != 0 && flags & MS_BIND == 0) { return -22; }
+    let target = match mount_target_kpath(target_ptr) { Ok(p) => p, Err(e) => return e };
     let tns = target.ns_bytes().to_vec();
     let tdir = match kpath_is_dir(&target) { Ok(d) => d, Err(e) => return e };
     if flags & MS_BIND != 0 {
-        let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
+        let src = match mount_target_kpath(source_ptr) { Ok(p) => p, Err(e) => return e };
+        // Binding /proc/<pid>/ns/<name> onto a file keeps that namespace
+        // alive: the mount's superblock owns the reference.
+        match vfs::nsfs_bind_source(src.ns_bytes(), current_pid()) {
+            Err(e) => return e,
+            Ok(Some(synth)) => {
+                let put = |s: &[u8]| if let Some((_, id)) = vfs::alias::ns_src(s) { sched::ns::put_raw(id); };
+                if tdir { put(&synth); return -20; }
+                // bind_nsfs drops the reference itself on failure.
+                return match vfs::mnt::bind_nsfs(mns, &synth, &tns) {
+                    Ok(_) => 0,
+                    Err(e) => e as isize,
+                };
+            }
+            Ok(None) => {}
+        }
         let sdir = match kpath_is_dir(&src) { Ok(d) => d, Err(e) => return e };
-        if sdir != tdir { return -20; } // ENOTDIR (both directions, as Linux graft_tree)
+        if sdir != tdir {
+            return -20;
+        } // ENOTDIR (both directions, as Linux graft_tree)
         return match vfs::mnt::bind(mns, src.ns_bytes(), &tns, flags & MS_REC != 0) { Ok(_) => 0, Err(e) => e as isize };
     }
     let fstype = match read_user_short_str(fstype_ptr) { Ok(v) => v, Err(e) => return e };
-    if &fstype[..] != b"tmpfs" { return -22; } // EINVAL: other filesystems are lane M5's
     if !tdir { return -20; }
-    let (sb, _) = vfs::mnt::sb_create("tmpfs", Some(vfs::tmpfs_instance_destroy));
-    let root = match vfs::tmpfs_instance_create(sb, sched::current_euid(), sched::current_egid()) {
-        Ok(r) => r,
-        Err(e) => { vfs::mnt::sb_put(sb); return e as isize; }
-    };
+    let mflags0 = (flags as u8 & 0x0f) | vfs::mnt::MNT_RELATIME;
+    match &fstype[..] {
+        b"tmpfs" => {}
+        b"proc" | b"sysfs" => {
+            let fs: &'static str = if &fstype[..] == b"proc" { "proc" } else { "sysfs" };
+            // Linux mnt_already_visible: a mounter whose user namespace is not
+            // the initial one may mount proc/sysfs only if an unobstructed one
+            // is already fully visible in this mount namespace.
+            if sched::ns::current_userns() != 0 && !vfs::mnt::fully_visible(mns, fs, mflags0) { return -1; }
+            let root: &[u8] = if fs == "proc" { b"/proc" } else { b"/sys" };
+            return match vfs::mnt::add_mount(mns, &tns, root, 0, fs, fs.as_bytes(), mflags0) { Ok(_) => 0, Err(e) => e as isize };
+        }
+        b"mqueue" | b"cgroup2" => {
+            let (fs, root): (&'static str, &[u8]) = if &fstype[..] == b"mqueue" { ("mqueue", b"/dev/mqueue") } else { ("cgroup2", b"/sys/fs/cgroup") };
+            return match vfs::mnt::add_mount(mns, &tns, root, 0, fs, fs.as_bytes(), mflags0) {
+                Ok(_) => { if fs == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
+                Err(e) => e as isize,
+            };
+        }
+        b"devpts" => {
+            let opts = if data_ptr == 0 { Vec::new() } else { match copy_user_str(data_ptr, 1024) { Ok(v) => v, Err(e) => return e } };
+            let id = match vfs::devpts::create(&opts) { Ok(id) => id, Err(e) => return e };
+            let root = vfs::devpts::backing(id);
+            return match vfs::mnt::add_mount(mns, &tns, &root, id, "devpts", b"devpts", mflags0) {
+                Ok(_) => 0,
+                Err(e) => { vfs::devpts::discard(id); e as isize }
+            };
+        }
+        _ => return -22, // EINVAL
+    }
+    let (sb, root) = match tmpfs_new_instance(flags, data_ptr) { Ok(x) => x, Err(e) => return e };
     // Per-mount flags share their bit values with MS_RDONLY/NOSUID/NODEV/NOEXEC.
     let mflags = (flags as u8 & 0x0f) | vfs::mnt::MNT_RELATIME;
     let r = vfs::mnt::add_mount(mns, &tns, &root, sb, "tmpfs", b"tmpfs", mflags);
@@ -9640,11 +10121,28 @@ fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
     }
 }
 
+/// pivot_root(2) inside a mount namespace: re-root that namespace's tree
+/// and rebase the stored root/cwd of every task in it. The caller must not
+/// be chrooted (Linux needs its root to be a mountpoint).
+fn sys_pivot_root_ns(mns: sched::ns::NsId, new_root_ptr: usize, put_old_ptr: usize) -> isize {
+    vfs::mnt::reap();
+    let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
+    let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };
+    if let (Some(r), _, _) = sched::current_fs_ctx() { if r.len() > 1 { return -22; } }
+    let pm = match vfs::mnt::pivot_root(mns, new_path.ns_bytes(), old_path.ns_bytes()) {
+        Ok(m) => m,
+        Err(e) => return e as isize,
+    };
+    sched::rebase_fs_paths(mns, &|p| pm.map(p));
+    0
+}
+
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
-    // The pivot rewrites the global (ns 0) mount table; inside a mount
-    // namespace it would re-root the host. Per-namespace pivot is lane M4.
-    if sched::current_mntns() != 0 { return -22; }
+    // In ns 0 the pivot rewrites the global mount table; a mount namespace
+    // pivots its own tree (sys_pivot_root_ns).
+    let mns = sched::current_mntns();
     if !may_mount() { return -1; } // EPERM (CAP_SYS_ADMIN over the mntns owner)
+    if mns != 0 { return sys_pivot_root_ns(mns, new_root_ptr, put_old_ptr); }
     let pid = current_pid();
     let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
     let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };
@@ -9817,6 +10315,11 @@ fn fstatat_into(
     }
 
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        if let Some(fd) = proc_own_tmpfs_dir_fd(path.ns_bytes()).or_else(|| proc_own_anon_fd(path.ns_bytes())) {
+            return fstat_into(fd, statbuf_ptr, user_dest);
+        }
+    }
     let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
         match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
     } else {
@@ -10072,6 +10575,19 @@ fn sys_fchmodat2(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> is
 
 fn sys_fchmodat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        if let Some(h) = proc_own_tmpfs_dir_fd(path.ns_bytes()) {
+            return sys_fchmod(h, mode);
+        }
+        if let Some(fd) = proc_own_anon_fd(path.ns_bytes()) {
+            let mut kb = [0u64; STAT_SIZE.div_ceil(8)];
+            let r = fstat_into(fd, kb.as_mut_ptr() as usize, false);
+            return if r >= 0 { 0 } else { r };
+        }
+    }
+    let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
+    } else { path };
     let pid = current_pid();
     let tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LCHMOD } else { vfs::VFS_CHMOD };
     let msg = make_vfs_msg(tag, &[path.ptr() as u64, mode as u64]);
@@ -10501,7 +11017,7 @@ fn close_handle(pid: u32, h: usize) {
 /// Is handle `h` still open in thread group `tgid` (after an exec sweep or a
 /// fork that did not copy it)?
 fn handle_alive(tgid: u32, h: usize) -> bool {
-    if is_epoll_handle(h) { epoll_slot_for(h, tgid).is_some() }
+    if is_epoll_handle(h) { epoll_slot_for(h, ep_key(tgid)).is_some() }
     else if is_sock_handle(h) { net_server::sock_is_open(tgid, h) }
     else { true }
 }
@@ -10523,7 +11039,7 @@ const ANON_INODE_INO: u64 = 0x5000_0000;
 fn handle_stat(pid: u32, h: usize) -> Option<(u32, u64, u64)> {
     const S_IFSOCK: u32 = 0o140000;
     if is_epoll_handle(h) {
-        return epoll_slot_for(h, sched::tgid_of(pid)).map(|_| (0o600, ANON_INODE_INO, ANON_INODE_DEV));
+        return epoll_slot_for(h, ep_key(pid)).map(|_| (0o600, ANON_INODE_INO, ANON_INODE_DEV));
     }
     if is_sock_handle(h) {
         return net_server::fd_ofd(pid, h).map(|ofd| (S_IFSOCK | 0o777, ofd as u64, SOCKFS_DEV));
@@ -10549,7 +11065,7 @@ fn not_a_socket(number: usize, fd: usize) -> Option<isize> {
     // Epoll fds live above the socket range, in their own table: an open one
     // is a non-socket too, a closed (or never-held) number is EBADF.
     if is_epoll_handle(fd) {
-        return Some(if epoll_slot_for(fd, sched::current_tgid()).is_some() { -88 } else { -9 });
+        return Some(if epoll_slot_for(fd, ep_cur()).is_some() { -88 } else { -9 });
     }
     if is_sock_handle(fd) { return None; }
     Some(if vfs::fd_ofd(current_pid(), fd).is_some() { -88 } else { -9 }) // ENOTSOCK / EBADF
@@ -10612,7 +11128,7 @@ fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
             let target = fd_handle(newfd);
             if target != newfd { close_handle(pid, target); }
             else if vfs::vfs_get_node_kind(pid, newfd).is_some() {
-                if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), newfd); }
+                if !fd_private() { epoll_release_fd(pid, ep_cur(), newfd); }
             }
             let r = vfs::install_handle_at(pid, newfd, dup as usize);
             if r < 0 { close_handle(pid, dup as usize); }
@@ -10632,7 +11148,7 @@ fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     // registrations go with it, before the number is reused (Linux keys them
     // by file, and the file that lands on newfd was never registered).
     if newfd != usize::MAX && newfd != oldfd && vfs::vfs_get_node_kind(pid, oldfd).is_some() {
-        if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), newfd); }
+        if !fd_private() { epoll_release_fd(pid, ep_cur(), newfd); }
     }
     let msg = make_vfs_msg(tag, &[oldfd as u64, newfd as u64, flags as u64]);
     let r = vfs_reply_val(&vfs::handle(&msg, pid));
@@ -11757,14 +12273,21 @@ fn undo_unborn_child(child: u32) {
 fn vfs_close_all_for(pid: u32) {
     // A thread's private fd table dies with its last user.
     if let Some((key, _tgid, last)) = sched::fdkey::drop(pid) {
-        if last {
-            for (_, h) in vfs::handle_fds(key) { close_handle(pid, h); }
+        // (A plain key names another process's table: its owner frees it.)
+        if last && key & sched::fdkey::FD_KEY_PRIVATE != 0 {
+            let nm = make_vfs_msg(net_server::NET_CLOSE_ALL, &[key as u64]);
+            let _ = net_server::handle(&nm, pid);
+            epoll_close_all(key);
             let m = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[key as u64]);
             let _ = vfs::handle(&m, pid);
         }
     }
-    let msg = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[pid as u64]);
-    let _ = vfs::handle(&msg, pid);
+    // CLONE_FILES children still on this process's table take it over.
+    let handed_over = sched::tgid_of(pid) == pid && fd_detach_sharers(pid).is_some();
+    if !handed_over {
+        let msg = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[pid as u64]);
+        let _ = vfs::handle(&msg, pid);
+    }
     // Net sockets and epoll instances are per-process (tgid-keyed), so only
     // a thread-group leader's exit tears them down — a plain pthread exiting
     // must not close the sockets its siblings still use.
@@ -11908,6 +12431,27 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         }
         if arg == 0 || !validate_user_buf(arg, nl::IFREQ_LEN) { return -14; }
         let mut ifr = match sched::uaccess::read_user::<[u8; nl::IFREQ_LEN]>(arg) { Some(v) => v, None => return -14 };
+        // A tun/tap of the caller's netns (/dev/net/tun): flags, address,
+        // netmask and MTU are set on its vif; any other name falls through.
+        if matches!(cmd as u32, 0x8914 | 0x8916 | 0x891c | 0x8922) {
+            if let Some(r) = net_server::tunbe::sock_set(sched::ns::netns_of(pid as u32), cmd as u32, &ifr) {
+                return r as isize;
+            }
+        }
+        if cmd as u32 == nl::SIOCSIFFLAGS {
+            // Only a netns's own `lo` has an admin state to set (the same
+            // LO_UP netlink RTM_NEWLINK uses); needs CAP_NET_ADMIN over the
+            // netns owner's user namespace.
+            let ns = sched::ns::netns_of(pid as u32);
+            let owner = sched::ns::owner_userns(2, ns);
+            if !sched::caps::ns_capable_in(owner, 12) { return -1; }
+            let n = ifr[..16].iter().position(|&b| b == 0).unwrap_or(16);
+            if &ifr[..n] != b"lo" { return if links.iter().any(|l| l.name.as_bytes() == &ifr[..n]) { -95 } else { -19 }; }
+            if ns == 0 { return -95; }
+            let fl = u16::from_ne_bytes([ifr[16], ifr[17]]);
+            sched::ns::set_lo_admin_up(ns, fl & 1 != 0); // IFF_UP
+            return 0;
+        }
         let r = nl::ifreq_ioctl(cmd as u32, &mut ifr, &links);
         if r < 0 { return r as isize; }
         return if sched::uaccess::write_user(arg, ifr) { 0 } else { -14 };
@@ -12347,6 +12891,16 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     // /dev/netctl: its 'N' commands (docs/servers/netctl.md) are answered by
     // the net server's device, keyed on the fd's device port like the audio
     // server above. It copies the argument itself with no lock held.
+    // /dev/net/tun: tundev answers every ioctl on its opens (TUN*, FIONREAD).
+    if let Some(tp) = net_server::tundev::device_port() {
+        if let Some(vfs::VnodeKind::DynamicDevice { port, .. }) = vfs::vfs_get_node_kind(pid, fd) {
+            if port == tp {
+                let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
+                return vfs_reply_val(&vfs::handle(&msg, pid));
+            }
+        }
+    }
+
     if let Some(nc_port) = net_server::netctl::device_port() {
         if let Some(vfs::VnodeKind::DynamicDevice { port, .. }) = vfs::vfs_get_node_kind(pid, fd) {
             if port == nc_port {
@@ -12627,6 +13181,17 @@ fn unix_sockaddr_backing(addr_ptr: usize, addrlen: usize) -> Result<Option<KPath
     if u16::from_ne_bytes([raw[0], raw[1]]) != AF_UNIX || raw[2] == 0 { return Ok(None); }
     let name = &raw[2..n];
     let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+    // connect("/proc/self/fd/N") where N is an O_PATH descriptor of the socket
+    // file itself (podman's attach connect): the node the descriptor names,
+    // by its backing path. The VFS only reopens such magic links by identity,
+    // which cannot name a socket node.
+    if let Some((fd, below)) = proc_own_fd(name) {
+        if below.is_empty() && fd < net_server::SOCK_FD_BASE {
+            if let Some(host) = fd_host_path(fd) {
+                if !host.ends_with(b" (deleted)") { return Ok(Some(KPath::raw(&host))); }
+            }
+        }
+    }
     Ok(Some(KPath::from_ns(resolve_ns(name)?)?))
 }
 
@@ -13356,6 +13921,39 @@ fn fork_dup_tables(parent_pid: u32, child_pid: u32) {
     }
 }
 
+/// The epoll holder id of process `pid`: its fd-table key, so CLONE_FILES
+/// sharers hold one set of epoll fds (like the VFS table).
+fn ep_key(pid: u32) -> u32 {
+    if pid & sched::fdkey::FD_KEY_PRIVATE != 0 { pid } else { vfs::tbl_key(sched::tgid_of(pid)) }
+}
+
+/// The calling thread's epoll holder id.
+fn ep_cur() -> u32 { vfs::tbl_key(sched::current_tgid()) }
+
+/// The fd table `from` becomes `to`: its epoll holds and instance ownership follow.
+fn epoll_rekey(from: u32, to: u32) {
+    let mut ep = EPOLL_INSTANCES.lock();
+    let mut t = EPOLL_FDS.lock();
+    for e in t.t.iter_mut() { if e.in_use && e.tgid == from { e.tgid = to; } }
+    for h in t.extra.iter_mut() { if h.tgid == from { h.tgid = to; } }
+    for inst in ep.iter_mut() {
+        if inst.in_use && inst.owner_tgid == from { inst.owner_tgid = to; inst.owner_pid = to; }
+    }
+}
+
+/// Duplicate handle `h` of table `src` into table `dst` (a split fd table:
+/// every descriptor gets its own handle). Returns the new handle.
+fn dup_handle_across(src: u32, dst: u32, h: usize) -> isize {
+    if is_epoll_handle(h) {
+        let cx = EPOLL_FDS.lock().held_by(src).iter().any(|&(i, c)| c && EPOLL_FD_BASE + i == h);
+        return epoll_dup_into(h, src, dst, cx);
+    }
+    let cx = net_server::sock_cloexec(src, h);
+    let d = net_server::dup_in(src, h, cx);
+    if d < 0 { return d; }
+    net_server::move_slot(src, d as usize, dst)
+}
+
 fn epoll_fork_dup(parent: u32, child: u32) {
     let mut t = EPOLL_FDS.lock();
     for (i, cloexec) in t.held_by(parent) { t.add_holder(i, child, cloexec); }
@@ -13512,7 +14110,7 @@ static EPOLL_INSTANCES: sched::lockwatch::TrackedMutex<alloc::vec::Vec<EpollInst
 /// (and all interests with it) when the last alias goes away.
 fn sys_epoll_close(epfd: usize) -> isize {
     match epoll_fd_index(epfd) {
-        Some(i) => epoll_fd_drop(i, sched::current_tgid()),
+        Some(i) => epoll_fd_drop(i, ep_cur()),
         None => -9,
     }
 }
@@ -13681,7 +14279,7 @@ fn sys_epoll_create1(flags: usize) -> isize {
     }
     // Owner is the thread group, not the creating thread: the instance must
     // survive its creator thread's exit and be cleaned up with the process.
-    let pid = sched::current_tgid();
+    let pid = ep_cur();
     let mut ep = EPOLL_INSTANCES.lock();
     let mut t = EPOLL_FDS.lock();
     let i = match ep.iter().position(|e| !e.in_use) {
@@ -13719,7 +14317,7 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     // process (real POSIX fd-table semantics) — see the identical comment on
     // sys_epoll_wait's check for the bug this fixes — and by a fork child's
     // copy of the number (`epoll_fork_dup`).
-    let tgid = sched::current_tgid();
+    let tgid = ep_cur();
     // The event is read before EPOLL_INSTANCES is taken, fault-tolerantly: a
     // fault under that lock stalls every epoll caller, and a bad pointer is
     // EFAULT, not a killed caller holding it. (Not necessarily 8-byte
@@ -13968,7 +14566,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
     if !validate_user_buf(events_ptr, maxevents * EPOLL_EVENT_SIZE) { return -14; }
 
     // Held by the caller's thread group: its creator, a dup, or a fork copy.
-    let slot = match epoll_slot_for(epfd, sched::current_tgid()) {
+    let slot = match epoll_slot_for(epfd, ep_cur()) {
         Some(s) => s,
         None => return -9, // EBADF
     };
@@ -15628,7 +16226,7 @@ fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
     // `poll_fd()` IS an epoll fd) returned from `dispatch(100ms)` ~4600×/s in
     // the COSMIC panel.
     if is_epoll_handle(fd) {
-        let slot = match epoll_slot_for(fd, sched::tgid_of(pid)) { Some(s) => s, None => return POLLNVAL };
+        let slot = match epoll_slot_for(fd, ep_key(pid)) { Some(s) => s, None => return POLLNVAL };
         {
             // Scoped: the lock must be dropped before the recursive probe —
             // epoll_any_ready_nested re-takes it per interest (invariant
@@ -15968,7 +16566,8 @@ fn sys_inotify_add_watch(fd: usize, _path_ptr: usize, _mask: usize) -> isize {
 fn sys_inotify_rm_watch(_fd: usize, _wd: usize) -> isize { 0 }
 
 /// memfd_create(name_ptr, flags) → writable anonymous fd backed by a TmpFile.
-fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
+fn sys_memfd_create(name_ptr: usize, flags: usize) -> isize {
+    vfs::exe_pin_gc(0); // release memfd-exe pins of tasks that moved on
     // A memfd must be a DISTINCT anonymous inode every call, even when two calls
     // pass identical names (Linux semantics — the name is only a debug label).
     // We back memfds with named tmpfs nodes "/tmp/memfd:<name>", so a reused name
@@ -16022,7 +16621,7 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
                                        // no O_TRUNC (which a sealed reopen would
                                        // reject). O_RDWR keeps the wl_shm
                                        // read()-coherence path legal (K1).
-            0o600u64,
+            0o777u64, // Linux memfd inodes are 0777 (exec of a memfd needs x)
         ]);
         let fd = vfs_reply_val(&vfs::handle(&msg, pid));
         if fd == EEXIST {
@@ -16032,7 +16631,8 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
         if fd >= 0 {
             // Mark the inode as a memfd: creates an empty seal-capable VMO so the
             // file is genuinely shareable and F_ADD_SEALS/F_GET_SEALS are honored.
-            vfs::mark_memfd(pid, fd as usize);
+            vfs::mark_memfd(pid, fd as usize, &name[..name.len().min(32)]);
+            if flags & 1 != 0 { let _ = sys_fcntl(fd_handle(fd as usize), 2 /*F_SETFD*/, 1); } // MFD_CLOEXEC
             // [GAP2] Name the memfd, its owner pid and its tmpfs slot, so every
             // later [G2*] line can be attributed to a process and a pool. Also
             // arms the [G2SUM] content sampler on the applet's pool.
@@ -17211,7 +17811,11 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
             // fix for the identical fork() case (see the FORK arm above).
             if flags & CLONE_THREAD == 0 {
                 child = child_pid;
-                fork_dup_tables(parent_pid, child_pid);
+                if flags & CLONE_FILES != 0 && fd_share_with(parent_pid, child_pid) {
+                    stdio_flags_fork(sched::tgid_of(parent_pid), child_pid);
+                } else {
+                    fork_dup_tables(parent_pid, child_pid);
+                }
                 drop_child_pidfd(child_pid);
             } else {
                 // A thread joins its creator's private fd table, if any.
@@ -17250,7 +17854,11 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
         let mut child = 0u32;
         let ret = sched::fork_current_with(frame_ptr, opts, |child_pid| {
             child = child_pid;
-            fork_dup_tables(parent_pid, child_pid);
+            if flags & CLONE_FILES != 0 && fd_share_with(parent_pid, child_pid) {
+                stdio_flags_fork(sched::tgid_of(parent_pid), child_pid);
+            } else {
+                fork_dup_tables(parent_pid, child_pid);
+            }
             drop_child_pidfd(child_pid);
         });
         if ret < 0 { undo_unborn_child(child); }

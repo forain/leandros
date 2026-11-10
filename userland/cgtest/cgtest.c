@@ -245,6 +245,15 @@ static int rmdir_retry(const char *p)
     return -1;
 }
 
+/* Booted by init: /sys/fs/cgroup is cgroup2 before anything mounts it. */
+static int t_cg_boot_mounted(void)
+{
+    struct statfs sf;
+    CHECK(statfs(CGR, &sf) == 0);
+    CHECK((unsigned long)sf.f_type == CGROUP2_SUPER_MAGIC);
+    return 0;
+}
+
 static int t_cg_magic(void)
 {
     CHECK(mnt() == 0);
@@ -355,7 +364,7 @@ static int t_cg_busy_noproc(void)
     CHECK(rmdir(CGR "/cgt_b") == 0);
     close(k);
     CHECK(waitpid(c, NULL, 0) == c);
-    CHECK(wr(CGR "/cgroup.subtree_control", "-pids") == 0);
+    /* init keeps the controllers enabled on the root; nothing to undo */
     return 0;
 }
 
@@ -524,7 +533,7 @@ static int t_cg_pids_balance(void)
     char b[64];
     CHECK(rd(CGR "/cgt_p/cgroup.procs", b, sizeof b) == 0);
     CHECK(rmdir(CGR "/cgt_p") == 0);
-    CHECK(wr(CGR "/cgroup.subtree_control", "-pids") == 0);
+    /* init keeps the controllers enabled on the root; nothing to undo */
     return 0;
 }
 
@@ -558,7 +567,121 @@ static int t_cg_pids_max(void)
     char b[64];
     CHECK(rd(CGR "/cgt_q/pids.events", b, sizeof b) > 0 && !strncmp(b, "max 1", 5));
     CHECK(rmdir_retry(CGR "/cgt_q") == 0);
-    CHECK(wr(CGR "/cgroup.subtree_control", "-pids") == 0);
+    /* init keeps the controllers enabled on the root; nothing to undo */
+    return 0;
+}
+
+static int has_word(const char *buf, const char *w)
+{
+    size_t n = strlen(w);
+    for (const char *p = buf; (p = strstr(p, w)); p++)
+        if ((p == buf || p[-1] == ' ' || p[-1] == '\n') && (p[n] == ' ' || p[n] == '\n' || p[n] == 0)) return 1;
+    return 0;
+}
+
+/* init enables the controllers at boot, and the user slice too. */
+static int t_cg_boot_controllers(void)
+{
+    char b[128];
+    CHECK(rd(CGR "/cgroup.subtree_control", b, sizeof b) > 0);
+    CHECK(has_word(b, "cpu") && has_word(b, "io") && has_word(b, "memory") && has_word(b, "pids"));
+    struct stat st;
+    CHECK(stat(CGR "/user.slice", &st) == 0 && S_ISDIR(st.st_mode));
+    CHECK(rd(CGR "/user.slice/cgroup.subtree_control", b, sizeof b) > 0 && has_word(b, "pids"));
+    return 0;
+}
+
+/* A fresh child exposes every enabled controller's files; knobs round-trip. */
+static int t_cg_child_ctrl_files(void)
+{
+    char b[256];
+    CHECK(mnt() == 0);
+    CHECK(mkdir(CGR "/cgt_cf", 0755) == 0);
+    CHECK(rd(CGR "/cgt_cf/cgroup.controllers", b, sizeof b) > 0);
+    CHECK(has_word(b, "cpu") && has_word(b, "io") && has_word(b, "memory") && has_word(b, "pids"));
+    static const char *const f[] = { "pids.max", "pids.current", "memory.max", "memory.current",
+        "memory.high", "cpu.max", "cpu.weight", "cpu.stat", "io.max", "io.weight" };
+    for (unsigned i = 0; i < sizeof f / sizeof *f; i++) {
+        char p[96]; snprintf(p, sizeof p, CGR "/cgt_cf/%s", f[i]);
+        struct stat st;
+        if (stat(p, &st) != 0) { printf("  missing %s\n", f[i]); return 1; }
+    }
+    CHECK(rd(CGR "/cgt_cf/pids.max", b, sizeof b) > 0 && !strncmp(b, "max", 3));
+    CHECK(wr(CGR "/cgt_cf/pids.max", "7") == 0);
+    CHECK(rd(CGR "/cgt_cf/pids.max", b, sizeof b) > 0 && !strncmp(b, "7\n", 2));
+    CHECK(wr(CGR "/cgt_cf/memory.max", "67108864") == 0);
+    CHECK(rd(CGR "/cgt_cf/memory.max", b, sizeof b) > 0 && !strncmp(b, "67108864\n", 9));
+    CHECK(wr(CGR "/cgt_cf/cpu.weight", "200") == 0);
+    CHECK(rd(CGR "/cgt_cf/cpu.weight", b, sizeof b) > 0 && !strncmp(b, "200\n", 4));
+    CHECK(wr(CGR "/cgt_cf/cpu.weight", "0") == -EINVAL);
+    CHECK(wr(CGR "/cgt_cf/cpu.max", "50000 100000") == 0);
+    CHECK(rd(CGR "/cgt_cf/cpu.max", b, sizeof b) > 0 && !strncmp(b, "50000 100000", 12));
+    CHECK(wr(CGR "/cgt_cf/memory.current", "1") == -EACCES);
+    /* a grandchild gets nothing: the child enabled no controller for it */
+    CHECK(mkdir(CGR "/cgt_cf/g", 0755) == 0);
+    CHECK(rd(CGR "/cgt_cf/g/cgroup.controllers", b, sizeof b) >= 0 && !has_word(b, "pids"));
+    struct stat st;
+    CHECK(stat(CGR "/cgt_cf/g/pids.max", &st) == -1 && errno == ENOENT);
+    CHECK(rmdir(CGR "/cgt_cf/g") == 0);
+    /* a recreated cgroup starts from defaults */
+    CHECK(rmdir(CGR "/cgt_cf") == 0);
+    CHECK(mkdir(CGR "/cgt_cf", 0755) == 0);
+    CHECK(rd(CGR "/cgt_cf/pids.max", b, sizeof b) > 0 && !strncmp(b, "max", 3));
+    CHECK(rd(CGR "/cgt_cf/cpu.weight", b, sizeof b) > 0 && !strncmp(b, "100\n", 4));
+    CHECK(rmdir(CGR "/cgt_cf") == 0);
+    return 0;
+}
+
+/* pids.max of a child is enforced without anyone enabling +pids first. */
+static int t_cg_child_pids_enforced(void)
+{
+    CHECK(mnt() == 0);
+    CHECK(mkdir(CGR "/cgt_pe", 0755) == 0);
+    CHECK(wr(CGR "/cgt_pe/pids.max", "2") == 0);
+    int up[2], dn[2];
+    CHECK(pipe(up) == 0 && pipe(dn) == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        char z;
+        (void)read(dn[0], &z, 1);
+        pid_t k1 = fork();
+        if (k1 == 0) { (void)read(dn[0], &z, 1); _exit(0); }
+        if (k1 < 0) _exit(1);
+        pid_t k2 = fork();
+        if (k2 >= 0 || errno != EAGAIN) _exit(2);
+        (void)write(up[1], "d", 1);
+        (void)write(dn[1], "x", 1);
+        waitpid(k1, NULL, 0);
+        _exit(0);
+    }
+    CHECK(wrpid(CGR "/cgt_pe/cgroup.procs", c) == 0);
+    CHECK(write(dn[1], "x", 1) == 1);
+    char z;
+    CHECK(read(up[0], &z, 1) == 1);
+    CHECK(wait_ok(c));
+    CHECK(rmdir_retry(CGR "/cgt_pe") == 0);
+    return 0;
+}
+
+/* crun opens control files relative to a cgroup directory fd (openat, openat2). */
+static int t_cg_dirfd_open(void)
+{
+    char b[64];
+    CHECK(mnt() == 0);
+    CHECK(mkdir(CGR "/cgt_df", 0755) == 0);
+    int d = open(CGR "/cgt_df", O_RDONLY | O_DIRECTORY);
+    CHECK(d >= 0);
+    int f = openat(d, "pids.max", O_WRONLY);
+    CHECK(f >= 0);
+    CHECK(write(f, "9", 1) == 1);
+    close(f);
+    struct { unsigned long long flags, mode, resolve; } how = { O_RDONLY, 0, 0 };
+    long r = syscall(SYS_openat2, d, "pids.max", &how, sizeof how);
+    CHECK(r >= 0);
+    CHECK(read((int)r, b, sizeof b) > 0 && b[0] == '9');
+    close((int)r);
+    close(d);
+    CHECK(rmdir(CGR "/cgt_df") == 0);
     return 0;
 }
 
@@ -573,6 +696,82 @@ static int t_cg_proc_files(void)
     CHECK(l != NULL);
     CHECK(strstr(b, "/sys/fs/cgroup ") != NULL);
     CHECK(rd("/proc/mounts", b, sizeof b) > 0 && strstr(b, "cgroup2 /sys/fs/cgroup cgroup2"));
+    return 0;
+}
+
+static pid_t sleeper(void)
+{
+    pid_t c = fork();
+    if (c == 0) { for (;;) pause(); }
+    return c;
+}
+static int killed(pid_t c)
+{
+    int st = 0;
+    return waitpid(c, &st, 0) == c && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL;
+}
+
+/* cgroup.kill: write-only 0200, "1" SIGKILLs the whole subtree */
+static int t_cg_kill_tree(void)
+{
+    CHECK(mnt() == 0);
+    CHECK(mkdir(CGR "/cgt_k", 0755) == 0);
+    CHECK(mkdir(CGR "/cgt_k/sub", 0755) == 0);
+    struct stat st;
+    CHECK(stat(CGR "/cgt_k/cgroup.kill", &st) == 0 && (st.st_mode & 0777) == 0200);
+    char b[64];
+    int fd = open(CGR "/cgt_k/cgroup.kill", O_RDONLY);
+    CHECK(fd < 0 ? errno == EINVAL : (read(fd, b, sizeof b) < 0 && errno == EINVAL));
+    if (fd >= 0) close(fd);
+    CHECK(wr(CGR "/cgt_k/cgroup.kill", "0") == -EINVAL);
+    pid_t a = sleeper(), c = sleeper();
+    CHECK(a > 0 && c > 0);
+    CHECK(wrpid(CGR "/cgt_k/cgroup.procs", a) == 0);
+    CHECK(wrpid(CGR "/cgt_k/sub/cgroup.procs", c) == 0);
+    CHECK(wr(CGR "/cgt_k/cgroup.kill", "1") == 0);
+    CHECK(killed(a) && killed(c));
+    CHECK(rmdir_retry(CGR "/cgt_k/sub") == 0);
+    CHECK(rmdir_retry(CGR "/cgt_k") == 0);
+    return 0;
+}
+
+/* freeze/kill follow directory ownership: EACCES for a non-owner, writable after chown */
+static int t_cg_freeze_delegate(void)
+{
+    CHECK(mnt() == 0);
+    char b[256];
+    CHECK(rd("/sys/kernel/cgroup/delegate", b, sizeof b) > 0);
+    CHECK(has_word(b, "cgroup.freeze") && has_word(b, "cgroup.kill") && has_word(b, "cgroup.procs"));
+    CHECK(mkdir(CGR "/cgt_f", 0755) == 0);
+    int up[2], dn[2];
+    CHECK(pipe(up) == 0 && pipe(dn) == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        char z;
+        if (setgid(1000) != 0 || setuid(1000) != 0) _exit(1);
+        (void)write(up[1], "r", 1);
+        (void)read(dn[0], &z, 1);
+        if (wr(CGR "/cgt_f/cgroup.freeze", "1") != -EACCES) _exit(2);
+        if (wr(CGR "/cgt_f/cgroup.kill", "1") != -EACCES) _exit(3);
+        (void)write(up[1], "d", 1);
+        (void)read(dn[0], &z, 1);            /* chowned */
+        if (wr(CGR "/cgt_f/cgroup.freeze", "1") != 0) _exit(4);
+        if (rd(CGR "/cgt_f/cgroup.freeze", b, sizeof b) < 1 || b[0] != '1') _exit(5);
+        if (rd(CGR "/cgt_f/cgroup.events", b, sizeof b) < 1 || !strstr(b, "frozen 1")) _exit(6);
+        if (wr(CGR "/cgt_f/cgroup.freeze", "0") != 0) _exit(7);
+        if (rd(CGR "/cgt_f/cgroup.events", b, sizeof b) < 1 || !strstr(b, "frozen 0")) _exit(8);
+        if (wr(CGR "/cgt_f/cgroup.freeze", "2") != -EINVAL) _exit(9);
+        if (wr(CGR "/cgt_f/cgroup.kill", "1") != 0) _exit(10);
+        _exit(0);
+    }
+    char z;
+    CHECK(read(up[0], &z, 1) == 1);
+    CHECK(write(dn[1], "x", 1) == 1);
+    CHECK(read(up[0], &z, 1) == 1 && z == 'd');
+    CHECK(chown(CGR "/cgt_f", 1000, 1000) == 0);
+    CHECK(write(dn[1], "x", 1) == 1);
+    CHECK(wait_ok(c));
+    CHECK(rmdir_retry(CGR "/cgt_f") == 0);
     return 0;
 }
 
@@ -591,11 +790,14 @@ int main(int argc, char **argv)
         { "ns_exec_keeps", t_exec_keeps }, { "ns_clone_new", t_clone_new },
         { "ns_eperm_nonroot", t_eperm_nonroot }, { "ns_userns_unshare", t_userns_unshare },
         { "membership_churn", t_churn }, { "ns_leak", t_ns_leak },
-        { "cg_magic", t_cg_magic }, { "cg_mkdir_rmdir", t_cg_mkdir_rmdir },
+        { "cg_boot_mounted", t_cg_boot_mounted }, { "cg_magic", t_cg_magic }, { "cg_mkdir_rmdir", t_cg_mkdir_rmdir },
         { "cg_files", t_cg_files }, { "cg_busy_noproc", t_cg_busy_noproc },
         { "cg_migrate", t_cg_migrate }, { "cg_cgns_rel", t_cg_cgns_rel },
         { "cg_delegate", t_cg_delegate }, { "cg_pids_balance", t_cg_pids_balance },
         { "cg_pids_max", t_cg_pids_max }, { "cg_proc_files", t_cg_proc_files },
+        { "cg_boot_controllers", t_cg_boot_controllers }, { "cg_child_ctrl_files", t_cg_child_ctrl_files },
+        { "cg_child_pids_enforced", t_cg_child_pids_enforced }, { "cg_dirfd_open", t_cg_dirfd_open },
+        { "cg_kill_tree", t_cg_kill_tree }, { "cg_freeze_delegate", t_cg_freeze_delegate },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();

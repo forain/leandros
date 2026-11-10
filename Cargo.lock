@@ -149,6 +149,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ebpf-cgdev"
+version = "0.1.0"
+
+[[package]]
 name = "elf"
 version = "0.1.0"
 dependencies = [
@@ -683,6 +687,7 @@ dependencies = [
 name = "sched"
 version = "0.1.0"
 dependencies = [
+ "ebpf-cgdev",
  "leandros-lib",
  "mm",
  "seccomp-bpf",

@@ -45,6 +45,7 @@ pub mod signal;
 pub mod random;
 pub mod rseq;
 pub mod rtq;
+pub mod bpfcg;
 pub mod seccomp;
 pub mod task;
 pub mod uaccess;
@@ -1351,7 +1352,7 @@ pub fn oom_score_adj_of(pid: Pid) -> Option<i32> { RUN_QUEUE.lock().find_pid(pid
 /// the value needs CAP_SYS_RESOURCE (Linux oom_score_adj_min rule).
 pub fn set_oom_score_adj(caller: Pid, pid: Pid, v: i32) -> isize {
     if !(-1000..=1000).contains(&v) { return -22; }
-    let cap = RUN_QUEUE.lock().find_pid(caller).map_or(false, |t| t.caps[0] >> 24 & 1 != 0);
+    let cap = RUN_QUEUE.lock().find_pid(caller).map_or(false, |t| t.userns.id() == 0 && t.caps[0] >> 24 & 1 != 0); // CAP_SYS_RESOURCE in the initial userns (Linux capable())
     let mut rq = RUN_QUEUE.lock();
     let tgid = match rq.find_pid(pid) { Some(t) => { if v < t.oom_score_adj && !cap { return -13; } t.tgid } None => return -3 };
     for i in rq.live_slots() {
@@ -2849,6 +2850,60 @@ pub fn current_root_arc() -> Option<alloc::sync::Arc<[u8]>> {
     root_arc_of(current_pid())
 }
 
+/// Rewrite the root and cwd of every task in mount namespace `mntns` through
+/// `map` (an absolute-path to absolute-path function), as pivot_root requires.
+/// The run-queue lock is held only to snapshot and to swap pointers: every
+/// allocation (the snapshot vector, the mapped paths) happens outside it, and
+/// a task whose paths changed in between is left alone.
+pub fn rebase_fs_paths(mntns: ns::NsId, map: &dyn Fn(&[u8]) -> alloc::vec::Vec<u8>) {
+    type P = Option<alloc::sync::Arc<[u8]>>;
+    let mut snap: alloc::vec::Vec<(Pid, P, P)> = alloc::vec::Vec::new();
+    loop {
+        let need = {
+            let rq = RUN_QUEUE.lock();
+            rq.live_slots().into_iter().filter(|&i| rq.get(i).map_or(false, |t| t.mntns.id() == mntns)).count()
+        };
+        snap.clear();
+        if snap.try_reserve(need + 8).is_err() { return; }
+        let mut full = true;
+        {
+            let rq = RUN_QUEUE.lock();
+            for i in rq.live_slots() {
+                if let Some(t) = rq.get(i) {
+                    if t.mntns.id() != mntns || t.state == TaskState::Zombie { continue; }
+                    if snap.len() == snap.capacity() { full = false; break; }
+                    snap.push((t.pid, t.root.clone(), t.cwd.clone()));
+                }
+            }
+        }
+        if full { break; }
+    }
+    let root_of = |p: &P| -> P {
+        let np = match p { Some(a) => map(a), None => return None };
+        if np.len() <= 1 { None } else { Some(alloc::sync::Arc::from(&np[..])) }
+    };
+    let cwd_of = |p: &P| -> P {
+        let np = match p { Some(a) => map(a), None => map(b"/") };
+        if np.len() <= 1 { None } else { Some(alloc::sync::Arc::from(&np[..])) }
+    };
+    let mut news: alloc::vec::Vec<(P, P)> = alloc::vec::Vec::new();
+    if news.try_reserve(snap.len()).is_err() { return; }
+    for (_, r, c) in snap.iter() { news.push((root_of(r), cwd_of(c))); }
+    let mut old: alloc::vec::Vec<P> = alloc::vec::Vec::new();
+    if old.try_reserve(snap.len() * 2).is_err() { return; }
+    {
+        let mut rq = RUN_QUEUE.lock();
+        for ((pid, r0, c0), (rn, cn)) in snap.iter().zip(news.iter()) {
+            if let Some(t) = rq.find_pid_mut(*pid) {
+                let same = |a: &P, b: &P| match (a, b) { (None, None) => true, (Some(x), Some(y)) => alloc::sync::Arc::ptr_eq(x, y), _ => false };
+                if same(&t.root, r0) { old.push(core::mem::replace(&mut t.root, rn.clone())); }
+                if same(&t.cwd, c0) { old.push(core::mem::replace(&mut t.cwd, cn.clone())); }
+            }
+        }
+    }
+    drop(old);
+}
+
 /// Establish `path` (host-absolute) as the calling task's chroot root. A root
 /// of "/" (or empty) is the same as not being chrooted.
 pub fn set_root(path: &[u8]) -> bool {
@@ -3056,7 +3111,7 @@ pub fn set_current_groups(groups: &[u32]) -> bool {
     let mut rq = RUN_QUEUE.lock();
     if let Some(t) = rq.find_pid_mut(pid) {
         if !setid_priv(t, true) { return false; }
-        if groups.iter().any(|&g| !ns::mapped(1, t.userns.id(), g)) { return false; }
+        if groups.iter().any(|&g| !ns::from_k(1, t.userns.id(), g).is_some()) { return false; }
         let n = groups.len().min(task::NGROUPS_MAX);
         t.groups[..n].copy_from_slice(&groups[..n]);
         t.ngroups = n as u8;
@@ -3104,6 +3159,7 @@ pub fn exec_commit_ids(euid: Option<u32>, egid: Option<u32>, secure: bool) {
             t.sgid = t.egid;
             t.fsuid = t.euid;
             t.fsgid = t.egid;
+            if t.mm_userns.id() != t.userns.id() { t.mm_userns = t.userns.clone(); }
             t.tgid
         }
         None => return,
@@ -3270,7 +3326,7 @@ pub fn set_current_fsid(id: u32, gid: bool) -> u32 {
             let (r, e, s, f) = if gid { (t.gid, t.egid, t.sgid, t.fsgid) }
                                else   { (t.uid, t.euid, t.suid, t.fsuid) };
             let kind = if gid { 1 } else { 0 };
-            let ok_ns = ns::mapped(kind, t.userns.id(), id);
+            let ok_ns = ns::from_k(kind, t.userns.id(), id).is_some();
             if id != u32::MAX && ok_ns && (id == r || id == e || id == s || id == f || setid_priv(t, gid)) {
                 if gid { t.fsgid = id; } else { t.fsuid = id; }
             }
@@ -3684,6 +3740,24 @@ pub fn poll_reply_put_keys(data: &mut [u8], keys: &[u64]) {
 /// overflowed the first cut's 128 and left it unrefined. 1 KiB per task.
 pub const POLL_FP_MAX: usize = 512;
 
+/// Fingerprints (the first ones, index-aligned) that also keep the full
+/// 64-bit key. A 16-bit fingerprint alone lets a key sharing the bloom bit
+/// and the fingerprint wake a parked task falsely (lane wakecatch); narrow
+/// parks fit here, wide ones past this index stay fingerprint-only.
+pub const POLL_FK_MAX: usize = 16;
+
+/// Does `key` match one of the parked interests `fps` (full keys `fks` for
+/// the first `POLL_FK_MAX`)? A hit beyond the full-key range is accepted on
+/// the fingerprint (only ever an extra wake).
+#[inline]
+pub fn fp_has_key(fps: &[u16], fks: &[u64; POLL_FK_MAX], key: u64) -> bool {
+    let fp = poll_key_fp(key);
+    for (i, &f) in fps.iter().enumerate() {
+        if f == fp && (i >= POLL_FK_MAX || fks[i] == key) { return true; }
+    }
+    false
+}
+
 /// The targeted-wake answer of one probe: the bloom `bits` it contributes and,
 /// optionally, up to three exact object keys explaining (some of) those bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3734,6 +3808,7 @@ pub struct PollSet {
     unkeyed: u64,
     nfp:     usize,
     fps:     [u16; POLL_FP_MAX],
+    fks:     [u64; POLL_FK_MAX],
     /// Interests added with / without keys (diagnostics, `gdwake::note_park`).
     n_keyed:   u16,
     n_unkeyed: u16,
@@ -3756,7 +3831,7 @@ const POLL_VETO: usize = 32;
 
 impl PollSet {
     pub const fn new() -> PollSet {
-        PollSet { mask: 0, unkeyed: 0, nfp: 0, fps: [0; POLL_FP_MAX], n_keyed: 0, n_unkeyed: 0,
+        PollSet { mask: 0, unkeyed: 0, nfp: 0, fps: [0; POLL_FP_MAX], fks: [0; POLL_FK_MAX], n_keyed: 0, n_unkeyed: 0,
                   xkeys: [0; POLL_XKEYS], nx: 0, veto: [0; POLL_VETO], nv: 0, xoff: false }
     }
     /// Add one interest's probe answer.
@@ -3806,6 +3881,7 @@ impl PollSet {
             if t.bits & b == 0 { continue; } // inconsistent answer: ignore the key
             if self.nfp < POLL_FP_MAX {
                 self.fps[self.nfp] = poll_key_fp(k);
+                if self.nfp < POLL_FK_MAX { self.fks[self.nfp] = k; }
                 self.nfp += 1;
                 keyed |= b;
             }
@@ -3821,8 +3897,9 @@ impl PollSet {
     pub fn add_key(&mut self, k: u64) {
         let b = poll_key_bit(k);
         if self.nfp >= POLL_FP_MAX { self.add_bits(b); return; }
-        if !self.fps[..self.nfp].contains(&poll_key_fp(k)) {
+        if !fp_has_key(&self.fps[..self.nfp], &self.fks, k) {
             self.fps[self.nfp] = poll_key_fp(k);
+            if self.nfp < POLL_FK_MAX { self.fks[self.nfp] = k; }
             self.nfp += 1;
         }
         self.mask |= b;
@@ -3854,6 +3931,7 @@ impl PollSet {
     /// The bits only keyed interests explain (see `Task::poll_kbits`).
     pub fn kbits(&self) -> u64 { self.mask & !self.unkeyed }
     pub fn fps(&self) -> &[u16] { &self.fps[..self.nfp] }
+    pub fn fks(&self) -> &[u64] { &self.fks[..self.nfp.min(POLL_FK_MAX)] }
 }
 
 /// Phase 1: publish Blocked-on-poll intent while still executing. No deadline
@@ -3940,7 +4018,7 @@ pub fn block_on_poll_prepare_set(deadline: u64, set: &PollSet) {
     } else {
         let (xk, nx) = set.exclusive_keys();
         RUN_QUEUE.lock().block_on_port_until_keyed(pid, POLL_WAIT_CHANNEL, deadline,
-            set.mask(), set.kbits(), set.fps(), &xk[..nx as usize]);
+            set.mask(), set.kbits(), set.fps(), set.fks(), &xk[..nx as usize]);
     }
     if deadline != u64::MAX {
         register_poll_deadline(deadline);
@@ -3959,12 +4037,14 @@ pub fn block_on_poll_prepare_tag(deadline: u64, t: &PollTag) {
         return;
     }
     let mut fps = [0u16; 3];
+    let mut fks = [0u64; 3];
     let mut nfp = 0;
     let mut keyed = 0u64;
     for &k in &t.keys[..(t.n as usize).min(3)] {
         let b = poll_key_bit(k);
         if t.bits & b == 0 { continue; }
         fps[nfp] = poll_key_fp(k);
+        fks[nfp] = k;
         nfp += 1;
         keyed |= b;
     }
@@ -3976,7 +4056,7 @@ pub fn block_on_poll_prepare_tag(deadline: u64, t: &PollTag) {
         RUN_QUEUE.lock().block_on_port_until(pid, POLL_WAIT_CHANNEL, deadline, t.bits);
     } else {
         RUN_QUEUE.lock().block_on_port_until_keyed(pid, POLL_WAIT_CHANNEL, deadline,
-            t.bits, kbits, &fps[..nfp], &[]);
+            t.bits, kbits, &fps[..nfp], &fks[..nfp], &[]);
     }
     if deadline != u64::MAX {
         register_poll_deadline(deadline);
@@ -4129,8 +4209,8 @@ pub fn poll_listen_begin(set: Option<&PollSet>) -> u32 {
     let mut rq = RUN_QUEUE.lock();
     match set {
         Some(s) => { let (xk, nx) = s.exclusive_keys();
-                     rq.listen_begin(pid, s.mask(), s.kbits(), s.fps(), &xk[..nx as usize]) }
-        None    => rq.listen_begin(pid, POLL_TAG_ALL, 0, &[], &[]),
+                     rq.listen_begin(pid, s.mask(), s.kbits(), s.fps(), s.fks(), &xk[..nx as usize]) }
+        None    => rq.listen_begin(pid, POLL_TAG_ALL, 0, &[], &[], &[]),
     }
 }
 
@@ -4155,7 +4235,7 @@ pub fn poll_listen_begin_since(set: &PollSet, epoch: u64) -> (u32, bool) {
     let mut rq = RUN_QUEUE.lock();
     let moved = POLL_WAKE_EPOCH.load(Ordering::SeqCst) != epoch;
     let (xk, nx) = set.exclusive_keys();
-    (rq.listen_begin(pid, set.mask(), set.kbits(), set.fps(), &xk[..nx as usize]), moved)
+    (rq.listen_begin(pid, set.mask(), set.kbits(), set.fps(), set.fks(), &xk[..nx as usize]), moved)
 }
 
 /// Replace the listener's filter with `set`'s (same id) and take the ring.
@@ -4163,7 +4243,7 @@ pub fn poll_listen_begin_since(set: &PollSet, epoch: u64) -> (u32, bool) {
 pub fn poll_listen_update(id: u32, set: &PollSet) -> Option<WakeRing> {
     let pid = current_pid();
     let (xk, nx) = set.exclusive_keys();
-    RUN_QUEUE.lock().listen_update(pid, id, set.mask(), set.kbits(), set.fps(), &xk[..nx as usize])
+    RUN_QUEUE.lock().listen_update(pid, id, set.mask(), set.kbits(), set.fps(), set.fks(), &xk[..nx as usize])
 }
 
 /// Take the ring (`None` when not listening under `id`).
@@ -4942,6 +5022,43 @@ pub fn set_pagein_eio(comm: &str) {
     g.0[..n].copy_from_slice(&comm.as_bytes()[..n]);
     g.1 = n;
     PAGEIN_EIO_ON.store(true, Ordering::Release);
+}
+
+/// Debug knob `sched.errtrace=<comm>`: syscalls of tasks named `<comm>` that
+/// return a negative errno, and their exits, are logged. Off by default; one
+/// relaxed load when off.
+static ERRTRACE: Mutex<([u8; 15], usize)> = Mutex::new(([0; 15], 0));
+static ERRTRACE_ON: AtomicBool = AtomicBool::new(false);
+
+pub fn set_errtrace(comm: &str) {
+    let n = comm.len().min(15);
+    if n == 0 { return; }
+    let mut g = ERRTRACE.lock();
+    g.0[..n].copy_from_slice(&comm.as_bytes()[..n]);
+    g.1 = n;
+    ERRTRACE_ON.store(true, Ordering::Release);
+}
+
+#[inline(always)]
+pub fn errtrace_enabled() -> bool { ERRTRACE_ON.load(Ordering::Relaxed) }
+
+/// True when `tid`'s comm starts with the `sched.errtrace` name (prefix, so
+/// crun's re-exec'd `crun.XXXXXX` is traced).
+pub fn errtrace_match(tid: Pid) -> bool {
+    if !errtrace_enabled() { return false; }
+    let (want, n) = *ERRTRACE.lock();
+    let mut c = [0u8; 15];
+    let m = comm_of(tid, &mut c);
+    m >= n && c[..n] == want[..n]
+}
+
+fn errtrace_exit(pid: Pid, code: i32, signo: u32, kind: &str) {
+    if errtrace_enabled() && errtrace_match(pid) {
+        let mut c = [0u8; 15];
+        let m = comm_of(pid, &mut c);
+        klog_line(format_args!("\n[ERRTRACE] exit({}) pid={} comm={} code={} sig={}\n",
+            kind, pid, core::str::from_utf8(&c[..m]).unwrap_or("?"), code, signo));
+    }
 }
 
 fn pagein_eio_injected(tid: Pid) -> bool {
@@ -6655,7 +6772,12 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
             false
         }
         mm::vmm::Fault::Segv => {
-            if !quiet { report_segv(pid, addr, is_write); }
+            // A fault inside a fault-tolerant uaccess copy is an expected
+            // EFAULT the arch handler resumes from, not a crash: say nothing
+            // (it used to print "[PF] SEGV ... (kernel)" for every
+            // errtrace probe of a non-pointer argument).
+            let pc = FAULT_PC[unsafe { cpu_id() } % MAX_CPUS].load(Ordering::Relaxed);
+            if !quiet && uaccess::fixup(pc).is_none() { report_segv(pid, addr, is_write); }
             false
         }
     }
@@ -7871,6 +7993,7 @@ pub fn exit_group(code: i32) -> ! {
 /// an `execve` owner's new image later died "of" a signal it never got.
 fn exit_group_as(code: i32, signo: u32) -> ! {
     let pid = current_pid();
+    errtrace_exit(pid, code, signo, "group");
     let tgid = match claim_group_exit(pid) {
         GroupExitClaim::Owner { tgid } => tgid,
         GroupExitClaim::AlreadyDying => {
@@ -8398,6 +8521,7 @@ pub fn exit(code: i32) -> ! {
         fn print_number(n: u32);
     }
     let pid = current_pid();
+    errtrace_exit(pid, code, 0, "thread");
     // A kernel thread is not a process: defensive diversion.
     if RUN_QUEUE.lock().find_pid(pid).map_or(false, |t| t.kthread) { kthread_exit(); }
 

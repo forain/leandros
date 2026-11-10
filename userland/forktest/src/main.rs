@@ -85,6 +85,9 @@ extern "C" {
 
     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> isize;
     pub fn pipe(fds: *mut c_int) -> c_int;
+    pub fn open(path: *const u8, flags: c_int, ...) -> c_int;
+    pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> c_int;
     pub fn close(fd: c_int) -> c_int;
     pub fn usleep(usec: u32) -> c_int;
     pub fn clock_gettime(clk: c_int, tp: *mut timespec) -> c_int;
@@ -112,6 +115,9 @@ extern "C" {
 pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0;
 
+    // Re-exec target of clone_files_exec_unshares.
+    if _argc > 1 { return 0; }
+
     if !test_fork_return_and_waitpid() { failures += 1; }
     if !test_child_malloc_after_fork() { failures += 1; }
     if !test_pthread_atfork_hooks_run() { failures += 1; }
@@ -120,6 +126,16 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
     if !test_cow_threads_fork() { failures += 1; }
     if !test_cow_socket_fork() { failures += 1; }
     if !test_cow_fork_cost() { failures += 1; }
+
+    if !test_clone_files_shared() { failures += 1; }
+    if !test_clone_files_vfork_setns() { failures += 1; }
+    if !test_clone_files_exec_unshares() { failures += 1; }
+    if !test_clone_files_separate() { failures += 1; }
+    if !test_failing_syscall_odd_args() { failures += 1; }
+    if !test_clone_files_socket_shared() { failures += 1; }
+    if !test_clone_files_close_visible() { failures += 1; }
+    if !test_clone_files_epoll_shared() { failures += 1; }
+    if !test_clone_files_netlink_netns() { failures += 1; }
 
     puts(b"--- forktest done ---\n\0".as_ptr());
     failures
@@ -646,4 +662,308 @@ unsafe fn test_cow_socket_fork() -> bool {
     line[n] = b'\n'; n += 1;
     write(1, line.as_ptr() as *const c_void, n);
     report(name, bad_s == 0 && bad_p == 0)
+}
+
+
+// ── CLONE_FILES: parent and child share ONE fd table ─────────────────────────
+
+#[cfg(target_arch = "aarch64")]
+const NR_CLONE: i64 = 220;
+#[cfg(target_arch = "x86_64")]
+const NR_CLONE: i64 = 56;
+#[cfg(target_arch = "aarch64")]
+const NR_SETNS: i64 = 268;
+#[cfg(target_arch = "x86_64")]
+const NR_SETNS: i64 = 308;
+
+const CLONE_FILES_FLAG: i64 = 0x400;
+const SIGCHLD_N: i64 = 17;
+const F_GETFD: c_int = 1;
+const CLONE_NEWNET_N: i64 = 0x4000_0000;
+const NS_NET: &[u8] = b"/proc/self/ns/net\0";
+
+/// clone(`flags`) with no new stack and no CLONE_VM: a fork-like child that
+/// returns 0 into the caller's own code.
+unsafe fn clone_plain(flags: i64) -> pid_t {
+    rt::raw_syscall(NR_CLONE, [flags | SIGCHLD_N, 0, 0, 0, 0, 0]) as pid_t
+}
+
+/// clone(CLONE_VM|CLONE_VFORK|SIGCHLD|`flags`): the child shares the stack, so
+/// it touches no memory — it opens `path` read-only and exits with the fd.
+#[cfg(target_arch = "aarch64")]
+unsafe fn vfork_open_child(path: *const u8, flags: i64) -> i64 {
+    let r: i64;
+    core::arch::asm!(
+        "mov x9, x0",
+        "mov x0, x1",
+        "mov x1, #0", "mov x2, #0", "mov x3, #0", "mov x4, #0",
+        "mov x8, #220",
+        "svc #0",
+        "cbnz x0, 2f",
+        "mov x0, #-100", "mov x1, x9", "mov x2, #0", "mov x8, #56", "svc #0",
+        "mov x8, #93", "svc #0",
+        "2:",
+        inout("x0") path as i64 => r,
+        inout("x1") flags => _,
+        out("x2") _, out("x3") _, out("x4") _, out("x8") _, out("x9") _,
+        options(nostack),
+    );
+    r
+}
+#[cfg(target_arch = "x86_64")]
+unsafe fn vfork_open_child(path: *const u8, flags: i64) -> i64 {
+    let r: i64;
+    core::arch::asm!(
+        "mov r9, rdi",
+        "mov rdi, rsi",
+        "xor esi, esi", "xor edx, edx", "xor r10d, r10d", "xor r8d, r8d",
+        "mov eax, 56",
+        "syscall",
+        "test rax, rax",
+        "jnz 2f",
+        "mov rdi, -100", "mov rsi, r9", "xor edx, edx", "mov eax, 257", "syscall",
+        "mov rdi, rax", "mov eax, 60", "syscall",
+        "2:",
+        inout("rdi") path as i64 => _,
+        inout("rsi") flags => _,
+        out("rax") r,
+        out("rdx") _, out("r10") _, out("r8") _, out("r9") _, out("rcx") _, out("r11") _,
+        options(nostack),
+    );
+    r
+}
+
+unsafe fn reap_code(pid: pid_t) -> c_int {
+    let mut st: c_int = 0;
+    if waitpid(pid, &mut st, 0) != pid || !wifexited(st) { return -1; }
+    wexitstatus(st)
+}
+
+/// Child opens a file, parent sees the fd after wait; parent closes an fd
+/// the child then sees gone.
+unsafe fn test_clone_files_shared() -> bool {
+    let name = b"clone_files_shared\0";
+    let pg = shared_page() as *mut AtomicU32;
+    if pg.is_null() { return report(name, false); }
+    (*pg).store(0, Ordering::SeqCst);
+    let gone = pg.add(1);
+    (*gone).store(0, Ordering::SeqCst);
+    let q = open(b"/dev/null\0".as_ptr(), 0);       // closed by the parent
+    let p = open(b"/dev/null\0".as_ptr(), 0);       // closed by the child
+    if q < 0 || p < 0 { return report(name, false); }
+    let pid = clone_plain(CLONE_FILES_FLAG);
+    if pid < 0 { return report(name, false); }
+    if pid == 0 {
+        let n = open(b"/dev/null\0".as_ptr(), 0);
+        (*pg).store(n as u32, Ordering::SeqCst);
+        close(p);
+        // Wait for the parent to close q, then it must be gone for us too.
+        let mut spins = 0;
+        while (*pg.add(2)).load(Ordering::SeqCst) == 0 && spins < 2000 { usleep(1000); spins += 1; }
+        (*gone).store(if fcntl(q, F_GETFD) < 0 { 1 } else { 2 }, Ordering::SeqCst);
+        _exit(0);
+    }
+    (*pg.add(2)).store(0, Ordering::SeqCst);
+    // let the child open/close first
+    let mut spins = 0;
+    while (*pg).load(Ordering::SeqCst) == 0 && spins < 2000 { usleep(1000); spins += 1; }
+    close(q);
+    (*pg.add(2)).store(1, Ordering::SeqCst);
+    let rc = reap_code(pid);
+    let n = (*pg).load(Ordering::SeqCst) as c_int;
+    let ok = rc == 0 && n > 0
+        && fcntl(n, F_GETFD) >= 0          // child's open is visible
+        && fcntl(p, F_GETFD) < 0           // child's close is visible
+        && (*gone).load(Ordering::SeqCst) == 1; // parent's close is visible
+    if !ok {
+        let mut line = [0u8; 96];
+        let mut k = 0;
+        for &c in b"clone_files_shared: rc=" { line[k] = c; k += 1; }
+        k += fmt_u64(&mut line[k..], rc as u64);
+        for &c in b" n=" { line[k] = c; k += 1; }
+        k += fmt_u64(&mut line[k..], n as u64);
+        for &c in b" gone=" { line[k] = c; k += 1; }
+        k += fmt_u64(&mut line[k..], (*gone).load(Ordering::SeqCst) as u64);
+        line[k] = b'\n'; k += 1;
+        write(1, line.as_ptr() as *const c_void, k);
+    }
+    report(name, ok)
+}
+
+/// The pasta pattern: a CLONE_VM|CLONE_VFORK|CLONE_FILES child opens the netns
+/// fd, exits, and the parent setns()es through it.
+unsafe fn test_clone_files_vfork_setns() -> bool {
+    let name = b"clone_files_vfork_setns\0";
+    let pid = vfork_open_child(NS_NET.as_ptr(), CLONE_FILES_FLAG | 0x100 | 0x4000 | SIGCHLD_N);
+    if pid <= 0 { return report(name, false); }
+    let fd = reap_code(pid as pid_t);
+    let alive = fd > 0 && fcntl(fd, F_GETFD) >= 0;
+    let r = if alive { rt::raw_syscall(NR_SETNS, [fd as i64, CLONE_NEWNET_N, 0, 0, 0, 0]) } else { -9 };
+    report(name, alive && r == 0)
+}
+
+/// A shared-table child that execs gets a private copy: the close-on-exec
+/// sweep must not close the parent's close-on-exec descriptors.
+unsafe fn test_clone_files_exec_unshares() -> bool {
+    let name = b"clone_files_exec_unshares\0";
+    let a = open(b"/dev/null\0".as_ptr(), 0o2000000 /* O_CLOEXEC */);
+    if a < 0 { return report(name, false); }
+    let pid = clone_plain(CLONE_FILES_FLAG);
+    if pid < 0 { return report(name, false); }
+    if pid == 0 {
+        let argv: [*const u8; 3] = [b"forktest\0".as_ptr(), b"--noop\0".as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        execve(b"/bin/forktest\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        _exit(99);
+    }
+    let rc = reap_code(pid);
+    let still = fcntl(a, F_GETFD) >= 0;
+    close(a);
+    report(name, rc == 0 && still)
+}
+
+/// Without CLONE_FILES the tables stay separate.
+unsafe fn test_clone_files_separate() -> bool {
+    let name = b"clone_files_separate\0";
+    let pid = vfork_open_child(NS_NET.as_ptr(), 0x100 | 0x4000 | SIGCHLD_N);
+    if pid <= 0 { return report(name, false); }
+    let fd = reap_code(pid as pid_t);
+    let seen = fd > 0 && fcntl(fd, F_GETFD) >= 0;
+    report(name, fd > 0 && !seen)
+}
+
+/// Regression for the pasta kernel-mode SEGV: a failing syscall whose argument
+/// words are not pointers (setns' nstype 0x40000000 is CLONE_NEWNET) must just
+/// fail, in the parent and in a child -- whatever kernel diagnostics look at
+/// the arguments (`sched.errtrace=forktest` makes this case exercise them).
+unsafe fn test_failing_syscall_odd_args() -> bool {
+    let name = b"failing_syscall_odd_args\0";
+    let r = rt::raw_syscall(NR_SETNS, [9999, CLONE_NEWNET_N, 0x4000_0000, 0, 0, 0]);
+    let pid = clone_plain(CLONE_FILES_FLAG);
+    if pid < 0 { return report(name, false); }
+    if pid == 0 {
+        let r2 = rt::raw_syscall(NR_SETNS, [9998, CLONE_NEWNET_N, 0x4000_0000, 0, 0, 0]);
+        _exit(if r2 == -9 { 0 } else { 1 });
+    }
+    report(name, r == -9 && reap_code(pid) == 0)
+}
+
+// ── CLONE_FILES: the net server's sockets and epoll fds follow the fd table ──
+
+#[cfg(target_arch = "aarch64")]
+mod nr { pub const SOCKET: i64 = 198; pub const BIND: i64 = 200; pub const SENDTO: i64 = 206;
+         pub const RECVFROM: i64 = 207; pub const EPOLL_CREATE1: i64 = 20; pub const EPOLL_CTL: i64 = 21;
+         pub const UNSHARE: i64 = 97; }
+#[cfg(target_arch = "x86_64")]
+mod nr { pub const SOCKET: i64 = 41; pub const BIND: i64 = 49; pub const SENDTO: i64 = 44;
+         pub const RECVFROM: i64 = 45; pub const EPOLL_CREATE1: i64 = 291; pub const EPOLL_CTL: i64 = 233;
+         pub const UNSHARE: i64 = 272; }
+
+unsafe fn sys(n: i64, a: [i64; 6]) -> i64 { rt::raw_syscall(n, a) }
+
+/// sockaddr_in 127.0.0.1:`port` (network order port).
+fn sin_loopback(port_be: u16) -> [u8; 16] {
+    let mut a = [0u8; 16];
+    a[0] = 2; // AF_INET
+    a[2] = (port_be & 0xff) as u8; a[3] = (port_be >> 8) as u8;
+    a[4] = 127; a[7] = 1;
+    a
+}
+
+/// Run `child` in a CLONE_FILES child that stores its result in shared word 0
+/// and exits; returns that word, or -1000 when the child failed to run.
+unsafe fn files_child(pg: *mut AtomicU32, child: unsafe fn() -> i64) -> i64 {
+    (*pg).store(0, Ordering::SeqCst);
+    let pid = clone_plain(CLONE_FILES_FLAG);
+    if pid < 0 { return -1000; }
+    if pid == 0 {
+        let v = child();
+        (*pg).store(v as u32, Ordering::SeqCst);
+        _exit(0);
+    }
+    if reap_code(pid) != 0 { return -1000; }
+    (*pg).load(Ordering::SeqCst) as i32 as i64
+}
+
+unsafe fn child_udp_socket() -> i64 { sys(nr::SOCKET, [2, 2, 0, 0, 0, 0]) }
+
+/// A socket the child created is the parent's too: bind and send on it.
+unsafe fn test_clone_files_socket_shared() -> bool {
+    let name = b"clone_files_socket_shared\0";
+    let pg = shared_page() as *mut AtomicU32;
+    if pg.is_null() { return report(name, false); }
+    let fd = files_child(pg, child_udp_socket);
+    if fd < 0 { return report(name, false); }
+    let sa = sin_loopback(0);
+    let b = sys(nr::BIND, [fd, sa.as_ptr() as i64, 16, 0, 0, 0]);
+    let dst = sin_loopback(9u16.to_be());
+    let msg = b"hi";
+    let s = sys(nr::SENDTO, [fd, msg.as_ptr() as i64, 2, 0, dst.as_ptr() as i64, 16]);
+    close(fd as c_int);
+    report(name, b == 0 && s == 2)
+}
+
+/// The parent's socket, closed by a CLONE_FILES child, is gone for the parent.
+unsafe fn test_clone_files_close_visible() -> bool {
+    let name = b"clone_files_close_visible\0";
+    let pg = shared_page() as *mut AtomicU32;
+    if pg.is_null() { return report(name, false); }
+    let s = sys(nr::SOCKET, [2, 2, 0, 0, 0, 0]);
+    if s < 0 { return report(name, false); }
+    let pid = clone_plain(CLONE_FILES_FLAG);
+    if pid < 0 { return report(name, false); }
+    if pid == 0 { close(s as c_int); _exit(0); }
+    let rc = reap_code(pid);
+    let sa = sin_loopback(0);
+    let b = sys(nr::BIND, [s, sa.as_ptr() as i64, 16, 0, 0, 0]);
+    report(name, rc == 0 && b == -9 && fcntl(s as c_int, F_GETFD) < 0)
+}
+
+unsafe fn child_epoll_create() -> i64 { sys(nr::EPOLL_CREATE1, [0; 6]) }
+
+/// An epoll fd a CLONE_FILES child created is usable by the parent.
+unsafe fn test_clone_files_epoll_shared() -> bool {
+    let name = b"clone_files_epoll_shared\0";
+    let pg = shared_page() as *mut AtomicU32;
+    if pg.is_null() { return report(name, false); }
+    let s = sys(nr::SOCKET, [2, 2, 0, 0, 0, 0]);
+    let ep = files_child(pg, child_epoll_create);
+    if s < 0 || ep < 0 { return report(name, false); }
+    let mut ev = [0u64; 2];
+    ev[0] = 1; // EPOLLIN
+    let r = sys(nr::EPOLL_CTL, [ep, 1, s, ev.as_mut_ptr() as i64, 0, 0]);
+    close(ep as c_int); close(s as c_int);
+    report(name, r == 0)
+}
+
+/// A child in its own netns opens AF_NETLINK; the parent (same fd, shared
+/// table) brings lo up in THAT netns through it.
+unsafe fn child_netns_netlink() -> i64 {
+    if sys(nr::UNSHARE, [CLONE_NEWNET_N, 0, 0, 0, 0, 0]) != 0 { return -77; }
+    sys(nr::SOCKET, [16, 3, 0, 0, 0, 0]) // AF_NETLINK, SOCK_RAW, NETLINK_ROUTE
+}
+
+unsafe fn test_clone_files_netlink_netns() -> bool {
+    let name = b"clone_files_netlink_netns\0";
+    let pg = shared_page() as *mut AtomicU32;
+    if pg.is_null() { return report(name, false); }
+    let fd = files_child(pg, child_netns_netlink);
+    if fd < 0 { return report(name, false); }
+    // RTM_NEWLINK (16), REQUEST|ACK, ifindex 1 (lo), IFF_UP.
+    let mut m = [0u8; 32];
+    m[0..4].copy_from_slice(&32u32.to_ne_bytes());
+    m[4..6].copy_from_slice(&16u16.to_ne_bytes());
+    m[6..8].copy_from_slice(&5u16.to_ne_bytes());
+    m[8..12].copy_from_slice(&1u32.to_ne_bytes());
+    m[20..24].copy_from_slice(&1i32.to_ne_bytes());
+    m[24..28].copy_from_slice(&1u32.to_ne_bytes());
+    m[28..32].copy_from_slice(&1u32.to_ne_bytes());
+    let mut kernel = [0u8; 12]; kernel[0] = 16; // sockaddr_nl, pid 0 groups 0
+    let s = sys(nr::SENDTO, [fd, m.as_ptr() as i64, 32, 0, kernel.as_ptr() as i64, 12]);
+    let mut r = [0u8; 128];
+    let n = sys(nr::RECVFROM, [fd, r.as_mut_ptr() as i64, 128, 0, 0, 0]);
+    let ty = if n >= 20 { u16::from_ne_bytes([r[4], r[5]]) } else { 0 };
+    let err = if n >= 20 { i32::from_ne_bytes([r[16], r[17], r[18], r[19]]) } else { -1 };
+    close(fd as c_int);
+    report(name, s == 32 && ty == 2 && err == 0)
 }

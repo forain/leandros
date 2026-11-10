@@ -422,6 +422,9 @@ pub struct Task {
     pub poll_kbits:    u64,
     pub poll_nfp:      u16,
     pub poll_fps:      [u16; crate::POLL_FP_MAX],
+    /// Full keys of the first `POLL_FK_MAX` fingerprints (index-aligned with
+    /// `poll_fps`): a fingerprint hit in that range must match the full key.
+    pub poll_fks:      [u64; crate::POLL_FK_MAX],
     /// EPOLLEXCLUSIVE (lane epollabi): exact keys for which this park is
     /// wake-one — a keyed wake on one of them that already woke another
     /// such parker leaves this one parked. Valid under `poll_mask`'s rule;
@@ -481,6 +484,9 @@ pub struct Task {
     pub persona: u32,
     /// User namespace (0 = initial); one counted reference.
     pub userns: crate::ns::NsRef,
+    /// Linux `mm->user_ns`: the user namespace of the task at exec (mm creation). Copied across
+    /// fork/clone; unshare(CLONE_NEWUSER) and setns do not change it. One counted reference.
+    pub mm_userns: crate::ns::NsRef,
     /// Active pid namespace (0 = initial); immutable after creation. One counted reference.
     pub pidns: crate::ns::NsRef,
     /// pid_for_children: the namespace this task's children are placed in.
@@ -878,6 +884,7 @@ impl Task {
             poll_wakes:    0,
             poll_nfp:      0,
             poll_fps:      [0; crate::POLL_FP_MAX],
+            poll_fks:      [0; crate::POLL_FK_MAX],
             poll_xkeys:    [0; crate::POLL_XKEYS],
             poll_nx:       0,
             blocked_futex: 0,
@@ -894,6 +901,7 @@ impl Task {
             euid: 0,
             caps: crate::caps::ROOT_CAPS,
             userns: crate::ns::NsRef::INIT,
+            mm_userns: crate::ns::NsRef::INIT,
             pidns: crate::ns::NsRef::INIT,
             pidns_child: crate::ns::NsRef::INIT,
             netns: crate::ns::NsRef::INIT,
@@ -1319,6 +1327,7 @@ impl Task {
             poll_wakes:    0,
             poll_nfp:      0,
             poll_fps:      [0; crate::POLL_FP_MAX],
+            poll_fks:      [0; crate::POLL_FK_MAX],
             poll_xkeys:    [0; crate::POLL_XKEYS],
             poll_nx:       0,
             blocked_futex: 0,
@@ -1335,6 +1344,7 @@ impl Task {
             euid: 0,
             caps: crate::caps::ROOT_CAPS,
             userns: crate::ns::NsRef::INIT,
+            mm_userns: crate::ns::NsRef::INIT,
             pidns: crate::ns::NsRef::INIT,
             pidns_child: crate::ns::NsRef::INIT,
             netns: crate::ns::NsRef::INIT,

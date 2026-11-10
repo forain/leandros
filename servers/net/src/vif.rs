@@ -1,0 +1,196 @@
+//! Per-netns interface table: the dynamic stacks (sids >= `FIRST_DYN`) and
+//! the per-netns routing state that goes with them.
+//!
+//! netns 0 keeps its fixed layout (sid 0 = lo, sids 1..=MAX_NETIF = NICs, see
+//! `iface`). Every other stack is a dynamic sid owned by one netns: its `lo`
+//! and, later, tun/tap and veth ends. Nothing creates a dynamic sid yet; this
+//! is the bookkeeping the next lanes build on.
+//!
+//! Locks: `VIFS` and `NETNS` are leaves. Neither is held while a stack lock
+//! is taken, and a stack lock is never held while taking either (stack lock
+//! -> nothing). The namespace-death hook only sets a bit (it can run under
+//! the run queue); the daemon reaps in `daemon_pass`.
+#![allow(dead_code)]
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+use spin::Mutex;
+
+use crate::iface::{Sid, FIRST_DYN};
+pub(crate) use crate::vifsel::*;
+
+/// `route_select` for a namespace other than 0: its own dynamic stacks only.
+pub(crate) fn route_in_ns(ns: u16, dst: [u8; 4]) -> Option<Sid> {
+    let n = NETNS.lock();
+    let st = n.get(&ns)?;
+    let v = VIFS.lock();
+    select(st, &v, dst)
+}
+
+/// The dynamic sids of `ns` (empty until something creates one).
+pub(crate) fn ns_sids_dyn(ns: u16) -> Vec<Sid> {
+    let n = NETNS.lock();
+    let Some(s) = n.get(&ns) else { return Vec::new() };
+    let v = VIFS.lock();
+    // Bridge ports own no stack.
+    s.sids.iter().copied().filter(|&q| v[q as usize].as_ref().map_or(true, |x| x.master == NO_PEER)).collect()
+}
+
+/// Every live dynamic sid, any namespace (for lookups by listener id, /proc).
+pub(crate) fn all_dyn_sids() -> Vec<Sid> {
+    let v = VIFS.lock();
+    (FIRST_DYN as usize..MAX_STACKS).filter(|&i| v[i].as_ref().map_or(false, |x| x.master == NO_PEER)).map(|i| i as Sid).collect()
+}
+
+/// The user namespace that owns `ns`, for the CAP_NET_ADMIN check
+/// (`ns_capable(CAP_NET_ADMIN, owner_userns(netns))`). 0 for the initial one.
+pub(crate) fn owner_userns(ns: u16) -> u16 { sched::ns::owner_userns(1, ns) }
+
+// ---- namespace death ------------------------------------------------------
+
+pub(crate) static VIFS: Mutex<VifTable> = Mutex::new([const { None }; MAX_STACKS]);
+pub(crate) static NETNS: Mutex<BTreeMap<u16, NetNsState>> = Mutex::new(BTreeMap::new());
+
+static GONE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// `sched::ns` hook: the last reference to flat namespace `id` dropped. Runs
+/// in any context, so it only records the id.
+fn on_ns_gone(id: sched::ns::NsId) {
+    GONE[(id as usize / 64) & 3].fetch_or(1 << (id % 64), Ordering::AcqRel);
+}
+
+/// Install the hook (once, from the daemon's start).
+pub(crate) fn init() {
+    sched::ns::set_ns_gone_hook(on_ns_gone);
+    sched::ns::set_lo_hook(set_lo);
+    sched::ns::set_ifnames_hook(ifnames);
+}
+
+/// `sched::ns` hook: the `idx`-th non-loopback link of `ns` (0 = none), for /proc/sys/net/*/conf/<if>.
+fn ifnames(ns: u16, idx: usize, out: &mut [u8; 16]) -> usize {
+    let v = VIFS.lock();
+    let mut n = 0;
+    for x in v.iter().flatten() {
+        if x.netns != ns || x.kind == VifKind::Lo { continue; }
+        let l = x.name.iter().position(|&c| c == 0).unwrap_or(16);
+        if l == 0 { continue; }
+        if n == idx { out[..l].copy_from_slice(&x.name[..l]); return l; }
+        n += 1;
+    }
+    0
+}
+
+/// The sid of `ns`'s loopback stack when its lo is up (never for ns 0).
+pub(crate) fn lo_up_sid(ns: u16) -> Option<Sid> {
+    if ns == 0 { return None; }
+    let n = NETNS.lock();
+    let l = n.get(&ns)?.lo?;
+    let v = VIFS.lock();
+    v[l as usize].as_ref().filter(|x| x.admin_up).map(|_| l)
+}
+
+/// A previous owner of namespace id `ns` may not have been reaped yet: do it
+/// now, before the new owner creates or looks up any state under the id.
+pub(crate) fn claim(ns: u16) {
+    let (w, b) = (ns as usize / 64 & 3, ns % 64);
+    if GONE[w].fetch_and(!(1 << b), Ordering::AcqRel) & (1 << b) != 0 { reap(ns); }
+}
+
+/// Bring `ns`'s `lo` up or down. The first up allocates its stack (127.0.0.1/8,
+/// the same `LoopDev` as sid 0); later ups and downs only flip the admin bit,
+/// the stack and its sockets stay.
+pub(crate) fn set_lo(ns: u16, up: bool) {
+    if ns == 0 { return; }
+    claim(ns);
+    // Existing lo: flip the bit.
+    {
+        let n = NETNS.lock();
+        if let Some(l) = n.get(&ns).and_then(|s| s.lo) {
+            let mut v = VIFS.lock();
+            if let Some(x) = v[l as usize].as_mut() { x.admin_up = up; }
+            return;
+        }
+    }
+    if !up { return; }
+    // Slots exhausted: namespaces that died since the daemon's last pass.
+    if !VIFS.lock()[FIRST_DYN as usize..].iter().any(|x| x.is_none()) { daemon_pass(); }
+    let sid = {
+        let mut n = NETNS.lock();
+        let mut v = VIFS.lock();
+        let Some(sid) = (FIRST_DYN as usize..MAX_STACKS).find(|&i| v[i].is_none()) else { return };
+        let st = n.entry(ns).or_insert_with(|| NetNsState::new(ns));
+        let mut name = [0u8; 16];
+        name[..2].copy_from_slice(b"lo");
+        v[sid] = Some(Vif {
+            netns: ns, ifindex: 1, name, kind: VifKind::Lo, admin_up: true, mtu: 65536, mac: [0; 6],
+            addrs: alloc::vec![([127, 0, 0, 1], 8)], rxq: Default::default(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER,
+        });
+        st.lo = Some(sid as Sid);
+        st.sids.insert(0, sid as Sid);
+        sid as Sid
+    };
+    *crate::STACKS[sid as usize].lock() = Some(crate::make_loopback_stack());
+}
+
+/// Daemon pass: free the vifs and stacks of every namespace that died. A
+/// reused id cannot race: the bit is cleared before the state is looked up,
+/// and a new owner of the id creates its state afresh.
+pub(crate) fn daemon_pass() {
+    // A closed or exited process's netlink socket still holds its netns.
+    crate::nlsock::prune();
+    for w in 0..4 {
+        if GONE[w].load(Ordering::Acquire) == 0 { continue; }
+        let bits = GONE[w].swap(0, Ordering::AcqRel);
+        for b in 0..64 {
+            if bits & (1 << b) != 0 { reap((w * 64 + b) as u16); }
+        }
+    }
+}
+
+/// Free the given (netns, sid) vifs wherever they live: drop them from their
+/// namespace's sid list and routes, then the table slot, then the stack.
+pub(crate) fn free_vifs(list: &[(u16, Sid)]) {
+    let macs: Vec<[u8; 6]> = { let v = VIFS.lock(); list.iter().filter_map(|&(_, s)| v[s as usize].as_ref().map(|x| x.mac)).collect() };
+    {
+        let mut n = NETNS.lock();
+        let mut v = VIFS.lock();
+        for &(ns, sid) in list {
+            if let Some(st) = n.get_mut(&ns) {
+                st.sids.retain(|&s| s != sid);
+                st.routes.retain(|r| r.oif != sid);
+            }
+            v[sid as usize] = None;
+        }
+    }
+    for &(_, sid) in list { crate::l2::forget(sid); }
+    crate::fwd::forget_macs(&macs);
+    // No table lock is held: the stack locks are taken alone.
+    for &(_, sid) in list { *crate::STACKS[sid as usize].lock() = None; }
+}
+
+fn reap(ns: u16) {
+    let Some(st) = NETNS.lock().remove(&ns) else { return };
+    // Veth ends in this namespace take their peers (any namespace) with them.
+    let mut peers: Vec<(u16, Sid)> = Vec::new();
+    let mut macs: Vec<[u8; 6]> = Vec::new();
+    {
+        let mut v = VIFS.lock();
+        for &sid in st.sids.iter() { if let Some(x) = v[sid as usize].as_ref() { macs.push(x.mac); } }
+        for &sid in st.sids.iter() {
+            if let Some(x) = v[sid as usize].as_ref() {
+                if x.kind == VifKind::Veth && x.peer != NO_PEER {
+                    if let Some(p) = v[x.peer as usize].as_ref() {
+                        if p.netns != ns { peers.push((p.netns, x.peer)); }
+                    }
+                }
+            }
+        }
+        for &sid in st.sids.iter() { v[sid as usize] = None; }
+    }
+    free_vifs(&peers);
+    for &sid in st.sids.iter() { crate::l2::forget(sid); }
+    crate::fwd::forget_macs(&macs); // conntrack entries of the dead container
+    // No stack lock is held here (VIFS/NETNS are released).
+    for &sid in st.sids.iter() { *crate::STACKS[sid as usize].lock() = None; }
+}

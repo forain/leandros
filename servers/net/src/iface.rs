@@ -37,14 +37,27 @@ use drivers::netdev::{self, MAX_NETIF};
 pub(crate) type Sid = u8;
 /// The loopback stack.
 pub(crate) const LO: Sid = 0;
-/// `lo` plus one stack per possible netif.
-pub(crate) const MAX_STACKS: usize = 1 + MAX_NETIF;
+/// Size of the stack table: `lo`, one stack per possible netif, then the
+/// dynamic per-netns stacks of `vif` (sids from [`FIRST_DYN`]).
+pub(crate) use crate::vifsel::MAX_STACKS;
+/// First dynamic sid.
+pub(crate) const FIRST_DYN: Sid = 1 + MAX_NETIF as Sid;
 
 #[inline]
 pub(crate) fn sid_of(netif: u8) -> Sid { netif + 1 }
 
 /// The NIC stacks that exist, in registry order.
 pub(crate) fn nic_sids() -> impl Iterator<Item = Sid> { (0..netdev::count() as u8).map(sid_of) }
+
+/// Every stack of namespace `ns`: netns 0 = lo + the NICs + its dynamic
+/// stacks; another namespace = its own dynamic stacks, plus (until the void
+/// gates go) the legacy lo + NICs.
+pub(crate) fn ns_sids(ns: u16) -> alloc::vec::Vec<Sid> {
+    if ns != 0 { return crate::vif::ns_sids_dyn(ns); }
+    let mut v: alloc::vec::Vec<Sid> = core::iter::once(LO).chain(nic_sids()).collect();
+    v.extend(crate::vif::ns_sids_dyn(ns));
+    v
+}
 
 /// An interface's IPv4 configuration as its stack currently uses it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,8 +143,16 @@ pub(crate) fn is_broadcast(addr: IpAddress) -> bool {
     }))
 }
 
-/// The stack a new flow to `dst` leaves through, or `None` (no route).
-pub(crate) fn route_select(dst: IpAddress) -> Option<Sid> {
+/// The stack a new flow from a socket of network namespace `ns` to `dst`
+/// leaves through, or `None` (no route). A namespace other than 0 first
+/// consults its own dynamic stacks (`vif`); until the "void" gates go, what it
+/// does not hold falls through to the netns-0 table exactly as before.
+pub(crate) fn route_select(ns: u16, dst: IpAddress) -> Option<Sid> {
+    if ns != 0 {
+        // A non-initial netns sees only its own stacks: no fall-through to
+        // netns 0's lo or NICs.
+        return v4(dst).and_then(|d| crate::vif::route_in_ns(ns, d));
+    }
     if is_loopback(dst) { return Some(LO); }
     let d = v4(dst)?;
     let n = netdev::count().min(MAX_NETIF);
@@ -149,6 +170,11 @@ pub(crate) fn route_select(dst: IpAddress) -> Option<Sid> {
         if better { best = Some((c.prefix, r.metric, i)); }
     }
     if let Some((_, _, i)) = best { return Some(sid_of(i as u8)); }
+    drop(t);
+    // Dynamic stacks of netns 0 (veth host ends, tap/tun): connected and explicit routes
+    // win over the NIC default route.
+    if let Some(s) = crate::vif::route_in_ns(0, d) { return Some(s); }
+    let t = IFRT.lock();
     default_route_locked(&t, n).map(sid_of)
 }
 
@@ -203,6 +229,11 @@ pub(crate) fn weak_host_holder(netif: u8, dst: [u8; 4]) -> Option<Sid> {
 /// carrier, and `dst` is on-link or it has a default route).
 pub(crate) fn can_route(sid: Sid, dst: IpAddress) -> bool {
     if sid == LO { return is_loopback(dst); }
+    // A dynamic sid is a netns's lo or a tun/tap stack chosen by the netns's own route table.
+    if sid >= FIRST_DYN {
+        let lo = crate::vif::VIFS.lock()[sid as usize].as_ref().map_or(false, |v| v.kind == crate::vifsel::VifKind::Lo);
+        return if lo { is_loopback(dst) } else { v4(dst).is_some() && !is_loopback(dst) };
+    }
     let Some(d) = v4(dst) else { return false };
     let r = rt(sid - 1);
     match r.cfg {
@@ -397,4 +428,29 @@ pub fn any_ipv4_address() -> bool {
     let n = netdev::count().min(MAX_NETIF);
     let t = IFRT.lock();
     t.iter().take(n).any(|r| r.cfg.is_some())
+}
+
+/// True when `d` is the address of one of the NICs.
+pub(crate) fn is_nic_addr(d: [u8; 4]) -> bool {
+    let n = netdev::count().min(MAX_NETIF);
+    let t = IFRT.lock();
+    (0..n).any(|i| t[i].cfg.map_or(false, |c| c.addr == d))
+}
+
+/// The NIC a forwarded packet to `d` leaves through: (netif, next hop, NIC address).
+/// On-link (longest prefix, lowest metric) first, else the default route. NICs only.
+pub(crate) fn nic_route(d: [u8; 4]) -> Option<(u8, [u8; 4], [u8; 4])> {
+    let n = netdev::count().min(MAX_NETIF);
+    let t = IFRT.lock();
+    let mut best: Option<(u8, u32, usize)> = None;
+    for i in 0..n {
+        let r = &t[i];
+        let Some(c) = r.cfg else { continue };
+        if !r.carrier || !c.on_link(d) { continue; }
+        if best.map_or(true, |(p, m, _)| c.prefix > p || (c.prefix == p && r.metric < m)) { best = Some((c.prefix, r.metric, i)); }
+    }
+    if let Some((_, _, i)) = best { return Some((i as u8, d, t[i].cfg?.addr)); }
+    let i = default_route_locked(&t, n)? as usize;
+    let c = t[i].cfg?;
+    Some((i as u8, c.gateway?, c.addr))
 }

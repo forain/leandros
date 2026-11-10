@@ -1,0 +1,5 @@
+# lane clonefiles - FIXED (aarch64)
+- CLONE_FILES for non-thread clones (kernel/src/syscall.rs fd_share_with, sched/src/fdkey.rs share/rekey_shared): child names the creator's fd table through an fdkey override; the owner leaving (exit, exec, unshare) hands the table to the sharers under a private key, the last sharer frees it. exec/unshare(CLONE_FILES) give a private copy (cloexec applies to it).
+- Kernel-mode SEGV: NOT a crash. errtrace probes every arg as a string (setns a1=0x40000000); copy_from_user faults, the uaccess fixup resumes (-EFAULT) but handle_page_fault still printed "[PF] SEGV ... (kernel)". Process survives (forktest failing_syscall_odd_args PASS with sched.errtrace=forktest before the fix too). Now suppressed when the PC has a uaccess fixup.
+- Tests (forktest): clone_files_shared, clone_files_vfork_setns, clone_files_exec_unshares, clone_files_separate, failing_syscall_odd_args. Fail-first on unfixed kernel: shared + vfork_setns FAIL.
+- Limit: net/epoll tables stay per-process, so a CLONE_FILES child using an inherited socket fd is not covered.

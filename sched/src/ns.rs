@@ -31,7 +31,20 @@ static OWNER_EGID: [AtomicU32; NS_MAX] = [ZERO32; NS_MAX];
 /// when the id is allocated).
 static LO_UP: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 pub fn lo_admin_up(id: NsId) -> bool { id != 0 && LO_UP[id as usize].load(Acquire) != 0 }
-pub fn set_lo_admin_up(id: NsId, up: bool) { if id != 0 { LO_UP[id as usize].store(up as u8, Release); } }
+pub fn set_lo_admin_up(id: NsId, up: bool) {
+    if id == 0 { return; }
+    LO_UP[id as usize].store(up as u8, Release);
+    let h = LO_HOOK.load(Acquire);
+    if h != 0 {
+        // SAFETY: only `set_lo_hook` stores here, always a `fn(NsId, bool)`.
+        let f: fn(NsId, bool) = unsafe { core::mem::transmute(h) };
+        f(id, up);
+    }
+}
+static LO_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Register the callback that makes a namespace's loopback stack follow its admin state
+/// (runs in the caller's process context, after the state is stored).
+pub fn set_lo_hook(f: fn(NsId, bool)) { LO_HOOK.store(f as usize, Release); }
 
 /// uid/gid maps stored COMPOSED: up to `MAP_EXT` extents per namespace, each
 /// `[upper_first, lower_kuid_first, count]` where the lower id is already a
@@ -97,8 +110,50 @@ fn put(mut id: NsId) {
         // owning user namespace (setns lane).
         let ou = OWNER_UNS[id as usize].swap(0, AcqRel);
         if ou != 0 { put(ou); }
+        let h = GONE_HOOK.load(Acquire);
+        if h != 0 {
+            // SAFETY: only `set_ns_gone_hook` stores here, always a `fn(NsId)`.
+            let f: fn(NsId) = unsafe { core::mem::transmute(h) };
+            f(id);
+        }
         id = PARENT[id as usize].load(Acquire);
     }
+}
+
+/// Per-kuid namespace quota (Linux ucounts; host root exempt): a creator may
+/// own at most `MAX_USERNS_PER_UID` user namespaces and `MAX_NS_PER_UID`
+/// namespaces of all kinds, so one uid cannot exhaust the shared table.
+pub const MAX_USERNS_PER_UID: usize = 32;
+pub const MAX_NS_PER_UID: usize = 64;
+static SLOT_USER: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
+
+/// kuid that created live slot `id` (0 for host-created ones).
+fn slot_creator(id: usize) -> u32 {
+    if SLOT_USER[id].load(Acquire) != 0 { return OWNER_EUID[id].load(Acquire); }
+    let o = if IS_MNT[id].load(Acquire) != 0 { OWNER_USER[id].load(Acquire) }
+            else if CGNS_FLAG[id].load(Acquire) != 0 { PARENT[id].load(Acquire) as NsId }
+            else { OWNER_UNS[id].load(Acquire) };
+    if o == 0 { 0 } else { OWNER_EUID[o as usize].load(Acquire) }
+}
+
+/// ENOSPC when `kuid` already owns its share of namespaces.
+fn quota_ok(kuid: u32, want_user: bool) -> bool {
+    if kuid == 0 { return true; }
+    let (mut all, mut users) = (0usize, 0usize);
+    for id in 1..NS_MAX {
+        let r = REFS[id].load(Relaxed);
+        if r == 0 || r == DYING { continue; }
+        if slot_creator(id) == kuid {
+            all += 1;
+            if SLOT_USER[id].load(Acquire) != 0 { users += 1; }
+        }
+    }
+    all < MAX_NS_PER_UID && !(want_user && users >= MAX_USERNS_PER_UID)
+}
+
+/// Quota check for a non-user namespace created under owner user namespace `owner`.
+fn quota_owner_ok(owner: NsId) -> bool {
+    owner == 0 || quota_ok(OWNER_EUID[owner as usize].load(Acquire), false)
 }
 
 /// Create a user namespace owned by (`euid`, `egid`) as a child of `parent`.
@@ -110,6 +165,7 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
     if from_k(0, parent, euid).is_none() || from_k(1, parent, egid).is_none() { return Err(-1); }
     let level = if parent == 0 { 0 } else { LEVEL[parent as usize].load(Acquire) };
     if level >= MAX_USERNS_LEVEL { return Err(-87); }
+    if !quota_ok(euid, true) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             let p = NsRef::get(parent); // the child's reference on its parent
@@ -122,6 +178,7 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
             SETGROUPS_DENY[id].store(if parent != 0 { SETGROUPS_DENY[parent as usize].load(Acquire) } else { 0 }, Release);
             OWNER_EUID[id].store(euid, Release);
             OWNER_EGID[id].store(egid, Release);
+            SLOT_USER[id].store(1, Release);
             return Ok(NsRef(id as NsId));
         }
     }
@@ -143,11 +200,20 @@ static MNT_LIVE: AtomicU32 = AtomicU32::new(0);
 #[inline]
 pub fn mnt_active() -> bool { MNT_LIVE.load(Relaxed) != 0 }
 
+static GONE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register the callback run when the last reference to a (non-mount)
+/// namespace id drops, for any kind: the id is free again. It can run in any
+/// context (possibly under the run queue), so it must not block or take
+/// scheduler locks: record the id and reap later.
+pub fn set_ns_gone_hook(f: fn(NsId)) { GONE_HOOK.store(f as usize, Release); }
+
 /// Owner user namespace recorded for namespace `id`.
 pub fn owner_user(id: NsId) -> NsId { if id == 0 { 0 } else { OWNER_USER[id as usize].load(Acquire) } }
 
 /// Create a mount namespace id owned by user namespace `owner_user`.
 pub fn new_mntns(owner_user: NsId) -> Result<NsRef, isize> {
+    if !quota_owner_ok(owner_user) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             PARENT[id].store(0, Release);
@@ -156,6 +222,7 @@ pub fn new_mntns(owner_user: NsId) -> Result<NsRef, isize> {
             // the owner id cannot be reused while the mount tree lives.
             core::mem::forget(NsRef::get(owner_user));
             OWNER_USER[id].store(owner_user, Release);
+            SLOT_USER[id].store(0, Release);
             IS_MNT[id].store(1, Release);
             MNT_LIVE.fetch_add(1, AcqRel);
             return Ok(NsRef(id as NsId));
@@ -204,12 +271,15 @@ pub fn dying_count() -> usize { (1..NS_MAX).filter(|&i| REFS[i].load(Relaxed) ==
 
 /// Create a flat (parentless) namespace id: net or ipc. Errors: ENOSPC (28).
 pub fn new_flat(owner: NsId) -> Result<NsRef, isize> {
+    if !quota_owner_ok(owner) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             PARENT[id].store(0, Release);
             LEVEL[id].store(0, Release);
             set_owner_userns(id as NsId, owner);
             LO_UP[id].store(0, Release);
+            netctl_reset(id);
+            SLOT_USER[id].store(0, Release);
             return Ok(NsRef(id as NsId));
         }
     }
@@ -377,6 +447,7 @@ static PID_FLAGS: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 pub fn new_pidns(parent: NsId, owner: NsId) -> Result<NsRef, isize> {
     let level = level(parent);
     if level >= MAX_PIDNS_LEVEL { return Err(-28); }
+    if !quota_owner_ok(owner) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             let p = NsRef::get(parent);
@@ -385,6 +456,7 @@ pub fn new_pidns(parent: NsId, owner: NsId) -> Result<NsRef, isize> {
             LEVEL[id].store(level + 1, Release);
             PID_INIT[id].store(0, Release);
             PID_FLAGS[id].store(0, Release);
+            SLOT_USER[id].store(0, Release);
             set_owner_userns(id as NsId, owner);
             crate::pidns::USED.store(true, Relaxed);
             return Ok(NsRef(id as NsId));
@@ -448,14 +520,6 @@ pub fn from_k(kind: usize, ns: NsId, kid: u32) -> Option<u32> {
     None
 }
 
-/// The kernel id for id `vid` as the calling task names it (its user
-/// namespace's view); None when that namespace has no mapping for it. Inverse
-/// of `view_id`: the one place a non-identity map must change.
-pub fn kid_from_view(kind: usize, vid: u32) -> Option<u32> {
-    let ns = current_userns();
-    if mapped(kind, ns, vid) { Some(vid) } else { None }
-}
-
 /// Overflow id shown for ids with no mapping.
 pub const OVERFLOW_ID: u32 = 65534;
 
@@ -463,9 +527,6 @@ pub fn from_k_munged(kind: usize, ns: NsId, kid: u32) -> u32 { from_k(kind, ns, 
 
 /// The kernel uid that is root (id 0) of `ns`, if mapped.
 pub fn root_k(ns: NsId) -> Option<u32> { to_k(0, ns, 0) }
-
-/// Is kernel id `kid` mapped in namespace `ns` (id 0 maps everything)?
-pub fn mapped(kind: usize, ns: NsId, kid: u32) -> bool { from_k(kind, ns, kid).is_some() }
 
 /// An id argument taken from user space, in the caller's user namespace, as a
 /// kernel id. u32::MAX ("leave unchanged") passes through; an id with no
@@ -544,24 +605,32 @@ pub fn gid_map_written(ns: NsId) -> bool { ns == 0 || MAP_N[1][ns as usize].load
 
 pub fn setgroups_denied(ns: NsId) -> bool { ns != 0 && SETGROUPS_DENY[ns as usize].load(Acquire) != 0 }
 
-/// Identity of a process (userns, host euid/egid, effective caps) frozen at
-/// open() time, like Linux `file->f_cred` of a map file.
+/// Credentials (userns, host euid/egid, effective caps) of a process.
 #[derive(Clone, Copy)]
-pub struct Opener(NsId, u32, u32, u64);
+pub struct Cr(NsId, u32, u32, u64);
 
-pub fn snapshot(pid: u32) -> Option<Opener> {
-    writer_info(pid)
+/// Identity of a process frozen at open() time, like Linux `file->f_cred` of a
+/// map file, plus the target namespace captured at open (a counted reference,
+/// so the slot cannot be reused under the fd) and the target thread group.
+pub struct Opener { cr: Cr, _own: NsRef, tns: NsRef, tgid: u32 }
+
+/// Snapshot `pid` (the opener) and the user namespace of `target` (a tgid).
+pub fn snapshot(pid: u32, target: u32) -> Option<Opener> {
+    let rq = crate::RUN_QUEUE.lock();
+    let o = rq.find_pid(pid)?;
+    let t = rq.find_pid(target)?;
+    Some(Opener { cr: Cr(o.userns.id(), o.euid, o.egid, o.caps[0]), _own: o.userns.clone(), tns: t.userns.clone(), tgid: target })
 }
 
-fn writer_info(pid: u32) -> Option<Opener> {
-    crate::RUN_QUEUE.lock().find_pid(pid).map(|t| Opener(t.userns.id(), t.euid, t.egid, t.caps[0]))
+fn writer_info(pid: u32) -> Option<Cr> {
+    crate::RUN_QUEUE.lock().find_pid(pid).map(|t| Cr(t.userns.id(), t.euid, t.egid, t.caps[0]))
 }
 
-/// May the opener write `target`'s maps at all? (open-time EPERM)
-pub fn open_allowed(op: Opener, target: u32, kind: usize) -> bool {
-    let tns = userns_of(target);
+/// May the opener write the captured target namespace's maps at all? (open-time EPERM)
+pub fn open_allowed(op: &Opener, kind: usize) -> bool {
+    let tns = op.tns.id();
     if tns == 0 { return false; }
-    rights(op, tns, kind.min(1)).0
+    rights(op.cr, tns, kind.min(1)).0
 }
 
 static MAP_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -581,8 +650,8 @@ fn writer_rights(w: u32, tns: NsId, kind: usize) -> (bool, bool, u32) {
     rights(op, tns, kind)
 }
 
-fn rights(op: Opener, tns: NsId, kind: usize) -> (bool, bool, u32) {
-    let Opener(wns, eu, eg, caps) = op;
+fn rights(op: Cr, tns: NsId, kind: usize) -> (bool, bool, u32) {
+    let Cr(wns, eu, eg, caps) = op;
     let cap: u32 = if kind == 0 { 7 } else { 6 };
     let has = caps >> cap & 1 != 0;
     let (oe, _) = owner(tns);
@@ -618,16 +687,19 @@ fn lower_to_k(par: NsId, lower: u32, count: u32, kind: usize) -> Option<u32> {
 /// Write uid_map (kind 0) / gid_map (kind 1) of `target`'s user namespace on
 /// behalf of `writer` (Linux map_write / new_idmap_permitted). Returns bytes
 /// consumed or -errno.
-pub fn write_map(opener: Opener, writer: u32, target: u32, kind: usize, data: &[u8]) -> isize {
+pub fn write_map(opener: &Opener, writer: u32, kind: usize, data: &[u8]) -> isize {
     let _g = MapGuard::lock();
-    let tns = userns_of(target);
+    // The namespace captured at open; if the target no longer lives in it
+    // (exited, pid reused) the write fails instead of landing elsewhere.
+    let tns = opener.tns.id();
     if tns == 0 { return -1; }
+    if userns_of(opener.tgid) != tns { return -3; }
     let t = tns as usize;
     if MAP_N[kind][t].load(Acquire) != 0 { return -1; } // written once
     // Rule 1: both the opener (f_cred) and the writer sit in the target
     // namespace or its parent; the privileged branch needs both privileged,
     // and both must be the same id.
-    let (ok_o, priv_o, me_o) = rights(opener, tns, kind);
+    let (ok_o, priv_o, me_o) = rights(opener.cr, tns, kind);
     let (ok_w, priv_w, me_w) = writer_rights(writer, tns, kind);
     if !ok_o || !ok_w { return -1; }
     let privileged = priv_o && priv_w;
@@ -673,7 +745,7 @@ pub fn write_map(opener: Opener, writer: u32, target: u32, kind: usize, data: &[
         // Rule 4: one single-id extent, the translated lower id is the
         // opener's own euid (egid for gid_map); owner is the opener.
         if n != 1 || comp[0].2 != 1 || comp[0].1 != me { return -1; }
-        if owner(tns).0 != opener.1 { return -1; }
+        if owner(tns).0 != opener.cr.1 { return -1; }
         if kind == 1 && SETGROUPS_DENY[t].load(Acquire) == 0 { return -1; }
     }
     for i in 0..n {
@@ -687,12 +759,13 @@ pub fn write_map(opener: Opener, writer: u32, target: u32, kind: usize, data: &[
 }
 
 /// Write /proc/<target>/setgroups ("allow" / "deny"). Bytes consumed or -errno.
-pub fn write_setgroups(opener: Opener, writer: u32, target: u32, data: &[u8]) -> isize {
+pub fn write_setgroups(opener: &Opener, writer: u32, data: &[u8]) -> isize {
     let _g = MapGuard::lock();
-    let tns = userns_of(target);
+    let tns = opener.tns.id();
     if tns == 0 { return -1; }
+    if userns_of(opener.tgid) != tns { return -3; }
     let (ok, _, _) = writer_rights(writer, tns, 1);
-    let (ok_o, _, _) = rights(opener, tns, 1);
+    let (ok_o, _, _) = rights(opener.cr, tns, 1);
     if !ok || !ok_o { return -1; }
     let t = tns as usize;
     let s = data.strip_suffix(b"\n").unwrap_or(data);
@@ -798,7 +871,7 @@ pub fn owner_userns(kind: usize, id: NsId) -> NsId {
 }
 
 /// The caller's state a join is checked against.
-struct Ctx { userns: NsId, admin: bool, pidns: NsId, euid: u32 }
+struct Ctx { userns: NsId, admin: bool, chroot: bool, pidns: NsId, euid: u32 }
 
 fn cap_in(ctx: &Ctx, target_userns: NsId) -> bool { ctx.admin && covers(ctx.userns, target_userns) }
 
@@ -814,7 +887,7 @@ fn check_join(ctx: &mut Ctx, kind: usize, id: NsId, alone: bool, chrooted: bool)
             let creator = id != 0 && PARENT[id as usize].load(Acquire) == ctx.userns
                 && OWNER_EUID[id as usize].load(Acquire) == ctx.euid;
             if !cap_in(ctx, id) && !creator { return -1; }
-            ctx.userns = id; ctx.admin = true;
+            ctx.userns = id; ctx.admin = true; ctx.chroot = true;
             0
         }
         1 | 7 => {
@@ -825,7 +898,14 @@ fn check_join(ctx: &mut Ctx, kind: usize, id: NsId, alone: bool, chrooted: bool)
         2 | 3 => if cap_in(ctx, owner_userns(kind, id)) { 0 } else { -1 },
         5 => if cap_in(ctx, UTS[id as usize].lock().owner) { 0 } else { -1 },
         6 => if !is_cgns(id) { -22 } else if cap_in(ctx, cgns_owner(id)) { 0 } else { -1 },
-        _ => -22, // mnt: not yet (needs per-namespace root/cwd reset)
+        // Linux mntns_install: CAP_SYS_ADMIN over the namespace's owner, plus
+        // CAP_SYS_CHROOT and CAP_SYS_ADMIN in the caller's own user namespace.
+        // A slot that is not a live mount namespace fails closed.
+        4 => {
+            if id != 0 && (IS_MNT[id as usize].load(Acquire) == 0 || REFS[id as usize].load(Acquire) & DYING != 0) { return -22; }
+            if !cap_in(ctx, owner_user(id)) || !ctx.chroot || !ctx.admin { -1 } else { 0 }
+        }
+        _ => -22,
     }
 }
 
@@ -836,7 +916,7 @@ pub fn join(items: alloc::vec::Vec<(usize, NsRef)>, alone: bool, chrooted: bool)
     let mut ctx = {
         let rq = crate::RUN_QUEUE.lock();
         match rq.find_pid(pid) {
-            Some(t) => Ctx { userns: t.userns.id(), admin: t.caps[0] >> 21 & 1 != 0, pidns: t.pidns.id(), euid: t.euid },
+            Some(t) => Ctx { userns: t.userns.id(), admin: t.caps[0] >> 21 & 1 != 0, chroot: t.caps[0] >> 18 & 1 != 0, pidns: t.pidns.id(), euid: t.euid },
             None => return -3,
         }
     };
@@ -850,9 +930,25 @@ pub fn join(items: alloc::vec::Vec<(usize, NsRef)>, alone: bool, chrooted: bool)
     let mut old: alloc::vec::Vec<NsRef> = alloc::vec::Vec::new();
     {
         let mut rq = crate::RUN_QUEUE.lock();
+        let Some(t) = rq.find_pid(pid) else { return -3 };
+        // A mount-namespace join replaces the task's fs struct view: refuse
+        // while root/cwd are shared with other tasks (CLONE_FS), before any
+        // entry is applied.
+        if items.iter().any(|(k, _)| *k == 4) && t.fs_id != 0 {
+            let fid = t.fs_id;
+            if rq.live_slots().filter_map(|i| rq.get(i)).any(|o| o.pid != pid && o.fs_id == fid && o.state != crate::task::TaskState::Zombie) {
+                return -22;
+            }
+        }
         let Some(t) = rq.find_pid_mut(pid) else { return -3 };
         for (kind, n) in items {
             match kind {
+                4 => {
+                    // Root and cwd become the root of the new namespace.
+                    t.root = None;
+                    t.cwd = None;
+                    old.push(core::mem::replace(&mut t.mntns, n));
+                }
                 0 => {
                     t.caps = crate::caps::userns_root_caps(t.caps[3]);
                     old.push(core::mem::replace(&mut t.userns, n));
@@ -881,6 +977,7 @@ static CGNS_FLAG: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 /// New cgroup namespace rooted at cgroup `root`, owned by user namespace
 /// `owner`. The returned reference is the caller's. ENOSPC (28) when full.
 pub fn new_cgns(root: crate::cgroup::CgId, owner: NsId) -> Result<NsRef, isize> {
+    if !quota_owner_ok(owner) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             let p = NsRef::get(owner);
@@ -889,6 +986,7 @@ pub fn new_cgns(root: crate::cgroup::CgId, owner: NsId) -> Result<NsRef, isize> 
             LEVEL[id].store(0, Release);
             CGNS_ROOT[id].store(root, Release);
             crate::cgroup::ns_pin(root);
+            SLOT_USER[id].store(0, Release);
             CGNS_FLAG[id].store(1, Release);
             return Ok(NsRef(id as NsId));
         }
@@ -930,7 +1028,7 @@ pub fn unshare_cgroup() -> isize {
 /// setns(nsfd, nstype): `kind`/`id` come from the fd, which keeps `id` alive.
 pub fn setns_fd(kind: usize, id: NsId, nstype: usize, alone: bool, chrooted: bool) -> isize {
     if nstype != 0 && nstype != clone_flag(kind) { return -22; }
-    if !matches!(kind, 0 | 1 | 2 | 3 | 5 | 6 | 7) { return -22; }
+    if !matches!(kind, 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7) { return -22; }
     join(alloc::vec![(kind, NsRef::get(id))], alone, chrooted)
 }
 
@@ -938,7 +1036,6 @@ pub fn setns_fd(kind: usize, id: NsId, nstype: usize, alone: bool, chrooted: boo
 pub fn setns_pid(tgid: u32, flags: usize, alone: bool, chrooted: bool) -> isize {
     const KNOWN: usize = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
     if flags == 0 || flags & !KNOWN != 0 { return -22; }
-    if flags & CLONE_NEWNS != 0 { return -22; }
     let mut items = alloc::vec::Vec::new();
     {
         let rq = crate::RUN_QUEUE.lock();
@@ -948,6 +1045,7 @@ pub fn setns_pid(tgid: u32, flags: usize, alone: bool, chrooted: bool) -> isize 
         if flags & CLONE_NEWNET != 0 { items.push((2usize, t.netns.clone())); }
         if flags & CLONE_NEWIPC != 0 { items.push((3usize, t.ipcns.clone())); }
         if flags & CLONE_NEWUTS != 0 { items.push((5usize, t.utsns.clone())); }
+        if flags & CLONE_NEWNS != 0 { items.push((4usize, t.mntns.clone())); }
         if flags & CLONE_NEWCGROUP != 0 { items.push((6usize, t.cgns.clone())); }
     }
     join(items, alone, chrooted)
@@ -968,4 +1066,263 @@ pub fn setns_cgroup(id: NsId) -> isize {
     };
     drop(old);
     0
+}
+
+// ── /proc/sys/net (per network namespace) ────────────────────────────────────
+
+pub struct NetCtl { pub path: &'static str, pub def: u32, pub max: u32, pub pair: bool }
+pub const NETCTL_N: usize = 39;
+/// Entries with `pair` own this slot and the next ("lo hi" files); the next has an empty path.
+pub static NETCTL: [NetCtl; NETCTL_N] = [
+    NetCtl { path: "core/somaxconn", def: 4096, max: 2147483647, pair: false },
+    NetCtl { path: "core/rmem_max", def: 212992, max: 2147483647, pair: false },
+    NetCtl { path: "core/wmem_max", def: 212992, max: 2147483647, pair: false },
+    NetCtl { path: "ipv4/ip_forward", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/ip_unprivileged_port_start", def: 1024, max: 65535, pair: false },
+    NetCtl { path: "ipv4/ip_local_port_range", def: 32768, max: 65535, pair: true },
+    NetCtl { path: "", def: 60999, max: 65535, pair: false },
+    NetCtl { path: "ipv4/ping_group_range", def: 1, max: 4294967294, pair: true },
+    NetCtl { path: "", def: 0, max: 4294967294, pair: false },
+    NetCtl { path: "ipv4/ip_nonlocal_bind", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/ip_default_ttl", def: 64, max: 255, pair: false },
+    NetCtl { path: "ipv4/tcp_syncookies", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv4/conf/all/forwarding", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/all/route_localnet", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/all/rp_filter", def: 0, max: 2, pair: false },
+    NetCtl { path: "ipv4/conf/all/arp_notify", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/default/forwarding", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/default/route_localnet", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/default/rp_filter", def: 0, max: 2, pair: false },
+    NetCtl { path: "ipv4/conf/default/arp_notify", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/lo/forwarding", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/lo/route_localnet", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/conf/lo/rp_filter", def: 0, max: 2, pair: false },
+    NetCtl { path: "ipv4/conf/lo/arp_notify", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/all/disable_ipv6", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/all/forwarding", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/all/accept_ra", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv6/conf/all/accept_dad", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv6/conf/default/disable_ipv6", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/default/forwarding", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/default/accept_ra", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv6/conf/default/accept_dad", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv6/conf/lo/disable_ipv6", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/lo/forwarding", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/lo/accept_ra", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv6/conf/lo/accept_dad", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv6/conf/all/autoconf", def: 1, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/default/autoconf", def: 1, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/lo/autoconf", def: 1, max: 1, pair: false },
+];
+const fn netctl_init() -> [[AtomicU32; NETCTL_N]; NS_MAX] {
+    let mut out = [const { [const { AtomicU32::new(0) }; NETCTL_N] }; NS_MAX];
+    let mut i = 0;
+    while i < NS_MAX { let mut k = 0; while k < NETCTL_N { out[i][k] = AtomicU32::new(NETCTL[k].def); k += 1; } i += 1; }
+    // The initial namespace is open to every group, as on common distributions
+    // (systemd sysctl.d); a new namespace starts at the kernel default "1 0".
+    out[0][7] = AtomicU32::new(0); out[0][8] = AtomicU32::new(2147483647);
+    out
+}
+static NETCTL_V: [[AtomicU32; NETCTL_N]; NS_MAX] = netctl_init();
+fn netctl_reset(id: usize) {
+    for k in 0..NETCTL_N { NETCTL_V[id][k].store(NETCTL[k].def, Release); }
+    let mut t = IFCTL.lock();
+    for e in t.iter_mut() { if e.used && e.ns as usize == id { e.used = false; } }
+}
+/// Slot of the file `rel` (path below /proc/sys/net/).
+pub fn netctl_find(rel: &[u8]) -> Option<usize> {
+    NETCTL.iter().position(|c| !c.path.is_empty() && c.path.as_bytes() == rel)
+}
+pub fn netctl_get(ns: NsId, k: usize) -> u32 {
+    if k >= NETCTL_N { return ifctl_get(ns, k); }
+    NETCTL_V[ns as usize][k].load(Acquire)
+}
+/// Text of file `k` in netns `ns` (value, or "lo\thi" for pairs), with trailing newline.
+pub fn netctl_text(ns: NsId, k: usize, out: &mut [u8]) -> usize {
+    let mut n = 0;
+    fn num(mut v: u32, out: &mut [u8], n: &mut usize) {
+        let mut d = [0u8; 10]; let mut i = 0;
+        loop { d[i] = b'0' + (v % 10) as u8; i += 1; v /= 10; if v == 0 { break; } }
+        while i > 0 { i -= 1; out[*n] = d[i]; *n += 1; }
+    }
+    num(netctl_get(ns, k), out, &mut n);
+    if k < NETCTL_N && NETCTL[k].pair { out[n] = b'\t'; n += 1; num(netctl_get(ns, k + 1), out, &mut n); }
+    out[n] = b'\n';
+    n + 1
+}
+/// Parse and store a write to file `k` of netns `ns`. Negative errno on failure.
+pub fn netctl_set(ns: NsId, k: usize, data: &[u8]) -> isize {
+    if k >= NETCTL_N { return ifctl_set(ns, k, data); }
+    let mut v = [0u64; 2]; let mut cnt = 0; let mut i = 0;
+    while i < data.len() {
+        let c = data[i];
+        if c.is_ascii_digit() {
+            if cnt >= 2 { return -22; }
+            let mut x = 0u64;
+            while i < data.len() && data[i].is_ascii_digit() { x = x * 10 + (data[i] - b'0') as u64; if x > u32::MAX as u64 { return -22; } i += 1; }
+            v[cnt] = x; cnt += 1;
+        } else if c == b' ' || c == b'\t' || c == b'\n' || c == b'\0' { i += 1; } else { return -22; }
+    }
+    let want = if NETCTL[k].pair { 2 } else { 1 };
+    if cnt != want { return -22; }
+    for j in 0..want { if v[j] > NETCTL[k + j].max as u64 { return -22; } }
+    if want == 2 && NETCTL[k].path != "ipv4/ping_group_range" && v[0] > v[1] { return -22; }
+    for j in 0..want { NETCTL_V[ns as usize][k + j].store(v[j] as u32, Release); }
+    // Linux devinet_ctl: ip_forward and conf/all/forwarding set every interface.
+    let p = NETCTL[k].path;
+    if p == "ipv4/ip_forward" || p == "ipv4/conf/all/forwarding" {
+        fwd4_fanout(ns, v[0] as u32);
+    }
+    0
+}
+
+// ── per-interface entries (/proc/sys/net/ipv{4,6}/conf/<if>/...) ─────────────
+
+/// Fields of one interface, in slot order. Slot = NETCTL_N + entry * IF_STRIDE + field.
+const IF_FIELDS: [(&str, &str, u32); 9] = [
+    ("ipv4", "forwarding", 1), ("ipv4", "rp_filter", 2), ("ipv4", "route_localnet", 1), ("ipv4", "arp_notify", 1),
+    ("ipv6", "disable_ipv6", 1), ("ipv6", "forwarding", 1), ("ipv6", "accept_ra", 2), ("ipv6", "accept_dad", 2),
+    ("ipv6", "autoconf", 1),
+];
+const IF_STRIDE: usize = 16;
+const IF_MAX: usize = 64;
+#[derive(Clone, Copy)]
+struct IfEnt { used: bool, ns: u16, nlen: u8, name: [u8; 16], v: [u32; 9] }
+static IFCTL: spin::Mutex<[IfEnt; IF_MAX]> =
+    spin::Mutex::new([IfEnt { used: false, ns: 0, nlen: 0, name: [0; 16], v: [0; 9] }; IF_MAX]);
+/// `fn(ns, index, name_out) -> len` (0 = no interface at `index`): the names of the links of a netns.
+static IF_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub fn set_ifnames_hook(f: fn(NsId, usize, &mut [u8; 16]) -> usize) { IF_HOOK.store(f as usize, Release); }
+fn if_name(ns: NsId, idx: usize, out: &mut [u8; 16]) -> usize {
+    let h = IF_HOOK.load(Acquire);
+    if h == 0 { return 0; }
+    // SAFETY: only `set_ifnames_hook` stores here.
+    let f: fn(NsId, usize, &mut [u8; 16]) -> usize = unsafe { core::mem::transmute(h) };
+    f(ns, idx, out)
+}
+fn if_exists(ns: NsId, name: &[u8]) -> bool {
+    let mut b = [0u8; 16];
+    let mut i = 0;
+    loop {
+        let l = if_name(ns, i, &mut b);
+        if l == 0 { return false; }
+        if &b[..l] == name { return true; }
+        i += 1;
+        if i > 64 { return false; }
+    }
+}
+fn static_field(ns: NsId, scope: &str, ipv: &str, field: &str) -> u32 {
+    let mut buf = [0u8; 64]; let mut n = 0;
+    for part in [ipv, "/conf/", scope, "/", field] { for &c in part.as_bytes() { buf[n] = c; n += 1; } }
+    netctl_find(&buf[..n]).map(|k| netctl_get(ns, k)).unwrap_or(0)
+}
+/// Find or create the entry of `(ns, name)`, new ones inheriting `conf/default`. Drops stale entries of `ns`.
+fn ifctl_entry(ns: NsId, name: &[u8]) -> Option<usize> {
+    if name.is_empty() || name.len() > 15 { return None; }
+    if !if_exists(ns, name) { return None; }
+    let mut t = IFCTL.lock();
+    let mut free = None;
+    for (i, e) in t.iter().enumerate() {
+        if e.used && e.ns == ns && &e.name[..e.nlen as usize] == name { return Some(i); }
+        if !e.used && free.is_none() { free = Some(i); }
+    }
+    // Reclaim entries of links that are gone before giving up.
+    if free.is_none() {
+        for i in 0..IF_MAX {
+            let e = t[i];
+            if e.used && !if_exists_unlocked(e.ns, &e.name[..e.nlen as usize]) { t[i].used = false; if free.is_none() { free = Some(i); } }
+        }
+    }
+    let i = free?;
+    let mut v = [0u32; 9];
+    for (j, f) in IF_FIELDS.iter().enumerate() { v[j] = static_field(ns, "default", f.0, f.1); }
+    let mut nm = [0u8; 16]; nm[..name.len()].copy_from_slice(name);
+    t[i] = IfEnt { used: true, ns, nlen: name.len() as u8, name: nm, v };
+    Some(i)
+}
+fn if_exists_unlocked(ns: NsId, name: &[u8]) -> bool { if_exists(ns, name) }
+/// Forget entries of `ns` whose link no longer exists (a re-created link starts from the defaults again).
+fn ifctl_prune(ns: NsId) {
+    let mut i = 0;
+    while i < IF_MAX {
+        let e = { let t = IFCTL.lock(); t[i] };
+        if e.used && e.ns == ns && !if_exists(ns, &e.name[..e.nlen as usize]) {
+            let mut t = IFCTL.lock();
+            if t[i].used && t[i].ns == ns && t[i].name == e.name { t[i].used = false; }
+        }
+        i += 1;
+    }
+}
+/// Slot of `/proc/sys/net/<rel>` as seen from netns `ns` (static files, then per-interface ones).
+pub fn netctl_find_ns(ns: NsId, rel: &[u8]) -> Option<usize> {
+    if let Some(k) = netctl_find(rel) { return Some(k); }
+    let rest = if let Some(r) = rel.strip_prefix(b"ipv4/conf/") { (0usize, r) }
+        else if let Some(r) = rel.strip_prefix(b"ipv6/conf/") { (1usize, r) } else { return None };
+    let sl = rest.1.iter().position(|&c| c == b'/')?;
+    let (name, field) = (&rest.1[..sl], &rest.1[sl + 1..]);
+    let ipv = if rest.0 == 0 { "ipv4" } else { "ipv6" };
+    let f = IF_FIELDS.iter().position(|f| f.0 == ipv && f.1.as_bytes() == field)?;
+    ifctl_prune(ns);
+    let e = ifctl_entry(ns, name)?;
+    Some(NETCTL_N + e * IF_STRIDE + f)
+}
+fn ifctl_get(ns: NsId, k: usize) -> u32 {
+    let (e, f) = ((k - NETCTL_N) / IF_STRIDE, (k - NETCTL_N) % IF_STRIDE);
+    let t = IFCTL.lock();
+    if e < IF_MAX && f < 9 && t[e].used && t[e].ns == ns { t[e].v[f] } else { 0 }
+}
+fn ifctl_set(ns: NsId, k: usize, data: &[u8]) -> isize {
+    let (e, f) = ((k - NETCTL_N) / IF_STRIDE, (k - NETCTL_N) % IF_STRIDE);
+    if e >= IF_MAX || f >= 9 { return -2; }
+    let mut x = 0u64; let mut seen = false;
+    for &c in data {
+        if c.is_ascii_digit() { x = x * 10 + (c - b'0') as u64; seen = true; if x > u32::MAX as u64 { return -22; } }
+        else if c == b'\n' || c == b' ' || c == b'\0' || c == b'\t' { } else { return -22; }
+    }
+    if !seen || x > IF_FIELDS[f].2 as u64 { return -22; }
+    let mut t = IFCTL.lock();
+    if !(t[e].used && t[e].ns == ns) { return -2; }
+    t[e].v[f] = x as u32;
+    0
+}
+/// Linux `devinet_ctl` forward-all: set all/default/lo and every link's `ipv4 forwarding`; mirrors ip_forward.
+fn fwd4_fanout(ns: NsId, v: u32) {
+    for p in ["ipv4/ip_forward", "ipv4/conf/all/forwarding", "ipv4/conf/default/forwarding", "ipv4/conf/lo/forwarding"] {
+        if let Some(k) = netctl_find(p.as_bytes()) { NETCTL_V[ns as usize][k].store(v, Release); }
+    }
+    let mut i = 0; let mut b = [0u8; 16];
+    loop {
+        let l = if_name(ns, i, &mut b);
+        if l == 0 || i > 64 { break; }
+        if let Some(e) = ifctl_entry(ns, &b[..l]) { IFCTL.lock()[e].v[0] = v; }
+        i += 1;
+    }
+}
+/// IPv4 forwarding state of interface `ifname` in netns `ns` (the forward gate of the net server).
+pub fn forwarding(ns: NsId, ifname: &[u8]) -> bool {
+    match ifname {
+        b"all" | b"default" | b"lo" => {
+            let p: &[u8] = match ifname { b"all" => b"ipv4/conf/all/forwarding", b"default" => b"ipv4/conf/default/forwarding", _ => b"ipv4/conf/lo/forwarding" };
+            netctl_find(p).map(|k| netctl_get(ns, k) != 0).unwrap_or(false)
+        }
+        _ => {
+            { let t = IFCTL.lock();
+              for e in t.iter() { if e.used && e.ns == ns && &e.name[..e.nlen as usize] == ifname { return e.v[0] != 0; } } }
+            static_field(ns, "default", "ipv4", "forwarding") != 0
+        }
+    }
+}
+/// May `pid` (an unprivileged ICMP "ping" socket) be created in its netns?
+pub fn ping_allowed(pid: u32) -> bool {
+    let ns = netns_of(pid);
+    let k = netctl_find(b"ipv4/ping_group_range").unwrap();
+    let (lo, hi) = (netctl_get(ns, k), netctl_get(ns, k + 1));
+    let g = crate::egid_of(pid);
+    if lo <= g && g <= hi { return true; }
+    crate::caps::pid_capable_in(pid, owner_userns(2, ns), 13) // CAP_NET_RAW
+}
+/// May `pid` bind `port` in its netns `ns` (ip_unprivileged_port_start / CAP_NET_BIND_SERVICE)?
+pub fn bind_port_allowed(pid: u32, ns: NsId, port: u16) -> bool {
+    let k = netctl_find(b"ipv4/ip_unprivileged_port_start").unwrap();
+    port as u32 >= netctl_get(ns, k) || crate::caps::pid_capable_in(pid, owner_userns(2, ns), 10)
 }

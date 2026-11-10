@@ -144,6 +144,11 @@ pub fn translate(ns: NsId, path: &[u8]) -> Option<Xlat> {
     walk(&g.get(&ns)?.mnts, path)
 }
 
+/// Flags of mount `id` in namespace `ns` (0 when unknown).
+pub fn flags_of(ns: NsId, id: u32) -> u8 {
+    NS.lock().get(&ns).and_then(|n| n.mnts.iter().find(|m| m.id == id)).map_or(0, |m| m.flags)
+}
+
 /// Absolute namespace path of the mountpoint of `m`.
 fn ns_mountpoint(t: &[Mnt], mut i: usize) -> Vec<u8> {
     let mut parts: Vec<&[u8]> = Vec::new();
@@ -177,6 +182,41 @@ pub fn reverse(ns: NsId, backing: &[u8], hint: u32) -> Option<Vec<u8>> {
     }
     None
 }
+
+/// Like [`reverse`] for a descriptor whose mount is unknown: among the mounts
+/// whose path round-trips, the newest wins (a container's rootfs mounts are
+/// newer than the copies of the host's, which cover the same backing paths).
+pub fn reverse_newest(ns: NsId, backing: &[u8]) -> Option<Vec<u8>> {
+    let g = NS.lock();
+    let t = &g.get(&ns)?.mnts;
+    let mut order: Vec<usize> = (0..t.len()).collect();
+    order.sort_by_key(|&i| core::cmp::Reverse(t[i].id));
+    let order2 = order.clone();
+    for i in order {
+        let m = &t[i];
+        if !under(backing, &m.root) { continue; }
+        let mp = ns_mountpoint(t, i);
+        let rest: &[u8] = if &*m.root == b"/" { backing } else { &backing[m.root.len()..] };
+        let cand = join(&mp, rest);
+        if let Some(x) = walk(t, &cand) { if x.backing == backing { return Some(cand); } }
+    }
+    // A descriptor opened before something was mounted on its object (crun
+    // opens the target O_PATH, binds onto /proc/self/fd/N, then sets the
+    // propagation / attributes through the same descriptor): its backing path
+    // names a covered object, so no mount round-trips to it. Linux follows the
+    // mount at the end of the magic link; do the same - the name of the
+    // mountpoint now resolves to the covering mount.
+    for &i in order2.iter() {
+        let m = &t[i];
+        if !under(backing, &m.root) { continue; }
+        let mp = ns_mountpoint(t, i);
+        let rest: &[u8] = if &*m.root == b"/" { backing } else { &backing[m.root.len()..] };
+        let cand = join(&mp, rest);
+        if let Some(x) = walk(t, &cand) { if x.ns_prefix_len == cand.len() && cand.len() > 1 { return Some(cand); } }
+    }
+    None
+}
+
 
 /// Does the namespace have a tree (i.e. was it created through [`copy`])?
 pub fn has_tree(ns: NsId) -> bool { NS.lock().contains_key(&ns) }
@@ -259,6 +299,24 @@ pub fn bind(ns: NsId, src: &[u8], dst: &[u8], rec: bool) -> Result<u32, i32> {
     let mut g = NS.lock();
     let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
     if t.len() >= MNT_MAX { return Err(-28); }
+    let mut add = clone_subtree(t, src, rec)?;
+    let (pid, mp) = attach_point(t, dst)?;
+    add[0].parent = pid;
+    add[0].mp = mp.into_boxed_slice();
+    let top_id = add[0].id;
+    if t.len() + add.len() > MNT_MAX { return Err(-28); }
+    for m in add.iter() { sb_get(m.sb); }
+    t.extend(add);
+    Ok(top_id)
+}
+
+/// Copy the mount tree rooted at namespace path `src` (all of it when `rec`,
+/// only the top mount otherwise). The returned vector starts with the new top
+/// mount, detached (`parent == 0`, `mp == "/"`, not locked); the caller
+/// attaches it and takes the superblock references. A non-recursive copy of a
+/// tree with locked children is EINVAL (it would expose what the locks
+/// cover); an unbindable source is EINVAL.
+fn clone_subtree(t: &[Mnt], src: &[u8], rec: bool) -> Result<Vec<Mnt>, i32> {
     let (si, soff) = walk_idx(t, src).ok_or(-2)?;
     let sub: &[u8] = &src[soff..];
     let sm = &t[si];
@@ -266,11 +324,10 @@ pub fn bind(ns: NsId, src: &[u8], dst: &[u8], rec: bool) -> Result<u32, i32> {
     let sid = sm.id;
     let in_sub = |mp: &[u8]| sub.is_empty() || (mp != b"/" && under(mp, sub));
     if !rec && t.iter().any(|c| c.parent == sid && c.locked & LOCK_MNT != 0 && in_sub(&c.mp)) { return Err(-22); }
-    let (pid, mp) = attach_point(t, dst)?;
     let mut top = sm.clone();
     top.id = alloc_mnt_id();
-    top.parent = pid;
-    top.mp = mp.into_boxed_slice();
+    top.parent = 0;
+    top.mp = b"/".to_vec().into_boxed_slice();
     top.root = join(&sm.root, sub).into_boxed_slice();
     top.locked &= !LOCK_MNT;
     let top_id = top.id;
@@ -302,10 +359,172 @@ pub fn bind(ns: NsId, src: &[u8], dst: &[u8], rec: bool) -> Result<u32, i32> {
             }
         }
     }
-    if t.len() + add.len() > MNT_MAX { return Err(-28); }
+    Ok(add)
+}
+
+// ── New mount API: detached trees, move_mount, mount_setattr (lane opentree) ──
+
+/// Anonymous (detached) mount namespaces made by open_tree(OPEN_TREE_CLONE):
+/// (namespace id, whether the tree root is a directory). The tree lives in
+/// `NS` under that id and is freed with the namespace when its last fd closes.
+static ANON: Mutex<Vec<(NsId, bool)>> = Mutex::new(Vec::new());
+
+/// Where a detached tree's descriptor now lives after move_mount attached it:
+/// (detached id, namespace, namespace path). The descriptor keeps naming the
+/// moved mount, so mount_setattr(fd, "", AT_EMPTY_PATH) and mount(2) on
+/// /proc/self/fd/N act on it at its new place (crun does both right after
+/// moving a cloned file/dir bind into the rootfs). Bounded: oldest dropped.
+static ATTACHED: Mutex<Vec<(NsId, NsId, Vec<u8>)>> = Mutex::new(Vec::new());
+
+pub fn attached_at(anon: NsId) -> Option<(NsId, Vec<u8>)> {
+    ATTACHED.lock().iter().rev().find(|a| a.0 == anon).map(|a| (a.1, a.2.clone()))
+}
+
+/// Is `ns` a detached tree made by open_tree?
+pub fn is_anon(ns: NsId) -> bool { ANON.lock().iter().any(|a| a.0 == ns) }
+
+/// Does the detached tree `ns` have a directory as its root?
+pub fn anon_is_dir(ns: NsId) -> bool { ANON.lock().iter().find(|a| a.0 == ns).map_or(true, |a| a.1) }
+
+/// Identity of a detached tree's root: the (superblock, root path) of its
+/// first mount, as a stable inode number. Two clones of the same mount root
+/// (crun compares the maskdir fd with a fresh clone of the path it was moved
+/// onto) report the same value, as the same dentry does on Linux.
+pub fn anon_root_ident(ns: NsId) -> Option<u64> {
+    let g = NS.lock();
+    let m = g.get(&ns)?.mnts.first()?;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (m.sb as u64);
+    for &c in m.root.iter() { h = (h ^ c as u64).wrapping_mul(0x100_0000_01b3); }
+    Some((h | 0x4000_0000_0000_0000) & !0x8000_0000_0000_0000)
+}
+
+/// open_tree(OPEN_TREE_CLONE): copy the tree at `src` (a path in `ns`) into
+/// the fresh namespace `anon`, which becomes the detached tree.
+pub fn open_tree_clone(ns: NsId, src: &[u8], rec: bool, anon: NsId, anon_owner: NsId, is_dir: bool) -> Result<(), i32> {
+    let add = {
+        let g = NS.lock();
+        let t = &g.get(&ns).ok_or(-22)?.mnts;
+        if t.len() >= MNT_MAX { return Err(-28); }
+        clone_subtree(t, src, rec)?
+    };
     for m in add.iter() { sb_get(m.sb); }
-    t.extend(add);
-    Ok(top_id)
+    ATTACHED.lock().retain(|a| a.0 != anon); // namespace ids are recycled
+    ANON.lock().push((anon, is_dir));
+    NS.lock().insert(anon, MntNs { owner_user: anon_owner, mnts: add, seq: 0 });
+    Ok(())
+}
+
+/// move_mount() of a detached tree: graft it at `dst` in `ns`. The detached
+/// tree is consumed (a second attach is EINVAL).
+pub fn move_attach(ns: NsId, anon: NsId, dst: &[u8]) -> Result<(), i32> {
+    let mut g = NS.lock();
+    let mut mnts = match g.get_mut(&anon) { Some(a) => core::mem::take(&mut a.mnts), None => return Err(-22) };
+    if mnts.is_empty() { return Err(-22); }
+    let res = (|| -> Result<(), i32> {
+        let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+        if t.len() + mnts.len() > MNT_MAX { return Err(-28); }
+        let (pid, mp) = attach_point(t, dst)?;
+        let ri = mnts.iter().position(|m| m.parent == 0).ok_or(-22)?;
+        mnts[ri].parent = pid;
+        mnts[ri].mp = mp.into_boxed_slice();
+        t.extend(core::mem::take(&mut mnts));
+        Ok(())
+    })();
+    if res.is_ok() {
+        let mut a = ATTACHED.lock();
+        if a.len() >= 64 { a.remove(0); }
+        a.push((anon, ns, dst.to_vec()));
+    }
+    if res.is_err() {
+        if let Some(a) = g.get_mut(&anon) { a.mnts = mnts; }
+    }
+    res
+}
+
+/// move_mount() of an existing mount: re-parent the mount whose root is
+/// namespace path `src` onto `dst`. Locked mounts, the namespace root and a
+/// destination inside the moved subtree are refused.
+pub fn move_mnt(ns: NsId, src: &[u8], dst: &[u8]) -> Result<(), i32> {
+    let mut g = NS.lock();
+    let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+    let (si, soff) = walk_idx(t, src).ok_or(-2)?;
+    if soff != src.len() && !(src == b"/" && soff == 0) { return Err(-22); }
+    if t[si].parent == 0 || t[si].locked & LOCK_MNT != 0 { return Err(-22); }
+    let sid = t[si].id;
+    let (di, _) = walk_idx(t, dst).ok_or(-2)?;
+    if di == si || descendants(t, sid).contains(&di) { return Err(-40); }
+    let (pid, mp) = attach_point(t, dst)?;
+    t[si].parent = pid;
+    t[si].mp = mp.into_boxed_slice();
+    Ok(())
+}
+
+/// mount_setattr(): set/clear per-mount flags and/or change propagation of the
+/// mount rooted at `path` (and of everything below it when `rec`). Clearing a
+/// flag the mount is locked to is EPERM; nothing changes on failure.
+pub fn setattr(ns: NsId, path: &[u8], set: u8, clr: u8, prop: usize, rec: bool) -> Result<(), i32> {
+    {
+        let mut g = NS.lock();
+        let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+        let (i, off) = walk_idx(t, path).ok_or(-2)?;
+        if off != path.len() && !(path == b"/" && off == 0) { return Err(-22); }
+        let mut idx: Vec<usize> = alloc::vec![i];
+        if rec { idx.extend(descendants(t, t[i].id)); }
+        if idx.iter().any(|&k| clr & t[k].locked & 0x7f != 0) { return Err(-1); }
+        for &k in idx.iter() { t[k].flags = (t[k].flags & !clr) | set; }
+    }
+    if prop != 0 {
+        let r = set_propagation(ns, path, prop | if rec { MS_REC } else { 0 });
+        if r != 0 { return Err(r); }
+    }
+    Ok(())
+}
+
+/// Namespace references held by `nsfs` superblocks: sb id -> namespace id.
+static NSFS_SB: Mutex<Vec<(SbId, u16)>> = Mutex::new(Vec::new());
+
+fn nsfs_destroy(root: &[u8]) {
+    let n = root.iter().rev().take_while(|c| c.is_ascii_digit()).count();
+    let sbid: SbId = core::str::from_utf8(&root[root.len() - n..]).ok().and_then(|d| d.parse().ok()).unwrap_or(0);
+    let id = {
+        let mut t = NSFS_SB.lock();
+        t.iter().position(|e| e.0 == sbid).map(|i| t.remove(i).1)
+    };
+    if let Some(id) = id { crate::sched_ns_put(id); }
+}
+
+/// A superblock for a bound nsfs file: it OWNS one namespace reference
+/// (already taken by the caller) and drops it when the last mount (or mount
+/// namespace copy) of the file goes away.
+pub fn nsfs_sb_new(id: u16) -> SbId {
+    let (sb, _) = sb_create("nsfs", Some(nsfs_destroy));
+    NSFS_SB.lock().push((sb, id));
+    sb
+}
+
+/// Bind a namespace file (synthetic source `/.leandros-ns/<kind>/<id>`, one
+/// namespace reference already taken for `synth`) onto the file at namespace
+/// path `dst` of mount namespace `ns`. On error the reference is dropped.
+pub fn bind_nsfs(ns: NsId, synth: &[u8], dst: &[u8]) -> Result<u32, i32> {
+    let Some((_, id)) = ns0::ns_src(synth) else { return Err(-22) };
+    let sb = nsfs_sb_new(id);
+    let r = (|| {
+        let mut g = NS.lock();
+        let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+        if t.len() >= MNT_MAX { return Err(-28); }
+        let (pid, mp) = attach_point(t, dst)?;
+        let mut m = mk(alloc_mnt_id(), pid, &mp, synth, sb);
+        m.flags = MNT_NOSUID | MNT_RELATIME;
+        m.fstype = "nsfs";
+        m.device = Box::from(&b"nsfs"[..]);
+        let mid = m.id;
+        sb_get(sb);
+        t.push(m);
+        Ok(mid)
+    })();
+    // No mount took the reference: putting an unreferenced sb destroys it.
+    if r.is_err() { sb_put(sb); }
+    r
 }
 
 /// Attach a brand-new mount (a fresh superblock, already referenced by the
@@ -325,6 +544,22 @@ pub fn add_mount(ns: NsId, dst: &[u8], root: &[u8], sb: SbId, fstype: &'static s
     Ok(id)
 }
 
+/// Linux `mnt_already_visible` for proc and sysfs mounts by a task in a
+/// non-initial user namespace: some mount of `fstype` exposing the whole
+/// filesystem (root = its tree root) is in `ns`, with nothing locked stacked
+/// on it and no locked flag the new mount would drop.
+pub fn fully_visible(ns: NsId, fstype: &str, new_flags: u8) -> bool {
+    let g = NS.lock();
+    let Some(n) = g.get(&ns) else { return false };
+    let t = &n.mnts;
+    let full: &[u8] = if fstype == "proc" { b"/proc" } else { b"/sys" };
+    t.iter().any(|m| {
+        m.fstype == fstype && &*m.root == full
+            && (m.locked & 0x7f) & !new_flags == 0
+            && !t.iter().any(|c| c.parent == m.id && c.locked & LOCK_MNT != 0)
+    })
+}
+
 /// umount2 of the mount at namespace path `target`. The mount must be the
 /// final component's mountpoint (EINVAL otherwise), not the namespace root,
 /// not locked (EINVAL), and without submounts unless `detach` (EBUSY). A
@@ -334,7 +569,8 @@ pub fn umount(ns: NsId, target: &[u8], detach: bool) -> Result<(), i32> {
         let mut g = NS.lock();
         let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
         let (i, off) = walk_idx(t, target).ok_or(-22)?;
-        if off != target.len() { return Err(-22); }
+        // `/` names the top of the root's overmount stack (offset 0).
+        if off != target.len() && !(target == b"/" && off == 0) { return Err(-22); }
         let m = &t[i];
         if m.parent == 0 { return Err(-22); }
         if m.locked & LOCK_MNT != 0 { return Err(-22); }
@@ -350,6 +586,80 @@ pub fn umount(ns: NsId, target: &[u8], detach: bool) -> Result<(), i32> {
     Ok(())
 }
 
+/// Result of a tree pivot: how stored namespace paths move.
+pub struct PivotMap {
+    /// Namespace path of the new root before the pivot.
+    pub new_root: Vec<u8>,
+    /// Namespace path (in the new tree) at which the old root now sits.
+    pub old_at: Vec<u8>,
+}
+
+impl PivotMap {
+    /// Where the namespace path `p` (absolute, normalised) lives after the
+    /// pivot. A path under the new root loses that prefix; the rest of the
+    /// old tree is reached through the old root's new attachment point. The
+    /// old root itself (`/`) is the new root for the tasks standing on it.
+    pub fn map(&self, p: &[u8]) -> Vec<u8> {
+        if p == b"/" { return b"/".to_vec(); }
+        if under(p, &self.new_root) {
+            let rest = &p[self.new_root.len()..];
+            return if rest.is_empty() { b"/".to_vec() } else { rest.to_vec() };
+        }
+        if &*self.old_at == b"/" { return p.to_vec(); }
+        let mut v = self.old_at.clone();
+        v.extend_from_slice(p);
+        v
+    }
+}
+
+fn is_shared(m: &Mnt) -> bool { m.group != 0 }
+
+/// pivot_root(2) in mount namespace `ns` (not the initial one). The mount at
+/// `new_path` becomes the root mount and the old root mount is attached at
+/// `put_old`; `MNT_LOCKED` moves from the old root to the new one. Errors
+/// follow Linux: EINVAL (not a mountpoint, put_old not under new_root, a
+/// shared parent, new root locked), EBUSY (new_root or put_old on the current
+/// root mount).
+pub fn pivot_root(ns: NsId, new_path: &[u8], put_old: &[u8]) -> Result<PivotMap, i32> {
+    let mut g = NS.lock();
+    let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+    let (ri, _) = walk_idx(t, b"/").ok_or(-22)?;
+    if t[ri].parent != 0 { return Err(-22); }
+    let (ni, noff) = walk_idx(t, new_path).ok_or(-22)?;
+    if noff != new_path.len() && !(new_path == b"/" && noff == 0) { return Err(-22); }
+    let (yi, yoff) = walk_idx(t, put_old).ok_or(-22)?;
+    if ni == ri || yi == ri {
+        // The root mount: new_root on it is EBUSY; a put_old on it is either
+        // EBUSY or, outside the new root, EINVAL.
+        if ni == ri { return Err(-16); }
+    }
+    let xi = t.iter().position(|m| m.id == t[ni].parent).ok_or(-22)?;
+    if is_shared(&t[yi]) || is_shared(&t[xi]) { return Err(-22); }
+    if t[ni].locked & LOCK_MNT != 0 { return Err(-22); }
+    // put_old must lie inside the new root's tree.
+    let mut cur = yi;
+    let mut inside = false;
+    for _ in 0..256 {
+        if cur == ni { inside = true; break; }
+        match t.iter().position(|m| m.id == t[cur].parent) { Some(p) => cur = p, None => break }
+    }
+    if !inside { return Err(-22); }
+    if yi == ri { return Err(-16); }
+    let rel: Vec<u8> = if yoff >= put_old.len() { b"/".to_vec() } else { put_old[yoff..].to_vec() };
+    let new_root: Vec<u8> = if new_path.is_empty() { b"/".to_vec() } else { new_path.to_vec() };
+    let old_at: Vec<u8> = if put_old.len() <= new_root.len() || put_old == &new_root[..] { b"/".to_vec() }
+        else if new_root == b"/" { put_old.to_vec() } else { put_old[new_root.len()..].to_vec() };
+    let (nid, yid) = (t[ni].id, t[yi].id);
+    let _ = nid;
+    // Re-parent: the old root hangs off put_old, the new root becomes the root.
+    t[ri].parent = yid;
+    t[ri].mp = rel.into_boxed_slice();
+    t[ni].parent = 0;
+    t[ni].mp = b"/".to_vec().into_boxed_slice();
+    if t[ri].locked & LOCK_MNT != 0 { t[ri].locked &= !LOCK_MNT; t[ni].locked |= LOCK_MNT; }
+    Ok(PivotMap { new_root, old_at })
+}
+
 /// Owner user namespace of `ns`'s mount tree.
 pub fn owner_of(ns: NsId) -> Option<NsId> { NS.lock().get(&ns).map(|n| n.owner_user) }
 
@@ -358,6 +668,7 @@ pub fn mount_count(ns: NsId) -> usize { NS.lock().get(&ns).map_or(0, |n| n.mnts.
 
 /// Free the tree of `ns`, dropping its superblock references.
 pub fn release(ns: NsId) {
+    ANON.lock().retain(|a| a.0 != ns);
     let t = NS.lock().remove(&ns);
     if let Some(t) = t { for m in t.mnts.iter() { sb_put(m.sb); } }
 }
@@ -750,6 +1061,25 @@ pub struct Alias {
 }
 
 static ALIASES: Mutex<Vec<Alias>> = Mutex::new(Vec::new());
+/// Mount points created by binding a path onto itself.
+static SELF_BINDS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Prefix of the synthetic source of a bind mount whose source is an nsfs
+/// file: `/.leandros-ns/<link kind>/<namespace id>`. The alias holds one
+/// reference on that namespace for as long as it is mounted.
+pub const NS_SRC: &[u8] = b"/.leandros-ns/";
+
+/// `(link kind, namespace id)` when `p` names a bound namespace.
+pub fn ns_src(p: &[u8]) -> Option<(u8, u16)> {
+    let r = p.strip_prefix(NS_SRC)?;
+    let sl = r.iter().position(|&c| c == b'/')?;
+    let k: u8 = core::str::from_utf8(&r[..sl]).ok()?.parse().ok()?;
+    let id: u16 = core::str::from_utf8(&r[sl + 1..]).ok()?.parse().ok()?;
+    Some((k, id))
+}
+
+/// Mount points made by self-binds (for `ns0_mountpoints`).
+pub fn self_binds() -> Vec<Vec<u8>> { SELF_BINDS.lock().clone() }
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// `p` equals `prefix` or lies below it (component boundary respected).
@@ -776,33 +1106,71 @@ fn rebase(p: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
 /// alias whose source lies under its own mount point (a loop); ENOSPC when
 /// the table is full.
 pub fn add(mountpoint: &[u8], source: &[u8], fstype: &'static str, device: &[u8]) -> Result<(), i32> {
-    if mountpoint == source { return Ok(()); }
+    if mountpoint == source {
+        // A self-bind (`mount --bind /run/netns /run/netns`): the path stays
+        // as it is, but becomes a mount point so its propagation can change.
+        let mut sb = SELF_BINDS.lock();
+        if !sb.iter().any(|m| m.as_slice() == mountpoint) {
+            if sb.len() >= MAX_ALIASES { return Err(-28); }
+            sb.push(mountpoint.to_vec());
+        }
+        return Ok(());
+    }
     if under(source, mountpoint) { return Err(-22); }
     let mut t = ALIASES.lock();
     if let Some(a) = t.iter_mut().find(|a| a.mountpoint == mountpoint) {
-        if let Some(id) = crate::devpts::inst_of_backing(&a.source) { crate::devpts::destroy(id); }
+        let old_dp = crate::devpts::inst_of_backing(&a.source);
+        let old = tmpfs_inst_of(&a.source);
+        if let Some((_, id)) = ns_src(&a.source) { crate::sched_ns_put(id); }
         a.source = source.to_vec();
         a.fstype = fstype;
         a.device = device.to_vec();
+        if let Some(n) = tmpfs_inst_of(source) { super::sb_get(n); }
+        if let Some(n) = crate::devpts::inst_of_backing(source) { crate::devpts::get(n); }
+        drop(t);
+        if let Some(n) = old { super::sb_put(n); }
+        if let Some(n) = old_dp { crate::devpts::put(n); }
         return Ok(());
     }
     if t.len() >= MAX_ALIASES { return Err(-28); }
     t.push(Alias { mountpoint: mountpoint.to_vec(), source: source.to_vec(), fstype,
                    device: device.to_vec() });
     ACTIVE.store(t.len(), Ordering::Release);
+    // A mount holds a reference on the tmpfs instance it exposes.
+    if let Some(n) = tmpfs_inst_of(source) { super::sb_get(n); }
+    if let Some(n) = crate::devpts::inst_of_backing(source) { crate::devpts::get(n); }
     Ok(())
+}
+
+/// The superblock id when `p` names (or lies below) a tmpfs instance root
+/// `/.leandros-sb/tmpfs/<id>`.
+pub fn tmpfs_inst_of(p: &[u8]) -> Option<u32> {
+    let r = p.strip_prefix(b"/.leandros-sb/tmpfs/".as_slice())?;
+    let end = r.iter().position(|&c| c == b'/').unwrap_or(r.len());
+    core::str::from_utf8(&r[..end]).ok()?.parse().ok()
 }
 
 /// Remove the alias mounted exactly at `mountpoint`. False when none is.
 pub fn remove(mountpoint: &[u8]) -> bool {
+    {
+        let mut sb = SELF_BINDS.lock();
+        if let Some(i) = sb.iter().position(|m| m.as_slice() == mountpoint) { sb.remove(i); return true; }
+    }
     let mut t = ALIASES.lock();
+    let nsid = t.iter().find(|a| a.mountpoint == mountpoint).and_then(|a| ns_src(&a.source));
     let before = t.len();
     let gone = t.iter().find(|a| a.mountpoint == mountpoint).and_then(|a| crate::devpts::inst_of_backing(&a.source));
+    let tmp_inst = t.iter().find(|a| a.mountpoint == mountpoint).and_then(|a| tmpfs_inst_of(&a.source));
     t.retain(|a| a.mountpoint != mountpoint);
     ACTIVE.store(t.len(), Ordering::Release);
-    // A devpts instance lives as long as its mount.
-    if let Some(id) = gone { crate::devpts::destroy(id); }
-    t.len() != before
+    let removed = t.len() != before;
+    drop(t);
+    // A devpts instance lives as long as its last mount (copies hold refs).
+    if let Some(id) = gone { crate::devpts::put(id); }
+    // The last mount of a tmpfs instance frees it.
+    if let Some(n) = tmp_inst { super::sb_put(n); }
+    if removed { if let Some((_, id)) = nsid { crate::sched_ns_put(id); } }
+    removed
 }
 
 /// Rewrite a namespace path to the backing path the VFS serves, following
@@ -854,7 +1222,7 @@ pub fn crosses(path: &[u8]) -> bool {
 /// The mount point of the alias whose mount point is exactly `path`.
 pub fn is_mountpoint(path: &[u8]) -> bool {
     if ACTIVE.load(Ordering::Acquire) == 0 { return false; }
-    ALIASES.lock().iter().any(|a| a.mountpoint == path)
+    ALIASES.lock().iter().any(|a| a.mountpoint == path) || SELF_BINDS.lock().iter().any(|m| m.as_slice() == path)
 }
 
 /// Snapshot `(mountpoint, source, fstype, device)` of every alias.
@@ -865,8 +1233,9 @@ pub fn entries() -> Vec<(Vec<u8>, Vec<u8>, &'static str, Vec<u8>)> {
 
 /// Snapshot `(device, mountpoint, fstype)` of every alias, for /proc/mounts.
 pub fn list() -> Vec<(Vec<u8>, Vec<u8>, &'static str)> {
-    if ACTIVE.load(Ordering::Acquire) == 0 { return Vec::new(); }
-    ALIASES.lock().iter().map(|a| (a.device.clone(), a.mountpoint.clone(), a.fstype)).collect()
+    let mut v: Vec<_> = ALIASES.lock().iter().map(|a| (a.device.clone(), a.mountpoint.clone(), a.fstype)).collect();
+    for m in SELF_BINDS.lock().iter() { v.push((b"none".to_vec(), m.clone(), "none")); }
+    v
 }
 
 }

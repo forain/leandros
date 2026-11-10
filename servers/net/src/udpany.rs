@@ -81,11 +81,11 @@ pub(crate) fn of(ofd: u32) -> Option<[Option<SocketHandle>; MAX_STACKS]> {
 
 /// Give a just-materialized wildcard server socket (`primary` on `psid`,
 /// port `port`) a socket on every other stack. Caller holds SOCK_TABLES.
-pub(crate) fn create(ofd: u32, psid: Sid, primary: SocketHandle, port: u16) {
+pub(crate) fn create(ns: u16, ofd: u32, psid: Sid, primary: SocketHandle, port: u16) {
     if ofd == 0 { return; }
     let mut hs = [None; MAX_STACKS];
     hs[psid as usize] = Some(primary);
-    for sid in core::iter::once(LO).chain(iface::nic_sids()) {
+    for sid in iface::ns_sids(ns) {
         if sid == psid { continue; }
         let mut stack = stack_for(sid);
         let Some(s) = stack.as_mut() else { continue };
@@ -96,7 +96,8 @@ pub(crate) fn create(ofd: u32, psid: Sid, primary: SocketHandle, port: u16) {
         hs[sid as usize] = Some(s.socket_set.add(socket));
     }
     MIRRORS.lock().insert(ofd, hs);
-    PORTS.lock().register(ofd, port);
+    // Only netns 0's servers follow a late NIC stack (`adopt`).
+    if ns == 0 { PORTS.lock().register(ofd, port); }
 }
 
 /// The socket is gone (its last holder let go): remove the mirrors (the
@@ -134,10 +135,10 @@ pub(crate) fn collapse(ofd: u32, keep: Sid) -> Option<Option<SocketHandle>> {
 }
 
 /// The stack and socket a datagram to `dest` leaves from.
-pub(crate) fn send_via(hs: &[Option<SocketHandle>; MAX_STACKS], primary: (Sid, SocketHandle), dest: IpAddress)
+pub(crate) fn send_via(ns: u16, hs: &[Option<SocketHandle>; MAX_STACKS], primary: (Sid, SocketHandle), dest: IpAddress)
     -> (Sid, SocketHandle)
 {
-    match iface::route_select(dest) {
+    match iface::route_select(ns, dest) {
         Some(sid) => match hs[sid as usize] {
             Some(h) => (sid, h),
             None => primary,

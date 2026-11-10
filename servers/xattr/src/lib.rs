@@ -164,15 +164,6 @@ pub struct Cred {
     pub view: IdView,
 }
 
-/// chmod(2) by a caller that is neither root nor in the file's group drops
-/// S_ISGID from the new mode (Linux `setattr_prepare`: without CAP_FSETID,
-/// `!in_group_p(i_gid)` clears it). The owner check is done by the caller;
-/// this only filters the mode.
-pub fn chmod_filter_mode(cred: &Cred, file_gid: u32, mode: u32) -> u32 {
-    const S_ISGID: u32 = 0o2000;
-    if cred.euid != 0 && !cred.in_group(file_gid) { mode & !S_ISGID } else { mode }
-}
-
 /// `chmod_filter_mode` with CAP_FSETID over the inode (`setattr_prepare`):
 /// the capability must be held in the caller's user namespace AND the
 /// inode's owner/group must be mapped there.
@@ -203,11 +194,6 @@ impl Cred {
         self.host_root
             || (self.view.ns != 0 && cap < 64 && self.caps >> cap & 1 != 0
                 && self.view.maps_k(0, uid) && self.view.maps_k(1, gid))
-    }
-    /// Namespace-scoped capability not tied to an inode.
-    #[inline]
-    pub fn cap_any(&self, cap: u32) -> bool {
-        self.host_root || (self.view.ns != 0 && cap < 64 && self.caps >> cap & 1 != 0)
     }
     /// Linux `fsuidgid_has_mapping`: false when the caller's fsuid or fsgid
     /// is unmapped in its own namespace (creating a file would be EOVERFLOW).
@@ -667,16 +653,6 @@ pub const MAY_READ: u8 = 4;
 pub fn may_access(meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>, mask: u8) -> bool {
     access_check(meta, cred, acl,
                  mask & MAY_READ != 0, mask & MAY_WRITE != 0, mask & MAY_EXEC != 0)
-}
-
-/// The sticky-directory rule (Linux `check_sticky`): unlinking, renaming over
-/// or renaming away an entry inside a directory with S_ISVTX set is allowed
-/// only to the entry's owner, the directory's owner, or root. `dir` is the
-/// parent's meta, `victim_uid` the owner of the entry being removed/replaced.
-/// Returns true when the operation must be refused with EPERM.
-#[inline]
-pub fn sticky_denies(dir: &FileMeta, victim_uid: u32, euid: u32) -> bool {
-    dir.mode & S_ISVTX != 0 && euid != 0 && euid != victim_uid && euid != dir.uid
 }
 
 /// `sticky_denies` for a namespace-aware caller (Linux `check_sticky`): the

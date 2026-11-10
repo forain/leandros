@@ -22,12 +22,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/utsname.h>
+#include <sys/prctl.h>
 #include <linux/sched.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <stddef.h>
 #include <pthread.h>
 #include <sys/mount.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -1012,6 +1014,302 @@ static int t_netns_lo_up_ack(void)
     CHECK(ns_child_netns(netns_lo_up_body) == 0);
     return 0;
 }
+
+/* SIOCSIFFLAGS on a netns's lo (crun brings loopback up this way) agrees with netlink. */
+static int sioc_lo_body(int userns)
+{
+    static char b[8192];
+    if (unshare((userns ? CLONE_NEWUSER : 0) | CLONE_NEWNET) != 0) return 2;
+    int u = socket(AF_INET, SOCK_DGRAM, 0), s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (u < 0 || s < 0) return 3;
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo");
+    if (ioctl(u, SIOCGIFFLAGS, &q) != 0 || (q.ifr_flags & IFF_UP)) return 4;
+    if (ioctl(u, SIOCGIFINDEX, &q) != 0 || q.ifr_ifindex != 1) return 5;
+    memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo"); q.ifr_flags = IFF_UP | IFF_RUNNING;
+    if (ioctl(u, SIOCSIFFLAGS, &q) != 0) return 6;
+    memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo");
+    if (ioctl(u, SIOCGIFFLAGS, &q) != 0 || (q.ifr_flags & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING)) return 7;
+    int n = nl_rt(s, RTM_GETLINK, NLM_F_DUMP, 0, 0, 0, b, sizeof b);
+    int ok = 0;
+    for (struct nlmsghdr *h = (struct nlmsghdr *)b; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n))
+        if (h->nlmsg_type == RTM_NEWLINK && (((struct ifinfomsg *)NLMSG_DATA(h))->ifi_flags & IFF_UP)) ok = 1;
+    if (!ok) return 8;
+    memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo"); q.ifr_flags = 0;
+    if (ioctl(u, SIOCSIFFLAGS, &q) != 0) return 9;
+    memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo");
+    if (ioctl(u, SIOCGIFFLAGS, &q) != 0 || (q.ifr_flags & IFF_UP)) return 10;
+    if (!userns) { /* unprivileged user: EPERM */
+        if (setgid(1000) < 0 || setuid(1000) < 0) return 11;
+        memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo"); q.ifr_flags = IFF_UP;
+        errno = 0;
+        if (ioctl(u, SIOCSIFFLAGS, &q) == 0 || errno != EPERM) return 12;
+    }
+    return 0;
+}
+static int sioc_lo_run(int userns)
+{
+    pid_t c = fork();
+    if (c == 0) _exit(sioc_lo_body(userns));
+    int st = 0; waitpid(c, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 100;
+}
+static int t_netns_siocsifflags_lo(void)
+{
+    CHECK(sioc_lo_run(0) == 0);
+    return 0;
+}
+static int t_netns_siocsifflags_lo_userns(void)
+{
+    CHECK(sioc_lo_run(1) == 0);
+    return 0;
+}
+/* ---- /proc/sys/net is per network namespace ---- */
+#define PSN "/proc/sys/net/"
+static int psn_rd(const char *f, char *b, int n) { char p[128]; snprintf(p, sizeof p, PSN "%s", f); return slurp(p, b, n); }
+static int psn_wr(const char *f, const char *v)
+{
+    char p[128]; snprintf(p, sizeof p, PSN "%s", f);
+    int fd = open(p, O_WRONLY | O_TRUNC);
+    if (fd < 0) return -errno;
+    int r = write(fd, v, strlen(v)); int e = errno;
+    close(fd);
+    return r < 0 ? -e : 0;
+}
+static int psn_is(const char *f, const char *want)
+{
+    char b[64]; return psn_rd(f, b, sizeof b) > 0 && strcmp(b, want) == 0;
+}
+static int t_procsysnet_defaults(void)
+{
+    CHECK(psn_is("ipv4/ip_unprivileged_port_start", "1024\n"));
+    CHECK(psn_is("ipv4/ip_forward", "0\n"));
+    CHECK(psn_is("ipv4/conf/all/forwarding", "0\n"));
+    CHECK(psn_is("ipv4/conf/default/forwarding", "0\n"));
+    CHECK(psn_is("ipv4/conf/lo/forwarding", "0\n"));
+    CHECK(psn_is("ipv4/ip_local_port_range", "32768\t60999\n"));
+    CHECK(psn_is("ipv6/conf/all/disable_ipv6", "0\n"));
+    CHECK(psn_is("ipv6/conf/default/disable_ipv6", "0\n"));
+    CHECK(psn_is("core/somaxconn", "4096\n"));
+    char b[64]; CHECK(psn_rd("ipv4/ping_group_range", b, sizeof b) > 0);
+    return 0;
+}
+/* Fresh netns of a new userns: Linux defaults, writable by its root, host untouched. */
+static int psn_child_userns(void)
+{
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) return 2;
+    if (!psn_is("ipv4/ping_group_range", "1\t0\n")) return 3;
+    if (!psn_is("ipv4/ip_unprivileged_port_start", "1024\n")) return 4;
+    if (psn_wr("ipv4/ping_group_range", "0 0") != 0) return 5;
+    if (!psn_is("ipv4/ping_group_range", "0\t0\n")) return 6;
+    if (psn_wr("ipv4/ip_unprivileged_port_start", "80") != 0) return 7;
+    if (!psn_is("ipv4/ip_unprivileged_port_start", "80\n")) return 8;
+    if (psn_wr("ipv4/ip_forward", "1") != 0 || !psn_is("ipv4/ip_forward", "1\n")) return 9;
+    if (psn_wr("ipv6/conf/all/disable_ipv6", "1") != 0 || !psn_is("ipv6/conf/all/disable_ipv6", "1\n")) return 10;
+    if (psn_wr("ipv4/ip_forward", "7") != -EINVAL) return 11;
+    /* port 81 is now unprivileged for an unprivileged-uid thread of this netns */
+    return 0;
+}
+static int t_procsysnet_netns_isolated(void)
+{
+    char before[64], after[64];
+    CHECK(psn_rd("ipv4/ip_unprivileged_port_start", before, sizeof before) > 0);
+    char pb[64]; CHECK(psn_rd("ipv4/ping_group_range", pb, sizeof pb) > 0);
+    pid_t c = fork();
+    if (c == 0) _exit(psn_child_userns());
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(psn_rd("ipv4/ip_unprivileged_port_start", after, sizeof after) > 0 && strcmp(before, after) == 0);
+    CHECK(psn_is("ipv4/ip_forward", "0\n") && psn_is("ipv6/conf/all/disable_ipv6", "0\n"));
+    CHECK(psn_rd("ipv4/ping_group_range", after, sizeof after) > 0 && strcmp(pb, after) == 0);
+    /* a second new netns starts from defaults again */
+    c = fork();
+    if (c == 0) { if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) _exit(2); _exit(psn_is("ipv4/ip_forward", "0\n") && psn_is("ipv4/ping_group_range", "1\t0\n") ? 0 : 3); }
+    waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+/* Root in the init ns writes and restores; init-ns writes are visible to later reads. */
+
+/* ---- per-interface /proc/sys/net (lane sysctlif) ---- */
+#ifndef TUNSETIFF
+#define TUNSETIFF 0x400454ca
+#endif
+static int psn_tap(const char *name)
+{
+    int fd = open("/dev/net/tun", O_RDWR);
+    if (fd < 0) return -1;
+    struct ifreq ifr; memset(&ifr, 0, sizeof ifr);
+    strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+    ifr.ifr_flags = 0x0002 | 0x1000; /* IFF_TAP | IFF_NO_PI */
+    if (ioctl(fd, TUNSETIFF, &ifr) < 0) { close(fd); return -1; }
+    return fd;
+}
+static int psn_missing(const char *f)
+{
+    char p[160]; snprintf(p, sizeof p, PSN "%s", f);
+    int fd = open(p, O_RDONLY);
+    if (fd >= 0) { close(fd); return 0; }
+    return errno == ENOENT;
+}
+static int psn_child(int (*fn)(void))
+{
+    pid_t c = fork();
+    if (c == 0) { if (unshare(CLONE_NEWNET) != 0) _exit(100); _exit(fn()); }
+    int st = 0; waitpid(c, &st, 0);
+    if (!WIFEXITED(st)) return 99;
+    return WEXITSTATUS(st);
+}
+static int ifdirs_body(void)
+{
+    int fd = psn_tap("tap0");
+    if (fd < 0) return 1;
+    if (!psn_is("ipv4/conf/tap0/arp_notify", "0\n")) return 2;
+    if (psn_wr("ipv4/conf/tap0/arp_notify", "1") != 0) return 3;
+    if (!psn_is("ipv4/conf/tap0/arp_notify", "1\n")) return 4;
+    if (!psn_is("ipv4/conf/tap0/rp_filter", "0\n") || !psn_is("ipv4/conf/tap0/route_localnet", "0\n")) return 5;
+    if (!psn_is("ipv6/conf/tap0/autoconf", "1\n") || !psn_is("ipv6/conf/tap0/accept_dad", "1\n")) return 6;
+    if (psn_wr("ipv6/conf/tap0/disable_ipv6", "1") != 0 || !psn_is("ipv6/conf/tap0/disable_ipv6", "1\n")) return 7;
+    if (!psn_missing("ipv4/conf/nosuch/arp_notify")) return 8;
+    close(fd);
+    if (!psn_missing("ipv4/conf/tap0/arp_notify")) return 9;
+    return 0;
+}
+static int t_procsysnet_ifdirs(void) { int r = psn_child(ifdirs_body); if (r) printf("  ifdirs_body=%d\n", r); CHECK(r == 0); return 0; }
+static int fanout_body(void)
+{
+    int fd = psn_tap("tap0");
+    if (fd < 0) return 1;
+    if (!psn_is("ipv4/conf/tap0/forwarding", "0\n")) return 2;
+    if (psn_wr("ipv4/ip_forward", "1") != 0) return 3;
+    if (!psn_is("ipv4/conf/tap0/forwarding", "1\n")) return 4;
+    if (!psn_is("ipv4/conf/all/forwarding", "1\n") || !psn_is("ipv4/conf/default/forwarding", "1\n")) return 5;
+    int fd2 = psn_tap("tap1");
+    if (fd2 < 0 || !psn_is("ipv4/conf/tap1/forwarding", "1\n")) return 6; /* new if inherits default */
+    if (psn_wr("ipv4/ip_forward", "0") != 0 || !psn_is("ipv4/conf/tap0/forwarding", "0\n")) return 7;
+    if (!psn_is("ipv4/conf/tap1/forwarding", "0\n")) return 8;
+    close(fd); close(fd2);
+    return 0;
+}
+static int t_ip_forward_fanout(void) { int r = psn_child(fanout_body); if (r) printf("  fanout_body=%d\n", r); CHECK(r == 0); return 0; }
+static int t_ifdir_isolated(void)
+{
+    int up[2], dn[2]; CHECK(pipe(up) == 0 && pipe(dn) == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        if (unshare(CLONE_NEWNET) != 0) _exit(100);
+        int fd = psn_tap("tap0"); char b = fd >= 0 ? 'k' : 'f';
+        if (write(up[1], &b, 1) != 1) _exit(101);
+        if (read(dn[0], &b, 1) != 1) _exit(102);
+        _exit(0);
+    }
+    char b = 0; CHECK(read(up[0], &b, 1) == 1 && b == 'k');
+    CHECK(psn_missing("ipv4/conf/tap0/arp_notify"));
+    CHECK(psn_missing("ipv6/conf/tap0/autoconf"));
+    b = 'x'; CHECK(write(dn[1], &b, 1) == 1);
+    int st = 0; waitpid(c, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
+static int t_procsysnet_root_write(void)
+{
+    char old[64]; CHECK(psn_rd("core/somaxconn", old, sizeof old) > 0);
+    CHECK(psn_wr("core/somaxconn", "1234") == 0);
+    CHECK(psn_is("core/somaxconn", "1234\n"));
+    CHECK(psn_wr("core/somaxconn", "abc") == -EINVAL);
+    CHECK(psn_wr("core/somaxconn", old) == 0 && psn_is("core/somaxconn", old));
+    return 0;
+}
+static int t_procsysnet_unpriv_denied(void)
+{
+    pid_t c = fork();
+    if (c == 0) {
+        if (drop_to(1000) != 0) _exit(2);
+        int r = psn_wr("ipv4/ip_forward", "1");
+        if (r != -EACCES && r != -EPERM) _exit(3);
+        /* from an unprivileged user namespace over the HOST netns: still denied */
+        if (unshare(CLONE_NEWUSER) != 0) _exit(4);
+        r = psn_wr("ipv4/ip_forward", "1");
+        if (r != -EACCES && r != -EPERM) _exit(5);
+        _exit(psn_is("ipv4/ip_forward", "0\n") ? 0 : 6);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(psn_is("ipv4/ip_forward", "0\n"));
+    return 0;
+}
+static int t_procsysnet_port_start(void)
+{
+    CHECK(psn_wr("ipv4/ip_unprivileged_port_start", "1024") == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        if (drop_to(1000) != 0) _exit(2);
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(81) };
+        if (bind(s, (void *)&a, sizeof a) == 0 || errno != EACCES) _exit(3);
+        _exit(0);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* lower the host threshold: unprivileged bind of 81 now works */
+    CHECK(psn_wr("ipv4/ip_unprivileged_port_start", "80") == 0);
+    c = fork();
+    if (c == 0) {
+        if (drop_to(1000) != 0) _exit(2);
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(81) };
+        if (bind(s, (void *)&a, sizeof a) != 0) _exit(3);
+        a.sin_port = htons(79); int s2 = socket(AF_INET, SOCK_DGRAM, 0);
+        if (bind(s2, (void *)&a, sizeof a) == 0 || errno != EACCES) _exit(4);
+        _exit(0);
+    }
+    waitpid(c, &st, 0);
+    int ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    CHECK(psn_wr("ipv4/ip_unprivileged_port_start", "1024") == 0);
+    CHECK(ok);
+    return 0;
+}
+static int t_procsysnet_ping_range(void)
+{
+    /* a new netns defaults to "1 0": an unprivileged ping socket is refused; widening it allows it */
+    pid_t c = fork();
+    if (c == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) _exit(2);
+        /* give up the namespace root's CAP_NET_RAW bypass: be a non-zero gid with no caps */
+        if (psn_wr("ipv4/ping_group_range", "1 0") != 0) _exit(3);
+        if (setgid(1000) < 0 || setuid(1000) < 0) {
+            /* unmapped ids in a bare userns: fall back to checking the stored range only */
+            _exit(psn_is("ipv4/ping_group_range", "1\t0\n") ? 0 : 5);
+        }
+        int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+        if (s >= 0 || errno != EACCES) _exit(6);
+        _exit(0);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* init ns: unprivileged gid 1000 within the range may ping; out of range may not (init-ns range narrowed, restored) */
+    char old[64]; CHECK(psn_rd("ipv4/ping_group_range", old, sizeof old) > 0);
+    CHECK(psn_wr("ipv4/ping_group_range", "2000 3000") == 0);
+    c = fork();
+    if (c == 0) {
+        if (drop_to(1000) != 0) _exit(2);
+        int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+        _exit(s < 0 && errno == EACCES ? 0 : 3);
+    }
+    waitpid(c, &st, 0);
+    int ok1 = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    CHECK(psn_wr("ipv4/ping_group_range", "900 1100") == 0);
+    c = fork();
+    if (c == 0) {
+        if (drop_to(1000) != 0) _exit(2);
+        int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+        _exit(s >= 0 ? 0 : 3);
+    }
+    waitpid(c, &st, 0);
+    int ok2 = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    for (char *q = old; *q; q++) if (*q == '\t') *q = ' ';
+    CHECK(psn_wr("ipv4/ping_group_range", old) == 0);
+    CHECK(ok1 && ok2);
+    return 0;
+}
 static int t_netns_sendfam(void)
 {
     int h = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1709,6 +2007,155 @@ static int t_netns_udp_bind(void)
     return 0;
 }
 
+/* ---- lane nslo: a real loopback per netns ---- */
+#include <netinet/ip_icmp.h>
+static int ns_lo_set(int up)
+{
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo");
+    q.ifr_flags = up ? (IFF_UP | IFF_RUNNING) : 0;
+    int r = ioctl(u, SIOCSIFFLAGS, &q);
+    close(u);
+    return r;
+}
+static struct sockaddr_in lo_addr(unsigned port)
+{
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    return a;
+}
+/* TCP echo + UDP echo + ping on 127.0.0.1 inside the current netns. 0 = ok. */
+static int lo_traffic(unsigned port)
+{
+    struct sockaddr_in a = lo_addr(port);
+    struct timeval tv = { 2, 0 };
+    char buf[16];
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    if (l < 0 || bind(l, (void *)&a, sizeof a) || listen(l, 4)) return 10;
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (connect(c, (void *)&a, sizeof a)) return 11;
+    int s = accept(l, 0, 0);
+    if (s < 0) return 12;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (write(c, "ping", 4) != 4) return 13;
+    if (read(s, buf, sizeof buf) != 4 || memcmp(buf, "ping", 4)) return 14;
+    if (write(s, "pong", 4) != 4) return 15;
+    if (read(c, buf, sizeof buf) != 4 || memcmp(buf, "pong", 4)) return 16;
+    close(c); close(s); close(l);
+    int u = socket(AF_INET, SOCK_DGRAM, 0), v = socket(AF_INET, SOCK_DGRAM, 0);
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (bind(u, (void *)&a, sizeof a)) return 20;
+    if (sendto(v, "dg", 2, 0, (void *)&a, sizeof a) != 2) return 21;
+    if (recv(u, buf, sizeof buf, 0) != 2) return 22;
+    close(u); close(v);
+    int p = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (p < 0) return 30;
+    setsockopt(p, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct icmphdr h; memset(&h, 0, sizeof h); h.type = ICMP_ECHO; h.un.echo.id = 7; h.un.echo.sequence = 1;
+    struct sockaddr_in pa = lo_addr(0);
+    if (sendto(p, &h, sizeof h, 0, (void *)&pa, sizeof pa) != (ssize_t)sizeof h) return 31;
+    unsigned char r[64];
+    if (recv(p, r, sizeof r, 0) < 8) return 32;
+    close(p);
+    return 0;
+}
+static int lo_updown_body(void)
+{
+    struct sockaddr_in a = lo_addr(41600);
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    if (!(connect(t, (void *)&a, sizeof a) == -1 && errno == ENETUNREACH)) return 1;   /* lo down */
+    if (ns_lo_set(1)) return 2;
+    int r = lo_traffic(41600);
+    if (r) return r;
+    if (ns_lo_set(0)) return 3;
+    int t2 = socket(AF_INET, SOCK_STREAM, 0);
+    if (!(connect(t2, (void *)&a, sizeof a) == -1 && errno == ENETUNREACH)) return 4;   /* down again */
+    return 0;
+}
+static int t_netns_lo_echo(void)
+{
+    CHECK(ns_child_netns(lo_updown_body) == 0);
+    return 0;
+}
+static int lo_same_port_body(void)
+{
+    if (ns_lo_set(1)) return 2;
+    int l; struct sockaddr_in a = lo_addr(41610);
+    l = socket(AF_INET, SOCK_STREAM, 0);
+    if (bind(l, (void *)&a, sizeof a) || listen(l, 4)) return 3;
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(c, (void *)&a, sizeof a)) return 4;
+    return 0;
+}
+static int t_netns_lo_two_ns_same_port(void)
+{
+    int hp; CHECK(wild_listener(41610, &hp) == 0);       /* the host holds the port too */
+    int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
+    pid_t cs[2];
+    for (int i = 0; i < 2; i++) {
+        cs[i] = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
+        if (cs[i] == 0) {
+            int r = lo_same_port_body();
+            char b = (char)r;
+            write(pfd[1], &b, 1);
+            char x; read(qfd[0], &x, 1);
+            _exit(r);
+        }
+        CHECK(cs[i] > 0);
+    }
+    char r0 = 99, r1 = 99;
+    CHECK(read(pfd[0], &r0, 1) == 1 && read(pfd[0], &r1, 1) == 1);
+    CHECK(r0 == 0 && r1 == 0);
+    write(qfd[1], "xx", 2);
+    for (int i = 0; i < 2; i++) { int st; waitpid(cs[i], &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0); }
+    return 0;
+}
+static int lo_host_unreach_body(void)
+{
+    if (ns_lo_set(1)) return 2;
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = lo_addr(41620);
+    if (!(connect(c, (void *)&a, sizeof a) == -1 && errno == ECONNREFUSED)) return 3;   /* host's service is not here */
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct timeval tv = { 0, 300000 };
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct sockaddr_in b = lo_addr(41621);
+    if (sendto(u, "x", 1, 0, (void *)&b, sizeof b) < 0) return 4;
+    char buf[4];
+    if (recv(u, buf, sizeof buf, 0) >= 0) return 5;     /* nothing echoes back from the host */
+    return 0;
+}
+static int t_netns_lo_host_unreachable(void)
+{
+    int hp; CHECK(wild_listener(41620, &hp) == 0);
+    int hu = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = lo_addr(41621);
+    CHECK(bind(hu, (void *)&a, sizeof a) == 0);
+    CHECK(ns_child_netns(lo_host_unreach_body) == 0);
+    /* and the host saw no datagram from the netns */
+    struct timeval tv = { 0, 100000 };
+    setsockopt(hu, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    char buf[4];
+    CHECK(recv(hu, buf, sizeof buf, 0) < 0);
+    /* the netns's listener is not reachable from the host */
+    return 0;
+}
+static int lo_slot_body(void)
+{
+    if (ns_lo_set(1)) return 2;
+    return lo_traffic(41630) ? 3 : 0;
+}
+static int t_netns_lo_slots_reclaimed(void)
+{
+    /* 100 netns with lo up in a row: the 64 stack slots are reused */
+    for (int i = 0; i < 100; i++) {
+        int r = ns_child_netns(lo_slot_body);
+        if (r != 0) { printf("  iteration %d: rc %d\n", i, r); return 1; }
+    }
+    return 0;
+}
+
 /* ---- nsmapsec: map-file confused deputy, write race, chrooted NEWUSER, fdinfo ---- */
 static pid_t spawn_userns(int *go_w, int (*after)(void))
 {
@@ -2339,7 +2786,7 @@ static int t_setns_misc(void)
     errno = 0; CHECK(sys_setns(nf, CLONE_NEWIPC) == -1 && errno == EINVAL);   /* wrong nstype */
     int m = open("/proc/self/ns/mnt", O_RDONLY), g = open("/proc/self/ns/cgroup", O_RDONLY);
     CHECK(m >= 0 && g >= 0);
-    errno = 0; CHECK(sys_setns(m, 0) == -1 && errno == EINVAL);
+    errno = 0; CHECK(sys_setns(m, CLONE_NEWNET) == -1 && errno == EINVAL);
     CHECK(sys_setns(g, CLONE_NEWCGROUP) == 0);   /* rejoining one's own cgroup namespace */
     int self = open("/proc/self/ns/net", O_RDONLY);
     CHECK(sys_setns(self, CLONE_NEWNET) == 0);
@@ -2397,7 +2844,7 @@ static int t_setns_pidfd(void)
     int pf = syscall(NR_PIDFD_OPEN, c, 0);
     CHECK(pf >= 0);
     errno = 0; CHECK(sys_setns(pf, 0) == -1 && errno == EINVAL);
-    errno = 0; CHECK(sys_setns(pf, CLONE_NEWNS) == -1 && errno == EINVAL);
+    errno = 0; CHECK(sys_setns(pf, 0x80 /* CLONE_NEWTIME: unsupported */) == -1 && errno == EINVAL);
     CHECK(link_ino("/proc/self/ns/net") != ns_link_ino(c, "net"));
     CHECK(sys_setns(pf, CLONE_NEWNET | CLONE_NEWIPC) == 0);
     CHECK(link_ino("/proc/self/ns/net") == ns_link_ino(c, "net"));
@@ -2640,9 +3087,9 @@ static int run_userns_cases(void)
         { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
-        { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
+        { "procsysnet_defaults", t_procsysnet_defaults }, { "procsysnet_ifdirs", t_procsysnet_ifdirs }, { "ip_forward_fanout", t_ip_forward_fanout }, { "ifdir_isolated", t_ifdir_isolated }, { "procsysnet_netns_isolated", t_procsysnet_netns_isolated }, { "procsysnet_root_write", t_procsysnet_root_write }, { "procsysnet_unpriv_denied", t_procsysnet_unpriv_denied }, { "procsysnet_port_start", t_procsysnet_port_start }, { "procsysnet_ping_range", t_procsysnet_ping_range }, { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_siocsifflags_lo", t_netns_siocsifflags_lo }, { "netns_siocsifflags_lo_userns", t_netns_siocsifflags_lo_userns }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
-        { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind },
+        { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind }, { "netns_lo_echo", t_netns_lo_echo }, { "netns_lo_two_ns_same_port", t_netns_lo_two_ns_same_port }, { "netns_lo_host_unreachable", t_netns_lo_host_unreachable }, { "netns_lo_slots_reclaimed", t_netns_lo_slots_reclaimed },
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
         { "map_deputy", t_map_deputy }, { "map_race", t_map_race }, { "chroot_newuser_eperm", t_chroot_newuser },
         { "fdinfo_other_uid", t_fdinfo_other_uid },
@@ -2668,8 +3115,155 @@ static int run_userns_cases(void)
     return 0;
 }
 
+/* A forks B; B unshare(NEWUSER|NEWNET); A opens /proc/B/ns/net. drop != 0: A first drops to
+ * nobody (setuid clears dumpable). Returns 0 on open success, else the errno (or 1000+step). */
+static int child_ns_open(int drop)
+{
+    int pfd[2];
+    char c;
+    if (pipe(pfd)) return 1000;
+    pid_t a = fork();
+    if (a == 0) {
+        if (drop && drop_to(65534)) _exit(2);
+        pid_t b = fork();
+        if (b == 0) {
+            if (unshare(CLONE_NEWUSER | CLONE_NEWNET)) _exit(3);
+            c = 1; if (write(pfd[1], &c, 1) != 1) _exit(4);
+            for (;;) pause();
+        }
+        if (read(pfd[0], &c, 1) != 1) _exit(5);
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%d/ns/net", (int)b);
+        int fd = open(path, O_RDONLY);
+        int e = errno;
+        kill(b, SIGKILL); waitpid(b, NULL, 0);
+        if (fd < 0) _exit(e == 0 ? 6 : 10 + (e & 0x7f));
+        _exit(0);
+    }
+    int st = 0;
+    if (a < 0 || waitpid(a, &st, 0) != a || !WIFEXITED(st)) return 1001;
+    int r = WEXITSTATUS(st);
+    return r >= 10 ? r - 10 : (r ? 1000 + r : 0);
+}
+
+/* Root pasta: setuid(65534) clears dumpable and mm->user_ns stays init, so Linux fails
+ * open(/proc/<child>/ns/net) with EACCES ("Failed to join network namespace"; verified on real Linux). */
+static void nobody_drop_child_ns_denied(void)
+{
+    int e = child_ns_open(1);
+    if (e != EACCES) printf("  nobody_drop_child_ns_denied got %d\n", e);
+    check("nobody_drop_child_ns_denied", e == EACCES);
+}
+
+/* Rootless pasta/podman: no id change, stays dumpable, so the open succeeds. */
+static void user_opens_child_ns(void)
+{
+    int e = child_ns_open(0);
+    if (e) printf("  user_opens_child_ns got %d\n", e);
+    check("user_opens_child_ns", e == 0);
+}
+
+/* A same-uid sibling with no caps in a userns must NOT open a non-dumpable target's
+ * /proc/<pid>/ns/net or /environ (Linux __ptrace_may_access). */
+static void sibling_nondumpable_denied(void)
+{
+    int pfd[2], ok = 0;
+    char c;
+    if (pipe(pfd)) { check("sibling_nondumpable_denied", 0); return; }
+    pid_t a = fork();
+    if (a == 0) {
+        if (drop_to(65534)) _exit(2);
+        pid_t t = fork();
+        if (t == 0) {
+            if (unshare(CLONE_NEWUSER | CLONE_NEWNET)) _exit(3);
+            if (prctl(PR_SET_DUMPABLE, 0)) _exit(4);
+            pid_t s = fork();
+            if (s == 0) {
+                struct { unsigned v; int pid; } hdr = { 0x20080522, 0 };
+                unsigned d[6] = {0};
+                if (syscall(SYS_capset, &hdr, d)) _exit(5);
+                pid_t tp = getppid();
+                char path[64];
+                int bad = 0;
+                snprintf(path, sizeof path, "/proc/%d/ns/net", (int)tp);
+                int fd = open(path, O_RDONLY);
+                if (fd >= 0 || errno != EACCES) bad |= 1;
+                snprintf(path, sizeof path, "/proc/%d/environ", (int)tp);
+                fd = open(path, O_RDONLY);
+                if (fd >= 0 || errno != EACCES) bad |= 2;
+                _exit(bad ? 20 + bad : 0);
+            }
+            int st = 0;
+            waitpid(s, &st, 0);
+            _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 99);
+        }
+        (void)pfd;
+        int st = 0;
+        waitpid(t, &st, 0);
+        _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 98);
+    }
+    int st = 0;
+    (void)c;
+    if (a > 0 && waitpid(a, &st, 0) == a && WIFEXITED(st) && WEXITSTATUS(st) == 0) ok = 1;
+    else printf("  sibling_nondumpable_denied status 0x%x\n", st);
+    check("sibling_nondumpable_denied", ok);
+}
+
+/* P holds caps only in a userns it unshared; its child C (still on the pre-unshare mm, so
+ * mm->user_ns is the initial ns) is non-dumpable: P must NOT open /proc/C/ns/net (Linux checks
+ * CAP_SYS_PTRACE in mm->user_ns for a non-dumpable mm). When C execs inside the userns first,
+ * mm->user_ns is that userns and P is allowed. */
+static void userns_cap_case(const char *name, int do_exec)
+{
+    int ok = 0;
+    pid_t a = fork();
+    if (a == 0) {
+        int ready[2], go[2];
+        if (drop_to(65534) || pipe(ready) || pipe(go)) _exit(2);
+        if (unshare(CLONE_NEWUSER)) _exit(3);
+        pid_t cpid = fork();
+        if (cpid == 0) {
+            char c = 'r';
+            if (do_exec) {
+                char fdb[16];
+                snprintf(fdb, sizeof fdb, "%d", ready[1]);
+                char gb[16];
+                snprintf(gb, sizeof gb, "%d", go[0]);
+                execl("/bin/nstest", "nstest", "--nondump", fdb, gb, (char *)0);
+                _exit(4);
+            }
+            if (prctl(PR_SET_DUMPABLE, 0)) _exit(5);
+            if (write(ready[1], &c, 1) != 1) _exit(6);
+            if (read(go[0], &c, 1) < 0) _exit(7);
+            _exit(0);
+        }
+        char c;
+        if (read(ready[0], &c, 1) != 1) _exit(8);
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%d/ns/net", (int)cpid);
+        int fd = open(path, O_RDONLY);
+        int e = errno, bad = do_exec ? (fd < 0) : (fd >= 0 || e != EACCES);
+        if (fd >= 0) close(fd);
+        if (write(go[1], "g", 1) != 1) bad |= 2;
+        int st = 0;
+        waitpid(cpid, &st, 0);
+        _exit(bad ? 20 + bad : 0);
+    }
+    int st = 0;
+    if (a > 0 && waitpid(a, &st, 0) == a && WIFEXITED(st) && WEXITSTATUS(st) == 0) ok = 1;
+    else printf("  %s status 0x%x\n", name, st);
+    check(name, ok);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 3 && !strcmp(argv[1], "--nondump")) {
+        char c = 'r';
+        if (prctl(PR_SET_DUMPABLE, 0)) return 5;
+        if (write(atoi(argv[2]), &c, 1) != 1) return 6;
+        if (read(atoi(argv[3]), &c, 1) < 0) return 7;
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "--euid")) return print_euid();
     if (getenv("NSTEST_HOST")) { printf("nstest: SKIP (host)\n"); return 0; }
     for (unsigned i = 0; i < sizeof flags / sizeof flags[0]; i++) {
@@ -2686,7 +3280,7 @@ int main(int argc, char **argv)
         snprintf(nm, sizeof nm, "unshare_%s_einval", flags[i].n);
         check(nm, r == -1 && e == EINVAL);
     }
-    if (geteuid() == 0) run_userns_cases(); else printf("SKIP userns cases: not root\n");
+    if (geteuid() == 0) { run_userns_cases(); nobody_drop_child_ns_denied(); user_opens_child_ns(); sibling_nondumpable_denied(); userns_cap_case("userns_cap_nondumpable_denied", 0); userns_cap_case("userns_cap_exec_in_ns_allowed", 1); } else printf("SKIP userns cases: not root\n");
     /* A plain fork-style clone still works. */
     long r = do_clone(0);
     int ok = r >= 0;
