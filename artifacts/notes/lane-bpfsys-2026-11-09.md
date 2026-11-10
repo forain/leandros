@@ -26,3 +26,8 @@ Evidence
 
 Open
 - Enforcement (lane bpfenf). No BPF_LINK_CREATE, OBJ_PIN/GET, GET_INFO (systemd manager only).
+
+## Box results (2026-11-09)
+- aarch64 /bin/bpftest: PASS (hierarchy fix verified)
+- x86_64 full: 78 suites, 0 bad
+- aarch64 full: 78 suites, 0 bad
