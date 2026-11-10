@@ -11975,6 +11975,20 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         }
         if arg == 0 || !validate_user_buf(arg, nl::IFREQ_LEN) { return -14; }
         let mut ifr = match sched::uaccess::read_user::<[u8; nl::IFREQ_LEN]>(arg) { Some(v) => v, None => return -14 };
+        if cmd as u32 == nl::SIOCSIFFLAGS {
+            // Only a netns's own `lo` has an admin state to set (the same
+            // LO_UP netlink RTM_NEWLINK uses); needs CAP_NET_ADMIN over the
+            // netns owner's user namespace.
+            let ns = sched::ns::netns_of(pid as u32);
+            let owner = sched::ns::owner_userns(2, ns);
+            if !sched::caps::ns_capable_in(owner, 12) { return -1; }
+            let n = ifr[..16].iter().position(|&b| b == 0).unwrap_or(16);
+            if &ifr[..n] != b"lo" { return if links.iter().any(|l| l.name.as_bytes() == &ifr[..n]) { -95 } else { -19 }; }
+            if ns == 0 { return -95; }
+            let fl = u16::from_ne_bytes([ifr[16], ifr[17]]);
+            sched::ns::set_lo_admin_up(ns, fl & 1 != 0); // IFF_UP
+            return 0;
+        }
         let r = nl::ifreq_ioctl(cmd as u32, &mut ifr, &links);
         if r < 0 { return r as isize; }
         return if sched::uaccess::write_user(arg, ifr) { 0 } else { -14 };
