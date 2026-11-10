@@ -23,6 +23,12 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_SETLINK: u16 = 19;
+const RTM_DELLINK: u16 = 17;
+const IFLA_LINK: u16 = 5;
+const IFLA_NET_NS_PID: u16 = 19;
+const IFLA_NET_NS_FD: u16 = 28;
+const IFLA_INFO_DATA: u16 = 2;
+const VETH_INFO_PEER: u16 = 1;
 const RTM_DELADDR: u16 = 21;
 const RTM_DELROUTE: u16 = 25;
 const IFLA_TXQLEN: u16 = 13;
@@ -93,6 +99,10 @@ pub struct Link {
     pub loopback: bool,
     /// A tun/tap device (IFLA_INFO_KIND "tun").
     pub tap: bool,
+    /// A veth end (IFLA_INFO_KIND "veth"; also `tap`, i.e. dynamic and writable).
+    pub veth: bool,
+    /// Veth: the other end's ifindex (IFLA_LINK), else 0.
+    pub peer: u32,
     /// IPv4 address and prefix length, when configured.
     pub addr: Option<([u8; 4], u8)>,
 }
@@ -173,9 +183,10 @@ fn link_msg(l: &Link, seq: u32, pid: u32) -> Vec<u8> {
     // IF_OPER_UNKNOWN for lo, IF_OPER_UP / IF_OPER_DOWN otherwise.
     attr(&mut v, IFLA_OPERSTATE, &[if l.loopback { 0 } else if l.running { 6 } else { 2 }]);
     attr(&mut v, IFLA_TXQLEN, &1000u32.to_ne_bytes());
+    if l.veth && l.peer != 0 { attr(&mut v, IFLA_LINK, &l.peer.to_ne_bytes()); }
     if l.tap {
         let mut li = Vec::new();
-        attr_str(&mut li, IFLA_INFO_KIND, "tun");
+        attr_str(&mut li, IFLA_INFO_KIND, if l.veth { "veth" } else { "tun" });
         attr(&mut v, IFLA_LINKINFO, &li);
     }
     end_msg(&mut v, s);
@@ -302,9 +313,20 @@ pub enum RtOp {
     SetLink { index: u32, up: Option<bool>, mtu: Option<u32>, mac: Option<[u8; 6]>, name: Option<String> },
     AddAddr { index: u32, addr: [u8; 4], prefix: u8, excl: bool },
     DelAddr { index: u32, addr: [u8; 4], prefix: u8 },
+    /// RTM_NEWLINK kind=veth with VETH_INFO_PEER.
+    NewVeth { name: Option<String>, mtu: Option<u32>, mac: Option<[u8; 6]>, up: bool, peer: VethPeer },
+    /// RTM_DELLINK of a veth end: removes both ends.
+    DelLink { index: u32 },
     AddRoute { dst: [u8; 4], prefix: u8, gw: Option<[u8; 4]>, oif: u32, metric: u32, excl: bool, replace: bool },
     DelRoute { dst: [u8; 4], prefix: u8, gw: Option<[u8; 4]>, oif: u32, metric: Option<u32> },
 }
+
+/// Where a veth peer end goes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PeerNs { Same, Fd(i32), Pid(u32) }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VethPeer { pub name: Option<String>, pub mtu: Option<u32>, pub mac: Option<[u8; 6]>, pub up: bool, pub ns: PeerNs }
 
 fn a4(a: Option<&[u8]>) -> Option<[u8; 4]> {
     let a = a?;
@@ -366,14 +388,64 @@ fn route_ent_msg(r: &RouteEnt, seq: u32, pid: u32) -> Vec<u8> {
 /// The attribute `ty` of `msg` (an rtnl message whose fixed part is `fixed`
 /// bytes after the 16-byte header).
 fn find_attr(msg: &[u8], fixed: usize, ty: u16) -> Option<&[u8]> {
-    let mut o = 16 + fixed;
-    while o + 4 <= msg.len() {
-        let l = rd16(msg, o) as usize;
-        if l < 4 || o + l > msg.len() { break; }
-        if rd16(msg, o + 2) & 0x3fff == ty { return Some(&msg[o + 4..o + l]); }
+    nla_find(msg.get(16 + fixed..)?, ty)
+}
+
+/// The attribute `ty` in a bare attribute list (a nested attribute's body).
+fn nla_find(b: &[u8], ty: u16) -> Option<&[u8]> {
+    let mut o = 0;
+    while o + 4 <= b.len() {
+        let l = rd16(b, o) as usize;
+        if l < 4 || o + l > b.len() { break; }
+        if rd16(b, o + 2) & 0x3fff == ty { return Some(&b[o + 4..o + l]); }
         o += (l + 3) & !3;
     }
     None
+}
+
+fn nla_name(a: Option<&[u8]>) -> Option<String> {
+    let n = a?;
+    let n = &n[..n.iter().position(|&b| b == 0).unwrap_or(n.len())];
+    core::str::from_utf8(n).ok().map(String::from)
+}
+
+/// The end-specific attributes of a veth request (the main message or the
+/// VETH_INFO_PEER body after its ifinfomsg): (name, mtu, mac, up, ns).
+fn veth_end(b: &[u8], ifi_flags: u32, ifi_change: u32) -> Result<VethPeer, i32> {
+    let mtu = match nla_find(b, IFLA_MTU) { Some(m) if m.len() >= 4 => Some(rd32(m, 0)), Some(_) => return Err(22), None => None };
+    let mac = match nla_find(b, IFLA_ADDRESS) {
+        Some(a) if a.len() == 6 => Some([a[0], a[1], a[2], a[3], a[4], a[5]]), Some(_) => return Err(22), None => None,
+    };
+    let ns = if let Some(f) = nla_find(b, IFLA_NET_NS_FD) {
+        if f.len() < 4 { return Err(22); }
+        PeerNs::Fd(rd32(f, 0) as i32)
+    } else if let Some(p) = nla_find(b, IFLA_NET_NS_PID) {
+        if p.len() < 4 { return Err(22); }
+        PeerNs::Pid(rd32(p, 0))
+    } else { PeerNs::Same };
+    Ok(VethPeer { name: nla_name(nla_find(b, IFLA_IFNAME)), mtu, mac, up: ifi_change & IFF_UP != 0 && ifi_flags & IFF_UP != 0, ns })
+}
+
+/// RTM_NEWLINK with NLM_F_CREATE naming a link kind. `None` = not a create
+/// request for a kind handled here; `Some(errno)` = handled.
+fn create_link(msg: &[u8], flags: u16, env: &Env) -> Option<i32> {
+    if flags & NLM_F_CREATE == 0 { return None; }
+    let li = find_attr(msg, 16, IFLA_LINKINFO)?;
+    let kind = nla_find(li, IFLA_INFO_KIND)?;
+    if !cstr_eq(kind, "veth") { return None; }
+    let name = nla_name(find_attr(msg, 16, IFLA_IFNAME));
+    if let Some(n) = name.as_ref() { if env.links.iter().any(|l| l.name == *n) { return Some(17); } }
+    let (f, c) = (rd32(msg, 24), rd32(msg, 28));
+    let me = match veth_end(&msg[16 + 16..], f, c) { Ok(e) => e, Err(e) => return Some(e) };
+    // VETH_INFO_PEER: a full ifinfomsg, then the peer's attributes.
+    let Some(data) = nla_find(li, IFLA_INFO_DATA) else { return Some(22) };
+    let peer = match nla_find(data, VETH_INFO_PEER) {
+        Some(p) if p.len() >= 16 => match veth_end(&p[16..], rd32(p, 8), rd32(p, 12)) { Ok(e) => e, Err(e) => return Some(e) },
+        Some(_) => return Some(22),
+        None => VethPeer { name: None, mtu: None, mac: None, up: false, ns: PeerNs::Same },
+    };
+    if let (Some(a), PeerNs::Same) = (name.as_ref(), peer.ns) { if peer.name.as_ref() == Some(a) { return Some(17); } }
+    Some((env.apply)(RtOp::NewVeth { name, mtu: me.mtu, mac: me.mac, up: me.up, peer }))
 }
 
 fn cstr_eq(a: &[u8], name: &str) -> bool {
@@ -391,7 +463,8 @@ fn target_link<'a>(msg: &[u8], links: &'a [Link]) -> Option<&'a Link> {
 }
 
 /// RTM_NEWLINK change request. 0 = acked, else a positive errno.
-fn new_link(msg: &[u8], env: &Env) -> i32 {
+fn new_link(msg: &[u8], flags_nl: u16, env: &Env) -> i32 {
+    if let Some(e) = create_link(msg, flags_nl, env) { return e; }
     let Some(t) = target_link(msg, env.links) else { return 19 }; // ENODEV
     let flags = rd32(msg, 24);
     let change = rd32(msg, 28);
@@ -505,12 +578,18 @@ pub fn handle_request_env(req: &[u8], pid: u32, env: &Env) -> Vec<Vec<u8>> {
                 None => { out.push(error_msg(101, msg, seq, pid)); ack = false; } // ENETUNREACH
             },
             RTM_GETNEIGH if dump => out.push(done_msg(seq, pid)),
-            RTM_NEWLINK | RTM_SETLINK | RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE
+            RTM_NEWLINK | RTM_SETLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE
                 if flags & NLM_F_REQUEST != 0 && !env.admin => {
                 out.push(error_msg(1, msg, seq, pid)); ack = false; // EPERM
             }
+            RTM_DELLINK if flags & NLM_F_REQUEST != 0 => {
+                let e = if len < 32 { 22 } else {
+                    match target_link(msg, links) { Some(t) if t.veth => (env.apply)(RtOp::DelLink { index: t.index }), Some(_) => 95, None => 19 }
+                };
+                if e != 0 { out.push(error_msg(e, msg, seq, pid)); ack = false; }
+            }
             RTM_NEWLINK | RTM_SETLINK if flags & NLM_F_REQUEST != 0 => {
-                let e = if len < 32 { 22 } else { new_link(msg, env) };
+                let e = if len < 32 { 22 } else { new_link(msg, flags, env) };
                 if e != 0 { out.push(error_msg(e, msg, seq, pid)); ack = false; }
             }
             RTM_NEWADDR if flags & NLM_F_REQUEST != 0 => {
@@ -673,7 +752,7 @@ pub fn current_links(ns: u16) -> Vec<Link> {
         let up = sched::ns::lo_admin_up(ns);
         v.push(Link {
             index: 1, name: String::from("lo"), mac: [0; 6], mtu: 65536,
-            up, running: up, tap: false, loopback: true,
+            up, running: up, tap: false, veth: false, peer: 0, loopback: true,
             addr: if up { Some(([127, 0, 0, 1], 8)) } else { None },
         });
         v.extend(super::tunbe::links(ns));
@@ -681,7 +760,7 @@ pub fn current_links(ns: u16) -> Vec<Link> {
     }
     v.push(Link {
         index: 1, name: String::from("lo"), mac: [0; 6], mtu: 65536,
-        up: true, running: true, tap: false, loopback: true, addr: Some(([127, 0, 0, 1], 8)),
+        up: true, running: true, tap: false, veth: false, peer: 0, loopback: true, addr: Some(([127, 0, 0, 1], 8)),
     });
     for s in super::iface::snapshot() {
         v.push(Link {
@@ -691,7 +770,7 @@ pub fn current_links(ns: u16) -> Vec<Link> {
             mtu: 1500,
             up: s.admin_up,
             running: s.carrier && s.admin_up,
-            tap: false, loopback: false,
+            tap: false, veth: false, peer: 0, loopback: false,
             addr: if s.admin_up { s.addr } else { None },
         });
     }
@@ -727,11 +806,11 @@ mod tests {
     fn links() -> Vec<Link> {
         alloc::vec![
             Link { index: 1, name: "lo".into(), mac: [0; 6], mtu: 65536, up: true, running: true,
-                   tap: false, loopback: true, addr: Some(([127, 0, 0, 1], 8)) },
+                   tap: false, veth: false, peer: 0, loopback: true, addr: Some(([127, 0, 0, 1], 8)) },
             Link { index: 2, name: "eth0".into(), mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56], mtu: 1500,
-                   up: true, running: true, tap: false, loopback: false, addr: Some(([10, 0, 2, 15], 24)) },
+                   up: true, running: true, tap: false, veth: false, peer: 0, loopback: false, addr: Some(([10, 0, 2, 15], 24)) },
             Link { index: 3, name: "wifi0".into(), mac: [2; 6], mtu: 1500, up: true, running: false,
-                   tap: false, loopback: false, addr: None },
+                   tap: false, veth: false, peer: 0, loopback: false, addr: None },
         ]
     }
 
@@ -872,7 +951,7 @@ mod tests {
         let mut ls = Vec::new();
         for i in 0..100 {
             ls.push(Link { index: i + 1, name: alloc::format!("eth{}", i), mac: [1; 6], mtu: 1500,
-                           up: true, running: true, tap: false, loopback: false, addr: Some(([10, 0, 0, 1], 24)) });
+                           up: true, running: true, tap: false, veth: false, peer: 0, loopback: false, addr: Some(([10, 0, 0, 1], 24)) });
         }
         let out = handle_request(&req(RTM_GETLINK, 0x301, 1), &ls, 1);
         assert!(out.len() > 2);

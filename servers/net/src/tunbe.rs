@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use syngate::{Frames, GateRx};
 use tundev::TunHandle;
 use vif::{VIFS, NETNS};
-use vifsel::{NetNsState, Vif, VifKind, NO_TUN, RXQ_CAP, MAX_NS_SIDS};
+use vifsel::{NetNsState, Vif, VifKind, NO_TUN, NO_PEER, RXQ_CAP, ns_sid_cap};
 use iface::FIRST_DYN;
 
 const CAP_NET_ADMIN: u32 = 12;
@@ -33,7 +33,7 @@ fn peer_mac(mac: [u8; 6]) -> [u8; 6] { let mut m = mac; m[5] ^= 0x80; m }
 
 fn name_len(n: &[u8; 16]) -> usize { n.iter().position(|&b| b == 0).unwrap_or(16) }
 
-fn is_tun_kind(k: VifKind) -> bool { matches!(k, VifKind::Tap | VifKind::Tun) }
+fn is_tun_kind(k: VifKind) -> bool { matches!(k, VifKind::Tap | VifKind::Tun | VifKind::Veth) }
 
 // ── hooks ────────────────────────────────────────────────────────────────────
 
@@ -65,7 +65,7 @@ fn attach(ns: u16, name: &[u8; 16], tap: bool, h: TunHandle) -> Result<(u32, [u8
         let mut nss = NETNS.lock();
         let mut v = VIFS.lock();
         let st = nss.entry(ns).or_insert_with(|| NetNsState::new(ns));
-        if st.sids.len() >= MAX_NS_SIDS { return Err(23); }
+        if st.sids.len() >= ns_sid_cap(ns) { return Err(23); }
         let taken = |s: &NetNsState, v: &vifsel::VifTable, nm: &[u8]| {
             s.sids.iter().any(|&q| v[q as usize].as_ref().map_or(false, |x| x.name[..name_len(&x.name)] == *nm))
             || (nm == b"lo")
@@ -91,7 +91,7 @@ fn attach(ns: u16, name: &[u8; 16], tap: bool, h: TunHandle) -> Result<(u32, [u8
         st.next_ifindex += 1;
         let mac = [0x02, 0x00, 0x5e, 0x10, (sid as u8), 0x01];
         v[sid] = Some(Vif { netns: ns, ifindex, name: fin, kind, admin_up: false, mtu: 1500, mac,
-                            addrs: Vec::new(), rxq: VecDeque::new(), tun: h, pending: false });
+                            addrs: Vec::new(), rxq: VecDeque::new(), tun: h, pending: false, peer: NO_PEER });
         st.sids.push(sid as Sid);
         (sid as Sid, fin, ifindex, mac)
     };
@@ -158,42 +158,7 @@ fn find_sid(h: TunHandle) -> Option<(Sid, u16)> {
 
 // ── the stack's device ───────────────────────────────────────────────────────
 
-/// The vif as a smoltcp device for one poll: `rx` was drained from the vif's
-/// queue before the stack lock was taken, `tx` is delivered after it is dropped.
-pub(crate) struct TapDev { pub rx: VecDeque<Vec<u8>>, pub tx: Vec<Vec<u8>>, pub mtu: usize }
-pub struct TapTx<'a>(&'a mut Vec<Vec<u8>>);
-
-impl<'a> smoltcp::phy::TxToken for TapTx<'a> {
-    fn consume<R, F>(self, len: usize, f: F) -> R where F: FnOnce(&mut [u8]) -> R {
-        let mut buf = alloc::vec![0u8; len];
-        let r = f(&mut buf);
-        self.0.push(buf);
-        r
-    }
-}
-
-impl smoltcp::phy::Device for TapDev {
-    type RxToken<'a> = GateRx;
-    type TxToken<'a> = TapTx<'a>;
-
-    fn receive(&mut self, _ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let f = self.rx.pop_front()?;
-        Some((GateRx(f), TapTx(&mut self.tx)))
-    }
-    fn transmit(&mut self, _ts: Instant) -> Option<Self::TxToken<'_>> {
-        if self.tx.len() >= 256 { None } else { Some(TapTx(&mut self.tx)) }
-    }
-    fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
-        let mut caps = smoltcp::phy::DeviceCapabilities::default();
-        caps.max_transmission_unit = self.mtu + 14;
-        caps.medium = smoltcp::phy::Medium::Ethernet;
-        caps
-    }
-}
-
-impl Frames for TapDev {
-    fn frame<'a>(rx: GateRx) -> Vec<u8> where Self: 'a { rx.0 }
-}
+pub(crate) use framedev::FrameDev as TapDev;
 
 fn make_stack(sid: Sid, mac: [u8; 6]) {
     let mut dev = TapDev { rx: VecDeque::new(), tx: Vec::new(), mtu: 1500 };
@@ -224,11 +189,12 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
     }
     for sid in sids {
         // Drain the vif's queue before the stack lock is taken.
-        let (rx, mtu, h, l3, mac) = {
+        let (rx, mtu, h, l3, mac, peer) = {
             let mut v = VIFS.lock();
             let Some(x) = v[sid as usize].as_mut() else { continue };
             x.pending = false;
-            (core::mem::take(&mut x.rxq), x.mtu as usize, x.tun, x.kind == VifKind::Tun, x.mac)
+            let peer = if x.kind == VifKind::Veth { Some(x.peer) } else { None };
+            (core::mem::take(&mut x.rxq), x.mtu as usize, x.tun, x.kind == VifKind::Tun, x.mac, peer)
         };
         let mut dev = TapDev { rx, tx: Vec::new(), mtu };
         {
@@ -241,6 +207,24 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
                     *next = Some(next.map_or(d, |n| n.min(d)));
                 }
             }
+        }
+        // Stack lock released: a veth end hands its frames to the other end.
+        if let Some(p) = peer {
+            if dev.tx.is_empty() { continue; }
+            let mut v = VIFS.lock();
+            let mtu_ok = |f: &Vec<u8>, m: usize| f.len() <= m + 14;
+            if let Some(x) = v.get_mut(p as usize).and_then(|x| x.as_mut()) {
+                if x.admin_up && x.kind == VifKind::Veth {
+                    let m = x.mtu as usize;
+                    for f in dev.tx {
+                        if x.rxq.len() < RXQ_CAP && mtu_ok(&f, m) { x.rxq.push_back(f); }
+                    }
+                    x.pending = true;
+                    drop(v);
+                    drivers::netdev::kick();
+                }
+            }
+            continue;
         }
         // Stack lock released: hand the frames to tundev.
         if h == NO_TUN { continue; }
@@ -347,9 +331,14 @@ pub(crate) fn links(ns: u16) -> Vec<rtnetlink::Link> {
             out.push(rtnetlink::Link {
                 index: x.ifindex,
                 name: alloc::string::String::from(core::str::from_utf8(&x.name[..name_len(&x.name)]).unwrap_or("?")),
-                mac: x.mac, mtu: x.mtu, up: x.admin_up, running: x.admin_up && x.tun != NO_TUN,
+                mac: x.mac, mtu: x.mtu, up: x.admin_up,
+                running: x.admin_up && if x.kind == VifKind::Veth {
+                    v.get(x.peer as usize).and_then(|p| p.as_ref()).map_or(false, |p| p.admin_up)
+                } else { x.tun != NO_TUN },
                 tap: true, loopback: false,
                 addr: if x.admin_up { x.addrs.first().copied() } else { None },
+                veth: x.kind == VifKind::Veth,
+                peer: if x.kind == VifKind::Veth { v.get(x.peer as usize).and_then(|p| p.as_ref()).map_or(0, |p| p.ifindex) } else { 0 },
             });
         }
     }
@@ -430,6 +419,8 @@ pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
             drivers::netdev::kick();
             0
         }
+        RtOp::NewVeth { name, mtu, mac, up, peer } => veth_create(ns, name, mtu, mac, up, peer),
+        RtOp::DelLink { index } => veth_delete(ns, index),
         RtOp::AddAddr { index, addr, prefix, excl } => {
             let (sid, addrs);
             {
@@ -534,4 +525,99 @@ pub(crate) fn routes(ns: u16) -> Vec<rtnetlink::RouteEnt> {
         out.push(rtnetlink::RouteEnt { dst: r.dst, prefix: r.prefix, gw: r.gw, oif: x.ifindex, prefsrc: None });
     }
     out
+}
+
+// ── veth pairs ───────────────────────────────────────────────────────────────
+
+/// The network namespace a peer end goes to (`IFLA_NET_NS_FD` / `IFLA_NET_NS_PID`).
+fn resolve_peer_ns(sel: &rtnetlink::PeerNs, cur: u16) -> Result<u16, i32> {
+    match *sel {
+        rtnetlink::PeerNs::Same => Ok(cur),
+        rtnetlink::PeerNs::Fd(fd) => match vfs::nsfd_target(sched::current_pid(), fd as usize) {
+            Ok((2, id)) => Ok(id),
+            Ok(_) => Err(22),
+            Err(e) => Err(if e < 0 { -e } else { 9 }),
+        },
+        rtnetlink::PeerNs::Pid(p) => {
+            let k = sched::pidns::from_cur(p).map_err(|_| 3)?;
+            Ok(sched::ns::netns_of(k))
+        }
+    }
+}
+
+/// A free interface name in a namespace for `base` (`%d` is expanded).
+fn pick_name(st: &NetNsState, v: &vifsel::VifTable, base: &[u8], also: Option<&[u8]>) -> Result<[u8; 16], i32> {
+    let taken = |nm: &[u8]| nm == b"lo" || also == Some(nm)
+        || st.sids.iter().any(|&q| v[q as usize].as_ref().map_or(false, |x| x.name[..name_len(&x.name)] == *nm));
+    let mut fin = [0u8; 16];
+    if let Some(p) = base.windows(2).position(|w| w == b"%d") {
+        for i in 0..1000u32 {
+            let mut s = Vec::new();
+            s.extend_from_slice(&base[..p]);
+            s.extend_from_slice(alloc::format!("{}", i).as_bytes());
+            s.extend_from_slice(&base[p + 2..]);
+            if s.len() > 15 { return Err(22); }
+            if !taken(&s) { fin[..s.len()].copy_from_slice(&s); return Ok(fin); }
+        }
+        return Err(17);
+    }
+    if base.is_empty() || base.len() > 15 || base.iter().any(|&c| c == b'/' || c == b' ') { return Err(22); }
+    if taken(base) { return Err(17); }
+    fin[..base.len()].copy_from_slice(base);
+    Ok(fin)
+}
+
+fn veth_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>, mac: Option<[u8; 6]>, up: bool,
+               peer: rtnetlink::VethPeer) -> i32 {
+    let pns = match resolve_peer_ns(&peer.ns, ns) { Ok(n) => n, Err(e) => return e };
+    if pns != ns && !sched::caps::ns_capable_in(sched::ns::owner_userns(1, pns), CAP_NET_ADMIN) { return 1; }
+    for m in [mtu, peer.mtu].into_iter().flatten() { if !(68..=65535).contains(&m) { return 22; } }
+    crate::vif::claim(ns);
+    crate::vif::claim(pns);
+    let (sa, sb, ma, mb) = {
+        let mut nss = NETNS.lock();
+        let mut v = VIFS.lock();
+        nss.entry(ns).or_insert_with(|| NetNsState::new(ns));
+        nss.entry(pns).or_insert_with(|| NetNsState::new(pns));
+        let need_a = 1 + (ns == pns) as usize;
+        if nss[&ns].sids.len() + need_a > ns_sid_cap(ns) || nss[&pns].sids.len() + 1 > ns_sid_cap(pns) { return 23; }
+        let na = match pick_name(&nss[&ns], &v, name.as_deref().unwrap_or("veth%d").as_bytes(), None) { Ok(n) => n, Err(e) => return e };
+        let nb = match pick_name(&nss[&pns], &v, peer.name.as_deref().unwrap_or("veth%d").as_bytes(),
+                                 if ns == pns { Some(&na[..name_len(&na)]) } else { None }) { Ok(n) => n, Err(e) => return e };
+        let mut free = (FIRST_DYN as usize..MAX_STACKS).filter(|&i| v[i].is_none());
+        let (Some(sa), Some(sb)) = (free.next(), free.next()) else { return 23 };
+        let ma = mac.unwrap_or([0x02, 0x00, 0x5e, 0x11, sa as u8, 0x01]);
+        let mb = peer.mac.unwrap_or([0x02, 0x00, 0x5e, 0x11, sb as u8, 0x02]);
+        let ia = { let st = nss.get_mut(&ns).unwrap(); let i = st.next_ifindex; st.next_ifindex += 1; i };
+        let ib = { let st = nss.get_mut(&pns).unwrap(); let i = st.next_ifindex; st.next_ifindex += 1; i };
+        let mk = |ns, ifindex, name, up, mtu: Option<u32>, mac, peer| Vif {
+            netns: ns, ifindex, name, kind: VifKind::Veth, admin_up: up, mtu: mtu.unwrap_or(1500), mac,
+            addrs: Vec::new(), rxq: VecDeque::new(), tun: NO_TUN, pending: false, peer,
+        };
+        v[sa] = Some(mk(ns, ia, na, up, mtu, ma, sb as Sid));
+        v[sb] = Some(mk(pns, ib, nb, peer.up, peer.mtu, mb, sa as Sid));
+        nss.get_mut(&ns).unwrap().sids.push(sa as Sid);
+        nss.get_mut(&pns).unwrap().sids.push(sb as Sid);
+        (sa as Sid, sb as Sid, ma, mb)
+    };
+    make_stack(sa, ma);
+    make_stack(sb, mb);
+    drivers::netdev::kick();
+    0
+}
+
+fn veth_delete(ns: u16, index: u32) -> i32 {
+    let list = {
+        let nss = NETNS.lock();
+        let v = VIFS.lock();
+        let Some(st) = nss.get(&ns) else { return 19 };
+        let Some(sid) = st.sids.iter().copied().find(|&s| v[s as usize].as_ref().map_or(false, |x| x.ifindex == index)) else { return 19 };
+        let x = v[sid as usize].as_ref().unwrap();
+        if x.kind != VifKind::Veth { return 95; }
+        let mut l = alloc::vec![(ns, sid)];
+        if let Some(p) = v.get(x.peer as usize).and_then(|p| p.as_ref()) { l.push((p.netns, x.peer)); }
+        l
+    };
+    crate::vif::free_vifs(&list);
+    0
 }

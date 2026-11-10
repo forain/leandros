@@ -469,7 +469,7 @@ def main():
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "uinputtest", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "netlinktest", "udpselftest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
-        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "nstest", "tuntest", "cgtest", "ovltest", "ovlmknodtest", "idmaptest", "captest", "mnttest", "seccomptest", "bpftest", "preadtest", "kexectest", "memfdtest", "conmontest", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid", "fusetest",
+        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "nstest", "tuntest", "brtest", "cgtest", "ovltest", "ovlmknodtest", "idmaptest", "captest", "mnttest", "seccomptest", "bpftest", "preadtest", "kexectest", "memfdtest", "conmontest", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid", "fusetest",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -638,6 +638,7 @@ def main():
         b"root:x:0:0:root:/root:/bin/brush\n"
         b"cosmic-greeter:x:990:990:COSMIC Greeter:/home/cosmic-greeter:/bin/false\n"
         b"leandro:x:1000:1000:leandro:/home/leandro:/bin/brush\n"
+        b"nobody:x:65534:65534:nobody:/:/bin/false\n"
     )
     etc_files.append(("passwd", passwd_bytes, 0o100644))
     # Subordinate id ranges for containers, read by newuidmap/newgidmap
@@ -686,6 +687,8 @@ def main():
         b"bluetooth:x:112:leandro\n"
         b"cosmic-greeter:x:990:\n"
         b"leandro:x:1000:\n"
+        b"nobody:x:65534:\n"
+        b"nogroup:x:65533:\n"
     ), 0o100644))
 
     # /etc/shadow — /bin/login's only source of password hashes. Salts are
