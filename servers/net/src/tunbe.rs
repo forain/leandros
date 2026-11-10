@@ -40,6 +40,7 @@ fn is_tun_kind(k: VifKind) -> bool { matches!(k, VifKind::Tap | VifKind::Tun) }
 fn attach(ns: u16, name: &[u8; 16], tap: bool, h: TunHandle) -> Result<(u32, [u8; 16]), i32> {
     let n = name_len(name);
     let kind = if tap { VifKind::Tap } else { VifKind::Tun };
+    crate::vif::claim(ns);
     let base: Vec<u8> = if n == 0 { (if tap { b"tap%d" } else { b"tun%d" }).to_vec() } else { name[..n].to_vec() };
     // Re-attach of a persistent interface by exact name.
     let has_pct = base.windows(2).any(|w| w == b"%d");
