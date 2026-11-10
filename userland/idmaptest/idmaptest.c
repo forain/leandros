@@ -1702,6 +1702,85 @@ static int peercred_view(void)
     return 0;
 }
 
+/* ---- idacl: POSIX ACL named entries are stored as kuids ------------------ */
+static const char *acl_dir;
+static char acl_path[64];
+static void acl_put(unsigned char *b, int i, unsigned tag, unsigned perm, unsigned id)
+{
+    unsigned char *e = b + 4 + i * 8;
+    e[0] = tag; e[1] = tag >> 8; e[2] = perm; e[3] = 0;
+    memcpy(e + 4, &id, 4);
+}
+/* u::rw-, u:<id>:r--, g::r--, m::r--, o::--- */
+static size_t acl_mk(unsigned char *b, unsigned id)
+{
+    b[0] = 2; b[1] = b[2] = b[3] = 0;
+    acl_put(b, 0, 0x01, 6, 0xFFFFFFFFu);
+    acl_put(b, 1, 0x02, 4, id);
+    acl_put(b, 2, 0x04, 4, 0xFFFFFFFFu);
+    acl_put(b, 3, 0x10, 4, 0xFFFFFFFFu);
+    acl_put(b, 4, 0x20, 0, 0xFFFFFFFFu);
+    return 4 + 5 * 8;
+}
+/* id of the ACL_USER entry (or -1) */
+static long acl_user_id(const char *p)
+{
+    unsigned char b[128];
+    long n = syscall(SYS_getxattr, p, "system.posix_acl_access", b, sizeof b);
+    if (n < 4) return -1;
+    for (long o = 4; o + 8 <= n; o += 8)
+        if (b[o] == 0x02) { unsigned id; memcpy(&id, b + o + 4, 4); return id; }
+    return -2;
+}
+static int c_acl_set(void)
+{
+    unsigned char b[64]; size_t l;
+    CHECK(px_nsroot() == 0);
+    l = acl_mk(b, 5);
+    CHECK(px_setx(acl_path, "system.posix_acl_access", (char *)b, l) == 0);
+    CHECK(acl_user_id(acl_path) == 5);                  /* ns reader: in-ns id */
+    l = acl_mk(b, 1001);                                /* host uid: unmapped */
+    CHECK(px_setx(acl_path, "system.posix_acl_access", (char *)b, l) == -1 && errno == EINVAL);
+    CHECK(acl_user_id(acl_path) == 5);
+    CHECK(px_setx(acl_path, "user.idacl", "v", 1) == 0);   /* user_xattr_ok_in_ns */
+    char v[4];
+    CHECK(syscall(SYS_getxattr, acl_path, "user.idacl", v, sizeof v) == 1 && v[0] == 'v');
+    return 0;
+}
+static int c_acl_get(void)
+{
+    CHECK(px_nsroot() == 0);
+    CHECK(acl_user_id(acl_path) == 65534);              /* kuid 1001: unmapped */
+    return 0;
+}
+static int acl_run(const char *dir)
+{
+    unsigned char b[64]; size_t l;
+    struct stat st;
+    if (!knob) return SKIP;
+    mkdir(dir, 0777); chmod(dir, 0777);
+    snprintf(acl_path, sizeof acl_path, "%s/acl", dir);
+    unlink(acl_path);
+    CHECK(px_mk(acl_path, 0, 100000, 100000, 0644) == 0);
+    CHECK(stat(acl_path, &st) == 0);
+    CHECK(px_run(c_acl_set, MAP100) == 0);
+    /* host (ns 0) sees the kuid */
+    CHECK(acl_user_id(acl_path) == 100005);
+    /* a kuid outside the reader's map reads as the overflow id */
+    l = acl_mk(b, 1001);
+    CHECK(px_setx(acl_path, "system.posix_acl_access", (char *)b, l) == 0);
+    CHECK(acl_user_id(acl_path) == 1001);
+    CHECK(px_run(c_acl_get, MAP100) == 0);
+    unlink(acl_path);
+    return 0;
+}
+static int acl_translated_tmpfs(void) { return acl_run(PXD); }
+static int acl_translated_f2fs(void)
+{
+    mkdir(PXF, 0777);
+    if (!on_f2fs()) return SKIP;
+    return acl_run(PXF);
+}
 
 /* ---- idfix1: M1 scm pid, M2 oom_score_adj, M4 captured map ns, L1, L7, B-items ---- */
 #include <sys/signalfd.h>
@@ -1943,6 +2022,8 @@ static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "nsroot_write_in_subuid_0700_dir_f2fs", nsroot_write_in_subuid_0700_dir_f2 },
     { "nsroot_cannot_touch_unmapped", nsroot_cannot_touch_unmapped },
     { "nsroot_cannot_touch_unmapped_f2fs", nsroot_cannot_touch_unmapped_f2 },
+    { "acl_named_set_translated", acl_translated_tmpfs },
+    { "acl_named_set_translated_f2fs", acl_translated_f2fs },
     { "host_user_cannot_touch_subuid", host_user_cannot_touch_subuid },
     { "host_user_cannot_touch_subuid_f2fs", host_user_cannot_touch_subuid_f2 },
     { "sticky_fowner_ns", sticky_fowner_ns },

@@ -8647,6 +8647,14 @@ fn xattr_get(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
         Some(v) => v,
         None => return err_reply(-61), // ENODATA
     };
+    let mut kbuf = [0u8; xattr::ACL_INHERIT_MAX];
+    let val: &[u8] = if (idx == xattr::IDX_ACL_ACCESS || idx == xattr::IDX_ACL_DEFAULT)
+        && cred.view.ns != 0 {
+        match xattr::acl_from_kernel(&cred.view, val, &mut kbuf) {
+            Ok(n) => &kbuf[..n],
+            Err(e) => return err_reply(-e),
+        }
+    } else { val };
     if size == 0 { return val_reply(val.len() as u64); }
     if (val.len() as u64) > size { return err_reply(-34); } // ERANGE
     unsafe { core::ptr::copy_nonoverlapping(val.as_ptr(), val_ptr as *mut u8, val.len()); }
@@ -8710,6 +8718,14 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
             }
             return ok_reply();
         }
+        let mut kbuf = [0u8; xattr::ACL_INHERIT_MAX];
+        let val = match xattr::acl_validate(val) {
+            Ok(_) => match xattr::acl_to_kernel(&cred.view, val, &mut kbuf) {
+                Ok(n) => &kbuf[..n],
+                Err(e) => return err_reply(-e),
+            },
+            Err(_) => return err_reply(-22), // EINVAL
+        };
         let summary = match xattr::acl_validate(val) {
             Ok(s) => s,
             Err(_) => return err_reply(-22), // EINVAL
