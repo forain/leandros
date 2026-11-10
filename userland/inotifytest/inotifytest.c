@@ -22,6 +22,15 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef IN_EXCL_UNLINK
+#define IN_EXCL_UNLINK 0x04000000
+#endif
+#ifndef IN_MASK_CREATE
+#define IN_MASK_CREATE 0x10000000
+#endif
+#ifndef IN_MASK_ADD
+#define IN_MASK_ADD 0x20000000
+#endif
 static int npass, nfail;
 static char base[64];
 
@@ -501,42 +510,12 @@ static int wmap(pid_t pid, unsigned lower)
     return 0;
 }
 
-/* Child unshare(USER|NS); parent maps 0 -> lower; returns the child's pipes. */
-static pid_t spawn_userns(int newns, unsigned lower, int *to_child, int *from_child, int (*body)(void))
-{
-    int a[2], b[2];
-    pipe(a); pipe(b);
-    pid_t c = fork();
-    if (c == 0) {
-        char x;
-        if (unshare(CLONE_NEWUSER | (newns ? CLONE_NEWNS : 0))) _exit(90);
-        write(b[1], "u", 1);
-        if (read(a[0], &x, 1) != 1) _exit(91);
-        _exit(body());
-    }
-    char x; read(b[0], &x, 1);
-    if (wmap(c, lower)) { kill(c, 9); waitpid(c, NULL, 0); return -1; }
-    write(a[1], "m", 1);
-    *to_child = a[1]; *from_child = b[0];
-    close(a[0]); close(b[1]);
-    return c;
-}
-
-static int g_pipe_up = -1, g_pipe_dn = -1;
-static int limit_userns_body(void)
-{
-    int a = inotify_init1(IN_NONBLOCK), b = inotify_init1(IN_NONBLOCK);
-    int x = inotify_init1(IN_NONBLOCK); int e = errno;
-    int ok = a >= 0 && b >= 0 && x < 0 && e == EMFILE;
-    return ok ? 0 : 1;
-}
-
+static int g_pipe_up = -1;
 static void t_limit_userns(void)
 {
     /* Child ns instances are charged to (ns, kuid) AND to the creator (ns 0,
      * kuid 0) up the chain. */
     lim_set(LIM_I, 2);
-    int to, from;
     int a[2], b[2];
     pipe(a); pipe(b);
     pid_t c = fork();
@@ -561,12 +540,10 @@ static void t_limit_userns(void)
     if (mine >= 0) close(mine);
     write(a[1], "g", 1);
     int st = 0; waitpid(c, &st, 0);
-    (void)to; (void)from;
     report("t_limit_userns", ok && WIFEXITED(st) && WEXITSTATUS(st) == 0);
     lim_set(LIM_I, 128);
 }
 
-static char g_ab[160];
 static int userns_mntns_body(void)
 {
     char a[128]; snprintf(a, sizeof a, "%s/a", base);
