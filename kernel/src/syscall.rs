@@ -9568,8 +9568,8 @@ fn kpath_is_dir(kp: &KPath) -> Result<bool, isize> {
 fn tmpfs_new_instance(flags: usize, data_ptr: usize) -> Result<(u32, Vec<u8>), isize> {
     let data = if data_ptr == 0 { Vec::new() } else { copy_user_str(data_ptr, 1024)? };
     let o = vfs::parse_tmpfs_opts(&data).map_err(|e| e as isize)?;
-    let uid = match o.uid { Some(v) => sched::ns::kid_from_view(0, v).ok_or(-22isize)?, None => sched::current_euid() };
-    let gid = match o.gid { Some(v) => sched::ns::kid_from_view(1, v).ok_or(-22isize)?, None => sched::current_egid() };
+    let uid = match o.uid { Some(v) => sched::ns::to_k(0, sched::ns::current_userns(), v).ok_or(-22isize)?, None => sched::current_euid() };
+    let gid = match o.gid { Some(v) => sched::ns::to_k(1, sched::ns::current_userns(), v).ok_or(-22isize)?, None => sched::current_egid() };
     let mode = o.mode.unwrap_or(0o1777);
     let (sb, _) = vfs::mnt::sb_create("tmpfs", Some(vfs::tmpfs_instance_destroy));
     let root = match vfs::tmpfs_instance_create(sb, uid, gid, mode) {
