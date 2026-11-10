@@ -237,12 +237,12 @@ static int e2e_body(void)
         read(a[0], &x, 1);                 /* maps written */
         struct stat st;
         if (getuid() != 0 || getgid() != 0) _exit(20);
-        if (setresgid(1, 1, 1) || setresuid(1, 1, 1)) _exit(21);
-        if (getuid() != 1 || getgid() != 1) _exit(22);
+        if (setresgid(2, 2, 2) || setresuid(2, 2, 2)) _exit(21);
+        if (getuid() != 2 || getgid() != 2) _exit(22);
         int fd = open(e2e_path, O_CREAT | O_WRONLY | O_EXCL, 0644);
         if (fd < 0) _exit(23);
         close(fd);
-        if (stat(e2e_path, &st) || st.st_uid != 1 || st.st_gid != 1) _exit(24);
+        if (stat(e2e_path, &st) || st.st_uid != 2 || st.st_gid != 2) _exit(24);
         _exit(0);
     }
     char x; int rc = 0;
@@ -265,8 +265,8 @@ static int e2e_body(void)
     int st; waitpid(c, &st, 0);
     if (!rc && (!WIFEXITED(st) || WEXITSTATUS(st))) rc = 40 + (WIFEXITED(st) ? WEXITSTATUS(st) : 99);
     if (!rc) {
-        struct stat s;   /* ns 0 reads kernel ids: ns-uid 1 is kuid 100001 */
-        if (stat(e2e_path, &s) || s.st_uid != 100001 || s.st_gid != 100001) rc = 3;
+        struct stat s;   /* ns 0 reads kernel ids: ns-uid 2 is kuid 100001 (1->100000) */
+        if (stat(e2e_path, &s) || s.st_uid != 100001 || s.st_gid != 100001) { printf("e2e_subuid: init sees %u:%u\n", (unsigned)s.st_uid, (unsigned)s.st_gid); rc = 3; }
     }
     return rc;
 }
