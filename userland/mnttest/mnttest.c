@@ -1163,11 +1163,8 @@ int main(int argc, char **argv) {
     mount_userns_perm();
     setns_mnt_suite();
     tmpfs_anywhere();
-<<<<<<< HEAD
     netns_suite();
-=======
     devpts_copies();
->>>>>>> main
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
