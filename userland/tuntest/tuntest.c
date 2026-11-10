@@ -401,6 +401,15 @@ static int vec_cases(void)
         CHECK("vec_tap_readv_one_frame", peer_ok);
         close(cs);
     }
+    {   /* ARP reply from the peer, so the stack knows it */
+        unsigned char a[42];
+        memcpy(a, tapmac, 6); memcpy(a + 6, p_mac, 6);
+        a[12] = 0x08; a[13] = 0x06;
+        memcpy(a + 14, "\x00\x01\x08\x00\x06\x04\x00\x02", 8);
+        memcpy(a + 22, p_mac, 6); memcpy(a + 28, "\x0a\x09\x00\x02", 4);
+        memcpy(a + 32, tapmac, 6); memcpy(a + 38, "\x0a\x09\x00\x01", 4);
+        CHECK("vec_tap_write_arp", write(fd, a, 42) == 42);
+    }
     /* tap writev of 3 iovecs (eth | ip | udp+payload) is ONE frame */
     {
         unsigned char f[14 + 20 + 8 + 4];
