@@ -11268,11 +11268,12 @@ fn handle_close_all(pid: u32) -> Message {
 const MAX_LOCKS: usize = 1 << 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LockKey { Tmp(usize), Mount(u32, u32) }
+enum LockKey { Tmp(usize), Mount(u32, u32), Ino(u32, u64) }
 
 #[derive(Clone, Copy)]
 struct LockRecord {
-    key:       LockKey,
+    key:       LockKey, // lock domain: the inode (tmpfs index, or mount port + inode)
+    slot:      LockKey, // the open-file slot the lock was taken through (released by its close)
     pid:       u32,
     start:     u64,
     end:       u64, // exclusive upper bound; u64::MAX == to EOF
@@ -11282,7 +11283,7 @@ struct LockRecord {
 
 impl LockRecord {
     const fn empty() -> Self {
-        Self { key: LockKey::Tmp(0), pid: 0, start: 0, end: 0, exclusive: false, in_use: false }
+        Self { key: LockKey::Tmp(0), slot: LockKey::Tmp(0), pid: 0, start: 0, end: 0, exclusive: false, in_use: false }
     }
 }
 
@@ -11304,6 +11305,35 @@ fn lock_key_of(kind: &VnodeKind) -> Option<LockKey> {
         VnodeKind::MountedFile { port, file_id }  => Some(LockKey::Mount(*port, *file_id)),
         _ => None,
     }
+}
+
+/// st_ino of an open mounted file, asked of its mount server. A mount server's
+/// `file_id` names an open-file SLOT (one per open(2)), never the file, so it
+/// cannot be the lock domain: two processes opening the same path got two
+/// unrelated keys and their fcntl locks never conflicted (sqlite on f2fs: both
+/// podman processes held EXCLUSIVE at once and deleted each other's journal).
+fn mounted_ino(port: u32, file_id: u32) -> Option<u64> {
+    let mut st = [0u8; 160];
+    let mut proxy = Message::empty();
+    proxy.tag = VFS_FSTAT;
+    proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+    proxy.data[8..16].copy_from_slice(&(st.as_mut_ptr() as u64).to_le_bytes());
+    let r = call_port(port, proxy);
+    if reply_val(&r) != 0 { return None; }
+    let ino = u64::from_le_bytes(st[8..16].try_into().unwrap());
+    if ino == 0 { None } else { Some(ino) }
+}
+
+/// (lock domain, open-file slot) of a vnode. The domain is what conflicts are
+/// decided on; the slot is what a close releases.
+fn lock_domain_of(kind: &VnodeKind) -> Option<(LockKey, LockKey)> {
+    let slot = lock_key_of(kind)?;
+    let dom = match kind {
+        VnodeKind::MountedFile { port, file_id } =>
+            mounted_ino(*port, *file_id).map(|i| LockKey::Ino(*port, i)).unwrap_or(slot),
+        _ => slot,
+    };
+    Some((dom, slot))
 }
 
 fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
@@ -11329,6 +11359,8 @@ fn lock_wake_key(key: LockKey) -> u64 {
         LockKey::Tmp(idx) => idx as u32,
         LockKey::Mount(port, file_id) =>
             0x8000_0000 | (port.wrapping_mul(0x9E37_79B1) ^ file_id) & 0x7fff_ffff,
+        LockKey::Ino(port, ino) =>
+            0x8000_0000 | (port.wrapping_mul(0x9E37_79B1) ^ (ino as u32) ^ ((ino >> 32) as u32).wrapping_mul(0x85EB_CA6B)) & 0x7fff_ffff,
     };
     sched::poll_key(sched::poll_class::FLOCK, index)
 }
@@ -11360,9 +11392,19 @@ fn locks_clear(locks: &mut [LockRecord], key: LockKey, pid: u32,
 fn locks_released(key: LockKey) { sched::wake_poll_key(lock_wake_key(key)); }
 
 /// Release every lock `pid` holds on `key`.
-fn release_locks(key: LockKey, pid: u32) {
-    let cleared = locks_clear(&mut LOCKS.lock(), key, pid, |_| true);
-    if cleared { locks_released(key); }
+fn release_locks(slot: LockKey, pid: u32) {
+    let pid = sched::tgid_of(pid);
+    let mut woke: Option<LockKey> = None;
+    {
+        let mut locks = LOCKS.lock();
+        for l in locks.iter_mut() {
+            if l.in_use && l.slot == slot && l.pid == pid {
+                woke = Some(l.key);
+                *l = LockRecord::empty();
+            }
+        }
+    }
+    if let Some(k) = woke { locks_released(k); }
 }
 
 /// Park a lock waiter: `try_grant` runs once before parking and once after
@@ -11440,7 +11482,8 @@ fn handle_fcntl_lock(pid: u32, kind: VnodeKind, cmd: usize, arg: usize) -> Messa
     const F_GETLK:  usize = 5;
     const F_SETLK:  usize = 6;
 
-    let key = match lock_key_of(&kind) { Some(k) => k, None => return err_reply(-22) }; // EINVAL
+    let pid = sched::tgid_of(pid);
+    let (key, slot) = match lock_domain_of(&kind) { Some(k) => k, None => return err_reply(-22) }; // EINVAL
     let (l_type, l_whence, l_start, l_len, _) = match read_flock(arg) {
         Some(v) => v, None => return err_reply(-14), // EFAULT
     };
@@ -11478,7 +11521,7 @@ fn handle_fcntl_lock(pid: u32, kind: VnodeKind, cmd: usize, arg: usize) -> Messa
         // bytes or downgrade exclusive to shared, so it wakes like a release.
         let cleared = locks_clear(&mut locks, key, pid,
                                   |l| ranges_overlap(l.start, l.end, start, end));
-        let ok = lock_insert(&mut locks, LockRecord { key, pid, start, end, exclusive, in_use: true });
+        let ok = lock_insert(&mut locks, LockRecord { key, slot, pid, start, end, exclusive, in_use: true });
         drop(locks);
         if cleared { locks_released(key); }
         Some(if ok { ok_reply() } else { err_reply(-37) }) // ENOLCK
@@ -11497,11 +11540,13 @@ fn handle_flock(pid: u32, fd: usize, op: u32) -> Message {
     let mut tbls = TblSlot::new();
     let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
-    let key = match lock_key_of(&tbl.fds[fd].kind) { Some(k) => k, None => return err_reply(-22) };
+    let kind = tbl.fds[fd].kind;
     drop(tbls);
+    let pid = sched::tgid_of(pid);
+    let (key, slot) = match lock_domain_of(&kind) { Some(k) => k, None => return err_reply(-22) };
 
     if op & LOCK_UN != 0 {
-        release_locks(key, pid);
+        release_locks(slot, pid);
         return ok_reply();
     }
 
@@ -11514,7 +11559,7 @@ fn handle_flock(pid: u32, fd: usize, op: u32) -> Message {
         if find_conflict(&*locks, key, pid, 0, u64::MAX, exclusive).is_some() { return None; }
         // A conversion replaces the holder's own lock (EX -> SH releases).
         let cleared = locks_clear(&mut locks, key, pid, |_| true);
-        let ok = lock_insert(&mut locks, LockRecord { key, pid, start: 0, end: u64::MAX, exclusive, in_use: true });
+        let ok = lock_insert(&mut locks, LockRecord { key, slot, pid, start: 0, end: u64::MAX, exclusive, in_use: true });
         drop(locks);
         if cleared { locks_released(key); }
         Some(if ok { ok_reply() } else { err_reply(-37) }) // ENOLCK
