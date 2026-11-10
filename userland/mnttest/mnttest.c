@@ -639,6 +639,35 @@ static int cross_symlink_ok(void) {
     return 1;
 }
 
+/* lane conmondbg: stat/chmod of /proc/self/fd/N for a tmpfs-instance directory
+ * fd act on that directory only; no spelling reaches a sibling instance or the
+ * raw pool path, and the link text never names the pool. */
+static int procfd_tmpfs_dir_ok(void) {
+    int dfd = open("/mnt", O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) return 0;
+    char p[96], q[160], lnk[256];
+    struct stat a, b;
+    snprintf(p, sizeof p, "/proc/self/fd/%d", dfd);
+    if (stat(p, &a) != 0 || !S_ISDIR(a.st_mode)) return 0;
+    if (fstat(dfd, &b) != 0 || a.st_ino != b.st_ino) return 0;
+    if (chmod(p, 0711) != 0) return 0;
+    if (stat("/mnt", &b) != 0 || (b.st_mode & 0777) != 0711) return 0;
+    ssize_t n = readlink(p, lnk, sizeof lnk - 1);
+    if (n > 0) { lnk[n] = 0; if (strstr(lnk, ".leandros-sb")) return 0; }
+    for (int m = 1; m < 80; m++) {
+        snprintf(q, sizeof q, "%s/../%d/marker", p, m);
+        if (stat(q, &b) == 0) return 0;
+        snprintf(q, sizeof q, "%s/.leandros-sb/tmpfs/%d/marker", p, m);
+        if (stat(q, &b) == 0) return 0;
+        snprintf(q, sizeof q, "%s/../.leandros-sb/tmpfs/%d/marker", p, m);
+        if (stat(q, &b) == 0) return 0;
+        snprintf(q, sizeof q, "/.leandros-sb/tmpfs/%d", m);
+        if (chmod(q, 0777) == 0) return 0;
+    }
+    close(dfd);
+    return 1;
+}
+
 static int mountinfo_nopool_ok(void) {
     static char b[16384];
     for (int k = 0; k < 2; k++) {
@@ -673,6 +702,7 @@ static void pool_tests(void) {
     report("pool_via_fd_relative_ns0", pool_in_child(0, pool_fd_ok));
     report("pool_via_fd_relative_mntns", pool_in_child(1, pool_fd_ok));
     report("pool_cross_instance_symlink", pool_in_child(1, cross_symlink_ok));
+    report("pool_procfd_tmpfs_dir", pool_in_child(1, procfd_tmpfs_dir_ok));
     report("mountinfo_no_pool_path", pool_in_child(1, mountinfo_nopool_ok));
     if (holder > 0) { write(rp[1], &hc, 1); waitpid(holder, NULL, 0); }
 }

@@ -8896,11 +8896,31 @@ fn proc_own_anon_fd(ns_path: &[u8]) -> Option<usize> {
     Some(h)
 }
 
+/// `/proc/<own>/fd/N` naming a directory on a non-mounted filesystem (tmpfs
+/// instance, RamFS): the VFS handle. stat/chmod act on the descriptor itself
+/// (fstat / fchmod), so no backing path (the hidden `/.leandros-sb` pool in
+/// particular) is ever resolved and namespace translation cannot be bypassed.
+fn proc_own_tmpfs_dir_fd(ns_path: &[u8]) -> Option<usize> {
+    let (fd, below) = proc_own_fd(ns_path)?;
+    if !below.is_empty() || fd >= net_server::SOCK_FD_BASE { return None; }
+    if matches!(vfs::vfs_get_node_kind(current_pid(), fd), Some(vfs::VnodeKind::MountedFile { .. })) {
+        return None;
+    }
+    let h = fd_handle(fd);
+    // Kernel-internal is-directory query on the backing path; the path is
+    // never handed to anything that resolves it for the user.
+    let host = fd_host_path(h)?;
+    if host.ends_with(b" (deleted)") { return None; }
+    match kpath_is_dir(&KPath::raw(&host)) { Ok(true) => Some(h), _ => None }
+}
+
 /// The host path of fd `fd` when it names a live directory the VFS can
 /// resolve by path; None for anything else (files keep identity reopen).
 fn fd_dir_host_path(fd: usize) -> Option<Vec<u8>> {
     let host = fd_host_path(fd)?;
     if host.ends_with(b" (deleted)") { return None; }
+    // The hidden tmpfs pool is never a resolution base for a user path.
+    if vfs::mnt::is_sb_path(&host) { return None; }
     let kp = KPath::raw(&host);
     match kpath_is_dir(&kp) { Ok(true) => Some(host), _ => None }
 }
@@ -9935,7 +9955,7 @@ fn fstatat_into(
 
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     if flags & AT_SYMLINK_NOFOLLOW == 0 {
-        if let Some(fd) = proc_own_anon_fd(path.ns_bytes()) {
+        if let Some(fd) = proc_own_tmpfs_dir_fd(path.ns_bytes()).or_else(|| proc_own_anon_fd(path.ns_bytes())) {
             return fstat_into(fd, statbuf_ptr, user_dest);
         }
     }
@@ -10195,6 +10215,9 @@ fn sys_fchmodat2(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> is
 fn sys_fchmodat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        if let Some(h) = proc_own_tmpfs_dir_fd(path.ns_bytes()) {
+            return sys_fchmod(h, mode);
+        }
         if let Some(fd) = proc_own_anon_fd(path.ns_bytes()) {
             let mut kb = [0u64; STAT_SIZE.div_ceil(8)];
             let r = fstat_into(fd, kb.as_mut_ptr() as usize, false);

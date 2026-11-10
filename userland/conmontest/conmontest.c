@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int fails;
@@ -62,11 +63,86 @@ static void chmod_socket_fd(void)
     close(so); unlink(r); rmdir(d);
 }
 
+// AF_UNIX pathname sockets must work on any filesystem (f2fs root, tmpfs):
+// bind creates an S_IFSOCK node, connect reaches the listener, bind on an
+// existing path is EADDRINUSE, unlink makes the listener unreachable by
+// path, and a node with no listener (what a reboot leaves) is ECONNREFUSED.
+static int usock(const char *path, int *err, int do_bind, int do_listen)
+{
+    int so = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    strncpy(a.sun_path, path, sizeof a.sun_path - 1);
+    errno = 0;
+    int r = do_bind ? bind(so, (struct sockaddr *)&a, sizeof a) : connect(so, (struct sockaddr *)&a, sizeof a);
+    *err = errno;
+    if (r != 0) { close(so); return -1; }
+    if (do_listen) listen(so, 4);
+    return so;
+}
+
+static void unix_on_fs(const char *tag, const char *base)
+{
+    char d[96], p[128], s[160];
+    int e;
+    snprintf(d, sizeof d, "%s/usock.%d", base, getpid());
+    rmdir(d);
+    mkdir(d, 0755);
+    snprintf(p, sizeof p, "%s/s", d);
+    int ls = usock(p, &e, 1, 1);
+    snprintf(s, sizeof s, "%s: bind", tag); errno = e; ok(s, ls >= 0);
+    struct stat st;
+    snprintf(s, sizeof s, "%s: node is S_IFSOCK", tag); ok(s, stat(p, &st) == 0 && S_ISSOCK(st.st_mode));
+    int c = usock(p, &e, 0, 0);
+    snprintf(s, sizeof s, "%s: connect", tag); errno = e; ok(s, c >= 0);
+    int acc = ls >= 0 ? accept(ls, NULL, NULL) : -1;
+    char b[8] = {0};
+    snprintf(s, sizeof s, "%s: send/recv", tag);
+    ok(s, c >= 0 && acc >= 0 && write(c, "hi", 2) == 2 && read(acc, b, 8) == 2 && !memcmp(b, "hi", 2));
+    int dup = usock(p, &e, 1, 0);
+    snprintf(s, sizeof s, "%s: bind existing -> EADDRINUSE", tag); errno = e; ok(s, dup < 0 && e == EADDRINUSE);
+    // non-root caller may not create a node in a root-owned 0755 dir
+    pid_t k = fork();
+    if (k == 0) {
+        char q[128]; int e2;
+        snprintf(q, sizeof q, "%s/denied", d);
+        if (setuid(1000) != 0) _exit(2);
+        usock(q, &e2, 1, 0);
+        _exit(e2 == EACCES ? 0 : 1);
+    }
+    int stt = 0; waitpid(k, &stt, 0);
+    snprintf(s, sizeof s, "%s: bind without parent W+X -> EACCES", tag); ok(s, WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+    close(c); if (acc >= 0) close(acc);
+    unlink(p);
+    c = usock(p, &e, 0, 0);
+    snprintf(s, sizeof s, "%s: connect after unlink -> ENOENT", tag); errno = e; ok(s, c < 0 && e == ENOENT);
+    if (ls >= 0) close(ls);
+    // stale node: S_IFSOCK inode with no listener
+    int mk = mknod(p, S_IFSOCK | 0777, 0);
+    c = usock(p, &e, 0, 0);
+    snprintf(s, sizeof s, "%s: stale node -> ECONNREFUSED", tag); errno = e; ok(s, mk == 0 && c < 0 && e == ECONNREFUSED);
+    // rebind over a stale node name is EADDRINUSE until it is unlinked
+    int rb = usock(p, &e, 1, 0);
+    snprintf(s, sizeof s, "%s: bind over stale node -> EADDRINUSE", tag); errno = e; ok(s, rb < 0 && e == EADDRINUSE);
+    unlink(p);
+    // a fresh bind after unlink reaches only the new listener
+    int n1 = usock(p, &e, 1, 1);
+    unlink(p);
+    int n2 = usock(p, &e, 1, 1);
+    c = usock(p, &e, 0, 0);
+    snprintf(s, sizeof s, "%s: rebind after unlink", tag); ok(s, n1 >= 0 && n2 >= 0 && c >= 0);
+    char x = 'z'; int a2 = n2 >= 0 ? accept(n2, NULL, NULL) : -1;
+    snprintf(s, sizeof s, "%s: connect reaches newest listener", tag);
+    ok(s, c >= 0 && a2 >= 0 && write(c, &x, 1) == 1);
+    unlink(p); rmdir(d);
+}
+
 int main(void)
 {
     dirfd_proc_path("o_path", O_PATH | O_DIRECTORY | O_CLOEXEC);
     dirfd_proc_path("o_rdonly", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     chmod_socket_fd();
+    unix_on_fs("unix tmpfs", "/tmp");
+    unix_on_fs("unix f2fs", "/root");
     printf(fails ? "conmontest: %d FAILED\n" : "conmontest: ALL PASS\n", fails);
     return fails != 0;
 }

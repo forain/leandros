@@ -13475,8 +13475,10 @@ fn push_decimal(buf: &mut Vec<u8>, mut n: u32) {
 /// component is created literally (bind does not follow a trailing symlink).
 ///
 /// 0 on success, else a negative errno: -17 EEXIST (net → EADDRINUSE), -2
-/// ENOENT (missing parent), -36 ENAMETOOLONG, -28 ENOSPC, -95 EOPNOTSUPP (not
-/// a tmpfs path — f2fs socket binds are unsupported).
+/// ENOENT (missing parent), -36 ENAMETOOLONG, -28 ENOSPC, -95 EOPNOTSUPP (the
+/// path is on no mount server). Sockets on mounted filesystems (f2fs) are a
+/// real S_IFSOCK inode plus an in-memory (path, inode) -> listener table
+/// (`mounted_sock_bind`).
 pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
     let resolved = match tmp_resolve_links(path, false) {
         Ok(v)  => v,
@@ -13485,7 +13487,7 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
     let rpath = &resolved[..];
     let tpath = match tmpfs_path(rpath) {
         Some(p) => p,
-        None    => return -95, // EOPNOTSUPP — sockets only bind on tmpfs
+        None    => return mounted_sock_bind(rpath, sock_id),
     };
     if is_tmpfs_root(tpath) { return -17; }             // EEXIST — the mount root
     if tpath.len() > MAX_TMP_PATH - 1 { return -36; }   // ENAMETOOLONG
@@ -13503,6 +13505,97 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
     tmp[idx].gid  = cred.egid;
     tmp_init_created(&mut tmp, idx, tpath, 0o777, sched::umask(u32::MAX) as u16, false);
     0
+}
+
+// ── AF_UNIX sockets on mounted filesystems ───────────────────────────────────
+//
+// bind() makes a real S_IFSOCK inode through the mount server (permission and
+// EEXIST checks are the server's own mknod gate), then records which listener
+// it belongs to. The listener identity lives only in memory, so after a reboot
+// the node is a stale socket file: connect finds the inode but no listener
+// (ECONNREFUSED), as on Linux. unlink needs no hook: connect re-stats the path
+// and only honours an entry whose inode number still matches.
+
+/// (mount-server path, st_ino, net sock_id)
+static MOUNTED_SOCKS: Mutex<Vec<(Vec<u8>, u64, u64)>> = Mutex::new(Vec::new());
+const MOUNTED_SOCKS_MAX: usize = 1024;
+
+/// lstat `path` on its mount server: (mode, uid, gid, ino) or -errno.
+fn mounted_lstat(port: u32, path: &[u8]) -> Result<(u32, u32, u32, u64), i32> {
+    let mut pb: Vec<u8> = Vec::new();
+    if pb.try_reserve_exact(path.len() + 1).is_err() { return Err(-12); }
+    pb.extend_from_slice(path);
+    pb.push(0);
+    let mut st = [0u64; 24];
+    let mut m = Message::empty();
+    m.tag = VFS_LSTAT;
+    m.data[0..8].copy_from_slice(&(pb.as_ptr() as u64).to_le_bytes());
+    m.data[8..16].copy_from_slice(&(st.as_mut_ptr() as u64).to_le_bytes());
+    let r = reply_val(&call_port(port, m));
+    if r < 0 { return Err(r as i32); }
+    let p = st.as_ptr() as *const u8;
+    unsafe {
+        let ino = (p.add(8) as *const u64).read_unaligned();
+        #[cfg(target_arch = "x86_64")]
+        let (mode, uid, gid) = ((p.add(24) as *const u32).read_unaligned(),
+            (p.add(28) as *const u32).read_unaligned(), (p.add(32) as *const u32).read_unaligned());
+        #[cfg(not(target_arch = "x86_64"))]
+        let (mode, uid, gid) = ((p.add(16) as *const u32).read_unaligned(),
+            (p.add(24) as *const u32).read_unaligned(), (p.add(28) as *const u32).read_unaligned());
+        Ok((mode, uid, gid, ino))
+    }
+}
+
+fn mounted_sock_bind(rpath: &[u8], sock_id: u64) -> i32 {
+    let port = match find_mount_port(rpath) { Some(p) => p, None => return -95 };
+    if rpath.len() >= PATH_MAX { return -36; }
+    let mut pb: Vec<u8> = Vec::new();
+    if pb.try_reserve_exact(rpath.len() + 1).is_err() { return -12; }
+    pb.extend_from_slice(rpath);
+    pb.push(0);
+    let packed = xattr::pack_create_mode(0o777, sched::umask(u32::MAX));
+    let mut m = Message::empty();
+    m.tag = VFS_MKNOD;
+    m.data[0..8].copy_from_slice(&(pb.as_ptr() as u64).to_le_bytes());
+    m.data[8..16].copy_from_slice(&packed.to_le_bytes());
+    m.data[16..24].copy_from_slice(&((0o140000u32 >> 12) as u64).to_le_bytes());
+    m.data[24..32].copy_from_slice(&0u64.to_le_bytes());
+    let r = reply_val(&call_port(port, m));
+    if r < 0 { return r as i32; } // -17 EEXIST, -2 ENOENT, -13 EACCES, -28 ENOSPC...
+    let ino = match mounted_lstat(port, rpath) { Ok((_, _, _, i)) => i, Err(e) => return e };
+    let mut t = MOUNTED_SOCKS.lock();
+    t.retain(|e| e.0 != rpath);
+    if t.len() >= MOUNTED_SOCKS_MAX {
+        // Drop entries whose node is gone or was replaced.
+        let snap: Vec<(Vec<u8>, u64, u64)> = core::mem::take(&mut *t);
+        drop(t);
+        let keep: Vec<_> = snap.into_iter().filter(|e| {
+            find_mount_port(&e.0).map_or(false, |p| matches!(mounted_lstat(p, &e.0), Ok((_, _, _, i)) if i == e.1))
+        }).collect();
+        t = MOUNTED_SOCKS.lock();
+        t.extend(keep);
+        if t.len() >= MOUNTED_SOCKS_MAX { return -28; }
+    }
+    t.push((rpath.to_vec(), ino, sock_id));
+    0
+}
+
+fn mounted_sock_resolve(pid: u32, rpath: &[u8]) -> i64 {
+    let port = match find_mount_port(rpath) { Some(p) => p, None => return -2 };
+    let (mode, uid, gid, ino) = match mounted_lstat(port, rpath) { Ok(v) => v, Err(e) => return e as i64 };
+    if mode & 0o170000 != 0o140000 { return -111; } // exists, not a socket
+    let cred = cred_of(pid);
+    if cred.euid != 0 {
+        let bits = if cred.euid == uid { (mode >> 6) & 7 }
+                   else if cred.egid == gid { (mode >> 3) & 7 } else { mode & 7 };
+        if bits & 2 == 0 { return -13; } // connect needs write on the socket inode
+    }
+    let mut t = MOUNTED_SOCKS.lock();
+    match t.iter().position(|e| e.0 == rpath) {
+        Some(i) if t[i].1 == ino => t[i].2 as i64,
+        Some(i) => { t.swap_remove(i); -111 } // replaced node
+        None => -111,                         // stale node: no listener
+    }
 }
 
 /// connect(): resolve `path` (following symlinks on every component) to the
@@ -13526,7 +13619,7 @@ pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 {
     let rpath = &resolved[..];
     let tpath = match tmpfs_path(rpath) {
         Some(p) => p,
-        None    => return -2, // ENOENT — no socket can exist off-tmpfs
+        None    => return mounted_sock_resolve(pid, rpath),
     };
     let cred = cred_of(pid);
     let tmp = TMP_FILES.lock();
