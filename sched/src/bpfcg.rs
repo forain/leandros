@@ -219,3 +219,14 @@ pub fn dev_allowed(cg: CgId, ctx: &DevCtx) -> bool {
     let st = STATE.lock();
     effective(&st, cg).iter().all(|id| st.progs.get(id).map(|p| ebpf_cgdev::run(&p.prog, ctx) == 1).unwrap_or(true))
 }
+
+/// Device-cgroup enforcement (Linux `devcgroup_check_permission`): every
+/// program in the effective list of `pid`'s cgroup must allow the access.
+/// `acc` is a mask of BPF_DEVCG_ACC_{MKNOD,READ,WRITE}. Zero cost (one atomic
+/// load) while no program is attached anywhere. Err is -EPERM.
+pub fn dev_check(pid: u32, is_blk: bool, major: u32, minor: u32, acc: u32) -> Result<(), i32> {
+    if ATTACHED.load(Acquire) == 0 { return Ok(()); }
+    let ty = if is_blk { ebpf_cgdev::BPF_DEVCG_DEV_BLOCK } else { ebpf_cgdev::BPF_DEVCG_DEV_CHAR };
+    let ctx = DevCtx::new(ty, acc, major, minor);
+    if dev_allowed(cgroup::cg_of(pid), &ctx) { Ok(()) } else { Err(EPERM) }
+}
