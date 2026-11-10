@@ -201,6 +201,8 @@ pub const IPPROTO_ICMP: usize = 1;
 /// SOL_TCP and the TCP-level options this server implements (Linux values).
 const IPPROTO_TCP:   usize = 6;
 const TCP_NODELAY:   usize = 1;
+const TCP_INFO:      usize = 11;
+const TCP_INFO_LEN:  usize = 104;
 const TCP_KEEPIDLE:  usize = 4;
 const TCP_KEEPINTVL: usize = 5;
 const TCP_KEEPCNT:   usize = 6;
@@ -4020,10 +4022,14 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                         arg(msg,1) as usize, arg(msg,2) as usize,
                                         arg(msg,4) as usize, arg(msg,5) as usize,
                                         arg(msg,3) as usize),
+        // msghdr_ptr == 0 with arg3/arg4 = (iov_ptr, iovcnt): a writev/readv
+        // on a socket, i.e. a msghdr with no name and no control.
         NET_SENDMSG     => handle_sendmsg(caller_pid, arg(msg,0) as usize,
-                                          arg(msg,1) as usize, arg(msg,2) as usize),
+                                          arg(msg,1) as usize, arg(msg,2) as usize,
+                                          if arg(msg,1) == 0 { Some((arg(msg,3) as usize, arg(msg,4) as usize)) } else { None }),
         NET_RECVMSG     => handle_recvmsg(caller_pid, arg(msg,0) as usize,
-                                          arg(msg,1) as usize, arg(msg,2) as usize),
+                                          arg(msg,1) as usize, arg(msg,2) as usize,
+                                          if arg(msg,1) == 0 { Some((arg(msg,3) as usize, arg(msg,4) as usize)) } else { None }),
         NET_SHUTDOWN    => with_state_wake(caller_pid, arg(msg,0) as usize, true, ||
                                handle_shutdown(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize)),
         NET_GETSOCKNAME  => handle_getsockname(caller_pid, arg(msg,0) as usize,
@@ -6330,13 +6336,18 @@ fn unix_dgram_send_fds(pid: u32, fd: usize, conn_idx: usize, is_a: bool, data: &
     val_reply(data.len() as u64)
 }
 
-fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Message {
-    if msghdr_ptr == 0 { return err_reply(-14); }
-    if let Some(o) = nlsock::of(pid, fd) { return nlsock::send_msg(o, msghdr_ptr); }
-    let iov_ptr  = rd_or_efault!(msghdr_ptr + 16);
-    let iovcnt   = rd_or_efault!(msghdr_ptr + 24);
-    let ctrl_ptr = rd_or_efault!(msghdr_ptr + 32);
-    let ctrl_len = rd_or_efault!(msghdr_ptr + 40);
+fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: Option<(usize, usize)>) -> Message {
+    if msghdr_ptr == 0 && syn.is_none() { return err_reply(-14); }
+    if let Some(o) = nlsock::of(pid, fd) {
+        // A netlink writev stays one send per iovec (the caller's fallback).
+        if syn.is_some() { return err_reply(-38); }
+        return nlsock::send_msg(o, msghdr_ptr);
+    }
+    let (iov_ptr, iovcnt, ctrl_ptr, ctrl_len) = match syn {
+        Some((p, c)) => (p, c, 0, 0),
+        None => (rd_or_efault!(msghdr_ptr + 16), rd_or_efault!(msghdr_ptr + 24),
+                 rd_or_efault!(msghdr_ptr + 32), rd_or_efault!(msghdr_ptr + 40)),
+    };
     if ctrl_ptr != 0 && ctrl_len > 0 && !sched::uaccess::user_range_ok(ctrl_ptr, ctrl_len) { return err_reply(-14); }
 
     let unix_end = unix_stream_end(pid, fd);
@@ -6371,10 +6382,10 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     // a datagram into several and dropped msg_name, so an unconnected socket
     // could not sendmsg() at all.
     if nfd == 0 && cred.is_none() && inet_dgram(pid, fd) {
-        let name_ptr = rd_or_efault!(msghdr_ptr);
-        let name_len = match sched::uaccess::read_user::<u32>(msghdr_ptr + 8) {
+        let name_ptr = if syn.is_some() { 0 } else { rd_or_efault!(msghdr_ptr) };
+        let name_len = if syn.is_some() { 0 } else { match sched::uaccess::read_user::<u32>(msghdr_ptr + 8) {
             Some(v) => v as usize, None => return err_reply(-14),
-        };
+        } };
         let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         for i in 0..iovcnt.min(UIO_MAXIOV) {
             let iov  = iov_ptr + i * 16;
@@ -6759,17 +6770,22 @@ fn udp_cmsgs(recv: u8, m: &RxMeta) -> alloc::vec::Vec<u8> {
 }
 
 unsafe fn write_msg_tail(msghdr_ptr: usize, controllen: usize, msg_flags: i32) {
+    if msghdr_ptr == 0 { return; } // readv: no msghdr to report into
     wr_user(msghdr_ptr + 40, controllen);
     wr_user(msghdr_ptr + 48, msg_flags);
 }
 
-fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Message {
-    if msghdr_ptr == 0 { return err_reply(-14); }
-    if let Some(o) = nlsock::of(pid, fd) { return nlsock::recv_msg(o, msghdr_ptr, flags); }
-    let iov_ptr  = rd_or_efault!(msghdr_ptr + 16);
-    let iovcnt   = rd_or_efault!(msghdr_ptr + 24);
-    let ctrl_ptr = rd_or_efault!(msghdr_ptr + 32);
-    let ctrl_cap = rd_or_efault!(msghdr_ptr + 40);
+fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize, syn: Option<(usize, usize)>) -> Message {
+    if msghdr_ptr == 0 && syn.is_none() { return err_reply(-14); }
+    if let Some(o) = nlsock::of(pid, fd) {
+        if syn.is_some() { return err_reply(-38); }
+        return nlsock::recv_msg(o, msghdr_ptr, flags);
+    }
+    let (iov_ptr, iovcnt, ctrl_ptr, ctrl_cap) = match syn {
+        Some((p, c)) => (p, c, 0, 0),
+        None => (rd_or_efault!(msghdr_ptr + 16), rd_or_efault!(msghdr_ptr + 24),
+                 rd_or_efault!(msghdr_ptr + 32), rd_or_efault!(msghdr_ptr + 40)),
+    };
     if ctrl_ptr != 0 && ctrl_cap > 0 && !sched::uaccess::user_range_ok(ctrl_ptr, ctrl_cap) { return err_reply(-14); }
 
     let unix_end = unix_stream_end(pid, fd);
@@ -6777,7 +6793,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     // AF_INET datagram: one datagram scattered over the iovecs, its source
     // in msg_name, MSG_TRUNC when it did not fit.
     if unix_end.is_none() && inet_dgram(pid, fd) {
-        let name_ptr = rd_or_efault!(msghdr_ptr);
+        let name_ptr = if syn.is_some() { 0 } else { rd_or_efault!(msghdr_ptr) };
         let mut iovs: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
         let mut cap = 0usize;
         for i in 0..iovcnt.min(UIO_MAXIOV) {
@@ -7712,6 +7728,49 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             let a = sock_opts(e.ofd).mc_addr;
             if optval_ptr != 0 && !wr_user(optval_ptr, a) { return err_reply(-14); }
             if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
+            return ok_reply();
+        }
+        // TCP_INFO: Linux's `struct tcp_info` prefix (104 bytes: through
+        // total_retrans). Only the state and a few plausible constants are
+        // modelled; passt's pasta reads it on every connection and sizes its
+        // feature probes from the length we return.
+        if level == IPPROTO_TCP && optname == TCP_INFO && is_tcp_entry(&e) {
+            let st: u8 = match e.state {
+                SockState::InetListening { .. } => 10,
+                SockState::InetConnected { socket_handle, sid, .. } => {
+                    let mut stack = stack_for(sid);
+                    match stack.as_mut() {
+                        Some(s) => match s.socket_set.get_mut::<tcp::Socket>(socket_handle).state() {
+                            tcp::State::Established => 1, tcp::State::SynSent => 2,
+                            tcp::State::SynReceived => 3, tcp::State::FinWait1 => 4,
+                            tcp::State::FinWait2 => 5, tcp::State::TimeWait => 6,
+                            tcp::State::Closed => 7, tcp::State::CloseWait => 8,
+                            tcp::State::LastAck => 9, tcp::State::Listen => 10,
+                            tcp::State::Closing => 11,
+                        },
+                        None => 7,
+                    }
+                }
+                _ => 7,
+            };
+            let mut b = [0u8; TCP_INFO_LEN];
+            b[0] = st;
+            let put = |b: &mut [u8; TCP_INFO_LEN], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+            put(&mut b, 8, 200_000);   // rto (us)
+            put(&mut b, 16, 1448);     // snd_mss
+            put(&mut b, 20, 1448);     // rcv_mss
+            put(&mut b, 60, 1500);     // pmtu
+            put(&mut b, 68, 1000);     // rtt (us)
+            put(&mut b, 80, 10);       // snd_cwnd
+            put(&mut b, 84, 1460);     // advmss
+            if optlen_ptr == 0 { return err_reply(-14); }
+            let Some(len) = sched::uaccess::read_user::<i32>(optlen_ptr) else { return err_reply(-14) };
+            if len < 0 { return err_reply(-22); }
+            let n = (len as usize).min(TCP_INFO_LEN);
+            if n > 0 && (optval_ptr == 0 || !b[..n].iter().enumerate().all(|(i, &x)| wr_user(optval_ptr + i, x))) {
+                return err_reply(-14);
+            }
+            if !wr_user(optlen_ptr, n as u32) { return err_reply(-14); }
             return ok_reply();
         }
     }

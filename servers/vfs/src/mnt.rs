@@ -386,6 +386,18 @@ pub fn is_anon(ns: NsId) -> bool { ANON.lock().iter().any(|a| a.0 == ns) }
 /// Does the detached tree `ns` have a directory as its root?
 pub fn anon_is_dir(ns: NsId) -> bool { ANON.lock().iter().find(|a| a.0 == ns).map_or(true, |a| a.1) }
 
+/// Identity of a detached tree's root: the (superblock, root path) of its
+/// first mount, as a stable inode number. Two clones of the same mount root
+/// (crun compares the maskdir fd with a fresh clone of the path it was moved
+/// onto) report the same value, as the same dentry does on Linux.
+pub fn anon_root_ident(ns: NsId) -> Option<u64> {
+    let g = NS.lock();
+    let m = g.get(&ns)?.mnts.first()?;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (m.sb as u64);
+    for &c in m.root.iter() { h = (h ^ c as u64).wrapping_mul(0x100_0000_01b3); }
+    Some((h | 0x4000_0000_0000_0000) & !0x8000_0000_0000_0000)
+}
+
 /// open_tree(OPEN_TREE_CLONE): copy the tree at `src` (a path in `ns`) into
 /// the fresh namespace `anon`, which becomes the detached tree.
 pub fn open_tree_clone(ns: NsId, src: &[u8], rec: bool, anon: NsId, anon_owner: NsId, is_dir: bool) -> Result<(), i32> {

@@ -1779,6 +1779,8 @@ pub enum VnodeKind {
     DevNull,
     /// /dev/zero — reads return zero bytes; writes discarded.
     DevZero,
+    /// /dev/full (1:7) — reads return zero bytes; every write fails ENOSPC.
+    DevFull,
     /// One end of a pipe.
     Pipe { ring: usize, is_write: bool },
     /// One end of a pseudo-terminal pair (`/dev/ptmx` or `/dev/pts/N`).
@@ -1929,7 +1931,7 @@ pub fn fd_rwf_nowait_capable(pid: u32, fd: usize) -> Option<bool> {
     if fd >= FD_NUMBER_CEIL { return None; }
     if !tbl.fds.used(fd) { return if tbl.fds.implicit_console(fd) { console } else { None }; }
     Some(matches!(tbl.fds[fd].kind,
-        VnodeKind::RamFile { .. } | VnodeKind::DevNull | VnodeKind::DevZero
+        VnodeKind::RamFile { .. } | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevFull
         | VnodeKind::Pipe { .. } | VnodeKind::TmpFile { .. } | VnodeKind::EventFd { .. }
         | VnodeKind::Mq { .. } | VnodeKind::TimerFd { .. } | VnodeKind::DevUrandom | VnodeKind::MountedFile { .. }
         | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. }))
@@ -2304,7 +2306,7 @@ pub fn fd_epoll_eperm(pid: u32, fd: usize) -> bool {
         }
     };
     match kind {
-        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevFb { .. }
+        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevFull | VnodeKind::DevFb { .. }
         | VnodeKind::BlockDev { .. } | VnodeKind::SysBlock { .. } => true,
         VnodeKind::RamFile { is_dir, .. } => is_dir,
         VnodeKind::TmpFile { idx, .. } => {
@@ -2467,7 +2469,7 @@ fn reopen_fd_kind_of(pid: u32, target: u32, fd: usize, flags: u32) -> Result<Vno
     let kind = match vfs_get_node_kind(target, fd) { Some(k) => k, None => return Err(-2) };
     match kind {
         VnodeKind::TmpFile { idx, .. } => reopen_tmp_idx(pid, idx, flags),
-        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom => Ok(kind),
+        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevFull | VnodeKind::DevUrandom => Ok(kind),
         // A pipe: a new description on the same pipe, whose end follows the
         // access mode asked for (O_RDONLY reads, O_WRONLY writes) whichever
         // end the original was. O_RDWR keeps the original's end. The caller
@@ -4414,6 +4416,7 @@ static RAMFS: &[RamEntry] = &[
     // /dev virtual devices (zero-length placeholder; open is intercepted above)
     RamEntry { path: b"/dev/null",    data: b"" },
     RamEntry { path: b"/dev/zero",    data: b"" },
+    RamEntry { path: b"/dev/full",    data: b"" },
     RamEntry { path: b"/dev/urandom", data: b"" },
     RamEntry { path: b"/dev/random",  data: b"" },
     RamEntry { path: b"/dev/stdin",   data: b"" },
@@ -8738,6 +8741,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             VnodeKind::DevNull
         } else if lookup_path == b"/dev/zero" {
             VnodeKind::DevZero
+        } else if lookup_path == b"/dev/full" {
+            VnodeKind::DevFull
         } else if lookup_path == b"/dev/urandom" || lookup_path == b"/dev/random" {
             VnodeKind::DevUrandom
         } else if lookup_path == b"/dev/stdin" {
@@ -9583,7 +9588,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
     match &mut tbl.fds[fd].kind {
         VnodeKind::DevNull =>
             val_reply(0),
-        VnodeKind::DevZero => {
+        VnodeKind::DevZero | VnodeKind::DevFull => {
             // Whole request in one read, as on Linux (bounded by its
             // MAX_RW_COUNT). The kernel prefaulted the full buffer; the table
             // lock is dropped before the user memory is touched. This used to
@@ -9991,6 +9996,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
     if tbl.fds[fd].flags & O_PATH != 0 { return err_reply(-9); }
     let buf = buf_ptr as *const u8;
     match &mut tbl.fds[fd].kind {
+        VnodeKind::DevFull => err_reply(-28), // ENOSPC
         VnodeKind::DevUrandom | VnodeKind::DevNull | VnodeKind::DevZero =>
             val_reply(count as u64),
         // See the read arm: locks dropped before I/O and before the user
@@ -10642,7 +10648,7 @@ fn handle_lseek(pid: u32, fd: usize, offset: i64, whence: u32) -> Message {
         // Linux's null/zero/random char devices accept any seek and report
         // offset 0 (`noop_llseek` / `null_lseek`). uutils dd seeks its output
         // even for `of=/dev/null` and aborted with "Invalid seek" on ESPIPE.
-        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom => val_reply(0),
+        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevFull | VnodeKind::DevUrandom => val_reply(0),
         _ => err_reply(-29), // ESPIPE — not seekable (pipes, ttys, etc.)
     }
 }
@@ -11168,20 +11174,21 @@ fn find_conflict(locks: &[LockRecord], key: LockKey, pid: u32, start: u64, end: 
     }).copied()
 }
 
-/// The tag a waiter for a lock on `key` (F_SETLKW, blocking flock) parks
-/// on and every release of a record on `key` wakes: the one helper for both
-/// sides. A collision between two domains only costs a re-probe.
-fn lock_wake_tag(key: LockKey) -> u64 {
+/// The key a waiter for a lock on `key` (F_SETLKW, blocking flock) parks on and
+/// every release of a record on `key` wakes. A collision between two domains
+/// only costs a re-probe. Waiters park on it and releases wake it, so an unrelated keyed wake sharing only the bloom bit never reaches a
+/// lock waiter (a bits-only park woke on every such collision).
+fn lock_wake_key(key: LockKey) -> u64 {
     let index = match key {
         LockKey::Tmp(idx) => idx as u32,
         LockKey::Mount(port, file_id) =>
             0x8000_0000 | (port.wrapping_mul(0x9E37_79B1) ^ file_id) & 0x7fff_ffff,
     };
-    sched::poll_tag(sched::poll_class::FLOCK, index)
+    sched::poll_key(sched::poll_class::FLOCK, index)
 }
 
 /// Lock waiters re-probe at least this often even without a wake. Every
-/// path that clears a record wakes `lock_wake_tag`, so this is only a
+/// path that clears a record wakes `lock_wake_key`, so this is only a
 /// backstop for a release path added later without one.
 const LOCK_WAIT_BACKSTOP_NS: u64 = 1_000_000_000;
 
@@ -11204,7 +11211,7 @@ fn locks_clear(locks: &mut [LockRecord], key: LockKey, pid: u32,
 }
 
 /// Wake the waiters for a lock on `key` (after some record on it was cleared).
-fn locks_released(key: LockKey) { sched::wake_poll_tagged(lock_wake_tag(key)); }
+fn locks_released(key: LockKey) { sched::wake_poll_key(lock_wake_key(key)); }
 
 /// Release every lock `pid` holds on `key`.
 fn release_locks(key: LockKey, pid: u32) {
@@ -11218,8 +11225,8 @@ fn release_locks(key: LockKey, pid: u32) {
 fn lock_wait(key: LockKey, mut try_grant: impl FnMut() -> Option<Message>) -> Message {
     loop {
         if let Some(m) = try_grant() { return m; }
-        sched::block_on_poll_prepare_masked(sched::monotonic_ns() + LOCK_WAIT_BACKSTOP_NS,
-                                            lock_wake_tag(key));
+        sched::block_on_poll_prepare_tag(sched::monotonic_ns() + LOCK_WAIT_BACKSTOP_NS,
+                                         &sched::PollTag::keyed(&[lock_wake_key(key)], 0));
         if let Some(m) = try_grant() { sched::block_on_poll_cancel(); return m; }
         sched::block_on_poll_commit();
     }
@@ -13024,7 +13031,7 @@ fn poll_vnode_foreign(kind: &VnodeKind) -> bool {
         | VnodeKind::DynamicDevice { .. }
         // The static kinds (`static_poll_tag`): no producer at all.
         | VnodeKind::RamFile { .. } | VnodeKind::TmpFile { .. } | VnodeKind::MountedFile { .. }
-        | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom | VnodeKind::DevFb { .. }
+        | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevFull | VnodeKind::DevUrandom | VnodeKind::DevFb { .. }
         | VnodeKind::BlockDev { .. } | VnodeKind::SysBlock { .. })
 }
 
@@ -13105,7 +13112,7 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
              sched::poll_tag(sched::poll_class::PTY, p as u32))
         }
         VnodeKind::RamFile { .. } | VnodeKind::TmpFile { .. } | VnodeKind::MountedFile { .. }
-        | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom | VnodeKind::DevFb { .. }
+        | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevFull | VnodeKind::DevUrandom | VnodeKind::DevFb { .. }
         | VnodeKind::BlockDev { .. } | VnodeKind::SysBlock { .. } => {
             // Always ready and never changing: a poller parks on these only
             // under EPOLLET after the first edge, or for bits they never
@@ -13790,7 +13797,7 @@ fn devnode_open(pid: u32, is_blk: bool, rdev: u32, flags: u32, mode: u32) -> Mes
         if !block::path_for_rdev(major, minor, &mut buf) { return err_reply(-6); }
     } else {
         let fixed: Option<&[u8]> = match (major, minor) {
-            (1, 3) => Some(b"/dev/null"), (1, 5) => Some(b"/dev/zero"),
+            (1, 3) => Some(b"/dev/null"), (1, 5) => Some(b"/dev/zero"), (1, 7) => Some(b"/dev/full"),
             (1, 8) => Some(b"/dev/random"), (1, 9) => Some(b"/dev/urandom"),
             (5, 0) => Some(b"/dev/tty"), (5, 1) => Some(b"/dev/console"),
             (5, 2) => Some(b"/dev/ptmx"), (29, 0) => Some(b"/dev/fb0"),
@@ -14690,6 +14697,14 @@ fn tmp_setxattr_local(tmp: &mut TmpPool, owner: usize, cred: &xattr::Cred,
             return ok_reply();
         }
         let val = unsafe { core::slice::from_raw_parts(val_ptr as *const u8, size) };
+        let mut kbuf = [0u8; xattr::ACL_INHERIT_MAX];
+        let val = match xattr::acl_validate(val) {
+            Ok(_) => match xattr::acl_to_kernel(&cred.view, val, &mut kbuf) {
+                Ok(n) => &kbuf[..n],
+                Err(er) => return err_reply(-er),
+            },
+            Err(_) => return err_reply(-xattr::EINVAL),
+        };
         let summary = match xattr::acl_validate(val) {
             Ok(s) => s, Err(_) => return err_reply(-xattr::EINVAL),
         };
@@ -14736,6 +14751,14 @@ fn tmp_getxattr_local(tmp: &TmpPool, owner: usize, cred: &xattr::Cred,
     let value = match xattr::find(&xa[..], idx, suf) {
         Some(v) => v, None => return err_reply(-xattr::ENODATA),
     };
+    let mut kbuf = [0u8; xattr::ACL_INHERIT_MAX];
+    let value: &[u8] = if (idx == xattr::IDX_ACL_ACCESS || idx == xattr::IDX_ACL_DEFAULT)
+        && cred.view.ns != 0 {
+        match xattr::acl_from_kernel(&cred.view, value, &mut kbuf) {
+            Ok(n) => &kbuf[..n],
+            Err(er) => return err_reply(-er),
+        }
+    } else { value };
     let len = value.len();
     if size == 0 { return val_reply(len as u64); }
     if size < len { return err_reply(-xattr::ERANGE); }
@@ -15644,7 +15667,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         // ttyname() on a /dev/tty2 fd must read back /dev/tty2. 0620 is the
         // mode a real /dev/ttyN carries.
         VnodeKind::DevVt { vt, .. } => (S_IFCHR | 0o620, 0, VT_INO_BASE + vt as u64),
-        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom
+        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevFull | VnodeKind::DevUrandom
         | VnodeKind::DevFb { .. } => (S_IFCHR | 0o666, 0, 0),
         // DynamicDevice is handled by the early return above (it needs st_rdev);
         // this arm exists only for match exhaustiveness.
@@ -15673,7 +15696,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         // mount's root: Linux reports the type of that root, and crun decides
         // between creating a directory or a file mount point from it.
         VnodeKind::NsFd { kind: 4, id } if mnt::is_anon(id) && mnt::anon_is_dir(id) =>
-            (S_IFDIR | 0o755, 0, sched::ns::ns_ino(4, id)),
+            (S_IFDIR | 0o755, 0, mnt::anon_root_ident(id).unwrap_or_else(|| sched::ns::ns_ino(4, id))),
         VnodeKind::NsFd { kind, id } => (S_IFREG | 0o444, 0, sched::ns::ns_ino(kind as usize, id)),
         // Handled by the early return above (proxied to the owning mount);
         // this arm exists only for match exhaustiveness.
@@ -15734,6 +15757,7 @@ fn char_dev_rdev(kind: &VnodeKind) -> u64 {
         VnodeKind::DevVt { vt, .. } => makedev(4, vt as u32),
         VnodeKind::DevNull => makedev(1, 3),
         VnodeKind::DevZero => makedev(1, 5),
+        VnodeKind::DevFull => makedev(1, 7),
         VnodeKind::DevUrandom => makedev(1, 9),
         VnodeKind::DevFb { .. } => makedev(29, 0),
         _ => 0,
@@ -15750,6 +15774,7 @@ fn dev_node_rdev(path: &[u8]) -> u64 {
     match path {
         b"/dev/null" => makedev(1, 3),
         b"/dev/zero" => makedev(1, 5),
+        b"/dev/full" => makedev(1, 7),
         b"/dev/random" => makedev(1, 8),
         b"/dev/urandom" => makedev(1, 9),
         b"/dev/tty" => makedev(5, 0),
@@ -15896,7 +15921,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
             return ok_reply();
         }
         // Special device files.
-        if lookup_path == b"/dev/null" || lookup_path == b"/dev/zero" || lookup_path == b"/dev/urandom"
+        if lookup_path == b"/dev/null" || lookup_path == b"/dev/zero" || lookup_path == b"/dev/full" || lookup_path == b"/dev/urandom"
            || lookup_path == b"/dev/random" {
             write_stat_full_rdev(stat_ptr, 0o020666, 1, 0, 2, 0, 0, dev_node_rdev(lookup_path));
             return ok_reply();
@@ -16107,6 +16132,7 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
         match &tbl.fds[fd].kind {
             VnodeKind::DevNull => FdInfo::Static(b"/dev/null"),
             VnodeKind::DevZero => FdInfo::Static(b"/dev/zero"),
+            VnodeKind::DevFull => FdInfo::Static(b"/dev/full"),
             VnodeKind::Pipe { ring, .. } => FdInfo::Pipe(*ring),
             // ptsname(3) in some libcs is a readlink of /proc/self/fd/N on the
             // *master*, and ttyname(3) on the slave is the same readlink — so
