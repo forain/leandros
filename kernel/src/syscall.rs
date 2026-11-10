@@ -2638,7 +2638,10 @@ fn dispatch_inner(
         // New mount API (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
         // mount_setattr): not implemented. Quiet, explicit ENOSYS so callers
         // (crun, runc, libmount) fall back to mount(2).
-        OPEN_TREE | MOVE_MOUNT | FSOPEN | FSCONFIG | FSMOUNT | FSPICK | MOUNT_SETATTR => -38,
+        OPEN_TREE => sys_open_tree(a0, a1, a2),
+        MOVE_MOUNT => sys_move_mount(a0, a1, a2, a3, a4),
+        MOUNT_SETATTR => sys_mount_setattr(a0, a1, a2, a3, a4),
+        FSOPEN | FSCONFIG | FSMOUNT | FSPICK => -38,
 
         _ => log_enosys(number),
     }
@@ -9709,6 +9712,142 @@ fn sys_mount(
 /// CAP_SYS_ADMIN over the user namespace that owns it.
 fn mnt_may_mount(mns: sched::ns::NsId) -> bool {
     match vfs::mnt::owner_of(mns) { Some(o) => sched::caps::ns_capable_in(o, 21), None => false }
+}
+
+// ── New mount API: open_tree / move_mount / mount_setattr (lane opentree) ───
+
+/// What an open_tree/move_mount/mount_setattr operand names: a path in the
+/// caller's mount namespace, or a detached tree (an open_tree clone fd).
+enum TreeSrc { Path(Vec<u8>), Anon(sched::ns::NsId) }
+
+fn tree_src(dfd: usize, path_ptr: usize, empty_ok: bool) -> Result<TreeSrc, isize> {
+    let raw = copy_user_path(path_ptr)?;
+    let dfd_i = dfd as u32 as i32;
+    if raw.is_empty() {
+        if !empty_ok { return Err(-2); }
+        if dfd_i as isize as usize == AT_FDCWD { return Ok(TreeSrc::Path(resolve_ns(b".")?)); }
+        if dfd_i < 0 { return Err(-9); }
+        if let Ok((4, id)) = vfs::nsfd_target(current_pid(), dfd_i as usize) {
+            if vfs::mnt::is_anon(id as sched::ns::NsId) { return Ok(TreeSrc::Anon(id as sched::ns::NsId)); }
+        }
+        return Ok(TreeSrc::Path(fd_mount_ns_path(dfd_i as usize)?));
+    }
+    if let Some((fd, b"")) = proc_own_fd(&raw) { return Ok(TreeSrc::Path(fd_mount_ns_path(fd)?)); }
+    Ok(TreeSrc::Path(resolve_at_ns(dfd, &raw)?))
+}
+
+/// ns 0 has no tree to clone or edit: the host namespace keeps its old answer
+/// (ENOSYS for host root, EPERM for everyone else).
+fn newmnt_ns0() -> isize { if sched::host_root() { -38 } else { -1 } }
+
+fn sys_open_tree(dfd: usize, path_ptr: usize, flags: usize) -> isize {
+    const OPEN_TREE_CLONE: usize = 1;
+    const OPEN_TREE_CLOEXEC: usize = 0o2000000;
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_NO_AUTOMOUNT: usize = 0x800;
+    const AT_EMPTY_PATH: usize = 0x1000;
+    const AT_RECURSIVE: usize = 0x8000;
+    const O_PATH: usize = 0o10000000;
+    let flags = flags as u32 as usize;
+    if flags & !(OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_RECURSIVE) != 0 { return -22; }
+    if flags & AT_RECURSIVE != 0 && flags & OPEN_TREE_CLONE == 0 { return -22; }
+    if flags & OPEN_TREE_CLONE == 0 {
+        // A plain handle on the path (an O_PATH descriptor).
+        let mut of = O_PATH | (flags & OPEN_TREE_CLOEXEC);
+        if flags & AT_SYMLINK_NOFOLLOW != 0 { of |= 0o400000; } // O_NOFOLLOW
+        if flags & AT_EMPTY_PATH != 0 && copy_user_path(path_ptr).map_or(false, |p| p.is_empty()) {
+            let fd = dfd as u32 as i32;
+            if fd < 0 { return -9; }
+            return sys_fcntl(fd as usize, if flags & OPEN_TREE_CLOEXEC != 0 { 1030 } else { 0 }, 0);
+        }
+        return sys_openat(dfd, path_ptr, of, 0);
+    }
+    let mns = sched::current_mntns();
+    if mns == 0 { return newmnt_ns0(); }
+    if !may_mount() { return -1; }
+    vfs::mnt::reap();
+    let ns_path = match tree_src(dfd, path_ptr, flags & AT_EMPTY_PATH != 0) {
+        Ok(TreeSrc::Path(p)) => p,
+        Ok(TreeSrc::Anon(_)) => return -22,
+        Err(e) => return e,
+    };
+    if vfs::mnt::is_sb_path(&ns_path) { return -2; }
+    let kp = match KPath::from_ns(ns_path.clone()) { Ok(k) => k, Err(e) => return e };
+    let is_dir = match kpath_is_dir(&kp) { Ok(d) => d, Err(e) => return e };
+    let owner = match vfs::mnt::owner_of(mns) { Some(o) => o, None => return -22 };
+    let anon = match sched::ns::new_mntns(owner) { Ok(n) => n, Err(e) => return e };
+    if let Err(e) = vfs::mnt::open_tree_clone(mns, &ns_path, flags & AT_RECURSIVE != 0, anon.id(), owner, is_dir) {
+        return e as isize; // dropping `anon` frees the empty namespace
+    }
+    // The descriptor takes its own reference; ours drops with `anon`.
+    vfs::install_nsfd(current_pid(), 4, anon.id())
+}
+
+fn sys_move_mount(from_dfd: usize, from_ptr: usize, to_dfd: usize, to_ptr: usize, flags: usize) -> isize {
+    const F_EMPTY_PATH: usize = 4;
+    const T_EMPTY_PATH: usize = 0x40;
+    const KNOWN: usize = 1 | 2 | 4 | 0x10 | 0x20 | 0x40;
+    let flags = flags as u32 as usize;
+    if flags & !KNOWN != 0 { return -22; }
+    let mns = sched::current_mntns();
+    if mns == 0 { return newmnt_ns0(); }
+    if !may_mount() { return -1; }
+    vfs::mnt::reap();
+    let to = match tree_src(to_dfd, to_ptr, flags & T_EMPTY_PATH != 0) {
+        Ok(TreeSrc::Path(p)) => p,
+        Ok(TreeSrc::Anon(_)) => return -22,
+        Err(e) => return e,
+    };
+    if vfs::mnt::is_sb_path(&to) { return -2; }
+    let tk = match KPath::from_ns(to.clone()) { Ok(k) => k, Err(e) => return e };
+    let tdir = match kpath_is_dir(&tk) { Ok(d) => d, Err(e) => return e };
+    match tree_src(from_dfd, from_ptr, flags & F_EMPTY_PATH != 0) {
+        Ok(TreeSrc::Anon(id)) => {
+            if vfs::mnt::anon_is_dir(id) != tdir { return if tdir { -20 } else { -21 }; }
+            match vfs::mnt::move_attach(mns, id, &to) { Ok(()) => 0, Err(e) => e as isize }
+        }
+        Ok(TreeSrc::Path(from)) => {
+            if vfs::mnt::is_sb_path(&from) { return -2; }
+            match vfs::mnt::move_mnt(mns, &from, &to) { Ok(()) => 0, Err(e) => e as isize }
+        }
+        Err(e) => e,
+    }
+}
+
+fn sys_mount_setattr(dfd: usize, path_ptr: usize, flags: usize, attr_ptr: usize, size: usize) -> isize {
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_NO_AUTOMOUNT: usize = 0x800;
+    const AT_EMPTY_PATH: usize = 0x1000;
+    const AT_RECURSIVE: usize = 0x8000;
+    const MS_PROP: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+    let flags = flags as u32 as usize;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_RECURSIVE) != 0 { return -22; }
+    if size < 32 { return -22; }
+    if size > 4096 { return -7; } // E2BIG
+    let a: [u64; 4] = match sched::uaccess::read_user(attr_ptr) { Some(v) => v, None => return -14 };
+    let (set, clr, prop, userns) = (a[0], a[1], a[2], a[3]);
+    if userns != 0 { return -22; } // idmapped mounts: not supported here
+    if prop & !MS_PROP != 0 || prop.count_ones() > 1 { return -22; }
+    // MOUNT_ATTR_RDONLY/NOSUID/NODEV/NOEXEC/NOATIME/STRICTATIME/NODIRATIME.
+    let conv = |v: u64| -> Option<u8> {
+        if v & !(0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x80) != 0 { return None; }
+        let mut r = (v & 0xf) as u8;
+        if v & 0x10 != 0 { r |= vfs::mnt::MNT_NOATIME; }
+        if v & 0x80 != 0 { r |= vfs::mnt::MNT_NODIRATIME; }
+        Some(r)
+    };
+    let (set, clr) = match (conv(set), conv(clr)) { (Some(s), Some(c)) => (s, c), _ => return -22 };
+    if set & clr != 0 { return -22; }
+    let mns = sched::current_mntns();
+    if mns == 0 { return newmnt_ns0(); }
+    vfs::mnt::reap();
+    let (ns, path) = match tree_src(dfd, path_ptr, flags & AT_EMPTY_PATH != 0) {
+        Ok(TreeSrc::Path(p)) => { if !may_mount() { return -1; } (mns, p) }
+        Ok(TreeSrc::Anon(id)) => { if !mnt_may_mount(id) { return -1; } (id, b"/".to_vec()) }
+        Err(e) => return e,
+    };
+    if vfs::mnt::is_sb_path(&path) { return -2; }
+    match vfs::mnt::setattr(ns, &path, set, clr, prop as usize, flags & AT_RECURSIVE != 0) { Ok(()) => 0, Err(e) => e as isize }
 }
 
 /// stat(2) the backing file of `kp`: Ok(is_dir).
