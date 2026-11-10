@@ -13,6 +13,8 @@ mod nlsock;
 mod iface;
 mod vifsel;
 mod vif;
+pub mod tundev;
+pub mod tunbe;
 pub mod netwatch;
 
 use iface::{Sid, LO, MAX_STACKS};
@@ -3446,6 +3448,7 @@ fn poll_stack<D: syngate::Frames>(s: &mut NetStack, dev: &mut D, timestamp: Inst
 
 pub fn net_daemon() -> ! {
     vif::init();
+    tunbe::init();
     // Readiness snapshots of each stack's sockets taken just before a poll
     // (see `readiness_sigs`), reused across passes.
     let mut sigs: [alloc::vec::Vec<Sig>; MAX_STACKS] = [const { alloc::vec::Vec::new() }; MAX_STACKS];
@@ -3609,6 +3612,8 @@ pub fn net_daemon() -> ! {
                 }
             }
         }
+
+        tunbe::poll_all(timestamp, &mut sigs, &mut wake_keys, &mut readiness_changed, &mut wake_mask, &mut next_poll);
 
         // Readiness edges, published with every stack lock released. Each
         // socket whose readiness moved during this pass wakes its own tag
@@ -4607,6 +4612,15 @@ fn no_route_err() -> i32 { if drivers::netdev::count() == 0 { -100 } else { -101
 /// The stack a UDP socket bound to `local` (if bound) and first sending to
 /// `dest` (if known) lives on (see `udp_materialize`).
 fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>) -> Result<Sid, i32> {
+    if ns != 0 {
+        // A non-initial netns reaches only its own interfaces (tun/tap vifs).
+        if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) { return Err(-101); }
+        if let Some(a) = local.filter(|a| !a.is_unspecified()) {
+            return stack_holding(ns, a).ok_or(-99);
+        }
+        let d = dest.and_then(|d| if let IpAddress::Ipv4(x) = d { Some(x.0) } else { None });
+        return d.and_then(|d| vif::route_in_ns(ns, d)).ok_or(-101);
+    }
     if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) { return Ok(LO); }
     if let Some(a) = local.filter(|a| !a.is_unspecified()) {
         if let Some(sid) = iface::holder_of(a) { return Ok(sid); }
@@ -4628,7 +4642,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     let tbl = find_tbl(pid, &mut *tbls).ok_or(-9i32)?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return Err(-9); }
     // Backstop: a socket of a non-initial netns never gets a host-stack socket.
-    if tbl.socks[slot].netns() != 0 { return Err(-101); }
+    if tbl.socks[slot].netns() != 0 && vif::ns_sids_dyn(tbl.socks[slot].netns()).is_empty() { return Err(-101); }
     let local_addr = match tbl.socks[slot].state {
         SockState::Unbound { .. } => None,
         SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
@@ -5178,7 +5192,12 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
     // Gate on the SOCKET's own domain and captured netns, never on the user
     // sa_family (which a sibling thread can flip, or which can simply lie).
     // Folded into this read: one table lock per send.
-    if tbl.socks[slot].netns() != 0 {
+    // (An AF_INET datagram socket of a netns that has tun/tap interfaces is
+    // let through: `udp_stack` routes it over the namespace's own vifs only.)
+    if tbl.socks[slot].netns() != 0
+        && !(tbl.socks[slot].domain == 2 && tbl.socks[slot].sock_type == 2
+             && !vif::ns_sids_dyn(tbl.socks[slot].netns()).is_empty())
+    {
         let e = &tbl.socks[slot];
         let dom = if matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) { Some(2u8) }
                   else if e.domain == 2 || e.domain == 10 { Some(e.domain) } else { None };

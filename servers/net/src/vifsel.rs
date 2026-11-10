@@ -10,7 +10,7 @@ pub(crate) type Sid = u8;
 pub(crate) const MAX_STACKS: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum VifKind { Lo }
+pub(crate) enum VifKind { Lo, Tap, Tun }
 
 pub(crate) struct Vif {
     pub netns: u16,
@@ -24,10 +24,13 @@ pub(crate) struct Vif {
     pub addrs: Vec<([u8; 4], u8)>,
     /// Frames waiting to enter the stack (cap `RXQ_CAP`).
     pub rxq: VecDeque<Vec<u8>>,
+    /// Tap/Tun: the tundev handle of the attached fd (`NO_TUN` = detached persistent).
+    pub tun: u32,
     /// rxq non-empty or a timer is due: poll this pass.
     pub pending: bool,
 }
 
+pub(crate) const NO_TUN: u32 = u32::MAX;
 pub(crate) const RXQ_CAP: usize = 512;
 pub(crate) const MAX_NS_SIDS: usize = 8;
 
@@ -91,7 +94,7 @@ mod tests {
 
     fn vif(up: bool, addrs: &[([u8; 4], u8)]) -> Vif {
         Vif { netns: 1, ifindex: 2, name: [0; 16], kind: VifKind::Lo, admin_up: up, mtu: 1500, mac: [0; 6],
-              addrs: addrs.to_vec(), rxq: VecDeque::new(), pending: false }
+              addrs: addrs.to_vec(), rxq: VecDeque::new(), tun: NO_TUN, pending: false }
     }
 
     #[test]
