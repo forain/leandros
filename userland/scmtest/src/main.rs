@@ -1442,6 +1442,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     if !test_fork_dup2_low_exec() { failures += 1; }
     if !test_socket_alias_epoll_close() { failures += 1; }
     if !test_pass_connected_socket() { failures += 1; }
+    if !test_seqpacket_short_path() { failures += 1; }
     if !test_seqpacket_long_dir_via_procfd() { failures += 1; }
     if !test_memfd_reopen_readonly() { failures += 1; }
     if !test_sendmsg_short_write_keeps_stream() { failures += 1; }
@@ -2412,6 +2413,28 @@ unsafe fn test_seqpacket_long_dir_via_procfd() -> bool {
     if status != 0 { dbg1(b"[seqlong] child status %ld\n\0", status as i64); }
     close(ls); close(dfd);
     unlink(full.as_ptr()); rmdir(c3.as_ptr()); rmdir(c2.as_ptr()); rmdir(c1.as_ptr());
+    report(name, ok)
+}
+
+/// Control for seqpacket_long_dir_via_procfd: the same exchange on a short
+/// plain pathname (no /proc/self/fd).
+unsafe fn test_seqpacket_short_path() -> bool {
+    let name = b"seqpacket_short_path\0";
+    let path = b"/tmp/atsk_short\0";
+    unlink(path.as_ptr());
+    let ls = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    let (addr, alen) = sockaddr_un::from_path(&path[..path.len() - 1]);
+    let mut ok = ls >= 0 && raw_bind(ls, &addr, alen) == 0 && raw_listen(ls, 10) == 0;
+    let cs = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    ok = ok && raw_connect(cs, &addr, alen) == 0;
+    let asf = raw_accept(ls);
+    ok = ok && asf >= 0;
+    ok = ok && raw_send(cs, b"ping".as_ptr(), 4, 0) == 4;
+    let mut b = [0u8; 8];
+    let rr = raw_recv(asf, b.as_mut_ptr(), 8, 0);
+    if rr != 4 { dbg2(b"[seqshort] recv ret=%ld errno=%ld\n\0", rr as i64, get_errno() as i64); }
+    ok = ok && rr == 4 && &b[..4] == b"ping";
+    close(cs); close(asf); close(ls); unlink(path.as_ptr());
     report(name, ok)
 }
 
