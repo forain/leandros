@@ -219,6 +219,31 @@ static int echo_server_body(void) {
     { printf("brtest child fail %d errno %d\n", 0, errno); fflush(stdout); return 0; }
 }
 
+/* TCP-only child: configure eth0 (10.99.N.2), listen on 7777, serve `tcp_accepts` connections, then
+ * exit (0) or, with tcp_accepts == 0, signal and pause with the listener left open. */
+static int tcp_accepts;
+static int tcp_net;
+static int tcp_body(void) {
+    char ip[32]; snprintf(ip, sizeof ip, "10.99.%d.2", tcp_net);
+    int s = nl_sock();
+    int idx = link_get(s, "eth0", NULL, NULL);
+    if (!idx || addr_add(s, idx, ip, 24) || link_set_up(s, idx)) return 1;
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(7777) };
+    if (bind(t, (struct sockaddr *)&a, sizeof a) || listen(t, 4)) return 2;
+    char ch = 'r'; write(done_[1], &ch, 1);
+    for (int i = 0; i < tcp_accepts; i++) {
+        struct pollfd p = { t, POLLIN, 0 };
+        if (poll(&p, 1, 15000) <= 0) return 3;
+        int c = accept(t, NULL, NULL);
+        char b[64]; ssize_t n = read(c, b, sizeof b);
+        if (n > 0) write(c, b, n);
+        close(c);
+    }
+    if (!tcp_accepts) pause();
+    return 0;
+}
+
 static int noop_body(void) { return 0; }
 static int idle_body(void) { pause(); return 0; }
 
@@ -234,6 +259,61 @@ static int dellink_body(void) {
 }
 
 /* ---- cases ----------------------------------------------------------------- */
+
+/* True when link `name` disappears from the host within `ms` (each request also drives the reaper). */
+static int gone_within(int s, const char *name, int ms) {
+    for (int w = 0; w <= ms / 20; w++) {
+        if (!link_get(s, name, NULL, NULL)) return 1;
+        usleep(20000);
+    }
+    return 0;
+}
+
+/* Child netns with a pair; returns the child pid (or -1) after the host end is configured. */
+static pid_t tcp_ns_start(int s, const char *host_if, int net, int accepts) {
+    tcp_net = net; tcp_accepts = accepts;
+    pid_t c = spawn_ns(tcp_body);
+    if (c <= 0) return -1;
+    int nsfd = netns_fd_of(c);
+    int e = nsfd < 0 ? -1 : veth_new(s, host_if, "eth0", nsfd);
+    if (nsfd >= 0) close(nsfd);
+    char ip[32]; snprintf(ip, sizeof ip, "10.99.%d.1", net);
+    int ia = e ? 0 : link_get(s, host_if, NULL, NULL);
+    if (!ia || addr_add(s, ia, ip, 24) || link_set_up(s, ia)) { kill(c, SIGKILL); wait_child(c); return -1; }
+    char ch = 'g'; write(ctl[1], &ch, 1);
+    if (rd_to(done_[0], &ch) != 1) { kill(c, SIGKILL); wait_child(c); return -1; }
+    return c;
+}
+
+static void veth_tcp_reap(void) {
+    int s = nl_sock();
+    pid_t c = tcp_ns_start(s, "vethT", 98, 1);
+    CHECK("veth_tcp_reap: child netns listens", c > 0);
+    if (c <= 0) { close(s); return; }
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    struct timeval tv = { 5, 0 };
+    setsockopt(t, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7777) };
+    inet_pton(AF_INET, "10.99.98.2", &to.sin_addr);
+    char b[16] = {0};
+    int ok = connect(t, (struct sockaddr *)&to, sizeof to) == 0 && write(t, "x", 1) == 1 && read(t, b, sizeof b) == 1;
+    CHECK("veth_tcp_reap: TCP connect + echo + close", ok);
+    close(t);
+    CHECK("veth_tcp_reap: child exited 0", wait_child(c) == 0);
+    CHECK("veth_tcp_reap: veth end gone within 5 s of the child exiting", gone_within(s, "vethT", 5000));
+    close(s);
+}
+
+static void veth_listen_reap(void) {
+    int s = nl_sock();
+    pid_t c = tcp_ns_start(s, "vethL", 97, 0);
+    CHECK("veth_listen_reap: child netns listens", c > 0);
+    if (c <= 0) { close(s); return; }
+    kill(c, SIGKILL);
+    wait_child(c);
+    CHECK("veth_listen_reap: veth end gone within 5 s with a never-closed listener", gone_within(s, "vethL", 5000));
+    close(s);
+}
 
 static void veth_pair(void) {
     int s = nl_sock();
@@ -277,6 +357,7 @@ static void veth_pair(void) {
     CHECK("veth_pair: TCP echo over the pair", r == 8 && !memcmp(b, "tcp-ping", 8));
     close(t);
     CHECK("veth_pair: child served both and exited 0", wait_child(c) == 0);
+    CHECK("veth_pair: pair reaped after the TCP netns died", gone_within(s, "vethA", 5000));
     close(s);
 }
 
@@ -397,6 +478,8 @@ static void veth_nsgone(void) {
 int main(int argc, char **argv) {
     const char *only = argc > 1 ? argv[1] : NULL;
     if (!only || !strcmp(only, "veth_pair")) veth_pair();
+    if (!only || !strcmp(only, "veth_tcp_reap")) veth_tcp_reap();
+    if (!only || !strcmp(only, "veth_listen_reap")) veth_listen_reap();
     if (!only || !strcmp(only, "veth_ping")) veth_ping();
     if (!only || !strcmp(only, "veth_dellink")) veth_dellink();
     if (!only || !strcmp(only, "veth_naming")) veth_naming();
