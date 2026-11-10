@@ -5318,6 +5318,25 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             // Pre-accept the connector is end A, so its own half-close counts
             // here too (accept preserves conn_idx, so the flag carries over).
             if conn.wr_shut(true) { return err_reply(-32); } // EPIPE
+            // A SOCK_SEQPACKET connector (conmon's attach socket: podman writes
+            // right after connect, before conmon accepts) queues a framed
+            // record, as the connected branch does: raw stream bytes here made
+            // the accepted end read "ping" as a record length and fail EFAULT.
+            if sock_type != SOCK_STREAM as u8 {
+                let sndbuf = unix_sndbuf(ofd);
+                let r = conns[conn_idx].ring_ab.write_dgram(buf_ptr as *const u8, len, sndbuf);
+                return match r {
+                    Ok(Some(n)) => {
+                        let conn = &mut conns[conn_idx];
+                        conn.seq = conn.seq.wrapping_add(1);
+                        drop(conns);
+                        sched::wake_poll_key(unix_rd_key(conn_idx, false));
+                        val_reply(n as u64)
+                    }
+                    Ok(None) => { drop(conns); err_reply(-11) }
+                    Err(e) => err_reply(e),
+                };
+            }
             let n = match unix_stream_write(&mut conns, conn_idx, true, buf_ptr, len) {
                 Ok(n) => n,
                 Err(e) => return err_reply(e), // EFAULT, EPIPE
@@ -5921,6 +5940,22 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return val_reply(0); }
             if conn.rd_shut(true) { return val_reply(0); } // own read half retired
+            if sock_type != SOCK_STREAM as u8 {
+                // Records, not bytes (see the pre-accept send above).
+                let r = if peek { conn.ring_ba.peek_dgram(buf_ptr as *mut u8, len) }
+                        else { conn.ring_ba.read_dgram(buf_ptr as *mut u8, len) };
+                return match r {
+                    Ok(Some((n, full))) => {
+                        if !peek { conn.seq = conn.seq.wrapping_add(1); }
+                        drop(conns);
+                        if !peek { sched::wake_poll_key(unix_wr_key(conn_idx, false)); }
+                        val_reply((if flags & MSG_TRUNC as usize != 0 { full } else { n }) as u64)
+                    }
+                    Ok(None) if !conn.closed_b => err_reply(-11),
+                    Ok(None) => val_reply(0),
+                    Err(e) => err_reply(e),
+                };
+            }
             let n = match conn.ring_ba.read(buf_ptr as *mut u8, len) {
                 Ok(n) => n,
                 Err(e) => return err_reply(e), // EFAULT
