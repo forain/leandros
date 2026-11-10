@@ -469,7 +469,7 @@ def main():
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "uinputtest", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "netlinktest", "udpselftest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
-        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "nstest", "cgtest", "ovltest", "ovlmknodtest", "idmaptest", "captest", "mnttest", "seccomptest", "bpftest", "preadtest", "kexectest", "memfdtest", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid", "fusetest",
+        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "nstest", "cgtest", "ovltest", "ovlmknodtest", "idmaptest", "captest", "mnttest", "seccomptest", "bpftest", "preadtest", "kexectest", "memfdtest", "conmontest", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid", "fusetest",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -2965,6 +2965,11 @@ def main():
         else:
             h = e["host"] if e["kind"] == "file" else _ap_hosts[e["linkname"]]
             alpine_files.append((d, n, h, 0o100000 | e["mode"]))
+    # /var/run -> /run (conmon's default socket dir /var/run/crio; Alpine's
+    # baselayout ships the link, a stripped image may not).
+    if not any(e["path"] == "/var/run" for e in _ap_entries + _ap_gen):
+        alpine_files.append(("/var", "run", b"../run", S_IFLNK | 0o777))
+        _ap_dirs.add("/var")
     # /var/tmp: containers/storage and podman stage image copies there
     _ap_dirs.add("/var/tmp")
     _ap_dirmode["/var/tmp"] = 0o1777

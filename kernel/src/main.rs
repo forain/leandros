@@ -1457,6 +1457,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // `sched.wakestat=1`: per-thread wake census and the useful/spurious
     // table of `/proc/wakestat` (sched::gdwake). The per-site wake counts
     // there are always on.
+    if let Some(c) = cmdline_knob("sched.errtrace") { sched::set_errtrace(c); }
     if let Some(c) = cmdline_knob("mm.pagein_eio") { sched::set_pagein_eio(c); }
     sched::gdwake::set_log(cmdline_knob("sched.wakelog").map_or(false, |v| v != "0"));
     if cmdline_knob("sched.keyselftest").map_or(false, |v| v != "0") { sched::gdwake::key_selftest_start(); }
