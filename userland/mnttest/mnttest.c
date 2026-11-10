@@ -47,11 +47,11 @@ static void kernel_selftest(void) {
     report("selftest_rows", rows >= 15 && bad == 0);
 }
 
-/* New mount API (lane newmntapi, M8): every call returns ENOSYS. */
+/* New mount API (lane newmntapi, M8): fsopen and friends return ENOSYS
+ * (open_tree/move_mount/mount_setattr are real since lane opentree). */
 static void newapi_enosys(void) {
     static const struct { const char *n; long nr; } c[] = {
-        {"open_tree", 428}, {"move_mount", 429}, {"fsopen", 430}, {"fsconfig", 431},
-        {"fsmount", 432}, {"fspick", 433}, {"mount_setattr", 442} };
+        {"fsopen", 430}, {"fsconfig", 431}, {"fsmount", 432}, {"fspick", 433} };
     int ok = 1;
     for (unsigned i = 0; i < sizeof c / sizeof c[0]; i++) {
         errno = 0;
@@ -1743,6 +1743,138 @@ static void podexec_suite(void) {
     report("fd_path_after_pivot", nn_in_child(pl_fdpath, 0));
 }
 
+/* ── lane opentree: open_tree / move_mount / mount_setattr ──────────────── */
+struct ot_attr { uint64_t set, clr, prop, userns; };
+static int otree(int dfd, const char *p, unsigned fl) { return (int)syscall(428, dfd, p, fl); }
+static int omove(int fd, const char *fp, int tfd, const char *tp, unsigned fl) { return (int)syscall(429, fd, fp, tfd, tp, fl); }
+static int osetattr(int dfd, const char *p, unsigned fl, uint64_t set, uint64_t clr) {
+    struct ot_attr a = { set, clr, 0, 0 };
+    return (int)syscall(442, dfd, p, fl, &a, sizeof a);
+}
+#define OT_CLONE 1U
+#define OT_CLOEXEC 02000000U
+#define OT_REC 0x8000U
+static int ot_userns(void) {
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return -1;
+    wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 0 1"); wr("/proc/self/gid_map", "0 0 1");
+    return 0;
+}
+static int ot_noclone(int m) {
+    (void)m;
+    int fd = otree(AT_FDCWD, "/tmp", OT_CLOEXEC);
+    if (fd < 0) { printf("  open_tree errno=%d\n", errno); return 1; }
+    close(fd);
+    return 0;
+}
+/* crun's fallback when mount("sysfs") is EPERM: clone /sys, move it into the rootfs */
+static int ot_crun_sys(int m) {
+    (void)m;
+    mkdir("/tmp/otr", 0755); mkdir("/tmp/otr/sys", 0755);
+    if (ot_userns() < 0) return 91;
+    int fd = otree(AT_FDCWD, "/sys", OT_CLONE | OT_REC | OT_CLOEXEC);
+    if (fd < 0) { printf("  open_tree errno=%d\n", errno); return 10; }
+    if (omove(fd, "", AT_FDCWD, "/tmp/otr/sys", 4) < 0) { printf("  move_mount errno=%d\n", errno); return 11; }
+    static char mi[16384];
+    if (slurp("/proc/self/mountinfo", mi, sizeof mi) <= 0 || !strstr(mi, " /tmp/otr/sys ")) return 13;
+    errno = 0;
+    if (omove(fd, "", AT_FDCWD, "/tmp/otr/sys", 4) == 0 || errno != EINVAL) return 14; /* consumed */
+    close(fd);
+    errno = 0;
+    if (otree(AT_FDCWD, "/.leandros-sb", OT_CLONE | OT_REC) >= 0) return 15;
+    return 0;
+}
+static int ot_locked(int m) {
+    (void)m;
+    mkdir("/tmp/otl", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (mount("tmpfs", "/tmp/otl", "tmpfs", 0, NULL) < 0) return 92;
+    mkdir("/tmp/otl/c", 0755);
+    if (mount("tmpfs", "/tmp/otl/c", "tmpfs", 0, NULL) < 0) return 93;
+    if (ot_userns() < 0) return 94;
+    errno = 0;
+    int fd = otree(AT_FDCWD, "/tmp/otl", OT_CLONE);
+    if (fd >= 0 || errno != EINVAL) { printf("  nonrec clone fd=%d errno=%d\n", fd, errno); return 10; }
+    fd = otree(AT_FDCWD, "/tmp/otl", OT_CLONE | OT_REC);
+    if (fd < 0) { printf("  rec clone errno=%d\n", errno); return 11; }
+    return 0;
+}
+static int ot_eperm(int m) {
+    (void)m;
+    mkdir("/tmp/ote", 0755); mkdir("/tmp/ote/a", 0755); mkdir("/tmp/ote/b", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 92;
+    errno = 0;
+    if (otree(AT_FDCWD, "/tmp", OT_CLONE | OT_REC) >= 0 || errno != EPERM) return 10;
+    int fd = otree(AT_FDCWD, "/tmp", 0);
+    if (fd < 0) return 11; /* a plain handle needs no privilege */
+    close(fd);
+    errno = 0;
+    if (omove(AT_FDCWD, "/tmp/ote/a", AT_FDCWD, "/tmp/ote/b", 0) == 0 || errno != EPERM) return 12;
+    errno = 0;
+    if (osetattr(AT_FDCWD, "/tmp/ote/a", 0, 1, 0) == 0 || errno != EPERM) return 13;
+    return 0;
+}
+static int ot_release(int m) {
+    (void)m;
+    int l0 = 0, l1 = 0, l2 = 0, s = 0;
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    if (ns_counts(&l0, &s) < 0) return 92;
+    int fd = otree(AT_FDCWD, "/tmp", OT_CLONE | OT_REC);
+    if (fd < 0) { printf("  open_tree errno=%d\n", errno); return 10; }
+    if (ns_counts(&l1, &s) < 0 || l1 != l0 + 1) { printf("  live %d -> %d\n", l0, l1); return 11; }
+    close(fd);
+    mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL); /* reaps */
+    if (ns_counts(&l2, &s) < 0 || l2 != l0) { printf("  after close live %d (want %d)\n", l2, l0); return 12; }
+    return 0;
+}
+static int ot_move(int m) {
+    (void)m;
+    mkdir("/tmp/otm", 0755); mkdir("/tmp/otm/a", 0755); mkdir("/tmp/otm/b", 0755); mkdir("/tmp/otm/c", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (mount("tmpfs", "/tmp/otm/a", "tmpfs", 0, NULL) < 0) return 92;
+    put("/tmp/otm/a/f", "x", 0644);
+    if (omove(AT_FDCWD, "/tmp/otm/a", AT_FDCWD, "/tmp/otm/b", 0) < 0) { printf("  move errno=%d\n", errno); return 10; }
+    if (!exists("/tmp/otm/b/f") || exists("/tmp/otm/a/f")) return 11;
+    if (ot_userns() < 0) return 93;
+    errno = 0;
+    if (omove(AT_FDCWD, "/tmp/otm/b", AT_FDCWD, "/tmp/otm/c", 0) == 0 || errno != EINVAL) return 12; /* locked */
+    return 0;
+}
+static int ot_mi_ro(const char *mp) { /* 1 ro, 0 rw, -1 absent */
+    static char mi[16384];
+    char key[96]; snprintf(key, sizeof key, " %s ", mp);
+    if (slurp("/proc/self/mountinfo", mi, sizeof mi) <= 0) return -1;
+    char *l = strstr(mi, key); if (!l) return -1;
+    char *e = strchr(l, '\n'); if (e) *e = 0;
+    char *o = l + strlen(key);
+    return (o[0] == 'r' && o[1] == 'o' && (o[2] == ',' || o[2] == ' ')) ? 1 : 0;
+}
+static int ot_setattr(int m) {
+    (void)m;
+    mkdir("/tmp/ots", 0755); mkdir("/tmp/otk", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (mount("tmpfs", "/tmp/ots", "tmpfs", 0, NULL) < 0) return 92;
+    if (mount("tmpfs", "/tmp/otk", "tmpfs", MS_RDONLY, NULL) < 0) return 93;
+    if (osetattr(AT_FDCWD, "/tmp/ots", 0, 1, 0) < 0) { printf("  setattr ro errno=%d\n", errno); return 10; }
+    if (ot_mi_ro("/tmp/ots") != 1) return 11;
+    if (osetattr(AT_FDCWD, "/tmp/ots", 0, 0, 1) < 0) return 12;
+    if (ot_mi_ro("/tmp/ots") != 0) return 13;
+    if (ot_userns() < 0) return 94;
+    errno = 0;
+    if (osetattr(AT_FDCWD, "/tmp/otk", 0, 0, 1) == 0 || errno != EPERM) return 14; /* locked ro */
+    return 0;
+}
+static void opentree_suite(void) {
+    report("opentree_noclone_handle", nn_in_child(ot_noclone, 0));
+    report("opentree_crun_sys_clone_move", nn_in_child(ot_crun_sys, 0));
+    report("opentree_locked_children_einval", nn_in_child(ot_locked, 0));
+    report("opentree_eperm_without_cap", nn_in_child(ot_eperm, 0));
+    report("opentree_detached_release", nn_in_child(ot_release, 0));
+    report("opentree_move_existing", nn_in_child(ot_move, 0));
+    report("opentree_setattr_ro_and_locked", nn_in_child(ot_setattr, 0));
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -1763,6 +1895,7 @@ int main(int argc, char **argv) {
     pivot_suite();
     podexec_suite();
     devpts_copies();
+    opentree_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
