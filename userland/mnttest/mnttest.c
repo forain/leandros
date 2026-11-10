@@ -1654,6 +1654,95 @@ static void pivot_suite(void) {
     report("pivot_ns0_intact", exists("/bin/mnttest") && exists("/tmp/pv/r1/hello"));
 }
 
+/* ── lane podexec (M6): symlinks resolve against the pivoted root ────────── */
+static int pl_copy(const char *src, const char *dst) {
+    int a = open(src, O_RDONLY), b = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    if (a < 0 || b < 0) return -1;
+    char buf[8192]; ssize_t n;
+    while ((n = read(a, buf, sizeof buf)) > 0) if (write(b, buf, n) != n) return -1;
+    close(a); close(b);
+    return 0;
+}
+/* root/bin/real (an executable), root/bin/abs -> /bin/real (absolute),
+ * root/usr/lib/rel -> ../../bin/real, root/usr/lib/up -> ../../../../bin/real */
+static int pl_prepare(const char *root) {
+    char p[160];
+    if (pv_prepare(root) < 0) return -1;
+    snprintf(p, sizeof p, "%s/bin", root); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/proc", root); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/usr", root); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/usr/lib", root); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/bin/real", root);
+    if (pl_copy("/bin/mnttest", p) < 0) return -1;
+    snprintf(p, sizeof p, "%s/bin/abs", root);
+    if (symlink("/bin/real", p) < 0) return -1;
+    snprintf(p, sizeof p, "%s/usr/lib/rel", root);
+    if (symlink("../../bin/real", p) < 0) return -1;
+    snprintf(p, sizeof p, "%s/usr/lib/up", root);
+    if (symlink("../../../../bin/real", p) < 0) return -1;
+    return 0;
+}
+static int pl_exec(const char *path) {
+    pid_t c = fork();
+    if (c < 0) return -1;
+    if (c == 0) { char *av[] = {(char *)path, (char *)"child-ok", NULL}; execv(path, av); _exit(127); }
+    int st = 0; waitpid(c, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 42 ? 0 : -1;
+}
+static int pl_check(const char *root) {
+    int r = pv_crun_seq(root);
+    if (r) return r;
+    struct stat st;
+    if (stat("/bin/abs", &st) < 0) { printf("  stat /bin/abs errno=%d\n", errno); return 30; }
+    if (access("/bin/abs", X_OK) < 0) { printf("  access /bin/abs errno=%d\n", errno); return 31; }
+    if (pl_exec("/bin/abs") < 0) { printf("  exec /bin/abs failed\n"); return 32; }
+    return 0;
+}
+static int pl_rel(const char *root) {
+    int r = pv_crun_seq(root);
+    if (r) return r;
+    struct stat st;
+    if (stat("/usr/lib/rel", &st) < 0) { printf("  stat rel errno=%d\n", errno); return 30; }
+    if (pl_exec("/usr/lib/rel") < 0) { printf("  exec rel failed\n"); return 32; }
+    /* ".." at the pivoted root stays at the root */
+    if (stat("/usr/lib/up", &st) < 0) { printf("  stat up errno=%d\n", errno); return 33; }
+    if (pl_exec("/usr/lib/up") < 0) { printf("  exec up failed\n"); return 34; }
+    return 0;
+}
+static int pl_abs_tmp(int m) { (void)m; if (unshare(CLONE_NEWNS) < 0) return 91; if (pl_prepare("/tmp/pv/l1") < 0) return 92; return pl_check("/tmp/pv/l1"); }
+static int pl_abs_disk(int m) { (void)m; if (unshare(CLONE_NEWNS) < 0) return 91; mkdir("/root", 0700); mkdir("/root/pvl", 0755);
+    if (pl_prepare("/root/pvl/r") < 0) return 92; return pl_check("/root/pvl/r"); }
+static int pl_rel_tmp(int m) { (void)m; if (unshare(CLONE_NEWNS) < 0) return 91; if (pl_prepare("/tmp/pv/l2") < 0) return 92; return pl_rel("/tmp/pv/l2"); }
+static int pl_rel_disk(int m) { (void)m; if (unshare(CLONE_NEWNS) < 0) return 91; mkdir("/root/pvl", 0755);
+    if (pl_prepare("/root/pvl/r2") < 0) return 92; return pl_rel("/root/pvl/r2"); }
+static int pl_fdpath(int m) {
+    (void)m;
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (pl_prepare("/tmp/pv/l3") < 0) return 92;
+    int r = pv_crun_seq("/tmp/pv/l3");
+    if (r) return r;
+    if (mount("proc", "/proc", "proc", 0, NULL) < 0) { printf("  proc mount errno=%d\n", errno); return 45; }
+    int fd = open("/bin", O_DIRECTORY | O_RDONLY);
+    if (fd < 0) return 40;
+    char p[64], t[128]; snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(p, t, sizeof t - 1);
+    if (n < 0) return 41;
+    t[n] = 0;
+    if (strcmp(t, "/bin")) { printf("  fd path=%s\n", t); return 42; }
+    char q[96]; snprintf(q, sizeof q, "%s/real", p);
+    struct stat st;
+    if (stat(q, &st) < 0) { printf("  stat %s errno=%d\n", q, errno); return 43; }
+    if (!exists("/proc/self/fd")) return 44;
+    return 0;
+}
+static void podexec_suite(void) {
+    report("abs_link_in_root", nn_in_child(pl_abs_tmp, 0));
+    report("abs_link_in_root_disk", nn_in_child(pl_abs_disk, 0));
+    report("rel_dotdot_link", nn_in_child(pl_rel_tmp, 0));
+    report("rel_dotdot_link_disk", nn_in_child(pl_rel_disk, 0));
+    report("fd_path_after_pivot", nn_in_child(pl_fdpath, 0));
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -1672,6 +1761,7 @@ int main(int argc, char **argv) {
     fdpath_suite();
     fdmounts_suite();
     pivot_suite();
+    podexec_suite();
     devpts_copies();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;

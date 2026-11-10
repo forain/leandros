@@ -4927,6 +4927,57 @@ fn path_args(msg: &Message) -> (Option<(usize, bool)>, Option<(usize, bool)>) {
 /// every RamFS and mount path — is handed to the handlers byte-identical to
 /// how it arrived, so no non-tmpfs lookup (the exec path above all) can change
 /// behaviour because of this.
+/// Readlink of one backing path on any filesystem; `None` when it is not a link.
+fn backing_readlink(backing: &[u8]) -> Option<Vec<u8>> {
+    if backing.starts_with(b"/proc") || backing.starts_with(b"/sys") || backing.starts_with(b"/dev") { return None; }
+    let mut p = backing.to_vec();
+    p.push(0);
+    let mut out = alloc::vec![0u8; 512];
+    let r = handle_readlink(p.as_ptr() as usize, out.as_mut_ptr() as usize, out.len());
+    let n = reply_val(&r);
+    if n <= 0 { return None; }
+    out.truncate(n as usize);
+    Some(out)
+}
+
+/// Resolve every symlink of namespace path `ns_path` in mount namespace `ns`
+/// (each hop is translated through the namespace tree; an absolute target is
+/// anchored at the namespace root). Returns the resolved namespace path, its
+/// backing path and the final mount id; `None` when the namespace has no
+/// tree. Namespace-0 tasks never come here.
+pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool)
+    -> Result<Option<(Vec<u8>, Vec<u8>, u32)>, i32>
+{
+    let mut todo: Vec<Vec<u8>> = ns_path.split(|&c| c == b'/').filter(|c| !c.is_empty())
+        .map(|c| c.to_vec()).collect();
+    todo.reverse();
+    let mut cur: Vec<u8> = Vec::new(); // "" == "/"
+    let mut hops = 0u32;
+    while let Some(c) = todo.pop() {
+        if c == b"." { continue; }
+        if c == b".." {
+            if let Some(i) = cur.iter().rposition(|&b| b == b'/') { cur.truncate(i); }
+            continue;
+        }
+        let last = todo.is_empty();
+        let save = cur.len();
+        cur.push(b'/');
+        cur.extend_from_slice(&c);
+        if last && !follow { continue; }
+        let x = match mnt::translate(ns, &cur) { Some(x) => x, None => return Ok(None) };
+        if let Some(t) = backing_readlink(&x.backing) {
+            hops += 1;
+            if hops > SYMLINK_MAX_HOPS { return Err(-40); }
+            cur.truncate(save);
+            if t.first() == Some(&b'/') { cur.clear(); }
+            for comp in t.split(|&b| b == b'/').filter(|c| !c.is_empty()).rev() { todo.push(comp.to_vec()); }
+        }
+    }
+    if cur.is_empty() { cur.push(b'/'); }
+    let x = match mnt::translate(ns, &cur) { Some(x) => x, None => return Ok(None) };
+    Ok(Some((cur, x.backing, x.mnt_id)))
+}
+
 fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>)
     -> Result<(), i32>
 {
@@ -4934,6 +4985,23 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
     let ptr = arg(msg, idx) as usize;
     let (raw, rlen) = match read_cstr_raw(ptr) { Some(r) => r, None => return Ok(()) };
     let path = strip_trailing_slash(&raw[..rlen]);
+    // Mount-namespace tasks: symlinks resolve in namespace space (an absolute
+    // target is anchored at the pivoted root, not at the backing volume root).
+    let pid = sched::current_pid();
+    if let Some(cx) = mnt::callctx_get(pid, ptr) {
+        let ns = sched::current_mntns();
+        let rr = ns_resolve_links(ns, &cx.ns_path, follow);
+        if let Some((nsp, backing, mid)) = rr? {
+            if nsp != cx.ns_path {
+                *buf = backing;
+                buf.push(0);
+                let nptr = buf.as_ptr() as usize;
+                mnt::callctx_set(pid, mnt::CallCtx { ptr: nptr, ns_path: nsp, mnt_id: mid });
+                msg.data[idx * 8..idx * 8 + 8].copy_from_slice(&(nptr as u64).to_le_bytes());
+                return Ok(());
+            }
+        }
+    }
     if !is_tmp_path(path) { return Ok(()); }
 
     let resolved = tmp_resolve_links(path, follow)?;
@@ -4976,7 +5044,13 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
         let mut m = *msg;
         if let Err(e) = rewrite_one(&mut m, p0, &mut b0) { return err_reply(e); }
         if let Err(e) = rewrite_one(&mut m, p1, &mut b1) { return err_reply(e); }
-        return dispatch(&m, caller_pid);
+        let r = dispatch(&m, caller_pid);
+        // Contexts registered for the rewritten buffers die with them (a stale
+        // entry would be found again when the allocator reuses the address).
+        let me = sched::current_pid();
+        if !b0.is_empty() { mnt::callctx_clear(me, b0.as_ptr() as usize); }
+        if !b1.is_empty() { mnt::callctx_clear(me, b1.as_ptr() as usize); }
+        return r;
     }
     dispatch(msg, caller_pid)
 }
