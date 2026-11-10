@@ -1287,6 +1287,19 @@ static int nsfs_in_mntns(int mode) {
     DBGC();
     return 0;
 }
+static int leakvar(int v) {
+    char file[64]; snprintf(file, sizeof file, "/tmp/lv.%d", (int)getpid());
+    if (v >= 20 && unshare(CLONE_NEWNS) < 0) return 91;
+    v %= 20;
+    if (unshare(CLONE_NEWNET) < 0) return 92;
+    int fd = open(file, O_RDWR | O_CREAT, 0444); if (fd < 0) return 94; close(fd);
+    if (mount("/proc/self/ns/net", file, "none", MS_BIND, NULL) < 0) return 1;
+    if (v >= 1) { if (unshare(CLONE_NEWNET) < 0) return 96; }
+    if (v >= 2) { fd = open(file, O_RDONLY); if (fd < 0) return 3; if (v >= 3) { if (setns_(fd, CLONE_NEWNET) < 0) return 5; } close(fd); }
+    if (umount(file) < 0) return 7;
+    unlink(file);
+    return 0;
+}
 static int selfbind_copied(int m) {
     (void)m;
     if (unshare(CLONE_NEWNS) < 0) return 91;
@@ -1309,6 +1322,7 @@ static int nsfs_ns0_copied(int m) {
     return r ? 10 + r : 0;
 }
 static void fdpath_suite(void) {
+    for (int v = 0; v < 24; v++) { if (v % 20 > 3) continue; int l0,s0,l1,s1; ns_counts(&l0,&s0); nn_in_child(leakvar, v); ns_counts(&l1,&s1); printf("LV v=%d live %d->%d\n", v, l0, l1); }
     report("mount_private_via_fd_link_root", nn_in_child(fdp_direct, 0)); DBGC();
     report("crun_make_private_walk_root", nn_in_child(fdp_walk, 0)); DBGC();
     report("crun_make_private_walk_mntns", nn_in_child(fdp_root_mntns, 0)); DBGC();
