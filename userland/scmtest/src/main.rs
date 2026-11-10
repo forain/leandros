@@ -1443,6 +1443,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     if !test_socket_alias_epoll_close() { failures += 1; }
     if !test_pass_connected_socket() { failures += 1; }
     if !test_seqpacket_short_path() { failures += 1; }
+    if !test_seqpacket_short_path_forked() { failures += 1; }
     if !test_seqpacket_long_dir_via_procfd() { failures += 1; }
     if !test_memfd_reopen_readonly() { failures += 1; }
     if !test_sendmsg_short_write_keeps_stream() { failures += 1; }
@@ -2436,6 +2437,36 @@ unsafe fn test_seqpacket_short_path() -> bool {
     ok = ok && rr == 4 && &b[..4] == b"ping";
     close(cs); close(asf); close(ls); unlink(path.as_ptr());
     report(name, ok)
+}
+
+/// Control: short path, but the connector is a forked child (as podman is).
+unsafe fn test_seqpacket_short_path_forked() -> bool {
+    let name = b"seqpacket_short_path_forked\0";
+    let path = b"/tmp/atsk_short2\0";
+    unlink(path.as_ptr());
+    let ls = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    let (addr, alen) = sockaddr_un::from_path(&path[..path.len() - 1]);
+    let mut ok = ls >= 0 && raw_bind(ls, &addr, alen) == 0 && raw_listen(ls, 10) == 0;
+    let pid = fork();
+    if pid == 0 {
+        let cs = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+        if raw_connect(cs, &addr, alen) != 0 { exit(3); }
+        if raw_send(cs, b"ping".as_ptr(), 4, 0) != 4 { exit(4); }
+        let mut b = [0u8; 8];
+        if raw_recv(cs, b.as_mut_ptr(), 8, 0) != 4 { exit(5); }
+        exit(0);
+    }
+    let asf = raw_accept(ls);
+    ok = ok && asf >= 0;
+    let mut b = [0u8; 8];
+    let rr = raw_recv(asf, b.as_mut_ptr(), 8, 0);
+    if rr != 4 { dbg2(b"[seqshort2] recv ret=%ld errno=%ld\n\0", rr as i64, get_errno() as i64); }
+    ok = ok && rr == 4 && &b[..4] == b"ping";
+    raw_send(asf, b"pong".as_ptr(), 4, 0);
+    let mut status = 0i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    close(asf); close(ls); unlink(path.as_ptr());
+    report(name, ok && status == 0)
 }
 
 /// bind at a /tmp path → S_IFSOCK node → connect roundtrip.
