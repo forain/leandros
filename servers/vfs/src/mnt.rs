@@ -278,6 +278,24 @@ pub fn bind(ns: NsId, src: &[u8], dst: &[u8], rec: bool) -> Result<u32, i32> {
     let mut g = NS.lock();
     let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
     if t.len() >= MNT_MAX { return Err(-28); }
+    let mut add = clone_subtree(t, src, rec)?;
+    let (pid, mp) = attach_point(t, dst)?;
+    add[0].parent = pid;
+    add[0].mp = mp.into_boxed_slice();
+    let top_id = add[0].id;
+    if t.len() + add.len() > MNT_MAX { return Err(-28); }
+    for m in add.iter() { sb_get(m.sb); }
+    t.extend(add);
+    Ok(top_id)
+}
+
+/// Copy the mount tree rooted at namespace path `src` (all of it when `rec`,
+/// only the top mount otherwise). The returned vector starts with the new top
+/// mount, detached (`parent == 0`, `mp == "/"`, not locked); the caller
+/// attaches it and takes the superblock references. A non-recursive copy of a
+/// tree with locked children is EINVAL (it would expose what the locks
+/// cover); an unbindable source is EINVAL.
+fn clone_subtree(t: &[Mnt], src: &[u8], rec: bool) -> Result<Vec<Mnt>, i32> {
     let (si, soff) = walk_idx(t, src).ok_or(-2)?;
     let sub: &[u8] = &src[soff..];
     let sm = &t[si];
@@ -285,11 +303,10 @@ pub fn bind(ns: NsId, src: &[u8], dst: &[u8], rec: bool) -> Result<u32, i32> {
     let sid = sm.id;
     let in_sub = |mp: &[u8]| sub.is_empty() || (mp != b"/" && under(mp, sub));
     if !rec && t.iter().any(|c| c.parent == sid && c.locked & LOCK_MNT != 0 && in_sub(&c.mp)) { return Err(-22); }
-    let (pid, mp) = attach_point(t, dst)?;
     let mut top = sm.clone();
     top.id = alloc_mnt_id();
-    top.parent = pid;
-    top.mp = mp.into_boxed_slice();
+    top.parent = 0;
+    top.mp = b"/".to_vec().into_boxed_slice();
     top.root = join(&sm.root, sub).into_boxed_slice();
     top.locked &= !LOCK_MNT;
     let top_id = top.id;
@@ -321,10 +338,96 @@ pub fn bind(ns: NsId, src: &[u8], dst: &[u8], rec: bool) -> Result<u32, i32> {
             }
         }
     }
-    if t.len() + add.len() > MNT_MAX { return Err(-28); }
+    Ok(add)
+}
+
+// ── New mount API: detached trees, move_mount, mount_setattr (lane opentree) ──
+
+/// Anonymous (detached) mount namespaces made by open_tree(OPEN_TREE_CLONE):
+/// (namespace id, whether the tree root is a directory). The tree lives in
+/// `NS` under that id and is freed with the namespace when its last fd closes.
+static ANON: Mutex<Vec<(NsId, bool)>> = Mutex::new(Vec::new());
+
+/// Is `ns` a detached tree made by open_tree?
+pub fn is_anon(ns: NsId) -> bool { ANON.lock().iter().any(|a| a.0 == ns) }
+
+/// Does the detached tree `ns` have a directory as its root?
+pub fn anon_is_dir(ns: NsId) -> bool { ANON.lock().iter().find(|a| a.0 == ns).map_or(true, |a| a.1) }
+
+/// open_tree(OPEN_TREE_CLONE): copy the tree at `src` (a path in `ns`) into
+/// the fresh namespace `anon`, which becomes the detached tree.
+pub fn open_tree_clone(ns: NsId, src: &[u8], rec: bool, anon: NsId, anon_owner: NsId, is_dir: bool) -> Result<(), i32> {
+    let add = {
+        let g = NS.lock();
+        let t = &g.get(&ns).ok_or(-22)?.mnts;
+        if t.len() >= MNT_MAX { return Err(-28); }
+        clone_subtree(t, src, rec)?
+    };
     for m in add.iter() { sb_get(m.sb); }
-    t.extend(add);
-    Ok(top_id)
+    ANON.lock().push((anon, is_dir));
+    NS.lock().insert(anon, MntNs { owner_user: anon_owner, mnts: add, seq: 0 });
+    Ok(())
+}
+
+/// move_mount() of a detached tree: graft it at `dst` in `ns`. The detached
+/// tree is consumed (a second attach is EINVAL).
+pub fn move_attach(ns: NsId, anon: NsId, dst: &[u8]) -> Result<(), i32> {
+    let mut g = NS.lock();
+    let mut mnts = match g.get_mut(&anon) { Some(a) => core::mem::take(&mut a.mnts), None => return Err(-22) };
+    if mnts.is_empty() { return Err(-22); }
+    let res = (|| -> Result<(), i32> {
+        let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+        if t.len() + mnts.len() > MNT_MAX { return Err(-28); }
+        let (pid, mp) = attach_point(t, dst)?;
+        let ri = mnts.iter().position(|m| m.parent == 0).ok_or(-22)?;
+        mnts[ri].parent = pid;
+        mnts[ri].mp = mp.into_boxed_slice();
+        t.extend(core::mem::take(&mut mnts));
+        Ok(())
+    })();
+    if res.is_err() {
+        if let Some(a) = g.get_mut(&anon) { a.mnts = mnts; }
+    }
+    res
+}
+
+/// move_mount() of an existing mount: re-parent the mount whose root is
+/// namespace path `src` onto `dst`. Locked mounts, the namespace root and a
+/// destination inside the moved subtree are refused.
+pub fn move_mnt(ns: NsId, src: &[u8], dst: &[u8]) -> Result<(), i32> {
+    let mut g = NS.lock();
+    let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+    let (si, soff) = walk_idx(t, src).ok_or(-2)?;
+    if soff != src.len() && !(src == b"/" && soff == 0) { return Err(-22); }
+    if t[si].parent == 0 || t[si].locked & LOCK_MNT != 0 { return Err(-22); }
+    let sid = t[si].id;
+    let (di, _) = walk_idx(t, dst).ok_or(-2)?;
+    if di == si || descendants(t, sid).contains(&di) { return Err(-40); }
+    let (pid, mp) = attach_point(t, dst)?;
+    t[si].parent = pid;
+    t[si].mp = mp.into_boxed_slice();
+    Ok(())
+}
+
+/// mount_setattr(): set/clear per-mount flags and/or change propagation of the
+/// mount rooted at `path` (and of everything below it when `rec`). Clearing a
+/// flag the mount is locked to is EPERM; nothing changes on failure.
+pub fn setattr(ns: NsId, path: &[u8], set: u8, clr: u8, prop: usize, rec: bool) -> Result<(), i32> {
+    {
+        let mut g = NS.lock();
+        let t = &mut g.get_mut(&ns).ok_or(-22)?.mnts;
+        let (i, off) = walk_idx(t, path).ok_or(-2)?;
+        if off != path.len() && !(path == b"/" && off == 0) { return Err(-22); }
+        let mut idx: Vec<usize> = alloc::vec![i];
+        if rec { idx.extend(descendants(t, t[i].id)); }
+        if idx.iter().any(|&k| clr & t[k].locked & 0x7f != 0) { return Err(-1); }
+        for &k in idx.iter() { t[k].flags = (t[k].flags & !clr) | set; }
+    }
+    if prop != 0 {
+        let r = set_propagation(ns, path, prop | if rec { MS_REC } else { 0 });
+        if r != 0 { return Err(r); }
+    }
+    Ok(())
 }
 
 /// Namespace references held by `nsfs` superblocks: sb id -> namespace id.
@@ -515,6 +618,7 @@ pub fn mount_count(ns: NsId) -> usize { NS.lock().get(&ns).map_or(0, |n| n.mnts.
 
 /// Free the tree of `ns`, dropping its superblock references.
 pub fn release(ns: NsId) {
+    ANON.lock().retain(|a| a.0 != ns);
     let t = NS.lock().remove(&ns);
     if let Some(t) = t { for m in t.mnts.iter() { sb_put(m.sb); } }
 }
