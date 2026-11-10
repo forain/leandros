@@ -155,6 +155,8 @@ out:
     return n;
 }
 
+static int traffic_ms = 1000;
+
 /* (1) and (2) for the waiter `*tid`. `traffic` = 0 checks the mask only.
  * `*done` (may be NULL) going non-zero meanwhile means the waiter got its
  * event early, so the wake count is not this check's to judge. Returns 1 on
@@ -167,7 +169,7 @@ static int check_narrow(const char *n, volatile long *tid, volatile int *done, i
     }
     if (w.mask == ~0ULL) { fail(n, "parked with the broadcast mask (all ones)"); return 1; }
     if (!traffic) { printf("%s: mask %#llx\n", n, w.mask); return 0; }
-    long trips = unrelated_traffic(1000);
+    long trips = unrelated_traffic(traffic_ms);
     struct sysw w1 = sysstat_w(*tid);
     unsigned long long dw = w1.pwakes - w.pwakes;
     printf("%s: mask %#llx, %ld round trips, %llu wakes\n", n, w.mask, trips, dw);
@@ -280,6 +282,18 @@ static void lock_cases(void) {
         bad |= lock_round("setlkw_wait", API_SETLKW, REL_CLOSE, 0);
         bad |= lock_round("setlkw_wait", API_SETLKW, REL_EXIT, 0);
         if (!bad) pass("setlkw_wait");
+    }
+    /* A fresh socketpair + pipe per round gives the traffic ~6 new poll keys, so
+     * about one round in ten shares a bloom bit with the lock waiter's tag. A
+     * waiter parked on the bit alone is woken once per trip then; one parked on
+     * its exact key is not. 48 rounds make a miss of every collision ~1 %. */
+    if (!skipped("flock_collide")) {
+        int bad = 0;
+        traffic_ms = 100;
+        for (int i = 0; i < 48 && !bad; i++)
+            bad = lock_round("flock_collide", (i & 1) ? API_SETLKW : API_FLOCK, REL_UNLOCK, 1);
+        traffic_ms = 1000;
+        if (!bad) pass("flock_collide");
     }
     unlink(LOCKFILE);
 }

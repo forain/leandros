@@ -23,7 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import driver  # noqa: E402
 
-CASES = ["flock_wait", "setlkw_wait", "signalfd_read", "inotify_read",
+CASES = ["flock_wait", "setlkw_wait", "flock_collide", "signalfd_read", "inotify_read",
          "static_poll", "pipewire_poll", "drm_read", "evdev_read"]
 
 
