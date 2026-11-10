@@ -54,6 +54,7 @@ pub mod cgroupfs;
 
 /// Open file descriptions (see the module docs): what epoll keys by.
 pub mod ofd;
+pub mod inotify;
 pub mod mqueue;
 
 /// Alias mounts (proc/devtmpfs/sysfs/bind) — how a chroot gets its /proc.
@@ -205,6 +206,8 @@ pub const VFS_SIGNALFD_CREATE: u64 = 0x4A;
 pub const VFS_INOTIFY_CREATE:  u64 = 0x4B;
 /// inotify_add_watch(fd, path_ptr, mask) → watch descriptor (≥1) or -errno.
 pub const VFS_INOTIFY_ADD:     u64 = 0x4C;
+/// inotify_rm_watch(fd, wd) → 0 or -errno (only sent when `vfs.inotify=1`).
+pub const VFS_INOTIFY_RM:      u64 = 0x53;
 /// utimensat: `VFS_UTIMENS(path_ptr, atime_sec, atime_nsec, mtime_sec,
 /// mtime_nsec, flags)` / `VFS_LUTIMENS` (final symlink not followed) /
 /// `VFS_FUTIMENS(fd, ...)` → 0 or -errno. The kernel has already turned
@@ -1839,7 +1842,8 @@ pub enum VnodeKind {
     /// inotify: a valid fd that accepts watches (init/add_watch) but never
     /// delivers events — keeps a config-watch source quiet in an event loop.
     /// `next_wd` hands out monotonic watch descriptors (≥1).
-    Inotify { next_wd: u32 },
+    /// `inst` is the id of the description the instance lives on (`inotify.rs`).
+    Inotify { inst: u32 },
     /// A socket descriptor. `sock` is the socket's handle in the net server
     /// (`SOCK_HANDLE_BASE + slot`); every socket a process holds is one of
     /// these entries (see "Socket and epoll handles in the fd table"). The
@@ -2022,7 +2026,7 @@ pub fn fd_wake_tag(pid: u32, fd: usize, write: bool) -> Option<sched::PollTag> {
         VnodeKind::TimerFd { slot }   => return local(poll_tag(poll_class::TIMERFD, *slot as u32)),
         VnodeKind::DevVt { .. }       => return local(sched::POLL_TAG_VT_SWITCH),
         VnodeKind::SignalFd { .. } if !write => return local(signalfd_wake_tag()),
-        VnodeKind::Inotify { .. } if !write  => return local(inotify_wake_tag()),
+        VnodeKind::Inotify { inst } if !write => return local(sched::poll_key_bit(inotify::key(*inst))),
         VnodeKind::DynamicDevice { port, dev_id, open_id } if *open_id != 0 =>
             (*port, *dev_id, *open_id),
         _ => return None,
@@ -2069,9 +2073,16 @@ fn dev_block_tag(revents: u32, tag: u64, write: bool) -> Option<u64> {
 /// and what every signal post to that group wakes (`sched::signal_wake_tag`).
 fn signalfd_wake_tag() -> u64 { sched::signal_wake_tag(sched::current_tgid()) }
 
-/// The tag an inotify fd's poll answer and a blocked inotify read name. No
-/// producer: accepted watches never queue events.
-fn inotify_wake_tag() -> u64 { sched::poll_tag(sched::poll_class::INOTIFY, 0) }
+/// The tag of an inotify instance's poll answer: its exact key's bit.
+fn inotify_wake_tag(inst: u32) -> u64 { sched::poll_key_bit(inotify::key(inst)) }
+
+/// True when `vfs.inotify=1` is on the kernel command line. The kernel's
+/// inotify syscalls take the real path only then; otherwise the old silent
+/// stub (valid fd, fake wds, no events) stays byte for byte.
+pub fn inotify_enabled() -> bool {
+    let c = *KERNEL_CMDLINE.lock();
+    inotify::enabled(c)
+}
 
 /// The tag of every vnode whose readiness never changes (regular files,
 /// /dev/null|zero|urandom, framebuffers, block devices, /dev/pipewire): a
@@ -4917,6 +4928,8 @@ fn path_args(msg: &Message) -> (Option<(usize, bool)>, Option<(usize, bool)>) {
         VFS_UNLINK | VFS_RMDIR | VFS_MKDIR | VFS_MKNOD
         | VFS_LSTAT | VFS_READLINK                              => (Some((0, false)), None),
         VFS_RENAME | VFS_LINK                                   => (Some((0, false)), Some((1, false))),
+        // inotify_add_watch(fd, path, mask): the path is arg1; IN_DONT_FOLLOW keeps a final symlink.
+        VFS_INOTIFY_ADD                                         => (Some((1, arg(msg, 2) as u32 & inotify::IN_DONT_FOLLOW == 0)), None),
         // arg0 of VFS_SYMLINK is the link *body*, stored verbatim — resolving
         // it here would turn `ln -s ../x l` into an absolute link.
         VFS_SYMLINK                                             => (None, Some((1, false))),
@@ -5100,7 +5113,100 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
     dispatch(msg, caller_pid)
 }
 
+/// The tmpfs path named by message argument `n`, owned (`None` for any other
+/// filesystem, which L1 does not emit for).
+fn inotify_tmp_arg(msg: &Message, n: usize) -> Option<Vec<u8>> {
+    let (b, l) = read_cstr_raw(arg(msg, n) as usize)?;
+    tmpfs_path(&b[..l]).map(|p| p.to_vec())
+}
+
+/// `Some(is_dir)` if tmpfs `path` exists.
+fn inotify_tmp_kind(path: &[u8]) -> Option<bool> {
+    let tmp = TMP_FILES.lock();
+    tmp_find(&tmp, path).map(|i| tmp[i].is_dir)
+}
+
+/// (parent, name) of a normalised tmpfs path.
+fn inotify_split(path: &[u8]) -> Option<(&[u8], &[u8])> {
+    let parent = tmp_parent(path)?;
+    let i = path.iter().rposition(|&b| b == b'/')?;
+    Some((parent, &path[i + 1..]))
+}
+
+/// Run `dispatch_inner` and, when a watch exists anywhere, emit the directory
+/// entry events a successful tmpfs create/delete/rename implies (design §2).
+/// Only reached when `inotify::armed()`.
+fn inotify_hooks(msg: &Message, pid: u32) -> Message {
+    use inotify::*;
+    match msg.tag {
+        VFS_OPEN if arg(msg, 1) as u32 & O_CREAT != 0 => {
+            let path = inotify_tmp_arg(msg, 0);
+            let existed = path.as_deref().map_or(true, |p| inotify_tmp_kind(p).is_some());
+            let r = dispatch_inner(msg, pid);
+            if let Some(p) = path {
+                if !existed && reply_val(&r) >= 0 {
+                    if let Some((par, nm)) = inotify_split(&p) { dirent(par, nm, IN_CREATE, 0); }
+                }
+            }
+            r
+        }
+        VFS_MKDIR | VFS_MKNOD | VFS_SYMLINK | VFS_LINK => {
+            let (idx, mask) = match msg.tag {
+                VFS_MKDIR => (0, IN_CREATE | IN_ISDIR),
+                VFS_MKNOD => (0, IN_CREATE),
+                VFS_SYMLINK | VFS_LINK => (1, IN_CREATE),
+                _ => unreachable!(),
+            };
+            let path = inotify_tmp_arg(msg, idx);
+            let r = dispatch_inner(msg, pid);
+            if let Some(p) = path {
+                if reply_val(&r) >= 0 {
+                    if let Some((par, nm)) = inotify_split(&p) { dirent(par, nm, mask, 0); }
+                }
+            }
+            r
+        }
+        VFS_UNLINK | VFS_RMDIR => {
+            let path = inotify_tmp_arg(msg, 0);
+            let r = dispatch_inner(msg, pid);
+            if let Some(p) = path {
+                if reply_val(&r) >= 0 {
+                    let isdir = msg.tag == VFS_RMDIR;
+                    if let Some((par, nm)) = inotify_split(&p) {
+                        dirent(par, nm, IN_DELETE | if isdir { IN_ISDIR } else { 0 }, 0);
+                    }
+                    if isdir { dir_removed(&p); }
+                }
+            }
+            r
+        }
+        VFS_RENAME => {
+            let (old, new) = (inotify_tmp_arg(msg, 0), inotify_tmp_arg(msg, 1));
+            let src = old.as_deref().and_then(inotify_tmp_kind);
+            let r = dispatch_inner(msg, pid);
+            if let (Some(o), Some(n), Some(isdir)) = (old, new, src) {
+                if o != n && reply_val(&r) >= 0 {
+                    let cookie = new_cookie();
+                    let dir = if isdir { IN_ISDIR } else { 0 };
+                    if let (Some((op, on)), Some((np, nn))) = (inotify_split(&o), inotify_split(&n)) {
+                        dirent(op, on, IN_MOVED_FROM | dir, cookie);
+                        dirent(np, nn, IN_MOVED_TO | dir, cookie);
+                    }
+                    if isdir { dir_renamed(&o, &n); }
+                }
+            }
+            r
+        }
+        _ => dispatch_inner(msg, pid),
+    }
+}
+
 fn dispatch(msg: &Message, caller_pid: u32) -> Message {
+    if inotify::armed() { return inotify_hooks(msg, caller_pid); }
+    dispatch_inner(msg, caller_pid)
+}
+
+fn dispatch_inner(msg: &Message, caller_pid: u32) -> Message {
     match msg.tag {
         VFS_OPEN         => handle_open(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32),
         VFS_READ         => handle_read(caller_pid, arg(msg,0) as usize,
@@ -5145,7 +5251,8 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_EVENTFD          => handle_eventfd(caller_pid, arg(msg,0) as u64, arg(msg,1) as u32),
         VFS_SIGNALFD_CREATE  => handle_signalfd_create(caller_pid, arg(msg,0) as usize, arg(msg,1) as u64, arg(msg,2) as u32),
         VFS_INOTIFY_CREATE   => handle_inotify_create(caller_pid, arg(msg,0) as u32),
-        VFS_INOTIFY_ADD      => handle_inotify_add(caller_pid, arg(msg,0) as usize),
+        VFS_INOTIFY_ADD      => handle_inotify_add(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize, arg(msg,2) as u32),
+        VFS_INOTIFY_RM       => handle_inotify_rm(caller_pid, arg(msg,0) as usize, arg(msg,1) as i32),
         VFS_TIMERFD_CREATE   => handle_timerfd_create(caller_pid, arg(msg,0) as u32, arg(msg,1) as u32),
         VFS_TIMERFD_SETTIME  => handle_timerfd_settime(caller_pid, arg(msg,0) as usize,
                                                         arg(msg,1) as u64, arg(msg,2) as u64,
@@ -9955,9 +10062,17 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             }
             val_reply(written as u64)
         }
-        VnodeKind::Inotify { .. } => {
+        VnodeKind::Inotify { inst } => {
+            let inst = *inst;
             drop(tbls);
-            err_reply(-11) // EAGAIN — a watch was accepted but never fires
+            let mut out: Vec<u8> = Vec::new();
+            match inotify::read(inst, count, &mut out) {
+                Err(e) => err_reply(e),
+                Ok(()) => {
+                    if unsafe { sched::uaccess::copy_raw(buf, out.as_ptr(), out.len()) } != 0 { return err_reply(-14); }
+                    val_reply(out.len() as u64)
+                }
+            }
         }
         _ => err_reply(-9),
     }
@@ -12584,39 +12699,95 @@ fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -
     }
 }
 
-/// inotify_init1(flags) → a valid Inotify fd that accepts watches but never
-/// delivers events. `flags` carries IN_CLOEXEC (== O_CLOEXEC, 0x80000) and
-/// IN_NONBLOCK (== O_NONBLOCK, 0o4000). These MUST be persisted on the fd:
-/// dropping IN_CLOEXEC (the old `flags: 0`) made every inotify instance survive
-/// the execve close-on-exec sweep, so cosmic-config's per-key config watchers —
-/// each an IN_CLOEXEC inotify fd — leaked into every child. A config-heavy
-/// session (cosmic-session + launch_pad) accumulated ~one-per-watch and handed
-/// its whole ~125-deep fd table down; late children like cosmic-greeter opened
-/// their very first fd into a full table and died on EMFILE ("No file
-/// descriptors available"), crash-looping under launch_pad's infinite restart.
+/// inotify_init1(flags) → an Inotify fd. `flags` carries IN_CLOEXEC (==
+/// O_CLOEXEC, 0x80000) and IN_NONBLOCK (== O_NONBLOCK, 0o4000). These MUST be
+/// persisted on the fd: dropping IN_CLOEXEC made every inotify instance
+/// survive the execve close-on-exec sweep (cosmic-config's per-key watchers
+/// leaked into every child and filled late children's fd tables: EMFILE
+/// crash-loop of cosmic-greeter).
+///
+/// With `vfs.inotify=1` the instance lives on the fd's description
+/// (`inotify.rs`); otherwise it is the old silent stub (`inst == 0`: accepted
+/// watches, no events).
 fn handle_inotify_create(pid: u32, flags: u32) -> Message {
+    let real = inotify_enabled();
     let mut tbls = TblSlot::new();
     let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return err_reply(-23) };
     let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
     let stored = flags & (O_CLOEXEC | O_NONBLOCK_FL);
-    tbl.fds.set(fd, FdEntry { kind: VnodeKind::Inotify { next_wd: 1 }, flags: stored, in_use: true, ofd: ofd::alloc() });
+    let o = ofd::alloc();
+    let mut inst = 0;
+    if real {
+        if o == 0 { return err_reply(-23); }
+        if !inotify::create(o) { return err_reply(-24); }
+        // The last put of this description must free the instance.
+        ofd::mark_watched(o);
+        inst = o;
+    }
+    tbl.fds.set(fd, FdEntry { kind: VnodeKind::Inotify { inst }, flags: stored, in_use: true, ofd: o });
     val_reply(fd as u64)
 }
 
-/// inotify_add_watch(fd, path, mask) → a monotonic fake watch descriptor (≥1).
-/// The path/mask are accepted and discarded — the watch never fires.
-fn handle_inotify_add(pid: u32, fd: usize) -> Message {
+/// Fake watch descriptors of the silent stub (`vfs.inotify=0`).
+static STUB_WD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// The instance behind `fd`, or the errno (EBADF / EINVAL).
+fn inotify_inst_of(pid: u32, fd: usize) -> Result<u32, i32> {
     let mut tbls = TblSlot::new();
-    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
-    if !tbl.fds.used(fd) { return err_reply(-9); }
-    match &mut tbl.fds[fd].kind {
-        VnodeKind::Inotify { next_wd } => {
-            let wd = *next_wd;
-            *next_wd = next_wd.checked_add(1).unwrap_or(1);
-            val_reply(wd as u64)
-        }
-        _ => err_reply(-22), // EINVAL — fd is not an inotify instance
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return Err(-9) };
+    if !tbl.fds.used(fd) { return Err(-9); }
+    match &tbl.fds[fd].kind { VnodeKind::Inotify { inst } => Ok(*inst), _ => Err(-22) }
+}
+
+/// inotify_add_watch(fd, path, mask) → watch descriptor. `path_ptr` is already
+/// the backing path (path_args). Search permission on the components comes from
+/// the lookup; read permission on the target is checked here (MAY_READ).
+fn handle_inotify_add(pid: u32, fd: usize, path_ptr: usize, mask: u32) -> Message {
+    let inst = match inotify_inst_of(pid, fd) { Ok(i) => i, Err(e) => return err_reply(e) };
+    if inst == 0 {
+        // Silent stub: the kernel only sends the fd.
+        return val_reply(STUB_WD.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u64);
     }
+    if mask & inotify::IN_ALL_EVENTS == 0 { return err_reply(-22); }
+    if mask & inotify::IN_MASK_ADD != 0 && mask & inotify::IN_MASK_CREATE != 0 { return err_reply(-22); }
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let raw = &pbuf[..plen];
+    let path: Vec<u8>;
+    if let Some(tp) = tmpfs_path(raw) {
+        let cred = cred_of(pid);
+        let tmp = TMP_FILES.lock();
+        if !is_tmpfs_root(tp) {
+            let parent = match tmp_parent(tp) { Some(p) => p, None => return err_reply(-2) };
+            if let Err(e) = tmp_dir_may(&tmp, parent, &cred, xattr::MAY_EXEC) { return err_reply(e); }
+            let idx = match tmp_find(&tmp, tp) { Some(i) => i, None => return err_reply(-2) };
+            if mask & inotify::IN_ONLYDIR != 0 && !tmp[idx].is_dir { return err_reply(-20); }
+            if !tmp_may(&tmp, idx, &cred, xattr::MAY_READ) { return err_reply(-13); }
+        }
+        path = tp.to_vec();
+    } else {
+        // Other filesystems: accepted (existence and read permission checked
+        // by their own access path); no events until a later lane.
+        let r = reply_val(&handle_access(pid, path_ptr, 4, true));
+        if r == -38 {
+            let mut st = [0u8; STAT_SIZE];
+            let sr = reply_val(&handle_stat(path_ptr, st.as_mut_ptr() as usize));
+            if sr < 0 { return err_reply(sr as i32); }
+        } else if r < 0 {
+            return err_reply(r as i32);
+        }
+        path = strip_trailing_slash(raw).to_vec();
+    }
+    match inotify::add(inst, &path, mask, 0) {
+        Ok(wd) => val_reply(wd as u64),
+        Err(e) => err_reply(e),
+    }
+}
+
+/// inotify_rm_watch(fd, wd).
+fn handle_inotify_rm(pid: u32, fd: usize, wd: i32) -> Message {
+    let inst = match inotify_inst_of(pid, fd) { Ok(i) => i, Err(e) => return err_reply(e) };
+    if inst == 0 { return ok_reply(); }
+    match inotify::rm(inst, wd) { Ok(()) => ok_reply(), Err(e) => err_reply(e) }
 }
 
 fn handle_timerfd_create(pid: u32, flags: u32, clockid: u32) -> Message {
@@ -12942,6 +13113,7 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
             n
         }
         VnodeKind::TmpFile { idx, .. } => { let i = *idx; let c = tmp_pos_get(&tbl.fds[fd].kind); drop(tbls); TMP_FILES.lock()[i].len.saturating_sub(c) as i32 }
+        VnodeKind::Inotify { inst } => { let i = *inst; drop(tbls); inotify::nbytes(i) as i32 }
         VnodeKind::EventFd { slot } => { let s = *slot; drop(tbls); if EVENTFD_COUNTERS.lock()[s] > 0 { 8 } else { 0 } }
         VnodeKind::TimerFd { slot } => { let s = *slot; drop(tbls); if timerfd_poll_expirations(s) > 0 || TIMERFD_POOL.lock()[s].canceled { 8 } else { 0 } }
         _ => return err_reply(-25),
@@ -13048,6 +13220,7 @@ fn poll_vnode_key(kind: &VnodeKind) -> Option<u64> {
         VnodeKind::PidFd { pid } => Some(sched::poll_key(sched::poll_class::PIDFD, *pid)),
         // Signal posts wake the reader's group keyed (sched::signal_wake_key).
         VnodeKind::SignalFd { .. } => Some(sched::signal_wake_key(sched::current_tgid())),
+        VnodeKind::Inotify { inst } => Some(inotify::key(*inst)),
         _ => None,
     }
 }
@@ -13173,14 +13346,15 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             (ev, exited as u64, sched::poll_tag(sched::poll_class::PIDFD, pid))
         }
         VnodeKind::NsFd { .. } | VnodeKind::BpfProg { .. } => (0, 0, sched::poll_tag(sched::poll_class::PIDFD, 0)),
-        VnodeKind::Inotify { .. } => {
+        VnodeKind::Inotify { inst } => {
             // Never fires: accepted watches silently produce no events. Its
             // own tag, not the broadcast mask — with POLL_TAG_ALL every event
             // loop holding a config watch (every COSMIC client) parked on a
             // broadcast mask and was woken by every timerfd expiry and every
             // untagged wake in the system: ~180 of the idle desktop's ~800
             // wakeups a second.
-            (0, 0, inotify_wake_tag())
+            let (rdy, seq) = inotify::ready(*inst);
+            (if rdy { POLLIN } else { 0 }, seq, inotify_wake_tag(*inst))
         }
         VnodeKind::DynamicDevice { port, dev_id, open_id } => {
             let port = *port;
