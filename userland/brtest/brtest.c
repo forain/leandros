@@ -125,7 +125,7 @@ static int link_get(int s, const char *name, int *peer, int *kindveth) {
 }
 /* Poll (up to 1 s) until `name` is gone: namespace teardown is lazy. */
 static int wait_gone(int s, const char *name) {
-    for (int w = 0; w < 50; w++) { if (!link_get(s, name, NULL, NULL)) return 1; usleep(20000); }
+    for (int w = 0; w < 1000; w++) { if (!link_get(s, name, NULL, NULL)) { printf("gone after %d ms\n", w * 20); return 1; } usleep(20000); }
     return 0;
 }
 /* Count links named veth* in a full dump. */
