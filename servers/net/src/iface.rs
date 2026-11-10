@@ -170,6 +170,11 @@ pub(crate) fn route_select(ns: u16, dst: IpAddress) -> Option<Sid> {
         if better { best = Some((c.prefix, r.metric, i)); }
     }
     if let Some((_, _, i)) = best { return Some(sid_of(i as u8)); }
+    drop(t);
+    // Dynamic stacks of netns 0 (veth host ends, tap/tun): connected and explicit routes
+    // win over the NIC default route.
+    if let Some(s) = crate::vif::route_in_ns(0, d) { return Some(s); }
+    let t = IFRT.lock();
     default_route_locked(&t, n).map(sid_of)
 }
 

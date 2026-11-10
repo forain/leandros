@@ -154,18 +154,26 @@ static int netns_fd_of(pid_t p) {
 
 /* A child in a new netns that waits for a byte on `gofd`, runs `body(child_sock)` and exits with its result. */
 static int ctl[2], done_[2];
+/* read one byte, giving up after 15 s (a wedged child must not hang the suite) */
+static int rd_to(int fd, char *ch) {
+    struct pollfd p = { fd, POLLIN, 0 };
+    if (poll(&p, 1, 15000) <= 0) return -1;
+    return read(fd, ch, 1);
+}
 static pid_t spawn_ns(int (*body)(void)) {
     if (pipe(ctl) || pipe(done_)) return -1;
     fflush(stdout);
     pid_t c = fork();
     if (c == 0) {
+        close(ctl[1]); close(done_[0]);
         if (unshare(CLONE_NEWNET) != 0) _exit(90);
         char ch = 'r'; write(done_[1], &ch, 1);      /* netns exists */
         if (read(ctl[0], &ch, 1) != 1) _exit(91);   /* veth arrived */
         _exit(body());
     }
+    close(ctl[0]); close(done_[1]);
     char ch;
-    if (read(done_[0], &ch, 1) != 1) return -1;
+    if (rd_to(done_[0], &ch) != 1) return -1;
     return c;
 }
 static int wait_child(pid_t c) { int st = 0; waitpid(c, &st, 0); return WIFEXITED(st) ? WEXITSTATUS(st) : 100 + WTERMSIG(st); }
@@ -239,7 +247,7 @@ static void veth_pair(void) {
     CHECK("veth_pair: vethA up", ia > 0 && link_set_up(s, ia) == 0);
     char ch = 'g'; write(ctl[1], &ch, 1);
     /* child configures eth0 and starts listening */
-    int rd = read(done_[0], &ch, 1);
+    int rd = rd_to(done_[0], &ch);
     CHECK("veth_pair: child configured eth0 and listens", rd == 1);
     if (rd != 1) { kill(c, SIGKILL); wait_child(c); return; }
     /* UDP echo (host -> child, via ARP over the pair) */

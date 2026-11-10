@@ -10,7 +10,7 @@ pub(crate) type Sid = u8;
 pub(crate) const MAX_STACKS: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum VifKind { Lo, Tap, Tun }
+pub(crate) enum VifKind { Lo, Tap, Tun, Veth }
 
 pub(crate) struct Vif {
     pub netns: u16,
@@ -28,11 +28,17 @@ pub(crate) struct Vif {
     pub tun: u32,
     /// rxq non-empty or a timer is due: poll this pass.
     pub pending: bool,
+    /// Veth: the other end's sid (`NO_PEER` = none). The ends may live in different netns.
+    pub peer: Sid,
 }
 
+pub(crate) const NO_PEER: Sid = 255;
 pub(crate) const NO_TUN: u32 = u32::MAX;
 pub(crate) const RXQ_CAP: usize = 512;
 pub(crate) const MAX_NS_SIDS: usize = 8;
+/// netns 0 also hosts the bridge-side ends of every container's veth.
+pub(crate) const MAX_NS0_SIDS: usize = 24;
+pub(crate) fn ns_sid_cap(ns: u16) -> usize { if ns == 0 { MAX_NS0_SIDS } else { MAX_NS_SIDS } }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Route { pub dst: [u8; 4], pub prefix: u8, pub gw: Option<[u8; 4]>, pub oif: Sid, pub metric: u32 }
@@ -94,7 +100,7 @@ mod tests {
 
     fn vif(up: bool, addrs: &[([u8; 4], u8)]) -> Vif {
         Vif { netns: 1, ifindex: 2, name: [0; 16], kind: VifKind::Lo, admin_up: up, mtu: 1500, mac: [0; 6],
-              addrs: addrs.to_vec(), rxq: VecDeque::new(), tun: NO_TUN, pending: false }
+              addrs: addrs.to_vec(), rxq: VecDeque::new(), tun: NO_TUN, pending: false, peer: NO_PEER }
     }
 
     #[test]

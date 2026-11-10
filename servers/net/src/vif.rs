@@ -120,7 +120,7 @@ pub(crate) fn set_lo(ns: u16, up: bool) {
         name[..2].copy_from_slice(b"lo");
         v[sid] = Some(Vif {
             netns: ns, ifindex: 1, name, kind: VifKind::Lo, admin_up: true, mtu: 65536, mac: [0; 6],
-            addrs: alloc::vec![([127, 0, 0, 1], 8)], rxq: Default::default(), tun: NO_TUN, pending: false,
+            addrs: alloc::vec![([127, 0, 0, 1], 8)], rxq: Default::default(), tun: NO_TUN, pending: false, peer: NO_PEER,
         });
         st.lo = Some(sid as Sid);
         st.sids.insert(0, sid as Sid);
@@ -142,12 +142,42 @@ pub(crate) fn daemon_pass() {
     }
 }
 
+/// Free the given (netns, sid) vifs wherever they live: drop them from their
+/// namespace's sid list and routes, then the table slot, then the stack.
+pub(crate) fn free_vifs(list: &[(u16, Sid)]) {
+    {
+        let mut n = NETNS.lock();
+        let mut v = VIFS.lock();
+        for &(ns, sid) in list {
+            if let Some(st) = n.get_mut(&ns) {
+                st.sids.retain(|&s| s != sid);
+                st.routes.retain(|r| r.oif != sid);
+            }
+            v[sid as usize] = None;
+        }
+    }
+    // No table lock is held: the stack locks are taken alone.
+    for &(_, sid) in list { *crate::STACKS[sid as usize].lock() = None; }
+}
+
 fn reap(ns: u16) {
     let Some(st) = NETNS.lock().remove(&ns) else { return };
+    // Veth ends in this namespace take their peers (any namespace) with them.
+    let mut peers: Vec<(u16, Sid)> = Vec::new();
     {
         let mut v = VIFS.lock();
+        for &sid in st.sids.iter() {
+            if let Some(x) = v[sid as usize].as_ref() {
+                if x.kind == VifKind::Veth && x.peer != NO_PEER {
+                    if let Some(p) = v[x.peer as usize].as_ref() {
+                        if p.netns != ns { peers.push((p.netns, x.peer)); }
+                    }
+                }
+            }
+        }
         for &sid in st.sids.iter() { v[sid as usize] = None; }
     }
+    free_vifs(&peers);
     // No stack lock is held here (VIFS/NETNS are released).
     for &sid in st.sids.iter() { *crate::STACKS[sid as usize].lock() = None; }
 }
