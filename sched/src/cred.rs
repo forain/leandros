@@ -422,6 +422,19 @@ pub fn ids_of(pid: Pid) -> Option<([u32; 4], [u32; 4])> {
         .map(|t| ([t.uid, t.euid, t.suid, t.fsuid], [t.gid, t.egid, t.sgid, t.fsgid]))
 }
 
+/// Linux `task_dump_owner` for /proc/<pid>: the task's effective kuid/kgid;
+/// a non-dumpable task (its thread group leader's flag) shows the root of its
+/// user namespace instead (kuid 0 when that root is unmapped). Kernel ids:
+/// the reader's view translation happens on the copy to user memory.
+pub fn proc_dump_owner(pid: Pid) -> (u32, u32) {
+    let rq = RUN_QUEUE.lock();
+    let Some(t) = rq.find_pid(pid) else { return (0, 0) };
+    let dumpable = rq.find_pid(t.tgid).unwrap_or(t).dumpable;
+    if dumpable { return (t.euid, t.egid); }
+    let ns = t.userns.id();
+    (crate::ns::to_k(0, ns, 0).unwrap_or(0), crate::ns::to_k(1, ns, 0).unwrap_or(0))
+}
+
 /// May the calling thread put a message on a queue port owned by `owner`
 /// (SYS_IPC_SEND / SYS_IPC_CALL, and a caller-chosen `reply_port`)?
 /// 0 = allowed, else -EPERM.
