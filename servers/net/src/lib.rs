@@ -201,6 +201,8 @@ pub const IPPROTO_ICMP: usize = 1;
 /// SOL_TCP and the TCP-level options this server implements (Linux values).
 const IPPROTO_TCP:   usize = 6;
 const TCP_NODELAY:   usize = 1;
+const TCP_INFO:      usize = 11;
+const TCP_INFO_LEN:  usize = 104;
 const TCP_KEEPIDLE:  usize = 4;
 const TCP_KEEPINTVL: usize = 5;
 const TCP_KEEPCNT:   usize = 6;
@@ -7712,6 +7714,49 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             let a = sock_opts(e.ofd).mc_addr;
             if optval_ptr != 0 && !wr_user(optval_ptr, a) { return err_reply(-14); }
             if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
+            return ok_reply();
+        }
+        // TCP_INFO: Linux's `struct tcp_info` prefix (104 bytes: through
+        // total_retrans). Only the state and a few plausible constants are
+        // modelled; passt's pasta reads it on every connection and sizes its
+        // feature probes from the length we return.
+        if level == IPPROTO_TCP && optname == TCP_INFO && is_tcp_entry(&e) {
+            let st: u8 = match e.state {
+                SockState::InetListening { .. } => 10,
+                SockState::InetConnected { socket_handle, sid, .. } => {
+                    let mut stack = stack_for(sid);
+                    match stack.as_mut() {
+                        Some(s) => match s.socket_set.get_mut::<tcp::Socket>(socket_handle).state() {
+                            tcp::State::Established => 1, tcp::State::SynSent => 2,
+                            tcp::State::SynReceived => 3, tcp::State::FinWait1 => 4,
+                            tcp::State::FinWait2 => 5, tcp::State::TimeWait => 6,
+                            tcp::State::Closed => 7, tcp::State::CloseWait => 8,
+                            tcp::State::LastAck => 9, tcp::State::Listen => 10,
+                            tcp::State::Closing => 11,
+                        },
+                        None => 7,
+                    }
+                }
+                _ => 7,
+            };
+            let mut b = [0u8; TCP_INFO_LEN];
+            b[0] = st;
+            let put = |b: &mut [u8; TCP_INFO_LEN], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+            put(&mut b, 8, 200_000);   // rto (us)
+            put(&mut b, 16, 1448);     // snd_mss
+            put(&mut b, 20, 1448);     // rcv_mss
+            put(&mut b, 60, 1500);     // pmtu
+            put(&mut b, 68, 1000);     // rtt (us)
+            put(&mut b, 80, 10);       // snd_cwnd
+            put(&mut b, 84, 1460);     // advmss
+            if optlen_ptr == 0 { return err_reply(-14); }
+            let Some(len) = sched::uaccess::read_user::<i32>(optlen_ptr) else { return err_reply(-14) };
+            if len < 0 { return err_reply(-22); }
+            let n = (len as usize).min(TCP_INFO_LEN);
+            if n > 0 && (optval_ptr == 0 || !b[..n].iter().enumerate().all(|(i, &x)| wr_user(optval_ptr + i, x))) {
+                return err_reply(-14);
+            }
+            if !wr_user(optlen_ptr, n as u32) { return err_reply(-14); }
             return ok_reply();
         }
     }
