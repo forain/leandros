@@ -15,7 +15,7 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU16, AtomicU8, Ordering::Relaxed};
+use core::sync::atomic::{AtomicU32, AtomicU16, AtomicU8, AtomicUsize, Ordering::Relaxed};
 use spin::Mutex;
 
 pub const IN_ACCESS: u32 = 0x1;
@@ -40,12 +40,35 @@ pub const IN_ISDIR: u32 = 0x4000_0000;
 pub const IN_ONESHOT: u32 = 0x8000_0000;
 pub const IN_ALL_EVENTS: u32 = 0xFFF;
 
-const MAX_QUEUED: usize = 16384;
-const MAX_INSTANCES: usize = 1024;
-const MAX_WATCHES: usize = 65536;
+/// /proc/sys/fs/inotify/{max_queued_events,max_user_instances,max_user_watches}.
+static MAX_QUEUED: AtomicUsize = AtomicUsize::new(16384);
+static MAX_USER_INST: AtomicUsize = AtomicUsize::new(128);
+static MAX_USER_WATCH: AtomicUsize = AtomicUsize::new(65536);
+/// Monotonic counters (read via /proc/sys/fs/inotify/{events_queued,events_coalesced,events_overflow,instances,watches}).
+static EV_QUEUED: AtomicUsize = AtomicUsize::new(0);
+static EV_COALESCED: AtomicUsize = AtomicUsize::new(0);
+static EV_OVERFLOW: AtomicUsize = AtomicUsize::new(0);
+/// Safety cap on live instances in the whole system.
+const MAX_INSTANCES: usize = 8192;
+
+/// 0 = max_queued_events, 1 = max_user_instances, 2 = max_user_watches.
+pub fn limit_get(k: usize) -> usize {
+    match k { 3 => EV_QUEUED.load(Relaxed), 4 => EV_COALESCED.load(Relaxed), 5 => EV_OVERFLOW.load(Relaxed),
+        6 => STATE.lock().insts.len(), 7 => STATE.lock().nwatches, 0 => MAX_QUEUED.load(Relaxed), 1 => MAX_USER_INST.load(Relaxed), _ => MAX_USER_WATCH.load(Relaxed) }
+}
+pub fn limit_set(k: usize, v: usize) -> Result<(), i32> {
+    if k > 2 || v == 0 || v > i32::MAX as usize { return Err(-22); }
+    match k { 0 => MAX_QUEUED.store(v, Relaxed), 1 => MAX_USER_INST.store(v, Relaxed), _ => MAX_USER_WATCH.store(v, Relaxed) }
+    Ok(())
+}
+
+/// ucounts key: (owning user namespace, kuid). A task is charged at its own
+/// (userns, kuid) and, like Linux `inc_ucount`, at each ancestor level under
+/// the kuid that created the child namespace.
+pub type UKey = (u16, u32);
 const BLOOM: usize = 4096;
 
-/// Kill switch: 0 unknown, 1 off, 2 on (`vfs.inotify=1` on the command line).
+/// Kill switch: 0 unknown, 1 off, 2 on (default on; `vfs.inotify=0` on the command line turns it off).
 static KNOB: AtomicU8 = AtomicU8::new(0);
 /// Live watch count. Every hook starts with one load of this.
 static ARMED: AtomicU32 = AtomicU32::new(0);
@@ -55,13 +78,24 @@ static DIR_BLOOM: [AtomicU16; BLOOM] = [const { AtomicU16::new(0) }; BLOOM];
 
 struct Watch { wd: i32, mask: u32, #[allow(dead_code)] ino_key: u64, path: Vec<u8>, hash: u64 }
 struct Ev { wd: i32, mask: u32, cookie: u32, name: Vec<u8> }
-struct Instance { next_wd: i32, queue: VecDeque<Ev>, bytes: usize, seq: u64, watches: Vec<Watch> }
+struct Instance { next_wd: i32, queue: VecDeque<Ev>, bytes: usize, seq: u64, watches: Vec<Watch>, charge: Vec<UKey> }
 struct State {
     insts: BTreeMap<u32, Instance>,
     by_path: BTreeMap<u64, Vec<(u32, i32)>>,
     nwatches: usize,
+    /// (instances, watches) charged per ucounts key.
+    uc: BTreeMap<UKey, (usize, usize)>,
 }
-static STATE: Mutex<State> = Mutex::new(State { insts: BTreeMap::new(), by_path: BTreeMap::new(), nwatches: 0 });
+static STATE: Mutex<State> = Mutex::new(State { insts: BTreeMap::new(), by_path: BTreeMap::new(), nwatches: 0, uc: BTreeMap::new() });
+
+fn uc_adj(uc: &mut BTreeMap<UKey, (usize, usize)>, chain: &[UKey], inst: isize, watch: isize) {
+    for k in chain {
+        let e = uc.entry(*k).or_insert((0, 0));
+        e.0 = (e.0 as isize + inst).max(0) as usize;
+        e.1 = (e.1 as isize + watch).max(0) as usize;
+        if *e == (0, 0) { uc.remove(k); }
+    }
+}
 
 /// Resolve the knob from the command line on first use (cached once the
 /// command line is known).
@@ -71,7 +105,8 @@ pub fn enabled(cmdline: Option<&str>) -> bool {
         2 => true,
         _ => match cmdline {
             Some(c) => {
-                let on = c.split_ascii_whitespace().any(|t| t == "vfs.inotify=1");
+                let on = c.split_ascii_whitespace().any(|t| t == "vfs.inotify=0");
+                let on = !on;
                 KNOB.store(if on { 2 } else { 1 }, Relaxed);
                 on
             }
@@ -118,15 +153,17 @@ fn wake(keys: &[u64]) {
 /// queue changed.
 fn push(i: &mut Instance, ev: Ev) -> bool {
     if let Some(t) = i.queue.back() {
-        if t.wd == ev.wd && t.mask == ev.mask && t.cookie == ev.cookie && t.name == ev.name { return false; }
+        if t.wd == ev.wd && t.mask == ev.mask && t.cookie == ev.cookie && t.name == ev.name { EV_COALESCED.fetch_add(1, Relaxed); return false; }
     }
-    if i.queue.len() >= MAX_QUEUED {
+    if i.queue.len() >= MAX_QUEUED.load(Relaxed) {
         if i.queue.back().map_or(false, |t| t.mask == IN_Q_OVERFLOW) { return false; }
+        EV_OVERFLOW.fetch_add(1, Relaxed);
         i.bytes += 16;
         i.queue.push_back(Ev { wd: -1, mask: IN_Q_OVERFLOW, cookie: 0, name: Vec::new() });
         i.seq += 1;
         return true;
     }
+    EV_QUEUED.fetch_add(1, Relaxed);
     i.bytes += ev_len(&ev);
     i.queue.push_back(ev);
     i.seq += 1;
@@ -139,10 +176,13 @@ fn ev_len(e: &Ev) -> usize { 16 + name_len(&e.name) }
 // ── instances ────────────────────────────────────────────────────────────────
 
 /// Create the instance for description `inst`. False at the instance limit.
-pub fn create(inst: u32) -> bool {
+pub fn create(inst: u32, chain: &[UKey]) -> bool {
     let mut st = STATE.lock();
     if st.insts.len() >= MAX_INSTANCES { return false; }
-    st.insts.insert(inst, Instance { next_wd: 1, queue: VecDeque::new(), bytes: 0, seq: 0, watches: Vec::new() });
+    let max = MAX_USER_INST.load(Relaxed);
+    if chain.iter().any(|k| st.uc.get(k).map_or(0, |e| e.0) >= max) { return false; }
+    uc_adj(&mut st.uc, chain, 1, 0);
+    st.insts.insert(inst, Instance { next_wd: 1, queue: VecDeque::new(), bytes: 0, seq: 0, watches: Vec::new(), charge: chain.to_vec() });
     true
 }
 
@@ -154,6 +194,7 @@ pub fn released(inst: u32) {
         for w in &i.watches { index_del(&mut st, inst, w.wd, w.hash); }
         st.nwatches -= n;
         ARMED.fetch_sub(n as u32, Relaxed);
+        uc_adj(&mut st.uc, &i.charge, -1, -(n as isize));
     }
 }
 
@@ -170,7 +211,9 @@ pub fn add(inst: u32, path: &[u8], mask: u32, ino_key: u64) -> Result<i32, i32> 
         w.mask = if mask & IN_MASK_ADD != 0 { w.mask | ev_mask } else { ev_mask };
         return Ok(w.wd);
     }
-    if st.nwatches >= MAX_WATCHES { return Err(-28); }
+    let maxw = MAX_USER_WATCH.load(Relaxed);
+    if i.charge.iter().any(|k| st.uc.get(k).map_or(0, |e| e.1) >= maxw) { return Err(-28); }
+    uc_adj(&mut st.uc, &i.charge, 0, 1);
     // Cyclic wd allocation that skips live descriptors.
     let mut wd = i.next_wd;
     while i.watches.iter().any(|w| w.wd == wd) { wd = if wd == i32::MAX { 1 } else { wd + 1 }; }
@@ -193,9 +236,11 @@ pub fn rm(inst: u32, wd: i32) -> Result<(), i32> {
         let p = match i.watches.iter().position(|w| w.wd == wd) { Some(p) => p, None => return Err(-22) };
         let w = i.watches.remove(p);
         push(i, Ev { wd, mask: IN_IGNORED, cookie: 0, name: Vec::new() });
+        let ch = i.charge.clone();
         index_del(st, inst, wd, w.hash);
         st.nwatches -= 1;
         ARMED.fetch_sub(1, Relaxed);
+        uc_adj(&mut st.uc, &ch, 0, -1);
         k = key(inst);
     }
     wake(&[k]);
@@ -253,7 +298,7 @@ pub fn dirent(parent: &[u8], name: &[u8], mask: u32, cookie: u32) {
         let mut st = STATE.lock();
         let st = &mut *st;
         let list = match st.by_path.get(&h) { Some(l) => l.clone(), None => return };
-        let mut gone: Vec<(u32, i32, u64)> = Vec::new();
+        let mut gone: Vec<(u32, i32, u64, Vec<UKey>)> = Vec::new();
         for (inst, wd) in list {
             let i = match st.insts.get_mut(&inst) { Some(i) => i, None => continue };
             let w = match i.watches.iter().find(|w| w.wd == wd) { Some(w) => w, None => continue };
@@ -264,14 +309,14 @@ pub fn dirent(parent: &[u8], name: &[u8], mask: u32, cookie: u32) {
             if oneshot {
                 i.watches.retain(|w| w.wd != wd);
                 push(i, Ev { wd, mask: IN_IGNORED, cookie: 0, name: Vec::new() });
-                gone.push((inst, wd, hh));
+                gone.push((inst, wd, hh, i.charge.clone()));
             }
             if changed || oneshot {
                 let k = key(inst);
                 if nk < keys.len() { keys[nk] = k; nk += 1; } else { more.push(k); }
             }
         }
-        for (inst, wd, hh) in gone { index_del(st, inst, wd, hh); st.nwatches -= 1; ARMED.fetch_sub(1, Relaxed); }
+        for (inst, wd, hh, ch) in gone { index_del(st, inst, wd, hh); st.nwatches -= 1; ARMED.fetch_sub(1, Relaxed); uc_adj(&mut st.uc, &ch, 0, -1); }
     }
     wake(&keys[..nk]);
     wake(&more);
@@ -295,9 +340,11 @@ pub fn dir_removed(path: &[u8]) {
             if w.mask & IN_DELETE_SELF != 0 { push(i, Ev { wd, mask: IN_DELETE_SELF | IN_ISDIR, cookie: 0, name: Vec::new() }); }
             push(i, Ev { wd, mask: IN_IGNORED, cookie: 0, name: Vec::new() });
             keys.push(key(inst));
+            let ch = i.charge.clone();
             index_del(st, inst, wd, h);
             st.nwatches -= 1;
             ARMED.fetch_sub(1, Relaxed);
+            uc_adj(&mut st.uc, &ch, 0, -1);
         }
     }
     wake(&keys);

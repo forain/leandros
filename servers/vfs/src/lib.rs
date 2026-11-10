@@ -206,7 +206,7 @@ pub const VFS_SIGNALFD_CREATE: u64 = 0x4A;
 pub const VFS_INOTIFY_CREATE:  u64 = 0x4B;
 /// inotify_add_watch(fd, path_ptr, mask) → watch descriptor (≥1) or -errno.
 pub const VFS_INOTIFY_ADD:     u64 = 0x4C;
-/// inotify_rm_watch(fd, wd) → 0 or -errno (only sent when `vfs.inotify=1`).
+/// inotify_rm_watch(fd, wd) → 0 or -errno (only sent unless `vfs.inotify=0`).
 pub const VFS_INOTIFY_RM:      u64 = 0x53;
 /// utimensat: `VFS_UTIMENS(path_ptr, atime_sec, atime_nsec, mtime_sec,
 /// mtime_nsec, flags)` / `VFS_LUTIMENS` (final symlink not followed) /
@@ -2076,8 +2076,8 @@ fn signalfd_wake_tag() -> u64 { sched::signal_wake_tag(sched::current_tgid()) }
 /// The tag of an inotify instance's poll answer: its exact key's bit.
 fn inotify_wake_tag(inst: u32) -> u64 { sched::poll_key_bit(inotify::key(inst)) }
 
-/// True when `vfs.inotify=1` is on the kernel command line. The kernel's
-/// inotify syscalls take the real path only then; otherwise the old silent
+/// True unless `vfs.inotify=0` is on the kernel command line. The kernel's
+/// inotify syscalls take the real path then; with the opt-out the old silent
 /// stub (valid fd, fake wds, no events) stays byte for byte.
 pub fn inotify_enabled() -> bool {
     let c = *KERNEL_CMDLINE.lock();
@@ -7597,6 +7597,10 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
     // nr_open is the ceiling RLIMIT_NOFILE's hard limit can be raised to;
     // file-max the system-wide count of open file descriptions (`ofd`), and
     // file-nr those in use, Linux's "<allocated> 0 <max>".
+    if let Some(k) = inotify_sysctl(path) {
+        let p = write_u32(buf, 0, inotify::limit_get(k) as u32);
+        return Some(write_lit(buf, p, b"\n"));
+    }
     if path == b"/proc/sys/fs/nr_open" {
         let p = write_u32(buf, 0, NR_OPEN as u32);
         return Some(write_lit(buf, p, b"\n"));
@@ -9350,6 +9354,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if let Some(k) = inotify_sysctl(lookup_path) {
+            // Linux: 0644 root; a write needs CAP_SYS_ADMIN in the initial userns.
+            let write = flags & 0o3 != 0;
+            if write && !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+            match gen_proc_inotify(k, write) {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
         } else if let Some(k) = netctl_slot(sched::ns::netns_of(pid), lookup_path) {
             // Per-netns sysctl; writing needs CAP_NET_ADMIN over the netns owner.
             let write = flags & 0o3 != 0;
@@ -10301,6 +10313,24 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
                 let r = sched::ns::netctl_set(ns, k, &b[..n]);
                 return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
+            }
+            let inot_k = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                if e.in_use() && e.ephemeral() && e.path().starts_with(PROC_INOT_W) {
+                    Some((e.path()[PROC_INOT_W.len()] - b'0') as usize)
+                } else { None }
+            };
+            if let Some(k) = inot_k {
+                let n = count.min(15);
+                let mut b = [0u8; 15];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let mut s = &b[..n];
+                while let Some((&l, r)) = s.split_last() { if l == b'\n' || l == b' ' { s = r } else { break } }
+                if s.is_empty() || !s.iter().all(|c| c.is_ascii_digit()) { return err_reply(-22); }
+                let mut v = 0usize;
+                for &c in s { v = v.saturating_mul(10).saturating_add((c - b'0') as usize); }
+                return match inotify::limit_set(k, v) { Ok(()) => val_reply(count as u64), Err(e) => err_reply(e) };
             }
             let oom_tid = {
                 let tmp = TMP_FILES.lock();
@@ -12720,13 +12750,58 @@ fn handle_inotify_create(pid: u32, flags: u32) -> Message {
     let mut inst = 0;
     if real {
         if o == 0 { return err_reply(-23); }
-        if !inotify::create(o) { return err_reply(-24); }
+        if !inotify::create(o, &inotify_chain(pid)) { ofd::put(o); return err_reply(-24); }
         // The last put of this description must free the instance.
         ofd::mark_watched(o);
         inst = o;
     }
     tbl.fds.set(fd, FdEntry { kind: VnodeKind::Inotify { inst }, flags: stored, in_use: true, ofd: o });
     val_reply(fd as u64)
+}
+
+/// ucounts chain of `pid`: its (userns, kuid), then each ancestor namespace
+/// under the kuid that created the child (Linux `inc_ucount`).
+fn inotify_chain(pid: u32) -> Vec<inotify::UKey> {
+    let mut ns = sched::ns::userns_of(pid);
+    let mut k = sched::ruid_of(pid);
+    let mut v = Vec::new();
+    loop {
+        v.push((ns as u16, k));
+        if ns == 0 || v.len() > 33 { break; }
+        k = sched::ns::owner(ns).0;
+        ns = sched::ns::parent(ns);
+    }
+    v
+}
+
+/// `/proc/sys/fs/inotify/<name>` -> limit index.
+fn inotify_sysctl(path: &[u8]) -> Option<usize> {
+    match path.strip_prefix(b"/proc/sys/fs/inotify/")? {
+        b"max_queued_events" => Some(0), b"max_user_instances" => Some(1), b"max_user_watches" => Some(2),
+        b"events_queued" => Some(3), b"events_coalesced" => Some(4), b"events_overflow" => Some(5),
+        b"instances" => Some(6), b"watches" => Some(7), _ => None,
+    }
+}
+const PROC_INOT_W: &[u8] = b"/tmp/.proc_inotlim_";
+
+fn gen_proc_inotify(k: usize, write: bool) -> Option<VnodeKind> {
+    let mut data = [0u8; 12];
+    let l = oom_text(inotify::limit_get(k) as i32, &mut data);
+    let mut buf = [0u8; TMP_BUF_SIZE];
+    if !write {
+        buf[..l].copy_from_slice(&data[..l]);
+        return gen_proc_system_file(&buf, l);
+    }
+    let mut fake = [0u8; 32];
+    fake[..PROC_INOT_W.len()].copy_from_slice(PROC_INOT_W);
+    fake[PROC_INOT_W.len()] = b'0' + k as u8;
+    let n = PROC_INOT_W.len() + 1;
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, &fake[..n]);
+    if !tmp_fill_kernel(&mut tmp, idx, &data[..l]) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
 }
 
 /// Fake watch descriptors of the silent stub (`vfs.inotify=0`).
