@@ -16624,8 +16624,9 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
         match sched::ns::new_pidns(cur_pidns) { Ok(n) => Some(n), Err(e) => return e }
     } else { None };
     req.pidns = new_pid_ns.as_ref().map_or(0, |n| n.id());
-    let new_net = if flags & CLONE_NEWNET != 0 { match sched::ns::new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
-    let new_ipc = if flags & CLONE_NEWIPC != 0 { match sched::ns::new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let flat_owner = new_user.as_ref().map_or_else(sched::ns::current_userns, |n| n.id());
+    let new_net = if flags & CLONE_NEWNET != 0 { match sched::ns::new_flat(flat_owner) { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let new_ipc = if flags & CLONE_NEWIPC != 0 { match sched::ns::new_flat(flat_owner) { Ok(n) => Some(n), Err(e) => return e } } else { None };
     req.netns = new_net.as_ref().map_or(0, |n| n.id());
     req.ipcns = new_ipc.as_ref().map_or(0, |n| n.id());
 

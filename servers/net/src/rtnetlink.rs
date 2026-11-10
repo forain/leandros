@@ -402,7 +402,7 @@ pub fn ifconf(links: &[Link], cap: usize) -> Vec<u8> {
 #[cfg(not(test))]
 pub fn route_lookup(d: [u8; 4]) -> Option<RouteHit> {
     use smoltcp::wire::{IpAddress, Ipv4Address};
-    let sid = super::iface::route_select(IpAddress::Ipv4(Ipv4Address::from_bytes(&d)))?;
+    let sid = super::iface::route_select(0, IpAddress::Ipv4(Ipv4Address::from_bytes(&d)))?;
     let gw = super::iface::snapshot().into_iter().find(|s| s.id as u32 + 1 == sid as u32)
         .and_then(|s| match (s.addr, s.gateway) {
             (Some((a, p)), Some(g)) if !super::iface::IfCfg { addr: a, prefix: p, gateway: None }.on_link(d) => Some(g),

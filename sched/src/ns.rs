@@ -60,10 +60,33 @@ impl Drop for NsRef {
 fn put(mut id: NsId) {
     while id != 0 {
         if REFS[id as usize].fetch_sub(1, AcqRel) != 1 { return; }
-        // Last reference: the slot is free again; release the parent.
+        // Last reference: the slot is free again; release the parent (for a
+        // flat namespace, its owning user namespace).
+        if FLAT[id as usize].swap(0, AcqRel) != 0 {
+            let h = GONE_HOOK.load(Acquire);
+            if h != 0 {
+                // SAFETY: only `set_ns_gone_hook` stores here, always a `fn(NsId)`.
+                let f: fn(NsId) = unsafe { core::mem::transmute(h) };
+                f(id);
+            }
+        }
         id = PARENT[id as usize].load(Acquire);
     }
 }
+
+/// 1 for a live flat (net/ipc) namespace id; cleared when it is freed.
+static FLAT: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
+static GONE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register the callback run when the last reference to a flat (net/ipc)
+/// namespace drops. It may run in any context (possibly with the run queue
+/// held), so it must not block or take scheduler locks: record the id and
+/// reap later.
+pub fn set_ns_gone_hook(f: fn(NsId)) { GONE_HOOK.store(f as usize, Release); }
+
+/// Owning user namespace of a flat (net/ipc) namespace (0 = initial).
+/// Stored in `PARENT`, which for a flat id holds a reference on the owner.
+pub fn owner_userns(id: NsId) -> NsId { if id == 0 { 0 } else { PARENT[id as usize].load(Acquire) } }
 
 /// Create a user namespace owned by (`euid`, `egid`) as a child of `parent`.
 /// The returned reference is the caller's; clone it for each holder.
@@ -88,12 +111,16 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
     Err(-28)
 }
 
-/// Create a flat (parentless) namespace id: net or ipc. Errors: ENOSPC (28).
-pub fn new_flat() -> Result<NsRef, isize> {
+/// Create a flat namespace id (net or ipc) owned by user namespace `owner`;
+/// it holds a reference on the owner until freed. Errors: ENOSPC (28).
+pub fn new_flat(owner: NsId) -> Result<NsRef, isize> {
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
-            PARENT[id].store(0, Release);
+            let o = NsRef::get(owner);
+            PARENT[id].store(o.0, Release);
+            core::mem::forget(o);
             LEVEL[id].store(0, Release);
+            FLAT[id].store(1, Release);
             return Ok(NsRef(id as NsId));
         }
     }
@@ -112,8 +139,9 @@ pub fn ipcns_of(pid: u32) -> NsId {
 /// unshare(CLONE_NEWNET / CLONE_NEWIPC) for the calling thread: it moves
 /// into a fresh namespace of that kind. 0 or a negative errno.
 pub fn unshare_flat(net: bool, ipc: bool) -> isize {
-    let nn = if net { match new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
-    let ni = if ipc { match new_flat() { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let owner = current_userns();
+    let nn = if net { match new_flat(owner) { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let ni = if ipc { match new_flat(owner) { Ok(n) => Some(n), Err(e) => return e } } else { None };
     let pid = crate::current_pid();
     let (o1, o2) = {
         let mut rq = crate::RUN_QUEUE.lock();
