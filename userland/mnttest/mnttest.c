@@ -1250,6 +1250,89 @@ static int fdp_root_mntns(int m) {
     if (w != 1) { printf("  root mntns walk=%d\n", w); return 2; }
     return 0;
 }
+/* nsbindtask: per-thread namespace links (Go/netavark LockOSThread + bind of
+ * /proc/self/task/<tid>/ns/net onto an O_EXCL mode-0 file). */
+static volatile int tb_tid, tb_state;           /* state: 0 start, 1 ready, 2 quit */
+static volatile ino_t tb_ino;
+static const char *tb_self_bind;                /* thread binds thread-self itself */
+static volatile int tb_bind_rc;
+static void *tb_thread(void *a) {
+    (void)a;
+    struct stat st;
+    if (unshare(CLONE_NEWNET) < 0 || stat("/proc/thread-self/ns/net", &st) < 0) { tb_state = -1; return NULL; }
+    tb_ino = st.st_ino; tb_tid = (int)syscall(SYS_gettid);
+    if (tb_self_bind) {
+        tb_bind_rc = mount("/proc/thread-self/ns/net", tb_self_bind, "none", MS_BIND, "") < 0 ? errno : 0;
+    }
+    tb_state = 1;
+    while (tb_state == 1) usleep(1000);
+    return NULL;
+}
+static int nsfs_thread_selfbind(int mode) {
+    if (mode == 1 && unshare(CLONE_NEWNS) < 0) return 89;
+    mkdir("/run", 0755); mkdir("/run/netns", 0755);
+    if (mount("/run/netns", "/run/netns", "none", MS_BIND | MS_REC, NULL) < 0) return 90;
+    if (mount("", "/run/netns", NULL, MS_SHARED | MS_REC, NULL) < 0) return 91;
+    static char file[] = "/run/netns/netns-tb";
+    int cf = open(file, O_RDONLY | O_CREAT | O_EXCL, 0); if (cf < 0) return 92; close(cf);
+    tb_self_bind = file; tb_state = 0;
+    pthread_t th;
+    if (pthread_create(&th, NULL, tb_thread, NULL)) return 93;
+    for (int i = 0; i < 2000 && tb_state == 0; i++) usleep(1000);
+    int rc = tb_state != 1 ? 94 : 0;
+    if (!rc && tb_bind_rc) { printf("  thread-self bind errno=%d\n", tb_bind_rc); rc = 1; }
+    if (!rc) {
+        int fd = open(file, O_RDONLY); struct stat a;
+        if (fd < 0 || fstat(fd, &a) < 0 || a.st_ino != tb_ino) rc = 4;
+        if (fd >= 0) close(fd);
+        if (umount(file) < 0 && !rc) rc = 7;
+        if (unlink(file) < 0 && !rc) rc = 8;
+    }
+    tb_state = 2; pthread_join(th, NULL);
+    umount2("/run/netns", MNT_DETACH);
+    return rc;
+}
+static int nsfs_thread_bind(int mode) {
+    char file[64], src[96];
+    snprintf(file, sizeof file, "/tmp/nsfst.%d", (int)getpid());
+    if (mode == 1) {
+        if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+        int pf = open(file, O_RDONLY | O_CREAT | O_EXCL, 0); if (pf < 0) return 89; close(pf);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
+        wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
+    } else if (mode == 2 && unshare(CLONE_NEWNS) < 0) return 91;
+    struct stat lead;
+    if (stat("/proc/self/ns/net", &lead) < 0) return 92;
+    pthread_t th;
+    if (pthread_create(&th, NULL, tb_thread, NULL)) return 93;
+    for (int i = 0; i < 2000 && tb_state == 0; i++) usleep(1000);
+    if (tb_state != 1) return 94;
+    int rc = 0;
+    snprintf(src, sizeof src, "/proc/self/task/%d/ns/net", tb_tid);
+    struct stat ts, ls;
+    if (stat(src, &ts) < 0) { printf("  stat task ns errno=%d\n", errno); rc = 95; goto out; }
+    if (ts.st_ino != tb_ino || ts.st_ino == lead.st_ino) { rc = 96; goto out; }
+    snprintf(src, sizeof src, "/proc/%d/task/%d/ns/net", (int)getpid(), tb_tid);
+    if (stat(src, &ls) < 0 || ls.st_ino != tb_ino) { rc = 97; goto out; }
+    snprintf(src, sizeof src, "/proc/self/task/%d/ns/net", tb_tid);
+    /* podman: O_CREAT|O_EXCL, mode 0 */
+    if (mode != 1) { int cf = open(file, O_RDONLY | O_CREAT | O_EXCL, 0); if (cf < 0) { rc = 98; goto out; } close(cf); }
+    if (mount(src, file, "none", MS_BIND, NULL) < 0) { printf("  thread nsfs bind errno=%d\n", errno); rc = 1; goto out; }
+    int fd = open(file, O_RDONLY);
+    struct stat a;
+    if (fd < 0) { rc = 3; goto out_um; }
+    if (fstat(fd, &a) < 0 || a.st_ino != tb_ino) { rc = 4; close(fd); goto out_um; }
+    if (setns_(fd, CLONE_NEWNET) < 0) { rc = 5; close(fd); goto out_um; }
+    close(fd);
+    struct stat now;
+    if (stat("/proc/thread-self/ns/net", &now) < 0 || now.st_ino != tb_ino) rc = 6;
+out_um:
+    if (umount(file) < 0 && rc == 0) rc = 7;
+    if (unlink(file) < 0 && rc == 0) rc = 8;
+out:
+    tb_state = 2; pthread_join(th, NULL);
+    return rc;
+}
 /* nsfs bind in a mount namespace of its own; mode 0 root, 1 rootless
  * (userns+mntns), 2 root + a further unshare(NEWNS) after the bind */
 static int nsfs_in_mntns(int mode) {
@@ -1332,6 +1415,11 @@ static void fdpath_suite(void) {
     report("nsfs_bind_in_mntns_root", nn_in_child(nsfs_in_mntns, 0));
     report("nsfs_bind_in_userns_mntns", nn_in_child(nsfs_in_mntns, 1));
     report("nsfs_bind_in_mntns_then_unshare_newns", nn_in_child(nsfs_in_mntns, 2));
+    report("nsfs_thread_self_bind_run_netns", nn_in_child(nsfs_thread_selfbind, 0));
+    report("nsfs_thread_self_bind_run_netns_mntns", nn_in_child(nsfs_thread_selfbind, 1));
+    report("nsfs_thread_task_bind_root", nn_in_child(nsfs_thread_bind, 0));
+    report("nsfs_thread_task_bind_mntns", nn_in_child(nsfs_thread_bind, 2));
+    report("nsfs_thread_task_bind_userns_mntns", nn_in_child(nsfs_thread_bind, 1));
     /* an ns-0 nsfs bind is copied into new mount namespaces */
     int p[2], q[2];
     if (pipe(p) || pipe(q)) { report("nsfs_ns0_bind_copied_by_unshare", 0); return; }
