@@ -12951,6 +12951,17 @@ fn unix_sockaddr_backing(addr_ptr: usize, addrlen: usize) -> Result<Option<KPath
     if u16::from_ne_bytes([raw[0], raw[1]]) != AF_UNIX || raw[2] == 0 { return Ok(None); }
     let name = &raw[2..n];
     let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+    // connect("/proc/self/fd/N") where N is an O_PATH descriptor of the socket
+    // file itself (podman's attach connect): the node the descriptor names,
+    // by its backing path. The VFS only reopens such magic links by identity,
+    // which cannot name a socket node.
+    if let Some((fd, below)) = proc_own_fd(name) {
+        if below.is_empty() && fd < net_server::SOCK_FD_BASE {
+            if let Some(host) = fd_host_path(fd) {
+                if !host.ends_with(b" (deleted)") { return Ok(Some(KPath::raw(&host))); }
+            }
+        }
+    }
     Ok(Some(KPath::from_ns(resolve_ns(name)?)?))
 }
 
