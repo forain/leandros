@@ -131,6 +131,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
     if !test_clone_files_vfork_setns() { failures += 1; }
     if !test_clone_files_exec_unshares() { failures += 1; }
     if !test_clone_files_separate() { failures += 1; }
+    if !test_failing_syscall_odd_args() { failures += 1; }
 
     puts(b"--- forktest done ---\n\0".as_ptr());
     failures
@@ -825,4 +826,20 @@ unsafe fn test_clone_files_separate() -> bool {
     let fd = reap_code(pid as pid_t);
     let seen = fd > 0 && fcntl(fd, F_GETFD) >= 0;
     report(name, fd > 0 && !seen)
+}
+
+/// Regression for the pasta kernel-mode SEGV: a failing syscall whose argument
+/// words are not pointers (setns' nstype 0x40000000 is CLONE_NEWNET) must just
+/// fail, in the parent and in a child -- whatever kernel diagnostics look at
+/// the arguments (`sched.errtrace=forktest` makes this case exercise them).
+unsafe fn test_failing_syscall_odd_args() -> bool {
+    let name = b"failing_syscall_odd_args\0";
+    let r = rt::raw_syscall(NR_SETNS, [9999, CLONE_NEWNET_N, 0x4000_0000, 0, 0, 0]);
+    let pid = clone_plain(CLONE_FILES_FLAG);
+    if pid < 0 { return report(name, false); }
+    if pid == 0 {
+        let r2 = rt::raw_syscall(NR_SETNS, [9998, CLONE_NEWNET_N, 0x4000_0000, 0, 0, 0]);
+        _exit(if r2 == -9 { 0 } else { 1 });
+    }
+    report(name, r == -9 && reap_code(pid) == 0)
 }
