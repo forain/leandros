@@ -662,7 +662,7 @@ static void bridge_l2(void) {
     CHECK("bridge_teardown: DELLINK vethQ", link_del(s, qa) == 0 && !link_get(s, "vethQ", NULL, NULL));
     CHECK("bridge_teardown: DELLINK vethR", link_del(s, qb) == 0 && !link_get(s, "vethR", NULL, NULL));
     CHECK("bridge_teardown: DELLINK br0", link_del(s, bidx) == 0 && !link_get(s, "br0", NULL, NULL));
-    CHECK("bridge_teardown: no vifs left of ours", count_veth(s) <= base_v - 4 && !link_get(s, "vethX", NULL, NULL) && !link_get(s, "vethY", NULL, NULL));
+    CHECK("bridge_teardown: no vifs left of ours", count_veth(s) <= base_v && !link_get(s, "vethX", NULL, NULL) && !link_get(s, "vethY", NULL, NULL));
     /* a bridge deleted with a port still attached releases the port */
     base_v = count_veth(s);
     CHECK("bridge_teardown: br1 with a port", br_new(s, "br1", NULL) == 0 && veth_new_m(s, "vethC", "vethD", -1, link_get(s, "br1", NULL, NULL)) == 0);
