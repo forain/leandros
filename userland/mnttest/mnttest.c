@@ -1879,7 +1879,7 @@ static void opentree_suite(void) {
  * rootfs, open the target O_PATH, mount_setattr(fd, "", EMPTY_PATH|RECURSIVE),
  * then mount(NULL, "/proc/self/fd/N", MS_REC|MS_PRIVATE). */
 static int fb_seq(int mode) {
-    int isdir = mode & 1, disk = mode & 2, ro = mode & 4, pv = mode & 8;
+    int isdir = mode & 1, disk = mode & 2, pre = mode & 4, pv = mode & 8;
     const char *B = disk ? "/root/fb" : "/tmp/fb";
     char R[64], E[64], S[64], src[64], dst[64];
     mkdir("/root", 0700); mkdir(B, 0755);
@@ -1892,11 +1892,15 @@ static int fb_seq(int mode) {
            f = open(dst, O_CREAT | O_WRONLY, 0644); if (f < 0) return 90; close(f); }
     if (ot_userns() < 0) return 91;
     if (mount(R, R, NULL, MS_BIND | MS_REC, NULL) < 0) { printf("  rootfs bind errno=%d\n", errno); return 10; }
-    if (mount(src, dst, NULL, MS_BIND, NULL) < 0) { printf("  bind errno=%d\n", errno); return 11; }
-    if (ro && mount(NULL, dst, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) { printf("  remount errno=%d\n", errno); return 15; }
     if (pv) { if (chdir(R) < 0) return 16; }
-    int fd = open(pv ? (isdir ? "etc/d" : "etc/hosts") : dst, O_PATH | O_CLOEXEC | (isdir ? O_DIRECTORY : 0));
-    if (fd < 0) { printf("  open errno=%d\n", errno); return 12; }
+    int fd = -1;
+    if (pre) { fd = open(pv ? (isdir ? "etc/d" : "etc/hosts") : dst, O_PATH | O_CLOEXEC | (isdir ? O_DIRECTORY : 0));
+               if (fd < 0) { printf("  preopen errno=%d\n", errno); return 12; } }
+    if (pre) { char q[48]; snprintf(q, sizeof q, "/proc/self/fd/%d", fd);
+               if (mount(src, q, NULL, MS_BIND, NULL) < 0) { printf("  bind(fd) errno=%d\n", errno); return 11; } }
+    else if (mount(src, dst, NULL, MS_BIND, NULL) < 0) { printf("  bind errno=%d\n", errno); return 11; }
+    if (!pre) { fd = open(pv ? (isdir ? "etc/d" : "etc/hosts") : dst, O_PATH | O_CLOEXEC | (isdir ? O_DIRECTORY : 0));
+                if (fd < 0) { printf("  open errno=%d\n", errno); return 12; } }
     if (osetattr(fd, "", 0x1000 | OT_REC, 0, 0) < 0) { printf("  mount_setattr errno=%d\n", errno); return 13; }
     char p[48]; snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
     if (mount(NULL, p, NULL, MS_REC | MS_PRIVATE, NULL) < 0) { printf("  propagation errno=%d\n", errno); return 14; }
@@ -1905,7 +1909,7 @@ static int fb_seq(int mode) {
 }
 static int fb_m(int m) { return fb_seq(m); }
 static void fdbindprop_suite(void) {
-    static const char *nm[] = { "file_tmp", "dir_tmp", "file_disk", "dir_disk", "file_tmp_ro", "dir_tmp_ro", "file_disk_ro", "dir_disk_ro", "file_tmp_rel", "dir_tmp_rel", "file_disk_rel", "dir_disk_rel", "file_tmp_ro_rel", "dir_tmp_ro_rel", "file_disk_ro_rel", "dir_disk_ro_rel" };
+    static const char *nm[] = { "file_tmp", "dir_tmp", "file_disk", "dir_disk", "file_tmp_pre", "dir_tmp_pre", "file_disk_pre", "dir_disk_pre", "file_tmp_rel", "dir_tmp_rel", "file_disk_rel", "dir_disk_rel", "file_tmp_pre_rel", "dir_tmp_pre_rel", "file_disk_pre_rel", "dir_disk_pre_rel" };
     for (int m = 0; m < 16; m++) {
         char n[64]; snprintf(n, sizeof n, "fdbindprop_%s", nm[m]);
         report(n, nn_in_child(fb_m, m));
