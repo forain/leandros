@@ -97,6 +97,12 @@ fn put(mut id: NsId) {
         // owning user namespace (setns lane).
         let ou = OWNER_UNS[id as usize].swap(0, AcqRel);
         if ou != 0 { put(ou); }
+        let h = GONE_HOOK.load(Acquire);
+        if h != 0 {
+            // SAFETY: only `set_ns_gone_hook` stores here, always a `fn(NsId)`.
+            let f: fn(NsId) = unsafe { core::mem::transmute(h) };
+            f(id);
+        }
         id = PARENT[id as usize].load(Acquire);
     }
 }
@@ -180,6 +186,14 @@ static MNT_LIVE: AtomicU32 = AtomicU32::new(0);
 /// True while any non-initial mount namespace exists.
 #[inline]
 pub fn mnt_active() -> bool { MNT_LIVE.load(Relaxed) != 0 }
+
+static GONE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register the callback run when the last reference to a (non-mount)
+/// namespace id drops, for any kind: the id is free again. It can run in any
+/// context (possibly under the run queue), so it must not block or take
+/// scheduler locks: record the id and reap later.
+pub fn set_ns_gone_hook(f: fn(NsId)) { GONE_HOOK.store(f as usize, Release); }
 
 /// Owner user namespace recorded for namespace `id`.
 pub fn owner_user(id: NsId) -> NsId { if id == 0 { 0 } else { OWNER_USER[id as usize].load(Acquire) } }

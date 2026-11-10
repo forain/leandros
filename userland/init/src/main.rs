@@ -547,6 +547,16 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if mount(b"none\0".as_ptr(), b"/sys/fs/cgroup\0".as_ptr(), b"cgroup2\0".as_ptr(), 0,
              b"nsdelegate\0".as_ptr()) < 0 {
         write_str("WARNING: mounting cgroup2 on /sys/fs/cgroup failed\n");
+    } else {
+        // Enable every controller cgroupfs implements (cpu io memory pids) for
+        // children of the root and of user.slice, as systemd does, so a
+        // container runtime's cgroup gets pids.max and friends.
+        let ctl = b"+cpu +io +memory +pids";
+        if !cg_write(b"/sys/fs/cgroup/cgroup.subtree_control\0", ctl) {
+            write_str("WARNING: enabling cgroup controllers failed\n");
+        }
+        mkdir(b"/sys/fs/cgroup/user.slice\0".as_ptr(), 0o755);
+        cg_write(b"/sys/fs/cgroup/user.slice/cgroup.subtree_control\0", ctl);
     }
 
     // 4c. One XDG runtime directory per account, owned by it, before any login
@@ -2309,6 +2319,15 @@ unsafe fn copy_file(src: &[u8], dst: &[u8]) -> bool {
     close(fd_in);
     close(fd_out);
     true
+}
+
+/// Write `data` to the (NUL-terminated) cgroupfs control file `path`.
+unsafe fn cg_write(path: &[u8], data: &[u8]) -> bool {
+    let fd = open(path.as_ptr(), O_WRONLY, 0);
+    if fd < 0 { return false; }
+    let r = write(fd, data.as_ptr(), data.len());
+    close(fd);
+    r == data.len() as isize
 }
 
 unsafe fn write_str(s: &str) {

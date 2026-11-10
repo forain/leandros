@@ -51,7 +51,7 @@ fn echo_request(seq: u16) -> [u8; 24] {
 /// since the previous call. Then sends the next echo request.
 pub fn probe(dest: [u8; 4]) -> bool {
     let ip = IpAddress::Ipv4(Ipv4Address::new(dest[0], dest[1], dest[2], dest[3]));
-    let sid = match iface::route_select(ip) { Some(s) if s != iface::LO => s, _ => return false };
+    let sid = match iface::route_select(0, ip) { Some(s) if s != iface::LO => s, _ => return false };
     let mut pg = PROBE.lock();
     if let Some(p) = pg.as_ref() {
         if p.sid != sid {
