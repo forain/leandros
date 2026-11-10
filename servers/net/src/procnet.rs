@@ -140,6 +140,13 @@ fn nic(w: &mut Out) {
     });
     let _ = writeln!(w);
     let _ = writeln!(w, "fwd: conntrack {}", super::fwd::ct_len());
+    {
+        let mut ports = alloc::vec::Vec::new();
+        super::fwd::live_tcp_nat_ports(&mut ports);
+        let _ = write!(w, "fwd_nat_tcp:");
+        for p in ports { let _ = write!(w, " {}", p); }
+        let _ = writeln!(w);
+    }
     let _ = writeln!(w, "netd: passes {} max_rx_per_pass {} wakes tagged {} broadcast {} rx_irq {} virtio_rx_irqs {} tcp_rx_buf {} netctl_wakes {}",
                      NETD_PASSES.load(Ordering::Relaxed), NETD_MAX_RX.load(Ordering::Relaxed),
                      NETD_TAG_WAKES.load(Ordering::Relaxed), NETD_BCAST_WAKES.load(Ordering::Relaxed),

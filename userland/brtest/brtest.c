@@ -751,6 +751,7 @@ static void bridge_l2(void) {
     CHECK("bridge_l2: duplicate br0 is EEXIST", br_new(s, "br0", NULL) == EEXIST);
     /* host listener on 0.0.0.0:7778, reached through the bridge address */
     int hl = socket(AF_INET, SOCK_STREAM, 0);
+    { int one = 1; setsockopt(hl, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); }
     struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7778) };
     CHECK("bridge_l2: host wildcard listener", !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
     /* netns A and B, host ends enslaved at create time */
@@ -941,16 +942,28 @@ static int http_get(const char *hp) {
     close(fd);
     return ok;
 }
-/* First port of the NAT range (61000..64999) a host bind() cannot take; 0 if all bind. */
+/* First live TCP NAT port the kernel reports (/proc/net/nic "fwd_nat_tcp:"); 0 if none.
+ * Asked of the kernel, not probed with bind(): TIME_WAIT ports from earlier cases or
+ * suites are not NAT-held and must not count. */
 static int nat_scan(void) {
-    for (int p = 61000; p < 65000; p++) {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(p) };
-        int r = bind(fd, (struct sockaddr *)&a, sizeof a), e = errno;
-        close(fd);
-        if (r && e == EADDRINUSE) return p;
+    FILE *f = fopen("/proc/net/nic", "r");
+    if (!f) return 0;
+    char line[1024]; int port = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "fwd_nat_tcp:", 12)) continue;
+        port = atoi(line + 12);
+        break;
     }
-    return 0;
+    fclose(f);
+    return port;
+}
+/* A host bind() to `p` must fail with EADDRINUSE. */
+static int nat_inuse(int p) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(p) };
+    int r = bind(fd, (struct sockaddr *)&a, sizeof a), e = errno;
+    close(fd);
+    return r && e == EADDRINUSE;
 }
 static int nat_bindable(int p) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1025,6 +1038,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     int hl = -1;
     if (mode == 6 && g_early_listen) {
         hl = socket(AF_INET, SOCK_STREAM, 0);
+    { int one = 1; setsockopt(hl, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); }
         struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7779) };
         snprintf(msg, sizeof msg, "%s: host wildcard listener on 7779 (before br0)", name);
         CHECK(msg, !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
@@ -1039,6 +1053,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     g_fwd_mode = mode; g_fwd_expect = ipfwd;
     if (mode == 6 && !g_early_listen) {
         hl = socket(AF_INET, SOCK_STREAM, 0);
+    { int one = 1; setsockopt(hl, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); }
         struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7779) };
         snprintf(msg, sizeof msg, "%s: host wildcard listener on 7779", name);
         CHECK(msg, !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
@@ -1066,7 +1081,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
         natp = nat_scan();
         if (mode == 4) {
             snprintf(msg, sizeof msg, "%s: host bind() to the in-use NAT port gets EADDRINUSE (port %d)", name, natp);
-            CHECK(msg, natp > 0);
+            CHECK(msg, natp > 0 && nat_inuse(natp));
             write(cc[1], &ch, 1);
         } else if (mode >= 8) {
             /* attacker B: own netns, veth with the victim's MAC, then act (6: delete it, 7: join br0 and get learned) */
@@ -1139,6 +1154,7 @@ static void fwd_reap(void) { fwd_case("fwd_reap", 5, 1); }
 static void hostlisten_not_in_ns(void) {
     int s = nl_sock();
     int hl = socket(AF_INET, SOCK_STREAM, 0);
+    { int one = 1; setsockopt(hl, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); }
     struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7781) };
     CHECK("hostlisten_not_in_ns: host wildcard listener on 7781",
           !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
