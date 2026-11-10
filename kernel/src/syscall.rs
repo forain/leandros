@@ -6235,6 +6235,8 @@ fn parse_shebang(buf: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
 /// (ENOSYS: the initrd) falls back to the stat mode bits.
 fn exec_permitted(kp: &KPath, pid: u32) -> isize {
     const X_OK: u64 = 1;
+    // MS_NOEXEC on the file's mount (mount namespaces other than the host's).
+    if kp.mnt_id != 0 && vfs::mnt::flags_of(sched::current_mntns(), kp.mnt_id) & vfs::mnt::MNT_NOEXEC != 0 { return -13; }
     let amsg = make_vfs_msg(vfs::VFS_ACCESS, &[kp.ptr() as u64, X_OK]);
     let ar = vfs_reply_val(&vfs::handle(&amsg, pid));
     // Only a refusal is an answer: a missing file (ENOENT) or a filesystem
@@ -9914,6 +9916,14 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
         if flags & !(MS_PROPAGATION | MS_REC) != 0 { return -22; }
         let target = match resolve_mount_target(target_ptr) { Ok(p) => p, Err(e) => return e };
         return vfs::mnt::set_propagation(mns, &target, flags) as isize;
+    }
+    // MS_REMOUNT (bind or not): the mount at the target gets exactly the new
+    // ro/nosuid/nodev/noexec set (clearing a locked flag is EPERM); fds opened
+    // read-write before keep working.
+    if flags & MS_REMOUNT != 0 && flags & MS_MOVE == 0 {
+        let target = match resolve_mount_target(target_ptr) { Ok(p) => p, Err(e) => return e };
+        let set = (flags & 0x0f) as u8;
+        return match vfs::mnt::setattr(mns, &target, set, !set & 0x0f, 0, flags & MS_REC != 0) { Ok(()) => 0, Err(e) => e as isize };
     }
     if flags & (MS_REMOUNT | MS_MOVE) != 0 || (flags & MS_PROPAGATION != 0 && flags & MS_BIND == 0) { return -22; }
     let target = match mount_target_kpath(target_ptr) { Ok(p) => p, Err(e) => return e };
