@@ -263,14 +263,14 @@ static int t_hierarchy(void) {
     CHECK(attach(cg, a, 0, -1) == 0);                                        /* strict parent */
     CHECK(ERR(attach(ch, b, F_MULTI, -1), EPERM));
     CHECK(ERR(attach(ch, b, F_OVERRIDE, -1), EPERM));
-    CHECK(detach(cg, -1) == 0);                                              /* non-multi: fd optional */
+    CHECK(detach(cg, 0) == 0);                                              /* non-multi: fd optional */
     CHECK(attach(cg, a, F_OVERRIDE, -1) == 0);
     CHECK(attach(ch, b, F_OVERRIDE, -1) == 0);
     CHECK(attach(cg, b, F_OVERRIDE, -1) == 0);                               /* single prog replaced */
     uint32_t ids[4], cnt;
     CHECK(query(cg, 0, ids, 4, &cnt, NULL) == 0 && cnt == 1);
-    CHECK(detach(ch, -1) == 0 && detach(cg, -1) == 0);
-    CHECK(ERR(detach(cg, -1), ENOENT));
+    CHECK(detach(ch, 0) == 0 && detach(cg, 0) == 0);
+    CHECK(ERR(detach(cg, 0), ENOENT));
     CHECK(attach(cg, a, F_MULTI, -1) == 0);
     CHECK(attach(ch, b, F_MULTI, -1) == 0);
     CHECK(query(ch, Q_EFFECTIVE, ids, 4, &cnt, NULL) == 0 && cnt == 2);     /* parent first, then child */
