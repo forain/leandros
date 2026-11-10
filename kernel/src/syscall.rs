@@ -9379,6 +9379,31 @@ fn may_mount() -> bool {
     sched::caps::ns_capable_in(sched::ns::owner_user(mntns), 21)
 }
 
+/// The namespace path a mount(2) propagation target names. A target that is
+/// exactly `/proc/self/fd/N` (or `/proc/<own pid>/fd/N`) follows the magic
+/// link, as on Linux: it is the directory the descriptor was opened on, in the
+/// caller's mount namespace (crun's make-private parent walk opens the rootfs
+/// O_PATH and mounts on the link). The VFS answers with the backing path, so
+/// it is mapped back through the caller's tree; a backing path with no name in
+/// the namespace (the hidden superblock space) never leaks out: EINVAL.
+fn resolve_mount_target(target_ptr: usize) -> Result<Vec<u8>, isize> {
+    let p = resolve_user_path(target_ptr)?;
+    if let Some((fd, b"")) = proc_own_fd(p.ns_bytes()) {
+        let host = fd_host_path(fd).ok_or(-22isize)?;
+        let mns = sched::current_mntns();
+        let ns = if mns != 0 {
+            vfs::mnt::reverse(mns, &host, 0)
+        } else {
+            Some(host)
+        };
+        return match ns {
+            Some(n) if !vfs::mnt::is_sb_path(&n) => Ok(n),
+            _ => Err(-22),
+        };
+    }
+    Ok(p.ns_bytes().to_vec())
+}
+
 fn sys_mount(
     source_ptr: usize,
     target_ptr: usize,
@@ -9411,8 +9436,8 @@ fn sys_mount(
     // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC):
     // only the mount's propagation state changes; source/fstype are ignored.
     if flags & (vfs::mnt::MS_UNBINDABLE | vfs::mnt::MS_PRIVATE | vfs::mnt::MS_SLAVE | vfs::mnt::MS_SHARED) != 0 {
-        let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
-        return vfs::mnt::set_propagation(sched::current_mntns(), target_path.ns_bytes(), flags) as isize;
+        let target = match resolve_mount_target(target_ptr) { Ok(p) => p, Err(e) => return e };
+        return vfs::mnt::set_propagation(sched::current_mntns(), &target, flags) as isize;
     }
     if flags & MS_REMOUNT != 0 {
         let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
@@ -9704,8 +9729,8 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
     // MS_REC|MS_PRIVATE / MS_SLAVE on "/" first.
     if flags & MS_PROPAGATION != 0 {
         if flags & !(MS_PROPAGATION | MS_REC) != 0 { return -22; }
-        let target = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
-        return vfs::mnt::set_propagation(mns, target.ns_bytes(), flags) as isize;
+        let target = match resolve_mount_target(target_ptr) { Ok(p) => p, Err(e) => return e };
+        return vfs::mnt::set_propagation(mns, &target, flags) as isize;
     }
     if flags & (MS_REMOUNT | MS_MOVE | MS_PROPAGATION) != 0 { return -22; }
     let target = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
@@ -9713,6 +9738,20 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
     let tdir = match kpath_is_dir(&target) { Ok(d) => d, Err(e) => return e };
     if flags & MS_BIND != 0 {
         let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
+        // Binding /proc/<pid>/ns/<name> onto a file keeps that namespace
+        // alive: the mount's superblock owns the reference.
+        match vfs::nsfs_bind_source(src.ns_bytes(), current_pid()) {
+            Err(e) => return e,
+            Ok(Some(synth)) => {
+                let put = |s: &[u8]| if let Some((_, id)) = vfs::alias::ns_src(s) { sched::ns::put_raw(id); };
+                if tdir { put(&synth); return -20; }
+                return match vfs::mnt::bind_nsfs(mns, &synth, &tns) {
+                    Ok(_) => 0,
+                    Err(e) => { put(&synth); e as isize }
+                };
+            }
+            Ok(None) => {}
+        }
         let sdir = match kpath_is_dir(&src) { Ok(d) => d, Err(e) => return e };
         if sdir != tdir { return -20; } // ENOTDIR (both directions, as Linux graft_tree)
         return match vfs::mnt::bind(mns, src.ns_bytes(), &tns, flags & MS_REC != 0) { Ok(_) => 0, Err(e) => e as isize };

@@ -6743,8 +6743,20 @@ pub(crate) fn ns0_snapshot() -> Vec<mnt::Mnt> {
     for (p, fs) in [(&b"/proc"[..], "proc"), (b"/dev", "devtmpfs"), (b"/dev/pts", "devpts"), (b"/sys", "sysfs")] {
         raw.push((p.to_vec(), p.to_vec(), fs, fs.as_bytes().to_vec(), mnt::MNT_RELATIME));
     }
+    let mut nssb: Vec<(Vec<u8>, mnt::SbId)> = Vec::new();
     for (mp, src, fs, dev) in alias::entries() {
+        // A bound nsfs file: the copy takes its own namespace reference,
+        // owned by a superblock of its own (dropped with the last copy).
+        let sb = match alias::ns_src(&src) {
+            Some((_, id)) => { sched::ns::hold_raw(id); mnt::nsfs_sb_new(id) }
+            None => 0,
+        };
+        if sb != 0 { nssb.push((mp.clone(), sb)); }
         raw.push((mp, src, fs, dev, mnt::MNT_NOSUID | mnt::MNT_RELATIME));
+    }
+    // Self-binds (`mount --bind /run/netns /run/netns`) are mount points too.
+    for mp in alias::self_binds() {
+        raw.push((mp.clone(), mp, "none", b"none".to_vec(), mnt::MNT_NOSUID | mnt::MNT_RELATIME));
     }
     // Parents: the deepest earlier-or-equal mountpoint covering ours (the
     // root first, so "/" is its own tree root and later duplicates overmount).
@@ -6763,7 +6775,8 @@ pub(crate) fn ns0_snapshot() -> Vec<mnt::Mnt> {
         };
         let pg = mnt::ns0_prop(&r.0);
         let mut m = mnt::Mnt { id: ids[i], parent: pid, mp: rel.into_boxed_slice(), root: r.1.clone().into_boxed_slice(),
-            sb: mnt::ns0::tmpfs_inst_of(&r.1).or_else(|| devpts::inst_of_backing(&r.1)).unwrap_or(0), flags: r.4, locked: 0, group: pg.0, master: pg.1, unbindable: pg.2, fstype: r.2,
+            sb: mnt::ns0::tmpfs_inst_of(&r.1).or_else(|| devpts::inst_of_backing(&r.1))
+                .or_else(|| if alias::ns_src(&r.1).is_some() { nssb.iter().find(|e| e.0 == r.0).map(|e| e.1) } else { None }).unwrap_or(0), flags: r.4, locked: 0, group: pg.0, master: pg.1, unbindable: pg.2, fstype: r.2,
             device: r.3.clone().into_boxed_slice(), opts: Box::from(&b""[..]) };
         if pid == 0 && i != 0 { m.parent = ids[0]; m.mp = r.0.clone().into_boxed_slice(); }
         out.push(m);

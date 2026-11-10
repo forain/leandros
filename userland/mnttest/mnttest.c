@@ -1232,7 +1232,7 @@ static int fdp_userns_mntns(int m) {
     if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
     wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
     mkdir("/tmp/fdpu", 0755); mkdir("/tmp/fdpu/a", 0755); mkdir("/tmp/fdpu/a/b", 0755);
-    if (mount("/tmp/fdpu", "/tmp/fdpu", "none", MS_BIND, NULL) < 0) return 1;
+    if (mount("/tmp/fdpu", "/tmp/fdpu", "none", MS_BIND, NULL) < 0) { printf("  userns bind errno=%d\n", errno); return 1; }
     int w = crun_make_private_walk("/tmp/fdpu/a/b");
     if (w != 2) { printf("  userns walk=%d\n", w); return 2; }
     int fd = open("/", O_PATH | O_DIRECTORY);
@@ -1261,7 +1261,7 @@ static int nsfs_in_mntns(int mode) {
     struct stat orig, a, b;
     if (stat("/proc/self/ns/net", &orig) < 0) return 93;
     char file[64]; snprintf(file, sizeof file, "/tmp/nsfsm.%d", (int)getpid());
-    int fd = open(file, O_RDWR | O_CREAT, 0444); if (fd < 0) return 94; close(fd);
+    int fd = open(file, O_RDWR | O_CREAT, 0444); if (fd < 0) { printf("  creat errno=%d uid=%d\n", errno, (int)getuid()); return 94; } close(fd);
     if (mount("/proc/self/ns/net", file, "none", MS_BIND, NULL) < 0) { printf("  nsfs bind errno=%d\n", errno); return 1; }
     if (mode == 2 && unshare(CLONE_NEWNS) < 0) return 95;
     static char mi[16384];
