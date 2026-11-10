@@ -1403,6 +1403,28 @@ static int ib_ign(void)
 static int ub_init_ignores(void) { return in_init(ib_ign); }
 PCASE(init_ignores_inside, ub_init_ignores)
 
+/* Linux sig_ignored()/get_signal(): a BLOCKED signal to a pidns init is queued (sigwaitinfo gets it);
+ * a blocked SIG_DFL SIGTERM is dropped at dequeue once unblocked (SIGNAL_UNKILLABLE), init survives. */
+static int ib_blocked(void)
+{
+    sigset_t m, u; sigemptyset(&m); sigaddset(&m, SIGUSR1); sigaddset(&m, SIGTERM);
+    CHECK(sigprocmask(SIG_BLOCK, &m, 0) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) _exit(kill(1, SIGUSR1) == 0 && kill(1, SIGTERM) == 0 ? 0 : 1);
+    CHECK(child_ok(c) == 0);
+    sigemptyset(&u); sigaddset(&u, SIGUSR1);
+    struct timespec ts = { 3, 0 };
+    siginfo_t si;
+    CHECK(sigtimedwait(&u, &si, &ts) == SIGUSR1);
+    sigemptyset(&u); sigaddset(&u, SIGTERM);
+    CHECK(sigprocmask(SIG_UNBLOCK, &u, 0) == 0);   /* queued SIGTERM must not kill init */
+    usleep(50000);
+    return 0;
+}
+static int ub_init_blocked(void) { return in_init(ib_blocked); }
+PCASE(init_blocked_queued, ub_init_blocked)
+
 static int ub_init_kill_outside(void)
 {
     alarm(10);
@@ -3078,7 +3100,7 @@ static int run_userns_cases(void)
         { "wait_inside", t_wait_inside }, { "siginfo_pid", t_siginfo_pid }, { "siginfo_outside", t_siginfo_outside },
         { "pthread_in_pidns", t_pthread_in_pidns }, { "nested", t_nested },
         { "pidns_leak", t_pidns_leak }, { "fork_enomem", t_fork_enomem },
-        { "init_ignores_inside", t_init_ignores_inside }, { "init_kill_outside", t_init_kill_outside },
+        { "init_ignores_inside", t_init_ignores_inside }, { "init_blocked_queued", t_init_blocked_queued }, { "init_kill_outside", t_init_kill_outside },
         { "init_handler", t_init_handler }, { "orphan_to_init", t_orphan_to_init },
         { "init_death_kills", t_init_death_kills }, { "proc_magic_pidns", t_proc_magic_pidns },
         { "zap_leaderless", t_zap_leaderless }, { "zap_forkrace", t_zap_forkrace }, { "kill_minus1_scoped", t_kill_minus1_scoped },
