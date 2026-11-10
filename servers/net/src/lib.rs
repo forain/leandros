@@ -1740,7 +1740,8 @@ fn is_loopback_addr(addr: IpAddress) -> bool { iface::is_loopback(addr) }
 
 /// The NIC stack whose interface holds `ip` now. One stack lock at a time.
 fn stack_holding(ns: u16, ip: IpAddress) -> Option<Sid> {
-    iface::nic_sids().chain(vif::ns_sids_dyn(ns)).find(|&sid| match *stack_for(sid) {
+    let nics: alloc::vec::Vec<Sid> = if ns == 0 { iface::nic_sids().collect() } else { alloc::vec::Vec::new() };
+    nics.into_iter().chain(vif::ns_sids_dyn(ns)).find(|&sid| match *stack_for(sid) {
         Some(ref s) => s.interface.ip_addrs().iter().any(|c| c.address() == ip),
         None => false,
     })
@@ -3202,6 +3203,15 @@ fn init_nic(nif: drivers::netdev::Netif) {
 /// Stand up the loopback stack. Unconditional, unlike the NICs': 127.0.0.1 has
 /// to work on a guest with no network device at all.
 fn init_loopback() {
+    *stack_for(LO) = Some(make_loopback_stack());
+    extern "C" { fn arch_serial_putc(b: u8); }
+    let msg = b"[NET] Loopback interface 127.0.0.1/8 up\r\n";
+    for &b in msg { unsafe { arch_serial_putc(b); } }
+}
+
+/// A fresh loopback stack: 127.0.0.1/8 on a `LoopDev`. netns 0's `LO` and
+/// every other netns's lo (`vif::set_lo`) are built the same way.
+pub(crate) fn make_loopback_stack() -> NetStack {
     let mut device = syngate::LoopDev::new();
     // A locally-administered MAC, distinct from the NIC's. It is never seen off
     // the box; smoltcp needs one only so the interface can answer its own ARP
@@ -3219,7 +3229,7 @@ fn init_loopback() {
     // No default route on purpose: 127.0.0.0/8 is on-link here, and nothing
     // else may ever leave through this interface.
 
-    *stack_for(LO) = Some(NetStack {
+    NetStack {
         interface,
         socket_set: SocketSet::new(alloc::vec![]),
         dhcp_handle: None,
@@ -3228,11 +3238,7 @@ fn init_loopback() {
         icmp_peeked: alloc::collections::BTreeMap::new(),
         listens: alloc::vec::Vec::new(),
         inet_seq: alloc::collections::BTreeMap::new(),
-    });
-
-    extern "C" { fn arch_serial_putc(b: u8); }
-    let msg = b"[NET] Loopback interface 127.0.0.1/8 up\r\n";
-    for &b in msg { unsafe { arch_serial_putc(b); } }
+    }
 }
 
 /// What one stack's DHCP client reported during a pass.
@@ -3599,6 +3605,23 @@ pub fn net_daemon() -> ! {
                 // stack); the stack lock stays held, so nobody sees it gone.
                 if let Some(mut dev) = s.loopback_dev.take() {
                     let (changed, mask) = poll_stack(s, &mut dev, timestamp, &mut sigs[LO as usize], LO, &mut wake_keys);
+                    s.loopback_dev = Some(dev);
+                    readiness_changed |= changed;
+                    wake_mask |= mask;
+                    reap_orphans(s);
+                    if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
+                        next_poll = Some(next_poll.map_or(d, |n| n.min(d)));
+                    }
+                }
+            }
+        }
+
+        // Every other netns's loopback stack, polled the same way.
+        for sid in vif::all_dyn_sids() {
+            let mut st = stack_for(sid);
+            if let Some(ref mut s) = *st {
+                if let Some(mut dev) = s.loopback_dev.take() {
+                    let (changed, mask) = poll_stack(s, &mut dev, timestamp, &mut sigs[sid as usize], sid, &mut wake_keys);
                     s.loopback_dev = Some(dev);
                     readiness_changed |= changed;
                     wake_mask |= mask;
@@ -4029,7 +4052,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
             // A fresh network namespace has only a DOWN loopback: no address
             // can be bound but the wildcard.
-            if !ip.is_unspecified() && sock_netns(pid, slot) != 0 { return err_reply(-99); }
+            if !ip.is_unspecified() && sock_netns(pid, slot) != 0 && vif::lo_up_sid(sock_netns(pid, slot)).is_none() { return err_reply(-99); }
 
             // An address no interface owns is EADDRNOTAVAIL on Linux. INADDR_ANY
             // and 127.0.0.0/8 always bind; anything else must be an address the
@@ -4143,7 +4166,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 let server = ip.is_unspecified();
                 // A non-initial netns has only a down loopback: its UDP bind
                 // stays a pure table entry, no host-stack socket (unreachable).
-                if me.netns() == 0 {
+                if me.netns() == 0 || vif::lo_up_sid(me.netns()).is_some() {
                     if let Err(e) = udp_materialize(pid, slot, None, server) { return err_reply(e); }
                 }
             }
@@ -4251,16 +4274,17 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
         // and roam without being touched.
         // Registered first: a stack built after this point (wifi0, once
         // its MAC is known) adopts the listener (`listen::adopt`).
-        if tbl.socks[slot].netns() != 0 {
-            // A non-initial netns has no interface: the listener lives in
-            // its own port space only, no stack socket, unreachable from
-            // the host.
-            let lid = listen::new_lid();
+        let lns = tbl.socks[slot].netns();
+        let lid = listen::new_lid();
+        if lns != 0 {
+            // A non-initial netns: the listener lives on its own lo stack, if
+            // that exists. With lo never brought up it is a table entry only
+            // (port space, nothing reachable), as on Linux.
+            for sid in listen::stacks_for(lns, local) { listen::create(sid, lid, local); }
             tbl.socks[slot].state = SockState::InetListening { lid, local };
             share_state(&mut *tbls, pid, slot);
             return ok_reply();
         }
-        let lid = listen::new_lid();
         listen::register(lid, local);
         let mut any = false;
         for sid in listen::stacks_for(tbl.socks[slot].netns(), local) { any |= listen::create(sid, lid, local); }
@@ -4342,7 +4366,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
             // The oldest completed connection on any stack: the NICs', then
             // loopback. `listen::accept` holds one stack lock at a time and
             // hands the connection over (its queue no longer names it).
-            let order = iface::nic_sids().chain(core::iter::once(LO));
+            let order = iface::nic_sids().chain(core::iter::once(LO)).chain(vif::all_dyn_sids());
             let Some((from, established)) = order
                 .filter_map(|sid| listen::accept(sid, lid).map(|h| (sid, h)))
                 .next()
@@ -4611,6 +4635,10 @@ fn no_route_err() -> i32 { if drivers::netdev::count() == 0 { -100 } else { -101
 /// The stack a UDP socket bound to `local` (if bound) and first sending to
 /// `dest` (if known) lives on (see `udp_materialize`).
 fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>) -> Result<Sid, i32> {
+    if ns != 0 {
+        // Its own lo is the only stack; down = no route.
+        return vif::lo_up_sid(ns).ok_or(-101);
+    }
     if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) { return Ok(LO); }
     if let Some(a) = local.filter(|a| !a.is_unspecified()) {
         if let Some(sid) = iface::holder_of(a) { return Ok(sid); }
@@ -4631,8 +4659,9 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     let ephemeral = alloc_ephemeral_port(&*tbls, &resv[..nresv]);
     let tbl = find_tbl(pid, &mut *tbls).ok_or(-9i32)?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return Err(-9); }
-    // Backstop: a socket of a non-initial netns never gets a host-stack socket.
-    if tbl.socks[slot].netns() != 0 { return Err(-101); }
+    // Backstop: a socket of a non-initial netns only ever lands on its own lo
+    // (`udp_stack`); with that down it fails here.
+    if tbl.socks[slot].netns() != 0 && vif::lo_up_sid(tbl.socks[slot].netns()).is_none() { return Err(-101); }
     let local_addr = match tbl.socks[slot].state {
         SockState::Unbound { .. } => None,
         SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
@@ -4648,7 +4677,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     };
     let sid = match udp_stack(tbl.socks[slot].netns(), local_addr, dest) {
         Ok(s) => s,
-        Err(_) if server => LO,
+        Err(_) if server && tbl.socks[slot].netns() == 0 => LO,
         Err(e) => return Err(e),
     };
     // Multicast and limited broadcast leave through IP_MULTICAST_IF's
@@ -4801,7 +4830,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
 
     let sa_family = match sched::uaccess::read_user::<u16>(addr_ptr) { Some(f) => f as usize, None => return err_reply(-14) };
     // A fresh network namespace has no routes and a DOWN loopback.
-    if (sa_family == AF_INET || sa_family == 10) && sock_netns(pid, slot) != 0 { return err_reply(-101); }
+    if sa_family == 10 && sock_netns(pid, slot) != 0 { return err_reply(-101); }
 
     // connect(AF_UNSPEC) on an AF_INET socket (it used to fall into the
     // AF_UNIX path below): see `inet_disconnect`.
@@ -4838,13 +4867,14 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
             // A port connect(AF_UNSPEC) gave up is replaced first.
             if let Err(e) = udp_rebind_port(pid, slot) { return err_reply(e); }
         }
-        let sid = match bound_addr.filter(|a| !a.is_unspecified() && !is_loopback_addr(*a))
+        let cns = sock_netns(pid, slot);
+        let sid = match bound_addr.filter(|a| cns == 0 && !a.is_unspecified() && !is_loopback_addr(*a))
             .and_then(iface::holder_of)
         {
             Some(sid) if !is_loopback_addr(remote_ip) => sid,
-            _ => match iface::route_select(sock_netns(pid, slot), remote_ip) {
+            _ => match iface::route_select(cns, remote_ip) {
                 Some(sid) => sid,
-                None => return err_reply(no_route_err()),
+                None => return err_reply(if cns != 0 { -101 } else { no_route_err() }),
             },
         };
 
@@ -5182,7 +5212,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
     // Gate on the SOCKET's own domain and captured netns, never on the user
     // sa_family (which a sibling thread can flip, or which can simply lie).
     // Folded into this read: one table lock per send.
-    if tbl.socks[slot].netns() != 0 {
+    if tbl.socks[slot].netns() != 0 && tbl.socks[slot].domain == 10 {
         let e = &tbl.socks[slot];
         let dom = if matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) { Some(2u8) }
                   else if e.domain == 2 || e.domain == 10 { Some(e.domain) } else { None };
@@ -5478,7 +5508,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
 
             // The ping socket lives on the stack its first destination routes
             // through, and stays there.
-            let sid = match iface::route_select(sock_netns(pid, slot), dest_ip) { Some(s) => s, None => return err_reply(no_route_err()) };
+            let sid = match iface::route_select(sock_netns(pid, slot), dest_ip) { Some(s) => s, None => return err_reply(if sock_netns(pid, slot) != 0 { -101 } else { no_route_err() }) };
             let mut stack = stack_for(sid);
             if stack.is_none() { return err_reply(-100); }
             let s = stack.as_mut().unwrap();
