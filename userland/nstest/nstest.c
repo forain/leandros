@@ -3394,7 +3394,7 @@ static void nsforge_detached_theft(void)
     mkdir("/tmp/nsforge_mp", 0755);
     mkdir("/tmp/nsforge_src", 0755);
     int tree = syscall(SYS_open_tree, AT_FDCWD, "/tmp/nsforge_src", 1 /*OPEN_TREE_CLONE*/ | 0x80000 /*CLOEXEC*/);
-    if (tree < 0) { check("nsforge_detached_theft_denied", 0); return; }
+    if (tree < 0) { printf("  open_tree errno %d\n", errno); check("nsforge_detached_theft_denied", 0); return; }
     pid_t c = fork();
     if (c == 0) {
         if (drop_to(1000)) _exit(2);
@@ -3413,6 +3413,7 @@ static void nsforge_detached_theft(void)
     }
     int st = 0; waitpid(c, &st, 0);
     int ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    if (!ok) printf("  theft child st=%d\n", st);
     /* The genuine holder can still attach its own tree. */
     long r = syscall(SYS_move_mount, tree, "", AT_FDCWD, "/tmp/nsforge_mp", 0x4);
     if (r != 0) { printf("  genuine move_mount: %d\n", errno); ok = 0; }
