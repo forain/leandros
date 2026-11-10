@@ -186,6 +186,7 @@ pub fn reverse_newest(ns: NsId, backing: &[u8]) -> Option<Vec<u8>> {
     let t = &g.get(&ns)?.mnts;
     let mut order: Vec<usize> = (0..t.len()).collect();
     order.sort_by_key(|&i| core::cmp::Reverse(t[i].id));
+    let order2 = order.clone();
     for i in order {
         let m = &t[i];
         if !under(backing, &m.root) { continue; }
@@ -194,8 +195,23 @@ pub fn reverse_newest(ns: NsId, backing: &[u8]) -> Option<Vec<u8>> {
         let cand = join(&mp, rest);
         if let Some(x) = walk(t, &cand) { if x.backing == backing { return Some(cand); } }
     }
+    // A descriptor opened before something was mounted on its object (crun
+    // opens the target O_PATH, binds onto /proc/self/fd/N, then sets the
+    // propagation / attributes through the same descriptor): its backing path
+    // names a covered object, so no mount round-trips to it. Linux follows the
+    // mount at the end of the magic link; do the same - the name of the
+    // mountpoint now resolves to the covering mount.
+    for &i in order2.iter() {
+        let m = &t[i];
+        if !under(backing, &m.root) { continue; }
+        let mp = ns_mountpoint(t, i);
+        let rest: &[u8] = if &*m.root == b"/" { backing } else { &backing[m.root.len()..] };
+        let cand = join(&mp, rest);
+        if let Some(x) = walk(t, &cand) { if x.ns_prefix_len == cand.len() && cand.len() > 1 { return Some(cand); } }
+    }
     None
 }
+
 
 /// Does the namespace have a tree (i.e. was it created through [`copy`])?
 pub fn has_tree(ns: NsId) -> bool { NS.lock().contains_key(&ns) }
