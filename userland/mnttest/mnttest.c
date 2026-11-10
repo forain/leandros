@@ -1180,6 +1180,155 @@ static void netns_suite(void) {
     umount2("/run/netns", MNT_DETACH); rmdir("/run/netns");
 }
 
+/* ---- lane mntfdpath: mount(2) on /proc/self/fd/N, crun's make-private walk,
+ * nsfs binds inside a non-initial mount namespace, binds copied by NEWNS ---- */
+static int mount_fd_private(int fd) {
+    char p[40]; snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    return mount(NULL, p, NULL, MS_PRIVATE, NULL);
+}
+/* crun make_parent_mount_private: open the rootfs O_PATH and mount MS_PRIVATE on
+ * its /proc/self/fd link; on EINVAL walk to ".." until a mount point accepts.
+ * Returns the number of steps taken, -1 if the walk never succeeds. */
+static int crun_make_private_walk(const char *rootfs) {
+    int fd = open(rootfs, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -2;
+    for (int step = 0; step < 32; step++) {
+        errno = 0;
+        if (mount_fd_private(fd) == 0) { close(fd); return step; }
+        if (errno != EINVAL) { printf("  walk step %d errno=%d\n", step, errno); close(fd); return -1; }
+        int up = openat(fd, "..", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        close(fd);
+        if (up < 0) return -1;
+        fd = up;
+    }
+    close(fd); return -1;
+}
+static int fdp_direct(int m) {
+    (void)m;
+    mkdir("/tmp/fdp.m", 0755);
+    if (mount("/tmp/fdp.m", "/tmp/fdp.m", "none", MS_BIND, NULL) < 0) return 1;
+    int fd = open("/tmp/fdp.m", O_PATH | O_DIRECTORY);
+    if (fd < 0) return 2;
+    int r = mount_fd_private(fd);
+    close(fd);
+    if (r < 0) return 3;
+    mkdir("/tmp/fdp.m/a", 0755);
+    fd = open("/tmp/fdp.m/a", O_PATH | O_DIRECTORY);
+    if (fd < 0) return 4;
+    errno = 0; r = mount_fd_private(fd);
+    int e = errno; close(fd);
+    if (!(r < 0 && e == EINVAL)) return 5;
+    if (mount(NULL, "/proc/self/fd/999", NULL, MS_PRIVATE, NULL) == 0) return 6;
+    return 0;
+}
+static int fdp_walk(int m) {
+    (void)m;
+    mkdir("/tmp/fdp.m", 0755); mkdir("/tmp/fdp.m/a", 0755); mkdir("/tmp/fdp.m/a/b", 0755);
+    return crun_make_private_walk("/tmp/fdp.m/a/b") == 2 ? 0 : 1;
+}
+static int fdp_userns_mntns(int m) {
+    (void)m;
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
+    wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
+    mkdir("/tmp/fdpu", 0755); mkdir("/tmp/fdpu/a", 0755); mkdir("/tmp/fdpu/a/b", 0755);
+    if (mount("/tmp/fdpu", "/tmp/fdpu", "none", MS_BIND, NULL) < 0) return 1;
+    int w = crun_make_private_walk("/tmp/fdpu/a/b");
+    if (w != 2) { printf("  userns walk=%d\n", w); return 2; }
+    int fd = open("/", O_PATH | O_DIRECTORY);
+    if (fd < 0 || mount_fd_private(fd) < 0) return 3;
+    close(fd);
+    return 0;
+}
+static int fdp_root_mntns(int m) {
+    (void)m;
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    mkdir("/tmp/fdpr", 0755); mkdir("/tmp/fdpr/a", 0755);
+    if (mount("/tmp/fdpr", "/tmp/fdpr", "none", MS_BIND, NULL) < 0) return 1;
+    int w = crun_make_private_walk("/tmp/fdpr/a");
+    if (w != 1) { printf("  root mntns walk=%d\n", w); return 2; }
+    return 0;
+}
+/* nsfs bind in a mount namespace of its own; mode 0 root, 1 rootless
+ * (userns+mntns), 2 root + a further unshare(NEWNS) after the bind */
+static int nsfs_in_mntns(int mode) {
+    if (mode == 1) {
+        if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
+        wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");
+    } else if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (unshare(CLONE_NEWNET) < 0) return 92;
+    struct stat orig, a, b;
+    if (stat("/proc/self/ns/net", &orig) < 0) return 93;
+    char file[64]; snprintf(file, sizeof file, "/tmp/nsfsm.%d", (int)getpid());
+    int fd = open(file, O_RDWR | O_CREAT, 0444); if (fd < 0) return 94; close(fd);
+    if (mount("/proc/self/ns/net", file, "none", MS_BIND, NULL) < 0) { printf("  nsfs bind errno=%d\n", errno); return 1; }
+    if (mode == 2 && unshare(CLONE_NEWNS) < 0) return 95;
+    static char mi[16384];
+    if (slurp("/proc/self/mountinfo", mi, sizeof mi) <= 0 || !strstr(mi, file)) return 2;
+    if (unshare(CLONE_NEWNET) < 0) return 96;       /* the bind now holds the old netns alone */
+    fd = open(file, O_RDONLY);
+    if (fd < 0) return 3;
+    if (fstat(fd, &a) < 0 || a.st_ino != orig.st_ino) return 4;
+    if (setns_(fd, CLONE_NEWNET) < 0) return 5;
+    if (stat("/proc/self/ns/net", &b) < 0 || b.st_ino != orig.st_ino) return 6;
+    close(fd);
+    if (umount(file) < 0) return 7;
+    return 0;
+}
+static int selfbind_copied(int m) {
+    (void)m;
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    static char mi[16384];
+    if (slurp("/proc/self/mountinfo", mi, sizeof mi) <= 0) return 92;
+    if (!strstr(mi, " /tmp/fdp.m ")) return 1;
+    int fd = open("/tmp/fdp.m", O_PATH | O_DIRECTORY);
+    if (fd < 0 || mount_fd_private(fd) < 0) return 2;
+    if (mount("", "/tmp/fdp.m", NULL, MS_SHARED | MS_REC, NULL) < 0) return 3;
+    return 0;
+}
+static int nsfs_ns0_copied(int m) {
+    (void)m;
+    const char *file = "/tmp/nsfs0.file";
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    static char mi[16384];
+    if (slurp("/proc/self/mountinfo", mi, sizeof mi) <= 0 || !strstr(mi, file)) return 1;
+    if (unshare(CLONE_NEWNS) < 0) return 92;          /* and once more */
+    int r = nn_join_check(file);
+    return r ? 10 + r : 0;
+}
+static void fdpath_suite(void) {
+    report("mount_private_via_fd_link_root", nn_in_child(fdp_direct, 0));
+    report("crun_make_private_walk_root", nn_in_child(fdp_walk, 0));
+    report("crun_make_private_walk_mntns", nn_in_child(fdp_root_mntns, 0));
+    report("crun_make_private_walk_userns_mntns", nn_in_child(fdp_userns_mntns, 0));
+    report("selfbind_visible_after_unshare_newns", nn_in_child(selfbind_copied, 0));
+    umount2("/tmp/fdp.m", MNT_DETACH);
+    report("nsfs_bind_in_mntns_root", nn_in_child(nsfs_in_mntns, 0));
+    report("nsfs_bind_in_userns_mntns", nn_in_child(nsfs_in_mntns, 1));
+    report("nsfs_bind_in_mntns_then_unshare_newns", nn_in_child(nsfs_in_mntns, 2));
+    /* an ns-0 nsfs bind is copied into new mount namespaces */
+    int p[2], q[2];
+    if (pipe(p) || pipe(q)) { report("nsfs_ns0_bind_copied_by_unshare", 0); return; }
+    pid_t c = fork();
+    if (c == 0) {
+        char ch;
+        if (unshare(CLONE_NEWNET) < 0) _exit(1);
+        if (write(p[1], "x", 1) != 1) _exit(2);
+        if (read(q[0], &ch, 1) < 0) _exit(3);
+        _exit(0);
+    }
+    char ch; int ok = read(p[0], &ch, 1) == 1;
+    char src[64]; const char *file = "/tmp/nsfs0.file";
+    snprintf(src, sizeof src, "/proc/%d/ns/net", (int)c);
+    int fd = open(file, O_RDWR | O_CREAT, 0444); if (fd >= 0) close(fd);
+    int br = mount(src, file, "none", MS_BIND, NULL);
+    if (write(q[1], "x", 1) != 1) {}
+    int st = 0; waitpid(c, &st, 0);
+    report("nsfs_ns0_bind_copied_by_unshare", ok && br == 0 && nn_in_child(nsfs_ns0_copied, 0));
+    umount2(file, MNT_DETACH); unlink(file);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -1195,6 +1344,7 @@ int main(int argc, char **argv) {
     setns_mnt_suite();
     tmpfs_anywhere();
     netns_suite();
+    fdpath_suite();
     devpts_copies();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
