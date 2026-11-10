@@ -385,6 +385,22 @@ static int vec_cases(void)
     struct sockaddr_in me = { .sin_family = AF_INET, .sin_port = htons(4242) };
     CHECK("vec_udp_bind", bind(u, (struct sockaddr *)&me, sizeof me) == 0);
 
+    /* tap readv: one frame (the ARP request for 10.9.0.2) over two iovecs */
+    {
+        char peer_ok = 0;
+        int cs = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in peer = { .sin_family = AF_INET, .sin_port = htons(9999) };
+        peer.sin_addr.s_addr = inet_addr("10.9.0.2");
+        sendto(cs, "hello", 5, 0, (struct sockaddr *)&peer, sizeof peer);
+        struct pollfd p = { fd, POLLIN, 0 };
+        unsigned char h[14], r[100];
+        struct iovec iov[2] = { { h, sizeof h }, { r, sizeof r } };
+        ssize_t n = poll(&p, 1, 3000) == 1 ? readv(fd, iov, 2) : -1;
+        if (n == 42) memcpy(tapmac, r + 8, 6);
+        peer_ok = n == 42 && h[12] == 0x08 && h[13] == 0x06 && r[6] == 0 && r[7] == 1;
+        CHECK("vec_tap_readv_one_frame", peer_ok);
+        close(cs);
+    }
     /* tap writev of 3 iovecs (eth | ip | udp+payload) is ONE frame */
     {
         unsigned char f[14 + 20 + 8 + 4];
@@ -404,21 +420,6 @@ static int vec_cases(void)
         char rb[16];
         int g = poll(&p, 1, 1500) == 1 ? (int)recv(u, rb, sizeof rb, 0) : -1;
         CHECK("vec_tap_writev_one_frame", g == 4 && memcmp(rb, "pong", 4) == 0);
-    }
-    /* tap readv: one frame (the ARP request for 10.9.0.2) over two iovecs */
-    {
-        char peer_ok = 0;
-        int cs = socket(AF_INET, SOCK_DGRAM, 0);
-        struct sockaddr_in peer = { .sin_family = AF_INET, .sin_port = htons(9999) };
-        peer.sin_addr.s_addr = inet_addr("10.9.0.2");
-        sendto(cs, "hello", 5, 0, (struct sockaddr *)&peer, sizeof peer);
-        struct pollfd p = { fd, POLLIN, 0 };
-        unsigned char h[14], r[100];
-        struct iovec iov[2] = { { h, sizeof h }, { r, sizeof r } };
-        ssize_t n = poll(&p, 1, 3000) == 1 ? readv(fd, iov, 2) : -1;
-        peer_ok = n == 42 && h[12] == 0x08 && h[13] == 0x06 && r[6] == 0 && r[7] == 1;
-        CHECK("vec_tap_readv_one_frame", peer_ok);
-        close(cs);
     }
     close(u); close(fd);
 
