@@ -1229,7 +1229,6 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "veth_dellink")) veth_dellink();
     if (!only || !strcmp(only, "veth_naming")) veth_naming();
     if (!only || !strcmp(only, "veth_nsgone")) veth_nsgone();
-    if (!only || !strcmp(only, "stale_stack")) stale_stack();
     if (!only || !strcmp(only, "bridge_l2")) bridge_l2();
     if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
     if (!only || !strcmp(only, "fwd_ping")) fwd_ping();
@@ -1242,6 +1241,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "fwd_hostlisten")) fwd_hostlisten();
     if (!only || !strcmp(only, "fwd_hostlisten_early")) fwd_hostlisten_early();
     if (!only || !strcmp(only, "hostlisten_not_in_ns")) hostlisten_not_in_ns();
+    if (!only || !strcmp(only, "stale_stack")) stale_stack();
     printf("brtest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
