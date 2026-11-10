@@ -1445,6 +1445,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     if !test_seqpacket_short_path() { failures += 1; }
     if !test_seqpacket_short_path_forked() { failures += 1; }
     if !test_seqpacket_long_dir_via_procfd() { failures += 1; }
+    if !test_seqpacket_opath_sockfile_procfd() { failures += 1; }
     if !test_memfd_reopen_readonly() { failures += 1; }
     if !test_sendmsg_short_write_keeps_stream() { failures += 1; }
     if !test_send_on_pipe_enotsock() { failures += 1; }
@@ -2414,6 +2415,54 @@ unsafe fn test_seqpacket_long_dir_via_procfd() -> bool {
     if status != 0 { dbg1(b"[seqlong] child status %ld\n\0", status as i64); }
     close(ls); close(dfd);
     unlink(full.as_ptr()); rmdir(c3.as_ptr()); rmdir(c2.as_ptr()); rmdir(c1.as_ptr());
+    report(name, ok)
+}
+
+/// podman's attach connect: it opens the socket FILE itself with O_PATH and
+/// connects SOCK_SEQPACKET to `/proc/self/fd/<fd>` (no dir fd, no suffix).
+unsafe fn test_seqpacket_opath_sockfile_procfd() -> bool {
+    let name = b"seqpacket_opath_sockfile_procfd\0";
+    let path = b"/tmp/atsk_opath_sock\0";
+    unlink(path.as_ptr());
+    let mut ok = true;
+    let mut step = 0i64;
+    let mut check = |c: bool, s: &mut i64| { *s += 1; if !c && ok { dbg2(b"[seqopath] failed at step %ld errno=%ld\n\0", *s, get_errno() as i64); ok = false; } };
+    let ls = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    check(ls >= 0, &mut step); // 1
+    let (addr, alen) = sockaddr_un::from_path(&path[..path.len() - 1]);
+    check(raw_bind(ls, &addr, alen) == 0, &mut step); // 2
+    check(raw_listen(ls, 10) == 0, &mut step); // 3
+    let pid = fork();
+    if pid == 0 {
+        let pf = open(path.as_ptr(), 0x200000, 0);
+        let cs = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+        if pf < 0 || cs < 0 { exit(2); }
+        let mut pb2 = [0u8; 64];
+        let n2 = fd_attach_path(&mut pb2, pf);
+        // strip the "/attach" suffix: connect to /proc/self/fd/<fd> itself
+        let n2 = n2 - b"/attach".len();
+        let (a2, l2) = sockaddr_un::from_path(&pb2[..n2]);
+        if raw_connect(cs, &a2, l2) != 0 { exit(3); }
+        if raw_send(cs, b"ping".as_ptr(), 4, 0) != 4 { exit(4); }
+        let mut b = [0u8; 8];
+        if raw_recv(cs, b.as_mut_ptr(), 8, 0) != 4 || &b[..4] != b"pong" { exit(5); }
+        exit(0);
+    }
+    let asf = raw_accept(ls);
+    check(asf >= 0, &mut step); // 4
+    if asf >= 0 {
+        let mut b = [0u8; 8];
+        let rr = raw_recv(asf, b.as_mut_ptr(), 8, 0);
+        check(rr == 4 && &b[..4] == b"ping", &mut step); // 5
+        check(raw_send(asf, b"pong".as_ptr(), 4, 0) == 4, &mut step); // 6
+        close(asf);
+    }
+    let mut status = 0i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    check(status == 0, &mut step); // 7
+    if status != 0 { dbg1(b"[seqopath] child status %ld\n\0", status as i64); }
+    close(ls);
+    unlink(path.as_ptr());
     report(name, ok)
 }
 
