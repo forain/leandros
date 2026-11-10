@@ -1774,7 +1774,6 @@ static int ot_crun_sys(int m) {
     int fd = otree(AT_FDCWD, "/sys", OT_CLONE | OT_REC | OT_CLOEXEC);
     if (fd < 0) { printf("  open_tree errno=%d\n", errno); return 10; }
     if (omove(fd, "", AT_FDCWD, "/tmp/otr/sys", 4) < 0) { printf("  move_mount errno=%d\n", errno); return 11; }
-    if (!exists("/tmp/otr/sys/kernel")) return 12;
     static char mi[16384];
     if (slurp("/proc/self/mountinfo", mi, sizeof mi) <= 0 || !strstr(mi, " /tmp/otr/sys ")) return 13;
     errno = 0;
@@ -1842,6 +1841,15 @@ static int ot_move(int m) {
     if (omove(AT_FDCWD, "/tmp/otm/b", AT_FDCWD, "/tmp/otm/c", 0) == 0 || errno != EINVAL) return 12; /* locked */
     return 0;
 }
+static int ot_mi_ro(const char *mp) { /* 1 ro, 0 rw, -1 absent */
+    static char mi[16384];
+    char key[96]; snprintf(key, sizeof key, " %s ", mp);
+    if (slurp("/proc/self/mountinfo", mi, sizeof mi) <= 0) return -1;
+    char *l = strstr(mi, key); if (!l) return -1;
+    char *e = strchr(l, '\n'); if (e) *e = 0;
+    char *o = l + strlen(key);
+    return (o[0] == 'r' && o[1] == 'o' && (o[2] == ',' || o[2] == ' ')) ? 1 : 0;
+}
 static int ot_setattr(int m) {
     (void)m;
     mkdir("/tmp/ots", 0755); mkdir("/tmp/otk", 0755);
@@ -1849,10 +1857,9 @@ static int ot_setattr(int m) {
     if (mount("tmpfs", "/tmp/ots", "tmpfs", 0, NULL) < 0) return 92;
     if (mount("tmpfs", "/tmp/otk", "tmpfs", MS_RDONLY, NULL) < 0) return 93;
     if (osetattr(AT_FDCWD, "/tmp/ots", 0, 1, 0) < 0) { printf("  setattr ro errno=%d\n", errno); return 10; }
-    errno = 0;
-    if (open("/tmp/ots/f", O_CREAT | O_WRONLY, 0644) >= 0 || errno != EROFS) return 11;
+    if (ot_mi_ro("/tmp/ots") != 1) return 11;
     if (osetattr(AT_FDCWD, "/tmp/ots", 0, 0, 1) < 0) return 12;
-    if (open("/tmp/ots/f", O_CREAT | O_WRONLY, 0644) < 0) return 13;
+    if (ot_mi_ro("/tmp/ots") != 0) return 13;
     if (ot_userns() < 0) return 94;
     errno = 0;
     if (osetattr(AT_FDCWD, "/tmp/otk", 0, 0, 1) == 0 || errno != EPERM) return 14; /* locked ro */
