@@ -50,7 +50,11 @@ fn parse_num(b: &[u8], radix: u32) -> Option<u32> {
 
 /// Parse a mount option string (`newinstance,ptmxmode=0666,mode=0620,gid=5`)
 /// and register a new instance. ENOSPC when all instances are in use.
-pub fn create(data: &[u8]) -> Result<u32, isize> {
+///
+/// `to_k(is_gid, id)` maps the mounter's namespace-relative `uid=`/`gid=` to a
+/// kernel id (Linux parse_mount_options: make_kuid/make_kgid, EINVAL when
+/// unmapped).
+pub fn create(data: &[u8], to_k: &dyn Fn(bool, u32) -> Option<u32>) -> Result<u32, isize> {
     let mut o = Opts { mode: 0o600, ptmxmode: 0, uid: 0, gid: 0, set_uid: false, set_gid: false };
     for opt in data.split(|&c| c == b',') {
         let (k, v) = match opt.iter().position(|&c| c == b'=') {
@@ -60,8 +64,8 @@ pub fn create(data: &[u8]) -> Result<u32, isize> {
         match (k, v) {
             (b"mode", Some(v)) => o.mode = (parse_num(v, 8).ok_or(-22isize)? & 0o7777) as u16,
             (b"ptmxmode", Some(v)) => o.ptmxmode = (parse_num(v, 8).ok_or(-22isize)? & 0o7777) as u16,
-            (b"uid", Some(v)) => { o.uid = parse_num(v, 10).ok_or(-22isize)?; o.set_uid = true; }
-            (b"gid", Some(v)) => { o.gid = parse_num(v, 10).ok_or(-22isize)?; o.set_gid = true; }
+            (b"uid", Some(v)) => { o.uid = to_k(false, parse_num(v, 10).ok_or(-22isize)?).ok_or(-22isize)?; o.set_uid = true; }
+            (b"gid", Some(v)) => { o.gid = to_k(true, parse_num(v, 10).ok_or(-22isize)?).ok_or(-22isize)?; o.set_gid = true; }
             // newinstance, max=, nosuid, ...: accepted, nothing to record.
             _ => {}
         }

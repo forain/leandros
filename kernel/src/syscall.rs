@@ -9729,7 +9729,7 @@ fn sys_mount(
             let opts = if data_ptr == 0 { Vec::new() } else {
                 match read_user_short_str(data_ptr) { Ok(v) => v, Err(e) => return e }
             };
-            match vfs::devpts::create(&opts) { Ok(id) => vfs::devpts::backing(id), Err(e) => return e }
+            match vfs::devpts::create(&opts, &|g, v| sched::ns::to_k(g as usize, sched::ns::current_userns(), v)) { Ok(id) => vfs::devpts::backing(id), Err(e) => return e }
         } else { src };
         return match vfs::alias::add(mp, &src, fstype, &device) {
             Ok(()) => { if fstype == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
@@ -10122,7 +10122,7 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
         }
         b"devpts" => {
             let opts = if data_ptr == 0 { Vec::new() } else { match copy_user_str(data_ptr, 1024) { Ok(v) => v, Err(e) => return e } };
-            let id = match vfs::devpts::create(&opts) { Ok(id) => id, Err(e) => return e };
+            let id = match vfs::devpts::create(&opts, &|g, v| sched::ns::to_k(g as usize, sched::ns::current_userns(), v)) { Ok(id) => id, Err(e) => return e };
             let root = vfs::devpts::backing(id);
             return match vfs::mnt::add_mount(mns, &tns, &root, id, "devpts", b"devpts", mflags0) {
                 Ok(_) => 0,
