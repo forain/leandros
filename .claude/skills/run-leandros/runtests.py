@@ -207,6 +207,7 @@ SUITES = {
     "idmap": ["/bin/idmaptest"],
     # inotify (needs --cmdline vfs.inotify=1 for the real cases; without it only the kill-switch guard runs).
     "inotify": ["/bin/inotifytest"],
+    "inotifyforce": ["/bin/inotifytest force"],
     "cgroup": ["/bin/cgtest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
     "wifisim": ["host:wifisimtest.py"],
