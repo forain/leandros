@@ -1,9 +1,11 @@
 // netlinktest: NETLINK_ROUTE (RTM_GETLINK/RTM_GETADDR dumps), getifaddrs,
 // if_nameindex and the SIOCGIF* ioctls. nICEr (Firefox WebRTC) gathers its
 // local ICE candidates through exactly these.
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <ifaddrs.h>
+#include <linux/if_tun.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
