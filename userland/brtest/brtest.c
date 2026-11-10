@@ -886,6 +886,74 @@ static int dns_query(const char *srv) {
     close(u);
     return ok;
 }
+/* TCP helpers: DNS over TCP/53 (2-byte length prefix) and an HTTP GET (-h IP[:PORT]). */
+static const char *g_http; /* host:port for the HTTP GET, NULL = skip */
+static int tcp_conn(const char *ip, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct timeval tv = { 8, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(port) };
+    inet_pton(AF_INET, ip, &to.sin_addr);
+    if (connect(fd, (struct sockaddr *)&to, sizeof to)) { close(fd); return -1; }
+    return fd;
+}
+static int tcp_dns_c(const char *srv) {
+    int fd = tcp_conn(srv, 53);
+    if (fd < 0) return 0;
+    unsigned char q[] = { 0, 29, 0x4c, 0x45, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
+                          7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0, 0, 1, 0, 1 };
+    int ok = 0;
+    if (send(fd, q, sizeof q, 0) == (ssize_t)sizeof q) {
+        unsigned char rb[600]; int got = 0, want = 2;
+        while (got < want) {
+            ssize_t n = recv(fd, rb + got, sizeof rb - got, 0);
+            if (n <= 0) break;
+            got += n;
+            if (got >= 2) want = 2 + (rb[0] << 8 | rb[1]);
+        }
+        ok = got >= 14 && got >= want && rb[2] == 0x4c && rb[3] == 0x45 && (rb[4] & 0x80);
+    }
+    close(fd);
+    return ok;
+}
+static int http_get(const char *hp) {
+    char ip[64]; int port = 80;
+    snprintf(ip, sizeof ip, "%s", hp);
+    char *c = strchr(ip, ':');
+    if (c) { *c = 0; port = atoi(c + 1); }
+    int fd = tcp_conn(ip, port);
+    if (fd < 0) return 0;
+    char req[160];
+    int rl = snprintf(req, sizeof req, "GET / HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", ip);
+    char buf[2048]; int got = 0, ok = 0;
+    if (send(fd, req, rl, 0) == rl) {
+        ssize_t n;
+        while ((n = recv(fd, buf + got, sizeof buf - 1 - got, 0)) > 0 && got < (int)sizeof buf - 1) got += n;
+        buf[got] = 0;
+        ok = got >= 12 && !strncmp(buf, "HTTP/", 5);
+    }
+    close(fd);
+    return ok;
+}
+/* First port of the NAT range (61000..64999) a host bind() cannot take; 0 if all bind. */
+static int nat_scan(void) {
+    for (int p = 61000; p < 65000; p++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(p) };
+        int r = bind(fd, (struct sockaddr *)&a, sizeof a), e = errno;
+        close(fd);
+        if (r && e == EADDRINUSE) return p;
+    }
+    return 0;
+}
+static int nat_bindable(int p) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(p) };
+    int r = bind(fd, (struct sockaddr *)&a, sizeof a);
+    close(fd);
+    return r == 0;
+}
 static int fwd_body(void) {
     g_ip = "10.97.0.2";
     int s = nl_sock();
@@ -898,6 +966,20 @@ static int fwd_body(void) {
     if (rd_to(ctl[0], &ch) != 1) return 3;
     int ok;
     if (g_fwd_mode == 0) { char srv[64]; fwd_resolver(srv); ok = dns_query(srv); }
+    else if (g_fwd_mode == 2) {
+        char srv[64]; fwd_resolver(srv);
+        ok = tcp_dns_c(srv);
+        if (ok && g_http) ok = http_get(g_http);
+    }
+    else if (g_fwd_mode >= 4) { /* hold an established TCP flow open until released */
+        char srv[64]; fwd_resolver(srv);
+        int fd = tcp_conn(srv, 53);
+        if (fd < 0) return 9;
+        write(done_[1], &ch, 1);
+        rd_to(ctl[0], &ch);
+        close(fd);
+        ok = 1;
+    }
     else { char gw[32]; fwd_gateway(gw); ok = icmp_ping(gw); }
     return ok == g_fwd_expect ? 0 : 4 + ok;
 }
@@ -932,9 +1014,31 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     int rd = rd_to(dd[0], &ch);
     snprintf(msg, sizeof msg, "%s: netns configured eth0 + default via 10.97.0.1", name); CHECK(msg, rd == 1);
     if (rd == 1) write(cc[1], &ch, 1); /* go */
+    int natp = 0;
+    if (mode >= 4) {
+        snprintf(msg, sizeof msg, "%s: precondition: no NAT port is held yet", name);
+        CHECK(msg, nat_scan() == 0);
+        rd = rd_to(dd[0], &ch);
+        snprintf(msg, sizeof msg, "%s: TCP flow to the resolver established through NAT", name); CHECK(msg, rd == 1);
+        natp = nat_scan();
+        if (mode == 4) {
+            snprintf(msg, sizeof msg, "%s: host bind() to the in-use NAT port gets EADDRINUSE (port %d)", name, natp);
+            CHECK(msg, natp > 0);
+            write(cc[1], &ch, 1);
+        } else kill(c, SIGKILL);
+    }
     int rc = wait_child(c);
+    if (mode == 5) {
+        usleep(500000);
+        snprintf(msg, sizeof msg, "%s: after the netns died its NAT port %d is released", name, natp);
+        CHECK(msg, natp > 0 && nat_bindable(natp));
+        snprintf(msg, sizeof msg, "%s: no NAT port stays reserved", name); CHECK(msg, nat_scan() == 0);
+        rc = 0;
+    }
     printf("%s child exit %d\n", name, rc);
-    if (mode == 0 && ipfwd) snprintf(msg, sizeof msg, "%s: UDP DNS query to the resolver is answered through NAT", name);
+    if (mode == 2) snprintf(msg, sizeof msg, "%s: TCP DNS query to the resolver%s is answered through NAT", name, g_http ? " and an HTTP GET" : "");
+    else if (mode >= 4) snprintf(msg, sizeof msg, "%s: flow holder exited cleanly", name);
+    else if (mode == 0 && ipfwd) snprintf(msg, sizeof msg, "%s: UDP DNS query to the resolver is answered through NAT", name);
     else if (mode == 1 && ipfwd) snprintf(msg, sizeof msg, "%s: ICMP echo to the default gateway is answered through NAT", name);
     else snprintf(msg, sizeof msg, "%s: ip_forward=0 means no reply (nothing forwarded)", name);
     CHECK(msg, rc == 0);
@@ -946,9 +1050,16 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
 static void fwd_udp(void) { fwd_case("fwd_udp", 0, 1); }
 static void fwd_ping(void) { fwd_case("fwd_ping", 1, 1); }
 static void fwd_off(void) { fwd_case("fwd_off", 0, 0); }
+static void fwd_tcp(void) { fwd_case("fwd_tcp", 2, 1); }
+static void fwd_port_reserved(void) { fwd_case("fwd_port_reserved", 4, 1); }
+static void fwd_reap(void) { fwd_case("fwd_reap", 5, 1); }
 
 int main(int argc, char **argv) {
-    const char *only = argc > 1 ? argv[1] : NULL;
+    const char *only = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-h") && i + 1 < argc) g_http = argv[++i];
+        else only = argv[i];
+    }
     if (!only || !strcmp(only, "veth_pair")) veth_pair();
     if (!only || !strcmp(only, "accept_ns")) accept_ns();
     if (!only || !strcmp(only, "veth_tcp_reap")) veth_tcp_reap();
@@ -961,6 +1072,9 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
     if (!only || !strcmp(only, "fwd_ping")) fwd_ping();
     if (!only || !strcmp(only, "fwd_off")) fwd_off();
+    if (!only || !strcmp(only, "fwd_tcp")) fwd_tcp();
+    if (!only || !strcmp(only, "fwd_port_reserved")) fwd_port_reserved();
+    if (!only || !strcmp(only, "fwd_reap")) fwd_reap();
     printf("brtest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
