@@ -388,7 +388,7 @@ static int vec_cases(void)
     /* tap readv: one frame (the ARP request for 10.9.0.2) over two iovecs */
     {
         char peer_ok = 0;
-        int cs = socket(AF_INET, SOCK_DGRAM, 0);
+        int cs = u;
         struct sockaddr_in peer = { .sin_family = AF_INET, .sin_port = htons(9999) };
         peer.sin_addr.s_addr = inet_addr("10.9.0.2");
         sendto(cs, "hello", 5, 0, (struct sockaddr *)&peer, sizeof peer);
@@ -399,7 +399,6 @@ static int vec_cases(void)
         if (n == 42) memcpy(tapmac, r + 8, 6);
         peer_ok = n == 42 && h[12] == 0x08 && h[13] == 0x06 && r[6] == 0 && r[7] == 1;
         CHECK("vec_tap_readv_one_frame", peer_ok);
-        close(cs);
     }
     {   /* ARP reply from the peer, so the stack knows it */
         unsigned char a[42];
@@ -409,6 +408,9 @@ static int vec_cases(void)
         memcpy(a + 22, p_mac, 6); memcpy(a + 28, "\x0a\x09\x00\x02", 4);
         memcpy(a + 32, tapmac, 6); memcpy(a + 38, "\x0a\x09\x00\x01", 4);
         CHECK("vec_tap_write_arp", write(fd, a, 42) == 42);
+        unsigned char hb[128];   /* the queued "hello" datagram, now resolved */
+        int hn = rd_timeout(fd, hb, sizeof hb, 3000);
+        CHECK("vec_tap_udp_frame", hn >= 14 + 20 + 8 + 5 && hb[12] == 0x08 && hb[13] == 0x00);
     }
     /* tap writev of 3 iovecs (eth | ip | udp+payload) is ONE frame */
     {
