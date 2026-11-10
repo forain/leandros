@@ -191,6 +191,7 @@ pub fn reverse_newest(ns: NsId, backing: &[u8]) -> Option<Vec<u8>> {
     let t = &g.get(&ns)?.mnts;
     let mut order: Vec<usize> = (0..t.len()).collect();
     order.sort_by_key(|&i| core::cmp::Reverse(t[i].id));
+    let order2 = order.clone();
     for i in order {
         let m = &t[i];
         if !under(backing, &m.root) { continue; }
@@ -199,8 +200,23 @@ pub fn reverse_newest(ns: NsId, backing: &[u8]) -> Option<Vec<u8>> {
         let cand = join(&mp, rest);
         if let Some(x) = walk(t, &cand) { if x.backing == backing { return Some(cand); } }
     }
+    // A descriptor opened before something was mounted on its object (crun
+    // opens the target O_PATH, binds onto /proc/self/fd/N, then sets the
+    // propagation / attributes through the same descriptor): its backing path
+    // names a covered object, so no mount round-trips to it. Linux follows the
+    // mount at the end of the magic link; do the same - the name of the
+    // mountpoint now resolves to the covering mount.
+    for &i in order2.iter() {
+        let m = &t[i];
+        if !under(backing, &m.root) { continue; }
+        let mp = ns_mountpoint(t, i);
+        let rest: &[u8] = if &*m.root == b"/" { backing } else { &backing[m.root.len()..] };
+        let cand = join(&mp, rest);
+        if let Some(x) = walk(t, &cand) { if x.ns_prefix_len == cand.len() && cand.len() > 1 { return Some(cand); } }
+    }
     None
 }
+
 
 /// Does the namespace have a tree (i.e. was it created through [`copy`])?
 pub fn has_tree(ns: NsId) -> bool { NS.lock().contains_key(&ns) }
@@ -353,6 +369,17 @@ fn clone_subtree(t: &[Mnt], src: &[u8], rec: bool) -> Result<Vec<Mnt>, i32> {
 /// `NS` under that id and is freed with the namespace when its last fd closes.
 static ANON: Mutex<Vec<(NsId, bool)>> = Mutex::new(Vec::new());
 
+/// Where a detached tree's descriptor now lives after move_mount attached it:
+/// (detached id, namespace, namespace path). The descriptor keeps naming the
+/// moved mount, so mount_setattr(fd, "", AT_EMPTY_PATH) and mount(2) on
+/// /proc/self/fd/N act on it at its new place (crun does both right after
+/// moving a cloned file/dir bind into the rootfs). Bounded: oldest dropped.
+static ATTACHED: Mutex<Vec<(NsId, NsId, Vec<u8>)>> = Mutex::new(Vec::new());
+
+pub fn attached_at(anon: NsId) -> Option<(NsId, Vec<u8>)> {
+    ATTACHED.lock().iter().rev().find(|a| a.0 == anon).map(|a| (a.1, a.2.clone()))
+}
+
 /// Is `ns` a detached tree made by open_tree?
 pub fn is_anon(ns: NsId) -> bool { ANON.lock().iter().any(|a| a.0 == ns) }
 
@@ -369,6 +396,7 @@ pub fn open_tree_clone(ns: NsId, src: &[u8], rec: bool, anon: NsId, anon_owner: 
         clone_subtree(t, src, rec)?
     };
     for m in add.iter() { sb_get(m.sb); }
+    ATTACHED.lock().retain(|a| a.0 != anon); // namespace ids are recycled
     ANON.lock().push((anon, is_dir));
     NS.lock().insert(anon, MntNs { owner_user: anon_owner, mnts: add, seq: 0 });
     Ok(())
@@ -390,6 +418,11 @@ pub fn move_attach(ns: NsId, anon: NsId, dst: &[u8]) -> Result<(), i32> {
         t.extend(core::mem::take(&mut mnts));
         Ok(())
     })();
+    if res.is_ok() {
+        let mut a = ATTACHED.lock();
+        if a.len() >= 64 { a.remove(0); }
+        a.push((anon, ns, dst.to_vec()));
+    }
     if res.is_err() {
         if let Some(a) = g.get_mut(&anon) { a.mnts = mnts; }
     }
