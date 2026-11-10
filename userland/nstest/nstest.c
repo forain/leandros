@@ -22,6 +22,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/utsname.h>
+#include <sys/prctl.h>
 #include <linux/sched.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -3145,6 +3146,52 @@ static void nobody_opens_child_ns(void)
     check("nobody_opens_child_ns", ok);
 }
 
+/* A same-uid sibling with no caps in a userns must NOT open a non-dumpable target's
+ * /proc/<pid>/ns/net or /environ (Linux __ptrace_may_access). */
+static void sibling_nondumpable_denied(void)
+{
+    int pfd[2], ok = 0;
+    char c;
+    if (pipe(pfd)) { check("sibling_nondumpable_denied", 0); return; }
+    pid_t a = fork();
+    if (a == 0) {
+        if (drop_to(65534)) _exit(2);
+        pid_t t = fork();
+        if (t == 0) {
+            if (unshare(CLONE_NEWUSER | CLONE_NEWNET)) _exit(3);
+            if (prctl(PR_SET_DUMPABLE, 0)) _exit(4);
+            pid_t s = fork();
+            if (s == 0) {
+                struct { unsigned v; int pid; } hdr = { 0x20080522, 0 };
+                unsigned d[6] = {0};
+                if (syscall(SYS_capset, &hdr, d)) _exit(5);
+                pid_t tp = getppid();
+                char path[64];
+                int bad = 0;
+                snprintf(path, sizeof path, "/proc/%d/ns/net", (int)tp);
+                int fd = open(path, O_RDONLY);
+                if (fd >= 0 || errno != EACCES) bad |= 1;
+                snprintf(path, sizeof path, "/proc/%d/environ", (int)tp);
+                fd = open(path, O_RDONLY);
+                if (fd >= 0 || errno != EACCES) bad |= 2;
+                _exit(bad ? 20 + bad : 0);
+            }
+            int st = 0;
+            waitpid(s, &st, 0);
+            _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 99);
+        }
+        (void)pfd;
+        int st = 0;
+        waitpid(t, &st, 0);
+        _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 98);
+    }
+    int st = 0;
+    (void)c;
+    if (a > 0 && waitpid(a, &st, 0) == a && WIFEXITED(st) && WEXITSTATUS(st) == 0) ok = 1;
+    else printf("  sibling_nondumpable_denied status 0x%x\n", st);
+    check("sibling_nondumpable_denied", ok);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--euid")) return print_euid();
@@ -3163,7 +3210,7 @@ int main(int argc, char **argv)
         snprintf(nm, sizeof nm, "unshare_%s_einval", flags[i].n);
         check(nm, r == -1 && e == EINVAL);
     }
-    if (geteuid() == 0) { run_userns_cases(); nobody_opens_child_ns(); } else printf("SKIP userns cases: not root\n");
+    if (geteuid() == 0) { run_userns_cases(); nobody_opens_child_ns(); sibling_nondumpable_denied(); } else printf("SKIP userns cases: not root\n");
     /* A plain fork-style clone still works. */
     long r = do_clone(0);
     int ok = r >= 0;
