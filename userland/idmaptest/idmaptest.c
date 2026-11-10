@@ -2,7 +2,7 @@
  * idmaptest -- user-namespace uid/gid map behaviour. Static zig-cc build,
  * runs as root; each case prints "case: PASS|FAIL|SKIP". Non-identity map
  * cases SKIP when the map write returns EPERM (kernel booted without
- * idmap=test) and must PASS with it. Lanes append cases as separate functions.
+ * idmap=off) and must PASS by default. Lanes append cases as separate functions.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -211,7 +211,7 @@ static void newuidmap_e2e(void)
     struct stat st;
     if (stat("/usr/bin/newuidmap", &st)) { skip("newuidmap_e2e", "no /usr/bin/newuidmap"); return; }
     char cl[1024];
-    if (slurp_file("/proc/cmdline", cl, sizeof cl) < 0 || !strstr(cl, "idmap=test")) { skip("newuidmap_e2e", "needs idmap=test"); return; }
+    if (slurp_file("/proc/cmdline", cl, sizeof cl) < 0 || strstr(cl, "idmap=off")) { skip("newuidmap_e2e", "idmap=off boot"); return; }
     pid_t m = fork();
     if (m == 0) _exit(newuidmap_body());
     int s; waitpid(m, &s, 0);
@@ -275,7 +275,7 @@ static void e2e_subuid(void)
     struct stat st;
     if (stat("/usr/bin/newuidmap", &st) || stat("/usr/bin/newgidmap", &st)) { skip("e2e_subuid", "no newuidmap/newgidmap"); return; }
     char cl[1024];
-    if (slurp_file("/proc/cmdline", cl, sizeof cl) < 0 || !strstr(cl, "idmap=test")) { skip("e2e_subuid", "needs idmap=test"); return; }
+    if (slurp_file("/proc/cmdline", cl, sizeof cl) < 0 || strstr(cl, "idmap=off")) { skip("e2e_subuid", "idmap=off boot"); return; }
     snprintf(e2e_path, sizeof e2e_path, "/tmp/e2e_subuid.%d", (int)getpid());
     unlink(e2e_path);
     pid_t m = fork();
@@ -331,7 +331,7 @@ static int run_ns_case(const char *name, int (*body)(void))
     char m = write_maps(c, 100000) ? 'n' : 'm';
     write(go, &m, 1);
     int st; waitpid(c, &st, 0);
-    if (m == 'n') { skip(name, "non-identity map refused (no idmap=test)"); return 0; }
+    if (m == 'n') { skip(name, "non-identity map refused (idmap=off)"); return 0; }
     report(name, WIFEXITED(st) && WEXITSTATUS(st) == 0);
     return 1;
 }
@@ -487,7 +487,7 @@ static void procsys_overflow(void)
 #define SKIP 77
 #define CHECK(c) do { if (!(c)) { printf("  FAIL line %d: %s (errno %d)\n", __LINE__, #c, errno); return 1; } } while (0)
 
-static int knob; /* non-identity maps accepted (idmap=test) */
+static int knob; /* non-identity maps accepted (default; refused only with idmap=off) */
 
 static int wr(const char *path, const char *txt)
 {
@@ -2264,14 +2264,17 @@ static int probe_knob(void)
 static void idcore_cases(void)
 {
     knob = probe_knob();
-    printf("idmaptest: non-identity maps %s\n", knob ? "ON (idmap=test)" : "off (non-identity cases SKIP)");
+    char cl[1024];
+    int off = slurp_file("/proc/cmdline", cl, sizeof cl) >= 0 && strstr(cl, "idmap=off");
+    printf("idmaptest: non-identity maps %s\n", knob ? "ON (default)" : off ? "off (idmap=off, non-identity cases SKIP)" : "REFUSED without idmap=off");
+    if (!knob && !off) { report("probe_nonidentity_accepted", 0); return; } /* a reverted flip must not pass as SKIP */
     for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         fflush(stdout);
         pid_t p = fork();
         if (p == 0) _exit(cases[i].fn());
         int st = 0; waitpid(p, &st, 0);
         int rc = WIFEXITED(st) ? WEXITSTATUS(st) : 100;
-        if (rc == SKIP) skip(cases[i].name, "non-identity map refused (no idmap=test)");
+        if (rc == SKIP) skip(cases[i].name, "non-identity map refused (idmap=off)");
         else report(cases[i].name, rc == 0);
     }
 }

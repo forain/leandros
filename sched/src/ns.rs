@@ -532,14 +532,14 @@ fn ext(kind: usize, id: usize, i: usize) -> (u32, u32, u32) {
     (MAP_DATA[kind][b].load(Acquire), MAP_DATA[kind][b + 1].load(Acquire), MAP_DATA[kind][b + 2].load(Acquire))
 }
 
-/// Set once the composed maps may be non-identity for everyone. While false,
-/// `write_map` still refuses `upper != lower` unless the `idmap=test` knob is on.
-pub const IDMAP_REAL: bool = false;
-static IDMAP_TEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// Kernel cmdline `idmap=test`: exercise real maps before the flip. It never
-/// lifts the kuid-0 refusal.
-pub fn set_idmap_test() { IDMAP_TEST.store(true, Release); }
-pub fn idmap_real() -> bool { IDMAP_REAL || IDMAP_TEST.load(Acquire) }
+/// Non-identity maps are on by default (flip 2026-11-10). `write_map` rule 9
+/// refuses `upper != lower` only when the kernel cmdline carries `idmap=off`
+/// (one-release opt-out). `idmap=test` is accepted and ignored. Neither lifts
+/// the kuid-0 refusal.
+pub const IDMAP_REAL: bool = true;
+static IDMAP_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub fn set_idmap_off() { IDMAP_OFF.store(true, Release); }
+pub fn idmap_real() -> bool { IDMAP_REAL && !IDMAP_OFF.load(Acquire) }
 
 /// Namespace id `id` -> kernel id through namespace `ns` (None if unmapped or
 /// `id` is u32::MAX). Namespace 0 is the identity.
@@ -783,7 +783,7 @@ pub fn write_map(opener: &Opener, writer: u32, kind: usize, data: &[u8]) -> isiz
         comp[i] = (exts[i].0, lk, exts[i].2);
         // Rule 6: no extent covers kuid 0 until lane idroot0.
         if lk == 0 { return -1; }
-        // Rule 9: identity maps only until the flip (or the test knob).
+        // Rule 9: identity maps only when the idmap=off opt-out is set.
         if !idmap_real() && exts[i].0 != lk { return -1; }
     }
     if !privileged {

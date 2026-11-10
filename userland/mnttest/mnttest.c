@@ -1230,7 +1230,7 @@ static int fdp_walk(int m) {
 static int fdp_userns_mntns(int m) {
     (void)m;
     if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
-    /* made before the unshare: without idmap=test the new userns has no uid map */
+    /* made before the unshare: with idmap=off the new userns has no uid map */
     mkdir("/tmp/fdpu", 0755); mkdir("/tmp/fdpu/a", 0755); mkdir("/tmp/fdpu/a/b", 0755);
     if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
     wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "0 1000 1"); wr("/proc/self/gid_map", "0 1000 1");

@@ -2,8 +2,7 @@
 """podbridgetest.py -- root podman on the default bridge network (acceptance, lane podbridge).
 
 Runs in the running VM (same LEANDROS_RUN_ID); needs an image built with
-LEANDROS_IMAGE_ARCHIVE=<alpine-oci.tar> and the kernel cmdline `idmap=test`
-(runtests --cmdline idmap=test).  Checks, over one held serial connection:
+LEANDROS_IMAGE_ARCHIVE=<alpine-oci.tar> (non-identity maps are on by default).  Checks, over one held serial connection:
   podman_echo      podman run --rm alpine:3.21 echo hi: RC=0, no "Rolling back"
   podman_hostnet   wget from a container to a host-side python http.server
                    at the guest's default gateway

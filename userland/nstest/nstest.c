@@ -737,18 +737,16 @@ static int nslink(const char *path, char *buf, size_t sz)
 static int p2c[2], c2p[2];
 static void child_ready_wait(void) { char c = 'r'; (void)!write(c2p[1], &c, 1); (void)!read(p2c[0], &c, 1); }
 
+static int ff_mode; /* 0 = Firefox identity sequence, 1 = ns-root (0 1000 1) */
 static int ff_seq_child(void)
 {
     char m[64]; char num[64];
     int uid = 1000, gid = 1000;
     CHECK(getuid() == 65534 && getgid() == 65534);        /* unmapped: overflow ids */
     CHECK(wr("/proc/self/gid_map", "1000 1000 1\n") == -EPERM); /* gid_map before deny */
-    /* Non-identity maps are refused unless the kernel runs with idmap=test
-     * (then "0 1000 1" is accepted and consumes the write-once uid_map). */
-    int r = wr("/proc/self/uid_map", "0 1000 1\n");
-    int knob = (r == 0);
-    CHECK(knob || r == -EPERM);                                 /* non-identity */
-    if (!knob) {
+    /* ff_mode 0: Firefox's real identity sequence (the "0 1000 1" probe is
+     * not made, so the uid_map stays writable). ff_mode 1: ns-root map. */
+    if (!ff_mode) {
         CHECK(wr("/proc/self/uid_map", "0 0 1\n") == -EPERM);   /* foreign uid */
         CHECK(wr("/proc/self/setgroups", "deny") == 0);
         snprintf(num, sizeof num, "%d %d 1", uid, uid);
@@ -756,6 +754,7 @@ static int ff_seq_child(void)
         snprintf(num, sizeof num, "%d %d 1", gid, gid);
         CHECK(wr("/proc/self/gid_map", num) == 0);
     } else {
+        CHECK(wr("/proc/self/uid_map", "0 1000 1\n") == 0);     /* consumes the write-once uid_map */
         CHECK(wr("/proc/self/setgroups", "deny") == 0);
         snprintf(num, sizeof num, "0 %d 1\n", gid);
         CHECK(wr("/proc/self/gid_map", num) == 0);
@@ -773,8 +772,9 @@ static int ff_seq_child(void)
     return 0;
 }
 
-static int t_ff_seq(void)
+static int ff_seq_run(int mode)
 {
+    ff_mode = mode;
     CHECK(drop_to(1000) == 0);
     CHECK(pipe(p2c) == 0 && pipe(c2p) == 0);
     pid_t c = syscall(SYS_clone, SIGCHLD | CLONE_NEWUSER, 0, 0, 0, 0);
@@ -791,6 +791,13 @@ static int t_ff_seq(void)
     (void)!write(p2c[1], "g", 1);
     int st = 0; waitpid(c, &st, 0);
     return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1;
+}
+static int t_ff_seq_identity(void) { return ff_seq_run(0); }
+static int t_ff_seq_nsroot(void)
+{
+    char cl[1024];
+    if (rd("/proc/cmdline", cl, sizeof cl) > 0 && strstr(cl, "idmap=off")) return 0; /* opt-out boot: maps refused */
+    return ff_seq_run(1);
 }
 static int links_child(void)
 {
@@ -3089,14 +3096,14 @@ static int t_cgns_leak(void)
 /* Namespace quota is charged up the userns tree (Linux inc_ucount): a container
  * whose ns-root is kuid 1000 and that maps subuids 100000.. may not multiply
  * its quota by setuid()ing across them, and must not starve other users.
- * Needs idmap=test (multi-range map) until the flip. */
+ * Skips on idmap=off. */
 static int t_quota_hier(void)
 {
     char cl[512]; int fd = open("/proc/cmdline", O_RDONLY), n = 0;
     if (fd >= 0) { n = read(fd, cl, sizeof cl - 1); close(fd); }
     if (n < 0) n = 0;
     cl[n] = 0;
-    if (!strstr(cl, "idmap=test")) { printf("  quota_hier: SKIP (needs idmap=test)\n"); return 0; }
+    if (strstr(cl, "idmap=off")) { printf("  quota_hier: SKIP (idmap=off)\n"); return 0; }
     int ready[2], go[2], res[2];
     CHECK(pipe(ready) == 0 && pipe(go) == 0 && pipe(res) == 0);
     pid_t c = fork();
@@ -3180,7 +3187,7 @@ static int run_userns_cases(void)
         { "sid_pgid", t_sid_pgid }, { "byid_calls", t_byid_calls }, { "peercred", t_peercred },
         { "proc_self_tgid", t_proc_self_tgid }, { "proc_self_init", t_proc_self_init },
         { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
-        { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
+        { "ff_seq_identity", t_ff_seq_identity }, { "ff_seq_nsroot", t_ff_seq_nsroot }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
         { "procsysnet_defaults", t_procsysnet_defaults }, { "procsysnet_ifdirs", t_procsysnet_ifdirs }, { "ip_forward_fanout", t_ip_forward_fanout }, { "ifdir_isolated", t_ifdir_isolated }, { "procsysnet_netns_isolated", t_procsysnet_netns_isolated }, { "procsysnet_root_write", t_procsysnet_root_write }, { "procsysnet_unpriv_denied", t_procsysnet_unpriv_denied }, { "procsysnet_port_start", t_procsysnet_port_start }, { "procsysnet_ping_range", t_procsysnet_ping_range }, { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_siocsifflags_lo", t_netns_siocsifflags_lo }, { "netns_siocsifflags_lo_userns", t_netns_siocsifflags_lo_userns }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
