@@ -28,6 +28,7 @@
 #include <stddef.h>
 #include <pthread.h>
 #include <sys/mount.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -1127,6 +1128,86 @@ static int t_procsysnet_netns_isolated(void)
     return 0;
 }
 /* Root in the init ns writes and restores; init-ns writes are visible to later reads. */
+
+/* ---- per-interface /proc/sys/net (lane sysctlif) ---- */
+#ifndef TUNSETIFF
+#define TUNSETIFF 0x400454ca
+#endif
+static int psn_tap(const char *name)
+{
+    int fd = open("/dev/net/tun", O_RDWR);
+    if (fd < 0) return -1;
+    struct ifreq ifr; memset(&ifr, 0, sizeof ifr);
+    strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+    ifr.ifr_flags = 0x0002 | 0x1000; /* IFF_TAP | IFF_NO_PI */
+    if (ioctl(fd, TUNSETIFF, &ifr) < 0) { close(fd); return -1; }
+    return fd;
+}
+static int psn_missing(const char *f)
+{
+    char p[160]; snprintf(p, sizeof p, PSN "%s", f);
+    int fd = open(p, O_RDONLY);
+    if (fd >= 0) { close(fd); return 0; }
+    return errno == ENOENT;
+}
+static int psn_child(int (*fn)(void))
+{
+    pid_t c = fork();
+    if (c == 0) { if (unshare(CLONE_NEWNET) != 0) _exit(100); _exit(fn()); }
+    int st = 0; waitpid(c, &st, 0);
+    if (!WIFEXITED(st)) return 99;
+    return WEXITSTATUS(st);
+}
+static int ifdirs_body(void)
+{
+    int fd = psn_tap("tap0");
+    if (fd < 0) return 1;
+    if (!psn_is("ipv4/conf/tap0/arp_notify", "0\n")) return 2;
+    if (psn_wr("ipv4/conf/tap0/arp_notify", "1") != 0) return 3;
+    if (!psn_is("ipv4/conf/tap0/arp_notify", "1\n")) return 4;
+    if (!psn_is("ipv4/conf/tap0/rp_filter", "0\n") || !psn_is("ipv4/conf/tap0/route_localnet", "0\n")) return 5;
+    if (!psn_is("ipv6/conf/tap0/autoconf", "1\n") || !psn_is("ipv6/conf/tap0/accept_dad", "1\n")) return 6;
+    if (psn_wr("ipv6/conf/tap0/disable_ipv6", "1") != 0 || !psn_is("ipv6/conf/tap0/disable_ipv6", "1\n")) return 7;
+    if (!psn_missing("ipv4/conf/nosuch/arp_notify")) return 8;
+    close(fd);
+    if (!psn_missing("ipv4/conf/tap0/arp_notify")) return 9;
+    return 0;
+}
+static int t_procsysnet_ifdirs(void) { int r = psn_child(ifdirs_body); if (r) printf("  ifdirs_body=%d\n", r); CHECK(r == 0); return 0; }
+static int fanout_body(void)
+{
+    int fd = psn_tap("tap0");
+    if (fd < 0) return 1;
+    if (!psn_is("ipv4/conf/tap0/forwarding", "0\n")) return 2;
+    if (psn_wr("ipv4/ip_forward", "1") != 0) return 3;
+    if (!psn_is("ipv4/conf/tap0/forwarding", "1\n")) return 4;
+    if (!psn_is("ipv4/conf/all/forwarding", "1\n") || !psn_is("ipv4/conf/default/forwarding", "1\n")) return 5;
+    int fd2 = psn_tap("tap1");
+    if (fd2 < 0 || !psn_is("ipv4/conf/tap1/forwarding", "1\n")) return 6; /* new if inherits default */
+    if (psn_wr("ipv4/ip_forward", "0") != 0 || !psn_is("ipv4/conf/tap0/forwarding", "0\n")) return 7;
+    if (!psn_is("ipv4/conf/tap1/forwarding", "0\n")) return 8;
+    close(fd); close(fd2);
+    return 0;
+}
+static int t_ip_forward_fanout(void) { int r = psn_child(fanout_body); if (r) printf("  fanout_body=%d\n", r); CHECK(r == 0); return 0; }
+static int t_ifdir_isolated(void)
+{
+    int up[2], dn[2]; CHECK(pipe(up) == 0 && pipe(dn) == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        if (unshare(CLONE_NEWNET) != 0) _exit(100);
+        int fd = psn_tap("tap0"); char b = fd >= 0 ? 'k' : 'f';
+        if (write(up[1], &b, 1) != 1) _exit(101);
+        if (read(dn[0], &b, 1) != 1) _exit(102);
+        _exit(0);
+    }
+    char b = 0; CHECK(read(up[0], &b, 1) == 1 && b == 'k');
+    CHECK(psn_missing("ipv4/conf/tap0/arp_notify"));
+    CHECK(psn_missing("ipv6/conf/tap0/autoconf"));
+    b = 'x'; CHECK(write(dn[1], &b, 1) == 1);
+    int st = 0; waitpid(c, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    return 0;
+}
 static int t_procsysnet_root_write(void)
 {
     char old[64]; CHECK(psn_rd("core/somaxconn", old, sizeof old) > 0);
@@ -3005,7 +3086,7 @@ static int run_userns_cases(void)
         { "proc_listing", t_proc_listing }, { "status_views", t_status_views },
         { "map_firefox_seq", t_ff_seq }, { "ns_links", t_ns_links }, { "void_root_link", t_void_root_link },
         { "setid_guard", t_setid_guard }, { "root_einval", t_root_einval }, { "id_translate", t_id_translate },
-        { "procsysnet_defaults", t_procsysnet_defaults }, { "procsysnet_netns_isolated", t_procsysnet_netns_isolated }, { "procsysnet_root_write", t_procsysnet_root_write }, { "procsysnet_unpriv_denied", t_procsysnet_unpriv_denied }, { "procsysnet_port_start", t_procsysnet_port_start }, { "procsysnet_ping_range", t_procsysnet_ping_range }, { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_siocsifflags_lo", t_netns_siocsifflags_lo }, { "netns_siocsifflags_lo_userns", t_netns_siocsifflags_lo_userns }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
+        { "procsysnet_defaults", t_procsysnet_defaults }, { "procsysnet_ifdirs", t_procsysnet_ifdirs }, { "ip_forward_fanout", t_ip_forward_fanout }, { "ifdir_isolated", t_ifdir_isolated }, { "procsysnet_netns_isolated", t_procsysnet_netns_isolated }, { "procsysnet_root_write", t_procsysnet_root_write }, { "procsysnet_unpriv_denied", t_procsysnet_unpriv_denied }, { "procsysnet_port_start", t_procsysnet_port_start }, { "procsysnet_ping_range", t_procsysnet_ping_range }, { "netns_sendfam", t_netns_sendfam }, { "netns_sees_only_lo", t_netns_sees_only_lo }, { "netns_lo_up_ack", t_netns_lo_up_ack }, { "netns_siocsifflags_lo", t_netns_siocsifflags_lo }, { "netns_siocsifflags_lo_userns", t_netns_siocsifflags_lo_userns }, { "netns_ipcns", t_netns_ipcns }, { "netns_isolate_reverse", t_netns_isolate_reverse },
         { "sock_netns_inherited", t_sock_netns_inherited }, { "sock_netns_scm", t_sock_netns_scm },
         { "sock_before_unshare", t_sock_before_unshare }, { "netns_portspace", t_netns_portspace }, { "netns_udp_bind", t_netns_udp_bind }, { "netns_lo_echo", t_netns_lo_echo }, { "netns_lo_two_ns_same_port", t_netns_lo_two_ns_same_port }, { "netns_lo_host_unreachable", t_netns_lo_host_unreachable }, { "netns_lo_slots_reclaimed", t_netns_lo_slots_reclaimed },
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
