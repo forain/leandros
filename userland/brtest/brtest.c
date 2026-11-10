@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -394,9 +395,83 @@ static void veth_nsgone(void) {
     close(s);
 }
 
+/* Accepts one connection, hands the accepted fd to the parent over `fdpass` (SCM_RIGHTS) and exits,
+ * leaving the accepted socket as the only thing that can still reference this netns. */
+static int fdpass[2];
+static int acceptpass_body(void) {
+    char ip[32] = "10.99.96.2";
+    int s = nl_sock();
+    int idx = link_get(s, "eth0", NULL, NULL);
+    if (!idx || addr_add(s, idx, ip, 24) || link_set_up(s, idx)) return 1;
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(7777) };
+    if (bind(t, (struct sockaddr *)&a, sizeof a) || listen(t, 4)) return 2;
+    char ch = 'r'; write(done_[1], &ch, 1);
+    struct pollfd p = { t, POLLIN, 0 };
+    if (poll(&p, 1, 15000) <= 0) return 3;
+    int c = accept(t, NULL, NULL);
+    if (c < 0) return 4;
+    char cb[CMSG_SPACE(sizeof(int))]; memset(cb, 0, sizeof cb);
+    char d = 'a'; struct iovec io = { &d, 1 };
+    struct msghdr m = { .msg_iov = &io, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof cb };
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = SOL_SOCKET; h->cmsg_type = SCM_RIGHTS; h->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(h), &c, sizeof c);
+    if (sendmsg(fdpass[1], &m, 0) != 1) return 5;
+    return 0;
+}
+
+/* An accepted socket belongs to the listener's netns (Linux sk_clone): while the parent holds it the netns
+ * and its veth stay alive after every process in the netns exited, and are reaped once it is closed. */
+static void accept_ns(void) {
+    int s = nl_sock();
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fdpass)) { CHECK("accept_ns: socketpair", 0); return; }
+    pid_t c = spawn_ns(acceptpass_body);
+    int nsfd = c > 0 ? netns_fd_of(c) : -1;
+    int e = nsfd < 0 ? -1 : veth_new(s, "vethC", "eth0", nsfd);
+    if (nsfd >= 0) close(nsfd);
+    int ia = e ? 0 : link_get(s, "vethC", NULL, NULL);
+    CHECK("accept_ns: pair created", ia > 0 && addr_add(s, ia, "10.99.96.1", 24) == 0 && link_set_up(s, ia) == 0);
+    if (ia <= 0) { if (c > 0) { kill(c, SIGKILL); wait_child(c); } close(s); return; }
+    char ch = 'g'; write(ctl[1], &ch, 1);
+    CHECK("accept_ns: child netns listens", rd_to(done_[0], &ch) == 1);
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7777) };
+    inet_pton(AF_INET, "10.99.96.2", &to.sin_addr);
+    CHECK("accept_ns: connect", connect(t, (struct sockaddr *)&to, sizeof to) == 0);
+    char cb[CMSG_SPACE(sizeof(int))]; memset(cb, 0, sizeof cb);
+    char d; struct iovec io = { &d, 1 };
+    struct msghdr m = { .msg_iov = &io, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof cb };
+    int got = -1;
+    struct pollfd p = { fdpass[0], POLLIN, 0 };
+    if (poll(&p, 1, 15000) > 0 && recvmsg(fdpass[0], &m, 0) == 1) {
+        struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+        if (h && h->cmsg_type == SCM_RIGHTS) memcpy(&got, CMSG_DATA(h), sizeof got);
+    }
+    CHECK("accept_ns: accepted fd received", got >= 0);
+    CHECK("accept_ns: child exited 0", wait_child(c) == 0);
+    /* the reaper runs with every request; give it ample time to (wrongly) reap */
+    int alive = 1;
+    for (int w = 0; w < 100; w++) { if (!link_get(s, "vethC", NULL, NULL)) { alive = 0; break; } usleep(20000); }
+    CHECK("accept_ns: netns pinned by the accepted socket (veth survives 2 s)", alive);
+    if (got >= 0) {
+        struct timeval tv = { 5, 0 };
+        setsockopt(t, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        char b[4] = {0};
+        int ok = write(t, "x", 1) == 1 && read(got, b, 1) == 1 && b[0] == 'x';
+        CHECK("accept_ns: accepted socket still carries data", ok);
+        close(got);
+    }
+    close(t);
+    CHECK("accept_ns: veth reaped within 5 s of closing the accepted socket", gone_within(s, "vethC", 5000));
+    close(fdpass[0]); close(fdpass[1]);
+    close(s);
+}
+
 int main(int argc, char **argv) {
     const char *only = argc > 1 ? argv[1] : NULL;
     if (!only || !strcmp(only, "veth_pair")) veth_pair();
+    if (!only || !strcmp(only, "accept_ns")) accept_ns();
     if (!only || !strcmp(only, "veth_ping")) veth_ping();
     if (!only || !strcmp(only, "veth_dellink")) veth_dellink();
     if (!only || !strcmp(only, "veth_naming")) veth_naming();
