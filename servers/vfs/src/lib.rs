@@ -15265,7 +15265,7 @@ fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
     }
     // A bound namespace file (/.leandros-ns/..) is nsfs: containers/common
     // checks the magic of the file it bound at /run/netns/<name>.
-    if path.starts_with(mnt::NS_SRC) {
+    if path.starts_with(alias::NS_SRC) {
         let mut v = procfs_statfs();
         v.f_type = 0x6e73_6673;
         write_statfs(buf_ptr, &v);
