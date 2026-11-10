@@ -77,7 +77,9 @@ pub fn send(ofd: u32, data: &[u8]) -> Message {
     let links = rt::current_links(ns);
     let routes = rt::current_routes(ns);
     let lo_set = |up: bool| { if ns == 0 { false } else { sched::ns::set_lo_admin_up(ns, up); true } };
-    let env = rt::Env { links: &links, routes: &routes, route: &|d| if ns == 0 { rt::route_lookup(d) } else { None }, lo_set: &lo_set };
+    let env = rt::Env { links: &links, routes: &routes, route: &|d| if ns == 0 { rt::route_lookup(d) } else { None }, lo_set: &lo_set,
+        apply: &|op| crate::tunbe::rtnl_apply(ns, op),
+        admin: sched::caps::ns_capable_in(sched::ns::owner_userns(1, ns), 12) };
     let replies = rt::handle_request_env(data, pid, &env);
     if !replies.is_empty() {
         let mut m = NL.lock();
