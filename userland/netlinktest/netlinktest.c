@@ -225,7 +225,21 @@ static int tap_cfg_body(void) {
     return bad;
 }
 
+static void nl_connect_test(void) {
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    struct sockaddr_nl k = { .nl_family = AF_NETLINK };
+    CHECK("nl_connect_kernel", connect(s, (struct sockaddr *)&k, sizeof k) == 0);
+    struct sockaddr_nl pn; socklen_t pl = sizeof pn; memset(&pn, 0xff, sizeof pn);
+    CHECK("nl_getpeername", getpeername(s, (struct sockaddr *)&pn, &pl) == 0 && pn.nl_family == AF_NETLINK && pn.nl_pid == 0);
+    struct nlb m; struct rtgenmsg g = { AF_UNSPEC };
+    nl_begin(&m, RTM_GETLINK, NLM_F_DUMP, &g, sizeof g);
+    ((struct nlmsghdr *)m.b)->nlmsg_len = m.len;
+    CHECK("nl_send_after_connect", send(s, m.b, m.len, 0) == m.len);
+    close(s);
+}
+
 static void rtnl_write_tests(void) {
+    nl_connect_test();
     fflush(stdout);
     pid_t c = fork();
     if (c == 0) { int bad = tap_cfg_body(); fflush(stdout); _exit(bad ? 1 : 0); }
