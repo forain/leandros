@@ -612,6 +612,14 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
             // `claim_fatal_signal_locked`), so the signal is never off the
             // pending set while unclaimed.
             let b = 1u64 << (sig - 1);
+            // Linux get_signal(): SIGNAL_UNKILLABLE (a pid-namespace init) with
+            // SIG_DFL gets no signal but SIGKILL/SIGSTOP (sig_kernel_only); a
+            // signal queued while blocked is dropped here once unblocked.
+            if action.handler == 0 && !matches!(sig, 9 | 19)
+                && rq.find_pid(pid).map_or(false, |t| super::pidns::is_ns_init(t))
+            {
+                continue;
+            }
             if action.handler == 0 && (SIGDFL_IGNORE | SIGDFL_STOP) & b == 0 {
                 super::claim_fatal_signal_locked(&mut *rq, pid, sig);
             }

@@ -200,6 +200,12 @@ pub fn out(k: u32) -> u32 {
     if n == 0 { k } else { to_v(n, k) }
 }
 
+/// Is `t` (any thread) in the group of its pid namespace's init (Linux SIGNAL_UNKILLABLE)?
+pub fn is_ns_init(t: &crate::task::Task) -> bool {
+    let tn = t.pidns.id();
+    tn != 0 && t.tgid == ns::pid_init(tn)
+}
+
 /// Should a user-sent `sig` from a task in `sender_ns` to `target` (a thread
 /// group leader) be silently dropped? Only for a namespace init without a
 /// handler: same-ns senders can't kill/stop it, ancestors may (SIGKILL/SIGSTOP).
@@ -207,6 +213,9 @@ pub fn init_drops(sender_ns: NsId, target: &crate::task::Task, sig: u32) -> bool
     let tn = target.pidns.id();
     if tn == 0 || sig == 0 || sig > 64 || target.tgid != ns::pid_init(tn) { return false; }
     if target.signal_actions[(sig - 1) as usize].handler != 0 { return false; }
+    // Linux sig_ignored(): a blocked signal is never ignored (the handler may
+    // change before it is unblocked), e.g. pasta's sigwaitinfo(SIGUSR1) child.
+    if target.signal_mask & (1u64 << (sig - 1)) != 0 { return false; }
     if sender_ns == tn { return true; }
     !matches!(sig, 9 | 19)
 }
