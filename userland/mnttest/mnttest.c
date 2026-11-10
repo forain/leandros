@@ -1300,16 +1300,17 @@ static int nsfs_ns0_copied(int m) {
     int r = nn_join_check(file);
     return r ? 10 + r : 0;
 }
+#define DBGC() do{int l,sb;ns_counts(&l,&sb);printf("DBG live=%d sb=%d line=%d\n",l,sb,__LINE__);}while(0)
 static void fdpath_suite(void) {
-    report("mount_private_via_fd_link_root", nn_in_child(fdp_direct, 0));
-    report("crun_make_private_walk_root", nn_in_child(fdp_walk, 0));
-    report("crun_make_private_walk_mntns", nn_in_child(fdp_root_mntns, 0));
-    report("crun_make_private_walk_userns_mntns", nn_in_child(fdp_userns_mntns, 0));
-    report("selfbind_visible_after_unshare_newns", nn_in_child(selfbind_copied, 0));
+    report("mount_private_via_fd_link_root", nn_in_child(fdp_direct, 0)); DBGC();
+    report("crun_make_private_walk_root", nn_in_child(fdp_walk, 0)); DBGC();
+    report("crun_make_private_walk_mntns", nn_in_child(fdp_root_mntns, 0)); DBGC();
+    report("crun_make_private_walk_userns_mntns", nn_in_child(fdp_userns_mntns, 0)); DBGC();
+    report("selfbind_visible_after_unshare_newns", nn_in_child(selfbind_copied, 0)); DBGC();
     umount2("/tmp/fdp.m", MNT_DETACH);
-    report("nsfs_bind_in_mntns_root", nn_in_child(nsfs_in_mntns, 0));
-    report("nsfs_bind_in_userns_mntns", nn_in_child(nsfs_in_mntns, 1));
-    report("nsfs_bind_in_mntns_then_unshare_newns", nn_in_child(nsfs_in_mntns, 2));
+    report("nsfs_bind_in_mntns_root", nn_in_child(nsfs_in_mntns, 0)); DBGC();
+    report("nsfs_bind_in_userns_mntns", nn_in_child(nsfs_in_mntns, 1)); DBGC();
+    report("nsfs_bind_in_mntns_then_unshare_newns", nn_in_child(nsfs_in_mntns, 2)); DBGC();
     /* an ns-0 nsfs bind is copied into new mount namespaces */
     int p[2], q[2];
     if (pipe(p) || pipe(q)) { report("nsfs_ns0_bind_copied_by_unshare", 0); return; }
@@ -1329,7 +1330,7 @@ static void fdpath_suite(void) {
     if (write(q[1], "x", 1) != 1) {}
     int st = 0; waitpid(c, &st, 0);
     report("nsfs_ns0_bind_copied_by_unshare", ok && br == 0 && nn_in_child(nsfs_ns0_copied, 0));
-    umount2(file, MNT_DETACH); unlink(file);
+    umount2(file, MNT_DETACH); unlink(file); DBGC();
 }
 
 int main(int argc, char **argv) {
