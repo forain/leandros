@@ -364,6 +364,17 @@ fn clone_subtree(t: &[Mnt], src: &[u8], rec: bool) -> Result<Vec<Mnt>, i32> {
 /// `NS` under that id and is freed with the namespace when its last fd closes.
 static ANON: Mutex<Vec<(NsId, bool)>> = Mutex::new(Vec::new());
 
+/// Where a detached tree's descriptor now lives after move_mount attached it:
+/// (detached id, namespace, namespace path). The descriptor keeps naming the
+/// moved mount, so mount_setattr(fd, "", AT_EMPTY_PATH) and mount(2) on
+/// /proc/self/fd/N act on it at its new place (crun does both right after
+/// moving a cloned file/dir bind into the rootfs). Bounded: oldest dropped.
+static ATTACHED: Mutex<Vec<(NsId, NsId, Vec<u8>)>> = Mutex::new(Vec::new());
+
+pub fn attached_at(anon: NsId) -> Option<(NsId, Vec<u8>)> {
+    ATTACHED.lock().iter().rev().find(|a| a.0 == anon).map(|a| (a.1, a.2.clone()))
+}
+
 /// Is `ns` a detached tree made by open_tree?
 pub fn is_anon(ns: NsId) -> bool { ANON.lock().iter().any(|a| a.0 == ns) }
 
@@ -401,6 +412,11 @@ pub fn move_attach(ns: NsId, anon: NsId, dst: &[u8]) -> Result<(), i32> {
         t.extend(core::mem::take(&mut mnts));
         Ok(())
     })();
+    if res.is_ok() {
+        let mut a = ATTACHED.lock();
+        if a.len() >= 64 { a.remove(0); }
+        a.push((anon, ns, dst.to_vec()));
+    }
     if res.is_err() {
         if let Some(a) = g.get_mut(&anon) { a.mnts = mnts; }
     }

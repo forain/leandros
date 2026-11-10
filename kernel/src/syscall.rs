@@ -9412,6 +9412,13 @@ fn resolve_mount_target(target_ptr: usize) -> Result<Vec<u8>, isize> {
 
 /// The namespace path of the directory descriptor `fd` for a mount(2) target.
 fn fd_mount_ns_path(fd: usize) -> Result<Vec<u8>, isize> {
+    // A detached tree (open_tree clone) that move_mount has attached: the
+    // descriptor names the moved mount at its new place.
+    if let Ok((4, id)) = vfs::nsfd_target(current_pid(), fd) {
+        if let Some((ns, p)) = vfs::mnt::attached_at(id as sched::ns::NsId) {
+            if ns == sched::current_mntns() { return Ok(p); }
+        }
+    }
     let mut host = fd_host_path(fd).ok_or(-2isize)?;
     // A cgroup2 directory reports its absolute cgroup path, but the tree is
     // served relative to the reader's cgroup namespace root: a descriptor
@@ -9728,7 +9735,7 @@ fn tree_src(dfd: usize, path_ptr: usize, empty_ok: bool) -> Result<TreeSrc, isiz
         if dfd_i as isize as usize == AT_FDCWD { return Ok(TreeSrc::Path(resolve_ns(b".")?)); }
         if dfd_i < 0 { return Err(-9); }
         if let Ok((4, id)) = vfs::nsfd_target(current_pid(), dfd_i as usize) {
-            if vfs::mnt::is_anon(id as sched::ns::NsId) { return Ok(TreeSrc::Anon(id as sched::ns::NsId)); }
+            if vfs::mnt::is_anon(id as sched::ns::NsId) && vfs::mnt::attached_at(id as sched::ns::NsId).is_none() { return Ok(TreeSrc::Anon(id as sched::ns::NsId)); }
         }
         return Ok(TreeSrc::Path(fd_mount_ns_path(dfd_i as usize)?));
     }
