@@ -136,6 +136,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
     if !test_clone_files_close_visible() { failures += 1; }
     if !test_clone_files_epoll_shared() { failures += 1; }
     if !test_clone_files_netlink_netns() { failures += 1; }
+    if !test_sigwait_kill() { failures += 1; }
+    if !test_sigwait_kill_pidns() { failures += 1; }
 
     puts(b"--- forktest done ---\n\0".as_ptr());
     failures
@@ -853,11 +855,13 @@ unsafe fn test_failing_syscall_odd_args() -> bool {
 #[cfg(target_arch = "aarch64")]
 mod nr { pub const SOCKET: i64 = 198; pub const BIND: i64 = 200; pub const SENDTO: i64 = 206;
          pub const RECVFROM: i64 = 207; pub const EPOLL_CREATE1: i64 = 20; pub const EPOLL_CTL: i64 = 21;
-         pub const UNSHARE: i64 = 97; }
+         pub const UNSHARE: i64 = 97; pub const KILL: i64 = 129; pub const SIGPROCMASK: i64 = 135;
+         pub const SIGTIMEDWAIT: i64 = 137; }
 #[cfg(target_arch = "x86_64")]
 mod nr { pub const SOCKET: i64 = 41; pub const BIND: i64 = 49; pub const SENDTO: i64 = 44;
          pub const RECVFROM: i64 = 45; pub const EPOLL_CREATE1: i64 = 291; pub const EPOLL_CTL: i64 = 233;
-         pub const UNSHARE: i64 = 272; }
+         pub const UNSHARE: i64 = 272; pub const KILL: i64 = 62; pub const SIGPROCMASK: i64 = 14;
+         pub const SIGTIMEDWAIT: i64 = 128; }
 
 unsafe fn sys(n: i64, a: [i64; 6]) -> i64 { rt::raw_syscall(n, a) }
 
@@ -966,4 +970,31 @@ unsafe fn test_clone_files_netlink_netns() -> bool {
     let err = if n >= 20 { i32::from_ne_bytes([r[16], r[17], r[18], r[19]]) } else { -1 };
     close(fd as c_int);
     report(name, s == 32 && ty == 2 && err == 0)
+}
+
+const SIGUSR1_BIT: u64 = 1 << 9;
+
+/// pasta's startup handshake: SIGUSR1 blocked before clone, the child parks in
+/// sigwaitinfo(SIGUSR1) and the parent kill()s it once set up. `flags` are
+/// extra clone flags (CLONE_NEWUSER|CLONE_NEWPID for pasta's ns child).
+unsafe fn sigwait_kill_case(name: &[u8], flags: i64) -> bool {
+    let set = SIGUSR1_BIT;
+    if sys(nr::SIGPROCMASK, [0, &set as *const u64 as i64, 0, 8, 0, 0]) != 0 { return report(name, false); }
+    let pid = clone_plain(flags);
+    if pid < 0 { return report(name, false); }
+    if pid == 0 {
+        // 3 s timeout: EAGAIN (-11) means the signal never arrived.
+        let ts: [i64; 2] = [3, 0];
+        let r = sys(nr::SIGTIMEDWAIT, [&set as *const u64 as i64, 0, ts.as_ptr() as i64, 8, 0, 0]);
+        _exit(if r == 10 { 0 } else { 1 });
+    }
+    usleep(200_000);
+    let k = sys(nr::KILL, [pid as i64, 10, 0, 0, 0, 0]);
+    let rc = reap_code(pid);
+    report(name, k == 0 && rc == 0)
+}
+
+unsafe fn test_sigwait_kill() -> bool { sigwait_kill_case(b"sigwait_kill\0", 0) }
+unsafe fn test_sigwait_kill_pidns() -> bool {
+    sigwait_kill_case(b"sigwait_kill_pidns\0", 0x1000_0000 | 0x2000_0000)
 }
