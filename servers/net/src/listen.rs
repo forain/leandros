@@ -80,6 +80,12 @@ pub(crate) fn new_lid() -> u32 {
 pub(crate) fn stacks_for(ns: u16, local: IpEndpoint) -> alloc::vec::Vec<Sid> {
     let mut v = alloc::vec::Vec::new();
     let dynamic = crate::vif::ns_sids_dyn(ns);
+    if ns != 0 {
+        // Only its own lo (a down lo still holds the listener: it is just
+        // unreachable until up).
+        if local.addr.is_unspecified() || is_loopback_addr(local.addr) { v.extend(dynamic); }
+        return v;
+    }
     if local.addr.is_unspecified() {
         v.push(LO);
         v.extend(iface::nic_sids());

@@ -53,6 +53,7 @@ pub(crate) fn nic_sids() -> impl Iterator<Item = Sid> { (0..netdev::count() as u
 /// stacks; another namespace = its own dynamic stacks, plus (until the void
 /// gates go) the legacy lo + NICs.
 pub(crate) fn ns_sids(ns: u16) -> alloc::vec::Vec<Sid> {
+    if ns != 0 { return crate::vif::ns_sids_dyn(ns); }
     let mut v: alloc::vec::Vec<Sid> = core::iter::once(LO).chain(nic_sids()).collect();
     v.extend(crate::vif::ns_sids_dyn(ns));
     v
@@ -148,7 +149,9 @@ pub(crate) fn is_broadcast(addr: IpAddress) -> bool {
 /// does not hold falls through to the netns-0 table exactly as before.
 pub(crate) fn route_select(ns: u16, dst: IpAddress) -> Option<Sid> {
     if ns != 0 {
-        if let Some(d) = v4(dst) { if let Some(s) = crate::vif::route_in_ns(ns, d) { return Some(s); } }
+        // A non-initial netns sees only its own stacks: no fall-through to
+        // netns 0's lo or NICs.
+        return v4(dst).and_then(|d| crate::vif::route_in_ns(ns, d));
     }
     if is_loopback(dst) { return Some(LO); }
     let d = v4(dst)?;
@@ -220,7 +223,8 @@ pub(crate) fn weak_host_holder(netif: u8, dst: [u8; 4]) -> Option<Sid> {
 /// True when the stack can carry a new flow to `dst` (has an address and
 /// carrier, and `dst` is on-link or it has a default route).
 pub(crate) fn can_route(sid: Sid, dst: IpAddress) -> bool {
-    if sid == LO { return is_loopback(dst); }
+    // A dynamic sid is a netns's lo for now (tap/veth later get their own arm).
+    if sid == LO || sid >= FIRST_DYN { return is_loopback(dst); }
     let Some(d) = v4(dst) else { return false };
     let r = rt(sid - 1);
     match r.cfg {

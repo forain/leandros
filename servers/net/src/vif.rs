@@ -57,7 +57,57 @@ fn on_ns_gone(id: sched::ns::NsId) {
 }
 
 /// Install the hook (once, from the daemon's start).
-pub(crate) fn init() { sched::ns::set_ns_gone_hook(on_ns_gone); }
+pub(crate) fn init() {
+    sched::ns::set_ns_gone_hook(on_ns_gone);
+    sched::ns::set_lo_hook(set_lo);
+}
+
+/// The sid of `ns`'s loopback stack when its lo is up (never for ns 0).
+pub(crate) fn lo_up_sid(ns: u16) -> Option<Sid> {
+    if ns == 0 { return None; }
+    let n = NETNS.lock();
+    let l = n.get(&ns)?.lo?;
+    let v = VIFS.lock();
+    v[l as usize].as_ref().filter(|x| x.admin_up).map(|_| l)
+}
+
+/// Bring `ns`'s `lo` up or down. The first up allocates its stack (127.0.0.1/8,
+/// the same `LoopDev` as sid 0); later ups and downs only flip the admin bit,
+/// the stack and its sockets stay.
+pub(crate) fn set_lo(ns: u16, up: bool) {
+    if ns == 0 { return; }
+    // A previous owner of this id may not have been reaped yet.
+    let (w, b) = (ns as usize / 64 & 3, ns % 64);
+    if GONE[w].fetch_and(!(1 << b), Ordering::AcqRel) & (1 << b) != 0 { reap(ns); }
+    // Existing lo: flip the bit.
+    {
+        let n = NETNS.lock();
+        if let Some(l) = n.get(&ns).and_then(|s| s.lo) {
+            let mut v = VIFS.lock();
+            if let Some(x) = v[l as usize].as_mut() { x.admin_up = up; }
+            return;
+        }
+    }
+    if !up { return; }
+    // Slots exhausted: namespaces that died since the daemon's last pass.
+    if !VIFS.lock()[FIRST_DYN as usize..].iter().any(|x| x.is_none()) { daemon_pass(); }
+    let sid = {
+        let mut n = NETNS.lock();
+        let mut v = VIFS.lock();
+        let Some(sid) = (FIRST_DYN as usize..MAX_STACKS).find(|&i| v[i].is_none()) else { return };
+        let st = n.entry(ns).or_insert_with(|| NetNsState::new(ns));
+        let mut name = [0u8; 16];
+        name[..2].copy_from_slice(b"lo");
+        v[sid] = Some(Vif {
+            netns: ns, ifindex: 1, name, kind: VifKind::Lo, admin_up: true, mtu: 65536, mac: [0; 6],
+            addrs: alloc::vec![([127, 0, 0, 1], 8)], rxq: Default::default(), pending: false,
+        });
+        st.lo = Some(sid as Sid);
+        st.sids.insert(0, sid as Sid);
+        sid as Sid
+    };
+    *crate::STACKS[sid as usize].lock() = Some(crate::make_loopback_stack());
+}
 
 /// Daemon pass: free the vifs and stacks of every namespace that died. A
 /// reused id cannot race: the bit is cleared before the state is looked up,
