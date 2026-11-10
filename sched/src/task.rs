@@ -484,6 +484,9 @@ pub struct Task {
     pub persona: u32,
     /// User namespace (0 = initial); one counted reference.
     pub userns: crate::ns::NsRef,
+    /// Linux `mm->user_ns`: the user namespace of the task at exec (mm creation). Copied across
+    /// fork/clone; unshare(CLONE_NEWUSER) and setns do not change it. One counted reference.
+    pub mm_userns: crate::ns::NsRef,
     /// Active pid namespace (0 = initial); immutable after creation. One counted reference.
     pub pidns: crate::ns::NsRef,
     /// pid_for_children: the namespace this task's children are placed in.
@@ -898,6 +901,7 @@ impl Task {
             euid: 0,
             caps: crate::caps::ROOT_CAPS,
             userns: crate::ns::NsRef::INIT,
+            mm_userns: crate::ns::NsRef::INIT,
             pidns: crate::ns::NsRef::INIT,
             pidns_child: crate::ns::NsRef::INIT,
             netns: crate::ns::NsRef::INIT,
@@ -1340,6 +1344,7 @@ impl Task {
             euid: 0,
             caps: crate::caps::ROOT_CAPS,
             userns: crate::ns::NsRef::INIT,
+            mm_userns: crate::ns::NsRef::INIT,
             pidns: crate::ns::NsRef::INIT,
             pidns_child: crate::ns::NsRef::INIT,
             netns: crate::ns::NsRef::INIT,

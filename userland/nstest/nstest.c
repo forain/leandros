@@ -3137,16 +3137,16 @@ static int run_userns_cases(void)
     return 0;
 }
 
-/* pasta: a root that dropped to nobody (non-dumpable) opens the /proc/<pid>/ns/net of its
- * own child that sits in a fresh user+net namespace, then setns()es nothing: open only. */
-static void nobody_opens_child_ns(void)
+/* A forks B; B unshare(NEWUSER|NEWNET); A opens /proc/B/ns/net. drop != 0: A first drops to
+ * nobody (setuid clears dumpable). Returns 0 on open success, else the errno (or 1000+step). */
+static int child_ns_open(int drop)
 {
-    int pfd[2], ok = 0;
+    int pfd[2];
     char c;
-    if (pipe(pfd)) { check("nobody_opens_child_ns", 0); return; }
+    if (pipe(pfd)) return 1000;
     pid_t a = fork();
     if (a == 0) {
-        if (drop_to(65534)) _exit(2);
+        if (drop && drop_to(65534)) _exit(2);
         pid_t b = fork();
         if (b == 0) {
             if (unshare(CLONE_NEWUSER | CLONE_NEWNET)) _exit(3);
@@ -3163,9 +3163,26 @@ static void nobody_opens_child_ns(void)
         _exit(0);
     }
     int st = 0;
-    if (a > 0 && waitpid(a, &st, 0) == a && WIFEXITED(st) && WEXITSTATUS(st) == 0) ok = 1;
-    else printf("  nobody_opens_child_ns status 0x%x\n", st);
-    check("nobody_opens_child_ns", ok);
+    if (a < 0 || waitpid(a, &st, 0) != a || !WIFEXITED(st)) return 1001;
+    int r = WEXITSTATUS(st);
+    return r >= 10 ? r - 10 : (r ? 1000 + r : 0);
+}
+
+/* Root pasta: setuid(65534) clears dumpable and mm->user_ns stays init, so Linux fails
+ * open(/proc/<child>/ns/net) with EACCES ("Failed to join network namespace"; verified on real Linux). */
+static void nobody_drop_child_ns_denied(void)
+{
+    int e = child_ns_open(1);
+    if (e != EACCES) printf("  nobody_drop_child_ns_denied got %d\n", e);
+    check("nobody_drop_child_ns_denied", e == EACCES);
+}
+
+/* Rootless pasta/podman: no id change, stays dumpable, so the open succeeds. */
+static void user_opens_child_ns(void)
+{
+    int e = child_ns_open(0);
+    if (e) printf("  user_opens_child_ns got %d\n", e);
+    check("user_opens_child_ns", e == 0);
 }
 
 /* A same-uid sibling with no caps in a userns must NOT open a non-dumpable target's
@@ -3214,8 +3231,61 @@ static void sibling_nondumpable_denied(void)
     check("sibling_nondumpable_denied", ok);
 }
 
+/* P holds caps only in a userns it unshared; its child C (still on the pre-unshare mm, so
+ * mm->user_ns is the initial ns) is non-dumpable: P must NOT open /proc/C/ns/net (Linux checks
+ * CAP_SYS_PTRACE in mm->user_ns for a non-dumpable mm). When C execs inside the userns first,
+ * mm->user_ns is that userns and P is allowed. */
+static void userns_cap_case(const char *name, int do_exec)
+{
+    int ok = 0;
+    pid_t a = fork();
+    if (a == 0) {
+        int ready[2], go[2];
+        if (drop_to(65534) || pipe(ready) || pipe(go)) _exit(2);
+        if (unshare(CLONE_NEWUSER)) _exit(3);
+        pid_t cpid = fork();
+        if (cpid == 0) {
+            char c = 'r';
+            if (do_exec) {
+                char fdb[16];
+                snprintf(fdb, sizeof fdb, "%d", ready[1]);
+                char gb[16];
+                snprintf(gb, sizeof gb, "%d", go[0]);
+                execl("/bin/nstest", "nstest", "--nondump", fdb, gb, (char *)0);
+                _exit(4);
+            }
+            if (prctl(PR_SET_DUMPABLE, 0)) _exit(5);
+            if (write(ready[1], &c, 1) != 1) _exit(6);
+            if (read(go[0], &c, 1) < 0) _exit(7);
+            _exit(0);
+        }
+        char c;
+        if (read(ready[0], &c, 1) != 1) _exit(8);
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%d/ns/net", (int)cpid);
+        int fd = open(path, O_RDONLY);
+        int e = errno, bad = do_exec ? (fd < 0) : (fd >= 0 || e != EACCES);
+        if (fd >= 0) close(fd);
+        if (write(go[1], "g", 1) != 1) bad |= 2;
+        int st = 0;
+        waitpid(cpid, &st, 0);
+        _exit(bad ? 20 + bad : 0);
+    }
+    int st = 0;
+    if (a > 0 && waitpid(a, &st, 0) == a && WIFEXITED(st) && WEXITSTATUS(st) == 0) ok = 1;
+    else printf("  %s status 0x%x\n", name, st);
+    check(name, ok);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 3 && !strcmp(argv[1], "--nondump")) {
+        char c = 'r';
+        if (prctl(PR_SET_DUMPABLE, 0)) return 5;
+        if (write(atoi(argv[2]), &c, 1) != 1) return 6;
+        if (read(atoi(argv[3]), &c, 1) < 0) return 7;
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "--euid")) return print_euid();
     if (getenv("NSTEST_HOST")) { printf("nstest: SKIP (host)\n"); return 0; }
     for (unsigned i = 0; i < sizeof flags / sizeof flags[0]; i++) {
@@ -3232,7 +3302,7 @@ int main(int argc, char **argv)
         snprintf(nm, sizeof nm, "unshare_%s_einval", flags[i].n);
         check(nm, r == -1 && e == EINVAL);
     }
-    if (geteuid() == 0) { run_userns_cases(); nobody_opens_child_ns(); sibling_nondumpable_denied(); } else printf("SKIP userns cases: not root\n");
+    if (geteuid() == 0) { run_userns_cases(); nobody_drop_child_ns_denied(); user_opens_child_ns(); sibling_nondumpable_denied(); userns_cap_case("userns_cap_nondumpable_denied", 0); userns_cap_case("userns_cap_exec_in_ns_allowed", 1); } else printf("SKIP userns cases: not root\n");
     /* A plain fork-style clone still works. */
     long r = do_clone(0);
     int ok = r >= 0;
