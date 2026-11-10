@@ -63,6 +63,8 @@ struct St {
 }
 static FWD: Mutex<St> = Mutex::new(St { ct: Vec::new(), arp: Vec::new(), pend: Vec::new(),
     txq: VecDeque::new(), inq: VecDeque::new(), next: 0, swept: 0 });
+/// Live NAT/conntrack entries (/proc/net/nic `fwd:` line).
+pub(crate) fn ct_len() -> usize { FWD.lock().ct.len() }
 /// Set at the first forwarded flow: the NIC rx hook costs one load until then.
 static USED: AtomicBool = AtomicBool::new(false);
 static TXQ_N: AtomicUsize = AtomicUsize::new(0);
