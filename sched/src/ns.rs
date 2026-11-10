@@ -1071,7 +1071,7 @@ pub fn setns_cgroup(id: NsId) -> isize {
 // ── /proc/sys/net (per network namespace) ────────────────────────────────────
 
 pub struct NetCtl { pub path: &'static str, pub def: u32, pub max: u32, pub pair: bool }
-pub const NETCTL_N: usize = 36;
+pub const NETCTL_N: usize = 39;
 /// Entries with `pair` own this slot and the next ("lo hi" files); the next has an empty path.
 pub static NETCTL: [NetCtl; NETCTL_N] = [
     NetCtl { path: "core/somaxconn", def: 4096, max: 2147483647, pair: false },
@@ -1110,6 +1110,9 @@ pub static NETCTL: [NetCtl; NETCTL_N] = [
     NetCtl { path: "ipv6/conf/lo/forwarding", def: 0, max: 1, pair: false },
     NetCtl { path: "ipv6/conf/lo/accept_ra", def: 1, max: 2, pair: false },
     NetCtl { path: "ipv6/conf/lo/accept_dad", def: 1, max: 2, pair: false },
+    NetCtl { path: "ipv6/conf/all/autoconf", def: 1, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/default/autoconf", def: 1, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/lo/autoconf", def: 1, max: 1, pair: false },
 ];
 const fn netctl_init() -> [[AtomicU32; NETCTL_N]; NS_MAX] {
     let mut out = [const { [const { AtomicU32::new(0) }; NETCTL_N] }; NS_MAX];
@@ -1121,12 +1124,19 @@ const fn netctl_init() -> [[AtomicU32; NETCTL_N]; NS_MAX] {
     out
 }
 static NETCTL_V: [[AtomicU32; NETCTL_N]; NS_MAX] = netctl_init();
-fn netctl_reset(id: usize) { for k in 0..NETCTL_N { NETCTL_V[id][k].store(NETCTL[k].def, Release); } }
+fn netctl_reset(id: usize) {
+    for k in 0..NETCTL_N { NETCTL_V[id][k].store(NETCTL[k].def, Release); }
+    let mut t = IFCTL.lock();
+    for e in t.iter_mut() { if e.used && e.ns as usize == id { e.used = false; } }
+}
 /// Slot of the file `rel` (path below /proc/sys/net/).
 pub fn netctl_find(rel: &[u8]) -> Option<usize> {
     NETCTL.iter().position(|c| !c.path.is_empty() && c.path.as_bytes() == rel)
 }
-pub fn netctl_get(ns: NsId, k: usize) -> u32 { NETCTL_V[ns as usize][k].load(Acquire) }
+pub fn netctl_get(ns: NsId, k: usize) -> u32 {
+    if k >= NETCTL_N { return ifctl_get(ns, k); }
+    NETCTL_V[ns as usize][k].load(Acquire)
+}
 /// Text of file `k` in netns `ns` (value, or "lo\thi" for pairs), with trailing newline.
 pub fn netctl_text(ns: NsId, k: usize, out: &mut [u8]) -> usize {
     let mut n = 0;
@@ -1136,12 +1146,13 @@ pub fn netctl_text(ns: NsId, k: usize, out: &mut [u8]) -> usize {
         while i > 0 { i -= 1; out[*n] = d[i]; *n += 1; }
     }
     num(netctl_get(ns, k), out, &mut n);
-    if NETCTL[k].pair { out[n] = b'\t'; n += 1; num(netctl_get(ns, k + 1), out, &mut n); }
+    if k < NETCTL_N && NETCTL[k].pair { out[n] = b'\t'; n += 1; num(netctl_get(ns, k + 1), out, &mut n); }
     out[n] = b'\n';
     n + 1
 }
 /// Parse and store a write to file `k` of netns `ns`. Negative errno on failure.
 pub fn netctl_set(ns: NsId, k: usize, data: &[u8]) -> isize {
+    if k >= NETCTL_N { return ifctl_set(ns, k, data); }
     let mut v = [0u64; 2]; let mut cnt = 0; let mut i = 0;
     while i < data.len() {
         let c = data[i];
@@ -1157,7 +1168,149 @@ pub fn netctl_set(ns: NsId, k: usize, data: &[u8]) -> isize {
     for j in 0..want { if v[j] > NETCTL[k + j].max as u64 { return -22; } }
     if want == 2 && NETCTL[k].path != "ipv4/ping_group_range" && v[0] > v[1] { return -22; }
     for j in 0..want { NETCTL_V[ns as usize][k + j].store(v[j] as u32, Release); }
+    // Linux devinet_ctl: ip_forward and conf/all/forwarding set every interface.
+    let p = NETCTL[k].path;
+    if p == "ipv4/ip_forward" || p == "ipv4/conf/all/forwarding" {
+        fwd4_fanout(ns, v[0] as u32);
+    }
     0
+}
+
+// ── per-interface entries (/proc/sys/net/ipv{4,6}/conf/<if>/...) ─────────────
+
+/// Fields of one interface, in slot order. Slot = NETCTL_N + entry * IF_STRIDE + field.
+const IF_FIELDS: [(&str, &str, u32); 9] = [
+    ("ipv4", "forwarding", 1), ("ipv4", "rp_filter", 2), ("ipv4", "route_localnet", 1), ("ipv4", "arp_notify", 1),
+    ("ipv6", "disable_ipv6", 1), ("ipv6", "forwarding", 1), ("ipv6", "accept_ra", 2), ("ipv6", "accept_dad", 2),
+    ("ipv6", "autoconf", 1),
+];
+const IF_STRIDE: usize = 16;
+const IF_MAX: usize = 64;
+#[derive(Clone, Copy)]
+struct IfEnt { used: bool, ns: u16, nlen: u8, name: [u8; 16], v: [u32; 9] }
+static IFCTL: spin::Mutex<[IfEnt; IF_MAX]> =
+    spin::Mutex::new([IfEnt { used: false, ns: 0, nlen: 0, name: [0; 16], v: [0; 9] }; IF_MAX]);
+/// `fn(ns, index, name_out) -> len` (0 = no interface at `index`): the names of the links of a netns.
+static IF_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub fn set_ifnames_hook(f: fn(NsId, usize, &mut [u8; 16]) -> usize) { IF_HOOK.store(f as usize, Release); }
+fn if_name(ns: NsId, idx: usize, out: &mut [u8; 16]) -> usize {
+    let h = IF_HOOK.load(Acquire);
+    if h == 0 { return 0; }
+    // SAFETY: only `set_ifnames_hook` stores here.
+    let f: fn(NsId, usize, &mut [u8; 16]) -> usize = unsafe { core::mem::transmute(h) };
+    f(ns, idx, out)
+}
+fn if_exists(ns: NsId, name: &[u8]) -> bool {
+    let mut b = [0u8; 16];
+    let mut i = 0;
+    loop {
+        let l = if_name(ns, i, &mut b);
+        if l == 0 { return false; }
+        if &b[..l] == name { return true; }
+        i += 1;
+        if i > 64 { return false; }
+    }
+}
+fn static_field(ns: NsId, scope: &str, ipv: &str, field: &str) -> u32 {
+    let mut buf = [0u8; 64]; let mut n = 0;
+    for part in [ipv, "/conf/", scope, "/", field] { for &c in part.as_bytes() { buf[n] = c; n += 1; } }
+    netctl_find(&buf[..n]).map(|k| netctl_get(ns, k)).unwrap_or(0)
+}
+/// Find or create the entry of `(ns, name)`, new ones inheriting `conf/default`. Drops stale entries of `ns`.
+fn ifctl_entry(ns: NsId, name: &[u8]) -> Option<usize> {
+    if name.is_empty() || name.len() > 15 { return None; }
+    if !if_exists(ns, name) { return None; }
+    let mut t = IFCTL.lock();
+    let mut free = None;
+    for (i, e) in t.iter().enumerate() {
+        if e.used && e.ns == ns && &e.name[..e.nlen as usize] == name { return Some(i); }
+        if !e.used && free.is_none() { free = Some(i); }
+    }
+    // Reclaim entries of links that are gone before giving up.
+    if free.is_none() {
+        for i in 0..IF_MAX {
+            let e = t[i];
+            if e.used && !if_exists_unlocked(e.ns, &e.name[..e.nlen as usize]) { t[i].used = false; if free.is_none() { free = Some(i); } }
+        }
+    }
+    let i = free?;
+    let mut v = [0u32; 9];
+    for (j, f) in IF_FIELDS.iter().enumerate() { v[j] = static_field(ns, "default", f.0, f.1); }
+    let mut nm = [0u8; 16]; nm[..name.len()].copy_from_slice(name);
+    t[i] = IfEnt { used: true, ns, nlen: name.len() as u8, name: nm, v };
+    Some(i)
+}
+fn if_exists_unlocked(ns: NsId, name: &[u8]) -> bool { if_exists(ns, name) }
+/// Forget entries of `ns` whose link no longer exists (a re-created link starts from the defaults again).
+fn ifctl_prune(ns: NsId) {
+    let mut i = 0;
+    while i < IF_MAX {
+        let e = { let t = IFCTL.lock(); t[i] };
+        if e.used && e.ns == ns && !if_exists(ns, &e.name[..e.nlen as usize]) {
+            let mut t = IFCTL.lock();
+            if t[i].used && t[i].ns == ns && t[i].name == e.name { t[i].used = false; }
+        }
+        i += 1;
+    }
+}
+/// Slot of `/proc/sys/net/<rel>` as seen from netns `ns` (static files, then per-interface ones).
+pub fn netctl_find_ns(ns: NsId, rel: &[u8]) -> Option<usize> {
+    if let Some(k) = netctl_find(rel) { return Some(k); }
+    let rest = if let Some(r) = rel.strip_prefix(b"ipv4/conf/") { (0usize, r) }
+        else if let Some(r) = rel.strip_prefix(b"ipv6/conf/") { (1usize, r) } else { return None };
+    let sl = rest.1.iter().position(|&c| c == b'/')?;
+    let (name, field) = (&rest.1[..sl], &rest.1[sl + 1..]);
+    let ipv = if rest.0 == 0 { "ipv4" } else { "ipv6" };
+    let f = IF_FIELDS.iter().position(|f| f.0 == ipv && f.1.as_bytes() == field)?;
+    ifctl_prune(ns);
+    let e = ifctl_entry(ns, name)?;
+    Some(NETCTL_N + e * IF_STRIDE + f)
+}
+fn ifctl_get(ns: NsId, k: usize) -> u32 {
+    let (e, f) = ((k - NETCTL_N) / IF_STRIDE, (k - NETCTL_N) % IF_STRIDE);
+    let t = IFCTL.lock();
+    if e < IF_MAX && f < 9 && t[e].used && t[e].ns == ns { t[e].v[f] } else { 0 }
+}
+fn ifctl_set(ns: NsId, k: usize, data: &[u8]) -> isize {
+    let (e, f) = ((k - NETCTL_N) / IF_STRIDE, (k - NETCTL_N) % IF_STRIDE);
+    if e >= IF_MAX || f >= 9 { return -2; }
+    let mut x = 0u64; let mut seen = false;
+    for &c in data {
+        if c.is_ascii_digit() { x = x * 10 + (c - b'0') as u64; seen = true; if x > u32::MAX as u64 { return -22; } }
+        else if c == b'\n' || c == b' ' || c == b'\0' || c == b'\t' { } else { return -22; }
+    }
+    if !seen || x > IF_FIELDS[f].2 as u64 { return -22; }
+    let mut t = IFCTL.lock();
+    if !(t[e].used && t[e].ns == ns) { return -2; }
+    t[e].v[f] = x as u32;
+    0
+}
+/// Linux `devinet_ctl` forward-all: set all/default/lo and every link's `ipv4 forwarding`; mirrors ip_forward.
+fn fwd4_fanout(ns: NsId, v: u32) {
+    for p in ["ipv4/ip_forward", "ipv4/conf/all/forwarding", "ipv4/conf/default/forwarding", "ipv4/conf/lo/forwarding"] {
+        if let Some(k) = netctl_find(p.as_bytes()) { NETCTL_V[ns as usize][k].store(v, Release); }
+    }
+    let mut i = 0; let mut b = [0u8; 16];
+    loop {
+        let l = if_name(ns, i, &mut b);
+        if l == 0 || i > 64 { break; }
+        if let Some(e) = ifctl_entry(ns, &b[..l]) { IFCTL.lock()[e].v[0] = v; }
+        i += 1;
+    }
+}
+/// IPv4 forwarding state of interface `ifname` in netns `ns` (the forward gate of the net server).
+pub fn forwarding(ns: NsId, ifname: &[u8]) -> bool {
+    match ifname {
+        b"all" | b"default" | b"lo" => {
+            let p: &[u8] = match ifname { b"all" => b"ipv4/conf/all/forwarding", b"default" => b"ipv4/conf/default/forwarding", _ => b"ipv4/conf/lo/forwarding" };
+            netctl_find(p).map(|k| netctl_get(ns, k) != 0).unwrap_or(false)
+        }
+        _ => {
+            { let t = IFCTL.lock();
+              for e in t.iter() { if e.used && e.ns == ns && &e.name[..e.nlen as usize] == ifname { return e.v[0] != 0; } } }
+            static_field(ns, "default", "ipv4", "forwarding") != 0
+        }
+    }
 }
 /// May `pid` (an unprivileged ICMP "ping" socket) be created in its netns?
 pub fn ping_allowed(pid: u32) -> bool {
