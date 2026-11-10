@@ -430,6 +430,7 @@ pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
             0
         }
         RtOp::AddAddr { index, addr, prefix, excl } => {
+            crate::nlsock::trace_out("DBG addaddr enter");
             let (sid, addrs);
             {
                 let nss = NETNS.lock();
@@ -443,7 +444,9 @@ pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
                 x.addrs.push((addr, prefix));
                 addrs = x.addrs.clone();
             }
+            crate::nlsock::trace_out("DBG addaddr locks released");
             sync_addrs(sid, &addrs);
+            crate::nlsock::trace_out("DBG addaddr synced");
             drivers::netdev::kick();
             0
         }
