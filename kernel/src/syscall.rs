@@ -9388,20 +9388,23 @@ fn may_mount() -> bool {
 /// the namespace (the hidden superblock space) never leaks out: EINVAL.
 fn resolve_mount_target(target_ptr: usize) -> Result<Vec<u8>, isize> {
     let p = resolve_user_path(target_ptr)?;
-    if let Some((fd, b"")) = proc_own_fd(p.ns_bytes()) {
-        let host = fd_host_path(fd).ok_or(-22isize)?;
-        let mns = sched::current_mntns();
-        let ns = if mns != 0 {
-            vfs::mnt::reverse(mns, &host, 0)
-        } else {
-            Some(host)
-        };
-        return match ns {
-            Some(n) if !vfs::mnt::is_sb_path(&n) => Ok(n),
-            _ => Err(-22),
-        };
-    }
+    if let Some((fd, b"")) = proc_own_fd(p.ns_bytes()) { return fd_mount_ns_path(fd); }
     Ok(p.ns_bytes().to_vec())
+}
+
+/// The namespace path of the directory descriptor `fd` for a mount(2) target.
+fn fd_mount_ns_path(fd: usize) -> Result<Vec<u8>, isize> {
+    let mut host = fd_host_path(fd).ok_or(-2isize)?;
+    // A cgroup2 directory reports its absolute cgroup path, but the tree is
+    // served relative to the reader's cgroup namespace root: a descriptor
+    // anywhere in it names the mount point /sys/fs/cgroup.
+    if vfs::cgroupfs::is_path(&host) { host.truncate(vfs::cgroupfs::ROOT.len()); }
+    let mns = sched::current_mntns();
+    let ns = if mns != 0 { vfs::mnt::reverse_newest(mns, &host) } else { Some(host) };
+    match ns {
+        Some(n) if !vfs::mnt::is_sb_path(&n) => Ok(n),
+        _ => Err(-22),
+    }
 }
 
 /// The mount point of a mount(2) that creates or binds a mount. A target that
@@ -9411,15 +9414,7 @@ fn resolve_mount_target(target_ptr: usize) -> Result<Vec<u8>, isize> {
 /// A backing path with no name in the namespace never leaks out: EINVAL.
 fn mount_target_kpath(target_ptr: usize) -> Result<KPath, isize> {
     if let Ok(raw) = copy_user_str(target_ptr, 4096) {
-        if let Some((fd, b"")) = proc_own_fd(&raw) {
-            let host = fd_host_path(fd).ok_or(-2isize)?;
-            let mns = sched::current_mntns();
-            let ns = if mns != 0 { vfs::mnt::reverse(mns, &host, 0) } else { Some(host) };
-            return match ns {
-                Some(n) if !vfs::mnt::is_sb_path(&n) => KPath::from_ns(n),
-                _ => Err(-22),
-            };
-        }
+        if let Some((fd, b"")) = proc_own_fd(&raw) { return KPath::from_ns(fd_mount_ns_path(fd)?); }
     }
     resolve_user_path(target_ptr)
 }
@@ -9493,7 +9488,7 @@ fn sys_mount(
         match read_user_short_str(fstype_ptr) { Ok(v) => v, Err(e) => return e }
     };
     let alias_src: Option<(Vec<u8>, &'static str)> = if flags & MS_BIND != 0 {
-        let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
+        let src = match mount_target_kpath(source_ptr) { Ok(p) => p, Err(e) => return e };
         // Binding /proc/<pid>/ns/<name> keeps that namespace alive.
         match vfs::nsfs_bind_source(src.ns_bytes(), current_pid()) {
             Err(e) => return e,
@@ -9757,7 +9752,7 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
     let tns = target.ns_bytes().to_vec();
     let tdir = match kpath_is_dir(&target) { Ok(d) => d, Err(e) => return e };
     if flags & MS_BIND != 0 {
-        let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
+        let src = match mount_target_kpath(source_ptr) { Ok(p) => p, Err(e) => return e };
         // Binding /proc/<pid>/ns/<name> onto a file keeps that namespace
         // alive: the mount's superblock owns the reference.
         match vfs::nsfs_bind_source(src.ns_bytes(), current_pid()) {

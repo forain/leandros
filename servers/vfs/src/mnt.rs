@@ -178,6 +178,25 @@ pub fn reverse(ns: NsId, backing: &[u8], hint: u32) -> Option<Vec<u8>> {
     None
 }
 
+/// Like [`reverse`] for a descriptor whose mount is unknown: among the mounts
+/// whose path round-trips, the newest wins (a container's rootfs mounts are
+/// newer than the copies of the host's, which cover the same backing paths).
+pub fn reverse_newest(ns: NsId, backing: &[u8]) -> Option<Vec<u8>> {
+    let g = NS.lock();
+    let t = &g.get(&ns)?.mnts;
+    let mut order: Vec<usize> = (0..t.len()).collect();
+    order.sort_by_key(|&i| core::cmp::Reverse(t[i].id));
+    for i in order {
+        let m = &t[i];
+        if !under(backing, &m.root) { continue; }
+        let mp = ns_mountpoint(t, i);
+        let rest: &[u8] = if &*m.root == b"/" { backing } else { &backing[m.root.len()..] };
+        let cand = join(&mp, rest);
+        if let Some(x) = walk(t, &cand) { if x.backing == backing { return Some(cand); } }
+    }
+    None
+}
+
 /// Does the namespace have a tree (i.e. was it created through [`copy`])?
 pub fn has_tree(ns: NsId) -> bool { NS.lock().contains_key(&ns) }
 
