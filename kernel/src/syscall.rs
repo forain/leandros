@@ -6235,6 +6235,8 @@ fn parse_shebang(buf: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
 /// (ENOSYS: the initrd) falls back to the stat mode bits.
 fn exec_permitted(kp: &KPath, pid: u32) -> isize {
     const X_OK: u64 = 1;
+    // MS_NOEXEC on the file's mount (mount namespaces other than the host's).
+    if kp.mnt_id != 0 && vfs::mnt::flags_of(sched::current_mntns(), kp.mnt_id) & vfs::mnt::MNT_NOEXEC != 0 { return -13; }
     let amsg = make_vfs_msg(vfs::VFS_ACCESS, &[kp.ptr() as u64, X_OK]);
     let ar = vfs_reply_val(&vfs::handle(&amsg, pid));
     // Only a refusal is an answer: a missing file (ENOENT) or a filesystem
@@ -7096,7 +7098,29 @@ fn sys_execve_kp(kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: boo
     sched::robust::release_current();
     let pre_tid = current_pid();
     sched::dethread_current_group();
-    // exec unshares: a private table becomes the process table.
+    // exec unshares: an owner whose table CLONE_FILES children share keeps a
+    // private copy (they keep the original); a task on someone else's table
+    // (or a private one shared with other processes) leaves it with a copy.
+    let exec_tgid = sched::current_tgid();
+    let mut exec_copied = false;
+    if sched::fdkey::any() {
+        match sched::fdkey::override_of(pre_tid) {
+            None => {
+                if let Some(n) = fd_detach_sharers(exec_tgid) {
+                    exec_copied = vfs::copy_fd_table(n, exec_tgid, exec_tgid);
+                }
+            }
+            Some(k) => {
+                let shared = if k & sched::fdkey::FD_KEY_PRIVATE != 0 { sched::fdkey::users(k, exec_tgid) > 1 }
+                             else { k != exec_tgid };
+                if shared && vfs::copy_fd_table(k, exec_tgid, exec_tgid) {
+                    let _ = sched::fdkey::drop(pre_tid);
+                    exec_copied = true;
+                }
+            }
+        }
+        if exec_copied { fd_redup_handles(exec_tgid); }
+    }
     if let Some((key, tgid, _)) = sched::fdkey::drop(pre_tid) {
         for (_, h) in vfs::handle_fds(tgid) { close_handle(pre_tid, h); }
         let m = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[tgid as u64]);
@@ -8536,12 +8560,49 @@ fn fd_private() -> bool {
     sched::fdkey::any() && sched::fdkey::override_of(current_pid()).is_some()
 }
 
-fn fd_unshare_current() -> isize {
+/// Re-create every descriptor of `tid`'s table as its own handle: a socket or
+/// epoll handle is owned by exactly one descriptor (dup makes a new handle),
+/// so a copied table must not share handle numbers with its source.
+fn fd_redup_handles(tid: u32) {
     const F_GETFD: usize = 1;
+    for (fd, h) in vfs::handle_fds(tid) {
+        let cloexec = sys_fcntl(h, F_GETFD, 0) == 1;
+        let d = dup_handle(tid, h, cloexec);
+        if d >= 0 { let _ = vfs::install_handle_at(tid, fd, d as usize); }
+        else { let m = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]); let _ = vfs::handle(&m, tid); }
+    }
+}
+
+/// The owner of the plain process table `tgid` stops owning it while CLONE_FILES
+/// children still share it: the table moves to a private key those children
+/// now name (and the last of them frees). Returns that key.
+fn fd_detach_sharers(tgid: u32) -> Option<u32> {
+    if !sched::fdkey::any() || !sched::fdkey::has_sharers(tgid) { return None; }
+    let n = sched::fdkey::alloc_key();
+    vfs::rekey_table(tgid, n);
+    if sched::fdkey::rekey_shared(tgid, n) { Some(n) } else { vfs::rekey_table(n, tgid); None }
+}
+
+/// CLONE_FILES for a non-thread child: it names the creator's fd table.
+fn fd_share_with(parent_pid: u32, child_pid: u32) -> bool {
+    let key = vfs::tbl_key(parent_pid);
+    sched::fdkey::share(child_pid, key)
+}
+
+fn fd_unshare_current() -> isize {
     let tid = current_pid();
     let tgid = sched::current_tgid();
     let old = vfs::tbl_key(tgid);
-    if sched::fdkey::users(old, tgid) <= 1 { return 0; }
+    // The owner of a table CLONE_FILES children share: they keep the original,
+    // the caller continues on a copy.
+    if old == tgid && sched::fdkey::thread_group_single(tgid) {
+        if let Some(n) = fd_detach_sharers(tgid) {
+            if vfs::copy_fd_table(n, tgid, tgid) { fd_redup_handles(tgid); }
+            return 0;
+        }
+    }
+    let owner = if old & sched::fdkey::FD_KEY_PRIVATE != 0 { tgid } else { old };
+    if sched::fdkey::users(old, owner) <= 1 { return 0; }
     let new = sched::fdkey::alloc_key();
     if !vfs::copy_fd_table(tgid, new, tgid) { return 0; }
     if !sched::fdkey::set(tid, new, tgid) {
@@ -8549,15 +8610,7 @@ fn fd_unshare_current() -> isize {
         let _ = vfs::handle(&m, tid);
         return -12;
     }
-    // A socket or epoll handle is owned by exactly one descriptor (dup makes
-    // a new handle), so the copy must not share handle numbers with the old
-    // table.
-    for (fd, h) in vfs::handle_fds(tid) {
-        let cloexec = sys_fcntl(h, F_GETFD, 0) == 1;
-        let d = dup_handle(tid, h, cloexec);
-        if d >= 0 { let _ = vfs::install_handle_at(tid, fd, d as usize); }
-        else { let m = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]); let _ = vfs::handle(&m, tid); }
-    }
+    fd_redup_handles(tid);
     0
 }
 
@@ -9901,6 +9954,14 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
         if flags & !(MS_PROPAGATION | MS_REC) != 0 { return -22; }
         let target = match resolve_mount_target(target_ptr) { Ok(p) => p, Err(e) => return e };
         return vfs::mnt::set_propagation(mns, &target, flags) as isize;
+    }
+    // MS_REMOUNT (bind or not): the mount at the target gets exactly the new
+    // ro/nosuid/nodev/noexec set (clearing a locked flag is EPERM); fds opened
+    // read-write before keep working.
+    if flags & MS_REMOUNT != 0 && flags & MS_MOVE == 0 {
+        let target = match resolve_mount_target(target_ptr) { Ok(p) => p, Err(e) => return e };
+        let set = (flags & 0x0f) as u8;
+        return match vfs::mnt::setattr(mns, &target, set, !set & 0x0f, 0, flags & MS_REC != 0) { Ok(()) => 0, Err(e) => e as isize };
     }
     if flags & (MS_REMOUNT | MS_MOVE) != 0 || (flags & MS_PROPAGATION != 0 && flags & MS_BIND == 0) { return -22; }
     let target = match mount_target_kpath(target_ptr) { Ok(p) => p, Err(e) => return e };
@@ -12189,14 +12250,19 @@ fn undo_unborn_child(child: u32) {
 fn vfs_close_all_for(pid: u32) {
     // A thread's private fd table dies with its last user.
     if let Some((key, _tgid, last)) = sched::fdkey::drop(pid) {
-        if last {
+        // (A plain key names another process's table: its owner frees it.)
+        if last && key & sched::fdkey::FD_KEY_PRIVATE != 0 {
             for (_, h) in vfs::handle_fds(key) { close_handle(pid, h); }
             let m = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[key as u64]);
             let _ = vfs::handle(&m, pid);
         }
     }
-    let msg = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[pid as u64]);
-    let _ = vfs::handle(&msg, pid);
+    // CLONE_FILES children still on this process's table take it over.
+    let handed_over = sched::tgid_of(pid) == pid && fd_detach_sharers(pid).is_some();
+    if !handed_over {
+        let msg = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[pid as u64]);
+        let _ = vfs::handle(&msg, pid);
+    }
     // Net sockets and epoll instances are per-process (tgid-keyed), so only
     // a thread-group leader's exit tears them down — a plain pthread exiting
     // must not close the sockets its siblings still use.
@@ -17687,7 +17753,11 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
             // fix for the identical fork() case (see the FORK arm above).
             if flags & CLONE_THREAD == 0 {
                 child = child_pid;
-                fork_dup_tables(parent_pid, child_pid);
+                if flags & CLONE_FILES != 0 && fd_share_with(parent_pid, child_pid) {
+                    stdio_flags_fork(sched::tgid_of(parent_pid), child_pid);
+                } else {
+                    fork_dup_tables(parent_pid, child_pid);
+                }
                 drop_child_pidfd(child_pid);
             } else {
                 // A thread joins its creator's private fd table, if any.
@@ -17726,7 +17796,11 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
         let mut child = 0u32;
         let ret = sched::fork_current_with(frame_ptr, opts, |child_pid| {
             child = child_pid;
-            fork_dup_tables(parent_pid, child_pid);
+            if flags & CLONE_FILES != 0 && fd_share_with(parent_pid, child_pid) {
+                stdio_flags_fork(sched::tgid_of(parent_pid), child_pid);
+            } else {
+                fork_dup_tables(parent_pid, child_pid);
+            }
             drop_child_pidfd(child_pid);
         });
         if ret < 0 { undo_unborn_child(child); }
