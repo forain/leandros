@@ -179,6 +179,7 @@ const MSG_CMSG_CLOEXEC: i32 = 0x40000000;
 const AF_UNIX: i32 = 1;
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
+const SOCK_SEQPACKET: i32 = 5;
 const SOCK_DGRAM: i32 = 2;
 /// `unix_listen` answers EOPNOTSUPP — not EINVAL — for a socket type that
 /// cannot accept, and it checks the type before the address.
@@ -1441,6 +1442,10 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     if !test_fork_dup2_low_exec() { failures += 1; }
     if !test_socket_alias_epoll_close() { failures += 1; }
     if !test_pass_connected_socket() { failures += 1; }
+    if !test_seqpacket_short_path() { failures += 1; }
+    if !test_seqpacket_short_path_forked() { failures += 1; }
+    if !test_seqpacket_long_dir_via_procfd() { failures += 1; }
+    if !test_seqpacket_opath_sockfile_procfd() { failures += 1; }
     if !test_memfd_reopen_readonly() { failures += 1; }
     if !test_sendmsg_short_write_keeps_stream() { failures += 1; }
     if !test_send_on_pipe_enotsock() { failures += 1; }
@@ -2335,6 +2340,182 @@ unsafe fn socket_roundtrip_at(name: &[u8], cpath: *const u8) -> bool {
     close(cs); close(asf); close(ls);
     unlink(cpath);
     sock_ok && fwd_ok && rev_ok
+}
+
+/// Format `/proc/self/fd/<fd>/attach\0` into `buf`; returns the length without the NUL.
+fn fd_attach_path(buf: &mut [u8; 64], fd: i32) -> usize {
+    let pre = b"/proc/self/fd/";
+    buf[..pre.len()].copy_from_slice(pre);
+    let mut n = pre.len();
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    let mut v = fd as u32;
+    loop { digits[d] = b'0' + (v % 10) as u8; d += 1; v /= 10; if v == 0 { break; } }
+    while d > 0 { d -= 1; buf[n] = digits[d]; n += 1; }
+    let suf = b"/attach";
+    buf[n..n + suf.len()].copy_from_slice(suf);
+    n += suf.len();
+    buf[n] = 0;
+    n
+}
+
+/// conmon/podman's attach socket: the userdata dir path is over 108 bytes, so
+/// conmon binds a SOCK_SEQPACKET listener through `/proc/self/fd/<dirfd>/attach`
+/// and podman (another process, its own dirfd on the same directory) connects
+/// the same way. bind -> listen -> connect -> accept -> datagram both ways.
+unsafe fn test_seqpacket_long_dir_via_procfd() -> bool {
+    let name = b"seqpacket_long_dir_via_procfd\0";
+    let c1 = b"/tmp/atsk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0";
+    let c2 = b"/tmp/atsk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0";
+    let c3 = b"/tmp/atsk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/userdata\0";
+    let full = b"/tmp/atsk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/userdata/attach\0";
+    mkdir(c1.as_ptr(), 0o755); mkdir(c2.as_ptr(), 0o755); mkdir(c3.as_ptr(), 0o755);
+    let mut ok = true;
+    let mut step = 0i64;
+    let mut check = |c: bool, s: &mut i64| { *s += 1; if !c && ok { dbg2(b"[seqlong] failed at step %ld errno=%ld\n\0", *s, get_errno() as i64); ok = false; } };
+    check(full.len() > 109, &mut step); // 1: the real path cannot fit sun_path
+    let dfd = open(c3.as_ptr(), 0, 0);
+    check(dfd >= 0, &mut step); // 2
+    let ls = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    check(ls >= 0, &mut step); // 3
+    let mut pb = [0u8; 64];
+    let n = fd_attach_path(&mut pb, dfd);
+    let (addr, alen) = sockaddr_un::from_path(&pb[..n]);
+    check(raw_bind(ls, &addr, alen) == 0, &mut step); // 4 bind via /proc/self/fd/N/attach
+    check(raw_listen(ls, 10) == 0, &mut step); // 5
+    let (sr, mode) = raw_stat_mode(full.as_ptr());
+    check(sr == 0 && (mode & S_IFMT) == S_IFSOCK, &mut step); // 6 node lands in the real directory
+    let pid = fork();
+    if pid == 0 {
+        let d2 = open(c3.as_ptr(), 0, 0);
+        let cs = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+        if d2 < 0 || cs < 0 { exit(2); }
+        let mut pb2 = [0u8; 64];
+        let n2 = fd_attach_path(&mut pb2, d2);
+        let (a2, l2) = sockaddr_un::from_path(&pb2[..n2]);
+        if raw_connect(cs, &a2, l2) != 0 { exit(3); }
+        if raw_send(cs, b"ping".as_ptr(), 4, 0) != 4 { exit(4); }
+        let mut b = [0u8; 8];
+        if raw_recv(cs, b.as_mut_ptr(), 8, 0) != 4 || &b[..4] != b"pong" { exit(5); }
+        exit(0);
+    }
+    let asf = raw_accept(ls);
+    check(asf >= 0, &mut step); // 7
+    if asf >= 0 {
+        let mut b = [0u8; 8];
+        let rr = raw_recv(asf, b.as_mut_ptr(), 8, 0);
+        if rr != 4 { dbg2(b"[seqlong] recv ret=%ld errno=%ld\n\0", rr as i64, get_errno() as i64); }
+        check(rr == 4 && &b[..4] == b"ping", &mut step); // 8
+        check(raw_send(asf, b"pong".as_ptr(), 4, 0) == 4, &mut step); // 9
+        close(asf);
+    }
+    let mut status = 0i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    check(status == 0, &mut step); // 10
+    if status != 0 { dbg1(b"[seqlong] child status %ld\n\0", status as i64); }
+    close(ls); close(dfd);
+    unlink(full.as_ptr()); rmdir(c3.as_ptr()); rmdir(c2.as_ptr()); rmdir(c1.as_ptr());
+    report(name, ok)
+}
+
+/// podman's attach connect: it opens the socket FILE itself with O_PATH and
+/// connects SOCK_SEQPACKET to `/proc/self/fd/<fd>` (no dir fd, no suffix).
+unsafe fn test_seqpacket_opath_sockfile_procfd() -> bool {
+    let name = b"seqpacket_opath_sockfile_procfd\0";
+    let path = b"/tmp/atsk_opath_sock\0";
+    unlink(path.as_ptr());
+    let mut ok = true;
+    let mut step = 0i64;
+    let mut check = |c: bool, s: &mut i64| { *s += 1; if !c && ok { dbg2(b"[seqopath] failed at step %ld errno=%ld\n\0", *s, get_errno() as i64); ok = false; } };
+    let ls = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    check(ls >= 0, &mut step); // 1
+    let (addr, alen) = sockaddr_un::from_path(&path[..path.len() - 1]);
+    check(raw_bind(ls, &addr, alen) == 0, &mut step); // 2
+    check(raw_listen(ls, 10) == 0, &mut step); // 3
+    let pid = fork();
+    if pid == 0 {
+        let pf = open(path.as_ptr(), 0x200000, 0);
+        let cs = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+        if pf < 0 || cs < 0 { exit(2); }
+        let mut pb2 = [0u8; 64];
+        let n2 = fd_attach_path(&mut pb2, pf);
+        // strip the "/attach" suffix: connect to /proc/self/fd/<fd> itself
+        let n2 = n2 - b"/attach".len();
+        let (a2, l2) = sockaddr_un::from_path(&pb2[..n2]);
+        if raw_connect(cs, &a2, l2) != 0 { exit(3); }
+        if raw_send(cs, b"ping".as_ptr(), 4, 0) != 4 { exit(4); }
+        let mut b = [0u8; 8];
+        if raw_recv(cs, b.as_mut_ptr(), 8, 0) != 4 || &b[..4] != b"pong" { exit(5); }
+        exit(0);
+    }
+    let asf = raw_accept(ls);
+    check(asf >= 0, &mut step); // 4
+    if asf >= 0 {
+        let mut b = [0u8; 8];
+        let rr = raw_recv(asf, b.as_mut_ptr(), 8, 0);
+        check(rr == 4 && &b[..4] == b"ping", &mut step); // 5
+        check(raw_send(asf, b"pong".as_ptr(), 4, 0) == 4, &mut step); // 6
+        close(asf);
+    }
+    let mut status = 0i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    check(status == 0, &mut step); // 7
+    if status != 0 { dbg1(b"[seqopath] child status %ld\n\0", status as i64); }
+    close(ls);
+    unlink(path.as_ptr());
+    report(name, ok)
+}
+
+/// Control for seqpacket_long_dir_via_procfd: the same exchange on a short
+/// plain pathname (no /proc/self/fd).
+unsafe fn test_seqpacket_short_path() -> bool {
+    let name = b"seqpacket_short_path\0";
+    let path = b"/tmp/atsk_short\0";
+    unlink(path.as_ptr());
+    let ls = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    let (addr, alen) = sockaddr_un::from_path(&path[..path.len() - 1]);
+    let mut ok = ls >= 0 && raw_bind(ls, &addr, alen) == 0 && raw_listen(ls, 10) == 0;
+    let cs = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    ok = ok && raw_connect(cs, &addr, alen) == 0;
+    let asf = raw_accept(ls);
+    ok = ok && asf >= 0;
+    ok = ok && raw_send(cs, b"ping".as_ptr(), 4, 0) == 4;
+    let mut b = [0u8; 8];
+    let rr = raw_recv(asf, b.as_mut_ptr(), 8, 0);
+    if rr != 4 { dbg2(b"[seqshort] recv ret=%ld errno=%ld\n\0", rr as i64, get_errno() as i64); }
+    ok = ok && rr == 4 && &b[..4] == b"ping";
+    close(cs); close(asf); close(ls); unlink(path.as_ptr());
+    report(name, ok)
+}
+
+/// Control: short path, but the connector is a forked child (as podman is).
+unsafe fn test_seqpacket_short_path_forked() -> bool {
+    let name = b"seqpacket_short_path_forked\0";
+    let path = b"/tmp/atsk_short2\0";
+    unlink(path.as_ptr());
+    let ls = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    let (addr, alen) = sockaddr_un::from_path(&path[..path.len() - 1]);
+    let mut ok = ls >= 0 && raw_bind(ls, &addr, alen) == 0 && raw_listen(ls, 10) == 0;
+    let pid = fork();
+    if pid == 0 {
+        let cs = raw_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+        if raw_connect(cs, &addr, alen) != 0 { exit(3); }
+        if raw_send(cs, b"ping".as_ptr(), 4, 0) != 4 { exit(4); }
+        let mut b = [0u8; 8];
+        if raw_recv(cs, b.as_mut_ptr(), 8, 0) != 4 { exit(5); }
+        exit(0);
+    }
+    let asf = raw_accept(ls);
+    ok = ok && asf >= 0;
+    let mut b = [0u8; 8];
+    let rr = raw_recv(asf, b.as_mut_ptr(), 8, 0);
+    if rr != 4 { dbg2(b"[seqshort2] recv ret=%ld errno=%ld\n\0", rr as i64, get_errno() as i64); }
+    ok = ok && rr == 4 && &b[..4] == b"ping";
+    raw_send(asf, b"pong".as_ptr(), 4, 0);
+    let mut status = 0i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    close(asf); close(ls); unlink(path.as_ptr());
+    report(name, ok && status == 0)
 }
 
 /// bind at a /tmp path → S_IFSOCK node → connect roundtrip.
