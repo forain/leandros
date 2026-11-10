@@ -1233,6 +1233,10 @@ pub extern "C" fn syscall_dispatch(
         }
     }
     let ret = dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr);
+    if ret < 0 && ret > -4096 && ret != ERESTARTSYS && ret != ERESTARTNOHAND
+        && ret != ERESTART_RESTARTBLOCK && sched::errtrace_enabled() {
+        errtrace_log(number, ret, a0, a1, a2);
+    }
     if number != RT_SIGRETURN && (ret == ERESTARTSYS || ret == ERESTARTNOHAND) {
         // Never reaches user space: the frame gets EINTR, and the signal
         // pass that runs next rewinds to re-execute the syscall when no
@@ -1249,6 +1253,40 @@ pub extern "C" fn syscall_dispatch(
         return -4;
     }
     ret
+}
+
+/// `sched.errtrace=<comm>`: one line per failing syscall of a matching task.
+#[cold]
+fn errtrace_log(number: usize, ret: isize, a0: usize, a1: usize, a2: usize) {
+    let pid = current_pid();
+    if !sched::errtrace_match(pid) { return; }
+    let _g = TRACE_LOCK.lock();
+    crate::serial_print_str("[ERRTRACE] pid=");
+    crate::serial_print_hex(pid as usize);
+    crate::serial_print_str(" nr=");
+    crate::serial_print_hex(number);
+    crate::serial_print_str(" ret=-");
+    crate::serial_print_hex((-ret) as usize);
+    crate::serial_print_str(" a0=");
+    crate::serial_print_hex(a0);
+    crate::serial_print_str(" a1=");
+    crate::serial_print_hex(a1);
+    crate::serial_print_str(" a2=");
+    crate::serial_print_hex(a2);
+    // Path-like arguments: a printable NUL-terminated string at a pointer arg.
+    for (i, a) in [a0, a1, a2].into_iter().enumerate() {
+        if a < 0x1000 || a >= 0x0000_8000_0000_0000 { continue; }
+        if let Ok(v) = copy_user_str(a, 96) {
+            if v.len() >= 2 && v.iter().all(|&c| (0x20..0x7f).contains(&c)) {
+                crate::serial_print_str(" s");
+                crate::serial_print_hex(i);
+                crate::serial_print_str("=\"");
+                crate::serial_print_str(core::str::from_utf8(&v).unwrap_or("?"));
+                crate::serial_print_str("\"");
+            }
+        }
+    }
+    crate::serial_print_str("\n");
 }
 
 /// Kernel-internal "interrupted, restartable" return (Linux -ERESTARTSYS):
@@ -8844,6 +8882,15 @@ fn lstat_magic_link(ns: &[u8], statbuf_ptr: usize) -> Option<isize> {
 /// O_NOFOLLOW in the VFS (x86_64) open-flag layout.
 const OPEN_O_NOFOLLOW: usize = 0o400000;
 
+/// The host path of fd `fd` when it names a live directory the VFS can
+/// resolve by path; None for anything else (files keep identity reopen).
+fn fd_dir_host_path(fd: usize) -> Option<Vec<u8>> {
+    let host = fd_host_path(fd)?;
+    if host.ends_with(b" (deleted)") { return None; }
+    let kp = KPath::raw(&host);
+    match kpath_is_dir(&kp) { Ok(true) => Some(host), _ => None }
+}
+
 /// Follow a final `/proc/<pid>/{exe,cwd,root}` magic link, as open and stat
 /// do on Linux: `open("/proc/self/exe")` opens the running binary,
 /// `stat("/proc/self/cwd")` the working directory. Anything else (including
@@ -8889,6 +8936,13 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
                 Some(vfs::VnodeKind::MountedFile { .. }));
             if mounted {
                 if let Some(host) = fd_host_path(fd) { return Ok(KPath::raw(&host)); }
+            } else if let Some(dir) = fd_dir_host_path(fd) {
+                // A directory descriptor on a non-mounted filesystem (tmpfs,
+                // RamFS): stat/chmod/bind below the magic link act on the
+                // directory itself, as on Linux (conmon chmods its
+                // O_PATH attach-socket directory this way). Directories have
+                // no unlinked-identity case worth keeping.
+                return Ok(KPath::raw(&dir));
             } else if !b.starts_with(b"/proc/self/fd/") {
                 // The VFS reopens by identity only under /proc/self/fd: give
                 // it /proc/<own pid>/fd/N (the Claude Code CLI reads its task
@@ -10121,6 +10175,9 @@ fn sys_fchmodat2(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> is
 
 fn sys_fchmodat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
+    } else { path };
     let pid = current_pid();
     let tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LCHMOD } else { vfs::VFS_CHMOD };
     let msg = make_vfs_msg(tag, &[path.ptr() as u64, mode as u64]);

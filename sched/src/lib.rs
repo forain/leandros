@@ -4968,6 +4968,42 @@ pub fn set_pagein_eio(comm: &str) {
     PAGEIN_EIO_ON.store(true, Ordering::Release);
 }
 
+/// Debug knob `sched.errtrace=<comm>`: syscalls of tasks named `<comm>` that
+/// return a negative errno, and their exits, are logged. Off by default; one
+/// relaxed load when off.
+static ERRTRACE: Mutex<([u8; 15], usize)> = Mutex::new(([0; 15], 0));
+static ERRTRACE_ON: AtomicBool = AtomicBool::new(false);
+
+pub fn set_errtrace(comm: &str) {
+    let n = comm.len().min(15);
+    if n == 0 { return; }
+    let mut g = ERRTRACE.lock();
+    g.0[..n].copy_from_slice(&comm.as_bytes()[..n]);
+    g.1 = n;
+    ERRTRACE_ON.store(true, Ordering::Release);
+}
+
+#[inline(always)]
+pub fn errtrace_enabled() -> bool { ERRTRACE_ON.load(Ordering::Relaxed) }
+
+/// True when `tid`'s comm equals the `sched.errtrace` name.
+pub fn errtrace_match(tid: Pid) -> bool {
+    if !errtrace_enabled() { return false; }
+    let (want, n) = *ERRTRACE.lock();
+    let mut c = [0u8; 15];
+    let m = comm_of(tid, &mut c);
+    m == n && c[..m] == want[..n]
+}
+
+fn errtrace_exit(pid: Pid, code: i32, signo: u32, kind: &str) {
+    if errtrace_enabled() && errtrace_match(pid) {
+        let mut c = [0u8; 15];
+        let m = comm_of(pid, &mut c);
+        klog_line(format_args!("\n[ERRTRACE] exit({}) pid={} comm={} code={} sig={}\n",
+            kind, pid, core::str::from_utf8(&c[..m]).unwrap_or("?"), code, signo));
+    }
+}
+
 fn pagein_eio_injected(tid: Pid) -> bool {
     if !PAGEIN_EIO_ON.load(Ordering::Acquire) { return false; }
     let (want, n) = *PAGEIN_EIO.lock();
@@ -7895,6 +7931,7 @@ pub fn exit_group(code: i32) -> ! {
 /// an `execve` owner's new image later died "of" a signal it never got.
 fn exit_group_as(code: i32, signo: u32) -> ! {
     let pid = current_pid();
+    errtrace_exit(pid, code, signo, "group");
     let tgid = match claim_group_exit(pid) {
         GroupExitClaim::Owner { tgid } => tgid,
         GroupExitClaim::AlreadyDying => {
@@ -8422,6 +8459,7 @@ pub fn exit(code: i32) -> ! {
         fn print_number(n: u32);
     }
     let pid = current_pid();
+    errtrace_exit(pid, code, 0, "thread");
     // A kernel thread is not a process: defensive diversion.
     if RUN_QUEUE.lock().find_pid(pid).map_or(false, |t| t.kthread) { kthread_exit(); }
 
