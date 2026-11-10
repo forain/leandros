@@ -780,14 +780,16 @@ pub fn add(mountpoint: &[u8], source: &[u8], fstype: &'static str, device: &[u8]
     if under(source, mountpoint) { return Err(-22); }
     let mut t = ALIASES.lock();
     if let Some(a) = t.iter_mut().find(|a| a.mountpoint == mountpoint) {
-        if let Some(id) = crate::devpts::inst_of_backing(&a.source) { crate::devpts::destroy(id); }
+        let old_dp = crate::devpts::inst_of_backing(&a.source);
         let old = tmpfs_inst_of(&a.source);
         a.source = source.to_vec();
         a.fstype = fstype;
         a.device = device.to_vec();
         if let Some(n) = tmpfs_inst_of(source) { super::sb_get(n); }
+        if let Some(n) = crate::devpts::inst_of_backing(source) { crate::devpts::get(n); }
         drop(t);
         if let Some(n) = old { super::sb_put(n); }
+        if let Some(n) = old_dp { crate::devpts::put(n); }
         return Ok(());
     }
     if t.len() >= MAX_ALIASES { return Err(-28); }
@@ -796,6 +798,7 @@ pub fn add(mountpoint: &[u8], source: &[u8], fstype: &'static str, device: &[u8]
     ACTIVE.store(t.len(), Ordering::Release);
     // A mount holds a reference on the tmpfs instance it exposes.
     if let Some(n) = tmpfs_inst_of(source) { super::sb_get(n); }
+    if let Some(n) = crate::devpts::inst_of_backing(source) { crate::devpts::get(n); }
     Ok(())
 }
 
@@ -817,8 +820,8 @@ pub fn remove(mountpoint: &[u8]) -> bool {
     ACTIVE.store(t.len(), Ordering::Release);
     let removed = t.len() != before;
     drop(t);
-    // A devpts instance lives as long as its mount.
-    if let Some(id) = gone { crate::devpts::destroy(id); }
+    // A devpts instance lives as long as its last mount (copies hold refs).
+    if let Some(id) = gone { crate::devpts::put(id); }
     // The last mount of a tmpfs instance frees it.
     if let Some(n) = tmp_inst { super::sb_put(n); }
     removed
