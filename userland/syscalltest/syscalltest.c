@@ -48,6 +48,8 @@
  *   pidfd_open_errors    EINVAL (flags, pid 0, a non-leader thread), ESRCH
  *   pidfd_poll_exit      POLLIN exactly when the child exits, then
  *                        waitpid(WNOHANG) reaps it (tokio's reaping path)
+ *   pidfd_wake_conmon    a pidfd is never readable while the process (or its
+ *                        waitpid(-1) children) lives, under SIGURG/fork/socket churn
  *   pidfd_epoll_et       EPOLLIN|EPOLLET fires once for the exit
  *   pidfd_waitid         waitid(P_PIDFD): status, WNOHANG, EAGAIN on an
  *                        O_NONBLOCK pidfd
@@ -851,6 +853,130 @@ static void pidfd_poll_exit(void) {
         if (w != c) waitpid(c, NULL, 0);
     }
     close(fd);
+}
+
+/* pidfd_wake_conmon: podman's WaitForExit shape (c127). A "conmon" child
+ * lives 300 ms, forks a grandchild that lives 200 ms and waitpid(-1)s until
+ * ECHILD. Watchers ppoll(pidfd, 250 ms) in a loop under Go-style SIGURG
+ * preemption plus fork/exit and socket churn. A pidfd may become readable
+ * only once the process has exited: never while /proc/<pid> shows it alive,
+ * never while waitid(P_PIDFD, WNOHANG|WNOWAIT) says running, and not before
+ * the grandchild is gone; revents must be exactly POLLIN. */
+#define PW_WATCHERS 4
+static volatile int pw_stop;
+static pthread_t pw_tid[PW_WATCHERS];
+static volatile int pw_tid_ok[PW_WATCHERS];
+static volatile int pw_bad;
+static char pw_msg[PW_WATCHERS][200];
+static int pw_iters = 10;
+
+static void pw_urg(int s) { (void)s; }
+
+static void *pw_signaller(void *a) {
+    (void)a;
+    while (!pw_stop) {
+        for (int i = 0; i < PW_WATCHERS; i++) if (pw_tid_ok[i]) pthread_kill(pw_tid[i], SIGURG);
+        struct timespec ts = { 0, 5000000 };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+static void *pw_forkchurn(void *a) {
+    (void)a;
+    while (!pw_stop) {
+        pid_t p = fork();
+        if (p == 0) _exit(0);
+        if (p > 0) waitpid(p, NULL, 0);
+        struct timespec ts = { 0, 2000000 };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+static void *pw_sockchurn(void *a) {
+    (void)a;
+    while (!pw_stop) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0) { close(sv[0]); close(sv[1]); }
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s >= 0) close(s);
+        struct timespec ts = { 0, 1000000 };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+static void pw_conmon_child(void) {
+    struct timespec ts = { 0, 300000000 };
+    nanosleep(&ts, NULL);
+    pid_t g = fork();
+    if (g == 0) { struct timespec t2 = { 0, 200000000 }; nanosleep(&t2, NULL); _exit(0); }
+    for (;;) {
+        pid_t w = waitpid(-1, NULL, 0);
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0) break;
+    }
+    _exit(0);
+}
+
+static void *pw_watcher(void *arg) {
+    int idx = (int)(intptr_t)arg;
+    pw_tid[idx] = pthread_self();
+    pw_tid_ok[idx] = 1;
+    for (int it = 0; it < pw_iters && !pw_bad; it++) {
+        pid_t c = fork();
+        if (c == 0) pw_conmon_child();
+        if (c < 0) { snprintf(pw_msg[idx], sizeof pw_msg[idx], "fork: %s", strerror(errno)); pw_bad = 1; break; }
+        long long t0 = now_ms();
+        int fd = pidfd_open(c, 0);
+        if (fd < 0) { snprintf(pw_msg[idx], sizeof pw_msg[idx], "pidfd_open: %s", strerror(errno)); pw_bad = 1; waitpid(c, NULL, 0); break; }
+        for (;;) {
+            struct pollfd pf = { fd, POLLIN, 0 };
+            struct timespec to = { 0, 250000000 };
+            int n = ppoll(&pf, 1, &to, NULL);
+            if (n < 0 && errno == EINTR) continue;
+            if (n == 0) continue;
+            long long dt = now_ms() - t0;
+            char pp[48]; snprintf(pp, sizeof pp, "/proc/%d/stat", (int)c);
+            int alive = 0; char st = '?';
+            FILE *f = fopen(pp, "r");
+            if (f) { char buf[256]; if (fgets(buf, sizeof buf, f)) { char *p = strrchr(buf, ')'); if (p && p[1] == ' ') st = p[2]; } fclose(f); alive = st != 'Z' && st != 'X'; }
+            siginfo_t si; memset(&si, 0, sizeof si);
+            int wr = (int)syscall(SYS_waitid, P_PIDFD, fd, &si, WEXITED | WNOHANG | WNOWAIT, NULL);
+            int running = wr == 0 && si.si_pid == 0;
+            if (n < 0 || pf.revents != POLLIN || alive || running || dt < 480) {
+                snprintf(pw_msg[idx], sizeof pw_msg[idx], "iter %d n=%d errno=%d revents=%#x dt=%lld proc_state=%c waitid=%d si_pid=%d", it, n, errno, pf.revents, dt, st, wr, (int)si.si_pid);
+                pw_bad = 1;
+            }
+            break;
+        }
+        close(fd);
+        waitpid(c, NULL, 0);
+    }
+    pw_tid_ok[idx] = 0;
+    return NULL;
+}
+
+static void pidfd_wake_conmon(void) {
+    const char *n = "pidfd_wake_conmon";
+    const char *e = getenv("PIDFDWAKE_ITERS");
+    if (e && atoi(e) > 0) pw_iters = atoi(e);
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = pw_urg; sa.sa_flags = SA_RESTART;
+    sigaction(SIGURG, &sa, NULL);
+    pw_stop = 0; pw_bad = 0;
+    pthread_t sig, fc, sc, w[PW_WATCHERS];
+    pthread_create(&fc, NULL, pw_forkchurn, NULL);
+    pthread_create(&sc, NULL, pw_sockchurn, NULL);
+    for (int i = 0; i < PW_WATCHERS; i++) { pw_msg[i][0] = 0; pthread_create(&w[i], NULL, pw_watcher, (void *)(intptr_t)i); }
+    pthread_create(&sig, NULL, pw_signaller, NULL);
+    for (int i = 0; i < PW_WATCHERS; i++) pthread_join(w[i], NULL);
+    pw_stop = 1;
+    pthread_join(sig, NULL); pthread_join(fc, NULL); pthread_join(sc, NULL);
+    if (!pw_bad) { printf("%s: %d x %d iterations clean\n", n, PW_WATCHERS, pw_iters); pass(n); return; }
+    for (int i = 0; i < PW_WATCHERS; i++) if (pw_msg[i][0]) { fail(n, "early pidfd wake: %s", pw_msg[i]); return; }
+    fail(n, "unknown");
 }
 
 static void pidfd_epoll_et(void) {
@@ -2618,6 +2744,7 @@ int main(int argc, char **argv) {
 
     pidfd_open_errors();
     pidfd_poll_exit();
+    pidfd_wake_conmon();
     pidfd_epoll_et();
     pidfd_waitid();
     pidfd_send_signal_case();
