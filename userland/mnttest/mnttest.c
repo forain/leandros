@@ -850,6 +850,8 @@ static void setns_mnt_suite(void) {
         if (fd >= 0) close(fd);
     }
     close(c2p[0]); close(p2c[1]);
+}
+
 /* lane podsys: tmpfs mountable on any directory in the initial mount
  * namespace (podman's shm, crun's /dev), options honoured, umount frees it. */
 static int tfs_unpriv_child(void) {
