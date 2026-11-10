@@ -8489,6 +8489,18 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         return err_reply(-2); // ENOENT: no such process
     }
 
+    // Device cgroup (BPF_CGROUP_DEVICE), before any driver open runs. On-disk
+    // and tmpfs device nodes re-enter here through `devnode_open` with the
+    // canonical /dev name, so they are checked on that pass. O_PATH is skipped.
+    if flags & O_PATH == 0 && sched::bpfcg::ATTACHED.load(core::sync::atomic::Ordering::Acquire) != 0 {
+        if let Some((is_blk, maj, min)) = open_dev_identity(path) {
+            let acc = match flags & 3 { 0 => 2, 1 => 4, _ => 6 }; // READ / WRITE / both
+            if sched::bpfcg::dev_check(pid, is_blk, maj, min, acc).is_err() {
+                return err_reply(-1); // EPERM
+            }
+        }
+    }
+
     // A mapped tmpfs file that O_TRUNC emptied (its VMO id): every mapping
     // drops its pages after the open, with no VFS lock held.
     let mut trunc_zap: Option<u64> = None;
@@ -13397,6 +13409,16 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32, dev: u64) -> Message {
     let raw = &pbuf[..plen];
     let ftype = mode & S_IFMT;
 
+    // Device cgroup (BPF_CGROUP_DEVICE): creating a device node needs MKNOD
+    // access. The whiteout (char 0:0) is exempt. Every mknod route (syscall,
+    // overlay copy-up, mount proxy) funnels through here.
+    if (ftype == S_IFCHR || ftype == S_IFBLK) && !(ftype == S_IFCHR && dev as u32 == 0) {
+        let (maj, min) = dev_major_minor(dev);
+        if sched::bpfcg::dev_check(pid, ftype == S_IFBLK, maj, min, 1).is_err() {
+            return err_reply(-1); // EPERM
+        }
+    }
+
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-17); }              // EEXIST — mount root
         if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }    // ENAMETOOLONG
@@ -13454,6 +13476,29 @@ const DEVNODE_BASE: i64 = 1 << 40;
 /// Finish an open of an on-disk device node: find the driver that owns
 /// `rdev` and re-enter `handle_open` on its /dev name. Unknown numbers (and
 /// the whiteout 0:0) are ENXIO, as on Linux.
+/// Device identity `(is_block, major, minor)` of a canonical open path, for
+/// the device-cgroup check: fixed char nodes, VTs, pts, dynamic devices
+/// (drm, input, ...) and block devices.
+fn open_dev_identity(path: &[u8]) -> Option<(bool, u32, u32)> {
+    let r = dev_node_rdev(path);
+    if r != 0 {
+        let (ma, mi) = dev_major_minor(r);
+        return Some((false, ma, mi));
+    }
+    if path.starts_with(b"/dev/") {
+        if path == b"/dev/ptmx" { return Some((false, 5, 2)); }
+        if let Some(dev) = block::lookup_dev_node(path) {
+            let (ma, mi) = dev_major_minor(block::dev_rdev(dev));
+            return Some((true, ma, mi));
+        }
+        let devices = DYNAMIC_DEVICES.lock();
+        if let Some(d) = devices.iter().find(|d| d.in_use && d.path.as_bytes() == path) {
+            return Some((false, d.major, d.minor));
+        }
+    }
+    None
+}
+
 fn devnode_open(pid: u32, is_blk: bool, rdev: u32, flags: u32, mode: u32) -> Message {
     let (major, minor) = dev_major_minor(rdev as u64);
     let mut buf: Vec<u8> = Vec::new();
