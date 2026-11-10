@@ -44,15 +44,20 @@ pub const IN_ALL_EVENTS: u32 = 0xFFF;
 static MAX_QUEUED: AtomicUsize = AtomicUsize::new(16384);
 static MAX_USER_INST: AtomicUsize = AtomicUsize::new(128);
 static MAX_USER_WATCH: AtomicUsize = AtomicUsize::new(65536);
+/// Monotonic counters (read via /proc/sys/fs/inotify/{events_queued,events_coalesced,events_overflow,instances,watches}).
+static EV_QUEUED: AtomicUsize = AtomicUsize::new(0);
+static EV_COALESCED: AtomicUsize = AtomicUsize::new(0);
+static EV_OVERFLOW: AtomicUsize = AtomicUsize::new(0);
 /// Safety cap on live instances in the whole system.
 const MAX_INSTANCES: usize = 8192;
 
 /// 0 = max_queued_events, 1 = max_user_instances, 2 = max_user_watches.
 pub fn limit_get(k: usize) -> usize {
-    match k { 0 => MAX_QUEUED.load(Relaxed), 1 => MAX_USER_INST.load(Relaxed), _ => MAX_USER_WATCH.load(Relaxed) }
+    match k { 3 => EV_QUEUED.load(Relaxed), 4 => EV_COALESCED.load(Relaxed), 5 => EV_OVERFLOW.load(Relaxed),
+        6 => STATE.lock().insts.len(), 7 => STATE.lock().nwatches, 0 => MAX_QUEUED.load(Relaxed), 1 => MAX_USER_INST.load(Relaxed), _ => MAX_USER_WATCH.load(Relaxed) }
 }
 pub fn limit_set(k: usize, v: usize) -> Result<(), i32> {
-    if v == 0 || v > i32::MAX as usize { return Err(-22); }
+    if k > 2 || v == 0 || v > i32::MAX as usize { return Err(-22); }
     match k { 0 => MAX_QUEUED.store(v, Relaxed), 1 => MAX_USER_INST.store(v, Relaxed), _ => MAX_USER_WATCH.store(v, Relaxed) }
     Ok(())
 }
@@ -63,7 +68,7 @@ pub fn limit_set(k: usize, v: usize) -> Result<(), i32> {
 pub type UKey = (u16, u32);
 const BLOOM: usize = 4096;
 
-/// Kill switch: 0 unknown, 1 off, 2 on (`vfs.inotify=1` on the command line).
+/// Kill switch: 0 unknown, 1 off, 2 on (default on; `vfs.inotify=0` on the command line turns it off).
 static KNOB: AtomicU8 = AtomicU8::new(0);
 /// Live watch count. Every hook starts with one load of this.
 static ARMED: AtomicU32 = AtomicU32::new(0);
@@ -100,7 +105,8 @@ pub fn enabled(cmdline: Option<&str>) -> bool {
         2 => true,
         _ => match cmdline {
             Some(c) => {
-                let on = c.split_ascii_whitespace().any(|t| t == "vfs.inotify=1");
+                let on = c.split_ascii_whitespace().any(|t| t == "vfs.inotify=0");
+                let on = !on;
                 KNOB.store(if on { 2 } else { 1 }, Relaxed);
                 on
             }
@@ -147,15 +153,17 @@ fn wake(keys: &[u64]) {
 /// queue changed.
 fn push(i: &mut Instance, ev: Ev) -> bool {
     if let Some(t) = i.queue.back() {
-        if t.wd == ev.wd && t.mask == ev.mask && t.cookie == ev.cookie && t.name == ev.name { return false; }
+        if t.wd == ev.wd && t.mask == ev.mask && t.cookie == ev.cookie && t.name == ev.name { EV_COALESCED.fetch_add(1, Relaxed); return false; }
     }
     if i.queue.len() >= MAX_QUEUED.load(Relaxed) {
         if i.queue.back().map_or(false, |t| t.mask == IN_Q_OVERFLOW) { return false; }
+        EV_OVERFLOW.fetch_add(1, Relaxed);
         i.bytes += 16;
         i.queue.push_back(Ev { wd: -1, mask: IN_Q_OVERFLOW, cookie: 0, name: Vec::new() });
         i.seq += 1;
         return true;
     }
+    EV_QUEUED.fetch_add(1, Relaxed);
     i.bytes += ev_len(&ev);
     i.queue.push_back(ev);
     i.seq += 1;

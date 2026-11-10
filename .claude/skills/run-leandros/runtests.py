@@ -208,7 +208,7 @@ SUITES = {
     "ovlmknod": ["/bin/ovlmknodtest"],
     "bpf": ["/bin/bpftest"],
     "idmap": ["/bin/idmaptest"],
-    # inotify (needs --cmdline vfs.inotify=1 for the real cases; without it only the kill-switch guard runs).
+    # inotify (on by default; with --cmdline vfs.inotify=0 only the kill-switch guard runs).
     "inotify": ["/bin/inotifytest"],
     "inotifyforce": ["/bin/inotifytest force"],
     "cgroup": ["/bin/cgtest"],

@@ -16642,7 +16642,7 @@ fn sys_inotify_init1(flags: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-/// inotify_add_watch(fd, path, mask) → watch descriptor. With `vfs.inotify=1`
+/// inotify_add_watch(fd, path, mask) → watch descriptor. Unless `vfs.inotify=0`
 /// the path is resolved like any path syscall (mntns, chroot, symlinks unless
 /// IN_DONT_FOLLOW) and the VFS registers a real watch; otherwise the path and
 /// mask are discarded and a fake wd returned (the silent stub).
@@ -16662,7 +16662,7 @@ fn sys_inotify_add_watch(fd: usize, path_ptr: usize, mask: usize) -> isize {
 }
 
 /// inotify_rm_watch(fd, wd): a no-op with the silent stub, a real removal
-/// (IN_IGNORED, EINVAL for an unknown wd) with `vfs.inotify=1`.
+/// (IN_IGNORED, EINVAL for an unknown wd) unless `vfs.inotify=0`.
 fn sys_inotify_rm_watch(fd: usize, wd: usize) -> isize {
     if !vfs::inotify_enabled() { return 0; }
     let msg = make_vfs_msg(vfs::VFS_INOTIFY_RM, &[fd as u64, wd as u32 as u64]);

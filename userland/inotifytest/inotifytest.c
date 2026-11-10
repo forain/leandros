@@ -1,8 +1,8 @@
 /*
  * inotifytest -- inotify semantics (design-inotify.md, lane L1: tmpfs dirent
  * events). Static zig-cc build, runs as root; one "case: PASS|FAIL|SKIP" line
- * per case. The real cases need the kernel booted with vfs.inotify=1 and SKIP
- * without it; `inotifytest force` runs them regardless (fail-first evidence
+ * per case. The real cases run by default and SKIP when the kernel is booted
+ * with vfs.inotify=0; `inotifytest force` runs them regardless (fail-first evidence
  * against the silent stub). The kill-switch guard runs only with the knob off.
  */
 #define _GNU_SOURCE
@@ -618,11 +618,61 @@ static int knob_on(void)
     ssize_t n = read(fd, b, sizeof b - 1); close(fd);
     if (n < 0) return 0;
     b[n] = 0;
-    return strstr(b, "vfs.inotify=1") != NULL;
+    return strstr(b, "vfs.inotify=0") == NULL;
+}
+
+static double now_s(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+/* L5 microbenchmark: 4 KiB write loop and create+unlink loop in a directory,
+ * with 0 and with 200 unrelated watches. `inotifytest bench <dir>`. */
+static int bench(const char *dir)
+{
+    char p[256], q[300], buf[4096];
+    memset(buf, 'x', sizeof buf);
+    snprintf(p, sizeof p, "%s/benchf", dir);
+    for (int round = 0; round < 2; round++) {
+        int ifd = -1;
+        if (round == 1) {
+            ifd = inotify_init1(IN_NONBLOCK);
+            for (int i = 0; i < 200; i++) {
+                snprintf(q, sizeof q, "%s/bw%d", dir, i);
+                mkdir(q, 0755);
+                inotify_add_watch(ifd, q, IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM);
+            }
+        }
+        double best_w = 1e9, best_c = 1e9;
+        for (int rep = 0; rep < 5; rep++) {
+            int fd = open(p, O_CREAT | O_RDWR | O_TRUNC, 0644);
+            double t0 = now_s();
+            for (int i = 0; i < 20000; i++) pwrite(fd, buf, sizeof buf, (i & 63) * 4096);
+            double t1 = now_s();
+            close(fd);
+            if (t1 - t0 < best_w) best_w = t1 - t0;
+            t0 = now_s();
+            for (int i = 0; i < 3000; i++) {
+                snprintf(q, sizeof q, "%s/bc%d", dir, i & 7);
+                int f = open(q, O_CREAT | O_WRONLY, 0644); close(f); unlink(q);
+            }
+            t1 = now_s();
+            if (t1 - t0 < best_c) best_c = t1 - t0;
+        }
+        printf("BENCH watches=%d write20k_s=%.4f creunl3k_s=%.4f\n", round ? 200 : 0, best_w, best_c);
+        unlink(p);
+        if (round == 1) {
+            for (int i = 0; i < 200; i++) { snprintf(q, sizeof q, "%s/bw%d", dir, i); rmdir(q); }
+            close(ifd);
+        }
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
+    if (argc > 2 && !strcmp(argv[1], "bench")) return bench(argv[2]);
     int force = argc > 1 && !strcmp(argv[1], "force");
     int on = knob_on();
     setup();
@@ -635,7 +685,7 @@ int main(int argc, char **argv)
         t_dont_follow(); t_overflow(); t_proc_limits(); t_limit_instances(); t_limit_watches();
         t_limit_perkuid(); t_limit_userns(); t_userns_mntns();
     } else {
-        printf("real cases: SKIP (kernel booted without vfs.inotify=1)\n");
+        printf("real cases: SKIP (kernel booted with vfs.inotify=0)\n");
     }
     if (!on) t_killswitch(); else printf("t_killswitch: SKIP (knob on)\n");
     printf("inotifytest: %d passed, %d failed\n", npass, nfail);

@@ -206,7 +206,7 @@ pub const VFS_SIGNALFD_CREATE: u64 = 0x4A;
 pub const VFS_INOTIFY_CREATE:  u64 = 0x4B;
 /// inotify_add_watch(fd, path_ptr, mask) → watch descriptor (≥1) or -errno.
 pub const VFS_INOTIFY_ADD:     u64 = 0x4C;
-/// inotify_rm_watch(fd, wd) → 0 or -errno (only sent when `vfs.inotify=1`).
+/// inotify_rm_watch(fd, wd) → 0 or -errno (only sent unless `vfs.inotify=0`).
 pub const VFS_INOTIFY_RM:      u64 = 0x53;
 /// utimensat: `VFS_UTIMENS(path_ptr, atime_sec, atime_nsec, mtime_sec,
 /// mtime_nsec, flags)` / `VFS_LUTIMENS` (final symlink not followed) /
@@ -2076,8 +2076,8 @@ fn signalfd_wake_tag() -> u64 { sched::signal_wake_tag(sched::current_tgid()) }
 /// The tag of an inotify instance's poll answer: its exact key's bit.
 fn inotify_wake_tag(inst: u32) -> u64 { sched::poll_key_bit(inotify::key(inst)) }
 
-/// True when `vfs.inotify=1` is on the kernel command line. The kernel's
-/// inotify syscalls take the real path only then; otherwise the old silent
+/// True unless `vfs.inotify=0` is on the kernel command line. The kernel's
+/// inotify syscalls take the real path then; with the opt-out the old silent
 /// stub (valid fd, fake wds, no events) stays byte for byte.
 pub fn inotify_enabled() -> bool {
     let c = *KERNEL_CMDLINE.lock();
@@ -12777,7 +12777,9 @@ fn inotify_chain(pid: u32) -> Vec<inotify::UKey> {
 /// `/proc/sys/fs/inotify/<name>` -> limit index.
 fn inotify_sysctl(path: &[u8]) -> Option<usize> {
     match path.strip_prefix(b"/proc/sys/fs/inotify/")? {
-        b"max_queued_events" => Some(0), b"max_user_instances" => Some(1), b"max_user_watches" => Some(2), _ => None,
+        b"max_queued_events" => Some(0), b"max_user_instances" => Some(1), b"max_user_watches" => Some(2),
+        b"events_queued" => Some(3), b"events_coalesced" => Some(4), b"events_overflow" => Some(5),
+        b"instances" => Some(6), b"watches" => Some(7), _ => None,
     }
 }
 const PROC_INOT_W: &[u8] = b"/tmp/.proc_inotlim_";
