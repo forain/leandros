@@ -2145,6 +2145,68 @@ static void shmbind_suite(void) {
     report("shmbind_bind_remount_clear_ro", nn_in_child(sb_remount_clear, 0));
 }
 
+/* ── lane devbind: crun's rootless default-device binds ─────────────────
+ * A rootless container cannot mknod, so crun creates an empty file in the
+ * container's /dev tmpfs and bind-mounts the host node onto it (by path, or
+ * through /proc/self/fd/N of an O_PATH fd of the target). mode bit0: target
+ * through an fd. */
+static const char *const DB_DEV[] = {"null", "zero", "full", "tty", "random", "urandom"};
+static int db_dev(int m) {
+    int idx = m >> 4, via_fd = m & 1;
+    const char *B = "/tmp/dbd", *name = DB_DEV[idx];
+    char D[64], T[96], src[32];
+    mkdir(B, 0755); snprintf(D, sizeof D, "%s/dev", B); mkdir(D, 0755);
+    chown(B, 1000, 1000); chown(D, 1000, 1000);
+    snprintf(src, sizeof src, "/dev/%s", name);
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) return 91;
+    wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "1000 1000 1"); wr("/proc/self/gid_map", "1000 1000 1");
+    if (mount("tmpfs", D, "tmpfs", MS_NOSUID, "mode=755") < 0) { printf("  tmpfs errno=%d\n", errno); return 11; }
+    snprintf(T, sizeof T, "%s/%s", D, name);
+    int cfd = open(T, O_CREAT | O_WRONLY | O_EXCL, 0644); if (cfd < 0) { printf("  create errno=%d\n", errno); return 12; } close(cfd);
+    struct stat st;
+    if (stat(src, &st) < 0) { printf("  host %s errno=%d\n", src, errno); return 13; }
+    if (!S_ISCHR(st.st_mode)) { printf("  host %s not chr mode=%o\n", src, st.st_mode); return 14; }
+    if (via_fd) {
+        int fd = open(T, O_PATH | O_CLOEXEC); if (fd < 0) return 15;
+        char q[48]; snprintf(q, sizeof q, "/proc/self/fd/%d", fd);
+        if (mount(src, q, NULL, MS_BIND, NULL) < 0) { printf("  bind(fd) %s errno=%d\n", src, errno); return 16; }
+        close(fd);
+    } else if (mount(src, T, NULL, MS_BIND, NULL) < 0) { printf("  bind %s errno=%d\n", src, errno); return 16; }
+    /* crun then remounts it nosuid|noexec (never nodev for devices) */
+    if (mount(NULL, T, NULL, MS_BIND | MS_REMOUNT | MS_NOSUID | MS_NOEXEC, NULL) < 0) { printf("  remount errno=%d\n", errno); return 17; }
+    struct stat bt;
+    if (stat(T, &bt) < 0 || !S_ISCHR(bt.st_mode) || bt.st_rdev != st.st_rdev) { printf("  bound stat mode=%o rdev=%lx want %lx\n", bt.st_mode, (unsigned long)bt.st_rdev, (unsigned long)st.st_rdev); return 18; }
+    if (!strcmp(name, "tty")) return 0; /* no controlling terminal to exercise */
+    int fd = open(T, O_RDWR); if (fd < 0) { printf("  open bound errno=%d\n", errno); return 19; }
+    unsigned char b[32]; ssize_t n;
+    if (!strcmp(name, "null")) {
+        if (write(fd, "abc", 3) != 3) return 20;
+        if (read(fd, b, sizeof b) != 0) return 21;
+    } else if (!strcmp(name, "zero") || !strcmp(name, "full")) {
+        memset(b, 0xff, sizeof b);
+        if (read(fd, b, sizeof b) != (ssize_t)sizeof b) return 22;
+        for (size_t i = 0; i < sizeof b; i++) if (b[i]) return 23;
+        if (!strcmp(name, "full")) {
+            errno = 0; n = write(fd, "abc", 3);
+            if (n != -1 || errno != ENOSPC) { printf("  full write n=%zd errno=%d\n", n, errno); return 24; }
+        } else if (write(fd, "abc", 3) != 3) return 25;
+    } else {
+        memset(b, 0, sizeof b);
+        if (read(fd, b, sizeof b) != (ssize_t)sizeof b) return 26;
+        int nz = 0; for (size_t i = 0; i < sizeof b; i++) nz |= b[i];
+        if (!nz) return 27;
+    }
+    close(fd);
+    return 0;
+}
+static void devbind_suite(void) {
+    for (int i = 0; i < 6; i++) for (int f = 0; f < 2; f++) {
+        char n[64]; snprintf(n, sizeof n, "devbind_%s_%s", DB_DEV[i], f ? "fd" : "path");
+        report(n, nn_in_child(db_dev, (i << 4) | f));
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -2169,6 +2231,7 @@ int main(int argc, char **argv) {
     fdbindprop_suite();
     mro_suite();
     shmbind_suite();
+    devbind_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
