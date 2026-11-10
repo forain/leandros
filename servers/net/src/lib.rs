@@ -11,6 +11,8 @@ mod procnet;
 pub mod rtnetlink;
 mod nlsock;
 mod iface;
+mod vifsel;
+mod vif;
 pub mod netwatch;
 
 use iface::{Sid, LO, MAX_STACKS};
@@ -1737,8 +1739,8 @@ fn stack_for(sid: Sid) -> spin::MutexGuard<'static, Option<NetStack>> {
 fn is_loopback_addr(addr: IpAddress) -> bool { iface::is_loopback(addr) }
 
 /// The NIC stack whose interface holds `ip` now. One stack lock at a time.
-fn stack_holding(ip: IpAddress) -> Option<Sid> {
-    iface::nic_sids().find(|&sid| match *stack_for(sid) {
+fn stack_holding(ns: u16, ip: IpAddress) -> Option<Sid> {
+    iface::nic_sids().chain(vif::ns_sids_dyn(ns)).find(|&sid| match *stack_for(sid) {
         Some(ref s) => s.interface.ip_addrs().iter().any(|c| c.address() == ip),
         None => false,
     })
@@ -3443,6 +3445,7 @@ fn poll_stack<D: syngate::Frames>(s: &mut NetStack, dev: &mut D, timestamp: Inst
 }
 
 pub fn net_daemon() -> ! {
+    vif::init();
     // Readiness snapshots of each stack's sockets taken just before a poll
     // (see `readiness_sigs`), reused across passes.
     let mut sigs: [alloc::vec::Vec<Sig>; MAX_STACKS] = [const { alloc::vec::Vec::new() }; MAX_STACKS];
@@ -3455,6 +3458,7 @@ pub fn net_daemon() -> ! {
     read_net_knobs();
     let (mut prev_tx, mut prev_rx) = (0u64, 0u64);
     loop {
+        vif::daemon_pass();
         // This task runs with IRQs masked between parks: let the tick in on
         // every pass, so a pass that keeps restarting cannot starve the CPU
         // and the wedge scan / watchdog can still run on it (1-CPU boots).
@@ -4027,7 +4031,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             // and 127.0.0.0/8 always bind; anything else must be an address the
             // NIC currently holds. Without this a bind to a bogus address
             // "succeeded" and then silently never received anything.
-            if !ip.is_unspecified() && !is_loopback_addr(ip) && stack_holding(ip).is_none() {
+            if !ip.is_unspecified() && !is_loopback_addr(ip) && stack_holding(sock_netns(pid, slot), ip).is_none() {
                 return err_reply(-99); // EADDRNOTAVAIL
             }
 
@@ -4255,7 +4259,7 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
         let lid = listen::new_lid();
         listen::register(lid, local);
         let mut any = false;
-        for sid in listen::stacks_for(local) { any |= listen::create(sid, lid, local); }
+        for sid in listen::stacks_for(tbl.socks[slot].netns(), local) { any |= listen::create(sid, lid, local); }
         if !any { listen::destroy_all(lid); return err_reply(-100); } // ENETDOWN
 
         tbl.socks[slot].state = SockState::InetListening { lid, local };
@@ -4602,13 +4606,13 @@ fn no_route_err() -> i32 { if drivers::netdev::count() == 0 { -100 } else { -101
 
 /// The stack a UDP socket bound to `local` (if bound) and first sending to
 /// `dest` (if known) lives on (see `udp_materialize`).
-fn udp_stack(local: Option<IpAddress>, dest: Option<IpAddress>) -> Result<Sid, i32> {
+fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>) -> Result<Sid, i32> {
     if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) { return Ok(LO); }
     if let Some(a) = local.filter(|a| !a.is_unspecified()) {
         if let Some(sid) = iface::holder_of(a) { return Ok(sid); }
     }
     match dest {
-        Some(d) => iface::route_select(d).ok_or_else(no_route_err),
+        Some(d) => iface::route_select(ns, d).ok_or_else(no_route_err),
         None => iface::default_sid().ok_or(-100),
     }
 }
@@ -4638,7 +4642,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     } else {
         ephemeral.ok_or(-98i32)? // EADDRINUSE: range exhausted
     };
-    let sid = match udp_stack(local_addr, dest) {
+    let sid = match udp_stack(tbl.socks[slot].netns(), local_addr, dest) {
         Ok(s) => s,
         Err(_) if server => LO,
         Err(e) => return Err(e),
@@ -4663,7 +4667,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     };
     tbl.socks[slot].bound_port = port;
     tbl.socks[slot].state = SockState::InetConnected { socket_handle: handle, remote_endpoint: None, sid };
-    if server { udpany::create(tbl.socks[slot].ofd, sid, handle, port); }
+    if server { udpany::create(tbl.socks[slot].netns(), tbl.socks[slot].ofd, sid, handle, port); }
     share_state(&mut *tbls, pid, slot);
     drop(tbls);
     // A poller of the unbound socket (another thread, another holder) now
@@ -4834,7 +4838,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
             .and_then(iface::holder_of)
         {
             Some(sid) if !is_loopback_addr(remote_ip) => sid,
-            _ => match iface::route_select(remote_ip) {
+            _ => match iface::route_select(sock_netns(pid, slot), remote_ip) {
                 Some(sid) => sid,
                 None => return err_reply(no_route_err()),
             },
@@ -5336,7 +5340,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             let mirrors = if sock_type == SOCK_DGRAM as u8 { udpany::of(ofd) } else { None };
             let (sid, socket_handle) = match (&mirrors, dest, mc_sid) {
                 (Some(hs), Some(_), Some(m)) if hs[m as usize].is_some() => (m, hs[m as usize].unwrap()),
-                (Some(hs), Some(ep), _) => udpany::send_via(hs, (sid, socket_handle), ep.addr),
+                (Some(hs), Some(ep), _) => udpany::send_via(sock_netns(pid, slot), hs, (sid, socket_handle), ep.addr),
                 _ => (sid, socket_handle),
             };
             // A UDP socket whose interface can no longer reach `dest` (it lost
@@ -5348,7 +5352,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                     let to = match mc_sid {
                         Some(m) => Some(m).filter(|&m| m != sid),
                         None if sid != LO && !iface::can_route(sid, ep.addr) =>
-                            iface::route_select(ep.addr).filter(|&t| t != sid),
+                            iface::route_select(sock_netns(pid, slot), ep.addr).filter(|&t| t != sid),
                         None => None,
                     };
                     if let Some(to) = to {
@@ -5470,7 +5474,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
 
             // The ping socket lives on the stack its first destination routes
             // through, and stays there.
-            let sid = match iface::route_select(dest_ip) { Some(s) => s, None => return err_reply(no_route_err()) };
+            let sid = match iface::route_select(sock_netns(pid, slot), dest_ip) { Some(s) => s, None => return err_reply(no_route_err()) };
             let mut stack = stack_for(sid);
             if stack.is_none() { return err_reply(-100); }
             let s = stack.as_mut().unwrap();

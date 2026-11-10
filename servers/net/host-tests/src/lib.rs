@@ -7,6 +7,8 @@
 
 extern crate alloc;
 
+#[path = "../../src/vifsel.rs"]
+mod vifsel;
 #[path = "../../src/rxpolicy.rs"]
 pub mod rxpolicy;
 #[path = "../../src/latestack.rs"]
