@@ -6520,7 +6520,22 @@ fn sys_execveat(dirfd: usize, path_ptr: usize, argv_ptr: usize, envp_ptr: usize,
 /// `fd_cloexec`: the file came from a close-on-exec fd (fexecve); a `#!`
 /// script would then name an fd that is closed by the time the interpreter
 /// opens /dev/fd/N, which Linux reports as ENOENT.
-fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: bool) -> isize {
+/// Re-resolve the symlinks of `kp` in its mount namespace (exec reads the file
+/// from the backing path, past the VFS path chokepoint that does this for the
+/// other path syscalls). Namespace 0 and paths without a namespace form pass.
+fn ns_follow_links(kp: KPath) -> Result<KPath, isize> {
+    let mns = sched::current_mntns();
+    if mns == 0 { return Ok(kp); }
+    let nsb = match kp.ns.as_ref() { Some(n) => n.clone(), None => return Ok(kp) };
+    match vfs::ns_resolve_links(mns, &nsb, true) {
+        Ok(Some((nsp, _, _))) if nsp != nsb => KPath::from_ns(nsp),
+        Ok(_) => Ok(kp),
+        Err(e) => Err(e as isize),
+    }
+}
+
+fn sys_execve_kp(kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: bool) -> isize {
+    let mut kpath = match ns_follow_links(kpath) { Ok(k) => k, Err(e) => return e };
     let pid = current_pid();
     // A memfd image stays the task's /proc/self/exe past the close-on-exec
     // sweep: pin it now (dropped again on any early return).
@@ -6575,7 +6590,7 @@ fn sys_execve_kp(mut kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec:
         next.extend(head_args.into_iter().skip(1));
         head_args = next;
 
-        kpath = match resolve_ns(interp).and_then(KPath::from_ns) {
+        kpath = match resolve_ns(interp).and_then(KPath::from_ns).and_then(ns_follow_links) {
             Ok(k) => k,
             Err(e) => return e,
         };
@@ -9450,7 +9465,8 @@ fn sys_mount(
     if !sched::host_root() && !devpts_mount { return -1; } // EPERM
     // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC):
     // only the mount's propagation state changes; source/fstype are ignored.
-    if flags & (vfs::mnt::MS_UNBINDABLE | vfs::mnt::MS_PRIVATE | vfs::mnt::MS_SLAVE | vfs::mnt::MS_SHARED) != 0 {
+    // MS_BIND wins over propagation bits, as in Linux do_mount (Go netns bind passes both).
+    if flags & 4096 == 0 && flags & (vfs::mnt::MS_UNBINDABLE | vfs::mnt::MS_PRIVATE | vfs::mnt::MS_SLAVE | vfs::mnt::MS_SHARED) != 0 {
         let target = match resolve_mount_target(target_ptr) { Ok(p) => p, Err(e) => return e };
         return vfs::mnt::set_propagation(sched::current_mntns(), &target, flags) as isize;
     }
@@ -9742,12 +9758,12 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
     // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC)
     // act on this namespace's tree: crun and containers/storage call
     // MS_REC|MS_PRIVATE / MS_SLAVE on "/" first.
-    if flags & MS_PROPAGATION != 0 {
+    if flags & MS_PROPAGATION != 0 && flags & MS_BIND == 0 {
         if flags & !(MS_PROPAGATION | MS_REC) != 0 { return -22; }
         let target = match resolve_mount_target(target_ptr) { Ok(p) => p, Err(e) => return e };
         return vfs::mnt::set_propagation(mns, &target, flags) as isize;
     }
-    if flags & (MS_REMOUNT | MS_MOVE | MS_PROPAGATION) != 0 { return -22; }
+    if flags & (MS_REMOUNT | MS_MOVE) != 0 || (flags & MS_PROPAGATION != 0 && flags & MS_BIND == 0) { return -22; }
     let target = match mount_target_kpath(target_ptr) { Ok(p) => p, Err(e) => return e };
     let tns = target.ns_bytes().to_vec();
     let tdir = match kpath_is_dir(&target) { Ok(d) => d, Err(e) => return e };
