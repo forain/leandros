@@ -1878,17 +1878,24 @@ static void opentree_suite(void) {
 /* lane fdbindprop: crun's etc/hosts sequence - bind a source onto a target in a
  * rootfs, open the target O_PATH, mount_setattr(fd, "", EMPTY_PATH|RECURSIVE),
  * then mount(NULL, "/proc/self/fd/N", MS_REC|MS_PRIVATE). */
-static int fb_seq(int isdir) {
-    mkdir("/tmp/fbr", 0755); mkdir("/tmp/fbr/etc", 0755); mkdir("/tmp/fbs", 0755);
-    const char *src = isdir ? "/tmp/fbs/d" : "/tmp/fbs/hosts";
-    const char *dst = isdir ? "/tmp/fbr/etc/d" : "/tmp/fbr/etc/hosts";
+static int fb_seq(int mode) {
+    int isdir = mode & 1, disk = mode & 2, ro = mode & 4, pv = mode & 8;
+    const char *B = disk ? "/root/fb" : "/tmp/fb";
+    char R[64], E[64], S[64], src[64], dst[64];
+    mkdir("/root", 0700); mkdir(B, 0755);
+    snprintf(R, sizeof R, "%s/r", B); snprintf(E, sizeof E, "%s/r/etc", B); snprintf(S, sizeof S, "%s/s", B);
+    mkdir(R, 0755); mkdir(E, 0755); mkdir(S, 0755);
+    snprintf(src, sizeof src, "%s/%s", S, isdir ? "d" : "hosts");
+    snprintf(dst, sizeof dst, "%s/%s", E, isdir ? "d" : "hosts");
     if (isdir) { mkdir(src, 0755); mkdir(dst, 0755); }
     else { int f = open(src, O_CREAT | O_WRONLY, 0644); if (f < 0) return 90; close(f);
            f = open(dst, O_CREAT | O_WRONLY, 0644); if (f < 0) return 90; close(f); }
     if (ot_userns() < 0) return 91;
-    if (mount("/tmp/fbr", "/tmp/fbr", NULL, MS_BIND | MS_REC, NULL) < 0) { printf("  rootfs bind errno=%d\n", errno); return 10; }
+    if (mount(R, R, NULL, MS_BIND | MS_REC, NULL) < 0) { printf("  rootfs bind errno=%d\n", errno); return 10; }
     if (mount(src, dst, NULL, MS_BIND, NULL) < 0) { printf("  bind errno=%d\n", errno); return 11; }
-    int fd = open(dst, O_PATH | O_CLOEXEC | (isdir ? O_DIRECTORY : 0));
+    if (ro && mount(NULL, dst, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) { printf("  remount errno=%d\n", errno); return 15; }
+    if (pv) { if (chdir(R) < 0) return 16; }
+    int fd = open(pv ? (isdir ? "etc/d" : "etc/hosts") : dst, O_PATH | O_CLOEXEC | (isdir ? O_DIRECTORY : 0));
     if (fd < 0) { printf("  open errno=%d\n", errno); return 12; }
     if (osetattr(fd, "", 0x1000 | OT_REC, 0, 0) < 0) { printf("  mount_setattr errno=%d\n", errno); return 13; }
     char p[48]; snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
@@ -1896,11 +1903,13 @@ static int fb_seq(int isdir) {
     close(fd);
     return 0;
 }
-static int fb_file(int m) { (void)m; return fb_seq(0); }
-static int fb_dir(int m) { (void)m; return fb_seq(1); }
+static int fb_m(int m) { return fb_seq(m); }
 static void fdbindprop_suite(void) {
-    report("fdbindprop_file_bind_setattr_and_private", nn_in_child(fb_file, 0));
-    report("fdbindprop_dir_bind_setattr_and_private", nn_in_child(fb_dir, 0));
+    static const char *nm[] = { "file_tmp", "dir_tmp", "file_disk", "dir_disk", "file_tmp_ro", "dir_tmp_ro", "file_disk_ro", "dir_disk_ro", "file_tmp_rel", "dir_tmp_rel", "file_disk_rel", "dir_disk_rel", "file_tmp_ro_rel", "dir_tmp_ro_rel", "file_disk_ro_rel", "dir_disk_ro_rel" };
+    for (int m = 0; m < 16; m++) {
+        char n[64]; snprintf(n, sizeof n, "fdbindprop_%s", nm[m]);
+        report(n, nn_in_child(fb_m, m));
+    }
 }
 
 int main(int argc, char **argv) {
