@@ -640,6 +640,8 @@ static void bridge_l2(void) {
     CHECK("bridge_l2: B: UDP+TCP to A, ping bridge addr, ping A, TCP to host", rb == 0);
     CHECK("bridge_l2: A served B and exited 0", wait_child(ca) == 0);
     close(hl);
+    /* a netns that ran TCP may be reaped late (veth lane note): compare against what is left now */
+    int base_m = count_master(s, bidx), base_v = count_veth(s);
     /* bridge_getlink (ports whose peer stays in the host netns, so they outlive the children) */
     CHECK("bridge_getlink: persistent ports vethQ/vethR enslaved at create",
           veth_new_m(s, "vethQ", "vethX", -1, bidx) == 0 && veth_new_m(s, "vethR", "vethY", -1, bidx) == 0);
@@ -649,9 +651,9 @@ static void bridge_l2(void) {
     CHECK("bridge_getlink: defaults ageing 30000, fwd_delay 1500, stp 0, vlan_filtering 0",
           bi.ageing == 30000 && bi.fwd == 1500 && bi.stp == 0 && bi.vlan == 0);
     CHECK("bridge_getlink: a non-bridge has no bridge INFO_DATA", link_info(s, "vethQ", &pa) > 0 && !pa.isbr && pa.master == bidx);
-    CHECK("bridge_getlink: dump filter lists the two ports", count_master(s, bidx) == 2);
+    CHECK("bridge_getlink: dump filter lists the two new ports", count_master(s, bidx) == base_m + 2);
     CHECK("bridge_getlink: SETLINK IFLA_MASTER=0 releases vethQ", link_set_master(s, qa, 0) == 0 && link_info(s, "vethQ", &pa) > 0 && pa.master == 0);
-    CHECK("bridge_getlink: dump filter now lists one port", count_master(s, bidx) == 1);
+    CHECK("bridge_getlink: dump filter now lists one new port", count_master(s, bidx) == base_m + 1);
     CHECK("bridge_getlink: SETLINK IFLA_MASTER=br0 re-enslaves vethQ", link_set_master(s, qa, bidx) == 0 && link_info(s, "vethQ", &pa) > 0 && pa.master == bidx);
     CHECK("bridge_getlink: IFLA_MASTER to a non-bridge is rejected", link_set_master(s, qa, qb) != 0);
     unsigned char m2[6] = { 0x02, 0x00, 0x5e, 0x98, 0x00, 0x09 };
@@ -660,15 +662,16 @@ static void bridge_l2(void) {
     CHECK("bridge_teardown: DELLINK vethQ", link_del(s, qa) == 0 && !link_get(s, "vethQ", NULL, NULL));
     CHECK("bridge_teardown: DELLINK vethR", link_del(s, qb) == 0 && !link_get(s, "vethR", NULL, NULL));
     CHECK("bridge_teardown: DELLINK br0", link_del(s, bidx) == 0 && !link_get(s, "br0", NULL, NULL));
-    CHECK("bridge_teardown: no vifs left", count_veth(s) == 0);
+    CHECK("bridge_teardown: no vifs left of ours", count_veth(s) <= base_v - 4 && !link_get(s, "vethX", NULL, NULL) && !link_get(s, "vethY", NULL, NULL));
     /* a bridge deleted with a port still attached releases the port */
+    base_v = count_veth(s);
     CHECK("bridge_teardown: br1 with a port", br_new(s, "br1", NULL) == 0 && veth_new_m(s, "vethC", "vethD", -1, link_get(s, "br1", NULL, NULL)) == 0);
     int i1 = link_get(s, "br1", NULL, NULL);
     CHECK("bridge_teardown: DELLINK br1 with a live port releases it", link_del(s, i1) == 0 && !link_get(s, "br1", NULL, NULL)
           && link_info(s, "vethC", &pa) > 0 && pa.master == 0);
     int ic = link_get(s, "vethC", NULL, NULL);
     if (ic) link_del(s, ic);
-    CHECK("bridge_teardown: nothing left over", count_veth(s) == 0);
+    CHECK("bridge_teardown: nothing left over", count_veth(s) == base_v);
     close(s);
 }
 
