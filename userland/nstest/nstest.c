@@ -3086,13 +3086,86 @@ static int t_cgns_leak(void)
     return 0;
 }
 
+/* Namespace quota is charged up the userns tree (Linux inc_ucount): a container
+ * whose ns-root is kuid 1000 and that maps subuids 100000.. may not multiply
+ * its quota by setuid()ing across them, and must not starve other users.
+ * Needs idmap=test (multi-range map) until the flip. */
+static int t_quota_hier(void)
+{
+    char cl[512]; int fd = open("/proc/cmdline", O_RDONLY), n = 0;
+    if (fd >= 0) { n = read(fd, cl, sizeof cl - 1); close(fd); }
+    if (n < 0) n = 0;
+    cl[n] = 0;
+    if (!strstr(cl, "idmap=test")) { printf("  quota_hier: SKIP (needs idmap=test)\n"); return 0; }
+    int ready[2], go[2], res[2];
+    CHECK(pipe(ready) == 0 && pipe(go) == 0 && pipe(res) == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        setpgid(0, 0);
+        if (drop_to(1000) || unshare(CLONE_NEWUSER)) _exit(1);
+        char b = 'r'; (void)!write(ready[1], &b, 1);
+        if (read(go[0], &b, 1) != 1) _exit(2);
+        int hold[2], total = 0;
+        if (pipe(hold)) _exit(3);
+        for (int sub = 1; sub <= 9; sub++) {
+            for (int a = 0; a < 40; a++) {
+                pid_t h = fork();
+                if (h == 0) {
+                    char r = 'x';
+                    if (setgid(sub) == 0 && setuid(sub) == 0) {
+                        if (unshare(CLONE_NEWUSER) == 0) r = 'o';
+                        else if (errno == ENOSPC) r = 'e';
+                    }
+                    (void)!write(hold[1], &r, 1);
+                    if (r != 'o') _exit(0);
+                    for (;;) pause();
+                }
+                char r = 'x';
+                if (h < 0 || read(hold[0], &r, 1) != 1) _exit(4);
+                if (r != 'o') break;
+                total++;
+            }
+        }
+        (void)!write(res[1], &total, sizeof total);
+        for (;;) pause();
+    }
+    CHECK(c > 0);
+    setpgid(c, c);
+    char b;
+    int ok = read(ready[0], &b, 1) == 1;
+    int rc = 0, total = -1;
+    if (ok) {
+        char m[64];
+        snprintf(m, sizeof m, "/proc/%d/uid_map", (int)c);
+        int f = open(m, O_WRONLY);
+        ok = f >= 0 && write(f, "0 1000 1\n1 100000 16\n", 21) == 21; if (f >= 0) close(f);
+        snprintf(m, sizeof m, "/proc/%d/gid_map", (int)c);
+        f = open(m, O_WRONLY);
+        ok = ok && f >= 0 && write(f, "0 1000 1\n1 100000 16\n", 21) == 21; if (f >= 0) close(f);
+        if (ok) { (void)!write(go[1], "g", 1); ok = read(res[0], &total, sizeof total) == sizeof total; }
+    }
+    if (!ok) { printf("  quota_hier: setup failed\n"); rc = 1; }
+    else {
+        printf("  quota_hier: created %d userns via subuids (owner limit %d)\n", total, 32);
+        if (total < 1 || total > 32) { printf("  quota_hier: FAIL total %d not within 1..32\n", total); rc = 1; }
+        /* another host user must still be able to unshare */
+        pid_t d = fork();
+        if (d == 0) _exit(drop_to(2000) == 0 && unshare(CLONE_NEWUSER) == 0 ? 0 : 1);
+        int st = 0; waitpid(d, &st, 0);
+        if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) { printf("  quota_hier: FAIL other user cannot unshare\n"); rc = 1; }
+    }
+    kill(-c, SIGKILL);
+    waitpid(c, 0, 0);
+    return rc;
+}
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
         { "unpriv_clone_full_caps", t_unpriv_clone }, { "ns_chroot", t_ns_chroot },
         { "host_root_unaffected", t_host_unaffected }, { "magic_link_access", t_magic_link_access }, { "unshare_basic", t_unshare_basic },
         { "unshare_threaded_einval", t_unshare_threaded }, { "other_new_einval", t_other_new_einval },
-        { "depth_limit_32", t_depth_limit }, { "ns_leak", t_leak }, { "suid_ignored_in_userns", t_suid_ignored },
+        { "depth_limit_32", t_depth_limit }, { "quota_hier", t_quota_hier }, { "ns_leak", t_leak }, { "suid_ignored_in_userns", t_suid_ignored },
         { "ff_probe", t_ff_probe }, { "unshare_pid_eperm", t_unshare_pid_eperm },
         { "unshare_pid_twice", t_unshare_pid_twice }, { "thread_after_unshare", t_thread_after_unshare },
         { "pid1_self", t_pid1_self }, { "parent_view", t_parent_view }, { "child_of_init", t_child_of_init },

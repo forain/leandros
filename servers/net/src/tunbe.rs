@@ -91,7 +91,7 @@ fn attach(ns: u16, name: &[u8; 16], tap: bool, h: TunHandle) -> Result<(u32, [u8
         st.next_ifindex += 1;
         let mac = [0x02, 0x00, 0x5e, 0x10, (sid as u8), 0x01];
         v[sid] = Some(Vif { netns: ns, ifindex, name: fin, kind, admin_up: false, mtu: 1500, mac,
-                            addrs: Vec::new(), rxq: VecDeque::new(), tun: h, pending: false, peer: NO_PEER, master: NO_PEER });
+                            addrs: Vec::new(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: h, pending: false, peer: NO_PEER, master: NO_PEER });
         st.sids.push(sid as Sid);
         (sid as Sid, fin, ifindex, mac)
     };
@@ -110,7 +110,7 @@ fn detach(h: TunHandle, keep: bool) {
     let Some((ns, sid)) = found else { return };
     if keep {
         let mut v = VIFS.lock();
-        if let Some(x) = v[sid as usize].as_mut() { x.tun = NO_TUN; x.rxq.clear(); }
+        if let Some(x) = v[sid as usize].as_mut() { x.tun = NO_TUN; x.rxq.clear(); x.rxsrc.clear(); }
         return;
     }
     {
@@ -175,6 +175,95 @@ fn make_stack(sid: Sid, mac: [u8; 6]) {
         listens: Vec::new(),
         inet_seq: alloc::collections::BTreeMap::new(),
     });
+    // Host wildcard listeners set up before this stack existed (httpd on
+    // 0.0.0.0 before podman0 is created) belong on it too: Linux delivers to
+    // them on every host address. `adopt` skips stacks of other namespaces
+    // (listen::stacks_for) and is a no-op with none.
+    let _ = crate::listen::adopt(sid);
+}
+
+/// Take from `tx` the frames a stack built for one of its own interface
+/// addresses and queue them on its own receive side: an ARP request for an
+/// own address is answered (with the interface MAC) and an IPv4 frame
+/// addressed to the interface's own MAC is received as sent, so a connect()
+/// to the netns's own address reaches its listener or an RST from it.
+fn loop_own(sid: Sid, mac: [u8; 6], tx: &mut Vec<Vec<u8>>) {
+    if tx.is_empty() { return; }
+    let addrs: Vec<[u8; 4]> = {
+        let v = VIFS.lock();
+        match v[sid as usize].as_ref() { Some(x) => x.addrs.iter().map(|&(a, _)| a).collect(), None => return }
+    };
+    let mut back: Vec<Vec<u8>> = Vec::new();
+    tx.retain(|f| {
+        if f.len() < 14 { return true; }
+        let et = u16::from_be_bytes([f[12], f[13]]);
+        if et == 0x0806 && f.len() >= 42 && f[20..22] == [0, 1] && addrs.iter().any(|a| a[..] == f[38..42]) {
+            let mut r = alloc::vec![0u8; 42];
+            r[0..6].copy_from_slice(&f[6..12]);
+            r[6..12].copy_from_slice(&mac);
+            r[12..14].copy_from_slice(&[0x08, 0x06]);
+            r[14..20].copy_from_slice(&f[14..20]);
+            r[20..22].copy_from_slice(&[0, 2]);
+            r[22..28].copy_from_slice(&mac);
+            r[28..32].copy_from_slice(&f[38..42]);
+            r[32..38].copy_from_slice(&f[22..28]);
+            r[38..42].copy_from_slice(&f[28..32]);
+            back.push(r);
+            return false;
+        }
+        if et == 0x0800 && f[0] & 1 == 0 && f[0..6] == mac {
+            back.push(f.clone());
+            return false;
+        }
+        true
+    });
+    if back.is_empty() { return; }
+    {
+        let mut v = VIFS.lock();
+        if let Some(x) = v[sid as usize].as_mut() {
+            for f in back { if x.rxq.len() < RXQ_CAP { x.rxq.push_back(f); } }
+            x.pending = true;
+        }
+    }
+    drivers::netdev::kick();
+}
+
+/// Frames this stack built for its own addresses never reach the wire: an
+/// ARP request for an own address is answered here and an IPv4 frame to the
+/// vif's own MAC is queued back to its receive side. Returns the frames that
+/// still leave. (The host NIC does the same in `local_delivery`.)
+fn local_loop(sid: Sid, mac: [u8; 6], own: &[[u8; 4]], tx: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(tx.len());
+    let mut back: Vec<Vec<u8>> = Vec::new();
+    for f in tx {
+        if f.len() >= 42 && f[12..14] == [0x08, 0x06] && f[20..22] == [0, 1] && own.iter().any(|a| a[..] == f[38..42]) {
+            let mut r = alloc::vec![0u8; 42];
+            r[0..6].copy_from_slice(&f[6..12]);
+            r[6..12].copy_from_slice(&mac);
+            r[12..14].copy_from_slice(&[0x08, 0x06]);
+            r[14..20].copy_from_slice(&f[14..20]);
+            r[20..22].copy_from_slice(&[0, 2]);
+            r[22..28].copy_from_slice(&mac);
+            r[28..32].copy_from_slice(&f[38..42]);
+            r[32..38].copy_from_slice(&f[22..28]);
+            r[38..42].copy_from_slice(&f[28..32]);
+            back.push(r);
+        } else if f.len() >= 14 && f[12..14] == [0x08, 0x00] && f[0..6] == mac {
+            back.push(f);
+        } else {
+            out.push(f);
+        }
+    }
+    if !back.is_empty() {
+        let mut v = VIFS.lock();
+        if let Some(x) = v[sid as usize].as_mut() {
+            for f in back { if x.rxq.len() < RXQ_CAP { x.rxq.push_back(f); } }
+            x.pending = true;
+        }
+        drop(v);
+        drivers::netdev::kick();
+    }
+    out
 }
 
 /// Poll every up tun/tap stack once. Called from the daemon pass.
@@ -189,32 +278,41 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
     }
     for sid in sids {
         // Drain the vif's queue before the stack lock is taken.
-        let (rx, mtu, h, l3, mac, peer, kind, master) = {
+        let (rx, rxsrc, mtu, h, l3, mac, peer, kind, master) = {
             let mut v = VIFS.lock();
             let Some(x) = v[sid as usize].as_mut() else { continue };
             x.pending = false;
             let peer = if x.kind == VifKind::Veth { Some(x.peer) } else { None };
-            (core::mem::take(&mut x.rxq), x.mtu as usize, x.tun, x.kind == VifKind::Tun, x.mac, peer, x.kind, x.master)
+            (core::mem::take(&mut x.rxq), core::mem::take(&mut x.rxsrc), x.mtu as usize, x.tun, x.kind == VifKind::Tun, x.mac, peer, x.kind, x.master)
         };
         // Frames to the bridge MAC for another network may be forwarded (fwd.rs).
-        let rx = if kind == VifKind::Bridge { crate::fwd::divert(sid, rx) } else { rx };
+        let rx = if kind == VifKind::Bridge { crate::fwd::divert(sid, rx, rxsrc) } else { rx };
         // A bridge port has no stack: what its peer sent goes into the switch.
         if kind == VifKind::Veth && master != NO_PEER {
             if !rx.is_empty() { crate::l2::forward(master, sid, rx.into_iter().collect()); }
             continue;
         }
         let mut dev = TapDev { rx, tx: Vec::new(), mtu };
+        let mut own: Vec<[u8; 4]> = Vec::new();
         {
             let mut g = stack_for(sid);
             if let Some(ref mut s) = *g {
                 let (c, m) = poll_stack(s, &mut dev, timestamp, &mut sigs[sid as usize], sid, keys);
                 *changed |= c; *mask |= m;
                 reap_orphans(s);
+                for c in s.interface.ip_addrs() {
+                    if let IpAddress::Ipv4(a) = c.address() { own.push(a.0); }
+                }
                 if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
                     *next = Some(next.map_or(d, |n| n.min(d)));
                 }
             }
         }
+        // A stack talking to its own interface address: Linux delivers it
+        // locally (the `local` table); here the frames loop back to its own
+        // receive queue instead of waiting on a neighbour that is itself.
+        let mut dev = dev;
+        loop_own(sid, mac, &mut dev.tx);
         // Stack lock released: the bridge's own frames enter the switch.
         if kind == VifKind::Bridge {
             if !dev.tx.is_empty() { crate::l2::forward(sid, sid, dev.tx); }
@@ -237,6 +335,10 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
                 }
             }
             continue;
+        }
+        // A namespace talking to its own interface address (Linux's `local` table).
+        if kind != VifKind::Veth && kind != VifKind::Bridge && !l3 {
+            dev.tx = local_loop(sid, mac, &own, dev.tx);
         }
         // Stack lock released: hand the frames to tundev.
         if h == NO_TUN { continue; }
@@ -292,7 +394,7 @@ pub fn sock_set(ns: u16, cmd: u32, ifr: &[u8; 40]) -> Option<i32> {
             0x8914 => { // SIFFLAGS
                 let f = u16::from_ne_bytes([ifr[16], ifr[17]]);
                 x.admin_up = f & 1 != 0;
-                if !x.admin_up { x.rxq.clear(); }
+                if !x.admin_up { x.rxq.clear(); x.rxsrc.clear(); }
             }
             0x8916 | 0x891c => { // SIFADDR / SIFNETMASK
                 let a = [ifr[20], ifr[21], ifr[22], ifr[23]];
@@ -305,7 +407,7 @@ pub fn sock_set(ns: u16, cmd: u32, ifr: &[u8; 40]) -> Option<i32> {
             }
             0x8922 => { // SIFMTU
                 let m = i32::from_ne_bytes([ifr[16], ifr[17], ifr[18], ifr[19]]);
-                if !(68..=65000).contains(&m) { return Some(-22); }
+                if !(68..=65535).contains(&m) { return Some(-22); }
                 x.mtu = m as u32;
             }
             _ => return Some(-95),
@@ -423,7 +525,7 @@ pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
                 if let Some(m) = mtu { x.mtu = m; }
                 if let Some(m) = mac { x.mac = m; }
                 if let Some(n) = name.as_ref() { x.name = [0; 16]; x.name[..n.len()].copy_from_slice(n.as_bytes()); }
-                if let Some(u) = up { x.admin_up = u; if !u { x.rxq.clear(); } }
+                if let Some(u) = up { x.admin_up = u; if !u { x.rxq.clear(); x.rxsrc.clear(); } }
             }
             if let Some(m) = mac {
                 if let Some(s) = stack_for(sid).as_mut() {
@@ -611,7 +713,7 @@ fn veth_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>, m
         let ib = { let st = nss.get_mut(&pns).unwrap(); let i = st.next_ifindex; st.next_ifindex += 1; i };
         let mk = |ns, ifindex, name, up, mtu: Option<u32>, mac, peer| Vif {
             netns: ns, ifindex, name, kind: VifKind::Veth, admin_up: up, mtu: mtu.unwrap_or(1500), mac,
-            addrs: Vec::new(), rxq: VecDeque::new(), tun: NO_TUN, pending: false, peer, master: NO_PEER,
+            addrs: Vec::new(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: NO_TUN, pending: false, peer, master: NO_PEER,
         };
         v[sa] = Some(mk(ns, ia, na, up, mtu, ma, sb as Sid));
         v[sb] = Some(mk(pns, ib, nb, peer.up, peer.mtu, mb, sa as Sid));
@@ -646,7 +748,7 @@ fn enslave(ns: u16, sid: Sid, br_index: u32) -> i32 {
         if x.master != NO_PEER { return 16; } // EBUSY: enslaved to another master
         x.master = b;
         x.addrs.clear();
-        x.rxq.clear();
+        x.rxq.clear(); x.rxsrc.clear();
     }
     {
         let mut nss = NETNS.lock();
@@ -666,7 +768,7 @@ fn release(sid: Sid) -> i32 {
         let Some(x) = v[sid as usize].as_mut() else { return 19 };
         if x.master == NO_PEER { return 0; }
         x.master = NO_PEER;
-        x.rxq.clear();
+        x.rxq.clear(); x.rxsrc.clear();
         x.mac
     };
     crate::l2::forget(sid);
@@ -692,7 +794,7 @@ fn bridge_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>,
         st.next_ifindex += 1;
         v[sid] = Some(Vif {
             netns: ns, ifindex, name: nm, kind: VifKind::Bridge, admin_up: up, mtu: mtu.unwrap_or(1500), mac: m,
-            addrs: Vec::new(), rxq: VecDeque::new(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER,
+            addrs: Vec::new(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER,
         });
         st.sids.push(sid as Sid);
         (sid as Sid, m)

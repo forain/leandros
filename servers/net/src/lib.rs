@@ -1683,6 +1683,7 @@ fn release_inet_state(state: SockState, sock_type: u8, park: bool) {
     for (sid, h) in inet_handles(&state) {
         let mut stack = stack_for(sid);
         let Some(ref mut s) = *stack else { continue };
+        if !s.socket_set.contains(h) { continue; }
         if park && sock_type == SOCK_STREAM as u8
             && matches!(state, SockState::InetConnected { .. })
         {
@@ -1756,7 +1757,10 @@ pub fn tcp_connect_status(pid: u32, fd: usize) -> isize {
         let mut stack = stack_for(sid);
         match stack.as_mut() {
             Some(s) => {
-                let t = s.socket_set.get_mut::<tcp::Socket>(handle);
+                let Some(t) = s.socket_set.try_get_mut::<tcp::Socket>(handle) else {
+                    tbl.socks[slot].connecting = false;
+                    return -(111i32 as isize); // ECONNREFUSED: the socket is gone
+                };
                 let st = t.state();
                 // The handshake is over: arm the keepalive timeout that
                 // connect() held back (see apply_tcp_opts).
@@ -1788,6 +1792,43 @@ pub fn tcp_connect_status(pid: u32, fd: usize) -> isize {
 #[inline]
 fn stack_for(sid: Sid) -> spin::MutexGuard<'static, Option<NetStack>> {
     STACKS[(sid as usize).min(MAX_STACKS - 1)].lock()
+}
+
+/// A socket whose smoltcp socket is gone (its stack was freed by a link
+/// delete / namespace reap, or the slot was reused) must fail like a socket on
+/// a dead link, never reach `SocketSet::get`, which panics on a stale handle.
+/// Called before every fd operation: a stale connected/ICMP entry (and every
+/// holder sharing its description) is demoted to the unconnected state the
+/// handlers already answer with an error. Common case: one table read.
+fn heal_stale(pid: u32, fd: usize) {
+    let Some(e) = sock_entry(pid, fd) else { return };
+    let (sid, h) = match e.state {
+        SockState::InetConnected { socket_handle, sid, .. } => (sid, socket_handle),
+        SockState::IcmpBound { socket_handle, sid } => (sid, socket_handle),
+        _ => return,
+    };
+    if stack_for(sid).as_ref().map_or(false, |s| s.socket_set.contains(h)) { return; }
+    let Some(slot) = fd_to_slot(fd) else { return };
+    let mut tbls = SOCK_TABLES.lock();
+    {
+        let Some(tbl) = find_tbl(pid, &mut *tbls) else { return };
+        let Some(e) = tbl.socks.get_mut(slot).filter(|e| e.in_use) else { return };
+        let same = match e.state {
+            SockState::InetConnected { socket_handle, sid: s2, .. } => s2 == sid && socket_handle == h,
+            SockState::IcmpBound { socket_handle, sid: s2 } => s2 == sid && socket_handle == h,
+            _ => false,
+        };
+        if !same { return; }
+        e.state = match e.state {
+            SockState::InetConnected { .. } => SockState::InetBound {
+                domain: e.domain, sock_type: e.sock_type,
+                local_endpoint: IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), e.bound_port),
+            },
+            _ => SockState::IcmpUnbound,
+        };
+        e.connecting = false;
+    }
+    share_state(&mut *tbls, pid, slot);
 }
 
 /// True for an address the loopback stack owns (127.0.0.0/8).
@@ -3999,6 +4040,11 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         // pass on an idle system.
         _ => false,
     };
+    if matches!(msg.tag, NET_BIND | NET_LISTEN | NET_ACCEPT | NET_CONNECT | NET_SEND | NET_RECV
+        | NET_SENDMSG | NET_RECVMSG | NET_SHUTDOWN | NET_GETSOCKNAME | NET_GETPEERNAME
+        | NET_SETSOCKOPT | NET_GETSOCKOPT | NET_CLOSE | NET_POLL | NET_DUP | NET_QUEUE_LEN) {
+        heal_stale(caller_pid, arg(msg,0) as usize);
+    }
     let reply = match msg.tag {
         NET_SOCKET      => handle_socket(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize),
@@ -4022,10 +4068,14 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                         arg(msg,1) as usize, arg(msg,2) as usize,
                                         arg(msg,4) as usize, arg(msg,5) as usize,
                                         arg(msg,3) as usize),
+        // msghdr_ptr == 0 with arg3/arg4 = (iov_ptr, iovcnt): a writev/readv
+        // on a socket, i.e. a msghdr with no name and no control.
         NET_SENDMSG     => handle_sendmsg(caller_pid, arg(msg,0) as usize,
-                                          arg(msg,1) as usize, arg(msg,2) as usize),
+                                          arg(msg,1) as usize, arg(msg,2) as usize,
+                                          if arg(msg,1) == 0 { Some((arg(msg,3) as usize, arg(msg,4) as usize)) } else { None }),
         NET_RECVMSG     => handle_recvmsg(caller_pid, arg(msg,0) as usize,
-                                          arg(msg,1) as usize, arg(msg,2) as usize),
+                                          arg(msg,1) as usize, arg(msg,2) as usize,
+                                          if arg(msg,1) == 0 { Some((arg(msg,3) as usize, arg(msg,4) as usize)) } else { None }),
         NET_SHUTDOWN    => with_state_wake(caller_pid, arg(msg,0) as usize, true, ||
                                handle_shutdown(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize)),
         NET_GETSOCKNAME  => handle_getsockname(caller_pid, arg(msg,0) as usize,
@@ -6332,13 +6382,18 @@ fn unix_dgram_send_fds(pid: u32, fd: usize, conn_idx: usize, is_a: bool, data: &
     val_reply(data.len() as u64)
 }
 
-fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Message {
-    if msghdr_ptr == 0 { return err_reply(-14); }
-    if let Some(o) = nlsock::of(pid, fd) { return nlsock::send_msg(o, msghdr_ptr); }
-    let iov_ptr  = rd_or_efault!(msghdr_ptr + 16);
-    let iovcnt   = rd_or_efault!(msghdr_ptr + 24);
-    let ctrl_ptr = rd_or_efault!(msghdr_ptr + 32);
-    let ctrl_len = rd_or_efault!(msghdr_ptr + 40);
+fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: Option<(usize, usize)>) -> Message {
+    if msghdr_ptr == 0 && syn.is_none() { return err_reply(-14); }
+    if let Some(o) = nlsock::of(pid, fd) {
+        // A netlink writev stays one send per iovec (the caller's fallback).
+        if syn.is_some() { return err_reply(-38); }
+        return nlsock::send_msg(o, msghdr_ptr);
+    }
+    let (iov_ptr, iovcnt, ctrl_ptr, ctrl_len) = match syn {
+        Some((p, c)) => (p, c, 0, 0),
+        None => (rd_or_efault!(msghdr_ptr + 16), rd_or_efault!(msghdr_ptr + 24),
+                 rd_or_efault!(msghdr_ptr + 32), rd_or_efault!(msghdr_ptr + 40)),
+    };
     if ctrl_ptr != 0 && ctrl_len > 0 && !sched::uaccess::user_range_ok(ctrl_ptr, ctrl_len) { return err_reply(-14); }
 
     let unix_end = unix_stream_end(pid, fd);
@@ -6373,10 +6428,10 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     // a datagram into several and dropped msg_name, so an unconnected socket
     // could not sendmsg() at all.
     if nfd == 0 && cred.is_none() && inet_dgram(pid, fd) {
-        let name_ptr = rd_or_efault!(msghdr_ptr);
-        let name_len = match sched::uaccess::read_user::<u32>(msghdr_ptr + 8) {
+        let name_ptr = if syn.is_some() { 0 } else { rd_or_efault!(msghdr_ptr) };
+        let name_len = if syn.is_some() { 0 } else { match sched::uaccess::read_user::<u32>(msghdr_ptr + 8) {
             Some(v) => v as usize, None => return err_reply(-14),
-        };
+        } };
         let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         for i in 0..iovcnt.min(UIO_MAXIOV) {
             let iov  = iov_ptr + i * 16;
@@ -6761,17 +6816,22 @@ fn udp_cmsgs(recv: u8, m: &RxMeta) -> alloc::vec::Vec<u8> {
 }
 
 unsafe fn write_msg_tail(msghdr_ptr: usize, controllen: usize, msg_flags: i32) {
+    if msghdr_ptr == 0 { return; } // readv: no msghdr to report into
     wr_user(msghdr_ptr + 40, controllen);
     wr_user(msghdr_ptr + 48, msg_flags);
 }
 
-fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Message {
-    if msghdr_ptr == 0 { return err_reply(-14); }
-    if let Some(o) = nlsock::of(pid, fd) { return nlsock::recv_msg(o, msghdr_ptr, flags); }
-    let iov_ptr  = rd_or_efault!(msghdr_ptr + 16);
-    let iovcnt   = rd_or_efault!(msghdr_ptr + 24);
-    let ctrl_ptr = rd_or_efault!(msghdr_ptr + 32);
-    let ctrl_cap = rd_or_efault!(msghdr_ptr + 40);
+fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize, syn: Option<(usize, usize)>) -> Message {
+    if msghdr_ptr == 0 && syn.is_none() { return err_reply(-14); }
+    if let Some(o) = nlsock::of(pid, fd) {
+        if syn.is_some() { return err_reply(-38); }
+        return nlsock::recv_msg(o, msghdr_ptr, flags);
+    }
+    let (iov_ptr, iovcnt, ctrl_ptr, ctrl_cap) = match syn {
+        Some((p, c)) => (p, c, 0, 0),
+        None => (rd_or_efault!(msghdr_ptr + 16), rd_or_efault!(msghdr_ptr + 24),
+                 rd_or_efault!(msghdr_ptr + 32), rd_or_efault!(msghdr_ptr + 40)),
+    };
     if ctrl_ptr != 0 && ctrl_cap > 0 && !sched::uaccess::user_range_ok(ctrl_ptr, ctrl_cap) { return err_reply(-14); }
 
     let unix_end = unix_stream_end(pid, fd);
@@ -6779,7 +6839,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     // AF_INET datagram: one datagram scattered over the iovecs, its source
     // in msg_name, MSG_TRUNC when it did not fit.
     if unix_end.is_none() && inet_dgram(pid, fd) {
-        let name_ptr = rd_or_efault!(msghdr_ptr);
+        let name_ptr = if syn.is_some() { 0 } else { rd_or_efault!(msghdr_ptr) };
         let mut iovs: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
         let mut cap = 0usize;
         for i in 0..iovcnt.min(UIO_MAXIOV) {

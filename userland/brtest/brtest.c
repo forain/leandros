@@ -839,6 +839,7 @@ static int route_default(int s, int oif, const char *gw) {
     nl_attr(&m, RTA_GATEWAY, &g, 4); nl_attr(&m, RTA_OIF, &oif, 4);
     return nl_do(s, &m);
 }
+static const unsigned char VICTIM_MAC[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0xaa };
 static int g_fwd_mode; /* 0 = UDP DNS query, 1 = ping the QEMU gateway; expect success */
 static int g_fwd_expect = 1;
 static void fwd_resolver(char *out) {
@@ -898,9 +899,7 @@ static int tcp_conn(const char *ip, int port) {
     if (connect(fd, (struct sockaddr *)&to, sizeof to)) { close(fd); return -1; }
     return fd;
 }
-static int tcp_dns_c(const char *srv) {
-    int fd = tcp_conn(srv, 53);
-    if (fd < 0) return 0;
+static int tcp_dns_fd(int fd) {
     unsigned char q[] = { 0, 29, 0x4c, 0x45, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
                           7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0, 0, 1, 0, 1 };
     int ok = 0;
@@ -914,6 +913,12 @@ static int tcp_dns_c(const char *srv) {
         }
         ok = got >= 14 && got >= want && rb[2] == 0x4c && rb[3] == 0x45 && (rb[4] & 0x80);
     }
+    return ok;
+}
+static int tcp_dns_c(const char *srv) {
+    int fd = tcp_conn(srv, 53);
+    if (fd < 0) return 0;
+    int ok = tcp_dns_fd(fd);
     close(fd);
     return ok;
 }
@@ -958,6 +963,7 @@ static int fwd_body(void) {
     g_ip = "10.97.0.2";
     int s = nl_sock();
     int idx = link_get(s, "eth0", NULL, NULL);
+    if (g_fwd_mode >= 8) link_set_mac(s, idx, VICTIM_MAC);
     if (!idx || addr_add(s, idx, g_ip, 24) || link_set_up(s, idx)) return 1;
     int lo = link_get(s, "lo", NULL, NULL); link_set_up(s, lo);
     if (route_default(s, idx, "10.97.0.1")) return 2;
@@ -971,6 +977,20 @@ static int fwd_body(void) {
         ok = tcp_dns_c(srv);
         if (ok && g_http) ok = http_get(g_http);
     }
+    else if (g_fwd_mode >= 8) { /* hold a flow; after the attacker acted, the same connection must still work */
+        char srv[64]; fwd_resolver(srv);
+        int fd = tcp_conn(srv, 53);
+        if (fd < 0) return 9;
+        write(done_[1], &ch, 1);
+        rd_to(ctl[0], &ch);
+        ok = tcp_dns_fd(fd);
+        close(fd);
+    }
+    else if (g_fwd_mode == 6) { /* TCP to the bridge's own address: a host 0.0.0.0 listener, with forwarding on */
+        int fd = tcp_conn("10.97.0.1", 7779);
+        ok = fd >= 0;
+        if (fd >= 0) close(fd);
+    }
     else if (g_fwd_mode >= 4) { /* hold an established TCP flow open until released */
         char srv[64]; fwd_resolver(srv);
         int fd = tcp_conn(srv, 53);
@@ -983,6 +1003,15 @@ static int fwd_body(void) {
     else { char gw[32]; fwd_gateway(gw); ok = icmp_ping(gw); }
     return ok == g_fwd_expect ? 0 : 4 + ok;
 }
+/* Attacker netns: takes the victim's MAC and the victim-network address, then pings the bridge to get learned. */
+static int spoof_body(void) {
+    int s = nl_sock();
+    int idx = link_get(s, "eth0", NULL, NULL);
+    if (!idx || link_set_mac(s, idx, VICTIM_MAC) || addr_add(s, idx, "10.97.0.3", 24) || link_set_up(s, idx)) return 1;
+    int ok = icmp_ping("10.97.0.1");
+    char ch = 'r'; write(done_[1], &ch, 1);
+    return ok ? 0 : 2;
+}
 static int ip_forward_set(int on) {
     int fd = open("/proc/sys/net/ipv4/ip_forward", O_WRONLY);
     if (fd < 0) return -1;
@@ -990,8 +1019,16 @@ static int ip_forward_set(int on) {
     close(fd);
     return r == 2 ? 0 : -1;
 }
+static int g_early_listen; /* mode 6: bind the host listener before br0 exists (httpd before podman0) */
 static void fwd_case(const char *name, int mode, int ipfwd) {
     char msg[96];
+    int hl = -1;
+    if (mode == 6 && g_early_listen) {
+        hl = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7779) };
+        snprintf(msg, sizeof msg, "%s: host wildcard listener on 7779 (before br0)", name);
+        CHECK(msg, !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
+    }
     int s = nl_sock();
     unsigned char brmac[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x01 };
     int ok = br_new(s, "br0", brmac) == 0;
@@ -1000,6 +1037,12 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     snprintf(msg, sizeof msg, "%s: br0 10.97.0.1/24 up", name); CHECK(msg, ok);
     snprintf(msg, sizeof msg, "%s: ip_forward=%d", name, ipfwd); CHECK(msg, ip_forward_set(ipfwd) == 0);
     g_fwd_mode = mode; g_fwd_expect = ipfwd;
+    if (mode == 6 && !g_early_listen) {
+        hl = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7779) };
+        snprintf(msg, sizeof msg, "%s: host wildcard listener on 7779", name);
+        CHECK(msg, !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
+    }
     pid_t c = spawn_ns(fwd_body);
     int cc[2] = { ctl[0], ctl[1] }, dd[2] = { done_[0], done_[1] };
     snprintf(msg, sizeof msg, "%s: netns spawned", name); CHECK(msg, c > 0);
@@ -1015,7 +1058,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     snprintf(msg, sizeof msg, "%s: netns configured eth0 + default via 10.97.0.1", name); CHECK(msg, rd == 1);
     if (rd == 1) write(cc[1], &ch, 1); /* go */
     int natp = 0;
-    if (mode >= 4) {
+    if (mode >= 4 && mode != 6) {
         snprintf(msg, sizeof msg, "%s: precondition: no NAT port is held yet", name);
         CHECK(msg, nat_scan() == 0);
         rd = rd_to(dd[0], &ch);
@@ -1025,6 +1068,34 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
             snprintf(msg, sizeof msg, "%s: host bind() to the in-use NAT port gets EADDRINUSE (port %d)", name, natp);
             CHECK(msg, natp > 0);
             write(cc[1], &ch, 1);
+        } else if (mode >= 8) {
+            /* attacker B: own netns, veth with the victim's MAC, then act (6: delete it, 7: join br0 and get learned) */
+            int bc[2] = { ctl[0], ctl[1] };
+            (void)bc;
+            pid_t b = spawn_ns(mode == 9 ? spoof_body : idle_body);
+            int bcc[2] = { ctl[0], ctl[1] }, bdd[2] = { done_[0], done_[1] };
+            snprintf(msg, sizeof msg, "%s: attacker netns spawned", name); CHECK(msg, b > 0);
+            int fb = b > 0 ? netns_fd_of(b) : -1;
+            int mst = mode == 9 ? bidx : 0;
+            int vr = veth_new_m(s, "vethB", "eth0", fb, mst);
+            if (fb >= 0) close(fb);
+            int ib = link_get(s, "vethB", NULL, NULL);
+            snprintf(msg, sizeof msg, "%s: attacker veth created", name); CHECK(msg, vr == 0 && ib > 0);
+            if (mode == 8) {
+                link_set_mac(s, ib, VICTIM_MAC);
+                link_del(s, ib);
+                snprintf(msg, sizeof msg, "%s: attacker veth deleted", name); CHECK(msg, gone_within(s, "vethB", 3000));
+                usleep(300000);
+            } else {
+                link_set_up(s, ib);
+                write(bcc[1], &ch, 1);
+                snprintf(msg, sizeof msg, "%s: attacker (victim MAC) pinged br0", name); CHECK(msg, rd_to(bdd[0], &ch) == 1);
+                usleep(200000);
+            }
+            write(cc[1], &ch, 1);   /* victim: query on its held flow */
+            int brc = 0;
+            if (b > 0) { kill(b, SIGKILL); brc = wait_child(b); }
+            (void)brc;
         } else kill(c, SIGKILL);
     }
     int rc = wait_child(c);
@@ -1036,13 +1107,17 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
         rc = 0;
     }
     printf("%s child exit %d\n", name, rc);
-    if (mode == 2) snprintf(msg, sizeof msg, "%s: TCP DNS query to the resolver%s is answered through NAT", name, g_http ? " and an HTTP GET" : "");
+    if (mode == 6) snprintf(msg, sizeof msg, "%s: connect to the bridge address reaches the host 0.0.0.0 listener", name);
+    else if (mode == 8) snprintf(msg, sizeof msg, "%s: victim flow survives another netns deleting a link with its MAC", name);
+    else if (mode == 9) snprintf(msg, sizeof msg, "%s: spoofed MAC does not steal the victim's return traffic", name);
+    else if (mode == 2) snprintf(msg, sizeof msg, "%s: TCP DNS query to the resolver%s is answered through NAT", name, g_http ? " and an HTTP GET" : "");
     else if (mode >= 4) snprintf(msg, sizeof msg, "%s: flow holder exited cleanly", name);
     else if (mode == 0 && ipfwd) snprintf(msg, sizeof msg, "%s: UDP DNS query to the resolver is answered through NAT", name);
     else if (mode == 1 && ipfwd) snprintf(msg, sizeof msg, "%s: ICMP echo to the default gateway is answered through NAT", name);
     else snprintf(msg, sizeof msg, "%s: ip_forward=0 means no reply (nothing forwarded)", name);
     CHECK(msg, rc == 0);
     ip_forward_set(0);
+    if (hl >= 0) close(hl);
     if (iv > 0) link_del(s, iv);
     link_del(s, bidx);
     close(s);
@@ -1052,7 +1127,93 @@ static void fwd_ping(void) { fwd_case("fwd_ping", 1, 1); }
 static void fwd_off(void) { fwd_case("fwd_off", 0, 0); }
 static void fwd_tcp(void) { fwd_case("fwd_tcp", 2, 1); }
 static void fwd_port_reserved(void) { fwd_case("fwd_port_reserved", 4, 1); }
+static void fwd_mac_forge(void) { fwd_case("fwd_mac_forge", 8, 1); }
+static void fwd_mac_steal(void) { fwd_case("fwd_mac_steal", 9, 1); }
+static void fwd_hostlisten(void) { fwd_case("fwd_hostlisten", 6, 1); }
+static void fwd_hostlisten_early(void) { g_early_listen = 1; fwd_case("fwd_hostlisten_early", 6, 1); g_early_listen = 0; }
 static void fwd_reap(void) { fwd_case("fwd_reap", 5, 1); }
+
+/* A host wildcard listener must not leak into a container netns: a netns
+ * stack that connects to its OWN address on the listener's port gets
+ * ECONNREFUSED, and the host listener never sees a connection. */
+static void hostlisten_not_in_ns(void) {
+    int s = nl_sock();
+    int hl = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7781) };
+    CHECK("hostlisten_not_in_ns: host wildcard listener on 7781",
+          !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
+    pid_t c = spawn_ns(idle_body);
+    int nsfd = netns_fd_of(c);
+    int e = veth_new(s, "vethH", "eth0", nsfd);
+    close(nsfd);
+    int ia = link_get(s, "vethH", NULL, NULL);
+    CHECK("hostlisten_not_in_ns: pair created", e == 0 && ia > 0);
+    addr_add(s, ia, "10.99.2.1", 24); link_set_up(s, ia);
+    int ns = netns_fd_of(c);
+    pid_t h = fork();
+    if (h == 0) {
+        if (setns(ns, CLONE_NEWNET)) _exit(1);
+        int cs = nl_sock();
+        int idx = link_get(cs, "eth0", NULL, NULL);
+        if (!idx || addr_add(cs, idx, "10.99.2.2", 24) || link_set_up(cs, idx)) _exit(2);
+        int lo = link_get(cs, "lo", NULL, NULL); link_set_up(cs, lo);
+        int t = socket(AF_INET, SOCK_STREAM, 0);
+        struct timeval tv = { 5, 0 };
+        setsockopt(t, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        setsockopt(t, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7781) };
+        inet_pton(AF_INET, "10.99.2.2", &to.sin_addr);
+        if (connect(t, (struct sockaddr *)&to, sizeof to) == 0) _exit(200);
+        _exit(errno == ECONNREFUSED ? 0 : errno);
+    }
+    int rc = wait_child(h);
+    printf("hostlisten_not_in_ns child exit %d (200 = connected, else errno)\n", rc);
+    CHECK("hostlisten_not_in_ns: connect to the netns's own address is refused", rc == 0);
+    int fl = fcntl(hl, F_GETFL); fcntl(hl, F_SETFL, fl | O_NONBLOCK);
+    int a = accept(hl, NULL, NULL);
+    CHECK("hostlisten_not_in_ns: the host listener saw no connection", a < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    if (a >= 0) close(a);
+    close(ns); close(hl);
+    kill(c, SIGKILL); wait_child(c);
+    close(s);
+}
+
+/* A socket bound to a stack that was freed (DELLINK) must fail like a socket on a
+ * dead link; the net server used to hit SocketSet::get on the stale handle and panic. */
+static void stale_stack(void) {
+    int s = nl_sock();
+    pid_t c = spawn_ns(idle_body);
+    int nsfd = netns_fd_of(c);
+    int e = veth_new(s, "vethZ", "eth0", nsfd);
+    close(nsfd);
+    int iz = link_get(s, "vethZ", NULL, NULL);
+    CHECK("stale_stack: pair created", e == 0 && iz > 0);
+    addr_add(s, iz, "10.99.9.1", 24); link_set_up(s, iz);
+    int t = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7777) };
+    inet_pton(AF_INET, "10.99.9.2", &to.sin_addr);
+    int r = connect(t, (struct sockaddr *)&to, sizeof to);
+    CHECK("stale_stack: connect in flight on the veth stack", r < 0 && errno == EINPROGRESS);
+    CHECK("stale_stack: DELLINK of the stack's link", link_del(s, iz) == 0);
+    /* a new pair reuses the freed stack slot */
+    int e2 = veth_new(s, "vethSa", "vethSb", -1);
+    (void)e2;
+    struct pollfd p = { t, POLLIN | POLLOUT, 0 };
+    int n = poll(&p, 1, 0);
+    CHECK("stale_stack: poll answers (no panic)", n >= 0);
+    char b[8];
+    ssize_t w = send(t, "x", 1, MSG_NOSIGNAL);
+    CHECK("stale_stack: send fails, not hangs", w < 0);
+    ssize_t rd = recv(t, b, sizeof b, 0);
+    CHECK("stale_stack: recv fails", rd < 0);
+    int soerr = 0; socklen_t sl = sizeof soerr;
+    CHECK("stale_stack: getsockopt answers", getsockopt(t, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0);
+    CHECK("stale_stack: close", close(t) == 0);
+    CHECK("stale_stack: net server alive", link_get(s, "lo", NULL, NULL) > 0);
+    { int ia = link_get(s, "vethSa", NULL, NULL); if (ia > 0) link_del(s, ia); } /* leave no link behind */
+    kill(c, SIGKILL); wait_child(c);
+    close(s);
+}
 
 int main(int argc, char **argv) {
     const char *only = NULL;
@@ -1075,6 +1236,12 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "fwd_tcp")) fwd_tcp();
     if (!only || !strcmp(only, "fwd_port_reserved")) fwd_port_reserved();
     if (!only || !strcmp(only, "fwd_reap")) fwd_reap();
+    if (!only || !strcmp(only, "fwd_mac_forge")) fwd_mac_forge();
+    if (!only || !strcmp(only, "fwd_mac_steal")) fwd_mac_steal();
+    if (!only || !strcmp(only, "fwd_hostlisten")) fwd_hostlisten();
+    if (!only || !strcmp(only, "fwd_hostlisten_early")) fwd_hostlisten_early();
+    if (!only || !strcmp(only, "hostlisten_not_in_ns")) hostlisten_not_in_ns();
+    if (!only || !strcmp(only, "stale_stack")) stale_stack();
     printf("brtest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
