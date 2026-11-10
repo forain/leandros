@@ -4567,22 +4567,6 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/dev/pts",
     // Backing directories of devpts mounts (see devpts.rs).
     b"/dev/.devpts",
-    b"/dev/.devpts/1",
-    b"/dev/.devpts/2",
-    b"/dev/.devpts/3",
-    b"/dev/.devpts/4",
-    b"/dev/.devpts/5",
-    b"/dev/.devpts/6",
-    b"/dev/.devpts/7",
-    b"/dev/.devpts/8",
-    b"/dev/.devpts/9",
-    b"/dev/.devpts/10",
-    b"/dev/.devpts/11",
-    b"/dev/.devpts/12",
-    b"/dev/.devpts/13",
-    b"/dev/.devpts/14",
-    b"/dev/.devpts/15",
-    b"/dev/.devpts/16",
     b"/dev/mqueue",
     b"/run",
     b"/run/user",
@@ -4840,6 +4824,7 @@ pub fn is_directory(path_ptr: usize) -> bool {
     for &dir in RAMFS_DIRS {
         if path_eq(&pbuf, plen, dir) { return true; }
     }
+    if devpts::inst_of_backing(&pbuf[..plen]).is_some() { return true; }
     // Check tmpfs dirs.
     let path = match tmpfs_path(&pbuf[..plen]) { Some(p) => p, None => return false };
     let tmp = TMP_FILES.lock();
@@ -5274,13 +5259,13 @@ fn pts_number(path: &[u8]) -> Option<usize> {
 }
 
 /// Instance whose `ptmx` `path` names (`/dev/ptmx` is the default's).
-fn ptmx_inst(path: &[u8]) -> Option<u16> {
+fn ptmx_inst(path: &[u8]) -> Option<u32> {
     if path == b"/dev/ptmx" { return Some(0); }
     match devpts::parse(path)? { (inst, devpts::Tail::Ptmx) => Some(inst), _ => None }
 }
 
 /// Owner/mode of an instance's `ptmx` node.
-fn ptmx_meta(inst: u16) -> xattr::FileMeta {
+fn ptmx_meta(inst: u32) -> xattr::FileMeta {
     let mode = devpts::opts(inst).map_or(0o666, |o| o.ptmxmode);
     xattr::FileMeta { mode: 0o020000 | mode, uid: 0, gid: 0 }
 }
@@ -6775,7 +6760,7 @@ pub(crate) fn ns0_snapshot() -> Vec<mnt::Mnt> {
         };
         let pg = mnt::ns0_prop(&r.0);
         let mut m = mnt::Mnt { id: ids[i], parent: pid, mp: rel.into_boxed_slice(), root: r.1.clone().into_boxed_slice(),
-            sb: mnt::ns0::tmpfs_inst_of(&r.1).unwrap_or(0), flags: r.4, locked: 0, group: pg.0, master: pg.1, unbindable: pg.2, fstype: r.2,
+            sb: mnt::ns0::tmpfs_inst_of(&r.1).or_else(|| devpts::inst_of_backing(&r.1)).unwrap_or(0), flags: r.4, locked: 0, group: pg.0, master: pg.1, unbindable: pg.2, fstype: r.2,
             device: r.3.clone().into_boxed_slice(), opts: Box::from(&b""[..]) };
         if pid == 0 && i != 0 { m.parent = ids[0]; m.mp = r.0.clone().into_boxed_slice(); }
         out.push(m);
@@ -9123,6 +9108,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                         found = Some(VnodeKind::RamFile { data: dir, pos: 0, is_dir: true });
                         break;
                     }
+                }
+            }
+            if found.is_none() {
+                if let Some(sp) = devpts::backing_static(lookup_path) {
+                    found = Some(VnodeKind::RamFile { data: sp, pos: 0, is_dir: true });
                 }
             }
             if found.is_none() && is_tmp_path(path) {
