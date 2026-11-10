@@ -1099,11 +1099,11 @@ static void hostlisten_not_in_ns(void) {
         setsockopt(t, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7781) };
         inet_pton(AF_INET, "10.99.2.2", &to.sin_addr);
-        if (connect(t, (struct sockaddr *)&to, sizeof to) == 0) _exit(5);
-        _exit(errno == ECONNREFUSED ? 0 : 6);
+        if (connect(t, (struct sockaddr *)&to, sizeof to) == 0) _exit(200);
+        _exit(errno == ECONNREFUSED ? 0 : errno);
     }
     int rc = wait_child(h);
-    printf("hostlisten_not_in_ns child exit %d (5 = connected, 6 = other errno)\n", rc);
+    printf("hostlisten_not_in_ns child exit %d (200 = connected, else errno)\n", rc);
     CHECK("hostlisten_not_in_ns: connect to the netns's own address is refused", rc == 0);
     int fl = fcntl(hl, F_GETFL); fcntl(hl, F_SETFL, fl | O_NONBLOCK);
     int a = accept(hl, NULL, NULL);
