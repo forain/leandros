@@ -220,6 +220,72 @@ static void newuidmap_e2e(void)
     report("newuidmap_e2e", rc == 0);
 }
 
+
+/* ---- e2e_subuid: newuidmap/newgidmap with /etc/subuid build 0->1000, 1->100000.. */
+static char e2e_path[64];
+static int e2e_body(void)
+{
+    int a[2], b[2];
+    if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) return 1;
+    pipe(a); pipe(b);
+    pid_t c = fork();
+    if (c == 0) {
+        char x = 0;
+        if (unshare(CLONE_NEWUSER)) { x = 'u'; write(b[1], &x, 1); _exit(1); }
+        prctl(PR_SET_DUMPABLE, 1);
+        write(b[1], &x, 1);
+        read(a[0], &x, 1);                 /* maps written */
+        struct stat st;
+        if (getuid() != 0 || getgid() != 0) _exit(20);
+        if (setresgid(2, 2, 2) || setresuid(2, 2, 2)) _exit(21);
+        if (getuid() != 2 || getgid() != 2) _exit(22);
+        int fd = open(e2e_path, O_CREAT | O_WRONLY | O_EXCL, 0644);
+        if (fd < 0) _exit(23);
+        close(fd);
+        if (stat(e2e_path, &st) || st.st_uid != 2 || st.st_gid != 2) _exit(24);
+        _exit(0);
+    }
+    char x; int rc = 0;
+    if (read(b[0], &x, 1) != 1 || x) rc = 2;
+    else {
+        char pid[16];
+        snprintf(pid, sizeof pid, "%d", c);
+        const char *tool[2] = { "/usr/bin/newuidmap", "/usr/bin/newgidmap" };
+        for (int i = 0; i < 2 && !rc; i++) {
+            pid_t h = fork();
+            if (h == 0) {
+                execl(tool[i], tool[i], pid, "0", "1000", "1", "1", "100000", "65536", (char *)NULL);
+                _exit(127);
+            }
+            int st; waitpid(h, &st, 0);
+            if (!WIFEXITED(st) || WEXITSTATUS(st)) rc = 10 + i * 10 + (WIFEXITED(st) ? WEXITSTATUS(st) : 99) % 10;
+        }
+    }
+    write(a[1], "x", 1);
+    int st; waitpid(c, &st, 0);
+    if (!rc && (!WIFEXITED(st) || WEXITSTATUS(st))) rc = 40 + (WIFEXITED(st) ? WEXITSTATUS(st) : 99);
+    if (!rc) {
+        struct stat s;   /* ns 0 reads kernel ids: ns-uid 2 is kuid 100001 (1->100000) */
+        if (stat(e2e_path, &s) || s.st_uid != 100001 || s.st_gid != 100001) { printf("e2e_subuid: init sees %u:%u\n", (unsigned)s.st_uid, (unsigned)s.st_gid); rc = 3; }
+    }
+    return rc;
+}
+static void e2e_subuid(void)
+{
+    struct stat st;
+    if (stat("/usr/bin/newuidmap", &st) || stat("/usr/bin/newgidmap", &st)) { skip("e2e_subuid", "no newuidmap/newgidmap"); return; }
+    char cl[1024];
+    if (slurp_file("/proc/cmdline", cl, sizeof cl) < 0 || !strstr(cl, "idmap=test")) { skip("e2e_subuid", "needs idmap=test"); return; }
+    snprintf(e2e_path, sizeof e2e_path, "/tmp/e2e_subuid.%d", (int)getpid());
+    unlink(e2e_path);
+    pid_t m = fork();
+    if (m == 0) _exit(e2e_body());
+    int s; waitpid(m, &s, 0);
+    int rc = WIFEXITED(s) ? WEXITSTATUS(s) : 99;
+    unlink(e2e_path);
+    if (rc) printf("e2e_subuid rc=%d\n", rc);
+    report("e2e_subuid", rc == 0);
+}
 /* ---- status_groups_view ------------------------------------------------- */
 static void status_groups_view(void)
 {
@@ -801,6 +867,56 @@ static int nested_view(void)
     return run_nest(&n, 1);
 }
 
+
+/* ---- nested_map_composed: ns2 "0 100 10" under ns1 "100 200000 50" ------ */
+static char nc_new[64], nc_pre[64];
+static int nc_b(void *x)
+{
+    struct stat st;
+    (void)x;
+    CHECK(setresgid(3, 3, 3) == 0 && setresuid(3, 3, 3) == 0);
+    int fd = open(nc_new, O_CREAT | O_WRONLY | O_EXCL, 0644);
+    CHECK(fd >= 0);
+    close(fd);
+    CHECK(stat(nc_new, &st) == 0 && st.st_uid == 3 && st.st_gid == 3);   /* created: ns2 3 */
+    CHECK(stat(nc_pre, &st) == 0 && st.st_uid == 7 && st.st_gid == 7);   /* kuid 200007 */
+    return 0;
+}
+static int nc_a(void *x)
+{
+    struct stat st;
+    int go; (void)x;
+    pid_t b = spawn(-1, nc_b, NULL, &go);
+    CHECK(b > 0);
+    CHECK(wrp(b, "uid_map", "0 100 10\n") == 0);
+    CHECK(wrp(b, "gid_map", "0 100 10\n") == 0);
+    CHECK(fin(b, go) == 0);
+    CHECK(stat(nc_new, &st) == 0 && st.st_uid == 103 && st.st_gid == 103);   /* ns1 names */
+    CHECK(stat(nc_pre, &st) == 0 && st.st_uid == 107 && st.st_gid == 107);
+    return 0;
+}
+static int nested_map_composed(void)
+{
+    struct stat st;
+    if (!knob) return SKIP;
+    snprintf(nc_new, sizeof nc_new, "/tmp/nmc_new.%d", (int)getpid());
+    snprintf(nc_pre, sizeof nc_pre, "/tmp/nmc_pre.%d", (int)getpid());
+    unlink(nc_new); unlink(nc_pre);
+    int fd = open(nc_pre, O_CREAT | O_WRONLY, 0644);
+    CHECK(fd >= 0);
+    CHECK(fchown(fd, 200007, 200007) == 0);
+    close(fd);
+    int go; pid_t a = spawn(1000, nc_a, NULL, &go);
+    CHECK(a > 0);
+    CHECK(wrp(a, "uid_map", "5 1000 1\n100 200000 50\n") == 0);
+    CHECK(wrp(a, "gid_map", "5 1000 1\n100 200000 50\n") == 0);
+    int rc = fin(a, go);
+    int ok = stat(nc_new, &st) == 0 && st.st_uid == 200003 && st.st_gid == 200003;   /* init: kernel ids */
+    unlink(nc_new); unlink(nc_pre);
+    CHECK(rc == 0);
+    CHECK(ok);
+    return 0;
+}
 /* ---- idcaps: capability transitions are relative to the namespace root --- */
 
 #define CAP_EXIT_NONE 20
@@ -936,6 +1052,9 @@ static pid_t fork_subuid_child(int *go)
         char b = 'r';
         close(g[1]); close(r[0]);
         if (setresuid(1, 1, 1)) _exit(98);
+        /* setresuid clears dumpable; Linux __ptrace_may_access then needs CAP_SYS_PTRACE in mm->user_ns
+         * (the init ns here: never exec'd inside the userns), so opt in like a real exec would. */
+        prctl(PR_SET_DUMPABLE, 1);
         (void)!write(r[1], &b, 1);
         (void)!read(g[0], &b, 1);
         _exit(0);
@@ -1991,6 +2110,7 @@ static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "map_kuid0_eperm", map_kuid0_eperm },
     { "priv_multi_extent", priv_multi_extent },
     { "nested_view", nested_view },
+    { "nested_map_composed", nested_map_composed },
     { "podman_map_text", podman_map_text },
     { "unpriv_root_map", unpriv_root_map },
     { "chown_unmapped_einval", chown_unmapped_einval },
@@ -2077,6 +2197,7 @@ int main(int argc, char **argv)
     proc_owner_newuser();
     proc_owner_nondumpable();
     newuidmap_e2e();
+    e2e_subuid();
     status_groups_view();
     stat_unmapped_65534();
     sigchld_si_uid_view();
