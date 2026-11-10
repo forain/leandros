@@ -1398,12 +1398,61 @@ fn report_sock_tables_full() {
 
 // ── Table helpers ─────────────────────────────────────────────────────────────
 
+/// The fd-table key socket `pid` lives under: the VFS table id, so
+/// CLONE_FILES sharers resolve one fd number to one socket (`sched::fdkey`).
+#[inline]
+fn tk(pid: u32) -> u32 {
+    if pid & sched::fdkey::FD_KEY_PRIVATE != 0 { pid } else { vfs::tbl_key(sched::tgid_of(pid)) }
+}
+
+/// Move the socket table `from` to key `to` (the table follows its fd table).
+pub fn rekey_table(from: u32, to: u32) {
+    let mut tbls = SOCK_TABLES.lock();
+    if let Some(t) = tbls.iter_mut().find(|t| t.in_use && t.pid == from) { t.pid = to; }
+}
+
+/// Move the socket at `slot` of table `src` into a free slot of table `dst`
+/// (no refcount change). Returns the new handle. Used after a dup within
+/// `src` to hand the new reference to a split-off table.
+pub fn move_slot(src: u32, slot_fd: usize, dst: u32) -> isize {
+    let Some(slot) = fd_to_slot(slot_fd) else { return -9 };
+    let mut tbls = SOCK_TABLES.lock();
+    let (entry, hidden) = match tbls.iter().find(|t| t.in_use && t.pid == src) {
+        Some(t) if slot < t.socks.len() && t.socks[slot].in_use => (t.socks[slot].clone(), t.is_hidden(slot)),
+        _ => return -9,
+    };
+    let Some(d) = get_or_create(dst, &mut *tbls) else { return -23 };
+    let Some(ns) = d.alloc() else { return -24 };
+    d.socks[ns] = entry; d.set_hidden(ns, hidden);
+    if let Some(t) = tbls.iter_mut().find(|t| t.in_use && t.pid == src) { t.socks[slot] = SockEntry::empty(); }
+    (ns + SOCK_FD_BASE) as isize
+}
+
+fn find_tbl_key<'a>(key: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcSockTable> {
+    tbls.iter_mut().find(|t| t.in_use && t.pid == key)
+}
+
+/// Duplicate socket `fd` inside table `key` (exact key), returning the new fd.
+pub fn dup_in(key: u32, fd: usize, cloexec: bool) -> isize {
+    let m = handle_dup(key, fd, cloexec, false);
+    let b: [u8; 8] = m.data[0..8].try_into().unwrap_or([0u8; 8]);
+    i64::from_le_bytes(b) as isize
+}
+
+/// FD_CLOEXEC of socket `fd` in table `key` (exact key).
+pub fn sock_cloexec(key: u32, fd: usize) -> bool {
+    let Some(slot) = fd_to_slot(fd) else { return false };
+    let tbls = SOCK_TABLES.read();
+    tbls.iter().find(|t| t.in_use && t.pid == key)
+        .map_or(false, |t| slot < t.socks.len() && t.socks[slot].in_use && t.socks[slot].cloexec)
+}
+
 fn find_tbl<'a>(pid: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcSockTable> {
-    tbls.iter_mut().find(|t| t.in_use && t.pid == pid)
+    tbls.iter_mut().find(|t| t.in_use && t.pid == tk(pid))
 }
 
 fn get_or_create<'a>(pid: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcSockTable> {
-    if let Some(pos) = tbls.iter().position(|t| t.in_use && t.pid == pid) {
+    if let Some(pos) = tbls.iter().position(|t| t.in_use && t.pid == tk(pid)) {
         return Some(&mut tbls[pos]);
     }
     if let Some(pos) = tbls.claim() {
@@ -1420,7 +1469,7 @@ fn get_or_create<'a>(pid: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcS
 pub fn open_fds(pid: u32) -> alloc::vec::Vec<usize> {
     let pid = sched::tgid_of(pid);
     let tbls = SOCK_TABLES.read();
-    match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+    match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) => t.socks.iter().enumerate().filter(|(_, e)| e.in_use).map(|(i, _)| i + SOCK_FD_BASE).collect(),
         None => alloc::vec::Vec::new(),
     }
@@ -1432,7 +1481,7 @@ pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
     let pid = sched::tgid_of(pid);
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.read();
-    let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+    let t = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))?;
     if slot < t.socks.len() && t.socks[slot].in_use { Some(t.socks[slot].ofd) } else { None }
 }
 
@@ -1462,14 +1511,14 @@ pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
     let tbls = SOCK_TABLES.read();
     let find = |t: &ProcSockTable| t.socks.iter().position(|e| e.in_use && e.ofd == id)
         .map(|s| (t.pid, s + SOCK_FD_BASE));
-    if let Some(r) = tbls.iter().find(|t| t.in_use && t.pid == pid).and_then(find) { return Some(r); }
-    tbls.iter().filter(|t| t.in_use && t.pid != pid).find_map(find)
+    if let Some(r) = tbls.iter().find(|t| t.in_use && t.pid == tk(pid)).and_then(find) { return Some(r); }
+    tbls.iter().filter(|t| t.in_use && t.pid != tk(pid)).find_map(find)
 }
 
 /// Network namespace captured when the socket at `slot` was created. Takes the
 /// table read lock: never call it with SOCK_TABLES held.
 fn sock_netns(pid: u32, slot: usize) -> u16 {
-    SOCK_TABLES.read().iter().find(|t| t.in_use && t.pid == pid)
+    SOCK_TABLES.read().iter().find(|t| t.in_use && t.pid == tk(pid))
         .and_then(|t| t.socks.get(slot)).filter(|e| e.in_use)
         .map(|e| e.netns()).unwrap_or_else(|| sched::ns::netns_of(pid))
 }
@@ -1547,7 +1596,7 @@ fn inet_shareable(e: &SockEntry) -> bool {
 /// them, with SOCK_TABLES held (it is the `tbls` passed) and no stack lock.
 /// An unshared socket costs one leaf-lock probe.
 fn share_state(tbls: &mut SockTables, pid: u32, slot: usize) {
-    let Some(src) = tbls.iter().find(|t| t.in_use && t.pid == pid)
+    let Some(src) = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
         .and_then(|t| t.socks.get(slot).cloned()) else { return };
     // Only inet states (and an AF_INET socket not bound yet, for
     // SO_REUSEADDR): an AF_UNIX object (a bound address, a connection end) is
@@ -1972,7 +2021,7 @@ pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<sched::PollTag> {
 fn inet_sock_info(pid: u32, fd: usize) -> Option<(SockState, u8, u16)> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.read();
-    let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+    let tbl = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
     Some((tbl.socks[slot].state, tbl.socks[slot].sock_type, tbl.socks[slot].bound_port))
 }
@@ -2098,7 +2147,7 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
     };
     let entry = {
         let tbls = SOCK_TABLES.read();
-        let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+        let tbl = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))?;
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
         let e = tbl.socks[slot].clone();
         // An inet socket: the in-flight copy is one more holder of its
@@ -3990,11 +4039,11 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         NET_GETSOCKOPT  => handle_getsockopt(caller_pid, arg(msg,0) as usize,
                                              arg(msg,1) as usize, arg(msg,2) as usize,
                                              arg(msg,3) as usize, arg(msg,4) as usize),
-        NET_CLOSE_ALL   => { if handle_close_all(caller_pid) { drivers::netdev::kick(); } ok_reply() }
+        NET_CLOSE_ALL   => { if handle_close_all(arg(msg,0) as u32) { drivers::netdev::kick(); } ok_reply() }
         NET_CLOSE       => with_state_wake(caller_pid, arg(msg,0) as usize, true, ||
                                handle_close(caller_pid, arg(msg,0) as usize)),
         NET_POLL        => handle_poll(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32),
-        NET_DUP         => handle_dup(caller_pid, arg(msg,0) as usize, arg(msg,1) != 0, arg(msg,2) != 0),
+        NET_DUP         => handle_dup(tk(caller_pid), arg(msg,0) as usize, arg(msg,1) != 0, arg(msg,2) != 0),
         NET_FORK_DUP    => handle_fork_dup(arg(msg,0) as u32, arg(msg,1) as u32),
         NET_EXEC_CLOEXEC => handle_exec_cloexec(arg(msg,0) as u32),
         NET_SETFL       => handle_setfl(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
@@ -4100,7 +4149,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             let mut tbls = SOCK_TABLES.lock();
             // The entry (and its SO_REUSEADDR) is read through a shared
             // borrow, before the mutable one below.
-            let me = match tbls.iter().find(|t| t.in_use && t.pid == pid)
+            let me = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
                 .and_then(|t| t.socks.get(slot).cloned()).filter(|e| e.in_use)
             {
                 Some(e) => e,
@@ -4384,7 +4433,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
 
     let (state, _bound_port, sock_type, listen_ofd, lnetns) = {
         let tbls = SOCK_TABLES.read();
-        let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+        let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
             Some(t) => t, None => return err_reply(-9),
         };
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
@@ -4900,7 +4949,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         // same socket set: an established flow stays on its interface.
         let (bound_addr, dgram_ofd) = {
             let tbls = SOCK_TABLES.read();
-            let e = tbls.iter().find(|t| t.in_use && t.pid == pid)
+            let e = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
                 .and_then(|t| t.socks.get(slot).filter(|e| e.in_use).cloned());
             (e.clone().and_then(|e| match e.state {
                 SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
@@ -5252,7 +5301,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
     // Shared: a send only reads the table (lane ipcfast: the write lock here
     // serialized every send in the system and stalled all readers).
     let tbls = SOCK_TABLES.read();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) => t, None => return err_reply(-9),
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
@@ -5861,7 +5910,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
     let peek = flags & MSG_PEEK != 0;
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.read();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) => t, None => return err_reply(-9),
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
@@ -6081,7 +6130,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
 fn unix_dgram_connected(pid: u32, fd: usize) -> bool {
     let Some(slot) = fd_to_slot(fd) else { return false };
     let tbls = SOCK_TABLES.read();
-    tbls.iter().find(|t| t.in_use && t.pid == pid).map_or(false, |t| {
+    tbls.iter().find(|t| t.in_use && t.pid == tk(pid)).map_or(false, |t| {
         slot < t.socks.len() && t.socks[slot].in_use
             && t.socks[slot].sock_type != SOCK_STREAM as u8
             && matches!(t.socks[slot].state, SockState::UnixConnected { .. })
@@ -6099,7 +6148,7 @@ fn unix_conn_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
 fn unix_stream_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.read();
-    let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+    let tbl = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
     if tbl.socks[slot].sock_type != SOCK_STREAM as u8 { return None; }
     match tbl.socks[slot].state {
@@ -6539,7 +6588,7 @@ const MSG_TRUNC: i32 = 0x20;
 fn inet_dgram(pid: u32, fd: usize) -> bool {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return false };
     let tbls = SOCK_TABLES.read();
-    match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+    match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) if slot < t.socks.len() && t.socks[slot].in_use =>
             matches!(t.socks[slot].state, SockState::IcmpUnbound | SockState::IcmpBound { .. })
                 || (t.socks[slot].domain == AF_INET as u8 && t.socks[slot].sock_type == SOCK_DGRAM as u8),
@@ -7058,7 +7107,7 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
     // stack lock is taken (K2 lock order), exactly as handle_recv does.
     let (state, sock_type, ofd) = {
         let tbls = SOCK_TABLES.read();
-        let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+        let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
             Some(t) => t, None => return err_reply(-9),
         };
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
@@ -7256,7 +7305,7 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         let Some(v) = val else { return err_reply(if optlen < 4 { -22 } else { -14 }) };
         let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
         let tbls = SOCK_TABLES.read();
-        let Some(e) = tbls.iter().find(|t| t.in_use && t.pid == pid)
+        let Some(e) = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
             .and_then(|t| t.socks.get(slot).cloned()).filter(|e| e.in_use) else { return err_reply(-9) };
         drop(tbls);
         let mut o = sock_opts(e.ofd);
@@ -7398,7 +7447,7 @@ pub fn sock_timeo(pid: u32, fd: usize, send: bool) -> u64 {
 fn sock_entry(pid: u32, fd: usize) -> Option<SockEntry> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.read();
-    tbls.iter().find(|t| t.in_use && t.pid == pid)
+    tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
         .and_then(|t| t.socks.get(slot).cloned()).filter(|e| e.in_use)
 }
 
@@ -7597,7 +7646,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         const SO_REUSEADDR: usize = 2;
         let entry = fd_to_slot(fd).and_then(|slot| {
             let tbls = SOCK_TABLES.read();
-            let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+            let t = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))?;
             if slot < t.socks.len() && t.socks[slot].in_use { Some(t.socks[slot].clone()) } else { None }
         });
         let Some(e) = entry else { return err_reply(-9) };
@@ -7732,7 +7781,7 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
     // Work by table index, copying one SockEntry at a time. Snapshotting the
     // whole `socks` array (as `let x = t.socks`) would put a ~24 KB copy
     // (MAX_SOCKS * SockEntry) on the kernel stack at every fork.
-    match tbls.iter().find(|t| t.in_use && t.pid == parent) {
+    match tbls.iter().find(|t| t.in_use && t.pid == tk(parent)) {
         None => return ok_reply(), // parent has no sockets — nothing to do
         // A table whose sockets are all closed: nothing to inherit, so do not
         // claim (and possibly heap-allocate, 32 KiB) a table for the child.
@@ -7744,8 +7793,8 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
     if get_or_create(child, &mut *tbls).is_none() {
         return err_reply(-12);
     }
-    let parent_pos = tbls.iter().position(|t| t.in_use && t.pid == parent).unwrap();
-    let child_pos  = tbls.iter().position(|t| t.in_use && t.pid == child).unwrap();
+    let parent_pos = tbls.iter().position(|t| t.in_use && t.pid == tk(parent)).unwrap();
+    let child_pos  = tbls.iter().position(|t| t.in_use && t.pid == tk(child)).unwrap();
 
     // TEMPORARY: (slot, conn_idx) of each inherited pending connector, printed
     // after both locks are released. `Vec::new` does not allocate, and nothing
@@ -7827,7 +7876,7 @@ fn handle_exec_cloexec(pid: u32) -> Message {
     loop {
         let is_cloexec = {
             let tbls = SOCK_TABLES.read();
-            match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+            match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
                 Some(t) if slot < t.socks.len() => t.socks[slot].in_use && t.socks[slot].cloexec,
                 _ => return ok_reply(),
             }
@@ -7867,7 +7916,7 @@ fn handle_setfl(pid: u32, sockfd: usize, flags: u32) -> Message {
 fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.read();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) { Some(t) => t, None => return err_reply(-9) };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
@@ -7923,7 +7972,7 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
 fn handle_getfl(pid: u32, sockfd: usize) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.read();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) { Some(t) => t, None => return err_reply(-9) };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     val_reply(if tbl.socks[slot].nonblock { 0x800 } else { 0 })
 }
@@ -7949,7 +7998,7 @@ fn handle_getfd(pid: u32, sockfd: usize) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let cloexec = {
         let tbls = SOCK_TABLES.read();
-        match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+        match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
             Some(t) if slot < t.socks.len() && t.socks[slot].in_use => Some(t.socks[slot].cloexec),
             _ => None,
         }
@@ -7971,10 +8020,10 @@ fn handle_getfd(pid: u32, sockfd: usize) -> Message {
 /// fcntl(F_DUPFD/F_DUPFD_CLOEXEC) on a socket fd: allocate a second slot
 /// aliasing the same connection end (tokio/mio clone the fd of one
 /// socketpair end this way for their signal driver).
-fn handle_dup(pid: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
+fn handle_dup(key: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let mut tbls = SOCK_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) {
+    let tbl = match find_tbl_key(key, &mut *tbls) {
         Some(t) => t, None => return err_reply(-9),
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
@@ -8002,7 +8051,7 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
         drop(tbls);
         bound_ref_inc(bound_idx);
         let mut tbls = SOCK_TABLES.lock();
-        let placed = match find_tbl(pid, &mut *tbls) {
+        let placed = match find_tbl_key(key, &mut *tbls) {
             Some(t) => match t.alloc() {
                 Some(s) => { let mut e = entry.clone(); e.cloexec = cloexec; t.socks[s] = e; t.set_hidden(s, hidden); Some(s) }
                 None => None,
@@ -8041,7 +8090,7 @@ pub fn sock_is_hidden(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid);
     let Some(slot) = fd_to_slot(fd) else { return false };
     let tbls = SOCK_TABLES.read();
-    tbls.iter().find(|t| t.in_use && t.pid == pid)
+    tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
         .map_or(false, |t| slot < t.socks.len() && t.socks[slot].in_use && t.is_hidden(slot))
 }
 
@@ -8051,7 +8100,7 @@ pub fn sock_is_hidden(pid: u32, fd: usize) -> bool {
 pub fn open_sock_fds(pid: u32) -> alloc::vec::Vec<usize> {
     let pid = sched::tgid_of(pid);
     let tbls = SOCK_TABLES.read();
-    match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+    match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) => t.socks.iter().enumerate().filter(|(_, e)| e.in_use).map(|(i, _)| SOCK_FD_BASE + i).collect(),
         None => alloc::vec::Vec::new(),
     }
@@ -8061,7 +8110,7 @@ pub fn sock_is_open(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid);
     let Some(slot) = fd_to_slot(fd) else { return false };
     let tbls = SOCK_TABLES.read();
-    tbls.iter().find(|t| t.in_use && t.pid == pid)
+    tbls.iter().find(|t| t.in_use && t.pid == tk(pid))
         .map_or(false, |t| slot < t.socks.len() && t.socks[slot].in_use)
 }
 
@@ -8113,7 +8162,7 @@ fn close_entry(pid: u32, sockfd: usize) -> (Message, Option<Closed>) {
     if sockfd < SOCK_FD_BASE { return (err_reply(-9), None); }
     let slot = sockfd - SOCK_FD_BASE;
     let mut tbls = SOCK_TABLES.lock();
-    let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
+    let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) => t,
         None    => return (err_reply(-9), None),
     };
@@ -8130,7 +8179,7 @@ fn close_entry(pid: u32, sockfd: usize) -> (Message, Option<Closed>) {
             drop(tbls);
             unix_end_release(conn_idx, is_a);
             let mut tbls2 = SOCK_TABLES.lock();
-            if let Some(t2) = tbls2.iter_mut().find(|t| t.in_use && t.pid == pid) {
+            if let Some(t2) = tbls2.iter_mut().find(|t| t.in_use && t.pid == tk(pid)) {
                 t2.socks[slot] = SockEntry::empty();
             }
             drop(tbls2);
@@ -8239,7 +8288,7 @@ fn unix_end_keys(conn_idx: usize, is_a: bool, requested: u32) -> sched::PollTag 
 fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.read();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) => t, None => return err_reply(-9),
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
