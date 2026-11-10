@@ -305,7 +305,7 @@ pub fn sock_set(ns: u16, cmd: u32, ifr: &[u8; 40]) -> Option<i32> {
             }
             0x8922 => { // SIFMTU
                 let m = i32::from_ne_bytes([ifr[16], ifr[17], ifr[18], ifr[19]]);
-                if !(68..=65000).contains(&m) { return Some(-22); }
+                if !(68..=65535).contains(&m) { return Some(-22); }
                 x.mtu = m as u32;
             }
             _ => return Some(-95),
