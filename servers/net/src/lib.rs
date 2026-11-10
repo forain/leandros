@@ -4456,6 +4456,8 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     Some(sn) => sn,
                     None => { drop(tbls); drop_conn(from, established); return err_reply(-24); }
                 };
+                // Linux sk_clone: the child lives in the listener's netns.
+                let lns = tbl.socks[slot].ns.clone();
                 tbl.socks[new_slot] = SockEntry {
                     state: SockState::InetConnected {
                         socket_handle: established, remote_endpoint: None, sid: from },
@@ -4471,7 +4473,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     ofd: vfs::ofd::alloc(),
                     hidden: false,
                     connecting: false,
-                    ns: sched::ns::NsRef::INIT,
+                    ns: lns,
                 };
                 // Linux clones the accepted socket from the listener, so it
                 // inherits TCP_NODELAY and the keepalive settings. The
