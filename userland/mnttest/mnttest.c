@@ -1276,13 +1276,14 @@ static int nsfs_in_mntns(int mode) {
     if (unshare(CLONE_NEWNET) < 0) return 96;       /* the bind now holds the old netns alone */
     fd = open(file, O_RDONLY);
     if (fd < 0) return 3;
+    DBGC();
     if (fstat(fd, &a) < 0 || a.st_ino != orig.st_ino) return 4;
     DBGC();
     if (setns_(fd, CLONE_NEWNET) < 0) return 5;
     if (stat("/proc/self/ns/net", &b) < 0 || b.st_ino != orig.st_ino) return 6;
-    close(fd);
-    DBGC();
+    close(fd); DBGC();
     if (umount(file) < 0) return 7;
+    DBGC();
     DBGC();
     return 0;
 }
