@@ -108,5 +108,34 @@ pub fn users(key: u32, tgid: u32) -> usize {
         if v as u32 == key { with_key += 1; }
         if TGID[i].load(Ordering::Relaxed) == tgid { in_group += 1; }
     }
-    if key & FD_KEY_PRIVATE != 0 { with_key } else { crate::thread_count(tgid).saturating_sub(in_group) }
+    if key & FD_KEY_PRIVATE != 0 { with_key }
+    else { crate::thread_count(tgid).saturating_sub(in_group) + with_key }
 }
+
+/// CLONE_FILES: the child task `child` (its own tgid) uses the table `key` of
+/// another process. false: the registry is full.
+pub fn share(child: u32, key: u32) -> bool { set(child, key, child) }
+
+/// The owner of the plain process table `old` (a tgid) leaves it: every task
+/// that shared it through `share` now names `new` (a private key) instead, so
+/// the table lives until its last sharer goes. false: nobody shared it.
+pub fn rekey_shared(old: u32, new: u32) -> bool {
+    let _g = WRITE.lock();
+    let mut any = false;
+    for i in 0..SLOTS {
+        let v = TID_KEY[i].load(Ordering::Relaxed);
+        if v != 0 && v as u32 == old {
+            TID_KEY[i].store((v & !0xffff_ffff) | new as u64, Ordering::Release);
+            any = true;
+        }
+    }
+    any
+}
+
+/// Does any task other than the owner use the plain process table `tgid`?
+pub fn has_sharers(tgid: u32) -> bool {
+    TID_KEY.iter().any(|s| { let v = s.load(Ordering::Acquire); v != 0 && v as u32 == tgid })
+}
+
+/// Is `tgid` a single-threaded group?
+pub fn thread_group_single(tgid: u32) -> bool { crate::thread_count(tgid) <= 1 }

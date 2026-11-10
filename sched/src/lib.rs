@@ -6771,7 +6771,12 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
             false
         }
         mm::vmm::Fault::Segv => {
-            if !quiet { report_segv(pid, addr, is_write); }
+            // A fault inside a fault-tolerant uaccess copy is an expected
+            // EFAULT the arch handler resumes from, not a crash: say nothing
+            // (it used to print "[PF] SEGV ... (kernel)" for every
+            // errtrace probe of a non-pointer argument).
+            let pc = FAULT_PC[unsafe { cpu_id() } % MAX_CPUS].load(Ordering::Relaxed);
+            if !quiet && uaccess::fixup(pc).is_none() { report_segv(pid, addr, is_write); }
             false
         }
     }
