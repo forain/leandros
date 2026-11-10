@@ -1941,6 +1941,7 @@ static void fdbindprop_suite(void) {
         char n[64]; snprintf(n, sizeof n, "fdbindprop_%s", nm[m]);
         report(n, nn_in_child(fb_m, m));
     }
+}
 
 /* ── lane mntro: per-mount ro / noexec / nodev enforcement ─────────────── */
 static int mro_setup(void) {
