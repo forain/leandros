@@ -213,8 +213,17 @@ static unsigned long long probe_pipe(int pp[2]) {
 static int alias_pipe(unsigned long long mask, int out[2]) {
     for (int i = 0; ; i++) {
         if (i == n_alias) {
-            if (n_alias == ALIAS_MAX || pipe(alias_fd[n_alias]) < 0) return -1;
-            alias_bit[n_alias] = probe_pipe(alias_fd[n_alias]);
+            if (n_alias == ALIAS_MAX) return -1;
+            /* A probe that never parked (a loaded machine) says nothing about the
+             * pipe: drop it and try another instead of spending a slot. */
+            unsigned long long b = 0;
+            for (int tries = 0; tries < 8 && !b; tries++) {
+                if (pipe(alias_fd[n_alias]) < 0) return -1;
+                b = probe_pipe(alias_fd[n_alias]);
+                if (!b) { close(alias_fd[n_alias][0]); close(alias_fd[n_alias][1]); }
+            }
+            if (!b) return -1;
+            alias_bit[n_alias] = b;
             n_alias++;
         }
         if (alias_bit[i] & mask) { out[0] = alias_fd[i][0]; out[1] = alias_fd[i][1]; return 0; }
