@@ -17,3 +17,13 @@ rustflags = [
     "-C", "link-arg=-nostartfiles",
     "-C", "link-arg=-static",
 ]
+
+# Musl-linked tests: see the repo-root .cargo/config.toml. Same flags, with the
+# linker path relative to userland/.
+[target.aarch64-unknown-linux-musl]
+linker = "../scripts/linker-aarch64-musl.sh"
+rustflags = ["-C", "link-self-contained=no", "-C", "relocation-model=static"]
+
+[target.x86_64-unknown-linux-musl]
+linker = "../scripts/linker-x86_64-musl.sh"
+rustflags = ["-C", "link-self-contained=no", "-C", "relocation-model=static"]
