@@ -100,6 +100,14 @@ pub(crate) fn reserved(tcp: bool, port: u16) -> bool {
     FWD.lock().ct.iter().any(|e| e.proto == proto && e.nat == port && now.saturating_sub(e.last) < ct_ttl(e))
 }
 
+/// Live TCP NAT ports (the ones `reserved(true, _)` reports), for /proc/net/nic.
+pub(crate) fn live_tcp_nat_ports(out: &mut alloc::vec::Vec<u16>) {
+    let now = sched::monotonic_ns();
+    for e in FWD.lock().ct.iter() {
+        if e.proto == PROTO_TCP && now.saturating_sub(e.last) < ct_ttl(e) { out.push(e.nat); }
+    }
+}
+
 /// Number of live conntrack entries (diagnostics).
 pub(crate) fn ct_len() -> usize { FWD.lock().ct.len() }
 
