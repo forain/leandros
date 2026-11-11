@@ -18,7 +18,7 @@ fn errno(e: KmodErr) -> isize {
 }
 
 fn check() -> Option<isize> {
-    if !sched::host_root() || super::disabled() { Some(EPERM) } else { None }
+    if !sched::caps::host_capable(sched::caps::CAP_SYS_MODULE) || super::disabled() { Some(EPERM) } else { None }
 }
 
 pub fn sys_init_module(ptr: usize, len: usize, _params: usize) -> isize {

@@ -2595,7 +2595,7 @@ fn dispatch_inner(
         DELETE_MODULE => crate::kmod::sys::sys_delete_module(a0, a1),
         KEXEC_FILE_LOAD => crate::kexec::sys_kexec_file_load(a0, a1, a2, a3, a4),
         #[cfg(not(target_arch = "aarch64"))]
-        IOPL | IOPERM => if !sched::host_root() { -1 } else { log_enosys(number) },
+        IOPL | IOPERM => if !sched::caps::host_capable(sched::caps::CAP_SYS_RAWIO) { -1 } else { log_enosys(number) },
         SETHOSTNAME   => sys_setxname(a0, a1, false),
         SETDOMAINNAME => sys_setxname(a0, a1, true),
 
@@ -4290,7 +4290,8 @@ fn pidfd_reaped_wake(pid: u32) {
 fn sys_clock_settime(clkid: usize, tp_ptr: usize) -> isize {
     if clkid != CLOCK_REALTIME { return -22; }
     let ns = match read_user_timespec(tp_ptr) { Ok(n) => n, Err(e) => return e };
-    if !sched::host_root() { return -1; } // EPERM
+    // Linux settime_ns/do_sys_settimeofday64: CAP_SYS_TIME in the initial userns.
+    if !sched::caps::host_capable(sched::caps::CAP_SYS_TIME) { return -1; } // EPERM
     step_realtime_ns(ns);
     0
 }
@@ -4323,7 +4324,7 @@ fn sys_settimeofday(tv_ptr: usize, _tz_ptr: usize) -> isize {
     let tv_sec  = match sched::uaccess::read_user::<i64>(tv_ptr) { Some(v) => v, None => return -14 };
     let tv_usec = match sched::uaccess::read_user::<i64>(tv_ptr + 8) { Some(v) => v, None => return -14 };
     if tv_sec < 0 || tv_usec < 0 || tv_usec >= 1_000_000 { return -22; }
-    if !sched::host_root() { return -1; } // EPERM
+    if !sched::caps::host_capable(sched::caps::CAP_SYS_TIME) { return -1; } // EPERM
     step_realtime_ns((tv_sec as u64).saturating_mul(1_000_000_000) + (tv_usec as u64) * 1_000);
     0
 }
@@ -6532,7 +6533,9 @@ fn ns_follow_links(kp: KPath) -> Result<KPath, isize> {
     let mns = sched::current_mntns();
     if mns == 0 { return Ok(kp); }
     let nsb = match kp.ns.as_ref() { Some(n) => n.clone(), None => return Ok(kp) };
-    match vfs::ns_resolve_links(mns, &nsb, true) {
+    let jail = sched::current_root_arc();
+    let floor: &[u8] = jail.as_deref().unwrap_or(b"/");
+    match vfs::ns_resolve_links(mns, &nsb, true, floor) {
         Ok(Some((nsp, _, _))) if nsp != nsb => KPath::from_ns(nsp),
         Ok(_) => Ok(kp),
         Err(e) => Err(e as isize),
@@ -12841,6 +12844,53 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     // the caller set FENCE_FD_OUT, `fence_fd` is written before we return —
     // with a real fd on success, and with **-1** on every failure path. It is
     // never left holding the caller's incoming value.
+    // IN_FENCE_FD of an atomic commit (lane i915feat): upstream resolves the
+    // plane's IN_FENCE_FD with `sync_file_get_fence` and waits it before the
+    // flip. The fd table lives here, so each IN_FENCE_FD value (property id
+    // 53, a primary plane's) is resolved and CPU-waited (interruptible) before
+    // the driver sees the commit; a value that is not a fence fd is EINVAL, -1
+    // means none. The driver ignores the property's value afterwards.
+    const DRM_IOCTL_MODE_ATOMIC: usize = 0xC03864BC;
+    if cmd == DRM_IOCTL_MODE_ATOMIC && arg != 0 && validate_user_buf(arg, 56) {
+        const PROP_IN_FENCE_FD: u32 = 53;
+        let rd32 = |a: usize| sched::uaccess::read_user::<u32>(a);
+        let rd64 = |a: usize| sched::uaccess::read_user::<u64>(a);
+        let (Some(nobj), Some(objs), Some(counts), Some(props), Some(vals)) =
+            (rd32(arg + 4), rd64(arg + 8), rd64(arg + 16), rd64(arg + 24), rd64(arg + 32)) else { return -14 };
+        let _ = objs;
+        let mut k = 0usize;
+        for i in 0..(nobj as usize).min(32) {
+            let Some(n) = rd32(counts as usize + 4 * i) else { return -14 };
+            for _ in 0..(n as usize).min(64) {
+                let (Some(id), Some(val)) = (rd32(props as usize + 4 * k), rd64(vals as usize + 8 * k)) else { return -14 };
+                k += 1;
+                if id != PROP_IN_FENCE_FD { continue; }
+                let in_fd = val as i64 as i32;
+                if in_fd == -1 { continue; }
+                use drivers::syncobj_core::Fence as SFence;
+                let fence = if in_fd < 0 { None } else {
+                    match vfs::eventfd_fence_meta(pid, in_fd as usize) {
+                        Some((vfs::EVFD_ORIGIN_SYNC_FILE, tok)) => Some(drivers::sync_file::fence_of(tok)),
+                        Some((vfs::EVFD_ORIGIN_FENCE, 0)) => Some(SFence::Signaled),
+                        Some((vfs::EVFD_ORIGIN_FENCE, f)) => Some(SFence::One(f)),
+                        _ => None,
+                    }
+                };
+                let rc = match fence {
+                    None => -22,
+                    Some(f) => match {
+                        drivers::drm_device_interface::EXEC_IN_FENCE_WAITS.fetch_add(1, Ordering::Relaxed);
+                        drivers::drm_device_interface::wait_fence_obj(&f, u64::MAX)
+                    } {
+                        Ok(()) => 0,
+                        Err(drivers::DriverError::Busy) => -62,
+                        Err(_) => -4,
+                    },
+                };
+                if rc != 0 { return rc; }
+            }
+        }
+    }
     const DRM_IOCTL_VIRTGPU_EXECBUFFER: usize = 0xC0406442;
     if cmd == DRM_IOCTL_VIRTGPU_EXECBUFFER {
         const EXECBUF_FENCE_FD_OUT: u32 = 0x02;
@@ -13153,7 +13203,7 @@ fn tty_ioctl_bounce(cmd: usize, arg: usize, f: impl FnOnce(usize) -> isize) -> i
 fn sys_timer_create(clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) -> isize {
     match clockid as i32 {
         0 | 1 | 2 | 3 | 7 | 11 => {}
-        8 | 9 => if !sched::host_root() { return -1; } // EPERM: CAP_WAKE_ALARM
+        8 | 9 => if !sched::caps::host_capable(sched::caps::CAP_WAKE_ALARM) { return -1; } // EPERM
         4 | 5 | 6 => return -95, // EOPNOTSUPP
         _ => return -22,
     }
