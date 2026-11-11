@@ -11,6 +11,16 @@ import os
 import subprocess
 import soundfont
 
+def _image_missing(what):
+    """A required payload is absent: fail the build, do not ship a broken image.
+    LEANDROS_ALLOW_PARTIAL_IMAGE=1 downgrades to a warning (kernel-only work)."""
+    if os.environ.get("LEANDROS_ALLOW_PARTIAL_IMAGE") == "1":
+        print(f"WARNING (LEANDROS_ALLOW_PARTIAL_IMAGE=1): image lacks {what}", file=sys.stderr)
+        return
+    raise SystemExit(f"ERROR: required image payload missing: {what}\n"
+                     "  (set LEANDROS_ALLOW_PARTIAL_IMAGE=1 to build a partial image anyway)")
+
+
 def sibling_dir(name):
     """The shared sibling checkout ../NAME (same fallback as build-all.sh):
     a worktree elsewhere has no sibling, so use the main checkout's."""
@@ -579,6 +589,17 @@ def main():
         for util in coreutils_command_names("../coreutils"):
             bin_files.append((util, p, 0o100755))
 
+    # No shell / no coreutils = an image that boots to nothing usable. This used
+    # to be a build-all.sh warning followed by exit 0 (TODO "no shell").
+    _bn = {n for n, _p, _m in bin_files}
+    if "brush" not in _bn:
+        _image_missing(f"/bin/brush (no shell): expected {brush_target} build under "
+                       f"{os.environ.get('LEANDROS_BRUSH_DIR', '../brush')}; needs the ../crossterm sibling too")
+    if "coreutils" not in _bn:
+        _image_missing(f"/bin/coreutils (expected {coreutils_bin})")
+    if "btm" not in _bn:
+        print(f"  WARNING: /bin/btm not staged (expected ../bottom-leandros/target/{bottom_target}/release/btm)")
+
 
     lib_files = []
     root_files = []
@@ -936,6 +957,8 @@ def main():
         p = built if os.path.exists(built) else f"{m4_lib_dir}/{so}"
         if os.path.exists(p):
             usr_lib_files.append((so, p, 0o100755))
+        elif so in ("libseat.so.1", "libudev.so.1"):
+            _image_missing(f"{so} (neither {built} nor {p}; run ports/input-stack/build-shims.sh, needs zig)")
     # Recursively enumerate the /usr/share data tree. m4_share_files holds
     # (image_dir_abspath, name, hostpath); m4_share_dirs holds every directory
     # (and its ancestors down to /usr/share) that must be created. Directory
@@ -1847,6 +1870,8 @@ def main():
         f"~/code/leandros-artifacts/m9-wlglobals/out/wl-globals-{arch}")
     if os.path.exists(m9_wlglobals):
         bin_files.append(("wl-globals", m9_wlglobals, 0o100755))
+    else:
+        print(f"  note: /bin/wl-globals not staged ({m9_wlglobals} absent); measurement-only, nothing depends on it")
 
     # liprobe: runs libinput directly, with its log priority raised to DEBUG, so
     # the input path can be observed without patching COSMIC. It is what showed

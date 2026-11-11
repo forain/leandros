@@ -64,14 +64,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Why Limine leaves RAM above 4 GiB out of the HHDM is unexplained** (`lane-fbmm`); aarch64 has no HHDM gap walker.
 - **Real-PC (RTX 3070) verification deferred ~1 month** (user, 2026-10-24).
 
-### Build / tooling
-- **Image can silently ship without `libseat.so.1`/`libudev.so.1`** (no zig, no blob cache): build succeeds, COSMIC fails at runtime. Same for other `os.path.exists()`-guarded blobs.
-- **Fresh worktrees boot with no shell** unless `brush`/`coreutils`/`bottom-leandros` siblings resolve; build exits 0 with only a warning.
-- **`../crossterm` sibling required by brush**; `/bin/wl-globals` staged only if the host binary exists.
-- **Doom links `leandros-libc`** whose allocator is a bump allocator over `brk` (no free list).
-- **A userland test built with bare `cargo build` lacks `-C relocation-model=static`** and faults before `main`.
-- **`~/code/leandros-artifacts` is unversioned and diverges from `artifacts/`**; diff before trusting either.
-
 ## Missing features
 
 ### Kernel
