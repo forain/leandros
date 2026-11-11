@@ -2692,6 +2692,11 @@ impl MountEntry {
 /// (initrd, ramfs pseudo-directories, /proc, /dev nodes): anonymous 0:1.
 pub const VFS_ANON_DEV: u64 = 1;
 
+/// VFS-private: a filesystem met a symlink while the call was marked strict (mount
+/// namespace task, paths already resolved in ns space). `handle_as` retries the
+/// whole resolution at most twice, then answers ELOOP. Never reaches userspace.
+pub const VFS_ELINKRACE: i32 = -4100;
+
 /// Anonymous `st_dev` of the `i`-th built-in tmpfs root (TMPFS_ROOTS order),
 /// matching the minor /proc/self/mountinfo prints for it.
 fn tmpfs_root_dev(i: usize) -> u64 { makedev(0, 10 + i as u32) }
@@ -4965,6 +4970,8 @@ pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool, floor
         cur.extend_from_slice(&c);
         if last && !follow { continue; }
         let x = match mnt::translate(ns, &cur) { Some(x) => x, None => return Ok(None) };
+        // A bind root swapped for a link must fail before that link is followed.
+        bindpin_verify(ns, x.mnt_id)?;
         if let Some(t) = backing_readlink(&x.backing) {
             hops += 1;
             if hops > SYMLINK_MAX_HOPS { return Err(-40); }
@@ -4975,7 +4982,43 @@ pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool, floor
     }
     if cur.is_empty() { cur.push(b'/'); }
     let x = match mnt::translate(ns, &cur) { Some(x) => x, None => return Ok(None) };
+    bindpin_verify(ns, x.mnt_id)?;
     Ok(Some((cur, x.backing, x.mnt_id)))
+}
+
+/// `(st_dev, st_ino)` of backing path `root`, `None` when it cannot be stat'ed.
+fn stat_id_of(root: &[u8]) -> Option<(u64, u64)> {
+    let mut p = root.to_vec();
+    p.push(0);
+    let mut buf = [0u8; 256];
+    let r = handle_stat(p.as_ptr() as usize, buf.as_mut_ptr() as usize);
+    if reply_val(&r) < 0 { None } else { Some(read_stat_id(buf.as_ptr() as usize)) }
+}
+
+/// mntiso-bindpin (D5): a pinned bind root must still be the object that was
+/// bound. Only checked after a name-changing op somewhere (`NAME_GEN` moved
+/// since the last verification): one stat. Mismatch = ESTALE (fail closed;
+/// Linux would keep following the old dentry).
+fn bindpin_verify(ns: sched::ns::NsId, mid: u32) -> Result<(), i32> {
+    let Some((root, pin, vgen)) = mnt::pin_of(ns, mid) else { return Ok(()) };
+    let g = mnt::name_gen();
+    if vgen >= g { return Ok(()); }
+    BINDPIN_STATS_CHECKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    match stat_id_of(&root) {
+        Some(id) if id == pin => { mnt::pin_verified(ns, mid, g); Ok(()) }
+        _ => { BINDPIN_STATS_STALE.fetch_add(1, core::sync::atomic::Ordering::Relaxed); Err(-116) }
+    }
+}
+static BINDPIN_STATS_CHECKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BINDPIN_STATS_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Pin the root of bind mount `mid` of namespace `ns` to the object it names now.
+/// Only host-backed trees are pinned (not /proc, /sys, /dev or the hidden sb space).
+pub fn bindpin_set(ns: sched::ns::NsId, mid: u32) {
+    let Some(root) = mnt::root_of(ns, mid) else { return };
+    if root.starts_with(b"/proc") || root.starts_with(b"/sys") || root.starts_with(b"/dev") || mnt::is_sb_path(&root) { return; }
+    let g = mnt::name_gen();
+    if let Some(id) = stat_id_of(&root) { mnt::pin_set(ns, mid, id, g); }
 }
 
 /// Per-mount MS_RDONLY / MS_NODEV enforcement for a path resolved into a
@@ -5040,6 +5083,7 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
     let pid = sched::current_pid();
     if let Some(cx) = mnt::callctx_get(pid, ptr) {
         let ns = sched::current_mntns();
+        if ns != 0 { sched::set_strict_links(true); }
         let jail = sched::current_root_arc();
         let floor: &[u8] = jail.as_deref().unwrap_or(b"/");
         let rr = ns_resolve_links(ns, &cx.ns_path, follow, floor);
@@ -5099,23 +5143,40 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
     // argument `KPath` makes on the kernel side).
     let (p0, p1) = path_args(&msg);
     if p0.is_some() || p1.is_some() {
-        let mut b0: Vec<u8> = Vec::new();
-        let mut b1: Vec<u8> = Vec::new();
-        let mut m = *msg;
-        let (mut i0, mut i1): (Option<u32>, Option<u32>) = (None, None);
-        if let Err(e) = rewrite_one(&mut m, p0, &mut b0, &mut i0) { return err_reply(e); }
-        if let Err(e) = rewrite_one(&mut m, p1, &mut b1, &mut i1) { return err_reply(e); }
-        // rename/link across mounts is EXDEV even when both sit on one volume.
-        if matches!(m.tag, VFS_RENAME | VFS_LINK) {
-            if let (Some(a), Some(b)) = (i0, i1) { if a != b { return err_reply(-18); } }
-        }
-        let r = dispatch(&m, caller_pid);
-        // Contexts registered for the rewritten buffers die with them (a stale
-        // entry would be found again when the allocator reuses the address).
-        let me = sched::current_pid();
-        if !b0.is_empty() { mnt::callctx_clear(me, b0.as_ptr() as usize); }
-        if !b1.is_empty() { mnt::callctx_clear(me, b1.as_ptr() as usize); }
-        return r;
+        // mntiso-strict: a filesystem that meets a link in a ns-resolved call
+        // answers VFS_ELINKRACE; redo the resolution at most twice, then ELOOP.
+        let was_strict = sched::strict_links();
+        let mut attempt = 0;
+        let out = loop {
+            let mut b0: Vec<u8> = Vec::new();
+            let mut b1: Vec<u8> = Vec::new();
+            let mut m = *msg;
+            let (mut i0, mut i1): (Option<u32>, Option<u32>) = (None, None);
+            let mut r = match rewrite_one(&mut m, p0, &mut b0, &mut i0) {
+                Err(e) => err_reply(e),
+                Ok(()) => match rewrite_one(&mut m, p1, &mut b1, &mut i1) {
+                    Err(e) => err_reply(e),
+                    Ok(()) => {
+                        // rename/link across mounts is EXDEV even when both sit on one volume.
+                        let xdev = matches!(m.tag, VFS_RENAME | VFS_LINK)
+                            && matches!((i0, i1), (Some(a), Some(b)) if a != b);
+                        if xdev { err_reply(-18) } else { dispatch(&m, caller_pid) }
+                    }
+                },
+            };
+            // Contexts registered for the rewritten buffers die with them (a stale
+            // entry would be found again when the allocator reuses the address).
+            let me = sched::current_pid();
+            if !b0.is_empty() { mnt::callctx_clear(me, b0.as_ptr() as usize); }
+            if !b1.is_empty() { mnt::callctx_clear(me, b1.as_ptr() as usize); }
+            if reply_val(&r) == VFS_ELINKRACE as i64 {
+                attempt += 1;
+                if attempt > 2 { r = err_reply(-40); } else { continue; }
+            }
+            break r;
+        };
+        sched::set_strict_links(was_strict);
+        return out;
     }
     dispatch(msg, caller_pid)
 }
@@ -6193,6 +6254,7 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
     // walk passes through. Taken before TMP_FILES (RUN_QUEUE is never taken
     // under it here).
     let cred = cred_of(sched::current_pid());
+    let strict = sched::strict_links();
 
     loop {
         let path = &cur[..];
@@ -6241,6 +6303,10 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
             Some(h) => h,
             None    => break, // fully resolved
         };
+
+        // Mount-namespace task whose path was already resolved in ns space: a
+        // link met here appeared after that scan (a race) — never follow it.
+        if strict { return Err(VFS_ELINKRACE); }
 
         hops += 1;
         if hops > SYMLINK_MAX_HOPS { return Err(-40); } // ELOOP
@@ -6877,6 +6943,21 @@ fn gen_mntselftest() -> Option<VnodeKind> {
     use core::fmt::Write;
     let mut s = alloc::string::String::new();
     for (name, ok) in mnt::selftest() { let _ = writeln!(s, "{}: {}", name, if ok { "PASS" } else { "FAIL" }); }
+    // mntiso-strict (D1): inside a mount namespace a tmpfs walk that meets a link in
+    // a ns-resolved call must fail closed. The fixture link `/tmp/mntiso-strict-l`
+    // (-> /tmp) is created by mnttest; absent fixture or ns 0 = no row.
+    if sched::current_mntns() != 0 {
+        let fixture = { let t = TMP_FILES.lock(); tmp_find(&t, b"/tmp/mntiso-strict-l").map_or(false, |i| t[i].is_link) };
+        if fixture {
+            let was = sched::set_strict_links(true);
+            let r = tmp_resolve_links(b"/tmp/mntiso-strict-l/x", true);
+            let rn = tmp_resolve_links(b"/tmp/mntiso-strict-l", false);
+            sched::set_strict_links(was);
+            let ok = matches!(r, Err(e) if e == VFS_ELINKRACE) && rn.is_ok();
+            let _ = writeln!(s, "strict_tmp_link_refused: {}", if ok { "PASS" } else { "FAIL" });
+        }
+    }
+    let _ = writeln!(s, "bindpin_checks={} bindpin_stale={}", BINDPIN_STATS_CHECKS.load(core::sync::atomic::Ordering::Relaxed), BINDPIN_STATS_STALE.load(core::sync::atomic::Ordering::Relaxed));
     let _ = writeln!(s, "ns_live={} ns_dying={} sb_count={}", sched::ns::live_count(), sched::ns::dying_count(), mnt::sb_count());
     let _ = write!(s, "sb_devs=");
     for d in mnt::sb_devs() { let _ = write!(s, "{},", d); }
@@ -7103,7 +7184,7 @@ pub(crate) fn ns0_snapshot() -> Vec<mnt::Mnt> {
         let mut m = mnt::Mnt { id: ids[i], parent: pid, mp: rel.into_boxed_slice(), root: r.1.clone().into_boxed_slice(),
             sb: mnt::ns0::tmpfs_inst_of(&r.1).or_else(|| devpts::inst_of_backing(&r.1))
                 .or_else(|| if alias::ns_src(&r.1).is_some() { nssb.iter().find(|e| e.0 == r.0).map(|e| e.1) } else { None }).unwrap_or(0), flags: r.4, locked: 0, group: pg.0, master: pg.1, unbindable: pg.2, fstype: r.2,
-            device: r.3.clone().into_boxed_slice(), opts: Box::from(&b""[..]) };
+            device: r.3.clone().into_boxed_slice(), opts: Box::from(&b""[..]), pin: None, vgen: 0 };
         if pid == 0 && i != 0 { m.parent = ids[0]; m.mp = r.0.clone().into_boxed_slice(); }
         out.push(m);
     }
@@ -13886,6 +13967,7 @@ fn devfs_unlink(pid: u32, path: &[u8]) -> Message {
 }
 
 fn handle_rename(pid: u32, old_ptr: usize, new_ptr: usize, flags: usize) -> Message {
+    mnt::name_gen_bump(); // mntiso-bindpin: bind pins re-verify after this
     let (obuf, olen) = match read_cstr_raw(old_ptr) { Some(r) => r, None => return err_reply(-14) };
     let (nbuf, nlen) = match read_cstr_raw(new_ptr) { Some(r) => r, None => return err_reply(-14) };
 
@@ -14022,6 +14104,7 @@ fn tmpfs_rename(pid: u32, old: &[u8], new: &[u8], flags: usize) -> Message {
 }
 
 fn handle_unlink(pid: u32, path_ptr: usize) -> Message {
+    mnt::name_gen_bump(); // mntiso-bindpin: bind pins re-verify after this
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
 
@@ -14448,6 +14531,7 @@ pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 {
 /// relative target at creation time would break the "resolve against the
 /// link's own directory" rule that `tmp_resolve_links` implements.
 fn handle_symlink(pid: u32, target_ptr: usize, link_ptr: usize) -> Message {
+    mnt::name_gen_bump(); // mntiso-bindpin: bind pins re-verify after this
     let (tbuf, tlen) = match read_cstr_raw(target_ptr) { Some(r) => r, None => return err_reply(-14) };
     let (lbuf, llen) = match read_cstr_raw(link_ptr)   { Some(r) => r, None => return err_reply(-14) };
     if tlen == 0 { return err_reply(-2); } // ENOENT — empty target
@@ -14629,6 +14713,7 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
 }
 
 fn handle_rmdir(pid: u32, path_ptr: usize) -> Message {
+    mnt::name_gen_bump(); // mntiso-bindpin: bind pins re-verify after this
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
 
@@ -15046,9 +15131,12 @@ fn host_root_of(pid: u32) -> bool {
 /// permitted set when the real uid is the namespace root, else none.
 fn cred_with_ns(c: xattr::Cred, pid: u32, real: bool) -> xattr::Cred {
     let ns = sched::ns::userns_of(pid);
-    if ns == 0 { return c; }
-    let sv = sched::ns::view_of_ns(ns);
-    let v = xattr::IdView { ns: sv.ns, n: sv.n, ext: sv.ext };
+    // Unknown pid (boot-time mount path): keep the kernel-private `Cred::new`.
+    if ns == 0 && sched::caps::caps_of(pid).is_none() { return c; }
+    let v = if ns == 0 { xattr::IdView::HOST } else {
+        let sv = sched::ns::view_of_ns(ns);
+        xattr::IdView { ns: sv.ns, n: sv.n, ext: sv.ext }
+    };
     let caps = match sched::caps::caps_of(pid) {
         Some(cs) if !real || sched::euid_of(pid) == c.euid => cs[0],
         Some(cs) if sched::ns::root_k(ns) == Some(c.euid) => cs[1],

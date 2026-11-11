@@ -2633,8 +2633,94 @@ static void entry_ns_suite(void) {
     unlink("/root/mntiso.sock"); unlink("/root/mntiso-bound.sock"); unlink("/root/mntiso-secret"); unlink("/ldx");
 }
 
+/* mntiso-strict (D1): in a mount namespace the tmpfs walk must refuse a link on its own
+ * (/proc/mntselftest row strict_tmp_link_refused); unlinking the fixture removes the row. */
+static int strict_case(int m) {
+    (void)m;
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    static char buf[8192];
+    if (slurp("/proc/mntselftest", buf, sizeof buf) <= 0) return 92;
+    if (strstr(buf, "strict_tmp_link_refused: PASS")) return 0;
+    return strstr(buf, "strict_tmp_link_refused: FAIL") ? 11 : 93;
+}
+static void strict_ns_suite(void) {
+    unlink("/tmp/mntiso-strict-l");
+    if (symlink("/tmp", "/tmp/mntiso-strict-l") < 0) { report("strict_tmp_link_refused", 0); return; }
+    report("strict_tmp_link_refused", nn_in_child(strict_case, 0));
+    unlink("/tmp/mntiso-strict-l");
+}
+
+/* mntiso-bindpin (D5): a bind root is pinned by (dev, ino). The source is swapped on the host side
+ * (ns 0) after the bind; access through the bind must be ESTALE (or ELOOP for a link), never the
+ * replacement. m: 0 dir swap (NEW), 1 link swap (host sentinel), 2 unrelated renames keep working. */
+static int bp_child(int m, int rd, int wr) {
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (mount("/tmp/bp/vol", "/tmp/bp/mp", NULL, MS_BIND, NULL) < 0) return 92;
+    char b[16] = {0}, c = 'x';
+    if (slurp("/tmp/bp/mp/f", b, sizeof b) <= 0 || strncmp(b, "OLD", 3)) return 93;
+    if (write(wr, &c, 1) != 1) return 94;
+    if (read(rd, &c, 1) != 1) return 95;
+    memset(b, 0, sizeof b); errno = 0;
+    int n = slurp(m == 1 ? "/tmp/bp/mp/mntiso-secret" : "/tmp/bp/mp/f", b, sizeof b), e = errno;
+    if (n > 0 && (!strncmp(b, "NEW", 3) || !strncmp(b, "HOST", 4))) { printf("  reached replacement: %s\n", b); return 11; }
+    if (m == 2) return n > 0 && !strncmp(b, "OLD", 3) ? 0 : 12;
+    if (n > 0 || (e != ESTALE && !(m == 1 && e == ELOOP))) { printf("  n=%d errno=%d\n", n, e); return 12; }
+    return 0;
+}
+static int bp_case(int m) {
+    system("rm -rf /tmp/bp"); mkdir("/tmp/bp", 0755); mkdir("/tmp/bp/vol", 0755); mkdir("/tmp/bp/mp", 0755);
+    put("/tmp/bp/vol/f", "OLD", 0644);
+    mkdir("/root", 0755); put("/root/mntiso-secret", "HOST", 0644);
+    int up[2], dn[2];
+    if (pipe(up) || pipe(dn)) return 90;
+    pid_t c = fork();
+    if (c == 0) _exit(bp_child(m, dn[0], up[1]));
+    char x;
+    if (read(up[0], &x, 1) != 1) { int st; waitpid(c, &st, 0); printf("  child setup failed %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1); return 1; }
+    if (m == 2) { mkdir("/tmp/bp/other", 0755); rename("/tmp/bp/other", "/tmp/bp/other2"); rmdir("/tmp/bp/other2"); }
+    else {
+        rename("/tmp/bp/vol", "/tmp/bp/x");
+        if (m == 0) { mkdir("/tmp/bp/vol", 0755); put("/tmp/bp/vol/f", "NEW", 0644); }
+        else if (symlink("/root", "/tmp/bp/vol") < 0) return 2;
+    }
+    if (write(dn[1], &x, 1) != 1) return 3;
+    int st = 0; waitpid(c, &st, 0);
+    system("rm -rf /tmp/bp"); unlink("/root/mntiso-secret");
+    if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) printf("  child status=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 4;
+}
+static void bindpin_suite(void) {
+    report("bindpin_dir_swap", bp_case(0) == 0);
+    report("bindpin_link_swap", bp_case(1) == 0);
+    report("bindpin_unrelated_ok", bp_case(2) == 0);
+}
+
+/* mntiso-bindpin cost: stat through a bind in a mntns, (a) quiet: no name-changing op between
+ * stats (pin verified once), (b) churn: a rename in /tmp between every stat (one pin stat per op). */
+static void bindbench(void) {
+    system("rm -rf /tmp/bb"); mkdir("/tmp/bb", 0755); mkdir("/tmp/bb/vol", 0755); mkdir("/tmp/bb/mp", 0755);
+    put("/tmp/bb/vol/f", "x", 0644); put("/tmp/bb/a", "x", 0644);
+    if (unshare(CLONE_NEWNS) < 0) { printf("bindbench: unshare failed\n"); return; }
+    if (mount("/tmp/bb/vol", "/tmp/bb/mp", NULL, MS_BIND, NULL) < 0) { printf("bindbench: bind failed\n"); return; }
+    struct stat st; const int N = 20000;
+    for (int round = 0; round < 3; round++) {
+        long long t0 = now_ns();
+        for (int i = 0; i < N; i++) stat("/tmp/bb/mp/f", &st);
+        long long t1 = now_ns();
+        for (int i = 0; i < N; i++) { rename(i & 1 ? "/tmp/bb/b" : "/tmp/bb/a", i & 1 ? "/tmp/bb/a" : "/tmp/bb/b"); stat("/tmp/bb/mp/f", &st); }
+        long long t2 = now_ns();
+        for (int i = 0; i < N; i++) { rename(i & 1 ? "/tmp/bb/b" : "/tmp/bb/a", i & 1 ? "/tmp/bb/a" : "/tmp/bb/b"); stat("/tmp/bb/vol/f", &st); }
+        long long t3 = now_ns();
+        printf("bindbench %d: quiet %lld ns/stat; churn via-bind %lld ns/(rename+stat); churn no-bind %lld ns/(rename+stat)\n",
+               round, (t1 - t0) / N, (t2 - t1) / N, (t3 - t2) / N);
+    }
+    static char buf[8192];
+    if (slurp("/proc/mntselftest", buf, sizeof buf) > 0) { char *q = strstr(buf, "bindpin_checks"); if (q) { char *e = strchr(q, '\n'); if (e) *e = 0; printf("%s\n", q); } }
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "bindbench")) { bindbench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
     if (argc > 1 && !strcmp(argv[1], "euid-chk")) return geteuid() == 1000 ? 42 : geteuid() == 0 ? 44 : 45;
     newapi_enosys();
@@ -2663,6 +2749,8 @@ int main(int argc, char **argv) {
     mntiso_busy_suite();
     chroot_ns_suite();
     entry_ns_suite();
+    strict_ns_suite();
+    bindpin_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }

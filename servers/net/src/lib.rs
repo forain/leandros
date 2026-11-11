@@ -199,6 +199,18 @@ pub const SOCK_SEQPACKET: usize = 5;
 const EOPNOTSUPP: i32 = 95;
 
 pub const IPPROTO_ICMP: usize = 1;
+pub const IPPROTO_ICMPV6: usize = 58;
+/// Level 58 (SOL_ICMPV6) option: the 256-bit block mask of a raw ICMPv6 socket.
+const ICMP6_FILTER: usize = 1;
+const IPV6_UNICAST_HOPS: usize = 16;
+const IPV6_MULTICAST_HOPS: usize = 18;
+const IPV6_RECVERR: usize = 25;
+const IPV6_RECVPKTINFO: usize = 49;
+const IPV6_PKTINFO: usize = 50;
+const IPV6_RECVHOPLIMIT: usize = 51;
+const IPV6_HOPLIMIT: usize = 52;
+const IPV6_RECVTCLASS: usize = 66;
+const IPV6_TCLASS: usize = 67;
 /// SOL_TCP and the TCP-level options this server implements (Linux values).
 const IPPROTO_TCP:   usize = 6;
 const TCP_NODELAY:   usize = 1;
@@ -1310,6 +1322,10 @@ struct SockOpts {
     passcred:  bool,
     /// IPV6_V6ONLY on an AF_INET6 socket: it hears and reaches only v6.
     v6only:    bool,
+    /// IPv6 ancillary data recvmsg adds (`RECV6_*`).
+    recv6:     u8,
+    /// ICMP6_FILTER of a raw ICMPv6 socket: a set bit blocks that type.
+    icmp6f:    [u32; 8],
 }
 
 /// Linux's `net.core.wmem_default` / `rmem_default`: an AF_UNIX socket's
@@ -1329,6 +1345,11 @@ const RECV_TTL: u8 = 4;
 const RECV_GRO: u8 = 8;
 const RECV_ERR: u8 = 16;
 
+const RECV6_PKTINFO: u8 = 1;
+const RECV6_HOPLIMIT: u8 = 2;
+const RECV6_TCLASS: u8 = 4;
+const RECV6_ERR: u8 = 8;
+
 const BIND_ADDR_LOCK: u8 = 1;
 const BIND_PORT_LOCK: u8 = 2;
 
@@ -1336,7 +1357,7 @@ impl SockOpts {
     const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
                                  reuseport: false, broadcast: false, gso: 0, shut: 0,
                                  mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0,
-                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false, v6only: false };
+                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false, v6only: false, recv6: 0, icmp6f: [0; 8] };
 }
 
 /// Rows for live descriptions with a non-default `SockOpts`. Leaf lock: taken
@@ -2832,6 +2853,38 @@ fn release_inet_socket(s: &mut NetStack, handle: SocketHandle) {
     }
 }
 
+/// The destination of a ping socket's sendto: a sockaddr_in, or for an
+/// AF_INET6 ping socket a sockaddr_in6 (a v4-mapped address is EINVAL).
+fn icmp_dest(domain: usize, addr_ptr: usize, addrlen: usize) -> Result<IpAddress, i32> {
+    if domain == AF_INET6 {
+        let a = sa::parse_for(AF_INET6, addr_ptr, addrlen)?;
+        return match a.ip { IpAddress::Ipv6(_) => Ok(a.ip), _ => Err(-22) };
+    }
+    let sin_addr = sched::uaccess::read_user::<u32>(addr_ptr + 4).ok_or(-14)?;
+    Ok(IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes())))
+}
+
+/// `icmp_recv_locked` for a socket that may carry an ICMP6_FILTER: datagrams
+/// whose type the filter blocks are dropped (also under `peek`, which would
+/// otherwise see the same one forever). `v6` sockets read the bare ICMPv6
+/// message (raw(7): no IPv6 header on raw ICMPv6 sockets).
+fn icmp_recv_filtered(s: &mut NetStack, h: SocketHandle, cap: usize, peek: bool, raw: bool, v6: bool,
+                      filt: &[u32; 8]) -> Result<(alloc::vec::Vec<u8>, usize, IpAddress), i32>
+{
+    let raw = raw && !v6;
+    if !v6 || *filt == [0u32; 8] { return icmp_recv_locked(s, h, cap, peek, raw); }
+    loop {
+        let (d, full, from) = icmp_recv_locked(s, h, usize::MAX, peek, raw)?;
+        let ty = d.first().copied().unwrap_or(0) as usize;
+        if filt[ty >> 5] & (1u32 << (ty & 31)) != 0 {
+            if peek { let _ = icmp_recv_locked(s, h, 0, false, raw); }
+            continue;
+        }
+        let n = full.min(cap);
+        return Ok((d[..n].to_vec(), full, from));
+    }
+}
+
 /// The next datagram of an ICMP socket: its first `cap` bytes, its full
 /// length and its source; EAGAIN when none is queued. `peek` leaves it
 /// queued — in `icmp_peeked`, since smoltcp's `icmp::Socket` cannot peek.
@@ -4140,9 +4193,13 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         // TCP and UDP only until ICMPv6/raw sockets land (L3).
         AF_INET6 => {
             let t = sock_type & 0xf;
-            if t != SOCK_STREAM && t != SOCK_DGRAM { return err_reply(-93); }
-            if protocol != 0 && !(t == SOCK_STREAM && protocol == 6) && !(t == SOCK_DGRAM && protocol == 17) {
-                return err_reply(-93); // EPROTONOSUPPORT
+            // ICMPv6: the unprivileged ping socket and the raw one.
+            let icmp6 = protocol == IPPROTO_ICMPV6 && (t == SOCK_DGRAM || t == SOCK_RAW);
+            if !icmp6 {
+                if t != SOCK_STREAM && t != SOCK_DGRAM { return err_reply(-93); }
+                if protocol != 0 && !(t == SOCK_STREAM && protocol == 6) && !(t == SOCK_DGRAM && protocol == 17) {
+                    return err_reply(-93); // EPROTONOSUPPORT
+                }
             }
         }
         // NETLINK_ROUTE only (`rtnetlink`): getifaddrs, if_nameindex, nICEr.
@@ -4156,12 +4213,13 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
     // SOCK_DGRAM/IPPROTO_ICMP instead, which Linux allows for every group in
     // net.ipv4.ping_group_range (all of them on common distributions) and
     // which lands on the same ICMP socket below.
-    if domain == AF_INET && sock_type & 0xf == SOCK_RAW
+    if (domain == AF_INET || domain == AF_INET6) && sock_type & 0xf == SOCK_RAW
         && !sched::caps::ns_capable_in_of(pid, sched::ns::owner_userns(1, sched::ns::netns_of(pid)), sched::caps::CAP_NET_RAW) {
         return err_reply(-1);
     }
     // net.ipv4.ping_group_range of the caller's netns gates SOCK_DGRAM ICMP.
-    if domain == AF_INET && sock_type & 0xf == SOCK_DGRAM && protocol == IPPROTO_ICMP && !sched::ns::ping_allowed(pid) {
+    if sock_type & 0xf == SOCK_DGRAM && ((domain == AF_INET && protocol == IPPROTO_ICMP) || (domain == AF_INET6 && protocol == IPPROTO_ICMPV6))
+        && !sched::ns::ping_allowed(pid) {
         return err_reply(-13);
     }
     let mut tbls = SOCK_TABLES.lock();
@@ -4169,7 +4227,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         Some(t) => t, None => return err_reply(-23), // ENFILE: table pool full
     };
     let slot = match tbl.alloc() { Some(s) => s, None => return err_reply(-24) };
-    let state = if domain == AF_INET && protocol == IPPROTO_ICMP {
+    let state = if (domain == AF_INET && protocol == IPPROTO_ICMP) || (domain == AF_INET6 && protocol == IPPROTO_ICMPV6) {
         SockState::IcmpUnbound
     } else {
         SockState::Unbound { domain: domain as u8, sock_type: sock_type as u8 }
@@ -5421,8 +5479,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
         && matches!(tbl.socks[slot].state, SockState::InetConnected { .. });
     if tbl.socks[slot].netns() != 0 && tbl.socks[slot].domain == 10 && !v4_mapped_stream {
         let e = &tbl.socks[slot];
-        let dom = if matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) { Some(2u8) }
-                  else if e.domain == 2 || e.domain == 10 { Some(e.domain) } else { None };
+        let dom = if e.domain == 2 || e.domain == 10 { Some(e.domain) } else { None };
         if let Some(dom) = dom {
             drop(tbls);
             // Error selection only (Linux: a mismatched family is EAFNOSUPPORT);
@@ -5438,6 +5495,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
 
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
+    let sock_domain = tbl.socks[slot].domain as usize;
     let ofd = tbl.socks[slot].ofd;
 
     match state {
@@ -5711,8 +5769,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
         SockState::IcmpUnbound => {
             if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); }
             if len < 8 { return err_reply(-22); }
-            let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
-            let dest_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+            let dest_ip = match icmp_dest(sock_domain, addr_ptr, addrlen) { Ok(a) => a, Err(e) => return err_reply(e) };
             // Bind smoltcp's filter to whatever ident the caller already put in its
             // own ICMP header (bytes 4..6), rather than picking one ourselves and
             // having no way to tell the caller — see plan for why.
@@ -5738,6 +5795,8 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             let rx_buffer = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 4], alloc::vec![0; 2048]);
             let tx_buffer = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 4], alloc::vec![0; 2048]);
             let mut socket = icmp::Socket::new(rx_buffer, tx_buffer);
+            let ttl = sock_opts(ofd).ttl;
+            if ttl != 0 { socket.set_hop_limit(Some(ttl)); }
             if socket.bind(icmp::Endpoint::Ident(ident)).is_err() { return err_reply(-22); }
             let socket_handle = s.socket_set.add(socket);
             let result = s.socket_set.get_mut::<icmp::Socket>(socket_handle).send_slice(&data, dest_ip);
@@ -5778,8 +5837,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
         }
         SockState::IcmpBound { socket_handle, sid } => {
             if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); }
-            let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
-            let dest_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+            let dest_ip = match icmp_dest(sock_domain, addr_ptr, addrlen) { Ok(a) => a, Err(e) => return err_reply(e) };
             let data = match kdata {
                 Some(d) => d,
                 None => {
@@ -5794,6 +5852,8 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             if stack.is_none() { return err_reply(-100); }
             let s = stack.as_mut().unwrap();
             let socket = s.socket_set.get_mut::<icmp::Socket>(socket_handle);
+            let ttl = sock_opts(ofd).ttl;
+            socket.set_hop_limit(if ttl != 0 { Some(ttl) } else { None });
             let r = socket.send_slice(&data, dest_ip);
             drop(stack);
             drivers::netdev::kick();
@@ -6025,6 +6085,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
     let ofd = tbl.socks[slot].ofd;
+    let sock_domain = tbl.socks[slot].domain as usize;
     drop(tbls);
 
     match state {
@@ -6193,7 +6254,8 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
         }
         SockState::IcmpBound { socket_handle, sid } => {
             let r = match stack_for(sid).as_mut() {
-                Some(s) => icmp_recv_locked(s, socket_handle, len, peek, sock_type == SOCK_RAW as u8),
+                Some(s) => icmp_recv_filtered(s, socket_handle, len, peek, sock_type == SOCK_RAW as u8,
+                                              sock_domain == AF_INET6, &sock_opts(ofd).icmp6f),
                 None => return err_reply(-100),
             };
             match r {
@@ -6202,12 +6264,11 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                     // Out to the caller with NET_STACK released.
                     if !ucopy_out(buf_ptr, &data) { return err_reply(-14); }
                     if addr_ptr != 0 && addrlen_ptr != 0 {
-                        let mut sa = [0u8; 16];
-                        sa[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes()); // ICMP has no port
-                        #[allow(irrefutable_let_patterns)]
-                        if let IpAddress::Ipv4(ipv4) = from_addr { sa[4..8].copy_from_slice(&ipv4.0); }
-                        ucopy_out(addr_ptr, &sa);
-                        wr_user(addrlen_ptr, 16u32);
+                        // ICMP has no port.
+                        let (sa, n) = sa::encode(sock_domain, from_addr, 0, 0);
+                        let cap = sched::uaccess::read_user::<u32>(addrlen_ptr).unwrap_or(0) as usize;
+                        ucopy_out(addr_ptr, &sa[..cap.min(n)]);
+                        wr_user(addrlen_ptr, n as u32);
                     }
                     val_reply(n as u64)
                 }
@@ -6728,7 +6789,9 @@ fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool, gro: bool)
         SockState::IcmpBound { socket_handle, sid } => {
             let mut stack = stack_for(sid);
             let s = stack.as_mut().ok_or(-100i32)?;
-            let (d, full, from) = icmp_recv_locked(s, socket_handle, cap, peek, sock_type == SOCK_RAW as u8)?;
+            let ofd = fd_ofd(pid, fd).unwrap_or(0);
+            let (d, full, from) = icmp_recv_filtered(s, socket_handle, cap, peek, sock_type == SOCK_RAW as u8,
+                                                     sock_dom(pid, fd) == AF_INET6, &sock_opts(ofd).icmp6f)?;
             return Ok((d, full, RxMeta { from: IpEndpoint::new(from, 0), dst: None, spec_dst: None,
                                          tos: 0, ttl: 0, sid, seg: 0 }));
         }
@@ -6817,7 +6880,7 @@ fn udp_any_recv(ofd: u32, primary: (Sid, SocketHandle), cap: usize, peek: bool, 
 /// The control messages recvmsg adds for a UDP datagram, as Linux lays them
 /// out: UDP_GRO (udp_cmsg_recv) first, then IP_PKTINFO, IP_TTL, IP_TOS
 /// (ip_cmsg_recv_offset's order).
-fn udp_cmsgs(recv: u8, m: &RxMeta) -> alloc::vec::Vec<u8> {
+fn udp_cmsgs(recv: u8, recv6: u8, m: &RxMeta) -> alloc::vec::Vec<u8> {
     const IPPROTO_IP: i32 = 0;
     const IP_TOS: i32 = 1;
     const IP_TTL: i32 = 2;
@@ -6851,6 +6914,27 @@ fn udp_cmsgs(recv: u8, m: &RxMeta) -> alloc::vec::Vec<u8> {
     }
     if recv & RECV_TOS != 0 && m.dst.is_some() {
         put(IPPROTO_IP, IP_TOS, &[m.tos]);
+    }
+    // IPv6 (ip6_datagram_recv_specific_ctl's order): IPV6_PKTINFO (a v4
+    // datagram shows its addresses v4-mapped), IPV6_HOPLIMIT, IPV6_TCLASS.
+    if recv6 != 0 && m.dst.is_some() {
+        if recv6 & RECV6_PKTINFO != 0 {
+            let mut d = [0u8; 20];
+            let a = match m.dst {
+                Some(IpAddress::Ipv6(a)) => a.0,
+                Some(IpAddress::Ipv4(a)) => { let mut b = [0u8; 16]; b[10] = 0xff; b[11] = 0xff; b[12..].copy_from_slice(&a.0); b }
+                None => [0; 16],
+            };
+            d[0..16].copy_from_slice(&a);
+            d[16..20].copy_from_slice(&((m.sid as u32) + 1).to_ne_bytes());
+            put(IPPROTO_IPV6 as i32, IPV6_PKTINFO as i32, &d);
+        }
+        if recv6 & RECV6_HOPLIMIT != 0 {
+            put(IPPROTO_IPV6 as i32, IPV6_HOPLIMIT as i32, &(m.ttl as i32).to_ne_bytes());
+        }
+        if recv6 & RECV6_TCLASS != 0 {
+            put(IPPROTO_IPV6 as i32, IPV6_TCLASS as i32, &(m.tos as i32).to_ne_bytes());
+        }
     }
     out
 }
@@ -6889,7 +6973,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize, syn: Opt
             iovs.push((b, l));
             cap += l;
         }
-        let recv = fd_ofd(pid, fd).map_or(0, |o| sock_opts(o).recv);
+        let (recv, recv6) = fd_ofd(pid, fd).map_or((0, 0), |o| { let so = sock_opts(o); (so.recv, so.recv6) });
         let (data, full, meta) = match udp_recv_k(pid, fd, cap, flags & MSG_PEEK != 0, recv & RECV_GRO != 0) {
             Ok(r) => r,
             // shutdown(SHUT_RD): end of file, as in handle_recv.
@@ -6915,8 +6999,8 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize, syn: Opt
         // messages that fit, MSG_CTRUNC for the rest (Linux put_cmsg).
         let mut ctrl_written = 0usize;
         let mut ctrunc = false;
-        if recv & (RECV_PKTINFO | RECV_TOS | RECV_TTL | RECV_GRO) != 0 {
-            let c = udp_cmsgs(recv, &meta);
+        if recv & (RECV_PKTINFO | RECV_TOS | RECV_TTL | RECV_GRO) != 0 || recv6 != 0 {
+            let c = udp_cmsgs(recv, recv6, &meta);
             let mut pos = 0usize;
             while pos < c.len() {
                 let clen = u64::from_ne_bytes(c[pos..pos + 8].try_into().unwrap_or([0; 8])) as usize;
@@ -7385,18 +7469,8 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         return ok_reply();
     }
     if level == IPPROTO_IP { return ip_setsockopt(pid, fd, optname, optval_ptr, optlen); }
-    if level == IPPROTO_IPV6 && optname == IPV6_V6ONLY {
-        let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
-        if e.domain as usize != AF_INET6 { return err_reply(-ENOPROTOOPT); }
-        let Some(v) = (if optlen < 4 { None } else { sched::uaccess::read_user::<i32>(optval_ptr) })
-            else { return err_reply(if optlen < 4 { -22 } else { -14 }) };
-        // Linux: only before the socket has a port (a bound or listening socket is EINVAL).
-        if !matches!(e.state, SockState::Unbound { .. }) || e.bound_port != 0 { return err_reply(-22); }
-        let mut o = sock_opts(e.ofd);
-        o.v6only = v != 0;
-        set_sock_opts(e.ofd, o);
-        return ok_reply();
-    }
+    if level == IPPROTO_IPV6 { return ipv6_setsockopt(pid, fd, optname, optval_ptr, optlen); }
+    if level == IPPROTO_ICMPV6 { return icmp6_setsockopt(pid, fd, optname, optval_ptr, optlen); }
     // UDP_GRO: recvmsg returns runs of equal-sized datagrams together.
     if level == SOL_UDP && optname == UDP_GRO {
         let Some(v) = (if optlen < 4 { None } else { sched::uaccess::read_user::<i32>(optval_ptr) })
@@ -7567,6 +7641,69 @@ fn sock_entry(pid: u32, fd: usize) -> Option<SockEntry> {
 /// setsockopt(IPPROTO_IP, ...): Linux's do_ip_setsockopt for the options a
 /// UDP program uses. Values are read before any lock is taken. Unknown IP
 /// options (and any on an AF_UNIX socket) stay accepted no-ops, as before.
+/// setsockopt(IPPROTO_IPV6, ...): V6ONLY and the options the ICMPv6 and UDP
+/// paths honour. IPV6_UNICAST_HOPS and IPV6_TCLASS share the `ttl` / `tos`
+/// fields with their IPv4 twins: an AF_INET6 socket uses one set.
+fn ipv6_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen: usize) -> Message {
+    let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
+    if e.domain as usize != AF_INET6 { return if optname == IPV6_V6ONLY { err_reply(-ENOPROTOOPT) } else { ok_reply() }; }
+    let v = match (if optlen < 4 { None } else { sched::uaccess::read_user::<i32>(optval_ptr) }) {
+        Some(v) => v,
+        None => return err_reply(if optlen < 4 { -22 } else { -14 }),
+    };
+    let mut o = sock_opts(e.ofd);
+    let flag = |o: &mut SockOpts, bit: u8| if v != 0 { o.recv6 |= bit } else { o.recv6 &= !bit };
+    match optname {
+        IPV6_V6ONLY => {
+            // Linux: only before the socket has a port (a bound or listening socket is EINVAL).
+            if !matches!(e.state, SockState::Unbound { .. }) || e.bound_port != 0 { return err_reply(-22); }
+            o.v6only = v != 0;
+        }
+        IPV6_UNICAST_HOPS => match v {
+            -1 => o.ttl = 0,
+            0..=255 => o.ttl = v as u8, // 0 reads as the default
+            _ => return err_reply(-22),
+        },
+        IPV6_MULTICAST_HOPS => match v {
+            -1 => o.mc_ttl = 1,
+            0..=255 => o.mc_ttl = v as u8,
+            _ => return err_reply(-22),
+        },
+        IPV6_TCLASS => match v {
+            -1 => o.tos = 0,
+            0..=255 => o.tos = v as u8,
+            _ => return err_reply(-22),
+        },
+        IPV6_RECVPKTINFO => flag(&mut o, RECV6_PKTINFO),
+        IPV6_RECVHOPLIMIT => flag(&mut o, RECV6_HOPLIMIT),
+        IPV6_RECVTCLASS => flag(&mut o, RECV6_TCLASS),
+        IPV6_RECVERR => flag(&mut o, RECV6_ERR),
+        // Sticky pktinfo (source address / interface choice) is accepted, not used.
+        IPV6_PKTINFO => if optlen < 20 { return err_reply(-22) },
+        _ => return ok_reply(),
+    }
+    set_sock_opts(e.ofd, o);
+    ok_reply()
+}
+
+/// setsockopt(IPPROTO_ICMPV6, ICMP6_FILTER): a raw ICMPv6 socket only.
+fn icmp6_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen: usize) -> Message {
+    let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
+    if e.domain as usize != AF_INET6 || e.sock_type as usize != SOCK_RAW || optname != ICMP6_FILTER {
+        return err_reply(-ENOPROTOOPT);
+    }
+    let mut b = [0u8; 32];
+    let mut o = sock_opts(e.ofd);
+    for (i, w) in o.icmp6f.iter().enumerate() { b[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes()); }
+    let n = optlen.min(32);
+    if n > 0 && !ucopy_in(&mut b[..n], optval_ptr) { return err_reply(-14); }
+    for i in 0..8 { o.icmp6f[i] = u32::from_ne_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]); }
+    set_sock_opts(e.ofd, o);
+    // Datagrams a new filter lets through may already be waiting.
+    sock_state_moved(&[sock_state_key(e.ofd)]);
+    ok_reply()
+}
+
 fn ip_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen: usize) -> Message {
     let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
     if e.domain as usize != AF_INET { return ok_reply(); }
@@ -7747,6 +7884,19 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
         return ok_reply();
     }
+    if level == IPPROTO_ICMPV6 {
+        let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
+        if e.domain as usize != AF_INET6 || e.sock_type as usize != SOCK_RAW || optname != ICMP6_FILTER {
+            return err_reply(-ENOPROTOOPT);
+        }
+        let o = sock_opts(e.ofd);
+        let mut b = [0u8; 32];
+        for (i, w) in o.icmp6f.iter().enumerate() { b[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes()); }
+        let Some(cap) = sched::uaccess::read_user::<u32>(optlen_ptr) else { return err_reply(-14) };
+        let n = (cap as usize).min(32);
+        if !ucopy_out(optval_ptr, &b[..n]) || !wr_user(optlen_ptr, n as u32) { return err_reply(-14); }
+        return ok_reply();
+    }
     // Plain int options a socket library reads back (NSPR's
     // PR_GetSocketOption, glib, Python's socket module). The buffer sizes are
     // the smoltcp buffers a TCP socket gets; SO_KEEPALIVE and the TCP options
@@ -7768,7 +7918,8 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             (l, SO_DOMAIN) if l == SOL_SOCKET as usize => Some(e.domain as u32),
             // A ping socket (SOCK_DGRAM or SOCK_RAW) is IPPROTO_ICMP, not UDP.
             (l, SO_PROTOCOL) if l == SOL_SOCKET as usize
-                && matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) => Some(IPPROTO_ICMP as u32),
+                && matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) =>
+                Some(if e.domain as usize == AF_INET6 { IPPROTO_ICMPV6 } else { IPPROTO_ICMP } as u32),
             (l, SO_PROTOCOL) if l == SOL_SOCKET as usize => Some(match (e.domain as usize, e.sock_type as usize) {
                 (AF_INET | AF_INET6, SOCK_STREAM) => 6, (AF_INET | AF_INET6, SOCK_DGRAM) => 17, _ => 0 }),
             (l, SO_SNDBUF) if l == SOL_SOCKET as usize && sock_opts(e.ofd).sndbuf != 0 =>
@@ -7783,7 +7934,20 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             (SOL_UDP, UDP_SEGMENT) if is_udp_entry(&e) => Some(sock_opts(e.ofd).gso as u32),
             (SOL_UDP, UDP_GRO) if is_udp_entry(&e) => Some((sock_opts(e.ofd).recv & RECV_GRO != 0) as u32),
             (IPPROTO_IP, n) if is_inet(e.domain) && n != IP_MULTICAST_IF => ip_getsockopt(&e, n),
-            (IPPROTO_IPV6, IPV6_V6ONLY) if e.domain as usize == AF_INET6 => Some(sock_opts(e.ofd).v6only as u32),
+            (IPPROTO_IPV6, n) if e.domain as usize == AF_INET6 => {
+                let o = sock_opts(e.ofd);
+                match n {
+                    IPV6_V6ONLY => Some(o.v6only as u32),
+                    IPV6_UNICAST_HOPS => Some(if o.ttl == 0 { 64 } else { o.ttl as u32 }),
+                    IPV6_MULTICAST_HOPS => Some(o.mc_ttl as u32),
+                    IPV6_TCLASS => Some(o.tos as u32),
+                    IPV6_RECVPKTINFO => Some((o.recv6 & RECV6_PKTINFO != 0) as u32),
+                    IPV6_RECVHOPLIMIT => Some((o.recv6 & RECV6_HOPLIMIT != 0) as u32),
+                    IPV6_RECVTCLASS => Some((o.recv6 & RECV6_TCLASS != 0) as u32),
+                    IPV6_RECVERR => Some((o.recv6 & RECV6_ERR != 0) as u32),
+                    _ => None,
+                }
+            }
             (l, SO_PASSCRED) if l == SOL_SOCKET as usize && e.domain as usize == AF_UNIX => Some(sock_opts(e.ofd).passcred as u32),
             (l, SO_KEEPALIVE) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).keepalive as u32),
             (l, SO_REUSEADDR) if l == SOL_SOCKET as usize => Some(e.reuseaddr as u32),
@@ -8078,6 +8242,7 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
     let ofd = tbl.socks[slot].ofd;
+    let sock_domain = tbl.socks[slot].domain as usize;
     drop(tbls);
     let n = match state {
         // A wildcard UDP server: the datagram a read would return next.
@@ -8118,7 +8283,8 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
         // The next datagram's length, as for UDP. smoltcp cannot peek one, so
         // this parks it in `icmp_peeked`, where the next read finds it.
         SockState::IcmpBound { socket_handle, sid } if !outq => match stack_for(sid).as_mut() {
-            Some(s) => icmp_recv_locked(s, socket_handle, 0, true, sock_type == SOCK_RAW as u8).map(|(_, full, _)| full).unwrap_or(0),
+            Some(s) => icmp_recv_filtered(s, socket_handle, 0, true, sock_type == SOCK_RAW as u8,
+                                          sock_domain == AF_INET6, &sock_opts(ofd).icmp6f).map(|(_, full, _)| full).unwrap_or(0),
             None => 0,
         },
         _ => 0,
@@ -8642,7 +8808,10 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                 seq = Some(s.inet_seq.get(&socket_handle).copied().unwrap_or(0));
                 let mut ev = 0;
                 if s.socket_set.get_mut::<icmp::Socket>(socket_handle).can_send() { ev |= POLLOUT; }
-                if icmp_readable(s, socket_handle) { ev |= POLLIN; }
+                let readable = if ent.domain as usize == AF_INET6 && sock_opts(ent.ofd).icmp6f != [0u32; 8] {
+                    icmp_recv_filtered(s, socket_handle, 0, true, false, true, &sock_opts(ent.ofd).icmp6f).is_ok()
+                } else { icmp_readable(s, socket_handle) };
+                if readable { ev |= POLLIN; }
                 ev
             } else {
                 0
