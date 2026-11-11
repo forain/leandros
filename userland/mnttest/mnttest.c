@@ -247,6 +247,40 @@ static int ns_counts(int *live, int *sbs) {
     return sscanf(q, "ns_live=%d ns_dying=%d sb_count=%d", live, &dying, sbs) == 3 ? 0 : -1;
 }
 
+/* Minor of the "major:minor" mountinfo field of the mount at `mp` (0 = not found). */
+static unsigned long mount_dev_minor(const char *mp) {
+    static char buf[65536];
+    if (slurp("/proc/self/mountinfo", buf, sizeof buf) <= 0) return 0;
+    char pat[160];
+    snprintf(pat, sizeof pat, " %s ", mp);
+    for (char *ln = buf; ln && *ln; ln = strchr(ln, '\n') ? strchr(ln, '\n') + 1 : NULL) {
+        char *eol = strchr(ln, '\n');
+        char *h = strstr(ln, pat);
+        if (!h || (eol && h > eol)) continue;
+        unsigned id, parent, maj, mnr;
+        if (sscanf(ln, "%u %u %u:%u", &id, &parent, &maj, &mnr) == 4) return ((unsigned long)maj << 8) | mnr;
+    }
+    return 0;
+}
+
+/* Is the superblock with this dev minor live? Identity, not a global count:
+ * other tasks mount and unmount concurrently, so sb_count deltas flake. */
+static int sb_dev_live(unsigned long dev) {
+    static char buf[8192];
+    if (slurp("/proc/mntselftest", buf, sizeof buf) <= 0) return -1;
+    char *q = strstr(buf, "sb_devs=");
+    if (!q) return -1;
+    q += 8;
+    while (*q && *q != '\n') {
+        char *e;
+        unsigned long v = strtoul(q, &e, 10);
+        if (e == q) break;
+        if (v == dev) return 1;
+        q = (*e == ',') ? e + 1 : e;
+    }
+    return 0;
+}
+
 static void sync_parent(int wr, int rd) { char c = 'x'; write(wr, &c, 1); read(rd, &c, 1); }
 
 /* The unprivileged child: user + mount namespace, then the whole tour. */
@@ -969,6 +1003,17 @@ static void tmpfs_anywhere(void) {
     n = slurp("/proc/sys/kernel/ngroups_max", buf, sizeof buf);
     report("proc_ngroups_max", n > 0 && atoi(buf) > 0);
     mkdir(d, 0755);
+    /* Concurrent mount churn elsewhere (any other task): the superblock
+     * registry is system-wide, so a count delta flakes; identity does not. */
+    const char *cd = "/root/mt-tfs-churn.d";
+    mkdir(cd, 0755);
+    pid_t churn = fork();
+    if (churn == 0) {
+        for (;;) {
+            if (mount("shm", cd, "tmpfs", 0, "size=64k") == 0) umount(cd);
+        }
+    }
+    usleep(20000);
     ns_counts(&live0, &sb0);
     stat(d, &st0);
     int r = mount("shm", d, "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777,size=65536k");
@@ -983,10 +1028,13 @@ static void tmpfs_anywhere(void) {
     struct statfs sf;
     report("tfs_nosuid_flag", statfs(d, &sf) == 0 && (sf.f_flags & 2));
     ns_counts(&live1, &sb1);
-    report("tfs_sb_registered", sb1 == sb0 + 1);
+    unsigned long tdev = mount_dev_minor(d);
+    printf("# tfs count delta (old verdict) %d, churn running; mount dev minor %lu\n", sb1 - sb0, tdev);
+    report("tfs_sb_registered", sb_dev_live(tdev) == 1);
     r = umount(d);
     report("tfs_umount_ok", r == 0);
-    report("tfs_umount_frees", stat(f, &st1) != 0 && ns_counts(&live1, &sb1) == 0 && sb1 == sb0);
+    report("tfs_umount_frees", stat(f, &st1) != 0 && sb_dev_live(tdev) == 0);
+    if (churn > 0) { kill(churn, SIGKILL); waitpid(churn, NULL, 0); umount(cd); rmdir(cd); }
     /* a second umount is not a mountpoint */
     errno = 0;
     report("tfs_umount_twice_einval", umount(d) < 0 && errno == EINVAL);
@@ -2290,6 +2338,100 @@ static void devbind_suite(void) {
     }
 }
 
+/* ── lane mntiso-procfd: /proc/self/fd/N reopen and /proc/self/fd/N/<below>
+ * honour the fd's mount (ro/nodev/mask) and never follow links in host space.
+ * Host sentinel /root/mntiso-secret ("HOST") lives on the root volume in ns 0;
+ * the pivoted root holds its own /root/mntiso-secret ("INNER"). ──────────── */
+static int mi_enter(const char *tag, int ro, int nodev) {
+    char r[96], p[160];
+    mkdir("/root/mipv", 0755);
+    snprintf(r, sizeof r, "/root/mipv/%s", tag); mkdir(r, 0755);
+    snprintf(p, sizeof p, "%s/dd", r); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/mi", r); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/proc", r); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/root", r); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/root/mntiso-secret", r); put(p, "INNER", 0644);
+    snprintf(p, sizeof p, "%s/dd/f", r); put(p, "data", 0644);
+    snprintf(p, sizeof p, "%s/dd/l", r); unlink(p); if (symlink("/root/mntiso-secret", p) < 0) return 90;
+    snprintf(p, sizeof p, "%s/dd/null", r); unlink(p);
+    if (mknod(p, S_IFCHR | 0666, makedev(1, 3)) < 0) return 89;
+    snprintf(p, sizeof p, "%s/dd/x", r); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/dd/x/f", r); put(p, "BACK", 0644);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (mount("", "/", NULL, MS_REC | MS_SLAVE, NULL) < 0) return 93;
+    if (mount(r, r, NULL, MS_BIND | MS_REC, NULL) < 0) return 94;
+    char src[128], dst[128];
+    snprintf(src, sizeof src, "%s/dd", r); snprintf(dst, sizeof dst, "%s/mi", r);
+    if (mount(src, dst, NULL, MS_BIND, NULL) < 0) return 95;
+    unsigned long fl = MS_BIND | MS_REMOUNT | (ro ? MS_RDONLY : 0) | (nodev ? MS_NODEV : 0);
+    if ((ro || nodev) && mount(NULL, dst, NULL, fl, NULL) < 0) return 96;
+    if (chdir(r) < 0) return 97;
+    int oldroot = open("/", O_DIRECTORY | O_RDONLY);
+    if (oldroot < 0) return 98;
+    if (syscall(SYS_pivot_root, ".", ".") < 0) return 99;
+    if (fchdir(oldroot) < 0) return 100;
+    close(oldroot);
+    if (mount("", ".", NULL, MS_SLAVE | MS_REC, NULL) < 0) return 101;
+    if (umount2(".", MNT_DETACH) < 0) return 102;
+    if (chdir("/") < 0) return 103;
+    if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) return 104;
+    return 0;
+}
+static int mi_host_intact(void) { char b[16] = {0}; return slurp("/root/mntiso-secret", b, sizeof b) > 0 && !strncmp(b, "HOST", 4); }
+static int mi_procfd_reopen_ro(int m) {
+    (void)m; int r = mi_enter("a", 1, 0); if (r) return r;
+    int fd = open("/mi/f", O_PATH); if (fd < 0) return 10;
+    char p[48]; snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    int c = open(p, O_RDONLY); if (c < 0) { printf("  ro reopen errno=%d\n", errno); return 11; }
+    close(c);
+    errno = 0; c = open(p, O_RDWR);
+    if (c >= 0 || errno != EROFS) { printf("  rw reopen fd=%d errno=%d\n", c, errno); return 12; }
+    return 0;
+}
+static int mi_procfd_below_ro(int m) {
+    (void)m; int r = mi_enter("b", 1, 0); if (r) return r;
+    int fd = open("/mi", O_PATH | O_DIRECTORY); if (fd < 0) return 10;
+    char p[64]; snprintf(p, sizeof p, "/proc/self/fd/%d/f", fd);
+    errno = 0; int c = open(p, O_RDWR);
+    if (c >= 0 || errno != EROFS) { printf("  below rw fd=%d errno=%d\n", c, errno); return 11; }
+    return 0;
+}
+static int mi_procfd_below_nodev(int m) {
+    (void)m; int r = mi_enter("c", 0, 1); if (r) return r;
+    int fd = open("/mi", O_PATH | O_DIRECTORY); if (fd < 0) return 10;
+    char p[64]; snprintf(p, sizeof p, "/proc/self/fd/%d/null", fd);
+    errno = 0; int c = open(p, O_RDONLY);
+    if (c >= 0 || errno != EACCES) { printf("  below nodev fd=%d errno=%d\n", c, errno); return 11; }
+    return 0;
+}
+static int mi_procfd_below_link(int m) {
+    (void)m; int r = mi_enter("d", 0, 0); if (r) return r;
+    int fd = open("/mi", O_PATH | O_DIRECTORY); if (fd < 0) return 10;
+    char p[64], b[16] = {0}; snprintf(p, sizeof p, "/proc/self/fd/%d/l", fd);
+    int c = open(p, O_RDONLY);
+    if (c >= 0) { ssize_t n = read(c, b, 15); (void)n; }
+    if (!strncmp(b, "HOST", 4)) { printf("  link followed into the host\n"); return 11; }
+    if (c < 0 || strncmp(b, "INNER", 5)) { printf("  link: fd=%d errno=%d body=%s\n", c, errno, b); return 12; }
+    return 0;
+}
+static int mi_procfd_below_mask(int m) {
+    (void)m; int r = mi_enter("e", 0, 0); if (r) return r;
+    int fd = open("/mi", O_PATH | O_DIRECTORY); if (fd < 0) return 10;
+    if (mount("tmpfs", "/mi/x", "tmpfs", 0, NULL) < 0) return 11;
+    put("/mi/x/f", "TMPFS", 0644);
+    char p[64], b[16] = {0}; snprintf(p, sizeof p, "/proc/self/fd/%d/x/f", fd);
+    if (slurp(p, b, sizeof b) <= 0 || strncmp(b, "TMPFS", 5)) { printf("  mask: body=%s\n", b); return 12; }
+    return 0;
+}
+static void mntiso_procfd_suite(void) {
+    put("/root/mntiso-secret", "HOST", 0644);
+    report("procfd_reopen_ro_erofs", nn_in_child(mi_procfd_reopen_ro, 0));
+    report("procfd_below_ro_erofs", nn_in_child(mi_procfd_below_ro, 0));
+    report("procfd_below_nodev_eacces", nn_in_child(mi_procfd_below_nodev, 0));
+    report("procfd_below_link_in_ns", nn_in_child(mi_procfd_below_link, 0));
+    report("procfd_below_mask", nn_in_child(mi_procfd_below_mask, 0));
+    report("procfd_host_sentinel_intact", mi_host_intact());
+}
 
 /* ── lane mntiso-busy: mount roots are EBUSY, cross-mount ops EXDEV ── */
 static int mb_prep(void) {
@@ -2515,6 +2657,7 @@ int main(int argc, char **argv) {
     opentree_suite();
     fdbindprop_suite();
     mro_suite();
+    mntiso_procfd_suite();
     shmbind_suite();
     devbind_suite();
     mntiso_busy_suite();

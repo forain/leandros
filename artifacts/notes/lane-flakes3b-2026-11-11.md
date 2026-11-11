@@ -1,0 +1,5 @@
+# lane flakes3b (2026-11-11)
+- epolltest unrelated_unix_traffic_no_wake: stale, fixed by lane nowake; TODO struck.
+- mnttest tfs_sb_registered/tfs_umount_frees: FIXED. Root cause 1: test compared the system-wide sb_count (races other mounts). Root cause 2 (kernel): ns-0 /proc/self/mountinfo printed alias tmpfs mounts as `0:<mount id>` instead of the superblock dev; now prints the sb dev (as Linux). Test checks by identity (sb_devs in /proc/mntselftest) under a forked mount/umount churner: green.
+- waitpid(WUNTRACED) late: FIXED. notify_parent_state_change never woke the parent's WAIT-class poll tag (only exits did), so the stop report waited out the 1 s park backstop (el_ms 1250/1700 before per handoff). Now wakes it. New sigtest `wuntr` (wuntraced_stop_prompt, spin + nanosleep children, <300 ms): 0-4 ms on aarch64 HVF. Fail-first rests on the 1.2 s observation in the handoff, not a re-run of the unfixed kernel.
+- sigtest timed_wait_stop_resumes_remainder flake still not captured; plausibly the same lateness. Re-watch.

@@ -185,6 +185,7 @@ fn cmsg_align(n: usize) -> usize { (n + 7) & !7 }
 
 pub const AF_UNIX:    usize = 1;
 pub const AF_INET:    usize = 2;
+pub const AF_INET6:   usize = 10;
 pub const AF_NETLINK: usize = 16;
 /// connect(AF_UNSPEC): dissolve a UDP socket's association.
 const AF_UNSPEC:      usize = 0;
@@ -1581,9 +1582,13 @@ fn is_inet_state(s: &SockState) -> bool {
 
 /// An inet socket, or an AF_INET one not bound yet: the entries whose state
 /// `share_state` publishes and whose last put goes through `inet_put`.
+/// AF_INET or AF_INET6 (the socket's `domain` byte).
+#[inline]
+fn is_inet(d: u8) -> bool { d == AF_INET as u8 || d == AF_INET6 as u8 }
+
 fn inet_family(e: &SockEntry) -> bool {
     is_inet_state(&e.state)
-        || matches!(e.state, SockState::Unbound { .. }) && e.domain == AF_INET as u8
+        || matches!(e.state, SockState::Unbound { .. }) && is_inet(e.domain)
 }
 
 /// May this entry be copied to a second holder (fork, dup, SCM_RIGHTS)? Not
@@ -1852,17 +1857,30 @@ fn stack_holding(ns: u16, ip: IpAddress) -> Option<Sid> {
 /// that is listening. Holders of the same description (dup, fork) are the
 /// same socket. Caller holds SOCK_TABLES; this takes stack locks (the
 /// documented order) for the address of a connected socket, and SOCK_OPTS.
+/// Do two bound addresses claim a common local address? Within a family a wildcard
+/// overlaps everything; across families only a v6 wildcard (dual-stack `::`) reaches
+/// the v4 side, so 0.0.0.0:P and [::1]:P coexist (Linux, bindv6only=0).
+fn bind_addrs_overlap(a: IpAddress, b: IpAddress) -> bool {
+    match (a, b) {
+        (IpAddress::Ipv4(_), IpAddress::Ipv4(_)) | (IpAddress::Ipv6(_), IpAddress::Ipv6(_)) => {
+            a.is_unspecified() || b.is_unspecified() || a == b
+        }
+        (IpAddress::Ipv6(_), _) => a.is_unspecified(),
+        (_, IpAddress::Ipv6(_)) => b.is_unspecified(),
+    }
+}
+
 fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, port: u16) -> bool {
     let tcp = me.sock_type == SOCK_STREAM as u8;
     // A port a NAT flow (fwd.rs) holds on the host's NIC address is taken. FWD is a leaf lock.
-    if me.netns() == 0 && me.domain == AF_INET as u8 && fwd::reserved(tcp, port) {
+    if me.netns() == 0 && is_inet(me.domain) && fwd::reserved(tcp, port) {
         if ip.is_unspecified() || matches!(ip, IpAddress::Ipv4(a) if iface::is_nic_addr(a.0)) { return true; }
     }
     let my_reuseport = sock_opts(me.ofd).reuseport;
     let my_uid = sched::euid_of(pid);
     for t in tbls.iter().filter(|t| t.in_use) {
         for e in t.socks.iter() {
-            if !e.in_use || e.bound_port != port || e.domain != AF_INET as u8 || e.sock_type != me.sock_type { continue; }
+            if !e.in_use || e.bound_port != port || !is_inet(e.domain) || e.sock_type != me.sock_type { continue; }
             // Each network namespace has its own port space.
             if e.netns() != me.netns() { continue; }
             if me.ofd != 0 && e.ofd == me.ofd { continue; }
@@ -1880,7 +1898,7 @@ fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, por
                 }
                 _ => continue,
             };
-            if !(addr.is_unspecified() || ip.is_unspecified() || addr == ip) { continue; }
+            if !bind_addrs_overlap(addr, ip) { continue; }
             if my_reuseport && sock_opts(e.ofd).reuseport && sched::euid_of(t.pid) == my_uid { continue; }
             if me.reuseaddr && e.reuseaddr && !(tcp && listening) { continue; }
             return true;
@@ -1895,7 +1913,7 @@ pub(crate) fn host_port_busy(tcp: bool, port: u16) -> bool {
     let st = if tcp { SOCK_STREAM as u8 } else { SOCK_DGRAM as u8 };
     let tbls = SOCK_TABLES.read();
     tbls.iter().any(|t| t.in_use && t.socks.iter().any(|e| e.in_use && e.bound_port == port
-        && e.domain == AF_INET as u8 && e.sock_type == st && e.netns() == 0))
+        && is_inet(e.domain) && e.sock_type == st && e.netns() == 0))
 }
 
 /// Pick a free local port from Linux's ephemeral range for a `bind()` to port 0
@@ -1949,16 +1967,13 @@ fn seed_ephemeral() {
 /// always reports the full address length back. The caller must hold NO server
 /// lock — this touches user memory, which can demand-page and re-enter the
 /// scheduler.
-unsafe fn write_sockaddr_in(addr_ptr: usize, addrlen_ptr: usize, endpoint: IpEndpoint) {
-    let mut sa = [0u8; 16];
-    sa[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
-    sa[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
-    if let IpAddress::Ipv4(ipv4) = endpoint.addr {
-        sa[4..8].copy_from_slice(&ipv4.0); // already network order
-    }
-    let cap = match sched::uaccess::read_user::<u32>(addrlen_ptr) { Some(c) => c as usize, None => return };
-    ucopy_out(addr_ptr, &sa[..cap.min(sa.len())]);
-    wr_user(addrlen_ptr, sa.len() as u32);
+unsafe fn write_sockaddr_in(dom: usize, addr_ptr: usize, addrlen_ptr: usize, endpoint: IpEndpoint) {
+    sa::write(dom, addr_ptr, addrlen_ptr, endpoint);
+}
+
+/// The domain (AF_INET / AF_INET6) of the inet socket at `fd`; AF_INET when unknown.
+fn sock_dom(pid: u32, fd: usize) -> usize {
+    sock_entry(pid, fd).map_or(AF_INET, |e| e.domain as usize)
 }
 
 /// The local endpoint of an AF_INET socket, for getsockname. `None` for
@@ -1970,7 +1985,7 @@ fn inet_local_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
     match state {
         // An AF_INET socket not bound yet: 0.0.0.0:0 (it answered with an
         // AF_UNSPEC address).
-        SockState::Unbound { domain, .. } if domain == AF_INET as u8 => Some(IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), 0)),
+        SockState::Unbound { domain, .. } if is_inet(domain) => Some(IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), 0)),
         SockState::InetBound { local_endpoint, .. }  => Some(local_endpoint),
         SockState::InetListening { local, .. }       => Some(local),
         // Only a TCP socket may be fetched as a tcp::Socket — `SocketSet::get_mut`
@@ -3238,6 +3253,7 @@ pub mod latestack;
 mod mcast;
 mod udpany;
 mod syngate;
+mod sa;
 
 pub fn init() {
     sched::register_dump_hook(dump_sockets);
@@ -3336,6 +3352,7 @@ pub(crate) fn make_loopback_stack() -> NetStack {
     let mut interface = Interface::new(config, &mut device, stack_now());
     interface.update_ip_addrs(|addrs| {
         addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
+        addrs.push(IpCidr::new(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::LOOPBACK), 128)).unwrap();
     });
     // No default route on purpose: 127.0.0.0/8 is on-link here, and nothing
     // else may ever leave through this interface.
@@ -4033,7 +4050,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
     // daemon sleeps up to `IDLE_CAP_NS` when idle. Unix sockets never need it.
     let kick = match msg.tag {
         NET_CONNECT | NET_SHUTDOWN | NET_CLOSE | NET_LISTEN | NET_ACCEPT | NET_SETSOCKOPT | NET_BIND =>
-            sock_entry(caller_pid, arg(msg,0) as usize).map_or(false, |e| e.domain as usize == AF_INET),
+            sock_entry(caller_pid, arg(msg,0) as usize).map_or(false, |e| is_inet(e.domain)),
         // Every exit sends CLOSE_ALL; only one that held an inet socket
         // needs a pass (decided in the arm below). Kicking on all of them
         // made each short-lived process (a shell pipeline, `cat`) a daemon
@@ -4114,6 +4131,14 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
 fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> Message {
     match domain {
         AF_UNIX | AF_INET => {}
+        // TCP and UDP only until ICMPv6/raw sockets land (L3).
+        AF_INET6 => {
+            let t = sock_type & 0xf;
+            if t != SOCK_STREAM && t != SOCK_DGRAM { return err_reply(-93); }
+            if protocol != 0 && !(t == SOCK_STREAM && protocol == 6) && !(t == SOCK_DGRAM && protocol == 17) {
+                return err_reply(-93); // EPROTONOSUPPORT
+            }
+        }
         // NETLINK_ROUTE only (`rtnetlink`): getifaddrs, if_nameindex, nICEr.
         AF_NETLINK => {
             if sock_type & 0xf != SOCK_RAW && sock_type & 0xf != SOCK_DGRAM { return err_reply(-94); } // ESOCKTNOSUPPORT
@@ -4168,19 +4193,19 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
     let sa_family = match sched::uaccess::read_user::<u16>(addr_ptr) { Some(f) => f as usize, None => return err_reply(-14) };
 
     match sa_family {
-        AF_INET => {
-            if addrlen < 8 { return err_reply(-22); }
-            // sockaddr_in is read out of user memory here, before any lock is
+        AF_INET | AF_INET6 => {
+            // The sockaddr is read out of user memory here, before any lock is
             // taken: a demand-paging fault under SOCK_TABLES would re-enter the
             // scheduler with a server lock held.
-            let port_be = match sched::uaccess::read_user::<u16>(addr_ptr + 2) { Some(v) => v, None => return err_reply(-14) };
-            let port = u16::from_be(port_be);
+            let sdom = sock_entry(pid, fd).map_or(AF_INET, |e| e.domain as usize);
+            if !is_inet(sdom as u8) { return err_reply(-22); }
+            let parsed = match sa::parse_for(sdom, addr_ptr, addrlen) { Ok(a) => a, Err(e) => return err_reply(e) };
+            let port = parsed.port;
             let explicit_port = port != 0;
             // Ports below 1024 need CAP_NET_BIND_SERVICE (root): Linux's
             // net.ipv4.ip_unprivileged_port_start default, EACCES.
             if port != 0 && !sched::ns::bind_port_allowed(pid, sock_netns(pid, slot), port) { return err_reply(-13); }
-            let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
-            let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+            let ip = parsed.ip;
             // A fresh network namespace has only a DOWN loopback: no address
             // can be bound but the wildcard.
             if !ip.is_unspecified() && sock_netns(pid, slot) != 0 && vif::lo_up_sid(sock_netns(pid, slot)).is_none() { return err_reply(-99); }
@@ -4212,7 +4237,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             // smoltcp socket goes once the bind is certain.
             let mut released: Option<(Sid, SocketHandle)> = None;
             match me.state {
-                SockState::Unbound { .. } if me.domain == AF_INET as u8 => {}
+                SockState::Unbound { .. } if is_inet(me.domain) => {}
                 SockState::InetConnected { socket_handle, sid, .. }
                     if me.sock_type == SOCK_DGRAM as u8 && me.bound_port == 0
                         && udpany::of(me.ofd).is_none() => released = Some((sid, socket_handle)),
@@ -4268,7 +4293,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 if let Some(s) = stack.as_mut() { s.socket_set.remove(h); }
             }
             tbl.socks[slot].state = SockState::InetBound {
-                domain: AF_INET as u8,
+                domain: me.domain,
                 sock_type: tbl.socks[slot].sock_type,
                 local_endpoint,
             };
@@ -4380,7 +4405,7 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
 
-    if tbl.socks[slot].domain == AF_INET as u8 {
+    if is_inet(tbl.socks[slot].domain) {
         // bind() is what assigns the port (including the ephemeral one for a
         // bind to :0), so a socket that never bound has no InetBound state and
         // gets EINVAL — the same answer the old zero-bound_port check gave.
@@ -4539,7 +4564,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                         socket_handle: established, remote_endpoint: None, sid: from },
                     in_use: true,
                     bound_port: 0,
-                    domain: AF_INET as u8,
+                    domain: tbl.socks[slot].domain,
                     sock_type: SOCK_STREAM as u8,
                     cloexec: acc_cloexec,
                     nonblock: acc_nonblock,
@@ -4575,7 +4600,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                         s.socket_set.get_mut::<tcp::Socket>(established).remote_endpoint())
                 };
                 if let Some(endpoint) = peer {
-                    unsafe { write_sockaddr_in(addr_ptr, addrlen_ptr, endpoint); }
+                    unsafe { write_sockaddr_in(sock_dom(pid, fd), addr_ptr, addrlen_ptr, endpoint); }
                 }
             }
 
@@ -4774,6 +4799,8 @@ fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>) -> Resu
         if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) {
             return vif::lo_up_sid(ns).ok_or(-101);
         }
+        // No IPv6 route off the loopback in a netns yet.
+        if matches!(dest, Some(IpAddress::Ipv6(_))) { return Err(-101); }
         if let Some(a) = local.filter(|a| !a.is_unspecified()) {
             return stack_holding(ns, a).ok_or(-99);
         }
@@ -4815,6 +4842,10 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
         SockState::InetConnected { .. } => return Ok(()),
         _ => return Err(-22),
     };
+    // A wildcard socket is held to its family: AF_INET (or a mapped 0.0.0.0)
+    // never hears a v6 datagram; AF_INET6 `::` stays dual until V6ONLY (L2).
+    let v4only = tbl.socks[slot].domain == AF_INET as u8
+        || matches!(local_addr, Some(IpAddress::Ipv4(_)));
     // No object yet, so this is just its SOCKSTATE key (no `udpany::of` lock).
     let old_keys = [sock_state_key(tbl.socks[slot].ofd)];
     let port = if tbl.socks[slot].bound_port != 0 {
@@ -4842,12 +4873,13 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
             port,
         };
         if socket.bind(ep).is_err() { return Err(-22); }
+        if v4only { socket.set_family(Some(smoltcp::wire::IpVersion::Ipv4)); }
         socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
         s.socket_set.add(socket)
     };
     tbl.socks[slot].bound_port = port;
     tbl.socks[slot].state = SockState::InetConnected { socket_handle: handle, remote_endpoint: None, sid };
-    if server { udpany::create(tbl.socks[slot].netns(), tbl.socks[slot].ofd, sid, handle, port); }
+    if server { udpany::create(tbl.socks[slot].netns(), tbl.socks[slot].ofd, sid, handle, port, v4only); }
     share_state(&mut *tbls, pid, slot);
     drop(tbls);
     // A poller of the unbound socket (another thread, another holder) now
@@ -4874,7 +4906,7 @@ fn inet_disconnect(pid: u32, slot: usize) -> Option<Message> {
     let tbl = find_tbl(pid, &mut *tbls)?;
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
     let e = tbl.socks[slot].clone();
-    if e.domain != AF_INET as u8 { return None; }
+    if !is_inet(e.domain) { return None; }
     let lock = sock_opts(e.ofd).bind_lock;
     match e.state {
         SockState::Unbound { .. } | SockState::InetBound { .. }
@@ -4937,11 +4969,11 @@ fn tcp_unconnect(tbl: &mut ProcSockTable, slot: usize, lock: u8, addr: IpAddress
     let e = &mut tbl.socks[slot];
     e.connecting = false;
     if lock & BIND_PORT_LOCK != 0 && e.bound_port != 0 {
-        e.state = SockState::InetBound { domain: AF_INET as u8, sock_type: e.sock_type,
+        e.state = SockState::InetBound { domain: e.domain, sock_type: e.sock_type,
                                          local_endpoint: IpEndpoint::new(addr, e.bound_port) };
     } else {
         e.bound_port = 0;
-        e.state = SockState::Unbound { domain: AF_INET as u8, sock_type: e.sock_type };
+        e.state = SockState::Unbound { domain: e.domain, sock_type: e.sock_type };
     }
 }
 
@@ -4977,22 +5009,17 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
     if addrlen < 2 { return err_reply(-22); }
 
     let sa_family = match sched::uaccess::read_user::<u16>(addr_ptr) { Some(f) => f as usize, None => return err_reply(-14) };
-    // A fresh network namespace has no routes and a DOWN loopback.
-    if sa_family == 10 && sock_netns(pid, slot) != 0 { return err_reply(-101); }
-
     // connect(AF_UNSPEC) on an AF_INET socket (it used to fall into the
     // AF_UNIX path below): see `inet_disconnect`.
     if sa_family == AF_UNSPEC {
         if let Some(r) = inet_disconnect(pid, slot) { return r; }
     }
 
-    if sa_family == AF_INET {
-        if addrlen < 8 { return err_reply(-22); }
-        let port_be  = match sched::uaccess::read_user::<u16>(addr_ptr + 2) { Some(v) => v, None => return err_reply(-14) };
-        let port     = u16::from_be(port_be);
-        let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
-
-        let remote_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+    if sa_family == AF_INET || sa_family == AF_INET6 {
+        let sdom = sock_entry(pid, fd).map_or(AF_INET, |e| e.domain as usize);
+        let parsed = match sa::parse_for(sdom, addr_ptr, addrlen) { Ok(a) => a, Err(e) => return err_reply(e) };
+        let port = parsed.port;
+        let remote_ip = parsed.ip;
         let remote_endpoint = IpEndpoint::new(remote_ip, port);
         // 127.0.0.0/8 is served by the loopback stack, everything else by the
         // stack the route lookup picks (`iface::route_select`), or the one
@@ -5007,7 +5034,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
                 SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
                 _ => None,
             }),
-             e.filter(|e| e.domain == AF_INET as u8 && e.sock_type == SOCK_DGRAM as u8).map(|e| e.ofd))
+             e.filter(|e| is_inet(e.domain) && e.sock_type == SOCK_DGRAM as u8).map(|e| e.ofd))
         };
         if let Some(ofd) = dgram_ofd {
             // A broadcast peer needs SO_BROADCAST (Linux ip4_datagram_connect).
@@ -5517,11 +5544,8 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             let dest = if sock_type == SOCK_STREAM as u8 {
                 None
             } else if addr_ptr != 0 && addrlen >= 8 {
-                let port_be = match sched::uaccess::read_user::<u16>(addr_ptr + 2) { Some(v) => v, None => return err_reply(-14) };
-                let port = u16::from_be(port_be);
-                let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
-                let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
-                Some(IpEndpoint::new(ip, port))
+                let sa = match sa::parse(addr_ptr, addrlen) { Ok(a) => a, Err(e) => return err_reply(e) };
+                Some(IpEndpoint::new(sa.ip, sa.port))
             } else {
                 remote_endpoint
             };
@@ -5603,7 +5627,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                     if err != 0 { return err_reply(-(err as i32)); }
                     // A datagram the send buffer can never hold: EMSGSIZE, not
                     // an EAGAIN that never clears (a blocking sender hung).
-                    if data.len() > cap { return err_reply(-90); }
+                    if data.len() > cap || data.len() > UDP_MAX_PAYLOAD { return err_reply(-90); }
                     let mcast = endpoint.addr.is_multicast();
                     let mut meta = smoltcp::socket::udp::UdpMetadata::from(endpoint);
                     meta.hop_limit = if mcast { Some(opts.mc_ttl) }
@@ -5644,12 +5668,11 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
         // UDP socket answered sendto() with EPIPE — musl's DNS resolver among
         // them, so no name ever resolved.
         SockState::Unbound { .. } | SockState::InetBound { .. }
-            if tbl.socks[slot].domain == AF_INET as u8 && sock_type == SOCK_DGRAM as u8 =>
+            if is_inet(tbl.socks[slot].domain) && sock_type == SOCK_DGRAM as u8 =>
         {
             drop(tbls);
             if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); } // EDESTADDRREQ
-            let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
-            let dest = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+            let dest = match sa::parse(addr_ptr, addrlen) { Ok(a) => a.ip, Err(e) => return err_reply(e) };
             if let Err(e) = udp_materialize(pid, slot, Some(dest), false) { return err_reply(e); }
             handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, kdata)
         }
@@ -5985,11 +6008,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                     let n = data.len();
                     if !ucopy_out(buf_ptr, &data[..n]) { return err_reply(-14); }
                     if addr_ptr != 0 && addrlen_ptr != 0 {
-                        let ip = match endpoint.addr {
-                            IpAddress::Ipv4(v) => Some(v.0),
-                            #[allow(unreachable_patterns)] _ => None,
-                        };
-                        put_sockaddr_in(addr_ptr, addrlen_ptr, ip, endpoint.port);
+                        sa::write(sock_dom(pid, fd), addr_ptr, addrlen_ptr, endpoint);
                     }
                     // recv(MSG_TRUNC) answers the datagram's real length
                     // (Linux udp_recvmsg); the rest of it is gone either way.
@@ -6169,7 +6188,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
         // An AF_INET datagram socket nothing has been sent from or bound yet
         // has nothing to receive.
         SockState::Unbound { domain, sock_type: ty }
-            if domain == AF_INET as u8 && ty == SOCK_DGRAM as u8 => err_reply(-11),
+            if is_inet(domain) && ty == SOCK_DGRAM as u8 => err_reply(-11),
         _ => err_reply(-9),
     }
 }
@@ -6240,17 +6259,6 @@ fn ucopy_in(dst: &mut [u8], src: usize) -> bool {
 /// Fault-tolerant copy of `src` out to a caller buffer; false on a fault.
 fn ucopy_out(dst: usize, src: &[u8]) -> bool {
     unsafe { sched::uaccess::copy_raw(dst as *mut u8, src.as_ptr(), src.len()) == 0 }
-}
-
-/// Store an AF_INET sockaddr for `ip:port` and its length (16) to the
-/// caller, honouring the capacity in `*addrlen_ptr`. Fault-tolerant.
-fn put_sockaddr_in(addr_ptr: usize, addrlen_ptr: usize, ip: Option<[u8; 4]>, port: u16) -> bool {
-    let mut sa = [0u8; 16];
-    sa[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
-    sa[2..4].copy_from_slice(&port.to_be_bytes());
-    if let Some(ip) = ip { sa[4..8].copy_from_slice(&ip); }
-    let cap = match sched::uaccess::read_user::<u32>(addrlen_ptr) { Some(c) => c as usize, None => return false };
-    ucopy_out(addr_ptr, &sa[..cap.min(sa.len())]) && wr_user(addrlen_ptr, 16u32)
 }
 
 /// Store an unnamed address (family only, addrlen 2). Fault-tolerant.
@@ -6648,7 +6656,7 @@ fn inet_dgram(pid: u32, fd: usize) -> bool {
     match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
         Some(t) if slot < t.socks.len() && t.socks[slot].in_use =>
             matches!(t.socks[slot].state, SockState::IcmpUnbound | SockState::IcmpBound { .. })
-                || (t.socks[slot].domain == AF_INET as u8 && t.socks[slot].sock_type == SOCK_DGRAM as u8),
+                || (is_inet(t.socks[slot].domain) && t.socks[slot].sock_type == SOCK_DGRAM as u8),
         _ => false,
     }
 }
@@ -6868,8 +6876,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize, syn: Opt
         }
         let from = meta.from;
         if name_ptr != 0 {
-            let ip = match from.addr { IpAddress::Ipv4(v) => Some(v.0), #[allow(unreachable_patterns)] _ => None };
-            put_sockaddr_in(name_ptr, msghdr_ptr + 8, ip, from.port);
+            sa::write(sock_dom(pid, fd), name_ptr, msghdr_ptr + 8, from);
         }
         let truncated = full > data.len();
         // IP_PKTINFO / IP_RECVTTL / IP_RECVTOS / UDP_GRO: whole control
@@ -7250,7 +7257,7 @@ fn handle_getsockname(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
     // Endpoint resolved first; user memory is written with no lock held.
     let endpoint = inet_local_endpoint(pid, fd);
     match endpoint {
-        Some(ep) => unsafe { write_sockaddr_in(addr_ptr, addrlen_ptr, ep); },
+        Some(ep) => unsafe { write_sockaddr_in(sock_dom(pid, fd), addr_ptr, addrlen_ptr, ep); },
         None => match unix_bound_name(pid, fd) {
             Some((name, len)) => if !put_sockaddr_un(addr_ptr, addrlen_ptr, &name[..len]) {
                 return err_reply(-14);
@@ -7297,13 +7304,13 @@ fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
     if let Some(o) = nlsock::of(pid, fd) { return nlsock::getpeername(o, addr_ptr, addrlen_ptr); }
     let endpoint = inet_remote_endpoint(pid, fd);
     match endpoint {
-        Some(ep) => unsafe { write_sockaddr_in(addr_ptr, addrlen_ptr, ep); },
+        Some(ep) => unsafe { write_sockaddr_in(sock_dom(pid, fd), addr_ptr, addrlen_ptr, ep); },
         // An AF_INET socket with no peer (unconnected UDP, a listener, a
         // TCP socket never connected): ENOTCONN, as on Linux. It answered
         // success with an AF_UNSPEC address, which a caller asking "am I
         // connected?" (the UDP connect/disconnect dance) took for yes.
         None if inet_sock_info(pid, fd).map_or(false, |(st, _, _)| match st {
-            SockState::Unbound { domain, .. } => domain == AF_INET as u8,
+            SockState::Unbound { domain, .. } => is_inet(domain),
             st => is_inet_state(&st),
         }) => return err_reply(-107),
         None => if !put_sockaddr_unnamed(addr_ptr, addrlen_ptr, 0) { return err_reply(-14); },
@@ -7640,14 +7647,14 @@ fn udp_take_error(pid: u32, fd: usize) -> Option<u8> {
 /// An AF_INET UDP socket in any state (not a ping socket): the sockets the
 /// SOL_UDP level applies to.
 fn is_udp_entry(e: &SockEntry) -> bool {
-    e.domain as usize == AF_INET && e.sock_type as usize == SOCK_DGRAM
+    is_inet(e.domain) && e.sock_type as usize == SOCK_DGRAM
         && !matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. })
 }
 
 /// An AF_INET SOCK_STREAM socket in any state — the sockets the IPPROTO_TCP
 /// level applies to. Ping and raw sockets are SOCK_DGRAM/SOCK_RAW.
 fn is_tcp_entry(e: &SockEntry) -> bool {
-    e.domain as usize == AF_INET && e.sock_type as usize == SOCK_STREAM
+    is_inet(e.domain) && e.sock_type as usize == SOCK_STREAM
 }
 
 fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
@@ -7719,7 +7726,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             (l, SO_PROTOCOL) if l == SOL_SOCKET as usize
                 && matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) => Some(IPPROTO_ICMP as u32),
             (l, SO_PROTOCOL) if l == SOL_SOCKET as usize => Some(match (e.domain as usize, e.sock_type as usize) {
-                (AF_INET, SOCK_STREAM) => 6, (AF_INET, SOCK_DGRAM) => 17, _ => 0 }),
+                (AF_INET | AF_INET6, SOCK_STREAM) => 6, (AF_INET | AF_INET6, SOCK_DGRAM) => 17, _ => 0 }),
             (l, SO_SNDBUF) if l == SOL_SOCKET as usize && sock_opts(e.ofd).sndbuf != 0 =>
                 Some(sock_opts(e.ofd).sndbuf),
             (l, SO_SNDBUF) | (l, SO_RCVBUF) if l == SOL_SOCKET as usize && e.domain as usize == AF_UNIX =>
@@ -7731,7 +7738,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             (l, SO_REUSEPORT) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).reuseport as u32),
             (SOL_UDP, UDP_SEGMENT) if is_udp_entry(&e) => Some(sock_opts(e.ofd).gso as u32),
             (SOL_UDP, UDP_GRO) if is_udp_entry(&e) => Some((sock_opts(e.ofd).recv & RECV_GRO != 0) as u32),
-            (IPPROTO_IP, n) if e.domain as usize == AF_INET && n != IP_MULTICAST_IF => ip_getsockopt(&e, n),
+            (IPPROTO_IP, n) if is_inet(e.domain) && n != IP_MULTICAST_IF => ip_getsockopt(&e, n),
             (l, SO_PASSCRED) if l == SOL_SOCKET as usize && e.domain as usize == AF_UNIX => Some(sock_opts(e.ofd).passcred as u32),
             (l, SO_KEEPALIVE) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).keepalive as u32),
             (l, SO_REUSEADDR) if l == SOL_SOCKET as usize => Some(e.reuseaddr as u32),
@@ -7770,7 +7777,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             return ok_reply();
         }
         // IP_MULTICAST_IF answers a struct in_addr.
-        if level == IPPROTO_IP && optname == IP_MULTICAST_IF && e.domain as usize == AF_INET {
+        if level == IPPROTO_IP && optname == IP_MULTICAST_IF && is_inet(e.domain) {
             let a = sock_opts(e.ofd).mc_addr;
             if optval_ptr != 0 && !wr_user(optval_ptr, a) { return err_reply(-14); }
             if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
@@ -8606,7 +8613,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
         // Tag: the description's SOCKSTATE key (`sock_keys`), woken by the
         // bind/connect/first sendto that gives it a socket.
         SockState::Unbound { domain, sock_type: ty }
-            if domain == AF_INET as u8 && ty == SOCK_DGRAM as u8 =>
+            if is_inet(domain) && ty == SOCK_DGRAM as u8 =>
         {
             drop(tbls);
             (POLLOUT, Some(0), sock_tag(&ent))
