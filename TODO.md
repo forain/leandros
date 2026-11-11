@@ -7,10 +7,8 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ## Known bugs
 
 ### Kernel / VFS
-- **Pending AF_UNIX connections whose client closed before `accept` are dropped** (Linux hands them over) (?).
 - **Paths below `/proc/self/fd/N` follow the directory's open-time path** (no dentries; no " (deleted)" suffix on readlink).
 - **Global scans on last close** of tmpfs/mounted files walk every fd table (O(all fds)); a per-object refcount would retire it and `FD_COPY_GATE`.
-- **AF_UNIX connection pool (512) is a fixed system-wide pool** (?).
 - **Wake scans are O(parked pollers)**; keyed wake still dereferences each mask match (~11 us per scan). A per-tag index / kbits bloom would fix it.
 - **The switch-back CPU charge still takes RUN_QUEUE** (~22.5k holds/s); needs a lock-free `on_cpu` release protocol.
 - **New writers of signal state must call `sig_kick`**; a miss shows as `miss` > 0 in `/proc/rqhold` (invariant, no known violation).
@@ -24,11 +22,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Pty background-child SIGHUP on su session end** unverified against Linux (?).
 
 ### Podman / namespaces / cgroups
-- **`cgroup.freeze` is delegated but still a stub** (events say frozen, tasks keep running): `podman pause` is not real.
-- **`memfd` exe pin not inherited by fork** (?).
-- **nsfs bind inside a non-init mntns; self-binds not copied into a new mntns.**
 - **netns**: SETLINK move of an existing link; TCP over a tap in a netns (?).
-- **fchmod/fchown/futimens on fds of an ro mount** are not refused.
 - **mntunshare is not an isolation boundary for root-run workloads** (M6).
 - **rename on devfs unsupported.**
 - **cgsession: only `/bin/login` joins the session cgroup** (greetd/sshd/launcher/autologin need a helper).
@@ -38,7 +32,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **UDP/IP gaps**: no PMTUD, no IGMPv3/SSM, no IP fragmentation/reassembly (?), `connect(AF_UNSPEC)` quirks (UDP keeps bind(0) port; TCP takes the AF_UNIX path).
 - **Real NIC drivers program no multicast filter** (mDNS works only in QEMU).
 - **Inet listeners report no tag**, so sshd parks with a broadcast mask.
-- **iwlwifi gaps**: later-beacon WMM changes ignored, STATISTICS_NOTIFICATION ignored, antennas only toggled on failure; TX MIMO/STBC/short GI on 5 GHz untested; 2.4 GHz poor (36% AP retries); sparse pings lose 1-4%.
+- **iwlwifi gaps** (lane iwlgaps 2026-11-11: WMM later-beacon updates, STATISTICS_NOTIFICATION and antenna comparison were already implemented; sparse ping loss 0/300 on LeandrOS vs 4/300 on Linux, same AP; 2.4 GHz is channel noise): still open: TX MIMO/STBC/SGI on 5 GHz unmeasured (the saved 5 GHz profile/passphrase is not on the stick; add the profile and A/B `iwlwifi.rscol`/`txmimo`).
 - **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
 - **`netwatch.loss=S` not exercised in QEMU.**
 - **Podman published ports**: TCP NAT port reservation / ICMP error translation open; rootful `-p`, `--internal`, host-NIC reach deferred.
@@ -61,18 +55,10 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Why Limine leaves RAM above 4 GiB out of the HHDM is unexplained** (`lane-fbmm`); aarch64 has no HHDM gap walker.
 - **Real-PC (RTX 3070) verification deferred ~1 month** (user, 2026-10-24).
 
-### Build / tooling
-- **Image can silently ship without `libseat.so.1`/`libudev.so.1`** (no zig, no blob cache): build succeeds, COSMIC fails at runtime. Same for other `os.path.exists()`-guarded blobs.
-- **Fresh worktrees boot with no shell** unless `brush`/`coreutils`/`bottom-leandros` siblings resolve; build exits 0 with only a warning.
-- **`../crossterm` sibling required by brush**; `/bin/wl-globals` staged only if the host binary exists.
-- **Doom links `leandros-libc`** whose allocator is a bump allocator over `brk` (no free list).
-- **A userland test built with bare `cargo build` lacks `-C relocation-model=static`** and faults before `main`.
-- **`~/code/leandros-artifacts` is unversioned and diverges from `artifacts/`**; diff before trusting either.
-
 ## Missing features
 
 ### Kernel
-- **Real cgroup freezer**; inotify L2/L3 (beyond the default-on L1).
+- inotify L2/L3 (beyond the default-on L1).
 - **Interrupt paths**: virtio keyboard/blk/net/snd and the aarch64 GPU control queue are still polled (INTx via GIC SPI is the aarch64 step).
 - **Synthetic sysfs**: only `/sys/class/block` (+ cgroup/kernel paths); `/sys/dev/char`, `/sys/class/drm`, `/sys/class/input` per `docs/design/k4-drm-design.md` deferred.
 - **utmpx/wtmp/lastlog**: unimplemented; establish a consumer (`who`, `w`, `last`) first.
