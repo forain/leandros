@@ -100,6 +100,9 @@ pub(crate) struct TmpFileEntry {
     pub(crate) atime: (i64, i64),
     pub(crate) mtime: (i64, i64),
     pub(crate) ctime: (i64, i64),
+    /// st_ino: allocated once at claim, never reused while the slot is
+    /// recycled, kept across rename; hard links report their owner's.
+    pub(crate) ino: u64,
 }
 
 impl TmpFileEntry {
@@ -108,7 +111,7 @@ impl TmpFileEntry {
                link_to: 0, link: alloc::vec::Vec::new(), len: 0,
                is_dir: false, is_fifo: false, is_link: false, is_sock: false, sock_id: 0, devtype: 0, rdev: 0,
                mode: 0, uid: 0, gid: 0,
-               atime: (0, 0), mtime: (0, 0), ctime: (0, 0) }
+               atime: (0, 0), mtime: (0, 0), ctime: (0, 0), ino: 0 }
     }
     #[inline] pub(crate) fn path(&self) -> &[u8] { &self.path }
     #[inline] pub(crate) fn in_use(&self) -> bool { self.in_use }
@@ -163,6 +166,8 @@ pub(crate) struct TmpPool {
     table:  alloc::vec::Vec<u16>,
     /// In-use slot count.
     count:  usize,
+    /// Last inode number handed out; every claim takes the next one.
+    next_ino: u64,
 }
 
 impl Deref for TmpPool {
@@ -179,7 +184,7 @@ impl TmpPool {
         Self { e: Vec::new(), xattr: Vec::new(),
                parent: Vec::new(), first: Vec::new(), next: Vec::new(), prev: Vec::new(),
                hash: Vec::new(), phash: Vec::new(), nalias: Vec::new(), used: Vec::new(),
-               table: Vec::new(), count: 0 }
+               table: Vec::new(), count: 0, next_ino: 0 }
     }
 
     // ── growth ──────────────────────────────────────────────────────────────
@@ -352,6 +357,8 @@ impl TmpPool {
         e.in_use = true;
         e.ephemeral = ephemeral;
         e.unlinked = false;
+        self.next_ino = (self.next_ino + 1) % 0x1000_0000;
+        e.ino = 0x2000_0000 + self.next_ino;
         let n = path.len().min(MAX_TMP_PATH - 1);
         e.path = path[..n].to_vec();
         self.used[idx / 64] |= 1u64 << (idx % 64);
