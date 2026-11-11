@@ -1083,6 +1083,10 @@ pub(crate) fn notify_parent_state_change(tgid: super::task::Pid, ppid: super::ta
                                          _uid: u32, info: crate::task::SigInfo) {
     if tgid == 0 || ppid == 0 { return; }
     let parent_tgid = super::tgid_of(ppid);
+    // A parent parked in wait4/waitid(WUNTRACED/WCONTINUED) sleeps on its
+    // WAIT-class tag, which only exits used to wake: without this the stop
+    // report waited out the 1 s park backstop.
+    super::request_poll_wake_key(super::poll_key(super::poll_class::WAIT, parent_tgid));
     let suppressed = {
         let rq = super::RUN_QUEUE.lock();
         rq.find_pid(parent_tgid)
