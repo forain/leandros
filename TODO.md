@@ -25,7 +25,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **netns**: SETLINK move of an existing link; TCP over a tap in a netns (?).
 - **mntunshare is not an isolation boundary for root-run workloads** (M6).
 - **rename on devfs unsupported.**
-- **cgsession: only `/bin/login` joins the session cgroup** (greetd/sshd/launcher/autologin need a helper).
 
 ### Network
 - **No IPv6 / AF_INET6** (sshd `[::]:22` fails with EAFNOSUPPORT; podman IPv6 deferred).
