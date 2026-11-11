@@ -127,7 +127,10 @@ fn v4(a: IpAddress) -> Option<[u8; 4]> {
 /// True for an address the loopback stack owns (127.0.0.0/8).
 #[inline]
 pub(crate) fn is_loopback(addr: IpAddress) -> bool {
-    matches!(addr, IpAddress::Ipv4(v4) if v4.is_loopback())
+    match addr {
+        IpAddress::Ipv4(v4) => v4.is_loopback(),
+        IpAddress::Ipv6(v6) => v6.is_loopback(),
+    }
 }
 
 /// A broadcast address: the limited broadcast 255.255.255.255, loopback's
@@ -151,6 +154,7 @@ pub(crate) fn route_select(ns: u16, dst: IpAddress) -> Option<Sid> {
     if ns != 0 {
         // A non-initial netns sees only its own stacks: no fall-through to
         // netns 0's lo or NICs.
+        if matches!(dst, IpAddress::Ipv6(_)) && is_loopback(dst) { return crate::vif::lo_up_sid(ns); }
         return v4(dst).and_then(|d| crate::vif::route_in_ns(ns, d));
     }
     if is_loopback(dst) { return Some(LO); }
