@@ -48,7 +48,6 @@ const CUR_WM: u32 = 0x70140;
 const CUR_WM_TRANS: u32 = 0x70168;
 const CUR_BUF_CFG: u32 = 0x7017C;
 /// MCURSOR_MODE_64_ARGB_AX, MCURSOR_PIPE_GAMMA_ENABLE, MCURSOR_PIPE_CSC_ENABLE.
-const MODE_64_ARGB: u32 = 0x27;
 const CUR_GAMMA: u32 = 1 << 26;
 const CUR_CSC: u32 = 1 << 24;
 /// PLANE_CTL pipe gamma / pipe CSC enable (skl..kbl).
@@ -56,8 +55,12 @@ const PLANE_GAMMA: u32 = 1 << 30;
 const PLANE_CSC: u32 = 1 << 23;
 const PIPECONF_A: u32 = 0x70008;
 
-const SIZE: u32 = 64;
+/// Largest cursor gen9 scans out: 256x256 ARGB (Linux's DRM_CAP_CURSOR_WIDTH
+/// on skl+). 64 and 128 are the other square sizes the hardware has.
+const SIZE: u32 = 256;
 const BYTES: usize = (SIZE * SIZE * 4) as usize;
+/// MCURSOR_MODE_{64,128,256}_ARGB_AX.
+fn mode_for(size: u32) -> u32 { match size { 64 => 0x27, 128 => 0x22, _ => 0x23 } }
 /// gen9: 896 blocks, the last 4 reserved.
 const DDB_BLOCKS: u32 = 892;
 const CUR_DDB: u32 = 32;
@@ -67,11 +70,13 @@ struct Cur {
     active: usize,
     /// An image is loaded.
     loaded: bool,
+    /// Edge of the loaded image (64, 128 or 256).
+    size: u32,
     x: i32,
     y: i32,
 }
 
-static CUR: KSpinLock<Cur> = KSpinLock::new(Cur { active: 0, loaded: false, x: 0, y: 0 });
+static CUR: KSpinLock<Cur> = KSpinLock::new(Cur { active: 0, loaded: false, size: 64, x: 0, y: 0 });
 /// CUR_CTL is enabled in hardware (cleared lock-free by `console_hide`).
 static SHOWN: AtomicBool = AtomicBool::new(false);
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -95,9 +100,9 @@ fn pos(x: i32, y: i32) -> u32 {
     v
 }
 
-fn visible(x: i32, y: i32) -> bool {
+fn visible(x: i32, y: i32, size: u32) -> bool {
     let (mw, mh, _) = kms::mode();
-    x < mw as i32 && y < mh as i32 && x > -(SIZE as i32) && y > -(SIZE as i32)
+    x < mw as i32 && y < mh as i32 && x > -(size as i32) && y > -(size as i32)
 }
 
 /// Watermarks and DDB, then enable — or disable — and arm (CURBASE last).
@@ -105,13 +110,13 @@ fn visible(x: i32, y: i32) -> bool {
 fn program(c: &Cur) {
     let m = kms::mmio();
     if m.va == 0 { return; }
-    let show = c.loaded && visible(c.x, c.y);
+    let show = c.loaded && visible(c.x, c.y, c.size);
     if show {
-        if !SHOWN.load(Ordering::Acquire) {
-            write_wm(&m);
+        if !SHOWN.load(Ordering::Acquire) || WM_SIZE.swap(c.size, Ordering::AcqRel) != c.size {
+            write_wm(&m, c.size);
         }
         let pctl = m.r(kms::preg(reg::PLANE_CTL_1_A));
-        let mut ctl = MODE_64_ARGB;
+        let mut ctl = mode_for(c.size);
         if pctl & PLANE_GAMMA != 0 { ctl |= CUR_GAMMA; }
         if pctl & PLANE_CSC != 0 { ctl |= CUR_CSC; }
         m.w(CURPOS, pos(c.x, c.y));
@@ -126,13 +131,19 @@ fn program(c: &Cur) {
 
 /// CUR_BUF_CFG and CUR_WM 0..7 (+ TRANS off), from plane 1A's current
 /// watermarks capped at the cursor's DDB.
-fn write_wm(m: &super::Mmio) {
+/// Edge the watermarks in CUR_WM were last written for.
+static WM_SIZE: AtomicU32 = AtomicU32::new(0);
+
+fn write_wm(m: &super::Mmio, size: u32) {
     let ddb = DDB.load(Ordering::Relaxed);
     let blocks_ddb = ((ddb >> 16) & 0x7FF).saturating_sub(ddb & 0x7FF) + 1;
     m.w(CUR_BUF_CFG, ddb);
     let mut off = false;
     let mut wm = [0u32; 8];
-    let own = PLAN_WM_SET.load(Ordering::Acquire);
+    // The planned values were computed for a 64-wide cursor; a wider one
+    // needs more blocks per line, so it takes plane 1A's (bounds it above,
+    // capped at the cursor's DDB) instead.
+    let own = PLAN_WM_SET.load(Ordering::Acquire) && size == 64;
     for (i, w) in wm.iter_mut().enumerate() {
         if own { *w = PLAN_WM[i].load(Ordering::Relaxed); continue; }
         let v = m.r(kms::preg(kms::PLANE_WM_1_A) + 4 * i as u32);
@@ -175,29 +186,25 @@ fn set(src: &KmsCursorSrc, x: i32, y: i32) -> bool {
         (src.phys, src.pitch, src.width, src.height)
     };
     if phys == 0 || pitch < 4 { return false; }
+    // Square 64/128/256 only (Linux's cursor size check): anything else is refused.
+    let size = if w == h && matches!(w, 64 | 128 | 256) { w } else { return false };
     let next = 1 - CUR.lock().active;
     // Copy outside the lock: the other buffer is not being scanned (the
     // previous switch latched before the commit that brings this one).
     let dst = crate::kenv::mm::phys_to_virt(buf_phys(next) as usize) as *mut u8;
     let s = crate::kenv::mm::phys_to_virt(phys as usize) as *const u8;
-    let cols = w.min(SIZE) as usize * 4;
-    let rows = h.min(SIZE) as usize;
+    let row = size as usize * 4;
     unsafe {
-        for r in 0..SIZE as usize {
-            let d = dst.add(r * SIZE as usize * 4);
-            if r < rows {
-                core::ptr::copy_nonoverlapping(s.add(r * pitch as usize), d, cols);
-                core::ptr::write_bytes(d.add(cols), 0, SIZE as usize * 4 - cols);
-            } else {
-                core::ptr::write_bytes(d, 0, SIZE as usize * 4);
-            }
+        for r in 0..size as usize {
+            core::ptr::copy_nonoverlapping(s.add(r * pitch as usize), dst.add(r * row), row);
         }
     }
-    kms::flush_for_display(buf_phys(next), BYTES as u64);
+    kms::flush_for_display(buf_phys(next), (size as usize * row) as u64);
     {
         let mut c = CUR.lock();
         c.active = next;
         c.loaded = true;
+        c.size = size;
         c.x = x;
         c.y = y;
         program(&c);
@@ -214,7 +221,7 @@ fn move_to(x: i32, y: i32) {
         c.y = y;
         if !c.loaded { return; }
         let m = kms::mmio();
-        if SHOWN.load(Ordering::Acquire) && visible(x, y) && m.va != 0 {
+        if SHOWN.load(Ordering::Acquire) && visible(x, y, c.size) && m.va != 0 {
             // The common case: position, then the arm.
             m.w(CURPOS, pos(x, y));
             m.w(CURBASE, buf_ggtt(c.active));
@@ -242,6 +249,12 @@ pub(super) fn console_hide() {
     if m.va == 0 { return; }
     m.w(CURCNTR, 0);
     m.w(CURBASE, m.r(CURBASE));
+}
+
+/// Edge of the cursor image programmed into the hardware, 0 = none shown.
+pub(super) fn loaded_size() -> u32 {
+    let c = CUR.lock();
+    if c.loaded { c.size } else { 0 }
 }
 
 /// `(images loaded, moves)` for summary lines.
@@ -324,8 +337,8 @@ pub(super) fn init(d: &Device) -> bool {
             return false;
         }
     };
-    // Two 16 KiB images, contiguous (order 3 = 32 KiB), zeroed, flushed.
-    let Some(phys) = crate::kenv::mm::buddy::alloc(3) else { log("kms: cursor: out of memory; no hardware cursor"); return false };
+    // Two 256 KiB image buffers, contiguous (order 7 = 512 KiB), zeroed, flushed.
+    let Some(phys) = crate::kenv::mm::buddy::alloc(7) else { log("kms: cursor: out of memory; no hardware cursor"); return false };
     unsafe { core::ptr::write_bytes(crate::kenv::mm::phys_to_virt(phys) as *mut u8, 0, 2 * BYTES); }
     kms::flush_for_display(phys as u64, 2 * BYTES as u64);
     let base = kms::CURSOR_GGTT / 4096;
