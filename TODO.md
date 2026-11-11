@@ -36,7 +36,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **r8169 RX stalls/chip resets on the PC**: ISR-mask fix needs PC confirmation (R8169 as a loadable module also deferred).
 
 ### Desktop / GPU / COSMIC
-- **Venus/Vulkan**: ISR path unwired, virtgpu `FENCE_FD_IN`/`in_syncobjs`/`out_syncobjs` not honoured, cross-open dmabuf import deferred (`artifacts/notes/m9-crossopen-dmabuf/`), aarch64 vkwl untested.
+- **Venus/Vulkan**: cross-open dmabuf import deferred (`artifacts/notes/m9-crossopen-dmabuf/`), aarch64 vkwl untested.
 - **i915**: cursor 64x64 only, no async flips, no real `WAIT_VBLANK`, no `IN_FENCE_FD`.
 - **Laptop**: low FPS under COSMIC; Firefox on iris unproven; Wi-Fi link still weak on 2.4 GHz.
 - **x86 audio clipping** in DOOM/PipeWire (lane/doomvis).
