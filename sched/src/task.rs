@@ -594,6 +594,9 @@ pub struct Task {
     /// explicit `chroot(2)`. Storing it host-absolute lets the non-chrooted
     /// path skip every root-related step and behave exactly as before.
     pub root:     Option<alloc::sync::Arc<[u8]>>,
+    /// Set by the VFS around a dispatch whose paths were resolved in mount-namespace
+    /// space: filesystems must not follow symlinks themselves (they fail closed).
+    pub strict_links: bool,
     /// File-creation mask (POSIX umask).
     pub umask:   u32,
 
@@ -940,6 +943,7 @@ impl Task {
             user_gs_base: 0,
             cwd: None,  // "/"
             root: None, // not chrooted
+            strict_links: false,
             umask: 0o022,
             altstack_sp: 0,
             altstack_size: 0,
@@ -1386,6 +1390,7 @@ impl Task {
             user_gs_base: 0,
             cwd: None,  // "/"
             root: None, // not chrooted
+            strict_links: false,
             umask: 0o022,
             altstack_sp: 0,
             altstack_size: 0,

@@ -2633,6 +2633,23 @@ static void entry_ns_suite(void) {
     unlink("/root/mntiso.sock"); unlink("/root/mntiso-bound.sock"); unlink("/root/mntiso-secret"); unlink("/ldx");
 }
 
+/* mntiso-strict (D1): in a mount namespace the tmpfs walk must refuse a link on its own
+ * (/proc/mntselftest row strict_tmp_link_refused); unlinking the fixture removes the row. */
+static int strict_case(int m) {
+    (void)m;
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    static char buf[8192];
+    if (slurp("/proc/mntselftest", buf, sizeof buf) <= 0) return 92;
+    if (strstr(buf, "strict_tmp_link_refused: PASS")) return 0;
+    return strstr(buf, "strict_tmp_link_refused: FAIL") ? 11 : 93;
+}
+static void strict_ns_suite(void) {
+    unlink("/tmp/mntiso-strict-l");
+    if (symlink("/tmp", "/tmp/mntiso-strict-l") < 0) { report("strict_tmp_link_refused", 0); return; }
+    report("strict_tmp_link_refused", nn_in_child(strict_case, 0));
+    unlink("/tmp/mntiso-strict-l");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -2663,6 +2680,7 @@ int main(int argc, char **argv) {
     mntiso_busy_suite();
     chroot_ns_suite();
     entry_ns_suite();
+    strict_ns_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
