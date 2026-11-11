@@ -64,13 +64,18 @@ pub struct Mnt {
     pub fstype: &'static str,
     pub device: Box<[u8]>,
     pub opts: Box<[u8]>,
+    /// mntiso-bindpin (D5): `(st_dev, st_ino)` of a bind mount's root as it was
+    /// when the bind was made; `None` for mounts that are not pinned.
+    pub pin: Option<(u64, u64)>,
+    /// `VFS_NAME_GEN` value at which `pin` was last verified.
+    pub vgen: u64,
 }
 
 impl Clone for Mnt {
     fn clone(&self) -> Mnt {
         Mnt { id: self.id, parent: self.parent, mp: self.mp.clone(), root: self.root.clone(), sb: self.sb,
               flags: self.flags, locked: self.locked, group: self.group, master: self.master,
-              unbindable: self.unbindable, fstype: self.fstype, device: self.device.clone(), opts: self.opts.clone() }
+              unbindable: self.unbindable, fstype: self.fstype, device: self.device.clone(), opts: self.opts.clone(), pin: self.pin, vgen: self.vgen }
     }
 }
 
@@ -148,6 +153,31 @@ pub fn translate(ns: NsId, path: &[u8]) -> Option<Xlat> {
 /// mountpoint of a non-root mount (Linux: rename/unlink/rmdir give EBUSY).
 pub fn is_mount_root(ns: NsId, ns_path: &[u8]) -> bool {
     ns_path.len() > 1 && translate(ns, ns_path).map_or(false, |x| x.ns_prefix_len == ns_path.len())
+}
+
+/// mntiso-bindpin (D5): bumped by every name-changing op (rename, unlink,
+/// rmdir, symlink); a pinned mount re-verifies its root only when this moved.
+pub static NAME_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+pub fn name_gen_bump() { NAME_GEN.fetch_add(1, Ordering::SeqCst); }
+pub fn name_gen() -> u64 { NAME_GEN.load(Ordering::SeqCst) }
+
+/// `(backing root, pin, verified gen)` of mount `id` when it is pinned.
+pub fn pin_of(ns: NsId, id: u32) -> Option<(Vec<u8>, (u64, u64), u64)> {
+    let g = NS.lock();
+    let m = g.get(&ns)?.mnts.iter().find(|m| m.id == id)?;
+    m.pin.map(|p| (m.root.to_vec(), p, m.vgen))
+}
+/// Set the pin of mount `id` (bind time) and mark it verified at `gen`.
+pub fn pin_set(ns: NsId, id: u32, pin: (u64, u64), gen: u64) {
+    if let Some(m) = NS.lock().get_mut(&ns).and_then(|n| n.mnts.iter_mut().find(|m| m.id == id)) { m.pin = Some(pin); m.vgen = gen; }
+}
+/// Record a successful verification at `gen` (never moves it backwards).
+pub fn pin_verified(ns: NsId, id: u32, gen: u64) {
+    if let Some(m) = NS.lock().get_mut(&ns).and_then(|n| n.mnts.iter_mut().find(|m| m.id == id)) { if m.vgen < gen { m.vgen = gen; } }
+}
+/// Backing root of mount `id` (for pinning at bind time).
+pub fn root_of(ns: NsId, id: u32) -> Option<Vec<u8>> {
+    NS.lock().get(&ns)?.mnts.iter().find(|m| m.id == id).map(|m| m.root.to_vec())
 }
 
 /// Flags of mount `id` in namespace `ns` (0 when unknown).
@@ -959,7 +989,7 @@ pub fn callctx_get(pid: u32, ptr: usize) -> Option<CallCtx> {
 
 fn mk(id: u32, parent: u32, mp: &[u8], root: &[u8], sb: SbId) -> Mnt {
     Mnt { id, parent, mp: mp.into(), root: root.into(), sb, flags: 0, locked: 0, group: 0, master: 0,
-          unbindable: false, fstype: "test", device: Box::from(&b"t"[..]), opts: Box::from(&b""[..]) }
+          unbindable: false, fstype: "test", device: Box::from(&b"t"[..]), opts: Box::from(&b""[..]), pin: None, vgen: 0 }
 }
 
 /// Walk/reverse/copy/registry checks on a synthetic tree in a scratch

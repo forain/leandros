@@ -2650,6 +2650,51 @@ static void strict_ns_suite(void) {
     unlink("/tmp/mntiso-strict-l");
 }
 
+/* mntiso-bindpin (D5): a bind root is pinned by (dev, ino). The source is swapped on the host side
+ * (ns 0) after the bind; access through the bind must be ESTALE (or ELOOP for a link), never the
+ * replacement. m: 0 dir swap (NEW), 1 link swap (host sentinel), 2 unrelated renames keep working. */
+static int bp_child(int m, int rd, int wr) {
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (mount("/tmp/bp/vol", "/tmp/bp/mp", NULL, MS_BIND, NULL) < 0) return 92;
+    char b[16] = {0}, c = 'x';
+    if (slurp("/tmp/bp/mp/f", b, sizeof b) <= 0 || strncmp(b, "OLD", 3)) return 93;
+    if (write(wr, &c, 1) != 1) return 94;
+    if (read(rd, &c, 1) != 1) return 95;
+    memset(b, 0, sizeof b); errno = 0;
+    int n = slurp(m == 1 ? "/tmp/bp/mp/mntiso-secret" : "/tmp/bp/mp/f", b, sizeof b), e = errno;
+    if (n > 0 && (!strncmp(b, "NEW", 3) || !strncmp(b, "HOST", 4))) { printf("  reached replacement: %s\n", b); return 11; }
+    if (m == 2) return n > 0 && !strncmp(b, "OLD", 3) ? 0 : 12;
+    if (n > 0 || (e != ESTALE && !(m == 1 && e == ELOOP))) { printf("  n=%d errno=%d\n", n, e); return 12; }
+    return 0;
+}
+static int bp_case(int m) {
+    system("rm -rf /tmp/bp"); mkdir("/tmp/bp", 0755); mkdir("/tmp/bp/vol", 0755); mkdir("/tmp/bp/mp", 0755);
+    put("/tmp/bp/vol/f", "OLD", 0644);
+    mkdir("/root", 0755); put("/root/mntiso-secret", "HOST", 0644);
+    int up[2], dn[2];
+    if (pipe(up) || pipe(dn)) return 90;
+    pid_t c = fork();
+    if (c == 0) _exit(bp_child(m, dn[0], up[1]));
+    char x;
+    if (read(up[0], &x, 1) != 1) { int st; waitpid(c, &st, 0); printf("  child setup failed %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1); return 1; }
+    if (m == 2) { mkdir("/tmp/bp/other", 0755); rename("/tmp/bp/other", "/tmp/bp/other2"); rmdir("/tmp/bp/other2"); }
+    else {
+        rename("/tmp/bp/vol", "/tmp/bp/x");
+        if (m == 0) { mkdir("/tmp/bp/vol", 0755); put("/tmp/bp/vol/f", "NEW", 0644); }
+        else if (symlink("/root", "/tmp/bp/vol") < 0) return 2;
+    }
+    if (write(dn[1], &x, 1) != 1) return 3;
+    int st = 0; waitpid(c, &st, 0);
+    system("rm -rf /tmp/bp"); unlink("/root/mntiso-secret");
+    if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) printf("  child status=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 4;
+}
+static void bindpin_suite(void) {
+    report("bindpin_dir_swap", bp_case(0) == 0);
+    report("bindpin_link_swap", bp_case(1) == 0);
+    report("bindpin_unrelated_ok", bp_case(2) == 0);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -2681,6 +2726,7 @@ int main(int argc, char **argv) {
     chroot_ns_suite();
     entry_ns_suite();
     strict_ns_suite();
+    bindpin_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
