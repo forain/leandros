@@ -1,0 +1,5 @@
+# lane/smallfix (2026-11-11)
+FIXED pty SIGHUP: servers/tty/src/pty.rs session_leader_exited sent HUP+CONT to the foreground pgrp; Linux (disassociate_ctty on exit) sends HUP only. New ptytest leader_exit_hup: RED on main's pty.rs (slot 17=1), GREEN with fix (a64).
+FIXED PipeWire sink name: ports/pipewire/snd-name.h derives desc/nick from the snd ioctl info text; leandros-snd-sink --describe prints "desc|nick". Guest a64: "Virtio Sound Output|Virtio Sound". HDA path covered by host test only (RED 4 vs stub, GREEN with header); not run on x86/HDA.
+Port fixes found on the way: leandros-snd-sink.c `info` shadowed spa_audio_info_raw (compile error); ports/pipewire/build.sh read the deleted ports/firefox/build.sh (sonames) -> now tolerant. ports/gstreamer/build.sh has the same stale reference (not touched).
+Worktree note: a fresh worktree did NOT trip the busd staleness check (no touch workaround needed); the PipeWire stage silently "reused previously staged" output because Docker was not running, so the seeded out/ shipped the old sink. Started Docker Desktop to rebuild it.
