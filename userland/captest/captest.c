@@ -269,20 +269,27 @@ static int child_amb(void)
     return chroot("/") == 0 ? 0 : 5;
 }
 
+/* Linux: setresuid to an unrelated uid needs CAP_SETUID, so these keep it. */
+static int set_chroot_setuid(void)
+{
+    struct dat d[2] = { { CH | 1u << 7, CH | 1u << 7, CH | 1u << 7 }, { 0, 0, 0 } };
+    return cset(d);
+}
+
 static int t_ambient_exec_nonroot(void)
 {
-    CHECK(set_chroot_only() == 0);
+    CHECK(set_chroot_setuid() == 0);
     CHECK(prctl(PR_CAP_AMBIENT, AMB_RAISE, CAP_SYS_CHROOT, 0, 0) == 0);
     CHECK(prctl(PR_SET_KEEPCAPS, 1) == 0 && prctl(PR_GET_KEEPCAPS) == 1);
     CHECK(setresuid(1000, 1000, 1000) == 0);
-    struct dat d[2]; CHECK(cget(d) == 0 && d[0].eff == 0 && d[0].prm == CH); /* kept, effective cleared */
+    struct dat d[2]; CHECK(cget(d) == 0 && d[0].eff == 0 && d[0].prm == (CH | 1u << 7)); /* kept, effective cleared */
     execl("/bin/captest", "captest", "--child-amb", (char *)0);
     return 1;
 }
 
 static int t_ambient_cleared_without_keepcaps(void)
 {
-    CHECK(set_chroot_only() == 0);
+    CHECK(set_chroot_setuid() == 0);
     CHECK(prctl(PR_CAP_AMBIENT, AMB_RAISE, CAP_SYS_CHROOT, 0, 0) == 0);
     CHECK(setresuid(1000, 1000, 1000) == 0);
     CHECK(prctl(PR_CAP_AMBIENT, AMB_IS_SET, CAP_SYS_CHROOT, 0, 0) == 0);
