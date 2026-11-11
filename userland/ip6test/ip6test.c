@@ -246,7 +246,28 @@ static void test_udp_dual(void) {
     if (r >= 0) close(r);
 }
 
-int main(void) {
+// `ip6test banner ADDR PORT`: connect (v4 or v6 literal), print the first bytes the server sends.
+static int banner(const char *addr, int port) {
+    struct sockaddr_in6 a6; struct sockaddr_in a4; int s, r;
+    memset(&a6, 0, sizeof a6); memset(&a4, 0, sizeof a4);
+    if (inet_pton(AF_INET6, addr, &a6.sin6_addr) == 1) {
+        a6.sin6_family = AF_INET6; a6.sin6_port = htons(port);
+        s = socket(AF_INET6, SOCK_STREAM, 0); tmo(s, 5);
+        r = connect(s, (struct sockaddr *)&a6, sizeof a6);
+    } else if (inet_pton(AF_INET, addr, &a4.sin_addr) == 1) {
+        a4.sin_family = AF_INET; a4.sin_port = htons(port);
+        s = socket(AF_INET, SOCK_STREAM, 0); tmo(s, 5);
+        r = connect(s, (struct sockaddr *)&a4, sizeof a4);
+    } else return 2;
+    if (r) { printf("connect failed: %d\n", errno); return 1; }
+    char b[16]; ssize_t n = read(s, b, 4);
+    if (n < 4) { printf("read failed: %zd\n", n); return 1; }
+    b[4] = 0; printf("%s\n", b);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc >= 4 && !strcmp(argv[1], "banner")) return banner(argv[2], atoi(argv[3]));
     test_socket6();
     test_bad_len6();
     test_unreach6();
