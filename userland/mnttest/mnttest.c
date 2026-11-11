@@ -2695,8 +2695,32 @@ static void bindpin_suite(void) {
     report("bindpin_unrelated_ok", bp_case(2) == 0);
 }
 
+/* mntiso-bindpin cost: stat through a bind in a mntns, (a) quiet: no name-changing op between
+ * stats (pin verified once), (b) churn: a rename in /tmp between every stat (one pin stat per op). */
+static void bindbench(void) {
+    system("rm -rf /tmp/bb"); mkdir("/tmp/bb", 0755); mkdir("/tmp/bb/vol", 0755); mkdir("/tmp/bb/mp", 0755);
+    put("/tmp/bb/vol/f", "x", 0644); put("/tmp/bb/a", "x", 0644);
+    if (unshare(CLONE_NEWNS) < 0) { printf("bindbench: unshare failed\n"); return; }
+    if (mount("/tmp/bb/vol", "/tmp/bb/mp", NULL, MS_BIND, NULL) < 0) { printf("bindbench: bind failed\n"); return; }
+    struct stat st; const int N = 20000;
+    for (int round = 0; round < 3; round++) {
+        long long t0 = now_ns();
+        for (int i = 0; i < N; i++) stat("/tmp/bb/mp/f", &st);
+        long long t1 = now_ns();
+        for (int i = 0; i < N; i++) { rename(i & 1 ? "/tmp/bb/b" : "/tmp/bb/a", i & 1 ? "/tmp/bb/a" : "/tmp/bb/b"); stat("/tmp/bb/mp/f", &st); }
+        long long t2 = now_ns();
+        for (int i = 0; i < N; i++) { rename(i & 1 ? "/tmp/bb/b" : "/tmp/bb/a", i & 1 ? "/tmp/bb/a" : "/tmp/bb/b"); stat("/tmp/bb/vol/f", &st); }
+        long long t3 = now_ns();
+        printf("bindbench %d: quiet %lld ns/stat; churn via-bind %lld ns/(rename+stat); churn no-bind %lld ns/(rename+stat)\n",
+               round, (t1 - t0) / N, (t2 - t1) / N, (t3 - t2) / N);
+    }
+    static char buf[8192];
+    if (slurp("/proc/mntselftest", buf, sizeof buf) > 0) { char *q = strstr(buf, "bindpin_checks"); if (q) { char *e = strchr(q, '\n'); if (e) *e = 0; printf("%s\n", q); } }
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "bindbench")) { bindbench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
     if (argc > 1 && !strcmp(argv[1], "euid-chk")) return geteuid() == 1000 ? 42 : geteuid() == 0 ? 44 : 45;
     newapi_enosys();
