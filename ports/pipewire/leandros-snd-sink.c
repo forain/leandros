@@ -36,9 +36,12 @@
 #include <spa/utils/result.h>
 #include <pipewire/pipewire.h>
 
+#include "snd-name.h"
+
 #define DEV_PATH     "/dev/pipewire"
 #define IOC_SET_PARAMS 0x101
 #define IOC_GET_DELAY  0x102
+#define IOC_GET_INFO   0x103
 
 #define RATE      48000
 #define CHANNELS  2
@@ -297,12 +300,21 @@ int main(int argc, char *argv[])
 	pw_loop_add_signal(pw_main_loop_get_loop(d.loop), SIGINT, do_quit, &d);
 	pw_loop_add_signal(pw_main_loop_get_loop(d.loop), SIGTERM, do_quit, &d);
 
+	/* Name the node after the real backend (virtio-snd, HDA codec, ...). */
+	char info[4096] = { 0 }, desc[160] = "Virtio Sound Output", nick[80] = "Virtio Sound";
+	if (ioctl(d.fd, IOC_GET_INFO, info) == 0)
+		snd_describe(info, desc, sizeof desc, nick, sizeof nick);
+	if (argc > 1 && strcmp(argv[1], "--describe") == 0) {
+		printf("%s|%s\n", desc, nick);
+		return 0;
+	}
+
 	struct pw_properties *props = pw_properties_new(
 			PW_KEY_MEDIA_TYPE, "Audio",
 			PW_KEY_MEDIA_CLASS, "Audio/Sink",
 			PW_KEY_NODE_NAME, "leandros_output",
-			PW_KEY_NODE_DESCRIPTION, "Virtio Sound Output",
-			PW_KEY_NODE_NICK, "Virtio Sound",
+			PW_KEY_NODE_DESCRIPTION, desc,
+			PW_KEY_NODE_NICK, nick,
 			PW_KEY_DEVICE_ICON_NAME, "audio-card",
 			PW_KEY_PRIORITY_DRIVER, "1500",
 			PW_KEY_PRIORITY_SESSION, "1500",
