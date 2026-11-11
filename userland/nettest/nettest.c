@@ -1100,6 +1100,26 @@ static int first_nameserver(char *out, size_t n) {
     return ok;
 }
 
+/* connect(AF_UNSPEC) disconnects an inet socket (Linux): UDP forgets the peer and drops an auto-bound port, TCP stays inet. */
+static void connect_unspec(void) {
+    const char *N = "connect_unspec";
+    struct sockaddr_in a = sin4("127.0.0.1", 0), p = sin4("127.0.0.1", 9);
+    struct sockaddr un; memset(&un, 0, sizeof un); un.sa_family = AF_UNSPEC;
+    struct sockaddr_in q; socklen_t ql = sizeof q;
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (u < 0 || bind(u, (struct sockaddr *)&a, sizeof a) < 0 || connect(u, (struct sockaddr *)&p, sizeof p) < 0) {
+        fail(N, "udp setup: %s", strerror(errno)); if (u >= 0) close(u); return;
+    }
+    if (connect(u, &un, sizeof un) != 0) { fail(N, "udp connect(AF_UNSPEC): %s", strerror(errno)); close(u); return; }
+    if (getpeername(u, (struct sockaddr *)&q, &ql) == 0 || errno != ENOTCONN) { fail(N, "udp still has a peer after AF_UNSPEC"); close(u); return; }
+    if (local_port(u) != 0) { fail(N, "udp bind(0) port %u kept after AF_UNSPEC (Linux drops it)", local_port(u)); close(u); return; }
+    close(u);
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    if (t < 0 || connect(t, &un, sizeof un) != 0) { fail(N, "tcp connect(AF_UNSPEC) on a fresh socket: %s", strerror(errno)); if (t >= 0) close(t); return; }
+    close(t);
+    pass(N);
+}
+
 int main(int argc, char **argv) {
     const char *gw = NULL, *name = "example.com", *http = NULL;
     char dns[64] = "";
@@ -1143,6 +1163,7 @@ int main(int argc, char **argv) {
     proc_net_tcp();
     proc_net_udp();
     proc_net_unix();
+    connect_unspec();
 
     printf("nettest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;
