@@ -459,7 +459,7 @@ fn sid_of_index(st: &NetNsState, v: &vifsel::VifTable, index: u32) -> Option<Sid
 pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
     if !sched::caps::ns_capable_in(sched::ns::owner_userns(1, ns), CAP_NET_ADMIN) { return 1; }
     match op {
-        RtOp::SetLink { index, up, mtu, mac, name, master } => {
+        RtOp::SetLink { index, up, mtu, mac, name, master, ns: nsel } => {
             let sid;
             {
                 let nss = NETNS.lock();
@@ -489,6 +489,16 @@ pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
             if let Some(m) = master {
                 let e = if m == 0 { release(sid) } else { enslave(ns, sid, m) };
                 if e != 0 { return e; }
+            }
+            // IFLA_NET_NS_FD / IFLA_NET_NS_PID: move the link to another netns
+            // (Linux `dev_change_net_namespace`: leaves its bridge, goes down,
+            // loses its addresses, gets a new ifindex there).
+            if !matches!(nsel, rtnetlink::PeerNs::Same) {
+                let tns = match resolve_peer_ns(&nsel, ns) { Ok(n) => n, Err(e) => return e };
+                if tns != ns {
+                    let e = move_link(ns, sid, tns);
+                    if e != 0 { return e; }
+                }
             }
             drivers::netdev::kick();
             0
@@ -640,6 +650,34 @@ fn pick_name(st: &NetNsState, v: &vifsel::VifTable, base: &[u8], also: Option<&[
     if taken(base) { return Err(17); }
     fin[..base.len()].copy_from_slice(base);
     Ok(fin)
+}
+
+/// Move the tun/veth/bridge `sid` of `ns` to netns `tns`.
+fn move_link(ns: u16, sid: Sid, tns: u16) -> i32 {
+    if !sched::caps::ns_capable_in(sched::ns::owner_userns(1, tns), CAP_NET_ADMIN) { return 1; }
+    crate::vif::claim(tns);
+    let _ = release(sid); // a bridge port leaves its bridge
+    {
+        let mut nss = NETNS.lock();
+        let mut v = VIFS.lock();
+        nss.entry(tns).or_insert_with(|| NetNsState::new(tns));
+        if nss[&tns].sids.len() + 1 > ns_sid_cap(tns) { return 23; }
+        let Some(cur) = v[sid as usize].as_ref().map(|x| x.name) else { return 19 };
+        let nm = &cur[..name_len(&cur)];
+        let clash = nm == b"lo" || nss[&tns].sids.iter().any(|&q| v[q as usize].as_ref()
+            .map_or(false, |x| &x.name[..name_len(&x.name)] == nm));
+        let fin = if clash {
+            match pick_name(&nss[&tns], &v, b"eth%d", None) { Ok(n) => n, Err(e) => return e }
+        } else { cur };
+        let ifindex = { let st = nss.get_mut(&tns).unwrap(); let i = st.next_ifindex; st.next_ifindex += 1; i };
+        if let Some(st) = nss.get_mut(&ns) { st.sids.retain(|&q| q != sid); }
+        nss.get_mut(&tns).unwrap().sids.push(sid);
+        let x = v[sid as usize].as_mut().unwrap();
+        x.netns = tns; x.ifindex = ifindex; x.name = fin;
+        x.admin_up = false; x.addrs.clear(); x.rxq.clear(); x.rxsrc.clear();
+    }
+    sync_addrs(sid, &[]);
+    0
 }
 
 fn veth_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>, mac: Option<[u8; 6]>, up: bool,

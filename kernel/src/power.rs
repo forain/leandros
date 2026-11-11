@@ -175,7 +175,7 @@ fn arm_tryboot() -> Result<(), isize> {
 pub fn sys_reboot(magic1: usize, magic2: usize, cmd: usize, _arg: usize) -> isize {
     // CAP_SYS_BOOT first, as Linux does: an unprivileged caller learns
     // nothing about the magic numbers.
-    if !sched::host_root() { return EPERM; }
+    if !sched::caps::host_capable(sched::caps::CAP_SYS_BOOT) { return EPERM; }
     // The magics and the command are C `int`s; compare the low 32 bits so a
     // sign-extending caller matches too.
     let (m1, m2, cmd) = (magic1 as u32, magic2 as u32, cmd as u32);

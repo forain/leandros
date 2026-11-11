@@ -2595,7 +2595,7 @@ fn dispatch_inner(
         DELETE_MODULE => crate::kmod::sys::sys_delete_module(a0, a1),
         KEXEC_FILE_LOAD => crate::kexec::sys_kexec_file_load(a0, a1, a2, a3, a4),
         #[cfg(not(target_arch = "aarch64"))]
-        IOPL | IOPERM => if !sched::host_root() { -1 } else { log_enosys(number) },
+        IOPL | IOPERM => if !sched::caps::host_capable(sched::caps::CAP_SYS_RAWIO) { -1 } else { log_enosys(number) },
         SETHOSTNAME   => sys_setxname(a0, a1, false),
         SETDOMAINNAME => sys_setxname(a0, a1, true),
 
@@ -4290,7 +4290,8 @@ fn pidfd_reaped_wake(pid: u32) {
 fn sys_clock_settime(clkid: usize, tp_ptr: usize) -> isize {
     if clkid != CLOCK_REALTIME { return -22; }
     let ns = match read_user_timespec(tp_ptr) { Ok(n) => n, Err(e) => return e };
-    if !sched::host_root() { return -1; } // EPERM
+    // Linux settime_ns/do_sys_settimeofday64: CAP_SYS_TIME in the initial userns.
+    if !sched::caps::host_capable(sched::caps::CAP_SYS_TIME) { return -1; } // EPERM
     step_realtime_ns(ns);
     0
 }
@@ -4323,7 +4324,7 @@ fn sys_settimeofday(tv_ptr: usize, _tz_ptr: usize) -> isize {
     let tv_sec  = match sched::uaccess::read_user::<i64>(tv_ptr) { Some(v) => v, None => return -14 };
     let tv_usec = match sched::uaccess::read_user::<i64>(tv_ptr + 8) { Some(v) => v, None => return -14 };
     if tv_sec < 0 || tv_usec < 0 || tv_usec >= 1_000_000 { return -22; }
-    if !sched::host_root() { return -1; } // EPERM
+    if !sched::caps::host_capable(sched::caps::CAP_SYS_TIME) { return -1; } // EPERM
     step_realtime_ns((tv_sec as u64).saturating_mul(1_000_000_000) + (tv_usec as u64) * 1_000);
     0
 }
@@ -6532,7 +6533,9 @@ fn ns_follow_links(kp: KPath) -> Result<KPath, isize> {
     let mns = sched::current_mntns();
     if mns == 0 { return Ok(kp); }
     let nsb = match kp.ns.as_ref() { Some(n) => n.clone(), None => return Ok(kp) };
-    match vfs::ns_resolve_links(mns, &nsb, true) {
+    let jail = sched::current_root_arc();
+    let floor: &[u8] = jail.as_deref().unwrap_or(b"/");
+    match vfs::ns_resolve_links(mns, &nsb, true, floor) {
         Ok(Some((nsp, _, _))) if nsp != nsb => KPath::from_ns(nsp),
         Ok(_) => Ok(kp),
         Err(e) => Err(e as isize),
@@ -13153,7 +13156,7 @@ fn tty_ioctl_bounce(cmd: usize, arg: usize, f: impl FnOnce(usize) -> isize) -> i
 fn sys_timer_create(clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) -> isize {
     match clockid as i32 {
         0 | 1 | 2 | 3 | 7 | 11 => {}
-        8 | 9 => if !sched::host_root() { return -1; } // EPERM: CAP_WAKE_ALARM
+        8 | 9 => if !sched::caps::host_capable(sched::caps::CAP_WAKE_ALARM) { return -1; } // EPERM
         4 | 5 | 6 => return -95, // EOPNOTSUPP
         _ => return -22,
     }

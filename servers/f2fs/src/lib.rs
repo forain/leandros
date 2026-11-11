@@ -3076,6 +3076,10 @@ fn pcache_thread() -> ! {
         if tick % 10 == 0 {
             mm::pagecache::purge();
             pc_flush_dirty(None, false);
+            // Dirty pages a shared mapping holds never become unmapped in a
+            // long-lived process: write them back too (write-protected
+            // first), every 10 s as Linux's periodic flusher would.
+            if tick % 100 == 0 { pc_flush_dirty(None, true); }
             reap_orphans();
         }
         if tick % 300 == 0 { pc_sweep_orphans(); }
