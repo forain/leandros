@@ -273,6 +273,8 @@ impl Conn {
         let groups = accounts::groups_of(&user);
         let home_c = CString::new(user.home.clone()).map_err(|_| "bad home")?;
         let (uid, gid) = (user.uid, user.gid);
+        let scope = crate::cgsession::prepare(uid, gid);
+        let scope_procs = scope.as_ref().map(|s| s.procs());
 
         let mut cmd = tokio::process::Command::new(&prog);
         cmd.arg0(&argv0).args(&args).env_clear().kill_on_drop(false);
@@ -307,6 +309,9 @@ impl Conn {
             cmd.pre_exec(move || {
                 // Runs in the forked child: syscalls only, nothing allocates.
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                if let Some(p) = &scope_procs {
+                    crate::cgsession::join(p);
+                }
                 if libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -376,6 +381,7 @@ impl Conn {
             let mut reader = tokio::spawn(async move { pump_fd(&rfd, &h, id).await });
             tokio::spawn(async move {
                 let status = child.wait().await;
+                drop(scope);
                 pid_slot.store(0, Ordering::Release);
                 // Drain what the shell wrote before it exited; a background
                 // job still holding the tty must not keep the channel open.
@@ -431,6 +437,7 @@ impl Conn {
             });
             tokio::spawn(async move {
                 let status = child.wait().await;
+                drop(scope);
                 pid_slot.store(0, Ordering::Release);
                 // Output already written must reach the client; a daemon the
                 // command left behind holding the pipes must not hold the

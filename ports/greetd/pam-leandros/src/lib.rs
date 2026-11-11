@@ -301,6 +301,12 @@ pub unsafe extern "C" fn pam_setcred(_pamh: *mut PamHandle, _flags: c_int) -> c_
 #[no_mangle]
 pub unsafe extern "C" fn pam_open_session(pamh: *mut PamHandle, _flags: c_int) -> c_int {
     let h = handle!(pamh, PAM_SYSTEM_ERR);
+    if matches!(h.service.as_deref().map(CStr::to_bytes), Some(b"greetd")) {
+        if let Some(user) = h.user.as_ref() {
+            join_session_cgroup(user);
+        }
+        return PAM_SUCCESS;
+    }
     let switching = matches!(
         h.service.as_deref().map(CStr::to_bytes),
         Some(b"su") | Some(b"su-l") | Some(b"sudo") | Some(b"sudo-i")
@@ -320,6 +326,29 @@ pub unsafe extern "C" fn pam_open_session(pamh: *mut PamHandle, _flags: c_int) -
         }
     }
     PAM_SUCCESS
+}
+
+/// Put the calling process (greetd's session worker, which forks the user's
+/// session) into `/sys/fs/cgroup/user.slice/user-<uid>.slice/session-<pid>.scope`,
+/// owned by the user, as /bin/login does. Best effort: any failure leaves the
+/// session in greetd's cgroup, as before.
+unsafe fn join_session_cgroup(user: &CStr) {
+    use std::os::unix::fs::{chown, DirBuilderExt};
+    let pw = libc::getpwnam(user.as_ptr());
+    if pw.is_null() || (*pw).pw_uid == 0 {
+        return;
+    }
+    let (uid, gid) = ((*pw).pw_uid, (*pw).pw_gid);
+    let slice = format!("/sys/fs/cgroup/user.slice/user-{uid}.slice");
+    if fs::DirBuilder::new().mode(0o755).create(&slice).is_ok() {
+        let _ = chown(&slice, Some(uid), Some(gid));
+        let _ = fs::write(format!("{slice}/cgroup.subtree_control"), "+cpu +io +memory +pids");
+    }
+    let scope = format!("{slice}/session-{}.scope", libc::getpid());
+    if fs::DirBuilder::new().mode(0o755).create(&scope).is_ok() {
+        let _ = chown(&scope, Some(uid), Some(gid));
+        let _ = fs::write(format!("{scope}/cgroup.procs"), "0");
+    }
 }
 
 #[no_mangle]
