@@ -81,6 +81,9 @@ static int lock_try(const char *path, int wr)
     if (fd < 0) return 90;
     struct flock fl = { .l_type = wr ? F_WRLCK : F_RDLCK, .l_whence = SEEK_SET, .l_start = 1073741824, .l_len = 512 };
     int r = fcntl(fd, F_SETLK, &fl);
+    int e = errno;
+    close(fd);
+    errno = e;
     return r == 0 ? 0 : (errno == EAGAIN || errno == EACCES ? 11 : 91);
 }
 
