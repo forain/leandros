@@ -144,6 +144,12 @@ pub fn translate(ns: NsId, path: &[u8]) -> Option<Xlat> {
     walk(&g.get(&ns)?.mnts, path)
 }
 
+/// True when namespace path `ns_path` (normalised, absolute) is exactly the
+/// mountpoint of a non-root mount (Linux: rename/unlink/rmdir give EBUSY).
+pub fn is_mount_root(ns: NsId, ns_path: &[u8]) -> bool {
+    ns_path.len() > 1 && translate(ns, ns_path).map_or(false, |x| x.ns_prefix_len == ns_path.len())
+}
+
 /// Flags of mount `id` in namespace `ns` (0 when unknown).
 pub fn flags_of(ns: NsId, id: u32) -> u8 {
     NS.lock().get(&ns).and_then(|n| n.mnts.iter().find(|m| m.id == id)).map_or(0, |m| m.flags)
