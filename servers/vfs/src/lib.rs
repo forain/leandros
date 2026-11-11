@@ -14606,6 +14606,24 @@ fn fd_note_mnt(pid: u32, fd: usize, ns: u16, mid: u32) {
     }
 }
 
+/// The (mount namespace, mount id) `pid`'s fd was opened through, if recorded.
+pub fn fd_mnt(pid: u32, fd: usize) -> Option<(u16, u32)> {
+    let pid = sched::tgid_of(pid);
+    let ofd = {
+        let mut tbls = TblSlot::new();
+        match find_tbl(pid, &mut tbls) {
+            Some(tbl) if tbl.fds.used(fd) => tbl.fds[fd].ofd,
+            _ => return None,
+        }
+    };
+    ofd::mnt_of(ofd)
+}
+
+/// `(st_dev, st_ino)` out of a filled `struct stat` buffer (same offsets on both ABIs).
+pub fn read_stat_id(stat_ptr: usize) -> (u64, u64) {
+    unsafe { ((stat_ptr as *const u64).read_unaligned(), ((stat_ptr + 8) as *const u64).read_unaligned()) }
+}
+
 /// EROFS when `fd` was opened through a mount that is read-only now.
 fn fd_mnt_ro(pid: u32, fd: usize) -> bool {
     let ofd = {
