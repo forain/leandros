@@ -117,8 +117,12 @@ pub(crate) fn all_sids() -> impl Iterator<Item = Sid> {
 /// The family a wildcard listener on `a` is held to: an AF_INET socket's
 /// 0.0.0.0 never hears a v6 SYN (it did not matter until ::1 existed); `::`
 /// stays dual until IPV6_V6ONLY (L2).
-pub(crate) fn wildcard_family(a: IpAddress) -> Option<IpVersion> {
-    match a { IpAddress::Ipv4(_) if a.is_unspecified() => Some(IpVersion::Ipv4), _ => None }
+pub(crate) fn wildcard_family(a: IpAddress, v6only: bool) -> Option<IpVersion> {
+    match a {
+        IpAddress::Ipv4(_) if a.is_unspecified() => Some(IpVersion::Ipv4),
+        IpAddress::Ipv6(_) if v6only => Some(IpVersion::Ipv6),
+        _ => None,
+    }
 }
 
 fn listen_ep(local: IpEndpoint) -> IpListenEndpoint {
@@ -135,30 +139,30 @@ fn new_arm(set: &mut SocketSet<'static>, ep: IpListenEndpoint, fam: Option<IpVer
 
 /// Put listener `lid` on stack `sid` and arm it. False when the stack does
 /// not exist or the endpoint cannot listen. Takes that stack's lock.
-pub(crate) fn create(sid: Sid, lid: u32, local: IpEndpoint) -> bool {
+pub(crate) fn create(sid: Sid, lid: u32, local: IpEndpoint, v6only: bool) -> bool {
     let mut stack = stack_for(sid);
     let Some(s) = stack.as_mut() else { return false };
     // Idempotent: listen() and a late stack's `adopt` may both get here.
     if s.listens.iter().any(|l| l.lid == lid) { return true; }
     let ep = listen_ep(local);
-    let fam = wildcard_family(local.addr);
+    let fam = wildcard_family(local.addr, v6only);
     let Some(arm) = new_arm(&mut s.socket_set, ep, fam) else { return false };
     s.listens.push(Listen { lid, ep, fam, arm: Some(arm), queue: alloc::vec::Vec::new(), seq: 0, seen: alloc::vec::Vec::new() });
     true
 }
 
 /// Every live listener, for stacks built after it (`latestack`).
-static REGISTRY: Mutex<crate::latestack::Registry<IpEndpoint>> = Mutex::new(crate::latestack::Registry::new());
+static REGISTRY: Mutex<crate::latestack::Registry<(IpEndpoint, bool)>> = Mutex::new(crate::latestack::Registry::new());
 
 /// Record listener `lid` before it is put on the existing stacks.
-pub(crate) fn register(lid: u32, local: IpEndpoint) { REGISTRY.lock().register(lid, local); }
+pub(crate) fn register(lid: u32, local: IpEndpoint, v6only: bool) { REGISTRY.lock().register(lid, (local, v6only)); }
 
 /// Stack `sid` was just built: put every registered listener that belongs
 /// on it there. Returns how many it carries. Caller holds no net lock.
 pub(crate) fn adopt(sid: Sid) -> usize {
     let snap = REGISTRY.lock().snapshot();
-    crate::latestack::adopt(&snap, |local| stacks_for(0, *local).contains(&sid),
-        |lid, local| create(sid, lid, *local),
+    crate::latestack::adopt(&snap, |(local, _)| stacks_for(0, *local).contains(&sid),
+        |lid, (local, v6only)| create(sid, lid, *local, *v6only),
         |lid| REGISTRY.lock().contains(lid),
         |lid| destroy(sid, lid))
 }
@@ -379,7 +383,7 @@ pub(crate) fn proc_listen(w: &mut dyn core::fmt::Write) {
             let _ = writeln!(w, "{} lid {} port {} arm {} queue {}", nm, l.lid, l.ep.port, arm, l.queue.len());
         }
     }
-    for (lid, local) in REGISTRY.lock().snapshot() {
+    for (lid, (local, _)) in REGISTRY.lock().snapshot() {
         let want = stacks_for(0, local);
         let on = want.iter().filter(|sid| have.contains(&(**sid, lid))).count();
         let _ = write!(w, "registered lid {} {} on {}/{}", lid, local, on, want.len());
