@@ -14,7 +14,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **The switch-back CPU charge still takes RUN_QUEUE** (~22.5k holds/s); needs a lock-free `on_cpu` release protocol.
 - **New writers of signal state must call `sig_kick`**; a miss shows as `miss` > 0 in `/proc/rqhold` (invariant, no known violation).
 - **Flakes to root-cause**: `epolltest unrelated_unix_traffic_no_wake` (11% vs 1/8 threshold in a busy session), `sigtest` (?), `mnttest` tfs_* ordering.
-- **Page cache**: dirty `MAP_SHARED` pages stay dirty while mapped writable (no rmap); global `CACHE` lock contention unmeasured.
 - **F2FS fsync is durable only via full checkpoint** (no fsync node log, no NAT/SIT journal); `f2fs.fsync=lazy` trades a ~5 s loss window.
 - **Buddy-slack leak on the ELF loader's eager-to-lazy split** (?); lazy-fault residual ~27 pages/death.
 - **Interrupt-context serial diagnostics can drop under back-pressure** (by design).
