@@ -158,6 +158,7 @@ pub(crate) fn route_select(ns: u16, dst: IpAddress) -> Option<Sid> {
         return v4(dst).and_then(|d| crate::vif::route_in_ns(ns, d));
     }
     if is_loopback(dst) { return Some(LO); }
+    if let IpAddress::Ipv6(a) = dst { return if crate::ip6::is_link_local(&a.0) { None } else { crate::ip6::route(a) }; }
     let d = v4(dst)?;
     let n = netdev::count().min(MAX_NETIF);
     let t = IFRT.lock();
@@ -208,6 +209,7 @@ pub(crate) fn default_sid() -> Option<Sid> {
 
 /// The NIC stack holding `addr`, if any.
 pub(crate) fn holder_of(addr: IpAddress) -> Option<Sid> {
+    if let IpAddress::Ipv6(a) = addr { return crate::ip6::holder_of(a); }
     let a = v4(addr)?;
     let n = netdev::count().min(MAX_NETIF);
     let t = IFRT.lock();
@@ -238,6 +240,7 @@ pub(crate) fn can_route(sid: Sid, dst: IpAddress) -> bool {
         let lo = crate::vif::VIFS.lock()[sid as usize].as_ref().map_or(false, |v| v.kind == crate::vifsel::VifKind::Lo);
         return if lo { is_loopback(dst) } else { v4(dst).is_some() && !is_loopback(dst) };
     }
+    if let IpAddress::Ipv6(a) = dst { return crate::ip6::can_route(sid, a); }
     let Some(d) = v4(dst) else { return false };
     let r = rt(sid - 1);
     match r.cfg {
