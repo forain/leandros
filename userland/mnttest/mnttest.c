@@ -2269,6 +2269,56 @@ static void devbind_suite(void) {
     }
 }
 
+
+/* ── lane mntiso-busy: mount roots are EBUSY, cross-mount ops EXDEV ── */
+static int mb_prep(void) {
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    mkdir("/root", 0700); mkdir("/root/mb", 0755);
+    mkdir("/root/mb/src1", 0755); mkdir("/root/mb/src2", 0755);
+    mkdir("/root/mb/t1", 0755); mkdir("/root/mb/t2", 0755);
+    int fd = open("/root/mb/hostfile", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return 92; if (write(fd, "HOST", 4) < 0) {} close(fd);
+    fd = open("/root/mb/src1/f", O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd >= 0) close(fd);
+    fd = open("/root/mb/src2/g", O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd >= 0) close(fd);
+    fd = open("/root/mb/fbind", O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd >= 0) close(fd);
+    if (mount("", "/", NULL, MS_REC | MS_SLAVE, NULL) < 0) return 93;
+    if (mount("/root/mb/src1", "/root/mb/t1", NULL, MS_BIND, NULL) < 0) return 94;
+    if (mount("/root/mb/src2", "/root/mb/t2", NULL, MS_BIND, NULL) < 0) return 95;
+    fd = open("/root/mb/fmp", O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd >= 0) close(fd);
+    if (mount("/root/mb/hostfile", "/root/mb/fmp", NULL, MS_BIND, NULL) < 0) return 96;
+    return 0;
+}
+static int mb_case(int m) {
+    int r = mb_prep(); if (r) return r;
+    switch (m) {
+    case 0: if (rename("/root/mb/t1", "/root/mb/t1x") == 0 || errno != EBUSY) return 1;
+            return exists("/root/mb/src1/f") && exists("/root/mb/t1/f") ? 0 : 2;
+    case 1: if (unlink("/root/mb/fmp") == 0 || errno != EBUSY) return 1;
+            return exists("/root/mb/hostfile") ? 0 : 2;
+    case 2: if (rmdir("/root/mb/t1") == 0 || errno != EBUSY) return 1;
+            return exists("/root/mb/src1") ? 0 : 2;
+    case 3: if (rename("/root/mb/t1/f", "/root/mb/t2/f2") == 0 || errno != EXDEV) return 1;
+            return exists("/root/mb/src1/f") ? 0 : 2;
+    case 4: if (link("/root/mb/t1/f", "/root/mb/t2/f3") == 0 || errno != EXDEV) return 1;
+            return !exists("/root/mb/src2/f3") ? 0 : 2;
+    case 5: /* same mount still works */
+            if (rename("/root/mb/t1/f", "/root/mb/t1/f4") < 0) return 1;
+            return exists("/root/mb/src1/f4") ? 0 : 2;
+    case 6: { char b[8] = {0}; int fd = open("/root/mb/hostfile", O_RDONLY);
+            if (fd < 0) return 1; if (read(fd, b, 4) < 0) {} close(fd);
+            return !strcmp(b, "HOST") ? 0 : 2; }
+    }
+    return 99;
+}
+static void mntiso_busy_suite(void) {
+    report("busy_rename_bind_root", nn_in_child(mb_case, 0));
+    report("busy_unlink_file_bind", nn_in_child(mb_case, 1));
+    report("busy_rmdir_mountpoint", nn_in_child(mb_case, 2));
+    report("xdev_rename_across_binds", nn_in_child(mb_case, 3));
+    report("xdev_link_across_binds", nn_in_child(mb_case, 4));
+    report("busy_same_mount_rename_ok", nn_in_child(mb_case, 5));
+    report("busy_host_sentinel_intact", nn_in_child(mb_case, 6));
+}
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -2295,6 +2345,7 @@ int main(int argc, char **argv) {
     mro_suite();
     shmbind_suite();
     devbind_suite();
+    mntiso_busy_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
