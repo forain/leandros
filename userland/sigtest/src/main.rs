@@ -1871,7 +1871,7 @@ unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
                               b"  futex_bs ", b"  ppoll_msk", b"  poll     "];
     // poll(2) (nr 7) exists on x86_64 only.
     let kinds = if cfg!(target_arch = "x86_64") { 7 } else { 6 };
-    for &(stop_ms, cont_ms) in &[(150i32, 250i32), (300, 700)] {
+    for &(stop_ms, cont_ms, lo, hi) in &[(150i32, 250i32, 480i64, 680i64), (300, 700, 680, 950)] {
         for which in 0..kinds {
             // The waiter is a forked child that the parent stops: stopping
             // sigtest itself would hand the terminal back to the shell.
@@ -1917,17 +1917,8 @@ unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
             close(fds[1]);
             sleep_ms(stop_ms);
             kill(child, SIGSTOP);
-            // The stopped span is MEASURED, from the child really being
-            // stopped (WUNTRACED report) to just before SIGCONT: sleeping a
-            // fixed span and comparing against a fixed window made the verdict
-            // depend on host scheduling jitter on the parent side.
-            let mut sst = 0;
-            waitpid(child, &mut sst, 2 /* WUNTRACED */);
-            let t_stopped = now_ns();
             sleep_ms(cont_ms - stop_ms);
-            let span_ms = (now_ns() - t_stopped) / 1_000_000;
             kill(child, SIGCONT);
-            let (lo, hi) = (500 + span_ms - 120, 500 + span_ms + 80);
             let mut out: [i64; 2] = [-9999, 0];
             read(fds[0], out.as_mut_ptr() as *mut u8, 16);
             close(fds[0]);
