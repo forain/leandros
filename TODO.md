@@ -49,6 +49,11 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Why Limine leaves RAM above 4 GiB out of the HHDM is unexplained** (`lane-fbmm`); aarch64 has no HHDM gap walker.
 - **Real-PC (RTX 3070) verification deferred ~1 month** (user, 2026-10-24).
 
+### Build / tooling
+- **build-all silently reuses stale container-built ports when Docker is not running** (PipeWire shipped an old sink, lane smallfix 2026-11-11); same class as the buildguard guards: should fail loudly.
+- **A port build failure only warns** (busd link failure → stale busd → misleading staleness error on the box, lane boxbuild); make per-port build failures fatal.
+- **`ports/gstreamer/build.sh` still references the deleted `ports/firefox/build.sh`** (fixed for pipewire in lane smallfix).
+
 ## Missing features
 
 ### Kernel
