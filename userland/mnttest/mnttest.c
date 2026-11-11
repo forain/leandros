@@ -2288,7 +2288,6 @@ static void devbind_suite(void) {
     }
 }
 
-<<<<<<< HEAD
 
 /* ── lane mntiso-busy: mount roots are EBUSY, cross-mount ops EXDEV ── */
 static int mb_prep(void) {
@@ -2339,7 +2338,6 @@ static void mntiso_busy_suite(void) {
     report("busy_same_mount_rename_ok", nn_in_child(mb_case, 5));
     report("busy_host_sentinel_intact", nn_in_child(mb_case, 6));
 }
-=======
 /* ── lane mntiso-chroot: chroot inside a mntns (E4) ───────────────────── */
 /* mode 0: abs link to / , 1: ".." link, 2: exec through an in-jail abs link */
 static int cj_case(int m) {
@@ -2381,7 +2379,6 @@ static void chroot_ns_suite(void) {
     unlink("/root/mntiso-secret");
 }
 
->>>>>>> main
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -2408,11 +2405,8 @@ int main(int argc, char **argv) {
     mro_suite();
     shmbind_suite();
     devbind_suite();
-<<<<<<< HEAD
     mntiso_busy_suite();
-=======
     chroot_ns_suite();
->>>>>>> main
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
