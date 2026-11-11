@@ -12,6 +12,7 @@
 //!   -p  override Port
 
 mod accounts;
+mod cgsession;
 #[path = "../../../lib/shadowhash/shadowhash.rs"]
 mod shadowhash;
 mod session;
