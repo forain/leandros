@@ -97,6 +97,18 @@ pub struct KmsFlip {
     pub busy: fn() -> bool,
     /// Wait (task context, bounded) until not `busy`. False on timeout.
     pub wait_idle: fn(timeout_ns: u64) -> bool,
+    /// `queue` as an ASYNCHRONOUS flip (DRM_MODE_PAGE_FLIP_ASYNC): the new
+    /// surface is scanned out at once, mid-frame (tearing allowed); `ev`
+    /// still completes at the next vblank. `None`: not supported (EINVAL).
+    pub queue_async: Option<fn(token: u32, src_x: u32, src_y: u32, ev: u32) -> Result<(), DriverError>>,
+    /// The hardware vblank counter and the monotonic time of the latest
+    /// vblank start (DRM_IOCTL_WAIT_VBLANK / CRTC_GET_SEQUENCE). `None`: the
+    /// DRM layer's own 60 Hz synthetic counter answers.
+    pub frame: Option<fn() -> (u32, u64)>,
+    /// Task context: sleep until the counter reaches `target` (wrapping
+    /// compare), at most `timeout_ns`; the (counter, time) seen, or `None`
+    /// on timeout.
+    pub wait_frame: Option<fn(target: u32, timeout_ns: u64) -> Option<(u32, u64)>>,
 }
 
 /// Where a cursor image comes from: a backend framebuffer (`token`), or the

@@ -91,14 +91,17 @@ done
 # is why it only appeared when the build first ran on the Linux box.)
 printf '\n[workspace]\n' >> "$SRC/Cargo.toml"
 
+# The repo-root .cargo/config.toml sets link-self-contained=no for musl targets
+# (zig linker wrappers); config rustflags are concatenated, so without the explicit
+# =yes here rust-lld cannot find -lunwind/-lc (box build failure 2026-11-11).
 mkdir -p "$SRC/.cargo"
 cat > "$SRC/.cargo/config.toml" <<'CFG'
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "relocation-model=static"]
+rustflags = ["-C", "relocation-model=static", "-C", "link-self-contained=yes"]
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "relocation-model=static"]
+rustflags = ["-C", "relocation-model=static", "-C", "link-self-contained=yes"]
 CFG
 
 # Cargo target dir shared by all worktrees (cargo locks it), not per checkout.

@@ -5054,7 +5054,7 @@ fn mnt_flag_check(tag: u64, msg: &Message, backing: &[u8], flags: u8) -> Result<
     Ok(())
 }
 
-fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>)
+fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>, mid_out: &mut Option<u32>)
     -> Result<(), i32>
 {
     let (idx, follow) = match spec { Some(s) => s, None => return Ok(()) };
@@ -5080,6 +5080,12 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
         let floor: &[u8] = jail.as_deref().unwrap_or(b"/");
         let rr = ns_resolve_links(ns, &cx.ns_path, follow, floor);
         if let Some((nsp, backing, mid)) = rr? {
+            *mid_out = Some(mid);
+            // A mount root is busy for unlink/rmdir/rename (Linux: EBUSY); the
+            // backing source must never be modified through the mount point.
+            if matches!(msg.tag, VFS_UNLINK | VFS_RMDIR | VFS_RENAME) && mnt::is_mount_root(ns, &nsp) {
+                return Err(-16);
+            }
             let fl = mnt::flags_of(ns, mid);
             if fl & (mnt::MNT_RDONLY | mnt::MNT_NODEV) != 0 { mnt_flag_check(msg.tag, msg, &backing, fl)?; }
             if nsp != cx.ns_path {
@@ -5132,8 +5138,13 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
         let mut b0: Vec<u8> = Vec::new();
         let mut b1: Vec<u8> = Vec::new();
         let mut m = *msg;
-        if let Err(e) = rewrite_one(&mut m, p0, &mut b0) { return err_reply(e); }
-        if let Err(e) = rewrite_one(&mut m, p1, &mut b1) { return err_reply(e); }
+        let (mut i0, mut i1): (Option<u32>, Option<u32>) = (None, None);
+        if let Err(e) = rewrite_one(&mut m, p0, &mut b0, &mut i0) { return err_reply(e); }
+        if let Err(e) = rewrite_one(&mut m, p1, &mut b1, &mut i1) { return err_reply(e); }
+        // rename/link across mounts is EXDEV even when both sit on one volume.
+        if matches!(m.tag, VFS_RENAME | VFS_LINK) {
+            if let (Some(a), Some(b)) = (i0, i1) { if a != b { return err_reply(-18); } }
+        }
         let r = dispatch(&m, caller_pid);
         // Contexts registered for the rewritten buffers die with them (a stale
         // entry would be found again when the allocator reuses the address).

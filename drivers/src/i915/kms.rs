@@ -572,6 +572,20 @@ pub(super) fn prepare(token: u32, src_x: u32, src_y: u32) -> Result<FlipRegs, Dr
     })
 }
 
+/// PLANE_CTL async-flip bit (skl..kbl, bit 9).
+const PLANE_CTL_ASYNC_FLIP: u32 = 1 << 9;
+
+/// Make `r` an asynchronous flip. As Linux's intel_async_flip_check: only a
+/// buffer with the same format/stride/tiling as the one on screen (the
+/// hardware latches PLANE_SURF alone; CTL/STRIDE changes need a vblank).
+pub(super) fn make_async(r: &mut FlipRegs) -> Result<(), DriverError> {
+    let cur = ON_SCREEN.load(Ordering::Acquire);
+    let Some(c) = fb_info(cur) else { return Err(err(EINVAL)) };
+    if c.pitch != r.fb.pitch || c.width != r.fb.width || c.height != r.fb.height { return Err(err(EINVAL)); }
+    r.ctl |= PLANE_CTL_ASYNC_FLIP;
+    Ok(())
+}
+
 /// Has the frame's rendering finished (implicit sync), without waiting?
 pub(super) fn fence_ready(r: &FlipRegs) -> bool { uapi::kms_bo_wait(r.obj, 0) }
 
