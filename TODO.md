@@ -7,38 +7,30 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ## Known bugs
 
 ### Kernel / VFS
-- **Podman churn**: rootless 20x run/rm loops failed 3/4/1 of 20 (cleanup exit 125); root cause was cross-open fcntl/flock keying (`exitrace`, merged) — re-run the churn to confirm it is gone.
-- **`wait4` rusage is not filled**; `majflt` also counts page-cache hits.
-- **Implicit console fd 0/1/2 has no "closed" state**: after `close(1)` writes still reach the console and `fstat` succeeds (Linux: EBADF).
-- **fstat on a pty reports no owner**; pty slave chown is best effort.
-- **Pending AF_UNIX connections whose client closed before `accept` are dropped** (Linux hands them over); closing a listener leaves pending connectors without HUP.
-- **`TFD_TIMER_CANCEL_ON_SET` accepted and ignored.**
+- **Podman rootless pasta churn**: earlier 3/4/1 of 20 failures, unverified after the fcntl lock fix (?).
+- **Pending AF_UNIX connections whose client closed before `accept` are dropped** (Linux hands them over) (?).
 - **Paths below `/proc/self/fd/N` follow the directory's open-time path** (no dentries; no " (deleted)" suffix on readlink).
-- **`uname` release is `1.0.0`**; version-gated programs may guess wrong.
 - **Global scans on last close** of tmpfs/mounted files walk every fd table (O(all fds)); a per-object refcount would retire it and `FD_COPY_GATE`.
-- **TMP_FILES (4096) and AF_UNIX connection pool (512) are fixed system-wide pools.**
-- **epoll_ctl registrations stay per process** and `clone(CLONE_THREAD)` without `CLONE_FILES` still shares the table (fd unshare).
+- **AF_UNIX connection pool (512) is a fixed system-wide pool** (?).
 - **Wake scans are O(parked pollers)**; keyed wake still dereferences each mask match (~11 us per scan). A per-tag index / kbits bloom would fix it.
 - **The switch-back CPU charge still takes RUN_QUEUE** (~22.5k holds/s); needs a lock-free `on_cpu` release protocol.
 - **New writers of signal state must call `sig_kick`**; a miss shows as `miss` > 0 in `/proc/rqhold` (invariant, no known violation).
-- **Flakes to root-cause**: `epolltest unrelated_unix_traffic_no_wake` (11% vs 1/8 threshold in a busy session), `sigtest` (?), nettag2test wake counts, `mnttest` tfs_* ordering, `brtest` back-to-back TIME_WAIT NAT-port precondition.
+- **Flakes to root-cause**: `epolltest unrelated_unix_traffic_no_wake` (11% vs 1/8 threshold in a busy session), `sigtest` (?), `mnttest` tfs_* ordering.
 - **Page cache**: dirty `MAP_SHARED` pages stay dirty while mapped writable (no rmap); global `CACHE` lock contention unmeasured.
 - **F2FS fsync is durable only via full checkpoint** (no fsync node log, no NAT/SIT journal); `f2fs.fsync=lazy` trades a ~5 s loss window.
 - **Buddy-slack leak on the ELF loader's eager-to-lazy split** (?); lazy-fault residual ~27 pages/death.
 - **Interrupt-context serial diagnostics can drop under back-pressure** (by design).
 - **fd-limit fence loss**: EMFILE in a virgl client's submit kills its context (as Linux); fd headroom is the defence.
 - **Host-refused `RING_IDX` submit is never completed by QEMU** (descriptors lost); Mesa cannot reach it. Do not rewrite RING_IDX kernel-side.
-- **tmpfs lookup ~8x slower since a9c4743d** (?).
-- **Pty background-child SIGHUP on su session end** unverified against Linux.
+- **Pty background-child SIGHUP on su session end** unverified against Linux (?).
 
 ### Podman / namespaces / cgroups
-- **`cgroup.freeze` is a stub** (events say frozen, tasks keep running): `podman pause` is not real.
-- **`memfd` without ALLOW_SEALING is not pre-sealed; exe pin not inherited by fork.**
+- **`cgroup.freeze` is delegated but still a stub** (events say frozen, tasks keep running): `podman pause` is not real.
+- **`memfd` exe pin not inherited by fork** (?).
 - **nsfs bind inside a non-init mntns; self-binds not copied into a new mntns.**
-- **netns**: SETLINK move of an existing link; netlink NEWLINK/ADDR/ROUTE on taps and TCP over a tap in a netns (`tundev2`).
+- **netns**: SETLINK move of an existing link; TCP over a tap in a netns (?).
 - **fchmod/fchown/futimens on fds of an ro mount** are not refused.
 - **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
-- **idlow LOW batch** from the idmap review (see `lane-idflip-2026-11-10.md`); no explicit named-ACL-entry permission-grant test case.
 - **mntunshare is not an isolation boundary for root-run workloads** (M6).
 - **rename on devfs unsupported.**
 - **Redundant `local_loop` case in podpasta** (duplicate of `loop_own`); podpastatest `bridge_ip` has no httpd in Alpine (now an nc loop) and leaks a baseline mount.
@@ -46,7 +38,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ### Network
 - **No IPv6 / AF_INET6** (sshd `[::]:22` fails with EAFNOSUPPORT; podman IPv6 deferred).
-- **UDP/IP gaps**: no `IP_RECVERR`, no `IP_PKTINFO` on sendmsg, no PMTUD, no IGMPv3/SSM, no IP fragmentation/reassembly, `SO_BROADCAST` not enforced, ephemeral ports lowest-free (Linux randomizes), `connect(AF_UNSPEC)` quirks (UDP keeps bind(0) port; TCP takes the AF_UNIX path).
+- **UDP/IP gaps**: no PMTUD, no IGMPv3/SSM, no IP fragmentation/reassembly (?), `connect(AF_UNSPEC)` quirks (UDP keeps bind(0) port; TCP takes the AF_UNIX path).
 - **Real NIC drivers program no multicast filter** (mDNS works only in QEMU).
 - **Inet listeners report no tag**, so sshd parks with a broadcast mask.
 - **iwlwifi gaps**: later-beacon WMM changes ignored, STATISTICS_NOTIFICATION ignored, antennas only toggled on failure; TX MIMO/STBC/short GI on 5 GHz untested; 2.4 GHz poor (36% AP retries); sparse pings lose 1-4%.
@@ -57,7 +49,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ### Desktop / GPU / COSMIC
 - **Venus/Vulkan**: ISR path unwired, virtgpu `FENCE_FD_IN`/`in_syncobjs`/`out_syncobjs` not honoured, cross-open dmabuf import deferred (`artifacts/notes/m9-crossopen-dmabuf/`), aarch64 vkwl untested.
-- **i915**: cursor 64x64 only, approximate watermarks, no async flips, no real `WAIT_VBLANK`, no `IN_FENCE_FD`, 8 MB clflush per non-PRIME scanout flip.
+- **i915**: cursor 64x64 only, no async flips, no real `WAIT_VBLANK`, no `IN_FENCE_FD`.
 - **Laptop**: low FPS under COSMIC; Firefox on iris unproven; Wi-Fi link still weak on 2.4 GHz.
 - **x86 audio clipping** in DOOM/PipeWire (lane/doomvis).
 - **PipeWire sink is named "Virtio Sound Output"** whatever the backend (HDA on the PC shows that name).
@@ -68,7 +60,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **x86_64/TCG COSMIC settle timing is stale** — re-measure (clock fixed 2026-09-16).
 
 ### Hardware (laptop / PC / Pi)
-- **USB hubs unsupported** (keyboard dead behind a hub on the PC); stick write commands of 0.5-1.3 s are hidden, not removed.
+- **Stick write commands of 0.5-1.3 s are hidden, not removed** (USB hubs now supported, usbhot2).
 - **Why Limine leaves RAM above 4 GiB out of the HHDM is unexplained** (`lane-fbmm`); aarch64 has no HHDM gap walker.
 - **Real-PC (RTX 3070) verification deferred ~1 month** (user, 2026-10-24).
 
@@ -83,13 +75,12 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ## Missing features
 
 ### Kernel
-- **Real cgroup freezer**; inotify L2/L3 (beyond the default-on L1); IPv6 stack.
+- **Real cgroup freezer**; inotify L2/L3 (beyond the default-on L1).
 - **Interrupt paths**: virtio keyboard/blk/net/snd and the aarch64 GPU control queue are still polled (INTx via GIC SPI is the aarch64 step).
 - **Synthetic sysfs**: only `/sys/class/block` (+ cgroup/kernel paths); `/sys/dev/char`, `/sys/class/drm`, `/sys/class/input` per `docs/design/k4-drm-design.md` deferred.
 - **utmpx/wtmp/lastlog**: unimplemented; establish a consumer (`who`, `w`, `last`) first.
 - **Replace the C `libpam.so.0` shim** with a Rust cdylib or Linux-PAM (decision open; guard must show wrong passwords rejected).
 - **VT console**: TAB advance and double-width glyphs.
-- **UDP cmsgs**: `IP_PKTINFO`, `IP_RECVTOS`, `UDP_GRO`.
 - **sshd**: privilege separation, `authorized_keys` options, keyboard-interactive, forwarding, MaxStartups, utmp/lastlog; password hashes are single-pass salted SHA-256.
 
 ### Network / Wi-Fi
