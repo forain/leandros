@@ -3,6 +3,8 @@
  * (/proc/mntselftest) and ns-0 invariants. Output: "case: PASS|FAIL|SKIP". */
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -2379,6 +2381,116 @@ static void chroot_ns_suite(void) {
     unlink("/root/mntiso-secret");
 }
 
+/* ── lane mntiso-entry: exec PT_INTERP, AF_UNIX and mount bind source follow ns links (E2) ── */
+/* A minimal ELF that exits with `code`; `interp` (or NULL) becomes PT_INTERP. */
+static int ce_write_elf(const char *path, int code, const char *interp) {
+    unsigned char b[512]; memset(b, 0, sizeof b);
+    int dyn = interp == NULL;                  /* the loader is ET_DYN, the program ET_EXEC */
+    int nph = interp ? 2 : 1, phoff = 64, ioff = 64 + 56 * nph;
+    int cstart = interp ? ioff + (int)strlen(interp) + 1 : ioff;
+    cstart = (cstart + 7) & ~7;
+    unsigned char code_b[16]; int clen;
+#if defined(__x86_64__)
+    code_b[0] = 0xBF; code_b[1] = code; code_b[2] = code_b[3] = code_b[4] = 0;
+    code_b[5] = 0xB8; code_b[6] = 60; code_b[7] = code_b[8] = code_b[9] = 0; code_b[10] = 0x0F; code_b[11] = 0x05; clen = 12;
+#else
+    unsigned w[3] = { 0xD2800000u | ((unsigned)code << 5), 0xD2800BA8u, 0xD4000001u };
+    memcpy(code_b, w, 12); clen = 12;
+#endif
+    long base = dyn ? 0 : 0x400000;
+    memcpy(b, "\177ELF", 4); b[4] = 2; b[5] = 1; b[6] = 1;
+    *(uint16_t *)(b + 16) = dyn ? 3 : 2;
+#if defined(__x86_64__)
+    *(uint16_t *)(b + 18) = 62;
+#else
+    *(uint16_t *)(b + 18) = 183;
+#endif
+    *(uint32_t *)(b + 20) = 1;
+    *(uint64_t *)(b + 24) = base + cstart;     /* e_entry */
+    *(uint64_t *)(b + 32) = phoff;
+    *(uint16_t *)(b + 52) = 64; *(uint16_t *)(b + 54) = 56; *(uint16_t *)(b + 56) = nph;
+    int total = cstart + clen;
+    unsigned char *ph = b + phoff;
+    if (interp) {
+        *(uint32_t *)(ph) = 3; *(uint32_t *)(ph + 4) = 4;       /* PT_INTERP, R */
+        *(uint64_t *)(ph + 8) = ioff; *(uint64_t *)(ph + 16) = base + ioff; *(uint64_t *)(ph + 24) = base + ioff;
+        *(uint64_t *)(ph + 32) = strlen(interp) + 1; *(uint64_t *)(ph + 40) = strlen(interp) + 1; *(uint64_t *)(ph + 48) = 1;
+        ph += 56;
+        memcpy(b + ioff, interp, strlen(interp) + 1);
+    }
+    *(uint32_t *)(ph) = 1; *(uint32_t *)(ph + 4) = 5;            /* PT_LOAD, R+X */
+    *(uint64_t *)(ph + 8) = 0; *(uint64_t *)(ph + 16) = base; *(uint64_t *)(ph + 24) = base;
+    *(uint64_t *)(ph + 32) = total; *(uint64_t *)(ph + 40) = total; *(uint64_t *)(ph + 48) = 0x1000;
+    memcpy(b + cstart, code_b, clen);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (fd < 0) return -1;
+    int ok = write(fd, b, total) == total;
+    close(fd); chmod(path, 0755);
+    return ok ? 0 : -1;
+}
+/* mode 0: PT_INTERP abs link, 1: AF_UNIX connect abs link, 2: mount --bind source abs link,
+   3: AF_UNIX bind through an abs-link directory */
+static int ce_case(int m) {
+    mkdir("/tmp/cem", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    if (mount("tmpfs", "/tmp/cem", "tmpfs", 0, NULL) < 0) return 92;
+    chmod("/tmp/cem", 0755);
+    mkdir("/tmp/cem/sub", 0755); chmod("/tmp/cem/sub", 0755);
+    if (m == 0) {
+        if (ce_write_elf("/tmp/cem/sub/ldx", 43, NULL) < 0) return 93;      /* the in-root loader */
+        if (ce_write_elf("/tmp/cem/sub/prog", 41, "/ldl") < 0) return 94;
+        if (symlink("/ldx", "/tmp/cem/sub/ldl") < 0) return 95;
+    } else if (m == 1) {
+        if (symlink("/root/mntiso.sock", "/tmp/cem/sub/l") < 0) return 93;
+    } else if (m == 2) {
+        mkdir("/tmp/cem/sub/root", 0755); mkdir("/tmp/cem/sub/mnt", 0755);
+        int f = open("/tmp/cem/sub/root/inroot", O_WRONLY | O_CREAT, 0644); if (f >= 0) close(f);
+        if (symlink("/root", "/tmp/cem/sub/l") < 0) return 93;
+    } else {
+        if (symlink("/root", "/tmp/cem/sub/d") < 0) return 93;
+        mkdir("/tmp/cem/sub/root", 0755);
+    }
+    if (chroot("/tmp/cem/sub") < 0 || chdir("/") < 0) return 99;
+    if (m == 0) {
+        pid_t p = fork();
+        if (p == 0) { execl("/prog", "/prog", (char *)0); _exit(99); }
+        int st = 0; waitpid(p, &st, 0);
+        return WIFEXITED(st) && WEXITSTATUS(st) == 43 ? 0 : 10 + (WIFEXITED(st) ? WEXITSTATUS(st) : 0);
+    }
+    if (m == 1 || m == 3) {
+        struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
+        strcpy(a.sun_path, m == 1 ? "/l" : "/d/mntiso-bound.sock");
+        int s = socket(AF_UNIX, SOCK_STREAM, 0); if (s < 0) return 96;
+        int r = m == 1 ? connect(s, (struct sockaddr *)&a, sizeof a) : bind(s, (struct sockaddr *)&a, sizeof a);
+        close(s);
+        if (m == 1) return r < 0 ? 0 : 11;
+        /* bind must have created the node inside the jail's /root, not the host's */
+        return r == 0 && access("/root/mntiso-bound.sock", F_OK) == 0 ? 0 : 12;
+    }
+    if (mount("/l", "/mnt", NULL, MS_BIND, NULL) < 0) return 97;
+    if (access("/mnt/mntiso-secret", F_OK) == 0) return 11;
+    return access("/mnt/inroot", F_OK) == 0 ? 0 : 12;
+}
+static void entry_ns_suite(void) {
+    mkdir("/root", 0755);
+    int f = open("/root/mntiso-secret", O_WRONLY | O_CREAT, 0644);
+    if (f >= 0) { if (write(f, "HOST", 4) != 4) {} close(f); }
+    ce_write_elf("/ldx", 44, NULL);                                          /* the host's loader */
+    int ls = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
+    strcpy(a.sun_path, "/root/mntiso.sock");
+    unlink(a.sun_path);
+    if (ls >= 0 && (bind(ls, (struct sockaddr *)&a, sizeof a) < 0 || listen(ls, 4) < 0)) { close(ls); ls = -1; }
+    report("interp_abs_link_in_root", nn_in_child(ce_case, 0));
+    report("unix_connect_abs_link", ls >= 0 && nn_in_child(ce_case, 1));
+    report("bind_src_abs_link", nn_in_child(ce_case, 2));
+    report("unix_bind_abs_link_dir", nn_in_child(ce_case, 3));
+    report("unix_bind_host_node_absent", access("/root/mntiso-bound.sock", F_OK) != 0);
+    if (ls >= 0) close(ls);
+    unlink("/root/mntiso.sock"); unlink("/root/mntiso-bound.sock"); unlink("/root/mntiso-secret"); unlink("/ldx");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -2407,6 +2519,7 @@ int main(int argc, char **argv) {
     devbind_suite();
     mntiso_busy_suite();
     chroot_ns_suite();
+    entry_ns_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
