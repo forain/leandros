@@ -102,6 +102,10 @@ Evaluation runs with interrupts masked (the kernel is not preemptible), which wi
 
 Firefox's sandboxes (content, GMP, RDD, socket, utility) are **on by default** (`LEANDROS_FIREFOX_SANDBOX=0` in `firefox.sh` turns them off). Each child is created with user, net and (for content/utility/socket) IPC namespaces, the void chroot and a seccomp filter; the parent and fork server are unsandboxed by design. The acceptance harness [`ffsandbox.py`](../../.claude/skills/run-leandros/ffsandbox.py) prints per-process `Seccomp`, `NoNewPrivs`, root and namespace differences and exits non-zero unless every child shows `Seccomp: 2` with no sandbox error lines. Features added for it: `/proc/<pid>/fdinfo`, `SECCOMP_*` status lines, thread-group `TSYNC`, pidns magic-link translation, and `/etc/ld.so.conf` and `/etc/localtime` on disk (the sandbox policy reads them).
 
+## Mount namespace as an isolation boundary
+
+A mount namespace confines root-run workloads: backing paths are resolved in namespace space, filesystems never follow a symlink inside a ns-resolved call (`VFS_ELINKRACE`, redone twice, then `ELOOP`), chroot/`..` clamp at the task root, mount roots and mountpoints are `EBUSY` for rename/unlink/rmdir, and `/proc/self/fd/N` reopens use the fd's mount. Bind mounts are **pinned**: the root of a bind records `(st_dev, st_ino)` at mount time and, after any name-changing op (`rename`, `unlink`, `rmdir`, `symlink`; global `NAME_GEN`), the next ns-resolved call crossing that mount re-stats the root once and fails with `ESTALE` if the identity changed. Documented deviations from Linux: `ESTALE` where Linux keeps following the old dentry, `ELOOP` for a link race, and `/proc/<pid>/{root,cwd}` across mount namespaces stays `EACCES`. Namespace 0 is untouched. Test: `mnttest` `bindpin_*`.
+
 ## Limitations and open work
 
 - Net, IPC and UTS share one slot class, so `hold_checked` cannot tell them apart.

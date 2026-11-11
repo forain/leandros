@@ -20,7 +20,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ### Podman / namespaces / cgroups
 - ~~**Unconverted `host_root()` privilege checks**~~ DONE (capaudit 2026-11-11 + capvfs 2026-11-11: tmpfs/f2fs chown/chmod/DAC/xattr now use the task's real caps in ns 0; only mount-root gates keep `Cred.host_root` = full-cap init-ns root; sys_secprobe/dbg_serial/spawn stay kernel-private).
 - **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
-- **mntunshare is not an isolation boundary for root-run workloads** (M6).
+- ~~**mntunshare is not an isolation boundary for root-run workloads** (M6)~~ DONE (mntiso chroot/busy/procfd/entry/strict/bindpin 2026-11-11; the remaining reopen hint is the E7 line above).
 
 ### Network
 - **IPv6 beyond loopback** (L1 ::1 and L2 dual-stack/V6ONLY/v4-mapped done, sshd listens on `[::]:22`; no NIC/SLAAC/neighbour discovery, netns, podman IPv6 yet: design-ipv6 L3+).
