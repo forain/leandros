@@ -46,9 +46,21 @@ static int child(void)
     return 1;
 }
 
+/* The exe pin must follow a fork: the forked copy of the memfd image still
+ * sees its own /proc/self/exe as the sealed memfd (Linux: same mm exe_file). */
+static int forkchild(void)
+{
+    pid_t q = fork();
+    if (q == 0) _exit(child());
+    int st = 0;
+    waitpid(q, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+}
+
 int main(int argc, char **argv, char **envp)
 {
     if (argc > 1 && !strcmp(argv[1], "child")) return child();
+    if (argc > 1 && !strcmp(argv[1], "forkchild")) return forkchild();
 
     // 1: not already sealed
     int self = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
@@ -107,6 +119,17 @@ int main(int argc, char **argv, char **envp)
     waitpid(p, &stt, 0);
     errno = WIFEXITED(stt) ? WEXITSTATUS(stt) : -1;
     ok("fexecve_memfd_child_ok", WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+
+    // 5b: a fork of the memfd image keeps the exe pin
+    p = fork();
+    if (p == 0) {
+        char *av[] = {"memfdtest", "forkchild", NULL};
+        syscall(SYS_execveat, m, "", av, envp, AT_EMPTY_PATH);
+        _exit(111);
+    }
+    waitpid(p, &stt, 0);
+    errno = WIFEXITED(stt) ? WEXITSTATUS(stt) : -1;
+    ok("memfd_exe_pin_inherited_by_fork", WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
 
     // 6: exec via /proc/self/fd/N
     char path[64];
