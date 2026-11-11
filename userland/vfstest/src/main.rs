@@ -33,6 +33,12 @@ use leandros_libc::syscall::{syscall1, syscall2, syscall3, syscall4, syscall5};
 #[cfg(target_arch = "aarch64")] const SYS_RENAMEAT2: usize = 276;
 #[cfg(target_arch = "x86_64")]  const SYS_RENAMEAT2: usize = 316;
 const RENAME_NOREPLACE: usize = 1;
+#[cfg(target_arch = "aarch64")] const SYS_LINKAT: usize = 37;
+#[cfg(target_arch = "x86_64")]  const SYS_LINKAT: usize = 265;
+unsafe fn link(old: *const u8, new: *const u8) -> i32 {
+    let r = syscall5(SYS_LINKAT, AT_FDCWD as usize, old as usize, AT_FDCWD as usize, new as usize, 0);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
 
 /// Change the process's filesystem root. Irreversible for the calling
 /// process, so callers that need to keep operating outside the jail must
@@ -1111,7 +1117,7 @@ unsafe fn test_devfs_rename() -> bool {
     let fd = open(full2, O_WRONLY, 0);
     let new_ok = fd >= 0;
     if new_ok { close(fd); }
-    let old_gone = open(full, O_WRONLY, 0) == -1 && get_errno() == ENOENT;
+    let old_gone = open(full, O_WRONLY, 0) == -1 && get_errno() == 2;
     // Hard link: a second name for the same node, then drop it.
     let link_ok = link(full2, full3) == 0 && { let f = open(full3, O_WRONLY, 0); if f >= 0 { close(f); true } else { false } };
     let unl_ok = unlink(full3) == 0 && open(full3, O_WRONLY, 0) == -1;
