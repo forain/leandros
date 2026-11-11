@@ -139,6 +139,15 @@ unsafe fn daemon(fd: i32) -> ! {
             10 => { // UNLINK
                 match find(&body[..body.len() - 1]) { Some(i) => FILES[i].used = false, None => err = -2 }
             }
+            12 => { // RENAME: newdir u64, oldname\0, newname\0
+                let names = &body[8..];
+                let z = names.iter().position(|&c| c == 0).unwrap_or(0);
+                let (on, nn) = (&names[..z], &names[z + 1..names.len() - 1]);
+                match find(on) {
+                    Some(i) if nn.len() < 32 => { FILES[i].nlen = nn.len(); FILES[i].name[..nn.len()].copy_from_slice(nn); }
+                    _ => err = -2,
+                }
+            }
             17 => { p64(&mut out[16..], 0, 100); p64(&mut out[16..], 8, 50); p64(&mut out[16..], 16, 50); p32(&mut out[16..], 40, 4096); p32(&mut out[16..], 44, 255); blen = 80; }
             _ => err = -38,
         }
@@ -236,6 +245,19 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     let u = unlink(b"/tmp/fusemnt/new.txt\0".as_ptr());
     verdict(b"unlink", u == 0 && stat_mode_size(b"/tmp/fusemnt/new.txt\0").is_none());
 
+    // An open file's /proc/self/fd/N link follows rename and unlink.
+    let c = open(b"/tmp/fusemnt/mv.txt\0".as_ptr(), O_WRONLY | O_CREAT, 0o644);
+    let mut lb = [0u8; 128];
+    let l1 = fdlink(c, &mut lb);
+    verdict(b"fd_link_opened_path", l1 == b"/tmp/fusemnt/mv.txt");
+    let rr = rename(b"/tmp/fusemnt/mv.txt\0".as_ptr(), b"/tmp/fusemnt/mv2.txt\0".as_ptr());
+    let l2 = fdlink(c, &mut lb);
+    verdict(b"fd_link_follows_rename", rr == 0 && l2 == b"/tmp/fusemnt/mv2.txt");
+    unlink(b"/tmp/fusemnt/mv2.txt\0".as_ptr());
+    let l3 = fdlink(c, &mut lb);
+    verdict(b"fd_link_deleted_suffix", l3 == b"/tmp/fusemnt/mv2.txt (deleted)");
+    if c >= 0 { close(c); }
+
     // statfs-free sanity: mount shows up
     let mut listed = false;
     let cnt = devinfo::mounts_count().max(0) as usize;
@@ -253,6 +275,19 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     verdict(b"umount", r == 0);
     verdict(b"umount_gone", stat_mode_size(b"/tmp/fusemnt/hello\0").is_none());
     0
+}
+
+#[cfg(target_arch = "aarch64")] const SYS_READLINKAT: usize = 78;
+#[cfg(target_arch = "x86_64")]  const SYS_READLINKAT: usize = 267;
+/// readlink("/proc/self/fd/<fd>") into `out`; the link text (empty on error).
+unsafe fn fdlink(fd: i32, out: &mut [u8]) -> &[u8] {
+    let mut p = *b"/proc/self/fd/\0\0\0\0\0\0\0\0";
+    let mut n = 14; let mut d = [0u8; 8]; let mut di = 0; let mut v = fd.max(0) as usize;
+    if v == 0 { d[0] = b'0'; di = 1; }
+    while v > 0 { d[di] = b'0' + (v % 10) as u8; di += 1; v /= 10; }
+    while di > 0 { di -= 1; p[n] = d[di]; n += 1; }
+    let r = syscall4(SYS_READLINKAT, AT_FDCWD as usize, p.as_ptr() as usize, out.as_mut_ptr() as usize, out.len());
+    if r < 0 { &out[..0] } else { &out[..r as usize] }
 }
 
 unsafe fn kill_child(pid: i32) {

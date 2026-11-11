@@ -76,3 +76,11 @@ This handbook describes the current design; dated history goes in [history](../o
 - [Workflow](workflow.md)
 - [Testing](testing.md)
 - [Design principles](../overview/design-principles.md)
+
+## Two artifact trees
+
+`artifacts/` in the repository is the tracked tree: notes, small tools and the sources of staged payloads. `~/code/leandros-artifacts` is an unversioned host directory beside the checkout; the image build reads its prebuilt blobs from there (`m4-input-ship`, `m3-gl-stack`, `m5-session-ship`, `s1-musl-spike`, ...) and the orchestration scripts live in its `orch/`. Neither tree is a superset: as of 2026-11-11 about 1,000 paths exist only in each, and seven shared files differ (`driver_nobreak.py`, the two `m5-session-ship/*/usr/share/dbus-1/session.conf`, `m6-session-bins/build-greeter.sh`, `m6-session-data/{m12c-input,m4-vkwl,start-cosmic-leandros}`). The rule: the repository copy is canonical for anything the build verifies against tracked sources (the D-Bus staging check in `mkfs-f2fs-populated.py` compares against `ports/`); the host directory is canonical for binary blobs, which are never committed. Diff the two before trusting either (`diff -rq ~/code/leandros-artifacts artifacts`).
+
+## Build guards
+
+The image build fails (it does not warn) when `libseat.so.1`, `libudev.so.1`, `/bin/brush` or `/bin/coreutils` cannot be staged, and `build-all.sh` fails when the `../crossterm` sibling that brush needs is absent. `LEANDROS_ALLOW_PARTIAL_IMAGE=1` downgrades the image checks to warnings for kernel-only work. `/bin/wl-globals` is a measurement tool nothing depends on; its absence is logged as a note. A bare `cargo build` of a musl-linked test now gets `-C relocation-model=static` from `.cargo/config.toml`.

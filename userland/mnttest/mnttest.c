@@ -2043,6 +2043,24 @@ static int mro_openfd_keeps_writing(int m) {
     errno = 0; if (open("/tmp/mrc/f", O_RDWR) >= 0 || errno != EROFS) return 15;
     return 0;
 }
+/* fchmod/fchown/futimens on an fd opened through a read-only mount: EROFS
+ * (also when the mount turns read-only after the open, as Linux mnt_want_write). */
+static int mro_fd_attr(int m) {
+    (void)m;
+    int r = mro_setup(); if (r) return r;
+    int fd = open("/tmp/mrb/f", O_RDONLY); if (fd < 0) return 10;
+    errno = 0; if (fchmod(fd, 0600) == 0 || errno != EROFS) { printf("  fchmod errno=%d\n", errno); return 11; }
+    errno = 0; if (fchown(fd, 5, 5) == 0 || errno != EROFS) { printf("  fchown errno=%d\n", errno); return 12; }
+    struct timespec ts[2] = {{1, 0}, {1, 0}};
+    errno = 0; if (futimens(fd, ts) == 0 || errno != EROFS) { printf("  futimens errno=%d\n", errno); return 13; }
+    close(fd);
+    /* the rw original stays changeable */
+    fd = open("/tmp/mro/f", O_RDONLY); if (fd < 0) return 20;
+    if (fchmod(fd, 0600) < 0) { printf("  rw fchmod errno=%d\n", errno); return 21; }
+    if (futimens(fd, ts) < 0) return 22;
+    close(fd);
+    return 0;
+}
 static int mro_noexec(int m) {
     (void)m;
     mkdir("/tmp/mrx", 0755); mkdir("/tmp/mry", 0755);
@@ -2113,6 +2131,7 @@ static void mro_suite(void) {
     report("mntnosuid_bind_ignores_setuid", nn_in_child(mns_nosuid_bind, 0));
     report("mntro_ro_bind_erofs", nn_in_child(mro_erofs, 0));
     report("mntro_rw_fd_survives_remount_ro", nn_in_child(mro_openfd_keeps_writing, 0));
+    report("mntro_fd_attr_erofs", nn_in_child(mro_fd_attr, 0));
     report("mntro_noexec_eacces", nn_in_child(mro_noexec, 0));
     report("mntro_nodev_eacces", nn_in_child(mro_nodev, 0));
 }
