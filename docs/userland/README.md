@@ -26,6 +26,7 @@ accounts, `/etc` files, icon themes and desktop entries are seeded.
 |---|---|
 | [libc.md](libc.md) | `leandros-libc`, musl (static and dynamic), and how pthreads are layered between kernel and libc |
 | [programs.md](programs.md) | every program in the image: init, login, the shells, utilities, coreutils, and where the tests are documented |
+| [containers.md](containers.md) | rootless and root `podman` (crun, conmon, netavark, pasta): what the kernel provides, shipped configuration, networking modes, tests |
 | [ports.md](ports.md) | the `ports/` directory — one entry per port with its recipe and design notes — plus Firefox, brush, DOOM, MAME and disks-rs |
 
 ## Design decisions

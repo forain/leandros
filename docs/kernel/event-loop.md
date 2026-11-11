@@ -104,7 +104,7 @@ All four are VFS objects in global, refcounted pools (refcounted so a `dup`'d fd
 - **eventfd** (`MAX_EVENTFDS` = 1024): a counter plus a per-slot `seq` bumped on every write, which is what lets mio's never-drained `EPOLLET` waker re-fire once per `wake()`. `EFD_SEMAPHORE` is not implemented.
 - **timerfd** (256 slots): see [time.md](time.md#timerfd).
 - **signalfd**: reports `POLLIN` while a masked signal is pending (thread or process level); a read dequeues each pending masked signal as a 128-byte `signalfd_siginfo` with `ssi_signo`, `ssi_code`, `ssi_pid`, `ssi_uid` and `ssi_status` taken from the same `SigInfo` a handler would get, so reaping children through a signalfd and through a `SIGCHLD` handler see the same death. `ufd == -1` creates; otherwise the named signalfd's mask is replaced — on its open file description (`SIGFD_MASKS`, keyed by the ofd id the vnode carries), so dup'd, forked and SCM_RIGHTS copies all read with the new mask, as on Linux. Process-directed signals queue on the leader's shared set, so a signalfd read on any thread sees them (lane epollsig).
-- **inotify**: a valid fd that accepts watches (returning fake watch descriptors ≥ 1) and never delivers events. It exists to keep config-watch sources (cosmic-settings-daemon, `notify::Watcher`) quiet in an event loop; there is no live reload. `IN_CLOEXEC` matters: dropping it leaked every config-watch inotify fd across `execve` and filled late children's fd tables (the cosmic-greeter `EMFILE` crash loop).
+- **inotify**: real since the `vfs.inotify` work and on by default (`vfs.inotify=0` disables it); tmpfs directory events wake a keyed poll tag per instance. See [../servers/vfs.md](../servers/vfs.md#inotify). `IN_CLOEXEC` matters: dropping it leaked every config-watch inotify fd across `execve` and filled late children's fd tables (the cosmic-greeter `EMFILE` crash loop).
 
 Dropping `O_NONBLOCK` on any of these is not a cosmetic bug: a read that would return `EAGAIN` on a fd the kernel thinks is blocking yield-spins in the kernel's generic blocking read loop, pinning the caller's thread there instead of letting its event loop poll other fds.
 
@@ -153,7 +153,7 @@ Laptop playback censuses (lanes deskplay, playcost, panelwake, percpu, epnameles
 
 - **`ELOOP` for epoll cycles and the `EPOLLEXCLUSIVE` `EINVAL` rules** are not implemented (cycles are bounded by the nesting depth instead).
 - **`CLOSE_RANGE_UNSHARE`** is a no-op: exact for a single-threaded caller, but in a multithreaded caller the siblings see the closes.
-- inotify never delivers events.
+- inotify delivers events only for tmpfs directory entries; watches elsewhere never fire.
 - `EFD_SEMAPHORE` is not implemented.
 - A queued `SCM_RIGHTS` *socket* (as opposed to a VFS description) reports nothing until received; its probe contributes the broadcast tag meanwhile, so no wake is lost.
 - Pipes have a 16 KiB ring (Linux: 64 KiB).

@@ -51,7 +51,7 @@ Three login paths exist, all supervised and respawned by PID 1 ([`userland/init`
 - Each task carries real, effective and saved uid and gid plus up to 32 supplementary groups. All are copied by `fork` and `clone` and survive `execve`. Any new per-task security property must be added both to the task constructors and to the inheritance paths in `sched/src/clone.rs` (`fork_current`, `clone_thread`); missing the latter lets every `fork()` escape.
 - `setresuid`/`setresgid` are real (relibc's `setuid()` routes through them — they were once accept-and-ignore, so libc `setuid` silently kept root), as are `setreuid`/`setregid` with Linux's rules, `setuid`/`setgid`, `getres*id`, and `setgroups` (root only → `EPERM`; more than 32 → `EINVAL`) / `getgroups`.
 - `umask` is applied kernel-side in `openat`/`mkdirat` and inherited across `fork`. When a parent directory has a default ACL the umask is *not* applied (Linux `posix_acl_create`), so it travels with the create request and each filesystem applies it through the shared `xattr::acl_create`.
-- `execve` honours the set-user-ID and set-group-ID bits (and `PR_SET_NO_NEW_PRIVS`). The set-user-ID root programs in the image are `/bin/su` and `/bin/sudo` (below) and the in-guest CLI launcher described in [../userland/ports.md](../userland/ports.md). There are no capability sets: privilege is "euid 0" (`capget` reports bits 0..40 for euid 0 and none otherwise; a root `capset` drop is accepted but has no effect).
+- `execve` honours the set-user-ID and set-group-ID bits (and `PR_SET_NO_NEW_PRIVS`). The set-user-ID root programs in the image are `/bin/su` and `/bin/sudo` (below) and the in-guest CLI launcher described in [../userland/ports.md](../userland/ports.md). Capabilities are real, per thread (effective, permitted, inheritable, bounding, ambient): `capset` drops take effect and are inherited, and sandbox-relevant gates (`chroot`, namespace creation, mounts, network configuration) ask `ns_capable`. Most legacy host-wide checks remain "euid 0 in the initial user namespace" (`host_capable`); see [../kernel/namespaces.md](../kernel/namespaces.md#capabilities-and-host-root).
 
 ## Filesystem permission enforcement
 
@@ -95,6 +95,10 @@ Measured against a Linux host with the same test program (`userland/privtest`, w
 
 `chroot(2)` is real confinement, not a path prefix. The kernel resolver anchors absolute paths at the jail root and clamps `..` at it; f2fs and tmpfs re-anchor absolute symlink targets at the jail root; dirfd paths are translated back into the jail's view. A symlink inside a jail pointing above it (`chroot /home/jail`, link → `/above`) stays inside. See [vfs.md](vfs.md#path-resolution).
 
+### Sandboxing and containers
+
+User, PID, mount, network, UTS, IPC and cgroup namespaces, seccomp-BPF, `no_new_privs`, non-identity uid/gid maps (default; `idmap=off` opts out) and the ptrace/dumpable gate for `/proc/<pid>/ns` and `environ` are implemented; the model and the access rules are in [../kernel/namespaces.md](../kernel/namespaces.md). Two rules matter for this page: permission checks on a file compare the caller's capability *over the inode* in the caller's user namespace (an unmapped owner makes create `EOVERFLOW`), and `mount`, `umount2`, `pivot_root` and `chroot` need the capability over the owner of the *namespace they act on*, not just root. Do not loosen a gate to make a program run; compare with the Linux function (`ptrace_may_access`, `ns_capable`, `may_mount`) first.
+
 ### Power-off authorisation
 
 `init` accepts `poweroff`/`reboot`/`halt` requests on a stream socket at `/run/user/initctl` (sockets only live on tmpfs, and `/run/user` is the tmpfs only root may create entries in, so nobody can squat the name). The request is authorised from the peer's `SO_PEERCRED`: root always, anyone else only if the requesting process belongs to a local session init supervises (the graphical login, the serial login, or a text VT login) — logind's default `allow_active=yes` policy. The session's `login1` service and `/bin/poweroff`/`/bin/reboot`/`/bin/halt` ([`userland/poweroff`](../../userland/poweroff)) forward to it; the actual `reboot(2)` remains root-only.
@@ -118,7 +122,7 @@ The project's broader list of desktop limitations lives in [../desktop/limitatio
 | No real PAM stack | `pam-leandros` implements the application ABI greetd needs (including the environment table, which *is* greetd's session `envp`); `open_session`/`setcred` are stubs, which is correct for greetd. Whether to keep extending it or port Linux-PAM (which `dlopen`s its modules) is undecided. |
 | No utmpx | Nothing writes `utmp`/`wtmp`; no shipped program is known to read them. |
 | Private IPC syscalls unchecked | `SYS_IPC_SEND` to any port id, `SYS_SPAWN` and the debug serial-write syscall carry no credential checks. |
-| No capabilities | Root is all-or-nothing; `capset` drops are accepted and ignored. |
+| Coarse host privilege | Capabilities and user namespaces exist ([../kernel/namespaces.md](../kernel/namespaces.md)), but most host-wide checks (module load, device nodes, raw sockets, rlimit raises) test euid 0 in the initial namespace rather than an individual capability. |
 | rlimits stored, mostly not enforced | Only `RLIMIT_NICE` and `RLIMIT_RTPRIO` act; all others default to unlimited. |
 | `protected_regular` / `protected_fifos` | `O_CREAT` on another user's file in sticky `/tmp` is not restricted. |
 | `setsid()` by a group leader | Succeeds (Linux: `EPERM`); left because of session-start risk, with no privilege gain. |
@@ -126,7 +130,7 @@ The project's broader list of desktop limitations lives in [../desktop/limitatio
 | `mknod(S_IFSOCK)` | `EPERM` for everyone; Linux allows it unprivileged. |
 | Password hashing | A single salted SHA-256 pass, not a slow password-hashing scheme; no `passwd(1)` to change passwords. |
 | Keyboard ioctls | VT keymap writes are root-only; Linux also lets the VT's controlling user write them. |
-| No `ptrace` | `ENOSYS`, so there is no hole there. |
+| No `ptrace` | `ENOSYS`, so there is no hole there. (The `ptrace` *access rule* is still modelled for `/proc/<pid>/{ns,environ}`; see namespaces.md.) |
 
 ## Code and tests
 
@@ -145,3 +149,4 @@ The project's broader list of desktop limitations lives in [../desktop/limitatio
 - [../desktop/login.md](../desktop/login.md) — greetd, the greeter, `pam-leandros`.
 - [../desktop/limitations.md](../desktop/limitations.md) — what the desktop still cannot do.
 - [../kernel/processes.md](../kernel/processes.md) — credentials, chroot and priorities in the process model.
+- [../kernel/namespaces.md](../kernel/namespaces.md) — user namespaces, capabilities, seccomp and the mount/PID/network namespaces.

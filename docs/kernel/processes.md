@@ -199,7 +199,7 @@ Several races between a non-leader `execve` (which de-threads the group), a fata
 - A signal-killed group still becomes waitable when its leader is reaped, before a sibling's CPU drops the last address-space reference; `killmt` tolerates the window, the kernel still has it.
 - `with_task_address_space` (evdev/drm) reads a page-table root without taking a reference, a latent race against any address-space drop.
 - The non-leader `execve` takeover window is closed for fatal signals (above); what remains open is only the ordinary race that a group exit begun elsewhere in the same instant fails the exec with the signal, which is Linux's behaviour too.
-- No core dumps. `clone3` is `ENOSYS` (callers fall back to `clone`), so `CLONE_PIDFD` is only reachable through `clone`.
+- No core dumps.
 - `times(2)` reports zero CPU times (the per-task `cpu_ns` behind `CLOCK_*_CPUTIME_ID` is not wired into it).
 
 ## Code and tests

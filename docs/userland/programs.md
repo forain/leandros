@@ -155,7 +155,7 @@ leandros-libc.
 | `mkfs.fat`, `mkfs.xfs` | [ports/mkfs-fat](../../ports/mkfs-fat/), [ports/mkfs-xfs](../../ports/mkfs-xfs/README.md) | in-tree Rust formatters for disks-rs ([ports.md](ports.md#disks-rs-mkfsfat-and-mkfsxfs)) |
 | `disktester` | sibling `../disks-rs` | AerynOS's provisioning tester, unmodified |
 | `gpuprobe` | the Mesa GPU stage | reports virtio-gpu capsets and creates a real GBM + EGL context; `/bin/gpu-env` decides the renderer from it |
-| `git`, `less`, `nano`, `sftp-server` | [ports/git](../../ports/git/build.sh) | Alpine 3.21's git 2.47 (https through libcurl/OpenSSL), its pager, an editor (`/etc/gitconfig` sets `core.editor = nano`) and OpenSSH's sftp server. `git`, `git-upload-pack`, `git-receive-pack`, `git-upload-archive`, `less` and `nano` are also in `/bin`, because the console login's `PATH` is `/bin` |
+| `git`, `less`, `nano`, `sftp-server` | [ports/git](../../ports/git/build.sh) | Alpine's git (https through libcurl/OpenSSL), its pager, an editor (`/etc/gitconfig` sets `core.editor = nano`) and OpenSSH's sftp server. `git`, `git-upload-pack`, `git-receive-pack`, `git-upload-archive`, `less` and `nano` are also in `/bin`, because the console login's `PATH` is `/bin` |
 | `su`, `sudo` | [ports/sudo-rs](../../ports/sudo-rs/README.md) | sudo-rs v0.2.15, set-user-ID root; `/etc/sudoers` lets `root` and `%wheel` run anything ([security](../servers/security.md#su-and-sudo)) |
 | `kmscube` | [ports/gl-stack](../../ports/gl-stack/NOTES.md) | the first dynamic `ET_DYN` + `PT_INTERP` binary; a KMS/GL smoke test |
 
