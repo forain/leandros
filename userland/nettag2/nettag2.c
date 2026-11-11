@@ -56,6 +56,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -178,7 +179,13 @@ out:
  * add round trips on it to the unrelated traffic: a park refined by key
  * ignores them, a bits-only park is woken by each one, on every arch. */
 
-#define ALIAS_MAX 320
+/* Pipe rings are numbered from a pool whose position depends on every suite
+ * that ran earlier in the boot, so a window of N consecutive ring numbers can
+ * miss a given bit for good (full regress: 320 rings covered 63 of 64 bits,
+ * never the waiter's bit 13, on both arches). The window just keeps sliding
+ * while candidates stay open, so allow many more, raising the soft fd limit
+ * to the hard one first. */
+#define ALIAS_MAX 1500
 static int alias_fd[ALIAS_MAX][2];
 static unsigned long long alias_bit[ALIAS_MAX];
 static int n_alias;
@@ -211,6 +218,12 @@ static unsigned long long probe_pipe(int pp[2]) {
 /* A pipe (its fds in `out`) whose reader parks on a bit of `mask`; 0 if one
  * was found. Candidates stay open, so ring numbers are not reused. */
 static int alias_pipe(unsigned long long mask, int out[2]) {
+    static int raised;
+    if (!raised) {
+        struct rlimit rl;
+        raised = 1;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) { rl.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_NOFILE, &rl); }
+    }
     for (int i = 0; ; i++) {
         if (i == n_alias) {
             if (n_alias == ALIAS_MAX) return -1;
@@ -243,6 +256,9 @@ static int check_quiet(const char *n, volatile long *tid, volatile int *returned
     int al[2];
     if (alias_pipe(w.mask, al) < 0) {
         /* (63/64)^320 < 1 in 150 000: only a probe failing does this. */
+        { unsigned long long u = 0; int z = 0, all = 0;
+          for (int i = 0; i < n_alias; i++) { u |= alias_bit[i]; if (!alias_bit[i]) z++; }
+          (void)all; printf("alias: union %#llx zero %d first %#llx last %#llx\n", u, z, alias_bit[0], alias_bit[n_alias-1]); }
         fail(n, "no pipe parks on a bit of mask %#llx (%d probed)", w.mask, n_alias);
         return 1;
     }
