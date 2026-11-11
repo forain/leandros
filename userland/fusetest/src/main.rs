@@ -139,7 +139,7 @@ unsafe fn daemon(fd: i32) -> ! {
             10 => { // UNLINK
                 match find(&body[..body.len() - 1]) { Some(i) => FILES[i].used = false, None => err = -2 }
             }
-            11 => { // RENAME: newdir u64, oldname\0, newname\0
+            12 => { // RENAME: newdir u64, oldname\0, newname\0
                 let names = &body[8..];
                 let z = names.iter().position(|&c| c == 0).unwrap_or(0);
                 let (on, nn) = (&names[..z], &names[z + 1..names.len() - 1]);
