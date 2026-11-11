@@ -306,13 +306,16 @@ fn init_sequence() {
     assert_eq!(c[3], Call::IovarSet("bus:txglom".into(), vec![0, 0, 0, 0]));
     assert_eq!(c[4], Call::IovarSet("event_msgs".into(), EventMask::station().bytes().to_vec()));
     assert_eq!(c[5], Call::CmdSet(cmd::UP, vec![1, 0, 0, 0]));
+    // Group-addressed frames (mDNS 224.0.0.251, IPv6 ND 33:33:..) are dropped
+    // by the firmware unless allmulti is on (brcmf_netdev_set_multicast_list).
+    assert!(c.contains(&Call::IovarSet("allmulti".into(), vec![1, 0, 0, 0])));
     assert!(d.radio_on());
 }
 
 #[test]
 fn init_tolerates_optional_refusals() {
     let mut m = Mock::default();
-    m.refuse = vec!["country".into(), "bus:txglom".into(), "mpc".into()];
+    m.refuse = vec!["country".into(), "bus:txglom".into(), "mpc".into(), "allmulti".into()];
     let mut d = Brcmf::new(m, env());
     assert!(d.init(*b"PT").is_ok());
     let mut m = Mock::default();
