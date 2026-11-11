@@ -6,6 +6,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ## Known bugs
 
+- [ ] mntiso E7: add a host_to_view hint to the fd_ns_path reopen so links whose target is only reachable from another view resolve without the identity-check fallback (design-mntiso.md E7; open after lane/mntiso-procfd).
 ### Kernel / VFS
 - **Global scans on last close** of tmpfs/mounted files walk every fd table (O(all fds)); a per-object refcount would retire it and `FD_COPY_GATE`.
 - **Wake scans are O(parked pollers)**; keyed wake still dereferences each mask match (~11 us per scan). A per-tag index / kbits bloom would fix it.
