@@ -1425,7 +1425,6 @@ pub fn tmpfs_census() -> Option<TmpfsCensus> {
     // Referenced slots first: every table at one instant (the scan gate,
     // exclusive, as `tmp_open_fd_mask` takes it), then TMP_INFLIGHT, then
     // TMP_FILES — the established order, all try_lock (IRQ-safe).
-    let _gate = FD_COPY_GATE.try_write()?;
     let refd = {
         let mut mask = TmpMask::new();
         {
@@ -1448,7 +1447,7 @@ pub fn tmpfs_census() -> Option<TmpfsCensus> {
             c.used += 1;
             if t[i].ephemeral() {
                 c.anon += 1;
-                if !refd.has(i) && tmp_alias_count(&t, i) == 0 { c.orphan += 1; }
+                if !refd.has(i) && !tmp_fd_open(i) && tmp_alias_count(&t, i) == 0 { c.orphan += 1; }
             }
         }
     }
@@ -2747,18 +2746,6 @@ pub fn mounting_device(device: &str) -> bool {
     MOUNT_PINS.lock().iter().any(|d| d.strip_prefix("/dev/").unwrap_or(d) == w)
 }
 
-/// Queued SCM_RIGHTS copies of block-device fds, per registry slot (leaf lock; changed only
-/// under `FD_COPY_GATE` shared, read under `scan_gate()`).
-static BLK_INFLIGHT: Mutex<[u16; block::MAX_BDEV]> = Mutex::new([0u16; block::MAX_BDEV]);
-
-fn blk_inflight_add(kind: &VnodeKind, inc: bool) {
-    if let VnodeKind::BlockDev { dev, .. } = *kind {
-        if let Some(c) = BLK_INFLIGHT.lock().get_mut(dev as usize) {
-            *c = if inc { c.saturating_add(1) } else { c.saturating_sub(1) };
-        }
-    }
-}
-
 /// Why the block-device family rooted at `paths` ("/dev/x" or "x": a disk and its partitions)
 /// cannot lose its driver, or None. A busy pin for module unload (D6/D9). Matches by BDEVS slot
 /// (the disk, every `Backing::Part` whose parent is one of them, so BLKPG partitions count) and
@@ -2780,13 +2767,8 @@ pub fn block_family_busy(paths: &[&str]) -> Option<&'static str> {
         let w = m.device.strip_prefix("/dev/").unwrap_or(m.device);
         if fam.iter().any(|(_, n)| n.as_str() == w) { return Some("mounted"); }
     }
-    {
-        let _gate = scan_gate();
-        let fl = BLK_INFLIGHT.lock();
-        if fam.iter().any(|(d, _)| fl.get(*d as usize).copied().unwrap_or(0) != 0) { return Some("block device open"); }
-        drop(fl);
-        let open = any_fd(|f| matches!(f.kind, VnodeKind::BlockDev { dev, .. } if fam.iter().any(|(d, _)| *d == dev)));
-        if open { return Some("block device open"); }
+    if fam.iter().any(|(d, _)| BLK_FDREFS.get(*d as usize).map_or(false, |c| c.load(atomic::Ordering::Acquire) != 0)) {
+        return Some("block device open");
     }
     if block::loop_bound_on(&fam) { return Some("loop device bound"); }
     None
@@ -3979,23 +3961,20 @@ impl ProcFdTable {
 // guarded every table, so every fd syscall of every process serialised on it.
 //
 // Lock order:
-// - `FD_COPY_GATE` → a table lock → `FD_TABLES` (the map) → the leaf locks
+// - A table lock → `FD_TABLES` (the map) → the leaf locks
 //   (PIPE_RINGS, TMP_*, ofd, ...) exactly as they nested under the old global
 //   lock. The map is a leaf with respect to tables: no table lock is ever
 //   taken while it is held (the IRQ-context census only try-locks).
 // - At most one table lock at a time. Fork does not need two: the child's
 //   table is built from a copy of the parent's and inserted whole.
-// - `FD_COPY_GATE` is never taken with a table lock held.
 //
-// What the global lock gave for free and this has to provide: a scan of
-// every table that decides an object is unreferenced (the last close of a
-// mounted file, a tmpfs inode's last fd) saw all tables at one instant. Per
-// table, a descriptor copied into a table the scan has already passed —
-// by fork (a new table) or SCM_RIGHTS / pidfd_getfd (`import_fd`) — while its
-// source closes in a table not reached yet would be missed. The paths that
-// copy a descriptor *into another table* take `FD_COPY_GATE` shared; such a
-// scan takes it exclusive (`scan_gate`). A dup within one table needs no
-// gate: the table's own lock orders it against the scan of that table.
+// "Is this object still open?" (last close of a mounted file, a tmpfs
+// inode's last fd, a block device's unload check) is answered from per-object
+// reference counts kept by `FdVec` itself (`TMP_FDREFS`, `MOUNT_FDREFS`,
+// `BLK_FDREFS`: one per fd-table entry plus one per queued SCM_RIGHTS copy),
+// not by walking every table. The counts are bumped before a copy becomes
+// visible and dropped after the source goes, so they never read 0 for a live
+// object; there is no global copy gate.
 
 type FdTableLock = sched::lockwatch::TrackedMutex<ProcFdTable, { sched::lockwatch::L_FD_TABLE }>;
 type FdTableRef = alloc::sync::Arc<FdTableLock>;
@@ -4012,10 +3991,6 @@ impl FdTables {
 
 static FD_TABLES: sched::lockwatch::TrackedMutex<FdTables, { sched::lockwatch::L_FD_TABLES }> =
     sched::lockwatch::TrackedMutex::new_typed(FdTables::new());
-
-/// Shared by the paths that copy a descriptor into another process's table,
-/// exclusive for the scans that must see every table at one instant (above).
-static FD_COPY_GATE: spin::RwLock<()> = spin::RwLock::new(());
 
 /// The table each CPU looked up last. Nearly every fd syscall resolves its
 /// descriptor and then operates on it, two lookups of the same table; with
@@ -4178,18 +4153,6 @@ fn with_tbl_raw<R>(id: u32, f: impl FnOnce(&mut ProcFdTable) -> R) -> Option<R> 
 fn with_tbl<R>(pid: u32, f: impl FnOnce(&mut ProcFdTable) -> R) -> Option<R> {
     let mut slot = TblSlot::new();
     find_tbl(pid, &mut slot).map(f)
-}
-
-/// The exclusive side of `FD_COPY_GATE`, for a scan that must see every
-/// table at one instant. Caller holds no table lock.
-fn scan_gate() -> spin::RwLockWriteGuard<'static, ()> {
-    FD_COPY_GATE.write()
-}
-
-/// Does any descriptor of any process satisfy `pred`? Caller holds
-/// `scan_gate()` (see above) and no table lock.
-fn any_fd(pred: impl Fn(&FdEntry) -> bool) -> bool {
-    all_tables().iter().any(|t| t.lock().fds.iter_used().any(|(_, f)| pred(f)))
 }
 
 /// Fork never fails for lack of an fd table any more (tables are allocated
@@ -6004,20 +5967,62 @@ static TMP_INFLIGHT: Mutex<[u16; MAX_TMP_FILES]> = Mutex::new([0u16; MAX_TMP_FIL
 static TMP_FDREFS: [atomic::AtomicU32; MAX_TMP_FILES] =
     [const { atomic::AtomicU32::new(0) }; MAX_TMP_FILES];
 
+/// Open references (fd-table entries plus queued SCM_RIGHTS copies) to each
+/// block-device registry slot. Same discipline as `TMP_FDREFS`.
+static BLK_FDREFS: [atomic::AtomicU32; block::MAX_BDEV] =
+    [const { atomic::AtomicU32::new(0) }; block::MAX_BDEV];
+
+/// Open references to each mounted-file open, keyed (port, file_id): every
+/// fd-table entry and every queued SCM_RIGHTS copy. Leaf lock. Replaces the
+/// walk of every fd table that the last
+/// close of a mounted file used to make, which made `close` O(all open fds).
+static MOUNT_FDREFS: Mutex<alloc::vec::Vec<(u32, u32, u32)>> = Mutex::new(alloc::vec::Vec::new());
+
+fn mount_fdref_add(port: u32, file_id: u32, inc: bool) {
+    let mut v = MOUNT_FDREFS.lock();
+    if let Some(i) = v.iter().position(|e| e.0 == port && e.1 == file_id) {
+        if inc { v[i].2 += 1; } else { v[i].2 = v[i].2.saturating_sub(1); if v[i].2 == 0 { v.swap_remove(i); } }
+    } else if inc {
+        v.push((port, file_id, 1));
+    }
+}
+
+/// Is a mounted-file open still named by any descriptor or queued copy?
+fn mount_referenced(port: u32, file_id: u32) -> bool {
+    MOUNT_FDREFS.lock().iter().any(|e| e.0 == port && e.1 == file_id)
+}
+
 #[inline]
 fn tmp_fdref_inc(kind: &VnodeKind) {
-    if let VnodeKind::TmpFile { idx, .. } = *kind {
-        if idx < MAX_TMP_FILES { TMP_FDREFS[idx].fetch_add(1, atomic::Ordering::AcqRel); }
+    match *kind {
+        VnodeKind::TmpFile { idx, .. } => {
+            if idx < MAX_TMP_FILES { TMP_FDREFS[idx].fetch_add(1, atomic::Ordering::AcqRel); }
+        }
+        VnodeKind::MountedFile { port, file_id } => mount_fdref_add(port, file_id, true),
+        VnodeKind::BlockDev { dev, .. } => {
+            if let Some(c) = BLK_FDREFS.get(dev as usize) { c.fetch_add(1, atomic::Ordering::AcqRel); }
+        }
+        _ => {}
     }
 }
 
 #[inline]
 fn tmp_fdref_dec(kind: &VnodeKind) {
-    if let VnodeKind::TmpFile { idx, .. } = *kind {
-        if idx < MAX_TMP_FILES {
-            let _ = TMP_FDREFS[idx].fetch_update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire,
-                                                 |n| Some(n.saturating_sub(1)));
+    match *kind {
+        VnodeKind::TmpFile { idx, .. } => {
+            if idx < MAX_TMP_FILES {
+                let _ = TMP_FDREFS[idx].fetch_update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire,
+                                                     |n| Some(n.saturating_sub(1)));
+            }
         }
+        VnodeKind::MountedFile { port, file_id } => mount_fdref_add(port, file_id, false),
+        VnodeKind::BlockDev { dev, .. } => {
+            if let Some(c) = BLK_FDREFS.get(dev as usize) {
+                let _ = c.fetch_update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire,
+                                       |n| Some(n.saturating_sub(1)));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -6035,26 +6040,11 @@ fn tmp_fd_open(idx: usize) -> bool {
 // slot before the receiver's recvmsg installed its copy, which then read
 // nothing (or whatever file reused the slot). `MOUNT_INFLIGHT` counts the
 // queued copies per (port, file_id) so the last close waits for them.
-static MOUNT_INFLIGHT: Mutex<alloc::vec::Vec<(u32, u32, u32)>> = Mutex::new(alloc::vec::Vec::new());
-
-fn mount_inflight_add(port: u32, file_id: u32, inc: bool) {
-    let mut v = MOUNT_INFLIGHT.lock();
-    if let Some(i) = v.iter().position(|e| e.0 == port && e.1 == file_id) {
-        if inc { v[i].2 += 1; } else { v[i].2 -= 1; if v[i].2 == 0 { v.swap_remove(i); } }
-    } else if inc {
-        v.push((port, file_id, 1));
-    }
-}
-
-/// Is a copy of this mounted-file open queued on some socket?
-fn mount_inflight(port: u32, file_id: u32) -> bool {
-    MOUNT_INFLIGHT.lock().iter().any(|e| e.0 == port && e.1 == file_id)
-}
 
 /// Take an in-flight reference if `kind` is a tmpfs fd. No-op otherwise.
 fn tmp_inflight_inc(kind: &VnodeKind) {
-    blk_inflight_add(kind, true);
-    if let VnodeKind::MountedFile { port, file_id } = *kind { mount_inflight_add(port, file_id, true); }
+    // A queued copy is one more reference (same counters as fd-table entries).
+    if matches!(*kind, VnodeKind::MountedFile { .. } | VnodeKind::BlockDev { .. }) { tmp_fdref_inc(kind); }
     if let VnodeKind::TmpFile { idx, .. } = *kind {
         if idx < MAX_TMP_FILES {
             let mut f = TMP_INFLIGHT.lock();
@@ -6069,8 +6059,7 @@ fn tmp_inflight_inc(kind: &VnodeKind) {
 /// must run *after* the descriptor is installed in the receiver's table, so the
 /// slot is never unreferenced for even an instant.
 fn tmp_inflight_dec(kind: &VnodeKind) {
-    blk_inflight_add(kind, false);
-    if let VnodeKind::MountedFile { port, file_id } = *kind { mount_inflight_add(port, file_id, false); }
+    if matches!(*kind, VnodeKind::MountedFile { .. } | VnodeKind::BlockDev { .. }) { tmp_fdref_dec(kind); }
     if let VnodeKind::TmpFile { idx, .. } = *kind {
         if idx < MAX_TMP_FILES {
             let mut f = TMP_INFLIGHT.lock();
@@ -10710,12 +10699,7 @@ fn handle_close(pid: u32, fd: usize) -> Message {
             // fd `fdopendir` makes to run one `readdir` — freed the slot out from
             // under the original, and the next fstat/unlink on it came back
             // EBADF. That is what broke `rm -r`, `du` and every fts-style walk.
-            let still_referenced = {
-                let _gate = scan_gate();
-                any_fd(|f| matches!(f.kind,
-                    VnodeKind::MountedFile { port: p, file_id: i } if p == port && i == file_id))
-             || mount_inflight(port, file_id)
-            };
+            let still_referenced = mount_referenced(port, file_id);
             if !still_referenced {
                 let mut proxy = Message::empty();
                 proxy.tag = VFS_CLOSE;
@@ -11059,7 +11043,6 @@ pub fn poll_transfer(tf: &TransferFd, pid: u32) -> (u32, u64, u64) {
 pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
     // The copy leaves the table here and is counted in flight below: a scan
     // that decides an object is unreferenced must not run in between.
-    let _gate = FD_COPY_GATE.read();
     let (kind, flags, desc) = {
         let mut tbls = TblSlot::new();
         let e = find_tbl(pid, &mut tbls)?.fds.get(fd)?;
@@ -11119,9 +11102,6 @@ pub fn clone_transfer(tf: &TransferFd) -> TransferFd {
 /// the receiver happened to hold on that vnode through an unrelated fd of its
 /// own — for a descriptor the receiver never even took delivery of.
 pub fn import_fd(pid: u32, tf: TransferFd, cloexec: bool) -> isize {
-    // A copy into a table a scan may already have passed (see FD_COPY_GATE);
-    // held until the in-flight count is dropped below.
-    let _gate = FD_COPY_GATE.read();
     let mut tbls = TblSlot::new();
     let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => {
         drop(tbls); return -23; // ENFILE (fd-table pool full); `tf` is still the caller's to drop
@@ -11172,9 +11152,6 @@ fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
 /// Copy `src_pid`'s table (the calling thread's, if it is that process's)
 /// into a new table `dst_key` owned by tgid `owner`. false: no source table.
 pub fn copy_fd_table(src_pid: u32, dst_key: u32, owner: u32) -> bool {
-    // A copy into a new table, which a running scan has not seen (see
-    // FD_COPY_GATE); held until the copies are referenced below.
-    let _gate = FD_COPY_GATE.read();
     // The new table is a copy of the source, built on the heap under the
     // source's lock (chunk by chunk: no table-sized temporary anywhere) and
     // published whole, so no second table lock is ever held.
@@ -11257,12 +11234,7 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
         // killmt fs_io ran the pool dry (EMFILE for every later open, logins
         // included) after ~100 kills. Same last-reference rule as `handle_close`.
         VnodeKind::MountedFile { port, file_id } => {
-            let still_referenced = {
-                let _gate = scan_gate();
-                any_fd(|f| matches!(f.kind,
-                    VnodeKind::MountedFile { port: p, file_id: i } if p == port && i == file_id))
-             || mount_inflight(port, file_id)
-            };
+            let still_referenced = mount_referenced(port, file_id);
             if !still_referenced {
                 let mut proxy = Message::empty();
                 proxy.tag = VFS_CLOSE;

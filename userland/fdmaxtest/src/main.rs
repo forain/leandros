@@ -630,6 +630,235 @@ unsafe fn bench() {
     }
 }
 
+
+// ── Last close: per-object open counts (lane lastclose) ─────────────────────
+//
+// The last close of a mounted (f2fs) file or a tmpfs inode used to walk every
+// fd table under a global gate to learn whether anything still named it. It
+// is now a per-object count. These cases pin the semantics on both: an
+// unlinked-but-open file stays readable across fork / dup2 / SCM_RIGHTS in
+// flight / exec (CLOEXEC) / process death, and its slot is released at the
+// last close (a leak shows as EMFILE/ENOSPC after enough create+unlink+close
+// rounds: the mount server has 256 open-file slots, the tmpfs pool 32768).
+
+#[cfg(target_arch = "x86_64")] const NR_UNLINKAT: usize = 263;
+#[cfg(target_arch = "aarch64")] const NR_UNLINKAT: usize = 35;
+#[cfg(target_arch = "x86_64")] const NR_PREAD: usize = 17;
+#[cfg(target_arch = "aarch64")] const NR_PREAD: usize = 67;
+#[cfg(target_arch = "x86_64")] const NR_EXECVE: usize = 59;
+#[cfg(target_arch = "aarch64")] const NR_EXECVE: usize = 221;
+const O_CREAT: usize = 0o100;
+
+/// Create `<dir>/fdmaxtest.lc`, write one byte, unlink it. The fd stays open.
+unsafe fn open_unlinked(dir: &[u8], flags: usize) -> isize {
+    let mut path = [0u8; 64];
+    let mut n = 0;
+    for &c in dir { path[n] = c; n += 1; }
+    for &c in b"/fdmaxtest.lc" { path[n] = c; n += 1; }
+    let fd = sc6(nr::OPENAT, AT_FDCWD, path.as_ptr() as usize, O_RDWR | O_CREAT | flags, 0o600, 0, 0);
+    if fd < 0 { return fd; }
+    if wr(fd, b"q") != 1 { close(fd); return -5; }
+    let r = sc(NR_UNLINKAT, AT_FDCWD, path.as_ptr() as usize, 0);
+    if r < 0 { close(fd); return r; }
+    fd
+}
+unsafe fn pread0(fd: isize) -> isize {
+    let mut b = [0u8; 2];
+    let r = sc6(NR_PREAD, fd as usize, b.as_mut_ptr() as usize, 1, 0, 0, 0);
+    if r == 1 && b[0] == b'q' { 1 } else if r >= 0 { -5 } else { r }
+}
+
+unsafe fn lc_leak(dir: &[u8], rounds: usize) -> bool {
+    let mut ok = true;
+    for i in 0..rounds {
+        let fd = open_unlinked(dir, 0);
+        if fd < 0 { ok &= expect(b"open_unlinked (slot leak?)", fd, 0); let _ = i; break; }
+        close(fd);
+    }
+    ok
+}
+
+unsafe fn lc_fork(dir: &[u8]) -> bool {
+    let mut ok = true;
+    let fd = open_unlinked(dir, 0);
+    if fd < 0 { return expect(b"open", fd, 0); }
+    let (r, w) = pipe();
+    let pid = fork();
+    if pid == 0 {
+        // Wait until the parent has closed its copy, then read ours.
+        let mut b = [0u8; 1];
+        close(w);
+        rd(r, &mut b);
+        _exit(if pread0(fd) == 1 { 0 } else { 1 });
+    }
+    close(r);
+    close(fd);
+    wr(w, b"g");
+    close(w);
+    let mut st = 0;
+    waitpid(pid, &mut st, 0);
+    ok &= expect(b"child read after parent closed", st as isize, 0);
+    ok
+}
+
+unsafe fn lc_dup2(dir: &[u8]) -> bool {
+    let mut ok = true;
+    let fd = open_unlinked(dir, 0);
+    if fd < 0 { return expect(b"open", fd, 0); }
+    ok &= expect(b"dup2", dup2(fd, 50), 50);
+    close(fd);
+    ok &= expect(b"read dup", pread0(50), 1);
+    let d = sc(nr::FCNTL, 50, F_DUPFD, 60);
+    close(50);
+    ok &= expect(b"read second dup", pread0(d), 1);
+    close(d);
+    ok
+}
+
+unsafe fn lc_scm(dir: &[u8]) -> bool {
+    #[repr(C)] struct Iov { base: *mut u8, len: usize }
+    #[repr(C)] struct Msg { name: *mut u8, namelen: u32, iov: *mut Iov, iovlen: usize, ctl: *mut u8, ctllen: usize, flags: i32 }
+    let mut ok = true;
+    let (a, b) = sockpair();
+    let fd = open_unlinked(dir, 0);
+    if fd < 0 { return expect(b"open", fd, 0); }
+    let mut byte = [b'm'];
+    let mut iov = Iov { base: byte.as_mut_ptr(), len: 1 };
+    let mut ctl = [0u64; 3];
+    let c = ctl.as_mut_ptr() as *mut u8;
+    *(c as *mut usize) = 20;
+    *(c.add(8) as *mut i32) = 1;
+    *(c.add(12) as *mut i32) = 1;
+    *(c.add(16) as *mut i32) = fd as i32;
+    let msg = Msg { name: core::ptr::null_mut(), namelen: 0, iov: &mut iov, iovlen: 1, ctl: c, ctllen: 24, flags: 0 };
+    let sent = sc(nr::SENDMSG, a as usize, &msg as *const _ as usize, 0);
+    ok &= expect(b"sendmsg", sent, 1);
+    close(fd); // the only table entry goes; the queued copy keeps the file alive
+    if sent != 1 { close(a); close(b); return false; }
+    let mut rbyte = [0u8];
+    let mut riov = Iov { base: rbyte.as_mut_ptr(), len: 1 };
+    let mut rctl = [0u64; 4];
+    let mut rmsg = Msg { name: core::ptr::null_mut(), namelen: 0, iov: &mut riov, iovlen: 1, ctl: rctl.as_mut_ptr() as *mut u8, ctllen: 32, flags: 0 };
+    ok &= expect(b"recvmsg", sc(nr::RECVMSG, b as usize, &mut rmsg as *mut _ as usize, 0), 1);
+    let got = *((rctl.as_ptr() as *const u8).add(16) as *const i32) as isize;
+    ok &= expect(b"read via received fd", pread0(got), 1);
+    close(got); close(a); close(b);
+    ok
+}
+
+/// A queued copy whose socket dies unread must release the file (no leak).
+unsafe fn lc_scm_dropped(dir: &[u8]) -> bool {
+    #[repr(C)] struct Iov { base: *mut u8, len: usize }
+    #[repr(C)] struct Msg { name: *mut u8, namelen: u32, iov: *mut Iov, iovlen: usize, ctl: *mut u8, ctllen: usize, flags: i32 }
+    let mut ok = true;
+    for _ in 0..40 {
+        let (a, b) = sockpair();
+        let fd = open_unlinked(dir, 0);
+        if fd < 0 { return expect(b"open (queued-copy leak?)", fd, 0); }
+        let mut byte = [b'm'];
+        let mut iov = Iov { base: byte.as_mut_ptr(), len: 1 };
+        let mut ctl = [0u64; 3];
+        let c = ctl.as_mut_ptr() as *mut u8;
+        *(c as *mut usize) = 20;
+        *(c.add(8) as *mut i32) = 1;
+        *(c.add(12) as *mut i32) = 1;
+        *(c.add(16) as *mut i32) = fd as i32;
+        let msg = Msg { name: core::ptr::null_mut(), namelen: 0, iov: &mut iov, iovlen: 1, ctl: c, ctllen: 24, flags: 0 };
+        ok &= expect(b"sendmsg", sc(nr::SENDMSG, a as usize, &msg as *const _ as usize, 0), 1);
+        close(fd); close(a); close(b); // never received
+    }
+    ok &= lc_leak(dir, 300);
+    ok
+}
+
+unsafe fn lc_exec(dir: &[u8]) -> bool {
+    let mut ok = true;
+    let fd = open_unlinked(dir, O_CLOEXEC);
+    if fd < 0 { return expect(b"open", fd, 0); }
+    let pid = fork();
+    if pid == 0 {
+        let argv = [b"fdmaxtest\0".as_ptr(), b"n\0".as_ptr(), core::ptr::null()];
+        let envp = [core::ptr::null::<u8>()];
+        sc(NR_EXECVE, b"/bin/fdmaxtest\0".as_ptr() as usize, argv.as_ptr() as usize, envp.as_ptr() as usize);
+        _exit(92);
+    }
+    let mut st = 0;
+    waitpid(pid, &mut st, 0);
+    ok &= expect(b"exec'd child status", st as isize, 0);
+    ok &= expect(b"parent read after child's CLOEXEC close", pread0(fd), 1);
+    close(fd);
+    ok
+}
+
+/// Children die holding an inherited unlinked file; the parent closes first.
+/// Every death must drop its reference exactly once (300 rounds > 256 slots).
+unsafe fn lc_death(dir: &[u8]) -> bool {
+    let mut ok = true;
+    for _ in 0..300 {
+        let fd = open_unlinked(dir, 0);
+        if fd < 0 { return expect(b"open (death leak?)", fd, 0); }
+        let pid = fork();
+        if pid == 0 { _exit(0); }
+        close(fd);
+        let mut st = 0;
+        waitpid(pid, &mut st, 0);
+    }
+    // And the survivor case: parent keeps its fd across a child's death.
+    let fd = open_unlinked(dir, 0);
+    if fd < 0 { return expect(b"open", fd, 0); }
+    let pid = fork();
+    if pid == 0 { _exit(0); }
+    let mut st = 0;
+    waitpid(pid, &mut st, 0);
+    ok &= expect(b"parent read after child death", pread0(fd), 1);
+    close(fd);
+    ok
+}
+
+unsafe fn t_lastclose(label: &[u8], dir: &[u8], leak_rounds: usize) {
+    closefrom(3);
+    let probe = open_unlinked(dir, 0);
+    if probe < 0 { puts(label); puts(b": SKIP (no writable dir)\n"); return; }
+    close(probe);
+    let mut ok = true;
+    ok &= lc_leak(dir, leak_rounds);
+    ok &= lc_fork(dir);
+    ok &= lc_dup2(dir);
+    ok &= lc_scm(dir);
+    ok &= lc_scm_dropped(dir);
+    ok &= lc_exec(dir);
+    ok &= lc_death(dir);
+    closefrom(3);
+    report(label, ok);
+}
+
+/// `fdmaxtest closebench`: cost of open+close of a mounted file with N other
+/// descriptors open system-wide (this process). Flat after the refcount change.
+unsafe fn closebench() {
+    closefrom(3);
+    if setrlimit(40000, 524288) != 0 { puts(b"[closebench] setrlimit failed\n"); return; }
+    let mut opened = 0usize;
+    for &target in &[0usize, 1000, 5000, 20000] {
+        while opened < target { if open_null() >= 0 { opened += 1; } else { break; } }
+        const N: u64 = 400;
+        let mut path = *b"/root/fdmaxtest.cb\0";
+        let _ = &mut path;
+        let t0 = now_ns();
+        let mut bad = 0u64;
+        for _ in 0..N {
+            let fd = sc6(nr::OPENAT, AT_FDCWD, path.as_ptr() as usize, O_RDWR | O_CREAT, 0o600, 0, 0);
+            if fd < 0 { bad += 1; continue; }
+            close(fd);
+        }
+        let t1 = now_ns();
+        puts(b"[closebench] other_fds="); putn(opened as u64);
+        puts(b" open_close_ns="); putn((t1 - t0) / N);
+        puts(b" failed="); putn(bad); puts(b"\n");
+    }
+    sc(NR_UNLINKAT, AT_FDCWD, b"/root/fdmaxtest.cb\0".as_ptr() as usize, 0);
+    closefrom(3);
+}
+
 // ── Entry ───────────────────────────────────────────────────────────────────
 
 
@@ -639,6 +868,8 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if argc > 1 {
         let a = *argv.add(1);
         if *a == b'b' { bench(); return 0; }
+        if *a == b'n' { return 0; }
+        if *a == b'c' { closebench(); return 0; }
         if *a == b'x' && argc > 2 {
             let s = *argv.add(2);
             let mut n = 0isize; let mut i = 0;
@@ -656,6 +887,8 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     t_scm_rights_high();
     t_exec_keeps_sockets();
     t_fork_inet_socket();
+    t_lastclose(b"lastclose_tmpfs", b"/tmp", 33000);
+    t_lastclose(b"lastclose_mounted", b"/root", 600);
     puts(b"--- fdmaxtest done: "); putn(FAILS as u64); puts(b" failed ---\n");
     FAILS
 }
