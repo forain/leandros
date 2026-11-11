@@ -4975,9 +4975,13 @@ fn backing_readlink(backing: &[u8]) -> Option<Vec<u8>> {
 /// anchored at the namespace root). Returns the resolved namespace path, its
 /// backing path and the final mount id; `None` when the namespace has no
 /// tree. Namespace-0 tasks never come here.
-pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool)
+pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool, floor: &[u8])
     -> Result<Option<(Vec<u8>, Vec<u8>, u32)>, i32>
 {
+    // `floor` is the caller's chroot prefix in namespace space ("/" or "" when
+    // not chrooted): an absolute link body re-anchors there and `..` never
+    // climbs above it (Linux path_walk root semantics).
+    let floor: &[u8] = if floor.len() <= 1 { &[] } else { floor.strip_suffix(b"/").unwrap_or(floor) };
     let mut todo: Vec<Vec<u8>> = ns_path.split(|&c| c == b'/').filter(|c| !c.is_empty())
         .map(|c| c.to_vec()).collect();
     todo.reverse();
@@ -4986,7 +4990,9 @@ pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool)
     while let Some(c) = todo.pop() {
         if c == b"." { continue; }
         if c == b".." {
-            if let Some(i) = cur.iter().rposition(|&b| b == b'/') { cur.truncate(i); }
+            if cur.len() > floor.len() {
+                if let Some(i) = cur.iter().rposition(|&b| b == b'/') { cur.truncate(i); }
+            }
             continue;
         }
         let last = todo.is_empty();
@@ -4999,7 +5005,7 @@ pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool)
             hops += 1;
             if hops > SYMLINK_MAX_HOPS { return Err(-40); }
             cur.truncate(save);
-            if t.first() == Some(&b'/') { cur.clear(); }
+            if t.first() == Some(&b'/') { cur.clear(); cur.extend_from_slice(floor); }
             for comp in t.split(|&b| b == b'/').filter(|c| !c.is_empty()).rev() { todo.push(comp.to_vec()); }
         }
     }
@@ -5060,7 +5066,9 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
     let pid = sched::current_pid();
     if let Some(cx) = mnt::callctx_get(pid, ptr) {
         let ns = sched::current_mntns();
-        let rr = ns_resolve_links(ns, &cx.ns_path, follow);
+        let jail = sched::current_root_arc();
+        let floor: &[u8] = jail.as_deref().unwrap_or(b"/");
+        let rr = ns_resolve_links(ns, &cx.ns_path, follow, floor);
         if let Some((nsp, backing, mid)) = rr? {
             let fl = mnt::flags_of(ns, mid);
             if fl & (mnt::MNT_RDONLY | mnt::MNT_NODEV) != 0 { mnt_flag_check(msg.tag, msg, &backing, fl)?; }
@@ -7505,6 +7513,8 @@ fn gen_pcache() -> Option<VnodeKind> {
     put("write_through", st.wrote_through);
     put("written_back", st.written_back);
     put("mkclean_ptes", mm::pagecache::MKCLEAN_PTES.load(core::sync::atomic::Ordering::Relaxed));
+    put("cache_lock_acq", mm::pagecache::LOCK_ACQ.load(core::sync::atomic::Ordering::Relaxed));
+    put("cache_lock_contended", mm::pagecache::LOCK_CONTENDED.load(core::sync::atomic::Ordering::Relaxed));
     put("uncached_reads", st.bypass);
     put("free_pages", mm::buddy::free_pages());
     let (low, high) = mm::pagecache::watermarks();
