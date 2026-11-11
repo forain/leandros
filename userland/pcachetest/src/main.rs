@@ -702,6 +702,8 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
               t_two_procs, t_append, t_fsync_durable, t_bg_writeback_mapped, t_big_evict] {
         if !t() { failures += 1; }
     }
+    let (a, c) = (pcache_val(b"cache_lock_acq").unwrap_or(0), pcache_val(b"cache_lock_contended").unwrap_or(0));
+    say(b"CACHE lock acquisitions "); say_u(a); say(b" contended "); say_u(c); say(b"\n");
     say(b"--- pcachetest done ---\n");
     failures
 }
