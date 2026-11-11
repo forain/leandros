@@ -37,3 +37,16 @@ rustflags = []
 [target.x86_64-unknown-kernel]
 runner = "scripts/run-x86_64.sh"
 rustflags = []
+
+# ── Userland musl tests ──────────────────────────────────────────────────────
+# A bare `cargo build -p <test> --target <arch>-unknown-linux-musl` without
+# -C relocation-model=static produces a PIE that faults before main (the
+# kernel loader does not relocate it). scripts/build-userland.sh sets RUSTFLAGS
+# itself, which overrides these; they only cover the bare invocation.
+[target.aarch64-unknown-linux-musl]
+linker = "scripts/linker-aarch64-musl.sh"
+rustflags = ["-C", "link-self-contained=no", "-C", "relocation-model=static"]
+
+[target.x86_64-unknown-linux-musl]
+linker = "scripts/linker-x86_64-musl.sh"
+rustflags = ["-C", "link-self-contained=no", "-C", "relocation-model=static"]

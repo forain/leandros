@@ -328,7 +328,7 @@ pub struct Env<'a> {
 /// A rtnetlink write, parsed and validated by [`parse_write`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum RtOp {
-    SetLink { index: u32, up: Option<bool>, mtu: Option<u32>, mac: Option<[u8; 6]>, name: Option<String>, master: Option<u32> },
+    SetLink { index: u32, up: Option<bool>, mtu: Option<u32>, mac: Option<[u8; 6]>, name: Option<String>, master: Option<u32>, ns: PeerNs },
     AddAddr { index: u32, addr: [u8; 4], prefix: u8, excl: bool },
     DelAddr { index: u32, addr: [u8; 4], prefix: u8 },
     /// RTM_NEWLINK kind=veth with VETH_INFO_PEER.
@@ -519,7 +519,14 @@ fn new_link(msg: &[u8], flags_nl: u16, env: &Env) -> i32 {
             core::str::from_utf8(n).ok().map(String::from)
         }).filter(|n| *n != t.name);
         let master = match find_attr(msg, 16, IFLA_MASTER) { Some(m) if m.len() >= 4 => Some(rd32(m, 0)), Some(_) => return 22, None => None };
-        return (env.apply)(RtOp::SetLink { index: t.index, up, mtu, mac, name, master });
+        let ns = if let Some(f) = find_attr(msg, 16, IFLA_NET_NS_FD) {
+            if f.len() < 4 { return 22; }
+            PeerNs::Fd(rd32(f, 0) as i32)
+        } else if let Some(p) = find_attr(msg, 16, IFLA_NET_NS_PID) {
+            if p.len() < 4 { return 22; }
+            PeerNs::Pid(rd32(p, 0))
+        } else { PeerNs::Same };
+        return (env.apply)(RtOp::SetLink { index: t.index, up, mtu, mac, name, master, ns });
     }
     if let Some(m) = find_attr(msg, 16, IFLA_MTU) {
         if m.len() < 4 || rd32(m, 0) != t.mtu { return 95; }
