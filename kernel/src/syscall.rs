@@ -9142,6 +9142,22 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
                 vfs::vfs_get_node_kind(current_pid(), fd),
                 Some(vfs::VnodeKind::MountedFile { .. }));
             if mounted {
+                let mns = sched::current_mntns();
+                if mns != 0 {
+                    // Reopen through the namespace tree so ro/nodev/mask and
+                    // link resolution apply, then prove it is the same file.
+                    if let Some(p) = fd_ns_path(mns, fd, b"") {
+                        let kp2 = KPath::from_ns_mnt(p, mns)?;
+                        let (mut a, mut b2) = ([0u8; STAT_SIZE], [0u8; STAT_SIZE]);
+                        let m1 = make_vfs_msg(vfs::VFS_FSTAT, &[fd as u64, a.as_mut_ptr() as u64]);
+                        let m2 = make_vfs_msg(vfs::VFS_STAT, &[kp2.ptr() as u64, b2.as_mut_ptr() as u64]);
+                        if vfs_reply_val(&vfs::handle(&m1, current_pid())) < 0 { return Err(-2); }
+                        let r = vfs_reply_val(&vfs::handle(&m2, current_pid()));
+                        if r < 0 { return Err(r); }
+                        if vfs::read_stat_id(a.as_ptr() as usize) != vfs::read_stat_id(b2.as_ptr() as usize) { return Err(-2); }
+                        return Ok(kp2);
+                    }
+                }
                 if let Some(host) = fd_host_path(fd) { return Ok(KPath::raw(&host)); }
             } else if let Some(dir) = fd_dir_host_path(fd) {
                 // A directory descriptor on a non-mounted filesystem (tmpfs,
@@ -11851,6 +11867,14 @@ impl KPath {
     /// (pointer -> ns path, mount id) pair is published to the VFS chokepoint
     /// keyed by thread pid.
     fn from_ns_mnt(ns: Vec<u8>, mns: sched::ns::NsId) -> Result<KPath, isize> {
+        // /proc/self/fd/N/<below>: the directory the fd names lives in the
+        // mount the fd was opened through, not in /proc. Resolve it as the
+        // namespace path it really is, so links, ro/nodev and masking apply.
+        if let Some((fd, below)) = proc_own_fd(&ns) {
+            if !below.is_empty() {
+                if let Some(p) = fd_ns_path(mns, fd, below) { return KPath::from_ns_mnt(p, mns); }
+            }
+        }
         let (mut denied, mut crossed) = (false, false);
         let (mut mid, mut plen) = (0u32, 0usize);
         let backing = backing_walk_m(&ns, &mut crossed, &mut denied, mns, &mut mid, &mut plen);
@@ -12051,6 +12075,22 @@ fn proc_fd_below(p: &[u8]) -> Option<Vec<u8>> {
         return Some(b"/.leandros-hidden".to_vec());
     }
     Some(host)
+}
+
+/// The namespace path (in mount namespace `mns` != 0) at which fd `fd`'s file
+/// is visible, plus `below`; preferring the mount the fd was opened through.
+/// None when the fd has no path, is not visible in the namespace (opened
+/// before a pivot_root), or maps back into /proc.
+fn fd_ns_path(mns: sched::ns::NsId, fd: usize, below: &[u8]) -> Option<Vec<u8>> {
+    let host = fd_host_path(fd)?;
+    let hint = match vfs::fd_mnt(current_pid(), fd) { Some((n, m)) if n == mns => m, _ => 0 };
+    let mut p = vfs::mnt::reverse(mns, &host, hint)?;
+    if p.starts_with(b"/proc/") || p == b"/proc" { return None; }
+    if !below.is_empty() {
+        if p.last() != Some(&b'/') { p.push(b'/'); }
+        p.extend_from_slice(below);
+    }
+    Some(p)
 }
 
 /// `/proc/<own pid>/fd/N[/rest]` → (N, rest without its leading '/'), for

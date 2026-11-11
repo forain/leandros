@@ -2336,6 +2336,100 @@ static void devbind_suite(void) {
     }
 }
 
+/* ── lane mntiso-procfd: /proc/self/fd/N reopen and /proc/self/fd/N/<below>
+ * honour the fd's mount (ro/nodev/mask) and never follow links in host space.
+ * Host sentinel /root/mntiso-secret ("HOST") lives on the root volume in ns 0;
+ * the pivoted root holds its own /root/mntiso-secret ("INNER"). ──────────── */
+static int mi_enter(const char *tag, int ro, int nodev) {
+    char r[96], p[160];
+    mkdir("/root/mipv", 0755);
+    snprintf(r, sizeof r, "/root/mipv/%s", tag); mkdir(r, 0755);
+    snprintf(p, sizeof p, "%s/dd", r); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/mi", r); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/proc", r); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/root", r); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/root/mntiso-secret", r); put(p, "INNER", 0644);
+    snprintf(p, sizeof p, "%s/dd/f", r); put(p, "data", 0644);
+    snprintf(p, sizeof p, "%s/dd/l", r); unlink(p); if (symlink("/root/mntiso-secret", p) < 0) return 90;
+    snprintf(p, sizeof p, "%s/dd/null", r); unlink(p);
+    if (mknod(p, S_IFCHR | 0666, makedev(1, 3)) < 0) return 89;
+    snprintf(p, sizeof p, "%s/dd/x", r); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/dd/x/f", r); put(p, "BACK", 0644);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    if (mount("", "/", NULL, MS_REC | MS_SLAVE, NULL) < 0) return 93;
+    if (mount(r, r, NULL, MS_BIND | MS_REC, NULL) < 0) return 94;
+    char src[128], dst[128];
+    snprintf(src, sizeof src, "%s/dd", r); snprintf(dst, sizeof dst, "%s/mi", r);
+    if (mount(src, dst, NULL, MS_BIND, NULL) < 0) return 95;
+    unsigned long fl = MS_BIND | MS_REMOUNT | (ro ? MS_RDONLY : 0) | (nodev ? MS_NODEV : 0);
+    if ((ro || nodev) && mount(NULL, dst, NULL, fl, NULL) < 0) return 96;
+    if (chdir(r) < 0) return 97;
+    int oldroot = open("/", O_DIRECTORY | O_RDONLY);
+    if (oldroot < 0) return 98;
+    if (syscall(SYS_pivot_root, ".", ".") < 0) return 99;
+    if (fchdir(oldroot) < 0) return 100;
+    close(oldroot);
+    if (mount("", ".", NULL, MS_SLAVE | MS_REC, NULL) < 0) return 101;
+    if (umount2(".", MNT_DETACH) < 0) return 102;
+    if (chdir("/") < 0) return 103;
+    if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) return 104;
+    return 0;
+}
+static int mi_host_intact(void) { char b[16] = {0}; return slurp("/root/mntiso-secret", b, sizeof b) > 0 && !strncmp(b, "HOST", 4); }
+static int mi_procfd_reopen_ro(int m) {
+    (void)m; int r = mi_enter("a", 1, 0); if (r) return r;
+    int fd = open("/mi/f", O_PATH); if (fd < 0) return 10;
+    char p[48]; snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    int c = open(p, O_RDONLY); if (c < 0) { printf("  ro reopen errno=%d\n", errno); return 11; }
+    close(c);
+    errno = 0; c = open(p, O_RDWR);
+    if (c >= 0 || errno != EROFS) { printf("  rw reopen fd=%d errno=%d\n", c, errno); return 12; }
+    return 0;
+}
+static int mi_procfd_below_ro(int m) {
+    (void)m; int r = mi_enter("b", 1, 0); if (r) return r;
+    int fd = open("/mi", O_PATH | O_DIRECTORY); if (fd < 0) return 10;
+    char p[64]; snprintf(p, sizeof p, "/proc/self/fd/%d/f", fd);
+    errno = 0; int c = open(p, O_RDWR);
+    if (c >= 0 || errno != EROFS) { printf("  below rw fd=%d errno=%d\n", c, errno); return 11; }
+    return 0;
+}
+static int mi_procfd_below_nodev(int m) {
+    (void)m; int r = mi_enter("c", 0, 1); if (r) return r;
+    int fd = open("/mi", O_PATH | O_DIRECTORY); if (fd < 0) return 10;
+    char p[64]; snprintf(p, sizeof p, "/proc/self/fd/%d/null", fd);
+    errno = 0; int c = open(p, O_RDONLY);
+    if (c >= 0 || errno != EACCES) { printf("  below nodev fd=%d errno=%d\n", c, errno); return 11; }
+    return 0;
+}
+static int mi_procfd_below_link(int m) {
+    (void)m; int r = mi_enter("d", 0, 0); if (r) return r;
+    int fd = open("/mi", O_PATH | O_DIRECTORY); if (fd < 0) return 10;
+    char p[64], b[16] = {0}; snprintf(p, sizeof p, "/proc/self/fd/%d/l", fd);
+    int c = open(p, O_RDONLY);
+    if (c >= 0) { ssize_t n = read(c, b, 15); (void)n; }
+    if (!strncmp(b, "HOST", 4)) { printf("  link followed into the host\n"); return 11; }
+    if (c < 0 || strncmp(b, "INNER", 5)) { printf("  link: fd=%d errno=%d body=%s\n", c, errno, b); return 12; }
+    return 0;
+}
+static int mi_procfd_below_mask(int m) {
+    (void)m; int r = mi_enter("e", 0, 0); if (r) return r;
+    int fd = open("/mi", O_PATH | O_DIRECTORY); if (fd < 0) return 10;
+    if (mount("tmpfs", "/mi/x", "tmpfs", 0, NULL) < 0) return 11;
+    put("/mi/x/f", "TMPFS", 0644);
+    char p[64], b[16] = {0}; snprintf(p, sizeof p, "/proc/self/fd/%d/x/f", fd);
+    if (slurp(p, b, sizeof b) <= 0 || strncmp(b, "TMPFS", 5)) { printf("  mask: body=%s\n", b); return 12; }
+    return 0;
+}
+static void mntiso_procfd_suite(void) {
+    put("/root/mntiso-secret", "HOST", 0644);
+    report("procfd_reopen_ro_erofs", nn_in_child(mi_procfd_reopen_ro, 0));
+    report("procfd_below_ro_erofs", nn_in_child(mi_procfd_below_ro, 0));
+    report("procfd_below_nodev_eacces", nn_in_child(mi_procfd_below_nodev, 0));
+    report("procfd_below_link_in_ns", nn_in_child(mi_procfd_below_link, 0));
+    report("procfd_below_mask", nn_in_child(mi_procfd_below_mask, 0));
+    report("procfd_host_sentinel_intact", mi_host_intact());
+}
 
 /* ── lane mntiso-busy: mount roots are EBUSY, cross-mount ops EXDEV ── */
 static int mb_prep(void) {
@@ -2451,6 +2545,7 @@ int main(int argc, char **argv) {
     opentree_suite();
     fdbindprop_suite();
     mro_suite();
+    mntiso_procfd_suite();
     shmbind_suite();
     devbind_suite();
     mntiso_busy_suite();
