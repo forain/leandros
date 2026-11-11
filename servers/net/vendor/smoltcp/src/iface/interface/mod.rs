@@ -1885,6 +1885,10 @@ impl InterfaceInner {
                 }
 
                 emit_ip(&ip_repr, tx_buffer);
+                // LEANDROS: IPV6_TCLASS.
+                if meta.tos != 0 {
+                    Ipv6Packet::new_unchecked(&mut tx_buffer[..]).set_traffic_class(meta.tos);
+                }
                 Ok(())
             }),
         }

@@ -33,6 +33,8 @@ impl InterfaceInner {
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
     ) -> Option<Packet<'frame>> {
         let ipv6_repr = check!(Ipv6Repr::parse(ipv6_packet));
+        // LEANDROS: the traffic class, for IPV6_RECVTCLASS (see udp::Socket::process).
+        self.rx_tos = ipv6_packet.traffic_class();
 
         if !ipv6_repr.src_addr.is_unicast() {
             // Discard packets with non-unicast source addresses.
