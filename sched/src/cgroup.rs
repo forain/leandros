@@ -59,6 +59,8 @@ static DEPTH: [AtomicU8; CG_MAX] = [Z8; CG_MAX];
 static GEN: [AtomicU32; CG_MAX] = [Z32; CG_MAX];
 /// Threads in the node and all descendants (zombies included until reap).
 static NR_TASKS: [AtomicU32; CG_MAX] = [Z32; CG_MAX];
+/// cgroup.freeze requested on this cgroup itself (hierarchical: see `freeze_effective`).
+static FREEZE_REQ: [AtomicU8; CG_MAX] = [Z8; CG_MAX];
 /// Threads in the node itself.
 static DIRECT: [AtomicU32; CG_MAX] = [Z32; CG_MAX];
 /// Live direct children.
@@ -97,6 +99,19 @@ fn init_tree(t: &mut CgTree) {
 
 /// Node 0 is alive from boot, before anything calls `init_tree`.
 #[inline]
+/// Record the `cgroup.freeze` request of `cg`.
+pub fn set_freeze_req(cg: CgId, on: bool) { FREEZE_REQ[cg as usize % CG_MAX].store(on as u8, Release) }
+
+/// True when `cg` or any ancestor has `cgroup.freeze` set (Linux: a cgroup is
+/// frozen if it or an ancestor is). Tasks joining such a cgroup are frozen.
+pub fn freeze_effective(mut cg: CgId) -> bool {
+    loop {
+        if FREEZE_REQ[cg as usize % CG_MAX].load(Acquire) != 0 { return true; }
+        if cg == 0 { return false; }
+        cg = parent(cg);
+    }
+}
+
 pub fn alive(cg: CgId) -> bool {
     cg == 0 || ((cg as usize) < CG_MAX && ALIVE[cg as usize].load(Acquire) == 1)
 }
@@ -203,6 +218,7 @@ pub fn create(parent_cg: CgId, name: &str, uid: u32, gid: u32) -> Result<CgId, i
             NR_DESC[i].store(0, Release);
             NS_PINS[i].store(0, Release);
             SUBTREE[i].store(0, Release);
+            FREEZE_REQ[i].store(0, Release);
             PIDS_MAX[i].store(UNLIMITED, Release);
             PIDS_PEAK[i].store(0, Release);
             PIDS_EV_MAX[i].store(0, Release);

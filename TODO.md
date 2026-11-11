@@ -23,7 +23,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **netns**: TCP over a tap in a netns (?).
 - **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
 - **mntunshare is not an isolation boundary for root-run workloads** (M6).
-- **rename on devfs unsupported.**
 
 ### Network
 - **No IPv6 / AF_INET6** (sshd `[::]:22` fails with EAFNOSUPPORT; podman IPv6 deferred).
