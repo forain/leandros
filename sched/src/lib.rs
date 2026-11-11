@@ -2879,6 +2879,24 @@ pub fn current_mntns() -> ns::NsId {
     ns::mntns_of(current_pid())
 }
 
+/// True while the calling task is in a non-initial mount namespace AND the VFS
+/// marked the current call as ns-resolved: filesystems must never follow a
+/// symlink on their own (D1, mntiso-strict).
+pub fn strict_links() -> bool {
+    if current_mntns() == 0 { return false; }
+    RUN_QUEUE.lock().find_pid(current_pid()).map_or(false, |t| t.strict_links)
+}
+
+/// Set the strict flag of the calling task; returns the previous value.
+pub fn set_strict_links(v: bool) -> bool {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    match rq.find_pid_mut(pid) {
+        Some(t) => core::mem::replace(&mut t.strict_links, v),
+        None => false,
+    }
+}
+
 /// Copy `pid`'s chroot root (host-absolute) into `buf`, truncated to
 /// `max_len`. Returns its full length, or 0 when the task is not chrooted —
 /// the caller's cue to skip all root handling. `-1` if there is no such task.
