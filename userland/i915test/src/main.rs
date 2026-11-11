@@ -1232,6 +1232,16 @@ const DRM_IOCTL_MODE_GETPLANERESOURCES: c_ulong = 0xC010_64B5;
 const DRM_IOCTL_MODE_CREATE_DUMB: c_ulong = 0xC020_64B2;
 const DRM_IOCTL_MODE_DESTROY_DUMB: c_ulong = 0xC004_64B4;
 const EBUSY: i32 = 16;
+const ATOMIC_ASYNC: u32 = 0x2;
+const P_IN_FENCE_FD: u32 = 53;
+const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: c_ulong = 0xC010_64C1;
+const DRM_IOCTL_WAIT_VBLANK: c_ulong = 0xC018_643A;
+const DRM_IOCTL_CRTC_GET_SEQUENCE: c_ulong = 0xC018_643B;
+const DRM_IOCTL_MODE_PAGE_FLIP: c_ulong = 0xC018_64B0;
+#[repr(C)] struct WaitVblank { typ: u32, seq: u32, tv_sec: i64, tv_usec: i64 }
+#[repr(C)] struct CrtcSeq { crtc_id: u32, active: u32, sequence: u64, sequence_ns: i64 }
+#[repr(C)] struct PageFlip { crtc_id: u32, fb_id: u32, flags: u32, reserved: u32, user_data: u64 }
+#[repr(C)] struct SyncobjFd { handle: u32, flags: u32, fd: i32, pad: u32 }
 const FLIP_EVENT: u32 = 0x1;
 const ATOMIC_TEST_ONLY: u32 = 0x100;
 const ATOMIC_NONBLOCK: u32 = 0x200;
@@ -1303,7 +1313,7 @@ unsafe fn kms_async() {
     }
     report(b"kms_cursor_plane_exposed", planes[0] == PLANE_PRIMARY && planes[1] == PLANE_CURSOR);
     let mut cap = GetCap { capability: 0x8 /* CURSOR_WIDTH */, value: 0 };
-    report(b"kms_cap_cursor_64", io(cfd, DRM_IOCTL_GET_CAP, &mut cap).is_ok() && cap.value == 64);
+    report(b"kms_cap_cursor_size", io(cfd, DRM_IOCTL_GET_CAP, &mut cap).is_ok() && cap.value == 256);
     let mut dummy = 0u64;
     if io(cfd, DRM_IOCTL_SET_MASTER, &mut dummy).is_err() {
         out(b"    (card0 has another master, e.g. a greeter: async flip tests skipped)\n");
@@ -1353,6 +1363,81 @@ unsafe fn kms_async() {
     let e2 = read_event(cfd, 1000);
     report(b"kms_blocking_commit_waits", p1 && p2 && matches!(e1, Some((2, 0xC1, _))) && matches!(e2, Some((2, 0xC2, _))));
     if let (Some((_, _, s1)), Some((_, _, s2))) = (e1, e2) { report(b"kms_event_sequence_advances", s2 > s1); }
+
+    // lane i915feat: caps, real WAIT_VBLANK, async flips, IN_FENCE_FD, big cursors.
+    let mut cap7 = GetCap { capability: 0x7, value: 0 };
+    report(b"kms_cap_async_page_flip", io(cfd, DRM_IOCTL_GET_CAP, &mut cap7).is_ok() && cap7.value == 1);
+    let mut cap8 = GetCap { capability: 0x8, value: 0 };
+    report(b"kms_cap_cursor_256", io(cfd, DRM_IOCTL_GET_CAP, &mut cap8).is_ok() && cap8.value == 256);
+
+    let vb = |typ: u32, seq: u32| -> Result<(u32, i64, i64), i32> {
+        let mut v = WaitVblank { typ, seq, tv_sec: 0, tv_usec: 0 };
+        io(cfd, DRM_IOCTL_WAIT_VBLANK, &mut v).map(|_| (v.seq, v.tv_sec, v.tv_usec))
+    };
+    let v0 = vb(1, 0);
+    report(b"kms_wait_vblank_relative0_now", v0.is_ok());
+    let s0 = v0.map_or(0, |v| v.0);
+    let tw = mono_ms();
+    let v1 = vb(1, 1);
+    let v2 = vb(1, 1);
+    let v3 = vb(1, 1);
+    let tw = mono_ms() - tw;
+    report(b"kms_wait_vblank_sequence_advances", matches!((v1, v2, v3), (Ok(a), Ok(b), Ok(c)) if a.0 > s0 && b.0 > a.0 && c.0 > b.0));
+    // Three frames at 60 Hz take 33..50 ms; a stub that returns at once fails.
+    report(b"kms_wait_vblank_takes_frames", v3.is_ok() && tw >= 25 && tw < 400);
+    note(b"3 vblank waits ms", tw);
+    report(b"kms_wait_vblank_timestamp", matches!(v3, Ok((_, sec, _)) if sec > 0));
+    let t1 = mono_ms();
+    let past = vb(0, s0);
+    report(b"kms_wait_vblank_absolute_past_immediate", past.is_ok() && mono_ms() - t1 < 10);
+    let fut = vb(0, s0.wrapping_add(8));
+    report(b"kms_wait_vblank_absolute_future", matches!(fut, Ok(f) if f.0.wrapping_sub(s0.wrapping_add(8)) < 100));
+    report(b"kms_wait_vblank_bad_crtc_einval", vb(0x2000_0001, 0) == Err(EINVAL));
+    let mut gs = CrtcSeq { crtc_id: 1, active: 0, sequence: 0, sequence_ns: 0 };
+    report(b"kms_crtc_get_sequence", io(cfd, DRM_IOCTL_CRTC_GET_SEQUENCE, &mut gs).is_ok() && gs.active == 1 && gs.sequence >= s0 as u64 && gs.sequence_ns > 0);
+
+    // Async flip: accepted, completes its event, never with a modeset.
+    let a1 = added && atomic(cfd, PLANE_PRIMARY, &prim, FLIP_EVENT | ATOMIC_NONBLOCK | ATOMIC_ASYNC, 0xD1).is_ok();
+    report(b"kms_async_flip_accepted", a1);
+    report(b"kms_async_flip_event", a1 && matches!(read_event(cfd, 1000), Some((2, 0xD1, _))));
+    report(b"kms_async_flip_modeset_einval", atomic(cfd, PLANE_PRIMARY, &prim, ATOMIC_ASYNC | 0x400, 0) == Err(EINVAL));
+    let l1 = added && io(cfd, DRM_IOCTL_MODE_PAGE_FLIP, &mut PageFlip { crtc_id: 1, fb_id: fc.fb_id, flags: 3, reserved: 0, user_data: 0xD2 }).is_ok();
+    report(b"kms_legacy_async_flip", l1 && matches!(read_event(cfd, 1000), Some((2, 0xD2, _))));
+
+    // IN_FENCE_FD: -1 is none, a signalled sync_file passes, junk is EINVAL.
+    let mut sc = SyncobjCreate { handle: 0, flags: 1 };
+    let sig = io(cfd, DRM_IOCTL_SYNCOBJ_CREATE, &mut sc).is_ok() && sc.handle != 0;
+    let mut hf = SyncobjFd { handle: sc.handle, flags: 1, fd: -1, pad: 0 };
+    let sfd = if sig && io(cfd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut hf).is_ok() { hf.fd } else { -1 };
+    report(b"kms_in_fence_fd_exported", sfd >= 0);
+    let with = |fd: i64| [(P_FB_ID, pfb), (P_CRTC_ID, 1), (P_IN_FENCE_FD, fd as u64)];
+    report(b"kms_in_fence_fd_minus1_ok", atomic(cfd, PLANE_PRIMARY, &with(-1), ATOMIC_TEST_ONLY, 0).is_ok());
+    let f1 = atomic(cfd, PLANE_PRIMARY, &with(sfd as i64), FLIP_EVENT | ATOMIC_NONBLOCK, 0xE1);
+    report(b"kms_in_fence_fd_signalled_flips", sfd >= 0 && f1.is_ok() && matches!(read_event(cfd, 1000), Some((2, 0xE1, _))));
+    report(b"kms_in_fence_fd_junk_einval", atomic(cfd, PLANE_PRIMARY, &with(9999), 0, 0) == Err(EINVAL));
+    if sfd >= 0 { close(sfd); }
+
+    // Cursors beyond 64x64: 128 and 256 ARGB images, as Linux's skl+ cursor.
+    for &csz in &[128u32, 256] {
+        let mut d2 = CreateDumb { width: csz, height: csz, bpp: 32, ..Default::default() };
+        let ok2 = io(cfd, DRM_IOCTL_MODE_CREATE_DUMB, &mut d2).is_ok() && d2.handle != 0;
+        let mut f2 = FbCmd2 { width: csz, height: csz, pixel_format: 0x3432_5241, ..Default::default() };
+        f2.handles[0] = d2.handle;
+        f2.pitches[0] = d2.pitch;
+        let add2 = ok2 && io(cfd, DRM_IOCTL_MODE_ADDFB2, &mut f2).is_ok() && f2.fb_id != 0;
+        let sh = (csz as u64) << 16;
+        let kv = [(P_CRTC_ID, 1u64), (P_FB_ID, f2.fb_id as u64), (P_CRTC_X, 40), (P_CRTC_Y, 40),
+            (P_CRTC_W, csz as u64), (P_CRTC_H, csz as u64), (P_SRC_X, 0), (P_SRC_Y, 0), (P_SRC_W, sh), (P_SRC_H, sh)];
+        let r = add2 && atomic(cfd, PLANE_CURSOR, &kv, FLIP_EVENT | ATOMIC_NONBLOCK, 0xF0 + (csz >> 7) as u64).is_ok();
+        let name: &[u8] = if csz == 128 { b"kms_cursor_128_image" } else { b"kms_cursor_256_image" };
+        report(name, r && matches!(read_event(cfd, 1000), Some((2, u, _)) if u == 0xF0 + (csz >> 7) as u64));
+        if let Some(sz) = proc_i915(b"cursor_size") { report(if csz == 128 { b"kms_cursor_128_in_hw" } else { b"kms_cursor_256_in_hw" }, sz == csz as u64); }
+        let _ = atomic(cfd, PLANE_CURSOR, &[(P_FB_ID, 0), (P_CRTC_ID, 0)], 0, 0);
+        let mut id = f2.fb_id;
+        if add2 { let _ = io(cfd, DRM_IOCTL_MODE_RMFB, &mut id); }
+        let mut dh2 = d2.handle;
+        if ok2 { let _ = io(cfd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut dh2); }
+    }
 
     // L8.9 (lane i915wc): a WC CPU mapping is honoured — a scanout object
     // written only through MMAP_OFFSET_WC flips without the clflush, while a
