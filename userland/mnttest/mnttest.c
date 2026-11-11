@@ -257,7 +257,7 @@ static int sb_dev_live(unsigned long dev) {
         char *e;
         unsigned long v = strtoul(q, &e, 10);
         if (e == q) break;
-        if (v == (dev & 0xffffffffUL)) return 1;
+        if (v == (unsigned long)(((dev & 0xff) | ((dev >> 12) & ~0xffUL)) & 0xffffffffUL)) return 1; /* minor(st_dev) */
         q = (*e == ',') ? e + 1 : e;
     }
     return 0;
