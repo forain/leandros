@@ -507,6 +507,129 @@ static int banner(const char *addr, int port) {
     return 0;
 }
 
+
+// ---- L4 ip6link: link-local addresses, scope ids, NDP on the real NIC ----
+#include <sys/ioctl.h>
+
+static int if_inet6_find(const char *ifn, const char *prefix, char *line, size_t ll) {
+    FILE *f = fopen("/proc/net/if_inet6", "r");
+    if (!f) return 0;
+    char b[256]; int found = 0;
+    while (fgets(b, sizeof b, f)) {
+        size_t n = strlen(b);
+        while (n && (b[n-1] == '\n' || b[n-1] == ' ')) b[--n] = 0;
+        size_t k = strlen(ifn);
+        if (n >= k && !strcmp(b + n - k, ifn) && !strncmp(b, prefix, strlen(prefix))) {
+            if (line) snprintf(line, ll, "%s", b);
+            found = 1; break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static int eth0_mac(unsigned char *m) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq r; memset(&r, 0, sizeof r); strcpy(r.ifr_name, "eth0");
+    int ok = s >= 0 && ioctl(s, 0x8927 /* SIOCGIFHWADDR */, &r) == 0;
+    if (ok) memcpy(m, r.ifr_hwaddr.sa_data, 6);
+    if (s >= 0) close(s);
+    return ok;
+}
+
+static void test_ll_present(void) {
+    unsigned char m[6]; char want[40], line[256] = "";
+    int ok = eth0_mac(m);
+    if (ok) {
+        snprintf(want, sizeof want, "fe80000000000000%02x%02x%02xfffe%02x%02x%02x",
+                 m[0] ^ 2, m[1], m[2], m[3], m[4], m[5]);
+        ok = if_inet6_find("eth0", "fe80", line, sizeof line) && !strncmp(line, want, 32);
+        // addr ifindex prefix(0x40) scope(0x20)
+        if (ok) { unsigned ix, pl, sc; ok = sscanf(line + 33, "%x %x %x", &ix, &pl, &sc) == 3 && pl == 0x40 && sc == 0x20 && ix == if_nametoindex("eth0"); }
+    }
+    if (!ok) printf("  want fe80::..%s got [%s]\n", ok ? "" : "", line);
+    CHECK("ll_present", ok);
+}
+
+static struct sockaddr_in6 router_ll(void) {
+    struct sockaddr_in6 a; memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6;
+    inet_pton(AF_INET6, "fe80::2", &a.sin6_addr);
+    a.sin6_scope_id = if_nametoindex("eth0");
+    return a;
+}
+
+static void test_ping6_ll_router(void) {
+    int s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (s < 0) { CHECK("ping6_ll_router", 0); return; }
+    tmo(s, 3);
+    struct sockaddr_in6 a = router_ll();
+    int good = 0;
+    for (int seq = 1; seq <= 4; seq++) {
+        uint8_t q[64], r[256];
+        size_t n = echo_req(q, 0x4321, seq);
+        if (sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) != (ssize_t)n) continue;
+        int got = await_reply(s, seq, r, sizeof r);
+        if (got == 24 && !memcmp(r + 8, q + 8, 16)) good++;
+    }
+    close(s);
+    if (good != 4) printf("  ping fe80::2%%eth0: %d/4\n", good);
+    CHECK("ping6_ll_router", good == 4);
+}
+
+static void test_ll_noscope(void) {
+    struct sockaddr_in6 a = router_ll();
+    a.sin6_port = htons(53);
+    a.sin6_scope_id = 0;
+    int s = socket(AF_INET6, SOCK_STREAM, 0); tmo(s, 2);
+    int r = connect(s, (struct sockaddr *)&a, sizeof a);
+    int e1 = errno; close(s);
+    int u = socket(AF_INET6, SOCK_DGRAM, 0); tmo(u, 2);
+    ssize_t w = sendto(u, "x", 1, 0, (struct sockaddr *)&a, sizeof a);
+    int e2 = errno; close(u);
+    // A scope id naming no interface is ENODEV on Linux.
+    a.sin6_scope_id = 9999;
+    int s2 = socket(AF_INET6, SOCK_STREAM, 0); tmo(s2, 2);
+    int r2 = connect(s2, (struct sockaddr *)&a, sizeof a);
+    int e3 = errno; close(s2);
+    CHECK("ll_noscope", r == -1 && e1 == EINVAL && w == -1 && e2 == EINVAL && r2 == -1 && e3 == ENODEV);
+}
+
+static void test_ll_bind_scope(void) {
+    char line[256];
+    struct sockaddr_in6 a; memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6;
+    int ok = if_inet6_find("eth0", "fe80", line, sizeof line);
+    if (ok) {
+        for (int i = 0; i < 16; i++) { unsigned v; sscanf(line + 2 * i, "%2x", &v); a.sin6_addr.s6_addr[i] = v; }
+        int s = socket(AF_INET6, SOCK_DGRAM, 0);
+        int r0 = bind(s, (struct sockaddr *)&a, sizeof a); int e0 = errno;   // no scope: EINVAL
+        a.sin6_scope_id = if_nametoindex("eth0");
+        int r1 = bind(s, (struct sockaddr *)&a, sizeof a);
+        ok = r0 == -1 && e0 == EINVAL && r1 == 0;
+        close(s);
+    }
+    CHECK("ll_bind_scope", ok);
+}
+
+static int set_disable(int v) {
+    int fd = open("/proc/sys/net/ipv6/conf/eth0/disable_ipv6", O_WRONLY);
+    if (fd < 0) return -1;
+    char c[2] = { (char)('0' + v), '\n' };
+    int r = write(fd, c, 2) == 2 ? 0 : -1;
+    close(fd);
+    return r;
+}
+
+static void test_disable_ipv6(void) {
+    int a = set_disable(1) == 0;
+    int gone = a && !if_inet6_find("eth0", "fe80", NULL, 0);
+    int b = set_disable(0) == 0;
+    int back = 0;
+    for (int i = 0; b && i < 20 && !back; i++) { back = if_inet6_find("eth0", "fe80", NULL, 0); if (!back) usleep(100000); }
+    CHECK("disable_ipv6", gone && back);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 4 && !strcmp(argv[1], "banner")) return banner(argv[2], atoi(argv[3]));
     test_socket6();
@@ -533,6 +656,11 @@ int main(int argc, char **argv) {
     test_gai();
     test_gni6();
     test_localhost_fallback();
+    test_ll_present();
+    test_ping6_ll_router();
+    test_ll_noscope();
+    test_ll_bind_scope();
+    test_disable_ipv6();
     printf("ip6test: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
