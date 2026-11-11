@@ -6529,13 +6529,17 @@ fn sys_execveat(dirfd: usize, path_ptr: usize, argv_ptr: usize, envp_ptr: usize,
 /// Re-resolve the symlinks of `kp` in its mount namespace (exec reads the file
 /// from the backing path, past the VFS path chokepoint that does this for the
 /// other path syscalls). Namespace 0 and paths without a namespace form pass.
-fn ns_follow_links(kp: KPath) -> Result<KPath, isize> {
+fn ns_follow_links(kp: KPath) -> Result<KPath, isize> { ns_follow_links_ex(kp, true) }
+
+/// As `ns_follow_links`, with the final component followed only when `follow`
+/// (AF_UNIX bind names the socket node itself).
+fn ns_follow_links_ex(kp: KPath, follow: bool) -> Result<KPath, isize> {
     let mns = sched::current_mntns();
     if mns == 0 { return Ok(kp); }
     let nsb = match kp.ns.as_ref() { Some(n) => n.clone(), None => return Ok(kp) };
     let jail = sched::current_root_arc();
     let floor: &[u8] = jail.as_deref().unwrap_or(b"/");
-    match vfs::ns_resolve_links(mns, &nsb, true, floor) {
+    match vfs::ns_resolve_links(mns, &nsb, follow, floor) {
         Ok(Some((nsp, _, _))) if nsp != nsb => KPath::from_ns(nsp),
         Ok(_) => Ok(kp),
         Err(e) => Err(e as isize),
@@ -6774,7 +6778,10 @@ fn sys_execve_kp(kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: boo
         // file). For an unjailed task this is the same absolute path as
         // before.
         if plen == 0 || plen >= KPATH_MAX { drop(new_as); return -8; }
-        let interp_kp = match resolve_ns(&raw[..plen]).and_then(KPath::from_ns) {
+        // In a mount namespace the interpreter's symlinks resolve in
+        // namespace space too (an absolute link is anchored at the pivoted
+        // root, never at the host volume).
+        let interp_kp = match resolve_ns(&raw[..plen]).and_then(KPath::from_ns).and_then(ns_follow_links) {
             Ok(k) => k,
             Err(_) => { drop(new_as); return -2; }
         };
@@ -9575,6 +9582,7 @@ fn may_mount() -> bool {
 fn resolve_mount_target(target_ptr: usize) -> Result<Vec<u8>, isize> {
     let p = resolve_user_path(target_ptr)?;
     if let Some((fd, b"")) = proc_own_fd(p.ns_bytes()) { return fd_mount_ns_path(fd); }
+    let p = ns_follow_links(p)?;
     Ok(p.ns_bytes().to_vec())
 }
 
@@ -9609,7 +9617,7 @@ fn mount_target_kpath(target_ptr: usize) -> Result<KPath, isize> {
     if let Ok(raw) = copy_user_str(target_ptr, 4096) {
         if let Some((fd, b"")) = proc_own_fd(&raw) { return KPath::from_ns(fd_mount_ns_path(fd)?); }
     }
-    resolve_user_path(target_ptr)
+    ns_follow_links(resolve_user_path(target_ptr)?)
 }
 
 fn sys_mount(
@@ -10170,7 +10178,7 @@ fn sys_umount_ns(mns: sched::ns::NsId, target_ptr: usize, flags: usize) -> isize
     if flags as u32 as usize & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 { return -22; }
     if flags & MNT_EXPIRE != 0 && flags & (MNT_FORCE | MNT_DETACH) != 0 { return -22; }
     if flags & MNT_EXPIRE != 0 { return -22; }
-    let target = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+    let target = match resolve_user_path(target_ptr).and_then(|p| ns_follow_links_ex(p, flags & UMOUNT_NOFOLLOW == 0)) { Ok(p) => p, Err(e) => return e };
     match vfs::mnt::umount(mns, target.ns_bytes(), flags & MNT_DETACH != 0) { Ok(()) => 0, Err(e) => e as isize }
 }
 
@@ -13353,7 +13361,7 @@ fn sys_socket(domain: usize, sock_type: usize, protocol: usize) -> isize {
 /// The net server used sun_path verbatim, as a host-absolute path, so a
 /// chrooted tmux (or ssh-agent, or dbus) bound `/tmp/tmux-0/default` in the
 /// host's /tmp, not its own, and a relative name never resolved at all.
-fn unix_sockaddr_backing(addr_ptr: usize, addrlen: usize) -> Result<Option<KPath>, isize> {
+fn unix_sockaddr_backing(addr_ptr: usize, addrlen: usize, follow: bool) -> Result<Option<KPath>, isize> {
     const AF_UNIX: u16 = 1;
     const SUN_PATH_MAX: usize = 108;
     if addrlen < 3 { return Ok(None); }
@@ -13375,13 +13383,15 @@ fn unix_sockaddr_backing(addr_ptr: usize, addrlen: usize) -> Result<Option<KPath
             }
         }
     }
-    Ok(Some(KPath::from_ns(resolve_ns(name)?)?))
+    // Mount-namespace tasks: links resolve in namespace space (bind names the
+    // node itself, so its final component is not followed).
+    Ok(Some(ns_follow_links_ex(KPath::from_ns(resolve_ns(name)?)?, follow)?))
 }
 
 /// NET_BIND / NET_CONNECT for `sockfd`, carrying the resolved pathname (see
 /// `unix_sockaddr_backing`) in args 3-4.
 fn net_addr_call(tag: u64, sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
-    let host = match unix_sockaddr_backing(addr_ptr, addrlen) { Ok(h) => h, Err(e) => return e };
+    let host = match unix_sockaddr_backing(addr_ptr, addrlen, tag != net_server::NET_BIND) { Ok(h) => h, Err(e) => return e };
     let (hp, hl) = match &host { Some(k) => (k.ptr() as u64, k.bytes().len() as u64), None => (0, 0) };
     let msg = make_vfs_msg(tag, &[sockfd as u64, addr_ptr as u64, addrlen as u64, hp, hl]);
     let r = net_reply_val(&net_server::handle(&msg, current_pid()));
