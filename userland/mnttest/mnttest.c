@@ -245,6 +245,24 @@ static int ns_counts(int *live, int *sbs) {
     return sscanf(q, "ns_live=%d ns_dying=%d sb_count=%d", live, &dying, sbs) == 3 ? 0 : -1;
 }
 
+/* Is the superblock with this st_dev live? Identity, not a global count:
+ * other tasks mount and unmount concurrently, so sb_count deltas flake. */
+static int sb_dev_live(unsigned long dev) {
+    static char buf[8192];
+    if (slurp("/proc/mntselftest", buf, sizeof buf) <= 0) return -1;
+    char *q = strstr(buf, "sb_devs=");
+    if (!q) return -1;
+    q += 8;
+    while (*q && *q != '\n') {
+        char *e;
+        unsigned long v = strtoul(q, &e, 10);
+        if (e == q) break;
+        if (v == (dev & 0xffffffffUL)) return 1;
+        q = (*e == ',') ? e + 1 : e;
+    }
+    return 0;
+}
+
 static void sync_parent(int wr, int rd) { char c = 'x'; write(wr, &c, 1); read(rd, &c, 1); }
 
 /* The unprivileged child: user + mount namespace, then the whole tour. */
@@ -967,6 +985,17 @@ static void tmpfs_anywhere(void) {
     n = slurp("/proc/sys/kernel/ngroups_max", buf, sizeof buf);
     report("proc_ngroups_max", n > 0 && atoi(buf) > 0);
     mkdir(d, 0755);
+    /* Concurrent mount churn elsewhere (any other task): the superblock
+     * registry is system-wide, so a count delta flakes; identity does not. */
+    const char *cd = "/root/mt-tfs-churn.d";
+    mkdir(cd, 0755);
+    pid_t churn = fork();
+    if (churn == 0) {
+        for (;;) {
+            if (mount("shm", cd, "tmpfs", 0, "size=64k") == 0) umount(cd);
+        }
+    }
+    usleep(20000);
     ns_counts(&live0, &sb0);
     stat(d, &st0);
     int r = mount("shm", d, "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777,size=65536k");
@@ -981,10 +1010,14 @@ static void tmpfs_anywhere(void) {
     struct statfs sf;
     report("tfs_nosuid_flag", statfs(d, &sf) == 0 && (sf.f_flags & 2));
     ns_counts(&live1, &sb1);
-    report("tfs_sb_registered", sb1 == sb0 + 1);
+    stat(d, &st1);
+    unsigned long tdev = st1.st_dev;
+    printf("# tfs count delta (old verdict) %d, churn running\n", sb1 - sb0);
+    report("tfs_sb_registered", sb_dev_live(tdev) == 1);
     r = umount(d);
     report("tfs_umount_ok", r == 0);
-    report("tfs_umount_frees", stat(f, &st1) != 0 && ns_counts(&live1, &sb1) == 0 && sb1 == sb0);
+    report("tfs_umount_frees", stat(f, &st1) != 0 && sb_dev_live(tdev) == 0);
+    if (churn > 0) { kill(churn, SIGKILL); waitpid(churn, NULL, 0); umount(cd); rmdir(cd); }
     /* a second umount is not a mountpoint */
     errno = 0;
     report("tfs_umount_twice_einval", umount(d) < 0 && errno == EINVAL);

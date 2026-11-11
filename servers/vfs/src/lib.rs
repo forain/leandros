@@ -6830,6 +6830,9 @@ fn gen_mntselftest() -> Option<VnodeKind> {
     let mut s = alloc::string::String::new();
     for (name, ok) in mnt::selftest() { let _ = writeln!(s, "{}: {}", name, if ok { "PASS" } else { "FAIL" }); }
     let _ = writeln!(s, "ns_live={} ns_dying={} sb_count={}", sched::ns::live_count(), sched::ns::dying_count(), mnt::sb_count());
+    let _ = write!(s, "sb_devs=");
+    for d in mnt::sb_devs() { let _ = write!(s, "{},", d); }
+    let _ = writeln!(s);
     proc_snapshot(b"/tmp/.mntselftest", s.as_bytes(), false)
 }
 
