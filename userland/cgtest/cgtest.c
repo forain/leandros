@@ -777,6 +777,43 @@ static int t_cg_freeze_real(void)
     return 0;
 }
 
+/* A task migrated into an already-frozen cgroup is frozen; migrated back out
+ * of it into a thawed cgroup it resumes (Linux cgroup_freezer semantics). */
+static int t_cg_freeze_join(void)
+{
+    CHECK(mnt() == 0);
+    CHECK(mkdir(CGR "/cgt_j", 0755) == 0);
+    CHECK(wr(CGR "/cgt_j/cgroup.freeze", "1") == 0);
+    volatile unsigned long *ctr = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(ctr != MAP_FAILED);
+    pid_t c = fork();
+    if (c == 0) { for (;;) (*ctr)++; }
+    CHECK(c > 0);
+    usleep(100000);
+    CHECK(*ctr > 0);
+    CHECK(wrpid(CGR "/cgt_j/cgroup.procs", c) == 0);
+    char b[128];
+    int ok = 0;
+    for (int i = 0; i < 100 && !ok; i++) {
+        if (rd(CGR "/cgt_j/cgroup.events", b, sizeof b) > 0 && strstr(b, "frozen 1")) ok = 1;
+        else usleep(50000);
+    }
+    CHECK(ok);
+    unsigned long a = *ctr;
+    usleep(300000);
+    CHECK(*ctr == a);
+    /* back out to the root cgroup: thawed */
+    CHECK(wrpid(CGR "/cgroup.procs", c) == 0);
+    usleep(300000);
+    CHECK(*ctr > a);
+    CHECK(wrpid(CGR "/cgt_j/cgroup.procs", c) == 0);
+    usleep(200000);
+    CHECK(wr(CGR "/cgt_j/cgroup.kill", "1") == 0);
+    CHECK(killed(c));
+    CHECK(rmdir_retry(CGR "/cgt_j") == 0);
+    return 0;
+}
+
 /* freeze/kill follow directory ownership: EACCES for a non-owner, writable after chown */
 static int t_cg_freeze_delegate(void)
 {
@@ -839,7 +876,7 @@ int main(int argc, char **argv)
         { "cg_pids_max", t_cg_pids_max }, { "cg_proc_files", t_cg_proc_files },
         { "cg_boot_controllers", t_cg_boot_controllers }, { "cg_child_ctrl_files", t_cg_child_ctrl_files },
         { "cg_child_pids_enforced", t_cg_child_pids_enforced }, { "cg_dirfd_open", t_cg_dirfd_open },
-        { "cg_kill_tree", t_cg_kill_tree }, { "cg_freeze_delegate", t_cg_freeze_delegate }, { "cg_freeze_real", t_cg_freeze_real },
+        { "cg_kill_tree", t_cg_kill_tree }, { "cg_freeze_delegate", t_cg_freeze_delegate }, { "cg_freeze_real", t_cg_freeze_real }, { "cg_freeze_join", t_cg_freeze_join },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();
