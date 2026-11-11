@@ -2381,7 +2381,7 @@ static void mntiso_procfd_suite(void) {
     report("procfd_below_link_in_ns", nn_in_child(mi_procfd_below_link, 0));
     report("procfd_below_mask", nn_in_child(mi_procfd_below_mask, 0));
     report("procfd_host_sentinel_intact", mi_host_intact());
-
+}
 
 /* ── lane mntiso-busy: mount roots are EBUSY, cross-mount ops EXDEV ── */
 static int mb_prep(void) {
