@@ -1013,6 +1013,7 @@ static void tmpfs_anywhere(void) {
     stat(d, &st1);
     unsigned long tdev = st1.st_dev;
     printf("# tfs count delta (old verdict) %d, churn running\n", sb1 - sb0);
+    { static char dbg[8192]; slurp("/proc/mntselftest", dbg, sizeof dbg); char *q = strstr(dbg, "sb_devs="); printf("# st_dev=%lx %s", tdev, q ? q : "(no sb_devs)\n"); }
     report("tfs_sb_registered", sb_dev_live(tdev) == 1);
     r = umount(d);
     report("tfs_umount_ok", r == 0);
