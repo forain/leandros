@@ -221,8 +221,11 @@ fn frozen_all(cg: CgId) -> bool {
 
 /// Apply the cgroup's freeze state to every process of its subtree.
 fn apply_freeze(cg: CgId, on: bool) {
+    cgroup::set_freeze_req(cg, on);
     for t in cgroup::subtree_tgids(cg) {
-        if on { sched::freeze_group(t) } else { sched::thaw_group(t) }
+        if on { sched::freeze_group(t) }
+        // Thawing an ancestor leaves tasks of a still-frozen descendant parked.
+        else if !cgroup::freeze_effective(cgroup::cg_of(t)) { sched::thaw_group(t) }
     }
 }
 
@@ -256,7 +259,16 @@ pub fn write(pid: u32, cg: CgId, f: F, data: &[u8]) -> isize {
             let anc = cgroup::common_ancestor(src, cg);
             if !may_write(pid, cgroup::dir_owner(anc).0) { return -13; }
             if !sched::host_root_of(pid) && fsuid != sched::euid_of(tgid) && fsuid != sched::ruid_of(tgid) { return -13; }
-            cgroup::migrate_tgid(tgid, cg, view_root(pid))
+            let r = cgroup::migrate_tgid(tgid, cg, view_root(pid));
+            // The mover adopts the destination's freezer state (Linux
+            // cgroup_freezer_migrate_task): into a frozen cgroup it stops, out
+            // of one into a thawed cgroup it resumes.
+            if r == 0 && src != cg {
+                let (was, now) = (cgroup::freeze_effective(src), cgroup::freeze_effective(cg));
+                if now && !was { sched::freeze_group(tgid); }
+                else if was && !now { sched::thaw_group(tgid); }
+            }
+            r
         }
         F::SubtreeControl => {
             let s = match core::str::from_utf8(data) { Ok(s) => s, Err(_) => return -22 };

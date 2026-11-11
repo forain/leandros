@@ -12,7 +12,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **The switch-back CPU charge still takes RUN_QUEUE** (~22.5k holds/s); needs a lock-free `on_cpu` release protocol.
 - **New writers of signal state must call `sig_kick`**; a miss shows as `miss` > 0 in `/proc/rqhold` (invariant, no known violation).
 - **Flakes to root-cause**: `epolltest unrelated_unix_traffic_no_wake` (11% vs 1/8 threshold in a busy session), `sigtest` (?), `mnttest` tfs_* ordering.
-- **Page cache**: dirty `MAP_SHARED` pages stay dirty while mapped writable (no rmap); global `CACHE` lock contention unmeasured.
 - **F2FS fsync log is private-format, not Linux's**: fsync of a regular file is already durable without a checkpoint (roll-forward records in the checkpoint pack, lanes f2fsync/f2fsrf; fsync p50 4.7 ms -> 0.3 ms) and the mount rolls Linux-written fsync chains forward, but Linux itself cannot recover a file fsynced by this server after a crash (it ignores the LRF1 records). Needs a warm/hot node-log write side with FSYNC/DENT marks (curseg-sequential node allocation + SSA/summary updates). See artifacts/notes/lane-f2fsfsync-2026-11-11.md.
 - **Interrupt-context serial diagnostics can drop under back-pressure** (by design).
 - **fd-limit fence loss**: EMFILE in a virgl client's submit kills its context (as Linux); fd headroom is the defence.
@@ -21,10 +20,8 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ### Podman / namespaces / cgroups
 - **Unconverted `host_root()` privilege checks** (SYS_TIME/SYS_BOOT/SYS_MODULE/RAWIO/WAKE_ALARM done in lane/capclock; rest still all-or-nothing): vt.rs (CAP_SYS_TTY_CONFIG), net raw sockets (CAP_NET_RAW), evdev (CAP_SYS_ADMIN, verify), block.rs (CAP_SYS_ADMIN/CAP_SYS_RAWIO), vfs tmpfs chown/chmod (CAP_CHOWN/CAP_FOWNER), ACCT/VHANGUP/SWAPON (CAP_SYS_PACCT/TTY_CONFIG/SYS_ADMIN), ptrace/kill-like (CAP_SYS_PTRACE/CAP_KILL), mount (CAP_SYS_ADMIN), xattr (CAP_SYS_ADMIN/FOWNER), f2fs (CAP_DAC_OVERRIDE); sys_secprobe/dbg_serial/spawn stay kernel-private.
-- **netns**: TCP over a tap in a netns (?).
 - **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
 - **mntunshare is not an isolation boundary for root-run workloads** (M6).
-- **rename on devfs unsupported.**
 
 ### Network
 - **No IPv6 / AF_INET6** (sshd `[::]:22` fails with EAFNOSUPPORT; podman IPv6 deferred).
@@ -33,12 +30,12 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **iwlwifi gaps** (lane iwlgaps 2026-11-11: WMM later-beacon updates, STATISTICS_NOTIFICATION and antenna comparison were already implemented; sparse ping loss 0/300 on LeandrOS vs 4/300 on Linux, same AP; 2.4 GHz is channel noise): still open: TX MIMO/STBC/SGI on 5 GHz unmeasured (the saved 5 GHz profile/passphrase is not on the stick; add the profile and A/B `iwlwifi.rscol`/`txmimo`).
 - **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
 - **`netwatch.loss=S` not exercised in QEMU.**
-- **Podman published ports**: TCP NAT port reservation open; rootful `-p`, `--internal`, host-NIC reach deferred.
+- **Podman published ports**: rootful `-p` and `--internal` firewall semantics open (iptables-shim design: artifacts/notes/lane-podports-2026-11-11.md); TCP NAT port reservation done; host-NIC reach deferred.
 - **r8169 RX stalls/chip resets on the PC**: ISR-mask fix needs PC confirmation (R8169 as a loadable module also deferred).
 
 ### Desktop / GPU / COSMIC
-- **Venus/Vulkan**: cross-open dmabuf import deferred (`artifacts/notes/m9-crossopen-dmabuf/`), aarch64 vkwl untested.
-- **i915**: cursor 64x64 only, no async flips, no real `WAIT_VBLANK`, no `IN_FENCE_FD`.
+- **Venus/Vulkan**: cross-open dmabuf import deferred (`artifacts/notes/m9-crossopen-dmabuf/`), aarch64 vkwl untested; Venus submit still synchronous (parks on fence IRQ, no async completion).
+- **i915** (cursors to 256x256, async flips, hardware WAIT_VBLANK and IN_FENCE_FD landed in lane/i915feat): `WAIT_VBLANK` polls PIPE_FRMCOUNT every 500 us, not IRQ-driven; `DRM_VBLANK_EVENT`/`SIGNAL` return EINVAL; `IN_FENCE_FD` is a CPU wait before the commit, so a NONBLOCK commit blocks on an unsignalled in-fence; wide cursors use the capped plane-1A watermark (no own skl_compute_wm); async flips need the on-screen fb's pitch/size.
 - **Laptop**: low FPS under COSMIC; Firefox on iris unproven; Wi-Fi link still weak on 2.4 GHz.
 - **x86 audio clipping** in DOOM/PipeWire (lane/doomvis).
 - **PipeWire sink is named "Virtio Sound Output"** whatever the backend (HDA on the PC shows that name).

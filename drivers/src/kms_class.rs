@@ -78,6 +78,13 @@ pub struct KKmsFlipOps {
     pub event: extern "C" fn(ctx: usize, ev: u32),
     pub busy: extern "C" fn(ctx: usize) -> bool,
     pub wait_idle: extern "C" fn(ctx: usize, timeout_ns: u64) -> bool,
+    // Added after the first release of this table: read only when `size`
+    // covers them (an older module's table ends at `wait_idle`).
+    pub queue_async: Option<extern "C" fn(ctx: usize, token: u32, src_x: u32, src_y: u32, ev: u32) -> i32>,
+    /// `out[0]` = counter, `out[1]` = monotonic ns of the latest vblank.
+    pub frame: Option<extern "C" fn(ctx: usize, out: *mut u64)>,
+    /// Sleep until the counter reaches `target`; false on timeout, else `out` as `frame`.
+    pub wait_frame: Option<extern "C" fn(ctx: usize, target: u32, timeout_ns: u64, out: *mut u64) -> bool>,
 }
 
 #[repr(C)]
@@ -161,6 +168,22 @@ fn f_queue(tok: u32, sx: u32, sy: u32, ev: u32) -> Result<(), DriverError> { let
 fn f_event(ev: u32) { let (t, c) = tb!(FL_T, FL_C); (t.event)(c, ev) }
 fn f_busy() -> bool { let (t, c) = tb!(FL_T, FL_C); (t.busy)(c) }
 fn f_wait(ns: u64) -> bool { let (t, c) = tb!(FL_T, FL_C); (t.wait_idle)(c, ns) }
+const FL_V1: usize = core::mem::offset_of!(KKmsFlipOps, queue_async);
+fn f_queue_async(tok: u32, sx: u32, sy: u32, ev: u32) -> Result<(), DriverError> {
+    let (t, c) = tb!(FL_T, FL_C);
+    match t.queue_async { Some(f) if t.size as usize > FL_V1 => errno(f(c, tok, sx, sy, ev)), _ => Err(DriverError::Errno(22)) }
+}
+fn f_frame() -> (u32, u64) {
+    let (t, c) = tb!(FL_T, FL_C);
+    let mut o = [0u64; 2];
+    if let Some(f) = t.frame { f(c, o.as_mut_ptr()); }
+    (o[0] as u32, o[1])
+}
+fn f_wait_frame(target: u32, ns: u64) -> Option<(u32, u64)> {
+    let (t, c) = tb!(FL_T, FL_C);
+    let mut o = [0u64; 2];
+    match t.wait_frame { Some(f) if f(c, target, ns, o.as_mut_ptr()) => Some((o[0] as u32, o[1])), _ => None }
+}
 
 // cursor (const generic = slot)
 fn cu_set<const N: usize>(s: &KmsCursorSrc, x: i32, y: i32) -> bool {
@@ -226,7 +249,13 @@ pub fn register_raw(kind: u32, ops: *const u8, ctx: usize) -> i32 {
             let o = get!(KKmsFlipOps);
             if !claim(&FL_T, o as *const _) { return -17; }
             FL_C.store(ctx, Ordering::Release);
-            gpu_kms::register_flip(FL.call_once(|| KmsFlip { queue: f_queue, event: f_event, busy: f_busy, wait_idle: f_wait }));
+            gpu_kms::register_flip(FL.call_once(|| {
+                let v = o.size as usize > FL_V1;
+                KmsFlip { queue: f_queue, event: f_event, busy: f_busy, wait_idle: f_wait,
+                    queue_async: if v && o.queue_async.is_some() { Some(f_queue_async) } else { None },
+                    frame: if v && o.frame.is_some() { Some(f_frame) } else { None },
+                    wait_frame: if v && o.wait_frame.is_some() { Some(f_wait_frame) } else { None } }
+            }));
         }
         KIND_CURSOR | KIND_CURSOR2 => {
             let n = (kind == KIND_CURSOR2) as usize;
