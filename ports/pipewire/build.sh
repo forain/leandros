@@ -35,9 +35,10 @@ stage_alpine() {
   # binfmt emulation (build-in-alpine.sh then installs into a foreign root).
   PLAT="${LEANDROS_PW_PLATFORM:-$PLAT}"
   SNAP=$(mktemp -d "${TMPDIR:-/tmp}/pipewire-port-src.XXXXXX")
-  cp "$HERE/build-in-alpine.sh" "$HERE"/*.c "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
+  cp "$HERE/build-in-alpine.sh" "$HERE"/*.c "$HERE"/*.h "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
   # sonames the image packs itself (keep in sync with ports/firefox/build.sh)
-  sed -n '/^cat > "\$SNAP\/image-sonames.txt"/,/^EOF/p' "$ROOT/ports/firefox/build.sh" \
+  # ports/firefox/build.sh is gone (vanilla Alpine firefox); without it, pack everything
+  { sed -n '/^cat > "\$SNAP\/image-sonames.txt"/,/^EOF/p' "$ROOT/ports/firefox/build.sh" 2>/dev/null || true; } \
     | sed '1d;$d' > "$SNAP/image-sonames.txt"
   MNT=""
   LIBC_DIR="$ART/musl-dynamic/sysroot/$ARCH/usr/lib"

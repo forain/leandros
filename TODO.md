@@ -6,17 +6,17 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ## Known bugs
 
+- [ ] mntiso E7: add a host_to_view hint to the fd_ns_path reopen so links whose target is only reachable from another view resolve without the identity-check fallback (design-mntiso.md E7; open after lane/mntiso-procfd).
 ### Kernel / VFS
 - **Global scans on last close** of tmpfs/mounted files walk every fd table (O(all fds)); a per-object refcount would retire it and `FD_COPY_GATE`.
 - **Wake scans are O(parked pollers)**; keyed wake still dereferences each mask match (~11 us per scan). A per-tag index / kbits bloom would fix it.
 - **The switch-back CPU charge still takes RUN_QUEUE** (~22.5k holds/s); needs a lock-free `on_cpu` release protocol.
 - **New writers of signal state must call `sig_kick`**; a miss shows as `miss` > 0 in `/proc/rqhold` (invariant, no known violation).
-- **Flakes to root-cause**: `epolltest unrelated_unix_traffic_no_wake` (11% vs 1/8 threshold in a busy session), `sigtest` (?), `mnttest` tfs_* ordering.
+- **Flakes to root-cause**: `sigtest` timed_wait_stop_resumes_remainder (not captured; waitpid(WUNTRACED) 1 s lateness fixed 2026-11-11, re-watch).
 - **F2FS fsync log is private-format, not Linux's**: fsync of a regular file is already durable without a checkpoint (roll-forward records in the checkpoint pack, lanes f2fsync/f2fsrf; fsync p50 4.7 ms -> 0.3 ms) and the mount rolls Linux-written fsync chains forward, but Linux itself cannot recover a file fsynced by this server after a crash (it ignores the LRF1 records). Needs a warm/hot node-log write side with FSYNC/DENT marks (curseg-sequential node allocation + SSA/summary updates). See artifacts/notes/lane-f2fsfsync-2026-11-11.md.
 - **Interrupt-context serial diagnostics can drop under back-pressure** (by design).
 - **fd-limit fence loss**: EMFILE in a virgl client's submit kills its context (as Linux); fd headroom is the defence.
 - **Host-refused `RING_IDX` submit is never completed by QEMU** (descriptors lost); Mesa cannot reach it. Do not rewrite RING_IDX kernel-side.
-- **Pty background-child SIGHUP on su session end** unverified against Linux (?).
 
 ### Podman / namespaces / cgroups
 - **Unconverted `host_root()` privilege checks** (lane/capaudit 2026-11-11 converted: vt.rs TTY_CONFIG, net SOCK_RAW (ns_capable_in NET_RAW), evdev serialkbd/block.rs (SYS_ADMIN), ACCT/VHANGUP/SWAPON/SWAPOFF/KEXEC_LOAD, mount, ptrace/kill (cap_over/ptrace_cap/ipc_send_check no longer bypass for root), proc links/environ/oom/comm, nice/rtprio/prlimit, setuid/gid, NPROC bypass, PR_SET_MM, set_tid, cgroupfs chown/write, sysfs/acpi writes). STILL OPEN: vfs tmpfs chown/chmod (CAP_CHOWN/CAP_FOWNER) and xattr/f2fs `Cred::host_root` (cap_inode, trusted.*/security.* = CAP_SYS_ADMIN, CAP_DAC_OVERRIDE): `Cred.caps` is only filled for userns != 0 (cred_with_ns returns early for ns 0) and `Cred::new` has caps 0, so the fix needs ns-0 caps populated first; sys_secprobe/dbg_serial/spawn stay kernel-private.
@@ -38,7 +38,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **i915** (cursors to 256x256, async flips, hardware WAIT_VBLANK and IN_FENCE_FD landed in lane/i915feat): `WAIT_VBLANK` polls PIPE_FRMCOUNT every 500 us, not IRQ-driven; `DRM_VBLANK_EVENT`/`SIGNAL` return EINVAL; `IN_FENCE_FD` is a CPU wait before the commit, so a NONBLOCK commit blocks on an unsignalled in-fence; wide cursors use the capped plane-1A watermark (no own skl_compute_wm); async flips need the on-screen fb's pitch/size.
 - **Laptop**: low FPS under COSMIC; Firefox on iris unproven; Wi-Fi link still weak on 2.4 GHz.
 - **x86 audio clipping** in DOOM/PipeWire (lane/doomvis).
-- **PipeWire sink is named "Virtio Sound Output"** whatever the backend (HDA on the PC shows that name).
 - **Minimize applet un-hide unverified**; `cosmic-files-applet` smithay-clipboard OOM panic and `cosmic-notifications` panel-dbus Broken pipe have no root cause; greeter's cosmic-comp logs `eglMakeCurrent BadDisplay` on exit (cosmetic).
 - **Panel-embedded applets render with tiny-skia**; aarch64 desktop clicks need a physical-mouse check (P0 #5).
 - **VT switching**: a present inside its handler during a switch can flash; evdev VT gate not tested against cosmic-comp; `EVIOCGRAB` exclusive delivery unmeasured; `EVIOCREVOKE` ignored; Ctrl+Alt+Esc swallowed.
