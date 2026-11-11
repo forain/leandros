@@ -245,7 +245,23 @@ static int ns_counts(int *live, int *sbs) {
     return sscanf(q, "ns_live=%d ns_dying=%d sb_count=%d", live, &dying, sbs) == 3 ? 0 : -1;
 }
 
-/* Is the superblock with this st_dev live? Identity, not a global count:
+/* Minor of the "major:minor" mountinfo field of the mount at `mp` (0 = not found). */
+static unsigned long mount_dev_minor(const char *mp) {
+    static char buf[65536];
+    if (slurp("/proc/self/mountinfo", buf, sizeof buf) <= 0) return 0;
+    char pat[160];
+    snprintf(pat, sizeof pat, " %s ", mp);
+    for (char *ln = buf; ln && *ln; ln = strchr(ln, '\n') ? strchr(ln, '\n') + 1 : NULL) {
+        char *eol = strchr(ln, '\n');
+        char *h = strstr(ln, pat);
+        if (!h || (eol && h > eol)) continue;
+        unsigned id, parent, maj, mnr;
+        if (sscanf(ln, "%u %u %u:%u", &id, &parent, &maj, &mnr) == 4) return mnr;
+    }
+    return 0;
+}
+
+/* Is the superblock with this dev minor live? Identity, not a global count:
  * other tasks mount and unmount concurrently, so sb_count deltas flake. */
 static int sb_dev_live(unsigned long dev) {
     static char buf[8192];
@@ -257,7 +273,7 @@ static int sb_dev_live(unsigned long dev) {
         char *e;
         unsigned long v = strtoul(q, &e, 10);
         if (e == q) break;
-        if (v == (unsigned long)(((dev & 0xff) | ((dev >> 12) & ~0xffUL)) & 0xffffffffUL)) return 1; /* minor(st_dev) */
+        if (v == dev) return 1;
         q = (*e == ',') ? e + 1 : e;
     }
     return 0;
@@ -1010,10 +1026,8 @@ static void tmpfs_anywhere(void) {
     struct statfs sf;
     report("tfs_nosuid_flag", statfs(d, &sf) == 0 && (sf.f_flags & 2));
     ns_counts(&live1, &sb1);
-    stat(d, &st1);
-    unsigned long tdev = st1.st_dev;
-    printf("# tfs count delta (old verdict) %d, churn running\n", sb1 - sb0);
-    { static char dbg[8192]; slurp("/proc/mntselftest", dbg, sizeof dbg); char *q = strstr(dbg, "sb_devs="); printf("# st_dev=%lx %s", tdev, q ? q : "(no sb_devs)\n"); }
+    unsigned long tdev = mount_dev_minor(d);
+    printf("# tfs count delta (old verdict) %d, churn running; mount dev minor %lu\n", sb1 - sb0, tdev);
     report("tfs_sb_registered", sb_dev_live(tdev) == 1);
     r = umount(d);
     report("tfs_umount_ok", r == 0);
