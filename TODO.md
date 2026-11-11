@@ -26,7 +26,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **netns**: SETLINK move of an existing link; TCP over a tap in a netns (?).
 - **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
 - **mntunshare is not an isolation boundary for root-run workloads** (M6).
-- **rename on devfs unsupported.**
 - **Redundant `local_loop` case in podpasta** (duplicate of `loop_own`); podpastatest `bridge_ip` has no httpd in Alpine (now an nc loop) and leaks a baseline mount.
 - **cgsession: only `/bin/login` joins the session cgroup** (greetd/sshd/launcher/autologin need a helper).
 
