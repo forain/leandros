@@ -228,44 +228,6 @@ fn loop_own(sid: Sid, mac: [u8; 6], tx: &mut Vec<Vec<u8>>) {
     drivers::netdev::kick();
 }
 
-/// Frames this stack built for its own addresses never reach the wire: an
-/// ARP request for an own address is answered here and an IPv4 frame to the
-/// vif's own MAC is queued back to its receive side. Returns the frames that
-/// still leave. (The host NIC does the same in `local_delivery`.)
-fn local_loop(sid: Sid, mac: [u8; 6], own: &[[u8; 4]], tx: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-    let mut out = Vec::with_capacity(tx.len());
-    let mut back: Vec<Vec<u8>> = Vec::new();
-    for f in tx {
-        if f.len() >= 42 && f[12..14] == [0x08, 0x06] && f[20..22] == [0, 1] && own.iter().any(|a| a[..] == f[38..42]) {
-            let mut r = alloc::vec![0u8; 42];
-            r[0..6].copy_from_slice(&f[6..12]);
-            r[6..12].copy_from_slice(&mac);
-            r[12..14].copy_from_slice(&[0x08, 0x06]);
-            r[14..20].copy_from_slice(&f[14..20]);
-            r[20..22].copy_from_slice(&[0, 2]);
-            r[22..28].copy_from_slice(&mac);
-            r[28..32].copy_from_slice(&f[38..42]);
-            r[32..38].copy_from_slice(&f[22..28]);
-            r[38..42].copy_from_slice(&f[28..32]);
-            back.push(r);
-        } else if f.len() >= 14 && f[12..14] == [0x08, 0x00] && f[0..6] == mac {
-            back.push(f);
-        } else {
-            out.push(f);
-        }
-    }
-    if !back.is_empty() {
-        let mut v = VIFS.lock();
-        if let Some(x) = v[sid as usize].as_mut() {
-            for f in back { if x.rxq.len() < RXQ_CAP { x.rxq.push_back(f); } }
-            x.pending = true;
-        }
-        drop(v);
-        drivers::netdev::kick();
-    }
-    out
-}
-
 /// Poll every up tun/tap stack once. Called from the daemon pass.
 pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sched::WakeKeys,
                        changed: &mut bool, mask: &mut u64, next: &mut Option<smoltcp::time::Duration>) {
@@ -293,16 +255,12 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
             continue;
         }
         let mut dev = TapDev { rx, tx: Vec::new(), mtu };
-        let mut own: Vec<[u8; 4]> = Vec::new();
         {
             let mut g = stack_for(sid);
             if let Some(ref mut s) = *g {
                 let (c, m) = poll_stack(s, &mut dev, timestamp, &mut sigs[sid as usize], sid, keys);
                 *changed |= c; *mask |= m;
                 reap_orphans(s);
-                for c in s.interface.ip_addrs() {
-                    if let IpAddress::Ipv4(a) = c.address() { own.push(a.0); }
-                }
                 if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
                     *next = Some(next.map_or(d, |n| n.min(d)));
                 }
@@ -335,10 +293,6 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
                 }
             }
             continue;
-        }
-        // A namespace talking to its own interface address (Linux's `local` table).
-        if kind != VifKind::Veth && kind != VifKind::Bridge && !l3 {
-            dev.tx = local_loop(sid, mac, &own, dev.tx);
         }
         // Stack lock released: hand the frames to tundev.
         if h == NO_TUN { continue; }
@@ -505,7 +459,7 @@ fn sid_of_index(st: &NetNsState, v: &vifsel::VifTable, index: u32) -> Option<Sid
 pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
     if !sched::caps::ns_capable_in(sched::ns::owner_userns(1, ns), CAP_NET_ADMIN) { return 1; }
     match op {
-        RtOp::SetLink { index, up, mtu, mac, name, master } => {
+        RtOp::SetLink { index, up, mtu, mac, name, master, ns: nsel } => {
             let sid;
             {
                 let nss = NETNS.lock();
@@ -535,6 +489,16 @@ pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
             if let Some(m) = master {
                 let e = if m == 0 { release(sid) } else { enslave(ns, sid, m) };
                 if e != 0 { return e; }
+            }
+            // IFLA_NET_NS_FD / IFLA_NET_NS_PID: move the link to another netns
+            // (Linux `dev_change_net_namespace`: leaves its bridge, goes down,
+            // loses its addresses, gets a new ifindex there).
+            if !matches!(nsel, rtnetlink::PeerNs::Same) {
+                let tns = match resolve_peer_ns(&nsel, ns) { Ok(n) => n, Err(e) => return e };
+                if tns != ns {
+                    let e = move_link(ns, sid, tns);
+                    if e != 0 { return e; }
+                }
             }
             drivers::netdev::kick();
             0
@@ -686,6 +650,34 @@ fn pick_name(st: &NetNsState, v: &vifsel::VifTable, base: &[u8], also: Option<&[
     if taken(base) { return Err(17); }
     fin[..base.len()].copy_from_slice(base);
     Ok(fin)
+}
+
+/// Move the tun/veth/bridge `sid` of `ns` to netns `tns`.
+fn move_link(ns: u16, sid: Sid, tns: u16) -> i32 {
+    if !sched::caps::ns_capable_in(sched::ns::owner_userns(1, tns), CAP_NET_ADMIN) { return 1; }
+    crate::vif::claim(tns);
+    let _ = release(sid); // a bridge port leaves its bridge
+    {
+        let mut nss = NETNS.lock();
+        let mut v = VIFS.lock();
+        nss.entry(tns).or_insert_with(|| NetNsState::new(tns));
+        if nss[&tns].sids.len() + 1 > ns_sid_cap(tns) { return 23; }
+        let Some(cur) = v[sid as usize].as_ref().map(|x| x.name) else { return 19 };
+        let nm = &cur[..name_len(&cur)];
+        let clash = nm == b"lo" || nss[&tns].sids.iter().any(|&q| v[q as usize].as_ref()
+            .map_or(false, |x| &x.name[..name_len(&x.name)] == nm));
+        let fin = if clash {
+            match pick_name(&nss[&tns], &v, b"eth%d", None) { Ok(n) => n, Err(e) => return e }
+        } else { cur };
+        let ifindex = { let st = nss.get_mut(&tns).unwrap(); let i = st.next_ifindex; st.next_ifindex += 1; i };
+        if let Some(st) = nss.get_mut(&ns) { st.sids.retain(|&q| q != sid); }
+        nss.get_mut(&tns).unwrap().sids.push(sid);
+        let x = v[sid as usize].as_mut().unwrap();
+        x.netns = tns; x.ifindex = ifindex; x.name = fin;
+        x.admin_up = false; x.addrs.clear(); x.rxq.clear(); x.rxsrc.clear();
+    }
+    sync_addrs(sid, &[]);
+    0
 }
 
 fn veth_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>, mac: Option<[u8; 6]>, up: bool,

@@ -25,7 +25,12 @@ pub const SECURE_NO_CAP_AMBIENT_RAISE: u64 = 1 << 6;
 pub const SECURE_ALL_LOCKS: u64 = 0xaa;
 pub const SECURE_ALL_BITS: u64 = 0x55;
 pub const CAP_SETPCAP: u32 = 8;
+pub const CAP_SYS_MODULE: u32 = 16;
+pub const CAP_SYS_RAWIO: u32 = 17;
 pub const CAP_SYS_CHROOT: u32 = 18;
+pub const CAP_SYS_BOOT: u32 = 22;
+pub const CAP_SYS_TIME: u32 = 25;
+pub const CAP_WAKE_ALARM: u32 = 35;
 pub const CAP_LAST: u32 = 40;
 
 /// Capabilities of the first task inside a fresh user namespace: everything

@@ -15,6 +15,8 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <time.h>
+#include <sys/time.h>
 
 #define V3 0x20080522
 #define CAP_SETPCAP 8
@@ -121,6 +123,20 @@ static int t_drop_cannot_regain(void)
     CHECK(chroot("/") == -1 && errno == EPERM);
     CHECK(cset(d) == -1 && errno == EPERM); /* permitted is gone */
     CHECK(cget(d) == 0 && d[0].eff == 0 && d[0].prm == 0);
+    return 0;
+}
+
+static int t_sys_time_needs_cap(void)
+{
+    struct timespec now; CHECK(clock_gettime(CLOCK_REALTIME, &now) == 0);
+    struct timeval tv = { now.tv_sec, now.tv_nsec / 1000 };
+    struct dat all[2]; CHECK(cget(all) == 0);
+    CHECK(clock_settime(CLOCK_REALTIME, &now) == 0); /* full-cap root works */
+    unsigned e0 = all[0].prm & ~(1u << 25); /* CAP_SYS_TIME dropped from effective */
+    struct dat d[2] = { { e0, all[0].prm, 0 }, { all[1].eff, all[1].prm, 0 } };
+    CHECK(cset(d) == 0);
+    CHECK(clock_settime(CLOCK_REALTIME, &now) == -1 && errno == EPERM);
+    CHECK(settimeofday(&tv, NULL) == -1 && errno == EPERM);
     return 0;
 }
 
@@ -445,7 +461,7 @@ int main(int argc, char **argv)
     struct tc cs[] = {
         { "root_full", t_root_full }, { "status_matches", t_status_matches },
         { "nonroot_empty", t_nonroot_empty }, { "eff_subset", t_eff_subset },
-        { "drop_cannot_regain", t_drop_cannot_regain }, { "drop_effective_only", t_drop_effective_only },
+        { "drop_cannot_regain", t_drop_cannot_regain }, { "sys_time_needs_cap", t_sys_time_needs_cap }, { "drop_effective_only", t_drop_effective_only },
         { "fork_inherits", t_fork_inherits }, { "bset_drop", t_bset_drop },
         { "exec_nonroot_clears", t_exec_nonroot_clears },
         { "exec_nnp_keeps_dropped", t_exec_nnp_keeps_dropped },

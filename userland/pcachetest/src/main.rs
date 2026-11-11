@@ -565,6 +565,47 @@ unsafe fn t_fsync_durable() -> bool {
     report(name, true)
 }
 
+/// A store through a long-lived MAP_SHARED mapping must be written back by the
+/// background flusher (no msync, mapping kept), the PTE write-protected so the
+/// next store re-dirties the page (Linux's periodic writeback + page_mkclean).
+unsafe fn t_bg_writeback_mapped() -> bool {
+    let name = b"bg_writeback_mapped";
+    if !shared_maps_cached(name) { return true; }
+    let path = b"/root/pc_bgwb.bin\0";
+    let fd = open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 { return why(name, b"open", 0); }
+    if ftruncate(fd, PS) != 0 { close(fd); return why(name, b"ftruncate", 0); }
+    let map = mmap(core::ptr::null_mut(), PS, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if map as isize == -1 { close(fd); return why(name, b"mmap", 0); }
+    let wb0 = pcache_val(b"written_back").unwrap_or(0);
+    let mk0 = pcache_val(b"mkclean_ptes").unwrap_or(0);
+    *map = 0x5a;
+    let ts = timespec { tv_sec: 1, tv_nsec: 0 };
+    let mut got = false;
+    for _ in 0..30 {
+        nanosleep(&ts, core::ptr::null_mut());
+        if pcache_val(b"written_back").unwrap_or(0) > wb0 { got = true; break; }
+    }
+    if !got { munmap(map, PS); close(fd); unlink(path.as_ptr()); return why(name, b"never written back while mapped", 0); }
+    let mk1 = pcache_val(b"mkclean_ptes").unwrap_or(0);
+    // Re-dirty: a store after the write-back must fault and mark the page dirty.
+    let d0 = pcache_val(b"dirty_pages").unwrap_or(0);
+    *map = 0xa5;
+    let d1 = pcache_val(b"dirty_pages").unwrap_or(0);
+    let wb1 = pcache_val(b"written_back").unwrap_or(0);
+    let ok_re = d1 > d0 || wb1 > wb0 + 1;
+    msync(map, PS, MS_SYNC);
+    munmap(map, PS);
+    let mut b = [0u8; 1];
+    let n = pread(fd, b.as_mut_ptr(), 1, 0);
+    close(fd);
+    unlink(path.as_ptr());
+    if mk1 <= mk0 { return why(name, b"no PTE write-protected", 0); }
+    if !ok_re { return why(name, b"store after write-back not re-dirtied", 0); }
+    if n != 1 || b[0] != 0xa5 { return why(name, b"final byte wrong", b[0] as u64); }
+    report(name, true)
+}
+
 /// `pcachetest verify`: after a hard reset, the fsync'd/msync'd file of
 /// `fsync_durable` must hold exactly what was committed.
 unsafe fn verify_durable() -> i32 {
@@ -649,7 +690,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         if arg == b"quick" {
             let mut f = 0;
             for t in [t_write_read, t_mmap_coherent, t_mmap_clean, t_mmap_fork, t_truncate, t_unlink_open,
-                      t_two_procs, t_append, t_fsync_durable] {
+                      t_two_procs, t_append, t_fsync_durable, t_bg_writeback_mapped] {
                 if !t() { f += 1; }
             }
             say(b"--- pcachetest done ---\n");
@@ -658,9 +699,11 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     }
     let mut failures = 0;
     for t in [t_write_read, t_mmap_coherent, t_mmap_clean, t_mmap_fork, t_truncate, t_unlink_open,
-              t_two_procs, t_append, t_fsync_durable, t_big_evict] {
+              t_two_procs, t_append, t_fsync_durable, t_bg_writeback_mapped, t_big_evict] {
         if !t() { failures += 1; }
     }
+    let (a, c) = (pcache_val(b"cache_lock_acq").unwrap_or(0), pcache_val(b"cache_lock_contended").unwrap_or(0));
+    say(b"CACHE lock acquisitions "); say_num(a); say(b" contended "); say_num(c); say(b"\n");
     say(b"--- pcachetest done ---\n");
     failures
 }

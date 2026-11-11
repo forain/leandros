@@ -166,6 +166,9 @@ def quick(ssh, user, pw):
     step("stdin_eof", rc == 0 and out.strip() == "100000", f"rc={rc} out={out.strip()!r}")
     rc, out, err = ssh.run(user, "tty", password=pw, extra=("-tt",))
     step("exec_pty", rc == 0 and "/dev/pts/" in out, f"rc={rc} out={out.strip()!r}")
+    rc, out, err = ssh.run(user, "cat /proc/self/cgroup", password=pw)
+    step("session_cgroup", rc == 0 and "/user.slice/user-" in out and "/session-" in out,
+         f"rc={rc} out={out.strip()!r}")
 
 
 def full(ssh, user, pw, tmp):
