@@ -6413,7 +6413,7 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         if p >= buf.len() { return start; }
     }
     // Alias mounts (proc/devtmpfs/sysfs/bind), where the reader sees them.
-    for (dev, mp, fstype) in alias_mounts_for_reader() {
+    for (dev, mp, fstype, _sbi) in alias_mounts_for_reader() {
         let start = p;
         p = write_lit(buf, p, &dev);
         p = write_lit(buf, p, b" ");
@@ -6445,16 +6445,16 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
 /// The alias mounts as the calling task sees them: mount points inside its
 /// chroot with the root stripped; the rest omitted (as Linux hides mounts
 /// outside a reader's root). Unjailed readers see them all.
-fn alias_mounts_for_reader() -> Vec<(Vec<u8>, Vec<u8>, &'static str)> {
+fn alias_mounts_for_reader() -> Vec<(Vec<u8>, Vec<u8>, &'static str, Option<u32>)> {
     let root = sched::current_root_arc();
-    alias::list().into_iter().filter_map(|(dev, mp, fstype)| {
+    alias::list().into_iter().filter_map(|(dev, mp, fstype, sbi)| {
         match root.as_deref() {
             Some(r) if r.len() > 1 => {
                 if !alias::under(&mp, r) { return None; }
                 let v = if mp.len() == r.len() { b"/".to_vec() } else { mp[r.len()..].to_vec() };
-                Some((dev, v, fstype))
+                Some((dev, v, fstype, sbi))
             }
-            _ => Some((dev, mp, fstype)),
+            _ => Some((dev, mp, fstype, sbi)),
         }
     }).collect()
 }
@@ -6549,11 +6549,16 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         if p >= buf.len() { return start; }
         mount_id += 1;
     }
-    for (dev, mp, fstype) in alias_mounts_for_reader() {
+    for (dev, mp, fstype, sbi) in alias_mounts_for_reader() {
         let start = p;
         p = write_u32(buf, p, mount_id);
-        p = write_lit(buf, p, b" 20 0:");
-        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" 20 ");
+        // A tmpfs instance shows its superblock's device number (as Linux
+        // does); other aliases keep the synthetic `0:<mount id>`.
+        match sbi.and_then(mnt::sb_dev) {
+            Some(d) => { let (ma, mi) = dev_major_minor(d as u64); p = write_u32(buf, p, ma); p = write_lit(buf, p, b":"); p = write_u32(buf, p, mi); }
+            None => { p = write_lit(buf, p, b"0:"); p = write_u32(buf, p, mount_id); }
+        }
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, &mp);
         p = write_lit(buf, p, b" rw,nosuid,relatime");
@@ -6883,6 +6888,9 @@ fn gen_mntselftest() -> Option<VnodeKind> {
     let mut s = alloc::string::String::new();
     for (name, ok) in mnt::selftest() { let _ = writeln!(s, "{}: {}", name, if ok { "PASS" } else { "FAIL" }); }
     let _ = writeln!(s, "ns_live={} ns_dying={} sb_count={}", sched::ns::live_count(), sched::ns::dying_count(), mnt::sb_count());
+    let _ = write!(s, "sb_devs=");
+    for d in mnt::sb_devs() { let _ = write!(s, "{},", d); }
+    let _ = writeln!(s);
     proc_snapshot(b"/tmp/.mntselftest", s.as_bytes(), false)
 }
 
@@ -14746,6 +14754,24 @@ fn fd_note_mnt(pid: u32, fd: usize, ns: u16, mid: u32) {
     if let Some(tbl) = find_tbl(pid, &mut tbls) {
         if tbl.fds.used(fd) { ofd::set_mnt(tbl.fds[fd].ofd, ns, mid); }
     }
+}
+
+/// The (mount namespace, mount id) `pid`'s fd was opened through, if recorded.
+pub fn fd_mnt(pid: u32, fd: usize) -> Option<(u16, u32)> {
+    let pid = sched::tgid_of(pid);
+    let ofd = {
+        let mut tbls = TblSlot::new();
+        match find_tbl(pid, &mut tbls) {
+            Some(tbl) if tbl.fds.used(fd) => tbl.fds[fd].ofd,
+            _ => return None,
+        }
+    };
+    ofd::mnt_of(ofd)
+}
+
+/// `(st_dev, st_ino)` out of a filled `struct stat` buffer (same offsets on both ABIs).
+pub fn read_stat_id(stat_ptr: usize) -> (u64, u64) {
+    unsafe { ((stat_ptr as *const u64).read_unaligned(), ((stat_ptr + 8) as *const u64).read_unaligned()) }
 }
 
 /// EROFS when `fd` was opened through a mount that is read-only now.

@@ -1,0 +1,5 @@
+# lane mntiso-entry (E2) 2026-11-11 — PARTIAL (core DONE)
+- kernel/src/syscall.rs: `ns_follow_links_ex(kp, follow)`; PT_INTERP path now resolved through ns link resolution; AF_UNIX connect follows, bind resolves parents but not the final node (`unix_sockaddr_backing(.., follow)`); mount source/target (`mount_target_kpath`, `resolve_mount_target`) and umount target (honours UMOUNT_NOFOLLOW) resolve in ns space.
+- mnttest `entry_ns_suite`: interp_abs_link_in_root, unix_bind_abs_link_dir RED on main (box a64 lane/mntiso-entry-red), all GREEN after; unix_connect_abs_link, bind_src_abs_link, unix_bind_host_node_absent are guards (already fail-closed on main in this chroot setup; not red).
+- Evidence: box aarch64 mnttest 1/1 pass; full regress 83 suites 0 bad; podbridge+podpasta+podpause host tests 0 bad.
+- NOT done: link() with dest = mount root -> EBUSY. Linux link(2) gives EEXIST there (filename_create), EBUSY applies to rename; current EEXIST is correct, left unchanged. ffsandbox not run (needs Mac Firefox image).
