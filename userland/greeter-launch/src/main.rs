@@ -466,6 +466,10 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     chown_to_greeter(envp, b"XDG_RUNTIME_DIR=", b"WAYLAND_DISPLAY=", &acct);
     chown_to_greeter(envp, b"", b"GREETD_SOCK=", &acct);
 
+    // Join the greeter account's session cgroup while still root (the
+    // slice is created and handed to the account here, as /bin/login does).
+    leandros_libc::cgsession::join(acct.uid, acct.gid);
+
     // ---- cross the boundary --------------------------------------------------
     // Supplementary groups first: setgroups needs root, which setresuid below
     // gives up, and the effective gid becoming non-root right after setresgid

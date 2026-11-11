@@ -279,6 +279,7 @@ fn run(ci: usize, prefix: &str, msg: &Message, c: &Cr, looked: &mut Vec<u64>) ->
         VFS_UNLINK | VFS_RMDIR => {
             let (dir, name) = rc(parent_of(ci, rel(prefix, cstr(a(0))), c, looked))?;
             rc(call(ci, if msg.tag == VFS_UNLINK { UNLINK } else { RMDIR }, dir, c, &[&nul(&name)]))?;
+            files_deleted(ci, cstr(a(0)));
             Ok(reply(0))
         }
         VFS_RENAME => {
@@ -293,6 +294,9 @@ fn run(ci: usize, prefix: &str, msg: &Message, c: &Cr, looked: &mut Vec<u64>) ->
                 h[8..12].copy_from_slice(&flags.to_le_bytes());
                 rc(call(ci, RENAME2, od, c, &[&h, &nul(&on), &nul(&nn)]))?;
             }
+            // A replaced target is gone (RENAME_EXCHANGE swaps both names).
+            if flags & 2 == 0 { files_deleted(ci, cstr(a(1))); }
+            files_renamed(ci, cstr(a(0)), cstr(a(1)), flags & 2 != 0);
             Ok(reply(0))
         }
         VFS_SYMLINK => {
@@ -453,6 +457,33 @@ fn alloc_file(ci: usize, f: OFile) -> i64 {
     match cn.files.iter().position(|x| x.is_none()) {
         Some(i) => { cn.files[i] = Some(f); i as i64 }
         None => { cn.files.push(Some(f)); (cn.files.len() - 1) as i64 }
+    }
+}
+
+/// Open files name the path they were opened by (there are no dentries), so
+/// namespace changes are applied to those paths: a rename moves `old` and
+/// everything below it to `new`; readlink of /proc/self/fd/N follows it.
+fn files_renamed(ci: usize, old: &[u8], new: &[u8], exchange: bool) {
+    let mut g = CONNS.lock();
+    let Some(cn) = conn_mut(&mut g, ci) else { return };
+    let moved = |p: &[u8], from: &[u8], to: &[u8]| -> Option<Vec<u8>> {
+        if p == from { Some(to.to_vec()) }
+        else if p.len() > from.len() && p.starts_with(from) && p[from.len()] == b'/' {
+            let mut v = to.to_vec(); v.extend_from_slice(&p[from.len()..]); Some(v)
+        } else { None }
+    };
+    for f in cn.files.iter_mut().flatten() {
+        if let Some(v) = moved(&f.path, old, new) { f.path = v; }
+        else if exchange { if let Some(v) = moved(&f.path, new, old) { f.path = v; } }
+    }
+}
+
+/// `path` was removed: descriptors opened by it read as `<path> (deleted)`.
+fn files_deleted(ci: usize, path: &[u8]) {
+    let mut g = CONNS.lock();
+    let Some(cn) = conn_mut(&mut g, ci) else { return };
+    for f in cn.files.iter_mut().flatten() {
+        if f.path == path { f.path.extend_from_slice(b" (deleted)"); }
     }
 }
 

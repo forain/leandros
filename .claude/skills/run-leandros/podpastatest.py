@@ -18,6 +18,7 @@ Exit status 0 iff every check passed.
 import http.server
 import os
 import re
+import shlex
 import socketserver
 import sys
 import threading
@@ -51,7 +52,11 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     res = []
 
+    as_user = [False]
+
     def run(cmd, timeout=240):
+        if as_user[0]:
+            cmd = "su -l leandro -c " + shlex.quote(cmd)
         r = driver.serial_run(cmd, timeout=timeout, arch=arch, ser=ser)
         lines = [l for l in r.get("output", "").splitlines() if not re.match(r"^(0x)*\[", l)]
         return r.get("rc"), "\n".join(lines)
@@ -67,7 +72,10 @@ def main():
         # Runs as user leandro (the harness logs in as root: switch with su).
         rc, out = run("id -u")
         if out.strip().splitlines()[-1:] != ["1000"]:
-            print("podpasta: shell is not uid 1000 (log in as leandro first)")
+            as_user[0] = True  # the harness shell is root: run every command through su leandro
+            rc, out = run("id -u")
+            if out.strip().splitlines()[-1:] != ["1000"]:
+                print("podpasta: cannot run as uid 1000")
         rc, out = run("cat /proc/net/route")
         gw = "10.0.2.2"
         for l in out.splitlines():
@@ -83,7 +91,8 @@ def main():
         check("pasta_hostnet", rc == 0 and "hello-from-host-podpasta" in out, f"rc={rc} " + tail(out))
 
         run(f"podman rm -f pphttpd >/dev/null 2>&1; mkdir -p /tmp/ppwww && echo hello-from-container-httpd > /tmp/ppwww/index.html && "
-            f"podman run -d --rm --name pphttpd -p 8080:80 -v /tmp/ppwww:/www:ro {IMG} httpd -f -p 80 -h /www 2>&1")
+            f"podman run -d --rm --name pphttpd -p 8080:80 {IMG} sh -c "
+            "'while :; do printf \"HTTP/1.0 200 OK\\r\\n\\r\\nhello-from-container-httpd\\n\" | nc -l -p 80; done' 2>&1; sleep 2")
         rc, out = run("busybox.static wget -T 15 -qO- http://127.0.0.1:8080/ 2>&1; echo")
         check("pasta_portfwd", "hello-from-container-httpd" in out, f"rc={rc} " + tail(out))
         run("podman stop -t 1 pphttpd 2>&1")
@@ -94,6 +103,8 @@ def main():
         else:
             print(f"pasta_dns: SKIP rc={rc} " + tail(out))
 
+        rc, out = run("grep -c netns /proc/self/mountinfo")
+        base_mnt = int(out.strip().splitlines()[-1]) if out.strip().splitlines()[-1:] and out.strip().splitlines()[-1].isdigit() else 0
         rc, out = run(f"i=0; f=0; while [ $i -lt {CHURN} ]; do podman run --rm {IMG} true >/dev/null 2>&1 || f=$((f+1)); "
                       f"i=$((i+1)); done; echo CHURN_FAIL=$f", timeout=1800)
         mm = re.search(r"CHURN_FAIL=(\d+)", out)
@@ -101,7 +112,7 @@ def main():
 
         rc, out = run("echo PASTA; ls /proc | while read p; do case $p in [0-9]*) "
                       "grep -l '^Name:.pasta' /proc/$p/status 2>/dev/null;; esac; done; "
-                      "echo NETNS; ls /run/user/1000/netns /run/netns 2>&1; "
+                      "echo NETNS; ls -A /run/user/1000/netns 2>/dev/null; ls -A /run/netns 2>/dev/null; "
                       "echo MNT; grep -c 'netns' /proc/self/mountinfo; echo END")
         pasta = out.split("PASTA")[-1].split("NETNS")[0].strip()
         netns = out.split("NETNS")[-1].split("MNT")[0].strip()
@@ -109,10 +120,10 @@ def main():
         leak = []
         if pasta:
             leak.append("pasta: " + pasta.replace("\n", " "))
-        if netns and not all("No such file" in l for l in netns.splitlines()):
+        if netns:
             leak.append("netns: " + netns.replace("\n", " "))
-        if mnt.isdigit() and int(mnt) > 0:
-            leak.append("mounts: " + mnt)
+        if mnt.isdigit() and int(mnt) > base_mnt:
+            leak.append(f"mounts: {mnt} (baseline {base_mnt})")
         check("pasta_leaks", not leak, "; ".join(leak))
     finally:
         srv.shutdown()

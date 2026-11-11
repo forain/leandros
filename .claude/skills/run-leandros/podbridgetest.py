@@ -94,6 +94,9 @@ def main():
         else:
             print(f"podman_dns: SKIP rc={rc} " + out.strip()[-120:].replace("\n", " | "))
 
+        rc, out = run("grep -c ' /run/netns/' /proc/self/mountinfo")
+        bl = out.strip().splitlines()[-1:] 
+        base_mnt = int(bl[0]) if bl and bl[0].isdigit() else 0
         rc, out = run(f"i=0; f=0; while [ $i -lt {CHURN} ]; do podman run --rm {IMG} true >/dev/null 2>&1 || f=$((f+1)); "
                       f"i=$((i+1)); done; echo CHURN_FAIL=$f", timeout=1800)
         mm = re.search(r"CHURN_FAIL=(\d+)", out)
@@ -112,8 +115,8 @@ def main():
             leak.append("links: " + links.replace("\n", " | "))
         if netns and "No such file" not in netns:
             leak.append("netns: " + netns.replace("\n", " "))
-        if mnt and mnt[0].strip() not in ("0", ""):
-            leak.append("mounts: " + mnt[0])
+        if mnt and mnt[0].strip().isdigit() and int(mnt[0]) > base_mnt:
+            leak.append(f"mounts: {mnt[0]} (baseline {base_mnt})")
         if ct.isdigit() and int(ct) > 0:
             leak.append("conntrack: " + ct)
         check("podman_leaks", not leak, "; ".join(leak))

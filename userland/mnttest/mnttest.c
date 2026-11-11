@@ -2288,6 +2288,47 @@ static void devbind_suite(void) {
     }
 }
 
+/* ── lane mntiso-chroot: chroot inside a mntns (E4) ───────────────────── */
+/* mode 0: abs link to / , 1: ".." link, 2: exec through an in-jail abs link */
+static int cj_case(int m) {
+    mkdir("/tmp/cjm", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    if (mount("tmpfs", "/tmp/cjm", "tmpfs", 0, NULL) < 0) return 92;
+    chmod("/tmp/cjm", 0755);
+    mkdir("/tmp/cjm/sub", 0755); chmod("/tmp/cjm/sub", 0755);
+    if (symlink("/", "/tmp/cjm/sub/esc") < 0) return 93;
+    if (symlink("../../../..", "/tmp/cjm/sub/up") < 0) return 94;
+    if (m == 2) {
+        int in = open("/bin/mnttest", O_RDONLY); if (in < 0) return 95;
+        int a = open("/tmp/cjm/sub/m", O_WRONLY | O_CREAT, 0755); if (a < 0) return 96;
+        char buf[4096]; ssize_t n;
+        while ((n = read(in, buf, sizeof buf)) > 0) { if (write(a, buf, n) != n) return 97; }
+        close(a); close(in);
+        if (symlink("/m", "/tmp/cjm/sub/l") < 0) return 98;
+    }
+    if (chroot("/tmp/cjm/sub") < 0 || chdir("/") < 0) return 99;
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    if (m == 2) {
+        pid_t p = fork();
+        if (p == 0) { execl("/l", "/l", "child-ok", (char *)0); _exit(99); }
+        int st = 0; waitpid(p, &st, 0);
+        return WIFEXITED(st) && WEXITSTATUS(st) == 42 ? 0 : 10;
+    }
+    int fd = open(m == 0 ? "/esc/root/mntiso-secret" : "/up/root/mntiso-secret", O_RDONLY);
+    if (fd >= 0) { close(fd); return 11; }
+    return errno == ENOENT ? 0 : 12;
+}
+static void chroot_ns_suite(void) {
+    mkdir("/root", 0755);
+    int f = open("/root/mntiso-secret", O_WRONLY | O_CREAT, 0644);
+    if (f >= 0) { if (write(f, "HOST", 4) != 4) {} close(f); }
+    report("chroot_ns_abs_link", nn_in_child(cj_case, 0));
+    report("chroot_ns_dotdot_link", nn_in_child(cj_case, 1));
+    report("chroot_ns_exec_through_link", nn_in_child(cj_case, 2));
+    unlink("/root/mntiso-secret");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
@@ -2314,6 +2355,7 @@ int main(int argc, char **argv) {
     mro_suite();
     shmbind_suite();
     devbind_suite();
+    chroot_ns_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
