@@ -96,10 +96,33 @@ PRIME-exported dmabufs use the same mechanism (`/tmp/dmabuf:<n>`, unlinked immed
 ### Pipes and descriptor-only objects
 
 - **Pipes**: 128 rings (`MAX_PIPES`) of 16 KiB, `PIPE_BUF` = 4096 atomic writes. Each end is reference-counted, so EOF, `POLLHUP` and `EPIPE` fire only when the *last* fd on that end closes — which keeps shell pipelines correct across `fork`. `close` wakes the peer.
-- **eventfd** (1024, global), **timerfd** (256, monotonic, `TFD_TIMER_ABSTIME`), **signalfd** and **inotify** (accepts watches, delivers nothing — enough to keep a config-watch source quiet). All honour `O_NONBLOCK` and `*_CLOEXEC` at creation and keep refcounted pool slots, so `dup`'d fds do not alias each other.
+- **eventfd** (1024, global), **timerfd** (256, monotonic, `TFD_TIMER_ABSTIME`), **signalfd** and **inotify** (see [inotify](#inotify)). All honour `O_NONBLOCK` and `*_CLOEXEC` at creation and keep refcounted pool slots, so `dup`'d fds do not alias each other.
 - **pidfd** (`PidFd { pid }`): no pool, since pids are never reused; readable once the process has exited (see [../kernel/processes.md](../kernel/processes.md#pidfds)).
 - **Readiness** is computed from real state (`VFS_POLL`): ring occupancy and endpoint counts, the eventfd counter, timer expiry, process exit. See [../kernel/event-loop.md](../kernel/event-loop.md).
 - **splice / tee / vmsplice.** The kernel drives `splice` (`sys_splice`) through ring helpers that split the pipe read and write arms at the point where the other end's I/O happens: `pipe_peek` + `pipe_consume` on the read side (bytes a file or socket did not take stay queued), `pipe_reserve` + `pipe_commit` on the write side (ring space is reserved before the source is read and no other writer can take it meanwhile, so a socket or console byte read always has room — a writer racing into the same pipe used to make such a splice drop bytes; `syscalltest`'s `splice_socket_race`), `pipe_to_pipe` for two rings in one lock hold (also `tee`, which leaves the source intact). A splice returns as soon as it has moved anything — a full destination or an empty source pipe ends it short — and blocks only when it could move nothing (`EAGAIN` under `SPLICE_F_NONBLOCK` or an `O_NONBLOCK` pipe). The old `ENOSYS` stub existed because a move-everything loop deadlocked uutils `cat` on its own full broker pipe; the short count is what removes that. `off_in`/`off_out` give `pread`/`pwrite` semantics on the non-pipe end and `ESPIPE` on a pipe end. `vmsplice` is `readv`/`writev` on the pipe (no page gifting).
+
+### inotify
+
+[`inotify.rs`](../../servers/vfs/src/inotify.rs) is real, and on by default; the kernel command-line knob **`vfs.inotify=0`** is the kill switch (watches are then accepted but nothing fires, and the hooks cost one flag test). Watches live in the VFS and events are emitted from its own routing points (`inotify_hooks`) after an operation has succeeded, so no filesystem server needs to know about them. An instance is keyed by the id of its open file description (`VnodeKind::Inotify`), so `dup`, `fork` and `SCM_RIGHTS` share it and the last `ofd::put` frees it. `STATE` is a leaf lock and is never held across a wake; readiness is a keyed poll wake on the instance.
+
+- **Coverage.** Directory-entry events on **tmpfs** (`IN_CREATE`, `IN_DELETE`, `IN_MOVED_FROM/TO`), `IN_DELETE_SELF` plus `IN_IGNORED` for a removed watched directory and `IN_IGNORED` on `inotify_rm_watch`. A watch on another filesystem (f2fs, `/proc`) is accepted and never fires. `IN_ONESHOT`, `IN_MASK_ADD`, `IN_MASK_CREATE`, `IN_ONLYDIR`, `IN_DONT_FOLLOW`, `IN_EXCL_UNLINK` and `IN_Q_OVERFLOW` are honoured; identical queued events are coalesced.
+- **Limits.** Charged per (user namespace, kuid) up the namespace chain, like Linux `inc_ucount`: `max_user_instances` 128, `max_user_watches` 65536, `max_queued_events` 16384 (exceeding the queue delivers `IN_Q_OVERFLOW`), writable by root in `/proc/sys/fs/inotify/`, with read-only counters `events_queued`, `events_coalesced`, `events_overflow`, `instances` and `watches` beside them. A system-wide cap of 8192 instances backs them.
+- **Why default-on.** The knob stayed off until the desktop was measured: with the full COSMIC session idle for two minutes, total CPU rose from 0.30 % to 0.46 % busy, with no events at idle and 35 instances / 54 watches; write and create/unlink microbenchmarks with 200 unrelated watches stayed within 3 %. Rootless `podman` and `pasta` need real notifications and `fanotify`-free config reload.
+
+### Advisory locks
+
+`fcntl` (POSIX and OFD) and `flock` records are keyed by **(mount server port, inode) with the owner being the thread group**, not by the mount server's open-file slot (which is one per `open(2)`). Keying by slot made two processes opening the same file each see an uncontended lock; SQLite then let two writers both hold EXCLUSIVE and each deleted the other's journal, which surfaced as `podman run --rm` exiting 127. Release happens by slot (closing a description drops the process's records on that inode, as POSIX specifies), waiters park on an exact 64-bit poll key (`lock_wake_key`) and releases wake only that key, so unrelated keyed wakes with a colliding bloom bit no longer wake every waiter (751 wakes per 750 round trips before).
+
+### Other in-VFS filesystems
+
+- **FUSE** ([`servers/fuse`](../../servers/fuse)): `/dev/fuse` (char 10:229), `mount -t fuse[.sub]` with `fd=N,rootmode=,user_id=,group_id=[,allow_other]`, protocol 7.31. The VFS is path based, so each operation walks with `LOOKUP` and sends `FORGET` afterwards; open files hold one lookup until `RELEASE`. Callers park until the daemon replies, the last close of the device fd aborts the connection (`ENOTCONN`), and without `allow_other` only the mounting uid may access it. A mount whose mount point lies under a tmpfs root (`/tmp/x`) is honoured by `open` and `getdents`.
+- **POSIX message queues**: `mq_*` and `/dev/mqueue`, per IPC namespace ([`mqueue.rs`](../../servers/vfs/src/mqueue.rs)).
+- **cgroup2**: [`cgroupfs.rs`](../../servers/vfs/src/cgroupfs.rs) serves `/sys/fs/cgroup` and any `mount -t cgroup2`; see [../kernel/namespaces.md](../kernel/namespaces.md#cgroup-v2).
+- **overlayfs** is only partly built: the real-layer helper functions and a pseudo-pid credential override exist ([`ovl/`](../../servers/vfs/src/ovl)) but `mount -t overlay` is not wired.
+
+### Mount namespaces
+
+Processes in a non-initial mount namespace are resolved against a per-namespace mount tree (`mnt.rs`) instead of the alias table; processes in namespace 0 never touch it. The model (tree, propagation, `pivot_root`, `open_tree`/`move_mount`/`mount_setattr`, per-mount `ro`/`nodev`/`noexec`) is described in [../kernel/namespaces.md](../kernel/namespaces.md#mount-namespaces).
 
 ### Devices and the console
 

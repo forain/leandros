@@ -180,7 +180,7 @@ Known gaps:
 | ripgrep (vanilla Alpine package, [lock](../../ports/alpine/)) | `rg`, behind the `grep` shim | [programs.md](programs.md) |
 | [portal](../../ports/portal/) | xdg-desktop-portal frontend (Alpine) + xdg-desktop-portal-cosmic (cross-built, unmodified) | [build.sh](../../ports/portal/build.sh), [../desktop/session.md](../desktop/session.md#the-desktop-portal) |
 | [apk](../../ports/apk/) | `apk.static`, `alpine-sysroot`, Alpine keys/repositories and a CA bundle for in-guest builds; `claude-code-install` and its `claude` launcher | [build.sh](../../ports/apk/build.sh), [In-guest builds](#in-guest-builds-apk-without-containers), [below](#the-claude-code-cli) |
-| git (vanilla Alpine package, [lock](../../ports/alpine/)) | git 2.47 + git-remote-https, less, nano, OpenSSH's `sftp-server` and `/etc/terminfo`, repackaged from Alpine 3.21 like PipeWire; symlinks in the staged tree become hard links in the image | [build-in-alpine.sh](../../ports/git/build-in-alpine.sh), [programs.md](programs.md#sshd) |
+| git (vanilla Alpine package, [lock](../../ports/alpine/)) | git + git-remote-https, less, nano, OpenSSH's `sftp-server` and `/etc/terminfo`, symlinks in the staged tree become hard links in the image | [build-in-alpine.sh](../../ports/git/build-in-alpine.sh), [programs.md](programs.md#sshd) |
 | [pipewire](../../ports/pipewire/) | PipeWire 1.2.7 + WirePlumber from Alpine, the `leandros-snd-sink` virtio-snd sink, `pipewire-pulse`, `cosmic-applet-audio`, a ScreenCast-enabled `cosmic.portal` | [build.sh](../../ports/pipewire/build.sh), [../audio.md](../audio.md) |
 | [gstreamer](../../ports/gstreamer/) | GStreamer 1.24.11 (core, plugins-base/good whitelist, gst-libav on FFmpeg 6.1) and the PipeWire plugin 1.2.7 from Alpine 3.21, `gst-launch-1.0`/`gst-inspect-1.0`, a 30 s test clip, and the `-dev` files merged into the cross sysroot for cosmic-player's gstreamer-rs crates | this file |
 | iso-codes (vanilla Alpine package, [lock](../../ports/alpine/)) | Debian iso-codes 4.18.0 JSON tables (sha256-pinned) for Settings' Region page | [build.sh](../../ports/iso-codes/build.sh) |
@@ -268,19 +268,13 @@ Known gaps:
 
 ## Firefox
 
-Firefox 136 runs on both architectures as a native Wayland client under COSMIC, with
+Firefox runs on both architectures as a native Wayland client under COSMIC, with
 hardware WebRender on the GPU path, HTTP/2 and HTTP/3 browsing, FFmpeg media and PipeWire
 audio.
 
-**Gecko is not compiled.** [ports/firefox/build.sh](../../ports/firefox/build.sh) `apk add`s
-Alpine 3.21's prebuilt Firefox (the release the GPU Mesa stage is built on) in a container of
-the target architecture, collects its GTK3/NSS closure and fonts, rewrites the ELFs for the
-guest, and writes `ports/firefox/out/<arch>/` (~290 MB), which mkfs overlays. Because nothing
-compiles, the foreign architecture can run under emulation in a few minutes. Libraries
-Firefox `dlopen`s rather than links — system FFmpeg (`libavcodec`/`libavutil`) and `libpulse`
-— are invisible to a `DT_NEEDED` walk and are staged separately (`--dlopen-only`). Without
-FFmpeg, Firefox fell back to Cisco's OpenH264 plugin, a glibc build whose load failure
-crashed the media process; without `libpulse` there was no audio backend.
+**Sandboxes are on by default** (since 2026-11-08): the parent and fork server are unsandboxed; content, GMP (ClearKey), RDD, socket and utility processes run with `Seccomp: 2`, `NoNewPrivs: 1`, a user namespace (plus net and IPC where Firefox asks for them) and the void chroot. `LEANDROS_FIREFOX_SANDBOX=0` in `ports/firefox/firefox.sh` disables them. The kernel mechanisms are in [../kernel/namespaces.md](../kernel/namespaces.md#firefoxs-content-sandbox); the harness is `.claude/skills/run-leandros/ffsandbox.py`. `/etc/ld.so.conf` and `/etc/localtime` ship on disk because the sandbox policy reads them.
+
+**Gecko is not compiled.** Firefox is Alpine's prebuilt package, staged by mkfs from the lock `ports/alpine/<arch>.lock` together with its closure (GTK3, NSS, fonts, system FFmpeg and `libpulse`) like every other vanilla Alpine package ([above](#how-ports-are-built)); `ports/firefox/` holds only the launcher, the prefs file, the desktop entry and the icon list. The pinned version is whatever the lock says (151.0.3 on v3.24 at the time of writing). Libraries Firefox `dlopen`s rather than links (FFmpeg, `libpulse`) are invisible to a `DT_NEEDED` walk, so they are named in `ports/alpine/world` explicitly. Without FFmpeg, Firefox fell back to Cisco's OpenH264 plugin, a glibc build whose load failure crashed the media process; without `libpulse` there was no audio backend.
 
 `/bin/firefox` ([firefox.sh](../../ports/firefox/firefox.sh)) refuses to start without a GPU
 renderer rather than let WebRender fall back to software, and

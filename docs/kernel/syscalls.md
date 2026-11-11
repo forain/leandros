@@ -72,7 +72,7 @@ Coverage, by area (each links to the page that owns the semantics):
 - sockets: AF_UNIX, AF_INET (TCP/UDP/ICMP), `SCM_RIGHTS`, `sendmmsg`/`recvmmsg`, UDP GSO ([servers/networking.md](../servers/networking.md));
 - misc: `uname`, `getrandom`, `reboot`, `getcpu`, `getrusage` and `wait4`'s `rusage` (user/system split, maxrss carried across execve, minflt/majflt where a fault is major only when it reached a device, nvcsw/nivcsw; `RUSAGE_THREAD` is the thread's own), `unshare` (`CLONE_FS`), `capget`/`capset`.
 
-Deliberate non-implementations answer the way Linux would for the caller: `clone3` returns `ENOSYS` so callers take their portable fallback (`clone`); root-only operations the kernel does not implement (`acct`, `swapon`, `iopl`/`ioperm`) return `EPERM` to an unprivileged caller, as Linux's capability check would, and `ENOSYS` to root. `kexec_file_load` (x86-64 320, AArch64 294) and `reboot(LINUX_REBOOT_CMD_KEXEC)` are implemented and root-only ([boot.md](boot.md#kexec-leandros-to-leandros)); `kexec_load` (the segment-list form) is not.
+Deliberate non-implementations answer the way Linux would for the caller: root-only operations the kernel does not implement (`acct`, `swapon`, `iopl`/`ioperm`) return `EPERM` to an unprivileged caller, as Linux's capability check would, and `ENOSYS` to root. `kexec_file_load` (x86-64 320, AArch64 294) and `reboot(LINUX_REBOOT_CMD_KEXEC)` are implemented and root-only ([boot.md](boot.md#kexec-leandros-to-leandros)); `kexec_load` (the segment-list form) is not.
 
 ### Dispatcher structure
 

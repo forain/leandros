@@ -21,6 +21,7 @@ The root [`Cargo.toml`](../../Cargo.toml) lists these members. The release profi
 | [`drivers/usb`](../../drivers/usb) | xHCI host controller | [PC hardware](../hardware/pc.md) |
 | [`drivers/wifi`](../../drivers/wifi) | mac80211 and virtio-wifi | [drivers](../hardware/drivers.md) |
 | [`servers/vfs`](../../servers/vfs) | Virtual file system: fd tables, open file descriptions, tmpfs, mounts, pipes, eventfd/timerfd/signalfd/inotify, block-device layer and synthetic `/sys/class/block` | [VFS](../servers/vfs.md) |
+| [`servers/fuse`](../../servers/fuse) | FUSE: `/dev/fuse` (10:229), protocol 7.31, `fuse`/`fuse.<sub>` mounts | [VFS](../servers/vfs.md#other-in-vfs-filesystems) |
 | [`servers/f2fs`](../../servers/f2fs) | F2FS file system — persistent storage on virtio-blk, SD or USB | [file systems](../servers/filesystems.md) |
 | [`servers/xattr`](../../servers/xattr) | Shared xattr and POSIX ACL contract: codec, namespace gates, the one access evaluator | [file systems](../servers/filesystems.md), [security](../servers/security.md) |
 | [`servers/drm`](../../servers/drm) | DRM server: Linux DRM ioctls, KMS, PRIME, fences | [DRM/KMS](../graphics/drm-kms.md) |
@@ -32,6 +33,8 @@ The root [`Cargo.toml`](../../Cargo.toml) lists these members. The release profi
 | [`lib`](../../lib) | `align_up`/`align_down` and other utilities shared across crates | — |
 
 Loadable-module support adds `lib/` crates, listed in the root workspace: [`lib/kmod-abi`](../../lib/kmod-abi) (the module/kernel ABI types), [`lib/kmod-elf`](../../lib/kmod-elf) (the module ELF loader and relocator), [`lib/kmod-kapi`](../../lib/kmod-kapi) (the kernel API shim modules link against) and [`lib/kmod-rt`](../../lib/kmod-rt) (the module runtime). [`lib/bt-host`](../../lib/bt-host) is the host-side Bluetooth stack shared by `userland/btd` and `userland/bthid`, and [`lib/netctl-abi`](../../lib/netctl-abi) the `/dev/netctl` ABI. Each driver built as a module is a crate under [`modules/`](../../modules) (`virtio-blk`, `nvme`, `virtio-net`, `e1000e`, `iwlwifi`, `usb-hid`, `usb-storage`, `uvc`, `bt`, `hda`, `virtio-snd`, `virtio-rng`, `virtio-keyboard`, `hello`). Many drivers also have a sibling `*-tests` host crate (for example `drivers/bt-tests`, `drivers/v3d-tests`, `drivers/brcmf-tests`) that runs their logic on the build host. See [kernel modules](../kernel/modules.md).
+
+The sandboxing work adds two more `lib/` crates: [`lib/seccomp-bpf`](../../lib/seccomp-bpf) (the classic-BPF checker and interpreter behind seccomp) and [`lib/ebpf-cgdev`](../../lib/ebpf-cgdev) (the eBPF verifier and interpreter for cgroup device programs); see [namespaces](../kernel/namespaces.md).
 
 [`drivers/nvidia`](../../drivers/nvidia) (`nvidia-rm`) is an optional kernel dependency behind the `nvidia` feature (x86-64 only): the OS-interface shim for NVIDIA's open GPU kernel modules ([PC hardware](../hardware/pc.md)).
 
