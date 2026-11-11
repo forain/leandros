@@ -232,6 +232,7 @@ pub fn proc_text() -> Option<String> {
     // Live display-buffer allocation (raw BUF_CFG values: start | end << 16).
     if let Some((pl, cur)) = super::kms::ddb_regs() {
         let _ = writeln!(s, "ddb_plane {}\nddb_cursor {}", pl, cur);
+        let _ = writeln!(s, "cursor_size {}", super::cursor::loaded_size());
     }
     let uapi = super::uapi::proc_errors(&mut s);
     let prime = crate::kenv::drm::proc_prime(&mut s);

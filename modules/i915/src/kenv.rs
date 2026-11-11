@@ -278,6 +278,9 @@ pub mod kms {
         event: extern "C" fn(usize, u32),
         busy: extern "C" fn(usize) -> bool,
         wait_idle: extern "C" fn(usize, u64) -> bool,
+        queue_async: Option<extern "C" fn(usize, u32, u32, u32, u32) -> i32>,
+        frame: Option<extern "C" fn(usize, *mut u64)>,
+        wait_frame: Option<extern "C" fn(usize, u32, u64, *mut u64) -> bool>,
     }
     #[repr(C)] #[derive(Clone, Copy)]
     struct KCursorOps {
@@ -342,6 +345,18 @@ pub mod kms {
     extern "C" fn f_event(_: usize, ev: u32) { (g!(FL).event)(ev) }
     extern "C" fn f_busy(_: usize) -> bool { (g!(FL).busy)() }
     extern "C" fn f_wait(_: usize, ns: u64) -> bool { (g!(FL).wait_idle)(ns) }
+    extern "C" fn f_queue_async(_: usize, t: u32, sx: u32, sy: u32, ev: u32) -> i32 {
+        match g!(FL).queue_async { Some(f) => st(f(t, sx, sy, ev)), None => -22 }
+    }
+    extern "C" fn f_frame(_: usize, out: *mut u64) {
+        if let Some(f) = g!(FL).frame { let (c, t) = f(); unsafe { *out = c as u64; *out.add(1) = t; } }
+    }
+    extern "C" fn f_wait_frame(_: usize, target: u32, ns: u64, out: *mut u64) -> bool {
+        match g!(FL).wait_frame {
+            Some(f) => match f(target, ns) { Some((c, t)) => { unsafe { *out = c as u64; *out.add(1) = t; } true } None => false },
+            None => false,
+        }
+    }
 
     extern "C" fn cu_set<const N: usize>(_: usize, s: *const KCursorSrc, x: i32, y: i32) -> bool {
         let s = unsafe { &*s };
@@ -381,7 +396,10 @@ pub mod kms {
     }
     pub fn register_flip(f: &'static KmsFlip) {
         FL.store(f as *const _ as *mut _, Ordering::Release);
-        reg(kd::KMS_FLIP, leak(KFlipOps { size: core::mem::size_of::<KFlipOps>() as u32, queue: f_queue, event: f_event, busy: f_busy, wait_idle: f_wait }));
+        reg(kd::KMS_FLIP, leak(KFlipOps { size: core::mem::size_of::<KFlipOps>() as u32, queue: f_queue, event: f_event, busy: f_busy, wait_idle: f_wait,
+            queue_async: if g!(FL).queue_async.is_some() { Some(f_queue_async) } else { None },
+            frame: if g!(FL).frame.is_some() { Some(f_frame) } else { None },
+            wait_frame: if g!(FL).wait_frame.is_some() { Some(f_wait_frame) } else { None } }));
     }
     fn reg_cursor<const N: usize>(c: &'static KmsCursor, kind: u32) {
         CU[N].store(c as *const _ as *mut _, Ordering::Release);

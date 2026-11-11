@@ -22,6 +22,8 @@ const DRM_IOCTL_MODE_MAP_DUMB: u32 = 0xC01064B3;
 const DRM_IOCTL_MODE_ADDFB: u32 = 0xC01C64AE;
 const DRM_IOCTL_MODE_SETCRTC: u32 = 0xC06864A2;
 const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC01864B0;
+const DRM_IOCTL_WAIT_VBLANK: u32 = 0xC018643A;
+const DRM_IOCTL_CRTC_GET_SEQUENCE: u32 = 0xC018643B;
 const DRM_IOCTL_VERSION: u32 = 0xC0406400;
 
 // ── K4: Mesa/GBM buffer + Smithay/libdrm KMS surface ─────────────────────────
@@ -252,6 +254,10 @@ const PROP_FB_DAMAGE_CLIPS: u32 = 51;
 /// Primary plane, only while a KMS backend is registered (`gpu_kms`): the
 /// format/modifier pairs it scans out. Immutable blob.
 const PROP_IN_FORMATS: u32 = 52;
+/// Primary plane of a KMS backend: sync_file fd to wait for before the flip
+/// (-1 = none). The fd lives in the caller's table, so the syscall layer
+/// resolves and waits it before the commit (`drm_atomic_in_fence_fds`).
+const PROP_IN_FENCE_FD: u32 = 53;
 const PROP_ACTIVE: u32 = 60;
 const PROP_MODE_ID: u32 = 61;
 const PROP_CONN_CRTC_ID: u32 = 70;
@@ -321,6 +327,7 @@ static PROPS: &[PropDef] = &[
     prop(PROP_CRTC_H, b"CRTC_H\0", PropKind::Range(0, u32::MAX as u64)),
     prop(PROP_FB_DAMAGE_CLIPS, b"FB_DAMAGE_CLIPS\0", PropKind::Blob),
     prop(PROP_IN_FORMATS, b"IN_FORMATS\0", PropKind::Blob),
+    prop(PROP_IN_FENCE_FD, b"IN_FENCE_FD\0", PropKind::SignedRange(-1, i32::MAX as i64)),
     prop(PROP_ACTIVE, b"ACTIVE\0", PropKind::Range(0, 1)),
     prop(PROP_MODE_ID, b"MODE_ID\0", PropKind::Blob),
     prop(PROP_CONN_CRTC_ID, b"CRTC_ID\0", PropKind::Object(DRM_MODE_OBJECT_CRTC)),
@@ -410,6 +417,7 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
         PROP_CRTC_H,
         PROP_FB_DAMAGE_CLIPS,
         PROP_IN_FORMATS,
+        PROP_IN_FENCE_FD,
     ];
     if crate::gpu_kms::active() && (obj_type == DRM_MODE_OBJECT_PLANE || obj_type == 0) {
         return match obj_id {
@@ -443,6 +451,8 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
 
 // PAGE_FLIP flags / event types
 const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+/// PAGE_FLIP and ATOMIC flag: flip at once, tearing allowed.
+const DRM_MODE_PAGE_FLIP_ASYNC: u32 = 0x02;
 const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
 
 // ── Virtio-GPU (virtgpu_drm.h) IOCTLs ────────────────────────────────────────
@@ -862,6 +872,27 @@ struct drm_mode_fb_cmd {
     bpp: u32,
     depth: u32,
     handle: u32,
+}
+
+/// drm_wait_vblank: request {type, sequence, signal} / reply {type, sequence,
+/// tval_sec, tval_usec} share the 24 bytes (`signal`'s 8 + padding = tval_sec).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_wait_vblank { typ: u32, seq: u32, tv_sec: i64, tv_usec: i64 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_crtc_get_sequence { crtc_id: u32, active: u32, sequence: u64, sequence_ns: i64 }
+
+static WAIT_VBLANKS: AtomicU64 = AtomicU64::new(0);
+/// Software vblank period of a backend with no hardware counter.
+const SYNTH_VBLANK_NS: u64 = 16_666_667;
+
+/// (counter, monotonic ns of its vblank): the backend's hardware counter,
+/// else the 60 Hz software one.
+fn vblank_now() -> (u32, u64) {
+    if let Some(fr) = crate::gpu_kms::flip().and_then(|f| f.frame) { return fr(); }
+    let n = unsafe { arch_monotonic_ns() } / SYNTH_VBLANK_NS;
+    (n as u32, n * SYNTH_VBLANK_NS)
 }
 
 #[repr(C)]
@@ -2979,7 +3010,7 @@ fn ext_present(
 /// has latched. On `Some(Err)` the cookie was not taken (the caller cancels
 /// it). A VT switch that lands meanwhile is caught as in `ext_present`; the
 /// backend's `console_restore` also drops a flip still waiting to be armed.
-fn ext_present_async(fb_id: u32, open_id: u32, src: (u32, u32), ev: u32) -> Option<Result<(), DriverError>> {
+fn ext_present_async(fb_id: u32, open_id: u32, src: (u32, u32), ev: u32, asyn: bool) -> Option<Result<(), DriverError>> {
     let f = crate::gpu_kms::flip()?;
     let token = ext_fb_token(fb_id);
     if token == 0 { return None; }
@@ -2988,7 +3019,11 @@ fn ext_present_async(fb_id: u32, open_id: u32, src: (u32, u32), ev: u32) -> Opti
         crate::framebuffer::drm_scanout_claim(open_id);
     }
     crate::drm::device::SCANOUT_WRITES.fetch_add(1, Ordering::Relaxed);
-    let r = (f.queue)(token, src.0, src.1, ev);
+    let r = if asyn {
+        match f.queue_async { Some(q) => q(token, src.0, src.1, ev), None => Err(DriverError::Errno(22)) }
+    } else {
+        (f.queue)(token, src.0, src.1, ev)
+    };
     if open_id != 0 && !master_ok(open_id) && crate::framebuffer::scanout_owner() == 0 {
         extern "C" { fn vt_console_reclaim() -> bool; }
         EXT_VT_REPAINTS.fetch_add(1, Ordering::Relaxed);
@@ -6264,6 +6299,8 @@ impl DrmDeviceInterface {
 
             // ── K4: Mesa/GBM buffer + Smithay/libdrm KMS surface ──
             DRM_IOCTL_GET_CAP => self.std_handle_get_cap(arg),
+            DRM_IOCTL_WAIT_VBLANK => Self::std_wait_vblank(arg),
+            DRM_IOCTL_CRTC_GET_SEQUENCE => Self::std_crtc_get_sequence(arg),
             DRM_IOCTL_SET_CLIENT_CAP => self.std_handle_set_client_cap(arg),
             DRM_IOCTL_SET_MASTER => master_set(open_id),
             DRM_IOCTL_DROP_MASTER => master_drop(open_id),
@@ -7327,7 +7364,7 @@ impl DrmDeviceInterface {
                     None => return Some(Err(DriverError::Errno(EBUSY))),
                 }
             } else { 0 };
-            let r = ext_present_async(flip.fb_id, open_id, (0, 0), ev)?;
+            let r = ext_present_async(flip.fb_id, open_id, (0, 0), ev, flip.flags & DRM_MODE_PAGE_FLIP_ASYNC != 0)?;
             match r {
                 Ok(()) => { FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed); }
                 Err(_) => if ev != 0 { ext_event_cancel(ev); },
@@ -7424,6 +7461,65 @@ impl DrmDeviceInterface {
         }
     }
 
+    /// DRM_IOCTL_WAIT_VBLANK (CRTC 0): sleep until the vblank counter reaches
+    /// the requested sequence and report the counter and the vblank time. The
+    /// counter is the backend's hardware one (`KmsFlip::frame`) when it has
+    /// one, else a 60 Hz software count of the monotonic clock. EVENT and
+    /// SIGNAL delivery are not implemented (EINVAL). No DRM lock is held.
+    fn std_wait_vblank(arg: usize) -> Result<usize, DriverError> {
+        const RELATIVE: u32 = 1;
+        const HIGH_CRTC_MASK: u32 = 0x3e;
+        const EVENT: u32 = 0x0400_0000;
+        const NEXTONMISS: u32 = 0x1000_0000;
+        const SECONDARY: u32 = 0x2000_0000;
+        const SIGNAL: u32 = 0x4000_0000;
+        const WAIT_NS: u64 = 1_000_000_000;
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let mut v = uread::<drm_wait_vblank>(arg)?;
+        if v.typ & (EVENT | SIGNAL) != 0 { return Err(DriverError::InvalidParameter); }
+        let crtc = if v.typ & HIGH_CRTC_MASK != 0 { (v.typ & HIGH_CRTC_MASK) >> 1 } else if v.typ & SECONDARY != 0 { 1 } else { 0 };
+        if crtc != 0 { return Err(DriverError::InvalidParameter); }
+        let (cur, _) = vblank_now();
+        let mut target = if v.typ & RELATIVE != 0 { cur.wrapping_add(v.seq) } else { v.seq };
+        // `target` already passed (the counter wraps: half the range is "past").
+        let passed = |c: u32, t: u32| c.wrapping_sub(t) < 0x8000_0000;
+        if v.typ & NEXTONMISS != 0 && v.typ & RELATIVE == 0 && passed(cur, target) {
+            target = cur.wrapping_add(1);
+        }
+        WAIT_VBLANKS.fetch_add(1, Ordering::Relaxed);
+        let (got, ts) = if passed(cur, target) {
+            vblank_now()
+        } else if let Some(wf) = crate::gpu_kms::flip().and_then(|f| f.wait_frame) {
+            wf(target, WAIT_NS).ok_or(DriverError::Errno(EBUSY))?
+        } else {
+            let t0 = unsafe { arch_monotonic_ns() };
+            loop {
+                let (c, ts) = vblank_now();
+                if passed(c, target) { break (c, ts); }
+                if unsafe { arch_monotonic_ns() }.saturating_sub(t0) >= WAIT_NS { return Err(DriverError::Errno(EBUSY)); }
+                sched::kthread::msleep(1);
+            }
+        };
+        v.seq = got;
+        v.tv_sec = (ts / 1_000_000_000) as i64;
+        v.tv_usec = ((ts % 1_000_000_000) / 1_000) as i64;
+        uwrite(arg, &v)?;
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_CRTC_GET_SEQUENCE: the counter now and its time, no wait.
+    fn std_crtc_get_sequence(arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let mut s = uread::<drm_crtc_get_sequence>(arg)?;
+        if s.crtc_id != DRM_CRTC_ID { return Err(DriverError::InvalidParameter); }
+        let (c, ts) = vblank_now();
+        s.active = 1;
+        s.sequence = c as u64;
+        s.sequence_ns = ts as i64;
+        uwrite(arg, &s)?;
+        Ok(0)
+    }
+
     /// DRM_IOCTL_GET_CAP — Smithay/Mesa best-effort capability probe.
     fn std_handle_get_cap(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
@@ -7446,7 +7542,7 @@ impl DrmDeviceInterface {
             // buffers are KMS-scanout-capable; kmscube consumes the KMS handle,
             // not a PRIME fd, so PRIME_HANDLE_TO_FD need not be implemented here.
             DRM_CAP_PRIME => DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT,
-            DRM_CAP_ASYNC_PAGE_FLIP => 0,
+            DRM_CAP_ASYNC_PAGE_FLIP => crate::gpu_kms::flip().map_or(false, |f| f.queue_async.is_some()) as u64,
             // The host's cursor is fixed at 64x64 and silently drops anything
             // else, so advertise exactly that. Reporting 0 (the old `_ => 0`)
             // makes smithay skip the cursor plane entirely.
@@ -7562,6 +7658,7 @@ impl DrmDeviceInterface {
                 _ => DRM_PLANE_TYPE_PRIMARY as u64,
             },
             PROP_IN_FORMATS => in_formats_blob() as u64,
+            PROP_IN_FENCE_FD => -1i64 as u64,
             PROP_CONN_CRTC_ID if two => {
                 if obj_id == DRM_CONNECTOR_ID { CONN_CRTC.load(Ordering::Relaxed) as u64 }
                 else { crate::gpu_kms::ext_index(obj_id, crate::gpu_kms::EXT_CONN_BASE)
@@ -7888,6 +7985,8 @@ impl DrmDeviceInterface {
                             PROP_CRTC_W => p.crtc_w = Some(val as u32),
                             PROP_CRTC_H => p.crtc_h = Some(val as u32),
                             PROP_FB_DAMAGE_CLIPS => p.damage_blob = Some(val as u32),
+                            // Already waited for (and validated) by the syscall layer.
+                            PROP_IN_FENCE_FD if crate::gpu_kms::active() && !matches!(obj, DRM_CURSOR_PLANE_ID | DRM_CURSOR2_PLANE_ID) => {}
                             _ => return Err(DriverError::InvalidParameter),
                         }
                     }
@@ -7994,6 +8093,13 @@ impl DrmDeviceInterface {
         // one has not completed is EBUSY, a blocking one waits for it. Before
         // any state is applied, so an EBUSY commit changes nothing.
         let hw_flip = crate::gpu_kms::flip();
+        // DRM_MODE_PAGE_FLIP_ASYNC: needs a backend that can flip mid-frame,
+        // and is never a modeset (Linux: EINVAL both ways).
+        if flags & DRM_MODE_PAGE_FLIP_ASYNC != 0
+            && (hw_flip.map_or(true, |f| f.queue_async.is_none()) || allow_modeset || changes_modeset)
+        {
+            return Err(DriverError::InvalidParameter);
+        }
         if let Some(p2) = crate::gpu_kms::pipe2().filter(|_| touch_b) {
             if (p2.busy)() {
                 if flags & DRM_MODE_ATOMIC_NONBLOCK != 0 || !(p2.wait_idle)(EXT_BLOCKING_WAIT_NS) {
@@ -8086,7 +8192,7 @@ impl DrmDeviceInterface {
                     // goes with it.
                     let src = (primary.src_x.unwrap_or(0), primary.src_y.unwrap_or(0));
                     let ext = if hw_flip.is_some() {
-                        let r = ext_present_async(fb_id, open_id, src, hw_ev);
+                        let r = ext_present_async(fb_id, open_id, src, hw_ev, flags & DRM_MODE_PAGE_FLIP_ASYNC != 0);
                         if r.is_some() { hw_ev_owned = false; }
                         r
                     } else {
