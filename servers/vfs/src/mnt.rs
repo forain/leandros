@@ -1235,9 +1235,9 @@ pub fn entries() -> Vec<(Vec<u8>, Vec<u8>, &'static str, Vec<u8>)> {
 }
 
 /// Snapshot `(device, mountpoint, fstype)` of every alias, for /proc/mounts.
-pub fn list() -> Vec<(Vec<u8>, Vec<u8>, &'static str)> {
-    let mut v: Vec<_> = ALIASES.lock().iter().map(|a| (a.device.clone(), a.mountpoint.clone(), a.fstype)).collect();
-    for m in SELF_BINDS.lock().iter() { v.push((b"none".to_vec(), m.clone(), "none")); }
+pub fn list() -> Vec<(Vec<u8>, Vec<u8>, &'static str, Option<u32>)> {
+    let mut v: Vec<_> = ALIASES.lock().iter().map(|a| (a.device.clone(), a.mountpoint.clone(), a.fstype, tmpfs_inst_of(&a.source))).collect();
+    for m in SELF_BINDS.lock().iter() { v.push((b"none".to_vec(), m.clone(), "none", None)); }
     v
 }
 
