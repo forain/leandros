@@ -3,6 +3,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <time.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdio.h>
@@ -246,6 +249,92 @@ static void test_udp_dual(void) {
     if (r >= 0) close(r);
 }
 
+
+// --- resolver (L7): all guest userland is musl (relibc retired 2026-11-02), so these exercise musl's
+// inet_pton/ntop, getaddrinfo (/etc/hosts, AI_ADDRCONFIG, scope ids) and getnameinfo on our kernel.
+static void test_pton_ntop6(void) {
+    struct in6_addr a, b; char buf[INET6_ADDRSTRLEN];
+    int r = inet_pton(AF_INET6, "2001:db8::1", &a);
+    unsigned char want[16] = {0x20,1,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,1};
+    CHECK("pton6", r == 1 && !memcmp(&a, want, 16));
+    CHECK("ntop6", inet_ntop(AF_INET6, &a, buf, sizeof buf) && !strcmp(buf, "2001:db8::1"));
+    r = inet_pton(AF_INET6, "::ffff:1.2.3.4", &b);
+    CHECK("pton6_mapped", r == 1 && inet_ntop(AF_INET6, &b, buf, sizeof buf) && !strcmp(buf, "::ffff:1.2.3.4"));
+    CHECK("pton6_bad", inet_pton(AF_INET6, "2001:db8:::1", &a) == 0 && inet_pton(AF_INET6, "1:2:3:4:5:6:7:8:9", &a) == 0);
+    CHECK("ntop6_loopback", inet_ntop(AF_INET6, &in6addr_loopback, buf, sizeof buf) && !strcmp(buf, "::1"));
+    CHECK("ntop6_enospc", !inet_ntop(AF_INET6, &a, buf, 4) && errno == ENOSPC);
+}
+
+static int gai_count(const char *host, int fam, int flags, int *n4, int *n6, int *first) {
+    struct addrinfo h, *res = 0, *p; memset(&h, 0, sizeof h);
+    h.ai_family = fam; h.ai_flags = flags; h.ai_socktype = SOCK_STREAM;
+    int r = getaddrinfo(host, "80", &h, &res);
+    *n4 = *n6 = 0; *first = 0;
+    if (r) return r;
+    for (p = res; p; p = p->ai_next) { if (p == res) *first = p->ai_family; if (p->ai_family == AF_INET) (*n4)++; else if (p->ai_family == AF_INET6) (*n6)++; }
+    freeaddrinfo(res);
+    return 0;
+}
+
+static void test_gai(void) {
+    int n4, n6, f, r;
+    r = gai_count("localhost", AF_INET6, 0, &n4, &n6, &f);
+    CHECK("gai_localhost6", r == 0 && n6 >= 1 && n4 == 0);
+    r = gai_count("localhost", AF_INET, 0, &n4, &n6, &f);
+    CHECK("gai_localhost4", r == 0 && n4 >= 1 && n6 == 0);
+    r = gai_count("localhost", AF_UNSPEC, 0, &n4, &n6, &f);
+    CHECK("gai_localhost_unspec", r == 0 && n4 >= 1 && n6 >= 1);
+    r = gai_count("localhost", AF_UNSPEC, AI_ADDRCONFIG, &n4, &n6, &f);
+    CHECK("gai_localhost_addrconfig", r == 0 && n4 >= 1 && n6 >= 1);
+    r = gai_count("::1", AF_UNSPEC, AI_NUMERICHOST, &n4, &n6, &f);
+    CHECK("gai_numeric_loopback6", r == 0 && n6 == 1 && n4 == 0);
+    r = gai_count("::1", AF_INET, AI_NUMERICHOST, &n4, &n6, &f);
+    CHECK("gai_numeric6_vs_inet", r == EAI_ADDRFAMILY || r == EAI_NONAME);
+    r = gai_count("127.0.0.1", AF_INET6, AI_V4MAPPED, &n4, &n6, &f);
+    CHECK("gai_v4mapped", r == 0 && n6 == 1);
+    struct addrinfo h, *res = 0; memset(&h, 0, sizeof h);
+    h.ai_family = AF_INET6; h.ai_flags = AI_NUMERICHOST; h.ai_socktype = SOCK_STREAM;
+    r = getaddrinfo("fe80::1%lo", "80", &h, &res);
+    unsigned want = if_nametoindex("lo");
+    CHECK("gai_numeric6_scope", r == 0 && res && want &&
+          ((struct sockaddr_in6 *)res->ai_addr)->sin6_scope_id == want &&
+          ntohs(((struct sockaddr_in6 *)res->ai_addr)->sin6_port) == 80);
+    if (res) freeaddrinfo(res);
+}
+
+static void test_gni6(void) {
+    struct sockaddr_in6 a = lo6(8080); char h[64], sv[16];
+    int r = getnameinfo((struct sockaddr *)&a, sizeof a, h, sizeof h, sv, sizeof sv, NI_NUMERICHOST | NI_NUMERICSERV);
+    CHECK("gni6_numeric", r == 0 && !strcmp(h, "::1") && !strcmp(sv, "8080"));
+    r = getnameinfo((struct sockaddr *)&a, sizeof a, h, sizeof h, 0, 0, 0);
+    CHECK("gni6_name_localhost", r == 0 && !strcmp(h, "localhost"));
+}
+
+// R1: a client that resolves "localhost" (::1 first) must fall through to a 127.0.0.1-only
+// listener quickly, never hang on the refused ::1 attempt.
+static void test_localhost_fallback(void) {
+    int l = socket(AF_INET, SOCK_STREAM, 0), ok = 0;
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_port = htons(47320); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 4) == 0) {
+        struct addrinfo h, *res = 0, *p; memset(&h, 0, sizeof h);
+        h.ai_family = AF_UNSPEC; h.ai_socktype = SOCK_STREAM;
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (getaddrinfo("localhost", "47320", &h, &res) == 0) {
+            for (p = res; p && !ok; p = p->ai_next) {
+                int c = socket(p->ai_family, SOCK_STREAM, 0); tmo(c, 3);
+                if (connect(c, p->ai_addr, p->ai_addrlen) == 0) ok = 1;
+                close(c);
+            }
+            freeaddrinfo(res);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (t1.tv_sec - t0.tv_sec > 2) ok = 0;
+    }
+    CHECK("localhost_fallback_v4only", ok);
+    close(l);
+}
+
 // `ip6test banner ADDR PORT`: connect (v4 or v6 literal), print the first bytes the server sends.
 static int banner(const char *addr, int port) {
     struct sockaddr_in6 a6; struct sockaddr_in a4; int s, r;
@@ -282,6 +371,10 @@ int main(int argc, char **argv) {
     test_v6only_after_bind();
     test_mapped_connect_v6only();
     test_udp_dual();
+    test_pton_ntop6();
+    test_gai();
+    test_gni6();
+    test_localhost_fallback();
     printf("ip6test: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
