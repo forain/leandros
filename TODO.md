@@ -19,7 +19,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Host-refused `RING_IDX` submit is never completed by QEMU** (descriptors lost); Mesa cannot reach it. Do not rewrite RING_IDX kernel-side.
 
 ### Podman / namespaces / cgroups
-- **Unconverted `host_root()` privilege checks** (SYS_TIME/SYS_BOOT/SYS_MODULE/RAWIO/WAKE_ALARM done in lane/capclock; rest still all-or-nothing): vt.rs (CAP_SYS_TTY_CONFIG), net raw sockets (CAP_NET_RAW), evdev (CAP_SYS_ADMIN, verify), block.rs (CAP_SYS_ADMIN/CAP_SYS_RAWIO), vfs tmpfs chown/chmod (CAP_CHOWN/CAP_FOWNER), ACCT/VHANGUP/SWAPON (CAP_SYS_PACCT/TTY_CONFIG/SYS_ADMIN), ptrace/kill-like (CAP_SYS_PTRACE/CAP_KILL), mount (CAP_SYS_ADMIN), xattr (CAP_SYS_ADMIN/FOWNER), f2fs (CAP_DAC_OVERRIDE); sys_secprobe/dbg_serial/spawn stay kernel-private.
+- **Unconverted `host_root()` privilege checks** (lane/capaudit 2026-11-11 converted: vt.rs TTY_CONFIG, net SOCK_RAW (ns_capable_in NET_RAW), evdev serialkbd/block.rs (SYS_ADMIN), ACCT/VHANGUP/SWAPON/SWAPOFF/KEXEC_LOAD, mount, ptrace/kill (cap_over/ptrace_cap/ipc_send_check no longer bypass for root), proc links/environ/oom/comm, nice/rtprio/prlimit, setuid/gid, NPROC bypass, PR_SET_MM, set_tid, cgroupfs chown/write, sysfs/acpi writes). STILL OPEN: vfs tmpfs chown/chmod (CAP_CHOWN/CAP_FOWNER) and xattr/f2fs `Cred::host_root` (cap_inode, trusted.*/security.* = CAP_SYS_ADMIN, CAP_DAC_OVERRIDE): `Cred.caps` is only filled for userns != 0 (cred_with_ns returns early for ns 0) and `Cred::new` has caps 0, so the fix needs ns-0 caps populated first; sys_secprobe/dbg_serial/spawn stay kernel-private.
 - **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
 - **mntunshare is not an isolation boundary for root-run workloads** (M6).
 

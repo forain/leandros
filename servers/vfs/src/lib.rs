@@ -7565,7 +7565,7 @@ const SYSCLASS_W: &[u8] = b"/tmp/.syscw";
 fn sysclass_write_ok(pid: u32, path: &[u8]) -> bool {
     let mut g = [0u32; xattr::NGROUPS_MAX];
     let n = sched::groups_of(pid, &mut g).min(g.len());
-    sysclass::write_allowed(host_root_of(pid), sched::egid_of(pid), &g[..n],
+    sysclass::write_allowed(sched::caps::host_capable_of(pid, sched::caps::CAP_DAC_OVERRIDE), sched::egid_of(pid), &g[..n],
                             sysclass::is_writable(path), sysclass::is_video_writable(path))
 }
 
@@ -8161,7 +8161,7 @@ fn open_proc_task(caller: u32, t: ProcTask, flags: u32) -> Result<VnodeKind, i32
 /// `/proc/<pid>/environ` is readable by root and by the process's owner
 /// (Linux: PTRACE_MODE_READ_FSCREDS, so non-dumpable targets need CAP_SYS_PTRACE).
 fn proc_environ_allowed(caller: u32, target: u32) -> bool {
-    sched::host_root_of(caller) || sched::cred::ptrace_read_check(caller, target) == 0
+    sched::caps::host_capable_of(caller, sched::caps::CAP_SYS_PTRACE) || sched::cred::ptrace_read_check(caller, target) == 0
 }
 
 /// stat of a per-process procfs path: `None` not one; `Some(None)` it names
@@ -9006,7 +9006,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             VnodeKind::SysBlock { dev: sysclass::SC_TABLES, level: sysclass::LVL_SC_CLASS, pos: 0 }
         } else if let Some(t) = sysclass::acpi_table(lookup_path) {
             // Raw firmware tables are root-only, as on Linux (mode 0400).
-            if flags & (O_WRONLY | O_RDWR) != 0 || !host_root_of(pid) { return err_reply(-13); }
+            if flags & (O_WRONLY | O_RDWR) != 0 || !sched::caps::host_capable_of(pid, sched::caps::CAP_DAC_OVERRIDE) { return err_reply(-13); }
             let mut tmp = TMP_FILES.lock();
             let Some(idx) = tmp_free_slot(&mut *tmp) else { return err_reply(-23) };
             tmp.claim(idx, b"", true);
@@ -9273,7 +9273,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
             if flags & 0o3 == 0o0 { return err_reply(-13); }
             let me = sched::euid_of(pid);
-            if !sched::host_root_of(pid) && me != sched::euid_of(tpid) { return err_reply(-13); }
+            if !sched::caps::host_capable_of(pid, sched::caps::CAP_DAC_OVERRIDE) && me != sched::euid_of(tpid) { return err_reply(-13); }
             match gen_proc_oom_writable(tpid) {
                 Some(v) => v,
                 None    => return err_reply(-23),
@@ -9284,7 +9284,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
             if flags & 0o3 == 0o0 { return err_reply(-13); }
             let me = sched::euid_of(pid);
-            if !sched::host_root_of(pid) && me != sched::euid_of(tpid) { return err_reply(-13); } // EACCES
+            if !sched::caps::host_capable_of(pid, sched::caps::CAP_DAC_OVERRIDE) && me != sched::euid_of(tpid) { return err_reply(-13); } // EACCES
             match gen_proc_comm_writable(tpid) {
                 Some(v) => v,
                 None    => return err_reply(-23),
@@ -10419,7 +10419,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
             }
             if let Some(tid) = comm_tid {
                 let me = sched::euid_of(pid);
-                if !sched::host_root_of(pid) && me != sched::euid_of(tid) { return err_reply(-13); }
+                if !sched::caps::host_capable_of(pid, sched::caps::CAP_DAC_OVERRIDE) && me != sched::euid_of(tid) { return err_reply(-13); }
                 if sched::proc_stat_of(tid).is_none() { return err_reply(-3); } // ESRCH
                 let n = count.min(15);
                 let mut name = [0u8; 15];
@@ -15350,7 +15350,7 @@ fn handle_listxattr(pid: u32, tag: u64, path_ptr: usize, list_ptr: usize, size: 
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
     if let Some(path) = tmpfs_path(raw) {
-        let euid = host_root_of(pid);
+        let euid = sched::caps::host_capable_of(pid, sched::caps::CAP_SYS_ADMIN);
         let tmp = TMP_FILES.lock();
         let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
         let owner = tmp_owner(&tmp, idx);
@@ -15571,7 +15571,7 @@ fn handle_flistxattr(pid: u32, fd: usize, list_ptr: usize, size: usize) -> Messa
     };
     match kind {
         VnodeKind::TmpFile { idx, .. } => {
-            let euid = host_root_of(pid);
+            let euid = sched::caps::host_capable_of(pid, sched::caps::CAP_SYS_ADMIN);
             let tmp = TMP_FILES.lock();
             let owner = tmp_owner(&tmp, idx);
             tmp_listxattr_local(&tmp, owner, euid, list_ptr, size)

@@ -1635,7 +1635,7 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
                 let v = crate::keyboard::get_ent(e[0], e[1], unicode);
                 put(arg + 2, v.to_ne_bytes())
             } else {
-                if !sched::host_root() { return EPERM; }
+                if !sched::caps::host_capable(sched::caps::CAP_SYS_TTY_CONFIG) { return EPERM; }
                 let v = u16::from_ne_bytes([e[2], e[3]]);
                 crate::keyboard::set_ent(e[0], e[1], v, unicode)
             }
@@ -1653,7 +1653,7 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
 
         KDSKBSENT => {
             if arg == 0 { return EFAULT; }
-            if !sched::host_root() { return EPERM; }
+            if !sched::caps::host_capable(sched::caps::CAP_SYS_TTY_CONFIG) { return EPERM; }
             let func: u8 = match get(arg) { Some(f) => f, None => return EFAULT };
             let mut b = [0u8; KBSENT_STRING];
             if sched::uaccess::copy_from_user(b.as_mut_ptr(), arg + 1, KBSENT_STRING) != 0 { return EFAULT; }
@@ -1664,7 +1664,7 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
         KDKBDREP => {
             if arg == 0 { return EFAULT; }
             // Linux asks for CAP_SYS_TTY_CONFIG: the rate is global.
-            if !sched::host_root() { return EPERM; }
+            if !sched::caps::host_capable(sched::caps::CAP_SYS_TTY_CONFIG) { return EPERM; }
             // struct kbd_repeat { int delay; int period; } — positive fields
             // set, and the values in force come back either way.
             let mut r: [u8; 8] = match get(arg) { Some(r) => r, None => return EFAULT };
