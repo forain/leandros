@@ -1533,6 +1533,16 @@ impl InterfaceInner {
             return Ok((hardware_addr, tx_token));
         }
 
+        // LEANDROS: an IPv6 packet to one of this interface's own addresses
+        // (::1 on the Ethernet-medium loopback; smoltcp never answers an NS
+        // for ::1) needs no neighbor discovery: it goes to our own MAC.
+        #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
+        if let IpAddress::Ipv6(_) = dst_addr {
+            if matches!(self.caps.medium, Medium::Ethernet) && self.has_ip_addr(*dst_addr) {
+                return Ok((self.hardware_addr, tx_token));
+            }
+        }
+
         let dst_addr = self
             .route(dst_addr, self.now)
             .ok_or(DispatchError::NoRoute)?;

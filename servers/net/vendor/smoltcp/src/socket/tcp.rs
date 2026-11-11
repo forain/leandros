@@ -245,7 +245,7 @@ use crate::socket::{Context, PollAt};
 use crate::storage::{Assembler, RingBuffer};
 use crate::time::{Duration, Instant};
 use crate::wire::{
-    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TcpControl, TcpRepr, TcpSeqNumber,
+    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, IpVersion, TcpControl, TcpRepr, TcpSeqNumber,
     TCP_HEADER_LEN,
 };
 
@@ -661,6 +661,9 @@ pub struct Socket<'a> {
     /// Address passed to listen(). Listen address is set when listen() is called and
     /// used every time the socket is reset back to the LISTEN state.
     listen_endpoint: IpListenEndpoint,
+    /// LEANDROS: restrict a wildcard LISTEN to one IP family (an AF_INET
+    /// socket must not accept a v6 SYN and vice versa). `None` = both.
+    family: Option<IpVersion>,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
@@ -767,6 +770,7 @@ impl<'a> Socket<'a> {
             keep_alive_probes: 0,
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
+            family: None,
             tuple: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
@@ -1787,6 +1791,11 @@ impl<'a> Socket<'a> {
         Some(self.ack_reply(ip_repr, repr))
     }
 
+    /// LEANDROS: restrict a wildcard-bound socket to one IP family.
+    pub fn set_family(&mut self, family: Option<IpVersion>) {
+        self.family = family;
+    }
+
     pub(crate) fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
         if self.state == State::Closed {
             return false;
@@ -1809,7 +1818,10 @@ impl<'a> Socket<'a> {
             // We're listening, reject packets not matching the listen endpoint.
             let addr_ok = match self.listen_endpoint.addr {
                 Some(addr) => ip_repr.dst_addr() == addr,
-                None => true,
+                None => match self.family {
+                    Some(f) => ip_repr.dst_addr().version() == f,
+                    None => true,
+                },
             };
             addr_ok && repr.dst_port != 0 && repr.dst_port == self.listen_endpoint.port
         }

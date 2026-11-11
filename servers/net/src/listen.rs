@@ -41,7 +41,7 @@
 //! LISTEN socket back.
 
 use super::*;
-use smoltcp::wire::IpListenEndpoint;
+use smoltcp::wire::{IpListenEndpoint, IpVersion};
 use core::fmt::Write as _;
 
 /// Connections a listener holds before accept() takes them (handshakes in
@@ -54,6 +54,8 @@ pub(crate) const SYN_RECV_TIMEOUT_NS: u64 = 60_000_000_000;
 pub struct Listen {
     pub lid: u32,
     pub ep: IpListenEndpoint,
+    /// The family a wildcard listener is restricted to (None: both).
+    pub fam: Option<IpVersion>,
     pub arm: Option<SocketHandle>,
     /// (socket, `monotonic_ns` when it left LISTEN), oldest first.
     pub queue: alloc::vec::Vec<(SocketHandle, u64)>,
@@ -112,13 +114,21 @@ pub(crate) fn all_sids() -> impl Iterator<Item = Sid> {
     core::iter::once(LO).chain(iface::nic_sids()).chain(crate::vif::all_dyn_sids())
 }
 
+/// The family a wildcard listener on `a` is held to: an AF_INET socket's
+/// 0.0.0.0 never hears a v6 SYN (it did not matter until ::1 existed); `::`
+/// stays dual until IPV6_V6ONLY (L2).
+pub(crate) fn wildcard_family(a: IpAddress) -> Option<IpVersion> {
+    match a { IpAddress::Ipv4(_) if a.is_unspecified() => Some(IpVersion::Ipv4), _ => None }
+}
+
 fn listen_ep(local: IpEndpoint) -> IpListenEndpoint {
     IpListenEndpoint { addr: if local.addr.is_unspecified() { None } else { Some(local.addr) }, port: local.port }
 }
 
 /// A fresh LISTEN socket for `ep` in `set`.
-fn new_arm(set: &mut SocketSet<'static>, ep: IpListenEndpoint) -> Option<SocketHandle> {
+fn new_arm(set: &mut SocketSet<'static>, ep: IpListenEndpoint, fam: Option<IpVersion>) -> Option<SocketHandle> {
     let mut socket = new_tcp_socket(set);
+    socket.set_family(fam);
     socket.listen(ep).ok()?;
     Some(set.add(socket))
 }
@@ -131,8 +141,9 @@ pub(crate) fn create(sid: Sid, lid: u32, local: IpEndpoint) -> bool {
     // Idempotent: listen() and a late stack's `adopt` may both get here.
     if s.listens.iter().any(|l| l.lid == lid) { return true; }
     let ep = listen_ep(local);
-    let Some(arm) = new_arm(&mut s.socket_set, ep) else { return false };
-    s.listens.push(Listen { lid, ep, arm: Some(arm), queue: alloc::vec::Vec::new(), seq: 0, seen: alloc::vec::Vec::new() });
+    let fam = wildcard_family(local.addr);
+    let Some(arm) = new_arm(&mut s.socket_set, ep, fam) else { return false };
+    s.listens.push(Listen { lid, ep, fam, arm: Some(arm), queue: alloc::vec::Vec::new(), seq: 0, seen: alloc::vec::Vec::new() });
     true
 }
 
@@ -238,7 +249,7 @@ fn maintain_one(set: &mut SocketSet<'static>, l: &mut Listen, now: u64) -> bool 
         i += 1;
     }
     if l.arm.is_none() && l.queue.len() < BACKLOG {
-        l.arm = new_arm(set, l.ep);
+        l.arm = new_arm(set, l.ep, l.fam);
     }
     // The arm must come after every queued socket in slot order.
     if let Some(a) = l.arm {
