@@ -132,6 +132,20 @@ struct Cache {
 static CACHE: Mutex<Cache> = Mutex::new(Cache { files: BTreeMap::new(), hand: (0, 0), next_token: 1 });
 
 /// Published frames the cache holds.
+/// CACHE lock acquisitions / those that found it held (/proc/pcache
+/// `cache_lock_acq` / `cache_lock_contended`).
+pub static LOCK_ACQ: AtomicUsize = AtomicUsize::new(0);
+pub static LOCK_CONTENDED: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn cache_lock() -> spin::MutexGuard<'static, Cache> {
+    LOCK_ACQ.fetch_add(1, Ordering::Relaxed);
+    match CACHE.try_lock() {
+        Some(g) => g,
+        None => { LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed); CACHE.lock() }
+    }
+}
+
 static CACHED: AtomicUsize = AtomicUsize::new(0);
 static DIRTY: AtomicUsize = AtomicUsize::new(0);
 static FILLING: AtomicUsize = AtomicUsize::new(0);
@@ -320,7 +334,7 @@ pub fn clean_dcache(virt: usize, len: usize) {
 
 /// The file's size, if the cache knows it (set by the filesystem).
 pub fn file_size(key: u64) -> Option<u64> {
-    let c = CACHE.lock();
+    let c = cache_lock();
     c.files.get(&key).filter(|f| f.size_known).map(|f| f.size)
 }
 
@@ -329,7 +343,7 @@ pub fn file_size(key: u64) -> Option<u64> {
 /// file must reach `note_size`/`truncate`.
 pub fn set_size(key: u64, size: u64) {
     if key == 0 { return; }
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     let fe = c.files.entry(key).or_insert_with(FileEnt::new);
     fe.size = size;
     fe.size_known = true;
@@ -337,7 +351,7 @@ pub fn set_size(key: u64, size: u64) {
 
 /// The file's size changed to `size` (no-op unless the cache tracks it).
 pub fn note_size(key: u64, size: u64) {
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     if let Some(fe) = c.files.get_mut(&key) {
         if fe.size_known { fe.size = size; }
         fe.atime_ok = 0;
@@ -347,14 +361,14 @@ pub fn note_size(key: u64, size: u64) {
 /// The file's metadata changed in a way relatime looks at (ctime/mtime):
 /// the next read checks atime again.
 pub fn note_ctime(key: u64) {
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     if let Some(fe) = c.files.get_mut(&key) { fe.atime_ok = 0; }
 }
 
 /// relatime: does a read at `now` need the filesystem to look at atime?
 /// `period` bounds how long a "no update needed" answer is trusted.
 pub fn atime_due(key: u64, now: u64, period: u64) -> bool {
-    let c = CACHE.lock();
+    let c = cache_lock();
     match c.files.get(&key) {
         Some(fe) => fe.atime_ok == 0 || now.saturating_sub(fe.atime_ok) >= period,
         None => true,
@@ -363,23 +377,23 @@ pub fn atime_due(key: u64, now: u64, period: u64) -> bool {
 
 /// The filesystem checked (and if needed updated) atime at `now`.
 pub fn atime_checked(key: u64, now: u64) {
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     if let Some(fe) = c.files.get_mut(&key) { fe.atime_ok = now.max(1); }
 }
 
 /// The file's last name went while it was still open or mapped.
 pub fn set_orphan(key: u64) {
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     if let Some(fe) = c.files.get_mut(&key) { fe.orphan = true; }
 }
 
 pub fn is_orphan(key: u64) -> bool {
-    CACHE.lock().files.get(&key).map_or(false, |f| f.orphan)
+    cache_lock().files.get(&key).map_or(false, |f| f.orphan)
 }
 
 /// Keys of orphaned files (background sweep).
 pub fn orphans(out: &mut Vec<u64>) {
-    let c = CACHE.lock();
+    let c = cache_lock();
     for (k, fe) in c.files.iter() { if fe.orphan { out.push(*k); } }
 }
 
@@ -390,7 +404,7 @@ pub fn orphans(out: &mut Vec<u64>) {
 pub fn drop_file(key: u64) {
     if key == 0 { return; }
     let gone = {
-        let mut c = CACHE.lock();
+        let mut c = cache_lock();
         match c.files.remove(&key) {
             Some(mut fe) => {
                 let pages = core::mem::take(&mut fe.pages);
@@ -410,7 +424,7 @@ pub fn drop_file(key: u64) {
 /// A mapping registry entry for `key` was created.
 pub fn key_get(key: u64) {
     if key == 0 { return; }
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     c.files.entry(key).or_insert_with(FileEnt::new).users += 1;
 }
 
@@ -419,7 +433,7 @@ pub fn key_get(key: u64) {
 pub fn key_put(key: u64) {
     if key == 0 { return; }
     let last = {
-        let mut c = CACHE.lock();
+        let mut c = cache_lock();
         match c.files.get_mut(&key) {
             Some(fe) => { fe.users = fe.users.saturating_sub(1); fe.users == 0 }
             None => false,
@@ -444,7 +458,7 @@ pub enum Run {
 /// `pgoff` (one `pageref` reference each, dropped with [`unpin`]), so they
 /// can be copied out with no lock held.
 pub fn pin_run(key: u64, pgoff: u64, out: &mut [usize]) -> Run {
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     let fe = match c.files.get_mut(&key) { Some(f) => f, None => return Run::Miss };
     let mut n = 0usize;
     let mut first_state = None;
@@ -481,7 +495,7 @@ pub fn pin_page(key: u64, pgoff: u64) -> Option<usize> {
 /// doubles the window; any other miss starts again at `RA_INIT`.
 pub fn ra_window(key: u64, pgoff: u64, req: usize, max: usize) -> usize {
     const RA_INIT: u32 = 16;
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     let fe = match c.files.get_mut(&key) { Some(f) => f, None => return req.max(1) };
     let seq = pgoff == fe.ra_next;
     let win = if seq { (fe.ra_win.saturating_mul(2)).max(RA_INIT) } else { RA_INIT };
@@ -497,7 +511,7 @@ pub fn ra_window(key: u64, pgoff: u64, req: usize, max: usize) -> usize {
 /// filled, and at end of file). None if the file is not tracked or the
 /// first page is not absent; else the fill's token and the page count.
 pub fn begin_fill(key: u64, pgoff: u64, want: usize) -> Option<(u32, usize)> {
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     let token = c.next_token;
     c.next_token = c.next_token.wrapping_add(1).max(1);
     let fe = c.files.get_mut(&key)?;
@@ -531,7 +545,7 @@ pub fn end_fill(key: u64, token: u32, pgoff: u64, frames: &[usize], valid: usize
     let mut published = 0usize;
     let mut stale = 0usize;
     {
-        let mut c = CACHE.lock();
+        let mut c = cache_lock();
         match c.files.get_mut(&key) {
             None => freed.extend_from_slice(frames),
             Some(fe) => {
@@ -566,7 +580,7 @@ pub fn end_fill(key: u64, token: u32, pgoff: u64, frames: &[usize], valid: usize
 /// Remove the placeholders of fill `token` for `n` pages from `pgoff` (the
 /// read failed or was cut short).
 pub fn abort_fill(key: u64, token: u32, pgoff: u64, n: usize) {
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     if let Some(fe) = c.files.get_mut(&key) {
         for i in 0..n as u64 {
             let ours = matches!(fe.pages.get(&(pgoff + i)),
@@ -585,7 +599,7 @@ pub fn abort_fill(key: u64, token: u32, pgoff: u64, n: usize) {
 /// the caller's mapping. `exec`: the mapping is executable.
 pub fn lookup(key: u64, pgoff: u64, exec: bool) -> Option<usize> {
     if key == 0 { return None; }
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     let p = c.files.get_mut(&key)?.pages.get_mut(&pgoff)?;
     if p.state != ST_UPTODATE || p.phys == 0 { return None; }
     if p.flags & F_MAPPED == 0 { MAPPED.fetch_add(1, Ordering::Relaxed); }
@@ -600,7 +614,7 @@ pub fn lookup(key: u64, pgoff: u64, exec: bool) -> Option<usize> {
 /// A shared mapping is about to write (`key`, `pgoff`): it must be written
 /// back. False if the page is not the cached frame `phys` (anymore).
 pub fn mark_dirty(key: u64, pgoff: u64, phys: usize) -> bool {
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     let fe = match c.files.get_mut(&key) { Some(f) => f, None => return false };
     let p = match fe.pages.get_mut(&pgoff) { Some(p) => p, None => return false };
     if p.state != ST_UPTODATE || p.phys != phys { return false; }
@@ -632,7 +646,7 @@ pub struct DirtyPage {
 /// write-back. Pages a mapping still holds are included only with `mapped`.
 pub fn take_dirty(lo: u64, hi: u64, mapped: bool, max: usize, out: &mut Vec<DirtyPage>) {
     if DIRTY.load(Ordering::Relaxed) == 0 { return; }
-    let c = CACHE.lock();
+    let c = cache_lock();
     let mut pins: Vec<usize> = Vec::new();
     for (&key, fe) in c.files.range(lo..=hi) {
         if fe.ndirty == 0 { continue; }
@@ -653,7 +667,7 @@ pub fn take_dirty(lo: u64, hi: u64, mapped: bool, max: usize, out: &mut Vec<Dirt
 /// filesystem under its lock right before it writes the page back: a file
 /// freed meanwhile dropped its pages under that same lock.)
 pub fn still_dirty(key: u64, pgoff: u64, phys: usize) -> bool {
-    let c = CACHE.lock();
+    let c = cache_lock();
     c.files.get(&key).and_then(|f| f.pages.get(&pgoff))
         .map_or(false, |p| p.state == ST_UPTODATE && p.phys == phys && p.flags & F_DIRTY != 0)
 }
@@ -665,7 +679,7 @@ pub fn still_dirty(key: u64, pgoff: u64, phys: usize) -> bool {
 /// bumps `seq` through `mark_dirty`. Unpins.
 pub fn writeback_done(d: &DirtyPage, ok: bool) {
     {
-        let mut c = CACHE.lock();
+        let mut c = cache_lock();
         if let Some(fe) = c.files.get_mut(&d.key) {
             if let Some(p) = fe.pages.get_mut(&d.pgoff) {
                 // Two references: the cache's and this write-back's pin.
@@ -694,7 +708,7 @@ pub fn wt_pin(key: u64, pos: u64, len: usize, out: &mut Vec<Pinned>) {
     if len == 0 { return; }
     let first = pos / PAGE_SIZE as u64;
     let last = (pos + len as u64 - 1) / PAGE_SIZE as u64;
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     let fe = match c.files.get_mut(&key) { Some(f) => f, None => return };
     fe.atime_ok = 0;
     let mut pins: Vec<usize> = Vec::new();
@@ -731,7 +745,7 @@ pub fn extend(key: u64, from: u64, upto: u64) {
     let off = (from % PAGE_SIZE as u64) as usize;
     if off == 0 { return; } // the old end was page-aligned: nothing cached past it
     let end = ((upto - pg * PAGE_SIZE as u64) as usize).min(PAGE_SIZE);
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     let fe = match c.files.get_mut(&key) { Some(f) => f, None => return };
     fe.atime_ok = 0;
     if let Some(p) = fe.pages.get_mut(&pg) {
@@ -747,7 +761,7 @@ pub fn extend(key: u64, from: u64, upto: u64) {
 /// zeroed, fills of affected pages in flight are doomed.
 pub fn truncate(key: u64, size: u64) {
     let gone = {
-        let mut c = CACHE.lock();
+        let mut c = cache_lock();
         let fe = match c.files.get_mut(&key) { Some(f) => f, None => return };
         if fe.size_known { fe.size = size; }
         fe.atime_ok = 0;
@@ -838,7 +852,7 @@ pub fn reclaim_pages(want: usize) -> usize {
         frames.clear();
         let mut scanned = 0usize;
         {
-            let mut c = CACHE.lock();
+            let mut c = cache_lock();
             if c.files.is_empty() { break; }
             let (mut hk, mut hp) = c.hand;
             let need = (want - freed).min(BATCH);
@@ -982,7 +996,7 @@ static HOLES: AtomicUsize = AtomicUsize::new(0);
 /// Background housekeeping: drop the entries the emergency path emptied.
 pub fn purge() {
     if HOLES.swap(0, Ordering::Relaxed) == 0 { return; }
-    let mut c = CACHE.lock();
+    let mut c = cache_lock();
     let mut keys: Vec<(u64, u64)> = Vec::new();
     for (&k, fe) in c.files.iter() {
         for (&pg, p) in fe.pages.iter() {
