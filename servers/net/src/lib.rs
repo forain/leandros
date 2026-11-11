@@ -4192,6 +4192,12 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         AF_UNIX | AF_INET => {}
         // TCP and UDP only until ICMPv6/raw sockets land (L3).
         AF_INET6 => {
+            // A non-initial netns has no IPv6 yet (no v6 route or address on its
+            // stacks), so AF_INET6 stays EAFNOSUPPORT there, as before ip6lo. A
+            // library that probes for v6 (passt/pasta in a rootless container's
+            // netns) then stays on AF_INET; with v6 sockets allowed its tcp
+            // relay stalled (pastafix 2026-11-11, open: TODO).
+            if sched::ns::netns_of(pid) != 0 { return err_reply(-97); }
             let t = sock_type & 0xf;
             // ICMPv6: the unprivileged ping socket and the raw one.
             let icmp6 = protocol == IPPROTO_ICMPV6 && (t == SOCK_DGRAM || t == SOCK_RAW);
