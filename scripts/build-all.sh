@@ -723,6 +723,12 @@ build_brush() {
         echo "⚠️  brush source not found at $brush_dir, skipping"
         return 0
     fi
+    # brush's [patch.crates-io] points at the sibling ../crossterm fork; fail
+    # here with the reason instead of deep inside cargo's resolver.
+    if [[ ! -d "$(sibling_dir crossterm)" ]]; then
+        echo "❌ sibling crossterm checkout not found at $(sibling_dir crossterm) (brush needs the CPR fork; see ports/brush/README.md)"
+        return 1
+    fi
     # The checkout must be the pinned brush (ports/brush/README.md): upstream
     # e46b4ae + ports/brush/patches. A Mac checkout that never got patch 0003
     # shipped a /bin/sh whose `cmd &` was still an unstarted in-process task

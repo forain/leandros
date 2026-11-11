@@ -13995,6 +13995,7 @@ fn fork_dup_tables(parent_pid: u32, child_pid: u32) {
     let nmsg = make_vfs_msg(net_server::NET_FORK_DUP, &[parent_pid as u64, child_pid as u64]);
     let _ = net_server::handle(&nmsg, parent_pid);
     epoll_fork_dup(parent_pid, child_pid);
+    vfs::exe_pin_inherit(sched::tgid_of(parent_pid), child_pid);
     stdio_flags_fork(sched::tgid_of(parent_pid), child_pid);
     vfs::prune_handles(child_pid, |h| handle_alive(child_pid, h));
     // The net and epoll tables are per process, so the copies above took a
