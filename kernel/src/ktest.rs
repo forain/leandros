@@ -1916,7 +1916,7 @@ mod k2a {
     extern "C" fn event(_c: usize, ev: u32) { HITS.fetch_add(ev, Ordering::SeqCst); }
     extern "C" fn busy(_c: usize) -> bool { true }
     extern "C" fn wait(_c: usize, ns: u64) -> bool { ns == 7 }
-    pub static FL: KKmsFlipOps = KKmsFlipOps { size: core::mem::size_of::<KKmsFlipOps>() as u32, queue, event, busy, wait_idle: wait };
+    pub static FL: KKmsFlipOps = KKmsFlipOps { size: core::mem::size_of::<KKmsFlipOps>() as u32, queue, event, busy, wait_idle: wait, queue_async: None, frame: None, wait_frame: None };
     extern "C" fn cset(_c: usize, s: *const KKmsCursorSrc, x: i32, y: i32) -> bool { let s = unsafe { &*s }; s.token == 3 && s.width == 64 && x == -4 && y == 5 }
     extern "C" fn cmove(_c: usize, x: i32, _y: i32) { HITS.fetch_add(x as u32, Ordering::SeqCst); }
     extern "C" fn chide(_c: usize) { HITS.fetch_add(100_000, Ordering::SeqCst); }

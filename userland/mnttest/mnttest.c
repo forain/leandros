@@ -2288,6 +2288,7 @@ static void devbind_suite(void) {
     }
 }
 
+<<<<<<< HEAD
 /* ── lane mntiso-procfd: /proc/self/fd/N reopen and /proc/self/fd/N/<below>
  * honour the fd's mount (ro/nodev/mask) and never follow links in host space.
  * Host sentinel /root/mntiso-secret ("HOST") lives on the root volume in ns 0;
@@ -2381,6 +2382,97 @@ static void mntiso_procfd_suite(void) {
     report("procfd_below_link_in_ns", nn_in_child(mi_procfd_below_link, 0));
     report("procfd_below_mask", nn_in_child(mi_procfd_below_mask, 0));
     report("procfd_host_sentinel_intact", mi_host_intact());
+=======
+
+/* ── lane mntiso-busy: mount roots are EBUSY, cross-mount ops EXDEV ── */
+static int mb_prep(void) {
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    mkdir("/root", 0700); mkdir("/root/mb", 0755);
+    mkdir("/root/mb/src1", 0755); mkdir("/root/mb/src2", 0755);
+    mkdir("/root/mb/t1", 0755); mkdir("/root/mb/t2", 0755);
+    int fd = open("/root/mb/hostfile", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return 92; if (write(fd, "HOST", 4) < 0) {} close(fd);
+    fd = open("/root/mb/src1/f", O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd >= 0) close(fd);
+    fd = open("/root/mb/src2/g", O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd >= 0) close(fd);
+    fd = open("/root/mb/fbind", O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd >= 0) close(fd);
+    if (mount("", "/", NULL, MS_REC | MS_SLAVE, NULL) < 0) return 93;
+    if (mount("/root/mb/src1", "/root/mb/t1", NULL, MS_BIND, NULL) < 0) return 94;
+    if (mount("/root/mb/src2", "/root/mb/t2", NULL, MS_BIND, NULL) < 0) return 95;
+    fd = open("/root/mb/fmp", O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd >= 0) close(fd);
+    if (mount("/root/mb/hostfile", "/root/mb/fmp", NULL, MS_BIND, NULL) < 0) return 96;
+    return 0;
+}
+static int mb_case(int m) {
+    int r = mb_prep(); if (r) return r;
+    switch (m) {
+    case 0: if (rename("/root/mb/t1", "/root/mb/t1x") == 0 || errno != EBUSY) return 1;
+            return exists("/root/mb/src1/f") && exists("/root/mb/t1/f") ? 0 : 2;
+    case 1: if (unlink("/root/mb/fmp") == 0 || errno != EBUSY) return 1;
+            return exists("/root/mb/hostfile") ? 0 : 2;
+    case 2: if (rmdir("/root/mb/t1") == 0 || errno != EBUSY) return 1;
+            return exists("/root/mb/src1") ? 0 : 2;
+    case 3: if (rename("/root/mb/t1/f", "/root/mb/t2/f2") == 0 || errno != EXDEV) return 1;
+            return exists("/root/mb/src1/f") ? 0 : 2;
+    case 4: if (link("/root/mb/t1/f", "/root/mb/t2/f3") == 0 || errno != EXDEV) return 1;
+            return !exists("/root/mb/src2/f3") ? 0 : 2;
+    case 5: /* same mount still works */
+            if (rename("/root/mb/t1/f", "/root/mb/t1/f4") < 0) return 1;
+            return exists("/root/mb/src1/f4") ? 0 : 2;
+    case 6: { char b[8] = {0}; int fd = open("/root/mb/hostfile", O_RDONLY);
+            if (fd < 0) return 1; if (read(fd, b, 4) < 0) {} close(fd);
+            return !strcmp(b, "HOST") ? 0 : 2; }
+    }
+    return 99;
+}
+static void mntiso_busy_suite(void) {
+    report("busy_rename_bind_root", nn_in_child(mb_case, 0));
+    report("busy_unlink_file_bind", nn_in_child(mb_case, 1));
+    report("busy_rmdir_mountpoint", nn_in_child(mb_case, 2));
+    report("xdev_rename_across_binds", nn_in_child(mb_case, 3));
+    report("xdev_link_across_binds", nn_in_child(mb_case, 4));
+    report("busy_same_mount_rename_ok", nn_in_child(mb_case, 5));
+    report("busy_host_sentinel_intact", nn_in_child(mb_case, 6));
+}
+/* ── lane mntiso-chroot: chroot inside a mntns (E4) ───────────────────── */
+/* mode 0: abs link to / , 1: ".." link, 2: exec through an in-jail abs link */
+static int cj_case(int m) {
+    mkdir("/tmp/cjm", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    if (mount("tmpfs", "/tmp/cjm", "tmpfs", 0, NULL) < 0) return 92;
+    chmod("/tmp/cjm", 0755);
+    mkdir("/tmp/cjm/sub", 0755); chmod("/tmp/cjm/sub", 0755);
+    if (symlink("/", "/tmp/cjm/sub/esc") < 0) return 93;
+    if (symlink("../../../..", "/tmp/cjm/sub/up") < 0) return 94;
+    if (m == 2) {
+        int in = open("/bin/mnttest", O_RDONLY); if (in < 0) return 95;
+        int a = open("/tmp/cjm/sub/m", O_WRONLY | O_CREAT, 0755); if (a < 0) return 96;
+        char buf[4096]; ssize_t n;
+        while ((n = read(in, buf, sizeof buf)) > 0) { if (write(a, buf, n) != n) return 97; }
+        close(a); close(in);
+        if (symlink("/m", "/tmp/cjm/sub/l") < 0) return 98;
+    }
+    if (chroot("/tmp/cjm/sub") < 0 || chdir("/") < 0) return 99;
+    if (setgid(1000) < 0 || setuid(1000) < 0) return 90;
+    if (m == 2) {
+        pid_t p = fork();
+        if (p == 0) { execl("/l", "/l", "child-ok", (char *)0); _exit(99); }
+        int st = 0; waitpid(p, &st, 0);
+        return WIFEXITED(st) && WEXITSTATUS(st) == 42 ? 0 : 10;
+    }
+    int fd = open(m == 0 ? "/esc/root/mntiso-secret" : "/up/root/mntiso-secret", O_RDONLY);
+    if (fd >= 0) { close(fd); return 11; }
+    return errno == ENOENT ? 0 : 12;
+}
+static void chroot_ns_suite(void) {
+    mkdir("/root", 0755);
+    int f = open("/root/mntiso-secret", O_WRONLY | O_CREAT, 0644);
+    if (f >= 0) { if (write(f, "HOST", 4) != 4) {} close(f); }
+    report("chroot_ns_abs_link", nn_in_child(cj_case, 0));
+    report("chroot_ns_dotdot_link", nn_in_child(cj_case, 1));
+    report("chroot_ns_exec_through_link", nn_in_child(cj_case, 2));
+    unlink("/root/mntiso-secret");
+>>>>>>> main
 }
 
 int main(int argc, char **argv) {
@@ -2410,6 +2502,8 @@ int main(int argc, char **argv) {
     mntiso_procfd_suite();
     shmbind_suite();
     devbind_suite();
+    mntiso_busy_suite();
+    chroot_ns_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
