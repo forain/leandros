@@ -416,6 +416,15 @@ impl RunQueue {
         crate::pid_tgid_insert(task.pid, task.tgid);
         let pid = task.pid;
         if task.pid == task.tgid { self.nproc += 1; }
+        // A task created inside a frozen cgroup is born frozen (Linux
+        // cgroup_post_fork -> cgroup_freeze_task).
+        {
+            let cg = crate::cgroup::adopt(task.cgroup);
+            if crate::cgroup::freeze_effective(cg) && task.state != TaskState::Zombie {
+                task.frozen = true;
+                task.stop_pending = true;
+            }
+        }
         crate::slot::on_insert(i, &mut task);
         crate::slot::SCHED[i].aff.store(task.affinity, Ordering::Relaxed);
         if task.state != TaskState::Zombie { crate::uidcount::inc(task.uid); }
