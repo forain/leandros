@@ -1181,6 +1181,20 @@ pub fn exe_pin_commit(tgid: u32, r: ExeRef) {
     drop(old);
 }
 
+/// fork: the child's exe path is inherited, so it inherits the pin too (own
+/// TMP_FDREFS count, dropped by `exe_pin_gc` once it execs something else).
+pub fn exe_pin_inherit(parent: u32, child: u32) {
+    let mut t = EXE_PINS.lock();
+    let (idx, name, nlen) = match t.iter().find_map(|e| match e {
+        Some((g, r)) if *g == parent => Some((r.idx, r.name, r.nlen)), _ => None }) {
+        Some(x) => x,
+        None => return,
+    };
+    let Some(slot) = t.iter().position(|e| e.is_none()) else { return };
+    TMP_FDREFS[idx].fetch_add(1, atomic::Ordering::AcqRel);
+    t[slot] = Some((child, ExeRef { idx, name, nlen, live: true }));
+}
+
 /// Release pins whose tgid no longer runs a memfd image (`keep` is spared).
 pub fn exe_pin_gc(keep: u32) {
     let mut dead: alloc::vec::Vec<ExeRef> = alloc::vec::Vec::new();
@@ -5208,7 +5222,17 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
 
 fn dispatch_inner(msg: &Message, caller_pid: u32) -> Message {
     match msg.tag {
-        VFS_OPEN         => handle_open(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32),
+        VFS_OPEN         => {
+            // Remember the mount a mount-namespace task opened through, so a
+            // later fchmod/fchown/futimens can answer EROFS on a read-only one.
+            let cx = mnt::callctx_get(caller_pid, arg(msg,0) as usize);
+            let r = handle_open(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32);
+            if let Some(cx) = cx {
+                let fd = reply_val(&r);
+                if fd >= 0 { fd_note_mnt(caller_pid, fd as usize, sched::current_mntns(), cx.mnt_id); }
+            }
+            r
+        }
         VFS_READ         => handle_read(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_WRITE        => handle_write(caller_pid, arg(msg,0) as usize,
@@ -14574,7 +14598,31 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
     err_reply(-30) // EROFS
 }
 
+/// Tag `pid`'s fd with the mount it was opened through (see `ofd::set_mnt`).
+fn fd_note_mnt(pid: u32, fd: usize, ns: u16, mid: u32) {
+    let mut tbls = TblSlot::new();
+    if let Some(tbl) = find_tbl(pid, &mut tbls) {
+        if tbl.fds.used(fd) { ofd::set_mnt(tbl.fds[fd].ofd, ns, mid); }
+    }
+}
+
+/// EROFS when `fd` was opened through a mount that is read-only now.
+fn fd_mnt_ro(pid: u32, fd: usize) -> bool {
+    let ofd = {
+        let mut tbls = TblSlot::new();
+        match find_tbl(pid, &mut tbls) {
+            Some(tbl) if tbl.fds.used(fd) => tbl.fds[fd].ofd,
+            _ => return false,
+        }
+    };
+    match ofd::mnt_of(ofd) {
+        Some((ns, mid)) => mnt::flags_of(ns, mid) & mnt::MNT_RDONLY != 0,
+        None => false,
+    }
+}
+
 fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
+    if fd_mnt_ro(pid, fd) { return err_reply(-30); }
     let mut tbls = TblSlot::new();
     let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
@@ -14645,6 +14693,7 @@ fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32, follow: bool) -> 
 }
 
 fn handle_fchown(pid: u32, fd: usize, uid: u32, gid: u32) -> Message {
+    if fd_mnt_ro(pid, fd) { return err_reply(-30); }
     let mut tbls = TblSlot::new();
     let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
@@ -14748,6 +14797,7 @@ fn handle_futimens(pid: u32, msg: &Message) -> Message {
     let at = (arg(msg, 1) as i64, arg(msg, 2) as i64);
     let mt = (arg(msg, 3) as i64, arg(msg, 4) as i64);
     let explicit = arg(msg, 5) & UTIMENS_EXPLICIT != 0;
+    if fd_mnt_ro(pid, fd) { return err_reply(-30); }
     let kind = {
         let mut tbls = TblSlot::new();
         let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };

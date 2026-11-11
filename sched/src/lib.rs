@@ -2259,7 +2259,10 @@ fn on_signal_generated(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32)
         for i in rq.live_slots() {
             if let Some(t) = rq.get_mut(i) {
                 if t.tgid != tgid { continue; }
+                // The cgroup freezer outlives SIGCONT; only SIGKILL breaks it.
+                if t.frozen && signo == signal::SIGCONT { continue; }
                 t.stop_pending = false;
+                t.frozen = false;
                 if signo == signal::SIGCONT { t.signal_pending &= !signal::SIGDFL_STOP; }
                 if t.state == TaskState::Stopped {
                     t.set_state(TaskState::Ready);
@@ -2292,6 +2295,66 @@ fn on_signal_generated(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32)
         if let Some(l) = rq.find_pid_mut(tgid) { l.shared_signal_pending &= !cont; }
     }
     (false, None)
+}
+
+/// cgroup freezer: stop every thread of `tgid` (no parent notification, no
+/// wait4 report). Threads on another CPU park at their switch-back.
+pub fn freeze_group(tgid: Pid) {
+    let mut kick: [Option<usize>; MAX_CPUS] = [None; MAX_CPUS];
+    {
+        let mut rq = RUN_QUEUE.lock();
+        let mut n = 0;
+        for i in rq.live_slots() {
+            let park = match rq.get_mut(i) {
+                Some(t) => {
+                    if t.tgid != tgid || t.state == TaskState::Zombie { continue; }
+                    t.frozen = true;
+                    t.stop_pending = true;
+                    slot::mark_sb_slow(t.slot);
+                    t.sig_kick();
+                    matches!(t.state, TaskState::Ready | TaskState::Blocked)
+                }
+                None => false,
+            };
+            if !park { continue; }
+            match rq.try_park(i, TaskState::Stopped) {
+                Ok(()) => { if let Some(t) = rq.get_mut(i) { signal::clear_block_fields(t); } }
+                Err(cpu) => { if n < kick.len() { kick[n] = Some(cpu); n += 1; } }
+            }
+        }
+    }
+    for cpu in kick.iter().flatten() { trigger_preempt(*cpu); }
+}
+
+/// Undo `freeze_group`. Threads that were also job-control stopped stay so.
+pub fn thaw_group(tgid: Pid) {
+    let mut rq = RUN_QUEUE.lock();
+    let job_stopped = rq.find_pid(tgid).map_or(false, |l| l.stop_signal != 0);
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get_mut(i) {
+            if t.tgid != tgid || !t.frozen { continue; }
+            t.frozen = false;
+            if job_stopped { continue; }
+            t.stop_pending = false;
+            if t.state == TaskState::Stopped {
+                t.set_state(TaskState::Ready);
+                signal::clear_block_fields(t);
+            }
+        }
+    }
+    drop(rq);
+    wake_up_an_idle_cpu();
+}
+
+/// True once every live thread of `tgid` is parked (or none are left).
+pub fn group_all_stopped(tgid: Pid) -> bool {
+    let rq = RUN_QUEUE.lock();
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get(i) {
+            if t.tgid == tgid && t.state != TaskState::Zombie && t.state != TaskState::Stopped { return false; }
+        }
+    }
+    true
 }
 
 /// SIGCHLD/CLD_CONTINUED to the parent of a just-resumed process. No locks
