@@ -33,6 +33,12 @@ use leandros_libc::syscall::{syscall1, syscall2, syscall3, syscall4, syscall5};
 #[cfg(target_arch = "aarch64")] const SYS_RENAMEAT2: usize = 276;
 #[cfg(target_arch = "x86_64")]  const SYS_RENAMEAT2: usize = 316;
 const RENAME_NOREPLACE: usize = 1;
+#[cfg(target_arch = "aarch64")] const SYS_LINKAT: usize = 37;
+#[cfg(target_arch = "x86_64")]  const SYS_LINKAT: usize = 265;
+unsafe fn link(old: *const u8, new: *const u8) -> i32 {
+    let r = syscall5(SYS_LINKAT, AT_FDCWD as usize, old as usize, AT_FDCWD as usize, new as usize, 0);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
 
 /// Change the process's filesystem root. Irreversible for the calling
 /// process, so callers that need to keep operating outside the jail must
@@ -780,6 +786,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_flock_conflict() { failures += 1; }
     if !test_fcntl_byte_range_conflict() { failures += 1; }
     if !test_permission_enforced() { failures += 1; }
+    if !test_devfs_rename() { failures += 1; }
     if !test_f2fs_ownership_enforced() { failures += 1; }
     if !test_access_real_vs_effective(b"/tmp", b"access_real_vs_effective_tmpfs\0") { failures += 1; }
     if !test_access_real_vs_effective(b"/home/.vfstest", b"access_real_vs_effective_f2fs\0") { failures += 1; }
@@ -1081,6 +1088,45 @@ unsafe fn test_permission_enforced() -> bool {
     let ok = fd2 >= 0;
     if ok { close(fd2); }
     report(name, ok)
+}
+
+/// rename(2) on devfs: root may rename a device node (and link/unlink it), the
+/// node keeps working under its new name and the old name is gone; an
+/// unprivileged caller is refused with EACCES (Linux /dev is root:root 0755).
+unsafe fn test_devfs_rename() -> bool {
+    let name = b"devfs_rename\0";
+    let full = b"/dev/full\0".as_ptr();
+    let full2 = b"/dev/full_ren\0".as_ptr();
+    let full3 = b"/dev/full_lnk\0".as_ptr();
+
+    // Unprivileged rename must be refused and change nothing.
+    let pid = fork();
+    if pid == 0 {
+        if setuid(1000) != 0 { exit(1); }
+        let r = rename(full, full2);
+        let denied = r == -1 && get_errno() == EACCES;
+        let fd = open(full, O_WRONLY, 0);
+        exit(if denied && fd >= 0 { 0 } else { 2 });
+    }
+    let mut status: i32 = -1;
+    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    if status != 0 { return report(name, false); }
+
+    // Root: rename, node reachable under the new name only.
+    if rename(full, full2) != 0 { return report(name, false); }
+    let fd = open(full2, O_WRONLY, 0);
+    let new_ok = fd >= 0;
+    if new_ok { close(fd); }
+    let old_gone = open(full, O_WRONLY, 0) == -1 && get_errno() == 2;
+    // Hard link: a second name for the same node, then drop it.
+    let link_ok = link(full2, full3) == 0 && { let f = open(full3, O_WRONLY, 0); if f >= 0 { close(f); true } else { false } };
+    let unl_ok = unlink(full3) == 0 && open(full3, O_WRONLY, 0) == -1;
+    // Restore.
+    let back = rename(full2, full) == 0;
+    let fd = open(full, O_WRONLY, 0);
+    let restored = fd >= 0;
+    if restored { close(fd); }
+    report(name, new_ok && old_gone && link_ok && unl_ok && back && restored)
 }
 
 /// Ownership enforcement on the f2fs mount at `/home` (the tmpfs test above

@@ -4938,9 +4938,13 @@ fn backing_readlink(backing: &[u8]) -> Option<Vec<u8>> {
 /// anchored at the namespace root). Returns the resolved namespace path, its
 /// backing path and the final mount id; `None` when the namespace has no
 /// tree. Namespace-0 tasks never come here.
-pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool)
+pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool, floor: &[u8])
     -> Result<Option<(Vec<u8>, Vec<u8>, u32)>, i32>
 {
+    // `floor` is the caller's chroot prefix in namespace space ("/" or "" when
+    // not chrooted): an absolute link body re-anchors there and `..` never
+    // climbs above it (Linux path_walk root semantics).
+    let floor: &[u8] = if floor.len() <= 1 { &[] } else { floor.strip_suffix(b"/").unwrap_or(floor) };
     let mut todo: Vec<Vec<u8>> = ns_path.split(|&c| c == b'/').filter(|c| !c.is_empty())
         .map(|c| c.to_vec()).collect();
     todo.reverse();
@@ -4949,7 +4953,9 @@ pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool)
     while let Some(c) = todo.pop() {
         if c == b"." { continue; }
         if c == b".." {
-            if let Some(i) = cur.iter().rposition(|&b| b == b'/') { cur.truncate(i); }
+            if cur.len() > floor.len() {
+                if let Some(i) = cur.iter().rposition(|&b| b == b'/') { cur.truncate(i); }
+            }
             continue;
         }
         let last = todo.is_empty();
@@ -4962,7 +4968,7 @@ pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool)
             hops += 1;
             if hops > SYMLINK_MAX_HOPS { return Err(-40); }
             cur.truncate(save);
-            if t.first() == Some(&b'/') { cur.clear(); }
+            if t.first() == Some(&b'/') { cur.clear(); cur.extend_from_slice(floor); }
             for comp in t.split(|&b| b == b'/').filter(|c| !c.is_empty()).rev() { todo.push(comp.to_vec()); }
         }
     }
@@ -5011,20 +5017,38 @@ fn mnt_flag_check(tag: u64, msg: &Message, backing: &[u8], flags: u8) -> Result<
     Ok(())
 }
 
-fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>)
+fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>, mid_out: &mut Option<u32>)
     -> Result<(), i32>
 {
     let (idx, follow) = match spec { Some(s) => s, None => return Ok(()) };
     let ptr = arg(msg, idx) as usize;
     let (raw, rlen) = match read_cstr_raw(ptr) { Some(r) => r, None => return Ok(()) };
     let path = strip_trailing_slash(&raw[..rlen]);
+    // devfs: a renamed/linked/removed static /dev node is addressed by its
+    // canonical name from here on (rename/unlink/link see the raw names).
+    if !matches!(msg.tag, VFS_RENAME | VFS_UNLINK | VFS_LINK) && path.starts_with(b"/dev/") {
+        if let Some(c) = devfs_canon(path) {
+            *buf = c;
+            buf.push(0);
+            msg.data[idx * 8..idx * 8 + 8].copy_from_slice(&(buf.as_ptr() as u64).to_le_bytes());
+            return Ok(());
+        }
+    }
     // Mount-namespace tasks: symlinks resolve in namespace space (an absolute
     // target is anchored at the pivoted root, not at the backing volume root).
     let pid = sched::current_pid();
     if let Some(cx) = mnt::callctx_get(pid, ptr) {
         let ns = sched::current_mntns();
-        let rr = ns_resolve_links(ns, &cx.ns_path, follow);
+        let jail = sched::current_root_arc();
+        let floor: &[u8] = jail.as_deref().unwrap_or(b"/");
+        let rr = ns_resolve_links(ns, &cx.ns_path, follow, floor);
         if let Some((nsp, backing, mid)) = rr? {
+            *mid_out = Some(mid);
+            // A mount root is busy for unlink/rmdir/rename (Linux: EBUSY); the
+            // backing source must never be modified through the mount point.
+            if matches!(msg.tag, VFS_UNLINK | VFS_RMDIR | VFS_RENAME) && mnt::is_mount_root(ns, &nsp) {
+                return Err(-16);
+            }
             let fl = mnt::flags_of(ns, mid);
             if fl & (mnt::MNT_RDONLY | mnt::MNT_NODEV) != 0 { mnt_flag_check(msg.tag, msg, &backing, fl)?; }
             if nsp != cx.ns_path {
@@ -5077,8 +5101,13 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
         let mut b0: Vec<u8> = Vec::new();
         let mut b1: Vec<u8> = Vec::new();
         let mut m = *msg;
-        if let Err(e) = rewrite_one(&mut m, p0, &mut b0) { return err_reply(e); }
-        if let Err(e) = rewrite_one(&mut m, p1, &mut b1) { return err_reply(e); }
+        let (mut i0, mut i1): (Option<u32>, Option<u32>) = (None, None);
+        if let Err(e) = rewrite_one(&mut m, p0, &mut b0, &mut i0) { return err_reply(e); }
+        if let Err(e) = rewrite_one(&mut m, p1, &mut b1, &mut i1) { return err_reply(e); }
+        // rename/link across mounts is EXDEV even when both sit on one volume.
+        if matches!(m.tag, VFS_RENAME | VFS_LINK) {
+            if let (Some(a), Some(b)) = (i0, i1) { if a != b { return err_reply(-18); } }
+        }
         let r = dispatch(&m, caller_pid);
         // Contexts registered for the rewritten buffers die with them (a stale
         // entry would be found again when the allocator reuses the address).
@@ -7486,6 +7515,8 @@ fn gen_pcache() -> Option<VnodeKind> {
     put("write_through", st.wrote_through);
     put("written_back", st.written_back);
     put("mkclean_ptes", mm::pagecache::MKCLEAN_PTES.load(core::sync::atomic::Ordering::Relaxed));
+    put("cache_lock_acq", mm::pagecache::LOCK_ACQ.load(core::sync::atomic::Ordering::Relaxed));
+    put("cache_lock_contended", mm::pagecache::LOCK_CONTENDED.load(core::sync::atomic::Ordering::Relaxed));
     put("uncached_reads", st.bypass);
     put("free_pages", mm::buddy::free_pages());
     let (low, high) = mm::pagecache::watermarks();
@@ -13744,10 +13775,117 @@ fn handle_sync() -> Message {
 // See the comment on `tmpfs_path` for why the reverse order silently routed
 // all of /tmp's mutating operations at the pivoted-root F2FS mount.
 
+// ── devfs name table ─────────────────────────────────────────────────────────
+//
+// /dev's built-in nodes (RAMFS entries directly under /dev) are static. Linux
+// devtmpfs lets root rename, hard-link and unlink them, so a small mutable
+// name table sits in front: `alias` maps a name to the static node's
+// canonical path, `gone` lists static names that were renamed away or removed.
+// `rewrite_one` swaps an aliased name for its canonical path (a removed name
+// for a path that does not exist) before any handler runs. Only host root may
+// change it (Linux: /dev is root:root 0755, no write for anyone else).
+
+struct DevfsNames { alias: Vec<(Vec<u8>, Vec<u8>)>, gone: Vec<Vec<u8>> }
+static DEVFS_NAMES: Mutex<DevfsNames> = Mutex::new(DevfsNames { alias: Vec::new(), gone: Vec::new() });
+static DEVFS_MUTATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `/dev/<name>` with a single component.
+fn devfs_leaf(path: &[u8]) -> bool {
+    match path.strip_prefix(b"/dev/".as_slice()) {
+        Some(r) => !r.is_empty() && !r.contains(&b'/'),
+        None => false,
+    }
+}
+
+fn devfs_static(path: &[u8]) -> bool {
+    devfs_leaf(path) && RAMFS.iter().any(|e| e.path == path)
+}
+
+/// Canonical path for `path` when the table changes its meaning: the static
+/// node an alias points at, or a never-existing path for a removed name.
+fn devfs_canon(path: &[u8]) -> Option<Vec<u8>> {
+    if !DEVFS_MUTATED.load(core::sync::atomic::Ordering::Acquire) || !devfs_leaf(path) { return None; }
+    let t = DEVFS_NAMES.lock();
+    if let Some((_, c)) = t.alias.iter().find(|(n, _)| n.as_slice() == path) { return Some(c.clone()); }
+    if t.gone.iter().any(|n| n.as_slice() == path) { return Some(b"/dev/.gone".to_vec()); }
+    None
+}
+
+/// The static node `path` currently names (None if it names nothing).
+fn devfs_target(t: &DevfsNames, path: &[u8]) -> Option<Vec<u8>> {
+    if let Some((_, c)) = t.alias.iter().find(|(n, _)| n.as_slice() == path) { return Some(c.clone()); }
+    if devfs_static(path) && !t.gone.iter().any(|n| n.as_slice() == path) { return Some(path.to_vec()); }
+    None
+}
+
+/// Drop the name `path` (alias entry, and a tombstone if it is a static name).
+fn devfs_drop(t: &mut DevfsNames, path: &[u8]) {
+    t.alias.retain(|(n, _)| n.as_slice() != path);
+    if devfs_static(path) && !t.gone.iter().any(|n| n.as_slice() == path) { t.gone.push(path.to_vec()); }
+    DEVFS_MUTATED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Names a devfs rename/link/unlink concerns: a single-component /dev name
+/// that is a built-in node or an alias. `None` when the path is not devfs's.
+fn devfs_owns(path: &[u8]) -> bool {
+    if !devfs_leaf(path) { return false; }
+    let t = DEVFS_NAMES.lock();
+    devfs_target(&t, path).is_some() || t.gone.iter().any(|n| n.as_slice() == path)
+}
+
+fn devfs_dest_ok(path: &[u8]) -> Option<i32> {
+    if !devfs_leaf(path) { return Some(-18); }                    // EXDEV: not a plain /dev name
+    if path.len() - 5 > 255 { return Some(-36); }
+    if DEVFS_DIRS.iter().any(|d| *d == path) || is_tmpfs_root(path) { return Some(-21); } // EISDIR
+    None
+}
+
+const DEVFS_DIRS: &[&[u8]] = &[b"/dev/shm", b"/dev/dri", b"/dev/input", b"/dev/pts", b"/dev/.devpts", b"/dev/mqueue"];
+
+fn devfs_rename(pid: u32, old: &[u8], new: &[u8], flags: usize) -> Message {
+    const RENAME_NOREPLACE: usize = 1;
+    if flags & !RENAME_NOREPLACE != 0 { return err_reply(-22); }
+    if !host_root_of(pid) { return err_reply(-13); } // EACCES: /dev is root-writable only
+    if let Some(e) = devfs_dest_ok(new) { return err_reply(e); }
+    let mut t = DEVFS_NAMES.lock();
+    let target = match devfs_target(&t, old) { Some(c) => c, None => return err_reply(-2) };
+    if old == new { return ok_reply(); }
+    if flags & RENAME_NOREPLACE != 0 && devfs_target(&t, new).is_some() { return err_reply(-17); }
+    devfs_drop(&mut t, old);
+    t.alias.retain(|(n, _)| n.as_slice() != new);
+    t.alias.push((new.to_vec(), target));
+    ok_reply()
+}
+
+fn devfs_link(pid: u32, old: &[u8], new: &[u8]) -> Message {
+    if !host_root_of(pid) { return err_reply(-13); }
+    if let Some(e) = devfs_dest_ok(new) { return err_reply(e); }
+    let mut t = DEVFS_NAMES.lock();
+    let target = match devfs_target(&t, old) { Some(c) => c, None => return err_reply(-2) };
+    if devfs_target(&t, new).is_some() { return err_reply(-17); }
+    t.alias.push((new.to_vec(), target));
+    DEVFS_MUTATED.store(true, core::sync::atomic::Ordering::Release);
+    ok_reply()
+}
+
+fn devfs_unlink(pid: u32, path: &[u8]) -> Message {
+    if !host_root_of(pid) { return err_reply(-13); }
+    let mut t = DEVFS_NAMES.lock();
+    if devfs_target(&t, path).is_none() { return err_reply(-2); }
+    devfs_drop(&mut t, path);
+    ok_reply()
+}
+
 fn handle_rename(pid: u32, old_ptr: usize, new_ptr: usize, flags: usize) -> Message {
     let (obuf, olen) = match read_cstr_raw(old_ptr) { Some(r) => r, None => return err_reply(-14) };
     let (nbuf, nlen) = match read_cstr_raw(new_ptr) { Some(r) => r, None => return err_reply(-14) };
 
+    {
+        let (o, n) = (strip_trailing_slash(&obuf[..olen]), strip_trailing_slash(&nbuf[..nlen]));
+        if o.starts_with(b"/dev/") && n.starts_with(b"/dev/") && devfs_owns(o) {
+            return devfs_rename(pid, o, n, flags);
+        }
+    }
     match (tmpfs_path(&obuf[..olen]), tmpfs_path(&nbuf[..nlen])) {
         (Some(old), Some(new)) => tmpfs_rename(pid, old, new, flags),
         // One side in tmpfs, the other not: a real cross-filesystem move,
@@ -13879,6 +14017,7 @@ fn handle_unlink(pid: u32, path_ptr: usize) -> Message {
     let raw = &pbuf[..plen];
 
     if cgroupfs::is_path(strip_trailing_slash(raw)) { return err_reply(-1); } // EPERM
+    if devfs_owns(strip_trailing_slash(raw)) { return devfs_unlink(pid, strip_trailing_slash(raw)); }
     if let Some(name) = mqueue::path_name(strip_trailing_slash(raw)) {
         let r = mqueue::unlink(pid, name);
         return if r < 0 { err_reply(r as i32) } else { ok_reply() };
@@ -14422,6 +14561,9 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
     let (obuf, olen) = match read_cstr_raw(old_ptr) { Some(r) => r, None => return err_reply(-14) };
     let (nbuf, nlen) = match read_cstr_raw(new_ptr) { Some(r) => r, None => return err_reply(-14) };
     let (oraw, nraw) = (&obuf[..olen], &nbuf[..nlen]);
+    if devfs_owns(strip_trailing_slash(oraw)) {
+        return devfs_link(pid, strip_trailing_slash(oraw), strip_trailing_slash(nraw));
+    }
 
     let (otmp, ntmp) = (tmpfs_path(oraw), tmpfs_path(nraw));
     match (otmp, ntmp) {
