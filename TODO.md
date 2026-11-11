@@ -7,7 +7,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ## Known bugs
 
 ### Kernel / VFS
-- **Podman rootless pasta churn**: earlier 3/4/1 of 20 failures, unverified after the fcntl lock fix (?).
 - **Pending AF_UNIX connections whose client closed before `accept` are dropped** (Linux hands them over) (?).
 - **Paths below `/proc/self/fd/N` follow the directory's open-time path** (no dentries; no " (deleted)" suffix on readlink).
 - **Global scans on last close** of tmpfs/mounted files walk every fd table (O(all fds)); a per-object refcount would retire it and `FD_COPY_GATE`.
@@ -30,10 +29,8 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **nsfs bind inside a non-init mntns; self-binds not copied into a new mntns.**
 - **netns**: SETLINK move of an existing link; TCP over a tap in a netns (?).
 - **fchmod/fchown/futimens on fds of an ro mount** are not refused.
-- **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
 - **mntunshare is not an isolation boundary for root-run workloads** (M6).
 - **rename on devfs unsupported.**
-- **Redundant `local_loop` case in podpasta** (duplicate of `loop_own`); podpastatest `bridge_ip` has no httpd in Alpine (now an nc loop) and leaks a baseline mount.
 - **cgsession: only `/bin/login` joins the session cgroup** (greetd/sshd/launcher/autologin need a helper).
 
 ### Network
