@@ -74,7 +74,8 @@ fn ifnames(ns: u16, idx: usize, out: &mut [u8; 16]) -> usize {
     if ns == 0 {
         let nics = drivers::netdev::count().min(drivers::netdev::MAX_NETIF);
         if idx < nics {
-            let name = drivers::netdev::iter().nth(idx).map(|n| n.name()).unwrap_or("");
+            let Some(n) = drivers::netdev::iter().nth(idx) else { return 0 };
+            let name = n.name();
             let l = name.len().min(15);
             out[..l].copy_from_slice(&name.as_bytes()[..l]);
             return l;
