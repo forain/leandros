@@ -350,8 +350,10 @@ impl Pending {
 }
 
 /// Session leader `sid` exited: its controlling pty loses the session and the
-/// foreground group gets SIGHUP then SIGCONT (POSIX; Linux
-/// `disassociate_ctty`). Only the leader's own exit does this; a non-leader
+/// foreground group gets SIGHUP, and no SIGCONT (Linux `disassociate_ctty(1)`
+/// sends SIGCONT only on the non-exit paths; checked against Arch with the
+/// ptytest `leader_exit_hup` scenario). A stopped background group the exit
+/// orphans gets SIGHUP+SIGCONT from `sched::signal::kill_orphaned_pgrps`. Only the leader's own exit does this; a non-leader
 /// never matches because `p.sid == sid` is a session id, not a pid.
 pub fn session_leader_exited(sid: u32) {
     if sid == 0 {
@@ -371,7 +373,6 @@ pub fn session_leader_exited(sid: u32) {
     }
     if fg != 0 {
         let _ = sched::kill_pgrp(fg, 1, sched::SigInfo::KERNEL);
-        let _ = sched::kill_pgrp(fg, 18, sched::SigInfo::KERNEL);
     }
 }
 

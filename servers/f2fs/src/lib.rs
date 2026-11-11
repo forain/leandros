@@ -9145,12 +9145,12 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
             },
         VFS_LISTXATTR | VFS_LLISTXATTR =>
             match xattr_path_ino(ms, arg(msg,0), msg.tag == VFS_LISTXATTR) {
-                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.host_root),
+                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.host_sysadmin()),
                 Err(m) => m,
             },
         VFS_FLISTXATTR =>
             match xattr_fd_ino(ms, arg(msg,0)) {
-                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.host_root),
+                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.host_sysadmin()),
                 Err(m) => m,
             },
         VFS_REMOVEXATTR | VFS_LREMOVEXATTR =>

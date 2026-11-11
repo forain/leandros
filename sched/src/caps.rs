@@ -24,7 +24,18 @@ pub const SECURE_NO_CAP_AMBIENT_RAISE: u64 = 1 << 6;
 /// Every lock bit (each is its flag's bit << 1).
 pub const SECURE_ALL_LOCKS: u64 = 0xaa;
 pub const SECURE_ALL_BITS: u64 = 0x55;
+pub const CAP_CHOWN: u32 = 0;
+pub const CAP_DAC_OVERRIDE: u32 = 1;
+pub const CAP_FOWNER: u32 = 3;
+pub const CAP_KILL: u32 = 5;
 pub const CAP_SETPCAP: u32 = 8;
+pub const CAP_NET_RAW: u32 = 13;
+pub const CAP_SYS_PTRACE: u32 = 19;
+pub const CAP_SYS_PACCT: u32 = 20;
+pub const CAP_SYS_ADMIN: u32 = 21;
+pub const CAP_SYS_RESOURCE: u32 = 24;
+pub const CAP_SYS_TTY_CONFIG: u32 = 26;
+pub const CAP_CHECKPOINT_RESTORE: u32 = 40;
 pub const CAP_SYS_MODULE: u32 = 16;
 pub const CAP_SYS_RAWIO: u32 = 17;
 pub const CAP_SYS_CHROOT: u32 = 18;
@@ -43,6 +54,19 @@ pub fn userns_root_caps(bnd: u64) -> [u64; 6] { [ALL_CAPS, ALL_CAPS, 0, bnd, 0, 
 pub fn ns_capable(cap: u32) -> bool {
     cap <= CAP_LAST
         && RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.caps[0] >> cap & 1 != 0).unwrap_or(false)
+}
+
+/// `host_capable` for an arbitrary task (server code acting for `pid`).
+pub fn host_capable_of(pid: u32, cap: u32) -> bool {
+    cap <= CAP_LAST
+        && RUN_QUEUE.lock().find_pid(pid)
+            .map(|t| t.userns.id() == 0 && t.caps[0] >> cap & 1 != 0).unwrap_or(false)
+}
+
+/// `ns_capable_in` for an arbitrary task (server code acting for `pid`).
+pub fn ns_capable_in_of(pid: u32, target_ns: crate::ns::NsId, cap: u32) -> bool {
+    RUN_QUEUE.lock().find_pid(pid)
+        .map(|t| capable_snap(t.userns.id(), t.euid, t.caps[0], target_ns, cap)).unwrap_or(false)
 }
 
 /// Like `ns_capable` but only true in the initial user namespace: for

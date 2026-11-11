@@ -746,7 +746,7 @@ fn window_check(i: u8, abs: u64, n: u64) -> WinCheck {
 }
 
 fn blkwrwin(pid: u32, ofd_id: u32, backing: Backing, size: u64, ro: bool, arg: usize) -> isize {
-    if !sched::host_root_of(pid) { return -13; } // EACCES
+    if !sched::caps::host_capable_of(pid, sched::caps::CAP_SYS_ADMIN) { return -13; } // EACCES
     let i = match backing { Backing::Disk(i) => i, _ => return -22 }; // whole disk only
     if arg == 0 { return -14; }
     let req = match sched::uaccess::read_user::<WrWin>(arg) { Some(v) => v, None => return -14 };
@@ -1188,7 +1188,7 @@ pub fn ioctl(pid: u32, ofd_id: u32, dev: u16, cmd: usize, arg: usize) -> isize {
             let v = match sched::uaccess::read_user::<i32>(arg) { Some(v) => v, None => return -14 };
             if v != 0 {
                 if ro { return 0; }
-                if !sched::host_root_of(pid) { return -13; }
+                if !sched::caps::host_capable_of(pid, sched::caps::CAP_SYS_ADMIN) { return -13; }
                 return match backing {
                     Backing::Disk(i) => match ops() {
                         Some(o) if (o.set_ro)(i as usize) => {
@@ -1210,7 +1210,7 @@ pub fn ioctl(pid: u32, ofd_id: u32, dev: u16, cmd: usize, arg: usize) -> isize {
             }
             if !ro { return 0; }
             // Runtime write enable: root only, whole NVMe disk only, this boot only.
-            if !sched::host_root_of(pid) { return -13; }
+            if !sched::caps::host_capable_of(pid, sched::caps::CAP_SYS_ADMIN) { return -13; }
             match backing {
                 Backing::Disk(i) => match ops() {
                     // blk.rw= still holds after the controller is writable.

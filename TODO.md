@@ -8,7 +8,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 - [ ] mntiso E7: add a host_to_view hint to the fd_ns_path reopen so links whose target is only reachable from another view resolve without the identity-check fallback (design-mntiso.md E7; open after lane/mntiso-procfd).
 ### Kernel / VFS
-- **Global scans on last close** of tmpfs/mounted files walk every fd table (O(all fds)); a per-object refcount would retire it and `FD_COPY_GATE`.
 - **Wake scans are O(parked pollers)**; keyed wake still dereferences each mask match (~11 us per scan). A per-tag index / kbits bloom would fix it.
 - **The switch-back CPU charge still takes RUN_QUEUE** (~22.5k holds/s); needs a lock-free `on_cpu` release protocol.
 - **New writers of signal state must call `sig_kick`**; a miss shows as `miss` > 0 in `/proc/rqhold` (invariant, no known violation).
@@ -17,15 +16,14 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Interrupt-context serial diagnostics can drop under back-pressure** (by design).
 - **fd-limit fence loss**: EMFILE in a virgl client's submit kills its context (as Linux); fd headroom is the defence.
 - **Host-refused `RING_IDX` submit is never completed by QEMU** (descriptors lost); Mesa cannot reach it. Do not rewrite RING_IDX kernel-side.
-- **Pty background-child SIGHUP on su session end** unverified against Linux (?).
 
 ### Podman / namespaces / cgroups
-- **Unconverted `host_root()` privilege checks** (SYS_TIME/SYS_BOOT/SYS_MODULE/RAWIO/WAKE_ALARM done in lane/capclock; rest still all-or-nothing): vt.rs (CAP_SYS_TTY_CONFIG), net raw sockets (CAP_NET_RAW), evdev (CAP_SYS_ADMIN, verify), block.rs (CAP_SYS_ADMIN/CAP_SYS_RAWIO), vfs tmpfs chown/chmod (CAP_CHOWN/CAP_FOWNER), ACCT/VHANGUP/SWAPON (CAP_SYS_PACCT/TTY_CONFIG/SYS_ADMIN), ptrace/kill-like (CAP_SYS_PTRACE/CAP_KILL), mount (CAP_SYS_ADMIN), xattr (CAP_SYS_ADMIN/FOWNER), f2fs (CAP_DAC_OVERRIDE); sys_secprobe/dbg_serial/spawn stay kernel-private.
+- ~~**Unconverted `host_root()` privilege checks**~~ DONE (capaudit 2026-11-11 + capvfs 2026-11-11: tmpfs/f2fs chown/chmod/DAC/xattr now use the task's real caps in ns 0; only mount-root gates keep `Cred.host_root` = full-cap init-ns root; sys_secprobe/dbg_serial/spawn stay kernel-private).
 - **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
 - **mntunshare is not an isolation boundary for root-run workloads** (M6).
 
 ### Network
-- **No IPv6 / AF_INET6** (sshd `[::]:22` fails with EAFNOSUPPORT; podman IPv6 deferred).
+- **IPv6 beyond loopback** (L1 ::1 and L2 dual-stack/V6ONLY/v4-mapped done, sshd listens on `[::]:22`; no NIC/SLAAC/neighbour discovery, netns, podman IPv6 yet: design-ipv6 L3+).
 - **UDP/IP gaps**: no PMTUD (IP_MTU_DISCOVER/IP_MTU, DF on Frag-Needed), no IGMPv3/SSM. (IP fragmentation/reassembly works: udptest `udp_huge` + peer_frag_echo guard it.)
 - ~~**Real NIC drivers program no multicast filter**~~ FIXED 2026-11-11 (lane/nicmcast): macb, e1000e, r8169, iwlwifi already accepted all multicast; brcmf (Pi Wi-Fi) now sets `allmulti` (Pi wifi0 rx of 30 mDNS-group datagrams: +5 before, +37 after). Pass-all, no per-group list. See artifacts/notes/lane-nicmcast-2026-11-11.md.
 - **iwlwifi gaps** (lane iwlgaps 2026-11-11: WMM later-beacon updates, STATISTICS_NOTIFICATION and antenna comparison were already implemented; sparse ping loss 0/300 on LeandrOS vs 4/300 on Linux, same AP; 2.4 GHz is channel noise): still open: TX MIMO/STBC/SGI on 5 GHz unmeasured (the saved 5 GHz profile/passphrase is not on the stick; add the profile and A/B `iwlwifi.rscol`/`txmimo`).
@@ -39,7 +37,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **i915** (cursors to 256x256, async flips, hardware WAIT_VBLANK and IN_FENCE_FD landed in lane/i915feat): `WAIT_VBLANK` polls PIPE_FRMCOUNT every 500 us, not IRQ-driven; `DRM_VBLANK_EVENT`/`SIGNAL` return EINVAL; `IN_FENCE_FD` is a CPU wait before the commit, so a NONBLOCK commit blocks on an unsignalled in-fence; wide cursors use the capped plane-1A watermark (no own skl_compute_wm); async flips need the on-screen fb's pitch/size.
 - **Laptop**: low FPS under COSMIC; Firefox on iris unproven; Wi-Fi link still weak on 2.4 GHz.
 - **x86 audio clipping** in DOOM/PipeWire (lane/doomvis).
-- **PipeWire sink is named "Virtio Sound Output"** whatever the backend (HDA on the PC shows that name).
 - **Minimize applet un-hide unverified**; `cosmic-files-applet` smithay-clipboard OOM panic and `cosmic-notifications` panel-dbus Broken pipe have no root cause; greeter's cosmic-comp logs `eglMakeCurrent BadDisplay` on exit (cosmetic).
 - **Panel-embedded applets render with tiny-skia**; aarch64 desktop clicks need a physical-mouse check (P0 #5).
 - **VT switching**: a present inside its handler during a switch can flash; evdev VT gate not tested against cosmic-comp; `EVIOCGRAB` exclusive delivery unmeasured; `EVIOCREVOKE` ignored; Ctrl+Alt+Esc swallowed.
@@ -50,6 +47,11 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Stick write commands of 0.5-1.3 s are hidden, not removed** (USB hubs now supported, usbhot2).
 - **Why Limine leaves RAM above 4 GiB out of the HHDM is unexplained** (`lane-fbmm`); aarch64 has no HHDM gap walker.
 - **Real-PC (RTX 3070) verification deferred ~1 month** (user, 2026-10-24).
+
+### Build / tooling
+- **build-all silently reuses stale container-built ports when Docker is not running** (PipeWire shipped an old sink, lane smallfix 2026-11-11); same class as the buildguard guards: should fail loudly.
+- **A port build failure only warns** (busd link failure → stale busd → misleading staleness error on the box, lane boxbuild); make per-port build failures fatal.
+- **`ports/gstreamer/build.sh` still references the deleted `ports/firefox/build.sh`** (fixed for pipewire in lane smallfix).
 
 ## Missing features
 

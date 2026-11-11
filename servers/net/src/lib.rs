@@ -220,6 +220,8 @@ const SOL_UDP:       usize = 17;
 const UDP_SEGMENT:   usize = 103;
 const UDP_GRO:       usize = 104;
 const IPPROTO_IP:    usize = 0;
+const IPPROTO_IPV6:  usize = 41;
+const IPV6_V6ONLY:   usize = 26;
 const IP_TOS:        usize = 1;
 const IP_TTL:        usize = 2;
 const IP_PKTINFO:    usize = 8;
@@ -1306,6 +1308,8 @@ struct SockOpts {
     sndbuf:    u32,
     /// SO_PASSCRED: recvmsg returns the sender's SCM_CREDENTIALS.
     passcred:  bool,
+    /// IPV6_V6ONLY on an AF_INET6 socket: it hears and reaches only v6.
+    v6only:    bool,
 }
 
 /// Linux's `net.core.wmem_default` / `rmem_default`: an AF_UNIX socket's
@@ -1332,7 +1336,7 @@ impl SockOpts {
     const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
                                  reuseport: false, broadcast: false, gso: 0, shut: 0,
                                  mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0,
-                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false };
+                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false, v6only: false };
 }
 
 /// Rows for live descriptions with a non-default `SockOpts`. Leaf lock: taken
@@ -1860,13 +1864,13 @@ fn stack_holding(ns: u16, ip: IpAddress) -> Option<Sid> {
 /// Do two bound addresses claim a common local address? Within a family a wildcard
 /// overlaps everything; across families only a v6 wildcard (dual-stack `::`) reaches
 /// the v4 side, so 0.0.0.0:P and [::1]:P coexist (Linux, bindv6only=0).
-fn bind_addrs_overlap(a: IpAddress, b: IpAddress) -> bool {
+fn bind_addrs_overlap(a: IpAddress, a_v6only: bool, b: IpAddress, b_v6only: bool) -> bool {
     match (a, b) {
         (IpAddress::Ipv4(_), IpAddress::Ipv4(_)) | (IpAddress::Ipv6(_), IpAddress::Ipv6(_)) => {
             a.is_unspecified() || b.is_unspecified() || a == b
         }
-        (IpAddress::Ipv6(_), _) => a.is_unspecified(),
-        (_, IpAddress::Ipv6(_)) => b.is_unspecified(),
+        (IpAddress::Ipv6(_), _) => a.is_unspecified() && !a_v6only,
+        (_, IpAddress::Ipv6(_)) => b.is_unspecified() && !b_v6only,
     }
 }
 
@@ -1876,7 +1880,9 @@ fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, por
     if me.netns() == 0 && is_inet(me.domain) && fwd::reserved(tcp, port) {
         if ip.is_unspecified() || matches!(ip, IpAddress::Ipv4(a) if iface::is_nic_addr(a.0)) { return true; }
     }
-    let my_reuseport = sock_opts(me.ofd).reuseport;
+    let my_opts = sock_opts(me.ofd);
+    let my_reuseport = my_opts.reuseport;
+    let my_v6only = my_opts.v6only;
     let my_uid = sched::euid_of(pid);
     for t in tbls.iter().filter(|t| t.in_use) {
         for e in t.socks.iter() {
@@ -1898,7 +1904,7 @@ fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, por
                 }
                 _ => continue,
             };
-            if !bind_addrs_overlap(addr, ip) { continue; }
+            if !bind_addrs_overlap(addr, sock_opts(e.ofd).v6only, ip, my_v6only) { continue; }
             if my_reuseport && sock_opts(e.ofd).reuseport && sched::euid_of(t.pid) == my_uid { continue; }
             if me.reuseaddr && e.reuseaddr && !(tcp && listening) { continue; }
             return true;
@@ -4146,11 +4152,12 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         }
         _                 => return err_reply(-97),
     }
-    // SOCK_RAW needs CAP_NET_RAW (root) — EPERM. An unprivileged ping uses
+    // SOCK_RAW needs CAP_NET_RAW over the netns owner's userns (Linux ns_capable) — EPERM. An unprivileged ping uses
     // SOCK_DGRAM/IPPROTO_ICMP instead, which Linux allows for every group in
     // net.ipv4.ping_group_range (all of them on common distributions) and
     // which lands on the same ICMP socket below.
-    if domain == AF_INET && sock_type & 0xf == SOCK_RAW && !sched::host_root_of(pid) {
+    if domain == AF_INET && sock_type & 0xf == SOCK_RAW
+        && !sched::caps::ns_capable_in_of(pid, sched::ns::owner_userns(1, sched::ns::netns_of(pid)), sched::caps::CAP_NET_RAW) {
         return err_reply(-1);
     }
     // net.ipv4.ping_group_range of the caller's netns gates SOCK_DGRAM ICMP.
@@ -4181,6 +4188,12 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         connecting: false,
         ns:         sched::ns::NsRef::get(sched::ns::netns_of(pid)),
     };
+    if domain == AF_INET6 && sched::ns::bindv6only(sched::ns::netns_of(pid)) {
+        let ofd = tbl.socks[slot].ofd;
+        let mut o = sock_opts(ofd);
+        o.v6only = true;
+        set_sock_opts(ofd, o);
+    }
     if domain == AF_NETLINK { nlsock::create(tbl.socks[slot].ofd, sched::tgid_of(pid), sched::ns::netns_of(pid)); }
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
@@ -4206,6 +4219,11 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             // net.ipv4.ip_unprivileged_port_start default, EACCES.
             if port != 0 && !sched::ns::bind_port_allowed(pid, sock_netns(pid, slot), port) { return err_reply(-13); }
             let ip = parsed.ip;
+            // A V6ONLY socket cannot take a v4-mapped address (Linux inet6_bind: EINVAL).
+            if sdom == AF_INET6 && matches!(ip, IpAddress::Ipv4(_)) {
+                let ofd = sock_entry(pid, fd).map_or(0, |e| e.ofd);
+                if sock_opts(ofd).v6only { return err_reply(-22); }
+            }
             // A fresh network namespace has only a DOWN loopback: no address
             // can be bound but the wildcard.
             if !ip.is_unspecified() && sock_netns(pid, slot) != 0 && vif::lo_up_sid(sock_netns(pid, slot)).is_none() { return err_reply(-99); }
@@ -4431,19 +4449,20 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
         // Registered first: a stack built after this point (wifi0, once
         // its MAC is known) adopts the listener (`listen::adopt`).
         let lns = tbl.socks[slot].netns();
+        let v6only = tbl.socks[slot].domain == AF_INET6 as u8 && sock_opts(tbl.socks[slot].ofd).v6only;
         let lid = listen::new_lid();
         if lns != 0 {
             // A non-initial netns: the listener lives on its own lo stack, if
             // that exists. With lo never brought up it is a table entry only
             // (port space, nothing reachable), as on Linux.
-            for sid in listen::stacks_for(lns, local) { listen::create(sid, lid, local); }
+            for sid in listen::stacks_for(lns, local) { listen::create(sid, lid, local, v6only); }
             tbl.socks[slot].state = SockState::InetListening { lid, local };
             share_state(&mut *tbls, pid, slot);
             return ok_reply();
         }
-        listen::register(lid, local);
+        listen::register(lid, local, v6only);
         let mut any = false;
-        for sid in listen::stacks_for(tbl.socks[slot].netns(), local) { any |= listen::create(sid, lid, local); }
+        for sid in listen::stacks_for(tbl.socks[slot].netns(), local) { any |= listen::create(sid, lid, local, v6only); }
         if !any { listen::destroy_all(lid); return err_reply(-100); } // ENETDOWN
 
         tbl.socks[slot].state = SockState::InetListening { lid, local };
@@ -4843,9 +4862,12 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
         _ => return Err(-22),
     };
     // A wildcard socket is held to its family: AF_INET (or a mapped 0.0.0.0)
-    // never hears a v6 datagram; AF_INET6 `::` stays dual until V6ONLY (L2).
+    // never hears a v6 datagram; AF_INET6 `::` is dual unless V6ONLY.
     let v4only = tbl.socks[slot].domain == AF_INET as u8
         || matches!(local_addr, Some(IpAddress::Ipv4(_)));
+    let v6only = tbl.socks[slot].domain == AF_INET6 as u8 && sock_opts(tbl.socks[slot].ofd).v6only;
+    let fam = if v4only { Some(smoltcp::wire::IpVersion::Ipv4) }
+        else if v6only { Some(smoltcp::wire::IpVersion::Ipv6) } else { None };
     // No object yet, so this is just its SOCKSTATE key (no `udpany::of` lock).
     let old_keys = [sock_state_key(tbl.socks[slot].ofd)];
     let port = if tbl.socks[slot].bound_port != 0 {
@@ -4873,13 +4895,13 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
             port,
         };
         if socket.bind(ep).is_err() { return Err(-22); }
-        if v4only { socket.set_family(Some(smoltcp::wire::IpVersion::Ipv4)); }
+        if fam.is_some() { socket.set_family(fam); }
         socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
         s.socket_set.add(socket)
     };
     tbl.socks[slot].bound_port = port;
     tbl.socks[slot].state = SockState::InetConnected { socket_handle: handle, remote_endpoint: None, sid };
-    if server { udpany::create(tbl.socks[slot].netns(), tbl.socks[slot].ofd, sid, handle, port, v4only); }
+    if server { udpany::create(tbl.socks[slot].netns(), tbl.socks[slot].ofd, sid, handle, port, fam); }
     share_state(&mut *tbls, pid, slot);
     drop(tbls);
     // A poller of the unbound socket (another thread, another holder) now
@@ -5020,6 +5042,10 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         let parsed = match sa::parse_for(sdom, addr_ptr, addrlen) { Ok(a) => a, Err(e) => return err_reply(e) };
         let port = parsed.port;
         let remote_ip = parsed.ip;
+        // A V6ONLY socket cannot reach a v4-mapped peer (Linux: ENETUNREACH).
+        if sdom == AF_INET6 && matches!(remote_ip, IpAddress::Ipv4(_)) {
+            if sock_entry(pid, fd).map_or(false, |e| sock_opts(e.ofd).v6only) { return err_reply(-101); }
+        }
         let remote_endpoint = IpEndpoint::new(remote_ip, port);
         // 127.0.0.0/8 is served by the loopback stack, everything else by the
         // stack the route lookup picks (`iface::route_select`), or the one
@@ -7353,6 +7379,18 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         return ok_reply();
     }
     if level == IPPROTO_IP { return ip_setsockopt(pid, fd, optname, optval_ptr, optlen); }
+    if level == IPPROTO_IPV6 && optname == IPV6_V6ONLY {
+        let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
+        if e.domain as usize != AF_INET6 { return err_reply(-ENOPROTOOPT); }
+        let Some(v) = (if optlen < 4 { None } else { sched::uaccess::read_user::<i32>(optval_ptr) })
+            else { return err_reply(if optlen < 4 { -22 } else { -14 }) };
+        // Linux: only before the socket has a port (a bound or listening socket is EINVAL).
+        if !matches!(e.state, SockState::Unbound { .. }) || e.bound_port != 0 { return err_reply(-22); }
+        let mut o = sock_opts(e.ofd);
+        o.v6only = v != 0;
+        set_sock_opts(e.ofd, o);
+        return ok_reply();
+    }
     // UDP_GRO: recvmsg returns runs of equal-sized datagrams together.
     if level == SOL_UDP && optname == UDP_GRO {
         let Some(v) = (if optlen < 4 { None } else { sched::uaccess::read_user::<i32>(optval_ptr) })
@@ -7739,6 +7777,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             (SOL_UDP, UDP_SEGMENT) if is_udp_entry(&e) => Some(sock_opts(e.ofd).gso as u32),
             (SOL_UDP, UDP_GRO) if is_udp_entry(&e) => Some((sock_opts(e.ofd).recv & RECV_GRO != 0) as u32),
             (IPPROTO_IP, n) if is_inet(e.domain) && n != IP_MULTICAST_IF => ip_getsockopt(&e, n),
+            (IPPROTO_IPV6, IPV6_V6ONLY) if e.domain as usize == AF_INET6 => Some(sock_opts(e.ofd).v6only as u32),
             (l, SO_PASSCRED) if l == SOL_SOCKET as usize && e.domain as usize == AF_UNIX => Some(sock_opts(e.ofd).passcred as u32),
             (l, SO_KEEPALIVE) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).keepalive as u32),
             (l, SO_REUSEADDR) if l == SOL_SOCKET as usize => Some(e.reuseaddr as u32),

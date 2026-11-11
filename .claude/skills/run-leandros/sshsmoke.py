@@ -166,6 +166,11 @@ def quick(ssh, user, pw):
     step("stdin_eof", rc == 0 and out.strip() == "100000", f"rc={rc} out={out.strip()!r}")
     rc, out, err = ssh.run(user, "tty", password=pw, extra=("-tt",))
     step("exec_pty", rc == 0 and "/dev/pts/" in out, f"rc={rc} out={out.strip()!r}")
+    # sshd listens on 0.0.0.0:22 and [::]:22 (V6ONLY): both loopback addresses
+    # answer with the SSH banner (lane ip6dual).
+    for tag, dev in (("v4", "127.0.0.1"), ("v6", "::1")):
+        rc, out, err = ssh.run(user, f"/bin/ip6test banner {dev} 22", password=pw)
+        step(f"loopback_banner_{tag}", rc == 0 and out.startswith("SSH-"), f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
     rc, out, err = ssh.run(user, "cat /proc/self/cgroup", password=pw)
     step("session_cgroup", rc == 0 and "/user.slice/user-" in out and "/session-" in out,
          f"rc={rc} out={out.strip()!r}")

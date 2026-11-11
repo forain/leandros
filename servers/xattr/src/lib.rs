@@ -100,6 +100,8 @@ pub const CAP_DAC_OVERRIDE: u32 = 1;
 pub const CAP_DAC_READ_SEARCH: u32 = 2;
 pub const CAP_FOWNER: u32 = 3;
 pub const CAP_FSETID: u32 = 4;
+pub const CAP_SYS_ADMIN: u32 = 21;
+const HOST_ROOT_CAPS: u64 = 1 << CAP_CHOWN | 1 << CAP_DAC_OVERRIDE | 1 << CAP_DAC_READ_SEARCH | 1 << CAP_FOWNER | 1 << CAP_FSETID | 1 << CAP_SYS_ADMIN;
 
 /// Extents per id map (must equal `sched::ns::MAP_EXT`; `vfs::cred_of`
 /// copies the arrays, so a mismatch is a compile error there).
@@ -154,11 +156,15 @@ pub struct Cred {
     pub egid: u32,
     pub ngroups: u8,
     pub groups: [u32; NGROUPS_MAX],
-    /// fsuid == 0 in the initial user namespace: exactly the old `euid == 0`.
-    /// The ONLY thing the host-only gates (trusted.*, security.*, mount roots,
-    /// devices) accept.
+    /// Fast-path flag: fsuid == 0 in the initial user namespace AND every
+    /// capability the VFS consults over inodes (CHOWN, DAC_OVERRIDE,
+    /// DAC_READ_SEARCH, FOWNER, FSETID, SYS_ADMIN) is held. Only a shortcut
+    /// for "every inode check passes"; a root that dropped one of them goes
+    /// through the per-capability evaluation instead. Mount roots stay gated
+    /// on it (stricter than before, never looser).
     pub host_root: bool,
-    /// Effective capabilities; meaningful only when `view.ns != 0`.
+    /// Effective capabilities of the caller (every namespace). `Cred::new`
+    /// gives a fsuid-0 kernel-private caller all of them.
     pub caps: u64,
     /// The caller's user-namespace id maps (kuid <-> ns id).
     pub view: IdView,
@@ -175,13 +181,13 @@ pub fn chmod_filter_mode_c(cred: &Cred, meta: &FileMeta, mode: u32) -> u32 {
 impl Cred {
     pub const fn new(euid: u32, egid: u32) -> Self {
         Cred { euid, egid, ngroups: 0, groups: [0; NGROUPS_MAX],
-               host_root: euid == 0, caps: 0, view: IdView::HOST }
+               host_root: euid == 0, caps: if euid == 0 { u64::MAX } else { 0 }, view: IdView::HOST }
     }
     pub const ROOT: Cred = Cred::new(0, 0);
     /// Attach the caller's namespace view and effective caps. A fsuid-0 task
     /// outside the initial user namespace is NOT host root.
     pub fn with_ns(mut self, view: IdView, caps: u64) -> Self {
-        self.host_root = self.euid == 0 && view.ns == 0;
+        self.host_root = self.euid == 0 && view.ns == 0 && caps & HOST_ROOT_CAPS == HOST_ROOT_CAPS;
         self.caps = caps;
         self.view = view;
         self
@@ -191,9 +197,14 @@ impl Cred {
     /// (identical to the old `euid == 0`). Never "euid 0 in any namespace".
     #[inline]
     pub fn cap_inode(&self, cap: u32, uid: u32, gid: u32) -> bool {
-        self.host_root
-            || (self.view.ns != 0 && cap < 64 && self.caps >> cap & 1 != 0
-                && self.view.maps_k(0, uid) && self.view.maps_k(1, gid))
+        cap < 64 && self.caps >> cap & 1 != 0
+            && self.view.maps_k(0, uid) && self.view.maps_k(1, gid)
+    }
+    /// `capable(CAP_SYS_ADMIN)` in the initial user namespace (trusted.*,
+    /// security.*, ls of trusted.*).
+    #[inline]
+    pub fn host_sysadmin(&self) -> bool {
+        self.view.ns == 0 && self.caps >> CAP_SYS_ADMIN & 1 != 0
     }
     /// Linux `fsuidgid_has_mapping`: false when the caller's fsuid or fsgid
     /// is unmapped in its own namespace (creating a file would be EOVERFLOW).
@@ -433,7 +444,7 @@ pub fn may_read_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>)
         IDX_ACL_ACCESS | IDX_ACL_DEFAULT => Ok(()),
         IDX_SECURITY => Ok(()), // readable by all, on any inode type
         IDX_TRUSTED => {
-            if cred.host_root { // Linux: CAP_SYS_ADMIN in the init ns
+            if cred.host_sysadmin() { // Linux: CAP_SYS_ADMIN in the init ns
                 Ok(())
             } else {
                 Err(ENODATA)
@@ -450,7 +461,7 @@ pub fn may_write_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>
         // allowed on every inode type (labels on symlinks are legal).
         // host only: security.capability needs SETFCAP over the inode, which
         // is EPERM outside the initial namespace (design idmap 2.8).
-        return if cred.host_root { Ok(()) } else { Err(EPERM) };
+        return if cred.host_sysadmin() { Ok(()) } else { Err(EPERM) };
     }
     if is_lnk(meta.mode) {
         return Err(EPERM); // no user.* and no ACLs on symlinks
@@ -479,7 +490,7 @@ pub fn may_write_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>
             Ok(())
         }
         IDX_TRUSTED => {
-            if cred.host_root {
+            if cred.host_sysadmin() {
                 Ok(())
             } else {
                 Err(EPERM)
@@ -736,7 +747,7 @@ pub fn access_check(
         }
         return true;
     }
-    if cred.view.ns != 0 {
+    {
         // Linux generic_permission, capabilities taken in the caller's user
         // namespace over an inode whose uid AND gid are mapped there.
         let ovr = cred.cap_inode(CAP_DAC_OVERRIDE, meta.uid, meta.gid);

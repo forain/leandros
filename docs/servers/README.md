@@ -67,7 +67,7 @@ Servers sit *below* the device layer. The VFS must not depend on the `drivers` c
 
 ### Leaf locks, and nothing held across re-entry or user memory
 
-- Every server lock is either a **leaf** (nothing else is taken while it is held) or has a documented order (`SOCK_TABLES` → `UNIX_CONNS` → `BOUND_PATHS` in the net server; `FD_COPY_GATE` → one per-process fd table → the `FD_TABLES` map in the VFS, see [vfs.md](vfs.md#locking-the-fd-tables); fd tables / `SOCK_TABLES` → `vfs::ofd` leaf).
+- Every server lock is either a **leaf** (nothing else is taken while it is held) or has a documented order (`SOCK_TABLES` → `UNIX_CONNS` → `BOUND_PATHS` in the net server; one per-process fd table → the `FD_TABLES` map in the VFS, see [vfs.md](vfs.md#locking-the-fd-tables); fd tables / `SOCK_TABLES` → `vfs::ofd` leaf).
 - Nothing is held across a VFS re-entry (`call_port`) or a touch of user memory. User memory is copied through `AddressSpace::read_user_buf`/`write_user_buf`, never dereferenced, because a supervisor-mode fault on a not-yet-faulted copy-on-write page has no recovery path and a fault under the scheduler lock freezes every vCPU. See [../kernel/invariants.md](../kernel/invariants.md).
 - Hot paths that can run in IRQ context (`vt::console_out`, the UART drain) only `try_lock` and count a drop when they lose.
 

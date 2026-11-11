@@ -16,7 +16,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <time.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/mount.h>
+#include <netinet/in.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <sys/xattr.h>
 
 #define V3 0x20080522
 #define CAP_SETPCAP 8
@@ -139,6 +145,62 @@ static int t_sys_time_needs_cap(void)
     CHECK(settimeofday(&tv, NULL) == -1 && errno == EPERM);
     return 0;
 }
+
+/* Root with one inode capability dropped from the effective set, on file
+ * `path` owned by uid 1000 (made while still full-cap). */
+static int drop_eff(unsigned bit)
+{
+    struct dat all[2]; if (cget(all)) return -1;
+    struct dat d[2] = { { all[0].prm & ~(1u << bit), all[0].prm, 0 }, { all[1].eff, all[1].prm, 0 } };
+    return cset(d);
+}
+static int mkfile(const char *path)
+{
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600); if (fd < 0) return -1; close(fd);
+    return chown(path, 1000, 1000);
+}
+static int vfs_chown_needs_cap(const char *p)
+{
+    CHECK(mkfile(p) == 0);
+    CHECK(chown(p, 1001, 1001) == 0); /* full-cap root works */
+    CHECK(chown(p, 1000, 1000) == 0);
+    CHECK(drop_eff(0) == 0);          /* CAP_CHOWN */
+    CHECK(chown(p, 1001, 1001) == -1 && errno == EPERM);
+    unlink(p); return 0;
+}
+static int vfs_chmod_needs_cap(const char *p)
+{
+    CHECK(mkfile(p) == 0);
+    CHECK(chmod(p, 0644) == 0);
+    CHECK(drop_eff(3) == 0);          /* CAP_FOWNER */
+    CHECK(chmod(p, 0600) == -1 && errno == EPERM);
+    unlink(p); return 0;
+}
+static int vfs_dac_needs_cap(const char *p)
+{
+    CHECK(mkfile(p) == 0);
+    int fd = open(p, O_RDWR); CHECK(fd >= 0); close(fd);
+    CHECK(drop_eff(1) == 0);          /* CAP_DAC_OVERRIDE */
+    CHECK(open(p, O_RDWR) == -1 && errno == EACCES);
+    unlink(p); return 0;
+}
+static int vfs_trusted_needs_cap(const char *p)
+{
+    CHECK(mkfile(p) == 0);
+    CHECK(setxattr(p, "trusted.cap", "x", 1, 0) == 0);
+    CHECK(drop_eff(21) == 0);         /* CAP_SYS_ADMIN */
+    CHECK(setxattr(p, "trusted.cap", "y", 1, 0) == -1 && errno == EPERM);
+    CHECK(getxattr(p, "trusted.cap", NULL, 0) == -1);
+    unlink(p); return 0;
+}
+static int t_tmpfs_chown_needs_cap(void) { return vfs_chown_needs_cap("/tmp/captest-o"); }
+static int t_tmpfs_chmod_needs_cap(void) { return vfs_chmod_needs_cap("/tmp/captest-m"); }
+static int t_tmpfs_dac_needs_cap(void) { return vfs_dac_needs_cap("/tmp/captest-d"); }
+static int t_tmpfs_trusted_needs_cap(void) { return vfs_trusted_needs_cap("/tmp/captest-x"); }
+static int t_f2fs_chown_needs_cap(void) { return vfs_chown_needs_cap("/root/captest-o"); }
+static int t_f2fs_chmod_needs_cap(void) { return vfs_chmod_needs_cap("/root/captest-m"); }
+static int t_f2fs_dac_needs_cap(void) { return vfs_dac_needs_cap("/root/captest-d"); }
+static int t_f2fs_trusted_needs_cap(void) { return vfs_trusted_needs_cap("/root/captest-x"); }
 
 static int t_drop_effective_only(void)
 {
@@ -265,20 +327,27 @@ static int child_amb(void)
     return chroot("/") == 0 ? 0 : 5;
 }
 
+/* Linux: setresuid to an unrelated uid needs CAP_SETUID, so these keep it. */
+static int set_chroot_setuid(void)
+{
+    struct dat d[2] = { { CH | 1u << 7, CH | 1u << 7, CH | 1u << 7 }, { 0, 0, 0 } };
+    return cset(d);
+}
+
 static int t_ambient_exec_nonroot(void)
 {
-    CHECK(set_chroot_only() == 0);
+    CHECK(set_chroot_setuid() == 0);
     CHECK(prctl(PR_CAP_AMBIENT, AMB_RAISE, CAP_SYS_CHROOT, 0, 0) == 0);
     CHECK(prctl(PR_SET_KEEPCAPS, 1) == 0 && prctl(PR_GET_KEEPCAPS) == 1);
     CHECK(setresuid(1000, 1000, 1000) == 0);
-    struct dat d[2]; CHECK(cget(d) == 0 && d[0].eff == 0 && d[0].prm == CH); /* kept, effective cleared */
+    struct dat d[2]; CHECK(cget(d) == 0 && d[0].eff == 0 && d[0].prm == (CH | 1u << 7)); /* kept, effective cleared */
     execl("/bin/captest", "captest", "--child-amb", (char *)0);
     return 1;
 }
 
 static int t_ambient_cleared_without_keepcaps(void)
 {
-    CHECK(set_chroot_only() == 0);
+    CHECK(set_chroot_setuid() == 0);
     CHECK(prctl(PR_CAP_AMBIENT, AMB_RAISE, CAP_SYS_CHROOT, 0, 0) == 0);
     CHECK(setresuid(1000, 1000, 1000) == 0);
     CHECK(prctl(PR_CAP_AMBIENT, AMB_IS_SET, CAP_SYS_CHROOT, 0, 0) == 0);
@@ -451,6 +520,68 @@ static int t_oom_score_adj(void)
     return 0;
 }
 
+/* capaudit: drop `cap` from the effective set only (the permitted set keeps it). */
+static int drop_cap(int cap)
+{
+    struct dat all[2]; if (cget(all) != 0) return -1;
+    struct dat d[2] = { { all[0].eff & ~(cap < 32 ? 1u << cap : 0), all[0].prm, 0 },
+                        { all[1].eff & ~(cap >= 32 ? 1u << (cap - 32) : 0), all[1].prm, 0 } };
+    return cset(d);
+}
+
+/* Full-cap root: the call is not refused (ENOSYS is fine). Dropped: EPERM. */
+#define NEEDS_CAP(name, cap, expr)                                       \
+static int name(void)                                                    \
+{                                                                        \
+    errno = 0; long r = (expr);                                          \
+    CHECK(!(r == -1 && errno == EPERM));                                 \
+    CHECK(drop_cap(cap) == 0);                                           \
+    errno = 0; r = (expr);                                               \
+    CHECK(r == -1 && errno == EPERM);                                    \
+    return 0;                                                            \
+}
+NEEDS_CAP(t_acct_needs_cap, 20, syscall(SYS_acct, NULL))
+NEEDS_CAP(t_vhangup_needs_cap, 26, syscall(SYS_vhangup))
+NEEDS_CAP(t_swapoff_needs_cap, 21, syscall(SYS_swapoff, "/nonexistent"))
+NEEDS_CAP(t_mount_needs_cap, 21, mount("none", "/tmp", "tmpfs", MS_REMOUNT | MS_BIND, ""))
+
+static int t_net_raw_needs_cap(void)
+{
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    CHECK(fd >= 0);
+    close(fd);
+    CHECK(drop_cap(13) == 0);
+    errno = 0; fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    CHECK(fd == -1 && errno == EPERM);
+    return 0;
+}
+
+/* A uid-1000 child: root needs CAP_KILL to signal it, CAP_SYS_PTRACE to read its /proc links. */
+static int with_victim(int cap, int proc_link)
+{
+    int p[2]; CHECK(pipe(p) == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        if (setresuid(1000, 1000, 1000) != 0) _exit(2);
+        char ok = 'x'; write(p[1], &ok, 1);
+        pause(); _exit(0);
+    }
+    char b; CHECK(read(p[0], &b, 1) == 1);
+    char path[64]; snprintf(path, sizeof path, "/proc/%d/exe", (int)c);
+    char tgt[128];
+    int full = proc_link ? (readlink(path, tgt, sizeof tgt) >= 0) : (kill(c, 0) == 0);
+    CHECK(full);
+    CHECK(drop_cap(cap) == 0);
+    errno = 0;
+    int r = proc_link ? (int)readlink(path, tgt, sizeof tgt) : kill(c, 0);
+    int e = errno;
+    kill(c, SIGKILL); /* may fail while the cap is dropped; the parent reaps via exit of this test */
+    CHECK(r == -1 && (proc_link ? (e == EACCES || e == EPERM) : e == EPERM));
+    return 0;
+}
+static int t_kill_needs_cap(void) { return with_victim(5, 0); }
+static int t_ptrace_link_needs_cap(void) { return with_victim(19, 1); }
+
 struct tc { const char *n; int (*f)(void); };
 int main(int argc, char **argv)
 {
@@ -475,6 +606,14 @@ int main(int argc, char **argv)
         { "subreaper_flag", t_subreaper_flag }, { "orphan_to_init", t_orphan_to_init },
         { "orphan_to_subreaper", t_orphan_to_subreaper }, { "keyctl_enosys", t_keyctl_enosys },
         { "personality", t_personality }, { "rlimits", t_rlimits }, { "oom_score_adj", t_oom_score_adj },
+        { "acct_needs_cap", t_acct_needs_cap }, { "vhangup_needs_cap", t_vhangup_needs_cap },
+        { "swapoff_needs_cap", t_swapoff_needs_cap }, { "mount_needs_cap", t_mount_needs_cap },
+        { "net_raw_needs_cap", t_net_raw_needs_cap }, { "kill_needs_cap", t_kill_needs_cap },
+        { "ptrace_link_needs_cap", t_ptrace_link_needs_cap },
+        { "tmpfs_chown_needs_cap", t_tmpfs_chown_needs_cap }, { "tmpfs_chmod_needs_cap", t_tmpfs_chmod_needs_cap },
+        { "tmpfs_dac_needs_cap", t_tmpfs_dac_needs_cap }, { "tmpfs_trusted_needs_cap", t_tmpfs_trusted_needs_cap },
+        { "f2fs_chown_needs_cap", t_f2fs_chown_needs_cap }, { "f2fs_chmod_needs_cap", t_f2fs_chmod_needs_cap },
+        { "f2fs_dac_needs_cap", t_f2fs_dac_needs_cap }, { "f2fs_trusted_needs_cap", t_f2fs_trusted_needs_cap },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();

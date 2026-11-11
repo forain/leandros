@@ -218,6 +218,24 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
+/// Listen on `sa`. An IPv6 listener is V6ONLY, so `::` and `0.0.0.0` are two
+/// separate listeners (as OpenSSH does) and neither collides with the other.
+fn bind_listener(sa: SocketAddr) -> std::io::Result<TcpListener> {
+    use std::os::fd::AsRawFd;
+    let sock = if sa.is_ipv6() { tokio::net::TcpSocket::new_v6()? } else { tokio::net::TcpSocket::new_v4()? };
+    if sa.is_ipv6() {
+        let one: libc::c_int = 1;
+        let r = unsafe {
+            libc::setsockopt(sock.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY,
+                &one as *const _ as *const libc::c_void, core::mem::size_of::<libc::c_int>() as libc::socklen_t)
+        };
+        if r != 0 { return Err(std::io::Error::last_os_error()); }
+    }
+    sock.set_reuseaddr(true)?;
+    sock.bind(sa)?;
+    sock.listen(1024)
+}
+
 fn main() {
     let mut config_path = "/etc/ssh/sshd_config".to_string();
     let mut to_stderr = false;
@@ -337,7 +355,7 @@ async fn serve(cfg: Config, host_key: PrivateKey, fp: String) {
                 }
             }
         };
-        match TcpListener::bind(sa).await {
+        match bind_listener(sa) {
             Ok(l) => {
                 log(&format!("listening on {sa}"));
                 listeners.push(l);

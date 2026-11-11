@@ -3285,7 +3285,7 @@ pub fn set_dumpable(v: bool) {
 /// capability held there decides; targets are limited to mapped ids by the
 /// syscall layer (`ns::arg_id`, which translates to kernel ids), so privilege never reaches unmapped ids.
 pub(crate) fn setid_priv(t: &task::Task, gid: bool) -> bool {
-    if t.userns.id() == 0 { t.euid == 0 } else { t.caps[0] >> (if gid { 6 } else { 7 }) & 1 != 0 }
+    t.caps[0] >> (if gid { 6 } else { 7 }) & 1 != 0
 }
 
 /// setresuid(2) semantics. Each argument u32::MAX (-1) means "leave unchanged".
@@ -5257,7 +5257,7 @@ pub enum MmArgField { ArgStart, ArgEnd, EnvStart, EnvEnd }
 pub fn set_mm_arg_field(field: MmArgField, addr: usize) -> isize {
     const MMAP_MIN_ADDR: usize = 4096;
     const TASK_SIZE: usize = 0x0000_8000_0000_0000;
-    if !host_root() { return -1; } // EPERM
+    if !caps::host_capable(caps::CAP_SYS_RESOURCE) { return -1; } // EPERM
     if addr >= TASK_SIZE || addr < MMAP_MIN_ADDR { return -22; }
     let tgid = current_tgid();
     let mut a = ARG_AREAS.lock().get(&tgid).copied()
@@ -7452,7 +7452,7 @@ pub fn fork_admission(new_process: bool) -> isize {
     if admit_locked(&rq, new_process) != 0 { return -11; }
     let Some(me) = rq.find_pid(pid) else { return 0 };
     if cgroup::fork_check(me.cgroup) != 0 { return -11; }
-    if me.uid == 0 || me.euid == 0 { if me.userns.id() == 0 { return 0; } }
+    if me.userns.id() == 0 && (me.caps[0] >> 21 & 1 != 0 || me.caps[0] >> 24 & 1 != 0) { return 0; }
     let uid = me.uid;
     let limit = rq.find_pid(me.tgid).map_or(task::RLIM_INFINITY, |l| l.rlimits[task::RLIMIT_NPROC][0]);
     if limit == task::RLIM_INFINITY { return 0; }

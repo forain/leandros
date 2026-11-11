@@ -144,7 +144,130 @@ static void test_bad_len6(void) {
     close(s);
 }
 
-int main(void) {
+// ---- L2 ip6dual: dual-stack, V6ONLY, v4-mapped (design-ipv6 L2) ----
+static int sock6(int type) { int s = socket(AF_INET6, type, 0); if (s >= 0) tmo(s, 3); return s; }
+static struct sockaddr_in any6(int port) {
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = htonl(INADDR_ANY);
+    return a;
+}
+static int bind_any6(int s, int port) {
+    struct sockaddr_in6 a; memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6; a.sin6_port = htons(port); a.sin6_addr = in6addr_any;
+    return bind(s, (struct sockaddr *)&a, sizeof a);
+}
+static int bind_any4(int s, int port) {
+    struct sockaddr_in a = any6(port);
+    return bind(s, (struct sockaddr *)&a, sizeof a);
+}
+static int v6only_of(int s) { int v = -1; socklen_t l = sizeof v; if (getsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &v, &l)) return -1; return v; }
+
+static void test_v6only_default(void) {
+    int s = sock6(SOCK_STREAM);
+    CHECK("v6only_default", s >= 0 && v6only_of(s) == 0);
+    int one = 1;
+    CHECK("v6only_set_get", setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) == 0 && v6only_of(s) == 1);
+    close(s);
+}
+
+static void test_dual_accept_v4(void) {
+    int l = sock6(SOCK_STREAM), ok = 0;
+    int one = 1; setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (l >= 0 && bind_any6(l, 47301) == 0 && listen(l, 4) == 0) {
+        int c = socket(AF_INET, SOCK_STREAM, 0); tmo(c, 3);
+        struct sockaddr_in d; memset(&d, 0, sizeof d);
+        d.sin_family = AF_INET; d.sin_port = htons(47301); d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (connect(c, (struct sockaddr *)&d, sizeof d) == 0) {
+            struct sockaddr_in6 p; socklen_t pl = sizeof p; memset(&p, 0, sizeof p);
+            int a = accept(l, (struct sockaddr *)&p, &pl);
+            struct in6_addr want; inet_pton(AF_INET6, "::ffff:127.0.0.1", &want);
+            ok = a >= 0 && p.sin6_family == AF_INET6 && memcmp(&p.sin6_addr, &want, 16) == 0;
+            if (a >= 0) close(a);
+        }
+        close(c);
+    }
+    CHECK("dual_accept_v4", ok);
+    if (l >= 0) close(l);
+}
+
+static void test_v6only_coexist(void) {
+    int a = sock6(SOCK_STREAM), b = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(a, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
+    int r1 = bind_any6(a, 47302), r2 = bind_any4(b, 47302);
+    CHECK("v6only_coexist", r1 == 0 && r2 == 0);
+    close(a); close(b);
+}
+
+static void test_dual_conflict(void) {
+    int a = sock6(SOCK_STREAM), b = socket(AF_INET, SOCK_STREAM, 0);
+    int r1 = bind_any6(a, 47303), r2 = bind_any4(b, 47303), e2 = errno;
+    CHECK("dual_conflict_v4_second", r1 == 0 && r2 < 0 && e2 == EADDRINUSE);
+    close(a); close(b);
+    a = socket(AF_INET, SOCK_STREAM, 0); b = sock6(SOCK_STREAM);
+    r1 = bind_any4(a, 47304); r2 = bind_any6(b, 47304); e2 = errno;
+    CHECK("dual_conflict_v6_second", r1 == 0 && r2 < 0 && e2 == EADDRINUSE);
+    close(a); close(b);
+}
+
+static void test_v6only_after_bind(void) {
+    int s = sock6(SOCK_STREAM), one = 1;
+    int r = bind_any6(s, 47305);
+    int r2 = setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
+    CHECK("v6only_after_bind", r == 0 && r2 < 0 && errno == EINVAL);
+    close(s);
+}
+
+static void test_mapped_connect_v6only(void) {
+    int s = sock6(SOCK_STREAM), one = 1;
+    setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
+    struct sockaddr_in6 d; memset(&d, 0, sizeof d);
+    d.sin6_family = AF_INET6; d.sin6_port = htons(47306);
+    inet_pton(AF_INET6, "::ffff:127.0.0.1", &d.sin6_addr);
+    int r = connect(s, (struct sockaddr *)&d, sizeof d);
+    CHECK("mapped_connect_v6only", r < 0 && errno == ENETUNREACH);
+    close(s);
+}
+
+static void test_udp_dual(void) {
+    int r = sock6(SOCK_DGRAM), ok = 0;
+    if (r >= 0 && bind_any6(r, 47307) == 0) {
+        int c = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in d; memset(&d, 0, sizeof d);
+        d.sin_family = AF_INET; d.sin_port = htons(47307); d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sendto(c, "hi", 2, 0, (struct sockaddr *)&d, sizeof d);
+        char buf[8]; struct sockaddr_in6 p; socklen_t pl = sizeof p; memset(&p, 0, sizeof p);
+        ssize_t n = recvfrom(r, buf, sizeof buf, 0, (struct sockaddr *)&p, &pl);
+        struct in6_addr want; inet_pton(AF_INET6, "::ffff:127.0.0.1", &want);
+        ok = n == 2 && p.sin6_family == AF_INET6 && memcmp(&p.sin6_addr, &want, 16) == 0;
+        close(c);
+    }
+    CHECK("udp_dual", ok);
+    if (r >= 0) close(r);
+}
+
+// `ip6test banner ADDR PORT`: connect (v4 or v6 literal), print the first bytes the server sends.
+static int banner(const char *addr, int port) {
+    struct sockaddr_in6 a6; struct sockaddr_in a4; int s, r;
+    memset(&a6, 0, sizeof a6); memset(&a4, 0, sizeof a4);
+    if (inet_pton(AF_INET6, addr, &a6.sin6_addr) == 1) {
+        a6.sin6_family = AF_INET6; a6.sin6_port = htons(port);
+        s = socket(AF_INET6, SOCK_STREAM, 0); tmo(s, 5);
+        r = connect(s, (struct sockaddr *)&a6, sizeof a6);
+    } else if (inet_pton(AF_INET, addr, &a4.sin_addr) == 1) {
+        a4.sin_family = AF_INET; a4.sin_port = htons(port);
+        s = socket(AF_INET, SOCK_STREAM, 0); tmo(s, 5);
+        r = connect(s, (struct sockaddr *)&a4, sizeof a4);
+    } else return 2;
+    if (r) { printf("connect failed: %d\n", errno); return 1; }
+    char b[16]; ssize_t n = read(s, b, 4);
+    if (n < 4) { printf("read failed: %zd\n", n); return 1; }
+    b[4] = 0; printf("%s\n", b);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc >= 4 && !strcmp(argv[1], "banner")) return banner(argv[2], atoi(argv[3]));
     test_socket6();
     test_bad_len6();
     test_unreach6();
@@ -152,6 +275,13 @@ int main(void) {
     test_udp6_lo();
     test_v4_listener_no_v6();
     test_bind_family_aware();
+    test_v6only_default();
+    test_dual_accept_v4();
+    test_v6only_coexist();
+    test_dual_conflict();
+    test_v6only_after_bind();
+    test_mapped_connect_v6only();
+    test_udp_dual();
     printf("ip6test: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
