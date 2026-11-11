@@ -53,6 +53,7 @@
  *   udp_burst           3000 nonblocking 1200-byte sends to an unread socket
  *                       answer the length or EAGAIN, nothing else; 500
  *                       blocking sends all succeed
+ *   udp_huge            4000-, 60000- and 65507-byte datagrams round-trip over loopback; 65508 is EMSGSIZE
  *   udp_large           an 8000-byte datagram over loopback arrives whole
  *   udp_gso             UDP_SEGMENT (cmsg and socket option) splits one send
  *                       into datagrams of the segment size
@@ -794,6 +795,31 @@ static void udp_large(void) {
     else pass(N);
 }
 
+static void udp_huge(void) {
+    const char *N = "udp_huge";
+    if (skipped(N)) return;
+    static const size_t sizes[3] = { 4000, 60000, 65507 };
+    static char d[65508], g[70000];
+    for (size_t i = 0; i < sizeof d; i++) d[i] = (char)(i * 13 + (i >> 8));
+    char why[160] = "";
+    struct sockaddr_in ra;
+    int r = udp_bound("127.0.0.1", 0, &ra), s = udp_bound("127.0.0.1", 0, NULL);
+    int rcv = 1 << 20; setsockopt(r, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv);
+    for (int i = 0; i < 3 && !why[0]; i++) {
+        ssize_t n = send_to(s, d, sizes[i], &ra);
+        if (n != (ssize_t)sizes[i]) { snprintf(why, sizeof why, "send %zu: %zd %s", sizes[i], n, strerror(errno)); break; }
+        wait_ev(r, POLLIN, 2000);
+        ssize_t k = recv(r, g, sizeof g, MSG_DONTWAIT);
+        if (k != (ssize_t)sizes[i] || memcmp(d, g, sizes[i])) snprintf(why, sizeof why, "%zu bytes came back as %zd", sizes[i], k);
+    }
+    errno = 0;
+    ssize_t e = send_to(s, d, 65508, &ra); int ee = errno;
+    close(r); close(s);
+    if (why[0]) fail(N, "%s", why);
+    else if (e != -1 || ee != EMSGSIZE) fail(N, "65508-byte send: %zd %s, want EMSGSIZE", e, strerror(ee));
+    else pass(N);
+}
+
 static void udp_gso(void) {
     const char *N = "udp_gso";
     if (skipped(N)) return;
@@ -965,6 +991,7 @@ int main(int argc, char **argv) {
     udp_sockopts();
     udp_burst();
     udp_large();
+    udp_huge();
     udp_gso();
     udp_mmsg();
     udp_dup();
