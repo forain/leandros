@@ -20,6 +20,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Pty background-child SIGHUP on su session end** unverified against Linux (?).
 
 ### Podman / namespaces / cgroups
+- **Unconverted `host_root()` privilege checks** (SYS_TIME/SYS_BOOT/SYS_MODULE/RAWIO/WAKE_ALARM done in lane/capclock; rest still all-or-nothing): vt.rs (CAP_SYS_TTY_CONFIG), net raw sockets (CAP_NET_RAW), evdev (CAP_SYS_ADMIN, verify), block.rs (CAP_SYS_ADMIN/CAP_SYS_RAWIO), vfs tmpfs chown/chmod (CAP_CHOWN/CAP_FOWNER), ACCT/VHANGUP/SWAPON (CAP_SYS_PACCT/TTY_CONFIG/SYS_ADMIN), ptrace/kill-like (CAP_SYS_PTRACE/CAP_KILL), mount (CAP_SYS_ADMIN), xattr (CAP_SYS_ADMIN/FOWNER), f2fs (CAP_DAC_OVERRIDE); sys_secprobe/dbg_serial/spawn stay kernel-private.
 - **netns**: TCP over a tap in a netns (?).
 - **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
 - **mntunshare is not an isolation boundary for root-run workloads** (M6).
