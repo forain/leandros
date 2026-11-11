@@ -6533,7 +6533,9 @@ fn ns_follow_links(kp: KPath) -> Result<KPath, isize> {
     let mns = sched::current_mntns();
     if mns == 0 { return Ok(kp); }
     let nsb = match kp.ns.as_ref() { Some(n) => n.clone(), None => return Ok(kp) };
-    match vfs::ns_resolve_links(mns, &nsb, true) {
+    let jail = sched::current_root_arc();
+    let floor: &[u8] = jail.as_deref().unwrap_or(b"/");
+    match vfs::ns_resolve_links(mns, &nsb, true, floor) {
         Ok(Some((nsp, _, _))) if nsp != nsb => KPath::from_ns(nsp),
         Ok(_) => Ok(kp),
         Err(e) => Err(e as isize),
