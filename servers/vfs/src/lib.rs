@@ -4970,6 +4970,8 @@ pub fn ns_resolve_links(ns: sched::ns::NsId, ns_path: &[u8], follow: bool, floor
         cur.extend_from_slice(&c);
         if last && !follow { continue; }
         let x = match mnt::translate(ns, &cur) { Some(x) => x, None => return Ok(None) };
+        // A bind root swapped for a link must fail before that link is followed.
+        bindpin_verify(ns, x.mnt_id)?;
         if let Some(t) = backing_readlink(&x.backing) {
             hops += 1;
             if hops > SYMLINK_MAX_HOPS { return Err(-40); }
