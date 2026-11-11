@@ -21,6 +21,8 @@
 #include <sys/mount.h>
 #include <netinet/in.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <sys/xattr.h>
 
 #define V3 0x20080522
 #define CAP_SETPCAP 8
@@ -143,6 +145,62 @@ static int t_sys_time_needs_cap(void)
     CHECK(settimeofday(&tv, NULL) == -1 && errno == EPERM);
     return 0;
 }
+
+/* Root with one inode capability dropped from the effective set, on file
+ * `path` owned by uid 1000 (made while still full-cap). */
+static int drop_eff(unsigned bit)
+{
+    struct dat all[2]; if (cget(all)) return -1;
+    struct dat d[2] = { { all[0].prm & ~(1u << bit), all[0].prm, 0 }, { all[1].eff, all[1].prm, 0 } };
+    return cset(d);
+}
+static int mkfile(const char *path)
+{
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600); if (fd < 0) return -1; close(fd);
+    return chown(path, 1000, 1000);
+}
+static int vfs_chown_needs_cap(const char *p)
+{
+    CHECK(mkfile(p) == 0);
+    CHECK(chown(p, 1001, 1001) == 0); /* full-cap root works */
+    CHECK(chown(p, 1000, 1000) == 0);
+    CHECK(drop_eff(0) == 0);          /* CAP_CHOWN */
+    CHECK(chown(p, 1001, 1001) == -1 && errno == EPERM);
+    unlink(p); return 0;
+}
+static int vfs_chmod_needs_cap(const char *p)
+{
+    CHECK(mkfile(p) == 0);
+    CHECK(chmod(p, 0644) == 0);
+    CHECK(drop_eff(3) == 0);          /* CAP_FOWNER */
+    CHECK(chmod(p, 0600) == -1 && errno == EPERM);
+    unlink(p); return 0;
+}
+static int vfs_dac_needs_cap(const char *p)
+{
+    CHECK(mkfile(p) == 0);
+    int fd = open(p, O_RDWR); CHECK(fd >= 0); close(fd);
+    CHECK(drop_eff(1) == 0);          /* CAP_DAC_OVERRIDE */
+    CHECK(open(p, O_RDWR) == -1 && errno == EACCES);
+    unlink(p); return 0;
+}
+static int vfs_trusted_needs_cap(const char *p)
+{
+    CHECK(mkfile(p) == 0);
+    CHECK(setxattr(p, "trusted.cap", "x", 1, 0) == 0);
+    CHECK(drop_eff(21) == 0);         /* CAP_SYS_ADMIN */
+    CHECK(setxattr(p, "trusted.cap", "y", 1, 0) == -1 && errno == EPERM);
+    CHECK(getxattr(p, "trusted.cap", NULL, 0) == -1);
+    unlink(p); return 0;
+}
+static int t_tmpfs_chown_needs_cap(void) { return vfs_chown_needs_cap("/tmp/captest-o"); }
+static int t_tmpfs_chmod_needs_cap(void) { return vfs_chmod_needs_cap("/tmp/captest-m"); }
+static int t_tmpfs_dac_needs_cap(void) { return vfs_dac_needs_cap("/tmp/captest-d"); }
+static int t_tmpfs_trusted_needs_cap(void) { return vfs_trusted_needs_cap("/tmp/captest-x"); }
+static int t_f2fs_chown_needs_cap(void) { return vfs_chown_needs_cap("/root/captest-o"); }
+static int t_f2fs_chmod_needs_cap(void) { return vfs_chmod_needs_cap("/root/captest-m"); }
+static int t_f2fs_dac_needs_cap(void) { return vfs_dac_needs_cap("/root/captest-d"); }
+static int t_f2fs_trusted_needs_cap(void) { return vfs_trusted_needs_cap("/root/captest-x"); }
 
 static int t_drop_effective_only(void)
 {
@@ -552,6 +610,10 @@ int main(int argc, char **argv)
         { "swapoff_needs_cap", t_swapoff_needs_cap }, { "mount_needs_cap", t_mount_needs_cap },
         { "net_raw_needs_cap", t_net_raw_needs_cap }, { "kill_needs_cap", t_kill_needs_cap },
         { "ptrace_link_needs_cap", t_ptrace_link_needs_cap },
+        { "tmpfs_chown_needs_cap", t_tmpfs_chown_needs_cap }, { "tmpfs_chmod_needs_cap", t_tmpfs_chmod_needs_cap },
+        { "tmpfs_dac_needs_cap", t_tmpfs_dac_needs_cap }, { "tmpfs_trusted_needs_cap", t_tmpfs_trusted_needs_cap },
+        { "f2fs_chown_needs_cap", t_f2fs_chown_needs_cap }, { "f2fs_chmod_needs_cap", t_f2fs_chmod_needs_cap },
+        { "f2fs_dac_needs_cap", t_f2fs_dac_needs_cap }, { "f2fs_trusted_needs_cap", t_f2fs_trusted_needs_cap },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();

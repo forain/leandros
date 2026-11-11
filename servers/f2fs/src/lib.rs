@@ -6909,6 +6909,7 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
     let mut hops = 0u32;
 
     ms.walk_err = 0;
+    let strict = sched::strict_links();
     'restart: loop {
         if len <= 1 { return ms.sb.root_ino; }
         let mut ino = ms.sb.root_ino;
@@ -6948,6 +6949,8 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
 
             let is_last = comp_end == len;
             if ftype == DT_LNK && !(is_last && !follow_final) {
+                // mntiso-strict: only ns_resolve_links follows in a mount namespace.
+                if strict { ms.walk_err = -4100; return 0; } // VFS_ELINKRACE
                 hops += 1;
                 if hops > SYMLINK_MAX_HOPS { ms.walk_err = -40; return 0; } // ELOOP
 
@@ -9142,12 +9145,12 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
             },
         VFS_LISTXATTR | VFS_LLISTXATTR =>
             match xattr_path_ino(ms, arg(msg,0), msg.tag == VFS_LISTXATTR) {
-                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.host_root),
+                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.host_sysadmin()),
                 Err(m) => m,
             },
         VFS_FLISTXATTR =>
             match xattr_fd_ino(ms, arg(msg,0)) {
-                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.host_root),
+                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.host_sysadmin()),
                 Err(m) => m,
             },
         VFS_REMOVEXATTR | VFS_LREMOVEXATTR =>

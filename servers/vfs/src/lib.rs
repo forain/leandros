@@ -2692,6 +2692,11 @@ impl MountEntry {
 /// (initrd, ramfs pseudo-directories, /proc, /dev nodes): anonymous 0:1.
 pub const VFS_ANON_DEV: u64 = 1;
 
+/// VFS-private: a filesystem met a symlink while the call was marked strict (mount
+/// namespace task, paths already resolved in ns space). `handle_as` retries the
+/// whole resolution at most twice, then answers ELOOP. Never reaches userspace.
+pub const VFS_ELINKRACE: i32 = -4100;
+
 /// Anonymous `st_dev` of the `i`-th built-in tmpfs root (TMPFS_ROOTS order),
 /// matching the minor /proc/self/mountinfo prints for it.
 fn tmpfs_root_dev(i: usize) -> u64 { makedev(0, 10 + i as u32) }
@@ -5040,6 +5045,7 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
     let pid = sched::current_pid();
     if let Some(cx) = mnt::callctx_get(pid, ptr) {
         let ns = sched::current_mntns();
+        if ns != 0 { sched::set_strict_links(true); }
         let jail = sched::current_root_arc();
         let floor: &[u8] = jail.as_deref().unwrap_or(b"/");
         let rr = ns_resolve_links(ns, &cx.ns_path, follow, floor);
@@ -5099,23 +5105,40 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
     // argument `KPath` makes on the kernel side).
     let (p0, p1) = path_args(&msg);
     if p0.is_some() || p1.is_some() {
-        let mut b0: Vec<u8> = Vec::new();
-        let mut b1: Vec<u8> = Vec::new();
-        let mut m = *msg;
-        let (mut i0, mut i1): (Option<u32>, Option<u32>) = (None, None);
-        if let Err(e) = rewrite_one(&mut m, p0, &mut b0, &mut i0) { return err_reply(e); }
-        if let Err(e) = rewrite_one(&mut m, p1, &mut b1, &mut i1) { return err_reply(e); }
-        // rename/link across mounts is EXDEV even when both sit on one volume.
-        if matches!(m.tag, VFS_RENAME | VFS_LINK) {
-            if let (Some(a), Some(b)) = (i0, i1) { if a != b { return err_reply(-18); } }
-        }
-        let r = dispatch(&m, caller_pid);
-        // Contexts registered for the rewritten buffers die with them (a stale
-        // entry would be found again when the allocator reuses the address).
-        let me = sched::current_pid();
-        if !b0.is_empty() { mnt::callctx_clear(me, b0.as_ptr() as usize); }
-        if !b1.is_empty() { mnt::callctx_clear(me, b1.as_ptr() as usize); }
-        return r;
+        // mntiso-strict: a filesystem that meets a link in a ns-resolved call
+        // answers VFS_ELINKRACE; redo the resolution at most twice, then ELOOP.
+        let was_strict = sched::strict_links();
+        let mut attempt = 0;
+        let out = loop {
+            let mut b0: Vec<u8> = Vec::new();
+            let mut b1: Vec<u8> = Vec::new();
+            let mut m = *msg;
+            let (mut i0, mut i1): (Option<u32>, Option<u32>) = (None, None);
+            let mut r = match rewrite_one(&mut m, p0, &mut b0, &mut i0) {
+                Err(e) => err_reply(e),
+                Ok(()) => match rewrite_one(&mut m, p1, &mut b1, &mut i1) {
+                    Err(e) => err_reply(e),
+                    Ok(()) => {
+                        // rename/link across mounts is EXDEV even when both sit on one volume.
+                        let xdev = matches!(m.tag, VFS_RENAME | VFS_LINK)
+                            && matches!((i0, i1), (Some(a), Some(b)) if a != b);
+                        if xdev { err_reply(-18) } else { dispatch(&m, caller_pid) }
+                    }
+                },
+            };
+            // Contexts registered for the rewritten buffers die with them (a stale
+            // entry would be found again when the allocator reuses the address).
+            let me = sched::current_pid();
+            if !b0.is_empty() { mnt::callctx_clear(me, b0.as_ptr() as usize); }
+            if !b1.is_empty() { mnt::callctx_clear(me, b1.as_ptr() as usize); }
+            if reply_val(&r) == VFS_ELINKRACE as i64 {
+                attempt += 1;
+                if attempt > 2 { r = err_reply(-40); } else { continue; }
+            }
+            break r;
+        };
+        sched::set_strict_links(was_strict);
+        return out;
     }
     dispatch(msg, caller_pid)
 }
@@ -6193,6 +6216,7 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
     // walk passes through. Taken before TMP_FILES (RUN_QUEUE is never taken
     // under it here).
     let cred = cred_of(sched::current_pid());
+    let strict = sched::strict_links();
 
     loop {
         let path = &cur[..];
@@ -6241,6 +6265,10 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
             Some(h) => h,
             None    => break, // fully resolved
         };
+
+        // Mount-namespace task whose path was already resolved in ns space: a
+        // link met here appeared after that scan (a race) — never follow it.
+        if strict { return Err(VFS_ELINKRACE); }
 
         hops += 1;
         if hops > SYMLINK_MAX_HOPS { return Err(-40); } // ELOOP
@@ -6877,6 +6905,20 @@ fn gen_mntselftest() -> Option<VnodeKind> {
     use core::fmt::Write;
     let mut s = alloc::string::String::new();
     for (name, ok) in mnt::selftest() { let _ = writeln!(s, "{}: {}", name, if ok { "PASS" } else { "FAIL" }); }
+    // mntiso-strict (D1): inside a mount namespace a tmpfs walk that meets a link in
+    // a ns-resolved call must fail closed. The fixture link `/tmp/mntiso-strict-l`
+    // (-> /tmp) is created by mnttest; absent fixture or ns 0 = no row.
+    if sched::current_mntns() != 0 {
+        let fixture = { let t = TMP_FILES.lock(); tmp_find(&t, b"/tmp/mntiso-strict-l").map_or(false, |i| t[i].is_link) };
+        if fixture {
+            let was = sched::set_strict_links(true);
+            let r = tmp_resolve_links(b"/tmp/mntiso-strict-l/x", true);
+            let rn = tmp_resolve_links(b"/tmp/mntiso-strict-l", false);
+            sched::set_strict_links(was);
+            let ok = matches!(r, Err(e) if e == VFS_ELINKRACE) && rn.is_ok();
+            let _ = writeln!(s, "strict_tmp_link_refused: {}", if ok { "PASS" } else { "FAIL" });
+        }
+    }
     let _ = writeln!(s, "ns_live={} ns_dying={} sb_count={}", sched::ns::live_count(), sched::ns::dying_count(), mnt::sb_count());
     let _ = write!(s, "sb_devs=");
     for d in mnt::sb_devs() { let _ = write!(s, "{},", d); }
@@ -15046,9 +15088,12 @@ fn host_root_of(pid: u32) -> bool {
 /// permitted set when the real uid is the namespace root, else none.
 fn cred_with_ns(c: xattr::Cred, pid: u32, real: bool) -> xattr::Cred {
     let ns = sched::ns::userns_of(pid);
-    if ns == 0 { return c; }
-    let sv = sched::ns::view_of_ns(ns);
-    let v = xattr::IdView { ns: sv.ns, n: sv.n, ext: sv.ext };
+    // Unknown pid (boot-time mount path): keep the kernel-private `Cred::new`.
+    if ns == 0 && sched::caps::caps_of(pid).is_none() { return c; }
+    let v = if ns == 0 { xattr::IdView::HOST } else {
+        let sv = sched::ns::view_of_ns(ns);
+        xattr::IdView { ns: sv.ns, n: sv.n, ext: sv.ext }
+    };
     let caps = match sched::caps::caps_of(pid) {
         Some(cs) if !real || sched::euid_of(pid) == c.euid => cs[0],
         Some(cs) if sched::ns::root_k(ns) == Some(c.euid) => cs[1],
