@@ -25,7 +25,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Pty background-child SIGHUP on su session end** unverified against Linux (?).
 
 ### Podman / namespaces / cgroups
-- **`cgroup.freeze` is delegated but still a stub** (events say frozen, tasks keep running): `podman pause` is not real.
 - **`memfd` exe pin not inherited by fork** (?).
 - **nsfs bind inside a non-init mntns; self-binds not copied into a new mntns.**
 - **netns**: SETLINK move of an existing link; TCP over a tap in a netns (?).
@@ -75,7 +74,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ## Missing features
 
 ### Kernel
-- **Real cgroup freezer**; inotify L2/L3 (beyond the default-on L1).
+- inotify L2/L3 (beyond the default-on L1).
 - **Interrupt paths**: virtio keyboard/blk/net/snd and the aarch64 GPU control queue are still polled (INTx via GIC SPI is the aarch64 step).
 - **Synthetic sysfs**: only `/sys/class/block` (+ cgroup/kernel paths); `/sys/dev/char`, `/sys/class/drm`, `/sys/class/input` per `docs/design/k4-drm-design.md` deferred.
 - **utmpx/wtmp/lastlog**: unimplemented; establish a consumer (`who`, `w`, `last`) first.
