@@ -38,7 +38,8 @@ static MIRRORS: Mutex<alloc::collections::BTreeMap<u32, [Option<SocketHandle>; M
 
 /// Port of each wildcard server in MIRRORS, for a stack built after it
 /// (`adopt`). Leaf lock, taken after MIRRORS when both are needed.
-static PORTS: Mutex<crate::latestack::Registry<u16>> = Mutex::new(crate::latestack::Registry::new());
+/// (port, v4only): an AF_INET server's mirrors never hear v6 datagrams.
+static PORTS: Mutex<crate::latestack::Registry<(u16, bool)>> = Mutex::new(crate::latestack::Registry::new());
 
 /// Stack `sid` was just built (wifi0, once its MAC is known): give every
 /// wildcard server a mirror there. Returns how many it carries. Caller
@@ -48,12 +49,14 @@ pub(crate) fn adopt(sid: Sid) -> usize {
     // The commit below checks, under MIRRORS, that the server still is one;
     // from then on `release`/`collapse` own the mirror like any other.
     crate::latestack::adopt(&snap, |_| true,
-        |ofd, port| {
+        |ofd, pf| {
+            let (port, v4only) = *pf;
             let h = {
                 let mut stack = stack_for(sid);
                 let Some(s) = stack.as_mut() else { return false };
                 let mut socket = new_mirror_socket();
-                if socket.bind(*port).is_err() { return false; }
+                if socket.bind(port).is_err() { return false; }
+                if v4only { socket.set_family(Some(smoltcp::wire::IpVersion::Ipv4)); }
                 socket.set_reuseport(sock_opts(ofd).reuseport);
                 s.socket_set.add(socket)
             };
@@ -90,7 +93,7 @@ pub(crate) fn of(ofd: u32) -> Option<[Option<SocketHandle>; MAX_STACKS]> {
 
 /// Give a just-materialized wildcard server socket (`primary` on `psid`,
 /// port `port`) a socket on every other stack. Caller holds SOCK_TABLES.
-pub(crate) fn create(ns: u16, ofd: u32, psid: Sid, primary: SocketHandle, port: u16) {
+pub(crate) fn create(ns: u16, ofd: u32, psid: Sid, primary: SocketHandle, port: u16, v4only: bool) {
     if ofd == 0 { return; }
     let mut hs = [None; MAX_STACKS];
     hs[psid as usize] = Some(primary);
@@ -100,13 +103,14 @@ pub(crate) fn create(ns: u16, ofd: u32, psid: Sid, primary: SocketHandle, port: 
         let Some(s) = stack.as_mut() else { continue };
         let mut socket = new_mirror_socket();
         if socket.bind(port).is_err() { continue; }
+        if v4only { socket.set_family(Some(smoltcp::wire::IpVersion::Ipv4)); }
         // SO_REUSEPORT: the group's unicast spreading (smoltcp's demux).
         socket.set_reuseport(sock_opts(ofd).reuseport);
         hs[sid as usize] = Some(s.socket_set.add(socket));
     }
     MIRRORS.lock().insert(ofd, hs);
     // Only netns 0's servers follow a late NIC stack (`adopt`).
-    if ns == 0 { PORTS.lock().register(ofd, port); }
+    if ns == 0 { PORTS.lock().register(ofd, (port, v4only)); }
 }
 
 /// The socket is gone (its last holder let go): remove the mirrors (the

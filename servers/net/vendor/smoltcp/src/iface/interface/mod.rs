@@ -963,7 +963,16 @@ impl InterfaceInner {
             bits as usize
         }
 
-        // Get the first address that is a candidate address.
+        // LEANDROS: ::1 talks to itself from ::1 (RFC 6724 excludes loopback
+        // from the candidates, which left a loopback-only interface with none
+        // and panicked on the unwrap below).
+        if dst_addr.is_loopback() && self.has_ip_addr(*dst_addr) {
+            return Some(*dst_addr);
+        }
+
+        // Get the first address that is a candidate address. None (no IPv6
+        // address on this interface) is an unaddressable destination, not a
+        // panic.
         let mut candidate = self
             .ip_addrs
             .iter()
@@ -973,8 +982,7 @@ impl InterfaceInner {
                 #[cfg(feature = "proto-ipv6")]
                 IpCidr::Ipv6(a) => Some(a),
             })
-            .find(|a| is_candidate_source_address(dst_addr, &a.address()))
-            .unwrap();
+            .find(|a| is_candidate_source_address(dst_addr, &a.address()))?;
 
         for addr in self.ip_addrs.iter().filter_map(|a| match a {
             #[cfg(feature = "proto-ipv4")]
@@ -1531,6 +1539,16 @@ impl InterfaceInner {
             };
 
             return Ok((hardware_addr, tx_token));
+        }
+
+        // LEANDROS: an IPv6 packet to one of this interface's own addresses
+        // (::1 on the Ethernet-medium loopback; smoltcp never answers an NS
+        // for ::1) needs no neighbor discovery: it goes to our own MAC.
+        #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
+        if let IpAddress::Ipv6(_) = dst_addr {
+            if matches!(self.caps.medium, Medium::Ethernet) && self.has_ip_addr(*dst_addr) {
+                return Ok((self.hardware_addr, tx_token));
+            }
         }
 
         let dst_addr = self
