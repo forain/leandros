@@ -366,6 +366,32 @@ static int dellink_body(void) {
     return 0;
 }
 
+/* ---- veth_setlink_move: RTM_SETLINK + IFLA_NET_NS_FD moves an existing link --------------- */
+static int setlink_move_body(void) {
+    int s = nl_sock();
+    return link_get(s, "vsmB", NULL, NULL) ? 0 : 1;   /* arrived in our netns */
+}
+static void veth_setlink_move(void) {
+    int s = nl_sock();
+    CHECK("veth_setlink_move: veth pair created in the host netns", veth_new(s, "vsmA", "vsmB", -1) == 0);
+    pid_t c = spawn_ns(setlink_move_body);
+    CHECK("veth_setlink_move: netns spawned", c > 0);
+    if (c <= 0) { link_del(s, link_get(s, "vsmA", NULL, NULL)); close(s); return; }
+    int fc = netns_fd_of(c);
+    int idx = link_get(s, "vsmB", NULL, NULL);
+    struct ifinfomsg i; memset(&i, 0, sizeof i); i.ifi_index = idx;
+    struct nlb m; nl_begin(&m, RTM_SETLINK, 0, &i, sizeof i);
+    nl_attr(&m, IFLA_NET_NS_FD, &fc, 4);
+    CHECK("veth_setlink_move: SETLINK with IFLA_NET_NS_FD accepted", nl_do(s, &m) == 0);
+    close(fc);
+    CHECK("veth_setlink_move: link left the host netns", link_get(s, "vsmB", NULL, NULL) == 0);
+    char ch = 'g'; write(ctl[1], &ch, 1);
+    CHECK("veth_setlink_move: link present in the target netns", wait_child(c) == 0);
+    int a = link_get(s, "vsmA", NULL, NULL);
+    if (a) link_del(s, a);
+    close(s);
+}
+
 /* ---- cases ----------------------------------------------------------------- */
 
 /* True when link `name` disappears from the host within `ms` (each request also drives the reaper). */
@@ -1263,6 +1289,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "veth_ping")) veth_ping();
     if (!only || !strcmp(only, "veth_dellink")) veth_dellink();
     if (!only || !strcmp(only, "veth_naming")) veth_naming();
+    if (!only || !strcmp(only, "veth_setlink_move")) veth_setlink_move();
     if (!only || !strcmp(only, "veth_nsgone")) veth_nsgone();
     if (!only || !strcmp(only, "bridge_l2")) bridge_l2();
     if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
