@@ -999,6 +999,23 @@ static int fwd_body(void) {
         ok = tcp_dns_fd(fd);
         close(fd);
     }
+    else if (g_fwd_mode == 3) { /* UDP to a closed port beyond the NAT: the ICMP port-unreachable must come back */
+        char gw[32]; fwd_gateway(gw);
+        int u = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(9) };
+        inet_pton(AF_INET, gw, &a.sin_addr);
+        struct timeval tv = { 3, 0 };
+        setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        ok = 0;
+        if (u >= 0 && !connect(u, (struct sockaddr *)&a, sizeof a)) {
+            char b[8];
+            for (int k = 0; k < 3 && !ok; k++) {
+                send(u, "x", 1, 0);
+                if (recv(u, b, sizeof b, 0) < 0 && errno == ECONNREFUSED) ok = 1;
+            }
+        }
+        if (u >= 0) close(u);
+    }
     else if (g_fwd_mode == 6) { /* TCP to the bridge's own address: a host 0.0.0.0 listener, with forwarding on */
         int fd = tcp_conn("10.97.0.1", 7779);
         ok = fd >= 0;
@@ -1128,6 +1145,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     else if (mode == 2) snprintf(msg, sizeof msg, "%s: TCP DNS query to the resolver%s is answered through NAT", name, g_http ? " and an HTTP GET" : "");
     else if (mode >= 4) snprintf(msg, sizeof msg, "%s: flow holder exited cleanly", name);
     else if (mode == 0 && ipfwd) snprintf(msg, sizeof msg, "%s: UDP DNS query to the resolver is answered through NAT", name);
+    else if (mode == 3 && ipfwd) snprintf(msg, sizeof msg, "%s: ICMP port-unreachable for a NATed UDP flow reaches the container (ECONNREFUSED)", name);
     else if (mode == 1 && ipfwd) snprintf(msg, sizeof msg, "%s: ICMP echo to the default gateway is answered through NAT", name);
     else snprintf(msg, sizeof msg, "%s: ip_forward=0 means no reply (nothing forwarded)", name);
     CHECK(msg, rc == 0);
@@ -1140,6 +1158,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
 static void fwd_udp(void) { fwd_case("fwd_udp", 0, 1); }
 static void fwd_ping(void) { fwd_case("fwd_ping", 1, 1); }
 static void fwd_off(void) { fwd_case("fwd_off", 0, 0); }
+static void fwd_icmperr(void) { fwd_case("fwd_icmperr", 3, 1); }
 static void fwd_tcp(void) { fwd_case("fwd_tcp", 2, 1); }
 static void fwd_port_reserved(void) { fwd_case("fwd_port_reserved", 4, 1); }
 static void fwd_mac_forge(void) { fwd_case("fwd_mac_forge", 8, 1); }
@@ -1249,6 +1268,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
     if (!only || !strcmp(only, "fwd_ping")) fwd_ping();
     if (!only || !strcmp(only, "fwd_off")) fwd_off();
+    if (!only || !strcmp(only, "fwd_icmperr")) fwd_icmperr();
     if (!only || !strcmp(only, "fwd_tcp")) fwd_tcp();
     if (!only || !strcmp(only, "fwd_port_reserved")) fwd_port_reserved();
     if (!only || !strcmp(only, "fwd_reap")) fwd_reap();
