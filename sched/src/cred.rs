@@ -25,7 +25,7 @@ const SIGCONT: u32 = 18;
 
 /// Snapshot of the identity a check needs from the calling thread.
 #[derive(Clone, Copy)]
-struct Caller { tgid: Pid, sid: Pid, uid: u32, euid: u32, gid: u32, pidns: crate::ns::NsId, root: bool,
+struct Caller { tgid: Pid, sid: Pid, uid: u32, euid: u32, gid: u32, pidns: crate::ns::NsId,
     /// Caller's user namespace and effective caps, for `cap_over` (the RUN_QUEUE is held, so
     /// `caps::ns_capable_in` cannot be called).
     cns: crate::ns::NsId, caps: u64 }
@@ -34,7 +34,6 @@ fn caller(rq: &runqueue::RunQueue) -> Option<Caller> {
     rq.find_pid(current_pid()).map(|t| Caller {
         tgid: t.tgid, sid: t.sid,
         uid: t.uid, euid: t.euid, gid: t.gid, pidns: t.pidns.id(),
-        root: t.euid == 0 && t.userns.id() == 0,
         cns: t.userns.id(), caps: t.caps[0],
     })
 }
@@ -47,8 +46,11 @@ const CAP_SYS_NICE: u32 = 23;
 /// in the caller's own namespace when it is the TARGET's namespace or an ancestor of it (or the
 /// caller owns the target's namespace). A capability in a sibling or child namespace is not power
 /// over the target.
+/// `cap` effective in the caller's own namespace, and that is the initial one (Linux `capable()`).
+fn host_cap(c: &Caller, cap: u32) -> bool { c.cns == 0 && c.caps >> cap & 1 != 0 }
+
 fn cap_over(c: &Caller, t: &Task, cap: u32) -> bool {
-    c.root || crate::caps::capable_snap(c.cns, c.euid, c.caps, t.userns.id(), cap)
+    crate::caps::capable_snap(c.cns, c.euid, c.caps, t.userns.id(), cap)
 }
 
 /// Linux `kill_ok_by_cred` plus the two exemptions of `check_kill_permission`:
@@ -304,7 +306,7 @@ pub fn set_nice_checked(matches: impl Fn(&Task) -> bool, nice: i8) -> isize {
     let mut rq = RUN_QUEUE.lock();
     let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
     let rlim_nice = leader_rlimit(&rq, c.tgid, task::RLIMIT_NICE);
-    let can_nice = c.root || (20 - nice as i64) as u64 <= rlim_nice;
+    let can_nice = host_cap(&c, 23) || (20 - nice as i64) as u64 <= rlim_nice;
     let mut err = ESRCH;
     for i in rq.live_slots() {
         let (m, owner_ok, lowering) = match rq.get(i) {
@@ -343,7 +345,7 @@ pub fn sched_policy_check(pid: Pid, policy: Option<u32>, prio: i32) -> isize {
     let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
     let pid = if pid == 0 { current_pid() } else { pid };
     let t = match rq.find_pid(pid) { Some(t) => t, None => return ESRCH };
-    if c.root { return 0; }
+    if host_cap(&c, 23) { return 0; }
     if !same_owner(&c, t) { return EPERM; }
     if rt && (prio as u64) > leader_rlimit(&rq, t.tgid, task::RLIMIT_RTPRIO) { return EPERM; }
     0
@@ -406,7 +408,7 @@ pub fn prlimit(pid: Pid, res: usize, new: Option<[u64; 2]>) -> Result<[u64; 2], 
     let l = match rq.find_pid_mut(tgid) { Some(l) => l, None => return Err(ESRCH) };
     let old = l.rlimits[res];
     if let Some(nl) = new {
-        if nl[1] > old[1] && !c.root { return Err(EPERM); }
+        if nl[1] > old[1] && !host_cap(&c, 24) { return Err(EPERM); }
         l.rlimits[res] = nl;
         if res == task::RLIMIT_CPU && nl[0] != task::RLIM_INFINITY {
             super::CPU_RLIMIT_SET.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -453,7 +455,6 @@ pub fn proc_dump_owner(pid: Pid) -> (u32, u32) {
 pub fn ipc_send_check(owner: Pid) -> isize {
     let rq = RUN_QUEUE.lock();
     let c = match rq.find_pid(current_pid()) { Some(t) => t, None => return EPERM };
-    if c.euid == 0 && c.userns.id() == 0 { return 0; }
     let t = match rq.find_pid(owner) { Some(t) => t, None => return EPERM };
     if t.tgid == c.tgid { return 0; }
     if crate::caps::capable_snap(c.userns.id(), c.euid, c.caps[0], t.userns.id(), CAP_SYS_PTRACE) { return 0; }
@@ -468,8 +469,7 @@ pub fn ipc_send_check(owner: Pid) -> isize {
 
 /// Linux `ns_capable(ns, CAP_SYS_PTRACE)` for the caller `c`: host root, or the cap over `ns`.
 fn ptrace_cap(c: &task::Task, ns: crate::ns::NsId) -> bool {
-    (c.euid == 0 && c.userns.id() == 0)
-        || crate::caps::capable_snap(c.userns.id(), c.euid, c.caps[0], ns, CAP_SYS_PTRACE)
+    crate::caps::capable_snap(c.userns.id(), c.euid, c.caps[0], ns, CAP_SYS_PTRACE)
 }
 
 /// The `__ptrace_may_access` tail: the ids match or the caller has CAP_SYS_PTRACE in the target's

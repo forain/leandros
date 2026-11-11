@@ -170,6 +170,8 @@ extern "C" {
     pub fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_int) -> pid_t;
     pub fn _exit(status: c_int) -> !;
     pub fn getpid() -> pid_t;
+    pub fn kill(pid: pid_t, sig: c_int) -> c_int;
+    pub fn setpgid(pid: pid_t, pgid: pid_t) -> c_int;
     pub fn setsid() -> pid_t;
     pub fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
     pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> c_int;
@@ -432,7 +434,7 @@ unsafe fn shared_init() -> bool {
         return false;
     }
     SHARED = p as *mut u32;
-    for i in 0..16 {
+    for i in 0..24 {
         core::ptr::write_volatile(SHARED.add(i), 0);
     }
     true
@@ -776,6 +778,75 @@ unsafe fn test_sighup(m: c_int, n: usize) -> bool {
     let mut status: c_int = 0;
     waitpid(child, &mut status, 0);
     report(b"sighup_on_close", ready && killed_by(status, SIGHUP))
+}
+
+// ── 11b. the session leader's exit: SIGHUP to the foreground group only ─────
+//
+// Linux `disassociate_ctty(on_exit=1)` sends the foreground group SIGHUP and
+// *no* SIGCONT (SIGCONT is only for the non-exit paths); a stopped background
+// group that the exit orphans gets SIGHUP + SIGCONT from `kill_orphaned_pgrp`;
+// a running background group sees nothing. Verified against Linux with the
+// same scenario (box, Arch): fg {HUP}, stopped bg {CONT, HUP}, running bg {}.
+// Slots: 16/17 fg HUP/CONT, 18/19 stopped-bg HUP/CONT, 20/21 running-bg HUP/CONT.
+
+unsafe fn hup_count(slot: usize) {
+    core::ptr::write_volatile(SHARED.add(slot), core::ptr::read_volatile(SHARED.add(slot)) + 1);
+}
+extern "C" fn fg_hup(_s: c_int) { unsafe { hup_count(16) } }
+extern "C" fn fg_cont(_s: c_int) { unsafe { hup_count(17) } }
+extern "C" fn sb_hup(_s: c_int) { unsafe { hup_count(18) } }
+extern "C" fn sb_cont(_s: c_int) { unsafe { hup_count(19) } }
+extern "C" fn rb_hup(_s: c_int) { unsafe { hup_count(20) } }
+extern "C" fn rb_cont(_s: c_int) { unsafe { hup_count(21) } }
+
+unsafe fn test_leader_exit_hup(m: c_int, n: usize) -> bool {
+    let leader = fork();
+    if leader == 0 {
+        close(m);
+        if !child_login_tty(n) {
+            _exit(1);
+        }
+        // kind 0 = foreground, 1 = stopped background, 2 = running background
+        for kind in 0..3u32 {
+            if fork() == 0 {
+                let (h, c): (extern "C" fn(c_int), extern "C" fn(c_int)) = match kind {
+                    0 => (fg_hup, fg_cont),
+                    1 => (sb_hup, sb_cont),
+                    _ => (rb_hup, rb_cont),
+                };
+                signal(SIGHUP, h as usize);
+                signal(18, c as usize);
+                if kind != 0 {
+                    setpgid(0, 0);
+                }
+                if kind == 1 {
+                    kill(getpid(), 19); // SIGSTOP
+                }
+                for _ in 0..300 {
+                    msleep(10);
+                }
+                _exit(0);
+            }
+        }
+        msleep(600);
+        _exit(0);
+    }
+    let mut status: c_int = 0;
+    waitpid(leader, &mut status, 0);
+    msleep(1000);
+    let ok = shared_get(16) == 1 && shared_get(17) == 0
+        && shared_get(18) == 1 && shared_get(19) == 1
+        && shared_get(20) == 0 && shared_get(21) == 0;
+    if !ok {
+        for i in 16..22 {
+            out(b"  leader_exit_hup slot ");
+            out_num(i);
+            out(b"=");
+            out_num(shared_get(i) as usize);
+            out(b"\n");
+        }
+    }
+    report(b"leader_exit_hup", ok)
 }
 
 // ── 12. /dev/tty is the *controlling* terminal, not the machine console ──────
@@ -1123,7 +1194,7 @@ unsafe fn with_pair(name: &[u8], f: unsafe fn(c_int, usize) -> bool) -> bool {
 
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
-    const TOTAL: usize = 18;
+    const TOTAL: usize = 19;
     let mut passed = 0usize;
 
     let (m, s) = match open_pair() {
@@ -1172,6 +1243,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
     if with_pair(b"tiocsig", test_tiocsig) { passed += 1; }
     if with_pair(b"sigint_fg_only", test_sigint) { passed += 1; }
     if with_pair(b"sighup_on_close", test_sighup) { passed += 1; }
+    if with_pair(b"leader_exit_hup", test_leader_exit_hup) { passed += 1; }
     if with_pair(b"devtty_is_ctty", test_devtty) { passed += 1; }
     if with_pair(b"devtty_enxio_after_hangup", test_devtty_after_hangup) { passed += 1; }
     if test_master_eio() { passed += 1; }

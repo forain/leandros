@@ -2473,7 +2473,7 @@ fn hp_handle(msg: &Message) -> Message {
             val_reply(0)
         }
         vfs_server::VFS_IOCTL if arg(msg, 1) as usize == SERIALKBD_IOCTL => {
-            if !sched::host_root_of(pid) { return err_reply(-1); } // EPERM
+            if !sched::caps::host_capable_of(pid, sched::caps::CAP_SYS_ADMIN) { return err_reply(-1); } // EPERM
             val_reply(set_serial_kbd(arg(msg, 2) != 0) as u64)
         }
         vfs_server::VFS_IOCTL => err_reply(-25), // ENOTTY

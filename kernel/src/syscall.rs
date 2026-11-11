@@ -2588,7 +2588,15 @@ fn dispatch_inner(
         // caller gets Linux's answer (EPERM — the capability check comes before
         // anything else there), root gets ENOSYS.
         ACCT | VHANGUP | SWAPON | SWAPOFF | KEXEC_LOAD => {
-            if !sched::host_root() { -1 } else { log_enosys(number) }
+            // Linux: acct/CAP_SYS_PACCT, vhangup/CAP_SYS_TTY_CONFIG, swapon+swapoff/CAP_SYS_ADMIN,
+            // kexec_load/CAP_SYS_BOOT, each in the initial user namespace.
+            let cap = match number {
+                ACCT => sched::caps::CAP_SYS_PACCT,
+                VHANGUP => sched::caps::CAP_SYS_TTY_CONFIG,
+                KEXEC_LOAD => sched::caps::CAP_SYS_BOOT,
+                _ => sched::caps::CAP_SYS_ADMIN,
+            };
+            if !sched::caps::host_capable(cap) { -1 } else { log_enosys(number) }
         }
         INIT_MODULE   => crate::kmod::sys::sys_init_module(a0, a1, a2),
         FINIT_MODULE  => crate::kmod::sys::sys_finit_module(a0, a1, a2),
@@ -5584,7 +5592,7 @@ fn sys_getppid() -> isize {
 /// asks ptrace_may_access).
 fn sys_get_robust_list(tid: usize, head_ptr: usize, len_ptr: usize) -> isize {
     let Ok(tid) = sched::pidns::from_cur(tid as u32) else { return -3 };
-    if tid != 0 && sched::tgid_of(tid) != sched::current_tgid() && !sched::host_root() {
+    if tid != 0 && sched::tgid_of(tid) != sched::current_tgid() && !sched::caps::host_capable(sched::caps::CAP_SYS_PTRACE) {
         return -1; // EPERM
     }
     let Some(head) = sched::robust::get(tid) else { return -3 }; // ESRCH
@@ -6529,13 +6537,17 @@ fn sys_execveat(dirfd: usize, path_ptr: usize, argv_ptr: usize, envp_ptr: usize,
 /// Re-resolve the symlinks of `kp` in its mount namespace (exec reads the file
 /// from the backing path, past the VFS path chokepoint that does this for the
 /// other path syscalls). Namespace 0 and paths without a namespace form pass.
-fn ns_follow_links(kp: KPath) -> Result<KPath, isize> {
+fn ns_follow_links(kp: KPath) -> Result<KPath, isize> { ns_follow_links_ex(kp, true) }
+
+/// As `ns_follow_links`, with the final component followed only when `follow`
+/// (AF_UNIX bind names the socket node itself).
+fn ns_follow_links_ex(kp: KPath, follow: bool) -> Result<KPath, isize> {
     let mns = sched::current_mntns();
     if mns == 0 { return Ok(kp); }
     let nsb = match kp.ns.as_ref() { Some(n) => n.clone(), None => return Ok(kp) };
     let jail = sched::current_root_arc();
     let floor: &[u8] = jail.as_deref().unwrap_or(b"/");
-    match vfs::ns_resolve_links(mns, &nsb, true, floor) {
+    match vfs::ns_resolve_links(mns, &nsb, follow, floor) {
         Ok(Some((nsp, _, _))) if nsp != nsb => KPath::from_ns(nsp),
         Ok(_) => Ok(kp),
         Err(e) => Err(e as isize),
@@ -6774,7 +6786,10 @@ fn sys_execve_kp(kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: boo
         // file). For an unjailed task this is the same absolute path as
         // before.
         if plen == 0 || plen >= KPATH_MAX { drop(new_as); return -8; }
-        let interp_kp = match resolve_ns(&raw[..plen]).and_then(KPath::from_ns) {
+        // In a mount namespace the interpreter's symlinks resolve in
+        // namespace space too (an absolute link is anchored at the pivoted
+        // root, never at the host volume).
+        let interp_kp = match resolve_ns(&raw[..plen]).and_then(KPath::from_ns).and_then(ns_follow_links) {
             Ok(k) => k,
             Err(_) => { drop(new_as); return -2; }
         };
@@ -9142,6 +9157,22 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
                 vfs::vfs_get_node_kind(current_pid(), fd),
                 Some(vfs::VnodeKind::MountedFile { .. }));
             if mounted {
+                let mns = sched::current_mntns();
+                if mns != 0 {
+                    // Reopen through the namespace tree so ro/nodev/mask and
+                    // link resolution apply, then prove it is the same file.
+                    if let Some(p) = fd_ns_path(mns, fd, b"") {
+                        let kp2 = KPath::from_ns_mnt(p, mns)?;
+                        let (mut a, mut b2) = ([0u8; STAT_SIZE], [0u8; STAT_SIZE]);
+                        let m1 = make_vfs_msg(vfs::VFS_FSTAT, &[fd as u64, a.as_mut_ptr() as u64]);
+                        let m2 = make_vfs_msg(vfs::VFS_STAT, &[kp2.ptr() as u64, b2.as_mut_ptr() as u64]);
+                        if vfs_reply_val(&vfs::handle(&m1, current_pid())) < 0 { return Err(-2); }
+                        let r = vfs_reply_val(&vfs::handle(&m2, current_pid()));
+                        if r < 0 { return Err(r); }
+                        if vfs::read_stat_id(a.as_ptr() as usize) != vfs::read_stat_id(b2.as_ptr() as usize) { return Err(-2); }
+                        return Ok(kp2);
+                    }
+                }
                 if let Some(host) = fd_host_path(fd) { return Ok(KPath::raw(&host)); }
             } else if let Some(dir) = fd_dir_host_path(fd) {
                 // A directory descriptor on a non-mounted filesystem (tmpfs,
@@ -9545,7 +9576,7 @@ fn fstat_into(fd: usize, statbuf_ptr: usize, user_dest: bool) -> isize {
 /// owned by the initial user namespace, so that is host root only.
 fn may_mount() -> bool {
     let mntns = sched::current_mntns();
-    if mntns == 0 { return sched::host_root(); }
+    if mntns == 0 { return sched::caps::host_capable(sched::caps::CAP_SYS_ADMIN); }
     sched::caps::ns_capable_in(sched::ns::owner_user(mntns), 21)
 }
 
@@ -9559,6 +9590,7 @@ fn may_mount() -> bool {
 fn resolve_mount_target(target_ptr: usize) -> Result<Vec<u8>, isize> {
     let p = resolve_user_path(target_ptr)?;
     if let Some((fd, b"")) = proc_own_fd(p.ns_bytes()) { return fd_mount_ns_path(fd); }
+    let p = ns_follow_links(p)?;
     Ok(p.ns_bytes().to_vec())
 }
 
@@ -9593,7 +9625,7 @@ fn mount_target_kpath(target_ptr: usize) -> Result<KPath, isize> {
     if let Ok(raw) = copy_user_str(target_ptr, 4096) {
         if let Some((fd, b"")) = proc_own_fd(&raw) { return KPath::from_ns(fd_mount_ns_path(fd)?); }
     }
-    resolve_user_path(target_ptr)
+    ns_follow_links(resolve_user_path(target_ptr)?)
 }
 
 fn sys_mount(
@@ -9624,7 +9656,7 @@ fn sys_mount(
     // caller's mount namespace. Non-host-root callers are only ever allowed
     // devpts (other types stay host-root until their userns story exists).
     if !may_mount() { return -1; } // EPERM
-    if !sched::host_root() && !devpts_mount { return -1; } // EPERM
+    if !sched::caps::host_capable(sched::caps::CAP_SYS_ADMIN) && !devpts_mount { return -1; } // EPERM
     // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC):
     // only the mount's propagation state changes; source/fstype are ignored.
     // MS_BIND wins over propagation bits, as in Linux do_mount (Go netns bind passes both).
@@ -9897,7 +9929,7 @@ fn tree_src(dfd: usize, path_ptr: usize, empty_ok: bool) -> Result<TreeSrc, isiz
 
 /// ns 0 has no tree to clone or edit: the host namespace keeps its old answer
 /// (ENOSYS for host root, EPERM for everyone else).
-fn newmnt_ns0() -> isize { if sched::host_root() { -38 } else { -1 } }
+fn newmnt_ns0() -> isize { if sched::caps::host_capable(sched::caps::CAP_SYS_ADMIN) { -38 } else { -1 } }
 
 fn sys_open_tree(dfd: usize, path_ptr: usize, flags: usize) -> isize {
     const OPEN_TREE_CLONE: usize = 1;
@@ -10154,7 +10186,7 @@ fn sys_umount_ns(mns: sched::ns::NsId, target_ptr: usize, flags: usize) -> isize
     if flags as u32 as usize & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 { return -22; }
     if flags & MNT_EXPIRE != 0 && flags & (MNT_FORCE | MNT_DETACH) != 0 { return -22; }
     if flags & MNT_EXPIRE != 0 { return -22; }
-    let target = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+    let target = match resolve_user_path(target_ptr).and_then(|p| ns_follow_links_ex(p, flags & UMOUNT_NOFOLLOW == 0)) { Ok(p) => p, Err(e) => return e };
     match vfs::mnt::umount(mns, target.ns_bytes(), flags & MNT_DETACH != 0) { Ok(()) => 0, Err(e) => e as isize }
 }
 
@@ -11673,7 +11705,7 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
             let tgt = sched::tgid_of(pid);
             if tgt != sched::current_tgid() {
                 let c = sched::euid_of(current_pid());
-                if !sched::host_root() && c != sched::euid_of(tgt) { return -13; }
+                if !sched::caps::host_capable(sched::caps::CAP_SYS_PTRACE) && c != sched::euid_of(tgt) { return -13; }
             }
             let mut fd = 0usize;
             for &d in num_str { fd = fd * 10 + (d - b'0') as usize; }
@@ -11851,6 +11883,14 @@ impl KPath {
     /// (pointer -> ns path, mount id) pair is published to the VFS chokepoint
     /// keyed by thread pid.
     fn from_ns_mnt(ns: Vec<u8>, mns: sched::ns::NsId) -> Result<KPath, isize> {
+        // /proc/self/fd/N/<below>: the directory the fd names lives in the
+        // mount the fd was opened through, not in /proc. Resolve it as the
+        // namespace path it really is, so links, ro/nodev and masking apply.
+        if let Some((fd, below)) = proc_own_fd(&ns) {
+            if !below.is_empty() {
+                if let Some(p) = fd_ns_path(mns, fd, below) { return KPath::from_ns_mnt(p, mns); }
+            }
+        }
         let (mut denied, mut crossed) = (false, false);
         let (mut mid, mut plen) = (0u32, 0usize);
         let backing = backing_walk_m(&ns, &mut crossed, &mut denied, mns, &mut mid, &mut plen);
@@ -11892,7 +11932,7 @@ fn proc_ns_link(p: &[u8]) -> Option<(u32, usize)> {
 fn proc_link_allowed(pid: u32) -> bool {
     let tgt = sched::tgid_of(pid);
     if tgt == sched::current_tgid() { return true; }
-    sched::host_root() || sched::euid_of(current_pid()) == sched::euid_of(tgt)
+    sched::caps::host_capable(sched::caps::CAP_SYS_PTRACE) || sched::euid_of(current_pid()) == sched::euid_of(tgt)
 }
 
 /// `proc_link_allowed` for the /proc/<pid>/{root,cwd} links, which are path
@@ -12051,6 +12091,22 @@ fn proc_fd_below(p: &[u8]) -> Option<Vec<u8>> {
         return Some(b"/.leandros-hidden".to_vec());
     }
     Some(host)
+}
+
+/// The namespace path (in mount namespace `mns` != 0) at which fd `fd`'s file
+/// is visible, plus `below`; preferring the mount the fd was opened through.
+/// None when the fd has no path, is not visible in the namespace (opened
+/// before a pivot_root), or maps back into /proc.
+fn fd_ns_path(mns: sched::ns::NsId, fd: usize, below: &[u8]) -> Option<Vec<u8>> {
+    let host = fd_host_path(fd)?;
+    let hint = match vfs::fd_mnt(current_pid(), fd) { Some((n, m)) if n == mns => m, _ => 0 };
+    let mut p = vfs::mnt::reverse(mns, &host, hint)?;
+    if p.starts_with(b"/proc/") || p == b"/proc" { return None; }
+    if !below.is_empty() {
+        if p.last() != Some(&b'/') { p.push(b'/'); }
+        p.extend_from_slice(below);
+    }
+    Some(p)
 }
 
 /// `/proc/<own pid>/fd/N[/rest]` → (N, rest without its leading '/'), for
@@ -13313,7 +13369,7 @@ fn sys_socket(domain: usize, sock_type: usize, protocol: usize) -> isize {
 /// The net server used sun_path verbatim, as a host-absolute path, so a
 /// chrooted tmux (or ssh-agent, or dbus) bound `/tmp/tmux-0/default` in the
 /// host's /tmp, not its own, and a relative name never resolved at all.
-fn unix_sockaddr_backing(addr_ptr: usize, addrlen: usize) -> Result<Option<KPath>, isize> {
+fn unix_sockaddr_backing(addr_ptr: usize, addrlen: usize, follow: bool) -> Result<Option<KPath>, isize> {
     const AF_UNIX: u16 = 1;
     const SUN_PATH_MAX: usize = 108;
     if addrlen < 3 { return Ok(None); }
@@ -13335,13 +13391,15 @@ fn unix_sockaddr_backing(addr_ptr: usize, addrlen: usize) -> Result<Option<KPath
             }
         }
     }
-    Ok(Some(KPath::from_ns(resolve_ns(name)?)?))
+    // Mount-namespace tasks: links resolve in namespace space (bind names the
+    // node itself, so its final component is not followed).
+    Ok(Some(ns_follow_links_ex(KPath::from_ns(resolve_ns(name)?)?, follow)?))
 }
 
 /// NET_BIND / NET_CONNECT for `sockfd`, carrying the resolved pathname (see
 /// `unix_sockaddr_backing`) in args 3-4.
 fn net_addr_call(tag: u64, sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
-    let host = match unix_sockaddr_backing(addr_ptr, addrlen) { Ok(h) => h, Err(e) => return e };
+    let host = match unix_sockaddr_backing(addr_ptr, addrlen, tag != net_server::NET_BIND) { Ok(h) => h, Err(e) => return e };
     let (hp, hl) = match &host { Some(k) => (k.ptr() as u64, k.bytes().len() as u64), None => (0, 0) };
     let msg = make_vfs_msg(tag, &[sockfd as u64, addr_ptr as u64, addrlen as u64, hp, hl]);
     let r = net_reply_val(&net_server::handle(&msg, current_pid()));
@@ -17792,7 +17850,7 @@ fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
         if want < 1 || want as u32 >= sched::PID_MAX { return -22; }
         // Linux: CAP_CHECKPOINT_RESTORE (or CAP_SYS_ADMIN) in the owning
         // user namespace.
-        if !sched::host_root() { return -1; }
+        if !(sched::caps::host_capable(sched::caps::CAP_CHECKPOINT_RESTORE) || sched::caps::host_capable(sched::caps::CAP_SYS_ADMIN)) { return -1; }
         Some(want as u32)
     } else { None };
     // Default handlers in the child: what the child of a fork that is about

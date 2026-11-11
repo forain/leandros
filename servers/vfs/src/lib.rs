@@ -6402,7 +6402,7 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         if p >= buf.len() { return start; }
     }
     // Alias mounts (proc/devtmpfs/sysfs/bind), where the reader sees them.
-    for (dev, mp, fstype) in alias_mounts_for_reader() {
+    for (dev, mp, fstype, _sbi) in alias_mounts_for_reader() {
         let start = p;
         p = write_lit(buf, p, &dev);
         p = write_lit(buf, p, b" ");
@@ -6434,16 +6434,16 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
 /// The alias mounts as the calling task sees them: mount points inside its
 /// chroot with the root stripped; the rest omitted (as Linux hides mounts
 /// outside a reader's root). Unjailed readers see them all.
-fn alias_mounts_for_reader() -> Vec<(Vec<u8>, Vec<u8>, &'static str)> {
+fn alias_mounts_for_reader() -> Vec<(Vec<u8>, Vec<u8>, &'static str, Option<u32>)> {
     let root = sched::current_root_arc();
-    alias::list().into_iter().filter_map(|(dev, mp, fstype)| {
+    alias::list().into_iter().filter_map(|(dev, mp, fstype, sbi)| {
         match root.as_deref() {
             Some(r) if r.len() > 1 => {
                 if !alias::under(&mp, r) { return None; }
                 let v = if mp.len() == r.len() { b"/".to_vec() } else { mp[r.len()..].to_vec() };
-                Some((dev, v, fstype))
+                Some((dev, v, fstype, sbi))
             }
-            _ => Some((dev, mp, fstype)),
+            _ => Some((dev, mp, fstype, sbi)),
         }
     }).collect()
 }
@@ -6538,11 +6538,16 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         if p >= buf.len() { return start; }
         mount_id += 1;
     }
-    for (dev, mp, fstype) in alias_mounts_for_reader() {
+    for (dev, mp, fstype, sbi) in alias_mounts_for_reader() {
         let start = p;
         p = write_u32(buf, p, mount_id);
-        p = write_lit(buf, p, b" 20 0:");
-        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" 20 ");
+        // A tmpfs instance shows its superblock's device number (as Linux
+        // does); other aliases keep the synthetic `0:<mount id>`.
+        match sbi.and_then(mnt::sb_dev) {
+            Some(d) => { let (ma, mi) = dev_major_minor(d as u64); p = write_u32(buf, p, ma); p = write_lit(buf, p, b":"); p = write_u32(buf, p, mi); }
+            None => { p = write_lit(buf, p, b"0:"); p = write_u32(buf, p, mount_id); }
+        }
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, &mp);
         p = write_lit(buf, p, b" rw,nosuid,relatime");
@@ -6872,6 +6877,9 @@ fn gen_mntselftest() -> Option<VnodeKind> {
     let mut s = alloc::string::String::new();
     for (name, ok) in mnt::selftest() { let _ = writeln!(s, "{}: {}", name, if ok { "PASS" } else { "FAIL" }); }
     let _ = writeln!(s, "ns_live={} ns_dying={} sb_count={}", sched::ns::live_count(), sched::ns::dying_count(), mnt::sb_count());
+    let _ = write!(s, "sb_devs=");
+    for d in mnt::sb_devs() { let _ = write!(s, "{},", d); }
+    let _ = writeln!(s);
     proc_snapshot(b"/tmp/.mntselftest", s.as_bytes(), false)
 }
 
@@ -7546,7 +7554,7 @@ const SYSCLASS_W: &[u8] = b"/tmp/.syscw";
 fn sysclass_write_ok(pid: u32, path: &[u8]) -> bool {
     let mut g = [0u32; xattr::NGROUPS_MAX];
     let n = sched::groups_of(pid, &mut g).min(g.len());
-    sysclass::write_allowed(host_root_of(pid), sched::egid_of(pid), &g[..n],
+    sysclass::write_allowed(sched::caps::host_capable_of(pid, sched::caps::CAP_DAC_OVERRIDE), sched::egid_of(pid), &g[..n],
                             sysclass::is_writable(path), sysclass::is_video_writable(path))
 }
 
@@ -8142,7 +8150,7 @@ fn open_proc_task(caller: u32, t: ProcTask, flags: u32) -> Result<VnodeKind, i32
 /// `/proc/<pid>/environ` is readable by root and by the process's owner
 /// (Linux: PTRACE_MODE_READ_FSCREDS, so non-dumpable targets need CAP_SYS_PTRACE).
 fn proc_environ_allowed(caller: u32, target: u32) -> bool {
-    sched::host_root_of(caller) || sched::cred::ptrace_read_check(caller, target) == 0
+    sched::caps::host_capable_of(caller, sched::caps::CAP_SYS_PTRACE) || sched::cred::ptrace_read_check(caller, target) == 0
 }
 
 /// stat of a per-process procfs path: `None` not one; `Some(None)` it names
@@ -8987,7 +8995,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             VnodeKind::SysBlock { dev: sysclass::SC_TABLES, level: sysclass::LVL_SC_CLASS, pos: 0 }
         } else if let Some(t) = sysclass::acpi_table(lookup_path) {
             // Raw firmware tables are root-only, as on Linux (mode 0400).
-            if flags & (O_WRONLY | O_RDWR) != 0 || !host_root_of(pid) { return err_reply(-13); }
+            if flags & (O_WRONLY | O_RDWR) != 0 || !sched::caps::host_capable_of(pid, sched::caps::CAP_DAC_OVERRIDE) { return err_reply(-13); }
             let mut tmp = TMP_FILES.lock();
             let Some(idx) = tmp_free_slot(&mut *tmp) else { return err_reply(-23) };
             tmp.claim(idx, b"", true);
@@ -9254,7 +9262,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
             if flags & 0o3 == 0o0 { return err_reply(-13); }
             let me = sched::euid_of(pid);
-            if !sched::host_root_of(pid) && me != sched::euid_of(tpid) { return err_reply(-13); }
+            if !sched::caps::host_capable_of(pid, sched::caps::CAP_DAC_OVERRIDE) && me != sched::euid_of(tpid) { return err_reply(-13); }
             match gen_proc_oom_writable(tpid) {
                 Some(v) => v,
                 None    => return err_reply(-23),
@@ -9265,7 +9273,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
             if flags & 0o3 == 0o0 { return err_reply(-13); }
             let me = sched::euid_of(pid);
-            if !sched::host_root_of(pid) && me != sched::euid_of(tpid) { return err_reply(-13); } // EACCES
+            if !sched::caps::host_capable_of(pid, sched::caps::CAP_DAC_OVERRIDE) && me != sched::euid_of(tpid) { return err_reply(-13); } // EACCES
             match gen_proc_comm_writable(tpid) {
                 Some(v) => v,
                 None    => return err_reply(-23),
@@ -10400,7 +10408,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
             }
             if let Some(tid) = comm_tid {
                 let me = sched::euid_of(pid);
-                if !sched::host_root_of(pid) && me != sched::euid_of(tid) { return err_reply(-13); }
+                if !sched::caps::host_capable_of(pid, sched::caps::CAP_DAC_OVERRIDE) && me != sched::euid_of(tid) { return err_reply(-13); }
                 if sched::proc_stat_of(tid).is_none() { return err_reply(-3); } // ESRCH
                 let n = count.min(15);
                 let mut name = [0u8; 15];
@@ -14720,6 +14728,24 @@ fn fd_note_mnt(pid: u32, fd: usize, ns: u16, mid: u32) {
     }
 }
 
+/// The (mount namespace, mount id) `pid`'s fd was opened through, if recorded.
+pub fn fd_mnt(pid: u32, fd: usize) -> Option<(u16, u32)> {
+    let pid = sched::tgid_of(pid);
+    let ofd = {
+        let mut tbls = TblSlot::new();
+        match find_tbl(pid, &mut tbls) {
+            Some(tbl) if tbl.fds.used(fd) => tbl.fds[fd].ofd,
+            _ => return None,
+        }
+    };
+    ofd::mnt_of(ofd)
+}
+
+/// `(st_dev, st_ino)` out of a filled `struct stat` buffer (same offsets on both ABIs).
+pub fn read_stat_id(stat_ptr: usize) -> (u64, u64) {
+    unsafe { ((stat_ptr as *const u64).read_unaligned(), ((stat_ptr + 8) as *const u64).read_unaligned()) }
+}
+
 /// EROFS when `fd` was opened through a mount that is read-only now.
 fn fd_mnt_ro(pid: u32, fd: usize) -> bool {
     let ofd = {
@@ -15296,7 +15322,7 @@ fn handle_listxattr(pid: u32, tag: u64, path_ptr: usize, list_ptr: usize, size: 
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
     if let Some(path) = tmpfs_path(raw) {
-        let euid = host_root_of(pid);
+        let euid = sched::caps::host_capable_of(pid, sched::caps::CAP_SYS_ADMIN);
         let tmp = TMP_FILES.lock();
         let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
         let owner = tmp_owner(&tmp, idx);
@@ -15517,7 +15543,7 @@ fn handle_flistxattr(pid: u32, fd: usize, list_ptr: usize, size: usize) -> Messa
     };
     match kind {
         VnodeKind::TmpFile { idx, .. } => {
-            let euid = host_root_of(pid);
+            let euid = sched::caps::host_capable_of(pid, sched::caps::CAP_SYS_ADMIN);
             let tmp = TMP_FILES.lock();
             let owner = tmp_owner(&tmp, idx);
             tmp_listxattr_local(&tmp, owner, euid, list_ptr, size)
