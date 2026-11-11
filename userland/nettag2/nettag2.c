@@ -243,6 +243,9 @@ static int check_quiet(const char *n, volatile long *tid, volatile int *returned
     int al[2];
     if (alias_pipe(w.mask, al) < 0) {
         /* (63/64)^320 < 1 in 150 000: only a probe failing does this. */
+        { unsigned long long u = 0; int z = 0, all = 0;
+          for (int i = 0; i < n_alias; i++) { u |= alias_bit[i]; if (!alias_bit[i]) z++; }
+          (void)all; printf("alias: union %#llx zero %d first %#llx last %#llx\n", u, z, alias_bit[0], alias_bit[n_alias-1]); }
         fail(n, "no pipe parks on a bit of mask %#llx (%d probed)", w.mask, n_alias);
         return 1;
     }
