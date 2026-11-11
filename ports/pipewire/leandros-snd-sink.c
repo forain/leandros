@@ -301,9 +301,9 @@ int main(int argc, char *argv[])
 	pw_loop_add_signal(pw_main_loop_get_loop(d.loop), SIGTERM, do_quit, &d);
 
 	/* Name the node after the real backend (virtio-snd, HDA codec, ...). */
-	char info[4096] = { 0 }, desc[160] = "Virtio Sound Output", nick[80] = "Virtio Sound";
-	if (ioctl(d.fd, IOC_GET_INFO, info) == 0)
-		snd_describe(info, desc, sizeof desc, nick, sizeof nick);
+	char sinfo[4096] = { 0 }, desc[160] = "Virtio Sound Output", nick[80] = "Virtio Sound";
+	if (ioctl(d.fd, IOC_GET_INFO, sinfo) == 0)
+		snd_describe(sinfo, desc, sizeof desc, nick, sizeof nick);
 	if (argc > 1 && strcmp(argv[1], "--describe") == 0) {
 		printf("%s|%s\n", desc, nick);
 		return 0;
