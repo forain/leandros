@@ -28,9 +28,9 @@ fd 0, 1 and 2 on the console are special: the kernel's read/write fast paths ser
 
 Each process's table has its own lock (lockwatch class `FD_TABLE`); `FD_TABLES` is only the TGID → table map, held to look up, insert or remove a table, and each CPU caches the table it looked up last, so a syscall's resolve-then-operate pair rarely touches the map. Until lane fdgaps (2026-10-13) one lock guarded every table, so every fd syscall of every process serialised on it: four processes running `fdmaxtest bench` side by side contended on 21 % of 3.9 M acquisitions and spun 292 ms; now the map sees 12.9 k acquisitions (7 contended) and the per-process locks 3.85 M (18 contended). `/proc/lockstat` prints these counters for every tracked lock.
 
-- **Order**: `FD_COPY_GATE` → one table lock → the map → the leaf locks (`PIPE_RINGS`, `TMP_*`, `ofd`, …). No path holds two table locks: fork copies the parent's entries under the parent's lock and publishes the child's table whole.
+- **Order**: one table lock → the map → the leaf locks (`PIPE_RINGS`, `TMP_*`, `ofd`, …). No path holds two table locks: fork copies the parent's entries under the parent's lock and publishes the child's table whole.
 - **Exit**: `handle_close_all` takes the table out of the map and marks it `dead` under its lock, so a caller that looked it up first and locked it after installs nothing (`TblSlot::holds`); a stale per-CPU cache entry is caught the same way.
-- **Scans that decide "unreferenced"** (a mounted file's or a tmpfs inode's last close, unlink's open mask) must see every table at one instant, which the global lock used to give for free. A descriptor copied into another table — fork, `import_fd`, `export_fd`'s in-flight count — takes `FD_COPY_GATE` shared; such a scan takes it exclusive. A `dup` within one table needs no gate: the table's own lock orders it against the scan of that table.
+- **"Is this still open?"** (a mounted file's or a tmpfs inode's last close, unlink's open mask, block-device unload) is a per-object count kept by `FdVec` itself (`TMP_FDREFS`, `MOUNT_FDREFS`, `BLK_FDREFS`: one per fd-table entry plus one per queued SCM_RIGHTS copy), so close is O(1) in the number of open fds system-wide. There is no global copy gate; a copy bumps the count before it becomes visible.
 
 ### Path resolution
 
