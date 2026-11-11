@@ -256,7 +256,7 @@ static unsigned long mount_dev_minor(const char *mp) {
         char *h = strstr(ln, pat);
         if (!h || (eol && h > eol)) continue;
         unsigned id, parent, maj, mnr;
-        if (sscanf(ln, "%u %u %u:%u", &id, &parent, &maj, &mnr) == 4) return mnr;
+        if (sscanf(ln, "%u %u %u:%u", &id, &parent, &maj, &mnr) == 4) return ((unsigned long)maj << 8) | mnr;
     }
     return 0;
 }
