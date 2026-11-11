@@ -2288,7 +2288,6 @@ static void devbind_suite(void) {
     }
 }
 
-<<<<<<< HEAD
 /* ── lane mntiso-procfd: /proc/self/fd/N reopen and /proc/self/fd/N/<below>
  * honour the fd's mount (ro/nodev/mask) and never follow links in host space.
  * Host sentinel /root/mntiso-secret ("HOST") lives on the root volume in ns 0;
@@ -2382,7 +2381,7 @@ static void mntiso_procfd_suite(void) {
     report("procfd_below_link_in_ns", nn_in_child(mi_procfd_below_link, 0));
     report("procfd_below_mask", nn_in_child(mi_procfd_below_mask, 0));
     report("procfd_host_sentinel_intact", mi_host_intact());
-=======
+
 
 /* ── lane mntiso-busy: mount roots are EBUSY, cross-mount ops EXDEV ── */
 static int mb_prep(void) {
@@ -2472,7 +2471,6 @@ static void chroot_ns_suite(void) {
     report("chroot_ns_dotdot_link", nn_in_child(cj_case, 1));
     report("chroot_ns_exec_through_link", nn_in_child(cj_case, 2));
     unlink("/root/mntiso-secret");
->>>>>>> main
 }
 
 int main(int argc, char **argv) {
