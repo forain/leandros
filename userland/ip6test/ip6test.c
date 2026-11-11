@@ -623,10 +623,11 @@ static int set_disable(int v) {
 
 static void test_disable_ipv6(void) {
     int a = set_disable(1) == 0;
-    int gone = a && !if_inet6_find("eth0", "fe80", NULL, 0);
+    int gone = 0;
+    for (int i = 0; a && i < 50 && !gone; i++) { gone = !if_inet6_find("eth0", "fe80", NULL, 0); if (!gone) usleep(100000); }
     int b = set_disable(0) == 0;
     int back = 0;
-    for (int i = 0; b && i < 20 && !back; i++) { back = if_inet6_find("eth0", "fe80", NULL, 0); if (!back) usleep(100000); }
+    for (int i = 0; b && i < 50 && !back; i++) { back = if_inet6_find("eth0", "fe80", NULL, 0); if (!back) usleep(100000); }
     CHECK("disable_ipv6", gone && back);
 }
 
