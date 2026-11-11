@@ -23,10 +23,13 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Pty background-child SIGHUP on su session end** unverified against Linux (?).
 
 ### Podman / namespaces / cgroups
+<<<<<<< HEAD
+- **`cgroup.freeze` is delegated but still a stub** (events say frozen, tasks keep running): `podman pause` is not real.
+=======
 - **`memfd` exe pin not inherited by fork** (?).
 - **nsfs bind inside a non-init mntns; self-binds not copied into a new mntns.**
+>>>>>>> main
 - **netns**: SETLINK move of an existing link; TCP over a tap in a netns (?).
-- **fchmod/fchown/futimens on fds of an ro mount** are not refused.
 - **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
 - **mntunshare is not an isolation boundary for root-run workloads** (M6).
 - **rename on devfs unsupported.**
