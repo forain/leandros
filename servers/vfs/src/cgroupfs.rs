@@ -163,7 +163,7 @@ pub fn lookup(pid: u32, path: &[u8]) -> Option<Node> {
     Some(match file { Some(f) => Node::File(cg, f), None => Node::Dir(cg) })
 }
 
-fn may_write(pid: u32, owner: u32) -> bool { sched::host_root_of(pid) || sched::fsuid_of(pid) == owner }
+fn may_write(pid: u32, owner: u32) -> bool { sched::caps::host_capable_of(pid, sched::caps::CAP_DAC_OVERRIDE) || sched::fsuid_of(pid) == owner }
 
 fn limit_text(v: u32, out: &mut String) {
     if v == UNLIMITED { out.push_str("max\n"); } else { push_u(out, v as u64); out.push('\n'); }
@@ -407,12 +407,12 @@ pub fn chown(pid: u32, path: &[u8], uid: u32, gid: u32) -> isize {
         Some(Node::File(c, _)) => {
             let (u, g) = cgroup::dir_owner(c);
             let same = (uid == u32::MAX || uid == u) && (gid == u32::MAX || gid == g);
-            return if same || sched::host_root_of(pid) { 0 } else { -1 };
+            return if same || sched::caps::host_capable_of(pid, sched::caps::CAP_CHOWN) { 0 } else { -1 };
         }
         Some(Node::Static(_)) => return -1,
         Some(Node::Dir(c)) => c,
     };
-    if !sched::host_root_of(pid) { 
+    if !sched::caps::host_capable_of(pid, sched::caps::CAP_CHOWN) { 
         let (u, g) = cgroup::dir_owner(cg);
         let same = (uid == u32::MAX || uid == u) && (gid == u32::MAX || gid == g);
         return if same { 0 } else { -1 };

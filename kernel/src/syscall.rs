@@ -2588,7 +2588,15 @@ fn dispatch_inner(
         // caller gets Linux's answer (EPERM — the capability check comes before
         // anything else there), root gets ENOSYS.
         ACCT | VHANGUP | SWAPON | SWAPOFF | KEXEC_LOAD => {
-            if !sched::host_root() { -1 } else { log_enosys(number) }
+            // Linux: acct/CAP_SYS_PACCT, vhangup/CAP_SYS_TTY_CONFIG, swapon+swapoff/CAP_SYS_ADMIN,
+            // kexec_load/CAP_SYS_BOOT, each in the initial user namespace.
+            let cap = match number {
+                ACCT => sched::caps::CAP_SYS_PACCT,
+                VHANGUP => sched::caps::CAP_SYS_TTY_CONFIG,
+                KEXEC_LOAD => sched::caps::CAP_SYS_BOOT,
+                _ => sched::caps::CAP_SYS_ADMIN,
+            };
+            if !sched::caps::host_capable(cap) { -1 } else { log_enosys(number) }
         }
         INIT_MODULE   => crate::kmod::sys::sys_init_module(a0, a1, a2),
         FINIT_MODULE  => crate::kmod::sys::sys_finit_module(a0, a1, a2),
@@ -5584,7 +5592,7 @@ fn sys_getppid() -> isize {
 /// asks ptrace_may_access).
 fn sys_get_robust_list(tid: usize, head_ptr: usize, len_ptr: usize) -> isize {
     let Ok(tid) = sched::pidns::from_cur(tid as u32) else { return -3 };
-    if tid != 0 && sched::tgid_of(tid) != sched::current_tgid() && !sched::host_root() {
+    if tid != 0 && sched::tgid_of(tid) != sched::current_tgid() && !sched::caps::host_capable(sched::caps::CAP_SYS_PTRACE) {
         return -1; // EPERM
     }
     let Some(head) = sched::robust::get(tid) else { return -3 }; // ESRCH
@@ -9543,7 +9551,7 @@ fn fstat_into(fd: usize, statbuf_ptr: usize, user_dest: bool) -> isize {
 /// owned by the initial user namespace, so that is host root only.
 fn may_mount() -> bool {
     let mntns = sched::current_mntns();
-    if mntns == 0 { return sched::host_root(); }
+    if mntns == 0 { return sched::caps::host_capable(sched::caps::CAP_SYS_ADMIN); }
     sched::caps::ns_capable_in(sched::ns::owner_user(mntns), 21)
 }
 
@@ -9622,7 +9630,7 @@ fn sys_mount(
     // caller's mount namespace. Non-host-root callers are only ever allowed
     // devpts (other types stay host-root until their userns story exists).
     if !may_mount() { return -1; } // EPERM
-    if !sched::host_root() && !devpts_mount { return -1; } // EPERM
+    if !sched::caps::host_capable(sched::caps::CAP_SYS_ADMIN) && !devpts_mount { return -1; } // EPERM
     // Propagation type changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE, +MS_REC):
     // only the mount's propagation state changes; source/fstype are ignored.
     // MS_BIND wins over propagation bits, as in Linux do_mount (Go netns bind passes both).
@@ -9895,7 +9903,7 @@ fn tree_src(dfd: usize, path_ptr: usize, empty_ok: bool) -> Result<TreeSrc, isiz
 
 /// ns 0 has no tree to clone or edit: the host namespace keeps its old answer
 /// (ENOSYS for host root, EPERM for everyone else).
-fn newmnt_ns0() -> isize { if sched::host_root() { -38 } else { -1 } }
+fn newmnt_ns0() -> isize { if sched::caps::host_capable(sched::caps::CAP_SYS_ADMIN) { -38 } else { -1 } }
 
 fn sys_open_tree(dfd: usize, path_ptr: usize, flags: usize) -> isize {
     const OPEN_TREE_CLONE: usize = 1;
@@ -11671,7 +11679,7 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
             let tgt = sched::tgid_of(pid);
             if tgt != sched::current_tgid() {
                 let c = sched::euid_of(current_pid());
-                if !sched::host_root() && c != sched::euid_of(tgt) { return -13; }
+                if !sched::caps::host_capable(sched::caps::CAP_SYS_PTRACE) && c != sched::euid_of(tgt) { return -13; }
             }
             let mut fd = 0usize;
             for &d in num_str { fd = fd * 10 + (d - b'0') as usize; }
@@ -11890,7 +11898,7 @@ fn proc_ns_link(p: &[u8]) -> Option<(u32, usize)> {
 fn proc_link_allowed(pid: u32) -> bool {
     let tgt = sched::tgid_of(pid);
     if tgt == sched::current_tgid() { return true; }
-    sched::host_root() || sched::euid_of(current_pid()) == sched::euid_of(tgt)
+    sched::caps::host_capable(sched::caps::CAP_SYS_PTRACE) || sched::euid_of(current_pid()) == sched::euid_of(tgt)
 }
 
 /// `proc_link_allowed` for the /proc/<pid>/{root,cwd} links, which are path
@@ -17743,7 +17751,7 @@ fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
         if want < 1 || want as u32 >= sched::PID_MAX { return -22; }
         // Linux: CAP_CHECKPOINT_RESTORE (or CAP_SYS_ADMIN) in the owning
         // user namespace.
-        if !sched::host_root() { return -1; }
+        if !(sched::caps::host_capable(sched::caps::CAP_CHECKPOINT_RESTORE) || sched::caps::host_capable(sched::caps::CAP_SYS_ADMIN)) { return -1; }
         Some(want as u32)
     } else { None };
     // Default handlers in the child: what the child of a fork that is about

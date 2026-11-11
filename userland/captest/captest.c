@@ -16,6 +16,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <time.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/mount.h>
+#include <netinet/in.h>
 #include <sys/time.h>
 
 #define V3 0x20080522
@@ -451,6 +455,68 @@ static int t_oom_score_adj(void)
     return 0;
 }
 
+/* capaudit: drop `cap` from the effective set only (the permitted set keeps it). */
+static int drop_cap(int cap)
+{
+    struct dat all[2]; if (cget(all) != 0) return -1;
+    struct dat d[2] = { { all[0].eff & ~(cap < 32 ? 1u << cap : 0), all[0].prm, 0 },
+                        { all[1].eff & ~(cap >= 32 ? 1u << (cap - 32) : 0), all[1].prm, 0 } };
+    return cset(d);
+}
+
+/* Full-cap root: the call is not refused (ENOSYS is fine). Dropped: EPERM. */
+#define NEEDS_CAP(name, cap, expr)                                       \
+static int name(void)                                                    \
+{                                                                        \
+    errno = 0; long r = (expr);                                          \
+    CHECK(!(r == -1 && errno == EPERM));                                 \
+    CHECK(drop_cap(cap) == 0);                                           \
+    errno = 0; r = (expr);                                               \
+    CHECK(r == -1 && errno == EPERM);                                    \
+    return 0;                                                            \
+}
+NEEDS_CAP(t_acct_needs_cap, 20, syscall(SYS_acct, NULL))
+NEEDS_CAP(t_vhangup_needs_cap, 26, syscall(SYS_vhangup))
+NEEDS_CAP(t_swapoff_needs_cap, 21, syscall(SYS_swapoff, "/nonexistent"))
+NEEDS_CAP(t_mount_needs_cap, 21, mount("none", "/tmp", "tmpfs", MS_REMOUNT | MS_BIND, ""))
+
+static int t_net_raw_needs_cap(void)
+{
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    CHECK(fd >= 0);
+    close(fd);
+    CHECK(drop_cap(13) == 0);
+    errno = 0; fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    CHECK(fd == -1 && errno == EPERM);
+    return 0;
+}
+
+/* A uid-1000 child: root needs CAP_KILL to signal it, CAP_SYS_PTRACE to read its /proc links. */
+static int with_victim(int cap, int proc_link)
+{
+    int p[2]; CHECK(pipe(p) == 0);
+    pid_t c = fork();
+    if (c == 0) {
+        if (setresuid(1000, 1000, 1000) != 0) _exit(2);
+        char ok = 'x'; write(p[1], &ok, 1);
+        pause(); _exit(0);
+    }
+    char b; CHECK(read(p[0], &b, 1) == 1);
+    char path[64]; snprintf(path, sizeof path, "/proc/%d/exe", (int)c);
+    char tgt[128];
+    int full = proc_link ? (readlink(path, tgt, sizeof tgt) >= 0) : (kill(c, 0) == 0);
+    CHECK(full);
+    CHECK(drop_cap(cap) == 0);
+    errno = 0;
+    int r = proc_link ? (int)readlink(path, tgt, sizeof tgt) : kill(c, 0);
+    int e = errno;
+    kill(c, SIGKILL); /* may fail while the cap is dropped; the parent reaps via exit of this test */
+    CHECK(r == -1 && (proc_link ? (e == EACCES || e == EPERM) : e == EPERM));
+    return 0;
+}
+static int t_kill_needs_cap(void) { return with_victim(5, 0); }
+static int t_ptrace_link_needs_cap(void) { return with_victim(19, 1); }
+
 struct tc { const char *n; int (*f)(void); };
 int main(int argc, char **argv)
 {
@@ -475,6 +541,10 @@ int main(int argc, char **argv)
         { "subreaper_flag", t_subreaper_flag }, { "orphan_to_init", t_orphan_to_init },
         { "orphan_to_subreaper", t_orphan_to_subreaper }, { "keyctl_enosys", t_keyctl_enosys },
         { "personality", t_personality }, { "rlimits", t_rlimits }, { "oom_score_adj", t_oom_score_adj },
+        { "acct_needs_cap", t_acct_needs_cap }, { "vhangup_needs_cap", t_vhangup_needs_cap },
+        { "swapoff_needs_cap", t_swapoff_needs_cap }, { "mount_needs_cap", t_mount_needs_cap },
+        { "net_raw_needs_cap", t_net_raw_needs_cap }, { "kill_needs_cap", t_kill_needs_cap },
+        { "ptrace_link_needs_cap", t_ptrace_link_needs_cap },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
         pid_t c = fork();

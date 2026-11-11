@@ -4121,11 +4121,12 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         }
         _                 => return err_reply(-97),
     }
-    // SOCK_RAW needs CAP_NET_RAW (root) — EPERM. An unprivileged ping uses
+    // SOCK_RAW needs CAP_NET_RAW over the netns owner's userns (Linux ns_capable) — EPERM. An unprivileged ping uses
     // SOCK_DGRAM/IPPROTO_ICMP instead, which Linux allows for every group in
     // net.ipv4.ping_group_range (all of them on common distributions) and
     // which lands on the same ICMP socket below.
-    if domain == AF_INET && sock_type & 0xf == SOCK_RAW && !sched::host_root_of(pid) {
+    if domain == AF_INET && sock_type & 0xf == SOCK_RAW
+        && !sched::caps::ns_capable_in_of(pid, sched::ns::owner_userns(1, sched::ns::netns_of(pid)), sched::caps::CAP_NET_RAW) {
         return err_reply(-1);
     }
     // net.ipv4.ping_group_range of the caller's netns gates SOCK_DGRAM ICMP.
