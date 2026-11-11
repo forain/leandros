@@ -1,7 +1,5 @@
-//! Memory allocation — bump allocator using sys_brk (Stage 1).
-//!
-//! Stage 2 will replace this with a proper free-list allocator.
-//! `free` and `realloc`-shrink are no-ops; memory is never returned to the OS.
+//! Memory allocation — program-break allocator with size-binned free lists.
+//! Freed blocks are reused; memory is never returned to the OS.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::syscall::{nr, syscall1};
@@ -23,52 +21,119 @@ unsafe fn heap_init() -> usize {
     start
 }
 
-/// Allocate `size` bytes. Returns a 16-byte-aligned pointer, or NULL on OOM.
+/// Bytes of block (header included) are always a multiple of 16. The header
+/// word holds the block's usable capacity (block size - 8).
+const SMALL_MAX: usize = 4096;                 // exact-size bins up to here
+const NBINS: usize = SMALL_MAX / 16 + 1;
+
+struct FreeLists {
+    bins: [usize; NBINS],   // head of singly linked list per block size / 16
+    large: usize,           // single list for blocks > SMALL_MAX
+}
+
+static LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static mut FREE: FreeLists = FreeLists { bins: [0; NBINS], large: 0 };
+
+fn lock() {
+    while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+}
+fn unlock() { LOCK.store(false, Ordering::Release); }
+
+/// Allocate `size` bytes. Returns a pointer, or NULL on OOM. Freed blocks are
+/// reused: exact-size bins for small blocks, first fit (at most 2x oversize)
+/// for large ones; fresh memory comes from the program break.
 #[no_mangle]
 pub unsafe extern "C" fn malloc(size: size_t) -> *mut u8 {
     if size == 0 { return core::ptr::null_mut(); }
-    // Round up to 16-byte alignment; prepend an 8-byte size header.
-    let alloc_size = (size + 8 + 15) & !15;
+    let alloc_size = match size.checked_add(8 + 15) {
+        Some(v) => v & !15,
+        None => { crate::errno::set_errno(crate::errno::ENOMEM); return core::ptr::null_mut(); }
+    };
+    lock();
+    let free = &mut *core::ptr::addr_of_mut!(FREE);
+    if alloc_size <= SMALL_MAX {
+        let head = free.bins[alloc_size / 16];
+        if head != 0 {
+            free.bins[alloc_size / 16] = *((head + 8) as *const usize);
+            unlock();
+            return (head + 8) as *mut u8;
+        }
+    } else {
+        let mut prev: *mut usize = &mut free.large;
+        let mut cur = free.large;
+        while cur != 0 {
+            let blk = *(cur as *const usize) + 8;
+            if blk >= alloc_size && blk <= alloc_size * 2 {
+                *prev = *((cur + 8) as *const usize);
+                unlock();
+                return (cur + 8) as *mut u8;
+            }
+            prev = (cur + 8) as *mut usize;
+            cur = *prev;
+        }
+    }
     let mut ptr = HEAP_PTR.load(Ordering::Relaxed);
     if ptr == 0 { ptr = heap_init(); }
     let new_ptr = ptr + alloc_size;
     let actual  = brk(new_ptr);
     if actual < new_ptr {
+        unlock();
         crate::errno::set_errno(crate::errno::ENOMEM);
         return core::ptr::null_mut();
     }
-    // Store size before the returned pointer for realloc/free.
-    *(ptr as *mut usize) = size;
+    // Header = usable capacity, needed by realloc/free.
+    *(ptr as *mut usize) = alloc_size - 8;
     HEAP_PTR.store(actual, Ordering::Relaxed);
+    unlock();
     (ptr + 8) as *mut u8
 }
 
 /// Allocate `size` zero-initialised bytes.
 #[no_mangle]
 pub unsafe extern "C" fn calloc(nmemb: size_t, size: size_t) -> *mut u8 {
-    let total = nmemb.checked_mul(size).unwrap_or(0);
+    let total = match nmemb.checked_mul(size) { Some(t) => t, None => {
+        crate::errno::set_errno(crate::errno::ENOMEM);
+        return core::ptr::null_mut();
+    } };
     let p = malloc(total);
     if !p.is_null() { memset(p, 0, total); }
     p
 }
 
-/// Resize an allocation.  For Stage 1, grow-only: allocates fresh and copies.
+/// Resize an allocation: in place when the block is already big enough,
+/// otherwise allocate, copy and free the old block.
 #[no_mangle]
 pub unsafe extern "C" fn realloc(ptr: *mut u8, new_size: size_t) -> *mut u8 {
     if ptr.is_null() { return malloc(new_size); }
-    let old_size = *((ptr as usize - 8) as *const usize);
-    if new_size <= old_size { return ptr; } // shrink: no-op
+    let old_cap = *((ptr as usize - 8) as *const usize);
+    if new_size <= old_cap { return ptr; }
     let new_ptr = malloc(new_size);
     if !new_ptr.is_null() {
-        memcpy(new_ptr, ptr, old_size);
-        // free(ptr) is a no-op in Stage 1, so we don't bother.
+        memcpy(new_ptr, ptr, old_cap);
+        free(ptr);
     }
     new_ptr
 }
 
-/// No-op for Stage 1 bump allocator.
+/// Return a block to its free list.
 #[no_mangle]
-pub unsafe extern "C" fn free(_ptr: *mut u8) {}
+pub unsafe extern "C" fn free(ptr: *mut u8) {
+    if ptr.is_null() { return; }
+    let blk = ptr as usize - 8;
+    let alloc_size = *(blk as *const usize) + 8;
+    lock();
+    let free = &mut *core::ptr::addr_of_mut!(FREE);
+    let head: *mut usize = if alloc_size <= SMALL_MAX {
+        &mut free.bins[alloc_size / 16]
+    } else {
+        &mut free.large
+    };
+    *((blk + 8) as *mut usize) = *head;
+    *head = blk;
+    unlock();
+}
 
 // ── Global Allocator ─────────────────────────────────────────────────────────
 

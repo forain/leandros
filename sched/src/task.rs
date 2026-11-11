@@ -631,6 +631,9 @@ pub struct Task {
     /// `Stopped` from another CPU (its registers are still live), so the
     /// flag carries the request to the point where it stops running.
     pub stop_pending: bool,
+    /// Held by the cgroup freezer (`cgroup.freeze`): like `stop_pending`, but
+    /// invisible to the parent and not undone by SIGCONT; SIGKILL still wins.
+    pub frozen: bool,
     /// Thread-group leader only: the signal that stopped the group, or 0
     /// while it is running. `wait4(WUNTRACED)` reports it as `WSTOPSIG`.
     pub stop_signal: u8,
@@ -945,6 +948,7 @@ impl Task {
             vfork_pending: false,
             mm_borrowed: false,
             stop_pending: false,
+            frozen: false,
             stop_signal: 0,
             stop_reported: false,
             cont_pending: false,
@@ -1244,6 +1248,8 @@ impl Task {
         // Job-control state: a kernel task is never stopped.
         let stop_pending_ptr = (dest as usize + core::mem::offset_of!(Task, stop_pending)) as *mut bool;
         core::ptr::write_volatile(stop_pending_ptr, false);
+        let frozen_ptr = (dest as usize + core::mem::offset_of!(Task, frozen)) as *mut bool;
+        core::ptr::write_volatile(frozen_ptr, false);
         let stop_signal_ptr = (dest as usize + core::mem::offset_of!(Task, stop_signal)) as *mut u8;
         core::ptr::write_volatile(stop_signal_ptr, 0);
         let stop_reported_ptr = (dest as usize + core::mem::offset_of!(Task, stop_reported)) as *mut bool;
@@ -1388,6 +1394,7 @@ impl Task {
             vfork_pending: false,
             mm_borrowed: false,
             stop_pending: false,
+            frozen: false,
             stop_signal: 0,
             stop_reported: false,
             cont_pending: false,

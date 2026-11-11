@@ -199,9 +199,9 @@ pub fn read(cg: CgId, f: F) -> Vec<u8> {
         F::Type => s.push_str("domain\n"),
         F::Events => {
             s.push_str(if cgroup::populated(cg) { "populated 1\n" } else { "populated 0\n" });
-            // cgroup.freeze is a recorded request, not scheduler enforcement:
-            // cgroup.events reports it as `frozen 1` (see freeze_requested).
-            s.push_str(if freeze_requested(cg) { "frozen 1\n" } else { "frozen 0\n" });
+            // `frozen 1` only once the freeze was requested and every task of
+            // the subtree is actually parked (Linux cgroup.events semantics).
+            s.push_str(if freeze_requested(cg) && frozen_all(cg) { "frozen 1\n" } else { "frozen 0\n" });
         }
         F::PidsCurrent => { push_u(&mut s, cgroup::subtree_tasks(cg) as u64); s.push('\n'); }
         F::PidsMax => limit_text(cgroup::pids_max(cg), &mut s),
@@ -213,6 +213,17 @@ pub fn read(cg: CgId, f: F) -> Vec<u8> {
         },
     }
     s.into_bytes()
+}
+
+fn frozen_all(cg: CgId) -> bool {
+    cgroup::subtree_tgids(cg).into_iter().all(sched::group_all_stopped)
+}
+
+/// Apply the cgroup's freeze state to every process of its subtree.
+fn apply_freeze(cg: CgId, on: bool) {
+    for t in cgroup::subtree_tgids(cg) {
+        if on { sched::freeze_group(t) } else { sched::thaw_group(t) }
+    }
 }
 
 fn freeze_requested(cg: CgId) -> bool {
@@ -278,6 +289,7 @@ pub fn write(pid: u32, cg: CgId, f: F, data: &[u8]) -> isize {
             if !ok { return -22; }
             let mut v = String::from(t); v.push('\n');
             KNOBS.lock().insert((cg, f as u8), v);
+            if f == F::Freeze { apply_freeze(cg, t == "1"); }
             0
         }
         F::Kill => {
