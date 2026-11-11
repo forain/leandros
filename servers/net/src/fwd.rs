@@ -361,6 +361,9 @@ fn sweep(st: &mut St, now: u64) {
 pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
     if !USED.load(Ordering::Relaxed) || buf.len() < 34 { return false; }
     if buf[12] == 0x08 && buf[13] == 0x06 { arp_learn(nic, buf); return false; }
+    if buf[12] == 0x08 && buf[13] == 0x00 && buf[23] == PROTO_ICMP && icmp_error_type(buf) {
+        return icmp_error_rx(nic, buf);
+    }
     if buf[12] != 0x08 || buf[13] != 0x00 || (buf[23] != PROTO_UDP && buf[23] != PROTO_ICMP && buf[23] != PROTO_TCP) { return false; }
     let mut st = FWD.lock();
     if st.ct.is_empty() { return false; }
@@ -379,6 +382,65 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
     if p.proto != PROTO_ICMP { f[o + 2..o + 4].copy_from_slice(&cport.to_be_bytes()); }
     else { f[o + 4..o + 6].copy_from_slice(&cport.to_be_bytes()); }
     finish(&mut f, &p);
+    f[0..6].copy_from_slice(&cmac);
+    f[6..12].copy_from_slice(&bmac);
+    if st.inq.len() < 256 { st.inq.push_back((br, port, f)); INQ_N.fetch_add(1, Ordering::Relaxed); }
+    drop(st);
+    drivers::netdev::kick();
+    true
+}
+
+/// True for an ICMP destination-unreachable / time-exceeded / parameter-problem
+/// message in an IPv4 frame (the ones that quote the datagram that caused them).
+fn icmp_error_type(b: &[u8]) -> bool {
+    let ihl = (b[14] & 15) as usize * 4;
+    b.len() >= 14 + ihl + 1 && matches!(b[14 + ihl], 3 | 11 | 12)
+}
+
+/// Un-NAT an ICMP error that quotes a forwarded flow (RFC 5508): the quoted
+/// header names NIC address + NAT port as the source, which is looked up in
+/// conntrack and rewritten to the container, as are the outer destination and
+/// both checksums. True = taken (also when dropped); false = not ours.
+fn icmp_error_rx(nic: u8, buf: &[u8]) -> bool {
+    let ihl = (buf[14] & 15) as usize * 4;
+    let tot = u16::from_be_bytes([buf[16], buf[17]]) as usize;
+    if ihl < 20 || tot < ihl + 8 + 20 || 14 + tot > buf.len() { return false; }
+    if u16::from_be_bytes([buf[20], buf[21]]) & 0x3fff != 0 { return false; }
+    let i = 14 + ihl + 8; // quoted IP header
+    if buf[i] >> 4 != 4 { return false; }
+    let iihl = (buf[i] & 15) as usize * 4;
+    if iihl < 20 || 14 + tot < i + iihl + 8 { return false; }
+    let proto = buf[i + 9];
+    if proto != PROTO_UDP && proto != PROTO_TCP && proto != PROTO_ICMP { return false; }
+    let qsrc = [buf[i + 12], buf[i + 13], buf[i + 14], buf[i + 15]];
+    let qdst = [buf[i + 16], buf[i + 17], buf[i + 18], buf[i + 19]];
+    let l = i + iihl;
+    let (qsport, qdport) = if proto == PROTO_ICMP {
+        let id = u16::from_be_bytes([buf[l + 4], buf[l + 5]]);
+        (id, 0)
+    } else {
+        (u16::from_be_bytes([buf[l], buf[l + 1]]), u16::from_be_bytes([buf[l + 2], buf[l + 3]]))
+    };
+    let mut st = FWD.lock();
+    let now = sched::monotonic_ns();
+    let Some(e) = st.ct.iter_mut().find(|e| e.nic == nic && e.proto == proto && e.nicip == qsrc && e.nat == qsport
+        && e.rip == qdst && (proto == PROTO_ICMP || e.rport == qdport)) else { return false };
+    if buf[30..34] != e.nicip { return false; }
+    e.last = now;
+    let (cip, cport, cmac, bmac, br, port) = (e.cip, e.cport, e.cmac, e.bmac, e.br, e.port);
+    let mut f = buf[..14 + tot].to_vec();
+    if f[22] <= 1 { return true; }
+    f[22] -= 1;
+    f[30..34].copy_from_slice(&cip);
+    f[i + 12..i + 16].copy_from_slice(&cip);
+    if proto == PROTO_ICMP { f[l + 4..l + 6].copy_from_slice(&cport.to_be_bytes()); }
+    else { f[l..l + 2].copy_from_slice(&cport.to_be_bytes()); }
+    // Quoted IP header checksum, then the ICMP message, then the outer header.
+    f[i + 10] = 0; f[i + 11] = 0;
+    let c = fold(sum(&f[i..i + iihl], 0));
+    f[i + 10..i + 12].copy_from_slice(&c.to_be_bytes());
+    icmp_csum(&mut f, ihl, tot - ihl);
+    ip_csum(&mut f, ihl);
     f[0..6].copy_from_slice(&cmac);
     f[6..12].copy_from_slice(&bmac);
     if st.inq.len() < 256 { st.inq.push_back((br, port, f)); INQ_N.fetch_add(1, Ordering::Relaxed); }
