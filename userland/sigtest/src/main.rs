@@ -251,6 +251,11 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
                 puts(b"--- sigtest futex done ---\n\0".as_ptr());
                 return failures;
             }
+            b"wuntr" => {
+                if !test_wuntraced_stop_prompt() { failures += 1; }
+                puts(b"--- sigtest wuntr done ---\n\0".as_ptr());
+                return failures;
+            }
             b"stoprem" => {
                 if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
                 puts(b"--- sigtest stoprem done ---\n\0".as_ptr());
@@ -317,6 +322,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if !test_futex_ignored_signal_keeps_waiting() { failures += 1; }
     if !test_futex_timed_signal_stress(5) { failures += 1; }
     if !test_futex_wait_bitset_signal() { failures += 1; }
+    if !test_wuntraced_stop_prompt() { failures += 1; }
     if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
     if !test_ppoll_pselect_sigmask() { failures += 1; }
     if !test_stack_overflow_sigsegv_on_altstack() { failures += 1; }
@@ -1860,6 +1866,38 @@ unsafe fn test_futex_wait_bitset_signal() -> bool {
 ///     >= 700 also proves the stop really took effect.
 /// nanosleep used to fail with EINTR at the continue instead (Linux has
 /// restarted it since 2.6.24); ppoll/pselect6 likewise.
+/// waitpid(WUNTRACED) must report a SIGSTOPped child promptly (Linux: within
+/// ms). Covers a child spinning in userland and one blocked in nanosleep.
+unsafe fn test_wuntraced_stop_prompt() -> bool {
+    let name = b"wuntraced_stop_prompt\0";
+    let mut ok = true;
+    for which in 0..2 {
+        for _ in 0..3 {
+            let child = fork();
+            if child == 0 {
+                if which == 0 { loop { core::hint::spin_loop(); } }
+                let ts = timespec { tv_sec: 5, tv_nsec: 0 };
+                syscall(nr::NANOSLEEP, &ts as *const timespec as c_long, 0 as c_long);
+                _exit(0);
+            }
+            sleep_ms(50);
+            let t0 = now_ns();
+            kill(child, SIGSTOP);
+            let mut st = 0;
+            let r = waitpid(child, &mut st, 2);
+            let el_ms = (now_ns() - t0) / 1_000_000;
+            let c = r == child && (st & 0xff) == 0x7f && el_ms < 300;
+            write(1, b"  wuntraced which=".as_ptr(), 18); put_i32(which);
+            write(1, b" el_ms=".as_ptr(), 7); put_i32(el_ms as i32);
+            write(1, if c { b" ok\n".as_ptr() } else { b" BAD\n".as_ptr() }, if c { 4 } else { 5 });
+            ok &= c;
+            kill(child, SIGKILL);
+            waitpid(child, &mut st, 0);
+        }
+    }
+    report(name, ok)
+}
+
 unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
     let name = b"timed_wait_stop_resumes_remainder\0";
     // SIGCHLD at SIG_DFL: the child's exit must not end the wait with a
