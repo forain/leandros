@@ -112,6 +112,20 @@ static void test_v4_listener_no_v6(void) {
     close(c); close(l);
 }
 
+static void test_bind_family_aware(void) {
+    int a = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in v4 = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_ANY) }, got;
+    socklen_t gl = sizeof got;
+    int ok = a >= 0 && bind(a, (struct sockaddr *)&v4, sizeof v4) == 0 &&
+             getsockname(a, (struct sockaddr *)&got, &gl) == 0;
+    int b = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 t = lo6(ntohs(got.sin_port));
+    int r = ok && b >= 0 ? bind(b, (struct sockaddr *)&t, sizeof t) : -1;
+    CHECK("bind_family_aware", ok && r == 0);
+    if (a >= 0) close(a);
+    if (b >= 0) close(b);
+}
+
 static void test_unreach6(void) {
     int s = socket(AF_INET6, SOCK_DGRAM, 0);
     struct sockaddr_in6 a; memset(&a, 0, sizeof a);
@@ -137,6 +151,7 @@ int main(void) {
     test_tcp6_lo_echo();
     test_udp6_lo();
     test_v4_listener_no_v6();
+    test_bind_family_aware();
     printf("ip6test: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }

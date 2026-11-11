@@ -1857,6 +1857,19 @@ fn stack_holding(ns: u16, ip: IpAddress) -> Option<Sid> {
 /// that is listening. Holders of the same description (dup, fork) are the
 /// same socket. Caller holds SOCK_TABLES; this takes stack locks (the
 /// documented order) for the address of a connected socket, and SOCK_OPTS.
+/// Do two bound addresses claim a common local address? Within a family a wildcard
+/// overlaps everything; across families only a v6 wildcard (dual-stack `::`) reaches
+/// the v4 side, so 0.0.0.0:P and [::1]:P coexist (Linux, bindv6only=0).
+fn bind_addrs_overlap(a: IpAddress, b: IpAddress) -> bool {
+    match (a, b) {
+        (IpAddress::Ipv4(_), IpAddress::Ipv4(_)) | (IpAddress::Ipv6(_), IpAddress::Ipv6(_)) => {
+            a.is_unspecified() || b.is_unspecified() || a == b
+        }
+        (IpAddress::Ipv6(_), _) => a.is_unspecified(),
+        (_, IpAddress::Ipv6(_)) => b.is_unspecified(),
+    }
+}
+
 fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, port: u16) -> bool {
     let tcp = me.sock_type == SOCK_STREAM as u8;
     // A port a NAT flow (fwd.rs) holds on the host's NIC address is taken. FWD is a leaf lock.
@@ -1885,7 +1898,7 @@ fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, por
                 }
                 _ => continue,
             };
-            if !(addr.is_unspecified() || ip.is_unspecified() || addr == ip) { continue; }
+            if !bind_addrs_overlap(addr, ip) { continue; }
             if my_reuseport && sock_opts(e.ofd).reuseport && sched::euid_of(t.pid) == my_uid { continue; }
             if me.reuseaddr && e.reuseaddr && !(tcp && listening) { continue; }
             return true;
