@@ -5603,7 +5603,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                     if err != 0 { return err_reply(-(err as i32)); }
                     // A datagram the send buffer can never hold: EMSGSIZE, not
                     // an EAGAIN that never clears (a blocking sender hung).
-                    if data.len() > cap { return err_reply(-90); }
+                    if data.len() > cap || data.len() > UDP_MAX_PAYLOAD { return err_reply(-90); }
                     let mcast = endpoint.addr.is_multicast();
                     let mut meta = smoltcp::socket::udp::UdpMetadata::from(endpoint);
                     meta.hop_limit = if mcast { Some(opts.mc_ttl) }
