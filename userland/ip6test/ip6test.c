@@ -1,10 +1,15 @@
 // ip6test: AF_INET6 on the loopback (lane ip6lo, L1 of design-ipv6).
 // Builds for the host too (cc ip6test.c) to confirm the expectations on Linux.
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <net/if.h>
+#include <sched.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -266,6 +271,71 @@ static int banner(const char *addr, int port) {
     return 0;
 }
 
+// ── v6 / v4-mapped TCP inside a non-initial netns (lane ip6nswake) ───────────
+// Peer writes then closes; the client must see POLLIN, the data, EOF
+// (the net poll does not report POLLRDHUP for TCP, in any netns).
+// mode: 0 v6 client -> dual [::] server (::ffff:127.0.0.1), 1 v4 client -> dual
+// server, 4 v4/v4 baseline, 2 v6 client -> v4 server (mapped), 3 v6 client -> [::1] server.
+static int ns6_body(int mode) {
+    if (unshare(CLONE_NEWNET) != 0) return 2;
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo"); q.ifr_flags = IFF_UP | IFF_RUNNING;
+    if (u < 0 || ioctl(u, SIOCSIFFLAGS, &q) != 0) return 3;
+    close(u);
+    int port = 47400 + mode;
+    int v4s = mode == 2 || mode == 4;
+    int l = socket(v4s ? AF_INET : AF_INET6, SOCK_STREAM, 0);
+    if (l < 0) return 4;
+    tmo(l, 3);
+    if (v4s) {
+        struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons(port);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(l, (struct sockaddr *)&a, sizeof a)) return 5;
+    } else {
+        struct sockaddr_in6 a; memset(&a, 0, sizeof a); a.sin6_family = AF_INET6; a.sin6_port = htons(port);
+        if (mode == 3) a.sin6_addr = in6addr_loopback;
+        if (bind(l, (struct sockaddr *)&a, sizeof a)) return 5;
+    }
+    if (listen(l, 4)) return 6;
+    int c = socket(mode == 1 || mode == 4 ? AF_INET : AF_INET6, SOCK_STREAM, 0);
+    if (c < 0) return 7;
+    tmo(c, 3);
+    int rc;
+    if (mode == 1 || mode == 4) {
+        struct sockaddr_in d; memset(&d, 0, sizeof d); d.sin_family = AF_INET; d.sin_port = htons(port);
+        d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        rc = connect(c, (struct sockaddr *)&d, sizeof d);
+    } else {
+        struct sockaddr_in6 d; memset(&d, 0, sizeof d); d.sin6_family = AF_INET6; d.sin6_port = htons(port);
+        if (mode == 3) d.sin6_addr = in6addr_loopback; else inet_pton(AF_INET6, "::ffff:127.0.0.1", &d.sin6_addr);
+        rc = connect(c, (struct sockaddr *)&d, sizeof d);
+    }
+    if (rc) return 8;
+    int a = accept(l, NULL, NULL);
+    if (a < 0) return 9;
+    if (write(a, "hi", 2) != 2) return 10;
+    close(a);
+    struct pollfd p = { .fd = c, .events = POLLIN };
+    int pr = poll(&p, 1, 3000);
+    if (pr != 1) return 11;
+    if (!(p.revents & POLLIN)) return 14;
+    char b[8];
+    if (read(c, b, sizeof b) != 2) return 12;
+    if (read(c, b, sizeof b) != 0) return 13;
+    return 0;
+}
+
+static void test_netns_v6_tcp(void) {
+    static const char *nm[] = { "ns_v6_to_dual", "ns_v4_to_dual", "ns_v6_to_v4", "ns_v6_loopback", "ns_v4_baseline" };
+    for (int m = 0; m < 5; m++) {
+        pid_t k = fork();
+        if (k == 0) _exit(ns6_body(m));
+        int st = 0; waitpid(k, &st, 0);
+        errno = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        CHECK(nm[m], WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc >= 4 && !strcmp(argv[1], "banner")) return banner(argv[2], atoi(argv[3]));
     test_socket6();
@@ -282,6 +352,7 @@ int main(int argc, char **argv) {
     test_v6only_after_bind();
     test_mapped_connect_v6only();
     test_udp_dual();
+    test_netns_v6_tcp();
     printf("ip6test: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }

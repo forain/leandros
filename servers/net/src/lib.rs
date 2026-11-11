@@ -4139,12 +4139,6 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         AF_UNIX | AF_INET => {}
         // TCP and UDP only until ICMPv6/raw sockets land (L3).
         AF_INET6 => {
-            // A non-initial netns has no IPv6 yet (no v6 route or address on its
-            // stacks), so AF_INET6 stays EAFNOSUPPORT there, as before ip6lo. A
-            // library that probes for v6 (passt/pasta in a rootless container's
-            // netns) then stays on AF_INET; with v6 sockets allowed its tcp
-            // relay stalled (pastafix 2026-11-11, open: TODO).
-            if sched::ns::netns_of(pid) != 0 { return err_reply(-97); }
             let t = sock_type & 0xf;
             if t != SOCK_STREAM && t != SOCK_DGRAM { return err_reply(-93); }
             if protocol != 0 && !(t == SOCK_STREAM && protocol == 6) && !(t == SOCK_DGRAM && protocol == 17) {
@@ -5419,7 +5413,13 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
     // Gate on the SOCKET's own domain and captured netns, never on the user
     // sa_family (which a sibling thread can flip, or which can simply lie).
     // Folded into this read: one table lock per send.
-    if tbl.socks[slot].netns() != 0 && tbl.socks[slot].domain == 10 {
+    // A non-initial netns stack is v4-only. A connected AF_INET6 stream there can
+    // only be a v4-mapped flow (connect refuses a real v6 peer), so its sends are
+    // ordinary IPv4 and pass; the refusal keeps to datagram / unconnected sends,
+    // whose destination may be a genuine v6 address (ip6nswake).
+    let v4_mapped_stream = tbl.socks[slot].sock_type == SOCK_STREAM as u8
+        && matches!(tbl.socks[slot].state, SockState::InetConnected { .. });
+    if tbl.socks[slot].netns() != 0 && tbl.socks[slot].domain == 10 && !v4_mapped_stream {
         let e = &tbl.socks[slot];
         let dom = if matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) { Some(2u8) }
                   else if e.domain == 2 || e.domain == 10 { Some(e.domain) } else { None };
