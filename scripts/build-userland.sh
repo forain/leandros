@@ -175,6 +175,10 @@ if command -v zig >/dev/null 2>&1; then
     # conmontest: syscall sequences conmon performs at start (lane conmondbg).
     echo "[userland] Building conmontest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/conmontest" userland/conmontest/conmontest.c
+    # exitracetest: reaped-pid and rename visibility to a freshly exec'd process (lane exitrace).
+    echo "[userland] Building exitracetest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/exitracetest" userland/exitracetest/exitracetest.c
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/exitwrap" userland/exitracetest/exitwrap.c
     # suspendtest: one freeze-only device suspend/resume cycle (kernel pm).
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/suspendtest" userland/suspendtest/suspendtest.c
     # kexec: kexec-tools style front end (-l/-u/-e) over kexec_file_load + reboot(KEXEC).
