@@ -937,6 +937,10 @@ impl<F: Fwil> Brcmf<F> {
         self.set_u32(cmd::UP, 1)?;
         self.radio_on = true;
         if let Err(e) = self.set_u32(cmd::SET_INFRA, 1) { self.log(&alloc::format!("infra 1 refused: {:?}", e)); }
+        // The firmware drops group-addressed frames not in its mcast_list:
+        // accept all (mDNS 224.0.0.251, IPv6 ND/RA 33:33:xx), as the other
+        // NIC drivers do; the net server filters by joined group.
+        if let Err(e) = self.iovar_u32("allmulti", 1) { self.log(&alloc::format!("allmulti 1 refused: {:?}", e)); }
         Ok(self.mac)
     }
 
