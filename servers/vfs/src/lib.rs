@@ -15073,9 +15073,12 @@ fn host_root_of(pid: u32) -> bool {
 /// permitted set when the real uid is the namespace root, else none.
 fn cred_with_ns(c: xattr::Cred, pid: u32, real: bool) -> xattr::Cred {
     let ns = sched::ns::userns_of(pid);
-    if ns == 0 { return c; }
-    let sv = sched::ns::view_of_ns(ns);
-    let v = xattr::IdView { ns: sv.ns, n: sv.n, ext: sv.ext };
+    // Unknown pid (boot-time mount path): keep the kernel-private `Cred::new`.
+    if ns == 0 && sched::caps::caps_of(pid).is_none() { return c; }
+    let v = if ns == 0 { xattr::IdView::HOST } else {
+        let sv = sched::ns::view_of_ns(ns);
+        xattr::IdView { ns: sv.ns, n: sv.n, ext: sv.ext }
+    };
     let caps = match sched::caps::caps_of(pid) {
         Some(cs) if !real || sched::euid_of(pid) == c.euid => cs[0],
         Some(cs) if sched::ns::root_k(ns) == Some(c.euid) => cs[1],
