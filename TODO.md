@@ -37,7 +37,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ### Network
 - **No IPv6 / AF_INET6** (sshd `[::]:22` fails with EAFNOSUPPORT; podman IPv6 deferred).
 - **UDP/IP gaps**: no PMTUD, no IGMPv3/SSM, no IP fragmentation/reassembly (?), `connect(AF_UNSPEC)` quirks (UDP keeps bind(0) port; TCP takes the AF_UNIX path).
-- **Real NIC drivers program no multicast filter** (mDNS works only in QEMU).
+- ~~**Real NIC drivers program no multicast filter**~~ FIXED 2026-11-11 (lane/nicmcast): macb, e1000e, r8169, iwlwifi already accepted all multicast; brcmf (Pi Wi-Fi) now sets `allmulti` (Pi wifi0 rx of 30 mDNS-group datagrams: +5 before, +37 after). Pass-all, no per-group list. See artifacts/notes/lane-nicmcast-2026-11-11.md.
 - **Inet listeners report no tag**, so sshd parks with a broadcast mask.
 - **iwlwifi gaps**: later-beacon WMM changes ignored, STATISTICS_NOTIFICATION ignored, antennas only toggled on failure; TX MIMO/STBC/short GI on 5 GHz untested; 2.4 GHz poor (36% AP retries); sparse pings lose 1-4%.
 - **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
