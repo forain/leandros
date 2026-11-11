@@ -37,6 +37,10 @@ type size_t = usize;
 type ssize_t = isize;
 
 const AF_INET:      c_int = 2;
+const AF_INET6:     c_int = 10;
+const IPPROTO_ICMPV6: c_int = 58;
+const ICMP6_ECHO_REQUEST: u8 = 128;
+const ICMP6_ECHO_REPLY:   u8 = 129;
 const SOCK_RAW:     c_int = 3;
 const SOCK_DGRAM:   c_int = 2;
 const IPPROTO_ICMP: c_int = 1;
@@ -164,7 +168,7 @@ fn parse_uint(s: &[u8]) -> Option<u64> {
 }
 
 unsafe fn usage() -> i32 {
-    write_str(b"usage: ping [-c count] [-W timeout_s] [-i interval_s] <ipv4-address>\n");
+    write_str(b"usage: ping [-4|-6] [-c count] [-W timeout_s] [-i interval_s] <ip-address>\n");
     2
 }
 
@@ -193,6 +197,59 @@ fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
     if !have_digit || idx != 3 { return None; }
     octets[3] = cur as u8;
     Some(octets)
+}
+
+// An IPv6 literal: hex groups with at most one `::` (no embedded IPv4, no scope).
+fn parse_ipv6(s: &[u8]) -> Option<[u8; 16]> {
+    let mut head = [0u16; 8];
+    let mut tail = [0u16; 8];
+    let (mut nh, mut nt) = (0usize, 0usize);
+    let mut in_tail = false;
+    let mut cur: u32 = 0;
+    let mut digits = 0;
+    let mut i = 0;
+    if s.is_empty() { return None; }
+    while i < s.len() {
+        let b = s[i];
+        match b {
+            b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' => {
+                let d = (b as char).to_digit(16)?;
+                cur = cur * 16 + d;
+                digits += 1;
+                if digits > 4 { return None; }
+            }
+            b':' => {
+                let dbl = s.get(i + 1) == Some(&b':');
+                if digits > 0 {
+                    if in_tail { if nt >= 8 { return None; } tail[nt] = cur as u16; nt += 1; }
+                    else { if nh >= 8 { return None; } head[nh] = cur as u16; nh += 1; }
+                    cur = 0; digits = 0;
+                } else if !(dbl && i == 0) && !(i > 0 && s[i - 1] == b':') {
+                    return None;
+                }
+                if dbl {
+                    if in_tail { return None; }
+                    in_tail = true;
+                    i += 1;
+                }
+            }
+            _ => return None,
+        }
+        i += 1;
+    }
+    if digits > 0 {
+        if in_tail { if nt >= 8 { return None; } tail[nt] = cur as u16; nt += 1; }
+        else { if nh >= 8 { return None; } head[nh] = cur as u16; nh += 1; }
+    } else if s[s.len() - 1] == b':' && !(s.len() >= 2 && s[s.len() - 2] == b':') {
+        return None;
+    }
+    if in_tail { if nh + nt > 7 { return None; } } else if nh != 8 { return None; }
+    let mut g = [0u16; 8];
+    g[..nh].copy_from_slice(&head[..nh]);
+    g[8 - nt..].copy_from_slice(&tail[..nt]);
+    let mut o = [0u8; 16];
+    for k in 0..8 { o[k * 2] = (g[k] >> 8) as u8; o[k * 2 + 1] = g[k] as u8; }
+    Some(o)
 }
 
 // Standard RFC 1071 Internet checksum (ones'-complement sum of 16-bit words).
@@ -225,6 +282,84 @@ fn build_packet(ident: u16, seq: u16, send_time_ms: i64, buf: &mut [u8; PACKET_L
     buf[3] = csum as u8;
 }
 
+#[repr(C)]
+struct sockaddr_in6 {
+    sin6_family:   u16,
+    sin6_port:     u16,
+    sin6_flowinfo: u32,
+    sin6_addr:     [u8; 16],
+    sin6_scope_id: u32,
+}
+
+// ICMPv6 echo: the kernel fills the checksum (a pseudo-header sum the sender
+// cannot know before routing), and a raw ICMPv6 socket carries no IPv6 header.
+unsafe fn ping6(dest: [u8; 16], arg: &[u8], count: u32, timeout_ms: i64, interval_ms: i64) -> i32 {
+    let mut fd = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    if fd < 0 { fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6); }
+    if fd < 0 {
+        write_str(b"ping: socket() failed\n");
+        return 1;
+    }
+    let ident = (getpid() as u16) & 0x7FFF;
+    let dest_addr = sockaddr_in6 { sin6_family: AF_INET6 as u16, sin6_port: 0, sin6_flowinfo: 0, sin6_addr: dest, sin6_scope_id: 0 };
+
+    write_str(b"PING "); write_str(arg); write_str(b"\n");
+    let mut sent = 0u32;
+    let mut received = 0u32;
+    for seq in 0..count {
+        let mut pkt = [0u8; PACKET_LEN];
+        let t0 = now_ms();
+        build_packet(ident, seq as u16, t0, &mut pkt);
+        pkt[0] = ICMP6_ECHO_REQUEST;
+        pkt[2] = 0; pkt[3] = 0;
+        sent += 1;
+        let n = sendto(fd, pkt.as_ptr() as *const c_void, pkt.len(), 0,
+                       &dest_addr as *const sockaddr_in6 as *const c_void, 28);
+        let mut got_reply = false;
+        if n < 0 {
+            write_str(b"ping: sendto failed\n");
+        } else {
+            loop {
+                let left = timeout_ms - (now_ms() - t0);
+                if left <= 0 { break; }
+                let mut pfd = pollfd { fd, events: POLLIN, revents: 0 };
+                if poll(&mut pfd, 1, left as c_int) <= 0 { continue; }
+                let mut rbuf = [0u8; 128];
+                let mut from = sockaddr_in6 { sin6_family: 0, sin6_port: 0, sin6_flowinfo: 0, sin6_addr: [0; 16], sin6_scope_id: 0 };
+                let mut fromlen: u32 = 28;
+                let rn = recvfrom(fd, rbuf.as_mut_ptr() as *mut c_void, rbuf.len(), MSG_DONTWAIT,
+                                  &mut from as *mut sockaddr_in6 as *mut c_void, &mut fromlen);
+                if rn >= 8 {
+                    let rseq = u16::from_be_bytes([rbuf[6], rbuf[7]]);
+                    if rbuf[0] == ICMP6_ECHO_REPLY && rseq == seq as u16 {
+                        let rtt = now_ms() - t0;
+                        write_uint(rn as u64); write_str(b" bytes from "); write_str(arg);
+                        write_str(b": icmp_seq="); write_uint(seq as u64);
+                        write_str(b" time="); write_uint(rtt as u64); write_str(b"ms\n");
+                        received += 1;
+                        got_reply = true;
+                        break;
+                    }
+                }
+            }
+            if !got_reply {
+                write_str(b"Request timeout for icmp_seq "); write_uint(seq as u64); write_str(b"\n");
+            }
+        }
+        if seq + 1 < count {
+            let rest = interval_ms - (now_ms() - t0);
+            if rest > 0 { sleep_ms(rest); }
+        }
+    }
+    close(fd);
+    write_str(b"--- ping statistics ---\n");
+    write_uint(sent as u64); write_str(b" packets transmitted, ");
+    write_uint(received as u64); write_str(b" received, ");
+    write_uint(((sent - received) as u64 * 100) / sent.max(1) as u64);
+    write_str(b"% packet loss\n");
+    if received == 0 { 1 } else { 0 }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -234,6 +369,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     let mut timeout_ms = TIMEOUT_MS;
     let mut interval_ms = INTERVAL_MS;
     let mut target: Option<&[u8]> = None;
+    let mut force6 = false;
     let mut i = 1;
     while i < argc {
         let a = arg_at(argv, i);
@@ -247,6 +383,12 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
                 _     => interval_ms = (v as i64) * 1000,
             }
             i += 2;
+        } else if a == b"-6" {
+            force6 = true;
+            i += 1;
+        } else if a == b"-4" {
+            force6 = false;
+            i += 1;
         } else if a.first() == Some(&b'-') {
             return usage();
         } else {
@@ -255,6 +397,14 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
         }
     }
     let arg = match target { Some(t) => t, None => return usage() };
+    let v6 = force6 || arg.contains(&b':');
+    if v6 {
+        let dest6 = match parse_ipv6(arg) {
+            Some(o) => o,
+            None => { write_str(b"ping: invalid IPv6 address\n"); return 1; }
+        };
+        return ping6(dest6, arg, count, timeout_ms, interval_ms);
+    }
     let dest = match parse_ipv4(arg) {
         Some(o) => o,
         None => { write_str(b"ping: invalid IPv4 address\n"); return 1; }
