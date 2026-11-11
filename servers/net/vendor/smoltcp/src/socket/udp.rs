@@ -9,7 +9,7 @@ use crate::time::Instant;
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
 use crate::storage::Empty;
-use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, UdpRepr};
+use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, IpVersion, UdpRepr};
 
 /// LEANDROS: source of `Socket::bind_seq` (bind order, for Linux's "newest
 /// bound socket wins" unicast demultiplexing).
@@ -140,6 +140,8 @@ const TX_STALL_MS: u64 = 3000;
 #[derive(Debug)]
 pub struct Socket<'a> {
     endpoint: IpListenEndpoint,
+    /// LEANDROS: restrict a wildcard bind to one IP family (`None` = both).
+    family: Option<IpVersion>,
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -172,6 +174,7 @@ impl<'a> Socket<'a> {
     pub fn new(rx_buffer: PacketBuffer<'a>, tx_buffer: PacketBuffer<'a>) -> Socket<'a> {
         Socket {
             endpoint: IpListenEndpoint::default(),
+            family: None,
             rx_buffer,
             tx_buffer,
             hop_limit: None,
@@ -564,6 +567,11 @@ impl<'a> Socket<'a> {
         Ok((length, endpoint))
     }
 
+    /// LEANDROS: restrict a wildcard-bound socket to one IP family.
+    pub fn set_family(&mut self, family: Option<IpVersion>) {
+        self.family = family;
+    }
+
     pub(crate) fn accepts(&self, cx: &mut Context, ip_repr: &IpRepr, repr: &UdpRepr) -> bool {
         self.score(cx, ip_repr, repr).is_some()
     }
@@ -583,6 +591,10 @@ impl<'a> Socket<'a> {
                 return None;
             }
             score += 4;
+        } else if let Some(f) = self.family {
+            if ip_repr.dst_addr().version() != f {
+                return None;
+            }
         }
         if let Some(peer) = self.peer {
             if peer.addr != ip_repr.src_addr() || peer.port != repr.src_port {

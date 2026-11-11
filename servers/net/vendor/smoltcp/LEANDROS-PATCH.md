@@ -195,3 +195,15 @@ Tests: `test_rx_autotune_starts_small_and_grows_for_fast_reader`,
 `test_rx_autotune_slow_reader_does_not_grow`,
 `test_rx_autotune_off_advertises_whole_buffer` (both assert the right edge
 never moves left). With the crates.io Cargo.toml: 602/602 pass.
+
+## IPv6 on loopback (lane ip6lo, design-ipv6 L1)
+
+- `tcp::Socket::set_family` / `udp::Socket::set_family`: a wildcard-bound socket
+  hears one IP family only (`None` = both). An AF_INET `0.0.0.0` listener must
+  not accept a v6 SYN to `::1`.
+- `lookup_hardware_addr`: an IPv6 packet to one of the interface's own
+  addresses goes to its own MAC (`::1` on the Ethernet-medium loopback: smoltcp
+  never answers a neighbor solicitation for it).
+- `get_source_address_ipv6`: `::1` to `::1` uses `::1`; no candidate returns
+  `None` instead of panicking on `unwrap()` (a loopback-only or v4-only
+  interface reached by a v6 destination).

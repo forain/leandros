@@ -97,10 +97,15 @@ impl<'d, D: Frames> SynGate<'d, D> {
     }
 }
 
-/// An Ethernet frame carrying an IPv4 TCP segment with SYN set and neither
+/// An Ethernet frame carrying an IPv4 or IPv6 TCP segment with SYN set and neither
 /// ACK nor RST: the first segment of a connection.
 fn pure_syn(f: &[u8]) -> bool {
     const ETH: usize = 14;
+    // IPv6: fixed 40-byte header, TCP as the next header (no extension headers).
+    if f.len() >= ETH + 40 + 20 && f[12] == 0x86 && f[13] == 0xdd {
+        if f[ETH] >> 4 != 6 || f[ETH + 6] != 6 { return false; }
+        return f[ETH + 40 + 13] & 0x16 == 0x02;
+    }
     if f.len() < ETH + 20 || f[12] != 0x08 || f[13] != 0x00 { return false; }
     if f[ETH] >> 4 != 4 || f[ETH + 9] != 6 { return false; }
     // A later fragment carries no TCP header.
