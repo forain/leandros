@@ -250,7 +250,18 @@ fn complete_now(p: &Pending) {
 // ── KmsFlip hooks ───────────────────────────────────────────────────────────
 
 fn queue(token: u32, src_x: u32, src_y: u32, ev: u32) -> Result<(), DriverError> {
-    let r = kms::prepare(token, src_x, src_y)?;
+    queue_impl(token, src_x, src_y, ev, false)
+}
+
+/// DRM_MODE_PAGE_FLIP_ASYNC: PLANE_CTL's async-flip bit with the new
+/// PLANE_SURF, so the surface changes at once instead of at the next vblank.
+fn queue_async(token: u32, src_x: u32, src_y: u32, ev: u32) -> Result<(), DriverError> {
+    queue_impl(token, src_x, src_y, ev, true)
+}
+
+fn queue_impl(token: u32, src_x: u32, src_y: u32, ev: u32, asyn: bool) -> Result<(), DriverError> {
+    let mut r = kms::prepare(token, src_x, src_y)?;
+    if asyn { kms::make_async(&mut r)?; ASYNC_FLIPS.fetch_add(1, Ordering::Relaxed); }
     let t0 = now();
     let ready = kms::fence_ready(&r) && !kms::needs_flush(&r);
     let mut p = Pending {
@@ -327,7 +338,30 @@ pub(super) fn wait_idle_quiet(timeout_ns: u64) {
     if ENABLED.load(Ordering::Relaxed) { let _ = wait_idle(timeout_ns); }
 }
 
-static FLIP: KmsFlip = KmsFlip { queue, event, busy, wait_idle };
+static ASYNC_FLIPS: AtomicU64 = AtomicU64::new(0);
+static VBL_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// The hardware frame counter and the monotonic time of the latest vblank.
+fn frame() -> (u32, u64) {
+    let f = frame_now();
+    (f, vblank_ts(now()))
+}
+
+/// Sleep until PIPE_FRMCOUNT reaches `target` (DRM_IOCTL_WAIT_VBLANK). The
+/// counter is hardware; the sleep polls it every 500 us (an error of at
+/// most that), which needs no interrupt unmasked while nothing is flipping.
+fn wait_frame(target: u32, timeout_ns: u64) -> Option<(u32, u64)> {
+    VBL_WAITS.fetch_add(1, Ordering::Relaxed);
+    let t0 = now();
+    loop {
+        let f = frame_now();
+        if f.wrapping_sub(target) < 0x8000_0000 { return Some((f, vblank_ts(now()))); }
+        if now().wrapping_sub(t0) >= timeout_ns { return None; }
+        crate::kenv::sched::kthread::sleep_ns(500_000);
+    }
+}
+
+static FLIP: KmsFlip = KmsFlip { queue, event, busy, wait_idle, queue_async: Some(queue_async), frame: Some(frame), wait_frame: Some(wait_frame) };
 
 // ── console / framebuffer lifetime ──────────────────────────────────────────
 
