@@ -8,10 +8,8 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ### Kernel / VFS
 - **Podman rootless pasta churn**: earlier 3/4/1 of 20 failures, unverified after the fcntl lock fix (?).
-- **Pending AF_UNIX connections whose client closed before `accept` are dropped** (Linux hands them over) (?).
 - **Paths below `/proc/self/fd/N` follow the directory's open-time path** (no dentries; no " (deleted)" suffix on readlink).
 - **Global scans on last close** of tmpfs/mounted files walk every fd table (O(all fds)); a per-object refcount would retire it and `FD_COPY_GATE`.
-- **AF_UNIX connection pool (512) is a fixed system-wide pool** (?).
 - **Wake scans are O(parked pollers)**; keyed wake still dereferences each mask match (~11 us per scan). A per-tag index / kbits bloom would fix it.
 - **The switch-back CPU charge still takes RUN_QUEUE** (~22.5k holds/s); needs a lock-free `on_cpu` release protocol.
 - **New writers of signal state must call `sig_kick`**; a miss shows as `miss` > 0 in `/proc/rqhold` (invariant, no known violation).
@@ -62,14 +60,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Stick write commands of 0.5-1.3 s are hidden, not removed** (USB hubs now supported, usbhot2).
 - **Why Limine leaves RAM above 4 GiB out of the HHDM is unexplained** (`lane-fbmm`); aarch64 has no HHDM gap walker.
 - **Real-PC (RTX 3070) verification deferred ~1 month** (user, 2026-10-24).
-
-### Build / tooling
-- **Image can silently ship without `libseat.so.1`/`libudev.so.1`** (no zig, no blob cache): build succeeds, COSMIC fails at runtime. Same for other `os.path.exists()`-guarded blobs.
-- **Fresh worktrees boot with no shell** unless `brush`/`coreutils`/`bottom-leandros` siblings resolve; build exits 0 with only a warning.
-- **`../crossterm` sibling required by brush**; `/bin/wl-globals` staged only if the host binary exists.
-- **Doom links `leandros-libc`** whose allocator is a bump allocator over `brk` (no free list).
-- **A userland test built with bare `cargo build` lacks `-C relocation-model=static`** and faults before `main`.
-- **`~/code/leandros-artifacts` is unversioned and diverges from `artifacts/`**; diff before trusting either.
 
 ## Missing features
 
