@@ -341,9 +341,16 @@ pub(super) fn wait_idle_quiet(timeout_ns: u64) {
 static ASYNC_FLIPS: AtomicU64 = AtomicU64::new(0);
 static VBL_WAITS: AtomicU64 = AtomicU64::new(0);
 
+/// Frame counter for WAIT_VBLANK: the hardware one; the fake device (whose
+/// FAKE_FRAME only moves while flips are pending) counts 60 Hz in time.
+fn uapi_frame() -> u32 {
+    if fake() { return (now() / 16_666_667) as u32; }
+    frame_now()
+}
+
 /// The hardware frame counter and the monotonic time of the latest vblank.
 fn frame() -> (u32, u64) {
-    let f = frame_now();
+    let f = uapi_frame();
     (f, vblank_ts(now()))
 }
 
@@ -354,7 +361,7 @@ fn wait_frame(target: u32, timeout_ns: u64) -> Option<(u32, u64)> {
     VBL_WAITS.fetch_add(1, Ordering::Relaxed);
     let t0 = now();
     loop {
-        let f = frame_now();
+        let f = uapi_frame();
         if f.wrapping_sub(target) < 0x8000_0000 { return Some((f, vblank_ts(now()))); }
         if now().wrapping_sub(t0) >= timeout_ns { return None; }
         crate::kenv::sched::kthread::sleep_ns(500_000);
