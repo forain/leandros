@@ -94,6 +94,8 @@ def main():
         else:
             print(f"pasta_dns: SKIP rc={rc} " + tail(out))
 
+        rc, out = run("grep -c netns /proc/self/mountinfo")
+        base_mnt = int(out.strip().splitlines()[-1]) if out.strip().splitlines()[-1:] and out.strip().splitlines()[-1].isdigit() else 0
         rc, out = run(f"i=0; f=0; while [ $i -lt {CHURN} ]; do podman run --rm {IMG} true >/dev/null 2>&1 || f=$((f+1)); "
                       f"i=$((i+1)); done; echo CHURN_FAIL=$f", timeout=1800)
         mm = re.search(r"CHURN_FAIL=(\d+)", out)
@@ -111,8 +113,8 @@ def main():
             leak.append("pasta: " + pasta.replace("\n", " "))
         if netns and not all("No such file" in l for l in netns.splitlines()):
             leak.append("netns: " + netns.replace("\n", " "))
-        if mnt.isdigit() and int(mnt) > 0:
-            leak.append("mounts: " + mnt)
+        if mnt.isdigit() and int(mnt) > base_mnt:
+            leak.append(f"mounts: {mnt} (baseline {base_mnt})")
         check("pasta_leaks", not leak, "; ".join(leak))
     finally:
         srv.shutdown()

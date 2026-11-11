@@ -312,12 +312,13 @@ pub fn has_zombies() -> bool { ZOMBIES.iter().any(|z| z.load(Relaxed) != 0) }
 /// Number of parked (DYING) mount namespaces.
 pub fn dying_count() -> usize { (1..NS_MAX).filter(|&i| REFS[i].load(Relaxed) == DYING).count() }
 
-/// Create a flat (parentless) namespace id: net or ipc. Errors: ENOSPC (28).
-pub fn new_flat(owner: NsId) -> Result<NsRef, isize> {
+/// Create a flat (parentless) namespace id of slot class `class` (3 net, 7 ipc,
+/// 8 uts; see `link_class`). Errors: ENOSPC (28).
+pub fn new_flat(owner: NsId, class: u8) -> Result<NsRef, isize> {
     if !quota_owner_ok(owner) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
-            SLOT_KIND[id].store(3, Release);
+            SLOT_KIND[id].store(class, Release);
             PARENT[id].store(0, Release);
             LEVEL[id].store(0, Release);
             set_owner_userns(id as NsId, owner);
@@ -343,8 +344,8 @@ pub fn ipcns_of(pid: u32) -> NsId {
 /// into a fresh namespace of that kind. 0 or a negative errno.
 pub fn unshare_flat(net: bool, ipc: bool) -> isize {
     let ou = current_userns();
-    let nn = if net { match new_flat(ou) { Ok(n) => Some(n), Err(e) => return e } } else { None };
-    let ni = if ipc { match new_flat(ou) { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let nn = if net { match new_flat(ou, 3) { Ok(n) => Some(n), Err(e) => return e } } else { None };
+    let ni = if ipc { match new_flat(ou, 7) { Ok(n) => Some(n), Err(e) => return e } } else { None };
     let pid = crate::current_pid();
     let (o1, o2) = {
         let mut rq = crate::RUN_QUEUE.lock();
@@ -381,7 +382,7 @@ static UTS: [spin::Mutex<UtsNames>; NS_MAX] = [const { spin::Mutex::new(UTS_INIT
 /// Create a UTS namespace owned by user namespace `owner`, names copied from `src`.
 pub fn new_uts(src: NsId, owner: NsId) -> Result<NsRef, isize> {
     let names = *UTS[src as usize].lock();
-    let r = new_flat(owner)?;
+    let r = new_flat(owner, 8)?;
     *UTS[r.0 as usize].lock() = UtsNames { owner, ..names };
     Ok(r)
 }
@@ -863,9 +864,9 @@ pub fn set_owner_userns(id: NsId, owner: NsId) {
 /// Take one raw reference on `id` (an nsfd's hold); pair with `put_raw`.
 pub fn hold_raw(id: NsId) { core::mem::forget(NsRef::get(id)); }
 
-/// Class of an nsfs link kind: 1 user, 2 mnt, 3 net/ipc/uts, 4 pid, 6 cgroup.
+/// Class of an nsfs link kind: 1 user, 2 mnt, 3 net, 4 pid, 6 cgroup, 7 ipc, 8 uts.
 fn link_class(kind: u8) -> u8 {
-    match kind { 0 => 1, 4 => 2, 2 | 3 | 5 => 3, 1 | 7 => 4, 6 => 6, _ => 0 }
+    match kind { 0 => 1, 4 => 2, 2 => 3, 3 => 7, 5 => 8, 1 | 7 => 4, 6 => 6, _ => 0 }
 }
 
 /// Take a reference on a namespace named by an id that did not come from a
