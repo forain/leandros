@@ -4558,6 +4558,7 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/sys/net/ipv6/conf/all/autoconf", data: b"1\n" },
     RamEntry { path: b"/proc/sys/net/ipv6/conf/default/autoconf", data: b"1\n" },
     RamEntry { path: b"/proc/sys/net/ipv6/conf/lo/autoconf", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/bindv6only", data: b"0\n" },
 ];
 const _: () = assert!(sched::caps::CAP_LAST == 40, "update /proc/sys/kernel/cap_last_cap");
 const _: () = assert!(sched::task::NGROUPS_MAX == 32, "update /proc/sys/kernel/ngroups_max");

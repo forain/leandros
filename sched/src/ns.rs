@@ -1140,7 +1140,7 @@ pub fn setns_cgroup(id: NsId) -> isize {
 // ── /proc/sys/net (per network namespace) ────────────────────────────────────
 
 pub struct NetCtl { pub path: &'static str, pub def: u32, pub max: u32, pub pair: bool }
-pub const NETCTL_N: usize = 39;
+pub const NETCTL_N: usize = 40;
 /// Entries with `pair` own this slot and the next ("lo hi" files); the next has an empty path.
 pub static NETCTL: [NetCtl; NETCTL_N] = [
     NetCtl { path: "core/somaxconn", def: 4096, max: 2147483647, pair: false },
@@ -1182,6 +1182,7 @@ pub static NETCTL: [NetCtl; NETCTL_N] = [
     NetCtl { path: "ipv6/conf/all/autoconf", def: 1, max: 1, pair: false },
     NetCtl { path: "ipv6/conf/default/autoconf", def: 1, max: 1, pair: false },
     NetCtl { path: "ipv6/conf/lo/autoconf", def: 1, max: 1, pair: false },
+    NetCtl { path: "ipv6/bindv6only", def: 0, max: 1, pair: false },
 ];
 const fn netctl_init() -> [[AtomicU32; NETCTL_N]; NS_MAX] {
     let mut out = [const { [const { AtomicU32::new(0) }; NETCTL_N] }; NS_MAX];
@@ -1389,6 +1390,10 @@ pub fn ping_allowed(pid: u32) -> bool {
     let g = crate::egid_of(pid);
     if lo <= g && g <= hi { return true; }
     crate::caps::pid_capable_in(pid, owner_userns(2, ns), 13) // CAP_NET_RAW
+}
+/// net.ipv6.bindv6only of namespace `ns`: the IPV6_V6ONLY a new AF_INET6 socket starts with.
+pub fn bindv6only(ns: NsId) -> bool {
+    netctl_find(b"ipv6/bindv6only").map_or(false, |k| netctl_get(ns, k) != 0)
 }
 /// May `pid` bind `port` in its netns `ns` (ip_unprivileged_port_start / CAP_NET_BIND_SERVICE)?
 pub fn bind_port_allowed(pid: u32, ns: NsId, port: u16) -> bool {
