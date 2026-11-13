@@ -47,7 +47,7 @@ const OFD_GROW: usize = 1024;
 /// file has its own description table (`TMP_OFDS`), a mounted file's offset
 /// lives in its filesystem server, keyed per open.
 #[derive(Clone, Copy)]
-struct Slot { refs: u32, gen: u16, watched: bool, pos: u64, mnt: u32, mns: u16 }
+struct Slot { refs: u32, gen: u16, watched: bool, pos: u64, mnt: u32, mns: u16, mfl: u8 }
 
 struct Table {
     s:       alloc::vec::Vec<Slot>,
@@ -78,13 +78,13 @@ pub fn alloc() -> u32 {
     // Slot 0 is id 0 ("none") and is never handed out: it stays busy.
     if t.s.is_empty() {
         if t.s.try_reserve(OFD_GROW).is_err() { return 0; }
-        t.s.push(Slot { refs: u32::MAX, gen: 0, watched: false, pos: 0, mnt: 0, mns: 0 });
+        t.s.push(Slot { refs: u32::MAX, gen: 0, watched: false, pos: 0, mnt: 0, mns: 0, mfl: 0 });
     }
     let n = t.s.len();
     // Every slot busy (slot 0 included): grow instead of a full rescan.
     if t.live + 1 >= n && n < MAX_OFDS && t.s.try_reserve(OFD_GROW).is_ok() {
         let m = (n + OFD_GROW).min(MAX_OFDS);
-        t.s.resize(m, Slot { refs: 0, gen: 0, watched: false, pos: 0, mnt: 0, mns: 0 });
+        t.s.resize(m, Slot { refs: 0, gen: 0, watched: false, pos: 0, mnt: 0, mns: 0, mfl: 0 });
     }
     let n = t.s.len();
     if n > 1 {
@@ -95,7 +95,7 @@ pub fn alloc() -> u32 {
                 t.s[i].refs = 1;
                 t.s[i].watched = false;
                 t.s[i].pos = 0;
-                t.s[i].mnt = 0;
+                t.s[i].mnt = 0; t.s[i].mfl = 0;
                 t.s[i].mns = 0;
                 t.cursor = if i + 1 >= n { 1 } else { i + 1 };
                 t.live += 1;
@@ -215,10 +215,10 @@ pub fn census() -> Option<(usize, usize)> {
 
 /// Record the mount (namespace, id) an fd was opened through, so
 /// fchmod/fchown/futimens can refuse on a read-only mount.
-pub fn set_mnt(id: u32, ns: u16, mnt: u32) {
+pub fn set_mnt(id: u32, ns: u16, mnt: u32, mfl: u8) {
     if let Some((i, g)) = split(id) {
         let mut t = OFDS.lock();
-        if let Some(e) = t.s.get_mut(i) { if e.gen == g && e.refs != 0 { e.mnt = mnt; e.mns = ns; } }
+        if let Some(e) = t.s.get_mut(i) { if e.gen == g && e.refs != 0 { e.mnt = mnt; e.mns = ns; e.mfl = mfl; } }
     }
 }
 
@@ -227,4 +227,11 @@ pub fn mnt_of(id: u32) -> Option<(u16, u32)> {
     let (i, g) = split(id)?;
     let t = OFDS.lock();
     t.s.get(i).filter(|e| e.gen == g && e.refs != 0 && e.mnt != 0).map(|e| (e.mns, e.mnt))
+}
+
+/// The mount flags recorded by `set_mnt` at open time.
+pub fn mnt_flags_of(id: u32) -> Option<u8> {
+    let (i, g) = split(id)?;
+    let t = OFDS.lock();
+    t.s.get(i).filter(|e| e.gen == g && e.refs != 0 && e.mnt != 0).map(|e| e.mfl)
 }

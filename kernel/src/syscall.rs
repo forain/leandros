@@ -11892,7 +11892,7 @@ impl KPath {
         if let Some((fd, below)) = proc_own_fd(&ns) {
             if !below.is_empty() {
                 if let Some(p) = fd_ns_path(mns, fd, below) { return KPath::from_ns_mnt(p, mns); }
-                if let Some(h) = fd_hidden_host(mns, fd) { return hidden_below(h, below); }
+                if let Some(h) = fd_hidden_host(mns, fd) { return hidden_below(h, below, fd); }
             }
         }
         let (mut denied, mut crossed) = (false, false);
@@ -11906,7 +11906,7 @@ impl KPath {
         kp.mnt_id = mid;
         kp.ns_prefix_len = plen;
         let pid = current_pid();
-        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: ns.clone(), mnt_id: mid });
+        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: ns.clone(), mnt_id: mid, hidden_flags: None });
         kp.ctx_pid = pid;
         kp.ns = Some(ns);
         Ok(kp)
@@ -12136,7 +12136,7 @@ fn fd_hidden_host(mns: sched::ns::NsId, fd: usize) -> Option<Vec<u8>> {
 /// `host`/`rel` as a verbatim backing path. Lexical `..` may not climb above
 /// the descriptor's directory (EXDEV: that parent is outside the caller's
 /// tree), so a hidden fd never reaches beyond its own subtree.
-fn hidden_below(mut host: Vec<u8>, rel: &[u8]) -> Result<KPath, isize> {
+fn hidden_below(mut host: Vec<u8>, rel: &[u8], fd: usize) -> Result<KPath, isize> {
     let rel = match rel.iter().position(|&b| b == 0) { Some(n) => &rel[..n], None => rel };
     let base = host.len();
     for comp in rel.split(|&b| b == b'/') {
@@ -12152,7 +12152,22 @@ fn hidden_below(mut host: Vec<u8>, rel: &[u8]) -> Result<KPath, isize> {
         host.extend_from_slice(comp);
         if host.len() >= HOST_PATH_MAX { return Err(-36); }
     }
-    Ok(KPath::raw(&host))
+    let mut kp = KPath::raw(&host);
+    // The fd keeps its vfsmount: enforce that mount's flags (live if the mount
+    // still exists, else as recorded at open). Unknown mount => read-only.
+    let fl = match vfs::fd_mnt(current_pid(), fd) {
+        Some((n, m)) => match vfs::mnt::flags_opt(n, m) {
+            Some(f) => f,
+            None => vfs::fd_mnt_flags(current_pid(), fd).unwrap_or(vfs::mnt::MNT_RDONLY),
+        },
+        None => 0, // opened outside any mount-ns tree (ns 0): no per-mount flags
+    };
+    if fl & (vfs::mnt::MNT_RDONLY | vfs::mnt::MNT_NODEV) != 0 {
+        let pid = current_pid();
+        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: 0, hidden_flags: Some(fl) });
+        kp.ctx_pid = pid;
+    }
+    Ok(kp)
 }
 
 /// `/proc/<own pid>/fd/N[/rest]` → (N, rest without its leading '/'), for
@@ -12335,7 +12350,7 @@ fn resolve_at_path(dirfd: usize, path_ptr: usize) -> Result<KPath, isize> {
     if raw.is_empty() { return Err(-2); }
     let d = dirfd as u32 as i32 as isize as usize;
     if d != AT_FDCWD && raw.first() != Some(&b'/') {
-        if let Some(h) = fd_hidden_host(sched::current_mntns(), d) { return hidden_below(h, &raw); }
+        if let Some(h) = fd_hidden_host(sched::current_mntns(), d) { return hidden_below(h, &raw, d); }
     }
     KPath::from_ns(resolve_at_ns(dirfd, &raw)?)
 }

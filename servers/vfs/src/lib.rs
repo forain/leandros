@@ -5084,6 +5084,12 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
     // target is anchored at the pivoted root, not at the backing volume root).
     let pid = sched::current_pid();
     if let Some(cx) = mnt::callctx_get(pid, ptr) {
+        if let Some(hf) = cx.hidden_flags {
+            // dirfd with no name in this namespace: the flags of the mount it
+            // was opened on still apply (Linux: the fd keeps its vfsmount).
+            if hf & (mnt::MNT_RDONLY | mnt::MNT_NODEV) != 0 { mnt_flag_check(msg.tag, msg, path, hf)?; }
+            return Ok(());
+        }
         let ns = sched::current_mntns();
         if ns != 0 { sched::set_strict_links(true); }
         let jail = sched::current_root_arc();
@@ -5102,7 +5108,7 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
                 *buf = backing;
                 buf.push(0);
                 let nptr = buf.as_ptr() as usize;
-                mnt::callctx_set(pid, mnt::CallCtx { ptr: nptr, ns_path: nsp, mnt_id: mid });
+                mnt::callctx_set(pid, mnt::CallCtx { ptr: nptr, ns_path: nsp, mnt_id: mid, hidden_flags: None });
                 msg.data[idx * 8..idx * 8 + 8].copy_from_slice(&(nptr as u64).to_le_bytes());
                 return Ok(());
             }
@@ -5285,7 +5291,13 @@ fn dispatch_inner(msg: &Message, caller_pid: u32) -> Message {
             let r = handle_open(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32);
             if let Some(cx) = cx {
                 let fd = reply_val(&r);
-                if fd >= 0 { fd_note_mnt(caller_pid, fd as usize, sched::current_mntns(), cx.mnt_id); }
+                if fd >= 0 {
+                    match cx.hidden_flags {
+                        // Inherit the originating mount's flags (ns MAX: no live table).
+                        Some(hf) => fd_note_mnt(caller_pid, fd as usize, u16::MAX, 1, hf),
+                        None => fd_note_mnt(caller_pid, fd as usize, sched::current_mntns(), cx.mnt_id, mnt::flags_of(sched::current_mntns(), cx.mnt_id)),
+                    }
+                }
             }
             r
         }
@@ -14809,11 +14821,24 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
 }
 
 /// Tag `pid`'s fd with the mount it was opened through (see `ofd::set_mnt`).
-fn fd_note_mnt(pid: u32, fd: usize, ns: u16, mid: u32) {
+fn fd_note_mnt(pid: u32, fd: usize, ns: u16, mid: u32, mfl: u8) {
     let mut tbls = TblSlot::new();
     if let Some(tbl) = find_tbl(pid, &mut tbls) {
-        if tbl.fds.used(fd) { ofd::set_mnt(tbl.fds[fd].ofd, ns, mid); }
+        if tbl.fds.used(fd) { ofd::set_mnt(tbl.fds[fd].ofd, ns, mid, mfl); }
     }
+}
+
+/// Mount flags recorded when `pid`'s fd was opened.
+pub fn fd_mnt_flags(pid: u32, fd: usize) -> Option<u8> {
+    let pid = sched::tgid_of(pid);
+    let ofd = {
+        let mut tbls = TblSlot::new();
+        match find_tbl(pid, &mut tbls) {
+            Some(tbl) if tbl.fds.used(fd) => tbl.fds[fd].ofd,
+            _ => return None,
+        }
+    };
+    ofd::mnt_flags_of(ofd)
 }
 
 /// The (mount namespace, mount id) `pid`'s fd was opened through, if recorded.
