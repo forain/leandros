@@ -115,6 +115,19 @@ pub struct Inputs<'a> {
 #[cfg(target_arch = "x86_64")]
 pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, _a: &mut Alloc) -> Result<u64, isize> {
     use boot::mb2_build::*;
+    // `kexec.test=acpiresvd`: firmware keeps such tables above the last usable
+    // RAM; QEMU puts them mid-RAM, where the next kernel's HHDM covers them
+    // anyway. Make the tables the top of RAM: everything usable above the
+    // lowest retyped (type 8) table entry becomes Reserved in the handed-over map.
+    let mut cut: Vec<Raw> = map.to_vec();
+    if super::acpi_resvd() {
+        if let Some(lo) = cut.iter().filter(|r| r.raw_type == 8 && r.base >= (2u64 << 30)).map(|r| r.base).min() {
+            let mut n = 0;
+            for r in cut.iter_mut().filter(|r| r.base >= lo && matches!(r.raw_type, 0 | 5 | 6)) { r.raw_type = 1; n += 1; }
+            crate::serial_print_str(&alloc::format!("[KEXEC] test acpiresvd: {} usable entr(ies) >= {:#x} made Reserved\n", n, lo));
+        }
+    }
+    let map = &cut[..];
     let regions: Vec<RawRegion> = map.iter()
         .map(|r| RawRegion { base: r.base, length: r.length, raw_type: r.raw_type }).collect();
     for r in map.iter().filter(|r| r.base >= (2u64 << 30)) { crate::serial_print_str(&alloc::format!("[KEXEC] mbi-in {:#x}+{:#x} t{}\n", r.base, r.length, r.raw_type)); }
