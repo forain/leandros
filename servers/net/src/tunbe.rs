@@ -442,7 +442,7 @@ pub(crate) fn ll_from_mac(m: [u8; 6]) -> [u8; 16] {
 }
 
 /// Every v6 address a vif's stack holds: link-local while up, then the static ones.
-fn addrs6_of(sid: Sid) -> Vec<([u8; 16], u8)> {
+pub(crate) fn addrs6_of(sid: Sid) -> Vec<([u8; 16], u8)> {
     let v = VIFS.lock();
     let Some(x) = v[sid as usize].as_ref() else { return Vec::new() };
     let mut o = Vec::new();
