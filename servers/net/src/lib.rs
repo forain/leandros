@@ -6824,6 +6824,14 @@ struct RxMeta {
 fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool, gro: bool)
     -> Result<(alloc::vec::Vec<u8>, usize, RxMeta), i32>
 {
+    let mut r = udp_recv_k0(pid, fd, cap, peek, gro);
+    if let Ok((_, _, m)) = &mut r { m.from = nft_unorig(pid, fd, m.from); }
+    r
+}
+
+fn udp_recv_k0(pid: u32, fd: usize, cap: usize, peek: bool, gro: bool)
+    -> Result<(alloc::vec::Vec<u8>, usize, RxMeta), i32>
+{
     let (state, sock_type, _) = inet_sock_info(pid, fd).ok_or(-9i32)?;
     let (handle, sid) = match state {
         SockState::InetConnected { socket_handle, sid, .. } => {
@@ -6901,7 +6909,7 @@ fn udp_next_locked(s: &mut NetStack, sid: Sid, h: SocketHandle, cap: usize, peek
         _ => if_addr,
     };
     let total = if seg != 0 { data.len() } else { full };
-    Ok((data, total, RxMeta { from: nft_unorig(pid, fd, m.endpoint), dst, spec_dst, tos: m.tos,
+    Ok((data, total, RxMeta { from: m.endpoint, dst, spec_dst, tos: m.tos,
                               ttl: m.hop_limit.unwrap_or(0), sid, seg }))
 }
 
