@@ -12122,8 +12122,15 @@ fn fd_hidden_host(mns: sched::ns::NsId, fd: usize) -> Option<Vec<u8>> {
     if mns == 0 { return None; }
     let host = fd_host_path(fd)?;
     let hint = match vfs::fd_mnt(current_pid(), fd) { Some((n, m)) if n == mns => m, _ => 0 };
-    if vfs::mnt::reverse(mns, &host, hint).is_some() { return None; }
-    Some(host)
+    match vfs::mnt::reverse(mns, &host, hint) {
+        None => Some(host),
+        // Named in the namespace but outside the caller's chroot: still not
+        // reachable by any path the caller can spell.
+        Some(p) => match sched::current_root_arc() {
+            Some(r) if r.len() > 1 && !vfs::alias::under(&p, &r) => Some(host),
+            _ => None,
+        },
+    }
 }
 
 /// `host`/`rel` as a verbatim backing path. Lexical `..` may not climb above
