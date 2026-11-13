@@ -81,3 +81,4 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **zig to clang** migration (est. 2-4 days, not started).
 - **Claude Code in-guest**: `claude-run` only appends to `/etc/passwd`/`group`; only 2.1.296 is pinned; x86_64 VT/cosmic-term runs not screenshotted.
 - **Test harness**: run with `python3 -u` and no pipe; pass `-D <file>` when host tracing is on.
+- [ ] ns 0 has no per-mount flags: `mount -o remount,bind,ro` is accepted but not enforced (alias mounts); pinned by mnttest e7_ns0_has_no_permount_flags (lane e7flags2)

@@ -6246,6 +6246,12 @@ fn exec_permitted(kp: &KPath, pid: u32) -> isize {
     const X_OK: u64 = 1;
     // MS_NOEXEC on the file's mount (mount namespaces other than the host's).
     if kp.mnt_id != 0 && vfs::mnt::flags_of(sched::current_mntns(), kp.mnt_id) & vfs::mnt::MNT_NOEXEC != 0 { return -13; }
+    // A path below a dirfd hidden from this namespace keeps its originating mount's flags.
+    if kp.ctx_pid != 0 {
+        if let Some(cx) = vfs::mnt::callctx_get(kp.ctx_pid, kp.ptr()) {
+            if cx.hidden_flags.map_or(false, |f| f & vfs::mnt::MNT_NOEXEC != 0) { return -13; }
+        }
+    }
     let amsg = make_vfs_msg(vfs::VFS_ACCESS, &[kp.ptr() as u64, X_OK]);
     let ar = vfs_reply_val(&vfs::handle(&amsg, pid));
     // Only a refusal is an answer: a missing file (ENOENT) or a filesystem
@@ -6518,6 +6524,12 @@ fn sys_execveat(dirfd: usize, path_ptr: usize, argv_ptr: usize, envp_ptr: usize,
         } else {
             match fd_host_path(dirfd) { Some(h) => h, None => return -9 }
         };
+        // The fd keeps its vfsmount: MS_NOEXEC of the mount it was opened on applies.
+        let nx = match vfs::fd_mnt(current_pid(), dirfd) {
+            Some((n, m)) => vfs::mnt::flags_opt(n, m).or_else(|| vfs::fd_mnt_flags(current_pid(), dirfd)),
+            None => None,
+        };
+        if nx.map_or(false, |f| f & vfs::mnt::MNT_NOEXEC != 0) { return -13; }
         let kp = KPath::raw(&host);
         return sys_execve_kp(kp, argv_ptr, envp_ptr, cloexec & 1 != 0);
     }
@@ -12162,7 +12174,7 @@ fn hidden_below(mut host: Vec<u8>, rel: &[u8], fd: usize) -> Result<KPath, isize
         },
         None => 0, // opened outside any mount-ns tree (ns 0): no per-mount flags
     };
-    if fl & (vfs::mnt::MNT_RDONLY | vfs::mnt::MNT_NODEV) != 0 {
+    if fl & (vfs::mnt::MNT_RDONLY | vfs::mnt::MNT_NODEV | vfs::mnt::MNT_NOEXEC) != 0 {
         let pid = current_pid();
         vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: 0, hidden_flags: Some(fl) });
         kp.ctx_pid = pid;

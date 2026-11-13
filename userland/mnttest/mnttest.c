@@ -2522,6 +2522,54 @@ static void e7flags_suite(void) {
     system("rm -rf /tmp/e7 /tmp/e7f");
 }
 
+/* ── lane e7flags2: ns-0 per-mount flags; hidden dirfd noexec / nodev ── */
+static int e7x_child(int m) {
+    mkdir("/tmp/e7x/mp", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 11;
+    if (mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) return 12;
+    if (mount("/tmp/e7x/src", "/tmp/e7x/mp", NULL, MS_BIND, NULL) < 0) return 13;
+    if (mount(NULL, "/tmp/e7x/mp", NULL, MS_REMOUNT | MS_BIND | MS_NOEXEC | MS_NODEV, NULL) < 0) return 14;
+    int dfd = open("/tmp/e7x/mp", O_DIRECTORY | O_RDONLY); if (dfd < 0) return 15;
+    if (mount(E7R, E7R, NULL, MS_BIND | MS_REC, NULL) < 0) return 16;
+    if (chdir(E7R) < 0) return 17;
+    if (syscall(SYS_pivot_root, ".", "old") < 0) return 18;
+    if (chdir("/") < 0) return 19;
+    if (umount2("/old", MNT_DETACH) < 0) return 20;
+    if (exists("/tmp/e7x/mp")) return 21;
+    char *av[] = { "bin", NULL }, *ev[] = { NULL };
+    errno = 0; syscall(SYS_execveat, dfd, "bin", av, ev, 0);
+    if (errno != EACCES) { printf("  execveat errno=%d\n", errno); return 22; }
+    int fd = openat(dfd, "bin", O_RDONLY); if (fd < 0) return 23;
+    errno = 0; syscall(SYS_execveat, fd, "", av, ev, 0x1000);
+    if (errno != EACCES) { printf("  fexecve errno=%d\n", errno); return 24; }
+    errno = 0; int nd = openat(dfd, "nul", O_RDONLY);
+    if (nd >= 0 || errno != EACCES) { printf("  nodev open fd=%d errno=%d\n", nd, errno); return 25; }
+    (void)m; return 0;
+}
+static int e7x_ns0(int m) {
+    (void)m;
+    mkdir("/tmp/e7x/mp", 0755);
+    if (mount("/tmp/e7x/src", "/tmp/e7x/mp", NULL, MS_BIND, NULL) < 0) return 13;
+    if (mount(NULL, "/tmp/e7x/mp", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { printf("  ns0 remount errno=%d\n", errno); return 14; }
+    errno = 0; int r = mkdir("/tmp/e7x/mp/m", 0755);
+    umount("/tmp/e7x/mp");
+    /* Documented gap: ns 0 binds are alias mounts without per-mount flags, so the
+     * remount is accepted but ro is not enforced. Hence a hidden dirfd from ns 0
+     * has nothing to inherit. Flip this to EROFS when ns 0 grows mount flags. */
+    if (r != 0) { printf("  ns0 now enforces ro (errno=%d): update the test and the hidden path\n", errno); return 21; }
+    rmdir("/tmp/e7x/src/m");
+    return 0;
+}
+static void e7x_suite(void) {
+    e7_mk();
+    mkdir("/tmp/e7x", 0755); mkdir("/tmp/e7x/src", 0755);
+    system("cp /bin/true /tmp/e7x/src/bin; chmod 755 /tmp/e7x/src/bin");
+    mknod("/tmp/e7x/src/nul", S_IFCHR | 0666, makedev(1, 3));
+    report("e7_hidden_fd_noexec_nodev", nn_in_child(e7x_child, 0));
+    report("e7_ns0_has_no_permount_flags", nn_in_child(e7x_ns0, 0));
+    system("rm -rf /tmp/e7 /tmp/e7x");
+}
+
 /* ── lane mntiso-busy: mount roots are EBUSY, cross-mount ops EXDEV ── */
 static int mb_prep(void) {
     if (unshare(CLONE_NEWNS) < 0) return 91;
@@ -2857,6 +2905,7 @@ int main(int argc, char **argv) {
     mntiso_procfd_suite();
     mntiso_e7_suite();
     e7flags_suite();
+    e7x_suite();
     shmbind_suite();
     devbind_suite();
     mntiso_busy_suite();
