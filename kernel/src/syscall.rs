@@ -9599,6 +9599,15 @@ fn may_mount() -> bool {
 /// O_PATH and mounts on the link). The VFS answers with the backing path, so
 /// it is mapped back through the caller's tree; a backing path with no name in
 /// the namespace (the hidden superblock space) never leaks out: EINVAL.
+/// `MS_RDONLY|MS_NODEV|MS_NOEXEC` of a mount(2) flags word as ns-0 mount flags.
+fn ns0_mnt_flags(flags: usize) -> u8 {
+    let mut f = 0u8;
+    if flags & 1 != 0 { f |= vfs::mnt::MNT_RDONLY; }
+    if flags & 4 != 0 { f |= vfs::mnt::MNT_NODEV; }
+    if flags & 8 != 0 { f |= vfs::mnt::MNT_NOEXEC; }
+    f
+}
+
 fn resolve_mount_target(target_ptr: usize) -> Result<Vec<u8>, isize> {
     let p = resolve_user_path(target_ptr)?;
     if let Some((fd, b"")) = proc_own_fd(p.ns_bytes()) { return fd_mount_ns_path(fd); }
@@ -9687,7 +9696,11 @@ fn sys_mount(
             Some(e) => *e,
             // An alias mount (proc/devtmpfs/sysfs/bind) has no flags to
             // change; anything else is not a mount point.
-            None if vfs::alias::is_mountpoint(target_path.ns_bytes()) => return 0,
+            None if vfs::alias::is_mountpoint(target_path.ns_bytes()) => {
+                // Per-mount flags of an ns-0 alias/bind mount (replaced, as a Linux remount does).
+                vfs::alias::set_flags(target_path.ns_bytes(), ns0_mnt_flags(flags));
+                return 0;
+            }
             None => return -22, // EINVAL: not a mount point
         };
         // A remount's flags replace the old ones, nosuid included.
@@ -9778,8 +9791,11 @@ fn sys_mount(
             };
             match vfs::devpts::create(&opts, &|g, v| sched::ns::to_k(g as usize, sched::ns::current_userns(), v)) { Ok(id) => vfs::devpts::backing(id), Err(e) => return e }
         } else { src };
+        // MS_BIND copies the source mount's flags (flags in the same call are
+        // ignored, as on Linux); a fresh mount takes the ones asked for.
+        let new_fl = if flags & MS_BIND != 0 { vfs::alias::flags_at(&src) } else { ns0_mnt_flags(flags) };
         return match vfs::alias::add(mp, &src, fstype, &device) {
-            Ok(()) => { if fstype == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
+            Ok(()) => { if new_fl != 0 { vfs::alias::set_flags(mp, new_fl); } if fstype == "cgroup2" { vfs::cgroupfs::set_mounted(); } 0 }
             Err(e) => {
                 if let Some(id) = vfs::devpts::inst_of_backing(&src) { vfs::devpts::discard(id); }
                 e as isize
@@ -11883,13 +11899,22 @@ impl KPath {
         let mut denied = false;
         let walked = backing_walk_d(&ns, &mut false, &mut denied);
         if denied { return Err(-13); }
-        let backing = match walked { Some(b) => b, None => {
+        // Per-mount flags of the ns-0 mount the path lies in (ro/nodev/noexec).
+        let fl = vfs::alias::flags_at(&ns);
+        let mut kp = match walked { Some(b) => {
+            if b.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
+            let mut kp = KPath::raw(&b);
+            kp.ns = Some(ns);
+            kp
+        }, None => {
             if ns.len() >= HOST_PATH_MAX { return Err(-36); }
-            return Ok(KPath::raw(&ns));
+            KPath::raw(&ns)
         } };
-        if backing.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
-        let mut kp = KPath::raw(&backing);
-        kp.ns = Some(ns);
+        if fl != 0 {
+            let pid = current_pid();
+            vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: 0, hidden_flags: Some(fl) });
+            kp.ctx_pid = pid;
+        }
         Ok(kp)
     }
 
@@ -12131,7 +12156,16 @@ fn fd_ns_path(mns: sched::ns::NsId, fd: usize, below: &[u8]) -> Option<Vec<u8>> 
 /// relative lookups go below its backing path; that path is never spelled
 /// into the namespace tree, where it could name a different file.
 fn fd_hidden_host(mns: sched::ns::NsId, fd: usize) -> Option<Vec<u8>> {
-    if mns == 0 { return None; }
+    if mns == 0 {
+        // ns 0: a dirfd opened through a flagged (ro/nodev/noexec) alias or bind
+        // mount keeps those flags; below it, walk by backing path like a hidden fd.
+        let fl = match vfs::fd_mnt(current_pid(), fd) {
+            Some((n, _)) if n == u16::MAX => vfs::fd_mnt_flags(current_pid(), fd),
+            _ => None,
+        };
+        if fl.map_or(false, |f| f & vfs::alias::ENFORCED != 0) { return fd_host_path(fd); }
+        return None;
+    }
     let host = fd_host_path(fd)?;
     let hint = match vfs::fd_mnt(current_pid(), fd) { Some((n, m)) if n == mns => m, _ => 0 };
     match vfs::mnt::reverse(mns, &host, hint) {

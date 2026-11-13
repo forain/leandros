@@ -7173,11 +7173,13 @@ pub(crate) fn ns0_snapshot() -> Vec<mnt::Mnt> {
             None => 0,
         };
         if sb != 0 { nssb.push((mp.clone(), sb)); }
-        raw.push((mp, src, fs, dev, mnt::MNT_NOSUID | mnt::MNT_RELATIME));
+        let xf = alias::flags_at(&mp);
+        raw.push((mp, src, fs, dev, mnt::MNT_NOSUID | mnt::MNT_RELATIME | xf));
     }
     // Self-binds (`mount --bind /run/netns /run/netns`) are mount points too.
     for mp in alias::self_binds() {
-        raw.push((mp.clone(), mp, "none", b"none".to_vec(), mnt::MNT_NOSUID | mnt::MNT_RELATIME));
+        let xf = alias::flags_at(&mp);
+        raw.push((mp.clone(), mp, "none", b"none".to_vec(), mnt::MNT_NOSUID | mnt::MNT_RELATIME | xf));
     }
     // Parents: the deepest earlier-or-equal mountpoint covering ours (the
     // root first, so "/" is its own tree root and later duplicates overmount).
