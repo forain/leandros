@@ -672,6 +672,8 @@ fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
             }
             let r = arp_request(t.mac, t.addr, cip);
             st.inq.push_back((t.br, crate::vifsel::NO_PEER, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
+            drop(st);
+            drivers::netdev::kick(); // else the ARP request waits for the next housekeeping tick (~450 ms)
             return true;
         };
         let claimed = crate::nfnl::dnat_ports(0);
