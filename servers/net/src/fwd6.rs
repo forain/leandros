@@ -205,7 +205,7 @@ fn ns_frame(mac: [u8; 6], src: [u8; 16], target: [u8; 16]) -> Vec<u8> {
     f[12] = 0x86; f[13] = 0xdd;
     f[14] = 0x60; f[18..20].copy_from_slice(&32u16.to_be_bytes()); f[20] = PROTO_ICMP6; f[21] = 255;
     f[22..38].copy_from_slice(&src);
-    f[38] = 0xff; f[39] = 0x02; f[51] = 1; f[52] = 0xff; f[53..56].copy_from_slice(&target[13..16]);
+    f[38] = 0xff; f[39] = 0x02; f[49] = 1; f[50] = 0xff; f[51..54].copy_from_slice(&target[13..16]);
     f[54] = 135;
     f[62..78].copy_from_slice(&target);
     f[78] = 1; f[79] = 1; f[80..86].copy_from_slice(&mac);
