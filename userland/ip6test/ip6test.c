@@ -1,5 +1,6 @@
 // ip6test: AF_INET6 on the loopback (lane ip6lo, L1 of design-ipv6).
 // Builds for the host too (cc ip6test.c) to confirm the expectations on Linux.
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -8,6 +9,9 @@
 #include <time.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <net/if.h>
+#include <sched.h>
+#include <sys/ioctl.h>
 #include <netinet/icmp6.h>
 #include <sys/wait.h>
 #include <stdint.h>
@@ -138,8 +142,17 @@ static void test_unreach6(void) {
     a.sin6_family = AF_INET6; a.sin6_port = htons(9);
     inet_pton(AF_INET6, "2001:db8::1", &a.sin6_addr);
     int r = connect(s, (struct sockaddr *)&a, sizeof a);
-    CHECK("unreach6", r < 0 && (errno == ENETUNREACH || errno == ENETDOWN));
+    int e = errno;
     close(s);
+    int t = socket(AF_INET6, SOCK_STREAM, 0); tmo(t, 1);
+    int r2 = connect(t, (struct sockaddr *)&a, sizeof a);
+    int e2 = errno;
+    close(t);
+    printf("  unreach6: udp %d/%d tcp %d/%d\n", r, e, r2, e2);
+    /* With a SLAAC router the route exists (Linux: connect succeeds); without
+     * one it is ENETUNREACH. Anything else is a bug. */
+    CHECK("unreach6", (r == 0 || e == ENETUNREACH || e == ENETDOWN) &&
+                      (r2 == 0 || e2 == ENETUNREACH || e2 == ENETDOWN || e2 == EINPROGRESS || e2 == ETIMEDOUT || e2 == EAGAIN));
 }
 
 static void test_bad_len6(void) {
@@ -507,6 +520,70 @@ static int banner(const char *addr, int port) {
     return 0;
 }
 
+// ── v6 / v4-mapped TCP inside a non-initial netns (lane ip6nswake) ───────────
+// Peer writes then closes; the client must see POLLIN, the data, EOF
+// (the net poll does not report POLLRDHUP for TCP, in any netns).
+// mode: 0 v6 client -> dual [::] server (::ffff:127.0.0.1), 1 v4 client -> dual
+// server, 4 v4/v4 baseline, 2 v6 client -> v4 server (mapped), 3 v6 client -> [::1] server.
+static int ns6_body(int mode) {
+    if (unshare(CLONE_NEWNET) != 0) return 2;
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo"); q.ifr_flags = IFF_UP | IFF_RUNNING;
+    if (u < 0 || ioctl(u, SIOCSIFFLAGS, &q) != 0) return 3;
+    close(u);
+    int port = 47400 + mode;
+    int v4s = mode == 2 || mode == 4;
+    int l = socket(v4s ? AF_INET : AF_INET6, SOCK_STREAM, 0);
+    if (l < 0) return 4;
+    tmo(l, 3);
+    if (v4s) {
+        struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons(port);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(l, (struct sockaddr *)&a, sizeof a)) return 5;
+    } else {
+        struct sockaddr_in6 a; memset(&a, 0, sizeof a); a.sin6_family = AF_INET6; a.sin6_port = htons(port);
+        if (mode == 3) a.sin6_addr = in6addr_loopback;
+        if (bind(l, (struct sockaddr *)&a, sizeof a)) return 5;
+    }
+    if (listen(l, 4)) return 6;
+    int c = socket(mode == 1 || mode == 4 ? AF_INET : AF_INET6, SOCK_STREAM, 0);
+    if (c < 0) return 7;
+    tmo(c, 3);
+    int rc;
+    if (mode == 1 || mode == 4) {
+        struct sockaddr_in d; memset(&d, 0, sizeof d); d.sin_family = AF_INET; d.sin_port = htons(port);
+        d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        rc = connect(c, (struct sockaddr *)&d, sizeof d);
+    } else {
+        struct sockaddr_in6 d; memset(&d, 0, sizeof d); d.sin6_family = AF_INET6; d.sin6_port = htons(port);
+        if (mode == 3) d.sin6_addr = in6addr_loopback; else inet_pton(AF_INET6, "::ffff:127.0.0.1", &d.sin6_addr);
+        rc = connect(c, (struct sockaddr *)&d, sizeof d);
+    }
+    if (rc) return 8;
+    int a = accept(l, NULL, NULL);
+    if (a < 0) return 9;
+    if (write(a, "hi", 2) != 2) return 10;
+    close(a);
+    struct pollfd p = { .fd = c, .events = POLLIN };
+    int pr = poll(&p, 1, 3000);
+    if (pr != 1) return 11;
+    if (!(p.revents & POLLIN)) return 14;
+    char b[8];
+    if (read(c, b, sizeof b) != 2) return 12;
+    if (read(c, b, sizeof b) != 0) return 13;
+    return 0;
+}
+
+static void test_netns_v6_tcp(void) {
+    static const char *nm[] = { "ns_v6_to_dual", "ns_v4_to_dual", "ns_v6_to_v4", "ns_v6_loopback", "ns_v4_baseline" };
+    for (int m = 0; m < 5; m++) {
+        pid_t k = fork();
+        if (k == 0) _exit(ns6_body(m));
+        int st = 0; waitpid(k, &st, 0);
+        errno = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        CHECK(nm[m], WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+}
 
 // ---- L4 ip6link: link-local addresses, scope ids, NDP on the real NIC ----
 #include <sys/ioctl.h>
@@ -551,10 +628,27 @@ static void test_ll_present(void) {
     CHECK("ll_present", ok);
 }
 
+/* The default router learned from the RA (nexthop of the ::/0 line of
+ * /proc/net/ipv6_route); slirp's is fe80::2, a vmnet host's is not. */
+static int find_router(unsigned char *out16) {
+    FILE *f = fopen("/proc/net/ipv6_route", "r");
+    if (!f) return 0;
+    char b[256], d[40], sr[40], nh[40]; unsigned pl, sp; int found = 0;
+    while (!found && fgets(b, sizeof b, f)) {
+        if (sscanf(b, "%32s %x %32s %x %32s", d, &pl, sr, &sp, nh) == 5 && pl == 0 &&
+            strspn(d, "0") == 32) {
+            for (int i = 0; i < 16; i++) sscanf(nh + 2 * i, "%2hhx", &out16[i]);
+            found = 1;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
 static struct sockaddr_in6 router_ll(void) {
     struct sockaddr_in6 a; memset(&a, 0, sizeof a);
     a.sin6_family = AF_INET6;
-    inet_pton(AF_INET6, "fe80::2", &a.sin6_addr);
+    if (!find_router(a.sin6_addr.s6_addr)) inet_pton(AF_INET6, "fe80::2", &a.sin6_addr);
     a.sin6_scope_id = if_nametoindex("eth0");
     return a;
 }
@@ -573,8 +667,73 @@ static void test_ping6_ll_router(void) {
         if (got == 24 && !memcmp(r + 8, q + 8, 16)) good++;
     }
     close(s);
-    if (good != 4) printf("  ping fe80::2%%eth0: %d/4\n", good);
+    if (good != 4) printf("  ping router%%eth0: %d/4\n", good);
     CHECK("ping6_ll_router", good == 4);
+}
+
+/* The SLAAC address of eth0 (any non-fe80 line), as 32 hex digits. */
+static int find_global(char *hex) {
+    FILE *f = fopen("/proc/net/if_inet6", "r");
+    if (!f) return 0;
+    char b[256]; int found = 0;
+    while (fgets(b, sizeof b, f)) {
+        if (strncmp(b, "fe80", 4) && strstr(b, "eth0") && strncmp(b, "0000000000000000", 16)) {
+            memcpy(hex, b, 32); hex[32] = 0; found = 1; break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static void test_slaac_addr(void) {
+    unsigned char m[6];
+    char line[256], want[40];
+    int ok = eth0_mac(m), found = 0;
+    for (int i = 0; ok && i < 100 && !found; i++) {
+        found = find_global(line);
+        if (!found) usleep(100000);
+    }
+    if (ok) {
+        snprintf(want, sizeof want, "%02x%02x%02xfffe%02x%02x%02x",
+                 m[0] ^ 2, m[1], m[2], m[3], m[4], m[5]);
+        ok = found && !strncmp(line + 16, want, 16);
+    }
+    CHECK("slaac_addr", ok);
+}
+
+static void test_ping6_global(void) {
+    int s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (s < 0) { CHECK("ping6_global", 0); return; }
+    tmo(s, 3);
+    struct sockaddr_in6 a; memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6;
+    char g[40] = "";
+    if (!find_global(g)) { CHECK("ping6_global", 0); close(s); return; }
+    for (int i = 0; i < 8; i++) sscanf(g + 2 * i, "%2hhx", &a.sin6_addr.s6_addr[i]);
+    unsigned char rt[16] = {0};
+    if (!find_router(rt)) rt[15] = 2;
+    /* The router's interface id on our prefix: slirp's host is prefix::2
+     * (= fe80::2); on a vmnet host the global address is a privacy
+     * address that cannot be derived, so there is nothing to ping. */
+    static const unsigned char two[16] = {[15] = 2};
+    if (memcmp(rt + 8, two + 8, 8)) {
+        printf("  skip: router is not slirp's (iid != ::2), cannot derive its global address\n");
+        CHECK("ping6_global", 1);
+        close(s);
+        return;
+    }
+    memcpy(a.sin6_addr.s6_addr + 8, rt + 8, 8);
+    int good = 0;
+    for (int seq = 1; seq <= 4; seq++) {
+        uint8_t q[64], r[256];
+        size_t n = echo_req(q, 0x4322, seq);
+        if (sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) != (ssize_t)n) continue;
+        int got = await_reply(s, seq, r, sizeof r);
+        if (got == 24 && !memcmp(r + 8, q + 8, 16)) good++;
+    }
+    close(s);
+    if (good != 4) printf("  ping <prefix>::2: %d/4\n", good);
+    CHECK("ping6_global", good == 4);
 }
 
 static void test_ll_noscope(void) {
@@ -647,6 +806,7 @@ int main(int argc, char **argv) {
     test_v6only_after_bind();
     test_mapped_connect_v6only();
     test_udp_dual();
+    test_netns_v6_tcp();
     test_ping6_dgram_lo();
     test_ping6_raw_lo();
     test_raw6_eperm();
@@ -659,6 +819,8 @@ int main(int argc, char **argv) {
     test_localhost_fallback();
     test_ll_present();
     test_ping6_ll_router();
+    test_slaac_addr();
+    test_ping6_global();
     test_ll_noscope();
     test_ll_bind_scope();
     test_disable_ipv6();
