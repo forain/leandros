@@ -228,3 +228,16 @@ Regression tests ([userland/](../../userland)): **`memtest`** (CoW isolation, `m
 - [scheduler.md](scheduler.md) — `busy` vs `RUN_QUEUE`, per-CPU current address space
 - [servers/vfs.md](../servers/vfs.md) — tmpfs, memfd and the VMO store
 - [arch-x86_64.md](arch-x86_64.md), [arch-aarch64.md](arch-aarch64.md) — page tables, cache types, shootdowns
+
+## HHDM contract
+
+- Limine base revision >= 4 (we request 6) maps every memmap entry except RESERVED and BAD_MEMORY into the HHDM; the
+  gap seen on HP boots 13-18 is not reproducible and is covered by the permanent check+fill `early_hhdm_fill`
+  (x86_64, `mm.hhdmfill`). See `artifacts/notes/lane-hhdmfb-2026-10-25.md`.
+- aarch64 has a walker too: `boot/src/hhdm_a64.rs` + `early_hhdm_a64`, fill default-on (`earlyfb.test=unmap4g1`).
+- x86_64 direct boot (a kexec'd kernel): Limine retypes firmware-Reserved ranges holding ACPI tables as type 8 and maps
+  them. kexec hands that on, but the MB2 map degrades 8 to Reserved, which `direct_hhdm::extend` leaves unmapped. After
+  the RSDP is known, `direct_hhdm::map_acpi` walks RSDP -> XSDT/RSDT -> tables (+ FADT DSDT/FACS) with
+  `boot::acpi_pages::walk` and maps just those pages (4 KiB, never over present entries). `direct.acpimap=0` disables it.
+  Guard: `kexecacpitest.py` (`--suite kexecacpi`; `kexec.test=acpiresvd` on the loaded cmdline retypes the tables and
+  puts them above usable RAM; `KEXECACPI_NOFIX=1` must fail).
