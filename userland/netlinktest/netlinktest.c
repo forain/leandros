@@ -570,6 +570,7 @@ int main(void) {
         for (struct nlmsghdr *h = (struct nlmsghdr *)buf; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
             if (h->nlmsg_type != RTM_NEWROUTE) continue;
             struct rtmsg *rm = NLMSG_DATA(h);
+            if (rm->rtm_family != AF_INET) continue; /* AF_UNSPEC dumps both families */
             int gw = 0, oif = 0, len = RTM_PAYLOAD(h);
             for (struct rtattr *a = RTM_RTA(rm); RTA_OK(a, len); a = RTA_NEXT(a, len)) {
                 if (a->rta_type == RTA_GATEWAY) gw = 1;
