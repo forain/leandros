@@ -5101,6 +5101,34 @@ fn udp_rebind_port(pid: u32, slot: usize) -> Result<(), i32> {
     Ok(())
 }
 
+/// Connections the host made before an OUTPUT DNAT rewrote the peer: (pid, slot, original, actual).
+static ORIG_PEER: Mutex<alloc::vec::Vec<(u32, usize, IpEndpoint, IpEndpoint)>> = Mutex::new(alloc::vec::Vec::new());
+
+/// nftables OUTPUT chain for a host-local connect (podnat L2): `fib daddr type local` + DNAT redirects
+/// 127.0.0.1:H / nicip:H to the container. getpeername keeps the original (see `ORIG_PEER`).
+fn nft_output_dnat(pid: u32, fd: usize, slot: usize, ip: IpAddress, ep: IpEndpoint) -> (IpAddress, IpEndpoint) {
+    let IpAddress::Ipv4(a) = ip else { return (ip, ep) };
+    if !nfnl::has_tables(0) || sock_netns(pid, slot) != 0 { return (ip, ep) }
+    let l4 = match sock_entry(pid, fd).map(|e| e.sock_type) {
+        Some(t) if t == SOCK_STREAM as u8 => 6u8,
+        Some(t) if t == SOCK_DGRAM as u8 => 17u8,
+        _ => return (ip, ep),
+    };
+    let d = a.0;
+    if !fwd::host_local(d) { return (ip, ep) }
+    let src = if d[0] == 127 { [127, 0, 0, 1] } else { d };
+    let mut m = nfnl::Pkt { l4, src, dst: d, sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true };
+    let (acc, nat) = nfnl::eval(0, nfnl::H_OUT, &mut m);
+    let _ = acc;
+    let nfnl::Nat::Dnat(c, cp) = nat else { return (ip, ep) };
+    let real = IpEndpoint::new(IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(c[0], c[1], c[2], c[3])), if cp == 0 { ep.port } else { cp });
+    let mut t = ORIG_PEER.lock();
+    t.retain(|x| !(x.0 == pid && x.1 == slot));
+    if t.len() >= 256 { t.remove(0); }
+    t.push((pid, slot, ep, real));
+    (real.addr, real)
+}
+
 fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Option<&[u8]>) -> Message {
     if let Some(o) = nlsock::of(pid, fd) { return nlsock::connect(o, addr_ptr, addrlen); }
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
@@ -5123,6 +5151,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
             if sock_entry(pid, fd).map_or(false, |e| sock_opts(e.ofd).v6only) { return err_reply(-101); }
         }
         let remote_endpoint = IpEndpoint::new(remote_ip, port);
+        let (remote_ip, remote_endpoint) = nft_output_dnat(pid, fd, slot, remote_ip, remote_endpoint);
         // 127.0.0.0/8 is served by the loopback stack, everything else by the
         // stack the route lookup picks (`iface::route_select`), or the one
         // holding a bound local address. Decided once, here, and recorded in
@@ -7423,7 +7452,10 @@ fn put_sockaddr_un(addr_ptr: usize, addrlen_ptr: usize, name: &[u8]) -> bool {
 fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Message {
     if addr_ptr == 0 || addrlen_ptr == 0 { return err_reply(-14); }
     if let Some(o) = nlsock::of(pid, fd) { return nlsock::getpeername(o, addr_ptr, addrlen_ptr); }
-    let endpoint = inet_remote_endpoint(pid, fd);
+    let endpoint = inet_remote_endpoint(pid, fd).map(|ep| {
+        let slot = fd_to_slot(fd).unwrap_or(usize::MAX);
+        ORIG_PEER.lock().iter().find(|x| x.0 == pid && x.1 == slot && x.3 == ep).map_or(ep, |x| x.2)
+    });
     match endpoint {
         Some(ep) => unsafe { write_sockaddr_in(sock_dom(pid, fd), addr_ptr, addrlen_ptr, ep); },
         // An AF_INET socket with no peer (unconnected UDP, a listener, a
