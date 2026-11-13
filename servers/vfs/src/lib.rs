@@ -6493,6 +6493,7 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, fstype.as_bytes());
         // Alias mounts are always nosuid (see alias.rs).
+        p = write_lit(buf, p, b" ");
         p = write_alias_opts(buf, p, fl);
         p = write_lit(buf, p, b" 0 0\n");
         if p >= buf.len() { return start; }
@@ -6645,6 +6646,7 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         }
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, &mp);
+        p = write_lit(buf, p, b" ");
         p = write_alias_opts(buf, p, fl);
         p = write_lit(buf, p, b",relatime");
         p = write_prop_fields(buf, p, &mp);
