@@ -618,6 +618,108 @@ static void veth6(void) {
     close(s);
 }
 
+/* ---- bridge6 / veth6gw: IPv6 over a bridge (33:33 multicast flooding) and netns gateway routes ---- */
+static const char *g_ip6;
+static int v6_conf_eth0(void) {
+    int cs = nl_sock();
+    int idx = link_get(cs, "eth0", NULL, NULL);
+    if (!idx || addr6_add(cs, idx, g_ip6, 64) || link_set_up(cs, idx)) return 2;
+    link_set_up(cs, link_get(cs, "lo", NULL, NULL));
+    close(cs);
+    return 0;
+}
+static int br6_server_body(void) {
+    int e = v6_conf_eth0(); if (e) return e;
+    int r = tcp6_echo_srv(g_ip6, 47662, done_[1]);
+    if (r) return 10 + r;
+    return ping6_once("fd00:66::1", 0) ? 20 : 0;
+}
+static int br6_client_body(void) {
+    int e = v6_conf_eth0(); if (e) return e;
+    char ch = 'r'; write(done_[1], &ch, 1);
+    if (read(ctl[0], &ch, 1) != 1) return 3;
+    if (ping6_once("fd00:66::2", 0)) return 4;
+    if (ping6_once("fd00:66::1", 0)) return 5;
+    int t = socket(AF_INET6, SOCK_STREAM, 0);
+    struct timeval tv = { 5, 0 };
+    setsockopt(t, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct sockaddr_in6 d; memset(&d, 0, sizeof d); d.sin6_family = AF_INET6; d.sin6_port = htons(47662);
+    inet_pton(AF_INET6, "fd00:66::2", &d.sin6_addr);
+    if (connect(t, (struct sockaddr *)&d, sizeof d)) return 6;
+    char b[8] = "ping";
+    return write(t, b, 4) == 4 && read(t, b, 4) == 4 && !memcmp(b, "ping", 4) ? 0 : 7;
+}
+static void bridge6(void) {
+    int s = nl_sock();
+    unsigned char brmac[6] = { 0x02, 0x00, 0x5e, 0x98, 0x06, 0x01 };
+    CHECK("bridge6: br6 created", br_new(s, "br6", brmac) == 0);
+    int bidx = link_get(s, "br6", NULL, NULL);
+    CHECK("bridge6: br6 fd00:66::1/64 + up", bidx > 0 && addr6_add(s, bidx, "fd00:66::1", 64) == 0 && link_set_up(s, bidx) == 0);
+    g_ip6 = "fd00:66::2";
+    pid_t ca = spawn_ns(br6_server_body);
+    int cA[2] = { ctl[0], ctl[1] }, dA[2] = { done_[0], done_[1] };
+    g_ip6 = "fd00:66::3";
+    pid_t cb = spawn_ns(br6_client_body);
+    int cB[2] = { ctl[0], ctl[1] }, dB[2] = { done_[0], done_[1] };
+    CHECK("bridge6: netns A and B spawned", ca > 0 && cb > 0);
+    if (ca <= 0 || cb <= 0) return;
+    int fa = netns_fd_of(ca), fb = netns_fd_of(cb);
+    CHECK("bridge6: veth ports created", veth_new_m(s, "v6brA", "eth0", fa, bidx) == 0 && veth_new_m(s, "v6brB", "eth0", fb, bidx) == 0);
+    close(fa); close(fb);
+    link_set_up(s, link_get(s, "v6brA", NULL, NULL)); link_set_up(s, link_get(s, "v6brB", NULL, NULL));
+    char ch = 'g';
+    write(cA[1], &ch, 1); write(cB[1], &ch, 1);
+    CHECK("bridge6: A listening", rd_to(dA[0], &ch) == 1);
+    CHECK("bridge6: B configured", rd_to(dB[0], &ch) == 1);
+    CHECK("bridge6: host pings A over the bridge", ping6_once("fd00:66::2", 0) == 0);
+    write(cB[1], &ch, 1);
+    int rb = wait_child(cb);
+    printf("B exit %d\n", rb);
+    CHECK("bridge6: B: ping A, ping bridge addr, TCP echo with A", rb == 0);
+    CHECK("bridge6: A served B and pinged the host back", wait_child(ca) == 0);
+    int ia = link_get(s, "v6brA", NULL, NULL), ib = link_get(s, "v6brB", NULL, NULL);
+    if (ia) link_del(s, ia);
+    if (ib) link_del(s, ib);
+    if (bidx) link_del(s, bidx);
+    close(s);
+}
+
+static int route6_default(int s, int oif, const char *gw) {
+    struct rtmsg r; memset(&r, 0, sizeof r);
+    r.rtm_family = AF_INET6; r.rtm_table = RT_TABLE_MAIN; r.rtm_protocol = RTPROT_BOOT;
+    r.rtm_scope = RT_SCOPE_UNIVERSE; r.rtm_type = RTN_UNICAST;
+    struct in6_addr g; inet_pton(AF_INET6, gw, &g);
+    struct nlb m; nl_begin(&m, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, &r, sizeof r);
+    nl_attr(&m, RTA_GATEWAY, &g, 16); nl_attr(&m, RTA_OIF, &oif, 4);
+    return nl_do(s, &m);
+}
+static int gw6_child_body(void) {
+    g_ip6 = "fd00:7::2";
+    int e = v6_conf_eth0(); if (e) return e;
+    int cs = nl_sock();
+    if (ping6_once("fd00:9::1", 0) == 0) return 3;            /* no route yet: must fail */
+    int idx = link_get(cs, "eth0", NULL, NULL);
+    errno = route6_default(cs, idx, "fd00:7::1");
+    if (errno) return 4;
+    if (ping6_once("fd00:9::1", 0)) return 5;                 /* off-link host address through the gateway */
+    close(cs);
+    return 0;
+}
+static void veth6gw(void) {
+    int s = nl_sock();
+    pid_t c = spawn_ns(gw6_child_body);
+    int nsfd = netns_fd_of(c);
+    CHECK("veth6gw: pair created", veth_new(s, "v6gwA", "eth0", nsfd) == 0);
+    close(nsfd);
+    int ia = link_get(s, "v6gwA", NULL, NULL);
+    CHECK("veth6gw: host end fd00:7::1/64 + fd00:9::1/128", ia > 0 && addr6_add(s, ia, "fd00:7::1", 64) == 0 && addr6_add(s, ia, "fd00:9::1", 128) == 0);
+    link_set_up(s, ia);
+    write(ctl[1], "g", 1);
+    CHECK("veth6gw: child: no route fails, default via gw works", wait_child(c) == 0);
+    if (ia) link_del(s, ia);
+    close(s);
+}
+
 static void veth_ping(void) {
     /* ICMP echo both ways: child pings the host end, host pings the child. */
     int s = nl_sock();
@@ -1412,6 +1514,8 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "veth_listen_reap")) veth_listen_reap();
     if (!only || !strcmp(only, "veth_ping")) veth_ping();
     if (!only || !strcmp(only, "veth6")) veth6();
+    if (!only || !strcmp(only, "bridge6")) bridge6();
+    if (!only || !strcmp(only, "veth6gw")) veth6gw();
     if (!only || !strcmp(only, "veth_dellink")) veth_dellink();
     if (!only || !strcmp(only, "veth_naming")) veth_naming();
     if (!only || !strcmp(only, "veth_setlink_move")) veth_setlink_move();
