@@ -180,6 +180,11 @@ pub fn root_of(ns: NsId, id: u32) -> Option<Vec<u8>> {
     NS.lock().get(&ns)?.mnts.iter().find(|m| m.id == id).map(|m| m.root.to_vec())
 }
 
+/// Flags of mount `id` in `ns`, None when that mount no longer exists.
+pub fn flags_opt(ns: NsId, id: u32) -> Option<u8> {
+    NS.lock().get(&ns).and_then(|n| n.mnts.iter().find(|m| m.id == id)).map(|m| m.flags)
+}
+
 /// Flags of mount `id` in namespace `ns` (0 when unknown).
 pub fn flags_of(ns: NsId, id: u32) -> u8 {
     NS.lock().get(&ns).and_then(|n| n.mnts.iter().find(|m| m.id == id)).map_or(0, |m| m.flags)
@@ -962,7 +967,9 @@ pub fn linkscan(backing: &[u8], floor: &[u8], follow: bool) -> Option<(usize, Ve
 /// path and final mount id. Keyed by THREAD pid (mntns is per-thread; the VFS
 /// canonicalizes callers to the tgid, so it cannot be keyed there).
 #[derive(Clone)]
-pub struct CallCtx { pub ptr: usize, pub ns_path: Vec<u8>, pub mnt_id: u32 }
+pub struct CallCtx { pub ptr: usize, pub ns_path: Vec<u8>, pub mnt_id: u32,
+    /// Hidden-dirfd path: the originating mount's flags apply verbatim (no ns translation).
+    pub hidden_flags: Option<u8> }
 
 static CALLCTX: Mutex<BTreeMap<u32, Vec<CallCtx>>> = Mutex::new(BTreeMap::new());
 
@@ -1049,7 +1056,7 @@ pub fn selftest() -> Vec<(&'static str, bool)> {
         && linkscan(b"/.mnttest-ls/x", b"/", true).map(|r| r.0 == 1).unwrap_or(false)));
     LINKSCANNERS.lock().retain(|e| !e.0.starts_with(b"/.mnttest-ls"));
     // callctx keyed by pid
-    callctx_set(7777, CallCtx { ptr: 5, ns_path: b"/x".to_vec(), mnt_id: 9 });
+    callctx_set(7777, CallCtx { ptr: 5, ns_path: b"/x".to_vec(), mnt_id: 9, hidden_flags: None });
     let g = callctx_get(7777, 5).map(|c| c.mnt_id == 9).unwrap_or(false) && callctx_get(7778, 5).is_none();
     callctx_clear(7777, 5);
     out.push(("callctx", g && callctx_get(7777, 5).is_none()));
