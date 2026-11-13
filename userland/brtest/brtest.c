@@ -539,6 +539,83 @@ static void veth_pair(void) {
     close(s);
 }
 
+
+static int addr6_add(int s, int idx, const char *ip, int plen) {
+    struct ifaddrmsg a; memset(&a, 0, sizeof a);
+    a.ifa_family = AF_INET6; a.ifa_prefixlen = plen; a.ifa_index = idx;
+    struct in6_addr in; inet_pton(AF_INET6, ip, &in);
+    struct nlb m; nl_begin(&m, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &a, sizeof a);
+    nl_attr(&m, IFA_LOCAL, &in, 16); nl_attr(&m, IFA_ADDRESS, &in, 16);
+    return nl_do(s, &m);
+}
+/* ICMPv6 echo through an unprivileged ping socket; 0 on a reply. */
+static int ping6_once(const char *dst, int ifidx) {
+    int ic = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (ic < 0) return 1;
+    struct timeval tv = { 5, 0 };
+    setsockopt(ic, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct sockaddr_in6 to; memset(&to, 0, sizeof to); to.sin6_family = AF_INET6;
+    inet_pton(AF_INET6, dst, &to.sin6_addr); to.sin6_scope_id = ifidx;
+    unsigned char pk[8] = { 128, 0, 0, 0, 0x12, 0x34, 0, 1 };
+    if (sendto(ic, pk, 8, 0, (struct sockaddr *)&to, sizeof to) != 8) { close(ic); return 2; }
+    unsigned char rb[64];
+    ssize_t n = recv(ic, rb, sizeof rb, 0);
+    close(ic);
+    return n >= 8 && rb[0] == 129 ? 0 : 3;
+}
+static int tcp6_echo_srv(const char *bindip, int port) {
+    int l = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 a; memset(&a, 0, sizeof a); a.sin6_family = AF_INET6; a.sin6_port = htons(port);
+    inet_pton(AF_INET6, bindip, &a.sin6_addr);
+    struct timeval tv = { 8, 0 };
+    setsockopt(l, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (bind(l, (struct sockaddr *)&a, sizeof a) || listen(l, 2)) return 1;
+    int c = accept(l, NULL, NULL);
+    if (c < 0) return 2;
+    char b[8]; ssize_t n = read(c, b, 8);
+    if (n != 4) return 3;
+    return write(c, b, 4) == 4 ? 0 : 4;
+}
+static int v6_child_body(void) {
+    int cs = nl_sock();
+    int idx = link_get(cs, "eth0", NULL, NULL);
+    if (!idx || addr6_add(cs, idx, "fd00:6::2", 64) || link_set_up(cs, idx)) return 2;
+    link_set_up(cs, link_get(cs, "lo", NULL, NULL));
+    char ch = 'x'; write(done_[1], &ch, 1);
+    int r = tcp6_echo_srv("fd00:6::2", 47661);
+    if (r) return 10 + r;
+    return ping6_once("fd00:6::1", 0) ? 20 : 0;
+}
+
+static void veth6(void) {
+    int s = nl_sock();
+    pid_t c = spawn_ns(v6_child_body);
+    int nsfd = netns_fd_of(c);
+    int e = veth_new(s, "veth6A", "eth0", nsfd);
+    close(nsfd);
+    CHECK("veth6: pair created", e == 0);
+    int ia = link_get(s, "veth6A", NULL, NULL);
+    CHECK("veth6: host end gets fd00:6::1/64", ia > 0 && addr6_add(s, ia, "fd00:6::1", 64) == 0);
+    link_set_up(s, ia);
+    write(ctl[1], "g", 1);
+    char ch;
+    CHECK("veth6: child configured", rd_to(done_[0], &ch) == 1);
+    CHECK("veth6: host pings child fd00:6::2", ping6_once("fd00:6::2", 0) == 0);
+    int t = socket(AF_INET6, SOCK_STREAM, 0);
+    struct timeval tv = { 5, 0 };
+    setsockopt(t, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct sockaddr_in6 d; memset(&d, 0, sizeof d); d.sin6_family = AF_INET6; d.sin6_port = htons(47661);
+    inet_pton(AF_INET6, "fd00:6::2", &d.sin6_addr);
+    int ce = connect(t, (struct sockaddr *)&d, sizeof d);
+    CHECK("veth6: TCP connect to the child over v6", ce == 0);
+    char b[8] = "ping";
+    int ok = ce == 0 && write(t, b, 4) == 4 && read(t, b, 4) == 4 && !memcmp(b, "ping", 4);
+    CHECK("veth6: TCP echo over v6", ok);
+    close(t);
+    CHECK("veth6: child served and pinged the host back", wait_child(c) == 0);
+    close(s);
+}
+
 static void veth_ping(void) {
     /* ICMP echo both ways: child pings the host end, host pings the child. */
     int s = nl_sock();
@@ -1332,6 +1409,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "veth_tcp_bulk_exit")) veth_tcp_bulk_exit();
     if (!only || !strcmp(only, "veth_listen_reap")) veth_listen_reap();
     if (!only || !strcmp(only, "veth_ping")) veth_ping();
+    if (!only || !strcmp(only, "veth6")) veth6();
     if (!only || !strcmp(only, "veth_dellink")) veth_dellink();
     if (!only || !strcmp(only, "veth_naming")) veth_naming();
     if (!only || !strcmp(only, "veth_setlink_move")) veth_setlink_move();
