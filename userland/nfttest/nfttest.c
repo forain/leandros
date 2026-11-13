@@ -168,8 +168,7 @@ int main(void)
     /* named set elements round trip */
     run("nft flush ruleset 2>&1", out, sizeof out);
     run("nft add table inet t 2>&1", out, sizeof out);
-    run("nft --debug=netlink add set inet t s '{ type inet_proto; elements = { tcp, udp }; }' 2>&1 | head -c 1500", got, sizeof got);
-    printf("DBG %s\n", got);
+    run("nft add set inet t s '{ type inet_proto; elements = { tcp, udp }; }' 2>&1", got, sizeof got);
     run("nft list set inet t s 2>&1", got, sizeof got);
     CHECK("named set keeps both elements", strstr(got, "tcp") && strstr(got, "udp"));
     if (!(strstr(got, "tcp") && strstr(got, "udp"))) printf("%.300s\n", got);
