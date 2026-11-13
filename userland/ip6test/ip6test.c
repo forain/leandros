@@ -522,7 +522,7 @@ static int banner(const char *addr, int port) {
 
 // ── v6 / v4-mapped TCP inside a non-initial netns (lane ip6nswake) ───────────
 // Peer writes then closes; the client must see POLLIN, the data, EOF
-// (the net poll does not report POLLRDHUP for TCP, in any netns).
+// (peer shutdown(SHUT_WR) -> POLLIN|POLLRDHUP, both shut -> POLLHUP).
 // mode: 0 v6 client -> dual [::] server (::ffff:127.0.0.1), 1 v4 client -> dual
 // server, 4 v4/v4 baseline, 2 v6 client -> v4 server (mapped), 3 v6 client -> [::1] server.
 static int ns6_body(int mode) {
@@ -563,14 +563,32 @@ static int ns6_body(int mode) {
     int a = accept(l, NULL, NULL);
     if (a < 0) return 9;
     if (write(a, "hi", 2) != 2) return 10;
-    close(a);
-    struct pollfd p = { .fd = c, .events = POLLIN };
+    // Peer FIN without closing: Linux reports POLLIN|POLLRDHUP, not POLLHUP.
+    if (shutdown(a, SHUT_WR) != 0) return 15;
+    struct pollfd p = { .fd = c, .events = POLLIN | POLLRDHUP };
     int pr = poll(&p, 1, 3000);
     if (pr != 1) return 11;
     if (!(p.revents & POLLIN)) return 14;
+    // The data may be readable before the FIN has been processed.
+    for (int i = 0; i < 150 && !(p.revents & POLLRDHUP); i++) {
+        usleep(20000);
+        p.revents = 0;
+        poll(&p, 1, 0);
+    }
+    if (!(p.revents & POLLRDHUP)) return 16;
+    if (p.revents & POLLHUP) return 17;
     char b[8];
     if (read(c, b, sizeof b) != 2) return 12;
     if (read(c, b, sizeof b) != 0) return 13;
+    // Both directions shut: POLLHUP.
+    if (shutdown(c, SHUT_WR) != 0) return 18;
+    p.revents = 0;
+    for (int i = 0; i < 30 && !(p.revents & POLLHUP); i++) {
+        p.revents = 0;
+        poll(&p, 1, 100);
+    }
+    if (!(p.revents & POLLHUP)) return 19;
+    close(a);
     return 0;
 }
 
