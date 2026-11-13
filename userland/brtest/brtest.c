@@ -1304,6 +1304,145 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     link_del(s, bidx);
     close(s);
 }
+
+/* ---- nftnat: rulesets from netavark's nftables driver drive DNAT (podnat L2) ------------------------- */
+static int g_nn_mode;      /* 0 host->127.0.0.1:H, 1 container -> bridge:H (self hairpin), 2 second container -> bridge:H */
+static int g_nn_role;      /* 0 server container, 1 client container */
+static const char NN_RULES[] =
+ "table inet netavark {\n"
+ " chain FORWARD { type filter hook forward priority filter; policy accept;\n"
+ "  ct state invalid drop\n"
+ "  ip daddr 10.97.0.0/24 ct state established,related accept\n"
+ "  ip saddr 10.97.0.0/24 accept }\n"
+ " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n"
+ "  meta mark & 0x00002000 == 0x00002000 masquerade }\n"
+ " chain PREROUTING { type nat hook prerouting priority dstnat; policy accept;\n"
+ "  fib daddr type local jump NETAVARK-HOSTPORT-DNAT }\n"
+ " chain OUTPUT { type nat hook output priority dstnat; policy accept;\n"
+ "  fib daddr type local jump NETAVARK-HOSTPORT-DNAT }\n"
+ " chain NETAVARK-HOSTPORT-DNAT { tcp dport 8080 jump nv_x_dnat }\n"
+ " chain NETAVARK-HOSTPORT-SETMARK { meta mark set meta mark | 0x00002000 }\n"
+ " chain nv_x_dnat {\n"
+ "  ip saddr 10.97.0.0/24 tcp dport 8080 jump NETAVARK-HOSTPORT-SETMARK\n"
+ "  ip saddr 127.0.0.1 tcp dport 8080 jump NETAVARK-HOSTPORT-SETMARK\n"
+ "  tcp dport 8080 dnat ip to 10.97.0.2:80 }\n"
+ "}\n";
+static int nn_poll(int fd, short ev, int ms) { struct pollfd p = { fd, ev, 0 }; return poll(&p, 1, ms) > 0 && (p.revents & ev); }
+static int nn_connect(const char *ip, int port) {
+    int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+    inet_pton(AF_INET, ip, &a.sin_addr);
+    connect(c, (struct sockaddr *)&a, sizeof a);
+    /* the first SYN may be dropped while the bridge learns a MAC: allow 12 s (SYN retransmit at 1 s) */
+    int err = -1; socklen_t el = sizeof err;
+    if (nn_poll(c, POLLOUT, 12000)) getsockopt(c, SOL_SOCKET, SO_ERROR, &err, &el);
+    if (err != 0) { close(c); return -1; }
+    return c;
+}
+static int nn_serve(const char *want_peer) {
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1; setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(80) };
+    if (bind(l, (struct sockaddr *)&a, sizeof a) || listen(l, 4)) return 10;
+    char ch = 'r'; write(done_[1], &ch, 1);     /* listening */
+    int selfc = -1;
+    if (g_nn_mode == 1) selfc = nn_connect("10.97.0.1", 8080);
+    if (!nn_poll(l, POLLIN, 15000)) return 11;
+    struct sockaddr_in p; socklen_t pl = sizeof p;
+    int c = accept(l, (struct sockaddr *)&p, &pl);
+    if (c < 0) return 12;
+    char got[32]; inet_ntop(AF_INET, &p.sin_addr, got, sizeof got);
+    write(c, "hi", 2);
+    usleep(200000);
+    if (selfc >= 0) close(selfc);
+    return want_peer && strcmp(got, want_peer) ? 13 : 0;
+}
+static int nn_body(void) {
+    g_ip = g_nn_role ? "10.97.0.3" : "10.97.0.2";
+    int s = nl_sock();
+    int idx = link_get(s, "eth0", NULL, NULL);
+    if (!idx || addr_add(s, idx, g_ip, 24) || link_set_up(s, idx)) return 1;
+    int lo = link_get(s, "lo", NULL, NULL); link_set_up(s, lo);
+    if (route_default(s, idx, "10.97.0.1")) return 2;
+    close(s);
+    char ch = 'c'; write(done_[1], &ch, 1);
+    if (rd_to(ctl[0], &ch) != 1) return 3;
+    if (!g_nn_role) return nn_serve(g_nn_mode == 0 ? NULL : "10.97.0.1");
+    int c = nn_connect("10.97.0.1", 8080);
+    if (c < 0) return 20;
+    char b[8] = { 0 };
+    if (!nn_poll(c, POLLIN, 8000) || read(c, b, 2) != 2) return 21;
+    return !strcmp(b, "hi") ? 0 : 22;
+}
+static void nn_case(const char *name, int mode) {
+    char msg[120];
+    int s = nl_sock();
+    unsigned char brmac[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x09 };
+    int ok = br_new(s, "br0", brmac) == 0;
+    int bidx = link_get(s, "br0", NULL, NULL);
+    ok = ok && bidx > 0 && addr_add(s, bidx, "10.97.0.1", 24) == 0 && link_set_up(s, bidx) == 0 && ip_forward_set(1) == 0;
+    snprintf(msg, sizeof msg, "%s: br0 10.97.0.1/24 up, ip_forward=1", name); CHECK(msg, ok);
+    FILE *fp = fopen("/tmp/nn.nft", "w");
+    if (fp) { fputs(NN_RULES, fp); fclose(fp); }
+    snprintf(msg, sizeof msg, "%s: nft -f loads the netavark-shaped ruleset", name);
+    CHECK(msg, system("nft -f /tmp/nn.nft") == 0);
+    g_nn_mode = mode; g_nn_role = 0;
+    pid_t c = spawn_ns(nn_body);
+    int cc[2] = { ctl[0], ctl[1] }, dd[2] = { done_[0], done_[1] };
+    pid_t c2 = -1; int cc2[2] = { -1, -1 }, dd2[2] = { -1, -1 };
+    char ch = 'g';
+    int fc = c > 0 ? netns_fd_of(c) : -1;
+    ok = c > 0 && veth_new_m(s, "vethN", "eth0", fc, bidx) == 0;
+    if (fc >= 0) close(fc);
+    int iv = link_get(s, "vethN", NULL, NULL);
+    ok = ok && iv > 0 && link_set_up(s, iv) == 0;
+    snprintf(msg, sizeof msg, "%s: server netns + veth", name); CHECK(msg, ok);
+    if (ok) {
+        write(cc[1], &ch, 1);
+        ok = rd_to(dd[0], &ch) == 1;
+        snprintf(msg, sizeof msg, "%s: server eth0 configured", name); CHECK(msg, ok);
+        if (ok) write(cc[1], &ch, 1);
+        ok = ok && rd_to(dd[0], &ch) == 1; /* listening */
+    }
+    if (ok && mode == 2) {
+        g_nn_role = 1;
+        c2 = spawn_ns(nn_body);
+        cc2[0] = ctl[0]; cc2[1] = ctl[1]; dd2[0] = done_[0]; dd2[1] = done_[1];
+        int f2 = c2 > 0 ? netns_fd_of(c2) : -1;
+        int ok2 = c2 > 0 && veth_new_m(s, "vethM", "eth0", f2, bidx) == 0;
+        if (f2 >= 0) close(f2);
+        int i2 = link_get(s, "vethM", NULL, NULL);
+        ok2 = ok2 && i2 > 0 && link_set_up(s, i2) == 0;
+        if (ok2) { write(cc2[1], &ch, 1); ok2 = rd_to(dd2[0], &ch) == 1; }
+        if (ok2) write(cc2[1], &ch, 1);
+        snprintf(msg, sizeof msg, "%s: client netns up", name); CHECK(msg, ok2);
+    }
+    if (ok && mode == 0) {
+        int h = nn_connect("127.0.0.1", 8080);
+        char b[8] = { 0 };
+        int got = h >= 0 && nn_poll(h, POLLIN, 8000) && read(h, b, 2) == 2 && !strcmp(b, "hi");
+        snprintf(msg, sizeof msg, "%s: host connect 127.0.0.1:8080 reaches the container listener", name); CHECK(msg, got);
+        struct sockaddr_in pa; socklen_t pl = sizeof pa; char ip[32] = "";
+        if (h >= 0 && !getpeername(h, (struct sockaddr *)&pa, &pl)) inet_ntop(AF_INET, &pa.sin_addr, ip, sizeof ip);
+        snprintf(msg, sizeof msg, "%s: getpeername keeps 127.0.0.1:8080 (got %s:%d)", name, ip, ntohs(pa.sin_port));
+        CHECK(msg, !strcmp(ip, "127.0.0.1") && ntohs(pa.sin_port) == 8080);
+        if (h >= 0) close(h);
+    }
+    if (c > 0) {
+        int r = wait_child(c);
+        snprintf(msg, sizeof msg, "%s: server saw the connection%s (exit %d)", name, mode ? " from 10.97.0.1" : "", r); CHECK(msg, r == 0);
+    }
+    if (c2 > 0) {
+        int r = wait_child(c2);
+        snprintf(msg, sizeof msg, "%s: client got the reply through the published port (exit %d)", name, r); CHECK(msg, r == 0);
+    }
+    system("nft delete table inet netavark");
+    link_del(s, bidx); close(s);
+}
+static void nftnat_local(void) { nn_case("nftnat_local_redirect", 0); }
+static void nftnat_hairpin(void) { nn_case("nftnat_hairpin", 1); }
+static void nftnat_cross(void) { nn_case("nftnat_cross_netns", 2); }
+
 static void fwd_udp(void) { fwd_case("fwd_udp", 0, 1); }
 static void fwd_ping(void) { fwd_case("fwd_ping", 1, 1); }
 static void fwd_off(void) { fwd_case("fwd_off", 0, 0); }
@@ -1417,6 +1556,9 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "veth_setlink_move")) veth_setlink_move();
     if (!only || !strcmp(only, "veth_nsgone")) veth_nsgone();
     if (!only || !strcmp(only, "bridge_l2")) bridge_l2();
+    if (!only || !strcmp(only, "nftnat_local_redirect")) nftnat_local();
+    if (!only || !strcmp(only, "nftnat_hairpin")) nftnat_hairpin();
+    if (!only || !strcmp(only, "nftnat_cross_netns")) nftnat_cross();
     if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
     if (!only || !strcmp(only, "fwd_ping")) fwd_ping();
     if (!only || !strcmp(only, "fwd_off")) fwd_off();

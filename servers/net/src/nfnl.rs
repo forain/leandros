@@ -804,3 +804,224 @@ fn set_in_use(t: &Table, name: &[u8]) -> bool {
 
 #[allow(dead_code)]
 const _: u16 = NLM_F_CREATE;
+
+// ---- evaluation VM (podnat L2) ----------------------------------------------
+//
+// A register machine over exactly the expressions netavark emits. Rules are
+// run on NEW flows only; unknown expressions never reach it (refused at commit).
+
+pub const H_PRE: u32 = 0;
+pub const H_FWD: u32 = 2;
+pub const H_OUT: u32 = 3;
+pub const H_POST: u32 = 4;
+
+/// What the VM sees of a packet.
+pub struct Pkt {
+    pub l4: u8, pub src: [u8; 4], pub dst: [u8; 4], pub sport: u16, pub dport: u16,
+    /// Output interface name (zero padded), for `meta oifname`.
+    pub oif: [u8; 16],
+    pub mark: u32,
+    /// `fib daddr type local`.
+    pub local: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Nat { None, Dnat([u8; 4], u16), Masq }
+
+#[derive(PartialEq, Clone, Copy)]
+enum Flow { Fall, Ret, Accept, Drop }
+
+struct Cx<'a> { t: &'a Table, m: &'a mut Pkt, nat: Nat, depth: u32 }
+
+fn roff(r: u32) -> usize { if r >= 8 { (r as usize - 8) * 4 } else { (r as usize).saturating_sub(1) * 16 } }
+
+fn rset(regs: &mut [u8; 64], r: u32, v: &[u8]) -> Option<()> {
+    let o = roff(r);
+    let n = pad4(v.len());
+    if o + n > 64 { return None; }
+    regs[o..o + v.len()].copy_from_slice(v);
+    for b in &mut regs[o + v.len()..o + n] { *b = 0; }
+    Some(())
+}
+
+fn rget(regs: &[u8; 64], r: u32, n: usize) -> Option<&[u8]> {
+    let o = roff(r);
+    if o + n > 64 { None } else { Some(&regs[o..o + n]) }
+}
+
+fn dval(d: &[u8]) -> Option<&[u8]> { find(&attrs(d), 1) }
+
+fn run_chain(cx: &mut Cx, name: &[u8]) -> Flow {
+    if cx.depth > 16 { return Flow::Fall; }
+    let t = cx.t;
+    let Some(c) = t.chains.iter().find(|c| c.name == name) else { return Flow::Fall };
+    cx.depth += 1;
+    let f = run_rules(cx, c);
+    cx.depth -= 1;
+    f
+}
+
+fn run_rules(cx: &mut Cx, c: &Chain) -> Flow {
+    for r in &c.rules {
+        match run_rule(cx, &r.exprs) { Flow::Fall => {}, Flow::Ret => return Flow::Fall, f => return f }
+    }
+    Flow::Fall
+}
+
+fn run_rule(cx: &mut Cx, exprs: &[u8]) -> Flow {
+    rule_inner(cx, exprs).unwrap_or(Flow::Fall)
+}
+
+fn rule_inner(cx: &mut Cx, exprs: &[u8]) -> Option<Flow> {
+    let mut regs = [0u8; 64];
+    for (_, e) in attrs(exprs) {
+        let ea = attrs(e);
+        let name = find(&ea, 1).map(cstr).unwrap_or(b"");
+        let d = attrs(find(&ea, 2).unwrap_or(&[]));
+        let g = |t: u16| find(&d, t).and_then(be32);
+        match name {
+            b"payload" => {
+                let (dreg, base, off, len) = (g(1)?, g(2)?, g(3)? as usize, g(4)? as usize);
+                let mut net = [0u8; 20];
+                net[0] = 0x45; net[9] = cx.m.l4;
+                net[12..16].copy_from_slice(&cx.m.src); net[16..20].copy_from_slice(&cx.m.dst);
+                let mut tr = [0u8; 4];
+                tr[0..2].copy_from_slice(&cx.m.sport.to_be_bytes()); tr[2..4].copy_from_slice(&cx.m.dport.to_be_bytes());
+                let h: &[u8] = match base { 1 => &net, 2 => &tr, _ => return None };
+                if off + len > h.len() { return None; }
+                rset(&mut regs, dreg, &h[off..off + len])?;
+            }
+            b"meta" => {
+                if let Some(sreg) = g(3) {
+                    if g(2)? == 3 { let v = rget(&regs, sreg, 4)?; cx.m.mark = u32::from_ne_bytes([v[0], v[1], v[2], v[3]]); }
+                } else {
+                    let dreg = g(1)?;
+                    match g(2)? {
+                        3 => rset(&mut regs, dreg, &cx.m.mark.to_ne_bytes())?,
+                        7 => { let o = cx.m.oif; rset(&mut regs, dreg, &o)? }
+                        15 => rset(&mut regs, dreg, &[2])?,
+                        16 => rset(&mut regs, dreg, &[cx.m.l4])?,
+                        _ => rset(&mut regs, dreg, &[0u8; 16])?,
+                    }
+                }
+            }
+            // New flows only: state is always NEW (8).
+            b"ct" => { let dreg = g(1)?; rset(&mut regs, dreg, &8u32.to_ne_bytes())?; }
+            b"fib" => {
+                let dreg = g(1)?;
+                let local = g(3)? & 2 != 0 && cx.m.local;
+                rset(&mut regs, dreg, &(if local { 2u32 } else { 1u32 }).to_ne_bytes())?;
+            }
+            b"cmp" => {
+                let v = dval(find(&d, 3)?)?;
+                let r = rget(&regs, g(1)?, v.len())?;
+                let ok = match g(2)? { 0 => r == v, 1 => r != v, 2 => r < v, 3 => r <= v, 4 => r > v, 5 => r >= v, _ => return None };
+                if !ok { return None; }
+            }
+            b"bitwise" => {
+                let (sreg, dreg, len) = (g(1)?, g(2)?, g(3)? as usize);
+                let mask = dval(find(&d, 4)?)?; let xor = dval(find(&d, 5)?)?;
+                if mask.len() < len || xor.len() < len { return None; }
+                let mut out = [0u8; 16];
+                if len > 16 { return None; }
+                let s = rget(&regs, sreg, len)?;
+                for i in 0..len { out[i] = (s[i] & mask[i]) ^ xor[i]; }
+                rset(&mut regs, dreg, &out[..len])?;
+            }
+            b"range" => {
+                let (from, to) = (dval(find(&d, 3)?)?, dval(find(&d, 4)?)?);
+                let r = rget(&regs, g(1)?, from.len())?;
+                let inr = r >= from && r <= to;
+                if inr != (g(2)? == 0) { return None; }
+            }
+            b"lookup" => {
+                let sn = find(&d, 1).map(cstr)?;
+                let set = cx.t.sets.iter().find(|s| s.name == sn)?;
+                let sreg = g(2)?;
+                let mut hit = false;
+                for el in &set.elems {
+                    let Some(k) = find(&attrs(el), 1).and_then(dval) else { continue };
+                    if rget(&regs, sreg, k.len()).map_or(false, |r| r == k) { hit = true; break; }
+                }
+                if hit == (g(5).unwrap_or(0) & 1 != 0) { return None; }
+            }
+            b"immediate" => {
+                let dreg = g(1)?;
+                let data = attrs(find(&d, 2)?);
+                if dreg != 0 { rset(&mut regs, dreg, find(&data, 1)?)?; continue; }
+                let vd = attrs(find(&data, 2)?);
+                let code = find(&vd, 1).and_then(be32)? as i32;
+                match code {
+                    0 => return Some(Flow::Drop),
+                    1 => return Some(Flow::Accept),
+                    -5 => return Some(Flow::Ret),
+                    -3 | -4 => {
+                        let n = find(&vd, 2).map(cstr)?.to_vec();
+                        let f = run_chain(cx, &n);
+                        return Some(if f == Flow::Fall { if code == -4 { Flow::Ret } else { Flow::Fall } } else { f });
+                    }
+                    _ => {}
+                }
+            }
+            b"nat" => {
+                if g(1)? != 1 { return None; }
+                let a = rget(&regs, g(3)?, 4)?;
+                let addr = [a[0], a[1], a[2], a[3]];
+                let port = match g(5) { Some(r) => { let p = rget(&regs, r, 2)?; u16::from_be_bytes([p[0], p[1]]) } None => 0 };
+                cx.nat = Nat::Dnat(addr, port);
+                return Some(Flow::Accept);
+            }
+            b"masq" => { cx.nat = Nat::Masq; return Some(Flow::Accept); }
+            _ => {}
+        }
+    }
+    Some(Flow::Fall)
+}
+
+/// Run every base chain of `ns` at `hook` in priority order. (accepted, nat action).
+pub fn eval(ns: u16, hook: u32, m: &mut Pkt) -> (bool, Nat) {
+    let g = NF.lock();
+    let Some(st) = g.get(&ns) else { return (true, Nat::None) };
+    let mut chains: Vec<(i32, &Table, &Chain)> = Vec::new();
+    for t in &st.tables {
+        if t.family != 1 && t.family != 2 { continue; }
+        for c in &t.chains {
+            let Some(h) = &c.hook else { continue };
+            let ha = attrs(h);
+            if find(&ha, 1).and_then(be32) == Some(hook) {
+                chains.push((find(&ha, 2).and_then(be32).unwrap_or(0) as i32, t, c));
+            }
+        }
+    }
+    chains.sort_by_key(|x| x.0);
+    let mut nat = Nat::None;
+    for (_, t, c) in chains {
+        let mut cx = Cx { t, m: &mut *m, nat, depth: 0 };
+        let f = run_rules(&mut cx, c);
+        nat = cx.nat;
+        if f == Flow::Drop || (f == Flow::Fall && c.policy == Some(0)) { return (false, nat); }
+    }
+    (true, nat)
+}
+
+/// Destination ports that some DNAT rule matches (any protocol): the SNAT allocator must not hand them out.
+pub fn dnat_ports(ns: u16) -> Vec<(u16, u16)> {
+    let g = NF.lock();
+    let mut out = Vec::new();
+    let Some(st) = g.get(&ns) else { return out };
+    for t in &st.tables { for c in &t.chains { for r in &c.rules {
+        let ex: Vec<_> = attrs(&r.exprs).into_iter().map(|(_, e)| attrs(e)).collect();
+        if !ex.iter().any(|ea| find(ea, 1).map(cstr) == Some(b"nat")) { continue; }
+        for ea in &ex {
+            let nm = find(ea, 1).map(cstr).unwrap_or(b"");
+            let Some(d) = find(ea, 2).map(attrs) else { continue };
+            let two = |v: &[u8]| if v.len() == 2 { Some(u16::from_be_bytes([v[0], v[1]])) } else { None };
+            if nm == b"cmp" {
+                if let Some(p) = find(&d, 3).and_then(dval).and_then(two) { out.push((p, p)); }
+            } else if nm == b"range" {
+                if let (Some(a), Some(b)) = (find(&d, 3).and_then(dval).and_then(two), find(&d, 4).and_then(dval).and_then(two)) { out.push((a, b)); }
+            }
+        }
+    } } }
+    out
+}
