@@ -6,6 +6,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod acpi;
+pub mod acpi_pages;
 pub mod earlyfb;
 pub mod device_tree;
 pub mod mpidr;

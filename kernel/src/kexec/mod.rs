@@ -66,6 +66,10 @@ struct Image {
 
 static STATE: spin::Mutex<Option<Image>> = spin::Mutex::new(None);
 static BUSY: AtomicBool = AtomicBool::new(false);
+/// `kexec.test=acpiresvd` on the cmdline being loaded: hand the next kernel its
+/// ACPI-table ranges as raw type 8 (firmware Reserved), simulating firmware that
+/// keeps tables there (x86_64 fail-first test, kexecacpitest.py).
+static ACPI_RESVD: AtomicBool = AtomicBool::new(false);
 
 /// What the jump needs.
 #[derive(Clone)]
@@ -154,6 +158,9 @@ fn do_load(kfd: usize, initrd_fd: Option<usize>, cmdline: &[u8]) -> Result<Image
     if bi_ptr == 0 { return Err(EINVAL); }
     let bi = unsafe { &*(bi_ptr as *const boot::BootInfo) };
 
+    ACPI_RESVD.store(
+        core::str::from_utf8(cmdline).map_or(false, |c| c.split_ascii_whitespace().any(|t| t.trim_end_matches('\0') == "kexec.test=acpiresvd")),
+        Ordering::SeqCst);
     let parsed = elf::parse(kfd)?;
     let map = info::raw_map(bi);
     let ram = info::loadable(&map);
@@ -321,6 +328,8 @@ pub fn exec_prepare() -> Result<(), isize> {
 
 /// The framebuffer the staged MBI hands over (x86_64), recomputed the way
 /// `info::build` decided it, for the device-reset plan.
+pub(crate) fn acpi_resvd() -> bool { ACPI_RESVD.load(Ordering::SeqCst) }
+
 pub fn handover_fb() -> Option<u64> {
     let bi_ptr = crate::BOOT_INFO_PTR.load(Ordering::SeqCst);
     if bi_ptr == 0 { return None; }
