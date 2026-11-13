@@ -33,6 +33,9 @@ pub fn raw_map(bi: &boot::BootInfo) -> Vec<Raw> {
 /// ACPI table above 2 GiB to raw 8, as firmware keeping tables in Reserved RAM
 /// would. x86_64 only (aarch64 has no ACPI path).
 #[allow(unused_variables)]
+static RETYPED_LO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+#[allow(unused_variables)]
 fn acpi_resvd(bi: &boot::BootInfo, v: &mut Vec<Raw>) {
     #[cfg(target_arch = "x86_64")]
     if super::acpi_resvd() && bi.rsdp_addr != 0 {
@@ -47,6 +50,7 @@ fn acpi_resvd(bi: &boot::BootInfo, v: &mut Vec<Raw>) {
             if matches!(r.raw_type, 2 | 3) && ranges.iter().any(|&(p, l)| p >= (2u64 << 30) && p < r.base + r.length && p + l > r.base) {
                 crate::serial_print_str(&alloc::format!("[KEXEC] retype {:#x}+{:#x} type {} -> 8\n", r.base, r.length, r.raw_type));
                 r.raw_type = 8;
+                RETYPED_LO.fetch_min(r.base, core::sync::atomic::Ordering::SeqCst);
                 n += 1;
             }
         }
@@ -121,7 +125,8 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, _a: &mut Alloc) -> 
     // lowest retyped (type 8) table entry becomes Reserved in the handed-over map.
     let mut cut: Vec<Raw> = map.to_vec();
     if super::acpi_resvd() {
-        if let Some(lo) = cut.iter().filter(|r| r.raw_type == 8 && r.base >= (2u64 << 30)).map(|r| r.base).min() {
+        let lo = RETYPED_LO.load(core::sync::atomic::Ordering::SeqCst);
+        if lo != u64::MAX {
             let mut n = 0;
             for r in cut.iter_mut().filter(|r| r.base >= lo && matches!(r.raw_type, 0 | 5 | 6)) { r.raw_type = 1; n += 1; }
             crate::serial_print_str(&alloc::format!("[KEXEC] test acpiresvd: {} usable entr(ies) >= {:#x} made Reserved\n", n, lo));
