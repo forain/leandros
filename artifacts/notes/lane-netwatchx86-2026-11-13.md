@@ -1,0 +1,2 @@
+# lane/netwatchx86 (2026-11-13) - REFUTED as kernel/net bug
+netwatchtest.py x86_64 --only loss: PASS (dhcp=True, line 14.6 s after set_link, reset seen). Earlier failures were harness environment: the worktree lacked f2fs-data*.img (QEMU never started, so dhcp=False / cannot connect to monitor), and a stale serial-full log from a killed run faked results. Test now removes the stale log and reports driver start failures. No kernel change, no box regress needed.
