@@ -25,7 +25,8 @@ The image ships Alpine's container stack (`podman`, `crun`, `conmon`, `netavark`
 ## Networking modes
 
 - **Root, default bridge.** `netavark` creates a bridge (`podman0`) and a veth pair per container through netlink; the net server's L2 switch and NAT give the container its own address and outward reachability, and a published port reaches a container listener. The bridge is created per run, so listeners bound on `0.0.0.0` before it exists are adopted by its stack.
-- **Rootless, `pasta`.** `pasta` runs in the new network namespace with a tap device; because it connects to the container's own address from inside the namespace, tap/tun/veth stacks answer ARP and loop frames for their own address locally, as Linux's local routing table does. DNS goes through pasta's forwarder; `-p host:container` forwards work.
+- **Rootless, `pasta`.** `pasta` runs in the new network namespace with a tap device; because it connects to the container's own address from inside the namespace, tap/tun/veth stacks answer ARP and loop frames for their own address locally, as Linux's local routing table does. DNS goes through pasta's forwarder; `-p host:container` forwards work. Rootful `--network=pasta -p` does NOT work: podman 5.8.9 itself rejects pasta as root ("only supported for rootless mode or when inside a nested userns"; guarded by `podman_pasta_root_rejected` in podbridge). Published ports are therefore available rootless via pasta today; rootful bridge `-p` awaits the nf_tables work (design-podnat).
+- **`--internal`.** netavark writes `conf/<bridge>/forwarding=0`; the net server honours it, and a later `ip_forward=1` no longer overwrites it (Linux fans out only when the value changes). The nft isolation drops netavark also emits are not implemented (`firewall_driver = "none"`).
 - **`--network=none`** creates a namespace with only a loopback and leaks nothing.
 
 ## Behaviours worth knowing

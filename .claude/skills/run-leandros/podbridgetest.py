@@ -70,6 +70,7 @@ def main():
                 gw = ".".join(str(b) for b in g)
         print(f"podbridge: host gateway {gw}, http port {port}")
 
+        run("podman rm -af >/dev/null 2>&1")  # stale containers of an earlier aborted run
         rc, out = run(f"podman run --rm {IMG} echo hi 2>&1")
         check("podman_echo", rc == 0 and "Rolling back" not in out and "level=error" not in out and "ERRO" not in out and re.search(r"^hi\s*$", out, re.M) is not None,
               f"rc={rc} " + out.strip()[-200:].replace("\n", " | ") if rc != 0 or "Rolling" in out or "ERRO" in out else "")
@@ -93,6 +94,24 @@ def main():
             check("podman_dns", True)
         else:
             print(f"podman_dns: SKIP rc={rc} " + out.strip()[-120:].replace("\n", " | "))
+
+        # L0 (podl0) REFUTED: podman 5.8.9 rejects `--network=pasta` as root ("pasta networking is
+        # only supported for rootless mode or when inside a nested userns"), a podman-side gate.
+        # Published ports work today only rootless (podpastatest pasta_portfwd).
+        rc, out = run(f"podman run --rm --network=pasta -p 18081:80 {IMG} true 2>&1")
+        check("podman_pasta_root_rejected", rc != 0 and "only supported for rootless" in out, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
+
+        # --internal (podl0): netavark writes conf/<bridge>/forwarding=0; a later non-internal
+        # setup's ip_forward=1 must not clobber it (Linux fans out only when the value changes).
+        run("podman network rm -f pbint >/dev/null 2>&1; podman rm -f pbintc >/dev/null 2>&1; podman network create --internal pbint 2>&1")
+        rc, out = run("podman run -d --rm --name pbintc --network=pbint " + IMG + " sleep 120 2>&1; "
+                      "podman run --rm " + IMG + " true 2>&1; "
+                      "br=$(podman network inspect pbint -f '{{.NetworkInterface}}'); echo BR=$br; "
+                      "echo 1 > /proc/sys/net/ipv4/ip_forward; "
+                      "echo FWD=$(cat /proc/sys/net/ipv4/conf/$br/forwarding)")
+        fm = re.search(r"FWD=(\d)", out)
+        check("podman_internal_forwarding_kept", fm is not None and fm.group(1) == "0", "out=" + out.strip()[-160:].replace("\n", " | "))
+        run("podman stop -t 0 pbintc >/dev/null 2>&1; sleep 3; podman rm -f pbintc >/dev/null 2>&1; podman network rm -f pbint >/dev/null 2>&1")
 
         rc, out = run("grep -c ' /run/netns/' /proc/self/mountinfo")
         bl = out.strip().splitlines()[-1:] 

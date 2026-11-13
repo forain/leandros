@@ -1871,7 +1871,9 @@ fn heal_stale(pid: u32, fd: usize) {
 
 /// True for an address the loopback stack owns (127.0.0.0/8).
 #[inline]
-fn is_loopback_addr(addr: IpAddress) -> bool { iface::is_loopback(addr) }
+fn is_loopback_addr(addr: IpAddress) -> bool {
+    iface::is_loopback(addr) || matches!(addr, IpAddress::Ipv6(a) if ip6::lo_static(&a))
+}
 
 /// The NIC stack whose interface holds `ip` now. One stack lock at a time.
 fn stack_holding(ns: u16, ip: IpAddress) -> Option<Sid> {

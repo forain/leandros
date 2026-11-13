@@ -6,7 +6,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ## Known bugs
 
-- [ ] mntiso E7: add a host_to_view hint to the fd_ns_path reopen so links whose target is only reachable from another view resolve without the identity-check fallback (design-mntiso.md E7; open after lane/mntiso-procfd).
 ### Kernel / VFS
 - **New writers of signal state must call `sig_kick`**; a miss shows as `miss` > 0 in `/proc/rqhold` (invariant, no known violation).
 - **Flakes to root-cause**: `sigtest` timed_wait_stop_resumes_remainder (not captured; waitpid(WUNTRACED) 1 s lateness fixed 2026-11-11, re-watch).
@@ -21,13 +20,13 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - ~~**mntunshare is not an isolation boundary for root-run workloads** (M6)~~ DONE (mntiso chroot/busy/procfd/entry/strict/bindpin 2026-11-11; the remaining reopen hint is the E7 line above).
 
 ### Network
-- **IPv6 beyond loopback** (L1 ::1, L2 dual-stack/V6ONLY/v4-mapped, L7 resolver (musl) and L4 NIC link-local fe80::/64 (EUI-64, disable_ipv6) + sin6_scope_id + /proc/net/if_inet6 + NDP to the slirp router, L3 ICMPv6 ping/raw sockets + ICMP6_FILTER + hop limit/tclass/pktinfo options and cmsgs + `ping -6` done on ::1; sshd listens on `[::]:22`. Known gaps: v4-mapped destination on a v6 ping socket is EINVAL, hop limit 0 reads back as the default, no ICMPv6 cmsgs. SLAAC/RA (L5: RS x3, RA -> global addr + on-link prefix + default router + lifetimes, /proc/net/ipv6_route) done; no DAD, no DHCPv6/RDNSS, RA MTU ignored; own-address local delivery of fe80 on the NIC stack, scope id in recvfrom/accept sockaddrs, netns, podman IPv6 yet: design-ipv6 L4+).
+- **IPv6 beyond loopback** (L1 ::1, L2 dual-stack/V6ONLY/v4-mapped, L7 resolver (musl) and L4 NIC link-local fe80::/64 (EUI-64, disable_ipv6) + sin6_scope_id + /proc/net/if_inet6 + NDP to the slirp router, L3 ICMPv6 ping/raw sockets + ICMP6_FILTER + hop limit/tclass/pktinfo options and cmsgs + `ping -6` done on ::1; sshd listens on `[::]:22`. Known gaps: v4-mapped destination on a v6 ping socket is EINVAL, hop limit 0 reads back as the default, no ICMPv6 cmsgs. SLAAC/RA (L5: RS x3, RA -> global addr + on-link prefix + default router + lifetimes, /proc/net/ipv6_route) done; no DAD, no DHCPv6/RDNSS, RA MTU ignored; rtnetlink v6 (L6: GETADDR/GETROUTE, NEWADDR/DELADDR/NEWROUTE/DELROUTE, static v6 routes in best(), /proc/net tcp6/udp6/raw6) done, open: RTNLGRP v6 notifications, IFLA_AF_SPEC AF_INET6, busybox `ip -6` output unchecked; own-address local delivery of fe80 on the NIC stack, scope id in recvfrom/accept sockaddrs, netns, podman IPv6 yet: design-ipv6 L4+).
 - **UDP/IP gaps**: no PMTUD (IP_MTU_DISCOVER/IP_MTU, DF on Frag-Needed), no IGMPv3/SSM. (IP fragmentation/reassembly works: udptest `udp_huge` + peer_frag_echo guard it.)
 - ~~**Real NIC drivers program no multicast filter**~~ FIXED 2026-11-11 (lane/nicmcast): macb, e1000e, r8169, iwlwifi already accepted all multicast; brcmf (Pi Wi-Fi) now sets `allmulti` (Pi wifi0 rx of 30 mDNS-group datagrams: +5 before, +37 after). Pass-all, no per-group list. See artifacts/notes/lane-nicmcast-2026-11-11.md.
 - **iwlwifi gaps** (lane iwlgaps 2026-11-11: WMM later-beacon updates, STATISTICS_NOTIFICATION and antenna comparison were already implemented; sparse ping loss 0/300 on LeandrOS vs 4/300 on Linux, same AP; 2.4 GHz is channel noise): still open: TX MIMO/STBC/SGI on 5 GHz unmeasured (the saved 5 GHz profile/passphrase is not on the stick; add the profile and A/B `iwlwifi.rscol`/`txmimo`).
 - **brtest fwd_port_reserved flake** (lane brflake 2026-11-13): "flow holder exited cleanly" fails ~2/30 on Mac aarch64 HVF after the TCP flow to the resolver is established; separate from the dead-netns drain bug (fixed; veth_tcp_bulk_exit guards it). Not yet investigated. The earlier veth_pair/veth_tcp_reap/bridge_l2 flakes are FIXED.
 - **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
-- **Podman published ports**: rootful `-p` and `--internal` firewall semantics open (iptables-shim design: artifacts/notes/lane-podports-2026-11-11.md); TCP NAT port reservation done; host-NIC reach deferred.
+- **Podman published ports**: bridge `-p` (needs nf_tables, design-podnat) and the nft isolation drops open; `--internal` forwarding=0 now survives ip_forward=1 (lane podl0); rootful `--network=pasta` is rejected by podman itself, rootless `-p` works (iptables-shim design: artifacts/notes/lane-podports-2026-11-11.md); TCP NAT port reservation done; host-NIC reach deferred.
 - **r8169 RX stalls/chip resets on the PC**: ISR-mask fix needs PC confirmation (R8169 as a loadable module also deferred).
 
 ### Desktop / GPU / COSMIC

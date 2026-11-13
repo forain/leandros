@@ -26,6 +26,10 @@ static LL: Mutex<[Option<[u8; 16]>; MAX_NETIF]> = Mutex::new([None; MAX_NETIF]);
 static PREFIXES: Mutex<Vec<(Sid, [u8; 16], u8, u32)>> = Mutex::new(Vec::new());
 /// Default routers `(sid, router link-local, metric)`.
 static ROUTERS: Mutex<Vec<(Sid, [u8; 16], u32)>> = Mutex::new(Vec::new());
+/// Addresses added over rtnetlink: `(ifindex, address, prefix length)`.
+static STATIC_A: Mutex<Vec<(u32, [u8; 16], u8)>> = Mutex::new(Vec::new());
+/// Routes added over rtnetlink.
+static STATIC_R: Mutex<Vec<crate::rtnetlink::R6>> = Mutex::new(Vec::new());
 
 /// Modified EUI-64 link-local address of a MAC (RFC 4291 appendix A).
 pub(crate) fn eui64_ll(m: [u8; 6]) -> [u8; 16] {
@@ -69,14 +73,27 @@ fn prefix_match(a: &[u8; 16], p: &[u8; 16], len: u8) -> bool {
 /// prefix (ties to the lower metric), else the lowest-metric default router,
 /// on stacks with carrier. `None` is ENETUNREACH.
 pub(crate) fn route(dst: Ipv6Address) -> Option<Sid> {
+    best(&dst.0).filter(|b| b.2 >= 2).map(|b| (b.2 - 1) as Sid)
+}
+
+/// Longest-prefix match over the on-link prefixes, the static routes and the
+/// default routers of the NICs with carrier: `(prefix length, metric, oif, gateway)`.
+fn best(dst: &[u8; 16]) -> Option<(u8, u32, u32, Option<[u8; 16]>)> {
     let up = |sid: Sid| sid >= 1 && sid < FIRST_DYN && iface::rt(sid - 1).carrier;
-    let mut best: Option<(u8, u32, Sid)> = None;
+    let mut best: Option<(u8, u32, u32, Option<[u8; 16]>)> = None;
+    let mut take = |len: u8, m: u32, oif: u32, gw: Option<[u8; 16]>| {
+        if best.map_or(true, |(bl, bm, _, _)| len > bl || (len == bl && m < bm)) { best = Some((len, m, oif, gw)); }
+    };
     for &(sid, p, len, m) in PREFIXES.lock().iter() {
-        if !up(sid) || !prefix_match(&dst.0, &p, len) { continue; }
-        if best.map_or(true, |(bl, bm, _)| len > bl || (len == bl && m < bm)) { best = Some((len, m, sid)); }
+        if up(sid) && prefix_match(dst, &p, len) { take(len, m, sid as u32 + 1, None); }
     }
-    if let Some((_, _, s)) = best { return Some(s); }
-    ROUTERS.lock().iter().filter(|r| up(r.0)).min_by_key(|r| r.2).map(|r| r.0)
+    for r in STATIC_R.lock().iter() {
+        if r.oif >= 2 && up((r.oif - 1) as Sid) && prefix_match(dst, &r.dst, r.plen) { take(r.plen, r.metric, r.oif, r.gw); }
+    }
+    for &(sid, r, m) in ROUTERS.lock().iter() {
+        if up(sid) { take(0, m, sid as u32 + 1, Some(r)); }
+    }
+    best
 }
 
 /// Can stack `sid` carry a new flow to `dst`?
@@ -131,6 +148,11 @@ pub(crate) fn proc_if_inet6(out: &mut impl Write) {
             for b in g { let _ = write!(out, "{:02x}", b); }
             let _ = writeln!(out, " {:02x} 40 00 00 {:>8}", nif.id as u32 + 2, nif.name());
         }
+    }
+    for &(idx, a, p) in STATIC_A.lock().iter() {
+        let name = if idx == 1 { alloc::string::String::from("lo") } else { nic_of(idx).map(|n| alloc::string::String::from(n.name())).unwrap_or_default() };
+        for b in a { let _ = write!(out, "{:02x}", b); }
+        let _ = writeln!(out, " {:02x} {:02x} {:02x} 80 {:>8}", idx, p, if is_link_local(&a) { 0x20 } else { 0 }, name);
     }
 }
 
@@ -366,4 +388,175 @@ pub(crate) fn proc_ipv6_route(out: &mut impl Write) {
         hex(out, &z); let _ = write!(out, " 00 "); hex(out, &z); let _ = write!(out, " 00 "); hex(out, &r);
         let _ = writeln!(out, " {:08x} 00000000 00000000 00000003 {:>8}", m, nm(sid).unwrap_or_default());
     }
+    for r in STATIC_R.lock().iter() {
+        hex(out, &r.dst); let _ = write!(out, " {:02x} ", r.plen); hex(out, &z); let _ = write!(out, " 00 ");
+        hex(out, &r.gw.unwrap_or(z));
+        let _ = writeln!(out, " {:08x} 00000000 00000000 {:08x} {:>8}", r.metric, if r.gw.is_some() { 3 } else { 1 }, nm(r.oif.wrapping_sub(1) as Sid).unwrap_or_default());
+    }
+}
+
+// ── rtnetlink view and writes (design-ipv6 L6) ───────────────────────────────
+
+use crate::rtnetlink::{A6, R6, RtOp};
+
+fn scope_of(a: &[u8; 16]) -> u8 { if is_link_local(a) { 253 } else { 0 } }
+
+/// Is `a` a static address on `lo`? Such an address is local: it is delivered through the loopback.
+pub(crate) fn lo_static(a: &Ipv6Address) -> bool {
+    STATIC_A.lock().iter().any(|e| e.0 == 1 && e.1 == a.0)
+}
+
+/// `::1` of a namespace's loopback while it is up.
+pub(crate) fn lo_addrs6(ns: u16) -> Vec<A6> {
+    if sched::ns::lo_admin_up(ns) && !sched::ns::ipv6_disabled(ns, b"lo") {
+        alloc::vec![A6 { index: 1, addr: LOOPBACK, prefix: 128, scope: 254, flags: 0x80 }]
+    } else { Vec::new() }
+}
+
+const LOOPBACK: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+/// Every IPv6 address of the initial namespace.
+pub(crate) fn addrs6() -> Vec<A6> {
+    let mut v = alloc::vec![A6 { index: 1, addr: LOOPBACK, prefix: 128, scope: 254, flags: 0x80 }];
+    for nif in netdev::iter() {
+        let idx = nif.id as u32 + 2;
+        if let Some(a) = ll_of(nif.id) { v.push(A6 { index: idx, addr: a, prefix: 64, scope: 253, flags: 0x80 }); }
+        if let Some((g, _)) = SLAAC.lock()[nif.id as usize].addr { v.push(A6 { index: idx, addr: g, prefix: 64, scope: 0, flags: 0x80 }); }
+    }
+    for &(idx, a, p) in STATIC_A.lock().iter() { v.push(A6 { index: idx, addr: a, prefix: p, scope: scope_of(&a), flags: 0x80 }); }
+    v
+}
+
+/// Every IPv6 route of the initial namespace (the `/proc/net/ipv6_route` table).
+pub(crate) fn routes6() -> Vec<R6> {
+    let mut v = Vec::new();
+    for nif in netdev::iter() {
+        if ll_of(nif.id).is_some() {
+            let mut a = [0u8; 16]; a[0] = 0xfe; a[1] = 0x80;
+            v.push(R6 { dst: a, plen: 64, gw: None, oif: nif.id as u32 + 2, metric: 256, proto: 2 });
+        }
+    }
+    for &(sid, p, len, m) in PREFIXES.lock().iter() { v.push(R6 { dst: p, plen: len, gw: None, oif: sid as u32 + 1, metric: m, proto: 2 }); }
+    for &(sid, r, m) in ROUTERS.lock().iter() { v.push(R6 { dst: [0; 16], plen: 0, gw: Some(r), oif: sid as u32 + 1, metric: m, proto: 9 }); }
+    for r in STATIC_R.lock().iter() { v.push(r.clone()); }
+    v
+}
+
+/// RTM_GETROUTE for one destination: `(oif, gateway)`.
+pub(crate) fn lookup6(dst: [u8; 16]) -> Option<(u32, Option<[u8; 16]>)> {
+    if dst == LOOPBACK || lo_static(&Ipv6Address(dst)) { return Some((1, None)); }
+    if is_link_local(&dst) {
+        return netdev::iter().find(|n| ll_of(n.id).is_some()).map(|n| (n.id as u32 + 2, None));
+    }
+    best(&dst).map(|b| (b.2, b.3))
+}
+
+fn nic_of(index: u32) -> Option<netdev::Netif> { netdev::iter().find(|n| n.id as u32 + 2 == index) }
+
+fn mask16(a: &[u8; 16], len: u8) -> [u8; 16] {
+    let mut o = *a;
+    for (i, b) in o.iter_mut().enumerate() {
+        let keep = (len as u32).saturating_sub(i as u32 * 8).min(8);
+        *b &= if keep == 0 { 0 } else { 0xffu8 << (8 - keep) };
+    }
+    o
+}
+
+/// Apply an IPv6 rtnetlink write; 0 or a positive errno.
+pub(crate) fn apply(ns: u16, op: RtOp) -> i32 {
+    if ns != 0 { return 95; }
+    match op {
+        RtOp::AddAddr6 { index, addr, prefix, flags, excl, replace } => {
+            if index != 1 && nic_of(index).is_none() { return 19; }
+            if addr == [0; 16] || addr[0] == 0xff { return 22; }
+            if is_link_local(&addr) && prefix != 64 && index == 1 { return 22; }
+            {
+                let mut t = STATIC_A.lock();
+                if t.iter().any(|e| e.0 == index && e.1 == addr && e.2 == prefix) { return if replace && !excl { 0 } else { 17 }; }
+                if index == 1 && (addr == LOOPBACK || t.iter().any(|e| e.1 == addr)) { return 17; }
+                t.push((index, addr, prefix));
+            }
+            if let Some(nif) = nic_of(index) {
+                let sid = iface::sid_of(nif.id);
+                if let Some(ref mut s) = *crate::stack_for(sid) {
+                    s.interface.update_ip_addrs(|v| { let _ = v.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address(addr)), prefix)); });
+                }
+                if flags & crate::rtnetlink::IFA_F_NOPREFIXROUTE == 0 && prefix < 128 {
+                    let p = mask16(&addr, prefix);
+                    let mut t = PREFIXES.lock();
+                    if !t.iter().any(|e| e.0 == sid && e.1 == p && e.2 == prefix) { t.push((sid, p, prefix, 256)); }
+                }
+                iface::notify(nif.id);
+            }
+            0
+        }
+        RtOp::DelAddr6 { index, addr, prefix } => {
+            {
+                let mut t = STATIC_A.lock();
+                let Some(i) = t.iter().position(|e| e.0 == index && e.1 == addr && (prefix == 0 || e.2 == prefix)) else { return 99 };
+                t.remove(i);
+            }
+            if let Some(nif) = nic_of(index) {
+                let sid = iface::sid_of(nif.id);
+                if let Some(ref mut s) = *crate::stack_for(sid) {
+                    s.interface.update_ip_addrs(|v| {
+                        let keep: Vec<IpCidr> = v.iter().copied().filter(|c| c.address() != IpAddress::Ipv6(Ipv6Address(addr))).collect();
+                        v.clear();
+                        for c in keep { let _ = v.push(c); }
+                    });
+                }
+                let p = mask16(&addr, prefix);
+                let others = STATIC_A.lock().iter().any(|e| e.0 == index && e.2 == prefix && mask16(&e.1, prefix) == p);
+                if !others { PREFIXES.lock().retain(|e| !(e.0 == sid && e.1 == p && e.2 == prefix && e.3 == 256)); }
+                iface::notify(nif.id);
+            }
+            0
+        }
+        RtOp::AddRoute6 { dst, plen, gw, oif, metric, excl, replace } => {
+            let mut oif = oif;
+            if oif == 0 {
+                match gw.and_then(|g| best(&g)) { Some(b) => oif = b.2, None => return 22 }
+            }
+            if oif != 1 && nic_of(oif).is_none() { return 19; }
+            {
+                let mut t = STATIC_R.lock();
+                if let Some(i) = t.iter().position(|r| r.dst == dst && r.plen == plen && r.oif == oif && r.metric == metric) {
+                    if replace && !excl { t.remove(i); } else { return 17; }
+                }
+                t.push(R6 { dst, plen, gw, oif, metric, proto: 3 });
+            }
+            sync_static_routes(oif);
+            0
+        }
+        RtOp::DelRoute6 { dst, plen, gw, oif, metric } => {
+            let removed = {
+                let mut t = STATIC_R.lock();
+                let Some(i) = t.iter().position(|r| r.dst == dst && r.plen == plen && (oif == 0 || r.oif == oif)
+                    && (gw.is_none() || r.gw == gw) && metric.map_or(true, |m| r.metric == m)) else { return 3 };
+                t.remove(i)
+            };
+            sync_static_routes(removed.oif);
+            0
+        }
+        _ => 95,
+    }
+}
+
+/// Mirror the gateway routes of NIC `oif` into its smoltcp interface.
+fn sync_static_routes(oif: u32) {
+    let Some(nif) = nic_of(oif) else { return };
+    let mine: Vec<R6> = STATIC_R.lock().iter().filter(|r| r.oif == oif && r.gw.is_some()).cloned().collect();
+    if let Some(ref mut s) = *crate::stack_for(iface::sid_of(nif.id)) {
+        s.interface.routes_mut().update(|t| {
+            t.retain(|r| !(matches!(r.cidr.address(), IpAddress::Ipv6(_)) && r.cidr.prefix_len() != 0));
+            for r in &mine {
+                let _ = t.push(smoltcp::iface::Route {
+                    cidr: IpCidr::new(IpAddress::Ipv6(Ipv6Address(r.dst)), r.plen),
+                    via_router: IpAddress::Ipv6(Ipv6Address(r.gw.unwrap())),
+                    preferred_until: None, expires_at: None,
+                });
+            }
+        });
+    }
+    iface::notify(nif.id);
 }
