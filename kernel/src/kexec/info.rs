@@ -42,11 +42,14 @@ fn acpi_resvd(bi: &boot::BootInfo, v: &mut Vec<Raw>) {
             &mut |p, l| ranges.push((p, l)),
             &mut |p, b| unsafe { core::ptr::copy_nonoverlapping(mm::phys_to_virt(p as usize) as *const u8, b.as_mut_ptr(), b.len()) },
         );
+        let mut n = 0;
         for r in v.iter_mut() {
             if matches!(r.raw_type, 2 | 3) && ranges.iter().any(|&(p, l)| p >= (2u64 << 30) && p < r.base + r.length && p + l > r.base) {
                 r.raw_type = 8;
+                n += 1;
             }
         }
+        crate::serial_print_str(&alloc::format!("[KEXEC] test acpiresvd: {} table range(s), {} map entr(ies) retyped to 8\n", ranges.len(), n));
     }
 }
 
