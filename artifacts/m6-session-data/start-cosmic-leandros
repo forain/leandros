@@ -237,6 +237,16 @@ fi
 
 if [ -d "${HOME:-/nonexistent}" ]; then _trace "home ok"; else _trace "home MISSING (${HOME:-unset})"; fi
 if [ -d "$XDG_RUNTIME_DIR" ]; then _trace "runtime dir ok"; else _trace "runtime dir MISSING"; fi
+# Capture cosmic-session's stderr, and that of every child that inherits it
+# (cosmic-comp, panel, applets, notifications...), in a per-uid log. Without
+# this it goes to pipes nobody reads. One generation is kept as .1 (rotation
+# at session start). No tee/FIFO on LeandrOS, so it is a plain redirect; the
+# tracing subscribers stamp their own lines.
+_slog="/tmp/cosmic-session-$(id -u).log"
+[ -f "$_slog" ] && mv -f "$_slog" "$_slog.1" 2>/dev/null
+_trace "session stderr -> $_slog"
+exec 2>>"$_slog"
+
 if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
 	_trace "exec cosmic-session"
 	exec /bin/cosmic-session /bin/cosmic-comp --no-xwayland

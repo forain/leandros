@@ -1389,6 +1389,14 @@ pub fn ipv6_disabled(ns: NsId, ifname: &[u8]) -> bool {
       for e in t.iter() { if e.used && e.ns == ns && &e.name[..e.nlen as usize] == ifname { return e.v[4] != 0; } } }
     static_field(ns, "default", "ipv6", "disable_ipv6") != 0
 }
+/// Per-interface IPv6 conf value `field` ("accept_ra", "autoconf") of `ifname` in netns `ns`.
+pub fn ipv6_conf(ns: NsId, ifname: &[u8], field: &str) -> u32 {
+    if let Some(j) = IF_FIELDS.iter().position(|f| f.0 == "ipv6" && f.1 == field) {
+        let t = IFCTL.lock();
+        for e in t.iter() { if e.used && e.ns == ns && &e.name[..e.nlen as usize] == ifname { return e.v[j]; } }
+    }
+    static_field(ns, "default", "ipv6", field)
+}
 /// May `pid` (an unprivileged ICMP "ping" socket) be created in its netns?
 pub fn ping_allowed(pid: u32) -> bool {
     let ns = netns_of(pid);
