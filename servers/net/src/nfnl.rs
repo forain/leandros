@@ -246,7 +246,7 @@ fn resolve_exprs(body: &[u8], t: &Table) -> Result<Vec<u8>, i32> {
 fn resolve_lookup(d: &[u8], t: &Table) -> Result<Vec<u8>, i32> {
     let da = attrs(d);
     let mut set_name: Option<Vec<u8>> = find(&da, 1).map(|s| cstr(s).to_vec());
-    if let Some(id) = find(&da, 5).and_then(be32) {
+    if let Some(id) = find(&da, 4).and_then(be32) {
         let s = t.sets.iter().find(|s| s.id == id && id != 0).ok_or(ENOENT)?;
         set_name = Some(s.name.clone());
     }
@@ -254,7 +254,7 @@ fn resolve_lookup(d: &[u8], t: &Table) -> Result<Vec<u8>, i32> {
     if !t.sets.iter().any(|s| s.name == sn) { return Err(ENOENT); }
     let mut o = Vec::new();
     put_str(&mut o, 1, &sn);
-    for (ty, b) in da { if ty != 1 && ty != 5 { put(&mut o, ty, b); } }
+    for (ty, b) in da { if ty != 1 && ty != 4 { put(&mut o, ty, b); } }
     // keep SREG/DREG/FLAGS order stable: type order of the kernel's dump
     Ok(sorted(&o))
 }

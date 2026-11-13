@@ -57,6 +57,7 @@ static void norm(char *s)
         *w++ = *r++;
     }
     *w = 0;
+    while (w > s && (w[-1] == '\n' || w[-1] == ' ')) *--w = 0;
 }
 
 static void showdiff(const char *a, const char *b)
@@ -146,6 +147,15 @@ int main(void)
     CHECK("teardown: delete per-network chains", rc == 0);
     if (rc) printf("  nft: %.300s\n", out);
     same(cap_td, "b_teardown");
+
+    /* named set elements round trip */
+    run("nft flush ruleset 2>&1", out, sizeof out);
+    run("nft add table inet t 2>&1", out, sizeof out);
+    run("nft --debug=netlink add set inet t s '{ type inet_proto; elements = { tcp, udp }; }' 2>&1 | head -c 1500", got, sizeof got);
+    printf("DBG %s\n", got);
+    run("nft list set inet t s 2>&1", got, sizeof got);
+    CHECK("named set keeps both elements", strstr(got, "tcp") && strstr(got, "udp"));
+    if (!(strstr(got, "tcp") && strstr(got, "udp"))) printf("%.300s\n", got);
 
     /* rule order: append, insert (prepend) and position. */
     run("nft flush ruleset 2>&1", out, sizeof out);
