@@ -58,15 +58,16 @@ struct Ct {
     /// Hairpin target: container ip/port, its bridge and port, its MAC and the bridge MAC.
     tip: [u8; 4], tport: u16, tbr: Sid, tps: Sid, tmac: [u8; 6], tbmac: [u8; 6],
 }
+struct Park { br: Sid, ip: [u8; 4], t: u64, port: Sid, frame: Vec<u8> }
 struct Lrn { br: Sid, ip: [u8; 4], mac: [u8; 6], port: Sid, t: u64 }
 struct Arp { nic: u8, ip: [u8; 4], mac: [u8; 6], t: u64 }
 struct Pend { nic: u8, ip: [u8; 4], t: u64, frames: Vec<Vec<u8>> }
 struct St {
-    ct: Vec<Ct>, arp: Vec<Arp>, lrn: Vec<Lrn>, pend: Vec<Pend>,
+    ct: Vec<Ct>, arp: Vec<Arp>, lrn: Vec<Lrn>, pend: Vec<Pend>, park: Vec<Park>,
     txq: VecDeque<(u8, Vec<u8>)>, inq: VecDeque<(Sid, Sid, Vec<u8>)>,
     next: u16, swept: u64,
 }
-static FWD: Mutex<St> = Mutex::new(St { ct: Vec::new(), arp: Vec::new(), lrn: Vec::new(), pend: Vec::new(),
+static FWD: Mutex<St> = Mutex::new(St { ct: Vec::new(), arp: Vec::new(), lrn: Vec::new(), pend: Vec::new(), park: Vec::new(),
     txq: VecDeque::new(), inq: VecDeque::new(), next: 0, swept: 0 });
 /// Set at the first forwarded flow: the NIC rx hook costs one load until then.
 static USED: AtomicBool = AtomicBool::new(false);
@@ -244,9 +245,12 @@ pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>, rxsrc: VecDeque<Sid>) -> Ve
     let mut keep = VecDeque::with_capacity(rx.len());
     let aligned = rxsrc.len() == rx.len();
     let nft = crate::nfnl::has_tables(0);
-    for (i, mut f) in rx.into_iter().enumerate() {
-        let port = if aligned { rxsrc[i] } else { crate::vifsel::NO_PEER };
-        if nft && port != crate::vifsel::NO_PEER && port != br { learn(br, port, bmac, &f); }
+    let mut work: VecDeque<(Sid, Vec<u8>)> = rx.into_iter().enumerate()
+        .map(|(i, f)| (if aligned { rxsrc[i] } else { crate::vifsel::NO_PEER }, f)).collect();
+    while let Some((port, mut f)) = work.pop_front() {
+        if nft && port != crate::vifsel::NO_PEER && port != br {
+            if let Some(ip) = learn(br, port, bmac, &f) { for q in unpark(br, ip).into_iter().rev() { work.push_front(q); } }
+        }
         if f.len() < 34 || f[0..6] != bmac || f[12] != 0x08 || f[13] != 0 {
             keep.push_back(f);
             continue;
@@ -292,6 +296,14 @@ fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
             // A TCP flow starts with a bare SYN only.
             if p.proto == PROTO_TCP && p.flags & 0x12 != 0x02 { return; }
             drop(st);
+            // With a nat/postrouting chain loaded, outbound flows need FORWARD to accept and a masquerade
+            // verdict (netavark: an internal network has none, so a leaked ip_forward=1 cannot SNAT it).
+            if crate::nfnl::has_hook(0, crate::nfnl::H_POST) {
+                let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
+                let mut m = crate::nfnl::Pkt { l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rport, oif, mark: 0, local: false };
+                if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return; }
+                if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { return; }
+            }
             let mut pick = None;
             let claimed = if crate::nfnl::has_tables(0) { crate::nfnl::dnat_ports(0) } else { Vec::new() };
             for _ in 0..16 {
@@ -524,18 +536,32 @@ pub(crate) fn drain_in() {
 // ---- nftables NAT on new flows (podnat L2) ----------------------------------------
 
 /// Learn the IP -> (MAC, port) of whoever sent an IPv4 or ARP frame into bridge `br`.
-fn learn(br: Sid, port: Sid, bmac: [u8; 6], f: &[u8]) {
-    if f.len() < 34 { return; }
+fn learn(br: Sid, port: Sid, bmac: [u8; 6], f: &[u8]) -> Option<[u8; 4]> {
+    if f.len() < 34 { return None; }
     let (ip, mac): ([u8; 4], [u8; 6]) = if f[12] == 0x08 && f[13] == 0x06 && f.len() >= 42 && f[14..20] == [0, 1, 8, 0, 6, 4] {
         (f[28..32].try_into().unwrap(), f[22..28].try_into().unwrap())
     } else if f[12] == 0x08 && f[13] == 0 {
         (f[26..30].try_into().unwrap(), f[6..12].try_into().unwrap())
-    } else { return };
-    if ip == [0; 4] || mac[0] & 1 != 0 || mac == bmac { return; }
+    } else { return None };
+    if ip == [0; 4] || mac[0] & 1 != 0 || mac == bmac { return None; }
     let now = sched::monotonic_ns();
     let mut st = FWD.lock();
     if let Some(l) = st.lrn.iter_mut().find(|l| l.br == br && l.ip == ip) { l.mac = mac; l.port = port; l.t = now; }
     else { if st.lrn.len() >= 256 { st.lrn.remove(0); } st.lrn.push(Lrn { br, ip, mac, port, t: now }); }
+    Some(ip)
+}
+
+/// Frames parked on a learn miss for `ip` on `br`, oldest first (a retransmit-free first connect).
+fn unpark(br: Sid, ip: [u8; 4]) -> Vec<(Sid, Vec<u8>)> {
+    let now = sched::monotonic_ns();
+    let mut st = FWD.lock();
+    st.park.retain(|q| now.saturating_sub(q.t) < PEND_NS * 2);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < st.park.len() {
+        if st.park[i].br == br && st.park[i].ip == ip { let q = st.park.remove(i); out.push((q.port, q.frame)); } else { i += 1; }
+    }
+    out
 }
 
 struct Tgt { br: Sid, mac: [u8; 6], name: [u8; 16], addr: [u8; 4] }
@@ -639,6 +665,11 @@ fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
         if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return true; }
         if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { return false; }
         let Some((tmac, tps)) = st.lrn.iter().find(|l| l.br == t.br && l.ip == cip).map(|l| (l.mac, l.port)) else {
+            if t.br == br && st.park.len() < 16 {
+                // Hold the SYN until the ARP reply teaches us the MAC; `divert` replays it.
+                let fr = core::mem::take(f);
+                st.park.push(Park { br, ip: cip, t: now, port, frame: fr });
+            }
             let r = arp_request(t.mac, t.addr, cip);
             st.inq.push_back((t.br, crate::vifsel::NO_PEER, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
             return true;

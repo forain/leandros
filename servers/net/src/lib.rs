@@ -5129,6 +5129,14 @@ fn nft_output_dnat(pid: u32, fd: usize, slot: usize, ip: IpAddress, ep: IpEndpoi
     (real.addr, real)
 }
 
+/// A datagram's source as the application knows the peer: the container's address maps back to the
+/// 127.0.0.1:H it sent to (see `ORIG_PEER`).
+fn nft_unorig(pid: u32, fd: usize, ep: IpEndpoint) -> IpEndpoint {
+    if !nfnl::has_tables(0) { return ep; }
+    let Some(slot) = fd_to_slot(fd) else { return ep };
+    ORIG_PEER.lock().iter().find(|x| x.0 == pid && x.1 == slot && x.3 == ep).map_or(ep, |x| x.2)
+}
+
 fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Option<&[u8]>) -> Message {
     if let Some(o) = nlsock::of(pid, fd) { return nlsock::connect(o, addr_ptr, addrlen); }
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
@@ -5664,7 +5672,8 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                 None
             } else if addr_ptr != 0 && addrlen >= 8 {
                 let sa = match sa::parse(addr_ptr, addrlen) { Ok(a) => a, Err(e) => return err_reply(e) };
-                Some(IpEndpoint::new(sa.ip, sa.port))
+                let ep = IpEndpoint::new(sa.ip, sa.port);
+                Some(if sock_type == SOCK_DGRAM as u8 { nft_output_dnat(pid, fd, slot, sa.ip, ep).1 } else { ep })
             } else {
                 remote_endpoint
             };
@@ -5791,7 +5800,9 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
         {
             drop(tbls);
             if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); } // EDESTADDRREQ
-            let (dest, dscope) = match sa::parse(addr_ptr, addrlen) { Ok(a) => (a.ip, a.scope), Err(e) => return err_reply(e) };
+            let (dest, dscope) = match sa::parse(addr_ptr, addrlen) {
+                Ok(a) => (nft_output_dnat(pid, fd, slot, a.ip, IpEndpoint::new(a.ip, a.port)).0, a.scope),
+                Err(e) => return err_reply(e) };
             if let Err(e) = udp_materialize(pid, slot, Some(dest), dscope, false) { return err_reply(e); }
             handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, kdata)
         }
@@ -6811,6 +6822,14 @@ struct RxMeta {
 /// none is queued (or the socket has no smoltcp socket yet); a pending ICMP
 /// error comes first (see `udp_next_locked`). `gro`: see `udp_next_locked`.
 fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool, gro: bool)
+    -> Result<(alloc::vec::Vec<u8>, usize, RxMeta), i32>
+{
+    let mut r = udp_recv_k0(pid, fd, cap, peek, gro);
+    if let Ok((_, _, m)) = &mut r { m.from = nft_unorig(pid, fd, m.from); }
+    r
+}
+
+fn udp_recv_k0(pid: u32, fd: usize, cap: usize, peek: bool, gro: bool)
     -> Result<(alloc::vec::Vec<u8>, usize, RxMeta), i32>
 {
     let (state, sock_type, _) = inet_sock_info(pid, fd).ok_or(-9i32)?;

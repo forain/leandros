@@ -1094,6 +1094,8 @@ static int route_default(int s, int oif, const char *gw) {
 static const unsigned char VICTIM_MAC[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0xaa };
 static int g_fwd_mode; /* 0 = UDP DNS query, 1 = ping the QEMU gateway; expect success */
 static int g_fwd_expect = 1;
+static const char *g_fwd_nft;   /* nft ruleset loaded before the container starts (nftnat_*) */
+static int g_fwd_expect_ovr = -1;
 static void fwd_resolver(char *out) {
     strcpy(out, "10.0.2.3");
     FILE *f = fopen("/etc/resolv.conf", "r");
@@ -1318,7 +1320,12 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     ok = ok && bidx > 0 && addr_add(s, bidx, "10.97.0.1", 24) == 0 && link_set_up(s, bidx) == 0;
     snprintf(msg, sizeof msg, "%s: br0 10.97.0.1/24 up", name); CHECK(msg, ok);
     snprintf(msg, sizeof msg, "%s: ip_forward=%d", name, ipfwd); CHECK(msg, ip_forward_set(ipfwd) == 0);
-    g_fwd_mode = mode; g_fwd_expect = ipfwd;
+    g_fwd_mode = mode; g_fwd_expect = g_fwd_expect_ovr >= 0 ? g_fwd_expect_ovr : ipfwd;
+    if (g_fwd_nft) {
+        FILE *nf = fopen("/tmp/fn.nft", "w"); if (nf) { fputs(g_fwd_nft, nf); fclose(nf); }
+        snprintf(msg, sizeof msg, "%s: nft -f loads the ruleset", name);
+        CHECK(msg, system("nft -f /tmp/fn.nft >/tmp/fn.err 2>&1") == 0);
+    }
     if (mode == 6 && !g_early_listen) {
         hl = socket(AF_INET, SOCK_STREAM, 0);
     { int one = 1; setsockopt(hl, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); }
@@ -1390,7 +1397,8 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
         rc = 0;
     }
     printf("%s child exit %d\n", name, rc);
-    if (mode == 6) snprintf(msg, sizeof msg, "%s: connect to the bridge address reaches the host 0.0.0.0 listener", name);
+    if (g_fwd_nft) snprintf(msg, sizeof msg, "%s: %s", name, g_fwd_expect ? "UDP DNS query is answered: the subnet has a masquerade rule" : "UDP DNS query gets no reply: no masquerade rule for the subnet (internal)");
+    else if (mode == 6) snprintf(msg, sizeof msg, "%s: connect to the bridge address reaches the host 0.0.0.0 listener", name);
     else if (mode == 8) snprintf(msg, sizeof msg, "%s: victim flow survives another netns deleting a link with its MAC", name);
     else if (mode == 9) snprintf(msg, sizeof msg, "%s: spoofed MAC does not steal the victim's return traffic", name);
     else if (mode == 2) snprintf(msg, sizeof msg, "%s: TCP DNS query to the resolver%s is answered through NAT", name, g_http ? " and an HTTP GET" : "");
@@ -1401,6 +1409,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     else snprintf(msg, sizeof msg, "%s: ip_forward=0 means no reply (nothing forwarded)", name);
     CHECK(msg, rc == 0);
     ip_forward_set(0);
+    if (g_fwd_nft) system("nft delete table inet netavark");
     if (hl >= 0) close(hl);
     if (iv > 0) link_del(s, iv);
     link_del(s, bidx);
@@ -1409,6 +1418,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
 
 /* ---- nftnat: rulesets from netavark's nftables driver drive DNAT (podnat L2) ------------------------- */
 static int g_nn_mode;      /* 0 host->127.0.0.1:H, 1 container -> bridge:H (self hairpin), 2 second container -> bridge:H */
+static int g_nn_ms;        /* last nn_connect latency */
 static int g_nn_role;      /* 0 server container, 1 client container */
 static const char NN_RULES[] =
  "table inet netavark {\n"
@@ -1429,22 +1439,65 @@ static const char NN_RULES[] =
  "  ip saddr 127.0.0.1 tcp dport 8080 jump NETAVARK-HOSTPORT-SETMARK\n"
  "  tcp dport 8080 dnat ip to 10.97.0.2:80\n }\n"
  "}\n";
+static const char NN_RULES_UDP[] =
+ "table inet netavark {\n"
+ " chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state invalid drop\n  ip saddr 10.97.0.0/24 accept\n }\n"
+ " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  meta mark & 0x00002000 == 0x00002000 masquerade\n }\n"
+ " chain PREROUTING { type nat hook prerouting priority dstnat; policy accept;\n  fib daddr type local jump NETAVARK-HOSTPORT-DNAT\n }\n"
+ " chain OUTPUT { type nat hook output priority dstnat; policy accept;\n  fib daddr type local jump NETAVARK-HOSTPORT-DNAT\n }\n"
+ " chain NETAVARK-HOSTPORT-DNAT { ip daddr 127.0.0.1 udp dport 9090 jump nv_x_dnat\n }\n"
+ " chain NETAVARK-HOSTPORT-SETMARK { meta mark set meta mark | 0x00002000\n }\n"
+ " chain nv_x_dnat {\n"
+ "  ip saddr 10.97.0.0/24 ip daddr 127.0.0.1 udp dport 9090 jump NETAVARK-HOSTPORT-SETMARK\n"
+ "  ip saddr 127.0.0.1 ip daddr 127.0.0.1 udp dport 9090 jump NETAVARK-HOSTPORT-SETMARK\n"
+ "  ip daddr 127.0.0.1 udp dport 9090 dnat ip to 10.97.0.2:90\n }\n"
+ "}\n";
+static const char NN_RULES_RANGE[] =
+ "table inet netavark {\n"
+ " chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state invalid drop\n  ip saddr 10.97.0.0/24 accept\n }\n"
+ " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  meta mark & 0x00002000 == 0x00002000 masquerade\n }\n"
+ " chain PREROUTING { type nat hook prerouting priority dstnat; policy accept;\n  fib daddr type local jump NETAVARK-HOSTPORT-DNAT\n }\n"
+ " chain OUTPUT { type nat hook output priority dstnat; policy accept;\n  fib daddr type local jump NETAVARK-HOSTPORT-DNAT\n }\n"
+ " chain NETAVARK-HOSTPORT-DNAT { tcp dport 8000-8002 jump nv_x_dnat\n }\n"
+ " chain NETAVARK-HOSTPORT-SETMARK { meta mark set meta mark | 0x00002000\n }\n"
+ " chain nv_x_dnat {\n"
+ "  ip saddr 127.0.0.1 tcp dport 8000-8002 jump NETAVARK-HOSTPORT-SETMARK\n"
+ "  tcp dport 8000 dnat ip to 10.97.0.2:8000\n  tcp dport 8001 dnat ip to 10.97.0.2:8001\n  tcp dport 8002 dnat ip to 10.97.0.2:8002\n }\n"
+ "}\n";
 static int nn_poll(int fd, short ev, int ms) { struct pollfd p = { fd, ev, 0 }; return poll(&p, 1, ms) > 0 && (p.revents & ev); }
 static int nn_connect(const char *ip, int port) {
     int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
     inet_pton(AF_INET, ip, &a.sin_addr);
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     connect(c, (struct sockaddr *)&a, sizeof a);
     /* the first SYN may be dropped while the bridge learns a MAC: allow 12 s (SYN retransmit at 1 s) */
     int err = -1; socklen_t el = sizeof err;
     if (nn_poll(c, POLLOUT, 12000)) getsockopt(c, SOL_SOCKET, SO_ERROR, &err, &el);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    g_nn_ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
     if (err != 0) { close(c); return -1; }
     return c;
 }
+static int nn_udp_serve(void) {
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(90) };
+    if (bind(u, (struct sockaddr *)&a, sizeof a)) return 10;
+    char ch = 'r'; write(done_[1], &ch, 1);
+    for (int i = 0; i < 2; i++) {            /* connected-socket query, then the unconnected one */
+        char b[16]; struct sockaddr_in p; socklen_t pl = sizeof p;
+        if (!nn_poll(u, POLLIN, 15000)) return 11;
+        ssize_t n = recvfrom(u, b, sizeof b, 0, (struct sockaddr *)&p, &pl);
+        if (n < 0) return 12;
+        if (sendto(u, "hi", 2, 0, (struct sockaddr *)&p, pl) != 2) return 13;
+    }
+    return 0;
+}
 static int nn_serve(const char *want_peer) {
+    if (g_nn_mode == 3) return nn_udp_serve();
     int l = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1; setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(80) };
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(g_nn_mode == 4 ? 8001 : 80) };
     if (bind(l, (struct sockaddr *)&a, sizeof a) || listen(l, 4)) return 10;
     char ch = 'r'; write(done_[1], &ch, 1);     /* listening */
     int selfc = -1;
@@ -1472,6 +1525,7 @@ static int nn_body(void) {
     if (!g_nn_role) return nn_serve(g_nn_mode == 0 ? NULL : "10.97.0.1");
     int c = nn_connect("10.97.0.1", 8080);
     if (c < 0) return 20;
+    if (g_nn_ms > 500) { printf("# KNOWN-OPEN: first connect took %d ms (park on learn miss does not remove the ~700 ms)\n", g_nn_ms); fflush(stdout); }
     char b[8] = { 0 };
     if (!nn_poll(c, POLLIN, 8000) || read(c, b, 2) != 2) return 21;
     return !strcmp(b, "hi") ? 0 : 22;
@@ -1485,7 +1539,7 @@ static void nn_case(const char *name, int mode) {
     ok = ok && bidx > 0 && addr_add(s, bidx, "10.97.0.1", 24) == 0 && link_set_up(s, bidx) == 0 && ip_forward_set(1) == 0;
     snprintf(msg, sizeof msg, "%s: br0 10.97.0.1/24 up, ip_forward=1", name); CHECK(msg, ok);
     FILE *fp = fopen("/tmp/nn.nft", "w");
-    if (fp) { fputs(NN_RULES, fp); fclose(fp); }
+    if (fp) { fputs(mode == 3 ? NN_RULES_UDP : mode == 4 ? NN_RULES_RANGE : NN_RULES, fp); fclose(fp); }
     snprintf(msg, sizeof msg, "%s: nft -f loads the netavark-shaped ruleset", name);
     int nr = system("nft -f /tmp/nn.nft >/tmp/nn.err 2>&1");
     if (nr) { char eb[200] = ""; FILE *ef = fopen("/tmp/nn.err", "r"); if (ef) { size_t n = fread(eb, 1, 190, ef); eb[n] = 0; fclose(ef); }
@@ -1534,6 +1588,32 @@ static void nn_case(const char *name, int mode) {
         CHECK(msg, !strcmp(ip, "127.0.0.1") && ntohs(pa.sin_port) == 8080);
         if (h >= 0) close(h);
     }
+    if (ok && mode == 4) {
+        int h = nn_connect("127.0.0.1", 8001);
+        char b[8] = { 0 };
+        int got = h >= 0 && nn_poll(h, POLLIN, 8000) && read(h, b, 2) == 2 && !strcmp(b, "hi");
+        snprintf(msg, sizeof msg, "%s: host connect 127.0.0.1:8001 (inside 8000-8002) reaches the container listener", name); CHECK(msg, got);
+        if (h >= 0) close(h);
+    }
+    if (ok && mode == 3) {
+        char b[8] = { 0 };
+        int u = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(9090) };
+        inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+        int got = connect(u, (struct sockaddr *)&a, sizeof a) == 0 && send(u, "q1", 2, 0) == 2 && nn_poll(u, POLLIN, 8000)
+            && recv(u, b, 2, 0) == 2 && !strcmp(b, "hi");
+        snprintf(msg, sizeof msg, "%s: connected UDP 127.0.0.1:9090 is answered by the container", name); CHECK(msg, got);
+        close(u);
+        u = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in from; socklen_t fl = sizeof from; memset(b, 0, sizeof b);
+        got = sendto(u, "q2", 2, 0, (struct sockaddr *)&a, sizeof a) == 2 && nn_poll(u, POLLIN, 8000)
+            && recvfrom(u, b, 2, 0, (struct sockaddr *)&from, &fl) == 2 && !strcmp(b, "hi");
+        snprintf(msg, sizeof msg, "%s: unconnected sendto 127.0.0.1:9090 is answered", name); CHECK(msg, got);
+        char ip[32] = ""; inet_ntop(AF_INET, &from.sin_addr, ip, sizeof ip);
+        snprintf(msg, sizeof msg, "%s: recvfrom reports 127.0.0.1:9090 (got %s:%d)", name, ip, ntohs(from.sin_port));
+        CHECK(msg, !strcmp(ip, "127.0.0.1") && ntohs(from.sin_port) == 9090);
+        close(u);
+    }
     if (c > 0) {
         int r = wait_child(c);
         snprintf(msg, sizeof msg, "%s: server saw the connection%s (exit %d)", name, mode ? " from 10.97.0.1" : "", r); CHECK(msg, r == 0);
@@ -1548,7 +1628,18 @@ static void nn_case(const char *name, int mode) {
 static void nftnat_local(void) { nn_case("nftnat_local_redirect", 0); }
 static void nftnat_hairpin(void) { nn_case("nftnat_hairpin", 1); }
 static void nftnat_cross(void) { nn_case("nftnat_cross_netns", 2); }
+static void nftnat_udp(void) { nn_case("nftnat_udp_local", 3); }
+static void nftnat_range(void) { nn_case("nftnat_port_range", 4); }
 
+static const char FN_RULES_FMT_A[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state invalid drop\n  oifname \"br0\" drop\n }\n"
+ " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip saddr 10.98.0.0/24 masquerade\n }\n}\n";
+static const char FN_RULES_FMT_B[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state invalid drop\n  ip saddr 10.97.0.0/24 accept\n }\n"
+ " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip saddr 10.97.0.0/24 masquerade\n }\n}\n";
+/* --internal: ip_forward=1 (a later network clobbered forwarding=0) but no masquerade intent for the subnet */
+static void nftnat_internal(void) { g_fwd_nft = FN_RULES_FMT_A; g_fwd_expect_ovr = 0; fwd_case("nftnat_internal", 0, 1); g_fwd_nft = NULL; g_fwd_expect_ovr = -1; }
+static void nftnat_masq_ok(void) { g_fwd_nft = FN_RULES_FMT_B; fwd_case("nftnat_masq_ok", 0, 1); g_fwd_nft = NULL; }
 static void fwd_udp(void) { fwd_case("fwd_udp", 0, 1); }
 static void fwd_ping(void) { fwd_case("fwd_ping", 1, 1); }
 static void fwd_off(void) { fwd_case("fwd_off", 0, 0); }
@@ -1667,6 +1758,10 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "nftnat_local_redirect")) nftnat_local();
     if (!only || !strcmp(only, "nftnat_hairpin")) nftnat_hairpin();
     if (!only || !strcmp(only, "nftnat_cross_netns")) nftnat_cross();
+    if (!only || !strcmp(only, "nftnat_udp_local")) nftnat_udp();
+    if (!only || !strcmp(only, "nftnat_port_range")) nftnat_range();
+    if (!only || !strcmp(only, "nftnat_internal")) nftnat_internal();
+    if (!only || !strcmp(only, "nftnat_masq_ok")) nftnat_masq_ok();
     if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
     if (!only || !strcmp(only, "fwd_ping")) fwd_ping();
     if (!only || !strcmp(only, "fwd_off")) fwd_off();
