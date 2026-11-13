@@ -11900,7 +11900,7 @@ impl KPath {
         let walked = backing_walk_d(&ns, &mut false, &mut denied);
         if denied { return Err(-13); }
         // Per-mount flags of the ns-0 mount the path lies in (ro/nodev/noexec).
-        let fl = vfs::alias::flags_at(&ns);
+        let (mid0, fl) = vfs::alias::mount_at(&ns).unwrap_or((0, 0));
         let mut kp = match walked { Some(b) => {
             if b.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
             let mut kp = KPath::raw(&b);
@@ -11910,9 +11910,9 @@ impl KPath {
             if ns.len() >= HOST_PATH_MAX { return Err(-36); }
             KPath::raw(&ns)
         } };
-        if fl != 0 {
+        if mid0 != 0 {
             let pid = current_pid();
-            vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: 0, hidden_flags: Some(fl) });
+            vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: mid0, hidden_flags: Some(fl) });
             kp.ctx_pid = pid;
         }
         Ok(kp)
@@ -12160,7 +12160,7 @@ fn fd_hidden_host(mns: sched::ns::NsId, fd: usize) -> Option<Vec<u8>> {
         // ns 0: a dirfd opened through a flagged (ro/nodev/noexec) alias or bind
         // mount keeps those flags; below it, walk by backing path like a hidden fd.
         let fl = match vfs::fd_mnt(current_pid(), fd) {
-            Some((n, _)) if n == u16::MAX => vfs::fd_mnt_flags(current_pid(), fd),
+            Some((n, m)) if n == u16::MAX => vfs::alias::flags_by_id(m).or_else(|| vfs::fd_mnt_flags(current_pid(), fd)),
             _ => None,
         };
         if fl.map_or(false, |f| f & vfs::alias::ENFORCED != 0) { return fd_host_path(fd); }
@@ -12202,6 +12202,7 @@ fn hidden_below(mut host: Vec<u8>, rel: &[u8], fd: usize) -> Result<KPath, isize
     // The fd keeps its vfsmount: enforce that mount's flags (live if the mount
     // still exists, else as recorded at open). Unknown mount => read-only.
     let fl = match vfs::fd_mnt(current_pid(), fd) {
+        Some((n, m)) if n == u16::MAX => vfs::alias::flags_by_id(m).or_else(|| vfs::fd_mnt_flags(current_pid(), fd)).unwrap_or(vfs::mnt::MNT_RDONLY),
         Some((n, m)) => match vfs::mnt::flags_opt(n, m) {
             Some(f) => f,
             None => vfs::fd_mnt_flags(current_pid(), fd).unwrap_or(vfs::mnt::MNT_RDONLY),
@@ -12210,7 +12211,7 @@ fn hidden_below(mut host: Vec<u8>, rel: &[u8], fd: usize) -> Result<KPath, isize
     };
     if fl & (vfs::mnt::MNT_RDONLY | vfs::mnt::MNT_NODEV | vfs::mnt::MNT_NOEXEC) != 0 {
         let pid = current_pid();
-        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: 0, hidden_flags: Some(fl) });
+        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: vfs::fd_mnt(pid, fd).map_or(0, |x| x.1), hidden_flags: Some(fl) });
         kp.ctx_pid = pid;
     }
     Ok(kp)
